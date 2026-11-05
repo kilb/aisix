@@ -168,6 +168,16 @@ fn parse_san_uris(pem: &str) -> anyhow::Result<(String, String)> {
     Ok((env_id, dp_id))
 }
 
+/// The data-plane id a persisted client certificate was issued to.
+pub fn dp_id_from_cert_file(path: &Path) -> anyhow::Result<String> {
+    let pem = std::fs::read_to_string(path).with_context(|| format!("read {path:?}"))?;
+    let (_, dp_id) = parse_san_uris(&pem).context("parse dp_id from leaf cert SAN URIs")?;
+    if dp_id.is_empty() {
+        bail!("leaf cert is missing the `x-aisix://dp/<uuid>` SAN URI");
+    }
+    Ok(dp_id)
+}
+
 pub fn ca_cert_path(mtls_dir: impl AsRef<Path>) -> PathBuf {
     mtls_dir.as_ref().join("ca.crt")
 }

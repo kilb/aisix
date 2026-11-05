@@ -1,7 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { once } from "node:events";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { createServer as createHttpsServer, type Server as HttpsServer } from "node:https";
 import { connect, type Socket } from "node:net";
@@ -120,10 +120,7 @@ function issue(dir: string, name: string, subject: string, extensions: string): 
   );
 }
 
-export async function startMockControlPlane(): Promise<MockControlPlane> {
-  const envId = randomUUID();
-  const dpId = randomUUID();
-  const dir = mkdtempSync(join(tmpdir(), "aisix-e2e-cp-"));
+function issueCa(dir: string): void {
   openssl(
     [
       "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1", "-nodes",
@@ -133,12 +130,28 @@ export async function startMockControlPlane(): Promise<MockControlPlane> {
     ],
     dir,
   );
-  issue(
-    dir,
-    "server",
-    "/CN=127.0.0.1",
-    "basicConstraints=CA:FALSE\nsubjectAltName=IP:127.0.0.1,DNS:localhost\nextendedKeyUsage=serverAuth\n",
-  );
+}
+
+const SERVER_EXTENSIONS =
+  "basicConstraints=CA:FALSE\nsubjectAltName=IP:127.0.0.1,DNS:localhost\nextendedKeyUsage=serverAuth\n";
+
+export interface MockControlPlaneOptions {
+  /**
+   * Serve the REST surface under a certificate from a CA the gateway was not
+   * given, so a spec can stand in for someone intercepting that link. The etcd
+   * front keeps the real certificate: the gateway still boots.
+   */
+  restCertFromForeignCa?: boolean;
+}
+
+export async function startMockControlPlane(
+  options: MockControlPlaneOptions = {},
+): Promise<MockControlPlane> {
+  const envId = randomUUID();
+  const dpId = randomUUID();
+  const dir = mkdtempSync(join(tmpdir(), "aisix-e2e-cp-"));
+  issueCa(dir);
+  issue(dir, "server", "/CN=127.0.0.1", SERVER_EXTENSIONS);
   issue(
     dir,
     "client",
@@ -163,7 +176,19 @@ export async function startMockControlPlane(): Promise<MockControlPlane> {
     close: async () => {},
   };
 
-  const rest: HttpsServer = createHttpsServer(tlsMaterial, (req, res) => {
+  let restTlsMaterial = tlsMaterial;
+  if (options.restCertFromForeignCa) {
+    const foreign = join(dir, "foreign");
+    mkdirSync(foreign);
+    issueCa(foreign);
+    issue(foreign, "server", "/CN=127.0.0.1", SERVER_EXTENSIONS);
+    restTlsMaterial = {
+      key: readFileSync(join(foreign, "server.key")),
+      cert: readFileSync(join(foreign, "server.crt")),
+    };
+  }
+
+  const rest: HttpsServer = createHttpsServer(restTlsMaterial, (req, res) => {
     const path = (req.url ?? "").split("?")[0];
     cp.calls.push(path);
     const chunks: Buffer[] = [];

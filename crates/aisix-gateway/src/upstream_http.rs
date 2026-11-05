@@ -196,6 +196,16 @@ pub fn caller_chosen_peer_client_builder() -> reqwest::ClientBuilder {
     b
 }
 
+/// [`client_builder`] for the control plane: the same connection settings, and
+/// nothing of `upstream.tls`.
+///
+/// That block is about model endpoints. Turning verification off for one, or
+/// trusting an extra CA for it, must not reach a link that carries usage records
+/// and per-user tokens and has its own CA, which the caller adds.
+pub fn control_plane_client_builder() -> reqwest::ClientBuilder {
+    base_client_builder()
+}
+
 fn base_client_builder() -> reqwest::ClientBuilder {
     let cfg = config();
     let mut b = reqwest::Client::builder()
@@ -553,6 +563,7 @@ mod tests {
         for public in [
             "pub fn client_builder() -> reqwest::ClientBuilder {",
             "pub fn caller_chosen_peer_client_builder() -> reqwest::ClientBuilder {",
+            "pub fn control_plane_client_builder() -> reqwest::ClientBuilder {",
         ] {
             assert!(
                 body_of(public).contains("base_client_builder()"),

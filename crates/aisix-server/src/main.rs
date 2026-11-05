@@ -914,14 +914,13 @@ async fn run(mut cfg: Config, hangup: Option<HangupSignal>) -> anyhow::Result<()
                     managed_bundle::env_id_path(&cfg.managed.mtls_dir),
                 )
             })?;
-            match load_heartbeat_config_from_disk(&cfg.managed, extra_ca_pem.clone()) {
-                Ok(h) => Some(h),
-                Err(e) => {
-                    tracing::warn!(error = %e,
-                        "managed mode: heartbeat worker disabled (dp_id unreadable)");
-                    None
-                }
-            }
+            // Hard for the same reason as env_id: telemetry derives from
+            // this, so going on without it would serve traffic that no usage
+            // record, budget or billing ever hears about.
+            Some(
+                load_heartbeat_config_from_disk(&cfg.managed, extra_ca_pem.clone())
+                    .map_err(|e| anyhow::anyhow!("managed mode: bundle on disk but {e:#}"))?,
+            )
         } else {
             // The branch above caught the "neither supplied bundle nor
             // persisted bundle" case and bailed. This arm is
@@ -2463,9 +2462,9 @@ fn derive_cp_etcd_url(managed: &aisix_core::ManagedConfig) -> anyhow::Result<Str
 }
 
 /// Synthesise a HeartbeatConfig when the mTLS bundle is already on
-/// disk from a previous boot. Reads `managed.dp_id_file` and
-/// combines with `managed.cp_base_url` — the register response is
-/// not available on this code path.
+/// disk from a previous boot. Takes the dp_id from `persisted_dp_id`
+/// and combines it with `managed.cp_base_url` — the register response
+/// is not available on this code path.
 ///
 /// Returns an error (not None) when the user has configured managed
 /// mode AND the bundle exists BUT the dp_id is unreadable — that's
@@ -2481,13 +2480,7 @@ fn load_heartbeat_config_from_disk(
         .ok_or_else(|| {
             anyhow::anyhow!("managed.cp_base_url must be set for heartbeat on subsequent boots")
         })?;
-    let dp_id = std::fs::read_to_string(&managed.dp_id_file)
-        .map_err(|e| anyhow::anyhow!("read dp_id from {}: {e}", managed.dp_id_file))?
-        .trim()
-        .to_string();
-    if dp_id.is_empty() {
-        anyhow::bail!("dp_id file {} is empty", managed.dp_id_file);
-    }
+    let dp_id = persisted_dp_id(managed)?;
     let url = heartbeat::heartbeat_url(base);
     Ok(heartbeat::HeartbeatConfig::sanitised(
         url,
@@ -2500,6 +2493,32 @@ fn load_heartbeat_config_from_disk(
             extra_ca_pem,
         },
     ))
+}
+
+/// Which data plane this is, on a boot that reuses a persisted bundle.
+///
+/// `managed.dp_id_file` defaults to a path outside `mtls_dir`, so a volume that
+/// persists only the bundle loses it. The client certificate in the bundle names
+/// the same id, so that loss costs nothing.
+fn persisted_dp_id(managed: &aisix_core::ManagedConfig) -> anyhow::Result<String> {
+    let sidecar = std::fs::read_to_string(&managed.dp_id_file);
+    if let Ok(dp_id) = &sidecar {
+        let dp_id = dp_id.trim();
+        if !dp_id.is_empty() {
+            return Ok(dp_id.to_string());
+        }
+    }
+    let cert_path = managed_bundle::client_cert_path(&managed.mtls_dir);
+    cert_bundle::dp_id_from_cert_file(&cert_path).map_err(|e| {
+        let sidecar = match sidecar {
+            Ok(_) => "is empty".to_string(),
+            Err(read) => format!("is unreadable ({read})"),
+        };
+        anyhow::anyhow!(
+            "dp_id file {} {sidecar}, and {cert_path:?} does not name one either: {e:#}",
+            managed.dp_id_file,
+        )
+    })
 }
 
 /// Register all bridge-backed provider implementations on a fresh
@@ -5538,29 +5557,67 @@ managed:
         );
     }
 
-    /// A first read against an etcd endpoint that accepts the TCP connection
-    /// and then says nothing must FAIL, not hang.
-    ///
-    /// `Client::connect` proves nothing here — etcd-client builds a
-    /// `balance_channel` and, with no auth configured, sends no request, so it
-    /// returns `Ok` against an endpoint that is not etcd at all. Connectivity
-    /// is first exercised by `load_all`, which is on the boot path; with no
-    /// connect timeout set that call had nothing bounding it.
-    ///
-    /// Drives the REAL options builder rather than a hand-made
-    /// `ConnectOptions`, because the wiring is what was wrong: the bounds used
-    /// to sit behind `needs_options`, so a plain no-auth no-TLS etcd — the
-    /// standalone default — got no options at all.
-    #[tokio::test]
-    async fn a_first_read_from_a_silent_etcd_fails_instead_of_hanging() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a free port");
-        let port = listener.local_addr().expect("read back the port").port();
-        std::thread::spawn(move || {
-            let mut held = Vec::new();
-            while let Ok((sock, _)) = listener.accept() {
-                held.push(sock);
-            }
-        });
+    fn leaf_naming_a_dp(dp_id: Option<&str>) -> String {
+        let mut params = rcgen::CertificateParams::default();
+        params.subject_alt_names = vec![rcgen::SanType::URI(
+            "x-aisix://env/env-1".to_string().try_into().unwrap(),
+        )];
+        if let Some(dp_id) = dp_id {
+            params.subject_alt_names.push(rcgen::SanType::URI(
+                format!("x-aisix://dp/{dp_id}").try_into().unwrap(),
+            ));
+        }
+        let key = rcgen::KeyPair::generate().unwrap();
+        params.self_signed(&key).unwrap().pem()
+    }
+
+    /// `dp_id_file` defaults to a path outside `mtls_dir`, so a volume holding
+    /// only the bundle loses it, and telemetry derives from this id: without
+    /// one a gateway would serve traffic that no usage record ever hears about.
+    #[test]
+    fn a_lost_dp_id_file_is_recovered_from_the_bundles_certificate() {
+        let dir = tempfile::tempdir().unwrap();
+        let dp_id_file = dir.path().join("dp_id");
+        let managed = aisix_core::ManagedConfig {
+            mtls_dir: dir.path().to_string_lossy().into_owned(),
+            dp_id_file: dp_id_file.to_string_lossy().into_owned(),
+            ..aisix_core::ManagedConfig::default()
+        };
+        std::fs::write(
+            managed_bundle::client_cert_path(&managed.mtls_dir),
+            leaf_naming_a_dp(Some("dp-in-cert")),
+        )
+        .unwrap();
+
+        assert_eq!(persisted_dp_id(&managed).unwrap(), "dp-in-cert", "missing");
+        std::fs::write(&dp_id_file, " \n").unwrap();
+        assert_eq!(persisted_dp_id(&managed).unwrap(), "dp-in-cert", "empty");
+        std::fs::write(&dp_id_file, "dp-in-file\n").unwrap();
+        assert_eq!(persisted_dp_id(&managed).unwrap(), "dp-in-file");
+    }
+
+    /// With neither source there is no id to report usage under, and the boot
+    /// must say so rather than go on without metering.
+    #[test]
+    fn no_dp_id_anywhere_is_an_error_naming_both_places() {
+        let dir = tempfile::tempdir().unwrap();
+        let managed = aisix_core::ManagedConfig {
+            mtls_dir: dir.path().to_string_lossy().into_owned(),
+            dp_id_file: dir.path().join("dp_id").to_string_lossy().into_owned(),
+            ..aisix_core::ManagedConfig::default()
+        };
+        std::fs::write(
+            managed_bundle::client_cert_path(&managed.mtls_dir),
+            leaf_naming_a_dp(None),
+        )
+        .unwrap();
+
+        let error = format!("{:#}", persisted_dp_id(&managed).unwrap_err());
+        assert!(error.contains("dp_id"), "{error}");
+        assert!(error.contains("client.crt"), "{error}");
+        assert!(error.contains("x-aisix://dp/"), "{error}");
+    }
+
     /// A connection that never says anything cannot keep the listener, and
     /// so the process, from finishing. Nothing else bounds one on the default
     /// config, which sets no idle timeout.
@@ -5584,6 +5641,29 @@ managed:
         assert!(served.is_ok(), "{served:?}");
     }
 
+    /// A first read against an etcd endpoint that accepts the TCP connection
+    /// and then says nothing must FAIL, not hang.
+    ///
+    /// `Client::connect` proves nothing here — etcd-client builds a
+    /// `balance_channel` and, with no auth configured, sends no request, so it
+    /// returns `Ok` against an endpoint that is not etcd at all. Connectivity
+    /// is first exercised by `load_all`, which is on the boot path; with no
+    /// connect timeout set that call had nothing bounding it.
+    ///
+    /// Drives the REAL options builder rather than a hand-made
+    /// `ConnectOptions`, because the wiring is what was wrong: the bounds used
+    /// to sit behind `needs_options`, so a plain no-auth no-TLS etcd — the
+    /// standalone default — got no options at all.
+    #[tokio::test]
+    async fn a_first_read_from_a_silent_etcd_fails_instead_of_hanging() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a free port");
+        let port = listener.local_addr().expect("read back the port").port();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept() {
+                held.push(sock);
+            }
+        });
 
         let cfg = aisix_core::config::EtcdConfig {
             endpoints: vec![format!("http://127.0.0.1:{port}")],

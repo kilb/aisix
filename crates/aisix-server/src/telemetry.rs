@@ -820,7 +820,7 @@ fn build_client(mtls: &MtlsBundle) -> anyhow::Result<reqwest::Client> {
 
     let ca = reqwest::Certificate::from_pem(&ca_pem).context("parse CA certificate")?;
 
-    let mut builder = aisix_gateway::client_builder()
+    let mut builder = aisix_gateway::control_plane_client_builder()
         .timeout(Duration::from_secs(10))
         .user_agent(format!("aisix-dp/{}", &*aisix_core::BUILD_VERSION))
         .identity(identity)
@@ -2469,6 +2469,7 @@ mod tests {
         assert_eq!(drops_with_reason(&metrics, DROP_SEND_FAILED), 4);
         assert_eq!(drops_with_reason(&metrics, DROP_RETRY_BUDGET_EXHAUSTED), 0);
     }
+
     /// One deadline for the whole drain, not one timeout per batch. A control
     /// plane that stops answering is what fills the queue, and the exit must
     /// still happen before the platform kills it, with what it could not send
@@ -2520,7 +2521,6 @@ mod tests {
         );
         assert!(tx.is_closed());
     }
-
 
     /// `managed.cp_base_url` may carry a password. It is used as configured
     /// and displayed nowhere: not in `Debug`, the startup line, or the text of

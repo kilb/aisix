@@ -81,8 +81,8 @@ pub use upstream_headers::{
     UpstreamHeaderContext,
 };
 pub use upstream_http::{
-    build_client_or_default, client_builder, error_with_causes, json_body, log_body_read_causes,
-    redact_url_for_log, send_error, transport_error_message, upstream_body_read_error,
-    UpstreamHttpConfig,
+    build_client_or_default, client_builder, control_plane_client_builder, error_with_causes,
+    json_body, log_body_read_causes, redact_url_for_log, send_error, transport_error_message,
+    upstream_body_read_error, UpstreamHttpConfig,
 };
 pub use upstream_tls::TlsSettings;
