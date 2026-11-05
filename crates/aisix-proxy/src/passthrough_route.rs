@@ -1109,6 +1109,7 @@ async fn dispatch(
         captured_prompt,
         content_cap: content_cap.map(|c| c as usize),
         response_text: String::new(),
+        response_capture_safe: true,
         guardrail_blocked: false,
         emitted: false,
     };
@@ -4188,11 +4189,6 @@ fn path_is_within_base(candidate: &str, base: &str) -> bool {
 // Streaming relay
 // ---------------------------------------------------------------------------
 
-/// Default cap on bytes buffered while waiting for one SSE frame terminator.
-/// A hold-back policy instead derives its splitter cap from its own raw-byte
-/// limit, so an unterminated frame cannot outgrow the bytes it may hold.
-const MAX_HELD_STREAM_BYTES: usize = 1024 * 1024;
-
 /// Bound independently scanned output candidates even when an upstream never
 /// emits its terminal item event. Two source branches (first/last) are kept
 /// for each identity; supplemental values consume the same budget so one
@@ -6048,6 +6044,13 @@ fn anthropic_stream_frame(frame: &[u8]) -> Option<bool> {
     }
 }
 
+/// What aborts a relayed response whose upstream failed after the head went out.
+/// The relay forwards bytes and has no in-band error frame of its own, so the
+/// caller learns it the way a native relay's does: the body ends in an error.
+fn upstream_cut_error() -> std::io::Error {
+    std::io::Error::other("upstream stream failed")
+}
+
 /// Wait until a distributed stream-concurrency renewal proves that this
 /// stream's member has disappeared from Redis. A backend outage is
 /// deliberately not a signal: rate limiting remains fail-open when Redis
@@ -6089,6 +6092,7 @@ fn stream_opaque_response(
             stream_read_timeout,
             read_timeout.clone(),
         ));
+        let mut upstream_failed = false;
         loop {
             let chunk = tokio::select! {
                 biased;
@@ -6121,7 +6125,7 @@ fn stream_opaque_response(
                                 .push_str(&String::from_utf8_lossy(&chunk[..chunk.len().min(room)]));
                         }
                     }
-                    yield Ok::<_, std::convert::Infallible>(chunk);
+                    yield Ok::<_, std::io::Error>(chunk);
                 }
                 Err(err) => {
                     let bridge = if status.is_success() {
@@ -6135,6 +6139,7 @@ fn stream_opaque_response(
                         error = %telemetry.error_message,
                         "passthrough-route opaque SSE relay failed mid-stream",
                     );
+                    upstream_failed = true;
                     break;
                 }
             }
@@ -6146,9 +6151,13 @@ fn stream_opaque_response(
                 error = %telemetry.error_message,
                 "passthrough-route opaque SSE relay timed out mid-stream",
             );
+            upstream_failed = true;
         }
         telemetry.stream_reached_end = true;
         telemetry.emit();
+        if upstream_failed {
+            yield Err(upstream_cut_error());
+        }
     };
 
     let mut response = Response::builder()
@@ -6193,6 +6202,7 @@ fn stream_response(
     } else {
         chain.stream_output_policy()
     };
+    telemetry.response_capture_safe = !output_guardrail_active;
     let route_name = telemetry.route_name.clone();
     let capture_cap = telemetry.content_cap;
     // A hold-back policy derives its cap from its own raw-byte limit, so an
@@ -6251,6 +6261,7 @@ fn stream_response(
         // Degrades a hold-back policy to live forwarding after a fail-open cap hit.
         let mut fail_opened = false;
         let mut blocked = false;
+        let mut upstream_failed = false;
         // The chat envelope also carries Anthropic Messages streams; the
         // first frame that says which one decides the refusal frame's shape.
         let mut anthropic: Option<bool> = None;
@@ -6278,6 +6289,7 @@ fn stream_response(
                         error = %telemetry.error_message,
                         "passthrough-route upstream stream failed mid-relay",
                     );
+                    upstream_failed = true;
                     break;
                 }
                 None => break,
@@ -6463,7 +6475,7 @@ fn stream_response(
                 match &policy {
                     _ if fail_opened => {
                         telemetry.mark_first_delivery();
-                        yield Ok::<_, std::convert::Infallible>(frame);
+                        yield Ok::<_, std::io::Error>(frame);
                     }
                     StreamOutputPolicy::EndOfStreamCheck => {
                         if let Some(text) = guardrail_text.as_ref().filter(|_| !unevaluable_output) {
@@ -6651,6 +6663,7 @@ fn stream_response(
                 error = %telemetry.error_message,
                 "passthrough-route upstream stream timed out mid-relay",
             );
+            upstream_failed = true;
         }
 
         if !blocked {
@@ -6956,6 +6969,7 @@ fn stream_response(
                         }
                     }
                 }
+                telemetry.response_capture_safe = !scan_budget_exhausted && !live_scan_outgrown;
             }
             for f in pending.drain(..) {
                 telemetry.mark_first_delivery();
@@ -6970,6 +6984,11 @@ fn stream_response(
         // unset, and the emit turns that into a 499.
         telemetry.stream_reached_end = true;
         telemetry.emit();
+        // What was scanned was delivered, and the caller still has to learn
+        // the response is incomplete: a clean end would read as a whole answer.
+        if upstream_failed && !blocked {
+            yield Err(upstream_cut_error());
+        }
     };
 
     // Re-attach the request span (the body is polled after the request-id
@@ -7183,6 +7202,10 @@ struct RouteTelemetry {
     captured_prompt: Option<String>,
     content_cap: Option<usize>,
     response_text: String,
+    /// Whether `response_text` may reach an exporter: no scan is owed on it, or
+    /// the one that was has read all of it and let it through. A streamed relay
+    /// under an output chain starts false.
+    response_capture_safe: bool,
     guardrail_blocked: bool,
     emitted: bool,
 }
@@ -7223,6 +7246,9 @@ impl RouteTelemetry {
             return;
         }
         self.guardrail_blocked = true;
+        // What the refusal stopped stays out of the export with it.
+        self.response_capture_safe = false;
+        self.response_text.clear();
         self.error_class = crate::attempt::GUARDRAIL_BLOCK_CLASS.to_string();
         self.error_message =
             crate::attempt::StreamRefusal::new(guardrail_name, unavailable).error_message;
@@ -7480,12 +7506,18 @@ impl RouteTelemetry {
 
         // Captured content rides ONLY on the exporter fan-out, per the
         // content_mode invariant (never the CP telemetry path).
+        // A check that failed open read none of the text either.
+        let response_text = if self.response_capture_safe
+            && crate::usage_attr::bypass_reason(&self.audit).is_empty()
+        {
+            self.response_text.as_str()
+        } else {
+            ""
+        };
         let content = match (&self.captured_prompt, self.content_cap) {
-            (Some(prompt), Some(cap)) => Some(aisix_obs::CapturedContent::new(
-                prompt,
-                &self.response_text,
-                cap,
-            )),
+            (Some(prompt), Some(cap)) => {
+                Some(aisix_obs::CapturedContent::new(prompt, response_text, cap))
+            }
             _ => None,
         };
         crate::usage_attr::emit_usage(
@@ -12008,6 +12040,129 @@ data: [DONE]\n\n";
             .unwrap();
         assert_eq!(event.prompt_tokens, 123_456);
         assert_eq!(event.completion_tokens, 7_890);
+    }
+
+    fn relay_request(path: &str) -> Request<axum::body::Body> {
+        Request::builder()
+            .method("POST")
+            .uri(path)
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                serde_json::json!({"model": "x", "stream": true,
+                    "messages": [{"role": "user", "content": "hi"}]})
+                .to_string(),
+            ))
+            .unwrap()
+    }
+
+    /// What a refusal stopped never reached the caller, and it must not reach
+    /// an exporter either: the buffered path leaves it out, and so does a chat
+    /// stream.
+    #[tokio::test]
+    async fn a_blocked_stream_exports_no_text_of_what_it_stopped() {
+        let upstream = MockServer::builder().start().await;
+        Mock::given(wm_method("POST"))
+            .and(wm_path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(OPENAI_SSE.to_owned(), "text/event-stream"),
+            )
+            .mount(&upstream)
+            .await;
+        let snap = AisixSnapshot::new();
+        snap.provider_keys
+            .insert(provider_key_entry("http://unused"));
+        snap.apikeys.insert(apikey_entry("sk-caller", Some(&["*"])));
+        snap.passthrough_routes
+            .insert(inject_route(&upstream.uri()));
+        let g: aisix_core::Guardrail = serde_json::from_str(OUTPUT_KEYWORD_BLOCK).unwrap();
+        crate::seed_env_scoped_guardrail(&snap, ResourceEntry::new("g-1", g, 1));
+        let collector = crate::seed_full_content_collector(&snap).await;
+        let resp = build_app(snap)
+            .oneshot(relay_request("/passthrough/openai/v1/chat/completions"))
+            .await
+            .unwrap();
+        let (parts, body) = resp.into_parts();
+        let wire = to_bytes(body, 1 << 20).await.unwrap();
+        assert!(!String::from_utf8_lossy(&wire).contains("FORBIDDEN"));
+        let head = axum::response::Response::from_parts(parts, axum::body::Body::empty());
+        let exported = crate::exported_for(&collector, &head).await;
+        assert!(!exported.contains("FORBIDDEN"), "{exported}");
+    }
+
+    /// What was scanned clean is what the caller got, so it is exported.
+    #[tokio::test]
+    async fn a_clean_guarded_stream_exports_its_text() {
+        let upstream = MockServer::builder().start().await;
+        let sse = OPENAI_SSE.replace("say FORBIDDEN now", "a clean answer");
+        Mock::given(wm_method("POST"))
+            .and(wm_path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(sse, "text/event-stream"))
+            .mount(&upstream)
+            .await;
+        let snap = AisixSnapshot::new();
+        snap.provider_keys
+            .insert(provider_key_entry("http://unused"));
+        snap.apikeys.insert(apikey_entry("sk-caller", Some(&["*"])));
+        snap.passthrough_routes
+            .insert(inject_route(&upstream.uri()));
+        let g: aisix_core::Guardrail = serde_json::from_str(OUTPUT_KEYWORD_BLOCK).unwrap();
+        crate::seed_env_scoped_guardrail(&snap, ResourceEntry::new("g-1", g, 1));
+        let collector = crate::seed_full_content_collector(&snap).await;
+        let resp = build_app(snap)
+            .oneshot(relay_request("/passthrough/openai/v1/chat/completions"))
+            .await
+            .unwrap();
+        let (parts, body) = resp.into_parts();
+        let _ = to_bytes(body, 1 << 20).await.unwrap();
+        let head = axum::response::Response::from_parts(parts, axum::body::Body::empty());
+        let exported = crate::exported_for(&collector, &head).await;
+        assert!(exported.contains("a clean answer"), "{exported}");
+    }
+
+    /// An upstream cut off mid-answer must not read as a whole answer: the body
+    /// ends in an error, after what was relayed so far.
+    #[tokio::test]
+    async fn an_upstream_cut_off_mid_stream_fails_the_relayed_body() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut req = vec![0u8; 65536];
+            let _ = sock.read(&mut req).await;
+            let body = "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"half an ans\"},\"finish_reason\":null}]}\n\n";
+            let head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n{:x}\r\n{body}\r\n",
+                body.len(),
+            );
+            sock.write_all(head.as_bytes()).await.unwrap();
+            sock.flush().await.unwrap();
+            // Gone in the middle of the chunked body.
+        });
+        let snap = AisixSnapshot::new();
+        snap.provider_keys
+            .insert(provider_key_entry("http://unused"));
+        snap.apikeys.insert(apikey_entry("sk-caller", Some(&["*"])));
+        snap.passthrough_routes
+            .insert(inject_route(&format!("http://{addr}")));
+        let resp = build_app(snap)
+            .oneshot(relay_request("/passthrough/openai/v1/chat/completions"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let mut body = resp.into_body().into_data_stream();
+        let mut received = Vec::new();
+        let mut failed = false;
+        use futures::StreamExt;
+        while let Some(item) = body.next().await {
+            match item {
+                Ok(bytes) => received.extend_from_slice(&bytes),
+                Err(_) => failed = true,
+            }
+        }
+        assert!(String::from_utf8_lossy(&received).contains("half an ans"));
+        assert!(failed, "the caller must learn the answer is incomplete");
     }
 
     /// A refusal ending a relayed Anthropic Messages stream is the frame

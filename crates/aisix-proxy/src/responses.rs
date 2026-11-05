@@ -4691,6 +4691,10 @@ where
             .unwrap_or(0)
             .max(crate::token_estimate::OUTPUT_ACCUMULATION_CAP),
     });
+    // Only a scan that was owed can make a partial capture unsafe. An unguarded
+    // stream's export is what the caller received, cut at the exporter's cap
+    // like any other.
+    let scan_owed = eos_scan.is_some();
     // Re-attach the request span: the body is polled after the request-id
     // middleware returns, so the end-of-stream output-guardrail scan
     // (`EosOutputScan::observe`) would otherwise log without a
@@ -4783,10 +4787,13 @@ where
                      restamp skipped)"
                 );
                 forward.append(&mut buf);
-                state.capture_safe = false;
+                scanned = 0;
+                if scan_owed {
+                    state.capture_safe = false;
+                }
                 released_unparsed = true;
             }
-            if state.capture.as_ref().is_some_and(|capture| capture.truncated) {
+            if scan_owed && state.capture.as_ref().is_some_and(|capture| capture.truncated) {
                 state.capture_safe = false;
             }
             // Nothing completed yet — keep reading rather than yielding an
@@ -4934,7 +4941,7 @@ where
         };
         if let Some((f, state)) = guard.slot.take() {
             let capture_safe = state.capture_safe
-                && !state.capture.as_ref().is_some_and(|capture| capture.truncated);
+                && !(scan_owed && state.capture.as_ref().is_some_and(|capture| capture.truncated));
             f(
                 state.usage.unwrap_or_default(),
                 state
@@ -6567,6 +6574,42 @@ mod tests {
         assert!(!event.usage_estimated);
     }
 
+    /// With no output chain nothing is owed, so an answer longer than the
+    /// accumulator exports what it kept, cut at the cap like chat's.
+    #[tokio::test]
+    async fn an_unguarded_stream_past_the_accumulator_cap_keeps_its_capture() {
+        let big = "x".repeat(crate::token_estimate::OUTPUT_ACCUMULATION_CAP + 1024);
+        let frames = format!(
+            "data: {}\n\ndata: {}\n\n",
+            serde_json::json!({"type": "response.output_text.delta", "delta": big}),
+            serde_json::json!({
+                "type": "response.completed",
+                "response": {"usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}},
+            }),
+        );
+        let upstream = futures::stream::iter([Ok::<_, crate::stream_timeout::RawStreamError>(
+            bytes::Bytes::from(frames),
+        )]);
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let seen_out = Arc::clone(&seen);
+        let stream = super::build_responses_passthrough_stream(
+            upstream,
+            std::time::Instant::now(),
+            std::time::Instant::now(),
+            None,
+            Some(64),
+            None,
+            true,
+            "m".to_string(),
+            crate::responses_affinity::ResponseMark::default(),
+            move |_, text, _, safe, _| {
+                *seen_out.lock().unwrap() = Some((text, safe));
+            },
+        );
+        let _: Vec<_> = futures::StreamExt::collect(stream).await;
+        let (text, safe) = seen.lock().unwrap().take().expect("completed");
+        assert!(safe, "no scan was owed");
+        assert!(!text.is_empty());
     }
 
     /// The same tail, but ending in ONE newline — a provider that wrote half
