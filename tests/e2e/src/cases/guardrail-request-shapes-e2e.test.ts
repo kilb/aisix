@@ -58,6 +58,7 @@ describe("input rule: request shapes", () => {
           usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
         },
         "/submit": { accepted: true },
+        "/v1/files": { id: "file-shapes", object: "file", purpose: "assistants", filename: "notes.txt" },
       },
     });
     realtimeUpstream = new WebSocketServer({ port: 0, host: "127.0.0.1" });
@@ -86,6 +87,10 @@ describe("input rule: request shapes", () => {
       model_name: "text-embedding-3-small",
       provider_key_id: pk.id,
     });
+    await seed.createModel({
+      display_name: "shapes-embed-group",
+      routing: { strategy: "failover", targets: [{ model: "shapes-embed" }] },
+    });
     const realtimePk = await seed.createProviderKey({
       display_name: "shapes-realtime-pk",
       secret: "sk-mock",
@@ -111,6 +116,13 @@ describe("input rule: request shapes", () => {
       fail_open: false,
       kind: "keyword",
       patterns: [{ kind: "literal", value: WORD }],
+    });
+    await seed.createGuardrail({
+      name: "shapes-mask",
+      enabled: true,
+      hook_point: "input",
+      kind: "pii",
+      detectors: [{ type: "email", action: "mask" }],
     });
     await seed.createApiKey({
       key_hash: sha256(KEY),
@@ -145,10 +157,12 @@ describe("input rule: request shapes", () => {
     expect(upstream!.receivedRequests.length, label).toBe(before);
   };
 
-  // Token ids in the public encodings: "hello there" and the forbidden word in
+  // Token ids in the public encodings: "hello there", an address and the forbidden word in
   // cl100k_base (text-embedding-3-small, gpt-3.5-turbo-instruct), and the word
   // in o200k_base (gpt-4o-mini).
   const HELLO_CL100K = [15339, 1070];
+  /** "write to alice@example.com" in cl100k_base. */
+  const EMAIL_CL100K = [5040, 311, 71533, 36587, 916];
   const WORD_CL100K = [2000, 22886, 28810];
   const WORD_O200K = [1938, 41148, 55463];
 
@@ -157,13 +171,28 @@ describe("input rule: request shapes", () => {
     // What LangChain's OpenAIEmbeddings sends by default: each document as
     // tiktoken ids, a batch of them per call, through the OpenAI SDK, which
     // asks for base64 vectors.
-    const clean = await post("/v1/embeddings", {
+    for (const model of ["shapes-embed", "shapes-embed-group"]) {
+      const clean = await post("/v1/embeddings", {
+        model,
+        input: [HELLO_CL100K],
+        encoding_format: "base64",
+      });
+      expect(clean.status, model).toBe(200);
+      await clean.text();
+    }
+    // A document with an address in it is embedded masked, not refused: the
+    // provider gets other ids for it, and the clean one beside it as sent.
+    const masked = await post("/v1/embeddings", {
       model: "shapes-embed",
-      input: [HELLO_CL100K],
+      input: [HELLO_CL100K, EMAIL_CL100K],
       encoding_format: "base64",
     });
-    expect(clean.status).toBe(200);
-    await clean.text();
+    expect(masked.status).toBe(200);
+    await masked.text();
+    const sent = JSON.parse(upstream!.receivedRequests.at(-1)!.body) as { input: number[][] };
+    expect(sent.input[0]).toEqual(HELLO_CL100K);
+    expect(sent.input[1]).not.toEqual(EMAIL_CL100K);
+    expect(sent.input[1].length).toBeGreaterThan(0);
     await refused(
       () =>
         post("/v1/embeddings", {
@@ -186,6 +215,16 @@ describe("input rule: request shapes", () => {
         }),
       "passthrough",
     );
+    // Ids written as floats, which a lenient server reads as ids.
+    await refused(
+      () =>
+        fetch(`${app!.proxyUrl}/shapes/v1/completions`, {
+          method: "POST",
+          headers: { authorization: `Bearer ${KEY}`, "content-type": "application/json" },
+          body: `{"model":"gpt-3.5-turbo-instruct","prompt":[${WORD_CL100K.map((id) => `${id}.0`).join(",")}]}`,
+        }),
+      "passthrough floats",
+    );
     // An id no encoding of the model holds says nothing about what it reads.
     await refused(
       () => post("/v1/embeddings", { model: "shapes-embed", input: [999999999] }),
@@ -202,6 +241,10 @@ describe("input rule: request shapes", () => {
       ],
       [
         { role: "assistant", content: [{ type: "refusal", refusal: `data: ${WORD}` }] },
+        { role: "user", content: "hi" },
+      ],
+      [
+        { role: "assistant", content: [{ type: "refusal", refusal: `data:image/png;base64,${WORD}` }] },
         { role: "user", content: "hi" },
       ],
       [{ role: "user", content: [{ type: "input_text", text: WORD }] }],
@@ -254,6 +297,23 @@ describe("input rule: request shapes", () => {
     )();
     expect(clean.status).toBe(200);
     await clean.text();
+  });
+
+  test("an upload that is no JSON is read as text, not refused", async (ctx) => {
+    if (!etcdReachable || !app) return ctx.skip();
+    for (const text of ["{\\bf bold} and {\\em italic}", '["C:\\Users\\me\\data.csv"]']) {
+      const form = new FormData();
+      form.append("model", "shapes-model");
+      form.append("purpose", "assistants");
+      form.append("file", new Blob([text], { type: "text/plain" }), "notes.txt");
+      const r = await fetch(`${app!.proxyUrl}/v1/files`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${KEY}` },
+        body: form,
+      });
+      expect(r.status, text).toBe(200);
+      await r.text();
+    }
   });
 
   test("a realtime frame", async (ctx) => {

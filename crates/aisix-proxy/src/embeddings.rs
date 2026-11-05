@@ -141,7 +141,7 @@ impl InputField {
 /// request is never sent upstream (the original `input` shape is forwarded
 /// verbatim).
 /// `decoded` is the text token-id input decodes to
-/// ([`crate::token_estimate::decode_token_ids`]); a text input ignores it.
+/// ([`crate::token_estimate::TokenEncoding`]); a text input ignores it.
 fn embeddings_input_to_chat(model: &str, input: &InputField, decoded: &[String]) -> ChatFormat {
     let items = match input {
         InputField::Single(s) => std::slice::from_ref(s),
@@ -572,9 +572,10 @@ async fn dispatch(
         InputField::TokenArrays(arrays) => Some(arrays.clone()),
         InputField::Single(_) | InputField::Multi(_) => None,
     };
-    let decoded = token_arrays.as_deref().map(|arrays| {
-        crate::token_estimate::decode_token_ids(model_entry.value.model_name.as_deref(), arrays)
-    });
+    let encoding = crate::token_estimate::TokenEncoding::for_entry(snapshot, &model_entry.value);
+    let decoded = token_arrays
+        .as_deref()
+        .map(|arrays| encoding.and_then(|encoding| encoding.decode(arrays)));
     if matches!(decoded, Some(None)) && !resolved_chain.is_empty() {
         if aisix_guardrails::Guardrail::refuses_unevaluable_input(&resolved_chain) {
             return Err(crate::error::guardrail_block_error(
@@ -631,18 +632,29 @@ async fn dispatch(
         }
     }
 
-    // Ids cannot be rewritten, so a mask rule that would rewrite their text
-    // refuses the request.
-    if crate::redact::mask_would_rewrite(&resolved_chain, &decoded) {
-        crate::usage_attr::note_failure_request(snapshot, String::new);
-        return Err(crate::error::guardrail_block_error("request", None, None));
-    }
-
     // #932: mask-action PII rules rewrite the embeddings input in place
     // AFTER the block check passes — the masked text is what gets embedded,
-    // so the matched values never reach the provider.
+    // so the matched values never reach the provider. Token ids are sent as
+    // the ids of their masked text.
     let mut redactions = crate::redact::RedactionCounts::new();
     mask_input(&resolved_chain, &mut body.input, &mut redactions);
+    if let (Some(encoding), Some(mut arrays)) =
+        (encoding.filter(|_| !decoded.is_empty()), token_arrays)
+    {
+        crate::redact::mask_token_ids(
+            &resolved_chain,
+            encoding,
+            &mut arrays,
+            &decoded,
+            &mut redactions,
+        );
+        body.input = match body.input {
+            InputField::Tokens(_) => {
+                InputField::Tokens(arrays.into_iter().next().unwrap_or_default())
+            }
+            _ => InputField::TokenArrays(arrays),
+        };
+    }
     // A failure row reports the masked text, and nothing when a check failed
     // open: the success path's capture withholds that request too.
     crate::usage_attr::release_failure_request();
@@ -1624,11 +1636,13 @@ mod tests {
             .collect()
     }
 
-    /// Token ids are read as the text they decode to: a blocked word in them
-    /// is refused, clean ones go through, and a mask rule's match refuses since
-    /// ids cannot be rewritten. Ids this gateway cannot decode, out of the
-    /// encoding's range or for a model whose encoding it does not know, are
-    /// refused under a chain that fails closed.
+    /// Token ids are read as the text they decode to, on a direct model and on
+    /// a group whose targets share an encoding: a blocked word in them is
+    /// refused, clean ones go through, and a mask rule's match is sent as the
+    /// ids of the masked text. Ids this gateway cannot decode, out of the
+    /// encoding's range, for a model whose encoding it does not know, or for a
+    /// group whose targets disagree, are refused under a chain that fails
+    /// closed.
     #[tokio::test]
     async fn token_ids_are_read_as_the_text_they_decode_to() {
         let upstream = MockServer::builder().start().await;
@@ -1644,6 +1658,24 @@ mod tests {
         ))
         .unwrap();
         snap.models.insert(ResourceEntry::new("m-bge", unknown, 1));
+        // A group reads ids in the encoding its targets share, and in none
+        // when they disagree.
+        let group = |name: &str, targets: serde_json::Value| -> ResourceEntry<Model> {
+            let m: Model = serde_json::from_value(serde_json::json!({
+                "display_name": name,
+                "routing": {"strategy": "failover", "targets": targets},
+            }))
+            .unwrap();
+            ResourceEntry::new(format!("m-{name}"), m, 1)
+        };
+        snap.models.insert(group(
+            "embed-group",
+            serde_json::json!([{"model": "my-embed"}]),
+        ));
+        snap.models.insert(group(
+            "mixed-group",
+            serde_json::json!([{"model": "my-embed"}, {"model": "bge"}]),
+        ));
         snap.apikeys.insert(apikey_entry(&["*"]));
         crate::seed_env_scoped_guardrail(&snap, keyword_input_guardrail("BLOCKME"));
         let mask: aisix_core::Guardrail = serde_json::from_value(serde_json::json!({
@@ -1661,22 +1693,50 @@ mod tests {
             tower::ServiceExt::oneshot(app.clone(), make_req(body))
         };
         let clean = serde_json::json!([cl100k("what the gateway reads")]);
-        let resp = send("my-embed", clean.clone()).await.unwrap();
+        for model in ["my-embed", "embed-group"] {
+            let resp = send(model, clean.clone()).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{model}");
+        }
+        // A mask rule's match is sent as the ids of the masked text, and the
+        // clean document beside it as it came.
+        let batch = serde_json::json!([cl100k("clean"), cl100k("write to alice@example.com")]);
+        let resp = send("my-embed", batch).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let forwarded = upstream.received_requests().await.unwrap().len();
-        assert_eq!(forwarded, 1);
+        let sent = upstream.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&sent.last().unwrap().body).unwrap();
+        let ids = |v: &serde_json::Value| -> Vec<u32> {
+            v.as_array()
+                .unwrap()
+                .iter()
+                .map(|id| id.as_u64().unwrap() as u32)
+                .collect()
+        };
+        let decode = |v: &serde_json::Value| {
+            String::from_utf8(
+                tiktoken_rs::cl100k_base_singleton()
+                    .decode_bytes(&ids(v))
+                    .unwrap(),
+            )
+            .unwrap()
+        };
+        assert_eq!(decode(&body["input"][0]), "clean");
+        let masked = decode(&body["input"][1]);
+        assert!(
+            masked.starts_with("write to ") && !masked.contains("alice@example.com"),
+            "{masked}"
+        );
+        let forwarded = sent.len();
+        assert_eq!(forwarded, 3);
         for (model, input) in [
             ("my-embed", serde_json::json!(cl100k("please BLOCKME now"))),
             (
                 "my-embed",
                 serde_json::json!([cl100k("clean"), cl100k("BLOCKME")]),
             ),
-            (
-                "my-embed",
-                serde_json::json!([cl100k("write to alice@example.com")]),
-            ),
+            ("embed-group", serde_json::json!([cl100k("BLOCKME")])),
             ("my-embed", serde_json::json!([999_999_999u64])),
             ("bge", clean.clone()),
+            ("mixed-group", clean.clone()),
         ] {
             let resp = send(model, input.clone()).await.unwrap();
             assert_eq!(

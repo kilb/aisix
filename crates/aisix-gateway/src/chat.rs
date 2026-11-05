@@ -217,12 +217,29 @@ fn part_has_named_slots(part: &Value) -> bool {
 }
 
 /// A `data:` URL carrying media bytes, `data:<type>;base64,<bytes>` (RFC 2397),
-/// which no model reads as text. Anything else that merely starts with `data:`
-/// is text a caller wrote, and a `text/*` payload is text however it is coded.
+/// which no model reads as text: well formed, and its payload strict base64 with
+/// nothing else in it. Anything else that starts with `data:` is text a caller
+/// wrote, and a `text/*` payload is text however it is coded.
 fn is_media_data_url(text: &str) -> bool {
     text.strip_prefix("data:")
         .and_then(|rest| rest.split_once(','))
-        .is_some_and(|(meta, _)| meta.ends_with(";base64") && !meta.starts_with("text/"))
+        .is_some_and(|(meta, payload)| {
+            meta.ends_with(";base64") && !meta.starts_with("text/") && is_strict_base64(payload)
+        })
+}
+
+/// Standard base64 with its padding and no other byte: no whitespace, no
+/// punctuation, no text.
+fn is_strict_base64(payload: &str) -> bool {
+    let bytes = payload.as_bytes();
+    if bytes.is_empty() || !bytes.len().is_multiple_of(4) {
+        return false;
+    }
+    let padding = bytes.iter().rev().take_while(|&&b| b == b'=').count();
+    padding <= 2
+        && bytes[..bytes.len() - padding]
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/'))
 }
 
 /// Every string of a content part no named slot covers, and a bridge that

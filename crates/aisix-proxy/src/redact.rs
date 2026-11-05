@@ -4816,17 +4816,26 @@ pub async fn moderate_responses_sse(
     .await
 }
 
-/// Whether a mask rule of `chain` would rewrite any of `texts`, the text that
-/// token-id input decodes to. Ids cannot be written back, so such a match
-/// refuses the request as a block does.
-pub(crate) fn mask_would_rewrite(
+/// Token-id input through `chain`'s mask rules: an array whose decoded text a
+/// rule rewrites is sent back as the ids of the masked text, in the encoding it
+/// was read in, as a string input is sent masked. `decoded` is `arrays`'
+/// text, in order.
+pub(crate) fn mask_token_ids(
     chain: &aisix_guardrails::GuardrailChain,
-    texts: &[String],
-) -> bool {
-    aisix_guardrails::Guardrail::redacts_input(chain)
-        && texts
-            .iter()
-            .any(|text| aisix_guardrails::Guardrail::redact_input_text(chain, text).is_some())
+    encoding: crate::token_estimate::TokenEncoding,
+    arrays: &mut [Vec<u64>],
+    decoded: &[String],
+    redactions: &mut RedactionCounts,
+) {
+    if !aisix_guardrails::Guardrail::redacts_input(chain) {
+        return;
+    }
+    for (ids, text) in arrays.iter_mut().zip(decoded) {
+        if let Some(r) = aisix_guardrails::Guardrail::redact_input_text(chain, text) {
+            *ids = encoding.encode(&r.text);
+            merge_counts(redactions, r.counts);
+        }
+    }
 }
 
 #[cfg(test)]

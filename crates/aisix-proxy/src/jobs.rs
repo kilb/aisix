@@ -144,6 +144,12 @@ pub(crate) fn encode_routed_id(raw: &str, model: &str, owner: Option<(&str, &str
 /// reads an id cannot re-issue it under another owner. Rotating that secret
 /// invalidates the owned ids it sealed: their owners find them gone, as an id
 /// minted anywhere else.
+///
+/// The seal is exactly as strong as that secret. A provider key whose upstream
+/// needs no key and holds a placeholder (`EMPTY`, `sk-local`) gives no
+/// protection: whoever guesses the placeholder seals ids for any owner. A
+/// provider key that serves the jobs surface to keys with an owner needs a
+/// secret nobody can guess.
 fn owner_tag(secret: &str, raw: &str, owner: &str) -> String {
     let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, secret.as_bytes());
     URL_SAFE_NO_PAD.encode(ring::hmac::sign(&key, &owner_tag_message(raw, owner)))
@@ -223,8 +229,9 @@ fn job_owner(auth: &AuthenticatedKey) -> Option<String> {
 /// `raw` came in, `None` for a provider's raw id.
 ///
 /// - A key with an owner reaches only ids sealed for it on this provider key.
-/// - A key without one reaches unowned gateway ids, and a raw id only where no
-///   key with an owner can reach this provider key ([`pk_serves_owned_keys`]).
+/// - A key without one reaches unowned ids: sealed as unowned where a key with
+///   an owner can reach this provider key ([`pk_serves_owned_keys`]), and
+///   unsealed ones and raw ids only where none can.
 fn require_job_owner(
     auth: &AuthenticatedKey,
     snapshot: &aisix_core::AisixSnapshot,
@@ -241,7 +248,16 @@ fn require_job_owner(
                     .is_some_and(|tag| owner_tag_matches(&target.secret, raw, &mine, tag))
         }
         (Some(_), None) => false,
-        (None, Some(id)) => id.owner.is_none(),
+        // Where owned keys share the provider key, an unowned id must carry
+        // the seal: an unsealed one is anyone's to write around a raw id.
+        (None, Some(id)) => match id.owner.as_deref() {
+            None => !pk_serves_owned_keys(snapshot, &target.pk_entry.id),
+            Some(UNOWNED_SEAL) => id
+                .tag
+                .as_deref()
+                .is_some_and(|tag| owner_tag_matches(&target.secret, raw, UNOWNED_SEAL, tag)),
+            Some(_) => false,
+        },
         (None, None) => !pk_serves_owned_keys(snapshot, &target.pk_entry.id),
     };
     if reachable {
@@ -269,25 +285,70 @@ fn require_job_list(
 /// Whether a key with a team or user can reach a model on the provider key
 /// `pk_id`, so that the provider's account holds owned resources.
 fn pk_serves_owned_keys(snapshot: &aisix_core::AisixSnapshot, pk_id: &str) -> bool {
-    let models: Vec<String> = snapshot
-        .models
-        .entries()
-        .iter()
-        .filter(|m| m.value.provider_key_id.as_deref() == Some(pk_id))
-        .map(|m| m.value.display_name.clone())
-        .collect();
-    let has = |id: &Option<String>| id.as_deref().is_some_and(|id| !id.is_empty());
-    snapshot.apikeys.entries().iter().any(|entry| {
-        let key = &entry.value;
-        (has(&key.team_id) || has(&key.user_id))
-            && models.iter().any(|model| key.can_access(snapshot, model))
-    })
+    provider_keys_serving_owned_keys(snapshot).contains(pk_id)
 }
 
+/// The provider keys some key with a team or user can reach a model on,
+/// computed once per change of the models or keys table rather than walking
+/// keys times models on every jobs request. Keyed on the tables' generations,
+/// which are unique process-wide, so one cache serves every snapshot.
+fn provider_keys_serving_owned_keys(
+    snapshot: &aisix_core::AisixSnapshot,
+) -> Arc<std::collections::HashSet<String>> {
+    type Cached = Option<((u64, u64), Arc<std::collections::HashSet<String>>)>;
+    static CACHE: std::sync::Mutex<Cached> = std::sync::Mutex::new(None);
+    let key = (snapshot.models.generation(), snapshot.apikeys.generation());
+    let mut cache = CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some((cached, set)) = cache.as_ref() {
+        if *cached == key {
+            return Arc::clone(set);
+        }
+    }
+    let has = |id: &Option<String>| id.as_deref().is_some_and(|id| !id.is_empty());
+    let owned: Vec<_> = snapshot
+        .apikeys
+        .entries()
+        .into_iter()
+        .filter(|entry| has(&entry.value.team_id) || has(&entry.value.user_id))
+        .collect();
+    let mut set = std::collections::HashSet::new();
+    for model in snapshot.models.entries() {
+        let Some(pk) = model.value.provider_key_id.as_deref() else {
+            continue;
+        };
+        if !set.contains(pk)
+            && owned
+                .iter()
+                .any(|key| key.value.can_access(snapshot, &model.value.display_name))
+        {
+            set.insert(pk.to_string());
+        }
+    }
+    let set = Arc::new(set);
+    *cache = Some((key, Arc::clone(&set)));
+    set
+}
+
+/// The owner an unowned resource is sealed for where keys with an owner share
+/// the provider key: an unsealed id there would be one anyone can write around
+/// a raw id. Never an owner a key can have (`team:`, `user:`).
+const UNOWNED_SEAL: &str = "-";
+
 /// The owner a key's new job resources are sealed for, with the secret that
-/// seals them.
-fn owner_seal<'a>(owner: Option<&'a str>, target: &'a JobTarget) -> Option<(&'a str, &'a str)> {
-    owner.map(|owner| (owner, target.secret.as_str()))
+/// seals them: its own, or [`UNOWNED_SEAL`] for a key without one on a provider
+/// key that owned keys reach. `None` mints unsealed ids, as a single-tenant
+/// provider key always has.
+fn owner_seal<'a>(
+    auth: &AuthenticatedKey,
+    snapshot: &aisix_core::AisixSnapshot,
+    target: &'a JobTarget,
+) -> Option<(String, &'a str)> {
+    let owner = job_owner(auth).or_else(|| {
+        pk_serves_owned_keys(snapshot, &target.pk_entry.id).then(|| UNOWNED_SEAL.to_string())
+    })?;
+    Some((owner, target.secret.as_str()))
 }
 
 /// Charset guard for ids interpolated into upstream URL paths. A decoded
@@ -729,9 +790,11 @@ pub(crate) fn json_decoded_strings(value: &serde_json::Value, out: &mut Vec<Stri
 }
 
 /// Whether an uploaded JSONL line holds an escape this gateway cannot decode: it
-/// looks like JSON, has a backslash and does not parse here. The scan would read
-/// its bytes, and an upstream whose parser takes what this one refuses (a lone
-/// `\ud800`, which Python, Node and Go take) reads text the scan never saw.
+/// looks like JSON, has a backslash, and fails to parse here for a reason other
+/// parsers accept (a lone `\ud800`, which Python, Node and Go take, or nesting
+/// past this parser's depth limit). The scan would read its bytes, and such an
+/// upstream reads text the scan never saw. A line that is no JSON to anyone
+/// (`{\bf bold}`, a Windows path) is text, and scanned as text.
 fn holds_undecodable_escape(blob: &[u8]) -> bool {
     let text = String::from_utf8_lossy(blob);
     let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
@@ -740,7 +803,14 @@ fn holds_undecodable_escape(blob: &[u8]) -> bool {
         (line.starts_with('{') || line.starts_with('['))
             && line.contains('\\')
             // A full parse: skipping a value checks no escape's meaning.
-            && serde_json::from_str::<serde_json::Value>(line).is_err()
+            && serde_json::from_str::<serde_json::Value>(line).is_err_and(|e| {
+                let why = e.to_string();
+                // serde_json's words for a lone surrogate (alone at the
+                // string's end, or before anything but its pair) and for depth.
+                why.contains("surrogate")
+                    || why.contains("end of hex escape")
+                    || why.contains("recursion limit")
+            })
     })
 }
 
@@ -1630,7 +1700,9 @@ pub(crate) async fn create_file(
                 &resp_headers,
                 bytes,
                 Some(&model),
-                owner_seal(job_owner(&auth).as_deref(), &target),
+                owner_seal(&auth, snapshot, &target)
+                    .as_ref()
+                    .map(|(owner, secret)| (owner.as_str(), *secret)),
             ),
             target,
         ))
@@ -1940,7 +2012,9 @@ pub(crate) async fn create_batch(
                 &resp_headers,
                 bytes,
                 Some(&model),
-                owner_seal(job_owner(&auth).as_deref(), &target),
+                owner_seal(&auth, &snapshot, &target)
+                    .as_ref()
+                    .map(|(owner, secret)| (owner.as_str(), *secret)),
             ),
             target,
         ))
@@ -2046,7 +2120,9 @@ pub(crate) async fn get_batch(
                 &resp_headers,
                 bytes,
                 Some(&model),
-                owner_seal(job_owner(&auth).as_deref(), &target),
+                owner_seal(&auth, &snapshot, &target)
+                    .as_ref()
+                    .map(|(owner, secret)| (owner.as_str(), *secret)),
             ),
             target,
         ))
@@ -2284,7 +2360,9 @@ pub(crate) async fn create_ft_job(
                 &resp_headers,
                 bytes,
                 Some(&model),
-                owner_seal(job_owner(&auth).as_deref(), &target),
+                owner_seal(&auth, &snapshot, &target)
+                    .as_ref()
+                    .map(|(owner, secret)| (owner.as_str(), *secret)),
             ),
             target,
         ))
@@ -2543,7 +2621,9 @@ async fn forward_simple(
                 &resp_headers,
                 bytes,
                 model.as_deref(),
-                owner_seal(job_owner(&auth).as_deref(), &target),
+                owner_seal(&auth, &snapshot, &target)
+                    .as_ref()
+                    .map(|(owner, secret)| (owner.as_str(), *secret)),
             )
         };
         Ok((resp, target))
@@ -3678,11 +3758,23 @@ mod tests {
             "GET",
             format!(
                 "/v1/files/{}/content",
-                encode_routed_id("file-a", "jobs-a", None)
+                encode_routed_id("file-a", "jobs-a", Some((UNOWNED_SEAL, SECRET_A)))
             ),
         )
         .await;
         assert_eq!((status, body.as_str()), (StatusCode::OK, "team a's data"));
+        // An unsealed unowned id is anyone's to write around a raw id, so it
+        // does not open here.
+        let (status, _) = call(
+            "sk-shared",
+            "GET",
+            format!(
+                "/v1/files/{}/content",
+                encode_routed_id("file-a", "jobs-a", None)
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
 
         // What an owned batch names is owned too.
         let a_batch = encode_routed_id("batch-a", "jobs-a", Some(("team:t-a", SECRET_A)));
@@ -5602,12 +5694,14 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert!(!sent.is_empty());
 
-        let (status, _) = upload_with_guardrail(
-            &rule(false),
-            &[("notes.txt", r"see C:\docs\plan for the schedule")],
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK);
+        for clean in [
+            r"see C:\docs\plan for the schedule",
+            r"{\bf bold} and {\em italic}",
+            r#"["C:\Users\me\data.csv"]"#,
+        ] {
+            let (status, _) = upload_with_guardrail(&rule(false), &[("notes.txt", clean)]).await;
+            assert_eq!(status, StatusCode::OK, "{clean}");
+        }
     }
 
     /// GBK bytes for 你好 inside an otherwise well-formed JSONL line.

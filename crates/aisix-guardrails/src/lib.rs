@@ -1510,10 +1510,12 @@ mod tests {
                 {"type": "text", "text": ["in a text part's array"]},
                 {"type": "custom", "payload": {"deep": ["in a nested leaf"]}},
                 {"type": "image_url", "image_url": {"url": "https://x/in-a-media-part"}},
-                {"type": "unknown", "image": "data:image/png;base64,in-a-data-url"},
+                {"type": "unknown", "image": "data:image/png;base64,aW4tYS1kYXRhLXVybA=="},
                 // Text that merely starts like a `data:` URL is text.
                 {"type": "refusal", "refusal": "data: led by data colon"},
                 {"type": "custom", "note": "data:text/plain;base64,aW4gdGV4dA=="},
+                {"type": "refusal", "refusal": "data:image/png;base64,behind a media header"},
+                {"type": "refusal", "refusal": "data:;base64,behind an empty type"},
             ],
         }))
         .unwrap();
@@ -1525,11 +1527,13 @@ mod tests {
             "in a nested leaf",
             "led by data colon",
             "data:text/plain",
+            "behind a media header",
+            "behind an empty type",
         ] {
             assert!(scanned.contains(text), "{text}: {scanned:?}");
         }
         assert!(!scanned.contains("in-a-media-part"), "{scanned:?}");
-        assert!(!scanned.contains("in-a-data-url"), "{scanned:?}");
+        assert!(!scanned.contains("aW4tYS1kYXRhLXVybA"), "{scanned:?}");
         assert!(
             !scanned.contains("refusal\n"),
             "a type is no text: {scanned:?}"

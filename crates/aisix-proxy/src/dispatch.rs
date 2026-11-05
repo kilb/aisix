@@ -705,10 +705,22 @@ pub(crate) fn require_api_key<'a>(
     // Every route that sends its own request reads its credential here, so
     // here is where an upstream's echo of it is armed against.
     aisix_gateway::note_sent_credential(&provider_key.api_key);
-    if let Some(base) = &provider_key.api_base {
+    note_base_url_userinfo(provider_key);
+    Ok(provider_key.api_key.as_str())
+}
+
+/// Note the userinfo of every base URL a provider key dials: `api_base`, and the
+/// per-surface bases its `apis` declares.
+fn note_base_url_userinfo(provider_key: &ProviderKey) {
+    let surfaces = provider_key.apis.as_ref().into_iter().flat_map(|apis| {
+        [apis.messages.as_ref(), apis.responses.as_ref()]
+            .into_iter()
+            .flatten()
+            .filter_map(|endpoint| endpoint.base.as_deref())
+    });
+    for base in provider_key.api_base.as_deref().into_iter().chain(surfaces) {
         aisix_gateway::note_url_userinfo(base);
     }
-    Ok(provider_key.api_key.as_str())
 }
 
 /// Build the [`BridgeContext`] for one upstream call.
@@ -735,9 +747,7 @@ pub(crate) fn bridge_ctx(
     client: Option<&crate::client_ip::ClientContext>,
 ) -> aisix_gateway::BridgeContext {
     // A bridge sends the base URL's userinfo as a Basic credential.
-    if let Some(base) = &provider_key.api_base {
-        aisix_gateway::note_url_userinfo(base);
-    }
+    note_base_url_userinfo(&provider_key);
     let ctx = aisix_gateway::BridgeContext::new(request_id, model, provider_key)
         .with_resource_ids(model_id, provider_key_id);
     match client {
@@ -890,6 +900,40 @@ pub(crate) async fn json_body_within(
 mod tests {
     use super::*;
     use aisix_core::resource::ResourceEntry;
+
+    /// Every base URL a provider key dials has its userinfo noted, the
+    /// per-surface ones included, so an upstream quoting the `Basic`
+    /// credential reqwest built from it does not hand it to the caller.
+    #[test]
+    fn the_userinfo_of_every_base_url_is_noted_as_sent() {
+        use base64::Engine as _;
+        let pk: ProviderKey = serde_json::from_value(serde_json::json!({
+            "display_name": "pk",
+            "provider": "anthropic",
+            "secret": "sk-x",
+            "api_base": "https://api.example.com",
+            "apis": {
+                "messages": {"base": "https://msg-user:MsgPassw0rd1234@messages.example.com"},
+                "responses": {"base": "https://rsp-user:RspPassw0rd1234@responses.example.com"},
+            },
+        }))
+        .unwrap();
+        let basic = |pair: &str| base64::engine::general_purpose::STANDARD.encode(pair);
+        let tap = std::sync::Arc::new(aisix_gateway::ResponseHeaderTap::new(
+            Vec::new(),
+            false,
+            String::new(),
+        ));
+        let got = aisix_gateway::response_tap::sync_scope(&tap, || {
+            super::note_base_url_userinfo(&pk);
+            aisix_gateway::scrub_upstream_error_text(&format!(
+                "saw Basic {} and Basic {}",
+                basic("msg-user:MsgPassw0rd1234"),
+                basic("rsp-user:RspPassw0rd1234")
+            ))
+        });
+        assert_eq!(got, "saw Basic <redacted> and Basic <redacted>");
+    }
 
     #[test]
     fn the_first_frame_is_read_from_a_streams_first_read() {

@@ -462,7 +462,7 @@ pub async fn completions(
 /// Build a [`ChatFormat`](aisix_gateway::ChatFormat) from the legacy
 /// completions request so the input guardrail chain can scan it (#545).
 /// A token-id prompt is read as `decoded_prompt`, the text its ids decode to
-/// ([`crate::token_estimate::decode_token_ids`]). Never sent upstream.
+/// ([`crate::token_estimate::TokenEncoding`]). Never sent upstream.
 fn completions_input_to_chat(
     model: &str,
     body: &Value,
@@ -548,16 +548,15 @@ async fn dispatch(
     // encoding of the model the upstream serves. One that does not decode is
     // refused like any other body the chain cannot be given (see
     // `refuses_unevaluable_input`).
+    let encoding = crate::token_estimate::TokenEncoding::for_entry(snapshot, &model_entry.value);
+    let prompt_ids = body
+        .get("prompt")
+        .and_then(crate::token_estimate::token_id_arrays);
     let decoded_prompt = if completions_prompt_uses_token_ids(&body) {
-        let decoded = body
-            .get("prompt")
-            .and_then(crate::token_estimate::token_id_arrays)
-            .and_then(|arrays| {
-                crate::token_estimate::decode_token_ids(
-                    model_entry.value.model_name.as_deref(),
-                    &arrays,
-                )
-            });
+        let decoded = prompt_ids
+            .as_deref()
+            .zip(encoding)
+            .and_then(|(arrays, encoding)| encoding.decode(arrays));
         if decoded.is_none() && !resolved_chain.is_empty() {
             if aisix_guardrails::Guardrail::refuses_unevaluable_input(resolved_chain.as_ref()) {
                 return Err(crate::error::guardrail_block_error(
@@ -652,17 +651,29 @@ async fn dispatch(
         }
     }
 
-    // Ids cannot be rewritten, so a mask rule that would rewrite their text
-    // refuses the request.
-    if let Some(decoded) = &decoded_prompt {
-        if crate::redact::mask_would_rewrite(resolved_chain.as_ref(), decoded) {
-            crate::usage_attr::note_failure_request(snapshot, String::new);
-            return Err(crate::error::guardrail_block_error("request", None, None));
+    // #932: mask-action PII rules rewrite the prompt in place AFTER the
+    // block check passes, BEFORE the body is forwarded upstream. A token-id
+    // prompt is sent as the ids of its masked text, in the shape it came in.
+    let mut token_redactions = crate::redact::RedactionCounts::new();
+    if let (Some(decoded), Some(encoding), Some(mut arrays)) =
+        (&decoded_prompt, encoding, prompt_ids)
+    {
+        crate::redact::mask_token_ids(
+            resolved_chain.as_ref(),
+            encoding,
+            &mut arrays,
+            decoded,
+            &mut token_redactions,
+        );
+        if !token_redactions.is_empty() {
+            let nested = body["prompt"].get(0).is_some_and(Value::is_array);
+            body["prompt"] = if nested {
+                serde_json::json!(arrays)
+            } else {
+                serde_json::json!(arrays.into_iter().next().unwrap_or_default())
+            };
         }
     }
-
-    // #932: mask-action PII rules rewrite the prompt in place AFTER the
-    // block check passes, BEFORE the body is forwarded upstream.
     let final_redaction =
         crate::redact::redact_completions_request_structured(resolved_chain.as_ref(), &mut body);
     if final_redaction.unrewritable_tool_key {
@@ -671,6 +682,7 @@ async fn dispatch(
     }
     let mut redactions = final_redaction.counts;
     crate::redact::merge_counts(&mut redactions, input_seg_counts);
+    crate::redact::merge_counts(&mut redactions, token_redactions);
     // A failure row reports the masked text, and nothing when a check failed
     // open: the success path's capture withholds that request too.
     crate::usage_attr::note_screened_request(snapshot, || {
@@ -3499,8 +3511,8 @@ mod tests {
 
     /// A token-id prompt is read as the text its ids decode to, as
     /// `/v1/embeddings` reads token-id input: a blocked word in it is refused,
-    /// a clean one goes through, a mask rule's match refuses since ids cannot
-    /// be rewritten, and ids this gateway cannot decode are refused under a
+    /// a clean one goes through, a mask rule's match is sent as the ids of the
+    /// masked text, and ids this gateway cannot decode are refused under a
     /// chain that fails closed.
     #[tokio::test]
     async fn a_token_id_prompt_is_read_as_the_text_it_decodes_to() {
@@ -3549,10 +3561,44 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let forwarded = upstream.received_requests().await.unwrap().len();
         assert_eq!(forwarded, 1);
+        // A mask rule's match goes as the ids of the masked text, in the
+        // prompt's shape.
+        for prompt in [
+            serde_json::json!(ids("write to alice@example.com")),
+            serde_json::json!([ids("write to alice@example.com")]),
+        ] {
+            let nested = prompt[0].is_array();
+            let resp = send(prompt).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let sent = upstream.received_requests().await.unwrap();
+            let body: serde_json::Value =
+                serde_json::from_slice(&sent.last().unwrap().body).unwrap();
+            let got = if nested {
+                &body["prompt"][0]
+            } else {
+                &body["prompt"]
+            };
+            let got: Vec<u32> = got
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|id| id.as_u64().unwrap() as u32)
+                .collect();
+            let text = String::from_utf8(
+                tiktoken_rs::cl100k_base_singleton()
+                    .decode_bytes(&got)
+                    .unwrap(),
+            )
+            .unwrap();
+            assert!(
+                text.starts_with("write to ") && !text.contains("alice@example.com"),
+                "{text}"
+            );
+        }
+        let forwarded = upstream.received_requests().await.unwrap().len();
         for prompt in [
             serde_json::json!(ids("please BLOCKME")),
             serde_json::json!([ids("clean"), ids("BLOCKME")]),
-            serde_json::json!(ids("write to alice@example.com")),
             serde_json::json!([999_999_999u64]),
         ] {
             let resp = send(prompt.clone()).await.unwrap();

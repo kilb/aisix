@@ -3097,36 +3097,27 @@ fn decoded_responses_request_string_values(
     Some(out)
 }
 
-/// A token-id `prompt` or `input` (`[1, 2]`, or `[[1, 2], [3]]`) holds the text
-/// its ids decode to with the encoding of the body's `model`, as the typed
-/// `/v1/completions` and `/v1/embeddings` read it: appended to `out`, and
-/// `Some(true)` returned. Ids that do not decode make the body unevaluable
-/// (`None`). `Some(false)` for a value that is no token-id array.
+/// A token-id `prompt` or `input` (`[1, 2]`, `[[1, 2], [3]]`, or the same with
+/// integral floats, which a lenient server reads as ids) holds text no rule can
+/// read here: a route's configuration names no model, and the body's `model` is
+/// the caller's word, which the upstream may ignore. Such a body is unevaluable
+/// (`None`), as is any other array of numbers in that slot. `Some(false)` for a
+/// value that is no numeric array.
 fn append_token_id_text(
-    out: &mut String,
-    body: &[u8],
+    _out: &mut String,
+    _body: &[u8],
     value: &RawJson<'_>,
     scan_error: &mut Option<crate::json_splice::SpliceError>,
 ) -> Option<bool> {
     let parsed = serde_json::from_str::<serde_json::Value>(value.get()).ok();
-    let Some(arrays) = parsed
+    if !parsed
         .as_ref()
-        .and_then(crate::token_estimate::token_id_arrays)
-    else {
+        .is_some_and(crate::token_estimate::numeric_arrays)
+    {
         return Some(false);
-    };
-    let model = raw_top_level_values(body, "model")?
-        .first()
-        .and_then(|m| serde_json::from_str::<String>(m.get()).ok());
-    let Some(texts) = crate::token_estimate::decode_token_ids(model.as_deref(), &arrays) else {
-        mark_unevaluable(scan_error);
-        return None;
-    };
-    for text in texts {
-        out.push('\n');
-        out.push_str(&text);
     }
-    Some(true)
+    mark_unevaluable(scan_error);
+    None
 }
 
 fn decoded_completions_request_string_values(
@@ -8408,39 +8399,47 @@ mod tests {
         }
     }
 
-    /// A token-id `prompt` or `input` is read as the text its ids decode to
-    /// with the body's model, as the typed endpoints read it, and ids that do
-    /// not decode make the body unevaluable.
+    /// A token-id `prompt` or `input` is no text a rule can read on a route:
+    /// nothing in its configuration says the encoding, and the body's `model`
+    /// is the caller's. Integral floats are ids to a lenient server, and any
+    /// other numbers there are no text either.
     #[test]
-    fn token_ids_on_a_route_are_read_as_the_text_they_decode_to() {
-        let ids: Vec<u32> = tiktoken_rs::cl100k_base_singleton().encode_ordinary("forbidden words");
-        let ids = serde_json::to_string(&ids).unwrap();
+    fn token_ids_on_a_route_are_unevaluable() {
         for (protocol, body) in [
             (
                 PassthroughProtocol::OpenaiCompletions,
-                format!(r#"{{"model":"gpt-3.5-turbo-instruct","prompt":{ids}}}"#),
+                r#"{"model":"gpt-3.5-turbo-instruct","prompt":[2000,22886,28810]}"#,
             ),
             (
                 PassthroughProtocol::OpenaiCompletions,
-                format!(r#"{{"model":"gpt-3.5-turbo-instruct","prompt":[{ids}]}}"#),
+                r#"{"model":"gpt-4o","prompt":[[2000,22886,28810]]}"#,
+            ),
+            (
+                PassthroughProtocol::OpenaiCompletions,
+                r#"{"model":"m","prompt":[2000.0,22886.0,4339.0]}"#,
+            ),
+            (
+                PassthroughProtocol::OpenaiCompletions,
+                r#"{"model":"m","prompt":[[2000.0,22886.0]]}"#,
+            ),
+            (
+                PassthroughProtocol::OpenaiCompletions,
+                r#"{"model":"m","prompt":[1.5]}"#,
             ),
             (
                 PassthroughProtocol::OpenaiResponses,
-                format!(r#"{{"model":"text-embedding-3-small","input":{ids}}}"#),
+                r#"{"model":"text-embedding-3-small","input":[2000,22886]}"#,
             ),
         ] {
-            let text = try_request_guardrail_text(protocol, body.as_bytes()).expect(&body);
-            assert!(text.contains("forbidden words"), "{body} read as {text:?}");
-        }
-        for body in [
-            r#"{"model":"gpt-3.5-turbo-instruct","prompt":[999999999]}"#,
-            r#"{"model":"some-local-model","prompt":[1,2,3]}"#,
-        ] {
-            let err =
-                try_request_guardrail_text(PassthroughProtocol::OpenaiCompletions, body.as_bytes())
-                    .expect_err(body);
+            let err = try_request_guardrail_text(protocol, body.as_bytes()).expect_err(body);
             assert!(err.is_unevaluable(), "{body}");
         }
+        let text = try_request_guardrail_text(
+            PassthroughProtocol::OpenaiCompletions,
+            br#"{"model":"m","prompt":["forbidden words"]}"#,
+        )
+        .unwrap();
+        assert!(text.contains("forbidden words"));
     }
 
     #[test]

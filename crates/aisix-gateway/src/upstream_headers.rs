@@ -240,7 +240,7 @@ pub fn resolve_default_headers(ctx: &UpstreamHeaderContext<'_>) -> Vec<(HeaderNa
 /// or under a name that says it is one (an APIM `ocp-apim-subscription-key`, a
 /// vendor's `x-auth-token`). The token after an auth scheme is noted too.
 fn note_if_credential(name: &str, value: &str) {
-    let named_as_one = ["key", "token", "secret", "auth"]
+    let named_as_one = ["key", "token", "secret", "auth", "pass", "credential"]
         .iter()
         .any(|word| name.contains(word));
     if !named_as_one && !aisix_core::CREDENTIAL_SLOT_HEADERS.contains(&name) {

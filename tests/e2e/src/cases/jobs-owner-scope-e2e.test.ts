@@ -325,11 +325,17 @@ describe("jobs resources belong to the team or user that created them", () => {
     expect(built.status).toBe(200);
     await built.text();
 
-    // The provider's raw id and its lists would hand it the teams' files.
+    // The provider's raw id and its lists would hand it the teams' files, and
+    // so would an unowned id written around that raw id.
     const before = upstream.receivedRequests.length;
     const raw = await request(SHARED, "GET", `/v1/files/file-up-1/content?model=${MODEL}`);
     expect(raw.status).toBe(404);
     await raw.text();
+    const prefix = own.slice(0, own.indexOf("-") + 1);
+    const wrapped = prefix + Buffer.from(`file-up-1;model,${MODEL}`).toString("base64url");
+    const around = await request(SHARED, "GET", `/v1/files/${wrapped}/content`);
+    expect(around.status).toBe(404);
+    await around.text();
     for (const path of ["/v1/files", "/v1/batches", "/v1/fine_tuning/jobs"]) {
       const listed = await request(SHARED, "GET", `${path}?model=${MODEL}`);
       expect(listed.status, path).toBe(403);

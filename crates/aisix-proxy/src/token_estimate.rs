@@ -234,31 +234,99 @@ fn known_bpe(model: &str) -> Option<&'static CoreBPE> {
 /// APIs take. `None` for any other value.
 pub(crate) fn token_id_arrays(value: &Value) -> Option<Vec<Vec<u64>>> {
     let items = value.as_array().filter(|items| !items.is_empty())?;
-    let ids = |items: &[Value]| items.iter().map(Value::as_u64).collect::<Option<Vec<_>>>();
+    // An integral float is the id a lenient server (pydantic) reads it as.
+    let id = |v: &Value| {
+        v.as_u64().or_else(|| {
+            v.as_f64()
+                .filter(|f| f.fract() == 0.0 && (0.0..=f64::from(u32::MAX)).contains(f))
+                .map(|f| f as u64)
+        })
+    };
+    let ids = |items: &[Value]| items.iter().map(id).collect::<Option<Vec<_>>>();
     if let Some(one) = ids(items) {
         return Some(vec![one]);
     }
     items.iter().map(|item| ids(item.as_array()?)).collect()
 }
 
-/// The text each array of token ids stands for, decoded as an upstream serving
-/// `model` decodes it: with the encoding tiktoken's model map names, which is
-/// what a client such as LangChain encodes with. `None` when that map knows no
-/// encoding for the model, or an id is not one of the encoding's: nothing then
-/// says what the upstream will read.
-pub(crate) fn decode_token_ids(model: Option<&str>, arrays: &[Vec<u64>]) -> Option<Vec<String>> {
-    let bpe = known_bpe(model?)?;
-    arrays
-        .iter()
-        .map(|ids| {
-            let ids = ids
-                .iter()
-                .map(|&id| u32::try_from(id).ok())
-                .collect::<Option<Vec<_>>>()?;
-            let bytes = bpe.decode_bytes(&ids).ok()?;
-            Some(String::from_utf8_lossy(&bytes).into_owned())
-        })
-        .collect()
+/// Whether `value` is an array of numbers, or of arrays of numbers: token ids by
+/// shape, whether or not each number is one.
+pub(crate) fn numeric_arrays(value: &Value) -> bool {
+    let numbers = |items: &[Value]| !items.is_empty() && items.iter().all(Value::is_number);
+    value.as_array().is_some_and(|items| {
+        numbers(items)
+            || (!items.is_empty()
+                && items
+                    .iter()
+                    .all(|item| item.as_array().is_some_and(|a| numbers(a))))
+    })
+}
+
+/// The encoding token ids sent to a model are read in: the one tiktoken's
+/// model map names for the model the upstream serves, which is what a client
+/// such as LangChain encodes with. Resolved in one place for every token-id
+/// surface ([`Self::for_model`], [`Self::for_entry`]).
+#[derive(Clone, Copy)]
+pub(crate) struct TokenEncoding(&'static CoreBPE);
+
+impl TokenEncoding {
+    /// The encoding of an upstream model name, and nothing for a name the map
+    /// does not know: nothing then says what the upstream reads.
+    pub(crate) fn for_model(model: &str) -> Option<Self> {
+        known_bpe(model).map(Self)
+    }
+
+    /// The encoding of a caller-addressed model: its own upstream model, or for
+    /// a routing group the one encoding every target the group can dispatch to
+    /// shares. `None` when a target's encoding is unknown, the targets disagree,
+    /// or the entry is a kind with no upstream model of its own to say.
+    pub(crate) fn for_entry(
+        snapshot: &aisix_core::AisixSnapshot,
+        entry: &aisix_core::Model,
+    ) -> Option<Self> {
+        if let Some(name) = entry.model_name.as_deref() {
+            return Self::for_model(name);
+        }
+        let routing = entry.routing.as_ref()?;
+        let mut shared: Option<&'static CoreBPE> = None;
+        for target in &routing.targets {
+            // A target that resolves to nothing is never dispatched to.
+            let Some(model) = snapshot.models.get_by_name(&target.model_ref(snapshot)) else {
+                continue;
+            };
+            let bpe = known_bpe(model.value.model_name.as_deref()?)?;
+            match shared {
+                Some(seen) if !std::ptr::eq(seen, bpe) => return None,
+                _ => shared = Some(bpe),
+            }
+        }
+        shared.map(Self)
+    }
+
+    /// The text each array of ids stands for. `None` when an id is not one of
+    /// the encoding's.
+    pub(crate) fn decode(self, arrays: &[Vec<u64>]) -> Option<Vec<String>> {
+        arrays
+            .iter()
+            .map(|ids| {
+                let ids = ids
+                    .iter()
+                    .map(|&id| u32::try_from(id).ok())
+                    .collect::<Option<Vec<_>>>()?;
+                let bytes = self.0.decode_bytes(&ids).ok()?;
+                Some(String::from_utf8_lossy(&bytes).into_owned())
+            })
+            .collect()
+    }
+
+    /// `text` as ids in this encoding: what a masked decode is sent back as.
+    pub(crate) fn encode(self, text: &str) -> Vec<u64> {
+        self.0
+            .encode_ordinary(text)
+            .into_iter()
+            .map(u64::from)
+            .collect()
+    }
 }
 
 fn clamp(n: usize) -> u32 {
@@ -1010,6 +1078,7 @@ fn format_type(props: &Value, indent: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use aisix_gateway::chat::{ChatFormat, ChatMessage, Role};
     use serde_json::json;
@@ -1019,36 +1088,88 @@ mod tests {
     }
 
     /// Ids decode in the model's own encoding, and only there: an id outside
-    /// it, or a model tiktoken's map does not know, decodes to nothing.
+    /// it, or a model tiktoken's map does not know, decodes to nothing. A
+    /// group reads in the encoding its targets share, and in none when they
+    /// disagree or one is unknown.
     #[test]
     fn token_ids_decode_in_the_model_encoding() {
         let hello_cl100k = vec![15339, 1070];
         let hello_o200k = vec![24912, 1354];
+        let decode = |model: &str, ids: &[u64]| {
+            TokenEncoding::for_model(model).and_then(|e| e.decode(&[ids.to_vec()]))
+        };
         assert_eq!(
-            decode_token_ids(
-                Some("text-embedding-3-small"),
-                std::slice::from_ref(&hello_cl100k)
-            ),
+            decode("text-embedding-3-small", &hello_cl100k),
             Some(vec!["hello there".to_string()])
         );
         assert_eq!(
-            decode_token_ids(Some("gpt-4o-mini"), &[hello_o200k]),
+            decode("gpt-4o-mini", &hello_o200k),
             Some(vec!["hello there".to_string()])
         );
+        assert_eq!(decode("bge-m3", &hello_cl100k), None);
+        assert_eq!(decode("gpt-4o-mini", &[999_999_999]), None);
+        let encoding = TokenEncoding::for_model("text-embedding-3-small").unwrap();
+        assert_eq!(encoding.encode("hello there"), hello_cl100k);
+
+        let snapshot = aisix_core::AisixSnapshot::new();
+        let model = |name: &str, body: Value| {
+            let mut doc =
+                json!({"display_name": name, "provider": "openai", "provider_key_id": "pk"});
+            doc.as_object_mut()
+                .unwrap()
+                .extend(body.as_object().unwrap().clone());
+            let m: aisix_core::Model = serde_json::from_value(doc).unwrap();
+            aisix_core::resource::ResourceEntry::new(format!("id-{name}"), m, 1)
+        };
+        for (name, upstream) in [
+            ("small", "text-embedding-3-small"),
+            ("ada", "text-embedding-ada-002"),
+            ("mini", "gpt-4o-mini"),
+            ("local", "bge-m3"),
+        ] {
+            snapshot
+                .models
+                .insert(model(name, json!({"model_name": upstream})));
+        }
+        let group = |targets: &[&str]| {
+            let targets: Vec<Value> = targets.iter().map(|t| json!({"model": t})).collect();
+            model(
+                "g",
+                json!({"routing": {"strategy": "failover", "targets": targets}}),
+            )
+            .value
+        };
+        let decodes = |targets: &[&str]| {
+            TokenEncoding::for_entry(&snapshot, &group(targets))
+                .and_then(|e| e.decode(std::slice::from_ref(&hello_cl100k)))
+        };
+        let hello = Some(vec!["hello there".to_string()]);
+        assert_eq!(decodes(&["small"]), hello);
+        assert_eq!(decodes(&["small", "ada"]), hello);
         assert_eq!(
-            decode_token_ids(Some("bge-m3"), std::slice::from_ref(&hello_cl100k)),
-            None
+            decodes(&["small", "ghost"]),
+            hello,
+            "a dangling target is never sent to"
         );
-        assert_eq!(decode_token_ids(None, &[hello_cl100k]), None);
+        assert_eq!(decodes(&["small", "mini"]), None, "targets that disagree");
         assert_eq!(
-            decode_token_ids(Some("gpt-4o-mini"), &[vec![999_999_999]]),
-            None
+            decodes(&["small", "local"]),
+            None,
+            "a target nothing can say"
         );
+
         assert_eq!(
             token_id_arrays(&json!([[1, 2], [3]])),
             Some(vec![vec![1, 2], vec![3]])
         );
         assert_eq!(token_id_arrays(&json!([1, 2])), Some(vec![vec![1, 2]]));
+        assert_eq!(
+            token_id_arrays(&json!([2000.0, 22886.0])),
+            Some(vec![vec![2000, 22886]])
+        );
+        assert_eq!(token_id_arrays(&json!([1.5])), None);
+        assert!(numeric_arrays(&json!([1.5])) && numeric_arrays(&json!([[2.0], [-1]])));
+        assert!(!numeric_arrays(&json!(["a"])) && !numeric_arrays(&json!([])));
         assert_eq!(token_id_arrays(&json!(["text"])), None);
         assert_eq!(token_id_arrays(&json!([1, "two"])), None);
         assert_eq!(token_id_arrays(&json!([])), None);
