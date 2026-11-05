@@ -727,6 +727,42 @@ pub(crate) fn hold_failure_request(chain: &dyn aisix_guardrails::Guardrail) {
     }
 }
 
+/// [`hold_failure_request`] for a request its chain has not started on, as soon
+/// as the caller's key and the model it addressed say which rules apply: a route
+/// answering a 400 or a 404 ahead of the chain would otherwise export the text as
+/// sent, with no rule run. `model` is the name the request addresses, if it says.
+/// One that names no model, or none that exists, still answers to the rules
+/// scoped to the environment, the key and its team. A request none of whose rules
+/// enforce keeps its body, and the next hold or release takes this one's place.
+///
+/// Only under a full-content export, so nothing else pays for the lookup.
+pub(crate) fn hold_ahead_of_chain(
+    state: &ProxyState,
+    snap: &AisixSnapshot,
+    auth: &crate::auth::AuthenticatedKey,
+    model: Option<&str>,
+) {
+    if content_cap(snap).is_none() {
+        return;
+    }
+    let model_id = model
+        .and_then(|name| crate::model_resolve::resolve_model(snap, name))
+        .map(|entry| entry.id.clone())
+        .unwrap_or_default();
+    let chain = state
+        .guardrail_index
+        .resolve(&aisix_guardrails::RequestContext {
+            passthrough_route_id: "",
+            model_id: &model_id,
+            mcp_server_id: "",
+            api_key_id: &auth.entry.id,
+            team_id: auth.key().team_id.as_deref(),
+        });
+    if aisix_guardrails::Guardrail::enforces_input(&chain) {
+        crate::attribution::hold_failure_request_ahead_of_chain();
+    }
+}
+
 /// The input chain has finished with the request and the noted body stands.
 pub(crate) fn release_failure_request() {
     crate::attribution::release_failure_request();
@@ -827,7 +863,7 @@ fn failure_row_content(
         client_error: noted_error,
         refused,
         held,
-    } = crate::attribution::failure_notes();
+    } = crate::attribution::failure_notes(event.status_code);
     let row = match content {
         // Not what the route captured: nothing masked that.
         _ if refused => {
@@ -1693,6 +1729,49 @@ mod tests {
         .await;
     }
 
+    /// Ahead of the chain a row reports no request text on any status but a 403,
+    /// which keeps its body, and the chain starting makes that exception end: a
+    /// 403 once it has is held like everything else.
+    #[tokio::test]
+    #[allow(clippy::field_reassign_with_default)] // A literal here would read as an emitter to the scans below.
+    async fn a_row_ahead_of_the_chain_reports_no_request_text_but_a_403_keeps_it() {
+        let cell = std::sync::Arc::new(crate::attribution::RequestAttribution::default());
+        crate::attribution::scope(cell, async {
+            let row = |status| {
+                let mut event = UsageEvent::default();
+                event.status_code = status;
+                let event = event;
+                failure_row_content(&event, None, None, true, 1000)
+                    .unwrap_or_else(|| aisix_obs::CapturedContent::new("", "", 1000))
+                    .prompt
+            };
+            crate::attribution::note_failure_request(aisix_obs::CapturedContent::new(
+                "raw-note", "", 1000,
+            ));
+            crate::attribution::hold_failure_request_ahead_of_chain();
+            for status in [400, 404, 429, 500, 501, crate::CLIENT_CLOSED_REQUEST] {
+                assert_eq!(row(status), "", "{status}");
+            }
+            assert_eq!(row(403), "raw-note");
+
+            // A hang-up reads the same answer.
+            let mut body = Some(String::new());
+            crate::attribution::with_cancel_for_test(|c| {
+                body = c.failure_body().map(|b| b.prompt.clone());
+            });
+            assert_eq!(body, None);
+
+            crate::attribution::hold_failure_request();
+            assert_eq!(row(403), "");
+
+            release_failure_request();
+            for status in [400, 403, 404] {
+                assert_eq!(row(status), "raw-note", "{status}");
+            }
+        })
+        .await;
+    }
+
     /// The hold comes on where every input chain passes, whether or not the
     /// reservation goes through, and only for a chain that enforces.
     #[tokio::test]
@@ -1720,7 +1799,7 @@ mod tests {
                 })
                 .await;
                 assert!(refused.is_err());
-                assert_eq!(crate::attribution::failure_notes().held, held);
+                assert_eq!(crate::attribution::failure_notes(429).held, held);
             })
             .await;
         }

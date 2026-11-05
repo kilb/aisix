@@ -1902,6 +1902,7 @@ async fn dispatch_create(
     crate::usage_attr::note_failure_request(snapshot, || {
         serde_json::to_string(&body).unwrap_or_default()
     });
+    crate::usage_attr::hold_ahead_of_chain(state, snapshot, auth, Some(&body.model));
     let model_entry = crate::model_resolve::resolve_model(snapshot, &body.model)
         .ok_or_else(|| ProxyError::ModelNotFound(body.model.clone()))?;
     let model_id = model_entry.id.to_string();

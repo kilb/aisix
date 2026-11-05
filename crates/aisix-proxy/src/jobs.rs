@@ -1281,6 +1281,8 @@ pub(crate) async fn create_file(
 
         let snapshot = &**snapshot.insert(state.snapshot.load());
         crate::usage_attr::note_failure_request(snapshot, || Value::Object(captured).to_string());
+        let wanted = form_model.or_else(|| explicit_model(&params, &headers));
+        crate::usage_attr::hold_ahead_of_chain(&state, snapshot, &auth, wanted.as_deref());
 
         if !fields.iter().any(|f| matches!(f, UploadField::File { .. })) {
             return Err(ProxyError::InvalidRequest(
@@ -1288,7 +1290,6 @@ pub(crate) async fn create_file(
             ));
         }
 
-        let wanted = form_model.or_else(|| explicit_model(&params, &headers));
         let target = resolve_target(snapshot, &auth, wanted.as_deref(), &client)?;
 
         // Batch/fine-tune input files carry end-user content — scan them
@@ -1568,6 +1569,13 @@ pub(crate) async fn create_batch(
     crate::usage_attr::note_failure_request(&snapshot, || {
         String::from_utf8_lossy(&body).into_owned()
     });
+    // 模型名可能还在请求体里，解析之后再按它补一次（见下）。
+    crate::usage_attr::hold_ahead_of_chain(
+        &state,
+        &snapshot,
+        &auth,
+        explicit_model(&params, &headers).as_deref(),
+    );
 
     let result = async {
         let mut req_json: Value = serde_json::from_slice(&body)
@@ -1597,6 +1605,7 @@ pub(crate) async fn create_batch(
         let wanted = embedded
             .or(body_model)
             .or_else(|| explicit_model(&params, &headers));
+        crate::usage_attr::hold_ahead_of_chain(&state, &snapshot, &auth, wanted.as_deref());
         let target = resolve_target(&snapshot, &auth, wanted.as_deref(), &client)?;
 
         // Forward the provider wire shape: raw file id, no gateway-only
@@ -1897,6 +1906,13 @@ pub(crate) async fn create_ft_job(
     crate::usage_attr::note_failure_request(&snapshot, || {
         String::from_utf8_lossy(&body).into_owned()
     });
+    // 模型名可能还在请求体里，解析之后再按它补一次（见下）。
+    crate::usage_attr::hold_ahead_of_chain(
+        &state,
+        &snapshot,
+        &auth,
+        explicit_model(&params, &headers).as_deref(),
+    );
 
     let result = async {
         let mut req_json: Value = serde_json::from_slice(&body)
@@ -1920,6 +1936,7 @@ pub(crate) async fn create_ft_job(
             .unwrap_or((training_file.clone(), None));
         require_safe_upstream_id(&raw_training)?;
         let wanted = embedded.or_else(|| explicit_model(&params, &headers));
+        crate::usage_attr::hold_ahead_of_chain(&state, &snapshot, &auth, wanted.as_deref());
         let target = resolve_target(&snapshot, &auth, wanted.as_deref(), &client)?;
 
         if let Some(obj) = req_json.as_object_mut() {
@@ -2141,6 +2158,12 @@ async fn forward_simple(
         crate::usage_attr::note_failure_request(&snapshot, || {
             String::from_utf8_lossy(body).into_owned()
         });
+        let model = spec
+            .id
+            .as_ref()
+            .and_then(|(_, embedded)| embedded.clone())
+            .or_else(|| explicit_model(&params, &headers));
+        crate::usage_attr::hold_ahead_of_chain(&state, &snapshot, &auth, model.as_deref());
     }
 
     let result = async {

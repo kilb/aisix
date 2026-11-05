@@ -350,6 +350,12 @@ async fn dispatch(
     routing_out: &mut crate::attempt::RoutingTelemetry,
 ) -> Result<RerankDispatchSuccess, ProxyError> {
     crate::usage_attr::note_failure_request(snapshot, || body.to_string());
+    crate::usage_attr::hold_ahead_of_chain(
+        state,
+        snapshot,
+        auth,
+        body.get("model").and_then(|v| v.as_str()),
+    );
     let model_name = body
         .get("model")
         .and_then(|v| v.as_str())

@@ -1767,6 +1767,68 @@ mod tests {
         ProxyState::new(handle, hub, &cfg()).without_cache()
     }
 
+    /// A failure ahead of the chain exports its body only while no enforcing rule
+    /// applies; a monitored row enforces nothing. A 403 keeps its body either way.
+    #[tokio::test]
+    async fn a_failure_ahead_of_the_chain_exports_its_body_only_without_an_enforcing_rule() {
+        const TEXT: &str = "ahead-of-chain-text-b5a7";
+        for (mode, model, status, exported) in [
+            (Some("block"), "no-such-model", StatusCode::NOT_FOUND, false),
+            (
+                Some("monitor"),
+                "no-such-model",
+                StatusCode::NOT_FOUND,
+                true,
+            ),
+            (None, "no-such-model", StatusCode::NOT_FOUND, true),
+            (Some("block"), "out-of-reach", StatusCode::FORBIDDEN, true),
+        ] {
+            let snap = AisixSnapshot::new();
+            let key: ApiKey = serde_json::from_value(serde_json::json!({
+                "key_hash": ApiKey::hash_bearer("sk-ahead"),
+                "allowed_models": ["elsewhere"],
+            }))
+            .unwrap();
+            snap.apikeys.insert(ResourceEntry::new("k-ahead", key, 1));
+            snap.models.insert(model_entry("out-of-reach"));
+            if let Some(mode) = mode {
+                let row: aisix_core::Guardrail = serde_json::from_value(serde_json::json!({
+                    "name": "ahead",
+                    "enabled": true,
+                    "enforcement_mode": mode,
+                    "kind": "keyword",
+                    "hook_point": "input",
+                    "patterns": [{"kind": "literal", "value": "never-in-this-request"}],
+                }))
+                .unwrap();
+                seed_env_scoped_guardrail(&snap, ResourceEntry::new("g-ahead", row, 1));
+            }
+            let collector = seed_full_content_collector(&snap).await;
+            let app = build_router(build_state(snap, Arc::new(Hub::new())));
+            let response = tower::ServiceExt::oneshot(
+                app,
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("authorization", "Bearer sk-ahead")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "model": model,
+                            "messages": [{"role": "user", "content": TEXT}],
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.status(), status);
+            let sent = exported_for(&collector, &response).await;
+            assert_eq!(sent.contains(TEXT), exported, "{mode:?} {model}: {sent}");
+        }
+    }
+
     fn build_state_with_cache(snapshot: AisixSnapshot, hub: Arc<Hub>) -> ProxyState {
         let handle = SnapshotHandle::new(snapshot);
         ProxyState::new(handle, hub, &cfg())

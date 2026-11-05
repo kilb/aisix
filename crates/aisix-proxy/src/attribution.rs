@@ -252,6 +252,11 @@ pub(crate) struct CancelContext {
     /// mask: until it has, a failure row reports no request body. See
     /// [`crate::usage_attr::hold_failure_request`].
     pub failure_request_held: bool,
+    /// An enforcing input guardrail applies and the chain has not started on
+    /// this request, so its failure rows report no request body either, except
+    /// a 403: a caller turned away for what it may not reach keeps its row's
+    /// body, as with a 401. See [`crate::usage_attr::hold_ahead_of_chain`].
+    pub failure_request_ahead_of_chain: bool,
     /// An input guardrail refused this request, so `failure_request` no longer
     /// speaks for it: its rows report `refused_request` or no body. Set where
     /// the refusal is built, which is what a route that forgets the note
@@ -1739,9 +1744,17 @@ pub(crate) fn hold_failure_request() {
     with_cancel(|c| c.failure_request_held = true);
 }
 
+/// See [`CancelContext::failure_request_ahead_of_chain`].
+pub(crate) fn hold_failure_request_ahead_of_chain() {
+    with_cancel(|c| c.failure_request_ahead_of_chain = true);
+}
+
 /// See [`CancelContext::failure_request_held`].
 pub(crate) fn release_failure_request() {
-    with_cancel(|c| c.failure_request_held = false);
+    with_cancel(|c| {
+        c.failure_request_held = false;
+        c.failure_request_ahead_of_chain = false;
+    });
 }
 
 /// See [`CancelContext::client_error_body`].
@@ -1760,28 +1773,38 @@ pub(crate) fn note_refused_request(content: aisix_obs::CapturedContent) {
 }
 
 impl CancelContext {
-    /// The request body this request's failure rows report.
+    /// The request body the rows of a request that hung up report.
     pub(crate) fn failure_body(&self) -> Option<&aisix_obs::CapturedContent> {
+        self.failure_body_at(crate::CLIENT_CLOSED_REQUEST)
+    }
+
+    /// The request body a failure row with `status` reports.
+    fn failure_body_at(&self, status: u16) -> Option<&aisix_obs::CapturedContent> {
         if self.request_refused {
             self.refused_request.as_ref()
-        } else if self.failure_request_held {
+        } else if self.holds_failure_request(status) {
             None
         } else {
             self.failure_request.as_ref()
         }
     }
+
+    fn holds_failure_request(&self, status: u16) -> bool {
+        self.failure_request_held || (self.failure_request_ahead_of_chain && status != 403)
+    }
 }
 
-/// For a failure row: the request body it reports, the client error body, and
-/// whether an input guardrail refused the request or has not finished with it.
-pub(crate) fn failure_notes() -> FailureNotes {
+/// For a failure row with `status`: the request body it reports, the client
+/// error body, and whether an input guardrail refused the request or has not
+/// finished with it.
+pub(crate) fn failure_notes(status: u16) -> FailureNotes {
     let mut notes = FailureNotes::default();
     with_cancel(|c| {
         notes = FailureNotes {
-            request: c.failure_body().cloned(),
+            request: c.failure_body_at(status).cloned(),
             client_error: c.client_error_body.clone(),
             refused: c.request_refused,
-            held: c.failure_request_held,
+            held: c.holds_failure_request(status),
         };
     });
     notes

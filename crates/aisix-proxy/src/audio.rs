@@ -1302,6 +1302,7 @@ async fn multipart_dispatch(
 
     let snapshot = &**snapshot_out.insert(state.snapshot.load());
     crate::usage_attr::note_failure_request(snapshot, || captured_transcription_fields(&fields));
+    crate::usage_attr::hold_ahead_of_chain(state, snapshot, auth, Some(&model_name));
     let model_entry = crate::model_resolve::resolve_model(snapshot, &model_name)
         .ok_or_else(|| ProxyError::ModelNotFound(model_name.clone()))?;
 
@@ -2221,6 +2222,12 @@ async fn speech_dispatch(
     routing_out: &mut crate::attempt::RoutingTelemetry,
 ) -> Result<SpeechDispatchSuccess, ProxyError> {
     crate::usage_attr::note_failure_request(snapshot, || body.to_string());
+    crate::usage_attr::hold_ahead_of_chain(
+        state,
+        snapshot,
+        auth,
+        body.get("model").and_then(|v| v.as_str()),
+    );
     let model_name = body
         .get("model")
         .and_then(|v| v.as_str())

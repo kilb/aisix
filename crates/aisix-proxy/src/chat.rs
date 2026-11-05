@@ -1622,6 +1622,7 @@ async fn dispatch(
     // `Arc<dyn Guardrail>`, which carries neither `applied()` nor the log.
     audit_out: &mut crate::usage_attr::GuardrailAudit,
 ) -> Result<Success, DispatchFailure> {
+    crate::usage_attr::hold_ahead_of_chain(state, snapshot, auth, Some(&req.model));
     if req.messages.is_empty() {
         // Refused ahead of model resolution, but a resolvable name still
         // reports the model it addressed, like every later refusal.

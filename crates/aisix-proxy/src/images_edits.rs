@@ -398,6 +398,7 @@ async fn dispatch(
 
     let snapshot = &**snapshot_out.insert(state.snapshot.load());
     crate::usage_attr::note_failure_request(snapshot, || captured_edit_fields(&fields));
+    crate::usage_attr::hold_ahead_of_chain(state, snapshot, auth, Some(&model_name));
     let model_entry = crate::model_resolve::resolve_model(snapshot, &model_name)
         .ok_or_else(|| ProxyError::ModelNotFound(model_name.clone()))?;
 

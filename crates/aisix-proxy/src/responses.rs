@@ -796,6 +796,12 @@ async fn dispatch(
     // streaming paths, from a closure that runs after both frames are gone.
     audit_out: &mut crate::usage_attr::GuardrailAudit,
 ) -> Result<ResponseDispatchSuccess, ResponsesDispatchError> {
+    crate::usage_attr::hold_ahead_of_chain(
+        state,
+        snapshot,
+        auth,
+        body.get("model").and_then(|v| v.as_str()),
+    );
     let model_name = body
         .get("model")
         .and_then(|v| v.as_str())

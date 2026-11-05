@@ -595,6 +595,12 @@ async fn dispatch(
     // (AISIX-Cloud#1330).
     audit_out: &mut crate::usage_attr::GuardrailAudit,
 ) -> Result<DispatchOutcome, MessagesDispatchError> {
+    crate::usage_attr::hold_ahead_of_chain(
+        state,
+        snapshot,
+        auth,
+        body.get("model").and_then(|v| v.as_str()),
+    );
     // Extract and resolve model.
     let model_name = body
         .get("model")

@@ -331,3 +331,246 @@ describe("a request turned away ahead of its chain exports no unmasked body", ()
     if (!NOT_REWRITTEN.has(label)) expect(exported, label).not.toContain(EMAIL);
   });
 });
+
+// Ahead of its chain a request can fail on its own terms: the model it names does
+// not exist, or the request is malformed. No rule has read it then, so while an
+// enforcing input rule applies its row carries no body, and a request no such
+// rule applies to keeps it. A caller refused a model it may not use keeps its
+// body under either: that row says who tried what.
+describe("a request that fails ahead of its chain exports no unmasked body", () => {
+  const GUARDED_CALLER = "sk-ahead-guarded";
+  const FORBIDDEN_CALLER = "sk-ahead-forbidden";
+  const OPEN_CALLER = "sk-ahead-open";
+  const AHEAD_LOGSTORE = "ahead-of-chain";
+  const GUARDED_MODEL = "ahead-guarded-model";
+  const sha256 = (s: string) => createHash("sha256").update(s).digest("hex");
+  const messages = [{ role: "user", content: TEXT }];
+
+  interface Names {
+    openai: string;
+    rerank: string;
+    anthropic: string;
+    video: string;
+  }
+  const EXISTING: Names = {
+    openai: "ahead-openai",
+    rerank: "ahead-rerank",
+    anthropic: "ahead-anthropic",
+    video: "ahead-video",
+  };
+  const MISSING = "ahead-no-such-model";
+  const named = (n: Names): Array<[string, () => Request]> => [
+    ["chat", () => json("/v1/chat/completions", { model: n.openai, messages })],
+    ["chat stream", () => json("/v1/chat/completions", { model: n.openai, messages, stream: true })],
+    ["responses", () => json("/v1/responses", { model: n.openai, input: TEXT })],
+    ["messages", () => json("/v1/messages", { model: n.anthropic, max_tokens: 16, messages })],
+    ["count_tokens", () => json("/v1/messages/count_tokens", { model: n.anthropic, messages })],
+    ["completions", () => json("/v1/completions", { model: n.openai, prompt: TEXT })],
+    ["embeddings", () => json("/v1/embeddings", { model: n.openai, input: TEXT })],
+    ["rerank", () => json("/v1/rerank", { model: n.rerank, query: TEXT, documents: ["a"] })],
+    ["images", () => json("/v1/images/generations", { model: n.openai, prompt: TEXT })],
+    ["image edits", () => multipart("/v1/images/edits", { model: n.openai, prompt: TEXT }, "image")],
+    ["speech", () => json("/v1/audio/speech", { model: n.openai, input: TEXT, voice: "alloy" })],
+    ["transcription", () => multipart("/v1/audio/transcriptions", { model: n.openai, prompt: TEXT }, "file")],
+    ["videos", () => json("/v1/videos", { model: n.video, prompt: TEXT })],
+    [
+      "batches",
+      () =>
+        json("/v1/batches", {
+          input_file_id: "file-unrouted",
+          model: n.openai,
+          endpoint: "/v1/chat/completions",
+          completion_window: "24h",
+          metadata: { note: TEXT },
+        }),
+    ],
+    ["uploads", () => multipart(`/v1/files?model=${n.openai}`, { purpose: TEXT }, "file")],
+  ];
+  const UNKNOWN_MODEL = named({ openai: MISSING, rerank: MISSING, anthropic: MISSING, video: MISSING });
+  const UNREACHABLE_MODEL = named(EXISTING);
+  // Each one is refused as malformed, with the caller's text in it.
+  const MALFORMED: Array<[string, () => Request]> = [
+    ["chat", () => json("/v1/chat/completions", { model: EXISTING.openai, messages: [], user: TEXT })],
+    ["responses", () => json("/v1/responses", { input: TEXT })],
+    ["messages", () => json("/v1/messages", { max_tokens: 16, messages })],
+    ["count_tokens", () => json("/v1/messages/count_tokens", { messages })],
+    ["completions", () => json("/v1/completions", { prompt: TEXT })],
+    ["rerank", () => json("/v1/rerank", { query: TEXT, documents: ["a"] })],
+    ["images", () => json("/v1/images/generations", { model: EXISTING.openai, prompt: TEXT, stream: true })],
+    [
+      "image edits",
+      () => multipart("/v1/images/edits", { model: EXISTING.openai, prompt: TEXT, stream: "true" }, "image"),
+    ],
+    ["speech", () => json("/v1/audio/speech", { input: TEXT, voice: "alloy" })],
+    ["videos", () => json("/v1/videos", { model: EXISTING.video, prompt: TEXT, seconds: "soon" })],
+    ["batches", () => json("/v1/batches", { model: EXISTING.openai, metadata: { note: TEXT } })],
+  ];
+  const noFile = (): Request => {
+    const form = new FormData();
+    form.set("purpose", TEXT);
+    return new Request(`http://gateway/v1/files?model=${EXISTING.openai}`, { method: "POST", body: form });
+  };
+  MALFORMED.push(["uploads", noFile]);
+
+  let etcdReachable = false;
+  let sls: MockSls | undefined;
+  let upstream: OpenAiUpstream | undefined;
+  let app: SpawnedApp | undefined;
+
+  beforeAll(async () => {
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
+    if (!etcdReachable) return;
+    sls = await startMockSls();
+    upstream = await startOpenAiUpstream();
+    app = await spawnApp({
+      extraEnv: {
+        [`SLS_CRED_${CREDENTIAL_REF.toUpperCase()}_AK_ID`]: "mock-akid",
+        [`SLS_CRED_${CREDENTIAL_REF.toUpperCase()}_AK_SECRET`]: "mock-secret",
+      },
+    });
+    const seed = new SeedClient(etcd, app.etcdPrefix);
+    await seed.createObservabilityExporter({
+      name: "ahead-of-chain",
+      enabled: true,
+      kind: "aliyun_sls",
+      endpoint: sls.url,
+      project: "aisix-e2e-obs",
+      logstore: AHEAD_LOGSTORE,
+      credential_ref: CREDENTIAL_REF,
+      content_mode: "full",
+    });
+    let guardedModelId = "";
+    for (const [name, provider, model_name, base, adapter] of [
+      [EXISTING.openai, "openai", "gpt-4o-mini", `${upstream.baseUrl}/v1`, undefined],
+      [GUARDED_MODEL, "openai", "gpt-4o-mini", `${upstream.baseUrl}/v1`, undefined],
+      [EXISTING.rerank, "cohere", "rerank-v3.5", `${upstream.baseUrl}/v1`, "openai"],
+      [EXISTING.anthropic, "anthropic", "claude-sonnet-4-5", upstream.baseUrl, undefined],
+      [EXISTING.video, "alibaba", "wan-mock", upstream.baseUrl, undefined],
+    ] as const) {
+      const pk = await seed.createProviderKey({
+        display_name: `${name}-pk`,
+        secret: "sk-mock",
+        provider,
+        ...(adapter ? { adapter } : {}),
+        api_base: base,
+      });
+      const model = await seed.createModel({ display_name: name, provider, model_name, provider_key_id: pk.id });
+      if (name === GUARDED_MODEL) guardedModelId = model.id;
+    }
+
+    // A rule that only watches applies to every caller here, and enforces nothing.
+    await seed.createGuardrail({
+      name: "ahead-monitored",
+      enabled: true,
+      enforcement_mode: "monitor",
+      hook_point: "input",
+      kind: "pii",
+      detectors: [{ type: "email", action: "mask" }],
+    });
+    const enforcing = await seed.createGuardrail(
+      {
+        name: "ahead-enforcing",
+        enabled: true,
+        hook_point: "input",
+        kind: "pii",
+        detectors: [{ type: "email", action: "mask" }],
+      },
+      { attach: false },
+    );
+    await seed.attachGuardrailToModel(enforcing.id, guardedModelId);
+    const access = { allowed_mcp_servers: ["*"], allowed_agents: ["*"], allowed_routes: ["*"] };
+    for (const [caller, allowed_models] of [
+      [GUARDED_CALLER, ["*"]],
+      [FORBIDDEN_CALLER, ["ahead-elsewhere"]],
+    ] as const) {
+      const key = await seed.createApiKey({ key_hash: sha256(caller), allowed_models: [...allowed_models], ...access });
+      await seed.update("guardrail_attachments", randomUUID(), {
+        guardrail_id: enforcing.id,
+        scope_type: "api_key",
+        scope_id: key.id,
+        priority: 100,
+      });
+    }
+    await seed.createApiKey({ key_hash: sha256(OPEN_CALLER), allowed_models: ["*"], ...access });
+    await waitConfigPropagation(async () => {
+      const res = await fetch(`${app!.proxyUrl}/v1/models`, {
+        headers: { authorization: `Bearer ${OPEN_CALLER}` },
+      });
+      await res.arrayBuffer();
+      return res.status === 200;
+    });
+  }, 120_000);
+
+  afterAll(async () => {
+    await app?.exit();
+    await sls?.close();
+    await upstream?.close();
+  });
+
+  /** Send `make()` as `caller` and read back its row, having checked the status. */
+  async function rowFor(make: () => Request, caller: string, status: number, label: string) {
+    const req = make();
+    const headers = new Headers(req.headers);
+    headers.set("authorization", `Bearer ${caller}`);
+    const url = new URL(req.url);
+    const res = await fetch(`${app!.proxyUrl}${url.pathname}${url.search}`, {
+      method: "POST",
+      headers,
+      body: await req.arrayBuffer(),
+    });
+    const body = await res.text();
+    expect(res.status, `${label}: ${body}`).toBe(status);
+    const requestId = res.headers.get("x-aisix-request-id");
+    expect(requestId, label).toBeTruthy();
+    const row = await waitForSlsLog(sls!, AHEAD_LOGSTORE, (r) => r.get("request_id") === requestId, `${label}: its row`);
+    expect(row.get("status_code"), label).toBe(String(status));
+    return row;
+  }
+
+  function expectNoText(row: Map<string, string>, label: string): void {
+    expect(row.get("input_messages"), label).toBeUndefined();
+    expect(row.get("prompt"), label).toBeUndefined();
+    const exported = [...row.values()].join("\n");
+    expect(exported, label).not.toContain(EMAIL);
+    expect(exported, label).not.toContain(KEEP);
+    // The row is still a full one: it says what the caller was told.
+    expect(row.get("response"), label).toBeTruthy();
+  }
+
+  function expectText(row: Map<string, string>, label: string): void {
+    expect([...row.values()].join("\n"), label).toContain(KEEP);
+  }
+
+  test.for(UNKNOWN_MODEL)("%s: a 404 under an enforcing rule carries no body", { timeout: 30_000 }, async ([label, make], ctx) => {
+    if (!etcdReachable) return ctx.skip();
+    expectNoText(await rowFor(make, GUARDED_CALLER, 404, label), label);
+  });
+
+  test.for(UNKNOWN_MODEL)("%s: a 404 with no enforcing rule keeps its body", { timeout: 30_000 }, async ([label, make], ctx) => {
+    if (!etcdReachable) return ctx.skip();
+    expectText(await rowFor(make, OPEN_CALLER, 404, label), label);
+  });
+
+  test.for(MALFORMED)("%s: a 400 under an enforcing rule carries no body", { timeout: 30_000 }, async ([label, make], ctx) => {
+    if (!etcdReachable) return ctx.skip();
+    expectNoText(await rowFor(make, GUARDED_CALLER, 400, label), label);
+  });
+
+  test.for(MALFORMED)("%s: a 400 with no enforcing rule keeps its body", { timeout: 30_000 }, async ([label, make], ctx) => {
+    if (!etcdReachable) return ctx.skip();
+    expectText(await rowFor(make, OPEN_CALLER, 400, label), label);
+  });
+
+  test.for(UNREACHABLE_MODEL)("%s: a 403 keeps its body under an enforcing rule", { timeout: 30_000 }, async ([label, make], ctx) => {
+    if (!etcdReachable) return ctx.skip();
+    expectText(await rowFor(make, FORBIDDEN_CALLER, 403, label), label);
+  });
+
+  test("a rule on the model addressed reaches the failure ahead of its chain, and only that model's", async (ctx) => {
+    if (!etcdReachable) return ctx.skip();
+    const make = (model: string) => () => json("/v1/images/generations", { model, prompt: TEXT, stream: true });
+    expectNoText(await rowFor(make(GUARDED_MODEL), OPEN_CALLER, 400, "the guarded model"), "the guarded model");
+    expectText(await rowFor(make(EXISTING.openai), OPEN_CALLER, 400, "another model"), "another model");
+  });
+});
