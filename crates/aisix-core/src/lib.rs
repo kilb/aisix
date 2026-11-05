@@ -24,6 +24,7 @@ pub mod filesource;
 pub mod forwarded_headers;
 pub mod header_template;
 pub mod host;
+pub mod log_value;
 pub mod mcp_openapi;
 pub mod models;
 pub mod resource;
@@ -57,6 +58,7 @@ pub use forwarded_headers::{
     NEVER_FORWARD_FROM_CLIENT_PREFIXES, NON_FORWARDABLE_HEADERS,
 };
 pub use header_template::{render_header_template, HeaderVars, HEADER_TEMPLATE_VARS};
+pub use log_value::LogValue;
 pub use models::{
     validate_a2a_agent, validate_apikey, validate_cache_policy, validate_guardrail,
     validate_mcp_server, validate_model, validate_observability_exporter, validate_provider_key,

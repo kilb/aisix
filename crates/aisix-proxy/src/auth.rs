@@ -362,7 +362,7 @@ where
                 reason = "missing_credentials",
                 http_method = %ctx.method,
                 path = %ctx.path,
-                request_id = %ctx.request_id,
+                request_id = %aisix_core::LogValue(ctx.request_id),
                 source_ip = %ctx.source_ip.resolve(),
                 "rejected inbound request without a credential",
             );
@@ -496,7 +496,7 @@ fn deny_key(
             reason = %reason,
             http_method = %ctx.method,
             path = %ctx.path,
-            request_id = %ctx.request_id,
+            request_id = %aisix_core::LogValue(ctx.request_id),
             source_ip = %ctx.source_ip.resolve(),
             "rejected inbound credential",
         );
@@ -508,7 +508,7 @@ fn deny_key(
             api_key_id = ?api_key_id,
             http_method = %ctx.method,
             path = %ctx.path,
-            request_id = %ctx.request_id,
+            request_id = %aisix_core::LogValue(ctx.request_id),
             source_ip = %ctx.source_ip.resolve(),
             "rejected inbound credential",
         );

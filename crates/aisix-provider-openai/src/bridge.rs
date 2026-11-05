@@ -981,14 +981,14 @@ where
                 StreamDoneOutcome::MissingDoneMarker => {
                     tracing::warn!(
                         bridge = bridge_name,
-                        request_id = %request_id,
+                        request_id = %aisix_core::LogValue(&request_id),
                         "upstream stream ended without [DONE] marker (policy=Required)"
                     );
                 }
                 StreamDoneOutcome::UnexpectedDoneMarker => {
                     tracing::warn!(
                         bridge = bridge_name,
-                        request_id = %request_id,
+                        request_id = %aisix_core::LogValue(&request_id),
                         "upstream emitted [DONE] marker (policy=None)"
                     );
                 }

@@ -220,9 +220,12 @@ pub(crate) async fn ensure_request_id(
         aisix_obs::RequestTraceBundle::new(remote).with_http_server(http),
     ));
 
+    // The id may be the caller's own, so it is written through `LogValue`:
+    // as is when it is an ordinary id, quoted when it could read as fields of
+    // the line, the same reason `downstream_request_id` below is a string.
     let span = tracing::info_span!(
         "request",
-        request_id = %id,
+        request_id = %aisix_core::LogValue(&id),
         http_version = http_version_label(request.version()),
         peer = tracing::field::Empty,
         downstream_request_id = tracing::field::Empty,

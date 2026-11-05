@@ -191,7 +191,7 @@ pub(crate) fn log_attempt_failure(
     fallback_on_statuses: &[u16],
 ) {
     tracing::warn!(
-        request_id = %request_id,
+        request_id = %aisix_core::LogValue(request_id),
         target_model = %target_model,
         target_attempt = attempt_number,
         error = %err,
