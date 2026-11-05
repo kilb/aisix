@@ -113,18 +113,17 @@ describe("mcp tool patterns with more than one `*`", () => {
     await seed.update("mcp_servers", randomUUID(), { display_name: "beta", url: beta.url, enabled: true });
     await seed.update("mcp_policies", ENV_POLICY_ID, {
       scope: "env",
-      mode: "all",
+      allow: ["*"],
       deny: ["*reverse*"],
     });
     await seed.createApiKey({
       key_hash: sha256(KEY_INHERIT),
       allowed_models: [],
-      mcp_access: { mode: "inherit" },
     });
     await seed.createApiKey({
       key_hash: sha256(KEY_KEY_DENY),
       allowed_models: [],
-      mcp_access: { mode: "inherit", deny: ["beta__*ch*"] },
+      mcp_access: { allow: ["*"], deny: ["beta__*ch*"] },
     });
     await seed.createApiKey({
       key_hash: sha256(KEY_ALLOWLIST),
