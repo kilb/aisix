@@ -20,8 +20,15 @@ export interface DocState {
    * 重载放在返回之前，是因为失败时它就是回滚。顺序反了的话调用方拿到
    * 的 doc 还是被拒的那份，下一次保存会把它连同新改动再提交一遍。
    */
-  save: (next: Json) => Promise<{ ok: boolean; message: string }>;
-  saveRawText: (text: string) => Promise<{ ok: boolean; message: string }>;
+  save: (next: Json) => Promise<SaveOutcome>;
+  saveRawText: (text: string) => Promise<SaveOutcome>;
+}
+
+export interface SaveOutcome {
+  ok: boolean;
+  message: string;
+  /** 因版本冲突被拒。界面重载之后，用户手上那份改动已经不在编辑框里了。 */
+  stale?: boolean;
 }
 
 function describe(e: unknown): string {
@@ -64,18 +71,20 @@ export function useDoc(enabled: boolean): DocState {
   }, [enabled, reload]);
 
   const commit = useCallback(
-    async (write: () => Promise<string>): Promise<{ ok: boolean; message: string }> => {
+    async (write: () => Promise<string>): Promise<SaveOutcome> => {
       let ok = false;
+      let stale = false;
       let message: string;
       try {
         message = detailMessage(await write());
         ok = true;
       } catch (e) {
         message = describe(e);
+        stale = e instanceof api.ApiError && e.stale;
       }
       // 成功是确认，失败是回滚 —— 两种情况都要以磁盘为准。
       await reload();
-      return { ok, message };
+      return { ok, message, stale };
     },
     [reload],
   );

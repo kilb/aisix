@@ -84,6 +84,11 @@ export function Users() {
       return;
     }
     const micro = Math.round(Number(usd) * 1_000_000);
+    // 填了正数却被舍入成 0：「设为 0」是把这个人的额度整个收回，与意图正相反。
+    if (Number(usd) > 0 && micro === 0) {
+      setErr(`金额 $${usd} 小于最小可表示单位（0.000001 美元），四舍五入后是 0`);
+      return;
+    }
     // 设定允许 0（把额度收回），发放不允许 —— 发放 0 是个空操作，静默成功会让
     // 人以为发出去了。
     if (!Number.isFinite(micro) || micro < 0 || (mode === "grant" && micro === 0)) {

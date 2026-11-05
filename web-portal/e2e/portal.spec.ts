@@ -465,3 +465,39 @@ test("吊销一把密钥会把它占的额度还回来", async ({ page }) => {
   await expect(page.locator(".budget")).toContainText("可再分配 $8.00");
   await expect(page.locator(".budget")).toContainText("已分配 $0.00");
 });
+
+test("超长的邮箱与请求体在入口就被挡下", async () => {
+  const post = (path: string, body: unknown) =>
+    fetch(`${fx.portalUrl}${path}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    }).then((r) => r.status);
+
+  const longEmail = `${"x".repeat(8_000)}@e2e.test`;
+  expect(await post("/api/register", { email: longEmail, password: PASSWORD })).toBe(400);
+  // 不存在的账号，返回与口令错一致。
+  expect(await post("/api/login", { email: longEmail, password: PASSWORD })).toBe(401);
+  expect(await post("/api/login", { email: "x".repeat(1_000_000), password: PASSWORD })).toBe(413);
+});
+
+test("额度框留空点保存不会悄悄撤掉上限", async ({ page }) => {
+  const email = mail("blank-quota");
+  await signUp(page, email);
+  await setQuota(email, 10_000_000);
+  await page.getByLabel("名称（可选）").fill("甲");
+  await page.getByRole("button", { name: "创建密钥" }).click();
+  await page.getByRole("button", { name: "我已保存" }).click();
+  await page.reload();
+
+  await keyRow(page, 0).getByRole("button", { name: "不设限" }).click();
+  await keyRow(page, 0).getByLabel(/的额度 USD$/).fill("6");
+  await keyRow(page, 0).getByRole("button", { name: "保存" }).click();
+  await expect(page.locator(".budget")).toContainText("已分配 $6.00");
+
+  await keyRow(page, 0).getByRole("button", { name: "$6.00" }).click();
+  await keyRow(page, 0).getByLabel(/的额度 USD$/).fill("");
+  await keyRow(page, 0).getByRole("button", { name: "保存" }).click();
+  await expect(page.locator(".note.crit")).toContainText("请填金额");
+  await expect(page.locator(".budget")).toContainText("已分配 $6.00");
+});

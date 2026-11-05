@@ -1,7 +1,7 @@
 import { useState } from "react";
 import * as api from "../lib/api";
 import { Msg } from "../components/Msg";
-import { fmtUsd, intOrNull, modelsOrAll } from "../lib/fmt";
+import { badInt, fmtSpendCap, intOrNull, modelsOrAll } from "../lib/fmt";
 import { useSave } from "../lib/useSave";
 import type { DocState } from "../lib/useDoc";
 
@@ -23,8 +23,7 @@ function fmtRl(rl: unknown): string {
  */
 function spendPolicyFor(policies: Rec[], keyName: unknown): Rec | undefined {
   return policies.find(
-    (p) =>
-      p.scope === "api_key" && p.scope_ref === keyName && p.max_spend_micro_usd != null,
+    (p) => p.scope === "api_key" && p.scope_ref === keyName && fmtSpendCap(p) != null,
   );
 }
 
@@ -51,6 +50,11 @@ export function Keys({ doc }: { doc: DocState }) {
     }
     if (keys.some((k) => k.display_name === n)) {
       setNote({ text: `已存在同名密钥「${n}」`, kind: "crit" });
+      return;
+    }
+
+    if (badInt(rpm) || badInt(tpm)) {
+      setNote({ text: "限速必须是正整数，留空表示不限", kind: "crit" });
       return;
     }
 
@@ -196,7 +200,7 @@ export function Keys({ doc }: { doc: DocState }) {
                       </td>
                       <td className="num" style={{ fontSize: 12 }}>
                         {sp ? (
-                          `${fmtUsd(sp.max_spend_micro_usd)} / ${String(sp.window ?? "day")}`
+                          sp.window != null ? `${fmtSpendCap(sp)} / ${String(sp.window)}` : fmtSpendCap(sp)
                         ) : (
                           <span style={{ color: "var(--ink-3)" }}>不限</span>
                         )}
@@ -350,11 +354,7 @@ export function Keys({ doc }: { doc: DocState }) {
                     </td>
                     <td>{String(p.window ?? "—")}</td>
                     <td className="right num">
-                      {p.max_spend_micro_usd != null ? (
-                        `$${(Number(p.max_spend_micro_usd) / 1e6).toFixed(2)}`
-                      ) : (
-                        <span style={{ color: "var(--ink-3)" }}>非花费策略</span>
-                      )}
+                      {fmtSpendCap(p) ?? <span style={{ color: "var(--ink-3)" }}>非花费策略</span>}
                     </td>
                     <td className="right">
                       <button className="ghost" disabled={busy} onClick={() => void delPolicy(i)}>

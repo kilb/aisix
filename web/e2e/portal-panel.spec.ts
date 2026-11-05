@@ -178,3 +178,19 @@ test("停用与恢复一个账号_两侧同时生效", async ({ page }) => {
   });
   expect(again.status, "恢复后仍然登不进去").toBe(200);
 });
+
+test("过小的金额不会被舍入成零_把这个人的额度收回", async ({ page }) => {
+  const email = mail("tiny-set");
+  const uid = await register(email);
+  await openPanel(page);
+  await page.getByLabel("用户").selectOption(uid);
+  await page.getByLabel("金额 USD").fill("5");
+  await page.getByRole("button", { name: "设为该额度" }).click();
+  await expect(page.getByText(/总额度已设为/)).toBeVisible();
+  expect(await granted(uid)).toBe(5_000_000);
+
+  await page.getByLabel("金额 USD").fill("0.0000001");
+  await page.getByRole("button", { name: "设为该额度" }).click();
+  await expect(page.locator(".note.crit", { hasText: "最小可表示单位" }).first()).toBeVisible();
+  expect(await granted(uid)).toBe(5_000_000);
+});

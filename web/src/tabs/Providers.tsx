@@ -87,7 +87,7 @@ export function Providers({ doc }: { doc: DocState }) {
                     </td>
                     <td>{String(p.provider ?? "openai")}</td>
                     <td className="num" style={{ fontSize: 12 }}>
-                      {maskKey(p.api_key)}
+                      {maskKey(p.api_key ?? p.secret)}
                     </td>
                     <td className="num" style={{ fontSize: 12 }}>
                       {String(p.api_base ?? "（默认）")}

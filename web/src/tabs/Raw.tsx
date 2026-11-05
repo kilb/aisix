@@ -4,6 +4,14 @@ import type { DocState } from "../lib/useDoc";
 
 export function Raw({ doc }: { doc: DocState }) {
   const [text, setText] = useState(doc.raw);
+  /**
+   * 因版本冲突没保存上的那份内容。
+   *
+   * 冲突之后编辑框必须换成磁盘上的最新内容：留着旧文本的话，下一次保存带的是新
+   * 版本号，别人刚做的改动就被它整份盖掉了。可手上的改动不能跟着消失，所以单独
+   * 留一份只读的，让人照着合进去。
+   */
+  const [draft, setDraft] = useState<string | null>(null);
   const [note, setNote] = useState<Note | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -24,8 +32,9 @@ export function Raw({ doc }: { doc: DocState }) {
     }
     setBusy(true);
     setNote({ text: "校验中…", kind: "ok" });
-    const { ok, message } = await doc.saveRawText(text);
+    const { ok, message, stale } = await doc.saveRawText(text);
     setNote({ text: message, kind: ok ? "ok" : "crit" });
+    setDraft(stale ? text : null);
     setBusy(false);
   }
 
@@ -66,6 +75,30 @@ export function Raw({ doc }: { doc: DocState }) {
         控制台保存时整体重写这个文件，所以手写的注释会消失。
       </div>
       <Msg note={note} />
+      {draft !== null && (
+        <div className="note warn">
+          <strong>刚才的内容没有保存，这里留了一份。</strong>
+          编辑框已换成磁盘上的最新内容，请把要改的部分重新合进去。
+          <textarea
+            readOnly
+            aria-label="没有保存上的内容"
+            spellCheck={false}
+            value={draft}
+            style={{
+              width: "100%",
+              minHeight: 200,
+              marginTop: 8,
+              fontFamily: "var(--mono)",
+              fontSize: 12,
+              background: "var(--paper-2)",
+              color: "var(--ink)",
+            }}
+          />
+          <button className="ghost" onClick={() => setDraft(null)}>
+            不要了
+          </button>
+        </div>
+      )}
     </div>
   );
 }

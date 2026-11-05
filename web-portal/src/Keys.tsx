@@ -70,6 +70,12 @@ export function Keys({ onChanged }: { onChanged: () => void }) {
   async function saveQuota(fullName: string) {
     // 金额按 micro-USD 整数下发。浮点做钱会累积误差，而这个产品的花费到千分
     // 之一美分 —— 在这里就换算成整数。
+    // 空框不算 0：`Number("")` 是 0，而 0 在这里是「不单独设限」，点一下保存就把
+    // 上限撤了。要撤就明确填 0。
+    if (quotaUsd.trim() === "") {
+      setErr("请填金额；要取消这把密钥的单独额度请填 0");
+      return;
+    }
     const usd = Number(quotaUsd);
     const micro = Math.round(usd * 1_000_000);
     if (!Number.isFinite(micro) || micro < 0) {

@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { Msg } from "../components/Msg";
-import { fmtUsd, intOrNull } from "../lib/fmt";
+import { badInt, fmtSpendCap, intOrNull } from "../lib/fmt";
 import { useSave } from "../lib/useSave";
 import type { DocState } from "../lib/useDoc";
 
@@ -47,9 +47,21 @@ export function Limits({ doc }: { doc: DocState }) {
       setNote({ text: "名称不能为空", kind: "crit" });
       return;
     }
+    if (badInt(req) || badInt(tok)) {
+      setNote({ text: "请求数和 Token 上限必须是正整数，留空表示不限", kind: "crit" });
+      return;
+    }
     const r = intOrNull(req);
     const t = intOrNull(tok);
     const usd = parseFloat(spend);
+    // 与调用方密钥页同一道闸：四舍五入成 0 的上限等于禁止花任何钱。
+    if (usd > 0 && Math.round(usd * 1e6) < 1) {
+      setNote({
+        text: `花费上限 $${usd} 小于最小可表示单位（0.000001 美元），四舍五入后会变成 0。请填更大的值或留空。`,
+        kind: "crit",
+      });
+      return;
+    }
     if (!r && !t && !(usd > 0)) {
       setNote({
         text: "三个上限至少要填一个——不填任何上限的策略网关会拒绝加载",
@@ -138,11 +150,7 @@ export function Limits({ doc }: { doc: DocState }) {
                       {p.max_tokens != null ? String(p.max_tokens) : <Unset />}
                     </td>
                     <td className="right num">
-                      {p.max_spend_micro_usd != null ? (
-                        fmtUsd(p.max_spend_micro_usd)
-                      ) : (
-                        <Unset />
-                      )}
+                      {fmtSpendCap(p) ?? <Unset />}
                     </td>
                     <td className="right">
                       <button className="ghost" disabled={busy} onClick={() => void del(i)}>
@@ -204,7 +212,7 @@ export function Limits({ doc }: { doc: DocState }) {
             ) : (
               <input
                 type="text"
-                placeholder={scope === "team" ? "团队 id" : "用户 id"}
+                placeholder={scope === "member" ? "用户 id" : "团队 id"}
                 value={ref}
                 onChange={(e) => setRef(e.target.value)}
               />

@@ -31,12 +31,29 @@ export function fmtUsd(micro: unknown): string {
   })}`;
 }
 
+/**
+ * 一条策略的花费上限，读得懂的写法。没有花费上限时是 null。
+ *
+ * 门户下推的额度写在 `granted_micro_usd` 上：没有窗口、不会刷新，是累计口径。漏看
+ * 它的话，一把有额度的密钥在界面上就是「不限」。
+ */
+export function fmtSpendCap(p: Record<string, unknown>): string | null {
+  if (p.max_spend_micro_usd != null) return fmtUsd(p.max_spend_micro_usd);
+  if (p.granted_micro_usd != null) return `${fmtUsd(p.granted_micro_usd)}（累计）`;
+  return null;
+}
+
 /** 正整数或 null。空框表示「不设」，不是 0。 */
 export function intOrNull(v: unknown): number | null {
   const s = String(v ?? "").trim();
   if (!s) return null;
   const n = Number(s);
   return Number.isInteger(n) && n > 0 ? n : null;
+}
+
+/** 框里填了东西，却不是正整数。这种值不能当成「不设」悄悄丢掉。 */
+export function badInt(v: unknown): boolean {
+  return String(v ?? "").trim() !== "" && intOrNull(v) === null;
 }
 
 /**

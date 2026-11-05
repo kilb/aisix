@@ -565,3 +565,216 @@ test("门户的管理凭据既不进前端产物_也不进任何接口响应", a
 
   expect(leaked, "门户凭据泄漏到了浏览器").toEqual([]);
 });
+
+/** 改一份当前文档再提交。经页面内 fetch，理由见 `otherClient`。 */
+async function seedDoc(
+  browser: import("@playwright/test").Browser,
+  mutate: (doc: Record<string, unknown[]>) => void,
+): Promise<void> {
+  const api = await otherClient(browser);
+  const cur = (await api.get("/api/file")).body as {
+    doc: Record<string, unknown[]>;
+    version: string;
+  };
+  const doc = structuredClone(cur.doc);
+  mutate(doc);
+  const r = await api.put("/api/file", { doc, base_version: cur.version, client_contract: 1 });
+  expect(r.status).toBe(200);
+}
+
+test("加价系数乘到全部四个价上", async ({ page }) => {
+  await signIn(page);
+  await page.getByRole("tab", { name: "模型与定价" }).click();
+  await page.getByLabel("对外模型名").fill("marked-up");
+  await page.getByLabel("上游模型名").fill("gpt-4o-mini");
+  await page.getByLabel("输入 USD / 1k").fill("1");
+  await page.getByLabel("输出 USD / 1k").fill("2");
+  await page.getByLabel(/加价 \/ 折扣系数/).fill("1.5");
+  await page.getByRole("button", { name: /保存并重载网关/ }).click();
+  await expect(page.getByText(/已保存/)).toBeVisible();
+
+  // 表单写明系数「对全部四个价生效」。openai 的缓存读是输入价的一半、缓存写等于
+  // 输入价，所以四个价是 1.5、3、0.75、1.5。
+  const row = page.getByRole("row", { name: /marked-up/ });
+  await expect(row).toContainText("$1.50000");
+  await expect(row).toContainText("$3.00000");
+  await expect(row).toContainText("$0.75000");
+});
+
+test("手填的缓存价也吃加价系数", async ({ page }) => {
+  await signIn(page);
+  await page.getByRole("tab", { name: "模型与定价" }).click();
+  await page.getByLabel("对外模型名").fill("marked-up-by-hand");
+  await page.getByLabel("上游模型名").fill("gpt-4o-mini");
+  await page.getByLabel("输入 USD / 1k").fill("1");
+  await page.getByLabel("输出 USD / 1k").fill("1");
+  await page.getByLabel("缓存读 USD / 1k").fill("0.2");
+  await page.getByLabel(/加价 \/ 折扣系数/).fill("2");
+  await page.getByRole("button", { name: /保存并重载网关/ }).click();
+  await expect(page.getByText(/已保存/)).toBeVisible();
+
+  const row = page.getByRole("row", { name: /marked-up-by-hand/ });
+  await expect(row).toContainText("$2.00000");
+  await expect(row).toContainText("$0.40000");
+});
+
+test("新增模型的供应商类型跟着绑定的供应商走_换类型后缓存价跟着换算", async ({ page, browser }) => {
+  await seedDoc(browser, (doc) => {
+    doc.provider_keys!.push({
+      display_name: "claude-main",
+      provider: "anthropic",
+      api_key: "sk-ant-e2e",
+    });
+  });
+  await signIn(page);
+  await page.getByRole("tab", { name: "模型与定价" }).click();
+  await page.getByLabel("绑定供应商").selectOption("claude-main");
+  await expect(page.getByLabel("供应商类型")).toHaveValue("anthropic");
+
+  // anthropic 的缓存读是输入价的十分之一。
+  await page.getByLabel("输入 USD / 1k").fill("1");
+  await expect(page.getByLabel("缓存读 USD / 1k")).toHaveValue("0.1");
+  // 换一家：还没手改过，缓存价跟着新一家的倍率走。openai 是一半。
+  await page.getByLabel("供应商类型").selectOption("openai");
+  await expect(page.getByLabel("缓存读 USD / 1k")).toHaveValue("0.5");
+});
+
+test("没写基址的陌生供应商拉取清单时被拦下_说清要填基址", async ({ page }) => {
+  await signIn(page);
+  await page.getByRole("tab", { name: "供应商" }).click();
+  await page.getByLabel("名称").fill("gemini-no-base");
+  await page.getByLabel("供应商").selectOption("gemini");
+  await page.getByLabel("API 密钥").fill("sk-gemini-e2e");
+  await page.getByRole("button", { name: /保存并重载网关/ }).click();
+  await expect(page.getByText(/已保存/)).toBeVisible();
+
+  await page.getByRole("tab", { name: "模型与定价" }).click();
+  const panel = page.locator(".panel", { hasText: "从上游同步模型" });
+  await panel.getByLabel("供应商").selectOption("gemini-no-base");
+  await panel.getByRole("button", { name: "拉取清单" }).click();
+  await expect(panel.locator(".note.crit")).toContainText("API 基址");
+});
+
+test("路由模型不算未定价_花费按派发到的目标算", async ({ page, browser }) => {
+  await seedDoc(browser, (doc) => {
+    doc.models!.push({
+      display_name: "route-parent",
+      routing: { targets: [{ model: "seed-model" }] },
+    });
+  });
+  await signIn(page);
+  await page.getByRole("tab", { name: "模型与定价" }).click();
+  const warn = page.locator(".note.warn", { hasText: "没有定价" });
+  await expect(warn).toContainText("seed-model");
+  await expect(warn).not.toContainText("route-parent");
+});
+
+test("填错的限速不会被当成不限_密钥不铸出来", async ({ page }) => {
+  await signIn(page);
+  await page.getByRole("tab", { name: "调用方密钥" }).click();
+  await page.getByLabel("名称").fill("bad-rpm");
+  await page.getByLabel(/每分钟请求上限/).fill("1.5");
+  await page.getByRole("button", { name: /生成并重载网关/ }).click();
+
+  await expect(page.locator(".note.crit", { hasText: "正整数" })).toBeVisible();
+  await expect(page.getByText(/密钥明文/)).toHaveCount(0);
+  expect(fx.read()).not.toContain("bad-rpm");
+});
+
+test("策略页同样不吞掉填错的上限_也不把过小的花费舍成零", async ({ page }) => {
+  await signIn(page);
+  await page.getByRole("tab", { name: "限流与预算" }).click();
+  await page.getByLabel("名称").fill("bad-limit");
+  await page.getByLabel("请求数上限").fill("-5");
+  await page.getByLabel("Token 上限").fill("100");
+  await page.getByRole("button", { name: /保存并重载网关/ }).click();
+  await expect(page.locator(".note.crit", { hasText: "正整数" })).toBeVisible();
+  expect(fx.read()).not.toContain("bad-limit");
+
+  await page.getByLabel("请求数上限").fill("");
+  await page.getByLabel("Token 上限").fill("");
+  await page.getByLabel("花费上限 USD").fill("0.0000001");
+  await page.getByRole("button", { name: /保存并重载网关/ }).click();
+  await expect(page.locator(".note.crit", { hasText: "最小可表示单位" })).toBeVisible();
+  expect(fx.read()).not.toContain("bad-limit");
+});
+
+test("团队成员作用域要的是团队 id", async ({ page }) => {
+  await signIn(page);
+  await page.getByRole("tab", { name: "限流与预算" }).click();
+  await page.getByLabel("作用域").selectOption("team_member");
+  await expect(page.getByLabel("对象")).toHaveAttribute("placeholder", "团队 id");
+  await page.getByLabel("作用域").selectOption("member");
+  await expect(page.getByLabel("对象")).toHaveAttribute("placeholder", "用户 id");
+});
+
+test("门户下推的累计额度在两张表里都看得到_不显示成不限", async ({ page, browser }) => {
+  await seedDoc(browser, (doc) => {
+    doc.api_keys!.push({
+      display_name: "quota-key",
+      key_hash: "2".repeat(64),
+      user_id: "user-1",
+      allowed_models: ["*"],
+    });
+    doc.rate_limit_policies = [
+      ...(doc.rate_limit_policies ?? []),
+      {
+        name: "portal-key-quota-key",
+        scope: "api_key",
+        scope_ref: "quota-key",
+        granted_micro_usd: 3_000_000,
+      },
+    ];
+  });
+  await signIn(page);
+  await page.getByRole("tab", { name: "调用方密钥" }).click();
+  const key = page.getByRole("row", { name: /quota-key/ }).first();
+  // 第四列是花费上限。
+  const cap = key.locator("td").nth(3);
+  await expect(cap).toContainText("$3.00");
+  await expect(cap).not.toContainText("不限");
+
+  await page.getByRole("tab", { name: "限流与预算" }).click();
+  await expect(page.getByRole("row", { name: /portal-key-quota-key/ })).toContainText("$3.00");
+});
+
+test("用另一种写法存的上游密钥同样被遮蔽显示", async ({ page, browser }) => {
+  await seedDoc(browser, (doc) => {
+    doc.provider_keys!.push({
+      display_name: "secret-spelling",
+      provider: "openai",
+      secret: "sk-secret-spelling-value",
+    });
+  });
+  await signIn(page);
+  await page.getByRole("tab", { name: "供应商" }).click();
+  const row = page.getByRole("row", { name: /secret-spelling/ });
+  await expect(row).toContainText("…");
+  await expect(row).not.toContainText("sk-secret-spelling-value");
+});
+
+test("版本冲突时手上的原文不丢_且不会盖掉别人的改动", async ({ page, browser }) => {
+  await signIn(page);
+  await page.getByRole("tab", { name: "配置原文" }).click();
+  const box = page.getByRole("textbox").first();
+  await expect(box).not.toHaveValue("");
+  const mine = `${await box.inputValue()}# my-unsaved-edit\n`;
+  await box.fill(mine);
+
+  // 编辑期间另一处改了配置。
+  await seedDoc(browser, (doc) => {
+    doc.provider_keys!.push({
+      display_name: "changed-meanwhile",
+      provider: "openai",
+      api_key: "sk-meanwhile",
+    });
+  });
+
+  await page.getByRole("button", { name: "校验并保存" }).click();
+  await expect(page.getByText(/配置在你编辑期间已被改动/)).toBeVisible();
+  await expect(page.getByLabel("没有保存上的内容")).toHaveValue(/my-unsaved-edit/);
+  // 编辑框是磁盘上的最新内容，所以再点一次保存也盖不掉那次改动。
+  await expect(box).toHaveValue(/changed-meanwhile/);
+  await expect(box).not.toHaveValue(/my-unsaved-edit/);
+  expect(fx.read()).toContain("changed-meanwhile");
+});
