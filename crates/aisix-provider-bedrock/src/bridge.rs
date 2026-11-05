@@ -3206,6 +3206,7 @@ fn build_converse_additional_model_request_fields(
         let mut extras = req.extra.clone();
         let budget_max_tokens = write_thinking_budget(req, &mut extras);
         thinking_max_tokens = translate_reasoning_effort_to_anthropic(
+            req,
             &mut extras,
             bedrock_claude_model_name(upstream_id).unwrap_or(upstream_id),
             crate::converse_req::max_tokens(req),
@@ -8539,6 +8540,37 @@ mod stream_contract_tests {
                 "{body:?}: {failure:?}"
             );
         }
+    }
+
+    /// A caller's effort writes adaptive thinking on Converse too, under the
+    /// Claude name the Bedrock id carries, and only on Claude.
+    #[test]
+    fn a_callers_effort_turns_on_adaptive_thinking_on_converse() {
+        let fields = |model: &str| {
+            let mut req = ChatFormat::new("m", vec![ChatMessage::user("hi")]);
+            req.extra.insert("reasoning_effort".into(), "high".into());
+            req.thoughts_requested = true;
+            let (fields, _) = build_converse_additional_model_request_fields(
+                &req,
+                model,
+                None,
+                &compat_ctx(None),
+            )
+            .unwrap();
+            fields.as_ref().map(document_to_json).unwrap_or_default()
+        };
+        assert_eq!(
+            fields("us.anthropic.claude-opus-4-6-v1:0")["thinking"],
+            serde_json::json!({"type": "adaptive", "display": "summarized"})
+        );
+        assert_eq!(
+            fields("us.anthropic.claude-opus-4-6-v1:0")["output_config"]["effort"],
+            "high"
+        );
+        assert!(fields("us.anthropic.claude-opus-4-5-20251101-v1:0")
+            .get("thinking")
+            .is_none());
+        assert!(fields("amazon.nova-2-lite-v1:0").get("thinking").is_none());
     }
 
     /// The provider key's body overrides apply on the Chat Completions route,

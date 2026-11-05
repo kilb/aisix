@@ -242,10 +242,11 @@ describe("reasoning effort → Claude families without effort support: thinking 
     }
   });
 
-  test("models that accept effort keep the effort-only body", async (ctx) => {
+  test("models that accept effort take it as an effort, with adaptive thinking where they take that", async (ctx) => {
     if (!etcdReachable || !app || !upstream) return ctx.skip();
     // Opus 4.5, Claude 4.6+ and names with no readable Claude version
     // (an Anthropic-compatible endpoint serving another vendor's model).
+    // Of these only Claude 4.6+ takes adaptive thinking.
     for (const model of ["effort-opus-45", "effort-sonnet-46", "effort-unversioned"]) {
       const body = await upstreamBody(
         "/v1/chat/completions",
@@ -253,7 +254,11 @@ describe("reasoning effort → Claude families without effort support: thinking 
         MESSAGES,
       );
       expect(body.output_config, model).toEqual({ effort: "high" });
-      expect(body.thinking, model).toBeUndefined();
+      if (model === "effort-sonnet-46") {
+        expect(body.thinking, model).toEqual({ type: "adaptive", display: "summarized" });
+      } else {
+        expect(body.thinking, model).toBeUndefined();
+      }
       expect(body.max_tokens, model).toBe(4096);
       expect(body.reasoning_effort, model).toBeUndefined();
     }
@@ -263,7 +268,7 @@ describe("reasoning effort → Claude families without effort support: thinking 
       MESSAGES,
     );
     expect(responses.output_config).toEqual({ effort: "low" });
-    expect(responses.thinking).toBeUndefined();
+    expect(responses.thinking).toEqual({ type: "adaptive", display: "summarized" });
     expect(responses.max_tokens).toBe(4096);
   });
 

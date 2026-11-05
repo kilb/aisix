@@ -313,9 +313,9 @@ describe("OpenAI Chat → Anthropic upstream: reasoning_effort becomes output_co
     const tiered = await upstreamBodyFor({ reasoning_effort: "xhigh" });
     expect(tiered.reasoning_effort).toBeUndefined();
     expect(tiered.output_config).toEqual({ effort: "xhigh" });
-    // The caller asked for a depth, not a thinking mode — the model
-    // applies its own.
-    expect(tiered.thinking).toBeUndefined();
+    // This model takes adaptive thinking, and without the block it would
+    // not think at all at the depth the caller asked for.
+    expect(tiered.thinking).toEqual({ type: "adaptive", display: "summarized" });
 
     // Anthropic's vocabulary has no `minimal`; `low` is its floor.
     const minimal = await upstreamBodyFor({ reasoning_effort: "minimal" });

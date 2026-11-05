@@ -842,7 +842,7 @@ pub fn build_request<'a>(
         }
     }
     let thinking_max_tokens =
-        translate_reasoning_effort_to_anthropic(&mut extras, upstream_model, max_tokens)?
+        translate_reasoning_effort_to_anthropic(req, &mut extras, upstream_model, max_tokens)?
             .or(budget_max_tokens);
     // `response_format` is the OpenAI spelling of structured outputs. It
     // has no top-level Anthropic counterpart, so it is always consumed
@@ -1190,8 +1190,11 @@ fn claude_family_version(model: &str) -> Option<(u32, u32)> {
 /// `max_tokens` too small for Anthropic's minimum budget leaves thinking
 /// off.
 ///
-/// On the effort path `thinking` is left alone: a caller asking for a
-/// depth tier has said nothing about which thinking mode it wants.
+/// On the effort path a caller's own effort also asks for thinking, so a
+/// model that takes adaptive thinking gets it beside the tier, with its
+/// summary on: without the block Claude 4.6-4.8 does not think at all and
+/// Claude 5 and later hide what they thought. See [`effort_turns_on_thinking`].
+/// A `thinking` the caller sent stands.
 ///
 /// An effort the caller expressed natively always wins, being the more
 /// specific statement of the same setting. That means `output_config.effort`
@@ -1200,6 +1203,7 @@ fn claude_family_version(model: &str) -> Option<(u32, u32)> {
 /// declaration would drop the tier of any request that sent one of those.
 /// On the budget path a native `thinking` block wins the same way.
 pub fn translate_reasoning_effort_to_anthropic(
+    req: &ChatFormat,
     extras: &mut serde_json::Map<String, serde_json::Value>,
     model: &str,
     max_tokens: Option<u32>,
@@ -1217,11 +1221,12 @@ pub fn translate_reasoning_effort_to_anthropic(
         }
     };
     Ok(reasoning_effort_into_anthropic(
-        extras, effort, model, max_tokens,
+        req, extras, effort, model, max_tokens,
     ))
 }
 
 fn reasoning_effort_into_anthropic(
+    req: &ChatFormat,
     extras: &mut serde_json::Map<String, serde_json::Value>,
     effort: &str,
     model: &str,
@@ -1297,7 +1302,48 @@ fn reasoning_effort_into_anthropic(
             );
         }
     }
+    if effort_turns_on_thinking(req, extras, model) {
+        extras
+            .entry("thinking")
+            .or_insert_with(|| serde_json::json!({"type": "adaptive", "display": "summarized"}));
+    }
     None
+}
+
+/// Whether this request's effort also writes adaptive thinking: the caller
+/// asked for it themselves ([`ChatFormat::thoughts_requested`], which an
+/// operator's `effort_mapping` does not set), and the model takes it.
+///
+/// Opus 4.6 and Sonnet 4.6 are the exception. They accept these sampling
+/// parameters only while thinking is off: "`temperature` and `top_k` are
+/// incompatible with thinking, and `top_p` is allowed at values between 0.95
+/// and 1" (<https://platform.claude.com/docs/en/build-with-claude/thinking#sampling-parameters>).
+/// A request that sets one keeps the effort alone rather than becoming a 400.
+/// The families after them refuse those values with thinking on or off.
+fn effort_turns_on_thinking(
+    req: &ChatFormat,
+    extras: &serde_json::Map<String, serde_json::Value>,
+    model: &str,
+) -> bool {
+    let sampling_excludes_thinking = claude_family_version(model) == Some((4, 6))
+        && (req.temperature.is_some()
+            || req.top_k.is_some()
+            || extras.contains_key("top_k")
+            || req.top_p.is_some_and(|p| !(0.95..=1.0).contains(&p)));
+    req.thoughts_requested && takes_adaptive_thinking(model) && !sampling_excludes_thinking
+}
+
+/// Whether `model` names a Claude model that takes `thinking.type: "adaptive"`:
+/// Claude 4.6 and later and Mythos Preview, per the table at
+/// <https://platform.claude.com/docs/en/build-with-claude/thinking#configuring-thinking>.
+/// Claude 4.5 and earlier answer it with a 400
+/// (<https://platform.claude.com/docs/en/api/errors#adaptive-thinking-not-supported>),
+/// and a name with no readable Claude version is not one of them.
+fn takes_adaptive_thinking(model: &str) -> bool {
+    claude_family_version(model).is_some_and(|version| version >= (4, 6))
+        || model
+            .to_ascii_lowercase()
+            .starts_with("claude-mythos-preview")
 }
 
 /// Whether `model` names a Claude family that rejects
@@ -10261,6 +10307,131 @@ mod request_contract_tests {
         .unwrap();
         let chunk = StreamState::default().next_chunk(&event).unwrap();
         assert_eq!(chunk.usage.unwrap().reasoning_tokens, 30);
+    }
+
+    fn effort_body(model: &str, set: impl FnOnce(&mut ChatFormat)) -> serde_json::Value {
+        let mut req = ChatFormat::new("m", vec![ChatMessage::user("hi")]);
+        req.extra.insert("reasoning_effort".into(), "high".into());
+        req.thoughts_requested = true;
+        set(&mut req);
+        let (system, messages) = split_system(&req).unwrap();
+        serde_json::to_value(build_request(&req, model, system, messages, false).unwrap()).unwrap()
+    }
+
+    const SUMMARIZED: fn() -> serde_json::Value =
+        || serde_json::json!({"type": "adaptive", "display": "summarized"});
+
+    /// Every model the docs' table lists as taking adaptive thinking, under the
+    /// names the routes hand this function.
+    #[test]
+    fn a_callers_effort_turns_on_adaptive_thinking_where_the_model_takes_it() {
+        for model in [
+            "claude-opus-4-6",
+            "claude-sonnet-4-6",
+            "claude-sonnet-4-6@20260217",
+            "claude-opus-4-6-v1:0",
+            "claude-opus-4-7",
+            "claude-opus-4-8",
+            "claude-opus-5",
+            "claude-sonnet-5",
+            "claude-opus-5-5",
+            "claude-sonnet-5-5",
+            "claude-haiku-5-5",
+            "claude-fable-5",
+            "claude-fable-5-1",
+            "claude-mythos-5",
+            "claude-mythos-5-1",
+            "claude-mythos-preview",
+        ] {
+            let body = effort_body(model, |_| {});
+            assert_eq!(body["thinking"], SUMMARIZED(), "{model}");
+            assert_eq!(body["output_config"]["effort"], "high", "{model}");
+        }
+    }
+
+    /// Claude 4.5 and earlier answer adaptive with a 400, and a name with no
+    /// readable Claude version may not be Claude at all.
+    #[test]
+    fn a_model_that_does_not_take_adaptive_thinking_is_not_sent_it() {
+        for model in [
+            "claude-opus-4-5",
+            "claude-opus-4-5-20251101",
+            "glm-5",
+            "c-name",
+        ] {
+            let body = effort_body(model, |_| {});
+            assert!(body.get("thinking").is_none(), "{model}: {body}");
+            assert_eq!(body["output_config"]["effort"], "high", "{model}");
+        }
+        for model in [
+            "claude-sonnet-4-5",
+            "claude-haiku-4-5-20251001",
+            "claude-3-7-sonnet-20250219",
+        ] {
+            let body = effort_body(model, |_| {});
+            assert_eq!(body["thinking"]["type"], "enabled", "{model}: {body}");
+        }
+    }
+
+    #[test]
+    fn a_thinking_the_caller_sent_stands() {
+        for sent in [
+            serde_json::json!({"type": "adaptive", "display": "omitted"}),
+            serde_json::json!({"type": "adaptive"}),
+            serde_json::json!({"type": "enabled", "budget_tokens": 2048}),
+        ] {
+            let body = effort_body("claude-opus-4-6", |req| {
+                req.extra.insert("thinking".into(), sent.clone());
+            });
+            assert_eq!(body["thinking"], sent);
+        }
+    }
+
+    /// `none` stays what it was, and a tier nothing can read writes nothing.
+    #[test]
+    fn only_an_effort_with_a_tier_turns_thinking_on() {
+        let none = effort_body("claude-opus-4-6", |req| {
+            req.extra.insert("reasoning_effort".into(), "none".into());
+        });
+        assert_eq!(none["thinking"], serde_json::json!({"type": "disabled"}));
+        let unknown = effort_body("claude-opus-4-6", |req| {
+            req.extra
+                .insert("reasoning_effort".into(), "extreme".into());
+        });
+        assert!(unknown.get("thinking").is_none(), "{unknown}");
+    }
+
+    /// An effort only an operator's mapping wrote says nothing of the caller's
+    /// wanting to pay for thinking.
+    #[test]
+    fn an_effort_the_caller_did_not_ask_for_stays_an_effort() {
+        let body = effort_body("claude-opus-4-6", |req| req.thoughts_requested = false);
+        assert!(body.get("thinking").is_none(), "{body}");
+        assert_eq!(body["output_config"]["effort"], "high");
+    }
+
+    /// On Opus and Sonnet 4.6 these answer a 400 beside thinking and work
+    /// without it, so the request keeps working as it did.
+    #[test]
+    fn sampling_that_excludes_thinking_keeps_the_effort_alone() {
+        type Set = fn(&mut ChatFormat);
+        let excluding: [Set; 4] = [
+            |req| req.temperature = Some(0.2),
+            |req| req.top_k = Some(5),
+            |req| {
+                req.extra.insert("top_k".into(), 5.into());
+            },
+            |req| req.top_p = Some(0.5),
+        ];
+        for model in ["claude-opus-4-6", "claude-sonnet-4-6"] {
+            for set in excluding {
+                let body = effort_body(model, set);
+                assert!(body.get("thinking").is_none(), "{model}: {body}");
+                assert_eq!(body["output_config"]["effort"], "high", "{model}");
+            }
+            let in_range = effort_body(model, |req| req.top_p = Some(0.97));
+            assert_eq!(in_range["thinking"], SUMMARIZED(), "{model}");
+        }
     }
 
     #[test]
