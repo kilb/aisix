@@ -233,6 +233,20 @@ impl SinkHandle {
     }
 }
 
+/// Writes the exit line of a worker that was dropped rather than returning,
+/// which is what aborting it does: [`SinkPipeline::run`] reaches neither of its
+/// own, and the queue goes with the task. Holds the sink's name until `run`
+/// reaches one of them.
+struct TornDownLine(Option<String>);
+
+impl Drop for TornDownLine {
+    fn drop(&mut self) {
+        if let Some(sink) = self.0.take() {
+            tracing::info!(%sink, "sink pipeline shutting down: queued records discarded");
+        }
+    }
+}
+
 /// The per-sink worker: drains the queue, batches, and delivers with
 /// retry/backoff. Build with [`SinkPipeline::new`]; the caller spawns
 /// [`SinkPipeline::run`].
@@ -302,6 +316,7 @@ impl SinkPipeline {
             retry_budget_secs = self.cfg.retry_budget.as_secs(),
             "sink pipeline started",
         );
+        let mut torn_down = TornDownLine(Some(self.sink.name().to_string()));
 
         loop {
             tokio::select! {
@@ -315,6 +330,7 @@ impl SinkPipeline {
                     None => {
                         self.drain(&mut buffer, &mut shutdown).await;
                         tracing::info!(sink = %self.sink.name(), "sink pipeline: channel closed, exiting");
+                        torn_down.0 = None;
                         return;
                     }
                 },
@@ -325,6 +341,7 @@ impl SinkPipeline {
                     if *cancel.borrow() {
                         self.drain(&mut buffer, &mut shutdown).await;
                         tracing::info!(sink = %self.sink.name(), "sink pipeline shutting down");
+                        torn_down.0 = None;
                         return;
                     }
                 }

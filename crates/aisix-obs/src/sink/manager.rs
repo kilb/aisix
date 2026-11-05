@@ -124,12 +124,16 @@ impl ExporterPipelines {
     /// the next [`Self::get_or_create`] call.
     pub fn reconcile(&self, desired: &HashMap<String, u64>) {
         let mut running = self.running.lock();
-        running.retain(|key, pipeline| {
-            if desired.get(key) == Some(&pipeline.fingerprint) {
-                true
-            } else {
+        running.retain(|key, pipeline| match desired.get(key) {
+            Some(fingerprint) if *fingerprint == pipeline.fingerprint => true,
+            Some(_) => {
                 pipeline.worker.abort();
-                tracing::info!(exporter = %key, "stopping revoked exporter pipeline");
+                tracing::info!(exporter = %key, "stopping reconfigured exporter pipeline");
+                false
+            }
+            None => {
+                pipeline.worker.abort();
+                tracing::info!(exporter = %key, "stopping removed exporter pipeline");
                 false
             }
         });
