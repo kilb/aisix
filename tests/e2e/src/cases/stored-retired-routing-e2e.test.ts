@@ -39,7 +39,6 @@ describe("a stored group using a retired routing setting", () => {
     upstreams.push(await startOpenAiUpstream(), await startOpenAiUpstream());
     app = await spawnApp();
     seed = new SeedClient(etcd, app.etcdPrefix);
-    await seed.createApiKey({ key_hash: CALLER_KEY_HASH, allowed_models: ["*"] });
     for (const [i, upstream] of upstreams.entries()) {
       const pk = await seed.createProviderKey({
         display_name: `stored-routing-pk-${i}`,
@@ -54,6 +53,7 @@ describe("a stored group using a retired routing setting", () => {
         provider_key_id: pk.id,
       });
     }
+    await seed.createApiKey({ key_hash: CALLER_KEY_HASH, allowed_models: ["*"] });
   });
 
   afterAll(async () => {

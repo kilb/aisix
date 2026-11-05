@@ -98,11 +98,6 @@ describe("input rule: request shapes", () => {
       credential_mode: "inject",
       provider_key_id: pk.id,
     });
-    await seed.createApiKey({
-      key_hash: sha256(KEY),
-      allowed_models: ["*"],
-      allowed_routes: ["*"],
-    });
     await seed.createGuardrail({
       name: "shapes-rule",
       enabled: true,
@@ -110,6 +105,11 @@ describe("input rule: request shapes", () => {
       fail_open: false,
       kind: "keyword",
       patterns: [{ kind: "literal", value: WORD }],
+    });
+    await seed.createApiKey({
+      key_hash: sha256(KEY),
+      allowed_models: ["*"],
+      allowed_routes: ["*"],
     });
     await waitConfigPropagation(async () => {
       try {

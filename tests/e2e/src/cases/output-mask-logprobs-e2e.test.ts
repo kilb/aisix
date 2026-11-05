@@ -265,7 +265,6 @@ describe("output mask keeps a masked value out of token log-probabilities", () =
     await model("lp-completion-stream", { streamEvents: COMPLETION_STREAM });
     await model("lp-responses", { nonStreamBody: RESPONSES_BODY });
     await model("lp-responses-stream", { streamEvents: RESPONSES_STREAM });
-    await seed.createApiKey({ key_hash: sha256(KEY), allowed_models: ["*"] });
     await seed.createGuardrail({
       name: "lp-mask",
       enabled: true,
@@ -273,6 +272,7 @@ describe("output mask keeps a masked value out of token log-probabilities", () =
       kind: "pii",
       detectors: [{ type: "email", action: "mask" }],
     });
+    await seed.createApiKey({ key_hash: sha256(KEY), allowed_models: ["*"] });
 
     const chat = () =>
       call("/v1/chat/completions", {
