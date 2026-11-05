@@ -277,7 +277,8 @@ async fn connect_failure(
     if let Some(reason) = &body.read_error {
         tracing::warn!(status, request_id, %reason, "failed to read upstream error response body");
     }
-    let error = if body.read_error.is_none() && body.bytes.iter().all(u8::is_ascii_whitespace) {
+    let blank = body.read_error.is_none() && body.bytes.iter().all(u8::is_ascii_whitespace);
+    let error = if status < 400 && blank {
         BridgeError::UpstreamStatus {
             status,
             message: String::new(),
@@ -622,22 +623,32 @@ pub(crate) async fn realtime(
         Err((auth, err)) => {
             let status = err.status().as_u16();
             let api_key_id = auth.as_ref().map(|a| a.entry.id.as_str());
+            // `prepare` notes the model when it finds it and the target when
+            // it selects one, so what is empty here is what it never reached.
+            let attributed = crate::attribution::current().unwrap_or_default();
+            let last_target = crate::request_metrics::LastTarget::new(&snapshot, &attributed);
+            let addressed = Some(attributed.requested_model.as_str()).filter(|m| !m.is_empty());
             emit_access_log(
                 &method,
                 status,
                 started.elapsed(),
                 &request_id,
                 api_key_id,
-                None,
+                addressed.map(|model| {
+                    let provider = last_target.provider();
+                    let known = provider != crate::request_metrics::UNKNOWN;
+                    (if known { provider } else { "" }, model)
+                }),
                 Some(&err),
                 None,
                 None,
             );
-            // Count the refusal like every other pre-dispatch rejection
-            // (unresolved labels, same as `reject_before_dispatch`) — logs
-            // and the request-rate metrics must not disagree about whether
-            // these requests exist. Authentication may not have run, so the
-            // caller is attributed only when a key was resolved (#932).
+            // Count the refusal like every other pre-dispatch rejection —
+            // logs and the request-rate metrics must not disagree about
+            // whether these requests exist. Before `prepare` found the model
+            // the labels are unresolved, same as `reject_before_dispatch`.
+            // Authentication may not have run, so the caller is attributed
+            // only when a key was resolved (#932).
             crate::request_metrics::record(
                 &state,
                 "/v1/realtime",
@@ -645,10 +656,14 @@ pub(crate) async fn realtime(
                     Some(a) => crate::request_metrics::Caller::new(a),
                     None => crate::request_metrics::Caller::unattributed(None),
                 },
-                crate::request_metrics::Upstream {
-                    model: crate::usage_attr::UNRESOLVED_MODEL_LABEL,
-                    ..Default::default()
-                },
+                last_target.upstream(
+                    &addressed.map_or(
+                        std::borrow::Cow::Borrowed(crate::usage_attr::UNRESOLVED_MODEL_LABEL),
+                        |model| crate::usage_attr::metric_model_label(&snapshot, model),
+                    ),
+                    false,
+                    false,
+                ),
                 status,
                 crate::attempt::error_source(&err),
                 started.elapsed(),
@@ -660,7 +675,7 @@ pub(crate) async fn realtime(
                 crate::operation::REALTIME,
                 "realtime",
                 &request_id,
-                params.get("model").map(String::as_str).unwrap_or(""),
+                params.get("model").map_or("", |model| model.trim()),
                 api_key_id.unwrap_or(""),
                 status,
                 crate::usage_attr::EventError::of(&err),
@@ -1330,7 +1345,8 @@ async fn run_session(
                 crate::request_metrics::Caller::new(&auth),
                 crate::request_metrics::Upstream {
                     provider: &provider_label,
-                    model: &model_entry.value.display_name,
+                    // The requested string, as in the session's own emit below.
+                    model: &requested_model,
                     upstream_model: model_entry
                         .value
                         .upstream_model()
@@ -1771,7 +1787,9 @@ async fn run_session(
         crate::request_metrics::Caller::new(&auth),
         crate::request_metrics::Upstream {
             provider: &provider_label,
-            model: &model_entry.value.display_name,
+            // The requested string so the emit chokepoint folds a
+            // wildcard-served alias's pair to the row's identities (#451).
+            model: &requested_model,
             // AISIX-Cloud#1325: a session that ends on an upstream error
             // still names the key it was talking to — these two used to be
             // `unknown` on every realtime sample, success included.
@@ -1943,6 +1961,7 @@ fn session_refusal_error(text: &str) -> Option<BridgeError> {
         let kind = view.and_then(|v| v.kind.as_deref());
         *status = status.or(match (code, kind) {
             (Some("invalid_api_key"), _) => Some(401),
+            (Some("invalid_model" | "model_not_found"), _) => Some(404),
             (Some("rate_limit_exceeded" | "insufficient_quota"), _) => Some(429),
             (_, Some("invalid_request_error")) => Some(400),
             _ => None,
@@ -2422,7 +2441,14 @@ mod tests {
     async fn a_refused_upgrade_quotes_only_a_body_that_arrived_whole() {
         // With no stream left to read, what came with the head is all there is.
         async fn refused(headers: &[(&str, &str)], body: Option<&[u8]>) -> String {
-            let mut response = axum::http::Response::builder().status(400);
+            refused_with(400, headers, body).await
+        }
+        async fn refused_with(
+            status: u16,
+            headers: &[(&str, &str)],
+            body: Option<&[u8]>,
+        ) -> String {
+            let mut response = axum::http::Response::builder().status(status);
             for (name, value) in headers {
                 response = response.header(*name, *value);
             }
@@ -2506,7 +2532,7 @@ mod tests {
             "upstream returned HTTP 400: failed to read response body: malformed chunked body"
         );
 
-        let in_handshake = "upstream returned HTTP 400 during the realtime handshake";
+        let no_detail = "upstream returned HTTP 400 with no error detail in the response";
         for (what, headers, body) in [
             (
                 "compressed",
@@ -2525,7 +2551,27 @@ mod tests {
                 Some(&b""[..]),
             ),
         ] {
-            assert_eq!(refused(&headers, body).await, in_handshake, "{what}");
+            assert_eq!(refused(&headers, body).await, no_detail, "{what}");
+        }
+
+        let empty = [("content-length", "0")];
+        assert_eq!(
+            refused_with(500, &empty, Some(b"")).await,
+            "upstream returned HTTP 500 with no error detail in the response"
+        );
+        for status in [200, 302] {
+            let in_handshake =
+                format!("upstream returned HTTP {status} during the realtime handshake");
+            assert_eq!(refused_with(status, &empty, Some(b"")).await, in_handshake);
+            assert_eq!(
+                refused_with(
+                    status,
+                    &[("content-length", "4"), ("content-encoding", "gzip")],
+                    Some(b"\x1f\x8b\x08\x00"),
+                )
+                .await,
+                in_handshake
+            );
         }
     }
 
