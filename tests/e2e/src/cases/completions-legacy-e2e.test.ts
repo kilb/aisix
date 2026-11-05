@@ -308,10 +308,6 @@ describe("legacy /v1/completions e2e: text-in / text-out passthrough", () => {
         return;
       }
 
-      // The other half of the #1093 contract: the refusal is scoped to the
-      // streaming request. An over-broad guard — reading `stream` as
-      // "present" rather than "true" — would take the ordinary path down
-      // with it, and `stream: false` is what an SDK sends by default.
       const reqHeaders = {
         authorization: `Bearer ${CALLER_PLAINTEXT}`,
         "content-type": "application/json",
