@@ -396,6 +396,13 @@ async fn send(
             stream,
         ))
         .map_err(|e| BridgeError::Config(format!("serialize request body: {e}")))?;
+        // Bedrock refuses a schema that leaves an object open, so a `strict`
+        // the gateway set while translating owes the closed one.
+        aisix_provider_openai::close_strict_response_format_schema(
+            &mut body,
+            req.gateway_strict_schema,
+        );
+        crate::bridge::apply_body_overrides(&mut body, ctx)?;
         shape_body(&mut body);
         bytes::Bytes::from(
             serde_json::to_vec(&body)
@@ -497,23 +504,44 @@ pub(crate) async fn chat_stream(
         let mut indexer = ToolCallIndexer::default();
         let mut minted: Vec<((u32, u64), String)> = Vec::new();
         let mut byte_stream = Box::pin(byte_stream);
+        // `[DONE]` or a finish reason says the answer is complete; a body that
+        // ends before either is truncated.
+        let mut terminal_seen = false;
         'outer: while let Some(next) = byte_stream.next().await {
-            let bytes = next.map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))?;
+            let bytes = match next {
+                Ok(bytes) => bytes,
+                Err(_) if terminal_seen => return,
+                Err(e) => {
+                    Err(BridgeError::Transport(aisix_gateway::transport_error_message(&e)))?
+                }
+            };
             for event in decoder.feed(bytes.as_ref()).map_err(|e| BridgeError::UpstreamDecode(e.to_string()))? {
                 match event {
-                    SseEvent::Done => break 'outer,
+                    SseEvent::Done => {
+                        terminal_seen = true;
+                        break 'outer;
+                    }
                     SseEvent::Data(payload) => {
                         for chunk in chunk_from(&payload, &mut indexer, &mut minted, &request_id)? {
+                            terminal_seen |= chunk.finish_reason.is_some();
                             yield chunk;
                         }
                     }
                 }
             }
         }
-        if let Some(SseEvent::Data(payload)) = decoder.finish().map_err(|e| BridgeError::UpstreamDecode(e.to_string()))? {
-            for chunk in chunk_from(&payload, &mut indexer, &mut minted, &request_id)? {
-                yield chunk;
+        match decoder.finish().map_err(|e| BridgeError::UpstreamDecode(e.to_string()))? {
+            Some(SseEvent::Done) => terminal_seen = true,
+            Some(SseEvent::Data(payload)) => {
+                for chunk in chunk_from(&payload, &mut indexer, &mut minted, &request_id)? {
+                    terminal_seen |= chunk.finish_reason.is_some();
+                    yield chunk;
+                }
             }
+            None => {}
+        }
+        if !terminal_seen {
+            Err(BridgeError::StreamAborted)?;
         }
     };
     Ok(Box::pin(stream))

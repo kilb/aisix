@@ -823,8 +823,8 @@ fn fold_betas(obj: &mut serde_json::Map<String, serde_json::Value>, betas: Vec<S
 /// overrides are NOT applied here — Bedrock signs via the AWS SDK, so
 /// `default_headers` ride [`DefaultHeadersInterceptor`] instead.
 ///
-/// Only the `invoke_model` (Anthropic) path carries a JSON body; the Converse
-/// path builds its request through the SDK's typed `InferenceConfiguration`
+/// The `invoke_model` (Anthropic) and Chat Completions paths carry a JSON body;
+/// the Converse path builds its request through the SDK's typed `InferenceConfiguration`
 /// builder, which has no JSON body for these top-level-key transforms to act
 /// on. (`param_constraints`'s temperature clamp IS still re-applied on the
 /// Converse path via `build_inference_config` — see #463 — but `param_renames`
@@ -1840,19 +1840,27 @@ impl BedrockBridge {
         let upstream_id_owned = upstream_id.to_string();
         let stream = async_stream::try_stream! {
             let mut state = ConverseStreamState::default();
+            // `messageStop` said the answer is complete, so a body that ends
+            // after one is whole; one that ends before it is truncated.
+            let mut semantic_terminal_seen = false;
             loop {
                 match resp.stream.recv().await {
                     Ok(Some(event)) => {
                         for mut chunk in emit_converse_chunk(event, &upstream_id_owned, &mut state) {
                             chunk.id = request_id.clone();
+                            semantic_terminal_seen |= chunk.finish_reason.is_some();
                             yield chunk;
                         }
                     }
                     Ok(None) => break,
+                    Err(_) if semantic_terminal_seen => return,
                     Err(e) => {
                         Err(map_converse_stream_event_error(e))?;
                     }
                 }
+            }
+            if !semantic_terminal_seen {
+                Err(BridgeError::StreamAborted)?;
             }
         };
         Ok(Box::pin(stream))
@@ -2620,6 +2628,11 @@ fn assistant_content_blocks(
     Ok(blocks)
 }
 
+/// Where a Converse answer's `additionalModelResponseFields` reach the caller:
+/// an OpenAI-shape response has no slot of its own for them, so they travel on
+/// the message under Converse's own name.
+const ADDITIONAL_RESPONSE_FIELDS: &str = "additionalModelResponseFields";
+
 /// Translate a Converse response into the gateway [`ChatResponse`].
 /// Text content blocks are concatenated; `toolUse` blocks become OpenAI
 /// `tool_calls` (#560); image / document blocks (rare in chat scenarios)
@@ -2654,6 +2667,12 @@ fn converse_output_into_chat_response(
                 message.extra.insert(
                     "reasoning_content".to_string(),
                     serde_json::Value::String(reasoning.join("\n")),
+                );
+            }
+            if let Some(fields) = resp.additional_model_response_fields() {
+                message.extra.insert(
+                    ADDITIONAL_RESPONSE_FIELDS.to_string(),
+                    document_to_json(fields),
                 );
             }
             (message, map_stop_reason(resp.stop_reason()))
@@ -2765,13 +2784,17 @@ fn build_assistant_message(text: String, tool_calls: Vec<serde_json::Value>) -> 
 fn map_stop_reason(stop: &SdkStopReason) -> FinishReason {
     match stop {
         SdkStopReason::EndTurn => FinishReason::Stop,
-        SdkStopReason::MaxTokens => FinishReason::Length,
+        SdkStopReason::MaxTokens | SdkStopReason::ModelContextWindowExceeded => {
+            FinishReason::Length
+        }
         SdkStopReason::ContentFiltered | SdkStopReason::GuardrailIntervened => {
             FinishReason::ContentFilter
         }
         SdkStopReason::ToolUse => FinishReason::ToolCalls,
         SdkStopReason::StopSequence => FinishReason::Stop,
-        _ => FinishReason::Stop,
+        // `malformed_tool_use`, `malformed_model_output`, and any reason this
+        // SDK does not name: not a turn that ended well, so it is not `stop`.
+        other => FinishReason::Other(other.as_str().to_string()),
     }
 }
 
@@ -2779,11 +2802,11 @@ fn map_stop_reason(stop: &SdkStopReason) -> FinishReason {
 #[derive(Default)]
 struct ConverseStreamState {
     emitted_role: bool,
-    /// Each tool-use block's Converse `contentBlockIndex` in arrival order;
-    /// a block's position here is its dense 0-based OpenAI
-    /// `tool_calls[].index`, so a leading text block at index 0 doesn't
-    /// shift the first tool call (#560).
-    tool_blocks: Vec<i32>,
+    /// Each tool-use block's Converse `contentBlockIndex` in arrival order,
+    /// and whether it has streamed any input yet; a block's position here is
+    /// its dense 0-based OpenAI `tool_calls[].index`, so a leading text block
+    /// at index 0 doesn't shift the first tool call (#560).
+    tool_blocks: Vec<(i32, bool)>,
     /// The `contentBlockIndex` of the last reasoning block that streamed
     /// text, so a second block starts on a new line — the non-streaming
     /// Claude path joins thinking blocks with `\n`.
@@ -2802,9 +2825,11 @@ struct ConverseStreamState {
 /// - `ContentBlockDelta` (reasoningContent text) → `reasoning_content`
 ///   chunk, in the shape the non-streaming Claude path (`/invoke`)
 ///   returns it: the signature and redacted ciphertext are dropped
+/// - `ContentBlockStop` of a tool-use block that streamed no input → the
+///   `"{}"` arguments a whole response reports for such a call
 /// - `MessageStop` → finish-reason chunk
 /// - `Metadata` → usage chunk
-/// - Other variants (`ContentBlockStop`, image deltas) → no chunk.
+/// - Other variants (image deltas) → no chunk.
 fn emit_converse_chunk(
     event: ConverseStreamOutput,
     upstream_id: &str,
@@ -2838,7 +2863,7 @@ fn emit_converse_chunk(
             let block_index = s.content_block_index;
             if let Some(ContentBlockStart::ToolUse(tu)) = s.start {
                 let oai_index = state.tool_blocks.len() as i32;
-                state.tool_blocks.push(block_index);
+                state.tool_blocks.push((block_index, false));
                 out.push(tool_call_chunk(
                     upstream_id,
                     oai_index,
@@ -2870,7 +2895,8 @@ fn emit_converse_chunk(
                 // #560: a tool-use `arguments` fragment. Correlate to the
                 // call opened by ContentBlockStart via the block index.
                 Some(ContentBlockDelta::ToolUse(tu)) => {
-                    if let Some(pos) = state.tool_blocks.iter().position(|&i| i == block_index) {
+                    if let Some(pos) = state.tool_blocks.iter().position(|b| b.0 == block_index) {
+                        state.tool_blocks[pos].1 |= !tu.input().is_empty();
                         out.push(tool_call_chunk(
                             upstream_id,
                             pos as i32,
@@ -2909,13 +2935,37 @@ fn emit_converse_chunk(
                 _ => {}
             }
         }
+        ConverseStreamOutput::ContentBlockStop(stop) => {
+            if let Some(pos) = state
+                .tool_blocks
+                .iter()
+                .position(|b| *b == (stop.content_block_index, false))
+            {
+                out.push(tool_call_chunk(upstream_id, pos as i32, None, None, "{}"));
+            }
+        }
         ConverseStreamOutput::MessageStop(m) => {
+            // The fields the caller asked for by
+            // `additionalModelResponseFieldPaths`.
+            let extra = m
+                .additional_model_response_fields
+                .as_ref()
+                .map(|fields| {
+                    serde_json::Map::from_iter([(
+                        ADDITIONAL_RESPONSE_FIELDS.to_string(),
+                        document_to_json(fields),
+                    )])
+                })
+                .unwrap_or_default();
             out.push(ChatChunk {
                 choice_index: 0,
                 logprobs: None,
                 id: String::new(),
                 model: upstream_id.to_string(),
-                delta: ChatDelta::default(),
+                delta: ChatDelta {
+                    extra,
+                    ..Default::default()
+                },
                 finish_reason: Some(map_stop_reason(&m.stop_reason)),
                 usage: None,
                 service_tier: None,
@@ -2956,8 +3006,7 @@ fn emit_converse_chunk(
                 });
             }
         }
-        // ContentBlockStop carries no customer-visible payload. The
-        // catch-all is non-exhaustive because the SDK enum is
+        // The catch-all is non-exhaustive because the SDK enum is
         // non_exhaustive — future AWS event types fall here safely.
         _ => {}
     }
@@ -8292,5 +8341,254 @@ mod forwarded_header_tests {
                 "context-1m-2025-08-07".to_string()
             )]
         );
+    }
+}
+
+#[cfg(test)]
+mod stream_contract_tests {
+    use super::*;
+    use aisix_core::{Model, ProviderKey};
+    use aws_sdk_bedrockruntime::types::{
+        ContentBlockDeltaEvent, ContentBlockStartEvent, ContentBlockStopEvent, MessageStopEvent,
+        ToolUseBlockDelta, ToolUseBlockStart,
+    };
+    use futures::StreamExt;
+    use std::sync::Arc;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn start(index: i32, id: &str) -> ConverseStreamOutput {
+        ConverseStreamOutput::ContentBlockStart(
+            ContentBlockStartEvent::builder()
+                .content_block_index(index)
+                .start(ContentBlockStart::ToolUse(
+                    ToolUseBlockStart::builder()
+                        .tool_use_id(id)
+                        .name("now")
+                        .build()
+                        .unwrap(),
+                ))
+                .build()
+                .unwrap(),
+        )
+    }
+
+    fn input(index: i32, text: &str) -> ConverseStreamOutput {
+        ConverseStreamOutput::ContentBlockDelta(
+            ContentBlockDeltaEvent::builder()
+                .content_block_index(index)
+                .delta(ContentBlockDelta::ToolUse(
+                    ToolUseBlockDelta::builder().input(text).build().unwrap(),
+                ))
+                .build()
+                .unwrap(),
+        )
+    }
+
+    fn stop(index: i32) -> ConverseStreamOutput {
+        ConverseStreamOutput::ContentBlockStop(
+            ContentBlockStopEvent::builder()
+                .content_block_index(index)
+                .build()
+                .unwrap(),
+        )
+    }
+
+    fn assembled_arguments(events: Vec<ConverseStreamOutput>) -> Vec<String> {
+        let mut state = ConverseStreamState::default();
+        let mut calls = std::collections::BTreeMap::<u64, String>::new();
+        for event in events {
+            for chunk in emit_converse_chunk(event, "anthropic.claude-sonnet-4-5", &mut state) {
+                for call in chunk.delta.tool_calls.iter().flatten() {
+                    calls
+                        .entry(call["index"].as_u64().unwrap())
+                        .or_default()
+                        .push_str(call["function"]["arguments"].as_str().unwrap());
+                }
+            }
+        }
+        calls.into_values().collect()
+    }
+
+    /// A tool call with no parameters assembles to JSON, as it does on a whole
+    /// response: clients parse `arguments` without looking at it first.
+    #[test]
+    fn a_tool_call_with_no_input_streams_empty_object_arguments() {
+        assert_eq!(assembled_arguments(vec![start(0, "t1"), stop(0)]), ["{}"]);
+        // Converse may open the input with an empty delta.
+        assert_eq!(
+            assembled_arguments(vec![start(0, "t1"), input(0, ""), stop(0)]),
+            ["{}"]
+        );
+        // A call that streamed its input closes with nothing added.
+        assert_eq!(
+            assembled_arguments(vec![
+                start(1, "t1"),
+                input(1, "{\"a\":"),
+                input(1, "1}"),
+                stop(1),
+                start(2, "t2"),
+                stop(2),
+            ]),
+            ["{\"a\":1}", "{}"]
+        );
+    }
+
+    /// A cut-off answer does not read as a finished one.
+    #[test]
+    fn stop_reasons_that_are_not_a_finished_turn_say_so() {
+        for (raw, expected) in [
+            ("model_context_window_exceeded", FinishReason::Length),
+            (
+                "malformed_tool_use",
+                FinishReason::Other("malformed_tool_use".into()),
+            ),
+            (
+                "malformed_model_output",
+                FinishReason::Other("malformed_model_output".into()),
+            ),
+            ("end_turn", FinishReason::Stop),
+            ("stop_sequence", FinishReason::Stop),
+        ] {
+            assert_eq!(
+                map_stop_reason(&SdkStopReason::from(raw)),
+                expected,
+                "{raw}"
+            );
+        }
+    }
+
+    /// What `additionalModelResponseFieldPaths` asked for comes back.
+    #[test]
+    fn additional_response_fields_reach_the_terminal_chunk() {
+        let mut state = ConverseStreamState::default();
+        let fields = serde_json::json!({"stop_sequence": "SUCCESS"});
+        let event = ConverseStreamOutput::MessageStop(
+            MessageStopEvent::builder()
+                .stop_reason(SdkStopReason::StopSequence)
+                .additional_model_response_fields(json_to_document(&fields))
+                .build()
+                .unwrap(),
+        );
+        let chunks = emit_converse_chunk(event, "m", &mut state);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].finish_reason, Some(FinishReason::Stop));
+        assert_eq!(chunks[0].delta.extra[ADDITIONAL_RESPONSE_FIELDS], fields);
+    }
+
+    fn compat_ctx(request: Option<serde_json::Value>) -> BridgeContext {
+        let model: Model = serde_json::from_value(serde_json::json!({
+            "display_name": "grok",
+            "provider": "bedrock",
+            "provider_key_id": "pk",
+            "model_name": "us.xai.grok-4",
+        }))
+        .unwrap();
+        let mut pk = serde_json::json!({
+            "display_name": "pk",
+            "api_key": r#"{"auth_type":"api_key","api_key":"k","region":"us-east-1"}"#,
+        });
+        if let Some(request) = request {
+            pk["request"] = request;
+        }
+        let pk: ProviderKey = serde_json::from_value(pk).unwrap();
+        BridgeContext::new("req-1", Arc::new(model), Arc::new(pk))
+    }
+
+    async fn compat_server(body: &str) -> MockServer {
+        let server = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path("/openai/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(body.to_string()),
+            )
+            .mount(&server)
+            .await;
+        server
+    }
+
+    const CONTENT: &str =
+        "data: {\"id\":\"c\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n";
+    const FINISH: &str = "data: {\"id\":\"c\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n";
+
+    /// EOF with no terminal is a failure on Bedrock's Chat Completions route;
+    /// `[DONE]` or a finish reason is the terminal.
+    #[tokio::test]
+    async fn a_chat_completions_stream_with_no_terminal_fails() {
+        for (body, aborted) in [
+            (CONTENT.to_string(), true),
+            (format!("{CONTENT}{FINISH}"), false),
+            (format!("{CONTENT}data: [DONE]\n\n"), false),
+            (format!("{CONTENT}data: [DONE]\n"), false),
+        ] {
+            let server = compat_server(&body).await;
+            let bridge = BedrockBridge::new().with_endpoint_override(server.uri());
+            let req = ChatFormat::new("grok", vec![ChatMessage::user("hi")]);
+            let mut stream = bridge.chat_stream(&req, &compat_ctx(None)).await.unwrap();
+            let mut failure = None;
+            while let Some(item) = stream.next().await {
+                if let Err(e) = item {
+                    failure = Some(e);
+                }
+            }
+            assert_eq!(
+                matches!(failure, Some(BridgeError::StreamAborted)),
+                aborted,
+                "{body:?}: {failure:?}"
+            );
+        }
+    }
+
+    /// The provider key's body overrides apply on the Chat Completions route,
+    /// as on every other route that carries a JSON body.
+    #[tokio::test]
+    async fn chat_completions_route_applies_body_overrides() {
+        let server = compat_server(&format!("{CONTENT}{FINISH}")).await;
+        let bridge = BedrockBridge::new().with_endpoint_override(server.uri());
+        let ctx = compat_ctx(Some(serde_json::json!({
+            "param_constraints": {"temperature_max": 0.5},
+            "default_body_fields": {"seed": 7},
+        })));
+        let mut req = ChatFormat::new("grok", vec![ChatMessage::user("hi")]);
+        req.temperature = Some(1.5);
+        let mut stream = bridge.chat_stream(&req, &ctx).await.unwrap();
+        while stream.next().await.is_some() {}
+        let sent = server.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&sent[0].body).unwrap();
+        assert_eq!(body["temperature"], 0.5);
+        assert_eq!(body["seed"], 7);
+    }
+
+    /// A strict schema the gateway set while translating goes out closed:
+    /// Bedrock refuses an object that omits `additionalProperties: false`.
+    #[tokio::test]
+    async fn chat_completions_route_closes_a_gateway_strict_schema() {
+        let server = compat_server(&format!("{CONTENT}{FINISH}")).await;
+        let bridge = BedrockBridge::new().with_endpoint_override(server.uri());
+        for (gateway_strict, closed) in [(true, true), (false, false)] {
+            let mut req = ChatFormat::new("grok", vec![ChatMessage::user("hi")]);
+            req.gateway_strict_schema = gateway_strict;
+            req.extra.insert(
+                "response_format".into(),
+                serde_json::json!({"type": "json_schema", "json_schema": {
+                    "name": "s",
+                    "strict": true,
+                    "schema": {"type": "object", "properties": {"a": {"type": "string"}}},
+                }}),
+            );
+            let mut stream = bridge.chat_stream(&req, &compat_ctx(None)).await.unwrap();
+            while stream.next().await.is_some() {}
+            let sent = server.received_requests().await.unwrap();
+            let body: serde_json::Value =
+                serde_json::from_slice(&sent.last().unwrap().body).unwrap();
+            let schema = &body["response_format"]["json_schema"]["schema"];
+            assert_eq!(
+                schema.get("additionalProperties").is_some(),
+                closed,
+                "{schema}"
+            );
+        }
     }
 }
