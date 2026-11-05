@@ -388,9 +388,10 @@ describe("a request that fails ahead of its chain exports no unmasked body", () 
   ];
   const UNKNOWN_MODEL = named({ openai: MISSING, rerank: MISSING, anthropic: MISSING, video: MISSING });
   const UNREACHABLE_MODEL = named(EXISTING);
-  // Each one is refused as malformed, with the caller's text in it.
+  // Each one is refused as malformed, with the caller's text in it. Chat is not
+  // here: what it refuses this way is an empty `messages`, which leaves a row no
+  // text to report under any rule.
   const MALFORMED: Array<[string, () => Request]> = [
-    ["chat", () => json("/v1/chat/completions", { model: EXISTING.openai, messages: [], user: TEXT })],
     ["responses", () => json("/v1/responses", { input: TEXT })],
     ["messages", () => json("/v1/messages", { max_tokens: 16, messages })],
     ["count_tokens", () => json("/v1/messages/count_tokens", { messages })],
