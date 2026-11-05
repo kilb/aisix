@@ -84,8 +84,7 @@ export function Logs({ doc }: { doc: DocState }) {
         </div>
       )}
       <div className="note warn">
-        两个限制照实说：<strong>流式请求</strong>的这一行是在 SSE 开始推送之前写的，
-        所以 token 数为空；<strong>journald 有留存上限</strong>，不是无限历史。
+        <strong>journald 有留存上限</strong>，不是无限历史。
         要长期留存需要配 observability exporter。
       </div>
       <div style={{ marginTop: 14 }}>
@@ -112,6 +111,10 @@ export function Logs({ doc }: { doc: DocState }) {
               <tbody>
                 {rows.map((x, i) => {
                   const tokens = String(x.total_tokens ?? "");
+                  // 新字段名优先；旧名只会出现在升级之前写下的日志行里。
+                  const status = x.status_code ?? x.status;
+                  const latency = x.downstream_latency_ms ?? x.latency_ms;
+                  const model = x.requested_model ?? x.model;
                   return (
                     <tr key={i}>
                       <td className="num" style={{ fontSize: 11 }}>
@@ -121,11 +124,11 @@ export function Logs({ doc }: { doc: DocState }) {
                         {String(x.path ?? "")}
                       </td>
                       <td className="right num">
-                        <StatusText s={x.status} />
+                        <StatusText s={status} />
                       </td>
-                      <td className="right num">{String(x.latency_ms ?? "")}ms</td>
-                      <td>{String(x.model ?? "")}</td>
-                      {/* 流式请求这一行没有 token 数，显示 "—" 而不是 0：
+                      <td className="right num">{latency != null ? `${String(latency)}ms` : ""}</td>
+                      <td>{String(model ?? "")}</td>
+                      {/* 没走到上游的请求这一行没有 token 数，显示 "—" 而不是 0：
                           0 会被读成「这个请求没消耗 token」。 */}
                       <td className="right num">{tokens && tokens !== "0" ? tokens : "—"}</td>
                       <td className="num" style={{ fontSize: 11, color: "var(--ink-3)" }}>

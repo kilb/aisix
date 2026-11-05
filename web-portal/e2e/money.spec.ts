@@ -1277,3 +1277,25 @@ test("命中缓存时不收_chat_的钱_但分类那一发照收", async () => {
     "反复命中缓存也要把额度烧完",
   );
 });
+
+test("调用记录带上状态_模型与耗时_而且只有自己的", async () => {
+  const cookie = await fx.sessionCookie();
+  await grant(5_000_000);
+  await waitFor(async () => (await fx.chat()) === 200, "预置密钥可用");
+
+  // 网关在响应写完之后才记这一行，所以等一下。
+  await waitFor(async () => {
+    const r = await fetch(`${fx.portalUrl}/api/logs?limit=50`, { headers: { cookie } }).then((x) =>
+      x.json(),
+    );
+    return (r.rows as Record<string, unknown>[]).some((row) => row.status === 200);
+  }, "这次调用出现在调用记录里");
+
+  const { rows } = await fetch(`${fx.portalUrl}/api/logs?limit=50`, { headers: { cookie } }).then(
+    (x) => x.json(),
+  );
+  const row = (rows as Record<string, unknown>[]).find((x) => x.status === 200)!;
+  expect(row.path).toBe("/v1/chat/completions");
+  expect(row.model).toBe("gpt-4o-mini");
+  expect(typeof row.latency_ms).toBe("number");
+});

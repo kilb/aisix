@@ -1,7 +1,11 @@
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
+import { createHash } from "node:crypto";
 import { createServer } from "node:net";
 import {
+  chmodSync,
+  mkdirSync,
   mkdtempSync,
+  openSync,
   writeFileSync,
   readFileSync,
   rmSync,
@@ -17,6 +21,12 @@ const GATEWAY_BIN = join(REPO, "target/release/aisix");
 const PORTAL_BIN = join(REPO, "target/release/aisix-portal");
 export const PORTAL_TOKEN_SENTINEL = "e2e-portal-token-must-never-leak";
 export const PASSWORD = "e2e-test-password";
+/** 带网关的夹具里那把调用方密钥的明文。 */
+export const CALLER_KEY = "e2e-console-caller-key";
+/** 只有网关进程才有的环境变量：控制台与网关的环境本来就可以不同。 */
+export const GATEWAY_ONLY_VAR = "E2E_GATEWAY_ONLY_KEY";
+/** 只有控制台进程才有的环境变量：`aisix validate` 看得到，网关看不到。 */
+export const CONSOLE_ONLY_VAR = "E2E_CONSOLE_ONLY_KEY";
 
 export interface Fixture {
   dir: string;
@@ -25,6 +35,8 @@ export interface Fixture {
   previewUrl: string;
   /** 真门户的地址；只有 `start({ withPortal: true })` 才有。 */
   portalUrl?: string;
+  /** 真网关的代理口；只有 `start({ withGateway: true })` 才有。 */
+  proxyUrl?: string;
   read(): string;
   stop(): void;
 }
@@ -37,6 +49,13 @@ export interface StartOptions {
    * 所以分成两个夹具实例，而不是在一个里面切。
    */
   withPortal?: boolean;
+  /**
+   * 顺带起一个**真的**网关，读同一份 resources.yaml，让「保存后网关到底有没有
+   * 用上」和逐请求日志有真东西可看。
+   *
+   * 默认不起：默认那套用例要的正是「管理 API 不可达」时的表现。
+   */
+  withGateway?: boolean;
 }
 
 const SEED = `_format_version: '1'
@@ -189,6 +208,65 @@ export async function start(opts: StartOptions = {}): Promise<Fixture> {
   const webPort = await freePort();
   const procs: ChildProcess[] = [];
 
+  // 真网关（可选）。起在控制台之前 —— 控制台启动时就要拿到它的地址。
+  let proxyUrl: string | undefined;
+  let adminUrl = "http://127.0.0.1:1";
+  let statusUrl: string | undefined;
+  let consolePath = process.env.PATH ?? "";
+  if (opts.withGateway) {
+    const [proxyPort, adminPort, metricsPort] = [
+      await freePort(),
+      await freePort(),
+      await freePort(),
+    ];
+    proxyUrl = `http://127.0.0.1:${proxyPort}`;
+    adminUrl = `http://127.0.0.1:${adminPort}`;
+    statusUrl = `http://127.0.0.1:${metricsPort}`;
+    const callerHash = createHash("sha256").update(CALLER_KEY).digest("hex");
+    writeFileSync(
+      resourcesPath,
+      SEED.replace("api_key: sk-seed", `api_key: \${${GATEWAY_ONLY_VAR}}`).replace(
+        "0".repeat(64),
+        callerHash,
+      ),
+    );
+    const cfgPath = join(dir, "config.yaml");
+    writeFileSync(
+      cfgPath,
+      `resources_file: "${resourcesPath}"
+proxy:
+  addr: "127.0.0.1:${proxyPort}"
+admin:
+  addr: "127.0.0.1:${adminPort}"
+  admin_keys: ["e2e-admin-key"]
+observability:
+  log_level: info
+  metrics:
+    prometheus:
+      enabled: true
+      path: "/metrics"
+      addr: "127.0.0.1:${metricsPort}"
+`,
+    );
+    const gatewayLog = join(dir, "gateway.log");
+    const logFd = openSync(gatewayLog, "a");
+    procs.push(
+      spawn(GATEWAY_BIN, ["--config", cfgPath], {
+        env: { ...process.env, [GATEWAY_ONLY_VAR]: "sk-only-the-gateway-has-this" },
+        stdio: ["ignore", logFd, logFd],
+      }),
+    );
+    await waitFor(`${statusUrl}/metrics`);
+    // 这里没有 systemd。控制台的日志页读 journald，所以给它一个读法：网关真实写
+    // 出来的日志原样给它，内容没有任何一个字是编的。
+    const bin = join(dir, "bin");
+    mkdirSync(bin);
+    const shim = join(bin, "journalctl");
+    writeFileSync(shim, `#!/bin/sh\nexec tail -n 3000 "${gatewayLog}"\n`);
+    chmodSync(shim, 0o755);
+    consolePath = `${bin}:${consolePath}`;
+  }
+
   // 真门户（可选）。起在控制台之前 —— 控制台启动时就要拿到它的地址。
   let portalUrl: string | undefined;
   if (opts.withPortal) {
@@ -215,6 +293,9 @@ export async function start(opts: StartOptions = {}): Promise<Fixture> {
   const api = spawn(CONSOLE_BIN, [], {
     env: {
       ...process.env,
+      PATH: consolePath,
+      [CONSOLE_ONLY_VAR]: "sk-only-the-console-has-this",
+      ...(statusUrl ? { AISIX_STATUS_URL: statusUrl } : {}),
       CONSOLE_PASSWORD_HASH: hashed.stdout.trim(),
       AISIX_ADMIN_KEY_FOR_CONSOLE: "e2e-admin-key",
       // 哨兵值：用例断言它绝不出现在任何前端产物或接口响应里。
@@ -226,7 +307,7 @@ export async function start(opts: StartOptions = {}): Promise<Fixture> {
       PORTAL_URL: portalUrl ?? "http://127.0.0.1:1",
       // 网关管理 API 不需要真的可达：本套用例只驱动配置读写这条路径，
       // 而那条路径只用到 resources.yaml 和 `aisix validate`。
-      AISIX_ADMIN_URL: "http://127.0.0.1:1",
+      AISIX_ADMIN_URL: adminUrl,
       PROMETHEUS_URL: "http://127.0.0.1:1",
       AISIX_RESOURCES: resourcesPath,
       AISIX_BIN: GATEWAY_BIN,
@@ -265,6 +346,7 @@ export async function start(opts: StartOptions = {}): Promise<Fixture> {
     consoleUrl: `http://127.0.0.1:${apiPort}`,
     previewUrl: `http://127.0.0.1:${webPort}`,
     portalUrl,
+    proxyUrl,
     read: () => readFileSync(resourcesPath, "utf8"),
     stop() {
       for (const p of procs) killTree(p);

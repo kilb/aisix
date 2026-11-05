@@ -1,6 +1,14 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { createServer, type Server } from "node:http";
-import { mkdtempSync, writeFileSync, readFileSync, rmSync } from "node:fs";
+import {
+  chmodSync,
+  mkdirSync,
+  mkdtempSync,
+  openSync,
+  writeFileSync,
+  readFileSync,
+  rmSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer as netServer } from "node:net";
@@ -735,10 +743,19 @@ export async function startMoney(): Promise<MoneyFixture> {
   // 这个顺序本身就是一期的真实形态 —— 管理员在有了用户之后才建密钥。
   const portalUrl = `http://127.0.0.1:${portalPort}`;
   writeFileSync(resourcesPath, "api_keys: []\n");
+  // 这里没有 systemd。门户的调用记录读 journald，所以给它一个读法：网关真实写出来
+  // 的日志原样给它，内容没有任何一个字是编的。
+  const gatewayLog = join(dir, "gateway.log");
+  const logFd = openSync(gatewayLog, "a");
+  const shimDir = join(dir, "bin");
+  mkdirSync(shimDir);
+  writeFileSync(join(shimDir, "journalctl"), `#!/bin/sh\nexec tail -n 3000 "${gatewayLog}"\n`);
+  chmodSync(join(shimDir, "journalctl"), 0o755);
   procs.push(
     spawn(PORTAL_BIN, [], {
       env: {
         ...process.env,
+        PATH: `${shimDir}:${process.env.PATH ?? ""}`,
         PORTAL_DB: `sqlite:${join(dir, "portal.db")}`,
         PORTAL_ADDR: `127.0.0.1:${portalPort}`,
         PORTAL_ADMIN_TOKEN: ADMIN_TOKEN,
@@ -790,7 +807,9 @@ observability:
   // 按名字持有，不靠下标：门户是先起的（要先注册用户才知道 user_id），
   // 下标取错的症状是「SIGHUP 发给了门户」，而门户不重读网关配置 —— 表现成
   // 「闸没生效」，跟真 bug 一模一样。
-  let gateway = spawn(GATEWAY_BIN, ["--config", cfgPath], { stdio: "inherit" });
+  let gateway = spawn(GATEWAY_BIN, ["--config", cfgPath], {
+    stdio: ["ignore", logFd, logFd],
+  });
   procs.push(gateway);
   const metricsUrl = `http://127.0.0.1:${metricsPort}/metrics`;
   await waitReady(metricsUrl, "aisix 网关指标口", (s) => s === 200);
@@ -981,7 +1000,9 @@ observability:
       const old = procs.indexOf(gateway);
       gateway.kill("SIGTERM");
       await new Promise<void>((r) => gateway.once("exit", () => r()));
-      gateway = spawn(GATEWAY_BIN, ["--config", cfgPath], { stdio: "inherit" });
+      gateway = spawn(GATEWAY_BIN, ["--config", cfgPath], {
+        stdio: ["ignore", logFd, logFd],
+      });
       if (old >= 0) procs[old] = gateway;
       else procs.push(gateway);
       await waitReady(metricsUrl, "aisix 网关指标口（重启后）", (st) => st === 200);

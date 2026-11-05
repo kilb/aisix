@@ -80,8 +80,7 @@ export function Logs() {
                   </td>
                   <td className="right num">{r.status ?? ""}</td>
                   <td className="right num">{r.latency_ms != null ? `${r.latency_ms} ms` : ""}</td>
-                  {/* 流式请求这一行在推流开始前写下，token 数为空 —— 上面的
-                      提示会说明，这里不要用 0 冒充。 */}
+                  {/* 没走到上游的请求这一行没有 token 数，这里不要用 0 冒充。 */}
                   <td className="right num">{r.total_tokens ?? "—"}</td>
                 </tr>
               ))}

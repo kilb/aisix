@@ -75,7 +75,6 @@ pub async fn logs(
         // 只扫了最近若干行日志，所以「没有记录」有两种可能：真没调用过，或者
         // 调用早于这个窗口。不说清楚的话用户会以为自己的请求没被记下来。
         "window_note": format!("只在网关最近 {} 行日志里查找", limit * 8),
-        "note": if rows_note(&rows) { Some("流式请求的这一行在推流开始前写下，所以 token 数为空") } else { None },
     }))
     .into_response()
 }
@@ -114,6 +113,18 @@ async fn read_journal(n: u32) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
 }
 
+/// 接口对外的字段，以及它在日志行上可能叫的名字。
+const LOG_FIELDS: &[(&str, &[&str])] = &[
+    ("method", &["method"]),
+    ("path", &["path"]),
+    ("status", &["status_code", "status"]),
+    ("latency_ms", &["downstream_latency_ms", "latency_ms"]),
+    ("model", &["requested_model", "model"]),
+    ("prompt_tokens", &["prompt_tokens"]),
+    ("completion_tokens", &["completion_tokens"]),
+    ("total_tokens", &["total_tokens"]),
+];
+
 /// 只留下属于 `mine` 的行，并只保留展示需要的字段。
 ///
 /// **不返回整行原文**：那里有 `provider_key_id`、上游 request id 之类的内部
@@ -130,19 +141,12 @@ fn filter(text: &str, mine: &[String], limit: u32) -> Vec<Value> {
             continue;
         }
         let mut row = Map::new();
-        // 白名单，不是黑名单：新增字段默认不外泄。
-        for f in [
-            "method",
-            "path",
-            "status",
-            "latency_ms",
-            "model",
-            "prompt_tokens",
-            "completion_tokens",
-            "total_tokens",
-        ] {
-            if let Some(v) = kv.get(f) {
-                row.insert(f.to_string(), v.clone());
+        // 白名单，不是黑名单：新增字段默认不外泄。左边是这个接口对外的名字，右边是
+        // 日志行上的键。网关改过名（`status` → `status_code` 等），旧名只会出现在
+        // 升级之前写下的那些行里，所以排在后面。
+        for (field, keys) in LOG_FIELDS {
+            if let Some(v) = keys.iter().find_map(|k| kv.get(*k)) {
+                row.insert((*field).to_string(), v.clone());
             }
         }
         row.insert(
@@ -157,9 +161,39 @@ fn filter(text: &str, mine: &[String], limit: u32) -> Vec<Value> {
     rows
 }
 
-fn rows_note(rows: &[Value]) -> bool {
-    rows.iter()
-        .any(|r| r.get("total_tokens").is_none() && r.get("status").is_some())
+/// 带引号的值结束在哪：`s` 从开引号之后算起，返回闭引号的下标。
+///
+/// 网关把字符串按 Debug 写，里面的引号是 `\"`。停在第一个 `"` 的话，后半截就被
+/// 当成新的键值对读 —— 而模型名是调用方给的，一个不存在的模型名会被原样写进
+/// `error`，于是调用方能借它改写这一行的 `api_key_id` 与 `status_code`。
+fn closing_quote(s: &str) -> Option<usize> {
+    let mut chars = s.char_indices();
+    while let Some((i, c)) = chars.next() {
+        match c {
+            '\\' => {
+                chars.next();
+            }
+            '"' => return Some(i),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// 还原 [`closing_quote`] 找到的那段里的 `\"` 与 `\\`。
+fn unescape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        match (c, chars.as_str().chars().next()) {
+            ('\\', Some(next @ ('"' | '\\'))) => {
+                out.push(next);
+                chars.next();
+            }
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 /// 拆 `k=v` 与 `k="v"`。
@@ -178,20 +212,20 @@ fn parse_kv(line: &str) -> Map<String, Value> {
         let key = &line[key_start..eq];
         let rest = &line[eq + 1..];
         let (val, consumed) = if let Some(stripped) = rest.strip_prefix('"') {
-            match stripped.find('"') {
-                Some(end) => (&stripped[..end], end + 2),
+            match closing_quote(stripped) {
+                Some(end) => (unescape(&stripped[..end]), end + 2),
                 None => break,
             }
         } else {
             let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
-            (&rest[..end], end)
+            (rest[..end].to_string(), end)
         };
         if !key.is_empty() && key.chars().all(|c| c.is_alphanumeric() || c == '_') {
             out.insert(
                 key.to_string(),
                 val.parse::<i64>()
                     .map(Value::from)
-                    .unwrap_or_else(|_| Value::String(val.to_string())),
+                    .unwrap_or_else(|_| Value::String(val)),
             );
         }
         i = eq + 1 + consumed;
@@ -203,11 +237,56 @@ fn parse_kv(line: &str) -> Map<String, Value> {
 mod tests {
     use super::*;
 
-    /// 一行真实形状的访问日志（取自生产 journal）。
+    /// 一行真实形状的访问日志（取自真网关的输出）。
     fn line(api_key_id: &str, status: i64) -> String {
         format!(
-            r#"2026-08-19T18:53:01.020719Z  INFO request{{request_id=1d5b52c7}}: aisix_obs::access_log: proxy request completed method="POST" path="/v1/chat/completions" status={status} latency_ms=1 provider="openai" model="gpt-4o-mini" api_key_id="{api_key_id}" prompt_tokens=120 completion_tokens=45 total_tokens=165 request_id="1d5b52c7" provider_request_id="chatcmpl-mock" routing_attempt_count=1"#
+            r#"2026-11-05T13:28:48.799434Z  INFO request{{request_id=b0a05f37 http_version="1.1" peer=127.0.0.1:36148}}: aisix_obs::access_log: proxy request completed method="POST" path="/v1/chat/completions" status_code={status} downstream_latency_ms=32 duration_ms=32 provider="openai" requested_model="gpt-4o-mini" upstream_model="up" provider_key_id="012f0097" api_key_id="{api_key_id}" prompt_tokens=120 completion_tokens=45 total_tokens=165 request_id="b0a05f37" provider_request_id="chatcmpl-mock" routing_attempt_count=1"#
         )
+    }
+
+    /// 这个模块读的是另一个 crate 写的日志行，改名不会有任何编译错误 —— 症状只是
+    /// 页面上的几列变空。所以直接对着写日志的那段源码核对键名。
+    #[test]
+    fn 读的键名都还在网关写的日志行上() {
+        let emit = include_str!("../../aisix-obs/src/access_log.rs");
+        let emit = emit
+            .split_once("fn emit_with(")
+            .and_then(|(_, rest)| rest.split_once("\"proxy request completed\""))
+            .map(|(body, _)| body)
+            .expect("找不到写访问日志的那段");
+        for (field, keys) in LOG_FIELDS {
+            assert!(
+                emit.contains(&format!("{} = ", keys[0])),
+                "接口字段 {field} 读的键 {} 不在访问日志上了",
+                keys[0]
+            );
+        }
+        assert!(emit.contains("api_key_id = "));
+    }
+
+    #[test]
+    fn 升级之前写下的旧键名也认得() {
+        let old = r#"2026-08-19T18:53:01.020719Z  INFO request{request_id=1d5b52c7}: aisix_obs::access_log: proxy request completed method="POST" path="/v1/chat/completions" status=200 latency_ms=1 provider="openai" model="gpt-4o-mini" api_key_id="mine" prompt_tokens=120"#;
+        let rows = filter(old, &["mine".into()], 5);
+        assert_eq!(rows[0]["status"], serde_json::json!(200));
+        assert_eq!(rows[0]["latency_ms"], serde_json::json!(1));
+        assert_eq!(rows[0]["model"], serde_json::json!("gpt-4o-mini"));
+    }
+
+    /// 模型名是调用方给的，不存在时网关把它原样写进 `error`。引号里的东西不能被
+    /// 当成这一行的字段。
+    #[test]
+    fn 调用方给的模型名改写不了这一行的字段() {
+        let forged = r#"2026-11-05T13:28:48.807888Z  INFO request{request_id=ee74 http_version="1.1" peer=127.0.0.1:36156}: aisix_obs::access_log: proxy request completed method="POST" path="/v1/chat/completions" status_code=404 downstream_latency_ms=0 duration_ms=0 requested_model="x api_key_id=VICTIM status_code=200 y" api_key_id="attacker" request_id="ee74" error_class="model_not_found" error="model \"x api_key_id=VICTIM status_code=200 y\" not found" request_body_bytes=79"#;
+        let kv = parse_kv(forged);
+        assert_eq!(kv["api_key_id"], serde_json::json!("attacker"));
+        assert_eq!(kv["status_code"], serde_json::json!(404));
+        assert_eq!(
+            kv["error"],
+            serde_json::json!("model \"x api_key_id=VICTIM status_code=200 y\" not found")
+        );
+        assert_eq!(filter(forged, &["VICTIM".into()], 5).len(), 0);
+        assert_eq!(filter(forged, &["attacker".into()], 5).len(), 1);
     }
 
     #[test]
