@@ -149,6 +149,21 @@ interface Seeded {
 
 const MODELS: Record<string, Seeded> = {
   "sc-large-responses": { upstream: { rawStreamFrames: LARGE_TERMINAL_FRAMES } },
+  "sc-large-completions": {
+    upstream: {
+      streamEvents: [
+        JSON.stringify({
+          id: "cmpl-large",
+          object: "text_completion",
+          created: 0,
+          model: "upstream-model",
+          choices: [{ index: 0, text: "w".repeat(2 * 1024 * 1024), finish_reason: "stop" }],
+          usage: { prompt_tokens: 321, completion_tokens: 654, total_tokens: 975 },
+        }),
+        "[DONE]",
+      ],
+    },
+  },
   "sc-held-responses": { upstream: RESPONSES_SLOW, hold: true },
   "sc-tpm-held": { upstream: RESPONSES_SLOW, hold: true },
   "sc-held-completions": { upstream: COMPLETIONS_SLOW, hold: true },
@@ -363,6 +378,22 @@ describe("what a stream owes, whatever shape it took", () => {
     expect(row.get("status_code")).toBe("200");
     expect(row.get("prompt_tokens")).toBe("123456");
     expect(row.get("completion_tokens")).toBe("7890");
+  });
+
+  test("so is one on /v1/completions, from an upstream that answers in one frame", async (ctx) => {
+    if (!ready()) return ctx.skip();
+    const res = await post("/v1/completions", {
+      model: "sc-large-completions",
+      prompt: "go",
+      stream: true,
+      stream_options: { include_usage: true },
+    });
+    expect(res.status).toBe(200);
+    const requestId = res.headers.get("x-aisix-request-id") ?? "";
+    await res.text();
+    const row = await rowOf((l) => l.get("request_id") === requestId, "the large completion's row");
+    expect(row.get("prompt_tokens")).toBe("321");
+    expect(row.get("completion_tokens")).toBe("654");
   });
 
   test("so is one relayed through a passthrough route", async (ctx) => {

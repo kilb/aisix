@@ -2508,6 +2508,37 @@ mod tests {
         assert!(String::from_utf8_lossy(&body).contains("data: [DONE]"));
     }
 
+    /// A window chain's cap binds this relay's hold as a whole-response chain's
+    /// does: its own bound, not the default, and its own overflow policy.
+    #[tokio::test]
+    async fn a_window_chains_cap_binds_the_hold() {
+        let upstream = MockServer::builder().start().await;
+        let frame = "data: {\"id\":\"cmpl-w\",\"object\":\"text_completion\",\"choices\":[{\"text\":\"a word or two\",\"index\":0}]}\n\n";
+        let sse = format!("{}data: [DONE]\n\n", frame.repeat(20));
+        Mock::given(method("POST"))
+            .and(path("/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(sse, "text/event-stream"))
+            .mount(&upstream)
+            .await;
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(model_entry("instruct"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        // Nothing listens at the endpoint, and a failed check allows: only the
+        // cap can refuse this answer.
+        let row: aisix_core::Guardrail = serde_json::from_str(
+            r#"{"name":"tm","kind":"azure_content_safety_text_moderation","hook_point":"output","endpoint":"http://127.0.0.1:9","api_key":"k","stream_processing_mode":"window","window_size":1000,"window_overlap_size":0,"max_buffer_bytes":64,"on_buffer_exceeded":"fail_closed","output_fail_open":true}"#,
+        )
+        .unwrap();
+        crate::seed_env_scoped_guardrail(&snap, ResourceEntry::new("g-w", row, 1));
+        let resp = tower::ServiceExt::oneshot(
+            build_app(snap),
+            make_req(serde_json::json!({"model": "instruct", "prompt": "hello", "stream": true})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
     /// A caller who hangs up on a held completion takes the handler with it:
     /// the row reports what the stream had read, estimated where no usage
     /// frame had arrived, and the rate-limit bucket moves.
