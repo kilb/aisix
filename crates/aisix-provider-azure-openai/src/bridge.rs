@@ -391,7 +391,7 @@ impl AzureUpstreamRef {
         }
 
         // Bare-resource shorthand (`acme-east` → canonical Azure URL).
-        validate_url_token("resource name", base)?;
+        validate_url_token("api_base resource name", base)?;
         Ok(Self {
             resource: base.to_string(),
             deployment: deployment.to_string(),
@@ -3184,6 +3184,10 @@ mod tests {
             assert!(
                 !msg.contains("sk-live-9f2b1e"),
                 "{base}: the rejection quotes the credential back: {msg}"
+            );
+            assert!(
+                msg.contains("api_base"),
+                "{base}: the rejection must name the field: {msg}"
             );
         }
     }
