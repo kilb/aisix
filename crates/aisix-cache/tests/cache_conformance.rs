@@ -146,7 +146,7 @@ where
     let shared: std::sync::Arc<dyn Cache> =
         std::sync::Arc::new(RedisCache::connect(&cfg).await.expect("connect"));
     let local: std::sync::Arc<dyn Cache> =
-        std::sync::Arc::new(MemoryCache::new(Duration::from_secs(60), 128));
+        std::sync::Arc::new(MemoryCache::new(Duration::from_secs(60), 1 << 20));
 
     let ns = NS.fetch_add(1, Ordering::Relaxed);
     let from_local = scenario(local, format!("conf-{}-{ns}-mem", std::process::id())).await;

@@ -17,7 +17,10 @@ use std::time::{Duration, Instant};
 use crate::cache::{Cache, CacheError, CachedBody};
 
 pub const DEFAULT_TTL: Duration = Duration::from_secs(300);
-pub const DEFAULT_CAPACITY: u64 = 10_000;
+/// Bytes of responses each of the two stores holds. In bytes because a response
+/// can be anywhere from a line of chat to tens of megabytes of embedding matrix:
+/// a count of entries bounds nothing.
+pub const DEFAULT_CAPACITY: u64 = 256 << 20;
 
 /// What we actually store inside moka — the response plus the TTL the
 /// caller asked for. The Expiry impl below reads the second field on
@@ -26,6 +29,8 @@ pub const DEFAULT_CAPACITY: u64 = 10_000;
 struct Entry {
     response: ChatResponse,
     ttl: Duration,
+    /// The response's serialized size, what eviction charges it.
+    weight: u32,
 }
 
 /// Same per-entry-TTL shape as [`Entry`], for the non-chat endpoints whose
@@ -34,6 +39,7 @@ struct Entry {
 struct BodyEntry {
     body: CachedBody,
     ttl: Duration,
+    weight: u32,
 }
 
 struct PerBodyEntryExpiry;
@@ -80,13 +86,16 @@ impl Expiry<String, Entry> for PerEntryExpiry {
 }
 
 impl MemoryCache {
+    /// `capacity` is the bytes each of the two stores holds.
     pub fn new(ttl: Duration, capacity: u64) -> Self {
         let inner = MokaCache::builder()
             .max_capacity(capacity)
+            .weigher(|_, entry: &Entry| entry.weight)
             .expire_after(PerEntryExpiry)
             .build();
         let bodies = MokaCache::builder()
             .max_capacity(capacity)
+            .weigher(|_, entry: &BodyEntry| entry.weight)
             .expire_after(PerBodyEntryExpiry)
             .build();
         Self { inner, bodies, ttl }
@@ -105,6 +114,10 @@ impl Default for MemoryCache {
     fn default() -> Self {
         Self::with_defaults()
     }
+}
+
+fn weight_of(bytes: usize) -> u32 {
+    u32::try_from(bytes).unwrap_or(u32::MAX)
 }
 
 #[async_trait]
@@ -131,12 +144,14 @@ impl Cache for MemoryCache {
     ) -> Result<(), CacheError> {
         // Same as a serialized entry: a hit was served by no upstream.
         value.service_tier = None;
+        let weight = serde_json::to_vec(&value).map_or(u32::MAX, |json| weight_of(json.len()));
         self.inner
             .insert(
                 key.to_string(),
                 Entry {
                     response: value,
                     ttl,
+                    weight,
                 },
             )
             .await;
@@ -153,8 +168,16 @@ impl Cache for MemoryCache {
         value: CachedBody,
         ttl: Duration,
     ) -> Result<(), CacheError> {
+        let weight = weight_of(value.body.len());
         self.bodies
-            .insert(key.to_string(), BodyEntry { body: value, ttl })
+            .insert(
+                key.to_string(),
+                BodyEntry {
+                    body: value,
+                    ttl,
+                    weight,
+                },
+            )
             .await;
         Ok(())
     }
@@ -174,6 +197,38 @@ mod tests {
             prompt_tokens: 7,
             completion_tokens: 0,
         }
+    }
+
+    /// The store is bounded by what it holds, not how many: ten thousand entries
+    /// of a few megabytes each is tens of gigabytes.
+    #[tokio::test]
+    async fn the_store_is_bounded_in_bytes_whatever_the_entry_count() {
+        let cache = MemoryCache::new(Duration::from_secs(60), 4 << 20);
+        for i in 0..32 {
+            let mut body = sample_body();
+            body.body = vec![0u8; 1 << 20];
+            cache
+                .put_body_with_ttl(&format!("k{i}"), body, Duration::from_secs(60))
+                .await
+                .unwrap();
+        }
+        cache.bodies.run_pending_tasks().await;
+        assert!(
+            cache.bodies.weighted_size() <= 4 << 20,
+            "held {} bytes",
+            cache.bodies.weighted_size()
+        );
+        assert!(cache.bodies.entry_count() <= 4);
+
+        // One entry that alone exceeds the store does not displace it.
+        let mut huge = sample_body();
+        huge.body = vec![0u8; 8 << 20];
+        cache
+            .put_body_with_ttl("huge", huge, Duration::from_secs(60))
+            .await
+            .unwrap();
+        cache.bodies.run_pending_tasks().await;
+        assert!(cache.get_body("huge").await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -249,7 +304,7 @@ mod tests {
 
     #[tokio::test]
     async fn ttl_eviction_drops_stale_entries() {
-        let cache = MemoryCache::new(Duration::from_millis(50), 100);
+        let cache = MemoryCache::new(Duration::from_millis(50), 1 << 20);
         cache.put("k1", sample_response()).await.unwrap();
         assert!(cache.get("k1").await.unwrap().is_some());
         // Wait past TTL. Moka uses lazy eviction on read; one extra
@@ -281,7 +336,7 @@ mod tests {
     async fn put_with_ttl_uses_per_entry_expiry() {
         // Long-fallback cache so a regression that ignores the
         // per-entry TTL doesn't accidentally pass by global eviction.
-        let cache = MemoryCache::new(Duration::from_secs(300), 100);
+        let cache = MemoryCache::new(Duration::from_secs(300), 1 << 20);
         cache
             .put_with_ttl("short", sample_response(), Duration::from_millis(50))
             .await
