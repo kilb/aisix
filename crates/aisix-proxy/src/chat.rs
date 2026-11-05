@@ -6484,6 +6484,7 @@ struct ChoiceTexts {
 impl ChoiceTexts {
     const CONTENT: u64 = 0;
     const REFUSAL: u64 = 1;
+    const TRANSCRIPT: u64 = 2;
 
     fn push(&mut self, choice: u32, channel: u64, text: &str) {
         if !text.is_empty() {
@@ -6771,11 +6772,19 @@ where
                     // (bounded memory); other modes accumulate the whole
                     // response in content_buffer. No-op without a guardrail.
                     // A streamed `refusal` reaches the caller beside the
-                    // content, so it is scanned with it.
+                    // content, and an audio answer's transcript beside its
+                    // audio, so they are scanned with it.
                     let refusal = chunk.delta.extra.get("refusal").and_then(|r| r.as_str());
+                    let transcript = chunk
+                        .delta
+                        .audio
+                        .as_ref()
+                        .and_then(|audio| audio.get("transcript"))
+                        .and_then(|t| t.as_str());
                     let channels = [
                         (ChoiceTexts::CONTENT, chunk.delta.content.as_deref()),
                         (ChoiceTexts::REFUSAL, refusal),
+                        (ChoiceTexts::TRANSCRIPT, transcript),
                     ];
                     for (channel, text) in channels {
                         let Some(text) = text else { continue };
@@ -6791,8 +6800,9 @@ where
                         // Content capture: assemble the response for the
                         // observability fan-out, bounded to the cap so a long
                         // stream can't grow the buffer without limit. Only when
-                        // an exporter wants full content.
-                        if !capture_bypassed {
+                        // an exporter wants full content. A transcript is not
+                        // part of it, as on the buffered path.
+                        if !capture_bypassed && channel != ChoiceTexts::TRANSCRIPT {
                             if let Some(cap) = content_cap {
                                 let _ = crate::token_estimate::push_capped_to(
                                     &mut comp.response_text,
@@ -6825,10 +6835,10 @@ where
                                 .tool_calls
                                 .iter()
                                 .flatten()
-                                .filter_map(|tc| tc.get("function"))
+                                .filter_map(|tc| tc.get("function").or_else(|| tc.get("custom")))
                                 .chain(legacy_call);
                             for f in functions {
-                                for field in ["name", "arguments"] {
+                                for field in ["name", "arguments", "input"] {
                                     push_capped(
                                         &mut comp.est_output_text,
                                         &json_field_text(f.get(field)),
@@ -6866,9 +6876,13 @@ where
                         tool_calls_overflowed,
                     ) {
                         for (channel, tc) in calls {
-                            let function = tc.get("function");
+                            // A custom tool's call carries the same two things
+                            // under its own names.
+                            let function = tc.get("function").or_else(|| tc.get("custom"));
                             let name = json_field_text(function.and_then(|f| f.get("name")));
-                            let args = json_field_text(function.and_then(|f| f.get("arguments")));
+                            let args = json_field_text(
+                                function.and_then(|f| f.get("arguments").or_else(|| f.get("input"))),
+                            );
                             if let Some((cap, _)) = window_tool_calls_cap {
                                 if buf.len() + name.len() + args.len() > cap {
                                     tool_calls_overflowed = true;
@@ -7291,6 +7305,16 @@ where
                     let blocked = if final_text.is_empty() && window_scanned {
                         false
                     } else {
+                        // A segment kind reads only the chunks still held below,
+                        // not the overlap the last window kept, so it gets the
+                        // window's text too or a literal across that boundary
+                        // goes unseen.
+                        let window_scan = matches!(
+                            stream_policy,
+                            aisix_guardrails::StreamOutputPolicy::Window { .. }
+                        )
+                        .then(|| final_text.clone())
+                        .filter(|text| !text.is_empty());
                         let synthesized = {
                             let comp = guard.comp();
                             aisix_gateway::ChatResponse { logprobs: None, more_choices: Vec::new(),
@@ -7312,13 +7336,17 @@ where
                         guard.comp().monitor_hits.extend(hits);
                         let mut seg_counts = crate::redact::RedactionCounts::new();
                         let mut seg_hits = Vec::new();
-                        let moderation = crate::redact::moderate_chat_chunks_structured(
+                        let moderation = crate::redact::moderate_body_scanning(
                             ctx.chain.as_ref(),
-
+                            crate::redact::Direction::Output,
+                            None,
                             verdict,
-                            &mut pending,
                             &mut seg_counts,
                             &mut seg_hits,
+                            window_scan.into_iter().map(|text| (text, true)).collect(),
+                            |guardrail| {
+                                crate::redact::redact_chat_chunks_structured(guardrail, &mut pending)
+                            },
                         )
                         .await;
                         moderation_capture_safe = moderation.capture_safe;
@@ -7649,6 +7677,263 @@ fn error_frame_payload(error_type: &str, message: &str) -> String {
     .unwrap_or_else(|_| {
         r#"{"error":{"message":"error","type":"internal_error"}}"#.into()
     })
+}
+
+#[cfg(test)]
+mod stream_output_scan_tests {
+    use super::{build_sse_stream, StreamCompletion, StreamGuardrailContext};
+    use aisix_gateway::{ChatChunk, ChatChunkStream, ChatDelta, ChatResponse};
+    use aisix_guardrails::{
+        builtin_rule, Guardrail, GuardrailChain, GuardrailVerdict, KeywordBlocklist, KeywordRule,
+        PiiAction, PiiGuardrail, SegmentsOutcome, StreamOutputPolicy,
+    };
+    use async_trait::async_trait;
+    use axum::response::{IntoResponse, Sse};
+    use std::sync::{Arc, Mutex};
+    use std::time::Instant;
+
+    fn chunk(delta: ChatDelta) -> ChatChunk {
+        ChatChunk {
+            id: "c".into(),
+            model: "m".into(),
+            delta,
+            finish_reason: None,
+            usage: None,
+            choice_index: 0,
+            logprobs: None,
+            service_tier: None,
+            accounting_usage: None,
+        }
+    }
+
+    /// What the caller receives from `chunks`, and the stream's completion.
+    async fn run(chunks: Vec<ChatChunk>, chain: Arc<dyn Guardrail>) -> (String, StreamCompletion) {
+        let upstream: ChatChunkStream = Box::pin(futures::stream::iter(chunks.into_iter().map(Ok)));
+        let captured = Arc::new(Mutex::new(None::<StreamCompletion>));
+        let out = Arc::clone(&captured);
+        let stream = build_sse_stream(
+            upstream,
+            1,
+            Some(StreamGuardrailContext {
+                chain,
+                model_name: "gw".into(),
+            }),
+            Instant::now(),
+            Instant::now(),
+            "gw".into(),
+            None,
+            false,
+            aisix_gateway::chat::UsageStats::default(),
+            None,
+            move |completion| {
+                *out.lock().unwrap() = Some(completion);
+            },
+        );
+        let body = axum::body::to_bytes(Sse::new(stream).into_response().into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let completion = captured.lock().unwrap().take().expect("on_complete fired");
+        (String::from_utf8_lossy(&body).into_owned(), completion)
+    }
+
+    fn keyword() -> Arc<dyn Guardrail> {
+        Arc::new(GuardrailChain::new(vec![
+            Arc::new(KeywordBlocklist::output_only(vec![KeywordRule::literal(
+                "SECRET",
+            )])) as Arc<dyn Guardrail>,
+        ]))
+    }
+
+    fn email_mask() -> Arc<dyn Guardrail> {
+        Arc::new(GuardrailChain::new(vec![Arc::new(PiiGuardrail::new(
+            vec![builtin_rule("email", PiiAction::Mask).unwrap()],
+            aisix_core::models::GuardrailHookPoint::Output,
+            262_144,
+            false,
+        )) as Arc<dyn Guardrail>]))
+    }
+
+    /// A row that reads the text it is handed, not the local segments, as the
+    /// remote kinds do.
+    struct ReadsScanText;
+
+    #[async_trait]
+    impl Guardrail for ReadsScanText {
+        fn name(&self) -> &'static str {
+            "reads-scan-text"
+        }
+        fn stream_output_policy(&self) -> StreamOutputPolicy {
+            StreamOutputPolicy::BufferFull {
+                max_buffer_bytes: 1 << 20,
+                on_exceeded_fail_open: false,
+            }
+        }
+        async fn check_output(&self, response: &ChatResponse) -> GuardrailVerdict {
+            if response.message.content_str().contains("SECRET") {
+                GuardrailVerdict::block("matched")
+            } else {
+                GuardrailVerdict::Allow
+            }
+        }
+    }
+
+    fn transcript(text: &str) -> ChatDelta {
+        ChatDelta {
+            audio: Some(serde_json::json!({"id": "a", "transcript": text})),
+            ..Default::default()
+        }
+    }
+
+    fn custom_call(id: Option<&str>, name: Option<&str>, input: &str) -> ChatDelta {
+        let mut custom = serde_json::json!({"input": input});
+        if let Some(name) = name {
+            custom["name"] = name.into();
+        }
+        let mut call = serde_json::json!({"index": 0, "type": "custom", "custom": custom});
+        if let Some(id) = id {
+            call["id"] = id.into();
+        }
+        ChatDelta {
+            tool_calls: Some(vec![call]),
+            ..Default::default()
+        }
+    }
+
+    /// The buffered path reads an audio answer's transcript and so must a
+    /// stream, or `stream: true` is the way around the rule. Split across
+    /// deltas, as it streams.
+    #[tokio::test]
+    async fn a_block_rule_reads_a_streamed_audio_transcript() {
+        let chunks = || vec![chunk(transcript("the SEC")), chunk(transcript("RET word"))];
+        for chain in [keyword(), Arc::new(ReadsScanText) as Arc<dyn Guardrail>] {
+            let (body, completion) = run(chunks(), chain).await;
+            assert!(completion.guardrail_blocked, "{body}");
+            assert!(!body.contains("SEC"), "{body}");
+        }
+    }
+
+    /// The audio holds the same words, out of reach of a rewrite, so a mask hit
+    /// refuses as on the buffered path rather than showing a masked transcript
+    /// beside unmasked audio.
+    #[tokio::test]
+    async fn a_mask_rule_refuses_a_streamed_audio_transcript_it_matches() {
+        let (body, completion) = run(
+            vec![
+                chunk(transcript("mail alice@")),
+                chunk(transcript("example.com")),
+            ],
+            email_mask(),
+        )
+        .await;
+        assert!(completion.guardrail_blocked, "{body}");
+        assert!(!body.contains("alice@"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn a_clean_streamed_audio_transcript_goes_out_untouched() {
+        let (body, completion) = run(vec![chunk(transcript("hello"))], keyword()).await;
+        assert!(!completion.guardrail_blocked, "{body}");
+        assert!(body.contains(r#""transcript":"hello""#), "{body}");
+        assert!(body.contains("[DONE]"), "{body}");
+    }
+
+    /// A custom tool's input is generated text like a function's arguments,
+    /// split across deltas the same way.
+    #[tokio::test]
+    async fn a_block_rule_reads_a_streamed_custom_tool_input() {
+        let chunks = || {
+            vec![
+                chunk(custom_call(Some("call_1"), Some("run"), "the SEC")),
+                chunk(custom_call(None, None, "RET word")),
+            ]
+        };
+        for chain in [keyword(), Arc::new(ReadsScanText) as Arc<dyn Guardrail>] {
+            let (body, completion) = run(chunks(), chain).await;
+            assert!(completion.guardrail_blocked, "{body}");
+            assert!(!body.contains("SEC"), "{body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_block_rule_reads_a_streamed_custom_tool_name() {
+        let (body, completion) = run(
+            vec![chunk(custom_call(Some("call_1"), Some("SECRET"), "x"))],
+            keyword(),
+        )
+        .await;
+        assert!(completion.guardrail_blocked, "{body}");
+    }
+
+    /// A custom tool's input is free-form text, so unlike a transcript it can
+    /// be rewritten: the mask lands across the deltas it spans.
+    #[tokio::test]
+    async fn a_mask_rule_rewrites_a_streamed_custom_tool_input() {
+        let (body, completion) = run(
+            vec![
+                chunk(custom_call(Some("call_1"), Some("run"), "mail alice@")),
+                chunk(custom_call(None, None, "example.com now")),
+            ],
+            email_mask(),
+        )
+        .await;
+        assert!(!completion.guardrail_blocked, "{body}");
+        assert!(!body.contains("alice@"), "{body}");
+        assert!(body.contains("mail [EMAIL_REDACTED] now"), "{body}");
+    }
+
+    /// A window kind that takes its verdict from the segment pass: `custom`
+    /// and `aliyun_ai_guardrail` are shaped like this.
+    struct WindowSegments;
+
+    #[async_trait]
+    impl Guardrail for WindowSegments {
+        fn name(&self) -> &'static str {
+            "window-segments"
+        }
+        fn stream_output_policy(&self) -> StreamOutputPolicy {
+            StreamOutputPolicy::Window {
+                size_chars: 10,
+                overlap_chars: 5,
+                max_buffer_bytes: 1 << 20,
+                on_exceeded_fail_open: false,
+            }
+        }
+        fn moderates_segments(&self) -> bool {
+            true
+        }
+        async fn check_output(&self, response: &ChatResponse) -> GuardrailVerdict {
+            if response.guardrail_output_text().contains("SECRET") {
+                GuardrailVerdict::block("matched")
+            } else {
+                GuardrailVerdict::Allow
+            }
+        }
+        async fn moderate_output_segments(&self, texts: &[String]) -> SegmentsOutcome {
+            if texts.iter().any(|text| text.contains("SECRET")) {
+                SegmentsOutcome::from_verdict(GuardrailVerdict::block("matched"))
+            } else {
+                SegmentsOutcome::allow()
+            }
+        }
+    }
+
+    /// The first half of the literal ends the last full window and goes out
+    /// with it; the rest is the final partial window. The overlap is what lets
+    /// the last scan see them together.
+    #[tokio::test]
+    async fn the_last_window_scan_keeps_its_overlap_for_a_segment_kind() {
+        let text = |t: &str| ChatDelta {
+            content: Some(t.into()),
+            ..Default::default()
+        };
+        let (body, completion) = run(
+            vec![chunk(text("aaaaaaaSEC")), chunk(text("RET"))],
+            Arc::new(WindowSegments),
+        )
+        .await;
+        assert!(completion.guardrail_blocked, "{body}");
+        assert!(!body.contains("[DONE]"), "{body}");
+    }
 }
 
 #[cfg(test)]

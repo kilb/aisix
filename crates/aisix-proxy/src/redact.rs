@@ -1370,6 +1370,24 @@ fn redact_tool_call_arguments(
         } else {
             offer_tool_name(chain, dir, tc.get("function").and_then(|f| f.get("name")));
         }
+        // A custom tool's call: a name like a function's, and free-form text
+        // rather than a JSON-encoded argument object.
+        if detect_keys {
+            if let Some(custom) = tc.get("custom") {
+                unrewritable_tool_key |=
+                    detect_named_structural_fields(chain, dir, custom, &["name"], counts);
+            }
+        } else {
+            offer_tool_name(chain, dir, tc.get("custom").and_then(|c| c.get("name")));
+        }
+        if let Some(input) = tc.get_mut("custom").and_then(|c| c.get_mut("input")) {
+            if input.is_string() {
+                apply_to_value_string(chain, dir, input, counts);
+            } else {
+                unrewritable_tool_key |=
+                    redact_tool_arguments_value(chain, dir, input, counts, detect_keys);
+            }
+        }
         let Some(function) = tc.get_mut("function") else {
             continue;
         };
@@ -3212,6 +3230,33 @@ fn redact_chat_chunks_impl(
         }
     }
 
+    // Transcript channels: judged and never rewritten, as on the buffered path
+    // (`redact_chat_response_impl`), since the same words travel in audio the
+    // redactor cannot reach. A mask hit therefore refuses.
+    let mut transcripts: BTreeMap<u32, String> = BTreeMap::new();
+    for c in chunks.iter() {
+        if let Some(text) = c
+            .delta
+            .audio
+            .as_ref()
+            .and_then(|audio| audio.get("transcript"))
+            .and_then(Value::as_str)
+        {
+            transcripts
+                .entry(c.choice_index)
+                .or_default()
+                .push_str(text);
+        }
+    }
+    for joined in transcripts.into_values() {
+        unrewritable_tool_key |= detect_unrewritable_value_strings(
+            chain,
+            Direction::Output,
+            &Value::String(joined),
+            &mut counts,
+        );
+    }
+
     // Compatible upstreams sometimes emit already-decoded argument objects
     // even though OpenAI documents a JSON-encoded string. They are still
     // forwarded on the raw wire, so recursively rewrite them before building
@@ -3294,6 +3339,13 @@ fn redact_chat_chunks_impl(
     type StructuralChannels =
         BTreeMap<(u32, Option<u64>, &'static str), Vec<(usize, Option<usize>)>>;
     let mut structural_channels = StructuralChannels::new();
+    // A custom tool's `input`: free-form text in fragments, one channel per
+    // call of a choice.
+    let mut custom_channels: BTreeMap<(u32, u64), Vec<(usize, usize)>> = BTreeMap::new();
+    // What a call's name sits on: `function`, or `custom` on a custom tool's.
+    fn callee(tc: &Value) -> Option<&Value> {
+        tc.get("function").or_else(|| tc.get("custom"))
+    }
     // The deprecated single call: the typed field the OpenAI wire fills, or
     // `extra`, which the legacy-functions reply path writes.
     fn legacy_call(chunk: &ChatChunk) -> Option<&Value> {
@@ -3310,7 +3362,7 @@ fn redact_chat_chunks_impl(
                 if detect_keys {
                     for field in ["id", "type", "name"] {
                         let value = match field {
-                            "name" => tc.get("function").and_then(|function| function.get("name")),
+                            "name" => callee(tc).and_then(|callee| callee.get("name")),
                             _ => tc.get(field),
                         };
                         if value
@@ -3327,7 +3379,7 @@ fn redact_chat_chunks_impl(
                     offer_tool_name(
                         chain,
                         Direction::Output,
-                        tc.get("function").and_then(|f| f.get("name")),
+                        callee(tc).and_then(|f| f.get("name")),
                     );
                 }
                 if tc
@@ -3340,6 +3392,17 @@ fn redact_chat_chunks_impl(
                         .entry((chunk.choice_index, Some(idx)))
                         .or_default()
                         .push((ci, Some(ti)));
+                }
+                if tc
+                    .get("custom")
+                    .and_then(|c| c.get("input"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|s| !s.is_empty())
+                {
+                    custom_channels
+                        .entry((chunk.choice_index, idx))
+                        .or_default()
+                        .push((ci, ti));
                 }
             }
         }
@@ -3372,7 +3435,7 @@ fn redact_chat_chunks_impl(
     }
     fn function_of(chunk: &ChatChunk, ti: Option<usize>) -> Option<&Value> {
         match ti {
-            Some(ti) => chunk.delta.tool_calls.as_ref()?.get(ti)?.get("function"),
+            Some(ti) => callee(chunk.delta.tool_calls.as_ref()?.get(ti)?),
             None => legacy_call(chunk),
         }
     }
@@ -3443,6 +3506,38 @@ fn redact_chat_chunks_impl(
             }
         }
         merge_counts(&mut counts, local);
+    }
+    for sites in custom_channels.values() {
+        let input_of = |chunk: &ChatChunk, ti: usize| -> Option<String> {
+            chunk.delta.tool_calls.as_ref()?.get(ti)?["custom"]["input"]
+                .as_str()
+                .map(str::to_owned)
+        };
+        let joined: String = sites
+            .iter()
+            .filter_map(|&(ci, ti)| input_of(&chunks[ci], ti))
+            .collect();
+        if let Some(r) = chain.redact_output_text(&joined) {
+            let mut first = true;
+            for &(ci, ti) in sites {
+                if let Some(input) = chunks[ci]
+                    .delta
+                    .tool_calls
+                    .as_mut()
+                    .and_then(|calls| calls.get_mut(ti))
+                    .and_then(|tc| tc.get_mut("custom"))
+                    .and_then(|custom| custom.get_mut("input"))
+                {
+                    *input = Value::String(if first {
+                        first = false;
+                        r.text.clone()
+                    } else {
+                        String::new()
+                    });
+                }
+            }
+            merge_counts(&mut counts, r.counts);
+        }
     }
 
     for chunk in chunks.iter_mut() {
@@ -5841,6 +5936,77 @@ mod tests {
             "{\"mail\":\"[EMAIL_REDACTED]\"}"
         );
         assert_eq!(counts.get("email"), Some(&4));
+    }
+
+    #[test]
+    fn a_custom_tool_call_input_is_masked_like_any_generated_text() {
+        let chain = both();
+        let mut msg = ChatMessage::assistant("");
+        msg.extra.insert(
+            "tool_calls".into(),
+            json!([{
+                "id": "call_1",
+                "type": "custom",
+                "custom": {"name": "run", "input": "mail a@x.com"},
+            }]),
+        );
+        let mut resp = ChatResponse {
+            logprobs: None,
+            more_choices: Vec::new(),
+            service_tier: None,
+            id: "r".into(),
+            model: "m".into(),
+            message: msg,
+            finish_reason: aisix_gateway::FinishReason::ToolCalls,
+            usage: aisix_gateway::UsageStats::new(0, 0),
+        };
+        let redaction = redact_chat_response_structured(chain.as_ref(), &mut resp);
+        assert!(!redaction.unrewritable_tool_key);
+        assert_eq!(
+            resp.message.extra["tool_calls"][0]["custom"]["input"],
+            "mail [EMAIL_REDACTED]"
+        );
+    }
+
+    /// Keyword and PII rows judge only what the walk offers, so a custom
+    /// tool's fields have to be among it for a block rule to read them.
+    #[tokio::test]
+    async fn a_block_rule_reads_a_custom_tool_call_on_a_buffered_answer() {
+        let chain: Arc<dyn Guardrail> = Arc::new(GuardrailChain::new(vec![Arc::new(
+            aisix_guardrails::KeywordBlocklist::output_only(vec![
+                aisix_guardrails::KeywordRule::literal("SECRET"),
+            ]),
+        )
+            as Arc<dyn Guardrail>]));
+        for call in [
+            json!({"id": "c", "type": "custom", "custom": {"name": "run", "input": "the SECRET"}}),
+            json!({"id": "c", "type": "custom", "custom": {"name": "SECRET", "input": "x"}}),
+        ] {
+            let mut msg = ChatMessage::assistant("");
+            msg.extra.insert("tool_calls".into(), json!([call]));
+            let mut resp = ChatResponse {
+                logprobs: None,
+                more_choices: Vec::new(),
+                service_tier: None,
+                id: "r".into(),
+                model: "m".into(),
+                message: msg,
+                finish_reason: aisix_gateway::FinishReason::ToolCalls,
+                usage: aisix_gateway::UsageStats::new(0, 0),
+            };
+            let (verdict, _) = chain.check_output_non_segment_observed(&resp).await;
+            let mut counts = RedactionCounts::new();
+            let mut hits = Vec::new();
+            let moderation = moderate_chat_response_structured(
+                chain.as_ref(),
+                verdict,
+                &mut resp,
+                &mut counts,
+                &mut hits,
+            )
+            .await;
+            assert!(moderation.verdict.is_block());
+        }
     }
 
     #[test]

@@ -218,7 +218,13 @@ pub(crate) fn chat_delta(delta: &ChatDelta) -> usize {
         .and_then(|call| call.get("arguments"))
         .and_then(Value::as_str)
         .map_or(0, str::len);
-    text + reasoning + tool_args + legacy_args
+    let transcript = delta
+        .audio
+        .as_ref()
+        .and_then(|audio| audio.get("transcript"))
+        .and_then(Value::as_str)
+        .map_or(0, str::len);
+    text + reasoning + tool_args + legacy_args + transcript
 }
 
 /// One stream event split the way the output guardrails read it: `scan`
