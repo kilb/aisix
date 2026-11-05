@@ -27,6 +27,7 @@ use std::time::Duration;
 use aisix_cache::{body_fingerprint, Cache, CachedBody};
 use aisix_core::models::CacheScope;
 use aisix_core::AisixSnapshot;
+use aisix_gateway::{ChatResponse, FinishReason};
 
 use crate::auth::AuthenticatedKey;
 use crate::chat::CacheStatus;
@@ -38,6 +39,53 @@ use crate::state::ProxyState;
 /// return a message, a Responses object or an embedding matrix, all far
 /// below this. A body above it is relayed uncached rather than rejected.
 pub(crate) const MAX_CACHED_BODY_BYTES: usize = 32 << 20;
+
+/// Marks a rendered response the gate must not store, for an answer only the
+/// site holding the upstream's [`ChatResponse`] can judge. See
+/// [`answer_is_storable`].
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct UnstorableAnswer;
+
+/// Whether an upstream answer may be written to a response cache. One rule for
+/// every endpoint that caches an answer:
+///
+/// - An answer with generated images stays out. Chat would keep megabytes per
+///   image. `/v1/messages` and `/v1/responses` discard the images, so what they
+///   would keep is the answer without them, which for an image-only answer is
+///   an empty message replayed for the policy's whole TTL.
+/// - A content-filter refusal stays out for the reason a non-200 does: one
+///   refusal would become minutes of replayed refusal for a request a later
+///   attempt may well answer.
+pub(crate) fn answer_is_storable(answer: &ChatResponse) -> bool {
+    answer.finish_reason != FinishReason::ContentFilter
+        && !answer.messages().any(|m| m.extra.contains_key("images"))
+}
+
+/// [`answer_is_storable`]'s refusal half for a body relayed from a native
+/// upstream, which never became a [`ChatResponse`]: `stop_reason: "refusal"` on
+/// a Messages answer (<https://docs.anthropic.com/en/api/messages>),
+/// `incomplete_details.reason: "content_filter"` on a Responses one
+/// (<https://platform.openai.com/docs/api-reference/responses/object>). Each
+/// field exists in one protocol only, so one check serves both endpoints.
+pub(crate) fn body_is_refusal(body: &[u8]) -> bool {
+    #[derive(serde::Deserialize)]
+    struct Incomplete {
+        reason: Option<String>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Answer {
+        stop_reason: Option<String>,
+        incomplete_details: Option<Incomplete>,
+    }
+    let Ok(answer) = serde_json::from_slice::<Answer>(body) else {
+        return false;
+    };
+    answer.stop_reason.as_deref() == Some("refusal")
+        || answer
+            .incomplete_details
+            .and_then(|d| d.reason)
+            .is_some_and(|reason| reason == "content_filter")
+}
 
 /// What the cache did for one request, as the usage event reports it.
 ///
@@ -260,5 +308,56 @@ pub(crate) fn apply_cache_headers(response: &mut axum::response::Response, statu
             axum::http::HeaderName::from_static(crate::chat::CACHE_LAYER_HEADER),
             axum::http::HeaderValue::from_static("exact"),
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aisix_gateway::{ChatMessage, UsageStats};
+
+    fn answer(finish_reason: FinishReason) -> ChatResponse {
+        ChatResponse {
+            logprobs: None,
+            more_choices: Vec::new(),
+            id: "id".to_string(),
+            model: "m".to_string(),
+            message: ChatMessage::assistant("text".to_string()),
+            finish_reason,
+            usage: UsageStats::new(0, 0),
+            service_tier: None,
+        }
+    }
+
+    #[test]
+    fn an_answer_with_images_or_a_refusal_is_not_stored() {
+        assert!(answer_is_storable(&answer(FinishReason::Stop)));
+        assert!(answer_is_storable(&answer(FinishReason::Length)));
+        assert!(!answer_is_storable(&answer(FinishReason::ContentFilter)));
+
+        let mut with_images = answer(FinishReason::Stop);
+        with_images
+            .message
+            .extra
+            .insert("images".to_string(), serde_json::json!([]));
+        assert!(!answer_is_storable(&with_images));
+    }
+
+    #[test]
+    fn a_relayed_refusal_is_recognised_on_both_protocols() {
+        for refusal in [
+            r#"{"type":"message","stop_reason":"refusal","content":[]}"#,
+            r#"{"status":"incomplete","incomplete_details":{"reason":"content_filter"}}"#,
+        ] {
+            assert!(body_is_refusal(refusal.as_bytes()), "{refusal}");
+        }
+        for answer in [
+            r#"{"type":"message","stop_reason":"end_turn","content":[]}"#,
+            r#"{"status":"completed","incomplete_details":null}"#,
+            r#"{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"}}"#,
+            "not json",
+        ] {
+            assert!(!body_is_refusal(answer.as_bytes()), "{answer}");
+        }
     }
 }

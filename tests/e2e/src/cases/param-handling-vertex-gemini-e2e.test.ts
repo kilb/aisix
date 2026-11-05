@@ -1715,6 +1715,34 @@ describe("Vertex Gemini: generated images on chat completions", () => {
     expect(await cachedAcross(say())).toBe("miss");
   });
 
+  test.for(["/v1/chat/completions", "/v1/messages", "/v1/responses"] as const)(
+    "%s caches neither an answer with images nor a refusal, and does cache plain text",
+    async (path, ctx) => {
+      if (!ready(ctx)) return;
+      const request = () =>
+        path === "/v1/responses"
+          ? { model: "img", input: `prompt-${++unique}` }
+          : { model: "img", max_tokens: 100, messages: say() };
+      const secondAnswerCache = async () => {
+        const body = request();
+        const first = await post(path, body);
+        expect(first.status, first.text.slice(0, 500)).toBe(200);
+        const second = await post(path, body);
+        expect(second.status, second.text.slice(0, 500)).toBe(200);
+        return second.headers.get("x-aisix-cache");
+      };
+
+      useAnswer([{ text: "with a picture" }, inline(IMAGE_A)]);
+      expect(await secondAnswerCache(), "text beside an image").toBe("miss");
+      useAnswer([inline(IMAGE_A)]);
+      expect(await secondAnswerCache(), "an image alone").toBe("miss");
+      useAnswer([], USAGE_METADATA, "IMAGE_SAFETY");
+      expect(await secondAnswerCache(), "a refusal").toBe("miss");
+      useAnswer([{ text: "plain" }]);
+      expect(await secondAnswerCache(), "plain text").toBe("hit");
+    },
+  );
+
   test.for([
     ["/v1/messages", { max_tokens: 100, messages: HI }, "hi from text"],
     ["/v1/responses", { input: "hi" }, "hi from text"],

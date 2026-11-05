@@ -220,6 +220,11 @@ async fn store_in_cache(
     if success.response.status() != axum::http::StatusCode::OK
         || success.usage_handled_by_stream
         || success.guardrail_blocked
+        || success
+            .response
+            .extensions()
+            .get::<crate::response_cache::UnstorableAnswer>()
+            .is_some()
     {
         crate::response_cache::apply_cache_headers(&mut success.response, status);
         return success;
@@ -253,13 +258,15 @@ async fn store_in_cache(
         .as_ref()
         .map(|u| (u.prompt_tokens, u.completion_tokens))
         .unwrap_or((0, 0));
-    gate.store(aisix_cache::CachedBody {
-        content_type,
-        body: bytes.to_vec(),
-        prompt_tokens,
-        completion_tokens,
-    })
-    .await;
+    if !crate::response_cache::body_is_refusal(&bytes) {
+        gate.store(aisix_cache::CachedBody {
+            content_type,
+            body: bytes.to_vec(),
+            prompt_tokens,
+            completion_tokens,
+        })
+        .await;
+    }
     success.response = Response::from_parts(parts, axum::body::Body::from(bytes));
     crate::response_cache::apply_cache_headers(&mut success.response, status);
     success
@@ -3691,6 +3698,11 @@ async fn responses_cross_provider_to_target(
     };
     mark.apply_to_body(&mut json_body);
     let mut response = Json(json_body).into_response();
+    if !crate::response_cache::answer_is_storable(&resp) {
+        response
+            .extensions_mut()
+            .insert(crate::response_cache::UnstorableAnswer);
+    }
     if let Ok(hv) = HeaderValue::from_str(request_id) {
         response
             .headers_mut()

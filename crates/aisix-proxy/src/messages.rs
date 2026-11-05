@@ -3404,8 +3404,14 @@ async fn cross_provider_dispatch(
             &json,
         )))
     });
+    let mut response = Json(json).into_response();
+    if !crate::response_cache::answer_is_storable(&resp) {
+        response
+            .extensions_mut()
+            .insert(crate::response_cache::UnstorableAnswer);
+    }
     Ok(DispatchOutcome {
-        response: Json(json).into_response(),
+        response,
         provider_label,
         upstream_protocol: aisix_gateway::upstream_protocol(provider_key),
         provider_key_id: provider_key_id.to_string(),
@@ -4238,7 +4244,14 @@ async fn store_in_cache(
     gate.record(state, status);
     let mut outcome = outcome;
     outcome.cache = crate::response_cache::CacheTelemetry::of(status);
-    if outcome.response.status() != axum::http::StatusCode::OK || outcome.usage_handled_by_stream {
+    if outcome.response.status() != axum::http::StatusCode::OK
+        || outcome.usage_handled_by_stream
+        || outcome
+            .response
+            .extensions()
+            .get::<crate::response_cache::UnstorableAnswer>()
+            .is_some()
+    {
         crate::response_cache::apply_cache_headers(&mut outcome.response, status);
         return outcome;
     }
@@ -4274,13 +4287,15 @@ async fn store_in_cache(
             return outcome;
         }
     };
-    gate.store(aisix_cache::CachedBody {
-        content_type,
-        body: bytes.to_vec(),
-        prompt_tokens: outcome.metrics.prompt_tokens,
-        completion_tokens: outcome.metrics.completion_tokens,
-    })
-    .await;
+    if !crate::response_cache::body_is_refusal(&bytes) {
+        gate.store(aisix_cache::CachedBody {
+            content_type,
+            body: bytes.to_vec(),
+            prompt_tokens: outcome.metrics.prompt_tokens,
+            completion_tokens: outcome.metrics.completion_tokens,
+        })
+        .await;
+    }
     outcome.response = Response::from_parts(parts, axum::body::Body::from(bytes));
     crate::response_cache::apply_cache_headers(&mut outcome.response, status);
     outcome

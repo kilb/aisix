@@ -3819,8 +3819,7 @@ async fn dispatch(
         cache_key.as_ref(),
         // `Cache-Control: no-store` suppresses both layers' writes.
         cc.no_store,
-        // Generated images run to megabytes each.
-        upstream.messages().any(|m| m.extra.contains_key("images")),
+        !crate::response_cache::answer_is_storable(&upstream),
     ) {
         match cache.put_with_ttl(key, upstream.clone(), ttl).await {
             Ok(()) => note_cache_ok(state, policy_backend, CacheHalf::Exact),
