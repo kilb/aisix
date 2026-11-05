@@ -43,18 +43,35 @@ function killTree(p: ChildProcess): void {
   }
 }
 
+/** 这个进程已经发出去的端口号。见 freePort。 */
+const issuedPorts = new Set<number>();
+
+/**
+ * 要一个空闲端口。同一个进程里不会把同一个号发两次。
+ *
+ * 这里是绑定 :0、读出号、关掉再交给调用方，从关掉到真正有人绑上去之间，内核可以
+ * 把同一个号再发给下一次 freePort。夹具一次要好几个端口、而且不是马上都用：门户的
+ * 号要到 Prometheus 和转发器都起来之后才绑。真撞上时，就绪探测和注册请求都打到了
+ * 占了那个号的别的服务上，看起来是「注册失败: 200」，跟门户毫无关系。
+ */
 export async function freePort(): Promise<number> {
-  return new Promise((res, rej) => {
-    const s = netServer();
-    s.once("error", rej);
-    s.listen(0, "127.0.0.1", () => {
-      const a = s.address();
-      if (a && typeof a === "object") {
-        const p = a.port;
-        s.close(() => res(p));
-      } else rej(new Error("拿不到端口"));
+  for (;;) {
+    const port = await new Promise<number>((res, rej) => {
+      const s = netServer();
+      s.once("error", rej);
+      s.listen(0, "127.0.0.1", () => {
+        const a = s.address();
+        if (a && typeof a === "object") {
+          const p = a.port;
+          s.close(() => res(p));
+        } else rej(new Error("拿不到端口"));
+      });
     });
-  });
+    if (!issuedPorts.has(port)) {
+      issuedPorts.add(port);
+      return port;
+    }
+  }
 }
 
 export async function waitReady(url: string, label: string, ok = (s: number) => s < 500) {
