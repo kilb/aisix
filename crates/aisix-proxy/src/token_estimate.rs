@@ -175,9 +175,16 @@ pub fn count_text(model: &str, text: &str) -> u32 {
 /// replaced with local counts. `output_text: None` disables the
 /// completion side (nothing was delivered, or nothing was accumulated).
 /// Sub-counters (cache/reasoning) are never estimated.
+///
+/// `additive_cache_input` is the upstream's cache reads and writes where they
+/// sit beside its prompt count (`cache_read_tokens` + `cache_creation_tokens`).
+/// A zero prompt beside them is a reported number: all of it came from or went
+/// to the cache, and counting the prompt locally would bill it a second time at
+/// the full input rate.
 pub fn fill_missing(
     est: &Estimator,
     upstream_prompt: u32,
+    additive_cache_input: u32,
     upstream_completion: u32,
     output_text: Option<&str>,
 ) -> Filled {
@@ -186,7 +193,7 @@ pub fn fill_missing(
         completion_tokens: upstream_completion,
         estimated: false,
     };
-    if upstream_prompt == 0 {
+    if upstream_prompt == 0 && additive_cache_input == 0 {
         let n = est.count_prompt();
         if n > 0 {
             filled.prompt_tokens = n;
@@ -1324,6 +1331,22 @@ mod tests {
         assert_eq!(wire.count_prompt(), expected);
     }
 
+    /// Anthropic-shape usage reports cache reads and writes BESIDE its input
+    /// count, so `input_tokens: 0` next to them is a real number: the whole
+    /// prompt came from or went to the cache. Counting it locally would charge
+    /// it again at the full input rate.
+    #[test]
+    fn a_zero_prompt_beside_cache_counters_is_a_reported_number() {
+        let est = chat_est(
+            "gpt-4",
+            ChatFormat::new("gpt-4", vec![msg(Role::User, "Hello")]),
+        );
+        let f = fill_missing(&est, 0, 900, 34, Some("Hello world"));
+        assert_eq!(f.prompt_tokens, 0);
+        assert_eq!(f.completion_tokens, 34);
+        assert!(!f.estimated);
+    }
+
     #[test]
     fn fill_missing_or_semantics() {
         let est = chat_est(
@@ -1332,34 +1355,34 @@ mod tests {
         );
 
         // Upstream reported both: untouched, not estimated.
-        let f = fill_missing(&est, 12, 34, Some("Hello world"));
+        let f = fill_missing(&est, 12, 0, 34, Some("Hello world"));
         assert_eq!(
             (f.prompt_tokens, f.completion_tokens, f.estimated),
             (12, 34, false)
         );
 
         // Both missing: both filled.
-        let f = fill_missing(&est, 0, 0, Some("Hello world"));
+        let f = fill_missing(&est, 0, 0, 0, Some("Hello world"));
         assert_eq!(f.prompt_tokens, 8);
         assert_eq!(f.completion_tokens, 2);
         assert!(f.estimated);
 
         // Partial: only the missing side fills.
-        let f = fill_missing(&est, 12, 0, Some("Hello world"));
+        let f = fill_missing(&est, 12, 0, 0, Some("Hello world"));
         assert_eq!(
             (f.prompt_tokens, f.completion_tokens, f.estimated),
             (12, 2, true)
         );
 
         // No output text (nothing delivered): completion stays 0, prompt fills.
-        let f = fill_missing(&est, 0, 0, None);
+        let f = fill_missing(&est, 0, 0, 0, None);
         assert_eq!(
             (f.prompt_tokens, f.completion_tokens, f.estimated),
             (8, 0, true)
         );
 
         // Empty output text estimates to 0 — not marked estimated for it.
-        let f = fill_missing(&est, 5, 0, Some(""));
+        let f = fill_missing(&est, 5, 0, 0, Some(""));
         assert_eq!(
             (f.prompt_tokens, f.completion_tokens, f.estimated),
             (5, 0, false)

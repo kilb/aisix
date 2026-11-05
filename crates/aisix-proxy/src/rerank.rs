@@ -916,13 +916,13 @@ fn rerank_prompt_tokens(body: &Value) -> Option<u32> {
             .or_else(|| usage.get("total_tokens"))
             .and_then(|v| v.as_u64());
         if let Some(t) = tokens {
-            return Some(t as u32);
+            return Some(crate::usage_attr::token_count(t));
         }
     }
     // Cohere shape: `meta.billed_units.input_tokens`.
     if let Some(units) = body.get("meta").and_then(|m| m.get("billed_units")) {
         if let Some(t) = units.get("input_tokens").and_then(|v| v.as_u64()) {
-            return Some(t as u32);
+            return Some(crate::usage_attr::token_count(t));
         }
     }
     None
@@ -1273,6 +1273,17 @@ mod tests {
         );
         let g: aisix_core::Guardrail = serde_json::from_str(&json).unwrap();
         ResourceEntry::new("g-1", g, 1)
+    }
+
+    #[test]
+    fn a_token_count_past_u32_saturates_rather_than_wraps() {
+        let past = u64::from(u32::MAX) + 2;
+        for body in [
+            serde_json::json!({"usage": {"prompt_tokens": past}}),
+            serde_json::json!({"meta": {"billed_units": {"input_tokens": past}}}),
+        ] {
+            assert_eq!(super::rerank_prompt_tokens(&body), Some(u32::MAX), "{body}");
+        }
     }
 
     /// #545: a configured input guardrail must fire on /v1/rerank — a blocked

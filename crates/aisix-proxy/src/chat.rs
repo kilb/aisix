@@ -1318,8 +1318,15 @@ fn estimate_missing_chat_usage(
         upstream_model,
         crate::token_estimate::PromptInput::Chat(Box::new(req.clone())),
     );
-    let filled =
-        crate::token_estimate::fill_missing(&est, p, c, Some(&estimation_output_text(resp)));
+    let filled = crate::token_estimate::fill_missing(
+        &est,
+        p,
+        resp.usage
+            .cache_read_tokens
+            .saturating_add(resp.usage.cache_creation_tokens),
+        c,
+        Some(&estimation_output_text(resp)),
+    );
     (
         filled.prompt_tokens,
         filled.completion_tokens,
@@ -1392,6 +1399,9 @@ fn estimate_subcall_tokens(
     let filled = crate::token_estimate::fill_missing(
         &est,
         usage.prompt_tokens,
+        usage
+            .cache_read_tokens
+            .saturating_add(usage.cache_creation_tokens),
         usage.completion_tokens,
         Some(output_text),
     );
@@ -3190,6 +3200,7 @@ async fn dispatch(
                     let filled = crate::token_estimate::fill_missing(
                         &est,
                         prompt as u32,
+                        cache_read_tokens.saturating_add(cache_creation_tokens),
                         completion as u32,
                         Some(&estimation_output_text(&cached)),
                     );
@@ -6482,18 +6493,16 @@ impl<F: FnOnce(StreamCompletion)> Drop for CompleteOnDrop<F> {
             // future before the first chunk was pulled), the upstream's
             // `usage` block is meaningless for billing — no completion
             // tokens crossed the wire to the client. Zero out the
-            // completion-side counters but keep `prompt_tokens` (the
-            // prompt was processed by upstream regardless, and the
-            // industry contract is "prompts always billed").
+            // completion-side counters but keep the prompt's (it was
+            // processed by upstream regardless, and the industry contract
+            // is "prompts always billed"), the cache reads and writes beside
+            // `prompt_tokens` included: on that shape they ARE most of it.
             if delivered == 0 && !c.held_output {
                 c.completion_tokens = 0;
                 c.reasoning_tokens = 0;
                 // The upstream's total describes counters no longer being
                 // recorded.
                 c.upstream_total_tokens = None;
-                c.cache_creation_tokens = 0;
-                c.cache_creation_ttl = aisix_gateway::CacheCreationTtl::NONE;
-                c.cache_read_tokens = 0;
                 c.total_tokens = c.prompt_tokens as u64;
             }
             // Token-estimation fallback (#1074), after the #419
@@ -6507,6 +6516,7 @@ impl<F: FnOnce(StreamCompletion)> Drop for CompleteOnDrop<F> {
                 let filled = crate::token_estimate::fill_missing(
                     &est,
                     c.prompt_tokens,
+                    c.cache_read_tokens.saturating_add(c.cache_creation_tokens),
                     c.completion_tokens,
                     output,
                 );
@@ -8913,15 +8923,17 @@ mod complete_on_drop_tests {
             "completion_tokens must zero when delivered==0 (#419)"
         );
         assert_eq!(out.reasoning_tokens, 0, "reasoning_tokens must zero");
-        assert_eq!(out.cache_creation_tokens, 0, "cache_creation must zero");
-        assert_eq!(out.cache_read_tokens, 0, "cache_read must zero");
         assert_eq!(
             out.prompt_tokens, 10,
             "prompt_tokens preserved — prompt was processed regardless of delivery"
         );
+        // The same reason holds for the cache reads and writes reported beside
+        // it: they are the prompt too.
+        assert_eq!(out.cache_creation_tokens, 1);
+        assert_eq!(out.cache_read_tokens, 1);
         assert_eq!(
-            out.total_tokens, 10,
-            "total_tokens recomputed = prompt_tokens only when completion-side zeroed"
+            out.total_tokens, 12,
+            "total_tokens = the prompt's three counters when completion-side zeroed"
         );
         assert_eq!(out.chunks_delivered, 0, "Drop must persist delivered count");
     }

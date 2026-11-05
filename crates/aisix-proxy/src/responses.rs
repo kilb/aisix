@@ -2388,6 +2388,9 @@ async fn responses_to_target(
                 let filled = crate::token_estimate::fill_missing(
                     &est,
                     usage.prompt_tokens,
+                    usage
+                        .cache_read_tokens
+                        .saturating_add(usage.cache_creation_tokens),
                     usage.completion_tokens,
                     Some(&responses_sse_output_text(&buf)),
                 );
@@ -2753,6 +2756,9 @@ async fn responses_to_target(
                     let filled = crate::token_estimate::fill_missing(
                         &estimator_c,
                         usage.prompt_tokens,
+                        usage
+                            .cache_read_tokens
+                            .saturating_add(usage.cache_creation_tokens),
                         usage.completion_tokens,
                         Some(&out_text),
                     );
@@ -2961,6 +2967,7 @@ async fn responses_to_target(
                 let filled = crate::token_estimate::fill_missing(
                     &est,
                     u.prompt_tokens,
+                    u.cache_read_tokens.saturating_add(u.cache_creation_tokens),
                     u.completion_tokens,
                     Some(&responses_output_text(&json_body)),
                 );
@@ -3638,6 +3645,7 @@ async fn responses_cross_provider_to_target(
             let filled = crate::token_estimate::fill_missing(
                 &est,
                 u.prompt_tokens,
+                u.cache_read_tokens.saturating_add(u.cache_creation_tokens),
                 u.completion_tokens,
                 Some(&crate::chat::estimation_output_text(&resp)),
             );
@@ -4185,6 +4193,9 @@ fn held_refusal_usage(
     let filled = crate::token_estimate::fill_missing(
         &est,
         usage.prompt_tokens,
+        usage
+            .cache_read_tokens
+            .saturating_add(usage.cache_creation_tokens),
         usage.completion_tokens,
         Some(output_text),
     );

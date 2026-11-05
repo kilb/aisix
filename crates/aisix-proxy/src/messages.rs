@@ -2500,6 +2500,9 @@ fn fill_missing_anthropic_metrics(
     let filled = crate::token_estimate::fill_missing(
         &est,
         metrics.prompt_tokens,
+        metrics
+            .cache_read_tokens
+            .saturating_add(metrics.cache_creation_tokens),
         metrics.completion_tokens,
         Some(&output_text()),
     );
@@ -4031,6 +4034,9 @@ fn build_anthropic_sse_stream(
                 crate::token_estimate::fill_missing(
                     &est,
                     comp.prompt_tokens,
+                    comp
+                        .cache_read_tokens
+                        .saturating_add(comp.cache_creation_tokens),
                     comp.completion_tokens,
                     Some(comp.est_output_text.as_str()),
                 )
@@ -4247,6 +4253,7 @@ impl<F: FnOnce(AnthropicStreamCompletion)> Drop for CompleteAnthropicStreamOnDro
                 let filled = crate::token_estimate::fill_missing(
                     &est,
                     c.prompt_tokens,
+                    c.cache_read_tokens.saturating_add(c.cache_creation_tokens),
                     c.completion_tokens,
                     Some(c.est_output_text.as_str()),
                 );
@@ -4920,25 +4927,26 @@ fn update_anthropic_usage(
                     acc.service_tier = Some(tier);
                 }
                 if let Some(t) = usage.get("input_tokens").and_then(Value::as_u64) {
-                    acc.prompt_tokens = t as u32;
+                    acc.prompt_tokens = crate::usage_attr::token_count(t);
                 }
                 if let Some(t) = usage
                     .get("cache_creation_input_tokens")
                     .and_then(Value::as_u64)
                 {
-                    acc.cache_creation_tokens = t as u32;
+                    acc.cache_creation_tokens = crate::usage_attr::token_count(t);
                 }
                 acc.cache_creation_ttl =
                     aisix_gateway::CacheCreationTtl::from_anthropic(usage.get("cache_creation"));
                 if let Some(t) = usage.get("cache_read_input_tokens").and_then(Value::as_u64) {
-                    acc.cache_read_tokens = t as u32;
+                    acc.cache_read_tokens = crate::usage_attr::token_count(t);
                 }
                 // message_start carries an initial output_tokens (often
                 // 1); take it as a floor — message_delta supersedes with
                 // the real total. max-wins guards against a provider that
                 // double-emits or re-orders.
                 if let Some(t) = usage.get("output_tokens").and_then(Value::as_u64) {
-                    acc.completion_tokens = acc.completion_tokens.max(t as u32);
+                    acc.completion_tokens =
+                        acc.completion_tokens.max(crate::usage_attr::token_count(t));
                 }
             }
             if let Some(id) = msg.and_then(|m| m.get("id")).and_then(Value::as_str) {
@@ -5024,7 +5032,8 @@ fn update_anthropic_usage(
                 }
                 if let Some(v) = usage.get("output_tokens") {
                     if let Some(t) = v.as_u64() {
-                        acc.completion_tokens = acc.completion_tokens.max(t as u32);
+                        acc.completion_tokens =
+                            acc.completion_tokens.max(crate::usage_attr::token_count(t));
                         acc.output_tokens_from_delta = true;
                     } else {
                         // PR #436 audit LOW-1: a `usage` object present but
@@ -5046,28 +5055,35 @@ fn update_anthropic_usage(
                 // prompt_tokens=0. Harvest them here too, max-wins with
                 // the message_start values (mainstream gateways read both frames).
                 if let Some(t) = usage.get("input_tokens").and_then(Value::as_u64) {
-                    acc.prompt_tokens = acc.prompt_tokens.max(t as u32);
+                    acc.prompt_tokens = acc.prompt_tokens.max(crate::usage_attr::token_count(t));
                 }
                 if let Some(t) = usage
                     .get("cache_creation_input_tokens")
                     .and_then(Value::as_u64)
                 {
-                    acc.cache_creation_tokens = acc.cache_creation_tokens.max(t as u32);
+                    acc.cache_creation_tokens = acc
+                        .cache_creation_tokens
+                        .max(crate::usage_attr::token_count(t));
                 }
                 acc.cache_creation_ttl = acc.cache_creation_ttl.max_fieldwise(
                     &aisix_gateway::CacheCreationTtl::from_anthropic(usage.get("cache_creation")),
                 );
                 if let Some(t) = usage.get("cache_read_input_tokens").and_then(Value::as_u64) {
-                    acc.cache_read_tokens = acc.cache_read_tokens.max(t as u32);
+                    acc.cache_read_tokens =
+                        acc.cache_read_tokens.max(crate::usage_attr::token_count(t));
                 }
                 // Cumulative for the turn, same as the counters above, so a
                 // later frame's figure supersedes an earlier one.
                 if let Some(stu) = usage.get("server_tool_use") {
                     if let Some(n) = stu.get("web_search_requests").and_then(Value::as_u64) {
-                        acc.web_search_requests = acc.web_search_requests.max(n as u32);
+                        acc.web_search_requests = acc
+                            .web_search_requests
+                            .max(crate::usage_attr::token_count(n));
                     }
                     if let Some(n) = stu.get("web_fetch_requests").and_then(Value::as_u64) {
-                        acc.web_fetch_requests = acc.web_fetch_requests.max(n as u32);
+                        acc.web_fetch_requests = acc
+                            .web_fetch_requests
+                            .max(crate::usage_attr::token_count(n));
                     }
                 }
             }
@@ -5260,6 +5276,9 @@ impl<F: FnOnce(AnthropicStreamUsage)> Drop for AnthropicStreamGuard<F> {
                 let filled = crate::token_estimate::fill_missing(
                     &est,
                     usage.prompt_tokens,
+                    usage
+                        .cache_read_tokens
+                        .saturating_add(usage.cache_creation_tokens),
                     upstream_completion,
                     output,
                 );
@@ -9360,6 +9379,28 @@ event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\
         assert_eq!(out.prompt_tokens, 37);
         assert_eq!(out.completion_tokens, 52);
         assert!(!out.usage_estimated);
+    }
+
+    /// A count past `u32` saturates on a stream as it does on a buffered body:
+    /// a wrap would turn an absurd number into a plausible small one.
+    #[test]
+    fn a_streamed_token_count_past_u32_saturates_rather_than_wraps() {
+        let past = u64::from(u32::MAX) + 2;
+        let mut usage = super::AnthropicStreamUsage::default();
+        let event = serde_json::json!({
+            "type": "message_start",
+            "message": {"usage": {
+                "input_tokens": past,
+                "output_tokens": past,
+                "cache_read_input_tokens": past,
+                "cache_creation_input_tokens": past
+            }}
+        });
+        super::update_anthropic_usage(&mut usage, &event, std::time::Instant::now(), &mut true, 0);
+        assert_eq!(usage.prompt_tokens, u32::MAX);
+        assert_eq!(usage.completion_tokens, u32::MAX);
+        assert_eq!(usage.cache_read_tokens, u32::MAX);
+        assert_eq!(usage.cache_creation_tokens, u32::MAX);
     }
 
     /// #1074: the non-streaming fill helper and its output

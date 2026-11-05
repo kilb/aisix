@@ -2626,6 +2626,8 @@ impl<F: FnOnce(ResponsesStreamCompletion)> Drop for CompleteOnDrop<F> {
                 let filled = crate::token_estimate::fill_missing(
                     &est,
                     comp.prompt_tokens,
+                    comp.cache_read_tokens
+                        .saturating_add(comp.cache_creation_tokens),
                     comp.completion_tokens,
                     Some(comp.est_output_text.as_str()),
                 );
@@ -2990,6 +2992,9 @@ pub fn build_responses_bridge_stream(
                 crate::token_estimate::fill_missing(
                     &est,
                     comp.prompt_tokens,
+                    comp
+                        .cache_read_tokens
+                        .saturating_add(comp.cache_creation_tokens),
                     comp.completion_tokens,
                     Some(comp.est_output_text.as_str()),
                 )
