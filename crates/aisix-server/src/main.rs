@@ -338,10 +338,8 @@ fn run_validate(resources: &Path) -> anyhow::Result<()> {
     };
     // Loading only proves the file parses. A guardrail row whose config
     // does not build — an invalid regex, an unknown detector, a
-    // `kind: custom` script with a syntax error — keeps its last good build
-    // on a reload and has none to keep on a fresh start, while the gateway
-    // keeps serving. Runtime status reports that rejection, but this command
-    // still needs to fail synchronously rather than validate a file whose
+    // `kind: custom` script with a syntax error — is a file boot and SIGHUP
+    // refuse too, so this command fails rather than validate a file whose
     // screening rule cannot run.
     let unbuildable = aisix_guardrails::unbuildable_guardrail_rows(&snapshot.guardrails, None);
     if !unbuildable.is_empty() {
@@ -522,6 +520,21 @@ fn gauge_series_is_live(
     }
 }
 
+/// A guardrail row that loads and cannot run fails its file, at boot and on a
+/// SIGHUP: the file is the one edit in hand, and an operator hears about it now
+/// rather than from traffic the rule was meant to stop.
+fn unbuildable_guardrail_errors(
+    snapshot: &AisixSnapshot,
+) -> Vec<aisix_core::filesource::LoadError> {
+    aisix_guardrails::unbuildable_guardrail_rows(&snapshot.guardrails, None)
+        .into_iter()
+        .map(|row| aisix_core::filesource::LoadError {
+            scope: format!("guardrails ({:?})", row.name),
+            message: format!("cannot run: {}", row.reason),
+        })
+        .collect()
+}
+
 /// SIGHUP → re-run the whole file-source pipeline against the same
 /// resources file. Success swaps the snapshot atomically (the same
 /// [`SnapshotHandle::store`] the etcd watch supervisor uses), stamping
@@ -566,6 +579,7 @@ async fn file_reload_loop(
                             next_generation,
                             true,
                             &reload_status,
+                            &unbuildable_guardrail_errors,
                         )
                     })
                     .await;
@@ -958,9 +972,14 @@ async fn run(mut cfg: Config, hangup: Option<HangupSignal>) -> anyhow::Result<()
             // error report on any problem. SIGHUP re-runs the identical
             // pipeline; a failed reload keeps the last-good snapshot.
             let config_status = ConfigStatus::new(SourceKind::File);
-            let snapshot =
-                aisix_core::filesource::load_resources_file_tracked(path, 1, true, &config_status)
-                    .map_err(|report| anyhow::anyhow!("{report}"))?;
+            let snapshot = aisix_core::filesource::load_resources_file_tracked(
+                path,
+                1,
+                true,
+                &config_status,
+                &unbuildable_guardrail_errors,
+            )
+            .map_err(|report| anyhow::anyhow!("{report}"))?;
             tracing::info!(
                 file = %path.display(),
                 resources = snapshot.total_entries(),

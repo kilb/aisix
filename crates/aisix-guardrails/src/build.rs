@@ -145,10 +145,10 @@ pub struct UnbuildableGuardrailRow {
 /// Report the enabled guardrail rows in `table` whose configuration does
 /// not build — [`build_chain_from_snapshot`]'s error arm, made returnable.
 ///
-/// The gateway logs those errors, reports them through config status, and
-/// keeps serving. A pre-deployment check still needs a synchronous report:
-/// the row silently not existing is the defect, even though the file itself
-/// loaded successfully.
+/// An etcd node logs those errors, reports them through config status, and
+/// keeps serving. `aisix validate` and a file-mode load need a synchronous
+/// report: the row silently not existing is the defect, even though the file
+/// itself loaded successfully.
 ///
 /// [`BuildError::EmbedderUnavailable`] is deliberately excluded. The
 /// embedding dispatcher is a runtime capability, not part of the

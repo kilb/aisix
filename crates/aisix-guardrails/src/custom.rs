@@ -59,10 +59,10 @@
 //! and no operator code runs on the config-apply path.
 //!
 //! Where the failure first surfaces depends on the entry point, not the
-//! source. `aisix validate` reports the row through
-//! `unbuildable_guardrail_rows` and exits non-zero. A serving gateway logs
+//! source. `aisix validate` and a file-mode boot or reload report the row
+//! through `unbuildable_guardrail_rows` and refuse the file. An etcd node logs
 //! it and publishes a runtime rejection to `/status/config`, metrics, and
-//! managed-mode heartbeats. For an etcd node this may happen on the first
+//! managed-mode heartbeats. This may happen on the first
 //! request after the snapshot version moves because `LiveGuardrailIndex`
 //! rebuilds lazily; its constructor also builds once over the snapshot it
 //! already holds. cp-api's own esbuild pass catches the common case at save

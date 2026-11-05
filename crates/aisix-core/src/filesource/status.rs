@@ -23,11 +23,15 @@ use super::{load_from_str, FileSourceErrors, LoadError};
 ///
 /// A file that cannot be read is a fetch failure (source unreachable); a file
 /// that loads with errors is a wholesale rejection (last-good retained).
+///
+/// `check` is what a file must also pass that this crate cannot judge: anything
+/// it returns fails the load as the pipeline's own errors do.
 pub fn load_resources_file_tracked(
     path: &Path,
     revision: i64,
     is_reload: bool,
     config_status: &ConfigStatus,
+    check: &dyn Fn(&AisixSnapshot) -> Vec<LoadError>,
 ) -> Result<AisixSnapshot, FileSourceErrors> {
     let label = path.display().to_string();
     let contents = match std::fs::read_to_string(path) {
@@ -49,6 +53,17 @@ pub fn load_resources_file_tracked(
     let source_hash = LazyHash::ready(hash_bytes(contents.as_bytes()));
     let result = load_from_str(&contents, &label, revision, &|name| {
         std::env::var(name).ok()
+    })
+    .and_then(|snapshot| {
+        let errors = check(&snapshot);
+        if errors.is_empty() {
+            Ok(snapshot)
+        } else {
+            Err(FileSourceErrors {
+                file: label.clone(),
+                errors,
+            })
+        }
     });
 
     match &result {
@@ -221,7 +236,7 @@ mod tests {
         )
         .unwrap();
         let cs = ConfigStatus::new(SourceKind::File);
-        let result = load_resources_file_tracked(&path, 1, true, &cs);
+        let result = load_resources_file_tracked(&path, 1, true, &cs, &|_| Vec::new());
         assert!(result.is_ok(), "load failed: {:?}", result.err());
         let view = cs.view();
         assert_eq!(view.state, ConfigState::Synced);
@@ -264,7 +279,7 @@ mcp_auth_settings:
         )
         .unwrap();
         let cs = ConfigStatus::new(SourceKind::File);
-        let result = load_resources_file_tracked(&path, 1, true, &cs);
+        let result = load_resources_file_tracked(&path, 1, true, &cs, &|_| Vec::new());
         assert!(result.is_ok(), "load failed: {}", result.err().unwrap());
         let json = serde_json::to_value(cs.view()).unwrap();
         let counts = &json["applied"]["resource_counts"];
@@ -283,13 +298,40 @@ mcp_auth_settings:
         )
         .unwrap();
         let cs = ConfigStatus::new(SourceKind::File);
-        load_resources_file_tracked(&path, 1, true, &cs).unwrap();
+        load_resources_file_tracked(&path, 1, true, &cs, &|_| Vec::new()).unwrap();
 
         // A broken reload: unknown top-level key.
         std::fs::write(&path, "_format_version: \"1\"\nnot_a_collection: []\n").unwrap();
-        let result = load_resources_file_tracked(&path, 2, true, &cs);
+        let result = load_resources_file_tracked(&path, 2, true, &cs, &|_| Vec::new());
         assert!(result.is_err());
         assert_eq!(cs.view().state, ConfigState::OutOfSync);
         assert!(!cs.view().rejected.is_empty());
+    }
+
+    /// What the caller's check refuses is refused as the pipeline's own errors
+    /// are: the file does not load, and status names the row.
+    #[test]
+    fn a_file_the_check_refuses_is_rejected_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("resources.yaml");
+        std::fs::write(
+            &path,
+            "_format_version: \"1\"\nprovider_keys:\n  - display_name: pk\n    api_key: sk-x\n",
+        )
+        .unwrap();
+        let cs = ConfigStatus::new(SourceKind::File);
+        let result = load_resources_file_tracked(&path, 1, true, &cs, &|_| {
+            vec![LoadError {
+                scope: "guardrails (\"bad\")".to_owned(),
+                message: "cannot run: invalid_regex".to_owned(),
+            }]
+        });
+        let Err(report) = result else {
+            panic!("the file is refused");
+        };
+        assert!(report.to_string().contains("invalid_regex"), "{report}");
+        let view = cs.view();
+        assert_eq!(view.rejected[0].resource_kind, "guardrails");
+        assert_eq!(view.rejected[0].resource_id, "bad");
     }
 }

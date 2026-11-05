@@ -552,10 +552,51 @@ guardrails:
       messages: [{ role: "user", content: "must not exist" }],
     });
     expect(notPickedUp.status).toBe(404);
+
+    // Same for an edit that parses and cannot run: a guardrail whose pattern
+    // does not compile refuses the file, or the rule it was editing goes dark.
+    const uncompilable = `${reloadFile(upstream.baseUrl, ["reload-a", "reload-b", "reload-c"])}
+guardrails:
+  - name: uncompilable-entry
+    kind: keyword
+    patterns:
+      - kind: regex
+        value: "oops[("
+`;
+    const failuresBeforeUncompilable = (app.output().match(/reload failed/g) ?? []).length;
+    await writeFile(app.resourcesPath, uncompilable, "utf8");
+    app.signal("SIGHUP");
+    await waitConfigPropagation(async () => {
+      return (app!.output().match(/reload failed/g) ?? []).length > failuresBeforeUncompilable;
+    });
+    expect(app.output()).toContain("uncompilable-entry");
+    expect(await modelIds()).toEqual(["reload-a", "reload-b"]);
   });
 });
 
 describe("file resource source: fail-fast boot", () => {
+  test("a guardrail that cannot run stops the boot, naming the row", async () => {
+    let caught: unknown;
+    try {
+      await spawnApp({
+        admin: true,
+        resourcesFile: `
+_format_version: "1"
+guardrails:
+  - name: uncompilable-at-boot
+    kind: keyword
+    patterns:
+      - kind: regex
+        value: "oops[("
+`,
+      });
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(Error);
+    expect((caught as Error).message).toContain("uncompilable-at-boot");
+  });
+
   test("malformed file exits non-zero with the aggregated named errors on stderr", async () => {
     let caught: unknown;
     try {
