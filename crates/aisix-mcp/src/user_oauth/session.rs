@@ -27,8 +27,13 @@ use crate::shared_store::{PutCondition, StoreError, StoredValue};
 pub const ACCESS_TOKEN_PREFIX: &str = "aisix_mcp_at_";
 const REFRESH_TOKEN_PREFIX: &str = "aisix_mcp_rt_";
 pub const ACCESS_TOKEN_TTL_SECS: i64 = 3600;
-/// Counted afresh at each rotation, with no absolute cap.
+/// Counted afresh at each rotation, up to [`SESSION_MAX_AGE_SECS`].
 const REFRESH_TOKEN_TTL_SECS: i64 = 14 * 24 * 3600;
+/// How long one sign-in lasts, however often its tokens are refreshed. Nothing
+/// asks the identity provider about this person again after they sign in, so
+/// this is what brings someone removed there, or moved out of a group a mapping
+/// reads, back to it. A client hears `invalid_grant` and opens the browser.
+const SESSION_MAX_AGE_SECS: i64 = 30 * 24 * 3600;
 
 const SESSION_KEY_NAME: &str = "v1";
 const SESSION_KEY_BYTES: usize = 32;
@@ -58,8 +63,23 @@ pub struct SessionToken {
     pub jti: String,
     pub iat: i64,
     pub exp: i64,
+    /// When the person signed in. Carried through every rotation.
+    #[serde(default)]
+    pub signed_in_at: i64,
     /// The ID token's claims at sign-in, less those about the token itself.
     pub claims: serde_json::Value,
+}
+
+impl SessionToken {
+    /// Who this token is for, to mint the next pair from.
+    pub fn identity(&self) -> SessionIdentity {
+        SessionIdentity {
+            provider: self.provider.clone(),
+            identity: self.identity.clone(),
+            claims: self.claims.clone(),
+            signed_in_at: self.signed_in_at,
+        }
+    }
 }
 
 /// Who a session is for, as the sign-in established it.
@@ -68,6 +88,10 @@ pub struct SessionIdentity {
     pub provider: String,
     pub identity: String,
     pub claims: serde_json::Value,
+    /// Unix seconds. Absent from a record an older gateway wrote, whose session
+    /// counts from its next token.
+    #[serde(default)]
+    pub signed_in_at: i64,
 }
 
 pub struct SessionTokenPair {
@@ -167,7 +191,12 @@ impl SessionKeys {
         identity: &SessionIdentity,
     ) -> SessionTokenPair {
         let iat = unix_now();
-        let token = |kind, ttl| SessionToken {
+        let signed_in_at = if identity.signed_in_at > 0 {
+            identity.signed_in_at
+        } else {
+            iat
+        };
+        let token = |kind, ttl: i64| SessionToken {
             kind,
             server: server.to_owned(),
             client_id: client_id.to_owned(),
@@ -175,7 +204,8 @@ impl SessionKeys {
             identity: identity.identity.clone(),
             jti: random_token(),
             iat,
-            exp: iat + ttl,
+            exp: (iat + ttl).min(signed_in_at + SESSION_MAX_AGE_SECS),
+            signed_in_at,
             claims: identity.claims.clone(),
         };
         SessionTokenPair {
@@ -437,6 +467,7 @@ mod tests {
             provider: "corp".to_owned(),
             identity: "alice".to_owned(),
             claims: serde_json::json!({"sub": "alice"}),
+            signed_in_at: 0,
         }
     }
 
@@ -508,6 +539,39 @@ mod tests {
         async fn delete(&self, ns: &str, key: &str, v: Option<i64>) -> Result<(), StoreError> {
             self.inner.delete(ns, key, v).await
         }
+    }
+
+    /// A refresh renews a session, and what it cannot renew is the sign-in: past
+    /// the limit, neither token of a new pair opens, so the client goes back to
+    /// the identity provider.
+    #[test]
+    fn a_session_ends_at_its_limit_however_often_it_is_refreshed() {
+        let keys = SessionKeys::new(vec![1u8; SESSION_KEY_BYTES], None);
+        let signed_in = |ago: i64| SessionIdentity {
+            signed_in_at: unix_now() - ago,
+            ..identity()
+        };
+
+        // Rotation carries the sign-in, and the last pair stops at the limit.
+        let late = signed_in(SESSION_MAX_AGE_SECS - 3600);
+        let first = keys.mint_pair("srv", "client", &late);
+        let first = keys.open_refresh_token(&first.refresh_token).unwrap();
+        assert_eq!(first.signed_in_at, late.signed_in_at);
+        let next = keys.mint_pair("srv", "client", &first.identity());
+        let refresh = keys.open_refresh_token(&next.refresh_token).unwrap();
+        let access = keys.open_access_token(&next.access_token).unwrap();
+        assert_eq!(refresh.signed_in_at, late.signed_in_at);
+        assert_eq!(refresh.exp, late.signed_in_at + SESSION_MAX_AGE_SECS);
+        assert_eq!(access.exp, late.signed_in_at + SESSION_MAX_AGE_SECS);
+
+        let over = keys.mint_pair("srv", "client", &signed_in(SESSION_MAX_AGE_SECS + 1));
+        assert!(keys.open_refresh_token(&over.refresh_token).is_none());
+        assert!(keys.open_access_token(&over.access_token).is_none());
+
+        // A token an older gateway minted has no sign-in time: it counts from now.
+        let unknown = keys.mint_pair("srv", "client", &identity());
+        let token = keys.open_refresh_token(&unknown.refresh_token).unwrap();
+        assert_eq!(token.signed_in_at, token.iat);
     }
 
     #[tokio::test]
@@ -607,6 +671,7 @@ mod tests {
                 jti: "j".to_owned(),
                 iat: now - 10,
                 exp: now - 1,
+                signed_in_at: 0,
                 claims: serde_json::json!({}),
             },
         );

@@ -668,6 +668,7 @@ async fn handle_login_callback(state: &ProxyState, request: Parts) -> Result<Res
         provider: provider.name.clone(),
         identity: principal.subject,
         claims: session_claims,
+        signed_in_at: chrono::Utc::now().timestamp(),
     };
     connect_upstream(state, &oauth, &base, &keys, flow, identity, &subject).await
 }
@@ -1242,11 +1243,7 @@ pub(crate) async fn token(
             {
                 return invalid_grant();
             }
-            let identity = SessionIdentity {
-                provider: session.provider.clone(),
-                identity: session.identity.clone(),
-                claims: session.claims.clone(),
-            };
+            let identity = session.identity();
             let Some(provider) = authorized_provider(state, &snapshot, &identity) else {
                 return invalid_grant();
             };
