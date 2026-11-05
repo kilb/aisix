@@ -83,6 +83,11 @@ pub const GATEWAY_HEADER_PREFIX: &str = "x-aisix-";
 /// slot is refused for capture or as a request-id source.
 pub const GATEWAY_CREDENTIAL_HEADER: &str = "x-aisix-api-key";
 
+/// The WebSocket handshake's subprotocol list, in which a browser's realtime
+/// client carries its gateway key (`openai-insecure-api-key.<key>`). Refused for
+/// capture beside the credential slots.
+pub const WEBSOCKET_CREDENTIAL_HEADER: &str = "sec-websocket-protocol";
+
 /// The credential behind a `Bearer` authentication scheme, matching the
 /// scheme name case-insensitively (RFC 7235 §2.1) and the credential as
 /// written. `None` when `value` does not start with `Bearer `.

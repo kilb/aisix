@@ -150,9 +150,10 @@ describe("exporters record the request and upstream response headers they list",
       name: "urh-sls-a",
       enabled: true,
       ...sink(STORE_A),
-      // `x-gw-key` is the header-key route's credential slot below: listed
-      // here, it must still never be recorded.
-      request_headers: ["x-sub-user", "x-department", "x-gw-key"],
+      // `x-gw-key` is the header-key route's credential slot below, and
+      // `sec-websocket-protocol` carries a browser realtime client's key:
+      // listed here, neither may ever be recorded.
+      request_headers: ["x-sub-user", "x-department", "x-gw-key", "sec-websocket-protocol"],
       upstream_response_headers: ["x-upstream-region"],
     });
     await seed.createObservabilityExporter({
@@ -255,6 +256,17 @@ describe("exporters record the request and upstream response headers they list",
     const all = otlp.spans.filter((s) => s.attributes["aisix.request_id"] === res.requestId);
     expect(all.some((s) => s.attributes["http.request.header.x-sub-user"] === "alice")).toBe(true);
     expect(all.some((s) => "http.request.header.x-department" in s.attributes)).toBe(false);
+  });
+
+  test("the subprotocol header that carries a browser's key is not recorded, even listed", async (ctx) => {
+    if (!etcdReachable || !app || !sls) return ctx.skip();
+    const res = await send("/v1/chat/completions", chat, {
+      "x-sub-user": "carol",
+      "sec-websocket-protocol": "realtime, openai-insecure-api-key.sk-caller-secret",
+    });
+    expect(res.status).toBe(200);
+    const row = await rowFor(STORE_A, res.requestId, "exporter A row");
+    expect(map(row, "request_headers")).toEqual({ "x-sub-user": "carol" });
   });
 
   test("a listed header the request did not send has no key, and none sent means no map", async (ctx) => {

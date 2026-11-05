@@ -236,6 +236,7 @@ pub(crate) fn exported_header_names(
             })
             && !aisix_core::forwarded_headers::CREDENTIAL_SLOT_HEADERS.contains(&name.as_str())
             && name.as_str() != aisix_core::forwarded_headers::GATEWAY_CREDENTIAL_HEADER
+            && name.as_str() != aisix_core::forwarded_headers::WEBSOCKET_CREDENTIAL_HEADER
             && (!response || name.as_str() != "set-cookie")
     };
     let mut names: Vec<String> = snap
@@ -426,7 +427,7 @@ mod tests {
         let exporter: aisix_core::ObservabilityExporter =
             serde_json::from_value(serde_json::json!({
                 "name": "x", "kind": "otlp_http", "endpoint": "https://x",
-                "request_headers": ["x-sub-user", "authorization", "x-aisix-api-key", "X-Upper", "x-sub-user"],
+                "request_headers": ["x-sub-user", "authorization", "x-aisix-api-key", "sec-websocket-protocol", "X-Upper", "x-sub-user"],
                 "upstream_response_headers": ["x-region", "set-cookie", "x-api-key"],
             }))
             .unwrap();

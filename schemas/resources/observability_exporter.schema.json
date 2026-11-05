@@ -134,7 +134,8 @@
                 "x-amz-security-token",
                 "x-api-key",
                 "x-goog-api-key",
-                "x-aisix-api-key"
+                "x-aisix-api-key",
+                "sec-websocket-protocol"
               ]
             },
             "pattern": "^[a-z0-9!#$%&'*+.^_`|~-]+$",
@@ -165,7 +166,8 @@
                 "x-api-key",
                 "x-goog-api-key",
                 "set-cookie",
-                "x-aisix-api-key"
+                "x-aisix-api-key",
+                "sec-websocket-protocol"
               ]
             },
             "pattern": "^[a-z0-9!#$%&'*+.^_`|~-]+$",
@@ -253,7 +255,8 @@
                 "x-amz-security-token",
                 "x-api-key",
                 "x-goog-api-key",
-                "x-aisix-api-key"
+                "x-aisix-api-key",
+                "sec-websocket-protocol"
               ]
             },
             "pattern": "^[a-z0-9!#$%&'*+.^_`|~-]+$",
@@ -277,7 +280,8 @@
                 "x-api-key",
                 "x-goog-api-key",
                 "set-cookie",
-                "x-aisix-api-key"
+                "x-aisix-api-key",
+                "sec-websocket-protocol"
               ]
             },
             "pattern": "^[a-z0-9!#$%&'*+.^_`|~-]+$",
@@ -411,7 +415,8 @@
                 "x-amz-security-token",
                 "x-api-key",
                 "x-goog-api-key",
-                "x-aisix-api-key"
+                "x-aisix-api-key",
+                "sec-websocket-protocol"
               ]
             },
             "pattern": "^[a-z0-9!#$%&'*+.^_`|~-]+$",
@@ -435,7 +440,8 @@
                 "x-api-key",
                 "x-goog-api-key",
                 "set-cookie",
-                "x-aisix-api-key"
+                "x-aisix-api-key",
+                "sec-websocket-protocol"
               ]
             },
             "pattern": "^[a-z0-9!#$%&'*+.^_`|~-]+$",
@@ -516,7 +522,8 @@
                 "x-amz-security-token",
                 "x-api-key",
                 "x-goog-api-key",
-                "x-aisix-api-key"
+                "x-aisix-api-key",
+                "sec-websocket-protocol"
               ]
             },
             "pattern": "^[a-z0-9!#$%&'*+.^_`|~-]+$",
@@ -558,7 +565,8 @@
                 "x-api-key",
                 "x-goog-api-key",
                 "set-cookie",
-                "x-aisix-api-key"
+                "x-aisix-api-key",
+                "sec-websocket-protocol"
               ]
             },
             "pattern": "^[a-z0-9!#$%&'*+.^_`|~-]+$",
@@ -603,7 +611,8 @@
             "x-amz-security-token",
             "x-api-key",
             "x-goog-api-key",
-            "x-aisix-api-key"
+            "x-aisix-api-key",
+            "sec-websocket-protocol"
           ]
         },
         "pattern": "^[a-z0-9!#$%&'*+.^_`|~-]+$",
@@ -627,7 +636,8 @@
             "x-api-key",
             "x-goog-api-key",
             "set-cookie",
-            "x-aisix-api-key"
+            "x-aisix-api-key",
+            "sec-websocket-protocol"
           ]
         },
         "pattern": "^[a-z0-9!#$%&'*+.^_`|~-]+$",
