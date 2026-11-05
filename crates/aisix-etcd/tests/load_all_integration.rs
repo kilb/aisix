@@ -328,3 +328,71 @@ async fn a_load_compacted_on_every_attempt_gives_up() {
         "the compaction error is returned: {err}"
     );
 }
+
+/// 同一个 etcd 上的邻居命名空间：`/x` 不能读到或 watch 到 `/x-dev/...`。读到了
+/// 就会把邻居的文档（包括它的上游凭据）写进这个网关的磁盘缓存。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_bare_prefix_reads_and_watches_only_its_own_namespace() {
+    use aisix_etcd::WatchEvent;
+    use futures::StreamExt;
+
+    let Some(url) = etcd_url() else {
+        eprintln!("skipping: ETCD_TEST_URL not set");
+        return;
+    };
+    let _history = ETCD_HISTORY.read().await;
+    let prefix = unique_prefix();
+    let neighbour = format!("{prefix}-dev");
+    let mut client = Client::connect([url.as_str()], None)
+        .await
+        .expect("connect");
+    client
+        .put(format!("{prefix}/models/mine"), "{}", None)
+        .await
+        .expect("put");
+    client
+        .put(format!("{neighbour}/provider_keys/theirs"), "{}", None)
+        .await
+        .expect("put");
+
+    let provider = EtcdConfigProvider::connect_with_policy(
+        std::slice::from_ref(&url),
+        prefix.clone(),
+        None,
+        Some(Duration::from_secs(10)),
+        None,
+        ConnectPolicy::default(),
+    )
+    .await
+    .expect("connect provider");
+
+    let (entries, revision) = provider.load_all().await.expect("load");
+    let keys: Vec<&str> = entries.iter().map(|e| e.key.as_str()).collect();
+    assert_eq!(keys, [format!("{prefix}/models/mine")]);
+
+    let mut watch = provider.watch(revision + 1).await.expect("watch");
+    client
+        .put(format!("{neighbour}/provider_keys/theirs-2"), "{}", None)
+        .await
+        .expect("put");
+    client
+        .put(format!("{prefix}/models/mine-2"), "{}", None)
+        .await
+        .expect("put");
+    let event = tokio::time::timeout(Duration::from_secs(10), watch.next())
+        .await
+        .expect("an event")
+        .expect("the stream is open")
+        .expect("no watch error");
+    let WatchEvent::Put(put) = event else {
+        panic!("expected a put, got {event:?}");
+    };
+    assert_eq!(put.key, format!("{prefix}/models/mine-2"));
+
+    for p in [prefix, neighbour] {
+        client
+            .delete(p, Some(DeleteOptions::new().with_prefix()))
+            .await
+            .expect("cleanup");
+    }
+}

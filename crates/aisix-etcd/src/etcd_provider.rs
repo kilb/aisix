@@ -80,6 +80,18 @@ impl std::fmt::Debug for EtcdConfigProvider {
     }
 }
 
+/// The key range a provider reads and watches: the prefix with its trailing
+/// slash, so the range stops at the namespace boundary.
+///
+/// Without the slash, `/aisix` also covers `/aisix-dev/...`. The loader refuses
+/// such a key as a resource, but only after it has been read: it would report
+/// every neighbouring row as rejected for good, and with the snapshot cache on,
+/// write the neighbour's documents (its provider credentials included) to this
+/// gateway's disk.
+fn namespace_prefix(prefix: String) -> String {
+    format!("{}/", prefix.trim_end_matches('/'))
+}
+
 impl EtcdConfigProvider {
     /// Connect for a gateway boot, splitting the failure by cause.
     ///
@@ -103,7 +115,7 @@ impl EtcdConfigProvider {
         request_timeout: Option<Duration>,
         dial_timeout: Option<Duration>,
     ) -> Result<Self, ProviderError> {
-        let prefix = prefix.into();
+        let prefix = namespace_prefix(prefix.into());
         let client = Arc::new(LazyEtcdClient::new(
             endpoints.to_vec(),
             options,
@@ -148,7 +160,7 @@ impl EtcdConfigProvider {
         dial_timeout: Option<Duration>,
         policy: ConnectPolicy,
     ) -> Result<Self, ProviderError> {
-        let prefix = prefix.into();
+        let prefix = namespace_prefix(prefix.into());
         let client = Arc::new(LazyEtcdClient::new(
             endpoints.to_vec(),
             options,
@@ -532,6 +544,21 @@ impl Stream for EtcdWatchStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_key_range_stops_at_the_namespace_boundary() {
+        for bare in ["/aisix", "/aisix/"] {
+            let prefix = namespace_prefix(bare.to_string());
+            assert_eq!(prefix, "/aisix/");
+            let end = prefix_range_end(prefix.as_bytes());
+            assert!(b"/aisix/models/m1".as_slice() < end.as_slice());
+            assert!(
+                b"/aisix-dev/models/m1".as_slice() < prefix.as_bytes(),
+                "a neighbouring namespace sorts ahead of the range, so it is outside it"
+            );
+            assert!(b"/aisix0/models/m1".as_slice() >= end.as_slice());
+        }
+    }
 
     /// Credentials for a dial. Any user is enough to make
     /// `Client::connect` issue the `Authenticate` RPC, which is the only
