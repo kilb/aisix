@@ -243,6 +243,12 @@ pub(crate) struct CancelContext {
     /// An ensemble's returned sub-calls, while no exit of the request's own
     /// has settled them. See [`crate::chat::PendingEnsemble`].
     pub ensemble: Option<crate::chat::PendingEnsemble>,
+    /// What a stream held back inside the handler has read. See
+    /// [`crate::cancel::HeldStream`].
+    pub held_stream: Option<crate::cancel::HeldStream>,
+    /// The token and spend buckets of the routing target being attempted,
+    /// for a hold that runs inside the failover walk and cannot see them.
+    pub member_reservation_keys: (Vec<String>, Vec<String>),
     /// The request body as every failure row of this request reports it; only
     /// ever set under a full-content export. See
     /// [`crate::usage_attr::note_failure_request`].
@@ -1253,6 +1259,38 @@ fn with(f: impl FnOnce(&mut Resolved)) {
 /// Same, for the cancel half of the cell.
 fn with_cancel(f: impl FnOnce(&mut CancelContext)) {
     let _ = CURRENT.try_with(|a| f(&mut a.lock().cancel));
+}
+
+/// Publish what a held-back stream has read for the cancel guard to report.
+pub(crate) fn publish_held_stream(held: crate::cancel::HeldStream) {
+    with_cancel(|c| c.held_stream = Some(held));
+}
+
+/// The request's own exit has charged the held stream's tokens, so a cancel
+/// from here on reports them without charging them again.
+pub(crate) fn note_held_stream_charged() {
+    with_cancel(|c| {
+        if let Some(held) = c.held_stream.as_mut() {
+            held.token_keys.clear();
+            held.spend_keys.clear();
+        }
+    });
+}
+
+/// The routing target's own buckets, for the attempt about to run.
+pub(crate) fn note_member_reservation(member: Option<&aisix_ratelimit::MultiReservation>) {
+    with_cancel(|c| {
+        c.member_reservation_keys = member
+            .map(|m| (m.token_keys(), m.spend_keys()))
+            .unwrap_or_default();
+    });
+}
+
+/// See [`CancelContext::member_reservation_keys`].
+pub(crate) fn member_reservation_keys() -> (Vec<String>, Vec<String>) {
+    CURRENT
+        .try_with(|a| a.lock().cancel.member_reservation_keys.clone())
+        .unwrap_or_default()
 }
 
 /// Publish an ensemble's pending sub-calls for the cancel guard to report.

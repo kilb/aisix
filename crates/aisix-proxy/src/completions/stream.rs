@@ -82,6 +82,8 @@ pub(super) struct CompletionSseAccumulator {
     text_cap: usize,
     /// Some of the text did not fit under `text_cap`.
     text_truncated: bool,
+    /// All the generated text the frames carried, whether or not it fit.
+    generated_bytes: usize,
     pub(super) saw_done: bool,
     /// Where, in the bytes of the [`Self::push`] that found it, the `[DONE]`
     /// frame began — `0` when it began in an earlier push.
@@ -103,6 +105,7 @@ impl Default for CompletionSseAccumulator {
             frame_cap: aisix_gateway::sse::MAX_SSE_FRAME_BYTES,
             text_cap: crate::token_estimate::OUTPUT_ACCUMULATION_CAP,
             text_truncated: false,
+            generated_bytes: 0,
             saw_done: false,
             done_frame_start: 0,
             malformed_data: false,
@@ -171,6 +174,12 @@ impl CompletionSseAccumulator {
         self.observed_bytes
     }
 
+    /// What `max_buffer_bytes` caps on this stream: the generated text, not
+    /// the frames around it (see [`crate::held_content`]).
+    pub(super) fn generated_bytes(&self) -> usize {
+        self.generated_bytes
+    }
+
     /// EOF terminates the final SSE event even when the provider omitted its
     /// blank-line separator. Observe that frame before making policy or usage
     /// decisions.
@@ -232,6 +241,7 @@ impl CompletionSseAccumulator {
                 if text.is_empty() {
                     continue;
                 }
+                self.generated_bytes = self.generated_bytes.saturating_add(text.len());
                 let index = choice.get("index").and_then(Value::as_u64).unwrap_or(0);
                 if let Some(channel) = self.text_by_choice.get_mut(&index) {
                     let appended =
@@ -492,6 +502,85 @@ pub(super) fn completion_usage_with_estimates(
         }
     }
     usage
+}
+
+/// What the hold-back loop has read off a completion's frames. Dropped with
+/// the handler when the caller hangs up, which is when it reports them
+/// ([`crate::cancel::HeldStream`]). An arm that hands `observed` on to the
+/// handler leaves an empty one here, which reports nothing.
+pub(super) struct HeldCompletion {
+    pub(super) observed: CompletionSseAccumulator,
+    entry_keys: (Vec<String>, Vec<String>),
+    upstream_model: String,
+    prompt: Option<Value>,
+    attempt_started: Instant,
+    upstream_ttft: Arc<OnceLock<Duration>>,
+}
+
+impl HeldCompletion {
+    pub(super) fn new(
+        entry_keys: (Vec<String>, Vec<String>),
+        upstream_model: String,
+        prompt: Option<Value>,
+        attempt_started: Instant,
+        upstream_ttft: Arc<OnceLock<Duration>>,
+    ) -> Self {
+        Self {
+            observed: CompletionSseAccumulator::default(),
+            entry_keys,
+            upstream_model,
+            prompt,
+            attempt_started,
+            upstream_ttft,
+        }
+    }
+}
+
+impl Drop for HeldCompletion {
+    fn drop(&mut self) {
+        if !self.observed.has_observed_bytes() {
+            return;
+        }
+        let mut observed = std::mem::take(&mut self.observed);
+        let upstream_model = std::mem::take(&mut self.upstream_model);
+        let prompt = self.prompt.take();
+        let upstream_ttft = Arc::clone(&self.upstream_ttft);
+        let (member_tokens, member_spend) = crate::attribution::member_reservation_keys();
+        let (mut token_keys, mut spend_keys) = std::mem::take(&mut self.entry_keys);
+        token_keys.extend(member_tokens);
+        spend_keys.extend(member_spend);
+        crate::attribution::publish_held_stream(crate::cancel::HeldStream {
+            token_keys,
+            spend_keys,
+            attempt_started: self.attempt_started,
+            tally: Box::new(move || {
+                let output_text = observed.finish_for_overflow_estimate();
+                let usage = completion_usage_with_estimates(
+                    observed.usage.take().unwrap_or_default(),
+                    &upstream_model,
+                    prompt.as_ref(),
+                    &output_text,
+                );
+                crate::cancel::HeldStreamTally {
+                    estimated: usage.usage_estimated,
+                    upstream_ttft_ms: upstream_ttft
+                        .get()
+                        .map_or(0, |ttft| crate::attempt::measured_ms(*ttft)),
+                    provider_request_id: std::mem::take(&mut observed.provider_request_id),
+                    usage: UsageStats {
+                        prompt_tokens: usage.prompt_tokens,
+                        completion_tokens: usage.completion_tokens,
+                        cached_prompt_tokens: usage.cached_prompt_tokens,
+                        cache_write_tokens: usage.cache_write_tokens,
+                        modality: usage.modality,
+                        reasoning_tokens: usage.reasoning_tokens,
+                        upstream_total_tokens: usage.upstream_total_tokens,
+                        ..Default::default()
+                    },
+                }
+            }),
+        });
+    }
 }
 
 struct CompletionStreamGuard<

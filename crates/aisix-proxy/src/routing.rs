@@ -762,6 +762,7 @@ where
                 continue;
             }
         };
+        crate::attribution::note_member_reservation(member_reservation.as_ref());
         let budget = effective_retries(
             &target.model,
             group_retries_of(&entry.value),

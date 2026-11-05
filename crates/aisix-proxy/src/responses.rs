@@ -1984,7 +1984,14 @@ async fn responses_to_target(
         // What the hold-back loop reads off the frames as they arrive: the
         // first frame's time, which re-parsing the buffer later cannot
         // recover, and how the upstream ended the response.
-        let mut observed_usage: Option<ResponseUsage> = None;
+        let mut observed = HeldResponse::new(
+            &upstream_model,
+            &body_bytes,
+            attempt_started,
+            hold_back,
+            reservation.as_ref(),
+            member_reservation.as_ref(),
+        );
         let mut observed_failure: Option<crate::stream_timeout::RawStreamFailure> = None;
         // fail-open 放行时，扣留期间边读边量到的上游首帧时刻。放行后的流会把
         // 缓冲前缀重新解析一遍，那时“看到”首帧已经是放行时刻了。
@@ -2010,10 +2017,7 @@ async fn responses_to_target(
             // consistent with the verbatim branch and the connect deadline.
             let read_to = timeouts.stream;
             let mut saw_chunk = false;
-            let mut observed_capture =
-                SseTextCapture::new(crate::token_estimate::OUTPUT_ACCUMULATION_CAP);
             let mut observed_first_frame = false;
-            let mut observed_raw = String::new();
             // What `buf` holds (#513): content in `buf[..counted_upto]`,
             // which `max_buffer_bytes` caps (the SSE/JSON envelope is not
             // counted), and every raw byte, unterminated tail included.
@@ -2084,7 +2088,7 @@ async fn responses_to_target(
                         let error = aisix_gateway::upstream_body_read_error(&error);
                         if saw_chunk {
                             crate::attempt::StreamFailure::record(
-                                &mut observed_usage.get_or_insert_with(Default::default).failure,
+                                &mut observed.usage.get_or_insert_with(Default::default).failure,
                                 &error,
                             );
                             observed_failure =
@@ -2102,7 +2106,7 @@ async fn responses_to_target(
                     }
                 };
                 saw_chunk = true;
-                push_capped_lossy_bytes(&mut observed_raw, &chunk);
+                push_capped_lossy_bytes(&mut observed.raw, &chunk);
                 buf.extend_from_slice(&chunk);
                 // Parse/account through the exact semantic-terminal boundary.
                 // A provider may coalesce later frames into the same transport
@@ -2115,8 +2119,8 @@ async fn responses_to_target(
                     scanned = 0;
                     semantic_terminal = observe_responses_sse_frame(
                         &buf[parsed_upto..frame_end],
-                        &mut observed_usage,
-                        Some(&mut observed_capture),
+                        &mut observed.usage,
+                        Some(&mut observed.capture),
                         &mut observed_failure,
                         attempt_started,
                         &mut observed_first_frame,
@@ -2129,7 +2133,6 @@ async fn responses_to_target(
                 }
                 scanned = buf.len() - parsed_upto;
                 buf_held.set(buf.len());
-                let end = counted_upto + crate::redact::last_frame_end(&buf[counted_upto..]);
                 held_content.hold(
                     crate::held_content::responses_sse_held_frames(
                         &mut responses_held_content,
@@ -2159,7 +2162,7 @@ async fn responses_to_target(
             }
             if exceeded && on_exceeded_fail_open {
                 crate::guardrail_stream::release_output_buffer_unscanned(chain);
-                released_ttft = observed_usage.as_ref().and_then(|u| u.upstream_ttft);
+                released_ttft = observed.usage.as_ref().and_then(|u| u.upstream_ttft);
                 fail_open_prefix = Some(std::mem::take(&mut buf));
             } else if exceeded {
                 tracing::warn!(
@@ -2175,17 +2178,12 @@ async fn responses_to_target(
                 // The upstream ran and bills for this response even though the
                 // caller gets none of it, and the terminal usage frame was
                 // never reached: count what arrived rather than record zero.
-                let parsed_output = observed_capture.text();
-                let output_text = if parsed_output.is_empty() {
-                    observed_raw.as_str()
-                } else {
-                    parsed_output.as_str()
-                };
+                let output_text = observed.output_text();
                 let usage = held_refusal_usage(
-                    observed_usage.take(),
+                    observed.usage.take(),
                     &upstream_model,
                     &body_bytes,
-                    output_text,
+                    &output_text,
                 );
                 // At least one upstream frame may already have arrived.
                 // Return the refusal as a terminal dispatch envelope so
@@ -2222,7 +2220,8 @@ async fn responses_to_target(
         }
         if hold_back && fail_open_prefix.is_none() {
             if observed_failure.is_none()
-                && observed_usage
+                && observed
+                    .usage
                     .as_ref()
                     .is_some_and(|usage| usage.reached_end)
                 && !responses_sse_has_done(&buf)
@@ -2288,7 +2287,7 @@ async fn responses_to_target(
             // is left alone.
             if buf.is_empty() && seal.cut_anything() {
                 let usage = held_refusal_usage(
-                    observed_usage.take(),
+                    observed.usage.take(),
                     &upstream_model,
                     &body_bytes,
                     &seal.excised.join("\n"),
@@ -2333,7 +2332,7 @@ async fn responses_to_target(
             let mut usage = responses_sse_usage(&buf).unwrap_or_default();
             // 首帧时刻是上面边读边缓冲时量的，事后重新解析缓冲区得不到；
             // 不带过来的话，扣留路径的 TTFT 就整个丢了。
-            if let Some(observed) = observed_usage.as_ref() {
+            if let Some(observed) = observed.usage.as_ref() {
                 usage.upstream_ttft_ms = observed.upstream_ttft_ms;
                 usage.upstream_ttft = observed.upstream_ttft;
                 if usage.failure.is_none() {
@@ -4021,6 +4020,101 @@ fn responses_stream_error_body(
         "upstream stream failed",
     )
     .to_vec()
+}
+
+/// What the hold-back loop has read off a response's frames. Dropped with the
+/// handler when the caller hangs up, which is when it reports them
+/// ([`crate::cancel::HeldStream`]).
+struct HeldResponse {
+    usage: Option<ResponseUsage>,
+    capture: SseTextCapture,
+    /// The bytes as they came, for a response whose frames gave up no text.
+    raw: String,
+    upstream_model: String,
+    outbound_body: bytes::Bytes,
+    attempt_started: Instant,
+    /// `None` on a stream this dispatch does not hold back.
+    keys: Option<(Vec<String>, Vec<String>)>,
+}
+
+impl HeldResponse {
+    fn new(
+        upstream_model: &str,
+        outbound_body: &bytes::Bytes,
+        attempt_started: Instant,
+        hold_back: bool,
+        reservation: Option<&aisix_ratelimit::MultiReservation>,
+        member: Option<&aisix_ratelimit::MultiReservation>,
+    ) -> Self {
+        let keys = hold_back.then(|| {
+            let layers = || reservation.into_iter().chain(member);
+            (
+                layers().flat_map(|r| r.token_keys()).collect(),
+                layers().flat_map(|r| r.spend_keys()).collect(),
+            )
+        });
+        Self {
+            usage: None,
+            capture: SseTextCapture::new(crate::token_estimate::OUTPUT_ACCUMULATION_CAP),
+            raw: String::new(),
+            upstream_model: upstream_model.to_string(),
+            outbound_body: outbound_body.clone(),
+            attempt_started,
+            keys,
+        }
+    }
+
+    /// What the estimator reads for the output: the text the frames carried,
+    /// else the bytes themselves.
+    fn output_text(&self) -> String {
+        let parsed = self.capture.text();
+        if parsed.is_empty() {
+            self.raw.clone()
+        } else {
+            parsed
+        }
+    }
+}
+
+impl Drop for HeldResponse {
+    fn drop(&mut self) {
+        let Some((token_keys, spend_keys)) = self.keys.take().filter(|_| !self.raw.is_empty())
+        else {
+            return;
+        };
+        let output_text = self.output_text();
+        let observed = self.usage.take();
+        let upstream_model = std::mem::take(&mut self.upstream_model);
+        let outbound_body = self.outbound_body.clone();
+        crate::attribution::publish_held_stream(crate::cancel::HeldStream {
+            token_keys,
+            spend_keys,
+            attempt_started: self.attempt_started,
+            tally: Box::new(move || {
+                let usage =
+                    held_refusal_usage(observed, &upstream_model, &outbound_body, &output_text);
+                crate::cancel::HeldStreamTally {
+                    estimated: usage.usage_estimated,
+                    upstream_ttft_ms: usage.upstream_ttft_ms,
+                    provider_request_id: usage.provider_request_id,
+                    usage: aisix_gateway::UsageStats {
+                        prompt_tokens: usage.prompt_tokens,
+                        completion_tokens: usage.completion_tokens,
+                        cached_prompt_tokens: usage.cached_prompt_tokens,
+                        cache_write_tokens: usage.cache_write_tokens,
+                        modality: usage.modality,
+                        cache_creation_ttl: usage.cache_creation_ttl,
+                        reasoning_tokens: usage.reasoning_tokens,
+                        cache_creation_tokens: usage.cache_creation_tokens,
+                        cache_read_tokens: usage.cache_read_tokens,
+                        upstream_total_tokens: usage.upstream_total_tokens,
+                        reasoning_folded_into_completion: usage.reasoning_folded_into_completion,
+                        ..Default::default()
+                    },
+                }
+            }),
+        });
+    }
 }
 
 /// The usage of a held-back response refused before its terminal event was
@@ -6271,6 +6365,8 @@ mod tests {
         assert_eq!(event.completion_tokens, 17, "{streamed}");
         assert!(!event.usage_estimated, "the frame was read, not guessed");
         assert_eq!(event.provider_request_id, "resp_eof");
+    }
+
     /// `response.completed` carries the whole Response object, so an image
     /// result takes it well past a mebibyte, and it is the only frame that
     /// reports the usage: the row must have the provider's counts, not a guess.
@@ -6329,6 +6425,146 @@ mod tests {
         assert_eq!(event.prompt_tokens, 123_456);
         assert_eq!(event.completion_tokens, 7_890);
         assert!(!event.usage_estimated, "the frame was read, not guessed");
+    }
+
+    /// An upstream that sends `frames`, chunked, and then keeps the connection
+    /// open: the caller is the one who ends this.
+    async fn spawn_stalling_sse_upstream(frames: &'static str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut req = vec![0u8; 65536];
+            let _ = sock.read(&mut req).await;
+            let head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n{:x}\r\n{frames}\r\n",
+                frames.len(),
+            );
+            sock.write_all(head.as_bytes()).await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        });
+        format!("http://{addr}")
+    }
+
+    /// A held stream runs inside the handler, so a caller who hangs up takes
+    /// the handler with it. The upstream is billing by then: the row has to say
+    /// so, and the rate-limit buckets have to move.
+    #[tokio::test]
+    async fn a_caller_leaving_a_held_stream_is_charged_what_it_read() {
+        use aisix_obs::UsageSink;
+        let upstream = spawn_stalling_sse_upstream(
+            "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_held\"}}\n\nevent: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"a long answer the provider already billed\"}\n\n",
+        )
+        .await;
+        let snap = new_snap_openai(&upstream);
+        snap.models.insert(openai_model("gpt-4o-resp"));
+        let key: aisix_core::ApiKey = serde_json::from_value(serde_json::json!({
+            "key_hash": "8b6712790a2089c67aa97a2d80022df18cc65c7814350e33baebe79aab508891",
+            "allowed_models": ["*"],
+            "rate_limit": {"tpm": 5},
+        }))
+        .unwrap();
+        snap.apikeys
+            .insert(aisix_core::resource::ResourceEntry::new("k-1", key, 1));
+        crate::seed_env_scoped_guardrail(&snap, keyword_output_guardrail("BLOCKME"));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let state = crate::ProxyState::new(SnapshotHandle::new(snap), hub, &cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+        let app = crate::build_router(state);
+        let held = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            app.clone().oneshot(make_req(serde_json::json!({
+                "model": "gpt-4o-resp",
+                "input": "a prompt of several words",
+                "stream": true,
+            }))),
+        )
+        .await;
+        assert!(
+            held.is_err(),
+            "a held stream writes no head before its verdict"
+        );
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("the guard must emit")
+            .expect("usage_sink sender dropped");
+        assert_eq!(event.status_code, 499);
+        assert_eq!(event.error_class, "client_disconnected");
+        assert!(event.prompt_tokens > 0, "the prompt reached the provider");
+        assert!(event.completion_tokens > 0, "the answer's start did too");
+        assert!(event.usage_estimated, "no usage frame had arrived");
+        assert_eq!(event.provider_request_id, "resp_held");
+
+        let next = app
+            .oneshot(make_req(
+                serde_json::json!({"model":"gpt-4o-resp","input":"hi"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(next.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    /// When the terminal frame had arrived and only the verdict was pending,
+    /// the row carries the provider's own counts.
+    #[tokio::test]
+    async fn a_caller_leaving_during_the_verdict_is_charged_the_upstreams_counts() {
+        use aisix_obs::UsageSink;
+        let moderation = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_secs(30))
+                    .set_body_json(serde_json::json!({"results": []})),
+            )
+            .mount(&moderation)
+            .await;
+        let upstream = spawn_stalling_sse_upstream(
+            "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"an answer to moderate\"}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_done\",\"usage\":{\"input_tokens\":31,\"output_tokens\":17,\"total_tokens\":48}}}\n\n",
+        )
+        .await;
+        let snap = new_snap_openai(&upstream);
+        snap.models.insert(openai_model("gpt-4o-resp"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        let row: aisix_core::Guardrail = serde_json::from_value(serde_json::json!({
+            "name": "slow",
+            "enabled": true,
+            "hook_point": "output",
+            "kind": "openai_moderation",
+            "endpoint": moderation.uri(),
+            "api_key": "k",
+        }))
+        .unwrap();
+        crate::seed_env_scoped_guardrail(
+            &snap,
+            aisix_core::resource::ResourceEntry::new("g-slow", row, 1),
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let state = crate::ProxyState::new(SnapshotHandle::new(snap), hub, &cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            crate::build_router(state).oneshot(make_req(serde_json::json!({
+                "model": "gpt-4o-resp",
+                "input": "hi",
+                "stream": true,
+            }))),
+        )
+        .await;
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("the guard must emit")
+            .expect("usage_sink sender dropped");
+        assert_eq!(event.status_code, 499);
+        assert_eq!(event.prompt_tokens, 31);
+        assert_eq!(event.completion_tokens, 17);
+        assert!(!event.usage_estimated);
     }
 
     }

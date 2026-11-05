@@ -36,7 +36,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use stream::{
     build_completion_passthrough_stream, completion_usage_with_estimates, stamp_first_chunk,
     strip_usage_frame, without_usage_frame, CompletionSseAccumulator, CompletionStreamFailure,
-    CompletionStreamOutcome, PreparedCompletionStream,
+    CompletionStreamOutcome, HeldCompletion, PreparedCompletionStream,
 };
 
 use crate::auth::AuthenticatedKey;
@@ -712,13 +712,13 @@ async fn dispatch(
             aisix_guardrails::Guardrail::stream_output_policy(resolved_chain.as_ref());
         let hold_back = aisix_guardrails::Guardrail::runs_on_output(resolved_chain.as_ref())
             && output_policy.holds_back();
-        let (max_buffer_bytes, fail_open) = match output_policy {
-            aisix_guardrails::StreamOutputPolicy::BufferFull {
-                max_buffer_bytes,
-                on_exceeded_fail_open,
-            } => (max_buffer_bytes, on_exceeded_fail_open),
-            _ => (aisix_guardrails::DEFAULT_STREAM_OUTPUT_BUFFER_BYTES, false),
-        };
+        // The chain's folded cap and overflow policy, whether it resolved to a
+        // window or a whole-response hold: this relay holds the whole response.
+        let (max_buffer_bytes, fail_open) = output_policy
+            .hold_cap()
+            .unwrap_or((aisix_guardrails::DEFAULT_STREAM_OUTPUT_BUFFER_BYTES, false));
+        // The hold runs inside the walk, ahead of the merge below.
+        let entry_keys = (reservation.token_keys(), reservation.spend_keys());
         let dispatched = crate::routing::dispatch_stream_with_failover(
             state,
             snapshot,
@@ -735,6 +735,7 @@ async fn dispatch(
                 let body = &body;
                 let resolved_chain = &resolved_chain;
                 let attempt_ctx = &attempt_ctx;
+                let entry_keys = &entry_keys;
                 async move {
                     let provider =
                         crate::dispatch::require_provider(&target.model)?.to_ascii_lowercase();
@@ -747,6 +748,7 @@ async fn dispatch(
                     // 随胜出的那次尝试一起带出 walk，各分支收尾时读。
                     let upstream_ttft = Arc::new(std::sync::OnceLock::new());
                     let attempt_started = Instant::now();
+                    let upstream_model = target.model.upstream_model().unwrap_or("unknown");
                     let prepared: Result<PreparedCompletionStream, ProxyError> = if hold_back {
                         async {
                         let stream = bridge
@@ -764,7 +766,16 @@ async fn dispatch(
                                 timeouts.stream,
                             );
                 let mut buffer = Vec::new();
-                let mut observed = CompletionSseAccumulator::default();
+                // What `buffer` holds (#513): the generated text, which
+                // `max_buffer_bytes` caps, and the raw bytes it bounds too.
+                let mut held_content = crate::held_content::HeldBuffer::default();
+                let mut held = HeldCompletion::new(
+                    entry_keys.clone(),
+                    upstream_model.to_string(),
+                    body.get("prompt").cloned(),
+                    attempt_started,
+                    Arc::clone(&upstream_ttft),
+                );
                 while let Some(item) = stream.next().await {
                     let chunk = match item {
                         Ok(chunk) => chunk,
@@ -774,11 +785,11 @@ async fn dispatch(
                             // comes back as `Failed` rather than as an error,
                             // and the arm that handles it marks the target's
                             // health itself.
-                            if observed.has_observed_bytes() {
-                                let output_text = observed.finish_for_overflow_estimate();
+                            if held.observed.has_observed_bytes() {
+                                let output_text = held.observed.finish_for_overflow_estimate();
                                 return Ok(PreparedCompletionStream::Failed {
                                     error,
-                                    accumulator: observed,
+                                    accumulator: std::mem::take(&mut held.observed),
                                     output_text,
                                 });
                             }
@@ -790,8 +801,13 @@ async fn dispatch(
                     // Feed a separately bounded parser before enforcing the
                     // wire-buffer limit so usage/token estimates include the
                     // complete observed prefix without retaining it all.
-                    observed.push(&chunk);
-                    if buffer.len().saturating_add(chunk.len()) > max_buffer_bytes {
+                    let generated_before = held.observed.generated_bytes();
+                    held.observed.push(&chunk);
+                    held_content.hold(
+                        held.observed.generated_bytes() - generated_before,
+                        chunk.len(),
+                    );
+                    if held_content.exceeds(max_buffer_bytes) {
                         if fail_open {
                             tracing::warn!(
                                 guardrail_hook = "output",
@@ -816,9 +832,9 @@ async fn dispatch(
                             max_buffer_bytes,
                             "streaming /v1/completions output exceeded buffer cap; failing closed"
                         );
-                        let output_text = observed.finish_for_overflow_estimate();
+                        let output_text = held.observed.finish_for_overflow_estimate();
                         return Ok(PreparedCompletionStream::BufferExceeded {
-                            accumulator: observed,
+                            accumulator: std::mem::take(&mut held.observed),
                             output_text,
                         });
                     }
@@ -980,6 +996,7 @@ async fn dispatch(
                         completion_spend_micro_usd(snapshot, &model_entry_id, &usage),
                     )
                     .await;
+                crate::attribution::note_held_stream_charged();
 
                 let synth = ChatResponse {
                     logprobs: None,
@@ -2455,6 +2472,108 @@ mod tests {
         assert!(!text.contains("alice@example.com"));
         assert!(text.contains("[EMAIL_REDACTED]"));
         assert!(text.contains("data: [DONE]"));
+    }
+
+    /// `max_buffer_bytes` caps what the model generated, as on every other
+    /// route. Counted on the wire, a chain would refuse any answer past roughly
+    /// a thousand tokens, whose text is a small part of its frames.
+    #[tokio::test]
+    async fn the_hold_cap_measures_generated_text_not_framing() {
+        let upstream = MockServer::builder().start().await;
+        let frame = "data: {\"id\":\"cmpl-7QmVI15qgYVllxK0FtxVGG6ywfzaq\",\"object\":\"text_completion\",\"created\":1715000000,\"choices\":[{\"text\":\" token\",\"index\":0,\"logprobs\":null,\"finish_reason\":null}],\"model\":\"gpt-3.5-turbo-instruct\"}\n\n";
+        let sse = format!("{}data: [DONE]\n\n", frame.repeat(1500));
+        assert!(sse.len() > aisix_guardrails::DEFAULT_STREAM_OUTPUT_BUFFER_BYTES);
+        Mock::given(method("POST"))
+            .and(path("/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(sse, "text/event-stream"))
+            .mount(&upstream)
+            .await;
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(model_entry("instruct"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        crate::seed_env_scoped_guardrail(&snap, keyword_output_guardrail("NEVERPRESENT"));
+        let resp = tower::ServiceExt::oneshot(
+            build_app(snap),
+            make_req(serde_json::json!({"model": "instruct", "prompt": "hello", "stream": true})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), 1 << 22).await.unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("data: [DONE]"));
+    }
+
+    /// A caller who hangs up on a held completion takes the handler with it:
+    /// the row reports what the stream had read, estimated where no usage
+    /// frame had arrived, and the rate-limit bucket moves.
+    #[tokio::test]
+    async fn a_caller_leaving_a_held_stream_is_charged_what_it_read() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut req = vec![0u8; 65536];
+            let _ = sock.read(&mut req).await;
+            let body = "data: {\"id\":\"cmpl-held\",\"object\":\"text_completion\",\"choices\":[{\"text\":\"a long answer the provider already billed\",\"index\":0}]}\n\n";
+            let head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n{:x}\r\n{body}\r\n",
+                body.len(),
+            );
+            sock.write_all(head.as_bytes()).await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        });
+        let snap = new_snap(&format!("http://{addr}"));
+        snap.models.insert(model_entry("instruct"));
+        let key: aisix_core::ApiKey = serde_json::from_value(serde_json::json!({
+            "key_hash": "8b6712790a2089c67aa97a2d80022df18cc65c7814350e33baebe79aab508891",
+            "allowed_models": ["*"],
+            "rate_limit": {"tpm": 5},
+        }))
+        .unwrap();
+        snap.apikeys
+            .insert(aisix_core::resource::ResourceEntry::new("k-1", key, 1));
+        crate::seed_env_scoped_guardrail(&snap, keyword_output_guardrail("NEVERPRESENT"));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let state = crate::ProxyState::new(SnapshotHandle::new(snap), hub, &cfg())
+            .without_cache()
+            .with_usage_sink(aisix_obs::UsageSink::new(tx));
+        let app = crate::build_router(state);
+        let held = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            tower::ServiceExt::oneshot(
+                app.clone(),
+                make_req(serde_json::json!({
+                    "model": "instruct",
+                    "prompt": "a prompt of several words",
+                    "stream": true,
+                })),
+            ),
+        )
+        .await;
+        assert!(
+            held.is_err(),
+            "a held stream writes no head before its verdict"
+        );
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("the guard must emit")
+            .expect("usage_sink sender dropped");
+        assert_eq!(event.status_code, 499);
+        assert!(event.prompt_tokens > 0);
+        assert!(event.completion_tokens > 0);
+        assert!(event.usage_estimated);
+        assert_eq!(event.provider_request_id, "cmpl-held");
+
+        let next = tower::ServiceExt::oneshot(
+            app,
+            make_req(serde_json::json!({"model": "instruct", "prompt": "hi"})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(next.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 
     /// BufferFull is bounded. A fail-closed output guardrail returns 422 before
