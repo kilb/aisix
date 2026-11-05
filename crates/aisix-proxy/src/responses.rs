@@ -1371,6 +1371,7 @@ async fn dispatch(
                                         crate::usage_attr::input_tokens_for_pricing(
                                             u64::from(u.prompt_tokens),
                                             u64::from(u.cached_prompt_tokens),
+                                            u64::from(u.cache_write_tokens.unwrap_or(0)),
                                             u64::from(u.cache_read_tokens),
                                             u64::from(u.cache_creation_tokens),
                                         ),
@@ -2798,6 +2799,7 @@ async fn responses_to_target(
                         crate::usage_attr::input_tokens_for_pricing(
                             u64::from(usage.prompt_tokens),
                             u64::from(usage.cached_prompt_tokens),
+                            u64::from(usage.cache_write_tokens.unwrap_or(0)),
                             u64::from(usage.cache_read_tokens),
                             u64::from(usage.cache_creation_tokens),
                         ),
@@ -3447,6 +3449,7 @@ async fn responses_cross_provider_to_target(
                         crate::usage_attr::input_tokens_for_pricing(
                             u64::from(usage.prompt_tokens),
                             u64::from(usage.cached_prompt_tokens),
+                            u64::from(usage.cache_write_tokens.unwrap_or(0)),
                             u64::from(usage.cache_read_tokens),
                             u64::from(usage.cache_creation_tokens),
                         ),
@@ -5334,6 +5337,7 @@ fn emit_usage_event(
             crate::usage_attr::input_tokens_for_pricing(
                 u64::from(usage.prompt_tokens),
                 u64::from(usage.cached_prompt_tokens),
+                u64::from(usage.cache_write_tokens.unwrap_or(0)),
                 u64::from(usage.cache_read_tokens),
                 u64::from(usage.cache_creation_tokens),
             ),

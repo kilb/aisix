@@ -541,21 +541,27 @@ pub(crate) fn request_spend_micro_usd(
 /// - `cache_read_tokens` / `cache_creation_tokens` are Anthropic's, counters
 ///   SEPARATE from `prompt_tokens`.
 ///
-/// So the fresh portion subtracts only the subset one. Getting this backwards
-/// is silent in both directions — double-charging the cached half on one
-/// provider, or pricing six thousand billed tokens at nothing on the other —
-/// and no request fails either way, which is why it is derived once here
+/// - `cache_write_subset` is `UsageStats::cache_write_tokens`, OpenAI's own
+///   write count, also a SUBSET of `prompt_tokens`.
+///
+/// So the fresh portion subtracts only the two subset ones. Getting this
+/// backwards is silent in both directions — double-charging the cached half on
+/// one provider, or pricing six thousand billed tokens at nothing on the other
+/// — and no request fails either way, which is why it is derived once here
 /// rather than at each of the ten call sites.
 pub(crate) fn input_tokens_for_pricing(
     prompt_tokens: u64,
     cached_prompt_tokens: u64,
+    cache_write_subset: u64,
     cache_read_tokens: u64,
     cache_creation_tokens: u64,
 ) -> aisix_core::InputTokens {
     aisix_core::InputTokens {
-        uncached: prompt_tokens.saturating_sub(cached_prompt_tokens),
+        uncached: prompt_tokens
+            .saturating_sub(cached_prompt_tokens)
+            .saturating_sub(cache_write_subset),
         cache_read: cached_prompt_tokens.saturating_add(cache_read_tokens),
-        cache_write: cache_creation_tokens,
+        cache_write: cache_creation_tokens.saturating_add(cache_write_subset),
     }
 }
 
@@ -1808,7 +1814,7 @@ mod tests {
     #[test]
     fn pricing_buckets_follow_each_upstream_vocabulary() {
         // OpenAI 形状：cached 是子集。
-        let openai = input_tokens_for_pricing(1_000, 800, 0, 0);
+        let openai = input_tokens_for_pricing(1_000, 800, 0, 0, 0);
         assert_eq!(openai.uncached, 200, "子集口径下必须减掉 cached");
         assert_eq!(openai.cache_read, 800);
         assert_eq!(openai.cache_write, 0);
@@ -1820,7 +1826,7 @@ mod tests {
 
         // Anthropic 形状：三个计数器互不相交（数值取自
         // aisix-provider-anthropic 的流式夹具）。
-        let anthropic = input_tokens_for_pricing(37, 0, 9, 4);
+        let anthropic = input_tokens_for_pricing(37, 0, 0, 9, 4);
         assert_eq!(
             anthropic.uncached, 37,
             "不相交口径下减掉缓存 token 会让已计费的 token 免费",
@@ -1836,7 +1842,7 @@ mod tests {
     /// 早期的构造器做过的事。
     #[test]
     fn cache_writes_are_never_subtracted_from_the_prompt() {
-        let got = input_tokens_for_pricing(1_000, 0, 0, 300);
+        let got = input_tokens_for_pricing(1_000, 0, 0, 0, 300);
         assert_eq!(
             got.uncached, 1_000,
             "cache_write 被从 prompt 里减掉了 —— 那是另一种上游口径，本仓库没有这种来源",
@@ -1848,9 +1854,30 @@ mod tests {
     /// 不能回绕成一笔天文数字的账单。
     #[test]
     fn an_impossible_cached_count_cannot_wrap_the_fresh_bucket() {
-        let got = input_tokens_for_pricing(100, 999, 0, 0);
+        let got = input_tokens_for_pricing(100, 999, 0, 0, 0);
         assert_eq!(got.uncached, 0);
         assert_eq!(got.cache_read, 999);
+    }
+
+    /// OpenAI 形状的缓存写是 `prompt_tokens` 的子集：要从新鲜输入里挪到写入桶，
+    /// 否则一个配了 `cache_write_per_1k` 的模型按普通输入价收，少收的正是这个
+    /// 字段文档警告的那部分。三个桶加起来仍是上游报的 prompt 总数。
+    #[test]
+    fn an_openai_shape_cache_write_is_priced_at_the_write_rate() {
+        let got = input_tokens_for_pricing(1_000, 100, 700, 0, 0);
+        assert_eq!(got.uncached, 200);
+        assert_eq!(got.cache_read, 100);
+        assert_eq!(got.cache_write, 700);
+        assert_eq!(got.total(), 1_000);
+
+        let cost = aisix_core::ModelCost {
+            input_per_1k: 10.0,
+            output_per_1k: 0.0,
+            cached_input_per_1k: Some(1.0),
+            cache_write_per_1k: Some(12.5),
+        };
+        // 200*10 + 100*1 + 700*12.5 = 10850，再除以 1000。
+        assert!((cost.calculate_with_cache(got, 0) - 10.85).abs() < 1e-9);
     }
 
     /// USD→micro-USD 必须四舍五入。单次调用常在 1e-4 美元量级（这里是

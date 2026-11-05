@@ -581,6 +581,7 @@ pub async fn chat_completions(
                         crate::usage_attr::input_tokens_for_pricing(
                             u64::from(c.prompt_tokens),
                             u64::from(c.cached_prompt_tokens),
+                            u64::from(c.cache_write_tokens.unwrap_or(0)),
                             u64::from(c.cache_read_tokens),
                             u64::from(c.cache_creation_tokens),
                         ),
@@ -2519,6 +2520,7 @@ async fn dispatch(
                     crate::usage_attr::input_tokens_for_pricing(
                         u64::from(comp.prompt_tokens),
                         u64::from(comp.cached_prompt_tokens),
+                        u64::from(comp.cache_write_tokens.unwrap_or(0)),
                         u64::from(comp.cache_read_tokens),
                         u64::from(comp.cache_creation_tokens),
                     ),
@@ -3690,6 +3692,7 @@ async fn dispatch(
         crate::usage_attr::input_tokens_for_pricing(
             prompt,
             u64::from(cached_prompt_tokens),
+            u64::from(cache_write_tokens.unwrap_or(0)),
             u64::from(cache_read_tokens),
             u64::from(cache_creation_tokens),
         ),
@@ -4546,6 +4549,7 @@ async fn dispatch_ensemble(
                     crate::usage_attr::input_tokens_for_pricing(
                         u64::from(comp.prompt_tokens),
                         u64::from(comp.cached_prompt_tokens),
+                        u64::from(comp.cache_write_tokens.unwrap_or(0)),
                         u64::from(comp.cache_read_tokens),
                         u64::from(comp.cache_creation_tokens),
                     ),
@@ -4772,6 +4776,7 @@ async fn dispatch_ensemble(
         crate::usage_attr::input_tokens_for_pricing(
             u64::from(effective_judge.usage.prompt_tokens),
             u64::from(effective_judge.usage.cached_prompt_tokens),
+            u64::from(effective_judge.usage.cache_write_tokens.unwrap_or(0)),
             u64::from(effective_judge.usage.cache_read_tokens),
             u64::from(effective_judge.usage.cache_creation_tokens),
         ),
@@ -5956,6 +5961,7 @@ impl EnsembleSubcall {
             crate::usage_attr::input_tokens_for_pricing(
                 u64::from(self.usage.prompt_tokens),
                 u64::from(self.usage.cached_prompt_tokens),
+                u64::from(self.usage.cache_write_tokens.unwrap_or(0)),
                 u64::from(self.usage.cache_read_tokens),
                 u64::from(self.usage.cache_creation_tokens),
             ),

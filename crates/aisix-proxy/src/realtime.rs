@@ -1544,7 +1544,8 @@ async fn run_session(
                 crate::usage_attr::input_tokens_for_pricing(
                     usage.input_tokens,
                     usage.cached_tokens,
-                    // 这个表面没有 Anthropic 那套分开的缓存读/写计数。
+                    // 这个表面没有缓存写计数，也没有 Anthropic 那套分开的缓存读/写。
+                    0,
                     0,
                     0,
                 ),

@@ -2489,6 +2489,7 @@ async fn attribute_batch_usage(
         prompt: u64,
         completion: u64,
         cached: u64,
+        cache_write: u64,
         modality: aisix_gateway::ModalityTokens,
         total: crate::usage_attr::ReportedTotalSum,
         lines: u64,
@@ -2509,6 +2510,9 @@ async fn attribute_batch_usage(
         let cached = usage["prompt_tokens_details"]["cached_tokens"]
             .as_u64()
             .unwrap_or(0);
+        let cache_write = usage["prompt_tokens_details"]["cache_write_tokens"]
+            .as_u64()
+            .unwrap_or(0);
         if prompt == 0 && completion == 0 {
             continue; // errored line or embeddings-shape without usage
         }
@@ -2517,6 +2521,7 @@ async fn attribute_batch_usage(
         agg.prompt += prompt;
         agg.completion += completion;
         agg.cached += cached;
+        agg.cache_write += cache_write;
         // Lines that counted nothing were skipped above.
         agg.total.add(usage, true);
         agg.modality =
@@ -2589,7 +2594,13 @@ async fn attribute_batch_usage(
     let slice_cost_usd = |agg: &Agg| {
         cost.map(|c| {
             c.calculate_with_cache(
-                crate::usage_attr::input_tokens_for_pricing(agg.prompt, agg.cached, 0, 0),
+                crate::usage_attr::input_tokens_for_pricing(
+                    agg.prompt,
+                    agg.cached,
+                    agg.cache_write,
+                    0,
+                    0,
+                ),
                 agg.completion,
             )
         })
@@ -2624,6 +2635,8 @@ async fn attribute_batch_usage(
             completion_tokens: agg.completion.min(u32::MAX as u64) as u32,
             total_tokens: agg.total.recorded(),
             cached_prompt_tokens: agg.cached.min(u32::MAX as u64) as u32,
+            cache_write_tokens: (agg.cache_write > 0)
+                .then(|| agg.cache_write.min(u32::MAX as u64) as u32),
             modality_tokens: agg.modality,
             status_code: 200,
             provider_model_version: provider_model.clone(),
