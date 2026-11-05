@@ -259,7 +259,10 @@ pub struct RateLimitPolicy {
     /// model with no price contributes nothing to this counter — the policy
     /// then admits every request regardless of the ceiling. The gateway
     /// counts those requests on `aisix_budget_unpriced_requests_total` and
-    /// logs them rather than failing them.
+    /// logs them rather than failing them. A price is per token, so an image,
+    /// audio or video request whose upstream reports no tokens, and the web
+    /// searches a request makes, also add nothing here and are counted on the
+    /// same metric.
     ///
     /// Enforced as a ceiling on *recorded* spend, not on in-flight spend. A
     /// request is admitted when the spend already recorded for the window is

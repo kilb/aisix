@@ -784,6 +784,51 @@ pub(crate) fn spend_bucket_keys(
         .collect()
 }
 
+/// 这次请求的花费有一部分记不进任何花费上限：`Model.cost` 只有按 token 的价，
+/// 而一张图、一段语音、一段视频、一次网页搜索不按 token 收钱。按配了花费上限的每条
+/// 策略各记一次 `aisix_budget_unpriced_requests_total`，这样「配了价、配了上限、
+/// 账上却一分没动」至少看得见。
+///
+/// 不能在预留时判断：那时还不知道上游有没有报 token。身份取自用量事件 —— 花费
+/// 上限只在经典形态的行上，这些行不看标签。
+pub(crate) fn note_spend_a_ceiling_cannot_see(
+    state: &ProxyState,
+    snapshot: &aisix_core::AisixSnapshot,
+    event: &aisix_obs::UsageEvent,
+) {
+    if snapshot.rate_limit_policies.is_empty() {
+        return;
+    }
+    let present = |id: &'_ str| -> bool { !id.is_empty() };
+    let input = ConditionInput {
+        team: Some(event.team_id.as_str()).filter(|id| present(id)),
+        member: Some(event.user_id.as_str()).filter(|id| present(id)),
+        api_key: Some(event.api_key_id.as_str()),
+        model: Some(event.model_id.as_str()),
+        model_name: Some(event.requested_model.as_str()),
+        provider: None,
+        routing_parent_model: None,
+        routing_parent_model_name: None,
+        tags: None,
+    };
+    let phase = PolicyPhase::Request {
+        defer_model_properties: false,
+    };
+    let now = chrono::Utc::now();
+    let label = crate::usage_attr::metric_model_label(snapshot, &event.requested_model);
+    let index = state.policy_index.for_table(&snapshot.rate_limit_policies);
+    for entry in index.candidates(&input) {
+        if !entry.value.suspended_at(now)
+            && match_policy_layer(&entry.value, &entry.id, &input, phase)
+                .is_some_and(|layer| layer.spend.is_some())
+        {
+            state
+                .metrics
+                .record_budget_unpriced(&entry.value.name, &label);
+        }
+    }
+}
+
 /// Convert a store-level rejection into the surfaced [`ProxyError`],
 /// counting it under `aisix_ratelimit_rejections_total{scope,layer}` —
 /// the gate is the one point every endpoint funnels through, so the
@@ -2495,6 +2540,64 @@ mod tests {
             !rendered.contains(aisix_obs::metrics::M_BUDGET_UNPRICED_REQUESTS_TOTAL),
             "把「父级结构上没有 cost」当成了没配价: {rendered}"
         );
+    }
+
+    /// 配了价、配了花费上限，但这次请求按张、按秒收钱：上限看不见这笔钱，
+    /// 只算写了花费上限的那条策略，别的策略不算。
+    #[test]
+    #[allow(clippy::field_reassign_with_default)] // 字面量会被 UsageEvent 的普查当成产品代码。
+    fn a_ceiling_that_cannot_see_a_requests_cost_is_counted_on_its_own_policy() {
+        let snap = snapshot_with_policy(make_spend_policy(
+            "api_key",
+            "k1",
+            "day",
+            None,
+            Some(5_000_000),
+        ));
+        // 同一把钥匙上只限 token 的策略：它没有花费上限，也就谈不上看不见花费。
+        snap.rate_limit_policies
+            .insert(aisix_core::resource::ResourceEntry::new(
+                "pol-2",
+                make_named_token_policy("tokens-only", "api_key", "k1"),
+                1,
+            ));
+        // 另一把钥匙的花费上限管不到这次请求。
+        snap.rate_limit_policies
+            .insert(aisix_core::resource::ResourceEntry::new(
+                "pol-3",
+                make_named_spend_policy("someone-else", "api_key", "k2"),
+                1,
+            ));
+        let state = test_state(&snap);
+        let mut event = aisix_obs::UsageEvent::default();
+        event.api_key_id = "k1".into();
+        event.requested_model = "dall-e".into();
+
+        note_spend_a_ceiling_cannot_see(&state, &snap, &event);
+
+        let rendered = state.metrics.render();
+        let series: Vec<&str> = rendered
+            .lines()
+            .filter(|l| l.starts_with(aisix_obs::metrics::M_BUDGET_UNPRICED_REQUESTS_TOTAL))
+            .collect();
+        assert_eq!(series.len(), 1, "{series:?}");
+        assert!(series[0].contains("policy=\"both\""), "{series:?}");
+    }
+
+    fn make_named_token_policy(name: &str, scope: &str, scope_ref: &str) -> RateLimitPolicy {
+        serde_json::from_value(serde_json::json!({
+            "name": name, "scope": scope, "scope_ref": scope_ref,
+            "window": "day", "max_tokens": 1_000,
+        }))
+        .unwrap()
+    }
+
+    fn make_named_spend_policy(name: &str, scope: &str, scope_ref: &str) -> RateLimitPolicy {
+        serde_json::from_value(serde_json::json!({
+            "name": name, "scope": scope, "scope_ref": scope_ref,
+            "window": "day", "max_spend_micro_usd": 5_000_000,
+        }))
+        .unwrap()
     }
 
     #[tokio::test]

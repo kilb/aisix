@@ -844,6 +844,34 @@ pub(crate) fn note_client_error_body(snap: &AisixSnapshot, body: impl FnOnce() -
     }
 }
 
+/// Whether a served request cost its provider something the row's price has no
+/// rate for. A price is per token, so a surface that bills per image, per second
+/// or per video and reported no tokens came to nothing here, however it was
+/// configured, and a web search is billed on top of the tokens it rode with. A
+/// row with no price at all was already counted when it was admitted.
+fn costs_what_its_price_cannot_say(
+    snap: &AisixSnapshot,
+    surface: Surface,
+    event: &UsageEvent,
+) -> bool {
+    const PRICED_IN_OTHER_UNITS: [Surface; 6] = [
+        crate::operation::IMAGE_GENERATION,
+        crate::operation::IMAGE_EDIT,
+        crate::operation::TRANSCRIPTION,
+        crate::operation::TRANSLATION,
+        crate::operation::SPEECH,
+        crate::operation::VIDEO_GENERATION,
+    ];
+    let no_tokens = event.prompt_tokens == 0 && event.completion_tokens == 0;
+    (200..300).contains(&event.status_code)
+        && (event.web_search_requests > 0
+            || (no_tokens && PRICED_IN_OTHER_UNITS.contains(&surface)))
+        && snap
+            .models
+            .get_by_id(&event.model_id)
+            .is_some_and(|row| pricing_index(snap).resolve(&row.value).is_some())
+}
+
 /// Whether `event` reports a failure, whatever its status told the caller.
 fn is_failure_row(event: &UsageEvent) -> bool {
     event.status_code >= 400 || !event.error_class.is_empty()
@@ -1464,6 +1492,9 @@ pub(crate) fn emit_usage(
     // terminal attempt's own upstream duration — this figure, so the metric
     // and the row cannot disagree — and only when that attempt reached an
     // upstream at all.
+    if terminal && dispatched && costs_what_its_price_cannot_say(snap, surface, &event) {
+        crate::quota::note_spend_a_ceiling_cannot_see(state, snap, &event);
+    }
     if terminal && dispatched {
         crate::attribution::note_terminal_upstream(std::time::Duration::from_millis(u64::from(
             event.upstream_latency_ms,
@@ -2325,6 +2356,75 @@ mod tests {
     /// left it unjoinable with the families that did:
     /// `sum by (upstream_protocol)` returned an aggregate with this
     /// counter silently missing from it.
+    /// A price is per token. What a surface billed in another unit comes to
+    /// nothing here, and only a row that has a price can say so: one with none
+    /// was counted when it was admitted.
+    #[test]
+    #[allow(clippy::field_reassign_with_default)] // 字面量会被 UsageEvent 的普查当成产品代码。
+    fn what_a_price_cannot_say_is_told_apart_from_what_it_can() {
+        let snap = AisixSnapshot::new();
+        let row = |cost: serde_json::Value| -> aisix_core::Model {
+            serde_json::from_value(serde_json::json!({
+                "display_name": "m",
+                "provider": "openai",
+                "model_name": "m",
+                "provider_key_id": "pk",
+                "cost": cost,
+            }))
+            .unwrap()
+        };
+        let priced = row(serde_json::json!({"input_per_1k": 1.0, "output_per_1k": 1.0}));
+        snap.models.insert(aisix_core::resource::ResourceEntry::new(
+            "priced", priced, 1,
+        ));
+        let unpriced = row(serde_json::Value::Null);
+        snap.models.insert(aisix_core::resource::ResourceEntry::new(
+            "unpriced", unpriced, 1,
+        ));
+        let event = |model: &str, status: u16, tokens: u32, searches: u32| {
+            let mut event = UsageEvent::default();
+            event.model_id = model.to_string();
+            event.status_code = status;
+            event.prompt_tokens = tokens;
+            event.web_search_requests = searches;
+            event
+        };
+        let image = crate::operation::IMAGE_GENERATION;
+        let chat = crate::operation::CHAT;
+
+        assert!(costs_what_its_price_cannot_say(
+            &snap,
+            image,
+            &event("priced", 200, 0, 0)
+        ));
+        assert!(costs_what_its_price_cannot_say(
+            &snap,
+            chat,
+            &event("priced", 200, 9, 1)
+        ));
+        // An image model that does report tokens is priced by them.
+        assert!(!costs_what_its_price_cannot_say(
+            &snap,
+            image,
+            &event("priced", 200, 9, 0)
+        ));
+        assert!(!costs_what_its_price_cannot_say(
+            &snap,
+            chat,
+            &event("priced", 200, 9, 0)
+        ));
+        assert!(!costs_what_its_price_cannot_say(
+            &snap,
+            image,
+            &event("priced", 500, 0, 0)
+        ));
+        assert!(!costs_what_its_price_cannot_say(
+            &snap,
+            image,
+            &event("unpriced", 200, 0, 0)
+        ));
+    }
+
     #[test]
     fn usage_event_labels_carry_the_resolved_upstream_protocol() {
         let snap = snap_with_pk("prod-openai", "");

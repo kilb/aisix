@@ -230,10 +230,12 @@ pub const M_BUDGET_SPENT_USD: &str = "aisix_budget_spent_usd";
 pub const M_BUDGET_REMAINING_USD: &str = "aisix_budget_remaining_usd";
 pub const M_BUDGET_RESET_SECONDS: &str = "aisix_budget_reset_seconds";
 pub const M_BUDGET_DETAILS_PRESENT: &str = "aisix_budget_details_present";
-/// Requests admitted under a policy that sets a spend ceiling while the
-/// dispatched model has no configured price, so the request contributes
-/// nothing to the ceiling. Labels: `policy` (the policy's name), `model`
-/// (the resolved row name, never a caller-supplied string).
+/// Requests under a policy that sets a spend ceiling that cost the provider
+/// something the ceiling never sees: the dispatched model has no configured
+/// price, or it has one and the request was billed in a unit a per-token price
+/// cannot express (an image, a second of audio, a video, a web search). Labels:
+/// `policy` (the policy's name), `model` (the resolved row name, never a
+/// caller-supplied string).
 ///
 /// A non-zero rate here means a budget is configured but not enforcing.
 pub const M_BUDGET_UNPRICED_REQUESTS_TOTAL: &str = "aisix_budget_unpriced_requests_total";
