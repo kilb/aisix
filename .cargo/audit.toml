@@ -1,0 +1,9 @@
+# `cargo audit` 的配置。这里只放确认过与本仓库无关的公告，每条写明为什么。
+[advisories]
+ignore = [
+    # rsa 的 Marvin 时序攻击，官方没有修复版本。它只因 sqlx 的 `sqlx-mysql` 留在
+    # Cargo.lock 里，从不参与编译：门户只启用 sqlite，JWT 走 jsonwebtoken 的
+    # aws_lc_rs 后端。验证：`cargo tree --workspace --all-features -i rsa` 无输出。
+    # 哪天这条命令有了输出（比如启用了 sqlx 的 mysql），这条就必须删掉。
+    "RUSTSEC-2023-0071",
+]
