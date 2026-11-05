@@ -21,8 +21,8 @@ import {
 // mask back is reported, not silent.
 //
 // A passthrough route relays the caller's body and the provider's reply as
-// bytes, and so do a job's body, a realtime frame, an A2A message and a video
-// prompt. A mask rule that matches there cannot rewrite
+// bytes, and so do a job's body and a realtime frame. A mask rule that matches
+// there cannot rewrite
 // anything: the content is forwarded unmodified. Before this, the enforcing
 // row left no trace at all — the event read exactly like a request with no
 // PII in it — and the monitor row previewed `would_mask`, promising a
@@ -36,6 +36,10 @@ import {
 //   - monitor: `guardrail_monitor_hits` carries `would_mask_unsupported`,
 //     never `would_mask`.
 // Each surface's row is found by a field independent of the ones under test.
+//
+// A video prompt and an A2A message are the contrast: both have a channel to
+// write a mask back, so what reaches the upstream is the masked text, and the
+// row reports that redaction and no unsupported mask.
 
 const KEY = "sk-pii-mask-unsupported-e2e";
 const sha256 = (s: string) => createHash("sha256").update(s).digest("hex");
@@ -55,6 +59,7 @@ const IN_A = "alice@example.com";
 const IN_B = "bob@example.com";
 const OUT = "carol@example.com";
 const PROMPT = `write to ${IN_A} and ${IN_B}`;
+const MASKED_PROMPT = "write to [EMAIL_REDACTED] and [EMAIL_REDACTED]";
 const REPLY = `ask ${OUT}`;
 
 const chatReply = {
@@ -117,6 +122,7 @@ describe("a pii mask rule where content cannot be rewritten is reported, not sil
   let realtime: RealtimeUpstream | undefined;
   let chatUp: OpenAiUpstream | undefined;
   let streamUp: OpenAiUpstream | undefined;
+  let videoUp: OpenAiUpstream | undefined;
   const upstreams: OpenAiUpstream[] = [];
   let etcdReachable = false;
 
@@ -135,7 +141,7 @@ describe("a pii mask rule where content cannot be rewritten is reported, not sil
         "[DONE]",
       ],
     });
-    const videoUp = await startOpenAiUpstream({
+    videoUp = await startOpenAiUpstream({
       nonStreamBody: { output: { task_id: "task-pmu", task_status: "PENDING" }, request_id: "req-pmu" },
     });
     upstreams.push(chatUp, streamUp, videoUp);
@@ -295,6 +301,26 @@ describe("a pii mask rule where content cannot be rewritten is reported, not sil
     );
   };
 
+  /**
+   * The upstream received `MASKED_PROMPT` and neither address, and the row
+   * reports both addresses as redacted on the input hook, with nothing left
+   * to call unsupported.
+   */
+  const expectMasked = (log: Map<string, string>, what: string, sent: string) => {
+    expect(sent, `${what}: what reached the upstream`).toContain(MASKED_PROMPT);
+    expect(sent, `${what}: what reached the upstream`).not.toContain(IN_A);
+    expect(sent, `${what}: what reached the upstream`).not.toContain(IN_B);
+    expect(log.get("guardrail_blocked") ?? "false", `${what}: refused`).not.toBe("true");
+    expect(JSON.parse(log.get("redacted_entity_counts") ?? "{}"), `${what}: redactions`).toEqual({ email: 2 });
+    const hit = ({ guardrail_name, hook, action, counts }: Hit) => ({ guardrail_name, hook, action, counts });
+    expect(hitsOf(log, "guardrail_enforced_hits").map(hit), `${what}: enforced hits`).toEqual([
+      { guardrail_name: ENFORCE, hook: "input", action: "masked", counts: { email: 2 } },
+    ]);
+    expect(hitsOf(log, "guardrail_monitor_hits").map(hit), `${what}: monitor hits`).toEqual([
+      { guardrail_name: MONITOR, hook: "input", action: "would_mask", counts: { email: 2 } },
+    ]);
+  };
+
   const BOTH = [
     { hook: "input", email: 2 },
     { hook: "output", email: 1 },
@@ -381,7 +407,7 @@ describe("a pii mask rule where content cannot be rewritten is reported, not sil
     const res = await postJson("/v1/videos", { model: "pmu-video", prompt: PROMPT });
     expect(res.status).toBe(200);
     const log = await waitForSlsLog(sls, LOGSTORE, (l) => l.get("requested_model") === "pmu-video", "videos");
-    expectReported(log, "/v1/videos", [{ hook: "input", email: 2 }]);
+    expectMasked(log, "/v1/videos", videoUp!.receivedRequests.map((r) => r.body).join("\n"));
   });
 
   test("/a2a: the message is reported", async (ctx) => {
@@ -400,9 +426,8 @@ describe("a pii mask rule where content cannot be rewritten is reported, not sil
     });
     expect(res.status).toBe(200);
     const sent = a2a!.requests.map((r) => JSON.stringify(r.body ?? {})).join("\n");
-    expect(sent, "the message reached the agent as the caller sent it").toContain(IN_A);
     const log = await waitForSlsLog(sls, LOGSTORE, (l) => l.get("a2a_agent_name") === AGENT, "a2a");
-    expectReported(log, "/a2a", [{ hook: "input", email: 2 }]);
+    expectMasked(log, "/a2a", sent);
   });
 
   test("/v1/realtime: both directions' frames are reported", async (ctx) => {

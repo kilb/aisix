@@ -1956,9 +1956,11 @@ async fn dispatch_create(
             &body.model,
             vec![aisix_gateway::ChatMessage::user(body.prompt.clone())],
         );
+        // The maskable check: the rewrite below does what a mask rule asks, so
+        // reporting `mask_unsupported` here would contradict the `masked` hit
+        // the same row carries.
         let (verdict, hits) =
-            aisix_guardrails::Guardrail::check_input_unmaskable_observed(&resolved_chain, &chat)
-                .await;
+            aisix_guardrails::Guardrail::check_input_observed(&resolved_chain, &chat).await;
         monitor_hits.extend(hits);
         input_capture_safe = !verdict.is_bypass();
         if let aisix_guardrails::GuardrailVerdict::Block {
@@ -3430,6 +3432,16 @@ mod tests {
             event.redacted_entity_counts.get("email"),
             Some(&1),
             "the rewrite happened but was not reported",
+        );
+        let actions: Vec<&str> = event
+            .guardrail_enforced_hits
+            .iter()
+            .map(|hit| hit.action.as_str())
+            .collect();
+        assert_eq!(
+            actions,
+            ["masked"],
+            "a rewrite reported as unsupported contradicts itself",
         );
     }
 
