@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { Msg } from "../components/Msg";
+import { maskUrl } from "../lib/fmt";
 import { useSave } from "../lib/useSave";
 import type { DocState } from "../lib/useDoc";
 
@@ -90,7 +91,7 @@ export function Providers({ doc }: { doc: DocState }) {
                       {maskKey(p.api_key ?? p.secret)}
                     </td>
                     <td className="num" style={{ fontSize: 12 }}>
-                      {String(p.api_base ?? "（默认）")}
+                      {p.api_base != null ? maskUrl(p.api_base) : "（默认）"}
                     </td>
                     <td className="right">
                       <button className="ghost" disabled={busy} onClick={() => void del(i)}>

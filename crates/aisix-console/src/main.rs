@@ -113,6 +113,21 @@ impl AppState {
     }
 }
 
+/// 鉴权放在提取器之前：未登录的请求连请求体都不读。
+///
+/// 处理器自己也查（`require_auth`），可那时请求体已经被 `Json` 提取器整个读进内存、
+/// 解析成树了 —— 一个不带 cookie 的大请求就能把控制台撑过它的内存上限。
+async fn auth_layer(
+    State(st): State<AppState>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if let Err(r) = require_auth(&st, req.headers()).await {
+        return r;
+    }
+    next.run(req).await
+}
+
 async fn require_auth(state: &AppState, headers: &HeaderMap) -> Result<(), Response> {
     if state.authed(headers).await {
         Ok(())
@@ -787,28 +802,43 @@ impl Reload {
     }
 }
 
+/// 问一次网关的 `/status/config`。最多等 `wait`：这一步跑在跨进程写锁里，门户等锁
+/// 只等十秒，这里不能用客户端那二十秒的超时把它耗过去。
+async fn gateway_status(st: &AppState, wait: std::time::Duration) -> Option<Value> {
+    let base = st.status_url.as_ref()?;
+    st.http
+        .get(format!("{base}/status/config"))
+        .timeout(wait.max(std::time::Duration::from_millis(200)))
+        .send()
+        .await
+        .ok()?
+        .json::<Value>()
+        .await
+        .ok()
+}
+
+/// 网关读过 `contents` 并拒收了它。读不到状态、或者网关还没读到它，都不算。
+async fn gateway_rejected(st: &AppState, contents: &str) -> bool {
+    let Some(view) = gateway_status(st, std::time::Duration::from_secs(1)).await else {
+        return false;
+    };
+    let have = sha256_hex(contents.as_bytes());
+    let hash = |pointer: &str| view.pointer(pointer).and_then(Value::as_str);
+    hash("/source/source_hash") == Some(have.as_str())
+        && hash("/applied/config_hash") != Some(have.as_str())
+}
+
 /// 等网关报告它读到了 `written`，再看它有没有收下。文件模式下 `source_hash` 是刚读到
 /// 的文件的散列，`config_hash` 是正在用的那份的。
 async fn confirm_reload(st: &AppState, written: &str) -> Reload {
-    let Some(base) = &st.status_url else {
+    if st.status_url.is_none() {
         return Reload::Unconfirmed;
-    };
+    }
     let want = sha256_hex(written.as_bytes());
-    let url = format!("{base}/status/config");
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
     loop {
-        if let Some(view) = async {
-            st.http
-                .get(&url)
-                .send()
-                .await
-                .ok()?
-                .json::<Value>()
-                .await
-                .ok()
-        }
-        .await
-        {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if let Some(view) = gateway_status(st, left).await {
             let hash = |pointer: &str| view.pointer(pointer).and_then(Value::as_str);
             if hash("/source/source_hash") == Some(want.as_str()) {
                 if hash("/applied/config_hash") == Some(want.as_str()) {
@@ -862,58 +892,42 @@ async fn save_resources(
     // 比对必须在锁内、且是重读磁盘：在锁外读会让检查本身可以被插队，
     // 而用请求进来时的旧读数比对等于没比对。文件读不到时不拦——那种情况
     // 下面的替换步骤自己会失败，在这里多编一个理由只会遮住真正的错误。
-    if let Ok(current) = tokio::fs::read_to_string(&st.resources_path).await
+    //
+    // 读到的这份留着：网关拒收新的就把它放回去（见下）。
+    let previous = tokio::fs::read_to_string(&st.resources_path).await.ok();
+    if let Some(current) = &previous
         && stale_write(base_version, &sha256_hex(current.as_bytes()))
     {
         return Err(SaveError::Stale);
     }
+    // 现行文件引用的 `${VAR}` 算作网关那边有，前提是网关收下过它。网关读过却拒收的
+    // 那份不能当依据：它多半正是因为某个变量网关没有才被拒的，拿它当依据就会把同一个
+    // 值一次次放过去。
+    let trust_baseline = match &previous {
+        Some(current) => !gateway_rejected(st, current).await,
+        None => true,
+    };
 
     // 随机后缀：即便将来锁被绕过，两个请求也不会踩同一个文件。
     let tmp = st
         .resources_path
         .with_extension(format!("yaml.console-tmp.{}", &random_token()[..16]));
 
-    // 沿用原文件的权限，文件还不存在时 0600：这份内容和正式配置一样含明文上游密钥。
-    // 用 fs::write 会按 umask 建成 0644，而 rename 会把这个权限一并带到正式文件上 ——
-    // 运维设的 0600 会在第一次保存后被静默降级。反过来一律 0600 也不对：网关不是同
-    // 一个用户、靠组读这个文件的部署，第一次保存之后它就读不到了。
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = tokio::fs::metadata(&st.resources_path)
-            .await
-            .map(|m| m.permissions().mode() & 0o777)
-            .unwrap_or(0o600);
-        let mut f = tokio::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(mode)
-            .open(&tmp)
-            .await
-            .map_err(|e| format!("建临时文件失败: {e}"))?;
-        use tokio::io::AsyncWriteExt;
-        f.write_all(yaml.as_bytes())
-            .await
-            .map_err(|e| format!("写临时文件失败: {e}"))?;
-        // rename 之前落盘：崩溃在写与 rename 之间会让网关读到半截文件。
-        f.sync_all().await.map_err(|e| format!("落盘失败: {e}"))?;
-    }
+    write_private(&st.resources_path, &tmp, &yaml).await?;
 
     // 失败路径统一清理，避免留下一份 0600 但内容是废稿的密钥副本。
     let cleanup = |t: std::path::PathBuf| async move {
         let _ = tokio::fs::remove_file(t).await;
     };
 
-    let out = match tokio::process::Command::new(&st.aisix_bin)
-        .arg("validate")
-        .arg("--resources")
-        .arg(&tmp)
-        // 现行文件里引用的 `${VAR}` 是网关的环境变量，这个进程不一定有。这次新写
-        // 进去的变量则得这里也有：它同样可能是个笔误，而网关那边没有就拒收。
-        .arg("--baseline")
-        .arg(&st.resources_path)
-        .output()
-        .await
-    {
+    let mut validate = tokio::process::Command::new(&st.aisix_bin);
+    validate.arg("validate").arg("--resources").arg(&tmp);
+    // 现行文件里引用的 `${VAR}` 是网关的环境变量，这个进程不一定有。这次新写进去的
+    // 变量则得这里也有：它同样可能是个笔误，而网关那边没有就拒收。
+    if trust_baseline {
+        validate.arg("--baseline").arg(&st.resources_path);
+    }
+    let out = match validate.output().await {
         Ok(o) => o,
         Err(e) => {
             cleanup(tmp).await;
@@ -938,16 +952,10 @@ async fn save_resources(
         return Err(SaveError::Failed(format!("替换 resources.yaml 失败: {e}")));
     }
 
-    let hup = tokio::process::Command::new("pkill")
-        .arg("-HUP")
-        .arg("-x")
-        .arg("aisix")
-        .output()
-        .await;
     // 配置已经上线了——SIGHUP 没送到只是「还没热加载」，不是保存失败。
     // 当成失败返回会让调用方以为什么都没发生，而铸密钥那条路径会因此
     // 丢掉刚生成的明文，留下一把没人持有的活密钥。
-    let reload_ok = matches!(&hup, Ok(o) if o.status.success());
+    let reload_ok = signal_reload().await;
     let detail = String::from_utf8_lossy(&out.stdout).trim().to_string();
     let warnings = String::from_utf8_lossy(&out.stderr).trim().to_string();
     let reload = if reload_ok {
@@ -955,6 +963,48 @@ async fn save_resources(
     } else {
         Reload::SignalFailed
     };
+
+    // 网关拒收：把保存前的那份放回去。拒收的文件留在盘上，之后谁写都整份被拒（门户
+    // 停用密钥也跟着不生效），网关下次重启干脆起不来。
+    if let Reload::Rejected(why) = &reload {
+        tracing_line(&format!(
+            "resources.yaml rejected by the gateway ({} bytes), rolling back",
+            yaml.len()
+        ));
+        let Some(prev) = &previous else {
+            return Err(SaveError::Failed(format!(
+                "网关拒绝了这份配置，而保存前没有可以放回去的文件——网关重启会起不来，\
+                 请改好再保存：{why}"
+            )));
+        };
+        let back = st
+            .resources_path
+            .with_extension(format!("yaml.console-tmp.{}", &random_token()[..16]));
+        let restored = match write_private(&st.resources_path, &back, prev).await {
+            Ok(()) => tokio::fs::rename(&back, &st.resources_path)
+                .await
+                .map_err(|e| SaveError::Failed(format!("替换失败: {e}"))),
+            Err(e) => Err(e),
+        };
+        if let Err(e) = restored {
+            cleanup(back).await;
+            return Err(SaveError::Failed(format!(
+                "网关拒绝了这份配置，恢复保存前的配置也没成功（{}）——盘上现在是网关不收的那份，\
+                 网关重启会起不来，请到配置原文页改回去：{why}",
+                e.message()
+            )));
+        }
+        let back_in_force =
+            signal_reload().await && confirm_reload(st, prev).await == Reload::Applied;
+        return Err(SaveError::Failed(if back_in_force {
+            format!("网关拒绝了这份配置，已恢复为保存前的配置，这次改动没有生效：{why}")
+        } else {
+            format!(
+                "网关拒绝了这份配置，已把文件恢复为保存前的内容，但没能确认网关重新用上了它，\
+                 这次改动没有生效：{why}"
+            )
+        }));
+    }
 
     // 配置改写留痕：谁在什么时候改了网关配置，此前无处可查。
     tracing_line(&format!(
@@ -973,6 +1023,49 @@ async fn save_resources(
         warnings,
         reload,
     })
+}
+
+/// 把 `body` 写进 `tmp` 并落盘，权限照着 `like`（还不存在时 0600）。
+///
+/// 这份内容和正式配置一样含明文上游密钥。用 fs::write 会按 umask 建成 0644，而 rename
+/// 会把这个权限一并带到正式文件上 —— 运维设的 0600 会在第一次保存后被静默降级。反过来
+/// 一律 0600 也不对：网关不是同一个用户、靠组读这个文件的部署，第一次保存之后它就读
+/// 不到了。
+async fn write_private(
+    like: &std::path::Path,
+    tmp: &std::path::Path,
+    body: &str,
+) -> Result<(), SaveError> {
+    use std::os::unix::fs::PermissionsExt;
+    use tokio::io::AsyncWriteExt;
+    let mode = tokio::fs::metadata(like)
+        .await
+        .map(|m| m.permissions().mode() & 0o777)
+        .unwrap_or(0o600);
+    let mut f = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(mode)
+        .open(tmp)
+        .await
+        .map_err(|e| format!("建临时文件失败: {e}"))?;
+    f.write_all(body.as_bytes())
+        .await
+        .map_err(|e| format!("写临时文件失败: {e}"))?;
+    // rename 之前落盘：崩溃在写与 rename 之间会让网关读到半截文件。
+    f.sync_all().await.map_err(|e| format!("落盘失败: {e}"))?;
+    Ok(())
+}
+
+/// 让网关重读配置。信号送到了就是 true。
+async fn signal_reload() -> bool {
+    let hup = tokio::process::Command::new("pkill")
+        .arg("-HUP")
+        .arg("-x")
+        .arg("aisix")
+        .output()
+        .await;
+    matches!(&hup, Ok(o) if o.status.success())
 }
 
 /// 单行审计输出，交给 systemd 收进 journal。
@@ -1020,6 +1113,13 @@ async fn api_file_put(
     }
     // 原文优先：两个字段都给时以原文为准，因为那是用户实际看到并编辑的东西。
     let doc = match (&req.raw, &req.doc) {
+        (Some(text), _) if yaml_has_alias(text) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "原文里不能用 YAML 别名（*名字）：请把它展开再保存"})),
+            )
+                .into_response();
+        }
         (Some(text), _) => match serde_yaml_ng::from_str::<Value>(text) {
             Ok(v) => v,
             Err(e) => {
@@ -1040,26 +1140,37 @@ async fn api_file_put(
         }
     };
     match save_resources(&st, &doc, req.base_version.as_deref(), req.client_contract).await {
-        Ok(saved) => {
-            let reload_error = match &saved.reload {
-                Reload::Rejected(why) => Some(why.clone()),
-                _ => None,
-            };
-            Json(json!({
-                "ok": true,
-                "detail": saved.detail,
-                "warnings": saved.warnings,
-                "reload": saved.reload.label(),
-                "reload_error": reload_error,
-            }))
-            .into_response()
-        }
+        // 网关拒收的那份不会走到这里：它已经被放回去，按失败报。
+        Ok(saved) => Json(json!({
+            "ok": true,
+            "detail": saved.detail,
+            "warnings": saved.warnings,
+            "reload": saved.reload.label(),
+        }))
+        .into_response(),
         // 版本冲突是 409 而不是 400：前端要据此提示「重新载入」，而 400
         // 的其余成员都是「你写的内容不合法」，两者的处理动作完全不同。
         Err(e @ SaveError::Stale) => {
             (StatusCode::CONFLICT, Json(json!({"error": e.message()}))).into_response()
         }
         Err(e) => (StatusCode::BAD_REQUEST, Json(json!({"error": e.message()}))).into_response(),
+    }
+}
+
+/// 文本里有没有 YAML 别名。只过一遍事件流，不展开。
+///
+/// 别名的展开没有总量上限（serde_yaml_ng 只限跳转次数）：N 个别名指向一个 N 项的锚
+/// 就是 N² 个节点，二十 KB 的原文能把控制台撑到六百多 MB。控制台保存时本来就把别名
+/// 展开写回，所以原文里不需要它。解析不了的交给后面的解析去报错。
+fn yaml_has_alias(text: &str) -> bool {
+    use yaml_rust2::parser::{Event, Parser};
+    let mut parser = Parser::new_from_str(text);
+    loop {
+        match parser.next_token() {
+            Ok((Event::Alias(_), _)) => return true,
+            Ok((Event::StreamEnd, _)) | Err(_) => return false,
+            Ok(_) => {}
+        }
     }
 }
 
@@ -1098,6 +1209,16 @@ struct LogQuery {
     api_key_id: String,
     #[serde(default)]
     limit: Option<u32>,
+}
+
+/// 访问日志那一行自己的字段：target 与消息之后的部分。别的行一概是 `None`。
+///
+/// 只读这一段，是因为前面的 span 里有调用方给的请求 id，网关原样写、不加引号：整行
+/// 一起拆的话，它能在这一行里种下 `api_key_id=` 之类。标记里带空格，请求 id 里不能
+/// 有空格，所以 span 伪造不出它。
+fn access_log_fields(line: &str) -> Option<&str> {
+    const MARK: &str = "aisix_obs::access_log: proxy request completed ";
+    line.split_once(MARK).map(|(_, fields)| fields)
 }
 
 /// 从一行 tracing 输出里取出 `key=value` / `key="value"` 对。
@@ -1192,11 +1313,10 @@ async fn api_logs(
     let text = String::from_utf8_lossy(&out.stdout);
     let mut rows: Vec<Value> = Vec::new();
     for line in text.lines().rev() {
-        // 只要带 api_key_id 的行——那是逐请求记录，其余是启动/重载噪声。
-        if !line.contains("api_key_id=") {
+        let Some(fields) = access_log_fields(line) else {
             continue;
-        }
-        let kv = parse_kv(line);
+        };
+        let kv = parse_kv(fields);
         if !q.api_key_id.is_empty()
             && kv.get("api_key_id").and_then(Value::as_str) != Some(q.api_key_id.as_str())
         {
@@ -1283,7 +1403,19 @@ async fn api_upstream_models(
             )
                 .into_response();
         }
-        std::env::var(var).unwrap_or_default()
+        match std::env::var(var) {
+            Ok(v) if !v.is_empty() => v,
+            // 发一个空的 Bearer 出去只会换回一个看不出原因的 401。
+            _ => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": format!(
+                        "控制台的环境里没有 {var}（它可能只设在网关那边），拉不了这家的模型清单"
+                    )})),
+                )
+                    .into_response();
+            }
+        }
     } else {
         raw_key.to_string()
     };
@@ -1420,6 +1552,15 @@ fn outbound_client() -> reqwest::Client {
 /// 出站地址防护：只允许 https，且解析后的地址不得落在回环 / 链路本地 /
 /// 私网段。DNS 在这里解析一次用于判断——这不能完全消除 DNS rebinding，
 /// 但挡住了直接写内网地址这一类，而那才是这个入口的现实风险。
+/// 给人看的地址：userinfo 里的口令换成 `***`。
+fn shown_url(url: &reqwest::Url) -> String {
+    let mut shown = url.clone();
+    if shown.password().is_some() {
+        let _ = shown.set_password(Some("***"));
+    }
+    shown.to_string()
+}
+
 fn guard_outbound_base(base: &str) -> Result<(), String> {
     // 用真正的 URL 解析器，不手写切分。手写版本在 bracketed IPv6 上是坏的：
     // 对 `[::ffff:127.0.0.1]` 从最后一个冒号切会得到 `::ffff`，于是守卫
@@ -1427,11 +1568,14 @@ fn guard_outbound_base(base: &str) -> Result<(), String> {
     // 属巧合。userinfo（`https://good.example@127.0.0.1/`）是同一类问题。
     let url = reqwest::Url::parse(base).map_err(|e| format!("上游地址无法解析：{e}"))?;
     if url.scheme() != "https" {
-        return Err(format!("上游地址必须是 https://，收到 {base:?}"));
+        return Err(format!(
+            "上游地址必须是 https://，收到 {:?}",
+            shown_url(&url)
+        ));
     }
     let host = url
         .host_str()
-        .ok_or_else(|| format!("上游地址里没有主机名：{base:?}"))?
+        .ok_or_else(|| format!("上游地址里没有主机名：{:?}", shown_url(&url)))?
         .to_string();
     // 直接从解析结果拿 IP 字面量，绕开一次没必要的名字解析；只有真正的
     // 主机名才走 DNS。
@@ -1504,7 +1648,8 @@ fn password_to_hash(arg: Option<&str>, mut stdin: impl std::io::BufRead) -> Opti
 
 /// 路由装配。抽成函数是为了测试能拿到同一个 app，不必复制一份路由表。
 fn router(state: AppState) -> Router {
-    Router::new()
+    // 公开的几条：不需要会话。
+    let public = Router::new()
         .route("/healthz", get(health))
         // 排队期间请求体一直占着内存；一个口令用不了多大。
         .route(
@@ -1512,16 +1657,18 @@ fn router(state: AppState) -> Router {
             post(login).layer(axum::extract::DefaultBodyLimit::max(4 * 1024)),
         )
         .route("/api/logout", post(logout))
-        .route("/api/session", get(session_state))
+        .route("/api/session", get(session_state));
+    Router::new()
         .route("/api/resources", get(api_resources))
         // 这份配置的大小不由运维决定：门户里每把自助密钥都是一行，一千多把就超过
-        // 256KB，而控制台一旦收不下，运维在界面上什么都改不了了。YAML 的 alias 炸弹
-        // 不靠这个数挡，解析器自己有展开上限。
+        // 256KB，而控制台一旦收不下，运维在界面上什么都改不了了。4 MiB 够两万把上下。
+        // 上限也不能再大：解析成 JSON 树要放大十几倍，而服务跑在 MemoryMax=120M 下。
+        // YAML 别名另外挡，见 `yaml_has_alias`。
         .route(
             "/api/file",
             get(api_file_get)
                 .put(api_file_put)
-                .layer(axum::extract::DefaultBodyLimit::max(8 * 1024 * 1024)),
+                .layer(axum::extract::DefaultBodyLimit::max(4 * 1024 * 1024)),
         )
         .route("/api/portal/users", get(portal_users))
         .route("/api/portal/users/{id}/grant", post(portal_grant))
@@ -1533,6 +1680,14 @@ fn router(state: AppState) -> Router {
         .route("/api/metrics", post(api_metrics))
         .route("/api/logs", post(api_logs))
         .route("/api/upstream-models", post(api_upstream_models))
+        // 上面这些都要登录：在读请求体之前就查，见 `auth_layer`。
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth_layer,
+        ))
+        .merge(public)
+        // 除了配置文件，没有哪个接口的请求体需要超过几 KB。
+        .layer(axum::extract::DefaultBodyLimit::max(64 * 1024))
         .with_state(state)
 }
 
@@ -2467,6 +2622,256 @@ mod tests {
             password_to_hash(Some("arg"), stdin("s3cret\n")),
             Some("arg".into())
         );
+    }
+
+    /// 未登录的请求连请求体都不读：一个声明了 8 MB 却只发了几个字节的请求，必须立刻
+    /// 拿到 401，而不是让服务端等着把整个请求体读进内存。
+    #[tokio::test]
+    async fn an_unauthenticated_request_is_refused_before_its_body_is_read() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let dir = temp_dir("authfirst");
+        let st = state_on(&dir, PathBuf::from("/bin/true"), String::new());
+        let (base, _) = serve(st).await;
+        let addr = base.trim_start_matches("http://").to_string();
+        for path in ["/api/file", "/api/portal/users/u1/grant", "/api/logs"] {
+            let method = if path == "/api/file" { "PUT" } else { "POST" };
+            let mut s = tokio::net::TcpStream::connect(&addr).await.unwrap();
+            s.write_all(
+                format!(
+                    "{method} {path} HTTP/1.1\r\nhost: x\r\ncontent-type: application/json\r\n\
+                     content-length: 8000000\r\n\r\n{{\"doc\":["
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+            let mut buf = vec![0u8; 256];
+            let n = tokio::time::timeout(std::time::Duration::from_secs(3), s.read(&mut buf))
+                .await
+                .unwrap_or_else(|_| panic!("{path}: 服务端在等请求体，没有先查身份"))
+                .unwrap();
+            let head = String::from_utf8_lossy(&buf[..n]);
+            assert!(head.starts_with("HTTP/1.1 401"), "{path}: {head}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 登录之后请求体也有上限：解析成树要放大十几倍，服务跑在 MemoryMax=120M 下。
+    #[tokio::test]
+    async fn an_authenticated_body_over_the_limit_is_refused() {
+        let dir = temp_dir("bodycap");
+        let st = state_on(&dir, PathBuf::from("/bin/true"), String::new());
+        let (base, cookie) = serve(st).await;
+        let big = format!("{{\"raw\":\"{}\"}}", "x".repeat(5 * 1024 * 1024));
+        let r = reqwest::Client::new()
+            .put(format!("{base}/api/file"))
+            .header("cookie", &cookie)
+            .header("content-type", "application/json")
+            .body(big)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 413);
+        let r = reqwest::Client::new()
+            .post(format!("{base}/api/logs"))
+            .header("cookie", &cookie)
+            .header("content-type", "application/json")
+            .body(format!("{{\"api_key_id\":\"{}\"}}", "x".repeat(100 * 1024)))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 413);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 二十 KB 的别名能把解析撑到六百多 MB。原文里有别名就不解析。
+    #[tokio::test]
+    async fn raw_yaml_with_aliases_is_refused_before_parsing() {
+        let dir = temp_dir("alias");
+        let base_version = seed_file(&dir);
+        let st = state_on(&dir, PathBuf::from("/bin/true"), String::new());
+        let (base, cookie) = serve(st).await;
+        let r = reqwest::Client::new()
+            .put(format!("{base}/api/file"))
+            .header("cookie", &cookie)
+            .json(&json!({
+                "raw": "a: &a [0, 0, 0]\nb: [*a, *a, *a]\n",
+                "base_version": base_version,
+                "client_contract": 2,
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 400);
+        assert!(r.text().await.unwrap().contains("别名"));
+        assert!(!yaml_has_alias(
+            "models:\n- display_name: openai/*\n  model_name: '*'\n"
+        ));
+        assert!(!yaml_has_alias(
+            "guardrails:\n- name: g\n  script: |\n    * a * b\n"
+        ));
+        assert!(yaml_has_alias("a: &x 1\nb: *x\n"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 一个假网关的指标口：按 `hashes` 依次回答 `/status/config`，读到最后一份就一直
+    /// 回答它。每份是（读到的那份，正在用的那份）。
+    async fn fake_status(hashes: Vec<(String, String)>) -> String {
+        let at = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().route(
+            "/status/config",
+            get(move || {
+                let at = at.clone();
+                let hashes = hashes.clone();
+                async move {
+                    let i = at
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                        .min(hashes.len() - 1);
+                    let (source, applied) = &hashes[i];
+                    Json(json!({
+                        "source": {"source_hash": source},
+                        "applied": {"config_hash": applied},
+                        "rejected": [{"last_error": "environment variable `X` is unset or empty"}],
+                    }))
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{addr}")
+    }
+
+    /// 网关拒收：把保存前那份放回去。留着的话之后谁写都被整份拒收，网关下次重启起不来。
+    #[tokio::test]
+    async fn a_save_the_gateway_rejects_is_rolled_back() {
+        let dir = temp_dir("rollback");
+        let base_version = seed_file(&dir);
+        let previous = std::fs::read_to_string(dir.join("resources.yaml")).unwrap();
+        let doc = json!({"_format_version": "1", "models": []});
+        let new_hash = sha256_hex(serde_yaml_ng::to_string(&doc).unwrap().as_bytes());
+        let old_hash = sha256_hex(previous.as_bytes());
+        // 先说读到了新的、却还在用旧的（拒收）；放回去之后说旧的在用。
+        let status = fake_status(vec![
+            (old_hash.clone(), old_hash.clone()),
+            (new_hash.clone(), old_hash.clone()),
+            (old_hash.clone(), old_hash.clone()),
+        ])
+        .await;
+        let mut st = state_on(&dir, fake_validator(&dir, ""), String::new());
+        st.status_url = Some(status);
+        let r = save_resources(&st, &doc, Some(&base_version), Some(2)).await;
+        let Err(SaveError::Failed(msg)) = r else {
+            panic!("网关拒收却报了保存成功");
+        };
+        assert!(msg.contains("已恢复为保存前的配置"), "{msg}");
+        assert!(msg.contains("`X`"), "{msg}");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("resources.yaml")).unwrap(),
+            previous,
+            "拒收的那份留在了盘上",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 网关读过却拒收的现行文件不能当 `--baseline`：它多半正是因为某个变量网关没有才被
+    /// 拒的，拿它当依据就会把同一个值一次次放过去。
+    #[tokio::test]
+    async fn a_file_the_gateway_rejected_is_not_used_as_the_baseline() {
+        let dir = temp_dir("baseline");
+        let base_version = seed_file(&dir);
+        let current = sha256_hex(
+            std::fs::read_to_string(dir.join("resources.yaml"))
+                .unwrap()
+                .as_bytes(),
+        );
+        let mut st = state_on(&dir, fake_validator(&dir, ""), String::new());
+        st.status_url = Some(fake_status(vec![(current, "something-else".into())]).await);
+        let doc = json!({"_format_version": "1"});
+        let _ = save_resources(&st, &doc, Some(&base_version), Some(2)).await;
+        let args = std::fs::read_to_string(dir.join("args")).unwrap();
+        assert!(!args.contains("--baseline"), "{args}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 状态口接了连接却不答：这一步在跨进程写锁里，不能把门户的十秒等锁耗过去。
+    #[tokio::test]
+    async fn a_silent_status_listener_does_not_hold_the_save_for_long() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((c, _)) = listener.accept().await {
+                held.push(c);
+            }
+        });
+        let dir = temp_dir("silent");
+        let mut st = state_on(&dir, PathBuf::from("/bin/true"), String::new());
+        st.status_url = Some(format!("http://{addr}"));
+        let started = std::time::Instant::now();
+        assert_eq!(confirm_reload(&st, "x").await, Reload::Unconfirmed);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// span 里的请求 id 是调用方给的，网关原样写、不加引号。它不能被当成这一行的字段。
+    #[test]
+    fn a_caller_chosen_request_id_cannot_plant_log_fields() {
+        let forged = r#"2026-11-05T13:28:48.807888Z  INFO request{request_id="x"api_key_id="VICTIM"total_tokens="999999" http_version="1.1" peer=127.0.0.1:36156}: aisix_obs::access_log: proxy request completed method="POST" path="/v1/chat/completions" status_code=401 downstream_latency_ms=0 error_class="authentication""#;
+        let m = parse_kv(access_log_fields(forged).unwrap());
+        assert_eq!(m.get("api_key_id"), None);
+        assert_eq!(m.get("total_tokens"), None);
+        assert_eq!(m.get("status_code").and_then(Value::as_str), Some("401"));
+        assert_eq!(
+            access_log_fields(r#"2026-11-05T13:28:48Z  WARN aisix_proxy::auth: api_key_id="x""#),
+            None
+        );
+    }
+
+    /// 上游密钥写成 `${PROVIDER_KEY_*}`、而控制台的环境里没有它：别发一个空 Bearer。
+    #[tokio::test]
+    async fn a_provider_key_variable_the_console_lacks_is_not_sent_empty() {
+        let dir = temp_dir("novar");
+        std::fs::write(
+            dir.join("resources.yaml"),
+            serde_yaml_ng::to_string(&json!({"provider_keys": [{
+                "display_name": "p",
+                "provider": "openai",
+                "api_key": "${PROVIDER_KEY_AISIX_CONSOLE_TEST_UNSET}",
+                "api_base": "https://127.0.0.1/v1",
+            }]}))
+            .unwrap(),
+        )
+        .unwrap();
+        let (base, cookie) = serve(state_on(&dir, PathBuf::from("/bin/true"), String::new())).await;
+        let r = reqwest::Client::new()
+            .post(format!("{base}/api/upstream-models"))
+            .header("cookie", cookie)
+            .json(&json!({"provider_key": "p"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 400);
+        assert!(
+            r.text()
+                .await
+                .unwrap()
+                .contains("PROVIDER_KEY_AISIX_CONSOLE_TEST_UNSET")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn outbound_guard_errors_hide_the_url_password() {
+        let e = guard_outbound_base("http://user:hunter2@api.example.com/v1").unwrap_err();
+        assert!(!e.contains("hunter2"), "{e}");
+        assert!(e.contains("user:***@"), "{e}");
     }
 
     /// 认不出的供应商没写 `api_base` 时，绝不能猜一个地址把它的密钥发出去。

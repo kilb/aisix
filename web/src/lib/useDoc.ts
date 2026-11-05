@@ -29,8 +29,6 @@ export interface SaveOutcome {
   message: string;
   /** 因版本冲突被拒。界面重载之后，用户手上那份改动已经不在编辑框里了。 */
   stale?: boolean;
-  /** 文件已经换了，但网关拒收：`ok` 仍为真（表单该清空），提示要按出错显示。 */
-  rejected?: boolean;
 }
 
 function describe(e: unknown): string {
@@ -43,8 +41,6 @@ function reloadMessage(r: api.SaveResult): string {
     switch (r.reload) {
       case "applied":
         return "已保存，网关已重载。";
-      case "rejected":
-        return `已保存，但网关拒绝了这份配置，仍在用旧配置：${r.reload_error ?? "没有给出原因"}`;
       case "signal_failed":
         return `已保存，但网关未热加载——${r.detail ?? ""}`;
       default:
@@ -87,12 +83,9 @@ export function useDoc(enabled: boolean): DocState {
     async (write: () => Promise<api.SaveResult>): Promise<SaveOutcome> => {
       let ok = false;
       let stale = false;
-      let rejected = false;
       let message: string;
       try {
-        const saved = await write();
-        message = reloadMessage(saved);
-        rejected = saved.reload === "rejected";
+        message = reloadMessage(await write());
         ok = true;
       } catch (e) {
         message = describe(e);
@@ -100,7 +93,7 @@ export function useDoc(enabled: boolean): DocState {
       }
       // 成功是确认，失败是回滚 —— 两种情况都要以磁盘为准。
       await reload();
-      return { ok, message, stale, rejected };
+      return { ok, message, stale };
     },
     [reload],
   );

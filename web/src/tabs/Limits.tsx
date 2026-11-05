@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { Msg } from "../components/Msg";
-import { badInt, fmtSpendCap, intOrNull } from "../lib/fmt";
+import { badInt, badUsd, fmtSpendCap, intOrNull } from "../lib/fmt";
 import { useSave } from "../lib/useSave";
 import type { DocState } from "../lib/useDoc";
 
@@ -49,6 +49,10 @@ export function Limits({ doc }: { doc: DocState }) {
     }
     if (badInt(req) || badInt(tok)) {
       setNote({ text: "请求数和 Token 上限必须是正整数，留空表示不限", kind: "crit" });
+      return;
+    }
+    if (badUsd(spend)) {
+      setNote({ text: "花费上限必须是正数，留空表示不限", kind: "crit" });
       return;
     }
     const r = intOrNull(req);

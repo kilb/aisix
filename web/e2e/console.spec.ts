@@ -833,3 +833,38 @@ test("门户的自助密钥多到几百 KB 时_控制台照样能保存", async 
   });
   expect(back.status).toBe(200);
 });
+
+test("花费上限填错的数不会被当成不限", async ({ page }) => {
+  await signIn(page);
+  await page.getByRole("tab", { name: "调用方密钥" }).click();
+  await page.getByLabel("名称").fill("bad-spend");
+  await page.getByLabel("花费上限 USD（留空不限）").fill("-5");
+  await page.getByRole("button", { name: /生成并重载网关/ }).click();
+  await expect(page.locator(".note.crit", { hasText: "花费上限必须是正数" })).toBeVisible();
+  await expect(page.getByText(/密钥明文/)).toHaveCount(0);
+  expect(fx.read()).not.toContain("bad-spend");
+
+  await page.getByRole("tab", { name: "限流与预算" }).click();
+  await page.getByLabel("名称").fill("bad-spend-policy");
+  await page.getByLabel("花费上限 USD").fill("0");
+  await page.getByLabel("请求数上限").fill("5");
+  await page.getByRole("button", { name: /保存并重载网关/ }).click();
+  await expect(page.locator(".note.crit", { hasText: "花费上限必须是正数" })).toBeVisible();
+  expect(fx.read()).not.toContain("bad-spend-policy");
+});
+
+test("供应商表里的基址不显示口令", async ({ page, browser }) => {
+  await seedDoc(browser, (doc) => {
+    doc.provider_keys!.push({
+      display_name: "base-with-password",
+      provider: "openai",
+      api_key: "sk-base",
+      api_base: "https://proxyuser:hunter2-base-secret@proxy.example.com/v1",
+    });
+  });
+  await signIn(page);
+  await page.getByRole("tab", { name: "供应商" }).click();
+  const row = page.getByRole("row", { name: /base-with-password/ });
+  await expect(row).toContainText("proxyuser:***@proxy.example.com");
+  await expect(row).not.toContainText("hunter2-base-secret");
+});

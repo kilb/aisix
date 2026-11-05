@@ -87,9 +87,11 @@ export interface SaveResult {
   detail?: string;
   /** 校验通过但校验器有话要说，比如护栏没有挂载、什么流量也不检查。 */
   warnings?: string;
-  /** 网关用上这份配置了没有。信号送到不等于它收下了。 */
-  reload?: "applied" | "rejected" | "unconfirmed" | "signal_failed";
-  reload_error?: string | null;
+  /**
+   * 网关用上这份配置了没有。信号送到不等于它收下了。网关拒收的那份不会以成功回来：
+   * 服务端已经把文件恢复成保存前的样子，按失败报。
+   */
+  reload?: "applied" | "unconfirmed" | "signal_failed";
 }
 
 /**

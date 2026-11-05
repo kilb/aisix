@@ -97,3 +97,32 @@ test("网关拒收时如实说_不说已重载", async ({ page }) => {
   await page.getByRole("button", { name: "校验并保存" }).click();
   await expect(page.getByText("已保存，网关已重载。")).toBeVisible();
 });
+
+test("网关拒收的那份不留在盘上_之后的保存照常生效", async ({ page }) => {
+  await signIn(page);
+  await page.getByRole("tab", { name: "配置原文" }).click();
+  const box = page.getByRole("textbox").first();
+  await expect(box).not.toHaveValue("");
+  const good = await box.inputValue();
+  const before = fx.read();
+  await box.fill(good.replace("sk-applied", `\${${CONSOLE_ONLY_VAR}}`));
+  await page.getByRole("button", { name: "校验并保存" }).click();
+  await expect(page.locator(".note.crit", { hasText: "网关拒绝了这份配置" })).toBeVisible();
+
+  // 拒收的那份留在盘上的话，网关下次重启起不来，之后谁写都整份被拒。
+  expect(fx.read()).toBe(before);
+  expect(fx.read()).not.toContain(CONSOLE_ONLY_VAR);
+
+  // 再试一次，照样被拒、照样恢复。
+  await page.getByRole("button", { name: "校验并保存" }).click();
+  await expect(page.locator(".note.crit", { hasText: "网关拒绝了这份配置" })).toBeVisible();
+  expect(fx.read()).toBe(before);
+
+  // 网关照常在用保存前的那份，别的改动照常生效。
+  await page.getByRole("tab", { name: "供应商" }).click();
+  await page.getByLabel("名称").fill("after-rollback");
+  await page.getByLabel("API 密钥").fill("sk-after-rollback");
+  await page.getByRole("button", { name: /保存并重载网关/ }).click();
+  await expect(page.getByText("已保存，网关已重载。")).toBeVisible();
+  expect(fx.read()).toContain("after-rollback");
+});

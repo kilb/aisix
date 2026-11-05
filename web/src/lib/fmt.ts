@@ -51,6 +51,19 @@ export function intOrNull(v: unknown): number | null {
   return Number.isInteger(n) && n > 0 ? n : null;
 }
 
+/** 框里填了东西，却不是正数。`-5` 或 `0` 不能当成「不设上限」悄悄丢掉。 */
+export function badUsd(v: unknown): boolean {
+  const s = String(v ?? "").trim();
+  if (!s) return false;
+  const n = Number(s);
+  return !Number.isFinite(n) || n <= 0;
+}
+
+/** 给人看的地址：userinfo 里的口令换成 `***`。 */
+export function maskUrl(v: unknown): string {
+  return String(v ?? "").replace(/\/\/([^:@/]*):[^@/]*@/, "//$1:***@");
+}
+
 /** 框里填了东西，却不是正整数。这种值不能当成「不设」悄悄丢掉。 */
 export function badInt(v: unknown): boolean {
   return String(v ?? "").trim() !== "" && intOrNull(v) === null;

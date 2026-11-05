@@ -1,7 +1,7 @@
 import { useState } from "react";
 import * as api from "../lib/api";
 import { Msg } from "../components/Msg";
-import { badInt, fmtSpendCap, intOrNull, modelsOrAll } from "../lib/fmt";
+import { badInt, badUsd, fmtSpendCap, intOrNull, modelsOrAll } from "../lib/fmt";
 import { useSave } from "../lib/useSave";
 import type { DocState } from "../lib/useDoc";
 
@@ -55,6 +55,10 @@ export function Keys({ doc }: { doc: DocState }) {
 
     if (badInt(rpm) || badInt(tpm)) {
       setNote({ text: "限速必须是正整数，留空表示不限", kind: "crit" });
+      return;
+    }
+    if (badUsd(spend)) {
+      setNote({ text: "花费上限必须是正数，留空表示不限", kind: "crit" });
       return;
     }
 
