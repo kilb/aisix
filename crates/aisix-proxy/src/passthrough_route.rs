@@ -6087,6 +6087,12 @@ fn upstream_cut_error() -> std::io::Error {
     std::io::Error::other("upstream stream failed")
 }
 
+/// The same for a stream cut because its distributed concurrency lease is gone:
+/// half an answer must not read as a whole one, whichever side ended it.
+fn lease_lost_error() -> std::io::Error {
+    std::io::Error::other("stream concurrency lease lost")
+}
+
 /// Wait until a distributed stream-concurrency renewal proves that this
 /// stream's member has disappeared from Redis. A backend outage is
 /// deliberately not a signal: rate limiting remains fail-open when Redis
@@ -6136,6 +6142,7 @@ fn stream_opaque_response(
                     telemetry.record_rate_limit_lease_lost();
                     telemetry.stream_reached_end = true;
                     telemetry.emit();
+                    yield Err(lease_lost_error());
                     return;
                 }
                 chunk = upstream.next() => chunk,
@@ -6187,6 +6194,7 @@ fn stream_opaque_response(
                 error = %telemetry.error_message,
                 "passthrough-route opaque SSE relay timed out mid-stream",
             );
+            upstream_failed = true;
         }
         telemetry.stream_reached_end = true;
         telemetry.emit();
@@ -6197,8 +6205,11 @@ fn stream_opaque_response(
 
     let mut response = Response::builder()
         .status(status)
-        .body(Body::from_stream(crate::request_id::in_request_span(
-            stream,
+        // No heartbeat on an opaque body, but its failure still goes out behind
+        // what came before it.
+        .body(Body::from_stream(crate::sse_keepalive::with_heartbeat(
+            crate::request_id::in_request_span(stream),
+            None,
         )))
         .unwrap();
     copy_safe_headers(&resp_headers, response.headers_mut());
@@ -6308,6 +6319,7 @@ fn stream_response(
                     telemetry.record_rate_limit_lease_lost();
                     telemetry.stream_reached_end = true;
                     telemetry.emit();
+                    yield Err(lease_lost_error());
                     return;
                 }
                 chunk = upstream.next() => chunk,
@@ -6698,6 +6710,7 @@ fn stream_response(
                 error = %telemetry.error_message,
                 "passthrough-route upstream stream timed out mid-relay",
             );
+            upstream_failed = true;
         }
 
         if !blocked {
@@ -12305,6 +12318,59 @@ data: [DONE]\n\n";
             }
         }
         assert!(String::from_utf8_lossy(&received).contains("half an ans"));
+        assert!(failed, "the caller must learn the answer is incomplete");
+    }
+
+    /// A stream the route's read budget ended is half an answer too: what came
+    /// before the silence arrives as it was, and the body ends in an error.
+    #[tokio::test]
+    async fn a_read_timeout_mid_stream_fails_the_relayed_body() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut req = vec![0u8; 65536];
+            let _ = sock.read(&mut req).await;
+            let body = "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"first\"}}]}\n\n";
+            let head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n{:x}\r\n{body}\r\n",
+                body.len(),
+            );
+            sock.write_all(head.as_bytes()).await.unwrap();
+            sock.flush().await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        });
+        let snap = AisixSnapshot::new();
+        snap.provider_keys
+            .insert(provider_key_entry("http://unused"));
+        snap.apikeys.insert(apikey_entry("sk-caller", Some(&["*"])));
+        snap.passthrough_routes.insert(route_entry(
+            "route-1",
+            serde_json::json!({
+                "name": "openai-tunnel",
+                "path_prefix": "/passthrough/openai",
+                "target_url": format!("http://{addr}"),
+                "provider_key_id": PK_ID,
+                "timeout_ms": 100,
+            }),
+        ));
+        let resp = build_app(snap)
+            .oneshot(relay_request("/passthrough/openai/v1/chat/completions"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let mut body = resp.into_body().into_data_stream();
+        let mut received = Vec::new();
+        let mut failed = false;
+        use futures::StreamExt;
+        while let Some(item) = body.next().await {
+            match item {
+                Ok(bytes) => received.extend_from_slice(&bytes),
+                Err(_) => failed = true,
+            }
+        }
+        assert!(String::from_utf8_lossy(&received).contains("first"));
         assert!(failed, "the caller must learn the answer is incomplete");
     }
 

@@ -566,7 +566,22 @@ describe("passthrough SSE concurrency is shared and renewed across Redis replica
       expect(
         await redisCommand(REDIS_URL, ["DEL", `aisix:rl:{${apiKeyId}}:conc`]),
       ).toBe(":1\r\n");
-      expect(await beforeTimeout(leaseLost!.text(), 2_000)).toBe("");
+      // Cut with the lease, and the caller can tell: the read rejects, with
+      // nothing delivered beforehand. The bound tells that from a stall.
+      const leaseLostRead = leaseLost!.body!.getReader();
+      const leaseLostChunks: Uint8Array[] = [];
+      const leaseLostOutcome = await beforeTimeout(
+        (async () => {
+          for (;;) {
+            const { done, value } = await leaseLostRead.read();
+            if (done) return "clean end";
+            leaseLostChunks.push(value);
+          }
+        })().catch(() => "read rejected"),
+        2_000,
+      );
+      expect(leaseLostOutcome).toBe("read rejected");
+      expect(leaseLostChunks).toHaveLength(0);
       const leaseLossLog = await waitForSlsLog(
         sls,
         LEASE_LOSS_SLS_LOGSTORE,

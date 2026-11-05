@@ -1160,8 +1160,23 @@ describe("passthrough-route e2e: explicit routes, BYO credentials, unclaimed pat
     const started = Date.now();
     const stalled = await call();
     expect(stalled.status).toBe(200);
-    const body = await stalled.text();
+    // Half an answer must not read as a whole one: the read rejects, with what
+    // came before the silence delivered as it was.
+    const reader = stalled.body!.getReader();
+    const decoder = new TextDecoder();
+    let body = "";
+    let readFailed = false;
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        body += decoder.decode(value);
+      }
+    } catch {
+      readFailed = true;
+    }
     const elapsed = Date.now() - started;
+    expect(readFailed, body).toBe(true);
     expect(body).toContain("first");
     expect(body).not.toContain("late");
     expect(elapsed).toBeLessThan(1_000);
