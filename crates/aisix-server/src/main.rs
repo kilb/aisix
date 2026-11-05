@@ -3118,7 +3118,7 @@ async fn serve_listeners(
     // serving on fewer ports than it reported.
     let mut listeners = Vec::with_capacity(resolved.len());
     for (addr, tls) in resolved {
-        let listener = std::net::TcpListener::bind(addr)
+        let listener = bind_listener(addr)
             .map_err(|e| anyhow::anyhow!("{label} listener bind {addr} failed: {e}"))?;
         match tls {
             None => tracing::info!(%addr, label, "aisix listening (http)"),
@@ -3812,11 +3812,44 @@ struct WorkerListener {
     tls: Option<tokio_rustls::TlsAcceptor>,
 }
 
+/// How many handshaken connections a listener asks the kernel to hold for
+/// `accept`: as many as the host allows. The kernel truncates the request
+/// to its own limit (`net.core.somaxconn` on Linux, 4096 by default since
+/// 5.4), so the operator's existing setting is the one that applies.
+///
+/// It used to be 128, `std::net::TcpListener::bind`'s fixed value. A burst
+/// of new connections larger than that arrives faster than a busy worker
+/// returns to its accept loop, and the kernel drops what does not fit
+/// without telling the client: each dropped one waits out a SYN
+/// retransmission, a full second at first, then three, then seven. On one
+/// core that turned a cold start at 8,000 requests a second, within
+/// capacity, into a p99 of several seconds, and a client that opens a new
+/// connection whenever its others are busy opened six times as many as it
+/// needed while the first ones hung. Queued instead, the same burst is
+/// served in order within milliseconds.
+const LISTEN_BACKLOG: i32 = i32::MAX;
+
+/// A listener on `addr` with [`LISTEN_BACKLOG`], set up the way
+/// `std::net::TcpListener::bind` sets one up otherwise (`SO_REUSEADDR`
+/// outside Windows, close-on-exec).
+fn bind_listener(addr: std::net::SocketAddr) -> std::io::Result<std::net::TcpListener> {
+    let socket = socket2::Socket::new(
+        socket2::Domain::for_address(addr),
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    )?;
+    #[cfg(not(windows))]
+    socket.set_reuse_address(true)?;
+    socket.bind(&addr.into())?;
+    socket.listen(LISTEN_BACKLOG)?;
+    Ok(socket.into())
+}
+
 /// A listener that shares `addr` with the other workers' listeners.
 ///
 /// `SO_REUSEPORT` has to be set before the bind, and every socket on the
 /// address has to set it, which is why this cannot go through
-/// `TcpListener::bind`.
+/// [`bind_listener`].
 fn bind_reuseport_listener(addr: std::net::SocketAddr) -> std::io::Result<std::net::TcpListener> {
     #[cfg(not(unix))]
     return Err(std::io::Error::new(
@@ -3837,10 +3870,9 @@ fn bind_reuseport_listener(addr: std::net::SocketAddr) -> std::io::Result<std::n
         socket.set_reuse_address(true)?;
         socket.set_reuse_port(true)?;
         socket.bind(&addr.into())?;
-        // Matches the backlog `std::net::TcpListener::bind` requests, so
-        // the two modes queue the same number of pending connections per
-        // socket.
-        socket.listen(128)?;
+        // The same backlog as `bind_listener`, so the two modes queue the
+        // same number of pending connections per socket.
+        socket.listen(LISTEN_BACKLOG)?;
         Ok(socket.into())
     }
 }
@@ -5688,6 +5720,57 @@ managed:
                 .is_err(),
             "the listener must be closed once the drain has ended",
         );
+    }
+
+    /// A burst of new connections wider than the old fixed backlog of 128
+    /// waits in the accept queue instead of being dropped, on the shared
+    /// listener and on a thread-per-core worker's listener alike. Nothing
+    /// accepts here, so every handshake that completes is a connection the
+    /// kernel queued. A dropped one gets no answer until its SYN is
+    /// retransmitted, a second later at the earliest, into a queue that is
+    /// still full.
+    ///
+    /// The kernel caps the backlog at `net.core.somaxconn`, so on a host
+    /// that set it below the burst the expectation follows it down.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_burst_of_new_connections_waits_in_the_accept_queue() {
+        const BURST: usize = 512;
+        let somaxconn: usize = std::fs::read_to_string("/proc/sys/net/core/somaxconn")
+            .expect("somaxconn is readable")
+            .trim()
+            .parse()
+            .expect("somaxconn is a number");
+        // Linux queues one connection more than the backlog.
+        let expected = BURST.min(somaxconn + 1);
+        let loopback: std::net::SocketAddr = "127.0.0.1:0".parse().expect("loopback");
+        for (mode, listener) in [
+            ("shared", bind_listener(loopback)),
+            ("thread-per-core", bind_reuseport_listener(loopback)),
+        ] {
+            let listener = listener.expect("bind");
+            let addr = listener.local_addr().expect("local addr");
+            let mut connects = tokio::task::JoinSet::new();
+            for _ in 0..BURST {
+                connects.spawn(tokio::time::timeout(
+                    Duration::from_secs(2),
+                    tokio::net::TcpStream::connect(addr),
+                ));
+            }
+            let mut queued = Vec::new();
+            while let Some(done) = connects.join_next().await {
+                if let Ok(Ok(stream)) = done.expect("connect task") {
+                    queued.push(stream);
+                }
+            }
+            assert!(
+                queued.len() >= expected,
+                "{mode}: {} of {BURST} connections reached the accept queue, expected \
+                 at least {expected}; the rest were dropped by a backlog smaller than \
+                 the host allows",
+                queued.len(),
+            );
+        }
     }
 
     /// Diagnostic only, so the boot does not wait for it. Returning `()` is the
