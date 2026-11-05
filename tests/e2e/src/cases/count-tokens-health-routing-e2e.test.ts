@@ -21,6 +21,8 @@ const MODELS = {
   group: "ct-health-group",
   truncated: "ct-health-truncated",
   control: "ct-health-control",
+  counted500: "ct-health-counted-500",
+  counted429: "ct-health-counted-429",
 } as const;
 
 describe("count_tokens health and routing telemetry", () => {
@@ -28,6 +30,7 @@ describe("count_tokens health and routing telemetry", () => {
   let app: SpawnedApp | undefined;
   let primary: OpenAiUpstream | undefined;
   let fallback: OpenAiUpstream | undefined;
+  let limited: OpenAiUpstream | undefined;
   let truncatedServer: Server | undefined;
   let truncatedBaseUrl = "";
   let truncatedRequests = 0;
@@ -43,6 +46,10 @@ describe("count_tokens health and routing telemetry", () => {
       errorBody: { error: { message: "count failed" } },
     });
     fallback = await startOpenAiUpstream({ nonStreamBody: { input_tokens: 42 } });
+    limited = await startOpenAiUpstream({
+      status: 429,
+      errorBody: { type: "error", error: { type: "rate_limit_error", message: "slow down" } },
+    });
     truncatedServer = createServer((req, res) => {
       req.resume();
       req.on("end", () => {
@@ -84,6 +91,8 @@ describe("count_tokens health and routing telemetry", () => {
     modelIds.fallback = await createDirect(MODELS.fallback, fallback.baseUrl);
     modelIds.truncated = await createDirect(MODELS.truncated, truncatedBaseUrl);
     modelIds.control = await createDirect(MODELS.control, primary.baseUrl);
+    modelIds.counted500 = await createDirect(MODELS.counted500, primary.baseUrl);
+    modelIds.counted429 = await createDirect(MODELS.counted429, limited.baseUrl);
     const group = await seed.createModel({
       display_name: MODELS.group,
       routing: {
@@ -115,6 +124,7 @@ describe("count_tokens health and routing telemetry", () => {
     await app?.exit();
     await primary?.close();
     await fallback?.close();
+    await limited?.close();
     if (truncatedServer) {
       await new Promise<void>((resolve, reject) =>
         truncatedServer!.close((error) => (error ? reject(error) : resolve())),
@@ -135,6 +145,34 @@ describe("count_tokens health and routing telemetry", () => {
         messages: [{ role: "user", content: `count ${model}` }],
       }),
     });
+
+  const generate = (model: string) =>
+    fetch(`${app!.proxyUrl}/v1/messages`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-api-key": CALLER,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model,
+        max_tokens: 8,
+        messages: [{ role: "user", content: `generate ${model}` }],
+      }),
+    });
+
+  const statusOf = async (id: string | undefined) => {
+    const status = await fetch(`${app!.metricsUrl}/status/models`);
+    if (status.status !== 200) {
+      throw new Error(`model status probe returned ${status.status}`);
+    }
+    const rows = (await status.json()) as Array<{
+      id?: string;
+      status?: string;
+      status_reason?: string;
+    }>;
+    return rows.find((row) => row.id === id);
+  };
 
   test("records the failed deployment and successful fallback", async (ctx) => {
     if (!etcdReachable || !app || !primary || !fallback) {
@@ -172,7 +210,52 @@ describe("count_tokens health and routing telemetry", () => {
         fallback_model: MODELS.fallback,
       }),
     ).toBe(1);
+
+    // The failure left the member available: the next call through the group
+    // tries it again rather than skipping it.
+    expect((await countTokens(MODELS.group)).status).toBe(200);
+    expect(primary.receivedRequests).toHaveLength(primaryBaseline + 2);
   });
+
+  // A server error is a 5xx to the caller, whichever one; a rate limit is the
+  // 429 the upstream answered.
+  const isServerError = (status: number) => status >= 500;
+  const isRateLimit = (status: number) => status === 429;
+  for (const [label, key, failedAs, coolingReason] of [
+    ["5xx", "counted500", isServerError, "upstream_server_error"],
+    ["429", "counted429", isRateLimit, "upstream_rate_limited"],
+  ] as const) {
+    test(`a ${label} on count_tokens leaves the model available, and a generation failure still cools it`, async (ctx) => {
+      if (!etcdReachable || !app) {
+        ctx.skip();
+        return;
+      }
+      const before = await scrapeMetrics(app.metricsUrl);
+      const counted = await countTokens(MODELS[key]);
+      expect(failedAs(counted.status), `count_tokens answered ${counted.status}`).toBe(true);
+
+      // Read once the failure is on record, so this answer comes after
+      // anything that failure was going to do.
+      const after = await scrapeMetrics(app.metricsUrl);
+      expect(
+        metricDelta(before, after, "aisix_deployment_failure_responses_total", {
+          model: MODELS[key],
+        }),
+      ).toBe(1);
+      const row = await statusOf(modelIds[key]);
+      expect(row?.status).toBe("healthy");
+      expect(row?.status_reason).toBeUndefined();
+
+      // The same model and the same status on generation does cool down, so
+      // the read above is one that could have found a cooldown.
+      const generated = await generate(MODELS[key]);
+      expect(failedAs(generated.status), `generation answered ${generated.status}`).toBe(true);
+      await waitConfigPropagation(async () => {
+        const cooled = await statusOf(modelIds[key]);
+        return cooled?.status === "cooldown" && cooled.status_reason === coolingReason;
+      });
+    });
+  }
 
   test("a truncated 200 is a decode failure and leaves the target healthy", async (ctx) => {
     if (!etcdReachable || !app) {
@@ -185,22 +268,10 @@ describe("count_tokens health and routing telemetry", () => {
     expect(response.status).toBe(502);
     expect(truncatedRequests).toBe(baseline + 1);
 
-    // A real failure on the same route, sent after it, cools its own target:
-    // once that shows, the read below is one that could have found a cooldown.
-    const control = await countTokens(MODELS.control);
+    // A real generation failure, sent after it, cools its own target: once
+    // that shows, the read below is one that could have found a cooldown.
+    const control = await generate(MODELS.control);
     expect(control.status).toBeGreaterThanOrEqual(500);
-    const statusOf = async (id: string | undefined) => {
-      const status = await fetch(`${app!.metricsUrl}/status/models`);
-      if (status.status !== 200) {
-        throw new Error(`model status probe returned ${status.status}`);
-      }
-      const rows = (await status.json()) as Array<{
-        id?: string;
-        status?: string;
-        status_reason?: string;
-      }>;
-      return rows.find((row) => row.id === id);
-    };
     await waitConfigPropagation(async () => {
       const row = await statusOf(modelIds.control);
       return row?.status === "cooldown" && row.status_reason === "upstream_server_error";

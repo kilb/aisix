@@ -25,6 +25,9 @@
 //! prevents the H-1 audit class of bug: a new dispatch path silently
 //! forgets to cool down because the routing-loop in chat.rs is where
 //! cooldown lived historically.
+//!
+//! `/v1/messages/count_tokens` deliberately stays out, in both directions:
+//! see `count_tokens::count_tokens_to_target`.
 
 use std::time::Duration;
 

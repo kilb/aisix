@@ -860,6 +860,12 @@ fn counts_anthropic_tokens(
 /// resolves against that surface's own base when the Provider Key names
 /// one and against `api_base` otherwise. The caller has already confirmed
 /// the target speaks the Anthropic protocol (`dispatch::speaks_anthropic`).
+///
+/// This route stays out of the target's cooldown state, in both directions.
+/// Token counting has its own rate limits and availability apart from
+/// generation, so a failure here says nothing about whether the model can
+/// generate and must not take it out of rotation, and a success here says
+/// nothing about whether a generation failure has passed.
 #[allow(clippy::too_many_arguments)]
 async fn count_tokens_to_target(
     state: &ProxyState,
@@ -1050,12 +1056,7 @@ async fn count_tokens_to_target(
         .await
         .map_err(|e| {
             state.health.record_failure(&model.display_name);
-            crate::cooldown::note_failure(
-                &state.runtime_status,
-                model_id,
-                model.cooldown.as_ref(),
-                crate::dispatch::reqwest_error_to_bridge(&e, send_started),
-            )
+            crate::dispatch::reqwest_error_to_bridge(&e, send_started)
         })
         .map_err(ProxyError::Bridge)?;
     aisix_gateway::note_upstream_response(upstream_resp.headers());
@@ -1066,10 +1067,6 @@ async fn count_tokens_to_target(
         let err = aisix_provider_anthropic::map_http_error(status, upstream_resp).await;
         if status.is_server_error() {
             state.health.record_failure(&model.display_name);
-        }
-        if let Some((ttl, reason)) = crate::cooldown::decide_cooldown(&err, model.cooldown.as_ref())
-        {
-            state.runtime_status.mark_cooldown(model_id, ttl, reason);
         }
         return Err(ProxyError::Bridge(err));
     }
@@ -1082,28 +1079,17 @@ async fn count_tokens_to_target(
         .await
         .map_err(|e| {
             state.health.record_failure(&model.display_name);
-            crate::cooldown::note_failure(
-                &state.runtime_status,
-                model_id,
-                model.cooldown.as_ref(),
-                aisix_gateway::upstream_body_read_error(&e),
-            )
+            aisix_gateway::upstream_body_read_error(&e)
         })
         .map_err(ProxyError::Bridge)?;
     if let Some(err) = aisix_gateway::in_band_error_body(&body_bytes)
         .as_ref()
         .and_then(aisix_provider_anthropic::wire::body_in_band_error)
     {
-        return Err(ProxyError::Bridge(crate::cooldown::note_failure(
-            &state.runtime_status,
-            model_id,
-            model.cooldown.as_ref(),
-            err,
-        )));
+        return Err(ProxyError::Bridge(err));
     }
 
     state.health.record_success(&model.display_name);
-    state.runtime_status.mark_healthy(model_id, attempt_started);
 
     let mut resp = axum::response::Response::new(axum::body::Body::from(body_bytes));
     if let Some(ct) = upstream_headers.get("content-type") {
@@ -1179,20 +1165,13 @@ async fn platform_count_tokens(
     let counted = bridge
         .anthropic_count_tokens(outbound, &ctx)
         .await
-        .map_err(|be| {
+        .inspect_err(|be| {
             if be.http_status() >= 500 {
                 state.health.record_failure(&model.display_name);
             }
-            crate::cooldown::note_failure(
-                &state.runtime_status,
-                model_id,
-                model.cooldown.as_ref(),
-                be,
-            )
         })
         .map_err(ProxyError::Bridge)?;
     state.health.record_success(&model.display_name);
-    state.runtime_status.mark_healthy(model_id, attempt_started);
     let mut resp = axum::response::IntoResponse::into_response(axum::Json(counted));
     if let Ok(hv) = HeaderValue::from_str(request_id) {
         resp.headers_mut()
@@ -2065,6 +2044,105 @@ mod tests {
         let bytes = to_bytes(resp.into_body(), 4096).await.unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["type"], "error");
+    }
+
+    /// A cooldown-enabled model and a state to read its cooldown from.
+    fn cooldown_app(upstream: &str) -> (axum::Router, crate::ProxyState) {
+        let snap = new_snap(upstream);
+        let json = format!(
+            r#"{{"display_name":"ct-cool","provider":"anthropic","model_name":"claude-haiku-4-5-20251001","provider_key_id":"{PK_ID}","retries":0,"cooldown":{{"enabled":true,"default_seconds":60}}}}"#
+        );
+        let model: Model = serde_json::from_str(&json).unwrap();
+        snap.models
+            .insert(ResourceEntry::new("m-ct-cool", model, 1));
+        snap.apikeys.insert(apikey_entry(&["ct-cool"]));
+        let state = crate::ProxyState::new(SnapshotHandle::new(snap), Arc::new(Hub::new()), &cfg())
+            .without_cache();
+        (crate::build_router(state.clone()), state)
+    }
+
+    fn cooling_count_request() -> Request<axum::body::Body> {
+        make_req(serde_json::json!({
+            "model": "ct-cool",
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+    }
+
+    /// Token counting has limits of its own, so its failures, a 429 included,
+    /// must not take the model out of rotation for generation.
+    #[tokio::test]
+    async fn a_failed_count_leaves_the_model_out_of_cooldown() {
+        for (status, body) in [
+            (
+                500,
+                r#"{"type":"error","error":{"type":"api_error","message":"boom"}}"#,
+            ),
+            (
+                429,
+                r#"{"type":"error","error":{"type":"rate_limit_error","message":"slow"}}"#,
+            ),
+            // An error reported in a 200 body takes the in-band arm.
+            (
+                200,
+                r#"{"type":"error","error":{"type":"overloaded_error","message":"busy"}}"#,
+            ),
+        ] {
+            let upstream = MockServer::builder().start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/messages/count_tokens"))
+                .respond_with(ResponseTemplate::new(status).set_body_raw(body, "application/json"))
+                .mount(&upstream)
+                .await;
+            let (app, state) = cooldown_app(&upstream.uri());
+            let resp = app.oneshot(cooling_count_request()).await.unwrap();
+            assert!(!resp.status().is_success(), "{status}: {}", resp.status());
+            assert_eq!(
+                state.runtime_status.status("m-ct-cool").status,
+                crate::RuntimeStatus::Healthy,
+                "upstream {status}"
+            );
+        }
+    }
+
+    /// A transport failure, the other arm that used to set a cooldown.
+    #[tokio::test]
+    async fn an_unreachable_count_upstream_leaves_the_model_out_of_cooldown() {
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", closed.local_addr().unwrap());
+        drop(closed);
+        let (app, state) = cooldown_app(&base);
+        let resp = app.oneshot(cooling_count_request()).await.unwrap();
+        assert!(resp.status().is_server_error(), "{}", resp.status());
+        assert_eq!(
+            state.runtime_status.status("m-ct-cool").status,
+            crate::RuntimeStatus::Healthy
+        );
+    }
+
+    /// The other direction: a counted prompt says nothing about whether the
+    /// generation failure behind a cooldown has passed.
+    #[tokio::test]
+    async fn a_successful_count_does_not_end_a_generation_cooldown() {
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages/count_tokens"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"input_tokens": 3})),
+            )
+            .mount(&upstream)
+            .await;
+        let (app, state) = cooldown_app(&upstream.uri());
+        state.runtime_status.mark_cooldown(
+            "m-ct-cool",
+            std::time::Duration::from_secs(60),
+            "upstream_server_error",
+        );
+        let resp = app.oneshot(cooling_count_request()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            state.runtime_status.status("m-ct-cool").status,
+            crate::RuntimeStatus::Cooldown
+        );
     }
 
     /// #418 happy path: the route is registered, dispatches to the
