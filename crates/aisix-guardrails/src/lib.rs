@@ -152,8 +152,11 @@ pub(crate) async fn read_body_capped(
 ///     — the same replayed reasoning written into `content` instead of the
 ///     slot, read IN ADDITION to the slot so a benign one cannot hide the
 ///     other.
+///   * every other part's strings (`aisix_gateway::chat::unnamed_part_strings`)
+///     — a `refusal` part, or a type this gateway does not model, which a
+///     bridge forwarding blocks still sends.
 ///
-/// Non-text content blocks (image/audio) are out of scope — multimodal
+/// Media content blocks (image/audio/file) are out of scope — multimodal
 /// moderation is a separate feature. Every blob-check guardrail's input
 /// collector goes through this so the families can't drift, and
 /// `redact_chat_format` masks exactly this list — the two must stay in
@@ -199,6 +202,14 @@ pub(crate) fn message_scan_text(m: &ChatMessage) -> String {
             .flat_map(aisix_gateway::chat::reasoning_part_slots)
             .filter(|slot| !slot.text.is_empty())
             .map(|slot| slot.text.to_string()),
+    );
+    parts.extend(
+        m.content_blocks
+            .iter()
+            .flatten()
+            .flat_map(aisix_gateway::chat::unnamed_part_strings)
+            .filter(|text| !text.is_empty())
+            .map(str::to_string),
     );
     parts.join("\n")
 }
@@ -1485,6 +1496,39 @@ mod tests {
         let empty: ChatMessage =
             serde_json::from_value(serde_json::json!({"role": "user", "content": ""})).unwrap();
         assert_eq!(message_scan_text(&empty), "");
+    }
+
+    /// A bridge forwards the block array whole, so a part this gateway does not
+    /// model reaches the model unread unless the scan reads it. Media stays out.
+    #[test]
+    fn message_scan_text_reads_every_part_that_is_not_media() {
+        let msg: ChatMessage = serde_json::from_value(serde_json::json!({
+            "role": "assistant",
+            "content": [
+                {"type": "refusal", "refusal": "in a refusal part"},
+                {"type": "input_text", "text": "in an unknown part"},
+                {"type": "text", "text": ["in a text part's array"]},
+                {"type": "custom", "payload": {"deep": ["in a nested leaf"]}},
+                {"type": "image_url", "image_url": {"url": "https://x/in-a-media-part"}},
+                {"type": "unknown", "image": "data:image/png;base64,in-a-data-url"},
+            ],
+        }))
+        .unwrap();
+        let scanned = message_scan_text(&msg);
+        for text in [
+            "in a refusal part",
+            "in an unknown part",
+            "in a text part's array",
+            "in a nested leaf",
+        ] {
+            assert!(scanned.contains(text), "{text}: {scanned:?}");
+        }
+        assert!(!scanned.contains("in-a-media-part"), "{scanned:?}");
+        assert!(!scanned.contains("in-a-data-url"), "{scanned:?}");
+        assert!(
+            !scanned.contains("refusal\n"),
+            "a type is no text: {scanned:?}"
+        );
     }
 
     #[test]

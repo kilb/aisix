@@ -1157,6 +1157,9 @@ fn redact_chat_format_impl(
                         apply_to_value_string(chain, dir, slot.text, &mut counts);
                     }
                 }
+                for text in aisix_gateway::chat::unnamed_part_strings_mut(block) {
+                    apply_to_value_string(chain, dir, text, &mut counts);
+                }
             }
         }
         // History-replay tool calls: arguments travel to the upstream
@@ -7604,6 +7607,35 @@ mod tests {
         assert!(!out.contains("a@x.com"), "out: {out}");
         assert!(out.contains("\r\n\r\n"), "CRLF separator changed: {out:?}");
         assert_eq!(counts.get("email"), Some(&1));
+    }
+
+    /// What the scan reads of a content part, the mask reads too: a match it
+    /// cannot rewrite would be forwarded as written.
+    #[test]
+    fn a_mask_reaches_every_part_the_scan_reads() {
+        let chain = both();
+        let mut req: ChatFormat = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [
+                {"role": "assistant", "content": [
+                    {"type": "refusal", "refusal": "mail a@x.com"},
+                ]},
+                {"role": "user", "content": [
+                    {"type": "input_text", "text": "mail b@x.com"},
+                    {"type": "text", "text": ["mail c@x.com"]},
+                    {"type": "image_url", "image_url": {"url": "https://x/d@x.com"}},
+                ]},
+            ],
+        }))
+        .unwrap();
+        let counts = redact_chat_format(chain.as_ref(), &mut req);
+        assert_eq!(counts.get("email"), Some(&3));
+        let wire = serde_json::to_string(&req.messages).unwrap();
+        for address in ["a@x.com", "b@x.com", "c@x.com"] {
+            assert!(!wire.contains(address), "{address}: {wire}");
+        }
+        assert!(wire.contains("d@x.com"), "media is opaque: {wire}");
+        assert!(wire.contains("\"type\":\"input_text\""), "{wire}");
     }
 
     fn logprobs_of(token: &str) -> Value {

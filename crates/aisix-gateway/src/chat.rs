@@ -205,6 +205,70 @@ pub fn blocks_text(blocks: &[Value]) -> String {
         .collect()
 }
 
+/// Whether a guardrail reads `part` through a slot of its own: the `text` of a
+/// `text` part, a reasoning part's slots ([`reasoning_part_slots`]), or nothing,
+/// for the media parts [`crate::content_part`] names, which are opaque bytes.
+fn part_has_named_slots(part: &Value) -> bool {
+    match part.get("type").and_then(Value::as_str) {
+        Some("text") => part.get("text").is_none_or(Value::is_string),
+        Some("image_url" | "input_audio" | "file") => true,
+        _ => is_reasoning_part(part),
+    }
+}
+
+/// Every string of a content part no named slot covers, and a bridge that
+/// forwards blocks verbatim still forwards: a `refusal` part, a part type this
+/// gateway does not model, a `text` part whose `text` is not a string. The part's
+/// `type` names the part rather than saying anything, and a `data:` URL is media.
+pub fn unnamed_part_strings_mut(part: &mut Value) -> Vec<&mut Value> {
+    fn walk<'a>(value: &'a mut Value, out: &mut Vec<&'a mut Value>) {
+        match value {
+            Value::String(text) if !text.starts_with("data:") => out.push(value),
+            Value::Array(items) => items.iter_mut().for_each(|item| walk(item, out)),
+            Value::Object(map) => map.values_mut().for_each(|item| walk(item, out)),
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    if part_has_named_slots(part) {
+        return out;
+    }
+    let Value::Object(map) = part else {
+        return out;
+    };
+    for (key, value) in map.iter_mut() {
+        if key != "type" {
+            walk(value, &mut out);
+        }
+    }
+    out
+}
+
+/// [`unnamed_part_strings_mut`], to read.
+pub fn unnamed_part_strings(part: &Value) -> Vec<&str> {
+    fn walk<'a>(value: &'a Value, out: &mut Vec<&'a str>) {
+        match value {
+            Value::String(text) if !text.starts_with("data:") => out.push(text),
+            Value::Array(items) => items.iter().for_each(|item| walk(item, out)),
+            Value::Object(map) => map.values().for_each(|item| walk(item, out)),
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    if part_has_named_slots(part) {
+        return out;
+    }
+    let Value::Object(map) = part else {
+        return out;
+    };
+    for (key, value) in map {
+        if key != "type" {
+            walk(value, &mut out);
+        }
+    }
+    out
+}
+
 /// One text slot of a reasoning content part, and whether a non-empty
 /// `signature` covers it. A signed slot must reach the upstream
 /// byte-identical, so it may be judged but never rewritten.
