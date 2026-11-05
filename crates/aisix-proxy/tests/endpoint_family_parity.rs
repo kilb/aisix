@@ -367,6 +367,11 @@ fn the_handler_list_matches_what_is_on_disk() {
             "resolves a name only to choose a metric label for a request that \
              already ended; it dispatches nothing and answers nothing.",
         ),
+        (
+            "usage_attr.rs",
+            "resolves a name only to find the rules a failure row's body answers \
+             to, ahead of the chain; it dispatches nothing and answers nothing.",
+        ),
     ];
 
     let mut unlisted: Vec<String> = Vec::new();
