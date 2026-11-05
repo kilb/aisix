@@ -36,6 +36,14 @@ use serde_json::Value;
 /// `UsageEvent::redacted_entity_counts`.
 pub type RedactionCounts = BTreeMap<String, u32>;
 
+/// How many spans `counts` says were masked: compared before and after a
+/// walk of one choice, it says whether that walk rewrote anything. A choice
+/// that was rewritten loses its `logprobs`, whose tokens are the answer's text
+/// in the clear and which no mask can rewrite and leave meaningful.
+fn masked_spans(counts: &RedactionCounts) -> u64 {
+    counts.values().map(|n| u64::from(*n)).sum()
+}
+
 /// Merge `from` into `into` (repeated small helper; counts are tiny maps).
 pub fn merge_counts(into: &mut RedactionCounts, from: RedactionCounts) {
     for (k, v) in from {
@@ -2374,7 +2382,14 @@ fn redact_responses_tree(
                 .and_then(Value::as_str)
                 .map(ToOwned::to_owned);
             let mut unrewritable = false;
-            for (field, child) in map {
+            // An `output_text` part's token list repeats its text one token at
+            // a time, where a mask of each token misses a span split across
+            // them. The part loses the list when its text was rewritten.
+            let text_before = map
+                .contains_key("logprobs")
+                .then(|| map.get("text").cloned())
+                .flatten();
+            for (field, child) in map.iter_mut() {
                 if responses_field_is_opaque(item_type, field, parent_type) {
                     continue;
                 }
@@ -2420,6 +2435,9 @@ fn redact_responses_tree(
                     item_type,
                     object_type.as_deref().or(parent_type),
                 );
+            }
+            if text_before.is_some_and(|before| map.get("text") != Some(&before)) {
+                map.remove("logprobs");
             }
             unrewritable
         }
@@ -2974,8 +2992,14 @@ pub fn redact_completions_response(chain: &dyn Guardrail, body: &mut Value) -> R
     }
     if let Some(Value::Array(choices)) = body.get_mut("choices") {
         for choice in choices {
+            let before = masked_spans(&counts);
             if let Some(text) = choice.get_mut("text") {
                 apply_to_value_string(chain, Direction::Output, text, &mut counts);
+            }
+            if masked_spans(&counts) != before {
+                if let Some(choice) = choice.as_object_mut() {
+                    choice.remove("logprobs");
+                }
             }
         }
     }
@@ -3001,7 +3025,8 @@ fn redact_chat_response_impl(
         };
     }
     let mut unrewritable_tool_key = false;
-    for message in resp.messages_mut() {
+    for (message, logprobs) in resp.choices_mut() {
+        let before = masked_spans(&counts);
         if let Some(content) = message.content.as_mut() {
             apply_to_string(chain, Direction::Output, content, &mut counts);
         } else if let Some(parts) = message.content_blocks.as_mut() {
@@ -3049,6 +3074,9 @@ fn redact_chat_response_impl(
                 &mut counts,
                 detect_keys,
             );
+        }
+        if masked_spans(&counts) != before {
+            *logprobs = None;
         }
     }
     AnthropicRequestRedaction {
@@ -3104,7 +3132,8 @@ pub async fn moderate_chat_response_structured(
 /// channel's first carrying chunk; later chunks in that channel become
 /// empty deltas. The stream is already released en bloc at this point, so
 /// chunk-size distribution is not client-observable. Non-content fields
-/// (ids, usage, finish_reason, reasoning) are untouched.
+/// (ids, usage, finish_reason, reasoning) are untouched, except that a choice
+/// with anything rewritten loses its `logprobs` (see [`masked_spans`]).
 fn redact_chat_chunks_impl(
     chain: &dyn Guardrail,
     chunks: &mut [ChatChunk],
@@ -3118,6 +3147,7 @@ fn redact_chat_chunks_impl(
         };
     }
     let mut unrewritable_tool_key = false;
+    let mut rewritten_choices: std::collections::BTreeSet<u32> = Default::default();
 
     // Content channels: each choice streams one assistant message.
     let mut content_channels: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
@@ -3126,12 +3156,13 @@ fn redact_chat_chunks_impl(
             content_channels.entry(c.choice_index).or_default().push(i);
         }
     }
-    for content_sites in content_channels.values() {
+    for (&choice, content_sites) in &content_channels {
         let joined: String = content_sites
             .iter()
             .map(|&i| chunks[i].delta.content.as_deref().unwrap_or(""))
             .collect();
         if let Some(r) = chain.redact_output_text(&joined) {
+            rewritten_choices.insert(choice);
             let mut first = true;
             for &i in content_sites {
                 chunks[i].delta.content = Some(if first {
@@ -3157,12 +3188,13 @@ fn redact_chat_chunks_impl(
             refusal_channels.entry(c.choice_index).or_default().push(i);
         }
     }
-    for refusal_sites in refusal_channels.values() {
+    for (&choice, refusal_sites) in &refusal_channels {
         let joined: String = refusal_sites
             .iter()
             .filter_map(|&i| chunks[i].delta.extra.get("refusal").and_then(Value::as_str))
             .collect();
         if let Some(r) = chain.redact_output_text(&joined) {
+            rewritten_choices.insert(choice);
             let mut first = true;
             for &i in refusal_sites {
                 let text = if first {
@@ -3200,6 +3232,7 @@ fn redact_chat_chunks_impl(
                 }
                 if let Some(arguments) = function.get_mut("arguments") {
                     if !arguments.is_string() {
+                        let before = masked_spans(&counts);
                         unrewritable_tool_key |= redact_tool_arguments_value(
                             chain,
                             Direction::Output,
@@ -3207,6 +3240,9 @@ fn redact_chat_chunks_impl(
                             &mut counts,
                             detect_keys,
                         );
+                        if masked_spans(&counts) != before {
+                            rewritten_choices.insert(chunk.choice_index);
+                        }
                     }
                 }
             }
@@ -3228,6 +3264,7 @@ fn redact_chat_chunks_impl(
             }
             if let Some(arguments) = function_call.get_mut("arguments") {
                 if !arguments.is_string() {
+                    let before = masked_spans(&counts);
                     unrewritable_tool_key |= redact_tool_arguments_value(
                         chain,
                         Direction::Output,
@@ -3235,6 +3272,9 @@ fn redact_chat_chunks_impl(
                         &mut counts,
                         detect_keys,
                     );
+                    if masked_spans(&counts) != before {
+                        rewritten_choices.insert(chunk.choice_index);
+                    }
                 }
             }
         }
@@ -3370,7 +3410,7 @@ fn redact_chat_chunks_impl(
             &mut counts,
         );
     }
-    for sites in channels.values() {
+    for (&(choice, _), sites) in &channels {
         let joined: String = sites
             .iter()
             .filter_map(|&(ci, ti)| {
@@ -3389,6 +3429,7 @@ fn redact_chat_chunks_impl(
             detect_keys,
         );
         if rewritten != joined {
+            rewritten_choices.insert(choice);
             let mut first = true;
             for &(ci, ti) in sites {
                 if let Some(args) = arguments_slot(&mut chunks[ci], ti) {
@@ -3402,6 +3443,12 @@ fn redact_chat_chunks_impl(
             }
         }
         merge_counts(&mut counts, local);
+    }
+
+    for chunk in chunks.iter_mut() {
+        if rewritten_choices.contains(&chunk.choice_index) {
+            chunk.logprobs = None;
+        }
     }
 
     AnthropicRequestRedaction {
@@ -3956,7 +4003,8 @@ pub fn redact_completions_sse(
     }
 
     let mut counts = RedactionCounts::new();
-    for sites in channels.values() {
+    let mut rewritten_choices: Vec<u64> = Vec::new();
+    for (&index, sites) in &channels {
         let joined: String = sites
             .iter()
             .map(|&(frame_index, choice_index)| {
@@ -3974,6 +4022,7 @@ pub fn redact_completions_sse(
         let Some(redaction) = chain.redact_output_text(&joined) else {
             continue;
         };
+        rewritten_choices.push(index);
         let mut first = true;
         for &(frame_index, choice_index) in sites {
             let text = frames[frame_index]
@@ -3996,6 +4045,21 @@ pub fn redact_completions_sse(
     }
     if counts.is_empty() {
         return None;
+    }
+    // Every frame of a rewritten choice, not only the ones that carried text.
+    for frame in &mut frames {
+        let Some(Value::Array(choices)) = frame.data.as_mut().and_then(|d| d.get_mut("choices"))
+        else {
+            continue;
+        };
+        for choice in choices {
+            let index = choice.get("index").and_then(Value::as_u64).unwrap_or(0);
+            if rewritten_choices.contains(&index) {
+                if let Some(choice) = choice.as_object_mut() {
+                    frame.dirty |= choice.remove("logprobs").is_some();
+                }
+            }
+        }
     }
 
     let mut out = Vec::with_capacity(raw.len());
@@ -4456,6 +4520,9 @@ fn redact_responses_sse_impl(
                 });
                 frame.dirty = true;
             }
+            if let Some(data) = frame.data.as_mut().and_then(Value::as_object_mut) {
+                data.remove("logprobs");
+            }
         }
     };
     for sites in text_channels.values() {
@@ -4546,6 +4613,11 @@ fn redact_responses_sse_impl(
                             apply_to_value_string(chain, aggregate, text, &mut local);
                         }
                     }
+                    if !local.is_empty() {
+                        if let Some(part) = part.as_object_mut() {
+                            part.remove("logprobs");
+                        }
+                    }
                 }
             }
             "response.function_call_arguments.done" | "response.mcp_call_arguments.done" => {
@@ -4596,6 +4668,11 @@ fn redact_responses_sse_impl(
         }
         if !local.is_empty() {
             frame.dirty = true;
+            // `response.output_text.done` carries the part's token list beside
+            // its text.
+            if let Some(data) = data.as_object_mut() {
+                data.remove("logprobs");
+            }
             if counts.is_empty() {
                 merge_counts(&mut counts, local);
             }
@@ -7361,6 +7438,147 @@ mod tests {
         assert!(!out.contains("a@x.com"), "out: {out}");
         assert!(out.contains("\r\n\r\n"), "CRLF separator changed: {out:?}");
         assert_eq!(counts.get("email"), Some(&1));
+    }
+
+    fn logprobs_of(token: &str) -> Value {
+        json!({"content": [{"token": token, "logprob": -0.1, "bytes": null, "top_logprobs": []}]})
+    }
+
+    /// A choice's tokens are its text in the clear, and a mask cannot rewrite
+    /// them. A choice nothing was masked in keeps them: the caller asked.
+    #[test]
+    fn a_masked_chat_choice_loses_its_logprobs_and_only_that_choice() {
+        let chain = both();
+        let mut resp: ChatResponse = serde_json::from_value(json!({
+            "id": "c", "model": "m", "finish_reason": "stop",
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            "message": {"role": "assistant", "content": "mail a@x.com"},
+            "logprobs": logprobs_of("a@x.com"),
+            "more_choices": [
+                {"index": 1, "finish_reason": "stop", "logprobs": logprobs_of("clean"),
+                 "message": {"role": "assistant", "content": "clean"}},
+                {"index": 2, "finish_reason": "stop", "logprobs": logprobs_of("b@x.com"),
+                 "message": {"role": "assistant", "content": "mail b@x.com"}},
+            ],
+        }))
+        .unwrap();
+        redact_chat_response(chain.as_ref(), &mut resp);
+        assert_eq!(
+            resp.message.content.as_deref(),
+            Some("mail [EMAIL_REDACTED]")
+        );
+        assert_eq!(resp.logprobs, None);
+        assert_eq!(resp.more_choices[0].logprobs, Some(logprobs_of("clean")));
+        assert_eq!(resp.more_choices[1].logprobs, None);
+    }
+
+    /// A segment moderator rewrites through the apply walk, whose rewrite is the
+    /// same "something changed" as a local one.
+    #[tokio::test]
+    async fn a_segment_mask_drops_the_choice_logprobs_too() {
+        let chain = seg_chain(StubSegments::masker());
+        let mut resp: ChatResponse = serde_json::from_value(json!({
+            "id": "c", "model": "m", "finish_reason": "stop",
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            "message": {"role": "assistant", "content": "secret"},
+            "logprobs": logprobs_of("secret"),
+        }))
+        .unwrap();
+        let moderation = moderate_chat_response_structured(
+            &chain,
+            GuardrailVerdict::Allow,
+            &mut resp,
+            &mut RedactionCounts::new(),
+            &mut Vec::new(),
+        )
+        .await;
+        assert!(!moderation.verdict.is_block(), "{:?}", moderation.verdict);
+        assert_eq!(resp.message.content.as_deref(), Some("<M0:SECRET>"));
+        assert_eq!(resp.logprobs, None);
+    }
+
+    #[test]
+    fn a_masked_stream_choice_loses_its_logprobs_on_every_frame() {
+        let chain = both();
+        let chunk = |choice: u32, text: &str, token: Option<&str>| -> ChatChunk {
+            serde_json::from_value(json!({
+                "id": "c",
+                "model": "m",
+                "choice_index": choice,
+                "delta": {"content": text},
+                "logprobs": token.map(logprobs_of),
+            }))
+            .unwrap()
+        };
+        let mut chunks = vec![
+            chunk(0, "mail a@", Some("a@")),
+            chunk(1, "clean", Some("clean")),
+            chunk(0, "x.com", Some("x.com")),
+        ];
+        redact_chat_chunks(chain.as_ref(), &mut chunks);
+        assert_eq!(
+            chunks[0].delta.content.as_deref(),
+            Some("mail [EMAIL_REDACTED]")
+        );
+        assert_eq!(chunks[0].logprobs, None);
+        assert_eq!(chunks[2].logprobs, None);
+        assert_eq!(chunks[1].logprobs, Some(logprobs_of("clean")));
+    }
+
+    #[test]
+    fn a_masked_completion_choice_loses_its_logprobs() {
+        let chain = both();
+        let mut body = json!({"choices": [
+            {"index": 0, "text": "mail a@x.com", "logprobs": {"tokens": ["a@x.com"]}},
+            {"index": 1, "text": "clean", "logprobs": {"tokens": ["clean"]}},
+        ]});
+        redact_completions_response(chain.as_ref(), &mut body);
+        assert_eq!(body["choices"][0]["text"], "mail [EMAIL_REDACTED]");
+        assert!(body["choices"][0].get("logprobs").is_none(), "{body}");
+        assert_eq!(body["choices"][1]["logprobs"]["tokens"][0], "clean");
+
+        let raw = concat!(
+            "data: {\"choices\":[{\"index\":0,\"text\":\"mail a@\",\"logprobs\":{\"tokens\":[\"a@\"]}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"text\":\"x.com\",\"logprobs\":{\"tokens\":[\"x.com\"]}}]}\n\n",
+            "data: {\"choices\":[{\"index\":1,\"text\":\"clean\",\"logprobs\":{\"tokens\":[\"clean\"]}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"text\":\"\",\"logprobs\":{\"tokens\":[\"x.com\"]}}]}\n\n",
+        );
+        let (out, _) = redact_completions_sse(chain.as_ref(), raw.as_bytes()).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(!out.contains("a@"), "{out}");
+        assert!(!out.contains("x.com"), "{out}");
+        assert!(out.contains("\"tokens\":[\"clean\"]"), "{out}");
+    }
+
+    /// One token per string, so a span split across tokens is in no single one
+    /// of them: the rewrite of the part's text is what says the list must go.
+    #[test]
+    fn a_masked_responses_part_loses_its_logprobs() {
+        let chain = both();
+        let split = json!([{"token": "a@", "bytes": [97, 64]}, {"token": "x.com", "bytes": [120]}]);
+        let mut body = json!({"output": [{"type": "message", "role": "assistant", "content": [
+            {"type": "output_text", "text": "a@x.com", "logprobs": split},
+            {"type": "output_text", "text": "clean", "logprobs": [{"token": "clean"}]},
+        ]}]});
+        redact_responses_response(chain.as_ref(), &mut body);
+        let parts = &body["output"][0]["content"];
+        assert_eq!(parts[0]["text"], "[EMAIL_REDACTED]");
+        assert!(parts[0].get("logprobs").is_none(), "{body}");
+        assert_eq!(parts[1]["logprobs"][0]["token"], "clean");
+
+        let raw = concat!(
+            "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"m\",\"content_index\":0,\"delta\":\"a@\",\"logprobs\":[{\"token\":\"a@\"}]}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"m\",\"content_index\":0,\"delta\":\"x.com\",\"logprobs\":[{\"token\":\"x.com\"}]}\n\n",
+            "data: {\"type\":\"response.output_text.done\",\"item_id\":\"m\",\"content_index\":0,\"text\":\"a@x.com\",\"logprobs\":[{\"token\":\"a@\"},{\"token\":\"x.com\"}]}\n\n",
+            "data: {\"type\":\"response.content_part.done\",\"item_id\":\"m\",\"content_index\":0,\"part\":{\"type\":\"output_text\",\"text\":\"a@x.com\",\"logprobs\":[{\"token\":\"a@\"}]}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"a@x.com\",\"logprobs\":[{\"token\":\"a@\"}]}]}]}}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"n\",\"content_index\":0,\"delta\":\"clean\",\"logprobs\":[{\"token\":\"clean\"}]}\n\n",
+        );
+        let (out, _) = redact_responses_sse(chain.as_ref(), raw.as_bytes()).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(!out.contains("a@"), "{out}");
+        assert!(!out.contains("x.com"), "{out}");
+        assert!(out.contains("\"token\":\"clean\""), "{out}");
     }
 
     #[test]

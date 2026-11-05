@@ -1435,6 +1435,15 @@ impl ChatResponse {
             .chain(self.more_choices.iter_mut().map(|c| &mut c.message))
     }
 
+    /// [`Self::messages_mut`], each message beside its choice's `logprobs`.
+    pub fn choices_mut(&mut self) -> impl Iterator<Item = (&mut ChatMessage, &mut Option<Value>)> {
+        std::iter::once((&mut self.message, &mut self.logprobs)).chain(
+            self.more_choices
+                .iter_mut()
+                .map(|c| (&mut c.message, &mut c.logprobs)),
+        )
+    }
+
     /// Take `fallback` as the tier when the body reported none.
     pub fn with_fallback_service_tier(mut self, fallback: Option<ServiceTier>) -> Self {
         if self.service_tier.is_none() {
