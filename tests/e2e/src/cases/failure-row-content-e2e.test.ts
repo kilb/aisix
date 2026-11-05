@@ -258,6 +258,62 @@ describe("failure rows carry request and response bodies", () => {
       disconnectAfterEvents: 1,
       eventDelayMs: 100,
     });
+    // The same cut on every other streaming family, native and bridged.
+    const cutModel = async (
+      name: string,
+      provider: "openai" | "anthropic",
+      streamEvents: string[],
+      providerKey: Record<string, unknown> = {},
+    ): Promise<void> => {
+      const upstream = await startOpenAiUpstream({
+        streamEvents,
+        disconnectAfterEvents: streamEvents.length - 1,
+        eventDelayMs: 100,
+      });
+      upstreams.push(upstream);
+      const pk = await seed.createProviderKey({
+        display_name: `${name}-pk`,
+        secret: "sk-mock",
+        api_base: provider === "anthropic" ? upstream.baseUrl : `${upstream.baseUrl}/v1`,
+        ...providerKey,
+      });
+      await seed.createModel({
+        display_name: name,
+        provider,
+        model_name: provider === "anthropic" ? "claude-3-5-haiku-20241022" : "gpt-4o-mini",
+        provider_key_id: pk.id,
+        cooldown: { enabled: false },
+      });
+    };
+    await cutModel("row-stream-cut-messages", "anthropic", [
+      JSON.stringify({
+        type: "message_start",
+        message: {
+          id: "msg_cut",
+          role: "assistant",
+          content: [],
+          model: "claude-3-5-haiku-20241022",
+          stop_reason: null,
+          usage: { input_tokens: 5, output_tokens: 1 },
+        },
+      }),
+      JSON.stringify({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }),
+      JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "partial-answer" } }),
+      JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: " more" } }),
+    ]);
+    await cutModel("row-stream-cut-responses", "openai", [
+      JSON.stringify({ type: "response.created", response: { id: "resp_cut", status: "in_progress" } }),
+      JSON.stringify({ type: "response.output_text.delta", delta: "partial-answer" }),
+      JSON.stringify({ type: "response.output_text.delta", delta: " more" }),
+    ]);
+    // `apis: {}`: no `/v1/responses` on this endpoint, so the route reaches it
+    // through the chat bridge.
+    await cutModel(
+      "row-stream-cut-responses-bridge",
+      "openai",
+      [delta("partial-answer"), delta(" more")],
+      { apis: {} },
+    );
     await failingModel("row-in-band", {
       streamEvents: [JSON.stringify({ error: { message: "sentinel-in-band", code: 500 } })],
     });
@@ -432,6 +488,9 @@ describe("failure rows carry request and response bodies", () => {
         "row-html",
         "row-truncated",
         "row-stream-cut",
+        "row-stream-cut-messages",
+        "row-stream-cut-responses",
+        "row-stream-cut-responses-bridge",
         "row-in-band",
       ],
     });
@@ -1084,6 +1143,26 @@ describe("failure rows carry request and response bodies", () => {
         stream: true,
         messages: [{ role: "user", content: "stream-cut-prompt" }],
       }),
+    });
+    await res.text().catch(() => "");
+    const row = await rowOf(res.headers.get("x-aisix-request-id")!, "the cut stream row");
+    expect(Number(row.get("status_code"))).toBeGreaterThanOrEqual(400);
+    expect(requestText(row)).toContain("stream-cut-prompt");
+    expect(row.get("output_messages") ?? row.get("response")).toContain("partial-answer");
+  });
+
+  const CUT_MESSAGES = { max_tokens: 16, messages: [{ role: "user", content: "stream-cut-prompt" }] };
+  test.each([
+    ["/v1/messages, bridged", "/v1/messages", "row-stream-cut", CUT_MESSAGES],
+    ["/v1/messages, native", "/v1/messages", "row-stream-cut-messages", CUT_MESSAGES],
+    ["/v1/responses, native", "/v1/responses", "row-stream-cut-responses", { input: "stream-cut-prompt" }],
+    ["/v1/responses, bridged", "/v1/responses", "row-stream-cut-responses-bridge", { input: "stream-cut-prompt" }],
+  ] as const)("%s: a stream cut off mid-way keeps the request and what had arrived", async (_, path, model, body) => {
+    if (!etcdReachable) return;
+    const res = await fetch(`${app!.proxyUrl}${path}`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ model, stream: true, ...body }),
     });
     await res.text().catch(() => "");
     const row = await rowOf(res.headers.get("x-aisix-request-id")!, "the cut stream row");

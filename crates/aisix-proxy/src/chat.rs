@@ -6936,8 +6936,13 @@ where
                     let etype = err.error_type();
                     let message = err.stream_frame_message();
                     let comp = guard.comp();
-                    comp.response_capture_safe = false;
-                    comp.response_text.clear();
+                    // Output-guarded text stays unexportable: its scan will
+                    // never run. With no output guardrail nothing was owed,
+                    // and the failure row reports what the caller got.
+                    if output_guardrail.is_some() {
+                        comp.response_capture_safe = false;
+                        comp.response_text.clear();
+                    }
                     comp.terminal_failure = Some(err);
                     yield Ok::<_, Infallible>(
                         Event::default()
@@ -8790,6 +8795,73 @@ mod fail_open_capture_tests {
             })
         ));
         assert!(!completion.reached_end);
+    }
+
+    /// One partial chunk, then a timeout, relayed with a content-capturing
+    /// exporter: the completion the stream ends with.
+    async fn cut_off_stream(guardrail: Option<StreamGuardrailContext>) -> StreamCompletion {
+        let upstream = futures::stream::iter(vec![
+            Ok(ChatChunk {
+                id: "chunk-1".into(),
+                model: "upstream-model".into(),
+                delta: ChatDelta {
+                    content: Some("partial".into()),
+                    ..ChatDelta::default()
+                },
+                finish_reason: None,
+                usage: None,
+                choice_index: 0,
+                logprobs: None,
+                service_tier: None,
+                accounting_usage: None,
+            }),
+            Err(aisix_gateway::BridgeError::Timeout {
+                elapsed_ms: 300,
+                cause: String::new(),
+            }),
+        ])
+        .boxed();
+        let captured = Arc::new(Mutex::new(None::<StreamCompletion>));
+        let captured_for_callback = Arc::clone(&captured);
+        let stream = build_sse_stream(
+            upstream,
+            1,
+            guardrail,
+            Instant::now(),
+            Instant::now(),
+            "gateway-model".into(),
+            Some(1_024),
+            false,
+            aisix_gateway::chat::UsageStats::default(),
+            None,
+            move |completion| {
+                *captured_for_callback.lock().unwrap() = Some(completion);
+            },
+        );
+        let _: Vec<_> = stream.collect().await;
+        let completion = captured.lock().unwrap().take();
+        completion.expect("on_complete fired")
+    }
+
+    /// With no output guardrail no scan is owed: a stream that failed still
+    /// exports what the caller received, which is what its failure row reports.
+    #[tokio::test]
+    async fn an_unguarded_stream_that_fails_keeps_what_the_caller_received() {
+        let completion = cut_off_stream(None).await;
+        assert!(completion.response_capture_safe);
+        assert_eq!(completion.response_text, "partial");
+    }
+
+    /// Held text the failure stopped short of scanning is never exported.
+    #[tokio::test]
+    async fn a_guarded_stream_that_fails_exports_nothing_unscanned() {
+        let completion = cut_off_stream(Some(StreamGuardrailContext {
+            chain: Arc::new(BlocksOnSecret),
+            model_name: "gateway-model".into(),
+        }))
+        .await;
+        assert!(!completion.response_capture_safe);
+        assert!(completion.response_text.is_empty());
     }
 }
 

@@ -3653,8 +3653,10 @@ fn build_anthropic_sse_stream(
                             let aborted = aisix_gateway::BridgeError::StreamAborted;
                             let comp = guard.comp();
                             crate::attempt::StreamFailure::record(&mut comp.failure, &aborted);
-                            comp.response_capture_safe = false;
-                            comp.response_text.clear();
+                            if output_guardrail.is_some() {
+                                comp.response_capture_safe = false;
+                                comp.response_text.clear();
+                            }
                             comp.terminal_failure = Some(aborted);
                             yield Ok(bytes::Bytes::from_static(
                                 b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"stream_aborted\",\"message\":\"upstream tool stream exceeded translation limit\"}}\n\n",
@@ -3746,8 +3748,13 @@ fn build_anthropic_sse_stream(
                         serde_json::to_string(&e.stream_frame_message()).unwrap_or_else(|_| "\"error\"".into()),
                     );
                     let comp = guard.comp();
-                    comp.response_capture_safe = false;
-                    comp.response_text.clear();
+                    // Output-guarded text stays unexportable: its scan will
+                    // never run. With no output guardrail nothing was owed,
+                    // and the failure row reports what the caller got.
+                    if output_guardrail.is_some() {
+                        comp.response_capture_safe = false;
+                        comp.response_text.clear();
+                    }
                     comp.terminal_failure = Some(e);
                     yield Ok(bytes::Bytes::from(frame));
                     return;
@@ -5347,8 +5354,13 @@ where
                     let usage = guard.usage();
                     crate::attempt::StreamFailure::record(&mut usage.failure, &bridge);
                     usage.stream_failure = Some(error.failure());
-                    usage.response_capture_safe = false;
-                    usage.response_text.clear();
+                    // Output-guarded text stays unexportable: its scan will
+                    // never run. With no output guardrail nothing was owed,
+                    // and the failure row reports what the caller got.
+                    if output_guardrail.is_some() {
+                        usage.response_capture_safe = false;
+                        usage.response_text.clear();
+                    }
                     yield Err(error);
                     return;
                 }
@@ -5812,9 +5824,11 @@ where
                 model = %model_label,
                 "upstream /v1/messages stream contained malformed SSE data",
             );
-            let usage = guard.usage();
-            usage.response_capture_safe = false;
-            usage.response_text.clear();
+            if output_guardrail.is_some() {
+                let usage = guard.usage();
+                usage.response_capture_safe = false;
+                usage.response_text.clear();
+            }
             yield Ok(Bytes::from(upstream_stream_error_frame()));
             return;
         }
@@ -8225,6 +8239,108 @@ event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_toke
         ));
         assert!(!usage.response_capture_safe);
         assert!(usage.response_text.is_empty());
+    }
+
+    /// With no output guardrail no scan is owed: a relayed stream that failed
+    /// still exports what the caller received, which is what its failure row
+    /// reports. The held counterpart is the test above.
+    #[tokio::test]
+    async fn an_unguarded_native_stream_that_fails_keeps_what_the_caller_received() {
+        use futures::StreamExt;
+        use std::sync::{Arc, Mutex};
+
+        let delivered = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_cut\",\"model\":\"claude\",\"usage\":{\"input_tokens\":30,\"output_tokens\":1}}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n",
+        );
+        let upstream = futures::stream::iter([
+            Ok::<_, crate::stream_timeout::RawStreamError>(bytes::Bytes::from_static(
+                delivered.as_bytes(),
+            )),
+            Err(crate::stream_timeout::RawStreamError::Timeout { elapsed_ms: 300 }),
+        ]);
+        let captured = Arc::new(Mutex::new(None));
+        let captured_out = Arc::clone(&captured);
+        let now = std::time::Instant::now();
+        let stream = super::build_anthropic_passthrough_stream(
+            upstream,
+            now,
+            now,
+            None,
+            "relay-claude".into(),
+            Some(4096),
+            None,
+            move |usage| *captured_out.lock().unwrap() = Some(usage),
+        );
+        let _: Vec<_> = stream.collect().await;
+
+        let usage = captured.lock().unwrap().take().expect("on_complete fired");
+        assert!(usage.stream_failure.is_some());
+        assert!(usage.response_capture_safe);
+        assert!(usage.response_text.contains("partial"));
+    }
+
+    /// The same two rules on the cross-provider relay.
+    #[tokio::test]
+    async fn a_failed_bridged_stream_exports_only_what_needed_no_scan() {
+        use aisix_core::models::GuardrailHookPoint;
+        use aisix_gateway::{BridgeError, ChatChunk, ChatChunkStream, ChatDelta};
+        use aisix_guardrails::{builtin_rule, Guardrail, GuardrailChain, PiiAction, PiiGuardrail};
+        use std::sync::{Arc, Mutex};
+
+        let pii = PiiGuardrail::new(
+            vec![builtin_rule("email", PiiAction::Mask).unwrap()],
+            GuardrailHookPoint::Output,
+            262_144,
+            false,
+        );
+        let chain = Arc::new(GuardrailChain::new(vec![
+            Arc::new(pii) as Arc<dyn Guardrail>
+        ]));
+        for (guardrail, expect_exported) in [(None, true), (Some(chain), false)] {
+            let upstream: ChatChunkStream = Box::pin(futures::stream::iter(vec![
+                Ok(ChatChunk {
+                    id: "chunk-1".into(),
+                    model: "upstream-model".into(),
+                    delta: ChatDelta {
+                        content: Some("partial".into()),
+                        ..ChatDelta::default()
+                    },
+                    finish_reason: None,
+                    choice_index: 0,
+                    logprobs: None,
+                    usage: None,
+                    service_tier: None,
+                    accounting_usage: None,
+                }),
+                Err(BridgeError::Timeout {
+                    elapsed_ms: 300,
+                    cause: String::new(),
+                }),
+            ]));
+            let captured = Arc::new(Mutex::new(None));
+            let captured_out = Arc::clone(&captured);
+            let now = std::time::Instant::now();
+            let body = super::build_anthropic_sse_stream(
+                upstream,
+                aisix_provider_anthropic::AnthropicSseEncoder::new("msg_cut", "relay-openai", 0),
+                now,
+                now,
+                guardrail,
+                "relay-openai".into(),
+                Some(4096),
+                None,
+                move |completion| *captured_out.lock().unwrap() = Some(completion),
+            );
+            let _ = to_bytes(body, usize::MAX).await;
+
+            let completion = captured.lock().unwrap().take().expect("on_complete fired");
+            assert_eq!(completion.response_capture_safe, expect_exported);
+            assert_eq!(completion.response_text == "partial", expect_exported);
+            assert_eq!(completion.response_text.is_empty(), !expect_exported);
+        }
     }
 
     #[tokio::test]

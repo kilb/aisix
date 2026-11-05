@@ -2662,8 +2662,10 @@ pub fn build_responses_bridge_stream(
                     if encoder.overflowed() {
                         let aborted = aisix_gateway::BridgeError::StreamAborted;
                         let comp = guard.comp();
-                        comp.response_capture_safe = false;
-                        comp.response_text.clear();
+                        if output_guardrail.is_some() {
+                            comp.response_capture_safe = false;
+                            comp.response_text.clear();
+                        }
                         crate::attempt::StreamFailure::record(&mut comp.failure, &aborted);
                         comp.terminal_failure = Some(aborted);
                         yield Ok(failure_frames(
@@ -2737,8 +2739,13 @@ pub fn build_responses_bridge_stream(
                         &message,
                     );
                     let comp = guard.comp();
-                    comp.response_capture_safe = false;
-                    comp.response_text.clear();
+                    // Output-guarded text stays unexportable: its scan will
+                    // never run. With no output guardrail nothing was owed,
+                    // and the failure row reports what the caller got.
+                    if output_guardrail.is_some() {
+                        comp.response_capture_safe = false;
+                        comp.response_text.clear();
+                    }
                     crate::attempt::StreamFailure::record(&mut comp.failure, &e);
                     comp.terminal_failure = Some(e);
                     // The loop stops at the terminal event, so none went out.
@@ -5695,6 +5702,78 @@ mod tests {
 
     fn event_names(events: &[(String, Value)]) -> Vec<&str> {
         events.iter().map(|(e, _)| e.as_str()).collect()
+    }
+
+    /// One partial chunk, then a timeout, with a content-capturing exporter
+    /// and the given output guardrail: the completion the stream ends with.
+    async fn cut_off_relay(
+        output_guardrail: Option<Arc<aisix_guardrails::GuardrailChain>>,
+    ) -> ResponsesStreamCompletion {
+        let partial = ChatChunk {
+            choice_index: 0,
+            logprobs: None,
+            id: "c".into(),
+            model: "m".into(),
+            delta: ChatDelta {
+                content: Some("partial".into()),
+                ..ChatDelta::default()
+            },
+            finish_reason: None,
+            usage: None,
+            service_tier: None,
+            accounting_usage: None,
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let hold_back = output_guardrail.is_some();
+        let body = build_responses_bridge_stream(
+            Box::pin(futures::stream::iter(vec![
+                Ok(partial),
+                Err(aisix_gateway::BridgeError::Timeout {
+                    elapsed_ms: 300,
+                    cause: String::new(),
+                }),
+            ])),
+            ResponsesSseEncoder::new("resp_1", "m", 0, no_custom_tools()),
+            Instant::now(),
+            Instant::now(),
+            output_guardrail,
+            hold_back,
+            usize::MAX,
+            false,
+            "m".to_string(),
+            Some(1_024),
+            None,
+            move |comp| tx.send(comp).unwrap(),
+        );
+        let _ = axum::body::to_bytes(body, usize::MAX).await;
+        rx.recv().unwrap()
+    }
+
+    /// With no output guardrail no scan is owed: a stream that failed still
+    /// exports what the caller received, which is what its failure row reports.
+    #[tokio::test]
+    async fn an_unguarded_stream_that_fails_keeps_what_the_caller_received() {
+        let comp = cut_off_relay(None).await;
+        assert!(comp.response_capture_safe);
+        assert_eq!(comp.response_text, "partial");
+    }
+
+    /// Held text the failure stopped short of scanning is never exported.
+    #[tokio::test]
+    async fn a_guarded_stream_that_fails_exports_nothing_unscanned() {
+        use aisix_guardrails::{builtin_rule, Guardrail, GuardrailChain, PiiAction, PiiGuardrail};
+        let pii = PiiGuardrail::new(
+            vec![builtin_rule("email", PiiAction::Mask).unwrap()],
+            aisix_core::models::GuardrailHookPoint::Output,
+            262_144,
+            false,
+        );
+        let chain = Arc::new(GuardrailChain::new(vec![
+            Arc::new(pii) as Arc<dyn Guardrail>
+        ]));
+        let comp = cut_off_relay(Some(chain)).await;
+        assert!(!comp.response_capture_safe);
+        assert!(comp.response_text.is_empty());
     }
 
     /// A stream that ends before carrying any piece of a response — here a

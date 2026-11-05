@@ -4617,7 +4617,6 @@ where
                         &bridge,
                     );
                     state.failure = Some(error.failure());
-                    state.capture_safe = false;
                     yield Err(error);
                     return;
                 }
@@ -4672,9 +4671,7 @@ where
                 state.capture_safe = false;
                 released_unparsed = true;
             }
-            if state.failure.is_some()
-                || state.capture.as_ref().is_some_and(|capture| capture.truncated)
-            {
+            if state.capture.as_ref().is_some_and(|capture| capture.truncated) {
                 state.capture_safe = false;
             }
             // Nothing completed yet — keep reading rather than yielding an
@@ -4781,9 +4778,6 @@ where
                     );
                     state.failure = Some(truncated);
                 }
-            }
-            if state.failure.is_some() {
-                state.capture_safe = false;
             }
         }
         // Clean end-of-stream: run the monitor observation (needs async, so
@@ -8350,6 +8344,48 @@ data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\"
             usage.provider_request_id, "resp_released",
             "the BOM-led first frame still parses as the first frame"
         );
+    }
+
+    /// With no scan owed a stream that failed still exports what the caller
+    /// received, which is what its failure row reports. A stream that started
+    /// unsafe (a scan is owed, or the buffer was released unscanned) stays so.
+    #[tokio::test]
+    async fn a_failed_stream_exports_what_the_caller_received_only_if_no_scan_was_owed() {
+        use futures::StreamExt;
+        use std::sync::{Arc, Mutex};
+
+        for initial_capture_safe in [true, false] {
+            let upstream = futures::stream::iter([
+                Ok::<_, crate::stream_timeout::RawStreamError>(bytes::Bytes::from_static(
+                    b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n",
+                )),
+                Err(crate::stream_timeout::RawStreamError::Timeout { elapsed_ms: 300 }),
+            ]);
+            let captured = Arc::new(Mutex::new(None));
+            let captured_out = Arc::clone(&captured);
+            let now = std::time::Instant::now();
+            let stream = super::build_responses_passthrough_stream(
+                upstream,
+                now,
+                now,
+                None,
+                Some(1_024),
+                None,
+                initial_capture_safe,
+                "client-facing".to_string(),
+                Default::default(),
+                move |_, text, _, capture_safe, failure| {
+                    *captured_out.lock().unwrap() = Some((text, capture_safe, failure));
+                },
+            );
+            let _: Vec<_> = stream.collect().await;
+
+            let (text, capture_safe, failure) =
+                captured.lock().unwrap().take().expect("on_complete fired");
+            assert!(failure.is_some());
+            assert_eq!(text, "partial");
+            assert_eq!(capture_safe, initial_capture_safe);
+        }
     }
 
     /// The sentinel the relay closes a stream with is framed like the stream:
