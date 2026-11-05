@@ -48,6 +48,10 @@ const STORED = Buffer.from(
   "utf8",
 );
 
+/** An upload the input scan has no objection to, for the legs that only need
+ *  a file id to work with. */
+const CLEAN_UPLOAD = Buffer.from('{"custom_id":"r1","note":"clean"}\n', "utf8");
+
 const guardrail = {
   name: "files-guardrail-scope-e2e",
   enabled: true,
@@ -248,7 +252,7 @@ describe("files: the surface is not guardrail-screened", () => {
       ctx.skip();
       return;
     }
-    const uploaded = (await (await upload("batch")).json()) as { id: string };
+    const uploaded = (await (await upload("batch", CLEAN_UPLOAD)).json()) as { id: string };
     const res = await fetch(
       `${app!.proxyUrl}/v1/files/${encodeURIComponent(uploaded.id)}/content`,
       { headers: { authorization: `Bearer ${KEY}` } },
@@ -264,7 +268,7 @@ describe("files: the surface is not guardrail-screened", () => {
       ctx.skip();
       return;
     }
-    const uploaded = (await (await upload("batch")).json()) as { id: string };
+    const uploaded = (await (await upload("batch", CLEAN_UPLOAD)).json()) as { id: string };
     const before = upstream!.batches.length;
     const res = await fetch(`${app!.proxyUrl}/v1/batches`, {
       method: "POST",
