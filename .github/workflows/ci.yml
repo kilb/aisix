@@ -389,9 +389,19 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: 22
+      - uses: pnpm/action-setup@v6
+        with:
+          # Same version as the e2e jobs: see the note on `version` there.
+          version: 11
       - name: tsc --noEmit
         run: |
-          for d in tests/e2e web web-portal; do
+          # tests/e2e commits no lockfile (it is gitignored), so `npm ci` cannot
+          # install it. It installs the way the jobs that run it do, so the
+          # types are checked against the dependencies those jobs execute.
+          echo "::group::tests/e2e"
+          (cd tests/e2e && pnpm install --no-frozen-lockfile && pnpm exec tsc --noEmit)
+          echo "::endgroup::"
+          for d in web web-portal; do
             echo "::group::$d"
             (cd "$d" && npm ci --no-audit --no-fund && npx tsc --noEmit)
             echo "::endgroup::"
