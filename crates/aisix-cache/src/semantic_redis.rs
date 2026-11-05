@@ -282,15 +282,9 @@ impl RedisSemanticCache {
     /// Forget a memoized index after the server reported it missing:
     /// the server lost state (restart / failover to an empty replica /
     /// external cleanup / a concurrent boot sweep), so the next call
-    /// must re-create instead of trusting the memo forever. Matches
-    /// every known wording — redis 8 reports `Index not found`, older
-    /// search modules `no such index` / `Unknown index name`.
+    /// must re-create instead of trusting the memo forever.
     fn forget_missing_index(&self, policy_id: &str, err: &CacheError) {
-        let msg = err.to_string().to_ascii_lowercase();
-        if msg.contains("index not found")
-            || msg.contains("no such index")
-            || msg.contains("unknown index")
-        {
+        if is_missing_index_error(err) {
             self.ensured.remove(policy_id);
         }
     }
@@ -343,6 +337,16 @@ impl RedisSemanticCache {
         }
         Ok(dropped)
     }
+}
+
+/// Whether the server reported the index missing. Matches every known
+/// wording: redis 8 says `Index not found`, older search modules `Unknown
+/// index name` or `No such index`. The client library splits a server error at
+/// its first word and takes that word for an error code, so the last one
+/// reaches here as `No: such index`, which is why the match leaves out the "no".
+fn is_missing_index_error(err: &CacheError) -> bool {
+    let msg = err.to_string().to_ascii_lowercase();
+    msg.contains("index not found") || msg.contains("such index") || msg.contains("unknown index")
 }
 
 fn vector_blob(embedding: &[f32]) -> Vec<u8> {
@@ -527,5 +531,35 @@ impl SemanticCacheStore for RedisSemanticCache {
             return Err(err);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_wording_of_a_missing_index_is_recognised() {
+        for wording in [
+            "redis FT.SEARCH: Index not found",
+            "redis FT.SEARCH: Unknown index name",
+            "redis FT.SEARCH: no such index",
+            // As redis-stack 7.4's `No such index x` reaches the caller.
+            "redis FT.SEARCH: No: such index aisix:semcache:p:idx:p:0:2",
+        ] {
+            assert!(
+                is_missing_index_error(&CacheError::Backend(wording.to_string())),
+                "{wording}"
+            );
+        }
+        for other in [
+            "redis FT.SEARCH: connection refused",
+            "redis FT.SEARCH: Syntax error at offset 3",
+        ] {
+            assert!(
+                !is_missing_index_error(&CacheError::Backend(other.to_string())),
+                "{other}"
+            );
+        }
     }
 }
