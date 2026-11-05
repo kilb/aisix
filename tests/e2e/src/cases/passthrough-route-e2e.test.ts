@@ -556,6 +556,71 @@ describe("passthrough-route e2e: explicit routes, BYO credentials, unclaimed pat
     expect(upstream.receivedRequests).toHaveLength(baseline);
   });
 
+  test("a caller's account of its own address does not reach the upstream unless the route asks", async (ctx) => {
+    if (!etcdReachable || !app || !seed) {
+      ctx.skip();
+      return;
+    }
+
+    const upstream = await startOpenAiUpstream({
+      nonStreamBody: { routed: "client-address" },
+    });
+    upstreams.push(upstream);
+    const claims = {
+      "x-forwarded-for": "203.0.113.99",
+      "x-real-ip": "203.0.113.99",
+      forwarded: "for=203.0.113.99",
+    };
+
+    await seed.createPassthroughRoute({
+      name: "ptr-address-default",
+      path_prefix: "/passthrough/ptr-address-default",
+      target_url: upstream.baseUrl,
+      auth_mode: "header_key",
+      auth_header_name: "x-aisix-api-key",
+      credential_mode: "forward_client",
+    });
+    await seed.createPassthroughRoute({
+      name: "ptr-address-named",
+      path_prefix: "/passthrough/ptr-address-named",
+      target_url: upstream.baseUrl,
+      auth_mode: "header_key",
+      auth_header_name: "x-aisix-api-key",
+      credential_mode: "forward_client",
+      forward_client_headers: ["x-forwarded-for"],
+    });
+    const call = async (prefix: string) =>
+      fetch(`${app!.proxyUrl}${prefix}/v1/ping`, {
+        method: "POST",
+        headers: {
+          "x-aisix-api-key": CALLER_PLAINTEXT,
+          "x-keep": "kept",
+          "content-type": "application/json",
+          ...claims,
+        },
+        body: "{}",
+      });
+    await waitConfigPropagation(async () => {
+      const [a, b] = await Promise.all([
+        call("/passthrough/ptr-address-default"),
+        call("/passthrough/ptr-address-named"),
+      ]);
+      await Promise.all([a.text(), b.text()]);
+      return a.status === 200 && b.status === 200;
+    });
+
+    upstream.receivedRequests.length = 0;
+    await (await call("/passthrough/ptr-address-default")).text();
+    const unnamed = upstream.receivedRequests.at(-1)!.headers;
+    expect(unnamed["x-keep"]).toBe("kept");
+    for (const name of Object.keys(claims)) expect(unnamed[name]).toBeUndefined();
+
+    await (await call("/passthrough/ptr-address-named")).text();
+    const named = upstream.receivedRequests.at(-1)!.headers;
+    expect(named["x-forwarded-for"]).toBe("203.0.113.99");
+    expect(named["x-real-ip"]).toBeUndefined();
+  });
+
   test("forward-proxy BYO: host match beats typed routes; Authorization forwarded verbatim", async (ctx) => {
     if (!etcdReachable || !app || !seed) {
       ctx.skip();

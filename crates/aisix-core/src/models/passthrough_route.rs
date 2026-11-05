@@ -174,6 +174,10 @@ pub struct PassthroughRoute {
     /// glob does not sweep either, and a pattern that names one in full
     /// forwards it.
     ///
+    /// `forwarded`, `x-forwarded-for` and `x-real-ip` are the caller's own
+    /// account of who it is, and reach the upstream only when a pattern
+    /// admits them.
+    ///
     /// Headers whose forwarding would break the exchange rather than
     /// change who it comes from are stripped whatever the patterns say:
     /// `host`, `content-length`, the hop-by-hop headers that describe the

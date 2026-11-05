@@ -144,6 +144,13 @@ const ALWAYS_STRIP: &[&str] = &[
     // `RequestBuilder::header` appends — an inbound copy would reach the
     // upstream as a duplicate.
     "x-aisix-request-id",
+    // Who the client is, as the caller tells it. An upstream behind this
+    // gateway reads these as the last proxy's word, and this gateway did not
+    // write them. `forward_client_headers` puts one back for a route whose
+    // upstream knows what it is getting.
+    "forwarded",
+    "x-forwarded-for",
+    "x-real-ip",
 ];
 
 // ---------------------------------------------------------------------------
