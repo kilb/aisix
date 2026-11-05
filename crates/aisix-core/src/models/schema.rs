@@ -620,6 +620,134 @@ fn validate_mcp_urls(value: &Value) -> Result<(), SchemaError> {
 
 pub fn validate_apikey(value: &Value) -> Result<(), SchemaError> {
     validate(&SCHEMAS.apikey, value)
+        .map_err(|err| name_retired_fields(&SCHEMAS.apikey, value, err, APIKEY_RETIRED))
+}
+
+/// A field a later release retired, and how to write what it meant.
+///
+/// The strict schema no longer knows it, so a write that still carries one
+/// (a resources file from an earlier release, say) is refused with an
+/// "unexpected property" or a failed `anyOf` that says nothing of what to do.
+struct Retired {
+    /// Where the field sits, one segment per level.
+    path: &'static [&'static str],
+    rewrite: &'static str,
+    /// A required list that took over the field's meaning, which a document
+    /// written with the field never carried.
+    replaced_by: Option<&'static str>,
+}
+
+const APIKEY_RETIRED: &[Retired] = &[
+    Retired {
+        path: &["allowed_tools"],
+        rewrite: "`allowed_tools` is retired: write the same patterns as \
+                  `mcp_access: {allow: [...]}`",
+        replaced_by: None,
+    },
+    Retired {
+        path: &["mcp_access", "mode"],
+        rewrite: "`mcp_access.mode` is retired: `mcp_access` is now an `allow`/`deny` pattern \
+                  pair narrowing what the key's team and environment grant. Write `restrict` \
+                  by keeping its `allow` list, `deny` as `allow: []`, and `inherit` by leaving \
+                  `mcp_access` out",
+        replaced_by: None,
+    },
+];
+
+const MCP_POLICY_RETIRED: &[Retired] = &[Retired {
+    path: &["mode"],
+    rewrite: "`mode` is retired: a policy is now an `allow`/`deny` pattern pair. Write `all` \
+              as `allow: [\"*\"]`, `none` as `allow: []`, and `selected` by keeping its \
+              `allow` list",
+    replaced_by: Some("allow"),
+}];
+
+const GUARDRAIL_RETIRED: &[Retired] = &[Retired {
+    path: &["mandatory"],
+    rewrite: "`mandatory` is retired: remove it. `fail_open: false`, the default, refuses a \
+              request the guardrail cannot evaluate, which is what `mandatory: true` did",
+    replaced_by: None,
+}];
+
+const PASSTHROUGH_ROUTE_RETIRED: &[Retired] = &[
+    Retired {
+        path: &["protocol"],
+        rewrite: "`protocol` is retired: remove it, a route tells each exchange's protocol \
+                  from the request itself",
+        replaced_by: None,
+    },
+    Retired {
+        path: &["streaming"],
+        rewrite: "`streaming` is retired: remove it, a route tells whether an exchange \
+                  streams from the request itself",
+        replaced_by: None,
+    },
+];
+
+/// `err`, or what to write instead of the retired fields it is about.
+///
+/// Same discipline as [`validate_model`]: the rewrite replaces the message
+/// only when the retired fields are the WHOLE story. The document is
+/// re-validated without them, and one that also violates something else keeps
+/// the original error, which points at the other problem.
+fn name_retired_fields(
+    validator: &Validator,
+    value: &Value,
+    err: SchemaError,
+    retired: &[Retired],
+) -> SchemaError {
+    let present: Vec<&Retired> = retired
+        .iter()
+        .filter(|r| value.pointer(&format!("/{}", r.path.join("/"))).is_some())
+        .collect();
+    if present.is_empty() {
+        return err;
+    }
+    let mut probe = value.clone();
+    for r in &present {
+        remove_retired(&mut probe, r.path);
+        if let (Some(list), Some(obj)) = (r.replaced_by, probe.as_object_mut()) {
+            obj.entry(list).or_insert_with(|| Value::Array(Vec::new()));
+        }
+    }
+    if validate(validator, &probe).is_err() {
+        return err;
+    }
+    SchemaError {
+        path: err.path,
+        message: present
+            .iter()
+            .map(|r| r.rewrite)
+            .collect::<Vec<_>>()
+            .join("; "),
+    }
+}
+
+/// Remove a retired field, and the block holding it when nothing else is
+/// left in there: `mcp_access: {mode: inherit}` is written by leaving the
+/// block out.
+fn remove_retired(value: &mut Value, path: &[&str]) {
+    let Some(obj) = value.as_object_mut() else {
+        return;
+    };
+    match path {
+        [field] => {
+            obj.remove(*field);
+        }
+        [block, field] => {
+            let emptied = obj
+                .get_mut(*block)
+                .and_then(Value::as_object_mut)
+                .is_some_and(|inner| {
+                    inner.remove(*field);
+                    inner.is_empty()
+                });
+            if emptied {
+                obj.remove(*block);
+            }
+        }
+        _ => {}
+    }
 }
 
 pub fn validate_provider_key(value: &Value) -> Result<(), SchemaError> {
@@ -629,11 +757,18 @@ pub fn validate_provider_key(value: &Value) -> Result<(), SchemaError> {
 pub fn validate_guardrail(value: &Value) -> Result<(), SchemaError> {
     match validate(&SCHEMAS.guardrail, value) {
         Ok(()) => Ok(()),
-        Err(err) => Err(name_unknown_fields(
-            "guardrail",
+        // Retired fields are unknown fields too; naming one as merely unknown
+        // would leave out what to write instead.
+        Err(err) => Err(name_retired_fields(
             &SCHEMAS.guardrail,
             value,
-            name_missing_semantic_threshold(value, err),
+            name_unknown_fields(
+                "guardrail",
+                &SCHEMAS.guardrail,
+                value,
+                name_missing_semantic_threshold(value, err),
+            ),
+            GUARDRAIL_RETIRED,
         )),
     }
 }
@@ -817,6 +952,7 @@ pub fn validate_a2a_agent(value: &Value) -> Result<(), SchemaError> {
 
 pub fn validate_mcp_policy(value: &Value) -> Result<(), SchemaError> {
     validate(&SCHEMAS.mcp_policy, value)
+        .map_err(|err| name_retired_fields(&SCHEMAS.mcp_policy, value, err, MCP_POLICY_RETIRED))
 }
 
 pub fn validate_oidc_provider(value: &Value) -> Result<(), SchemaError> {
@@ -828,7 +964,14 @@ pub fn validate_claim_mapping(value: &Value) -> Result<(), SchemaError> {
 }
 
 pub fn validate_passthrough_route(value: &Value) -> Result<(), SchemaError> {
-    validate(&SCHEMAS.passthrough_route, value)?;
+    validate(&SCHEMAS.passthrough_route, value).map_err(|err| {
+        name_retired_fields(
+            &SCHEMAS.passthrough_route,
+            value,
+            err,
+            PASSTHROUGH_ROUTE_RETIRED,
+        )
+    })?;
     validate_source_cidrs(value)
 }
 
@@ -4060,6 +4203,84 @@ mod tests {
             "mcp_access": {"mode": "deny", "allow": ["github__*"], "deny": ["x__y"]}
         }))
         .unwrap();
+    }
+
+    /// A write carrying a field a later release retired is refused, and the
+    /// refusal says what to write instead: it is what an operator upgrading a
+    /// resources file reads.
+    #[test]
+    fn a_retired_field_is_refused_with_its_rewrite() {
+        let hash = "9df37f5e7cbc3c391d872742b5f286c242e733a09add9eeaa4d26a599bd90b20";
+        let cases: [(&str, Result<(), SchemaError>, &[&str]); 7] = [
+            (
+                "allowed_tools",
+                validate_apikey(&json!({
+                    "key_hash": hash, "allowed_models": [], "allowed_tools": ["github__*"]
+                })),
+                &["`allowed_tools`", "`mcp_access: {allow: [...]}`"],
+            ),
+            (
+                "mcp_access.mode alone",
+                validate_apikey(&json!({
+                    "key_hash": hash, "allowed_models": [], "mcp_access": {"mode": "inherit"}
+                })),
+                &[
+                    "`mcp_access.mode`",
+                    "leaving `mcp_access` out",
+                    "`allow: []`",
+                ],
+            ),
+            (
+                "mcp_access.mode beside its allow list",
+                validate_apikey(&json!({
+                    "key_hash": hash, "allowed_models": [],
+                    "mcp_access": {"mode": "restrict", "allow": ["github__*"]}
+                })),
+                &["`mcp_access.mode`", "keeping its `allow` list"],
+            ),
+            (
+                "mcp_policies mode",
+                validate_mcp_policy(&json!({"scope": "env", "mode": "all"})),
+                &["`mode`", "`allow: [\"*\"]`"],
+            ),
+            (
+                "mandatory",
+                validate_guardrail(&json!({
+                    "name": "g", "kind": "keyword", "mandatory": true,
+                    "patterns": [{"kind": "literal", "value": "AKIA"}]
+                })),
+                &["`mandatory`", "`fail_open: false`"],
+            ),
+            (
+                "protocol",
+                validate_passthrough_route(&json!({
+                    "name": "r", "path_prefix": "/pt", "target_url": "https://example.com",
+                    "provider_key_id": "pk-1", "protocol": "openai"
+                })),
+                &["`protocol`", "remove it"],
+            ),
+            (
+                "protocol and streaming",
+                validate_passthrough_route(&json!({
+                    "name": "r", "path_prefix": "/pt", "target_url": "https://example.com",
+                    "provider_key_id": "pk-1", "protocol": "openai", "streaming": true
+                })),
+                &["`protocol`", "`streaming`"],
+            ),
+        ];
+        for (case, result, rewrite) in cases {
+            let err = result.expect_err(case);
+            for part in rewrite {
+                assert!(err.message.contains(part), "{case}: {part}: {err}");
+            }
+        }
+
+        // An unrelated fault keeps its own error rather than this one.
+        let err = validate_apikey(&json!({
+            "key_hash": hash, "allowed_models": "everything", "allowed_tools": ["github__*"]
+        }))
+        .expect_err("still refused");
+        assert!(!err.message.contains("mcp_access"), "{err}");
     }
 
     #[test]
