@@ -605,6 +605,7 @@ async fn dispatch(
 
     // Input guardrails: scan the tool arguments.
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
+    let mut input_capture_safe = true;
     if let Some(chain) = &guardrail_chain {
         let args = peek
             .as_ref()
@@ -649,6 +650,7 @@ async fn dispatch(
                 monitor_hits.extend(hits);
                 verdict.merged_with(local)
             };
+        input_capture_safe = !verdict.is_bypass();
         if let aisix_guardrails::GuardrailVerdict::Block {
             reason,
             guardrail_name,
@@ -798,8 +800,14 @@ async fn dispatch(
     // shape; the aisix#1027 scan/rewrite divergence is not widened).
     let bytes = match &guardrail_chain {
         Some(chain) if aisix_guardrails::Guardrail::moderates_segments(chain) => {
-            match moderate_tool_arguments(chain, &bytes, &mut monitor_hits, &mut redaction_counts)
-                .await
+            match moderate_tool_arguments(
+                chain,
+                &bytes,
+                &mut monitor_hits,
+                &mut redaction_counts,
+                &mut input_capture_safe,
+            )
+            .await
             {
                 SegmentPassOutcome::Keep => bytes,
                 SegmentPassOutcome::Rewritten(rewritten) => {
@@ -858,10 +866,19 @@ async fn dispatch(
     };
     // Post-mask by construction: cloned AFTER the write-backs above, so a
     // capturing exporter can never archive a value the mask removed
-    // (same ordering rule as the LLM path — mask first, capture after).
-    let captured_args = capture_cap.map(|_| bytes.clone());
+    // (same ordering rule as the LLM path — mask first, capture after). Neither
+    // copy when a check failed open: no rule processed those arguments.
+    let captured_args = capture_cap
+        .filter(|_| input_capture_safe)
+        .map(|_| bytes.clone());
     if is_tool_call {
-        crate::usage_attr::note_screened_request(&snapshot, || tool_call_prompt(&bytes));
+        crate::usage_attr::note_screened_request(&snapshot, || {
+            if input_capture_safe {
+                tool_call_prompt(&bytes)
+            } else {
+                String::new()
+            }
+        });
     }
 
     // Scope the gateway to the tools this caller's key permits — resolved
@@ -1310,6 +1327,7 @@ async fn moderate_tool_arguments(
     body: &[u8],
     monitor_hits: &mut Vec<aisix_core::GuardrailMonitorHit>,
     counts_out: &mut crate::redact::RedactionCounts,
+    capture_safe: &mut bool,
 ) -> SegmentPassOutcome {
     moderate_selected_segments(
         chain,
@@ -1318,6 +1336,7 @@ async fn moderate_tool_arguments(
         true,
         monitor_hits,
         counts_out,
+        capture_safe,
     )
     .await
 }
@@ -1335,6 +1354,8 @@ async fn moderate_selected_segments(
     input: bool,
     monitor_hits: &mut Vec<aisix_core::GuardrailMonitorHit>,
     counts_out: &mut crate::redact::RedactionCounts,
+    // Cleared when a check failed open: it processed none of this text.
+    capture_safe: &mut bool,
 ) -> SegmentPassOutcome {
     // Collect: a rewrite walk that rewrites nothing.
     let mut texts: Vec<String> = Vec::new();
@@ -1362,6 +1383,7 @@ async fn moderate_selected_segments(
         aisix_guardrails::Guardrail::moderate_output_segments(chain, &texts).await
     };
     monitor_hits.append(&mut outcome.monitor_hits);
+    *capture_safe &= !outcome.verdict.is_bypass();
     if let aisix_guardrails::GuardrailVerdict::Block {
         reason,
         guardrail_name,
@@ -1740,6 +1762,9 @@ async fn apply_output_guardrails(
             false,
             monitor_hits,
             &mut counts,
+            // The request's capture is what this tracks, and the request's
+            // check has already run.
+            &mut true,
         )
         .await
         {
@@ -3999,6 +4024,31 @@ mod tests {
                 "the tool-call usage event never reached the OTLP exporter"
             );
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
+
+    /// A check that failed open read nothing, so the arguments it let past stay
+    /// out of a full-content export. The check that ran is the control. The
+    /// server is unknown, which still records the call.
+    #[tokio::test]
+    async fn a_failed_open_check_keeps_the_arguments_off_the_export() {
+        const TEXT: &str = "failed-open-mcp-text-a4f6";
+        for (script, exported) in [
+            (crate::INPUT_CHECK_FAILS_OPEN, false),
+            (crate::INPUT_CHECK_PASSES, true),
+        ] {
+            let snapshot = snapshot_with_key();
+            crate::seed_input_script_row(&snapshot, script);
+            let collector = crate::seed_full_content_collector(&snapshot).await;
+            let response = router_with(snapshot)
+                .oneshot(mcp_request(
+                    "tools/call",
+                    serde_json::json!({ "name": "ghost__tool", "arguments": { "text": TEXT } }),
+                ))
+                .await
+                .expect("router responds");
+            let sent = crate::exported_for(&collector, &response).await;
+            assert_eq!(sent.contains(TEXT), exported, "script {script}: {sent}");
         }
     }
 

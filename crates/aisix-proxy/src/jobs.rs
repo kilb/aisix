@@ -638,6 +638,7 @@ async fn scan_input_blob(
     let (verdict, hits) =
         aisix_guardrails::Guardrail::check_input_unmaskable_observed(&chain, &chat).await;
     monitor_hits.extend(hits);
+    let failed_open = verdict.is_bypass();
     // Drained BEFORE the block branch: a `blocked` hit is exactly the one
     // that leaves through `Err`, and the caller's `?` would drop it.
     enforced_hits.extend(chain.enforced_hits());
@@ -676,8 +677,11 @@ async fn scan_input_blob(
     }
 
     // 审查放行了：这条路线之前记下的请求体（控制体，或上传表单的字段和文件
-    // 哈希）就是失败行该报告的内容。
+    // 哈希）就是失败行该报告的内容。失败放行时这段文本没被处理过，什么都不报。
     crate::usage_attr::release_failure_request();
+    if failed_open {
+        crate::usage_attr::note_failure_request(snapshot, String::new);
+    }
 
     // #932 的顺序：先过阻断，再改写，改写后的字节才是上游收到的东西。
     let Some(redactions) = redactions else {
@@ -3075,6 +3079,58 @@ mod tests {
     }
 
     // ---- batches ----
+
+    /// 审查失败放行时，这段文本没有被处理过，所以它不进全量导出；真正跑过的
+    /// 审查作为对照，文本照常导出。
+    #[tokio::test]
+    async fn a_failed_open_check_keeps_the_control_body_off_the_export() {
+        const TEXT: &str = "failed-open-batch-text-93e5";
+        for (script, exported) in [
+            (crate::INPUT_CHECK_FAILS_OPEN, false),
+            (crate::INPUT_CHECK_PASSES, true),
+        ] {
+            let upstream = MockServer::builder().start().await;
+            Mock::given(wm_method("POST"))
+                .and(path("/v1/batches"))
+                .respond_with(
+                    ResponseTemplate::new(500)
+                        .set_body_json(serde_json::json!({"error": {"message": "an answer"}})),
+                )
+                .mount(&upstream)
+                .await;
+            let snap = AisixSnapshot::new();
+            snap.provider_keys
+                .insert(openai_pk(PK_A, &format!("{}/v1", upstream.uri())));
+            snap.models.insert(model("m-a", "gpt-a", PK_A));
+            snap.apikeys.insert(apikey_entry(&["*"]));
+            crate::seed_input_script_row(&snap, script);
+            let collector = crate::seed_full_content_collector(&snap).await;
+            let app = build_app(snap);
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/batches?model=gpt-a")
+                        .header("authorization", "Bearer sk-caller")
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(
+                            serde_json::json!({
+                                "input_file_id": "file-1",
+                                "endpoint": "/v1/chat/completions",
+                                "completion_window": "24h",
+                                "metadata": {"note": TEXT},
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert!(response.status().is_server_error(), "{}", response.status());
+            let sent = crate::exported_for(&collector, &response).await;
+            assert_eq!(sent.contains(TEXT), exported, "script {script}: {sent}");
+        }
+    }
 
     #[tokio::test]
     async fn create_batch_decodes_input_file_id_and_routes_to_embedded_model() {

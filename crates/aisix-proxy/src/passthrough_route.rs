@@ -680,6 +680,7 @@ async fn dispatch(
     let metering = metering_protocol(protocol, raw_shape, &path);
 
     // INPUT guardrails on the (envelope-extracted) request text.
+    let mut input_capture_safe = true;
     if !resolved_chain.is_empty() {
         let request_text =
             probe_error.map_or_else(|| try_request_guardrail_text(protocol, &body_bytes), Err);
@@ -698,6 +699,7 @@ async fn dispatch(
                     "cannot safely select passthrough-route request text; resolved chain does not fail closed",
                 );
                 resolved_chain.record_unevaluable_input_bypass(crate::error::TAG_UNSCANNABLE_BODY);
+                input_capture_safe = !aisix_guardrails::Guardrail::runs_on_input(&resolved_chain);
                 None
             }
             Err(err) => {
@@ -728,6 +730,7 @@ async fn dispatch(
             )
             .await;
             monitor_hits.extend(hits);
+            input_capture_safe = !verdict.is_bypass();
             if let aisix_guardrails::GuardrailVerdict::Block {
                 reason,
                 guardrail_name,
@@ -758,8 +761,12 @@ async fn dispatch(
     }
 
     // This route forwards the bytes as sent, so the body noted before the chain
-    // is the one a failure row reports.
+    // is the one a failure row reports, and nothing when a check failed open or
+    // could not be given the body: no rule processed that text.
     crate::usage_attr::release_failure_request();
+    if !input_capture_safe {
+        crate::usage_attr::note_failure_request(snapshot, String::new);
+    }
 
     // Content capture (exporter-gated): the request body text, in the same
     // exporter-only channel the typed endpoints use.
@@ -775,7 +782,9 @@ async fn dispatch(
     // Structure matters to an audit (roles, tool definitions, parameters),
     // and the capture truncator is JSON-aware, so it reduces the body
     // rather than cutting it mid-token.
-    let captured_prompt = content_cap.map(|_| String::from_utf8_lossy(&body_bytes).into_owned());
+    let captured_prompt = content_cap
+        .filter(|_| input_capture_safe)
+        .map(|_| String::from_utf8_lossy(&body_bytes).into_owned());
 
     // The alias the caller addressed, for the usage event's attribution.
     let requested_model = body_model_name(protocol, raw_shape, &body_bytes);
@@ -11451,6 +11460,69 @@ data: {"type":"error","error":{"type":"server_error","code":null,"message":"nest
     /// passthrough route leaves through `RouteError`, and the terminal
     /// event is built by the handler's failure branch — the only place a
     /// refused passthrough request appears in Logs at all.
+    /// A check that failed open read nothing, so the text it let past stays out
+    /// of a full-content export, on a failure row and on a served request alike.
+    /// The same goes for a body the scan could not be given. The check that ran
+    /// is the control: its text is exported.
+    #[tokio::test]
+    async fn a_failed_open_check_keeps_the_body_off_the_export() {
+        const TEXT: &str = "failed-open-passthrough-text-82d4";
+        let readable =
+            serde_json::json!({"model": "x", "messages": [{"role": "user", "content": TEXT}]})
+                .to_string();
+        // Deeper than the scanner reads, so no check is given it.
+        let depth = crate::json_splice::MAX_JSON_DEPTH + 1;
+        let unreadable = format!("{}\"{TEXT}\"{}", "[".repeat(depth), "]".repeat(depth));
+        for (body, script, exported) in [
+            (&readable, crate::INPUT_CHECK_FAILS_OPEN, false),
+            (&readable, crate::INPUT_CHECK_PASSES, true),
+            (&unreadable, crate::INPUT_CHECK_PASSES, false),
+        ] {
+            for upstream_status in [500, 200] {
+                let upstream = MockServer::builder().start().await;
+                Mock::given(wm_method("POST"))
+                    .respond_with(
+                        ResponseTemplate::new(upstream_status)
+                            .set_body_json(serde_json::json!({"id": "an-answer"})),
+                    )
+                    .mount(&upstream)
+                    .await;
+                let snap = AisixSnapshot::new();
+                snap.provider_keys
+                    .insert(provider_key_entry("http://unused"));
+                snap.apikeys.insert(apikey_entry("sk-caller", Some(&["*"])));
+                snap.passthrough_routes
+                    .insert(inject_route(&upstream.uri()));
+                crate::seed_input_script_row(&snap, script);
+                let collector = crate::seed_full_content_collector(&snap).await;
+                let app = build_app(snap);
+                let response = app
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri("/passthrough/openai/v1/any")
+                            .header("authorization", "Bearer sk-caller")
+                            .header("content-type", "application/json")
+                            .body(axum::body::Body::from(body.clone()))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status().as_u16(), upstream_status);
+                // The row is written when the body is done with.
+                let (parts, body) = response.into_parts();
+                to_bytes(body, 1 << 20).await.unwrap();
+                let done = axum::response::Response::from_parts(parts, axum::body::Body::empty());
+                let sent = crate::exported_for(&collector, &done).await;
+                assert_eq!(
+                    sent.contains(TEXT),
+                    exported,
+                    "script {script}, upstream {upstream_status}: {sent}"
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn blocked_request_names_the_policy_on_the_usage_event() {
         use aisix_obs::UsageSink;

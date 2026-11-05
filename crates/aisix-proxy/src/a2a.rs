@@ -123,6 +123,10 @@ impl A2aCall {
 struct A2aCallText {
     /// The caller's message text.
     request: String,
+    /// A guardrail owed a reading of the request and did not get one: a check
+    /// failed open, or the scan could not read part of it. `request` still
+    /// meters the call, and no export reports it.
+    request_unread: bool,
     /// The agent's, under the protocol's own per-artifact append/replace rule.
     response: ResultText,
 }
@@ -387,6 +391,7 @@ async fn dispatch(
             } else {
                 String::new()
             },
+            request_unread: false,
             response: ResultText::default(),
         },
         applied_guardrails: Vec::new(),
@@ -1621,9 +1626,6 @@ async fn guardrail_block_response(
         }
         chain.record_unevaluable_input_bypass(crate::error::TAG_UNSCANNABLE_BODY);
         unread_body = aisix_guardrails::Guardrail::runs_on_input(chain);
-        if unread_body {
-            crate::usage_attr::note_failure_request(snapshot, String::new);
-        }
     }
     let chat = aisix_gateway::ChatFormat::new(
         A2A_MODEL_LABEL,
@@ -1631,6 +1633,8 @@ async fn guardrail_block_response(
     );
     let (verdict, hits) = aisix_guardrails::Guardrail::check_input_observed(chain, &chat).await;
     call.guardrail_monitor_hits.extend(hits);
+    // A check that failed open processed none of the text it let past.
+    unread_body |= verdict.is_bypass();
     if let aisix_guardrails::GuardrailVerdict::Block {
         reason,
         guardrail_name,
@@ -1670,6 +1674,10 @@ async fn guardrail_block_response(
             trace,
             /* dispatched */ false,
         ));
+    }
+    if unread_body {
+        call.text.request_unread = true;
+        crate::usage_attr::note_failure_request(snapshot, String::new);
     }
 
     // #932's order: block first, then rewrite, so the masked text is what
@@ -2018,8 +2026,14 @@ fn emit_a2a_usage(
     // captured text is the message parts, not the JSON-RPC envelopes, so it
     // reads as a prompt and a completion rather than as protocol scaffolding.
     let exporters = crate::usage_attr::live_exporters(state, snap);
-    let captured = content_capture_cap(exporters.iter().map(|e| &*e.value))
-        .map(|cap| CapturedContent::new(&call.text.request, &response_text, cap as usize));
+    let captured = content_capture_cap(exporters.iter().map(|e| &*e.value)).map(|cap| {
+        let request = if call.text.request_unread {
+            ""
+        } else {
+            call.text.request.as_str()
+        };
+        CapturedContent::new(request, &response_text, cap as usize)
+    });
     crate::usage_attr::emit_usage(
         state,
         snap,
@@ -2120,6 +2134,67 @@ mod tests {
         let calls = agent.received_requests().await.unwrap_or_default().len();
         let event = rx.recv().await.expect("A2A emits a terminal event");
         (status, calls, event)
+    }
+
+    /// A check that failed open read nothing, so the text it let past stays out
+    /// of a full-content export, on a failure row and on a served call alike.
+    /// The check that ran is the control: its text is exported.
+    #[tokio::test]
+    async fn a_failed_open_check_keeps_the_message_off_the_export() {
+        const TEXT: &str = "failed-open-a2a-text-71c3";
+        for (script, exported) in [
+            (crate::INPUT_CHECK_FAILS_OPEN, false),
+            (crate::INPUT_CHECK_PASSES, true),
+        ] {
+            for agent_status in [500, 200] {
+                let agent = wiremock::MockServer::builder().start().await;
+                wiremock::Mock::given(wiremock::matchers::method("POST"))
+                    .respond_with(wiremock::ResponseTemplate::new(agent_status).set_body_json(
+                        serde_json::json!({
+                            "jsonrpc": "2.0", "id": 1, "result": {
+                                "kind": "message", "role": "agent",
+                                "parts": [{"kind": "text", "text": "an answer"}]}
+                        }),
+                    ))
+                    .mount(&agent)
+                    .await;
+                let snap = snapshot_with(&agent.uri(), true, serde_json::json!(["*"]));
+                crate::seed_input_script_row(&snap, script);
+                let collector = crate::seed_full_content_collector(&snap).await;
+                let state = ProxyState::new(
+                    SnapshotHandle::new(snap),
+                    Arc::new(aisix_gateway::Hub::new()),
+                    &proxy_cfg(),
+                )
+                .without_cache();
+                let response = build_router(state)
+                    .oneshot(
+                        HttpRequest::post("/a2a/invoice")
+                            .header("host", "gw.example.com")
+                            .header("content-type", "application/json")
+                            .header("authorization", format!("Bearer {TOKEN}"))
+                            .body(Body::from(
+                                serde_json::json!({
+                                    "jsonrpc": "2.0",
+                                    "id": 1,
+                                    "method": "message/send",
+                                    "params": {"message": {"role": "user", "parts": [
+                                        {"kind": "text", "text": TEXT}]}}
+                                })
+                                .to_string(),
+                            ))
+                            .unwrap(),
+                    )
+                    .await
+                    .expect("router responds");
+                let sent = crate::exported_for(&collector, &response).await;
+                assert_eq!(
+                    sent.contains(TEXT),
+                    exported,
+                    "script {script}, agent {agent_status}: {sent}"
+                );
+            }
+        }
     }
 
     /// One rule on every surface: a request the scan cannot read is refused

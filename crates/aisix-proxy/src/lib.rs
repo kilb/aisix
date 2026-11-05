@@ -1564,6 +1564,90 @@ pub(crate) fn seed_env_scoped_guardrail(
     snap.guardrails.insert(guardrail);
 }
 
+/// An input row whose check faults instead of deciding, under `fail_open`.
+#[cfg(test)]
+pub(crate) const INPUT_CHECK_FAILS_OPEN: &str =
+    "export function checkInput() { throw new Error('x'); }";
+
+/// An input row whose check runs and lets the request past.
+#[cfg(test)]
+pub(crate) const INPUT_CHECK_PASSES: &str =
+    "export function checkInput() { return { action: 'none' }; }";
+
+/// An env-scoped input row running `script`, fail-open.
+#[cfg(test)]
+pub(crate) fn seed_input_script_row(snap: &aisix_core::AisixSnapshot, script: &str) {
+    let row: aisix_core::Guardrail = serde_json::from_value(serde_json::json!({
+        "name": "input-script",
+        "enabled": true,
+        "kind": "custom",
+        "hook_point": "input",
+        "fail_open": true,
+        "script": script,
+        "timeout_ms": 5000,
+    }))
+    .expect("valid guardrail");
+    seed_env_scoped_guardrail(snap, aisix_core::ResourceEntry::new("g-script", row, 1));
+}
+
+/// A full-content exporter on `snap`, and the collector it reports to.
+#[cfg(test)]
+pub(crate) async fn seed_full_content_collector(
+    snap: &aisix_core::AisixSnapshot,
+) -> wiremock::MockServer {
+    let collector = wiremock::MockServer::builder().start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .respond_with(wiremock::ResponseTemplate::new(200))
+        .mount(&collector)
+        .await;
+    let exporter: aisix_core::ObservabilityExporter = serde_json::from_value(serde_json::json!({
+        "name": "full-content",
+        "enabled": true,
+        "kind": "otlp_http",
+        "endpoint": format!("{}/v1/traces", collector.uri()),
+        "headers": {},
+        "content_mode": "full",
+    }))
+    .expect("valid exporter");
+    snap.observability_exporters
+        .insert(aisix_core::ResourceEntry::new("exp-full", exporter, 1));
+    collector
+}
+
+/// All `collector` received, once the span of `response`'s usage row has reached
+/// it: the exporter flushes on a timer and writes the request's server span apart
+/// from that one, so a body can only be called absent after this.
+#[cfg(test)]
+pub(crate) async fn exported_for(
+    collector: &wiremock::MockServer,
+    response: &axum::response::Response,
+) -> String {
+    let request_id = response
+        .headers()
+        .get("x-aisix-request-id")
+        .and_then(|v| v.to_str().ok())
+        .expect("the response names its request")
+        .to_owned();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let exported: String = collector
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .collect();
+        if exported.contains(&request_id) && exported.contains("gen_ai.operation.name") {
+            return exported;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "request {request_id} never reached the exporter"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
