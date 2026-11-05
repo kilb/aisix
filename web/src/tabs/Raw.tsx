@@ -32,8 +32,8 @@ export function Raw({ doc }: { doc: DocState }) {
     }
     setBusy(true);
     setNote({ text: "校验中…", kind: "ok" });
-    const { ok, message, stale } = await doc.saveRawText(text);
-    setNote({ text: message, kind: ok ? "ok" : "crit" });
+    const { ok, message, stale, unapplied } = await doc.saveRawText(text);
+    setNote({ text: message, kind: !ok ? "crit" : unapplied ? "warn" : "ok" });
     setDraft(stale ? text : null);
     setBusy(false);
   }

@@ -102,6 +102,8 @@ pub struct Writer {
     path: Arc<String>,
     /// 进程内串行。两条写路径共用一把锁，见模块注释。
     lock: Arc<Mutex<()>>,
+    /// 写完之后让网关重读配置的命令，见 [`RELOAD_COMMAND`]。
+    reload: &'static [&'static str],
 }
 
 #[derive(Debug)]
@@ -132,7 +134,15 @@ impl Writer {
         Self {
             path: Arc::new(path),
             lock: Arc::new(Mutex::new(())),
+            reload: RELOAD_COMMAND,
         }
+    }
+
+    /// 换一个重载命令。测试用来模拟「信号没送到」。
+    #[cfg(test)]
+    pub fn with_reload(mut self, reload: &'static [&'static str]) -> Self {
+        self.reload = reload;
+        self
     }
 
     pub async fn read(&self) -> Result<String, WriteError> {
@@ -187,7 +197,7 @@ impl Writer {
                 return Err(WriteError::WouldBreakGateway(why));
             }
             write_atomic(&self.path, &out).await?;
-            signal_reload().await;
+            signal_reload(self.reload).await;
             return Ok(true);
         }
         Err(WriteError::Contended)
@@ -288,9 +298,12 @@ fn breaks_gateway(before: &str, after: &str) -> Option<String> {
 ///
 /// 做法与 `crates/aisix-console` 一致：`pkill -HUP -x aisix`。二期改走 Admin
 /// API 写 etcd 之后，watch 会自动传播，这一步随之消失。
-async fn signal_reload() {
-    let out = tokio::process::Command::new("pkill")
-        .args(["-HUP", "-x", "aisix"])
+async fn signal_reload(command: &[&str]) {
+    let Some((program, args)) = command.split_first() else {
+        return;
+    };
+    let out = tokio::process::Command::new(program)
+        .args(args)
         .output()
         .await;
     // 配置已经落盘。信号没送到只是「还没热加载」，不该当成写入失败 ——
@@ -299,6 +312,14 @@ async fn signal_reload() {
         eprintln!("已改写 resources.yaml，但 SIGHUP 未送达：网关仍在用旧配置");
     }
 }
+
+/// 让网关重读配置的命令。
+#[cfg(not(test))]
+const RELOAD_COMMAND: &[&str] = &["pkill", "-HUP", "-x", "aisix"];
+/// 测试里换成一个不碰任何进程的替身。真的 `pkill` 会给整台机器上的每个网关发信号，
+/// 而门户的每条写配置用例都会走到这一步。
+#[cfg(test)]
+const RELOAD_COMMAND: &[&str] = &["true"];
 
 /// 取出 `api_keys` 序列（不存在则就地建一个空的）。
 ///
@@ -814,9 +835,44 @@ api_keys:
             .find("let _file_lock = lock_for_write")
             .expect("没有拿锁");
         let rename = body.find("write_atomic(").expect("没有写盘");
-        let signal = body.find("signal_reload()").expect("没有发信号");
+        let signal = body.find("signal_reload(").expect("没有发信号");
         assert!(lock < rename && rename < signal, "顺序不对");
         assert!(!body.contains("drop(_file_lock)"), "发信号之前放了锁");
+    }
+
+    /// 生产上用的就是 `pkill`（测试里的那个替身只在 `cfg(test)` 下）。
+    #[test]
+    fn 生产上让网关重读配置用的是_pkill() {
+        let src = include_str!("resources.rs");
+        let prod = src
+            .split_once("#[cfg(not(test))]\nconst RELOAD_COMMAND")
+            .map(|(_, rest)| rest.lines().next().unwrap_or(""))
+            .expect("找不到生产上的重载命令");
+        assert!(
+            prod.contains(r#"&["pkill", "-HUP", "-x", "aisix"]"#),
+            "{prod}"
+        );
+    }
+
+    /// 信号没送到：配置已经落盘，写入照样算成功 —— 但不能因此报错或回滚。
+    #[tokio::test]
+    async fn 信号没送到时写入照样落盘() {
+        let (w, path) = writer_with(VALID).await;
+        let w = w.with_reload(&["false"]);
+        let r = w
+            .edit(|d| {
+                api_keys_mut(d)[0]
+                    .as_mapping_mut()
+                    .unwrap()
+                    .insert(Value::from("disabled"), Value::from(true));
+                true
+            })
+            .await;
+        assert!(matches!(r, Ok(true)), "{r:?}");
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("disabled: true"));
+        let _ = std::fs::remove_file(path);
     }
 
     /// 往文档里加一把 portal 风格的密钥，展示名是 `portal-1 · <label>`。

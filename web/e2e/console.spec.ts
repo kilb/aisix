@@ -868,3 +868,19 @@ test("供应商表里的基址不显示口令", async ({ page, browser }) => {
   await expect(row).toContainText("proxyuser:***@proxy.example.com");
   await expect(row).not.toContainText("hunter2-base-secret");
 });
+
+test("网关没收到重载信号时_不说已重载_说清还没生效", async ({ page }) => {
+  // 这套夹具不起网关，所以重载信号必然送不到 —— 正好是要看的那个状态。
+  await signIn(page);
+  await page.getByRole("tab", { name: "供应商" }).click();
+  await page.getByLabel("名称").fill("no-signal-provider");
+  await page.getByLabel("API 密钥").fill("sk-no-signal");
+  await page.getByRole("button", { name: /保存并重载网关/ }).click();
+
+  const note = page.locator(".note.warn", { hasText: "没能通知网关重载" });
+  await expect(note).toBeVisible();
+  await expect(note).toContainText("仍在用旧配置");
+  await expect(page.getByText("已保存，网关已重载。")).toHaveCount(0);
+  // 文件写了：下次重读或重启网关就会用上。
+  expect(fx.read()).toContain("no-signal-provider");
+});

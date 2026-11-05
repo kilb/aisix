@@ -84,6 +84,8 @@ export async function loadDoc(): Promise<LoadedDoc> {
 
 /** 一次成功保存（文件已经替换）的结果。 */
 export interface SaveResult {
+  /** 只有网关确实收到了重载信号才为真；信号没送到时文件已经写了，这里是假（HTTP 202）。 */
+  ok?: boolean;
   detail?: string;
   /** 校验通过但校验器有话要说，比如护栏没有挂载、什么流量也不检查。 */
   warnings?: string;

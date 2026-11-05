@@ -54,6 +54,10 @@ struct AppState {
     resources_path: PathBuf,
     /// 网关二进制，用来在落盘前跑 `validate`。
     aisix_bin: PathBuf,
+    /// 让网关重读配置的命令，见 [`RELOAD_COMMAND`]。放在状态里是为了让测试换成一个
+    /// 不碰任何进程的替身：真的 `pkill` 会给整台机器上的每个网关发信号，而找不到网关
+    /// 时它返回 1，测试的结果就成了「这台机器上有没有网关」。
+    reload_command: Vec<String>,
     /// 口令的 argon2 散列。
     password_hash: String,
     /// 活跃会话 token -> 过期时间（unix 秒）。
@@ -955,7 +959,7 @@ async fn save_resources(
     // 配置已经上线了——SIGHUP 没送到只是「还没热加载」，不是保存失败。
     // 当成失败返回会让调用方以为什么都没发生，而铸密钥那条路径会因此
     // 丢掉刚生成的明文，留下一把没人持有的活密钥。
-    let reload_ok = signal_reload().await;
+    let reload_ok = signal_reload(st).await;
     let detail = String::from_utf8_lossy(&out.stdout).trim().to_string();
     let warnings = String::from_utf8_lossy(&out.stderr).trim().to_string();
     let reload = if reload_ok {
@@ -995,7 +999,7 @@ async fn save_resources(
             )));
         }
         let back_in_force =
-            signal_reload().await && confirm_reload(st, prev).await == Reload::Applied;
+            signal_reload(st).await && confirm_reload(st, prev).await == Reload::Applied;
         return Err(SaveError::Failed(if back_in_force {
             format!("网关拒绝了这份配置，已恢复为保存前的配置，这次改动没有生效：{why}")
         } else {
@@ -1013,11 +1017,6 @@ async fn save_resources(
         reload.label(),
     ));
 
-    let detail = if reload_ok {
-        detail
-    } else {
-        format!("{detail}\n注意：配置已保存，但 SIGHUP 未送达网关，需要手动 systemctl reload aisix")
-    };
     Ok(Saved {
         detail,
         warnings,
@@ -1057,12 +1056,17 @@ async fn write_private(
     Ok(())
 }
 
+/// 生产上让网关重读配置的命令。控制台以 `aisix` 用户运行，能直接给同用户的网关进程
+/// 发信号。
+const RELOAD_COMMAND: &[&str] = &["pkill", "-HUP", "-x", "aisix"];
+
 /// 让网关重读配置。信号送到了就是 true。
-async fn signal_reload() -> bool {
-    let hup = tokio::process::Command::new("pkill")
-        .arg("-HUP")
-        .arg("-x")
-        .arg("aisix")
+async fn signal_reload(st: &AppState) -> bool {
+    let Some((program, args)) = st.reload_command.split_first() else {
+        return false;
+    };
+    let hup = tokio::process::Command::new(program)
+        .args(args)
         .output()
         .await;
     matches!(&hup, Ok(o) if o.status.success())
@@ -1141,13 +1145,29 @@ async fn api_file_put(
     };
     match save_resources(&st, &doc, req.base_version.as_deref(), req.client_contract).await {
         // 网关拒收的那份不会走到这里：它已经被放回去，按失败报。
-        Ok(saved) => Json(json!({
-            "ok": true,
-            "detail": saved.detail,
-            "warnings": saved.warnings,
-            "reload": saved.reload.label(),
-        }))
-        .into_response(),
+        //
+        // 信号没送到时文件已经换了（校验通过，网关下次重读或重启就会用上），却还没生效：
+        // 回 202 而不是 200，`ok` 为假。不把文件放回去：网关因为坏文件起不来、正等着运维
+        // 在这里改好的时候，信号必然送不到，放回去就是让人永远改不了它。
+        Ok(saved) => {
+            let applied = saved.reload != Reload::SignalFailed;
+            let status = if applied {
+                StatusCode::OK
+            } else {
+                StatusCode::ACCEPTED
+            };
+            (
+                status,
+                Json(json!({
+                    "ok": applied,
+                    "written": true,
+                    "detail": saved.detail,
+                    "warnings": saved.warnings,
+                    "reload": saved.reload.label(),
+                })),
+            )
+                .into_response()
+        }
         // 版本冲突是 409 而不是 400：前端要据此提示「重新载入」，而 400
         // 的其余成员都是「你写的内容不合法」，两者的处理动作完全不同。
         Err(e @ SaveError::Stale) => {
@@ -1744,6 +1764,7 @@ async fn main() {
             .filter(|u| !u.is_empty()),
         resources_path: PathBuf::from(env("AISIX_RESOURCES", "/etc/aisix/resources.yaml")),
         aisix_bin: PathBuf::from(env("AISIX_BIN", "/usr/local/bin/aisix")),
+        reload_command: RELOAD_COMMAND.iter().map(|a| a.to_string()).collect(),
         password_hash,
         sessions: Arc::new(RwLock::new(HashMap::new())),
         save_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -2380,6 +2401,8 @@ mod tests {
             save_lock: Arc::new(tokio::sync::Mutex::new(())),
             login_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             http: outbound_client(),
+            // 替身：不碰任何进程，永远「送到了」。要测送不到的那条路时换成 `false`。
+            reload_command: vec!["true".into()],
         }
     }
 
@@ -2772,6 +2795,53 @@ mod tests {
             std::fs::read_to_string(dir.join("resources.yaml")).unwrap(),
             previous,
             "拒收的那份留在了盘上",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 生产上用的就是 `pkill`；测试里的替身只在测试状态里。
+    #[test]
+    fn production_reloads_the_gateway_with_pkill() {
+        assert_eq!(RELOAD_COMMAND, ["pkill", "-HUP", "-x", "aisix"]);
+        let src = include_str!("main.rs");
+        let main_fn = src
+            .split_once("async fn main()")
+            .map(|(_, rest)| rest)
+            .unwrap();
+        assert!(main_fn.contains("reload_command: RELOAD_COMMAND"));
+    }
+
+    /// 信号没送到：文件已经写了（校验过，下次重读就生效），但不能报成功 —— 回 202、
+    /// `ok` 为假、说清楚没生效。也不把文件放回去：网关起不来、正等着在这里改好的时候，
+    /// 信号必然送不到。
+    #[tokio::test]
+    async fn a_reload_signal_that_does_not_arrive_is_not_reported_as_success() {
+        let dir = temp_dir("nosignal");
+        let base_version = seed_file(&dir);
+        let mut st = state_on(&dir, fake_validator(&dir, ""), String::new());
+        st.reload_command = vec!["false".into()];
+        let (base, cookie) = serve(st).await;
+        let r = reqwest::Client::new()
+            .put(format!("{base}/api/file"))
+            .header("cookie", &cookie)
+            .json(&json!({
+                "doc": {"_format_version": "1", "models": []},
+                "base_version": base_version,
+                "client_contract": 2,
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 202);
+        let body: Value = r.json().await.unwrap();
+        assert_eq!(body["ok"], json!(false), "{body}");
+        assert_eq!(body["written"], json!(true), "{body}");
+        assert_eq!(body["reload"], json!("signal_failed"), "{body}");
+        assert!(
+            std::fs::read_to_string(dir.join("resources.yaml"))
+                .unwrap()
+                .contains("models: []"),
+            "校验过的新内容应当留在盘上",
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -29,6 +29,8 @@ export interface SaveOutcome {
   message: string;
   /** 因版本冲突被拒。界面重载之后，用户手上那份改动已经不在编辑框里了。 */
   stale?: boolean;
+  /** 文件写了（`ok` 为真，表单该清空），但网关没收到重载信号，还没生效。 */
+  unapplied?: boolean;
 }
 
 function describe(e: unknown): string {
@@ -42,7 +44,7 @@ function reloadMessage(r: api.SaveResult): string {
       case "applied":
         return "已保存，网关已重载。";
       case "signal_failed":
-        return `已保存，但网关未热加载——${r.detail ?? ""}`;
+        return "已保存到文件，但没能通知网关重载，网关仍在用旧配置：执行 systemctl reload aisix（或重启网关）之后才生效。";
       default:
         return "已保存，已通知网关重载（未确认是否用上）。";
     }
@@ -83,9 +85,12 @@ export function useDoc(enabled: boolean): DocState {
     async (write: () => Promise<api.SaveResult>): Promise<SaveOutcome> => {
       let ok = false;
       let stale = false;
+      let unapplied = false;
       let message: string;
       try {
-        message = reloadMessage(await write());
+        const saved = await write();
+        message = reloadMessage(saved);
+        unapplied = saved.reload === "signal_failed";
         ok = true;
       } catch (e) {
         message = describe(e);
@@ -93,7 +98,7 @@ export function useDoc(enabled: boolean): DocState {
       }
       // 成功是确认，失败是回滚 —— 两种情况都要以磁盘为准。
       await reload();
-      return { ok, message, stale };
+      return { ok, message, stale, unapplied };
     },
     [reload],
   );

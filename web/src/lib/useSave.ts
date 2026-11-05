@@ -26,8 +26,8 @@ export function useSave(doc: DocState) {
       setBusy(true);
       const draft = structuredClone(doc.doc);
       mutate(draft);
-      const { ok, message } = await doc.save(draft);
-      setNote({ text: message, kind: ok ? "ok" : "crit" });
+      const { ok, message, unapplied } = await doc.save(draft);
+      setNote({ text: message, kind: !ok ? "crit" : unapplied ? "warn" : "ok" });
       setBusy(false);
       return ok;
     },
