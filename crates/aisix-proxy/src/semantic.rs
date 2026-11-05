@@ -187,15 +187,27 @@ pub(crate) fn failure_target<'a>(
 /// Per-instance cache of route example-utterance embeddings, populated
 /// lazily on the first request that needs them and reused across requests
 /// so a steady-state request's logical embedding batch contains only the
-/// prompt. Keyed by `(embedding_model_id, dimensions, example_text)` —
-/// changing the embedding model or its dimensions auto-invalidates, since
-/// a stale vector of the wrong dimension must never be served.
+/// prompt. Keyed by `(vector_scope, dimensions, example_text)` — changing
+/// the embedding model, the upstream it names or its dimensions
+/// auto-invalidates, since vectors from another embedding space compare as
+/// noise and nothing would report it.
 #[derive(Debug, Default)]
 pub struct SemanticVectorCache {
     vectors: DashMap<(String, u32, String), Arc<Vec<f32>>>,
 }
 
 impl SemanticVectorCache {
+    /// What a cached vector is only valid for: the row, and the upstream
+    /// model and account that row embeds with. A row can be repointed at
+    /// another model of the same dimensions in place.
+    pub(crate) fn vector_scope(embedding_model_id: &str, model: &Model) -> String {
+        format!(
+            "{embedding_model_id}\0{}\0{}",
+            model.model_name.as_deref().unwrap_or_default(),
+            model.provider_key_id.as_deref().unwrap_or_default(),
+        )
+    }
+
     /// Embeddings cached; nothing is ever evicted.
     pub fn entry_count(&self) -> u64 {
         self.vectors.len() as u64
@@ -203,24 +215,24 @@ impl SemanticVectorCache {
 
     pub(crate) fn get(
         &self,
-        embedding_model_id: &str,
+        vector_scope: &str,
         dimensions: u32,
         text: &str,
     ) -> Option<Arc<Vec<f32>>> {
         self.vectors
-            .get(&(embedding_model_id.to_string(), dimensions, text.to_string()))
+            .get(&(vector_scope.to_string(), dimensions, text.to_string()))
             .map(|e| e.clone())
     }
 
     pub(crate) fn insert(
         &self,
-        embedding_model_id: &str,
+        vector_scope: &str,
         dimensions: u32,
         text: &str,
         vec: Arc<Vec<f32>>,
     ) {
         self.vectors.insert(
-            (embedding_model_id.to_string(), dimensions, text.to_string()),
+            (vector_scope.to_string(), dimensions, text.to_string()),
             vec,
         );
     }
@@ -411,16 +423,15 @@ async fn decide_by_embedding(
         .map(|e| e.dimensions)
         .unwrap_or(0);
 
+    let vector_scope = SemanticVectorCache::vector_scope(&embed_entry.id, &embed_entry.value);
+
     // Assemble the prompt (index 0) with every uncached example text as one
     // logical embedding batch. Providers without batch input may split it
     // into multiple upstream calls. Steady state: only the prompt is uncached.
     let mut pending: Vec<String> = Vec::new();
     for route in &semantic.routes {
         for ex in &route.examples {
-            if state
-                .semantic_cache
-                .get(&embed_entry.id, dims, ex)
-                .is_none()
+            if state.semantic_cache.get(&vector_scope, dims, ex).is_none()
                 && !pending.iter().any(|p| p == ex)
             {
                 pending.push(ex.clone());
@@ -516,7 +527,7 @@ async fn decide_by_embedding(
         if let Some(v) = iter.next() {
             state
                 .semantic_cache
-                .insert(&embed_entry.id, dims, text, Arc::new(v));
+                .insert(&vector_scope, dims, text, Arc::new(v));
         }
     }
 
@@ -527,7 +538,7 @@ async fn decide_by_embedding(
             route
                 .examples
                 .iter()
-                .filter_map(|ex| state.semantic_cache.get(&embed_entry.id, dims, ex))
+                .filter_map(|ex| state.semantic_cache.get(&vector_scope, dims, ex))
                 .collect()
         })
         .collect();
@@ -762,9 +773,12 @@ async fn classify_inner(
 /// loop will drive.
 fn attempt_for_target(snapshot: &AisixSnapshot, alias: &str) -> Result<AttemptModel, ProxyError> {
     let entry = snapshot.models.get_by_name(alias).ok_or_else(|| {
-        ProxyError::InvalidRequest(format!(
-            "semantic router target {alias:?} does not resolve to a known model",
-        ))
+        // The alias goes to the log, not the caller: a refusal must not name
+        // a router's members (`routing::refused_model_label`).
+        tracing::warn!(target_model = %alias, "semantic router target resolves to no model");
+        ProxyError::InvalidRequest(
+            "semantic router target does not resolve to a known model".to_string(),
+        )
     })?;
     Ok(AttemptModel {
         id: entry.id.clone(),
@@ -802,15 +816,27 @@ fn select_eligible(
     fallback_alias: Option<&str>,
 ) -> Result<(AttemptModel, bool), ProxyError> {
     let mut candidates: Vec<(AttemptModel, bool)> = Vec::with_capacity(2);
-    candidates.push((attempt_for_target(snapshot, primary)?, false));
+    // A dangling alias only matters when nothing else can serve: a route
+    // target deleted under a healthy `default` costs the route, not the
+    // request, and the same goes for a dangling `default` under a healthy
+    // route target.
+    let primary_attempt = attempt_for_target(snapshot, primary);
+    let unresolved = match primary_attempt {
+        Ok(attempt) => {
+            candidates.push((attempt, false));
+            None
+        }
+        Err(err) => Some(err),
+    };
     if let Some(alias) = fallback_alias {
-        // A dangling `default` only matters when it must actually serve;
-        // as a mere fallback candidate it is skipped, not fatal.
         if alias != primary {
             if let Ok(attempt) = attempt_for_target(snapshot, alias) {
                 candidates.push((attempt, true));
             }
         }
+    }
+    if let (true, Some(err)) = (candidates.is_empty(), unresolved) {
+        return Err(err);
     }
     candidates.retain(|(attempt, fell_back)| {
         let allowed = attempt.model.ip_allowed(source_ip);
@@ -1233,6 +1259,119 @@ mod tests {
                 "match": {"threshold": 0.5}
             }"#,
         )
+    }
+
+    /// A row repointed at another embedding model of the same dimensions must
+    /// not keep scoring against the old model's vectors: cosines across two
+    /// embedding spaces are noise, and nothing would report it.
+    #[test]
+    fn an_example_vector_does_not_survive_a_repointed_embedding_row() {
+        let row = |model_name: &str, key: &str| -> Model {
+            serde_json::from_value(serde_json::json!({
+                "display_name": "bge-m3",
+                "provider": "openai",
+                "model_name": model_name,
+                "provider_key_id": key,
+                "embedding": {"dimensions": 2},
+            }))
+            .unwrap()
+        };
+        let cache = SemanticVectorCache::default();
+        let scope = SemanticVectorCache::vector_scope("m-embed", &row("old", "pk-1"));
+        cache.insert(&scope, 2, "an example", arc(vec![1.0, 0.0]));
+        assert!(cache.get(&scope, 2, "an example").is_some());
+        for moved in [row("new", "pk-1"), row("old", "pk-2")] {
+            let scope = SemanticVectorCache::vector_scope("m-embed", &moved);
+            assert!(cache.get(&scope, 2, "an example").is_none());
+        }
+    }
+
+    fn select_snapshot(names: &[&str]) -> AisixSnapshot {
+        let snap = AisixSnapshot::new();
+        for name in names {
+            let model: Model = serde_json::from_value(serde_json::json!({
+                "display_name": name,
+                "provider": "openai",
+                "model_name": "up",
+                "provider_key_id": "pk-1",
+            }))
+            .unwrap();
+            snap.models
+                .insert(ResourceEntry::new(format!("id-{name}"), model, 1));
+        }
+        snap
+    }
+
+    fn select_state(snap: &AisixSnapshot) -> ProxyState {
+        ProxyState::new(
+            aisix_core::snapshot::SnapshotHandle::new(snap.clone()),
+            Arc::new(aisix_gateway::Hub::new()),
+            &aisix_core::ProxyConfig {
+                addr: "127.0.0.1:0".into(),
+                request_body_limit_bytes: 0,
+                tls: None,
+                real_ip: Default::default(),
+                request_id: Default::default(),
+                thread_per_core: None,
+                workers: None,
+                url_rewrites: Vec::new(),
+                expose_debug_headers: false,
+                listeners: Vec::new(),
+            },
+        )
+    }
+
+    fn router_model() -> Model {
+        serde_json::from_value(serde_json::json!({
+            "display_name": "router",
+            "semantic": {
+                "embedding_model": "bge-m3",
+                "routes": [{"name": "r", "target": "t", "examples": ["a"]}],
+                "default": "d",
+                "match": {"threshold": 0.5},
+            },
+        }))
+        .unwrap()
+    }
+
+    /// A route target deleted under a healthy `default` costs the route, not
+    /// the request.
+    #[test]
+    fn a_deleted_route_target_falls_through_to_the_fallback() {
+        let snap = select_snapshot(&["default-target"]);
+        let state = select_state(&snap);
+        let (attempt, fell_back) = select_eligible(
+            &state,
+            &snap,
+            &router_model(),
+            "127.0.0.1",
+            "deleted-target",
+            Some("default-target"),
+        )
+        .unwrap();
+        assert_eq!(attempt.model.display_name, "default-target");
+        assert!(fell_back);
+    }
+
+    /// With nothing left to serve it, the refusal names no member.
+    #[test]
+    fn a_router_with_no_target_left_is_refused_without_naming_one() {
+        let snap = select_snapshot(&[]);
+        let state = select_state(&snap);
+        let err = select_eligible(
+            &state,
+            &snap,
+            &router_model(),
+            "127.0.0.1",
+            "secret-target",
+            Some("secret-default"),
+        )
+        .map(|_| ())
+        .unwrap_err();
+        assert!(matches!(err, ProxyError::InvalidRequest(_)), "{err:?}");
+        let text = err.to_string();
+        assert!(!text.contains("secret-target"), "{text}");
+        assert!(!text.contains("secret-default"), "{text}");
     }
 
     /// Embedding is a dispatch the GATEWAY decides to make, and two of its

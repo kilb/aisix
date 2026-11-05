@@ -101,13 +101,14 @@ impl GuardrailEmbedder for ProxyGuardrailEmbedder {
             return Err(unresolved());
         };
 
+        let vector_scope = SemanticVectorCache::vector_scope(&entry.id, &entry.value);
         // Cache lookup first, so a fully warm example set costs no call.
         let mut cached: Vec<Option<Vec<f32>>> = Vec::with_capacity(texts.len());
         let mut misses: Vec<String> = Vec::new();
         for text in texts {
             let hit = if cacheable {
                 self.cache
-                    .get(&entry.id, dimensions, text)
+                    .get(&vector_scope, dimensions, text)
                     .map(|v| v.as_ref().clone())
             } else {
                 None
@@ -149,7 +150,7 @@ impl GuardrailEmbedder for ProxyGuardrailEmbedder {
         if cacheable {
             for (text, vector) in misses.iter().zip(fetched.iter()) {
                 self.cache
-                    .insert(&entry.id, dimensions, text, Arc::new(vector.clone()));
+                    .insert(&vector_scope, dimensions, text, Arc::new(vector.clone()));
             }
         }
 
@@ -196,7 +197,9 @@ fn classify(err: EmbedTextsError) -> EmbedError {
         // No bridge for the provider key, or the model has no provider /
         // upstream model name — configuration, not an outage.
         EmbedTextsError::Dispatch(
-            ProxyError::ProviderUnavailable | ProxyError::InvalidRequest(_),
+            ProxyError::ProviderUnavailable
+            | ProxyError::InvalidRequest(_)
+            | ProxyError::UnusableTarget(_),
         ) => EmbedFailure::Unresolved,
         EmbedTextsError::Dispatch(_) | EmbedTextsError::UnusableResponse(_) => {
             EmbedFailure::Upstream
