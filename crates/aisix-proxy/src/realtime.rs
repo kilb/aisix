@@ -1111,6 +1111,8 @@ struct SessionMeter<'a> {
     output_tokens: u64,
     cached_tokens: u64,
     micro_usd: u64,
+    /// What the session has cost so far: each response priced when it arrived.
+    cost_usd: f64,
     responses: u32,
 }
 
@@ -1120,46 +1122,49 @@ impl SessionMeter<'_> {
         self.responses != usage.responses
     }
 
-    /// The session's whole cost so far, through the index every other reader of
-    /// a model's price uses, from the row the session started on: it can outlive
-    /// the generation that had that row, and re-reading it could price the whole
-    /// session at nothing.
-    fn cost_usd(&self, snap: &aisix_core::AisixSnapshot, usage: &SessionUsage) -> f64 {
+    /// What these tokens cost at the price in force now, through the index every
+    /// other reader of a model's price uses, from the row the session started on:
+    /// it can outlive the generation that had that row, and re-reading it could
+    /// price the whole session at nothing.
+    fn price_usd(
+        &self,
+        snap: &aisix_core::AisixSnapshot,
+        input: u64,
+        cached: u64,
+        output: u64,
+    ) -> f64 {
         // The session's `input_tokens` includes what it read back from the
         // prompt cache (the OpenAI convention), so `cached_tokens` goes in the
         // subset slot. This surface reports no cache writes and none of the
         // separate read or write counters.
-        let input = crate::usage_attr::input_tokens_for_pricing(
-            usage.input_tokens,
-            usage.cached_tokens,
-            0,
-            0,
-            0,
-        );
+        let input = crate::usage_attr::input_tokens_for_pricing(input, cached, 0, 0, 0);
         self.state
             .pricing
             .for_snapshot(snap)
             .resolve(&self.model_entry.value)
-            .map(|c| c.calculate_with_cache(input, usage.output_tokens))
+            .map(|c| c.calculate_with_cache(input, output))
             .unwrap_or(0.0)
     }
 
-    /// Charge what arrived since the last call. The metric and the limits get
-    /// the difference from the running total, so what they add up to is exactly
-    /// what the session's one usage event reports.
+    /// Charge what arrived since the last call, at the price in force when it
+    /// arrived: a price that changes mid-session applies from then on, not to
+    /// what was already charged. The metric and the limits get the difference
+    /// from the running total, so what they add up to is exactly what the
+    /// session's one usage event reports.
     fn settle(&mut self, usage: &SessionUsage) {
         if !self.behind(usage) {
             return;
         }
         let snap = self.state.snapshot.load();
         let pk = crate::usage_attr::ResolvedPk::resolve(&snap, self.pk_id);
-        let micro_usd = crate::usage_attr::spend_micro_usd(self.cost_usd(&snap, usage));
-        let spend = micro_usd.saturating_sub(self.micro_usd);
         let input = usage.input_tokens.saturating_sub(self.input_tokens);
         let output = usage.output_tokens.saturating_sub(self.output_tokens);
         let cached = usage.cached_tokens.saturating_sub(self.cached_tokens);
         (self.input_tokens, self.output_tokens, self.cached_tokens) =
             (usage.input_tokens, usage.output_tokens, usage.cached_tokens);
+        self.cost_usd += self.price_usd(&snap, input, cached, output);
+        let micro_usd = crate::usage_attr::spend_micro_usd(self.cost_usd);
+        let spend = micro_usd.saturating_sub(self.micro_usd);
         self.micro_usd = self.micro_usd.max(micro_usd);
         self.responses = usage.responses;
 
@@ -1199,18 +1204,30 @@ impl SessionMeter<'_> {
     }
 
     /// Why this session may not go on, read off the current config: the key that
-    /// opened it was disabled, deleted or has expired, or a budget it answers to
-    /// ran out. Admission only looked once, and a session can run for hours.
+    /// opened it was disabled, deleted, rotated or has expired, it may no longer
+    /// use the model, or a budget it or its provider key answers to ran out.
+    /// Admission only looked once, and a session can run for hours.
     fn refusal(&self) -> Option<ProxyError> {
         let snap = self.state.snapshot.load();
         match snap.apikeys.get_by_id(&self.auth.entry.id) {
             Some(key) if key.value.is_expired_at(chrono::Utc::now()) => {
                 return Some(ProxyError::ApiKeyExpired)
             }
-            Some(key) if !key.value.disabled => {}
-            _ => return Some(ProxyError::ApiKeyDisabled),
+            // A rotated credential is a revoked one for the session it opened.
+            Some(key)
+                if key.value.disabled || key.value.key_hash != self.auth.entry.value.key_hash =>
+            {
+                return Some(ProxyError::ApiKeyDisabled)
+            }
+            Some(key) if !key.value.can_access(&snap, self.requested_model) => {
+                return Some(ProxyError::ModelForbidden(self.requested_model.to_string()))
+            }
+            Some(_) => {}
+            None => return Some(ProxyError::ApiKeyDisabled),
         }
-        crate::budget::enforce_key(self.state, &snap, self.auth).err()
+        crate::budget::enforce_key(self.state, &snap, self.auth)
+            .and_then(|()| crate::budget::gate(self.state, &snap).check_provider_key(self.pk_id))
+            .err()
     }
 }
 
@@ -1439,6 +1456,7 @@ async fn run_session(
         output_tokens: 0,
         cached_tokens: 0,
         micro_usd: 0,
+        cost_usd: 0.0,
         responses: 0,
     };
     let mut usage = SessionUsage::default();
@@ -1604,8 +1622,9 @@ async fn run_session(
                         OutputStep::Release { scan, frames } => (scan, frames),
                         OutputStep::Overflow { fail_open, frames } => {
                             if fail_open {
+                                // The rest of this response goes out unscanned, as
+                                // on the other routes; the next one is held.
                                 crate::guardrail_stream::release_output_buffer_unscanned(&chain);
-                                held_output = None;
                             } else {
                                 aisix_guardrails::Guardrail::record_output_buffer_exceeded(&chain);
                                 let refusal = crate::error::guardrail_block_error(
@@ -1725,8 +1744,12 @@ async fn run_session(
         }
     }
 
-    // Every other way out of the loop leaves the upstream half open: send
-    // its Close, or flush the reply to the one it sent.
+    // Every other way out of the loop leaves the upstream half open: send its
+    // Close and read what it sends back, as the client's own close does, so a
+    // `response.done` already on its way is still billed. Where the upstream
+    // already closed, the send fails and this returns at once; the flush below
+    // then sends the reply to the Close it sent.
+    close_upstream(&mut up_tx, &mut up_rx, None, |text| usage.absorb(text)).await;
     let _ = tokio::time::timeout(UPSTREAM_CLOSE_ACK, up_tx.close()).await;
 
     // Whoever hung up first, a session that only ever reported an error failed.
@@ -1775,7 +1798,7 @@ async fn run_session(
     // What the last frames brought, then the session's whole cost: one figure,
     // the same one the event reports and the charges along the way add up to.
     meter.settle(&usage);
-    let cost_usd = meter.cost_usd(&snap, &usage);
+    let cost_usd = meter.cost_usd;
     reservation.commit_tokens_no_spend(0).await;
 
     emit_access_log(
@@ -2304,6 +2327,9 @@ struct HeldOutput {
     content: usize,
     raw: usize,
     gauge: crate::held_content::HeldBytes,
+    /// A fail-open overflow let the rest of this response through unscanned;
+    /// the next one is held again.
+    passing: bool,
 }
 
 struct HeldOutputItem {
@@ -2366,6 +2392,7 @@ impl HeldOutput {
             content: 0,
             raw: 0,
             gauge: Default::default(),
+            passing: false,
         }
     }
 
@@ -2374,6 +2401,10 @@ impl HeldOutput {
             return OutputStep::release(frame);
         };
         let kind = head.kind.as_ref();
+        if self.passing {
+            self.passing = kind != "response.done";
+            return OutputStep::release(frame);
+        }
         // An answer is over, whichever way: nothing else will close its items.
         if kind == "response.done" {
             return self.release_items(None, frame);
@@ -2422,6 +2453,7 @@ impl HeldOutput {
         self.content = 0;
         self.raw = 0;
         self.gauge.clear();
+        self.passing = self.fail_open;
         OutputStep::Overflow {
             fail_open: self.fail_open,
             frames,
@@ -3170,6 +3202,128 @@ mod tests {
         seen
     }
 
+    /// A price that changes mid-session applies from then on: what was already
+    /// charged stays charged at the price it was charged at.
+    #[tokio::test]
+    async fn a_price_change_mid_session_applies_from_then_on() {
+        let up_addr = spawn_open_upstream().await;
+        let snap = snapshot_with_cost(
+            &format!("http://{up_addr}/v1"),
+            "openai",
+            "openai",
+            r#","pricing_key":"rt-price""#,
+        );
+        let price = |per_1k: f64, rev: i64| {
+            let p: aisix_core::models::pricing::Pricing = serde_json::from_value(
+                serde_json::json!({"key": "rt-price", "input_per_1k": per_1k, "output_per_1k": per_1k}),
+            )
+            .unwrap();
+            ResourceEntry::new("p-1", p, rev)
+        };
+        snap.pricing.insert(price(0.5, 1));
+        let (addr, state, mut rx) = serve(snap).await;
+        let mut req = format!("ws://{addr}/v1/realtime?model=rt-model")
+            .into_client_request()
+            .unwrap();
+        req.headers_mut()
+            .insert("authorization", "Bearer sk-caller".parse().unwrap());
+        let (ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+        let (mut tx, client_rx) = ws.split();
+        let ask = || TgMessage::Text(serde_json::json!({"type": "response.create"}).to_string());
+
+        // 1000 + 1000 tokens at $0.5/1k, then the same at $1/1k.
+        tx.send(ask()).await.unwrap();
+        assert_eq!(spend_reaches(&state, 1_000_000).await, 1_000_000);
+        state.snapshot.load().pricing.insert(price(1.0, 2));
+        tx.send(ask()).await.unwrap();
+        assert_eq!(spend_reaches(&state, 3_000_000).await, 3_000_000);
+        drop((tx, client_rx));
+
+        let ev = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .expect("the session's event")
+            .expect("sink closed");
+        assert!((ev.cost_usd - 3.0).abs() < 1e-9, "{}", ev.cost_usd);
+        assert_eq!(
+            spend_reaches(&state, 4_000_000).await,
+            3_000_000,
+            "nothing already charged is charged again"
+        );
+    }
+
+    /// The key that opened a session stops it when it is rotated, when it may
+    /// no longer use the model, and when its provider key's budget runs out.
+    #[tokio::test]
+    async fn a_session_ends_when_its_key_is_rotated_or_loses_the_model_or_the_budget() {
+        for (change, status) in [("rotate", 401), ("acl", 403), ("budget", 0)] {
+            let up_addr = spawn_open_upstream().await;
+            let snap = snapshot(&format!("http://{up_addr}/v1"), "openai", "openai");
+            let (addr, state, mut rx) = serve(snap).await;
+            let mut req = format!("ws://{addr}/v1/realtime?model=rt-model")
+                .into_client_request()
+                .unwrap();
+            req.headers_mut()
+                .insert("authorization", "Bearer sk-caller".parse().unwrap());
+            let (ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+            let (mut tx, mut client_rx) = ws.split();
+            let ask =
+                || TgMessage::Text(serde_json::json!({"type": "response.create"}).to_string());
+            tx.send(ask()).await.unwrap();
+            assert!(matches!(
+                client_rx.next().await,
+                Some(Ok(TgMessage::Text(_)))
+            ));
+
+            let live = state.snapshot.load();
+            match change {
+                "rotate" | "acl" => {
+                    let key = live.apikeys.get_by_id("k-1").unwrap();
+                    let mut changed = (*key.value).clone();
+                    if change == "rotate" {
+                        changed.key_hash = "0".repeat(64);
+                    } else {
+                        changed.allowed_models = vec!["another-model".to_string()];
+                    }
+                    live.apikeys.insert(ResourceEntry::new("k-1", changed, 2));
+                }
+                _ => {
+                    let budget: aisix_core::models::Budget =
+                        serde_json::from_value(serde_json::json!({
+                            "scope": "provider_key",
+                            "scope_ref": PK_ID,
+                            "period": "month",
+                            "exhausted": {"reason": {"message": "pk out", "scope": "provider_key"}},
+                        }))
+                        .unwrap();
+                    live.budgets.insert(ResourceEntry::new("b-1", budget, 1));
+                }
+            }
+
+            tx.send(ask()).await.unwrap();
+            let close_code = tokio::time::timeout(Duration::from_secs(5), async {
+                while let Some(Ok(msg)) = client_rx.next().await {
+                    if let TgMessage::Close(frame) = msg {
+                        return frame.map(|f| u16::from(f.code));
+                    }
+                }
+                None
+            })
+            .await
+            .ok()
+            .flatten();
+            assert_eq!(close_code, Some(1008), "{change}");
+            let ev = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+                .await
+                .expect("the session's event")
+                .expect("sink closed");
+            if status != 0 {
+                assert_eq!(ev.status_code, status, "{change}");
+            } else {
+                assert!(ev.status_code >= 400, "{change}: {}", ev.status_code);
+            }
+        }
+    }
+
     /// A session can run for hours. What it spends has to reach the counter a
     /// ledger reads while it is open, a key disabled meanwhile has to stop it,
     /// and what the session's one event reports is what the charges add up to.
@@ -3594,6 +3748,43 @@ mod tests {
         assert_eq!(event.requested_model, "rt-model");
     }
 
+    /// A session the gateway ends itself still reads what the upstream was
+    /// already sending, so a response finished meanwhile is billed.
+    #[tokio::test]
+    async fn a_session_the_gateway_ends_bills_the_response_already_on_its_way() {
+        let up_addr = spawn_scripted_upstream(vec![
+            delta("response.output_text.delta", "i1", "say FORBIDDEN"),
+            serde_json::json!({"type": "response.output_text.done", "item_id": "i1"}),
+            serde_json::json!({"type": "response.done", "response": {"usage": {"input_tokens": 7, "output_tokens": 9}}}),
+        ])
+        .await;
+        let snap = snapshot(&format!("http://{up_addr}/v1"), "openai", "openai");
+        let row: aisix_core::Guardrail = serde_json::from_str(KEYWORD_OUTPUT_BLOCK).unwrap();
+        crate::seed_env_scoped_guardrail(&snap, ResourceEntry::new("g-1", row, 1));
+        let (addr, _state, mut usage_rx) = serve(snap).await;
+        let mut req = format!("ws://{addr}/v1/realtime?model=rt-model")
+            .into_client_request()
+            .unwrap();
+        req.headers_mut()
+            .insert("authorization", "Bearer sk-caller".parse().unwrap());
+        let (ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+        let (mut tx, mut rx) = ws.split();
+        tx.send(TgMessage::Text(r#"{"type":"response.create"}"#.to_string()))
+            .await
+            .unwrap();
+        while let Some(Ok(msg)) = rx.next().await {
+            if matches!(msg, TgMessage::Close(_)) {
+                break;
+            }
+        }
+        let event = tokio::time::timeout(Duration::from_secs(5), usage_rx.recv())
+            .await
+            .expect("the session's event")
+            .expect("usage sink closed");
+        assert_eq!(event.status_code, 400, "refused");
+        assert_eq!((event.prompt_tokens, event.completion_tokens), (7, 9));
+    }
+
     /// A literal across two deltas matches neither, so a chain that can block
     /// has to judge the item whole before any of it goes out.
     #[tokio::test]
@@ -3740,6 +3931,16 @@ mod tests {
             }
             _ => panic!("expected an overflow"),
         }
+        // Only for the rest of that response: the next one is held again.
+        assert!(matches!(
+            open.observe(frame("more")),
+            OutputStep::Release { .. }
+        ));
+        assert!(matches!(
+            open.observe(serde_json::json!({"type": "response.done"}).to_string()),
+            OutputStep::Release { .. }
+        ));
+        assert!(matches!(open.observe(frame("ab")), OutputStep::Held));
     }
 
     /// `/v1/realtime` builds its upstream handshake by hand rather than
