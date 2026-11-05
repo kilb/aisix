@@ -267,6 +267,57 @@ pub struct PartialCompatResource {
     pub count: usize,
 }
 
+/// How many resource ids one [`ConfigWarning`] lists; `count` still covers
+/// them all. `GET /status/config` is unauthenticated and an environment can
+/// hold a great many rows of one shape.
+const MAX_WARNING_RESOURCE_IDS: usize = 64;
+
+/// Configuration that loads and serves but does not do what it reads as doing,
+/// reported on `GET /status/config` under `warnings[]`.
+///
+/// Not a rejection: nothing failed to load, `state` is unaffected and the
+/// operator may mean it. It exists for a shape whose meaning changed between
+/// releases, or that quietly does nothing, where a clean status would otherwise
+/// read as "the rule is in force". Ids rather than names, as on `rejected[]`,
+/// because the endpoint is unauthenticated.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ConfigWarning {
+    /// Stable identifier of the shape, for alerting.
+    pub code: &'static str,
+    /// Plural resource kind (`models`, `guardrails`, …).
+    pub resource_kind: &'static str,
+    /// Resources of this kind currently in this shape.
+    pub count: usize,
+    /// Their ids, sorted, capped at [`MAX_WARNING_RESOURCE_IDS`].
+    pub resource_ids: Vec<String>,
+    /// What this means and what to do about it.
+    pub message: &'static str,
+}
+
+impl ConfigWarning {
+    /// `None` when no resource is in this shape.
+    pub fn new(
+        code: &'static str,
+        resource_kind: &'static str,
+        mut resource_ids: Vec<String>,
+        message: &'static str,
+    ) -> Option<Self> {
+        if resource_ids.is_empty() {
+            return None;
+        }
+        let count = resource_ids.len();
+        resource_ids.sort();
+        resource_ids.truncate(MAX_WARNING_RESOURCE_IDS);
+        Some(Self {
+            code,
+            resource_kind,
+            count,
+            resource_ids,
+            message,
+        })
+    }
+}
+
 /// A configuration digest, computed the first time something reports it.
 ///
 /// Hashing is proportional to the whole configuration, not to the change
@@ -535,6 +586,10 @@ struct ConfigStatusInner {
     // wholesale on every load, like the partially-compatible state.
     stale_served_rows_by_kind: BTreeMap<String, usize>,
 
+    // Shapes that load and serve but do not do what they read as doing.
+    // Derived from the served snapshot, replaced wholesale on each publication.
+    warnings: Vec<ConfigWarning>,
+
     // Metric counters.
     reloads_total: u64,
     reload_failures: BTreeMap<&'static str, u64>,
@@ -579,6 +634,7 @@ impl ConfigStatus {
                 partially_compatible: Vec::new(),
                 partially_compatible_rows_by_kind: BTreeMap::new(),
                 stale_served_rows_by_kind: BTreeMap::new(),
+                warnings: Vec::new(),
                 reloads_total: 0,
                 reload_failures: BTreeMap::new(),
             })),
@@ -815,6 +871,11 @@ impl ConfigStatus {
                 last_error: err,
             });
         }
+    }
+
+    /// Replace the warnings derived from the served snapshot.
+    pub fn record_warnings(&self, warnings: Vec<ConfigWarning>) {
+        self.inner.lock().unwrap().warnings = warnings;
     }
 
     /// Record that the source became unreachable (etcd connect / load failed).
@@ -1071,6 +1132,7 @@ impl ConfigStatusInner {
                 rejected,
                 unknown_kinds,
                 partially_compatible,
+                warnings: self.warnings.clone(),
             },
             self.source_hash.clone(),
             self.effective_hash(),
@@ -1130,6 +1192,10 @@ pub struct ConfigStatusView {
     /// distinguishes "fully synced" from "synced with fields this
     /// gateway version does not enforce".
     pub partially_compatible: Vec<PartialCompatResource>,
+    /// Shapes that load and serve but do not do what they read as doing — see
+    /// [`ConfigWarning`]. Leaves `state` alone: `synced` with an entry here is
+    /// a gateway serving exactly what it was given.
+    pub warnings: Vec<ConfigWarning>,
 }
 
 #[derive(Debug, Clone, Serialize)]

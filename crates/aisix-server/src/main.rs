@@ -366,6 +366,23 @@ fn run_validate(resources: &Path) -> anyhow::Result<()> {
             );
         }
     }
+    let silently_off: Vec<String> = snapshot
+        .models
+        .matching_entries(|e| {
+            e.value
+                .cooldown
+                .as_ref()
+                .is_some_and(|cooldown| cooldown.is_silently_off())
+        })
+        .into_iter()
+        .map(|e| e.value.display_name.clone())
+        .collect();
+    for name in &silently_off {
+        eprintln!(
+            "resources file {}: warning: models ({name:?}): {COOLDOWN_NOT_ENABLED}",
+            resources.display(),
+        );
+    }
     // Operations whose ids collide after tool-name sanitization load and
     // stay callable under a `_2` / `_3` … suffix, so this is not an error —
     // but the suffixed names are not the ones the spec's author wrote.
@@ -1147,6 +1164,16 @@ async fn run(mut cfg: Config, hangup: Option<HangupSignal>) -> anyhow::Result<()
                      `max_spend_micro_usd` on a RateLimitPolicy, to restore a ceiling.",
                 );
             }
+        });
+    }
+
+    // Shapes that serve but do not do what they read as doing. On publication,
+    // for the same reason as the block above, and because the file source has
+    // no later hook: `/status/config` has to say so from the first load on.
+    {
+        let status = config_status.clone();
+        snapshot_handle.subscribe_after_publish(move |view| {
+            status.record_warnings(config_warnings(&view.snapshot));
         });
     }
 
@@ -3849,6 +3876,53 @@ async fn wait_for_signal(
     let _ = cancel_tx.send(true);
 }
 
+/// A `cooldown` block with no `enabled` used to mean on and now means off.
+const COOLDOWN_NOT_ENABLED: &str = "a cooldown block that does not set `enabled` keeps this model \
+     in rotation whatever else it configures: cooldown is opt-in. Set `enabled: true` to turn it \
+     on, or `enabled: false` to say it is meant to be off";
+/// A guardrail's scope is its attachments and nothing else.
+const GUARDRAIL_UNATTACHED: &str = "an enabled guardrail with no attachment inspects no traffic. \
+     Add a guardrail attachment to put it in force, or disable it";
+
+/// What `/status/config` warns about for this snapshot. Both shapes are
+/// deliberate meanings that a row written for an earlier one still loads under,
+/// so neither is a rejection, and without this a clean status reads as the rule
+/// being in force.
+fn config_warnings(snapshot: &AisixSnapshot) -> Vec<aisix_core::ConfigWarning> {
+    let silently_off: Vec<String> = snapshot
+        .models
+        .matching_entries(|e| {
+            e.value
+                .cooldown
+                .as_ref()
+                .is_some_and(|cooldown| cooldown.is_silently_off())
+        })
+        .into_iter()
+        .map(|e| e.id.clone())
+        .collect();
+    let unattached = aisix_guardrails::unattached_guardrail_ids(
+        &snapshot.guardrails,
+        &snapshot.guardrail_attachments,
+    );
+    [
+        aisix_core::ConfigWarning::new(
+            "cooldown_not_enabled",
+            "models",
+            silently_off,
+            COOLDOWN_NOT_ENABLED,
+        ),
+        aisix_core::ConfigWarning::new(
+            "guardrail_unattached",
+            "guardrails",
+            unattached,
+            GUARDRAIL_UNATTACHED,
+        ),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
 /// 快照里生效的花费上限条数：控制平面下发的 `budgets` 文档（只有硬上限才有
 /// 文档），加上配了 `max_spend_micro_usd` 的 RateLimitPolicy。
 fn count_spend_ceilings(snapshot: &AisixSnapshot) -> usize {
@@ -3874,6 +3948,91 @@ const fn spend_is_uncapped(managed: bool, configured: usize, total_entries: usiz
 
 #[cfg(test)]
 mod tests {
+    fn warning_of<'a>(
+        warnings: &'a [aisix_core::ConfigWarning],
+        code: &str,
+    ) -> Option<&'a aisix_core::ConfigWarning> {
+        warnings.iter().find(|w| w.code == code)
+    }
+
+    #[test]
+    fn a_cooldown_block_that_never_says_enabled_is_warned_about() {
+        use aisix_core::resource::ResourceEntry;
+        let snapshot = aisix_core::AisixSnapshot::new();
+        let model = |cooldown: serde_json::Value| -> aisix_core::Model {
+            serde_json::from_value(serde_json::json!({
+                "display_name": format!("m-{cooldown}"),
+                "provider": "openai",
+                "model_name": "gpt-4o",
+                "provider_key_id": "pk",
+                "cooldown": cooldown,
+            }))
+            .unwrap()
+        };
+        for (id, cooldown) in [
+            ("silent", serde_json::json!({ "default_seconds": 60 })),
+            ("empty", serde_json::json!({})),
+            ("on", serde_json::json!({ "enabled": true })),
+            (
+                "off",
+                serde_json::json!({ "enabled": false, "max_seconds": 5 }),
+            ),
+        ] {
+            snapshot
+                .models
+                .insert(ResourceEntry::new(id, model(cooldown), 1));
+        }
+        let warnings = super::config_warnings(&snapshot);
+        let warning = warning_of(&warnings, "cooldown_not_enabled").expect("warned");
+        assert_eq!(warning.resource_kind, "models");
+        assert_eq!(warning.count, 2);
+        assert_eq!(warning.resource_ids, ["empty", "silent"]);
+    }
+
+    #[test]
+    fn an_enabled_guardrail_with_no_attachment_is_warned_about_by_id() {
+        use aisix_core::resource::ResourceEntry;
+        let snapshot = aisix_core::AisixSnapshot::new();
+        let guardrail = |name: &str, enabled: bool| -> aisix_core::Guardrail {
+            serde_json::from_value(serde_json::json!({
+                "name": name,
+                "enabled": enabled,
+                "kind": "keyword",
+                "patterns": [{ "kind": "literal", "value": "x" }],
+            }))
+            .unwrap()
+        };
+        snapshot
+            .guardrails
+            .insert(ResourceEntry::new("g-loose", guardrail("loose", true), 1));
+        snapshot
+            .guardrails
+            .insert(ResourceEntry::new("g-held", guardrail("held", true), 1));
+        snapshot
+            .guardrails
+            .insert(ResourceEntry::new("g-off", guardrail("off", false), 1));
+        snapshot.guardrail_attachments.insert(ResourceEntry::new(
+            "a-1",
+            serde_json::from_value(serde_json::json!({
+                "guardrail_id": "g-held", "scope_type": "env", "priority": 100
+            }))
+            .unwrap(),
+            1,
+        ));
+        let warnings = super::config_warnings(&snapshot);
+        let warning = warning_of(&warnings, "guardrail_unattached").expect("warned");
+        assert_eq!(warning.resource_ids, ["g-loose"]);
+        assert!(
+            !warning.message.contains("loose"),
+            "the status endpoint is unauthenticated: ids only"
+        );
+    }
+
+    #[test]
+    fn a_clean_snapshot_warns_about_nothing() {
+        assert!(super::config_warnings(&aisix_core::AisixSnapshot::new()).is_empty());
+    }
+
     /// 托管模式冷启动时快照还是空的（etcd 分支先 restore_from_cache 再
     /// spawn watch）。拿空快照判定会让每个新托管部署都收到一条必然误报的
     /// 「没配预算」告警 —— 实机启动时抓到过这个 bug，这里是它的回归保护。

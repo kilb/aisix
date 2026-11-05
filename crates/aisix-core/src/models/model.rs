@@ -256,6 +256,14 @@ impl CooldownConfig {
         self.enabled == Some(true)
     }
 
+    /// A block that never says whether it is on. It reads as a cooldown being
+    /// configured, and an earlier release treated it as one, but
+    /// [`Self::is_enabled`] says no: nothing in it is ever read. An explicit
+    /// `enabled: false` says what it means and is not this.
+    pub fn is_silently_off(&self) -> bool {
+        self.enabled.is_none()
+    }
+
     pub fn default_seconds_or_default(&self) -> u64 {
         self.default_seconds.unwrap_or(DEFAULT_COOLDOWN_SECONDS)
     }

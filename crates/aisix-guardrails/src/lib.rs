@@ -463,8 +463,8 @@ pub use audit::GuardrailAuditLog;
 pub use bedrock::BedrockGuardrail;
 pub use build::{
     build_chain_from_snapshot, build_index_from_snapshot, sweep_unattached_guardrails,
-    unattached_guardrail_names, unbuildable_guardrail_rows, LiveGuardrailChain, LiveGuardrailIndex,
-    UnbuildableGuardrailRow, UNATTACHED_SWEEP_INTERVAL,
+    unattached_guardrail_ids, unattached_guardrail_names, unbuildable_guardrail_rows,
+    LiveGuardrailChain, LiveGuardrailIndex, UnbuildableGuardrailRow, UNATTACHED_SWEEP_INTERVAL,
 };
 pub use call_error::error_chain;
 pub use chain::GuardrailChain;

@@ -1578,6 +1578,18 @@ pub fn unattached_guardrail_names(
         .collect()
 }
 
+/// Ids of the enabled-but-unattached guardrails, for the status surface, which
+/// is unauthenticated and so shows ids rather than names.
+pub fn unattached_guardrail_ids(
+    guardrails: &ResourceTable<DomainGuardrail>,
+    attachments: &ResourceTable<GuardrailAttachment>,
+) -> Vec<String> {
+    unattached_ids(guardrails, attachments)
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect()
+}
+
 /// How long a guardrail must have been present-and-unattached before the
 /// notice is due.
 ///
