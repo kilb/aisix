@@ -562,6 +562,22 @@ async fn dispatch(
     // Same line, same reason: fill the caller's out-param so the failure
     // path — the one a Block takes — can surface the enforced hits too.
     *audit_out = resolved_chain.audit_log();
+    // Token ids carry no text a guardrail could read, and the gateway cannot
+    // rewrite them. Refused like any other body the chain cannot be given, as
+    // `/v1/completions` refuses a token-id prompt.
+    if matches!(
+        body.input,
+        InputField::Tokens(_) | InputField::TokenArrays(_)
+    ) {
+        if aisix_guardrails::Guardrail::refuses_unevaluable_input(&resolved_chain) {
+            return Err(crate::error::guardrail_block_error(
+                "request",
+                None,
+                Some(crate::error::TAG_UNSCANNABLE_BODY),
+            ));
+        }
+        resolved_chain.record_unevaluable_input_bypass(crate::error::TAG_UNSCANNABLE_BODY);
+    }
     // A check that calls a remote moderation service is admitted by the
     // key's rate limits before it runs, and a refusal keeps the slot it took
     // (see `quota::reserve_before_costly_check`).
@@ -1578,6 +1594,80 @@ mod tests {
         assert_eq!(ev.applied_guardrails[0].kind, "keyword");
         assert_eq!(ev.applied_guardrails[0].hook, "input");
         assert_eq!(ev.status_code, 422);
+    }
+
+    /// Token ids hold the text a rule exists to read, in a form no rule can.
+    /// A chain that fails closed refuses them, and the provider hears nothing.
+    #[tokio::test]
+    async fn token_ids_are_refused_by_a_chain_that_fails_closed() {
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path("/embeddings"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(upstream_response()))
+            .expect(0)
+            .mount(&upstream)
+            .await;
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(model_entry("my-embed"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        crate::seed_env_scoped_guardrail(&snap, keyword_input_guardrail("BLOCKME"));
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let state = crate::ProxyState::new(SnapshotHandle::new(snap), hub, &cfg()).without_cache();
+        let app = crate::build_router(state);
+        for input in [
+            serde_json::json!([1, 2, 3]),
+            serde_json::json!([[1, 2], [3]]),
+        ] {
+            let body = serde_json::json!({"model": "my-embed", "input": input});
+            let resp = tower::ServiceExt::oneshot(app.clone(), make_req(body))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY, "{input}");
+        }
+    }
+
+    /// A row that fails open lets them through, and the request says so.
+    #[tokio::test]
+    async fn token_ids_past_a_chain_that_fails_open_are_recorded_as_a_bypass() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path("/embeddings"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(upstream_response()))
+            .mount(&upstream)
+            .await;
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(model_entry("my-embed"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        let row: aisix_core::Guardrail = serde_json::from_value(serde_json::json!({
+            "name": "open", "enabled": true, "hook_point": "input", "fail_open": true,
+            "kind": "keyword", "patterns": [{"kind": "literal", "value": "BLOCKME"}],
+        }))
+        .unwrap();
+        crate::seed_env_scoped_guardrail(&snap, ResourceEntry::new("g-open", row, 1));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let state = crate::ProxyState::new(SnapshotHandle::new(snap), hub, &cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+        let app = crate::build_router(state);
+        let body = serde_json::json!({"model": "my-embed", "input": [1, 2, 3]});
+        let resp = tower::ServiceExt::oneshot(app, make_req(body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let _ = to_bytes(resp.into_body(), 65536).await.unwrap();
+        let ev = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("the request must emit a UsageEvent")
+            .expect("usage sink sender dropped");
+        assert_eq!(
+            ev.guardrail_bypassed_reason,
+            crate::error::TAG_UNSCANNABLE_BODY
+        );
     }
 
     /// #719: the array `input` form must be scanned too — a blocked literal
