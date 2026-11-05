@@ -955,16 +955,6 @@ pub trait Guardrail: Send + Sync + 'static {
         true
     }
 
-    /// Whether this guardrail can refuse or rewrite REQUEST content: it is
-    /// attached on the input hook and enforces rather than only observing
-    /// (monitor mode). The A2A call sites that refuse request content they
-    /// cannot read ask this, so that an output-only or monitor-mode guardrail
-    /// never causes such a refusal. Follows [`Self::runs_on_input`]; only the
-    /// monitor decorator answers differently.
-    fn enforces_input(&self) -> bool {
-        self.runs_on_input()
-    }
-
     /// Whether checking a request calls a remote service — a moderation API
     /// billed per call — rather than only running local rules. Monitor mode
     /// counts: it observes by making the same calls. A request checked this
@@ -996,7 +986,8 @@ pub trait Guardrail: Send + Sync + 'static {
     /// would not have read the body cannot be the reason it is refused,
     /// and neither can one whose operator asked for `fail_open: true`,
     /// since the refusal reports itself as `guardrail_unavailable` and
-    /// that is precisely what the setting governs.
+    /// that is precisely what the setting governs. A monitored row never
+    /// refuses, so it answers `false` whatever its policy.
     fn refuses_unevaluable_input(&self) -> bool {
         self.runs_on_input() && self.fails_closed_on_input()
     }

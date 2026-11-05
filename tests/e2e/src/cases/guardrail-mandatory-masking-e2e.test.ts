@@ -11,21 +11,21 @@ import {
   startMockSls,
   startOpenAiUpstream,
   waitConfigPropagation,
+  waitForSlsLog,
   type MockSls,
   type OpenAiUpstream,
   type SpawnedApp,
 } from "../harness/index.js";
 
-// E2E: `mandatory: true` on a guardrail that MASKS.
+// E2E: a fail-closed guardrail that MASKS.
 //
-// `mandatory` is documented as changing one thing: a remote guardrail that
-// cannot reach its upstream blocks the request instead of failing open. It
-// says nothing about what happens when the guardrail CAN evaluate, so a
-// mandatory masking guardrail must keep masking exactly as it would without
-// the flag — on every endpoint, on the request and on the (streamed)
-// response — and a mandatory monitor-mode guardrail must keep reporting what
-// it would have masked. Only an outage of the guardrail service changes the
-// outcome: the request is refused instead of passing unscanned.
+// `fail_open: false` and `output_fail_open: false` change one thing: a remote
+// guardrail that cannot reach its upstream blocks instead of letting the content
+// through unscanned. They say nothing about what happens when the guardrail CAN
+// evaluate, so it must keep masking on every endpoint, on the request and on the
+// (streamed) response. Monitor mode is the opposite promise: it never refuses,
+// so a monitored guardrail reports what it would have masked, and when its
+// provider is unreachable it forwards the request and says it went unread.
 //
 // The guardrail under test is a Presidio PII anonymizer (analyze → anonymize,
 // <https://microsoft.github.io/presidio/api-docs/api-docs.html>) masking
@@ -100,8 +100,7 @@ async function startPresidioMock(): Promise<PresidioMock> {
 const presidioGuardrail = (name: string, baseUrl: string, extra: Record<string, unknown>) => ({
   name,
   enabled: true,
-  fail_open: true,
-  mandatory: true,
+  fail_open: false,
   kind: "presidio",
   analyzer_url: baseUrl,
   anonymizer_url: baseUrl,
@@ -189,7 +188,7 @@ function sseData(body: string): Array<Record<string, unknown>> {
     });
 }
 
-describe("a mandatory masking guardrail masks, and blocks only when it cannot evaluate", () => {
+describe("a fail-closed masking guardrail masks, and blocks only when it cannot evaluate", () => {
   const CALLER = "sk-mandatory-mask-caller";
   let app: SpawnedApp | undefined;
   let upstream: OpenAiUpstream | undefined;
@@ -280,10 +279,10 @@ describe("a mandatory masking guardrail masks, and blocks only when it cannot ev
       model_name: "claude-sonnet-4-5",
       provider_key_id: claudePk.id,
     });
-    // Fail-open on both hooks: without `mandatory`, an outage would let the
-    // request and the response through unscanned.
+    // Fail-closed on both hooks: an outage refuses the request or the response
+    // rather than letting it through unscanned.
     await seed.createGuardrail(
-      presidioGuardrail("mandatory-presidio", presidio.baseUrl, { hook_point: "both", output_fail_open: true }),
+      presidioGuardrail("mandatory-presidio", presidio.baseUrl, { hook_point: "both", output_fail_open: false }),
     );
     // Caller key last: once it authenticates, every resource above is in
     // the snapshot.
@@ -460,7 +459,7 @@ describe("a mandatory masking guardrail masks, and blocks only when it cannot ev
     expect(reply).not.toContain(EMAIL);
   });
 
-  test("an unreachable guardrail blocks: mandatory overrides fail_open", async (ctx) => {
+  test("an unreachable guardrail blocks under fail_open: false", async (ctx) => {
     if (!etcdReachable || !app) return ctx.skip();
     const { status, sent } = await post("/v1/chat/completions", {
       model: "mandatory-mask-model",
@@ -470,7 +469,7 @@ describe("a mandatory masking guardrail masks, and blocks only when it cannot ev
     expect(sent).toHaveLength(0);
   });
 
-  test("a guardrail that cannot scan the response blocks it: mandatory overrides output_fail_open", async (ctx) => {
+  test("a guardrail that cannot scan the response blocks it under output_fail_open: false", async (ctx) => {
     if (!etcdReachable || !app) return ctx.skip();
     const { status, text } = await post("/v1/chat/completions", {
       model: "mandatory-mask-outage-model",
@@ -481,7 +480,7 @@ describe("a mandatory masking guardrail masks, and blocks only when it cannot ev
   });
 });
 
-describe("a mandatory monitor-mode masking guardrail still reports what it would have masked", () => {
+describe("a monitor-mode masking guardrail reports what it would have masked and never refuses", () => {
   const CALLER = "sk-mandatory-monitor-caller";
   const GUARD_NAME = "mandatory-monitor-presidio";
   const PII_GUARD_NAME = "mandatory-monitor-pii";
@@ -536,13 +535,12 @@ describe("a mandatory monitor-mode masking guardrail still reports what it would
     await seed.createGuardrail(
       presidioGuardrail(GUARD_NAME, presidio.baseUrl, { hook_point: "input", enforcement_mode: "monitor" }),
     );
-    // A guardrail evaluated in-process, monitored and mandatory too.
+    // A guardrail evaluated in-process, monitored too.
     await seed.createGuardrail({
       name: PII_GUARD_NAME,
       enabled: true,
       hook_point: "input",
       enforcement_mode: "monitor",
-      mandatory: true,
       kind: "pii",
       detectors: [{ type: "china_id_card", action: "block" }],
     });
@@ -595,16 +593,28 @@ describe("a mandatory monitor-mode masking guardrail still reports what it would
     expect(text).not.toContain(CN_ID);
   });
 
-  test("an unreachable guardrail still blocks: monitor mode does not cancel mandatory", async (ctx) => {
-    if (!etcdReachable || !app || !upstream) return ctx.skip();
+  test("a monitored guardrail that cannot be reached forwards the request and records the bypass", async (ctx) => {
+    if (!etcdReachable || !app || !upstream || !sls) return ctx.skip();
     const before = upstream.receivedRequests.length;
-    const res = await chat(`${OUTAGE} contact me at ${EMAIL}`);
-    expect(res.status).toBe(422);
-    expect(upstream.receivedRequests.length).toBe(before);
+    const prompt = `${OUTAGE} contact me at ${EMAIL}`;
+    const res = await chat(prompt);
+    expect(res.status, await res.text()).toBe(200);
+    expect(upstream.receivedRequests.length).toBe(before + 1);
+    expect(upstream.receivedRequests.at(-1)!.body).toContain(prompt);
+
+    const requestId = res.headers.get("x-aisix-request-id");
+    const log = await waitForSlsLog(
+      sls,
+      LOGSTORE,
+      (l) => l.get("request_id") === requestId,
+      "the row of the request the guardrail could not read",
+    );
+    expect(log.get("guardrail_bypassed_reason")).toBe("presidio_5xx");
+    expect(log.get("guardrail_blocked") ?? "false").not.toBe("true");
   });
 });
 
-describe("a mandatory masking guardrail on an A2A agent's answer", () => {
+describe("a fail-closed masking guardrail on an A2A agent's answer", () => {
   const CALLER = "sk-mandatory-a2a-caller";
   let app: SpawnedApp | undefined;
   let presidio: PresidioMock | undefined;
@@ -668,7 +678,7 @@ describe("a mandatory masking guardrail on an A2A agent's answer", () => {
     app = await spawnApp();
     const seed = new SeedClient(etcd, app.etcdPrefix);
     await seed.createGuardrail(
-      presidioGuardrail("mandatory-presidio-a2a", presidio.baseUrl, { hook_point: "output", output_fail_open: true }),
+      presidioGuardrail("mandatory-presidio-a2a", presidio.baseUrl, { hook_point: "output", output_fail_open: false }),
     );
     await seed.update("a2a_agents", randomUUID(), {
       name: "helper",

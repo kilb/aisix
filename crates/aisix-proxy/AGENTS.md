@@ -87,7 +87,9 @@ failure policy is fail-closed — and a chain is `any` over its members. Both
 halves must hold on the SAME member, which is why there is a combined predicate
 rather than two you could `&&` together: a chain of [output-only fail-closed,
 input-only fail-open] reads the request and contains a fail-closed row, yet
-nothing in it justifies refusing a request.
+nothing in it justifies refusing a request. A monitored row answers `false` to
+both whatever its policy, because monitor mode never refuses; what it could not
+read is a bypass like any other.
 
 The failure policy is per hook: the row's `fail_open` governs the input hook,
 and each remote kind's own `<Kind>Config::output_fail_open` governs the output
@@ -179,8 +181,8 @@ transcript OUTPUT scan is a separate site and is gated rather than dropped:
 `transcription_output_text` reports whether the plain-text fallback (`text` /
 `srt` / `vtt`) had to decode lossily, and its caller runs the same gate as
 `/mcp`'s tool-result arm — refuse under `refuses_unevaluable_output`, record
-the bypass otherwise. Those two are the crate's only `refuses_unevaluable_output`
-call sites: `/v1/messages` and `/v1/messages/count_tokens` gate the INPUT side
+the bypass otherwise. Those two and `/a2a`, on an answer and on each streamed
+event, are the typed routes' `refuses_unevaluable_output` call sites: `/v1/messages` and `/v1/messages/count_tokens` gate the INPUT side
 with the mirror predicate, and their response-side `unscannable_body` arms are
 the held-back-stream ones listed above as deliberately ungated. Audio differs
 from `/mcp` in still scanning the lossy text when it does not refuse, because a

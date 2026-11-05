@@ -831,6 +831,8 @@ struct Success {
     /// ensemble sub-call emitters are handed the value captured EARLIER in
     /// the request, which a request-scoped snapshot cannot express. The two
     /// agree by construction: both are the first `Bypass` the chain folded.
+    /// A monitored row whose check could not run has no such verdict and only
+    /// the audit log knows, so the emitter reads that when this is empty.
     bypass_reason: Option<String>,
     /// Cache outcome for this request. `disabled` when no enabled
     /// cache_policy is in snapshot for the env; `miss` when the cache
@@ -5201,7 +5203,11 @@ fn emit_usage_event(
         finish_reason: extras.finish_reason,
         cost_usd,
         guardrail_blocked,
-        guardrail_bypassed_reason: extras.bypass_reason,
+        guardrail_bypassed_reason: if extras.bypass_reason.is_empty() {
+            crate::usage_attr::bypass_reason(audit)
+        } else {
+            extras.bypass_reason
+        },
         applied_guardrails: extras.applied_guardrails,
         redacted_entity_counts: extras.redacted_entity_counts,
         guardrail_monitor_hits: extras.guardrail_monitor_hits,

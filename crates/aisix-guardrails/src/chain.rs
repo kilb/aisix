@@ -656,6 +656,18 @@ fn record_execution(
     if let (Some(audit), Some(tag)) = (to.audit, verdict.bypass_reason()) {
         audit.record_bypass(tag);
     }
+    // A monitored row whose check could not run let the content through
+    // unread whatever its `fail_open` says: its downgraded verdict is `Allow`,
+    // so this is the one bypass no verdict reports.
+    if let ("would_block", Some(tag)) = (result, error_type) {
+        let tag = crate::bounded_failure_tag(tag);
+        if let Some(audit) = to.audit {
+            audit.record_bypass(&tag);
+        }
+        if let Some(sink) = to.sink {
+            sink.record_guardrail_bypass(&tag);
+        }
+    }
     if let (Some(audit), "blocked" | "masked") = (to.audit, result) {
         // A `blocked` member reports no counts: the block short-circuits
         // before any span is rewritten, and the reason stays off the event
@@ -738,10 +750,6 @@ impl Guardrail for GuardrailChain {
 
     fn runs_on_output(&self) -> bool {
         self.members.iter().any(|m| m.guardrail.runs_on_output())
-    }
-
-    fn enforces_input(&self) -> bool {
-        self.members.iter().any(|m| m.guardrail.enforces_input())
     }
 
     fn checks_input_remotely(&self) -> bool {

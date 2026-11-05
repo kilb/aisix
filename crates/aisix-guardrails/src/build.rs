@@ -1068,19 +1068,23 @@ impl Guardrail for MonitorGuardrail {
         self.inner.runs_on_output()
     }
 
-    /// Forwarded, NOT forced false. A monitor row still participates in
-    /// the proxy-raised `unscannable_body` refusals — that is a settled
-    /// product decision, not an oversight (monitor mode downgrades a
-    /// guardrail's own verdict, and these refusals have none). Forcing
-    /// either hook predicate to `false` here would also disable
-    /// end-of-stream OBSERVATION, which `responses.rs` gates on
-    /// `runs_on_output`; a monitor row exists precisely to observe.
+    /// Forwarded, NOT forced false. Forcing either hook predicate to `false`
+    /// here would disable end-of-stream OBSERVATION, which `responses.rs`
+    /// gates on `runs_on_output`; a monitor row exists precisely to observe.
     fn runs_on_input(&self) -> bool {
         self.inner.runs_on_input()
     }
 
-    // Monitor mode never refuses or rewrites a request.
-    fn enforces_input(&self) -> bool {
+    /// False whatever the row's failure policy: monitor mode never refuses,
+    /// for any reason, and a body the gateway could not hand over is no
+    /// exception. What the row cannot read is forwarded and recorded as a
+    /// bypass (`GuardrailChain::record_unevaluable_input_bypass`).
+    fn refuses_unevaluable_input(&self) -> bool {
+        false
+    }
+
+    /// Response-side counterpart of [`Self::refuses_unevaluable_input`].
+    fn refuses_unevaluable_output(&self) -> bool {
         false
     }
 
@@ -1285,10 +1289,6 @@ impl Guardrail for LiveGuardrailChain {
 
     fn runs_on_output(&self) -> bool {
         self.current().runs_on_output()
-    }
-
-    fn enforces_input(&self) -> bool {
-        self.current().enforces_input()
     }
 
     fn checks_input_remotely(&self) -> bool {
@@ -2497,12 +2497,13 @@ mod tests {
         );
     }
 
-    /// `enforces_input` is true only for a chain with a member that can refuse
-    /// or rewrite the request: attached on the input hook (or both) and not in
-    /// monitor mode. An output-only or monitor-mode chain never acts on a
-    /// request, so a call site must not refuse one on its behalf.
+    /// A chain refuses a request it cannot evaluate only through a member that
+    /// reads the request and enforces: attached on the input hook (or both),
+    /// fail-closed and not in monitor mode. An output-only or monitor-mode
+    /// chain never acts on a request, so a call site must not refuse one on
+    /// its behalf. These rows take the default failure policy, fail-closed.
     #[tokio::test]
-    async fn enforces_input_needs_an_enforcing_input_member() {
+    async fn refuses_unevaluable_input_needs_an_enforcing_input_member() {
         let chain_of = |rows: &[(&str, &str)]| {
             let table: ResourceTable<DomainGuardrail> = ResourceTable::default();
             for (i, (hook, mode)) in rows.iter().enumerate() {
@@ -2519,13 +2520,13 @@ mod tests {
             }
             build_chain_from_snapshot(&table, None, &GuardrailEmbedderSlot::none())
         };
-        assert!(chain_of(&[("input", "block")]).enforces_input());
-        assert!(chain_of(&[("both", "block")]).enforces_input());
-        assert!(!chain_of(&[("output", "block")]).enforces_input());
-        assert!(!chain_of(&[("input", "monitor")]).enforces_input());
-        assert!(chain_of(&[("output", "block"), ("both", "block")]).enforces_input());
-        assert!(!chain_of(&[("output", "block"), ("input", "monitor")]).enforces_input());
-        assert!(!chain_of(&[]).enforces_input());
+        assert!(chain_of(&[("input", "block")]).refuses_unevaluable_input());
+        assert!(chain_of(&[("both", "block")]).refuses_unevaluable_input());
+        assert!(!chain_of(&[("output", "block")]).refuses_unevaluable_input());
+        assert!(!chain_of(&[("input", "monitor")]).refuses_unevaluable_input());
+        assert!(chain_of(&[("output", "block"), ("both", "block")]).refuses_unevaluable_input());
+        assert!(!chain_of(&[("output", "block"), ("input", "monitor")]).refuses_unevaluable_input());
+        assert!(!chain_of(&[]).refuses_unevaluable_input());
     }
 
     /// An unrecognised enforcement_mode is treated as `block` (fail-safe).
@@ -2839,28 +2840,51 @@ mod tests {
             };
             for hook in ["input", "both"] {
                 let enforcing = built(hook, "block");
-                assert!(enforcing.enforces_input(), "{body} on {hook}");
+                assert!(enforcing.refuses_unevaluable_input(), "{body} on {hook}");
                 assert_eq!(
                     enforcing.checks_input_remotely(),
                     *remote,
                     "{body} on {hook}"
                 );
+                assert_eq!(
+                    enforcing.locates_input_hits(),
+                    !*remote,
+                    "{body} on {hook}: a verdict from elsewhere names no span"
+                );
                 let monitored = built(hook, "monitor");
-                assert!(!monitored.enforces_input(), "{body} monitored on {hook}");
+                assert!(
+                    !monitored.refuses_unevaluable_input(),
+                    "{body} monitored on {hook} never refuses"
+                );
                 assert_eq!(
                     monitored.checks_input_remotely(),
                     *remote,
                     "{body} monitored on {hook} observes by making the same calls"
                 );
+                assert!(
+                    monitored.locates_input_hits(),
+                    "{body} monitored on {hook} refuses nothing it would have to locate"
+                );
             }
             for mode in ["block", "monitor"] {
                 let output_only = built("output", mode);
-                assert!(!output_only.enforces_input(), "{body} output-only {mode}");
+                assert!(
+                    !output_only.refuses_unevaluable_input(),
+                    "{body} output-only {mode}"
+                );
                 assert!(
                     !output_only.checks_input_remotely(),
                     "{body} output-only {mode} makes no call on a request"
                 );
+                assert!(
+                    output_only.locates_input_hits(),
+                    "{body} output-only {mode} has no hit on a request"
+                );
             }
+            assert!(
+                !built("both", "monitor").refuses_unevaluable_output(),
+                "{body} monitored never refuses a response either"
+            );
         }
     }
 
@@ -3006,6 +3030,44 @@ mod tests {
             "aliyun_text_moderation guardrail evaluation unavailable (aliyun_5xx)"
         );
         assert_eq!(hits[0].error_type, "aliyun_5xx");
+    }
+
+    /// A monitored row whose provider failed let the request through unread,
+    /// fail-closed default included: the verdict stays `Allow` and the chain
+    /// says so as a bypass. A monitored rule that ran and matched read the
+    /// request, so it is no bypass.
+    #[tokio::test]
+    async fn a_monitored_check_that_could_not_run_records_a_bypass() {
+        use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
+        let server = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let chain_of = |row: &DomainGuardrail| {
+            let g = build_one(row, None, &GuardrailEmbedderSlot::none())
+                .unwrap()
+                .unwrap();
+            GuardrailChain::new(vec![g])
+                .with_audit_log(Some(Arc::new(crate::GuardrailAuditLog::new())))
+        };
+
+        let outage = chain_of(&aliyun_row_against(
+            &server.uri(),
+            r#", "enforcement_mode": "monitor""#,
+        ));
+        let (verdict, _) = outage.check_input_observed(&req("hello")).await;
+        assert_eq!(verdict, GuardrailVerdict::Allow);
+        assert_eq!(outage.bypass_reason().as_deref(), Some("aliyun_5xx"));
+
+        let matched = chain_of(&parse(
+            r#"{"name": "kw", "enforcement_mode": "monitor", "kind": "keyword",
+                "patterns": [{ "kind": "literal", "value": "hello" }]}"#,
+        ));
+        let (verdict, hits) = matched.check_input_observed(&req("hello")).await;
+        assert_eq!(verdict, GuardrailVerdict::Allow);
+        assert_eq!(hits[0].action, "would_block");
+        assert_eq!(matched.bypass_reason(), None);
     }
 
     /// Monitor mode is unconditional: a provider outage is still only

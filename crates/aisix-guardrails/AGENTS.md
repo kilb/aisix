@@ -89,4 +89,6 @@ a failure policy. Do not add an exception: the value of the mode is that
 it is safe to turn on, and one edge that refuses traffic destroys it.
 Wanting an unreachable provider to refuse traffic is wanting
 enforcement, and `block` mode with `fail_open: false` is how that is
-spelled.
+spelled. What a monitored row could not read still goes on the request's
+record: a check that could not run, and a body or answer the gateway could
+not hand it (`refuses_unevaluable_*` answers `false` for it), are a bypass.

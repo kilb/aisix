@@ -601,35 +601,36 @@ async fn dispatch(
                 // `call.text.response` is capped and reads text parts of the
                 // answer only.
                 let scan = aisix_a2a::result_scan(&response_value);
-                // Refused only where a guardrail would act on the answer: an
-                // input-only or monitor-mode chain never refuses one, and
-                // must not start doing so here.
-                if let Some(why) = scan
-                    .unreadable
-                    .filter(|_| enforces_output(&guardrail_chain))
-                {
-                    tracing::warn!(
-                        guardrail_hook = "output",
-                        agent = %agent,
-                        operation = %call.operation,
-                        reason = why,
-                        "guardrail blocked A2A response: content the scan cannot read",
-                    );
-                    return guardrail_refusal(
-                        state,
-                        &snapshot,
-                        &auth,
-                        request_id,
-                        agent,
-                        &call,
-                        rpc_id,
-                        "response",
-                        None,
-                        Some(crate::error::TAG_UNSCANNABLE_BODY),
-                        latency,
-                        trace.as_ref(),
-                        /* dispatched */ true,
-                    );
+                // Refused only where a guardrail reads the answer and fails
+                // closed: an input-only, monitor-mode or `output_fail_open`
+                // chain relays it, and that is a bypass.
+                if let Some(why) = scan.unreadable {
+                    if aisix_guardrails::Guardrail::refuses_unevaluable_output(&guardrail_chain) {
+                        tracing::warn!(
+                            guardrail_hook = "output",
+                            agent = %agent,
+                            operation = %call.operation,
+                            reason = why,
+                            "guardrail blocked A2A response: content the scan cannot read",
+                        );
+                        return guardrail_refusal(
+                            state,
+                            &snapshot,
+                            &auth,
+                            request_id,
+                            agent,
+                            &call,
+                            rpc_id,
+                            "response",
+                            None,
+                            Some(crate::error::TAG_UNSCANNABLE_BODY),
+                            latency,
+                            trace.as_ref(),
+                            /* dispatched */ true,
+                        );
+                    }
+                    guardrail_chain
+                        .record_unevaluable_output_bypass(crate::error::TAG_UNSCANNABLE_BODY);
                 }
                 let answer = scan.text;
                 if !answer.is_empty() {
@@ -1072,7 +1073,9 @@ struct FollowedArtifact {
 /// An A2A event is a whole JSON-RPC message, so the unit held and released is
 /// an event, never part of one. Each event is read the way a unary result is
 /// — every key, string and number, file content decoded — and an event with
-/// content the scan cannot read refuses the answer, as a unary result would.
+/// content the scan cannot read refuses the answer, as a unary result would,
+/// where a guardrail reads the answer and fails closed; otherwise it is relayed
+/// and recorded as a bypass.
 /// An answer streamed in artifact chunks is ALSO read as the caller assembles
 /// it: a chunk with `append` continues its artifact's text, so a phrase
 /// started in one event and finished in the next is read whole.
@@ -1094,6 +1097,9 @@ struct StreamReview {
     /// Set once a fail-open buffer cap has been exceeded: from then on events
     /// pass unreviewed, as the guardrail's own setting asks.
     fail_opened: bool,
+    /// Set once an event relayed unread has been recorded as a bypass: the
+    /// counter takes one per request, not one per event.
+    reported_unread: bool,
 }
 
 impl StreamReview {
@@ -1110,7 +1116,25 @@ impl StreamReview {
             artifacts: Vec::new(),
             dropped_artifacts: false,
             fail_opened: false,
+            reported_unread: false,
         }
+    }
+
+    /// An event the review cannot read: the refusal, or `None` to relay it where
+    /// nothing reads the answer and fails closed.
+    fn unevaluable(&mut self, reason: String) -> Option<StreamVerdict> {
+        if aisix_guardrails::Guardrail::refuses_unevaluable_output(&self.chain) {
+            return Some(StreamVerdict::Refuse {
+                reason,
+                guardrail_name: None,
+                unavailable: Some(crate::error::TAG_UNSCANNABLE_BODY.to_string()),
+            });
+        }
+        if !std::mem::replace(&mut self.reported_unread, true) {
+            self.chain
+                .record_unevaluable_output_bypass(crate::error::TAG_UNSCANNABLE_BODY);
+        }
+        None
     }
 
     /// Read one event off the upstream. `ends` marks the stream's terminal
@@ -1130,21 +1154,17 @@ impl StreamReview {
             return StreamVerdict::Release(vec![held]);
         }
         let scan = aisix_a2a::result_scan(event);
-        if let Some(why) = scan.unreadable.filter(|_| self.policy.holds_back()) {
-            return StreamVerdict::Refuse {
-                reason: format!("streamed {why}"),
-                guardrail_name: None,
-                unavailable: Some(crate::error::TAG_UNSCANNABLE_BODY.to_string()),
-            };
+        if let Some(why) = scan.unreadable {
+            if let Some(refusal) = self.unevaluable(format!("streamed {why}")) {
+                return refusal;
+            }
         }
         if let Some(chunk) = aisix_a2a::artifact_chunk(event) {
-            if !self.follow(chunk) && self.policy.holds_back() {
-                return StreamVerdict::Refuse {
-                    reason: "streamed artifact continues one the review no longer follows"
-                        .to_string(),
-                    guardrail_name: None,
-                    unavailable: Some(crate::error::TAG_UNSCANNABLE_BODY.to_string()),
-                };
+            if !self.follow(chunk) {
+                let reason = "streamed artifact continues one the review no longer follows";
+                if let Some(refusal) = self.unevaluable(reason.to_string()) {
+                    return refusal;
+                }
             }
         }
         if !self.unscanned.is_empty() {
@@ -1541,34 +1561,42 @@ async fn guardrail_block_response(
     // binary media type, a value of the wrong type where the protocol has
     // text — is refused rather than forwarded unread: whatever reads it on
     // the other side may decode it more leniently than any scan predicts.
-    // Only where a guardrail would act on the request: an output-only or
-    // monitor-mode chain never refuses one.
-    if let Some(why) = scan
-        .unreadable
-        .filter(|_| aisix_guardrails::Guardrail::enforces_input(chain))
-    {
-        tracing::warn!(
-            guardrail_hook = "input",
-            agent = %agent,
-            operation = %call.operation,
-            reason = why,
-            "guardrail blocked A2A request: content the scan cannot read",
-        );
-        return Some(guardrail_refusal(
-            state,
-            snapshot,
-            auth,
-            request_id,
-            agent,
-            call,
-            rpc_id,
-            "request",
-            None,
-            Some(crate::error::TAG_UNSCANNABLE_BODY),
-            Duration::ZERO,
-            trace,
-            /* dispatched */ false,
-        ));
+    // Only where a guardrail reads the request and fails closed, the rule every
+    // surface shares: an output-only, monitor-mode or `fail_open: true` chain
+    // forwards it. That is a bypass under the tag the refusal would carry, and
+    // a guardrail that reads the request keeps the unread body out of a
+    // full-content export.
+    let mut unread_body = false;
+    if let Some(why) = scan.unreadable {
+        if aisix_guardrails::Guardrail::refuses_unevaluable_input(chain) {
+            tracing::warn!(
+                guardrail_hook = "input",
+                agent = %agent,
+                operation = %call.operation,
+                reason = why,
+                "guardrail blocked A2A request: content the scan cannot read",
+            );
+            return Some(guardrail_refusal(
+                state,
+                snapshot,
+                auth,
+                request_id,
+                agent,
+                call,
+                rpc_id,
+                "request",
+                None,
+                Some(crate::error::TAG_UNSCANNABLE_BODY),
+                Duration::ZERO,
+                trace,
+                /* dispatched */ false,
+            ));
+        }
+        chain.record_unevaluable_input_bypass(crate::error::TAG_UNSCANNABLE_BODY);
+        unread_body = aisix_guardrails::Guardrail::runs_on_input(chain);
+        if unread_body {
+            crate::usage_attr::note_failure_request(snapshot, String::new);
+        }
     }
     let chat = aisix_gateway::ChatFormat::new(
         A2A_MODEL_LABEL,
@@ -1675,7 +1703,9 @@ async fn guardrail_block_response(
         if rewritten > 0 {
             // A failure row reports the request the agent would have got, not
             // the text the rule removed.
-            crate::usage_attr::note_failure_request(snapshot, || value.to_string());
+            if !unread_body {
+                crate::usage_attr::note_failure_request(snapshot, || value.to_string());
+            }
             if meters_content(call.operation) {
                 // Keep the inspected copy in step with what was sent, so the
                 // usage event's token estimate and any captured content
@@ -1991,6 +2021,162 @@ mod tests {
         ]))
     }
 
+    /// A file part whose bytes decode to no text under a media type that does
+    /// not explain why: what the scan cannot read.
+    fn unreadable_part() -> serde_json::Value {
+        use base64::Engine as _;
+        let bytes: Vec<u8> = (0..512u32).map(|i| ((i * 37 + 11) % 256) as u8).collect();
+        let noise = base64::engine::general_purpose::STANDARD.encode(bytes);
+        serde_json::json!({"kind": "file", "file": {"mimeType": "application/octet-stream", "bytes": noise}})
+    }
+
+    /// One unary call through the real router under a keyword row with `row`'s
+    /// fields, against an agent that answers with `answer_parts`.
+    async fn call_under_row(
+        row: serde_json::Value,
+        request_parts: serde_json::Value,
+        answer_parts: serde_json::Value,
+    ) -> (StatusCode, usize, aisix_obs::UsageEvent) {
+        use aisix_obs::UsageSink;
+
+        let agent = wiremock::MockServer::builder().start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "jsonrpc": "2.0", "id": 1, "result": {
+                        "kind": "message", "role": "agent", "parts": answer_parts}
+                })),
+            )
+            .mount(&agent)
+            .await;
+        let snap = snapshot_with(&agent.uri(), true, serde_json::json!(["*"]));
+        let mut fields = serde_json::json!({
+            "name": "reads-a2a",
+            "enabled": true,
+            "kind": "keyword",
+            "patterns": [{"kind": "literal", "value": "forbiddenword"}]
+        });
+        for (key, value) in row.as_object().expect("row fields") {
+            fields[key] = value.clone();
+        }
+        let guardrail: aisix_core::Guardrail = serde_json::from_value(fields).unwrap();
+        crate::seed_env_scoped_guardrail(&snap, ResourceEntry::new("g-a2a", guardrail, 1));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let state = ProxyState::new(
+            SnapshotHandle::new(snap),
+            Arc::new(aisix_gateway::Hub::new()),
+            &proxy_cfg(),
+        )
+        .without_cache()
+        .with_usage_sink(UsageSink::new(tx));
+        let response = build_router(state)
+            .oneshot(
+                HttpRequest::post("/a2a/invoice")
+                    .header("host", "gw.example.com")
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {TOKEN}"))
+                    .body(Body::from(
+                        serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": 1,
+                            "method": "message/send",
+                            "params": {"message": {"role": "user", "parts": request_parts}}
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .expect("router responds");
+        let status = response.status();
+        let calls = agent.received_requests().await.unwrap_or_default().len();
+        let event = rx.recv().await.expect("A2A emits a terminal event");
+        (status, calls, event)
+    }
+
+    /// One rule on every surface: a request the scan cannot read is refused
+    /// only where a guardrail reads the request and fails closed. Anything else
+    /// forwards it, and a guardrail that read nothing it should have is a
+    /// bypass. A monitored row never refuses, whatever its policy.
+    #[tokio::test]
+    async fn a_request_the_scan_cannot_read_follows_the_failure_policy() {
+        let text = serde_json::json!([{"kind": "text", "text": "ok"}]);
+        for (row, status, calls, bypass) in [
+            (
+                serde_json::json!({"hook_point": "input", "fail_open": false}),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                0,
+                "",
+            ),
+            (
+                serde_json::json!({"hook_point": "input", "fail_open": true}),
+                StatusCode::OK,
+                1,
+                "unscannable_body",
+            ),
+            (
+                serde_json::json!({"hook_point": "input", "fail_open": false, "enforcement_mode": "monitor"}),
+                StatusCode::OK,
+                1,
+                "unscannable_body",
+            ),
+            (
+                serde_json::json!({"hook_point": "output", "fail_open": false}),
+                StatusCode::OK,
+                1,
+                "",
+            ),
+        ] {
+            let (got, got_calls, event) = call_under_row(
+                row.clone(),
+                serde_json::json!([unreadable_part()]),
+                text.clone(),
+            )
+            .await;
+            assert_eq!(got, status, "{row}");
+            assert_eq!(got_calls, calls, "{row}");
+            assert_eq!(event.guardrail_bypassed_reason, bypass, "{row}");
+        }
+    }
+
+    /// The same rule on an answer the scan cannot read.
+    #[tokio::test]
+    async fn an_answer_the_scan_cannot_read_follows_the_failure_policy() {
+        let text = serde_json::json!([{"kind": "text", "text": "ok"}]);
+        for (row, status, bypass) in [
+            (
+                serde_json::json!({"hook_point": "output", "fail_open": false}),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "",
+            ),
+            (
+                serde_json::json!({"hook_point": "output", "fail_open": true}),
+                StatusCode::OK,
+                "unscannable_body",
+            ),
+            (
+                serde_json::json!({"hook_point": "output", "fail_open": false, "enforcement_mode": "monitor"}),
+                StatusCode::OK,
+                "unscannable_body",
+            ),
+            (
+                serde_json::json!({"hook_point": "input", "fail_open": false}),
+                StatusCode::OK,
+                "",
+            ),
+        ] {
+            let (got, _, event) = call_under_row(
+                row.clone(),
+                text.clone(),
+                serde_json::json!([unreadable_part()]),
+            )
+            .await;
+            assert_eq!(got, status, "{row}");
+            assert_eq!(event.guardrail_bypassed_reason, bypass, "{row}");
+        }
+    }
+
     fn chunk(id: &str, append: bool, text: &str) -> serde_json::Value {
         serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": {
             "kind": "artifact-update", "taskId": "t", "append": append,
@@ -2109,6 +2295,30 @@ mod tests {
             "kind": "artifact-update", "taskId": "t", "artifact": {"artifactId": "f", "parts": [
                 {"kind": "file", "file": {"mimeType": "application/octet-stream", "bytes": noise}}]}}});
         assert!(refused(review.admit(&file, false, &mut hits).await));
+    }
+
+    /// Where nothing reads the answer and fails closed, the event is relayed
+    /// and the request says it went unread, once.
+    #[tokio::test]
+    async fn a_fail_open_rule_relays_a_streamed_event_the_scan_cannot_read() {
+        let mut hits = Vec::new();
+        let keyword = aisix_guardrails::KeywordBlocklist::output_only(vec![
+            aisix_guardrails::KeywordRule::literal("forbiddenword"),
+        ])
+        .with_fail_open(true);
+        let chain = aisix_guardrails::GuardrailChain::new(vec![
+            std::sync::Arc::new(keyword) as std::sync::Arc<dyn aisix_guardrails::Guardrail>
+        ])
+        .with_audit_log(Some(std::sync::Arc::new(
+            aisix_guardrails::GuardrailAuditLog::new(),
+        )));
+        let mut review = StreamReview::new(chain.clone());
+        let file = serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": {
+            "kind": "artifact-update", "taskId": "t", "artifact": {"artifactId": "f", "parts": [
+                unreadable_part()]}}});
+        assert_eq!(released(review.admit(&file, false, &mut hits).await), 0);
+        assert_eq!(released(review.admit(&file, true, &mut hits).await), 2);
+        assert_eq!(chain.bypass_reason().as_deref(), Some("unscannable_body"));
     }
 
     #[tokio::test]

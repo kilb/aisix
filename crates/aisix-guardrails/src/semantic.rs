@@ -768,10 +768,11 @@ mod tests {
         let on = |hook| build_with(cfg(&["x"], &[]), hook, false, embedder.clone());
         for hook in [GuardrailHookPoint::Input, GuardrailHookPoint::Both] {
             assert!(on(hook).checks_input_remotely());
-            assert!(on(hook).enforces_input());
+            assert!(on(hook).refuses_unevaluable_input());
+            assert!(!on(hook).locates_input_hits());
         }
         assert!(!on(GuardrailHookPoint::Output).checks_input_remotely());
-        assert!(!on(GuardrailHookPoint::Output).enforces_input());
+        assert!(!on(GuardrailHookPoint::Output).refuses_unevaluable_input());
     }
 
     #[tokio::test]
