@@ -142,6 +142,15 @@ impl OpenAiBridge {
                     "model".to_string(),
                     serde_json::Value::String(upstream.to_string()),
                 );
+                // A stream is billed from its usage frame, as on chat. The
+                // relay keeps it from a caller that did not ask for it.
+                if stream {
+                    if let Some(options) =
+                        crate::wire::upstream_stream_options(obj.get("stream_options"), true)
+                    {
+                        obj.insert("stream_options".to_string(), options);
+                    }
+                }
             }
             // Apply the PK's request overrides like `chat()` (#867 consistency
             // follow-up); no-op when none are configured.

@@ -35,8 +35,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use stream::{
     build_completion_passthrough_stream, completion_usage_with_estimates, stamp_first_chunk,
-    CompletionSseAccumulator, CompletionStreamFailure, CompletionStreamOutcome,
-    PreparedCompletionStream,
+    strip_usage_frame, without_usage_frame, CompletionSseAccumulator, CompletionStreamFailure,
+    CompletionStreamOutcome, PreparedCompletionStream,
 };
 
 use crate::auth::AuthenticatedKey;
@@ -677,6 +677,12 @@ async fn dispatch(
     // key, bridge, deadline — from the target inside it (#1111).
     crate::dispatch::require_dispatchable_entry(&model_entry.value)?;
     let is_stream = body.get("stream").and_then(Value::as_bool) == Some(true);
+    // The upstream always streams its usage frame, which the request is billed
+    // from; the caller is relayed it only when it asked.
+    let caller_wants_usage = body
+        .pointer("/stream_options/include_usage")
+        .and_then(Value::as_bool)
+        == Some(true);
     *routing_out = crate::attempt::RoutingTelemetry::for_request(&model_entry.value.display_name)
         .with_trace(client_ctx.trace.clone());
     // #554: the request deadline bounds a non-streaming call; the streaming
@@ -1068,6 +1074,9 @@ async fn dispatch(
                     }
                     _ => None,
                 };
+                if !caller_wants_usage {
+                    buffer = without_usage_frame(buffer);
+                }
                 let mut response = Response::new(axum::body::Body::from(buffer));
                 response.headers_mut().insert(
                     header::CONTENT_TYPE,
@@ -1368,6 +1377,11 @@ async fn dispatch(
                         );
                     },
                 );
+                let parsed: aisix_gateway::CompletionByteStream = if caller_wants_usage {
+                    Box::pin(parsed)
+                } else {
+                    Box::pin(strip_usage_frame(parsed))
+                };
                 let parsed =
                     crate::sse_keepalive::with_heartbeat(parsed, crate::sse_keepalive::interval());
                 let mut response = Response::new(axum::body::Body::from_stream(parsed));

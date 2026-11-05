@@ -387,6 +387,90 @@ pub(super) fn stamp_first_chunk(
     }))
 }
 
+/// Whether one SSE frame is the `include_usage` terminal frame: `usage` beside
+/// an empty `choices`, which is what the gateway asked the upstream for on a
+/// caller's behalf and the caller did not ask to see.
+fn is_usage_only_frame(frame: &[u8]) -> bool {
+    const KEY: &[u8] = b"\"usage\"";
+    if !frame.windows(KEY.len()).any(|w| w == KEY) {
+        return false;
+    }
+    crate::redact::parse_sse_json_event(frame)
+        .0
+        .is_some_and(|json| {
+            json.get("usage").is_some_and(|usage| !usage.is_null())
+                && json
+                    .get("choices")
+                    .and_then(Value::as_array)
+                    .is_some_and(Vec::is_empty)
+        })
+}
+
+/// `buffer` without the usage frame, for a held stream released at once.
+pub(super) fn without_usage_frame(buffer: Vec<u8>) -> Vec<u8> {
+    let mut splitter = aisix_gateway::sse::SseFrameSplitter::new(usize::MAX);
+    splitter.push(&buffer);
+    let mut out = Vec::with_capacity(buffer.len());
+    while let Ok(Some(frame)) = splitter.next_frame() {
+        if !is_usage_only_frame(&frame) {
+            out.extend_from_slice(&frame);
+        }
+    }
+    let rest = splitter.take_rest();
+    if !is_usage_only_frame(&rest) {
+        out.extend_from_slice(&rest);
+    }
+    out
+}
+
+/// A relayed completion stream without the usage frame. A frame that outgrows
+/// the splitter's bound is relayed as it stands rather than held without limit.
+pub(super) fn strip_usage_frame<S>(
+    upstream: S,
+) -> impl futures::Stream<Item = Result<bytes::Bytes, BridgeError>>
+where
+    S: futures::Stream<Item = Result<bytes::Bytes, BridgeError>>,
+{
+    async_stream::stream! {
+        futures::pin_mut!(upstream);
+        let mut splitter =
+            aisix_gateway::sse::SseFrameSplitter::new(aisix_gateway::sse::MAX_SSE_FRAME_BYTES);
+        while let Some(item) = upstream.next().await {
+            let bytes = match item {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    let rest = splitter.take_rest();
+                    if !rest.is_empty() {
+                        yield Ok(bytes::Bytes::from(rest));
+                    }
+                    yield Err(error);
+                    continue;
+                }
+            };
+            splitter.push(&bytes);
+            let mut out = Vec::with_capacity(bytes.len());
+            loop {
+                match splitter.next_frame() {
+                    Ok(Some(frame)) if is_usage_only_frame(&frame) => {}
+                    Ok(Some(frame)) => out.extend_from_slice(&frame),
+                    Ok(None) => break,
+                    Err(_) => {
+                        out.extend_from_slice(&splitter.take_rest());
+                        break;
+                    }
+                }
+            }
+            if !out.is_empty() {
+                yield Ok(bytes::Bytes::from(out));
+            }
+        }
+        let rest = splitter.take_rest();
+        if !rest.is_empty() && !is_usage_only_frame(&rest) {
+            yield Ok(bytes::Bytes::from(rest));
+        }
+    }
+}
+
 pub(super) fn completion_usage_with_estimates(
     mut usage: CompletionUsage,
     upstream_model: &str,
@@ -702,6 +786,38 @@ mod tests {
             serde_json::to_string(text).unwrap()
         )
         .into_bytes()
+    }
+
+    /// The usage frame the gateway asked for goes, in whichever pieces the
+    /// bytes arrive; every other frame reaches the caller as it was sent.
+    #[tokio::test]
+    async fn a_caller_that_did_not_ask_is_not_sent_the_usage_frame() {
+        let text = "data: {\"choices\":[{\"text\":\"usage\",\"index\":0}]}\n\n";
+        let usage = "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":3}}\n\n";
+        let done = "data: [DONE]\n\n";
+        let whole = format!("{text}{usage}{done}");
+        let expected = format!("{text}{done}");
+
+        assert_eq!(
+            without_usage_frame(whole.clone().into_bytes()),
+            expected.as_bytes()
+        );
+
+        for cut in [1, 7, text.len() + 3, whole.len() - 2] {
+            let (head, tail) = whole.as_bytes().split_at(cut);
+            let parts = vec![
+                Ok(bytes::Bytes::copy_from_slice(head)),
+                Ok(bytes::Bytes::copy_from_slice(tail)),
+            ];
+            let out: Vec<_> = strip_usage_frame(futures::stream::iter(parts))
+                .collect()
+                .await;
+            let relayed: Vec<u8> = out
+                .into_iter()
+                .flat_map(|item| item.expect("no upstream error").to_vec())
+                .collect();
+            assert_eq!(relayed, expected.as_bytes(), "cut at {cut}");
+        }
     }
 
     #[test]

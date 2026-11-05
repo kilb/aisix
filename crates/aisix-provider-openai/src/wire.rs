@@ -45,17 +45,51 @@ pub struct OpenAiRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
     pub stream: bool,
-    /// `{"include_usage": true}` injected on streaming requests when the
-    /// caller didn't set `stream_options` itself — OpenAI-protocol
-    /// upstreams omit the terminal `usage` frame without it, which
-    /// zeroed token telemetry for every streaming request whose client
-    /// didn't ask (#790). `None` whenever `extra` already
-    /// carries a client-supplied `stream_options` (the flattened map
-    /// wins; a typed duplicate would emit the key twice).
+    /// See [`upstream_stream_options`]. OpenAI-protocol upstreams omit the
+    /// terminal `usage` frame without `include_usage`, which zeroed token
+    /// telemetry for every streaming request whose client didn't ask (#790).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream_options: Option<serde_json::Value>,
     #[serde(flatten)]
-    pub extra: &'a serde_json::Map<String, serde_json::Value>,
+    pub extra: RequestExtra<'a>,
+}
+
+/// The caller's other top-level fields. `stream_options` is left out: the
+/// typed field carries it, and the key must go out once.
+#[derive(Debug, Clone, Copy)]
+pub struct RequestExtra<'a>(&'a serde_json::Map<String, serde_json::Value>);
+
+impl Serialize for RequestExtra<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_map(
+            self.0
+                .iter()
+                .filter(|(key, _)| key.as_str() != "stream_options"),
+        )
+    }
+}
+
+/// The `stream_options` an upstream receives. A streamed request always asks
+/// for the usage frame, whatever the caller asked for its own response: the
+/// frame is what the request is billed from, and it would otherwise fall back
+/// to an estimate that cannot count reasoning or cached tokens. Whether the
+/// caller sees it is decided where its response is rendered. The caller's other
+/// members go as sent, as does a value that is not an object and a
+/// non-streaming request's, for the upstream to answer.
+pub fn upstream_stream_options(
+    caller: Option<&serde_json::Value>,
+    stream: bool,
+) -> Option<serde_json::Value> {
+    match caller {
+        _ if !stream => caller.cloned(),
+        None | Some(serde_json::Value::Null) => Some(serde_json::json!({"include_usage": true})),
+        Some(serde_json::Value::Object(options)) => {
+            let mut options = options.clone();
+            options.insert("include_usage".to_string(), true.into());
+            Some(serde_json::Value::Object(options))
+        }
+        Some(other) => Some(other.clone()),
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -110,9 +144,8 @@ pub fn build_request<'a>(
         top_p: req.top_p,
         max_tokens: req.max_tokens,
         stream,
-        stream_options: (stream && !req.extra.contains_key("stream_options"))
-            .then(|| serde_json::json!({"include_usage": true})),
-        extra: &req.extra,
+        stream_options: upstream_stream_options(req.extra.get("stream_options"), stream),
+        extra: RequestExtra(&req.extra),
     }
 }
 
@@ -2023,36 +2056,55 @@ mod tests {
         );
     }
 
-    /// A client-supplied `stream_options` wins verbatim — the typed
-    /// injection must not duplicate or override it.
+    /// A caller's `stream_options` cannot turn the billing frame off: the
+    /// upstream is asked for usage whatever the caller wrote, its other
+    /// members go as sent, and the key goes out once.
     #[test]
-    fn build_request_respects_client_stream_options() {
-        let mut extra = serde_json::Map::new();
-        extra.insert(
+    fn build_request_always_asks_for_usage_on_a_stream() {
+        for (caller, expected) in [
+            (
+                serde_json::json!({"include_usage": false}),
+                serde_json::json!({"include_usage": true}),
+            ),
+            (
+                serde_json::json!({"include_obfuscation": false}),
+                serde_json::json!({"include_obfuscation": false, "include_usage": true}),
+            ),
+            (
+                serde_json::Value::Null,
+                serde_json::json!({"include_usage": true}),
+            ),
+        ] {
+            let mut req = ChatFormat::new("m", vec![]);
+            req.stream = Some(true);
+            req.extra.insert("stream_options".into(), caller);
+            let msgs = messages_from(&req, DeveloperRoleMode::Preserve);
+            let raw = serde_json::to_string(&build_request(&req, "gpt-4o", &msgs, true)).unwrap();
+            assert_eq!(raw.matches("stream_options").count(), 1, "{raw}");
+            let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            assert_eq!(json["stream_options"], expected);
+        }
+    }
+
+    /// A `stream_options` that is not an OpenAI shape, or sits on a
+    /// non-streaming request, is the upstream's to answer.
+    #[test]
+    fn build_request_leaves_an_illegal_stream_options_to_the_upstream() {
+        let mut req = ChatFormat::new("m", vec![]);
+        req.extra
+            .insert("stream_options".into(), serde_json::json!("yes"));
+        let msgs = messages_from(&req, DeveloperRoleMode::Preserve);
+        let streamed = serde_json::to_value(build_request(&req, "m", &msgs, true)).unwrap();
+        assert_eq!(streamed["stream_options"], "yes");
+
+        req.extra.insert(
             "stream_options".into(),
             serde_json::json!({"include_usage": false}),
         );
-        let req = ChatFormat {
-            gateway_strict_schema: false,
-            top_k: None,
-            thinking_budget_tokens: None,
-            thoughts_requested: false,
-            model: "m".into(),
-            messages: vec![],
-            temperature: None,
-            top_p: None,
-            max_tokens: None,
-            stream: Some(true),
-            extra,
-        };
         let msgs = messages_from(&req, DeveloperRoleMode::Preserve);
-        let raw = serde_json::to_string(&build_request(&req, "gpt-4o", &msgs, true)).unwrap();
-        // Exactly one stream_options key on the wire (flatten + typed
-        // field would double-emit if both were set).
-        assert_eq!(raw.matches("stream_options").count(), 1);
-        let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let buffered = serde_json::to_value(build_request(&req, "m", &msgs, false)).unwrap();
         assert_eq!(
-            json["stream_options"],
+            buffered["stream_options"],
             serde_json::json!({"include_usage": false})
         );
     }
