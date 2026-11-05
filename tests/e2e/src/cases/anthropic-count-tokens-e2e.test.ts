@@ -92,7 +92,7 @@ describe("anthropic count_tokens e2e: /v1/messages/count_tokens through the DP (
       ],
     });
     await seed.createGuardrail({
-      name: "ct-e2e-moderation-exempt",
+      name: "ct-e2e-moderation",
       enabled: true,
       hook_point: "input",
       kind: "keyword",
@@ -425,13 +425,13 @@ describe("anthropic count_tokens e2e: /v1/messages/count_tokens through the DP (
       },
       body: JSON.stringify({ model: MODEL_ALIAS, messages: "not-an-array" }),
     });
-    expect(res.status).toBe(400);
+    expect(res.status).toBe(422);
     const body = (await res.json()) as { error?: { type?: string } };
     expect(body.error?.type).toBe("invalid_request_error");
     expect(upstream.receivedRequests).toHaveLength(baseline);
   });
 
-  test("content-moderation keyword guardrails remain exempt", async (ctx) => {
+  test("a content-moderation keyword guardrail refuses before any upstream request", async (ctx) => {
     if (!etcdReachable || !app || !upstream) {
       ctx.skip();
       return;
@@ -449,11 +449,8 @@ describe("anthropic count_tokens e2e: /v1/messages/count_tokens through the DP (
         messages: [{ role: "user", content: MODERATION_ONLY_WORD }],
       }),
     });
-    expect(res.status).toBe(200);
-    await res.text();
-    const request = upstream.receivedRequests
-      .slice(baseline)
-      .find((candidate) => candidate.path === "/v1/messages/count_tokens");
-    expect(request?.body).toContain(MODERATION_ONLY_WORD);
+    expect(res.status).toBe(422);
+    expect(await res.text()).not.toContain(MODERATION_ONLY_WORD);
+    expect(upstream.receivedRequests).toHaveLength(baseline);
   });
 });

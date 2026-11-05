@@ -657,7 +657,7 @@ describe("pii guardrail e2e: mask + block on request and response", () => {
         messages: { hidden_text: EMAIL },
       }),
     });
-    expect(malformed.status).toBe(400);
+    expect(malformed.status).toBe(422);
     expect(await malformed.text()).not.toContain(EMAIL);
     expect(received).toHaveLength(malformedBaseline);
 
