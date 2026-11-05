@@ -94,11 +94,20 @@ pub async fn create(
     if label.contains('$') {
         return bad("名称里不能包含 $");
     }
+    // 控制字符与 Unicode 换行：门户与网关用的两个 YAML 库对它们读法不一，同一把
+    // 密钥在两边成了两个名字，它的调用记录与单独额度就都对不上了。
+    if label
+        .chars()
+        .any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}' | '\u{feff}'))
+    {
+        return bad("名称里不能包含换行或控制字符");
+    }
 
     let uid2 = uid.clone();
     let hash2 = hash.clone();
     let name2 = name.clone();
     let label2 = label.clone();
+    let display_name = format!("{name} · {label}");
     let allowed = st.default_allowed_models();
     let result = st
         .resources()
@@ -125,6 +134,18 @@ pub async fn create(
             true
         })
         .await;
+
+    if born_disabled && result.is_ok() {
+        // 生下来就停着的也是门户停的：有了额度要归对账环启用。记不上只是它不会
+        // 自动启用（方向是安全的），所以不让这次铸造失败 —— 明文已经生成了。
+        if let Err(e) = st
+            .store
+            .record_portal_disabled(std::slice::from_ref(&display_name), &[])
+            .await
+        {
+            eprintln!("记录门户停用的密钥失败，{display_name} 补额后不会自动启用: {e}");
+        }
+    }
 
     match result {
         Ok(_) => (

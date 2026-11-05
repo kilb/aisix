@@ -454,6 +454,51 @@ impl Store {
         Ok(())
     }
 
+    /// 门户自己停掉的密钥，见 `0007_portal_disabled_keys.sql`。含 `""` 就是还没登记过。
+    pub async fn portal_disabled_keys(
+        &self,
+    ) -> Result<std::collections::HashSet<String>, StoreError> {
+        let rows: Vec<(String,)> = sqlx::query_as("SELECT key_name FROM portal_disabled_keys")
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows.into_iter().map(|(n,)| n).collect())
+    }
+
+    /// 记下门户刚停掉的密钥，撤掉不再算数的。按增删记，不整表替换：铸密钥也在往
+    /// 这里写，整表替换会抹掉对账这一轮读表之后才铸出来的那把。
+    pub async fn record_portal_disabled(
+        &self,
+        add: &[String],
+        remove: &[String],
+    ) -> Result<(), StoreError> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let add = add.to_vec();
+        let remove = remove.to_vec();
+        self.immediate_tx(move |conn| {
+            Box::pin(async move {
+                for name in &add {
+                    sqlx::query(
+                        "INSERT INTO portal_disabled_keys (key_name, updated_at)
+                         VALUES (?1, ?2)
+                         ON CONFLICT(key_name) DO UPDATE SET updated_at = ?2",
+                    )
+                    .bind(name)
+                    .bind(&now)
+                    .execute(&mut *conn)
+                    .await?;
+                }
+                for name in &remove {
+                    sqlx::query("DELETE FROM portal_disabled_keys WHERE key_name = ?1")
+                        .bind(name)
+                        .execute(&mut *conn)
+                        .await?;
+                }
+                Ok(())
+            })
+        })
+        .await
+    }
+
     /// 这个用户的入账依据，见 [`BillingBasis`]。
     pub async fn billing_basis(&self, user_id: &str) -> Result<BillingBasis, StoreError> {
         let mut c = self.pool.acquire().await?;

@@ -41,6 +41,14 @@ const MAX_DISPLAY_NAME_CHARS: usize = 128;
 const LOGIN_FAILURES_BEFORE_COOLDOWN: u32 = 5;
 /// 铸密钥的频率窗口。
 const MINT_WINDOW_SECS: u64 = 60;
+/// 全站每个窗口接受的铸密钥次数，是单用户上限的这么多倍。账号是免费注册的，光按
+/// 用户限挡不住开一批账号一起铸：每一把都要重写整份配置、重载一次网关。
+const MINT_GLOBAL_FACTOR: u32 = 6;
+/// 全站每分钟接受多少次注册。注册不验证邮箱，而每个账号都让对账环每轮多查一次
+/// Prometheus、多开一个事务 —— 不设防的话，匿名脚本能把所有人的停用闸拖慢。
+const REGISTER_MAX_PER_MINUTE: usize = 60;
+/// argon2 的闸前最多排多久。一见忙就拒的话，几条连接循环试口令，所有人的登录都是 429。
+const GATE_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// 窗口内允许铸几把。默认一分钟十把：正常用户一次建几把就够了，而这个数把
 /// 「循环铸密钥逼网关一直重载」压到每分钟十次重载。
@@ -80,6 +88,9 @@ pub struct AppState {
     resources: crate::resources::Writer,
     default_allowed_models: Arc<Vec<String>>,
     http: reqwest::Client,
+    /// 窗口内的注册时刻。见 [`REGISTER_MAX_PER_MINUTE`]。
+    registrations: Arc<tokio::sync::Mutex<std::collections::VecDeque<u64>>>,
+    register_max: usize,
     /// 按用户记的铸密钥时刻。见 [`AppState::mint_allowed`]。
     mints: Arc<RwLock<HashMap<String, Vec<u64>>>>,
     /// 窗口内允许铸几把。**构造时读一次**，不是每次调用读环境变量 —— 后者让
@@ -151,6 +162,8 @@ impl AppState {
                     .unwrap_or_else(|_| vec!["*".to_string()]),
             ),
             http: crate::client::outbound(),
+            registrations: Arc::default(),
+            register_max: REGISTER_MAX_PER_MINUTE,
             mints: Arc::new(RwLock::new(HashMap::new())),
             mint_max: mint_max_per_window(),
             failures: Arc::new(RwLock::new(HashMap::new())),
@@ -200,7 +213,8 @@ impl AppState {
     /// 每铸一把都要重写整份网关配置并发一次 SIGHUP，网关据此重建整个快照 ——
     /// 一个登录用户循环调这个接口，就能让网关一直在重载。
     ///
-    /// 按用户记，所以谁也影响不到别人。
+    /// 按用户记，一个人铸得再多也占不了别人的份额。全站还有一道总数的上限：账号是
+    /// 免费注册的，光按用户限的话，开一批账号就能把网关按在重载上。
     pub async fn mint_allowed(&self, user_id: &str) -> bool {
         let now = now_secs();
         let mut m = self.mints.write().await;
@@ -208,12 +222,38 @@ impl AppState {
             v.retain(|t| *t + MINT_WINDOW_SECS > now);
             !v.is_empty()
         });
+        let total: usize = m.values().map(Vec::len).sum();
+        if total as u64 >= u64::from(self.mint_max) * u64::from(MINT_GLOBAL_FACTOR) {
+            return false;
+        }
         let v = m.entry(user_id.to_string()).or_default();
         if v.len() as u32 >= self.mint_max {
             return false;
         }
         v.push(now);
         true
+    }
+
+    /// 这一分钟还接不接受注册。接受就把这次记下来。
+    async fn register_allowed(&self) -> bool {
+        let now = now_secs();
+        let mut r = self.registrations.lock().await;
+        while r.front().is_some_and(|t| *t + 60 <= now) {
+            r.pop_front();
+        }
+        if r.len() >= self.register_max {
+            return false;
+        }
+        r.push_back(now);
+        true
+    }
+
+    /// 排队进 argon2 的闸，等不到就是 `None`。
+    async fn gate_permit(&self) -> Option<tokio::sync::SemaphorePermit<'_>> {
+        tokio::time::timeout(GATE_WAIT, self.gate.acquire())
+            .await
+            .ok()?
+            .ok()
     }
 
     /// 这个邮箱现在是不是在冷却里。顺手清掉早就过期的记录。
@@ -304,6 +344,13 @@ impl AppState {
         self.verifications.load(Ordering::SeqCst)
     }
 
+    /// 换一个注册上限，让用例不必真的注册六十个人。
+    #[cfg(test)]
+    pub fn with_register_max(mut self, max: usize) -> Self {
+        self.register_max = max;
+        self
+    }
+
     /// 失败记录占着的键字节数。测试用来断言超长输入没有留在内存里。
     #[cfg(test)]
     pub async fn failure_key_bytes(&self) -> usize {
@@ -321,11 +368,6 @@ pub struct RegisterReq {
 
 /// `POST /api/register`
 pub async fn register(State(st): State<AppState>, Json(req): Json<RegisterReq>) -> Response {
-    // 注册跟登录一样是未认证可达的 argon2 操作，同样要闸。
-    let Ok(_permit) = st.gate.try_acquire() else {
-        return busy();
-    };
-
     let email = req.email.trim().to_ascii_lowercase();
     if !plausible_email(&email) {
         return bad_request("邮箱格式不正确");
@@ -340,6 +382,18 @@ pub async fn register(State(st): State<AppState>, Json(req): Json<RegisterReq>) 
     if req.password.chars().count() < MIN_PASSWORD_LEN {
         return bad_request(&format!("口令至少 {MIN_PASSWORD_LEN} 个字符"));
     }
+
+    if !st.register_allowed().await {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({"error": "注册过于频繁，请稍后再试"})),
+        )
+            .into_response();
+    }
+    // 注册跟登录一样是未认证可达的 argon2 操作，同样要闸。
+    let Some(_permit) = st.gate_permit().await else {
+        return busy();
+    };
 
     let pw = req.password.clone();
     let hash = match tokio::task::spawn_blocking(move || hash_password(&pw)).await {
@@ -376,7 +430,7 @@ pub async fn login(State(st): State<AppState>, Json(req): Json<LoginReq>) -> Res
         return invalid_credentials();
     }
 
-    let Ok(_permit) = st.gate.try_acquire() else {
+    let Some(_permit) = st.gate_permit().await else {
         return busy();
     };
 

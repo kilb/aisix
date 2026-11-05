@@ -915,6 +915,128 @@ mod oversized_input_tests {
 }
 
 #[cfg(test)]
+mod abuse_tests {
+    use super::testutil::{temp_resources, FakeProm, TestApp};
+    use super::*;
+    use serde_json::json;
+
+    async fn serve(state: AppState) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = router(state);
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{addr}")
+    }
+
+    /// 注册不验证邮箱，每个账号都让对账环每轮多查一次、多开一个事务。
+    #[tokio::test]
+    async fn 注册有全站的频率上限() {
+        let store = Store::open_memory().await.unwrap();
+        let state = AppState::with_admin_token(store, 4, None).with_register_max(2);
+        let base = serve(state).await;
+        let http = reqwest::Client::new();
+        let mut codes = Vec::new();
+        for i in 0..3 {
+            let r = http
+                .post(format!("{base}/api/register"))
+                .json(&json!({"email": format!("u{i}@b.c"), "password": "correct horse battery"}))
+                .send()
+                .await
+                .unwrap();
+            codes.push(r.status().as_u16());
+        }
+        assert_eq!(codes, [201, 201, 429]);
+    }
+
+    /// 单用户十把一分钟；账号是免费的，所以全站还有一道总数的上限。
+    #[tokio::test]
+    async fn 开一批账号一起铸也有上限() {
+        let prom = FakeProm::start().await;
+        let path = temp_resources("api_keys: []\n");
+        let app = TestApp::start_with_usage(&prom, &path).await;
+        let mut minted = 0;
+        let mut refused = 0;
+        for u in 0..7 {
+            let email = format!("u{u}@b.c");
+            app.register(&email, "correct horse battery").await;
+            app.post(
+                "/api/login",
+                json!({"email": email, "password": "correct horse battery"}),
+            )
+            .await;
+            for _ in 0..10 {
+                match app.post("/api/keys", json!({"label": "k"})).await.0 {
+                    201 => minted += 1,
+                    429 => refused += 1,
+                    other => panic!("意外状态 {other}"),
+                }
+            }
+        }
+        assert_eq!(minted, 60);
+        assert_eq!(refused, 10);
+    }
+
+    /// 一见忙就拒的话，几条连接循环试口令，所有人的登录都是 429。这里只有一个许可，
+    /// 两个同时来的登录都该拿到真正的判定。
+    #[tokio::test]
+    async fn 登录在闸前排队_不是一见忙就拒() {
+        let store = Store::open_memory().await.unwrap();
+        let base = serve(AppState::with_admin_token(store, 1, None)).await;
+        let attempt = |email: &'static str| {
+            let url = format!("{base}/api/login");
+            async move {
+                reqwest::Client::new()
+                    .post(url)
+                    .json(&json!({"email": email, "password": "wrong wrong wrong"}))
+                    .send()
+                    .await
+                    .unwrap()
+                    .status()
+                    .as_u16()
+            }
+        };
+        let (a, b) = tokio::join!(attempt("a@b.c"), attempt("b@b.c"));
+        assert_eq!((a, b), (401, 401));
+    }
+}
+
+#[cfg(test)]
+mod label_tests {
+    use super::testutil::{temp_resources, FakeProm, TestApp};
+    use serde_json::json;
+
+    /// 两个 YAML 库对这些字符读法不一：门户读到的名字与网关的身份对不上，这把密钥的
+    /// 调用记录和单独额度就都找不到它。
+    #[tokio::test]
+    async fn 名称里不能有换行与控制字符() {
+        let prom = FakeProm::start().await;
+        let path = temp_resources("api_keys: []\n");
+        let app = TestApp::start_with_usage(&prom, &path).await;
+        app.register("a@b.c", "correct horse battery").await;
+        app.post(
+            "/api/login",
+            json!({"email": "a@b.c", "password": "correct horse battery"}),
+        )
+        .await;
+        for label in [
+            "x\u{2029}y",
+            "x\u{2028}y",
+            "a\nb",
+            "a\tb",
+            "a\u{1}b",
+            "\u{feff}x",
+        ] {
+            let (s, _) = app.post("/api/keys", json!({"label": label})).await;
+            assert_eq!(s, 400, "{label:?}");
+        }
+        let (s, _) = app.post("/api/keys", json!({"label": "我的 密钥-1"})).await;
+        assert_eq!(s, 201);
+    }
+}
+
+#[cfg(test)]
 mod disconnect_tests {
     use super::*;
     use serde_json::{json, Value};

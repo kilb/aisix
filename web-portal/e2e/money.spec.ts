@@ -1299,3 +1299,33 @@ test("调用记录带上状态_模型与耗时_而且只有自己的", async () 
   expect(row.model).toBe("gpt-4o-mini");
   expect(typeof row.latency_ms).toBe("number");
 });
+
+test("运维手工停掉的密钥不会被对账环重新启用", async () => {
+  await grant(5_000_000);
+  await waitFor(async () => (await fx.chat()) === 200, "预置密钥可用");
+
+  // 运维在配置里停掉这把密钥（比如它泄漏了）。余额充足，门户没有理由停它。
+  const doc = fx.readResources();
+  const disabled = doc.replace(
+    /(display_name: e2e-caller\n(?:\s+\S.*\n)*?\s+disabled: )false/,
+    "$1true",
+  );
+  expect(disabled, "夹具里找不到预置密钥的 disabled").not.toBe(doc);
+  fx.writeResources(disabled);
+  fx.reloadGateway();
+  await waitFor(async () => (await fx.chat()) === 401, "网关拒绝运维停掉的密钥");
+
+  // 对账环两秒一轮。多等几轮，它必须还是停着的。
+  await new Promise((r) => setTimeout(r, 10_000));
+  expect(fx.readResources()).toMatch(/display_name: e2e-caller\n(?:\s+\S.*\n)*?\s+disabled: true/);
+  expect(await fx.chat()).toBe(401);
+
+  // 运维自己打开，后面的用例照常。
+  fx.writeResources(
+    fx
+      .readResources()
+      .replace(/(display_name: e2e-caller\n(?:\s+\S.*\n)*?\s+disabled: )true/, "$1false"),
+  );
+  fx.reloadGateway();
+  await waitFor(async () => (await fx.chat()) === 200, "运维恢复之后可用");
+});
