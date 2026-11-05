@@ -119,6 +119,12 @@ describe("MCP server and A2A agent IP allowlists", () => {
       (await a2a("far")).status,
       "a caller outside the allowlist must be refused",
     ).toBe(403);
+    // The agent's card answers as the agent does.
+    expect((await a2aCard("near")).status).toBe(200);
+    expect(
+      (await a2aCard("far")).status,
+      "a caller outside the allowlist must not read the agent's card either",
+    ).toBe(403);
 
     // The MCP server the caller may reach answers `initialize`; the one it may
     // not reads as absent.
@@ -140,6 +146,14 @@ describe("MCP server and A2A agent IP allowlists", () => {
       "an unreachable server must not publish its tool inventory",
     ).toEqual([]);
   }, 120_000);
+
+  async function a2aCard(name: string): Promise<{ status: number }> {
+    const res = await fetch(`${app!.proxyUrl}/a2a/${name}/.well-known/agent-card.json`, {
+      headers: { authorization: `Bearer ${KEY}` },
+    });
+    await res.text();
+    return { status: res.status };
+  }
 
   async function a2a(name: string): Promise<{ status: number }> {
     const res = await fetch(`${app!.proxyUrl}/a2a/${name}`, {

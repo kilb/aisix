@@ -1352,8 +1352,10 @@ async fn check_answer(
 /// Serve the upstream agent's card at `/a2a/:agent/.well-known/agent-card.json`,
 /// rewriting its advertised service `url` to point back at this gateway so
 /// callers discover the agent through `/a2a/<agent>`.
+#[allow(clippy::too_many_arguments)]
 pub async fn a2a_agent_card(
     auth: AuthenticatedKey,
+    client: crate::client_ip::ClientContext,
     AisixPath(agent): AisixPath<String>,
     State(state): State<ProxyState>,
     uri: axum::http::Uri,
@@ -1362,7 +1364,7 @@ pub async fn a2a_agent_card(
     request_id: Option<axum::Extension<crate::request_id::RequestId>>,
 ) -> Response {
     let started = Instant::now();
-    let response = agent_card(&auth, &agent, &state, &uri, &headers).await;
+    let response = agent_card(&auth, &client, &agent, &state, &uri, &headers).await;
     crate::reject::emit_unrouted_access_log(
         method.as_str(),
         uri.path(),
@@ -1387,6 +1389,7 @@ pub async fn a2a_agent_card(
 
 async fn agent_card(
     auth: &AuthenticatedKey,
+    client: &crate::client_ip::ClientContext,
     agent: &str,
     state: &ProxyState,
     uri: &axum::http::Uri,
@@ -1406,6 +1409,20 @@ async fn agent_card(
         return (
             StatusCode::FORBIDDEN,
             format!("this key may not reach A2A agent: {agent}"),
+        )
+            .into_response();
+    }
+    // The same gate and the same answer as the agent's own route (`dispatch`):
+    // the card is the agent's inventory, and fetching it reaches the agent.
+    if !entry.value.ip_allowed(&client.source_ip) {
+        tracing::warn!(
+            agent = %agent,
+            source_ip = %client.source_ip,
+            "A2A agent card rejected: client IP not in agent allowed_cidrs",
+        );
+        return (
+            StatusCode::FORBIDDEN,
+            format!("client IP not allowed for A2A agent: {agent}"),
         )
             .into_response();
     }
@@ -3640,6 +3657,61 @@ mod tests {
         assert_eq!(card["name"], "Invoice Agent");
         assert_eq!(card["version"], "2.1.0");
         assert_eq!(card["skills"][0]["id"], "extract");
+    }
+
+    /// The card route gates on `allowed_cidrs` as the agent's own route does:
+    /// a caller outside the allowlist gets the same 403, and the agent is never
+    /// contacted for it. An empty allowlist stays open.
+    #[tokio::test]
+    async fn an_agent_card_outside_the_ip_allowlist_refuses_the_caller() {
+        let agent = wiremock::MockServer::builder().start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/.well-known/agent-card.json"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"name": "Invoice Agent", "url": "https://upstream.internal/a2a"}),
+            ))
+            // The one call is the empty allowlist's, below.
+            .expect(1)
+            .mount(&agent)
+            .await;
+        let row = |allowed: serde_json::Value| -> A2aAgent {
+            serde_json::from_value(serde_json::json!({
+                "display_name": "invoice",
+                "url": agent.uri(),
+                "enabled": true,
+                "allowed_cidrs": allowed,
+            }))
+            .expect("valid a2a agent")
+        };
+        let get_card = || {
+            HttpRequest::get("/a2a/invoice/.well-known/agent-card.json")
+                .header("host", "a2a.aisix.example.com")
+                .header("authorization", format!("Bearer {TOKEN}"))
+                .body(Body::empty())
+                .unwrap()
+        };
+
+        let snap = snapshot_with(&agent.uri(), true, serde_json::json!(["*"]));
+        snap.a2a_agents.insert(ResourceEntry::new(
+            "ag-1",
+            row(serde_json::json!(["10.99.0.0/24"])),
+            2,
+        ));
+        let response = router_with(snap).oneshot(get_card()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let refusal = axum::body::to_bytes(response.into_body(), 1_048_576)
+            .await
+            .unwrap();
+        assert_eq!(
+            &refusal[..],
+            b"client IP not allowed for A2A agent: invoice"
+        );
+
+        let snap = snapshot_with(&agent.uri(), true, serde_json::json!(["*"]));
+        snap.a2a_agents
+            .insert(ResourceEntry::new("ag-1", row(serde_json::json!([])), 2));
+        let response = router_with(snap).oneshot(get_card()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     /// A `mask` rule must rewrite the message before the agent sees it.
