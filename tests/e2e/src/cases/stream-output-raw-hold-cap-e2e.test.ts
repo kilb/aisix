@@ -73,12 +73,12 @@ const CHAT_EMPTY_TOOL_CALLS = [
   "[DONE]",
 ];
 
-// Bridged `/v1/responses` whose upstream ends without a finish or usage
-// chunk: the bridge closes the response itself. `response.created` and
+// Bridged `/v1/responses` whose upstream sends `[DONE]` without a finish or
+// usage chunk: the bridge closes the response itself. `response.created` and
 // `response.in_progress` echo the request's `instructions`, together under the
 // raw bound; the terminal event the bridge adds echoes them a third time and
 // carries the stream past it.
-const CHAT_NO_FINISH = [chatChunk({ role: "assistant" }), chatChunk({ content: TAIL })];
+const CHAT_NO_FINISH = [chatChunk({ role: "assistant" }), chatChunk({ content: TAIL }), "[DONE]"];
 const LONG_INSTRUCTIONS = `Be brief. ${"i".repeat(50 * CAP)}`;
 
 // Token-by-token text whose content totals `bytes`, ending with TAIL.
