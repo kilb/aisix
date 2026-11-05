@@ -45,6 +45,9 @@ const OPEN_MODEL = "ip-open-model";
 const MIXED_GROUP = "ip-mixed-group";
 const ALL_RESTRICTED_GROUP = "ip-all-restricted-group";
 const RESTRICTED_MODEL_2 = "ip-restricted-model-2";
+// Restricted to the range the trusted proxy itself sits in, the usual "inside
+// the network only" allowlist behind a load balancer.
+const PROXY_RANGE_MODEL = "ip-proxy-range-model";
 // The mixed group's open member gets its OWN upstream returning a marker
 // string. Sharing the restricted member's upstream would make the test pass
 // pre-fix too: both members answer 200, so only the response content can
@@ -136,6 +139,13 @@ describe("model IP restriction e2e (#557): allowed_cidrs gate before upstream", 
       provider_key_id: pk.id,
       allowed_cidrs: ["192.168.0.0/16"],
     });
+    await seed.createModel({
+      display_name: PROXY_RANGE_MODEL,
+      provider: "openai",
+      model_name: "gpt-4o-mini",
+      provider_key_id: pk.id,
+      allowed_cidrs: ["127.0.0.0/8"],
+    });
     const groupOpenPk = await seed.createProviderKey({
       display_name: "group-open-pk",
       secret: "sk-mock",
@@ -168,6 +178,7 @@ describe("model IP restriction e2e (#557): allowed_cidrs gate before upstream", 
       allowed_models: [
         RESTRICTED_MODEL,
         RESTRICTED_MODEL_2,
+        PROXY_RANGE_MODEL,
         OPEN_MODEL,
         GROUP_OPEN_MODEL,
         MIXED_GROUP,
@@ -180,6 +191,33 @@ describe("model IP restriction e2e (#557): allowed_cidrs gate before upstream", 
     await app?.exit();
     await upstream?.close();
     await groupOpenUpstream?.close();
+  });
+
+  // A proxy appends the address it saw to whatever the client sent, so the
+  // client controls every byte left of it. The client is the appended address,
+  // whatever those bytes are, and an allowlist covering the proxy's own range
+  // does not cover a client outside it.
+  test("a byte that is not text in the forwarded header does not make the proxy the client", async (ctx) => {
+    if (!etcdReachable || !app || !upstream) {
+      ctx.skip();
+      return;
+    }
+    await waitConfigPropagation(async () => {
+      try {
+        const r = await chat(app!, PROXY_RANGE_MODEL, "127.0.0.9");
+        await r.text();
+        return r.status === 200;
+      } catch {
+        return false;
+      }
+    });
+    const before = upstream.receivedRequests.length;
+    for (const forwardedFor of ["203.0.113.7", "\xff, 203.0.113.7", "\xff\xfe,203.0.113.7"]) {
+      const r = await chat(app, PROXY_RANGE_MODEL, forwardedFor);
+      expect(r.status, JSON.stringify(forwardedFor)).toBe(403);
+      await r.text();
+    }
+    expect(upstream.receivedRequests.length).toBe(before);
   });
 
   test(

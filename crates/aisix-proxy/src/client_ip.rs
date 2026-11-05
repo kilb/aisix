@@ -88,18 +88,39 @@ pub fn resolve_client_ip(
 
 /// Parse the configured forwarded header into a left-to-right IP list.
 /// Concatenates every header field instance (a client may send several)
-/// in received order, splits each on `,`, trims whitespace, strips an
-/// optional `:port` (or `[v6]:port`) suffix, and skips tokens that don't
-/// parse as an IP. Using `get_all` (not `get`) so a spoofed extra
-/// `x-forwarded-for` field can't hide entries from the trusted-proxy walk.
+/// in received order, splits each on `,`, trims whitespace, and strips an
+/// optional `:port` (or `[v6]:port`) suffix. Using `get_all` (not `get`) so a
+/// spoofed extra `x-forwarded-for` field can't hide entries from the
+/// trusted-proxy walk.
+///
+/// Split on the bytes, so a byte that is not text costs one token and not the
+/// field: a proxy appends the address it saw to whatever the client sent, and
+/// discarding that whole field made the proxy itself the client, inside
+/// whatever allowlist covers its address.
+///
+/// Read from the right and stopped at the first token that is not an address:
+/// the hop that wrote it named no address, so what sits to its left is only the
+/// client's word. Skipping it would hand the walk that word. An empty element
+/// is no token at all.
 fn parse_forwarded(headers: &axum::http::HeaderMap, header: &str) -> Vec<IpAddr> {
-    headers
+    let tokens: Vec<&[u8]> = headers
         .get_all(header)
         .iter()
-        .filter_map(|v| v.to_str().ok())
-        .flat_map(|raw| raw.split(','))
-        .filter_map(|tok| parse_forwarded_token(tok.trim()))
-        .collect()
+        .flat_map(|field| field.as_bytes().split(|b| *b == b','))
+        .map(<[u8]>::trim_ascii)
+        .filter(|tok| !tok.is_empty())
+        .collect();
+    let mut parsed: Vec<IpAddr> = tokens
+        .iter()
+        .rev()
+        .map_while(|tok| {
+            std::str::from_utf8(tok)
+                .ok()
+                .and_then(parse_forwarded_token)
+        })
+        .collect();
+    parsed.reverse();
+    parsed
 }
 
 fn parse_forwarded_token(tok: &str) -> Option<IpAddr> {
@@ -558,11 +579,11 @@ mod tests {
     }
 
     #[test]
-    fn header_parser_handles_whitespace_ports_and_garbage() {
+    fn header_parser_handles_whitespace_and_ports() {
         let mut h = axum::http::HeaderMap::new();
         h.insert(
             "x-forwarded-for",
-            "203.0.113.7:1234, garbage, 198.51.100.4 , [2001:db8::1]:443"
+            "203.0.113.7:1234, , 198.51.100.4 , [2001:db8::1]:443,"
                 .parse()
                 .unwrap(),
         );
@@ -570,6 +591,54 @@ mod tests {
         assert_eq!(
             parsed,
             vec![ip("203.0.113.7"), ip("198.51.100.4"), ip("2001:db8::1")]
+        );
+    }
+
+    /// A proxy appends to what the client sent, so a client controls every byte
+    /// left of the address the proxy wrote. A byte that is not text used to
+    /// cost the whole field, which left the list empty and made the proxy the
+    /// client.
+    #[test]
+    fn a_non_text_byte_does_not_cost_the_address_the_proxy_appended() {
+        let mut h = axum::http::HeaderMap::new();
+        h.insert(
+            "x-forwarded-for",
+            axum::http::HeaderValue::from_bytes(b"\xff, 203.0.113.7").unwrap(),
+        );
+        let parsed = parse_forwarded(&h, "x-forwarded-for");
+        assert_eq!(parsed, vec![ip("203.0.113.7")]);
+        assert_eq!(
+            resolve_client_ip(ip("10.0.0.5"), &parsed, &nets(&["10.0.0.0/8"]), false),
+            ip("203.0.113.7")
+        );
+    }
+
+    /// The trusted hop named no address, so nothing left of it is vouched for:
+    /// the next entry is the client's own word, and the peer is what is known.
+    #[test]
+    fn an_entry_that_is_not_an_address_ends_the_walk() {
+        for value in ["198.51.100.9, unknown", "198.51.100.9, unix:"] {
+            let mut h = axum::http::HeaderMap::new();
+            h.insert("x-forwarded-for", value.parse().unwrap());
+            let parsed = parse_forwarded(&h, "x-forwarded-for");
+            assert!(parsed.is_empty(), "{value}: {parsed:?}");
+            for recursive in [false, true] {
+                assert_eq!(
+                    resolve_client_ip(ip("10.0.0.5"), &parsed, &nets(&["10.0.0.0/8"]), recursive),
+                    ip("10.0.0.5"),
+                );
+            }
+        }
+        let mut h = axum::http::HeaderMap::new();
+        h.insert(
+            "x-forwarded-for",
+            "198.51.100.9, garbage, 203.0.113.7, 10.0.0.1"
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(
+            parse_forwarded(&h, "x-forwarded-for"),
+            vec![ip("203.0.113.7"), ip("10.0.0.1")]
         );
     }
 
