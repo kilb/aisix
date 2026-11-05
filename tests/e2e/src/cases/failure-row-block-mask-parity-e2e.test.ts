@@ -234,7 +234,8 @@ describe("what a blocked row says the guardrails did ignores the exporter's mode
 
     // The export itself is still the masked one.
     const exported = [...full.values()].join("\n");
-    expect(exported, label).toContain(BLOCK_WORD);
+    expect(exported, label).toContain("about");
+    expect(exported, label).not.toContain(BLOCK_WORD);
     expect(exported, label).not.toContain(SECRET);
     expect([...meta.values()].join("\n"), label).not.toContain(BLOCK_WORD);
   });

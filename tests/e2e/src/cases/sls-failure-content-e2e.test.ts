@@ -324,11 +324,12 @@ describe("sls e2e: failed requests record the request body (#1013)", () => {
 
     const log = await waitForLog(
       sls,
-      (l) => (l.get("input_messages") ?? "").includes(GUARDRAIL_SENTINEL),
+      (l) => (l.get("input_messages") ?? "").includes(GUARDRAIL_CONTEXT),
       "guardrail-blocked record with prompt",
     );
     expect(log.get("status_code")).toBe("422");
     expect(log.get("guardrail_blocked")).toBe("true");
+    expect([...log.values()].join("\n")).not.toContain(FORBIDDEN_WORD);
   });
 
   test("guardrail input block (422): the record masks the keyword and keeps the rest", async (ctx) => {

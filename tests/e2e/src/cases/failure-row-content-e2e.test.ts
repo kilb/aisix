@@ -1005,7 +1005,8 @@ describe("failure rows carry request and response bodies", () => {
     expect(body).toContain("content policy");
     const row = await rowOf(res.headers.get("x-aisix-request-id")!, "the blocked tool row");
     expect(row.get("guardrail_blocked")).toBe("true");
-    expect(requestText(row)).toContain(MCP_BLOCKED_WORD);
+    expect(requestText(row)).toContain("say");
+    expect(requestText(row)).not.toContain(MCP_BLOCKED_WORD);
     expect(JSON.parse(row.get("response")!)).toEqual(JSON.parse(body));
   });
 
