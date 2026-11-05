@@ -171,6 +171,12 @@ const ROUTES: Route[] = [
     send: (u, model) => json(u, "/v1/messages", { model, max_tokens: 64, messages: [{ role: "user", content: "go" }] }),
   },
   {
+    name: "messages-bridge",
+    provider: "openai",
+    upstream: { streamEvents: chatContent },
+    send: (u, model) => json(u, "/v1/messages", { model, max_tokens: 64, messages: [{ role: "user", content: "go" }] }),
+  },
+  {
     name: "transcription",
     provider: "openai",
     upstream: { rawStreamFrames: transcriptFrames },

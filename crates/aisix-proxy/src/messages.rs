@@ -3496,8 +3496,6 @@ fn build_anthropic_sse_stream(
         // kept raw — the guardrail scans their serialized text, no need to
         // reassemble by index.
         let mut tool_call_fragments: Vec<serde_json::Value> = Vec::new();
-        let mut scan_bytes = 0usize;
-        let mut scan_truncated = false;
         // Chunks withheld from the encoder until the end-of-stream scan
         // clears them (hold-back policies only). Held PRE-encode so the
         // mask rewrite can run on the normalised chunks.
@@ -3604,7 +3602,6 @@ fn build_anthropic_sse_stream(
                             // `on_buffer_exceeded: fail_open`: release what is
                             // held unscanned and unmasked, then stream the rest.
                             released = true;
-                            scan_truncated = true;
                             content_text.clear();
                             tool_call_fragments.clear();
                             let comp = guard.comp();
@@ -3683,35 +3680,15 @@ fn build_anthropic_sse_stream(
                     if let Some(fr) = chunk.finish_reason.as_ref() {
                         comp.finish_reason = finish_reason_label(fr);
                     }
+                    // Held or not, the end-of-stream scan judges all of the
+                    // generated text: a monitor-only chain holds nothing back,
+                    // so no hold cap applies to it.
                     if output_guardrail.is_some() && !released {
                         if let Some(t) = chunk.delta.content.as_deref() {
-                            if hold_policy.is_some() {
-                                content_text.push_str(t);
-                            } else {
-                                let before = content_text.len();
-                                scan_truncated |= crate::token_estimate::push_capped_to(
-                                    &mut content_text,
-                                    t,
-                                    aisix_guardrails::DEFAULT_STREAM_OUTPUT_BUFFER_BYTES,
-                                );
-                                scan_bytes += content_text.len() - before;
-                            }
+                            content_text.push_str(t);
                         }
                         if let Some(tcs) = chunk.delta.tool_calls.as_ref() {
-                            if hold_policy.is_some() {
-                                tool_call_fragments.extend(tcs.iter().cloned());
-                            } else {
-                                for tc in tcs {
-                                    let remaining = aisix_guardrails::DEFAULT_STREAM_OUTPUT_BUFFER_BYTES
-                                        .saturating_sub(scan_bytes);
-                                    if let Some(bytes) = bounded_json_len(tc, remaining) {
-                                        scan_bytes += bytes;
-                                        tool_call_fragments.push(tc.clone());
-                                    } else {
-                                        scan_truncated = true;
-                                    }
-                                }
-                            }
+                            tool_call_fragments.extend(tcs.iter().cloned());
                         }
                     }
                     // Content capture: assemble the response (bounded to the
@@ -3898,9 +3875,8 @@ fn build_anthropic_sse_stream(
             }
         }
         if output_guardrail.is_some() {
-            guard.comp().response_capture_safe =
-                moderation_capture_safe && !scan_truncated && !released;
-            if scan_truncated || released {
+            guard.comp().response_capture_safe = moderation_capture_safe && !released;
+            if released {
                 guard.comp().response_text.clear();
             }
         }
@@ -3985,36 +3961,6 @@ fn build_anthropic_sse_stream(
         crate::request_id::in_request_span(stream),
         crate::sse_keepalive::interval(),
     ))
-}
-
-fn bounded_json_len<T: serde::Serialize>(value: &T, limit: usize) -> Option<usize> {
-    struct CountingWriter {
-        remaining: usize,
-        written: usize,
-    }
-
-    impl std::io::Write for CountingWriter {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            if bytes.len() > self.remaining {
-                return Err(std::io::Error::other("JSON exceeds hold-back budget"));
-            }
-            self.remaining -= bytes.len();
-            self.written += bytes.len();
-            Ok(bytes.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    let mut writer = CountingWriter {
-        remaining: limit,
-        written: 0,
-    };
-    serde_json::to_writer(&mut writer, value)
-        .ok()
-        .map(|()| writer.written)
 }
 
 /// Anthropic-shape SSE error frame for a streaming guardrail block. Built
@@ -5292,7 +5238,10 @@ where
     let hold_policy = anthropic_stream_hold_policy(output_guardrail.as_deref());
     let response_text_cap = match (hold_policy, output_guardrail.is_some(), content_cap) {
         (Some((max_hold, _)), _, _) => max_hold,
-        (None, true, _) => aisix_guardrails::DEFAULT_STREAM_OUTPUT_BUFFER_BYTES,
+        // A monitor-only chain holds nothing back, so no hold cap applies: its
+        // end-of-stream scan judges all of the generated text. Nothing bounds
+        // this text but the upstream's own output.
+        (None, true, _) => usize::MAX,
         (None, false, Some(cap)) => cap as usize,
         (None, false, None) => 0,
     };

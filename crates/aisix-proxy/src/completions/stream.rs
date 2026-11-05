@@ -441,8 +441,19 @@ where
 {
     crate::request_id::in_request_span(async_stream::stream! {
         let output_guarded = output_observer.is_some();
+        // A monitor-only chain holds nothing back, so no hold cap applies: its
+        // end-of-stream scan judges all of the generated text. Nothing bounds
+        // this text but the upstream's own output.
+        let accumulator = CompletionSseAccumulator {
+            text_cap: if output_guarded {
+                usize::MAX
+            } else {
+                crate::token_estimate::OUTPUT_ACCUMULATION_CAP
+            },
+            ..CompletionSseAccumulator::default()
+        };
         let mut guard = CompletionStreamGuard {
-            slot: Some((on_complete, CompletionSseAccumulator::default())),
+            slot: Some((on_complete, accumulator)),
             drop_outcome: CompletionStreamOutcome::DownstreamDrop,
             output_guarded,
         };
@@ -1040,5 +1051,45 @@ mod tests {
         assert_eq!(hits.monitor_hits.len(), 1);
         assert_eq!(hits.monitor_hits[0].guardrail_name, "monitor-hit");
         assert!(hits.capture_safe);
+    }
+
+    /// The end-of-stream scan of a monitored stream reads past the bound on the
+    /// text kept for token estimation; an unguarded stream keeps that bound.
+    #[tokio::test]
+    async fn a_monitored_stream_is_scanned_past_the_estimation_cap() {
+        const MARKER: &str = "late-marker";
+        // Ordinary frames: one past `frame_cap` is dropped whatever the text cap.
+        let piece = "z".repeat(1024);
+        let pieces = crate::token_estimate::OUTPUT_ACCUMULATION_CAP / piece.len() + 1;
+        for (observer, expect_whole) in [
+            (
+                Some(Arc::new(aisix_guardrails::GuardrailChain::new(vec![
+                    Arc::new(MonitorHit) as Arc<dyn aisix_guardrails::Guardrail>,
+                ]))),
+                true,
+            ),
+            (None, false),
+        ] {
+            let mut body = frame(&piece, true).repeat(pieces);
+            body.extend_from_slice(&frame(MARKER, true));
+            body.extend_from_slice(b"data: [DONE]\n\n");
+            let upstream: CompletionByteStream =
+                Box::pin(futures::stream::iter([Ok(bytes::Bytes::from(body))]));
+            let output = Arc::new(std::sync::Mutex::new(None));
+            let output_for_callback = Arc::clone(&output);
+            let stream = build_completion_passthrough_stream(
+                upstream,
+                observer,
+                "model".to_string(),
+                move |accumulator, _, _| {
+                    *output_for_callback.lock().unwrap() = Some(accumulator.output_text());
+                },
+            );
+            futures::pin_mut!(stream);
+            while stream.next().await.is_some() {}
+
+            let output = output.lock().unwrap().take().expect("on_complete fired");
+            assert_eq!(output.contains(MARKER), expect_whole);
+        }
     }
 }
