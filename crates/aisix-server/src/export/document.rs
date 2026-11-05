@@ -47,6 +47,7 @@ use super::secrets::{redact_credentials, RedactionCtx, SecretPlaceholder};
 struct Diagnostics {
     warnings: Vec<String>,
     blocking: Vec<String>,
+    incomplete: Vec<String>,
 }
 
 /// The assembled export, ready to emit as YAML plus the side-channel
@@ -65,6 +66,10 @@ pub struct ExportDocument {
     /// dangling references the loader rejects). Non-empty → the command
     /// writes the file for inspection but exits non-zero.
     pub blocking: Vec<String>,
+    /// Documents the file cannot carry whose absence changes who may do what:
+    /// it loads, and it is not the same gateway. Non-empty → the command
+    /// writes the file for inspection but exits non-zero.
+    pub incomplete: Vec<String>,
 }
 
 /// Build the resources-file document from a decoded etcd snapshot.
@@ -79,6 +84,7 @@ pub fn build_export_document(snapshot: &AisixSnapshot, reveal_secrets: bool) -> 
     let model_names = id_to_name(&snapshot.models, |m| m.display_name.clone());
     let api_key_names = id_to_name(&snapshot.apikeys, |k| synthetic_api_key_name(&k.key_hash));
     let mcp_server_names = id_to_name(&snapshot.mcp_servers, |s| s.name.clone());
+    let route_names = id_to_name(&snapshot.passthrough_routes, |r| r.name.clone());
 
     let mut collections: Vec<(&'static str, Vec<Value>)> = Vec::new();
 
@@ -185,7 +191,13 @@ pub fn build_export_document(snapshot: &AisixSnapshot, reveal_secrets: bool) -> 
     push_kind(
         &mut collections,
         "guardrail_attachments",
-        emit_guardrail_attachments(snapshot, &model_names, &api_key_names, &mut diag),
+        emit_guardrail_attachments(
+            snapshot,
+            &model_names,
+            &api_key_names,
+            &route_names,
+            &mut diag,
+        ),
     );
 
     // mcp_servers — identity: name; secret: secret.
@@ -339,6 +351,23 @@ pub fn build_export_document(snapshot: &AisixSnapshot, reveal_secrets: bool) -> 
         ),
     );
 
+    // passthrough_routes — identity: name; no secrets of its own (a route
+    // borrows a provider key's); both key references resugar to file names.
+    push_kind(
+        &mut collections,
+        "passthrough_routes",
+        emit_entries(
+            &snapshot.passthrough_routes,
+            |r| r.name.clone(),
+            "passthrough_routes",
+            &mut diag,
+            |doc, identity, diag| {
+                resugar_route_keys(doc, identity, &provider_key_names, &api_key_names, diag)
+            },
+            |_, _| {},
+        ),
+    );
+
     // mcp_auth_settings — singleton per environment with a fixed
     // identity; no secrets (the resource URL is public discovery data).
     push_kind(
@@ -388,6 +417,8 @@ pub fn build_export_document(snapshot: &AisixSnapshot, reveal_secrets: bool) -> 
         }
     }
 
+    report_mcp_policies(snapshot, &mut diag);
+
     // Two entries whose identities differ only in characters `sanitize`
     // folds to `_` (e.g. `openai-prod` vs `openai.prod`) derive the SAME
     // placeholder variable, so the operator can only supply one value for
@@ -414,6 +445,45 @@ pub fn build_export_document(snapshot: &AisixSnapshot, reveal_secrets: bool) -> 
         secret_placeholders: placeholders,
         warnings: diag.warnings,
         blocking: diag.blocking,
+        incomplete: diag.incomplete,
+    }
+}
+
+/// Say what the file loses with the environment's MCP access policies. It has
+/// no collection for them: a policy's layer is one a file can only spell on
+/// each api key.
+///
+/// A tool is reachable when every present layer allows it and none denies it,
+/// so losing a layer that restricts anything widens every key under it. That
+/// is an authorization change a migration must not make quietly. A layer that
+/// allows everything and denies nothing restricts nobody, and losing it costs
+/// less: a key with no layer left has no MCP access at all.
+fn report_mcp_policies(snapshot: &AisixSnapshot, diag: &mut Diagnostics) {
+    let mut entries = snapshot.mcp_policies.entries();
+    entries.sort_by(|a, b| a.id.cmp(&b.id));
+    for entry in entries {
+        let policy = &entry.value;
+        if !policy.enabled {
+            continue;
+        }
+        let allows_everything = policy.allow_ids.is_none() && policy.allow == ["*"];
+        let denies_nothing = policy.deny.is_empty() && policy.deny_ids.is_none();
+        if allows_everything && denies_nothing {
+            diag.warnings.push(format!(
+                "mcp_policies document {:?} not exported — a resources file has no \
+                 `mcp_policies` collection, so an api key with no `mcp_access` of its own has no \
+                 MCP access on a gateway loading this file",
+                entry.id
+            ));
+        } else {
+            diag.incomplete.push(format!(
+                "mcp_policies document {:?} restricts MCP tools and is not in the file — a \
+                 resources file has no `mcp_policies` collection, so on a gateway loading it \
+                 every api key this policy covers can reach what it allows or denies; spell the \
+                 same rules on each api key's `mcp_access` before moving",
+                entry.id
+            ));
+        }
     }
 }
 
@@ -428,14 +498,14 @@ pub fn build_export_document(snapshot: &AisixSnapshot, reveal_secrets: bool) -> 
 /// the rate limit beside it survived.
 ///
 /// An attachment the file genuinely cannot express is dropped with a warning
-/// rather than emitted dangling: a `passthrough_route` scope (the export
-/// carries no routes collection to point at) and a `scope_id` naming a
-/// resource missing from the snapshot. Dropping is the safe direction — the
-/// guardrail loses that scope and governs less, never more.
+/// rather than emitted dangling: a `scope_id` naming a resource missing from
+/// the snapshot. Dropping is the safe direction — the guardrail loses that
+/// scope and governs less, never more.
 fn emit_guardrail_attachments(
     snapshot: &AisixSnapshot,
     model_names: &BTreeMap<String, String>,
     api_key_names: &BTreeMap<String, String>,
+    route_names: &BTreeMap<String, String>,
     diag: &mut Diagnostics,
 ) -> Vec<Value> {
     let guardrail_names = id_to_name(&snapshot.guardrails, |g| g.name.clone());
@@ -458,15 +528,8 @@ fn emit_guardrail_attachments(
                 Some(("an MCP server", mcp_server_names.get(scope_ref(a))))
             }
             GuardrailScopeType::ApiKey => Some(("an api key", api_key_names.get(scope_ref(a)))),
-            // The export carries no `passthrough_routes` collection, so a
-            // route-scoped attachment has nothing to point at in the file —
-            // emitting the name anyway makes the whole file fail to load.
             GuardrailScopeType::PassthroughRoute => {
-                diag.warnings.push(format!(
-                    "guardrail {guardrail:?} has a passthrough-route-scoped attachment; the \
-                     export does not carry passthrough routes, so that scope is omitted",
-                ));
-                continue;
+                Some(("a passthrough route", route_names.get(scope_ref(a))))
             }
             // Verbatim: `api_keys[].team_id` is a file field and
             // `IndexEntry::applies_to` compares the two ids as bare strings.
@@ -715,6 +778,44 @@ fn resugar_classifier_provider_key(
              which is not among the exported provider keys — kept as a raw id (the file will \
              not load until it is resolved)"
         )),
+    }
+}
+
+/// A passthrough route's `provider_key_id` / `anonymous_key_id` → the name
+/// forms the file keys them by. A raw id the file cannot resolve fails the
+/// load, so a dangling one is blocking.
+fn resugar_route_keys(
+    doc: &mut Value,
+    route: &str,
+    provider_key_names: &BTreeMap<String, String>,
+    api_key_names: &BTreeMap<String, String>,
+    diag: &mut Diagnostics,
+) {
+    let Some(map) = doc.as_object_mut() else {
+        return;
+    };
+    for (id_field, name_field, names) in [
+        ("provider_key_id", "provider_key", provider_key_names),
+        ("anonymous_key_id", "anonymous_key", api_key_names),
+    ] {
+        let Some(id) = map
+            .get(id_field)
+            .and_then(Value::as_str)
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        match names.get(&id) {
+            Some(name) => {
+                map.remove(id_field);
+                map.insert(name_field.into(), Value::String(name.clone()));
+            }
+            None => diag.blocking.push(format!(
+                "passthrough route {route:?} references {id_field} {id:?}, which is not among \
+                 the exported documents — kept as a raw id (dangling reference in the source \
+                 data; the file will not load until it is resolved)"
+            )),
+        }
     }
 }
 

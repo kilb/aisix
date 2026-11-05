@@ -480,10 +480,9 @@ fn an_attachment_the_file_cannot_name_is_dropped_with_a_warning() {
         serde_json::from_value(attachment("g-1", "mcp_server", Some("s-gone"))).unwrap(),
         1,
     ));
-    // The export carries no passthrough_routes collection at all, so a
-    // route-scoped attachment has nothing to point at. Emitting the name
-    // anyway produced a file the loader rejected WHOLE, with export still
-    // exiting 0.
+    // A route missing from the snapshot leaves the scope nothing to point at.
+    // Emitting the name anyway produced a file the loader rejected WHOLE, with
+    // export still exiting 0.
     snap.guardrail_attachments.insert(ResourceEntry::new(
         "att-route",
         serde_json::from_value(attachment("g-1", "passthrough_route", Some("r-1"))).unwrap(),
@@ -522,8 +521,146 @@ fn an_attachment_the_file_cannot_name_is_dropped_with_a_warning() {
     assert!(
         doc.warnings
             .iter()
-            .any(|w| w.contains("does not carry passthrough routes")),
-        "route scope must be reported: {:?}",
+            .any(|w| w.contains("scoped to a passthrough route that is not in the snapshot")),
+        "dangling route scope must be reported: {:?}",
+        doc.warnings
+    );
+}
+
+/// A route is a collection the file loads, and a key's `allowed_routes` and a
+/// guardrail's scope both name it, so leaving it out loses the route silently
+/// and can leave the file unable to load.
+#[test]
+fn passthrough_routes_survive_the_round_trip_with_their_references() {
+    use aisix_core::filesource::{derive_id, load_from_str};
+    use std::collections::HashMap;
+
+    let snap = AisixSnapshot::new();
+    snap.provider_keys.insert(ResourceEntry::new(
+        "pk-1",
+        provider_key("route-pk", "sk-live-value"),
+        1,
+    ));
+    snap.apikeys.insert(ResourceEntry::new(
+        "ak-1",
+        serde_json::from_value(json!({"key_hash": "a".repeat(64), "allowed_routes": ["r1"]}))
+            .unwrap(),
+        1,
+    ));
+    snap.passthrough_routes.insert(ResourceEntry::new(
+        "route-1",
+        serde_json::from_value(json!({
+            "name": "r1",
+            "path_prefix": "/passthrough/r1",
+            "target_url": "https://up.example/v1",
+            "provider_key_id": "pk-1",
+        }))
+        .unwrap(),
+        1,
+    ));
+    snap.guardrails.insert(ResourceEntry::new(
+        "g-1",
+        keyword_guardrail("route-rule"),
+        1,
+    ));
+    snap.guardrail_attachments.insert(ResourceEntry::new(
+        "att-1",
+        serde_json::from_value(attachment("g-1", "passthrough_route", Some("route-1"))).unwrap(),
+        1,
+    ));
+
+    let doc = build_export_document(&snap, false);
+    assert!(doc.blocking.is_empty(), "{:?}", doc.blocking);
+    assert!(doc.incomplete.is_empty(), "{:?}", doc.incomplete);
+    let routes = find(&doc, "passthrough_routes");
+    assert_eq!(routes[0]["provider_key"], "route-pk");
+    assert!(routes[0].get("provider_key_id").is_none());
+
+    let yaml = crate::export::yaml_emit::emit_yaml(&doc).expect("emit");
+    let env: HashMap<String, String> = doc
+        .secret_placeholders
+        .iter()
+        .map(|p| (p.env_var.clone(), "sk-real".to_string()))
+        .collect();
+    let loaded = load_from_str(&yaml, "exported.yaml", 1, &|n| env.get(n).cloned())
+        .expect("the exported file must re-load through the file source");
+    let route = loaded.passthrough_routes.get_by_name("r1").expect("route");
+    assert_eq!(
+        route.value.provider_key_id.as_deref(),
+        Some(derive_id("provider_keys", "route-pk").as_str())
+    );
+    let attachment = loaded
+        .guardrail_attachments
+        .entries()
+        .pop()
+        .expect("attachment kept");
+    assert_eq!(
+        attachment.value.scope_id.as_deref(),
+        Some(route.id.as_str())
+    );
+}
+
+#[test]
+fn a_dangling_route_key_is_blocking() {
+    let snap = AisixSnapshot::new();
+    snap.passthrough_routes.insert(ResourceEntry::new(
+        "route-1",
+        serde_json::from_value(json!({
+            "name": "r1",
+            "path_prefix": "/passthrough/r1",
+            "target_url": "https://up.example/v1",
+            "provider_key_id": "pk-gone",
+        }))
+        .unwrap(),
+        1,
+    ));
+    let doc = build_export_document(&snap, false);
+    assert!(
+        doc.blocking.iter().any(|b| b.contains("pk-gone")),
+        "{:?}",
+        doc.blocking
+    );
+}
+
+/// Every present layer has to allow a tool, so a policy that restricts
+/// anything widens the keys under it when it is lost.
+#[test]
+fn an_mcp_policy_the_file_cannot_carry_fails_the_export_when_it_restricts_anything() {
+    let policy =
+        |doc: Value| -> aisix_core::models::McpPolicy { serde_json::from_value(doc).unwrap() };
+    let snap = AisixSnapshot::new();
+    snap.mcp_policies.insert(ResourceEntry::new(
+        "p-deny",
+        policy(json!({"scope": "env", "allow": ["*"], "deny": ["srv__drop_table"]})),
+        1,
+    ));
+    snap.mcp_policies.insert(ResourceEntry::new(
+        "p-narrow",
+        policy(json!({"scope": "team", "scope_ref": "t-1", "allow": ["srv__read"]})),
+        1,
+    ));
+    snap.mcp_policies.insert(ResourceEntry::new(
+        "p-off",
+        policy(json!({"scope": "env", "allow": [], "enabled": false})),
+        1,
+    ));
+    snap.mcp_policies.insert(ResourceEntry::new(
+        "p-open",
+        policy(json!({"scope": "env", "allow": ["*"]})),
+        1,
+    ));
+    let doc = build_export_document(&snap, false);
+    assert_eq!(doc.incomplete.len(), 2, "{:?}", doc.incomplete);
+    assert!(doc.incomplete[0].contains("p-deny"));
+    assert!(doc.incomplete[1].contains("p-narrow"));
+    assert!(
+        doc.warnings.iter().any(|w| w.contains("p-open")),
+        "{:?}",
+        doc.warnings
+    );
+    assert!(
+        doc.warnings.iter().all(|w| !w.contains("p-off")),
+        "a disabled policy imposes nothing: {:?}",
         doc.warnings
     );
 }

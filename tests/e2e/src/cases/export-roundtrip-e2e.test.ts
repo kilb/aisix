@@ -201,6 +201,116 @@ describe("aisix export: etcd → export → file round-trip", () => {
     expect(envelope(fileBlocked.body)).toEqual(envelope(etcdBlocked.body));
   });
 
+  test("a passthrough route survives the move, with a guardrail scoped to it", async (ctx) => {
+    if (!etcdReachable || !upstream) {
+      ctx.skip();
+      return;
+    }
+    const etcd = new EtcdClient();
+    const prefix = `/aisix-export-route-${randomUUID()}`;
+    const seed = new SeedClient(etcd, prefix);
+    const routeCaller = "sk-export-route-caller";
+    let routeApp: SpawnedApp | undefined;
+    try {
+      const pk = await seed.createProviderKey({
+        display_name: "route-pk",
+        provider: "openai",
+        api_key: "sk-route-secret",
+      });
+      const route = await seed.createPassthroughRoute({
+        name: "exported-route",
+        path_prefix: "/passthrough/exported",
+        target_url: `${upstream.baseUrl}/v1`,
+        provider_key_id: pk.id,
+      });
+      const guardrail = await seed.createGuardrail(
+        {
+          name: "route-rule",
+          kind: "keyword",
+          patterns: [{ kind: "literal", value: "route-forbidden-phrase" }],
+        },
+        { attach: false },
+      );
+      await seed.update("guardrail_attachments", randomUUID(), {
+        guardrail_id: guardrail.id,
+        scope_type: "passthrough_route",
+        scope_id: route.id,
+        priority: 100,
+      });
+      await seed.createApiKey({
+        key_hash: createHash("sha256").update(routeCaller).digest("hex"),
+        allowed_routes: ["exported-route"],
+      });
+
+      const { stdout: yaml } = await execFileP(BIN_PATH, [
+        "export",
+        "--etcd",
+        ETCD_ENDPOINT,
+        "--prefix",
+        prefix,
+      ]);
+      const vars = placeholderVars(yaml);
+      routeApp = await spawnApp({
+        resourcesFile: yaml,
+        extraEnv: Object.fromEntries(vars.map((v) => [v, "sk-route-secret"])),
+      });
+
+      const call = (content: string) =>
+        fetch(`${routeApp!.proxyUrl}/passthrough/exported/chat/completions`, {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${routeCaller}`,
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({
+            model: "gpt-4o-mini",
+            messages: [{ role: "user", content }],
+          }),
+        });
+      const allowed = await call("hello");
+      await allowed.arrayBuffer();
+      expect(allowed.status).toBe(200);
+      const blocked = await call("contains route-forbidden-phrase here");
+      await blocked.arrayBuffer();
+      expect(blocked.status).toBeGreaterThanOrEqual(400);
+    } finally {
+      await routeApp?.exit();
+      await etcd.deletePrefix(prefix);
+    }
+  });
+
+  test("an MCP policy the file cannot carry fails the export and names itself", async (ctx) => {
+    if (!etcdReachable) {
+      ctx.skip();
+      return;
+    }
+    const etcd = new EtcdClient();
+    const prefix = `/aisix-export-policy-${randomUUID()}`;
+    const seed = new SeedClient(etcd, prefix);
+    const policyId = randomUUID();
+    try {
+      await seed.update("mcp_policies", policyId, {
+        scope: "env",
+        allow: ["*"],
+        deny: ["srv__drop_table"],
+      });
+      const exported = await execFileP(BIN_PATH, [
+        "export",
+        "--etcd",
+        ETCD_ENDPOINT,
+        "--prefix",
+        prefix,
+      ]).then(
+        () => ({ failed: false, stderr: "" }),
+        (e: { stderr: string }) => ({ failed: true, stderr: e.stderr }),
+      );
+      expect(exported.failed).toBe(true);
+      expect(exported.stderr).toContain(policyId);
+    } finally {
+      await etcd.deletePrefix(prefix);
+    }
+  });
+
   test("default export redacts a live secret on every secret-bearing kind", async (ctx) => {
     if (!etcdReachable) {
       ctx.skip();

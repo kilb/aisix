@@ -128,6 +128,16 @@ pub async fn run(args: ExportArgs) -> anyhow::Result<()> {
     // absent from the output (the file loads, yet the migration lost a
     // resource), and a collision or dangling reference means the file cannot
     // be loaded back as-is.
+    if !document.incomplete.is_empty() {
+        eprintln!(
+            "\n{} document(s) are not in the file, and a gateway loading it would not enforce \
+             them:",
+            document.incomplete.len()
+        );
+        for issue in &document.incomplete {
+            eprintln!("  - {issue}");
+        }
+    }
     if !document.blocking.is_empty() {
         eprintln!(
             "\n{} issue(s) leave the exported file non-loadable — fix them in the source and \
@@ -148,6 +158,14 @@ pub async fn run(args: ExportArgs) -> anyhow::Result<()> {
             "export omitted {} rejected entr(ies); the resources file is incomplete. \
              Fix them in the source and re-export — the written file is for inspection only",
             stats.rejections.len()
+        );
+    }
+
+    if !document.incomplete.is_empty() {
+        anyhow::bail!(
+            "export omitted {} document(s) a resources file cannot carry; a gateway loading it \
+             would not enforce them — the written file is for inspection only",
+            document.incomplete.len()
         );
     }
 

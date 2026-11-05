@@ -80,6 +80,7 @@ mod tests {
             secret_placeholders: Vec::new(),
             warnings: Vec::new(),
             blocking: Vec::new(),
+            incomplete: Vec::new(),
         }
     }
 
