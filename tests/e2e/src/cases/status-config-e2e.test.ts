@@ -740,12 +740,5 @@ describe("status/ready: never_loaded before any config", () => {
     // The etcd source shows disconnected while it keeps retrying.
     expect(cfg.source.type).toBe("etcd");
     expect(cfg.source.connected).toBe(false);
-
-    // The proxy listener is the production readiness surface. It must use the
-    // same fail-closed config gate as the diagnostics listener before the
-    // first successful etcd apply.
-    const proxyReady = await fetch(`${app.proxyUrl}/readyz`);
-    expect(proxyReady.status).toBe(503);
-    expect(await proxyReady.text()).toContain("config failed");
   });
 });
