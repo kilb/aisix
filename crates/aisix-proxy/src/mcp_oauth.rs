@@ -23,7 +23,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use aisix_core::models::{McpServerType, OidcProvider};
+use aisix_core::models::{McpServer, McpServerType, OidcProvider};
 use aisix_core::resource::ResourceEntry;
 use aisix_core::{AisixSnapshot, McpAuthType};
 use aisix_mcp::user_oauth::{RedeemError, RedeemRequest};
@@ -75,14 +75,47 @@ fn challenge_metadata_url(base: &str, server: &str) -> String {
     )
 }
 
-/// The registered server `name`, if it serves this surface.
-pub(crate) fn sign_in_server(snapshot: &AisixSnapshot, name: &str) -> Option<UserOAuthServer> {
+/// The registered server `name`, if it serves this surface to a caller at
+/// `source_ip`. A server whose `allowed_cidrs` excludes that caller is absent
+/// for them, here as on `/mcp/{server}`: anything that answered differently
+/// would confirm a private server exists to someone the allowlist was
+/// configured to withhold it from.
+pub(crate) fn sign_in_server(
+    snapshot: &AisixSnapshot,
+    name: &str,
+    source_ip: &str,
+) -> Option<UserOAuthServer> {
     let entry = snapshot.mcp_servers.get_by_name(name)?;
+    if !entry.value.ip_allowed(source_ip) {
+        return None;
+    }
+    sign_in_entry(&entry)
+}
+
+/// `entry` as a server of this surface, whoever is asking. For what no caller
+/// addressed by name; a caller's request goes through [`sign_in_server`].
+pub(crate) fn sign_in_entry(entry: &ResourceEntry<McpServer>) -> Option<UserOAuthServer> {
     let server = &entry.value;
     (server.enabled
         && server.server_type == McpServerType::Mcp
         && server.auth_type == McpAuthType::OAuth2AuthorizationCode)
         .then(|| UserOAuthServer::new(&entry.id, server))
+}
+
+/// What a route naming `server` answers a caller for whom it is absent: unknown,
+/// disabled, or outside its `allowed_cidrs`. One response on every route, so
+/// none of them can tell those apart.
+pub(crate) fn unknown_server(server: &str) -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        format!("unknown MCP server: {server}"),
+    )
+        .into_response()
+}
+
+/// The caller's address, resolved as `/mcp/{server}` resolves it.
+pub(crate) fn caller_ip(state: &ProxyState, request: &Request) -> String {
+    crate::client_ip::source_ip_from_request(request, state.real_ip.as_ref())
 }
 
 /// How the environment's `oauth2_authorization_code` servers sign users in.
@@ -149,9 +182,16 @@ pub(crate) fn caller_subject(auth: &AuthenticatedKey) -> Option<UserSubject> {
 pub(crate) fn challenge_for_server(
     snapshot: &AisixSnapshot,
     server: &str,
+    source_ip: &str,
     response: &mut Response,
 ) {
-    if response.status() != StatusCode::UNAUTHORIZED || sign_in_server(snapshot, server).is_none() {
+    if sign_in_server(snapshot, server, source_ip).is_some() {
+        point_challenge_at_sign_in(snapshot, server, response);
+    }
+}
+
+fn point_challenge_at_sign_in(snapshot: &AisixSnapshot, server: &str, response: &mut Response) {
+    if response.status() != StatusCode::UNAUTHORIZED {
         return;
     }
     let Some(base) = crate::mcp_auth::public_base(snapshot) else {
@@ -184,7 +224,14 @@ pub(crate) fn failure_response(
         server: server.to_owned(),
     }
     .into_response();
-    challenge_for_server(snapshot, server, &mut response);
+    // Every caller of this already got past the server's `allowed_cidrs`.
+    let signs_in = snapshot
+        .mcp_servers
+        .get_by_name(server)
+        .is_some_and(|entry| sign_in_entry(&entry).is_some());
+    if signs_in {
+        point_challenge_at_sign_in(snapshot, server, &mut response);
+    }
     response
 }
 
@@ -392,10 +439,10 @@ pub(crate) async fn protected_resource(
     observed(&state, None, request, async |state, request| {
         let snapshot = state.snapshot.load();
         let (Some(oauth), Some(base)) = (
-            sign_in_server(&snapshot, &server),
+            sign_in_server(&snapshot, &server, &caller_ip(state, &request)),
             crate::mcp_auth::public_base(&snapshot),
         ) else {
-            return StatusCode::NOT_FOUND.into_response();
+            return unknown_server(&server);
         };
         let resource = scoped_url(&base, &server);
         let mut document = json!({
@@ -427,10 +474,10 @@ pub(crate) async fn authorization_server(
     observed(&state, None, request, async |state, request| {
         let snapshot = state.snapshot.load();
         let (Some(oauth), Some(base)) = (
-            sign_in_server(&snapshot, &server),
+            sign_in_server(&snapshot, &server, &caller_ip(state, &request)),
             crate::mcp_auth::public_base(&snapshot),
         ) else {
-            return StatusCode::NOT_FOUND.into_response();
+            return unknown_server(&server);
         };
         let issuer = scoped_url(&base, &server);
         let mut document = json!({
@@ -462,8 +509,8 @@ pub(crate) async fn jwks(
     request: Request,
 ) -> Response {
     observed(&state, None, request, async |state, request| {
-        if sign_in_server(&state.snapshot.load(), &server).is_none() {
-            return StatusCode::NOT_FOUND.into_response();
+        if sign_in_server(&state.snapshot.load(), &server, &caller_ip(state, &request)).is_none() {
+            return unknown_server(&server);
         }
         json_document(request.method(), json!({ "keys": [] }))
     })
@@ -479,8 +526,8 @@ pub(crate) async fn register(
     request: Request,
 ) -> Response {
     observed(&state, None, request, async |state, request| {
-        if sign_in_server(&state.snapshot.load(), &server).is_none() {
-            return StatusCode::NOT_FOUND.into_response();
+        if sign_in_server(&state.snapshot.load(), &server, &caller_ip(state, &request)).is_none() {
+            return unknown_server(&server);
         }
         let Ok(body) = to_bytes(request.into_body(), MAX_BODY_BYTES).await else {
             return oauth_error(
@@ -527,8 +574,8 @@ pub(crate) async fn authorize(
 ) -> Response {
     observed(&state, None, request, async |state, request| {
         let snapshot = state.snapshot.load();
-        let Some(oauth) = sign_in_server(&snapshot, &server) else {
-            return StatusCode::NOT_FOUND.into_response();
+        let Some(oauth) = sign_in_server(&snapshot, &server, &caller_ip(state, &request)) else {
+            return unknown_server(&server);
         };
         let Some(base) = crate::mcp_auth::public_base(&snapshot) else {
             return failure_response(&snapshot, &server, UserOAuthFailure::Misconfigured);
@@ -662,8 +709,10 @@ pub(crate) async fn token(
     };
     let request = Request::from_parts(parts, body);
     observed(&state, Some(&auth), request, async |state, request| {
-        let Some(oauth) = sign_in_server(&state.snapshot.load(), &server) else {
-            return StatusCode::NOT_FOUND.into_response();
+        let Some(oauth) =
+            sign_in_server(&state.snapshot.load(), &server, &caller_ip(state, &request))
+        else {
+            return unknown_server(&server);
         };
         let Some(subject) = caller_subject(&auth) else {
             return oauth_error(
@@ -767,10 +816,10 @@ pub(crate) async fn delete_credential(
         }
     };
     let request = Request::from_parts(parts, body);
-    observed(&state, Some(&auth), request, async |state, _request| {
+    observed(&state, Some(&auth), request, async |state, request| {
         let snapshot = state.snapshot.load();
-        let Some(oauth) = sign_in_server(&snapshot, &server) else {
-            return StatusCode::NOT_FOUND.into_response();
+        let Some(oauth) = sign_in_server(&snapshot, &server, &caller_ip(state, &request)) else {
+            return unknown_server(&server);
         };
         let Some(subject) = caller_subject(&auth) else {
             return failure_response(&snapshot, &server, UserOAuthFailure::NoSubject);

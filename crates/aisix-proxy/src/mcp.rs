@@ -160,7 +160,12 @@ async fn resolve_caller(
     if let Some(server) = scope {
         if let Some(token) = crate::mcp_oauth_login::presented_session_token(&parts.headers) {
             let started = Instant::now();
-            return match crate::mcp_oauth_login::authenticate_session(state, token, server).await {
+            let source_ip = crate::client_ip::source_ip_from_parts(parts, state.real_ip.as_ref());
+            return match crate::mcp_oauth_login::authenticate_session(
+                state, token, server, &source_ip,
+            )
+            .await
+            {
                 Ok(auth) => {
                     auth.publish(parts);
                     if let Some(jwt) = &auth.jwt {
@@ -224,6 +229,7 @@ async fn serve(state: ProxyState, request: Request, scope: Option<String>) -> Re
                 crate::mcp_oauth::challenge_for_server(
                     &state.snapshot.load(),
                     server,
+                    &crate::client_ip::source_ip_from_parts(&parts, state.real_ip.as_ref()),
                     &mut response,
                 );
             }
@@ -376,11 +382,7 @@ async fn dispatch(
             .get_by_name(server)
             .is_some_and(|entry| entry.value.enabled && entry.value.ip_allowed(source_ip));
         if !known {
-            return (
-                StatusCode::NOT_FOUND,
-                format!("unknown MCP server: {server}"),
-            )
-                .into_response();
+            return crate::mcp_oauth::unknown_server(server);
         }
     }
     // The server signs in each user, which takes a public address to send
@@ -896,13 +898,7 @@ async fn dispatch(
             source_ip,
         ) {
             Some(gateway) => gateway,
-            None => {
-                return (
-                    StatusCode::NOT_FOUND,
-                    format!("unknown MCP server: {server}"),
-                )
-                    .into_response()
-            }
+            None => return crate::mcp_oauth::unknown_server(server),
         },
         // Aggregated: a server this caller may not reach is filtered out of
         // the gateway entirely, so its tools are neither listed nor callable.
@@ -4064,6 +4060,193 @@ mod tests {
             .insert(ResourceEntry::new("ak-1", apikey, 1));
         insert_mcp_server(&snapshot, "mcp-1", "alpha", true);
         snapshot
+    }
+
+    /// An `oauth2_authorization_code` server only `10.99.0.0/24` may reach, in
+    /// an environment with a public address, so every route of the sign-in
+    /// surface is live for a caller inside the range.
+    fn snapshot_with_private_sign_in_server() -> AisixSnapshot {
+        let snapshot = scoped_snapshot();
+        let private: aisix_core::McpServer = serde_json::from_value(serde_json::json!({
+            "display_name": "private",
+            "url": "http://127.0.0.1:9/mcp",
+            "enabled": true,
+            "auth_type": "oauth2_authorization_code",
+            "allowed_cidrs": ["10.99.0.0/24"],
+        }))
+        .expect("valid mcp server");
+        snapshot
+            .mcp_servers
+            .insert(ResourceEntry::new("mcp-private", private, 2));
+        let settings: aisix_core::models::McpAuthSettings =
+            serde_json::from_value(serde_json::json!({
+                "resource_url": "https://gw.example.com/mcp",
+            }))
+            .expect("valid mcp_auth_settings");
+        snapshot
+            .mcp_auth_settings
+            .insert(ResourceEntry::new("env-1", settings, 1));
+        snapshot
+    }
+
+    const INSIDE: &str = "10.99.0.7";
+    const OUTSIDE: &str = "192.0.2.9";
+
+    async fn status_and_body(
+        router: axum::Router,
+        request: HttpRequest<Body>,
+    ) -> (StatusCode, String) {
+        let response = router.oneshot(request).await.expect("router responds");
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("read body");
+        (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    /// Every route naming a server answers a caller outside its allowlist
+    /// exactly as `/mcp/{server}` does, and exactly as it answers for a name
+    /// nothing is registered under, so none of them confirms the server exists.
+    #[tokio::test]
+    async fn the_sign_in_surface_hides_a_server_the_caller_may_not_reach() {
+        let snapshot = snapshot_with_private_sign_in_server();
+        let router = router_with(snapshot);
+        let own_route = status_and_body(
+            router.clone(),
+            from_ip(scoped_tools_call("private", "tool"), OUTSIDE),
+        )
+        .await;
+        assert_eq!(own_route.0, StatusCode::NOT_FOUND);
+
+        let bearer = format!("Bearer {TOKEN}");
+        let routes: [(&str, &str, Option<&str>); 8] = [
+            ("GET", "/.well-known/oauth-protected-resource/mcp/{}", None),
+            (
+                "GET",
+                "/.well-known/oauth-authorization-server/mcp/{}",
+                None,
+            ),
+            ("GET", "/mcp/{}/.well-known/openid-configuration", None),
+            ("GET", "/mcp/{}/.well-known/jwks.json", None),
+            ("POST", "/mcp/{}/oauth/register", None),
+            ("GET", "/mcp/{}/oauth/authorize", None),
+            ("POST", "/mcp/{}/oauth/token", Some(&bearer)),
+            ("DELETE", "/mcp/{}/oauth/credential", Some(&bearer)),
+        ];
+        for (method, template, auth) in routes {
+            let request = |server: &str, ip: &str| {
+                let mut builder = HttpRequest::builder()
+                    .method(method)
+                    .uri(template.replace("{}", server));
+                if let Some(auth) = auth {
+                    builder = builder.header("authorization", auth);
+                }
+                from_ip(builder.body(Body::from("{}")).unwrap(), ip)
+            };
+            let hidden = status_and_body(router.clone(), request("private", OUTSIDE)).await;
+            assert_eq!(hidden, own_route, "{method} {template} from outside");
+            let absent = status_and_body(router.clone(), request("absent", INSIDE)).await;
+            assert_eq!(
+                absent.1.replace("absent", "private"),
+                hidden.1,
+                "{method} {template}: an unknown name answers the same",
+            );
+            assert_eq!(absent.0, hidden.0, "{method} {template}");
+            // The positive control: the same request from inside the range is
+            // past the fold, whatever it then makes of the empty request.
+            let served = status_and_body(router.clone(), request("private", INSIDE)).await;
+            assert_ne!(
+                served, hidden,
+                "{method} {template} must reach the route from inside",
+            );
+        }
+    }
+
+    /// A 401 on `/mcp/{server}` names the server's own sign-in only to a caller
+    /// who may reach it. Otherwise the challenge is the one an unknown name
+    /// gets, whether the request carried nothing or a session token.
+    #[tokio::test]
+    async fn a_challenge_does_not_name_a_server_the_caller_may_not_reach() {
+        let router = router_with(snapshot_with_private_sign_in_server());
+        let session = format!(
+            "{}not-a-real-session",
+            aisix_mcp::user_oauth::ACCESS_TOKEN_PREFIX
+        );
+        for auth in [None, Some(session.as_str())] {
+            let challenge = |response: axum::response::Response| {
+                assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+                response
+                    .headers()
+                    .get("www-authenticate")
+                    .map(|value| value.to_str().expect("ascii").to_owned())
+            };
+            let call = |server: &str, ip: &str| {
+                from_ip(
+                    scoped_request(server, auth, "initialize", serde_json::json!({})),
+                    ip,
+                )
+            };
+            let inside = challenge(
+                router
+                    .clone()
+                    .oneshot(call("private", INSIDE))
+                    .await
+                    .expect("router responds"),
+            );
+            assert_eq!(
+                inside.as_deref(),
+                Some(
+                    "Bearer resource_metadata=\"https://gw.example.com/.well-known/oauth-protected-resource/mcp/private\""
+                ),
+                "with {auth:?}",
+            );
+            let outside = challenge(
+                router
+                    .clone()
+                    .oneshot(call("private", OUTSIDE))
+                    .await
+                    .expect("router responds"),
+            );
+            let absent = challenge(
+                router
+                    .clone()
+                    .oneshot(call("absent", OUTSIDE))
+                    .await
+                    .expect("router responds"),
+            );
+            assert_eq!(outside, absent, "with {auth:?}");
+        }
+    }
+
+    /// The anonymous entry answers an unlisted server with a 401, so a listed
+    /// one whose own allowlist excludes the caller answers that too. A 404
+    /// there would say the name is registered.
+    #[tokio::test]
+    async fn anonymous_entry_hides_a_listed_server_the_caller_may_not_reach() {
+        let snapshot =
+            snapshot_with_anonymous(serde_json::json!({ "servers": ["docs", "private"] }));
+        let private: aisix_core::McpServer = serde_json::from_value(serde_json::json!({
+            "display_name": "private",
+            "url": "http://127.0.0.1:9/mcp",
+            "enabled": true,
+            "allowed_cidrs": ["10.99.0.0/24"],
+        }))
+        .expect("valid mcp server");
+        snapshot
+            .mcp_servers
+            .insert(ResourceEntry::new("mcp-private", private, 2));
+        let router = router_with(snapshot);
+        let call = |server: &str| {
+            from_ip(
+                scoped_request(server, None, "initialize", serde_json::json!({})),
+                // Inside the anonymous block's `source_cidrs`, outside the server's.
+                "10.1.2.3",
+            )
+        };
+        let hidden = status_and_body(router.clone(), call("private")).await;
+        let unlisted = status_and_body(router.clone(), call("absent")).await;
+        assert_eq!(hidden.0, StatusCode::UNAUTHORIZED);
+        assert_eq!(hidden, unlisted);
     }
 
     /// A server carrying `allowed_cidrs` is ABSENT for a caller outside them —

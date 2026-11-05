@@ -214,6 +214,22 @@ pub(crate) fn anonymous_entry(
             .record_auth_decision("anonymous", false, "source_not_allowed");
         return None;
     }
+    // A listed server whose own `allowed_cidrs` excludes this caller is absent
+    // for them, and an absent server answers this entry as an unlisted one
+    // does: 401 before the 404. Serving the principal here would reach the
+    // scoped route's 404 and say the name is registered.
+    if let Some(server) = scope {
+        let excluded = snapshot
+            .mcp_servers
+            .get_by_name(server)
+            .is_some_and(|entry| !entry.value.ip_allowed(&source_ip));
+        if excluded {
+            state
+                .metrics
+                .record_auth_decision("anonymous", false, "source_not_allowed");
+            return None;
+        }
+    }
     // The bound principal keeps its full lifecycle: a deleted, disabled
     // or expired key closes anonymous access rather than opening it.
     let Some(entry) = snapshot.apikeys.get_by_id(&anon.api_key_id) else {

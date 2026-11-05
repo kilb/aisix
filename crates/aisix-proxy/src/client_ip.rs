@@ -242,12 +242,27 @@ pub(crate) fn exported_header_names(
 /// `ClientContext` runs so a rejected credential can still name its source.
 /// Empty when the request carries no `ConnectInfo` (oneshot tests).
 pub(crate) fn source_ip_from_parts(parts: &Parts, cfg: &ResolvedRealIp) -> String {
-    parts
-        .extensions
+    source_ip_from(&parts.extensions, &parts.headers, cfg)
+}
+
+/// [`source_ip_from_parts`] for a handler holding the whole request.
+pub(crate) fn source_ip_from_request<B>(
+    request: &axum::http::Request<B>,
+    cfg: &ResolvedRealIp,
+) -> String {
+    source_ip_from(request.extensions(), request.headers(), cfg)
+}
+
+fn source_ip_from(
+    extensions: &axum::http::Extensions,
+    headers: &HeaderMap,
+    cfg: &ResolvedRealIp,
+) -> String {
+    extensions
         .get::<ConnectInfo<SocketAddr>>()
         .map(|ci| ci.0.ip())
         .map(|peer| {
-            let forwarded = parse_forwarded(&parts.headers, &cfg.header);
+            let forwarded = parse_forwarded(headers, &cfg.header);
             resolve_client_ip(peer, &forwarded, &cfg.trusted, cfg.recursive).to_string()
         })
         .unwrap_or_default()

@@ -51,8 +51,9 @@ use serde_json::json;
 use crate::auth::{AuthenticatedKey, JwtIdentity};
 use crate::error::ProxyError;
 use crate::mcp_oauth::{
-    callback_url, failure_response, no_store, oauth_error, observed, query_params, redirect,
-    redirect_to_client, refuse_to_client, resource_matches, sign_in_server, SignInMode,
+    callback_url, caller_ip, failure_response, no_store, oauth_error, observed, query_params,
+    redirect, redirect_to_client, refuse_to_client, resource_matches, sign_in_entry,
+    sign_in_server, unknown_server, SignInMode,
 };
 use crate::state::ProxyState;
 
@@ -681,7 +682,7 @@ fn failure_page(failure: UserOAuthFailure) -> Response {
 
 fn server_of(snapshot: &AisixSnapshot, flow: &FlowState) -> Option<UserOAuthServer> {
     let entry = snapshot.mcp_servers.get_by_id(&flow.server_id)?;
-    sign_in_server(snapshot, &entry.value.name)
+    sign_in_entry(&entry)
 }
 
 /// With the identity known, make sure it has a working upstream credential:
@@ -1058,6 +1059,7 @@ pub(crate) async fn authenticate_session(
     state: &ProxyState,
     token: &str,
     server: &str,
+    source_ip: &str,
 ) -> Result<AuthenticatedKey, ProxyError> {
     let snapshot = state.snapshot.load();
     let note_refusal = |reason: &'static str| {
@@ -1071,7 +1073,7 @@ pub(crate) async fn authenticate_session(
         note_refusal(reason);
         // A server that signs users in tells the client to do that. Any other
         // name reads as what the token is to it: a key it does not know.
-        if sign_in_server(&snapshot, server).is_some() {
+        if sign_in_server(&snapshot, server, source_ip).is_some() {
             ProxyError::McpUserOAuth {
                 failure: UserOAuthFailure::AuthorizationRequired,
                 server: server.to_owned(),
@@ -1082,7 +1084,7 @@ pub(crate) async fn authenticate_session(
     };
     // Before anything is read: a name that signs nobody in is no reason to
     // reach the store, and this is reachable with no credential at all.
-    let Some(oauth) = sign_in_server(&snapshot, server) else {
+    let Some(oauth) = sign_in_server(&snapshot, server, source_ip) else {
         return Err(refused("session_wrong_server"));
     };
     let keys = match state.mcp_oauth.session_keys().await {
@@ -1137,8 +1139,8 @@ pub(crate) async fn token(
     request: Request,
 ) -> Response {
     let snapshot = state.snapshot.load();
-    let Some(oauth) = sign_in_server(&snapshot, server) else {
-        return StatusCode::NOT_FOUND.into_response();
+    let Some(oauth) = sign_in_server(&snapshot, server, &caller_ip(state, &request)) else {
+        return unknown_server(server);
     };
     let (SignInMode::Interactive(_), Some(base)) = (mode, crate::mcp_auth::public_base(&snapshot))
     else {
