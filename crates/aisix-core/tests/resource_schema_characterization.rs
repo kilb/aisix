@@ -1529,6 +1529,54 @@ fn published_sets_differ_only_where_registered() {
     );
 }
 
+/// Field descriptions are rendered into the public API reference, where an
+/// issue number means nothing to the reader. Walks both directories so a file
+/// the dump starts emitting cannot skip the check.
+#[test]
+fn published_descriptions_cite_no_issue_numbers() {
+    fn cites_an_issue(text: &str) -> bool {
+        text.split('#').skip(1).any(|after| {
+            after
+                .chars()
+                .next()
+                .is_some_and(|first| first.is_ascii_digit())
+        })
+    }
+    fn offending(node: &Value, path: &str, out: &mut Vec<String>) {
+        match node {
+            Value::Object(obj) => {
+                if let Some(Value::String(text)) = obj.get("description") {
+                    if cites_an_issue(text) {
+                        out.push(format!("{path}: {text}"));
+                    }
+                }
+                for (k, v) in obj {
+                    offending(v, &format!("{path}/{k}"), out);
+                }
+            }
+            Value::Array(items) => {
+                for (i, v) in items.iter().enumerate() {
+                    offending(v, &format!("{path}/{i}"), out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut found = Vec::new();
+    for dir in ["resources", "resources-lenient"] {
+        for name in published_file_names(dir) {
+            let resource = name.trim_end_matches(".schema.json");
+            offending(
+                &published_schema(dir, resource),
+                &format!("{dir}/{resource}"),
+                &mut found,
+            );
+        }
+    }
+    assert!(found.is_empty(), "{found:#?}");
+}
+
 /// No published lenient file closes anything, at any depth.
 ///
 /// This is the property `open_unknown_fields` exists for and the one a

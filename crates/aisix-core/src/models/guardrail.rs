@@ -1056,7 +1056,7 @@ pub struct CustomConfig {
     /// schema — `minLength` counts characters, so a whitespace-only value is
     /// non-empty — and is refused when the chain is built instead. `aisix
     /// validate` reports that and exits non-zero; a serving gateway reports
-    /// the runtime rejection through config status (api7/aisix#1084).
+    /// the runtime rejection through config status.
     #[serde(default)]
     #[schemars(length(min = 1))]
     pub script: String,

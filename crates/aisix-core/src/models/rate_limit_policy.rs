@@ -354,7 +354,7 @@ pub struct RateLimitPolicy {
     pub action: Option<PolicyAction>,
     /// Recurring windows during which this policy is suspended — the
     /// quota gate skips it while `now` falls in any listed window and
-    /// enforcement resumes automatically afterwards (#1104).
+    /// enforcement resumes automatically afterwards.
     /// The counters' bucket key never changes, so suspension does not
     /// reset the surrounding window's counts. Empty/absent = always
     /// enforced. The control plane omits the field when empty, keeping
