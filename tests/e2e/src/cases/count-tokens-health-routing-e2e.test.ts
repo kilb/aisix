@@ -75,7 +75,7 @@ describe("count_tokens health and routing telemetry", () => {
         model_name: "claude",
         provider_key_id: pk.id,
         retries: 0,
-        cooldown: { default_seconds: 60 },
+        cooldown: { enabled: true, default_seconds: 60 },
       });
       return model.id;
     };

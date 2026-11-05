@@ -389,7 +389,7 @@ describe("stream timeout terminal state across handler families", () => {
         provider_key_id: providerKey.id,
         stream_timeout: TIMEOUT_MS,
         retries: 0,
-        cooldown: { default_seconds: 60 },
+        cooldown: { enabled: true, default_seconds: 60 },
       });
       modelIds[key] = model.id;
     };
@@ -423,7 +423,7 @@ describe("stream timeout terminal state across handler families", () => {
         provider_key_id: providerKey.id,
         stream_timeout: TIMEOUT_MS,
         retries: 0,
-        cooldown: { default_seconds: 60 },
+        cooldown: { enabled: true, default_seconds: 60 },
       });
       modelIds[key] = model.id;
     };

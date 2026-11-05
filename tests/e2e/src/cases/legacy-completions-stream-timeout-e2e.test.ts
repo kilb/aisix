@@ -254,7 +254,7 @@ describe("legacy completions stream timeout", () => {
       provider_key_id: slowPk,
       stream_timeout: TIMEOUT_MS,
       retries: 0,
-      cooldown: { default_seconds: 60 },
+      cooldown: { enabled: true, default_seconds: 60 },
     });
     slowModelId = slowModel.id;
     const midModel = await seed.createModel({
@@ -265,7 +265,7 @@ describe("legacy completions stream timeout", () => {
       stream_timeout: TIMEOUT_MS,
       retries: 0,
       rate_limit: { concurrency: 1 },
-      cooldown: { default_seconds: 1 },
+      cooldown: { enabled: true, default_seconds: 1 },
     });
     midModelId = midModel.id;
     const truncatedModel = await seed.createModel({
@@ -274,7 +274,7 @@ describe("legacy completions stream timeout", () => {
       model_name: "gpt-3.5-turbo-instruct",
       provider_key_id: truncatedPk,
       retries: 0,
-      cooldown: { default_seconds: 60 },
+      cooldown: { enabled: true, default_seconds: 60 },
     });
     truncatedModelId = truncatedModel.id;
     const malformedModel = await seed.createModel({
@@ -283,7 +283,7 @@ describe("legacy completions stream timeout", () => {
       model_name: "gpt-3.5-turbo-instruct",
       provider_key_id: malformedPk,
       retries: 0,
-      cooldown: { default_seconds: 60 },
+      cooldown: { enabled: true, default_seconds: 60 },
     });
     malformedModelId = malformedModel.id;
     const malformedDoneModel = await seed.createModel({
@@ -292,7 +292,7 @@ describe("legacy completions stream timeout", () => {
       model_name: "gpt-3.5-turbo-instruct",
       provider_key_id: malformedDonePk,
       retries: 0,
-      cooldown: { default_seconds: 60 },
+      cooldown: { enabled: true, default_seconds: 60 },
     });
     malformedDoneModelId = malformedDoneModel.id;
     await seed.createModel({
@@ -301,7 +301,7 @@ describe("legacy completions stream timeout", () => {
       model_name: "gpt-3.5-turbo-instruct",
       provider_key_id: malformedWithDonePk,
       retries: 0,
-      cooldown: { default_seconds: 60 },
+      cooldown: { enabled: true, default_seconds: 60 },
     });
     await seed.createModel({
       display_name: "legacy-done-with-trailer",
@@ -309,7 +309,7 @@ describe("legacy completions stream timeout", () => {
       model_name: "gpt-3.5-turbo-instruct",
       provider_key_id: doneTrailerPk,
       retries: 0,
-      cooldown: { default_seconds: 60 },
+      cooldown: { enabled: true, default_seconds: 60 },
     });
 
     // The caller key is the final revision. Authenticated model listing is a

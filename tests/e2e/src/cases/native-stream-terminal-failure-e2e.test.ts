@@ -200,8 +200,8 @@ describe("native stream protocol failures are not healthy completions", () => {
         model_name: messages ? "claude" : "gpt-4o-mini",
         provider_key_id: providerKey.id,
         cooldown: messages
-          ? { default_seconds: 60, trigger_statuses: [529] }
-          : { default_seconds: 60 },
+          ? { enabled: true, default_seconds: 60, trigger_statuses: [529] }
+          : { enabled: true, default_seconds: 60 },
       });
       modelIds[key] = model.id;
     }
