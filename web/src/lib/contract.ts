@@ -7,4 +7,4 @@
  *
  * 改这个数字的时机和那边一样：接口真的变了。不要跟着版本号或构建时间走。
  */
-export const EXPECTED_API_CONTRACT = 1;
+export const EXPECTED_API_CONTRACT = 2;

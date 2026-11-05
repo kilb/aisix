@@ -82,6 +82,16 @@ export async function loadDoc(): Promise<LoadedDoc> {
   };
 }
 
+/** 一次成功保存（文件已经替换）的结果。 */
+export interface SaveResult {
+  detail?: string;
+  /** 校验通过但校验器有话要说，比如护栏没有挂载、什么流量也不检查。 */
+  warnings?: string;
+  /** 网关用上这份配置了没有。信号送到不等于它收下了。 */
+  reload?: "applied" | "rejected" | "unconfirmed" | "signal_failed";
+  reload_error?: string | null;
+}
+
 /**
  * 保存整份文档。`baseVersion` 是本次编辑所基于的磁盘版本，服务端在写锁内
  * 重读比对，不一致返回 409。
@@ -90,7 +100,7 @@ export async function loadDoc(): Promise<LoadedDoc> {
  * 允许后保存的那份静默盖掉先保存的改动 —— 被盖掉的如果是一次密钥吊销，
  * 那把密钥就又活了。类型层面强制它一起传。
  */
-export async function saveDoc(doc: Json, baseVersion: string): Promise<string> {
+export async function saveDoc(doc: Json, baseVersion: string): Promise<SaveResult> {
   if (!baseVersion) {
     throw new ApiError(
       "配置未能读取，拒绝保存：保存会用一份不完整的文档覆盖线上配置。",
@@ -109,11 +119,11 @@ export async function saveDoc(doc: Json, baseVersion: string): Promise<string> {
     }),
   });
   if (!r.ok) throw new ApiError(await errorOf(r), r.status, r.status === 409);
-  return ((await r.json()) as { detail?: string }).detail ?? "";
+  return (await r.json()) as SaveResult;
 }
 
 /** 同上，提交的是原始 YAML 文本。一次过期覆盖抹掉的是整份文件。 */
-export async function saveRaw(raw: string, baseVersion: string): Promise<string> {
+export async function saveRaw(raw: string, baseVersion: string): Promise<SaveResult> {
   if (!baseVersion) {
     throw new ApiError(
       "配置未能读取，拒绝保存：编辑框里是上一次成功载入的内容，保存会把此后的改动全部覆盖掉。",
@@ -130,7 +140,7 @@ export async function saveRaw(raw: string, baseVersion: string): Promise<string>
     }),
   });
   if (!r.ok) throw new ApiError(await errorOf(r), r.status, r.status === 409);
-  return ((await r.json()) as { detail?: string }).detail ?? "";
+  return (await r.json()) as SaveResult;
 }
 
 /**

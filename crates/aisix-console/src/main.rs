@@ -30,6 +30,8 @@ use tokio::sync::RwLock;
 
 /// 会话有效期。控制台能看到明文上游密钥，所以不做长期免登录。
 const SESSION_TTL_SECS: u64 = 8 * 3600;
+/// 登录排队最多等多久。见 [`login`]。
+const LOGIN_QUEUE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[derive(Clone)]
 struct AppState {
@@ -45,6 +47,9 @@ struct AppState {
     portal_admin_token: Option<String>,
     /// Prometheus 基址（回环）。
     prom_url: String,
+    /// 网关指标口的基址（`observability.metrics.prometheus.addr`），问 `/status/config`
+    /// 用。没配就只能说信号发出去了，说不了网关用上了没有。
+    status_url: Option<String>,
     /// 声明式资源文件，控制台写它。
     resources_path: PathBuf,
     /// 网关二进制，用来在落盘前跑 `validate`。
@@ -123,8 +128,13 @@ struct LoginReq {
 
 async fn login(State(st): State<AppState>, Json(req): Json<LoginReq>) -> Response {
     // 未登录即可触达的最贵操作。argon2 默认单次占 19 MiB，本服务 MemoryMax=120M，
-    // 所以几个并发请求就能 OOM 掉它——闸住并发数，拿不到许可直接 429。
-    let Ok(_permit) = st.login_gate.try_acquire() else {
+    // 所以几个并发请求就能 OOM 掉它——闸住并发数。
+    //
+    // 排队等一会儿，等不到才 429。一见忙就拒的话，两条连接循环试口令就能占满两个
+    // 许可（下面失败后那 600ms 也算在内），运维自己永远登不进来。许可有意留到那
+    // 600ms 之后：它同时把猜口令的速度压在每秒三次上下。
+    let Ok(Ok(_permit)) = tokio::time::timeout(LOGIN_QUEUE_WAIT, st.login_gate.acquire()).await
+    else {
         return (
             StatusCode::TOO_MANY_REQUESTS,
             Json(json!({"error": "登录校验繁忙，请稍后重试"})),
@@ -223,7 +233,7 @@ async fn logout(State(st): State<AppState>, headers: HeaderMap) -> Response {
 /// [`stale_write`] 的逃生口（缺版本 = 不检查），于是丢失更新会静默回来：
 /// 两个标签页各改一处，后保存的整份覆盖先保存的，而被覆盖的可能是一次
 /// 密钥吊销。所以界面在偏移时必须停止写入，不只是显示一条横幅。
-const API_CONTRACT_VERSION: u32 = 1;
+const API_CONTRACT_VERSION: u32 = 2;
 
 async fn session_state(State(st): State<AppState>, headers: HeaderMap) -> Json<Value> {
     // 契约版本挂在这个端点上，而不是新开一个：界面启动时本来就要问一次
@@ -312,6 +322,18 @@ async fn portal_user_action(
 ) -> Response {
     if let Err(r) = require_auth(&st, &headers).await {
         return r;
+    }
+    // `user_id` 来自路径，框架已经解了 `%2F`。原样拼进 URL 的话，`../..` 能走到门户的
+    // 任何一个 POST 端点上，带的还是全权凭据。用户 id 是 uuid，用不到别的字符。
+    if !user_id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-')
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "用户 id 不合法"})),
+        )
+            .into_response();
     }
     let Some(token) = st.portal_admin_token.clone() else {
         return portal_absent();
@@ -560,6 +582,17 @@ fn promql_only_touches_aisix(q: &str) -> bool {
         "quantile",
         "histogram_quantile",
     ];
+    // 选择器前面必须紧贴一个 aisix_ 指标名。`aisix_x or {job=~".+"}` 里每个词都过得了
+    // 下面的检查，而那个裸选择器读的是这台 Prometheus 上的所有序列。
+    for (at, _) in q.match_indices('{') {
+        let head = q[..at].trim_end();
+        let name = head
+            .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == ':'))
+            .map_or(head, |p| &head[p + 1..]);
+        if !name.starts_with("aisix_") {
+            return false;
+        }
+    }
     let mut ident = String::new();
     let mut idents: Vec<String> = Vec::new();
     for ch in q.chars().chain(std::iter::once(' ')) {
@@ -686,6 +719,124 @@ fn contract_client_must_send_version(
     client_contract.is_some() && base_version.is_none()
 }
 
+/// 等跨进程写锁最多等多久。门户持锁时只是写一次文件，正常远用不了这么久。
+const FILE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// 跨进程写锁：`<配置路径>.lock` 上的 flock，返回的文件活着锁就在。
+///
+/// 门户也写这个文件（铸密钥、吊销、对账）。从比对版本到 rename 之间要跑一次校验子
+/// 进程，这段窗口里门户写进去的东西会被这边 rename 整份盖掉 —— 被盖掉的可能是一次
+/// 吊销（密钥又活了），也可能是一把刚铸的密钥（明文已经给了用户，配置却没有它）。
+/// 门户那边用同一个文件名（`crates/aisix-portal/src/resources.rs`）。
+async fn lock_for_write(path: &std::path::Path) -> Result<std::fs::File, SaveError> {
+    use std::fs::TryLockError;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".lock");
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .mode(0o600)
+        .open(&name)
+        .map_err(|e| format!("打不开写锁: {e}"))?;
+    let deadline = tokio::time::Instant::now() + FILE_LOCK_WAIT;
+    loop {
+        match lock.try_lock() {
+            Ok(()) => return Ok(lock),
+            Err(TryLockError::Error(e)) => {
+                return Err(SaveError::Failed(format!("拿不到写锁: {e}")));
+            }
+            Err(TryLockError::WouldBlock) if tokio::time::Instant::now() >= deadline => {
+                return Err(SaveError::Failed(
+                    "配置文件正被另一个进程改写，未保存，请稍后重试".into(),
+                ));
+            }
+            Err(TryLockError::WouldBlock) => {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }
+    }
+}
+
+/// 网关用上这份配置了没有。
+///
+/// 信号送到只说明网关会去读，不说明它收下了：加载失败时它只记一条 WARN，继续用旧
+/// 快照。所以要问 `/status/config`。
+#[derive(Debug, PartialEq)]
+enum Reload {
+    /// 网关已经在用这份内容。
+    Applied,
+    /// 网关读到了这份内容，但没收下。带它给的原因。
+    Rejected(String),
+    /// 信号发出去了，但没法确认（没配 `AISIX_STATUS_URL`，或者等到超时）。
+    Unconfirmed,
+    /// 信号没送到。
+    SignalFailed,
+}
+
+impl Reload {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Applied => "applied",
+            Self::Rejected(_) => "rejected",
+            Self::Unconfirmed => "unconfirmed",
+            Self::SignalFailed => "signal_failed",
+        }
+    }
+}
+
+/// 等网关报告它读到了 `written`，再看它有没有收下。文件模式下 `source_hash` 是刚读到
+/// 的文件的散列，`config_hash` 是正在用的那份的。
+async fn confirm_reload(st: &AppState, written: &str) -> Reload {
+    let Some(base) = &st.status_url else {
+        return Reload::Unconfirmed;
+    };
+    let want = sha256_hex(written.as_bytes());
+    let url = format!("{base}/status/config");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        if let Some(view) = async {
+            st.http
+                .get(&url)
+                .send()
+                .await
+                .ok()?
+                .json::<Value>()
+                .await
+                .ok()
+        }
+        .await
+        {
+            let hash = |pointer: &str| view.pointer(pointer).and_then(Value::as_str);
+            if hash("/source/source_hash") == Some(want.as_str()) {
+                if hash("/applied/config_hash") == Some(want.as_str()) {
+                    return Reload::Applied;
+                }
+                let why = view
+                    .pointer("/rejected/0/last_error")
+                    .or_else(|| view.pointer("/last_failure/last_error"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("网关没有给出原因");
+                return Reload::Rejected(why.to_string());
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Reload::Unconfirmed;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+/// 一次成功的保存（文件已经替换）。
+struct Saved {
+    detail: String,
+    /// 校验通过但校验器有话要说，比如「这个护栏没有挂载，什么流量也不检查」。
+    warnings: String,
+    reload: Reload,
+}
+
 /// 校验 → 落盘 → SIGHUP。三步都成功才算保存。
 ///
 /// 校验用的是网关自己的 `aisix validate`，不是这里重新实现一份 schema：
@@ -695,7 +846,7 @@ async fn save_resources(
     doc: &Value,
     base_version: Option<&str>,
     client_contract: Option<u32>,
-) -> Result<String, SaveError> {
+) -> Result<Saved, SaveError> {
     if contract_client_must_send_version(client_contract, base_version) {
         return Err(SaveError::Stale);
     }
@@ -704,6 +855,9 @@ async fn save_resources(
     // 整个序列串行执行。并发下共用一条临时路径会让 A 校验到 B 的内容
     // 再把它上线——界面承诺的「校验不通过就不落盘」正是死在这里。
     let _guard = st.save_lock.lock().await;
+    // 从这里一直持到函数结束，包括发信号：门户在这期间写不进来，它的 `pkill` 也就打
+    // 不到下面那个校验子进程。
+    let _file_lock = lock_for_write(&st.resources_path).await?;
 
     // 比对必须在锁内、且是重读磁盘：在锁外读会让检查本身可以被插队，
     // 而用请求进来时的旧读数比对等于没比对。文件读不到时不拦——那种情况
@@ -719,14 +873,20 @@ async fn save_resources(
         .resources_path
         .with_extension(format!("yaml.console-tmp.{}", &random_token()[..16]));
 
-    // 0600 建文件：这份内容和正式配置一样含明文上游密钥。用 fs::write 会按
-    // umask 建成 0644，而 rename 会把这个权限一并带到正式文件上——运维设的
-    // 0600 会在第一次保存后被静默降级。
+    // 沿用原文件的权限，文件还不存在时 0600：这份内容和正式配置一样含明文上游密钥。
+    // 用 fs::write 会按 umask 建成 0644，而 rename 会把这个权限一并带到正式文件上 ——
+    // 运维设的 0600 会在第一次保存后被静默降级。反过来一律 0600 也不对：网关不是同
+    // 一个用户、靠组读这个文件的部署，第一次保存之后它就读不到了。
     {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = tokio::fs::metadata(&st.resources_path)
+            .await
+            .map(|m| m.permissions().mode() & 0o777)
+            .unwrap_or(0o600);
         let mut f = tokio::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
-            .mode(0o600)
+            .mode(mode)
             .open(&tmp)
             .await
             .map_err(|e| format!("建临时文件失败: {e}"))?;
@@ -747,6 +907,10 @@ async fn save_resources(
         .arg("validate")
         .arg("--resources")
         .arg(&tmp)
+        // 现行文件里引用的 `${VAR}` 是网关的环境变量，这个进程不一定有。这次新写
+        // 进去的变量则得这里也有：它同样可能是个笔误，而网关那边没有就拒收。
+        .arg("--baseline")
+        .arg(&st.resources_path)
         .output()
         .await
     {
@@ -785,21 +949,30 @@ async fn save_resources(
     // 丢掉刚生成的明文，留下一把没人持有的活密钥。
     let reload_ok = matches!(&hup, Ok(o) if o.status.success());
     let detail = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let warnings = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    let reload = if reload_ok {
+        confirm_reload(st, &yaml).await
+    } else {
+        Reload::SignalFailed
+    };
 
     // 配置改写留痕：谁在什么时候改了网关配置，此前无处可查。
     tracing_line(&format!(
-        "resources.yaml rewritten ({} bytes), reload_signal={}",
+        "resources.yaml rewritten ({} bytes), reload={}",
         yaml.len(),
-        if reload_ok { "sent" } else { "FAILED" }
+        reload.label(),
     ));
 
-    if reload_ok {
-        Ok(detail)
+    let detail = if reload_ok {
+        detail
     } else {
-        Ok(format!(
-            "{detail}\n注意：配置已保存，但 SIGHUP 未送达网关，需要手动 systemctl reload aisix"
-        ))
-    }
+        format!("{detail}\n注意：配置已保存，但 SIGHUP 未送达网关，需要手动 systemctl reload aisix")
+    };
+    Ok(Saved {
+        detail,
+        warnings,
+        reload,
+    })
 }
 
 /// 单行审计输出，交给 systemd 收进 journal。
@@ -867,7 +1040,20 @@ async fn api_file_put(
         }
     };
     match save_resources(&st, &doc, req.base_version.as_deref(), req.client_contract).await {
-        Ok(detail) => Json(json!({"ok": true, "detail": detail})).into_response(),
+        Ok(saved) => {
+            let reload_error = match &saved.reload {
+                Reload::Rejected(why) => Some(why.clone()),
+                _ => None,
+            };
+            Json(json!({
+                "ok": true,
+                "detail": saved.detail,
+                "warnings": saved.warnings,
+                "reload": saved.reload.label(),
+                "reload_error": reload_error,
+            }))
+            .into_response()
+        }
         // 版本冲突是 409 而不是 400：前端要据此提示「重新载入」，而 400
         // 的其余成员都是「你写的内容不合法」，两者的处理动作完全不同。
         Err(e @ SaveError::Stale) => {
@@ -1079,11 +1265,7 @@ async fn api_upstream_models(
     };
 
     let provider = upstream_vendor(pk);
-    let raw_key = pk
-        .get("api_key")
-        .or_else(|| pk.get("secret"))
-        .and_then(Value::as_str)
-        .unwrap_or_default();
+    let raw_key = provider_credential(pk);
     // resources.yaml 支持 ${VAR}，这里要解出真实值才能调上游。
     //
     // 但变量名必须限定前缀：不限定的话，任何能编辑配置的人写一条
@@ -1185,6 +1367,14 @@ fn upstream_vendor(pk: &Value) -> &str {
         .iter()
         .find_map(|k| pk.get(*k).and_then(Value::as_str).filter(|v| !v.is_empty()))
         .unwrap_or("openai")
+}
+
+/// 上游密钥。`secret` 是 `api_key` 的另一种写法，网关两个都认。
+fn provider_credential(pk: &Value) -> &str {
+    pk.get("api_key")
+        .or_else(|| pk.get("secret"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
 }
 
 /// 没写 `api_base` 时，模型清单去哪问。只认得出的几家，认不出就是 `None`。
@@ -1300,22 +1490,38 @@ async fn health() -> &'static str {
     "ok"
 }
 
+/// `hash` 子命令要散列的口令。优先从标准输入读第一行：写在命令行上的口令留在 shell
+/// 历史里，运行时 `ps` 也看得到。参数形式留着，给已有的脚本用。
+fn password_to_hash(arg: Option<&str>, mut stdin: impl std::io::BufRead) -> Option<String> {
+    if let Some(p) = arg {
+        return Some(p.to_string());
+    }
+    let mut line = String::new();
+    stdin.read_line(&mut line).ok()?;
+    let p = line.trim_end_matches(['\r', '\n']);
+    (!p.is_empty()).then(|| p.to_string())
+}
+
 /// 路由装配。抽成函数是为了测试能拿到同一个 app，不必复制一份路由表。
 fn router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(health))
-        .route("/api/login", post(login))
+        // 排队期间请求体一直占着内存；一个口令用不了多大。
+        .route(
+            "/api/login",
+            post(login).layer(axum::extract::DefaultBodyLimit::max(4 * 1024)),
+        )
         .route("/api/logout", post(logout))
         .route("/api/session", get(session_state))
         .route("/api/resources", get(api_resources))
-        // 原文入口收的是 YAML 文本，而 YAML 的 alias 展开可以把 2KB 变成 GB
-        // （billion laughs）。默认 2MB 的 body 限制远大于这里需要的尺寸，
-        // 收紧到 256KB——真实配置离这个量级很远。
+        // 这份配置的大小不由运维决定：门户里每把自助密钥都是一行，一千多把就超过
+        // 256KB，而控制台一旦收不下，运维在界面上什么都改不了了。YAML 的 alias 炸弹
+        // 不靠这个数挡，解析器自己有展开上限。
         .route(
             "/api/file",
             get(api_file_get)
                 .put(api_file_put)
-                .layer(axum::extract::DefaultBodyLimit::max(256 * 1024)),
+                .layer(axum::extract::DefaultBodyLimit::max(8 * 1024 * 1024)),
         )
         .route("/api/portal/users", get(portal_users))
         .route("/api/portal/users/{id}/grant", post(portal_grant))
@@ -1338,10 +1544,16 @@ async fn main() {
     // 生成 CONSOLE_PASSWORD_HASH 的，把它放在那条检查后面就等于要求
     // 先有散列才能生成散列——README 记载的第一步会直接失败。
     let args: Vec<String> = std::env::args().collect();
-    if args.len() >= 3 && args[1] == "hash" {
+    if args.get(1).map(String::as_str) == Some("hash") {
+        let Some(password) =
+            password_to_hash(args.get(2).map(String::as_str), std::io::stdin().lock())
+        else {
+            eprintln!("没有读到口令。用法：运行 `aisix-console hash`，输入口令后回车。");
+            std::process::exit(1);
+        };
         let salt = SaltString::generate(&mut rand_core::OsRng);
         let h = Argon2::default()
-            .hash_password(args[2].as_bytes(), &salt)
+            .hash_password(password.as_bytes(), &salt)
             .expect("hash");
         println!("{h}");
         return;
@@ -1371,6 +1583,10 @@ async fn main() {
         // 没配就把门户管理页整个关掉 —— 控制台可以独立部署。
         portal_admin_token: std::env::var("PORTAL_ADMIN_TOKEN").ok(),
         prom_url: env("PROMETHEUS_URL", "http://127.0.0.1:9090"),
+        status_url: std::env::var("AISIX_STATUS_URL")
+            .ok()
+            .map(|u| u.trim_end_matches('/').to_string())
+            .filter(|u| !u.is_empty()),
         resources_path: PathBuf::from(env("AISIX_RESOURCES", "/etc/aisix/resources.yaml")),
         aisix_bin: PathBuf::from(env("AISIX_BIN", "/usr/local/bin/aisix")),
         password_hash,
@@ -1790,6 +2006,20 @@ mod tests {
 
     /// 一条不含任何 aisix_ 指标的查询即使全是允许的函数名也必须被拒 ——
     /// 否则 `sum(count(rate(...)))` 这类空壳能探出 Prometheus 的行为。
+    /// 每个词都过得了词表，选择器却读这台 Prometheus 上的所有序列。
+    #[test]
+    fn promql_gate_refuses_a_bare_selector_next_to_a_gateway_metric() {
+        for q in [
+            r#"aisix_x or {job=~".+"}"#,
+            r#"aisix_x or {instance!=""}"#,
+            r#"topk(5, {job=~".+"}) or aisix_x"#,
+        ] {
+            assert!(!promql_only_touches_aisix(q), "{q}");
+        }
+        assert!(promql_only_touches_aisix(r#"sum(aisix_x{status="200"})"#));
+        assert!(promql_only_touches_aisix(r#"sum(aisix_x {status="200"})"#));
+    }
+
     #[test]
     fn promql_gate_requires_an_actual_gateway_metric() {
         assert!(!promql_gate_allows("sum(count(1))"));
@@ -1987,6 +2217,7 @@ mod tests {
             portal_url,
             portal_admin_token: Some("tok".into()),
             prom_url: String::new(),
+            status_url: None,
             resources_path: dir.join("resources.yaml"),
             aisix_bin,
             password_hash: String::new(),
@@ -2018,6 +2249,226 @@ mod tests {
         (format!("http://{addr}"), "aisix_console=t".to_string())
     }
 
+    /// 放一个假校验器：把自己的参数记下来，按 `script` 行事。
+    fn fake_validator(dir: &std::path::Path, script: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = dir.join("fake-aisix");
+        std::fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\necho \"$@\" > {}/args\n{script}\necho OK\n",
+                dir.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        bin
+    }
+
+    fn seed_file(dir: &std::path::Path) -> String {
+        let body = "_format_version: '1'\napi_keys: []\n";
+        std::fs::write(dir.join("resources.yaml"), body).unwrap();
+        sha256_hex(body.as_bytes())
+    }
+
+    /// 校验期间门户写进来的东西会被 rename 整份盖掉。所以这一整段都要持着门户也认的
+    /// 那把锁：这里用 `try_lock` 扮演门户，校验进行中它必须拿不到。
+    #[tokio::test]
+    async fn the_write_lock_covers_validation_through_rename() {
+        let dir = temp_dir("lock");
+        let base = seed_file(&dir);
+        let started = dir.join("started");
+        let bin = fake_validator(&dir, &format!("touch {}\nsleep 0.4", started.display()));
+        let st = state_on(&dir, bin, String::new());
+        let doc = json!({"_format_version": "1", "models": []});
+        let saving = {
+            let st = st.clone();
+            tokio::spawn(async move { save_resources(&st, &doc, Some(&base), Some(1)).await })
+        };
+        while !started.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let lock = std::fs::File::open(dir.join("resources.yaml.lock")).expect("没有写锁文件");
+        assert!(
+            matches!(lock.try_lock(), Err(std::fs::TryLockError::WouldBlock)),
+            "校验进行中门户还能拿到写锁",
+        );
+        assert!(saving.await.unwrap().is_ok());
+        lock.try_lock().expect("保存结束后写锁没有放开");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 门户那边用的必须是同一个文件名。两边各写一份，改一边就等于没有锁。
+    #[test]
+    fn the_portal_locks_the_same_file() {
+        let portal = include_str!("../../aisix-portal/src/resources.rs");
+        assert!(
+            portal.contains(r#"format!("{path}.lock")"#),
+            "门户的写锁换了名字"
+        );
+    }
+
+    /// `aisix validate` 成功时也可能有话要说（比如护栏没有挂载、什么都不检查），它写在
+    /// stderr 上。只留 stdout 的话操作者永远看不到。
+    #[tokio::test]
+    async fn validator_warnings_reach_the_caller_and_the_baseline_is_passed() {
+        let dir = temp_dir("warn");
+        let base = seed_file(&dir);
+        let bin = fake_validator(&dir, "echo 'guardrail g inspects no traffic' >&2");
+        let st = state_on(&dir, bin, String::new());
+        let doc = json!({"_format_version": "1"});
+        let saved = save_resources(&st, &doc, Some(&base), Some(1))
+            .await
+            .map_err(|e| e.message())
+            .unwrap();
+        assert!(
+            saved.warnings.contains("inspects no traffic"),
+            "{}",
+            saved.warnings
+        );
+        let args = std::fs::read_to_string(dir.join("args")).unwrap();
+        assert!(
+            args.contains(&format!(
+                "--baseline {}",
+                dir.join("resources.yaml").display()
+            )),
+            "{args}",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 运维设的权限不能被一次保存改掉：放宽了是泄漏，收紧了是网关读不到。
+    #[tokio::test]
+    async fn saving_keeps_the_files_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        for mode in [0o600, 0o640] {
+            let dir = temp_dir("mode");
+            let base = seed_file(&dir);
+            let res = dir.join("resources.yaml");
+            std::fs::set_permissions(&res, std::fs::Permissions::from_mode(mode)).unwrap();
+            let st = state_on(&dir, fake_validator(&dir, ""), String::new());
+            let doc = json!({"_format_version": "1"});
+            assert!(
+                save_resources(&st, &doc, Some(&base), Some(1))
+                    .await
+                    .is_ok()
+            );
+            let got = std::fs::metadata(&res).unwrap().permissions().mode() & 0o777;
+            assert_eq!(got, mode);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// 两条连接循环试口令就能占满两个许可。排队的话第三个请求等一会儿就轮到了，
+    /// 拿到的是真正的判定，不是「繁忙」。
+    #[tokio::test]
+    async fn a_login_waits_for_the_gate_instead_of_being_turned_away() {
+        let dir = temp_dir("login");
+        let mut st = state_on(&dir, PathBuf::from("/bin/true"), String::new());
+        st.login_gate = Arc::new(tokio::sync::Semaphore::new(1));
+        let salt = SaltString::generate(&mut rand_core::OsRng);
+        st.password_hash = Argon2::default()
+            .hash_password(b"right", &salt)
+            .unwrap()
+            .to_string();
+        let (base, _) = serve(st).await;
+        let attempt = |pw: &'static str| {
+            let url = format!("{base}/api/login");
+            async move {
+                reqwest::Client::new()
+                    .post(url)
+                    .json(&json!({"password": pw}))
+                    .send()
+                    .await
+                    .unwrap()
+                    .status()
+                    .as_u16()
+            }
+        };
+        let (a, b, c) = tokio::join!(attempt("wrong"), attempt("wrong"), attempt("right"));
+        assert_eq!((a, b, c), (401, 401, 200));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `user_id` 路径段解码之后能带 `/`。拼进 URL 就是走到门户别的管理端点上，带着
+    /// 全权凭据。
+    #[tokio::test]
+    async fn the_user_id_segment_cannot_walk_to_another_portal_endpoint() {
+        let seen: Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+        let s2 = seen.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let portal = Router::new().fallback(move |req: axum::extract::Request| {
+            let s = s2.clone();
+            async move {
+                s.lock().unwrap().push(req.uri().to_string());
+                Json(json!({"ok": true}))
+            }
+        });
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, portal).await;
+        });
+        let dir = temp_dir("walk");
+        let (base, cookie) = serve(state_on(
+            &dir,
+            PathBuf::from("/bin/true"),
+            format!("http://{addr}"),
+        ))
+        .await;
+        let c = reqwest::Client::new();
+        let walk = c
+            .post(format!(
+                "{base}/api/portal/users/..%2F..%2Fadmin%2Ftopups%2F7%2Fapprove%3Fx%3D/grant"
+            ))
+            .header("cookie", &cookie)
+            .json(&json!({}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(walk.status(), 400);
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "{:?}",
+            seen.lock().unwrap()
+        );
+
+        // 对照：正常的 id 照常转发。
+        let ok = c
+            .post(format!(
+                "{base}/api/portal/users/9ca055a8-a3a1-4eba-a122-dc603fea2667/grant"
+            ))
+            .header("cookie", &cookie)
+            .json(&json!({}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), 200);
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            ["/admin/users/9ca055a8-a3a1-4eba-a122-dc603fea2667/grant"],
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hash_reads_the_password_from_stdin_when_no_argument_is_given() {
+        let stdin = |s: &'static str| std::io::Cursor::new(s);
+        assert_eq!(
+            password_to_hash(None, stdin("s3cret\n")),
+            Some("s3cret".into())
+        );
+        assert_eq!(
+            password_to_hash(None, stdin("s3cret\r\n")),
+            Some("s3cret".into())
+        );
+        assert_eq!(password_to_hash(None, stdin("\n")), None);
+        assert_eq!(password_to_hash(None, stdin("")), None);
+        assert_eq!(
+            password_to_hash(Some("arg"), stdin("s3cret\n")),
+            Some("arg".into())
+        );
+    }
+
     /// 认不出的供应商没写 `api_base` 时，绝不能猜一个地址把它的密钥发出去。
     #[tokio::test]
     async fn pulling_models_never_guesses_where_to_send_a_key() {
@@ -2046,6 +2497,13 @@ mod tests {
             assert!(body.contains("API 基址"), "{body}");
             let _ = std::fs::remove_dir_all(&dir);
         }
+    }
+
+    #[test]
+    fn the_upstream_credential_is_read_under_either_spelling() {
+        assert_eq!(provider_credential(&json!({"api_key": "a"})), "a");
+        assert_eq!(provider_credential(&json!({"secret": "s"})), "s");
+        assert_eq!(provider_credential(&json!({})), "");
     }
 
     #[test]

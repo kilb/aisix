@@ -778,3 +778,58 @@ test("版本冲突时手上的原文不丢_且不会盖掉别人的改动", asyn
   await expect(box).not.toHaveValue(/my-unsaved-edit/);
   expect(fx.read()).toContain("changed-meanwhile");
 });
+
+test("校验器的提醒会告诉操作者_没挂载的护栏不是悄悄失效", async ({ page }) => {
+  await signIn(page);
+  await page.getByRole("tab", { name: "配置原文" }).click();
+  const box = page.getByRole("textbox").first();
+  await expect(box).not.toHaveValue("");
+  await box.fill(
+    `${await box.inputValue()}guardrails:\n- name: lonely\n  kind: keyword\n  patterns:\n  - kind: literal\n    value: forbidden-phrase\n`,
+  );
+  await page.getByRole("button", { name: "校验并保存" }).click();
+
+  // 存得上，但操作者得知道它什么也不检查。
+  const note = page.locator(".note", { hasText: "已保存" });
+  await expect(note).toBeVisible();
+  await expect(note).toContainText("lonely");
+  await expect(note).toContainText("guardrail_attachments");
+
+  // 全部资源页也要把「挂载」这一类列出来，否则根本看不出它缺什么。
+  await page.getByRole("tab", { name: "全部资源" }).click();
+  await expect(page.getByRole("cell", { name: /guardrail_attachments/ })).toBeVisible();
+});
+
+test("门户的自助密钥多到几百 KB 时_控制台照样能保存", async ({ browser }) => {
+  const api = await otherClient(browser);
+  const cur = (await api.get("/api/file")).body as {
+    doc: Record<string, unknown[]>;
+    version: string;
+  };
+  const doc = structuredClone(cur.doc);
+  const original = doc.api_keys!.length;
+  for (let i = 0; i < 2000; i++) {
+    doc.api_keys!.push({
+      display_name: `portal-${String(i).padStart(8, "0")} · 我的密钥`,
+      key_hash: "b".repeat(56) + i.toString(16).padStart(8, "0"),
+      user_id: "11111111-1111-4111-8111-111111111111",
+      allowed_models: ["*"],
+    });
+  }
+  expect(JSON.stringify(doc).length).toBeGreaterThan(300 * 1024);
+  const r = await api.put("/api/file", { doc, base_version: cur.version, client_contract: 1 });
+  expect(r.status).toBe(200);
+
+  // 收回去，别让后面的用例背着这两千把。
+  const next = (await api.get("/api/file")).body as {
+    doc: Record<string, unknown[]>;
+    version: string;
+  };
+  next.doc.api_keys!.length = original;
+  const back = await api.put("/api/file", {
+    doc: next.doc,
+    base_version: next.version,
+    client_contract: 1,
+  });
+  expect(back.status).toBe(200);
+});

@@ -14,6 +14,7 @@ const RESOURCE_KINDS: [string, string, TabId | null][] = [
   ["api_keys", "调用方密钥", "keys"],
   ["rate_limit_policies", "限流与预算", "limits"],
   ["guardrails", "护栏", null],
+  ["guardrail_attachments", "护栏挂载", null],
   ["cache_policies", "缓存策略", null],
   ["mcp_servers", "MCP 服务", null],
   ["a2a_agents", "A2A 智能体", null],
@@ -21,6 +22,7 @@ const RESOURCE_KINDS: [string, string, TabId | null][] = [
   ["oidc_providers", "OIDC 提供方", null],
   ["claim_mappings", "声明映射", null],
   ["passthrough_routes", "透传路由", null],
+  ["mcp_auth_settings", "MCP 鉴权设置", null],
 ];
 
 export function Resources({
@@ -51,7 +53,7 @@ export function Resources({
             {RESOURCE_KINDS.map(([key, label, tab]) => {
               const items = (doc.doc?.[key] as Rec[] | undefined) ?? [];
               const names = items.map((x) =>
-                String(x.display_name ?? x.name ?? "（未命名）"),
+                String(x.display_name ?? x.name ?? x.guardrail_id ?? "（未命名）"),
               );
               return (
                 <tr key={key}>

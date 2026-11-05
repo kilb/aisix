@@ -42,7 +42,8 @@ validate` 二进制、resources schema 的字段名、`aisix_*` 指标名、Admi
 
 ## 写入路径
 
-`版本比对 → 校验 → 原子替换 → SIGHUP`，四步全成功才算保存：
+`版本比对 → 校验 → 原子替换 → SIGHUP`，四步全成功才算保存。这一整段持着
+`resources.yaml.lock` 上的 flock，门户写同一个文件时用同一把锁：
 
 0. 比对版本。`GET /api/file` 会返回一个 `version`（文件内容的 sha256），
    保存时带回来，服务端**在写锁内重读磁盘**再比对，不一致就返回 409 且不落盘。
@@ -54,7 +55,9 @@ validate` 二进制、resources schema 的字段名、`aisix_*` 指标名、Admi
    一定会漂移，而漂移方向永远是「控制台放行了网关拒绝的东西」）；
 3. 校验通过才 `rename` 覆盖，坏配置绝不落盘；
 4. `pkill -HUP -x aisix` 热加载。控制台以 `aisix` 用户运行，所以能直接给同
-   用户的网关进程发信号，不需要任何 sudo 授权。
+   用户的网关进程发信号，不需要任何 sudo 授权。信号送到不等于网关收下了：配了
+   `AISIX_STATUS_URL`（网关指标口的基址）时，控制台会问它的 `/status/config`，把
+   「已用上」和「拒收，原因是……」如实告诉界面；没配就只说信号发出去了。
 
 控制台一旦接管 `resources.yaml`，就由它整体重写 —— 手写的注释会在第一次保存
 后消失。原始带注释的版本留在 `/etc/aisix/resources.yaml.orig`。
@@ -75,7 +78,7 @@ nginx:   location / -> 127.0.0.1:8090
 ## 本地开发
 
 ```sh
-cargo run -p aisix-console --release -- hash '你的口令'   # 生成 argon2 散列
+cargo run -p aisix-console --release -- hash   # 输入口令后回车，生成 argon2 散列
 CONSOLE_PASSWORD_HASH='$argon2id$...' \
 AISIX_ADMIN_KEY_FOR_CONSOLE=... \
 AISIX_ADMIN_URL=http://127.0.0.1:8081 \
