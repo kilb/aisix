@@ -49,9 +49,9 @@ use crate::heartbeat::MtlsBundle;
 const MAX_BATCH: usize = 100;
 
 /// Cadence at which the worker flushes whatever it has buffered, even
-/// if the buffer hasn't filled. Keeps fresh requests visible on
-/// /usage and /logs within ~5s end-to-end.
-const FLUSH_INTERVAL: Duration = Duration::from_secs(5);
+/// if the buffer hasn't filled. Kept short so the control plane sees
+/// spend, and applies its budget marks, within a fraction of a second.
+const FLUSH_INTERVAL: Duration = Duration::from_millis(250);
 
 /// In-memory bound on the proxy → worker channel. Beyond it `try_emit`
 /// warns and the event is dropped (`sink_full`) — telemetry must not
@@ -186,7 +186,7 @@ impl std::fmt::Debug for TelemetryConfig {
 }
 
 impl TelemetryConfig {
-    /// Build with default flush interval (5s).
+    /// Build with default flush interval (250 ms).
     pub fn new(url: String, mtls: MtlsBundle) -> Self {
         Self {
             url,
@@ -265,7 +265,7 @@ async fn run(
 
     tracing::info!(
         url = %redact_url_for_log(&cfg.url),
-        flush_interval_secs = cfg.interval.as_secs(),
+        flush_interval_ms = cfg.interval.as_millis() as u64,
         max_batch = MAX_BATCH,
         retry_budget_secs = RETRY_BUDGET.as_secs(),
         "telemetry sender started (mTLS)",
@@ -275,7 +275,7 @@ async fn run(
         tokio::select! {
             // New event from the proxy. Buffer it; flush if we hit
             // the batch ceiling so a steady high-throughput stream
-            // doesn't starve the control plane on a 5s cadence.
+            // doesn't starve the control plane between ticks.
             maybe_event = rx.recv() => {
                 match maybe_event {
                     Some(event) => {
@@ -1581,6 +1581,51 @@ mod tests {
     #[tokio::test]
     async fn failed_interval_batch_without_dedup_support_is_dropped_not_retried() {
         run_interval_with_backlog(500).await;
+    }
+
+    #[tokio::test]
+    async fn a_lone_event_is_sent_within_a_quarter_second() {
+        let (server, batches) = recording_server(200).await;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = TelemetryConfig::new(
+            format!("{}/dp/telemetry", server.uri()),
+            write_test_bundle(dir.path()),
+        );
+        let (tx, rx) = tokio::sync::mpsc::channel(QUEUE_CAPACITY);
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        tokio::time::pause();
+        let mut sender = Box::pin(run(cfg, Metrics::new(false), rx, &mut cancel_rx));
+        assert!(poll_sender(sender.as_mut()).await.is_pending());
+        // The first tick lands only once the paused clock has moved; let it
+        // fire on an empty buffer so it cannot flush the event staged below.
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(poll_sender(sender.as_mut()).await.is_pending());
+        for event in ordered_events(1) {
+            tx.try_send(event).unwrap();
+        }
+        assert!(poll_sender(sender.as_mut()).await.is_pending());
+        // A paused clock auto-advances when the runtime idles, so assert on
+        // the virtual time that elapsed, not merely that the POST happened.
+        let staged_at = tokio::time::Instant::now();
+        tokio::time::advance(Duration::from_millis(260)).await;
+        assert!(poll_sender(sender.as_mut()).await.is_pending());
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while batches.lock().unwrap().is_empty() {
+            assert!(poll_sender(sender.as_mut()).await.is_pending());
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a lone event was not sent within 260 ms"
+            );
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            staged_at.elapsed() < Duration::from_millis(300),
+            "a lone event waited {:?} before it was sent",
+            staged_at.elapsed()
+        );
+        drop(tx);
+        finish_sender(sender.as_mut()).await;
+        assert_eq!(batches.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
