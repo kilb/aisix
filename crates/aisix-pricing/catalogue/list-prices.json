@@ -6,7 +6,7 @@
       "aliases": [],
       "source_url": "https://developers.openai.com/api/docs/pricing",
       "as_of": "2026-11-06",
-      "notes": "Source read on 2026-11-06 at https://platform.openai.com/docs/pricing, which redirects (301) to the source_url. Long context is read as above 272000 input tokens: the page says '>272K' and does not define K, nor say whether cached tokens count. Priority is the tier the page renamed Fast mode on 2026-07-30. cache_write is the page's 30m write column. The usage the gateway records carries one cache-write counter with no retention, so a 12h write bills at the 30m rate (ruling P2-R5); the 12h write rates are not recorded. Flex is the page's Flex sub-table of the Batch tab, equal to Batch. Ultrafast is not recorded. ",
+      "notes": "Source read on 2026-11-06 at https://platform.openai.com/docs/pricing, which redirects (301) to the source_url. Long context is read as above 272000 input tokens: the page says '>272K' and does not define K, nor say whether cached tokens count. Priority is the tier the page renamed Fast mode on 2026-07-30. cache_write is the page's 30m write column. The usage the gateway records carries one cache-write counter with no retention, so a 12h write bills at the 30m rate (ruling P2-R5); the 12h write rates are not recorded. Flex is the page's Flex sub-table of the Batch tab, equal to Batch. The fast tier repeats priority: the Fast mode guide says 'For GPT-5.6 and earlier models, the response returns `priority` whether the request specifies `priority` or `fast`' and states no returned value for later models, so a GPT-6 response may report either name. The ultrafast tier is the page's Ultrafast tab, which lists only gpt-6-astra and gpt-6.1-sol.",
       "card": {
         "default": {
           "base": {
@@ -83,6 +83,44 @@
               }
             }
           ]
+        },
+        "fast": {
+          "base": {
+            "input": "20",
+            "output": "100",
+            "cache_read": "2",
+            "cache_write": "25"
+          },
+          "long_context": [
+            {
+              "above_input_tokens": 272000,
+              "rates": {
+                "input": "40",
+                "output": "150",
+                "cache_read": "4",
+                "cache_write": "50"
+              }
+            }
+          ]
+        },
+        "ultrafast": {
+          "base": {
+            "input": "60",
+            "output": "300",
+            "cache_read": "6",
+            "cache_write": "75"
+          },
+          "long_context": [
+            {
+              "above_input_tokens": 272000,
+              "rates": {
+                "input": "120",
+                "output": "450",
+                "cache_read": "12",
+                "cache_write": "150"
+              }
+            }
+          ]
         }
       }
     },
@@ -91,7 +129,7 @@
       "aliases": [],
       "source_url": "https://developers.openai.com/api/docs/pricing",
       "as_of": "2026-11-06",
-      "notes": "Source read on 2026-11-06 at https://platform.openai.com/docs/pricing, which redirects (301) to the source_url. Long context is read as above 272000 input tokens: the page says '>272K' and does not define K, nor say whether cached tokens count. Priority is the tier the page renamed Fast mode on 2026-07-30. cache_write is the page's 30m write column. The usage the gateway records carries one cache-write counter with no retention, so a 12h write bills at the 30m rate (ruling P2-R5); the 12h write rates are not recorded. Flex is the page's Flex sub-table of the Batch tab, equal to Batch. Ultrafast is not recorded. ",
+      "notes": "Source read on 2026-11-06 at https://platform.openai.com/docs/pricing, which redirects (301) to the source_url. Long context is read as above 272000 input tokens: the page says '>272K' and does not define K, nor say whether cached tokens count. Priority is the tier the page renamed Fast mode on 2026-07-30. cache_write is the page's 30m write column. The usage the gateway records carries one cache-write counter with no retention, so a 12h write bills at the 30m rate (ruling P2-R5); the 12h write rates are not recorded. Flex is the page's Flex sub-table of the Batch tab, equal to Batch. The fast tier repeats priority: the Fast mode guide says 'For GPT-5.6 and earlier models, the response returns `priority` whether the request specifies `priority` or `fast`' and states no returned value for later models, so a GPT-6 response may report either name. The ultrafast tier is the page's Ultrafast tab, which lists only gpt-6-astra and gpt-6.1-sol.",
       "card": {
         "default": {
           "base": {
@@ -168,6 +206,44 @@
               }
             }
           ]
+        },
+        "fast": {
+          "base": {
+            "input": "4",
+            "output": "20",
+            "cache_read": "0.2",
+            "cache_write": "5"
+          },
+          "long_context": [
+            {
+              "above_input_tokens": 272000,
+              "rates": {
+                "input": "8",
+                "output": "30",
+                "cache_read": "0.4",
+                "cache_write": "10"
+              }
+            }
+          ]
+        },
+        "ultrafast": {
+          "base": {
+            "input": "12",
+            "output": "60",
+            "cache_read": "0.6",
+            "cache_write": "15"
+          },
+          "long_context": [
+            {
+              "above_input_tokens": 272000,
+              "rates": {
+                "input": "24",
+                "output": "90",
+                "cache_read": "1.2",
+                "cache_write": "30"
+              }
+            }
+          ]
         }
       }
     },
@@ -176,7 +252,7 @@
       "aliases": [],
       "source_url": "https://developers.openai.com/api/docs/pricing",
       "as_of": "2026-11-06",
-      "notes": "Source read on 2026-11-06 at https://platform.openai.com/docs/pricing, which redirects (301) to the source_url. Long context is read as above 272000 input tokens: the page says '>272K' and does not define K, nor say whether cached tokens count. Priority is the tier the page renamed Fast mode on 2026-07-30. cache_write is the page's 30m write column. The usage the gateway records carries one cache-write counter with no retention, so a 12h write bills at the 30m rate (ruling P2-R5); the 12h write rates are not recorded. Flex is the page's Flex sub-table of the Batch tab, equal to Batch. Ultrafast is not recorded. ",
+      "notes": "Source read on 2026-11-06 at https://platform.openai.com/docs/pricing, which redirects (301) to the source_url. Long context is read as above 272000 input tokens: the page says '>272K' and does not define K, nor say whether cached tokens count. Priority is the tier the page renamed Fast mode on 2026-07-30. cache_write is the page's 30m write column. The usage the gateway records carries one cache-write counter with no retention, so a 12h write bills at the 30m rate (ruling P2-R5); the 12h write rates are not recorded. Flex is the page's Flex sub-table of the Batch tab, equal to Batch. The fast tier repeats priority: the Fast mode guide says 'For GPT-5.6 and earlier models, the response returns `priority` whether the request specifies `priority` or `fast`' and states no returned value for later models, so a GPT-6 response may report either name. ",
       "card": {
         "default": {
           "base": {
@@ -253,6 +329,25 @@
               }
             }
           ]
+        },
+        "fast": {
+          "base": {
+            "input": "2",
+            "output": "10",
+            "cache_read": "0.1",
+            "cache_write": "2.5"
+          },
+          "long_context": [
+            {
+              "above_input_tokens": 272000,
+              "rates": {
+                "input": "4",
+                "output": "15",
+                "cache_read": "0.2",
+                "cache_write": "5"
+              }
+            }
+          ]
         }
       }
     },
@@ -261,7 +356,7 @@
       "aliases": [],
       "source_url": "https://developers.openai.com/api/docs/pricing",
       "as_of": "2026-11-06",
-      "notes": "Source read on 2026-11-06 at https://platform.openai.com/docs/pricing, which redirects (301) to the source_url. Long context is read as above 272000 input tokens: the page says '>272K' and does not define K, nor say whether cached tokens count. Priority is the tier the page renamed Fast mode on 2026-07-30. cache_write is the page's 30m write column. The usage the gateway records carries one cache-write counter with no retention, so a 12h write bills at the 30m rate (ruling P2-R5); the 12h write rates are not recorded. Flex is the page's Flex sub-table of the Batch tab, equal to Batch. Ultrafast is not recorded. ",
+      "notes": "Source read on 2026-11-06 at https://platform.openai.com/docs/pricing, which redirects (301) to the source_url. Long context is read as above 272000 input tokens: the page says '>272K' and does not define K, nor say whether cached tokens count. Priority is the tier the page renamed Fast mode on 2026-07-30. cache_write is the page's 30m write column. The usage the gateway records carries one cache-write counter with no retention, so a 12h write bills at the 30m rate (ruling P2-R5); the 12h write rates are not recorded. Flex is the page's Flex sub-table of the Batch tab, equal to Batch. The fast tier repeats priority: the Fast mode guide says 'For GPT-5.6 and earlier models, the response returns `priority` whether the request specifies `priority` or `fast`' and states no returned value for later models, so a GPT-6 response may report either name. ",
       "card": {
         "default": {
           "base": {
@@ -321,6 +416,25 @@
           ]
         },
         "priority": {
+          "base": {
+            "input": "0.2",
+            "output": "1",
+            "cache_read": "0.02",
+            "cache_write": "0.25"
+          },
+          "long_context": [
+            {
+              "above_input_tokens": 272000,
+              "rates": {
+                "input": "0.4",
+                "output": "1.5",
+                "cache_read": "0.04",
+                "cache_write": "0.5"
+              }
+            }
+          ]
+        },
+        "fast": {
           "base": {
             "input": "0.2",
             "output": "1",
@@ -473,7 +587,7 @@
       "aliases": [],
       "source_url": "https://developers.openai.com/api/docs/pricing",
       "as_of": "2026-11-06",
-      "notes": "Source read on 2026-11-06 at https://platform.openai.com/docs/pricing, which redirects (301) to the source_url. Long context is read as above 272000 input tokens: the page says '>272K' and does not define K, nor say whether cached tokens count. Priority is the tier the page renamed Fast mode on 2026-07-30. The page lists no batch price for embedding models. Output is 0: embeddings have no completion.",
+      "notes": "Source read on 2026-11-06 at https://platform.openai.com/docs/pricing, which redirects (301) to the source_url. The page lists no batch price for embedding models. Output is 0: embeddings have no completion.",
       "card": {
         "default": {
           "base": {
@@ -488,7 +602,7 @@
       "aliases": [],
       "source_url": "https://developers.openai.com/api/docs/pricing",
       "as_of": "2026-11-06",
-      "notes": "Source read on 2026-11-06 at https://platform.openai.com/docs/pricing, which redirects (301) to the source_url. Long context is read as above 272000 input tokens: the page says '>272K' and does not define K, nor say whether cached tokens count. Priority is the tier the page renamed Fast mode on 2026-07-30. The page lists no batch price for embedding models. Output is 0: embeddings have no completion.",
+      "notes": "Source read on 2026-11-06 at https://platform.openai.com/docs/pricing, which redirects (301) to the source_url. The page lists no batch price for embedding models. Output is 0: embeddings have no completion.",
       "card": {
         "default": {
           "base": {
@@ -503,7 +617,7 @@
       "aliases": [],
       "source_url": "https://developers.openai.com/api/docs/pricing",
       "as_of": "2026-11-06",
-      "notes": "Source read on 2026-11-06 at https://platform.openai.com/docs/pricing, which redirects (301) to the source_url. Long context is read as above 272000 input tokens: the page says '>272K' and does not define K, nor say whether cached tokens count. Priority is the tier the page renamed Fast mode on 2026-07-30. The page lists no batch price for embedding models. Output is 0: embeddings have no completion.",
+      "notes": "Source read on 2026-11-06 at https://platform.openai.com/docs/pricing, which redirects (301) to the source_url. The page lists no batch price for embedding models. Output is 0: embeddings have no completion.",
       "card": {
         "default": {
           "base": {
@@ -518,7 +632,7 @@
       "aliases": [],
       "source_url": "https://platform.claude.com/docs/en/about-claude/pricing",
       "as_of": "2026-11-06",
-      "notes": "Source read on 2026-11-06 at the source_url. Batch cache rates are derived, not published: the page lists batch input and output only and states that the cache multipliers stack with the Batch API discount, so each is the batch input price times the model's multiplier (write 1.25x, 1h write 2x, read 0.1x; 0.05x on Opus 5.5 and Sonnet 5.5, 0.025x on Fable 5.1). ",
+      "notes": "Source read on 2026-11-06 at the source_url. web_search 10000 is the page's '$10 USD per 1,000 searches' per 1M searches; the page prices search apart from tokens and states no per-tier difference, so every tier and band carries it. Batch cache rates are derived, not published: the page lists batch input and output only and states that the cache multipliers stack with the Batch API discount, so each is the batch input price times the model's multiplier (write 1.25x, 1h write 2x, read 0.1x; 0.05x on Opus 5.5 and Sonnet 5.5, 0.025x on Fable 5.1). ",
       "card": {
         "default": {
           "base": {
@@ -526,7 +640,8 @@
             "output": "50",
             "cache_read": "0.25",
             "cache_write": "12.5",
-            "cache_write_1h": "20"
+            "cache_write_1h": "20",
+            "web_search": "10000"
           }
         },
         "batch": {
@@ -535,7 +650,8 @@
             "output": "25",
             "cache_read": "0.125",
             "cache_write": "6.25",
-            "cache_write_1h": "10"
+            "cache_write_1h": "10",
+            "web_search": "10000"
           }
         }
       }
@@ -545,7 +661,7 @@
       "aliases": [],
       "source_url": "https://platform.claude.com/docs/en/about-claude/pricing",
       "as_of": "2026-11-06",
-      "notes": "Source read on 2026-11-06 at the source_url. Batch cache rates are derived, not published: the page lists batch input and output only and states that the cache multipliers stack with the Batch API discount, so each is the batch input price times the model's multiplier (write 1.25x, 1h write 2x, read 0.1x; 0.05x on Opus 5.5 and Sonnet 5.5, 0.025x on Fable 5.1). The fast tier is fast mode (the gateway records usage.speed 'fast' as the service tier): the page publishes 8 input and 40 output, and says the cache multipliers apply on top, so its cache rates are derived (read 8 x 0.05, write 8 x 1.25, 1h write 8 x 2). Fast mode is not available with the Batch API and applies across the full context window.",
+      "notes": "Source read on 2026-11-06 at the source_url. web_search 10000 is the page's '$10 USD per 1,000 searches' per 1M searches; the page prices search apart from tokens and states no per-tier difference, so every tier and band carries it. Batch cache rates are derived, not published: the page lists batch input and output only and states that the cache multipliers stack with the Batch API discount, so each is the batch input price times the model's multiplier (write 1.25x, 1h write 2x, read 0.1x; 0.05x on Opus 5.5 and Sonnet 5.5, 0.025x on Fable 5.1). The fast tier is fast mode (the gateway records usage.speed 'fast' as the service tier): the page publishes 8 input and 40 output, and says the cache multipliers apply on top, so its cache rates are derived (read 8 x 0.05, write 8 x 1.25, 1h write 8 x 2). Fast mode is not available with the Batch API and applies across the full context window. ",
       "card": {
         "default": {
           "base": {
@@ -553,7 +669,8 @@
             "output": "20",
             "cache_read": "0.2",
             "cache_write": "5",
-            "cache_write_1h": "8"
+            "cache_write_1h": "8",
+            "web_search": "10000"
           }
         },
         "batch": {
@@ -562,7 +679,8 @@
             "output": "10",
             "cache_read": "0.1",
             "cache_write": "2.5",
-            "cache_write_1h": "4"
+            "cache_write_1h": "4",
+            "web_search": "10000"
           }
         },
         "fast": {
@@ -571,7 +689,8 @@
             "output": "40",
             "cache_read": "0.4",
             "cache_write": "10",
-            "cache_write_1h": "16"
+            "cache_write_1h": "16",
+            "web_search": "10000"
           }
         }
       }
@@ -581,7 +700,7 @@
       "aliases": [],
       "source_url": "https://platform.claude.com/docs/en/about-claude/pricing",
       "as_of": "2026-11-06",
-      "notes": "Source read on 2026-11-06 at the source_url. Batch cache rates are derived, not published: the page lists batch input and output only and states that the cache multipliers stack with the Batch API discount, so each is the batch input price times the model's multiplier (write 1.25x, 1h write 2x, read 0.1x; 0.05x on Opus 5.5 and Sonnet 5.5, 0.025x on Fable 5.1). ",
+      "notes": "Source read on 2026-11-06 at the source_url. web_search 10000 is the page's '$10 USD per 1,000 searches' per 1M searches; the page prices search apart from tokens and states no per-tier difference, so every tier and band carries it. Batch cache rates are derived, not published: the page lists batch input and output only and states that the cache multipliers stack with the Batch API discount, so each is the batch input price times the model's multiplier (write 1.25x, 1h write 2x, read 0.1x; 0.05x on Opus 5.5 and Sonnet 5.5, 0.025x on Fable 5.1). ",
       "card": {
         "default": {
           "base": {
@@ -589,7 +708,8 @@
             "output": "10",
             "cache_read": "0.1",
             "cache_write": "2.5",
-            "cache_write_1h": "4"
+            "cache_write_1h": "4",
+            "web_search": "10000"
           }
         },
         "batch": {
@@ -598,7 +718,8 @@
             "output": "5",
             "cache_read": "0.05",
             "cache_write": "1.25",
-            "cache_write_1h": "2"
+            "cache_write_1h": "2",
+            "web_search": "10000"
           }
         }
       }
@@ -608,7 +729,7 @@
       "aliases": [],
       "source_url": "https://platform.claude.com/docs/en/about-claude/pricing",
       "as_of": "2026-11-06",
-      "notes": "Source read on 2026-11-06 at the source_url. Batch cache rates are derived, not published: the page lists batch input and output only and states that the cache multipliers stack with the Batch API discount, so each is the batch input price times the model's multiplier (write 1.25x, 1h write 2x, read 0.1x; 0.05x on Opus 5.5 and Sonnet 5.5, 0.025x on Fable 5.1). Long context is a prompt over 100,000 tokens. The page: 'A request's prompt length counts all of its input tokens, including cache reads and cache writes.' Web search ($10 per 1,000 searches) is not recorded: the page does not state it per tier.",
+      "notes": "Source read on 2026-11-06 at the source_url. web_search 10000 is the page's '$10 USD per 1,000 searches' per 1M searches; the page prices search apart from tokens and states no per-tier difference, so every tier and band carries it. Batch cache rates are derived, not published: the page lists batch input and output only and states that the cache multipliers stack with the Batch API discount, so each is the batch input price times the model's multiplier (write 1.25x, 1h write 2x, read 0.1x; 0.05x on Opus 5.5 and Sonnet 5.5, 0.025x on Fable 5.1). Long context is a prompt over 100,000 tokens. The page: 'A request's prompt length counts all of its input tokens, including cache reads and cache writes.'",
       "card": {
         "default": {
           "base": {
@@ -616,7 +737,8 @@
             "output": "0.5",
             "cache_read": "0.01",
             "cache_write": "0.125",
-            "cache_write_1h": "0.2"
+            "cache_write_1h": "0.2",
+            "web_search": "10000"
           },
           "long_context": [
             {
@@ -626,7 +748,8 @@
                 "output": "2.5",
                 "cache_read": "0.05",
                 "cache_write": "0.625",
-                "cache_write_1h": "1"
+                "cache_write_1h": "1",
+                "web_search": "10000"
               }
             }
           ]
@@ -637,7 +760,8 @@
             "output": "0.25",
             "cache_read": "0.005",
             "cache_write": "0.0625",
-            "cache_write_1h": "0.1"
+            "cache_write_1h": "0.1",
+            "web_search": "10000"
           },
           "long_context": [
             {
@@ -647,7 +771,8 @@
                 "output": "1.25",
                 "cache_read": "0.025",
                 "cache_write": "0.3125",
-                "cache_write_1h": "0.5"
+                "cache_write_1h": "0.5",
+                "web_search": "10000"
               }
             }
           ]
@@ -659,7 +784,7 @@
       "aliases": [],
       "source_url": "https://aistudio.google.com/docs/pricing",
       "as_of": "2026-11-06",
-      "notes": "Source read on 2026-11-06 at https://ai.google.dev/gemini-api/docs/pricing, which redirects (301) to the source_url. Cache storage per hour is a separate charge and is not recorded. The Contributor tier (invite-only preview) is not recorded. Web search grounding ($14 per 1,000 after a free monthly allowance) is not recorded: the allowance cannot be expressed. These rates apply through 2026-12-31 and double from 2027-01-01. The page gives dates without a time zone; the boundary is assumed to be UTC. ",
+      "notes": "Source read on 2026-11-06 at https://ai.google.dev/gemini-api/docs/pricing, which redirects (301) to the source_url. Cache storage per hour is a separate charge and is not recorded. The Contributor tier (invite-only preview) is not recorded. Web search grounding ($14 per 1,000 after a free monthly allowance) is not recorded: the allowance cannot be expressed. These rates apply through 2026-12-31 and double from 2027-01-01. The page gives dates without a time zone; the boundary is assumed to be UTC (if Google switches at 00:00 Pacific time, this catalogue moves 8 hours early). ",
       "card": {
         "default": {
           "base": {
@@ -697,7 +822,7 @@
       "source_url": "https://aistudio.google.com/docs/pricing",
       "as_of": "2026-11-06",
       "effective_from": "2027-01-01",
-      "notes": "Source read on 2026-11-06 at https://ai.google.dev/gemini-api/docs/pricing, which redirects (301) to the source_url. Cache storage per hour is a separate charge and is not recorded. The Contributor tier (invite-only preview) is not recorded. Web search grounding ($14 per 1,000 after a free monthly allowance) is not recorded: the allowance cannot be expressed. These are the doubled rates, in effect from 2027-01-01. The page gives dates without a time zone; the boundary is assumed to be UTC. ",
+      "notes": "Source read on 2026-11-06 at https://ai.google.dev/gemini-api/docs/pricing, which redirects (301) to the source_url. Cache storage per hour is a separate charge and is not recorded. The Contributor tier (invite-only preview) is not recorded. Web search grounding ($14 per 1,000 after a free monthly allowance) is not recorded: the allowance cannot be expressed. These are the doubled rates, in effect from 2027-01-01. The page gives dates without a time zone; the boundary is assumed to be UTC (if Google switches at 00:00 Pacific time, this catalogue moves 8 hours early). ",
       "card": {
         "default": {
           "base": {
@@ -734,7 +859,7 @@
       "aliases": [],
       "source_url": "https://aistudio.google.com/docs/pricing",
       "as_of": "2026-11-06",
-      "notes": "Source read on 2026-11-06 at https://ai.google.dev/gemini-api/docs/pricing, which redirects (301) to the source_url. Cache storage per hour is a separate charge and is not recorded. The Contributor tier (invite-only preview) is not recorded. Web search grounding ($14 per 1,000 after a free monthly allowance) is not recorded: the allowance cannot be expressed. These rates apply through 2026-12-31 and double from 2027-01-01. The page gives dates without a time zone; the boundary is assumed to be UTC. ",
+      "notes": "Source read on 2026-11-06 at https://ai.google.dev/gemini-api/docs/pricing, which redirects (301) to the source_url. Cache storage per hour is a separate charge and is not recorded. The Contributor tier (invite-only preview) is not recorded. Web search grounding ($14 per 1,000 after a free monthly allowance) is not recorded: the allowance cannot be expressed. These rates apply through 2026-12-31 and double from 2027-01-01. The page gives dates without a time zone; the boundary is assumed to be UTC (if Google switches at 00:00 Pacific time, this catalogue moves 8 hours early). ",
       "card": {
         "default": {
           "base": {
@@ -772,7 +897,7 @@
       "source_url": "https://aistudio.google.com/docs/pricing",
       "as_of": "2026-11-06",
       "effective_from": "2027-01-01",
-      "notes": "Source read on 2026-11-06 at https://ai.google.dev/gemini-api/docs/pricing, which redirects (301) to the source_url. Cache storage per hour is a separate charge and is not recorded. The Contributor tier (invite-only preview) is not recorded. Web search grounding ($14 per 1,000 after a free monthly allowance) is not recorded: the allowance cannot be expressed. These are the doubled rates, in effect from 2027-01-01. The page gives dates without a time zone; the boundary is assumed to be UTC. ",
+      "notes": "Source read on 2026-11-06 at https://ai.google.dev/gemini-api/docs/pricing, which redirects (301) to the source_url. Cache storage per hour is a separate charge and is not recorded. The Contributor tier (invite-only preview) is not recorded. Web search grounding ($14 per 1,000 after a free monthly allowance) is not recorded: the allowance cannot be expressed. These are the doubled rates, in effect from 2027-01-01. The page gives dates without a time zone; the boundary is assumed to be UTC (if Google switches at 00:00 Pacific time, this catalogue moves 8 hours early). ",
       "card": {
         "default": {
           "base": {
@@ -1000,7 +1125,7 @@
       "aliases": [],
       "source_url": "https://aistudio.google.com/docs/pricing",
       "as_of": "2026-11-06",
-      "notes": "Source read on 2026-11-06 at https://ai.google.dev/gemini-api/docs/pricing, which redirects (301) to the source_url. Cache storage per hour is a separate charge and is not recorded. The Contributor tier (invite-only preview) is not recorded. Web search grounding ($14 per 1,000 after a free monthly allowance) is not recorded: the allowance cannot be expressed. Output is 0: embeddings have no completion. Video ($12.00 per 1M, batch $6.00) has no rate dimension and is not recorded. Image and audio are the page's per-1M-token prices.",
+      "notes": "Source read on 2026-11-06 at https://ai.google.dev/gemini-api/docs/pricing, which redirects (301) to the source_url. Output is 0: embeddings have no completion. Video ($12.00 per 1M, batch $6.00) has no rate dimension and is not recorded. Image and audio are the page's per-1M-token prices.",
       "card": {
         "default": {
           "base": {
@@ -1025,7 +1150,7 @@
       "aliases": [],
       "source_url": "https://aistudio.google.com/docs/pricing",
       "as_of": "2026-11-06",
-      "notes": "Source read on 2026-11-06 at https://ai.google.dev/gemini-api/docs/pricing, which redirects (301) to the source_url. Cache storage per hour is a separate charge and is not recorded. The Contributor tier (invite-only preview) is not recorded. Web search grounding ($14 per 1,000 after a free monthly allowance) is not recorded: the allowance cannot be expressed. Output is 0: embeddings have no completion. Video ($12.00 per 1M, batch $6.00) has no rate dimension and is not recorded. ",
+      "notes": "Source read on 2026-11-06 at https://ai.google.dev/gemini-api/docs/pricing, which redirects (301) to the source_url. Output is 0: embeddings have no completion. Video ($12.00 per 1M, batch $6.00) has no rate dimension and is not recorded. ",
       "card": {
         "default": {
           "base": {
