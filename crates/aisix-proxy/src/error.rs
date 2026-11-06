@@ -1077,8 +1077,7 @@ impl AnthropicErrorEnvelope {
 pub(crate) fn anthropic_platform_body(
     class: &crate::platform_errors::PlatformErrorClass,
 ) -> String {
-    serde_json::to_string(&AnthropicErrorEnvelope::platform(class))
-        .expect("an error envelope serializes")
+    serde_json::to_string(&AnthropicErrorEnvelope::platform(class)).unwrap_or_default()
 }
 
 /// The Anthropic envelope's `error.code` for a guardrail refusal, shared by

@@ -315,7 +315,7 @@ pub(crate) fn openai_stream_payload(err: &BridgeError) -> Option<String> {
 }
 
 fn openai_payload(class: &PlatformErrorClass) -> String {
-    serde_json::to_string(&class.envelope()).expect("an error envelope serializes")
+    serde_json::to_string(&class.envelope()).unwrap_or_default()
 }
 
 /// The Anthropic `event: error` frame ending a `/v1/messages` stream on
@@ -389,6 +389,22 @@ pub(crate) fn relayed_responses_failure(frame: &[u8]) -> Option<Vec<u8>> {
         }
     };
     Some(format!("event: {}\ndata: {}\n\n", rewritten.0, rewritten.1).into_bytes())
+}
+
+/// A buffered Responses-API answer that is a failed Response object
+/// (`status: "failed"` with its own `error`), relayed as sent: in platform
+/// mode its `error` becomes the class of the error it reports, as a streamed
+/// `response.failed` does ([`relayed_responses_failure`]).
+pub(crate) fn relayed_failed_response(body: &mut Value) {
+    if !active() || body.get("status").and_then(Value::as_str) != Some("failed") {
+        return;
+    }
+    let class = aisix_gateway::capture_in_band_error_value(body, UpstreamWire::OpenAI)
+        .map_or(PlatformErrorClass::UpstreamUnavailable, |e| {
+            classify_bridge(&e)
+        });
+    body["error"] =
+        serde_json::json!({ "code": class.code(), "message": platform_message(&class) });
 }
 
 /// A whole Responses-API SSE body an output guardrail held back, which ends
@@ -877,6 +893,42 @@ mod tests {
             text.contains("\"context_length_exceeded\"") && !text.contains("Anthropic"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn a_relayed_failed_response_object_carries_its_class() {
+        let failed = serde_json::json!({
+            "id": "resp_1",
+            "object": "response",
+            "status": "failed",
+            "output": [],
+            "error": {"code": "server_error", "message": "Bedrock ThrottlingException in us-east-1"},
+        });
+        let mut off = failed.clone();
+        relayed_failed_response(&mut off);
+        assert_eq!(off, failed, "platform mode off leaves the object as sent");
+
+        let mut on = failed.clone();
+        in_platform_mode(|| relayed_failed_response(&mut on));
+        assert_eq!(on["status"], "failed");
+        assert_eq!(on["id"], "resp_1");
+        assert_eq!(on["error"]["code"], "upstream_unavailable");
+        assert_eq!(
+            on["error"]["message"],
+            "The model is temporarily unavailable. Retry later."
+        );
+        let text = on.to_string();
+        assert!(
+            !text.contains("Bedrock") && !text.contains("us-east-1"),
+            "{text}"
+        );
+
+        // A completed answer is the answer, and is left alone.
+        let mut completed =
+            serde_json::json!({"object": "response", "status": "completed", "error": null});
+        let before = completed.clone();
+        in_platform_mode(|| relayed_failed_response(&mut completed));
+        assert_eq!(completed, before);
     }
 
     #[test]

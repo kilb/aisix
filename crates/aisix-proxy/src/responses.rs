@@ -2544,7 +2544,10 @@ async fn responses_to_target(
             _ => None,
         };
 
-        // Last, after every telemetry read of the body.
+        // Last, after every telemetry read of the body, so the operator's
+        // copy keeps the upstream's own `error` and only the caller's is a
+        // platform class.
+        crate::platform_errors::relayed_failed_response(&mut json_body);
         mark.apply_to_body(&mut json_body);
         Ok(ResponseDispatchSuccess {
             response: Json(json_body).into_response(),
