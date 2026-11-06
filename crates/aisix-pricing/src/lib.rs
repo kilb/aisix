@@ -6,11 +6,13 @@
 //! is floating point.
 
 mod rates;
+mod usage;
 
 pub use rates::{
     Dimension, LongContextBand, MicroUsd, Rate, RateCard, RateCardError, Rates, ServiceTier,
     TierRates,
 };
+pub use usage::{BillableUsage, Inconsistency};
 
 /// Stamped on every charge and price revision; bumped on any rule change.
 pub const ENGINE_VERSION: u32 = 1;
