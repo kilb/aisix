@@ -22,7 +22,7 @@ use serde_json::{json, Value};
 
 use crate::auth::{MemberRole, OperatorRole};
 use crate::error::{ApiError, Detail};
-use crate::{audit, operators, AppState};
+use crate::{audit, gateways, operators, AppState};
 
 /// The largest request body the browser listener reads.
 const MAX_BODY_BYTES: usize = 1 << 20;
@@ -64,6 +64,26 @@ pub const ROUTE_ROLES: &[(&str, &str, MinRole)] = &[
         MinRole::Op(OperatorRole::Admin),
     ),
     ("GET", "/admin/audit", MinRole::Op(OperatorRole::Viewer)),
+    (
+        "GET",
+        "/admin/environment",
+        MinRole::Op(OperatorRole::Viewer),
+    ),
+    (
+        "GET",
+        "/admin/gateways/credentials",
+        MinRole::Op(OperatorRole::Viewer),
+    ),
+    (
+        "POST",
+        "/admin/gateways/credentials",
+        MinRole::Op(OperatorRole::Admin),
+    ),
+    (
+        "POST",
+        "/admin/gateways/credentials/{dp_id}/revoke",
+        MinRole::Op(OperatorRole::Admin),
+    ),
 ];
 
 /// `/healthz` (no session), `/admin/*` and, as they are added, `/api/*`.
@@ -80,6 +100,15 @@ pub fn browser_router(state: AppState) -> Router {
         )
         .route("/admin/operators/{id}", patch(operators::update))
         .route("/admin/audit", get(audit::list))
+        .route("/admin/environment", get(gateways::environment))
+        .route(
+            "/admin/gateways/credentials",
+            get(gateways::list_credentials).post(gateways::issue_credential),
+        )
+        .route(
+            "/admin/gateways/credentials/{dp_id}/revoke",
+            post(gateways::revoke_credential),
+        )
         .route_layer(axum::middleware::from_fn(only_listed_routes))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(state)
