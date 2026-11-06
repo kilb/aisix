@@ -25,7 +25,7 @@ use crate::config::CpConfig;
 use crate::db::DbError;
 use crate::error::{ApiError, Detail};
 use crate::http::{ApiJson, API_CONTRACT};
-use crate::pki::IssuedCert;
+use crate::pki::{IssuedCert, PkiError};
 use crate::AppState;
 
 /// Notified with the `dp_id` whenever a credential is issued or revoked, so
@@ -200,10 +200,7 @@ pub async fn issue_credential(
     };
 
     let dp_id = Uuid::new_v4();
-    let issued = state
-        .pki
-        .issue_client(dp_id, days)
-        .map_err(ApiError::internal)?;
+    let issued = state.pki.issue_client(dp_id, days).map_err(issue_error)?;
     let env = bundle_env(&state, &issued)?;
     let row = (
         name.clone(),
@@ -270,6 +267,24 @@ pub async fn issue_credential(
         Json(bundle),
     )
         .into_response())
+}
+
+/// `503 ca_expired` when the CA can sign nothing more, so an operator sees
+/// why; any other signing failure is internal. Neither carries anything of
+/// the CA.
+fn issue_error(e: PkiError) -> ApiError {
+    match e {
+        PkiError::CaExpiring => {
+            tracing::error!(error = %e, "refused to issue a gateway credential");
+            ApiError {
+                code: "ca_expired",
+                message: "控制面 CA 证书已过期或即将过期，无法签发网关证书，请先更换 CA"
+                    .to_string(),
+                ..ApiError::unavailable()
+            }
+        }
+        e => ApiError::internal(e),
+    }
 }
 
 /// `POST /admin/gateways/credentials/{dp_id}/revoke` → `200

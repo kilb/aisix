@@ -51,6 +51,9 @@ const SERVER_VALIDITY: time::Duration = time::Duration::days(397);
 /// Every certificate starts this long before it is made, so a peer whose
 /// clock runs a little behind already accepts it.
 const BACKDATE: time::Duration = time::Duration::minutes(5);
+/// A CA with less than this left signs nothing: what it signed would be
+/// unusable within hours, or end before it starts.
+const MIN_CA_REMAINING: time::Duration = time::Duration::days(1);
 
 const ENV_URI: &str = "x-aisix://env/";
 const DP_URI: &str = "x-aisix://dp/";
@@ -71,6 +74,12 @@ pub enum PkiError {
     Sign(#[from] rcgen::Error),
     #[error("the system random number generator failed")]
     Random,
+    /// Replacing the CA is the remedy.
+    #[error(
+        "the control-plane CA has expired or expires within a day; it signs no more \
+         certificates until it is replaced"
+    )]
+    CaExpiring,
     #[error("not a gateway certificate: {0}")]
     NotGateway(&'static str),
 }
@@ -275,15 +284,20 @@ impl Pki {
     /// Signs `params` as an end-entity certificate of this CA, with a fresh
     /// P-256 key and a random serial, valid from a little before now for
     /// `validity`, but never past the CA's own end: a chain is invalid once
-    /// its CA expires, whatever the leaf says.
+    /// its CA expires, whatever the leaf says. A CA with less than a day
+    /// left signs nothing ([`PkiError::CaExpiring`]).
     fn sign_leaf(
         &self,
         mut params: CertificateParams,
         validity: time::Duration,
     ) -> Result<(Certificate, KeyPair), PkiError> {
         let now = now();
+        let ca_end = self.ca.params().not_after;
+        if ca_end - now < MIN_CA_REMAINING {
+            return Err(PkiError::CaExpiring);
+        }
         params.not_before = now - BACKDATE;
-        params.not_after = (now + validity).min(self.ca.params().not_after);
+        params.not_after = (now + validity).min(ca_end);
         params.serial_number = Some(SerialNumber::from_slice(&random_serial()?));
         params.is_ca = IsCa::ExplicitNoCa;
         params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
@@ -606,21 +620,52 @@ mod tests {
         assert_eq!(pki.platform_id_key_hex(), "42".repeat(32));
     }
 
+    /// A `Pki` whose CA, otherwise like a real one, ends at `not_after`.
+    fn pki_with_ca_ending(not_after: OffsetDateTime) -> Pki {
+        let mut params = CertificateParams::default();
+        params.distinguished_name = common_name(&format!("AISIX control plane CA {ENV}"));
+        params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
+        params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+        params.not_before = not_after - time::Duration::days(3650);
+        params.not_after = not_after;
+        let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("a key");
+        let ca = params.self_signed(&key).expect("a CA");
+        Pki::from_stored(ENV, ca.pem(), &key.serialize_der(), &[0x42; 32]).expect("the CA loads")
+    }
+
+    #[test]
+    fn an_expired_or_expiring_ca_issues_nothing() {
+        let hosts = ["cp.example.test".to_string()];
+        for (left, what) in [
+            (-time::Duration::days(30), "expired"),
+            (-time::Duration::seconds(1), "just expired"),
+            (time::Duration::hours(12), "half a day left"),
+        ] {
+            let pki = pki_with_ca_ending(now() + left);
+            let refused = pki.issue_client(DP, 30);
+            assert!(
+                matches!(refused, Err(PkiError::CaExpiring)),
+                "{what}: {refused:?}"
+            );
+            assert!(
+                matches!(pki.server_cert(&hosts), Err(PkiError::CaExpiring)),
+                "{what}: a server certificate"
+            );
+        }
+        let message = PkiError::CaExpiring.to_string();
+        assert!(message.contains("expire"), "{message}");
+        // Two days left is enough, clamped to the CA's end.
+        let pki = pki_with_ca_ending(now() + time::Duration::days(2));
+        pki.issue_client(DP, 30).expect("two days left issues");
+        pki.server_cert(&hosts).expect("two days left serves");
+    }
+
     #[test]
     fn a_leaf_never_outlives_its_ca() {
         // A CA with ten days left.
         let now = now();
         let ca_end = now + time::Duration::days(10);
-        let mut params = CertificateParams::default();
-        params.distinguished_name = common_name(&format!("AISIX control plane CA {ENV}"));
-        params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
-        params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
-        params.not_before = now - time::Duration::days(1);
-        params.not_after = ca_end;
-        let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("a key");
-        let ca = params.self_signed(&key).expect("a CA");
-        let pki = Pki::from_stored(ENV, ca.pem(), &key.serialize_der(), &[0x42; 32])
-            .expect("the CA loads");
+        let pki = pki_with_ca_ending(ca_end);
         let end_of = |der: &[u8]| {
             let (_, cert) = X509Certificate::from_der(der).expect("an X.509 certificate");
             cert.validity().not_after.timestamp()
