@@ -731,11 +731,21 @@ impl ProxyError {
         }
         let env = ErrorEnvelope::new(self.to_string(), self.kind());
         match self {
+            // In platform mode a budget outside the caller's own scope says
+            // nothing but that a limit was reached.
+            ProxyError::BudgetExceeded(r) if hides_budget_scope(r) => {
+                ErrorEnvelope::new(HIDDEN_BUDGET_MESSAGE, self.kind()).with_code("budget_exceeded")
+            }
             ProxyError::BudgetExceeded(r) => env.with_code("budget_exceeded").with_budget(r),
             ProxyError::BudgetUnverified => env.with_code("budget_unverified"),
             // Attribution for policy-layer 429s (#892): the
             // OpenAI envelope names the offending policy. The Anthropic
             // envelope keeps its strict {type,message} shape.
+            // Platform mode names no policy: it is the platform's, and its
+            // name is in the Display text as well as in the block.
+            ProxyError::PolicyRateLimit { source, .. } if crate::platform_errors::active() => {
+                ErrorEnvelope::new(source.to_string(), self.kind())
+            }
             ProxyError::PolicyRateLimit {
                 policy_id,
                 policy_name,
@@ -797,6 +807,21 @@ impl ProxyError {
             _ => env,
         }
     }
+}
+
+/// What a caller is told of a budget outside its own scope in platform mode.
+const HIDDEN_BUDGET_MESSAGE: &str = "Spending limit reached.";
+
+/// Whether a `budget_exceeded` is hidden from the caller: platform mode, and
+/// a budget that is not the caller's own (key, member, team or team member).
+/// A reason with no scope is hidden too, since nothing says it is theirs.
+/// Keys on the budget that denied, whichever model the request addressed.
+fn hides_budget_scope(r: &crate::budget::BudgetReason) -> bool {
+    crate::platform_errors::active()
+        && !matches!(
+            r.scope.as_deref(),
+            Some("api_key" | "member" | "team" | "team_member")
+        )
 }
 
 /// Build the customer-visible envelope for an upstream HTTP error.
@@ -927,6 +952,15 @@ impl ProxyError {
         }
     }
 
+    /// [`Self::retry_after_secs`] as the caller is sent it. A hidden budget's
+    /// reset time is a figure of that budget, so it is not sent either.
+    fn caller_retry_after_secs(&self) -> Option<u64> {
+        match self {
+            ProxyError::BudgetExceeded(r) if hides_budget_scope(r) => None,
+            _ => self.retry_after_secs(),
+        }
+    }
+
     /// The status the caller is answered with: [`Self::status`], or in
     /// platform mode the status of the class the error reaches the caller
     /// as. Telemetry keeps reading [`Self::status`].
@@ -996,7 +1030,7 @@ impl IntoResponse for ProxyError {
     fn into_response(self) -> Response {
         let challenge = self.auth_challenge();
         let status = self.caller_status();
-        let retry_after = self.retry_after_secs();
+        let retry_after = self.caller_retry_after_secs();
         let rate_limit_detail = self.rate_limit_detail();
         let upgrade_reject = matches!(self, ProxyError::WebSocketUpgradeRequired { .. });
         let body = self.envelope();
@@ -1156,7 +1190,7 @@ impl ProxyError {
     /// renderers can't drift on those rules.
     pub fn into_anthropic_response(self) -> Response {
         let status = self.caller_status();
-        let retry_after = self.retry_after_secs();
+        let retry_after = self.caller_retry_after_secs();
         let rate_limit_detail = self.rate_limit_detail();
         let mut response = (status, Json(self.anthropic_envelope())).into_response();
         apply_retry_headers(&mut response, retry_after, rate_limit_detail);
@@ -1717,6 +1751,147 @@ pub(crate) mod tests {
         );
 
         assert!(policy["error"].get("param").is_none());
+    }
+
+    fn budget_exceeded(scope: &str, scope_ref: &str, limit: &str, spent: &str) -> ProxyError {
+        ProxyError::BudgetExceeded(Box::new(crate::budget::BudgetReason {
+            message: format!("{scope} budget '{scope_ref}' exceeded (${limit}/month)."),
+            scope: Some(scope.into()),
+            scope_ref: Some(scope_ref.into()),
+            limit_usd: Some(limit.into()),
+            spent_usd: Some(spent.into()),
+            period: Some("month".into()),
+            period_resets_at: Some("2026-12-01T00:00:00Z".into()),
+            retry_after_seconds: Some(259_200),
+            ..Default::default()
+        }))
+    }
+
+    fn policy_limited(id: &str, name: &str) -> ProxyError {
+        ProxyError::PolicyRateLimit {
+            source: aisix_ratelimit::RateLimitError::Requests {
+                scope: aisix_core::RateLimitScope::Requests,
+                detail: aisix_ratelimit::LimitDetail {
+                    dimension: "rpd",
+                    limit: 5_000,
+                    remaining: 0,
+                    reset_secs: 3_600,
+                },
+            },
+            policy_id: id.into(),
+            policy_name: name.into(),
+        }
+    }
+
+    #[test]
+    fn a_team_budget_429_shows_the_teams_own_figures() {
+        for scope in ["api_key", "member", "team", "team_member"] {
+            let b = render_platform(&budget_exceeded(scope, "t1", "10.00", "10.02"));
+            let e = &b["error"];
+            assert_eq!(e["scope"], scope);
+            assert_eq!(e["scope_ref"], "t1");
+            assert_eq!(e["limit_usd"], "10.00");
+            assert_eq!(e["spent_usd"], "10.02");
+            assert_eq!(e["code"], "budget_exceeded");
+        }
+    }
+
+    #[test]
+    fn a_platform_side_budget_429_reveals_no_id_and_no_figure() {
+        for scope in ["org", "environment", "tag", "provider_key"] {
+            let err = budget_exceeded(scope, "pk-7", "500.00", "500.10");
+            let b = render_platform(&err);
+            let s = b.to_string();
+            assert!(
+                !s.contains("pk-7") && !s.contains("500") && !s.contains("2026"),
+                "{s}"
+            );
+            assert!(!s.contains(scope), "{s}");
+            assert_eq!(b["error"]["message"], "Spending limit reached.");
+            assert_eq!(b["error"]["code"], "budget_exceeded");
+            assert_eq!(b["error"]["type"], "billing_error");
+            assert!(b["error"].get("scope").is_none());
+            assert!(b["error"].get("retry_after_seconds").is_none());
+        }
+    }
+
+    #[test]
+    fn a_budget_429_without_a_scope_is_hidden_in_platform_mode() {
+        let err = ProxyError::BudgetExceeded(Box::new(crate::budget::BudgetReason {
+            message: "spend ceiling reached for policy acme".into(),
+            limit_usd: Some("500.00".into()),
+            ..Default::default()
+        }));
+        let s = render_platform(&err).to_string();
+        assert!(!s.contains("acme") && !s.contains("500"), "{s}");
+    }
+
+    #[test]
+    fn budget_429_with_platform_mode_off_is_unchanged() {
+        let b = serde_json::to_value(
+            budget_exceeded("provider_key", "pk-7", "500.00", "500.10").envelope(),
+        )
+        .unwrap();
+        assert_eq!(b["error"]["scope_ref"], "pk-7");
+        assert_eq!(b["error"]["limit_usd"], "500.00");
+        assert!(b["error"]["message"].as_str().unwrap().contains("pk-7"));
+    }
+
+    #[test]
+    fn a_policy_429_names_no_policy_in_platform_mode() {
+        let b = render_platform(&policy_limited("pol-1", "acme-tier"));
+        assert!(b["error"].get("policy").is_none());
+        assert!(!b.to_string().contains("acme-tier"));
+        assert_eq!(b["error"]["type"], "rate_limit_exceeded");
+        let off = serde_json::to_value(policy_limited("pol-1", "acme-tier").envelope()).unwrap();
+        assert_eq!(off["error"]["policy"]["name"], "acme-tier");
+    }
+
+    /// Retry-After describes the budget's own reset, so it goes with the
+    /// figures: kept for the caller's scope, dropped for a platform one,
+    /// and still sent when platform mode is off.
+    #[test]
+    fn a_budget_429_keeps_retry_after_only_for_the_callers_scope() {
+        let header = |err: ProxyError, platform: bool| {
+            let resp = if platform {
+                in_platform_mode(|| err.into_response())
+            } else {
+                err.into_response()
+            };
+            assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+            resp.headers()
+                .get("retry-after")
+                .map(|v| v.to_str().unwrap().to_string())
+        };
+        assert_eq!(
+            header(budget_exceeded("team", "t1", "1", "2"), true).as_deref(),
+            Some("259200")
+        );
+        assert_eq!(
+            header(budget_exceeded("environment", "e", "1", "2"), true),
+            None
+        );
+        assert_eq!(
+            header(budget_exceeded("environment", "e", "1", "2"), false).as_deref(),
+            Some("259200")
+        );
+    }
+
+    #[test]
+    fn the_anthropic_budget_429_hides_a_platform_side_scope_too() {
+        let err = budget_exceeded("provider_key", "pk-7", "500.00", "500.10");
+        let (body, resp) =
+            in_platform_mode(|| (err.anthropic_body(), err.into_anthropic_response()));
+        assert!(
+            !body.contains("pk-7") && !body.contains("500") && !body.contains("provider_key"),
+            "{body}"
+        );
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["type"], "error");
+        assert_eq!(v["error"]["type"], "rate_limit_error");
+        assert_eq!(v["error"]["message"], "Spending limit reached.");
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(resp.headers().get("retry-after").is_none());
     }
 
     #[tokio::test]
