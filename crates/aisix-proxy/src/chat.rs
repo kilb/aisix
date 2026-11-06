@@ -7072,8 +7072,10 @@ where
                 }
                 Err(err) => {
                     crate::attempt::StreamFailure::record(&mut guard.comp().failure, &err);
-                    let etype = err.error_type();
-                    let message = err.stream_frame_message();
+                    let payload = crate::platform_errors::openai_stream_payload(&err)
+                        .unwrap_or_else(|| {
+                            error_frame_payload(err.error_type(), &err.stream_frame_message())
+                        });
                     let comp = guard.comp();
                     // Output-guarded text stays unexportable: its scan will
                     // never run. With no output guardrail nothing was owed,
@@ -7083,11 +7085,7 @@ where
                         comp.response_text.clear();
                     }
                     comp.terminal_failure = Some(err);
-                    yield Ok::<_, Infallible>(
-                        Event::default()
-                            .event("error")
-                            .data(error_frame_payload(etype, &message)),
-                    );
+                    yield Ok::<_, Infallible>(Event::default().event("error").data(payload));
                     return;
                 }
             };

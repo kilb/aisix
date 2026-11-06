@@ -298,6 +298,14 @@ pub enum ProxyError {
     /// request is bad on every target.
     #[error("request payload is invalid: {0}")]
     UnusableTarget(String),
+    /// [`Self::InvalidRequest`] on the wire, raised for a refusal whose text
+    /// names the provider or provider key the requested model resolved to:
+    /// a provider the endpoint cannot serve, or a provider key configured in
+    /// a way the endpoint cannot use. Its own variant so platform mode, where
+    /// a caller must not learn which upstream serves it, can tell it from a
+    /// refusal of the request itself (`crate::platform_errors`).
+    #[error("request payload is invalid: {0}")]
+    TargetRefused(String),
     /// A non-WebSocket request reached the WebSocket-only realtime
     /// endpoint. Carries the upgrade layer's own classification — 400 for
     /// malformed upgrade headers, 426 for a connection that cannot
@@ -535,9 +543,9 @@ impl ProxyError {
             ProxyError::VideoNotFound(_) => StatusCode::NOT_FOUND,
             ProxyError::JobResourceNotFound(_) => StatusCode::NOT_FOUND,
             ProxyError::JobListRefused => StatusCode::FORBIDDEN,
-            ProxyError::InvalidRequest(_) | ProxyError::UnusableTarget(_) => {
-                StatusCode::BAD_REQUEST
-            }
+            ProxyError::InvalidRequest(_)
+            | ProxyError::UnusableTarget(_)
+            | ProxyError::TargetRefused(_) => StatusCode::BAD_REQUEST,
             ProxyError::WebSocketUpgradeRequired { status, .. } => *status,
             ProxyError::ProviderUnavailable => StatusCode::SERVICE_UNAVAILABLE,
             ProxyError::SemanticDecisionFailed { .. } => StatusCode::SERVICE_UNAVAILABLE,
@@ -590,9 +598,9 @@ impl ProxyError {
             ProxyError::VideoNotFound(_) => "video_not_found",
             ProxyError::JobResourceNotFound(_) => "resource_not_found",
             ProxyError::JobListRefused => "permission_denied",
-            ProxyError::InvalidRequest(_) | ProxyError::UnusableTarget(_) => {
-                "invalid_request_error"
-            }
+            ProxyError::InvalidRequest(_)
+            | ProxyError::UnusableTarget(_)
+            | ProxyError::TargetRefused(_) => "invalid_request_error",
             ProxyError::WebSocketUpgradeRequired { .. } => "websocket_upgrade_required",
             ProxyError::RequestTooLarge { .. } => "invalid_request_error",
             ProxyError::ProviderUnavailable => "provider_unavailable",
@@ -658,7 +666,14 @@ impl ProxyError {
         }
     }
 
+    /// The OpenAI-shape envelope the caller receives. In platform mode an
+    /// upstream's failure, or a refusal naming the target, is its platform
+    /// class instead (`crate::platform_errors`); the original error still
+    /// names the failure in the usage event and the access log.
     pub fn envelope(&self) -> ErrorEnvelope {
+        if let Some(class) = crate::platform_errors::caller_class(self) {
+            return class.envelope();
+        }
         // Bridge-surface upstream errors get special handling: the
         // bridge has best-effort-parsed the upstream envelope into a
         // structured [`UpstreamErrorView`], and for a 4xx we translate
@@ -911,6 +926,13 @@ impl ProxyError {
             _ => None,
         }
     }
+
+    /// The status the caller is answered with: [`Self::status`], or in
+    /// platform mode the status of the class the error reaches the caller
+    /// as. Telemetry keeps reading [`Self::status`].
+    fn caller_status(&self) -> StatusCode {
+        crate::platform_errors::caller_class(self).map_or_else(|| self.status(), |c| c.status())
+    }
 }
 
 /// Write the retry / rate-limit headers both envelopes owe a rejection.
@@ -973,7 +995,7 @@ fn mcp_user_oauth_message(failure: &aisix_mcp::UserOAuthFailure, server: &str) -
 impl IntoResponse for ProxyError {
     fn into_response(self) -> Response {
         let challenge = self.auth_challenge();
-        let status = self.status();
+        let status = self.caller_status();
         let retry_after = self.retry_after_secs();
         let rate_limit_detail = self.rate_limit_detail();
         let upgrade_reject = matches!(self, ProxyError::WebSocketUpgradeRequired { .. });
@@ -1028,11 +1050,35 @@ struct AnthropicErrorBody {
     #[serde(rename = "type")]
     kind: String,
     message: String,
-    /// Set only on a guardrail refusal ([`anthropic_guardrail_code`]):
-    /// `type` is pinned to the SDK's closed literal, so without it a
-    /// policy block and a malformed request are the same 422.
+    /// Set on a guardrail refusal ([`anthropic_guardrail_code`]): `type` is
+    /// pinned to the SDK's closed literal, so without it a policy block and
+    /// a malformed request are the same 422. Set too on every error platform
+    /// mode replaces, to the class's code, for the same reason.
     #[serde(skip_serializing_if = "Option::is_none")]
     code: Option<&'static str>,
+}
+
+impl AnthropicErrorEnvelope {
+    /// The envelope of a platform error class.
+    fn platform(class: &crate::platform_errors::PlatformErrorClass) -> Self {
+        AnthropicErrorEnvelope {
+            discriminator: "error",
+            error: AnthropicErrorBody {
+                kind: class.anthropic_kind().to_string(),
+                message: crate::platform_errors::platform_message(class).to_string(),
+                code: Some(class.code()),
+            },
+        }
+    }
+}
+
+/// The Anthropic-shape body of a platform error class, shared by the HTTP
+/// response and the `event: error` frame that ends a `/v1/messages` stream.
+pub(crate) fn anthropic_platform_body(
+    class: &crate::platform_errors::PlatformErrorClass,
+) -> String {
+    serde_json::to_string(&AnthropicErrorEnvelope::platform(class))
+        .expect("an error envelope serializes")
 }
 
 /// The Anthropic envelope's `error.code` for a guardrail refusal, shared by
@@ -1110,7 +1156,7 @@ impl ProxyError {
     /// and upstream-message logic so the two envelope
     /// renderers can't drift on those rules.
     pub fn into_anthropic_response(self) -> Response {
-        let status = self.status();
+        let status = self.caller_status();
         let retry_after = self.retry_after_secs();
         let rate_limit_detail = self.rate_limit_detail();
         let mut response = (status, Json(self.anthropic_envelope())).into_response();
@@ -1124,6 +1170,9 @@ impl ProxyError {
     }
 
     fn anthropic_envelope(&self) -> AnthropicErrorEnvelope {
+        if let Some(class) = crate::platform_errors::caller_class(self) {
+            return AnthropicErrorEnvelope::platform(&class);
+        }
         let code = match self {
             ProxyError::ContentFiltered { unavailable, .. } => {
                 Some(anthropic_guardrail_code(unavailable.as_deref()))
@@ -1253,8 +1302,22 @@ pub(crate) fn is_length_limit_error(err: &axum::Error) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// Run `f` as a request served in platform mode would run.
+    pub(crate) fn in_platform_mode<T>(f: impl FnOnce() -> T) -> T {
+        let cell = std::sync::Arc::new(
+            crate::attribution::RequestAttribution::default().in_platform_mode(true),
+        );
+        crate::attribution::sync_scope(&cell, f)
+    }
+
+    /// The OpenAI-shape body the caller of a platform-mode request receives
+    /// for `err`.
+    pub(crate) fn render_platform(err: &ProxyError) -> serde_json::Value {
+        in_platform_mode(|| serde_json::to_value(err.envelope()).expect("an envelope serializes"))
+    }
 
     /// #1093 carries the transport cause on a timeout so an
     /// operator can tell a `connect_timeout` from an expired request

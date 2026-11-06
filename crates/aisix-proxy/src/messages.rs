@@ -3816,11 +3816,11 @@ fn build_anthropic_sse_stream(
                     crate::attempt::StreamFailure::record(&mut guard.comp().failure, &e);
                     // Hold-back: the held (unscanned) chunks are dropped —
                     // fail closed; only the error frame reaches the client.
-                    let frame = format!(
+                    let frame = crate::platform_errors::anthropic_stream_frame(&e).unwrap_or_else(|| format!(
                         "event: error\ndata: {{\"type\":\"error\",\"error\":{{\"type\":\"{}\",\"message\":{}}}}}\n\n",
                         e.error_type(),
                         serde_json::to_string(&e.stream_frame_message()).unwrap_or_else(|_| "\"error\"".into()),
-                    );
+                    ));
                     let comp = guard.comp();
                     // Output-guarded text stays unexportable: its scan will
                     // never run. With no output guardrail nothing was owed,
@@ -5202,11 +5202,11 @@ fn drain_anthropic_sse_frames(
             return Some(frame.len());
         }
         let mut reports_failure = false;
-        if let Some(json) = json {
+        if let Some(json) = &json {
             reports_failure = json.get("type").and_then(Value::as_str) == Some("error");
             update_anthropic_usage(
                 acc,
-                &json,
+                json,
                 attempt_started,
                 first_token_seen,
                 response_text_cap,
@@ -5219,9 +5219,15 @@ fn drain_anthropic_sse_frames(
         );
         let forwarded = forwarded.as_deref().unwrap_or(&frame);
         // The upstream's error event reaches the caller as sent, less the
-        // credentials this request sent it.
+        // credentials this request sent it; in platform mode, as the class
+        // of the error it reports.
         if reports_failure {
-            out.extend_from_slice(&aisix_gateway::scrub_upstream_error_bytes(forwarded));
+            match crate::platform_errors::relayed_anthropic_error(json.as_ref()) {
+                Some(class_frame) => out.extend_from_slice(class_frame.as_bytes()),
+                None => {
+                    out.extend_from_slice(&aisix_gateway::scrub_upstream_error_bytes(forwarded))
+                }
+            }
         } else {
             out.extend_from_slice(forwarded);
         }

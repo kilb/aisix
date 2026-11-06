@@ -820,7 +820,7 @@ async fn prepare(
                 .map(str::trim)
                 .filter(|b| !b.is_empty())
                 .ok_or_else(|| {
-                    ProxyError::InvalidRequest(format!(
+                    ProxyError::TargetRefused(format!(
                         "azure provider_key {:?} has no api_base",
                         pk_entry.value.display_name
                     ))
@@ -844,7 +844,7 @@ async fn prepare(
             req
         }
         _ => {
-            return Err(ProxyError::InvalidRequest(format!(
+            return Err(ProxyError::TargetRefused(format!(
                 "model {requested_model:?} uses provider {:?} which does not speak the OpenAI \
                  Realtime protocol; /v1/realtime supports OpenAI-compatible and Azure OpenAI \
                  providers",
@@ -931,7 +931,7 @@ fn to_ws_scheme(url: &str) -> Result<String, ProxyError> {
     } else {
         // A 400 the caller reads: never with the password of a configured URL.
         let shown = aisix_core::redact_userinfo(url);
-        Err(ProxyError::InvalidRequest(format!(
+        Err(ProxyError::TargetRefused(format!(
             "api_base {shown:?} has no http(s) scheme"
         )))
     }

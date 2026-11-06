@@ -73,6 +73,7 @@ mod models;
 mod operation;
 mod passthrough_route;
 pub mod platform;
+mod platform_errors;
 mod policy_index;
 mod quota;
 mod realtime;
@@ -645,15 +646,18 @@ async fn record_request_telemetry(
     // (AISIX-Cloud#1317). Installed here because a cancelled handler
     // future never gets to hand anything back.
     let snapshot = state.snapshot.load();
-    let attribution = std::sync::Arc::new(attribution::RequestAttribution::with_response_headers(
-        client_ip::exported_header_names(&snapshot, true),
-        usage_attr::content_cap(&snapshot).is_some(),
-        request
-            .extensions()
-            .get::<request_id::RequestId>()
-            .map(|r| r.0.clone())
-            .unwrap_or_default(),
-    ));
+    let attribution = std::sync::Arc::new(
+        attribution::RequestAttribution::with_response_headers(
+            client_ip::exported_header_names(&snapshot, true),
+            usage_attr::content_cap(&snapshot).is_some(),
+            request
+                .extensions()
+                .get::<request_id::RequestId>()
+                .map(|r| r.0.clone())
+                .unwrap_or_default(),
+        )
+        .in_platform_mode(state.platform().is_some()),
+    );
     // The access-log line is held on the cell until the guard below finishes
     // the request, which is when both body sizes are known. Written in the
     // request span this middleware runs in, since the guard writes it from

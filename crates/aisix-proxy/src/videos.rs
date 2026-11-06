@@ -1050,9 +1050,16 @@ impl UnsupportedProvider {
         monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
         redactions: crate::redact::RedactionCounts,
     ) -> CreateSuccess {
-        let env = ErrorEnvelope::new(self.0.clone(), "not_implemented");
+        // The text names the provider, which a platform-mode caller must not
+        // learn: there it is the refusal's platform class instead.
+        let response = if crate::platform_errors::active() {
+            ProxyError::TargetRefused(self.0.clone()).into_response()
+        } else {
+            let env = ErrorEnvelope::new(self.0.clone(), "not_implemented");
+            (StatusCode::NOT_IMPLEMENTED, Json(env)).into_response()
+        };
         CreateSuccess {
-            response: (StatusCode::NOT_IMPLEMENTED, Json(env)).into_response(),
+            response,
             provider: "unknown".into(),
             model_id,
             provider_key_id: String::new(),

@@ -3521,14 +3521,24 @@ fn responses_stream_error_body(
             .filter_map(|event| event.get("sequence_number").and_then(Value::as_u64))
             .max(),
     );
-    crate::responses_bridge::failure_frames(
-        &mut encoder,
-        !delivered.is_empty(),
-        false,
-        error.error_type(),
-        crate::responses_bridge::upstream_failed_code(&error),
-        "upstream stream failed",
-    )
+    match crate::platform_errors::stream_class(&error) {
+        Some(class) => crate::responses_bridge::failure_frames(
+            &mut encoder,
+            !delivered.is_empty(),
+            false,
+            class.code(),
+            class.code(),
+            crate::platform_errors::platform_message(&class),
+        ),
+        None => crate::responses_bridge::failure_frames(
+            &mut encoder,
+            !delivered.is_empty(),
+            false,
+            error.error_type(),
+            crate::responses_bridge::upstream_failed_code(&error),
+            "upstream stream failed",
+        ),
+    }
     .to_vec()
 }
 
@@ -3836,9 +3846,15 @@ fn drain_responses_sse_frames(
         let tagged = mark.apply_to_sse_frame(forwarded);
         let forwarded = tagged.as_deref().unwrap_or(forwarded);
         // A failure the upstream reported reaches the caller as sent, less the
-        // credentials this request sent it.
+        // credentials this request sent it; in platform mode, as the class of
+        // the error it reports.
         if failure.is_some() {
-            out.extend_from_slice(&aisix_gateway::scrub_upstream_error_bytes(forwarded));
+            match crate::platform_errors::relayed_responses_failure(forwarded) {
+                Some(class_frame) => out.extend_from_slice(&class_frame),
+                None => {
+                    out.extend_from_slice(&aisix_gateway::scrub_upstream_error_bytes(forwarded))
+                }
+            }
         } else {
             out.extend_from_slice(forwarded);
         }
@@ -4682,11 +4698,13 @@ where
             crate::model_echo::responses_snapshot_model,
         );
         // A failure the upstream reported is released as it sent it, less the
-        // credentials this request sent, as the live relay releases it.
+        // credentials this request sent, as the live relay releases it; in
+        // platform mode, as the class of the error it reports.
         let buf = if matches!(
             terminal_failure,
             Some(crate::stream_timeout::RawStreamFailure::UpstreamInBand { .. })
         ) {
+            let buf = crate::platform_errors::relayed_responses_buffer(&buf).unwrap_or(buf);
             aisix_gateway::scrub_upstream_error_bytes(&buf).into_owned()
         } else {
             buf

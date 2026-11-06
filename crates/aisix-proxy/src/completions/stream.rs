@@ -428,7 +428,14 @@ where
                     // request sent.
                     Ok(Some(frame)) => {
                         let frame = restamp_completion_frame(frame, &client_facing_model);
-                        out.extend_from_slice(&aisix_gateway::scrub_upstream_error_frame(&frame))
+                        // In platform mode an upstream's error event becomes
+                        // the class of the error it reports.
+                        match crate::platform_errors::relayed_openai_error(&frame) {
+                            Some(class_frame) => out.extend_from_slice(&class_frame),
+                            None => out.extend_from_slice(
+                                &aisix_gateway::scrub_upstream_error_frame(&frame),
+                            ),
+                        }
                     }
                     Ok(None) => break,
                     Err(_) => {
@@ -523,6 +530,16 @@ pub(super) struct HeldCompletionVerdict {
 /// sends for the same failure.
 fn failure_frame(payload: &str) -> bytes::Bytes {
     bytes::Bytes::from(format!("event: error\ndata: {payload}\n\n"))
+}
+
+/// The frame that ends a stream on an upstream-side failure: the error's own
+/// type and text, or in platform mode its class (`crate::platform_errors`).
+fn upstream_failure_frame(error: &BridgeError) -> bytes::Bytes {
+    failure_frame(
+        &crate::platform_errors::openai_stream_payload(error).unwrap_or_else(|| {
+            crate::chat::error_frame_payload(error.error_type(), &error.stream_frame_message())
+        }),
+    )
 }
 
 /// The body of a completion a block-capable output chain holds back. The head
@@ -686,10 +703,7 @@ where
                 error_class: error.error_type(),
             };
             drop(guard);
-            yield Ok(failure_frame(&crate::chat::error_frame_payload(
-                error.error_type(),
-                &error.stream_frame_message(),
-            )));
+            yield Ok(upstream_failure_frame(&error));
             return;
         }
         let mut accumulator = CompletionSseAccumulator::with_security_cap(buffer.len());
@@ -717,10 +731,7 @@ where
                 *held = accumulator;
             }
             drop(guard);
-            yield Ok(failure_frame(&crate::chat::error_frame_payload(
-                error.error_type(),
-                &error.stream_frame_message(),
-            )));
+            yield Ok(upstream_failure_frame(&error));
             return;
         }
         let output_text = accumulator.output_text();
@@ -848,10 +859,7 @@ where
         // The upstream ended without its `[DONE]`: the scanned frames went out,
         // and the stream closes on the failure.
         if truncated {
-            yield Ok(failure_frame(&crate::chat::error_frame_payload(
-                BridgeError::StreamAborted.error_type(),
-                &BridgeError::StreamAborted.stream_frame_message(),
-            )));
+            yield Ok(upstream_failure_frame(&BridgeError::StreamAborted));
         }
     })
 }

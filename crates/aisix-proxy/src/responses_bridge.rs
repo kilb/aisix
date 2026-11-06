@@ -2923,15 +2923,24 @@ pub fn build_responses_bridge_stream(
                     {
                         break;
                     }
-                    let message = e.stream_frame_message();
-                    let frames = failure_frames(
-                        &mut encoder,
-                        sent_downstream,
-                        false,
-                        e.error_type(),
-                        upstream_failed_code(&e),
-                        &message,
-                    );
+                    let frames = match crate::platform_errors::stream_class(&e) {
+                        Some(class) => failure_frames(
+                            &mut encoder,
+                            sent_downstream,
+                            false,
+                            class.code(),
+                            class.code(),
+                            crate::platform_errors::platform_message(&class),
+                        ),
+                        None => failure_frames(
+                            &mut encoder,
+                            sent_downstream,
+                            false,
+                            e.error_type(),
+                            upstream_failed_code(&e),
+                            &e.stream_frame_message(),
+                        ),
+                    };
                     let comp = guard.comp();
                     // Output-guarded text stays unexportable: its scan will
                     // never run. With no output guardrail nothing was owed,

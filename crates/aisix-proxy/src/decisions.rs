@@ -431,7 +431,7 @@ async fn dispatch(
                 let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
                 let pk = &pk_entry.value;
                 let Some(upstream) = Upstream::of(&pk.provider) else {
-                    return Err(ProxyError::InvalidRequest(format!(
+                    return Err(ProxyError::TargetRefused(format!(
                         "{} uses provider `{}`; {} requires a typesafe, azure, openai, or \
                          openrouter provider",
                         label(),
@@ -789,7 +789,7 @@ fn upstream_url(upstream: Upstream, pk: &aisix_core::ProviderKey) -> Result<Stri
         }
         Upstream::Foundry => {
             let base = configured.ok_or_else(|| {
-                ProxyError::InvalidRequest(format!(
+                ProxyError::TargetRefused(format!(
                     "provider_key {:?} has no api_base configured",
                     pk.display_name
                 ))

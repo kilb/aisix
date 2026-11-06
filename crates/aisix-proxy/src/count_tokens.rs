@@ -830,7 +830,7 @@ async fn dispatch(
     // with a 400 (parallel to /v1/rerank's provider gate) rather than
     // dispatching to an upstream that would 404.
     if !any_anthropic {
-        return Err(ProxyError::InvalidRequest(format!(
+        return Err(ProxyError::TargetRefused(format!(
             "model `{model_name}` is not backed by an Anthropic-protocol upstream; \
              /v1/messages/count_tokens requires a provider key that either uses \
              the anthropic adapter or declares `apis.messages`, or a Claude model \

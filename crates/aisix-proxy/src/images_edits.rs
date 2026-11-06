@@ -565,7 +565,7 @@ async fn dispatch(
                 // the gateway boundary instead. Cross-provider editing wires
                 // (Gemini / Vertex / BFL) are the AISIX-Cloud#1360 Phase 2 follow-up.
                 if model.provider.as_deref() != Some("openai") {
-                    return Err(ProxyError::InvalidRequest(format!(
+                    return Err(ProxyError::TargetRefused(format!(
                         "{} is not an OpenAI provider; \
                          /v1/images/edits requires OpenAI",
                         crate::routing::refused_model_label(model_name)
