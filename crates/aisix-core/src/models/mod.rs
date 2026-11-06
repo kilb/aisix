@@ -68,7 +68,6 @@ pub use guardrail::{
 pub use mcp_auth_settings::{McpAnonymousAccess, McpAuthSettings, McpServerAllowlist};
 pub use mcp_policy::{
     upgrade_stored_mcp_access, McpAccess, McpPolicy, McpPolicyScope, LEGACY_ALLOWED_TOOLS_AS_ALLOW,
-    LEGACY_MCP_ACCESS_INHERIT,
 };
 pub use mcp_ref::{LiveMcpServerIndex, McpServerIndex, McpToolRef};
 pub use mcp_server::{

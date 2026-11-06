@@ -170,56 +170,34 @@ pub struct McpAccess {
     pub deny_ids: Option<Vec<McpToolRef>>,
 }
 
-/// Reported when a stored key's `mcp_access: {mode: inherit}` loads as no
-/// block of its own.
-pub const LEGACY_MCP_ACCESS_INHERIT: &str = "legacy:mcp_access.mode_inherit_as_no_key_layer";
 /// Reported when a stored key's `allowed_tools` loads as its `mcp_access`
 /// allow list.
 pub const LEGACY_ALLOWED_TOOLS_AS_ALLOW: &str = "legacy:allowed_tools_as_mcp_access_allow";
 
-/// Bring a stored API key's MCP access forward from the shape a release
-/// before the layered ACL wrote, where it means the same thing now, and
-/// return a report label per change.
+/// Bring a stored API key's `allowed_tools` forward from a release before the
+/// layered ACL, and return a report label when it did.
 ///
 /// That release read a key with no `mcp_access` block by its `allowed_tools`
-/// alone, and read a block by its `mode`. Two of its shapes need help to keep
-/// that meaning; every other one already loads as what it meant, or narrower,
-/// with `mode` left as an ordinary unknown field:
+/// alone: it was the key's whole grant. Read as written it is ignored and the
+/// key takes the policy layers instead, which can grant more than the key ever
+/// had. Dropping it opens access, so it is read as the key's own allow list,
+/// which grants at most what it did.
 ///
-/// - `{mode: inherit}` and nothing else took the team and environment grant
-///   unchanged, which is what no block of its own does now. Read as written,
-///   it is a layer allowing nothing.
-/// - `allowed_tools` beside no block was the key's whole grant. Read as
-///   written it is ignored and the key takes the policy layers instead, which
-///   can grant more than the key ever had; as the key's own allow list, it
-///   grants at most what it did.
+/// Nothing else of that release's shape is carried forward: a retired `mode`
+/// stays an ordinary unknown field, reported through the partial-compat
+/// channel, because every one of its values loads as what it meant or
+/// narrower. `restrict` intersected its `allow` with the inherited grant, which
+/// a key layer does; `deny`, or `restrict` with no `allow`, granted nothing,
+/// which an empty allow list does; and `inherit`, which took the inherited
+/// grant, now loads as its own lists, an empty allow list when it carries none,
+/// and so fails closed. `allowed_tools` beside a block was not read, and still
+/// is not.
 ///
-/// What is left as it loads: `restrict` intersected its `allow` with the
-/// inherited grant, which a key layer does; `deny`, or `restrict` with no
-/// `allow`, granted nothing, which an empty allow list does; and `inherit`
-/// beside an `allow` or `deny` list loads as that list, which can grant less
-/// than it did but never more, since no shape here can subtract a list
-/// without also granting everything when no policy is present. `allowed_tools`
-/// beside a block was not read, and still is not.
-///
-/// For the read path only: the strict schema refuses both spellings.
+/// For the read path only: the strict schema refuses `allowed_tools`.
 pub fn upgrade_stored_mcp_access(key: &mut serde_json::Value) -> Vec<&'static str> {
     let Some(key) = key.as_object_mut() else {
         return Vec::new();
     };
-    let bare_inherit = key
-        .get("mcp_access")
-        .and_then(serde_json::Value::as_object)
-        .is_some_and(|block| {
-            block.len() == 1
-                && block.get("mode").and_then(serde_json::Value::as_str) == Some("inherit")
-        });
-    if bare_inherit {
-        key.remove("mcp_access");
-        // The block superseded `allowed_tools`, so it never applied.
-        key.remove("allowed_tools");
-        return vec![LEGACY_MCP_ACCESS_INHERIT];
-    }
     let has_block = key.get("mcp_access").is_some_and(|block| !block.is_null());
     if has_block
         || !key
@@ -279,17 +257,20 @@ mod tests {
         };
         let s = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
 
-        // Took the team and environment grant unchanged.
+        // Took the team and environment grant unchanged. Carrying that
+        // forward would be compatibility code for a reshape whose old field,
+        // dropped, only closes access: it fails closed, a layer allowing
+        // nothing, and `mode` is reported as an unknown field.
         assert_eq!(
             read(serde_json::json!({ "mcp_access": { "mode": "inherit" } })),
-            (None, vec![LEGACY_MCP_ACCESS_INHERIT], false)
+            (Some((vec![], vec![])), vec![], false)
         );
         assert_eq!(
             read(serde_json::json!({
                 "mcp_access": { "mode": "inherit" }, "allowed_tools": ["x__*"]
             })),
-            (None, vec![LEGACY_MCP_ACCESS_INHERIT], false),
-            "the block superseded allowed_tools"
+            (Some((vec![], vec![])), vec![], true),
+            "the block superseded allowed_tools, which is not carried forward"
         );
         // Was the key's whole grant.
         assert_eq!(

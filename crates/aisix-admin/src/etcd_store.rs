@@ -445,7 +445,8 @@ mod tests {
             "key_hash": hash, "allowed_models": [], "mcp_access": { "mode": "inherit" },
         }))
         .unwrap();
-        assert!(inherit.mcp_access.is_none());
+        // Fails closed, as the loader serves it.
+        assert_eq!(inherit.mcp_access.map(|a| a.allow), Some(vec![]));
         let tools = stored_apikey(serde_json::json!({
             "key_hash": hash, "allowed_models": [], "allowed_tools": ["github__*"],
         }))

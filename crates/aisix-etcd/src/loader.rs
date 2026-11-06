@@ -359,7 +359,6 @@ pub fn build_snapshot(prefixes: &PrefixSet, entries: &[RawEntry]) -> (AisixSnaps
                             row_kind,
                             &fields,
                             "row loaded with retired MCP access, serving what it meant: \
-                             `mcp_access: {mode: inherit}` as no block of its own, and \
                              `allowed_tools` beside no block as `mcp_access: {allow: [...]}`; \
                              rewrite the row, a write of this shape is refused",
                         );
@@ -984,7 +983,9 @@ mod tests {
     }
 
     /// Every MCP access shape a stored row could carry from before the layered
-    /// ACL loads as what it meant, or fails closed, and the row says so.
+    /// ACL loads as what it meant, or fails closed, and the row says so. A key
+    /// with no MCP access configured at all carries nothing retired, so it has
+    /// nothing to report.
     #[test]
     fn stored_mcp_access_shapes_load_as_what_they_meant_or_fail_closed() {
         let key = |mcp: Value| {
@@ -1014,6 +1015,7 @@ mod tests {
                 "deny",
                 key(serde_json::json!({ "mcp_access": { "mode": "deny" } })),
             ),
+            ("plain", key(serde_json::json!({}))),
             (
                 "inherit-deny",
                 key(serde_json::json!({ "mcp_access": { "mode": "inherit", "deny": ["a__b"] } })),
@@ -1049,7 +1051,9 @@ mod tests {
                 .map(|a| (a.allow.clone(), a.deny.clone()))
         };
         let s = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        assert_eq!(access("inherit"), None);
+        // Took the inherited grant; fails closed rather than carry that over.
+        assert_eq!(access("inherit"), Some((vec![], vec![])));
+        assert_eq!(access("plain"), None);
         assert_eq!(access("tools"), Some((s(&["github__*"]), vec![])));
         assert_eq!(access("restrict"), Some((s(&["a__*"]), vec![])));
         assert_eq!(access("deny"), Some((vec![], vec![])));
@@ -1074,15 +1078,12 @@ mod tests {
                 .flat_map(|r| r.fields.clone())
                 .collect()
         };
-        assert_eq!(
-            reported("/aisix/api_keys/inherit"),
-            ["legacy:mcp_access.mode_inherit_as_no_key_layer"]
-        );
+        assert!(reported("/aisix/api_keys/plain").is_empty());
         assert_eq!(
             reported("/aisix/api_keys/tools"),
             ["legacy:allowed_tools_as_mcp_access_allow"]
         );
-        for id in ["restrict", "deny", "inherit-deny"] {
+        for id in ["inherit", "restrict", "deny", "inherit-deny"] {
             assert_eq!(
                 reported(&format!("/aisix/api_keys/{id}")),
                 ["mcp_access.mode"],

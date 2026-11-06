@@ -170,7 +170,7 @@ describe("mcp access policy e2e: env, team and key layers intersect", () => {
     [KEY_NARROW, ["alpha__echo"]],
     [KEY_BLOCKED, []],
     [KEY_STALE_MODE, ["alpha__echo", "alpha__reverse"]],
-    [KEY_STORED_INHERIT, ENV_GRANT],
+    [KEY_STORED_INHERIT, []],
     [KEY_STORED_TOOLS, ["alpha__echo"]],
   ];
 
@@ -247,9 +247,9 @@ describe("mcp access policy e2e: env, team and key layers intersect", () => {
         mcp_access: { mode: "deny", allow: ["alpha__*"] },
       }),
     );
-    // Rows written before the layered ACL. There, `{mode: inherit}` took the
-    // policy grant unchanged, and a key with no block was granted exactly its
-    // `allowed_tools`.
+    // Rows written before the layered ACL. There, a key with no block was
+    // granted exactly its `allowed_tools`, and `{mode: inherit}` took the
+    // policy grant unchanged.
     await seed.createApiKey(keyDoc(KEY_STORED_INHERIT, { mcp_access: { mode: "inherit" } }));
     await seed.createApiKey(keyDoc(KEY_STORED_TOOLS, { allowed_tools: ["alpha__echo"] }));
 
@@ -285,21 +285,26 @@ describe("mcp access policy e2e: env, team and key layers intersect", () => {
     expect(denied.error).toContain("not available");
   });
 
-  test("a key stored before the layered ACL keeps the access it had", async (ctx) => {
+  test("a key stored before the layered ACL never gets more than it had", async (ctx) => {
     if (!etcdReachable || !app) return ctx.skip();
 
-    // `inherit` still takes the policy grant, the deny one layer up included.
-    await expectList(KEY_STORED_INHERIT, ENV_GRANT);
-    expect(await callTool(KEY_STORED_INHERIT, "beta__echo", "hi")).toEqual({
-      ok: true,
-      text: "beta:hi",
-    });
     // `allowed_tools` was the whole grant: the env layer allows more, but the
     // key never had it.
     await expectList(KEY_STORED_TOOLS, ["alpha__echo"]);
     const denied = await callTool(KEY_STORED_TOOLS, "alpha__reverse", "hi");
     expect(denied.ok).toBe(false);
     expect(denied.error).toContain("not available");
+    // A retired `mode` is not carried forward: `inherit` fails closed, and the
+    // status says the row carries a field this build does not read.
+    await expectList(KEY_STORED_INHERIT, []);
+    const status = (await (await fetch(`${app!.metricsUrl}/status/config`)).json()) as {
+      partially_compatible: Array<{ resource_kind: string; field: string }>;
+    };
+    expect(
+      status.partially_compatible.some(
+        (p) => p.resource_kind === "api_keys" && p.field.includes("mcp_access.mode"),
+      ),
+    ).toBe(true);
   });
 
   test("a key with no block of its own takes the env layer unchanged", async (ctx) => {
