@@ -21,6 +21,7 @@ use aisix_control_plane::auth::{OperatorAuth, OperatorRole};
 use aisix_control_plane::crypto::MasterKey;
 use aisix_control_plane::db::Db;
 use aisix_control_plane::error::ApiError;
+use aisix_control_plane::housekeeping;
 use aisix_control_plane::kine::{KeyValue, KineClient, KineError, KineWriter, WriteOutcome};
 use aisix_control_plane::projector::{self, claim_key, key_for, Timing, PROJECTOR_LOCK_KEY};
 use aisix_control_plane::resources::write::{write_resource, ResourceWrite, WriteCtx, WriteOp};
@@ -3038,4 +3039,121 @@ async fn a_reconcile_does_not_delete_by_a_list_older_than_a_takeover() {
     assert_eq!(reconcile_audit(db).await, []);
     let _ = stop.send(());
     task.await.expect("the projector stops");
+}
+
+// ---- with the tenant and gateway tasks ---------------------------------------
+
+/// The stored document of `kind`/`id`.
+async fn stored_doc(db: &Db, kind: Kind, id: Uuid) -> Value {
+    sqlx::query_scalar("SELECT doc FROM gw_resources WHERE kind = $1 AND id = $2")
+        .bind(kind.segment())
+        .bind(id)
+        .fetch_one(db.pool())
+        .await
+        .expect("load the stored document")
+}
+
+#[tokio::test]
+async fn an_approved_tenant_reaches_kine_as_its_team_and_limits() {
+    let Some(cp) = TestCp::start_with_kine().await else {
+        return;
+    };
+    let kine = raw_kine(&support::kine_endpoint().expect("kine is configured")).await;
+    let org = unique("acme");
+    let email = format!("owner-{}@tenant.test", Uuid::new_v4().simple());
+    let r = cp
+        .send(
+            "POST",
+            "/api/signup",
+            None,
+            Some(json!({"org_name": org, "email": email, "password": support::TEST_PASSWORD})),
+        )
+        .await;
+    assert_eq!(r.status, 201, "{r:?}");
+    let tenant: Uuid = r.body["tenant"]["id"]
+        .as_str()
+        .and_then(|id| id.parse().ok())
+        .expect("a tenant id");
+    let op = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let r = cp
+        .send(
+            "POST",
+            &format!("/admin/tenants/{tenant}/approve"),
+            Some(op.cookie()),
+            None,
+        )
+        .await;
+    assert_eq!(r.status, 200, "{r:?}");
+    all_projected(cp.db()).await;
+
+    // The team, named after the tenant, and the policy that limits it, as
+    // they are stored.
+    let env = cp.env();
+    let (team, _) = raw_json(&kine, &key_for(env, Kind::Teams, tenant))
+        .await
+        .expect("the team is in kine");
+    assert_eq!(team["name"], org);
+    assert_eq!(team, stored_doc(cp.db(), Kind::Teams, tenant).await);
+    let policy: Option<Uuid> =
+        sqlx::query_scalar("SELECT limits_policy_id FROM tenants WHERE id = $1")
+            .bind(tenant)
+            .fetch_one(cp.db().pool())
+            .await
+            .expect("read the tenant");
+    let policy = policy.expect("an approved tenant has a limits policy");
+    let (limits, _) = raw_json(&kine, &key_for(env, Kind::RateLimitPolicies, policy))
+        .await
+        .expect("the limits are in kine");
+    assert_eq!(
+        limits,
+        stored_doc(cp.db(), Kind::RateLimitPolicies, policy).await
+    );
+    // Its documents no longer wait for the projector.
+    let r = cp
+        .get_with_cookie(&format!("/admin/tenants/{tenant}"), op.cookie())
+        .await;
+    assert_eq!(r.status, 200, "{r:?}");
+    assert_ne!(r.body["rollout"]["state"], "pending", "{r:?}");
+}
+
+#[tokio::test]
+async fn a_projected_tombstone_is_pruned_and_an_unprojected_one_is_kept() {
+    let Some(bare) = BareDatabase::new().await else {
+        return;
+    };
+    let Some(endpoint) = support::kine_endpoint() else {
+        return;
+    };
+    let kine = raw_kine(&endpoint).await;
+    let (db, env) = (&bare.db, &bare.env);
+    let log = Arc::new(Mutex::new(Vec::<Write>::new()));
+    let (stop, task) = spawn_recorded("a", &bare, &endpoint, &log).await;
+    let projected = create_key(db, env, &unique("a")).await;
+    let pending = create_key(db, env, &unique("b")).await;
+    all_projected(db).await;
+    // One delete reaches kine; the other is made while no projector runs.
+    write_all(db, env, vec![(Kind::ProviderKeys, projected, Op::Delete)]).await;
+    all_projected(db).await;
+    let _ = stop.send(());
+    task.await.expect("the projector stops");
+    write_all(db, env, vec![(Kind::ProviderKeys, pending, Op::Delete)]).await;
+
+    let pruned = housekeeping::prune_tombstones(db, Duration::ZERO)
+        .await
+        .expect("prune the tombstones");
+    assert_eq!(pruned, 1);
+    let left: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM gw_resources ORDER BY id")
+        .fetch_all(db.pool())
+        .await
+        .expect("list the rows");
+    assert_eq!(left, [pending]);
+    assert!(!row_state(db, Kind::ProviderKeys, pending).await.projected());
+    // Kept until its delete reaches kine, where its key still is.
+    assert_eq!(
+        raw_get(&kine, &key_for(env, Kind::ProviderKeys, projected)).await,
+        None
+    );
+    assert!(raw_get(&kine, &key_for(env, Kind::ProviderKeys, pending))
+        .await
+        .is_some());
 }
