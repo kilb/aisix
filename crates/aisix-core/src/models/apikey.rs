@@ -221,18 +221,22 @@ pub struct ApiKey {
     /// `/v1/systemone`), `realtime` (`/v1/realtime`), `files` (`/v1/files`
     /// and the routes under it), `batches` (`/v1/batches` and the routes
     /// under it), `fine_tuning` (`/v1/fine_tuning/jobs` and the routes under
-    /// it), `mcp` (`/mcp`, `/mcp/{server}` and
-    /// `/mcp/{server}/oauth/credential`), `a2a` (`/a2a/{agent}` and its agent
+    /// it), `mcp` (`/mcp`, `/mcp/{server}`, `/mcp/{server}/oauth/credential`,
+    /// and `/mcp/{server}/oauth/token` when MCP sign-in authenticates the
+    /// token request with this key), `a2a` (`/a2a/{agent}` and its agent
     /// card), and `passthrough` (every passthrough route, whether it matched
     /// by path prefix or by host).
     ///
     /// Within the families it may call, the key's other grants still apply:
     /// `allowed_models`, `allowed_routes`, `allowed_agents` and `mcp_access`.
     /// Health checks, OAuth discovery documents and the MCP sign-in pages
-    /// take no API key and are not affected. When this key is the principal
-    /// of anonymous MCP access and the list leaves out `mcp`, anonymous MCP
-    /// access is closed. A family name this gateway version does not
-    /// recognize grants nothing.
+    /// take no API key and are not affected. A user whose sign-in to an MCP
+    /// server maps to this key cannot sign in, and a session issued earlier
+    /// is refused, while the list leaves out `mcp`. When this key is the
+    /// principal of anonymous MCP access or of an anonymous passthrough route
+    /// and the list leaves out that family, the anonymous entry is closed and
+    /// answers `401`. A family name this gateway version does not recognize
+    /// grants nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed_endpoints: Option<Vec<EndpointFamily>>,
 

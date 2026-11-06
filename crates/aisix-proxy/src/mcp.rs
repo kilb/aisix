@@ -165,15 +165,7 @@ async fn resolve_caller(
                 state, token, server, &source_ip,
             )
             .await
-            // The session's key keeps its endpoint allow-list: this path
-            // does not pass through the extractor that checks it elsewhere.
-            .and_then(|auth| {
-                crate::endpoint_acl::check_endpoint(
-                    auth.key(),
-                    aisix_core::models::EndpointFamily::Mcp,
-                )?;
-                Ok(auth)
-            }) {
+            {
                 Ok(auth) => {
                     auth.publish(parts);
                     if let Some(jwt) = &auth.jwt {
