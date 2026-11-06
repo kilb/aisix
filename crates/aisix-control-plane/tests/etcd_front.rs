@@ -34,7 +34,9 @@ use aisix_control_plane::etcd_front::proto::etcdserverpb::{
     PutResponse, RangeResponse, ResponseHeader, TxnRequest, TxnResponse,
 };
 use aisix_control_plane::etcd_front::proto::mvccpb;
-use aisix_control_plane::etcd_front::service::{MAX_RANGE_ANSWER, MAX_WATCHES_PER_CREDENTIAL};
+use aisix_control_plane::etcd_front::service::{
+    MAX_RANGES, MAX_RANGE_ANSWER, MAX_WATCHES_PER_CREDENTIAL, MAX_WATCH_ANSWER,
+};
 use aisix_control_plane::etcd_front::{self, Front};
 use aisix_control_plane::gateways::CREDENTIALS_CHANNEL;
 use aisix_control_plane::pki::Pki;
@@ -684,13 +686,20 @@ async fn old_revisions_counts_and_replays_through_the_front_stay_in_the_environm
     assert_eq!(keys_of(old.kvs()), vec![key.clone()]);
     assert_eq!(old.kvs()[0].value(), b"v1");
     let counted = gw
-        .get(
+        .get(env.clone(), Some(GetOptions::new().with_prefix()))
+        .await
+        .expect("the environment");
+    assert_eq!(counted.count(), 1);
+    // A count alone is not served: it would count what cannot be filtered.
+    let status = status_of(
+        gw.get(
             env.clone(),
             Some(GetOptions::new().with_prefix().with_count_only()),
         )
-        .await
-        .expect("a count");
-    assert_eq!(counted.count(), 1);
+        .await,
+    );
+    assert_eq!(status.code(), Code::InvalidArgument, "{status:?}");
+    assert_eq!(status.message(), "etcdserver: count_only is not served");
 
     // A replay from the first write, with the previous values and
     // fragmenting asked for: this environment's history only.
@@ -1406,16 +1415,23 @@ async fn answers_over_four_mib_pass_through_the_front() {
 
 /// A kine that answers with keys outside what it is asked for, as kine does
 /// when its table's collation is not bytewise. Every range gets `outside`
-/// and `inside`, except one for `huge`, which gets an answer longer than the
-/// front reads. Every watch gets its create confirmed, then an answer of
-/// nothing but `outside`, then one of `outside`, `inside`, and `also` with
-/// `outside` as its previous value.
+/// and `inside`, except: one for `huge` gets an answer longer than the front
+/// reads; one for `foreign_page` gets `outside` alone, saying more follow;
+/// and one for `slow` waits for a permit of `gate`, counted in `arrived`.
+/// Every watch gets its create confirmed, then an answer of nothing but
+/// `outside`, then one of `outside`, `inside`, and `also` with `outside` as
+/// its previous value; except a watch on `huge`, which gets one answer
+/// longer than the front reads.
 #[derive(Clone)]
 struct LeakyKine {
     inside: Vec<u8>,
     also: Vec<u8>,
     outside: Vec<u8>,
     huge: Vec<u8>,
+    foreign_page: Vec<u8>,
+    slow: Vec<u8>,
+    gate: Arc<tokio::sync::Semaphore>,
+    arrived: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 fn kv(key: &[u8], value: &[u8]) -> mvccpb::KeyValue {
@@ -1450,9 +1466,19 @@ impl Kv for LeakyKine {
         &self,
         request: tonic::Request<RangeRequest>,
     ) -> Result<tonic::Response<RangeResponse>, tonic::Status> {
-        let kvs = if request.get_ref().key == self.huge {
+        let key = &request.get_ref().key;
+        let mut more = false;
+        let kvs = if *key == self.huge {
             vec![kv(&self.huge, &vec![b'h'; MAX_RANGE_ANSWER])]
+        } else if *key == self.foreign_page {
+            more = true;
+            vec![kv(&self.outside, b"another-env-7c1")]
         } else {
+            if *key == self.slow {
+                self.arrived
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let _passed = self.gate.acquire().await;
+            }
             vec![
                 kv(&self.outside, b"another-env-7c1"),
                 kv(&self.inside, b"v1"),
@@ -1460,9 +1486,9 @@ impl Kv for LeakyKine {
         };
         Ok(tonic::Response::new(RangeResponse {
             header: header(),
-            count: kvs.len() as i64,
+            count: kvs.len() as i64 + 3,
             kvs,
-            more: false,
+            more,
         }))
     }
 
@@ -1510,15 +1536,38 @@ impl Watch for LeakyKine {
         let (answers, stream) = mpsc::channel(4);
         let leaky = self.clone();
         tokio::spawn(async move {
-            if !matches!(requests.message().await, Ok(Some(_))) {
+            let Ok(Some(first)) = requests.message().await else {
                 return;
-            }
+            };
             let created = Answer {
                 header: header(),
                 watch_id: 1,
                 created: true,
                 ..Default::default()
             };
+            let on_huge = matches!(
+                &first.request_union,
+                Some(watch_request::RequestUnion::CreateRequest(c)) if c.key == leaky.huge
+            );
+            if on_huge {
+                let huge = Answer {
+                    header: header(),
+                    watch_id: 1,
+                    events: vec![mvccpb::Event {
+                        r#type: mvccpb::event::EventType::Put as i32,
+                        kv: Some(kv(&leaky.huge, &vec![b'h'; MAX_WATCH_ANSWER])),
+                        prev_kv: None,
+                    }],
+                    ..Default::default()
+                };
+                for answer in [created, huge] {
+                    if answers.send(Ok(answer)).await.is_err() {
+                        return;
+                    }
+                }
+                while let Ok(Some(_)) = requests.message().await {}
+                return;
+            }
             let only_outside = Answer {
                 header: header(),
                 watch_id: 1,
@@ -1577,6 +1626,10 @@ async fn leaky_kine() -> (String, LeakyKine, Uuid) {
         )
         .into(),
         huge: format!("{env}models/huge-7c1").into(),
+        foreign_page: format!("{env}models/foreign-page-7c1").into(),
+        slow: format!("{env}models/slow-7c1").into(),
+        gate: Arc::new(tokio::sync::Semaphore::new(0)),
+        arrived: Arc::default(),
     };
     (serve_leaky(leaky.clone()).await, leaky, env_id)
 }
@@ -1597,6 +1650,8 @@ async fn whatever_kine_answers_only_keys_inside_the_key_spaces_reach_the_gateway
         .await
         .expect("a range");
     assert_eq!(keys_of(read.kvs()), vec![inside.clone()]);
+    // The count is of what was kept, not of what kine matched.
+    assert_eq!(read.count(), 1);
     let (entries, _) = provider(&t.cp, &t.bundle, &env)
         .await
         .load_all()
@@ -1853,4 +1908,82 @@ fn the_front_holds_1024_watches_at_most_and_the_fd_budget_counts_them() {
         "{}",
         limits.fds_needed()
     );
+}
+
+#[tokio::test]
+async fn a_page_of_nothing_but_foreign_keys_is_an_error_not_the_end_of_the_load() {
+    let (endpoint, leaky, env_id) = leaky_kine().await;
+    let Some(t) = Fixture::at(&endpoint, Some(env_id)).await else {
+        return;
+    };
+    let mut gw = gateway(&t.cp, &t.bundle).await;
+    // A page as the gateway's load asks for it: from a key, to the end of
+    // the environment, a page at a time.
+    let status = status_of(
+        gw.get(
+            leaky.foreign_page.clone(),
+            Some(
+                GetOptions::new()
+                    .with_range(prefix_end(t.env().as_bytes()))
+                    .with_limit(500),
+            ),
+        )
+        .await,
+    );
+    // An error the gateway retries (`Internal` is one, crates/aisix-etcd
+    // `client.rs`), not an empty last page.
+    assert_eq!(status.code(), Code::Internal, "{status:?}");
+}
+
+#[tokio::test]
+async fn at_most_eight_ranges_are_read_at_once() {
+    let (endpoint, leaky, env_id) = leaky_kine().await;
+    let Some(t) = Fixture::at(&endpoint, Some(env_id)).await else {
+        return;
+    };
+    assert_eq!(MAX_RANGES, 8);
+    let mut reading = Vec::new();
+    for _ in 0..MAX_RANGES {
+        let mut gw = gateway(&t.cp, &t.bundle).await;
+        let slow = leaky.slow.clone();
+        reading.push(tokio::spawn(async move { gw.get(slow, None).await }));
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while leaky.arrived.load(std::sync::atomic::Ordering::SeqCst) < MAX_RANGES {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the slow ranges never all reached kine"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let mut gw = gateway(&t.cp, &t.bundle).await;
+    let status = status_of(gw.get(leaky.inside.clone(), None).await);
+    assert_eq!(status.code(), Code::ResourceExhausted, "{status:?}");
+    assert_eq!(status.message(), "etcdserver: too many ranges");
+
+    leaky.gate.add_permits(MAX_RANGES);
+    for read in reading {
+        read.await
+            .expect("the read task")
+            .expect("a slow range, once kine answers");
+    }
+    gw.get(leaky.inside.clone(), None)
+        .await
+        .expect("a range once the others are read");
+}
+
+#[tokio::test]
+async fn a_watch_answer_longer_than_the_front_reads_is_resource_exhausted() {
+    let (endpoint, leaky, env_id) = leaky_kine().await;
+    let Some(t) = Fixture::at(&endpoint, Some(env_id)).await else {
+        return;
+    };
+    let mut gw = gateway(&t.cp, &t.bundle).await;
+    let (_watcher, mut stream) = gw.watch(leaky.huge.clone(), None).await.expect("created");
+    let answer = tokio::time::timeout(Duration::from_secs(10), stream.message())
+        .await
+        .expect("answered within 10 s");
+    let status = status_of(answer);
+    assert_eq!(status.code(), Code::ResourceExhausted, "{status:?}");
+    assert_eq!(status.message(), "etcdserver: watch answer too large");
 }

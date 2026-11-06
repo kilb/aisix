@@ -18,7 +18,11 @@
 //!
 //! What kine answers is also held to the key spaces, key by key: a range's
 //! keys and a watch's events outside them are dropped, and logged by count
-//! as an error. kine compares keys in its table's collation, which is
+//! as an error (at most once per [`LEAK_LOG_EVERY`]). A range that dropped
+//! keys reports the count of what it kept, and a page left empty while kine
+//! says more follow is an error, never the end of the gateway's load. A
+//! `count_only` range is refused: it would count what cannot be filtered.
+//! kine compares keys in its table's collation, which is
 //! bytewise only when its `name` column is `COLLATE "C"`: kine creates it
 //! so, but leaves an older table as it was, and creates none on
 //! CockroachDB. Under any other collation `[key, range_end)` is not a
@@ -26,9 +30,10 @@
 //!
 //! What the front holds is bounded: at most [`MAX_WATCHES`] watch calls,
 //! [`MAX_WATCHES_PER_CREDENTIAL`] of one credential's, each with one
-//! connection to kine and [`WATCH_BUFFER`] answers queued each way; and a
-//! range answer of at most [`MAX_RANGE_ANSWER`] bytes. Past a cap a gateway
-//! is told `ResourceExhausted`, which it retries.
+//! connection to kine and [`WATCH_BUFFER`] answers queued each way, none
+//! longer than [`MAX_WATCH_ANSWER`]; and at most [`MAX_RANGES`] ranges read
+//! at once, each answer at most [`MAX_RANGE_ANSWER`] bytes. Past a cap a
+//! gateway is told `ResourceExhausted`, which it retries.
 //!
 //! Nothing read from kine is logged: the documents carry plaintext
 //! credentials.
@@ -85,6 +90,21 @@ pub const WATCH_BUFFER: usize = 4;
 /// reading it.
 pub const MAX_RANGE_ANSWER: usize = 64 << 20;
 
+/// Ranges read from kine at once, across every gateway: with
+/// [`MAX_RANGE_ANSWER`], what the front holds of range answers at any time.
+/// A gateway's load reads its pages one after another.
+pub const MAX_RANGES: usize = 8;
+
+/// The largest watch answer the front reads from kine: 64 MiB. kine merges
+/// every event queued for a watch into one answer, and 22 MB has been
+/// seen. A longer one ends the watch `ResourceExhausted`; the gateway then
+/// loads again, by pages, and watches from there.
+pub const MAX_WATCH_ANSWER: usize = 64 << 20;
+
+/// At most one error about dropped keys this often, with the count dropped
+/// since the last.
+pub const LEAK_LOG_EVERY: Duration = Duration::from_secs(60);
+
 /// How often the connection to kine is pinged while a stream is open (kine
 /// allows no pings without one, and none more often than every 5 s).
 const KINE_KEEPALIVE: Duration = Duration::from_secs(30);
@@ -96,8 +116,12 @@ const CREDENTIAL_REFUSED: &str = "etcdserver: permission denied: gateway credent
 /// (`codec/decode.rs`), as `OutOfRange`.
 const TOO_LONG: &str = "Error, decoded message length too large";
 
-/// Logged, with the count, when kine answers with keys outside the key
-/// spaces.
+/// What a gateway is told of an answer longer than the front reads.
+const RANGE_TOO_LONG: &str = "etcdserver: range answer too large";
+const WATCH_TOO_LONG: &str = "etcdserver: watch answer too large";
+
+/// Logged, with the count ([`LeakLog`]), when kine answers with keys
+/// outside the key spaces.
 const COLLATION_LEAK: &str = "kine answered with keys outside the requested range, which the \
     etcd front dropped: kine's `name` column is not COLLATE \"C\" (a table created by an \
     older kine, or on CockroachDB), so its ranges are not prefixes";
@@ -125,8 +149,13 @@ pub struct Front {
     allowed: Arc<AllowedPrefixes>,
     /// Places for watch calls: [`MAX_WATCHES`] in all.
     watches: Arc<Semaphore>,
-    /// [`MAX_WATCHES_PER_CREDENTIAL`] places for each credential.
+    /// [`MAX_WATCHES_PER_CREDENTIAL`] places for each credential. Not
+    /// pruned: it holds one entry per credential admitted since boot, and
+    /// the credential cache already holds every credential listed.
     credential_watches: Arc<Mutex<HashMap<Uuid, Arc<Semaphore>>>>,
+    /// Places for ranges being read: [`MAX_RANGES`].
+    ranges: Arc<Semaphore>,
+    leaks: Arc<LeakLog>,
 }
 
 impl Front {
@@ -141,6 +170,8 @@ impl Front {
             env,
             watches: Arc::new(Semaphore::new(MAX_WATCHES)),
             credential_watches: Arc::default(),
+            ranges: Arc::new(Semaphore::new(MAX_RANGES)),
+            leaks: Arc::default(),
         }
     }
 
@@ -242,16 +273,35 @@ impl Kv for Front {
         if let Some(refused) = self.check(&caller, &range.key, &range.range_end) {
             return Err(refused);
         }
+        // The gateway reads pages and their last key, never a count.
+        if range.count_only {
+            return Err(Status::invalid_argument(
+                "etcdserver: count_only is not served",
+            ));
+        }
+        let Ok(_reading) = self.ranges.try_acquire() else {
+            tracing::warn!(dp_id = %caller.dp_id,
+                "refused an etcd range: the front reads as many ranges as it may");
+            return Err(Status::resource_exhausted("etcdserver: too many ranges"));
+        };
         let mut answer = KvClient::new(self.shared.clone())
             .max_decoding_message_size(MAX_RANGE_ANSWER)
             .range(range)
             .await
-            .map_err(|status| range_failure(&caller, status))?
+            .map_err(|status| too_long(&caller, status, MAX_RANGE_ANSWER, RANGE_TOO_LONG))?
             .into_inner();
         let read = answer.kvs.len();
         answer.kvs.retain(|kv| self.allowed.contains(&kv.key));
         if answer.kvs.len() < read {
-            tracing::error!(dropped = read - answer.kvs.len(), "{COLLATION_LEAK}");
+            self.leaks.note(read - answer.kvs.len());
+            answer.count = answer.kvs.len() as i64;
+        }
+        // kine never says more follow on an empty page; after the filter,
+        // an empty one would end the gateway's load short.
+        if answer.more && answer.kvs.is_empty() {
+            return Err(Status::internal(
+                "etcdserver: a range page held no key inside the range",
+            ));
         }
         Ok(Response::new(answer))
     }
@@ -376,9 +426,9 @@ impl Front {
         to_gateway: Answers,
         end: CallEnd,
     ) {
-        let mut guard = Guard::new(&self, caller);
-        let mut kine =
-            WatchClient::new(self.endpoint.connect_lazy()).max_decoding_message_size(usize::MAX);
+        let mut guard = Guard::new(&self, caller.clone());
+        let mut kine = WatchClient::new(self.endpoint.connect_lazy())
+            .max_decoding_message_size(MAX_WATCH_ANSWER);
         let opened = tokio::select! {
             opened = kine.watch(ReceiverStream::new(from_gateway)) => opened,
             () = end.ended() => return,
@@ -417,6 +467,7 @@ impl Front {
                     return;
                 }
                 Err(status) => {
+                    let status = too_long(&caller, status, MAX_WATCH_ANSWER, WATCH_TOO_LONG);
                     end.finish(&to_gateway, status).await;
                     return;
                 }
@@ -456,22 +507,52 @@ impl Front {
         if answer.events.len() == read {
             return Some(answer);
         }
-        tracing::error!(dropped = read - answer.events.len(), "{COLLATION_LEAK}");
+        self.leaks.note(read - answer.events.len());
         let control = answer.created || answer.canceled || answer.compact_revision != 0;
         (control || !answer.events.is_empty()).then_some(answer)
     }
 }
 
-/// A range that failed, as the gateway is told: kine's answer as it is,
-/// unless it was longer than [`MAX_RANGE_ANSWER`], which is
-/// `ResourceExhausted`.
-fn range_failure(caller: &Caller, status: Status) -> Status {
+/// What the gateway is told of a range or a watch that failed: kine's
+/// answer as it is, unless it was longer than `limit`, which is
+/// `ResourceExhausted` with `message`.
+fn too_long(caller: &Caller, status: Status, limit: usize, message: &'static str) -> Status {
     if status.code() == Code::OutOfRange && status.message().starts_with(TOO_LONG) {
-        tracing::warn!(dp_id = %caller.dp_id, limit = MAX_RANGE_ANSWER,
-            "refused an etcd range whose answer is longer than the front reads");
-        return Status::resource_exhausted("etcdserver: range answer too large");
+        tracing::warn!(dp_id = %caller.dp_id, limit,
+            "refused an etcd answer longer than the front reads");
+        return Status::resource_exhausted(message);
     }
     status
+}
+
+/// The error about dropped keys, at most once per [`LEAK_LOG_EVERY`] with
+/// the count since the last: a kine whose collation is not bytewise drops
+/// keys on every answer, and would otherwise log once for each.
+#[derive(Default)]
+struct LeakLog(Mutex<(u64, Option<std::time::Instant>)>);
+
+impl LeakLog {
+    fn note(&self, dropped: usize) {
+        if let Some(dropped) = self.due(dropped, std::time::Instant::now()) {
+            tracing::error!(dropped, "{COLLATION_LEAK}");
+        }
+    }
+
+    /// Adds `dropped` to the count since the last error, and takes the
+    /// count when one is due at `now`.
+    fn due(&self, dropped: usize, now: std::time::Instant) -> Option<u64> {
+        let mut held = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        held.0 += dropped as u64;
+        if held
+            .1
+            .is_some_and(|at| now.duration_since(at) < LEAK_LOG_EVERY)
+        {
+            return None;
+        }
+        let total = held.0;
+        *held = (0, Some(now));
+        Some(total)
+    }
 }
 
 /// One watch call's place under [`MAX_WATCHES`] and
@@ -558,5 +639,23 @@ impl Guard {
                 return Status::unavailable("etcdserver: the connection is closing");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Instant;
+
+    use super::{LeakLog, LEAK_LOG_EVERY};
+
+    #[test]
+    fn dropped_keys_are_logged_at_most_once_a_minute_with_the_count_since() {
+        let log = LeakLog::default();
+        let start = Instant::now();
+        assert_eq!(log.due(3, start), Some(3));
+        assert_eq!(log.due(2, start + LEAK_LOG_EVERY / 2), None);
+        assert_eq!(log.due(4, start + LEAK_LOG_EVERY / 2), None);
+        assert_eq!(log.due(1, start + LEAK_LOG_EVERY), Some(7));
+        assert_eq!(log.due(5, start + LEAK_LOG_EVERY * 3), Some(5));
     }
 }
