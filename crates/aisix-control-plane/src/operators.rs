@@ -18,7 +18,7 @@ use uuid::Uuid;
 
 use crate::audit::{self, Actor, AuditEntry};
 use crate::auth::password::{self, normalize_email, LOGIN_COOLDOWN, MIN_PASSWORD_LEN};
-use crate::auth::session::{self, Principal, ADMIN_COOKIE, OPERATOR_SESSION_TTL};
+use crate::auth::session::{self, Principal, PrincipalKind, ADMIN_COOKIE, OPERATOR_SESSION_TTL};
 use crate::auth::{OperatorAuth, OperatorRole};
 use crate::db::{Db, DbError};
 use crate::error::{ApiError, Detail};
@@ -112,7 +112,7 @@ fn is_email_taken(e: &DbError) -> bool {
 }
 
 /// `429 busy` with `Retry-After`, for an email that is cooling down.
-fn cooling_down() -> Response {
+pub(crate) fn cooling_down() -> Response {
     (
         [(header::RETRY_AFTER, LOGIN_COOLDOWN.as_secs().to_string())],
         ApiError::busy(),
@@ -310,7 +310,7 @@ pub async fn logout(
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     if let Some(token) = session::token_from_headers(&headers, ADMIN_COOKIE) {
-        session::revoke(&state.db, token).await?;
+        session::revoke(state.db.pool(), token, PrincipalKind::Operator).await?;
     }
     Ok((
         StatusCode::NO_CONTENT,

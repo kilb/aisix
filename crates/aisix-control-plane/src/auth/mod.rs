@@ -10,7 +10,7 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
-pub use extract::OperatorAuth;
+pub use extract::{MemberAuth, OperatorAuth};
 
 /// An operator's role. Ordered: each role may do everything the ones before
 /// it may.
@@ -59,6 +59,12 @@ impl fmt::Display for OperatorRole {
 
 /// A tenant member's role. Tenant routes name the roles they admit in
 /// `http::ROUTE_ROLES`.
+///
+/// - `owner`: everything, including making and changing other owners.
+/// - `admin`: manages members and every key, but cannot make an owner or
+///   change one.
+/// - `member`: uses keys, their own.
+/// - `billing`: reads only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MemberRole {
@@ -66,4 +72,30 @@ pub enum MemberRole {
     Admin,
     Member,
     Billing,
+}
+
+impl MemberRole {
+    /// The name stored in the database and used on the wire.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MemberRole::Owner => "owner",
+            MemberRole::Admin => "admin",
+            MemberRole::Member => "member",
+            MemberRole::Billing => "billing",
+        }
+    }
+}
+
+impl FromStr for MemberRole {
+    type Err = UnknownRole;
+
+    fn from_str(s: &str) -> Result<MemberRole, UnknownRole> {
+        match s {
+            "owner" => Ok(MemberRole::Owner),
+            "admin" => Ok(MemberRole::Admin),
+            "member" => Ok(MemberRole::Member),
+            "billing" => Ok(MemberRole::Billing),
+            _ => Err(UnknownRole),
+        }
+    }
 }

@@ -22,6 +22,7 @@ pub mod error;
 pub mod gateways;
 pub mod housekeeping;
 pub mod http;
+pub mod members;
 pub mod operators;
 pub mod pki;
 pub mod resources;
@@ -49,6 +50,8 @@ pub struct AppState {
     pub passwords: PasswordGate,
     /// The login cooldown for operator emails.
     pub operator_logins: LoginThrottle,
+    /// The login cooldown for member emails, and the signup window.
+    pub portal: members::PortalLimits,
     /// The CA that issues gateway certificates, and the platform id key.
     pub pki: Arc<Pki>,
     /// The gateway credentials, which every gateway request is checked
@@ -183,6 +186,7 @@ where
         cfg: Arc::new(cfg),
         passwords,
         operator_logins: LoginThrottle::default(),
+        portal: members::PortalLimits::default(),
         pki,
         creds,
         beats: BeatLimiter::default(),

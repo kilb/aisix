@@ -17,6 +17,9 @@ use crate::db::{Db, DbError};
 /// The operators' session cookie. The admin API reads only this one.
 pub const ADMIN_COOKIE: &str = "aisix_cp_admin";
 
+/// The tenant members' session cookie. The tenant API reads only this one.
+pub const PORTAL_COOKIE: &str = "aisix_cp_portal";
+
 pub const OPERATOR_SESSION_TTL: Duration = Duration::from_secs(8 * 3600);
 pub const MEMBER_SESSION_TTL: Duration = Duration::from_secs(12 * 3600);
 
@@ -112,14 +115,22 @@ pub async fn resolve(db: &Db, token: &str, kind: PrincipalKind) -> Result<Option
     .await?)
 }
 
-/// Ends the session `token`, if there is one.
-pub async fn revoke(db: &Db, token: &str) -> Result<(), DbError> {
+/// Ends the session `token`, if there is one of `kind`, with `executor`
+/// (the pool, or the connection of a transaction that starts a session in
+/// its place). A token of the other kind is left alone, so neither API can
+/// end the other's sessions.
+pub async fn revoke<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
+    token: &str,
+    kind: PrincipalKind,
+) -> Result<(), DbError> {
     if !well_formed(token) {
         return Ok(());
     }
-    sqlx::query("DELETE FROM sessions WHERE token_sha256 = $1")
+    sqlx::query("DELETE FROM sessions WHERE token_sha256 = $1 AND principal_kind = $2")
         .bind(digest(token))
-        .execute(db.pool())
+        .bind(kind.as_str())
+        .execute(executor)
         .await?;
     Ok(())
 }

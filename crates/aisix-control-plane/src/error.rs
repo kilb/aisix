@@ -66,6 +66,16 @@ impl ApiError {
         Self::new(StatusCode::FORBIDDEN, "forbidden", "没有执行此操作的权限")
     }
 
+    /// A member of a tenant that is pending approval or suspended, on a
+    /// route only an active tenant may use.
+    pub fn tenant_not_active() -> ApiError {
+        Self::new(
+            StatusCode::FORBIDDEN,
+            "tenant_not_active",
+            "租户尚未开通或已停用",
+        )
+    }
+
     pub fn not_found() -> ApiError {
         Self::new(StatusCode::NOT_FOUND, "not_found", "资源不存在")
     }

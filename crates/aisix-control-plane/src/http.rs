@@ -19,14 +19,14 @@ use axum::extract::{DefaultBodyLimit, FromRequest, MatchedPath, Request};
 use axum::http::{header, HeaderValue, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{any, get, patch, post};
+use axum::routing::{any, delete, get, patch, post};
 use axum::{Json, Router};
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 
 use crate::auth::{MemberRole, OperatorRole};
 use crate::error::{ApiError, Detail};
-use crate::{audit, dp, gateways, operators, resources, tenants, AppState};
+use crate::{audit, dp, gateways, members, operators, resources, tenants, AppState};
 
 /// The largest request body either listener reads.
 const MAX_BODY_BYTES: usize = 1 << 20;
@@ -42,7 +42,8 @@ pub enum MinRole {
     Public,
     /// An operator with this role or a higher one (`OperatorAuth`).
     Op(OperatorRole),
-    /// A member of an active tenant with one of these roles (`MemberAuth`).
+    /// A member with one of these roles (`MemberAuth`), of an active tenant
+    /// unless the route is one of [`INACTIVE_TENANT_ROUTES`].
     Member(&'static [MemberRole]),
     /// A gateway, by its client certificate (`DpIdentity`). Only the
     /// gateway listener serves these rows.
@@ -55,7 +56,8 @@ pub enum MinRole {
 /// `every_route_checks_identity` fails when a mounted route has no row, a
 /// row names no mounted route, or a handler lacks the extractor its row
 /// implies or the role check its row names; `tests/roles.rs` sends every
-/// operator route as the role just below its minimum.
+/// operator route as the role just below its minimum, and every member
+/// route as each role its row does not name.
 pub const ROUTE_ROLES: &[(&str, &str, MinRole)] = &[
     ("GET", "/healthz", MinRole::Public),
     ("POST", "/admin/login", MinRole::Public),
@@ -173,12 +175,66 @@ pub const ROUTE_ROLES: &[(&str, &str, MinRole)] = &[
         "/admin/provider-groups",
         MinRole::Op(OperatorRole::Viewer),
     ),
+    // Tenant members, as operators see them.
+    (
+        "GET",
+        "/admin/tenants/{id}/members",
+        MinRole::Op(OperatorRole::Viewer),
+    ),
+    (
+        "POST",
+        "/admin/tenants/{id}/invites",
+        MinRole::Op(OperatorRole::Operator),
+    ),
+    (
+        "PATCH",
+        "/admin/members/{id}",
+        MinRole::Op(OperatorRole::Operator),
+    ),
+    // The tenant API.
+    ("POST", "/api/signup", MinRole::Public),
+    ("POST", "/api/login", MinRole::Public),
+    ("POST", "/api/logout", MinRole::Public),
+    ("GET", "/api/session", MinRole::Public),
+    ("POST", "/api/invites/accept", MinRole::Public),
+    ("POST", "/api/password", MinRole::Member(EVERY_MEMBER)),
+    ("GET", "/api/org", MinRole::Member(EVERY_MEMBER)),
+    ("GET", "/api/models", MinRole::Member(EVERY_MEMBER)),
+    ("GET", "/api/members", MinRole::Member(MANAGERS)),
+    ("GET", "/api/members/invites", MinRole::Member(MANAGERS)),
+    ("POST", "/api/members/invites", MinRole::Member(MANAGERS)),
+    (
+        "DELETE",
+        "/api/members/invites/{id}",
+        MinRole::Member(MANAGERS),
+    ),
+    ("PATCH", "/api/members/{id}", MinRole::Member(MANAGERS)),
+    ("DELETE", "/api/members/{id}", MinRole::Member(MANAGERS)),
     // Gateways, on the gateway listener.
     ("POST", "/dp/heartbeat", MinRole::Dp),
     ("ANY", "/dp/store/v1/{*rest}", MinRole::Dp),
 ];
 
-/// `/healthz` (no session), `/admin/*` and, as they are added, `/api/*`.
+/// Every tenant role.
+const EVERY_MEMBER: &[MemberRole] = &[
+    MemberRole::Owner,
+    MemberRole::Admin,
+    MemberRole::Member,
+    MemberRole::Billing,
+];
+
+/// The tenant roles that manage members.
+const MANAGERS: &[MemberRole] = &[MemberRole::Owner, MemberRole::Admin];
+
+/// The member routes a member of a tenant that is not active (pending
+/// approval, or suspended) may still call, to see the tenant's state and
+/// keep their own account; on every other member route they get `403
+/// tenant_not_active`. `every_route_checks_identity` holds each handler to
+/// this list.
+pub const INACTIVE_TENANT_ROUTES: &[(&str, &str)] =
+    &[("POST", "/api/password"), ("GET", "/api/org")];
+
+/// `/healthz` (no session), `/admin/*` and `/api/*`.
 pub fn browser_router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
@@ -229,6 +285,27 @@ pub fn browser_router(state: AppState) -> Router {
             get(tenants::get_defaults).put(tenants::put_defaults),
         )
         .route("/admin/provider-groups", get(tenants::provider_groups))
+        .route("/admin/tenants/{id}/members", get(members::admin_list))
+        .route("/admin/tenants/{id}/invites", post(members::admin_invite))
+        .route("/admin/members/{id}", patch(members::admin_update))
+        .route("/api/signup", post(members::signup))
+        .route("/api/login", post(members::login))
+        .route("/api/logout", post(members::logout))
+        .route("/api/session", get(members::session))
+        .route("/api/invites/accept", post(members::accept_invite))
+        .route("/api/password", post(members::change_password))
+        .route("/api/org", get(members::org))
+        .route("/api/models", get(members::models))
+        .route("/api/members", get(members::list))
+        .route(
+            "/api/members/invites",
+            get(members::list_invites).post(members::invite),
+        )
+        .route("/api/members/invites/{id}", delete(members::revoke_invite))
+        .route(
+            "/api/members/{id}",
+            patch(members::update).delete(members::remove),
+        )
         .route_layer(axum::middleware::from_fn(only_listed_routes))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(state)
@@ -342,7 +419,7 @@ async fn healthz() -> Json<Value> {
 mod tests {
     use std::path::Path;
 
-    use super::{MinRole, ROUTE_ROLES};
+    use super::{MinRole, INACTIVE_TENANT_ROUTES, ROUTE_ROLES};
 
     /// The part of `src` before its test module.
     fn production(src: &str) -> &str {
@@ -516,6 +593,32 @@ mod tests {
                     "{method} {path}: {handler} must call {check}, the role its ROUTE_ROLES row names"
                 );
             }
+            if let MinRole::Member(roles) = min {
+                // Compared without whitespace, so rustfmt may wrap the list.
+                let compact: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+                let names: Vec<String> =
+                    roles.iter().map(|r| format!("MemberRole::{r:?}")).collect();
+                let check = format!(".require(&[{}])", names.join(","));
+                assert!(
+                    compact.replace(",])", "])").contains(&check),
+                    "{method} {path}: {handler} must call {check}, the roles its ROUTE_ROLES row names"
+                );
+                let open = INACTIVE_TENANT_ROUTES.contains(&(method.as_str(), path.as_str()));
+                assert_eq!(
+                    body.contains(".require_active()"),
+                    !open,
+                    "{method} {path}: {handler} must call .require_active() unless the route is in \
+                     INACTIVE_TENANT_ROUTES, and only then"
+                );
+            }
+        }
+        for (method, path) in INACTIVE_TENANT_ROUTES {
+            assert!(
+                ROUTE_ROLES.iter().any(|(m, p, min)| m == method
+                    && p == path
+                    && matches!(min, MinRole::Member(_))),
+                "{method} {path} is in INACTIVE_TENANT_ROUTES but is no member route"
+            );
         }
     }
 

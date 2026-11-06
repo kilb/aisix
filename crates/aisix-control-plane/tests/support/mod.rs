@@ -10,6 +10,8 @@
 // Each test binary uses a different part of this module.
 #![allow(dead_code)]
 
+pub mod members;
+
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

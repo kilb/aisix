@@ -74,7 +74,7 @@ impl TenantStatus {
         }
     }
 
-    fn parse(s: &str) -> Option<TenantStatus> {
+    pub(crate) fn parse(s: &str) -> Option<TenantStatus> {
         [
             TenantStatus::Pending,
             TenantStatus::Active,
@@ -737,7 +737,7 @@ pub async fn refuse_ungrantable_reshape(
 
 /// The tenant name to store: trimmed, 1 to 128 characters, no control
 /// characters.
-fn tenant_name(raw: &str) -> Result<String, Detail> {
+pub(crate) fn tenant_name(raw: &str) -> Result<String, Detail> {
     let name = raw.trim();
     if name.is_empty() {
         return Err(detail("/name", "名称不能为空"));
@@ -841,9 +841,9 @@ pub struct TenantView {
     allowed_model_ids: Vec<Uuid>,
     allowed_provider_groups: Vec<String>,
     limits: TenantLimits,
-    /// Members and keys arrive with the member and key tasks; until then a
-    /// tenant has none.
+    /// Members that are not removed, disabled ones included.
     member_count: i64,
+    /// Keys arrive with the key task; until then a tenant has none.
     key_count: i64,
     version: i64,
     created_at: DateTime<Utc>,
@@ -860,11 +860,22 @@ async fn views(
 ) -> Result<Vec<TenantView>, ApiError> {
     let owners: Vec<String> = tenants.iter().map(|t| owner(t.id)).collect();
     let mut rows: BTreeMap<String, Vec<ResourceRow>> = BTreeMap::new();
-    for row in store::owned_by(conn, &owners).await? {
+    for row in store::owned_by(&mut *conn, &owners).await? {
         if let Some(owner) = row.managed_by.clone() {
             rows.entry(owner).or_default().push(row);
         }
     }
+    let ids: Vec<Uuid> = tenants.iter().map(|t| t.id).collect();
+    let member_counts: BTreeMap<Uuid, i64> = sqlx::query_as::<_, (Uuid, i64)>(
+        "SELECT tenant_id, count(*) FROM members \
+         WHERE tenant_id = ANY($1) AND removed_at IS NULL GROUP BY tenant_id",
+    )
+    .bind(&ids)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(DbError::from)?
+    .into_iter()
+    .collect();
     Ok(tenants
         .into_iter()
         .map(|t| {
@@ -881,7 +892,7 @@ async fn views(
                 allowed_model_ids: t.allowed_model_ids,
                 allowed_provider_groups: t.allowed_provider_groups,
                 limits: t.limits,
-                member_count: 0,
+                member_count: member_counts.get(&t.id).copied().unwrap_or(0),
                 key_count: 0,
                 version: t.version,
                 created_at: t.created_at,
