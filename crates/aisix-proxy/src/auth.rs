@@ -383,19 +383,7 @@ where
     let family = crate::endpoint_acl::endpoint_family(parts.uri.path())
         .unwrap_or(aisix_core::models::EndpointFamily::Unknown);
     if let Err(err) = crate::endpoint_acl::check_endpoint(authed.key(), family) {
-        // The access-log line carries no key id, so this is the record of
-        // which key was refused, as `deny_key` is for a disabled one.
-        tracing::warn!(
-            target: "aisix::auth",
-            reason = "endpoint_forbidden",
-            api_key_id = %authed.entry.id,
-            family = ?family,
-            http_method = %ctx.method,
-            path = %ctx.path,
-            request_id = %aisix_core::LogValue(ctx.request_id),
-            source_ip = %ctx.source_ip.resolve(),
-            "refused a request outside the key's allowed endpoints",
-        );
+        warn_endpoint_refused(&authed.entry.id, family, ctx);
         return Err(err);
     }
     // Publish the resolved key so extractors that run after this one can
@@ -542,6 +530,29 @@ fn deny_key(
         );
     }
     err
+}
+
+/// Name the key a route refused under its `allowed_endpoints`, on the
+/// `aisix::auth` line, as [`deny_key`] names a disabled one: the access-log
+/// line of an extractor refusal carries no key id, so this is the record of
+/// which key it was. Called by the extractor and by `/v1/realtime`, which
+/// authenticates without it.
+pub(crate) fn warn_endpoint_refused(
+    api_key_id: &str,
+    family: aisix_core::models::EndpointFamily,
+    ctx: DenialContext<'_>,
+) {
+    tracing::warn!(
+        target: "aisix::auth",
+        reason = "endpoint_forbidden",
+        api_key_id = %api_key_id,
+        family = ?family,
+        http_method = %ctx.method,
+        path = %ctx.path,
+        request_id = %aisix_core::LogValue(ctx.request_id),
+        source_ip = %ctx.source_ip.resolve(),
+        "refused a request outside the key's allowed endpoints",
+    );
 }
 
 /// Dedicated header for the caller's gateway credential. When present it

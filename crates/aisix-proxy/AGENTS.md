@@ -349,6 +349,12 @@ if you stop there:
    missing from it is a route the tests cannot check.
 4. The route table in `tests/e2e/src/cases/metric-endpoint-parity-e2e.test.ts`
    — see the next section.
+5. The endpoint-family census in `endpoint_acl.rs` (`ROUTES` in its tests) and
+   `endpoint_acl::endpoint_family`, which decide what a key's
+   `allowed_endpoints` gates the route under. A new route fails the census
+   until it declares a family, or an exemption with the reason it takes no
+   key. A route that takes a key and is missing from the map refuses every
+   restricted key, so the gap fails closed rather than open.
 
 ## Every client-facing route emits every per-request metric family
 
@@ -562,7 +568,7 @@ Platform mode is a property of each exit, and a missed exit fails silently: noth
 
 ### Known follow-ups
 
-These surfaces are not adapted. Until each is, a platform deployment must not let tenant keys reach it.
+These surfaces are not adapted. A platform deployment confines tenant keys to the tenant endpoints with `allowed_endpoints`, listing the families `chat_completions`, `messages`, `count_tokens`, `responses`, `embeddings` and `models`; a tenant key is then refused on every surface below with `403` before any upstream call (`endpoint_acl`). Until a surface is adapted, its family stays off tenant keys.
 
 - `/v1/completions` returns the upstream's `id` and `system_fingerprint`.
 - Realtime frames inside an established session (connect failures, relayed upstream `error` events) are not classed, because the session runs outside the request's attribution scope. Realtime and `/v1/audio/speech` voice ids are not checked as stored objects.
