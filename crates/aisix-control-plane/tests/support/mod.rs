@@ -23,7 +23,7 @@ use aisix_control_plane::settings::EnvSettings;
 use aisix_control_plane::{AppState, Running};
 use serde_json::Value;
 use sqlx::{Connection, PgConnection};
-use tokio::sync::OnceCell;
+use tokio::sync::{OnceCell, Semaphore, SemaphorePermit};
 use uuid::Uuid;
 
 /// The master key every test control plane runs with.
@@ -139,7 +139,14 @@ struct TestDatabase {
     server_url: String,
     name: String,
     url: String,
+    // Released after `drop` has dropped the database.
+    _slot: SemaphorePermit<'static>,
 }
+
+/// How many test databases exist at once in one test process: each control
+/// plane holds several connections, and a server's `max_connections` is
+/// shared by every test binary running beside this one.
+static DATABASE_SLOTS: Semaphore = Semaphore::const_new(8);
 
 impl Drop for TestDatabase {
     fn drop(&mut self) {
@@ -484,9 +491,14 @@ impl Drop for TempFile {
 }
 
 /// A fresh database cloned from the migrated template, or `None` when
-/// `CP_TEST_DATABASE_URL` is unset (outside CI).
+/// `CP_TEST_DATABASE_URL` is unset (outside CI). Waits while
+/// [`DATABASE_SLOTS`] are all taken.
 async fn new_database() -> Option<Arc<TestDatabase>> {
     let server_url = gate_var("CP_TEST_DATABASE_URL")?;
+    let slot = DATABASE_SLOTS
+        .acquire()
+        .await
+        .expect("the database slots are never closed");
     let template = TEMPLATE
         .get_or_init(|| ensure_template(&server_url))
         .await
@@ -505,6 +517,7 @@ async fn new_database() -> Option<Arc<TestDatabase>> {
         url: with_database(&server_url, &name),
         server_url,
         name,
+        _slot: slot,
     }))
 }
 

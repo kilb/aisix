@@ -121,6 +121,11 @@ pub const ROUTE_ROLES: &[(&str, &str, MinRole)] = &[
         "/admin/rollout/reconcile",
         MinRole::Op(OperatorRole::Admin),
     ),
+    (
+        "POST",
+        "/admin/rollout/ownership",
+        MinRole::Op(OperatorRole::Admin),
+    ),
 ];
 
 /// `/healthz` (no session), `/admin/*` and, as they are added, `/api/*`.
@@ -158,6 +163,7 @@ pub fn browser_router(state: AppState) -> Router {
                 .delete(resources::api::delete),
         )
         .route("/admin/rollout/reconcile", post(projector::post_reconcile))
+        .route("/admin/rollout/ownership", post(projector::post_ownership))
         .route_layer(axum::middleware::from_fn(only_listed_routes))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(state)
