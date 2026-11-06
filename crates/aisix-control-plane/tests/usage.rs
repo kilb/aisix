@@ -17,6 +17,10 @@ use aisix_control_plane::auth::OperatorRole;
 use aisix_control_plane::dp::telemetry::{
     BODY_READ_WAIT, MAX_BODIES_IN_FLIGHT, MAX_EVENTS_PER_BATCH, SLOT_WAIT,
 };
+use bytes::Bytes;
+use http_body_util::{BodyExt, Full};
+use hyper::client::conn::http1::SendRequest;
+use hyper_util::rt::TokioIo;
 use serde_json::{json, Value};
 use sqlx::{Connection, PgConnection};
 use support::{Bundle, DpClient, Resp, TestCp};
@@ -1293,5 +1297,111 @@ async fn a_body_that_stops_arriving_gives_its_slot_back() {
     let r = queued.await.expect("the queued delivery");
     assert_eq!(answer(&r), (200, counts(1, 0, 0)), "{r:?}");
     assert_eq!(batch_row(&cp, b).await, Some((1, 1, 0, 0, 1)));
+    assert_eq!(cp.count("usage_batches").await, 1);
+}
+
+/// Sends one batch over `sender`'s connection, as the gateway sends it:
+/// `(status, headers, body)`.
+async fn deliver_on(
+    sender: &mut SendRequest<Full<Bytes>>,
+    batch_id: Uuid,
+    body: &Value,
+) -> (u16, hyper::HeaderMap, Value) {
+    sender.ready().await.expect("the connection is still open");
+    let request = hyper::Request::builder()
+        .method("POST")
+        .uri("/dp/telemetry")
+        .header("host", "localhost")
+        .header("content-type", "application/json")
+        .header("x-aisix-usage-batch-id", batch_id.to_string())
+        .body(Full::new(Bytes::from(
+            serde_json::to_vec(body).expect("serialize the batch"),
+        )))
+        .expect("a request");
+    let response = sender
+        .send_request(request)
+        .await
+        .expect("an answer on the same connection");
+    let status = response.status().as_u16();
+    let headers = response.headers().clone();
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("read the body")
+        .to_bytes();
+    (
+        status,
+        headers,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+/// `/dp/telemetry` is a gateway route like `/dp/heartbeat`: a credential
+/// revoked while its gateway stays connected is refused on that same
+/// connection. The refusal is a 403 that carries the dedup header and
+/// `Connection: close`, stores nothing, and the connection ends with it.
+#[tokio::test]
+async fn a_revoked_gateways_usage_is_refused_and_its_connection_closed() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let admin = cp.admin_login_seeded(OperatorRole::Admin).await;
+    let bundle = cp.issue_bundle(&admin, "gw-usage-7c1").await;
+    let tls = raw_dp_connection(&cp, &bundle).await;
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tls))
+        .await
+        .expect("an HTTP/1.1 connection");
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    let (status, _, body) = deliver_on(&mut sender, Uuid::new_v4(), &batch(&["kept-7c1"])).await;
+    assert_eq!((status, body), (200, counts(1, 0, 0)));
+
+    let r = cp
+        .send(
+            "POST",
+            &format!("/admin/gateways/credentials/{}/revoke", bundle.dp_id),
+            Some(admin.cookie()),
+            None,
+        )
+        .await;
+    assert_eq!(r.status, 200, "{r:?}");
+    // Until the revoke is known, on another connection and a route that
+    // stores nothing: the held one stays as it was.
+    let other = cp.dp_client(&bundle);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while other
+        .send("GET", "/dp/store/v1/ns/k-7c1", None)
+        .await
+        .status
+        != 403
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "still accepted 5 s after the revoke"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let refused = Uuid::new_v4();
+    let (status, headers, body) = deliver_on(&mut sender, refused, &batch(&["refused-7c1"])).await;
+    assert_eq!(status, 403, "{body}");
+    assert_eq!(body["code"], "forbidden");
+    let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+    assert_eq!(header("connection"), Some("close"), "{headers:?}");
+    assert_eq!(header(DEDUP), Some("1"), "{headers:?}");
+    // The connection ends with that answer.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    while !sender.is_closed() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the connection stayed open after the 403"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // Nothing of the refused batch was stored.
+    assert_eq!(batch_row(&cp, refused).await, None);
+    assert_eq!(cp.count("usage_events").await, 1);
     assert_eq!(cp.count("usage_batches").await, 1);
 }
