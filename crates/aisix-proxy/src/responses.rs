@@ -397,14 +397,17 @@ pub async fn responses(
     let affinity = match state.platform() {
         Some(platform) => {
             let owner = crate::platform::tenant_owner(&auth);
-            let affinity = crate::responses_affinity::ContextAffinity::unwrap_sealed_request(
+            let mut affinity = crate::responses_affinity::ContextAffinity::unwrap_sealed_request(
                 &mut body,
                 crate::responses_affinity::TenantSeal::new(platform, &owner),
             );
             // The item ids a client echoes from an earlier answer leave here
             // sealed; the upstream gets back the ones it issued, for the
-            // tenant they were handed to only.
-            crate::opaque_id::unseal_responses_input(platform, &owner, &mut body);
+            // tenant they were handed to only. An item reference that names
+            // anything else is refused below, with the other stored objects.
+            affinity.note_unopened_item_reference(crate::opaque_id::unseal_responses_input(
+                platform, &owner, &mut body,
+            ));
             affinity
         }
         None => crate::responses_affinity::ContextAffinity::unwrap_request(&mut body),
@@ -839,6 +842,7 @@ async fn dispatch(
     // Platform mode: nothing the request names may be an object stored
     // upstream for another tenant.
     crate::stored_refs::refuse_in_responses(state.platform(), body)?;
+    affinity.refuse_unopened_item_reference()?;
 
     // Platform mode: a continuation names a response this tenant was handed,
     // served by a target the key's provider groups still hold. Anything else
@@ -10750,6 +10754,58 @@ data: [DONE]\n\n";
             .into_response()
         });
         status_and_body(resp).await
+    }
+
+    /// An item reference that is not the caller's own seal is refused as a
+    /// reference to an object stored upstream, naming the field, and never
+    /// reaches the upstream; the tenant's own reaches it as the upstream's id.
+    #[tokio::test]
+    async fn platform_mode_refuses_an_item_reference_that_is_not_the_callers_own() {
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "resp_next", "object": "response", "output": []
+            })))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        let app = build_platform_app(two_tenants(&upstream.uri()));
+        let item_key = crate::opaque_id::seal_key(
+            &crate::platform::PlatformSettings::from_secret(PLATFORM_SECRET).id_key,
+        );
+        let sealed = crate::opaque_id::seal_id(&item_key, TENANT_A, "msg_up_1");
+        let referencing = |id: &str| {
+            serde_json::json!({"model": "gpt-4o-resp", "input": [
+                {"role": "user", "content": "go on"},
+                {"type": "item_reference", "id": id},
+            ]})
+        };
+
+        for (key, id) in [
+            (TENANT_B_PLAINTEXT, sealed.as_str()),
+            ("sk-caller", "msg_up_1"),
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(request_as(key, referencing(id)))
+                .await
+                .unwrap();
+            let (status, body) = status_and_body(resp).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{id}");
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["error"]["param"], "input[1].id", "{body}");
+            assert!(!body.to_string().contains(id), "{body}");
+        }
+
+        let resp = app
+            .oneshot(request_as("sk-caller", referencing(&sealed)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let sent: Value =
+            serde_json::from_slice(&upstream.received_requests().await.unwrap()[0].body).unwrap();
+        assert_eq!(sent["input"][1]["id"], "msg_up_1");
     }
 
     #[tokio::test]

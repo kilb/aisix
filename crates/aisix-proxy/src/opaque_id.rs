@@ -238,26 +238,20 @@ const MIN_SEALED_LEN: usize = ((aead::NONCE_LEN + SEAL_BUCKET + aead::MAX_TAG_LE
 /// `id`, a `0x80` marker, then zeros up to the bucket (ISO/IEC 7816-4
 /// padding): unambiguous for any id, of any length, at one byte's cost.
 pub(crate) fn pad(id: &str) -> Vec<u8> {
-    pad_after("", id)
+    pad_to(id, SEAL_BUCKET)
 }
 
-/// [`pad`] for an id behind a fixed `head`: `head || id`, padded to a
-/// multiple of [`SEAL_BUCKET`] that leaves the id a whole bucket of its own,
-/// so every id up to 63 bytes behind the same head pads to one length. With
-/// no head this is exactly [`pad`]'s bucket.
-pub(crate) fn pad_after(head: &str, id: &str) -> Vec<u8> {
-    let padded_len = (head.len() + (id.len() + 1).div_ceil(SEAL_BUCKET) * SEAL_BUCKET)
-        .div_ceil(SEAL_BUCKET)
-        * SEAL_BUCKET;
+/// [`pad`] to a multiple of `bucket` rather than of [`SEAL_BUCKET`].
+pub(crate) fn pad_to(data: &str, bucket: usize) -> Vec<u8> {
+    let padded_len = (data.len() + 1).div_ceil(bucket) * bucket;
     let mut out = Vec::with_capacity(padded_len + aead::MAX_TAG_LEN);
-    out.extend_from_slice(head.as_bytes());
-    out.extend_from_slice(id.as_bytes());
+    out.extend_from_slice(data.as_bytes());
     out.push(0x80);
     out.resize(padded_len, 0);
     out
 }
 
-/// The bytes [`pad`] or [`pad_after`] padded; `None` when they do not end in
+/// The bytes [`pad`] or [`pad_to`] padded; `None` when they do not end in
 /// the marker and zeros.
 pub(crate) fn unpad(padded: &[u8]) -> Option<&[u8]> {
     let marker = padded.iter().rposition(|&b| b != 0)?;
@@ -588,6 +582,12 @@ pub(crate) fn responses_event_id_kind(path: &[PathSeg]) -> Option<IdKind> {
 /// an id this key did not seal to `owner` — one the client made, or one
 /// sealed to another tenant — passes untouched.
 ///
+/// Answers the index of the first `item_reference` whose `id` did not
+/// unseal, for the handler to refuse ([`is_item_reference`]): an item
+/// reference has the upstream resolve an item it stored, so one that names
+/// anything but this tenant's own seal names an item of the shared account
+/// the tenant was never handed.
+///
 /// Responses cannot take a substitute id the way Chat Completions and
 /// Messages can, for two reasons, neither stated in the API reference but
 /// both in the API's own error text:
@@ -613,12 +613,13 @@ pub(crate) fn unseal_responses_input(
     platform: &crate::platform::PlatformSettings,
     owner: &str,
     body: &mut Value,
-) {
-    let Some(items) = body.get_mut("input").and_then(Value::as_array_mut) else {
-        return;
-    };
+) -> Option<usize> {
+    let items = body.get_mut("input").and_then(Value::as_array_mut)?;
     let mut sealer: Option<Sealer> = None;
-    for item in items {
+    let mut unopened_reference = None;
+    for (index, item) in items.iter_mut().enumerate() {
+        let reference = is_item_reference(item);
+        let mut opened = false;
         for_each_item_id(item, |kind, slot| {
             if slot.len() < MIN_SEALED_LEN {
                 return;
@@ -626,8 +627,26 @@ pub(crate) fn unseal_responses_input(
             let sealer = sealer.get_or_insert_with(|| Sealer::of(platform, owner));
             if let Some(original) = sealer.unseal(kind, slot) {
                 *slot = original;
+                opened = true;
             }
         });
+        if reference && !opened && unopened_reference.is_none() {
+            unopened_reference = Some(index);
+        }
+    }
+    unopened_reference
+}
+
+/// Whether an `input[]` item is an item reference: `type` is
+/// `item_reference`, or it has no `type` and no `role`, the one item whose
+/// `type` is optional and that has no role (openai-python
+/// `types/responses/response_input_item_param.py`, `ItemReference`: "`id`:
+/// The ID of the item to reference", `type: Optional[Literal["item_reference"]]`).
+fn is_item_reference(item: &Value) -> bool {
+    match item.get("type") {
+        Some(Value::String(t)) => t == "item_reference",
+        None | Some(Value::Null) => item.get("role").is_none() && item.get("id").is_some(),
+        Some(_) => false,
     }
 }
 
@@ -1105,15 +1124,11 @@ pub(crate) mod tests {
         assert_eq!(pad("").len(), SEAL_BUCKET);
         assert_eq!(pad(&"a".repeat(63)).len(), SEAL_BUCKET);
         assert_eq!(pad(&"a".repeat(64)).len(), 2 * SEAL_BUCKET);
-        // Behind a head, the id still gets a whole bucket of its own.
-        let head = "h".repeat(83);
-        assert_eq!(pad_after(&head, "").len(), 3 * SEAL_BUCKET);
-        assert_eq!(pad_after(&head, &"a".repeat(63)).len(), 3 * SEAL_BUCKET);
-        assert_eq!(pad_after(&head, &"a".repeat(64)).len(), 4 * SEAL_BUCKET);
-        assert_eq!(
-            unpad(&pad_after(&head, "ab")),
-            Some(format!("{head}ab").as_bytes())
-        );
+        // Another bucket size pads the same way.
+        assert_eq!(pad_to("", 128).len(), 128);
+        assert_eq!(pad_to(&"h".repeat(127), 128).len(), 128);
+        assert_eq!(pad_to(&"h".repeat(128), 128).len(), 256);
+        assert_eq!(unpad(&pad_to("ab", 128)), Some(&b"ab"[..]));
         // No marker, or something after it, is not padding.
         assert_eq!(unpad(&[b'a', 0, 0]), None);
         assert_eq!(unpad(&[b'a', 0x80, 1, 0]), None);
@@ -1407,6 +1422,66 @@ pub(crate) mod tests {
         assert_eq!(sealer.seal(IdKind::Item, "msg_2"), msg_2);
         assert_eq!(sealer.seal(IdKind::Item, "fc_bdrk_1"), first);
         assert_eq!(made() - before, 4);
+    }
+
+    /// An item reference has the upstream resolve an item it stored, so the
+    /// walk reports the first one whose id is not this tenant's own seal:
+    /// another tenant's, a bare upstream id, or one too short to be a seal,
+    /// with or without its optional `type`.
+    #[test]
+    fn an_item_reference_that_does_not_unseal_is_reported() {
+        let platform = crate::platform::PlatformSettings::from_secret("s");
+        let k = seal_key(&platform.id_key);
+        let own = seal_id(&k, T, "msg_bdrk_1");
+        let run = |input: Value| {
+            let mut body = json!({"model": "m", "input": input});
+            let found = unseal_responses_input(&platform, T, &mut body);
+            (found, body)
+        };
+
+        // The tenant's own reference opens, typed or not.
+        let (found, body) = run(json!([
+            {"role": "user", "content": "hi"},
+            {"type": "item_reference", "id": own},
+            {"id": own},
+        ]));
+        assert_eq!(found, None);
+        assert_eq!(body["input"][1]["id"], "msg_bdrk_1");
+        assert_eq!(body["input"][2]["id"], "msg_bdrk_1");
+
+        for (input, at) in [
+            (
+                json!([{"type": "item_reference", "id": seal_id(&k, "team-b", "msg_bdrk_1")}]),
+                0,
+            ),
+            (
+                json!([{"role": "user", "content": "hi"}, {"type": "item_reference", "id": "msg_bdrk_1"}]),
+                1,
+            ),
+            (json!([{"id": "msg_bdrk_1"}]), 0),
+            (json!([{"type": "item_reference", "id": ""}]), 0),
+            // A call seal is not an item's.
+            (
+                json!([{"type": "item_reference", "id": seal_call(&k, T, "msg_bdrk_1")}]),
+                0,
+            ),
+            // The first that does not open is the one named.
+            (
+                json!([{"type": "item_reference", "id": own}, {"id": "x"}, {"id": "y"}]),
+                1,
+            ),
+        ] {
+            assert_eq!(run(input.clone()).0, Some(at), "{input}");
+        }
+
+        // Anything that is not a reference is not reported, whatever its id.
+        let (found, _) = run(json!([
+            {"type": "message", "role": "assistant", "id": "msg_client", "content": []},
+            {"role": "user", "id": "msg_x", "content": "hi"},
+            {"type": "function_call", "id": "fc_x", "call_id": "call_x", "name": "f", "arguments": "{}"},
+        ]));
+        assert_eq!(found, None);
+        assert_eq!(run(json!("hi")).0, None);
     }
 
     /// A body of many items whose ids are too short to be seals is one walk:

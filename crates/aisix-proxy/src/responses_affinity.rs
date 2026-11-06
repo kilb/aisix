@@ -50,6 +50,11 @@ const RESP_ID_AAD: &[u8] = b"aisix-responses-v2";
 /// Associated data of a sealed ciphertext tag, so neither kind of seal opens
 /// as the other.
 const ENC_AAD: &[u8] = b"aisix-encrypted-content-v2";
+/// The bucket a sealed plaintext's head is padded to: 128 bytes holds the
+/// tag, an owner that names a team or key by UUID and a target id of up to
+/// 75 bytes, so every target of a deployment (UUIDs, in managed and file
+/// mode alike) seals to one length.
+const HEAD_BUCKET: usize = 2 * crate::opaque_id::SEAL_BUCKET;
 
 fn b64() -> base64::engine::GeneralPurpose {
     base64::engine::general_purpose::URL_SAFE_NO_PAD
@@ -65,9 +70,10 @@ pub(crate) fn response_id_key(id_key: &[u8; 32]) -> [u8; 32] {
 /// A response id sealed to `owner`: `resp_` + base64url(`nonce || ciphertext
 /// || tag`), the AES-256-GCM encryption of
 /// `aisix:v2;<owner>;<target_id>;<upstream_id>` under a random nonce. The
-/// plaintext is padded so the upstream id gets a whole bucket of the size
-/// item ids use ([`crate::opaque_id::pad_after`]): the id's length does not
-/// tell one upstream's id format from another's.
+/// head (`aisix:v2;<owner>;<target_id>;`) is padded to a bucket of its own
+/// ([`HEAD_BUCKET`]), and the upstream id to the bucket item ids use
+/// ([`crate::opaque_id::pad`]), so the id's length tells neither which
+/// target served it nor one upstream's id format from another's.
 ///
 /// The one-off form, under a key set up for this call; a request seals under
 /// the cipher the platform settings set up once ([`TenantSeal`]).
@@ -161,10 +167,11 @@ fn seal(
     target_id: &str,
     value: &str,
 ) -> String {
-    let mut sealed = crate::opaque_id::pad_after(
+    let mut sealed = crate::opaque_id::pad_to(
         &format!("{SEALED_TAG}{};{};", escaped(owner), escaped(target_id)),
-        value,
+        HEAD_BUCKET,
     );
+    sealed.extend_from_slice(&crate::opaque_id::pad(value));
     let mut nonce = [0u8; aead::NONCE_LEN];
     // The operating system's random source; there is no id to hand out
     // without it.
@@ -190,7 +197,8 @@ fn open(
     payload: &str,
 ) -> Option<(String, String)> {
     let raw = b64().decode(payload).ok()?;
-    if raw.len() < aead::NONCE_LEN + crate::opaque_id::SEAL_BUCKET + aead::MAX_TAG_LEN {
+    if raw.len() < aead::NONCE_LEN + HEAD_BUCKET + crate::opaque_id::SEAL_BUCKET + aead::MAX_TAG_LEN
+    {
         return None;
     }
     let (nonce, sealed) = raw.split_at(aead::NONCE_LEN);
@@ -202,13 +210,19 @@ fn open(
             &mut buf,
         )
         .ok()?;
-    let text = std::str::from_utf8(crate::opaque_id::unpad(plain)?).ok()?;
-    let (target, value) = text
-        .strip_prefix(SEALED_TAG)?
-        .strip_prefix(&*escaped(owner))?
-        .strip_prefix(';')?
-        .split_once(';')?;
-    let target = unescaped(target)?;
+    // The head ends at the `;` after the target, and its padding at the
+    // bucket that follows; the upstream id is padded on its own after it.
+    let owner_head = format!("{SEALED_TAG}{};", escaped(owner));
+    let rest = plain.strip_prefix(owner_head.as_bytes())?;
+    let target_len = rest.iter().position(|&b| b == b';')?;
+    let head_len = owner_head.len() + target_len + 1;
+    let padded_head = (head_len + 1).div_ceil(HEAD_BUCKET) * HEAD_BUCKET;
+    let (head, value) = (plain.get(..padded_head)?, plain.get(padded_head..)?);
+    if crate::opaque_id::unpad(head)?.len() != head_len {
+        return None;
+    }
+    let target = unescaped(std::str::from_utf8(&rest[..target_len]).ok()?)?;
+    let value = std::str::from_utf8(crate::opaque_id::unpad(value)?).ok()?;
     (!target.is_empty()).then(|| (target, value.to_owned()))
 }
 
@@ -392,6 +406,10 @@ pub(crate) struct ContextAffinity {
     /// Platform mode: the `previous_response_id` names no response this
     /// tenant was handed.
     previous_unknown: bool,
+    /// Platform mode: the index into `input[]` of the first item reference
+    /// whose id is not this tenant's seal
+    /// ([`crate::opaque_id::unseal_responses_input`]).
+    unopened_item_reference: Option<usize>,
 }
 
 impl ContextAffinity {
@@ -471,6 +489,27 @@ impl ContextAffinity {
                 Some(EncryptedContent::Plain) | None => {}
             }
             input.push(item);
+        }
+    }
+
+    /// Platform mode: record what [`crate::opaque_id::unseal_responses_input`]
+    /// found, for [`Self::refuse_unopened_item_reference`].
+    pub(crate) fn note_unopened_item_reference(&mut self, index: Option<usize>) {
+        self.unopened_item_reference = index;
+    }
+
+    /// Platform mode: refuse a request whose `input[]` references an item by
+    /// an id that is not this tenant's own seal: another tenant's, a forged
+    /// one, or a bare upstream id. The upstream would resolve it against
+    /// everything the shared account stored. It is refused like any other
+    /// reference to an object stored upstream, naming the field and never
+    /// the id, and nothing reaches an upstream.
+    pub(crate) fn refuse_unopened_item_reference(&self) -> Result<(), crate::error::ProxyError> {
+        match self.unopened_item_reference {
+            Some(index) => Err(crate::error::ProxyError::StoredObjectReference(format!(
+                "input[{index}].id"
+            ))),
+            None => Ok(()),
         }
     }
 
@@ -1109,6 +1148,38 @@ mod tests {
         for broken in ["%", "%3", "%41", "a%2"] {
             assert_eq!(unescaped(broken), None, "{broken}");
         }
+    }
+
+    /// The length of a sealed id says nothing about the target that served
+    /// it: a short target id and a UUID one, behind an owner of either kind,
+    /// seal to one length, and every one opens to what was sealed.
+    #[test]
+    fn sealed_response_ids_are_one_length_whatever_the_target_id_was() {
+        let k = [3u8; 32];
+        let uuid = "5a9d2c1b-3e4f-4a6b-8c7d-9e0f1a2b3c4d";
+        let mut lengths = Vec::new();
+        for owner in [
+            "team:0c0e5f8a-7a8f-4d2b-9a53-6d1e3f2b4c5d",
+            "key:0c0e5f8a-7a8f-4d2b-9a53-6d1e3f2b4c5d",
+            "team:t",
+        ] {
+            for target in ["m-1", uuid, "gpt-4o-mini-on-a-long-routing-target-name"] {
+                let id = seal_response_id(&k, owner, target, "resp_1");
+                assert_eq!(
+                    open_response_id(&k, owner, &id),
+                    Some((target.to_string(), "resp_1".to_string())),
+                    "{owner} {target}"
+                );
+                lengths.push(id.len());
+            }
+        }
+        assert!(lengths.windows(2).all(|w| w[0] == w[1]), "{lengths:?}");
+        // The ciphertext tag carries the same head, and the same length.
+        let tenant = tenant("team:0c0e5f8a-7a8f-4d2b-9a53-6d1e3f2b4c5d");
+        assert_eq!(
+            tenant.mark_encrypted_content("m-1", "CT").len(),
+            tenant.mark_encrypted_content(uuid, "CT").len()
+        );
     }
 
     /// The length of a sealed id says nothing about the upstream id inside:

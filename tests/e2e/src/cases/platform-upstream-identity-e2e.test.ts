@@ -988,7 +988,9 @@ describe("platform mode e2e: ids name no upstream channel, and tool use still ro
 // upstream account is shared, so an item or call id echoed back is resolved
 // against everything that account stored: echoed by another tenant, it must
 // reach the upstream as the opaque string that tenant sent, which names
-// nothing the upstream has.
+// nothing the upstream has. A reference to a stored item that is not the
+// caller's own id is refused outright, as a reference to another stored
+// object is.
 //
 // The same holds for every other object the shared account stores: a
 // container, a file, a vector store, a conversation, a stored prompt. A
@@ -1409,7 +1411,7 @@ describe("platform mode e2e: a response id continues only for the tenant it was 
     expect(up.otherGroup!.receivedRequests).toHaveLength(otherBefore + 1);
   });
 
-  test("an item id echoed by another tenant reaches the upstream as the opaque string it sent", async (ctx) => {
+  test("an item id echoed by another tenant is refused or reaches the upstream as the opaque string it sent", async (ctx) => {
     if (!etcdReachable || !tenantApp) return void ctx.skip();
     const upstream = up.items!;
     const model = TENANT_ALIASES.items;
@@ -1438,14 +1440,43 @@ describe("platform mode e2e: a response id continues only for the tenant it was 
           { type: "function_call_output", call_id: call.call_id, output: "sunny" },
         ],
       });
+    const refusedParam = (res: { status: number; text: string }) => {
+      expect(res.status, res.text).toBe(400);
+      return JSON.parse(res.text).error?.param;
+    };
 
+    // A reference resolves an item the shared account stored, so one that is
+    // not the caller's own seal is refused naming the field, never the id,
+    // and no upstream hears of it.
     const foreign = await echo(TENANT_KEYS.b);
-    expect(foreign.status, foreign.text).toBe(200);
+    expect(refusedParam(foreign)).toBe("input[0].id");
+    expect(foreign.text).not.toContain(message.id);
+    expect(upstream.receivedRequests).toHaveLength(1);
+    // So is the upstream's own id, which no tenant is ever handed.
+    const bare = await postAs(TENANT_KEYS.a, "/v1/responses", {
+      model,
+      input: [
+        { role: "user", content: "and tomorrow?" },
+        { id: "msg_bdrk_i01" },
+      ],
+    });
+    expect(refusedParam(bare)).toBe("input[1].id");
+    expect(upstream.receivedRequests).toHaveLength(1);
+
+    // A call or item id that is no reference still travels as the opaque
+    // string another tenant sent.
+    const foreignCall = await postAs(TENANT_KEYS.b, "/v1/responses", {
+      model,
+      input: [
+        { type: "function_call", id: call.id, call_id: call.call_id, name: "get_weather", arguments: "{}" },
+        { type: "function_call_output", call_id: call.call_id, output: "sunny" },
+      ],
+    });
+    expect(foreignCall.status, foreignCall.text).toBe(200);
     expect(upstream.receivedRequests).toHaveLength(2);
     const sentForB = upstreamBody(upstream, 1);
-    expect(sentForB.input[0].id).toBe(message.id);
-    expect(sentForB.input[1].id).toBe(call.id);
-    expect(sentForB.input[2].call_id).toBe(call.call_id);
+    expect(sentForB.input[0].id).toBe(call.id);
+    expect(sentForB.input[1].call_id).toBe(call.call_id);
     for (const original of ["msg_bdrk_i01", "fc_bdrk_i01", "call_bdrk_i01"]) {
       expect(upstream.receivedRequests[1]!.body, `tenant B's request names ${original}`).not.toContain(
         original,
