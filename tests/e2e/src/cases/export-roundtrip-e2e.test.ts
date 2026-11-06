@@ -279,6 +279,73 @@ describe("aisix export: etcd → export → file round-trip", () => {
     }
   });
 
+  // A password in a URL is sent as Basic auth, so it is a credential like a
+  // provider key's `api_key`: the export writes it as a placeholder and keeps
+  // the rest of the URL, the file loads once the variable holds it, and the
+  // Admin API shows it redacted.
+  test("a URL password is exported as a placeholder and read back redacted", async (ctx) => {
+    if (!etcdReachable || !upstream) {
+      ctx.skip();
+      return;
+    }
+    const etcd = new EtcdClient();
+    const prefix = `/aisix-export-url-${randomUUID()}`;
+    const seed = new SeedClient(etcd, prefix);
+    const password = "url-password-must-not-leak-9z8y";
+    const targetUrl = upstream.baseUrl.replace("http://", `http://svc:${password}@`) + "/v1";
+    let fileApp: SpawnedApp | undefined;
+    try {
+      const pk = await seed.createProviderKey({
+        display_name: "url-pk",
+        provider: "openai",
+        api_key: "sk-url-secret",
+        api_base: targetUrl,
+      });
+      await seed.createPassthroughRoute({
+        name: "url-route",
+        path_prefix: "/passthrough/url",
+        target_url: targetUrl,
+        provider_key_id: pk.id,
+      });
+
+      const { stdout: yaml } = await execFileP(BIN_PATH, [
+        "export",
+        "--etcd",
+        ETCD_ENDPOINT,
+        "--prefix",
+        prefix,
+      ]);
+      expect(yaml).not.toContain(password);
+      const vars = placeholderVars(yaml);
+      const urlVars = vars.filter((v) => v.endsWith("_PASSWORD"));
+      expect(urlVars).toHaveLength(2);
+      expect(yaml).toContain("http://svc:${");
+
+      fileApp = await spawnApp({
+        admin: true,
+        resourcesFile: yaml,
+        extraEnv: Object.fromEntries(
+          vars.map((v) => [v, urlVars.includes(v) ? password : "sk-url-secret"]),
+        ),
+      });
+      const read = async (path: string) => {
+        const res = await fetch(`${fileApp!.adminUrl}${path}`, {
+          headers: { authorization: `Bearer ${fileApp!.adminKey}` },
+        });
+        expect(res.status).toBe(200);
+        return res.text();
+      };
+      for (const path of ["/admin/v1/provider_keys", "/admin/v1/passthrough_routes"]) {
+        const body = await read(path);
+        expect(body).not.toContain(password);
+        expect(body).toContain("svc:[REDACTED]@");
+      }
+    } finally {
+      await fileApp?.exit();
+      await etcd.deletePrefix(prefix);
+    }
+  });
+
   test("an MCP policy the file cannot carry fails the export and names itself", async (ctx) => {
     if (!etcdReachable) {
       ctx.skip();

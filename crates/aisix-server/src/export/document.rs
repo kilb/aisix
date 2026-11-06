@@ -364,7 +364,16 @@ pub fn build_export_document(snapshot: &AisixSnapshot, reveal_secrets: bool) -> 
             |doc, identity, diag| {
                 resugar_route_keys(doc, identity, &provider_key_names, &api_key_names, diag)
             },
-            |_, _| {},
+            |doc, identity| {
+                let mut ctx = RedactionCtx {
+                    kind_token: "PASSTHROUGH_ROUTE",
+                    kind: "passthrough_routes",
+                    identity,
+                    reveal: reveal_secrets,
+                    out: &mut placeholders,
+                };
+                redact_credentials(doc, CredentialKind::PassthroughRoute, &mut ctx);
+            },
         ),
     );
 

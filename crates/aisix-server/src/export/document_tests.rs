@@ -1723,3 +1723,107 @@ fn team_and_user_documents_are_reported_not_dropped_silently() {
         .warnings
         .is_empty());
 }
+
+/// A password in a URL is a credential like any other: the HTTP client sends it
+/// as Basic auth. The default export writes it as a placeholder, every other
+/// part of the URL as it is, and the file reads back to the same URL once the
+/// variable holds the password.
+#[test]
+fn a_url_password_is_a_placeholder_and_reads_back_to_the_same_url() {
+    use aisix_core::filesource::load_from_str;
+    use std::collections::HashMap;
+
+    const PASSWORD: &str = "hunter2%40x";
+    let url = |host: &str| format!("https://svc:{PASSWORD}@{host}/v1");
+
+    let snap = AisixSnapshot::new();
+    let mut key = serde_json::to_value(provider_key("url-pk", "sk-live-value")).unwrap();
+    key["api_base"] = json!(url("base.example"));
+    key["apis"] = json!({ "messages": { "base": url("chat.example") } });
+    snap.provider_keys.insert(ResourceEntry::new(
+        "pk-1",
+        serde_json::from_value(key).unwrap(),
+        1,
+    ));
+    snap.passthrough_routes.insert(ResourceEntry::new(
+        "route-1",
+        serde_json::from_value(json!({
+            "name": "r1",
+            "path_prefix": "/passthrough/r1",
+            "target_url": url("route.example"),
+            "provider_key_id": "pk-1",
+        }))
+        .unwrap(),
+        1,
+    ));
+    snap.mcp_servers.insert(ResourceEntry::new(
+        "mcp-1",
+        serde_json::from_value(json!({ "name": "tools", "url": url("mcp.example") })).unwrap(),
+        1,
+    ));
+    snap.observability_exporters.insert(ResourceEntry::new(
+        "exp-1",
+        serde_json::from_value(json!({
+            "name": "otlp",
+            "kind": "otlp_http",
+            "endpoint": url("otlp.example"),
+        }))
+        .unwrap(),
+        1,
+    ));
+
+    let doc = build_export_document(&snap, false);
+    let yaml = crate::export::yaml_emit::emit_yaml(&doc).expect("emit");
+    assert!(!yaml.contains(PASSWORD), "{yaml}");
+    assert!(yaml.contains("https://svc:${AISIXSECRET_"), "{yaml}");
+    for host in [
+        "base.example",
+        "chat.example",
+        "route.example",
+        "mcp.example",
+        "otlp.example",
+    ] {
+        assert!(yaml.contains(&format!("@{host}/v1")), "{host}: {yaml}");
+    }
+    let fields: Vec<&str> = doc
+        .secret_placeholders
+        .iter()
+        .map(|p| p.field.as_str())
+        .collect();
+    for field in [
+        "api_base password",
+        "apis.messages.base password",
+        "target_url password",
+        "url password",
+        "endpoint password",
+    ] {
+        assert!(fields.contains(&field), "{field}: {fields:?}");
+    }
+
+    let env: HashMap<String, String> = doc
+        .secret_placeholders
+        .iter()
+        .map(|p| {
+            let value = if p.field.ends_with(" password") {
+                PASSWORD
+            } else {
+                "sk-real"
+            };
+            (p.env_var.clone(), value.to_string())
+        })
+        .collect();
+    let loaded = load_from_str(&yaml, "exported.yaml", 1, &|n| env.get(n).cloned())
+        .expect("the exported file must re-load through the file source");
+    let key = loaded.provider_keys.get_by_name("url-pk").expect("key");
+    assert_eq!(
+        key.value.api_base.as_deref(),
+        Some(url("base.example").as_str())
+    );
+    let route = loaded.passthrough_routes.get_by_name("r1").expect("route");
+    assert_eq!(
+        route.value.target_url.as_deref(),
+        Some(url("route.example").as_str())
+    );
+    let server = loaded.mcp_servers.get_by_name("tools").expect("server");
+    assert_eq!(server.value.url, url("mcp.example"));
+}

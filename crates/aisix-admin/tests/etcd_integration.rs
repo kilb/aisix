@@ -150,6 +150,7 @@ fn credential_kind(collection: &str) -> Option<aisix_core::credentials::Credenti
     match collection {
         "provider_keys" => Some(CredentialKind::ProviderKey),
         "mcp_servers" => Some(CredentialKind::McpServer),
+        "passthrough_routes" => Some(CredentialKind::PassthroughRoute),
         _ => None,
     }
 }
@@ -355,6 +356,53 @@ async fn provider_keys_round_trip_through_real_etcd() {
         }),
     )
     .await;
+}
+
+/// A password in a stored URL reads back as `[REDACTED]`, the rest of the URL
+/// as written, on a provider key and on a passthrough route.
+#[tokio::test]
+async fn a_url_password_reads_back_redacted_through_real_etcd() {
+    let Some(url) = etcd_url() else {
+        eprintln!("skipping: ADMIN_TEST_ETCD_URL not set");
+        return;
+    };
+    direct_write_read_round_trip(
+        &url,
+        "provider_keys",
+        "/admin/v1/provider_keys",
+        "pk-it-url",
+        json!({
+            "display_name": "openai-url-it",
+            "provider": "openai",
+            "adapter": "openai",
+            "api_key": "sk-it",
+            "api_base": "https://svc:hunter2@base.example/v1",
+        }),
+    )
+    .await;
+    direct_write_read_round_trip(
+        &url,
+        "passthrough_routes",
+        "/admin/v1/passthrough_routes",
+        "route-it-url",
+        json!({
+            "name": "url-route",
+            "path_prefix": "/passthrough/url-route",
+            "target_url": "https://svc:hunter2@route.example/v1",
+            "provider_key_id": "pk-it-url",
+        }),
+    )
+    .await;
+    // What the reads compared against: the password, and only it, replaced.
+    let mut served = json!({ "target_url": "https://svc:hunter2@route.example/v1" });
+    aisix_core::credentials::redact_credentials(
+        aisix_core::credentials::CredentialKind::PassthroughRoute,
+        &mut served,
+    );
+    assert_eq!(
+        served["target_url"],
+        "https://svc:[REDACTED]@route.example/v1"
+    );
 }
 
 #[tokio::test]

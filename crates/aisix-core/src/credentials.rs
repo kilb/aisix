@@ -14,30 +14,49 @@ use serde_json::Value;
 pub const REDACTED: &str = "[REDACTED]";
 
 /// The resource kinds that store credentials.
+///
+/// Every URL a kind stores is also walked for the password in its userinfo
+/// (`https://user:password@host/`), which the HTTP client sends as Basic auth.
+/// Only the password is a slot: the rest of the URL stays readable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CredentialKind {
     /// `api_key`, plus every string value under `request.default_headers`
     /// (outbound headers, which can carry auth) and
     /// `request.default_body_fields` (which can carry a secondary
     /// credential), at any depth. Non-string values, such as a boolean
-    /// flag, are kept.
+    /// flag, are kept. URLs: `api_base` and every `apis.<name>.base`.
     ProviderKey,
     /// `api_key`, `access_key_secret`, `secret_access_key` and
     /// `session_token` at any depth (the Bedrock secrets sit under
     /// `aws_credentials`), plus every string under a custom guardrail's
-    /// `secrets`, whatever its name.
+    /// `secrets`, whatever its name. URLs: `endpoint`, `analyzer_url` and
+    /// `anonymizer_url`.
     Guardrail,
-    /// `secret`.
+    /// `secret`. URLs: `url`, `token_url`, `authorization_url` and
+    /// `registration_url`.
     McpServer,
-    /// `secret`.
+    /// `secret`. URL: `url`.
     A2aAgent,
     /// Every value under `headers` (an OTLP exporter's request headers,
-    /// which routinely carry a vendor auth token).
+    /// which routinely carry a vendor auth token). URL: `endpoint`.
     ObservabilityExporter,
     /// `hmac_secret`, which every caller of a shared-secret provider
-    /// authenticates with, and `login.client_secret`.
+    /// authenticates with, and `login.client_secret`. URLs: `issuer` and
+    /// `jwks_uri`.
     OidcProvider,
+    /// No credential of its own (a route borrows a provider key's). URL:
+    /// `target_url`.
+    PassthroughRoute,
 }
+
+/// The URL fields of each kind, walked for a userinfo password.
+const PROVIDER_KEY_URLS: &[&str] = &["api_base"];
+const GUARDRAIL_URLS: &[&str] = &["endpoint", "analyzer_url", "anonymizer_url"];
+const MCP_SERVER_URLS: &[&str] = &["url", "token_url", "authorization_url", "registration_url"];
+const A2A_AGENT_URLS: &[&str] = &["url"];
+const OBSERVABILITY_EXPORTER_URLS: &[&str] = &["endpoint"];
+const OIDC_PROVIDER_URLS: &[&str] = &["issuer", "jwks_uri"];
+const PASSTHROUGH_ROUTE_URLS: &[&str] = &["target_url"];
 
 /// Guardrail fields that hold a credential wherever they appear.
 const GUARDRAIL_SECRET_KEYS: &[&str] = &[
@@ -82,8 +101,31 @@ pub fn visit_credentials(
     doc: &mut Value,
     visit: &mut dyn FnMut(&CredentialSlot, &mut Value),
 ) {
+    let urls = match kind {
+        CredentialKind::ProviderKey => PROVIDER_KEY_URLS,
+        CredentialKind::Guardrail => GUARDRAIL_URLS,
+        CredentialKind::McpServer => MCP_SERVER_URLS,
+        CredentialKind::A2aAgent => A2A_AGENT_URLS,
+        CredentialKind::ObservabilityExporter => OBSERVABILITY_EXPORTER_URLS,
+        CredentialKind::OidcProvider => OIDC_PROVIDER_URLS,
+        CredentialKind::PassthroughRoute => PASSTHROUGH_ROUTE_URLS,
+    };
+    for field in urls {
+        url_password(doc, field, &sanitize(field), field, visit);
+    }
     match kind {
         CredentialKind::ProviderKey => {
+            if let Some(Value::Object(apis)) = doc.get_mut("apis") {
+                for (name, endpoint) in apis.iter_mut() {
+                    url_password(
+                        endpoint,
+                        "base",
+                        &format!("APIS_{}_BASE", sanitize(name)),
+                        &format!("apis.{name}.base"),
+                        visit,
+                    );
+                }
+            }
             top_level(doc, "api_key", visit);
             if let Some(request) = doc.get_mut("request") {
                 string_map(request, "default_headers", "default header", visit);
@@ -109,7 +151,47 @@ pub fn visit_credentials(
                 top_level(login, "client_secret", visit);
             }
         }
+        CredentialKind::PassthroughRoute => {}
     }
+}
+
+/// The password in the userinfo of the URL at `doc[field]`, as a slot of its
+/// own. Visited as it is written, percent-encoding included, so whatever is
+/// put back in its place reads back into the same URL.
+fn url_password(
+    doc: &mut Value,
+    field: &str,
+    field_key: &str,
+    label: &str,
+    visit: &mut dyn FnMut(&CredentialSlot, &mut Value),
+) {
+    let Some(Value::String(url)) = doc.get_mut(field) else {
+        return;
+    };
+    let Some(span) = userinfo_password(url) else {
+        return;
+    };
+    let mut password = Value::String(url[span.clone()].to_string());
+    let found = CredentialSlot {
+        field_key: format!("{field_key}_PASSWORD"),
+        label: format!("{label} password"),
+    };
+    visit(&found, &mut password);
+    if let Value::String(replacement) = password {
+        url.replace_range(span, &replacement);
+    }
+}
+
+/// Where the password sits in `url`'s userinfo, if it has a non-empty one:
+/// after the first `:` of the userinfo, which ends at the authority's last `@`.
+fn userinfo_password(url: &str) -> Option<std::ops::Range<usize>> {
+    let start = url.find("://")? + 3;
+    let rest = &url[start..];
+    let authority = &rest[..rest.find(['/', '?', '#']).unwrap_or(rest.len())];
+    let userinfo = &authority[..authority.rfind('@')?];
+    let colon = userinfo.find(':')?;
+    let span = start + colon + 1..start + userinfo.len();
+    (!span.is_empty()).then_some(span)
 }
 
 /// Replace every credential in `doc` with [`REDACTED`].
@@ -226,6 +308,116 @@ mod tests {
         });
         out.sort();
         out
+    }
+
+    /// A URL's userinfo password is a slot of its own, on every URL field of
+    /// every kind; the rest of the URL is left as it is.
+    #[test]
+    fn a_url_password_is_a_slot_and_nothing_else_of_the_url_is() {
+        let url = "https://svc:p%40ss@host.example:8443/v1?x=1";
+        for (kind, doc, key) in [
+            (
+                CredentialKind::ProviderKey,
+                json!({ "api_base": url }),
+                "API_BASE_PASSWORD",
+            ),
+            (
+                CredentialKind::ProviderKey,
+                json!({ "apis": { "chat-completions": { "base": url } } }),
+                "APIS_CHAT_COMPLETIONS_BASE_PASSWORD",
+            ),
+            (
+                CredentialKind::Guardrail,
+                json!({ "endpoint": url }),
+                "ENDPOINT_PASSWORD",
+            ),
+            (
+                CredentialKind::Guardrail,
+                json!({ "analyzer_url": url }),
+                "ANALYZER_URL_PASSWORD",
+            ),
+            (
+                CredentialKind::Guardrail,
+                json!({ "anonymizer_url": url }),
+                "ANONYMIZER_URL_PASSWORD",
+            ),
+            (
+                CredentialKind::McpServer,
+                json!({ "url": url }),
+                "URL_PASSWORD",
+            ),
+            (
+                CredentialKind::McpServer,
+                json!({ "token_url": url }),
+                "TOKEN_URL_PASSWORD",
+            ),
+            (
+                CredentialKind::McpServer,
+                json!({ "authorization_url": url }),
+                "AUTHORIZATION_URL_PASSWORD",
+            ),
+            (
+                CredentialKind::McpServer,
+                json!({ "registration_url": url }),
+                "REGISTRATION_URL_PASSWORD",
+            ),
+            (
+                CredentialKind::A2aAgent,
+                json!({ "url": url }),
+                "URL_PASSWORD",
+            ),
+            (
+                CredentialKind::ObservabilityExporter,
+                json!({ "endpoint": url }),
+                "ENDPOINT_PASSWORD",
+            ),
+            (
+                CredentialKind::OidcProvider,
+                json!({ "jwks_uri": url }),
+                "JWKS_URI_PASSWORD",
+            ),
+            (
+                CredentialKind::OidcProvider,
+                json!({ "issuer": url }),
+                "ISSUER_PASSWORD",
+            ),
+            (
+                CredentialKind::PassthroughRoute,
+                json!({ "target_url": url }),
+                "TARGET_URL_PASSWORD",
+            ),
+        ] {
+            assert_eq!(
+                slots(kind, doc.clone()),
+                [(key.to_string(), "p%40ss".to_string())],
+                "{kind:?} {doc}"
+            );
+            let mut redacted = doc.clone();
+            redact_credentials(kind, &mut redacted);
+            let shown = redacted.to_string();
+            assert!(
+                shown.contains("https://svc:[REDACTED]@host.example:8443/v1?x=1"),
+                "{shown}"
+            );
+        }
+
+        // No password, no slot: a user alone, an `@` in the path, none at all.
+        for url in [
+            "https://svc@host.example/",
+            "https://host.example/a@b",
+            "https://host.example/",
+            "https://svc:@host.example/",
+            "not a url",
+        ] {
+            assert!(
+                slots(
+                    CredentialKind::PassthroughRoute,
+                    json!({ "target_url": url })
+                )
+                .is_empty(),
+                "{url}"
+            );
+        }
     }
 
     /// A resource property whose name suggests a credential must be either

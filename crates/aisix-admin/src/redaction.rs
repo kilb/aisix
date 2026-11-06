@@ -1,6 +1,7 @@
 //! Read responses for the resource kinds that store credentials
 //! (provider keys, guardrails, MCP servers, A2A agents, observability
-//! exporters): every credential the kind stores is returned as
+//! exporters, and the password in a URL any of them or a passthrough route
+//! stores): every credential the kind stores is returned as
 //! [`aisix_core::credentials::REDACTED`]. Which fields those are is
 //! defined once, in [`aisix_core::credentials`], and shared with
 //! `aisix export`.
