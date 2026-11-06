@@ -503,3 +503,70 @@ provider key's budget.
 **A stream's failure does not withhold what it delivered.** A stream's `response_capture_safe` answers one question, whether a scan that was owed has read the text. An unguarded stream starts safe and stays safe when it fails, so its row reports what the caller received; a guarded stream starts unsafe and only its completed scan makes it safe, so one that fails never exports text no guardrail read. Do not clear a stream's capture on the failure itself, on any family.
 
 **None of this changes what a caller is sent.** `BridgeError::UpstreamStatus.message` decides that (blank falls back to the status and reason phrase), so wording for logs and rows belongs in the variant's `Display` (`with_body_read_error`) and never in that field; a stream's error frame takes `stream_frame_message`, never `Display`. A row on a `499` has no error body: the caller left, so nothing was sent to report.
+
+## Platform mode
+
+**Platform mode is for a deployment that serves many tenants through upstream accounts the platform owns. A tenant must not learn which upstream channel, provider or account served it, and must not reach anything another tenant left upstream. The mode is off by default, and with it off every exit answers byte for byte as it would without the feature.**
+
+### The switch
+
+- `proxy.platform.enabled` turns it on, and `proxy.platform.id_key_env` names the environment variable that holds the platform secret. Both are read once at startup. Config validation refuses `enabled: true` without `id_key_env`, and startup refuses a variable that is missing or holds fewer than 32 bytes; the error names the variable, never its value.
+- The id key is the SHA-256 of the secret (`platform::PlatformSettings`, whose `Debug` hides it). Every use of it is separated by a label of its own: the tool-call mapping puts the protocol's label in what it hashes, and each Responses seal derives a key of its own (`opaque_id::derive_key`), so no two kinds of id can be turned into each other.
+- Code reads the mode through `ProxyState::platform()` where a handler holds the state, and through `platform_errors::active()` where an error or frame is rendered. The second reads the request's attribution cell, which is installed around the handler and around every poll of its response body, so a stream generator sees it too. The two agree by construction.
+- A request's tenant is `platform::tenant_owner`: `team:<team id>` for a key in a team, `key:<key entry id>` for one without. Everything sealed for a caller is sealed to that owner and opens only for it.
+- Keep `expose_debug_headers` off in a platform deployment. It gates the cache headers below, and on chat it also names the routing target that answered.
+
+### The exits it changes
+
+Platform mode covers the tenant endpoints: `/v1/chat/completions`, `/v1/messages` with `/v1/messages/count_tokens`, `/v1/responses`, `/v1/embeddings` and `/v1/models`. Each rule applies on the native and the translated path, and on the buffered and the streamed branch.
+
+- **Ids name no channel** (`opaque_id`, `responses_affinity`). An upstream's ids often carry a channel marker.
+  - Chat Completions and Messages: the response id is minted fresh for each response (`chatcmpl-` or `msg_` and a random UUID), and every frame of a stream carries the same one. A tool-call id is mapped one way, to an HMAC of the upstream id behind the protocol's own prefix (`call_`, `toolu_`). The mapping is deterministic and both protocols resend the whole conversation, so the id a caller puts into the next turn's history travels upstream unchanged and still pairs. On Messages only `tool_use` ids are mapped.
+  - Responses: an output item's `id`, `call_id`, `approval_request_id` and `caller.caller_id` are sealed reversibly (AES-256-GCM under a nonce derived from the plaintext), keep their short prefix (`fc_`, `msg_`, `call_`) because the upstream validates it, and are unsealed again when a request sends them back in `input[]`. That unseal runs before guardrails, cache keys, logs or dispatch read the body. These ids cannot be one-way: a continuation through `previous_response_id` pairs only ids the upstream issued itself. The response id is sealed with a random nonce, together with the target that served it.
+  - Every Responses seal is bound to the owner (an item or call id in its nonce and its associated data, the response id inside its encrypted plaintext), and pads the upstream id to a 64-byte bucket, so the length of a sealed id does not tell channels apart. A seal made for another tenant does not open. An item id passes upstream as the opaque string it is. A `previous_response_id` that does not open (another tenant's, a forged one, a bare upstream id) is answered exactly like a response that does not exist, `404` with code `not_found`, before any upstream call. One that opens must still pass the key's provider-group check on the target it recovers, and is answered the same way when it does not. Behind a routing group, the tag that records which target produced an item's encrypted content (`aisix_enc_v2:`) is sealed to the tenant too.
+  - Also removed: the top-level `amazon-bedrock-invocationMetrics` member of a relayed body; the usage counters the OpenAI shape does not define (`prompt_cache_hit_tokens`, `prompt_cache_miss_tokens`, `prompt_tokens_details.cache_creation_tokens`) on a rendered Chat Completions answer; and the `cache_creation_tokens` a translated Responses answer adds. A relayed native answer keeps every usage field its upstream wrote.
+  - Every rewrite runs after telemetry has read the response, so the usage event keeps the upstream's own id as `provider_request_id`.
+- **Upstream errors reach the caller as the gateway's own classes** (`platform_errors`). An error that came from an upstream, and a gateway refusal whose text names the provider, provider key or account the request resolved to, is answered as one of eight classes with a fixed status, `type`, `code` and message: context length exceeded (`400`), rate limited (`429`, `Retry-After` kept), invalid request (`400`, the upstream's `param` kept when it is shaped like a field name), content filtered (`400`), authentication (`401`), not found (`404`), upstream unavailable (`503`) and internal (`500`). An upstream `401` or `403` is upstream unavailable, since the platform's account is not the caller's to fix. The Anthropic envelope carries the same message and code under Anthropic's documented `type`.
+  - Where it applies: the buffered renderers (`ProxyError::envelope`, `caller_status`, `anthropic_envelope`), stream error frames built from a `BridgeError`, upstream error events relayed from a native stream, a buffered Responses object with `status: "failed"`, and relayed upstream error bodies. Because the buffered renderers are shared, a buffered upstream error that any other endpoint returns as a `ProxyError` is classed too.
+  - What keeps its envelope: the gateway's own refusals that name no upstream, which are budgets, rate limits, guardrails, request validation and authentication.
+  - The operator still sees what happened. The usage event's `status_code`, `error_class` and `error_message`, the access log and the metrics are written from the original error.
+- **References to objects stored upstream are refused** (`stored_refs`). Tenants share the platform's upstream accounts, so an object one tenant's request made an upstream store (a container, a file, a vector store, a conversation, a stored prompt, a custom skill) can be used by anyone who names its id. On chat, messages, count_tokens and responses, a request field that names such an object is refused with `400` `invalid_request`, its `param` naming the field's path and never the id. The check runs right after the model access and client-IP checks, before guardrails, rate limits, the cache and any upstream. The module doc lists every field with its source in the API's type definitions. The ids the gateway seals itself (response, item and call ids) are not refused.
+- **Cache headers are debug headers** (`response_cache::apply_cache_headers`). On messages, responses and embeddings, `x-aisix-cache` and `x-aisix-cache-layer` are sent only when `expose_debug_headers` is on, which is what chat does in either mode. Otherwise a hit would tell a tenant that someone asked the same thing.
+- **A forbidden model answers like an unknown one** (`platform_errors::caller_error`). A `ModelForbidden` reaches the caller with the status, headers and body of a `ModelNotFound` for the same name, so a key cannot map the catalog by asking for names. It is applied at the three render primitives in `error.rs`, and telemetry still records `403` `permission_denied`.
+- **A `429` shows only the caller's own limits** (`error.rs`).
+  - A `budget_exceeded` keeps its structured fields (`scope`, `scope_ref`, `limit_usd`, `spent_usd`, `period`, `period_resets_at`) and its `Retry-After` only when the budget is the caller's own: scope `api_key`, `member`, `team` or `team_member`, by both its typed scope and its text. Any other budget (`org`, `environment`, `tag`, `provider_key`, or one with no scope) is answered with the same type and code, the message `Spending limit reached.`, and no `Retry-After`, because its reset time is a figure of the platform's budget. A spend ceiling raised by a policy gets a neutral message of its own.
+  - A rate-limit `429` names no policy: no `error.policy` block, and no policy name in the message. A bucket that several callers share (a model's inline limit, or a policy not grouped by key, member or team, `quota::policy_bucket_is_callers`) sends none of `x-ratelimit-limit`, `-remaining`, `-reset` and `-scope`. `Retry-After` stays.
+- **Model listings name no vendor** (`models::owned_by`). `/v1/models` and `/v1/models/{id}` in the OpenAI shape report `owned_by: "aisix"` for every model. The Anthropic shape names no owner.
+
+Provider-key groups (`allowed_provider_groups`) and the `team` cache scope are what a platform deployment uses to keep tenants apart upstream and in the cache. They work with platform mode on or off.
+
+### Every new exit applies it
+
+Platform mode is a property of each exit, and a missed exit fails silently: nothing errors, the tenant simply sees the upstream's id, text or figures. When a change adds or reshapes a client-facing exit on a tenant endpoint (a new stream branch, a new relay of upstream bytes, a new error variant, a new response header), it applies every rule above in the same change, on both paths and both branches, and pins the result with a platform-mode test beside the off-mode one.
+
+- Render errors through `ProxyError::envelope`, `caller_status` and `anthropic_envelope`, or through the stream and relay helpers in `platform_errors`, never from `Display` or `kind()`. A new variant whose text names the upstream belongs in `platform_errors::hides`.
+- Pass every id an upstream issued through `opaque_id` or `responses_affinity`, after telemetry has read it.
+- Call the family's `stored_refs::refuse_in_*` check before the first upstream call. A newly found field that names an upstream-stored object goes into `stored_refs`.
+- Write cache headers only through `apply_cache_headers`.
+- With platform mode off, leave the bytes unchanged.
+
+### Known follow-ups
+
+These surfaces are not adapted. Until each is, a platform deployment must not let tenant keys reach it.
+
+- `/v1/completions` returns the upstream's `id` and `system_fingerprint`.
+- Realtime frames inside an established session (connect failures, relayed upstream `error` events) are not classed, because the session runs outside the request's attribution scope. Realtime and `/v1/audio/speech` voice ids are not checked as stored objects.
+- Passthrough routes relay the upstream's headers and body as sent, Responses bodies included, and the stored-object check does not read them.
+- The files, batches and fine-tuning surface, including Responses requests inside a batch file, is outside the id and stored-object rules. Its relayed error bodies are classed.
+- Images, audio, video, MCP and A2A have no adaptation beyond the shared error renderers.
+
+On the tenant endpoints themselves:
+
+- Paths that fail open forward an upstream's ids as sent rather than corrupt the frame: a frame the JSON splice cannot rewrite, or an oversized unterminated one.
+- Messages `server_tool_use` and `mcp_tool_use` ids pass unchanged. No captured upstream answer shows yet whether they carry a channel marker.
+- An operator's `param_renames` runs after the stored-object check, so it could map a caller's field onto a refused one.
+- Skills are refused by type `custom`. An allow-list of type `anthropic` would be stricter.
+- A bare-string `audio.voice` that names a custom voice is not refused; the object form is.
+- Messages `fallbacks[].model` is not checked against the key's model access.
+- A broad `forward_client_headers` rule can forward `anthropic-workspace-id` or `anthropic-user-profile-id` upstream.
+- A response cache in `env` scope would replay one tenant's sealed ids to another. Platform deployments use the `team` or `api_key` scope.
