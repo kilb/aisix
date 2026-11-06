@@ -1279,6 +1279,60 @@ describe("platform mode e2e: a response id continues only for the tenant it was 
         field: "tools[0].vector_store_ids",
       },
       {
+        family: "responses: a container by id, in a tool definition inside input",
+        path: "/v1/responses",
+        body: {
+          model: openai,
+          input: [
+            {
+              type: "additional_tools",
+              role: "developer",
+              tools: [{ type: "code_interpreter", container: "cntr_tenant_a_0001" }],
+            },
+            { role: "user", content: "run it" },
+          ],
+        },
+        field: "input[0].tools[0].container",
+      },
+      {
+        family: "responses: a vector store, in a tool search's output",
+        path: "/v1/responses",
+        body: {
+          model: openai,
+          input: [
+            { role: "user", content: "search it" },
+            {
+              type: "tool_search_output",
+              call_id: "call_search_1",
+              execution: "client",
+              status: "completed",
+              tools: [{ type: "file_search", vector_store_ids: ["vs_tenant_a_0001"] }],
+            },
+          ],
+        },
+        field: "input[1].tools[0].vector_store_ids",
+      },
+      {
+        family: "responses: an MCP tunnel",
+        path: "/v1/responses",
+        body: {
+          model: openai,
+          input: "list the files",
+          tools: [{ type: "mcp", server_label: "private", tunnel_id: "tunnel_tenant_a_0001" }],
+        },
+        field: "tools[0].tunnel_id",
+      },
+      {
+        family: "responses: a stored response to compare the cache with",
+        path: "/v1/responses",
+        body: {
+          model: openai,
+          input: "hello",
+          prompt_cache_options: { comparison_response_id: "resp_tenant_a_0001" },
+        },
+        field: "prompt_cache_options.comparison_response_id",
+      },
+      {
         family: "chat: a stored file",
         path: "/v1/chat/completions",
         body: {
@@ -1294,6 +1348,39 @@ describe("platform mode e2e: a response id continues only for the tenant it was 
           ],
         },
         field: "messages[0].content[1].file.file_id",
+      },
+      {
+        family: "chat: a custom voice",
+        path: "/v1/chat/completions",
+        body: {
+          model: openai,
+          modalities: ["text", "audio"],
+          audio: { format: "wav", voice: { id: "voice_tenant_a_0001" } },
+          messages: [{ role: "user", content: "say hello" }],
+        },
+        field: "audio.voice.id",
+      },
+      {
+        family: "messages: a stored request to diagnose against",
+        path: "/v1/messages",
+        body: {
+          model: anthropic,
+          max_tokens: 64,
+          diagnostics: { previous_message_id: "msg_tenant_a_0001" },
+          messages: [{ role: "user", content: "hello" }],
+        },
+        field: "diagnostics.previous_message_id",
+      },
+      {
+        family: "messages: a server-held thread",
+        path: "/v1/messages",
+        body: {
+          model: anthropic,
+          max_tokens: 64,
+          thread: { type: "continue", previous_message_id: "msg_tenant_a_0001" },
+          messages: [{ role: "user", content: "go on" }],
+        },
+        field: "thread",
       },
       {
         family: "messages: a container by id",
@@ -1368,5 +1455,32 @@ describe("platform mode e2e: a response id continues only for the tenant it was 
     });
     expect(plain.status, plain.text).toBe(200);
     expect(refsAnthropic!.receivedRequests).toHaveLength(1);
+    // What the model wrote as a tool's input is its own, whatever it looks
+    // like: a conversation carrying it goes on.
+    const toolTurn = await postAs(TENANT_KEYS.b, "/v1/messages", {
+      model: anthropic,
+      max_tokens: 64,
+      tools: [{ name: "load", input_schema: { type: "object" } }],
+      messages: [
+        { role: "user", content: "load the report" },
+        {
+          role: "assistant",
+          content: [
+            {
+              type: "tool_use",
+              id: "toolu_load_1",
+              name: "load",
+              input: { source: { type: "file", path: "/tmp/report.csv" } },
+            },
+          ],
+        },
+        {
+          role: "user",
+          content: [{ type: "tool_result", tool_use_id: "toolu_load_1", content: "loaded" }],
+        },
+      ],
+    });
+    expect(toolTurn.status, toolTurn.text).toBe(200);
+    expect(refsAnthropic!.receivedRequests).toHaveLength(2);
   });
 });

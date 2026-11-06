@@ -22,10 +22,18 @@
 //!   - `conversation`: `response_create_params.py:58`.
 //!   - `prompt`, a stored prompt by id: `response_create_params.py:156` and
 //!     `response_prompt_param.py:23`.
+//!   - `prompt_cache_options.comparison_response_id`, a stored response:
+//!     `response_create_params.py:169`, `:413`.
+//!   - Every tool definition below, wherever it appears: in `tools[]`, and
+//!     inside `input[]` in an `additional_tools` item
+//!     (`response_input_item_param.py:222`) or a `tool_search_output` item
+//!     (`response_tool_search_output_item_param_param.py:395`).
 //!   - A code interpreter's `container` given as an id, or as an automatic
 //!     container with uploaded `file_ids`: `tool_param.py:214` and `:230`.
 //!   - A file search's `vector_store_ids`: `file_search_tool_param.py:58`.
 //!   - An image generation's `input_image_mask.file_id`: `tool_param.py:256`.
+//!   - An MCP tool's `tunnel_id`, a Secure MCP Tunnel of the organization:
+//!     `tool_param.py:193`.
 //!   - A shell tool's `environment`, given as a `container_reference`
 //!     (`container_reference_param.py:11`) or as a `container_auto` with
 //!     `file_ids` or `skill_reference` skills
@@ -49,14 +57,22 @@
 //!   - the `file.file_id` of a `file` content part
 //!     (`chat_completion_content_part_param.py:22`);
 //!   - an assistant message's `audio.id`, a stored audio response
-//!     (`chat_completion_assistant_message_param.py:21`).
+//!     (`chat_completion_assistant_message_param.py:21`);
+//!   - `audio.voice.id`, a custom voice (`chat_completion_audio_param.py:11`).
 //! - Messages and count_tokens (anthropic `types/`):
 //!   - `container`, given as an id or as an object naming one
 //!     (`message_create_params.py:135`, `container_params.py:14`), or
 //!     loading a `custom` skill (`skill_params.py:11`, `:14`);
-//!   - a content block whose `source` is a stored file
-//!     (`file_document_source_param.py:9`, `file_image_source_param.py:9`);
-//!   - a `container_upload` block (`container_upload_block_param.py:17`).
+//!   - a document or image block whose `source` is a stored file
+//!     (`file_document_source_param.py:9`, `file_image_source_param.py:9`),
+//!     at any depth, but never inside the `input` the model wrote for a tool
+//!     use;
+//!   - a `container_upload` block (`container_upload_block_param.py:17`);
+//!   - `diagnostics.previous_message_id`, a stored request
+//!     (`message_create_params.py:138`, `diagnostics_param.py:16`);
+//!   - `thread`, server-held conversation state
+//!     (`beta/message_create_params.py:271`). The client's `anthropic-beta`
+//!     header is forwarded, so a beta field reaches the upstream.
 //!
 //! Left alone, on purpose:
 //!
@@ -67,7 +83,12 @@
 //!   `file_search_call`'s results, and the file and container citations in
 //!   an `output_text`'s annotations. Neither puts an object in the model's
 //!   context.
-//! - An MCP server: it is named by URL and credential, not by a stored id.
+//! - The `file_id`s of echoed code-execution outputs on Messages
+//!   (`code_execution_output_block_param.py:9`,
+//!   `bash_code_execution_output_block_param.py:9`): they live in a
+//!   container, and a request cannot name that container, since `container`
+//!   and `container_upload` are refused.
+//! - An MCP server named by URL and credential, not by a stored id.
 //! - The Messages API's workspace and user-profile selectors. They travel as
 //!   headers (`anthropic-workspace-id` and `anthropic-user-profile-id`), and
 //!   the gateway forwards a client header only where the operator
@@ -110,8 +131,32 @@ fn refuse(
         return Ok(());
     }
     match find() {
-        Some(field) => Err(ProxyError::StoredObjectReference(field)),
+        Some(field) => Err(ProxyError::StoredObjectReference(capped(field))),
         None => Ok(()),
+    }
+}
+
+/// The longest field path a refusal names; a longer one is cut here.
+const MAX_PATH_LEN: usize = 256;
+
+/// `path`, cut to [`MAX_PATH_LEN`]. Every path is ASCII ([`push_key`]), so
+/// any byte is a character boundary.
+fn capped(mut path: String) -> String {
+    path.truncate(MAX_PATH_LEN);
+    path
+}
+
+/// Append an object key to a path: `.key` for a key of 1 to 64 ASCII
+/// letters, digits and `_`, which every field the APIs define is, and `[?]`
+/// for anything else, so a caller's own key never reaches the refusal as
+/// written.
+fn push_key(path: &mut String, key: &str) {
+    if (1..=64).contains(&key.len()) && key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    {
+        path.push('.');
+        path.push_str(key);
+    } else {
+        path.push_str("[?]");
     }
 }
 
@@ -129,15 +174,22 @@ fn kind(value: &Value) -> Option<&str> {
     value.get("type").and_then(Value::as_str)
 }
 
-/// The first node under `root`, depth first, that `check` names a field of,
-/// as the path of that field: `input[0].content[1].file_id`.
-fn find_under(
-    value: &Value,
-    path: &mut String,
-    check: &dyn Fn(&Value) -> Option<&'static str>,
-) -> Option<String> {
-    if let Some(field) = check(value) {
-        return Some(format!("{path}.{field}"));
+/// What a walk does at one node.
+enum Visit {
+    /// The node names an object stored upstream, in this field under it.
+    Refuse(String),
+    /// Nothing under the node is a request field: the model wrote it.
+    Skip,
+    Descend,
+}
+
+/// The first node under `value`, depth first, that `check` refuses, as the
+/// path of the field it names: `input[0].content[1].file_id`.
+fn find_under(value: &Value, path: &mut String, check: &dyn Fn(&Value) -> Visit) -> Option<String> {
+    match check(value) {
+        Visit::Refuse(field) => return Some(format!("{path}.{field}")),
+        Visit::Skip => return None,
+        Visit::Descend => {}
     }
     let len = path.len();
     let found = match value {
@@ -148,8 +200,7 @@ fn find_under(
         }),
         Value::Object(map) => map.iter().find_map(|(key, item)| {
             path.truncate(len);
-            path.push('.');
-            path.push_str(key);
+            push_key(path, key);
             find_under(item, path, check)
         }),
         _ => None,
@@ -158,11 +209,7 @@ fn find_under(
     found
 }
 
-fn find_in(
-    body: &Value,
-    root: &str,
-    check: &dyn Fn(&Value) -> Option<&'static str>,
-) -> Option<String> {
+fn find_in(body: &Value, root: &str, check: &dyn Fn(&Value) -> Visit) -> Option<String> {
     let value = body.get(root)?;
     find_under(value, &mut root.to_string(), check)
 }
@@ -173,16 +220,23 @@ fn responses_reference(body: &Value) -> Option<String> {
             return Some(field.to_string());
         }
     }
-    if let Some(tools) = body.get("tools").and_then(Value::as_array) {
-        for (i, tool) in tools.iter().enumerate() {
-            if let Some(field) = responses_tool_reference(tool) {
-                return Some(format!("tools[{i}].{field}"));
-            }
-        }
+    if names(body.pointer("/prompt_cache_options/comparison_response_id")) {
+        return Some("prompt_cache_options.comparison_response_id".into());
     }
-    find_in(body, "input", &responses_input_reference)
+    // A tool definition can also arrive inside `input[]`, in an
+    // `additional_tools` or `tool_search_output` item, so both trees are
+    // walked with the same check.
+    find_in(body, "tools", &responses_node).or_else(|| find_in(body, "input", &responses_node))
 }
 
+fn responses_node(node: &Value) -> Visit {
+    match responses_tool_reference(node).or_else(|| responses_input_reference(node)) {
+        Some(field) => Visit::Refuse(field),
+        None => Visit::Descend,
+    }
+}
+
+/// A tool definition that names a stored object.
 fn responses_tool_reference(tool: &Value) -> Option<String> {
     match kind(tool)? {
         "code_interpreter" => match tool.get("container") {
@@ -195,6 +249,7 @@ fn responses_tool_reference(tool: &Value) -> Option<String> {
         "file_search" => names(tool.get("vector_store_ids")).then(|| "vector_store_ids".into()),
         "image_generation" => names(tool.pointer("/input_image_mask/file_id"))
             .then(|| "input_image_mask.file_id".into()),
+        "mcp" => names(tool.get("tunnel_id")).then(|| "tunnel_id".into()),
         "shell" => {
             let environment = tool.get("environment")?;
             container_environment_reference(environment).map(|field| format!("environment.{field}"))
@@ -223,19 +278,28 @@ fn container_environment_reference(environment: &Value) -> Option<String> {
     }
 }
 
-fn responses_input_reference(node: &Value) -> Option<&'static str> {
+/// An input item or content part that names a stored object.
+fn responses_input_reference(node: &Value) -> Option<String> {
     match kind(node)? {
         "input_file" | "input_image" | "computer_screenshot" if names(node.get("file_id")) => {
-            Some("file_id")
+            Some("file_id".into())
         }
         "code_interpreter_call" | "container_reference" if names(node.get("container_id")) => {
-            Some("container_id")
+            Some("container_id".into())
         }
         _ => None,
     }
 }
 
 fn chat_reference(req: &aisix_gateway::ChatFormat) -> Option<String> {
+    if req
+        .extra
+        .get("audio")
+        .and_then(|audio| audio.get("voice"))
+        .is_some_and(|voice| voice.is_object() && names(voice.get("id")))
+    {
+        return Some("audio.voice.id".into());
+    }
     for (i, message) in req.messages.iter().enumerate() {
         for (j, part) in message.content_blocks.iter().flatten().enumerate() {
             if kind(part) == Some("file") && names(part.pointer("/file/file_id")) {
@@ -266,14 +330,26 @@ fn messages_reference(body: &Value) -> Option<String> {
         }
         _ => {}
     }
-    find_in(body, "messages", &messages_block_reference)
+    if names(body.pointer("/diagnostics/previous_message_id")) {
+        return Some("diagnostics.previous_message_id".into());
+    }
+    if names(body.get("thread")) {
+        return Some("thread".into());
+    }
+    find_in(body, "messages", &messages_node)
 }
 
-fn messages_block_reference(node: &Value) -> Option<&'static str> {
-    if node.get("source").and_then(kind) == Some("file") {
-        return Some("source.file_id");
+fn messages_node(node: &Value) -> Visit {
+    match kind(node) {
+        // The model wrote a tool use's `input`; nothing in it is a content
+        // block the caller sends.
+        Some(t) if t.ends_with("tool_use") => Visit::Skip,
+        Some("document" | "image") if node.get("source").and_then(kind) == Some("file") => {
+            Visit::Refuse("source.file_id".into())
+        }
+        Some("container_upload") if names(node.get("file_id")) => Visit::Refuse("file_id".into()),
+        _ => Visit::Descend,
     }
-    (kind(node) == Some("container_upload") && names(node.get("file_id"))).then_some("file_id")
 }
 
 #[cfg(test)]
@@ -386,6 +462,54 @@ mod tests {
                     "environment": {"type": "container_reference", "container_id": "cntr_1"}}]}),
                 "input[0].environment.container_id",
             ),
+            (
+                json!({"prompt_cache_options": {"mode": "explicit",
+                                                "comparison_response_id": "resp_1"}}),
+                "prompt_cache_options.comparison_response_id",
+            ),
+            (
+                json!({"tools": [{"type": "mcp", "server_label": "s", "tunnel_id": "tun_1"}]}),
+                "tools[0].tunnel_id",
+            ),
+            // Tool definitions inside `input[]` are tool definitions too.
+            (
+                json!({"input": [{"type": "additional_tools", "role": "developer", "tools": [
+                    {"type": "code_interpreter", "container": "cntr_1"}]}]}),
+                "input[0].tools[0].container",
+            ),
+            (
+                json!({"input": [{"type": "additional_tools", "role": "developer", "tools": [
+                    {"type": "function", "name": "f"},
+                    {"type": "file_search", "vector_store_ids": ["vs_1"]}]}]}),
+                "input[0].tools[1].vector_store_ids",
+            ),
+            (
+                json!({"input": [{"type": "additional_tools", "role": "developer", "tools": [
+                    {"type": "shell", "environment": {"type": "container_auto",
+                                                      "file_ids": ["file-1"]}}]}]}),
+                "input[0].tools[0].environment.file_ids",
+            ),
+            (
+                json!({"input": [{"type": "tool_search_output", "execution": "client",
+                    "call_id": "c", "tools": [{"type": "code_interpreter", "container": "cntr_1"}]}]}),
+                "input[0].tools[0].container",
+            ),
+            (
+                json!({"input": [{"type": "tool_search_output", "tools": [
+                    {"type": "image_generation", "input_image_mask": {"file_id": "file-1"}}]}]}),
+                "input[0].tools[0].input_image_mask.file_id",
+            ),
+            (
+                json!({"input": [{"type": "tool_search_output", "tools": [
+                    {"type": "shell", "environment": {"type": "container_auto",
+                        "skills": [{"type": "skill_reference", "skill_id": "skill_1"}]}}]}]}),
+                "input[0].tools[0].environment.skills[0].skill_id",
+            ),
+            (
+                json!({"input": [{"type": "tool_search_output", "tools": [
+                    {"type": "mcp", "server_label": "s", "tunnel_id": "tun_1"}]}]}),
+                "input[0].tools[0].tunnel_id",
+            ),
         ];
         for (body, field) in cases {
             assert_eq!(
@@ -407,6 +531,10 @@ mod tests {
                              {"type": "shell", "environment": {"type": "local"}},
                              {"type": "image_generation", "input_image_mask": {"image_url": "data:x"}},
                              {"type": "mcp", "server_label": "s", "server_url": "https://m"}]}),
+            json!({"prompt_cache_options": {"mode": "explicit"},
+                   "input": [{"type": "additional_tools", "role": "developer", "tools": [
+                       {"type": "function", "name": "f", "parameters": {"type": "object"}},
+                       {"type": "code_interpreter", "container": {"type": "auto"}}]}]}),
             json!({"input": [
                 {"role": "user", "content": [{"type": "input_image", "image_url": "data:x"},
                                              {"type": "input_file", "file_data": "x", "filename": "a"},
@@ -441,10 +569,24 @@ mod tests {
             Some("messages[1].audio.id")
         );
         assert_eq!(
+            refused_chat(json!({"model": "m", "modalities": ["text", "audio"],
+                "audio": {"format": "wav", "voice": {"id": "voice_1"}},
+                "messages": [{"role": "user", "content": "hi"}]}))
+            .as_deref(),
+            Some("audio.voice.id")
+        );
+        assert_eq!(
             refused_chat(json!({"model": "m", "messages": [
                 {"role": "user", "content": [
                     {"type": "file", "file": {"file_data": "data:x", "filename": "a.pdf"}},
                     {"type": "image_url", "image_url": {"url": "https://i"}}]}]})),
+            None
+        );
+        assert_eq!(
+            refused_chat(
+                json!({"model": "m", "audio": {"format": "wav", "voice": "alloy"},
+                "messages": [{"role": "user", "content": "hi"}]})
+            ),
             None
         );
     }
@@ -490,6 +632,19 @@ mod tests {
                 user(json!([{"type": "container_upload", "file_id": "file_1"}])),
                 "messages[0].content[0].file_id",
             ),
+            (
+                json!({"diagnostics": {"previous_message_id": "msg_1"}, "messages": []}),
+                "diagnostics.previous_message_id",
+            ),
+            (
+                json!({"thread": {"type": "continue", "previous_message_id": "msg_1"},
+                       "messages": []}),
+                "thread",
+            ),
+            (
+                json!({"thread": {"type": "create"}, "messages": []}),
+                "thread",
+            ),
         ];
         for (body, field) in cases {
             assert_eq!(
@@ -510,10 +665,45 @@ mod tests {
             json!({"container": {"skills": [{"type": "anthropic", "skill_id": "pptx"}]},
                    "messages": [],
                    "mcp_servers": [{"type": "url", "url": "https://m", "name": "m"}]}),
-            json!({"container": null, "messages": []}),
+            json!({"container": null, "diagnostics": {}, "thread": null, "messages": []}),
+            // What the model wrote as a tool's input is not a content block,
+            // whatever it looks like.
+            json!({"messages": [{"role": "assistant", "content": [{"type": "tool_use",
+                "id": "toolu_1", "name": "load",
+                "input": {"source": {"type": "file", "path": "/tmp/a.csv"}}}]}]}),
+            json!({"messages": [{"role": "assistant", "content": [
+                {"type": "server_tool_use", "id": "srvtoolu_1", "name": "x",
+                 "input": {"type": "document", "source": {"type": "file", "file_id": "f"}}},
+                {"type": "mcp_tool_use", "id": "mcptoolu_1", "name": "x", "server_name": "s",
+                 "input": {"type": "container_upload", "file_id": "f"}}]}]}),
         ] {
             assert_eq!(refused_messages(body.clone()), None, "{body}");
         }
+    }
+
+    /// The path names the caller's keys only in the shape the APIs' own
+    /// fields have, and is never longer than [`MAX_PATH_LEN`].
+    #[test]
+    fn a_refused_path_carries_no_caller_text_and_is_bounded() {
+        let odd = "k\n".repeat(5);
+        assert_eq!(
+            refused_responses(json!({"input": [{ odd: {"type": "input_file", "file_id": "f"}}]}))
+                .as_deref(),
+            Some("input[0][?].file_id")
+        );
+        assert_eq!(
+            refused_responses(json!({"input": [{ "a".repeat(65): {"type": "input_file",
+                                                                  "file_id": "f"}}]}))
+            .as_deref(),
+            Some("input[0][?].file_id")
+        );
+        let mut deep = json!({"type": "input_file", "file_id": "f"});
+        for _ in 0..120 {
+            deep = json!([deep]);
+        }
+        let path = refused_responses(json!({ "input": deep })).unwrap();
+        assert_eq!(path.len(), MAX_PATH_LEN, "{path}");
+        assert!(path.starts_with("input[0][0]"), "{path}");
     }
 
     #[test]

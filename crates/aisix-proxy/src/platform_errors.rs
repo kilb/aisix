@@ -274,7 +274,13 @@ fn classify_upstream(
         Some(401 | 403) => PlatformErrorClass::UpstreamUnavailable,
         Some(404) => PlatformErrorClass::NotFound,
         Some(400..=499) => PlatformErrorClass::InvalidRequest {
-            param: view.and_then(|v| v.param.clone()),
+            // Only what has the shape of a field name of the caller's
+            // request: anything else is the upstream's own text.
+            param: view.and_then(|v| v.param.clone()).filter(|p| {
+                p.len() <= 256
+                    && p.bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b"_.[]-".contains(&b))
+            }),
         },
         Some(_) => PlatformErrorClass::UpstreamUnavailable,
         None if names(RATE_LIMIT_TOKENS) => PlatformErrorClass::RateLimited,
@@ -558,6 +564,33 @@ mod tests {
                 param: Some("temperature".into())
             }
         );
+    }
+
+    /// What is relayed as `param` has the shape of a field name; anything
+    /// else an upstream put there is its own text and is not.
+    #[test]
+    fn only_a_field_shaped_upstream_param_is_relayed() {
+        assert_eq!(
+            classify(&upstream_status_with_param(
+                400,
+                "bad",
+                "messages[0].content[1].source.file_id"
+            )),
+            PlatformErrorClass::InvalidRequest {
+                param: Some("messages[0].content[1].source.file_id".into())
+            }
+        );
+        for unshaped in [
+            "model arn:aws:bedrock:us-east-1:123:x".to_string(),
+            "a b".to_string(),
+            "x".repeat(257),
+        ] {
+            assert_eq!(
+                classify(&upstream_status_with_param(400, "bad", &unshaped)),
+                PlatformErrorClass::InvalidRequest { param: None },
+                "{unshaped}"
+            );
+        }
     }
 
     #[test]
