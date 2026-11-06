@@ -25,7 +25,8 @@ use crate::auth::{OperatorAuth, OperatorRole};
 use crate::db::DbError;
 use crate::error::{ApiError, Detail};
 use crate::http::ApiJson;
-use crate::AppState;
+use crate::rollout::ResourceRollout;
+use crate::{tenants, AppState};
 
 /// `ResourceView`: a stored document as the API shows it.
 #[derive(Debug, Serialize)]
@@ -37,22 +38,12 @@ pub struct ResourceView {
     version: i64,
     managed_by: Option<String>,
     updated_at: DateTime<Utc>,
-    rollout: Rollout,
-}
-
-/// How far the document has reached the gateways. Always `pending` until
-/// rollout tracking lands (Task 9).
-#[derive(Debug, Serialize)]
-struct Rollout {
-    state: &'static str,
-    kine_revision: Option<i64>,
-    applied: u64,
-    online: u64,
-    rejections: Vec<Value>,
+    rollout: ResourceRollout,
 }
 
 impl ResourceView {
     fn of(row: ResourceRow) -> ResourceView {
+        let rollout = ResourceRollout::of_row(&row);
         let mut doc = row.doc;
         secrets::redact(row.kind, &mut doc);
         ResourceView {
@@ -62,13 +53,7 @@ impl ResourceView {
             version: row.version,
             managed_by: row.managed_by,
             updated_at: row.updated_at,
-            rollout: Rollout {
-                state: "pending",
-                kine_revision: row.kine_revision,
-                applied: 0,
-                online: 0,
-                rejections: Vec::new(),
-            },
+            rollout,
         }
     }
 }
@@ -97,7 +82,7 @@ fn row_id(raw: &str) -> Result<Uuid, ApiError> {
 }
 
 /// The version `If-Match` names: `"3"`, or `3` unquoted.
-fn if_match(headers: &HeaderMap) -> Result<i64, ApiError> {
+pub(crate) fn if_match(headers: &HeaderMap) -> Result<i64, ApiError> {
     let Some(value) = headers.get(header::IF_MATCH) else {
         return Err(ApiError::if_match_required());
     };
@@ -254,6 +239,9 @@ pub async fn replace(
                     managed_by: None,
                 };
                 let row = write_resource(conn, &ctx, write).await?;
+                if kind == Kind::Models {
+                    tenants::refuse_ungrantable_reshape(conn, id, &row.doc).await?;
+                }
                 audit::record(
                     conn,
                     AuditEntry {
@@ -276,6 +264,10 @@ pub async fn replace(
 
 /// `DELETE /admin/resources/{kind}/{id}` with `If-Match` → `200
 /// ResourceView` of the tombstone; `409 in_use` while referenced.
+///
+/// A model is first withdrawn from every tenant grant (ruling 13), here and
+/// not inside `write_resource`, so the tenant locks come before the
+/// resources lock; a delete refused afterwards rolls the withdrawal back.
 pub async fn delete(
     auth: OperatorAuth,
     State(state): State<AppState>,
@@ -292,6 +284,9 @@ pub async fn delete(
         .db
         .tx(move |conn| {
             async move {
+                if kind == Kind::Models {
+                    tenants::on_model_deleted(conn, &ctx, id).await?;
+                }
                 let write = ResourceWrite {
                     kind,
                     id,

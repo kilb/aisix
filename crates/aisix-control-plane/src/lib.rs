@@ -22,7 +22,9 @@ pub mod http;
 pub mod operators;
 pub mod pki;
 pub mod resources;
+pub mod rollout;
 pub mod settings;
+pub mod tenants;
 
 use auth::password::{LoginThrottle, PasswordGate, ARGON2_GATE_PERMITS};
 use config::CpConfig;
@@ -92,6 +94,11 @@ where
     .await?;
     let env = settings::ensure_env(&db, cfg.env_id_seed, &cfg.etcd_prefix).await?;
     let pki = Arc::new(Pki::load_or_init(&db, &cfg.master_key, &env).await?);
+    let write_ctx = resources::write::WriteCtx {
+        mk: crypto::MasterKey(cfg.master_key.0),
+        env: env.clone(),
+    };
+    tenants::ensure_internal_tenant(&db, &write_ctx).await?;
     let passwords = PasswordGate::new(ARGON2_GATE_PERMITS)?;
     let listener = tokio::net::TcpListener::bind(cfg.http_addr)
         .await

@@ -29,6 +29,9 @@ pub struct ResourceRow {
     /// operators write directly.
     pub managed_by: Option<String>,
     pub deleted: bool,
+    /// The version the projector last wrote to kine; the row is due for
+    /// projection while this differs from `version`.
+    pub projected_version: Option<i64>,
     /// The kine revision of the last projection, once projected.
     pub kine_revision: Option<i64>,
     pub updated_at: DateTime<Utc>,
@@ -72,12 +75,21 @@ impl From<StoreError> for ApiError {
     }
 }
 
-type RawRow = (Value, i64, Option<String>, bool, Option<i64>, DateTime<Utc>);
+type RawRow = (
+    Value,
+    i64,
+    Option<String>,
+    bool,
+    Option<i64>,
+    Option<i64>,
+    DateTime<Utc>,
+);
 
-const COLUMNS: &str = "doc, version, managed_by, deleted, kine_revision, updated_at";
+const COLUMNS: &str =
+    "doc, version, managed_by, deleted, projected_version, kine_revision, updated_at";
 
 fn row(kind: Kind, id: Uuid, raw: RawRow) -> ResourceRow {
-    let (doc, version, managed_by, deleted, kine_revision, updated_at) = raw;
+    let (doc, version, managed_by, deleted, projected_version, kine_revision, updated_at) = raw;
     ResourceRow {
         kind,
         id,
@@ -85,6 +97,7 @@ fn row(kind: Kind, id: Uuid, raw: RawRow) -> ResourceRow {
         version,
         managed_by,
         deleted,
+        projected_version,
         kine_revision,
         updated_at,
     }
@@ -226,6 +239,62 @@ pub async fn get(
     Ok(raw.map(|raw| row(kind, id, raw)))
 }
 
+/// Every row, live or a tombstone, of any kind, derived by one of `owners`
+/// (`managed_by`), in write order.
+pub async fn owned_by(
+    conn: &mut PgConnection,
+    owners: &[String],
+) -> Result<Vec<ResourceRow>, DbError> {
+    type OwnedRow = (
+        String,
+        Uuid,
+        Value,
+        i64,
+        Option<String>,
+        bool,
+        Option<i64>,
+        Option<i64>,
+        DateTime<Utc>,
+    );
+    let raw: Vec<OwnedRow> = sqlx::query_as(&format!(
+        "SELECT kind, id, {COLUMNS} FROM gw_resources WHERE managed_by = ANY($1) ORDER BY seq"
+    ))
+    .bind(owners)
+    .fetch_all(conn)
+    .await?;
+    Ok(raw
+        .into_iter()
+        .filter_map(
+            |(
+                kind,
+                id,
+                doc,
+                version,
+                managed_by,
+                deleted,
+                projected_version,
+                kine_revision,
+                updated_at,
+            )| {
+                let kind = Kind::from_segment(&kind)?;
+                Some(row(
+                    kind,
+                    id,
+                    (
+                        doc,
+                        version,
+                        managed_by,
+                        deleted,
+                        projected_version,
+                        kine_revision,
+                        updated_at,
+                    ),
+                ))
+            },
+        )
+        .collect())
+}
+
 /// Every live row of `kind`, by identity and then id.
 pub async fn list(conn: &mut PgConnection, kind: Kind) -> Result<Vec<ResourceRow>, DbError> {
     type ListedRow = (
@@ -234,6 +303,7 @@ pub async fn list(conn: &mut PgConnection, kind: Kind) -> Result<Vec<ResourceRow
         i64,
         Option<String>,
         bool,
+        Option<i64>,
         Option<i64>,
         DateTime<Utc>,
     );
@@ -247,11 +317,28 @@ pub async fn list(conn: &mut PgConnection, kind: Kind) -> Result<Vec<ResourceRow
     Ok(raw
         .into_iter()
         .map(
-            |(id, doc, version, managed_by, deleted, kine_revision, updated_at)| {
+            |(
+                id,
+                doc,
+                version,
+                managed_by,
+                deleted,
+                projected_version,
+                kine_revision,
+                updated_at,
+            )| {
                 row(
                     kind,
                     id,
-                    (doc, version, managed_by, deleted, kine_revision, updated_at),
+                    (
+                        doc,
+                        version,
+                        managed_by,
+                        deleted,
+                        projected_version,
+                        kine_revision,
+                        updated_at,
+                    ),
                 )
             },
         )

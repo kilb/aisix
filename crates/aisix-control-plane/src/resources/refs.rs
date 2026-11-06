@@ -90,6 +90,10 @@ pub(crate) fn model_ref_node_paths(kind: Kind, doc: &mut Value) -> Vec<String> {
 /// - a guardrail attachment's `guardrail_id`, and its `scope_id` when it is
 ///   scoped to a model, an API key or a team;
 /// - a cache policy scoped `applies_to: "api_key:<id>"`;
+/// - a classic rate-limit policy's `scope_ref`, read by its `scope`: a
+///   model, an API key, a team (`team` and `team_member`) or a member (a
+///   user); the gateway matches it against those ids, so a target that does
+///   not exist would be limited by nothing;
 /// - an API key's `team_id` and `user_id`.
 pub fn outgoing(kind: Kind, doc: &Value) -> Vec<Ref> {
     let mut refs = Vec::new();
@@ -166,6 +170,18 @@ pub fn outgoing(kind: Kind, doc: &Value) -> Vec<Ref> {
                     Kind::ApiKeys,
                     Some(&Value::String(key.trim().to_string())),
                 );
+            }
+        }
+        Kind::RateLimitPolicies => {
+            let scoped = match field("scope").and_then(Value::as_str) {
+                Some("model") => Some(Kind::Models),
+                Some("api_key") => Some(Kind::ApiKeys),
+                Some("team" | "team_member") => Some(Kind::Teams),
+                Some("member") => Some(Kind::Users),
+                _ => None,
+            };
+            if let Some(scoped) = scoped {
+                push("/scope_ref".to_string(), scoped, field("scope_ref"));
             }
         }
         Kind::ApiKeys => {
@@ -315,6 +331,27 @@ mod tests {
         let refs = outgoing(Kind::CachePolicies, &by_model);
         assert_eq!(refs.len(), 1);
         assert_eq!((refs[0].kind, refs[0].id.as_str()), (Kind::Models, "m-1"));
+
+        for (scope, target) in [
+            ("model", Kind::Models),
+            ("api_key", Kind::ApiKeys),
+            ("team", Kind::Teams),
+            ("team_member", Kind::Teams),
+            ("member", Kind::Users),
+        ] {
+            let policy = json!({"name": "rl", "scope": scope, "scope_ref": "s-1", "window": "minute", "max_requests": 1});
+            let refs: Vec<(String, Kind, String)> = outgoing(Kind::RateLimitPolicies, &policy)
+                .into_iter()
+                .map(|r| (r.path, r.kind, r.id))
+                .collect();
+            assert_eq!(
+                refs,
+                [("/scope_ref".into(), target, "s-1".into())],
+                "{scope}"
+            );
+        }
+        let conditional = json!({"name": "rl", "conditions": [], "limits": {"rpm": 1}});
+        assert!(outgoing(Kind::RateLimitPolicies, &conditional).is_empty());
 
         let key = json!({"key_hash": "h", "team_id": "t-1", "user_id": null, "allowed_model_ids": ["m-1", "m-2"]});
         let refs: Vec<(String, Kind)> = outgoing(Kind::ApiKeys, &key)
