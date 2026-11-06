@@ -253,9 +253,12 @@ fn responses_reference(body: &Value) -> Option<String> {
 fn responses_node(node: &Value) -> Visit {
     // What lies under these is JSON the caller or the model wrote for its
     // own purposes: a function tool's JSON Schema, a custom tool's grammar,
-    // a tool search call's arguments. None of them carries a field the
-    // upstream resolves to a stored object.
-    if matches!(kind(node), Some("function" | "custom" | "tool_search_call")) {
+    // a tool search call's arguments, the JSON Schemas an MCP server listed.
+    // None of them carries a field the upstream resolves to a stored object.
+    if matches!(
+        kind(node),
+        Some("function" | "custom" | "tool_search_call" | "mcp_list_tools")
+    ) {
         return Visit::Skip;
     }
     match responses_tool_reference(node).or_else(|| responses_input_reference(node)) {
@@ -372,13 +375,14 @@ fn messages_reference(body: &Value) -> Option<String> {
 
 fn messages_node(node: &Value) -> Visit {
     match kind(node) {
-        // The model wrote a tool use's `input`; nothing in it is a content
-        // block the caller sends. The rest of the block is still read.
-        Some(t) if t.ends_with("tool_use") => Visit::DescendExcept("input"),
-        // Whatever the block's type: a stored file is a stored file.
+        // Whatever the block's type, a tool use's included: a stored file is
+        // a stored file. Checked first so no other arm can pass one through.
         _ if node.get("source").and_then(kind) == Some("file") => {
             Visit::Refuse("source.file_id".into())
         }
+        // The model wrote a tool use's `input`; nothing in it is a content
+        // block the caller sends. The rest of the block is still read.
+        Some(t) if t.ends_with("tool_use") => Visit::DescendExcept("input"),
         Some("container_upload") if names(node.get("file_id")) => Visit::Refuse("file_id".into()),
         _ => Visit::Descend,
     }
@@ -580,6 +584,10 @@ mod tests {
             json!({"tools": [{"type": "custom", "name": "c", "format": {"type": "grammar",
                 "syntax": "lark", "definition": "start: \"x\"",
                 "examples": {"type": "input_image", "file_id": "file-x"}}}]}),
+            // The JSON Schemas an MCP server listed are the server's own.
+            json!({"input": [{"type": "mcp_list_tools", "id": "l", "server_label": "s",
+                "tools": [{"name": "t", "input_schema": {"type": "object",
+                    "default": {"type": "input_file", "file_id": "file-x"}}}]}]}),
             json!({"tool_choice": {"type": "allowed_tools", "mode": "auto",
                                    "tools": [{"type": "mcp", "server_label": "s"}]}}),
             json!({"prompt_cache_options": {"mode": "explicit"},
@@ -682,6 +690,14 @@ mod tests {
             (
                 user(json!([{"type": "container_upload", "file_id": "file_1"}])),
                 "messages[0].content[0].file_id",
+            ),
+            // A tool use's own file source is still a stored file; only its
+            // model-written `input` is exempt.
+            (
+                json!({"model": "m", "max_tokens": 1, "messages": [{"role": "assistant",
+                    "content": [{"type": "tool_use", "id": "t", "name": "x", "input": {},
+                                 "source": {"type": "file", "file_id": "file_1"}}]}]}),
+                "messages[0].content[0].source.file_id",
             ),
             (
                 json!({"diagnostics": {"previous_message_id": "msg_1"}, "messages": []}),
