@@ -67,9 +67,12 @@ impl Rate {
     }
 }
 
-// The engine computes a charge as quantity × rate × (10_000 − discount bps)
-// in u128. At the cap, that cannot overflow for any u64 quantity.
-const _: () = assert!(Rate::MAX.0 as u128 * 10_000 <= u128::MAX / u64::MAX as u128);
+// The engine computes a charge as Σ quantity × rate × (10_000 − discount bps)
+// in u128, over at most one line per dimension. At the cap, that sum cannot
+// overflow even with every quantity at u64::MAX.
+const _: () = assert!(
+    Dimension::ALL.len() as u128 * Rate::MAX.0 as u128 * 10_000 <= u128::MAX / u64::MAX as u128
+);
 
 /// The shortest exact form: no trailing zeros, no `.` for a whole amount.
 impl fmt::Display for Rate {
@@ -356,13 +359,15 @@ impl RateCard {
     /// Checks every rule a card is written under, beyond each rate's format:
     ///
     /// - every rate is at most `Rate::MAX`, however the card was built;
-    /// - the card has a `default` tier, and every tier name matches
-    ///   `^[a-z0-9][a-z0-9_-]{0,31}$`;
+    /// - the card has a `default` tier, and every tier name is one a served
+    ///   tier can select: it matches `^[a-z0-9][a-z0-9_-]{0,31}$` and is not
+    ///   `standard`, an alias of `default`;
     /// - in each tier, band thresholds are above 0 and strictly increasing;
     /// - every band carries every optional rate its own tier's base carries;
     /// - every other tier has bands at exactly the default tier's
-    ///   thresholds, and its base carries every optional rate the default
-    ///   base carries.
+    ///   thresholds; its base carries every optional rate the default base
+    ///   carries, and each of its bands every optional rate the default band
+    ///   at the same threshold carries.
     ///
     /// Together these make a missing rate impossible to fill silently from a
     /// more expensive one: a band never falls back to its base, and a tier
@@ -374,7 +379,9 @@ impl RateCard {
             .get(&default_tier)
             .ok_or(RateCardError::NoDefaultTier)?;
         for (tier, rates) in &self.0 {
-            if !is_tier_name(tier.as_str()) {
+            // A name `normalize` does not give back unchanged can never be
+            // selected, so its prices would be silently ignored.
+            if ServiceTier::normalize(Some(tier.as_str()), false).as_ref() != Some(tier) {
                 return Err(RateCardError::BadTierName(tier.0.clone()));
             }
             rates.base.check_cap()?;
@@ -401,6 +408,16 @@ impl RateCard {
             }
             if !rates.thresholds().eq(default.thresholds()) {
                 return Err(RateCardError::BandsDifferFromDefault { tier: tier.clone() });
+            }
+            // Same thresholds, so the bands pair up by position.
+            for (band, default_band) in rates.long_context.iter().zip(&default.long_context) {
+                if let Some(dimension) = band.rates.first_missing_from(&default_band.rates) {
+                    return Err(RateCardError::BandMissingRate {
+                        tier: tier.clone(),
+                        above: band.above_input_tokens,
+                        dimension,
+                    });
+                }
             }
             if let Some(dimension) = rates.base.first_missing_from(&default.base) {
                 return Err(RateCardError::TierMissingRate {
@@ -494,8 +511,9 @@ impl<'de> Deserialize<'de> for RateCard {
 }
 
 /// A service tier's name: `^[a-z0-9][a-z0-9_-]{0,31}$`. `default` is the
-/// standard tier and `batch` the batch tier; any other name is the
-/// lowercased tier the upstream reports it served.
+/// standard tier (a served `standard` is an alias of it, never a tier of its
+/// own) and `batch` the batch tier; any other name is the lowercased tier the
+/// upstream reports it served.
 ///
 /// Deserializing accepts any string, so that a card with a bad name is
 /// reported by [`RateCard::validate`] as `BadTierName`.
@@ -527,10 +545,6 @@ impl ServiceTier {
     /// `standard` (`anthropic-sdk-python: src/anthropic/types/usage.py`,
     /// `service_tier`); the gateway records the value verbatim (the
     /// `service_tier` field of `aisix_obs::UsageEvent`).
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the engine (Task 6) is the first caller")
-    )]
     pub(crate) fn normalize(served: Option<&str>, is_batch: bool) -> Option<ServiceTier> {
         if is_batch {
             return Some(ServiceTier::batch());
@@ -574,7 +588,10 @@ pub enum RateCardError {
     Malformed(String),
     #[error("rate card has no default tier")]
     NoDefaultTier,
-    #[error("service tier name {0:?} does not match ^[a-z0-9][a-z0-9_-]{{0,31}}$")]
+    #[error(
+        "service tier name {0:?} can never be selected: a name matches \
+         ^[a-z0-9][a-z0-9_-]{{0,31}}$, and `standard` is an alias of `default`"
+    )]
     BadTierName(String),
     #[error("long-context band thresholds must strictly increase")]
     BandsNotRising,
@@ -586,7 +603,8 @@ pub enum RateCardError {
         dimension: Dimension,
     },
     #[error(
-        "tier {tier}'s band above {above} input tokens has no {dimension} rate, which its base has"
+        "tier {tier}'s band above {above} input tokens has no {dimension} rate, which its base \
+         or the default tier's band at that threshold has"
     )]
     BandMissingRate {
         tier: ServiceTier,
@@ -757,6 +775,37 @@ mod tests {
     }
 
     #[test]
+    fn all_names_every_rate_field() {
+        // A struct literal, so a new field must be written here; then this
+        // fails until `Dimension::ALL` names it too.
+        let r = Some(Rate(1));
+        let full = Rates {
+            input: Rate(1),
+            output: Rate(1),
+            cache_read: r,
+            cache_write: r,
+            cache_write_1h: r,
+            reasoning: r,
+            audio_input: r,
+            audio_output: r,
+            image_input: r,
+            image_output: r,
+            web_search: r,
+        };
+        let json = serde_json::to_value(&full).unwrap();
+        let fields: std::collections::BTreeSet<&str> = json
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let named: std::collections::BTreeSet<&str> =
+            Dimension::ALL.iter().map(|d| d.as_str()).collect();
+        assert_eq!(fields.len(), Dimension::ALL.len());
+        assert_eq!(fields, named);
+    }
+
+    #[test]
     fn a_card_with_an_unknown_rate_is_refused() {
         assert!(serde_json::from_str::<RateCard>(
             r#"{"default":{"base":{"input":"1","output":"2","image_count":"3"}}}"#
@@ -870,6 +919,23 @@ mod tests {
     }
 
     #[test]
+    fn a_tier_spelled_as_a_default_alias_is_refused() {
+        // A served `standard` selects `default`, so a `standard` key could
+        // never be selected and its prices would be silently ignored.
+        let c = card(
+            r#"{"default":{"base":{"input":"1","output":"2"}},
+                "standard":{"base":{"input":"9","output":"9"}}}"#,
+        );
+        let err = c.validate().unwrap_err();
+        assert_eq!(err, RateCardError::BadTierName("standard".to_owned()));
+        assert!(
+            err.to_string()
+                .contains("`standard` is an alias of `default`"),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn a_rate_above_the_cap_is_refused_however_it_was_built() {
         let mut c = one_rate_card(Rate(1));
         assert_eq!(c.validate(), Ok(()));
@@ -878,6 +944,47 @@ mod tests {
             .base
             .cache_read = Some(Rate(Rate::MAX.0 + 1));
         assert_eq!(c.validate(), Err(RateCardError::RateTooLarge));
+    }
+
+    #[test]
+    fn the_cap_binds_every_tier_and_band_and_admits_the_cap_itself() {
+        let over = Rate(Rate::MAX.0 + 1);
+        let (default, batch) = (ServiceTier::default_tier(), ServiceTier::batch());
+        let two_tiers = || {
+            card(
+                r#"{"default":{"base":{"input":"1","output":"2","cache_read":"0.1"},
+                    "long_context":[{"above_input_tokens":200000,"rates":{"input":"2","output":"3","cache_read":"0.2"}}]},
+                    "batch":{"base":{"input":"0.5","output":"1","cache_read":"0.05"},
+                    "long_context":[{"above_input_tokens":200000,"rates":{"input":"1","output":"1.5","cache_read":"0.1"}}]}}"#,
+            )
+        };
+        assert_eq!(two_tiers().validate(), Ok(()));
+
+        let mut c = two_tiers();
+        c.0.get_mut(&default).unwrap().long_context[0].rates.output = over;
+        assert_eq!(
+            c.validate(),
+            Err(RateCardError::RateTooLarge),
+            "default band"
+        );
+        let mut c = two_tiers();
+        c.0.get_mut(&batch).unwrap().base.input = over;
+        assert_eq!(c.validate(), Err(RateCardError::RateTooLarge), "batch base");
+        let mut c = two_tiers();
+        c.0.get_mut(&batch).unwrap().long_context[0]
+            .rates
+            .cache_read = Some(over);
+        assert_eq!(c.validate(), Err(RateCardError::RateTooLarge), "batch band");
+
+        // Exactly the cap, in every rate of every tier and band, is valid.
+        let mut c = two_tiers();
+        for tier in c.0.values_mut() {
+            let bands = tier.long_context.iter_mut().map(|b| &mut b.rates);
+            for r in std::iter::once(&mut tier.base).chain(bands) {
+                (r.input, r.output, r.cache_read) = (Rate::MAX, Rate::MAX, Some(Rate::MAX));
+            }
+        }
+        assert_eq!(c.validate(), Ok(()));
     }
 
     #[test]
@@ -922,6 +1029,55 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn a_non_default_band_without_a_rate_its_own_base_has_is_refused() {
+        // batch's base carries cache_read and default's does not, so only
+        // batch's own base can say its band is missing one.
+        let c = card(
+            r#"{"default":{"base":{"input":"1","output":"2"},
+                "long_context":[{"above_input_tokens":200000,"rates":{"input":"2","output":"3"}}]},
+                "batch":{"base":{"input":"0.5","output":"1","cache_read":"0.05"},
+                "long_context":[{"above_input_tokens":200000,"rates":{"input":"1","output":"1.5"}}]}}"#,
+        );
+        assert_eq!(
+            c.validate(),
+            Err(RateCardError::BandMissingRate {
+                tier: ServiceTier::batch(),
+                above: 200_000,
+                dimension: Dimension::CacheRead,
+            })
+        );
+    }
+
+    #[test]
+    fn a_non_default_band_without_a_rate_the_default_band_has_is_refused() {
+        // Ruling P2-R3: default's band carries a cache_read rate its base
+        // does not. Without one of its own, a long flex prompt's cache reads
+        // would bill at the flex band's input rate.
+        let flex = ServiceTier::normalize(Some("flex"), false).unwrap();
+        let c = card(
+            r#"{"default":{"base":{"input":"1","output":"2"},
+                "long_context":[{"above_input_tokens":200000,"rates":{"input":"2","output":"3","cache_read":"0.2"}}]},
+                "flex":{"base":{"input":"0.5","output":"1"},
+                "long_context":[{"above_input_tokens":200000,"rates":{"input":"1","output":"1.5"}}]}}"#,
+        );
+        assert_eq!(
+            c.validate(),
+            Err(RateCardError::BandMissingRate {
+                tier: flex,
+                above: 200_000,
+                dimension: Dimension::CacheRead,
+            })
+        );
+        let c = card(
+            r#"{"default":{"base":{"input":"1","output":"2"},
+                "long_context":[{"above_input_tokens":200000,"rates":{"input":"2","output":"3","cache_read":"0.2"}}]},
+                "flex":{"base":{"input":"0.5","output":"1"},
+                "long_context":[{"above_input_tokens":200000,"rates":{"input":"1","output":"1.5","cache_read":"0.1"}}]}}"#,
+        );
+        assert_eq!(c.validate(), Ok(()));
     }
 
     #[test]
