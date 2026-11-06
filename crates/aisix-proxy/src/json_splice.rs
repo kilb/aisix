@@ -944,7 +944,12 @@ mod tests {
             Some(r#"{"a":true}"#)
         );
         // An escaped spelling of the key is the same key.
-        assert_eq!(remove(r#"{"drop":1,"a":2}"#).as_deref(), Some(r#"{"a":2}"#));
+        let escaped = r#"{"dr\u006fp":1,"a":2}"#;
+        assert!(
+            escaped.contains(r"\u006f"),
+            "the key is spelled with an escape"
+        );
+        assert_eq!(remove(escaped).as_deref(), Some(r#"{"a":2}"#));
     }
 
     #[test]

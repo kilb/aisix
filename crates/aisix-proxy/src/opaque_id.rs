@@ -125,26 +125,6 @@ pub(crate) fn seal_key(id_key: &[u8; 32]) -> [u8; 32] {
     derive_key(id_key, b"seal-v1")
 }
 
-/// A seal key that never prints.
-#[derive(Clone, Copy)]
-pub(crate) struct SealKey([u8; 32]);
-
-impl SealKey {
-    pub(crate) fn of(platform: &crate::platform::PlatformSettings) -> Self {
-        SealKey(seal_key(&platform.id_key))
-    }
-
-    pub(crate) fn bytes(&self) -> &[u8; 32] {
-        &self.0
-    }
-}
-
-impl std::fmt::Debug for SealKey {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("SealKey(***)")
-    }
-}
-
 /// The longest leading `<letters and digits>_` a sealed id keeps in the clear.
 const MAX_KEPT_PREFIX: usize = 16;
 
@@ -174,6 +154,11 @@ fn b64() -> base64::engine::GeneralPurpose {
 /// tell one upstream's id format from another's.
 const SEAL_BUCKET: usize = 64;
 
+/// The shortest id [`Sealer::seal`] produces: no kept prefix, and the
+/// base64url form of a nonce, one bucket and a tag. Anything shorter cannot
+/// be one, so it is passed over before any decoding or key setup.
+const MIN_SEALED_LEN: usize = ((aead::NONCE_LEN + SEAL_BUCKET + aead::MAX_TAG_LEN) * 4).div_ceil(3);
+
 /// `id`, a `0x80` marker, then zeros up to the bucket (ISO/IEC 7816-4
 /// padding): unambiguous for any id, of any length, at one byte's cost.
 fn pad(id: &str) -> Vec<u8> {
@@ -199,13 +184,30 @@ fn unpad(padded: &[u8]) -> Option<&[u8]> {
 /// first. The AES-256-GCM key is derived from the seal key under its own
 /// label, so the nonce function and the cipher never share key material. The
 /// plaintext is padded to [`SEAL_BUCKET`] first.
-struct Sealer {
+///
+/// Building one sets up both keys, so a request builds one and seals or
+/// unseals every id it handles with it.
+#[derive(Clone)]
+pub(crate) struct Sealer {
     nonce_key: hmac::Key,
     cipher: aead::LessSafeKey,
 }
 
+impl std::fmt::Debug for Sealer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Sealer(***)")
+    }
+}
+
 impl Sealer {
-    fn new(key: &[u8; 32]) -> Self {
+    /// The sealer of platform mode: its keys come from [`seal_key`].
+    pub(crate) fn of(platform: &crate::platform::PlatformSettings) -> Self {
+        Self::new(&seal_key(&platform.id_key))
+    }
+
+    pub(crate) fn new(key: &[u8; 32]) -> Self {
+        #[cfg(test)]
+        tests::SEALERS_BUILT.with(|n| n.set(n.get() + 1));
         let cipher = aead::UnboundKey::new(&aead::AES_256_GCM, &derive_key(key, b"seal-aead"))
             .expect("a 32-byte key is the length AES-256-GCM takes");
         Self {
@@ -227,7 +229,7 @@ impl Sealer {
     /// `<kept prefix>` + base64url(nonce || ciphertext || tag), the ciphertext
     /// of the padded id, with the kept prefix as associated data so it cannot
     /// be swapped for another.
-    fn seal(&self, id: &str) -> String {
+    pub(crate) fn seal(&self, id: &str) -> String {
         let prefix = kept_prefix(id);
         let nonce = self.nonce(id);
         let mut sealed = pad(id);
@@ -244,7 +246,12 @@ impl Sealer {
         format!("{prefix}{}", b64().encode(payload))
     }
 
-    fn unseal(&self, id: &str) -> Option<String> {
+    /// The id [`Self::seal`] was given; `None` for anything this sealer did
+    /// not seal.
+    pub(crate) fn unseal(&self, id: &str) -> Option<String> {
+        if id.len() < MIN_SEALED_LEN {
+            return None;
+        }
         // The payload's alphabet includes `_`, so an id sealed without a
         // prefix is also tried whole.
         id.find('_')
@@ -275,12 +282,18 @@ impl Sealer {
 /// Seal an upstream id reversibly. The id's leading `<prefix>_` stays in the
 /// clear (see [`kept_prefix`]) so the sealed id still passes an upstream's
 /// prefix check; the rest names nothing, not even the id's length.
+///
+/// The one-off form of [`Sealer::seal`], for a caller with a single id; one
+/// that handles several builds one [`Sealer`] and reuses it.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn seal_id(key: &[u8; 32], upstream_id: &str) -> String {
     Sealer::new(key).seal(upstream_id)
 }
 
 /// The upstream id a [`seal_id`] value was made from; `None` for anything
-/// this key did not seal, which the caller passes through untouched.
+/// this key did not seal, which the caller passes through untouched. The
+/// one-off form of [`Sealer::unseal`].
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn unseal_id(key: &[u8; 32], id: &str) -> Option<String> {
     Sealer::new(key).unseal(id)
 }
@@ -290,66 +303,69 @@ pub(crate) fn unseal_id(key: &[u8; 32], id: &str) -> Option<String> {
 /// object's `caller_id` names a call too.
 const RESPONSES_ITEM_ID_FIELDS: [&str; 3] = ["id", "call_id", "approval_request_id"];
 
-fn item_id_slots(item: &mut Value) -> impl Iterator<Item = &mut String> {
-    let mut slots = Vec::new();
-    if let Value::Object(map) = item {
-        for (field, value) in map.iter_mut() {
-            match value {
-                Value::String(s) if RESPONSES_ITEM_ID_FIELDS.contains(&field.as_str()) => {
-                    slots.push(s);
+/// Run `visit` over every id field of one item.
+fn for_each_item_id(item: &mut Value, mut visit: impl FnMut(&mut String)) {
+    let Value::Object(map) = item else {
+        return;
+    };
+    for (field, value) in map.iter_mut() {
+        match value {
+            Value::String(s) if RESPONSES_ITEM_ID_FIELDS.contains(&field.as_str()) => visit(s),
+            Value::Object(caller) if field == "caller" => {
+                if let Some(Value::String(s)) = caller.get_mut("caller_id") {
+                    visit(s);
                 }
-                Value::Object(caller) if field == "caller" => {
-                    if let Some(Value::String(s)) = caller.get_mut("caller_id") {
-                        slots.push(s);
-                    }
-                }
-                _ => {}
             }
+            _ => {}
         }
     }
-    slots.into_iter()
 }
 
-/// Seal every item id of a Responses `Response` object, and drop the usage
-/// counter the gateway adds beside OpenAI's (an Anthropic-shape cache write,
-/// already counted in `input_tokens`). The response-level `id` is not an item
-/// id and is left alone.
-pub(crate) fn seal_responses_body(key: &[u8; 32], body: &mut Value) {
+/// Seal every item id of a Responses `Response` object. The response-level
+/// `id` is not an item id and is left alone, and so is every other field.
+pub(crate) fn seal_responses_body(sealer: &Sealer, body: &mut Value) {
     if let Some(items) = body.get_mut("output").and_then(Value::as_array_mut) {
         for item in items {
-            seal_item(key, item);
+            seal_item(sealer, item);
         }
-    }
-    if let Some(details) = body
-        .pointer_mut("/usage/input_tokens_details")
-        .and_then(Value::as_object_mut)
-    {
-        details.remove("cache_creation_tokens");
     }
 }
 
-fn seal_item(key: &[u8; 32], item: &mut Value) {
-    for slot in item_id_slots(item) {
+fn seal_item(sealer: &Sealer, item: &mut Value) {
+    for_each_item_id(item, |slot| {
         if !slot.is_empty() {
-            *slot = seal_id(key, slot);
+            *slot = sealer.seal(slot);
         }
-    }
+    });
 }
 
 /// [`seal_responses_body`] for one parsed Responses stream event: the item of
 /// `response.output_item.*`, the `item_id` of every per-item event, and the
 /// Response object of the snapshot events.
-pub(crate) fn seal_responses_event(key: &[u8; 32], event: &mut Value) {
+pub(crate) fn seal_responses_event(sealer: &Sealer, event: &mut Value) {
     if let Some(item) = event.get_mut("item") {
-        seal_item(key, item);
+        seal_item(sealer, item);
     }
     if let Some(Value::String(id)) = event.get_mut("item_id") {
         if !id.is_empty() {
-            *id = seal_id(key, id);
+            *id = sealer.seal(id);
         }
     }
     if let Some(response) = event.get_mut("response") {
-        seal_responses_body(key, response);
+        seal_responses_body(sealer, response);
+    }
+}
+
+/// Drop the usage counter the Responses bridge writes beside OpenAI's own:
+/// an Anthropic-shape cache write, which would name the upstream's vendor and
+/// is already counted in `input_tokens`. Only for a Response object the
+/// gateway built itself; a relayed one keeps every field its upstream wrote.
+pub(crate) fn drop_bridged_usage_extensions(response: &mut Value) {
+    if let Some(details) = response
+        .pointer_mut("/usage/input_tokens_details")
+        .and_then(Value::as_object_mut)
+    {
+        details.remove("cache_creation_tokens");
     }
 }
 
@@ -398,16 +414,28 @@ pub(crate) fn responses_event_id_path(path: &[PathSeg]) -> bool {
 ///   Expected an ID that begins with 'fs'."
 ///   (<https://community.openai.com/t/1373183>). That is why a sealed id
 ///   keeps the original's `<prefix>_`.
-pub(crate) fn unseal_responses_input(key: &[u8; 32], body: &mut Value) {
+///
+/// The request body has no size cap of its own, so this stays one walk: a
+/// value too short to be a seal is passed over unread, and the one
+/// [`Sealer`] the request needs is built only when a value could be one.
+pub(crate) fn unseal_responses_input(
+    platform: &crate::platform::PlatformSettings,
+    body: &mut Value,
+) {
     let Some(items) = body.get_mut("input").and_then(Value::as_array_mut) else {
         return;
     };
+    let mut sealer: Option<Sealer> = None;
     for item in items {
-        for slot in item_id_slots(item) {
-            if let Some(original) = unseal_id(key, slot) {
+        for_each_item_id(item, |slot| {
+            if slot.len() < MIN_SEALED_LEN {
+                return;
+            }
+            let sealer = sealer.get_or_insert_with(|| Sealer::of(platform));
+            if let Some(original) = sealer.unseal(slot) {
                 *slot = original;
             }
-        }
+        });
     }
 }
 
@@ -569,11 +597,20 @@ impl MessagesIds {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use serde_json::json;
 
     const K: [u8; 32] = [7u8; 32];
+
+    thread_local! {
+        /// How many [`Sealer`]s this test's thread has built.
+        pub(crate) static SEALERS_BUILT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    fn sealers_built() -> usize {
+        SEALERS_BUILT.with(std::cell::Cell::get)
+    }
 
     #[test]
     fn a_tool_call_id_maps_the_same_way_every_time() {
@@ -804,7 +841,7 @@ mod tests {
     }
 
     #[test]
-    fn a_response_body_seals_every_item_id_and_drops_gateway_usage_extensions() {
+    fn a_response_body_seals_every_item_id_and_keeps_every_other_field() {
         let mut body = json!({
             "id": "resp_up",
             "output": [
@@ -815,7 +852,7 @@ mod tests {
             ],
             "usage": {"input_tokens": 9, "input_tokens_details": {"cached_tokens": 1, "cache_creation_tokens": 3}},
         });
-        seal_responses_body(&K, &mut body);
+        seal_responses_body(&Sealer::new(&K), &mut body);
         let text = body.to_string();
         assert!(!text.contains("bdrk") && !text.contains("prog_1"), "{text}");
         // The response-level id is not an item id.
@@ -829,12 +866,28 @@ mod tests {
             body["output"][2]["approval_request_id"],
             seal_id(&K, "mcpr_bdrk_1")
         );
-        // Every other field survives as it was.
+        // Every other field survives as it was, the upstream's own usage
+        // counters included.
         assert_eq!(body["output"][1]["name"], "f");
         assert_eq!(
             body["usage"]["input_tokens_details"],
-            json!({"cached_tokens": 1})
+            json!({"cached_tokens": 1, "cache_creation_tokens": 3})
         );
+    }
+
+    #[test]
+    fn a_bridged_answer_drops_only_the_usage_counter_the_bridge_added() {
+        let mut body = json!({"id": "resp_gw", "usage": {"input_tokens": 9,
+            "input_tokens_details": {"cached_tokens": 1, "cache_write_tokens": 2, "cache_creation_tokens": 3}}});
+        drop_bridged_usage_extensions(&mut body);
+        assert_eq!(
+            body,
+            json!({"id": "resp_gw", "usage": {"input_tokens": 9,
+                "input_tokens_details": {"cached_tokens": 1, "cache_write_tokens": 2}}})
+        );
+        let mut no_usage = json!({"id": "resp_gw"});
+        drop_bridged_usage_extensions(&mut no_usage);
+        assert_eq!(no_usage, json!({"id": "resp_gw"}));
     }
 
     #[test]
@@ -845,8 +898,9 @@ mod tests {
         let mut done = json!({"type": "response.completed", "response": {"id": "resp_up",
             "output": [{"type": "function_call", "id": "fc_bdrk_1", "call_id": "call_bdrk_1"}],
             "usage": {"input_tokens_details": {"cached_tokens": 0, "cache_creation_tokens": 2}}}});
+        let sealer = Sealer::new(&K);
         for event in [&mut added, &mut delta, &mut done] {
-            seal_responses_event(&K, event);
+            seal_responses_event(&sealer, event);
         }
         let item_id = seal_id(&K, "fc_bdrk_1");
         assert_eq!(added["item"]["id"], item_id);
@@ -859,7 +913,7 @@ mod tests {
         assert_eq!(done["response"]["id"], "resp_up");
         assert_eq!(
             done["response"]["usage"]["input_tokens_details"],
-            json!({"cached_tokens": 0})
+            json!({"cached_tokens": 0, "cache_creation_tokens": 2})
         );
     }
 
@@ -889,20 +943,29 @@ mod tests {
 
     #[test]
     fn inbound_input_items_get_the_upstreams_own_ids_back() {
+        let platform = crate::platform::PlatformSettings::from_secret("s");
+        let k = seal_key(&platform.id_key);
+        let seal_id = |id: &str| seal_id(&k, id);
         let mut body = json!({
             "model": "m",
             "previous_response_id": "resp_up",
             "input": [
-                {"type": "function_call", "id": seal_id(&K, "fc_bdrk_1"),
-                 "call_id": seal_id(&K, "call_bdrk_1"), "name": "f", "arguments": "{}"},
-                {"type": "function_call_output", "call_id": seal_id(&K, "call_bdrk_1"), "output": "ok"},
-                {"type": "mcp_approval_response", "approval_request_id": seal_id(&K, "mcpr_1"), "approve": true},
+                {"type": "function_call", "id": seal_id("fc_bdrk_1"),
+                 "call_id": seal_id("call_bdrk_1"), "name": "f", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": seal_id("call_bdrk_1"), "output": "ok"},
+                {"type": "mcp_approval_response", "approval_request_id": seal_id("mcpr_1"), "approve": true},
                 {"type": "function_call_output", "call_id": "call_client_made", "output": "x",
-                 "caller": {"type": "program", "caller_id": seal_id(&K, "call_p")}},
+                 "caller": {"type": "program", "caller_id": seal_id("call_p")}},
                 {"type": "message", "role": "user", "content": "hi", "id": "msg_client"},
             ],
         });
-        unseal_responses_input(&K, &mut body);
+        let before = sealers_built();
+        unseal_responses_input(&platform, &mut body);
+        assert_eq!(
+            sealers_built() - before,
+            1,
+            "one sealer for the whole request"
+        );
         assert_eq!(body["input"][0]["id"], "fc_bdrk_1");
         assert_eq!(body["input"][0]["call_id"], "call_bdrk_1");
         assert_eq!(body["input"][1]["call_id"], "call_bdrk_1");
@@ -914,8 +977,35 @@ mod tests {
 
         // A string input has no items to restore.
         let mut plain = json!({"model": "m", "input": "hi"});
-        unseal_responses_input(&K, &mut plain);
+        unseal_responses_input(&platform, &mut plain);
         assert_eq!(plain, json!({"model": "m", "input": "hi"}));
+    }
+
+    /// A body of many items whose ids are too short to be seals is one walk:
+    /// no key is set up and no value is decoded.
+    #[test]
+    fn inbound_ids_too_short_to_be_seals_cost_no_key_setup() {
+        let platform = crate::platform::PlatformSettings::from_secret("s");
+        let items: Vec<Value> = (0..10_000)
+            .map(|i| json!({"type": "function_call_output", "call_id": format!("c{i}"), "id": "x", "output": ""}))
+            .collect();
+        let mut body = json!({"model": "m", "input": items});
+        let expected = body.clone();
+        let before = sealers_built();
+        unseal_responses_input(&platform, &mut body);
+        assert_eq!(
+            sealers_built(),
+            before,
+            "no sealer for a body with no candidate"
+        );
+        assert_eq!(body, expected);
+
+        // The shortest seal there is clears the bar; one shorter cannot be one.
+        let shortest = seal_id(&K, "");
+        assert_eq!(shortest.len(), MIN_SEALED_LEN);
+        let sealer = Sealer::new(&K);
+        assert_eq!(sealer.unseal(&shortest).as_deref(), Some(""));
+        assert_eq!(sealer.unseal(&shortest[1..]), None);
     }
 
     #[test]

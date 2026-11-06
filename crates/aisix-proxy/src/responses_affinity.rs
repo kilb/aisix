@@ -254,7 +254,7 @@ pub(crate) struct ResponseMark {
     previous_echo: Option<(String, String)>,
     /// Platform mode: output item ids leave sealed
     /// ([`crate::opaque_id::seal_id`]), and channel metrics do not leave.
-    seal: Option<crate::opaque_id::SealKey>,
+    seal: Option<std::sync::Arc<crate::opaque_id::Sealer>>,
 }
 
 #[derive(Clone, Copy)]
@@ -270,19 +270,20 @@ impl ResponseMark {
         self.target_id.is_none() && self.previous_echo.is_none() && self.seal.is_none()
     }
 
-    /// Seal the response's item ids when platform mode is on.
+    /// Seal the response's item ids when platform mode is on, with one
+    /// [`crate::opaque_id::Sealer`] for every frame of the response.
     pub(crate) fn sealing_ids(
         mut self,
         platform: Option<&crate::platform::PlatformSettings>,
     ) -> Self {
-        self.seal = platform.map(crate::opaque_id::SealKey::of);
+        self.seal = platform.map(|p| std::sync::Arc::new(crate::opaque_id::Sealer::of(p)));
         self
     }
 
-    /// The key item ids are sealed under, for an encoder that builds the
-    /// response itself.
-    pub(crate) fn seal_key(&self) -> Option<crate::opaque_id::SealKey> {
-        self.seal
+    /// The sealer item ids are sealed with, for an encoder that builds the
+    /// response itself; `None` outside platform mode.
+    pub(crate) fn sealer(&self) -> Option<std::sync::Arc<crate::opaque_id::Sealer>> {
+        self.seal.clone()
     }
 
     /// The `previous_response_id` as the client sent it, when it was tagged:
@@ -318,8 +319,9 @@ impl ResponseMark {
                 .map(|(_, sent)| sent.clone()),
             Slot::ItemId => self
                 .seal
+                .as_ref()
                 .filter(|_| !value.is_empty())
-                .map(|key| crate::opaque_id::seal_id(key.bytes(), value)),
+                .map(|sealer| sealer.seal(value)),
         }
     }
 
@@ -350,8 +352,8 @@ impl ResponseMark {
                 }
             }
         }
-        if let Some(key) = &self.seal {
-            crate::opaque_id::seal_responses_body(key.bytes(), body);
+        if let Some(sealer) = &self.seal {
+            crate::opaque_id::seal_responses_body(sealer, body);
             if let Some(map) = body.as_object_mut() {
                 map.remove(crate::opaque_id::CHANNEL_METRICS_KEY);
             }
@@ -546,8 +548,14 @@ mod tests {
                         "name": "f", "arguments": "{}"},
                        {"type": "reasoning", "id": "rs_1", "encrypted_content": "CT", "summary": []}],
             "amazon-bedrock-invocationMetrics": {"inputTokenCount": 1},
+            "usage": {"input_tokens": 9, "input_tokens_details": {"cached_tokens": 1, "cache_creation_tokens": 3}},
         });
         mark.apply_to_body(&mut body);
+        // A relayed answer keeps every usage field its upstream wrote.
+        assert_eq!(
+            body["usage"],
+            json!({"input_tokens": 9, "input_tokens_details": {"cached_tokens": 1, "cache_creation_tokens": 3}})
+        );
         assert_eq!(body["id"], mark_response_id("m-1", "resp_up"));
         assert_eq!(body["output"][0]["id"], seal_id(&key, "fc_bdrk_1"));
         assert_eq!(body["output"][0]["call_id"], seal_id(&key, "call_bdrk_1"));
@@ -589,10 +597,25 @@ mod tests {
         let frame =
             b"data: {\"type\":\"response.output_item.added\",\"item\":{\"id\":\"fc_1\"}}\n\n";
         assert!(mark.apply_to_sse_frame(frame).is_none());
-        assert!(mark.seal_key().is_none());
+        assert!(mark.sealer().is_none());
 
         // Platform mode alone, outside a routing group, still seals.
         let (mark, _) = sealing_mark(None);
         assert!(mark.apply_to_sse_frame(frame).is_some());
+    }
+
+    /// The keys are set up once per response, not once per frame or id.
+    #[test]
+    fn a_sealing_mark_builds_one_sealer_for_every_frame() {
+        let built = || crate::opaque_id::tests::SEALERS_BUILT.with(std::cell::Cell::get);
+        let before = built();
+        let (mark, _) = sealing_mark(None);
+        let frame = b"data: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_1\",\"delta\":\"x\"}\n\n";
+        for _ in 0..50 {
+            assert!(mark.apply_to_sse_frame(frame).is_some());
+        }
+        let mut body = json!({"output": [{"id": "fc_1", "call_id": "call_1"}]});
+        mark.apply_to_body(&mut body);
+        assert_eq!(built() - before, 1);
     }
 }

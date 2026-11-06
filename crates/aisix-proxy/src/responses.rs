@@ -397,10 +397,7 @@ pub async fn responses(
     // Platform mode: the item ids a client echoes from an earlier answer
     // leave here sealed; the upstream gets back the ones it issued.
     if let Some(platform) = state.platform() {
-        crate::opaque_id::unseal_responses_input(
-            crate::opaque_id::SealKey::of(platform).bytes(),
-            &mut body,
-        );
+        crate::opaque_id::unseal_responses_input(platform, &mut body);
     }
     let request_id = client.request_id.clone();
     crate::span_facts::note_request(
@@ -2764,7 +2761,7 @@ async fn responses_cross_provider_to_target(
             created_at,
             reply,
         )
-        .sealing_ids(mark.seal_key());
+        .sealing_ids(mark.sealer());
         // Only an output-hook guardrail needs the streamed response text.
         // When attached with a hold-back policy (Window/BufferFull — any
         // block-capable chain), the bridge buffers the SSE and scans before
@@ -3238,6 +3235,11 @@ async fn responses_cross_provider_to_target(
         ),
         _ => None,
     };
+    // Platform mode: the usage this bridge wrote keeps to OpenAI's fields. A
+    // relayed answer keeps its upstream's, so this is not part of the mark.
+    if mark.sealer().is_some() {
+        crate::opaque_id::drop_bridged_usage_extensions(&mut json_body);
+    }
     mark.apply_to_body(&mut json_body);
     let mut response = Json(json_body).into_response();
     if !crate::response_cache::answer_is_storable(&resp) {

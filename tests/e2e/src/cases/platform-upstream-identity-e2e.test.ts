@@ -183,7 +183,7 @@ function anthropicAnswer(): Record<string, unknown> {
     ],
     stop_reason: "tool_use",
     stop_sequence: null,
-    usage: { input_tokens: 9, output_tokens: 4 },
+    usage: { input_tokens: 9, output_tokens: 4, cache_creation_input_tokens: 2 },
     "amazon-bedrock-invocationMetrics": CHANNEL_METRICS,
   };
 }
@@ -201,7 +201,7 @@ function anthropicStream(): string[] {
         model: "upstream-model",
         content: [],
         stop_reason: null,
-        usage: { input_tokens: 9, output_tokens: 1 },
+        usage: { input_tokens: 9, output_tokens: 1, cache_creation_input_tokens: 2 },
       },
     }),
     frame("content_block_start", {
@@ -236,6 +236,14 @@ const FUNCTION_CALL_ITEM = {
   status: "completed",
 };
 
+/** A usage object carrying a counter of the upstream's own beside OpenAI's. */
+const RESPONSES_USAGE = {
+  input_tokens: 9,
+  input_tokens_details: { cached_tokens: 0, cache_creation_tokens: 2 },
+  output_tokens: 4,
+  total_tokens: 13,
+};
+
 /** A Responses upstream answering with a function call. */
 function responsesAnswer(): Record<string, unknown> {
   return {
@@ -245,7 +253,7 @@ function responsesAnswer(): Record<string, unknown> {
     status: "completed",
     model: "upstream-model",
     output: [FUNCTION_CALL_ITEM],
-    usage: { input_tokens: 9, output_tokens: 4, total_tokens: 13 },
+    usage: RESPONSES_USAGE,
     "amazon-bedrock-invocationMetrics": CHANNEL_METRICS,
   };
 }
@@ -281,7 +289,7 @@ function responsesStream(): string[] {
     frame("response.completed", {
       response: {
         ...snapshot("completed", [FUNCTION_CALL_ITEM]),
-        usage: { input_tokens: 9, output_tokens: 4, total_tokens: 13 },
+        usage: RESPONSES_USAGE,
       },
       "amazon-bedrock-invocationMetrics": CHANNEL_METRICS,
     }),
@@ -625,6 +633,9 @@ describe("platform mode e2e: ids name no upstream channel, and tool use still ro
     expect(call.id).not.toBe(UPSTREAM_FC_ITEM_ID);
     expect(call.call_id).not.toBe(UPSTREAM_CALL_ID);
     expect(call.arguments).toBe(WEATHER_ARGS);
+    // A relayed answer comes back in full: the upstream's own usage counters
+    // included, buffered and streamed alike (asserted on the stream below).
+    expect(firstBody.usage).toEqual(RESPONSES_USAGE);
 
     // A stateless continuation: the whole history, echoed.
     const stateless = await post(
@@ -669,6 +680,7 @@ describe("platform mode e2e: ids name no upstream channel, and tool use still ro
     for (const e of perItem) expect(e.item_id, e.type).toBe(call.id);
     const completed = events.find((e) => e.type === "response.completed");
     expect(responsesFunctionCall(completed?.response?.output ?? []).call_id).toBe(call.call_id);
+    expect(completed?.response?.usage).toEqual(RESPONSES_USAGE);
   });
 
   test("/v1/responses from an Anthropic upstream: call ids leave sealed and the upstream gets its own back", async (ctx) => {
@@ -685,9 +697,14 @@ describe("platform mode e2e: ids name no upstream channel, and tool use still ro
     const first = await post("/v1/responses", turn("weather in Paris?"));
     expect(first.status, first.text).toBe(200);
     expectNoUpstreamIdentity(first.text);
-    const call = responsesFunctionCall(JSON.parse(first.text).output);
+    const firstBody = JSON.parse(first.text);
+    const call = responsesFunctionCall(firstBody.output);
     expect(call.call_id).toMatch(/^toolu_/);
     expect(call.call_id).not.toBe(UPSTREAM_TOOL_USE_ID);
+    // The answer the gateway built keeps to the Responses usage fields; the
+    // upstream's cache write is not named beside them.
+    expect(firstBody.usage?.input_tokens_details).toBeDefined();
+    expect(firstBody.usage.input_tokens_details).not.toHaveProperty("cache_creation_tokens");
 
     const second = await post(
       "/v1/responses",
@@ -717,5 +734,8 @@ describe("platform mode e2e: ids name no upstream channel, and tool use still ro
     for (const e of events.filter((e) => e.item_id && e.type.startsWith("response.function_call"))) {
       expect(e.item_id, e.type).toBe(added?.item?.id);
     }
+    const completed = events.find((e) => e.type === "response.completed");
+    expect(completed?.response?.usage?.input_tokens_details).toBeDefined();
+    expect(completed!.response.usage.input_tokens_details).not.toHaveProperty("cache_creation_tokens");
   });
 });

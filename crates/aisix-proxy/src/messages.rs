@@ -8871,6 +8871,75 @@ event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_toke
         assert!(usage.response_text.contains("partial"));
     }
 
+    /// A final frame the upstream never terminated is released at EOF by its
+    /// own code path, one per delivery mode. When that frame is the
+    /// `message_start`, it is the only one naming the message, so platform
+    /// mode has to reach it there too.
+    const UNTERMINATED_MESSAGE_START: &str = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_bdrk_01X\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-up\",\"content\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}}";
+
+    async fn platform_mode_tail(
+        chain: Option<std::sync::Arc<aisix_guardrails::GuardrailChain>>,
+    ) -> String {
+        use futures::StreamExt;
+        let upstream = futures::stream::iter([Ok::<_, crate::stream_timeout::RawStreamError>(
+            bytes::Bytes::from_static(UNTERMINATED_MESSAGE_START.as_bytes()),
+        )]);
+        let now = std::time::Instant::now();
+        let mut stream = super::build_anthropic_passthrough_stream(
+            upstream,
+            now,
+            now,
+            chain,
+            "relay-claude".into(),
+            Some(crate::opaque_id::MessagesIds::new(&[7u8; 32])),
+            Some(4096),
+            None,
+            |_| {},
+        );
+        let mut wire = Vec::new();
+        while let Some(item) = stream.next().await {
+            wire.extend_from_slice(&item.unwrap());
+        }
+        String::from_utf8(wire).unwrap()
+    }
+
+    fn assert_tail_names_no_upstream_message(wire: &str) {
+        // The stream ended without `message_stop`, so an error frame follows
+        // the tail: read the first JSON document after `data: `.
+        let start = wire.find("data: ").expect("the tail is delivered") + "data: ".len();
+        let event: serde_json::Value = serde_json::Deserializer::from_str(&wire[start..])
+            .into_iter()
+            .next()
+            .expect("a JSON payload")
+            .unwrap();
+        let id = event["message"]["id"].as_str().unwrap();
+        assert!(
+            crate::opaque_id::is_platform_id(crate::opaque_id::Surface::Messages, id),
+            "{wire}"
+        );
+        assert_eq!(event["message"]["model"], "relay-claude");
+        assert!(!wire.contains("msg_bdrk_01X"), "{wire}");
+    }
+
+    #[tokio::test]
+    async fn platform_mode_rewrites_an_unterminated_message_start_on_the_live_relay() {
+        assert_tail_names_no_upstream_message(&platform_mode_tail(None).await);
+    }
+
+    #[tokio::test]
+    async fn platform_mode_rewrites_an_unterminated_message_start_held_for_the_scan() {
+        use aisix_guardrails::{Guardrail, GuardrailChain, KeywordBlocklist, KeywordRule};
+        let chain = std::sync::Arc::new(GuardrailChain::new(vec![std::sync::Arc::new(
+            KeywordBlocklist::output_only(vec![KeywordRule::literal("never said")]),
+        )
+            as std::sync::Arc<dyn Guardrail>]));
+        assert!(
+            super::anthropic_stream_hold_policy(Some(chain.as_ref())).is_some(),
+            "the chain holds the stream back"
+        );
+        assert_tail_names_no_upstream_message(&platform_mode_tail(Some(chain)).await);
+    }
+
     /// The same two rules on the cross-provider relay.
     /// A bridged, non-streaming failure feeds the target's health like every
     /// other failure on this endpoint: the admin health surface would
