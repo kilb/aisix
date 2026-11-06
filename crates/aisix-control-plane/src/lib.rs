@@ -21,6 +21,7 @@ pub mod gateways;
 pub mod http;
 pub mod operators;
 pub mod pki;
+pub mod resources;
 pub mod settings;
 
 use auth::password::{LoginThrottle, PasswordGate, ARGON2_GATE_PERMITS};
