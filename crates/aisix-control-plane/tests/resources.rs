@@ -2146,7 +2146,10 @@ async fn operator_configuration_scoped_to_a_derived_row_does_not_hold_its_delete
         .await;
     assert_eq!(r.status, 422, "{r:?}");
     assert_eq!(r.body["details"][0]["path"], "/scope_id");
-    // Deleting what was left behind still works.
+    // Deleting what was left behind still works. This could not fail on the
+    // owned/unowned distinction: nothing references an attachment, so its
+    // delete is never held. The `holders` assertion above is what guards
+    // that distinction.
     let r = admin
         .delete(
             &format!("/admin/resources/guardrail_attachments/{attachment}"),

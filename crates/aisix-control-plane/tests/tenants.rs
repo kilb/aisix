@@ -472,6 +472,62 @@ async fn a_new_tenant_starts_in_the_default_groups() {
     assert_eq!(r.status, 200, "{r:?}");
 }
 
+/// Defaults that name no group (an edit made outside the API, or a row
+/// written before the API refused one) would open every upstream to each
+/// new customer tenant, so no tenant is created from them.
+#[tokio::test]
+async fn a_tenant_is_never_created_from_defaults_that_name_no_group() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let admin = Admin::as_role(&cp, OperatorRole::Operator).await;
+    sqlx::query(
+        "UPDATE cp_settings SET value = jsonb_set(value, '{default_provider_groups}', '[]') \
+         WHERE key = 'tenant_defaults'",
+    )
+    .execute(cp.db().pool())
+    .await
+    .expect("store defaults with no group");
+    let counts = || async {
+        sqlx::query_as::<_, (i64, i64, i64)>(
+            "SELECT (SELECT count(*) FROM tenants), \
+                    (SELECT count(*) FROM gw_resources WHERE kind = 'teams'), \
+                    (SELECT count(*) FROM audit_log WHERE target_kind = 'tenant')",
+        )
+        .fetch_one(cp.db().pool())
+        .await
+        .expect("count")
+    };
+    let before = counts().await;
+
+    let r = admin
+        .post("/admin/tenants", json!({"name": "open-7c1"}))
+        .await;
+    assert_eq!(r.status, 500, "{r:?}");
+    assert_eq!(r.body["code"], "internal");
+    let ctx = ctx(&cp);
+    let signup = cp
+        .db()
+        .tx(move |conn| {
+            async move {
+                tenants::create(
+                    conn,
+                    &ctx,
+                    "open-signup-7c1",
+                    TenantStatus::Pending,
+                    BillingMode::Prepaid,
+                    Actor::System,
+                )
+                .await
+            }
+            .boxed()
+        })
+        .await
+        .expect_err("a pending tenant from the same defaults");
+    assert_eq!(signup.code, "internal");
+    assert_eq!(counts().await, before);
+}
+
 #[tokio::test]
 async fn approving_a_pending_tenant_writes_its_default_limits_policy() {
     let Some(cp) = TestCp::start().await else {

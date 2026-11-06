@@ -357,6 +357,15 @@ pub async fn create(
     actor: Actor<'_>,
 ) -> Result<TenantRow, ApiError> {
     let defaults = settings::tenant_defaults(&mut *conn).await?;
+    // A customer with no group is served by every upstream. The defaults
+    // API refuses to store none, so a stored row without one was written
+    // some other way; creating nothing is the closed failure.
+    if defaults.default_provider_groups.is_empty() {
+        return Err(ApiError::internal(
+            "the stored tenant defaults name no provider group; refusing to create a tenant \
+             that every upstream would serve",
+        ));
+    }
     let approved_by = match (status, actor) {
         (TenantStatus::Active, Actor::Operator(op)) => Some(op.id),
         _ => None,
