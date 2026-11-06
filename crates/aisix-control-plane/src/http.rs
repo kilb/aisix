@@ -26,7 +26,7 @@ use serde_json::{json, Value};
 
 use crate::auth::{MemberRole, OperatorRole};
 use crate::error::{ApiError, Detail};
-use crate::{audit, dp, gateways, members, operators, resources, tenants, AppState};
+use crate::{audit, dp, gateways, members, operators, resources, tenants, usage, AppState};
 
 /// The largest request body either listener reads.
 const MAX_BODY_BYTES: usize = 1 << 20;
@@ -210,9 +210,21 @@ pub const ROUTE_ROLES: &[(&str, &str, MinRole)] = &[
     ),
     ("PATCH", "/api/members/{id}", MinRole::Member(MANAGERS)),
     ("DELETE", "/api/members/{id}", MinRole::Member(MANAGERS)),
+    // Stored usage.
+    (
+        "GET",
+        "/admin/usage/events",
+        MinRole::Op(OperatorRole::Viewer),
+    ),
+    (
+        "GET",
+        "/admin/usage/batches",
+        MinRole::Op(OperatorRole::Viewer),
+    ),
     // Gateways, on the gateway listener.
     ("POST", "/dp/heartbeat", MinRole::Dp),
     ("ANY", "/dp/store/v1/{*rest}", MinRole::Dp),
+    ("POST", "/dp/telemetry", MinRole::Dp),
 ];
 
 /// Every tenant role.
@@ -306,6 +318,8 @@ pub fn browser_router(state: AppState) -> Router {
             "/api/members/{id}",
             patch(members::update).delete(members::remove),
         )
+        .route("/admin/usage/events", get(usage::list_events))
+        .route("/admin/usage/batches", get(usage::list_batches))
         .route_layer(axum::middleware::from_fn(only_listed_routes))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(state)
@@ -317,6 +331,14 @@ pub fn dp_router(state: AppState) -> Router {
     Router::new()
         .route("/dp/heartbeat", post(dp::heartbeat::heartbeat))
         .route("/dp/store/v1/{*rest}", any(dp::store::not_found))
+        // A batch may be larger than the other routes' bodies, and every
+        // answer, the body limit's included, says batches are deduplicated.
+        .route(
+            "/dp/telemetry",
+            post(dp::telemetry::telemetry)
+                .layer(DefaultBodyLimit::max(dp::telemetry::MAX_BODY_BYTES))
+                .layer(axum::middleware::map_response(dp::telemetry::mark_dedup)),
+        )
         .route_layer(axum::middleware::from_fn(only_listed_dp_routes))
         .layer(axum::middleware::map_response(close_on_forbidden))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))

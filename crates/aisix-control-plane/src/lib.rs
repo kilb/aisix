@@ -29,6 +29,7 @@ pub mod resources;
 pub mod rollout;
 pub mod settings;
 pub mod tenants;
+pub mod usage;
 
 use auth::password::{LoginThrottle, PasswordGate, ARGON2_GATE_PERMITS};
 use config::CpConfig;

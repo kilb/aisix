@@ -322,6 +322,22 @@ impl TestCp {
         )
     }
 
+    /// A gateway's REST client for a credential named `name`, issued by an
+    /// admin seeded for it.
+    pub async fn issue_dp_client(&self, name: &str) -> DpClient {
+        let admin = self.admin_login_seeded(OperatorRole::Admin).await;
+        let bundle = self.issue_bundle(&admin, name).await;
+        self.dp_client(&bundle)
+    }
+
+    /// The number of rows in `table`.
+    pub async fn count(&self, table: &str) -> i64 {
+        sqlx::query_scalar(&format!("SELECT count(*) FROM {table}"))
+            .fetch_one(self.db().pool())
+            .await
+            .unwrap_or_else(|e| panic!("count {table}: {e}"))
+    }
+
     pub fn state(&self) -> &AppState {
         &self.running.state
     }
@@ -516,6 +532,34 @@ impl DpClient {
     pub async fn heartbeat(&self, body: Value) -> Resp {
         self.send("POST", "/dp/heartbeat", Some(body)).await
     }
+
+    /// `POST /dp/telemetry` as the gateway sends it: `body` as JSON, with
+    /// `X-Aisix-Usage-Batch-Id: batch_id`.
+    pub async fn telemetry(&self, batch_id: Uuid, body: &Value) -> Resp {
+        let bytes = serde_json::to_vec(body).expect("serialize the batch");
+        self.telemetry_raw(Some(&batch_id.to_string()), bytes)
+            .await
+            .unwrap_or_else(|e| panic!("POST /dp/telemetry got no answer: {e}"))
+    }
+
+    /// `POST /dp/telemetry` with `body` as raw bytes labelled JSON, and the
+    /// batch-id header as given (none when `None`); an error when the
+    /// request never got an answer.
+    pub async fn telemetry_raw(
+        &self,
+        batch_id: Option<&str>,
+        body: Vec<u8>,
+    ) -> Result<Resp, reqwest::Error> {
+        let mut request = self
+            .client
+            .post(format!("{}/dp/telemetry", self.base))
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body);
+        if let Some(batch_id) = batch_id {
+            request = request.header("X-Aisix-Usage-Batch-Id", batch_id);
+        }
+        Ok(Resp::read(request.send().await?).await)
+    }
 }
 
 /// An operator the harness inserted.
@@ -571,6 +615,11 @@ impl Resp {
             set_cookie,
             headers,
         }
+    }
+
+    /// The header `name`'s value, when it is present and readable as text.
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers.get(name).and_then(|v| v.to_str().ok())
     }
 }
 
