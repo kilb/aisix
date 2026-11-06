@@ -516,7 +516,11 @@ test("给密钥配上花费上限后，概览就把这笔账结出来", async ({
   await page.getByLabel("名称").fill("gauge-scope");
   await page.getByLabel("花费上限 USD（留空不限）").fill("2");
   await page.getByRole("button", { name: /生成并重载网关/ }).click();
-  await expect(page.getByText(/已保存|明文/)).toBeVisible();
+  // 明文交出来了，保存也有了结果。不能写成在整页里找「明文」或「已保存」：本页的说明
+  // 文字里本来就有「明文」，明文块一出现就是两处，严格模式下必然报错；没出现时又只
+  // 匹配到那段说明，等于什么都没等。
+  await expect(page.getByText(/密钥明文——只显示这一次/)).toBeVisible();
+  await expect(page.locator(".note", { hasText: "已保存" })).toBeVisible();
 
   await page.getByRole("tab", { name: "概览" }).click();
   const bal = page.locator(".balance");
