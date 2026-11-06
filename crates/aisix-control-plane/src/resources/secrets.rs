@@ -127,32 +127,36 @@ pub fn redact(kind: Kind, doc: &mut Value) {
     });
 }
 
-/// The fields that decide where a kind's credentials are sent: the host,
-/// the address it is reached at, the trust placed in it, the protocol, and
-/// for a custom guardrail the script that holds them. From the
-/// `provider_key`, `guardrail` and `observability_exporter` schemas.
+/// The fields that decide where a kind's credentials are sent, as JSON
+/// pointers: the host, the address it is reached at, the trust placed in
+/// it, the protocol, the role a kept AWS key assumes (`sts:AssumeRole` signs
+/// for whichever role and external id are written), and for a custom
+/// guardrail the script that holds them. From the `provider_key`,
+/// `guardrail` and `observability_exporter` schemas.
 ///
 /// Every kind is named, so a kind added later is a compile error here until
 /// someone decides what its destination is.
 fn destination_fields(kind: Kind) -> &'static [&'static str] {
     match kind {
         Kind::ProviderKeys => &[
-            "provider",
-            "adapter",
-            "api_base",
-            "apis",
-            "resolve_addresses",
-            "tls",
+            "/provider",
+            "/adapter",
+            "/api_base",
+            "/apis",
+            "/resolve_addresses",
+            "/tls",
         ],
         Kind::Guardrails => &[
-            "kind",
-            "endpoint",
-            "analyzer_url",
-            "anonymizer_url",
-            "region",
-            "script",
+            "/kind",
+            "/endpoint",
+            "/analyzer_url",
+            "/anonymizer_url",
+            "/region",
+            "/script",
+            "/aws_credentials/role_arn",
+            "/aws_credentials/external_id",
         ],
-        Kind::ObservabilityExporters => &["kind", "endpoint"],
+        Kind::ObservabilityExporters => &["/kind", "/endpoint"],
         // No credentials (`Kind::credential_kind` is `None`).
         Kind::Models
         | Kind::CachePolicies
@@ -199,7 +203,7 @@ fn changed_destination(kind: Kind, incoming: &Value, stored: &Value) -> bool {
         redact(kind, &mut doc);
         destination_fields(kind)
             .iter()
-            .map(|field| doc.get(*field).filter(|v| !v.is_null()).cloned())
+            .map(|field| doc.pointer(field).filter(|v| !v.is_null()).cloned())
             .collect::<Vec<_>>()
     };
     destination(incoming) != destination(stored)
@@ -217,8 +221,8 @@ fn changed_destination(kind: Kind, incoming: &Value, stored: &Value) -> bool {
 /// value shaped like a sealed one, which no client is ever shown and which
 /// would otherwise be stored unsealed.
 pub fn restore(kind: Kind, incoming: &mut Value, stored: &Value) -> Result<(), Detail> {
-    let moved = changed_destination(kind, incoming, stored)
-        || rewrote_a_script_input(kind, incoming, stored);
+    let moved = changed_destination(kind, incoming, stored);
+    let rewrote = rewrote_a_script_input(kind, incoming, stored);
     // Keyed by field key and label: the label keeps apart names that
     // sanitize to one field key (`x-a` and `x_a`). `None` marks a key two
     // stored slots share, which cannot be told apart.
@@ -254,6 +258,12 @@ pub fn restore(kind: Kind, incoming: &mut Value, stored: &Value) -> Result<(), D
                 problem = Some(Detail {
                     path: slot.label.clone(),
                     message: "发送机密的目标已更改，请重新填写该机密".to_string(),
+                })
+            }
+            Some(Some(_)) if rewrote => {
+                problem = Some(Detail {
+                    path: slot.label.clone(),
+                    message: "自定义护栏的机密有改动时，需要一并重新填写全部机密".to_string(),
                 })
             }
             Some(Some(previous)) => *value = Value::String(previous.clone()),

