@@ -268,6 +268,9 @@ pub(crate) struct CancelContext {
     /// What the caller is being sent for this failure. See
     /// [`crate::usage_attr::note_client_error`].
     pub client_error_body: Option<String>,
+    /// The service tier the request body asked for. See
+    /// [`note_requested_service_tier`].
+    pub requested_service_tier: Option<String>,
 }
 
 /// A streamed response's access-log line, parked by its handler until the
@@ -1371,6 +1374,27 @@ pub(crate) fn note_a2a_call(agent: &str, method: &str, operation: &str) {
             c.route.a2a_operation = operation.to_string();
         }
     });
+}
+
+/// Note the top-level `service_tier` the caller's request body carried, so
+/// every row of the request reports it: each attempt's, the terminal one,
+/// and the one a cancel writes. Called by the handlers whose request body
+/// defines the field (`/v1/chat/completions`, `/v1/messages`,
+/// `/v1/responses`) once it has parsed. A body with no string there notes
+/// nothing.
+pub(crate) fn note_requested_service_tier(tier: Option<&str>) {
+    if let Some(tier) = tier {
+        with_cancel(|c| c.requested_service_tier = Some(tier.to_string()));
+    }
+}
+
+/// What [`note_requested_service_tier`] noted for the current request.
+/// `None` outside a request scope.
+pub(crate) fn requested_service_tier() -> Option<String> {
+    CURRENT
+        .try_with(|a| a.lock().cancel.requested_service_tier.clone())
+        .ok()
+        .flatten()
 }
 
 /// Note the Model row the caller's name resolved to, when that row is a

@@ -348,6 +348,9 @@ fn base_event(
         // matching every other event of the same request.
         requested_model: resolved.requested_model.clone(),
         requested_model_id: resolved.requested_model_id.clone(),
+        // `Drop` runs outside the request scope the emit chokepoint reads
+        // this from, so it comes off the context taken from the cell.
+        requested_service_tier: ctx.requested_service_tier.clone(),
         inbound_protocol: inbound_protocol.to_string(),
         provider_kind: crate::chat::sanitize_tag(
             tags.kind.map(|k| k.as_str().to_owned()).unwrap_or_default(),

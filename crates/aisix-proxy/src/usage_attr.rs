@@ -1381,6 +1381,55 @@ fn stamp_requested_model_id(event: &mut UsageEvent) {
     }
 }
 
+/// Stamp the fields the control plane bills a row by, here at the one point
+/// every row passes through, so no family's failure, cache-hit or streamed
+/// row can lack what its success row carries.
+///
+/// `event_id` is a random UUID v4 per row, unless the emitter set one. It
+/// is never derived from `request_id`: the caller may choose that, and
+/// every attempt of a request shares it. The tier the caller asked for is
+/// read off the request's cell, where its handler noted it, and bounded
+/// like the tier the upstream reports. The upstream identity is
+/// [`apply_upstream_identity`] over the ProviderKey this row's labels name
+/// and the Model its `model_id` names, so it keys on the DISPATCHED target,
+/// never the addressed entry: a direct or embedding model names itself; a
+/// routing or semantic attempt and an ensemble member or judge row name
+/// the target they called; an ensemble's aggregate and post-panel failure
+/// rows, whose `model_id` is the ensemble, name none; a wildcard row
+/// addressed directly names the concrete upstream model it filled in, and
+/// none when reached through a routing model.
+fn stamp_billing_fields(snap: &AisixSnapshot, event: &mut UsageEvent, provider_key_id: &str) {
+    if event.event_id.is_empty() {
+        event.event_id = uuid::Uuid::new_v4().to_string();
+    }
+    event.requested_service_tier = event
+        .requested_service_tier
+        .take()
+        .or_else(crate::attribution::requested_service_tier)
+        .map(sanitize_tag)
+        .filter(|t| !t.is_empty());
+    let model = snap.models.get_by_id(&event.model_id);
+    apply_upstream_identity(event, provider_key_id, model.as_deref().map(|e| &*e.value));
+}
+
+/// Name the upstream credential and model a row's call used: the
+/// ProviderKey `provider_key_id` names, and the `provider` and upstream
+/// model of `model` when that model calls an upstream itself. A routing,
+/// semantic or ensemble model has neither of its own, and the
+/// [`UNKNOWN_PK`] an unresolved label carries names no key.
+pub(crate) fn apply_upstream_identity(
+    event: &mut UsageEvent,
+    provider_key_id: &str,
+    model: Option<&aisix_core::Model>,
+) {
+    event.provider_key_id = (!provider_key_id.is_empty() && provider_key_id != UNKNOWN_PK)
+        .then(|| provider_key_id.to_string());
+    let model = model.filter(|m| !(m.is_routing() || m.is_ensemble() || m.is_semantic()));
+    let upstream_model = model.and_then(|m| crate::span_facts::request_model(m, event));
+    event.upstream_provider = model.and_then(|m| m.provider.clone());
+    event.upstream_model = upstream_model;
+}
+
 /// THE emission chokepoint (AISIX-Cloud#1279): every usage event leaves
 /// through here, so the CP telemetry leg and the exporter fan-out cannot
 /// drift, and the trace snapshot is taken in exactly one place.
@@ -1422,6 +1471,7 @@ pub(crate) fn emit_usage(
     event.operation = surface.operation.to_string();
     event.is_final_attempt = terminal;
     stamp_requested_model_id(&mut event);
+    stamp_billing_fields(snap, &mut event, labels.provider_key_id);
     // Upstream-supplied text bound for line-oriented stores: the same
     // control-character strip and cap as the provider's response id.
     event.service_tier = event
@@ -2073,6 +2123,155 @@ mod tests {
         assert_eq!(emit(500, "", " "), "request failed with status 500");
         assert_eq!(emit(502, "some_class", "named"), "named");
         assert_eq!(emit(200, "", ""), "");
+    }
+
+    /// A state whose usage sink the test reads, serving `snap`.
+    fn state_reading_rows(
+        snap: AisixSnapshot,
+    ) -> (crate::ProxyState, tokio::sync::mpsc::Receiver<UsageEvent>) {
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let state = crate::ProxyState::new(
+            aisix_core::snapshot::SnapshotHandle::new(snap),
+            std::sync::Arc::new(aisix_gateway::Hub::new()),
+            &aisix_core::ProxyConfig {
+                addr: "127.0.0.1:0".into(),
+                request_body_limit_bytes: 1_048_576,
+                real_ip: Default::default(),
+                request_id: Default::default(),
+                url_rewrites: Vec::new(),
+                expose_debug_headers: false,
+                platform: Default::default(),
+                tls: None,
+                listeners: Vec::new(),
+                thread_per_core: None,
+                workers: None,
+            },
+        )
+        .without_cache()
+        .with_usage_sink(aisix_obs::UsageSink::new(tx));
+        (state, rx)
+    }
+
+    /// Hand `event` to the chokepoint as an attempt made with the
+    /// ProviderKey `pk_id` names, and read back the row the sink received.
+    fn emitted_row(
+        state: &crate::ProxyState,
+        rx: &mut tokio::sync::mpsc::Receiver<UsageEvent>,
+        event: UsageEvent,
+        pk_id: &str,
+    ) -> UsageEvent {
+        let snap = state.snapshot.load();
+        let pk = ResolvedPk::resolve(&snap, pk_id);
+        emit_usage(
+            state,
+            &snap,
+            crate::operation::CHAT,
+            event,
+            usage_event_labels("m", &pk),
+            None,
+            None,
+            true,
+            true,
+        );
+        rx.try_recv().expect("the row reaches the sink")
+    }
+
+    #[allow(clippy::field_reassign_with_default)] // A literal here would read as an emitter to the scans below.
+    fn with_request_id(request_id: &str) -> UsageEvent {
+        let mut event = UsageEvent::default();
+        event.request_id = request_id.to_string();
+        event
+    }
+
+    #[tokio::test]
+    async fn every_usage_row_carries_a_unique_event_id() {
+        let (state, mut rx) = state_reading_rows(AisixSnapshot::new());
+        let a = emitted_row(&state, &mut rx, UsageEvent::default(), "");
+        let b = emitted_row(&state, &mut rx, UsageEvent::default(), "");
+        assert!(!a.event_id.is_empty());
+        assert_ne!(a.event_id, b.event_id);
+        let id = uuid::Uuid::parse_str(&a.event_id).expect("an event id is a UUID");
+        assert_eq!(id.get_version_num(), 4, "minted at random, not derived");
+    }
+
+    /// `request_id` is the caller's to choose and several rows share it, so
+    /// it can never be what tells two rows apart.
+    #[tokio::test]
+    async fn a_caller_supplied_request_id_never_becomes_the_event_id() {
+        let (state, mut rx) = state_reading_rows(AisixSnapshot::new());
+        let row = emitted_row(&state, &mut rx, with_request_id("1"), "");
+        assert_eq!(row.request_id, "1");
+        assert_ne!(row.event_id, "1");
+        let again = emitted_row(&state, &mut rx, with_request_id("1"), "");
+        assert_ne!(again.event_id, row.event_id, "two rows, one request id");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::field_reassign_with_default)] // A literal here would read as an emitter to the scans below.
+    async fn the_row_names_the_provider_key_and_upstream_model() {
+        let snap = snap_with_pk("pk-1", "");
+        let model: aisix_core::Model = serde_json::from_value(serde_json::json!({
+            "display_name": "gpt-4o",
+            "provider": "openai",
+            "model_name": "gpt-4o-2024-08-06",
+            "provider_key_id": PK_ID,
+        }))
+        .unwrap();
+        snap.models.insert(ResourceEntry::new("m-1", model, 1));
+        let (state, mut rx) = state_reading_rows(snap);
+        let mut event = UsageEvent::default();
+        event.model_id = "m-1".to_string();
+        let row = emitted_row(&state, &mut rx, event, PK_ID);
+        assert_eq!(row.provider_key_id.as_deref(), Some(PK_ID));
+        assert_eq!(row.upstream_provider.as_deref(), Some("openai"));
+        assert_eq!(row.upstream_model.as_deref(), Some("gpt-4o-2024-08-06"));
+    }
+
+    /// A row that reached no ProviderKey, or names an entry that is not an
+    /// upstream of its own, carries none rather than a guess.
+    #[tokio::test]
+    #[allow(clippy::field_reassign_with_default)] // A literal here would read as an emitter to the scans below.
+    async fn a_row_that_resolved_no_upstream_names_none() {
+        let snap = AisixSnapshot::new();
+        let group: aisix_core::Model = serde_json::from_value(serde_json::json!({
+            "display_name": "group",
+            "routing": {"strategy": "failover", "targets": [{"model": "a"}]},
+        }))
+        .unwrap();
+        snap.models.insert(ResourceEntry::new("g-1", group, 1));
+        let (state, mut rx) = state_reading_rows(snap);
+        for model_id in ["", "g-1", "missing"] {
+            let mut event = UsageEvent::default();
+            event.model_id = model_id.to_string();
+            let row = emitted_row(&state, &mut rx, event, "");
+            assert_eq!(row.provider_key_id, None, "{model_id:?}");
+            assert_eq!(row.upstream_provider, None, "{model_id:?}");
+            assert_eq!(row.upstream_model, None, "{model_id:?}");
+        }
+    }
+
+    /// Every row of a request carries the tier its body asked for, the
+    /// superseded attempts as well as the final one; a request that asked
+    /// for none reports none.
+    #[tokio::test]
+    async fn every_row_of_a_request_reports_the_service_tier_it_asked_for() {
+        let (state, mut rx) = state_reading_rows(AisixSnapshot::new());
+        let asked = std::sync::Arc::new(crate::attribution::RequestAttribution::default());
+        crate::attribution::scope(asked, async {
+            crate::attribution::note_requested_service_tier(Some("flex"));
+            for _ in 0..2 {
+                let row = emitted_row(&state, &mut rx, UsageEvent::default(), "");
+                assert_eq!(row.requested_service_tier.as_deref(), Some("flex"));
+            }
+        })
+        .await;
+        let silent = std::sync::Arc::new(crate::attribution::RequestAttribution::default());
+        crate::attribution::scope(silent, async {
+            crate::attribution::note_requested_service_tier(None);
+            let row = emitted_row(&state, &mut rx, UsageEvent::default(), "");
+            assert_eq!(row.requested_service_tier, None);
+        })
+        .await;
     }
 
     #[test]

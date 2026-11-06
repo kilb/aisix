@@ -119,6 +119,17 @@ pub struct UsageEvent {
     /// `x-aisix-call-id` response header carries so logs join.
     pub request_id: String,
 
+    /// The gateway's own identifier for this one row, which a consumer
+    /// deduplicates on. Unlike `request_id`, which a caller may choose and
+    /// which every attempt of a request shares, it is unique per row: a
+    /// random UUID v4 minted when the row is emitted. A batch attribution
+    /// row is the exception: its id is the deterministic UUID its
+    /// `request_id` also carries, so the row a restarted process or another
+    /// replica emits again for the same batch repeats it. Omitted only by a
+    /// gateway older than the field.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub event_id: String,
+
     /// The W3C trace id every OTLP span of this request shares, as 32
     /// lowercase-hex chars (AISIX-Cloud#1279). The public correlation key
     /// between a usage row and a trace backend: the dashboard's
@@ -524,6 +535,44 @@ pub struct UsageEvent {
     /// string: tier names differ across providers and change over time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service_tier: Option<String>,
+
+    /// The top-level `service_tier` the caller's request body carried on
+    /// `/v1/chat/completions`, `/v1/messages` or `/v1/responses`, as sent
+    /// (control characters stripped, capped at 256 characters). The tier
+    /// the caller ASKED for, beside `service_tier`, the one the upstream
+    /// reports it served. Every row of the request carries it; absent when
+    /// the body carried none, and on every other endpoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_service_tier: Option<String>,
+
+    /// UUID of the ProviderKey this row's upstream call was authenticated
+    /// with — the credential that served it, or failed to. On a cache hit,
+    /// the key of the direct model that was addressed. Absent when no key
+    /// was resolved: a failure before a target was selected, a cache hit
+    /// on a group, and the MCP and A2A routes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_key_id: Option<String>,
+
+    /// The `provider` of the Model `model_id` names, when that model calls
+    /// an upstream itself. Absent when `model_id` is empty or names a
+    /// routing, semantic or ensemble model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_provider: Option<String>,
+
+    /// The upstream model that Model sends requests to: its configured
+    /// `model_name`, or, for a wildcard model addressed directly, the
+    /// concrete name it filled in for this request. Absent where
+    /// `upstream_provider` is, and for a wildcard model reached through a
+    /// routing model. Unlike `provider_model_version`, which the upstream
+    /// reports, this is the gateway's own configuration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_model: Option<String>,
+
+    /// `true` on a batch attribution row: the usage of a finished batch
+    /// job, recorded when the gateway first sees the job complete. Absent
+    /// on every other row.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub is_batch: bool,
 
     /// finish_reason / stop_reason from the upstream response, raw. Empty
     /// for upstream errors and guardrail blocks.
@@ -2429,6 +2478,47 @@ mod tests {
         assert!(!empty.contains("attempt_model"));
         assert!(!empty.contains("error_class"));
         assert!(!empty.contains("error_message"));
+    }
+
+    /// A control plane that predates the billing fields receives exactly the
+    /// body it always did: none of them is written while unset.
+    #[test]
+    fn empty_billing_fields_are_omitted_on_the_wire() {
+        let wire = serde_json::to_value(sample_event("req-1")).unwrap();
+        for key in [
+            "event_id",
+            "provider_key_id",
+            "upstream_provider",
+            "upstream_model",
+            "requested_service_tier",
+            "is_batch",
+        ] {
+            assert!(
+                wire.get(key).is_none(),
+                "{key} is on the wire unset: {wire}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_set_event_id_and_billing_fields_reach_the_wire() {
+        let event = UsageEvent {
+            event_id: "0b7e5a52-6a4f-4d3e-9c1b-2f6f4d1d9e10".into(),
+            provider_key_id: Some("pk-1".into()),
+            upstream_provider: Some("openai".into()),
+            upstream_model: Some("gpt-4o-2024-08-06".into()),
+            requested_service_tier: Some("flex".into()),
+            is_batch: true,
+            ..sample_event("req-1")
+        };
+        let wire = serde_json::to_value(&event).unwrap();
+        assert_eq!(wire["event_id"], "0b7e5a52-6a4f-4d3e-9c1b-2f6f4d1d9e10");
+        assert_eq!(wire["request_id"], "req-1");
+        assert_eq!(wire["provider_key_id"], "pk-1");
+        assert_eq!(wire["upstream_provider"], "openai");
+        assert_eq!(wire["upstream_model"], "gpt-4o-2024-08-06");
+        assert_eq!(wire["requested_service_tier"], "flex");
+        assert_eq!(wire["is_batch"], true);
     }
 
     fn sample_event(id: &str) -> UsageEvent {

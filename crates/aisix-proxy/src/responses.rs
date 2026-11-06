@@ -400,6 +400,9 @@ pub async fn responses(
         body.as_object()
             .map(aisix_obs::GenAiRequestParams::from_openai_responses),
     );
+    crate::attribution::note_requested_service_tier(
+        body.get("service_tier").and_then(|v| v.as_str()),
+    );
     let api_key_id = auth.entry.id.clone();
 
     let model_name = body

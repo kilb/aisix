@@ -3184,7 +3184,14 @@ async fn attribute_batch_usage(job: &BatchAttribution) -> Result<(), String> {
             // NO-GUARDRAIL-CHAIN: a retroactive billing row for work the
             // provider did inside a batch. There is no request here, so no
             // chain was ever resolved and nothing could have been bypassed.
+            //
+            // The row's id is the batch's deterministic one, not a fresh
+            // UUID: a re-emitted row must repeat it for the consumer to
+            // drop the copy. This path bypasses the emit chokepoint that
+            // mints the id for every other row.
+            event_id: request_id.clone(),
             request_id,
+            is_batch: true,
             occurred_at: aisix_obs::UsageEvent::occurred_at_now(),
             model_id: model_id.to_string(),
             api_key_id: api_key_id.to_string(),
@@ -3222,6 +3229,10 @@ async fn attribute_batch_usage(job: &BatchAttribution) -> Result<(), String> {
             ..Default::default()
         };
         crate::usage_attr::apply_pk_telemetry(&mut event, &pk);
+        // From the Model row this attribution resolved, the one the metric
+        // labels below read too. This path bypasses the emit chokepoint
+        // that stamps every other row.
+        crate::usage_attr::apply_upstream_identity(&mut event, pk_id, Some(&job.model.value));
         // Attribution names the identity that observed completion — the
         // same caller the event's api_key_id already reflects.
         crate::usage_attr::apply_caller_identity(&mut event, jwt, caller);
@@ -4991,6 +5002,68 @@ mod tests {
                 "no second aggregated event for the same batch"
             );
         }
+    }
+
+    /// A restarted process, or another replica, attributes a finished batch
+    /// again. The control plane can only drop the second copy if both carry
+    /// the same `event_id`, so a batch row's id is fixed by the batch, never
+    /// minted per emission.
+    #[tokio::test]
+    async fn a_batch_row_keeps_the_same_event_id_when_re_emitted() {
+        let upstream = MockServer::builder().start().await;
+        mount_ended_batch(
+            &upstream,
+            serde_json::json!({
+                "id": "batch_x",
+                "status": "completed",
+                "completed_at": aisix_obs::metrics::process_start_time_seconds() + 1.0,
+                "output_file_id": "file-out"
+            }),
+        )
+        .await;
+        /// The batch row one process emits on first seeing `batch_x` end,
+        /// and the row of the retrieve call that saw it. A fresh state is a
+        /// process that has not attributed the batch yet.
+        async fn batch_row(upstream: &MockServer) -> (ObsUsageEvent, ObsUsageEvent) {
+            let (app, mut rx) = build_app_with_sink(ended_batch_snapshot(upstream));
+            let encoded = encode_routed_id("batch_x", "jobs-a", None);
+            let resp = app
+                .oneshot(get_as(format!("/v1/batches/{encoded}"), "sk-caller"))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let (mut batch, mut management) = (None, None);
+            for _ in 0..2 {
+                let ev = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+                    .await
+                    .expect("expected a usage event")
+                    .expect("sink closed");
+                if ev.inbound_protocol == "batch" {
+                    batch = Some(ev);
+                } else {
+                    management = Some(ev);
+                }
+            }
+            (
+                batch.expect("the batch row"),
+                management.expect("the retrieve call's own row"),
+            )
+        }
+        let (first, first_call) = batch_row(&upstream).await;
+        let (again, _) = batch_row(&upstream).await;
+        assert_eq!(first.event_id, again.event_id);
+        assert_eq!(
+            first.event_id,
+            batch_attribution_request_id("batch_x", 0, false)
+        );
+        assert!(first.is_batch);
+        assert_eq!(first.provider_key_id.as_deref(), Some(PK_A));
+        assert_eq!(first.upstream_provider.as_deref(), Some("openai"));
+        assert_eq!(first.upstream_model.as_deref(), Some("gpt-4o"));
+        // The caller's own call to `/v1/batches` is an ordinary row.
+        assert!(!first_call.is_batch);
+        assert!(!first_call.event_id.is_empty());
+        assert_ne!(first_call.event_id, first.event_id);
     }
 
     // ---- fine-tuning ----

@@ -118,6 +118,9 @@ pub async fn messages(
         body.as_object()
             .map(aisix_obs::GenAiRequestParams::from_anthropic_messages),
     );
+    crate::attribution::note_requested_service_tier(
+        body.get("service_tier").and_then(|v| v.as_str()),
+    );
     let api_key_id = auth.entry.id.clone();
 
     let model_name = body

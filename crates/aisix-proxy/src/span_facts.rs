@@ -103,8 +103,9 @@ fn passthrough_facts(
 /// The model name sent upstream. A wildcard row's own `model_name` is a
 /// template; the concrete name is the one the caller's alias substitutes
 /// into it, exactly as `model_resolve::resolve_model` built it for
-/// dispatch.
-fn request_model(model: &Model, event: &UsageEvent) -> Option<String> {
+/// dispatch. Also the usage row's `upstream_model`
+/// (`usage_attr::apply_upstream_identity`).
+pub(crate) fn request_model(model: &Model, event: &UsageEvent) -> Option<String> {
     if !model.display_name.contains('*') {
         return model.model_name.clone();
     }
