@@ -107,8 +107,10 @@ const RETRY_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const RETRY_MAX_BACKOFF: Duration = Duration::from_secs(30);
 
 /// How far either side of its step in the schedule a re-send wait may land:
-/// each wait is drawn uniformly from ±20% of the step, then held under
-/// [`RETRY_MAX_BACKOFF`]. A control-plane outage fails every gateway at the
+/// each wait is drawn uniformly from ±20% of the step, and a step is taken
+/// at no more than five sixths of [`RETRY_MAX_BACKOFF`], so the top of the
+/// band reaches the ceiling instead of being cut there and piling waits up
+/// on it. A control-plane outage fails every gateway at the
 /// same moment, and on a fixed schedule the whole fleet would then re-send
 /// on the same beat for as long as the outage lasts.
 const RETRY_JITTER: f64 = 0.2;
@@ -637,12 +639,13 @@ async fn deliver(
     }
 }
 
-/// The wait slept for one step of the backoff schedule: `step` moved to the
-/// point `unit`, a draw from `[0, 1)`, picks across ±[`RETRY_JITTER`] of it,
-/// and never past [`RETRY_MAX_BACKOFF`].
+/// The wait slept for one step of the backoff schedule: `step`, held at five
+/// sixths of [`RETRY_MAX_BACKOFF`], moved to the point `unit`, a draw from
+/// `[0, 1)`, picks across ±[`RETRY_JITTER`] of it. The hold comes first, so a
+/// wait at the ceiling is still drawn from the whole band, 20 s to 30 s.
 fn jittered(step: Duration, unit: f64) -> Duration {
-    step.mul_f64(1.0 + RETRY_JITTER * (2.0 * unit - 1.0))
-        .min(RETRY_MAX_BACKOFF)
+    step.min(RETRY_MAX_BACKOFF * 5 / 6)
+        .mul_f64(1.0 + RETRY_JITTER * (2.0 * unit - 1.0))
 }
 
 /// [`jittered`] with a fresh draw for every wait.
@@ -2433,8 +2436,10 @@ mod tests {
     }
 
     /// Each wait lands uniformly within a fifth of its step either way, and
-    /// the ceiling holds: at [`RETRY_MAX_BACKOFF`] the band is cut at the
-    /// top, never stretched past it.
+    /// the ceiling holds without waits piling up on it: a step at
+    /// [`RETRY_MAX_BACKOFF`] is jittered around five sixths of it, so the
+    /// band's top reaches the ceiling and every draw below the top stays
+    /// distinct.
     #[test]
     fn a_re_send_wait_lands_within_a_fifth_of_its_step_and_under_the_ceiling() {
         let near = |actual: Duration, expected_ms: u64| {
@@ -2452,15 +2457,22 @@ mod tests {
         near(jittered(step, 0.75), 4_400);
         near(jittered(step, 0.999_999), 4_800);
 
-        near(jittered(RETRY_MAX_BACKOFF, 0.0), 24_000);
-        near(jittered(RETRY_MAX_BACKOFF, 0.5), 30_000);
-        assert_eq!(jittered(RETRY_MAX_BACKOFF, 0.999_999), RETRY_MAX_BACKOFF);
+        near(jittered(RETRY_MAX_BACKOFF, 0.0), 20_000);
+        near(jittered(RETRY_MAX_BACKOFF, 0.5), 25_000);
+        near(jittered(RETRY_MAX_BACKOFF, 0.75), 27_500);
+        near(jittered(RETRY_MAX_BACKOFF, 0.999_999), 30_000);
+        assert!(jittered(RETRY_MAX_BACKOFF, 0.999_999) <= RETRY_MAX_BACKOFF);
 
         // The draw the sender takes stays in the band.
         for _ in 0..1_000 {
             let wait = random_jitter(step);
             assert!(
                 (Duration::from_millis(3_200)..=Duration::from_millis(4_800)).contains(&wait),
+                "{wait:?}",
+            );
+            let wait = random_jitter(RETRY_MAX_BACKOFF);
+            assert!(
+                (Duration::from_secs(20)..=RETRY_MAX_BACKOFF).contains(&wait),
                 "{wait:?}",
             );
         }
@@ -2640,7 +2652,7 @@ mod tests {
     /// the batch on its answer exactly as before, even in the middle of an
     /// outage the control plane did report.
     #[tokio::test]
-    async fn a_503_without_the_dedup_header_is_not_exempt() {
+    async fn a_503_without_the_dedup_header_is_dropped_on_its_first_answer() {
         let (server, posts) =
             scripted_server(vec![dedups(503), dedups(503), no_dedup(503), dedups(200)]).await;
         let dir = tempfile::tempdir().unwrap();
