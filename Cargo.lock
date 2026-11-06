@@ -134,9 +134,11 @@ version = "0.1.0"
 dependencies = [
  "aisix-core",
  "argon2",
+ "async-trait",
  "axum 0.8.9",
  "base64 0.22.1",
  "chrono",
+ "etcd-client",
  "futures",
  "hex",
  "rand_core 0.6.4",

@@ -206,6 +206,8 @@ pub enum BootError {
     Password(#[from] crate::auth::password::PasswordError),
     #[error("the control-plane CA: {0}")]
     Pki(#[from] crate::pki::PkiError),
+    #[error("kine (CP_KINE_ENDPOINT): {0}")]
+    Kine(#[from] crate::kine::KineError),
     #[error("cannot listen on CP_HTTP_ADDR: {0}")]
     Listen(std::io::Error),
     #[error("the browser listener (CP_HTTP_ADDR) stopped: {0}")]

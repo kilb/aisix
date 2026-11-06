@@ -70,6 +70,11 @@ fn fixture(method: &str, path: &str, target: &SeededOperator) -> (String, Option
             format!("/admin/resources/provider_keys/{}", Uuid::nil()),
             (method == "PUT").then(|| json!({"doc": {}})),
         ),
+        // This control plane reaches no kine, so no projector leads: past
+        // the role check, the request is refused and nothing is deleted.
+        ("POST", "/admin/rollout/reconcile") => {
+            (path.to_string(), Some(json!({"allow_deletes": false})))
+        }
         _ => panic!("no fixture for {method} {path}: add one to tests/roles.rs"),
     }
 }

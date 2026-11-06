@@ -183,7 +183,10 @@ fn test_config(database_url: &str) -> CpConfig {
         dp_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
         dp_hosts: vec!["localhost".to_string()],
         dp_base_url: "https://localhost:7943".to_string(),
-        kine_endpoint: "http://127.0.0.1:2379".to_string(),
+        // Nothing can listen on port 0: a control plane started without
+        // kine runs a projector that never reaches one, and never writes
+        // to an etcd or kine that happens to run on this host.
+        kine_endpoint: "http://127.0.0.1:0".to_string(),
         etcd_prefix: "/aisix".to_string(),
         env_id_seed: None,
         instance_stale_secs: 60,
@@ -211,29 +214,18 @@ impl TestCp {
     /// [`TestCp::start`], with `configure` applied to the test
     /// configuration first.
     pub async fn start_with(configure: impl FnOnce(&mut CpConfig)) -> Option<TestCp> {
-        let server_url = gate_var("CP_TEST_DATABASE_URL")?;
-        let template = TEMPLATE
-            .get_or_init(|| ensure_template(&server_url))
-            .await
-            .clone();
-        let name = format!("t_{}", Uuid::new_v4().simple());
-        let mut admin = PgConnection::connect(&server_url)
-            .await
-            .expect("connect to CP_TEST_DATABASE_URL");
-        execute(
-            &mut admin,
-            &format!("CREATE DATABASE \"{name}\" TEMPLATE \"{template}\""),
-        )
-        .await;
-        let _ = admin.close().await;
-        let database = Arc::new(TestDatabase {
-            url: with_database(&server_url, &name),
-            server_url,
-            name,
-        });
+        let database = new_database().await?;
         let mut cfg = test_config(&database.url);
         configure(&mut cfg);
         Some(Self::boot(database, cfg).await)
+    }
+
+    /// A control plane whose projector writes the test kine
+    /// (`CP_TEST_KINE_ENDPOINT`), under the fresh environment's own prefix;
+    /// `None` when either service is not configured (outside CI).
+    pub async fn start_with_kine() -> Option<TestCp> {
+        let endpoint = kine_endpoint()?;
+        Self::start_with(|cfg| cfg.kine_endpoint = endpoint).await
     }
 
     async fn boot(database: Arc<TestDatabase>, cfg: CpConfig) -> TestCp {
@@ -469,5 +461,80 @@ impl TempFile {
 impl Drop for TempFile {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// A fresh database cloned from the migrated template, or `None` when
+/// `CP_TEST_DATABASE_URL` is unset (outside CI).
+async fn new_database() -> Option<Arc<TestDatabase>> {
+    let server_url = gate_var("CP_TEST_DATABASE_URL")?;
+    let template = TEMPLATE
+        .get_or_init(|| ensure_template(&server_url))
+        .await
+        .clone();
+    let name = format!("t_{}", Uuid::new_v4().simple());
+    let mut admin = PgConnection::connect(&server_url)
+        .await
+        .expect("connect to CP_TEST_DATABASE_URL");
+    execute(
+        &mut admin,
+        &format!("CREATE DATABASE \"{name}\" TEMPLATE \"{template}\""),
+    )
+    .await;
+    let _ = admin.close().await;
+    Some(Arc::new(TestDatabase {
+        url: with_database(&server_url, &name),
+        server_url,
+        name,
+    }))
+}
+
+/// The test kine's etcd endpoint (`CP_TEST_KINE_ENDPOINT`), shared by every
+/// test; each control plane keeps to its own environment's prefix.
+pub fn kine_endpoint() -> Option<String> {
+    gate_var("CP_TEST_KINE_ENDPOINT")
+}
+
+/// The kine binary (`CP_TEST_KINE_BIN`), for a test that runs a kine of its
+/// own.
+pub fn kine_bin() -> Option<String> {
+    gate_var("CP_TEST_KINE_BIN")
+}
+
+/// The server `CP_TEST_DATABASE_URL` names, for a test that creates a
+/// database of its own.
+pub fn database_server_url() -> Option<String> {
+    gate_var("CP_TEST_DATABASE_URL")
+}
+
+/// A migrated database pinned to a fresh environment, with no control plane
+/// on it: for tests that run the projector themselves, so that no other
+/// projector competes for the database.
+pub struct BareDatabase {
+    pub db: Db,
+    pub env: EnvSettings,
+    // Declared last: the pool goes before its database.
+    _database: Arc<TestDatabase>,
+}
+
+impl BareDatabase {
+    pub async fn new() -> Option<BareDatabase> {
+        let database = new_database().await?;
+        let db = Db::connect(&database.url, 5_000, 30_000)
+            .await
+            .expect("open the test database");
+        let env = aisix_control_plane::settings::ensure_env(&db, None, "/aisix")
+            .await
+            .expect("pin an environment");
+        Some(BareDatabase {
+            db,
+            env,
+            _database: database,
+        })
+    }
+
+    /// The database URL, for connections of a test's own.
+    pub fn url(&self) -> &str {
+        &self._database.url
     }
 }

@@ -2,13 +2,14 @@
 //!
 //! Postgres holds all of its state. One deployment serves one environment
 //! (`env_id`), pinned by the first boot. The browser listener serves
-//! operators and tenants; later tasks add the gateway listener and the kine
-//! projection.
+//! operators and tenants, and a projector writes the gateway resources to
+//! kine; later tasks add the gateway listener.
 
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use futures::FutureExt;
 use tokio::task::JoinHandle;
 
 pub mod audit;
@@ -19,8 +20,10 @@ pub mod db;
 pub mod error;
 pub mod gateways;
 pub mod http;
+pub mod kine;
 pub mod operators;
 pub mod pki;
+pub mod projector;
 pub mod resources;
 pub mod settings;
 
@@ -28,7 +31,9 @@ use auth::password::{LoginThrottle, PasswordGate, ARGON2_GATE_PERMITS};
 use config::CpConfig;
 use db::Db;
 use error::BootError;
+use kine::{KineClient, KineWriter};
 use pki::Pki;
+use resources::write::WriteCtx;
 use settings::EnvSettings;
 
 /// What every request handler shares.
@@ -52,6 +57,8 @@ pub struct Running {
     /// `CP_HTTP_ADDR` names port 0).
     pub http_addr: SocketAddr,
     serve: Option<JoinHandle<std::io::Result<()>>>,
+    /// The projector, which stops with `shutdown`; aborting it is safe too.
+    projector: JoinHandle<()>,
 }
 
 impl Running {
@@ -74,12 +81,13 @@ impl Drop for Running {
         if let Some(serve) = &self.serve {
             serve.abort();
         }
+        self.projector.abort();
     }
 }
 
 /// Boots the control plane: opens and migrates the database, pins the
-/// environment, and starts the browser listener, which stops gracefully once
-/// `shutdown` resolves.
+/// environment, and starts the browser listener and the projector, which
+/// stop once `shutdown` resolves.
 pub async fn start<S>(cfg: CpConfig, shutdown: S) -> Result<Running, BootError>
 where
     S: Future<Output = ()> + Send + 'static,
@@ -93,6 +101,9 @@ where
     let env = settings::ensure_env(&db, cfg.env_id_seed, &cfg.etcd_prefix).await?;
     let pki = Arc::new(Pki::load_or_init(&db, &cfg.master_key, &env).await?);
     let passwords = PasswordGate::new(ARGON2_GATE_PERMITS)?;
+    // Connects on first use: a kine that is down at boot only delays the
+    // projection.
+    let kine: Arc<dyn KineWriter> = Arc::new(KineClient::connect(&cfg.kine_endpoint).await?);
     let listener = tokio::net::TcpListener::bind(cfg.http_addr)
         .await
         .map_err(BootError::Listen)?;
@@ -105,17 +116,21 @@ where
         operator_logins: LoginThrottle::default(),
         pki,
     };
+    let shutdown = shutdown.shared();
     let router = http::browser_router(state.clone());
+    let browser_shutdown = shutdown.clone();
     let serve = tokio::spawn(async move {
         axum::serve(listener, router)
-            .with_graceful_shutdown(shutdown)
+            .with_graceful_shutdown(browser_shutdown)
             .await
     });
+    let projector = projector::spawn(state.db.clone(), kine, WriteCtx::of(&state), shutdown);
     tracing::info!(%http_addr, env_id = %state.env.env_id, "control plane listening");
     Ok(Running {
         state,
         http_addr,
         serve: Some(serve),
+        projector,
     })
 }
 

@@ -47,6 +47,11 @@ rustls-pki-types = "1"
 # Certificate validity, in the type rcgen takes (rcgen 0.13.2 uses time 0.3;
 # 0.3.47 in Cargo.lock).
 time = "0.3"
+# The projector writes kine through the etcd client the gateway reads it
+# with (0.14.1 in Cargo.lock, the gateway's features), behind an
+# `async_trait` seam (0.1.89) so tests can stand in a kine that fails on cue.
+etcd-client = { version = "0.14", features = ["tls"] }
+async-trait = "0.1"
 
 [dev-dependencies]
 # A stand-in TLS listener for the bundle test (0.26.4 in Cargo.lock).
