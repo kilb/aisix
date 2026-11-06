@@ -20,6 +20,8 @@ use std::sync::Arc;
 use aisix_core::wildcard::wildcard_capture;
 use aisix_core::{AisixSnapshot, Model, ResourceEntry};
 
+use crate::error::ProxyError;
+
 /// Resolve `requested` against the snapshot's Model table, honoring `provider/*`
 /// wildcard Models when no exact match exists. Returns `None` if nothing matches.
 pub(crate) fn resolve_model(
@@ -49,6 +51,32 @@ pub(crate) fn resolve_model(
         model,
         entry.revision,
     )))
+}
+
+/// Refuse an ensemble to an API key restricted by `allowed_provider_groups`,
+/// with the error a name nothing serves gets.
+///
+/// An ensemble dispatches its panel and judge members itself, past the
+/// routing path that applies the key's provider groups, and ensemble is an
+/// experimental surface whose member-level gates wait for one design pass.
+/// Serving it would reach upstreams outside the key's groups, so for such a
+/// key it is answered as a model that does not exist rather than with a
+/// refusal of its own. Keys on the REQUESTED entry, the only identity an
+/// ensemble has; every other kind passes, and its targets meet the group
+/// filter in `routing::resolve_attempt_models` or `semantic::select_eligible`.
+///
+/// Called from `routing::resolve_attempt_models`, which `/v1/chat/completions`
+/// runs before it branches to the ensemble dispatch; the other endpoints
+/// cannot dispatch an ensemble and pass through it too.
+pub(crate) fn refuse_ensemble_to_grouped_key(
+    requested: &str,
+    model: &Model,
+    allowed_groups: &[String],
+) -> Result<(), ProxyError> {
+    if model.is_ensemble() && !allowed_groups.is_empty() {
+        return Err(ProxyError::ModelNotFound(requested.to_string()));
+    }
+    Ok(())
 }
 
 /// The `model_id` an event that selected no target reports for `entry`:
@@ -325,6 +353,36 @@ mod tests {
     fn no_match_returns_none() {
         let snap = snapshot_with(vec![("m-star", direct_model("openai/*", Some("*")))]);
         assert!(resolve_model(&snap, "anthropic/claude").is_none());
+    }
+
+    /// An ensemble's members are not filtered by provider group, so to a key
+    /// that names groups it answers exactly as a name nothing serves does.
+    #[test]
+    fn a_key_with_groups_cannot_address_an_ensemble() {
+        let ensemble: Model = serde_json::from_value(serde_json::json!({
+            "display_name": "panel",
+            "ensemble": {
+                "panel": [{"model": "m"}],
+                "judge": {"model": "m"},
+            },
+        }))
+        .unwrap();
+        let allowed = vec!["grp-alpha".to_string()];
+        let err = refuse_ensemble_to_grouped_key("panel", &ensemble, &allowed).unwrap_err();
+        assert!(
+            matches!(err, ProxyError::ModelNotFound(ref m) if m == "panel"),
+            "{err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            ProxyError::ModelNotFound("panel".into()).to_string()
+        );
+        // A key without groups addresses it as before, and a direct model is
+        // not this check's business.
+        assert!(refuse_ensemble_to_grouped_key("panel", &ensemble, &[]).is_ok());
+        assert!(
+            refuse_ensemble_to_grouped_key("m", &direct_model("m", Some("up")), &allowed).is_ok()
+        );
     }
 
     #[test]

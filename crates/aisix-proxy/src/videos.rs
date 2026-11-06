@@ -2159,7 +2159,9 @@ async fn dispatch_create(
 /// provider family) would let a caller probe the Model table by minting
 /// crafted ids. The submit path keeps its distinct 403/501 — there the
 /// caller already knows the model name they asked for, so there is
-/// nothing to disclose.
+/// nothing to disclose. An entry whose provider key is outside the key's
+/// `allowed_provider_groups` folds the same way: the submit could not have
+/// been dispatched to it, so a poll never reaches it either.
 ///
 /// Returns the resolved target, the provider-side task id, and the model
 /// name the CALLER addressed at submit time. That last one is NOT the row's
@@ -2195,6 +2197,13 @@ fn resolve_get_target(
             (row, acl_name, group)
         }
     };
+    if !crate::routing::target_in_groups(
+        snapshot,
+        &model_entry.value,
+        &auth.key().allowed_provider_groups,
+    ) {
+        return Err(not_found());
+    }
     let display_name = model_entry.value.display_name.clone();
     match resolve_video_target(snapshot, auth, model_entry, &acl_name, client_ctx) {
         Ok(Ok(target)) => {
@@ -3809,6 +3818,63 @@ mod tests {
             assert_eq!(resp.status(), StatusCode::NOT_FOUND);
             let v = body_json(resp).await;
             assert_eq!(v["error"]["type"], "video_not_found");
+        }
+    }
+
+    /// A key restricted to provider groups polls a task only through a
+    /// provider key in one of them, as its submit could only have been
+    /// dispatched there: outside them the id is answered like one the key
+    /// may not use, and the upstream is never contacted.
+    #[tokio::test]
+    async fn a_poll_outside_the_keys_provider_groups_is_404() {
+        async fn poll(pk_groups: &[&str]) -> (StatusCode, serde_json::Value, usize) {
+            let upstream = MockServer::builder().start().await;
+            Mock::given(method("GET"))
+                .respond_with(running_task_upstream())
+                .mount(&upstream)
+                .await;
+            let snap = new_snap(&upstream.uri(), "alibaba", "");
+            let pk: aisix_core::ProviderKey = serde_json::from_value(serde_json::json!({
+                "display_name": "pk-video", "secret": "sk-up",
+                "api_base": upstream.uri(), "provider": "alibaba",
+                "groups": pk_groups,
+            }))
+            .unwrap();
+            snap.provider_keys.insert(ResourceEntry::new(PK_ID, pk, 1));
+            let key: ApiKey = serde_json::from_value(serde_json::json!({
+                "key_hash": "8b6712790a2089c67aa97a2d80022df18cc65c7814350e33baebe79aab508891",
+                "allowed_models": ["*"],
+                "allowed_provider_groups": ["grp-alpha"],
+            }))
+            .unwrap();
+            snap.apikeys.insert(ResourceEntry::new("k-1", key, 1));
+            let id = encode_video_id(MODEL_ID, "my-video", "task-123");
+            let resp =
+                tower::ServiceExt::oneshot(build_app(snap), get_uri(&format!("/v1/videos/{id}")))
+                    .await
+                    .unwrap();
+            let status = resp.status();
+            let body = body_json(resp).await;
+            (
+                status,
+                body,
+                upstream.received_requests().await.unwrap().len(),
+            )
+        }
+
+        let (status, body, sent) = poll(&["grp-alpha"]).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(sent, 1);
+
+        for pk_groups in [&["grp-beta"][..], &[]] {
+            let (status, body, sent) = poll(pk_groups).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+            assert_eq!(body["error"]["type"], "video_not_found");
+            assert_eq!(sent, 0, "the poll reached the upstream");
+            let text = body.to_string();
+            for secret in ["grp-alpha", "grp-beta", "pk-video", "my-video"] {
+                assert!(!text.contains(secret), "{secret} leaked: {text}");
+            }
         }
     }
 

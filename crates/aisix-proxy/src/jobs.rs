@@ -470,6 +470,14 @@ pub(crate) fn resolve_target(
                      requests must route to a direct model"
                 )));
             }
+            // The key's provider groups hold here as on every dispatch, and
+            // a model outside them is refused the way a routing group with no
+            // target left is.
+            if !crate::routing::target_in_groups(snapshot, m, &auth.key().allowed_provider_groups) {
+                return Err(ProxyError::AllCandidatesUnavailable {
+                    retry_after_secs: None,
+                });
+            }
             entry
         }
         // The lowest id rather than the first the table yields: it iterates
@@ -486,6 +494,12 @@ pub(crate) fn resolve_target(
                     && !m.is_semantic()
                     && !m.display_name.contains('*')
                     && auth.key().can_access(snapshot, &m.display_name)
+                    // Never a default outside the key's provider groups.
+                    && crate::routing::target_in_groups(
+                        snapshot,
+                        m,
+                        &auth.key().allowed_provider_groups,
+                    )
                     && m.provider_key_id
                         .as_deref()
                         .and_then(|id| snapshot.provider_keys.get_by_id(id))
@@ -5180,6 +5194,66 @@ mod tests {
             "got {v}"
         );
     }
+    /// A key restricted to provider groups reaches this surface only through
+    /// a provider key in one of them: a named model outside them is refused
+    /// as a routing group with no target left is, and the default pick passes
+    /// over such a model rather than landing on it.
+    #[test]
+    fn a_key_with_groups_targets_only_models_inside_them() {
+        let snap = AisixSnapshot::new();
+        for (id, group) in [(PK_A, "grp-alpha"), (PK_B, "grp-beta")] {
+            let pk: aisix_core::ProviderKey = serde_json::from_value(serde_json::json!({
+                "display_name": format!("pk-{group}"), "secret": "sk-up",
+                "api_base": "http://unused", "provider": "openai", "adapter": "openai",
+                "groups": [group],
+            }))
+            .unwrap();
+            snap.provider_keys.insert(ResourceEntry::new(id, pk, 1));
+        }
+        // The out-of-group model has the lower id, so it is the default a
+        // key without groups lands on.
+        snap.models.insert(model("m-a", "jobs-alpha", PK_A));
+        snap.models.insert(model("m-b", "jobs-beta", PK_B));
+        let target = |groups: &[&str], wanted: Option<&str>| {
+            let key: ApiKey = serde_json::from_value(serde_json::json!({
+                "key_hash": "h", "allowed_models": ["*"],
+                "allowed_provider_groups": groups,
+            }))
+            .unwrap();
+            let auth = AuthenticatedKey::new(
+                &snap,
+                Arc::new(ResourceEntry::new("k-1", key, 1)),
+                None,
+                false,
+            );
+            resolve_target(&snap, &auth, wanted, &ClientContext::default())
+                .map(|t| t.model_entry.value.display_name.clone())
+        };
+
+        assert_eq!(target(&[], None).unwrap(), "jobs-alpha");
+        assert_eq!(target(&["grp-beta"], None).unwrap(), "jobs-beta");
+        assert_eq!(
+            target(&["grp-beta"], Some("jobs-beta")).unwrap(),
+            "jobs-beta"
+        );
+        let err = target(&["grp-beta"], Some("jobs-alpha")).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ProxyError::AllCandidatesUnavailable {
+                    retry_after_secs: None
+                }
+            ),
+            "{err:?}"
+        );
+        assert!(!format!("{err} {err:?}").contains("grp-"), "{err:?}");
+        // With nothing inside the groups there is no default to pick.
+        assert!(matches!(
+            target(&["grp-zeta"], None),
+            Err(ProxyError::InvalidRequest(_))
+        ));
+    }
+
     /// With no model named, the row a jobs request lands on picks the provider
     /// key it is sent with, so it has to be the same on every replica: the
     /// model table iterates in no fixed order.

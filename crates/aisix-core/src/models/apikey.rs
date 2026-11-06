@@ -58,6 +58,25 @@ pub struct ApiKey {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed_model_ids: Option<Vec<String>>,
 
+    /// Provider groups this key may route to, matched against the `groups`
+    /// of each provider key.
+    ///
+    /// When set, a request is sent upstream only with a provider key that
+    /// lists at least one of these groups. This holds whether a model is
+    /// addressed directly or reached as a target of a routing or semantic
+    /// model, and for passthrough routes that inject a provider key. A model
+    /// outside these groups is never used, not as a fallback and not when a
+    /// routing tag in the request names it. When nothing inside them is left
+    /// to serve the request, it fails with `503`, the same answer as when
+    /// every upstream is unavailable. Ensemble models are not available to a
+    /// key that sets this field, and are answered as not found.
+    ///
+    /// This decides which upstreams may serve the key, not which models it
+    /// may name; `allowed_models` still decides that. Omitted or empty means
+    /// the key is not restricted by provider group.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_provider_groups: Vec<String>,
+
     /// Request, token, and concurrency limits for this key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rate_limit: Option<RateLimit>,
@@ -456,6 +475,7 @@ mod tests {
             display_name: None,
             allowed_models: vec![],
             allowed_model_ids: None,
+            allowed_provider_groups: Vec::new(),
             rate_limit: None,
             team_id: None,
             user_id: None,

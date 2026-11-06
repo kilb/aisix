@@ -1107,6 +1107,7 @@ async fn dispatch(
             context_origin: affinity.origin(),
             budget: Some(&budget_gate),
             serves: None,
+            allowed_groups: &auth.key().allowed_provider_groups,
         },
     )?;
     let retry_on_429 = model_entry

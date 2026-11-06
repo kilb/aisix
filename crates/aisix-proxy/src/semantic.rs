@@ -279,6 +279,9 @@ pub(crate) async fn resolve(
         .as_ref()
         .expect("resolve called on a non-semantic model");
     let router = &router_entry.value;
+    // The router's targets bypass `routing::resolve_attempt_models`, so the
+    // key's provider groups are applied here, to every candidate it can pick.
+    let groups = auth.key().allowed_provider_groups.as_slice();
 
     // Every alias this function dispatches to is read through the model
     // reference helpers: a router that names its targets by id keeps
@@ -291,8 +294,15 @@ pub(crate) async fn resolve(
     // an empty string, which could spuriously match a route.
     if prompt.trim().is_empty() {
         note_decision(None, None, Some(SemanticFallback::EmptyPrompt));
-        let (attempt, _) =
-            select_eligible(state, snapshot, router, source_ip, &default_target, None)?;
+        let (attempt, _) = select_eligible(
+            state,
+            snapshot,
+            router,
+            source_ip,
+            groups,
+            &default_target,
+            None,
+        )?;
         // 没有可分类的文本 → 不发嵌入调用 → 这次没有额外花费。
         return Ok((vec![attempt], None, 0));
     }
@@ -336,7 +346,9 @@ pub(crate) async fn resolve(
         Ok(pick) => pick,
         Err(failure) => {
             note_decision(None, None, Some(SemanticFallback::DecisionFailed));
-            return fallback(state, snapshot, router, source_ip, semantic, failure);
+            return fallback(
+                state, snapshot, router, source_ip, groups, semantic, failure,
+            );
         }
     };
 
@@ -347,6 +359,7 @@ pub(crate) async fn resolve(
                 snapshot,
                 router,
                 source_ip,
+                groups,
                 &semantic.routes[i].target_ref(snapshot),
                 Some(&default_target),
             )?;
@@ -363,8 +376,15 @@ pub(crate) async fn resolve(
         }
         None => {
             note_decision(None, pick.score, pick.miss);
-            let (attempt, _) =
-                select_eligible(state, snapshot, router, source_ip, &default_target, None)?;
+            let (attempt, _) = select_eligible(
+                state,
+                snapshot,
+                router,
+                source_ip,
+                groups,
+                &default_target,
+                None,
+            )?;
             (attempt, None)
         }
     };
@@ -575,12 +595,14 @@ fn fallback(
     snapshot: &AisixSnapshot,
     router: &Model,
     source_ip: &str,
+    groups: &[String],
     semantic: &Semantic,
     failure: DecisionFailure,
 ) -> Result<(Vec<AttemptModel>, Option<String>, u64), ProxyError> {
     match failure_target(snapshot, semantic) {
         Some(alias) => {
-            let (attempt, _) = select_eligible(state, snapshot, router, source_ip, &alias, None)?;
+            let (attempt, _) =
+                select_eligible(state, snapshot, router, source_ip, groups, &alias, None)?;
             // 决策没有做成，上游没有报回 usage —— 没有可计的花费。
             Ok((vec![attempt], None, 0))
         }
@@ -793,6 +815,10 @@ fn attempt_for_target(snapshot: &AisixSnapshot, alias: &str) -> Result<AttemptMo
 /// semantic single-winner analogue of the group filter
 /// (`routing::targets_allowed_for_ip` + `filter_attempt_models`):
 ///
+/// - the API key's provider groups are the first HARD gate: a candidate
+///   outside them is dropped, and with none left the caller gets the
+///   all-unavailable answer, naming no group and no member — the same as a
+///   routing group ([`crate::routing::target_in_groups`]);
 /// - the member's client-IP allowlist is a HARD gate: an excluded
 ///   candidate is dropped, and with every candidate excluded the caller
 ///   gets the same 403 as the entry gate, naming only the alias they
@@ -813,6 +839,7 @@ fn select_eligible(
     snapshot: &AisixSnapshot,
     router: &Model,
     source_ip: &str,
+    allowed_groups: &[String],
     primary: &str,
     fallback_alias: Option<&str>,
 ) -> Result<(AttemptModel, bool), ProxyError> {
@@ -838,6 +865,18 @@ fn select_eligible(
     }
     if let (true, Some(err)) = (candidates.is_empty(), unresolved) {
         return Err(err);
+    }
+    candidates.retain(|(attempt, _)| {
+        crate::routing::target_in_groups(snapshot, &attempt.model, allowed_groups)
+    });
+    if candidates.is_empty() {
+        tracing::debug!(
+            router = %router.display_name,
+            "no semantic target is in the API key's provider groups",
+        );
+        return Err(ProxyError::AllCandidatesUnavailable {
+            retry_after_secs: None,
+        });
     }
     candidates.retain(|(attempt, fell_back)| {
         let allowed = attempt.model.ip_allowed(source_ip);
@@ -1347,12 +1386,93 @@ mod tests {
             &snap,
             &router_model(),
             "127.0.0.1",
+            &[],
             "deleted-target",
             Some("default-target"),
         )
         .unwrap();
         assert_eq!(attempt.model.display_name, "default-target");
         assert!(fell_back);
+    }
+
+    /// A router reaches its targets past the routing-group path, so it
+    /// applies the key's provider groups itself: a target outside them is
+    /// not a candidate, the default stands in only when it is inside them,
+    /// and with neither inside the caller gets the all-unavailable answer
+    /// naming no group, provider key or target.
+    #[test]
+    fn a_semantic_route_never_picks_a_target_outside_the_keys_groups() {
+        let snap = AisixSnapshot::new();
+        for (name, pk_id) in [
+            ("route-target", "pk-id-beta"),
+            ("default-target", "pk-id-alpha"),
+        ] {
+            let model: Model = serde_json::from_value(serde_json::json!({
+                "display_name": name,
+                "provider": "openai",
+                "model_name": "up",
+                "provider_key_id": pk_id,
+            }))
+            .unwrap();
+            snap.models
+                .insert(ResourceEntry::new(format!("id-{name}"), model, 1));
+        }
+        for (id, name, group) in [
+            ("pk-id-alpha", "pk-alpha", "grp-alpha"),
+            ("pk-id-beta", "pk-beta", "grp-beta"),
+        ] {
+            let pk: aisix_core::ProviderKey = serde_json::from_value(serde_json::json!({
+                "display_name": name,
+                "api_key": "sk-x",
+                "groups": [group],
+            }))
+            .unwrap();
+            snap.provider_keys.insert(ResourceEntry::new(id, pk, 1));
+        }
+        let state = select_state(&snap);
+        let pick = |allowed: &[&str]| {
+            let allowed: Vec<String> = allowed.iter().map(|g| g.to_string()).collect();
+            select_eligible(
+                &state,
+                &snap,
+                &router_model(),
+                "127.0.0.1",
+                &allowed,
+                "route-target",
+                Some("default-target"),
+            )
+        };
+
+        let (attempt, fell_back) = pick(&[]).unwrap();
+        assert_eq!(attempt.model.display_name, "route-target");
+        assert!(!fell_back);
+
+        let (attempt, fell_back) = pick(&["grp-alpha"]).unwrap();
+        assert_eq!(attempt.model.display_name, "default-target");
+        assert!(fell_back);
+
+        let err = pick(&["grp-zeta"]).map(|_| ()).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ProxyError::AllCandidatesUnavailable {
+                    retry_after_secs: None
+                }
+            ),
+            "{err:?}"
+        );
+        let text = format!("{err} {err:?}");
+        for secret in [
+            "grp-alpha",
+            "grp-beta",
+            "grp-zeta",
+            "pk-alpha",
+            "pk-beta",
+            "route-target",
+            "default-target",
+        ] {
+            assert!(!text.contains(secret), "{secret} leaked: {text}");
+        }
     }
 
     /// With nothing left to serve it, the refusal names no member.
@@ -1365,6 +1485,7 @@ mod tests {
             &snap,
             &router_model(),
             "127.0.0.1",
+            &[],
             "secret-target",
             Some("secret-default"),
         )

@@ -142,6 +142,22 @@ pub struct ProviderKey {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolve_addresses: Option<Vec<IpAddr>>,
 
+    /// Provider groups this key belongs to, as free-form names chosen by the
+    /// operator — for example a dedicated-capacity pool or a service tier.
+    ///
+    /// A model's upstream belongs to the groups of the provider key it uses.
+    /// An API key that sets `allowed_provider_groups` is served with this
+    /// provider key only when this list shares at least one name with it,
+    /// whether through a model that uses this key (addressed directly or
+    /// reached as a target of a routing or semantic model) or a passthrough
+    /// route that injects it. API keys that set no `allowed_provider_groups`
+    /// are not affected by this field.
+    ///
+    /// When omitted or empty, the key belongs to no group, so only API keys
+    /// without `allowed_provider_groups` can reach the models that use it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<String>,
+
     /// Filled in by the snapshot loader from the etcd key path.
     #[serde(skip)]
     pub(crate) runtime_id: String,
@@ -972,6 +988,7 @@ mod tests {
             strip_headers: default_strip_headers(),
             tls: None,
             resolve_addresses: None,
+            groups: Vec::new(),
             runtime_id: String::new(),
         };
         let s = serde_json::to_string(&original).unwrap();

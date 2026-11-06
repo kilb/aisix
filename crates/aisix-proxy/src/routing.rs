@@ -734,6 +734,7 @@ where
             context_origin: None,
             budget: Some(&budget_gate),
             serves: None,
+            allowed_groups: &auth.key().allowed_provider_groups,
         },
     )?;
     let routing = entry.value.routing.as_ref();
@@ -1681,6 +1682,93 @@ pub(crate) struct RoutingRequest<'a> {
     /// a client alternating it with those would otherwise always land them
     /// on the same target.
     pub serves: Option<&'a dyn Fn(&Model) -> bool>,
+    /// The caller's API key's `allowed_provider_groups`. When non-empty, a
+    /// target whose provider key is in none of these groups is not a
+    /// candidate, and a direct model outside them is refused. Empty — the
+    /// default — means unconstrained. See [`target_in_groups`].
+    pub allowed_groups: &'a [String],
+}
+
+/// Whether `model` may serve a key restricted to the provider groups in
+/// `allowed`: always when `allowed` is empty, otherwise only when the
+/// provider key the model dispatches with lists at least one of them. A
+/// model whose provider key cannot be found belongs to no group.
+///
+/// Keys on the DISPATCHED target, never the requested entry: a routing or
+/// semantic model has no provider key of its own, so each of its targets is
+/// judged by its own provider key (`resolve_attempt_models`,
+/// `semantic::select_eligible`); a direct or embedding model and a wildcard
+/// alias are judged by the provider key of the row that serves them; an
+/// ensemble never gets this far for a grouped key
+/// ([`crate::model_resolve::refuse_ensemble_to_grouped_key`]).
+///
+/// The paths that pick a provider key outside this module call it
+/// themselves: `/v1/realtime`, the files/batches/fine-tuning target
+/// (`jobs::resolve_target`, named and default pick alike), and the video
+/// polls; an `inject` passthrough route holds a provider key rather than a
+/// model and calls [`provider_key_in_groups`].
+pub(crate) fn target_in_groups(
+    snapshot: &AisixSnapshot,
+    model: &Model,
+    allowed: &[String],
+) -> bool {
+    if allowed.is_empty() {
+        return true;
+    }
+    model
+        .provider_key_id
+        .as_deref()
+        .and_then(|id| snapshot.provider_keys.get_by_id(id))
+        .is_some_and(|pk| provider_key_in_groups(&pk.value, allowed))
+}
+
+/// Whether a request restricted to the provider groups in `allowed` may be
+/// sent with `pk`: always when `allowed` is empty, otherwise only when `pk`
+/// lists at least one of them. [`target_in_groups`] for a path that holds a
+/// provider key rather than a model (a passthrough route that injects one).
+pub(crate) fn provider_key_in_groups(pk: &aisix_core::ProviderKey, allowed: &[String]) -> bool {
+    allowed.is_empty() || pk.groups.iter().any(|g| allowed.contains(g))
+}
+
+/// Keep the targets [`target_in_groups`] admits. Runs ahead of every other
+/// filter, the routing-tag one included, so a request header can only narrow
+/// what the key's groups allow and a `default`-tagged target outside them is
+/// no fallback. A target whose reference resolves to no model cannot be
+/// shown to be in a group, so a grouped key drops it here. Borrows when
+/// `allowed` is empty — every key without groups.
+fn targets_in_groups<'a>(
+    snapshot: &AisixSnapshot,
+    targets: &'a [RoutingTarget],
+    allowed: &[String],
+) -> std::borrow::Cow<'a, [RoutingTarget]> {
+    if allowed.is_empty() {
+        return std::borrow::Cow::Borrowed(targets);
+    }
+    std::borrow::Cow::Owned(
+        targets
+            .iter()
+            .filter(|t| {
+                snapshot
+                    .models
+                    .get_by_name(&t.model_ref(snapshot))
+                    .is_some_and(|entry| target_in_groups(snapshot, &entry.value, allowed))
+            })
+            .cloned()
+            .collect(),
+    )
+}
+
+/// What a grouped key is told when nothing inside its groups is left: the
+/// answer every upstream being unavailable gets, naming no group, tag or
+/// target, so the refusal cannot be used to learn how a model is grouped.
+fn no_target_in_groups(virtual_name: &str) -> ProxyError {
+    tracing::debug!(
+        virtual_model = %virtual_name,
+        "no target is in the API key's provider groups",
+    );
+    ProxyError::AllCandidatesUnavailable {
+        retry_after_secs: None,
+    }
 }
 
 /// Drop the targets whose own `allowed_cidrs` excludes `source_ip`.
@@ -1802,10 +1890,12 @@ fn targets_within_budget<'a>(
 /// Resolve the ordered list of concrete Models a request will attempt.
 ///
 /// For a routing model (Model Group), narrow `routing.targets` to the ones
-/// this request can use (tags, client IP, budget, weight, whether the name
-/// still resolves, health/cooldown), then order what is left per the
+/// this request can use (the API key's provider groups, tags, client IP,
+/// budget, weight, whether the name still resolves, health/cooldown), then
+/// order what is left per the
 /// configured strategy and cap it at `max_fallbacks`. For a direct
-/// (non-routing) model, the list is just the model itself.
+/// (non-routing) model, the list is just the model itself, once it has
+/// passed the same provider-group and budget checks.
 ///
 /// Shared by `/v1/chat/completions` and `/v1/messages` so both endpoints
 /// dispatch Model Groups identically (ai-gateway#471).
@@ -1820,7 +1910,15 @@ pub(crate) fn resolve_attempt_models(
     virtual_model: &std::sync::Arc<Model>,
     req: RoutingRequest<'_>,
 ) -> Result<Vec<AttemptModel>, ProxyError> {
+    crate::model_resolve::refuse_ensemble_to_grouped_key(
+        virtual_name,
+        virtual_model,
+        req.allowed_groups,
+    )?;
     let Some(routing) = virtual_model.routing.as_ref() else {
+        if !target_in_groups(snapshot, virtual_model, req.allowed_groups) {
+            return Err(no_target_in_groups(virtual_name));
+        }
         if let Some(gate) = req.budget {
             gate.check_model(virtual_model)?;
         }
@@ -1832,11 +1930,25 @@ pub(crate) fn resolve_attempt_models(
         }]);
     };
 
+    // The API key's provider groups are a hard constraint and come first:
+    // a target outside them is not a candidate for anything below, so the
+    // routing-tag header can only narrow what is left, and neither a
+    // `default` target nor a `when_all_unavailable` policy reaches past it.
+    let grouped = targets_in_groups(snapshot, &routing.targets, req.allowed_groups);
+    if grouped.is_empty() {
+        return Err(no_target_in_groups(virtual_name));
+    }
     // Tag/metadata pre-filter: narrow the targets to those eligible for this
     // request's routing tags, then let the configured strategy order whatever
     // survives. A no-op when no target is tagged.
-    let eligible = eligible_targets(&routing.targets, req.tags);
+    let eligible = eligible_targets(&grouped, req.tags);
     if eligible.is_empty() {
+        // A grouped key gets the all-unavailable answer, not the 400 below
+        // that lists the tags: what a tag matches outside the key's groups
+        // is none of its business.
+        if !req.allowed_groups.is_empty() {
+            return Err(no_target_in_groups(virtual_name));
+        }
         return Err(ProxyError::InvalidRequest(format!(
             "no routing target matches request tags {:?}",
             req.tags
@@ -3430,6 +3542,314 @@ mod tests {
         ] {
             assert!(!target_unusable(&other), "{other:?}");
         }
+    }
+
+    // ───────────────── key-bound provider groups ─────────────────
+
+    /// `model-a` on `pk-alpha` (group `grp-alpha`), `model-b` on `pk-beta`
+    /// (group `grp-beta`), `model-none` on `pk-none` (no group). The tokens
+    /// are distinctive so an assertion that a refusal does not name them
+    /// cannot pass or fail on ordinary English text.
+    fn groups_snapshot() -> AisixSnapshot {
+        let snap = pk_snapshot(&[
+            ("model-a", "pk-id-alpha"),
+            ("model-b", "pk-id-beta"),
+            ("model-none", "pk-id-none"),
+        ]);
+        for (id, name, groups) in [
+            ("pk-id-alpha", "pk-alpha", vec!["grp-alpha"]),
+            ("pk-id-beta", "pk-beta", vec!["grp-beta"]),
+            ("pk-id-none", "pk-none", vec![]),
+        ] {
+            let pk: aisix_core::ProviderKey = serde_json::from_value(serde_json::json!({
+                "display_name": name,
+                "api_key": "sk-x",
+                "groups": groups,
+            }))
+            .unwrap();
+            snap.provider_keys
+                .insert(aisix_core::ResourceEntry::new(id, pk, 1));
+        }
+        snap
+    }
+
+    fn groups(names: &[&str]) -> Vec<String> {
+        names.iter().map(|n| n.to_string()).collect()
+    }
+
+    fn every_grouped_target() -> Vec<RoutingTarget> {
+        vec![
+            RoutingTarget::new("model-a"),
+            RoutingTarget::new("model-b"),
+            RoutingTarget::new("model-none"),
+        ]
+    }
+
+    fn grouped_select(
+        snap: &AisixSnapshot,
+        targets: Vec<RoutingTarget>,
+        req: RoutingRequest<'_>,
+    ) -> Result<Vec<String>, ProxyError> {
+        select(
+            &RoutingRegistry::new(),
+            &crate::ModelRuntimeStatusTracker::new(),
+            snap,
+            r(RoutingStrategy::Failover, targets, Some(5)),
+            req,
+        )
+    }
+
+    fn sorted(mut names: Vec<String>) -> Vec<String> {
+        names.sort();
+        names
+    }
+
+    /// Every name a refusal to a grouped key must keep to itself.
+    fn assert_names_no_group_or_member(err: &ProxyError) {
+        let text = format!("{err} {err:?}");
+        for secret in [
+            "grp-alpha",
+            "grp-beta",
+            "grp-zeta",
+            "pk-alpha",
+            "pk-beta",
+            "pk-none",
+            "model-a",
+            "model-b",
+            "model-none",
+        ] {
+            assert!(!text.contains(secret), "{secret} leaked: {text}");
+        }
+    }
+
+    #[test]
+    fn a_key_with_groups_only_reaches_targets_in_those_groups() {
+        let snap = groups_snapshot();
+        let allowed = groups(&["grp-alpha"]);
+        let order = grouped_select(
+            &snap,
+            every_grouped_target(),
+            RoutingRequest {
+                allowed_groups: &allowed,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(order, vec!["model-a"]);
+    }
+
+    #[test]
+    fn a_key_with_several_groups_reaches_each_of_them() {
+        let snap = groups_snapshot();
+        let allowed = groups(&["grp-alpha", "grp-beta"]);
+        let order = grouped_select(
+            &snap,
+            every_grouped_target(),
+            RoutingRequest {
+                allowed_groups: &allowed,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(sorted(order), vec!["model-a", "model-b"]);
+    }
+
+    #[test]
+    fn a_key_without_groups_is_unconstrained() {
+        let snap = groups_snapshot();
+        let order = grouped_select(
+            &snap,
+            every_grouped_target(),
+            RoutingRequest {
+                allowed_groups: &[],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(sorted(order), vec!["model-a", "model-b", "model-none"]);
+    }
+
+    /// The routing-tag header narrows within the key's groups and never
+    /// past them — not to a target tagged with the asked-for value, and not
+    /// to a `default`-tagged one outside the groups either.
+    #[test]
+    fn header_tags_never_widen_beyond_the_keys_groups() {
+        let snap = groups_snapshot();
+        let targets = || {
+            vec![
+                tagged("model-a", &["grp-alpha"]),
+                tagged("model-b", &["grp-beta"]),
+                tagged("model-none", &["default"]),
+            ]
+        };
+        let asked = groups(&["grp-beta"]);
+        // Without a group constraint the header picks its target, so the
+        // refusal below is the constraint at work and not a dead tag.
+        assert_eq!(
+            grouped_select(
+                &snap,
+                targets(),
+                RoutingRequest {
+                    tags: &asked,
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+            vec!["model-b"]
+        );
+        let allowed = groups(&["grp-alpha"]);
+        let err = grouped_select(
+            &snap,
+            targets(),
+            RoutingRequest {
+                tags: &asked,
+                allowed_groups: &allowed,
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, ProxyError::AllCandidatesUnavailable { .. }),
+            "{err:?}"
+        );
+        assert_names_no_group_or_member(&err);
+    }
+
+    #[test]
+    fn no_target_in_the_keys_groups_answers_like_all_unavailable() {
+        let snap = groups_snapshot();
+        let allowed = groups(&["grp-zeta"]);
+        let err = grouped_select(
+            &snap,
+            every_grouped_target(),
+            RoutingRequest {
+                allowed_groups: &allowed,
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ProxyError::AllCandidatesUnavailable {
+                    retry_after_secs: None
+                }
+            ),
+            "{err:?}"
+        );
+        assert_names_no_group_or_member(&err);
+    }
+
+    fn resolve_direct(
+        snap: &AisixSnapshot,
+        name: &str,
+        allowed: &[String],
+    ) -> Result<Vec<String>, ProxyError> {
+        let entry = snap.models.get_by_name(name).unwrap();
+        resolve_attempt_models(
+            &RoutingRegistry::new(),
+            &crate::ModelRuntimeStatusTracker::new(),
+            &LivePricingIndex::new(),
+            snap,
+            name,
+            &entry.id,
+            &entry.value,
+            RoutingRequest {
+                allowed_groups: allowed,
+                ..Default::default()
+            },
+        )
+        .map(|attempts| {
+            attempts
+                .into_iter()
+                .map(|a| a.model.display_name.clone())
+                .collect()
+        })
+    }
+
+    #[test]
+    fn a_direct_model_outside_the_keys_groups_is_refused_the_same_way() {
+        let snap = groups_snapshot();
+        let allowed = groups(&["grp-alpha"]);
+        assert_eq!(
+            resolve_direct(&snap, "model-a", &allowed).unwrap(),
+            ["model-a"]
+        );
+        let err = resolve_direct(&snap, "model-b", &allowed).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ProxyError::AllCandidatesUnavailable {
+                    retry_after_secs: None
+                }
+            ),
+            "{err:?}"
+        );
+        assert_names_no_group_or_member(&err);
+        // A model on a provider key with no group is outside every group.
+        assert!(matches!(
+            resolve_direct(&snap, "model-none", &allowed),
+            Err(ProxyError::AllCandidatesUnavailable { .. })
+        ));
+        assert_eq!(resolve_direct(&snap, "model-b", &[]).unwrap(), ["model-b"]);
+    }
+
+    /// A target written by `model_id` is judged by the provider key of the
+    /// model that id resolves to, like one written by name.
+    #[test]
+    fn a_target_named_by_id_is_judged_by_its_own_provider_keys_groups() {
+        let snap = groups_snapshot();
+        let allowed = groups(&["grp-beta"]);
+        let order = grouped_select(
+            &snap,
+            vec![
+                RoutingTarget::by_id("id-model-a"),
+                RoutingTarget::by_id("id-model-b"),
+            ],
+            RoutingRequest {
+                allowed_groups: &allowed,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(order, vec!["model-b"]);
+    }
+
+    /// A model whose provider key cannot be found has no group to be in, so
+    /// a grouped key never reaches it; an ungrouped key is not asked.
+    #[test]
+    fn target_in_groups_refuses_a_model_whose_provider_key_is_missing() {
+        let snap = pk_snapshot(&[("orphan", "pk-id-gone")]);
+        let model = snap.models.get_by_name("orphan").unwrap();
+        assert!(!target_in_groups(
+            &snap,
+            &model.value,
+            &groups(&["grp-alpha"])
+        ));
+        assert!(target_in_groups(&snap, &model.value, &[]));
+    }
+
+    /// An ensemble dispatches its own members, and those are not filtered by
+    /// group, so to a grouped key the ensemble is a model that does not exist.
+    #[test]
+    fn a_key_with_groups_finds_no_ensemble_to_dispatch() {
+        let snap = groups_snapshot();
+        let ensemble: Model = serde_json::from_value(serde_json::json!({
+            "display_name": "panel",
+            "ensemble": {
+                "panel": [{"model": "model-a"}],
+                "judge": {"model": "model-a"},
+            },
+        }))
+        .unwrap();
+        snap.models
+            .insert(aisix_core::ResourceEntry::new("id-panel", ensemble, 1));
+        let err = resolve_direct(&snap, "panel", &groups(&["grp-alpha"])).unwrap_err();
+        assert!(
+            matches!(err, ProxyError::ModelNotFound(ref m) if m == "panel"),
+            "{err:?}"
+        );
+        assert_eq!(resolve_direct(&snap, "panel", &[]).unwrap(), ["panel"]);
     }
 
     fn ip_snapshot(models: &[(&str, Option<Vec<&str>>)]) -> AisixSnapshot {

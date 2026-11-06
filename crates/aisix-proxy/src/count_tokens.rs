@@ -596,6 +596,7 @@ async fn dispatch(
             context_origin: None,
             budget: Some(&budget_gate),
             serves: Some(&|model| counts_anthropic_tokens(state, snapshot, model)),
+            allowed_groups: &auth.key().allowed_provider_groups,
         },
     )?;
     let retry_on_429 = model_entry

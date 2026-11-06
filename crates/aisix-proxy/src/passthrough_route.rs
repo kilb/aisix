@@ -580,6 +580,22 @@ async fn dispatch(
                     &auth,
                 ));
             }
+            // The injected credential is the upstream this request is sent
+            // with, so the key's provider groups decide it as on every other
+            // dispatch, refused the way a routing group with no target left
+            // is. A `forward_client` route sends no provider key of the
+            // gateway's and is not a group's to decide.
+            if !crate::routing::provider_key_in_groups(
+                &entry.value,
+                &auth.key().allowed_provider_groups,
+            ) {
+                return Err(RouteError::of(
+                    ProxyError::AllCandidatesUnavailable {
+                        retry_after_secs: None,
+                    },
+                    &auth,
+                ));
+            }
             Some(entry)
         }
         PassthroughCredentialMode::ForwardClient => None,
@@ -8023,6 +8039,72 @@ mod tests {
         let received = &upstream.received_requests().await.unwrap()[0];
         let auth_values: Vec<_> = received.headers.get_all("authorization").iter().collect();
         assert_eq!(auth_values.len(), 1);
+    }
+
+    /// The provider key an inject route sends with is held to the caller's
+    /// provider groups: outside them the request never leaves the gateway
+    /// and is refused as a routing group with no target left is.
+    #[tokio::test]
+    async fn an_inject_route_holds_a_grouped_key_to_its_groups() {
+        async fn status(pk_groups: &[&str], key_groups: &[&str]) -> (StatusCode, usize, String) {
+            let upstream = MockServer::builder().start().await;
+            Mock::given(wm_method("GET"))
+                .and(wm_path("/v1/models"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({"object": "list", "data": []})),
+                )
+                .mount(&upstream)
+                .await;
+            let snap = AisixSnapshot::new();
+            let pk: ProviderKey = serde_json::from_value(serde_json::json!({
+                "display_name": "pk-tunnel", "secret": "sk-upstream",
+                "provider": "openai", "adapter": "openai",
+                "groups": pk_groups,
+            }))
+            .unwrap();
+            snap.provider_keys.insert(ResourceEntry::new(PK_ID, pk, 1));
+            let key: ApiKey = serde_json::from_value(serde_json::json!({
+                "key_hash": ApiKey::hash_bearer("sk-caller"),
+                "allowed_models": ["*"], "allowed_routes": ["*"],
+                "allowed_provider_groups": key_groups,
+            }))
+            .unwrap();
+            snap.apikeys.insert(ResourceEntry::new("k-1", key, 1));
+            snap.passthrough_routes
+                .insert(inject_route(&upstream.uri()));
+            let resp = build_app(snap)
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri("/passthrough/openai/v1/models")
+                        .header("authorization", "Bearer sk-caller")
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let code = resp.status();
+            let body = to_bytes(resp.into_body(), 65536).await.unwrap();
+            let sent = upstream.received_requests().await.unwrap().len();
+            (code, sent, String::from_utf8_lossy(&body).into_owned())
+        }
+
+        assert_eq!(status(&[], &[]).await.0, StatusCode::OK);
+        assert_eq!(
+            status(&["grp-alpha"], &["grp-alpha"]).await.0,
+            StatusCode::OK
+        );
+        for (pk_groups, key_groups) in [
+            (&[][..], &["grp-alpha"][..]),
+            (&["grp-beta"], &["grp-alpha"]),
+        ] {
+            let (code, sent, body) = status(pk_groups, key_groups).await;
+            assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+            assert_eq!(sent, 0, "the request reached the upstream");
+            assert!(!body.contains("grp-"), "{body}");
+            assert!(!body.contains("pk-tunnel"), "{body}");
+        }
     }
 
     #[tokio::test]

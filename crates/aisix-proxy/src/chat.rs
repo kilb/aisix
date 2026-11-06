@@ -1905,6 +1905,7 @@ async fn dispatch(
                 context_origin: None,
                 budget: Some(&budget_gate),
                 serves: None,
+                allowed_groups: &auth.key().allowed_provider_groups,
             },
         )
         .map_err(&with_model)?;

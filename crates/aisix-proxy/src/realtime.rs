@@ -746,6 +746,14 @@ async fn prepare(
             "model {requested_model:?} is a virtual router; /v1/realtime requires a direct model"
         )));
     }
+    // The key's provider groups hold for a session as for every other
+    // dispatch: it is opened only with a provider key in one of them, and
+    // otherwise refused the way a routing group with no target left is.
+    if !crate::routing::target_in_groups(snapshot, model, &auth.key().allowed_provider_groups) {
+        return Err(ProxyError::AllCandidatesUnavailable {
+            retry_after_secs: None,
+        });
+    }
     crate::dispatch::check_ip_access(model, &client.source_ip)?;
 
     let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
@@ -3443,6 +3451,64 @@ mod tests {
             "拒绝理由说的不是「这是个虚拟父级」，那说明闸没起作用、是后面某步偶然\
              拦下的: {msg}"
         );
+    }
+
+    /// A key restricted to provider groups opens a session only with a
+    /// provider key in one of them; outside them it is refused as a routing
+    /// group with no target left is, naming no group.
+    #[tokio::test]
+    async fn a_key_with_groups_opens_a_session_only_inside_them() {
+        async fn prepared(pk_groups: &[&str], key_groups: &[&str]) -> Result<(), ProxyError> {
+            let snap = snapshot("http://127.0.0.1:1/v1", "openai", "openai");
+            let pk: aisix_core::ProviderKey = serde_json::from_value(serde_json::json!({
+                "display_name": "rt-pk", "secret": "sk-up",
+                "api_base": "http://127.0.0.1:1/v1",
+                "provider": "openai", "adapter": "openai",
+                "groups": pk_groups,
+            }))
+            .unwrap();
+            snap.provider_keys.insert(ResourceEntry::new(PK_ID, pk, 1));
+            let handle = SnapshotHandle::new(snap);
+            let live = handle.load();
+            let state = crate::ProxyState::new(handle.clone(), Arc::new(Hub::new()), &cfg());
+            let key: aisix_core::ApiKey = serde_json::from_value(serde_json::json!({
+                "key_hash": "h", "allowed_models": ["*"],
+                "allowed_provider_groups": key_groups,
+            }))
+            .unwrap();
+            let auth = crate::auth::AuthenticatedKey::new(
+                &live,
+                Arc::new(ResourceEntry::new("k-1", key, 1)),
+                None,
+                false,
+            );
+            let params = HashMap::from([("model".to_string(), "rt-model".to_string())]);
+            let client = crate::client_ip::ClientContext::default();
+            super::prepare(&state, &live, &params, &HeaderMap::new(), &client, auth)
+                .await
+                .map(|_| ())
+        }
+
+        assert!(prepared(&[], &[]).await.is_ok());
+        assert!(prepared(&["grp-alpha"], &["grp-alpha"]).await.is_ok());
+        for (pk_groups, key_groups) in [
+            (&[][..], &["grp-alpha"][..]),
+            (&["grp-beta"], &["grp-alpha"]),
+        ] {
+            let err = prepared(pk_groups, key_groups).await.unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    ProxyError::AllCandidatesUnavailable {
+                        retry_after_secs: None
+                    }
+                ),
+                "{err:?}"
+            );
+            let text = format!("{err} {err:?}");
+            assert!(!text.contains("grp-"), "{text}");
+            assert!(!text.contains("rt-pk"), "{text}");
+        }
     }
 
     /// 会话里从提示缓存读回来的 token 要按缓存费率计价，而不是全价输入。
