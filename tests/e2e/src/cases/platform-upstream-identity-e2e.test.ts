@@ -760,6 +760,12 @@ describe("platform mode e2e: ids name no upstream channel, and tool use still ro
 // against everything that account stored: echoed by another tenant, it must
 // reach the upstream as the opaque string that tenant sent, which names
 // nothing the upstream has.
+//
+// The same holds for every other object the shared account stores: a
+// container, a file, a vector store, a conversation, a stored prompt. A
+// tenant is never handed the ids of such objects through the gateway, so a
+// request naming one names somebody else's, and it is refused as an invalid
+// request naming the field, before any upstream sees it.
 
 const TENANT_KEYS = {
   /** Tenant A. */
@@ -777,7 +783,11 @@ const TENANT_ALIASES = {
   otherGroup: "pi-tenant-other-group",
   probe: "pi-tenant-probe",
   items: "pi-tenant-items",
+  refs: "pi-tenant-refs",
 };
+
+/** A Messages target for the stored-object refusals. */
+const REFS_ANTHROPIC_ALIAS = "pi-tenant-refs-anthropic";
 
 /** A Responses upstream's answer, under an id that carries a channel marker. */
 function tenantAnswer(id: string, previous: string | null = null): Record<string, unknown> {
@@ -858,6 +868,7 @@ describe("platform mode e2e: a response id continues only for the tenant it was 
     otherGroup: "",
     probe: "",
     items: "",
+    refs: "",
   };
   const up: Record<keyof typeof TENANT_ALIASES, OpenAiUpstream | undefined> = {
     target: undefined,
@@ -866,7 +877,9 @@ describe("platform mode e2e: a response id continues only for the tenant it was 
     otherGroup: undefined,
     probe: undefined,
     items: undefined,
+    refs: undefined,
   };
+  let refsAnthropic: OpenAiUpstream | undefined;
 
   async function postAs(
     key: string,
@@ -933,6 +946,24 @@ describe("platform mode e2e: a response id continues only for the tenant it was 
     up.otherGroup = await startOpenAiUpstream({ nonStreamBody: tenantAnswer("resp_bdrk_o01") });
     up.probe = await startOpenAiUpstream();
     up.items = await startOpenAiUpstream({ nonStreamBody: itemsAnswer() });
+    up.refs = await startOpenAiUpstream({
+      pathBodies: { "/responses": tenantAnswer("resp_bdrk_r01") },
+    });
+    refsAnthropic = await startOpenAiUpstream({
+      pathBodies: {
+        "/messages": {
+          id: "msg_bdrk_r01",
+          type: "message",
+          role: "assistant",
+          model: "upstream-model",
+          content: [{ type: "text", text: "Sunny." }],
+          stop_reason: "end_turn",
+          stop_sequence: null,
+          usage: { input_tokens: 5, output_tokens: 2 },
+        },
+        "/count_tokens": { input_tokens: 5 },
+      },
+    });
 
     tenantApp = await spawnApp({
       extraEnv: {
@@ -950,6 +981,7 @@ describe("platform mode e2e: a response id continues only for the tenant it was 
       otherGroup: ["gb"],
       probe: ["ga"],
       items: ["ga"],
+      refs: ["ga"],
     };
     for (const route of Object.keys(TENANT_ALIASES) as Array<keyof typeof TENANT_ALIASES>) {
       const pk = await seed.createProviderKey({
@@ -967,6 +999,21 @@ describe("platform mode e2e: a response id continues only for the tenant it was 
       });
       modelIds[route] = model.id;
     }
+    const refsPk = await seed.createProviderKey({
+      display_name: `pk-${REFS_ANTHROPIC_ALIAS}`,
+      secret: "sk-mock",
+      api_base: `${refsAnthropic.baseUrl}/v1`,
+      provider: "anthropic",
+      adapter: "anthropic",
+      groups: ["ga"],
+    });
+    await seed.createModel({
+      display_name: REFS_ANTHROPIC_ALIAS,
+      provider: "anthropic",
+      model_name: "upstream-model",
+      provider_key_id: refsPk.id,
+      retries: 0,
+    });
     // The caller keys last: each one authenticating implies every model
     // above is in the gateway's snapshot.
     const sha = (plaintext: string) => createHash("sha256").update(plaintext).digest("hex");
@@ -984,7 +1031,8 @@ describe("platform mode e2e: a response id continues only for the tenant it was 
         const res = await new ProxyClient(tenantApp!.proxyUrl, key).listModels();
         if (res.status !== 200) return false;
         const data = (res.body as { data?: Array<{ id?: string }> }).data ?? [];
-        if (!Object.values(TENANT_ALIASES).every((alias) => data.some((m) => m.id === alias))) {
+        const aliases = [...Object.values(TENANT_ALIASES), REFS_ANTHROPIC_ALIAS];
+        if (!aliases.every((alias) => data.some((m) => m.id === alias))) {
           return false;
         }
       }
@@ -994,7 +1042,7 @@ describe("platform mode e2e: a response id continues only for the tenant it was 
 
   afterAll(async () => {
     await tenantApp?.exit();
-    await Promise.all(Object.values(up).map((u) => u?.close()));
+    await Promise.all([...Object.values(up), refsAnthropic].map((u) => u?.close()));
   });
 
   test("a buffered answer's id: another tenant gets no such response, the owner continues", async (ctx) => {
@@ -1182,5 +1230,143 @@ describe("platform mode e2e: a response id continues only for the tenant it was 
     expect(sentForA.input[0].id).toBe("msg_bdrk_i01");
     expect(sentForA.input[1].id).toBe("fc_bdrk_i01");
     expect(sentForA.input[2].call_id).toBe("call_bdrk_i01");
+  });
+
+  test("a request naming an object stored upstream is refused on every family, before any upstream", async (ctx) => {
+    if (!etcdReachable || !tenantApp) return void ctx.skip();
+    const openai = TENANT_ALIASES.refs;
+    const anthropic = REFS_ANTHROPIC_ALIAS;
+    const hello = { type: "input_text", text: "what is in it?" };
+    const rows: Array<{ family: string; path: string; body: Record<string, unknown>; field: string }> = [
+      {
+        family: "responses: a container by id",
+        path: "/v1/responses",
+        body: {
+          model: openai,
+          input: "run it",
+          tools: [{ type: "code_interpreter", container: "cntr_tenant_a_0001" }],
+        },
+        field: "tools[0].container",
+      },
+      {
+        family: "responses: a conversation",
+        path: "/v1/responses",
+        body: { model: openai, input: "go on", conversation: "conv_tenant_a_0001" },
+        field: "conversation",
+      },
+      {
+        family: "responses: a stored file",
+        path: "/v1/responses",
+        body: {
+          model: openai,
+          input: [
+            {
+              role: "user",
+              content: [hello, { type: "input_file", file_id: "file-tenant-a-0001" }],
+            },
+          ],
+        },
+        field: "input[0].content[1].file_id",
+      },
+      {
+        family: "responses: a vector store",
+        path: "/v1/responses",
+        body: {
+          model: openai,
+          input: "search it",
+          tools: [{ type: "file_search", vector_store_ids: ["vs_tenant_a_0001"] }],
+        },
+        field: "tools[0].vector_store_ids",
+      },
+      {
+        family: "chat: a stored file",
+        path: "/v1/chat/completions",
+        body: {
+          model: openai,
+          messages: [
+            {
+              role: "user",
+              content: [
+                { type: "text", text: "what is in it?" },
+                { type: "file", file: { file_id: "file-tenant-a-0001" } },
+              ],
+            },
+          ],
+        },
+        field: "messages[0].content[1].file.file_id",
+      },
+      {
+        family: "messages: a container by id",
+        path: "/v1/messages",
+        body: {
+          model: anthropic,
+          max_tokens: 64,
+          container: "container_tenant_a_0001",
+          messages: [{ role: "user", content: "run it" }],
+        },
+        field: "container",
+      },
+      {
+        family: "messages: a stored file",
+        path: "/v1/messages",
+        body: {
+          model: anthropic,
+          max_tokens: 64,
+          messages: [
+            {
+              role: "user",
+              content: [
+                { type: "text", text: "what is in it?" },
+                { type: "document", source: { type: "file", file_id: "file_tenant_a_0001" } },
+              ],
+            },
+          ],
+        },
+        field: "messages[0].content[1].source.file_id",
+      },
+      {
+        family: "count_tokens: a stored file",
+        path: "/v1/messages/count_tokens",
+        body: {
+          model: anthropic,
+          messages: [
+            {
+              role: "user",
+              content: [{ type: "image", source: { type: "file", file_id: "file_tenant_a_0001" } }],
+            },
+          ],
+        },
+        field: "messages[0].content[0].source.file_id",
+      },
+    ];
+    // Every row is sent before anything is asserted, so a failure shows
+    // each family that let its row through.
+    const outcomes: Array<{ family: string; status: number; param: unknown }> = [];
+    for (const row of rows) {
+      const res = await postAs(TENANT_KEYS.b, row.path, row.body);
+      const param = res.text.startsWith("{") ? JSON.parse(res.text).error?.param : res.text;
+      outcomes.push({ family: row.family, status: res.status, param });
+    }
+    expect(outcomes).toEqual(
+      rows.map((row) => ({ family: row.family, status: 400, param: row.field })),
+    );
+    expect(up.refs!.receivedRequests, "no OpenAI-shape request reached the upstream").toHaveLength(0);
+    expect(refsAnthropic!.receivedRequests, "no Messages request reached the upstream").toHaveLength(0);
+
+    // Without such a reference, the same requests are served.
+    const fresh = await postAs(TENANT_KEYS.b, "/v1/responses", {
+      model: openai,
+      input: "run it",
+      tools: [{ type: "code_interpreter", container: { type: "auto" } }],
+    });
+    expect(fresh.status, fresh.text).toBe(200);
+    expect(up.refs!.receivedRequests).toHaveLength(1);
+    const plain = await postAs(TENANT_KEYS.b, "/v1/messages", {
+      model: anthropic,
+      max_tokens: 64,
+      messages: [{ role: "user", content: "hello" }],
+    });
+    expect(plain.status, plain.text).toBe(200);
+    expect(refsAnthropic!.receivedRequests).toHaveLength(1);
   });
 });

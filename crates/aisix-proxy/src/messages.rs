@@ -621,6 +621,10 @@ async fn dispatch(
     // Client-IP allowlist gate (#557): reject before guardrails / upstream.
     crate::dispatch::check_ip_access(&model_entry.value, &client.source_ip)?;
 
+    // Platform mode: nothing the request names may be an object stored
+    // upstream for another tenant.
+    crate::stored_refs::refuse_in_messages(state.platform(), body)?;
+
     // #448 (#22): /v1/messages must run input guardrails like
     // /v1/chat/completions — previously prompts reached the upstream without
     // any content/DLP check. Translate the Anthropic-shaped body into the

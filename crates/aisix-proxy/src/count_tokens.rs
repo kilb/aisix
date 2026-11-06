@@ -549,6 +549,10 @@ async fn dispatch(
     // Client-IP allowlist gate (#557): reject before quota / upstream.
     crate::dispatch::check_ip_access(&model_entry.value, &client.source_ip)?;
 
+    // Platform mode: nothing the request names may be an object stored
+    // upstream for another tenant.
+    crate::stored_refs::refuse_in_messages(state.platform(), body)?;
+
     let model_rl =
         crate::quota::ModelRateLimit::from_model(&model_name, &model_entry.id, &model_entry.value);
     // Input guardrails (#555). Same chain, same order and same ordering

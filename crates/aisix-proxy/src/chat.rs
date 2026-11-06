@@ -1688,6 +1688,10 @@ async fn dispatch(
     crate::dispatch::check_ip_access(&virtual_entry.value, &client.source_ip)
         .map_err(with_model)?;
 
+    // Platform mode: nothing the request names may be an object stored
+    // upstream for another tenant.
+    crate::stored_refs::refuse_in_chat(state.platform(), req).map_err(with_model)?;
+
     // Resolve the per-request guardrail chain from the index.
     // Done once here; `resolved_chain` is reused for both the input
     // check below, the output check later, and the streaming output

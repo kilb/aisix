@@ -162,6 +162,10 @@ pub(crate) fn classify(err: &ProxyError) -> PlatformErrorClass {
         ProxyError::TargetRefused(_) => PlatformErrorClass::InvalidRequest { param: None },
         // Read exactly as a response the upstream does not have.
         ProxyError::ResponseNotFound => PlatformErrorClass::NotFound,
+        // The caller's own field, which the class names.
+        ProxyError::StoredObjectReference(field) => PlatformErrorClass::InvalidRequest {
+            param: Some(field.clone()),
+        },
         other => match other.status().as_u16() {
             401 => PlatformErrorClass::Authentication,
             404 => PlatformErrorClass::NotFound,
@@ -280,15 +284,17 @@ fn classify_upstream(
 
 /// Whether platform mode replaces `err` for the caller: an upstream's
 /// failure, a gateway refusal whose text names the target the request
-/// resolved to, or a response id refused for what only the gateway knows
-/// about it. The one upstream-side variant left alone is the gateway's own
+/// resolved to, or a refusal of what a request names that is decided on what
+/// only the gateway knows about it (a response id, an object stored
+/// upstream). The one upstream-side variant left alone is the gateway's own
 /// request size limit, which names nothing.
 fn hides(err: &ProxyError) -> bool {
     match err {
         ProxyError::Bridge(e) => hides_bridge(e),
         ProxyError::UnusableTarget(_)
         | ProxyError::TargetRefused(_)
-        | ProxyError::ResponseNotFound => true,
+        | ProxyError::ResponseNotFound
+        | ProxyError::StoredObjectReference(_) => true,
         _ => false,
     }
 }

@@ -920,6 +920,24 @@ pub(crate) mod tests {
         assert_eq!(body["input"][1]["call_id"], "call_bdrk_1");
     }
 
+    /// The owner's length prefix is what keeps one owner's bytes from being
+    /// another owner's followed by the start of an id or prefix.
+    #[test]
+    fn the_owner_is_length_prefixed_in_the_nonce_and_the_associated_data() {
+        assert_ne!(
+            Sealer::new(&K, "ab").aad("c_"),
+            Sealer::new(&K, "a").aad("bc_")
+        );
+        assert_ne!(
+            Sealer::new(&K, "ab").nonce("c"),
+            Sealer::new(&K, "a").nonce("bc")
+        );
+        assert_eq!(
+            Sealer::new(&K, "ab").aad("c_"),
+            [&2u64.to_be_bytes()[..], b"abc_"].concat()
+        );
+    }
+
     #[test]
     fn the_seal_key_is_not_the_id_key() {
         assert_ne!(seal_key(&K), K);

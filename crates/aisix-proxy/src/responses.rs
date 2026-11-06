@@ -395,25 +395,20 @@ pub async fn responses(
     // guardrail, a log, or an upstream. In platform mode the tags are sealed
     // to the tenant they were handed to: the key's team, or the key itself.
     let affinity = match state.platform() {
-        Some(platform) => crate::responses_affinity::ContextAffinity::unwrap_sealed_request(
-            &mut body,
-            crate::responses_affinity::TenantSeal::new(
-                platform,
-                crate::platform::tenant_owner(&auth),
-            ),
-        ),
+        Some(platform) => {
+            let owner = crate::platform::tenant_owner(&auth);
+            let affinity = crate::responses_affinity::ContextAffinity::unwrap_sealed_request(
+                &mut body,
+                crate::responses_affinity::TenantSeal::new(platform, &owner),
+            );
+            // The item ids a client echoes from an earlier answer leave here
+            // sealed; the upstream gets back the ones it issued, for the
+            // tenant they were handed to only.
+            crate::opaque_id::unseal_responses_input(platform, &owner, &mut body);
+            affinity
+        }
         None => crate::responses_affinity::ContextAffinity::unwrap_request(&mut body),
     };
-    // Platform mode: the item ids a client echoes from an earlier answer
-    // leave here sealed; the upstream gets back the ones it issued, for the
-    // tenant they were handed to only.
-    if let Some(platform) = state.platform() {
-        crate::opaque_id::unseal_responses_input(
-            platform,
-            crate::platform::tenant_owner(&auth),
-            &mut body,
-        );
-    }
     let request_id = client.request_id.clone();
     crate::span_facts::note_request(
         &client,
@@ -841,6 +836,10 @@ async fn dispatch(
     // Client-IP allowlist gate (#557): reject before guardrails / upstream.
     crate::dispatch::check_ip_access(&model_entry.value, &client.source_ip)?;
 
+    // Platform mode: nothing the request names may be an object stored
+    // upstream for another tenant.
+    crate::stored_refs::refuse_in_responses(state.platform(), body)?;
+
     // Platform mode: a continuation names a response this tenant was handed,
     // served by a target the key's provider groups still hold. Anything else
     // is a response that does not exist, and no upstream hears of it.
@@ -1160,6 +1159,11 @@ async fn dispatch(
     // pre-dispatch 4xx); if this endpoint ever grows semantic support,
     // widen this flag or the deferred policies are silently skipped.
     let is_routing_request = model_entry.value.routing.is_some();
+    // Platform mode: the tenant this request's item ids are sealed to.
+    let owner = state
+        .platform()
+        .map(|_| crate::platform::tenant_owner(auth))
+        .unwrap_or_default();
     let mut routing = RoutingTelemetry::for_request(&model_entry.value.display_name)
         .with_trace(client.trace.clone());
     // Walk the targets, failing over on a retryable failure. Streaming and
@@ -1285,7 +1289,7 @@ async fn dispatch(
             let attempt_body = stripped_body.as_ref().unwrap_or(body);
             let mark = affinity
                 .response_mark(&target.id, is_routing_request)
-                .sealing_ids(state.platform(), crate::platform::tenant_owner(auth));
+                .sealing_ids(state.platform(), &owner);
             let result = if crate::dispatch::serves_natively(
                 snapshot,
                 &target.model,
@@ -10663,6 +10667,8 @@ data: [DONE]\n\n";
     use serde_json::Value;
 
     const PLATFORM_SECRET: &str = "responses-tenant-secret";
+    /// The tenant `team-a`'s keys belong to.
+    const TENANT_A: &str = "team:team-a";
     /// The plaintext of tenant B's key; tenant A's is `make_req`'s.
     const TENANT_B_PLAINTEXT: &str = "sk-tenant-b";
 
@@ -10763,7 +10769,7 @@ data: [DONE]\n\n";
 
         let tenant_a_id = crate::responses_affinity::seal_response_id(
             &response_key(),
-            "team-a",
+            TENANT_A,
             "m-1",
             "resp_up",
         );
@@ -10821,7 +10827,7 @@ data: [DONE]\n\n";
         let app = build_platform_app(snap);
         let sent = crate::responses_affinity::seal_response_id(
             &response_key(),
-            "team-a",
+            TENANT_A,
             "m-1",
             "resp_up",
         );
@@ -10843,7 +10849,7 @@ data: [DONE]\n\n";
             let id = v["id"].as_str().unwrap();
             assert!(!id.contains("resp_bdrk_next"), "{id}");
             assert_eq!(
-                crate::responses_affinity::open_response_id(&response_key(), "team-a", id),
+                crate::responses_affinity::open_response_id(&response_key(), TENANT_A, id),
                 Some(("m-1".into(), "resp_bdrk_next".into()))
             );
         }
@@ -10893,7 +10899,7 @@ data: [DONE]\n\n";
             assert_eq!(ids.len(), 3, "{body}");
             assert!(ids.iter().all(|id| *id == ids[0]), "{ids:?}");
             assert_eq!(
-                crate::responses_affinity::open_response_id(&response_key(), "team-a", &ids[0]),
+                crate::responses_affinity::open_response_id(&response_key(), TENANT_A, &ids[0]),
                 Some(("m-1".into(), "resp_bdrk_s".into())),
                 "guarded: {guarded}"
             );
@@ -10933,12 +10939,24 @@ data: [DONE]\n\n";
             serde_json::from_slice(&to_bytes(resp.into_body(), 65536).await.unwrap()).unwrap();
         let (target, minted) = crate::responses_affinity::open_response_id(
             &response_key(),
-            "team-a",
+            TENANT_A,
             v["id"].as_str().unwrap(),
         )
         .unwrap();
         assert_eq!(target, "m-2");
-        assert!(minted.starts_with("resp_"), "{minted}");
+        // Sealed once: what the seal holds is the gateway's own minted id,
+        // not another seal.
+        assert_eq!(
+            crate::responses_affinity::open_response_id(&response_key(), TENANT_A, &minted),
+            None,
+            "{minted}"
+        );
+        assert!(
+            minted
+                .strip_prefix("resp_")
+                .is_some_and(|hex| hex.len() == 32 && hex.bytes().all(|b| b.is_ascii_hexdigit())),
+            "{minted}"
+        );
 
         let resp = app
             .oneshot(make_req(
@@ -10956,10 +10974,14 @@ data: [DONE]\n\n";
             .collect();
         assert!(ids.len() >= 2, "{body}");
         assert!(ids.iter().all(|id| *id == ids[0]), "{ids:?}");
+        let (target, minted) =
+            crate::responses_affinity::open_response_id(&response_key(), TENANT_A, &ids[0])
+                .unwrap();
+        assert_eq!(target, "m-2");
         assert_eq!(
-            crate::responses_affinity::open_response_id(&response_key(), "team-a", &ids[0])
-                .map(|(target, _)| target),
-            Some("m-2".into())
+            crate::responses_affinity::open_response_id(&response_key(), TENANT_A, &minted),
+            None,
+            "{minted}"
         );
     }
 
@@ -11006,7 +11028,7 @@ data: [DONE]\n\n";
         let app = build_platform_app(snap);
         let from_ga = crate::responses_affinity::seal_response_id(
             &response_key(),
-            "team-a",
+            TENANT_A,
             "m-1",
             "resp_up",
         );
@@ -11023,7 +11045,7 @@ data: [DONE]\n\n";
         // Inside its groups the same key continues.
         let from_gb = crate::responses_affinity::seal_response_id(
             &response_key(),
-            "team-a",
+            TENANT_A,
             "m-3",
             "resp_up",
         );

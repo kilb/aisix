@@ -18,11 +18,16 @@ impl PlatformSettings {
     }
 }
 
-/// The tenant a platform-mode request belongs to: its API key's team, or the
-/// key itself when it has none. Every id platform mode seals for a caller is
-/// sealed to it, and opens only for it.
-pub(crate) fn tenant_owner(auth: &crate::auth::AuthenticatedKey) -> &str {
-    auth.key().team_id.as_deref().unwrap_or(&auth.entry.id)
+/// The tenant a platform-mode request belongs to: `team:<team id>` for a key
+/// in a team, `key:<key entry id>` for one without. Every id platform mode
+/// seals for a caller is sealed to it, and opens only for it. The kind tag
+/// keeps a team id that equals some key's entry id from naming that key's
+/// tenant.
+pub(crate) fn tenant_owner(auth: &crate::auth::AuthenticatedKey) -> String {
+    match auth.key().team_id.as_deref() {
+        Some(team) => format!("team:{team}"),
+        None => format!("key:{}", auth.entry.id),
+    }
 }
 
 // 不派生 Debug：id_key 是密钥派生值，不能进日志。

@@ -102,19 +102,38 @@ fn cipher(key: &[u8; 32]) -> aead::LessSafeKey {
     )
 }
 
-/// The owner as it is written into a plaintext: `%` and `;` escaped, so an
-/// owner whose name extends another's past a `;` cannot pass for it.
-fn owner_field(owner: &str) -> Cow<'_, str> {
-    if owner.contains(['%', ';']) {
-        Cow::Owned(owner.replace('%', "%25").replace(';', "%3B"))
+/// An owner or target id as it is written into a plaintext: `%` and `;`
+/// escaped, so a field whose value extends another's past a `;` cannot pass
+/// for it.
+fn escaped(field: &str) -> Cow<'_, str> {
+    if field.contains(['%', ';']) {
+        Cow::Owned(field.replace('%', "%25").replace(';', "%3B"))
     } else {
-        Cow::Borrowed(owner)
+        Cow::Borrowed(field)
     }
+}
+
+/// The field [`escaped`] wrote; `None` for anything it could not have.
+fn unescaped(field: &str) -> Option<String> {
+    let mut out = String::with_capacity(field.len());
+    let mut rest = field;
+    while let Some(at) = rest.find('%') {
+        out.push_str(&rest[..at]);
+        let code = rest.get(at + 1..at + 3)?;
+        out.push(match code {
+            "25" => '%',
+            "3B" => ';',
+            _ => return None,
+        });
+        rest = &rest[at + 3..];
+    }
+    out.push_str(rest);
+    Some(out)
 }
 
 fn seal(key: &[u8; 32], aad: &[u8], owner: &str, target_id: &str, value: &str) -> String {
     let mut sealed = crate::opaque_id::pad_after(
-        &format!("{SEALED_TAG}{};{target_id};", owner_field(owner)),
+        &format!("{SEALED_TAG}{};{};", escaped(owner), escaped(target_id)),
         value,
     );
     let mut nonce = [0u8; aead::NONCE_LEN];
@@ -152,10 +171,11 @@ fn open(key: &[u8; 32], aad: &[u8], owner: &str, payload: &str) -> Option<(Strin
     let text = std::str::from_utf8(crate::opaque_id::unpad(plain)?).ok()?;
     let (target, value) = text
         .strip_prefix(SEALED_TAG)?
-        .strip_prefix(&*owner_field(owner))?
+        .strip_prefix(&*escaped(owner))?
         .strip_prefix(';')?
         .split_once(';')?;
-    (!target.is_empty()).then(|| (target.to_owned(), value.to_owned()))
+    let target = unescaped(target)?;
+    (!target.is_empty()).then(|| (target, value.to_owned()))
 }
 
 /// Platform mode: the key response ids and ciphertext tags are sealed under,
@@ -1007,6 +1027,24 @@ mod tests {
             open_response_id(&k, "team;model-x", &id),
             Some(("model-1".into(), "resp_up".into()))
         );
+    }
+
+    /// A target id is escaped like the owner, and read back as it was.
+    #[test]
+    fn a_target_id_with_separators_reads_back_as_it_was() {
+        let k = [3u8; 32];
+        for target in ["m;1", "m%3B1", "%", "m;%;x"] {
+            let id = seal_response_id(&k, "team", target, "resp_up");
+            assert_eq!(
+                open_response_id(&k, "team", &id),
+                Some((target.to_string(), "resp_up".to_string())),
+                "{target}"
+            );
+        }
+        assert_eq!(unescaped("a%3B%25b").as_deref(), Some("a;%b"));
+        for broken in ["%", "%3", "%41", "a%2"] {
+            assert_eq!(unescaped(broken), None, "{broken}");
+        }
     }
 
     /// The length of a sealed id says nothing about the upstream id inside:

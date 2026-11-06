@@ -267,6 +267,14 @@ pub enum ProxyError {
     /// text names neither, since it reaches the usage event.
     #[error("previous response not found")]
     ResponseNotFound,
+    /// Platform mode: a request field, named by its path, that names an
+    /// object stored upstream which the gateway cannot bind to the caller's
+    /// tenant (`crate::stored_refs`). Answered as an invalid request naming
+    /// the field.
+    #[error(
+        "request field `{0}` names an object stored upstream, which platform mode does not allow"
+    )]
+    StoredObjectReference(String),
     /// A list of files, batches or fine-tuning jobs asked for on a provider key
     /// that keys belonging to a team or user reach. The upstream's list spans
     /// its whole account, and the gateway cannot say which of it the caller
@@ -562,6 +570,7 @@ impl ProxyError {
             ProxyError::VideoNotFound(_) => StatusCode::NOT_FOUND,
             ProxyError::JobResourceNotFound(_) => StatusCode::NOT_FOUND,
             ProxyError::ResponseNotFound => StatusCode::NOT_FOUND,
+            ProxyError::StoredObjectReference(_) => StatusCode::BAD_REQUEST,
             ProxyError::JobListRefused => StatusCode::FORBIDDEN,
             ProxyError::InvalidRequest(_)
             | ProxyError::UnusableTarget(_)
@@ -620,6 +629,7 @@ impl ProxyError {
             ProxyError::VideoNotFound(_) => "video_not_found",
             ProxyError::JobResourceNotFound(_) => "resource_not_found",
             ProxyError::ResponseNotFound => "response_not_found",
+            ProxyError::StoredObjectReference(_) => "invalid_request_error",
             ProxyError::JobListRefused => "permission_denied",
             ProxyError::InvalidRequest(_)
             | ProxyError::UnusableTarget(_)
@@ -1155,6 +1165,10 @@ struct AnthropicErrorBody {
     /// mode replaces, to the class's code, for the same reason.
     #[serde(skip_serializing_if = "Option::is_none")]
     code: Option<&'static str>,
+    /// The field of the caller's request an invalid-request class names, in
+    /// platform mode; the OpenAI envelope carries the same as `param`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    param: Option<String>,
 }
 
 impl AnthropicErrorEnvelope {
@@ -1166,6 +1180,12 @@ impl AnthropicErrorEnvelope {
                 kind: class.anthropic_kind().to_string(),
                 message: crate::platform_errors::platform_message(class).to_string(),
                 code: Some(class.code()),
+                param: match class {
+                    crate::platform_errors::PlatformErrorClass::InvalidRequest { param } => {
+                        param.clone()
+                    }
+                    _ => None,
+                },
             },
         }
     }
@@ -1288,6 +1308,7 @@ impl ProxyError {
                 // (the upstream message, translated on a 4xx).
                 message: self.envelope().error.message,
                 code,
+                param: None,
             },
         }
     }

@@ -95,6 +95,7 @@ mod semantic;
 mod span_facts;
 pub mod sse_keepalive;
 mod state;
+mod stored_refs;
 mod stream_timeout;
 #[cfg(test)]
 mod test_log;
