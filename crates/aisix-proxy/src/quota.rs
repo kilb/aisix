@@ -597,7 +597,7 @@ async fn reserve_layers(
             .limiter
             .pre_commit(&auth.entry.id, &key_limits)
             .await
-            .map_err(|e| reject(state, e, "api_key", None))?;
+            .map_err(|e| reject(state, e, "api_key", None, true))?;
         reservations.push(r);
     }
 
@@ -609,7 +609,7 @@ async fn reserve_layers(
                 .limiter
                 .pre_commit(&key, limits)
                 .await
-                .map_err(|e| reject(state, e, "model", None))?;
+                .map_err(|e| reject(state, e, "model", None, false))?;
             reservations.push(r);
         }
     }
@@ -633,7 +633,7 @@ async fn reserve_layers(
                     .limiter
                     .pre_commit(&key, &rl)
                     .await
-                    .map_err(|e| reject(state, e, "mcp", None))?;
+                    .map_err(|e| reject(state, e, "mcp", None, true))?;
                 reservations.push(r);
             }
         }
@@ -706,7 +706,15 @@ async fn reserve_policy_layers(
                 .limiter
                 .pre_commit(&layer.bucket_key, &limits)
                 .await
-                .map_err(|e| reject(state, e, "policy", Some((&entry.id, &policy.name))))?;
+                .map_err(|e| {
+                    reject(
+                        state,
+                        e,
+                        "policy",
+                        Some((&entry.id, &policy.name)),
+                        policy_bucket_is_callers(policy),
+                    )
+                })?;
             reservations.push(r);
             if let ParentCounted::Record(keys) = &mut parent_counted {
                 if matched_only_through_parent(policy, &entry.id, input, phase) {
@@ -839,6 +847,7 @@ fn reject(
     err: aisix_ratelimit::RateLimitError,
     layer: &'static str,
     policy: Option<(&str, &str)>,
+    callers_bucket: bool,
 ) -> ProxyError {
     state
         .metrics
@@ -846,11 +855,31 @@ fn reject(
     match policy {
         Some((id, name)) => ProxyError::PolicyRateLimit {
             source: err,
-            policy_id: id.to_string(),
-            policy_name: name.to_string(),
+            policy_id: id.into(),
+            policy_name: name.into(),
+            callers_bucket,
         },
+        None if layer == "model" => ProxyError::ModelRateLimit(err),
         None => ProxyError::from(err),
     }
+}
+
+/// Whether every request counted in `policy`'s bucket is the caller's own:
+/// a classic policy not scoped to a model, or a conditional one grouped by
+/// the key, member or team. Anything else (a model scope, no `group_by`, or
+/// one by model, provider or tag only) is one counter for all callers.
+pub(crate) fn policy_bucket_is_callers(policy: &RateLimitPolicy) -> bool {
+    if policy.is_conditional() {
+        return policy.group_by.as_deref().is_some_and(|dims| {
+            dims.iter().any(|d| {
+                matches!(
+                    d,
+                    GroupByDimension::ApiKey | GroupByDimension::Member | GroupByDimension::Team
+                )
+            })
+        });
+    }
+    policy.scope.is_some_and(|s| s != PolicyScope::Model)
 }
 
 /// 花费拒绝的 `scope` 标签。不能用 `err.scope()`——底层花费桶复用的是
@@ -926,7 +955,23 @@ fn reject_spend(
             .map(|team| format!("{team}:{member}")),
         _ => policy.scope_ref.clone(),
     };
+    // Platform mode must not name the policy, so the caller reads a message
+    // without it; `message` keeps the name for telemetry.
+    let caller_message = if matches!(err, aisix_ratelimit::RateLimitError::AllowanceExhausted) {
+        "Spend allowance exhausted. Top up to continue."
+    } else {
+        "Spend ceiling reached."
+    };
     ProxyError::BudgetExceeded(Box::new(crate::budget::BudgetReason {
+        caller_message: Some(caller_message.to_string()),
+        scope_kind: policy.scope.and_then(|s| match s {
+            PolicyScope::ApiKey => Some(aisix_core::models::BudgetScope::ApiKey),
+            PolicyScope::Team => Some(aisix_core::models::BudgetScope::Team),
+            PolicyScope::Member => Some(aisix_core::models::BudgetScope::Member),
+            PolicyScope::TeamMember => Some(aisix_core::models::BudgetScope::TeamMember),
+            // A model-scoped ceiling is shared by every caller of the model.
+            PolicyScope::Model => None,
+        }),
         message: if matches!(err, aisix_ratelimit::RateLimitError::AllowanceExhausted) {
             // 措辞要说清「等不回来」。窗口上限的文案会让人以为再等等就好了，
             // 而这个要有人去充值。
@@ -1202,7 +1247,7 @@ async fn reserve_model_layers(
             .limiter
             .pre_commit(&key, limits)
             .await
-            .map_err(|e| reject(state, e, "model", None))?;
+            .map_err(|e| reject(state, e, "model", None, false))?;
         reservations.push(r);
     }
 
@@ -2265,6 +2310,67 @@ mod tests {
             rendered.contains("scope=\"spend_day\""),
             "花费层拒绝的 scope 标签应为 spend_day，不是 tokens: {rendered}"
         );
+    }
+
+    /// Platform mode: the caller reads no policy name in a spend refusal,
+    /// while the error's own text (telemetry) still carries it.
+    #[tokio::test]
+    async fn a_spend_ceiling_breach_names_no_policy_in_platform_mode() {
+        let snap = snapshot_with_policy(make_spend_policy("api_key", "k1", "day", None, Some(1)));
+        let state = test_state(&snap);
+        let auth = test_auth_key("k1");
+        reserve_layers(&state, &snap, &auth, None, None)
+            .await
+            .expect("first request passes")
+            .commit(0, 10_000)
+            .await;
+        let err = reserve_layers(&state, &snap, &auth, None, None)
+            .await
+            .expect_err("over the ceiling");
+        let body = crate::error::tests::render_platform(&err);
+        assert_eq!(body["error"]["message"], "Spend ceiling reached.");
+        assert_eq!(body["error"]["scope"], "api_key");
+        assert!(!body.to_string().contains("both"), "{body}");
+        assert!(err.to_string().contains("both"), "telemetry keeps the name");
+    }
+
+    #[test]
+    fn only_a_bucket_keyed_to_the_caller_is_the_callers() {
+        let classic = |scope: &str| make_scoped_policy(scope, "ref");
+        assert!(policy_bucket_is_callers(&classic("api_key")));
+        assert!(policy_bucket_is_callers(&classic("team")));
+        assert!(policy_bucket_is_callers(&classic("member")));
+        assert!(policy_bucket_is_callers(&classic("team_member")));
+        assert!(!policy_bucket_is_callers(&classic("model")));
+        let conditional = |group_by: serde_json::Value| {
+            make_conditional_policy(serde_json::json!({
+                "name": "c",
+                "conditions": [{ "dimension": "team", "operator": "in", "value": ["t"] }],
+                "group_by": group_by,
+                "limits": { "rpm": 1 },
+            }))
+        };
+        assert!(!policy_bucket_is_callers(&conditional(serde_json::json!(
+            []
+        ))));
+        assert!(!policy_bucket_is_callers(&conditional(serde_json::json!(
+            ["model"]
+        ))));
+        assert!(!policy_bucket_is_callers(&conditional(serde_json::json!(
+            ["provider"]
+        ))));
+        assert!(!policy_bucket_is_callers(&conditional(serde_json::json!(
+            ["tag:dept"]
+        ))));
+        assert!(policy_bucket_is_callers(&conditional(serde_json::json!([
+            "api_key"
+        ]))));
+        assert!(policy_bucket_is_callers(&conditional(serde_json::json!([
+            "team", "model"
+        ]))));
+        assert!(policy_bucket_is_callers(&conditional(serde_json::json!([
+            "member"
+        ]))));
     }
 
     /// token 数不能记进花费桶：两种桶的键表必须分开取。混在一起时数字看着

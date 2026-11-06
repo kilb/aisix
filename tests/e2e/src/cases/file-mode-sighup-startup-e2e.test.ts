@@ -1,6 +1,6 @@
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdtemp, open, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, open, readdir, readlink, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -62,6 +62,28 @@ async function feed(fifo: string, body: string): Promise<void> {
   } finally {
     await fh.close();
   }
+}
+
+/**
+ * Resolves once `pid` holds no descriptor on `path`: its read of the pipe
+ * has seen EOF and closed it. A reader that blocks in `open` for its next
+ * read holds no descriptor yet, so this also returns while the reload waits
+ * for a writer. Reopening the pipe for writing before the reader is done
+ * would hand it the next write as more of the same file.
+ */
+async function waitUntilClosed(pid: number, path: string): Promise<void> {
+  // `/proc/<pid>/fd` links name the resolved path.
+  const resolved = await realpath(path);
+  const deadline = Date.now() + 10_000;
+  while (Date.now() < deadline) {
+    const fds = await readdir(`/proc/${pid}/fd`).catch(() => [] as string[]);
+    const targets = await Promise.all(
+      fds.map((fd) => readlink(`/proc/${pid}/fd/${fd}`).catch(() => "")),
+    );
+    if (!targets.includes(resolved)) return;
+    await sleep(20);
+  }
+  throw new Error(`pid ${pid} still holds ${path} open after 10s`);
 }
 
 describe("file resource source: SIGHUP during startup", () => {
@@ -146,7 +168,9 @@ describe("file resource source: SIGHUP during startup", () => {
     await fh.writeFile(resources(upstream.baseUrl), "utf8");
     await fh.close();
     // The SIGHUP that arrived during startup asks for one reload, which reads
-    // the file again.
+    // the file again. Feed it only once the first read is done with the pipe,
+    // or the two writes reach the gateway as one file.
+    await waitUntilClosed(gateway.pid!, fifo);
     const reloaded = feed(fifo, resources(upstream.baseUrl));
     let status = 0;
     for (let i = 0; i < 100 && status !== 200; i++) {

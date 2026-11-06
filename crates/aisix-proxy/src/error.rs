@@ -259,6 +259,22 @@ pub enum ProxyError {
     /// caller supplied it, so it leaks nothing.
     #[error("resource {0:?} not found")]
     JobResourceNotFound(String),
+    /// Platform mode: a `previous_response_id` that names no response the
+    /// caller may continue from. It was not issued to the caller's tenant,
+    /// or the target that served it is outside the key's provider groups.
+    /// The caller is answered as for a response the upstream does not have
+    /// (`crate::platform_errors`), so the refusal cannot tell which; the
+    /// text names neither, since it reaches the usage event.
+    #[error("previous response not found")]
+    ResponseNotFound,
+    /// Platform mode: a request field, named by its path, that names an
+    /// object stored upstream which the gateway cannot bind to the caller's
+    /// tenant (`crate::stored_refs`). Answered as an invalid request naming
+    /// the field.
+    #[error(
+        "request field `{0}` names an object stored upstream, which platform mode does not allow"
+    )]
+    StoredObjectReference(String),
     /// A list of files, batches or fine-tuning jobs asked for on a provider key
     /// that keys belonging to a team or user reach. The upstream's list spans
     /// its whole account, and the gateway cannot say which of it the caller
@@ -298,6 +314,14 @@ pub enum ProxyError {
     /// request is bad on every target.
     #[error("request payload is invalid: {0}")]
     UnusableTarget(String),
+    /// [`Self::InvalidRequest`] on the wire, raised for a refusal whose text
+    /// names the provider or provider key the requested model resolved to:
+    /// a provider the endpoint cannot serve, or a provider key configured in
+    /// a way the endpoint cannot use. Its own variant so platform mode, where
+    /// a caller must not learn which upstream serves it, can tell it from a
+    /// refusal of the request itself (`crate::platform_errors`).
+    #[error("request payload is invalid: {0}")]
+    TargetRefused(String),
     /// A non-WebSocket request reached the WebSocket-only realtime
     /// endpoint. Carries the upgrade layer's own classification — 400 for
     /// malformed upgrade headers, 426 for a connection that cannot
@@ -383,6 +407,12 @@ pub enum ProxyError {
     RequestTooLarge { limit_bytes: usize },
     #[error(transparent)]
     RateLimit(#[from] RateLimitError),
+    /// The model's own inline limit refused the request. Same status, type
+    /// and headers as [`Self::RateLimit`]; its own variant because the bucket
+    /// is shared by every caller of the model, so in platform mode its
+    /// `x-ratelimit-*` figures are the platform's and are not sent.
+    #[error(transparent)]
+    ModelRateLimit(RateLimitError),
     /// A policy-layer rate-limit rejection carrying the offending
     /// policy's identity (#892). Same status/type/headers as
     /// [`Self::RateLimit`]; the envelope adds `error.policy` so a
@@ -393,8 +423,13 @@ pub enum ProxyError {
     #[error("{source} (policy '{policy_name}')")]
     PolicyRateLimit {
         source: RateLimitError,
-        policy_id: String,
-        policy_name: String,
+        // Boxed strs: with the flag below, a `String` pair would take the
+        // error past the size clippy allows in a `Result`.
+        policy_id: Box<str>,
+        policy_name: Box<str>,
+        /// Whether the bucket holds only the caller's own traffic
+        /// ([`crate::quota::policy_bucket_is_callers`]).
+        callers_bucket: bool,
     },
     #[error(transparent)]
     Bridge(#[from] BridgeError),
@@ -534,10 +569,12 @@ impl ProxyError {
             ProxyError::ModelNotFound(_) => StatusCode::NOT_FOUND,
             ProxyError::VideoNotFound(_) => StatusCode::NOT_FOUND,
             ProxyError::JobResourceNotFound(_) => StatusCode::NOT_FOUND,
+            ProxyError::ResponseNotFound => StatusCode::NOT_FOUND,
+            ProxyError::StoredObjectReference(_) => StatusCode::BAD_REQUEST,
             ProxyError::JobListRefused => StatusCode::FORBIDDEN,
-            ProxyError::InvalidRequest(_) | ProxyError::UnusableTarget(_) => {
-                StatusCode::BAD_REQUEST
-            }
+            ProxyError::InvalidRequest(_)
+            | ProxyError::UnusableTarget(_)
+            | ProxyError::TargetRefused(_) => StatusCode::BAD_REQUEST,
             ProxyError::WebSocketUpgradeRequired { status, .. } => *status,
             ProxyError::ProviderUnavailable => StatusCode::SERVICE_UNAVAILABLE,
             ProxyError::SemanticDecisionFailed { .. } => StatusCode::SERVICE_UNAVAILABLE,
@@ -546,7 +583,9 @@ impl ProxyError {
             ProxyError::BudgetExceeded(_) => StatusCode::TOO_MANY_REQUESTS,
             ProxyError::BudgetUnverified => StatusCode::SERVICE_UNAVAILABLE,
             ProxyError::RequestTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
-            ProxyError::RateLimit(_) => StatusCode::TOO_MANY_REQUESTS,
+            ProxyError::RateLimit(_) | ProxyError::ModelRateLimit(_) => {
+                StatusCode::TOO_MANY_REQUESTS
+            }
             ProxyError::PolicyRateLimit { .. } => StatusCode::TOO_MANY_REQUESTS,
             ProxyError::Bridge(b) => {
                 StatusCode::from_u16(b.http_status()).unwrap_or(StatusCode::BAD_GATEWAY)
@@ -589,10 +628,12 @@ impl ProxyError {
             ProxyError::ModelNotFound(_) => "model_not_found",
             ProxyError::VideoNotFound(_) => "video_not_found",
             ProxyError::JobResourceNotFound(_) => "resource_not_found",
+            ProxyError::ResponseNotFound => "response_not_found",
+            ProxyError::StoredObjectReference(_) => "invalid_request_error",
             ProxyError::JobListRefused => "permission_denied",
-            ProxyError::InvalidRequest(_) | ProxyError::UnusableTarget(_) => {
-                "invalid_request_error"
-            }
+            ProxyError::InvalidRequest(_)
+            | ProxyError::UnusableTarget(_)
+            | ProxyError::TargetRefused(_) => "invalid_request_error",
             ProxyError::WebSocketUpgradeRequired { .. } => "websocket_upgrade_required",
             ProxyError::RequestTooLarge { .. } => "invalid_request_error",
             ProxyError::ProviderUnavailable => "provider_unavailable",
@@ -605,7 +646,7 @@ impl ProxyError {
             // A gateway-side dependency failed, like `JwksUnavailable`;
             // `error.code` carries the distinction.
             ProxyError::BudgetUnverified => "api_error",
-            ProxyError::RateLimit(_) => "rate_limit_exceeded",
+            ProxyError::RateLimit(_) | ProxyError::ModelRateLimit(_) => "rate_limit_exceeded",
             ProxyError::PolicyRateLimit { .. } => "rate_limit_exceeded",
             ProxyError::Bridge(b) => b.error_type(),
         }
@@ -638,7 +679,7 @@ impl ProxyError {
     /// header.
     pub fn retry_after_secs(&self) -> Option<u64> {
         match self {
-            ProxyError::RateLimit(e) => e.retry_after_secs(),
+            ProxyError::RateLimit(e) | ProxyError::ModelRateLimit(e) => e.retry_after_secs(),
             ProxyError::PolicyRateLimit { source, .. } => source.retry_after_secs(),
             ProxyError::AllCandidatesUnavailable { retry_after_secs } => *retry_after_secs,
             // Source the Retry-After header from the same value the 429
@@ -658,7 +699,19 @@ impl ProxyError {
         }
     }
 
+    /// The OpenAI-shape envelope the caller receives. In platform mode an
+    /// upstream's failure, or a refusal naming the target, is its platform
+    /// class instead (`crate::platform_errors`); the original error still
+    /// names the failure in the usage event and the access log. Platform mode
+    /// also answers a model the key may not use as an unknown one
+    /// (`crate::platform_errors::caller_error`).
     pub fn envelope(&self) -> ErrorEnvelope {
+        if let Some(answered) = crate::platform_errors::caller_error(self) {
+            return answered.envelope();
+        }
+        if let Some(class) = crate::platform_errors::caller_class(self) {
+            return class.envelope();
+        }
         // Bridge-surface upstream errors get special handling: the
         // bridge has best-effort-parsed the upstream envelope into a
         // structured [`UpstreamErrorView`], and for a 4xx we translate
@@ -716,16 +769,33 @@ impl ProxyError {
         }
         let env = ErrorEnvelope::new(self.to_string(), self.kind());
         match self {
-            ProxyError::BudgetExceeded(r) => env.with_code("budget_exceeded").with_budget(r),
+            // In platform mode a budget outside the caller's own scope says
+            // nothing but that a limit was reached.
+            ProxyError::BudgetExceeded(r) if hides_budget_scope(r) => {
+                ErrorEnvelope::new(HIDDEN_BUDGET_MESSAGE, self.kind()).with_code("budget_exceeded")
+            }
+            ProxyError::BudgetExceeded(r) => {
+                let mut env = env.with_code("budget_exceeded").with_budget(r);
+                // A message that names a policy is the platform's wording.
+                if let (true, Some(m)) = (crate::platform_errors::active(), &r.caller_message) {
+                    env.error.message = m.clone();
+                }
+                env
+            }
             ProxyError::BudgetUnverified => env.with_code("budget_unverified"),
             // Attribution for policy-layer 429s (#892): the
             // OpenAI envelope names the offending policy. The Anthropic
             // envelope keeps its strict {type,message} shape.
+            // Platform mode names no policy: it is the platform's, and its
+            // name is in the Display text as well as in the block.
+            ProxyError::PolicyRateLimit { source, .. } if crate::platform_errors::active() => {
+                ErrorEnvelope::new(source.to_string(), self.kind())
+            }
             ProxyError::PolicyRateLimit {
                 policy_id,
                 policy_name,
                 ..
-            } => env.with_policy(policy_id, policy_name),
+            } => env.with_policy(policy_id.to_string(), policy_name.to_string()),
             // Stable machine-readable code for SDKs to branch on, distinct
             // from the generic `permission_denied` type shared with
             // ModelForbidden (#557 AC-1).
@@ -782,6 +852,30 @@ impl ProxyError {
             _ => env,
         }
     }
+}
+
+/// What a caller is told of a budget outside its own scope in platform mode.
+const HIDDEN_BUDGET_MESSAGE: &str = "Spending limit reached.";
+
+/// Whether a `budget_exceeded` is hidden from the caller: platform mode, and
+/// a budget that is not the caller's own (key, member, team or team member).
+/// A reason with no scope is hidden too, since nothing says it is theirs.
+/// Keys on the budget that denied, whichever model the request addressed.
+fn hides_budget_scope(r: &crate::budget::BudgetReason) -> bool {
+    use aisix_core::models::BudgetScope;
+    // Both the typed scope and the control plane's text must name one of the
+    // caller's own scopes; either one disagreeing hides the budget.
+    let own_typed = matches!(
+        r.scope_kind,
+        Some(
+            BudgetScope::ApiKey | BudgetScope::Member | BudgetScope::Team | BudgetScope::TeamMember
+        )
+    );
+    let own_text = matches!(
+        r.scope.as_deref(),
+        Some("api_key" | "member" | "team" | "team_member")
+    );
+    crate::platform_errors::active() && !(own_typed && own_text)
 }
 
 /// Build the customer-visible envelope for an upstream HTTP error.
@@ -906,10 +1000,47 @@ impl ProxyError {
     /// rejection.
     fn rate_limit_detail(&self) -> Option<aisix_ratelimit::LimitDetail> {
         match self {
-            ProxyError::RateLimit(e) => e.detail(),
+            ProxyError::RateLimit(e) | ProxyError::ModelRateLimit(e) => e.detail(),
             ProxyError::PolicyRateLimit { source, .. } => source.detail(),
             _ => None,
         }
+    }
+
+    /// [`Self::rate_limit_detail`] as the caller is sent it. In platform mode
+    /// a bucket several callers share (the model's inline limit, a policy not
+    /// keyed to the caller) reports the platform's own limit and what is left
+    /// of it, so none of the trio is sent. `Retry-After` stays: windows are
+    /// clock-aligned, so it shows only a window's length, and SDKs back off
+    /// on it.
+    fn caller_rate_limit_detail(&self) -> Option<aisix_ratelimit::LimitDetail> {
+        let shared = match self {
+            ProxyError::ModelRateLimit(_) => true,
+            ProxyError::PolicyRateLimit { callers_bucket, .. } => !callers_bucket,
+            _ => false,
+        };
+        if shared && crate::platform_errors::active() {
+            return None;
+        }
+        self.rate_limit_detail()
+    }
+
+    /// [`Self::retry_after_secs`] as the caller is sent it. A hidden budget's
+    /// reset time is a figure of that budget, so it is not sent either.
+    fn caller_retry_after_secs(&self) -> Option<u64> {
+        match self {
+            ProxyError::BudgetExceeded(r) if hides_budget_scope(r) => None,
+            _ => self.retry_after_secs(),
+        }
+    }
+
+    /// The status the caller is answered with: [`Self::status`], or in
+    /// platform mode the status of the class the error reaches the caller
+    /// as. Telemetry keeps reading [`Self::status`].
+    fn caller_status(&self) -> StatusCode {
+        if let Some(answered) = crate::platform_errors::caller_error(self) {
+            return answered.caller_status();
+        }
+        crate::platform_errors::caller_class(self).map_or_else(|| self.status(), |c| c.status())
     }
 }
 
@@ -973,9 +1104,9 @@ fn mcp_user_oauth_message(failure: &aisix_mcp::UserOAuthFailure, server: &str) -
 impl IntoResponse for ProxyError {
     fn into_response(self) -> Response {
         let challenge = self.auth_challenge();
-        let status = self.status();
-        let retry_after = self.retry_after_secs();
-        let rate_limit_detail = self.rate_limit_detail();
+        let status = self.caller_status();
+        let retry_after = self.caller_retry_after_secs();
+        let rate_limit_detail = self.caller_rate_limit_detail();
         let upgrade_reject = matches!(self, ProxyError::WebSocketUpgradeRequired { .. });
         let body = self.envelope();
         let mut response = (status, Json(body)).into_response();
@@ -1028,11 +1159,44 @@ struct AnthropicErrorBody {
     #[serde(rename = "type")]
     kind: String,
     message: String,
-    /// Set only on a guardrail refusal ([`anthropic_guardrail_code`]):
-    /// `type` is pinned to the SDK's closed literal, so without it a
-    /// policy block and a malformed request are the same 422.
+    /// Set on a guardrail refusal ([`anthropic_guardrail_code`]): `type` is
+    /// pinned to the SDK's closed literal, so without it a policy block and
+    /// a malformed request are the same 422. Set too on every error platform
+    /// mode replaces, to the class's code, for the same reason.
     #[serde(skip_serializing_if = "Option::is_none")]
     code: Option<&'static str>,
+    /// The field of the caller's request an invalid-request class names, in
+    /// platform mode; the OpenAI envelope carries the same as `param`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    param: Option<String>,
+}
+
+impl AnthropicErrorEnvelope {
+    /// The envelope of a platform error class.
+    fn platform(class: &crate::platform_errors::PlatformErrorClass) -> Self {
+        AnthropicErrorEnvelope {
+            discriminator: "error",
+            error: AnthropicErrorBody {
+                kind: class.anthropic_kind().to_string(),
+                message: crate::platform_errors::platform_message(class).to_string(),
+                code: Some(class.code()),
+                param: match class {
+                    crate::platform_errors::PlatformErrorClass::InvalidRequest { param } => {
+                        param.clone()
+                    }
+                    _ => None,
+                },
+            },
+        }
+    }
+}
+
+/// The Anthropic-shape body of a platform error class, shared by the HTTP
+/// response and the `event: error` frame that ends a `/v1/messages` stream.
+pub(crate) fn anthropic_platform_body(
+    class: &crate::platform_errors::PlatformErrorClass,
+) -> String {
+    serde_json::to_string(&AnthropicErrorEnvelope::platform(class)).unwrap_or_default()
 }
 
 /// The Anthropic envelope's `error.code` for a guardrail refusal, shared by
@@ -1110,9 +1274,9 @@ impl ProxyError {
     /// and upstream-message logic so the two envelope
     /// renderers can't drift on those rules.
     pub fn into_anthropic_response(self) -> Response {
-        let status = self.status();
-        let retry_after = self.retry_after_secs();
-        let rate_limit_detail = self.rate_limit_detail();
+        let status = self.caller_status();
+        let retry_after = self.caller_retry_after_secs();
+        let rate_limit_detail = self.caller_rate_limit_detail();
         let mut response = (status, Json(self.anthropic_envelope())).into_response();
         apply_retry_headers(&mut response, retry_after, rate_limit_detail);
         response
@@ -1124,6 +1288,12 @@ impl ProxyError {
     }
 
     fn anthropic_envelope(&self) -> AnthropicErrorEnvelope {
+        if let Some(answered) = crate::platform_errors::caller_error(self) {
+            return answered.anthropic_envelope();
+        }
+        if let Some(class) = crate::platform_errors::caller_class(self) {
+            return AnthropicErrorEnvelope::platform(&class);
+        }
         let code = match self {
             ProxyError::ContentFiltered { unavailable, .. } => {
                 Some(anthropic_guardrail_code(unavailable.as_deref()))
@@ -1138,6 +1308,7 @@ impl ProxyError {
                 // (the upstream message, translated on a 4xx).
                 message: self.envelope().error.message,
                 code,
+                param: None,
             },
         }
     }
@@ -1253,8 +1424,22 @@ pub(crate) fn is_length_limit_error(err: &axum::Error) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// Run `f` as a request served in platform mode would run.
+    pub(crate) fn in_platform_mode<T>(f: impl FnOnce() -> T) -> T {
+        let cell = std::sync::Arc::new(
+            crate::attribution::RequestAttribution::default().in_platform_mode(true),
+        );
+        crate::attribution::sync_scope(&cell, f)
+    }
+
+    /// The OpenAI-shape body the caller of a platform-mode request receives
+    /// for `err`.
+    pub(crate) fn render_platform(err: &ProxyError) -> serde_json::Value {
+        in_platform_mode(|| serde_json::to_value(err.envelope()).expect("an envelope serializes"))
+    }
 
     /// #1093 carries the transport cause on a timeout so an
     /// operator can tell a `connect_timeout` from an expired request
@@ -1383,6 +1568,61 @@ mod tests {
         let e = ProxyError::ModelForbidden("gpt-4o".into());
         assert_eq!(e.status(), StatusCode::FORBIDDEN);
         assert_eq!(e.kind(), "permission_denied");
+    }
+
+    #[test]
+    fn platform_mode_answers_a_forbidden_model_like_an_unknown_one() {
+        assert_eq!(
+            render_platform(&ProxyError::ModelForbidden("x".into())),
+            render_platform(&ProxyError::ModelNotFound("x".into()))
+        );
+    }
+
+    /// Status, headers and body, in both envelopes. Only the caller's answer
+    /// changes: the records an operator reads keep the refusal.
+    #[tokio::test]
+    async fn platform_mode_answers_a_forbidden_model_like_an_unknown_one_in_every_envelope() {
+        async fn parts(resp: Response) -> (StatusCode, axum::http::HeaderMap, bytes::Bytes) {
+            let (head, body) = resp.into_parts();
+            let body = axum::body::to_bytes(body, 65536).await.unwrap();
+            (head.status, head.headers, body)
+        }
+        let forbidden = || ProxyError::ModelForbidden("x".into());
+        let unknown = || ProxyError::ModelNotFound("x".into());
+
+        let (a, b) = in_platform_mode(|| (forbidden().into_response(), unknown().into_response()));
+        let (a, b) = (parts(a).await, parts(b).await);
+        assert_eq!(a.0, StatusCode::NOT_FOUND);
+        assert_eq!(a, b);
+        let (a, b) = in_platform_mode(|| {
+            (
+                forbidden().into_anthropic_response(),
+                unknown().into_anthropic_response(),
+            )
+        });
+        assert_eq!(parts(a).await, parts(b).await);
+        assert_eq!(
+            in_platform_mode(|| forbidden().anthropic_body()),
+            in_platform_mode(|| unknown().anthropic_body())
+        );
+
+        // What the operator reads is written in the same platform-mode scope
+        // the caller's answer is, and still names the real refusal.
+        in_platform_mode(|| {
+            let err = forbidden();
+            assert_eq!(err.status(), StatusCode::FORBIDDEN);
+            assert_eq!(crate::attempt::error_class(&err), "permission_denied");
+            assert_eq!(
+                crate::attempt::gateway_error_message(&err),
+                "API key is not allowed to use model \"x\""
+            );
+        });
+        // Off platform mode the refusal is the 403 it always was.
+        assert_eq!(forbidden().into_response().status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            forbidden().into_anthropic_response().status(),
+            StatusCode::FORBIDDEN
+        );
     }
 
     #[test]
@@ -1657,6 +1897,261 @@ mod tests {
         assert!(policy["error"].get("param").is_none());
     }
 
+    fn budget_exceeded(scope: &str, scope_ref: &str, limit: &str, spent: &str) -> ProxyError {
+        ProxyError::BudgetExceeded(Box::new(crate::budget::BudgetReason {
+            message: format!("{scope} budget '{scope_ref}' exceeded (${limit}/month)."),
+            scope: Some(scope.into()),
+            scope_kind: serde_json::from_value(serde_json::json!(scope)).ok(),
+            scope_ref: Some(scope_ref.into()),
+            limit_usd: Some(limit.into()),
+            spent_usd: Some(spent.into()),
+            period: Some("month".into()),
+            period_resets_at: Some("2026-12-01T00:00:00Z".into()),
+            retry_after_seconds: Some(259_200),
+            ..Default::default()
+        }))
+    }
+
+    fn policy_limited(id: &str, name: &str, callers_bucket: bool) -> ProxyError {
+        ProxyError::PolicyRateLimit {
+            source: aisix_ratelimit::RateLimitError::Requests {
+                scope: aisix_core::RateLimitScope::Requests,
+                detail: aisix_ratelimit::LimitDetail {
+                    dimension: "rpd",
+                    limit: 5_000,
+                    remaining: 0,
+                    reset_secs: 3_600,
+                },
+            },
+            policy_id: id.into(),
+            policy_name: name.into(),
+            callers_bucket,
+        }
+    }
+
+    #[test]
+    fn a_team_budget_429_shows_the_teams_own_figures() {
+        for scope in ["api_key", "member", "team", "team_member"] {
+            let b = render_platform(&budget_exceeded(scope, "t1", "10.00", "10.02"));
+            let e = &b["error"];
+            assert_eq!(e["scope"], scope);
+            assert_eq!(e["scope_ref"], "t1");
+            assert_eq!(e["limit_usd"], "10.00");
+            assert_eq!(e["spent_usd"], "10.02");
+            assert_eq!(e["code"], "budget_exceeded");
+        }
+    }
+
+    #[test]
+    fn a_platform_side_budget_429_reveals_no_id_and_no_figure() {
+        for scope in ["org", "environment", "tag", "provider_key"] {
+            let err = budget_exceeded(scope, "pk-7", "500.00", "500.10");
+            let b = render_platform(&err);
+            let s = b.to_string();
+            assert!(
+                !s.contains("pk-7") && !s.contains("500") && !s.contains("2026"),
+                "{s}"
+            );
+            assert!(!s.contains(scope), "{s}");
+            assert_eq!(b["error"]["message"], "Spending limit reached.");
+            assert_eq!(b["error"]["code"], "budget_exceeded");
+            assert_eq!(b["error"]["type"], "billing_error");
+            assert!(b["error"].get("scope").is_none());
+            assert!(b["error"].get("retry_after_seconds").is_none());
+        }
+    }
+
+    #[test]
+    fn a_budget_429_without_a_scope_is_hidden_in_platform_mode() {
+        let err = ProxyError::BudgetExceeded(Box::new(crate::budget::BudgetReason {
+            message: "spend ceiling reached for policy acme".into(),
+            limit_usd: Some("500.00".into()),
+            ..Default::default()
+        }));
+        let s = render_platform(&err).to_string();
+        assert!(!s.contains("acme") && !s.contains("500"), "{s}");
+    }
+
+    /// The typed scope and the control plane's text must agree on an own
+    /// scope; text alone (or a typed platform scope) does not unlock figures.
+    #[test]
+    fn a_budget_429_needs_the_typed_scope_and_the_text_to_agree() {
+        use aisix_core::models::BudgetScope;
+        let reason = |kind: Option<BudgetScope>, text: &str| {
+            ProxyError::BudgetExceeded(Box::new(crate::budget::BudgetReason {
+                message: "m".into(),
+                scope: Some(text.into()),
+                scope_kind: kind,
+                scope_ref: Some("ref-1".into()),
+                limit_usd: Some("5.00".into()),
+                ..Default::default()
+            }))
+        };
+        let shown = |e: &ProxyError| render_platform(e)["error"].get("limit_usd").is_some();
+        assert!(shown(&reason(Some(BudgetScope::Team), "team")));
+        assert!(!shown(&reason(Some(BudgetScope::ProviderKey), "team")));
+        assert!(!shown(&reason(Some(BudgetScope::Team), "provider_key")));
+        assert!(!shown(&reason(None, "team")));
+    }
+
+    #[test]
+    fn an_own_scope_budget_429_with_a_caller_message_names_no_policy() {
+        let err = ProxyError::BudgetExceeded(Box::new(crate::budget::BudgetReason {
+            message: "spend ceiling reached for policy acme-tier".into(),
+            caller_message: Some("Spend ceiling reached.".into()),
+            scope: Some("team".into()),
+            scope_kind: Some(aisix_core::models::BudgetScope::Team),
+            ..Default::default()
+        }));
+        let b = render_platform(&err);
+        assert_eq!(b["error"]["message"], "Spend ceiling reached.");
+        assert!(!b.to_string().contains("acme-tier"));
+        // Telemetry and the operator-facing text keep the policy name.
+        assert!(err.to_string().contains("acme-tier"));
+        let off = serde_json::to_value(err.envelope()).unwrap();
+        assert!(off["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("acme-tier"));
+    }
+
+    fn requests_detail() -> aisix_ratelimit::RateLimitError {
+        aisix_ratelimit::RateLimitError::Requests {
+            scope: aisix_core::RateLimitScope::Requests,
+            detail: aisix_ratelimit::LimitDetail {
+                dimension: "rpd",
+                limit: 5_000,
+                remaining: 0,
+                reset_secs: 3_600,
+            },
+        }
+    }
+
+    fn platform_headers(err: ProxyError) -> axum::http::HeaderMap {
+        in_platform_mode(|| err.into_response()).headers().clone()
+    }
+
+    #[test]
+    fn a_shared_bucket_429_sends_no_ratelimit_figures_in_platform_mode() {
+        for err in [
+            policy_limited("pol-1", "model-tier", false),
+            ProxyError::ModelRateLimit(requests_detail()),
+        ] {
+            let h = platform_headers(err);
+            for name in [
+                "x-ratelimit-limit",
+                "x-ratelimit-remaining",
+                "x-ratelimit-scope",
+                "x-ratelimit-reset",
+            ] {
+                assert!(h.get(name).is_none(), "{name} leaks a shared bucket");
+            }
+            // The back-off hint is only a window length.
+            assert_eq!(h.get("retry-after").unwrap(), "3600");
+        }
+    }
+
+    #[test]
+    fn a_callers_own_bucket_429_keeps_its_ratelimit_figures() {
+        for err in [
+            policy_limited("pol-1", "team-tier", true),
+            ProxyError::RateLimit(requests_detail()),
+        ] {
+            let h = platform_headers(err);
+            assert_eq!(h.get("x-ratelimit-limit").unwrap(), "5000");
+            assert_eq!(h.get("x-ratelimit-scope").unwrap(), "rpd");
+        }
+    }
+
+    #[test]
+    fn with_platform_mode_off_the_model_limit_renders_as_the_key_limit_does() {
+        let render = |e: ProxyError| {
+            let r = e.into_response();
+            (r.status(), r.headers().clone())
+        };
+        let (s1, h1) = render(ProxyError::ModelRateLimit(requests_detail()));
+        let (s2, h2) = render(ProxyError::RateLimit(requests_detail()));
+        assert_eq!(s1, s2);
+        assert_eq!(h1, h2);
+        assert_eq!(
+            ProxyError::ModelRateLimit(requests_detail()).kind(),
+            ProxyError::RateLimit(requests_detail()).kind()
+        );
+        assert_eq!(
+            serde_json::to_value(ProxyError::ModelRateLimit(requests_detail()).envelope()).unwrap(),
+            serde_json::to_value(ProxyError::RateLimit(requests_detail()).envelope()).unwrap()
+        );
+    }
+
+    #[test]
+    fn budget_429_with_platform_mode_off_is_unchanged() {
+        let b = serde_json::to_value(
+            budget_exceeded("provider_key", "pk-7", "500.00", "500.10").envelope(),
+        )
+        .unwrap();
+        assert_eq!(b["error"]["scope_ref"], "pk-7");
+        assert_eq!(b["error"]["limit_usd"], "500.00");
+        assert!(b["error"]["message"].as_str().unwrap().contains("pk-7"));
+    }
+
+    #[test]
+    fn a_policy_429_names_no_policy_in_platform_mode() {
+        let b = render_platform(&policy_limited("pol-1", "acme-tier", true));
+        assert!(b["error"].get("policy").is_none());
+        assert!(!b.to_string().contains("acme-tier"));
+        assert_eq!(b["error"]["type"], "rate_limit_exceeded");
+        let off =
+            serde_json::to_value(policy_limited("pol-1", "acme-tier", true).envelope()).unwrap();
+        assert_eq!(off["error"]["policy"]["name"], "acme-tier");
+    }
+
+    /// Retry-After describes the budget's own reset, so it goes with the
+    /// figures: kept for the caller's scope, dropped for a platform one,
+    /// and still sent when platform mode is off.
+    #[test]
+    fn a_budget_429_keeps_retry_after_only_for_the_callers_scope() {
+        let header = |err: ProxyError, platform: bool| {
+            let resp = if platform {
+                in_platform_mode(|| err.into_response())
+            } else {
+                err.into_response()
+            };
+            assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+            resp.headers()
+                .get("retry-after")
+                .map(|v| v.to_str().unwrap().to_string())
+        };
+        assert_eq!(
+            header(budget_exceeded("team", "t1", "1", "2"), true).as_deref(),
+            Some("259200")
+        );
+        assert_eq!(
+            header(budget_exceeded("environment", "e", "1", "2"), true),
+            None
+        );
+        assert_eq!(
+            header(budget_exceeded("environment", "e", "1", "2"), false).as_deref(),
+            Some("259200")
+        );
+    }
+
+    #[test]
+    fn the_anthropic_budget_429_hides_a_platform_side_scope_too() {
+        let err = budget_exceeded("provider_key", "pk-7", "500.00", "500.10");
+        let (body, resp) =
+            in_platform_mode(|| (err.anthropic_body(), err.into_anthropic_response()));
+        assert!(
+            !body.contains("pk-7") && !body.contains("500") && !body.contains("provider_key"),
+            "{body}"
+        );
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["type"], "error");
+        assert_eq!(v["error"]["type"], "rate_limit_error");
+        assert_eq!(v["error"]["message"], "Spending limit reached.");
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(resp.headers().get("retry-after").is_none());
+    }
+
     #[tokio::test]
     async fn anthropic_envelope_429_budget_exceeded_maps_to_rate_limit_error() {
         let err = ProxyError::BudgetExceeded(Box::new(crate::budget::BudgetReason {
@@ -1839,6 +2334,7 @@ mod tests {
             },
             policy_id: "pol-1".into(),
             policy_name: "team-daily".into(),
+            callers_bucket: true,
         };
         let resp = err.into_response();
         let h = resp.headers();

@@ -518,7 +518,7 @@ pub(crate) fn resolve_target(
 
     let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
     let adapter = supported_adapter(&pk_entry.value).ok_or_else(|| {
-        ProxyError::InvalidRequest(format!(
+        ProxyError::TargetRefused(format!(
             "model {:?} resolves to a provider key for {:?}, which the \
              files/batches/fine-tuning surface does not support yet. It supports \
              OpenAI and Azure OpenAI; set the key's `adapter` to `openai` or \
@@ -576,7 +576,7 @@ fn upstream_url(target: &JobTarget, path: &str, query: &str) -> Result<String, P
                 .map(str::trim)
                 .filter(|b| !b.is_empty())
                 .ok_or_else(|| {
-                    ProxyError::InvalidRequest(format!(
+                    ProxyError::TargetRefused(format!(
                         "azure provider_key {:?} has no api_base",
                         target.pk_entry.value.display_name
                     ))
@@ -1442,6 +1442,13 @@ fn json_response(
     rewrite_model: Option<&str>,
     owner: Option<(&str, &str)>,
 ) -> Response {
+    // In platform mode an upstream's refusal reaches the caller as its class,
+    // never as the upstream's own body; the row keeps that body.
+    if !status.is_success() {
+        if let Some(class) = crate::platform_errors::relayed_error(status.as_u16(), &bytes) {
+            return class.into_response();
+        }
+    }
     let body = match (rewrite_model, serde_json::from_slice::<Value>(&bytes).ok()) {
         (Some(model), Some(mut v)) => {
             rewrite_response_ids(&mut v, model, owner);
@@ -2606,7 +2613,12 @@ async fn forward_simple(
             .await?;
         }
 
-        let resp = if spec.relay_raw_body {
+        let platform_refusal = (!status.is_success())
+            .then(|| crate::platform_errors::relayed_error(status.as_u16(), &bytes))
+            .flatten();
+        let resp = if let Some(class) = platform_refusal {
+            class.into_response()
+        } else if spec.relay_raw_body {
             let mut resp = Response::builder()
                 .status(status)
                 .body(Body::from(bytes))

@@ -1182,6 +1182,11 @@ test("输出护栏拦截时_三个端点都按成功那样收钱", async () => {
     // 额度只够两发：一发热身 + 一发被拦，第三发就该被闸挡下。
     expect((await setKeyQuota(cookie, k.name, 2_000_000)).status).toBe(200);
     await waitFor(async () => fx.readResources().includes(`portal-key-${k.name}`), "额度推下去");
+    // The portal writes the file, then signals the reload. A warm-up that lands
+    // before the reload is served by the old config, where this key has no
+    // quota, so its spend never counts toward one. Wait for the gateway to serve
+    // this file before spending.
+    await waitFor(() => fx.gatewayApplied(), `${label}: gateway serves the pushed quota`);
     await waitFor(
       async () => (await fx.saying(ep, k.plaintext, "hello", model)) === 200,
       `${label} 可用`,

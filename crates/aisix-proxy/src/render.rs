@@ -249,6 +249,23 @@ impl Usage {
             prompt_cache_miss_tokens: u.prompt_cache_miss_tokens,
         }
     }
+
+    /// [`Self::from_stats`] in platform mode: OpenAI's own fields only. The
+    /// DeepSeek-native pair and the Anthropic-shape cache write would name the
+    /// upstream's vendor; their numbers are already in `prompt_tokens` and
+    /// `prompt_tokens_details.cached_tokens`.
+    fn for_client(u: &aisix_gateway::UsageStats, platform: bool) -> Self {
+        let mut usage = Self::from_stats(u);
+        if platform {
+            usage.prompt_cache_hit_tokens = None;
+            usage.prompt_cache_miss_tokens = None;
+            if let Some(details) = usage.prompt_tokens_details.as_mut() {
+                details.cache_creation_tokens = None;
+            }
+            usage.prompt_tokens_details = usage.prompt_tokens_details.filter(|d| !d.is_empty());
+        }
+        usage
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -309,16 +326,29 @@ fn generated_completion_id() -> String {
 /// generated id, and so does a whole stream with no upstream id. A generated id
 /// is minted here rather than in a provider bridge because `ChatChunk::id` also
 /// feeds the usage event's `provider_request_id`, which must stay the upstream's
-/// own.
-#[derive(Default)]
+/// own. In platform mode every frame carries the one generated id instead.
 pub(crate) struct StreamId {
     upstream: Option<String>,
     generated: Option<String>,
+    opaque: bool,
 }
 
 impl StreamId {
+    /// `opaque`: platform mode, where no upstream id reaches the client.
+    pub(crate) fn new(opaque: bool) -> Self {
+        Self {
+            upstream: None,
+            generated: None,
+            opaque,
+        }
+    }
+
     pub(crate) fn stamp(&mut self, id: &mut String) {
-        if let Some(upstream) = &self.upstream {
+        if self.opaque {
+            id.clone_from(self.generated.get_or_insert_with(|| {
+                crate::opaque_id::mint_response_id(crate::opaque_id::Surface::Chat)
+            }));
+        } else if let Some(upstream) = &self.upstream {
             id.clone_from(upstream);
         } else if id.is_empty() {
             id.clone_from(self.generated.get_or_insert_with(generated_completion_id));
@@ -328,16 +358,33 @@ impl StreamId {
     }
 }
 
+/// `platform`: platform mode, where the response id is minted, each tool-call
+/// id is mapped ([`crate::opaque_id`]) and usage keeps to OpenAI's fields.
 pub fn render_response(
     created_unix_ts: i64,
     resp: ChatResponse,
     client_facing_model: &str,
+    platform: Option<&crate::platform::PlatformSettings>,
 ) -> ChatCompletion {
+    let message = |mut message: aisix_gateway::ChatMessage| {
+        if let (Some(p), Some(serde_json::Value::Array(calls))) =
+            (platform, message.extra.get_mut("tool_calls"))
+        {
+            crate::opaque_id::map_tool_calls(
+                p.tool_id_key(),
+                crate::opaque_id::Surface::Chat,
+                calls,
+            );
+        }
+        RenderedMessage::from_message(message)
+    };
     // `resp.model` is whatever the upstream returned (`gpt-4o`,
     // `claude-3-5-sonnet-20241022`, etc.). The wire-level contract is
     // to echo the customer's requested name — see module-level docs.
     ChatCompletion {
-        id: if resp.id.is_empty() {
+        id: if platform.is_some() {
+            crate::opaque_id::mint_response_id(crate::opaque_id::Surface::Chat)
+        } else if resp.id.is_empty() {
             generated_completion_id()
         } else {
             resp.id
@@ -347,27 +394,33 @@ pub fn render_response(
         model: client_facing_model.to_string(),
         choices: std::iter::once(NonStreamChoice {
             index: 0,
-            message: RenderedMessage::from_message(resp.message),
+            message: message(resp.message),
             finish_reason: finish_to_str(&resp.finish_reason).to_string(),
             logprobs: resp.logprobs,
         })
         .chain(resp.more_choices.into_iter().map(|c| NonStreamChoice {
             index: c.index,
-            message: RenderedMessage::from_message(c.message),
+            message: message(c.message),
             finish_reason: finish_to_str(&c.finish_reason).to_string(),
             logprobs: c.logprobs,
         }))
         .collect(),
-        usage: Usage::from_stats(&resp.usage),
+        usage: Usage::for_client(&resp.usage, platform.is_some()),
         service_tier: openai_service_tier(resp.service_tier.as_ref()),
     }
 }
 
+/// `platform` as for [`render_response`]; the frame id itself is the
+/// caller's, stamped through [`StreamId`].
 pub fn render_chunk(
     created_unix_ts: i64,
-    chunk: ChatChunk,
+    mut chunk: ChatChunk,
     client_facing_model: &str,
+    platform: Option<&crate::platform::PlatformSettings>,
 ) -> ChatCompletionChunk {
+    if let (Some(p), Some(calls)) = (platform, chunk.delta.tool_calls.as_mut()) {
+        crate::opaque_id::map_tool_calls(p.tool_id_key(), crate::opaque_id::Surface::Chat, calls);
+    }
     // A frame that carries only usage is the `include_usage` terminal
     // frame, which OpenAI sends with an empty `choices` array.
     let usage_only = chunk.is_usage_only();
@@ -402,7 +455,10 @@ pub fn render_chunk(
         created: created_unix_ts,
         model: client_facing_model.to_string(),
         choices,
-        usage: chunk.usage.as_ref().map(Usage::from_stats),
+        usage: chunk
+            .usage
+            .as_ref()
+            .map(|u| Usage::for_client(u, platform.is_some())),
         service_tier: openai_service_tier(chunk.service_tier.as_ref()),
     }
 }
@@ -504,7 +560,7 @@ mod tests {
             usage: UsageStats::new(3, 2),
             service_tier: None,
         };
-        let out = render_response(42, r, "m");
+        let out = render_response(42, r, "m", None);
         let json = serde_json::to_value(&out).unwrap();
         assert_eq!(json["object"], "chat.completion");
         assert_eq!(json["created"], 42);
@@ -537,7 +593,7 @@ mod tests {
             usage: UsageStats::new(1, 1),
             service_tier: tier,
         };
-        let body = |tier| serde_json::to_value(render_response(0, resp(tier), "m")).unwrap();
+        let body = |tier| serde_json::to_value(render_response(0, resp(tier), "m", None)).unwrap();
         assert_eq!(
             body(Some(ServiceTier::OpenAi("priority".into())))["service_tier"],
             "priority"
@@ -559,7 +615,7 @@ mod tests {
             service_tier: tier,
             accounting_usage: None,
         };
-        let frame = |tier| serde_json::to_value(render_chunk(0, chunk(tier), "m")).unwrap();
+        let frame = |tier| serde_json::to_value(render_chunk(0, chunk(tier), "m", None)).unwrap();
         assert_eq!(
             frame(Some(ServiceTier::OpenAi("flex".into())))["service_tier"],
             "flex"
@@ -602,7 +658,7 @@ mod tests {
             usage: UsageStats::new(3, 2),
             service_tier: None,
         };
-        let out = render_response(0, r, "m");
+        let out = render_response(0, r, "m", None);
 
         // Serialized JSON must contain `"content":null`, not `""` and
         // not an omitted key.
@@ -645,7 +701,7 @@ mod tests {
             usage,
             service_tier: None,
         };
-        let json = serde_json::to_value(render_response(0, r, "m")).unwrap();
+        let json = serde_json::to_value(render_response(0, r, "m", None)).unwrap();
         assert_eq!(json["usage"]["prompt_tokens_details"]["cached_tokens"], 800);
         assert_eq!(
             json["usage"]["completion_tokens_details"]["reasoning_tokens"],
@@ -683,7 +739,7 @@ mod tests {
             usage,
             service_tier: None,
         };
-        let json = serde_json::to_value(render_response(0, r, "ds-alias")).unwrap();
+        let json = serde_json::to_value(render_response(0, r, "ds-alias", None)).unwrap();
         // Normalized OpenAI-canonical shape
         assert_eq!(json["usage"]["prompt_tokens_details"]["cached_tokens"], 768);
         // Native passthrough
@@ -726,7 +782,7 @@ mod tests {
             service_tier: None,
             accounting_usage: None,
         };
-        let json = serde_json::to_value(render_chunk(0, chunk, "m")).unwrap();
+        let json = serde_json::to_value(render_chunk(0, chunk, "m", None)).unwrap();
         assert_eq!(json["usage"]["prompt_tokens_details"]["cached_tokens"], 32);
         assert_eq!(json["usage"]["prompt_cache_hit_tokens"], 32);
         assert_eq!(json["usage"]["prompt_cache_miss_tokens"], 18);
@@ -750,7 +806,7 @@ mod tests {
             usage: UsageStats::default(),
             service_tier: None,
         };
-        let out = render_response(0, r, "failover-group-XXX");
+        let out = render_response(0, r, "failover-group-XXX", None);
         let json = serde_json::to_value(&out).unwrap();
         assert_eq!(
             json["model"], "failover-group-XXX",
@@ -779,7 +835,7 @@ mod tests {
             service_tier: None,
             accounting_usage: None,
         };
-        let out = render_chunk(1, chunk, "m");
+        let out = render_chunk(1, chunk, "m", None);
         let json = serde_json::to_value(&out).unwrap();
         assert_eq!(json["object"], "chat.completion.chunk");
         assert_eq!(json["choices"][0]["delta"]["content"], "hi");
@@ -811,9 +867,170 @@ mod tests {
             service_tier: None,
             accounting_usage: None,
         };
-        let out = render_chunk(0, chunk, "failover-group-XXX");
+        let out = render_chunk(0, chunk, "failover-group-XXX", None);
         let json = serde_json::to_value(&out).unwrap();
         assert_eq!(json["model"], "failover-group-XXX");
+    }
+
+    fn upstream_chunk(id: &str, tool_call_id: Option<&str>) -> ChatChunk {
+        ChatChunk {
+            choice_index: 0,
+            logprobs: None,
+            id: id.into(),
+            model: "m".into(),
+            delta: aisix_gateway::ChatDelta {
+                tool_calls: tool_call_id.map(|tid| {
+                    vec![serde_json::json!({
+                        "index": 0, "id": tid, "type": "function",
+                        "function": {"name": "f", "arguments": ""}
+                    })]
+                }),
+                ..Default::default()
+            },
+            finish_reason: None,
+            usage: None,
+            service_tier: None,
+            accounting_usage: None,
+        }
+    }
+
+    fn deepseek_and_anthropic_extended_usage() -> UsageStats {
+        UsageStats {
+            prompt_tokens: 50,
+            completion_tokens: 10,
+            total_tokens: 60,
+            cached_prompt_tokens: 32,
+            cache_creation_tokens: 4,
+            prompt_cache_hit_tokens: Some(32),
+            prompt_cache_miss_tokens: Some(18),
+            ..UsageStats::default()
+        }
+    }
+
+    #[test]
+    fn every_frame_of_a_stream_carries_one_opaque_id() {
+        let platform = crate::platform::PlatformSettings::from_secret("s");
+        let mut stream_id = StreamId::new(true);
+        // The upstream's id arrives on the second frame, as some do.
+        let ids: Vec<String> = ["", "chatcmpl-up", "chatcmpl-up"]
+            .into_iter()
+            .map(|upstream| {
+                let mut chunk = upstream_chunk(upstream, None);
+                stream_id.stamp(&mut chunk.id);
+                let frame = serde_json::to_value(render_chunk(0, chunk, "m", Some(&platform)));
+                frame.unwrap()["id"].as_str().unwrap().to_owned()
+            })
+            .collect();
+        assert!(ids.iter().all(|id| id == &ids[0]), "{ids:?}");
+        assert!(ids[0].starts_with("chatcmpl-"), "{ids:?}");
+        assert_ne!(ids[0], "chatcmpl-up");
+        // A second stream gets an id of its own.
+        let mut other = StreamId::new(true);
+        let mut id = "chatcmpl-up".to_string();
+        other.stamp(&mut id);
+        assert_ne!(id, ids[0]);
+    }
+
+    #[test]
+    fn without_platform_mode_ids_are_the_upstreams() {
+        let mut stream_id = StreamId::new(false);
+        let mut chunk = upstream_chunk("chatcmpl-up", Some("toolu_bdrk_01Y"));
+        chunk.usage = Some(deepseek_and_anthropic_extended_usage());
+        stream_id.stamp(&mut chunk.id);
+        let frame = serde_json::to_value(render_chunk(0, chunk, "m", None)).unwrap();
+        assert_eq!(frame["id"], "chatcmpl-up");
+        assert_eq!(
+            frame["choices"][0]["delta"]["tool_calls"][0]["id"],
+            "toolu_bdrk_01Y"
+        );
+        assert_eq!(frame["usage"]["prompt_cache_hit_tokens"], 32);
+        assert_eq!(
+            frame["usage"]["prompt_tokens_details"]["cache_creation_tokens"],
+            4
+        );
+
+        let mut message = ChatMessage::assistant("");
+        message.extra.insert(
+            "tool_calls".into(),
+            serde_json::json!([{"id": "toolu_bdrk_01Y", "type": "function",
+                "function": {"name": "f", "arguments": "{}"}}]),
+        );
+        let r = ChatResponse {
+            logprobs: None,
+            more_choices: Vec::new(),
+            id: "chatcmpl-up".into(),
+            model: "m".into(),
+            message,
+            finish_reason: FinishReason::ToolCalls,
+            usage: deepseek_and_anthropic_extended_usage(),
+            service_tier: None,
+        };
+        let body = serde_json::to_value(render_response(0, r, "m", None)).unwrap();
+        assert_eq!(body["id"], "chatcmpl-up");
+        assert_eq!(
+            body["choices"][0]["message"]["tool_calls"][0]["id"],
+            "toolu_bdrk_01Y"
+        );
+        assert_eq!(body["usage"]["prompt_cache_miss_tokens"], 18);
+    }
+
+    #[test]
+    fn platform_mode_maps_tool_call_ids_and_keeps_usage_to_the_openai_shape() {
+        use crate::opaque_id::{map_tool_call_id, Surface};
+        let platform = crate::platform::PlatformSettings::from_secret("s");
+        let mapped = map_tool_call_id(platform.tool_id_key(), Surface::Chat, "toolu_bdrk_01Y");
+        let calls = serde_json::json!([{"id": "toolu_bdrk_01Y", "type": "function",
+            "function": {"name": "f", "arguments": "{}"}}]);
+        let mut message = ChatMessage::assistant("");
+        message.extra.insert("tool_calls".into(), calls.clone());
+        let mut second = ChatMessage::assistant("");
+        second.extra.insert("tool_calls".into(), calls);
+        let r = ChatResponse {
+            logprobs: None,
+            more_choices: vec![aisix_gateway::chat::ChatChoice {
+                index: 1,
+                message: second,
+                finish_reason: FinishReason::ToolCalls,
+                logprobs: None,
+            }],
+            id: "msg_bdrk_01X".into(),
+            model: "m".into(),
+            message,
+            finish_reason: FinishReason::ToolCalls,
+            usage: deepseek_and_anthropic_extended_usage(),
+            service_tier: None,
+        };
+        let body = serde_json::to_value(render_response(0, r, "m", Some(&platform))).unwrap();
+        let id = body["id"].as_str().unwrap();
+        assert!(id.starts_with("chatcmpl-") && !id.contains("bdrk"), "{id}");
+        assert_eq!(
+            body["choices"][0]["message"]["tool_calls"][0]["id"],
+            mapped.as_str()
+        );
+        assert_eq!(
+            body["choices"][1]["message"]["tool_calls"][0]["id"],
+            mapped.as_str()
+        );
+        // The standard counters keep every number; the extensions are gone.
+        assert_eq!(body["usage"]["prompt_tokens"], 54);
+        assert_eq!(body["usage"]["prompt_tokens_details"]["cached_tokens"], 32);
+        assert!(body["usage"].get("prompt_cache_hit_tokens").is_none());
+        assert!(body["usage"].get("prompt_cache_miss_tokens").is_none());
+        assert!(body["usage"]["prompt_tokens_details"]
+            .get("cache_creation_tokens")
+            .is_none());
+
+        let mut chunk = upstream_chunk("chatcmpl-up", Some("toolu_bdrk_01Y"));
+        chunk.usage = Some(deepseek_and_anthropic_extended_usage());
+        let frame = serde_json::to_value(render_chunk(0, chunk, "m", Some(&platform))).unwrap();
+        assert_eq!(
+            frame["choices"][0]["delta"]["tool_calls"][0]["id"],
+            mapped.as_str()
+        );
+        assert!(frame["usage"].get("prompt_cache_hit_tokens").is_none());
+        assert!(frame["usage"]["prompt_tokens_details"]
+            .get("cache_creation_tokens")
+            .is_none());
     }
 
     #[test]
@@ -828,7 +1045,7 @@ mod tests {
             usage: UsageStats::default(),
             service_tier: None,
         };
-        let out = render_response(0, r, "m");
+        let out = render_response(0, r, "m", None);
         let json = serde_json::to_value(&out).unwrap();
         assert_eq!(json["choices"][0]["finish_reason"], "weird");
     }

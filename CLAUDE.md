@@ -140,6 +140,7 @@ Deliberate exceptions, each for its own reason:
 - An ensemble judge's sampling parameters are the gateway's own, not the caller's.
 - A single empty-string `stop` is skipped on Converse, which rejects it.
 - The Responses → Chat Completions bridge carries the fields Codex sends; the rest of the Responses API is out of its scope.
+- In platform mode (`proxy.platform.enabled`), an upstream's error reaches the caller as one of the gateway's own error classes, with a fixed status, code and message, and only the upstream's `param` kept: a tenant must not learn which upstream channel or account served it. The original text stays on the usage row's `error_message`, and in the access log, for operators (`crates/aisix-proxy/AGENTS.md`, "Platform mode").
 
 Two shared mechanics carry the rule across bridges. A bridge whose upstream takes tools but not the legacy `functions` / `function_call` runs the request through `aisix_gateway::tool_calls::legacy_functions_as_tools` and renders the answer back with the `LegacyFunctionCalling` it returns. A multi-choice answer is `ChatResponse::message` plus `more_choices`, and a stream keys each chunk by `ChatChunk::choice_index`; a renderer whose protocol holds one answer reads a chunk through `ChatChunk::first_choice_only`.
 

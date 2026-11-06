@@ -803,6 +803,10 @@ pub struct ProxyConfig {
     /// Usage events, access logs, metrics and traces record the same
     /// facts either way.
     ///
+    /// `/v1/messages`, `/v1/responses` and `/v1/embeddings` send
+    /// `x-aisix-cache` and `x-aisix-cache-layer` whatever this says, except
+    /// in platform mode, where they too send them only when this is on.
+    ///
     /// Applied at startup. Changing it requires a restart.
     #[serde(default)]
     pub expose_debug_headers: bool,

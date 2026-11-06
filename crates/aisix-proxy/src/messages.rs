@@ -621,6 +621,10 @@ async fn dispatch(
     // Client-IP allowlist gate (#557): reject before guardrails / upstream.
     crate::dispatch::check_ip_access(&model_entry.value, &client.source_ip)?;
 
+    // Platform mode: nothing the request names may be an object stored
+    // upstream for another tenant.
+    crate::stored_refs::refuse_in_messages(state.platform(), body)?;
+
     // #448 (#22): /v1/messages must run input guardrails like
     // /v1/chat/completions — previously prompts reached the upstream without
     // any content/DLP check. Translate the Anthropic-shaped body into the
@@ -926,6 +930,7 @@ async fn dispatch(
                     .insert(axum::http::header::CONTENT_TYPE, ct);
             }
             crate::response_cache::apply_cache_headers(
+                state,
                 &mut response,
                 crate::chat::CacheStatus::Hit,
             );
@@ -1792,7 +1797,7 @@ async fn anthropic_passthrough_dispatch(
     if is_stream {
         // For SSE streaming: pass through the response body as a streaming
         // `text/event-stream` response.
-        let (content_type, upstream_bytes) = answer.into_sse();
+        let (content_type, upstream_bytes) = answer.into_sse(state.platform());
         // #554: enforce the per-chunk read timeout on the forwarded bytes.
         // When a `stream_timeout` is configured, peek the first byte so a
         // slow/erroring first token fails over (the caller loops to the next
@@ -1959,6 +1964,9 @@ async fn anthropic_passthrough_dispatch(
             attempt_started,
             stream_guardrail,
             model_name.to_string(),
+            state
+                .platform()
+                .map(|p| crate::opaque_id::MessagesIds::new(p.tool_id_key())),
             content_cap,
             Some(estimator),
             move |usage| {
@@ -2148,7 +2156,8 @@ async fn anthropic_passthrough_dispatch(
             crate::sse_keepalive::with_heartbeat(parsed_stream, crate::sse_keepalive::interval()),
         ));
 
-        // Copy content-type from upstream (should be text/event-stream).
+        // The upstream's content type (should be text/event-stream); a
+        // fixed one in platform mode.
         response
             .headers_mut()
             .insert(axum::http::header::CONTENT_TYPE, content_type);
@@ -2320,6 +2329,12 @@ async fn anthropic_passthrough_dispatch(
         // than the one it was asked for (a dated snapshot, a server-side
         // remap), and the caller still addressed the alias.
         crate::model_echo::restamp_body(&mut json_body, model_name);
+        // Platform mode: no upstream id or channel metrics reach the caller.
+        // After the metrics read above, which keeps the upstream's own id.
+        if let Some(platform) = state.platform() {
+            crate::opaque_id::MessagesIds::new(platform.tool_id_key())
+                .apply_to_body(&mut json_body);
+        }
 
         // #932: mask-action PII rules rewrite the passthrough response body
         // (text blocks + tool_use input) AFTER the block check passes.
@@ -2422,23 +2437,27 @@ enum Upstream {
 }
 
 impl Upstream {
-    /// The SSE body and the content type to answer it under. A platform
-    /// stream's transport failure becomes an Anthropic `error` frame — the
-    /// stream it interrupts is already committed.
+    /// The SSE body and the content type to answer it under: the
+    /// upstream's own over HTTP, except in platform mode
+    /// ([`crate::platform::relayed_content_type`]). A platform stream's
+    /// transport failure becomes an Anthropic `error` frame — the stream it
+    /// interrupts is already committed.
     fn into_sse(
         self,
+        platform_mode: Option<&crate::platform::PlatformSettings>,
     ) -> (
         HeaderValue,
         std::pin::Pin<Box<dyn Stream<Item = reqwest::Result<Bytes>> + Send>>,
     ) {
-        let sse = HeaderValue::from_static("text/event-stream");
+        let sse = HeaderValue::from_static(crate::platform::SSE_CONTENT_TYPE);
         match self {
             Self::Http(resp) => {
-                let ct = resp
-                    .headers()
-                    .get(axum::http::header::CONTENT_TYPE)
-                    .and_then(|v| HeaderValue::from_bytes(v.as_bytes()).ok())
-                    .unwrap_or(sse);
+                let ct = crate::platform::relayed_content_type(
+                    platform_mode,
+                    resp.headers(),
+                    crate::platform::SSE_CONTENT_TYPE,
+                )
+                .unwrap_or(sse);
                 (ct, Box::pin(resp.bytes_stream()))
             }
             Self::Native(aisix_gateway::NativeMessages::Stream(frames)) => {
@@ -3113,6 +3132,9 @@ async fn cross_provider_dispatch(
             attempt_started,
             stream_guardrail,
             model_name.to_string(),
+            state
+                .platform()
+                .map(|p| crate::opaque_id::MessagesIds::new(p.tool_id_key())),
             content_cap,
             Some(estimator),
             move |mut comp| {
@@ -3460,6 +3482,11 @@ async fn cross_provider_dispatch(
     if resp.id.is_empty() {
         json["id"] = format!("msg_{}", Uuid::new_v4().simple()).into();
     }
+    // Platform mode: neither the upstream's id nor its tool-call ids reach
+    // the caller. `resp` keeps them for the usage event.
+    if let Some(platform) = state.platform() {
+        crate::opaque_id::MessagesIds::new(platform.tool_id_key()).apply_to_body(&mut json);
+    }
     let captured_content = content_capture_cap(
         snapshot
             .observability_exporters
@@ -3520,6 +3547,9 @@ fn build_anthropic_sse_stream(
     attempt_started: Instant,
     output_guardrail: Option<std::sync::Arc<aisix_guardrails::GuardrailChain>>,
     model_label: String,
+    // Platform mode: every event leaves with the response's one message id
+    // and its tool-use ids mapped.
+    platform_ids: Option<crate::opaque_id::MessagesIds>,
     // Largest content cap any content-capturing exporter wants, or `None` to
     // skip response accumulation (the common, content-free path).
     content_cap: Option<u32>,
@@ -3535,13 +3565,19 @@ fn build_anthropic_sse_stream(
     // leave for the client. Wrapping the encoder output here covers both
     // the live-forward drain and the hold-back release; putting it on the
     // outermost stream instead would misfire on a keep-alive heartbeat.
+    // Every encoder event passes here, so it is also where platform mode
+    // rewrites the ids.
     macro_rules! downstream_bytes {
         ($guard:expr, $ev:expr) => {{
             if $guard.comp().downstream_latency_ms == 0 {
                 $guard.comp().downstream_latency_ms =
                     crate::attempt::measured_ms(started.elapsed());
             }
-            bytes::Bytes::from($ev.to_sse_string())
+            let mut ev = $ev;
+            if let Some(ids) = platform_ids.as_ref() {
+                ids.apply_to_event(&mut ev.data);
+            }
+            bytes::Bytes::from(ev.to_sse_string())
         }};
     }
     // #932 / #466-class: under a hold-back policy chunks are withheld from
@@ -3816,11 +3852,11 @@ fn build_anthropic_sse_stream(
                     crate::attempt::StreamFailure::record(&mut guard.comp().failure, &e);
                     // Hold-back: the held (unscanned) chunks are dropped —
                     // fail closed; only the error frame reaches the client.
-                    let frame = format!(
+                    let frame = crate::platform_errors::anthropic_stream_frame(&e).unwrap_or_else(|| format!(
                         "event: error\ndata: {{\"type\":\"error\",\"error\":{{\"type\":\"{}\",\"message\":{}}}}}\n\n",
                         e.error_type(),
                         serde_json::to_string(&e.stream_frame_message()).unwrap_or_else(|_| "\"error\"".into()),
-                    );
+                    ));
                     let comp = guard.comp();
                     // Output-guarded text stays unexportable: its scan will
                     // never run. With no output guardrail nothing was owed,
@@ -4300,7 +4336,7 @@ async fn store_in_cache(
             .get::<crate::response_cache::UnstorableAnswer>()
             .is_some()
     {
-        crate::response_cache::apply_cache_headers(&mut outcome.response, status);
+        crate::response_cache::apply_cache_headers(state, &mut outcome.response, status);
         return outcome;
     }
     let content_type = outcome
@@ -4345,7 +4381,7 @@ async fn store_in_cache(
         .await;
     }
     outcome.response = Response::from_parts(parts, axum::body::Body::from(bytes));
-    crate::response_cache::apply_cache_headers(&mut outcome.response, status);
+    crate::response_cache::apply_cache_headers(state, &mut outcome.response, status);
     outcome
 }
 
@@ -5182,6 +5218,8 @@ fn drain_anthropic_sse_frames(
     first_token_seen: &mut bool,
     response_text_cap: usize,
     client_facing_model: &str,
+    // Platform mode's per-response ids; see `restamp_anthropic_frame`.
+    platform_ids: Option<&crate::opaque_id::MessagesIds>,
     out: &mut Vec<u8>,
 ) -> Option<usize> {
     if acc.reached_end || acc.stream_failure.is_some() {
@@ -5202,26 +5240,28 @@ fn drain_anthropic_sse_frames(
             return Some(frame.len());
         }
         let mut reports_failure = false;
-        if let Some(json) = json {
+        if let Some(json) = &json {
             reports_failure = json.get("type").and_then(Value::as_str) == Some("error");
             update_anthropic_usage(
                 acc,
-                &json,
+                json,
                 attempt_started,
                 first_token_seen,
                 response_text_cap,
             );
         }
-        let forwarded = crate::model_echo::restamp_sse_frame(
-            &frame,
-            client_facing_model,
-            crate::model_echo::anthropic_message_model,
-        );
+        let forwarded = restamp_anthropic_frame(&frame, client_facing_model, platform_ids);
         let forwarded = forwarded.as_deref().unwrap_or(&frame);
         // The upstream's error event reaches the caller as sent, less the
-        // credentials this request sent it.
+        // credentials this request sent it; in platform mode, as the class
+        // of the error it reports.
         if reports_failure {
-            out.extend_from_slice(&aisix_gateway::scrub_upstream_error_bytes(forwarded));
+            match crate::platform_errors::relayed_anthropic_error(json.as_ref()) {
+                Some(class_frame) => out.extend_from_slice(class_frame.as_bytes()),
+                None => {
+                    out.extend_from_slice(&aisix_gateway::scrub_upstream_error_bytes(forwarded))
+                }
+            }
         } else {
             out.extend_from_slice(forwarded);
         }
@@ -5231,6 +5271,26 @@ fn drain_anthropic_sse_frames(
     }
     *scanned = buf.len();
     None
+}
+
+/// The caller-facing `model` restamped onto one relayed Anthropic frame and,
+/// in platform mode, its ids rewritten and channel metrics dropped — in the
+/// same splice pass. `None` forwards the frame as it came.
+fn restamp_anthropic_frame(
+    frame: &[u8],
+    client_facing_model: &str,
+    platform_ids: Option<&crate::opaque_id::MessagesIds>,
+) -> Option<Vec<u8>> {
+    match platform_ids {
+        None => crate::model_echo::restamp_sse_frame(
+            frame,
+            client_facing_model,
+            crate::model_echo::anthropic_message_model,
+        ),
+        Some(ids) => crate::model_echo::splice_sse_frame(frame, |payload| {
+            ids.rewrite_event_json(payload, client_facing_model)
+        }),
+    }
 }
 
 /// Drop guard that fires `on_complete` exactly once with the
@@ -5351,6 +5411,9 @@ fn build_anthropic_passthrough_stream<S, F>(
     attempt_started: Instant,
     output_guardrail: Option<std::sync::Arc<aisix_guardrails::GuardrailChain>>,
     model_label: String,
+    // Platform mode: the response's one message id, and its tool-use ids
+    // mapped, on every frame (see `restamp_anthropic_frame`).
+    platform_ids: Option<crate::opaque_id::MessagesIds>,
     // When `Some`, the assembled `response_text` is preserved (not taken by the
     // guardrail scan) so the on_complete content capture can read it.
     content_cap: Option<u32>,
@@ -5463,6 +5526,7 @@ where
                 &mut first_token_seen,
                 response_text_cap,
                 &model_label,
+                platform_ids.as_ref(),
                 &mut forward,
             )
             .is_some();
@@ -5613,11 +5677,7 @@ where
                 // under the same size policy: this path reaches `held`
                 // outside the loop, so without this the last frame could
                 // carry the buffer past the cap the loop refuses at.
-                let tail = crate::model_echo::restamp_sse_frame(
-                    &tail,
-                    &model_label,
-                    crate::model_echo::anthropic_message_model,
-                )
+                let tail = restamp_anthropic_frame(&tail, &model_label, platform_ids.as_ref())
                 .unwrap_or(tail);
                 held_content.hold(
                     crate::held_content::sse_frames(&tail, crate::held_content::anthropic_event),
@@ -5659,11 +5719,7 @@ where
                 // that dies part-way through leaves whatever frame it was
                 // writing, and if that is `message_start` this restamp is the
                 // only thing standing between the caller and the upstream id.
-                let tail = crate::model_echo::restamp_sse_frame(
-                    &tail,
-                    &model_label,
-                    crate::model_echo::anthropic_message_model,
-                )
+                let tail = restamp_anthropic_frame(&tail, &model_label, platform_ids.as_ref())
                 .unwrap_or(tail);
                 if guard.usage().downstream_latency_ms == 0 {
                     guard.usage().downstream_latency_ms =
@@ -6510,6 +6566,44 @@ mod tests {
              rebuilt from a chat-shaped struct would drop whatever fields \
              the gateway does not itself read",
         );
+    }
+
+    /// In platform mode the cache headers are debug headers, as chat's are:
+    /// the hit is still served, and without `proxy.expose_debug_headers`
+    /// nothing on either answer says the cache was involved.
+    #[tokio::test]
+    async fn platform_mode_serves_a_hit_without_cache_headers() {
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(anthropic_response()))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap_anthropic(&upstream.uri());
+        snap.models.insert(anthropic_model("claude-haiku"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        snap.cache_policies.insert(memory_cache_policy());
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
+        let app = crate::build_router(
+            crate::ProxyState::new(SnapshotHandle::new(snap), hub, &cfg())
+                .with_platform(crate::platform::PlatformSettings::from_secret("s")),
+        );
+        let body = serde_json::json!({
+            "model": "claude-haiku",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "max_tokens": 100
+        });
+
+        for _ in 0..2 {
+            let resp = app.clone().oneshot(make_req(body.clone())).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            for name in [crate::chat::CACHE_HEADER, crate::chat::CACHE_LAYER_HEADER] {
+                assert!(resp.headers().get(name).is_none(), "{name}");
+            }
+        }
     }
 
     /// `anthropic-beta` goes upstream beside the body: a beta can change the
@@ -8190,6 +8284,7 @@ event: message_delta\rdata: {\"type\":\"message_delta\",\"usage\":{\"output_toke
             &mut first_token_seen,
             usize::MAX,
             "gw-alias",
+            None,
             &mut out,
         );
         assert!(buf.is_empty(), "both frames drained: {buf:?}");
@@ -8233,6 +8328,7 @@ event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_toke
             &mut first_token_seen,
             usize::MAX,
             "gw-alias",
+            None,
             &mut out,
         );
         // Only the complete first frame is consumed.
@@ -8265,6 +8361,7 @@ event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_toke
             &mut first_token_seen,
             usize::MAX,
             "gw-alias",
+            None,
             &mut out,
         );
         assert_eq!(
@@ -8303,6 +8400,7 @@ event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_toke
                 &mut first_token_seen,
                 usize::MAX,
                 "gw-alias",
+                None,
                 &mut Vec::new(),
             );
         }
@@ -8327,6 +8425,7 @@ event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_toke
             &mut first_token_seen,
             usize::MAX,
             "gw-alias",
+            None,
             &mut Vec::new(),
         );
         assert!(buf.is_empty());
@@ -8433,6 +8532,7 @@ event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_toke
             now,
             Some(chain),
             "relay-claude".into(),
+            None,
             Some(4096),
             None,
             move |usage| *captured_out.lock().unwrap() = Some(usage),
@@ -8487,6 +8587,7 @@ event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_toke
             now,
             Some(chain),
             "relay-claude".into(),
+            None,
             Some(4096),
             None,
             move |usage| *captured_out.lock().unwrap() = Some(usage),
@@ -8547,6 +8648,7 @@ event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_toke
             now,
             Some(chain),
             "relay-claude".into(),
+            None,
             Some(4096),
             None,
             move |usage| *captured_out.lock().unwrap() = Some(usage),
@@ -8634,6 +8736,7 @@ event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_toke
             "relay-claude".into(),
             None,
             None,
+            None,
             move |usage| *captured_out.lock().unwrap() = Some(usage),
         );
         assert!(
@@ -8687,6 +8790,7 @@ event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_toke
             now,
             Some(slow_verdict_chain()),
             "m".into(),
+            None,
             None,
             None,
             move |completion| *captured_out.lock().unwrap() = Some(completion),
@@ -8764,6 +8868,7 @@ event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_toke
             "m".into(),
             None,
             None,
+            None,
             move |completion: super::AnthropicStreamCompletion| {
                 *captured_out.lock().unwrap() = Some(completion.guardrail_blocked)
             },
@@ -8802,6 +8907,7 @@ event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_toke
             now,
             None,
             "relay-claude".into(),
+            None,
             Some(4096),
             None,
             move |usage| *captured_out.lock().unwrap() = Some(usage),
@@ -8812,6 +8918,78 @@ event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_toke
         assert!(usage.stream_failure.is_some());
         assert!(usage.response_capture_safe);
         assert!(usage.response_text.contains("partial"));
+    }
+
+    /// A final frame the upstream never terminated is released at EOF by its
+    /// own code path, one per delivery mode. When that frame is the
+    /// `message_start`, it is the only one naming the message, so platform
+    /// mode has to reach it there too.
+    const UNTERMINATED_MESSAGE_START: &str = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_bdrk_01X\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-up\",\"content\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}}";
+
+    async fn platform_mode_tail(
+        chain: Option<std::sync::Arc<aisix_guardrails::GuardrailChain>>,
+    ) -> String {
+        use futures::StreamExt;
+        let upstream = futures::stream::iter([Ok::<_, crate::stream_timeout::RawStreamError>(
+            bytes::Bytes::from_static(UNTERMINATED_MESSAGE_START.as_bytes()),
+        )]);
+        let now = std::time::Instant::now();
+        let mut stream = super::build_anthropic_passthrough_stream(
+            upstream,
+            now,
+            now,
+            chain,
+            "relay-claude".into(),
+            Some(crate::opaque_id::MessagesIds::new(&ring::hmac::Key::new(
+                ring::hmac::HMAC_SHA256,
+                &[7u8; 32],
+            ))),
+            Some(4096),
+            None,
+            |_| {},
+        );
+        let mut wire = Vec::new();
+        while let Some(item) = stream.next().await {
+            wire.extend_from_slice(&item.unwrap());
+        }
+        String::from_utf8(wire).unwrap()
+    }
+
+    fn assert_tail_names_no_upstream_message(wire: &str) {
+        // The stream ended without `message_stop`, so an error frame follows
+        // the tail: read the first JSON document after `data: `.
+        let start = wire.find("data: ").expect("the tail is delivered") + "data: ".len();
+        let event: serde_json::Value = serde_json::Deserializer::from_str(&wire[start..])
+            .into_iter()
+            .next()
+            .expect("a JSON payload")
+            .unwrap();
+        let id = event["message"]["id"].as_str().unwrap();
+        assert!(
+            crate::opaque_id::is_platform_id(crate::opaque_id::Surface::Messages, id),
+            "{wire}"
+        );
+        assert_eq!(event["message"]["model"], "relay-claude");
+        assert!(!wire.contains("msg_bdrk_01X"), "{wire}");
+    }
+
+    #[tokio::test]
+    async fn platform_mode_rewrites_an_unterminated_message_start_on_the_live_relay() {
+        assert_tail_names_no_upstream_message(&platform_mode_tail(None).await);
+    }
+
+    #[tokio::test]
+    async fn platform_mode_rewrites_an_unterminated_message_start_held_for_the_scan() {
+        use aisix_guardrails::{Guardrail, GuardrailChain, KeywordBlocklist, KeywordRule};
+        let chain = std::sync::Arc::new(GuardrailChain::new(vec![std::sync::Arc::new(
+            KeywordBlocklist::output_only(vec![KeywordRule::literal("never said")]),
+        )
+            as std::sync::Arc<dyn Guardrail>]));
+        assert!(
+            super::anthropic_stream_hold_policy(Some(chain.as_ref())).is_some(),
+            "the chain holds the stream back"
+        );
+        assert_tail_names_no_upstream_message(&platform_mode_tail(Some(chain)).await);
     }
 
     /// The same two rules on the cross-provider relay.
@@ -8900,6 +9078,7 @@ event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_toke
                 now,
                 guardrail,
                 "relay-openai".into(),
+                None,
                 Some(4096),
                 None,
                 move |completion| *captured_out.lock().unwrap() = Some(completion),
@@ -8966,6 +9145,7 @@ event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_toke
             now,
             Some(chain),
             "relay-openai".into(),
+            None,
             Some(4096),
             Some(crate::token_estimate::Estimator::new(
                 "relay-openai",
@@ -9042,6 +9222,7 @@ event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_toke
             now,
             Some(chain),
             "relay-openai".into(),
+            None,
             Some(4096),
             None,
             move |completion| *captured_out.lock().unwrap() = Some(completion),
@@ -9091,6 +9272,7 @@ event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_toke
             now,
             Some(chain),
             "relay-claude".into(),
+            None,
             Some(4096),
             None,
             move |usage| *captured_out.lock().unwrap() = Some(usage),
@@ -9148,6 +9330,7 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
             now,
             Some(chain),
             "relay-claude".into(),
+            None,
             Some(4096),
             None,
             move |usage| *captured_out.lock().unwrap() = Some(usage),
@@ -9198,6 +9381,7 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
             now,
             None,
             "relay-claude".into(),
+            None,
             None,
             None,
             move |usage| *captured_out.lock().unwrap() = Some(usage),
@@ -9251,6 +9435,7 @@ event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\"
             &mut first_token_seen,
             usize::MAX,
             "gw-alias",
+            None,
             &mut out,
         );
         assert_eq!(
@@ -9292,6 +9477,7 @@ event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\"}}\n\n"
             &mut first,
             usize::MAX,
             "gw-alias",
+            None,
             &mut Vec::new(),
         );
 
@@ -9322,6 +9508,7 @@ event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\
             now,
             None,
             "relay-claude".into(),
+            None,
             None,
             None,
             move |usage| *captured_out.lock().unwrap() = Some(usage),
@@ -10581,5 +10768,58 @@ data: [DONE]\n\n";
             Some("gpt-4o"),
             "an abandoned stream must still name the target it was dispatched to",
         );
+    }
+
+    /// A relayed event stream goes out under the upstream's own content
+    /// type, and in platform mode under a fixed `text/event-stream`: how an
+    /// upstream spells its content type differs by channel.
+    #[tokio::test]
+    async fn platform_mode_relays_a_stream_under_a_fixed_content_type() {
+        let sse = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-3-haiku-20240307\",\"content\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}}\n\n\
+                   event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+        for (platform, expected) in [
+            (false, "text/event-stream; charset=utf-8"),
+            (true, "text/event-stream"),
+        ] {
+            let upstream = MockServer::builder().start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/messages"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_raw(sse, "text/event-stream; charset=utf-8"),
+                )
+                .mount(&upstream)
+                .await;
+            let snap = new_snap_anthropic(&upstream.uri());
+            snap.models.insert(anthropic_model("claude-haiku"));
+            snap.apikeys.insert(apikey_entry(&["*"]));
+            let hub = Arc::new(Hub::new());
+            hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
+            let mut state =
+                crate::ProxyState::new(SnapshotHandle::new(snap), hub, &cfg()).without_cache();
+            if platform {
+                state = state.with_platform(crate::platform::PlatformSettings::from_secret("s"));
+            }
+            let resp = crate::build_router(state)
+                .oneshot(make_req(serde_json::json!({
+                    "model": "claude-haiku",
+                    "messages": [{"role": "user", "content": "Hello"}],
+                    "max_tokens": 100,
+                    "stream": true,
+                })))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(
+                resp.headers()[axum::http::header::CONTENT_TYPE],
+                expected,
+                "platform mode {platform}"
+            );
+            let body = to_bytes(resp.into_body(), 65536).await.unwrap();
+            assert!(
+                String::from_utf8_lossy(&body).contains("message_stop"),
+                "{body:?}"
+            );
+        }
     }
 }

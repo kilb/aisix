@@ -1688,6 +1688,10 @@ async fn dispatch(
     crate::dispatch::check_ip_access(&virtual_entry.value, &client.source_ip)
         .map_err(with_model)?;
 
+    // Platform mode: nothing the request names may be an object stored
+    // upstream for another tenant.
+    crate::stored_refs::refuse_in_chat(state.platform(), req).map_err(with_model)?;
+
     // Resolve the per-request guardrail chain from the index.
     // Done once here; `resolved_chain` is reused for both the input
     // check below, the output check later, and the streaming output
@@ -2536,6 +2540,7 @@ async fn dispatch(
             client_requested_usage,
             // Single upstream: nothing pre-incurred, so no usage to fold in.
             aisix_gateway::chat::UsageStats::default(),
+            state.platform().cloned(),
             Some(estimator),
             move |mut comp: StreamCompletion| {
                 // Rate-limit accounting (TPM cap) for all layers.
@@ -3261,7 +3266,8 @@ async fn dispatch(
                         completion.min(u64::from(u32::MAX)) as u32,
                     );
                 }
-                let mut response = Json(render_response(now, cached, &req.model)).into_response();
+                let mut response = Json(render_response(now, cached, &req.model, state.platform()))
+                    .into_response();
                 if state.expose_debug_headers {
                     response
                         .headers_mut()
@@ -3996,7 +4002,8 @@ async fn dispatch(
             completion_tokens_u32,
         );
     }
-    let mut response = Json(render_response(now, upstream, &req.model)).into_response();
+    let mut response =
+        Json(render_response(now, upstream, &req.model, state.platform())).into_response();
     // Header only when the gate was open — policy-disabled requests have
     // no cache header at all so a user can tell at a glance whether the
     // gate ran. `bypass` = the caller's `Cache-Control: no-cache`
@@ -4589,6 +4596,7 @@ async fn dispatch_ensemble(
             content_cap,
             client_requested_usage,
             panel_usage_sum,
+            state.platform().cloned(),
             Some(judge_estimator),
             move |comp: StreamCompletion| {
                 // Fresh snapshot at stream end, shared by every emit in this
@@ -5052,7 +5060,13 @@ async fn dispatch_ensemble(
             acc.saturating_add(&p.usage)
         });
     outcome.response.usage = aggregate_usage.clone();
-    let response = Json(render_response(created_ts, outcome.response, &req.model)).into_response();
+    let response = Json(render_response(
+        created_ts,
+        outcome.response,
+        &req.model,
+        state.platform(),
+    ))
+    .into_response();
     Ok(Success {
         response,
         // No single provider/model/key governs an ensemble response.
@@ -6656,6 +6670,9 @@ fn build_sse_stream<F>(
     // `on_complete` (`comp`) counts stay stream-only. Zero for single-upstream
     // callers, where the fold is a no-op.
     base_usage: aisix_gateway::chat::UsageStats,
+    // Platform mode: every frame carries one minted id and mapped tool-call
+    // ids (see `render::render_chunk`).
+    platform: Option<crate::platform::PlatformSettings>,
     // Token-estimation fallback context (#1074); see
     // `CompleteOnDrop::estimator`.
     estimator: Option<crate::token_estimate::Estimator>,
@@ -6790,7 +6807,7 @@ where
         let mut last_usage: Option<aisix_gateway::chat::UsageStats> = None;
         let fold_base = base_usage != aisix_gateway::chat::UsageStats::default();
         let mut last_chunk_id = String::new();
-        let mut stream_id = crate::render::StreamId::default();
+        let mut stream_id = crate::render::StreamId::new(platform.is_some());
         let mut last_chunk_model = String::new();
         let mut last_chunk_tier = None;
         // Render + serialise one held/live chunk into an SSE Event.
@@ -6812,7 +6829,7 @@ where
                 }
                 let mut chunk = $chunk;
                 stream_id.stamp(&mut chunk.id);
-                let rendered = render_chunk(created, chunk, &client_facing_model);
+                let rendered = render_chunk(created, chunk, &client_facing_model, platform.as_ref());
                 match serde_json::to_string(&rendered) {
                     Ok(json) => Event::default().data(json),
                     Err(err) => {
@@ -7072,8 +7089,10 @@ where
                 }
                 Err(err) => {
                     crate::attempt::StreamFailure::record(&mut guard.comp().failure, &err);
-                    let etype = err.error_type();
-                    let message = err.stream_frame_message();
+                    let payload = crate::platform_errors::openai_stream_payload(&err)
+                        .unwrap_or_else(|| {
+                            error_frame_payload(err.error_type(), &err.stream_frame_message())
+                        });
                     let comp = guard.comp();
                     // Output-guarded text stays unexportable: its scan will
                     // never run. With no output guardrail nothing was owed,
@@ -7083,11 +7102,7 @@ where
                         comp.response_text.clear();
                     }
                     comp.terminal_failure = Some(err);
-                    yield Ok::<_, Infallible>(
-                        Event::default()
-                            .event("error")
-                            .data(error_frame_payload(etype, &message)),
-                    );
+                    yield Ok::<_, Infallible>(Event::default().event("error").data(payload));
                     return;
                 }
             };
@@ -7828,6 +7843,7 @@ mod stream_output_scan_tests {
             false,
             aisix_gateway::chat::UsageStats::default(),
             None,
+            None,
             move |completion| {
                 *out.lock().unwrap() = Some(completion);
             },
@@ -8072,6 +8088,7 @@ mod stream_output_scan_tests {
             false,
             aisix_gateway::chat::UsageStats::default(),
             None,
+            None,
             move |completion| {
                 *out.lock().unwrap() = Some(completion);
             },
@@ -8119,6 +8136,7 @@ mod stream_output_scan_tests {
             None,
             false,
             aisix_gateway::chat::UsageStats::default(),
+            None,
             Some(crate::token_estimate::Estimator::new(
                 "gpt-4o",
                 crate::token_estimate::PromptInput::Chat(Box::new(aisix_gateway::ChatFormat::new(
@@ -8722,7 +8740,7 @@ mod complete_on_drop_tests {
         assert_eq!(completion, 2, "the zero is filled");
 
         apply_estimated_usage(&mut resp.usage, prompt, completion);
-        let rendered = crate::render::render_response(0, resp, "m");
+        let rendered = crate::render::render_response(0, resp, "m", None);
         assert_eq!(rendered.usage.prompt_tokens, 17);
         assert_eq!(rendered.usage.completion_tokens, 2);
         assert_eq!(
@@ -8744,7 +8762,7 @@ mod complete_on_drop_tests {
         assert!(!estimated);
         assert_eq!((prompt, completion), (17, 23));
 
-        let rendered = crate::render::render_response(0, resp, "m");
+        let rendered = crate::render::render_response(0, resp, "m", None);
         assert_eq!(rendered.usage.prompt_tokens, 17);
         assert_eq!(rendered.usage.completion_tokens, 23);
         assert_eq!(
@@ -9117,6 +9135,7 @@ mod fail_open_capture_tests {
             false,
             aisix_gateway::chat::UsageStats::default(),
             None,
+            None,
             move |completion| {
                 *captured_for_callback.lock().unwrap() = Some(completion);
             },
@@ -9218,6 +9237,7 @@ mod fail_open_capture_tests {
                 false,
                 aisix_gateway::chat::UsageStats::default(),
                 None,
+                None,
                 move |completion| {
                     *captured_for_callback.lock().unwrap() = Some(completion);
                 },
@@ -9279,6 +9299,7 @@ mod fail_open_capture_tests {
             false,
             aisix_gateway::chat::UsageStats::default(),
             None,
+            None,
             move |completion| {
                 *captured_for_callback.lock().unwrap() = Some(completion);
             },
@@ -9324,6 +9345,7 @@ mod fail_open_capture_tests {
             Some(1_024),
             false,
             aisix_gateway::chat::UsageStats::default(),
+            None,
             None,
             move |completion| {
                 *captured_for_callback.lock().unwrap() = Some(completion);
@@ -9375,6 +9397,7 @@ mod fail_open_capture_tests {
             None,
             false,
             aisix_gateway::chat::UsageStats::default(),
+            None,
             None,
             move |completion| {
                 *captured_for_callback.lock().unwrap() = Some(completion);
@@ -9430,6 +9453,7 @@ mod fail_open_capture_tests {
             Some(1_024),
             false,
             aisix_gateway::chat::UsageStats::default(),
+            None,
             None,
             move |completion| {
                 *captured_for_callback.lock().unwrap() = Some(completion);

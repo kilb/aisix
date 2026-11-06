@@ -782,6 +782,12 @@ pub(crate) struct RequestAttribution {
     /// The upstream response headers this request's exporters asked for.
     /// See [`aisix_gateway::response_tap`].
     response_tap: Arc<aisix_gateway::ResponseHeaderTap>,
+    /// Whether the gateway serves this request in platform mode, read where
+    /// an error is rendered for the caller ([`platform_mode`]). Carried here
+    /// because the cell is installed around the handler and around every poll
+    /// of its response body, which is where every error a caller receives is
+    /// rendered, streamed frames included.
+    platform: bool,
 }
 
 impl RequestAttribution {
@@ -794,7 +800,14 @@ impl RequestAttribution {
             bodies: BodyCounters::default(),
             gateway_embedding_ledger: Arc::clone(&self.gateway_embedding_ledger),
             response_tap: Arc::default(),
+            platform: self.platform,
         }
+    }
+
+    /// This cell, for a request the gateway serves in platform mode when `on`.
+    pub(crate) fn in_platform_mode(mut self, on: bool) -> Self {
+        self.platform = on;
+        self
     }
 
     /// A cell whose upstream responses record `names` for the exporters.
@@ -1168,6 +1181,12 @@ pub(crate) fn note_cache_hit_entry(entry: &Model, hit_layer: &'static str) {
 /// What the current request has resolved, or `None` outside a request.
 pub(crate) fn current() -> Option<Resolved> {
     CURRENT.try_with(|a| a.get()).ok()
+}
+
+/// Whether the request being served is served in platform mode. `false`
+/// outside a request scope.
+pub(crate) fn platform_mode() -> bool {
+    CURRENT.try_with(|a| a.platform).unwrap_or(false)
 }
 
 /// Record one actual gateway-initiated embedding bridge call. This is safe

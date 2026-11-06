@@ -119,7 +119,7 @@ async function post(
   endpoint: string,
   model: string,
   body: Record<string, unknown>,
-): Promise<{ status: number; cache: string | null; text: string }> {
+): Promise<{ status: number; cache: string | null; headers: Headers; text: string }> {
   const res = await fetch(`${app.proxyUrl}${endpoint}`, {
     method: "POST",
     headers: {
@@ -132,8 +132,92 @@ async function post(
   return {
     status: res.status,
     cache: res.headers.get("x-aisix-cache"),
+    headers: res.headers,
     text: await res.text(),
   };
+}
+
+/**
+ * Seed every model and the team-scoped policy, then the caller keys last, and
+ * wait until the last key authenticates: that implies every row is in the
+ * gateway's snapshot.
+ */
+async function seedTeamScope(
+  etcd: EtcdClient,
+  app: SpawnedApp,
+  upstream: OpenAiUpstream,
+): Promise<void> {
+  const seed = new SeedClient(etcd, app.etcdPrefix);
+  const anthropicPk = await seed.createProviderKey({
+    display_name: "teamscope-anthropic-pk",
+    secret: "sk-mock",
+    api_base: upstream.baseUrl,
+    provider: "anthropic",
+    adapter: "anthropic",
+  });
+  const openaiPk = await seed.createProviderKey({
+    display_name: "teamscope-openai-pk",
+    secret: "sk-mock",
+    api_base: `${upstream.baseUrl}/v1`,
+  });
+  await seed.createModel({
+    display_name: "teamscope-chat",
+    provider: "openai",
+    model_name: "gpt-4o-mini",
+    provider_key_id: openaiPk.id,
+  });
+  await seed.createModel({
+    display_name: "teamscope-messages",
+    provider: "anthropic",
+    model_name: "claude-3-5-haiku-20241022",
+    provider_key_id: anthropicPk.id,
+  });
+  await seed.createModel({
+    display_name: "teamscope-responses",
+    provider: "openai",
+    model_name: "gpt-4o-mini",
+    provider_key_id: openaiPk.id,
+  });
+  await seed.createModel({
+    display_name: "teamscope-embeddings",
+    provider: "openai",
+    model_name: "text-embedding-3-small",
+    provider_key_id: openaiPk.id,
+  });
+  await seed.createCachePolicy({
+    name: "teamscope",
+    enabled: true,
+    backend: "memory",
+    ttl_seconds: 300,
+    applies_to: "all",
+    scope: "team",
+  });
+
+  // The caller keys come last, so the gate below on the last of them
+  // authenticating implies every row above is in the snapshot.
+  const tenantOne = randomUUID();
+  const tenantTwo = randomUUID();
+  const allowed_models = CASES.map((c) => c.model);
+  await seed.createApiKey({
+    key_hash: hash(KEYS.tenantOneFirst),
+    team_id: tenantOne,
+    allowed_models,
+  });
+  await seed.createApiKey({
+    key_hash: hash(KEYS.tenantOneSecond),
+    team_id: tenantOne,
+    allowed_models,
+  });
+  await seed.createApiKey({
+    key_hash: hash(KEYS.tenantTwo),
+    team_id: tenantTwo,
+    allowed_models,
+  });
+  await seed.createApiKey({ key_hash: hash(KEYS.noTeamFirst), allowed_models });
+  await seed.createApiKey({ key_hash: hash(KEYS.noTeamSecond), allowed_models });
+
+  const last = new ProxyClient(app.proxyUrl, KEYS.noTeamSecond);
+  await waitConfigPropagation(async () => (await last.listModels()).status === 200);
 }
 
 describe("cache team scope e2e", () => {
@@ -151,78 +235,7 @@ describe("cache team scope e2e", () => {
     upstream = await startOpenAiUpstream({ pathBodies: pathBodies() });
     // Chat completions report `x-aisix-cache` only with the debug headers on.
     app = await spawnApp({ exposeDebugHeaders: true });
-
-    const seed = new SeedClient(etcd, app.etcdPrefix);
-    const anthropicPk = await seed.createProviderKey({
-      display_name: "teamscope-anthropic-pk",
-      secret: "sk-mock",
-      api_base: upstream.baseUrl,
-      provider: "anthropic",
-      adapter: "anthropic",
-    });
-    const openaiPk = await seed.createProviderKey({
-      display_name: "teamscope-openai-pk",
-      secret: "sk-mock",
-      api_base: `${upstream.baseUrl}/v1`,
-    });
-    await seed.createModel({
-      display_name: "teamscope-chat",
-      provider: "openai",
-      model_name: "gpt-4o-mini",
-      provider_key_id: openaiPk.id,
-    });
-    await seed.createModel({
-      display_name: "teamscope-messages",
-      provider: "anthropic",
-      model_name: "claude-3-5-haiku-20241022",
-      provider_key_id: anthropicPk.id,
-    });
-    await seed.createModel({
-      display_name: "teamscope-responses",
-      provider: "openai",
-      model_name: "gpt-4o-mini",
-      provider_key_id: openaiPk.id,
-    });
-    await seed.createModel({
-      display_name: "teamscope-embeddings",
-      provider: "openai",
-      model_name: "text-embedding-3-small",
-      provider_key_id: openaiPk.id,
-    });
-    await seed.createCachePolicy({
-      name: "teamscope",
-      enabled: true,
-      backend: "memory",
-      ttl_seconds: 300,
-      applies_to: "all",
-      scope: "team",
-    });
-
-    // The caller keys come last, so the gate below on the last of them
-    // authenticating implies every row above is in the snapshot.
-    const tenantOne = randomUUID();
-    const tenantTwo = randomUUID();
-    const allowed_models = CASES.map((c) => c.model);
-    await seed.createApiKey({
-      key_hash: hash(KEYS.tenantOneFirst),
-      team_id: tenantOne,
-      allowed_models,
-    });
-    await seed.createApiKey({
-      key_hash: hash(KEYS.tenantOneSecond),
-      team_id: tenantOne,
-      allowed_models,
-    });
-    await seed.createApiKey({
-      key_hash: hash(KEYS.tenantTwo),
-      team_id: tenantTwo,
-      allowed_models,
-    });
-    await seed.createApiKey({ key_hash: hash(KEYS.noTeamFirst), allowed_models });
-    await seed.createApiKey({ key_hash: hash(KEYS.noTeamSecond), allowed_models });
-
-    const last = new ProxyClient(app.proxyUrl, KEYS.noTeamSecond);
-    await waitConfigPropagation(async () => (await last.listModels()).status === 200);
+    await seedTeamScope(etcd, app, upstream);
   });
 
   afterAll(async () => {
@@ -239,6 +252,11 @@ describe("cache team scope e2e", () => {
     const failures: string[] = [];
     for (const { endpoint, model, body } of CASES) {
       const request = body(`shared within one tenant via ${endpoint}`);
+      // A chat hit stamps the current second into `created`, so only that
+      // number may differ; every other byte, and every byte the other
+      // endpoints answer, is the answer.
+      const stamp = (t: string) =>
+        endpoint.endsWith("/chat/completions") ? t.replace(/"created":\d+/, '"created":0') : t;
       const before = upstreamCalls(endpoint);
 
       const first = await post(app, KEYS.tenantOneFirst, endpoint, model, request);
@@ -253,7 +271,7 @@ describe("cache team scope e2e", () => {
             `(upstream calls +${afterTeammate - before}, want 1; ` +
             `x-aisix-cache=${teammate.cache}, want hit)`,
         );
-      } else if (teammate.text !== first.text) {
+      } else if (stamp(teammate.text) !== stamp(first.text)) {
         failures.push(`${endpoint}: the teammate's hit differs from the original answer`);
       }
 
@@ -303,6 +321,82 @@ describe("cache team scope e2e", () => {
     expect(
       failures,
       `under a team-scoped cache policy:\n${failures.map((f) => `  ${f}`).join("\n")}`,
+    ).toEqual([]);
+  });
+});
+
+// The team scope is what a multi-tenant gateway runs, and there a hit is a
+// fact about another key: it says a teammate already asked the same thing. In
+// platform mode that is a debug fact like any other, so unless the operator
+// turned the debug headers on, the teammate is served the entry without any
+// header saying the cache answered.
+describe("cache team scope in platform mode e2e", () => {
+  const PLATFORM_SECRET_ENV = "P0_E2E_PLATFORM_ID_KEY";
+  let upstream: OpenAiUpstream | undefined;
+  let app: SpawnedApp | undefined;
+  let etcdReachable = false;
+
+  const upstreamCalls = (endpoint: string) =>
+    upstream!.receivedRequests.filter((r) => r.path.endsWith(endpoint)).length;
+
+  beforeAll(async () => {
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
+    if (!etcdReachable) return;
+    upstream = await startOpenAiUpstream({ pathBodies: pathBodies() });
+    app = await spawnApp({
+      extraEnv: {
+        AISIX_PROXY__PLATFORM__ENABLED: "true",
+        AISIX_PROXY__PLATFORM__ID_KEY_ENV: PLATFORM_SECRET_ENV,
+        [PLATFORM_SECRET_ENV]: "cache-team-scope-e2e-platform-secret-0123456789",
+      },
+    });
+    await seedTeamScope(etcd, app, upstream);
+  });
+
+  afterAll(async () => {
+    await app?.exit();
+    await upstream?.close();
+  });
+
+  test("a teammate is served the team's entry and neither answer says the cache was involved", async (ctx) => {
+    if (!etcdReachable || !app) {
+      ctx.skip();
+      return;
+    }
+
+    const failures: string[] = [];
+    for (const { endpoint, model, body } of CASES) {
+      const request = body(`shared within one tenant in platform mode via ${endpoint}`);
+      const before = upstreamCalls(endpoint);
+
+      const first = await post(app, KEYS.tenantOneFirst, endpoint, model, request);
+      expect(first.status, `${endpoint}: first key of tenant one`).toBe(200);
+      const teammate = await post(app, KEYS.tenantOneSecond, endpoint, model, request);
+      expect(teammate.status, `${endpoint}: second key of tenant one`).toBe(200);
+
+      // The upstream is the ground truth: one call for the two requests.
+      const calls = upstreamCalls(endpoint) - before;
+      if (calls !== 1) {
+        failures.push(
+          `${endpoint}: tenant one's second key was not served tenant one's entry ` +
+            `(upstream calls +${calls}, want 1)`,
+        );
+      }
+      for (const [who, answer] of [
+        ["first key", first],
+        ["teammate", teammate],
+      ] as const) {
+        const named = [...answer.headers.keys()].filter((h) => h.startsWith("x-aisix-cache"));
+        if (named.length > 0) {
+          failures.push(`${endpoint}: the ${who}'s answer carries ${named.join(", ")}`);
+        }
+      }
+    }
+
+    expect(
+      failures,
+      `under a team-scoped cache policy in platform mode:\n${failures.map((f) => `  ${f}`).join("\n")}`,
     ).toEqual([]);
   });
 });

@@ -580,7 +580,7 @@ async fn dispatch(
                 // shape of gap as the Voyage rerank note in `rerank.rs`.
                 let azure = pk_entry.value.adapter == Some(aisix_core::Adapter::AzureOpenai);
                 if target.model.provider.as_deref() != Some("openai") && !azure {
-                    return Err(ProxyError::InvalidRequest(format!(
+                    return Err(ProxyError::TargetRefused(format!(
                         "{} is not an OpenAI provider; \
                          /v1/images/generations requires OpenAI or Azure OpenAI",
                         crate::routing::refused_model_label(model_name)

@@ -170,8 +170,10 @@ proxy:
   # (the semantic route that matched) and x-aisix-cache / -cache-layer /
   # -cache-similarity. Off by default: served-by and route reveal to the
   # caller which model behind a model group answered. Usage events, access
-  # logs, metrics and traces record the same facts either way. Applied at
-  # startup.
+  # logs, metrics and traces record the same facts either way. In platform
+  # mode it also gates x-aisix-cache / -cache-layer on /v1/messages,
+  # /v1/responses and /v1/embeddings, which otherwise always send them.
+  # Applied at startup.
   # expose_debug_headers: false
   # Platform mode for multi-tenant deployments. Off by default. When
   # enabled, id_key_env must name an environment variable holding a secret of

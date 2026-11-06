@@ -1658,6 +1658,8 @@ pub struct ResponsesSseEncoder {
     cache_read_tokens: u32,
     /// The last tier an OpenAI-shape upstream reported on this stream.
     service_tier: Option<String>,
+    /// Platform mode: every event leaves with its item ids sealed.
+    seal: Option<std::sync::Arc<crate::opaque_id::Sealer>>,
 }
 
 impl ResponsesSseEncoder {
@@ -1704,7 +1706,20 @@ impl ResponsesSseEncoder {
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
             service_tier: None,
+            seal: None,
         }
+    }
+
+    /// Platform mode: seal the item ids of every event this encoder builds,
+    /// as the non-streaming answer's are
+    /// ([`crate::opaque_id::seal_responses_event`]), and keep its usage to
+    /// OpenAI's own fields ([`crate::opaque_id::drop_bridged_usage_extensions`]).
+    pub(crate) fn sealing_ids(
+        mut self,
+        sealer: Option<std::sync::Arc<crate::opaque_id::Sealer>>,
+    ) -> Self {
+        self.seal = sealer;
+        self
     }
 
     /// Take the next `sequence_number` for an event this relay emits
@@ -1743,6 +1758,12 @@ impl ResponsesSseEncoder {
         if let Value::Object(map) = &mut data {
             map.insert("type".to_string(), json!(event_type));
             map.insert("sequence_number".to_string(), json!(seq));
+        }
+        if let Some(sealer) = &self.seal {
+            crate::opaque_id::seal_responses_event(sealer, &mut data);
+            if let Some(response) = data.get_mut("response") {
+                crate::opaque_id::drop_bridged_usage_extensions(response);
+            }
         }
         ResponsesSseEvent { event_type, data }
     }
@@ -2923,15 +2944,24 @@ pub fn build_responses_bridge_stream(
                     {
                         break;
                     }
-                    let message = e.stream_frame_message();
-                    let frames = failure_frames(
-                        &mut encoder,
-                        sent_downstream,
-                        false,
-                        e.error_type(),
-                        upstream_failed_code(&e),
-                        &message,
-                    );
+                    let frames = match crate::platform_errors::stream_class(&e) {
+                        Some(class) => failure_frames(
+                            &mut encoder,
+                            sent_downstream,
+                            false,
+                            class.code(),
+                            class.code(),
+                            crate::platform_errors::platform_message(&class),
+                        ),
+                        None => failure_frames(
+                            &mut encoder,
+                            sent_downstream,
+                            false,
+                            e.error_type(),
+                            upstream_failed_code(&e),
+                            &e.stream_frame_message(),
+                        ),
+                    };
                     let comp = guard.comp();
                     // Output-guarded text stays unexportable: its scan will
                     // never run. With no output guardrail nothing was owed,
@@ -4443,6 +4473,85 @@ mod tests {
         });
         assert_eq!(types_of(&usage_frame), vec!["response.completed"]);
         assert_eq!(usage_frame[0].data["response"]["usage"]["output_tokens"], 4);
+    }
+
+    /// Platform mode on the bridged stream: the call id leaves sealed, and
+    /// the usage counter this bridge adds beside OpenAI's does not leave.
+    /// Without a sealer the same stream is exactly as before.
+    #[test]
+    fn a_sealing_encoder_seals_call_ids_and_keeps_usage_to_openai_fields() {
+        let platform = crate::platform::PlatformSettings::from_secret("s");
+        let sealer = std::sync::Arc::new(crate::opaque_id::Sealer::of(&platform, "team-a"));
+        let run = |sealer: Option<std::sync::Arc<crate::opaque_id::Sealer>>| {
+            let mut enc =
+                ResponsesSseEncoder::new("resp_1", "m", 0, no_custom_tools()).sealing_ids(sealer);
+            let mut events = enc.next_events(&ChatChunk {
+                choice_index: 0,
+                logprobs: None,
+                id: "c".into(),
+                model: "m".into(),
+                delta: ChatDelta {
+                    tool_calls: Some(vec![json!({
+                        "index": 0, "id": "toolu_bdrk_01Y", "type": "function",
+                        "function": {"name": "shell", "arguments": "{}"},
+                    })]),
+                    ..Default::default()
+                },
+                finish_reason: Some(FinishReason::ToolCalls),
+                usage: Some(UsageStats {
+                    prompt_tokens: 5,
+                    completion_tokens: 2,
+                    cache_creation_tokens: 4,
+                    ..UsageStats::default()
+                }),
+                service_tier: None,
+                accounting_usage: None,
+            });
+            events.extend(enc.force_finish());
+            events
+        };
+        let completed = |events: &[ResponsesSseEvent]| {
+            events
+                .iter()
+                .find(|e| e.event_type == "response.completed")
+                .expect("response.completed")
+                .data["response"]
+                .clone()
+        };
+
+        let sealed = run(Some(sealer.clone()));
+        let response = completed(&sealed);
+        let call_id = response["output"][0]["call_id"].as_str().unwrap();
+        // A call id is shown behind `call_`, not the upstream's `toolu_`.
+        assert!(call_id.starts_with("call_"), "{call_id}");
+        assert_eq!(
+            sealer
+                .unseal(crate::opaque_id::IdKind::Call, call_id)
+                .as_deref(),
+            Some("toolu_bdrk_01Y")
+        );
+        assert!(response["usage"]["input_tokens_details"]
+            .get("cache_creation_tokens")
+            .is_none());
+        assert_eq!(
+            response["usage"]["input_tokens"], 9,
+            "the write is still counted"
+        );
+        for event in &sealed {
+            assert!(
+                !event.to_sse_string().contains("bdrk")
+                    && !event.to_sse_string().contains("toolu_"),
+                "{}",
+                event.to_sse_string()
+            );
+        }
+
+        let plain = completed(&run(None));
+        assert_eq!(plain["output"][0]["call_id"], "toolu_bdrk_01Y");
+        assert_eq!(
+            plain["usage"]["input_tokens_details"]["cache_creation_tokens"],
+            4
+        );
     }
 
     #[test]

@@ -183,8 +183,13 @@ function assertFresh(bin: string, crateDirs: string[]): void {
 
 /// Which crates each binary is actually built from. Comparing against all of
 /// `crates/` would condemn the console binary for a gateway-only edit and
-/// force a pointless release rebuild; comparing against only its own
-/// directory would miss `aisix-core`, which all three link.
+/// force a pointless release rebuild. Each set is the binary's own crate plus
+/// the workspace crates it links (`cargo tree -p <crate> -e normal`): the
+/// portal and the gateway link `aisix-core`, the console links no workspace
+/// crate. A set wider than that condemns a binary cargo rightly left alone —
+/// a core-only edit never rebuilds the console — and the run refuses to
+/// start; a set narrower than that lets a stale binary through. Update the
+/// set when the console gains a workspace dependency.
 function crateDirsFor(re: RegExp): string[] {
   const crates = resolve(REPO, "crates");
   return readdirSync(crates, { withFileTypes: true })
@@ -193,7 +198,7 @@ function crateDirsFor(re: RegExp): string[] {
 }
 
 export async function start(opts: StartOptions = {}): Promise<Fixture> {
-  assertFresh(CONSOLE_BIN, crateDirsFor(/^aisix-(console|core)$/));
+  assertFresh(CONSOLE_BIN, crateDirsFor(/^aisix-console$/));
   assertFresh(PORTAL_BIN, crateDirsFor(/^aisix-(portal|core)$/));
   assertFresh(GATEWAY_BIN, crateDirsFor(/^aisix-(?!portal$|console$)/));
 

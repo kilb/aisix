@@ -686,6 +686,8 @@ pub(crate) fn attempt_reached_upstream(err: &ProxyError) -> bool {
         | ProxyError::ModelNotFound(_)
         | ProxyError::VideoNotFound(_)
         | ProxyError::JobResourceNotFound(_)
+        | ProxyError::ResponseNotFound
+        | ProxyError::StoredObjectReference(_)
         | ProxyError::JobListRefused
         | ProxyError::ModelForbidden(_)
         | ProxyError::ModelIpRestricted(_)
@@ -693,6 +695,7 @@ pub(crate) fn attempt_reached_upstream(err: &ProxyError) -> bool {
         | ProxyError::RouteForbidden(_)
         | ProxyError::InvalidRequest(_)
         | ProxyError::UnusableTarget(_)
+        | ProxyError::TargetRefused(_)
         | ProxyError::WebSocketUpgradeRequired { .. }
         | ProxyError::ProviderUnavailable
         | ProxyError::SemanticDecisionFailed { .. }
@@ -701,6 +704,7 @@ pub(crate) fn attempt_reached_upstream(err: &ProxyError) -> bool {
         | ProxyError::BudgetUnverified
         | ProxyError::RequestTooLarge { .. }
         | ProxyError::RateLimit(_)
+        | ProxyError::ModelRateLimit(_)
         | ProxyError::PolicyRateLimit { .. } => false,
     }
 }

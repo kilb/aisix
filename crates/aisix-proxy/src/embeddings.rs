@@ -735,6 +735,7 @@ async fn dispatch(
                     .insert(axum::http::header::CONTENT_TYPE, ct);
             }
             crate::response_cache::apply_cache_headers(
+                state,
                 &mut response,
                 crate::chat::CacheStatus::Hit,
             );
@@ -964,7 +965,7 @@ async fn dispatch(
                 None => crate::chat::CacheStatus::Disabled,
             };
             let mut response = Json(embed_resp).into_response();
-            crate::response_cache::apply_cache_headers(&mut response, cache_status);
+            crate::response_cache::apply_cache_headers(state, &mut response, cache_status);
             Ok(EmbedDispatchSuccess {
                 response,
                 provider: provider_label,
