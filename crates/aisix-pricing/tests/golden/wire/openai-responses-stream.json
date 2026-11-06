@@ -1,0 +1,21 @@
+[
+  {
+    "cache_status": "disabled",
+    "cached_prompt_tokens": 1500,
+    "completion_tokens": 300,
+    "cost_usd": 0.00125,
+    "event_id": "evt-openai-responses-stream-1",
+    "guardrail_blocked": false,
+    "occurred_at": "2026-11-06T00:00:00.000Z",
+    "operation": "responses",
+    "prompt_tokens": 2000,
+    "provider_key_id": "pk-openai",
+    "reasoning_tokens": 120,
+    "requested_model_id": "model-openai-responses",
+    "status_code": 200,
+    "team_id": "tenant-golden",
+    "total_tokens": 2300,
+    "upstream_model": "gpt-5",
+    "upstream_provider": "openai"
+  }
+]

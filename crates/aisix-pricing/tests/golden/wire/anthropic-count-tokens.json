@@ -1,0 +1,17 @@
+[
+  {
+    "completion_tokens": 0,
+    "cost_usd": 0,
+    "event_id": "evt-anthropic-count-tokens-1",
+    "guardrail_blocked": false,
+    "occurred_at": "2026-11-06T00:00:00.000Z",
+    "operation": "count_tokens",
+    "prompt_tokens": 0,
+    "provider_key_id": "pk-anthropic",
+    "requested_model_id": "model-anthropic-count-tokens",
+    "status_code": 200,
+    "team_id": "tenant-golden",
+    "upstream_model": "claude-haiku-4-5-20251001",
+    "upstream_provider": "anthropic"
+  }
+]

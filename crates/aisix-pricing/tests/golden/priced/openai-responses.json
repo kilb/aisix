@@ -1,0 +1,45 @@
+[
+  {
+    "charge": 1250,
+    "cost": null,
+    "discount": null,
+    "engine_version": 1,
+    "estimated": false,
+    "event_id": "evt-openai-responses-1",
+    "lines": [
+      {
+        "dimension": "input",
+        "quantity": 500,
+        "rate": "1"
+      },
+      {
+        "dimension": "cache_read",
+        "quantity": 1500,
+        "rate": "0.1"
+      },
+      {
+        "dimension": "output",
+        "quantity": 180,
+        "rate": "2"
+      },
+      {
+        "dimension": "reasoning",
+        "quantity": 120,
+        "rate": "2"
+      }
+    ],
+    "long_context_above": null,
+    "occurred_at": "2026-11-06T00:00:00Z",
+    "outcome": "charged",
+    "price_instant": "2026-11-06T00:00:00Z",
+    "requested_model_id": "model-openai-responses",
+    "requested_service_tier": null,
+    "sell": {
+      "revision_id": 2,
+      "tenant_override": false
+    },
+    "service_tier": "default",
+    "tenant_id": "tenant-golden",
+    "warnings": []
+  }
+]

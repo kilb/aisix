@@ -1,0 +1,23 @@
+[
+  {
+    "charge": 0,
+    "cost": null,
+    "discount": null,
+    "engine_version": 1,
+    "estimated": false,
+    "event_id": "evt-cache-hit-messages-1",
+    "lines": [],
+    "long_context_above": null,
+    "occurred_at": "2026-11-06T00:00:00Z",
+    "outcome": {
+      "exempt": "response_cache_hit"
+    },
+    "price_instant": "2026-11-06T00:00:00Z",
+    "requested_model_id": "model-anthropic-messages",
+    "requested_service_tier": null,
+    "sell": null,
+    "service_tier": null,
+    "tenant_id": "tenant-golden",
+    "warnings": []
+  }
+]

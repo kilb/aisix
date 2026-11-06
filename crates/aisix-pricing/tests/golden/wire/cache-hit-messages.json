@@ -1,0 +1,17 @@
+[
+  {
+    "cache_status": "hit",
+    "completion_tokens": 52,
+    "cost_usd": 0,
+    "event_id": "evt-cache-hit-messages-1",
+    "guardrail_blocked": false,
+    "occurred_at": "2026-11-06T00:00:00.000Z",
+    "operation": "messages",
+    "prompt_tokens": 37,
+    "requested_model_id": "model-anthropic-messages",
+    "status_code": 200,
+    "team_id": "tenant-golden",
+    "upstream_model": "claude-sonnet-4-5-20250929",
+    "upstream_provider": "anthropic"
+  }
+]
