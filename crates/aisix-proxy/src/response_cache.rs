@@ -392,8 +392,18 @@ impl BodyCache {
 
 /// Attach the cache headers the chat surface already publishes, so a client
 /// can tell a replayed answer from a fresh one on any endpoint.
-pub(crate) fn apply_cache_headers(response: &mut axum::response::Response, status: CacheStatus) {
-    if matches!(status, CacheStatus::Disabled) {
+///
+/// In platform mode they are debug headers, as they are on chat: sent only
+/// with `proxy.expose_debug_headers` on. Under a scope shared across keys, a
+/// hit tells a caller that another key already asked the same thing.
+pub(crate) fn apply_cache_headers(
+    state: &ProxyState,
+    response: &mut axum::response::Response,
+    status: CacheStatus,
+) {
+    if matches!(status, CacheStatus::Disabled)
+        || (state.platform().is_some() && !state.expose_debug_headers)
+    {
         return;
     }
     if let Ok(value) = axum::http::HeaderValue::from_str(status.as_str()) {
@@ -757,5 +767,66 @@ mod tests {
             !lookup(partition(None, "k4")).await,
             "a key with no team sees no team's entries"
         );
+    }
+
+    /// A gateway in platform mode, or not, with the debug headers on or off.
+    fn state(platform: bool, expose_debug_headers: bool) -> crate::ProxyState {
+        let state = crate::ProxyState::new(
+            aisix_core::snapshot::SnapshotHandle::new(AisixSnapshot::new()),
+            Arc::new(aisix_gateway::Hub::new()),
+            &serde_json::from_value::<aisix_core::ProxyConfig>(serde_json::json!({
+                "addr": "127.0.0.1:0",
+                "expose_debug_headers": expose_debug_headers,
+            }))
+            .unwrap(),
+        );
+        if platform {
+            state.with_platform(crate::platform::PlatformSettings::from_secret("s"))
+        } else {
+            state
+        }
+    }
+
+    fn platform_state(expose_debug_headers: bool) -> crate::ProxyState {
+        state(true, expose_debug_headers)
+    }
+
+    /// An answer the cache served, as `state` sends it.
+    fn cached_response(state: crate::ProxyState) -> axum::response::Response {
+        let mut resp = axum::response::Response::new(axum::body::Body::empty());
+        apply_cache_headers(&state, &mut resp, CacheStatus::Hit);
+        resp
+    }
+
+    #[test]
+    fn platform_mode_sends_no_cache_headers_without_debug_headers() {
+        let resp = cached_response(platform_state(false));
+        assert!(resp.headers().get("x-aisix-cache").is_none());
+        assert!(resp.headers().get("x-aisix-cache-layer").is_none());
+        let mut miss = axum::response::Response::new(axum::body::Body::empty());
+        apply_cache_headers(&platform_state(false), &mut miss, CacheStatus::Miss);
+        assert!(miss.headers().is_empty(), "{:?}", miss.headers());
+    }
+
+    #[test]
+    fn platform_mode_sends_cache_headers_with_debug_headers() {
+        let resp = cached_response(platform_state(true));
+        assert_eq!(resp.headers()["x-aisix-cache"], "hit");
+        assert_eq!(resp.headers()["x-aisix-cache-layer"], "exact");
+    }
+
+    /// Outside platform mode these endpoints have always said whether the
+    /// cache answered, debug headers or not.
+    #[test]
+    fn outside_platform_mode_cache_headers_are_sent_whatever_the_debug_headers() {
+        for debug in [false, true] {
+            let resp = cached_response(state(false, debug));
+            assert_eq!(resp.headers()["x-aisix-cache"], "hit", "debug {debug}");
+            assert_eq!(
+                resp.headers()["x-aisix-cache-layer"],
+                "exact",
+                "debug {debug}"
+            );
+        }
     }
 }

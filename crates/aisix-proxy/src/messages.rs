@@ -926,6 +926,7 @@ async fn dispatch(
                     .insert(axum::http::header::CONTENT_TYPE, ct);
             }
             crate::response_cache::apply_cache_headers(
+                state,
                 &mut response,
                 crate::chat::CacheStatus::Hit,
             );
@@ -4325,7 +4326,7 @@ async fn store_in_cache(
             .get::<crate::response_cache::UnstorableAnswer>()
             .is_some()
     {
-        crate::response_cache::apply_cache_headers(&mut outcome.response, status);
+        crate::response_cache::apply_cache_headers(state, &mut outcome.response, status);
         return outcome;
     }
     let content_type = outcome
@@ -4370,7 +4371,7 @@ async fn store_in_cache(
         .await;
     }
     outcome.response = Response::from_parts(parts, axum::body::Body::from(bytes));
-    crate::response_cache::apply_cache_headers(&mut outcome.response, status);
+    crate::response_cache::apply_cache_headers(state, &mut outcome.response, status);
     outcome
 }
 
@@ -6555,6 +6556,44 @@ mod tests {
              rebuilt from a chat-shaped struct would drop whatever fields \
              the gateway does not itself read",
         );
+    }
+
+    /// In platform mode the cache headers are debug headers, as chat's are:
+    /// the hit is still served, and without `proxy.expose_debug_headers`
+    /// nothing on either answer says the cache was involved.
+    #[tokio::test]
+    async fn platform_mode_serves_a_hit_without_cache_headers() {
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(anthropic_response()))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap_anthropic(&upstream.uri());
+        snap.models.insert(anthropic_model("claude-haiku"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        snap.cache_policies.insert(memory_cache_policy());
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
+        let app = crate::build_router(
+            crate::ProxyState::new(SnapshotHandle::new(snap), hub, &cfg())
+                .with_platform(crate::platform::PlatformSettings::from_secret("s")),
+        );
+        let body = serde_json::json!({
+            "model": "claude-haiku",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "max_tokens": 100
+        });
+
+        for _ in 0..2 {
+            let resp = app.clone().oneshot(make_req(body.clone())).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            for name in [crate::chat::CACHE_HEADER, crate::chat::CACHE_LAYER_HEADER] {
+                assert!(resp.headers().get(name).is_none(), "{name}");
+            }
+        }
     }
 
     /// `anthropic-beta` goes upstream beside the body: a beta can change the

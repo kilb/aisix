@@ -16,9 +16,11 @@
 //!
 //! The gateway's own refusals that name no upstream (budgets, rate limits,
 //! guardrails, request validation, authentication) keep their envelopes in
-//! platform mode. With platform mode off nothing here applies, and every
-//! error renders exactly as it did before, upstream text relayed through the
-//! shared scrubber included.
+//! platform mode, with one exception: a model the key may not use is answered
+//! exactly as a model that does not exist ([`caller_error`]), so a key cannot
+//! map the catalog by asking for names. With platform mode off nothing here
+//! applies, and every error renders exactly as it did before, upstream text
+//! relayed through the shared scrubber included.
 //!
 //! The mode is read from the request's attribution cell
 //! ([`crate::attribution::platform_mode`]), which is installed around the
@@ -300,6 +302,24 @@ pub(crate) fn active() -> bool {
 /// `err` renders as it always has.
 pub(crate) fn caller_class(err: &ProxyError) -> Option<PlatformErrorClass> {
     (active() && hides(err)).then(|| classify(err))
+}
+
+/// The error the caller is answered with in place of `err`, when platform
+/// mode answers `err` as another of the gateway's own errors: a model the key
+/// may not use is answered in status, headers and body as a model that does
+/// not exist. Otherwise a key could tell the models it is refused from the
+/// names nobody configured. `None` when `err` is answered as itself.
+///
+/// Only the caller's answer changes. The usage event, the access log and the
+/// metrics are written from `err`, so the operator still sees a `403`
+/// `permission_denied` refusal.
+pub(crate) fn caller_error(err: &ProxyError) -> Option<ProxyError> {
+    match err {
+        ProxyError::ModelForbidden(model) if active() => {
+            Some(ProxyError::ModelNotFound(model.clone()))
+        }
+        _ => None,
+    }
 }
 
 /// [`caller_class`] for the failure that ends a stream.

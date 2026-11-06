@@ -226,7 +226,7 @@ async fn store_in_cache(
             .get::<crate::response_cache::UnstorableAnswer>()
             .is_some()
     {
-        crate::response_cache::apply_cache_headers(&mut success.response, status);
+        crate::response_cache::apply_cache_headers(state, &mut success.response, status);
         return success;
     }
     let content_type = success
@@ -268,7 +268,7 @@ async fn store_in_cache(
         .await;
     }
     success.response = Response::from_parts(parts, axum::body::Body::from(bytes));
-    crate::response_cache::apply_cache_headers(&mut success.response, status);
+    crate::response_cache::apply_cache_headers(state, &mut success.response, status);
     success
 }
 
@@ -1055,6 +1055,7 @@ async fn dispatch(
                     .insert(axum::http::header::CONTENT_TYPE, ct);
             }
             crate::response_cache::apply_cache_headers(
+                state,
                 &mut response,
                 crate::chat::CacheStatus::Hit,
             );

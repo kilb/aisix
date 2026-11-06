@@ -682,8 +682,13 @@ impl ProxyError {
     /// The OpenAI-shape envelope the caller receives. In platform mode an
     /// upstream's failure, or a refusal naming the target, is its platform
     /// class instead (`crate::platform_errors`); the original error still
-    /// names the failure in the usage event and the access log.
+    /// names the failure in the usage event and the access log. Platform mode
+    /// also answers a model the key may not use as an unknown one
+    /// (`crate::platform_errors::caller_error`).
     pub fn envelope(&self) -> ErrorEnvelope {
+        if let Some(answered) = crate::platform_errors::caller_error(self) {
+            return answered.envelope();
+        }
         if let Some(class) = crate::platform_errors::caller_class(self) {
             return class.envelope();
         }
@@ -1012,6 +1017,9 @@ impl ProxyError {
     /// platform mode the status of the class the error reaches the caller
     /// as. Telemetry keeps reading [`Self::status`].
     fn caller_status(&self) -> StatusCode {
+        if let Some(answered) = crate::platform_errors::caller_error(self) {
+            return answered.caller_status();
+        }
         crate::platform_errors::caller_class(self).map_or_else(|| self.status(), |c| c.status())
     }
 }
@@ -1250,6 +1258,9 @@ impl ProxyError {
     }
 
     fn anthropic_envelope(&self) -> AnthropicErrorEnvelope {
+        if let Some(answered) = crate::platform_errors::caller_error(self) {
+            return answered.anthropic_envelope();
+        }
         if let Some(class) = crate::platform_errors::caller_class(self) {
             return AnthropicErrorEnvelope::platform(&class);
         }
@@ -1526,6 +1537,57 @@ pub(crate) mod tests {
         let e = ProxyError::ModelForbidden("gpt-4o".into());
         assert_eq!(e.status(), StatusCode::FORBIDDEN);
         assert_eq!(e.kind(), "permission_denied");
+    }
+
+    #[test]
+    fn platform_mode_answers_a_forbidden_model_like_an_unknown_one() {
+        assert_eq!(
+            render_platform(&ProxyError::ModelForbidden("x".into())),
+            render_platform(&ProxyError::ModelNotFound("x".into()))
+        );
+    }
+
+    /// Status, headers and body, in both envelopes. Only the caller's answer
+    /// changes: the records an operator reads keep the refusal.
+    #[tokio::test]
+    async fn platform_mode_answers_a_forbidden_model_like_an_unknown_one_in_every_envelope() {
+        async fn parts(resp: Response) -> (StatusCode, axum::http::HeaderMap, bytes::Bytes) {
+            let (head, body) = resp.into_parts();
+            let body = axum::body::to_bytes(body, 65536).await.unwrap();
+            (head.status, head.headers, body)
+        }
+        let forbidden = || ProxyError::ModelForbidden("x".into());
+        let unknown = || ProxyError::ModelNotFound("x".into());
+
+        let (a, b) = in_platform_mode(|| (forbidden().into_response(), unknown().into_response()));
+        let (a, b) = (parts(a).await, parts(b).await);
+        assert_eq!(a.0, StatusCode::NOT_FOUND);
+        assert_eq!(a, b);
+        let (a, b) = in_platform_mode(|| {
+            (
+                forbidden().into_anthropic_response(),
+                unknown().into_anthropic_response(),
+            )
+        });
+        assert_eq!(parts(a).await, parts(b).await);
+        assert_eq!(
+            in_platform_mode(|| forbidden().anthropic_body()),
+            in_platform_mode(|| unknown().anthropic_body())
+        );
+
+        let err = forbidden();
+        assert_eq!(err.status(), StatusCode::FORBIDDEN);
+        assert_eq!(crate::attempt::error_class(&err), "permission_denied");
+        assert_eq!(
+            crate::attempt::gateway_error_message(&err),
+            "API key is not allowed to use model \"x\""
+        );
+        // Off platform mode the refusal is the 403 it always was.
+        assert_eq!(forbidden().into_response().status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            forbidden().into_anthropic_response().status(),
+            StatusCode::FORBIDDEN
+        );
     }
 
     #[test]

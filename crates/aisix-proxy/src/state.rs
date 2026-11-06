@@ -365,7 +365,8 @@ pub struct ProxyStateInner {
     /// request before routing (first match wins). Empty = layer no-ops.
     pub url_rewrites: Arc<[crate::rewrite::CompiledRewrite]>,
     /// `proxy.expose_debug_headers`: whether chat completions carry the
-    /// `x-aisix-call-id` / `-served-by` / `-route` / `-cache*` headers.
+    /// `x-aisix-call-id` / `-served-by` / `-route` / `-cache*` headers. In
+    /// platform mode it governs the other endpoints' `-cache*` headers too.
     pub expose_debug_headers: bool,
     /// Config-freshness probe for `GET /readyz`: returns the time since the
     /// config source last applied a snapshot (`None` = never applied). Every
