@@ -212,6 +212,10 @@ pub enum BootError {
     Listen(std::io::Error),
     #[error("the browser listener (CP_HTTP_ADDR) stopped: {0}")]
     Serve(std::io::Error),
+    #[error("cannot listen on CP_DP_ADDR: {0}")]
+    DpListen(std::io::Error),
+    #[error("the gateway listener's TLS (CP_DP_HOSTS): {0}")]
+    DpTls(#[from] crate::dp::listener::TlsSetupError),
 }
 
 #[cfg(test)]

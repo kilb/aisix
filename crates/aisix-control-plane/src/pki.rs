@@ -135,6 +135,8 @@ pub struct Pki {
     ca: Certificate,
     ca_key: KeyPair,
     ca_pem: String,
+    /// The stored certificate's DER, as gateways hold it.
+    ca_der: Vec<u8>,
     platform_id_key: [u8; PLATFORM_ID_KEY_LEN],
 }
 
@@ -222,6 +224,7 @@ impl Pki {
             ca,
             ca_key,
             ca_pem,
+            ca_der: pem.contents,
             platform_id_key,
         })
     }
@@ -229,6 +232,12 @@ impl Pki {
     /// The CA certificate, PEM: what gateways trust the control plane by.
     pub fn ca_pem(&self) -> &str {
         &self.ca_pem
+    }
+
+    /// The CA certificate, DER: the root the gateway listener verifies
+    /// client certificates against.
+    pub fn ca_der(&self) -> &[u8] {
+        &self.ca_der
     }
 
     /// The platform id key, as 64 hex characters: the value gateways are

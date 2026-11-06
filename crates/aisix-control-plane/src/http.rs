@@ -1,5 +1,6 @@
-//! The browser listener's routes, and the role table they are checked
-//! against.
+//! The routes of both listeners, and the role table they are checked
+//! against: the browser listener's ([`browser_router`]) and the gateway
+//! listener's ([`dp_router`]).
 //!
 //! Rules for every handler, checked by the tests at the end of this file:
 //! - Each route has a [`ROUTE_ROLES`] row, and its handler takes the
@@ -7,24 +8,27 @@
 //!   it names.
 //! - A request body is taken as [`ApiJson`], never as `axum::Json`, so a
 //!   body that cannot be read answers in the error envelope.
-//! - Routes are added with `.route(...)` only, before the router's
-//!   `only_listed_routes` layer.
+//! - Routes are added with `.route(...)` only, before the router's listing
+//!   layer: `only_listed_routes` on the browser router, which admits the
+//!   rows of every role but [`MinRole::Dp`], and `only_listed_dp_routes` on
+//!   the gateway router, which admits only those. Neither listener serves
+//!   the other's routes.
 
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{DefaultBodyLimit, FromRequest, MatchedPath, Request};
 use axum::http::{Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, patch, post};
+use axum::routing::{any, get, patch, post};
 use axum::{Json, Router};
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 
 use crate::auth::{MemberRole, OperatorRole};
 use crate::error::{ApiError, Detail};
-use crate::{audit, gateways, operators, AppState};
+use crate::{audit, dp, gateways, operators, AppState};
 
-/// The largest request body the browser listener reads.
+/// The largest request body either listener reads.
 const MAX_BODY_BYTES: usize = 1 << 20;
 
 /// The API contract version `/admin/session` reports. The Dashboard refuses
@@ -40,11 +44,13 @@ pub enum MinRole {
     Op(OperatorRole),
     /// A member of an active tenant with one of these roles (`MemberAuth`).
     Member(&'static [MemberRole]),
-    /// A gateway, by its client certificate (`DpIdentity`).
+    /// A gateway, by its client certificate (`DpIdentity`). Only the
+    /// gateway listener serves these rows.
     Dp,
 }
 
-/// Every route's minimum role, as `(method, path, minimum)`.
+/// Every route's minimum role, as `(method, path, minimum)`. The method
+/// `ANY` stands for every method.
 ///
 /// `every_route_checks_identity` fails when a mounted route has no row, a
 /// row names no mounted route, or a handler lacks the extractor its row
@@ -84,6 +90,13 @@ pub const ROUTE_ROLES: &[(&str, &str, MinRole)] = &[
         "/admin/gateways/credentials/{dp_id}/revoke",
         MinRole::Op(OperatorRole::Admin),
     ),
+    (
+        "GET",
+        "/admin/gateways/instances",
+        MinRole::Op(OperatorRole::Viewer),
+    ),
+    ("POST", "/dp/heartbeat", MinRole::Dp),
+    ("ANY", "/dp/store/v1/{*rest}", MinRole::Dp),
 ];
 
 /// `/healthz` (no session), `/admin/*` and, as they are added, `/api/*`.
@@ -109,35 +122,63 @@ pub fn browser_router(state: AppState) -> Router {
             "/admin/gateways/credentials/{dp_id}/revoke",
             post(gateways::revoke_credential),
         )
+        .route("/admin/gateways/instances", get(gateways::list_instances))
         .route_layer(axum::middleware::from_fn(only_listed_routes))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(state)
 }
 
-/// Answers `404 not_found` for a route with no [`ROUTE_ROLES`] row: the
-/// run-time backstop for a route added in a way the census does not read.
-/// A HEAD request is served by the GET handler, so it goes by the GET row.
+/// `/dp/*`, for gateways: served on the gateway listener, which attaches
+/// each connection's certificate identity to its requests.
+pub fn dp_router(state: AppState) -> Router {
+    Router::new()
+        .route("/dp/heartbeat", post(dp::heartbeat::heartbeat))
+        .route("/dp/store/v1/{*rest}", any(dp::store::not_found))
+        .route_layer(axum::middleware::from_fn(only_listed_dp_routes))
+        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
+        .with_state(state)
+}
+
+/// Answers `404 not_found` on the browser listener for a route with no
+/// [`ROUTE_ROLES`] row, or a gateway's row: the run-time backstop for a
+/// route added in a way the census does not read.
 async fn only_listed_routes(request: Request, next: Next) -> Response {
-    let listed = {
-        let method = if request.method() == Method::HEAD {
-            "GET"
-        } else {
-            request.method().as_str()
-        };
-        request
-            .extensions()
-            .get::<MatchedPath>()
-            .is_some_and(|path| {
-                ROUTE_ROLES
-                    .iter()
-                    .any(|(m, p, _)| *m == method && *p == path.as_str())
-            })
-    };
-    if listed {
+    if is_listed(&request, false) {
         next.run(request).await
     } else {
         ApiError::not_found().into_response()
     }
+}
+
+/// [`only_listed_routes`] for the gateway listener, which serves only the
+/// gateways' rows.
+async fn only_listed_dp_routes(request: Request, next: Next) -> Response {
+    if is_listed(&request, true) {
+        next.run(request).await
+    } else {
+        ApiError::not_found().into_response()
+    }
+}
+
+/// Whether the request's route has a [`ROUTE_ROLES`] row, a gateway's row
+/// when `dp` is set and any other otherwise. A HEAD request is served by
+/// the GET handler, so it goes by the GET row.
+fn is_listed(request: &Request, dp: bool) -> bool {
+    let method = if request.method() == Method::HEAD {
+        "GET"
+    } else {
+        request.method().as_str()
+    };
+    request
+        .extensions()
+        .get::<MatchedPath>()
+        .is_some_and(|path| {
+            ROUTE_ROLES.iter().any(|(m, p, min)| {
+                (*m == method || *m == "ANY")
+                    && *p == path.as_str()
+                    && matches!(min, MinRole::Dp) == dp
+            })
+        })
 }
 
 /// A JSON request body. A body that cannot be read (not JSON, no
@@ -226,7 +267,7 @@ mod tests {
             let close = closing_paren(src, open).expect("a closed .route( call");
             let call = &src[open + 1..close];
             let path = call.split('"').nth(1).expect("a path literal").to_string();
-            for verb in ["get", "post", "put", "patch", "delete"] {
+            for verb in ["get", "post", "put", "patch", "delete", "any"] {
                 let needle = format!("{verb}(");
                 for (v, _) in call.match_indices(&needle) {
                     // `get(` must not be the tail of a longer name.
@@ -360,8 +401,10 @@ mod tests {
     }
 
     /// Routes reach the routers only through `.route(...)`, which the census
-    /// reads, and every router ends its routes with the layer that refuses a
-    /// route without a row at run time.
+    /// reads; every router ends its routes with one of the layers that
+    /// refuse a route without a row at run time; and each route is on the
+    /// listener its row is for, the gateways' rows on the router with the
+    /// gateway layer and every other row on the one with the browser layer.
     #[test]
     fn routes_are_added_only_in_a_way_the_census_reads() {
         let src = without_comment_lines(production(include_str!("http.rs")));
@@ -378,20 +421,103 @@ mod tests {
                  extend the census first"
             );
         }
-        let layer = ".route_layer(axum::middleware::from_fn(only_listed_routes))";
+        // Each layer, and whether it is the gateway listener's.
+        let layers = [
+            (
+                ".route_layer(axum::middleware::from_fn(only_listed_routes))",
+                false,
+            ),
+            (
+                ".route_layer(axum::middleware::from_fn(only_listed_dp_routes))",
+                true,
+            ),
+        ];
         let routers: Vec<&str> = src.split("Router::new()").skip(1).collect();
-        assert!(!routers.is_empty(), "no router found");
+        assert!(routers.len() >= 2, "found {} routers", routers.len());
+        let mut kinds = Vec::new();
         for router in routers {
             let router = router.split_once(".with_state(").map_or(router, |(r, _)| r);
-            let guarded = router
-                .find(layer)
-                .expect("a router without the only_listed_routes layer");
+            let found: Vec<(usize, bool)> = layers
+                .iter()
+                .filter_map(|(layer, dp)| router.find(layer).map(|at| (at, *dp)))
+                .collect();
+            let [(guarded, dp)] = found[..] else {
+                panic!("a router must end its routes with exactly one listing layer: {found:?}");
+            };
             // A route layer covers only the routes added before it.
             assert!(
                 router.rfind(".route(").is_some_and(|last| last < guarded),
-                "a route is added after the only_listed_routes layer"
+                "a route is added after the listing layer"
+            );
+            for (method, path, _) in mounted_routes(router) {
+                let Some((_, _, min)) = ROUTE_ROLES
+                    .iter()
+                    .find(|(m, p, _)| *m == method && *p == path)
+                else {
+                    // every_route_checks_identity reports it.
+                    continue;
+                };
+                assert_eq!(
+                    matches!(min, MinRole::Dp),
+                    dp,
+                    "{method} {path} is mounted on the {} router, but its row is for the other \
+                     listener",
+                    if dp { "gateway" } else { "browser" }
+                );
+            }
+            kinds.push(dp);
+        }
+        assert!(
+            kinds.contains(&true) && kinds.contains(&false),
+            "both listeners have a router: {kinds:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn each_listener_admits_only_its_own_rows() {
+        use axum::routing::{get, post};
+        use axum::Router;
+
+        // Rows of the other listener, mounted where they do not belong.
+        let browser = Router::new()
+            .route("/healthz", get(|| async { "up" }))
+            .route("/dp/heartbeat", post(|| async { "leaked" }))
+            .route_layer(axum::middleware::from_fn(super::only_listed_routes));
+        let gateway = Router::new()
+            .route(
+                "/dp/store/v1/{*rest}",
+                axum::routing::any(|| async { "store" }),
+            )
+            .route("/admin/session", get(|| async { "leaked" }))
+            .route_layer(axum::middleware::from_fn(super::only_listed_dp_routes));
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("a client");
+        let mut addrs = Vec::new();
+        for app in [browser, gateway] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind");
+            addrs.push(listener.local_addr().expect("an address"));
+            tokio::spawn(async move { axum::serve(listener, app).await });
+        }
+        let status = |addr, method: &str, path: &str| {
+            let method = reqwest::Method::from_bytes(method.as_bytes()).expect("a method");
+            let request = client.request(method, format!("http://{addr}{path}"));
+            async move { request.send().await.expect("send").status().as_u16() }
+        };
+        assert_eq!(status(addrs[0], "GET", "/healthz").await, 200);
+        assert_eq!(status(addrs[0], "POST", "/dp/heartbeat").await, 404);
+        // `ANY` admits every method.
+        for method in ["GET", "PUT", "DELETE", "POST", "HEAD"] {
+            assert_eq!(
+                status(addrs[1], method, "/dp/store/v1/ns/k").await,
+                200,
+                "{method}"
             );
         }
+        assert_eq!(status(addrs[1], "GET", "/admin/session").await, 404);
     }
 
     #[tokio::test]

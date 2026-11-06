@@ -272,6 +272,49 @@ impl TestCp {
         format!("http://{}{path}", self.running.http_addr)
     }
 
+    /// Where the gateway listener is bound.
+    pub fn dp_addr(&self) -> SocketAddr {
+        self.running
+            .dp_addr
+            .expect("the gateway listener is serving")
+    }
+
+    /// Issues a gateway credential as `admin`, which must succeed.
+    pub async fn issue_bundle(&self, admin: &OperatorSession, name: &str) -> Bundle {
+        let r = self
+            .send(
+                "POST",
+                "/admin/gateways/credentials",
+                Some(admin.cookie()),
+                Some(serde_json::json!({ "name": name })),
+            )
+            .await;
+        assert_eq!(r.status, 201, "issue {name}: {r:?}");
+        let text = |field: &str| {
+            r.body[field]
+                .as_str()
+                .unwrap_or_else(|| panic!("{field} in {r:?}"))
+                .to_string()
+        };
+        Bundle {
+            dp_id: text("dp_id"),
+            cert_pem: text("cert_pem"),
+            key_pem: text("key_pem"),
+            ca_pem: text("ca_pem"),
+        }
+    }
+
+    /// A gateway's REST client for `bundle`, on this control plane's
+    /// gateway listener.
+    pub fn dp_client(&self, bundle: &Bundle) -> DpClient {
+        DpClient::new(
+            self.dp_addr(),
+            &bundle.cert_pem,
+            &bundle.key_pem,
+            &bundle.ca_pem,
+        )
+    }
+
     pub fn state(&self) -> &AppState {
         &self.running.state
     }
@@ -393,23 +436,78 @@ impl TestCp {
             request = request.body(body);
         }
         let response = request.send().await.expect("send the request");
-        let status = response.status().as_u16();
-        let headers = response.headers().clone();
-        let set_cookie = headers
-            .get(reqwest::header::SET_COOKIE)
-            .map(|v| v.to_str().expect("an ASCII Set-Cookie").to_string());
-        let text = response.text().await.expect("read the body");
-        let body = if text.is_empty() {
-            Value::Null
-        } else {
-            serde_json::from_str(&text).unwrap_or(Value::String(text))
-        };
-        Resp {
-            status,
-            body,
-            set_cookie,
-            headers,
+        Resp::read(response).await
+    }
+}
+
+/// A gateway credential as issued: what a gateway is given.
+#[derive(Debug, Clone)]
+pub struct Bundle {
+    pub dp_id: String,
+    pub cert_pem: String,
+    pub key_pem: String,
+    pub ca_pem: String,
+}
+
+/// A gateway's REST client, built the way the gateway builds it
+/// (`build_client` in `crates/aisix-server/src/heartbeat.rs`): the key and
+/// the certificate as one identity, the CA as a root, HTTP/1.1 only.
+/// `localhost` resolves to the listener's address.
+pub struct DpClient {
+    client: reqwest::Client,
+    base: String,
+}
+
+impl DpClient {
+    pub fn new(addr: SocketAddr, cert_pem: &str, key_pem: &str, ca_pem: &str) -> DpClient {
+        let mut identity = key_pem.to_string();
+        if !identity.ends_with('\n') {
+            identity.push('\n');
         }
+        identity.push_str(cert_pem);
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(10))
+            .identity(reqwest::Identity::from_pem(identity.as_bytes()).expect("an mTLS identity"))
+            .add_root_certificate(
+                reqwest::Certificate::from_pem(ca_pem.as_bytes()).expect("the CA"),
+            )
+            .http1_only()
+            .use_rustls_tls()
+            .resolve("localhost", addr)
+            .build()
+            .expect("the gateway's REST client");
+        DpClient {
+            client,
+            base: format!("https://localhost:{}", addr.port()),
+        }
+    }
+
+    /// Sends `method path` with a JSON `body`; an error when the request
+    /// never got an answer (a refused handshake, say).
+    pub async fn try_send(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+    ) -> Result<Resp, reqwest::Error> {
+        let method = reqwest::Method::from_bytes(method.as_bytes()).expect("an HTTP method");
+        let mut request = self.client.request(method, format!("{}{path}", self.base));
+        if let Some(body) = body {
+            request = request.json(&body);
+        }
+        Ok(Resp::read(request.send().await?).await)
+    }
+
+    pub async fn send(&self, method: &str, path: &str, body: Option<Value>) -> Resp {
+        self.try_send(method, path, body)
+            .await
+            .unwrap_or_else(|e| panic!("{method} {path} got no answer: {e}"))
+    }
+
+    /// `POST /dp/heartbeat` with `body`.
+    pub async fn heartbeat(&self, body: Value) -> Resp {
+        self.send("POST", "/dp/heartbeat", Some(body)).await
     }
 }
 
@@ -445,6 +543,28 @@ pub struct Resp {
     pub body: Value,
     pub set_cookie: Option<String>,
     pub headers: reqwest::header::HeaderMap,
+}
+
+impl Resp {
+    async fn read(response: reqwest::Response) -> Resp {
+        let status = response.status().as_u16();
+        let headers = response.headers().clone();
+        let set_cookie = headers
+            .get(reqwest::header::SET_COOKIE)
+            .map(|v| v.to_str().expect("an ASCII Set-Cookie").to_string());
+        let text = response.text().await.expect("read the body");
+        let body = if text.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_str(&text).unwrap_or(Value::String(text))
+        };
+        Resp {
+            status,
+            body,
+            set_cookie,
+            headers,
+        }
+    }
 }
 
 /// A file in the system temp directory, removed on drop.

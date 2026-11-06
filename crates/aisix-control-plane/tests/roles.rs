@@ -42,9 +42,9 @@ fn fixture(method: &str, path: &str, target: &SeededOperator) -> (String, Option
             format!("/admin/operators/{}", target.id),
             Some(json!({"display_name": "roles-target"})),
         ),
-        ("GET", "/admin/environment") | ("GET", "/admin/gateways/credentials") => {
-            (path.to_string(), None)
-        }
+        ("GET", "/admin/environment")
+        | ("GET", "/admin/gateways/credentials")
+        | ("GET", "/admin/gateways/instances") => (path.to_string(), None),
         ("POST", "/admin/gateways/credentials") => {
             (path.to_string(), Some(json!({"name": "roles-gateway"})))
         }

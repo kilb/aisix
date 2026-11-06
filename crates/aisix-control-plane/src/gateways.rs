@@ -1,5 +1,6 @@
-//! Gateway credentials, the deployment bundle a gateway boots from, and the
-//! environment view that bundle is built from.
+//! Gateway credentials, the deployment bundle a gateway boots from, the
+//! environment view that bundle is built from, and the gateway instances
+//! that have reported by heartbeat.
 //!
 //! A credential is a client certificate of the control plane's CA (see
 //! [`crate::pki`]), identified by its `dp_id`. Issuing one returns the
@@ -338,6 +339,96 @@ pub async fn revoke_credential(
         })
         .await?;
     Ok(Json(view))
+}
+
+/// The longest stale window applied: an instance silent for ten years is
+/// offline whatever `CP_INSTANCE_STALE_SECS` says, and a longer interval
+/// would not fit the timestamp arithmetic.
+const MAX_STALE_SECS: u64 = 10 * 365 * 86_400;
+
+#[derive(sqlx::FromRow)]
+struct InstanceRow {
+    dp_id: Uuid,
+    credential_name: String,
+    instance_id: String,
+    hostname: String,
+    version: String,
+    uptime_seconds: i64,
+    applied_revision: i64,
+    config_hash: Option<String>,
+    online: bool,
+    last_seen_at: DateTime<Utc>,
+    exporter_health: Value,
+    rejected_count: i64,
+}
+
+/// `GET /admin/gateways/instances`: every gateway process that has sent a
+/// heartbeat, first seen first. `online` means heard from within
+/// `CP_INSTANCE_STALE_SECS`; `version_matches_cp` is [`version_matches`]
+/// against this control plane's version.
+pub async fn list_instances(
+    auth: OperatorAuth,
+    State(state): State<AppState>,
+) -> Result<Json<Value>, ApiError> {
+    auth.require(OperatorRole::Viewer)?;
+    let stale_secs = state.cfg.instance_stale_secs.min(MAX_STALE_SECS) as f64;
+    let rows: Vec<InstanceRow> = sqlx::query_as(
+        "SELECT i.dp_id, c.name AS credential_name, i.instance_id, i.hostname, i.version, \
+         i.uptime_seconds, i.applied_revision, i.config_hash, \
+         i.last_seen_at > now() - make_interval(secs => $1) AS online, i.last_seen_at, \
+         i.exporter_health, jsonb_array_length(i.rejected_resources)::bigint AS rejected_count \
+         FROM dp_instances i JOIN dp_credentials c ON c.dp_id = i.dp_id \
+         ORDER BY i.first_seen_at, i.dp_id, i.instance_id",
+    )
+    .bind(stale_secs)
+    .fetch_all(state.db.pool())
+    .await
+    .map_err(DbError::from)?;
+    let cp_version = &*aisix_core::HEARTBEAT_VERSION;
+    let items: Vec<Value> = rows
+        .into_iter()
+        .map(|row| {
+            json!({
+                "dp_id": row.dp_id,
+                "credential_name": row.credential_name,
+                "instance_id": row.instance_id,
+                "hostname": row.hostname,
+                "version_matches_cp": version_matches(&row.version, cp_version),
+                "version": row.version,
+                "uptime_seconds": row.uptime_seconds,
+                "applied_revision": row.applied_revision,
+                "config_hash": row.config_hash,
+                "online": row.online,
+                "last_seen_at": row.last_seen_at,
+                "exporter_health": row.exporter_health,
+                "rejected_count": row.rejected_count,
+            })
+        })
+        .collect();
+    Ok(Json(json!({ "items": items })))
+}
+
+/// Whether a gateway reporting the heartbeat version `instance` runs the
+/// build of this control plane reporting `cp` (both are
+/// `aisix_core::HEARTBEAT_VERSION`, stamped the same way): the same release
+/// when both are stamped releases (`1.9.0+sha-<sha>`; the sha is build
+/// metadata and does not count, a pre-release such as `-rc.1` does), the
+/// same commit when both are unreleased builds (`dev+sha-<sha>`). `None`
+/// when it cannot be told: an unstamped `dev`, a release against an
+/// unreleased build, or a version of neither shape.
+pub fn version_matches(instance: &str, cp: &str) -> Option<bool> {
+    if let (Ok(instance), Ok(cp)) = (semver::Version::parse(instance), semver::Version::parse(cp)) {
+        return Some(instance.cmp_precedence(&cp).is_eq());
+    }
+    fn dev_sha(version: &str) -> Option<&str> {
+        version
+            .strip_prefix("dev+sha-")
+            .filter(|sha| !sha.is_empty())
+    }
+    match (dev_sha(instance), dev_sha(cp)) {
+        (Some(instance), Some(cp)) => Some(instance == cp),
+        _ => None,
+    }
 }
 
 /// Notifies [`CREDENTIALS_CHANNEL`] with `dp_id` when the transaction
