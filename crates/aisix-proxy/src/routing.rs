@@ -5022,12 +5022,25 @@ mod tests {
             // The resolver every other reader must go through.
             "aisix-core/src/models/pricing.rs",
         ];
-        /// Sources whose own `cost` is another price: the control plane's
-        /// pricing engine calls the platform's cost price `cost` (its price
-        /// rows, its lookup, the cost on a priced row), and it takes no
-        /// `Model`, so it cannot read a model's price off the field. Its
-        /// `tests/` stay scanned.
+        /// Directories whose `.cost` is the control plane's own price
+        /// vocabulary (its price rows, its cost lookup, the cost on a priced
+        /// row). Each stays exempt only while it cannot name a gateway
+        /// model's price: a code line in it naming `Model` or `ModelCost`
+        /// is reported like a read. `tests/` directories stay scanned.
         const OWN_COST_VOCABULARY: [&str; 1] = ["/crates/aisix-pricing/src/"];
+        const MODEL_PRICE_TYPES: [&str; 2] = ["Model", "ModelCost"];
+
+        /// `ident` occurs in `line` as a whole identifier.
+        fn names(line: &str, ident: &str) -> bool {
+            let is_ident = |c: char| c.is_alphanumeric() || c == '_';
+            line.match_indices(ident).any(|(at, _)| {
+                !line[..at].chars().next_back().is_some_and(is_ident)
+                    && !line[at + ident.len()..]
+                        .chars()
+                        .next()
+                        .is_some_and(is_ident)
+            })
+        }
 
         fn walk(dir: &Path, needle: &str, out: &mut Vec<(String, usize, String)>) {
             for e in std::fs::read_dir(dir).expect("crates dir is readable") {
@@ -5039,12 +5052,23 @@ mod tests {
                     walk(&path, needle, out);
                 } else if path.extension().is_some_and(|x| x == "rs") {
                     let name = path.to_string_lossy().replace('\\', "/");
-                    if AUTHORIZED.iter().any(|ok| name.ends_with(ok))
-                        || OWN_COST_VOCABULARY.iter().any(|dir| name.contains(dir))
-                    {
+                    if AUTHORIZED.iter().any(|ok| name.ends_with(ok)) {
                         continue;
                     }
                     let src = std::fs::read_to_string(&path).expect("source is utf-8");
+                    if OWN_COST_VOCABULARY.iter().any(|dir| name.contains(dir)) {
+                        for (i, line) in src.lines().enumerate() {
+                            let code = !line.trim_start().starts_with("//");
+                            if code && MODEL_PRICE_TYPES.iter().any(|t| names(line, t)) {
+                                let why = format!(
+                                    "exempt, yet names a model price type: {}",
+                                    line.trim()
+                                );
+                                out.push((name.clone(), i + 1, why));
+                            }
+                        }
+                        continue;
+                    }
                     for (i, line) in src.lines().enumerate() {
                         // `.cost` as a field access, not `cost_usd` /
                         // `cost_saved_usd` / a local named `*_cost`, and

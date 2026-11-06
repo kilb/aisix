@@ -146,13 +146,10 @@ pub struct CostPriced {
     pub source: CostSource,
 }
 
-/// Something a charge did not bill as the row reads, or did not take as
-/// the row says.
+/// Something a charge did not take as the row says.
 #[derive(Serialize, Debug, Clone, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PricingWarning {
-    /// The rates in use carry no rate for this quantity, so it is not billed.
-    UnpricedQuantity { dimension: Dimension, quantity: u64 },
     /// The caller asked for a tier and the upstream reported none served;
     /// the default rates applied.
     ServedTierUnreported { requested: String },
@@ -183,6 +180,10 @@ pub enum PricingError {
     /// upstream's own string, so it stays operator-side.
     #[error("the sell price has no rates for service tier {tier:?}")]
     MissingTierPrice { tier: String },
+    /// The row bills a quantity the rates in use carry no rate for, even by
+    /// fallback. It is refused rather than billed at nothing.
+    #[error("the sell price has no rate for {dimension}")]
+    MissingDimensionPrice { dimension: Dimension },
     #[error("the usage counters contradict each other: {0:?}")]
     InconsistentUsage(Inconsistency),
     /// A successful row with no tokens of an operation priced in other units.
@@ -203,6 +204,7 @@ impl PricingError {
             PricingError::MissingPrice { .. } => "missing_price",
             PricingError::InvalidPrice { .. } => "invalid_price",
             PricingError::MissingTierPrice { .. } => "missing_tier_price",
+            PricingError::MissingDimensionPrice { .. } => "missing_dimension_price",
             PricingError::InconsistentUsage(_) => "inconsistent_usage",
             PricingError::UnpricedOperation(_) => "unpriced_operation",
             PricingError::Overflow => "overflow",
@@ -255,16 +257,18 @@ impl PricingError {
 ///    caller requested a tier and the upstream reported none, the row is
 ///    billed at `default` and warned `ServedTierUnreported`; a batch row is
 ///    billed at `batch` and not warned.
-/// 10. Each dimension with a quantity is a line at its rate; one with no rate
-///     is warned `UnpricedQuantity` and not billed.
+/// 10. Each dimension with a quantity is a line at its rate. A quantity the
+///     rates carry no rate for, even by fallback, is `MissingDimensionPrice`:
+///     the upstream charged for it, so it is never billed at nothing.
 /// 11. The tenant's discount in effect applies, unless its own override
 ///     priced the row; an unreadable discount revision is `InvalidPrice`.
 /// 12. The charge is `⌈Σ quantity × rate × (10000 − bps) / 10¹⁰⌉` µ$: the
 ///     one rounding, upward, with the discount inside it.
 /// 13. The cost is the dispatched upstream's cost price at the same tier and
 ///     band, `⌈Σ quantity × rate / 10⁶⌉` µ$, with no discount and no
-///     warnings. A dimension it has no rate for adds nothing; a tier it lacks,
-///     or an unreadable cost revision, leaves the cost unknown.
+///     warnings. A tier it lacks, a quantity it has no rate for, or an
+///     unreadable cost revision leaves the cost unknown, never a cost that
+///     leaves something out.
 pub fn price_event(
     book: &PriceBook,
     usage: &BillableUsage,
@@ -351,8 +355,8 @@ pub fn price_event(
         }
     }
 
-    let (lines, unpriced) = lines_at(selected.rates, &q);
-    warnings.extend(unpriced);
+    let lines = lines_at(selected.rates, &q)
+        .map_err(|dimension| PricingError::MissingDimensionPrice { dimension })?;
 
     let discount = if sell.tenant_override {
         None
@@ -364,7 +368,9 @@ pub fn price_event(
         }
     };
     // The book admits only 0..=10000 bps.
-    let kept_bps = WHOLE_BPS - discount.map_or(0, |d| u128::from(d.bps));
+    let kept_bps = WHOLE_BPS
+        .checked_sub(discount.map_or(0, |d| u128::from(d.bps)))
+        .ok_or(PricingError::Overflow)?;
     let charge = ceil_micro_usd(sum(&lines) * kept_bps, PER_MILLION * WHOLE_BPS)?;
 
     let cost = cost_of(book, u, &tier, &q, price_instant)?;
@@ -386,7 +392,8 @@ pub fn price_event(
 
 /// What the dispatched upstream cost the platform, at `tier` and the band
 /// the row selects. `None` when the row does not name its upstream, or the
-/// book knows no usable cost for it at that tier.
+/// book knows no usable cost for it: no readable cost price, no rates for
+/// the tier, or no rate for one of the row's quantities.
 fn cost_of(
     book: &PriceBook,
     u: &BillableUsage,
@@ -403,7 +410,9 @@ fn cost_of(
     let Some(selected) = card.select(tier, q.input_total()) else {
         return Ok(None);
     };
-    let (lines, _) = lines_at(selected.rates, q);
+    let Ok(lines) = lines_at(selected.rates, q) else {
+        return Ok(None);
+    };
     let amount = ceil_micro_usd(sum(&lines), PER_MILLION)?;
     Ok(Some(CostPriced { amount, source }))
 }
@@ -436,29 +445,23 @@ fn unbilled(
     }
 }
 
-/// A line for each dimension `q` bills that `rates` prices, and a warning
-/// for each it does not.
-fn lines_at(rates: &Rates, q: &Quantities) -> (Vec<ChargeLine>, Vec<PricingWarning>) {
+/// A line for each dimension `q` bills, at its rate in `rates`; `Err` with
+/// the first dimension that has a quantity and no rate, even by fallback.
+fn lines_at(rates: &Rates, q: &Quantities) -> Result<Vec<ChargeLine>, Dimension> {
     let mut lines = Vec::new();
-    let mut unpriced = Vec::new();
     for dimension in Dimension::ALL {
         let quantity = q.get(dimension);
         if quantity == 0 {
             continue;
         }
-        match rates.rate_for(dimension) {
-            Some(rate) => lines.push(ChargeLine {
-                dimension,
-                quantity,
-                rate,
-            }),
-            None => unpriced.push(PricingWarning::UnpricedQuantity {
-                dimension,
-                quantity,
-            }),
-        }
+        let rate = rates.rate_for(dimension).ok_or(dimension)?;
+        lines.push(ChargeLine {
+            dimension,
+            quantity,
+            rate,
+        });
     }
-    (lines, unpriced)
+    Ok(lines)
 }
 
 /// `Σ quantity × rate`, exact: at most one line per dimension, and
@@ -1120,21 +1123,24 @@ mod tests {
     }
 
     #[test]
-    fn a_web_search_without_a_rate_bills_the_tokens_and_says_what_it_skipped() {
-        let p = price_event(
-            &book_without_web_search(),
-            &row(r#"{"prompt_tokens":10,"web_search_requests":2}"#),
-            RECEIVED,
-        )
-        .unwrap();
-        assert_eq!(p.charge, MicroUsd(10));
+    fn a_web_search_without_a_rate_is_refused_not_billed_at_nothing() {
+        // Ruling P2-R15, departing from the brief's sketch (which billed the
+        // tokens and warned): the upstream charged for the searches, so a
+        // card that cannot price them cannot price the row.
+        let book = book_without_web_search();
         assert_eq!(
-            p.warnings,
-            vec![PricingWarning::UnpricedQuantity {
-                dimension: Dimension::WebSearch,
-                quantity: 2
-            }]
+            price_event(
+                &book,
+                &row(r#"{"prompt_tokens":10,"web_search_requests":2}"#),
+                RECEIVED
+            ),
+            Err(PricingError::MissingDimensionPrice {
+                dimension: Dimension::WebSearch
+            })
         );
+        // The same card prices a row that searched nothing.
+        let p = price_event(&book, &row(r#"{"prompt_tokens":10}"#), RECEIVED).unwrap();
+        assert_eq!((p.charge, p.warnings), (MicroUsd(10), vec![]));
     }
 
     #[test]
@@ -1273,6 +1279,42 @@ mod tests {
         assert_eq!((p.price_instant, p.warnings), (ts(OCCURRED), vec![]));
     }
 
+    #[test]
+    fn a_late_row_is_priced_when_it_occurred_not_when_it_arrived() {
+        // Review Focus 2: revision 2 of each price starts between the event
+        // and its receipt.
+        let boundary = ts(OCCURRED) + TimeDelta::minutes(10);
+        let received = boundary + TimeDelta::minutes(20);
+        let b = boundary.to_rfc3339();
+        let one = |input: &str| json!({"default": {"base": {"input": input, "output": "1"}}});
+        let book = book_of(
+            vec![
+                sell(1, "m", None, T0, Some(one("1"))),
+                sell(2, "m", None, &b, Some(one("9"))),
+            ],
+            vec![cost(3, None, T0, one("0.4")), cost(4, None, &b, one("0.8"))],
+            vec![discount(5, "t", &b, 5_000)],
+        );
+        let u =
+            row(r#"{"prompt_tokens":1000,"upstream_provider":"openai","upstream_model":"up-1"}"#);
+        let p = price_event(&book, &u, received).unwrap();
+        assert_eq!(p.price_instant, ts(OCCURRED));
+        assert_eq!(
+            (p.sell.unwrap().revision_id, p.charge, p.discount),
+            (1, MicroUsd(1000), None)
+        );
+        assert_eq!(
+            p.cost.map(|c| c.source),
+            Some(CostSource::Upstream { revision_id: 3 })
+        );
+        // At the boundary instant the new revisions price it.
+        let mut at_boundary = u.clone();
+        at_boundary.occurred_at = boundary;
+        let p = price_event(&book, &at_boundary, received).unwrap();
+        assert_eq!((p.sell.unwrap().revision_id, p.charge), (2, MicroUsd(4500)));
+        assert_eq!(p.cost.map(|c| c.amount), Some(MicroUsd(800)));
+    }
+
     // ---- cost ----
 
     #[test]
@@ -1332,6 +1374,12 @@ mod tests {
             r#"{{"prompt_tokens":1000,"service_tier":"flex",{upstream}}}"#
         ));
         assert_eq!((p.charge, p.cost), (MicroUsd(250), None));
+        // A quantity the cost card has no rate for leaves the cost unknown,
+        // never a cost without it; the sell card prices the search.
+        let p = at(&format!(
+            r#"{{"prompt_tokens":1000,"web_search_requests":1,{upstream}}}"#
+        ));
+        assert_eq!((p.charge, p.cost), (MicroUsd(5_500), None));
         // Without both halves of the upstream's name there is no cost.
         for json in [
             r#"{"prompt_tokens":1000}"#,
@@ -1340,6 +1388,70 @@ mod tests {
         ] {
             assert_eq!(at(json).cost, None, "{json}");
         }
+    }
+
+    #[test]
+    fn the_cost_band_and_tier_are_the_rows_own() {
+        let book = book_of(
+            vec![sell(1, "m", None, T0, Some(test_card()))],
+            vec![cost(2, None, T0, test_card())],
+            vec![],
+        );
+        let up = r#""upstream_provider":"openai","upstream_model":"up-1""#;
+        let cost = |json: String| {
+            price_event(&book, &row(&json), RECEIVED)
+                .unwrap()
+                .cost
+                .map(|c| c.amount)
+        };
+        // Cached input counts toward the cost card's band too:
+        // 100000 × 2 + 100001 × 0.2 = 220000.2, rounded up.
+        assert_eq!(
+            cost(format!(
+                r#"{{"prompt_tokens":100000,"cache_read_tokens":100001,{up}}}"#
+            )),
+            Some(MicroUsd(220_001))
+        );
+        // A batch row is costed at the cost card's batch tier, whatever it
+        // reports.
+        assert_eq!(
+            cost(format!(
+                r#"{{"is_batch":true,"service_tier":"default","prompt_tokens":1000,{up}}}"#
+            )),
+            Some(MicroUsd(500))
+        );
+    }
+
+    #[test]
+    fn an_unreadable_key_cost_leaves_the_cost_unknown_and_the_charge_priced() {
+        // P2-R14 at the engine: the upstream's own cost is never substituted
+        // for the key's unreadable one.
+        let book = book_of(
+            vec![sell(1, "m", None, T0, Some(test_card()))],
+            vec![
+                cost(
+                    2,
+                    None,
+                    T0,
+                    json!({"default": {"base": {"input": "0.4", "output": "1"}}}),
+                ),
+                cost(
+                    3,
+                    Some("pk-1"),
+                    T0,
+                    json!({"default": {"base": {"input": "0.3"}}}),
+                ),
+            ],
+            vec![],
+        );
+        let u = row(
+            r#"{"prompt_tokens":1000,"provider_key_id":"pk-1","upstream_provider":"openai","upstream_model":"up-1"}"#,
+        );
+        let p = price_event(&book, &u, RECEIVED).unwrap();
+        assert_eq!(
+            (p.outcome, p.charge, p.cost),
+            (Outcome::Charged, MicroUsd(1000), None)
+        );
     }
 
     // ---- what a charge records ----
@@ -1392,7 +1504,7 @@ mod tests {
     #[test]
     fn a_priced_event_serializes_with_the_stored_names() {
         let book = book_of(
-            vec![sell(1, "m", None, T0, Some(card_without_web_search()))],
+            vec![sell(1, "m", None, T0, Some(test_card()))],
             vec![cost(
                 2,
                 None,
@@ -1402,7 +1514,7 @@ mod tests {
             vec![discount(3, "t", T0, 2_500)],
         );
         let u = row(
-            r#"{"prompt_tokens":10,"web_search_requests":2,"upstream_provider":"openai","upstream_model":"up-1"}"#,
+            r#"{"prompt_tokens":10,"requested_service_tier":"flex","upstream_provider":"openai","upstream_model":"up-1"}"#,
         );
         let p = serde_json::to_value(price_event(&book, &u, RECEIVED).unwrap()).unwrap();
         assert_eq!(
@@ -1413,12 +1525,12 @@ mod tests {
                 "outcome": "charged", "charge": 8,
                 "sell": {"revision_id": 1, "tenant_override": false},
                 "discount": {"revision_id": 3, "bps": 2500},
-                "service_tier": "default", "requested_service_tier": null,
+                "service_tier": "default", "requested_service_tier": "flex",
                 "long_context_above": null,
                 "lines": [{"dimension": "input", "quantity": 10, "rate": "1"}],
                 "cost": {"amount": 4, "source": {"kind": "upstream", "revision_id": 2}},
                 "estimated": false,
-                "warnings": [{"kind": "unpriced_quantity", "dimension": "web_search", "quantity": 2}],
+                "warnings": [{"kind": "served_tier_unreported", "requested": "flex"}],
                 "engine_version": ENGINE_VERSION,
             })
         );
@@ -1437,13 +1549,6 @@ mod tests {
         assert_eq!(
             serde_json::to_value(clamped).unwrap(),
             json!({"kind": "occurred_at_clamped", "occurred_at": "2026-11-06T00:00:00Z"})
-        );
-        let unreported = PricingWarning::ServedTierUnreported {
-            requested: "flex".into(),
-        };
-        assert_eq!(
-            serde_json::to_value(unreported).unwrap(),
-            json!({"kind": "served_tier_unreported", "requested": "flex"})
         );
     }
 
@@ -1475,6 +1580,12 @@ mod tests {
                 "missing_tier_price",
             ),
             (
+                PricingError::MissingDimensionPrice {
+                    dimension: Dimension::WebSearch,
+                },
+                "missing_dimension_price",
+            ),
+            (
                 PricingError::InconsistentUsage(Inconsistency::CacheWriteSplitMismatch),
                 "inconsistent_usage",
             ),
@@ -1487,6 +1598,14 @@ mod tests {
             assert_eq!(e.code(), code);
             assert!(!e.to_string().is_empty(), "{code}");
         }
+    }
+
+    #[test]
+    fn an_amount_past_i64_is_an_error_never_a_zero_charge() {
+        let d = PER_MILLION * WHOLE_BPS;
+        let max = u128::try_from(i64::MAX).unwrap();
+        assert_eq!(ceil_micro_usd(max * d, d), Ok(MicroUsd(i64::MAX)));
+        assert_eq!(ceil_micro_usd(max * d + 1, d), Err(PricingError::Overflow));
     }
 
     #[test]
@@ -1703,6 +1822,22 @@ mod tests {
         m
     }
 
+    /// One unit of one dimension on an otherwise empty row: the rows the one
+    /// rounding decides.
+    fn one_unit() -> impl Strategy<Value = BillableUsage> {
+        (0..Dimension::ALL.len()).prop_map(|i| {
+            let zero = BillableUsage {
+                event_id: "e".into(),
+                occurred_at: ts(OCCURRED),
+                team_id: "t".into(),
+                requested_model_id: "m".into(),
+                status_code: 200,
+                ..BillableUsage::default()
+            };
+            one_more(&zero, Dimension::ALL[i])
+        })
+    }
+
     proptest! {
         #[test]
         fn adding_a_token_never_lowers_the_charge(
@@ -1743,9 +1878,13 @@ mod tests {
 
         /// A 100% discount (10000 bps) is valid and prices any row at 0
         /// (`a_full_discount_prices_a_row_at_zero`), so it is left out here.
+        /// Half the rows are one unit of one dimension, whose exact amount
+        /// is a fraction of a µ$ that only rounding up keeps billable.
         #[test]
         fn a_billable_row_is_never_free(
-            u in consistent_usage(),
+            // Boxed: the union's value trees overflow a debug test thread's
+            // stack otherwise.
+            u in prop_oneof![consistent_usage().boxed(), one_unit().boxed()],
             card in synthetic_card(1),
             bps in 0u16..10_000,
         ) {
