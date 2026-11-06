@@ -702,6 +702,7 @@ pub(crate) fn attempt_reached_upstream(err: &ProxyError) -> bool {
         | ProxyError::BudgetUnverified
         | ProxyError::RequestTooLarge { .. }
         | ProxyError::RateLimit(_)
+        | ProxyError::ModelRateLimit(_)
         | ProxyError::PolicyRateLimit { .. } => false,
     }
 }

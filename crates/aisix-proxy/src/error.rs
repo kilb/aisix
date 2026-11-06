@@ -391,6 +391,12 @@ pub enum ProxyError {
     RequestTooLarge { limit_bytes: usize },
     #[error(transparent)]
     RateLimit(#[from] RateLimitError),
+    /// The model's own inline limit refused the request. Same status, type
+    /// and headers as [`Self::RateLimit`]; its own variant because the bucket
+    /// is shared by every caller of the model, so in platform mode its
+    /// `x-ratelimit-*` figures are the platform's and are not sent.
+    #[error(transparent)]
+    ModelRateLimit(RateLimitError),
     /// A policy-layer rate-limit rejection carrying the offending
     /// policy's identity (#892). Same status/type/headers as
     /// [`Self::RateLimit`]; the envelope adds `error.policy` so a
@@ -401,8 +407,13 @@ pub enum ProxyError {
     #[error("{source} (policy '{policy_name}')")]
     PolicyRateLimit {
         source: RateLimitError,
-        policy_id: String,
-        policy_name: String,
+        // Boxed strs: with the flag below, a `String` pair would take the
+        // error past the size clippy allows in a `Result`.
+        policy_id: Box<str>,
+        policy_name: Box<str>,
+        /// Whether the bucket holds only the caller's own traffic
+        /// ([`crate::quota::policy_bucket_is_callers`]).
+        callers_bucket: bool,
     },
     #[error(transparent)]
     Bridge(#[from] BridgeError),
@@ -554,7 +565,9 @@ impl ProxyError {
             ProxyError::BudgetExceeded(_) => StatusCode::TOO_MANY_REQUESTS,
             ProxyError::BudgetUnverified => StatusCode::SERVICE_UNAVAILABLE,
             ProxyError::RequestTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
-            ProxyError::RateLimit(_) => StatusCode::TOO_MANY_REQUESTS,
+            ProxyError::RateLimit(_) | ProxyError::ModelRateLimit(_) => {
+                StatusCode::TOO_MANY_REQUESTS
+            }
             ProxyError::PolicyRateLimit { .. } => StatusCode::TOO_MANY_REQUESTS,
             ProxyError::Bridge(b) => {
                 StatusCode::from_u16(b.http_status()).unwrap_or(StatusCode::BAD_GATEWAY)
@@ -613,7 +626,7 @@ impl ProxyError {
             // A gateway-side dependency failed, like `JwksUnavailable`;
             // `error.code` carries the distinction.
             ProxyError::BudgetUnverified => "api_error",
-            ProxyError::RateLimit(_) => "rate_limit_exceeded",
+            ProxyError::RateLimit(_) | ProxyError::ModelRateLimit(_) => "rate_limit_exceeded",
             ProxyError::PolicyRateLimit { .. } => "rate_limit_exceeded",
             ProxyError::Bridge(b) => b.error_type(),
         }
@@ -646,7 +659,7 @@ impl ProxyError {
     /// header.
     pub fn retry_after_secs(&self) -> Option<u64> {
         match self {
-            ProxyError::RateLimit(e) => e.retry_after_secs(),
+            ProxyError::RateLimit(e) | ProxyError::ModelRateLimit(e) => e.retry_after_secs(),
             ProxyError::PolicyRateLimit { source, .. } => source.retry_after_secs(),
             ProxyError::AllCandidatesUnavailable { retry_after_secs } => *retry_after_secs,
             // Source the Retry-After header from the same value the 429
@@ -736,7 +749,14 @@ impl ProxyError {
             ProxyError::BudgetExceeded(r) if hides_budget_scope(r) => {
                 ErrorEnvelope::new(HIDDEN_BUDGET_MESSAGE, self.kind()).with_code("budget_exceeded")
             }
-            ProxyError::BudgetExceeded(r) => env.with_code("budget_exceeded").with_budget(r),
+            ProxyError::BudgetExceeded(r) => {
+                let mut env = env.with_code("budget_exceeded").with_budget(r);
+                // A message that names a policy is the platform's wording.
+                if let (true, Some(m)) = (crate::platform_errors::active(), &r.caller_message) {
+                    env.error.message = m.clone();
+                }
+                env
+            }
             ProxyError::BudgetUnverified => env.with_code("budget_unverified"),
             // Attribution for policy-layer 429s (#892): the
             // OpenAI envelope names the offending policy. The Anthropic
@@ -750,7 +770,7 @@ impl ProxyError {
                 policy_id,
                 policy_name,
                 ..
-            } => env.with_policy(policy_id, policy_name),
+            } => env.with_policy(policy_id.to_string(), policy_name.to_string()),
             // Stable machine-readable code for SDKs to branch on, distinct
             // from the generic `permission_denied` type shared with
             // ModelForbidden (#557 AC-1).
@@ -817,11 +837,20 @@ const HIDDEN_BUDGET_MESSAGE: &str = "Spending limit reached.";
 /// A reason with no scope is hidden too, since nothing says it is theirs.
 /// Keys on the budget that denied, whichever model the request addressed.
 fn hides_budget_scope(r: &crate::budget::BudgetReason) -> bool {
-    crate::platform_errors::active()
-        && !matches!(
-            r.scope.as_deref(),
-            Some("api_key" | "member" | "team" | "team_member")
+    use aisix_core::models::BudgetScope;
+    // Both the typed scope and the control plane's text must name one of the
+    // caller's own scopes; either one disagreeing hides the budget.
+    let own_typed = matches!(
+        r.scope_kind,
+        Some(
+            BudgetScope::ApiKey | BudgetScope::Member | BudgetScope::Team | BudgetScope::TeamMember
         )
+    );
+    let own_text = matches!(
+        r.scope.as_deref(),
+        Some("api_key" | "member" | "team" | "team_member")
+    );
+    crate::platform_errors::active() && !(own_typed && own_text)
 }
 
 /// Build the customer-visible envelope for an upstream HTTP error.
@@ -946,10 +975,28 @@ impl ProxyError {
     /// rejection.
     fn rate_limit_detail(&self) -> Option<aisix_ratelimit::LimitDetail> {
         match self {
-            ProxyError::RateLimit(e) => e.detail(),
+            ProxyError::RateLimit(e) | ProxyError::ModelRateLimit(e) => e.detail(),
             ProxyError::PolicyRateLimit { source, .. } => source.detail(),
             _ => None,
         }
+    }
+
+    /// [`Self::rate_limit_detail`] as the caller is sent it. In platform mode
+    /// a bucket several callers share (the model's inline limit, a policy not
+    /// keyed to the caller) reports the platform's own limit and what is left
+    /// of it, so none of the trio is sent. `Retry-After` stays: windows are
+    /// clock-aligned, so it shows only a window's length, and SDKs back off
+    /// on it.
+    fn caller_rate_limit_detail(&self) -> Option<aisix_ratelimit::LimitDetail> {
+        let shared = match self {
+            ProxyError::ModelRateLimit(_) => true,
+            ProxyError::PolicyRateLimit { callers_bucket, .. } => !callers_bucket,
+            _ => false,
+        };
+        if shared && crate::platform_errors::active() {
+            return None;
+        }
+        self.rate_limit_detail()
     }
 
     /// [`Self::retry_after_secs`] as the caller is sent it. A hidden budget's
@@ -1031,7 +1078,7 @@ impl IntoResponse for ProxyError {
         let challenge = self.auth_challenge();
         let status = self.caller_status();
         let retry_after = self.caller_retry_after_secs();
-        let rate_limit_detail = self.rate_limit_detail();
+        let rate_limit_detail = self.caller_rate_limit_detail();
         let upgrade_reject = matches!(self, ProxyError::WebSocketUpgradeRequired { .. });
         let body = self.envelope();
         let mut response = (status, Json(body)).into_response();
@@ -1191,7 +1238,7 @@ impl ProxyError {
     pub fn into_anthropic_response(self) -> Response {
         let status = self.caller_status();
         let retry_after = self.caller_retry_after_secs();
-        let rate_limit_detail = self.rate_limit_detail();
+        let rate_limit_detail = self.caller_rate_limit_detail();
         let mut response = (status, Json(self.anthropic_envelope())).into_response();
         apply_retry_headers(&mut response, retry_after, rate_limit_detail);
         response
@@ -1757,6 +1804,7 @@ pub(crate) mod tests {
         ProxyError::BudgetExceeded(Box::new(crate::budget::BudgetReason {
             message: format!("{scope} budget '{scope_ref}' exceeded (${limit}/month)."),
             scope: Some(scope.into()),
+            scope_kind: serde_json::from_value(serde_json::json!(scope)).ok(),
             scope_ref: Some(scope_ref.into()),
             limit_usd: Some(limit.into()),
             spent_usd: Some(spent.into()),
@@ -1767,7 +1815,7 @@ pub(crate) mod tests {
         }))
     }
 
-    fn policy_limited(id: &str, name: &str) -> ProxyError {
+    fn policy_limited(id: &str, name: &str, callers_bucket: bool) -> ProxyError {
         ProxyError::PolicyRateLimit {
             source: aisix_ratelimit::RateLimitError::Requests {
                 scope: aisix_core::RateLimitScope::Requests,
@@ -1780,6 +1828,7 @@ pub(crate) mod tests {
             },
             policy_id: id.into(),
             policy_name: name.into(),
+            callers_bucket,
         }
     }
 
@@ -1826,6 +1875,117 @@ pub(crate) mod tests {
         assert!(!s.contains("acme") && !s.contains("500"), "{s}");
     }
 
+    /// The typed scope and the control plane's text must agree on an own
+    /// scope; text alone (or a typed platform scope) does not unlock figures.
+    #[test]
+    fn a_budget_429_needs_the_typed_scope_and_the_text_to_agree() {
+        use aisix_core::models::BudgetScope;
+        let reason = |kind: Option<BudgetScope>, text: &str| {
+            ProxyError::BudgetExceeded(Box::new(crate::budget::BudgetReason {
+                message: "m".into(),
+                scope: Some(text.into()),
+                scope_kind: kind,
+                scope_ref: Some("ref-1".into()),
+                limit_usd: Some("5.00".into()),
+                ..Default::default()
+            }))
+        };
+        let shown = |e: &ProxyError| render_platform(e)["error"].get("limit_usd").is_some();
+        assert!(shown(&reason(Some(BudgetScope::Team), "team")));
+        assert!(!shown(&reason(Some(BudgetScope::ProviderKey), "team")));
+        assert!(!shown(&reason(Some(BudgetScope::Team), "provider_key")));
+        assert!(!shown(&reason(None, "team")));
+    }
+
+    #[test]
+    fn an_own_scope_budget_429_with_a_caller_message_names_no_policy() {
+        let err = ProxyError::BudgetExceeded(Box::new(crate::budget::BudgetReason {
+            message: "spend ceiling reached for policy acme-tier".into(),
+            caller_message: Some("Spend ceiling reached.".into()),
+            scope: Some("team".into()),
+            scope_kind: Some(aisix_core::models::BudgetScope::Team),
+            ..Default::default()
+        }));
+        let b = render_platform(&err);
+        assert_eq!(b["error"]["message"], "Spend ceiling reached.");
+        assert!(!b.to_string().contains("acme-tier"));
+        // Telemetry and the operator-facing text keep the policy name.
+        assert!(err.to_string().contains("acme-tier"));
+        let off = serde_json::to_value(err.envelope()).unwrap();
+        assert!(off["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("acme-tier"));
+    }
+
+    fn requests_detail() -> aisix_ratelimit::RateLimitError {
+        aisix_ratelimit::RateLimitError::Requests {
+            scope: aisix_core::RateLimitScope::Requests,
+            detail: aisix_ratelimit::LimitDetail {
+                dimension: "rpd",
+                limit: 5_000,
+                remaining: 0,
+                reset_secs: 3_600,
+            },
+        }
+    }
+
+    fn platform_headers(err: ProxyError) -> axum::http::HeaderMap {
+        in_platform_mode(|| err.into_response()).headers().clone()
+    }
+
+    #[test]
+    fn a_shared_bucket_429_sends_no_ratelimit_figures_in_platform_mode() {
+        for err in [
+            policy_limited("pol-1", "model-tier", false),
+            ProxyError::ModelRateLimit(requests_detail()),
+        ] {
+            let h = platform_headers(err);
+            for name in [
+                "x-ratelimit-limit",
+                "x-ratelimit-remaining",
+                "x-ratelimit-scope",
+                "x-ratelimit-reset",
+            ] {
+                assert!(h.get(name).is_none(), "{name} leaks a shared bucket");
+            }
+            // The back-off hint is only a window length.
+            assert_eq!(h.get("retry-after").unwrap(), "3600");
+        }
+    }
+
+    #[test]
+    fn a_callers_own_bucket_429_keeps_its_ratelimit_figures() {
+        for err in [
+            policy_limited("pol-1", "team-tier", true),
+            ProxyError::RateLimit(requests_detail()),
+        ] {
+            let h = platform_headers(err);
+            assert_eq!(h.get("x-ratelimit-limit").unwrap(), "5000");
+            assert_eq!(h.get("x-ratelimit-scope").unwrap(), "rpd");
+        }
+    }
+
+    #[test]
+    fn with_platform_mode_off_the_model_limit_renders_as_the_key_limit_does() {
+        let render = |e: ProxyError| {
+            let r = e.into_response();
+            (r.status(), r.headers().clone())
+        };
+        let (s1, h1) = render(ProxyError::ModelRateLimit(requests_detail()));
+        let (s2, h2) = render(ProxyError::RateLimit(requests_detail()));
+        assert_eq!(s1, s2);
+        assert_eq!(h1, h2);
+        assert_eq!(
+            ProxyError::ModelRateLimit(requests_detail()).kind(),
+            ProxyError::RateLimit(requests_detail()).kind()
+        );
+        assert_eq!(
+            serde_json::to_value(ProxyError::ModelRateLimit(requests_detail()).envelope()).unwrap(),
+            serde_json::to_value(ProxyError::RateLimit(requests_detail()).envelope()).unwrap()
+        );
+    }
+
     #[test]
     fn budget_429_with_platform_mode_off_is_unchanged() {
         let b = serde_json::to_value(
@@ -1839,11 +1999,12 @@ pub(crate) mod tests {
 
     #[test]
     fn a_policy_429_names_no_policy_in_platform_mode() {
-        let b = render_platform(&policy_limited("pol-1", "acme-tier"));
+        let b = render_platform(&policy_limited("pol-1", "acme-tier", true));
         assert!(b["error"].get("policy").is_none());
         assert!(!b.to_string().contains("acme-tier"));
         assert_eq!(b["error"]["type"], "rate_limit_exceeded");
-        let off = serde_json::to_value(policy_limited("pol-1", "acme-tier").envelope()).unwrap();
+        let off =
+            serde_json::to_value(policy_limited("pol-1", "acme-tier", true).envelope()).unwrap();
         assert_eq!(off["error"]["policy"]["name"], "acme-tier");
     }
 
@@ -2076,6 +2237,7 @@ pub(crate) mod tests {
             },
             policy_id: "pol-1".into(),
             policy_name: "team-daily".into(),
+            callers_bucket: true,
         };
         let resp = err.into_response();
         let h = resp.headers();

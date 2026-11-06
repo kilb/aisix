@@ -34,6 +34,10 @@ const TEAM_ID = randomUUID();
 const PLATFORM_LIMIT = "777.00";
 const PLATFORM_SPENT = "777.25";
 const NEUTRAL = "Spending limit reached.";
+/** A name only the platform's shared rate-limit policies carry. */
+const POLICY_NAME = "pb-platform-shared-policy";
+const POLICY_KEYS = { chat: "sk-pb-e2e-policy-chat", messages: "sk-pb-e2e-policy-messages" };
+const POLICY_TEAMS = { chat: randomUUID(), messages: randomUUID() };
 
 const reason = (scope: string, scopeRef: string, limit: string, spent: string, name: string) => ({
   type: "billing_error",
@@ -127,7 +131,8 @@ describe("platform mode: a 429 shows a tenant only its own limits", () => {
     }
     const headerText = [...answer.headers.entries()].map(([k, v]) => `${k}: ${v}`).join("\n");
     const everything = `${answer.text}\n${headerText}`;
-    for (const leak of [PLATFORM_LIMIT, PLATFORM_SPENT, "777", ...spentPkIds, "provider_key", "environment"]) {
+    // Only strings no uuid, timestamp or port can spell by chance.
+    for (const leak of [PLATFORM_LIMIT, PLATFORM_SPENT, ...spentPkIds, "provider_key", "environment"]) {
       expect(everything, `leaks ${leak}`).not.toContain(leak);
     }
     // The reset time is the platform budget's own figure.
@@ -204,6 +209,22 @@ describe("platform mode: a 429 shows a tenant only its own limits", () => {
       exhausted: { period_start: rfc3339(MONTH_START), reason: reason("team", TEAM_ID, "10.00", "10.25", "team") },
     });
 
+    // An ungrouped conditional policy is one counter for every caller it
+    // matches. One team, key and policy per route, so the first request of
+    // each route is the one that takes the single slot.
+    for (const label of ["chat", "messages"] as const) {
+      await seed.update("teams", POLICY_TEAMS[label], { name: `pb-policy-team-${label}`, tags: {} });
+      await seed.update("rate_limit_policies", randomUUID(), {
+        name: POLICY_NAME,
+        conditions: [{ dimension: "team", operator: "in", value: [POLICY_TEAMS[label]] }],
+        limits: { rpm: 1 },
+      });
+      await seed.update("api_keys", randomUUID(), {
+        key_hash: hash(POLICY_KEYS[label]),
+        allowed_models: ["*"],
+        team_id: POLICY_TEAMS[label],
+      });
+    }
     // The caller keys go in last: once the sentinel authenticates, every
     // resource above is in the snapshot.
     await seed.update("api_keys", randomUUID(), { key_hash: hash(TEAM_KEY), allowed_models: ["*"], team_id: TEAM_ID });
@@ -255,6 +276,26 @@ describe("platform mode: a 429 shows a tenant only its own limits", () => {
       if (!etcdReachable || !app) return ctx.skip();
       expectHidden(route, await call(PLAIN_KEY, route, spentModel(route.family), stream));
     });
+  });
+
+  test.each([
+    ["chat", ROUTES[0]],
+    ["messages", ROUTES[1]],
+  ] as const)("a shared policy refusal on %s names no policy and no figures", async (label, route, ctx) => {
+    if (!etcdReachable || !app) return ctx.skip();
+    const key = POLICY_KEYS[label];
+    // The first request takes the single slot; what it gets back is not the point.
+    await call(key, route, cleanModel(route.family), false);
+    const answer = await call(key, route, cleanModel(route.family), false);
+    expect(answer.status, answer.text).toBe(429);
+    expect(answer.json.error).not.toHaveProperty("policy");
+    expect(answer.headers.get("x-ratelimit-limit")).toBeNull();
+    expect(answer.headers.get("x-ratelimit-remaining")).toBeNull();
+    expect(answer.headers.get("x-ratelimit-scope")).toBeNull();
+    const headerText = [...answer.headers.entries()].map(([k, v]) => `${k}: ${v}`).join("\n");
+    expect(`${answer.text}\n${headerText}`).not.toContain(POLICY_NAME);
+    // Windows are clock-aligned, so the back-off hint is only a window length.
+    expect(Number(answer.headers.get("retry-after"))).toBeGreaterThan(0);
   });
 
   // Last: it refuses every key in the environment until removed.
