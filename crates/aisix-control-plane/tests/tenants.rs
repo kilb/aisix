@@ -395,8 +395,18 @@ async fn a_new_tenant_starts_in_the_default_groups() {
     // Refused defaults change nothing.
     for (body, path) in [
         (
-            json!({"rpm": 0, "default_provider_groups": []}),
+            json!({"rpm": 0, "default_provider_groups": ["shared"]}),
             Some("/rpm"),
+        ),
+        // No group at all would open every upstream to new tenants, and so
+        // would leaving the groups out.
+        (
+            json!({"default_provider_groups": []}),
+            Some("/default_provider_groups"),
+        ),
+        (
+            json!({"default_provider_groups": [" shared"]}),
+            Some("/default_provider_groups/0"),
         ),
         (
             json!({"default_provider_groups": [""]}),
@@ -406,7 +416,6 @@ async fn a_new_tenant_starts_in_the_default_groups() {
             json!({"default_provider_groups": ["shared", "g".repeat(65)]}),
             Some("/default_provider_groups/1"),
         ),
-        // Leaving the groups out would open every upstream to new tenants.
         (json!({"rpm": 5}), Some("/default_provider_groups")),
         (
             json!({"rpm": 5, "default_provider_groups": [], "groups": []}),
@@ -430,6 +439,37 @@ async fn a_new_tenant_starts_in_the_default_groups() {
     .await
     .expect("count audit rows");
     assert_eq!(audited, 1);
+
+    // A group named twice is stored once.
+    let r = admin
+        .put(
+            "/admin/settings/tenant-defaults",
+            json!({"rpm": 600, "default_provider_groups": ["shared", "grp-eu-5d2", "shared"]}),
+        )
+        .await;
+    assert_eq!(r.status, 200, "{r:?}");
+    assert_eq!(
+        r.body["default_provider_groups"],
+        json!(["shared", "grp-eu-5d2"])
+    );
+
+    // Defaults a newer release stored, with a field this one does not know,
+    // still serve the tenants created here.
+    sqlx::query(
+        "UPDATE cp_settings SET value = value || '{\"future_cap_7c1\": 3}' \
+         WHERE key = 'tenant_defaults'",
+    )
+    .execute(cp.db().pool())
+    .await
+    .expect("store a newer field");
+    let third = admin.create_tenant("third-7c1").await;
+    assert_eq!(third["limits"], json!({"rpm": 600}));
+    assert_eq!(
+        third["allowed_provider_groups"],
+        json!(["shared", "grp-eu-5d2"])
+    );
+    let r = admin.get("/admin/settings/tenant-defaults").await;
+    assert_eq!(r.status, 200, "{r:?}");
 }
 
 #[tokio::test]
@@ -568,6 +608,26 @@ async fn clearing_every_tenant_limit_removes_its_policy() {
         assert_eq!(r.body["details"][0]["path"], path, "{r:?}");
     }
     assert_eq!(admin.tenant(&id).await["version"], 4);
+
+    // A PATCH that does not carry `limits` leaves them as stored, fields
+    // this release does not know included.
+    sqlx::query(
+        "UPDATE tenants SET limits = '{\"rpm\": 60, \"future_limit_7c1\": 5}' WHERE id = $1::uuid",
+    )
+    .bind(&id)
+    .execute(cp.db().pool())
+    .await
+    .expect("store a newer limit");
+    let r = admin
+        .patch_tenant(&id, 4, json!({"name": "limits-renamed-7c1"}))
+        .await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let stored: Value = sqlx::query_scalar("SELECT limits FROM tenants WHERE id = $1::uuid")
+        .bind(&id)
+        .fetch_one(cp.db().pool())
+        .await
+        .expect("read the limits");
+    assert_eq!(stored, json!({"rpm": 60, "future_limit_7c1": 5}));
 }
 
 #[tokio::test]
@@ -863,6 +923,46 @@ async fn a_wildcard_or_ensemble_model_cannot_be_granted_to_a_customer() {
         .await;
     assert_eq!(r.status, 200, "{r:?}");
     assert_eq!(r.body["allowed_provider_groups"], json!(["grp-eu-5d2"]));
+    for (groups, path) in [
+        // No group reaches every upstream: a customer names its groups.
+        (json!([]), "/allowed_provider_groups"),
+        (json!([" grp-eu-5d2"]), "/allowed_provider_groups/0"),
+        (
+            json!(["grp-eu-5d2", "shared "]),
+            "/allowed_provider_groups/1",
+        ),
+    ] {
+        let r = admin
+            .patch_tenant(&id, 3, json!({ "allowed_provider_groups": groups }))
+            .await;
+        assert_eq!(r.status, 422, "{groups}: {r:?}");
+        assert_eq!(r.body["details"][0]["path"], path, "{groups}");
+    }
+    let r = admin
+        .patch_tenant(
+            &id,
+            3,
+            json!({"allowed_provider_groups": ["shared", "grp-eu-5d2", "shared"]}),
+        )
+        .await;
+    assert_eq!(r.status, 200, "{r:?}");
+    assert_eq!(
+        r.body["allowed_provider_groups"],
+        json!(["shared", "grp-eu-5d2"])
+    );
+    // The platform's own tenant is meant to reach every upstream.
+    let version = admin.tenant(&internal_id).await["version"]
+        .as_i64()
+        .expect("a version");
+    let r = admin
+        .patch_tenant(
+            &internal_id,
+            version,
+            json!({"allowed_provider_groups": []}),
+        )
+        .await;
+    assert_eq!(r.status, 200, "{r:?}");
+    assert_eq!(r.body["allowed_provider_groups"], json!([]));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -898,6 +998,13 @@ async fn the_internal_tenant_exists_exactly_once_and_has_no_groups() {
     let found = internal(admin.get("/admin/tenants").await);
     assert_eq!(found.len(), 1, "{found:?}");
     assert_eq!(found[0], *t);
+
+    // Suspending it would stop every operator key.
+    let operator = Admin::as_role(&cp, OperatorRole::Operator).await;
+    let r = operator.act(&id, "suspend").await;
+    assert_eq!(r.status, 409, "{r:?}");
+    assert_eq!(r.body["code"], "tenant_state");
+    assert_eq!(operator.tenant(&id).await["status"], "active");
 
     // Two first boots at once create one between them.
     let internal_count = || async {
@@ -1345,6 +1452,67 @@ async fn a_grant_racing_its_models_delete_leaves_no_grant_of_a_deleted_model() {
         assert_eq!(dangling, 0, "round {round}: grant {grant}, delete {delete}");
     }
     eprintln!("deletes {deleted}, grants {granted} of 30 rounds");
+}
+
+/// A tenant's limits policy name is the tenant's: an operator's policy that
+/// took it would keep the tenant's own from being written.
+#[tokio::test]
+async fn an_operator_cannot_take_a_tenants_limits_policy_name() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let admin = Admin::as_role(&cp, OperatorRole::Operator).await;
+    let id = id_of(&admin.create_tenant("reserved-7c1").await);
+    assert_eq!(admin.act(&id, "suspend").await.status, 200);
+    let taken = json!({
+        "name": format!("tenant-{id}-limits"),
+        "conditions": [{"dimension": "team", "operator": "in", "value": [id]}],
+        "limits": {"rpm": 1},
+    });
+    let r = admin
+        .post(
+            "/admin/resources/rate_limit_policies",
+            json!({ "doc": taken }),
+        )
+        .await;
+    assert_eq!(r.status, 422, "{r:?}");
+    assert_eq!(r.body["details"][0]["path"], "/name");
+    // Any tenant's, whether or not it exists.
+    let mut other = taken.clone();
+    other["name"] = json!(format!("tenant-{}-limits", Uuid::new_v4()));
+    let r = admin
+        .post(
+            "/admin/resources/rate_limit_policies",
+            json!({ "doc": other }),
+        )
+        .await;
+    assert_eq!(r.status, 422, "{r:?}");
+    // Renaming an operator's policy onto it is refused the same way.
+    let mut own = taken.clone();
+    own["name"] = json!("rl-operator-7c1");
+    let policy = admin.create("rate_limit_policies", own).await;
+    let r = admin
+        .send(
+            "PUT",
+            &format!("/admin/resources/rate_limit_policies/{policy}"),
+            Some("\"1\""),
+            Some(json!({ "doc": taken })),
+        )
+        .await;
+    assert_eq!(r.status, 422, "{r:?}");
+    assert_eq!(r.body["details"][0]["path"], "/name");
+    // The tenant's own policy is written again on reactivation.
+    let r = admin.act(&id, "reactivate").await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let pid = limits_policy_id(&cp, &id)
+        .await
+        .expect("a policy id")
+        .to_string();
+    let policy = row(&cp, "rate_limit_policies", &pid)
+        .await
+        .expect("a policy");
+    assert!(!policy.deleted);
+    assert_eq!(policy.doc["name"], format!("tenant-{id}-limits"));
 }
 
 #[test]

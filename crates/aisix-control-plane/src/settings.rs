@@ -145,10 +145,12 @@ const TENANT_DEFAULTS: &str = "tenant_defaults";
 /// tenant copies them when it is created and keeps its copy; changing them
 /// changes no existing tenant.
 ///
-/// `default_provider_groups` has no default: a body without it is refused,
-/// since no groups at all opens every upstream to new tenants.
+/// Stored defaults are read leniently, so an instance of an older release
+/// reads what a newer one wrote; the write path (`PUT
+/// /admin/settings/tenant-defaults`) refuses unknown fields, and refuses a
+/// missing or empty `default_provider_groups`, since no groups at all opens
+/// every upstream to new tenants.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct TenantDefaults {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub concurrency: Option<u32>,

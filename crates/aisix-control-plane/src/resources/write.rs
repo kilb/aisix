@@ -98,8 +98,8 @@ pub async fn write_resource(
         }
         WriteOp::Delete => {
             writable_row(conn, &w).await?;
-            let referrers =
-                refs::incoming(conn, w.kind, w.id, non_holding_referrers(w.kind)).await?;
+            let (except, except_unowned) = non_holding_referrers(w.kind);
+            let referrers = refs::incoming(conn, w.kind, w.id, except, except_unowned).await?;
             if !referrers.is_empty() {
                 return Err(ApiError::in_use(referrers));
             }
@@ -108,8 +108,9 @@ pub async fn write_resource(
     }
 }
 
-/// The kinds whose references do not keep a row of `kind` from being
-/// deleted.
+/// The references that do not keep a row of `kind` from being deleted: of
+/// the first kinds every row, of the second only the rows operators wrote
+/// (no `managed_by`).
 ///
 /// - A model: the documents derived from tenants. Its delete withdraws it
 ///   from every grant and key selection first (`tenants::on_model_deleted`,
@@ -119,18 +120,45 @@ pub async fn write_resource(
 ///   request reaches a gateway through it, so a scope left naming it
 ///   governs nothing that still exists; holding the delete would let an
 ///   operator's guardrail or cache scope block a key revoke. A derived
-///   referrer (a key naming its team or member) still holds it: the code
-///   deriving both deletes the referrer first.
-fn non_holding_referrers(kind: Kind) -> &'static [Kind] {
+///   referrer (a key naming its team or member, or a derived document of
+///   one of those kinds) still holds it: the code deriving both deletes the
+///   referrer first.
+fn non_holding_referrers(kind: Kind) -> (&'static [Kind], &'static [Kind]) {
     match kind {
-        Kind::Models => &[Kind::ApiKeys, Kind::Teams, Kind::Users],
-        Kind::Teams | Kind::Users | Kind::ApiKeys => &[
-            Kind::CachePolicies,
-            Kind::GuardrailAttachments,
-            Kind::RateLimitPolicies,
-        ],
-        _ => &[],
+        Kind::Models => (&[Kind::ApiKeys, Kind::Teams, Kind::Users], &[]),
+        Kind::Teams | Kind::Users | Kind::ApiKeys => (
+            &[],
+            &[
+                Kind::CachePolicies,
+                Kind::GuardrailAttachments,
+                Kind::RateLimitPolicies,
+            ],
+        ),
+        _ => (&[], &[]),
     }
+}
+
+/// Refuses an operator's rate-limit policy named the way a tenant's limits
+/// policy is (`tenant-<id>-limits`): names are unique among live policies,
+/// so one taken by an operator would keep the tenant's own from being
+/// written when the tenant is approved or reactivated.
+fn refuse_reserved_name(w: &ResourceWrite<'_>, doc: &Value) -> Result<(), ApiError> {
+    if w.kind != Kind::RateLimitPolicies || w.managed_by.is_some() {
+        return Ok(());
+    }
+    let reserved = doc
+        .get("name")
+        .and_then(Value::as_str)
+        .and_then(|name| name.strip_prefix("tenant-"))
+        .and_then(|rest| rest.strip_suffix("-limits"))
+        .is_some_and(|id| Uuid::parse_str(id).is_ok());
+    if reserved {
+        return Err(ApiError::validation(vec![Detail {
+            path: "/name".to_string(),
+            message: "该名称留给租户的默认限流策略使用，请换一个名称".to_string(),
+        }]));
+    }
+    Ok(())
 }
 
 fn check_size(doc: &Value) -> Result<(), ApiError> {
@@ -200,6 +228,7 @@ async fn prepare(
     secrets::unseal(&ctx.mk, w.kind, w.id, &mut projected).map_err(ApiError::internal)?;
     check_size(&projected)?;
     validate_strict(w.kind, &doc).map_err(ApiError::validation)?;
+    refuse_reserved_name(w, &doc)?;
     refuse_self_reference(w, &doc)?;
     refs::check_outgoing(conn, w.kind, &doc).await?;
     // Task 9: the save-time gateway-version gate runs here.
