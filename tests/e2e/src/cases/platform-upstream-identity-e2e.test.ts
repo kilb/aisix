@@ -49,6 +49,8 @@ const UPSTREAM_TOOL_USE_ID = "toolu_bdrk_01Y";
 const UPSTREAM_CHAT_ID = "chatcmpl-up";
 const UPSTREAM_FC_ITEM_ID = "fc_bdrk_01Z";
 const UPSTREAM_CALL_ID = "call_bdrk_01Y";
+/** A tool-call id in the shape a Converse channel hands out. */
+const UPSTREAM_CONVERSE_TOOL_ID = "tooluse_bdrk_01Q";
 const CHANNEL_METRICS = { inputTokenCount: 9, outputTokenCount: 4, invocationLatency: 120 };
 
 const HEADERS = {
@@ -63,6 +65,7 @@ const ALIASES = {
   messagesTranslated: "pi-messages-translated",
   responsesNative: "pi-responses-native",
   responsesTranslated: "pi-responses-translated",
+  responsesChat: "pi-responses-chat",
 };
 
 /** What must never appear anywhere in a response the caller receives. */
@@ -106,7 +109,7 @@ function upstreamBody(upstream: OpenAiUpstream, index: number): Record<string, a
 const WEATHER_ARGS = '{"city":"Paris"}';
 
 /** A Chat Completions upstream answering with a tool call. */
-function openAiChatAnswer(): Record<string, unknown> {
+function openAiChatAnswer(toolCallId = UPSTREAM_TOOL_USE_ID): Record<string, unknown> {
   return {
     id: UPSTREAM_CHAT_ID,
     object: "chat.completion",
@@ -121,7 +124,7 @@ function openAiChatAnswer(): Record<string, unknown> {
           content: null,
           tool_calls: [
             {
-              id: UPSTREAM_TOOL_USE_ID,
+              id: toolCallId,
               type: "function",
               function: { name: "get_weather", arguments: WEATHER_ARGS },
             },
@@ -134,7 +137,7 @@ function openAiChatAnswer(): Record<string, unknown> {
   };
 }
 
-function openAiChatStream(): string[] {
+function openAiChatStream(toolCallId = UPSTREAM_TOOL_USE_ID): string[] {
   const chunk = (choices: unknown[], extra: Record<string, unknown> = {}) =>
     JSON.stringify({
       id: UPSTREAM_CHAT_ID,
@@ -154,7 +157,7 @@ function openAiChatStream(): string[] {
           tool_calls: [
             {
               index: 0,
-              id: UPSTREAM_TOOL_USE_ID,
+              id: toolCallId,
               type: "function",
               function: { name: "get_weather", arguments: "" },
             },
@@ -430,6 +433,7 @@ describe("platform mode e2e: ids name no upstream channel, and tool use still ro
     messagesTranslated: undefined,
     responsesNative: undefined,
     responsesTranslated: undefined,
+    responsesChat: undefined,
   };
 
   beforeAll(async () => {
@@ -462,6 +466,13 @@ describe("platform mode e2e: ids name no upstream channel, and tool use still ro
       ],
     });
     up.responsesTranslated = await startOpenAiUpstream({ scriptedResponses: anthropicScript() });
+    up.responsesChat = await startOpenAiUpstream({
+      scriptedResponses: [
+        { nonStreamBody: openAiChatAnswer(UPSTREAM_CONVERSE_TOOL_ID) },
+        { nonStreamBody: openAiChatAnswer(UPSTREAM_CONVERSE_TOOL_ID) },
+        { streamEvents: openAiChatStream(UPSTREAM_CONVERSE_TOOL_ID) },
+      ],
+    });
 
     app = await spawnApp({
       // The secret reaches the gateway process and nothing else.
@@ -475,13 +486,19 @@ describe("platform mode e2e: ids name no upstream channel, and tool use still ro
 
     const anthropic = { provider: "anthropic", adapter: "anthropic" };
     const openai = { provider: "openai", adapter: "openai" };
-    const routes: Array<[keyof typeof ALIASES, { provider: string; adapter: string }]> = [
+    // An OpenAI-compatible endpoint that declares no `/v1/responses`, so
+    // Responses traffic is translated onto its Chat Completions API.
+    const chatOnly = { ...openai, apis: {} };
+    const routes: Array<
+      [keyof typeof ALIASES, { provider: string; adapter: string; apis?: Record<string, never> }]
+    > = [
       ["chatOpenAi", openai],
       ["chatAnthropic", anthropic],
       ["messagesNative", anthropic],
       ["messagesTranslated", openai],
       ["responsesNative", openai],
       ["responsesTranslated", anthropic],
+      ["responsesChat", chatOnly],
     ];
     for (const [route, kind] of routes) {
       const pk = await seed.createProviderKey({
@@ -490,6 +507,7 @@ describe("platform mode e2e: ids name no upstream channel, and tool use still ro
         api_base: `${up[route]!.baseUrl}/v1`,
         provider: kind.provider,
         adapter: kind.adapter,
+        ...(kind.apis ? { apis: kind.apis } : {}),
       });
       await seed.createModel({
         display_name: ALIASES[route],
@@ -705,7 +723,8 @@ describe("platform mode e2e: ids name no upstream channel, and tool use still ro
     expectNoUpstreamIdentity(first.text);
     const firstBody = JSON.parse(first.text);
     const call = responsesFunctionCall(firstBody.output);
-    expect(call.call_id).toMatch(/^toolu_/);
+    // A call id names no vendor: not the upstream's `toolu_`.
+    expect(call.call_id).toMatch(/^call_/);
     expect(call.call_id).not.toBe(UPSTREAM_TOOL_USE_ID);
     // The answer the gateway built keeps to the Responses usage fields; the
     // upstream's cache write is not named beside them.
@@ -743,6 +762,64 @@ describe("platform mode e2e: ids name no upstream channel, and tool use still ro
     const completed = events.find((e) => e.type === "response.completed");
     expect(completed?.response?.usage?.input_tokens_details).toBeDefined();
     expect(completed!.response.usage.input_tokens_details).not.toHaveProperty("cache_creation_tokens");
+  });
+
+  // A translated answer's call id is the tool-call id the Chat Completions
+  // upstream handed out, and a Converse channel's start `tooluse_`: the
+  // caller must see a call id in the Responses API's own shape, and the
+  // upstream must get its own id back on the next turn.
+  test("/v1/responses from a Chat Completions upstream: a Converse-shaped call id leaves as call_ and returns as it was", async (ctx) => {
+    if (!etcdReachable || !app) return void ctx.skip();
+    const upstream = up.responsesChat!;
+    const alias = ALIASES.responsesChat;
+    const turn = (input: unknown, extra: Record<string, unknown> = {}) => ({
+      model: alias,
+      input,
+      tools: RESPONSES_TOOLS,
+      ...extra,
+    });
+    const expectNoConverseId = (text: string) => {
+      expectNoUpstreamIdentity(text);
+      expect(text).not.toContain(UPSTREAM_CONVERSE_TOOL_ID);
+      expect(text).not.toContain("tooluse");
+    };
+
+    const first = await post("/v1/responses", turn("weather in Paris?"));
+    expect(first.status, first.text).toBe(200);
+    expectNoConverseId(first.text);
+    const call = responsesFunctionCall(JSON.parse(first.text).output);
+    expect(call.call_id).toMatch(/^call_/);
+    expect(call.arguments).toBe(WEATHER_ARGS);
+
+    // The agent's next turn: the call it was handed, and the call's output.
+    const second = await post(
+      "/v1/responses",
+      turn([
+        { role: "user", content: "weather in Paris?" },
+        { type: "function_call", id: call.id, call_id: call.call_id, name: "get_weather", arguments: WEATHER_ARGS },
+        { type: "function_call_output", call_id: call.call_id, output: "sunny" },
+      ]),
+    );
+    expect(second.status, second.text).toBe(200);
+    expectNoConverseId(second.text);
+    const forwarded = upstreamBody(upstream, 1).messages as Array<Record<string, any>>;
+    const assistant = forwarded.find((m) => m.role === "assistant");
+    const tool = forwarded.find((m) => m.role === "tool");
+    expect(assistant?.tool_calls?.[0]?.id).toBe(UPSTREAM_CONVERSE_TOOL_ID);
+    expect(tool?.tool_call_id).toBe(UPSTREAM_CONVERSE_TOOL_ID);
+    // The same upstream call comes back as the same call id.
+    expect(responsesFunctionCall(JSON.parse(second.text).output).call_id).toBe(call.call_id);
+
+    const streamed = await post("/v1/responses", turn("weather in Paris?", { stream: true }));
+    expect(streamed.status, streamed.text).toBe(200);
+    expectNoConverseId(streamed.text);
+    const events = sseEvents(streamed.text);
+    const added = events.find(
+      (e) => e.type === "response.output_item.added" && e.item?.type === "function_call",
+    );
+    expect(added?.item?.call_id).toBe(call.call_id);
+    const completed = events.find((e) => e.type === "response.completed");
+    expect(responsesFunctionCall(completed?.response?.output ?? []).call_id).toBe(call.call_id);
   });
 });
 

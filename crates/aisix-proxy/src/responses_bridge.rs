@@ -4522,7 +4522,14 @@ mod tests {
         let sealed = run(Some(sealer.clone()));
         let response = completed(&sealed);
         let call_id = response["output"][0]["call_id"].as_str().unwrap();
-        assert_eq!(sealer.unseal(call_id).as_deref(), Some("toolu_bdrk_01Y"));
+        // A call id is shown behind `call_`, not the upstream's `toolu_`.
+        assert!(call_id.starts_with("call_"), "{call_id}");
+        assert_eq!(
+            sealer
+                .unseal(crate::opaque_id::IdKind::Call, call_id)
+                .as_deref(),
+            Some("toolu_bdrk_01Y")
+        );
         assert!(response["usage"]["input_tokens_details"]
             .get("cache_creation_tokens")
             .is_none());
@@ -4532,7 +4539,8 @@ mod tests {
         );
         for event in &sealed {
             assert!(
-                !event.to_sse_string().contains("bdrk"),
+                !event.to_sse_string().contains("bdrk")
+                    && !event.to_sse_string().contains("toolu_"),
                 "{}",
                 event.to_sse_string()
             );

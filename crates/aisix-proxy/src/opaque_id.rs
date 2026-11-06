@@ -13,9 +13,10 @@
 //!   every request, and an upstream pairs a tool call with its result only
 //!   inside that one request, so the mapped id travels upstream unchanged on
 //!   the next turn and still pairs.
-//! - A Responses output item's ids are sealed reversibly ([`seal_id`]) and
+//! - A Responses output item's ids are sealed reversibly ([`Sealer`]) and
 //!   unsealed on their way back in ([`unseal_responses_input`]): that protocol
-//!   cannot take a substitute id, see there.
+//!   cannot take a substitute id, see there. An item id keeps its upstream's
+//!   prefix, and a call id is shown behind a fixed `call_` ([`IdKind`]).
 //!
 //! The usage event keeps the upstream's own id as `provider_request_id`;
 //! every rewrite here runs after telemetry has read the response.
@@ -129,6 +130,46 @@ pub(crate) fn seal_key(id_key: &[u8; 32]) -> [u8; 32] {
 /// The longest leading `<letters and digits>_` a sealed id keeps in the clear.
 const MAX_KEPT_PREFIX: usize = 16;
 
+/// The prefix every sealed call id is shown behind.
+const CALL_PREFIX: &str = "call_";
+
+/// What a Responses id names, which decides the prefix its seal is shown
+/// behind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IdKind {
+    /// An item's `id`, and an `approval_request_id`, which is the `id` of
+    /// the approval request item it answers. The seal keeps the upstream's
+    /// own prefix, because the upstream checks an item id's prefix.
+    Item,
+    /// A field that names a call: `call_id`, and a `caller`'s `caller_id`,
+    /// which is "the call ID of the program item that produced this tool
+    /// call" (openai-python `types/responses/response_function_tool_call.py`).
+    /// The seal is shown behind a fixed `call_` whatever the upstream wrote:
+    /// a translated answer's call id is the tool-call id of the Chat
+    /// Completions or Messages upstream that served it, and that id's prefix
+    /// (`tooluse_`, `toolu_`, `call_`) names the channel.
+    Call,
+}
+
+impl IdKind {
+    /// The byte that separates the two kinds in a seal's nonce and its
+    /// associated data, so a seal of one kind never opens as the other.
+    fn label(self) -> u8 {
+        match self {
+            IdKind::Item => b'i',
+            IdKind::Call => b'c',
+        }
+    }
+
+    /// The prefix a seal of `id` is shown behind.
+    fn shown_prefix(self, id: &str) -> &str {
+        match self {
+            IdKind::Item => kept_prefix(id),
+            IdKind::Call => CALL_PREFIX,
+        }
+    }
+}
+
 /// The part of an id kept in front of its sealed form: everything up to and
 /// including the first `_`, when that is a short run of ASCII letters and
 /// digits (`fc_`, `rs_`, `msg_`, `call_`). Anything else keeps nothing, so a
@@ -191,10 +232,12 @@ pub(crate) fn unpad(padded: &[u8]) -> Option<&[u8]> {
 
 /// Deterministic authenticated encryption of ids under one seal key, bound
 /// to one tenant: the nonce is synthetic,
-/// `HMAC-SHA256(key, "seal" || 0x00 || owner || id)[..12]`, so the same id
-/// always seals to the same value for one tenant — a stream's `item_id` on
-/// every delta matches the item it belongs to, and a replayed answer matches
-/// the first. The AES-256-GCM key is derived from the seal key under its own
+/// `HMAC-SHA256(key, "seal" || 0x00 || owner || kind || id)[..12]`, so the
+/// same id always seals to the same value for one tenant — a stream's
+/// `item_id` on every delta matches the item it belongs to, and a replayed
+/// answer matches the first. The kind ([`IdKind`]) and the prefix the seal is
+/// shown behind are its associated data, so no seal opens as another kind or
+/// behind another prefix. The AES-256-GCM key is derived from the seal key under its own
 /// label, so the nonce function and the cipher never share key material. The
 /// plaintext is padded to [`SEAL_BUCKET`] first.
 ///
@@ -245,36 +288,37 @@ impl Sealer {
         }
     }
 
-    /// The associated data of a seal: the owner, then the kept prefix, so
-    /// neither can be swapped for another.
-    fn aad(&self, prefix: &str) -> Vec<u8> {
-        [self.owner.as_slice(), prefix.as_bytes()].concat()
+    /// The associated data of a seal: the owner, the kind, then the prefix
+    /// the seal is shown behind, so none of them can be swapped for another.
+    fn aad(&self, kind: IdKind, prefix: &str) -> Vec<u8> {
+        [self.owner.as_slice(), &[kind.label()], prefix.as_bytes()].concat()
     }
 
-    fn nonce(&self, id: &str) -> [u8; aead::NONCE_LEN] {
+    fn nonce(&self, kind: IdKind, id: &str) -> [u8; aead::NONCE_LEN] {
         let mut ctx = hmac::Context::with_key(&self.nonce_key);
         ctx.update(b"seal");
         ctx.update(&[0]);
         ctx.update(&self.owner);
+        ctx.update(&[kind.label()]);
         ctx.update(id.as_bytes());
         let mut nonce = [0u8; aead::NONCE_LEN];
         nonce.copy_from_slice(&ctx.sign().as_ref()[..aead::NONCE_LEN]);
         nonce
     }
 
-    /// `<kept prefix>` + base64url(nonce || ciphertext || tag), the ciphertext
-    /// of the padded id, with the owner and the kept prefix as associated
-    /// data.
-    pub(crate) fn seal(&self, id: &str) -> String {
-        let prefix = kept_prefix(id);
-        let nonce = self.nonce(id);
+    /// `<shown prefix>` + base64url(nonce || ciphertext || tag), the
+    /// ciphertext of the padded id, with the owner, the kind and the shown
+    /// prefix as associated data.
+    pub(crate) fn seal(&self, kind: IdKind, id: &str) -> String {
+        let prefix = kind.shown_prefix(id);
+        let nonce = self.nonce(kind, id);
         let mut sealed = pad(id);
         let mut payload = Vec::with_capacity(aead::NONCE_LEN + sealed.len() + aead::MAX_TAG_LEN);
         payload.extend_from_slice(&nonce);
         self.cipher
             .seal_in_place_append_tag(
                 aead::Nonce::assume_unique_for_key(nonce),
-                aead::Aad::from(self.aad(prefix)),
+                aead::Aad::from(self.aad(kind, prefix)),
                 &mut sealed,
             )
             .expect("an id is far below the AES-GCM message limit");
@@ -282,20 +326,24 @@ impl Sealer {
         format!("{prefix}{}", b64().encode(payload))
     }
 
-    /// The id [`Self::seal`] was given; `None` for anything this sealer did
-    /// not seal, another tenant's seal included.
-    pub(crate) fn unseal(&self, id: &str) -> Option<String> {
+    /// The id [`Self::seal`] was given for `kind`; `None` for anything this
+    /// sealer did not seal as that kind, another tenant's seal included.
+    pub(crate) fn unseal(&self, kind: IdKind, id: &str) -> Option<String> {
         if id.len() < MIN_SEALED_LEN {
             return None;
         }
-        // The payload's alphabet includes `_`, so an id sealed without a
-        // prefix is also tried whole.
-        id.find('_')
-            .and_then(|end| self.open(&id[..=end], &id[end + 1..]))
-            .or_else(|| self.open("", id))
+        match kind {
+            // The payload's alphabet includes `_`, so an id sealed without a
+            // prefix is also tried whole.
+            IdKind::Item => id
+                .find('_')
+                .and_then(|end| self.open(kind, &id[..=end], &id[end + 1..]))
+                .or_else(|| self.open(kind, "", id)),
+            IdKind::Call => self.open(kind, CALL_PREFIX, id.strip_prefix(CALL_PREFIX)?),
+        }
     }
 
-    fn open(&self, prefix: &str, payload: &str) -> Option<String> {
+    fn open(&self, kind: IdKind, prefix: &str, payload: &str) -> Option<String> {
         let raw = b64().decode(payload).ok()?;
         if raw.len() < aead::NONCE_LEN + SEAL_BUCKET + aead::MAX_TAG_LEN {
             return None;
@@ -306,50 +354,73 @@ impl Sealer {
             .cipher
             .open_in_place(
                 aead::Nonce::try_assume_unique_for_key(nonce).ok()?,
-                aead::Aad::from(self.aad(prefix)),
+                aead::Aad::from(self.aad(kind, prefix)),
                 &mut buf,
             )
             .ok()?;
         let plain = String::from_utf8(unpad(plain)?.to_vec()).ok()?;
-        (kept_prefix(&plain) == prefix && self.nonce(&plain) == nonce).then_some(plain)
+        (kind.shown_prefix(&plain) == prefix && self.nonce(kind, &plain) == nonce).then_some(plain)
     }
 }
 
-/// Seal an upstream id reversibly. The id's leading `<prefix>_` stays in the
-/// clear (see [`kept_prefix`]) so the sealed id still passes an upstream's
-/// prefix check; the rest names nothing, not even the id's length.
+/// Seal an upstream item id reversibly. The id's leading `<prefix>_` stays
+/// in the clear (see [`kept_prefix`]) so the sealed id still passes an
+/// upstream's prefix check; the rest names nothing, not even the id's length.
 ///
 /// The one-off form of [`Sealer::seal`], for a caller with a single id; one
 /// that handles several builds one [`Sealer`] and reuses it.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub(crate) fn seal_id(key: &[u8; 32], owner: &str, upstream_id: &str) -> String {
-    Sealer::new(key, owner).seal(upstream_id)
+    Sealer::new(key, owner).seal(IdKind::Item, upstream_id)
 }
 
 /// The upstream id a [`seal_id`] value was made from; `None` for anything
-/// this key did not seal to `owner`, which the caller passes through
-/// untouched. The one-off form of [`Sealer::unseal`].
-#[cfg_attr(not(test), allow(dead_code))]
+/// this key did not seal to `owner` as an item, which the caller passes
+/// through untouched. The one-off form of [`Sealer::unseal`].
+#[cfg(test)]
 pub(crate) fn unseal_id(key: &[u8; 32], owner: &str, id: &str) -> Option<String> {
-    Sealer::new(key, owner).unseal(id)
+    Sealer::new(key, owner).unseal(IdKind::Item, id)
 }
 
-/// The fields of a Responses output item that name an item or a call — the
-/// values a client echoes back in a later request's `input[]`. A `caller`
-/// object's `caller_id` names a call too.
-const RESPONSES_ITEM_ID_FIELDS: [&str; 3] = ["id", "call_id", "approval_request_id"];
+/// [`seal_id`] for an id that names a call: shown behind `call_`.
+#[cfg(test)]
+pub(crate) fn seal_call(key: &[u8; 32], owner: &str, upstream_id: &str) -> String {
+    Sealer::new(key, owner).seal(IdKind::Call, upstream_id)
+}
 
-/// Run `visit` over every id field of one item.
-fn for_each_item_id(item: &mut Value, mut visit: impl FnMut(&mut String)) {
+/// [`unseal_id`] for an id that names a call.
+#[cfg(test)]
+pub(crate) fn unseal_call(key: &[u8; 32], owner: &str, id: &str) -> Option<String> {
+    Sealer::new(key, owner).unseal(IdKind::Call, id)
+}
+
+/// The kind of id a field of a Responses item holds, for the fields that
+/// name an item or a call — the values a client echoes back in a later
+/// request's `input[]`.
+fn item_field_kind(field: &str) -> Option<IdKind> {
+    match field {
+        "id" | "approval_request_id" => Some(IdKind::Item),
+        "call_id" => Some(IdKind::Call),
+        _ => None,
+    }
+}
+
+/// Run `visit` over every id field of one item, with the kind it holds. A
+/// `caller` object's `caller_id` names a call.
+fn for_each_item_id(item: &mut Value, mut visit: impl FnMut(IdKind, &mut String)) {
     let Value::Object(map) = item else {
         return;
     };
     for (field, value) in map.iter_mut() {
         match value {
-            Value::String(s) if RESPONSES_ITEM_ID_FIELDS.contains(&field.as_str()) => visit(s),
+            Value::String(s) => {
+                if let Some(kind) = item_field_kind(field) {
+                    visit(kind, s);
+                }
+            }
             Value::Object(caller) if field == "caller" => {
                 if let Some(Value::String(s)) = caller.get_mut("caller_id") {
-                    visit(s);
+                    visit(IdKind::Call, s);
                 }
             }
             _ => {}
@@ -368,9 +439,9 @@ pub(crate) fn seal_responses_body(sealer: &Sealer, body: &mut Value) {
 }
 
 fn seal_item(sealer: &Sealer, item: &mut Value) {
-    for_each_item_id(item, |slot| {
+    for_each_item_id(item, |kind, slot| {
         if !slot.is_empty() {
-            *slot = sealer.seal(slot);
+            *slot = sealer.seal(kind, slot);
         }
     });
 }
@@ -384,7 +455,7 @@ pub(crate) fn seal_responses_event(sealer: &Sealer, event: &mut Value) {
     }
     if let Some(Value::String(id)) = event.get_mut("item_id") {
         if !id.is_empty() {
-            *id = sealer.seal(id);
+            *id = sealer.seal(IdKind::Item, id);
         }
     }
     if let Some(response) = event.get_mut("response") {
@@ -405,27 +476,29 @@ pub(crate) fn drop_bridged_usage_extensions(response: &mut Value) {
     }
 }
 
-/// The paths [`seal_responses_event`] seals, for a byte splice over a
-/// Responses stream event.
-pub(crate) fn responses_event_id_path(path: &[PathSeg]) -> bool {
-    fn item_field(rest: &[PathSeg]) -> bool {
+/// The paths [`seal_responses_event`] seals, with the kind of id each holds,
+/// for a byte splice over a Responses stream event.
+pub(crate) fn responses_event_id_kind(path: &[PathSeg]) -> Option<IdKind> {
+    fn item_field(rest: &[PathSeg]) -> Option<IdKind> {
         match rest {
-            [PathSeg::Key(field)] => RESPONSES_ITEM_ID_FIELDS.contains(&field.as_str()),
-            [PathSeg::Key(caller), PathSeg::Key(field)] => {
-                caller == "caller" && field == "caller_id"
+            [PathSeg::Key(field)] => item_field_kind(field),
+            [PathSeg::Key(caller), PathSeg::Key(field)]
+                if caller == "caller" && field == "caller_id" =>
+            {
+                Some(IdKind::Call)
             }
-            _ => false,
+            _ => None,
         }
     }
     match path {
-        [PathSeg::Key(key)] => key == "item_id",
+        [PathSeg::Key(key)] if key == "item_id" => Some(IdKind::Item),
         [PathSeg::Key(item), rest @ ..] if item == "item" => item_field(rest),
         [PathSeg::Key(response), PathSeg::Key(output), PathSeg::Index(_), rest @ ..]
             if response == "response" && output == "output" =>
         {
             item_field(rest)
         }
-        _ => false,
+        _ => None,
     }
 }
 
@@ -465,12 +538,12 @@ pub(crate) fn unseal_responses_input(
     };
     let mut sealer: Option<Sealer> = None;
     for item in items {
-        for_each_item_id(item, |slot| {
+        for_each_item_id(item, |kind, slot| {
             if slot.len() < MIN_SEALED_LEN {
                 return;
             }
             let sealer = sealer.get_or_insert_with(|| Sealer::of(platform, owner));
-            if let Some(original) = sealer.unseal(slot) {
+            if let Some(original) = sealer.unseal(kind, slot) {
                 *slot = original;
             }
         });
@@ -743,6 +816,58 @@ pub(crate) mod tests {
         );
     }
 
+    /// A translated answer's call id is its upstream's tool-call id, whose
+    /// prefix names the channel. Sealed as a call it is shown behind `call_`
+    /// whatever that prefix was, at one length, and unseals to the original.
+    #[test]
+    fn a_sealed_call_id_shows_call_whatever_the_upstream_wrote() {
+        let converse = seal_call(&K, T, "tooluse_bdrk_01Y");
+        let anthropic = seal_call(&K, T, "toolu_vrtx_01Y");
+        let openai = seal_call(&K, T, "call_abc");
+        for sealed in [&converse, &anthropic, &openai] {
+            assert!(sealed.starts_with("call_"), "{sealed}");
+            assert!(
+                !sealed.contains("tooluse") && !sealed.contains("toolu_"),
+                "{sealed}"
+            );
+        }
+        assert_eq!(converse.len(), anthropic.len());
+        assert_eq!(converse.len(), openai.len());
+        assert_eq!(
+            unseal_call(&K, T, &converse).as_deref(),
+            Some("tooluse_bdrk_01Y")
+        );
+        assert_eq!(
+            unseal_call(&K, T, &anthropic).as_deref(),
+            Some("toolu_vrtx_01Y")
+        );
+        assert_eq!(unseal_call(&K, T, &openai).as_deref(), Some("call_abc"));
+        // Bound to the tenant like every seal.
+        assert_eq!(unseal_call(&K, "team-b", &converse), None);
+    }
+
+    /// The kind is part of a seal: an item seal never opens as a call, a
+    /// call seal never opens as an item, and neither opens behind another
+    /// prefix.
+    #[test]
+    fn a_seal_opens_only_as_the_kind_it_was_made_for() {
+        let item = seal_id(&K, T, "fc_bdrk_1");
+        let call = seal_call(&K, T, "tooluse_bdrk_1");
+        assert_eq!(unseal_call(&K, T, &item), None);
+        assert_eq!(unseal_call(&K, T, &item.replacen("fc_", "call_", 1)), None);
+        assert_eq!(unseal_id(&K, T, &call), None);
+        assert_eq!(
+            unseal_id(&K, T, &call.replacen("call_", "tooluse_", 1)),
+            None
+        );
+        // Even where the shown prefixes agree, the two kinds seal apart.
+        let as_item = seal_id(&K, T, "call_x");
+        let as_call = seal_call(&K, T, "call_x");
+        assert_ne!(as_item, as_call);
+        assert_eq!(unseal_call(&K, T, &as_item), None);
+        assert_eq!(unseal_id(&K, T, &as_call), None);
+    }
+
     /// The length of a sealed id says nothing about the id it was made
     /// from: one upstream's short ids and another's long ones look alike.
     #[test]
@@ -909,7 +1034,7 @@ pub(crate) mod tests {
         let k = seal_key(&platform.id_key);
         let mut body = json!({"model": "m", "input": [
             {"type": "item_reference", "id": seal_id(&k, "team-a", "msg_bdrk_1")},
-            {"type": "function_call_output", "call_id": seal_id(&k, "team-a", "call_bdrk_1"),
+            {"type": "function_call_output", "call_id": seal_call(&k, "team-a", "call_bdrk_1"),
              "output": "sunny"},
         ]});
         let sent = body.clone();
@@ -925,16 +1050,16 @@ pub(crate) mod tests {
     #[test]
     fn the_owner_is_length_prefixed_in_the_nonce_and_the_associated_data() {
         assert_ne!(
-            Sealer::new(&K, "ab").aad("c_"),
-            Sealer::new(&K, "a").aad("bc_")
+            Sealer::new(&K, "ab").aad(IdKind::Item, "c_"),
+            Sealer::new(&K, "a").aad(IdKind::Item, "bc_")
         );
         assert_ne!(
-            Sealer::new(&K, "ab").nonce("c"),
-            Sealer::new(&K, "a").nonce("bc")
+            Sealer::new(&K, "ab").nonce(IdKind::Item, "c"),
+            Sealer::new(&K, "a").nonce(IdKind::Item, "bc")
         );
         assert_eq!(
-            Sealer::new(&K, "ab").aad("c_"),
-            [&2u64.to_be_bytes()[..], b"abc_"].concat()
+            Sealer::new(&K, "ab").aad(IdKind::Item, "c_"),
+            [&2u64.to_be_bytes()[..], b"abic_"].concat()
         );
     }
 
@@ -961,10 +1086,13 @@ pub(crate) mod tests {
         assert!(!text.contains("bdrk") && !text.contains("prog_1"), "{text}");
         // The response-level id is not an item id.
         assert_eq!(body["id"], "resp_up");
-        assert_eq!(body["output"][1]["call_id"], seal_id(&K, T, "call_bdrk_1"));
+        assert_eq!(
+            body["output"][1]["call_id"],
+            seal_call(&K, T, "call_bdrk_1")
+        );
         assert_eq!(
             body["output"][1]["caller"]["caller_id"],
-            seal_id(&K, T, "call_prog_1")
+            seal_call(&K, T, "call_prog_1")
         );
         assert_eq!(
             body["output"][2]["approval_request_id"],
@@ -1012,7 +1140,7 @@ pub(crate) mod tests {
         assert_eq!(done["response"]["output"][0]["id"], item_id);
         assert_eq!(
             done["response"]["output"][0]["call_id"],
-            seal_id(&K, T, "call_bdrk_1")
+            seal_call(&K, T, "call_bdrk_1")
         );
         assert_eq!(done["response"]["id"], "resp_up");
         assert_eq!(
@@ -1025,22 +1153,31 @@ pub(crate) mod tests {
     #[test]
     fn the_event_path_predicate_selects_the_fields_the_value_walk_seals() {
         let event = br#"{"type":"response.completed","item_id":"fc_bdrk_1","item":{"id":"fc_bdrk_1","call_id":"call_bdrk_1","caller":{"caller_id":"call_p"}},"response":{"id":"resp_up","output":[{"id":"fc_bdrk_1","call_id":"call_bdrk_1","approval_request_id":"mcpr_1","name":"keep"}]}}"#;
+        let kind = std::cell::Cell::new(None);
         let mut seen = Vec::new();
-        crate::json_splice::rewrite_string_values(event, responses_event_id_path, |v| {
-            seen.push(v.to_owned());
-            None
-        })
+        crate::json_splice::rewrite_string_values(
+            event,
+            |path| {
+                kind.set(responses_event_id_kind(path));
+                kind.get().is_some()
+            },
+            |v| {
+                seen.push((v.to_owned(), kind.get().unwrap()));
+                None
+            },
+        )
         .unwrap();
+        use IdKind::{Call, Item};
         assert_eq!(
             seen,
             [
-                "fc_bdrk_1",
-                "fc_bdrk_1",
-                "call_bdrk_1",
-                "call_p",
-                "fc_bdrk_1",
-                "call_bdrk_1",
-                "mcpr_1"
+                ("fc_bdrk_1".to_string(), Item),
+                ("fc_bdrk_1".to_string(), Item),
+                ("call_bdrk_1".to_string(), Call),
+                ("call_p".to_string(), Call),
+                ("fc_bdrk_1".to_string(), Item),
+                ("call_bdrk_1".to_string(), Call),
+                ("mcpr_1".to_string(), Item),
             ]
         );
     }
@@ -1050,16 +1187,17 @@ pub(crate) mod tests {
         let platform = crate::platform::PlatformSettings::from_secret("s");
         let k = seal_key(&platform.id_key);
         let seal_id = |id: &str| seal_id(&k, T, id);
+        let seal_call = |id: &str| seal_call(&k, T, id);
         let mut body = json!({
             "model": "m",
             "previous_response_id": "resp_up",
             "input": [
                 {"type": "function_call", "id": seal_id("fc_bdrk_1"),
-                 "call_id": seal_id("call_bdrk_1"), "name": "f", "arguments": "{}"},
-                {"type": "function_call_output", "call_id": seal_id("call_bdrk_1"), "output": "ok"},
+                 "call_id": seal_call("call_bdrk_1"), "name": "f", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": seal_call("call_bdrk_1"), "output": "ok"},
                 {"type": "mcp_approval_response", "approval_request_id": seal_id("mcpr_1"), "approve": true},
                 {"type": "function_call_output", "call_id": "call_client_made", "output": "x",
-                 "caller": {"type": "program", "caller_id": seal_id("call_p")}},
+                 "caller": {"type": "program", "caller_id": seal_call("call_p")}},
                 {"type": "message", "role": "user", "content": "hi", "id": "msg_client"},
             ],
         });
@@ -1108,8 +1246,8 @@ pub(crate) mod tests {
         let shortest = seal_id(&K, T, "");
         assert_eq!(shortest.len(), MIN_SEALED_LEN);
         let sealer = Sealer::new(&K, T);
-        assert_eq!(sealer.unseal(&shortest).as_deref(), Some(""));
-        assert_eq!(sealer.unseal(&shortest[1..]), None);
+        assert_eq!(sealer.unseal(IdKind::Item, &shortest).as_deref(), Some(""));
+        assert_eq!(sealer.unseal(IdKind::Item, &shortest[1..]), None);
     }
 
     #[test]

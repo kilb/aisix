@@ -581,7 +581,8 @@ enum Slot {
     ResponseId,
     PreviousResponseId,
     EncryptedContent,
-    ItemId,
+    /// An id platform mode seals, with the kind it holds.
+    Id(crate::opaque_id::IdKind),
 }
 
 impl ResponseMark {
@@ -650,11 +651,11 @@ impl ResponseMark {
                 .as_ref()
                 .filter(|(original, _)| original == value)
                 .map(|(_, sent)| sent.clone()),
-            Slot::ItemId => self
+            Slot::Id(kind) => self
                 .seal
                 .as_ref()
                 .filter(|_| !value.is_empty())
-                .map(|sealer| sealer.seal(value)),
+                .map(|sealer| sealer.seal(kind, value)),
         }
     }
 
@@ -723,8 +724,8 @@ impl ResponseMark {
                 [PathSeg::Key(i), PathSeg::Key(e)] if i == "item" && e == "encrypted_content" => {
                     Some(Slot::EncryptedContent)
                 }
-                _ if self.seal.is_some() && crate::opaque_id::responses_event_id_path(path) => {
-                    Some(Slot::ItemId)
+                _ if self.seal.is_some() => {
+                    crate::opaque_id::responses_event_id_kind(path).map(Slot::Id)
                 }
                 _ => None,
             };
@@ -874,7 +875,7 @@ mod tests {
 
     #[test]
     fn a_sealing_mark_seals_item_ids_beside_the_context_tags() {
-        use crate::opaque_id::seal_id;
+        use crate::opaque_id::{seal_call, seal_id};
         let (mark, key) = sealing_mark(Some("m-1"));
         let mut body = json!({
             "id": "resp_up",
@@ -897,7 +898,7 @@ mod tests {
         );
         assert_eq!(
             body["output"][0]["call_id"],
-            seal_id(&key, "team-a", "call_bdrk_1")
+            seal_call(&key, "team-a", "call_bdrk_1")
         );
         assert_eq!(body["output"][1]["id"], seal_id(&key, "team-a", "rs_1"));
         assert_eq!(
