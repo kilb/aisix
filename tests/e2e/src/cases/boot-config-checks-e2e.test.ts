@@ -120,3 +120,21 @@ describe("a request body limit of null", () => {
     expect(logs).not.toContain("request_body_limit_bytes");
   });
 });
+
+describe("a metric label selection without what billing reads", () => {
+  test("stops the boot, naming the label and why it is kept", async () => {
+    const { code, logs } = await boot({
+      observability: {
+        metrics: {
+          prometheus: { enabled: false },
+          labels: { aisix_llm_spend_micro_usd_total: ["endpoint", "model"] },
+        },
+      },
+    });
+    expect(code, logs).not.toBe(0);
+    expect(logs).toContain("aisix_llm_spend_micro_usd_total");
+    expect(logs).toContain("user_id");
+    expect(logs).toContain("portal");
+  });
+});
+

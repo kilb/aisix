@@ -279,7 +279,12 @@ pub static METRIC_DEFINITIONS: &[MetricDefinition] = &[
         extra = &["policy_name"]
     ),
     metric!(M_TOKENS_CONSUMED, &["provider", "model"]),
-    metric!(M_LLM_SPEND_MICRO_USD_TOTAL, USAGE, extra = CALLER_NAMES),
+    metric!(
+        M_LLM_SPEND_MICRO_USD_TOTAL,
+        USAGE,
+        extra = CALLER_NAMES,
+        required = &["user_id"]
+    ),
     metric!(M_LLM_INPUT_TOKENS_TOTAL, USAGE, extra = CALLER_NAMES),
     metric!(M_LLM_OUTPUT_TOKENS_TOTAL, USAGE, extra = CALLER_NAMES),
     metric!(M_LLM_TOTAL_TOKENS_TOTAL, USAGE, extra = CALLER_NAMES),
@@ -561,7 +566,16 @@ impl LabelSelection {
             }
             for required in definition.required_labels {
                 if !labels.iter().any(|label| label == required) {
-                    return Err(format!("observability.metrics.labels.{name}: must retain identity label {required:?}"));
+                    let why = match (definition.name, *required) {
+                        (M_LLM_SPEND_MICRO_USD_TOTAL, "user_id") => {
+                            ": the portal bills each user from this label"
+                        }
+                        _ => "",
+                    };
+                    return Err(format!(
+                        "observability.metrics.labels.{name}: must retain identity label \
+                         {required:?}{why}"
+                    ));
                 }
             }
         }
@@ -1029,12 +1043,27 @@ mod tests {
                 M_DEPLOYMENT_STATE,
                 vec!["provider", "model", "upstream_model"],
             ),
+            (M_LLM_SPEND_MICRO_USD_TOTAL, vec!["endpoint", "model"]),
         ] {
             assert!(
                 LabelSelection::compile(&selection(name, &labels)).is_err(),
                 "{name}: {labels:?}"
             );
         }
+    }
+
+    /// Spend is billed per user from `user_id`: a selection without it would
+    /// merge every user's spend into one series the portal cannot bill from.
+    #[test]
+    fn spend_refuses_a_selection_without_the_label_billing_reads() {
+        let error = LabelSelection::compile(&selection(
+            M_LLM_SPEND_MICRO_USD_TOTAL,
+            &["endpoint", "model"],
+        ))
+        .unwrap_err();
+        assert!(error.contains("\"user_id\""), "{error}");
+        assert!(error.contains("portal bills"), "{error}");
+        LabelSelection::compile(&selection(M_LLM_SPEND_MICRO_USD_TOTAL, &["user_id"])).unwrap();
     }
 
     /// Every family that can carry an identifier label can carry its
