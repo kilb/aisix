@@ -1374,7 +1374,10 @@ pub async fn post_ownership(
 ///
 /// A known gap (P1-R15): should the commit fail once the claim has moved,
 /// the environment has changed owner without its audit row. That is logged
-/// at error level and answered `500 internal`.
+/// at error level and answered `500 internal`. The same holds when the
+/// write's answer is lost and the claim cannot be read back to confirm it:
+/// that is answered `500 takeover_unconfirmed`, never a `503` that would
+/// invite a retry the moved claim then refuses.
 pub async fn take_over_with(
     db: &Db,
     kine: &dyn KineWriter,
@@ -1444,9 +1447,23 @@ async fn take_over(
         Ok(WriteOutcome::Conflict { .. }) => return Err(owned_elsewhere()),
         // The answer was lost, a timeout say, but the write may have landed:
         // the claim says which, and a claim that moved keeps its audit row.
-        Err(_) => match kine.get(&key).await {
-            Ok(Some(kv)) if claim_owner(&kv.value) == Some(mine) => {}
-            _ => return Err(ApiError::unavailable()),
+        Err(_) => match claim_after_lost_answer(kine, &key).await {
+            Some(owner) if owner == Some(mine) => {}
+            // Still the owner it was taken from: nothing moved, and asking
+            // again is safe.
+            Some(owner) if previous.is_some() && owner == previous => {
+                return Err(ApiError::unavailable())
+            }
+            Some(_) => return Err(owned_elsewhere()),
+            None => {
+                tracing::error!(
+                    from = ?previous,
+                    to = %mine,
+                    "the takeover's outcome cannot be confirmed (the P1-R15 gap): the claim \
+                     may name this database while no audit row records it"
+                );
+                return Err(takeover_unconfirmed());
+            }
         },
     }
     if let Err(e) = tx.commit().await {
@@ -1460,6 +1477,43 @@ async fn take_over(
     }
     tracing::warn!(from = ?previous, to = %mine, "this control plane took the environment over");
     Ok(json!({ "owner_database_id": mine }))
+}
+
+/// How often a takeover reads the claim back after its write's answer was
+/// lost, and how long it waits between reads.
+const CONFIRM_ATTEMPTS: usize = 3;
+const CONFIRM_PAUSE: Duration = Duration::from_millis(200);
+
+/// The owner the claim names once kine answers a read of it again: the
+/// claim's database id (`None` inside for a claim naming none); `None` when
+/// no read succeeded with the claim present, which leaves the outcome
+/// unknown.
+async fn claim_after_lost_answer(kine: &dyn KineWriter, key: &str) -> Option<Option<Uuid>> {
+    for attempt in 0..CONFIRM_ATTEMPTS {
+        if attempt > 0 {
+            tokio::time::sleep(CONFIRM_PAUSE).await;
+        }
+        if let Ok(Some(kv)) = kine.get(key).await {
+            return Some(claim_owner(&kv.value));
+        }
+    }
+    None
+}
+
+/// `500 takeover_unconfirmed`: the takeover's write may have moved the claim
+/// although its answer was lost, and reading the claim back did not settle
+/// it. Asking again would be refused if it did move, so the answer says to
+/// check instead.
+fn takeover_unconfirmed() -> ApiError {
+    ApiError {
+        status: axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        code: "takeover_unconfirmed",
+        message: "无法确认接管是否已生效：请先核对该环境当前的归属与审计日志，不要直接重试"
+            .to_string(),
+        details: Vec::new(),
+        referenced_by: Vec::new(),
+        current_version: None,
+    }
 }
 
 #[cfg(test)]

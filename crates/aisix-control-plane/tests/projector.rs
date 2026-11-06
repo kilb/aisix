@@ -1133,6 +1133,18 @@ async fn reconcile_removes_a_few_strays_and_leaves_other_prefixes_alone() {
     assert_eq!(audit[0].1.as_deref(), Some(admin.email.as_str()));
 }
 
+/// How many live documents `db` holds for its platform tenant.
+async fn platform_documents(db: &Db) -> usize {
+    let n: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM gw_resources WHERE NOT deleted \
+           AND managed_by = (SELECT 'tenant:' || id FROM tenants WHERE is_internal)",
+    )
+    .fetch_one(db.pool())
+    .await
+    .expect("count the platform tenant's documents");
+    usize::try_from(n).expect("a count")
+}
+
 /// The keys of every live row of `db`: what the prefix holds once it is
 /// projected, the platform tenant's own documents included.
 async fn live_keys(db: &Db, env: &EnvSettings) -> BTreeSet<String> {
@@ -1307,7 +1319,11 @@ async fn reconcile_on_an_empty_database_deletes_nothing_until_an_admin_allows_it
     let prefix = env.env_prefix();
     // The 20, and the original's platform tenant documents.
     let original = raw_keys(&kine, &prefix).await;
-    assert!(original.len() >= 20, "{original:?}");
+    assert_eq!(
+        original.len(),
+        20 + platform_documents(first.db()).await,
+        "{original:?}"
+    );
 
     // The same database as it was before any of it was written, restored
     // from a backup, in place of the original.
@@ -1601,6 +1617,11 @@ enum Injection {
     /// Leaves the session alone: the write is applied, and its answer is
     /// lost.
     LostAnswer,
+    /// As `LostAnswer`, and every later read of the key fails too.
+    LostThenUnreadable,
+    /// Leaves the session alone: the write is not applied, and the call
+    /// fails as if kine could not be reached.
+    Refused,
 }
 
 /// Another projector, or another control plane, taking over in the middle
@@ -1617,6 +1638,8 @@ struct Deposer {
     ops: Mutex<Vec<(&'static str, String)>>,
     /// Writes sent while no session held the lock.
     deposed: Mutex<Vec<(&'static str, String)>>,
+    /// A key every read of fails, once set.
+    blind: Mutex<Option<String>>,
 }
 
 impl Deposer {
@@ -1627,6 +1650,7 @@ impl Deposer {
             armed: Mutex::default(),
             ops: Mutex::default(),
             deposed: Mutex::default(),
+            blind: Mutex::default(),
         })
     }
 
@@ -1793,12 +1817,24 @@ impl KineWriter for Deposer {
             self.reassign(&claim, owner).await;
             return updated;
         }
-        if let Injection::LostAnswer = injection {
-            self.inner.update(key, rev, value).await?;
-            self.note("update:injected", key);
-            return Err(KineError::Unavailable(
-                "injected: the answer was lost".to_string(),
-            ));
+        match injection {
+            Injection::LostAnswer | Injection::LostThenUnreadable => {
+                self.inner.update(key, rev, value).await?;
+                self.note("update:injected", key);
+                if let Injection::LostThenUnreadable = injection {
+                    *self.blind.lock().expect("lock") = Some(key.to_string());
+                }
+                return Err(KineError::Unavailable(
+                    "injected: the answer was lost".to_string(),
+                ));
+            }
+            Injection::Refused => {
+                self.note("update:injected", key);
+                return Err(KineError::Unavailable(
+                    "injected: the write was refused".to_string(),
+                ));
+            }
+            _ => {}
         }
         self.end_session().await;
         self.note("update:injected", key);
@@ -1808,9 +1844,11 @@ impl KineWriter for Deposer {
                 self.delete_as_new_leader(key).await?;
                 Ok(WriteOutcome::Conflict { current: None })
             }
-            Injection::Answered | Injection::ThenClaimedBy { .. } | Injection::LostAnswer => {
-                self.inner.update(key, rev, value).await
-            }
+            Injection::Answered
+            | Injection::ThenClaimedBy { .. }
+            | Injection::LostAnswer
+            | Injection::LostThenUnreadable
+            | Injection::Refused => self.inner.update(key, rev, value).await,
         }
     }
 
@@ -1832,11 +1870,19 @@ impl KineWriter for Deposer {
             Injection::Deleted
             | Injection::Answered
             | Injection::ThenClaimedBy { .. }
-            | Injection::LostAnswer => self.inner.delete(key, rev).await,
+            | Injection::LostAnswer
+            | Injection::LostThenUnreadable
+            | Injection::Refused => self.inner.delete(key, rev).await,
         }
     }
 
     async fn get(&self, key: &str) -> Result<Option<KeyValue>, KineError> {
+        if self.blind.lock().expect("lock").as_deref() == Some(key) {
+            self.note("get:blind", key);
+            return Err(KineError::Unavailable(
+                "injected: the key cannot be read".to_string(),
+            ));
+        }
         let Some(injection) = self.fires("get", key) else {
             return self.inner.get(key).await;
         };
@@ -1856,7 +1902,9 @@ impl KineWriter for Deposer {
             Injection::Rewritten
             | Injection::Answered
             | Injection::ThenClaimedBy { .. }
-            | Injection::LostAnswer => self.inner.get(key).await,
+            | Injection::LostAnswer
+            | Injection::LostThenUnreadable
+            | Injection::Refused => self.inner.get(key).await,
         }
     }
 
@@ -3140,7 +3188,8 @@ async fn an_approved_tenant_reaches_kine_as_its_team_and_limits() {
         .get_with_cookie(&format!("/admin/tenants/{tenant}"), op.cookie())
         .await;
     assert_eq!(r.status, 200, "{r:?}");
-    assert_ne!(r.body["rollout"]["state"], "pending", "{r:?}");
+    // No gateway runs here, so nothing can be further along.
+    assert_eq!(r.body["rollout"]["state"], "no_gateways", "{r:?}");
 }
 
 #[tokio::test]
@@ -3242,4 +3291,148 @@ async fn a_takeover_whose_answer_was_lost_is_still_audited() {
         })]
     );
     assert_eq!(blocked_by(db).await, None);
+}
+
+// ---- integration follow-ups ------------------------------------------------
+
+/// Two control planes on one environment: the first owns it, the second is
+/// blocked and about to take it over. The second's database, the first's
+/// id, and the second's.
+async fn a_blocked_second(first: &TestCp, endpoint: &str) -> (TestCp, Uuid, Value) {
+    let env = first.env().clone();
+    let first_id: Uuid = setting(first.db(), "database_id")
+        .await
+        .and_then(|id| id.as_str().and_then(|id| id.parse().ok()))
+        .expect("an id");
+    all_projected(first.db()).await;
+    let endpoint = endpoint.to_string();
+    let second = TestCp::start_with(|cfg| {
+        cfg.kine_endpoint = endpoint;
+        cfg.env_id_seed = Some(env.env_id);
+    })
+    .await
+    .expect("the second control plane boots");
+    let second_id = setting(second.db(), "database_id").await.expect("an id");
+    let db = second.db();
+    eventually("the second to be blocked", PATIENCE, || async move {
+        blocked_by(db).await == Some(json!(first_id))
+    })
+    .await;
+    (second, first_id, second_id)
+}
+
+fn an_admin() -> OperatorAuth {
+    OperatorAuth {
+        id: Uuid::new_v4(),
+        email: "takeover@ops.test".to_string(),
+        role: OperatorRole::Admin,
+    }
+}
+
+async fn takeover_rows(db: &Db) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM audit_log WHERE action = 'rollout.ownership.taken_over'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .expect("read the audit log")
+}
+
+#[tokio::test]
+async fn a_takeover_whose_outcome_cannot_be_confirmed_says_so() {
+    let Some(first) = TestCp::start_with_kine().await else {
+        return;
+    };
+    let endpoint = support::kine_endpoint().expect("kine is configured");
+    let kine = raw_kine(&endpoint).await;
+    let (second, first_id, second_id) = a_blocked_second(&first, &endpoint).await;
+    drop(first);
+    let db = second.db();
+
+    // The claim moves, the answer is lost, and the claim cannot be read back.
+    let claim = claim_key(second.env());
+    let deposer = Deposer::new(&endpoint, db).await;
+    deposer.arm("update", &claim, Injection::LostThenUnreadable);
+    let taken =
+        projector::take_over_with(db, &*deposer, &ctx(second.env()), &an_admin(), first_id).await;
+    let refused = taken.expect_err("the outcome is unknown");
+    assert_eq!(
+        (refused.status.as_u16(), refused.code),
+        (500, "takeover_unconfirmed")
+    );
+    // It read the claim again before giving up.
+    let reads = deposer
+        .ops()
+        .iter()
+        .filter(|(op, _)| *op == "get:blind")
+        .count();
+    assert_eq!(reads, 3);
+    // The known gap, as it stands: the claim moved, and no audit row says so.
+    let (value, _) = raw_json(&kine, &claim).await.expect("the claim");
+    assert_eq!(value, json!({ "database_id": second_id }));
+    assert_eq!(takeover_rows(db).await, 0);
+}
+
+#[tokio::test]
+async fn a_takeover_whose_write_was_refused_moves_nothing() {
+    let Some(first) = TestCp::start_with_kine().await else {
+        return;
+    };
+    let endpoint = support::kine_endpoint().expect("kine is configured");
+    let kine = raw_kine(&endpoint).await;
+    let (second, first_id, _) = a_blocked_second(&first, &endpoint).await;
+    let db = second.db();
+
+    // The write never lands, and the call fails as a lost answer would.
+    let claim = claim_key(second.env());
+    let deposer = Deposer::new(&endpoint, db).await;
+    deposer.arm("update", &claim, Injection::Refused);
+    let taken =
+        projector::take_over_with(db, &*deposer, &ctx(second.env()), &an_admin(), first_id).await;
+    let refused = taken.expect_err("nothing moved");
+    assert_eq!(
+        (refused.status.as_u16(), refused.code),
+        (503, "unavailable")
+    );
+    let (value, _) = raw_json(&kine, &claim).await.expect("the claim");
+    assert_eq!(value, json!({ "database_id": first_id }));
+    assert_eq!(takeover_rows(db).await, 0);
+    assert_eq!(blocked_by(db).await, Some(json!(first_id)));
+}
+
+#[tokio::test]
+async fn shutdown_frees_the_projector_lock() {
+    let Some(mut cp) = support::StoppableCp::start_with_kine().await else {
+        return;
+    };
+    let db = cp.db().clone();
+    eventually("this instance to lead", PATIENCE, || {
+        let db = &db;
+        async move { lock_holders(db).await.len() == 1 }
+    })
+    .await;
+
+    let took = cp
+        .shut_down(Duration::from_secs(10))
+        .await
+        .expect("wait() returns within seconds of the shutdown");
+    assert!(took < Duration::from_secs(10), "{took:?}");
+    // Another session takes the lock, as another instance would.
+    let url = cp.database_url().to_string();
+    eventually("the lock to be free", Duration::from_secs(5), || {
+        let url = url.clone();
+        async move {
+            let Ok(mut other) = PgConnection::connect(&url).await else {
+                return false;
+            };
+            let won: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
+                .bind(PROJECTOR_LOCK_KEY)
+                .fetch_one(&mut other)
+                .await
+                .unwrap_or(false);
+            let _ = other.close().await;
+            won
+        }
+    })
+    .await;
 }

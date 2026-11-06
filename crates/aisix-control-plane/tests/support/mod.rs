@@ -150,10 +150,11 @@ struct TestDatabase {
 /// shared by every test binary running beside this one.
 ///
 /// A test holds its slots until it ends, so this is deadlock-free only while
-/// fewer than this many tests of one binary hold two databases at the same
-/// time: that many, each waiting for its second, would wait on each other.
-/// The wait is bounded by [`DATABASE_SLOT_WAIT`], and reports this.
-static DATABASE_SLOTS: Semaphore = Semaphore::const_new(8);
+/// fewer than 16 tests of one binary hold two databases at the same time:
+/// 16 of them, each holding one slot and waiting for its second, would wait
+/// on each other. The wait is bounded by [`DATABASE_SLOT_WAIT`], and reports
+/// this.
+static DATABASE_SLOTS: Semaphore = Semaphore::const_new(16);
 
 const DATABASE_SLOT_WAIT: std::time::Duration = std::time::Duration::from_secs(600);
 
@@ -707,5 +708,65 @@ impl BareDatabase {
     /// The database URL, for connections of a test's own.
     pub fn url(&self) -> &str {
         &self._database.url
+    }
+}
+
+/// A control plane on the test kine whose shutdown the test triggers, on a
+/// database that lives as long as this does.
+pub struct StoppableCp {
+    running: Option<Running>,
+    stop: Option<tokio::sync::oneshot::Sender<()>>,
+    // A handle of its own: still usable once the control plane has stopped.
+    db: Db,
+    // Declared last: the database goes after everything using it.
+    database: Arc<TestDatabase>,
+}
+
+impl StoppableCp {
+    /// `None` when either service is not configured (outside CI).
+    pub async fn start_with_kine() -> Option<StoppableCp> {
+        let endpoint = kine_endpoint()?;
+        let database = new_database().await?;
+        let mut cfg = test_config(&database.url);
+        cfg.kine_endpoint = endpoint;
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let running = aisix_control_plane::start(cfg, async move {
+            let _ = stopped.await;
+        })
+        .await
+        .expect("the control plane boots");
+        let db = running.state.db.clone();
+        Some(StoppableCp {
+            running: Some(running),
+            stop: Some(stop),
+            db,
+            database,
+        })
+    }
+
+    pub fn db(&self) -> &Db {
+        &self.db
+    }
+
+    /// The database URL, for a session of the test's own.
+    pub fn database_url(&self) -> &str {
+        &self.database.url
+    }
+
+    /// Resolves the shutdown and waits for the control plane to stop: how
+    /// long that took, or `None` when it took longer than `within`.
+    pub async fn shut_down(&mut self, within: std::time::Duration) -> Option<std::time::Duration> {
+        let running = self.running.take().expect("still running");
+        let started = std::time::Instant::now();
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        match tokio::time::timeout(within, running.wait()).await {
+            Ok(stopped) => {
+                stopped.expect("the control plane stops cleanly");
+                Some(started.elapsed())
+            }
+            Err(_) => None,
+        }
     }
 }
