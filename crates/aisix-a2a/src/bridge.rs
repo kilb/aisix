@@ -864,8 +864,15 @@ mod tests {
         );
     }
 
+    /// Orders the tests that free a loopback port and connect to it later
+    /// against the one that listens on a fresh port. Without it the kernel can
+    /// hand the freed port to that listener, and a refused-connection test
+    /// then dials it and consumes the listener's single `accept`.
+    static LOOPBACK_PORT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     #[tokio::test]
     async fn transport_errors_never_include_endpoint_path_or_query() {
+        let _port_guard = LOOPBACK_PORT_LOCK.lock().await;
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         drop(listener);
@@ -996,8 +1003,30 @@ mod tests {
         assert_eq!(back["skills"][0]["id"], "s1");
     }
 
+    /// Only one capturing test at a time: dropping a scoped dispatcher
+    /// recomputes tracing's global max-level hint, which a concurrent capture
+    /// could otherwise observe mid-update.
+    static CAPTURE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Keep every callsite emittable for the whole test binary.
+    ///
+    /// A callsite's `Interest` is cached process-wide the first time it is
+    /// hit, from whichever dispatcher the hitting thread has. With no global
+    /// default that is `NoSubscriber`, so a sibling test reaching the same
+    /// `warn!` on another thread caches `Interest::never()` and the event is
+    /// then skipped everywhere, including inside the capture (an empty log).
+    /// A bare global registry writes nothing and keeps every callsite enabled.
+    fn keep_callsites_enabled() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            let _ = tracing::subscriber::set_global_default(tracing_subscriber::registry());
+        });
+    }
+
     /// Run `f` under a capturing subscriber; returns its result and what it logged.
     async fn capture_logs<T>(f: impl std::future::Future<Output = T>) -> (T, String) {
+        keep_callsites_enabled();
+        let _capture_guard = CAPTURE_LOCK.lock().await;
         #[derive(Clone, Default)]
         struct Buf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
         impl std::io::Write for Buf {
@@ -1033,6 +1062,7 @@ mod tests {
     /// given, so the transport cause reaches the log and nothing else.
     #[tokio::test]
     async fn a_transport_failure_logs_its_cause_and_keeps_the_error_text() {
+        let _port_guard = LOOPBACK_PORT_LOCK.lock().await;
         let bridge = bridge_at(&refused_url("/a2a"));
         let (result, logged) = capture_logs(bridge.send(&serde_json::json!({}))).await;
         let err = result.expect_err("nothing listens");
@@ -1054,6 +1084,11 @@ mod tests {
             sock.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 100\r\n\r\nshort")
                 .await
                 .unwrap();
+            // Half-close, then wait for the client to hang up. Dropping the
+            // socket with request bytes still unread would send a reset, and
+            // the client would see a reset instead of the short body.
+            let _ = sock.shutdown().await;
+            while matches!(sock.read(&mut request).await, Ok(n) if n > 0) {}
         });
         format!("http://{addr}{path}")
     }
@@ -1061,6 +1096,7 @@ mod tests {
     /// As for a failed send: the read's cause stays out of the error's text.
     #[tokio::test]
     async fn a_failed_body_read_logs_its_cause_and_keeps_the_error_text() {
+        let _port_guard = LOOPBACK_PORT_LOCK.lock().await;
         let bridge = bridge_at(&cut_short_url("/a2a").await);
         let (result, logged) = capture_logs(bridge.send(&serde_json::json!({}))).await;
         let text = result.expect_err("the body is cut short").to_string();
