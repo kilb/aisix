@@ -9,7 +9,7 @@
 //! | `CP_DP_HOSTS` | required | Comma-separated DNS names or IP addresses that gateways use to reach the gateway listener. They become the SANs of the control plane's server certificate. |
 //! | `CP_HTTP_ADDR` | `127.0.0.1:8090` | Browser listener (`/healthz`, `/admin/*`, `/api/*`), meant to sit behind a reverse proxy. |
 //! | `CP_DP_ADDR` | `0.0.0.0:7943` | Gateway listener (mTLS: `/dp/*` and the read-only etcd front). |
-//! | `CP_DP_BASE_URL` | `https://<first CP_DP_HOSTS entry>:<port of CP_DP_ADDR>` | The URL gateways are given for the gateway listener; must be `https://`. The gateways' etcd endpoint is its `host:port` (443 when it names no port). |
+//! | `CP_DP_BASE_URL` | `https://<first CP_DP_HOSTS entry>:<port of CP_DP_ADDR>` | The URL gateways are given for the gateway listener; must be `https://` and name one of the `CP_DP_HOSTS` (in any case), since the listener's certificate names only those. The gateways' etcd endpoint is its `host:port` (443 when it names no port). |
 //! | `CP_KINE_ENDPOINT` | `http://127.0.0.1:2379` | kine's etcd endpoint, plaintext. Must name a loopback address (`127.0.0.0/8`, `::1` or `localhost`), checked at boot: kine has no authentication of its own, so it must never listen beyond this host. |
 //! | `CP_ETCD_PREFIX` | `/aisix` | Root of the etcd key space. Gateway resources live under `<prefix>/<env_id>/`, shared ones under `<prefix>/global/`. A trailing `/` is dropped. Fixed by the first boot: a later boot with another prefix refuses to start. |
 //! | `CP_ENV_ID` | unset | Seeds the environment id (a UUID) on the first boot; unset, the first boot mints one. A later boot whose `CP_ENV_ID` disagrees with the stored id refuses to start. |
@@ -174,7 +174,7 @@ impl CpConfig {
             SocketAddr::from(([0, 0, 0, 0], 7943)),
         )?;
         let dp_base_url = match get("CP_DP_BASE_URL") {
-            Some(url) => parse_base_url(url)?,
+            Some(url) => parse_base_url(url, &dp_hosts)?,
             None => default_base_url(&dp_hosts[0], dp_addr.port()),
         };
         let kine_endpoint = parse_kine_endpoint(get("CP_KINE_ENDPOINT"))?;
@@ -323,16 +323,41 @@ fn is_loopback_host(host: &str) -> bool {
         || host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }
 
-fn parse_base_url(raw: &str) -> Result<String, ConfigError> {
+/// The URL as written, once it is `https://` and its host is one of
+/// `hosts`: the gateway listener's certificate names only those, so any
+/// other host would fail every gateway's TLS check.
+fn parse_base_url(raw: &str, hosts: &[String]) -> Result<String, ConfigError> {
     let invalid = ConfigError::Invalid {
         var: "CP_DP_BASE_URL",
         reason: "must be an https:// URL naming a host",
     };
     let url = raw.trim();
-    match url.parse::<Uri>() {
-        Ok(uri) if uri.scheme_str() == Some("https") && uri.host().is_some() => Ok(url.to_string()),
-        _ => Err(invalid),
+    let host = match url.parse::<Uri>() {
+        Ok(uri) if uri.scheme_str() == Some("https") => uri.host().map(str::to_string),
+        _ => None,
+    };
+    let Some(host) = host else {
+        return Err(invalid);
+    };
+    if !is_listed_host(&host, hosts) {
+        return Err(ConfigError::Invalid {
+            var: "CP_DP_BASE_URL",
+            reason: "must name one of the CP_DP_HOSTS: the gateway listener's certificate \
+                     names only those",
+        });
     }
+    Ok(url.to_string())
+}
+
+/// Whether `host` (as a URL writes it, IPv6 in brackets) is one of `hosts`:
+/// a DNS name in any case, or the same IP address.
+fn is_listed_host(host: &str, hosts: &[String]) -> bool {
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    let ip = host.parse::<IpAddr>().ok();
+    hosts.iter().any(|listed| {
+        listed.eq_ignore_ascii_case(host)
+            || ip.is_some_and(|ip| listed.parse::<IpAddr>().is_ok_and(|l| l == ip))
+    })
 }
 
 fn default_base_url(host: &str, port: u16) -> String {

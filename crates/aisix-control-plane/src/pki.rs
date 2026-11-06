@@ -274,7 +274,8 @@ impl Pki {
 
     /// Signs `params` as an end-entity certificate of this CA, with a fresh
     /// P-256 key and a random serial, valid from a little before now for
-    /// `validity`.
+    /// `validity`, but never past the CA's own end: a chain is invalid once
+    /// its CA expires, whatever the leaf says.
     fn sign_leaf(
         &self,
         mut params: CertificateParams,
@@ -282,7 +283,7 @@ impl Pki {
     ) -> Result<(Certificate, KeyPair), PkiError> {
         let now = now();
         params.not_before = now - BACKDATE;
-        params.not_after = now + validity;
+        params.not_after = (now + validity).min(self.ca.params().not_after);
         params.serial_number = Some(SerialNumber::from_slice(&random_serial()?));
         params.is_ca = IsCa::ExplicitNoCa;
         params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
@@ -569,6 +570,14 @@ mod tests {
         let der = der(pki.ca_pem());
         let (_, cert) = X509Certificate::from_der(&der).expect("an X.509 certificate");
         assert!(cert.is_ca());
+        // It signs end-entity certificates only, never another CA.
+        let constraints = cert
+            .basic_constraints()
+            .expect("readable basic constraints")
+            .expect("basic constraints")
+            .value;
+        assert!(constraints.ca);
+        assert_eq!(constraints.path_len_constraint, Some(0));
         let cn: Vec<&str> = cert
             .subject()
             .iter_common_name()
@@ -595,6 +604,40 @@ mod tests {
             .map(|oid| oid.to_id_string());
         assert_eq!(curve.as_deref(), Some("1.2.840.10045.3.1.7"));
         assert_eq!(pki.platform_id_key_hex(), "42".repeat(32));
+    }
+
+    #[test]
+    fn a_leaf_never_outlives_its_ca() {
+        // A CA with ten days left.
+        let now = now();
+        let ca_end = now + time::Duration::days(10);
+        let mut params = CertificateParams::default();
+        params.distinguished_name = common_name(&format!("AISIX control plane CA {ENV}"));
+        params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
+        params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+        params.not_before = now - time::Duration::days(1);
+        params.not_after = ca_end;
+        let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("a key");
+        let ca = params.self_signed(&key).expect("a CA");
+        let pki = Pki::from_stored(ENV, ca.pem(), &key.serialize_der(), &[0x42; 32])
+            .expect("the CA loads");
+        let end_of = |der: &[u8]| {
+            let (_, cert) = X509Certificate::from_der(der).expect("an X.509 certificate");
+            cert.validity().not_after.timestamp()
+        };
+
+        let long = pki.issue_client(DP, 825).unwrap();
+        assert_eq!(long.not_after, to_chrono(ca_end), "the reported end");
+        assert_eq!(end_of(&der(&long.cert_pem)), ca_end.unix_timestamp());
+        let (chain, _) = pki
+            .server_cert(&["cp.example.test".to_string()])
+            .expect("a server certificate");
+        assert_eq!(end_of(&chain[0]), ca_end.unix_timestamp());
+        // A leaf that ends first keeps its own end.
+        let short = pki.issue_client(DP, 3).unwrap();
+        let three_days = (now + time::Duration::days(3)).unix_timestamp();
+        let end = end_of(&der(&short.cert_pem));
+        assert!((three_days..three_days + 5).contains(&end), "{end}");
     }
 
     #[test]
