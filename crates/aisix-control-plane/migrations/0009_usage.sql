@@ -6,7 +6,9 @@
 -- be filtered on. Events that cannot be stored (no event_id, no RFC 3339
 -- occurred_at, not an object) are kept as sent in usage_rejects. `seq`
 -- orders rows for paging; it is allocated before commit, so it is never an
--- ingest cursor.
+-- ingest cursor. The (column, seq) indexes serve the operators' filtered
+-- pages, which run newest first by seq; usage_events_team also keeps a
+-- tenant's events in time order.
 CREATE TABLE usage_batches (seq bigint GENERATED ALWAYS AS IDENTITY UNIQUE, dp_id uuid NOT NULL, batch_id uuid NOT NULL,
   received_at timestamptz NOT NULL DEFAULT now(), events bigint NOT NULL DEFAULT 0, inserted bigint NOT NULL DEFAULT 0,
   duplicates bigint NOT NULL DEFAULT 0, rejected bigint NOT NULL DEFAULT 0, deliveries bigint NOT NULL DEFAULT 1,
@@ -15,7 +17,9 @@ CREATE TABLE usage_events (seq bigint GENERATED ALWAYS AS IDENTITY UNIQUE, event
   dp_id uuid NOT NULL, batch_id uuid NOT NULL, occurred_at timestamptz NOT NULL, received_at timestamptz NOT NULL DEFAULT now(),
   team_id text, api_key_id text, request_id text, event jsonb NOT NULL);
 CREATE INDEX usage_events_team ON usage_events (team_id, occurred_at);
-CREATE INDEX usage_events_key ON usage_events (api_key_id, occurred_at);
-CREATE INDEX usage_events_request ON usage_events (request_id);
+CREATE INDEX usage_events_team_seq ON usage_events (team_id, seq);
+CREATE INDEX usage_events_key ON usage_events (api_key_id, seq);
+CREATE INDEX usage_events_request ON usage_events (request_id, seq);
 CREATE TABLE usage_rejects (seq bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, dp_id uuid NOT NULL, batch_id uuid NOT NULL,
   reason text NOT NULL, raw jsonb NOT NULL, received_at timestamptz NOT NULL DEFAULT now());
+CREATE INDEX usage_rejects_batch ON usage_rejects (batch_id, seq);

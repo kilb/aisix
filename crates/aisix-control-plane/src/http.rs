@@ -221,6 +221,11 @@ pub const ROUTE_ROLES: &[(&str, &str, MinRole)] = &[
         "/admin/usage/batches",
         MinRole::Op(OperatorRole::Viewer),
     ),
+    (
+        "GET",
+        "/admin/usage/rejects",
+        MinRole::Op(OperatorRole::Viewer),
+    ),
     // Gateways, on the gateway listener.
     ("POST", "/dp/heartbeat", MinRole::Dp),
     ("ANY", "/dp/store/v1/{*rest}", MinRole::Dp),
@@ -320,6 +325,7 @@ pub fn browser_router(state: AppState) -> Router {
         )
         .route("/admin/usage/events", get(usage::list_events))
         .route("/admin/usage/batches", get(usage::list_batches))
+        .route("/admin/usage/rejects", get(usage::list_rejects))
         .route_layer(axum::middleware::from_fn(only_listed_routes))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(state)

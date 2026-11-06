@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aisix_control_plane::auth::OperatorRole;
-use aisix_control_plane::dp::telemetry::MAX_EVENTS_PER_BATCH;
+use aisix_control_plane::dp::telemetry::{MAX_BODIES_IN_FLIGHT, MAX_EVENTS_PER_BATCH, SLOT_WAIT};
 use serde_json::{json, Value};
 use sqlx::{Connection, PgConnection};
 use support::{DpClient, Resp, TestCp};
@@ -26,6 +26,10 @@ const DEDUP: &str = "x-aisix-usage-batch-dedup";
 // The cap leaves room above the gateway's own largest batch, 100 events
 // (`MAX_BATCH` in `crates/aisix-server/src/telemetry.rs`).
 const _: () = assert!(MAX_EVENTS_PER_BATCH >= 1000);
+
+// A delivery waiting for a body slot is answered before the gateway's own
+// 10 s request timeout.
+const _: () = assert!(SLOT_WAIT.as_secs() < 10);
 
 /// A usage event as the gateway sends it.
 fn event(event_id: &str) -> Value {
@@ -189,7 +193,7 @@ async fn waiting(cp: &TestCp, locktype: &str) -> i64 {
 }
 
 async fn wait_for_waiting(cp: &TestCp, locktype: &str) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     while waiting(cp, locktype).await < 1 {
         assert!(
             tokio::time::Instant::now() < deadline,
@@ -335,10 +339,13 @@ async fn an_event_without_an_event_id_is_rejected_and_kept_for_operators() {
         assert_eq!((reason.as_str(), raw), (want_reason, &want_raw));
     }
 
-    // Sent again, the batch is recognised: no second set of rejects.
+    // Sent again, the batch is recognised: no second set of rejects. The
+    // answer repeats how many were refused, so a gateway whose first
+    // answer was lost still learns that those events are gone.
     let r = dp.telemetry(b, &json!({ "events": events })).await;
-    assert_eq!(answer(&r), (200, counts(0, 0, 0)));
+    assert_eq!(answer(&r), (200, counts(0, 7, 0)));
     assert_eq!(cp.count("usage_rejects").await, 7);
+    assert_eq!(batch_row(&cp, b).await, Some((9, 2, 0, 7, 2)));
 }
 
 #[tokio::test]
@@ -407,6 +414,8 @@ async fn a_malformed_body_is_400_with_the_dedup_header() {
         b"{\"events\": null}",
         b"{\"events\": {\"event_id\": \"m1\"}}",
         b"[]",
+        // A parser's message would quote this string.
+        br#"{"events": "echo-7c1"}"#,
     ] {
         let r = dp
             .telemetry_raw(Some(&Uuid::new_v4().to_string()), body.to_vec())
@@ -416,7 +425,9 @@ async fn a_malformed_body_is_400_with_the_dedup_header() {
         assert_eq!(r.status, 400, "{shown}: {r:?}");
         assert_eq!(r.header(DEDUP), Some("1"), "{shown}");
         // The answer does not quote the body back.
-        assert!(!r.body.to_string().contains("7c1"), "{r:?}");
+        let answered = r.body.to_string();
+        assert!(!answered.contains("echo-7c1"), "{r:?}");
+        assert!(!answered.contains("7c1"), "{r:?}");
     }
     assert_nothing_stored(&cp).await;
 
@@ -610,43 +621,281 @@ async fn batches_sharing_events_in_opposite_orders_never_deadlock() {
     assert_eq!(cp.count("usage_events").await, 2000);
 }
 
+/// Makes every insert into `usage_events` fail with SQLSTATE `code`.
+async fn fail_event_inserts_with(cp: &TestCp, code: &str) {
+    let pool = cp.db().pool();
+    for sql in [
+        format!(
+            "CREATE OR REPLACE FUNCTION fail_7c1() RETURNS trigger LANGUAGE plpgsql AS \
+             $$ BEGIN RAISE EXCEPTION 'injected-7c1' USING ERRCODE = '{code}'; END $$"
+        ),
+        "CREATE OR REPLACE TRIGGER fail_7c1 BEFORE INSERT ON usage_events \
+         FOR EACH ROW EXECUTE FUNCTION fail_7c1()"
+            .to_string(),
+    ] {
+        sqlx::query(&sql).execute(pool).await.expect(&sql);
+    }
+}
+
+async fn stop_failing_event_inserts(cp: &TestCp) {
+    sqlx::query("DROP TRIGGER fail_7c1 ON usage_events")
+        .execute(cp.db().pool())
+        .await
+        .expect("drop the trigger");
+}
+
+/// A batch with two events and one reject.
+fn failing_batch() -> Value {
+    let mut events = vec![event("f1"), event("f2")];
+    events.push(json!({"occurred_at": "2026-11-06T08:15:30Z"}));
+    json!({ "events": events })
+}
+
+/// `r` answers a failed store with `status` and `code`, the dedup header,
+/// and nothing of what caused it or what the batch carried.
+fn assert_store_failure(r: &Resp, status: u16, code: &str, sqlstate: &str) {
+    assert_eq!(r.status, status, "SQLSTATE {sqlstate}: {r:?}");
+    assert_eq!(r.body["code"], code, "SQLSTATE {sqlstate}");
+    assert_eq!(r.header(DEDUP), Some("1"), "SQLSTATE {sqlstate}");
+    for token in ["injected-7c1", sqlstate, "req-f1", "team-7c1"] {
+        assert!(!r.body.to_string().contains(token), "{token}: {r:?}");
+    }
+}
+
+/// A failure that sending the batch again can get past (a lost connection,
+/// a serialisation failure, an exhausted server, a shutdown, a read-only
+/// failover target) is a 503, which the gateway re-sends.
 #[tokio::test]
 async fn a_database_failure_is_503_with_the_dedup_header_and_stores_nothing() {
     let Some(cp) = TestCp::start().await else {
         return;
     };
     let dp = cp.issue_dp_client("gw-usage-7c1").await;
-    let pool = cp.db().pool();
-    for sql in [
-        "CREATE FUNCTION fail_7c1() RETURNS trigger LANGUAGE plpgsql AS \
-         $$ BEGIN RAISE EXCEPTION 'injected-7c1'; END $$",
-        "CREATE TRIGGER fail_7c1 BEFORE INSERT ON usage_events \
-         FOR EACH ROW EXECUTE FUNCTION fail_7c1()",
+    let (b, body) = (Uuid::new_v4(), failing_batch());
+    for sqlstate in [
+        "57P01", "40001", "40P01", "08006", "53300", "57014", "25006",
     ] {
-        sqlx::query(sql).execute(pool).await.expect(sql);
+        fail_event_inserts_with(&cp, sqlstate).await;
+        let r = dp.telemetry(b, &body).await;
+        assert_store_failure(&r, 503, "unavailable", sqlstate);
+        // Not even the batch id or the rejected event: the batch can be
+        // sent again.
+        assert_nothing_stored(&cp).await;
     }
-    let mut events = vec![event("f1"), event("f2")];
-    events.push(json!({"occurred_at": "2026-11-06T08:15:30Z"}));
-    let body = json!({ "events": events });
+
+    stop_failing_event_inserts(&cp).await;
+    let r = dp.telemetry(b, &body).await;
+    assert_eq!(answer(&r), (200, counts(2, 1, 0)), "{r:?}");
+    assert_eq!(batch_row(&cp, b).await, Some((3, 2, 0, 1, 1)));
+}
+
+/// Any other failure would fail the same way on every re-send: a 500,
+/// with a neutral message.
+#[tokio::test]
+async fn a_permanent_database_failure_is_500_with_the_dedup_header_and_stores_nothing() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let dp = cp.issue_dp_client("gw-usage-7c1").await;
+    let (b, body) = (Uuid::new_v4(), failing_batch());
+    for sqlstate in ["P0001", "23505", "22P05", "42P01", "54000"] {
+        fail_event_inserts_with(&cp, sqlstate).await;
+        let r = dp.telemetry(b, &body).await;
+        assert_store_failure(&r, 500, "internal", sqlstate);
+        assert_nothing_stored(&cp).await;
+    }
+
+    stop_failing_event_inserts(&cp).await;
+    let r = dp.telemetry(b, &body).await;
+    assert_eq!(answer(&r), (200, counts(2, 1, 0)), "{r:?}");
+}
+
+/// The other half of the forced race: the first delivery fails after the
+/// second has started waiting on it, and the second stores the batch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_delivery_waiting_on_one_that_fails_stores_the_batch_itself() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let dp = Arc::new(cp.issue_dp_client("gw-usage-7c1").await);
+    let (b, body) = (Uuid::new_v4(), batch(&["a1", "a2"]));
+    // The first event insert fails, once, with a failure worth a re-send.
+    for sql in [
+        "CREATE SEQUENCE fail_once_7c1",
+        "CREATE FUNCTION fail_once_7c1() RETURNS trigger LANGUAGE plpgsql AS \
+         $$ BEGIN IF nextval('fail_once_7c1') = 1 THEN \
+              RAISE EXCEPTION 'injected-7c1' USING ERRCODE = '40001'; \
+            END IF; RETURN NEW; END $$",
+        "CREATE TRIGGER fail_once_7c1 BEFORE INSERT ON usage_events \
+         FOR EACH ROW EXECUTE FUNCTION fail_once_7c1()",
+    ] {
+        sqlx::query(sql).execute(cp.db().pool()).await.expect(sql);
+    }
+    let mut holder = PgConnection::connect(cp.database_url())
+        .await
+        .expect("connect");
+    sqlx::query("BEGIN")
+        .execute(&mut holder)
+        .await
+        .expect("begin");
+    sqlx::query("LOCK TABLE usage_events IN EXCLUSIVE MODE")
+        .execute(&mut holder)
+        .await
+        .expect("lock the event table");
+    let send =
+        |dp: Arc<DpClient>, body: Value| tokio::spawn(async move { dp.telemetry(b, &body).await });
+    let first = send(dp.clone(), body.clone());
+    wait_for_waiting(&cp, "relation").await;
+    let second = send(dp.clone(), body.clone());
+    wait_for_waiting(&cp, "transactionid").await;
+    sqlx::query("COMMIT")
+        .execute(&mut holder)
+        .await
+        .expect("release the event table");
+    let (first, second) = (
+        first.await.expect("the first delivery"),
+        second.await.expect("the second delivery"),
+    );
+    assert_eq!(first.status, 503, "{first:?}");
+    assert_eq!(answer(&second), (200, counts(2, 0, 0)), "{second:?}");
+    assert!([&first, &second]
+        .iter()
+        .all(|r| r.header(DEDUP) == Some("1")));
+    assert_eq!(cp.count("usage_events").await, 2);
+    // The failed delivery left no trace.
+    assert_eq!(batch_row(&cp, b).await, Some((2, 2, 0, 0, 1)));
+}
+
+/// A slot of the bodies one control plane holds at once.
+fn slots(cp: &TestCp) -> Arc<tokio::sync::Semaphore> {
+    cp.state().telemetry_bodies.clone()
+}
+
+#[tokio::test]
+async fn a_delivery_finding_every_body_slot_taken_waits_then_answers_503() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let dp = cp.issue_dp_client("gw-usage-7c1").await;
+    let held = slots(&cp)
+        .acquire_many_owned(MAX_BODIES_IN_FLIGHT as u32)
+        .await
+        .expect("every slot");
+    let started = tokio::time::Instant::now();
+    let r = dp.telemetry(Uuid::new_v4(), &batch(&["s1"])).await;
+    let waited = started.elapsed();
+    assert_eq!(r.status, 503, "{r:?}");
+    assert_eq!(r.body["code"], "unavailable");
+    assert_eq!(r.header(DEDUP), Some("1"));
+    // After the full wait.
+    assert!(waited >= SLOT_WAIT, "answered after {waited:?}");
+    assert_nothing_stored(&cp).await;
+
+    drop(held);
+    let r = dp.telemetry(Uuid::new_v4(), &batch(&["s1"])).await;
+    assert_eq!(answer(&r), (200, counts(1, 0, 0)));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_delivery_waiting_for_a_body_slot_is_stored_once_one_frees() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let dp = Arc::new(cp.issue_dp_client("gw-usage-7c1").await);
+    let _rest = slots(&cp)
+        .acquire_many_owned(MAX_BODIES_IN_FLIGHT as u32 - 1)
+        .await
+        .expect("all slots but one");
+    let last = slots(&cp).acquire_owned().await.expect("the last slot");
     let b = Uuid::new_v4();
+    let delivery = {
+        let dp = dp.clone();
+        tokio::spawn(async move { dp.telemetry(b, &batch(&["s2"])).await })
+    };
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(!delivery.is_finished(), "answered with no slot free");
+    assert_nothing_stored(&cp).await;
+
+    drop(last);
+    let r = delivery.await.expect("the delivery");
+    assert_eq!(answer(&r), (200, counts(1, 0, 0)), "{r:?}");
+    assert_eq!(batch_row(&cp, b).await, Some((1, 1, 0, 0, 1)));
+}
+
+/// The slot goes with the store, not with the request: a gateway that
+/// stops waiting for its answer does not free a slot whose batch is still
+/// held while it is stored.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_body_slot_is_held_until_its_store_ends_even_once_the_request_is_gone() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let dp = Arc::new(cp.issue_dp_client("gw-usage-7c1").await);
+    let mut holder = PgConnection::connect(cp.database_url())
+        .await
+        .expect("connect");
+    sqlx::query("BEGIN")
+        .execute(&mut holder)
+        .await
+        .expect("begin");
+    sqlx::query("LOCK TABLE usage_events IN EXCLUSIVE MODE")
+        .execute(&mut holder)
+        .await
+        .expect("lock the event table");
+    let delivery = {
+        let dp = dp.clone();
+        tokio::spawn(async move { dp.telemetry(Uuid::new_v4(), &batch(&["g1"])).await })
+    };
+    wait_for_waiting(&cp, "relation").await;
+    assert_eq!(slots(&cp).available_permits(), MAX_BODIES_IN_FLIGHT - 1);
+    // The gateway gives up on the answer and its connection closes.
+    delivery.abort();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        slots(&cp).available_permits(),
+        MAX_BODIES_IN_FLIGHT - 1,
+        "the slot was freed while its batch was still being stored"
+    );
+
+    sqlx::query("COMMIT")
+        .execute(&mut holder)
+        .await
+        .expect("release the event table");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    while slots(&cp).available_permits() < MAX_BODIES_IN_FLIGHT {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the slot is still taken"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // The store finished although nobody waited for its answer.
+    assert_eq!(cp.count("usage_events").await, 1);
+}
+
+/// With every connection of the database pool busy, a delivery is answered
+/// 503 before the gateway's 10 s timeout, not left to time out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_delivery_that_cannot_get_a_database_connection_answers_503_in_time() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    // The client times out after 10 s, as the gateway's does.
+    let dp = cp.issue_dp_client("gw-usage-7c1").await;
+    let pool = cp.db().pool();
+    let mut held = Vec::new();
+    for _ in 0..pool.options().get_max_connections() {
+        held.push(pool.acquire().await.expect("a pool connection"));
+    }
+    let (b, body) = (Uuid::new_v4(), batch(&["p1"]));
     let r = dp.telemetry(b, &body).await;
     assert_eq!(r.status, 503, "{r:?}");
     assert_eq!(r.body["code"], "unavailable");
     assert_eq!(r.header(DEDUP), Some("1"));
-    // Neither the cause nor the events are in the answer.
-    for token in ["injected-7c1", "req-f1", "team-7c1"] {
-        assert!(!r.body.to_string().contains(token), "{token}: {r:?}");
-    }
-    // Not even the batch id or the rejected event: the batch can be sent again.
-    assert_nothing_stored(&cp).await;
 
-    sqlx::query("DROP TRIGGER fail_7c1 ON usage_events")
-        .execute(pool)
-        .await
-        .expect("drop the trigger");
+    drop(held);
     let r = dp.telemetry(b, &body).await;
-    assert_eq!(answer(&r), (200, counts(2, 1, 0)), "{r:?}");
-    assert_eq!(batch_row(&cp, b).await, Some((3, 2, 0, 1, 1)));
+    assert_eq!(answer(&r), (200, counts(1, 0, 0)));
 }
 
 #[tokio::test]
@@ -847,4 +1096,82 @@ async fn operators_page_through_stored_events_and_batches() {
         .get_with_cookie("/admin/usage/events?limit=many", viewer.cookie())
         .await;
     assert_eq!(r.status, 422, "{r:?}");
+}
+
+#[tokio::test]
+async fn operators_page_through_rejected_events() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let admin = cp.admin_login_seeded(OperatorRole::Admin).await;
+    let bundle = cp.issue_bundle(&admin, "gw-usage-7c1").await;
+    let dp = cp.dp_client(&bundle);
+    let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+    let first = json!({"event_id": "", "occurred_at": "2026-11-06T08:15:30Z"});
+    let second = json!("not-an-event-7c1");
+    let third = json!({"event_id": "no-time-7c1"});
+    let r = dp
+        .telemetry(a, &json!({"events": [first, event("ok-7c1"), second]}))
+        .await;
+    assert_eq!(answer(&r), (200, counts(1, 2, 0)));
+    let r = dp.telemetry(b, &json!({"events": [third]})).await;
+    assert_eq!(answer(&r), (200, counts(0, 1, 0)));
+
+    let viewer = cp.admin_login_seeded(OperatorRole::Viewer).await;
+    let get = |path: String| {
+        let cookie = viewer.cookie().to_string();
+        let cp = &cp;
+        async move { cp.get_with_cookie(&path, &cookie).await }
+    };
+    let raws = |page: &Value| -> Vec<Value> {
+        page["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .map(|i| i["raw"].clone())
+            .collect()
+    };
+
+    // Newest first, a page at a time.
+    let page = get("/admin/usage/rejects?limit=2".to_string()).await;
+    assert_eq!(page.status, 200, "{page:?}");
+    assert_eq!(raws(&page.body), [third.clone(), second.clone()]);
+    let before = page.body["next_before"].as_i64().expect("a next page");
+    let page = get(format!("/admin/usage/rejects?limit=2&before={before}")).await;
+    assert_eq!(raws(&page.body), std::slice::from_ref(&first));
+    assert_eq!(page.body["next_before"], Value::Null);
+
+    // Every field of an item.
+    let page = get(format!("/admin/usage/rejects?batch_id={b}")).await;
+    let items = page.body["items"].as_array().expect("items");
+    assert_eq!(items.len(), 1, "{page:?}");
+    let item = items[0].as_object().expect("an item");
+    let mut fields: Vec<&str> = item.keys().map(String::as_str).collect();
+    fields.sort_unstable();
+    assert_eq!(
+        fields,
+        ["batch_id", "dp_id", "raw", "reason", "received_at", "seq"]
+    );
+    assert_eq!(item["batch_id"], b.to_string());
+    assert_eq!(item["dp_id"], bundle.dp_id.as_str());
+    assert_eq!(item["reason"], "occurred_at_invalid");
+    assert_eq!(item["raw"], third);
+    assert!(item["seq"].is_i64() && item["received_at"].is_string());
+
+    // Only one batch's.
+    let page = get(format!("/admin/usage/rejects?batch_id={a}")).await;
+    assert_eq!(raws(&page.body), [second, first]);
+    let reasons: Vec<&str> = page.body["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .map(|i| i["reason"].as_str().expect("a reason"))
+        .collect();
+    assert_eq!(reasons, ["not_an_object", "event_id_missing"]);
+    let page = get(format!("/admin/usage/rejects?batch_id={}", Uuid::new_v4())).await;
+    assert_eq!(raws(&page.body), Vec::<Value>::new());
+
+    // A query that cannot be read is refused.
+    let page = get("/admin/usage/rejects?batch_id=not-a-uuid-7c1".to_string()).await;
+    assert_eq!(page.status, 422, "{page:?}");
 }

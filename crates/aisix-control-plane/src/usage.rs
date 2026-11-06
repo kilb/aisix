@@ -42,7 +42,8 @@ use chrono::{DateTime, Utc};
 use futures::FutureExt;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
-use sqlx::PgConnection;
+use sqlx::{PgConnection, Postgres, QueryBuilder};
+use tokio::sync::OwnedSemaphorePermit;
 use uuid::Uuid;
 
 use crate::auth::{OperatorAuth, OperatorRole};
@@ -67,7 +68,8 @@ pub struct IngestOutcome {
     pub duplicates: u64,
     /// Events refused, and kept in `usage_rejects`.
     pub rejected: u64,
-    /// The batch had been delivered before: nothing was stored.
+    /// The batch had been delivered before: nothing was stored, and
+    /// `rejected` is what its first stored delivery refused.
     pub batch_duplicate: bool,
 }
 
@@ -90,11 +92,16 @@ struct Reject {
 /// Stores the events of `dp_id`'s batch `batch_id`, once (see the module
 /// docs), in one transaction: either all of it is stored, the batch id
 /// included, or nothing is, and the batch can be delivered again.
+///
+/// `slot` is the batch body's place among those the process holds at once
+/// (`dp::telemetry::BodySlot`). It is held until the transaction ends, which
+/// runs to its end even when the request that brought the batch is gone.
 pub async fn ingest(
     db: &Db,
     dp_id: Uuid,
     batch_id: Uuid,
     events: Vec<Value>,
+    slot: OwnedSemaphorePermit,
 ) -> Result<IngestOutcome, DbError> {
     let total = events.len();
     let (mut rows, mut rejects) = (Vec::new(), Vec::new());
@@ -104,8 +111,14 @@ pub async fn ingest(
             Err(reject) => rejects.push(reject),
         }
     }
-    db.tx(move |conn| store(conn, dp_id, batch_id, total, rows, rejects).boxed())
-        .await
+    db.tx(move |conn| {
+        async move {
+            let _slot = slot;
+            store(conn, dp_id, batch_id, total, rows, rejects).await
+        }
+        .boxed()
+    })
+    .await
 }
 
 async fn store(
@@ -118,11 +131,12 @@ async fn store(
 ) -> Result<IngestOutcome, DbError> {
     // A row this statement inserted has no xmax; one it updated carries
     // this transaction's. A delivery that found the row uncommitted waited
-    // for it first, and sees it as updated once it has committed.
-    let fresh: bool = sqlx::query_scalar(
+    // for it first, and sees it as updated once it has committed, with the
+    // counts that delivery stored.
+    let (fresh, stored_rejected): (bool, i64) = sqlx::query_as(
         "INSERT INTO usage_batches (dp_id, batch_id) VALUES ($1, $2) \
          ON CONFLICT (dp_id, batch_id) DO UPDATE SET deliveries = usage_batches.deliveries + 1 \
-         RETURNING (xmax = 0)",
+         RETURNING (xmax = 0) AS fresh, rejected",
     )
     .bind(dp_id)
     .bind(batch_id)
@@ -130,6 +144,7 @@ async fn store(
     .await?;
     if !fresh {
         return Ok(IngestOutcome {
+            rejected: u64::try_from(stored_rejected).unwrap_or_default(),
             batch_duplicate: true,
             ..IngestOutcome::default()
         });
@@ -300,6 +315,26 @@ fn without_nul(value: Value) -> Value {
 const DEFAULT_LIMIT: i64 = 50;
 const MAX_LIMIT: i64 = 500;
 
+/// The page size a `limit` asks for: 50 when omitted, 1 to 500.
+fn page_limit(limit: Option<i64>) -> i64 {
+    limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT)
+}
+
+/// Ends a page query built on `SELECT … WHERE true`: newest first by `seq`,
+/// one row past `limit`, which [`page`] tells another page by.
+fn newest_first(sql: &mut QueryBuilder<'_, Postgres>, limit: i64) {
+    sql.push(" ORDER BY seq DESC LIMIT ").push_bind(limit + 1);
+}
+
+/// The page `rows` (read one past `limit`) make, and its `next_before`: the
+/// `seq` of its last row when another page follows, `None` on the last.
+fn page<R>(mut rows: Vec<R>, limit: i64, seq: impl Fn(&R) -> i64) -> (Vec<R>, Option<i64>) {
+    let more = rows.len() as i64 > limit;
+    rows.truncate(limit as usize);
+    let next_before = if more { rows.last().map(seq) } else { None };
+    (rows, next_before)
+}
+
 fn query_rejected(_: QueryRejection) -> ApiError {
     ApiError::validation(vec![Detail {
         path: "query".to_string(),
@@ -337,6 +372,9 @@ type EventRow = (
 /// `before` of the next page, null on the last. `seq` orders rows for
 /// paging only: it is taken before a row commits, so a row can appear
 /// behind a page already read.
+///
+/// The query names only the filters given, so each is answered from its
+/// `(column, seq)` index.
 pub async fn list_events(
     auth: OperatorAuth,
     State(state): State<AppState>,
@@ -344,29 +382,31 @@ pub async fn list_events(
 ) -> Result<Json<Value>, ApiError> {
     auth.require(OperatorRole::Viewer)?;
     let Query(q) = query.map_err(query_rejected)?;
-    let limit = q.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
-    // One row more than the page, to tell whether another page follows.
-    let mut rows: Vec<EventRow> = sqlx::query_as(
+    let limit = page_limit(q.limit);
+    let mut sql = QueryBuilder::<Postgres>::new(
         "SELECT seq, event_id, occurred_at, received_at, dp_id, batch_id, team_id, api_key_id, \
                 request_id, event \
-         FROM usage_events \
-         WHERE ($1::bigint IS NULL OR seq < $1) \
-           AND ($2::text IS NULL OR team_id = $2) \
-           AND ($3::text IS NULL OR api_key_id = $3) \
-           AND ($4::text IS NULL OR request_id = $4) \
-         ORDER BY seq DESC LIMIT $5",
-    )
-    .bind(q.before)
-    .bind(q.team_id)
-    .bind(q.api_key_id)
-    .bind(q.request_id)
-    .bind(limit + 1)
-    .fetch_all(state.db.pool())
-    .await
-    .map_err(DbError::from)?;
-    let more = rows.len() as i64 > limit;
-    rows.truncate(limit as usize);
-    let next_before = if more { rows.last().map(|r| r.0) } else { None };
+         FROM usage_events WHERE true",
+    );
+    if let Some(before) = q.before {
+        sql.push(" AND seq < ").push_bind(before);
+    }
+    if let Some(team_id) = q.team_id {
+        sql.push(" AND team_id = ").push_bind(team_id);
+    }
+    if let Some(api_key_id) = q.api_key_id {
+        sql.push(" AND api_key_id = ").push_bind(api_key_id);
+    }
+    if let Some(request_id) = q.request_id {
+        sql.push(" AND request_id = ").push_bind(request_id);
+    }
+    newest_first(&mut sql, limit);
+    let rows: Vec<EventRow> = sql
+        .build_query_as()
+        .fetch_all(state.db.pool())
+        .await
+        .map_err(DbError::from)?;
+    let (rows, next_before) = page(rows, limit, |r| r.0);
     let items: Vec<Value> = rows
         .into_iter()
         .map(
@@ -420,22 +460,22 @@ pub async fn list_batches(
 ) -> Result<Json<Value>, ApiError> {
     auth.require(OperatorRole::Viewer)?;
     let Query(q) = query.map_err(query_rejected)?;
-    let limit = q.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
-    let mut rows: Vec<BatchRow> = sqlx::query_as(
+    let limit = page_limit(q.limit);
+    let mut sql = QueryBuilder::<Postgres>::new(
         "SELECT seq, dp_id, batch_id, received_at, events, inserted, duplicates, rejected, \
                 deliveries \
-         FROM usage_batches \
-         WHERE ($1::bigint IS NULL OR seq < $1) \
-         ORDER BY seq DESC LIMIT $2",
-    )
-    .bind(q.before)
-    .bind(limit + 1)
-    .fetch_all(state.db.pool())
-    .await
-    .map_err(DbError::from)?;
-    let more = rows.len() as i64 > limit;
-    rows.truncate(limit as usize);
-    let next_before = if more { rows.last().map(|r| r.0) } else { None };
+         FROM usage_batches WHERE true",
+    );
+    if let Some(before) = q.before {
+        sql.push(" AND seq < ").push_bind(before);
+    }
+    newest_first(&mut sql, limit);
+    let rows: Vec<BatchRow> = sql
+        .build_query_as()
+        .fetch_all(state.db.pool())
+        .await
+        .map_err(DbError::from)?;
+    let (rows, next_before) = page(rows, limit, |r| r.0);
     let items: Vec<Value> = rows
         .into_iter()
         .map(
@@ -463,6 +503,60 @@ pub async fn list_batches(
                 })
             },
         )
+        .collect();
+    Ok(Json(json!({ "items": items, "next_before": next_before })))
+}
+
+#[derive(Deserialize)]
+pub struct RejectsQuery {
+    limit: Option<i64>,
+    /// Only rows with a smaller `seq`: the `next_before` of the previous
+    /// page.
+    before: Option<i64>,
+    batch_id: Option<Uuid>,
+}
+
+type RejectRow = (i64, Uuid, Uuid, String, Value, DateTime<Utc>);
+
+/// `GET /admin/usage/rejects`: the events intake refused, each as sent and
+/// with the reason, newest first by `seq`, optionally only those of a
+/// `batch_id`; paged as [`list_events`] is.
+pub async fn list_rejects(
+    auth: OperatorAuth,
+    State(state): State<AppState>,
+    query: Result<Query<RejectsQuery>, QueryRejection>,
+) -> Result<Json<Value>, ApiError> {
+    auth.require(OperatorRole::Viewer)?;
+    let Query(q) = query.map_err(query_rejected)?;
+    let limit = page_limit(q.limit);
+    let mut sql = QueryBuilder::<Postgres>::new(
+        "SELECT seq, dp_id, batch_id, reason, raw, received_at FROM usage_rejects WHERE true",
+    );
+    if let Some(before) = q.before {
+        sql.push(" AND seq < ").push_bind(before);
+    }
+    if let Some(batch_id) = q.batch_id {
+        sql.push(" AND batch_id = ").push_bind(batch_id);
+    }
+    newest_first(&mut sql, limit);
+    let rows: Vec<RejectRow> = sql
+        .build_query_as()
+        .fetch_all(state.db.pool())
+        .await
+        .map_err(DbError::from)?;
+    let (rows, next_before) = page(rows, limit, |r| r.0);
+    let items: Vec<Value> = rows
+        .into_iter()
+        .map(|(seq, dp_id, batch_id, reason, raw, received_at)| {
+            json!({
+                "seq": seq,
+                "dp_id": dp_id,
+                "batch_id": batch_id,
+                "reason": reason,
+                "raw": raw,
+                "received_at": received_at,
+            })
+        })
         .collect();
     Ok(Json(json!({ "items": items, "next_before": next_before })))
 }
