@@ -222,6 +222,7 @@ impl ContextAffinity {
         ResponseMark {
             target_id: target_id.map(str::to_string),
             previous_echo: self.previous_echo.clone(),
+            seal: None,
         }
     }
 }
@@ -251,6 +252,9 @@ fn strip_ciphertext(mut item: Value) -> Option<Value> {
 pub(crate) struct ResponseMark {
     target_id: Option<String>,
     previous_echo: Option<(String, String)>,
+    /// Platform mode: output item ids leave sealed
+    /// ([`crate::opaque_id::seal_id`]), and channel metrics do not leave.
+    seal: Option<crate::opaque_id::SealKey>,
 }
 
 #[derive(Clone, Copy)]
@@ -258,11 +262,27 @@ enum Slot {
     ResponseId,
     PreviousResponseId,
     EncryptedContent,
+    ItemId,
 }
 
 impl ResponseMark {
     fn is_noop(&self) -> bool {
-        self.target_id.is_none() && self.previous_echo.is_none()
+        self.target_id.is_none() && self.previous_echo.is_none() && self.seal.is_none()
+    }
+
+    /// Seal the response's item ids when platform mode is on.
+    pub(crate) fn sealing_ids(
+        mut self,
+        platform: Option<&crate::platform::PlatformSettings>,
+    ) -> Self {
+        self.seal = platform.map(crate::opaque_id::SealKey::of);
+        self
+    }
+
+    /// The key item ids are sealed under, for an encoder that builds the
+    /// response itself.
+    pub(crate) fn seal_key(&self) -> Option<crate::opaque_id::SealKey> {
+        self.seal
     }
 
     /// The `previous_response_id` as the client sent it, when it was tagged:
@@ -296,6 +316,10 @@ impl ResponseMark {
                 .as_ref()
                 .filter(|(original, _)| original == value)
                 .map(|(_, sent)| sent.clone()),
+            Slot::ItemId => self
+                .seal
+                .filter(|_| !value.is_empty())
+                .map(|key| crate::opaque_id::seal_id(key.bytes(), value)),
         }
     }
 
@@ -326,13 +350,28 @@ impl ResponseMark {
                 }
             }
         }
+        if let Some(key) = &self.seal {
+            crate::opaque_id::seal_responses_body(key.bytes(), body);
+            if let Some(map) = body.as_object_mut() {
+                map.remove(crate::opaque_id::CHANNEL_METRICS_KEY);
+            }
+        }
     }
 
     /// Tag one Responses SSE event payload, byte-preserving: the Response
     /// object of the snapshot events (`response.created` / `.in_progress` /
     /// `.queued` / `.completed` / `.incomplete` / `.failed`) and the item of
-    /// `response.output_item.added` / `.done`.
+    /// `response.output_item.added` / `.done`. In platform mode the same pass
+    /// seals every item id, the `item_id` of a per-item event included.
     fn apply_to_event_json(&self, payload: &[u8]) -> Option<Vec<u8>> {
+        let tagged = self.tag_event_json(payload);
+        if self.seal.is_none() {
+            return tagged;
+        }
+        crate::opaque_id::strip_channel_metrics(tagged.as_deref().unwrap_or(payload)).or(tagged)
+    }
+
+    fn tag_event_json(&self, payload: &[u8]) -> Option<Vec<u8>> {
         let slot = std::cell::Cell::new(Slot::ResponseId);
         let select = |path: &[PathSeg]| {
             let picked = match path {
@@ -348,6 +387,9 @@ impl ResponseMark {
                 }
                 [PathSeg::Key(i), PathSeg::Key(e)] if i == "item" && e == "encrypted_content" => {
                     Some(Slot::EncryptedContent)
+                }
+                _ if self.seal.is_some() && crate::opaque_id::responses_event_id_path(path) => {
+                    Some(Slot::ItemId)
                 }
                 _ => None,
             };
@@ -458,6 +500,7 @@ mod tests {
         let mark = ResponseMark {
             target_id: Some("m-1".into()),
             previous_echo: Some(("resp_prev".into(), "resp_SENT".into())),
+            seal: None,
         };
         let frame = b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_up\",\"previous_response_id\":\"resp_prev\",\"output\":[{\"type\":\"reasoning\",\"encrypted_content\":\"CT\"}]}}\n\n";
         let out = mark.apply_to_sse_frame(frame).unwrap();
@@ -482,5 +525,74 @@ mod tests {
         assert!(String::from_utf8(out).unwrap().contains("aisix_enc_v1:"));
         let delta = b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"x\"}\n\n";
         assert!(mark.apply_to_sse_frame(delta).is_none());
+    }
+
+    fn sealing_mark(target_id: Option<&str>) -> (ResponseMark, [u8; 32]) {
+        let platform = crate::platform::PlatformSettings::from_secret("s");
+        let key = crate::opaque_id::seal_key(&platform.id_key);
+        let mark = ContextAffinity::default()
+            .response_mark(target_id)
+            .sealing_ids(Some(&platform));
+        (mark, key)
+    }
+
+    #[test]
+    fn a_sealing_mark_seals_item_ids_beside_the_context_tags() {
+        use crate::opaque_id::seal_id;
+        let (mark, key) = sealing_mark(Some("m-1"));
+        let mut body = json!({
+            "id": "resp_up",
+            "output": [{"type": "function_call", "id": "fc_bdrk_1", "call_id": "call_bdrk_1",
+                        "name": "f", "arguments": "{}"},
+                       {"type": "reasoning", "id": "rs_1", "encrypted_content": "CT", "summary": []}],
+            "amazon-bedrock-invocationMetrics": {"inputTokenCount": 1},
+        });
+        mark.apply_to_body(&mut body);
+        assert_eq!(body["id"], mark_response_id("m-1", "resp_up"));
+        assert_eq!(body["output"][0]["id"], seal_id(&key, "fc_bdrk_1"));
+        assert_eq!(body["output"][0]["call_id"], seal_id(&key, "call_bdrk_1"));
+        assert_eq!(body["output"][1]["id"], seal_id(&key, "rs_1"));
+        assert_eq!(
+            body["output"][1]["encrypted_content"],
+            mark_encrypted_content("m-1", "CT")
+        );
+        assert!(body.get("amazon-bedrock-invocationMetrics").is_none());
+
+        let frame = b"data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"fc_bdrk_1\",\"delta\":\"{\"}\n\n";
+        let out = String::from_utf8(mark.apply_to_sse_frame(frame).unwrap()).unwrap();
+        assert_eq!(
+            out,
+            format!(
+                "data: {{\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"{}\",\"delta\":\"{{\"}}\n\n",
+                seal_id(&key, "fc_bdrk_1")
+            )
+        );
+        let done = b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_up\",\"output\":[{\"id\":\"fc_bdrk_1\",\"call_id\":\"call_bdrk_1\"}]},\"amazon-bedrock-invocationMetrics\":{\"n\":1}}\n\n";
+        let out = String::from_utf8(mark.apply_to_sse_frame(done).unwrap()).unwrap();
+        assert!(!out.contains("bdrk"), "{out}");
+        assert!(out.contains(&mark_response_id("m-1", "resp_up")), "{out}");
+        assert!(out.ends_with("]}}\n\n"), "{out}");
+        let buffered = mark.apply_to_sse_buffer([&frame[..], &done[..]].concat());
+        assert!(!String::from_utf8(buffered).unwrap().contains("bdrk"));
+    }
+
+    #[test]
+    fn a_mark_without_platform_mode_leaves_item_ids_alone() {
+        let mark = ContextAffinity::default()
+            .response_mark(None)
+            .sealing_ids(None);
+        let mut body = json!({"id": "resp_up", "output": [{"id": "fc_1", "call_id": "call_1"}],
+                              "amazon-bedrock-invocationMetrics": {}});
+        let before = body.clone();
+        mark.apply_to_body(&mut body);
+        assert_eq!(body, before);
+        let frame =
+            b"data: {\"type\":\"response.output_item.added\",\"item\":{\"id\":\"fc_1\"}}\n\n";
+        assert!(mark.apply_to_sse_frame(frame).is_none());
+        assert!(mark.seal_key().is_none());
+
+        // Platform mode alone, outside a routing group, still seals.
+        let (mark, _) = sealing_mark(None);
+        assert!(mark.apply_to_sse_frame(frame).is_some());
     }
 }

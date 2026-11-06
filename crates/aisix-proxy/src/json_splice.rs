@@ -371,6 +371,124 @@ pub fn rewrite_string_values(
     Ok(Some(out))
 }
 
+/// Remove every top-level member named `key` from a JSON object document,
+/// leaving every other byte as written. Only the separator in front of a
+/// removed member goes with it (or the one after it, for the first member).
+///
+/// Returns `Ok(None)` when the document is not an object or has no such
+/// member, and an error for a document [`validate_json`] refuses — nothing is
+/// ever half-removed.
+pub(crate) fn remove_top_level_member(
+    input: &[u8],
+    key: &str,
+) -> Result<Option<Vec<u8>>, SpliceError> {
+    validate_json(input)?;
+    let invalid = |at: usize| SpliceError {
+        at,
+        kind: SpliceErrorKind::Invalid,
+    };
+    let skip_ws = |pos: &mut usize| {
+        while *pos < input.len() && matches!(input[*pos], b' ' | b'\t' | b'\n' | b'\r') {
+            *pos += 1;
+        }
+    };
+    // The document is valid, so a string ends at the first unescaped quote.
+    let string_end = |start: usize| -> usize {
+        let mut i = start + 1;
+        while input[i] != b'"' {
+            i += if input[i] == b'\\' { 2 } else { 1 };
+        }
+        i + 1
+    };
+    let value_end = |start: usize| -> usize {
+        match input[start] {
+            b'"' => string_end(start),
+            b'{' | b'[' => {
+                let mut depth = 0usize;
+                let mut i = start;
+                loop {
+                    match input[i] {
+                        b'"' => {
+                            i = string_end(i);
+                            continue;
+                        }
+                        b'{' | b'[' => depth += 1,
+                        b'}' | b']' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                return i + 1;
+                            }
+                        }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+            }
+            _ => {
+                let mut i = start;
+                while i < input.len()
+                    && !matches!(input[i], b',' | b'}' | b']' | b' ' | b'\t' | b'\n' | b'\r')
+                {
+                    i += 1;
+                }
+                i
+            }
+        }
+    };
+
+    let mut pos = 0;
+    skip_ws(&mut pos);
+    if input.get(pos) != Some(&b'{') {
+        return Ok(None);
+    }
+    pos += 1;
+    // `(start of the key, end of the value, removed)` per member.
+    let mut members: Vec<(usize, usize, bool)> = Vec::new();
+    loop {
+        skip_ws(&mut pos);
+        if input.get(pos) == Some(&b'}') {
+            break;
+        }
+        let key_start = pos;
+        let key_end = string_end(pos);
+        let name: String =
+            serde_json::from_slice(&input[key_start..key_end]).map_err(|_| invalid(key_start))?;
+        pos = key_end;
+        skip_ws(&mut pos);
+        pos += 1; // `:`
+        skip_ws(&mut pos);
+        let end = value_end(pos);
+        members.push((key_start, end, name == key));
+        pos = end;
+        skip_ws(&mut pos);
+        if input.get(pos) == Some(&b',') {
+            pos += 1;
+        }
+    }
+    if !members.iter().any(|&(_, _, removed)| removed) {
+        return Ok(None);
+    }
+    let (Some(first), Some(last)) = (members.first(), members.last()) else {
+        return Ok(None);
+    };
+    let mut out = Vec::with_capacity(input.len());
+    out.extend_from_slice(&input[..first.0]);
+    let mut wrote_one = false;
+    for (i, &(start, end, removed)) in members.iter().enumerate() {
+        if removed {
+            continue;
+        }
+        if wrote_one {
+            // The separator this member had in front of it.
+            out.extend_from_slice(&input[members[i - 1].1..start]);
+        }
+        out.extend_from_slice(&input[start..end]);
+        wrote_one = true;
+    }
+    out.extend_from_slice(&input[last.1..]);
+    Ok(Some(out))
+}
+
 /// Decode and collect every JSON string **value** in source order.
 ///
 /// This reuses the iterative splice scanner with a no-op rewrite, so it
@@ -798,6 +916,53 @@ mod tests {
         assert!(rewrite_string_values(doc.as_bytes(), |_| true, |_| None)
             .expect("valid deep JSON")
             .is_none());
+    }
+
+    #[test]
+    fn removes_a_top_level_member_and_keeps_every_other_byte() {
+        let remove = |doc: &str| {
+            remove_top_level_member(doc.as_bytes(), "drop")
+                .unwrap()
+                .map(|b| String::from_utf8(b).unwrap())
+        };
+        assert_eq!(
+            remove(r#"{"type":"message_stop","drop":{"n":[1,"}",2e1]}}"#).as_deref(),
+            Some(r#"{"type":"message_stop"}"#)
+        );
+        assert_eq!(
+            remove(r#"{ "drop" : 1 , "a": 1e3 ,"b":"x" }"#).as_deref(),
+            Some(r#"{ "a": 1e3 ,"b":"x" }"#)
+        );
+        assert_eq!(
+            remove(r#"{"a":1, "drop":[{}], "b":2}"#).as_deref(),
+            Some(r#"{"a":1, "b":2}"#)
+        );
+        assert_eq!(remove(r#"{"drop":null}"#).as_deref(), Some("{}"));
+        // Every duplicate goes.
+        assert_eq!(
+            remove(r#"{"drop":1,"a":true,"drop":2}"#).as_deref(),
+            Some(r#"{"a":true}"#)
+        );
+        // An escaped spelling of the key is the same key.
+        assert_eq!(remove(r#"{"drop":1,"a":2}"#).as_deref(), Some(r#"{"a":2}"#));
+    }
+
+    #[test]
+    fn removing_an_absent_or_nested_member_changes_nothing() {
+        for doc in [
+            r#"{"a":{"drop":1}}"#,
+            r#"[{"drop":1}]"#,
+            r#""drop""#,
+            r#"{}"#,
+            r#"{"a":"drop"}"#,
+        ] {
+            assert_eq!(
+                remove_top_level_member(doc.as_bytes(), "drop").unwrap(),
+                None,
+                "{doc}"
+            );
+        }
+        assert!(remove_top_level_member(br#"{"drop":1"#, "drop").is_err());
     }
 
     #[test]

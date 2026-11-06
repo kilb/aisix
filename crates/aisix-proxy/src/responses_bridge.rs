@@ -1658,6 +1658,8 @@ pub struct ResponsesSseEncoder {
     cache_read_tokens: u32,
     /// The last tier an OpenAI-shape upstream reported on this stream.
     service_tier: Option<String>,
+    /// Platform mode: every event leaves with its item ids sealed.
+    seal: Option<crate::opaque_id::SealKey>,
 }
 
 impl ResponsesSseEncoder {
@@ -1704,7 +1706,15 @@ impl ResponsesSseEncoder {
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
             service_tier: None,
+            seal: None,
         }
+    }
+
+    /// Seal the item ids of every event this encoder builds, as the
+    /// non-streaming answer's are ([`crate::opaque_id::seal_responses_event`]).
+    pub(crate) fn sealing_ids(mut self, key: Option<crate::opaque_id::SealKey>) -> Self {
+        self.seal = key;
+        self
     }
 
     /// Take the next `sequence_number` for an event this relay emits
@@ -1743,6 +1753,9 @@ impl ResponsesSseEncoder {
         if let Value::Object(map) = &mut data {
             map.insert("type".to_string(), json!(event_type));
             map.insert("sequence_number".to_string(), json!(seq));
+        }
+        if let Some(key) = &self.seal {
+            crate::opaque_id::seal_responses_event(key.bytes(), &mut data);
         }
         ResponsesSseEvent { event_type, data }
     }

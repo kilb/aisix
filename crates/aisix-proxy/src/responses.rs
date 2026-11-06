@@ -394,6 +394,14 @@ pub async fn responses(
     // Before anything reads the body: no gateway context tag may reach a
     // guardrail, a log, or an upstream.
     let affinity = crate::responses_affinity::ContextAffinity::unwrap_request(&mut body);
+    // Platform mode: the item ids a client echoes from an earlier answer
+    // leave here sealed; the upstream gets back the ones it issued.
+    if let Some(platform) = state.platform() {
+        crate::opaque_id::unseal_responses_input(
+            crate::opaque_id::SealKey::of(platform).bytes(),
+            &mut body,
+        );
+    }
     let request_id = client.request_id.clone();
     crate::span_facts::note_request(
         &client,
@@ -1257,7 +1265,9 @@ async fn dispatch(
                 ..Default::default()
             };
             let attempt_body = stripped_body.as_ref().unwrap_or(body);
-            let mark = affinity.response_mark(is_routing_request.then_some(target.id.as_str()));
+            let mark = affinity
+                .response_mark(is_routing_request.then_some(target.id.as_str()))
+                .sealing_ids(state.platform());
             let result = if crate::dispatch::serves_natively(
                 snapshot,
                 &target.model,
@@ -2753,7 +2763,8 @@ async fn responses_cross_provider_to_target(
             requested_model,
             created_at,
             reply,
-        );
+        )
+        .sealing_ids(mark.seal_key());
         // Only an output-hook guardrail needs the streamed response text.
         // When attached with a hold-back policy (Window/BufferFull — any
         // block-capable chain), the bridge buffers the SSE and scans before

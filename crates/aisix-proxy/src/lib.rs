@@ -70,6 +70,7 @@ mod messages;
 mod model_echo;
 mod model_resolve;
 mod models;
+mod opaque_id;
 mod operation;
 mod passthrough_route;
 pub mod platform;
