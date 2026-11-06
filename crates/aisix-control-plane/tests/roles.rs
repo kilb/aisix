@@ -106,6 +106,7 @@ fn fixture(method: &str, path: &str, target: &SeededOperator) -> (String, Option
             format!("/admin/members/{}", Uuid::nil()),
             Some(json!({"disabled": true})),
         ),
+        ("GET", "/admin/rollout") => (path.to_string(), None),
         // This control plane reaches no kine, so no projector leads: past
         // the role check, the request is refused and nothing is deleted.
         ("POST", "/admin/rollout/reconcile") => {

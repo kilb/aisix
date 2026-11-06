@@ -14,6 +14,7 @@ use tokio::task::JoinHandle;
 
 pub mod audit;
 pub mod auth;
+pub mod compat;
 pub mod config;
 pub mod crypto;
 pub mod db;
@@ -148,6 +149,8 @@ where
     let write_ctx = resources::write::WriteCtx {
         mk: crypto::MasterKey(cfg.master_key.0),
         env: env.clone(),
+        cp_version: cfg.cp_version.clone(),
+        stale_secs: gateways::stale_window_secs(&cfg),
     };
     tenants::ensure_internal_tenant(&db, &write_ctx).await?;
     let passwords = PasswordGate::new(ARGON2_GATE_PERMITS)?;

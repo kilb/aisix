@@ -34,6 +34,7 @@ use crate::audit::{self, Actor, AuditEntry};
 use crate::auth::{OperatorAuth, OperatorRole};
 use crate::db::{Db, DbError};
 use crate::error::{ApiError, BootError, Detail};
+use crate::gateways::stale_window_secs;
 use crate::http::ApiJson;
 use crate::resources::api::if_match;
 use crate::resources::store::{self, ResourceRow};
@@ -41,8 +42,8 @@ use crate::resources::write::{
     write_resource, ResourceWrite, WriteCtx, WriteOp, RESOURCES_LOCK_KEY,
 };
 use crate::resources::Kind;
-use crate::rollout::{self, ResourceRollout};
-use crate::settings::{self, TenantDefaults, BOOT_LOCK_KEY};
+use crate::rollout::{self, Fleet, ResourceRollout, RolloutInput};
+use crate::settings::{self, EnvSettings, TenantDefaults, BOOT_LOCK_KEY};
 use crate::AppState;
 
 /// The platform's own tenant, which operator keys belong to.
@@ -544,6 +545,8 @@ pub async fn ensure_internal_tenant(db: &Db, ctx: &WriteCtx) -> Result<TenantRow
     let ctx = WriteCtx {
         mk: crate::crypto::MasterKey(ctx.mk.0),
         env: ctx.env.clone(),
+        cp_version: ctx.cp_version.clone(),
+        stale_secs: ctx.stale_secs,
     };
     db.tx(move |conn| {
         async move {
@@ -853,11 +856,15 @@ pub struct TenantView {
 }
 
 /// The views of `tenants`, each with the rollout of its documents (live
-/// ones, and deletes still on their way).
+/// ones, and deletes still on their way) over the gateways of `env`, online
+/// when heard from within `stale_secs`.
 async fn views(
     conn: &mut PgConnection,
+    env: &EnvSettings,
+    stale_secs: f64,
     tenants: Vec<TenantRow>,
 ) -> Result<Vec<TenantView>, ApiError> {
+    let fleet = Fleet::load(&mut *conn, env, stale_secs).await?;
     let owners: Vec<String> = tenants.iter().map(|t| owner(t.id)).collect();
     let mut rows: BTreeMap<String, Vec<ResourceRow>> = BTreeMap::new();
     for row in store::owned_by(&mut *conn, &owners).await? {
@@ -881,7 +888,11 @@ async fn views(
         .map(|t| {
             let states: Vec<ResourceRollout> = rows
                 .get(&owner(t.id))
-                .map(|rows| rows.iter().map(ResourceRollout::of_row).collect())
+                .map(|rows| {
+                    rows.iter()
+                        .map(|row| fleet.rollout(&RolloutInput::of_row(row)))
+                        .collect()
+                })
                 .unwrap_or_default();
             TenantView {
                 id: t.id,
@@ -903,8 +914,13 @@ async fn views(
         .collect())
 }
 
-async fn view(conn: &mut PgConnection, tenant: TenantRow) -> Result<TenantView, ApiError> {
-    views(conn, vec![tenant])
+async fn view(
+    conn: &mut PgConnection,
+    env: &EnvSettings,
+    stale_secs: f64,
+    tenant: TenantRow,
+) -> Result<TenantView, ApiError> {
+    views(conn, env, stale_secs, vec![tenant])
         .await?
         .pop()
         .ok_or_else(|| ApiError::internal("a tenant view went missing"))
@@ -962,7 +978,13 @@ pub async fn list(
         .into_iter()
         .map(TenantRow::from_raw)
         .collect::<Result<Vec<_>, _>>()?;
-    let items = views(&mut conn, tenants).await?;
+    let items = views(
+        &mut conn,
+        &state.env,
+        stale_window_secs(&state.cfg),
+        tenants,
+    )
+    .await?;
     Ok(Json(json!({ "items": items })))
 }
 
@@ -983,7 +1005,7 @@ pub async fn get(
             .map_err(DbError::from)?;
     let tenant = TenantRow::from_raw(raw.ok_or_else(ApiError::not_found)?)?;
     let etag = format!("\"{}\"", tenant.version);
-    let view = view(&mut conn, tenant).await?;
+    let view = view(&mut conn, &state.env, stale_window_secs(&state.cfg), tenant).await?;
     Ok(([(header::ETAG, etag)], Json(view)).into_response())
 }
 
@@ -1028,7 +1050,7 @@ pub async fn create_tenant(
                     ),
                 )
                 .await?;
-                view(conn, tenant).await
+                view(conn, &ctx.env, ctx.stale_secs, tenant).await
             }
             .boxed()
         })
@@ -1157,7 +1179,7 @@ pub async fn update(
                 )
                 .await?;
                 let tenant = lock(&mut *conn, id).await?;
-                view(conn, tenant).await
+                view(conn, &ctx.env, ctx.stale_secs, tenant).await
             }
             .boxed()
         })
@@ -1245,7 +1267,7 @@ async fn transition(
                 project(&mut *conn, &ctx, id).await?;
                 audit::record(&mut *conn, audit_entry(&auth, t.action(), id, json!({}))).await?;
                 let tenant = lock(&mut *conn, id).await?;
-                view(conn, tenant).await
+                view(conn, &ctx.env, ctx.stale_secs, tenant).await
             }
             .boxed()
         })

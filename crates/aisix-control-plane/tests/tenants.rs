@@ -137,6 +137,8 @@ fn ctx(cp: &TestCp) -> WriteCtx {
     WriteCtx {
         mk: MasterKey(TEST_MASTER_KEY),
         env: cp.env().clone(),
+        cp_version: cp.state().cfg.cp_version.clone(),
+        stale_secs: cp.state().cfg.instance_stale_secs as f64,
     }
 }
 

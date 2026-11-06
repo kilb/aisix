@@ -26,7 +26,9 @@ use serde_json::{json, Value};
 
 use crate::auth::{MemberRole, OperatorRole};
 use crate::error::{ApiError, Detail};
-use crate::{audit, dp, gateways, members, operators, projector, resources, tenants, AppState};
+use crate::{
+    audit, dp, gateways, members, operators, projector, resources, rollout, tenants, AppState,
+};
 
 /// The largest request body either listener reads.
 const MAX_BODY_BYTES: usize = 1 << 20;
@@ -128,7 +130,8 @@ pub const ROUTE_ROLES: &[(&str, &str, MinRole)] = &[
         "/admin/resources/{kind}/{id}",
         MinRole::Op(OperatorRole::Operator),
     ),
-    // The kine projection.
+    // The kine projection, and how far the gateways have it.
+    ("GET", "/admin/rollout", MinRole::Op(OperatorRole::Viewer)),
     (
         "POST",
         "/admin/rollout/reconcile",
@@ -280,6 +283,7 @@ pub fn browser_router(state: AppState) -> Router {
                 .put(resources::api::replace)
                 .delete(resources::api::delete),
         )
+        .route("/admin/rollout", get(rollout::summary))
         .route("/admin/rollout/reconcile", post(projector::post_reconcile))
         .route("/admin/rollout/ownership", post(projector::post_ownership))
         .route(
