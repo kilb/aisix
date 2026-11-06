@@ -1,0 +1,554 @@
+{
+  "version": "2026-11-06",
+  "entries": [
+    {
+      "key": "openai/gpt-6-astra",
+      "aliases": [],
+      "source_url": "https://platform.openai.com/docs/pricing",
+      "as_of": "2026-11-06",
+      "card": {
+        "default": {
+          "base": {
+            "input": "10",
+            "output": "50",
+            "cache_read": "1"
+          },
+          "long_context": [
+            {
+              "above_input_tokens": 272000,
+              "rates": {
+                "input": "20",
+                "output": "75",
+                "cache_read": "2"
+              }
+            }
+          ]
+        },
+        "batch": {
+          "base": {
+            "input": "5",
+            "output": "25",
+            "cache_read": "0.5"
+          },
+          "long_context": [
+            {
+              "above_input_tokens": 272000,
+              "rates": {
+                "input": "10",
+                "output": "37.5",
+                "cache_read": "1"
+              }
+            }
+          ]
+        },
+        "priority": {
+          "base": {
+            "input": "20",
+            "output": "100",
+            "cache_read": "2"
+          },
+          "long_context": [
+            {
+              "above_input_tokens": 272000,
+              "rates": {
+                "input": "40",
+                "output": "150",
+                "cache_read": "4"
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "key": "openai/gpt-5.4",
+      "aliases": [],
+      "source_url": "https://platform.openai.com/docs/pricing",
+      "as_of": "2026-11-06",
+      "card": {
+        "default": {
+          "base": {
+            "input": "2.5",
+            "output": "15",
+            "cache_read": "0.25"
+          },
+          "long_context": [
+            {
+              "above_input_tokens": 272000,
+              "rates": {
+                "input": "5",
+                "output": "22.5",
+                "cache_read": "0.5"
+              }
+            }
+          ]
+        },
+        "batch": {
+          "base": {
+            "input": "1.25",
+            "output": "7.5",
+            "cache_read": "0.13"
+          },
+          "long_context": [
+            {
+              "above_input_tokens": 272000,
+              "rates": {
+                "input": "2.5",
+                "output": "11.25",
+                "cache_read": "0.25"
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "key": "openai/gpt-5.4-mini",
+      "aliases": [],
+      "source_url": "https://platform.openai.com/docs/pricing",
+      "as_of": "2026-11-06",
+      "card": {
+        "default": {
+          "base": {
+            "input": "0.75",
+            "output": "4.5",
+            "cache_read": "0.075"
+          }
+        },
+        "batch": {
+          "base": {
+            "input": "0.375",
+            "output": "2.25",
+            "cache_read": "0.0375"
+          }
+        },
+        "flex": {
+          "base": {
+            "input": "0.375",
+            "output": "2.25",
+            "cache_read": "0.0375"
+          }
+        },
+        "priority": {
+          "base": {
+            "input": "1.5",
+            "output": "9",
+            "cache_read": "0.15"
+          }
+        }
+      }
+    },
+    {
+      "key": "openai/gpt-5.4-nano",
+      "aliases": [],
+      "source_url": "https://platform.openai.com/docs/pricing",
+      "as_of": "2026-11-06",
+      "card": {
+        "default": {
+          "base": {
+            "input": "0.2",
+            "output": "1.25",
+            "cache_read": "0.02"
+          }
+        },
+        "batch": {
+          "base": {
+            "input": "0.1",
+            "output": "0.625",
+            "cache_read": "0.01"
+          }
+        }
+      }
+    },
+    {
+      "key": "openai/text-embedding-3-small",
+      "aliases": [],
+      "source_url": "https://platform.openai.com/docs/pricing",
+      "as_of": "2026-11-06",
+      "card": {
+        "default": {
+          "base": {
+            "input": "0.02",
+            "output": "0"
+          }
+        }
+      }
+    },
+    {
+      "key": "openai/text-embedding-3-large",
+      "aliases": [],
+      "source_url": "https://platform.openai.com/docs/pricing",
+      "as_of": "2026-11-06",
+      "card": {
+        "default": {
+          "base": {
+            "input": "0.13",
+            "output": "0"
+          }
+        }
+      }
+    },
+    {
+      "key": "openai/text-embedding-ada-002",
+      "aliases": [],
+      "source_url": "https://platform.openai.com/docs/pricing",
+      "as_of": "2026-11-06",
+      "card": {
+        "default": {
+          "base": {
+            "input": "0.10",
+            "output": "0"
+          }
+        }
+      }
+    },
+    {
+      "key": "anthropic/claude-fable-5-1",
+      "aliases": [],
+      "source_url": "https://platform.claude.com/docs/en/about-claude/pricing",
+      "as_of": "2026-11-06",
+      "card": {
+        "default": {
+          "base": {
+            "input": "10",
+            "output": "50",
+            "cache_read": "0.25",
+            "cache_write": "12.5",
+            "cache_write_1h": "20"
+          }
+        },
+        "batch": {
+          "base": {
+            "input": "5",
+            "output": "25",
+            "cache_read": "0.125",
+            "cache_write": "6.25",
+            "cache_write_1h": "10"
+          }
+        }
+      }
+    },
+    {
+      "key": "anthropic/claude-opus-5-5",
+      "aliases": [],
+      "source_url": "https://platform.claude.com/docs/en/about-claude/pricing",
+      "as_of": "2026-11-06",
+      "card": {
+        "default": {
+          "base": {
+            "input": "4",
+            "output": "20",
+            "cache_read": "0.2",
+            "cache_write": "5",
+            "cache_write_1h": "8"
+          }
+        },
+        "batch": {
+          "base": {
+            "input": "2",
+            "output": "10",
+            "cache_read": "0.1",
+            "cache_write": "2.5",
+            "cache_write_1h": "4"
+          }
+        }
+      }
+    },
+    {
+      "key": "anthropic/claude-sonnet-5-5",
+      "aliases": [],
+      "source_url": "https://platform.claude.com/docs/en/about-claude/pricing",
+      "as_of": "2026-11-06",
+      "card": {
+        "default": {
+          "base": {
+            "input": "2",
+            "output": "10",
+            "cache_read": "0.1",
+            "cache_write": "2.5",
+            "cache_write_1h": "4"
+          }
+        },
+        "batch": {
+          "base": {
+            "input": "1",
+            "output": "5",
+            "cache_read": "0.05",
+            "cache_write": "1.25",
+            "cache_write_1h": "2"
+          }
+        }
+      }
+    },
+    {
+      "key": "anthropic/claude-haiku-5-5",
+      "aliases": [],
+      "source_url": "https://platform.claude.com/docs/en/about-claude/pricing",
+      "as_of": "2026-11-06",
+      "card": {
+        "default": {
+          "base": {
+            "input": "0.1",
+            "output": "0.5",
+            "cache_read": "0.01",
+            "cache_write": "0.125",
+            "cache_write_1h": "0.2"
+          },
+          "long_context": [
+            {
+              "above_input_tokens": 100000,
+              "rates": {
+                "input": "0.5",
+                "output": "2.5",
+                "cache_read": "0.05",
+                "cache_write": "0.625",
+                "cache_write_1h": "1"
+              }
+            }
+          ]
+        },
+        "batch": {
+          "base": {
+            "input": "0.05",
+            "output": "0.25",
+            "cache_read": "0.005",
+            "cache_write": "0.0625",
+            "cache_write_1h": "0.1"
+          },
+          "long_context": [
+            {
+              "above_input_tokens": 100000,
+              "rates": {
+                "input": "0.25",
+                "output": "1.25",
+                "cache_read": "0.025",
+                "cache_write": "0.3125",
+                "cache_write_1h": "0.5"
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "key": "google/gemini-3.1-pro-preview",
+      "aliases": [],
+      "source_url": "https://ai.google.dev/gemini-api/docs/pricing",
+      "as_of": "2026-11-06",
+      "card": {
+        "default": {
+          "base": {
+            "input": "2",
+            "output": "12",
+            "cache_read": "0.2"
+          },
+          "long_context": [
+            {
+              "above_input_tokens": 200000,
+              "rates": {
+                "input": "4",
+                "output": "18",
+                "cache_read": "0.4"
+              }
+            }
+          ]
+        },
+        "batch": {
+          "base": {
+            "input": "1",
+            "output": "6",
+            "cache_read": "0.2"
+          },
+          "long_context": [
+            {
+              "above_input_tokens": 200000,
+              "rates": {
+                "input": "2",
+                "output": "9",
+                "cache_read": "0.4"
+              }
+            }
+          ]
+        },
+        "flex": {
+          "base": {
+            "input": "1",
+            "output": "6",
+            "cache_read": "0.2"
+          },
+          "long_context": [
+            {
+              "above_input_tokens": 200000,
+              "rates": {
+                "input": "2",
+                "output": "9",
+                "cache_read": "0.4"
+              }
+            }
+          ]
+        },
+        "priority": {
+          "base": {
+            "input": "3.6",
+            "output": "21.6",
+            "cache_read": "0.36"
+          },
+          "long_context": [
+            {
+              "above_input_tokens": 200000,
+              "rates": {
+                "input": "7.2",
+                "output": "32.4",
+                "cache_read": "0.72"
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "key": "google/gemini-3.8-flash",
+      "aliases": [],
+      "source_url": "https://ai.google.dev/gemini-api/docs/pricing",
+      "as_of": "2026-11-06",
+      "card": {
+        "default": {
+          "base": {
+            "input": "0.75",
+            "output": "3.75",
+            "cache_read": "0.075"
+          }
+        },
+        "batch": {
+          "base": {
+            "input": "0.375",
+            "output": "1.875",
+            "cache_read": "0.0375"
+          }
+        },
+        "flex": {
+          "base": {
+            "input": "0.375",
+            "output": "1.875",
+            "cache_read": "0.0375"
+          }
+        },
+        "priority": {
+          "base": {
+            "input": "1.35",
+            "output": "6.75",
+            "cache_read": "0.135"
+          }
+        }
+      }
+    },
+    {
+      "key": "google/gemini-3.5-flash-lite",
+      "aliases": [],
+      "source_url": "https://ai.google.dev/gemini-api/docs/pricing",
+      "as_of": "2026-11-06",
+      "card": {
+        "default": {
+          "base": {
+            "input": "0.3",
+            "output": "2.5",
+            "cache_read": "0.03"
+          }
+        },
+        "batch": {
+          "base": {
+            "input": "0.15",
+            "output": "1.25",
+            "cache_read": "0.015"
+          }
+        },
+        "flex": {
+          "base": {
+            "input": "0.15",
+            "output": "1.25",
+            "cache_read": "0.02"
+          }
+        },
+        "priority": {
+          "base": {
+            "input": "0.54",
+            "output": "4.5",
+            "cache_read": "0.05"
+          }
+        }
+      }
+    },
+    {
+      "key": "google/gemini-embedding-2",
+      "aliases": [],
+      "source_url": "https://ai.google.dev/gemini-api/docs/pricing",
+      "as_of": "2026-11-06",
+      "card": {
+        "default": {
+          "base": {
+            "input": "0.2",
+            "output": "0"
+          }
+        },
+        "batch": {
+          "base": {
+            "input": "0.1",
+            "output": "0"
+          }
+        }
+      }
+    },
+    {
+      "key": "google/gemini-embedding-001",
+      "aliases": [],
+      "source_url": "https://ai.google.dev/gemini-api/docs/pricing",
+      "as_of": "2026-11-06",
+      "card": {
+        "default": {
+          "base": {
+            "input": "0.15",
+            "output": "0"
+          }
+        },
+        "batch": {
+          "base": {
+            "input": "0.075",
+            "output": "0"
+          }
+        }
+      }
+    },
+    {
+      "key": "deepseek/deepseek-flash",
+      "aliases": [
+        "deepseek-v4-flash"
+      ],
+      "source_url": "https://api-docs.deepseek.com/quick_start/pricing/",
+      "as_of": "2026-11-06",
+      "card": {
+        "default": {
+          "base": {
+            "input": "0.3",
+            "output": "1.2",
+            "cache_read": "0.006"
+          }
+        }
+      }
+    },
+    {
+      "key": "deepseek/deepseek-v4-pro",
+      "aliases": [],
+      "source_url": "https://api-docs.deepseek.com/quick_start/pricing/",
+      "as_of": "2026-11-06",
+      "card": {
+        "default": {
+          "base": {
+            "input": "1.32",
+            "output": "3.96",
+            "cache_read": "0.044"
+          }
+        }
+      }
+    }
+  ]
+}
