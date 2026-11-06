@@ -9,7 +9,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use tokio::sync::watch;
+use tokio::sync::{watch, Semaphore};
 use tokio::task::JoinHandle;
 
 pub mod audit;
@@ -32,6 +32,7 @@ pub mod resources;
 pub mod rollout;
 pub mod settings;
 pub mod tenants;
+pub mod usage;
 
 use auth::password::{LoginThrottle, PasswordGate, ARGON2_GATE_PERMITS};
 use config::CpConfig;
@@ -66,6 +67,9 @@ pub struct AppState {
     pub beats: BeatLimiter,
     /// Whether the gateway listener runs.
     pub dp_listener: ListenerState,
+    /// The usage-batch bodies this process may hold at once
+    /// ([`dp::telemetry::MAX_BODIES_IN_FLIGHT`]).
+    pub telemetry_bodies: Arc<Semaphore>,
 }
 
 /// A booted control plane. Dropping it stops everything it runs.
@@ -205,6 +209,7 @@ where
         creds,
         beats: BeatLimiter::default(),
         dp_listener,
+        telemetry_bodies: Arc::new(Semaphore::new(dp::telemetry::MAX_BODIES_IN_FLIGHT)),
     };
 
     // Nothing fails from here on, so nothing spawned below is left behind

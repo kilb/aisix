@@ -11,6 +11,7 @@
 pub mod heartbeat;
 pub mod listener;
 pub mod store;
+pub mod telemetry;
 
 use std::collections::HashMap;
 use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};

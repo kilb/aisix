@@ -21,6 +21,11 @@ use sqlx::{Connection, PgConnection, PgPool};
 /// Connections per control-plane instance.
 const MAX_CONNECTIONS: u32 = 10;
 
+/// How long a request waits for a connection of the pool, rather than the
+/// 30 s default: a gateway gives up on a request after 10 s, and one whose
+/// store cannot get a connection is answered `503` before then.
+const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// How long a boot waits to connect and apply the migrations, including the
 /// wait for another instance's run to finish. See [`Db::connect`].
 pub const MIGRATION_BOUND: Duration = Duration::from_secs(600);
@@ -110,6 +115,7 @@ impl Db {
             .map_err(|_| DbError::MigrationTimeout { after: bound })??;
         let pool = PgPoolOptions::new()
             .max_connections(MAX_CONNECTIONS)
+            .acquire_timeout(ACQUIRE_TIMEOUT)
             .connect_with(options.options([
                 ("lock_timeout", lock_timeout_ms),
                 ("statement_timeout", statement_timeout_ms),

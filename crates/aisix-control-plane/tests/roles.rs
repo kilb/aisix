@@ -116,6 +116,10 @@ fn fixture(method: &str, path: &str, target: &SeededOperator) -> (String, Option
             path.to_string(),
             Some(json!({"take_over_from": Uuid::nil()})),
         ),
+        // Stored usage.
+        ("GET", "/admin/usage/events")
+        | ("GET", "/admin/usage/batches")
+        | ("GET", "/admin/usage/rejects") => (path.to_string(), None),
         _ => panic!("no fixture for {method} {path}: add one to tests/roles.rs"),
     }
 }
