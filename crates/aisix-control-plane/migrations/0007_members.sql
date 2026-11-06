@@ -12,3 +12,6 @@ CREATE TABLE member_invites (id uuid PRIMARY KEY, tenant_id uuid NOT NULL REFERE
   email text NOT NULL, role text NOT NULL, token_sha256 bytea NOT NULL UNIQUE, expires_at timestamptz NOT NULL,
   created_by_kind text NOT NULL, created_by uuid, accepted_at timestamptz, revoked_at timestamptz,
   created_at timestamptz NOT NULL DEFAULT now());
+-- Signups are counted across instances by their `tenant.signup` audit rows
+-- of the last minute.
+CREATE INDEX audit_action_at ON audit_log (action, at);

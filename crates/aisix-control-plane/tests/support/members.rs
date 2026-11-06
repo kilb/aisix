@@ -126,6 +126,9 @@ impl TestCp {
             .db()
             .tx(move |conn| {
                 async move {
+                    // As `members::create` asks of a caller adding to an
+                    // existing tenant.
+                    tenants::lock(&mut *conn, tenant_id).await?;
                     members::create(conn, &ctx, tenant_id, &stored, &hash, None, role).await
                 }
                 .boxed()

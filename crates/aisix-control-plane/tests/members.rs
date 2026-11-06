@@ -852,6 +852,7 @@ async fn an_invite_is_single_use_and_expires() {
         json!({
             "id": open.body["id"], "email": items[0]["email"], "role": "billing",
             "expires_at": open.body["expires_at"], "created_at": items[0]["created_at"],
+            "invited_by": {"id": owner.id, "display_name": null},
         })
     );
     assert!(text(&items[0], "/email").starts_with("open-"));
@@ -1508,8 +1509,9 @@ async fn an_acceptance_racing_a_signup_for_its_email_is_409_not_500() {
     let invite_id = text(&r.body, "/id");
 
     // A signup for the same email, as far as the database sees one: it
-    // holds the resources lock (it has written its tenant's team) when it
-    // adds its member.
+    // holds the resources lock (it has written its own new tenant's team)
+    // when it adds its member to that tenant.
+    let signup_tenant = cp.seed_tenant(TenantStatus::Pending).await;
     let mut signup = cp.db().pool().begin().await.expect("begin");
     sqlx::query("SELECT pg_advisory_xact_lock($1)")
         .bind(RESOURCES_LOCK_KEY)
@@ -1526,7 +1528,7 @@ async fn an_acceptance_racing_a_signup_for_its_email_is_409_not_500() {
          VALUES ($1, $2, $3, 'not-a-hash', 'member')",
     )
     .bind(Uuid::new_v4())
-    .bind(tenant)
+    .bind(signup_tenant)
     .bind(&email)
     .execute(&mut *signup)
     .await
@@ -1546,6 +1548,172 @@ async fn an_acceptance_racing_a_signup_for_its_email_is_409_not_500() {
     .await
     .expect("read the invite");
     assert!(!used);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_acceptance_racing_a_removal_in_its_tenant_waits_for_it() {
+    let Some(cp) = TestCp::start_with(patient).await else {
+        return;
+    };
+    let cp = Arc::new(cp);
+    let tenant = cp.seed_tenant(TenantStatus::Active).await;
+    let owner = cp.member_login_seeded(tenant, MemberRole::Owner).await;
+    let leaving = cp.seed_member(tenant, MemberRole::Member).await;
+    let r = invite(&cp, &owner, &fresh_email("arriving"), "member").await;
+    let token = text(&r.body, "/invite_token");
+
+    // The removal holds the tenant, then waits for the leaving member's
+    // row; the acceptance comes in meanwhile.
+    let mut holder = cp.db().pool().begin().await.expect("begin");
+    sqlx::query("SELECT 1 FROM members WHERE id = $1 FOR UPDATE")
+        .bind(leaving.id)
+        .execute(&mut *holder)
+        .await
+        .expect("hold the leaving member");
+    let removal = tokio::spawn({
+        let (cp, owner, id) = (cp.clone(), owner.clone(), leaving.id.to_string());
+        async move { remove_member(&cp, &owner, &id).await }
+    });
+    until_lock_waiters(&cp, 1).await;
+    let acceptance = tokio::spawn({
+        let (cp, token) = (cp.clone(), token.clone());
+        async move { accept(&cp, &token, "arriving-password-1", None).await }
+    });
+    until_lock_waiters(&cp, 2).await;
+    holder.rollback().await.expect("release the member");
+    let removal = removal.await.expect("join");
+    let acceptance = acceptance.await.expect("join");
+    assert_eq!(
+        (removal.status, acceptance.status),
+        (204, 201),
+        "{removal:?} {acceptance:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_acceptance_racing_a_revocation_of_its_invite_is_never_a_500() {
+    let Some(cp) = TestCp::start_with(patient).await else {
+        return;
+    };
+    let cp = Arc::new(cp);
+    let tenant = cp.seed_tenant(TenantStatus::Active).await;
+    let owner = cp.member_login_seeded(tenant, MemberRole::Owner).await;
+    let r = invite(&cp, &owner, &fresh_email("revoked-or-not"), "member").await;
+    let (token, id) = (text(&r.body, "/invite_token"), text(&r.body, "/id"));
+
+    // The acceptance gets as far as the gateway documents and waits there;
+    // the revocation of the same invitation comes in meanwhile.
+    let mut holder = cp.db().pool().begin().await.expect("begin");
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(RESOURCES_LOCK_KEY)
+        .execute(&mut *holder)
+        .await
+        .expect("take the resources lock");
+    let acceptance = tokio::spawn({
+        let (cp, token) = (cp.clone(), token.clone());
+        async move { accept(&cp, &token, "revoked-password-1", None).await }
+    });
+    until_lock_waiters(&cp, 1).await;
+    let revocation = tokio::spawn({
+        let (cp, owner) = (cp.clone(), owner.clone());
+        async move {
+            cp.send(
+                "DELETE",
+                &format!("/api/members/invites/{id}"),
+                Some(owner.cookie()),
+                None,
+            )
+            .await
+        }
+    });
+    until_lock_waiters(&cp, 2).await;
+    holder.rollback().await.expect("release the resources lock");
+    let acceptance = acceptance.await.expect("join");
+    let revocation = revocation.await.expect("join");
+    let outcome = (acceptance.status, revocation.status);
+    assert!(
+        outcome == (201, 404) || outcome == (404, 204),
+        "{acceptance:?} {revocation:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_acceptance_racing_an_operator_change_to_its_tenant_is_never_a_500() {
+    let Some(cp) = TestCp::start_with(patient).await else {
+        return;
+    };
+    let cp = Arc::new(cp);
+    let op = cp.admin_login_seeded(OperatorRole::Operator).await;
+    // An approval, then a rename: both write the tenant's documents.
+    for approve in [true, false] {
+        let status = if approve {
+            TenantStatus::Pending
+        } else {
+            TenantStatus::Active
+        };
+        let tenant = cp.seed_tenant(status).await;
+        let r = cp
+            .send(
+                "POST",
+                &format!("/admin/tenants/{tenant}/invites"),
+                Some(op.cookie()),
+                Some(json!({"email": fresh_email("changing"), "role": "owner"})),
+            )
+            .await;
+        assert_eq!(r.status, 201, "{r:?}");
+        let token = text(&r.body, "/invite_token");
+        let version = cp
+            .get_with_cookie(&format!("/admin/tenants/{tenant}"), op.cookie())
+            .await
+            .body["version"]
+            .as_i64()
+            .expect("a version");
+
+        // The operator's change waits for the tenant; the acceptance
+        // queues behind it.
+        let mut holder = cp.db().pool().begin().await.expect("begin");
+        sqlx::query("SELECT 1 FROM tenants WHERE id = $1 FOR UPDATE")
+            .bind(tenant)
+            .execute(&mut *holder)
+            .await
+            .expect("hold the tenant");
+        let change = tokio::spawn({
+            let (cp, cookie) = (cp.clone(), op.cookie().to_string());
+            async move {
+                if approve {
+                    cp.send(
+                        "POST",
+                        &format!("/admin/tenants/{tenant}/approve"),
+                        Some(&cookie),
+                        None,
+                    )
+                    .await
+                    .status
+                } else {
+                    send_if_match(
+                        &cp,
+                        &cookie,
+                        "PATCH",
+                        &format!("/admin/tenants/{tenant}"),
+                        version,
+                        json!({"name": "renamed-7c1"}),
+                    )
+                    .await
+                }
+            }
+        });
+        until_lock_waiters(&cp, 1).await;
+        let acceptance = tokio::spawn({
+            let (cp, token) = (cp.clone(), token.clone());
+            async move { accept(&cp, &token, "changing-password-1", None).await }
+        });
+        until_lock_waiters(&cp, 2).await;
+        holder.rollback().await.expect("release the tenant");
+        let change = change.await.expect("join");
+        let acceptance = acceptance.await.expect("join");
+        assert_eq!(change, 200, "approve={approve}");
+        assert_eq!(acceptance.status, 201, "approve={approve}: {acceptance:?}");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1858,4 +2026,151 @@ async fn an_operator_invites_into_a_tenant_and_disables_its_members() {
     assert_eq!(r.status, 204, "{r:?}");
     let r = admin_patch_member(&cp, &op, &member_id, json!({"disabled": true})).await;
     assert_eq!(r.status, 404, "{r:?}");
+}
+
+/// The invitations `cookie`'s member lists as open.
+async fn open_invites(cp: &TestCp, cookie: &str) -> Vec<Value> {
+    let r = cp.get_with_cookie("/api/members/invites", cookie).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    r.body["items"].as_array().expect("items").clone()
+}
+
+#[tokio::test]
+async fn an_invite_dies_with_its_issuers_authority() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let tenant = cp.seed_tenant(TenantStatus::Active).await;
+    let owner = cp.member_login_seeded(tenant, MemberRole::Owner).await;
+    let op = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let issue = |by: &MemberSession, role: &'static str| {
+        let (cp, by) = (&cp, by.clone());
+        async move {
+            let r = invite(cp, &by, &fresh_email("issued"), role).await;
+            assert_eq!(r.status, 201, "{r:?}");
+            (text(&r.body, "/id"), text(&r.body, "/invite_token"))
+        }
+    };
+    // Invitations nobody below loses authority over, which must outlive
+    // every revocation: an operator's, and an owner invitation from the
+    // owner who stays.
+    let r = cp
+        .send(
+            "POST",
+            &format!("/admin/tenants/{tenant}/invites"),
+            Some(op.cookie()),
+            Some(json!({"email": fresh_email("from-ops"), "role": "member"})),
+        )
+        .await;
+    assert_eq!(r.status, 201, "{r:?}");
+    let ops_invite = text(&r.body, "/id");
+    let (own_invite, _) = issue(&owner, "owner").await;
+    let kept = [ops_invite.clone(), own_invite.clone()];
+    let with = |id: &str| [kept[0].clone(), kept[1].clone(), id.to_string()];
+
+    // An owner stepping down to admin loses only their owner invitations.
+    let second = cp.member_login_seeded(tenant, MemberRole::Owner).await;
+    let (_, owner_token) = issue(&second, "owner").await;
+    let (member_invite, member_token) = issue(&second, "member").await;
+    let r = patch_member(&cp, &owner, &second.id.to_string(), "admin").await;
+    assert_eq!(r.status, 200, "{r:?}");
+    assert_eq!(
+        ids(&open_invites(&cp, owner.cookie()).await),
+        with(&member_invite)
+    );
+    // Down to member, they lose the rest.
+    let r = patch_member(&cp, &owner, &second.id.to_string(), "member").await;
+    assert_eq!(r.status, 200, "{r:?}");
+    assert_eq!(ids(&open_invites(&cp, owner.cookie()).await), kept);
+
+    // A disabled admin's invitations go, and so do a removed one's.
+    let disabled = cp.member_login_seeded(tenant, MemberRole::Admin).await;
+    let (_, disabled_token) = issue(&disabled, "member").await;
+    let r = admin_patch_member(
+        &cp,
+        &op,
+        &disabled.id.to_string(),
+        json!({"disabled": true}),
+    )
+    .await;
+    assert_eq!(r.status, 200, "{r:?}");
+    assert_eq!(ids(&open_invites(&cp, owner.cookie()).await), kept);
+    let r = invite(&cp, &owner, &fresh_email("eve"), "admin").await;
+    let eve = accept(
+        &cp,
+        &text(&r.body, "/invite_token"),
+        "eve-password-7c1",
+        Some("Eve 7c1"),
+    )
+    .await;
+    assert_eq!(eve.status, 201, "{eve:?}");
+    let eve_id = text(&eve.body, "/member/id");
+    let eve_cookie = cookie_of(&eve).expect("a cookie");
+    let r = cp
+        .send(
+            "POST",
+            "/api/members/invites",
+            Some(&eve_cookie),
+            Some(json!({"email": fresh_email("from-eve"), "role": "billing"})),
+        )
+        .await;
+    assert_eq!(r.status, 201, "{r:?}");
+    let (eve_invite, eve_token) = (text(&r.body, "/id"), text(&r.body, "/invite_token"));
+    // The list names who issued each invitation; an operator's names no
+    // member.
+    let listed = open_invites(&cp, owner.cookie()).await;
+    assert_eq!(ids(&listed), with(&eve_invite));
+    assert_eq!(listed[0]["invited_by"], Value::Null);
+    assert_eq!(
+        listed[1]["invited_by"],
+        json!({"id": owner.id, "display_name": null})
+    );
+    assert_eq!(
+        listed[2]["invited_by"],
+        json!({"id": eve_id, "display_name": "Eve 7c1"})
+    );
+    assert_eq!(remove_member(&cp, &owner, &eve_id).await.status, 204);
+    assert_eq!(ids(&open_invites(&cp, owner.cookie()).await), kept);
+
+    // None of theirs can be accepted any more.
+    for token in [owner_token, member_token, disabled_token, eve_token] {
+        let r = accept(&cp, &token, "too-late-password-1", None).await;
+        assert_eq!(r.status, 404, "{r:?}");
+    }
+}
+
+#[tokio::test]
+async fn signups_are_counted_across_instances() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    // Sixty signups in the last minute, through other instances.
+    sqlx::query(
+        "INSERT INTO audit_log (actor_kind, action, target_kind) \
+         SELECT 'member', 'tenant.signup', 'tenant' FROM generate_series(1, 60)",
+    )
+    .execute(cp.db().pool())
+    .await
+    .expect("record signups");
+    let tenants = || async {
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM tenants")
+            .fetch_one(cp.db().pool())
+            .await
+            .expect("count tenants")
+    };
+    let before = tenants().await;
+    let r = signup(&cp, "counted-7c1", &fresh_email("counted"), None).await;
+    assert_eq!(r.status, 429, "{r:?}");
+    assert_eq!(r.body["code"], "busy");
+    assert!(r.set_cookie.is_none());
+    assert_eq!(tenants().await, before);
+    // A minute later they no longer count.
+    sqlx::query(
+        "UPDATE audit_log SET at = now() - interval '61 seconds' WHERE action = 'tenant.signup'",
+    )
+    .execute(cp.db().pool())
+    .await
+    .expect("age the signups");
+    let r = signup(&cp, "counted-7c1", &fresh_email("later"), None).await;
+    assert_eq!(r.status, 201, "{r:?}");
 }

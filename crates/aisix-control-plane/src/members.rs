@@ -54,8 +54,17 @@ pub const INVITE_TTL: Duration = Duration::from_secs(7 * 86_400);
 
 /// Signups accepted per minute across the site. Signup is unauthenticated
 /// and verifies no email, and each one creates a tenant, a member and
-/// gateway documents, so it is bounded as a whole.
+/// gateway documents, so it is bounded as a whole: counted in the database
+/// (the `tenant.signup` audit rows of the last minute), whichever instance
+/// took them, and first in this process, which turns a flood away before
+/// any argon2 work.
 pub const SIGNUPS_PER_MINUTE: usize = 60;
+
+/// Serialises the signups' count of the last minute against their own
+/// rows, so two instances cannot both admit the sixtieth. A signup takes it
+/// first in its transaction, before any other lock, and nothing else takes
+/// it.
+pub const SIGNUP_LOCK_KEY: i64 = 0x6169_7369_7863_7073;
 
 const SIGNUP_WINDOW: Duration = Duration::from_secs(60);
 
@@ -215,10 +224,16 @@ fn email_taken() -> ApiError {
 /// `password_hash`, and writes their `users` document. A live member with
 /// the same email, in any tenant, is `409 email_taken`.
 ///
+/// A caller adding to an existing tenant holds that tenant's lock
+/// ([`tenants::lock`]) first: the member row takes a key-share lock on the
+/// tenant row, and taken after the resources lock below, a change holding
+/// the tenant while it waits for the resources lock would deadlock with
+/// this. A signup adds to the tenant it has just created, which it holds.
+///
 /// The resources lock is taken before the member row, not only by the
 /// document write after it. A transaction already holding that lock (a
-/// signup, which wrote its tenant's team) may be adding a member with the
-/// same email, and it waits for any row this one inserted first: taken
+/// signup, which wrote its new tenant's team) may be adding a member with
+/// the same email, and it waits for any row this one inserted first: taken
 /// after the insert, the lock would close a deadlock.
 pub async fn create(
     conn: &mut PgConnection,
@@ -319,6 +334,32 @@ async fn current(
     now.require_active()?;
     now.require(allowed)?;
     Ok(now)
+}
+
+/// Revokes the open invitations member `issuer` of `tenant_id` issued:
+/// every one when `all`, otherwise only those for an owner. An invitation
+/// hands on its issuer's authority, so it goes when that authority does:
+/// all of them when the issuer is removed, disabled or demoted to member or
+/// billing, the owner ones when an owner becomes an admin. The caller holds
+/// the tenant's lock, as an acceptance does, so none is accepted meanwhile.
+async fn revoke_issued_invites(
+    conn: &mut PgConnection,
+    tenant_id: Uuid,
+    issuer: Uuid,
+    all: bool,
+) -> Result<u64, ApiError> {
+    Ok(sqlx::query(
+        "UPDATE member_invites SET revoked_at = now() \
+         WHERE tenant_id = $1 AND created_by_kind = 'member' AND created_by = $2 \
+           AND accepted_at IS NULL AND revoked_at IS NULL AND ($3 OR role = 'owner')",
+    )
+    .bind(tenant_id)
+    .bind(issuer)
+    .bind(all)
+    .execute(conn)
+    .await
+    .map_err(DbError::from)?
+    .rows_affected())
 }
 
 /// `409 last_owner` unless `tenant_id` keeps an enabled owner other than
@@ -494,16 +535,20 @@ pub async fn signup(
         return Err(ApiError::validation(problems));
     };
     let Some(slot) = state.portal.signups.try_take() else {
-        return Err(ApiError {
-            message: "注册过于频繁，请稍后再试".to_string(),
-            ..ApiError::busy()
-        });
+        return Err(signups_busy());
     };
     let signed_up = sign_up(&state, &headers, org, email, &req.password, name).await;
     if signed_up.is_err() {
         state.portal.signups.give_back(slot);
     }
     signed_up
+}
+
+fn signups_busy() -> ApiError {
+    ApiError {
+        message: "注册过于频繁，请稍后再试".to_string(),
+        ..ApiError::busy()
+    }
 }
 
 async fn sign_up(
@@ -521,6 +566,22 @@ async fn sign_up(
         .db
         .tx(move |conn| {
             async move {
+                sqlx::query("SELECT pg_advisory_xact_lock($1)")
+                    .bind(SIGNUP_LOCK_KEY)
+                    .execute(&mut *conn)
+                    .await
+                    .map_err(DbError::from)?;
+                let recent: i64 = sqlx::query_scalar(
+                    "SELECT count(*) FROM audit_log \
+                     WHERE action = 'tenant.signup' AND at > now() - make_interval(secs => $1)",
+                )
+                .bind(SIGNUP_WINDOW.as_secs_f64())
+                .fetch_one(&mut *conn)
+                .await
+                .map_err(DbError::from)?;
+                if recent >= SIGNUPS_PER_MINUTE as i64 {
+                    return Err(signups_busy());
+                }
                 let tenant = tenants::create(
                     &mut *conn,
                     &ctx,
@@ -887,20 +948,31 @@ pub async fn invite(
 }
 
 /// `GET /api/members/invites` → `{items: [{id, email, role, expires_at,
-/// created_at}]}`: the invitations still open (neither accepted, revoked
-/// nor expired), oldest first.
+/// created_at, invited_by}]}`: the invitations still open (neither
+/// accepted, revoked nor expired), oldest first. `invited_by` is the
+/// issuing member's `{id, display_name}`, or null for an operator's.
 pub async fn list_invites(
     auth: MemberAuth,
     State(state): State<AppState>,
 ) -> Result<Json<Value>, ApiError> {
     auth.require_active()?;
     auth.require(&[MemberRole::Owner, MemberRole::Admin])?;
-    type Raw = (Uuid, String, String, DateTime<Utc>, DateTime<Utc>);
+    type Raw = (
+        Uuid,
+        String,
+        String,
+        DateTime<Utc>,
+        DateTime<Utc>,
+        Option<Uuid>,
+        Option<String>,
+    );
     let rows: Vec<Raw> = sqlx::query_as(
-        "SELECT id, email, role, expires_at, created_at FROM member_invites \
-         WHERE tenant_id = $1 AND accepted_at IS NULL AND revoked_at IS NULL \
-           AND expires_at > now() \
-         ORDER BY created_at, id",
+        "SELECT i.id, i.email, i.role, i.expires_at, i.created_at, m.id, m.display_name \
+         FROM member_invites i \
+         LEFT JOIN members m ON i.created_by_kind = 'member' AND m.id = i.created_by \
+         WHERE i.tenant_id = $1 AND i.accepted_at IS NULL AND i.revoked_at IS NULL \
+           AND i.expires_at > now() \
+         ORDER BY i.created_at, i.id",
     )
     .bind(auth.tenant_id)
     .fetch_all(state.db.pool())
@@ -908,10 +980,13 @@ pub async fn list_invites(
     .map_err(DbError::from)?;
     let items: Vec<Value> = rows
         .into_iter()
-        .map(|(id, email, role, expires_at, created_at)| {
-            json!({"id": id, "email": email, "role": role, "expires_at": expires_at,
-                   "created_at": created_at})
-        })
+        .map(
+            |(id, email, role, expires_at, created_at, issuer, issuer_name)| {
+                let invited_by = issuer.map(|id| json!({"id": id, "display_name": issuer_name}));
+                json!({"id": id, "email": email, "role": role, "expires_at": expires_at,
+                       "created_at": created_at, "invited_by": invited_by})
+            },
+        )
         .collect();
     Ok(Json(json!({ "items": items })))
 }
@@ -988,8 +1063,13 @@ pub struct AcceptInvite {
 /// `201 Session` and the session cookie: the invited email joins the
 /// invitation's tenant with its role. A token that is invalid, expired,
 /// revoked or used is always `404 not_found`; `409 email_taken` when the
-/// email has become a live member meanwhile (the caller does not choose the
-/// email, so this tells nothing about any other one).
+/// email is a live member's by now.
+///
+/// That 409 tells whoever chose the email, the inviter, whether the address
+/// is a live member somewhere: by inviting it and accepting their own
+/// invitation, they probe it. Ruling 12 accepts that whether an email is
+/// registered can be probed, as signup answers the same `email_taken`;
+/// each probe here costs an invitation and an argon2 hash behind the gate.
 pub async fn accept_invite(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1030,17 +1110,32 @@ pub async fn accept_invite(
         .db
         .tx(move |conn| {
             async move {
-                // Locked, so two acceptances of one invitation cannot both
-                // find it open: the second waits, then finds it used.
-                let invite: Option<(Uuid, Uuid, String, String)> = sqlx::query_as(&format!(
-                    "SELECT id, tenant_id, email, role FROM member_invites WHERE {OPEN} \
-                     FOR UPDATE"
+                // The tenant first, as every change to its members does: the
+                // member row this adds takes a key-share lock on the tenant
+                // row (its foreign key), after the resources lock `create`
+                // holds, so a change holding the tenant while it waits for
+                // the resources lock would otherwise deadlock with it.
+                let tenant_id: Uuid = sqlx::query_scalar(&format!(
+                    "SELECT tenant_id FROM member_invites WHERE {OPEN}"
                 ))
                 .bind(&token_sha256)
                 .fetch_optional(&mut *conn)
                 .await
+                .map_err(DbError::from)?
+                .ok_or_else(ApiError::not_found)?;
+                tenants::lock(&mut *conn, tenant_id).await?;
+                // Locked, so two acceptances of one invitation cannot both
+                // find it open: the second waits, then finds it used.
+                let invite: Option<(Uuid, String, String)> = sqlx::query_as(&format!(
+                    "SELECT id, email, role FROM member_invites WHERE {OPEN} AND tenant_id = $2 \
+                     FOR UPDATE"
+                ))
+                .bind(&token_sha256)
+                .bind(tenant_id)
+                .fetch_optional(&mut *conn)
+                .await
                 .map_err(DbError::from)?;
-                let (invite_id, tenant_id, email, role) = invite.ok_or_else(ApiError::not_found)?;
+                let (invite_id, email, role) = invite.ok_or_else(ApiError::not_found)?;
                 let role: MemberRole = role.parse().map_err(ApiError::internal)?;
                 let member = create(
                     &mut *conn,
@@ -1197,6 +1292,17 @@ pub async fn update(
                     .execute(&mut *conn)
                     .await
                     .map_err(DbError::from)?;
+                // What the new role can no longer invite, the member's open
+                // invitations no longer offer.
+                let lost = match (target.role, req.role) {
+                    (_, MemberRole::Member | MemberRole::Billing) => Some(true),
+                    (MemberRole::Owner, MemberRole::Admin) => Some(false),
+                    _ => None,
+                };
+                let revoked = match lost {
+                    Some(all) => revoke_issued_invites(&mut *conn, auth.tenant_id, id, all).await?,
+                    None => 0,
+                };
                 audit::record(
                     conn,
                     member_entry(
@@ -1204,7 +1310,7 @@ pub async fn update(
                         "member.update",
                         auth.tenant_id,
                         id,
-                        json!({ "role": req.role }),
+                        json!({ "role": req.role, "invites_revoked": revoked }),
                     ),
                 )
                 .await?;
@@ -1258,6 +1364,7 @@ pub async fn remove(
                     .await
                     .map_err(DbError::from)?;
                 session::revoke_all(&mut *conn, Principal::Member(id), None).await?;
+                let revoked = revoke_issued_invites(&mut *conn, auth.tenant_id, id, true).await?;
                 // Task 12: the member's keys are revoked here, before their
                 // `users` document goes (a key document names its user).
                 write_resource(
@@ -1279,7 +1386,7 @@ pub async fn remove(
                         "member.remove",
                         auth.tenant_id,
                         id,
-                        json!({}),
+                        json!({ "invites_revoked": revoked }),
                     ),
                 )
                 .await?;
@@ -1391,9 +1498,13 @@ pub async fn admin_update(
                     .execute(&mut *conn)
                     .await
                     .map_err(DbError::from)?;
-                if req.disabled {
+                let detail = if req.disabled {
                     session::revoke_all(&mut *conn, Principal::Member(id), None).await?;
-                }
+                    let revoked = revoke_issued_invites(&mut *conn, tenant_id, id, true).await?;
+                    json!({ "invites_revoked": revoked })
+                } else {
+                    json!({})
+                };
                 // Task 12: `keys::reproject_member(conn, ctx, id)` goes here,
                 // so the member's keys follow in the same transaction.
                 let action = if req.disabled {
@@ -1403,7 +1514,7 @@ pub async fn admin_update(
                 };
                 audit::record(
                     conn,
-                    member_entry(Actor::Operator(&auth), action, tenant_id, id, json!({})),
+                    member_entry(Actor::Operator(&auth), action, tenant_id, id, detail),
                 )
                 .await?;
                 Ok::<_, ApiError>(
