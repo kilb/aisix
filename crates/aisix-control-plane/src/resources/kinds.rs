@@ -82,12 +82,24 @@ impl Kind {
     }
 
     /// Where the kind's documents keep credentials, if they keep any.
+    ///
+    /// Every kind is named, so a kind added later is a compile error here
+    /// until someone decides whether its credentials are sealed and
+    /// redacted.
     pub fn credential_kind(self) -> Option<CredentialKind> {
         match self {
             Kind::ProviderKeys => Some(CredentialKind::ProviderKey),
             Kind::Guardrails => Some(CredentialKind::Guardrail),
             Kind::ObservabilityExporters => Some(CredentialKind::ObservabilityExporter),
-            _ => None,
+            Kind::Models
+            | Kind::CachePolicies
+            | Kind::RateLimitPolicies
+            | Kind::GuardrailAttachments
+            | Kind::BudgetPolicy
+            | Kind::Teams
+            | Kind::Users
+            | Kind::ApiKeys
+            | Kind::Budgets => None,
         }
     }
 
