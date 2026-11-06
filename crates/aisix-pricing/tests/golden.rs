@@ -237,10 +237,13 @@ fn the_engine_charges_what_the_gateway_reported() {
                 .unwrap_or_else(|| panic!("{family}: the row carries no cost_usd: {row}"));
             let gateway = i64::try_from(spend_micro_usd(reported)).expect("a spend fits in i64");
             let PricedEvent { charge, .. } = &priced;
+            // The engine rounds up once and the gateway rounds its float to
+            // the nearest µ$, so the engine is equal or one above, never below.
+            let diff = charge.0 - gateway;
             assert!(
-                (charge.0 - gateway).abs() <= 1,
+                (0..=1).contains(&diff),
                 "{family}: the engine charges {} µ$, the gateway reported {reported} USD \
-                 ({gateway} µ$): {priced:?}",
+                 ({gateway} µ$), engine - gateway = {diff}: {priced:?}",
                 charge.0
             );
         }
