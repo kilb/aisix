@@ -53,9 +53,9 @@ pub use error::{
 pub use forwarded_headers::{
     client_header_forwardable, displaces_a_gateway_header, exact_match_only, exact_match_only_with,
     forward_pattern_admits, forward_pattern_admits_with, header_forward_blocked,
-    inbound_gateway_credential, is_caller_gateway_credential, resolve_forwarded_client_headers,
-    CREDENTIAL_SLOT_HEADERS, GATEWAY_HEADER_PREFIX, NEVER_FORWARD_FROM_CLIENT,
-    NEVER_FORWARD_FROM_CLIENT_PREFIXES, NON_FORWARDABLE_HEADERS,
+    inbound_gateway_credential, is_caller_gateway_credential, is_credential_header_name,
+    resolve_forwarded_client_headers, CREDENTIAL_SLOT_HEADERS, GATEWAY_HEADER_PREFIX,
+    NEVER_FORWARD_FROM_CLIENT, NEVER_FORWARD_FROM_CLIENT_PREFIXES, NON_FORWARDABLE_HEADERS,
 };
 pub use header_template::{render_header_template, HeaderVars, HEADER_TEMPLATE_VARS};
 pub use log_value::LogValue;

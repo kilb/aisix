@@ -201,3 +201,63 @@ guardrails:
     expect(cfg.warnings.map((w) => w.resource_kind).sort()).toEqual(["guardrails", "models"]);
   });
 });
+
+// An OTLP exporter whose headers carry a credential, sent to a plain http://
+// endpoint: anyone on the network path reads the credential. Lawful on a
+// private network, so a warning rather than a refusal, like a credentialed
+// MCP server or A2A agent reached over http. It names the exporter in the
+// log, once however often the configuration is reloaded, and by id on the
+// unauthenticated status.
+describe("status warnings: an exporter sending a credential over http", () => {
+  let app: SpawnedApp | undefined;
+
+  const warnLines = () =>
+    app!
+      .output()
+      .split("\n")
+      .filter((l) => l.includes("cleartext") && l.includes("warnings-plain-exporter"));
+
+  beforeAll(async () => {
+    app = await spawnApp({
+      // The reload line below is reported at INFO; the suite default is WARN.
+      logLevel: "info",
+      resourcesFile: `
+_format_version: "1"
+observability_exporters:
+  - name: warnings-plain-exporter
+    kind: otlp_http
+    endpoint: http://127.0.0.1:9/v1/traces
+    headers:
+      authorization: Bearer exporter-secret
+  - name: warnings-tls-exporter
+    kind: otlp_http
+    endpoint: https://127.0.0.1:9/v1/traces
+    headers:
+      authorization: Bearer exporter-secret
+`,
+    });
+  });
+
+  afterAll(async () => {
+    await app?.exit();
+  });
+
+  test("is named once in the log and listed on the status", async () => {
+    if (!app) throw new Error("setup failed");
+    const cfg = await statusConfig(app);
+    expect(cfg.state).toBe("synced");
+    const warning = cfg.warnings.find((w) => w.resource_kind === "observability_exporters");
+    expect(warning?.count).toBe(1);
+    expect(JSON.stringify(cfg)).not.toContain("exporter-secret");
+    await waitConfigPropagation(async () => warnLines().length > 0);
+    expect(warnLines()[0]).not.toContain("exporter-secret");
+
+    // A reload publishes the same configuration again.
+    const reloads = () => app!.output().split("\n").filter((l) => l.includes("reloaded")).length;
+    const before = reloads();
+    app.signal("SIGHUP");
+    await waitConfigPropagation(async () => reloads() > before);
+    expect(warnLines()).toHaveLength(1);
+  });
+});
+

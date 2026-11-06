@@ -287,6 +287,30 @@ const fn default_true() -> bool {
     true
 }
 
+impl ObservabilityExporter {
+    /// The first configured header that carries a credential, when this
+    /// exporter sends its headers over cleartext `http://`: anyone on the
+    /// network path can read it. Only an OTLP exporter sends configured
+    /// headers; the other kinds keep their credentials in fields of their own.
+    pub fn cleartext_credential_header(&self) -> Option<&str> {
+        let ExporterKind::OtlpHttp(otlp) = &self.kind else {
+            return None;
+        };
+        let cleartext = otlp
+            .endpoint
+            .trim_start()
+            .get(..7)
+            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("http://"));
+        if !cleartext {
+            return None;
+        }
+        otlp.headers
+            .iter()
+            .find(|(name, value)| !value.is_empty() && crate::is_credential_header_name(name))
+            .map(|(name, _)| name.as_str())
+    }
+}
+
 impl Resource for ObservabilityExporter {
     fn id(&self) -> &str {
         &self.runtime_id
@@ -309,6 +333,56 @@ impl Resource for ObservabilityExporter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_credential_header_sent_over_cleartext_http_is_named() {
+        let exporter = |endpoint: &str, headers: &[(&str, &str)]| -> ObservabilityExporter {
+            serde_json::from_value(serde_json::json!({
+                "name": "otlp",
+                "kind": "otlp_http",
+                "endpoint": endpoint,
+                "headers": headers.iter().copied().collect::<BTreeMap<_, _>>(),
+            }))
+            .unwrap()
+        };
+        let named = |e: &ObservabilityExporter| e.cleartext_credential_header().map(str::to_owned);
+        assert_eq!(
+            named(&exporter(
+                "http://collector:4318/v1/traces",
+                &[("Authorization", "Bearer t")]
+            )),
+            Some("Authorization".to_string())
+        );
+        assert_eq!(
+            named(&exporter(
+                " HTTP://collector/v1/traces",
+                &[("x-honeycomb-team", "t")]
+            )),
+            None,
+            "a name that says nothing of a credential"
+        );
+        assert_eq!(
+            named(&exporter(
+                "HTTP://collector/v1/traces",
+                &[("x-api-key", "k")]
+            )),
+            Some("x-api-key".to_string())
+        );
+        assert_eq!(
+            named(&exporter(
+                "https://collector/v1/traces",
+                &[("authorization", "Bearer t")]
+            )),
+            None
+        );
+        assert_eq!(
+            named(&exporter(
+                "http://collector/v1/traces",
+                &[("x-tenant", "a")]
+            )),
+            None
+        );
+    }
 
     const VALID_OTLP: &str = r#"{
         "name": "honeycomb-prod",

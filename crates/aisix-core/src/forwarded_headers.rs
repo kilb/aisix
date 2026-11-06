@@ -187,6 +187,17 @@ pub const CREDENTIAL_SLOT_HEADERS: &[&str] = &[
     "x-goog-api-key",       // Gemini API key
 ];
 
+/// Whether a header carries a credential by its name: a credential slot, or a
+/// name that says it is one (an APIM `ocp-apim-subscription-key`, a vendor's
+/// `x-auth-token`). `name` is matched case-insensitively.
+pub fn is_credential_header_name(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    ["key", "token", "secret", "auth", "pass", "credential"]
+        .iter()
+        .any(|word| name.contains(word))
+        || CREDENTIAL_SLOT_HEADERS.contains(&name.as_str())
+}
+
 /// Trace-context headers, which a glob never sweeps in.
 ///
 /// The caller's `traceparent` names a span in the CALLER's trace. Relayed

@@ -1231,6 +1231,7 @@ async fn run(mut cfg: Config, hangup: Option<HangupSignal>) -> anyhow::Result<()
     {
         let status = config_status.clone();
         snapshot_handle.subscribe_after_publish(move |view| {
+            warn_cleartext_exporters(&view.snapshot);
             status.record_warnings(config_warnings(&view.snapshot));
         });
     }
@@ -3979,6 +3980,44 @@ const COOLDOWN_NOT_ENABLED: &str = "a cooldown block that does not set `enabled`
 const GUARDRAIL_UNATTACHED: &str = "an enabled guardrail with no attachment inspects no traffic. \
      Add a guardrail attachment to put it in force, or disable it";
 
+/// An OTLP exporter whose headers carry a credential, sent to an `http://` endpoint.
+const EXPORTER_CLEARTEXT_CREDENTIAL: &str = "an exporter sends a credential header over \
+     cleartext http; anyone on the network path can read it. Serve its endpoint over https";
+
+/// Warn, once per exporter, credential header and endpoint for the process,
+/// that an exporter sends a credential over cleartext http. A warning rather
+/// than a refusal, like the MCP and A2A ones: a collector on a private network
+/// over plain http is a lawful deployment. Logs the exporter's name and the
+/// endpoint's origin only, since the path and query can carry a credential too.
+fn warn_cleartext_exporters(snapshot: &AisixSnapshot) {
+    use std::sync::{Mutex, OnceLock};
+    static WARNED: OnceLock<Mutex<std::collections::HashSet<(String, String, String)>>> =
+        OnceLock::new();
+    for entry in snapshot.observability_exporters.entries() {
+        let exporter = &entry.value;
+        let (Some(header), aisix_core::ExporterKind::OtlpHttp(otlp)) =
+            (exporter.cleartext_credential_header(), &exporter.kind)
+        else {
+            continue;
+        };
+        let url = aisix_core::redact_url_for_log(&otlp.endpoint);
+        let first = WARNED
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert((entry.id.clone(), header.to_owned(), url.clone()));
+        if first {
+            tracing::warn!(
+                exporter = %exporter.name,
+                header = %header,
+                url = %url,
+                "an exporter's credential header is sent over cleartext http; anyone on the \
+                 network path can read it — serve this endpoint over https"
+            );
+        }
+    }
+}
+
 /// What `/status/config` warns about for this snapshot. Both shapes are
 /// deliberate meanings that a row written for an earlier one still loads under,
 /// so neither is a rejection, and without this a clean status reads as the rule
@@ -3999,6 +4038,12 @@ fn config_warnings(snapshot: &AisixSnapshot) -> Vec<aisix_core::ConfigWarning> {
         &snapshot.guardrails,
         &snapshot.guardrail_attachments,
     );
+    let cleartext: Vec<String> = snapshot
+        .observability_exporters
+        .matching_entries(|e| e.value.cleartext_credential_header().is_some())
+        .into_iter()
+        .map(|e| e.id.clone())
+        .collect();
     [
         aisix_core::ConfigWarning::new(
             "cooldown_not_enabled",
@@ -4011,6 +4056,12 @@ fn config_warnings(snapshot: &AisixSnapshot) -> Vec<aisix_core::ConfigWarning> {
             "guardrails",
             unattached,
             GUARDRAIL_UNATTACHED,
+        ),
+        aisix_core::ConfigWarning::new(
+            "exporter_cleartext_credential",
+            "observability_exporters",
+            cleartext,
+            EXPORTER_CLEARTEXT_CREDENTIAL,
         ),
     ]
     .into_iter()
@@ -4121,6 +4172,38 @@ mod tests {
             !warning.message.contains("loose"),
             "the status endpoint is unauthenticated: ids only"
         );
+    }
+
+    #[test]
+    fn an_exporter_sending_a_credential_over_cleartext_http_is_warned_about_by_id() {
+        let snapshot = aisix_core::AisixSnapshot::new();
+        let exporter = |endpoint: &str| -> aisix_core::ObservabilityExporter {
+            serde_json::from_value(serde_json::json!({
+                "name": "collector",
+                "kind": "otlp_http",
+                "endpoint": endpoint,
+                "headers": { "authorization": "Bearer t" },
+            }))
+            .unwrap()
+        };
+        snapshot
+            .observability_exporters
+            .insert(aisix_core::ResourceEntry::new(
+                "e-plain",
+                exporter("http://collector:4318/v1/traces"),
+                1,
+            ));
+        snapshot
+            .observability_exporters
+            .insert(aisix_core::ResourceEntry::new(
+                "e-tls",
+                exporter("https://collector/v1/traces"),
+                1,
+            ));
+        let warnings = super::config_warnings(&snapshot);
+        let warning = warning_of(&warnings, "exporter_cleartext_credential").expect("warned");
+        assert_eq!(warning.resource_ids, ["e-plain"]);
+        assert!(!warning.message.contains("collector"), "ids only");
     }
 
     #[test]
