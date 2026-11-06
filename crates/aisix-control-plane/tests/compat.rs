@@ -566,3 +566,47 @@ async fn a_key_that_gains_a_route_is_judged_again() {
         .await
         .expect("a route withdrawn is not refused");
 }
+
+#[tokio::test]
+async fn an_api_key_with_endpoint_families_waits_for_the_gateways_that_read_them() {
+    let Some((cp, _admin, gw)) = setup().await else {
+        return;
+    };
+    gw.beat("gw-upgraded-7ce", OLD).await;
+    let key = |hash: &str, families: Value| json!({"key_hash": hash, "allowed_model_ids": [], "allowed_endpoints": families});
+    let id = Uuid::new_v4();
+    // An older gateway ignores the families and lets the key call every
+    // endpoint.
+    let err = write_key(&cp, id, key("hash-7ce", json!(["chat_completions"])), false)
+        .await
+        .expect_err("refused while an older gateway is registered");
+    assert_eq!((err.status.as_u16(), err.code), (422, "gateway_too_old"));
+    assert_eq!(err.details[0].path, "/allowed_endpoints");
+    let stored: i64 = sqlx::query_scalar("SELECT count(*) FROM gw_resources WHERE id = $1")
+        .bind(id)
+        .fetch_one(cp.db().pool())
+        .await
+        .expect("count the key");
+    assert_eq!(stored, 0, "nothing is stored");
+    gw.beat("gw-upgraded-7ce", CURRENT).await;
+    write_key(&cp, id, key("hash-7ce", json!(["chat_completions"])), false)
+        .await
+        .expect("accepted once every gateway reads the field");
+
+    // An older gateway registers after the key was saved: a family added
+    // is judged again, one withdrawn is not.
+    gw.beat("gw-old-7ce", OLD).await;
+    let err = write_key(
+        &cp,
+        id,
+        key("hash-7ce", json!(["chat_completions", "embeddings"])),
+        true,
+    )
+    .await
+    .expect_err("a family added is judged again");
+    assert_eq!(err.code, "gateway_too_old");
+    assert_eq!(err.details[0].path, "/allowed_endpoints");
+    write_key(&cp, id, key("hash-7ce", json!([])), true)
+        .await
+        .expect("a family withdrawn is not refused");
+}

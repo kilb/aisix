@@ -219,17 +219,36 @@ fn never(_stored: &Value, _doc: &Value) -> bool {
 
 /// Whether an api key reaches more after a replace of `stored` by `doc`,
 /// by the key's own semantics (`crates/aisix-core/src/models/apikey.rs`):
-/// switched back on, living longer, granted a model it was not, or granted
-/// a passthrough route it was not (`allowed_provider_groups` also binds the
-/// provider key a route injects, which an older gateway ignores). A
-/// narrowing edit (a model or route withdrawn, the key switched off, an
-/// earlier expiry) is not growth.
+/// switched back on, living longer, granted a model it was not, granted a
+/// passthrough route it was not (`allowed_provider_groups` also binds the
+/// provider key a route injects, which an older gateway ignores), or let
+/// call an endpoint family it was not. A gateway that reads the families
+/// but not the provider groups serves a new family through any provider
+/// key; on the families' own row, where an older gateway ignores the whole
+/// list, judging a new family again only refuses more. A narrowing edit (a
+/// model, route or family withdrawn, the key switched off, an earlier
+/// expiry) is not growth.
 fn key_widens(stored: &Value, doc: &Value) -> bool {
     let disabled = |d: &Value| d.get("disabled").and_then(Value::as_bool) == Some(true);
     (disabled(stored) && !disabled(doc))
         || lives_longer(stored, doc)
         || grants_more(&ModelGrant::of(stored), &ModelGrant::of(doc))
         || adds(routes(stored), routes(doc))
+        || calls_more_families(stored, doc)
+}
+
+/// Whether `doc` lets the key call an endpoint family `stored` did not.
+/// Without `allowed_endpoints` (or with `null`) a key calls every family.
+fn calls_more_families(stored: &Value, doc: &Value) -> bool {
+    fn families(d: &Value) -> Option<&[Value]> {
+        let listed = d.get("allowed_endpoints").filter(|v| !v.is_null())?;
+        Some(listed.as_array().map_or(&[][..], Vec::as_slice))
+    }
+    match (families(stored), families(doc)) {
+        (None, _) => false,
+        (Some(_), None) => true,
+        (Some(before), Some(after)) => after.iter().any(|family| !before.contains(family)),
+    }
 }
 
 /// A key's passthrough routes; absent or `null` grants none, as `[]` does.
@@ -801,6 +820,29 @@ mod tests {
             "routes within `*`",
         );
         narrows(&routes(Value::Null), &none, "null routes are none");
+        // Endpoint families: absent calls every family, a list exactly those.
+        let families = |list: Value| key(json!({ "allowed_endpoints": list }));
+        let chat = families(json!(["chat_completions"]));
+        let chat_and_embeddings = families(json!(["chat_completions", "embeddings"]));
+        assert!(key_widens(&chat, &chat_and_embeddings), "a family added");
+        assert!(
+            !key_widens(&chat_and_embeddings, &chat),
+            "a family withdrawn"
+        );
+        assert!(key_widens(&chat, &none), "families go away: every family");
+        assert!(!key_widens(&none, &chat), "families appear");
+        assert!(!key_widens(&chat, &families(json!([]))), "down to none");
+        assert!(!key_widens(&none, &families(Value::Null)), "null is absent");
+        // Keeping the groups and adding a family is judged again on both rows.
+        let kept = |list: Value| key(json!({ "allowed_endpoints": list }));
+        assert_eq!(
+            again(
+                &kept(json!(["chat_completions", "embeddings"])),
+                &kept(json!(["chat_completions"]))
+            ),
+            2
+        );
+        widens(&none, &chat, "families dropped: every family, groups kept");
         // Living longer, or for ever.
         let until = |at: &str| key(json!({ "expires_at": at }));
         widens(
