@@ -10798,6 +10798,34 @@ data: [DONE]\n\n";
             assert!(!body.to_string().contains(id), "{body}");
         }
 
+        // A decoy beside the reference that does open, the caller's own call
+        // seal, is no warrant for the reference's own id.
+        let own_call = crate::opaque_id::seal_call(&item_key, TENANT_A, "call_up_1");
+        for decoy in [
+            serde_json::json!({"type": "item_reference", "id": "msg_up_1", "call_id": own_call}),
+            serde_json::json!({"id": "msg_up_1", "caller": {"type": "program", "caller_id": own_call}}),
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(request_as(
+                    "sk-caller",
+                    serde_json::json!({"model": "gpt-4o-resp", "input": [
+                        {"role": "user", "content": "go on"},
+                        decoy,
+                    ]}),
+                ))
+                .await
+                .unwrap();
+            let (status, body) = status_and_body(resp).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["error"]["param"], "input[1].id", "{body}");
+        }
+        assert!(
+            upstream.received_requests().await.unwrap().is_empty(),
+            "no refused request reaches the upstream"
+        );
+
         let resp = app
             .oneshot(request_as("sk-caller", referencing(&sealed)))
             .await

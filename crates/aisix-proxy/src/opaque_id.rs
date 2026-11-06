@@ -77,8 +77,15 @@ pub(crate) fn map_tool_call_id(key: &hmac::Key, surface: Surface, upstream_id: &
     mapped_id(key, surface, surface.tool_call_id_prefix(), upstream_id)
 }
 
-/// [`map_tool_call_id`]'s HMAC behind `prefix`.
+/// [`map_tool_call_id`]'s HMAC behind `prefix`. An id already in that form,
+/// `prefix` and 32 lowercase hex digits, is left as it is: only the caller's
+/// own history carries one, and an upstream that echoes it back (a Messages
+/// `pause_turn` continuation, a code-execution `caller.tool_id`) must still
+/// pair with it.
 fn mapped_id(key: &hmac::Key, surface: Surface, prefix: &str, upstream_id: &str) -> String {
+    if is_mapped_form(prefix, upstream_id) {
+        return upstream_id.to_string();
+    }
     let mut ctx = hmac::Context::with_key(key);
     for part in [surface.label(), &[0], upstream_id.as_bytes()] {
         ctx.update(part);
@@ -114,18 +121,23 @@ pub(crate) fn map_messages_tool_id(key: &hmac::Key, upstream_id: &str) -> String
     mapped_id(key, Surface::Messages, prefix, upstream_id)
 }
 
-/// Whether `id` has the shape of an id this module mints or maps on `surface`.
-#[cfg(test)]
-pub(crate) fn is_platform_id(surface: Surface, id: &str) -> bool {
-    let hex32 = |rest: &str| {
+/// Whether `id` is `prefix` followed by exactly 32 lowercase hex digits: the
+/// form [`mapped_id`] writes, and [`mint_response_id`] too.
+fn is_mapped_form(prefix: &str, id: &str) -> bool {
+    id.strip_prefix(prefix).is_some_and(|rest| {
         rest.len() == 32
             && rest
                 .bytes()
                 .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-    };
+    })
+}
+
+/// Whether `id` has the shape of an id this module mints or maps on `surface`.
+#[cfg(test)]
+pub(crate) fn is_platform_id(surface: Surface, id: &str) -> bool {
     [surface.response_id_prefix(), surface.tool_call_id_prefix()]
         .iter()
-        .any(|prefix| id.strip_prefix(prefix).is_some_and(hex32))
+        .any(|prefix| is_mapped_form(prefix, id))
 }
 
 /// Map the `id` of every call in an OpenAI-shape `tool_calls` list. A
@@ -618,8 +630,9 @@ pub(crate) fn unseal_responses_input(
     let mut sealer: Option<Sealer> = None;
     let mut unopened_reference = None;
     for (index, item) in items.iter_mut().enumerate() {
-        let reference = is_item_reference(item);
-        let mut opened = false;
+        // A reference opens by its own `id` only: another id field beside it
+        // that opens (a `call_id`, a `caller`) is no warrant for it.
+        let reference_id = is_item_reference(item).then(|| item.get("id").cloned());
         for_each_item_id(item, |kind, slot| {
             if slot.len() < MIN_SEALED_LEN {
                 return;
@@ -627,11 +640,16 @@ pub(crate) fn unseal_responses_input(
             let sealer = sealer.get_or_insert_with(|| Sealer::of(platform, owner));
             if let Some(original) = sealer.unseal(kind, slot) {
                 *slot = original;
-                opened = true;
             }
         });
-        if reference && !opened && unopened_reference.is_none() {
-            unopened_reference = Some(index);
+        if let Some(before) = reference_id {
+            let opened = matches!(
+                (before, item.get("id")),
+                (Some(Value::String(sent)), Some(Value::String(now))) if sent != *now
+            );
+            if !opened && unopened_reference.is_none() {
+                unopened_reference = Some(index);
+            }
         }
     }
     unopened_reference
@@ -1470,6 +1488,22 @@ pub(crate) mod tests {
                 json!([{"type": "item_reference", "id": own}, {"id": "x"}, {"id": "y"}]),
                 1,
             ),
+            // Another id field beside the reference that opens is no warrant
+            // for its own id.
+            (
+                json!([{"type": "item_reference", "id": "msg_bdrk_1",
+                        "call_id": seal_call(&k, T, "call_bdrk_1")}]),
+                0,
+            ),
+            (
+                json!([{"id": "msg_bdrk_1", "caller": {"caller_id": seal_call(&k, T, "call_bdrk_1")}}]),
+                0,
+            ),
+            (
+                json!([{"type": "item_reference", "id": seal_id(&k, "team-b", "msg_bdrk_1"),
+                        "approval_request_id": seal_id(&k, T, "mcpr_1")}]),
+                0,
+            ),
         ] {
             assert_eq!(run(input.clone()).0, Some(at), "{input}");
         }
@@ -1583,6 +1617,65 @@ pub(crate) mod tests {
         );
         let delta = br#"{"type":"content_block_delta","index":0,"delta":{"text":"hi"}}"#;
         assert_eq!(ids.rewrite_event_json(delta, "alias"), None);
+    }
+
+    /// An id already in mapped form came from the caller's own history, so
+    /// an upstream that echoes it back keeps it, and it still pairs; a raw
+    /// id is still mapped, on both protocols.
+    #[test]
+    fn an_id_in_mapped_form_is_left_as_it_is() {
+        let key = mac(&K);
+        for upstream in [
+            "toolu_vrtx_01",
+            "srvtoolu_vrtx_01S",
+            "mcptoolu_vrtx_04",
+            "call_up_1",
+        ] {
+            let mapped = map_messages_tool_id(&key, upstream);
+            assert_ne!(mapped, upstream);
+            assert_eq!(map_messages_tool_id(&key, &mapped), mapped, "{upstream}");
+        }
+        let chat = map_tool_call_id(&key, Surface::Chat, "call_bdrk_1");
+        assert_ne!(chat, "call_bdrk_1");
+        assert_eq!(map_tool_call_id(&key, Surface::Chat, &chat), chat);
+        // Only the exact form: 32 lowercase hex digits behind the prefix.
+        for raw in [
+            format!("toolu_{}", "A".repeat(32)),
+            format!("toolu_{}", "a".repeat(31)),
+            format!("toolu_{}", "a".repeat(33)),
+            format!("srvtoolu_{}", "g".repeat(32)),
+        ] {
+            assert_ne!(map_messages_tool_id(&key, &raw), raw, "{raw}");
+        }
+        // In an answer: a paused turn's server tool use, its result and a
+        // caller that name the caller's own mapped id keep it.
+        let server = map_messages_tool_id(&key, "srvtoolu_vrtx_01S");
+        let ids = MessagesIds::new(&key);
+        let mut body = json!({"id": "msg_vrtx_2", "content": [
+            {"type": "server_tool_use", "id": server, "name": "code_execution", "input": {}},
+            {"type": "tool_use", "id": "toolu_vrtx_9", "name": "f", "input": {},
+             "caller": {"type": "code_execution_20250825", "tool_id": server}},
+            {"type": "code_execution_tool_result", "tool_use_id": server, "content": {}},
+        ]});
+        ids.apply_to_body(&mut body);
+        assert_eq!(body["content"][0]["id"], server.as_str());
+        assert_eq!(body["content"][1]["caller"]["tool_id"], server.as_str());
+        assert_eq!(body["content"][2]["tool_use_id"], server.as_str());
+        assert_eq!(
+            body["content"][1]["id"],
+            map_messages_tool_id(&key, "toolu_vrtx_9")
+        );
+        // The stream splice keeps it too.
+        let frame = format!(
+            r#"{{"type":"content_block_start","index":0,"content_block":{{"type":"server_tool_use","id":"{server}","name":"code_execution","input":{{}}}}}}"#
+        );
+        let out = ids
+            .rewrite_event_json(frame.as_bytes(), "alias")
+            .map(String::from_utf8)
+            .transpose()
+            .unwrap()
+            .unwrap_or_else(|| frame.clone());
+        assert_eq!(out, frame);
     }
 
     /// A client tool's id maps exactly as it did before server and MCP tool
