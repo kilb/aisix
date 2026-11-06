@@ -2621,15 +2621,8 @@ mod tests {
         assert!(text.contains("400"), "{text}");
         assert!(!text.contains("hunter2"), "{text}");
 
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let unanswered = test_config(
-            format!(
-                "http://user:hunter2@{}/dp/telemetry",
-                listener.local_addr().unwrap()
-            ),
-            &dir,
-        );
-        drop(listener);
+        let (_refusing, addr) = crate::dp_store::test_logs::refusing_addr();
+        let unanswered = test_config(format!("http://user:hunter2@{addr}/dp/telemetry"), &dir);
         let attempt = send(&plain_client(), &unanswered, Uuid::new_v4(), &events).await;
         let Attempt::Failed(failure @ SendFailure::NoResponse { .. }) = attempt else {
             panic!("expected no response: {attempt:?}");

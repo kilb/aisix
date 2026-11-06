@@ -1239,18 +1239,13 @@ managed:
     #[tokio::test]
     async fn a_failed_heartbeat_logs_its_cause() {
         let dir = tempfile::tempdir().unwrap();
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let url = format!("http://{}/dp/heartbeat", listener.local_addr().unwrap());
-        drop(listener);
+        let (_refusing, addr) = crate::dp_store::test_logs::refusing_addr();
+        let url = format!("http://{addr}/dp/heartbeat");
         let cfg = cfg_with_bundle(url, write_test_bundle(dir.path()));
         let (_keep, mut cancel) = watch::channel(false);
         // The first tick fires at once; `run` never returns on its own.
-        let (_, logged) = crate::dp_store::test_logs::capture_logs(tokio::time::timeout(
-            Duration::from_secs(3),
-            run(cfg, &mut cancel),
-        ))
-        .await;
-        assert!(logged.contains("heartbeat failed"), "{logged}");
+        let logged =
+            crate::dp_store::test_logs::logs_until(run(cfg, &mut cancel), "heartbeat failed").await;
         assert!(logged.to_lowercase().contains("refused"), "{logged}");
     }
 
@@ -1260,23 +1255,15 @@ managed:
     #[tokio::test]
     async fn a_password_in_the_url_reaches_no_log_line_and_no_debug_output() {
         let dir = tempfile::tempdir().unwrap();
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let url = format!(
-            "http://user:hunter2@{}/dp/heartbeat",
-            listener.local_addr().unwrap()
-        );
-        drop(listener);
+        let (_refusing, addr) = crate::dp_store::test_logs::refusing_addr();
+        let url = format!("http://user:hunter2@{addr}/dp/heartbeat");
         let cfg = cfg_with_bundle(url, write_test_bundle(dir.path()));
         let debug = format!("{cfg:?}");
         assert!(!debug.contains("hunter2"), "{debug}");
         let (_keep, mut cancel) = watch::channel(false);
-        let (_, logged) = crate::dp_store::test_logs::capture_logs(tokio::time::timeout(
-            Duration::from_secs(3),
-            run(cfg, &mut cancel),
-        ))
-        .await;
+        let logged =
+            crate::dp_store::test_logs::logs_until(run(cfg, &mut cancel), "heartbeat failed").await;
         assert!(logged.contains("heartbeat started"), "{logged}");
-        assert!(logged.contains("heartbeat failed"), "{logged}");
         assert!(!logged.contains("hunter2"), "{logged}");
     }
 

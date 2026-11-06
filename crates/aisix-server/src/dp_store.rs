@@ -175,31 +175,93 @@ impl SharedStore for DpManagerStore {
 
 #[cfg(test)]
 pub(crate) mod test_logs {
-    /// Run `f` under a capturing subscriber; returns its result and what it logged.
-    pub(crate) async fn capture_logs<T>(f: impl std::future::Future<Output = T>) -> (T, String) {
-        #[derive(Clone, Default)]
-        struct Buf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-        impl std::io::Write for Buf {
-            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(b);
-                Ok(b.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
+    #[derive(Clone, Default)]
+    struct Buf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Buf {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
         }
-        let buf = Buf::default();
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl Buf {
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    fn capture(buf: &Buf) -> tracing::subscriber::DefaultGuard {
+        // While a single dispatcher is registered, tracing computes a
+        // callsite's interest from whichever thread reaches it first, so a
+        // test on another thread with no subscriber marks the callsite
+        // disabled for everyone, and a line logged here once, such as a
+        // worker's startup line, is lost. A second dispatcher held for the
+        // process keeps interest computed over every registered one.
+        static SHARED_INTEREST: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+        SHARED_INTEREST
+            .get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
         let writer = buf.clone();
         let subscriber = tracing_subscriber::fmt()
             .with_ansi(false)
             .with_writer(move || writer.clone())
             .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let guard = tracing::subscriber::set_default(subscriber);
         // A callsite first hit where no subscriber was set has cached "disabled".
         tracing::callsite::rebuild_interest_cache();
+        guard
+    }
+
+    /// Run `f` under a capturing subscriber; returns its result and what it logged.
+    pub(crate) async fn capture_logs<T>(f: impl std::future::Future<Output = T>) -> (T, String) {
+        let buf = Buf::default();
+        let _guard = capture(&buf);
         let out = f.await;
-        let logged = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
-        (out, logged)
+        (out, buf.text())
+    }
+
+    /// [`capture_logs`] for a worker that never returns on its own: runs it
+    /// until what it logged contains `line`, and returns that.
+    ///
+    /// Ending on the line rather than after a fixed time keeps this
+    /// independent of how busy the machine is. A minute without the line is a
+    /// hang rather than a slow machine, and fails.
+    pub(crate) async fn logs_until(f: impl std::future::Future<Output = ()>, line: &str) -> String {
+        let buf = Buf::default();
+        let _guard = capture(&buf);
+        let mut f = std::pin::pin!(f);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while !buf.text().contains(line) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{line:?} never logged:\n{}",
+                buf.text()
+            );
+            tokio::select! {
+                () = &mut f => panic!("returned before logging {line:?}:\n{}", buf.text()),
+                () = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
+            }
+        }
+        buf.text()
+    }
+
+    /// A loopback address that refuses every connection while the returned
+    /// socket lives.
+    ///
+    /// Taking a free port and closing it does not give that: the next test to
+    /// bind port 0 can be handed the same one, and a request meant to be
+    /// refused then reaches that test's mock server, failing both. A socket
+    /// that is bound and never listens keeps the port, and a connection to it
+    /// is refused.
+    pub(crate) fn refusing_addr() -> (socket2::Socket, std::net::SocketAddr) {
+        let socket =
+            socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+        socket
+            .bind(&std::net::SocketAddr::from(([127, 0, 0, 1], 0)).into())
+            .unwrap();
+        let addr = socket.local_addr().unwrap().as_socket().unwrap();
+        (socket, addr)
     }
 }
 
@@ -360,14 +422,28 @@ mod tests {
     }
 
     /// A loopback address nothing listens on, so a connect is refused at once.
-    fn refused_url(path: &str) -> String {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        format!("http://{}{path}", listener.local_addr().unwrap())
+    /// A line reached first on a thread with no subscriber is still captured
+    /// on the thread that captures logs. The capture-based tests run beside
+    /// tests that log with no subscriber at all, and a worker's startup line
+    /// is logged once.
+    #[tokio::test]
+    async fn a_line_another_thread_reached_first_is_still_captured() {
+        fn mark() {
+            tracing::info!("capture-interest-marker");
+        }
+        let ((), logged) = test_logs::capture_logs(async {
+            std::thread::spawn(mark).join().unwrap();
+            mark();
+        })
+        .await;
+        assert!(logged.contains("capture-interest-marker"), "{logged}");
     }
 
     #[tokio::test]
     async fn a_failed_request_logs_its_cause_without_the_url() {
-        let store = DpManagerStore::with_client(&refused_url(""), Some(reqwest::Client::new()));
+        let (_refusing, addr) = test_logs::refusing_addr();
+        let store =
+            DpManagerStore::with_client(&format!("http://{addr}"), Some(reqwest::Client::new()));
         let (result, logged) = capture_logs(store.get("mcp_oauth_token", "abc")).await;
         assert!(matches!(result, Err(StoreError::Unavailable)));
         assert!(logged.to_lowercase().contains("refused"), "{logged}");
