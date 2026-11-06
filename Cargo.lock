@@ -141,6 +141,7 @@ dependencies = [
  "chrono",
  "etcd-client",
  "futures",
+ "h2",
  "hex",
  "http-body-util",
  "hyper",

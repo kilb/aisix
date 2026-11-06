@@ -139,6 +139,17 @@ mod tests {
             .collect()
     }
 
+    /// The first statement of a handler's `source` (its name, signature and
+    /// body), with every whitespace removed, so formatting cannot change it.
+    fn first_statement(source: &str) -> String {
+        let body = source
+            .split_once("{\n")
+            .unwrap_or_else(|| panic!("no body in {source}"))
+            .1;
+        let statement = body.split_once(';').map_or(body, |(first, _)| first);
+        format!("{};", statement.split_whitespace().collect::<String>())
+    }
+
     /// Every RPC of every service the front serves has exactly one row in
     /// [`RPCS`], every row names such an RPC, and each handler does what
     /// its row says: an allowed one admits the gateway first and refuses
@@ -200,9 +211,13 @@ mod tests {
                     .iter()
                     .find(|(n, _)| *n == snake(method))
                     .expect("a handler");
+                let first = first_statement(body);
                 assert!(
-                    body.contains("self.admit(request.extensions()).await?"),
-                    "{service}.{method} must admit the gateway before anything else"
+                    ["", "letcaller="].iter().any(|binding| {
+                        first == format!("{binding}self.admit(request.extensions()).await?;")
+                    }),
+                    "{service}.{method} must admit the gateway before anything else; its first \
+                     statement is `{first}`"
                 );
                 match decision {
                     Rpc::Allowed => assert!(
@@ -224,6 +239,18 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn the_first_statement_is_read_up_to_its_semicolon() {
+        let handler = "range(\n        &self,\n        request: Request<RangeRequest>,\n    ) \
+                       -> Result<Response<RangeResponse>, Status> {\n        let caller = \
+                       self\n            .admit(request.extensions())\n            .await?;\n        \
+                       other();\n";
+        assert_eq!(
+            first_statement(handler),
+            "letcaller=self.admit(request.extensions()).await?;"
+        );
     }
 
     #[test]

@@ -27,6 +27,13 @@ impl AllowedPrefixes {
             global: env.global_prefix().into_bytes(),
         }
     }
+
+    /// Whether `key` lies in one of the two key spaces, byte for byte:
+    /// what every key kine answers with is held to, whatever range kine
+    /// was asked for, since kine compares keys in its table's collation.
+    pub fn contains(&self, key: &[u8]) -> bool {
+        key.starts_with(&self.env) || key.starts_with(&self.global)
+    }
 }
 
 /// Why the front refused a request.
@@ -235,6 +242,23 @@ mod tests {
             check_range(&all_ff, b"\xff", b"\0"),
             Err(Denial::OutsidePrefix)
         );
+    }
+
+    #[test]
+    fn only_keys_that_start_with_a_prefix_byte_for_byte_are_contained() {
+        assert!(allowed().contains(b"/aisix/e1/models/a"));
+        assert!(allowed().contains(b"/aisix/e1/"));
+        assert!(allowed().contains(b"/aisix/global/pricing/p1"));
+        for key in [
+            &b"/aisix/E1/models/a"[..],
+            b"/aisix/e1",
+            b"/aisix/e10/models/a",
+            b"/aisix/e2/models/a",
+            b"/aisix/global",
+            b"",
+        ] {
+            assert!(!allowed().contains(key), "{key:?}");
+        }
     }
 
     #[test]

@@ -89,3 +89,6 @@ bytes = "1"
 # the feature the gateway builds it with).
 etcd-client = { version = "0.14", features = ["tls"] }
 aisix-etcd = { path = "../aisix-etcd" }
+# A raw HTTP/2 client, to see the GOAWAY a refused gateway's connection gets
+# (0.4.20 in Cargo.lock).
+h2 = "0.4"

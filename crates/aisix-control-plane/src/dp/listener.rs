@@ -26,7 +26,8 @@
 //!   refused per request.
 //!
 //! A connection over either cap is closed at once, unread. The process needs
-//! a file descriptor limit above `MAX_CONNECTIONS` plus what the browser
+//! a file descriptor limit above `MAX_CONNECTIONS`, plus the etcd front's
+//! connections to kine (at most `MAX_WATCHES`), plus what the browser
 //! listener and the database pools use (`ulimit -n` of 8192 or more).
 //!
 //! These caps are per process and say nothing of who is connecting: one
@@ -56,6 +57,7 @@ use tower::util::Oneshot;
 use tower::ServiceExt;
 
 use super::{closing, ConnClose, ConnIdentity};
+use crate::etcd_front::service::MAX_WATCHES;
 use crate::pki::{self, Pki, PkiError};
 use crate::stopped;
 
@@ -112,9 +114,10 @@ pub struct ConnLimits {
 
 impl ConnLimits {
     /// The open-file limit these caps need: every connection, handshakes
-    /// included, and the rest of the process.
+    /// included, the etcd front's connections to kine (one per watch), and
+    /// the rest of the process.
     pub fn fds_needed(&self) -> u64 {
-        self.connections as u64 + FD_HEADROOM
+        self.connections as u64 + MAX_WATCHES as u64 + FD_HEADROOM
     }
 }
 
