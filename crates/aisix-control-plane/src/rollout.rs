@@ -46,6 +46,18 @@ use crate::AppState;
 /// (`crates/aisix-guardrails/src/build.rs`, `record_build_rejections`).
 const RUNTIME_GUARDRAILS: &str = "/aisix/runtime/guardrails/";
 
+/// The most rejections read from one heartbeat: what a gateway keeps of its
+/// rejections and of its unknown kinds, each budget in full.
+const MAX_REJECTIONS_READ: usize = 512;
+
+/// The most characters of a gateway's rejection text shown, as the gateway
+/// itself bounds it.
+const MAX_REJECTION_CHARS: usize = 256;
+
+/// The rejection kind a gateway reports a key of a kind it does not know
+/// as, from its own budget (`aisix_core::config_status`).
+const UNKNOWN_KIND: &str = "unknown_kind";
+
 /// A document's rollout state, as the API names it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -185,6 +197,10 @@ pub struct Fleet {
     /// new instance away (`dp_credentials.instance_cap_hit_at`); `instances`
     /// may then miss live ones.
     pub cap_hit_at: Option<DateTime<Utc>>,
+    /// The online instances that report as many rejections as a gateway
+    /// keeps: more may have been dropped, so a document they do not name as
+    /// rejected may be rejected all the same.
+    pub rejections_truncated: Vec<String>,
 }
 
 impl Fleet {
@@ -209,6 +225,11 @@ impl Fleet {
         ))
         .fetch_one(&mut *conn)
         .await?;
+        let rejections_truncated = rows
+            .iter()
+            .filter(|(_, _, online, _, rejected)| *online && reports_a_full_list(rejected))
+            .map(|(instance_id, ..)| instance_id.clone())
+            .collect();
         let instances = rows
             .into_iter()
             .map(
@@ -224,6 +245,7 @@ impl Fleet {
         Ok(Fleet {
             instances,
             cap_hit_at,
+            rejections_truncated,
         })
     }
 
@@ -243,18 +265,44 @@ impl Fleet {
 }
 
 /// The documents of this environment that a heartbeat's
-/// `rejected_resources` names, with the gateway's error text.
+/// `rejected_resources` names, among its first [`MAX_REJECTIONS_READ`]
+/// entries, with the gateway's error text cut to [`MAX_REJECTION_CHARS`].
 fn rejections_of(env: &EnvSettings, reported: &Value) -> Vec<(Kind, String, String)> {
     reported
         .as_array()
         .into_iter()
         .flatten()
+        .take(MAX_REJECTIONS_READ)
         .filter_map(|r| {
             let (kind, id) = resource_of_rejected_key(env, r["key"].as_str()?)?;
-            let error = r["error"].as_str().unwrap_or_default().to_string();
+            let error = bounded(r["error"].as_str().unwrap_or_default());
             Some((kind, id, error))
         })
         .collect()
+}
+
+/// `text`, or its first characters and an ellipsis, in at most
+/// [`MAX_REJECTION_CHARS`] characters.
+fn bounded(text: &str) -> String {
+    if text.chars().count() <= MAX_REJECTION_CHARS {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(MAX_REJECTION_CHARS - 1).collect();
+    out.push('…');
+    out
+}
+
+/// Whether a heartbeat's `rejected_resources` holds as many rejections, not
+/// counting unknown kinds, as a gateway keeps
+/// (`aisix_core::config_status::MAX_CONFIG_REJECTIONS`).
+fn reports_a_full_list(reported: &Value) -> bool {
+    let rejections = reported
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|r| r["kind"].as_str() != Some(UNKNOWN_KIND))
+        .count();
+    rejections >= aisix_core::config_status::MAX_CONFIG_REJECTIONS
 }
 
 /// The document a rejected key names: `<env_prefix><segment>/<id>` for a
@@ -319,7 +367,9 @@ pub fn worst(states: &[ResourceRollout]) -> ResourceRollout {
 /// ones among those fields that a gateway-version floor guards
 /// ([`FIELD_FLOORS`]): such a gateway serves the document without
 /// enforcing the field. `instance_cap_hit_at` is set while the instances
-/// seen may not be the whole fleet.
+/// seen may not be the whole fleet, and `rejections_truncated` names the
+/// online instances whose rejection list is full, whose `applied` may
+/// count a document they rejected.
 pub async fn summary(
     auth: OperatorAuth,
     State(state): State<AppState>,
@@ -382,7 +432,7 @@ pub async fn summary(
             }));
             let floored = FIELD_FLOORS
                 .iter()
-                .any(|f| f.kind.segment() == kind && f.pointer.strip_prefix('/') == Some(field));
+                .any(|f| f.kind.segment() == kind && f.gateway_field() == field);
             if floored {
                 ignoring_floored.push(json!({
                     "instance_id": instance_id,
@@ -414,6 +464,7 @@ pub async fn summary(
         "projection_stalled": stalled,
         "projection_blocked": blocked,
         "instance_cap_hit_at": fleet.cap_hit_at,
+        "rejections_truncated": fleet.rejections_truncated,
     })))
 }
 
@@ -665,6 +716,7 @@ mod tests {
         let fleet = |incomplete: bool, instances: Vec<InstanceView>| Fleet {
             instances,
             cap_hit_at: incomplete.then(chrono::Utc::now),
+            rejections_truncated: Vec::new(),
         };
         let complete = fleet(false, vec![instance("a", true, 9)]);
         assert_eq!(complete.rollout(&r).state, RolloutState::Applied);
@@ -684,6 +736,37 @@ mod tests {
             ..written(9)
         };
         assert_eq!(capped.rollout(&unprojected).state, RolloutState::Pending);
+    }
+
+    #[test]
+    fn a_reported_rejection_list_is_read_bounded_and_a_full_one_is_named() {
+        let env = EnvSettings {
+            env_id: Uuid::from_u128(0xe9),
+            etcd_prefix: "/aisix".to_string(),
+        };
+        let entry = |i: usize, kind: &str, error: &str| {
+            json!({
+                "key": format!("{}models/{}", env.env_prefix(), Uuid::from_u128(i as u128)),
+                "kind": kind,
+                "error": error,
+            })
+        };
+        let list = |n: usize, kind: &str, error: &str| {
+            Value::Array((0..n).map(|i| entry(i, kind, error)).collect())
+        };
+        let read = rejections_of(&env, &list(600, "schema_failed", &"x".repeat(300)));
+        assert_eq!(read.len(), 512);
+        for (_, _, error) in &read {
+            assert_eq!(error.chars().count(), 256, "{error}");
+            assert!(error.ends_with('…'), "{error}");
+        }
+        let short = rejections_of(&env, &list(1, "schema_failed", "bad-7e3"));
+        assert_eq!(short[0].2, "bad-7e3");
+        // The gateway keeps at most 256 rejections; unknown kinds have a
+        // budget of their own and are not rejections.
+        assert!(reports_a_full_list(&list(256, "schema_failed", "e")));
+        assert!(!reports_a_full_list(&list(255, "schema_failed", "e")));
+        assert!(!reports_a_full_list(&list(300, "unknown_kind", "e")));
     }
 
     #[test]

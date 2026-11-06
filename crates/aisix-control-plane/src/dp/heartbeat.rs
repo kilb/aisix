@@ -27,7 +27,11 @@
 //!   every row is online is a new instance refused, `429 instance_limit`,
 //!   storing nothing; the time is recorded as the credential's
 //!   `instance_cap_hit_at`, since the instances shown are then not the whole
-//!   fleet.
+//!   fleet. An evicted instance the gateway-version gate still judges (heard
+//!   from within `compat::FLEET_WINDOW`) whose version fails a floor
+//!   (`compat::meets_every_floor`) is recorded there too, as of when it was
+//!   last heard from: the gate no longer sees it, and keeps judging the fleet
+//!   incomplete for as long as it would have judged that instance.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -35,6 +39,7 @@ use std::time::Instant;
 
 use axum::extract::State;
 use axum::Json;
+use chrono::{DateTime, Utc};
 use futures::FutureExt;
 use serde::{Deserialize, Deserializer};
 use serde_json::{json, Value};
@@ -42,6 +47,7 @@ use sqlx::PgConnection;
 use uuid::Uuid;
 
 use super::DpIdentity;
+use crate::compat::{self, FLEET_WINDOW};
 use crate::db::DbError;
 use crate::error::{ApiError, Detail};
 use crate::gateways::stale_window_secs;
@@ -156,12 +162,15 @@ pub async fn heartbeat(
     }
     let dp_id = dp.dp_id;
     let stale_secs = stale_window_secs(&state.cfg);
+    let cp_version = state.cfg.cp_version.clone();
     let recorded = state
         .db
         .tx(move |conn| {
             async move {
                 let known = is_known(conn, dp_id, &body.instance_id).await?;
-                if !known && !make_room(conn, dp_id, &body.instance_id, stale_secs).await? {
+                if !known
+                    && !make_room(conn, dp_id, &body.instance_id, stale_secs, &cp_version).await?
+                {
                     // Committed with the refusal: what the fleet view is
                     // missing is known.
                     sqlx::query(
@@ -211,7 +220,9 @@ async fn is_known(
 /// Whether `dp_id` has room for its new instance `instance_id`. At
 /// [`MAX_INSTANCES`] rows it makes room by deleting its least recently seen
 /// instance that is offline (silent for longer than `stale_secs`), and has
-/// none when every one is online.
+/// none when every one is online. An evicted instance the version gate
+/// still judged, whose version fails a floor by `cp_version`'s judgement,
+/// is recorded in `instance_cap_hit_at` (see the module docs).
 ///
 /// The credential's row is locked first, so new instances arriving together
 /// take the places there are one at a time; and a first beat of
@@ -222,6 +233,7 @@ async fn make_room(
     dp_id: Uuid,
     instance_id: &str,
     stale_secs: f64,
+    cp_version: &str,
 ) -> Result<bool, DbError> {
     sqlx::query("SELECT 1 FROM dp_credentials WHERE dp_id = $1 FOR UPDATE")
         .bind(dp_id)
@@ -237,21 +249,32 @@ async fn make_room(
     if rows < MAX_INSTANCES {
         return Ok(true);
     }
-    let evicted = sqlx::query(
+    let evicted: Option<(String, DateTime<Utc>, bool)> = sqlx::query_as(&format!(
         "DELETE FROM dp_instances WHERE (dp_id, instance_id) IN ( \
            SELECT dp_id, instance_id FROM dp_instances \
            WHERE dp_id = $1 AND last_seen_at < now() - make_interval(secs => $2) \
-           ORDER BY last_seen_at LIMIT 1)",
-    )
+           ORDER BY last_seen_at LIMIT 1) \
+         RETURNING version, last_seen_at, last_seen_at > now() - {FLEET_WINDOW}"
+    ))
     .bind(dp_id)
     .bind(stale_secs)
-    .execute(&mut *conn)
-    .await?
-    .rows_affected();
-    if evicted > 0 {
-        tracing::debug!(%dp_id, "a new gateway instance took the place of the longest-silent offline one");
+    .fetch_optional(&mut *conn)
+    .await?;
+    let Some((version, last_seen_at, judged)) = evicted else {
+        return Ok(false);
+    };
+    tracing::debug!(%dp_id, "a new gateway instance took the place of the longest-silent offline one");
+    if judged && !compat::meets_every_floor(&version, cp_version) {
+        sqlx::query(
+            "UPDATE dp_credentials \
+             SET instance_cap_hit_at = GREATEST(instance_cap_hit_at, $2) WHERE dp_id = $1",
+        )
+        .bind(dp_id)
+        .bind(last_seen_at)
+        .execute(&mut *conn)
+        .await?;
     }
-    Ok(evicted > 0)
+    Ok(true)
 }
 
 /// Upserts the instance's row with everything `body` reports.

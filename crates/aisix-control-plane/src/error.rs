@@ -228,6 +228,14 @@ pub enum BootError {
     DpListen(std::io::Error),
     #[error("the gateway listener's TLS (CP_DP_HOSTS): {0}")]
     DpTls(#[from] crate::dp::listener::TlsSetupError),
+    /// The build's version stamp reads as neither a release nor an
+    /// unstamped build, so the gateway-version gate could judge nothing.
+    #[error(
+        "this build's version stamp {0:?} is neither a release (X.Y.Z, optionally with a \
+         pre-release) nor an unstamped build (dev): the gateway-version gate cannot judge \
+         gateways by it"
+    )]
+    UnreadableVersion(String),
 }
 
 #[cfg(test)]

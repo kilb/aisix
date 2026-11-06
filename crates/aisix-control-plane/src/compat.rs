@@ -5,26 +5,27 @@
 //! ignored, and a row whose value it does not know is skipped. For most
 //! fields that is harmless, but for some it opens what the field closes.
 //! [`FIELD_FLOORS`] lists those fields with the first gateway release that
-//! reads them, and [`gate`] refuses a document that sets one while any
-//! gateway that may load it is older, or while the control plane cannot
-//! tell which versions its gateways run. Uncertainty refuses, because the
-//! older gateway is what the gate protects:
+//! reads them, and [`gate`] refuses a document that sets one while a
+//! registered gateway is older, or while the control plane cannot tell
+//! which versions its registered gateways run (ruling P1-R22):
 //!
 //! - the gateways judged are every instance heard from within
-//!   [`FLEET_WINDOW`], online or not, since one offline for a while still
-//!   serves what it loaded and may come back;
+//!   [`FLEET_WINDOW`], online or not, each by the version it last reported:
+//!   one offline for a while still serves what it loaded and may come back;
 //! - a version that does not read as a release or an unstamped build
 //!   refuses ([`GatewayVersion::Unrecognized`]);
 //! - while any credential has had to turn a new instance away within the
-//!   same window (`dp_credentials.instance_cap_hit_at`), the instances seen
-//!   are not the whole fleet, and every gated write is refused;
-//! - with no instance online, nothing says which gateway loads the document
-//!   next, and every gated write is refused.
+//!   same window, or has evicted the row of an older gateway the window
+//!   still covered (`dp_credentials.instance_cap_hit_at`), the instances
+//!   seen are not the whole fleet, and every gated write is refused.
 //!
-//! The gate judges the gateways registered when the document is saved; one
-//! that registers later with an older version is not stopped by it. Versions
-//! compare by semver precedence (ruling P1-R7): `1.9.0-rc.1` is older than
-//! `1.9.0`, and build metadata never counts.
+//! The gate judges the gateways registered when the document is saved, so
+//! with none registered the write passes; one that registers later with an
+//! older version is not stopped by it, and shows in `GET /admin/rollout`
+//! (`unsafe`) when it reports ignoring a floored field. A control plane
+//! whose own stamp cannot be read does not boot, so the gate never turns
+//! itself off. Versions compare by semver precedence (ruling P1-R7):
+//! `1.9.0-rc.1` is older than `1.9.0`, and build metadata never counts.
 
 use semver::{BuildMetadata, Version};
 use serde_json::Value;
@@ -59,15 +60,33 @@ pub enum Since {
 
 /// A field older gateways would misread: a document of `kind` whose value
 /// at `pointer` (a JSON pointer) meets `trigger` needs gateways at `since`
-/// or later, for the reason `why`.
+/// or later, for the reason `why`. `regrown_by` names the lists (JSON
+/// pointers) whose growth widens what an older gateway serves through the
+/// field it ignores: a replace that keeps the field is judged again when
+/// one of them grows.
 #[derive(Debug, Clone, Copy)]
 pub struct FieldFloor {
     pub kind: Kind,
     pub pointer: &'static str,
     pub trigger: Trigger,
     pub since: Since,
+    pub regrown_by: &'static [&'static str],
     pub why: &'static str,
 }
+
+impl FieldFloor {
+    /// The field as a gateway names it in `partially_compatible_resources`:
+    /// the pointer's segments joined by dots (`/a/b` → `a.b`).
+    pub fn gateway_field(&self) -> String {
+        self.pointer
+            .strip_prefix('/')
+            .unwrap_or(self.pointer)
+            .replace('/', ".")
+    }
+}
+
+/// The model grants of an api key (`crates/aisix-core/src/models/apikey.rs`).
+const KEY_GRANTS: &[&str] = &["/allowed_model_ids", "/allowed_models"];
 
 /// Every field older gateways would misread in a way that opens what it
 /// closes, or that quietly withholds what it grants. A new field whose
@@ -75,12 +94,19 @@ pub struct FieldFloor {
 /// new value of a field older gateways know, keyed on that value: an
 /// endpoint family added to `allowed_endpoints`, say, which an older
 /// gateway reads as its unknown family and grants nothing for.
+///
+/// `provider_keys` `/groups` has no row: an older gateway ignoring it lets
+/// every key use the provider key, as it lets a key that names no groups
+/// use every provider key, and the groups restrict only a key that sets
+/// `allowed_provider_groups`, which its own row already refuses while such
+/// a gateway is registered.
 pub const FIELD_FLOORS: &[FieldFloor] = &[
     FieldFloor {
         kind: Kind::CachePolicies,
         pointer: "/scope",
         trigger: Trigger::Equals("team"),
         since: Since::ThisRelease,
+        regrown_by: &[],
         why: "an older gateway skips a team-scoped policy and keeps serving the env-scoped \
               one it replaced, or an overlapping env catch-all, which shares cache entries \
               across tenants",
@@ -90,6 +116,7 @@ pub const FIELD_FLOORS: &[FieldFloor] = &[
         pointer: "/allowed_endpoints",
         trigger: Trigger::Present,
         since: Since::ThisRelease,
+        regrown_by: KEY_GRANTS,
         why: "an older gateway ignores the field and lets the key call every endpoint",
     },
     FieldFloor {
@@ -97,6 +124,7 @@ pub const FIELD_FLOORS: &[FieldFloor] = &[
         pointer: "/allowed_provider_groups",
         trigger: Trigger::Present,
         since: Since::ThisRelease,
+        regrown_by: KEY_GRANTS,
         why: "an older gateway ignores the field and lets the key reach every provider key",
     },
 ];
@@ -187,11 +215,33 @@ fn triggered(floor: &FieldFloor, doc: &Value) -> bool {
     }
 }
 
+/// Whether the list at one of a floor's `regrown_by` pointers grants more
+/// after a replace than before (`null` reads as absent): an item added to a
+/// list, or the list appearing or going away. Neither absence is narrower
+/// than every list on an api key: without `allowed_model_ids` the key
+/// falls back to `allowed_models`, and without `allowed_models` it grants
+/// none, so a list that appears can grant more as well.
+fn grew(before: Option<&Value>, after: Option<&Value>) -> bool {
+    fn given(v: Option<&Value>) -> Option<&Value> {
+        v.filter(|v| !v.is_null())
+    }
+    match (given(before), given(after)) {
+        (None, None) => false,
+        (Some(before), Some(after)) => match (before.as_array(), after.as_array()) {
+            (Some(before), Some(after)) => after.iter().any(|item| !before.contains(item)),
+            _ => before != after,
+        },
+        _ => true,
+    }
+}
+
 /// The rows of `floors` for `kind` that `doc` sets and `stored` (the
-/// document it replaces, `null` for a create) does not. A field the stored
+/// document it replaces, `null` for a create) does not, or that both set
+/// while a list the row's `regrown_by` names grew. A field the stored
 /// document already sets is what every gateway already loads, so keeping it
-/// exposes nothing new; refusing would only stop an operator from changing,
-/// or switching off, a row the older gateway already serves.
+/// exposes nothing new, unless the grants it guards grow; refusing would
+/// otherwise stop an operator from changing, or switching off, a row the
+/// older gateway already serves.
 fn newly_triggered<'f>(
     floors: &'f [FieldFloor],
     kind: Kind,
@@ -200,7 +250,13 @@ fn newly_triggered<'f>(
 ) -> Vec<&'f FieldFloor> {
     floors
         .iter()
-        .filter(|f| f.kind == kind && triggered(f, doc) && !triggered(f, stored))
+        .filter(|f| f.kind == kind && triggered(f, doc))
+        .filter(|f| {
+            !triggered(f, stored)
+                || f.regrown_by
+                    .iter()
+                    .any(|p| grew(stored.pointer(p), doc.pointer(p)))
+        })
         .collect()
 }
 
@@ -242,6 +298,16 @@ pub fn check(
     check_against(FIELD_FLOORS, kind, doc, fleet, cp_version)
 }
 
+/// Whether a gateway reporting `version` meets every row of
+/// [`FIELD_FLOORS`], judged by a control plane reporting `cp_version`; a row
+/// whose minimum it cannot judge is met.
+pub fn meets_every_floor(version: &str, cp_version: &str) -> bool {
+    let fleet = [GatewayVersion::parse(version)];
+    FIELD_FLOORS.iter().all(|floor| {
+        minimum(&floor.since, cp_version).is_none_or(|m| judge(floor, &m, &fleet).is_ok())
+    })
+}
+
 /// [`check`] by the rows of `floors` instead of [`FIELD_FLOORS`].
 pub fn check_against(
     floors: &[FieldFloor],
@@ -274,10 +340,10 @@ fn too_old(pointer: &str, message: String) -> ApiError {
 /// `kind`, replacing `stored`, `null` for a create): `422 gateway_too_old`
 /// at the first floored field `doc` newly sets, while a gateway heard from
 /// within [`FLEET_WINDOW`] is older than its minimum or reports a version
-/// that cannot be read, while some credential has turned an instance away
-/// within that window, or while no gateway is online. A write that sets no
-/// floored field, or only fields whose minimum this control plane cannot
-/// judge, reads nothing.
+/// that cannot be read, or while some credential's view of its instances
+/// has been incomplete within that window. With no gateway registered the
+/// write passes. A write that sets no floored field, or only fields whose
+/// minimum this control plane cannot judge, reads nothing.
 pub async fn gate(
     conn: &mut PgConnection,
     ctx: &WriteCtx,
@@ -292,17 +358,15 @@ pub async fn gate(
     let Some((first, first_minimum)) = floors.first() else {
         return Ok(());
     };
-    let instances: Vec<(String, bool)> = sqlx::query_as(&format!(
-        "SELECT version, last_seen_at > now() - make_interval(secs => $1) \
-         FROM dp_instances WHERE last_seen_at > now() - {FLEET_WINDOW}"
+    let versions: Vec<String> = sqlx::query_scalar(&format!(
+        "SELECT version FROM dp_instances WHERE last_seen_at > now() - {FLEET_WINDOW}"
     ))
-    .bind(ctx.stale_secs)
     .fetch_all(&mut *conn)
     .await
     .map_err(DbError::from)?;
-    let fleet: Vec<GatewayVersion> = instances
+    let fleet: Vec<GatewayVersion> = versions
         .iter()
-        .map(|(version, _)| GatewayVersion::parse(version))
+        .map(|version| GatewayVersion::parse(version))
         .collect();
     for (floor, minimum) in &floors {
         judge(floor, minimum, &fleet).map_err(|v| too_old(v.pointer, v.message()))?;
@@ -319,14 +383,8 @@ pub async fn gate(
             first.pointer,
             format!(
                 "需要网关版本 ≥ {first_minimum}；24 小时内有网关凭据达到实例上限，\
-                 无法确认全部网关实例的版本"
+                 部分网关实例未被记录，无法确认全部网关实例的版本"
             ),
-        ));
-    }
-    if !instances.iter().any(|(_, online)| *online) {
-        return Err(too_old(
-            first.pointer,
-            format!("需要网关版本 ≥ {first_minimum}；当前没有在线的网关实例，无法确认网关版本"),
         ));
     }
     Ok(())
@@ -503,6 +561,7 @@ mod tests {
             pointer: "/allowed_endpoints",
             trigger: Trigger::Contains("videos_7f1"),
             since: Since::Version("1.10.0"),
+            regrown_by: &[],
             why: "test row",
         }];
         let with = json!({"key_hash": "h", "allowed_endpoints": ["chat", "videos_7f1"]});
@@ -544,21 +603,123 @@ mod tests {
     }
 
     #[test]
+    fn a_kept_field_is_judged_again_when_the_grants_it_guards_grow() {
+        fn again(doc: &Value, stored: &Value) -> usize {
+            newly_triggered(FIELD_FLOORS, Kind::ApiKeys, doc, stored).len()
+        }
+        // A key that kept its provider groups, granted models by `grants`.
+        let key = |grants: Value| {
+            let mut doc = json!({"key_hash": "h", "allowed_provider_groups": ["shared"]});
+            if let (Some(doc), Some(grants)) = (doc.as_object_mut(), grants.as_object()) {
+                doc.extend(grants.clone());
+            }
+            doc
+        };
+        let ids = |list: Value| key(json!({ "allowed_model_ids": list }));
+        let names = |list: Value| key(json!({ "allowed_models": list }));
+        assert_eq!(
+            again(&ids(json!(["m1", "m2"])), &ids(json!(["m1"]))),
+            1,
+            "a model added"
+        );
+        assert_eq!(
+            again(&ids(json!(["m1"])), &ids(json!(["m1", "m2"]))),
+            0,
+            "a model withdrawn"
+        );
+        assert_eq!(
+            again(&ids(json!([])), &ids(json!(["m1"]))),
+            0,
+            "the last one withdrawn"
+        );
+        assert_eq!(again(&names(json!(["a", "b"])), &names(json!(["a"]))), 1);
+        assert_eq!(again(&names(json!(["a"])), &names(json!(["a", "b"]))), 0);
+        // Dropping the id list falls back to the names, which may grant more.
+        assert_eq!(
+            again(&key(json!({})), &ids(json!(["m1"]))),
+            1,
+            "present to absent"
+        );
+        // Without an id list the names decide, so a new id list can grant
+        // models they did not; without names the key granted none.
+        assert_eq!(
+            again(&ids(json!(["m1"])), &key(json!({}))),
+            1,
+            "absent to present"
+        );
+        assert_eq!(
+            again(&ids(Value::Null), &key(json!({}))),
+            0,
+            "null is absent"
+        );
+        // Switching the key off keeps every grant as it was.
+        let mut disabled = ids(json!(["m1"]));
+        disabled["disabled"] = json!(true);
+        assert_eq!(again(&disabled, &ids(json!(["m1"]))), 0);
+        // A cache policy has no grants to grow.
+        let team = json!({"name": "c", "scope": "team", "allowed_model_ids": ["m2"]});
+        let kept = json!({"name": "c", "scope": "team"});
+        assert_eq!(
+            newly_triggered(FIELD_FLOORS, Kind::CachePolicies, &team, &kept).len(),
+            0
+        );
+    }
+
+    #[test]
+    fn a_gateway_meets_every_floor_only_at_or_past_every_minimum() {
+        assert!(!meets_every_floor("1.8.2+sha-a", "1.9.0+sha-c"));
+        assert!(!meets_every_floor("1.9.0-rc.1+sha-a", "1.9.0+sha-c"));
+        assert!(
+            !meets_every_floor("", "1.9.0+sha-c"),
+            "an unreadable version"
+        );
+        assert!(meets_every_floor("1.9.0+sha-a", "1.9.0+sha-c"));
+        assert!(meets_every_floor("dev+sha-a", "1.9.0+sha-c"));
+        assert!(
+            meets_every_floor("1.0.0", "dev"),
+            "a dev control plane judges nothing"
+        );
+    }
+
+    #[test]
+    fn a_floored_pointer_names_the_field_as_the_gateway_reports_it() {
+        let floor = |pointer| FieldFloor {
+            kind: Kind::Models,
+            pointer,
+            trigger: Trigger::Present,
+            since: Since::ThisRelease,
+            regrown_by: &[],
+            why: "test row",
+        };
+        assert_eq!(
+            floor("/allowed_endpoints").gateway_field(),
+            "allowed_endpoints"
+        );
+        assert_eq!(floor("/semantic/match").gateway_field(), "semantic.match");
+    }
+
+    #[test]
     fn every_literal_minimum_is_a_version() {
+        // Asserts nothing until a row names a literal version: every row is
+        // `ThisRelease` until the release that ships it is tagged.
         for floor in FIELD_FLOORS {
             if let Since::Version(v) = floor.since {
                 assert!(semver::Version::parse(v).is_ok(), "{}: {v}", floor.pointer);
             }
             assert!(floor.pointer.starts_with('/'), "{}", floor.pointer);
         }
-        // The rows ruling 26 sets.
-        let rows: Vec<(Kind, &str)> = FIELD_FLOORS.iter().map(|f| (f.kind, f.pointer)).collect();
+        // The rows ruling 26 sets, and the grants each one guards.
+        let rows: Vec<(Kind, &str, &[&str])> = FIELD_FLOORS
+            .iter()
+            .map(|f| (f.kind, f.pointer, f.regrown_by))
+            .collect();
+        let grants: &[&str] = &["/allowed_model_ids", "/allowed_models"];
         assert_eq!(
             rows,
             [
-                (Kind::CachePolicies, "/scope"),
-                (Kind::ApiKeys, "/allowed_endpoints"),
-                (Kind::ApiKeys, "/allowed_provider_groups"),
+                (Kind::CachePolicies, "/scope", &[][..]),
+                (Kind::ApiKeys, "/allowed_endpoints", grants),
+                (Kind::ApiKeys, "/allowed_provider_groups", grants),
             ]
         );
     }

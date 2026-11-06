@@ -450,3 +450,44 @@ async fn the_rollout_summary_names_a_stopped_projection_by_ids_only() {
     );
     assert_eq!(s["reconcile_blocked"], true, "{s}");
 }
+
+#[tokio::test]
+async fn an_instance_reporting_a_full_rejection_list_is_named_as_truncated() {
+    let Some(cp) = TestCp::start_with_kine().await else {
+        return;
+    };
+    let admin = cp.admin_login_seeded(OperatorRole::Admin).await;
+    let id = create_policy(&cp, &admin, "long-error-7d6").await;
+    let revision = projected(&cp, &admin, &id).await["kine_revision"]
+        .as_i64()
+        .expect("a kine revision");
+    let gw = Gateway::issue(&cp, &admin).await;
+    // As many rejections as a gateway keeps: more may have been dropped.
+    let prefix = cp.env().env_prefix();
+    let mut full: Vec<Value> = (0..255)
+        .map(|_| rejection(&format!("{prefix}models/{}", Uuid::new_v4()), "bad-7d6"))
+        .collect();
+    full.push(rejection(
+        &format!("{prefix}cache_policies/{id}"),
+        &"long-7d6 ".repeat(40),
+    ));
+    gw.beat("gw-full-7d6", revision, Value::Array(full)).await;
+    gw.beat(
+        "gw-some-7d6",
+        revision,
+        json!([rejection(
+            &format!("{prefix}models/{}", Uuid::new_v4()),
+            "bad"
+        )]),
+    )
+    .await;
+    let s = summary(&cp, &admin).await;
+    assert_eq!(s["rejections_truncated"], json!(["gw-full-7d6"]), "{s}");
+    // A gateway's error text is shown bounded.
+    let rollout = rollout_of(&cp, &admin, &id).await;
+    let error = rollout["rejections"][0]["error"]
+        .as_str()
+        .expect("an error");
+    assert_eq!(error.chars().count(), 256, "{error}");
+    assert!(error.starts_with("long-7d6 "), "{error}");
+}

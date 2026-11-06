@@ -235,22 +235,21 @@ async fn a_gateway_ignoring_a_floored_field_is_listed_as_unsafe() {
 }
 
 #[tokio::test]
-async fn a_gated_write_is_refused_while_no_gateway_is_online() {
+async fn a_gated_write_before_any_gateway_reports_is_written_unchecked() {
     let Some((cp, admin, gw)) = setup().await else {
         return;
     };
-    // No gateway has reported at all: which version will load it is unknown.
-    let r = create(&cp, &admin, "cache_policies", team_policy("team-7c5")).await;
-    let message = refused_at(&r, "/scope");
-    assert!(message.contains("没有在线的网关实例"), "{message}");
-    // One reported recently enough to count, but is not online now.
+    // No gateway has registered: there is none to judge.
+    let r = create(&cp, &admin, "cache_policies", team_policy("team-7c5a")).await;
+    assert_eq!(r.status, 201, "{r:?}");
+    // One that registered and went quiet is judged by the version it reported.
+    gw.beat("gw-quiet-7c5", OLD).await;
+    age_instance(&cp, "gw-quiet-7c5", "10 minutes").await;
+    let r = create(&cp, &admin, "cache_policies", team_policy("team-7c5b")).await;
+    refused_at(&r, "/scope");
     gw.beat("gw-quiet-7c5", CURRENT).await;
     age_instance(&cp, "gw-quiet-7c5", "10 minutes").await;
-    let r = create(&cp, &admin, "cache_policies", team_policy("team-7c5")).await;
-    refused_at(&r, "/scope");
-    assert_eq!(cache_policy_rows(&cp).await, 0, "nothing is stored");
-    gw.beat("gw-quiet-7c5", CURRENT).await;
-    let r = create(&cp, &admin, "cache_policies", team_policy("team-7c5")).await;
+    let r = create(&cp, &admin, "cache_policies", team_policy("team-7c5b")).await;
     assert_eq!(r.status, 201, "{r:?}");
 }
 
@@ -360,4 +359,97 @@ async fn a_replace_that_keeps_a_floored_field_is_not_refused_but_one_that_adds_i
         .await
         .expect("read the env policy");
     assert_eq!(stored["scope"], "env", "the refused replace stored nothing");
+}
+
+/// Fills `gw`'s credential to its instance cap: `online` rows heard from
+/// just now at [`CURRENT`], and one more heard from `ago`, at `version`, which
+/// a new instance then takes the place of.
+async fn at_the_cap_with_a_quiet_instance(cp: &TestCp, gw: &Gateway, version: &str, ago: &str) {
+    let online = aisix_control_plane::dp::heartbeat::MAX_INSTANCES - 1;
+    sqlx::query(
+        "INSERT INTO dp_instances (dp_id, instance_id, version) \
+         SELECT $1::uuid, 'online-7ca-' || g, $2 FROM generate_series(1, $3) g",
+    )
+    .bind(&gw.dp_id)
+    .bind(CURRENT)
+    .bind(online)
+    .execute(cp.db().pool())
+    .await
+    .expect("seed the online instances");
+    sqlx::query(&format!(
+        "INSERT INTO dp_instances (dp_id, instance_id, version, last_seen_at) \
+         VALUES ($1::uuid, 'quiet-7ca', $2, now() - interval '{ago}')"
+    ))
+    .bind(&gw.dp_id)
+    .bind(version)
+    .execute(cp.db().pool())
+    .await
+    .expect("seed the quiet instance");
+}
+
+async fn cap_hit_at(cp: &TestCp, gw: &Gateway) -> Option<chrono::DateTime<chrono::Utc>> {
+    sqlx::query_scalar("SELECT instance_cap_hit_at FROM dp_credentials WHERE dp_id = $1::uuid")
+        .bind(&gw.dp_id)
+        .fetch_one(cp.db().pool())
+        .await
+        .expect("read the credential")
+}
+
+async fn instance_exists(cp: &TestCp, instance: &str) -> bool {
+    sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM dp_instances WHERE instance_id = $1)")
+        .bind(instance)
+        .fetch_one(cp.db().pool())
+        .await
+        .expect("look the instance up")
+}
+
+#[tokio::test]
+async fn evicting_an_older_gateway_seen_within_a_day_hides_it_and_counts_as_a_cap_hit() {
+    let Some((cp, admin, gw)) = setup().await else {
+        return;
+    };
+    at_the_cap_with_a_quiet_instance(&cp, &gw, OLD, "10 minutes").await;
+    gw.beat("gw-new-7ca", CURRENT).await;
+    assert!(
+        !instance_exists(&cp, "quiet-7ca").await,
+        "the quiet one was evicted"
+    );
+    assert!(cap_hit_at(&cp, &gw).await.is_some());
+    // The older gateway is no longer in the list, and is still judged.
+    let r = create(&cp, &admin, "cache_policies", team_policy("team-7ca")).await;
+    let message = refused_at(&r, "/scope");
+    assert!(message.contains("实例上限"), "{message}");
+}
+
+#[tokio::test]
+async fn evicting_a_current_gateway_or_one_gone_a_day_is_no_cap_hit() {
+    let Some((cp, admin, gw)) = setup().await else {
+        return;
+    };
+    // A crash-looping current gateway leaves rows like this one behind.
+    at_the_cap_with_a_quiet_instance(&cp, &gw, CURRENT, "10 minutes").await;
+    gw.beat("gw-new-7cb", CURRENT).await;
+    assert!(
+        !instance_exists(&cp, "quiet-7ca").await,
+        "the quiet one was evicted"
+    );
+    assert_eq!(cap_hit_at(&cp, &gw).await, None);
+    // An older one the gate no longer judges anyway.
+    sqlx::query(
+        "INSERT INTO dp_instances (dp_id, instance_id, version, last_seen_at) \
+         VALUES ($1::uuid, 'gone-7cb', $2, now() - interval '25 hours')",
+    )
+    .bind(&gw.dp_id)
+    .bind(OLD)
+    .execute(cp.db().pool())
+    .await
+    .expect("seed an instance gone a day");
+    gw.beat("gw-newer-7cb", CURRENT).await;
+    assert!(
+        !instance_exists(&cp, "gone-7cb").await,
+        "the day-old one was evicted"
+    );
+    assert_eq!(cap_hit_at(&cp, &gw).await, None);
+    let r = create(&cp, &admin, "cache_policies", team_policy("team-7cb")).await;
+    assert_eq!(r.status, 201, "{r:?}");
 }
