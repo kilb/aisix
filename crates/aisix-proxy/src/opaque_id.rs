@@ -168,12 +168,37 @@ fn b64() -> base64::engine::GeneralPurpose {
     base64::engine::general_purpose::URL_SAFE_NO_PAD
 }
 
+/// The size a sealed plaintext is padded to: 64 bytes, or the next multiple
+/// of 64 for a longer id. Every id up to 63 bytes — every upstream id seen in
+/// practice — therefore seals to one length, so a sealed id's length cannot
+/// tell one upstream's id format from another's.
+const SEAL_BUCKET: usize = 64;
+
+/// `id`, a `0x80` marker, then zeros up to the bucket (ISO/IEC 7816-4
+/// padding): unambiguous for any id, of any length, at one byte's cost.
+fn pad(id: &str) -> Vec<u8> {
+    let padded_len = (id.len() + 1).div_ceil(SEAL_BUCKET) * SEAL_BUCKET;
+    let mut out = Vec::with_capacity(padded_len + aead::MAX_TAG_LEN);
+    out.extend_from_slice(id.as_bytes());
+    out.push(0x80);
+    out.resize(padded_len, 0);
+    out
+}
+
+/// The id [`pad`] padded; `None` when the bytes do not end in the marker and
+/// zeros.
+fn unpad(padded: &[u8]) -> Option<&[u8]> {
+    let marker = padded.iter().rposition(|&b| b != 0)?;
+    (padded[marker] == 0x80).then(|| &padded[..marker])
+}
+
 /// Deterministic authenticated encryption of ids under one seal key: the
 /// nonce is synthetic, `HMAC-SHA256(key, "seal" || 0x00 || id)[..12]`, so the
 /// same id always seals to the same value — a stream's `item_id` on every
 /// delta matches the item it belongs to, and a replayed answer matches the
 /// first. The AES-256-GCM key is derived from the seal key under its own
-/// label, so the nonce function and the cipher never share key material.
+/// label, so the nonce function and the cipher never share key material. The
+/// plaintext is padded to [`SEAL_BUCKET`] first.
 struct Sealer {
     nonce_key: hmac::Key,
     cipher: aead::LessSafeKey,
@@ -199,14 +224,15 @@ impl Sealer {
         nonce
     }
 
-    /// `<kept prefix>` + base64url(nonce || ciphertext || tag), with the kept
-    /// prefix as associated data so it cannot be swapped for another.
+    /// `<kept prefix>` + base64url(nonce || ciphertext || tag), the ciphertext
+    /// of the padded id, with the kept prefix as associated data so it cannot
+    /// be swapped for another.
     fn seal(&self, id: &str) -> String {
         let prefix = kept_prefix(id);
         let nonce = self.nonce(id);
-        let mut payload = Vec::with_capacity(aead::NONCE_LEN + id.len() + aead::MAX_TAG_LEN);
+        let mut sealed = pad(id);
+        let mut payload = Vec::with_capacity(aead::NONCE_LEN + sealed.len() + aead::MAX_TAG_LEN);
         payload.extend_from_slice(&nonce);
-        let mut sealed = id.as_bytes().to_vec();
         self.cipher
             .seal_in_place_append_tag(
                 aead::Nonce::assume_unique_for_key(nonce),
@@ -228,7 +254,7 @@ impl Sealer {
 
     fn open(&self, prefix: &str, payload: &str) -> Option<String> {
         let raw = b64().decode(payload).ok()?;
-        if raw.len() <= aead::NONCE_LEN + aead::MAX_TAG_LEN {
+        if raw.len() < aead::NONCE_LEN + SEAL_BUCKET + aead::MAX_TAG_LEN {
             return None;
         }
         let (nonce, sealed) = raw.split_at(aead::NONCE_LEN);
@@ -241,14 +267,14 @@ impl Sealer {
                 &mut buf,
             )
             .ok()?;
-        let plain = String::from_utf8(plain.to_vec()).ok()?;
+        let plain = String::from_utf8(unpad(plain)?.to_vec()).ok()?;
         (kept_prefix(&plain) == prefix && self.nonce(&plain) == nonce).then_some(plain)
     }
 }
 
 /// Seal an upstream id reversibly. The id's leading `<prefix>_` stays in the
 /// clear (see [`kept_prefix`]) so the sealed id still passes an upstream's
-/// prefix check; the rest names nothing.
+/// prefix check; the rest names nothing, not even the id's length.
 pub(crate) fn seal_id(key: &[u8; 32], upstream_id: &str) -> String {
     Sealer::new(key).seal(upstream_id)
 }
@@ -635,6 +661,84 @@ mod tests {
         assert_eq!(seal_id(&K, "fc_bdrk_1"), seal_id(&K, "fc_bdrk_1"));
         assert_ne!(seal_id(&K, "fc_bdrk_1"), seal_id(&K, "fc_bdrk_2"));
         assert_ne!(seal_id(&K, "fc_bdrk_1"), seal_id(&[8u8; 32], "fc_bdrk_1"));
+    }
+
+    /// The length of a sealed id says nothing about the id it was made
+    /// from: one upstream's short ids and another's long ones look alike.
+    #[test]
+    fn sealed_ids_are_one_length_whatever_the_upstream_id_was() {
+        let short = "call_1";
+        let long = format!("call_{}", "b".repeat(57));
+        assert_eq!(long.len(), 62);
+        assert_eq!(seal_id(&K, short).len(), seal_id(&K, &long).len());
+        // The payload behind any kept prefix is one length too.
+        let payload = |upstream: &str| {
+            let sealed = seal_id(&K, upstream);
+            sealed.len() - kept_prefix(upstream).len()
+        };
+        for upstream in [
+            "",
+            "x",
+            "toolu_bdrk_01Y",
+            "fc_68af0c1e2b5f8190b2c1d3e4f5a6b7c8d9e0f1a2b3c4d5e6f",
+        ] {
+            assert_eq!(payload(upstream), payload("call_1"), "{upstream}");
+        }
+        // Past the first bucket the next one is shared the same way.
+        assert_eq!(
+            seal_id(&K, &"a".repeat(64)).len(),
+            seal_id(&K, &"a".repeat(127)).len()
+        );
+        assert!(seal_id(&K, &"a".repeat(64)).len() > seal_id(&K, &"a".repeat(63)).len());
+    }
+
+    #[test]
+    fn every_length_round_trips_exactly() {
+        for len in [0usize, 1, 63, 64, 65, 200] {
+            for upstream in [
+                "a".repeat(len),
+                format!("fc_{}", "é".repeat(len.saturating_sub(3) / 2)),
+                // Trailing zeros and a trailing marker byte value belong to the id.
+                format!("{}\u{0}", "z".repeat(len.saturating_sub(1))),
+            ] {
+                assert_eq!(
+                    unseal_id(&K, &seal_id(&K, &upstream)).as_deref(),
+                    Some(upstream.as_str()),
+                    "length {}",
+                    upstream.len()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_truncated_or_tampered_seal_opens_to_nothing() {
+        let sealed = seal_id(&K, "fc_bdrk_01Z");
+        let payload = &sealed["fc_".len()..];
+        let mut tampered = payload.as_bytes().to_vec();
+        let middle = tampered.len() / 2;
+        tampered[middle] = if tampered[middle] == b'A' { b'B' } else { b'A' };
+        for broken in [
+            sealed[..sealed.len() - 1].to_string(),
+            sealed[..sealed.len() - 4].to_string(),
+            sealed[..sealed.len() / 2].to_string(),
+            format!("fc_{}", String::from_utf8(tampered).unwrap()),
+            format!("{sealed}A"),
+        ] {
+            assert_eq!(unseal_id(&K, &broken), None, "{broken}");
+        }
+    }
+
+    #[test]
+    fn padding_is_read_back_only_as_it_was_written() {
+        assert_eq!(unpad(&pad("ab")), Some(&b"ab"[..]));
+        assert_eq!(pad("").len(), SEAL_BUCKET);
+        assert_eq!(pad(&"a".repeat(63)).len(), SEAL_BUCKET);
+        assert_eq!(pad(&"a".repeat(64)).len(), 2 * SEAL_BUCKET);
+        // No marker, or something after it, is not padding.
+        assert_eq!(unpad(&[b'a', 0, 0]), None);
+        assert_eq!(unpad(&[b'a', 0x80, 1, 0]), None);
+        assert_eq!(unpad(&[0, 0]), None);
     }
 
     /// An id with no plain `<letters>_` head keeps no prefix at all, so
