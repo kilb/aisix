@@ -20,6 +20,13 @@
 //! reconcile repairs what such a write leaves, and is not redundant with the
 //! one a tenure starts with.
 //!
+//! The same holds across databases. A control plane whose environment has
+//! just been taken over learns it from the claim, which it reads at the
+//! start of every pass, before each batch of rows it writes and before it
+//! deletes strays: what it already sent before the next read can still
+//! land, at most one batch of rows, and the new owner's periodic reconcile
+//! repairs it.
+//!
 //! **One owner per environment.** A database mints its own id
 //! (`cp_settings.database_id`) at first boot, and the projector of only one
 //! database writes an environment's prefix: the one named by the claim
@@ -294,7 +301,7 @@ pub async fn project_once(
 ) -> Result<usize, ProjectError> {
     let mut conn = locked_session(db).await?;
     let projected = match check_claim(&mut conn, kine, ctx).await {
-        Ok(()) => project_pending(&mut conn, kine, ctx).await,
+        Ok(mine) => project_pending(&mut conn, kine, ctx, mine).await,
         Err(e) => Err(e),
     };
     let _ = conn.close().await;
@@ -328,7 +335,7 @@ pub async fn reconcile(
 ) -> Result<ReconcileReport, ProjectError> {
     let mut conn = locked_session(db).await?;
     let report = match check_claim(&mut conn, kine, ctx).await {
-        Ok(()) => reconcile_on(&mut conn, kine, ctx, allow_deletes, None).await,
+        Ok(mine) => reconcile_on(&mut conn, kine, ctx, mine, allow_deletes, None).await,
         Err(e) => Err(e),
     };
     let _ = conn.close().await;
@@ -436,10 +443,14 @@ async fn fence(conn: &mut PgConnection) -> Result<(), ProjectError> {
 
 type RawDirtyRow = (String, Uuid, i64, i64, bool, Value, Option<i64>);
 
+/// Projects the rows due, in batches of [`BATCH`]; before writing each
+/// batch, checks that the claim still names `mine`, so a pass that started
+/// as the owner stops within a batch of losing the environment.
 async fn project_pending(
     conn: &mut PgConnection,
     kine: &dyn KineWriter,
     ctx: &WriteCtx,
+    mine: Uuid,
 ) -> Result<usize, ProjectError> {
     let mut projected = 0;
     loop {
@@ -450,6 +461,9 @@ async fn project_pending(
         .bind(BATCH)
         .fetch_all(&mut *conn)
         .await?;
+        if !rows.is_empty() {
+            still_owner(kine, ctx, mine).await?;
+        }
         let full = rows.len() as i64 == BATCH;
         for row in rows {
             project_row(conn, kine, ctx, row).await?;
@@ -628,6 +642,7 @@ async fn reconcile_on(
     conn: &mut PgConnection,
     kine: &dyn KineWriter,
     ctx: &WriteCtx,
+    mine: Uuid,
     allow_deletes: bool,
     by: Option<&OperatorAuth>,
 ) -> Result<ReconcileReport, ProjectError> {
@@ -686,6 +701,9 @@ async fn reconcile_on(
     }
     let mut deleted_strays = 0;
     if delete_now {
+        // The list may predate a takeover: deleting by it would delete the
+        // new owner's documents.
+        still_owner(kine, ctx, mine).await?;
         let keys: Vec<&str> = strays.iter().map(|(key, _)| key.as_str()).collect();
         let plan = json!({"allow_deletes": allow_deletes, "keys": keys});
         audit_environment(conn, ctx, by, "rollout.reconcile.planned", plan).await?;
@@ -782,33 +800,50 @@ fn not_mine(kv: &KeyValue, mine: Uuid) -> Result<(), ProjectError> {
     }
 }
 
-/// Refuses while the claim names another database. Reads only: a one-off
-/// pass does not claim an environment.
-async fn check_claim(
-    conn: &mut PgConnection,
+/// Refuses while the claim names another database. Reads only, and an
+/// absent claim does not refuse: a one-off pass does not claim an
+/// environment.
+async fn still_owner(
     kine: &dyn KineWriter,
     ctx: &WriteCtx,
+    mine: Uuid,
 ) -> Result<(), ProjectError> {
-    let mine = database_id(conn).await?;
     match kine.get(&claim_key(&ctx.env)).await? {
         Some(kv) => not_mine(&kv, mine),
         None => Ok(()),
     }
 }
 
-/// Makes sure the claim names `mine`: reads it, and claims the environment
-/// when the claim is absent. [`ProjectError::OwnedElsewhere`] when it names
-/// another database.
+/// [`still_owner`] for a one-off pass; this database's id.
+async fn check_claim(
+    conn: &mut PgConnection,
+    kine: &dyn KineWriter,
+    ctx: &WriteCtx,
+) -> Result<Uuid, ProjectError> {
+    let mine = database_id(conn).await?;
+    still_owner(kine, ctx, mine).await?;
+    Ok(mine)
+}
+
+/// Makes sure the claim names `mine`: reads it, and, when it is absent and
+/// `may_create`, claims the environment. [`ProjectError::OwnedElsewhere`]
+/// when it names another database, or is absent and may not be created: a
+/// database told that another owns the environment takes it only by an
+/// audited takeover, never because the claim went missing.
 async fn ensure_claim(
     conn: &mut PgConnection,
     kine: &dyn KineWriter,
     ctx: &WriteCtx,
     mine: Uuid,
+    may_create: bool,
 ) -> Result<(), ProjectError> {
     let key = claim_key(&ctx.env);
     for _ in 0..ATTEMPTS {
         if let Some(kv) = kine.get(&key).await? {
             return not_mine(&kv, mine);
+        }
+        if !may_create {
+            return Err(ProjectError::OwnedElsewhere { owner: None, mine });
         }
         fence(conn).await?;
         match kine.create(&key, &claim_value(mine)).await? {
@@ -1036,27 +1071,39 @@ async fn lead_once(
         None => *tenure.database_id.insert(database_id(conn).await?),
     };
     // On every pass: an owner may change while this tenure runs, and two
-    // owners would each reconcile the other's documents away.
-    ensure_claim(conn, kine, ctx, mine).await?;
+    // owners would each reconcile the other's documents away. A tenure that
+    // has owned the environment may claim it back if the claim vanishes; a
+    // database told another owns it may not.
+    let may_create = tenure.claimed || !setting_exists(conn, PROJECTION_BLOCKED).await?;
+    ensure_claim(conn, kine, ctx, mine, may_create).await?;
     if !tenure.claimed {
         tenure.claimed = true;
         delete_setting(conn, PROJECTION_BLOCKED).await?;
         tracing::info!("this instance now projects resources to kine");
     }
-    if serve_requests(conn, kine, ctx).await? {
+    if serve_requests(conn, kine, ctx, mine).await? {
         tenure.reconciled_at = Some(Instant::now());
     }
     if tenure
         .reconciled_at
         .is_none_or(|at| at.elapsed() >= timing.reconcile_every)
     {
-        let report = reconcile_on(conn, kine, ctx, false, None).await?;
+        let report = reconcile_on(conn, kine, ctx, mine, false, None).await?;
         tracing::info!(?report, "reconciled kine with the database");
         tenure.reconciled_at = Some(Instant::now());
     }
-    project_pending(conn, kine, ctx).await?;
+    project_pending(conn, kine, ctx, mine).await?;
     delete_setting(conn, PROJECTION_STALLED).await?;
     Ok(())
+}
+
+async fn setting_exists(conn: &mut PgConnection, key: &str) -> Result<bool, DbError> {
+    Ok(
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM cp_settings WHERE key = $1)")
+            .bind(key)
+            .fetch_one(conn)
+            .await?,
+    )
 }
 
 async fn delete_setting(conn: &mut PgConnection, key: &str) -> Result<(), DbError> {
@@ -1116,6 +1163,7 @@ async fn serve_requests(
     conn: &mut PgConnection,
     kine: &dyn KineWriter,
     ctx: &WriteCtx,
+    mine: Uuid,
 ) -> Result<bool, ProjectError> {
     // Nobody waits for an answer this old, and a database restored from
     // backup must not replay what an admin once allowed.
@@ -1156,7 +1204,7 @@ async fn serve_requests(
             role: OperatorRole::Admin,
         };
         let allow_deletes = request.allow_deletes;
-        let outcome = reconcile_on(conn, kine, ctx, allow_deletes, Some(&operator)).await;
+        let outcome = reconcile_on(conn, kine, ctx, mine, allow_deletes, Some(&operator)).await;
         let (answer, detail) = match outcome {
             Ok(report) => {
                 reconciled = true;
@@ -1271,7 +1319,7 @@ pub struct OwnershipBody {
 }
 
 /// `409 owned_elsewhere`: the claim does not name the database the request
-/// takes the environment over from.
+/// takes the environment over from, or that database is this one.
 fn owned_elsewhere() -> ApiError {
     ApiError::conflict(
         "owned_elsewhere",
@@ -1280,13 +1328,7 @@ fn owned_elsewhere() -> ApiError {
 }
 
 /// `POST /admin/rollout/ownership` with `{take_over_from: <database id>}`
-/// → `200 {owner_database_id}`: moves the environment's prefix in kine to
-/// this control plane's database, from the database the claim names, which
-/// `projection_blocked` reports. Every instance of the old control plane
-/// should be stopped first; one still running stops projecting at its next
-/// pass. `409 owned_elsewhere` when the claim names another database, `503
-/// unavailable` when kine cannot be reached or a projector of this database
-/// holds the lock at that moment.
+/// → `200 {owner_database_id}`: see [`take_over_with`].
 pub async fn post_ownership(
     auth: OperatorAuth,
     State(state): State<AppState>,
@@ -1297,43 +1339,62 @@ pub async fn post_ownership(
         .await
         .map_err(|_| ApiError::unavailable())?;
     let ctx = WriteCtx::of(&state);
-    let mut conn = match locked_session(&state.db).await {
+    let taken = take_over_with(&state.db, &kine, &ctx, &auth, body.take_over_from).await?;
+    Ok(Json(taken))
+}
+
+/// Moves the environment's prefix in kine to this database, from `from`:
+/// the database the claim names, which `projection_blocked` reports, or
+/// none when the claim is absent. Every instance of the old control plane
+/// should be stopped first; one still running stops writing at its next
+/// read of the claim.
+///
+/// Under the projector lock, the claim is read; then, in one transaction,
+/// the audit row is written and `projection_blocked` cleared, the claim is
+/// moved by a compare-and-swap at the revision read (a create when it was
+/// absent), and the transaction commits only once the claim has moved.
+/// `409 owned_elsewhere` when the claim names another database than
+/// `from`, when it changed after the read, or when `from` is this database;
+/// `503 unavailable` when kine cannot be reached or a projector of this
+/// database holds the lock at that moment.
+pub async fn take_over_with(
+    db: &Db,
+    kine: &dyn KineWriter,
+    ctx: &WriteCtx,
+    by: &OperatorAuth,
+    from: Uuid,
+) -> Result<Value, ApiError> {
+    let mut conn = match locked_session(db).await {
         Ok(conn) => conn,
         Err(ProjectError::NotLeader) => return Err(ApiError::unavailable()),
         Err(e) => return Err(ApiError::internal(e)),
     };
-    let taken = take_over(&mut conn, &kine, &ctx, &auth, body.take_over_from).await;
+    let taken = take_over(&mut conn, kine, ctx, by, from).await;
     let _ = conn.close().await;
     taken
 }
 
-/// [`post_ownership`] under the lock held by `conn`.
+/// [`take_over_with`] under the lock held by `conn`.
 async fn take_over(
     conn: &mut PgConnection,
     kine: &dyn KineWriter,
     ctx: &WriteCtx,
     by: &OperatorAuth,
     from: Uuid,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Value, ApiError> {
     let mine = database_id(conn).await?;
-    let key = claim_key(&ctx.env);
-    let unavailable = |_| ApiError::unavailable();
-    let current = kine.get(&key).await.map_err(unavailable)?;
-    let Some(current) = current.filter(|kv| claim_owner(&kv.value) == Some(from)) else {
+    if from == mine {
         return Err(owned_elsewhere());
-    };
-    fence(conn).await.map_err(|_| ApiError::unavailable())?;
-    // At the revision just read: the claim moves only from the owner named.
-    match kine
-        .update(&key, current.mod_revision, &claim_value(mine))
-        .await
-        .map_err(unavailable)?
-    {
-        WriteOutcome::Applied { .. } => {}
-        WriteOutcome::Conflict { .. } => return Err(owned_elsewhere()),
     }
+    let key = claim_key(&ctx.env);
+    let current = kine.get(&key).await.map_err(|_| ApiError::unavailable())?;
+    let previous = match &current {
+        None => None,
+        Some(kv) if claim_owner(&kv.value) == Some(from) => Some(from),
+        Some(_) => return Err(owned_elsewhere()),
+    };
     let mut tx = conn.begin().await.map_err(DbError::from)?;
-    let detail = json!({"from_database_id": from, "to_database_id": mine});
+    let detail = json!({"from_database_id": previous, "to_database_id": mine});
     audit_environment(
         &mut tx,
         ctx,
@@ -1343,9 +1404,33 @@ async fn take_over(
     )
     .await?;
     delete_setting(&mut tx, PROJECTION_BLOCKED).await?;
-    tx.commit().await.map_err(DbError::from)?;
-    tracing::warn!(from = %from, to = %mine, "this control plane took the environment over");
-    Ok(Json(json!({ "owner_database_id": mine })))
+    if fence(&mut tx).await.is_err() {
+        return Err(ApiError::unavailable());
+    }
+    // At the revision just read: the claim moves only from the owner named,
+    // or from nobody.
+    let value = claim_value(mine);
+    let moved = match &current {
+        Some(kv) => kine.update(&key, kv.mod_revision, &value).await,
+        None => kine.create(&key, &value).await,
+    };
+    match moved {
+        Ok(WriteOutcome::Applied { .. }) => {}
+        // Dropping `tx` rolls the audit row and the cleared flag back.
+        Ok(WriteOutcome::Conflict { .. }) => return Err(owned_elsewhere()),
+        Err(_) => return Err(ApiError::unavailable()),
+    }
+    if let Err(e) = tx.commit().await {
+        tracing::error!(
+            error = %e,
+            from = ?previous,
+            to = %mine,
+            "the environment was taken over, but its audit row could not be committed"
+        );
+        return Err(DbError::from(e).into());
+    }
+    tracing::warn!(from = ?previous, to = %mine, "this control plane took the environment over");
+    Ok(json!({ "owner_database_id": mine }))
 }
 
 #[cfg(test)]

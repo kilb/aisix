@@ -17,7 +17,7 @@ use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use aisix_control_plane::auth::OperatorRole;
+use aisix_control_plane::auth::{OperatorAuth, OperatorRole};
 use aisix_control_plane::crypto::MasterKey;
 use aisix_control_plane::db::Db;
 use aisix_control_plane::error::ApiError;
@@ -1551,25 +1551,29 @@ async fn an_instance_that_cannot_reach_kine_leaves_the_lock_to_one_that_can() {
 
 // ---- fix round 1 -----------------------------------------------------------
 
-/// What an armed [`Deposer`] call does once it has ended the leader's
-/// session.
-#[derive(Debug, Clone, Copy)]
+/// What an armed [`Deposer`] call does.
+#[derive(Debug, Clone)]
 enum Injection {
-    /// The new leader writes a newer value to the key; an update is
-    /// answered with the conflict that write causes.
+    /// Ends the leader's session; the new leader then writes a newer value
+    /// to the key, and an update or a delete is answered with the conflict
+    /// that write causes.
     Rewritten,
-    /// The new leader deletes the key; an update is answered
-    /// `Conflict { current: None }`, a get `None`.
+    /// Ends the leader's session; the new leader then deletes the key, and
+    /// an update is answered `Conflict { current: None }`, a get `None`.
     Deleted,
-    /// Answered as kine answers it.
+    /// Ends the leader's session; the call is answered as kine answers it.
     Answered,
+    /// Leaves the session alone: the call is answered as kine answers it,
+    /// and then another database takes the environment over, rewriting the
+    /// claim at `claim` to name `owner`.
+    ThenClaimedBy { claim: String, owner: Uuid },
 }
 
-/// Another projector taking over in the middle of the leader's work, as the
-/// leader sees it: the call it is armed for, `(operation, key)`, ends the
-/// leader's session and answers as its [`Injection`] says. It also notes
-/// every write sent while no session held the projector lock: a write only
-/// a deposed leader can send.
+/// Another projector, or another control plane, taking over in the middle
+/// of the leader's work, as the leader sees it: the call it is armed for,
+/// `(operation, key)`, does what its [`Injection`] says. It also notes every
+/// write sent while no session held the projector lock: a write only a
+/// deposed leader can send.
 struct Deposer {
     inner: KineClient,
     db: Db,
@@ -1659,6 +1663,39 @@ impl Deposer {
         Ok(())
     }
 
+    /// Writes a newer value to `key` as the new leader would; the conflict
+    /// the leader is then answered with.
+    async fn rewrite_as_new_leader(&self, key: &str) -> Result<WriteOutcome, KineError> {
+        let current = self.inner.get(key).await?.expect("the key is projected");
+        let newer = br#"{"display_name":"newer-leader-7c1"}"#;
+        let WriteOutcome::Applied { revision } =
+            self.inner.update(key, current.mod_revision, newer).await?
+        else {
+            panic!("the new leader's write lands");
+        };
+        Ok(WriteOutcome::Conflict {
+            current: Some(KeyValue {
+                value: newer.to_vec(),
+                mod_revision: revision,
+            }),
+        })
+    }
+
+    /// Rewrites the claim at `claim` to name `owner`, as a takeover by
+    /// another database would.
+    async fn reassign(&self, claim: &str, owner: Uuid) {
+        let value = json!({ "database_id": owner }).to_string().into_bytes();
+        let written = match self.inner.get(claim).await.expect("read the claim") {
+            Some(kv) => self.inner.update(claim, kv.mod_revision, &value).await,
+            None => self.inner.create(claim, &value).await,
+        }
+        .expect("rewrite the claim");
+        assert!(
+            matches!(written, WriteOutcome::Applied { .. }),
+            "{written:?}"
+        );
+    }
+
     /// The calls after the injected one, up to and including the next list:
     /// the rest of the deposed tenure, and the next tenure's start.
     fn after_injection(&self) -> Vec<(&'static str, String)> {
@@ -1674,13 +1711,34 @@ impl Deposer {
             .unwrap_or_else(|| panic!("no list after the injection: {:?}", &ops[at..]));
         rest[..=end].to_vec()
     }
+
+    /// Every call after the injected one.
+    fn since_injection(&self) -> Vec<(&'static str, String)> {
+        let ops = self.ops();
+        let at = ops
+            .iter()
+            .position(|(op, _)| op.ends_with(":injected"))
+            .expect("the injection fired");
+        ops[at + 1..].to_vec()
+    }
 }
 
 #[async_trait]
 impl KineWriter for Deposer {
     async fn create(&self, key: &str, value: &[u8]) -> Result<WriteOutcome, KineError> {
-        self.note_write("create", key).await;
-        self.inner.create(key, value).await
+        match self.fires("create", key) {
+            Some(Injection::ThenClaimedBy { claim, owner }) => {
+                let created = self.inner.create(key, value).await;
+                self.note("create:injected", key);
+                self.reassign(&claim, owner).await;
+                created
+            }
+            Some(other) => panic!("a create cannot be armed with {other:?}"),
+            None => {
+                self.note_write("create", key).await;
+                self.inner.create(key, value).await
+            }
+        }
     }
 
     async fn update(&self, key: &str, rev: i64, value: &[u8]) -> Result<WriteOutcome, KineError> {
@@ -1688,29 +1746,23 @@ impl KineWriter for Deposer {
             self.note_write("update", key).await;
             return self.inner.update(key, rev, value).await;
         };
+        if let Injection::ThenClaimedBy { claim, owner } = injection {
+            let updated = self.inner.update(key, rev, value).await;
+            self.note("update:injected", key);
+            self.reassign(&claim, owner).await;
+            return updated;
+        }
         self.end_session().await;
         self.note("update:injected", key);
         match injection {
-            Injection::Rewritten => {
-                let current = self.inner.get(key).await?.expect("the key is projected");
-                let newer = br#"{"display_name":"newer-leader-7c1"}"#;
-                let WriteOutcome::Applied { revision } =
-                    self.inner.update(key, current.mod_revision, newer).await?
-                else {
-                    panic!("the new leader's write lands");
-                };
-                Ok(WriteOutcome::Conflict {
-                    current: Some(KeyValue {
-                        value: newer.to_vec(),
-                        mod_revision: revision,
-                    }),
-                })
-            }
+            Injection::Rewritten => self.rewrite_as_new_leader(key).await,
             Injection::Deleted => {
                 self.delete_as_new_leader(key).await?;
                 Ok(WriteOutcome::Conflict { current: None })
             }
-            Injection::Answered => self.inner.update(key, rev, value).await,
+            Injection::Answered | Injection::ThenClaimedBy { .. } => {
+                self.inner.update(key, rev, value).await
+            }
         }
     }
 
@@ -1719,25 +1771,19 @@ impl KineWriter for Deposer {
             self.note_write("delete", key).await;
             return self.inner.delete(key, rev).await;
         };
+        if let Injection::ThenClaimedBy { claim, owner } = injection {
+            let deleted = self.inner.delete(key, rev).await;
+            self.note("delete:injected", key);
+            self.reassign(&claim, owner).await;
+            return deleted;
+        }
         self.end_session().await;
         self.note("delete:injected", key);
         match injection {
-            Injection::Rewritten => {
-                let current = self.inner.get(key).await?.expect("the key is projected");
-                let newer = br#"{"display_name":"newer-leader-7c1"}"#;
-                let WriteOutcome::Applied { revision } =
-                    self.inner.update(key, current.mod_revision, newer).await?
-                else {
-                    panic!("the new leader's write lands");
-                };
-                Ok(WriteOutcome::Conflict {
-                    current: Some(KeyValue {
-                        value: newer.to_vec(),
-                        mod_revision: revision,
-                    }),
-                })
+            Injection::Rewritten => self.rewrite_as_new_leader(key).await,
+            Injection::Deleted | Injection::Answered | Injection::ThenClaimedBy { .. } => {
+                self.inner.delete(key, rev).await
             }
-            Injection::Deleted | Injection::Answered => self.inner.delete(key, rev).await,
         }
     }
 
@@ -1745,6 +1791,12 @@ impl KineWriter for Deposer {
         let Some(injection) = self.fires("get", key) else {
             return self.inner.get(key).await;
         };
+        if let Injection::ThenClaimedBy { claim, owner } = injection {
+            let got = self.inner.get(key).await;
+            self.note("get:injected", key);
+            self.reassign(&claim, owner).await;
+            return got;
+        }
         self.end_session().await;
         self.note("get:injected", key);
         match injection {
@@ -1752,19 +1804,26 @@ impl KineWriter for Deposer {
                 self.delete_as_new_leader(key).await?;
                 Ok(None)
             }
-            Injection::Rewritten | Injection::Answered => self.inner.get(key).await,
+            Injection::Rewritten | Injection::Answered | Injection::ThenClaimedBy { .. } => {
+                self.inner.get(key).await
+            }
         }
     }
 
     async fn list(&self, prefix: &str) -> Result<Vec<(Vec<u8>, KeyValue)>, KineError> {
         let listed = self.inner.list(prefix).await;
-        if self.fires("list", prefix).is_some() {
+        match self.fires("list", prefix) {
+            Some(Injection::ThenClaimedBy { claim, owner }) => {
+                self.note("list:injected", prefix);
+                self.reassign(&claim, owner).await;
+            }
             // Answered first: the leader has the list in hand when its
             // session ends.
-            self.end_session().await;
-            self.note("list:injected", prefix);
-        } else {
-            self.note("list", prefix);
+            Some(_) => {
+                self.end_session().await;
+                self.note("list:injected", prefix);
+            }
+            None => self.note("list", prefix),
         }
         listed
     }
@@ -2667,4 +2726,285 @@ async fn the_one_off_passes_refuse_while_the_claim_names_another_database() {
         "{reconciled:?}"
     );
     assert!(kine.log().is_empty(), "{:?}", kine.log());
+}
+
+// ---- fix round 3 -----------------------------------------------------------
+
+/// `setting`'s `owner_database_id`, once `projection_blocked` is set.
+async fn blocked_by(db: &Db) -> Option<Value> {
+    setting(db, "projection_blocked")
+        .await
+        .map(|blocked| blocked["owner_database_id"].clone())
+}
+
+#[tokio::test]
+async fn a_blocked_control_plane_does_not_claim_a_vanished_claim() {
+    let Some(bare) = BareDatabase::new().await else {
+        return;
+    };
+    let Some(endpoint) = support::kine_endpoint() else {
+        return;
+    };
+    let kine = raw_kine(&endpoint).await;
+    let (db, env) = (&bare.db, &bare.env);
+    // Another database owns the environment.
+    let other = Uuid::new_v4();
+    let claim = claim_key(env);
+    let value = json!({ "database_id": other }).to_string();
+    raw_put(&kine, &claim, value.as_bytes()).await;
+    let timing = Timing {
+        owned_elsewhere_retry: Duration::from_secs(1),
+        ..Timing::default()
+    };
+    let log = Arc::new(Mutex::new(Vec::<Write>::new()));
+    let began = Instant::now();
+    let (stop, task) = spawn_recorded_with("a", &bare, &endpoint, &log, timing).await;
+    eventually("the control plane to be blocked", PATIENCE, || async move {
+        blocked_by(db).await == Some(json!(other))
+    })
+    .await;
+
+    // The claim vanishes, as if removed by hand: across several retries,
+    // the blocked control plane does not take it.
+    raw_delete(&kine, &claim).await;
+    let id = create_key(db, env, &unique("acct")).await;
+    eventually("the block to name no owner", PATIENCE, || async move {
+        blocked_by(db).await == Some(Value::Null)
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(
+        raw_get(&kine, &claim).await,
+        None,
+        "it claimed the environment"
+    );
+    assert_eq!(blocked_by(db).await, Some(Value::Null));
+    assert!(!row_state(db, Kind::ProviderKeys, id).await.projected());
+    assert_eq!(writers_since(&log, began), BTreeSet::new());
+    let _ = stop.send(());
+    task.await.expect("the projector stops");
+}
+
+#[tokio::test]
+async fn a_takeover_of_a_vanished_claim_is_audited() {
+    let Some(first) = TestCp::start_with_kine().await else {
+        return;
+    };
+    let endpoint = support::kine_endpoint().expect("kine is configured");
+    let kine = raw_kine(&endpoint).await;
+    let env = first.env().clone();
+    let first_id = setting(first.db(), "database_id").await.expect("an id");
+    create_key(first.db(), &env, &unique("a")).await;
+    all_projected(first.db()).await;
+    let second = TestCp::start_with(|cfg| {
+        cfg.kine_endpoint = endpoint.clone();
+        cfg.env_id_seed = Some(env.env_id);
+    })
+    .await
+    .expect("the second control plane boots");
+    let second_id = setting(second.db(), "database_id").await.expect("an id");
+    let db = second.db();
+    eventually("the second to be blocked", PATIENCE, || {
+        let first_id = &first_id;
+        async move { blocked_by(db).await.as_ref() == Some(first_id) }
+    })
+    .await;
+    let b = create_key(db, &env, &unique("b")).await;
+    // The old owner is stopped, and its claim removed by hand.
+    drop(first);
+    let claim = claim_key(&env);
+    raw_delete(&kine, &claim).await;
+    let admin = second.admin_login_seeded(OperatorRole::Admin).await;
+
+    // A takeover from this database itself is refused.
+    let r = take_over(&second, admin.cookie(), second_id.clone()).await;
+    assert_eq!(r.status, 409, "{r:?}");
+    assert_eq!(r.body["code"], "owned_elsewhere");
+    assert_eq!(raw_get(&kine, &claim).await, None);
+
+    // An absent claim is taken by the takeover, and audited.
+    let r = take_over(&second, admin.cookie(), first_id).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    assert_eq!(r.body, json!({ "owner_database_id": second_id }));
+    let (value, _) = raw_json(&kine, &claim).await.expect("the claim");
+    assert_eq!(value, json!({ "database_id": second_id }));
+    let audit: Vec<Value> = sqlx::query_scalar(
+        "SELECT detail FROM audit_log WHERE action = 'rollout.ownership.taken_over'",
+    )
+    .fetch_all(db.pool())
+    .await
+    .expect("read the audit log");
+    assert_eq!(
+        audit,
+        [json!({"from_database_id": null, "to_database_id": second_id})]
+    );
+    all_projected(db).await;
+    assert!(raw_get(&kine, &key_for(&env, Kind::ProviderKeys, b))
+        .await
+        .is_some());
+}
+
+#[tokio::test]
+async fn a_takeover_moves_the_claim_only_from_the_owner_it_read() {
+    let Some(first) = TestCp::start_with_kine().await else {
+        return;
+    };
+    let endpoint = support::kine_endpoint().expect("kine is configured");
+    let kine = raw_kine(&endpoint).await;
+    let env = first.env().clone();
+    let first_id: Uuid = setting(first.db(), "database_id")
+        .await
+        .and_then(|id| id.as_str().and_then(|id| id.parse().ok()))
+        .expect("an id");
+    all_projected(first.db()).await;
+    let second = TestCp::start_with(|cfg| {
+        cfg.kine_endpoint = endpoint.clone();
+        cfg.env_id_seed = Some(env.env_id);
+    })
+    .await
+    .expect("the second control plane boots");
+    let db = second.db();
+    eventually("the second to be blocked", PATIENCE, || async move {
+        blocked_by(db).await == Some(json!(first_id))
+    })
+    .await;
+
+    // A third database takes the environment just after the takeover has
+    // read the claim.
+    let claim = claim_key(&env);
+    let third = Uuid::new_v4();
+    let deposer = Deposer::new(&endpoint, db).await;
+    deposer.arm(
+        "get",
+        &claim,
+        Injection::ThenClaimedBy {
+            claim: claim.clone(),
+            owner: third,
+        },
+    );
+    let admin = OperatorAuth {
+        id: Uuid::new_v4(),
+        email: "takeover@ops.test".to_string(),
+        role: OperatorRole::Admin,
+    };
+    let taken =
+        projector::take_over_with(db, &*deposer, &ctx(second.env()), &admin, first_id).await;
+    let refused = taken.expect_err("the claim changed under the takeover");
+    assert_eq!(
+        (refused.status.as_u16(), refused.code),
+        (409, "owned_elsewhere")
+    );
+    let (value, _) = raw_json(&kine, &claim).await.expect("the claim");
+    assert_eq!(value, json!({ "database_id": third }));
+    // Nothing of the takeover was kept: no audit row, still blocked.
+    let audited: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM audit_log WHERE action = 'rollout.ownership.taken_over'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .expect("read the audit log");
+    assert_eq!(audited, 0);
+    assert_eq!(blocked_by(db).await, Some(json!(first_id)));
+}
+
+#[tokio::test]
+async fn an_old_owner_stops_within_a_batch_of_losing_the_environment() {
+    let Some(bare) = BareDatabase::new().await else {
+        return;
+    };
+    let Some(endpoint) = support::kine_endpoint() else {
+        return;
+    };
+    let kine = raw_kine(&endpoint).await;
+    let (db, env) = (&bare.db, &bare.env);
+    let deposer = Deposer::new(&endpoint, db).await;
+    let (stop, task) = spawn_on(&bare, deposer.clone(), Timing::default());
+    create_key(db, env, &unique("first")).await;
+    all_projected(db).await;
+
+    // Three batches' worth, in one transaction; another database takes the
+    // environment as the first batch's last row is written.
+    let ids: Vec<Uuid> = (0..130).map(|_| Uuid::new_v4()).collect();
+    let keys: Vec<String> = ids
+        .iter()
+        .map(|id| key_for(env, Kind::ProviderKeys, *id))
+        .collect();
+    let third = Uuid::new_v4();
+    deposer.arm(
+        "create",
+        &keys[63],
+        Injection::ThenClaimedBy {
+            claim: claim_key(env),
+            owner: third,
+        },
+    );
+    let writes = ids
+        .iter()
+        .map(|id| {
+            let doc = provider_key(&unique("bulk"), SECRET);
+            (Kind::ProviderKeys, *id, Op::Create(doc))
+        })
+        .collect();
+    write_all(db, env, writes).await;
+    eventually("the old owner to stop", PATIENCE, || async move {
+        blocked_by(db).await == Some(json!(third))
+    })
+    .await;
+    let later: BTreeSet<&String> = keys[64..].iter().collect();
+    let sent: Vec<_> = deposer
+        .since_injection()
+        .into_iter()
+        .filter(|(_, key)| later.contains(key))
+        .collect();
+    assert_eq!(sent, [], "written after the environment moved");
+    // The first row and the first batch.
+    assert_eq!(raw_keys(&kine, &env.env_prefix()).await.len(), 65);
+    let _ = stop.send(());
+    task.await.expect("the projector stops");
+}
+
+#[tokio::test]
+async fn a_reconcile_does_not_delete_by_a_list_older_than_a_takeover() {
+    let Some(bare) = BareDatabase::new().await else {
+        return;
+    };
+    let Some(endpoint) = support::kine_endpoint() else {
+        return;
+    };
+    let kine = raw_kine(&endpoint).await;
+    let (db, env) = (&bare.db, &bare.env);
+    create_key(db, env, &unique("acct")).await;
+    let prefix = env.env_prefix();
+    let strays = [
+        format!("{prefix}models/{}", Uuid::new_v4()),
+        format!("{prefix}models/{}", Uuid::new_v4()),
+    ];
+    for stray in &strays {
+        raw_put(&kine, stray, b"{}").await;
+    }
+    // Another database takes the environment just after the tenure's
+    // reconcile has listed it.
+    let third = Uuid::new_v4();
+    let deposer = Deposer::new(&endpoint, db).await;
+    deposer.arm(
+        "list",
+        &prefix,
+        Injection::ThenClaimedBy {
+            claim: claim_key(env),
+            owner: third,
+        },
+    );
+    let (stop, task) = spawn_on(&bare, deposer.clone(), Timing::default());
+    eventually("the old owner to stop", PATIENCE, || async move {
+        blocked_by(db).await == Some(json!(third))
+    })
+    .await;
+    for stray in &strays {
+        assert!(raw_get(&kine, stray).await.is_some(), "{stray} was deleted");
+    }
+    let since = deposer.since_injection();
+    assert!(!since.iter().any(|(op, _)| *op == "delete"), "{since:?}");
+    assert_eq!(reconcile_audit(db).await, []);
+    let _ = stop.send(());
+    task.await.expect("the projector stops");
 }

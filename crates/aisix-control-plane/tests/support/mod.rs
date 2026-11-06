@@ -146,7 +146,14 @@ struct TestDatabase {
 /// How many test databases exist at once in one test process: each control
 /// plane holds several connections, and a server's `max_connections` is
 /// shared by every test binary running beside this one.
+///
+/// A test holds its slots until it ends, so this is deadlock-free only while
+/// fewer than this many tests of one binary hold two databases at the same
+/// time: that many, each waiting for its second, would wait on each other.
+/// The wait is bounded by [`DATABASE_SLOT_WAIT`], and reports this.
 static DATABASE_SLOTS: Semaphore = Semaphore::const_new(8);
+
+const DATABASE_SLOT_WAIT: std::time::Duration = std::time::Duration::from_secs(600);
 
 impl Drop for TestDatabase {
     fn drop(&mut self) {
@@ -495,9 +502,14 @@ impl Drop for TempFile {
 /// [`DATABASE_SLOTS`] are all taken.
 async fn new_database() -> Option<Arc<TestDatabase>> {
     let server_url = gate_var("CP_TEST_DATABASE_URL")?;
-    let slot = DATABASE_SLOTS
-        .acquire()
+    let slot = tokio::time::timeout(DATABASE_SLOT_WAIT, DATABASE_SLOTS.acquire())
         .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "waited {DATABASE_SLOT_WAIT:?} for a test database slot: too many tests of \
+                 this binary hold two databases at once (see DATABASE_SLOTS)"
+            )
+        })
         .expect("the database slots are never closed");
     let template = TEMPLATE
         .get_or_init(|| ensure_template(&server_url))
