@@ -1131,26 +1131,108 @@ mod tests {
         };
         build_client(&mtls).expect("build_client must tolerate PEM without trailing newline");
     }
+    /// A control plane served from the test's own runtime.
+    ///
+    /// The paused-clock tests advance the clock while an exchange is on the
+    /// wire, and the client's 10s request timeout runs on that same clock. A
+    /// mock answering from a thread of its own answers when the OS schedules
+    /// that thread, and every real millisecond it waits becomes many virtual
+    /// ones: on a loaded machine an answered attempt reached the timeout
+    /// first and counted as unanswered. Served here, an exchange moves only as
+    /// this runtime polls it, so it takes the same few driver steps however
+    /// busy the machine is.
+    struct LocalServer {
+        addr: std::net::SocketAddr,
+    }
+
+    impl LocalServer {
+        fn uri(&self) -> String {
+            format!("http://{}", self.addr)
+        }
+    }
+
+    /// What [`LocalServer`] answers one request with.
+    struct Reply {
+        status: u16,
+        headers: Vec<(&'static str, &'static str)>,
+        body: &'static str,
+        /// Held this long first, on the runtime's clock.
+        delay: Option<Duration>,
+    }
+
+    impl Reply {
+        fn status(status: u16) -> Self {
+            Reply {
+                status,
+                headers: Vec::new(),
+                body: "",
+                delay: None,
+            }
+        }
+    }
+
+    async fn local_server(
+        respond: impl Fn(&axum::http::HeaderMap, &[u8]) -> Reply + Send + Sync + 'static,
+    ) -> LocalServer {
+        use http_body_util::BodyExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let respond = Arc::new(respond);
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let respond = Arc::clone(&respond);
+                tokio::spawn(async move {
+                    let service = hyper::service::service_fn(
+                        move |request: axum::http::Request<hyper::body::Incoming>| {
+                            let respond = Arc::clone(&respond);
+                            async move {
+                                assert_eq!(request.method(), "POST");
+                                assert_eq!(request.uri().path(), TELEMETRY_PATH);
+                                let (parts, body) = request.into_parts();
+                                let body = body.collect().await?.to_bytes();
+                                let reply = respond(&parts.headers, &body);
+                                if let Some(delay) = reply.delay {
+                                    tokio::time::sleep(delay).await;
+                                }
+                                let mut response =
+                                    axum::http::Response::builder().status(reply.status);
+                                for (name, value) in reply.headers {
+                                    response = response.header(name, value);
+                                }
+                                Ok::<_, hyper::Error>(
+                                    response
+                                        .body(http_body_util::Full::new(reply.body.as_bytes()))
+                                        .unwrap(),
+                                )
+                            }
+                        },
+                    );
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        });
+        LocalServer { addr }
+    }
+
     type RecordedBatches = Arc<std::sync::Mutex<Vec<serde_json::Value>>>;
 
-    async fn recording_server(first_status: u16) -> (MockServer, RecordedBatches) {
-        let server = MockServer::builder().start().await;
+    async fn recording_server(first_status: u16) -> (LocalServer, RecordedBatches) {
         let batches = Arc::new(std::sync::Mutex::new(Vec::new()));
         let recorded = Arc::clone(&batches);
-        Mock::given(method("POST"))
-            .and(path("/dp/telemetry"))
-            .respond_with(move |request: &wiremock::Request| {
-                assert!(request.headers.get("authorization").is_none());
-                let mut batches = recorded.lock().unwrap();
-                batches.push(serde_json::from_slice(&request.body).unwrap());
-                ResponseTemplate::new(if batches.len() == 1 {
-                    first_status
-                } else {
-                    200
-                })
+        let server = local_server(move |headers, body| {
+            assert!(headers.get("authorization").is_none());
+            let mut batches = recorded.lock().unwrap();
+            batches.push(serde_json::from_slice(body).unwrap());
+            Reply::status(if batches.len() == 1 {
+                first_status
+            } else {
+                200
             })
-            .mount(&server)
-            .await;
+        })
+        .await;
         (server, batches)
     }
 
@@ -1158,24 +1240,19 @@ mod tests {
     /// leaving the worker inside one flush while a test stages what
     /// arrives behind it. The body is recorded before the wait, so the
     /// test can tell "in flight" from "not sent yet".
-    async fn recording_server_holding_first(held: Duration) -> (MockServer, RecordedBatches) {
-        let server = MockServer::builder().start().await;
+    async fn recording_server_holding_first(held: Duration) -> (LocalServer, RecordedBatches) {
         let batches = Arc::new(std::sync::Mutex::new(Vec::new()));
         let recorded = Arc::clone(&batches);
-        Mock::given(method("POST"))
-            .and(path("/dp/telemetry"))
-            .respond_with(move |request: &wiremock::Request| {
-                let mut batches = recorded.lock().unwrap();
-                batches.push(serde_json::from_slice(&request.body).unwrap());
-                let response = ResponseTemplate::new(200);
-                if batches.len() == 1 {
-                    response.set_delay(held)
-                } else {
-                    response
-                }
-            })
-            .mount(&server)
-            .await;
+        let server = local_server(move |_, body| {
+            let mut batches = recorded.lock().unwrap();
+            batches.push(serde_json::from_slice(body).unwrap());
+            let mut reply = Reply::status(200);
+            if batches.len() == 1 {
+                reply.delay = Some(held);
+            }
+            reply
+        })
+        .await;
         (server, batches)
     }
 
@@ -1253,45 +1330,38 @@ mod tests {
     /// The header is per RESPONSE rather than per server on purpose: behind
     /// one dp-manager Service a rolling upgrade answers from both kinds of
     /// replica.
-    async fn scripted_server(script: Vec<Answer>) -> (MockServer, RecordedPosts) {
-        let server = MockServer::builder().start().await;
+    async fn scripted_server(script: Vec<Answer>) -> (LocalServer, RecordedPosts) {
         let posts: RecordedPosts = Arc::new(std::sync::Mutex::new(Vec::new()));
         let recorded = Arc::clone(&posts);
-        Mock::given(method("POST"))
-            .and(path("/dp/telemetry"))
-            .respond_with(move |request: &wiremock::Request| {
-                // Read before locking: a failed expectation here must fail
-                // the test, not poison the recording behind a confusing
-                // second error.
-                let batch_id = request
-                    .headers
-                    .get(USAGE_BATCH_ID_HEADER)
-                    .expect("every batch carries its id")
-                    .to_str()
-                    .unwrap()
-                    .to_string();
-                let mut posts = recorded.lock().unwrap();
-                posts.push((batch_id, serde_json::from_slice(&request.body).unwrap()));
-                let answer = *script
-                    .get(posts.len() - 1)
-                    .unwrap_or_else(|| script.last().unwrap());
-                let response = match answer.dedup {
-                    Some(value) => ResponseTemplate::new(answer.status)
-                        .insert_header(USAGE_BATCH_DEDUP_HEADER, value),
-                    None => ResponseTemplate::new(answer.status),
-                };
-                let response = match answer.body {
-                    Some(body) => response.set_body_raw(body, "application/json"),
-                    None => response,
-                };
-                if answer.stalled {
-                    response.set_delay(BEYOND_THE_REQUEST_TIMEOUT)
-                } else {
-                    response
-                }
-            })
-            .mount(&server)
-            .await;
+        let server = local_server(move |headers, body| {
+            // Read before locking: a failed expectation here must fail
+            // the test, not poison the recording behind a confusing
+            // second error.
+            let batch_id = headers
+                .get(USAGE_BATCH_ID_HEADER)
+                .expect("every batch carries its id")
+                .to_str()
+                .unwrap()
+                .to_string();
+            let mut posts = recorded.lock().unwrap();
+            posts.push((batch_id, serde_json::from_slice(body).unwrap()));
+            let answer = *script
+                .get(posts.len() - 1)
+                .unwrap_or_else(|| script.last().unwrap());
+            let mut reply = Reply::status(answer.status);
+            if let Some(value) = answer.dedup {
+                reply.headers.push((USAGE_BATCH_DEDUP_HEADER, value));
+            }
+            if let Some(body) = answer.body {
+                reply.headers.push(("content-type", "application/json"));
+                reply.body = body;
+            }
+            if answer.stalled {
+                reply.delay = Some(BEYOND_THE_REQUEST_TIMEOUT);
+            }
+            reply
+        })
+        .await;
         (server, posts)
     }
 
