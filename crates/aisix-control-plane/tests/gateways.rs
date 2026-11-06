@@ -468,6 +468,68 @@ async fn the_bundle_names_every_variable_the_image_needs_and_no_etcd_user() {
 }
 
 #[tokio::test]
+async fn an_expired_ca_issues_nothing_and_says_so() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    // The stored CA replaced by one that expired 30 days ago, and an
+    // instance booted on it.
+    let now = time::OffsetDateTime::now_utc();
+    let mut params = rcgen::CertificateParams::default();
+    let mut dn = rcgen::DistinguishedName::new();
+    dn.push(
+        rcgen::DnType::CommonName,
+        "AISIX control plane CA expired-7c1",
+    );
+    params.distinguished_name = dn;
+    params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Constrained(0));
+    params.key_usages = vec![
+        rcgen::KeyUsagePurpose::KeyCertSign,
+        rcgen::KeyUsagePurpose::CrlSign,
+    ];
+    params.not_before = now - time::Duration::days(3680);
+    params.not_after = now - time::Duration::days(30);
+    let key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("a key");
+    let ca = params.self_signed(&key).expect("an expired CA");
+    sqlx::query("UPDATE cp_settings SET value = to_jsonb($1::text) WHERE key = 'ca_cert_pem'")
+        .bind(ca.pem())
+        .execute(cp.db().pool())
+        .await
+        .expect("store the expired CA");
+    sqlx::query("UPDATE cp_secrets SET sealed = $1 WHERE name = 'ca_key'")
+        .bind(MasterKey(TEST_MASTER_KEY).seal(b"aisix-cp:ca_key", &key.serialize_der()))
+        .execute(cp.db().pool())
+        .await
+        .expect("store its key");
+    let expired = cp.restart().await;
+    assert_eq!(expired.state().pki.ca_pem(), ca.pem());
+
+    let admin = expired.admin_login_seeded(OperatorRole::Admin).await;
+    let r = issue(&expired, &admin, json!({"name": "gw-expired-7c1"})).await;
+    assert_eq!(r.status, 503, "{r:?}");
+    assert_eq!(r.body["code"], "ca_expired");
+    let message = str_at(&r.body, "/error");
+    assert!(
+        message.contains("CA") && message.contains("过期"),
+        "{message}"
+    );
+    let text = r.body.to_string();
+    assert!(
+        !text.contains("PRIVATE KEY") && !text.contains("BEGIN CERTIFICATE"),
+        "{text}"
+    );
+    // Nothing issued, nothing recorded.
+    assert_eq!(credential_count(&expired).await, 0);
+    assert!(
+        !audit_rows(&expired)
+            .await
+            .iter()
+            .any(|(action, _)| action == "gateway_credential.issue"),
+        "an issue was audited"
+    );
+}
+
+#[tokio::test]
 async fn validity_days_defaults_to_365_and_is_bounded() {
     let Some(cp) = TestCp::start().await else {
         return;
