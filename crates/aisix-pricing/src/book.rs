@@ -14,7 +14,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::catalogue::Catalogue;
@@ -105,9 +105,15 @@ pub enum CostSource {
     ProviderKey { revision_id: i64 },
     /// The cost revision of the upstream model, whichever key served it.
     Upstream { revision_id: i64 },
-    /// The built-in catalogue's list price: the catalogue's version and the
-    /// entry's own key, whichever alias matched.
-    Catalogue { version: String, key: String },
+    /// The built-in catalogue's list price: the catalogue's version, the
+    /// entry's own key (whichever alias matched) and the entry's
+    /// `effective_from`, which tells a key's dated entries apart (`None`:
+    /// the entry that applies from the beginning of time).
+    Catalogue {
+        version: String,
+        key: String,
+        effective_from: Option<NaiveDate>,
+    },
 }
 
 /// The sell price in effect for one tenant and model.
@@ -146,10 +152,15 @@ fn in_effect<T>(revisions: &[Revision<T>], at: DateTime<Utc>) -> Option<&Revisio
     revisions.get(started.checked_sub(1)?)
 }
 
-/// The cost revision in effect at `at`, when it is usable.
-fn usable_at(revisions: &[Revision<RateCard>], at: DateTime<Utc>) -> Option<(i64, &RateCard)> {
+/// What one cost source says at `at`: `None` when it has no revision in
+/// effect, so a less specific source may decide; otherwise its revision in
+/// effect, `Err(revision_id)` when that revision is invalid.
+fn cost_at(
+    revisions: &[Revision<RateCard>],
+    at: DateTime<Utc>,
+) -> Option<Result<(i64, &RateCard), i64>> {
     let r = in_effect(revisions, at)?;
-    Some((r.revision_id, r.read().ok()?))
+    Some(r.read().map(|card| (r.revision_id, card)))
 }
 
 /// One model's sell prices.
@@ -333,11 +344,16 @@ impl PriceBook {
     /// the platform at `at`. It keys on the upstream that served the row,
     /// never on the model the caller addressed.
     ///
-    /// The key's cost revision in effect comes first, then the upstream
-    /// model's, then the built-in catalogue's list price in effect at `at`.
-    /// Cost is optional, so an invalid revision in effect gives way to the
-    /// next source, never to an older revision of its own; it is still
-    /// listed in [`Self::invalid_revisions`].
+    /// The most specific source with a revision in effect decides: the
+    /// key's cost revisions, then the upstream model's, then the built-in
+    /// catalogue's list price in effect at `at`. When the deciding revision
+    /// is invalid the cost is unknown (`None`). It never gives way to a less
+    /// specific source: a key's row exists because its cost differs, and a
+    /// substituted cost could not be told apart on the charge. The revision
+    /// is still listed in [`Self::invalid_revisions`].
+    ///
+    /// Cost revisions match `provider` and `model` exactly. The catalogue's
+    /// aliases apply only to the catalogue fallback.
     #[cfg_attr(
         not(test),
         expect(dead_code, reason = "the engine (Task 6) is the first caller")
@@ -353,11 +369,13 @@ impl PriceBook {
         let by_key = upstream
             .zip(provider_key_id)
             .and_then(|(u, key)| u.by_key.get(key))
-            .and_then(|revisions| usable_at(revisions, at));
-        if let Some((revision_id, card)) = by_key {
+            .and_then(|revisions| cost_at(revisions, at));
+        if let Some(decided) = by_key {
+            let (revision_id, card) = decided.ok()?;
             return Some((CostSource::ProviderKey { revision_id }, card));
         }
-        if let Some((revision_id, card)) = upstream.and_then(|u| usable_at(&u.upstream, at)) {
+        if let Some(decided) = upstream.and_then(|u| cost_at(&u.upstream, at)) {
+            let (revision_id, card) = decided.ok()?;
             return Some((CostSource::Upstream { revision_id }, card));
         }
         let entry = self.catalogue.get(provider, model, at)?;
@@ -365,6 +383,7 @@ impl PriceBook {
             CostSource::Catalogue {
                 version: self.catalogue.version().to_owned(),
                 key: entry.key.clone(),
+                effective_from: entry.effective_from,
             },
             &entry.card,
         ))
@@ -755,6 +774,14 @@ mod tests {
                 invalid(RevisionTable::Sell, 9, "written by a newer engine"),
             ]
         );
+        // A newer engine's row that ends an override carries no card, and
+        // is unreadable all the same: it does not end the override.
+        let b = book(&[
+            sell(1, "m", None, T0, card(1)),
+            sell(2, "m", Some("acme"), T0, card(2)),
+            newer(sell(3, "m", Some("acme"), T2, None)),
+        ]);
+        assert_eq!(b.sell("acme", "m", ts(T3)), Some(Err(3)));
         // An older engine's revision is read as usual.
         let mut older = sell(1, "m", None, T0, card(1));
         older.engine_version = ENGINE_VERSION - 1;
@@ -892,11 +919,13 @@ mod tests {
                 (CostSource::Upstream { revision_id: 2 }, usd(2))
             );
         }
-        // A key's row prices only its own upstream model.
+        // Cost rows match the upstream model exactly; under the catalogue's
+        // alias only the catalogue prices it.
         let (source, card) = b.cost(Some("k1"), "openai", "up-1-latest", ts(T1)).unwrap();
         let catalogue = CostSource::Catalogue {
             version: "2026-11-06".to_owned(),
             key: "openai/up-1".to_owned(),
+            effective_from: None,
         };
         assert_eq!((source, input(card)), (catalogue.clone(), usd(3)));
         // No cost row at all: the catalogue, under the entry's own key.
@@ -928,7 +957,9 @@ mod tests {
     }
 
     #[test]
-    fn an_invalid_cost_revision_is_skipped_for_the_next_source() {
+    fn an_invalid_cost_revision_leaves_the_cost_unknown() {
+        // Ruling P2-R14: the most specific source with a revision in effect
+        // decides, and an invalid one decides "unknown".
         let b = book_of(
             Vec::new(),
             vec![
@@ -942,17 +973,21 @@ mod tests {
             source_of(&b, T1),
             CostSource::ProviderKey { revision_id: 1 }
         );
-        // The invalid revision keeps its slot: the key's older row does
-        // not come back; the upstream row prices it.
-        assert_eq!(source_of(&b, T3), CostSource::Upstream { revision_id: 3 });
+        // Neither the key's older row nor the upstream row stands in.
+        assert_eq!(b.cost(Some("k1"), "openai", "up-1", ts(T3)), None);
+        // Another key, or none, still reads the upstream row.
+        for key in [Some("k2"), None] {
+            let (source, _) = b.cost(key, "openai", "up-1", ts(T3)).unwrap();
+            assert_eq!(source, CostSource::Upstream { revision_id: 3 });
+        }
         let listed = b.invalid_revisions();
         assert_eq!(
             (listed.len(), listed[0].table, listed[0].revision_id),
             (1, RevisionTable::Cost, 2)
         );
 
-        // An invalid upstream row leaves the catalogue; so does a newer
-        // engine's row.
+        // An invalid upstream row is not replaced by the catalogue, which
+        // prices this model; nor is a newer engine's key row.
         let mut newer = cost(5, "openai", "up-1", Some("k1"), T0, card(1));
         newer.engine_version = ENGINE_VERSION + 1;
         let b = book_of(
@@ -960,7 +995,9 @@ mod tests {
             vec![cost(4, "openai", "up-1", None, T0, None), newer],
             Vec::new(),
         );
-        assert!(matches!(source_of(&b, T1), CostSource::Catalogue { .. }));
+        assert!(book(&[]).cost(None, "openai", "up-1", ts(T1)).is_some());
+        assert_eq!(b.cost(None, "openai", "up-1", ts(T1)), None);
+        assert_eq!(b.cost(Some("k1"), "openai", "up-1", ts(T1)), None);
         let listed: Vec<_> = b
             .invalid_revisions()
             .iter()
@@ -972,11 +1009,13 @@ mod tests {
     #[test]
     fn the_catalogue_fallback_is_dated_by_the_event_instant() {
         // Ruling P2-R7: the list price in effect when the event occurred.
+        // Ruling P2-R13: the source names the dated entry that priced it.
         let b = book(&[]);
-        for (at, want) in [
-            ("2026-11-30T23:59:59.999Z", 3),
-            ("2026-12-01T00:00:00Z", 4),
-            ("2027-06-01T00:00:00Z", 4),
+        let dec_1 = NaiveDate::from_ymd_opt(2026, 12, 1);
+        for (at, want, effective_from) in [
+            ("2026-11-30T23:59:59.999Z", 3, None),
+            ("2026-12-01T00:00:00Z", 4, dec_1),
+            ("2027-06-01T00:00:00Z", 4, dec_1),
         ] {
             for model in ["up-1", "up-1-latest"] {
                 let (source, card) = b.cost(None, "openai", model, ts(at)).unwrap();
@@ -986,6 +1025,7 @@ mod tests {
                         CostSource::Catalogue {
                             version: "2026-11-06".to_owned(),
                             key: "openai/up-1".to_owned(),
+                            effective_from,
                         },
                         usd(want)
                     ),
