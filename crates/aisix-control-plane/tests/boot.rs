@@ -267,6 +267,11 @@ fn each_config_error_names_its_variable_and_not_its_value() {
         ("CP_DB_STATEMENT_TIMEOUT_MS", "-5"),
         ("CP_KINE_ENDPOINT", "http://10.0.0.5:2379"),
         ("CP_KINE_ENDPOINT", "http://kine.example.com:2379"),
+        // Look-alikes: a loopback name or address as a prefix of another
+        // host, or as userinfo in front of it.
+        ("CP_KINE_ENDPOINT", "http://127.0.0.1.evil.com:2379"),
+        ("CP_KINE_ENDPOINT", "http://localhost.evil.com:2379"),
+        ("CP_KINE_ENDPOINT", "http://127.0.0.1@evil.com:2379"),
         ("CP_KINE_ENDPOINT", "not a url"),
         ("CP_MASTER_KEY_FILE", empty_key_file.path_str()),
     ];
@@ -533,6 +538,38 @@ async fn migrations_wait_for_a_lock_instead_of_timing_out() {
             .expect("show");
         assert_eq!(value, expected, "{setting}");
     }
+}
+
+#[tokio::test]
+async fn a_migration_run_stuck_past_its_bound_refuses_the_boot() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    // The lock is held for far longer than the bound, as by a hung peer.
+    let mut holder = cp.db().pool().begin().await.expect("begin");
+    sqlx::query("LOCK TABLE _sqlx_migrations IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *holder)
+        .await
+        .expect("hold the migrations table");
+    let started = Instant::now();
+    let refused = tokio::time::timeout(
+        Duration::from_secs(10),
+        Db::connect_within(cp.database_url(), 100, 30_000, Duration::from_millis(300)),
+    )
+    .await
+    .expect("the bound ends the wait");
+    let elapsed = started.elapsed();
+    holder.rollback().await.expect("release the lock");
+    let err = match refused {
+        Ok(_) => panic!("the boot went ahead while the migrations were stuck"),
+        Err(e) => e,
+    };
+    assert!(matches!(err, DbError::MigrationTimeout { .. }), "{err:?}");
+    assert!(elapsed >= Duration::from_millis(250), "{elapsed:?}");
+    let shown = BootError::from(err).to_string();
+    assert!(shown.contains("CP_DATABASE_URL"), "{shown}");
+    assert!(shown.contains("migration"), "{shown}");
+    assert!(shown.contains("300ms"), "{shown}");
 }
 
 #[tokio::test]

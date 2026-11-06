@@ -12,6 +12,7 @@
 //! text.
 
 use std::str::FromStr;
+use std::time::Duration;
 
 use futures::future::BoxFuture;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
@@ -19,6 +20,10 @@ use sqlx::{Connection, PgConnection, PgPool};
 
 /// Connections per control-plane instance.
 const MAX_CONNECTIONS: u32 = 10;
+
+/// How long a boot waits to connect and apply the migrations, including the
+/// wait for another instance's run to finish. See [`Db::connect`].
+pub const MIGRATION_BOUND: Duration = Duration::from_secs(600);
 
 #[derive(Debug, thiserror::Error)]
 pub enum DbError {
@@ -28,6 +33,12 @@ pub enum DbError {
     /// SQLSTATE `55P03`: a lock was not granted within `lock_timeout`.
     #[error("a lock was not granted within lock_timeout")]
     LockTimeout,
+    /// Connecting and migrating took longer than the boot allows.
+    #[error(
+        "the migrations did not finish within {after:?}: another instance may be holding \
+         the migration lock, or a migration is stuck"
+    )]
+    MigrationTimeout { after: Duration },
     #[error(transparent)]
     Db(sqlx::Error),
 }
@@ -58,23 +69,67 @@ pub struct Db {
 impl Db {
     /// Applies the migrations, then opens the pool, setting `lock_timeout`
     /// and `statement_timeout` on every pool connection.
+    ///
+    /// Connecting and migrating together are bounded by [`MIGRATION_BOUND`].
     pub async fn connect(
         url: &str,
         lock_timeout_ms: u64,
         statement_timeout_ms: u64,
     ) -> Result<Db, DbError> {
+        Self::connect_within(url, lock_timeout_ms, statement_timeout_ms, MIGRATION_BOUND).await
+    }
+
+    /// [`Db::connect`] with the migration bound given.
+    ///
+    /// Migrations run on a connection of their own with neither timeout.
+    /// sqlx holds an advisory lock for the whole run, so instances that boot
+    /// together apply each migration once, and the others wait for that run;
+    /// a `lock_timeout` there, or a `statement_timeout` on a long migration
+    /// statement, would fail every replica's boot over and over.
+    ///
+    /// Without any limit, though, a run that never ends (a hung peer holding
+    /// the lock, a statement blocked forever) would leave every booting
+    /// replica waiting silently. So the connect and the run together get one
+    /// generous `bound`, after which the boot is refused with
+    /// [`DbError::MigrationTimeout`] and the supervisor's restart policy
+    /// takes over. The trade-off: a migration that legitimately runs longer
+    /// than the bound cannot be applied by a booting instance and has to be
+    /// applied out of band. When the bound expires, this connection is
+    /// dropped; Postgres rolls back a migration it was running once it
+    /// notices the disconnect, which may be only after the current statement
+    /// ends.
+    pub async fn connect_within(
+        url: &str,
+        lock_timeout_ms: u64,
+        statement_timeout_ms: u64,
+        bound: Duration,
+    ) -> Result<Db, DbError> {
         let options = PgConnectOptions::from_str(url)?;
-        // Migrations run on a connection of their own with neither timeout.
-        // sqlx holds an advisory lock for the whole run, so instances that
-        // boot together apply each migration once, and the others wait for
-        // that run however long it takes; a timeout there, or on a long
-        // migration statement, would fail every replica's boot over and over.
+        tokio::time::timeout(bound, Self::migrate(&options))
+            .await
+            .map_err(|_| DbError::MigrationTimeout { after: bound })??;
+        let pool = PgPoolOptions::new()
+            .max_connections(MAX_CONNECTIONS)
+            .connect_with(options.options([
+                ("lock_timeout", lock_timeout_ms),
+                ("statement_timeout", statement_timeout_ms),
+            ]))
+            .await?;
+        Ok(Db { pool })
+    }
+
+    /// Connects without timeouts and applies the migrations.
+    async fn migrate(options: &PgConnectOptions) -> Result<(), DbError> {
         let mut migration_conn = PgConnection::connect_with(
             &options
                 .clone()
                 .options([("lock_timeout", 0), ("statement_timeout", 0)]),
         )
         .await?;
+        // Logged before the wait, so a boot that sits here says why.
+        tracing::info!(
+            "applying migrations; this waits while another instance holds the migration lock"
+        );
         let mut migrator = sqlx::migrate!("./migrations");
         // A database that a newer build has migrated further still opens, so
         // an older instance can run beside a newer one or after a rollback.
@@ -88,15 +143,7 @@ impl Db {
         // The run's own error is the one to report; closing only spares the
         // server a dangling session.
         let _ = migration_conn.close().await;
-        migrated.map_err(|e| DbError::Db(sqlx::Error::Migrate(Box::new(e))))?;
-        let pool = PgPoolOptions::new()
-            .max_connections(MAX_CONNECTIONS)
-            .connect_with(options.options([
-                ("lock_timeout", lock_timeout_ms),
-                ("statement_timeout", statement_timeout_ms),
-            ]))
-            .await?;
-        Ok(Db { pool })
+        migrated.map_err(|e| DbError::Db(sqlx::Error::Migrate(Box::new(e))))
     }
 
     pub fn pool(&self) -> &PgPool {
