@@ -32,8 +32,9 @@
 //! [`MAX_WATCHES_PER_CREDENTIAL`] of one credential's, each with one
 //! connection to kine and [`WATCH_BUFFER`] answers queued each way, none
 //! longer than [`MAX_WATCH_ANSWER`]; and at most [`MAX_RANGES`] ranges read
-//! at once, each answer at most [`MAX_RANGE_ANSWER`] bytes. Past a cap a
-//! gateway is told `ResourceExhausted`, which it retries.
+//! from kine at once, each answer at most [`MAX_RANGE_ANSWER`] bytes. A
+//! range waits up to [`RANGE_WAIT`] for its turn. Past a cap a gateway is
+//! told `ResourceExhausted`, which it retries.
 //!
 //! Nothing read from kine is logged: the documents carry plaintext
 //! credentials.
@@ -90,10 +91,20 @@ pub const WATCH_BUFFER: usize = 4;
 /// reading it.
 pub const MAX_RANGE_ANSWER: usize = 64 << 20;
 
-/// Ranges read from kine at once, across every gateway: with
-/// [`MAX_RANGE_ANSWER`], what the front holds of range answers at any time.
-/// A gateway's load reads its pages one after another.
+/// Ranges read from kine at once, across every gateway. A gateway's load
+/// reads its pages one after another. A range holds its place while it is
+/// read from kine and filtered, and gives it back when it returns its
+/// answer: so with [`MAX_RANGE_ANSWER`] this bounds the answers being read,
+/// and each range call may still hold one more answer queued for sending to
+/// its gateway, outside the cap.
 pub const MAX_RANGES: usize = 8;
+
+/// How long a range waits for a place among [`MAX_RANGES`] before it is
+/// refused `ResourceExhausted`. Waiting rather than refusing at once: a
+/// refused page restarts the gateway's whole load after its backoff (1 s
+/// doubling to 60 s, without jitter), so a fleet restarted together would
+/// otherwise retry in lockstep.
+pub const RANGE_WAIT: Duration = Duration::from_secs(10);
 
 /// The largest watch answer the front reads from kine: 64 MiB. kine merges
 /// every event queued for a watch into one answer, and 22 MB has been
@@ -155,6 +166,8 @@ pub struct Front {
     credential_watches: Arc<Mutex<HashMap<Uuid, Arc<Semaphore>>>>,
     /// Places for ranges being read: [`MAX_RANGES`].
     ranges: Arc<Semaphore>,
+    /// How long a range waits for a place: [`RANGE_WAIT`].
+    range_wait: Duration,
     leaks: Arc<LeakLog>,
 }
 
@@ -171,8 +184,17 @@ impl Front {
             watches: Arc::new(Semaphore::new(MAX_WATCHES)),
             credential_watches: Arc::default(),
             ranges: Arc::new(Semaphore::new(MAX_RANGES)),
+            range_wait: RANGE_WAIT,
             leaks: Arc::default(),
         }
+    }
+
+    /// This front, with ranges waiting `wait` for a place instead of
+    /// [`RANGE_WAIT`]: for tests, which cannot wait that long.
+    #[doc(hidden)]
+    pub fn with_range_wait(mut self, wait: Duration) -> Front {
+        self.range_wait = wait;
+        self
     }
 
     /// A place for one more of `caller`'s watch calls, under both caps, or
@@ -279,9 +301,11 @@ impl Kv for Front {
                 "etcdserver: count_only is not served",
             ));
         }
-        let Ok(_reading) = self.ranges.try_acquire() else {
-            tracing::warn!(dp_id = %caller.dp_id,
-                "refused an etcd range: the front reads as many ranges as it may");
+        // The semaphore is never closed: the only failure is the wait.
+        let Ok(Ok(_reading)) = tokio::time::timeout(self.range_wait, self.ranges.acquire()).await
+        else {
+            tracing::warn!(dp_id = %caller.dp_id, wait_ms = self.range_wait.as_millis() as u64,
+                "refused an etcd range: no place among the ranges the front reads at once");
             return Err(Status::resource_exhausted("etcdserver: too many ranges"));
         };
         let mut answer = KvClient::new(self.shared.clone())

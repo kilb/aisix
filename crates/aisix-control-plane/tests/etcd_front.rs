@@ -1935,16 +1935,27 @@ async fn a_page_of_nothing_but_foreign_keys_is_an_error_not_the_end_of_the_load(
     assert_eq!(status.code(), Code::Internal, "{status:?}");
 }
 
-#[tokio::test]
-async fn at_most_eight_ranges_are_read_at_once() {
-    let (endpoint, leaky, env_id) = leaky_kine().await;
-    let Some(t) = Fixture::at(&endpoint, Some(env_id)).await else {
-        return;
-    };
+/// A gateway client of the gateway listener at `addr`.
+async fn gateway_at(addr: SocketAddr, bundle: &Bundle) -> Client {
+    Client::connect(
+        [format!("https://127.0.0.1:{}", addr.port())],
+        Some(gateway_options(bundle)),
+    )
+    .await
+    .expect("connect through the front")
+}
+
+/// [`MAX_RANGES`] ranges through the listener at `addr`, each held at
+/// `leaky` until its gate opens; returns once all have reached it.
+async fn hold_every_range(
+    addr: SocketAddr,
+    bundle: &Bundle,
+    leaky: &LeakyKine,
+) -> Vec<tokio::task::JoinHandle<Result<etcd_client::GetResponse, etcd_client::Error>>> {
     assert_eq!(MAX_RANGES, 8);
     let mut reading = Vec::new();
     for _ in 0..MAX_RANGES {
-        let mut gw = gateway(&t.cp, &t.bundle).await;
+        let mut gw = gateway_at(addr, bundle).await;
         let slow = leaky.slow.clone();
         reading.push(tokio::spawn(async move { gw.get(slow, None).await }));
     }
@@ -1956,16 +1967,85 @@ async fn at_most_eight_ranges_are_read_at_once() {
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+    reading
+}
+
+#[tokio::test]
+async fn a_range_behind_every_place_waits_and_is_served_once_one_frees() {
+    let (endpoint, leaky, env_id) = leaky_kine().await;
+    let Some(t) = Fixture::at(&endpoint, Some(env_id)).await else {
+        return;
+    };
+    let reading = hold_every_range(t.cp.dp_addr(), &t.bundle, &leaky).await;
     let mut gw = gateway(&t.cp, &t.bundle).await;
+    let inside = leaky.inside.clone();
+    let ninth = tokio::spawn(async move { gw.get(inside, None).await });
+    // It waits for a place rather than being refused.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!ninth.is_finished(), "{:?}", ninth.await);
+
+    // One range done is one place free, which the waiting one takes.
+    leaky.gate.add_permits(1);
+    let served = tokio::time::timeout(Duration::from_secs(5), ninth)
+        .await
+        .expect("served within 5 s of a place freeing")
+        .expect("the read task")
+        .expect("served, not refused");
+    assert_eq!(
+        keys_of(served.kvs()),
+        vec![String::from_utf8(leaky.inside.clone()).expect("UTF-8")]
+    );
+    leaky.gate.add_permits(MAX_RANGES);
+    for read in reading {
+        read.await.expect("the read task").expect("a slow range");
+    }
+}
+
+#[tokio::test]
+async fn a_range_that_waits_too_long_for_a_place_is_resource_exhausted() {
+    let (endpoint, leaky, env_id) = leaky_kine().await;
+    let Some(t) = Fixture::at(&endpoint, Some(env_id)).await else {
+        return;
+    };
+    // The control plane's front, but waiting 200 ms instead of 10 s.
+    let wait = Duration::from_millis(200);
+    let front = Front::new(
+        etcd_front::kine_endpoint(&endpoint).expect("kine's endpoint"),
+        t.cp.state().creds.clone(),
+        t.cp.env().clone(),
+    )
+    .with_range_wait(wait);
+    let tls = listener::server_tls(&t.cp.state().pki, &["localhost".to_string()], true)
+        .expect("the listener's TLS");
+    let tcp = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = tcp.local_addr().expect("an address");
+    let (_stop, stopped) = tokio::sync::watch::channel(false);
+    tokio::spawn(listener::serve_dp(
+        tcp,
+        tls,
+        aisix_control_plane::http::dp_router(t.cp.state().clone()),
+        Some(etcd_front::routes(front)),
+        ConnLimits::default(),
+        stopped,
+    ));
+
+    let reading = hold_every_range(addr, &t.bundle, &leaky).await;
+    let mut gw = gateway_at(addr, &t.bundle).await;
+    let asked = tokio::time::Instant::now();
     let status = status_of(gw.get(leaky.inside.clone(), None).await);
+    let waited = asked.elapsed();
     assert_eq!(status.code(), Code::ResourceExhausted, "{status:?}");
     assert_eq!(status.message(), "etcdserver: too many ranges");
+    assert!(
+        waited >= wait && waited < Duration::from_secs(5),
+        "refused after {waited:?}, not after the {wait:?} wait"
+    );
 
     leaky.gate.add_permits(MAX_RANGES);
     for read in reading {
-        read.await
-            .expect("the read task")
-            .expect("a slow range, once kine answers");
+        read.await.expect("the read task").expect("a slow range");
     }
     gw.get(leaky.inside.clone(), None)
         .await
