@@ -228,6 +228,25 @@ impl TestCp {
         Self::start_with(|cfg| cfg.kine_endpoint = endpoint).await
     }
 
+    /// [`TestCp::start_with`], with the `seed` statements run on the fresh
+    /// database before the control plane first boots on it.
+    pub async fn start_seeded(
+        configure: impl FnOnce(&mut CpConfig),
+        seed: &[String],
+    ) -> Option<TestCp> {
+        let database = new_database().await?;
+        let mut conn = PgConnection::connect(&database.url)
+            .await
+            .expect("connect to the test database");
+        for sql in seed {
+            execute(&mut conn, sql).await;
+        }
+        let _ = conn.close().await;
+        let mut cfg = test_config(&database.url);
+        configure(&mut cfg);
+        Some(Self::boot(database, cfg).await)
+    }
+
     async fn boot(database: Arc<TestDatabase>, cfg: CpConfig) -> TestCp {
         let running = aisix_control_plane::start(cfg, std::future::pending())
             .await

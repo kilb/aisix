@@ -99,6 +99,8 @@ where
     )
     .await?;
     let env = settings::ensure_env(&db, cfg.env_id_seed, &cfg.etcd_prefix).await?;
+    // The id this database claims its environment's kine prefix under.
+    projector::ensure_database_id(&db).await?;
     let pki = Arc::new(Pki::load_or_init(&db, &cfg.master_key, &env).await?);
     let passwords = PasswordGate::new(ARGON2_GATE_PERMITS)?;
     // Connects on first use: a kine that is down at boot only delays the

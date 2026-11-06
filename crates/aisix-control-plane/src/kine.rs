@@ -15,6 +15,7 @@
 //! arrives late, after its caller gave up on it, changes nothing that moved
 //! on since.
 
+use std::fmt;
 use std::future::Future;
 use std::time::Duration;
 
@@ -42,20 +43,46 @@ const PAGE_SIZE: i64 = 500;
 const MAX_DECODING_MESSAGE_SIZE: usize = i32::MAX as usize;
 
 /// A key's value and the revision it was last written at.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct KeyValue {
     pub value: Vec<u8>,
     pub mod_revision: i64,
 }
 
+/// The value's length only: a projected value holds plaintext credentials.
+impl fmt::Debug for KeyValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("KeyValue")
+            .field("value", &format_args!("<{} bytes>", self.value.len()))
+            .field("mod_revision", &self.mod_revision)
+            .finish()
+    }
+}
+
 /// What a compare-and-swap write did.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum WriteOutcome {
     /// Written at `revision`, which for a put is the key's new mod revision.
     Applied { revision: i64 },
     /// The key was not at the expected revision: `current` is what it holds
     /// now (`None` when it does not exist).
     Conflict { current: Option<KeyValue> },
+}
+
+/// As [`KeyValue`]'s: never the value's bytes.
+impl fmt::Debug for WriteOutcome {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            WriteOutcome::Applied { revision } => f
+                .debug_struct("Applied")
+                .field("revision", revision)
+                .finish(),
+            WriteOutcome::Conflict { current } => f
+                .debug_struct("Conflict")
+                .field("current", current)
+                .finish(),
+        }
+    }
 }
 
 /// A call to kine that failed. Never carries a value: kine's own messages
@@ -100,8 +127,9 @@ pub trait KineWriter: Send + Sync {
     async fn get(&self, key: &str) -> Result<Option<KeyValue>, KineError>;
     /// Every key under `prefix`, read in pages the way the gateway reads
     /// them, all pinned to the first page's revision, so the list is one
-    /// moment's state.
-    async fn list(&self, prefix: &str) -> Result<Vec<(String, KeyValue)>, KineError>;
+    /// moment's state. Keys are the bytes kine holds: one that is not
+    /// UTF-8 is still listed, and cannot be mistaken for another.
+    async fn list(&self, prefix: &str) -> Result<Vec<(Vec<u8>, KeyValue)>, KineError>;
 }
 
 /// kine, over its etcd API.
@@ -238,7 +266,7 @@ impl KineWriter for KineClient {
         Ok(resp.kvs().first().map(key_value))
     }
 
-    async fn list(&self, prefix: &str) -> Result<Vec<(String, KeyValue)>, KineError> {
+    async fn list(&self, prefix: &str) -> Result<Vec<(Vec<u8>, KeyValue)>, KineError> {
         let range_end = prefix_range_end(prefix.as_bytes());
         let mut start = prefix.as_bytes().to_vec();
         let mut revision = 0;
@@ -254,14 +282,11 @@ impl KineWriter for KineClient {
             if revision == 0 {
                 revision = resp.header().map_or(0, |h| h.revision());
             }
-            out.extend(resp.kvs().iter().map(|kv| {
-                // Keys this control plane writes are UTF-8; another key is
-                // still listed, under a name that matches no row.
-                (
-                    String::from_utf8_lossy(kv.key()).into_owned(),
-                    key_value(kv),
-                )
-            }));
+            out.extend(
+                resp.kvs()
+                    .iter()
+                    .map(|kv| (kv.key().to_vec(), key_value(kv))),
+            );
             match (resp.more(), resp.kvs().last()) {
                 (true, Some(last)) => {
                     start = last.key().to_vec();
@@ -275,7 +300,24 @@ impl KineWriter for KineClient {
 
 #[cfg(test)]
 mod tests {
-    use super::prefix_range_end;
+    use super::{prefix_range_end, KeyValue, WriteOutcome};
+
+    #[test]
+    fn a_value_is_never_shown_only_its_length() {
+        let kv = KeyValue {
+            value: b"sk-shown-7c1".to_vec(),
+            mod_revision: 4,
+        };
+        let conflict = WriteOutcome::Conflict {
+            current: Some(kv.clone()),
+        };
+        for shown in [format!("{kv:?}"), format!("{conflict:?}")] {
+            assert!(!shown.contains("sk-shown-7c1"), "{shown}");
+            // Nor the bytes as numbers (`115, 107, ...`).
+            assert!(!shown.contains("115"), "{shown}");
+            assert!(shown.contains("<12 bytes>"), "{shown}");
+        }
+    }
 
     #[test]
     fn a_prefix_range_ends_just_past_its_last_key() {

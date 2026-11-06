@@ -4,16 +4,17 @@
 //! an admin's say-so.
 //!
 //! Most cases run against the real test kine (`CP_TEST_KINE_ENDPOINT`):
-//! every control plane mints a fresh `env_id`, so its prefix is its own. Two
-//! cases need a kine that fails on cue, which real kine cannot stage; they
-//! use [`MemKine`]. Kine is read back with `etcd_client` directly, not with
-//! the control plane's own client.
+//! every control plane mints a fresh `env_id`, so its prefix is its own. The
+//! cases that need a kine failing on cue, which real kine cannot stage, use
+//! [`MemKine`]. Kine is read back with `etcd_client` directly, not with the
+//! control plane's own client.
 
 mod support;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -22,10 +23,11 @@ use aisix_control_plane::crypto::MasterKey;
 use aisix_control_plane::db::Db;
 use aisix_control_plane::error::ApiError;
 use aisix_control_plane::kine::{KeyValue, KineClient, KineError, KineWriter, WriteOutcome};
-use aisix_control_plane::projector::{self, key_for, PROJECTOR_LOCK_KEY};
+use aisix_control_plane::projector::{self, claim_key, key_for, Timing, PROJECTOR_LOCK_KEY};
 use aisix_control_plane::resources::write::{write_resource, ResourceWrite, WriteCtx, WriteOp};
 use aisix_control_plane::resources::Kind;
 use aisix_control_plane::settings::EnvSettings;
+use aisix_etcd::{build_snapshot, PrefixSet, RawEntry, WatchedPrefix};
 use async_trait::async_trait;
 use etcd_client::{Client, Compare, CompareOp, EventType, GetOptions, Txn, TxnOp, WatchOptions};
 use futures::FutureExt;
@@ -96,9 +98,23 @@ async fn write_all(db: &Db, env: &EnvSettings, writes: Vec<(Kind, Uuid, Op)>) {
 /// Creates a provider key named `name`, in a transaction of its own.
 async fn create_key(db: &Db, env: &EnvSettings, name: &str) -> Uuid {
     let id = Uuid::new_v4();
+    create_key_as(db, env, id, name).await;
+    id
+}
+
+/// [`create_key`], with the id given.
+async fn create_key_as(db: &Db, env: &EnvSettings, id: Uuid, name: &str) {
     let doc = provider_key(name, SECRET);
     write_all(db, env, vec![(Kind::ProviderKeys, id, Op::Create(doc))]).await;
-    id
+}
+
+/// `n` fresh ids in ascending order, for tests whose write order must
+/// contradict id order: a projector that went by id instead of by write
+/// would then fail them every time, not one run in a few.
+fn ascending_ids(n: usize) -> Vec<Uuid> {
+    let mut ids: Vec<Uuid> = (0..n).map(|_| Uuid::new_v4()).collect();
+    ids.sort();
+    ids
 }
 
 #[derive(Debug)]
@@ -281,7 +297,7 @@ enum Fault {
 
 #[derive(Default)]
 struct Mem {
-    keys: BTreeMap<String, KeyValue>,
+    keys: BTreeMap<Vec<u8>, KeyValue>,
     revision: i64,
     writes: usize,
     fault: Option<(usize, Fault)>,
@@ -310,7 +326,16 @@ impl MemKine {
     }
 
     fn value(&self, key: &str) -> Option<KeyValue> {
+        self.value_at(key.as_bytes())
+    }
+
+    fn value_at(&self, key: &[u8]) -> Option<KeyValue> {
         self.0.lock().expect("lock").keys.get(key).cloned()
+    }
+
+    /// Writes `key` as another writer would, bypassing the log and faults.
+    fn put_raw(&self, key: &[u8], value: &[u8]) {
+        self.0.lock().expect("lock").put(key, value);
     }
 
     fn write(
@@ -343,13 +368,13 @@ impl MemKine {
 }
 
 impl Mem {
-    fn put(&mut self, key: &str, value: &[u8]) -> WriteOutcome {
+    fn put(&mut self, key: &[u8], value: &[u8]) -> WriteOutcome {
         self.revision += 1;
         let kv = KeyValue {
             value: value.to_vec(),
             mod_revision: self.revision,
         };
-        self.keys.insert(key.to_string(), kv);
+        self.keys.insert(key.to_vec(), kv);
         WriteOutcome::Applied {
             revision: self.revision,
         }
@@ -359,9 +384,10 @@ impl Mem {
 #[async_trait]
 impl KineWriter for MemKine {
     async fn create(&self, key: &str, value: &[u8]) -> Result<WriteOutcome, KineError> {
-        self.write("create", key, |m| match m.keys.get(key).cloned() {
+        let key_bytes = key.as_bytes();
+        self.write("create", key, |m| match m.keys.get(key_bytes).cloned() {
             Some(kv) => WriteOutcome::Conflict { current: Some(kv) },
-            None => m.put(key, value),
+            None => m.put(key_bytes, value),
         })
     }
 
@@ -371,8 +397,9 @@ impl KineWriter for MemKine {
         expected_mod_revision: i64,
         value: &[u8],
     ) -> Result<WriteOutcome, KineError> {
-        self.write("update", key, |m| match m.keys.get(key).cloned() {
-            Some(kv) if kv.mod_revision == expected_mod_revision => m.put(key, value),
+        let key_bytes = key.as_bytes();
+        self.write("update", key, |m| match m.keys.get(key_bytes).cloned() {
+            Some(kv) if kv.mod_revision == expected_mod_revision => m.put(key_bytes, value),
             current => WriteOutcome::Conflict { current },
         })
     }
@@ -382,9 +409,10 @@ impl KineWriter for MemKine {
         key: &str,
         expected_mod_revision: i64,
     ) -> Result<WriteOutcome, KineError> {
-        self.write("delete", key, |m| match m.keys.get(key).cloned() {
+        let key_bytes = key.as_bytes();
+        self.write("delete", key, |m| match m.keys.get(key_bytes).cloned() {
             Some(kv) if kv.mod_revision == expected_mod_revision => {
-                m.keys.remove(key);
+                m.keys.remove(key_bytes);
                 m.revision += 1;
                 WriteOutcome::Applied {
                     revision: m.revision,
@@ -398,11 +426,11 @@ impl KineWriter for MemKine {
         Ok(self.value(key))
     }
 
-    async fn list(&self, prefix: &str) -> Result<Vec<(String, KeyValue)>, KineError> {
+    async fn list(&self, prefix: &str) -> Result<Vec<(Vec<u8>, KeyValue)>, KineError> {
         let m = self.0.lock().expect("lock");
         Ok(m.keys
             .iter()
-            .filter(|(k, _)| k.starts_with(prefix))
+            .filter(|(k, _)| k.starts_with(prefix.as_bytes()))
             .map(|(k, kv)| (k.clone(), kv.clone()))
             .collect())
     }
@@ -414,9 +442,11 @@ async fn a_failure_does_not_skip_ahead() {
         return;
     };
     let (db, env) = (&bare.db, &bare.env);
-    let mut ids = Vec::new();
-    for name in ["a", "b", "c"] {
-        ids.push(create_key(db, env, &unique(name)).await);
+    // Written a, b, c, with ids in the opposite order.
+    let mut ids = ascending_ids(3);
+    ids.reverse();
+    for (id, name) in ids.iter().zip(["a", "b", "c"]) {
+        create_key_as(db, env, *id, &unique(name)).await;
     }
     let keys: Vec<String> = ids
         .iter()
@@ -629,10 +659,12 @@ async fn rows_are_projected_in_write_order() {
     };
     let kine = raw_kine(&support::kine_endpoint().expect("kine is configured")).await;
     let (db, env) = (cp.db(), cp.env());
-    let (a, b, c) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    let ids = ascending_ids(3);
+    let (a, b, c) = (ids[0], ids[1], ids[2]);
     let a_name = unique("a");
     // One transaction, so the projector finds all of it dirty at once: `a`
-    // was created first and rewritten last, so it is written last.
+    // was created first and rewritten last, so it is written last, though
+    // its id is the smallest.
     write_all(
         db,
         env,
@@ -679,14 +711,15 @@ async fn rows_are_projected_in_write_order() {
     assert!(b_seq < a_seq, "the rewrite of a took a later seq");
 }
 
-/// A kine process of the test's own, on its own database, that the test can
-/// stop and start again.
+/// kine processes of the test's own, all on one database of their own (as
+/// two control-plane hosts would run them), that the test can stop and
+/// start again.
 struct PrivateKine {
     bin: String,
     server_url: String,
     database: String,
-    port: u16,
-    child: Option<tokio::process::Child>,
+    /// Each process's port, and the process while it runs.
+    processes: Vec<(u16, Option<tokio::process::Child>)>,
 }
 
 impl PrivateKine {
@@ -702,26 +735,34 @@ impl PrivateKine {
             .await
             .expect("create kine's database");
         let _ = admin.close().await;
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
-            .and_then(|l| l.local_addr())
-            .expect("a free port")
-            .port();
         let mut kine = PrivateKine {
             bin,
             server_url,
             database,
-            port,
-            child: None,
+            processes: Vec::new(),
         };
-        kine.resume().await;
+        kine.add().await;
         Some(kine)
     }
 
-    fn endpoint(&self) -> String {
-        format!("http://127.0.0.1:{}", self.port)
+    /// Starts one more process on the same database; its index.
+    async fn add(&mut self) -> usize {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|l| l.local_addr())
+            .expect("a free port")
+            .port();
+        self.processes.push((port, None));
+        let i = self.processes.len() - 1;
+        self.resume(i).await;
+        i
     }
 
-    async fn resume(&mut self) {
+    fn endpoint(&self, i: usize) -> String {
+        format!("http://127.0.0.1:{}", self.processes[i].0)
+    }
+
+    async fn resume(&mut self, i: usize) {
+        let port = self.processes[i].0;
         let mut datastore = reqwest::Url::parse(&self.server_url).expect("a URL");
         datastore.set_path(&format!("/{}", self.database));
         datastore.set_query(Some("sslmode=disable"));
@@ -730,7 +771,7 @@ impl PrivateKine {
                 "--endpoint",
                 datastore.as_str(),
                 "--listen-address",
-                &format!("127.0.0.1:{}", self.port),
+                &format!("127.0.0.1:{port}"),
                 "--metrics-bind-address",
                 "0",
             ])
@@ -739,8 +780,7 @@ impl PrivateKine {
             .kill_on_drop(true)
             .spawn()
             .expect("start kine");
-        self.child = Some(child);
-        let port = self.port;
+        self.processes[i].1 = Some(child);
         eventually("kine to listen", PATIENCE, || async move {
             tokio::net::TcpStream::connect(("127.0.0.1", port))
                 .await
@@ -749,8 +789,8 @@ impl PrivateKine {
         .await;
     }
 
-    async fn stop(&mut self) {
-        if let Some(mut child) = self.child.take() {
+    async fn stop(&mut self, i: usize) {
+        if let Some(mut child) = self.processes[i].1.take() {
             child.kill().await.expect("stop kine");
         }
     }
@@ -758,8 +798,10 @@ impl PrivateKine {
 
 impl Drop for PrivateKine {
     fn drop(&mut self) {
-        if let Some(child) = &mut self.child {
-            let _ = child.start_kill();
+        for (_, child) in &mut self.processes {
+            if let Some(child) = child {
+                let _ = child.start_kill();
+            }
         }
         let server_url = self.server_url.clone();
         let sql = format!("DROP DATABASE IF EXISTS \"{}\" WITH (FORCE)", self.database);
@@ -788,24 +830,31 @@ async fn writes_made_while_kine_is_down_land_in_order_when_it_returns() {
     let Some(mut private) = PrivateKine::start().await else {
         return;
     };
-    let endpoint = private.endpoint();
+    let endpoint = private.endpoint(0);
     let Some(cp) = TestCp::start_with(|cfg| cfg.kine_endpoint = endpoint.clone()).await else {
         return;
     };
     let (db, env) = (cp.db(), cp.env());
+    // Landing b, c, a: against the order of their ids.
+    let ids = ascending_ids(3);
+    let (a, b, c) = (ids[0], ids[1], ids[2]);
     let a_name = unique("a");
-    let a = create_key(db, env, &a_name).await;
+    create_key_as(db, env, a, &a_name).await;
     all_projected(db).await;
 
-    private.stop().await;
-    let b = create_key(db, env, &unique("b")).await;
-    let c = create_key(db, env, &unique("c")).await;
+    private.stop(0).await;
+    create_key_as(db, env, b, &unique("b")).await;
+    create_key_as(db, env, c, &unique("c")).await;
     let doc = provider_key(&a_name, ROTATED);
     write_all(db, env, vec![(Kind::ProviderKeys, a, Op::Replace(doc))]).await;
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    // The stall names kine, not the row it happened to be at.
+    eventually("the stall to be reported", PATIENCE, || async move {
+        setting(db, "projection_stalled").await == Some(json!({"error": "kine unavailable"}))
+    })
+    .await;
     assert_eq!(dirty_rows(db).await, 3, "nothing lands while kine is down");
 
-    private.resume().await;
+    private.resume(0).await;
     all_projected(db).await;
     let kine = raw_kine(&endpoint).await;
     let mut revisions = Vec::new();
@@ -869,7 +918,7 @@ impl KineWriter for Recorder {
         self.inner.get(key).await
     }
 
-    async fn list(&self, prefix: &str) -> Result<Vec<(String, KeyValue)>, KineError> {
+    async fn list(&self, prefix: &str) -> Result<Vec<(Vec<u8>, KeyValue)>, KineError> {
         self.inner.list(prefix).await
     }
 }
@@ -881,20 +930,35 @@ async fn spawn_recorded(
     endpoint: &str,
     log: &Arc<Mutex<Vec<Write>>>,
 ) -> (oneshot::Sender<()>, JoinHandle<()>) {
+    spawn_recorded_with(by, bare, endpoint, log, Timing::default()).await
+}
+
+/// [`spawn_recorded`], at the given timing.
+async fn spawn_recorded_with(
+    by: &'static str,
+    bare: &BareDatabase,
+    endpoint: &str,
+    log: &Arc<Mutex<Vec<Write>>>,
+    timing: Timing,
+) -> (oneshot::Sender<()>, JoinHandle<()>) {
     let kine = Recorder {
         by,
         inner: KineClient::connect(endpoint).await.expect("a kine client"),
         log: log.clone(),
     };
+    spawn_on(bare, Arc::new(kine), timing)
+}
+
+/// A projector on `bare` writing through `kine`; stopped by the sender.
+fn spawn_on(
+    bare: &BareDatabase,
+    kine: Arc<dyn KineWriter>,
+    timing: Timing,
+) -> (oneshot::Sender<()>, JoinHandle<()>) {
     let (stop, stopped) = oneshot::channel::<()>();
-    let task = projector::spawn(
-        bare.db.clone(),
-        Arc::new(kine),
-        ctx(&bare.env),
-        async move {
-            let _ = stopped.await;
-        },
-    );
+    let task = projector::spawn_with(bare.db.clone(), kine, ctx(&bare.env), timing, async move {
+        let _ = stopped.await;
+    });
     (stop, task)
 }
 
@@ -1057,6 +1121,55 @@ async fn reconcile_removes_a_few_strays_and_leaves_other_prefixes_alone() {
         setting(cp.db(), "reconcile_blocked").await,
         Some(json!(false))
     );
+    // What was about to be deleted was audited before the answer was.
+    let audit = reconcile_audit(cp.db()).await;
+    let actions: Vec<&str> = audit.iter().map(|(a, _, _)| a.as_str()).collect();
+    assert_eq!(actions, ["rollout.reconcile.planned", "rollout.reconcile"]);
+    let mut planned = strays.to_vec();
+    planned.sort();
+    assert_eq!(audit[0].2, json!({"allow_deletes": false, "keys": planned}));
+    assert_eq!(audit[0].1.as_deref(), Some(admin.email.as_str()));
+}
+
+/// The `rollout.reconcile*` audit rows, oldest first: `(action, actor
+/// email, detail)`.
+async fn reconcile_audit(db: &Db) -> Vec<(String, Option<String>, Value)> {
+    sqlx::query_as(
+        "SELECT action, actor_email, detail FROM audit_log \
+         WHERE starts_with(action, 'rollout.reconcile') ORDER BY id",
+    )
+    .fetch_all(db.pool())
+    .await
+    .expect("read the audit log")
+}
+
+/// What a backup of `cp`'s database taken before any resource was written
+/// holds: its database id and environment.
+async fn backup_of(cp: &TestCp) -> (String, Uuid) {
+    let database_id = setting(cp.db(), "database_id")
+        .await
+        .expect("a database id")
+        .as_str()
+        .expect("a string")
+        .to_string();
+    (database_id, cp.env().env_id)
+}
+
+/// A control plane on that backup, restored: the same database id and
+/// environment, none of the rows.
+async fn restored_copy((database_id, env_id): (String, Uuid), kine_endpoint: &str) -> TestCp {
+    let endpoint = kine_endpoint.to_string();
+    TestCp::start_seeded(
+        move |cfg| {
+            cfg.kine_endpoint = endpoint;
+            cfg.env_id_seed = Some(env_id);
+        },
+        &[format!(
+            "INSERT INTO cp_settings (key, value) VALUES ('database_id', to_jsonb('{database_id}'::text))"
+        )],
+    )
+    .await
+    .expect("the restored copy boots")
 }
 
 #[tokio::test]
@@ -1175,15 +1288,12 @@ async fn reconcile_on_an_empty_database_deletes_nothing_until_an_admin_allows_it
     all_projected(first.db()).await;
     let prefix = env.env_prefix();
     assert_eq!(raw_keys(&kine, &prefix).await.len(), 20);
-    drop(first);
 
-    // The same environment, on a database that holds none of it.
-    let second = TestCp::start_with(|cfg| {
-        cfg.kine_endpoint = endpoint.clone();
-        cfg.env_id_seed = Some(env.env_id);
-    })
-    .await
-    .expect("the second control plane boots");
+    // The same database as it was before any of it was written, restored
+    // from a backup, in place of the original.
+    let backup = backup_of(&first).await;
+    drop(first);
+    let second = restored_copy(backup, &endpoint).await;
     assert_eq!(second.env().env_id, env.env_id);
     let db = second.db();
     eventually("reconcile to be blocked", PATIENCE, || async move {
@@ -1198,16 +1308,16 @@ async fn reconcile_on_an_empty_database_deletes_nothing_until_an_admin_allows_it
     assert_eq!(r.body, json!({"deleted_strays": 20, "marked_dirty": 0}));
     assert!(raw_keys(&kine, &prefix).await.is_empty());
     assert_eq!(setting(db, "reconcile_blocked").await, Some(json!(false)));
-    let audit: Vec<(String, Option<String>, Value)> = sqlx::query_as(
-        "SELECT action, actor_email, detail FROM audit_log WHERE action = 'rollout.reconcile'",
-    )
-    .fetch_all(db.pool())
-    .await
-    .expect("read the audit log");
-    assert_eq!(audit.len(), 1, "{audit:?}");
-    assert_eq!(audit[0].1.as_deref(), Some(admin.email.as_str()));
+    let audit = reconcile_audit(db).await;
+    assert_eq!(audit.len(), 2, "{audit:?}");
+    assert_eq!(audit[0].0, "rollout.reconcile.planned");
+    assert_eq!(audit[0].2["keys"].as_array().map(Vec::len), Some(20));
+    assert_eq!(audit[1].0, "rollout.reconcile");
+    for (_, email, _) in &audit {
+        assert_eq!(email.as_deref(), Some(admin.email.as_str()));
+    }
     assert_eq!(
-        audit[0].2,
+        audit[1].2,
         json!({"allow_deletes": true, "deleted_strays": 20, "marked_dirty": 0})
     );
 }
@@ -1349,16 +1459,12 @@ async fn reconcile_on_an_empty_database_keeps_even_a_few_strays() {
         create_key(first.db(), &env, &unique("acct")).await;
     }
     all_projected(first.db()).await;
-    drop(first);
 
     // Three strays are few, but a database without a single live row is
     // not one to delete by.
-    let second = TestCp::start_with(|cfg| {
-        cfg.kine_endpoint = endpoint.clone();
-        cfg.env_id_seed = Some(env.env_id);
-    })
-    .await
-    .expect("the second control plane boots");
+    let backup = backup_of(&first).await;
+    drop(first);
+    let second = restored_copy(backup, &endpoint).await;
     let db = second.db();
     eventually("reconcile to be blocked", PATIENCE, || async move {
         setting(db, "reconcile_blocked").await == Some(json!(true))
@@ -1441,4 +1547,548 @@ async fn an_instance_that_cannot_reach_kine_leaves_the_lock_to_one_that_can() {
         let _ = stop.send(());
         task.await.expect("a projector stops");
     }
+}
+
+// ---- fix round 1 -----------------------------------------------------------
+
+/// A second projector taking over in the middle of a row, as the leader
+/// sees it: the first update it is armed for ends the leader's session,
+/// writes a newer value to the key the way the new leader would, and answers
+/// with the conflict that write causes.
+struct Deposer {
+    inner: KineClient,
+    db: Db,
+    armed: AtomicBool,
+    /// Every call but `get`: the operation and its key (the prefix, for a
+    /// list).
+    ops: Mutex<Vec<(&'static str, String)>>,
+}
+
+impl Deposer {
+    fn note(&self, op: &'static str, key: &str) {
+        self.ops.lock().expect("lock").push((op, key.to_string()));
+    }
+
+    fn ops(&self) -> Vec<(&'static str, String)> {
+        self.ops.lock().expect("lock").clone()
+    }
+}
+
+#[async_trait]
+impl KineWriter for Deposer {
+    async fn create(&self, key: &str, value: &[u8]) -> Result<WriteOutcome, KineError> {
+        self.note("create", key);
+        self.inner.create(key, value).await
+    }
+
+    async fn update(&self, key: &str, rev: i64, value: &[u8]) -> Result<WriteOutcome, KineError> {
+        if !self.armed.swap(false, Ordering::SeqCst) {
+            self.note("update", key);
+            return self.inner.update(key, rev, value).await;
+        }
+        let holders = lock_holders(&self.db).await;
+        assert_eq!(holders.len(), 1, "{holders:?}");
+        let pid = holders[0];
+        let pool = self.db.pool();
+        sqlx::query("SELECT pg_terminate_backend($1)")
+            .bind(pid)
+            .execute(pool)
+            .await
+            .expect("end the leader's session");
+        eventually("the leader's session to end", PATIENCE, || async move {
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM pg_stat_activity WHERE pid = $1")
+                .bind(pid)
+                .fetch_one(pool)
+                .await
+                .is_ok_and(|n| n == 0)
+        })
+        .await;
+        let current = self.inner.get(key).await?.expect("the key is projected");
+        let newer = br#"{"display_name":"newer-leader-7c1"}"#;
+        let WriteOutcome::Applied { revision } =
+            self.inner.update(key, current.mod_revision, newer).await?
+        else {
+            panic!("the new leader's write lands");
+        };
+        self.note("update:conflict", key);
+        Ok(WriteOutcome::Conflict {
+            current: Some(KeyValue {
+                value: newer.to_vec(),
+                mod_revision: revision,
+            }),
+        })
+    }
+
+    async fn delete(&self, key: &str, rev: i64) -> Result<WriteOutcome, KineError> {
+        self.note("delete", key);
+        self.inner.delete(key, rev).await
+    }
+
+    async fn get(&self, key: &str) -> Result<Option<KeyValue>, KineError> {
+        self.inner.get(key).await
+    }
+
+    async fn list(&self, prefix: &str) -> Result<Vec<(Vec<u8>, KeyValue)>, KineError> {
+        self.note("list", prefix);
+        self.inner.list(prefix).await
+    }
+}
+
+#[tokio::test]
+async fn a_deposed_leader_writes_nothing_more() {
+    let Some(bare) = BareDatabase::new().await else {
+        return;
+    };
+    let Some(endpoint) = support::kine_endpoint() else {
+        return;
+    };
+    let kine = raw_kine(&endpoint).await;
+    let (db, env) = (&bare.db, &bare.env);
+    let deposer = Arc::new(Deposer {
+        inner: KineClient::connect(&endpoint).await.expect("a kine client"),
+        db: db.clone(),
+        armed: AtomicBool::new(false),
+        ops: Mutex::default(),
+    });
+    let (stop, task) = spawn_on(&bare, deposer.clone(), Timing::default());
+    let name = unique("acct");
+    let id = create_key(db, env, &name).await;
+    all_projected(db).await;
+
+    deposer.armed.store(true, Ordering::SeqCst);
+    let doc = provider_key(&name, ROTATED);
+    write_all(db, env, vec![(Kind::ProviderKeys, id, Op::Replace(doc))]).await;
+    all_projected(db).await;
+
+    // After the conflict, the deposed leader wrote nothing: what comes next
+    // is the new tenure, which claims the environment and reconciles.
+    let ops = deposer.ops();
+    let at = ops
+        .iter()
+        .position(|(op, _)| *op == "update:conflict")
+        .expect("the conflict was injected");
+    let claim = claim_key(env);
+    let next = ops[at + 1..]
+        .iter()
+        .find(|(_, key)| *key != claim)
+        .expect("an operation after the conflict");
+    assert_eq!(
+        next,
+        &("list", env.env_prefix()),
+        "after the conflict: {:?}",
+        &ops[at..]
+    );
+    // That tenure, the only leader, then writes the row.
+    let (value, _) = raw_json(&kine, &key_for(env, Kind::ProviderKeys, id))
+        .await
+        .expect("the key is in kine");
+    assert_eq!(value, provider_key(&name, ROTATED));
+    let _ = stop.send(());
+    task.await.expect("the projector stops");
+}
+
+#[tokio::test]
+async fn a_tenure_reconciles_again_on_its_own() {
+    let Some(bare) = BareDatabase::new().await else {
+        return;
+    };
+    let Some(endpoint) = support::kine_endpoint() else {
+        return;
+    };
+    let kine = raw_kine(&endpoint).await;
+    let (db, env) = (&bare.db, &bare.env);
+    let timing = Timing {
+        reconcile_every: Duration::from_secs(1),
+        ..Timing::default()
+    };
+    let log = Arc::new(Mutex::new(Vec::<Write>::new()));
+    let (stop, task) = spawn_recorded_with("a", &bare, &endpoint, &log, timing).await;
+    let name = unique("acct");
+    let id = create_key(db, env, &name).await;
+    all_projected(db).await;
+    let holders = lock_holders(db).await;
+
+    // A write that landed after its session ended, say: no row write, no
+    // request, and the tenure finds it anyway.
+    let key = key_for(env, Kind::ProviderKeys, id);
+    let stray = format!("{}models/{}", env.env_prefix(), Uuid::new_v4());
+    raw_delete(&kine, &key).await;
+    raw_put(&kine, &stray, b"{}").await;
+    eventually("kine to be reconciled", PATIENCE, || {
+        let (kine, key, stray) = (&kine, &key, &stray);
+        async move { raw_get(kine, key).await.is_some() && raw_get(kine, stray).await.is_none() }
+    })
+    .await;
+    assert_eq!(lock_holders(db).await, holders, "one tenure did it all");
+    let audit = reconcile_audit(db).await;
+    assert!(
+        audit
+            .iter()
+            .any(|(action, email, _)| action == "rollout.reconcile.planned" && email.is_none()),
+        "{audit:?}"
+    );
+    let _ = stop.send(());
+    task.await.expect("the projector stops");
+}
+
+#[tokio::test]
+async fn a_leader_whose_kine_stays_down_hands_over() {
+    let Some(mut private) = PrivateKine::start().await else {
+        return;
+    };
+    let other = private.add().await;
+    let Some(bare) = BareDatabase::new().await else {
+        return;
+    };
+    let (db, env) = (&bare.db, &bare.env);
+    let timing = Timing {
+        kine_down_step_down: Duration::from_secs(2),
+        ..Timing::default()
+    };
+    let log = Arc::new(Mutex::new(Vec::<Write>::new()));
+    let began = Instant::now();
+    let a = spawn_recorded_with("a", &bare, &private.endpoint(0), &log, timing).await;
+    // `a` leads once it has claimed the environment.
+    eventually("a to lead", PATIENCE, || {
+        let log = &log;
+        async move { writers_since(log, began).contains("a") }
+    })
+    .await;
+    let b = spawn_recorded_with("b", &bare, &private.endpoint(other), &log, timing).await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(writers_since(&log, began), BTreeSet::from(["a"]));
+
+    // a's kine goes down; b's, on the same database, stays up.
+    private.stop(0).await;
+    let down = Instant::now();
+    let id = create_key(db, env, &unique("acct")).await;
+    all_projected(db).await;
+    let kine = raw_kine(&private.endpoint(other)).await;
+    let key = key_for(env, Kind::ProviderKeys, id);
+    assert!(raw_get(&kine, &key).await.is_some());
+    assert!(writers_since(&log, down).contains("b"), "b took over");
+    for (stop, task) in [a, b] {
+        let _ = stop.send(());
+        task.await.expect("a projector stops");
+    }
+}
+
+/// Holds the update it is armed for until the test lets it through.
+struct Gate {
+    inner: KineClient,
+    armed: Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
+}
+
+#[async_trait]
+impl KineWriter for Gate {
+    async fn create(&self, key: &str, value: &[u8]) -> Result<WriteOutcome, KineError> {
+        self.inner.create(key, value).await
+    }
+
+    async fn update(&self, key: &str, rev: i64, value: &[u8]) -> Result<WriteOutcome, KineError> {
+        let gate = self.armed.lock().expect("lock").take();
+        if let Some((reached, go)) = gate {
+            let _ = reached.send(());
+            let _ = go.await;
+        }
+        self.inner.update(key, rev, value).await
+    }
+
+    async fn delete(&self, key: &str, rev: i64) -> Result<WriteOutcome, KineError> {
+        self.inner.delete(key, rev).await
+    }
+
+    async fn get(&self, key: &str) -> Result<Option<KeyValue>, KineError> {
+        self.inner.get(key).await
+    }
+
+    async fn list(&self, prefix: &str) -> Result<Vec<(Vec<u8>, KeyValue)>, KineError> {
+        self.inner.list(prefix).await
+    }
+}
+
+#[tokio::test]
+async fn a_row_lock_wait_costs_a_pass_not_the_lock() {
+    let Some(bare) = BareDatabase::new().await else {
+        return;
+    };
+    let Some(endpoint) = support::kine_endpoint() else {
+        return;
+    };
+    let (db, env) = (&bare.db, &bare.env);
+    let gate = Arc::new(Gate {
+        inner: KineClient::connect(&endpoint).await.expect("a kine client"),
+        armed: Mutex::new(None),
+    });
+    let (stop, task) = spawn_on(&bare, gate.clone(), Timing::default());
+    let name = unique("acct");
+    let id = create_key(db, env, &name).await;
+    all_projected(db).await;
+    let holders = lock_holders(db).await;
+
+    let (reached, at_update) = oneshot::channel();
+    let (go, wait) = oneshot::channel();
+    *gate.armed.lock().expect("lock") = Some((reached, wait));
+    let doc = provider_key(&name, ROTATED);
+    write_all(db, env, vec![(Kind::ProviderKeys, id, Op::Replace(doc))]).await;
+    at_update.await.expect("the projector reaches the update");
+    // The row is held while the projector records its write, longer than
+    // the session's lock_timeout (5 s).
+    let mut holder = PgConnection::connect(bare.url())
+        .await
+        .expect("a connection of the test's own");
+    sqlx::query("BEGIN")
+        .execute(&mut holder)
+        .await
+        .expect("begin");
+    sqlx::query("SELECT 1 FROM gw_resources WHERE kind = 'provider_keys' AND id = $1 FOR UPDATE")
+        .bind(id)
+        .execute(&mut holder)
+        .await
+        .expect("hold the row");
+    let _ = go.send(());
+    tokio::time::sleep(Duration::from_secs(7)).await;
+    assert_eq!(lock_holders(db).await, holders, "a lock wait cost the lock");
+    sqlx::query("ROLLBACK")
+        .execute(&mut holder)
+        .await
+        .expect("release the row");
+    all_projected(db).await;
+    assert_eq!(lock_holders(db).await, holders);
+    let _ = stop.send(());
+    task.await.expect("the projector stops");
+}
+
+#[tokio::test]
+async fn a_reconcile_request_nobody_waits_for_is_never_run() {
+    let Some(cp) = TestCp::start_with_kine().await else {
+        return;
+    };
+    let kine = raw_kine(&support::kine_endpoint().expect("kine is configured")).await;
+    let admin = cp.admin_login_seeded(OperatorRole::Admin).await;
+    let (db, env) = (cp.db(), cp.env());
+    create_key(db, env, &unique("acct")).await;
+    all_projected(db).await;
+    let stray = format!("{}models/{}", env.env_prefix(), Uuid::new_v4());
+    raw_put(&kine, &stray, b"{}").await;
+
+    // A request as a database restored from backup might hold it: deletes
+    // allowed, asked an hour ago.
+    let request = format!("reconcile_request:{}", Uuid::new_v4());
+    sqlx::query(
+        "INSERT INTO cp_settings (key, value, updated_at) VALUES ($1, $2, now() - interval '1 hour')",
+    )
+    .bind(&request)
+    .bind(json!({"allow_deletes": true, "operator_id": admin.id, "operator_email": admin.email}))
+    .execute(db.pool())
+    .await
+    .expect("store the old request");
+    // A write wakes the leader.
+    create_key(db, env, &unique("wake")).await;
+    eventually("the old request to be dropped", PATIENCE, || {
+        let request = &request;
+        async move { setting(db, request).await.is_none() }
+    })
+    .await;
+    assert!(raw_get(&kine, &stray).await.is_some(), "the request ran");
+    assert!(reconcile_audit(db).await.is_empty());
+}
+
+#[tokio::test]
+async fn a_key_that_is_not_utf8_is_never_deleted() {
+    let Some(bare) = BareDatabase::new().await else {
+        return;
+    };
+    let (db, env) = (&bare.db, &bare.env);
+    let kine = MemKine::default();
+    create_key(db, env, &unique("acct")).await;
+    projector::project_once(db, &kine, &ctx(env))
+        .await
+        .expect("projected");
+    let prefix = env.env_prefix();
+    let mut unreadable = format!("{prefix}models/").into_bytes();
+    unreadable.extend_from_slice(&[0xff, 0xfe]);
+    let stray = format!("{prefix}models/{}", Uuid::new_v4());
+    kine.put_raw(&unreadable, b"{}");
+    kine.put_raw(stray.as_bytes(), b"{}");
+
+    // One readable stray is few, but the unreadable key blocks reconcile.
+    let report = projector::reconcile(db, &kine, &ctx(env), false)
+        .await
+        .expect("reconciled");
+    assert_eq!((report.deleted_strays, report.blocked), (0, true));
+    assert!(kine.value(&stray).is_some());
+    // An admin's go-ahead deletes the readable one only.
+    let report = projector::reconcile(db, &kine, &ctx(env), true)
+        .await
+        .expect("reconciled");
+    assert_eq!((report.deleted_strays, report.blocked), (1, true));
+    assert!(kine.value(&stray).is_none());
+    assert!(kine.value_at(&unreadable).is_some(), "never deleted");
+    assert_eq!(setting(db, "reconcile_blocked").await, Some(json!(true)));
+}
+
+#[tokio::test]
+async fn the_one_off_passes_refuse_while_another_session_leads() {
+    let Some(bare) = BareDatabase::new().await else {
+        return;
+    };
+    let (db, env) = (&bare.db, &bare.env);
+    let kine = MemKine::default();
+    create_key(db, env, &unique("acct")).await;
+    let mut leader = PgConnection::connect(bare.url())
+        .await
+        .expect("a connection of the test's own");
+    sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(PROJECTOR_LOCK_KEY)
+        .execute(&mut leader)
+        .await
+        .expect("take the projector lock");
+    let projected = projector::project_once(db, &kine, &ctx(env)).await;
+    assert!(
+        matches!(projected, Err(projector::ProjectError::NotLeader)),
+        "{projected:?}"
+    );
+    let reconciled = projector::reconcile(db, &kine, &ctx(env), true).await;
+    assert!(
+        matches!(reconciled, Err(projector::ProjectError::NotLeader)),
+        "{reconciled:?}"
+    );
+    assert!(kine.log().is_empty(), "{:?}", kine.log());
+    let _ = leader.close().await;
+    assert_eq!(
+        projector::project_once(db, &kine, &ctx(env))
+            .await
+            .expect("projected once the lock is free"),
+        1
+    );
+}
+
+#[tokio::test]
+async fn one_environment_has_one_owner_across_databases() {
+    let Some(first) = TestCp::start_with_kine().await else {
+        return;
+    };
+    let endpoint = support::kine_endpoint().expect("kine is configured");
+    let kine = raw_kine(&endpoint).await;
+    let env = first.env().clone();
+    let a = create_key(first.db(), &env, &unique("a")).await;
+    all_projected(first.db()).await;
+    let (claim, _) = raw_json(&kine, &claim_key(&env))
+        .await
+        .expect("the first control plane claimed the environment");
+    assert_eq!(
+        claim,
+        json!({"database_id": setting(first.db(), "database_id").await.expect("an id")})
+    );
+
+    // Another database, configured with the same environment.
+    let second = TestCp::start_with(|cfg| {
+        cfg.kine_endpoint = endpoint.clone();
+        cfg.env_id_seed = Some(env.env_id);
+    })
+    .await
+    .expect("the second control plane boots");
+    let db = second.db();
+    eventually(
+        "the second to report it is blocked",
+        PATIENCE,
+        || async move {
+            setting(db, "projection_blocked").await
+                == Some(json!({"reason": "another control plane owns this environment"}))
+        },
+    )
+    .await;
+    let b = create_key(db, &env, &unique("b")).await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(!row_state(db, Kind::ProviderKeys, b).await.projected());
+    assert_eq!(
+        raw_get(&kine, &key_for(&env, Kind::ProviderKeys, b)).await,
+        None
+    );
+    assert!(lock_holders(db).await.is_empty());
+    let admin = second.admin_login_seeded(OperatorRole::Admin).await;
+    assert_eq!(
+        reconcile_api(&second, admin.cookie(), true).await.status,
+        503
+    );
+
+    // The first goes on projecting, and nothing of its was deleted.
+    let c = create_key(first.db(), &env, &unique("c")).await;
+    all_projected(first.db()).await;
+    for id in [a, c] {
+        let key = key_for(&env, Kind::ProviderKeys, id);
+        assert!(raw_get(&kine, &key).await.is_some(), "{key}");
+    }
+}
+
+#[tokio::test]
+async fn a_projected_document_loads_in_the_gateways_own_loader() {
+    let Some(cp) = TestCp::start_with_kine().await else {
+        return;
+    };
+    let kine = raw_kine(&support::kine_endpoint().expect("kine is configured")).await;
+    let op = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let pk_name = unique("acct");
+    let pk = api_create(
+        &cp,
+        op.cookie(),
+        "provider_keys",
+        provider_key(&pk_name, SECRET),
+    )
+    .await;
+    let model_name = unique("chat");
+    let model = api_create(
+        &cp,
+        op.cookie(),
+        "models",
+        json!({
+            "display_name": model_name,
+            "provider": "openai",
+            "model_name": "gpt-4o",
+            "provider_key_id": pk,
+        }),
+    )
+    .await;
+    all_projected(cp.db()).await;
+
+    // What a gateway of this environment reads, through its own loader.
+    let env = cp.env();
+    let resp = kine
+        .kv_client()
+        .get(env.env_prefix(), Some(GetOptions::new().with_prefix()))
+        .await
+        .expect("read the environment's prefix");
+    let entries: Vec<RawEntry> = resp
+        .kvs()
+        .iter()
+        .map(|kv| RawEntry {
+            key: String::from_utf8(kv.key().to_vec()).expect("a UTF-8 key"),
+            value: kv.value().to_vec(),
+            revision: kv.mod_revision(),
+        })
+        .collect();
+    let prefixes = PrefixSet::new(vec![
+        WatchedPrefix::environment(env.env_prefix()),
+        WatchedPrefix::global(env.global_prefix()),
+    ]);
+    let (snapshot, stats) = build_snapshot(&prefixes, &entries);
+    assert_eq!(stats.accepted, 2, "{stats:?}");
+    assert!(stats.rejections.is_empty(), "{stats:?}");
+    assert!(stats.partially_compatible.is_empty(), "{stats:?}");
+    let key = snapshot
+        .provider_keys
+        .get_by_id(&pk.to_string())
+        .expect("the provider key loads");
+    assert_eq!(key.value.display_name, pk_name);
+    assert_eq!(key.value.api_key, SECRET);
+    let loaded = snapshot
+        .models
+        .get_by_id(&model.to_string())
+        .expect("the model loads");
+    assert_eq!(loaded.value.display_name, model_name);
+    assert_eq!(
+        loaded.value.provider_key_id.as_deref(),
+        Some(pk.to_string().as_str())
+    );
 }
