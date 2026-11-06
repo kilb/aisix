@@ -9,7 +9,7 @@
 //! document that skipped it; it is covered all the same, so that no spelling
 //! the gateway accepts is ever stored, shown or logged in plaintext.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::LazyLock;
 
 use aisix_core::credentials::{visit_credentials, CredentialSlot, REDACTED};
@@ -131,6 +131,9 @@ pub fn redact(kind: Kind, doc: &mut Value) {
 /// the address it is reached at, the trust placed in it, the protocol, and
 /// for a custom guardrail the script that holds them. From the
 /// `provider_key`, `guardrail` and `observability_exporter` schemas.
+///
+/// Every kind is named, so a kind added later is a compile error here until
+/// someone decides what its destination is.
 fn destination_fields(kind: Kind) -> &'static [&'static str] {
     match kind {
         Kind::ProviderKeys => &[
@@ -150,8 +153,40 @@ fn destination_fields(kind: Kind) -> &'static [&'static str] {
             "script",
         ],
         Kind::ObservabilityExporters => &["kind", "endpoint"],
-        _ => &[],
+        // No credentials (`Kind::credential_kind` is `None`).
+        Kind::Models
+        | Kind::CachePolicies
+        | Kind::RateLimitPolicies
+        | Kind::GuardrailAttachments
+        | Kind::BudgetPolicy
+        | Kind::Teams
+        | Kind::Users
+        | Kind::ApiKeys
+        | Kind::Budgets => &[],
     }
+}
+
+/// Whether a custom guardrail's script would read different secrets. The
+/// script reads every one of them and can build where it sends one from
+/// another (`${ctx.secrets.SCAN_BASE}/scan?key=${ctx.secrets.SCAN_KEY}`),
+/// so the secrets are each other's destination: a name added or removed,
+/// or any value written instead of the placeholder, moves them all.
+fn rewrote_a_script_input(kind: Kind, incoming: &Value, stored: &Value) -> bool {
+    if kind != Kind::Guardrails || incoming.get("kind").and_then(Value::as_str) != Some("custom") {
+        return false;
+    }
+    let secrets = |doc: &Value| doc.get("secrets").and_then(Value::as_object).cloned();
+    let (incoming, stored) = (
+        secrets(incoming).unwrap_or_default(),
+        secrets(stored).unwrap_or_default(),
+    );
+    let names = |secrets: &serde_json::Map<String, Value>| -> BTreeSet<String> {
+        secrets.keys().cloned().collect()
+    };
+    names(&incoming) != names(&stored)
+        || incoming
+            .values()
+            .any(|value| value.as_str() != Some(REDACTED))
 }
 
 /// Whether `incoming` would send credentials anywhere `stored` does not.
@@ -176,12 +211,14 @@ fn changed_destination(kind: Kind, incoming: &Value, stored: &Value) -> bool {
 ///
 /// Refused, at the slot's label: a placeholder for a slot with nothing
 /// stored; a placeholder in a document whose destination differs from the
-/// stored one ([`destination_fields`]), since a kept secret must never
+/// stored one ([`destination_fields`], and a custom guardrail's other
+/// secrets, [`rewrote_a_script_input`]), since a kept secret must never
 /// follow a new destination, so every secret is entered again then; and a
 /// value shaped like a sealed one, which no client is ever shown and which
 /// would otherwise be stored unsealed.
 pub fn restore(kind: Kind, incoming: &mut Value, stored: &Value) -> Result<(), Detail> {
-    let moved = changed_destination(kind, incoming, stored);
+    let moved = changed_destination(kind, incoming, stored)
+        || rewrote_a_script_input(kind, incoming, stored);
     // Keyed by field key and label: the label keeps apart names that
     // sanitize to one field key (`x-a` and `x_a`). `None` marks a key two
     // stored slots share, which cannot be told apart.
@@ -278,6 +315,20 @@ mod tests {
         assert!(unseal(&KEY, Kind::ProviderKeys, id, &mut moved).is_err());
         let mut other_key = sealed;
         assert!(unseal(&MasterKey([8; 32]), Kind::ProviderKeys, id, &mut other_key).is_err());
+    }
+
+    /// A kind that keeps credentials says where they go, so a kept one can
+    /// be refused when that changes; a kind that keeps none has nothing to
+    /// say.
+    #[test]
+    fn every_kind_with_credentials_names_its_destination() {
+        for kind in Kind::ALL {
+            assert_eq!(
+                kind.credential_kind().is_some(),
+                !destination_fields(kind).is_empty(),
+                "{kind:?}"
+            );
+        }
     }
 
     #[test]
