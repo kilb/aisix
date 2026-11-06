@@ -876,6 +876,8 @@ async fn dispatch(
                 ));
             }
         };
+        // Estimated, if at all, once the stream ends.
+        crate::token_estimate::prepare_for(&upstream_model);
 
         let stream = prepared;
         {

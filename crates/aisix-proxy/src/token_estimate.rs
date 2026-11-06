@@ -38,6 +38,7 @@
 //! tell these numbers from upstream-reported ones.
 
 use serde_json::Value;
+use std::sync::{Once, OnceLock};
 use tiktoken_rs::tokenizer::{get_tokenizer, Tokenizer};
 use tiktoken_rs::CoreBPE;
 
@@ -138,10 +139,10 @@ pub struct Filled {
 
 impl Estimator {
     pub fn new(model: impl Into<String>, input: PromptInput) -> Self {
-        Self {
-            model: model.into(),
-            input,
-        }
+        let model = model.into();
+        // Dispatched now; estimated, if at all, once the response ends.
+        prepare_for(&model);
+        Self { model, input }
     }
 
     /// Count the prompt side of the captured request.
@@ -213,20 +214,127 @@ pub fn fill_missing(
 }
 
 fn bpe_for(model: &str) -> &'static CoreBPE {
-    known_bpe(model).unwrap_or_else(tiktoken_rs::cl100k_base_singleton)
+    table(tokenizer_for(model))
+}
+
+/// The encoding an estimate for `model` counts in: the one tiktoken's model
+/// map names, and cl100k for a model it does not know.
+fn tokenizer_for(model: &str) -> Tokenizer {
+    get_tokenizer(model).unwrap_or(Tokenizer::Cl100kBase)
 }
 
 /// The encoding tiktoken's model map names for `model`, and nothing for a model
 /// it does not know.
 fn known_bpe(model: &str) -> Option<&'static CoreBPE> {
-    Some(match get_tokenizer(model)? {
+    Some(table(get_tokenizer(model)?))
+}
+
+/// The name of the thread an encoding's table is built on.
+const TABLE_BUILD_THREAD: &str = "tokenizer-build";
+
+/// Each encoding's table, once [`start_building`] has built it.
+static TABLES: [OnceLock<&'static CoreBPE>; 6] = [const { OnceLock::new() }; 6];
+static BUILDS: [Once; 6] = [const { Once::new() }; 6];
+
+fn slot(tokenizer: Tokenizer) -> usize {
+    match tokenizer {
+        Tokenizer::O200kHarmony => 0,
+        Tokenizer::O200kBase => 1,
+        Tokenizer::P50kBase => 2,
+        Tokenizer::P50kEdit => 3,
+        Tokenizer::R50kBase | Tokenizer::Gpt2 => 4,
+        Tokenizer::Cl100kBase => 5,
+    }
+}
+
+/// The table for `tokenizer`. Building one takes long enough to stall every
+/// connection a runtime worker serves, so a table is only ever built on a
+/// thread of its own, the first time an estimate needs it: a caller that finds
+/// it missing starts that build and waits for it, as does any caller while it
+/// runs. Each table stays resident once built (o200k is about 47 MB, cl100k
+/// about 25 MB), which is why none is built before something needs it.
+fn table(tokenizer: Tokenizer) -> &'static CoreBPE {
+    let cell = &TABLES[slot(tokenizer)];
+    if let Some(bpe) = cell.get() {
+        return bpe;
+    }
+    start_building(tokenizer);
+    cell.wait()
+}
+
+fn start_building(tokenizer: Tokenizer) {
+    let cell = &TABLES[slot(tokenizer)];
+    BUILDS[slot(tokenizer)].call_once(|| {
+        let spawned = std::thread::Builder::new()
+            .name(TABLE_BUILD_THREAD.to_string())
+            .spawn(move || {
+                let _ = cell.set(build_table(tokenizer));
+            });
+        // No thread to spare: build here rather than not at all.
+        if spawned.is_err() {
+            let _ = cell.set(build_table(tokenizer));
+        }
+    });
+}
+
+fn build_table(tokenizer: Tokenizer) -> &'static CoreBPE {
+    #[cfg(test)]
+    note_table_build(tokenizer);
+    match tokenizer {
         Tokenizer::O200kHarmony => tiktoken_rs::o200k_harmony_singleton(),
         Tokenizer::O200kBase => tiktoken_rs::o200k_base_singleton(),
         Tokenizer::P50kBase => tiktoken_rs::p50k_base_singleton(),
         Tokenizer::P50kEdit => tiktoken_rs::p50k_edit_singleton(),
         Tokenizer::R50kBase | Tokenizer::Gpt2 => tiktoken_rs::r50k_base_singleton(),
         Tokenizer::Cl100kBase => tiktoken_rs::cl100k_base_singleton(),
-    })
+    }
+}
+
+/// Start building the table estimates for `model` count in, if nothing has, and
+/// return at once. Called when a request that may be estimated is dispatched,
+/// so the build runs while the upstream answers rather than when the response
+/// ends, and noted on the request, whose close must not wait for it
+/// ([`TableNeed`]).
+pub(crate) fn prepare_for(model: &str) {
+    let tokenizer = tokenizer_for(model);
+    start_building(tokenizer);
+    crate::attribution::note_table_need(TableNeed(slot(tokenizer)));
+}
+
+/// An encoding a request may estimate in. While its table is still being built,
+/// an estimate waits for it, which a response closing must not do on a runtime
+/// worker.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TableNeed(usize);
+
+impl TableNeed {
+    pub(crate) fn ready(self) -> bool {
+        TABLES[self.0].get().is_some()
+    }
+}
+
+/// The threads tables were built on, for the test that none is a runtime's.
+#[cfg(test)]
+static TABLE_BUILDS: std::sync::Mutex<Vec<(usize, Option<String>)>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn note_table_build(tokenizer: Tokenizer) {
+    let thread = std::thread::current().name().map(str::to_owned);
+    if let Ok(mut builds) = TABLE_BUILDS.lock() {
+        builds.push((slot(tokenizer), thread));
+    }
+}
+
+/// The name of the thread `tokenizer`'s table was built on, if it was built.
+#[cfg(test)]
+pub(crate) fn table_built_on(tokenizer: Tokenizer) -> Option<Option<String>> {
+    TABLE_BUILDS
+        .lock()
+        .ok()?
+        .iter()
+        .find(|(built, _)| *built == slot(tokenizer))
+        .map(|(_, thread)| thread.clone())
 }
 
 /// The token-id arrays a `prompt` or `input` value holds: `[1, 2]` is one and

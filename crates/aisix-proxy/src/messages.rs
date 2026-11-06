@@ -6096,6 +6096,39 @@ mod stream_failure_tests {
         assert_eq!(failure.error_class, "upstream_in_band");
     }
 
+    /// The usage a dropped stream settles is estimated without building a
+    /// tokenizer table on the runtime: building one takes long enough to stall
+    /// every connection the worker serves, and to hold the response's close.
+    #[tokio::test]
+    async fn a_dropped_stream_builds_no_tokenizer_table_on_the_runtime() {
+        use tiktoken_rs::tokenizer::Tokenizer;
+        // An encoding nothing else here estimates in, so this drop is what
+        // asks for its table.
+        let estimator = crate::token_estimate::Estimator::new(
+            "text-davinci-edit-001",
+            crate::token_estimate::PromptInput::Anthropic(serde_json::json!({
+                "messages": [{"role": "user", "content": "a prompt of several words"}],
+            })),
+        );
+        let settled = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let settled_out = std::sync::Arc::clone(&settled);
+        drop(AnthropicStreamGuard {
+            slot: Some((
+                move |usage: AnthropicStreamUsage| {
+                    *settled_out.lock().unwrap() = Some(usage.prompt_tokens)
+                },
+                AnthropicStreamUsage::default(),
+            )),
+            delivered: std::sync::Arc::new(AtomicU32::new(0)),
+            estimator: Some(estimator),
+        });
+        assert!(settled.lock().unwrap().is_some_and(|prompt| prompt > 0));
+        assert_eq!(
+            crate::token_estimate::table_built_on(Tokenizer::P50kEdit),
+            Some(Some("tokenizer-build".to_string())),
+        );
+    }
+
     /// A streamed reasoning count past `u32` saturates like every counter beside
     /// it, rather than wrapping to a small plausible one.
     #[test]

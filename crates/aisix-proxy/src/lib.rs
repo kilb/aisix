@@ -785,8 +785,8 @@ fn hold_until_body_done(
     let (parts, body) = response.into_parts();
     let body = axum::body::Body::new(TelemetryBody {
         inner: Some(body),
-        _drain: drain,
-        guard,
+        drain: Some(drain),
+        guard: Some(guard),
     });
     Response::from_parts(parts, body)
 }
@@ -804,24 +804,44 @@ fn hold_until_body_done(
 /// even one that returns `Pending`, means the generator exists and owns the
 /// emission; no poll means the guard does.
 struct TelemetryBody {
-    /// `None` only inside [`Drop`], which takes the body out to drop it
-    /// inside the request's attribution scope.
+    /// The three are `None` only inside [`Drop`], which takes them out to
+    /// drop them in order, the body inside the request's attribution scope.
     inner: Option<axum::body::Body>,
-    _drain: DrainGuard,
-    guard: ClientCancelGuard,
+    drain: Option<DrainGuard>,
+    guard: Option<ClientCancelGuard>,
 }
 
 impl Drop for TelemetryBody {
     fn drop(&mut self) {
-        // Drop the inner body FIRST, and inside the request's own
-        // attribution cell. Two families (`/a2a` streaming, passthrough)
-        // build their stream's terminal emitter outside the generator, so
-        // it fires even on a body nobody polled — and running that drop in
-        // scope is what lets it say so (`attribution::note_usage_emitted`),
-        // which the guard below reads before deciding it owes a row. The
-        // guard is a field, so it drops after this runs.
-        if let Some(inner) = self.inner.take() {
-            attribution::sync_scope(&self.guard.attribution, move || drop(inner));
+        let awaits_table = self
+            .guard
+            .as_ref()
+            .is_some_and(|guard| guard.attribution.awaits_table());
+        let (inner, guard, drain) = (self.inner.take(), self.guard.take(), self.drain.take());
+        let settle = move || {
+            // Drop the inner body FIRST, and inside the request's own
+            // attribution cell. Two families (`/a2a` streaming, passthrough)
+            // build their stream's terminal emitter outside the generator, so
+            // it fires even on a body nobody polled — and running that drop in
+            // scope is what lets it say so (`attribution::note_usage_emitted`),
+            // which the guard reads before deciding it owes a row. Then the
+            // guard, then the drain count.
+            if let (Some(inner), Some(guard)) = (inner, guard.as_ref()) {
+                attribution::sync_scope(&guard.attribution, move || drop(inner));
+            }
+            drop(guard);
+            drop(drain);
+        };
+        // A stream settles its usage as its body drops, and an estimate in an
+        // encoding whose table is still being built waits for it: long enough
+        // to hold this response's close and every connection the worker
+        // serves. A request that may estimate in one is settled on a blocking
+        // thread instead.
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) if awaits_table => {
+                runtime.spawn_blocking(settle);
+            }
+            _ => settle(),
         }
     }
 }
@@ -835,7 +855,10 @@ impl axum::body::HttpBody for TelemetryBody {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
         let this = &mut *self;
-        if let GuardPhase::Body { polled, .. } = &mut this.guard.phase {
+        let Some(guard) = this.guard.as_mut() else {
+            return std::task::Poll::Ready(None);
+        };
+        if let GuardPhase::Body { polled, .. } = &mut guard.phase {
             *polled = true;
         }
         // Poll the stream inside the request's own attribution cell. The
@@ -846,7 +869,7 @@ impl axum::body::HttpBody for TelemetryBody {
         // cell to read the parked line from, and a delivered stream would
         // log nothing at all. `Drop` covers the abandoned endings; this
         // covers the delivered one.
-        let cell = &this.guard.attribution;
+        let cell = &guard.attribution;
         let polled = match this.inner.as_mut() {
             Some(inner) => {
                 attribution::sync_scope(cell, || std::pin::Pin::new(inner).poll_frame(cx))

@@ -512,6 +512,8 @@ struct Cell {
     /// or a buffered body ([`note_responses_result`]).
     responses_finish: Option<aisix_obs::ResponsesFinishObserver>,
     responses_finish_value: Option<Option<&'static str>>,
+    /// See [`note_table_need`].
+    table_needs: Vec<crate::token_estimate::TableNeed>,
     /// Upstreams were called outside attempt windows (an ensemble's
     /// concurrent members), so neither the wait nor the "latest response"
     /// can be attributed: no overhead is reported, and an attempt without
@@ -873,6 +875,12 @@ impl RequestAttribution {
 
     pub(crate) fn note_request_complete(&self) {
         self.bodies.request_complete.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether this request may estimate in an encoding whose table is still
+    /// being built ([`note_table_need`]).
+    pub(crate) fn awaits_table(&self) -> bool {
+        self.lock().table_needs.iter().any(|need| !need.ready())
     }
 
     pub(crate) fn add_response_bytes(&self, n: u64) {
@@ -1841,6 +1849,18 @@ pub(crate) fn note_responses_result(response: &serde_json::Value) {
 }
 
 /// [`note_responses_result`] for a result already read.
+/// An encoding this request may estimate in, noted when it is dispatched, so a
+/// close that would wait for that encoding's table settles off the runtime
+/// instead ([`crate::token_estimate::prepare_for`]).
+pub(crate) fn note_table_need(need: crate::token_estimate::TableNeed) {
+    let _ = CURRENT.try_with(|a| {
+        let mut cell = a.lock();
+        if !cell.table_needs.contains(&need) {
+            cell.table_needs.push(need);
+        }
+    });
+}
+
 pub(crate) fn note_responses_finish(finish: Option<&'static str>) {
     let _ = CURRENT.try_with(|a| {
         a.lock().responses_finish_value = Some(finish);
