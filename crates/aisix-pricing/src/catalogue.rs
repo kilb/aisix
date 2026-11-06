@@ -787,8 +787,7 @@ mod tests {
             let earlier = c
                 .entries()
                 .iter()
-                .filter(|e| e.key == later.key && e.effective_from < later.effective_from)
-                .next_back()
+                .rfind(|e| e.key == later.key && e.effective_from < later.effective_from)
                 .unwrap();
             assert_eq!(
                 earlier.card.0.keys().collect::<Vec<_>>(),
