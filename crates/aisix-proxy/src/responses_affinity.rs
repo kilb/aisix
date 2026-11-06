@@ -572,13 +572,14 @@ impl ResponseMark {
             && self.tenant.is_none()
     }
 
-    /// Seal the response's item ids when platform mode is on, with one
-    /// [`crate::opaque_id::Sealer`] for every frame of the response.
+    /// Seal the response's item ids to `owner` when platform mode is on,
+    /// with one [`crate::opaque_id::Sealer`] for every frame of the response.
     pub(crate) fn sealing_ids(
         mut self,
         platform: Option<&crate::platform::PlatformSettings>,
+        owner: &str,
     ) -> Self {
-        self.seal = platform.map(|p| std::sync::Arc::new(crate::opaque_id::Sealer::of(p)));
+        self.seal = platform.map(|p| std::sync::Arc::new(crate::opaque_id::Sealer::of(p, owner)));
         self
     }
 
@@ -847,7 +848,7 @@ mod tests {
         let key = crate::opaque_id::seal_key(&platform.id_key);
         let mark = ContextAffinity::default()
             .response_mark(target_id.unwrap_or("m-1"), target_id.is_some())
-            .sealing_ids(Some(&platform));
+            .sealing_ids(Some(&platform), "team-a");
         (mark, key)
     }
 
@@ -870,9 +871,15 @@ mod tests {
             json!({"input_tokens": 9, "input_tokens_details": {"cached_tokens": 1, "cache_creation_tokens": 3}})
         );
         assert_eq!(body["id"], mark_response_id("m-1", "resp_up"));
-        assert_eq!(body["output"][0]["id"], seal_id(&key, "fc_bdrk_1"));
-        assert_eq!(body["output"][0]["call_id"], seal_id(&key, "call_bdrk_1"));
-        assert_eq!(body["output"][1]["id"], seal_id(&key, "rs_1"));
+        assert_eq!(
+            body["output"][0]["id"],
+            seal_id(&key, "team-a", "fc_bdrk_1")
+        );
+        assert_eq!(
+            body["output"][0]["call_id"],
+            seal_id(&key, "team-a", "call_bdrk_1")
+        );
+        assert_eq!(body["output"][1]["id"], seal_id(&key, "team-a", "rs_1"));
         assert_eq!(
             body["output"][1]["encrypted_content"],
             mark_encrypted_content("m-1", "CT")
@@ -885,7 +892,7 @@ mod tests {
             out,
             format!(
                 "data: {{\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"{}\",\"delta\":\"{{\"}}\n\n",
-                seal_id(&key, "fc_bdrk_1")
+                seal_id(&key, "team-a", "fc_bdrk_1")
             )
         );
         let done = b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_up\",\"output\":[{\"id\":\"fc_bdrk_1\",\"call_id\":\"call_bdrk_1\"}]},\"amazon-bedrock-invocationMetrics\":{\"n\":1}}\n\n";
@@ -901,7 +908,7 @@ mod tests {
     fn a_mark_without_platform_mode_leaves_item_ids_alone() {
         let mark = ContextAffinity::default()
             .response_mark("m-1", false)
-            .sealing_ids(None);
+            .sealing_ids(None, "team-a");
         let mut body = json!({"id": "resp_up", "output": [{"id": "fc_1", "call_id": "call_1"}],
                               "amazon-bedrock-invocationMetrics": {}});
         let before = body.clone();

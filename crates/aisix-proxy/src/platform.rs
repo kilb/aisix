@@ -18,6 +18,13 @@ impl PlatformSettings {
     }
 }
 
+/// The tenant a platform-mode request belongs to: its API key's team, or the
+/// key itself when it has none. Every id platform mode seals for a caller is
+/// sealed to it, and opens only for it.
+pub(crate) fn tenant_owner(auth: &crate::auth::AuthenticatedKey) -> &str {
+    auth.key().team_id.as_deref().unwrap_or(&auth.entry.id)
+}
+
 // 不派生 Debug：id_key 是密钥派生值，不能进日志。
 impl std::fmt::Debug for PlatformSettings {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

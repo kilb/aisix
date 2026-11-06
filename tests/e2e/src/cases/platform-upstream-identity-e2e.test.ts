@@ -754,6 +754,12 @@ describe("platform mode e2e: ids name no upstream channel, and tool use still ro
 // A key restricted to provider groups continues only through a target its
 // groups still contain: narrowing the groups turns the continuation into the
 // same "no such response", rather than sending it to some other upstream.
+//
+// The ids of the items inside an answer belong to its tenant too. The
+// upstream account is shared, so an item or call id echoed back is resolved
+// against everything that account stored: echoed by another tenant, it must
+// reach the upstream as the opaque string that tenant sent, which names
+// nothing the upstream has.
 
 const TENANT_KEYS = {
   /** Tenant A. */
@@ -770,6 +776,7 @@ const TENANT_ALIASES = {
   grouped: "pi-tenant-grouped",
   otherGroup: "pi-tenant-other-group",
   probe: "pi-tenant-probe",
+  items: "pi-tenant-items",
 };
 
 /** A Responses upstream's answer, under an id that carries a channel marker. */
@@ -820,6 +827,25 @@ function tenantStream(id: string): string[] {
   ];
 }
 
+/** An answer whose items name the upstream's own message, item and call ids. */
+function itemsAnswer(): Record<string, unknown> {
+  const answer = tenantAnswer("resp_bdrk_i01");
+  return {
+    ...answer,
+    output: [
+      ...(answer.output as unknown[]),
+      {
+        type: "function_call",
+        id: "fc_bdrk_i01",
+        call_id: "call_bdrk_i01",
+        name: "get_weather",
+        arguments: WEATHER_ARGS,
+        status: "completed",
+      },
+    ],
+  };
+}
+
 describe("platform mode e2e: a response id continues only for the tenant it was handed to", () => {
   let tenantApp: SpawnedApp | undefined;
   let seed: SeedClient | undefined;
@@ -831,6 +857,7 @@ describe("platform mode e2e: a response id continues only for the tenant it was 
     grouped: "",
     otherGroup: "",
     probe: "",
+    items: "",
   };
   const up: Record<keyof typeof TENANT_ALIASES, OpenAiUpstream | undefined> = {
     target: undefined,
@@ -838,6 +865,7 @@ describe("platform mode e2e: a response id continues only for the tenant it was 
     grouped: undefined,
     otherGroup: undefined,
     probe: undefined,
+    items: undefined,
   };
 
   async function postAs(
@@ -904,6 +932,7 @@ describe("platform mode e2e: a response id continues only for the tenant it was 
     up.grouped = await startOpenAiUpstream({ nonStreamBody: tenantAnswer("resp_bdrk_g01") });
     up.otherGroup = await startOpenAiUpstream({ nonStreamBody: tenantAnswer("resp_bdrk_o01") });
     up.probe = await startOpenAiUpstream();
+    up.items = await startOpenAiUpstream({ nonStreamBody: itemsAnswer() });
 
     tenantApp = await spawnApp({
       extraEnv: {
@@ -920,6 +949,7 @@ describe("platform mode e2e: a response id continues only for the tenant it was 
       grouped: ["ga"],
       otherGroup: ["gb"],
       probe: ["ga"],
+      items: ["ga"],
     };
     for (const route of Object.keys(TENANT_ALIASES) as Array<keyof typeof TENANT_ALIASES>) {
       const pk = await seed.createProviderKey({
@@ -1100,5 +1130,57 @@ describe("platform mode e2e: a response id continues only for the tenant it was 
     });
     expect(fresh.status, fresh.text).toBe(200);
     expect(up.otherGroup!.receivedRequests).toHaveLength(otherBefore + 1);
+  });
+
+  test("an item id echoed by another tenant reaches the upstream as the opaque string it sent", async (ctx) => {
+    if (!etcdReachable || !tenantApp) return void ctx.skip();
+    const upstream = up.items!;
+    const model = TENANT_ALIASES.items;
+
+    const first = await postAs(TENANT_KEYS.a, "/v1/responses", { model, input: "weather in Paris?" });
+    expect(first.status, first.text).toBe(200);
+    const output = JSON.parse(first.text).output as Array<Record<string, any>>;
+    const message = output.find((i) => i.type === "message")!;
+    const call = output.find((i) => i.type === "function_call")!;
+    for (const [sealed, original] of [
+      [message.id, "msg_bdrk_i01"],
+      [call.id, "fc_bdrk_i01"],
+      [call.call_id, "call_bdrk_i01"],
+    ] as const) {
+      expect(typeof sealed, JSON.stringify(output)).toBe("string");
+      expect(sealed).not.toBe(original);
+    }
+    // The ids a later turn echoes: a reference to the stored message, and
+    // the answer to the stored call.
+    const echo = (key: string) =>
+      postAs(key, "/v1/responses", {
+        model,
+        input: [
+          { type: "item_reference", id: message.id },
+          { type: "item_reference", id: call.id },
+          { type: "function_call_output", call_id: call.call_id, output: "sunny" },
+        ],
+      });
+
+    const foreign = await echo(TENANT_KEYS.b);
+    expect(foreign.status, foreign.text).toBe(200);
+    expect(upstream.receivedRequests).toHaveLength(2);
+    const sentForB = upstreamBody(upstream, 1);
+    expect(sentForB.input[0].id).toBe(message.id);
+    expect(sentForB.input[1].id).toBe(call.id);
+    expect(sentForB.input[2].call_id).toBe(call.call_id);
+    for (const original of ["msg_bdrk_i01", "fc_bdrk_i01", "call_bdrk_i01"]) {
+      expect(upstream.receivedRequests[1]!.body, `tenant B's request names ${original}`).not.toContain(
+        original,
+      );
+    }
+
+    // The tenant the ids were handed to gets the upstream's own ids back.
+    const own = await echo(TENANT_KEYS.a);
+    expect(own.status, own.text).toBe(200);
+    const sentForA = upstreamBody(upstream, 2);
+    expect(sentForA.input[0].id).toBe("msg_bdrk_i01");
+    expect(sentForA.input[1].id).toBe("fc_bdrk_i01");
+    expect(sentForA.input[2].call_id).toBe("call_bdrk_i01");
   });
 });

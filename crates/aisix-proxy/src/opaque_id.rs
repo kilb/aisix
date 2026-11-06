@@ -189,13 +189,22 @@ pub(crate) fn unpad(padded: &[u8]) -> Option<&[u8]> {
     (padded[marker] == 0x80).then(|| &padded[..marker])
 }
 
-/// Deterministic authenticated encryption of ids under one seal key: the
-/// nonce is synthetic, `HMAC-SHA256(key, "seal" || 0x00 || id)[..12]`, so the
-/// same id always seals to the same value — a stream's `item_id` on every
-/// delta matches the item it belongs to, and a replayed answer matches the
-/// first. The AES-256-GCM key is derived from the seal key under its own
+/// Deterministic authenticated encryption of ids under one seal key, bound
+/// to one tenant: the nonce is synthetic,
+/// `HMAC-SHA256(key, "seal" || 0x00 || owner || id)[..12]`, so the same id
+/// always seals to the same value for one tenant — a stream's `item_id` on
+/// every delta matches the item it belongs to, and a replayed answer matches
+/// the first. The AES-256-GCM key is derived from the seal key under its own
 /// label, so the nonce function and the cipher never share key material. The
 /// plaintext is padded to [`SEAL_BUCKET`] first.
+///
+/// The owner is the tenant the ids are handed to
+/// ([`crate::platform::tenant_owner`]), written length-prefixed into both the
+/// nonce and the associated data. The upstream account is shared by every
+/// tenant, so an id only its own tenant can unseal is what keeps one tenant
+/// from echoing another's id and having the upstream resolve what it stored
+/// for that other tenant: a seal made for anyone else does not open, and
+/// passes through as the opaque string it is.
 ///
 /// Building one sets up both keys, so a request builds one and seals or
 /// unseals every id it handles with it.
@@ -203,6 +212,9 @@ pub(crate) fn unpad(padded: &[u8]) -> Option<&[u8]> {
 pub(crate) struct Sealer {
     nonce_key: hmac::Key,
     cipher: aead::LessSafeKey,
+    /// The owner, length-prefixed: the bytes the nonce and the associated
+    /// data carry, so no owner's bytes are another owner's followed by more.
+    owner: Vec<u8>,
 }
 
 impl std::fmt::Debug for Sealer {
@@ -212,26 +224,38 @@ impl std::fmt::Debug for Sealer {
 }
 
 impl Sealer {
-    /// The sealer of platform mode: its keys come from [`seal_key`].
-    pub(crate) fn of(platform: &crate::platform::PlatformSettings) -> Self {
-        Self::new(&seal_key(&platform.id_key))
+    /// The sealer of platform mode for `owner`'s ids: its keys come from
+    /// [`seal_key`].
+    pub(crate) fn of(platform: &crate::platform::PlatformSettings, owner: &str) -> Self {
+        Self::new(&seal_key(&platform.id_key), owner)
     }
 
-    pub(crate) fn new(key: &[u8; 32]) -> Self {
+    pub(crate) fn new(key: &[u8; 32], owner: &str) -> Self {
         #[cfg(test)]
         tests::SEALERS_BUILT.with(|n| n.set(n.get() + 1));
         let cipher = aead::UnboundKey::new(&aead::AES_256_GCM, &derive_key(key, b"seal-aead"))
             .expect("a 32-byte key is the length AES-256-GCM takes");
+        let mut owner_bytes = Vec::with_capacity(8 + owner.len());
+        owner_bytes.extend_from_slice(&(owner.len() as u64).to_be_bytes());
+        owner_bytes.extend_from_slice(owner.as_bytes());
         Self {
             nonce_key: hmac::Key::new(hmac::HMAC_SHA256, key),
             cipher: aead::LessSafeKey::new(cipher),
+            owner: owner_bytes,
         }
+    }
+
+    /// The associated data of a seal: the owner, then the kept prefix, so
+    /// neither can be swapped for another.
+    fn aad(&self, prefix: &str) -> Vec<u8> {
+        [self.owner.as_slice(), prefix.as_bytes()].concat()
     }
 
     fn nonce(&self, id: &str) -> [u8; aead::NONCE_LEN] {
         let mut ctx = hmac::Context::with_key(&self.nonce_key);
         ctx.update(b"seal");
         ctx.update(&[0]);
+        ctx.update(&self.owner);
         ctx.update(id.as_bytes());
         let mut nonce = [0u8; aead::NONCE_LEN];
         nonce.copy_from_slice(&ctx.sign().as_ref()[..aead::NONCE_LEN]);
@@ -239,8 +263,8 @@ impl Sealer {
     }
 
     /// `<kept prefix>` + base64url(nonce || ciphertext || tag), the ciphertext
-    /// of the padded id, with the kept prefix as associated data so it cannot
-    /// be swapped for another.
+    /// of the padded id, with the owner and the kept prefix as associated
+    /// data.
     pub(crate) fn seal(&self, id: &str) -> String {
         let prefix = kept_prefix(id);
         let nonce = self.nonce(id);
@@ -250,7 +274,7 @@ impl Sealer {
         self.cipher
             .seal_in_place_append_tag(
                 aead::Nonce::assume_unique_for_key(nonce),
-                aead::Aad::from(prefix.as_bytes()),
+                aead::Aad::from(self.aad(prefix)),
                 &mut sealed,
             )
             .expect("an id is far below the AES-GCM message limit");
@@ -259,7 +283,7 @@ impl Sealer {
     }
 
     /// The id [`Self::seal`] was given; `None` for anything this sealer did
-    /// not seal.
+    /// not seal, another tenant's seal included.
     pub(crate) fn unseal(&self, id: &str) -> Option<String> {
         if id.len() < MIN_SEALED_LEN {
             return None;
@@ -282,7 +306,7 @@ impl Sealer {
             .cipher
             .open_in_place(
                 aead::Nonce::try_assume_unique_for_key(nonce).ok()?,
-                aead::Aad::from(prefix.as_bytes()),
+                aead::Aad::from(self.aad(prefix)),
                 &mut buf,
             )
             .ok()?;
@@ -298,16 +322,16 @@ impl Sealer {
 /// The one-off form of [`Sealer::seal`], for a caller with a single id; one
 /// that handles several builds one [`Sealer`] and reuses it.
 #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn seal_id(key: &[u8; 32], upstream_id: &str) -> String {
-    Sealer::new(key).seal(upstream_id)
+pub(crate) fn seal_id(key: &[u8; 32], owner: &str, upstream_id: &str) -> String {
+    Sealer::new(key, owner).seal(upstream_id)
 }
 
 /// The upstream id a [`seal_id`] value was made from; `None` for anything
-/// this key did not seal, which the caller passes through untouched. The
-/// one-off form of [`Sealer::unseal`].
+/// this key did not seal to `owner`, which the caller passes through
+/// untouched. The one-off form of [`Sealer::unseal`].
 #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn unseal_id(key: &[u8; 32], id: &str) -> Option<String> {
-    Sealer::new(key).unseal(id)
+pub(crate) fn unseal_id(key: &[u8; 32], owner: &str, id: &str) -> Option<String> {
+    Sealer::new(key, owner).unseal(id)
 }
 
 /// The fields of a Responses output item that name an item or a call — the
@@ -407,7 +431,8 @@ pub(crate) fn responses_event_id_path(path: &[PathSeg]) -> bool {
 
 /// Restore the upstream's own ids in a `/v1/responses` request's `input[]`
 /// before anything reads it, on the native and the translated path alike;
-/// an id this key did not seal — one the client made — passes untouched.
+/// an id this key did not seal to `owner` — one the client made, or one
+/// sealed to another tenant — passes untouched.
 ///
 /// Responses cannot take a substitute id the way Chat Completions and
 /// Messages can, for two reasons, neither stated in the API reference but
@@ -432,6 +457,7 @@ pub(crate) fn responses_event_id_path(path: &[PathSeg]) -> bool {
 /// [`Sealer`] the request needs is built only when a value could be one.
 pub(crate) fn unseal_responses_input(
     platform: &crate::platform::PlatformSettings,
+    owner: &str,
     body: &mut Value,
 ) {
     let Some(items) = body.get_mut("input").and_then(Value::as_array_mut) else {
@@ -443,7 +469,7 @@ pub(crate) fn unseal_responses_input(
             if slot.len() < MIN_SEALED_LEN {
                 return;
             }
-            let sealer = sealer.get_or_insert_with(|| Sealer::of(platform));
+            let sealer = sealer.get_or_insert_with(|| Sealer::of(platform, owner));
             if let Some(original) = sealer.unseal(slot) {
                 *slot = original;
             }
@@ -614,6 +640,8 @@ pub(crate) mod tests {
     use serde_json::json;
 
     const K: [u8; 32] = [7u8; 32];
+    /// The tenant the tests' ids are sealed to.
+    const T: &str = "team-a";
 
     thread_local! {
         /// How many [`Sealer`]s this test's thread has built.
@@ -693,7 +721,7 @@ pub(crate) mod tests {
             "msg_bdrk_01X",
             "toolu_vrtx_01ABC",
         ] {
-            let sealed = seal_id(&K, upstream);
+            let sealed = seal_id(&K, T, upstream);
             let prefix = &upstream[..=upstream.find('_').unwrap()];
             assert!(sealed.starts_with(prefix), "{sealed} keeps {prefix}");
             assert!(
@@ -701,15 +729,18 @@ pub(crate) mod tests {
                 "{sealed}"
             );
             assert_ne!(sealed, upstream);
-            assert_eq!(unseal_id(&K, &sealed).as_deref(), Some(upstream));
+            assert_eq!(unseal_id(&K, T, &sealed).as_deref(), Some(upstream));
         }
     }
 
     #[test]
     fn sealing_is_deterministic() {
-        assert_eq!(seal_id(&K, "fc_bdrk_1"), seal_id(&K, "fc_bdrk_1"));
-        assert_ne!(seal_id(&K, "fc_bdrk_1"), seal_id(&K, "fc_bdrk_2"));
-        assert_ne!(seal_id(&K, "fc_bdrk_1"), seal_id(&[8u8; 32], "fc_bdrk_1"));
+        assert_eq!(seal_id(&K, T, "fc_bdrk_1"), seal_id(&K, T, "fc_bdrk_1"));
+        assert_ne!(seal_id(&K, T, "fc_bdrk_1"), seal_id(&K, T, "fc_bdrk_2"));
+        assert_ne!(
+            seal_id(&K, T, "fc_bdrk_1"),
+            seal_id(&[8u8; 32], T, "fc_bdrk_1")
+        );
     }
 
     /// The length of a sealed id says nothing about the id it was made
@@ -719,10 +750,10 @@ pub(crate) mod tests {
         let short = "call_1";
         let long = format!("call_{}", "b".repeat(57));
         assert_eq!(long.len(), 62);
-        assert_eq!(seal_id(&K, short).len(), seal_id(&K, &long).len());
+        assert_eq!(seal_id(&K, T, short).len(), seal_id(&K, T, &long).len());
         // The payload behind any kept prefix is one length too.
         let payload = |upstream: &str| {
-            let sealed = seal_id(&K, upstream);
+            let sealed = seal_id(&K, T, upstream);
             sealed.len() - kept_prefix(upstream).len()
         };
         for upstream in [
@@ -735,10 +766,10 @@ pub(crate) mod tests {
         }
         // Past the first bucket the next one is shared the same way.
         assert_eq!(
-            seal_id(&K, &"a".repeat(64)).len(),
-            seal_id(&K, &"a".repeat(127)).len()
+            seal_id(&K, T, &"a".repeat(64)).len(),
+            seal_id(&K, T, &"a".repeat(127)).len()
         );
-        assert!(seal_id(&K, &"a".repeat(64)).len() > seal_id(&K, &"a".repeat(63)).len());
+        assert!(seal_id(&K, T, &"a".repeat(64)).len() > seal_id(&K, T, &"a".repeat(63)).len());
     }
 
     #[test]
@@ -751,7 +782,7 @@ pub(crate) mod tests {
                 format!("{}\u{0}", "z".repeat(len.saturating_sub(1))),
             ] {
                 assert_eq!(
-                    unseal_id(&K, &seal_id(&K, &upstream)).as_deref(),
+                    unseal_id(&K, T, &seal_id(&K, T, &upstream)).as_deref(),
                     Some(upstream.as_str()),
                     "length {}",
                     upstream.len()
@@ -762,7 +793,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_truncated_or_tampered_seal_opens_to_nothing() {
-        let sealed = seal_id(&K, "fc_bdrk_01Z");
+        let sealed = seal_id(&K, T, "fc_bdrk_01Z");
         let payload = &sealed["fc_".len()..];
         let mut tampered = payload.as_bytes().to_vec();
         let middle = tampered.len() / 2;
@@ -774,7 +805,7 @@ pub(crate) mod tests {
             format!("fc_{}", String::from_utf8(tampered).unwrap()),
             format!("{sealed}A"),
         ] {
-            assert_eq!(unseal_id(&K, &broken), None, "{broken}");
+            assert_eq!(unseal_id(&K, T, &broken), None, "{broken}");
         }
     }
 
@@ -811,13 +842,13 @@ pub(crate) mod tests {
             "_leading",
             "averyveryverylongprefix_x",
         ] {
-            let sealed = seal_id(&K, upstream);
+            let sealed = seal_id(&K, T, upstream);
             assert!(
                 !sealed.contains("p-123") && !sealed.contains("averyvery"),
                 "{sealed}"
             );
             assert_eq!(
-                unseal_id(&K, &sealed).as_deref(),
+                unseal_id(&K, T, &sealed).as_deref(),
                 Some(upstream),
                 "{upstream}"
             );
@@ -826,7 +857,7 @@ pub(crate) mod tests {
         for i in 0..64 {
             let upstream = format!("{i:08x}");
             assert_eq!(
-                unseal_id(&K, &seal_id(&K, &upstream)).as_deref(),
+                unseal_id(&K, T, &seal_id(&K, T, &upstream)).as_deref(),
                 Some(upstream.as_str())
             );
         }
@@ -834,7 +865,7 @@ pub(crate) mod tests {
 
     #[test]
     fn unseal_answers_none_for_anything_it_did_not_seal() {
-        let sealed = seal_id(&K, "fc_bdrk_1");
+        let sealed = seal_id(&K, T, "fc_bdrk_1");
         for foreign in [
             "call_abc",
             "fc_68af0c1e2b",
@@ -850,9 +881,43 @@ pub(crate) mod tests {
                 if sealed.ends_with('A') { 'B' } else { 'A' }
             ),
         ] {
-            assert_eq!(unseal_id(&K, foreign), None, "{foreign}");
+            assert_eq!(unseal_id(&K, T, foreign), None, "{foreign}");
         }
-        assert_eq!(unseal_id(&[8u8; 32], &sealed), None, "another key");
+        assert_eq!(unseal_id(&[8u8; 32], T, &sealed), None, "another key");
+    }
+
+    /// The upstream account is shared by every tenant: an id one tenant was
+    /// handed must not open for another, or echoing it would have the
+    /// upstream resolve what it stored for the first.
+    #[test]
+    fn a_seal_for_one_tenant_does_not_open_for_another() {
+        let sealed = seal_id(&K, "team-a", "msg_bdrk_1");
+        assert_eq!(
+            unseal_id(&K, "team-a", &sealed).as_deref(),
+            Some("msg_bdrk_1")
+        );
+        assert_eq!(unseal_id(&K, "team-b", &sealed), None);
+        // One upstream id, one sealed form per tenant.
+        assert_ne!(sealed, seal_id(&K, "team-b", "msg_bdrk_1"));
+        // An owner whose name starts another's is still another owner.
+        assert_eq!(unseal_id(&K, "team-", &sealed), None);
+        assert_eq!(unseal_id(&K, "team-ab", &sealed), None);
+
+        // Inbound, another tenant's seals stay the strings that tenant sent;
+        // the tenant they were handed to gets the upstream's ids back.
+        let platform = crate::platform::PlatformSettings::from_secret("s");
+        let k = seal_key(&platform.id_key);
+        let mut body = json!({"model": "m", "input": [
+            {"type": "item_reference", "id": seal_id(&k, "team-a", "msg_bdrk_1")},
+            {"type": "function_call_output", "call_id": seal_id(&k, "team-a", "call_bdrk_1"),
+             "output": "sunny"},
+        ]});
+        let sent = body.clone();
+        unseal_responses_input(&platform, "team-b", &mut body);
+        assert_eq!(body, sent);
+        unseal_responses_input(&platform, "team-a", &mut body);
+        assert_eq!(body["input"][0]["id"], "msg_bdrk_1");
+        assert_eq!(body["input"][1]["call_id"], "call_bdrk_1");
     }
 
     #[test]
@@ -873,19 +938,19 @@ pub(crate) mod tests {
             ],
             "usage": {"input_tokens": 9, "input_tokens_details": {"cached_tokens": 1, "cache_creation_tokens": 3}},
         });
-        seal_responses_body(&Sealer::new(&K), &mut body);
+        seal_responses_body(&Sealer::new(&K, T), &mut body);
         let text = body.to_string();
         assert!(!text.contains("bdrk") && !text.contains("prog_1"), "{text}");
         // The response-level id is not an item id.
         assert_eq!(body["id"], "resp_up");
-        assert_eq!(body["output"][1]["call_id"], seal_id(&K, "call_bdrk_1"));
+        assert_eq!(body["output"][1]["call_id"], seal_id(&K, T, "call_bdrk_1"));
         assert_eq!(
             body["output"][1]["caller"]["caller_id"],
-            seal_id(&K, "call_prog_1")
+            seal_id(&K, T, "call_prog_1")
         );
         assert_eq!(
             body["output"][2]["approval_request_id"],
-            seal_id(&K, "mcpr_bdrk_1")
+            seal_id(&K, T, "mcpr_bdrk_1")
         );
         // Every other field survives as it was, the upstream's own usage
         // counters included.
@@ -919,17 +984,17 @@ pub(crate) mod tests {
         let mut done = json!({"type": "response.completed", "response": {"id": "resp_up",
             "output": [{"type": "function_call", "id": "fc_bdrk_1", "call_id": "call_bdrk_1"}],
             "usage": {"input_tokens_details": {"cached_tokens": 0, "cache_creation_tokens": 2}}}});
-        let sealer = Sealer::new(&K);
+        let sealer = Sealer::new(&K, T);
         for event in [&mut added, &mut delta, &mut done] {
             seal_responses_event(&sealer, event);
         }
-        let item_id = seal_id(&K, "fc_bdrk_1");
+        let item_id = seal_id(&K, T, "fc_bdrk_1");
         assert_eq!(added["item"]["id"], item_id);
         assert_eq!(delta["item_id"], item_id);
         assert_eq!(done["response"]["output"][0]["id"], item_id);
         assert_eq!(
             done["response"]["output"][0]["call_id"],
-            seal_id(&K, "call_bdrk_1")
+            seal_id(&K, T, "call_bdrk_1")
         );
         assert_eq!(done["response"]["id"], "resp_up");
         assert_eq!(
@@ -966,7 +1031,7 @@ pub(crate) mod tests {
     fn inbound_input_items_get_the_upstreams_own_ids_back() {
         let platform = crate::platform::PlatformSettings::from_secret("s");
         let k = seal_key(&platform.id_key);
-        let seal_id = |id: &str| seal_id(&k, id);
+        let seal_id = |id: &str| seal_id(&k, T, id);
         let mut body = json!({
             "model": "m",
             "previous_response_id": "resp_up",
@@ -981,7 +1046,7 @@ pub(crate) mod tests {
             ],
         });
         let before = sealers_built();
-        unseal_responses_input(&platform, &mut body);
+        unseal_responses_input(&platform, T, &mut body);
         assert_eq!(
             sealers_built() - before,
             1,
@@ -998,7 +1063,7 @@ pub(crate) mod tests {
 
         // A string input has no items to restore.
         let mut plain = json!({"model": "m", "input": "hi"});
-        unseal_responses_input(&platform, &mut plain);
+        unseal_responses_input(&platform, T, &mut plain);
         assert_eq!(plain, json!({"model": "m", "input": "hi"}));
     }
 
@@ -1013,7 +1078,7 @@ pub(crate) mod tests {
         let mut body = json!({"model": "m", "input": items});
         let expected = body.clone();
         let before = sealers_built();
-        unseal_responses_input(&platform, &mut body);
+        unseal_responses_input(&platform, T, &mut body);
         assert_eq!(
             sealers_built(),
             before,
@@ -1022,9 +1087,9 @@ pub(crate) mod tests {
         assert_eq!(body, expected);
 
         // The shortest seal there is clears the bar; one shorter cannot be one.
-        let shortest = seal_id(&K, "");
+        let shortest = seal_id(&K, T, "");
         assert_eq!(shortest.len(), MIN_SEALED_LEN);
-        let sealer = Sealer::new(&K);
+        let sealer = Sealer::new(&K, T);
         assert_eq!(sealer.unseal(&shortest).as_deref(), Some(""));
         assert_eq!(sealer.unseal(&shortest[1..]), None);
     }

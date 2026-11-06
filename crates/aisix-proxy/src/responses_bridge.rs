@@ -4481,7 +4481,7 @@ mod tests {
     #[test]
     fn a_sealing_encoder_seals_call_ids_and_keeps_usage_to_openai_fields() {
         let platform = crate::platform::PlatformSettings::from_secret("s");
-        let sealer = std::sync::Arc::new(crate::opaque_id::Sealer::of(&platform));
+        let sealer = std::sync::Arc::new(crate::opaque_id::Sealer::of(&platform, "team-a"));
         let run = |sealer: Option<std::sync::Arc<crate::opaque_id::Sealer>>| {
             let mut enc =
                 ResponsesSseEncoder::new("resp_1", "m", 0, no_custom_tools()).sealing_ids(sealer);

@@ -399,15 +399,20 @@ pub async fn responses(
             &mut body,
             crate::responses_affinity::TenantSeal::new(
                 platform,
-                auth.key().team_id.as_deref().unwrap_or(&auth.entry.id),
+                crate::platform::tenant_owner(&auth),
             ),
         ),
         None => crate::responses_affinity::ContextAffinity::unwrap_request(&mut body),
     };
     // Platform mode: the item ids a client echoes from an earlier answer
-    // leave here sealed; the upstream gets back the ones it issued.
+    // leave here sealed; the upstream gets back the ones it issued, for the
+    // tenant they were handed to only.
     if let Some(platform) = state.platform() {
-        crate::opaque_id::unseal_responses_input(platform, &mut body);
+        crate::opaque_id::unseal_responses_input(
+            platform,
+            crate::platform::tenant_owner(&auth),
+            &mut body,
+        );
     }
     let request_id = client.request_id.clone();
     crate::span_facts::note_request(
@@ -1280,7 +1285,7 @@ async fn dispatch(
             let attempt_body = stripped_body.as_ref().unwrap_or(body);
             let mark = affinity
                 .response_mark(&target.id, is_routing_request)
-                .sealing_ids(state.platform());
+                .sealing_ids(state.platform(), crate::platform::tenant_owner(auth));
             let result = if crate::dispatch::serves_natively(
                 snapshot,
                 &target.model,
