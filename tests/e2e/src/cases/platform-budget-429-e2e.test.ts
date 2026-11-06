@@ -253,7 +253,7 @@ describe("platform mode: a 429 shows a tenant only its own limits", () => {
   describe.each(ROUTES)("$path", (route) => {
     const modes = route.streams ? [false, true] : [false];
 
-    test.each(modes)("a team budget refusal shows the team's own figures (stream: %s)", async (stream, ctx) => {
+    test.for(modes)("a team budget refusal shows the team's own figures (stream: %s)", async (stream, ctx) => {
       if (!etcdReachable || !app) return ctx.skip();
       const answer = await call(TEAM_KEY, route, cleanModel(route.family), stream);
       expect(answer.status, answer.text).toBe(429);
@@ -272,16 +272,16 @@ describe("platform mode: a 429 shows a tenant only its own limits", () => {
       expect(Number(answer.headers.get("retry-after"))).toBeGreaterThan(0);
     });
 
-    test.each(modes)("a provider key budget refusal reveals nothing of the key or its spend (stream: %s)", async (stream, ctx) => {
+    test.for(modes)("a provider key budget refusal reveals nothing of the key or its spend (stream: %s)", async (stream, ctx) => {
       if (!etcdReachable || !app) return ctx.skip();
       expectHidden(route, await call(PLAIN_KEY, route, spentModel(route.family), stream));
     });
   });
 
-  test.each([
+  test.for([
     ["chat", ROUTES[0]],
     ["messages", ROUTES[1]],
-  ] as const)("a shared policy refusal on %s names no policy and no figures", async (label, route, ctx) => {
+  ] as const)("a shared policy refusal on %s names no policy and no figures", async ([label, route], ctx) => {
     if (!etcdReachable || !app) return ctx.skip();
     const key = POLICY_KEYS[label];
     // The first request takes the single slot; what it gets back is not the point.
