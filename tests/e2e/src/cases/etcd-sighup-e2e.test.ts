@@ -12,8 +12,10 @@ import {
   ProxyClient,
   SeedClient,
   pickFreePorts,
+  recordProfileOwner,
   spawnApp,
   startOpenAiUpstream,
+  stopGateway,
   suiteThreadPerCore,
   waitConfigPropagation,
   type OpenAiUpstream,
@@ -116,11 +118,8 @@ describe("etcd resource source: SIGHUP during startup", () => {
   let dir: string | undefined;
 
   afterAll(async () => {
-    if (child && child.exitCode === null && child.signalCode === null) {
-      const exited = new Promise<void>((resolve) => child?.once("exit", () => resolve()));
-      child.kill("SIGKILL");
-      await exited;
-    }
+    // SIGTERM and the gateway's own exit, so its coverage profile is written whole.
+    if (child) await stopGateway(child);
     for (const socket of sockets) socket.destroy();
     await new Promise<void>((resolve) => (etcd ? etcd.close(() => resolve()) : resolve()));
     if (dir) await rm(dir, { recursive: true, force: true });
@@ -168,6 +167,8 @@ describe("etcd resource source: SIGHUP during startup", () => {
         tracing: { otlp: { enabled: false, endpoint: "http://127.0.0.1:4317", sample_ratio: 1 } },
       },
       cache: { backend: "memory" },
+      // Nothing balances this gateway, so the exit need not wait out a window.
+      shutdown: { min_drain_secs: 0 },
     };
     const cfgPath = join(dir, "config.yaml");
     await writeFile(cfgPath, yamlStringify(cfg), "utf8");
@@ -186,6 +187,7 @@ describe("etcd resource source: SIGHUP during startup", () => {
       env: childEnv,
     });
     child = gateway;
+    recordProfileOwner(gateway.pid);
     gateway.stdout?.on("data", (c: Buffer) => (output += c.toString("utf8")));
     gateway.stderr?.on("data", (c: Buffer) => (output += c.toString("utf8")));
     const exited = new Promise<string>((resolve) =>

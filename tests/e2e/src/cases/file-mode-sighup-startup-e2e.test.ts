@@ -6,7 +6,14 @@ import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { afterAll, describe, expect, test } from "vitest";
 import { stringify as yamlStringify } from "yaml";
-import { pickFreePorts, startOpenAiUpstream, suiteThreadPerCore, type OpenAiUpstream } from "../harness/index.js";
+import {
+  pickFreePorts,
+  recordProfileOwner,
+  startOpenAiUpstream,
+  stopGateway,
+  suiteThreadPerCore,
+  type OpenAiUpstream,
+} from "../harness/index.js";
 
 const BIN_PATH =
   process.env.AISIX_BIN ?? join(process.cwd(), "..", "..", "target", "debug", "aisix");
@@ -63,11 +70,8 @@ describe("file resource source: SIGHUP during startup", () => {
   let dir: string | undefined;
 
   afterAll(async () => {
-    if (child && child.exitCode === null && child.signalCode === null) {
-      const exited = new Promise<void>((resolve) => child?.once("exit", () => resolve()));
-      child.kill("SIGKILL");
-      await exited;
-    }
+    // SIGTERM and the gateway's own exit, so its coverage profile is written whole.
+    if (child) await stopGateway(child);
     await upstream?.close();
     if (dir) await rm(dir, { recursive: true, force: true });
   });
@@ -96,6 +100,8 @@ describe("file resource source: SIGHUP during startup", () => {
         tracing: { otlp: { enabled: false, endpoint: "http://127.0.0.1:4317", sample_ratio: 1 } },
       },
       cache: { backend: "memory" },
+      // Nothing balances this gateway, so the exit need not wait out a window.
+      shutdown: { min_drain_secs: 0 },
     };
     const cfgPath = join(dir, "config.yaml");
     await writeFile(cfgPath, yamlStringify(cfg), "utf8");
@@ -110,6 +116,7 @@ describe("file resource source: SIGHUP during startup", () => {
     let output = "";
     const gateway = spawn(BIN_PATH, ["--config", cfgPath], { stdio: ["ignore", "pipe", "pipe"], env: childEnv });
     child = gateway;
+    recordProfileOwner(gateway.pid);
     gateway.stdout?.on("data", (c: Buffer) => (output += c.toString("utf8")));
     gateway.stderr?.on("data", (c: Buffer) => (output += c.toString("utf8")));
     const exited = new Promise<string>((resolve) =>

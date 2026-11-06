@@ -1,4 +1,11 @@
-export { spawnApp, suiteThreadPerCore, type SpawnedApp, type AppOverrides } from "./app.js";
+export {
+  recordProfileOwner,
+  spawnApp,
+  stopGateway,
+  suiteThreadPerCore,
+  type SpawnedApp,
+  type AppOverrides,
+} from "./app.js";
 export { AdminClient, waitConfigPropagation, awaitWindowHeadroom } from "./admin.js";
 export { completeLines, waitForLogLine, waitForLogLines } from "./logs.js";
 export { ProxyClient, type ProxyResponse } from "./proxy.js";

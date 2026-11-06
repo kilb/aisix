@@ -6,7 +6,14 @@ import { randomUUID } from "node:crypto";
 import { stringify as yamlStringify } from "yaml";
 import { Agent, request } from "undici";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
-import { EtcdClient, etcdEndpoint, pickFreePorts, suiteThreadPerCore } from "../harness/index.js";
+import {
+  EtcdClient,
+  etcdEndpoint,
+  pickFreePorts,
+  recordProfileOwner,
+  stopGateway,
+  suiteThreadPerCore,
+} from "../harness/index.js";
 
 // E2E: `proxy.tls` / `admin.tls` actually serve HTTPS.
 //
@@ -102,6 +109,8 @@ describe("listener TLS (#473)", () => {
         },
       },
       cache: { backend: "memory" },
+      // Nothing balances this gateway, so the exit need not wait out a window.
+      shutdown: { min_drain_secs: 0 },
     };
     const cfgPath = join(dir, "config.yaml");
     await writeFile(cfgPath, yamlStringify(cfg), "utf8");
@@ -118,6 +127,7 @@ describe("listener TLS (#473)", () => {
       stdio: ["ignore", "pipe", "pipe"],
       env: childEnv,
     });
+    recordProfileOwner(child.pid);
     let buf = "";
     child.stderr?.on("data", (c: Buffer) => (buf += c.toString("utf8")));
     child.stdout?.on("data", (c: Buffer) => (buf += c.toString("utf8")));
@@ -131,9 +141,8 @@ describe("listener TLS (#473)", () => {
 
   afterAll(async () => {
     if (child) {
-      child.kill("SIGTERM");
-      await new Promise((r) => setTimeout(r, 500));
-      child.kill("SIGKILL");
+      // SIGTERM and the gateway's own exit, so its coverage profile is written whole.
+      await stopGateway(child);
     }
     if (dir) await rm(dir, { recursive: true, force: true });
   });

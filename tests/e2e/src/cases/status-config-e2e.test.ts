@@ -10,8 +10,10 @@ import {
   ProxyClient,
   SeedClient,
   pickFreePorts,
+  recordProfileOwner,
   spawnApp,
   startOpenAiUpstream,
+  stopGateway,
   suiteThreadPerCore,
   waitConfigPropagation,
   type OpenAiUpstream,
@@ -812,6 +814,8 @@ async function spawnPointedAtDeadEtcd(): Promise<MinimalApp> {
       },
     },
     cache: { backend: "memory" },
+    // Nothing balances this gateway, so the exit need not wait out a window.
+    shutdown: { min_drain_secs: 0 },
   };
   const cfgPath = join(dir, "config.yaml");
   await writeFile(cfgPath, yamlStringify(cfg), "utf8");
@@ -827,6 +831,7 @@ async function spawnPointedAtDeadEtcd(): Promise<MinimalApp> {
     stdio: ["ignore", "ignore", "ignore"],
     env: childEnv,
   });
+  recordProfileOwner(child.pid);
   const metricsUrl = `http://127.0.0.1:${metricsPort}`;
 
   // Gate only on the metrics/status listener answering (any status — a 503
@@ -848,12 +853,8 @@ async function spawnPointedAtDeadEtcd(): Promise<MinimalApp> {
     proxyUrl: `http://127.0.0.1:${proxyPort}`,
     metricsUrl,
     async stop() {
-      if (child.exitCode === null) child.kill("SIGTERM");
-      await Promise.race([
-        new Promise<void>((r) => child.once("exit", () => r())),
-        new Promise<void>((r) => setTimeout(r, 3000)),
-      ]);
-      if (child.exitCode === null) child.kill("SIGKILL");
+      // SIGTERM and the gateway's own exit, so its coverage profile is written whole.
+      await stopGateway(child);
       await rm(dir, { recursive: true, force: true });
     },
   };

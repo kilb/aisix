@@ -1,10 +1,11 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { readdirSync, statSync } from "node:fs";
+import { appendFileSync, readdirSync, statSync } from "node:fs";
 import { connect } from "node:net";
 import { mkdtemp, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
+import { expect } from "vitest";
 import { stringify as yamlStringify } from "yaml";
 
 import { pickFreePorts } from "./ports.js";
@@ -404,7 +405,18 @@ function assertGatewayBinaryIsFresh(bin: string): void {
  * apps in one `beforeAll`. Keep the two in step.
  */
 const READY_TIMEOUT_MS = positiveIntEnv("AISIX_E2E_READY_TIMEOUT_MS", 20_000);
-const SHUTDOWN_GRACE_MS = 3_000;
+/**
+ * How long a gateway gets to exit after SIGTERM before it is killed.
+ *
+ * Above every bounded step of its own exit: the post-drain tail is up to 30 s
+ * (connection grace, the usage and exporter drains, the log flush), and an
+ * exporter whose receiver is gone drains for 3 s of it. A kill that lands while
+ * the process is finishing that exit catches it writing its coverage profile,
+ * and a profile cut short is one `llvm-profdata merge` refuses, failing the
+ * coverage step for the whole shard. A gateway exits on its own long before
+ * this; only one that hangs is killed, and it has written nothing.
+ */
+const SHUTDOWN_GRACE_MS = 40_000;
 
 /** Read a positive-integer override, falling back when unset or unusable. */
 function positiveIntEnv(name: string, fallback: number): number {
@@ -435,7 +447,8 @@ export const suiteThreadPerCore: boolean | undefined =
  * metrics), picks a unique etcd prefix, and waits up to 10s for `/livez`
  * on the proxy, `/admin/v1/health` on the admin listener, and the scrape
  * path on the metrics listener to respond 200. `exit()` issues SIGTERM
- * and waits up to 3s, escalating to SIGKILL.
+ * and waits for the process to exit, escalating to SIGKILL only past
+ * `SHUTDOWN_GRACE_MS`.
  *
  * A startup that dies to a port collision (an external process bound one
  * of the picked ports in the pick→bind window; see `ports.ts`) is retried
@@ -678,6 +691,7 @@ async function spawnAppOnce(overrides: AppOverrides = {}): Promise<SpawnedApp> {
     stdio: ["ignore", "pipe", "pipe"],
     env: childEnv,
   });
+  recordProfileOwner(child.pid);
   const closed = new Promise<void>((resolve) => child.once("close", () => resolve()));
 
   let stderrBuf = "";
@@ -872,6 +886,32 @@ async function waitForReady(url: string, timeoutMs: number, bearer?: string): Pr
     `timed out waiting for ${url} after ${attempts} attempts over ${timeoutMs}ms ` +
       `(lastStatus=${lastStatus ?? "n/a"}): ${lastErr ?? "no response"}`,
   );
+}
+
+/**
+ * Under coverage, which test's gateway a profile came from.
+ *
+ * The profiling runtime names each profile by pid (`%p` in
+ * `LLVM_PROFILE_FILE`), and nothing else ties a pid to a test. The coverage
+ * step in ci.yml reads this map to name the test whose gateway left a profile
+ * it cannot merge.
+ */
+export function recordProfileOwner(pid: number | undefined): void {
+  const pattern = process.env.LLVM_PROFILE_FILE;
+  if (!pattern || pid === undefined) return;
+  const { testPath, currentTestName } = expect.getState();
+  appendFileSync(
+    join(dirname(pattern), "aisix-pids.tsv"),
+    `${pid}\t${testPath ?? "?"}\t${currentTestName ?? "(setup)"}\n`,
+  );
+}
+
+/**
+ * End a gateway the way an operator does, and wait for it: SIGTERM, then the
+ * process's own exit. For a case that spawns the binary itself.
+ */
+export async function stopGateway(child: ChildProcess): Promise<void> {
+  await terminate(child);
 }
 
 async function terminate(child: ChildProcess): Promise<void> {

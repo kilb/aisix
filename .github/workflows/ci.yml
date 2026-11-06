@@ -531,8 +531,22 @@ jobs:
           fi
           host=$(rustc -vV | sed -n 's/^host: //p')
           llvm_bin="$(rustc --print sysroot)/lib/rustlib/$host/bin"
-          "$llvm_bin/llvm-profdata" merge -sparse "${profiles[@]}" \
-            -o "coverage/aisix-${{ matrix.serving }}.profdata"
+          if ! "$llvm_bin/llvm-profdata" merge -sparse "${profiles[@]}" \
+            -o "coverage/aisix-${{ matrix.serving }}.profdata"; then
+            # One profile it cannot read fails the merge. Name each one, and
+            # the test whose gateway wrote it: the harness records which
+            # test spawned each pid, and the profile is named by pid. A
+            # profile cut short means that gateway was killed while it wrote
+            # it, at exit.
+            for p in "${profiles[@]}"; do
+              "$llvm_bin/llvm-profdata" show "$p" > /dev/null 2>&1 && continue
+              pid=$(basename "$p" | sed -E 's/^aisix-${{ matrix.serving }}-([0-9]+)-.*/\1/')
+              owner=$(awk -F'\t' -v pid="$pid" '$1 == pid { print $2 " > " $3 }' \
+                coverage/aisix-pids.tsv 2>/dev/null | tail -1)
+              echo "::error::unreadable coverage profile $p, from gateway pid $pid: ${owner:-not spawned through the harness}"
+            done
+            exit 1
+          fi
           "$llvm_bin/llvm-cov" export --format=lcov \
             --instr-profile="coverage/aisix-${{ matrix.serving }}.profdata" \
             --ignore-filename-regex='/(\.cargo/(registry|git)|rustc|target|tests)/' \
