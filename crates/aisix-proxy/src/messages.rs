@@ -1966,7 +1966,7 @@ async fn anthropic_passthrough_dispatch(
             model_name.to_string(),
             state
                 .platform()
-                .map(|p| crate::opaque_id::MessagesIds::new(&p.id_key)),
+                .map(|p| crate::opaque_id::MessagesIds::new(p.tool_id_key())),
             content_cap,
             Some(estimator),
             move |usage| {
@@ -2332,7 +2332,8 @@ async fn anthropic_passthrough_dispatch(
         // Platform mode: no upstream id or channel metrics reach the caller.
         // After the metrics read above, which keeps the upstream's own id.
         if let Some(platform) = state.platform() {
-            crate::opaque_id::MessagesIds::new(&platform.id_key).apply_to_body(&mut json_body);
+            crate::opaque_id::MessagesIds::new(platform.tool_id_key())
+                .apply_to_body(&mut json_body);
         }
 
         // #932: mask-action PII rules rewrite the passthrough response body
@@ -3133,7 +3134,7 @@ async fn cross_provider_dispatch(
             model_name.to_string(),
             state
                 .platform()
-                .map(|p| crate::opaque_id::MessagesIds::new(&p.id_key)),
+                .map(|p| crate::opaque_id::MessagesIds::new(p.tool_id_key())),
             content_cap,
             Some(estimator),
             move |mut comp| {
@@ -3484,7 +3485,7 @@ async fn cross_provider_dispatch(
     // Platform mode: neither the upstream's id nor its tool-call ids reach
     // the caller. `resp` keeps them for the usage event.
     if let Some(platform) = state.platform() {
-        crate::opaque_id::MessagesIds::new(&platform.id_key).apply_to_body(&mut json);
+        crate::opaque_id::MessagesIds::new(platform.tool_id_key()).apply_to_body(&mut json);
     }
     let captured_content = content_capture_cap(
         snapshot
@@ -8939,7 +8940,10 @@ event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_toke
             now,
             chain,
             "relay-claude".into(),
-            Some(crate::opaque_id::MessagesIds::new(&[7u8; 32])),
+            Some(crate::opaque_id::MessagesIds::new(&ring::hmac::Key::new(
+                ring::hmac::HMAC_SHA256,
+                &[7u8; 32],
+            ))),
             Some(4096),
             None,
             |_| {},

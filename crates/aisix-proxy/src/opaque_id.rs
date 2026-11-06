@@ -69,15 +69,21 @@ pub(crate) fn mint_response_id(surface: Surface) -> String {
 }
 
 /// The id a tenant sees for an upstream tool-call id: the first 16 bytes of
-/// `HMAC-SHA256(key, surface || 0x00 || upstream_id)` in hex, behind the
+/// `HMAC-SHA256(id_key, surface || 0x00 || upstream_id)` in hex, behind the
 /// surface's tool-call prefix. The same input always maps to the same id.
-pub(crate) fn map_tool_call_id(key: &[u8; 32], surface: Surface, upstream_id: &str) -> String {
+/// `key` is the platform's HMAC key
+/// ([`crate::platform::PlatformSettings::tool_id_key`]), set up once.
+pub(crate) fn map_tool_call_id(key: &hmac::Key, surface: Surface, upstream_id: &str) -> String {
     mapped_id(key, surface, surface.tool_call_id_prefix(), upstream_id)
 }
 
 /// [`map_tool_call_id`]'s HMAC behind `prefix`.
-fn mapped_id(key: &[u8; 32], surface: Surface, prefix: &str, upstream_id: &str) -> String {
-    let tag = hmac_parts(key, &[surface.label(), &[0], upstream_id.as_bytes()]);
+fn mapped_id(key: &hmac::Key, surface: Surface, prefix: &str, upstream_id: &str) -> String {
+    let mut ctx = hmac::Context::with_key(key);
+    for part in [surface.label(), &[0], upstream_id.as_bytes()] {
+        ctx.update(part);
+    }
+    let tag = ctx.sign();
     let mut id = String::with_capacity(prefix.len() + 32);
     id.push_str(prefix);
     for byte in &tag.as_ref()[..16] {
@@ -99,7 +105,7 @@ const MESSAGES_TOOL_ID_FAMILIES: [&str; 3] = ["srvtoolu_", "mcptoolu_", "toolu_"
 /// `^srvtoolu_[a-zA-Z0-9_]+$` of a `server_tool_use` block's `id`, a server
 /// tool result's `tool_use_id` and a `caller`'s `tool_id`,
 /// <https://platform.claude.com/docs/en/api/messages>).
-pub(crate) fn map_messages_tool_id(key: &[u8; 32], upstream_id: &str) -> String {
+pub(crate) fn map_messages_tool_id(key: &hmac::Key, upstream_id: &str) -> String {
     let prefix = MESSAGES_TOOL_ID_FAMILIES
         .iter()
         .find(|family| upstream_id.starts_with(*family))
@@ -124,7 +130,7 @@ pub(crate) fn is_platform_id(surface: Surface, id: &str) -> bool {
 
 /// Map the `id` of every call in an OpenAI-shape `tool_calls` list. A
 /// streamed continuation carries no id, and an empty one is left empty.
-pub(crate) fn map_tool_calls(key: &[u8; 32], surface: Surface, calls: &mut [Value]) {
+pub(crate) fn map_tool_calls(key: &hmac::Key, surface: Surface, calls: &mut [Value]) {
     for call in calls {
         if let Some(Value::String(id)) = call.get_mut("id") {
             if !id.is_empty() {
@@ -277,15 +283,17 @@ pub(crate) fn unpad(padded: &[u8]) -> Option<&[u8]> {
 /// for that other tenant: a seal made for anyone else does not open, and
 /// passes through as the opaque string it is.
 ///
-/// Building one sets up both keys, so a request builds one and seals or
+/// The keys are set up once, in [`crate::platform::PlatformSettings`]
+/// ([`SealKeys`]); a request builds one sealer for its owner and seals or
 /// unseals every id it handles with it.
-#[derive(Clone)]
 pub(crate) struct Sealer {
-    nonce_key: hmac::Key,
-    cipher: aead::LessSafeKey,
+    keys: std::sync::Arc<SealKeys>,
     /// The owner, length-prefixed: the bytes the nonce and the associated
     /// data carry, so no owner's bytes are another owner's followed by more.
     owner: Vec<u8>,
+    /// The last id sealed, as `(kind, id, sealed)`: a stream names the same
+    /// item on every delta, and this seals it once.
+    last: std::sync::Mutex<Option<(IdKind, String, String)>>,
 }
 
 impl std::fmt::Debug for Sealer {
@@ -294,25 +302,50 @@ impl std::fmt::Debug for Sealer {
     }
 }
 
-impl Sealer {
-    /// The sealer of platform mode for `owner`'s ids: its keys come from
-    /// [`seal_key`].
-    pub(crate) fn of(platform: &crate::platform::PlatformSettings, owner: &str) -> Self {
-        Self::new(&seal_key(&platform.id_key), owner)
-    }
+/// The two keys [`Sealer`] seals under, set up once from the seal key
+/// ([`seal_key`]): the nonce function's HMAC key, and the AES-256-GCM cipher
+/// under a key derived from it under its own label.
+pub(crate) struct SealKeys {
+    nonce_key: hmac::Key,
+    cipher: aead::LessSafeKey,
+}
 
-    pub(crate) fn new(key: &[u8; 32], owner: &str) -> Self {
+impl SealKeys {
+    pub(crate) fn new(key: &[u8; 32]) -> Self {
         #[cfg(test)]
-        tests::SEALERS_BUILT.with(|n| n.set(n.get() + 1));
+        tests::SEAL_KEYS_BUILT.with(|n| n.set(n.get() + 1));
         let cipher = aead::UnboundKey::new(&aead::AES_256_GCM, &derive_key(key, b"seal-aead"))
             .expect("a 32-byte key is the length AES-256-GCM takes");
+        Self {
+            nonce_key: hmac::Key::new(hmac::HMAC_SHA256, key),
+            cipher: aead::LessSafeKey::new(cipher),
+        }
+    }
+}
+
+impl Sealer {
+    /// The sealer of platform mode for `owner`'s ids, under the keys the
+    /// settings set up once.
+    pub(crate) fn of(platform: &crate::platform::PlatformSettings, owner: &str) -> Self {
+        Self::with_keys(platform.seal_keys().clone(), owner)
+    }
+
+    /// A sealer under keys set up from `key` for this one sealer.
+    #[cfg(test)]
+    pub(crate) fn new(key: &[u8; 32], owner: &str) -> Self {
+        Self::with_keys(std::sync::Arc::new(SealKeys::new(key)), owner)
+    }
+
+    fn with_keys(keys: std::sync::Arc<SealKeys>, owner: &str) -> Self {
+        #[cfg(test)]
+        tests::SEALERS_BUILT.with(|n| n.set(n.get() + 1));
         let mut owner_bytes = Vec::with_capacity(8 + owner.len());
         owner_bytes.extend_from_slice(&(owner.len() as u64).to_be_bytes());
         owner_bytes.extend_from_slice(owner.as_bytes());
         Self {
-            nonce_key: hmac::Key::new(hmac::HMAC_SHA256, key),
-            cipher: aead::LessSafeKey::new(cipher),
+            keys,
             owner: owner_bytes,
+            last: std::sync::Mutex::new(None),
         }
     }
 
@@ -323,7 +356,7 @@ impl Sealer {
     }
 
     fn nonce(&self, kind: IdKind, id: &str) -> [u8; aead::NONCE_LEN] {
-        let mut ctx = hmac::Context::with_key(&self.nonce_key);
+        let mut ctx = hmac::Context::with_key(&self.keys.nonce_key);
         ctx.update(b"seal");
         ctx.update(&[0]);
         ctx.update(&self.owner);
@@ -338,12 +371,31 @@ impl Sealer {
     /// ciphertext of the padded id, with the owner, the kind and the shown
     /// prefix as associated data.
     pub(crate) fn seal(&self, kind: IdKind, id: &str) -> String {
+        // A poisoned memo is only a lost shortcut.
+        if let Ok(last) = self.last.lock() {
+            if let Some((k, plain, sealed)) = last.as_ref() {
+                if *k == kind && plain == id {
+                    return sealed.clone();
+                }
+            }
+        }
+        let sealed = self.seal_fresh(kind, id);
+        if let Ok(mut last) = self.last.lock() {
+            *last = Some((kind, id.to_string(), sealed.clone()));
+        }
+        sealed
+    }
+
+    fn seal_fresh(&self, kind: IdKind, id: &str) -> String {
+        #[cfg(test)]
+        tests::SEALS_MADE.with(|n| n.set(n.get() + 1));
         let prefix = kind.shown_prefix(id);
         let nonce = self.nonce(kind, id);
         let mut sealed = pad(id);
         let mut payload = Vec::with_capacity(aead::NONCE_LEN + sealed.len() + aead::MAX_TAG_LEN);
         payload.extend_from_slice(&nonce);
-        self.cipher
+        self.keys
+            .cipher
             .seal_in_place_append_tag(
                 aead::Nonce::assume_unique_for_key(nonce),
                 aead::Aad::from(self.aad(kind, prefix)),
@@ -379,6 +431,7 @@ impl Sealer {
         let (nonce, sealed) = raw.split_at(aead::NONCE_LEN);
         let mut buf = sealed.to_vec();
         let plain = self
+            .keys
             .cipher
             .open_in_place(
                 aead::Nonce::try_assume_unique_for_key(nonce).ok()?,
@@ -602,7 +655,7 @@ pub(crate) fn strip_channel_metrics(doc: &[u8]) -> Option<Vec<u8>> {
 /// the one message id the whole response carries, and the key its tool-use
 /// ids are mapped under. Serves the native relay and the translated path.
 pub(crate) struct MessagesIds {
-    key: [u8; 32],
+    key: hmac::Key,
     message_id: String,
 }
 
@@ -658,9 +711,11 @@ struct MessagesSplice {
 }
 
 impl MessagesIds {
-    pub(crate) fn new(id_key: &[u8; 32]) -> Self {
+    /// `tool_id_key` is the platform's
+    /// ([`crate::platform::PlatformSettings::tool_id_key`]).
+    pub(crate) fn new(tool_id_key: &hmac::Key) -> Self {
         Self {
-            key: *id_key,
+            key: tool_id_key.clone(),
             message_id: mint_response_id(Surface::Messages),
         }
     }
@@ -820,6 +875,15 @@ pub(crate) mod tests {
     thread_local! {
         /// How many [`Sealer`]s this test's thread has built.
         pub(crate) static SEALERS_BUILT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        /// How many [`SealKeys`] this test's thread has set up.
+        pub(crate) static SEAL_KEYS_BUILT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        /// How many seals this test's thread has computed, memo hits aside.
+        pub(crate) static SEALS_MADE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    /// The HMAC key tool-call ids are mapped under, for a raw test key.
+    fn mac(key: &[u8; 32]) -> hmac::Key {
+        hmac::Key::new(hmac::HMAC_SHA256, key)
     }
 
     fn sealers_built() -> usize {
@@ -830,14 +894,14 @@ pub(crate) mod tests {
     fn a_tool_call_id_maps_the_same_way_every_time() {
         let k = [7u8; 32];
         assert_eq!(
-            map_tool_call_id(&k, Surface::Messages, "toolu_bdrk_01ABC"),
-            map_tool_call_id(&k, Surface::Messages, "toolu_bdrk_01ABC")
+            map_tool_call_id(&mac(&k), Surface::Messages, "toolu_bdrk_01ABC"),
+            map_tool_call_id(&mac(&k), Surface::Messages, "toolu_bdrk_01ABC")
         );
     }
 
     #[test]
     fn a_mapped_id_hides_the_channel_marker() {
-        let id = map_tool_call_id(&[7u8; 32], Surface::Messages, "toolu_bdrk_01ABC");
+        let id = map_tool_call_id(&mac(&[7u8; 32]), Surface::Messages, "toolu_bdrk_01ABC");
         assert!(id.starts_with("toolu_") && !id.contains("bdrk"), "{id}");
     }
 
@@ -845,15 +909,15 @@ pub(crate) mod tests {
     fn different_upstream_ids_map_to_different_ids() {
         let k = [7u8; 32];
         assert_ne!(
-            map_tool_call_id(&k, Surface::Chat, "call_a"),
-            map_tool_call_id(&k, Surface::Chat, "call_b")
+            map_tool_call_id(&mac(&k), Surface::Chat, "call_a"),
+            map_tool_call_id(&mac(&k), Surface::Chat, "call_b")
         );
     }
 
     #[test]
     fn mapped_ids_carry_the_surface_prefix_and_depend_on_the_key() {
-        let chat = map_tool_call_id(&K, Surface::Chat, "toolu_vrtx_01");
-        let messages = map_tool_call_id(&K, Surface::Messages, "toolu_vrtx_01");
+        let chat = map_tool_call_id(&mac(&K), Surface::Chat, "toolu_vrtx_01");
+        let messages = map_tool_call_id(&mac(&K), Surface::Messages, "toolu_vrtx_01");
         assert!(chat.starts_with("call_"), "{chat}");
         assert!(is_platform_id(Surface::Chat, &chat), "{chat}");
         assert!(is_platform_id(Surface::Messages, &messages), "{messages}");
@@ -864,7 +928,7 @@ pub(crate) mod tests {
         );
         assert_ne!(
             chat,
-            map_tool_call_id(&[8u8; 32], Surface::Chat, "toolu_vrtx_01")
+            map_tool_call_id(&mac(&[8u8; 32]), Surface::Chat, "toolu_vrtx_01")
         );
     }
 
@@ -1324,6 +1388,27 @@ pub(crate) mod tests {
         assert_eq!(plain, json!({"model": "m", "input": "hi"}));
     }
 
+    /// A stream names one item on every delta: the sealer seals it once and
+    /// hands back the same value, and a different id is sealed afresh.
+    #[test]
+    fn a_repeated_id_is_sealed_once() {
+        let made = || SEALS_MADE.with(std::cell::Cell::get);
+        let sealer = Sealer::new(&K, T);
+        let msg_2 = seal_id(&K, T, "msg_2");
+        let before = made();
+        let first = sealer.seal(IdKind::Item, "fc_bdrk_1");
+        for _ in 0..50 {
+            assert_eq!(sealer.seal(IdKind::Item, "fc_bdrk_1"), first);
+        }
+        assert_eq!(made() - before, 1);
+        // Another id, or the same one as another kind, is not the memo's.
+        let call = sealer.seal(IdKind::Call, "fc_bdrk_1");
+        assert_ne!(call, first);
+        assert_eq!(sealer.seal(IdKind::Item, "msg_2"), msg_2);
+        assert_eq!(sealer.seal(IdKind::Item, "fc_bdrk_1"), first);
+        assert_eq!(made() - before, 4);
+    }
+
     /// A body of many items whose ids are too short to be seals is one walk:
     /// no key is set up and no value is decoded.
     #[test]
@@ -1353,7 +1438,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_messages_body_gets_a_new_id_mapped_tool_use_ids_and_no_channel_metrics() {
-        let ids = MessagesIds::new(&K);
+        let ids = MessagesIds::new(&mac(&K));
         let mut body = json!({
             "id": "msg_bdrk_01X",
             "type": "message",
@@ -1372,12 +1457,12 @@ pub(crate) mod tests {
         );
         assert_eq!(
             body["content"][1]["id"],
-            map_tool_call_id(&K, Surface::Messages, "toolu_bdrk_01Y")
+            map_tool_call_id(&mac(&K), Surface::Messages, "toolu_bdrk_01Y")
         );
         // A server tool's id is mapped behind its own family prefix.
         assert_eq!(
             body["content"][2]["id"],
-            map_messages_tool_id(&K, "srvtoolu_01")
+            map_messages_tool_id(&mac(&K), "srvtoolu_01")
         );
         assert!(body.get("amazon-bedrock-invocationMetrics").is_none());
         assert_eq!(
@@ -1388,7 +1473,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_messages_stream_shares_one_id_and_maps_tool_use_blocks() {
-        let ids = MessagesIds::new(&K);
+        let ids = MessagesIds::new(&mac(&K));
         let start = br#"{"type":"message_start","message":{"id":"msg_bdrk_01X","model":"up","usage":{"input_tokens":1e2}}}"#;
         let out = String::from_utf8(ids.rewrite_event_json(start, "alias").unwrap()).unwrap();
         assert_eq!(
@@ -1401,7 +1486,7 @@ pub(crate) mod tests {
 
         let block = br#"{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_bdrk_01Y","name":"f","input":{}}}"#;
         let out = String::from_utf8(ids.rewrite_event_json(block, "alias").unwrap()).unwrap();
-        let mapped = map_tool_call_id(&K, Surface::Messages, "toolu_bdrk_01Y");
+        let mapped = map_tool_call_id(&mac(&K), Surface::Messages, "toolu_bdrk_01Y");
         assert!(out.contains(&format!(r#""id":"{mapped}""#)), "{out}");
         // The id ahead of the type is still read against it.
         let id_first = br#"{"type":"content_block_start","index":1,"content_block":{"id":"toolu_bdrk_01Y","type":"tool_use"}}"#;
@@ -1437,8 +1522,8 @@ pub(crate) mod tests {
             "",
         ] {
             assert_eq!(
-                map_messages_tool_id(&K, upstream),
-                map_tool_call_id(&K, Surface::Messages, upstream),
+                map_messages_tool_id(&mac(&K), upstream),
+                map_tool_call_id(&mac(&K), Surface::Messages, upstream),
                 "{upstream}"
             );
         }
@@ -1450,7 +1535,7 @@ pub(crate) mod tests {
     /// API sets for them on the next turn.
     #[test]
     fn server_and_mcp_tool_ids_are_mapped_behind_their_family_prefix() {
-        let ids = MessagesIds::new(&K);
+        let ids = MessagesIds::new(&mac(&K));
         let mut body = json!({
             "id": "msg_vrtx_01M",
             "type": "message",
@@ -1487,7 +1572,7 @@ pub(crate) mod tests {
         assert_eq!(c[4]["tool_use_id"], c[2]["id"]);
         assert_eq!(
             c[3]["id"],
-            map_tool_call_id(&K, Surface::Messages, "toolu_vrtx_03")
+            map_tool_call_id(&mac(&K), Surface::Messages, "toolu_vrtx_03")
         );
         let mcp = c[5]["id"].as_str().unwrap();
         assert!(pattern(mcp, "mcptoolu_"), "{mcp}");
@@ -1500,9 +1585,9 @@ pub(crate) mod tests {
     /// its fields in.
     #[test]
     fn a_messages_stream_maps_server_and_mcp_tool_ids() {
-        let ids = MessagesIds::new(&K);
-        let server = map_messages_tool_id(&K, "srvtoolu_vrtx_01S");
-        let mcp = map_messages_tool_id(&K, "mcptoolu_vrtx_04");
+        let ids = MessagesIds::new(&mac(&K));
+        let server = map_messages_tool_id(&mac(&K), "srvtoolu_vrtx_01S");
+        let mcp = map_messages_tool_id(&mac(&K), "mcptoolu_vrtx_04");
         for (frame, mapped) in [
             (
                 &br#"{"type":"content_block_start","index":0,"content_block":{"type":"server_tool_use","id":"srvtoolu_vrtx_01S","name":"web_search","input":{}}}"#[..],
@@ -1537,7 +1622,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_messages_encoder_event_gets_the_same_treatment() {
-        let ids = MessagesIds::new(&K);
+        let ids = MessagesIds::new(&mac(&K));
         let mut start =
             json!({"type": "message_start", "message": {"id": "msg_gw", "content": []}});
         let mut block = json!({"type": "content_block_start", "index": 0,
@@ -1547,7 +1632,7 @@ pub(crate) mod tests {
         assert_eq!(start["message"]["id"], ids.message_id.as_str());
         assert_eq!(
             block["content_block"]["id"],
-            map_tool_call_id(&K, Surface::Messages, "call_up_1")
+            map_tool_call_id(&mac(&K), Surface::Messages, "call_up_1")
         );
     }
 
@@ -1557,10 +1642,10 @@ pub(crate) mod tests {
             json!({"index": 0, "id": "toolu_bdrk_01Y", "type": "function", "function": {"name": "f", "arguments": ""}}),
             json!({"index": 0, "function": {"arguments": "{}"}}),
         ];
-        map_tool_calls(&K, Surface::Chat, &mut calls);
+        map_tool_calls(&mac(&K), Surface::Chat, &mut calls);
         assert_eq!(
             calls[0]["id"],
-            map_tool_call_id(&K, Surface::Chat, "toolu_bdrk_01Y")
+            map_tool_call_id(&mac(&K), Surface::Chat, "toolu_bdrk_01Y")
         );
         assert!(
             calls[1].get("id").is_none(),

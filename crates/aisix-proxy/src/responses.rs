@@ -3878,14 +3878,10 @@ fn drain_responses_sse_frames(
             attempt_started,
             first_frame_seen,
         );
-        let restamped = crate::model_echo::restamp_sse_frame(
-            &frame,
-            client_facing_model,
-            crate::model_echo::responses_snapshot_model,
-        );
-        let forwarded = restamped.as_deref().unwrap_or(&frame);
-        let tagged = mark.apply_to_sse_frame(forwarded);
-        let forwarded = tagged.as_deref().unwrap_or(forwarded);
+        // The caller-facing model and the context tags (and in platform mode
+        // the sealed ids) in one splice pass.
+        let tagged = mark.restamp_and_tag_sse_frame(&frame, client_facing_model);
+        let forwarded = tagged.as_deref().unwrap_or(&frame);
         // A failure the upstream reported reaches the caller as sent, less the
         // credentials this request sent it; in platform mode, as the class of
         // the error it reports.
