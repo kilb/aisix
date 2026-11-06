@@ -15,7 +15,7 @@ use std::str::FromStr;
 
 use futures::future::BoxFuture;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
-use sqlx::{PgConnection, PgPool};
+use sqlx::{Connection, PgConnection, PgPool};
 
 /// Connections per control-plane instance.
 const MAX_CONNECTIONS: u32 = 10;
@@ -56,23 +56,25 @@ pub struct Db {
 }
 
 impl Db {
-    /// Connects, setting `lock_timeout` and `statement_timeout` on every
-    /// connection, and applies the migrations.
+    /// Applies the migrations, then opens the pool, setting `lock_timeout`
+    /// and `statement_timeout` on every pool connection.
     pub async fn connect(
         url: &str,
         lock_timeout_ms: u64,
         statement_timeout_ms: u64,
     ) -> Result<Db, DbError> {
-        let options = PgConnectOptions::from_str(url)?.options([
-            ("lock_timeout", lock_timeout_ms),
-            ("statement_timeout", statement_timeout_ms),
-        ]);
-        let pool = PgPoolOptions::new()
-            .max_connections(MAX_CONNECTIONS)
-            .connect_with(options)
-            .await?;
+        let options = PgConnectOptions::from_str(url)?;
+        // Migrations run on a connection of their own with neither timeout.
         // sqlx holds an advisory lock for the whole run, so instances that
-        // boot together apply each migration once.
+        // boot together apply each migration once, and the others wait for
+        // that run however long it takes; a timeout there, or on a long
+        // migration statement, would fail every replica's boot over and over.
+        let mut migration_conn = PgConnection::connect_with(
+            &options
+                .clone()
+                .options([("lock_timeout", 0), ("statement_timeout", 0)]),
+        )
+        .await?;
         let mut migrator = sqlx::migrate!("./migrations");
         // A database that a newer build has migrated further still opens, so
         // an older instance can run beside a newer one or after a rollback.
@@ -82,10 +84,18 @@ impl Db {
         // reordered: sqlx refuses a changed checksum, and a reorder applies
         // the same set in different orders on different databases.
         migrator.set_ignore_missing(true);
-        migrator
-            .run(&pool)
-            .await
-            .map_err(|e| DbError::Db(sqlx::Error::Migrate(Box::new(e))))?;
+        let migrated = migrator.run(&mut migration_conn).await;
+        // The run's own error is the one to report; closing only spares the
+        // server a dangling session.
+        let _ = migration_conn.close().await;
+        migrated.map_err(|e| DbError::Db(sqlx::Error::Migrate(Box::new(e))))?;
+        let pool = PgPoolOptions::new()
+            .max_connections(MAX_CONNECTIONS)
+            .connect_with(options.options([
+                ("lock_timeout", lock_timeout_ms),
+                ("statement_timeout", statement_timeout_ms),
+            ]))
+            .await?;
         Ok(Db { pool })
     }
 

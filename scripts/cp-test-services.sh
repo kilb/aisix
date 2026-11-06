@@ -8,7 +8,7 @@
 #   start  create the cluster (first time only) and start it, create database
 #          kine_test, and start kine on it, fetching the pinned binary with
 #          scripts/fetch-kine.sh unless CP_TEST_KINE_BIN names one
-#   env    print the export lines the tests read:
+#   env    print the export lines the tests read, once `start` has run:
 #            eval "$(scripts/cp-test-services.sh env)"
 #   stop   stop kine, then Postgres (the data directory is kept)
 #
@@ -20,6 +20,12 @@
 #
 # Pass the same environment to every subcommand: `env` and `stop` derive the
 # ports and paths from it the way `start` did.
+#
+# Nothing here acts on a server it did not start: `start` and `env` refuse
+# unless the cluster in the state directory is running AND listening on
+# CP_TEST_PG_PORT, since another Postgres may well hold that port. kine runs
+# only from a state directory owned by the caller and only if its sha256 is
+# the pin in scripts/fetch-kine.sh.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." >/dev/null && pwd)"
@@ -43,6 +49,34 @@ pg_running() {
   [ -f "$DIR/data/PG_VERSION" ] && "$PG_BIN/pg_ctl" -D "$DIR/data" status >/dev/null 2>&1
 }
 
+# The port this directory's postmaster listens on: line 4 of postmaster.pid.
+cluster_port() {
+  sed -n 4p "$DIR/data/postmaster.pid" 2>/dev/null | tr -d '[:space:]'
+}
+
+# Exits unless this directory's own cluster is running on PG_PORT.
+require_own_cluster() {
+  if ! pg_running; then
+    echo "cp-test-services: the cluster in $DIR/data is not running; run start first" >&2
+    exit 1
+  fi
+  local port
+  port="$(cluster_port)"
+  if [ "$port" != "$PG_PORT" ]; then
+    echo "cp-test-services: the cluster in $DIR/data listens on port ${port:-<unknown>}, not on CP_TEST_PG_PORT=${PG_PORT}; refusing to touch port ${PG_PORT}" >&2
+    exit 1
+  fi
+}
+
+# Exits unless the state directory belongs to the caller: kine and the
+# cluster are run from it.
+require_own_dir() {
+  if [ ! -O "$DIR" ]; then
+    echo "cp-test-services: $DIR is not owned by $(id -un); refusing to use it" >&2
+    exit 1
+  fi
+}
+
 # The pid file names a live kine process (not a recycled pid).
 kine_running() {
   local pid
@@ -58,6 +92,7 @@ port_open() {
 
 start() {
   mkdir -p "$DIR"
+  require_own_dir
   if [ ! -f "$DIR/data/PG_VERSION" ]; then
     "$PG_BIN/initdb" -U postgres --auth=trust -D "$DIR/data" >"$DIR/initdb.log"
   fi
@@ -68,6 +103,7 @@ start() {
       -o "-p ${PG_PORT} -c listen_addresses=127.0.0.1 -c unix_socket_directories='' -c fsync=off -c synchronous_commit=off -c full_page_writes=off" \
       start >/dev/null
   fi
+  require_own_cluster
   if [ "$("$PG_BIN/psql" "$PG_URL" -tAc "SELECT 1 FROM pg_database WHERE datname = 'kine_test'")" != 1 ]; then
     "$PG_BIN/psql" "$PG_URL" -qc "CREATE DATABASE kine_test"
   fi
@@ -75,6 +111,12 @@ start() {
     if [ -z "${CP_TEST_KINE_BIN:-}" ] && [ ! -x "$KINE_BIN" ]; then
       "$ROOT/scripts/fetch-kine.sh" "$KINE_BIN"
     fi
+    # Checked again on every start, not only after the download: the file
+    # may have changed since.
+    "$ROOT/scripts/fetch-kine.sh" --verify "$KINE_BIN" || {
+      echo "cp-test-services: refusing to run $KINE_BIN" >&2
+      exit 1
+    }
     [ -x "$KINE_BIN" ] || { echo "cp-test-services: $KINE_BIN is not executable" >&2; exit 1; }
     nohup "$KINE_BIN" \
       --endpoint "postgres://postgres@127.0.0.1:${PG_PORT}/kine_test?sslmode=disable" \
@@ -95,10 +137,14 @@ start() {
 }
 
 stop() {
+  [ -e "$DIR" ] || return 0
+  require_own_dir
   if kine_running; then
     local pid
     pid="$(cat "$DIR/kine.pid")"
-    kill "$pid"
+    # It may exit between the check and the kill; Postgres is stopped
+    # either way.
+    kill "$pid" 2>/dev/null || true
     for _ in $(seq 50); do
       kill -0 "$pid" 2>/dev/null || break
       sleep 0.2
@@ -111,6 +157,7 @@ stop() {
 }
 
 print_env() {
+  require_own_cluster
   printf 'export CP_TEST_DATABASE_URL=%q\n' "$PG_URL"
   printf 'export CP_TEST_KINE_ENDPOINT=%q\n' "http://127.0.0.1:${KINE_PORT}"
   printf 'export CP_TEST_KINE_BIN=%q\n' "$KINE_BIN"

@@ -156,7 +156,16 @@ impl ApiError {
 
 impl From<DbError> for ApiError {
     fn from(e: DbError) -> ApiError {
-        ApiError::internal(e)
+        match e {
+            // Contention rather than a fault: the same request can succeed
+            // when retried, so it is answered as retryable. Still logged, as
+            // a run of them means something holds a lock too long.
+            DbError::LockTimeout => {
+                tracing::warn!(error = %e, "database lock timeout");
+                ApiError::unavailable()
+            }
+            e => ApiError::internal(e),
+        }
     }
 }
 
@@ -199,4 +208,90 @@ pub enum BootError {
     Listen(std::io::Error),
     #[error("the browser listener (CP_HTTP_ADDR) stopped: {0}")]
     Serve(std::io::Error),
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::{json, Value};
+
+    use super::*;
+
+    async fn answer(e: ApiError) -> (StatusCode, Value) {
+        let response = e.into_response();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read the body");
+        (status, serde_json::from_slice(&body).expect("a JSON body"))
+    }
+
+    /// The body without its human-readable `error`, after checking that it
+    /// is a non-empty string.
+    fn without_message(mut body: Value) -> Value {
+        let message = body
+            .as_object_mut()
+            .and_then(|o| o.remove("error"))
+            .expect("an error field");
+        assert!(message.as_str().is_some_and(|m| !m.is_empty()), "{message}");
+        body
+    }
+
+    #[tokio::test]
+    async fn the_envelope_carries_only_the_fields_an_error_has() {
+        let id = Uuid::new_v4();
+        let (status, body) = answer(ApiError::in_use(vec![Referrer {
+            kind: "models".to_string(),
+            id,
+            name: Some("grp-alpha-7c1".to_string()),
+        }]))
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            without_message(body),
+            json!({
+                "code": "in_use",
+                "referenced_by": [{"kind": "models", "id": id.to_string(), "name": "grp-alpha-7c1"}],
+            })
+        );
+
+        let (status, body) = answer(ApiError::version_mismatch(3)).await;
+        assert_eq!(status, StatusCode::PRECONDITION_FAILED);
+        assert_eq!(
+            without_message(body),
+            json!({"code": "version_mismatch", "current_version": 3})
+        );
+
+        let (status, body) = answer(ApiError::validation(vec![Detail {
+            path: "/display_name".to_string(),
+            message: "必填".to_string(),
+        }]))
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            without_message(body),
+            json!({
+                "code": "validation_failed",
+                "details": [{"path": "/display_name", "message": "必填"}],
+            })
+        );
+
+        let (status, body) = answer(ApiError::internal("pw-7c1")).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!body.to_string().contains("pw-7c1"), "{body}");
+        assert_eq!(without_message(body), json!({"code": "internal"}));
+    }
+
+    #[tokio::test]
+    async fn a_lock_timeout_is_retryable_and_other_database_errors_are_internal() {
+        let (status, body) = answer(ApiError::from(DbError::LockTimeout)).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["code"], "unavailable");
+
+        let (status, body) = answer(ApiError::from(DbError::UniqueViolation {
+            constraint: "cp_settings_pkey".to_string(),
+        }))
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!body.to_string().contains("cp_settings_pkey"), "{body}");
+    }
 }

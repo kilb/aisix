@@ -229,6 +229,19 @@ fn config_defaults_and_the_derived_gateway_url() {
         cfg.dp_etcd_endpoint().as_deref(),
         Some("dp.example.com:443")
     );
+
+    // kine on any loopback address.
+    for kine in [
+        "http://localhost:2379",
+        "http://[::1]:2379",
+        "http://127.0.0.2:2379",
+        "127.0.0.1:2379",
+    ] {
+        let mut vars = required(&key);
+        vars.push(("CP_KINE_ENDPOINT", kine));
+        let cfg = CpConfig::from_vars(&vars).unwrap_or_else(|e| panic!("{kine}: {e}"));
+        assert_eq!(cfg.kine_endpoint, kine);
+    }
 }
 
 #[test]
@@ -252,6 +265,9 @@ fn each_config_error_names_its_variable_and_not_its_value() {
         ("CP_INSTANCE_STALE_SECS", "soon"),
         ("CP_DB_LOCK_TIMEOUT_MS", "0"),
         ("CP_DB_STATEMENT_TIMEOUT_MS", "-5"),
+        ("CP_KINE_ENDPOINT", "http://10.0.0.5:2379"),
+        ("CP_KINE_ENDPOINT", "http://kine.example.com:2379"),
+        ("CP_KINE_ENDPOINT", "not a url"),
         ("CP_MASTER_KEY_FILE", empty_key_file.path_str()),
     ];
     for (var, value) in cases {
@@ -483,6 +499,43 @@ async fn a_dropped_caller_does_not_leave_a_transaction_open() {
 }
 
 #[tokio::test]
+async fn migrations_wait_for_a_lock_instead_of_timing_out() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    // Another session (a replica's long migration, an operator's maintenance)
+    // holds the migrations table for longer than the configured lock timeout.
+    let mut holder = cp.db().pool().begin().await.expect("begin");
+    sqlx::query("LOCK TABLE _sqlx_migrations IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *holder)
+        .await
+        .expect("hold the migrations table");
+    let release = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        holder.rollback().await
+    });
+    let started = Instant::now();
+    let db = Db::connect(cp.database_url(), 100, 30_000)
+        .await
+        .expect("the migration run waits for the lock instead of failing the boot");
+    assert!(
+        started.elapsed() >= Duration::from_millis(400),
+        "the migration run never waited: {:?}",
+        started.elapsed()
+    );
+    release.await.expect("join").expect("release the lock");
+    // The pool itself keeps the configured timeouts.
+    let mut conn = db.pool().acquire().await.expect("a connection");
+    for (setting, expected) in [("lock_timeout", "100ms"), ("statement_timeout", "30s")] {
+        let value: String = sqlx::query_scalar(&format!("SHOW {setting}"))
+            .fetch_one(&mut *conn)
+            .await
+            .expect("show");
+        assert_eq!(value, expected, "{setting}");
+    }
+}
+
+#[tokio::test]
 async fn a_database_migrated_by_a_newer_build_still_opens() {
     let Some(cp) = TestCp::start().await else {
         return;
@@ -537,13 +590,13 @@ fn an_uncast_sum_is_reported() {
 
 #[test]
 fn the_crate_has_no_uncast_sum() {
-    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let mut pending = vec![src];
+    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut pending = vec![crate_dir.join("src"), crate_dir.join("migrations")];
     let mut scanned = Vec::new();
     let mut found = Vec::new();
     while let Some(dir) = pending.pop() {
-        for entry in std::fs::read_dir(&dir).expect("read a src/ directory") {
-            let path = entry.expect("a src/ entry").path();
+        for entry in std::fs::read_dir(&dir).expect("read a directory") {
+            let path = entry.expect("a directory entry").path();
             if path.is_dir() {
                 pending.push(path);
                 continue;
@@ -555,9 +608,11 @@ fn the_crate_has_no_uncast_sum() {
             scanned.push(path);
         }
     }
-    assert!(
-        scanned.iter().any(|p| p.ends_with("db.rs")),
-        "scanned {scanned:?}"
-    );
+    for expected in ["db.rs", "0001_settings.sql"] {
+        assert!(
+            scanned.iter().any(|p| p.ends_with(expected)),
+            "{expected} not among {scanned:?}"
+        );
+    }
     assert!(found.is_empty(), "cast every SUM to ::bigint: {found:#?}");
 }

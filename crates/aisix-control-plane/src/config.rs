@@ -10,7 +10,7 @@
 //! | `CP_HTTP_ADDR` | `127.0.0.1:8090` | Browser listener (`/healthz`, `/admin/*`, `/api/*`), meant to sit behind a reverse proxy. |
 //! | `CP_DP_ADDR` | `0.0.0.0:7943` | Gateway listener (mTLS: `/dp/*` and the read-only etcd front). |
 //! | `CP_DP_BASE_URL` | `https://<first CP_DP_HOSTS entry>:<port of CP_DP_ADDR>` | The URL gateways are given for the gateway listener; must be `https://`. The gateways' etcd endpoint is its `host:port` (443 when it names no port). |
-//! | `CP_KINE_ENDPOINT` | `http://127.0.0.1:2379` | kine's etcd endpoint. Loopback and plaintext: kine has no authentication of its own, so it must never listen beyond this host. |
+//! | `CP_KINE_ENDPOINT` | `http://127.0.0.1:2379` | kine's etcd endpoint, plaintext. Must name a loopback address (`127.0.0.0/8`, `::1` or `localhost`), checked at boot: kine has no authentication of its own, so it must never listen beyond this host. |
 //! | `CP_ETCD_PREFIX` | `/aisix` | Root of the etcd key space. Gateway resources live under `<prefix>/<env_id>/`, shared ones under `<prefix>/global/`. A trailing `/` is dropped. Fixed by the first boot: a later boot with another prefix refuses to start. |
 //! | `CP_ENV_ID` | unset | Seeds the environment id (a UUID) on the first boot; unset, the first boot mints one. A later boot whose `CP_ENV_ID` disagrees with the stored id refuses to start. |
 //! | `CP_INSTANCE_STALE_SECS` | `60` | A gateway instance whose last heartbeat is older than this many seconds is shown as offline. |
@@ -177,9 +177,7 @@ impl CpConfig {
             Some(url) => parse_base_url(url)?,
             None => default_base_url(&dp_hosts[0], dp_addr.port()),
         };
-        let kine_endpoint = get("CP_KINE_ENDPOINT")
-            .unwrap_or("http://127.0.0.1:2379")
-            .to_string();
+        let kine_endpoint = parse_kine_endpoint(get("CP_KINE_ENDPOINT"))?;
         let etcd_prefix = parse_prefix(get("CP_ETCD_PREFIX"))?;
         let env_id_seed = get("CP_ENV_ID")
             .map(|v| {
@@ -297,6 +295,32 @@ fn parse_addr(
             reason: "must be an IP address and port, such as 127.0.0.1:8090",
         }),
     }
+}
+
+/// The endpoint as written, once its host is known to be loopback.
+fn parse_kine_endpoint(raw: Option<&str>) -> Result<String, ConfigError> {
+    let Some(raw) = raw else {
+        return Ok("http://127.0.0.1:2379".to_string());
+    };
+    let loopback = raw
+        .trim()
+        .parse::<Uri>()
+        .ok()
+        .and_then(|uri| uri.host().map(is_loopback_host))
+        .unwrap_or(false);
+    if !loopback {
+        return Err(ConfigError::Invalid {
+            var: "CP_KINE_ENDPOINT",
+            reason: "must name a loopback address (127.0.0.0/8, ::1 or localhost): kine has no authentication of its own",
+        });
+    }
+    Ok(raw.to_string())
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    host.eq_ignore_ascii_case("localhost")
+        || host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }
 
 fn parse_base_url(raw: &str) -> Result<String, ConfigError> {

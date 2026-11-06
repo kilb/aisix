@@ -7,11 +7,25 @@
 # the digest GitHub computes for the asset.
 #
 # Usage: scripts/fetch-kine.sh <dest>
+#        scripts/fetch-kine.sh --verify <path>   exit 0 only if <path> is the pinned binary
 set -euo pipefail
 
 KINE_VERSION=v0.17.5
 KINE_URL="https://github.com/k3s-io/kine/releases/download/${KINE_VERSION}/kine-amd64"
 KINE_SHA256=fc6780ff09301d3e7440c47988d8abbbd5fa380d81ce47ef69d155c82366fd48
+
+is_pinned() {
+  [ -f "$1" ] && [ "$(sha256sum "$1" | cut -d' ' -f1)" = "$KINE_SHA256" ]
+}
+
+if [ "${1:-}" = "--verify" ]; then
+  path="${2:?usage: scripts/fetch-kine.sh --verify <path>}"
+  if is_pinned "$path"; then
+    exit 0
+  fi
+  echo "fetch-kine: $path is not kine ${KINE_VERSION} (expected sha256 ${KINE_SHA256})" >&2
+  exit 1
+fi
 
 dest="${1:?usage: scripts/fetch-kine.sh <dest>}"
 
@@ -27,9 +41,8 @@ tmp="$(mktemp "${dest}.download.XXXXXX")"
 trap 'rm -f "$tmp"' EXIT
 
 curl -fsSL --retry 3 --output "$tmp" "$KINE_URL"
-actual="$(sha256sum "$tmp" | cut -d' ' -f1)"
-if [ "$actual" != "$KINE_SHA256" ]; then
-  echo "fetch-kine: refusing ${KINE_URL}: sha256 is ${actual}, expected ${KINE_SHA256}" >&2
+if ! is_pinned "$tmp"; then
+  echo "fetch-kine: refusing ${KINE_URL}: sha256 is $(sha256sum "$tmp" | cut -d' ' -f1), expected ${KINE_SHA256}" >&2
   exit 1
 fi
 
