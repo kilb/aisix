@@ -215,7 +215,12 @@ fn permitted_model_names(
 /// `owned_by` for the OpenAI shape: the model's vendor when it has one.
 /// A routing / ensemble / semantic alias has no single vendor — it is the
 /// gateway's own construct — so it is owned by the gateway.
-fn owned_by(snapshot: &aisix_core::AisixSnapshot, name: &str) -> String {
+/// In platform mode the vendor is never named: every model is owned by the
+/// gateway, so a listing does not reveal which upstream channel serves it.
+fn owned_by(snapshot: &aisix_core::AisixSnapshot, name: &str, platform: bool) -> String {
+    if platform {
+        return "aisix".to_string();
+    }
     snapshot
         .models
         .get_by_name(name)
@@ -223,12 +228,12 @@ fn owned_by(snapshot: &aisix_core::AisixSnapshot, name: &str) -> String {
         .unwrap_or_else(|| "aisix".to_string())
 }
 
-fn openai_model(snapshot: &aisix_core::AisixSnapshot, name: &str) -> ModelObject {
+fn openai_model(snapshot: &aisix_core::AisixSnapshot, name: &str, platform: bool) -> ModelObject {
     ModelObject {
         id: name.to_string(),
         object: "model",
         created: UNKNOWN_CREATED_UNIX,
-        owned_by: owned_by(snapshot, name),
+        owned_by: owned_by(snapshot, name, platform),
     }
 }
 
@@ -344,7 +349,10 @@ fn model_list(
         // model, in one page.
         return Json(ModelList {
             object: "list",
-            data: names.iter().map(|n| openai_model(&snapshot, n)).collect(),
+            data: names
+                .iter()
+                .map(|n| openai_model(&snapshot, n, state.platform().is_some()))
+                .collect(),
         })
         .into_response();
     }
@@ -407,7 +415,7 @@ fn model_retrieve(
     if wants_anthropic_shape(headers) {
         Json(anthropic_model(&id)).into_response()
     } else {
-        Json(openai_model(&snapshot, &id)).into_response()
+        Json(openai_model(&snapshot, &id, state.platform().is_some())).into_response()
     }
 }
 
@@ -445,6 +453,29 @@ mod tests {
         hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
         let handle = SnapshotHandle::new(snapshot);
         crate::build_router(crate::ProxyState::new(handle, hub, &cfg()).without_cache())
+    }
+
+    fn build_platform_app(snapshot: AisixSnapshot) -> Router {
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let handle = SnapshotHandle::new(snapshot);
+        let state = crate::ProxyState::new(handle, hub, &cfg())
+            .without_cache()
+            .with_platform(crate::platform::PlatformSettings::from_secret("s"));
+        crate::build_router(state)
+    }
+
+    /// Lists `/v1/models` (OpenAI shape) as `sk-caller` and returns the body.
+    async fn list_as_caller(app: Router) -> serde_json::Value {
+        let req = Request::builder()
+            .method("GET")
+            .uri("/v1/models")
+            .header("authorization", "Bearer sk-caller")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
     }
 
     const PK_ID: &str = "11111111-1111-1111-1111-111111111111";
@@ -639,6 +670,49 @@ mod tests {
             ids,
             ["embed", "gpt4", "panel", "smart-router", "topic-router"]
         );
+    }
+
+    #[tokio::test]
+    async fn platform_mode_lists_every_model_as_owned_by_the_gateway() {
+        let snap = new_snap();
+        snap.models.insert(model_entry("m1", "gpt4"));
+        snap.models.insert(model_entry("m2", "gpt4-mini"));
+        snap.apikeys.insert(apikey_entry("sk-caller", &["*"]));
+
+        let body = list_as_caller(build_platform_app(snap)).await;
+        let data = body["data"].as_array().unwrap();
+        assert_eq!(data.len(), 2);
+        assert!(data.iter().all(|m| m["owned_by"] == "aisix"));
+    }
+
+    #[tokio::test]
+    async fn platform_mode_retrieve_names_no_upstream_channel() {
+        let snap = new_snap();
+        snap.models.insert(model_entry("m1", "gpt4"));
+        snap.apikeys.insert(apikey_entry("sk-caller", &["*"]));
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/v1/models/gpt4")
+            .header("authorization", "Bearer sk-caller")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = tower::ServiceExt::oneshot(build_platform_app(snap), req)
+            .await
+            .unwrap();
+        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["owned_by"], "aisix");
+    }
+
+    #[tokio::test]
+    async fn without_platform_mode_owned_by_is_the_models_provider() {
+        let snap = new_snap();
+        snap.models.insert(model_entry("m1", "gpt4"));
+        snap.apikeys.insert(apikey_entry("sk-caller", &["*"]));
+
+        let body = list_as_caller(build_app(snap)).await;
+        assert_eq!(body["data"][0]["owned_by"], "openai");
     }
 
     /// A Model Group carries no `provider` of its own, so it falls back to the
