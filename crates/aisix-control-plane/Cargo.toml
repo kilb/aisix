@@ -1,0 +1,35 @@
+[package]
+name = "aisix-control-plane"
+version = "0.1.0"
+edition = "2021"
+
+# Pins its own dependency versions and stays out of [workspace.dependencies],
+# as crates/aisix-portal and crates/aisix-console do: the control plane is a
+# separate process, and its dependencies should not be forced onto the gateway
+# crates.
+[dependencies]
+# For `redact_url_for_log`: the one place configured URLs are reduced for
+# display, so this crate does not grow a second copy that drifts.
+aisix-core = { path = "../aisix-core" }
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+# Runtime queries (`sqlx::query`), never the `query!` macros: those need a
+# DATABASE_URL or an offline cache at build time, which the lint job has not.
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-webpki", "postgres", "macros", "migrate", "uuid", "chrono", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "1"
+tracing = "0.1"
+# `env-filter` so RUST_LOG selects what is logged.
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+futures = "0.3"
+ring = "0.17"
+hex = "0.4"
+base64 = "0.22"
+
+[dev-dependencies]
+# Tests start a real listener and send real HTTP, as the portal's and the
+# console's do.
+reqwest = { version = "0.12", default-features = false, features = ["json", "cookies", "rustls-tls"] }
