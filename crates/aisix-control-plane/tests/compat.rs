@@ -161,7 +161,7 @@ async fn a_team_scoped_cache_policy_is_refused_while_an_older_gateway_is_registe
         &cp,
         &admin,
         "cache_policies",
-        json!({"name": "env-7c1", "scope": "api_key"}),
+        json!({"name": "key-7c1", "scope": "api_key"}),
     )
     .await;
     assert_eq!(r.status, 201, "{r:?}");
@@ -329,14 +329,14 @@ async fn a_replace_that_keeps_a_floored_field_is_not_refused_but_one_that_adds_i
     gw.beat("gw-current-7c9", CURRENT).await;
     let team = create(&cp, &admin, "cache_policies", team_policy("team-7c9")).await;
     assert_eq!(team.status, 201, "{team:?}");
-    let env = create(
+    let other = create(
         &cp,
         &admin,
         "cache_policies",
-        json!({"name": "env-7c9", "scope": "api_key"}),
+        json!({"name": "key-7c9", "scope": "api_key"}),
     )
     .await;
-    assert_eq!(env.status, 201, "{env:?}");
+    assert_eq!(other.status, 201, "{other:?}");
     // An older gateway registers after both were saved.
     gw.beat("gw-old-7c9", OLD).await;
     // Keeping the team scope changes nothing an older gateway sees: an
@@ -353,16 +353,16 @@ async fn a_replace_that_keeps_a_floored_field_is_not_refused_but_one_that_adds_i
     let r = replace(
         &cp,
         &admin,
-        &env,
-        json!({"name": "env-7c9", "scope": "team"}),
+        &other,
+        json!({"name": "key-7c9", "scope": "team"}),
     )
     .await;
     refused_at(&r, "/scope");
     let stored: Value = sqlx::query_scalar("SELECT doc FROM gw_resources WHERE id = $1::uuid")
-        .bind(env.body["id"].as_str().expect("an id"))
+        .bind(other.body["id"].as_str().expect("an id"))
         .fetch_one(cp.db().pool())
         .await
-        .expect("read the env policy");
+        .expect("read the other policy");
     assert_eq!(
         stored["scope"], "api_key",
         "the refused replace stored nothing"

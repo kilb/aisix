@@ -2777,3 +2777,19 @@ async fn an_api_key_scoped_cache_policy_is_accepted() {
     let (doc, ..) = stored(&cp, "cache_policies", &id).await;
     assert_eq!(doc["scope"], "api_key", "{doc}");
 }
+
+#[tokio::test]
+async fn a_null_cache_scope_is_refused() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let admin = Admin::as_role(&cp, OperatorRole::Operator).await;
+    let r = admin
+        .post(
+            "/admin/resources/cache_policies",
+            json!({"doc": {"name": "n", "scope": null}}),
+        )
+        .await;
+    assert_eq!(r.status, 422, "{r:?}");
+    assert_eq!(live_count(&cp, "cache_policies").await, 0);
+}

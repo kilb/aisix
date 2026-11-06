@@ -78,7 +78,9 @@ pub enum WriteOp<'a> {
 /// (aliases first, so a redacted credential under its former name is
 /// restored under the canonical one); restoring redacted credentials; the
 /// size check again, on the document as it will be projected; the
-/// gateway's strict validation; the reference check; the gateway-version
+/// gateway's strict validation; the platform rules ([`platform_rules`]: a
+/// cache policy is never `env`-scoped, and a missing scope becomes `team`);
+/// the reference check; the gateway-version
 /// gate ([`compat::gate`], `422 gateway_too_old`); sealing; the store. A
 /// delete is refused while a live document references the row (`409
 /// in_use`), except the referrers [`non_holding_referrers`] names.
