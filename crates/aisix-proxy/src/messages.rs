@@ -6383,6 +6383,54 @@ mod tests {
         );
     }
 
+    /// A semantic model cannot be served on this endpoint. A key restricted
+    /// to provider groups gets the same permanent 400 as a key without
+    /// groups, not the 503 a model outside its groups gets, and neither
+    /// request reaches an upstream.
+    #[tokio::test]
+    async fn a_semantic_model_keeps_its_400_for_a_key_with_provider_groups() {
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(anthropic_response()))
+            .mount(&upstream)
+            .await;
+
+        for groups in [&[][..], &["grp-alpha"]] {
+            let snap = new_snap_anthropic(&upstream.uri());
+            snap.models.insert(anthropic_model("claude-target"));
+            let router: Model = serde_json::from_value(serde_json::json!({
+                "display_name": "router",
+                "semantic": {
+                    "embedding_model": "bge-m3",
+                    "routes": [{"name": "r", "target": "claude-target", "examples": ["a"]}],
+                    "default": "claude-target",
+                    "match": {"threshold": 0.5},
+                },
+            }))
+            .unwrap();
+            snap.models
+                .insert(ResourceEntry::new("m-router", router, 1));
+            let key: ApiKey = serde_json::from_value(serde_json::json!({
+                "key_hash": "8b6712790a2089c67aa97a2d80022df18cc65c7814350e33baebe79aab508891",
+                "allowed_models": ["*"],
+                "allowed_provider_groups": groups,
+            }))
+            .unwrap();
+            snap.apikeys.insert(ResourceEntry::new("k-1", key, 1));
+
+            let resp = build_app(snap)
+                .oneshot(make_req(serde_json::json!({
+                    "model": "router",
+                    "max_tokens": 16,
+                    "messages": [{"role": "user", "content": "Hello"}]
+                })))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "groups {groups:?}");
+        }
+        assert!(upstream.received_requests().await.unwrap().is_empty());
+    }
+
     /// `build_app` disables the cache backends; the cache tests need them on.
     fn build_app_with_cache(snap: AisixSnapshot) -> axum::Router {
         let hub = Arc::new(Hub::new());

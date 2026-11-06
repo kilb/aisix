@@ -212,6 +212,13 @@ impl InMemoryStore {
         self.apikeys.insert(entry.id.clone(), entry);
         Ok(())
     }
+    pub(crate) async fn put_provider_key(
+        &self,
+        entry: ResourceEntry<ProviderKey>,
+    ) -> Result<(), StoreError> {
+        self.provider_keys.insert(entry.id.clone(), entry);
+        Ok(())
+    }
 }
 
 #[cfg(test)]

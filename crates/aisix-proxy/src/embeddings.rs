@@ -1412,6 +1412,51 @@ mod tests {
         })
     }
 
+    /// A key restricted to provider groups is served only through a provider
+    /// key in one of them; outside them the request is refused with 503 and
+    /// never reaches the upstream.
+    #[tokio::test]
+    async fn a_key_with_provider_groups_embeds_only_inside_them() {
+        async fn embed(pk_groups: &[&str]) -> (StatusCode, usize) {
+            let upstream = MockServer::builder().start().await;
+            Mock::given(method("POST"))
+                .and(path("/embeddings"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(upstream_response()))
+                .mount(&upstream)
+                .await;
+            let snap = AisixSnapshot::new();
+            let pk: aisix_core::ProviderKey = serde_json::from_value(serde_json::json!({
+                "display_name": "pk-embed", "secret": "sk-up",
+                "api_base": upstream.uri(), "provider": "openai", "adapter": "openai",
+                "groups": pk_groups,
+            }))
+            .unwrap();
+            snap.provider_keys.insert(ResourceEntry::new(PK_ID, pk, 1));
+            snap.models.insert(model_entry("embed"));
+            let key: ApiKey = serde_json::from_value(serde_json::json!({
+                "key_hash": "8b6712790a2089c67aa97a2d80022df18cc65c7814350e33baebe79aab508891",
+                "allowed_models": ["*"],
+                "allowed_provider_groups": ["grp-alpha"],
+            }))
+            .unwrap();
+            snap.apikeys.insert(ResourceEntry::new("k-1", key, 1));
+            let resp = tower::ServiceExt::oneshot(
+                build_app(snap),
+                make_req(serde_json::json!({"model": "embed", "input": "hi"})),
+            )
+            .await
+            .unwrap();
+            let status = resp.status();
+            (status, upstream.received_requests().await.unwrap().len())
+        }
+
+        assert_eq!(embed(&["grp-alpha"]).await, (StatusCode::OK, 1));
+        assert_eq!(
+            embed(&["grp-beta"]).await,
+            (StatusCode::SERVICE_UNAVAILABLE, 0)
+        );
+    }
+
     /// A keyword input guardrail, attached env-wide by
     /// `seed_env_scoped_guardrail` so it applies to every request. Blocks on a
     /// literal. `fail_open:false` is irrelevant for keyword (local, never

@@ -1686,6 +1686,10 @@ pub(crate) struct RoutingRequest<'a> {
     /// target whose provider key is in none of these groups is not a
     /// candidate, and a direct model outside them is refused. Empty — the
     /// default — means unconstrained. See [`target_in_groups`].
+    ///
+    /// Every production call site sets this field explicitly, never through
+    /// `..Default::default()`: the default is unconstrained, so a site that
+    /// leaves it out silently lifts the key's restriction.
     pub allowed_groups: &'a [String],
 }
 
@@ -1706,7 +1710,9 @@ pub(crate) struct RoutingRequest<'a> {
 /// themselves: `/v1/realtime`, the files/batches/fine-tuning target
 /// (`jobs::resolve_target`, named and default pick alike), and the video
 /// polls; an `inject` passthrough route holds a provider key rather than a
-/// model and calls [`provider_key_in_groups`].
+/// model and calls [`provider_key_in_groups`]. Each of them refuses with
+/// [`no_target_in_groups`], except the video polls, which answer as for a
+/// video that does not exist.
 pub(crate) fn target_in_groups(
     snapshot: &AisixSnapshot,
     model: &Model,
@@ -1761,10 +1767,13 @@ fn targets_in_groups<'a>(
 /// What a grouped key is told when nothing inside its groups is left: the
 /// answer every upstream being unavailable gets, naming no group, tag or
 /// target, so the refusal cannot be used to learn how a model is grouped.
-fn no_target_in_groups(virtual_name: &str) -> ProxyError {
+/// The one refusal every provider-group gate returns; `addressed` is what the
+/// caller named (a model, a router, a passthrough route) and reaches only the
+/// debug log.
+pub(crate) fn no_target_in_groups(addressed: &str) -> ProxyError {
     tracing::debug!(
-        virtual_model = %virtual_name,
-        "no target is in the API key's provider groups",
+        addressed = %addressed,
+        "nothing the request addressed is in the API key's provider groups",
     );
     ProxyError::AllCandidatesUnavailable {
         retry_after_secs: None,
@@ -1916,7 +1925,16 @@ pub(crate) fn resolve_attempt_models(
         req.allowed_groups,
     )?;
     let Some(routing) = virtual_model.routing.as_ref() else {
-        if !target_in_groups(snapshot, virtual_model, req.allowed_groups) {
+        // A semantic parent has no provider key of its own, so the group
+        // check would refuse it with the 503 meant for a model outside the
+        // groups. Only `/v1/chat/completions` serves semantic routing, and it
+        // never gets here (it resolves through `semantic::resolve`, which
+        // applies the groups to each candidate); every other endpoint refuses
+        // the parent with its own permanent 4xx before anything goes
+        // upstream, and keeps that answer for a grouped key too.
+        if !virtual_model.is_semantic()
+            && !target_in_groups(snapshot, virtual_model, req.allowed_groups)
+        {
             return Err(no_target_in_groups(virtual_name));
         }
         if let Some(gate) = req.budget {
@@ -3546,14 +3564,15 @@ mod tests {
 
     // ───────────────── key-bound provider groups ─────────────────
 
-    /// `model-a` on `pk-alpha` (group `grp-alpha`), `model-b` on `pk-beta`
-    /// (group `grp-beta`), `model-none` on `pk-none` (no group). The tokens
-    /// are distinctive so an assertion that a refusal does not name them
-    /// cannot pass or fail on ordinary English text.
+    /// `model-a` and `model-d` on `pk-alpha` (group `grp-alpha`), `model-b`
+    /// on `pk-beta` (group `grp-beta`), `model-none` on `pk-none` (no group).
+    /// The tokens are distinctive so an assertion that a refusal does not
+    /// name them cannot pass or fail on ordinary English text.
     fn groups_snapshot() -> AisixSnapshot {
         let snap = pk_snapshot(&[
             ("model-a", "pk-id-alpha"),
             ("model-b", "pk-id-beta"),
+            ("model-d", "pk-id-alpha"),
             ("model-none", "pk-id-none"),
         ]);
         for (id, name, groups) in [
@@ -3616,6 +3635,7 @@ mod tests {
             "pk-none",
             "model-a",
             "model-b",
+            "model-d",
             "model-none",
         ] {
             assert!(!text.contains(secret), "{secret} leaked: {text}");
@@ -3713,6 +3733,33 @@ mod tests {
             "{err:?}"
         );
         assert_names_no_group_or_member(&err);
+    }
+
+    /// The key's groups narrow the targets BEFORE the routing-tag filter.
+    /// Inside `grp-alpha` no target carries the asked-for tag, so the tag
+    /// filter falls back to the `default`-tagged target there. Filtering by
+    /// tag first would pick the out-of-group target, then lose it to the
+    /// group filter and refuse a request an in-group target can serve.
+    #[test]
+    fn groups_narrow_the_targets_before_the_tags_pick_among_them() {
+        let snap = groups_snapshot();
+        let allowed = groups(&["grp-alpha"]);
+        let asked = groups(&["grp-beta"]);
+        let order = grouped_select(
+            &snap,
+            vec![
+                tagged("model-a", &["x"]),
+                tagged("model-b", &["grp-beta"]),
+                tagged("model-d", &["default"]),
+            ],
+            RoutingRequest {
+                tags: &asked,
+                allowed_groups: &allowed,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(order, vec!["model-d"]);
     }
 
     #[test]

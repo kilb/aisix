@@ -590,9 +590,7 @@ async fn dispatch(
                 &auth.key().allowed_provider_groups,
             ) {
                 return Err(RouteError::of(
-                    ProxyError::AllCandidatesUnavailable {
-                        retry_after_secs: None,
-                    },
+                    crate::routing::no_target_in_groups(&route.name),
                     &auth,
                 ));
             }

@@ -474,9 +474,7 @@ pub(crate) fn resolve_target(
             // a model outside them is refused the way a routing group with no
             // target left is.
             if !crate::routing::target_in_groups(snapshot, m, &auth.key().allowed_provider_groups) {
-                return Err(ProxyError::AllCandidatesUnavailable {
-                    retry_after_secs: None,
-                });
+                return Err(crate::routing::no_target_in_groups(name));
             }
             entry
         }
@@ -5194,6 +5192,7 @@ mod tests {
             "got {v}"
         );
     }
+
     /// A key restricted to provider groups reaches this surface only through
     /// a provider key in one of them: a named model outside them is refused
     /// as a routing group with no target left is, and the default pick passes

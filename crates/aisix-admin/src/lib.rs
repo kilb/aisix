@@ -1415,6 +1415,105 @@ mod tests {
         }
     }
 
+    /// `allowed_provider_groups` decides which upstreams may serve a key, so
+    /// an operator reading the key back must see it: both reads carry it when
+    /// the stored key sets it, and leave it out when it does not, as the
+    /// stored document does.
+    #[tokio::test]
+    async fn an_api_key_read_back_shows_its_provider_groups() {
+        let (state, store) = build_seedable_state();
+        let mut payload = apikey_payload("sk-grouped", &["*"]);
+        payload["allowed_provider_groups"] = json!(["grp-alpha", "grp-beta"]);
+        let grouped: aisix_core::ApiKey = serde_json::from_value(payload).unwrap();
+        store
+            .put_apikey(aisix_core::ResourceEntry::new("k-grouped", grouped, 1))
+            .await
+            .unwrap();
+        let open: aisix_core::ApiKey =
+            serde_json::from_value(apikey_payload("sk-open", &["*"])).unwrap();
+        store
+            .put_apikey(aisix_core::ResourceEntry::new("k-open", open, 1))
+            .await
+            .unwrap();
+
+        let resp = run(
+            build_router(state.clone()),
+            auth_req("GET", "/admin/v1/api_keys/k-grouped", None),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        assert_eq!(
+            v["value"]["allowed_provider_groups"],
+            json!(["grp-alpha", "grp-beta"])
+        );
+
+        let resp = run(
+            build_router(state),
+            auth_req("GET", "/admin/v1/api_keys", None),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        let by_id = |id: &str| {
+            v.as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["id"] == id)
+                .cloned()
+                .unwrap()
+        };
+        assert_eq!(
+            by_id("k-grouped")["value"]["allowed_provider_groups"],
+            json!(["grp-alpha", "grp-beta"])
+        );
+        assert!(by_id("k-open")["value"]
+            .get("allowed_provider_groups")
+            .is_none());
+    }
+
+    /// A provider key's `groups` are part of its read projection too.
+    #[tokio::test]
+    async fn a_provider_key_read_back_shows_its_groups() {
+        let (state, store) = build_seedable_state();
+        let pk: aisix_core::ProviderKey = serde_json::from_value(json!({
+            "display_name": "pk-grouped",
+            "secret": "sk-upstream",
+            "provider": "openai",
+            "groups": ["grp-alpha"],
+        }))
+        .unwrap();
+        store
+            .put_provider_key(aisix_core::ResourceEntry::new("pk-1", pk, 1))
+            .await
+            .unwrap();
+        let resp = run(
+            build_router(state),
+            auth_req("GET", "/admin/v1/provider_keys/pk-1", None),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        assert_eq!(v["value"]["groups"], json!(["grp-alpha"]));
+    }
+
+    /// The hand-written read projection documents the field, and the
+    /// provider key schema it is matched against documents `groups`.
+    #[tokio::test]
+    async fn openapi_documents_provider_groups_on_both_reads() {
+        let resp = openapi::openapi_json().await;
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let schemas = &parsed["components"]["schemas"];
+        let groups = &schemas["PublicApiKey"]["properties"]["allowed_provider_groups"];
+        assert_eq!(groups["type"], "array", "{groups}");
+        assert_eq!(groups["items"]["type"], "string", "{groups}");
+        assert!(groups["description"]
+            .as_str()
+            .is_some_and(|d| !d.is_empty()));
+        assert!(schemas["ProviderKey"]["properties"]["groups"].is_object());
+    }
+
     #[tokio::test]
     async fn openapi_apikey_schema_excludes_max_budget_usd() {
         let resp = openapi::openapi_json().await;

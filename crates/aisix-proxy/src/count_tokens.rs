@@ -1428,6 +1428,56 @@ mod tests {
         ResourceEntry::new("g-keyword", guardrail, 1)
     }
 
+    /// Token counting spends the provider key it counts with, so a key
+    /// restricted to provider groups counts only through a provider key in
+    /// one of them; outside them the request is refused with 503 and never
+    /// reaches the upstream.
+    #[tokio::test]
+    async fn a_key_with_provider_groups_counts_only_inside_them() {
+        async fn count(pk_groups: &[&str]) -> (StatusCode, usize) {
+            let upstream = MockServer::builder().start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/messages/count_tokens"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({"input_tokens": 11})),
+                )
+                .mount(&upstream)
+                .await;
+            let snap = AisixSnapshot::new();
+            let pk: aisix_core::ProviderKey = serde_json::from_value(serde_json::json!({
+                "display_name": "pk-count", "secret": "sk-ant-test",
+                "api_base": upstream.uri(), "provider": "anthropic", "adapter": "anthropic",
+                "groups": pk_groups,
+            }))
+            .unwrap();
+            snap.provider_keys.insert(ResourceEntry::new(PK_ID, pk, 1));
+            snap.models.insert(anthropic_model("claude"));
+            let key: ApiKey = serde_json::from_value(serde_json::json!({
+                "key_hash": "8b6712790a2089c67aa97a2d80022df18cc65c7814350e33baebe79aab508891",
+                "allowed_models": ["*"],
+                "allowed_provider_groups": ["grp-alpha"],
+            }))
+            .unwrap();
+            snap.apikeys.insert(ResourceEntry::new("k-1", key, 1));
+            let resp = build_app(snap)
+                .oneshot(make_req(serde_json::json!({
+                    "model": "claude",
+                    "messages": [{"role": "user", "content": "hi"}]
+                })))
+                .await
+                .unwrap();
+            let status = resp.status();
+            (status, upstream.received_requests().await.unwrap().len())
+        }
+
+        assert_eq!(count(&["grp-alpha"]).await, (StatusCode::OK, 1));
+        assert_eq!(
+            count(&["grp-beta"]).await,
+            (StatusCode::SERVICE_UNAVAILABLE, 0)
+        );
+    }
+
     /// #555: token counting still sends the prompt to a third party, so a
     /// dedicated DLP guardrail must mask sensitive input before that egress.
     #[tokio::test]

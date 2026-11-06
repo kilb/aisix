@@ -750,9 +750,7 @@ async fn prepare(
     // dispatch: it is opened only with a provider key in one of them, and
     // otherwise refused the way a routing group with no target left is.
     if !crate::routing::target_in_groups(snapshot, model, &auth.key().allowed_provider_groups) {
-        return Err(ProxyError::AllCandidatesUnavailable {
-            retry_after_secs: None,
-        });
+        return Err(crate::routing::no_target_in_groups(&requested_model));
     }
     crate::dispatch::check_ip_access(model, &client.source_ip)?;
 

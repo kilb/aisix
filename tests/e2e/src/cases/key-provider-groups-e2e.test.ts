@@ -16,7 +16,8 @@ import {
 // group's strategy spreading traffic, not a failing in-group upstream that a
 // healthy out-of-group one could have answered, and not a routing-tag header
 // that names an out-of-group target. Each case runs on every endpoint of the
-// chat family, because the three dispatch separately.
+// chat family, because the three dispatch separately; a streamed chat request
+// takes its own path and gets a case of its own.
 //
 // Group and provider-key names are distinctive tokens so the check that a
 // refusal does not name them cannot trip over ordinary English text.
@@ -67,6 +68,23 @@ const PATH_BODIES = {
   "/v1/responses": RESPONSE_BODY,
 };
 
+const STREAM_EVENTS = [
+  JSON.stringify({
+    id: "chatcmpl-groups-stream",
+    object: "chat.completion.chunk",
+    model: "gpt-4o-mini",
+    choices: [{ index: 0, delta: { content: "streamed-ok" }, finish_reason: null }],
+  }),
+  JSON.stringify({
+    id: "chatcmpl-groups-stream",
+    object: "chat.completion.chunk",
+    model: "gpt-4o-mini",
+    choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+    usage: { prompt_tokens: 3, completion_tokens: 1, total_tokens: 4 },
+  }),
+  "[DONE]",
+];
+
 type Endpoint = "chat" | "messages" | "responses";
 const ENDPOINTS: Endpoint[] = ["chat", "messages", "responses"];
 
@@ -84,6 +102,9 @@ describe("an API key routes only within its allowed provider groups", () => {
   // Pair behind `groups-route-down`: the in-group upstream answers 500.
   let mockADown: OpenAiUpstream | undefined;
   let mockBUp: OpenAiUpstream | undefined;
+  // Streaming pair behind `groups-route-stream`.
+  let mockAStream: OpenAiUpstream | undefined;
+  let mockBStream: OpenAiUpstream | undefined;
 
   beforeAll(async () => {
     const etcd = new EtcdClient();
@@ -97,6 +118,8 @@ describe("an API key routes only within its allowed provider groups", () => {
       errorBody: { error: { message: "upstream failed", type: "server_error" } },
     });
     mockBUp = await startOpenAiUpstream({ pathBodies: PATH_BODIES });
+    mockAStream = await startOpenAiUpstream({ streamEvents: STREAM_EVENTS });
+    mockBStream = await startOpenAiUpstream({ streamEvents: STREAM_EVENTS });
 
     app = await spawnApp();
     const seed = new SeedClient(etcd, app.etcdPrefix);
@@ -125,6 +148,8 @@ describe("an API key routes only within its allowed provider groups", () => {
     await model("groups-model-b", "pk-beta", ["grp-beta"], mockB);
     await model("groups-model-a-down", "pk-alpha-down", ["grp-alpha"], mockADown);
     await model("groups-model-b-up", "pk-beta-up", ["grp-beta"], mockBUp);
+    await model("groups-model-a-stream", "pk-alpha-stream", ["grp-alpha"], mockAStream);
+    await model("groups-model-b-stream", "pk-beta-stream", ["grp-beta"], mockBStream);
 
     // Round robin, so without the group constraint traffic splits across
     // both targets. The tags name the groups, so a header asking for
@@ -146,6 +171,13 @@ describe("an API key routes only within its allowed provider groups", () => {
         targets: [{ model: "groups-model-a-down" }, { model: "groups-model-b-up" }],
       },
     });
+    await seed.createModel({
+      display_name: "groups-route-stream",
+      routing: {
+        strategy: "round_robin",
+        targets: [{ model: "groups-model-a-stream" }, { model: "groups-model-b-stream" }],
+      },
+    });
 
     // Caller keys last; the grouped key is the readiness gate below.
     await seed.createApiKey({
@@ -164,7 +196,7 @@ describe("an API key routes only within its allowed provider groups", () => {
   afterAll(async () => {
     await app?.exit();
     await Promise.all(
-      [mockA, mockB, mockADown, mockBUp].map((u) => u?.close()),
+      [mockA, mockB, mockADown, mockBUp, mockAStream, mockBStream].map((u) => u?.close()),
     );
   });
 
@@ -269,4 +301,69 @@ describe("an API key routes only within its allowed provider groups", () => {
       expectNoLeak(answer, endpoint);
     },
   );
+
+  test.for(ENDPOINTS)(
+    "%s: a direct model outside the key's groups is refused",
+    async (endpoint, ctx) => {
+      if (!etcdReachable || !app) {
+        ctx.skip();
+        return;
+      }
+      const b0 = mockB!.receivedRequests.length;
+      const answer = await send(endpoint, GROUPED_PLAINTEXT, "groups-model-b");
+      expect(answer.status, answer.text).toBe(503);
+      expect(mockB!.receivedRequests.length - b0).toBe(0);
+      expectNoLeak(answer, endpoint);
+
+      // The same model serves a key without groups, so the refusal above is
+      // the constraint at work and not a broken model.
+      const open = await send(endpoint, OPEN_PLAINTEXT, "groups-model-b");
+      expect(open.status, open.text).toBe(200);
+      expect(mockB!.receivedRequests.length - b0).toBe(1);
+    },
+  );
+
+  test("chat stream: every streamed request lands in the key's group", async (ctx) => {
+    if (!etcdReachable || !app) {
+      ctx.skip();
+      return;
+    }
+    const stream = async (key: string): Promise<Answer & { contentType: string }> => {
+      const res = await fetch(`${app!.proxyUrl}/v1/chat/completions`, {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${key}` },
+        body: JSON.stringify({
+          model: "groups-route-stream",
+          stream: true,
+          messages: [{ role: "user", content: "hi" }],
+        }),
+      });
+      return {
+        status: res.status,
+        contentType: res.headers.get("content-type") ?? "",
+        text: await res.text(),
+      };
+    };
+
+    // Round robin spreads a key without groups over both targets, so the
+    // out-of-group upstream is reachable through this route.
+    const openB0 = mockBStream!.receivedRequests.length;
+    for (let i = 0; i < 2; i++) {
+      const open = await stream(OPEN_PLAINTEXT);
+      expect(open.status, open.text).toBe(200);
+    }
+    expect(mockBStream!.receivedRequests.length - openB0).toBeGreaterThanOrEqual(1);
+
+    const a0 = mockAStream!.receivedRequests.length;
+    const b0 = mockBStream!.receivedRequests.length;
+    for (let i = 0; i < 6; i++) {
+      const answer = await stream(GROUPED_PLAINTEXT);
+      expect(answer.status, `#${i}: ${answer.text}`).toBe(200);
+      expect(answer.contentType).toContain("text/event-stream");
+      expect(answer.text).toContain("streamed-ok");
+      expect(answer.text).toContain("[DONE]");
+    }
+    expect(mockAStream!.receivedRequests.length - a0).toBe(6);
+    expect(mockBStream!.receivedRequests.length - b0).toBe(0);
+  });
 });

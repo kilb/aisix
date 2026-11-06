@@ -26,6 +26,12 @@ pub struct PublicApiKey {
     /// key's ACL.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub allowed_model_ids: Option<Vec<String>>,
+    /// Shown whenever the stored key sets it, because it decides which
+    /// upstreams may serve the key whatever `allowed_models` grants, so an
+    /// operator reading only the model ACL would misread where the key's
+    /// traffic can go.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub allowed_provider_groups: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rate_limit: Option<aisix_core::models::RateLimit>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -44,6 +50,7 @@ impl From<ApiKey> for PublicApiKey {
             key_hash: value.key_hash,
             allowed_models: value.allowed_models,
             allowed_model_ids: value.allowed_model_ids,
+            allowed_provider_groups: value.allowed_provider_groups,
             rate_limit: value.rate_limit,
             mcp_access: value.mcp_access,
             allowed_agents: value.allowed_agents,

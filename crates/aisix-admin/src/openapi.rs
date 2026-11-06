@@ -1568,6 +1568,16 @@ const OPENAPI_JSON_BASE: &str = r##"{
               "9b1b6d9c-1f5e-4c1e-9f8f-2f5f5b9d1c11"
             ]
           },
+          "allowed_provider_groups": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Provider groups this key may route to, matched against the `groups` of each provider key.\n\nWhen set, a request is sent upstream only with a provider key that lists at least one of these groups. This holds whether a model is addressed directly or reached as a target of a routing or semantic model, and for passthrough routes that inject a provider key. A request is never sent upstream to a model outside these groups, not as a fallback and not when a routing tag in the request names it. When nothing inside them is left to serve the request, it usually fails with `503`, the same answer as when every upstream is unavailable. Two requests answer differently: a files, batches, or fine-tuning request that names no model fails with `400` when no model inside these groups can serve it, and polling a video whose model is outside them returns `404`, as for a video that does not exist. Ensemble models are not available to a key that sets this field, and are answered as not found.\n\nThis decides which upstreams may serve the key, not which models it may name; `allowed_models` still decides that. Omitted or empty means the key is not restricted by provider group.",
+            "example": [
+              "dedicated-capacity"
+            ]
+          },
           "rate_limit": {
             "$ref": "#/components/schemas/RateLimit",
             "description": "Request, token, and concurrency limits for this key."

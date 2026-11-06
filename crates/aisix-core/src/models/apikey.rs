@@ -64,12 +64,17 @@ pub struct ApiKey {
     /// When set, a request is sent upstream only with a provider key that
     /// lists at least one of these groups. This holds whether a model is
     /// addressed directly or reached as a target of a routing or semantic
-    /// model, and for passthrough routes that inject a provider key. A model
-    /// outside these groups is never used, not as a fallback and not when a
-    /// routing tag in the request names it. When nothing inside them is left
-    /// to serve the request, it fails with `503`, the same answer as when
-    /// every upstream is unavailable. Ensemble models are not available to a
-    /// key that sets this field, and are answered as not found.
+    /// model, and for passthrough routes that inject a provider key. A
+    /// request is never sent upstream to a model outside these groups, not as
+    /// a fallback and not when a routing tag in the request names it. When
+    /// nothing inside them is left to serve the request, it usually fails with
+    /// `503`, the same answer as when every upstream is unavailable. Two
+    /// requests answer differently: a files, batches, or fine-tuning request
+    /// that names no model fails with `400` when no model inside these groups
+    /// can serve it, and polling a video whose model is outside them returns
+    /// `404`, as for a video that does not exist. Ensemble models are not
+    /// available to a key that sets this field, and are answered as not
+    /// found.
     ///
     /// This decides which upstreams may serve the key, not which models it
     /// may name; `allowed_models` still decides that. Omitted or empty means

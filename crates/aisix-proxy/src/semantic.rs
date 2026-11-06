@@ -870,13 +870,7 @@ fn select_eligible(
         crate::routing::target_in_groups(snapshot, &attempt.model, allowed_groups)
     });
     if candidates.is_empty() {
-        tracing::debug!(
-            router = %router.display_name,
-            "no semantic target is in the API key's provider groups",
-        );
-        return Err(ProxyError::AllCandidatesUnavailable {
-            retry_after_secs: None,
-        });
+        return Err(crate::routing::no_target_in_groups(&router.display_name));
     }
     candidates.retain(|(attempt, fell_back)| {
         let allowed = attempt.model.ip_allowed(source_ip);
