@@ -535,3 +535,34 @@ async fn re_enabling_a_key_an_older_gateway_would_serve_unrestricted_is_refused(
         .await
         .expect("disabling is not refused");
 }
+
+#[tokio::test]
+async fn a_key_that_gains_a_route_is_judged_again() {
+    let Some((cp, _admin, gw)) = setup().await else {
+        return;
+    };
+    gw.beat("gw-current-7cd", CURRENT).await;
+    let key = |routes: Value| {
+        json!({
+            "key_hash": "hash-routes-7cd",
+            "allowed_model_ids": [],
+            "allowed_provider_groups": ["shared"],
+            "allowed_routes": routes,
+        })
+    };
+    let id = Uuid::new_v4();
+    write_key(&cp, id, key(json!(["route-a-7cd"])), false)
+        .await
+        .expect("a key, before any older gateway");
+    gw.beat("gw-old-7cd", OLD).await;
+    // An older gateway would serve the new route through any provider key.
+    let err = write_key(&cp, id, key(json!(["route-a-7cd", "route-b-7cd"])), true)
+        .await
+        .expect_err("a new route is judged again");
+    assert_eq!((err.status.as_u16(), err.code), (422, "gateway_too_old"));
+    assert_eq!(err.details[0].path, "/allowed_provider_groups");
+    // Withdrawing one takes nothing new to it.
+    write_key(&cp, id, key(json!([])), true)
+        .await
+        .expect("a route withdrawn is not refused");
+}

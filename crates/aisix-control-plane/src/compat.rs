@@ -219,14 +219,24 @@ fn never(_stored: &Value, _doc: &Value) -> bool {
 
 /// Whether an api key reaches more after a replace of `stored` by `doc`,
 /// by the key's own semantics (`crates/aisix-core/src/models/apikey.rs`):
-/// switched back on, living longer, or granted a model it was not. A
-/// narrowing edit (a model withdrawn, the key switched off, an earlier
-/// expiry) is not growth.
+/// switched back on, living longer, granted a model it was not, or granted
+/// a passthrough route it was not (`allowed_provider_groups` also binds the
+/// provider key a route injects, which an older gateway ignores). A
+/// narrowing edit (a model or route withdrawn, the key switched off, an
+/// earlier expiry) is not growth.
 fn key_widens(stored: &Value, doc: &Value) -> bool {
     let disabled = |d: &Value| d.get("disabled").and_then(Value::as_bool) == Some(true);
     (disabled(stored) && !disabled(doc))
         || lives_longer(stored, doc)
         || grants_more(&ModelGrant::of(stored), &ModelGrant::of(doc))
+        || adds(routes(stored), routes(doc))
+}
+
+/// A key's passthrough routes; absent or `null` grants none, as `[]` does.
+fn routes(doc: &Value) -> &[Value] {
+    doc.get("allowed_routes")
+        .and_then(Value::as_array)
+        .map_or(&[], Vec::as_slice)
 }
 
 /// Whether `doc` expires later than `stored`, or never while `stored` did.
@@ -276,12 +286,6 @@ impl<'a> ModelGrant<'a> {
 /// switch between them grants more unless it lands on no model, or leaves
 /// names that granted everything.
 fn grants_more(before: &ModelGrant<'_>, after: &ModelGrant<'_>) -> bool {
-    fn covers_everything(list: &[Value]) -> bool {
-        list.iter().any(|entry| entry.as_str() == Some("*"))
-    }
-    fn adds(before: &[Value], after: &[Value]) -> bool {
-        !covers_everything(before) && after.iter().any(|entry| !before.contains(entry))
-    }
     match (before, after) {
         (ModelGrant::Ids(before), ModelGrant::Ids(after))
         | (ModelGrant::Names(before), ModelGrant::Names(after)) => adds(before, after),
@@ -290,6 +294,17 @@ fn grants_more(before: &ModelGrant<'_>, after: &ModelGrant<'_>) -> bool {
         }
         (ModelGrant::Ids(_), ModelGrant::Names(after)) => !after.is_empty(),
     }
+}
+
+/// Whether a `*` glob list holds `*`, which grants everything.
+fn covers_everything(list: &[Value]) -> bool {
+    list.iter().any(|entry| entry.as_str() == Some("*"))
+}
+
+/// Whether the `*` glob list `after` grants an entry `before` did not:
+/// entries compare literally, and a `*` in `before` covers every one.
+fn adds(before: &[Value], after: &[Value]) -> bool {
+    !covers_everything(before) && after.iter().any(|entry| !before.contains(entry))
 }
 
 /// The rows of `floors` for `kind` that `doc` sets and `stored` (the
@@ -765,6 +780,27 @@ mod tests {
         enabled["disabled"] = json!(false);
         widens(&enabled, &off(ids(json!(["m1"]))), "enabled by false");
         narrows(&enabled, &ids(json!(["m1"])), "false is absent");
+        // Passthrough routes: an older gateway serves a new one through any
+        // provider key. Absent, `null` or empty grants none.
+        let routes = |list: Value| key(json!({ "allowed_routes": list }));
+        widens(&routes(json!(["r1"])), &none, "a route appears");
+        widens(
+            &routes(json!(["r1", "r2"])),
+            &routes(json!(["r1"])),
+            "a route added",
+        );
+        narrows(
+            &routes(json!(["r1"])),
+            &routes(json!(["r1", "r2"])),
+            "a route withdrawn",
+        );
+        narrows(&none, &routes(json!(["r1"])), "routes go away");
+        narrows(
+            &routes(json!(["*", "r2"])),
+            &routes(json!(["*"])),
+            "routes within `*`",
+        );
+        narrows(&routes(Value::Null), &none, "null routes are none");
         // Living longer, or for ever.
         let until = |at: &str| key(json!({ "expires_at": at }));
         widens(
