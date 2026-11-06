@@ -224,8 +224,28 @@ fn direct_model(name: &str, provider_key_id: &str) -> Value {
     })
 }
 
-fn classic_rate_limit(name: &str) -> Value {
-    json!({"name": name, "scope": "team", "scope_ref": "team-e2e", "window": "minute", "max_requests": 60})
+/// A classic policy, which limits the subject `scope_ref` names: a live row
+/// of the kind `scope` stands for.
+fn classic_rate_limit(name: &str, scope: &str, scope_ref: &str) -> Value {
+    json!({"name": name, "scope": scope, "scope_ref": scope_ref, "window": "minute", "max_requests": 60})
+}
+
+/// The owner of the rows [`derived`] writes.
+const DERIVED_OWNER: &str = "tenant:00000000-0000-4000-8000-0000000000e2";
+
+/// Writes a row of a kind derived from tenants, members or keys, as its
+/// owner ([`DERIVED_OWNER`]) would; its id.
+async fn derived(cp: &TestCp, kind: Kind, doc: Value) -> String {
+    let id = Uuid::new_v4();
+    write(cp, kind, id, Op::Create(doc), None, Some(DERIVED_OWNER))
+        .await
+        .unwrap_or_else(|e| panic!("write {kind:?}: {e:?}"));
+    id.to_string()
+}
+
+/// A live team, for a classic policy to scope to.
+async fn live_team(cp: &TestCp) -> String {
+    derived(cp, Kind::Teams, json!({"name": "team-e2e"})).await
 }
 
 /// One valid document of every kind the generic API writes, in an order in
@@ -246,7 +266,10 @@ fn generic_fixtures(
             Kind::CachePolicies,
             json!({"name": unique("cache"), "applies_to_model_id": model_id, "ttl_seconds": 60}),
         ),
-        (Kind::RateLimitPolicies, classic_rate_limit(&unique("rl"))),
+        (
+            Kind::RateLimitPolicies,
+            classic_rate_limit(&unique("rl"), "model", model_id),
+        ),
         (
             Kind::Guardrails,
             json!({"name": unique("mod"), "kind": "openai_moderation", "api_key": SECRET}),
@@ -446,8 +469,9 @@ async fn a_rate_limit_policy_mixing_both_forms_is_refused() {
         return;
     };
     let admin = Admin::as_role(&cp, OperatorRole::Operator).await;
+    let team = live_team(&cp).await;
 
-    let mut mixed = classic_rate_limit("rl-mixed");
+    let mut mixed = classic_rate_limit("rl-mixed", "team", &team);
     mixed["limits"] = json!({"rpm": 60});
     let r = admin
         .post(
@@ -478,7 +502,10 @@ async fn a_rate_limit_policy_mixing_both_forms_is_refused() {
 
     // Either form on its own is accepted.
     admin
-        .create("rate_limit_policies", classic_rate_limit("rl-classic"))
+        .create(
+            "rate_limit_policies",
+            classic_rate_limit("rl-classic", "team", &team),
+        )
         .await;
     admin
         .create(
@@ -1538,6 +1565,7 @@ async fn one_owner_cannot_change_another_owners_row() {
     let Some(cp) = TestCp::start().await else {
         return;
     };
+    let team = live_team(&cp).await;
     let (owner, other) = (
         format!("tenant:{}", Uuid::new_v4()),
         format!("tenant:{}", Uuid::new_v4()),
@@ -1547,7 +1575,7 @@ async fn one_owner_cannot_change_another_owners_row() {
         &cp,
         Kind::RateLimitPolicies,
         id,
-        Op::Create(classic_rate_limit("rl-owned")),
+        Op::Create(classic_rate_limit("rl-owned", "team", &team)),
         None,
         Some(&owner),
     )
@@ -1557,7 +1585,7 @@ async fn one_owner_cannot_change_another_owners_row() {
         &cp,
         Kind::RateLimitPolicies,
         id,
-        Op::Replace(classic_rate_limit("rl-taken")),
+        Op::Replace(classic_rate_limit("rl-taken", "team", &team)),
         Some(1),
         Some(&other),
     )
@@ -1586,7 +1614,7 @@ async fn one_owner_cannot_change_another_owners_row() {
         &cp,
         Kind::RateLimitPolicies,
         free,
-        Op::Create(classic_rate_limit("rl-free")),
+        Op::Create(classic_rate_limit("rl-free", "team", &team)),
         None,
         None,
     )
@@ -1957,6 +1985,182 @@ async fn every_kind_of_reference_holds_its_target() {
     }
 }
 
+#[tokio::test]
+async fn a_classic_rate_limit_policy_holds_its_scope_target() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let admin = Admin::as_role(&cp, OperatorRole::Operator).await;
+    let pk = admin
+        .create("provider_keys", provider_key("acct-scoped"))
+        .await;
+    let model = admin
+        .create("models", direct_model("chat-scoped", &pk))
+        .await;
+    let team = live_team(&cp).await;
+    let user = derived(&cp, Kind::Users, json!({"name": "member-e2e"})).await;
+    let key = derived(
+        &cp,
+        Kind::ApiKeys,
+        json!({"key_hash": unique("hash"), "team_id": team, "user_id": user}),
+    )
+    .await;
+    for (scope, target) in [
+        ("model", &model),
+        ("api_key", &key),
+        ("team", &team),
+        ("team_member", &team),
+        ("member", &user),
+    ] {
+        // A subject that is not there, or not of the kind the scope names,
+        // would be limited by nothing.
+        let other_kind = if scope == "model" { &team } else { &model };
+        for missing in [
+            Uuid::new_v4().to_string(),
+            other_kind.clone(),
+            target.to_uppercase(),
+        ] {
+            let r = admin
+                .post(
+                    "/admin/resources/rate_limit_policies",
+                    json!({"doc": classic_rate_limit(&unique("rl"), scope, &missing)}),
+                )
+                .await;
+            assert_eq!(r.status, 422, "{scope} {missing}: {r:?}");
+            assert_eq!(r.body["details"][0]["path"], "/scope_ref", "{scope}");
+        }
+        admin
+            .create(
+                "rate_limit_policies",
+                classic_rate_limit(&unique(&format!("rl-{scope}")), scope, target),
+            )
+            .await;
+    }
+    // A model stays while a policy limits it.
+    let r = admin
+        .delete(&format!("/admin/resources/models/{model}"), Some("\"1\""))
+        .await;
+    assert_eq!(r.status, 409, "{r:?}");
+    assert_eq!(r.body["referenced_by"][0]["kind"], "rate_limit_policies");
+}
+
+/// A row derived from a tenant, a member or a key goes when they go, and
+/// what operators scoped to it does not hold it: once the key, member or
+/// team is gone, nothing reaches a gateway through it, so a scope left
+/// pointing at it governs nothing that still exists. A derived referrer
+/// does hold it, so the code that derives both removes the referrer first.
+#[tokio::test]
+async fn operator_configuration_scoped_to_a_derived_row_does_not_hold_its_delete() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let admin = Admin::as_role(&cp, OperatorRole::Operator).await;
+    let team = live_team(&cp).await;
+    let user = derived(&cp, Kind::Users, json!({"name": "member-e2e"})).await;
+    let key = derived(
+        &cp,
+        Kind::ApiKeys,
+        json!({"key_hash": unique("hash"), "team_id": team, "user_id": user}),
+    )
+    .await;
+    let guardrail = admin
+        .create(
+            "guardrails",
+            json!({"name": "kw-scoped", "kind": "keyword", "patterns": [{"kind": "literal", "value": "x"}]}),
+        )
+        .await;
+    let on_key =
+        json!({"guardrail_id": guardrail, "priority": 1, "scope_type": "api_key", "scope_id": key});
+    let attachment = admin.create("guardrail_attachments", on_key.clone()).await;
+    admin
+        .create(
+            "guardrail_attachments",
+            json!({"guardrail_id": guardrail, "priority": 2, "scope_type": "team", "scope_id": team}),
+        )
+        .await;
+    admin
+        .create(
+            "cache_policies",
+            json!({"name": "cache-scoped", "applies_to": format!("api_key:{key}")}),
+        )
+        .await;
+    for (scope, target) in [("api_key", &key), ("member", &user), ("team", &team)] {
+        admin
+            .create(
+                "rate_limit_policies",
+                classic_rate_limit(&unique("rl"), scope, target),
+            )
+            .await;
+    }
+
+    let id = |s: &str| Uuid::parse_str(s).expect("a uuid");
+    let e = write(
+        &cp,
+        Kind::Teams,
+        id(&team),
+        Op::Delete,
+        None,
+        Some(DERIVED_OWNER),
+    )
+    .await
+    .expect_err("the key still names its team");
+    assert_eq!(e.code, "in_use");
+    let holders: Vec<(Kind, String)> = e
+        .referenced_by
+        .iter()
+        .map(|r| (r.kind, r.id.to_string()))
+        .collect();
+    assert_eq!(holders, [(Kind::ApiKeys, key.clone())]);
+
+    for (kind, row) in [
+        (Kind::ApiKeys, &key),
+        (Kind::Users, &user),
+        (Kind::Teams, &team),
+    ] {
+        let gone = write(&cp, kind, id(row), Op::Delete, None, Some(DERIVED_OWNER))
+            .await
+            .unwrap_or_else(|e| panic!("delete {kind:?}: {e:?}"));
+        assert!(gone.deleted);
+    }
+    // The configuration stays, and saving it as it is now says what it lost.
+    let r = admin
+        .put(
+            &format!("/admin/resources/guardrail_attachments/{attachment}"),
+            Some("\"1\""),
+            json!({ "doc": on_key }),
+        )
+        .await;
+    assert_eq!(r.status, 422, "{r:?}");
+    assert_eq!(r.body["details"][0]["path"], "/scope_id");
+}
+
+/// A key's model selection is withdrawn with the model's grants (ruling
+/// 13), so it does not hold the model's delete the way configuration does.
+#[tokio::test]
+async fn a_keys_model_selection_does_not_hold_the_models_delete() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let admin = Admin::as_role(&cp, OperatorRole::Operator).await;
+    let pk = admin
+        .create("provider_keys", provider_key("acct-selected"))
+        .await;
+    let model = admin
+        .create("models", direct_model("chat-selected", &pk))
+        .await;
+    let team = live_team(&cp).await;
+    derived(
+        &cp,
+        Kind::ApiKeys,
+        json!({"key_hash": unique("hash"), "team_id": team, "allowed_model_ids": [model]}),
+    )
+    .await;
+    let r = admin
+        .delete(&format!("/admin/resources/models/{model}"), Some("\"1\""))
+        .await;
+    assert_eq!(r.status, 200, "{r:?}");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_delete_racing_a_create_that_references_it_leaves_no_dangling_reference() {
     let Some(cp) = TestCp::start().await else {
@@ -2016,7 +2220,17 @@ async fn managed_kinds_refuse_generic_writes() {
         return;
     };
     let admin = Admin::as_role(&cp, OperatorRole::Admin).await;
+    // The first boot has already written the platform's own team.
+    let count_rows = || async {
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM gw_resources")
+            .fetch_one(cp.db().pool())
+            .await
+            .expect("count rows")
+    };
+    let rows_before = count_rows().await;
     for kind in ["teams", "users", "api_keys", "budgets"] {
+        let listed_before =
+            admin.get(&format!("/admin/resources/{kind}")).await.body["items"].clone();
         let r = admin
             .post(
                 &format!("/admin/resources/{kind}"),
@@ -2041,13 +2255,10 @@ async fn managed_kinds_refuse_generic_writes() {
         // Reading them is allowed.
         let r = admin.get(&format!("/admin/resources/{kind}")).await;
         assert_eq!(r.status, 200, "{kind}: {r:?}");
-        assert_eq!(r.body["items"], json!([]));
+        assert_eq!(r.body["items"], listed_before, "{kind}");
+        assert!(!r.body.to_string().contains("managed-7c1"), "{kind}");
     }
-    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM gw_resources")
-        .fetch_one(cp.db().pool())
-        .await
-        .expect("count rows");
-    assert_eq!(rows, 0);
+    assert_eq!(count_rows().await, rows_before);
 }
 
 #[tokio::test]
@@ -2055,6 +2266,7 @@ async fn a_managed_row_of_a_writable_kind_cannot_be_edited_through_the_generic_a
     let Some(cp) = TestCp::start().await else {
         return;
     };
+    let team = live_team(&cp).await;
     let admin = Admin::as_role(&cp, OperatorRole::Admin).await;
     let owner = format!("tenant:{}", Uuid::new_v4());
     let id = Uuid::new_v4();
@@ -2062,7 +2274,7 @@ async fn a_managed_row_of_a_writable_kind_cannot_be_edited_through_the_generic_a
         &cp,
         Kind::RateLimitPolicies,
         id,
-        Op::Create(classic_rate_limit("rl-tenant")),
+        Op::Create(classic_rate_limit("rl-tenant", "team", &team)),
         None,
         Some(&owner),
     )
@@ -2078,7 +2290,7 @@ async fn a_managed_row_of_a_writable_kind_cannot_be_edited_through_the_generic_a
         .put(
             &path,
             Some("\"1\""),
-            json!({"doc": classic_rate_limit("rl-hijack")}),
+            json!({"doc": classic_rate_limit("rl-hijack", "team", &team)}),
         )
         .await;
     assert_eq!(r.status, 409, "{r:?}");
@@ -2098,7 +2310,7 @@ async fn a_managed_row_of_a_writable_kind_cannot_be_edited_through_the_generic_a
         &cp,
         Kind::RateLimitPolicies,
         id,
-        Op::Replace(classic_rate_limit("rl-tenant-2")),
+        Op::Replace(classic_rate_limit("rl-tenant-2", "team", &team)),
         Some(1),
         Some(&owner),
     )
@@ -2112,12 +2324,13 @@ async fn creating_again_an_id_whose_row_is_a_tombstone_revives_it() {
     let Some(cp) = TestCp::start().await else {
         return;
     };
+    let team = live_team(&cp).await;
     let id = Uuid::new_v4();
     let first = write(
         &cp,
         Kind::RateLimitPolicies,
         id,
-        Op::Create(classic_rate_limit("rl-1")),
+        Op::Create(classic_rate_limit("rl-1", "team", &team)),
         None,
         None,
     )
@@ -2128,7 +2341,7 @@ async fn creating_again_an_id_whose_row_is_a_tombstone_revives_it() {
         &cp,
         Kind::RateLimitPolicies,
         id,
-        Op::Create(classic_rate_limit("rl-1b")),
+        Op::Create(classic_rate_limit("rl-1b", "team", &team)),
         None,
         None,
     )
@@ -2144,7 +2357,7 @@ async fn creating_again_an_id_whose_row_is_a_tombstone_revives_it() {
         &cp,
         Kind::RateLimitPolicies,
         id,
-        Op::Create(classic_rate_limit("rl-2")),
+        Op::Create(classic_rate_limit("rl-2", "team", &team)),
         None,
         None,
     )

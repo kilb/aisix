@@ -69,7 +69,7 @@ pub enum WriteOp<'a> {
 /// size check again, on the document as it will be projected; the
 /// gateway's strict validation; the reference check; sealing; the store. A
 /// delete is refused while a live document references the row (`409
-/// in_use`).
+/// in_use`), except the referrers [`non_holding_referrers`] names.
 pub async fn write_resource(
     conn: &mut PgConnection,
     ctx: &WriteCtx,
@@ -98,15 +98,38 @@ pub async fn write_resource(
         }
         WriteOp::Delete => {
             writable_row(conn, &w).await?;
-            // Task 10 cascades a model's tenant grants and key selections
-            // first, and then excludes those kinds here (ruling 13); until
-            // then every referrer counts.
-            let referrers = refs::incoming(conn, w.kind, w.id, &[]).await?;
+            let referrers =
+                refs::incoming(conn, w.kind, w.id, non_holding_referrers(w.kind)).await?;
             if !referrers.is_empty() {
                 return Err(ApiError::in_use(referrers));
             }
             Ok(store::mark_deleted(conn, w.kind, w.id, w.expected_version).await?)
         }
+    }
+}
+
+/// The kinds whose references do not keep a row of `kind` from being
+/// deleted.
+///
+/// - A model: the documents derived from tenants. Its delete withdraws it
+///   from every grant and key selection first (`tenants::on_model_deleted`,
+///   ruling 13); configuration that uses it still holds it.
+/// - A row derived from a tenant, a member or a key: the configuration
+///   operators scope to one. Once the team, member or key is gone, no
+///   request reaches a gateway through it, so a scope left naming it
+///   governs nothing that still exists; holding the delete would let an
+///   operator's guardrail or cache scope block a key revoke. A derived
+///   referrer (a key naming its team or member) still holds it: the code
+///   deriving both deletes the referrer first.
+fn non_holding_referrers(kind: Kind) -> &'static [Kind] {
+    match kind {
+        Kind::Models => &[Kind::ApiKeys, Kind::Teams, Kind::Users],
+        Kind::Teams | Kind::Users | Kind::ApiKeys => &[
+            Kind::CachePolicies,
+            Kind::GuardrailAttachments,
+            Kind::RateLimitPolicies,
+        ],
+        _ => &[],
     }
 }
 

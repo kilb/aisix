@@ -70,6 +70,27 @@ fn fixture(method: &str, path: &str, target: &SeededOperator) -> (String, Option
             format!("/admin/resources/provider_keys/{}", Uuid::nil()),
             (method == "PUT").then(|| json!({"doc": {}})),
         ),
+        // Tenants. The single-tenant routes name an id that matches nothing:
+        // past the role check, a read or an action answers 404 and a PATCH
+        // without If-Match 428, so nothing is written.
+        ("GET", "/admin/tenants")
+        | ("GET", "/admin/settings/tenant-defaults")
+        | ("GET", "/admin/provider-groups") => (path.to_string(), None),
+        ("POST", "/admin/tenants") => (path.to_string(), Some(json!({"name": "roles-tenant"}))),
+        ("GET", "/admin/tenants/{id}") => (format!("/admin/tenants/{}", Uuid::nil()), None),
+        ("PATCH", "/admin/tenants/{id}") => (
+            format!("/admin/tenants/{}", Uuid::nil()),
+            Some(json!({"name": "roles-tenant"})),
+        ),
+        ("POST", "/admin/tenants/{id}/approve")
+        | ("POST", "/admin/tenants/{id}/suspend")
+        | ("POST", "/admin/tenants/{id}/reactivate") => {
+            (path.replace("{id}", &Uuid::nil().to_string()), None)
+        }
+        ("PUT", "/admin/settings/tenant-defaults") => (
+            path.to_string(),
+            Some(json!({"concurrency": 20, "default_provider_groups": ["shared"]})),
+        ),
         _ => panic!("no fixture for {method} {path}: add one to tests/roles.rs"),
     }
 }

@@ -26,7 +26,7 @@ use serde_json::{json, Value};
 
 use crate::auth::{MemberRole, OperatorRole};
 use crate::error::{ApiError, Detail};
-use crate::{audit, dp, gateways, operators, resources, AppState};
+use crate::{audit, dp, gateways, operators, resources, tenants, AppState};
 
 /// The largest request body either listener reads.
 const MAX_BODY_BYTES: usize = 1 << 20;
@@ -126,6 +126,53 @@ pub const ROUTE_ROLES: &[(&str, &str, MinRole)] = &[
         "/admin/resources/{kind}/{id}",
         MinRole::Op(OperatorRole::Operator),
     ),
+    // Tenants, their defaults, and the provider groups they can be given.
+    ("GET", "/admin/tenants", MinRole::Op(OperatorRole::Viewer)),
+    (
+        "POST",
+        "/admin/tenants",
+        MinRole::Op(OperatorRole::Operator),
+    ),
+    (
+        "GET",
+        "/admin/tenants/{id}",
+        MinRole::Op(OperatorRole::Viewer),
+    ),
+    (
+        "PATCH",
+        "/admin/tenants/{id}",
+        MinRole::Op(OperatorRole::Operator),
+    ),
+    (
+        "POST",
+        "/admin/tenants/{id}/approve",
+        MinRole::Op(OperatorRole::Operator),
+    ),
+    (
+        "POST",
+        "/admin/tenants/{id}/suspend",
+        MinRole::Op(OperatorRole::Operator),
+    ),
+    (
+        "POST",
+        "/admin/tenants/{id}/reactivate",
+        MinRole::Op(OperatorRole::Operator),
+    ),
+    (
+        "GET",
+        "/admin/settings/tenant-defaults",
+        MinRole::Op(OperatorRole::Viewer),
+    ),
+    (
+        "PUT",
+        "/admin/settings/tenant-defaults",
+        MinRole::Op(OperatorRole::Admin),
+    ),
+    (
+        "GET",
+        "/admin/provider-groups",
+        MinRole::Op(OperatorRole::Viewer),
+    ),
     // Gateways, on the gateway listener.
     ("POST", "/dp/heartbeat", MinRole::Dp),
     ("ANY", "/dp/store/v1/{*rest}", MinRole::Dp),
@@ -166,6 +213,22 @@ pub fn browser_router(state: AppState) -> Router {
                 .put(resources::api::replace)
                 .delete(resources::api::delete),
         )
+        .route(
+            "/admin/tenants",
+            get(tenants::list).post(tenants::create_tenant),
+        )
+        .route(
+            "/admin/tenants/{id}",
+            get(tenants::get).patch(tenants::update),
+        )
+        .route("/admin/tenants/{id}/approve", post(tenants::approve))
+        .route("/admin/tenants/{id}/suspend", post(tenants::suspend))
+        .route("/admin/tenants/{id}/reactivate", post(tenants::reactivate))
+        .route(
+            "/admin/settings/tenant-defaults",
+            get(tenants::get_defaults).put(tenants::put_defaults),
+        )
+        .route("/admin/provider-groups", get(tenants::provider_groups))
         .route_layer(axum::middleware::from_fn(only_listed_routes))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(state)
