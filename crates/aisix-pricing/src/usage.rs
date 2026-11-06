@@ -132,6 +132,9 @@ pub enum Inconsistency {
     /// A write-lifetime split is half reported, or its parts do not add up
     /// to `cache_creation_tokens`.
     CacheWriteSplitMismatch,
+    /// `reasoning_tokens` is read as a subset of `completion_tokens` (the
+    /// upstream total does not place it beside the completion) and exceeds it.
+    ReasoningExceedsCompletion,
 }
 
 /// What one row bills, one disjoint quantity per [`Dimension`]: each token
@@ -199,22 +202,24 @@ impl Quantities {
 /// Splits a row into the quantities it bills. Every counter is widened to
 /// `u64` first, so no sum of `u32` counters can overflow.
 ///
-/// 1. The two subset counters (`cached_prompt_tokens`, `cache_write_tokens`)
-///    cannot exceed the prompt that contains them. Such a row is refused,
-///    never saturated into a guess.
+/// 1. The three input buckets come from `aisix_core::input_tokens_for_pricing`.
+///    They must hold exactly the prompt plus the two additive counters; when
+///    they do not, the subset counters taken out of the prompt exceed it,
+///    and the row is refused, never saturated into a guess.
 /// 2. The write-lifetime split is either absent, which bills every write as
 ///    a five-minute one, or present on both sides and adding up to
 ///    `cache_creation_tokens`.
-/// 3. The three input buckets come from `aisix_core::input_tokens_for_pricing`.
-/// 4. Prompt audio and image tokens include any cached portion. The cache is
+/// 3. Prompt audio and image tokens include any cached portion. The cache is
 ///    assumed to hold them first, which favours the tenant whenever a
 ///    modality token is priced above a text one, and the rest is carved
 ///    from fresh input, each capped by what is left.
-/// 5. Reasoning counted beside the completion
-///    (`aisix_core::reasoning_beside_completion`) is added to it; otherwise
-///    it is a subset of it.
-/// 6. Reasoning, then audio, then image output are carved out of the output
-///    total, each capped by what is left; the remainder is text output.
+/// 4. Reasoning counted beside the completion
+///    (`aisix_core::reasoning_beside_completion`) is added to it. Otherwise
+///    it is a subset of it, and a row whose reasoning exceeds the completion
+///    is refused.
+/// 5. Reasoning, then audio, then image output are carved out of the output
+///    total, the modality counts each capped by what is left; the remainder
+///    is text output.
 #[cfg_attr(
     not(test),
     expect(dead_code, reason = "the engine (Task 6) is the first caller")
@@ -222,10 +227,17 @@ impl Quantities {
 pub(crate) fn quantities(u: &BillableUsage) -> Result<Quantities, Inconsistency> {
     let prompt = u64::from(u.prompt_tokens);
     let cached = u64::from(u.cached_prompt_tokens);
-    let write_subset = u64::from(u.cache_write_tokens.unwrap_or(0));
+    let cache_read = u64::from(u.cache_read_tokens);
     let creation = u64::from(u.cache_creation_tokens);
 
-    if cached + write_subset > prompt {
+    let b = input_tokens_for_pricing(
+        prompt,
+        cached,
+        u64::from(u.cache_write_tokens.unwrap_or(0)),
+        cache_read,
+        creation,
+    );
+    if b.total() != prompt + cache_read + creation {
         return Err(Inconsistency::CachedExceedsPrompt);
     }
     let one_hour = match (u.cache_creation_5m_tokens, u.cache_creation_1h_tokens) {
@@ -236,14 +248,6 @@ pub(crate) fn quantities(u: &BillableUsage) -> Result<Quantities, Inconsistency>
         _ => return Err(Inconsistency::CacheWriteSplitMismatch),
     };
 
-    let b = input_tokens_for_pricing(
-        prompt,
-        cached,
-        write_subset,
-        u64::from(u.cache_read_tokens),
-        creation,
-    );
-
     let prompt_audio = u64::from(u.prompt_audio_tokens.unwrap_or(0));
     let prompt_image = u64::from(u.prompt_image_tokens.unwrap_or(0));
     let audio_input = prompt_audio.saturating_sub(cached).min(b.uncached);
@@ -252,6 +256,7 @@ pub(crate) fn quantities(u: &BillableUsage) -> Result<Quantities, Inconsistency>
         .saturating_sub(cached_left)
         .min(b.uncached - audio_input);
 
+    let completion = u64::from(u.completion_tokens);
     let reasoning = u64::from(u.reasoning_tokens);
     let beside = reasoning_beside_completion(
         u.prompt_tokens,
@@ -259,16 +264,19 @@ pub(crate) fn quantities(u: &BillableUsage) -> Result<Quantities, Inconsistency>
         u.reasoning_tokens,
         u.total_tokens,
     );
-    let output_total = u64::from(u.completion_tokens) + if beside { reasoning } else { 0 };
-    let reasoning = reasoning.min(output_total);
+    if !beside && reasoning > completion {
+        return Err(Inconsistency::ReasoningExceedsCompletion);
+    }
+    let output_total = completion + if beside { reasoning } else { 0 };
     let mut rest = output_total - reasoning;
     let audio_output = u64::from(u.completion_audio_tokens.unwrap_or(0)).min(rest);
     rest -= audio_output;
     let image_output = u64::from(u.completion_image_tokens.unwrap_or(0)).min(rest);
     rest -= image_output;
 
-    // Each subtraction is of an amount capped by what it is taken from, and
-    // `one_hour` is a part of `creation`, which `b.cache_write` contains.
+    // Each subtraction is of an amount capped by what it is taken from:
+    // `reasoning` fits in `output_total` once the refusal above has passed,
+    // and `one_hour` is a part of `creation`, which `b.cache_write` contains.
     Ok(Quantities {
         input: b.uncached - audio_input - image_input,
         cache_read: b.cache_read,
@@ -460,6 +468,7 @@ mod tests {
         for j in [
             r#"{"cache_creation_tokens":4,"cache_creation_5m_tokens":1,"cache_creation_1h_tokens":2}"#,
             r#"{"cache_creation_tokens":4,"cache_creation_1h_tokens":4}"#,
+            r#"{"cache_creation_tokens":4,"cache_creation_5m_tokens":4}"#,
         ] {
             assert_eq!(
                 quantities(&row(j)),
@@ -474,7 +483,98 @@ mod tests {
         assert!(quantities(&row("{}")).unwrap().is_zero());
     }
 
+    #[test]
+    fn reasoning_beyond_the_completion_that_contains_it_is_refused() {
+        // No total, and a total that is only prompt + completion: both read
+        // the reasoning as part of the completion, which cannot hold it.
+        for j in [
+            r#"{"prompt_tokens":100,"completion_tokens":20,"reasoning_tokens":30}"#,
+            r#"{"prompt_tokens":100,"completion_tokens":20,"reasoning_tokens":30,"total_tokens":120}"#,
+        ] {
+            assert_eq!(
+                quantities(&row(j)),
+                Err(Inconsistency::ReasoningExceedsCompletion),
+                "{j}"
+            );
+        }
+        // The same counters with a total that places the reasoning beside
+        // the completion are consistent.
+        let q = quantities(&row(
+            r#"{"prompt_tokens":100,"completion_tokens":20,"reasoning_tokens":30,"total_tokens":150}"#,
+        ))
+        .unwrap();
+        assert_eq!((q.output, q.reasoning), (20, 30));
+        // A completion that is all reasoning is consistent too.
+        let q = quantities(&row(r#"{"completion_tokens":30,"reasoning_tokens":30}"#)).unwrap();
+        assert_eq!((q.output, q.reasoning), (0, 30));
+    }
+
+    #[test]
+    fn a_bedrock_converse_row_bills_its_additive_cache_counters() {
+        let q = quantities(&row(
+            r#"{"prompt_tokens":100,"cache_read_tokens":900,"cache_creation_tokens":500,
+            "cache_creation_5m_tokens":500,"cache_creation_1h_tokens":0,
+            "completion_tokens":50,"total_tokens":1550}"#,
+        ))
+        .unwrap();
+        assert_eq!(
+            (q.input, q.cache_read, q.cache_write, q.cache_write_1h),
+            (100, 900, 500, 0)
+        );
+        assert_eq!((q.output, q.reasoning), (50, 0));
+    }
+
     // ---- decoding ----
+
+    #[test]
+    fn a_counter_that_is_not_a_u32_does_not_decode() {
+        let decode = |field: &str, value: &str| {
+            serde_json::from_str::<BillableUsage>(&format!(
+                r#"{{"event_id":"e","occurred_at":"2026-11-06T00:00:00Z","{field}":{value}}}"#
+            ))
+        };
+        let counters = [
+            "prompt_tokens",
+            "cached_prompt_tokens",
+            "web_search_requests",
+        ];
+        let breakdowns = ["cache_write_tokens", "prompt_audio_tokens"];
+        let not_a_u32 = ["-1", "4294967296", "18446744073709551616", "1.0", r#""10""#];
+        for field in counters.iter().chain(&breakdowns) {
+            let u = decode(field, "4294967295").unwrap();
+            let read = match *field {
+                "prompt_tokens" => Some(u.prompt_tokens),
+                "cached_prompt_tokens" => Some(u.cached_prompt_tokens),
+                "web_search_requests" => Some(u.web_search_requests),
+                "cache_write_tokens" => u.cache_write_tokens,
+                _ => u.prompt_audio_tokens,
+            };
+            assert_eq!(read, Some(u32::MAX), "{field}");
+            for value in not_a_u32 {
+                assert!(decode(field, value).is_err(), "{field}: {value}");
+            }
+        }
+        // A plain counter has no "unreported" state for `null` to mean.
+        for field in counters {
+            assert!(decode(field, "null").is_err(), "{field}: null");
+        }
+    }
+
+    #[test]
+    fn a_null_breakdown_reads_as_unreported() {
+        let nulls = row(
+            r#"{"prompt_tokens":100,"cache_creation_tokens":4,"completion_tokens":10,
+            "cache_write_tokens":null,"cache_creation_5m_tokens":null,
+            "cache_creation_1h_tokens":null,"prompt_audio_tokens":null,
+            "prompt_image_tokens":null,"completion_audio_tokens":null,
+            "completion_image_tokens":null,"service_tier":null,"requested_service_tier":null,
+            "upstream_provider":null,"upstream_model":null,"provider_key_id":null}"#,
+        );
+        let absent =
+            row(r#"{"prompt_tokens":100,"cache_creation_tokens":4,"completion_tokens":10}"#);
+        assert_eq!(nulls, absent);
+        assert_eq!(quantities(&nulls), quantities(&absent));
+    }
 
     #[test]
     fn a_wire_row_with_fields_this_engine_does_not_read_still_deserializes() {
@@ -579,6 +679,74 @@ mod tests {
         );
     }
 
+    /// Every counter the gateway keeps for an upstream call is either read
+    /// here or named as not billed, with the reason. The patterns are
+    /// exhaustive, so a counter the gateway adds fails to compile here until
+    /// someone decides which it is.
+    #[test]
+    fn every_gateway_usage_counter_is_classified() {
+        let aisix_gateway::UsageStats {
+            // Read: each reaches the usage row under the name BillableUsage
+            // reads.
+            prompt_tokens: _,
+            completion_tokens: _,
+            cached_prompt_tokens: _,
+            cache_write_tokens: _,
+            reasoning_tokens: _,
+            cache_creation_tokens: _,
+            cache_read_tokens: _,
+            web_search_requests: _,
+            // Recorded as the row's `total_tokens`.
+            upstream_total_tokens: _,
+            // Taken back out of the row's `completion_tokens` when the
+            // upstream total shows the reasoning sat beside it
+            // (`recorded_completion_tokens`), so the row is in the
+            // upstream's own shape.
+            reasoning_folded_into_completion: _,
+            modality,
+            cache_creation_ttl,
+            // Not billed: the gateway's own total, which it may compute;
+            // the row carries the upstream's instead.
+            total_tokens: _,
+            // Not billed: the provider charges nothing for a fetch; the
+            // fetched content bills as input tokens.
+            web_fetch_requests: _,
+            // Not billed: one provider's native names for the hit and the
+            // miss, kept for clients that read them. The hit is already
+            // `cached_prompt_tokens`, and the two add up to `prompt_tokens`
+            // (<https://api-docs.deepseek.com/api/create-chat-completion>).
+            prompt_cache_hit_tokens: _,
+            prompt_cache_miss_tokens: _,
+            openai_details,
+        } = aisix_gateway::UsageStats::default();
+        let aisix_gateway::ModalityTokens {
+            // Read, all four.
+            prompt_audio_tokens: _,
+            prompt_image_tokens: _,
+            completion_audio_tokens: _,
+            completion_image_tokens: _,
+        } = modality;
+        let aisix_gateway::CacheCreationTtl {
+            // Read, both.
+            cache_creation_5m_tokens: _,
+            cache_creation_1h_tokens: _,
+        } = cache_creation_ttl;
+        let aisix_gateway::OpenAiUsageDetails {
+            // Not billed: the client-facing projection only, never on the
+            // row. The two flags mark presence; the text counts are each
+            // side less its audio and image tokens, which `quantities` works
+            // out itself; and predicted-output tokens, accepted or rejected,
+            // are counted in `completion_tokens` (`openai-python`:
+            // `src/openai/types/completion_usage.py`).
+            cached_tokens_reported: _,
+            reasoning_tokens_reported: _,
+            prompt_text_tokens: _,
+            completion_text_tokens: _,
+            accepted_prediction_tokens: _,
+            rejected_prediction_tokens: _,
+        } = openai_details;
+    }
+
     // ---- Quantities ----
 
     #[test]
@@ -680,9 +848,10 @@ mod tests {
 
     prop_compose! {
         /// A row `quantities` accepts: the subset counters fit inside the
-        /// prompt, and a write-lifetime split, when present, adds up to the
-        /// write. Every other counter is arbitrary, and the upstream total is
-        /// absent, the subset identity, the additive identity, or anything.
+        /// prompt, reasoning read as part of the completion fits inside it,
+        /// and a write-lifetime split, when present, adds up to the write.
+        /// Every other counter is arbitrary, and the upstream total is absent,
+        /// the subset identity, the additive identity, or anything.
         fn consistent_row()(
             (prompt, cached, write) in (count(), count(), proptest::option::of(count())),
             (cache_read, creation, split) in (count(), count(), proptest::option::of(count())),
@@ -699,6 +868,11 @@ mod tests {
                 1 => p.checked_add(c).unwrap_or(0),
                 2 => p.checked_add(c).and_then(|pc| pc.checked_add(r)).unwrap_or(0),
                 _ => total,
+            };
+            let reasoning = if reasoning_beside_completion(p, c, r, total) {
+                r
+            } else {
+                within(r, c)
             };
             BillableUsage {
                 prompt_tokens: prompt,
