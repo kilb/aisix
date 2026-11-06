@@ -2713,3 +2713,67 @@ async fn a_provider_key_with_groups_is_accepted() {
     assert_eq!(r.status, 200, "{r:?}");
     assert_eq!(r.body["doc"]["groups"], json!(["shared", "grp-alpha-7c1"]));
 }
+
+#[tokio::test]
+async fn an_env_scoped_cache_policy_is_refused() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let admin = Admin::as_role(&cp, OperatorRole::Operator).await;
+    let r = admin
+        .post(
+            "/admin/resources/cache_policies",
+            json!({"doc": {"name": "env-t15", "scope": "env"}}),
+        )
+        .await;
+    assert_eq!(r.status, 422, "{r:?}");
+    assert_eq!(r.body["code"], "validation_failed", "{r:?}");
+    assert_eq!(r.body["details"][0]["path"], "/scope", "{r:?}");
+    assert_eq!(
+        r.body["details"][0]["message"], "平台部署不提供 env 范围",
+        "{r:?}"
+    );
+    assert_eq!(live_count(&cp, "cache_policies").await, 0);
+    // A replace may not switch a stored policy to env either.
+    let id = admin
+        .create("cache_policies", json!({"name": "ok-t15", "scope": "team"}))
+        .await;
+    let r = admin
+        .put(
+            &format!("/admin/resources/cache_policies/{id}"),
+            Some("\"1\""),
+            json!({"doc": {"name": "ok-t15", "scope": "env"}}),
+        )
+        .await;
+    assert_eq!(r.status, 422, "{r:?}");
+    assert_eq!(r.body["details"][0]["path"], "/scope", "{r:?}");
+}
+
+#[tokio::test]
+async fn a_cache_policy_without_a_scope_is_stored_as_team_scoped() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let admin = Admin::as_role(&cp, OperatorRole::Operator).await;
+    let id = admin
+        .create("cache_policies", json!({"name": "bare-t15"}))
+        .await;
+    let (doc, ..) = stored(&cp, "cache_policies", &id).await;
+    assert_eq!(doc["scope"], "team", "{doc}");
+}
+
+#[tokio::test]
+async fn an_api_key_scoped_cache_policy_is_accepted() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let admin = Admin::as_role(&cp, OperatorRole::Operator).await;
+    let id = admin
+        .create(
+            "cache_policies",
+            json!({"name": "key-t15", "scope": "api_key"}),
+        )
+        .await;
+    let (doc, ..) = stored(&cp, "cache_policies", &id).await;
+    assert_eq!(doc["scope"], "api_key", "{doc}");
+}

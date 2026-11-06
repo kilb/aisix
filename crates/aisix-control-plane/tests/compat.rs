@@ -161,7 +161,7 @@ async fn a_team_scoped_cache_policy_is_refused_while_an_older_gateway_is_registe
         &cp,
         &admin,
         "cache_policies",
-        json!({"name": "env-7c1", "scope": "env"}),
+        json!({"name": "env-7c1", "scope": "api_key"}),
     )
     .await;
     assert_eq!(r.status, 201, "{r:?}");
@@ -333,7 +333,7 @@ async fn a_replace_that_keeps_a_floored_field_is_not_refused_but_one_that_adds_i
         &cp,
         &admin,
         "cache_policies",
-        json!({"name": "env-7c9", "scope": "env"}),
+        json!({"name": "env-7c9", "scope": "api_key"}),
     )
     .await;
     assert_eq!(env.status, 201, "{env:?}");
@@ -363,7 +363,10 @@ async fn a_replace_that_keeps_a_floored_field_is_not_refused_but_one_that_adds_i
         .fetch_one(cp.db().pool())
         .await
         .expect("read the env policy");
-    assert_eq!(stored["scope"], "env", "the refused replace stored nothing");
+    assert_eq!(
+        stored["scope"], "api_key",
+        "the refused replace stored nothing"
+    );
 }
 
 /// Fills `gw`'s credential to its instance cap: `online` rows heard from

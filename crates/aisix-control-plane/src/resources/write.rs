@@ -240,10 +240,35 @@ async fn prepare(
     secrets::unseal(&ctx.mk, w.kind, w.id, &mut projected).map_err(ApiError::internal)?;
     check_size(&projected)?;
     validate_strict(w.kind, &doc).map_err(ApiError::validation)?;
+    platform_rules(w.kind, &mut doc)?;
     refuse_reserved_name(w, &doc)?;
     refuse_self_reference(w, &doc)?;
     refs::check_outgoing(conn, w.kind, &doc).await?;
     compat::gate(conn, ctx, w.kind, &doc, stored).await?;
     secrets::seal(&ctx.mk, w.kind, w.id, &mut doc);
     Ok(doc)
+}
+
+/// Rules only a platform deployment has, run after strict validation and
+/// before the reference check and the version gate. A cache policy is
+/// tenant-scoped: `env` would replay one tenant's answers to another, and a
+/// missing scope is written as `team` so the gateway never applies its own
+/// default.
+fn platform_rules(kind: Kind, doc: &mut Value) -> Result<(), ApiError> {
+    if kind != Kind::CachePolicies {
+        return Ok(());
+    }
+    match doc.get("scope").and_then(Value::as_str) {
+        Some("env") => Err(ApiError::validation(vec![Detail {
+            path: "/scope".into(),
+            message: "平台部署不提供 env 范围".into(),
+        }])),
+        Some(_) => Ok(()),
+        None => {
+            if let Some(map) = doc.as_object_mut() {
+                map.insert("scope".into(), Value::String("team".into()));
+            }
+            Ok(())
+        }
+    }
 }
