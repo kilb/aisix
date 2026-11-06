@@ -186,6 +186,13 @@ describe("usage rows carry the fields billing needs", () => {
         stream: true,
         stream_options: { include_usage: true },
       }),
+      await send("/v1/chat/completions", "billing-streamed-tier", {
+        model: "billing-streamed",
+        messages,
+        stream: true,
+        stream_options: { include_usage: true },
+        service_tier: "default",
+      }),
       await send("/v1/messages", "billing-messages", {
         model: "billing-buffered",
         max_tokens: 16,
@@ -200,10 +207,10 @@ describe("usage rows carry the fields billing needs", () => {
     ];
     for (const res of sent) expect(res.status, res.text).toBe(200);
 
-    const ids = [SHARED_REQUEST_ID, "billing-messages", "billing-responses"];
-    await waitConfigPropagation(async () => rowsFor(ids).length >= 4, 30_000);
+    const ids = [SHARED_REQUEST_ID, "billing-streamed-tier", "billing-messages", "billing-responses"];
+    await waitConfigPropagation(async () => rowsFor(ids).length >= 5, 30_000);
     const rows = rowsFor(ids);
-    expect(rows, JSON.stringify(rows)).toHaveLength(4);
+    expect(rows, JSON.stringify(rows)).toHaveLength(5);
 
     const one = (requestId: string, model: string): Row => {
       const matching = rows.filter((r) => r.request_id === requestId && r.requested_model === model);
@@ -212,6 +219,7 @@ describe("usage rows carry the fields billing needs", () => {
     };
     const chat = one(SHARED_REQUEST_ID, "billing-buffered");
     const streamedChat = one(SHARED_REQUEST_ID, "billing-streamed");
+    const streamedTierChat = one("billing-streamed-tier", "billing-streamed");
     const anthropic = one("billing-messages", "billing-buffered");
     const responses = one("billing-responses", "billing-buffered");
 
@@ -232,14 +240,17 @@ describe("usage rows carry the fields billing needs", () => {
       expect(row.upstream_provider, JSON.stringify(row)).toBe("openai");
       expect(row.upstream_model, JSON.stringify(row)).toBe(BUFFERED_UPSTREAM_MODEL);
     }
-    expect(streamedChat.provider_key_id).toBe(streamedKeyId);
-    expect(streamedChat.upstream_provider).toBe("openai");
-    expect(streamedChat.upstream_model).toBe(STREAMED_UPSTREAM_MODEL);
+    for (const row of [streamedChat, streamedTierChat]) {
+      expect(row.provider_key_id, JSON.stringify(row)).toBe(streamedKeyId);
+      expect(row.upstream_provider, JSON.stringify(row)).toBe("openai");
+      expect(row.upstream_model, JSON.stringify(row)).toBe(STREAMED_UPSTREAM_MODEL);
+    }
 
     // The tier each request asked for, and none where it asked for none.
     expect(chat.requested_service_tier).toBe("flex");
     expect(anthropic.requested_service_tier).toBe("auto");
     expect(responses.requested_service_tier).toBe("priority");
+    expect(streamedTierChat.requested_service_tier).toBe("default");
     expect("requested_service_tier" in streamedChat, JSON.stringify(streamedChat)).toBe(false);
 
     // None of these is a batch row, and a field that does not apply is left

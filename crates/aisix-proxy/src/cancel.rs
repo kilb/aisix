@@ -147,6 +147,10 @@ pub(crate) fn emit(
     if ctx.api_key_id.is_empty() || ctx.unmetered {
         return;
     }
+    // The context was taken off the cell this runs inside, so the emit
+    // chokepoint finds no requested tier there. Note it back, so every row
+    // below carries it, the abandoned ensemble's sub-call rows included.
+    crate::attribution::note_requested_service_tier(ctx.requested_service_tier.as_deref());
     // `/mcp` and `/a2a` resolve their principal without this extractor, so
     // they reach here with none — and their own events carry no source IP
     // or user agent either, which is exactly what the default renders.
@@ -348,9 +352,6 @@ fn base_event(
         // matching every other event of the same request.
         requested_model: resolved.requested_model.clone(),
         requested_model_id: resolved.requested_model_id.clone(),
-        // `Drop` runs outside the request scope the emit chokepoint reads
-        // this from, so it comes off the context taken from the cell.
-        requested_service_tier: ctx.requested_service_tier.clone(),
         inbound_protocol: inbound_protocol.to_string(),
         provider_kind: crate::chat::sanitize_tag(
             tags.kind.map(|k| k.as_str().to_owned()).unwrap_or_default(),

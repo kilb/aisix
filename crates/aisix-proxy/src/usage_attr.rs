@@ -1417,6 +1417,11 @@ fn stamp_billing_fields(snap: &AisixSnapshot, event: &mut UsageEvent, provider_k
 /// model of `model` when that model calls an upstream itself. A routing,
 /// semantic or ensemble model has neither of its own, and the
 /// [`UNKNOWN_PK`] an unresolved label carries names no key.
+///
+/// Composites are excluded by kind rather than left to their empty
+/// `provider` and `model_name`: an ensemble's own id is on its aggregate
+/// row, and a composite's name may hold a literal `*`, which
+/// [`crate::span_facts::request_model`] would read as a wildcard template.
 pub(crate) fn apply_upstream_identity(
     event: &mut UsageEvent,
     provider_key_id: &str,
@@ -2229,25 +2234,51 @@ mod tests {
 
     /// A row that reached no ProviderKey, or names an entry that is not an
     /// upstream of its own, carries none rather than a guess.
+    ///
+    /// The ensemble is the composite whose own id a row can carry (its
+    /// aggregate row), and its name holds a literal `*`, which nothing
+    /// forbids. Addressed by that exact name, it would read as a wildcard
+    /// template filled with `*` if composites were not excluded.
     #[tokio::test]
     #[allow(clippy::field_reassign_with_default)] // A literal here would read as an emitter to the scans below.
     async fn a_row_that_resolved_no_upstream_names_none() {
         let snap = AisixSnapshot::new();
-        let group: aisix_core::Model = serde_json::from_value(serde_json::json!({
-            "display_name": "group",
-            "routing": {"strategy": "failover", "targets": [{"model": "a"}]},
+        let ensemble: aisix_core::Model = serde_json::from_value(serde_json::json!({
+            "display_name": "council-*",
+            "ensemble": {"panel": [{"model": "a"}], "judge": {"model": "j"}},
         }))
         .unwrap();
-        snap.models.insert(ResourceEntry::new("g-1", group, 1));
+        snap.models.insert(ResourceEntry::new("e-1", ensemble, 1));
         let (state, mut rx) = state_reading_rows(snap);
-        for model_id in ["", "g-1", "missing"] {
+        for model_id in ["", "e-1", "missing"] {
             let mut event = UsageEvent::default();
             event.model_id = model_id.to_string();
+            event.requested_model = "council-*".to_string();
             let row = emitted_row(&state, &mut rx, event, "");
             assert_eq!(row.provider_key_id, None, "{model_id:?}");
             assert_eq!(row.upstream_provider, None, "{model_id:?}");
             assert_eq!(row.upstream_model, None, "{model_id:?}");
         }
+    }
+
+    /// The tier is the caller's own text, bound for the control plane's
+    /// store: control characters are stripped and it is capped at 256
+    /// characters, like the tier the upstream reports.
+    #[tokio::test]
+    async fn the_requested_service_tier_is_bounded_before_it_leaves() {
+        let (state, mut rx) = state_reading_rows(AisixSnapshot::new());
+        let cell = std::sync::Arc::new(crate::attribution::RequestAttribution::default());
+        let asked = format!("fl\u{7}ex{}", "x".repeat(300));
+        crate::attribution::scope(cell, async {
+            crate::attribution::note_requested_service_tier(Some(&asked));
+            let row = emitted_row(&state, &mut rx, UsageEvent::default(), "");
+            let expected = format!("flex{}", "x".repeat(252));
+            assert_eq!(
+                row.requested_service_tier.as_deref(),
+                Some(expected.as_str())
+            );
+        })
+        .await;
     }
 
     /// Every row of a request carries the tier its body asked for, the

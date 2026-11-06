@@ -1380,7 +1380,8 @@ pub(crate) fn note_a2a_call(agent: &str, method: &str, operation: &str) {
 /// every row of the request reports it: each attempt's, the terminal one,
 /// and the one a cancel writes. Called by the handlers whose request body
 /// defines the field (`/v1/chat/completions`, `/v1/messages`,
-/// `/v1/responses`) once it has parsed. A body with no string there notes
+/// `/v1/responses`) once it has parsed, and by `cancel::emit` to put back
+/// the value it took off the cell. A body with no string there notes
 /// nothing.
 pub(crate) fn note_requested_service_tier(tier: Option<&str>) {
     if let Some(tier) = tier {

@@ -12881,6 +12881,58 @@ data: [DONE]\n\n";
         assert_council_charged(&state, app, 32).await;
     }
 
+    /// Every row a cancelled request leaves keeps the service tier its body
+    /// asked for: the panel rows the cancel guard writes for the abandoned
+    /// ensemble as well as the guard's own 499 row.
+    #[tokio::test]
+    async fn ensemble_cancelled_while_the_judge_runs_keeps_the_requested_tier_on_every_row() {
+        use aisix_obs::UsageSink;
+        let upstream = MockServer::builder().start().await;
+        mount_council_with_a_slow_tail(&upstream, false).await;
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        let snap = new_snap(&upstream.uri());
+        seed_two_member_council(&snap);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let state = build_state(snap, hub).with_usage_sink(UsageSink::new(tx));
+        let app = build_router(state);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "model": "council",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "service_tier": "flex"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        cancel_in_flight(app, req).await;
+
+        let events = collect_events(&mut rx).await;
+        assert_eq!(
+            events.len(),
+            3,
+            "two panel rows and the 499 row: {events:?}"
+        );
+        assert!(
+            events[..2].iter().all(|e| e.attempt_kind == "panel"),
+            "{events:?}"
+        );
+        assert_eq!(events[2].status_code, CLIENT_CLOSED_REQUEST, "{events:?}");
+        for event in &events {
+            assert_eq!(
+                event.requested_service_tier.as_deref(),
+                Some("flex"),
+                "{event:?}"
+            );
+        }
+    }
+
     /// A non-streaming ensemble cancelled while one panel member is still
     /// out: the member that already answered is owed its row and its charge.
     #[tokio::test]
