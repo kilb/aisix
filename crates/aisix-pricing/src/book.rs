@@ -291,10 +291,6 @@ impl PriceBook {
     /// revision in effect, override or platform price, is `Err(revision_id)`
     /// and never gives way to another price. `None` when no price is in
     /// effect.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the engine (Task 6) is the first caller")
-    )]
     pub(crate) fn sell(
         &self,
         tenant_id: &str,
@@ -327,10 +323,6 @@ impl PriceBook {
 
     /// `tenant_id`'s discount in effect at `at`, as `(revision_id, bps)`;
     /// `Err(revision_id)` when that revision is invalid.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the engine (Task 6) is the first caller")
-    )]
     pub(crate) fn discount(
         &self,
         tenant_id: &str,
@@ -354,10 +346,6 @@ impl PriceBook {
     ///
     /// Cost revisions match `provider` and `model` exactly. The catalogue's
     /// aliases apply only to the catalogue fallback.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the engine (Task 6) is the first caller")
-    )]
     pub(crate) fn cost(
         &self,
         provider_key_id: Option<&str>,

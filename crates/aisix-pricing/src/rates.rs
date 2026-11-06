@@ -232,10 +232,6 @@ impl Rates {
     /// rate, one write rate covers both durations, and with no rate for
     /// reasoning, audio or image tokens those bill at the input or output
     /// rate of the side they are counted on.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the engine (Task 6) is the first caller")
-    )]
     pub(crate) fn rate_for(&self, d: Dimension) -> Option<Rate> {
         self.explicit(d).or(match d {
             Dimension::CacheRead
@@ -452,10 +448,6 @@ impl RateCard {
     /// The rates `tier` bills a request with `input_total` prompt tokens at:
     /// the last band whose threshold the prompt is strictly above, else the
     /// tier's base. `None` when the card has no such tier.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the engine (Task 6) is the first caller")
-    )]
     pub(crate) fn select(&self, tier: &ServiceTier, input_total: u64) -> Option<Selected<'_>> {
         let rates = self.0.get(tier)?;
         Some(

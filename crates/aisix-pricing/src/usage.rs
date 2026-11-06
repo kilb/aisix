@@ -155,10 +155,6 @@ pub(crate) struct Quantities {
 }
 
 impl Quantities {
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the engine (Task 6) is the first caller")
-    )]
     pub(crate) fn get(&self, d: Dimension) -> u64 {
         match d {
             Dimension::Input => self.input,
@@ -175,20 +171,12 @@ impl Quantities {
         }
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the engine (Task 6) is the first caller")
-    )]
     pub(crate) fn is_zero(&self) -> bool {
         *self == Quantities::default()
     }
 
     /// Every prompt token, fresh, cached or written: the prompt size a
     /// long-context band is selected by.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the engine (Task 6) is the first caller")
-    )]
     pub(crate) fn input_total(&self) -> u64 {
         self.input
             + self.cache_read
@@ -220,10 +208,6 @@ impl Quantities {
 /// 5. Reasoning, then audio, then image output are carved out of the output
 ///    total, the modality counts each capped by what is left; the remainder
 ///    is text output.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the engine (Task 6) is the first caller")
-)]
 pub(crate) fn quantities(u: &BillableUsage) -> Result<Quantities, Inconsistency> {
     let prompt = u64::from(u.prompt_tokens);
     let cached = u64::from(u.cached_prompt_tokens);

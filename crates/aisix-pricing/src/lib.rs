@@ -7,6 +7,7 @@
 
 mod book;
 mod catalogue;
+mod engine;
 mod rates;
 mod usage;
 
@@ -15,6 +16,10 @@ pub use book::{
     SellPriceRow,
 };
 pub use catalogue::{Catalogue, CatalogueEntry, CatalogueError};
+pub use engine::{
+    price_event, ChargeLine, CostPriced, DiscountRef, Exemption, Outcome, PricedEvent,
+    PricingError, PricingWarning, SellRef,
+};
 pub use rates::{
     Dimension, LongContextBand, MicroUsd, Rate, RateCard, RateCardError, Rates, ServiceTier,
     TierRates,
