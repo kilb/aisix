@@ -140,6 +140,12 @@ pub async fn start<S>(cfg: CpConfig, shutdown: S) -> Result<Running, BootError>
 where
     S: Future<Output = ()> + Send + 'static,
 {
+    // Every TLS client that takes the process default (the Postgres driver,
+    // the kine client, a gateway client in a test) gets ring, the provider
+    // this crate builds its own configurations with. A build that unifies
+    // the workspace's features also enables aws-lc-rs, and rustls then
+    // refuses to pick a default. Already installed is fine.
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let db = Db::connect(
         &cfg.database_url,
         cfg.db_lock_timeout_ms,
