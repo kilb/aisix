@@ -7,13 +7,20 @@
 //! its family and is called from every place a route resolves its caller:
 //!
 //! - the `AuthenticatedKey` extractor, once the key has resolved, for every
-//!   route that authenticates through it. The refusal takes the extractor's
-//!   own `Err` arm, which writes the access-log line and the request metrics;
+//!   route that authenticates through it, `/mcp/{server}/oauth/token` in the
+//!   relay sign-in mode included. The refusal takes the extractor's own `Err`
+//!   arm, which writes the access-log line and the request metrics;
 //! - `/v1/realtime`, before the session is prepared;
 //! - passthrough routes, as [`EndpointFamily::Passthrough`] whatever path or
 //!   host matched the route, since a host-matched route can carry any path;
-//! - `/mcp/{server}` callers resolved from an MCP sign-in session, and the
-//!   anonymous MCP principal, neither of which passes through the extractor.
+//! - the key an MCP sign-in session resolves to, at sign-in, at the token
+//!   step and on every `/mcp/{server}` request that presents the session
+//!   (`mcp_oauth_login::session_principal`), none of which passes through the
+//!   extractor;
+//! - the bound principal of anonymous MCP access and of an anonymous
+//!   passthrough route, where a principal that may not call the family closes
+//!   the entry: the caller is answered `401`, as by an entry no anonymous
+//!   caller may use, rather than refused for an API key it never sent.
 //!
 //! A route's family is read off the same route template the request metrics
 //! label it with ([`crate::normalize_endpoint_label`]), so the two cannot
@@ -31,7 +38,9 @@ use crate::error::ProxyError;
 /// `None` for the routes that take no API key (probes, OAuth discovery and
 /// the MCP sign-in pages) and for paths no typed route serves: a passthrough
 /// route may own such a path, and checks [`EndpointFamily::Passthrough`]
-/// itself.
+/// itself. The extractor reads `None` as a family nothing grants, so a route
+/// that takes a key and is missing here refuses a restricted key rather than
+/// skipping the check.
 pub(crate) fn endpoint_family(path: &str) -> Option<EndpointFamily> {
     use EndpointFamily as F;
     Some(match crate::normalize_endpoint_label(path) {
@@ -51,7 +60,10 @@ pub(crate) fn endpoint_family(path: &str) -> Option<EndpointFamily> {
         "/v1/files" | "/v1/files/:id" => F::Files,
         "/v1/batches" | "/v1/batches/:id" => F::Batches,
         "/v1/fine_tuning/jobs" | "/v1/fine_tuning/jobs/:id" => F::FineTuning,
-        "/mcp" | "/mcp/{server}" | "/mcp/{server}/oauth/credential" => F::Mcp,
+        "/mcp"
+        | "/mcp/{server}"
+        | "/mcp/{server}/oauth/token"
+        | "/mcp/{server}/oauth/credential" => F::Mcp,
         "/a2a" | "/a2a/{agent}/.well-known/agent-card.json" => F::A2a,
         _ => return None,
     })
@@ -168,7 +180,10 @@ mod tests {
         ("/mcp/:server/.well-known/jwks.json", Exempt(NO_KEY)),
         ("/mcp/:server/oauth/register", Exempt(NO_KEY)),
         ("/mcp/:server/oauth/authorize", Exempt(NO_KEY)),
-        ("/mcp/:server/oauth/token", Exempt(NO_KEY)),
+        // In the relay sign-in mode the token request authenticates with the
+        // caller's key and redeems an upstream code for it; in the
+        // interactive mode it takes no key and never reaches the check.
+        ("/mcp/:server/oauth/token", Family(F::Mcp)),
         // Authenticated with the key, unlike its siblings: it removes the
         // caller's stored MCP credential, which is the MCP surface's own.
         ("/mcp/:server/oauth/credential", Family(F::Mcp)),

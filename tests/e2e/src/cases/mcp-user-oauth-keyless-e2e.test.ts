@@ -1248,6 +1248,39 @@ describe("keyless sessions follow the configuration on the next request", () => 
     expect((await mcpPost(url(), bearer(tokens.access_token))).status).toBe(200);
   });
 
+  test("a key whose endpoint list leaves out MCP keeps no session and signs nobody in", async () => {
+    if (!etcdReachable) return;
+    provider.claims = claimsOf("tess", "endpoints");
+    upstream.user = "up-tess";
+    const { id, doc } = await ownKey("endpoints");
+    const tokens = await signInByHand(url());
+    expect((await mcpPost(url(), bearer(tokens.access_token))).status).toBe(200);
+
+    await seed.update("api_keys", id, { ...doc, allowed_endpoints: ["chat_completions"] });
+    await settled();
+    const refused = await mcpPost(url(), bearer(tokens.access_token));
+    expect(refused.status).toBe(403);
+    expect(refused.headers.get("www-authenticate")).toBeNull();
+    expect(((await refused.json()) as { error: { type: string } }).error.type).toBe("permission_denied");
+    const refreshed = await tokenRequest(url(), { grant_type: "refresh_token", refresh_token: tokens.refresh_token });
+    expect(await oauthError(refreshed)).toBe("invalid_grant");
+
+    // Signing in again on the same key ends on a page, with no code and no
+    // upstream step.
+    const seen = upstream.authorizeRequests.length;
+    const stop = await new Browser().walk(authorizeUrl(url()));
+    expect(stop.kind).toBe("page");
+    if (stop.kind === "page") {
+      expect(stop.status).toBe(403);
+      expect(stop.text).not.toContain("<form");
+    }
+    expect(upstream.authorizeRequests.length).toBe(seen);
+
+    await seed.update("api_keys", id, { ...doc, allowed_endpoints: ["mcp"] });
+    await settled();
+    expect((await mcpPost(url(), bearer(tokens.access_token))).status).toBe(200);
+  });
+
   test("a bound claim the session no longer meets is the policy refusal a JWT gets", async () => {
     if (!etcdReachable) return;
     provider.claims = claimsOf("quinn", "bound");

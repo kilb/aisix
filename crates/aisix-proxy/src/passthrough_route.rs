@@ -1464,6 +1464,21 @@ async fn authenticate(
             if entry.value.expires_at.is_some() && entry.value.is_expired_at(chrono::Utc::now()) {
                 return Err(ProxyError::ApiKeyExpired);
             }
+            // A principal whose `allowed_endpoints` leaves out passthrough
+            // closes the route the way anonymous MCP access closes: the
+            // caller is answered as on a route that takes a credential, not
+            // with a refusal of an API key it never sent.
+            if !entry
+                .value
+                .can_call(aisix_core::models::EndpointFamily::Passthrough)
+            {
+                state.metrics.record_auth_decision(
+                    "anonymous",
+                    false,
+                    "principal_endpoint_forbidden",
+                );
+                return Err(ProxyError::MissingAuth(crate::auth::AUTHORIZATION_LABEL));
+            }
             state.metrics.record_auth_decision("anonymous", true, "");
             let authed = AuthenticatedKey::new(snapshot, entry, None, true);
             // Verified credentials are noted inside `authenticate_token`;
@@ -8204,6 +8219,70 @@ mod tests {
                     "API key is not allowed to call this endpoint."
                 );
             }
+        }
+    }
+
+    /// An anonymous route whose bound principal's `allowed_endpoints` leaves
+    /// out `passthrough` closes, answering an uncredentialed caller 401 as a
+    /// route open to nobody anonymously would, rather than with a 403 about
+    /// an API key the caller never sent.
+    #[tokio::test]
+    async fn an_anonymous_route_closes_when_its_principal_may_not_call_passthrough() {
+        async fn status(endpoints: serde_json::Value) -> (StatusCode, usize) {
+            let upstream = MockServer::builder().start().await;
+            Mock::given(wm_method("GET"))
+                .and(wm_path("/x"))
+                .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+                .mount(&upstream)
+                .await;
+            let snap = AisixSnapshot::new();
+            let key: ApiKey = serde_json::from_value(serde_json::json!({
+                "key_hash": ApiKey::hash_bearer("sk-anon"),
+                "allowed_models": ["*"], "allowed_routes": ["*"],
+                "allowed_endpoints": endpoints,
+            }))
+            .unwrap();
+            snap.apikeys.insert(ResourceEntry::new("k-1", key, 1));
+            snap.passthrough_routes.insert(route_entry(
+                "route-a",
+                serde_json::json!({
+                    "name": "anon",
+                    "path_prefix": "/anon",
+                    "target_url": upstream.uri(),
+                    "auth_mode": "anonymous",
+                    "anonymous_key_id": "k-1",
+                    "source_cidrs": ["10.0.0.0/8"],
+                    "credential_mode": "forward_client"
+                }),
+            ));
+            let mut req = Request::builder()
+                .method("GET")
+                .uri("/anon/x")
+                .body(axum::body::Body::empty())
+                .unwrap();
+            req.extensions_mut()
+                .insert(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+                    [10, 1, 2, 3],
+                    40000,
+                ))));
+            let code = build_app(snap).oneshot(req).await.unwrap().status();
+            (code, upstream.received_requests().await.unwrap().len())
+        }
+
+        assert_eq!(
+            status(serde_json::json!(["passthrough"])).await,
+            (StatusCode::OK, 1)
+        );
+        assert_eq!(status(serde_json::json!(null)).await, (StatusCode::OK, 1));
+        for refused in [
+            serde_json::json!(["chat_completions"]),
+            serde_json::json!([]),
+        ] {
+            assert_eq!(
+                status(refused.clone()).await,
+                (StatusCode::UNAUTHORIZED, 0),
+                "{refused}"
+            );
         }
     }
 

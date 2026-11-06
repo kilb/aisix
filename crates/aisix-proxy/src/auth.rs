@@ -372,9 +372,31 @@ where
     let authed = authenticate_token(&proxy_state, &token, ctx).await?;
     // The key's endpoint allow-list, for every route that authenticates
     // here. Refused through this function's `Err`, so the caller's access-log
-    // line and request metrics are written like any other denial's.
-    if let Some(family) = crate::endpoint_acl::endpoint_family(parts.uri.path()) {
-        crate::endpoint_acl::check_endpoint(authed.key(), family)?;
+    // line and request metrics are written like any other denial's. Only
+    // routes that take a key reach this, so a path with no family is a census
+    // mistake: it answers as a family nothing grants, which refuses a
+    // restricted key and leaves an unrestricted one alone.
+    //
+    // Not recorded on `aisix_auth_decisions_total`: that counts credential
+    // judgments, and this credential was judged valid above. Like a model
+    // the key may not use, this is what the key may do with it.
+    let family = crate::endpoint_acl::endpoint_family(parts.uri.path())
+        .unwrap_or(aisix_core::models::EndpointFamily::Unknown);
+    if let Err(err) = crate::endpoint_acl::check_endpoint(authed.key(), family) {
+        // The access-log line carries no key id, so this is the record of
+        // which key was refused, as `deny_key` is for a disabled one.
+        tracing::warn!(
+            target: "aisix::auth",
+            reason = "endpoint_forbidden",
+            api_key_id = %authed.entry.id,
+            family = ?family,
+            http_method = %ctx.method,
+            path = %ctx.path,
+            request_id = %aisix_core::LogValue(ctx.request_id),
+            source_ip = %ctx.source_ip.resolve(),
+            "refused a request outside the key's allowed endpoints",
+        );
+        return Err(err);
     }
     // Publish the resolved key so extractors that run after this one can
     // see who is calling without re-authenticating. `ClientContext` reads
@@ -869,6 +891,104 @@ mod tests {
         assert!(logs.contains("reason=key_disabled"), "got: {logs}");
         assert!(logs.contains("ak-ctx-1"), "got: {logs}");
         assert!(logs.contains("source_ip=203.0.113.7"), "got: {logs}");
+    }
+
+    /// `router_with_key`'s state with the key limited to `endpoints`.
+    fn state_with_endpoints(endpoints: serde_json::Value) -> ProxyState {
+        use aisix_core::snapshot::SnapshotHandle;
+        use aisix_core::AisixSnapshot;
+
+        let apikey: ApiKey = serde_json::from_value(serde_json::json!({
+            "key_hash": ApiKey::hash_bearer(GOOD_TOKEN),
+            "allowed_models": ["*"],
+            "allowed_endpoints": endpoints,
+        }))
+        .expect("valid apikey");
+        let snapshot = AisixSnapshot::new();
+        snapshot
+            .apikeys
+            .insert(ResourceEntry::new("ak-endpoints-1", apikey, 1));
+        let cfg = aisix_core::ProxyConfig {
+            thread_per_core: None,
+            workers: None,
+            addr: "127.0.0.1:0".into(),
+            request_body_limit_bytes: 1 << 20,
+            tls: None,
+            listeners: Vec::new(),
+            real_ip: Default::default(),
+            request_id: Default::default(),
+            url_rewrites: Vec::new(),
+            expose_debug_headers: false,
+            platform: Default::default(),
+        };
+        ProxyState::new(
+            SnapshotHandle::new(snapshot),
+            Arc::new(aisix_gateway::Hub::new()),
+            &cfg,
+        )
+        .without_cache()
+    }
+
+    /// A route that takes a key but declares no endpoint family is a census
+    /// mistake, never a way past the allow-list: it refuses a restricted key
+    /// and serves an unrestricted one.
+    #[tokio::test]
+    async fn a_route_with_no_declared_family_refuses_a_restricted_key() {
+        use tower::ServiceExt;
+        for (endpoints, want) in [
+            (serde_json::json!(null), axum::http::StatusCode::OK),
+            (
+                serde_json::json!(["chat_completions", "models", "mcp"]),
+                axum::http::StatusCode::FORBIDDEN,
+            ),
+        ] {
+            let router = axum::Router::new()
+                .route(
+                    "/undeclared-test-route",
+                    axum::routing::get(|_auth: AuthenticatedKey| async { "served" }),
+                )
+                .with_state(state_with_endpoints(endpoints.clone()));
+            let request = Request::builder()
+                .uri("/undeclared-test-route")
+                .header("authorization", format!("Bearer {GOOD_TOKEN}"))
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let response = router.oneshot(request).await.expect("router responds");
+            assert_eq!(response.status(), want, "{endpoints}");
+        }
+    }
+
+    /// A refusal on a typed route names the key and the route on the
+    /// `aisix::auth` line, which is the only place the key is recorded: the
+    /// extractor's access-log line carries no key id.
+    #[tokio::test]
+    async fn an_endpoint_refusal_names_the_key_and_the_route() {
+        let logs = capture_logs(|| async {
+            use tower::ServiceExt;
+            let router = crate::build_router(state_with_endpoints(serde_json::json!(["models"])));
+            let mut request = Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {GOOD_TOKEN}"))
+                .body(axum::body::Body::from(r#"{"model":"m","messages":[]}"#))
+                .unwrap();
+            request.extensions_mut().insert(axum::extract::ConnectInfo(
+                std::net::SocketAddr::from(([203, 0, 113, 7], 5555)),
+            ));
+            let response = router.oneshot(request).await.expect("router responds");
+            assert_eq!(response.status(), axum::http::StatusCode::FORBIDDEN);
+        })
+        .await;
+        assert!(
+            logs.contains(r#"reason="endpoint_forbidden""#),
+            "got: {logs}"
+        );
+        assert!(logs.contains("ak-endpoints-1"), "got: {logs}");
+        assert!(logs.contains("ChatCompletions"), "got: {logs}");
+        assert!(logs.contains("path=/v1/chat/completions"), "got: {logs}");
+        assert!(logs.contains("http_method=POST"), "got: {logs}");
+        assert!(logs.contains("request_id="), "got: {logs}");
     }
 
     fn parts_with(headers: HeaderMap) -> Parts {

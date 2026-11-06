@@ -691,7 +691,16 @@ pub(crate) async fn token(
         Err(err) => {
             crate::attribution::note_unmetered_route();
             // `invalid_client` tells a client to discard its registration, so
-            // it is not for a gateway that merely cannot judge the credential.
+            // it is not for a gateway that merely cannot judge the credential,
+            // nor for a valid key whose `allowed_endpoints` leaves out MCP:
+            // that client is authenticated and not allowed (RFC 6749 §5.2).
+            if matches!(err, ProxyError::EndpointForbidden(_)) {
+                return oauth_error(
+                    StatusCode::FORBIDDEN,
+                    "unauthorized_client",
+                    "this gateway credential is not allowed to call this endpoint",
+                );
+            }
             return if err.status().is_server_error() {
                 oauth_error(
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -951,5 +960,159 @@ mod tests {
         let token = placeholder_token();
         assert!(!token.contains('.'));
         assert_ne!(token, placeholder_token());
+    }
+
+    /// The per-user token store, counting every call made to it.
+    #[derive(Default)]
+    struct CountingStore {
+        inner: aisix_mcp::MemoryStore,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl aisix_mcp::SharedStore for CountingStore {
+        async fn get(
+            &self,
+            namespace: &str,
+            key: &str,
+        ) -> Result<Option<aisix_mcp::StoredValue>, aisix_mcp::StoreError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.get(namespace, key).await
+        }
+
+        async fn put(
+            &self,
+            namespace: &str,
+            key: &str,
+            value: Vec<u8>,
+            ttl: std::time::Duration,
+            labels: &std::collections::BTreeMap<&str, &str>,
+            condition: aisix_mcp::PutCondition,
+        ) -> Result<i64, aisix_mcp::StoreError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner
+                .put(namespace, key, value, ttl, labels, condition)
+                .await
+        }
+
+        async fn delete(
+            &self,
+            namespace: &str,
+            key: &str,
+            if_version: Option<i64>,
+        ) -> Result<(), aisix_mcp::StoreError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.delete(namespace, key, if_version).await
+        }
+    }
+
+    /// In relay mode the token request authenticates with the caller's key,
+    /// so a key whose `allowed_endpoints` leaves out `mcp` is refused there,
+    /// as an OAuth client error, before any code is redeemed. The same
+    /// request on an unrestricted key reaches the store, so the zero is the
+    /// refusal's doing.
+    #[tokio::test]
+    async fn a_relay_token_request_from_a_key_without_mcp_is_refused_before_any_redeem() {
+        use tower::ServiceExt;
+        let snapshot = AisixSnapshot::new();
+        for (id, plaintext, endpoints) in [
+            ("k-limited", "sk-relay-limited", json!(["chat_completions"])),
+            ("k-open", "sk-relay-open", json!(null)),
+        ] {
+            let key: aisix_core::ApiKey = serde_json::from_value(json!({
+                "key_hash": aisix_core::ApiKey::hash_bearer(plaintext),
+                "allowed_models": [],
+                "mcp_access": {"allow": ["*"]},
+                "user_id": format!("member-{id}"),
+                "allowed_endpoints": endpoints,
+            }))
+            .unwrap();
+            snapshot.apikeys.insert(ResourceEntry::new(id, key, 1));
+        }
+        let server: McpServer = serde_json::from_value(json!({
+            "name": "main",
+            "url": "http://127.0.0.1:9/mcp",
+            "enabled": true,
+            "auth_type": "oauth2_authorization_code",
+        }))
+        .unwrap();
+        snapshot
+            .mcp_servers
+            .insert(ResourceEntry::new("mcp-main", server, 1));
+        assert!(matches!(sign_in_mode(&snapshot), SignInMode::Relay));
+
+        let store = Arc::new(CountingStore::default());
+        let cfg = aisix_core::ProxyConfig {
+            addr: "127.0.0.1:0".into(),
+            request_body_limit_bytes: 1_048_576,
+            real_ip: Default::default(),
+            request_id: Default::default(),
+            url_rewrites: Vec::new(),
+            expose_debug_headers: false,
+            platform: Default::default(),
+            tls: None,
+            listeners: Vec::new(),
+            thread_per_core: None,
+            workers: None,
+        };
+        let router = crate::build_router(
+            ProxyState::new(
+                aisix_core::snapshot::SnapshotHandle::new(snapshot),
+                Arc::new(aisix_gateway::Hub::new()),
+                &cfg,
+            )
+            .without_cache()
+            .with_mcp_oauth_store(store.clone()),
+        );
+        let token_request = |plaintext: &str| {
+            let mut request = Request::builder()
+                .method("POST")
+                .uri("/mcp/main/oauth/token")
+                .header("authorization", format!("Bearer {plaintext}"))
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(axum::body::Body::from(
+                    "grant_type=authorization_code&code=c-unknown&client_id=main\
+                     &redirect_uri=http%3A%2F%2Flocalhost%2Fcb&code_verifier=v",
+                ))
+                .unwrap();
+            request.extensions_mut().insert(axum::extract::ConnectInfo(
+                std::net::SocketAddr::from(([10, 0, 0, 7], 5555)),
+            ));
+            request
+        };
+        let answer = |response: Response| async move {
+            let status = response.status();
+            let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            (
+                status,
+                body["error"].as_str().unwrap_or_default().to_owned(),
+            )
+        };
+
+        let refused = router
+            .clone()
+            .oneshot(token_request("sk-relay-limited"))
+            .await
+            .unwrap();
+        assert_eq!(
+            answer(refused).await,
+            (StatusCode::FORBIDDEN, "unauthorized_client".to_owned())
+        );
+        assert_eq!(
+            store.calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a refused token request reached the store"
+        );
+
+        let served = router
+            .oneshot(token_request("sk-relay-open"))
+            .await
+            .unwrap();
+        assert_eq!(
+            answer(served).await,
+            (StatusCode::BAD_REQUEST, "invalid_grant".to_owned())
+        );
+        assert!(store.calls.load(std::sync::atomic::Ordering::SeqCst) > 0);
     }
 }
