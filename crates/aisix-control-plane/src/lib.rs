@@ -30,8 +30,9 @@ pub mod settings;
 use auth::password::{LoginThrottle, PasswordGate, ARGON2_GATE_PERMITS};
 use config::CpConfig;
 use db::Db;
-use dp::listener::TlsSetupError;
-use dp::CredentialCache;
+use dp::heartbeat::BeatLimiter;
+use dp::listener::{ConnLimits, ListenerState, TlsSetupError};
+use dp::{CredentialCache, CREDENTIALS_POOL_SIZE};
 use error::BootError;
 use pki::{Pki, PkiError};
 use settings::EnvSettings;
@@ -51,6 +52,10 @@ pub struct AppState {
     /// The gateway credentials, which every gateway request is checked
     /// against.
     pub creds: CredentialCache,
+    /// How many heartbeats each credential may still send.
+    pub beats: BeatLimiter,
+    /// Whether the gateway listener runs.
+    pub dp_listener: ListenerState,
 }
 
 /// A booted control plane. Dropping it stops everything it runs.
@@ -129,7 +134,7 @@ where
     let env = settings::ensure_env(&db, cfg.env_id_seed, &cfg.etcd_prefix).await?;
     let pki = Arc::new(Pki::load_or_init(&db, &cfg.master_key, &env).await?);
     let passwords = PasswordGate::new(ARGON2_GATE_PERMITS)?;
-    let creds = CredentialCache::load(&db).await?;
+    let creds = CredentialCache::load(&db.dedicated(CREDENTIALS_POOL_SIZE)).await?;
     let dp_tls = match dp::listener::server_tls(&pki, &cfg.dp_hosts, false) {
         Ok(tls) => Some(tls),
         // Still a boot, so operators can see why: every gateway certificate
@@ -158,6 +163,11 @@ where
         }
     };
     let dp_addr = dp.as_ref().map(|(_, _, addr)| *addr);
+    let dp_listener = if dp.is_some() {
+        ListenerState::Serving
+    } else {
+        ListenerState::CaExpired
+    };
     let state = AppState {
         db,
         env,
@@ -166,6 +176,8 @@ where
         operator_logins: LoginThrottle::default(),
         pki,
         creds,
+        beats: BeatLimiter::default(),
+        dp_listener,
     };
 
     // Nothing fails from here on, so nothing spawned below is left behind
@@ -189,10 +201,11 @@ where
             tls,
             http::dp_router(state.clone()),
             None,
+            ConnLimits::default(),
             stopping,
         )));
     }
-    let refresh = state.creds.spawn_refresh(state.db.clone());
+    let refresh = state.creds.spawn_refresh();
     tracing::info!(%http_addr, ?dp_addr, env_id = %state.env.env_id, "control plane listening");
     Ok(Running {
         state,

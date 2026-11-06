@@ -190,6 +190,7 @@ fn test_config(database_url: &str) -> CpConfig {
         portal_url: None,
         db_lock_timeout_ms: 5_000,
         db_statement_timeout_ms: 30_000,
+        cp_version: aisix_core::HEARTBEAT_VERSION.to_string(),
     }
 }
 
@@ -274,9 +275,13 @@ impl TestCp {
 
     /// Where the gateway listener is bound.
     pub fn dp_addr(&self) -> SocketAddr {
-        self.running
-            .dp_addr
+        self.dp_listening()
             .expect("the gateway listener is serving")
+    }
+
+    /// Where the gateway listener is bound, or `None` when it does not run.
+    pub fn dp_listening(&self) -> Option<SocketAddr> {
+        self.running.dp_addr
     }
 
     /// Issues a gateway credential as `admin`, which must succeed.

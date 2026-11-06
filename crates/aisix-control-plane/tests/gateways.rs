@@ -503,8 +503,15 @@ async fn an_expired_ca_issues_nothing_and_says_so() {
         .expect("store its key");
     let expired = cp.restart().await;
     assert_eq!(expired.state().pki.ca_pem(), ca.pem());
+    // The gateway listener does not run, and the environment view says so.
+    assert_eq!(expired.dp_listening(), None);
 
     let admin = expired.admin_login_seeded(OperatorRole::Admin).await;
+    let view = expired
+        .get_with_cookie("/admin/environment", admin.cookie())
+        .await;
+    assert_eq!(view.status, 200, "{view:?}");
+    assert_eq!(view.body["dp_listener"], "stopped: ca_expired", "{view:?}");
     let r = issue(&expired, &admin, json!({"name": "gw-expired-7c1"})).await;
     assert_eq!(r.status, 503, "{r:?}");
     assert_eq!(r.body["code"], "ca_expired");
@@ -676,6 +683,7 @@ async fn the_environment_view_shows_what_the_bundle_is_built_from() {
     assert_eq!(r.body["etcd_prefix"], "/aisix");
     assert_eq!(r.body["etcd_endpoint"], "localhost:7943");
     assert_eq!(r.body["api_contract"], 1);
+    assert_eq!(r.body["dp_listener"], "serving");
     assert!(
         r.body["cp_version"].as_str().is_some_and(|v| !v.is_empty()),
         "{r:?}"

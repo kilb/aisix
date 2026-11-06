@@ -102,6 +102,10 @@ pub struct CpConfig {
     pub portal_url: Option<String>,
     pub db_lock_timeout_ms: u64,
     pub db_statement_timeout_ms: u64,
+    /// The version this control plane reports, and compares gateways'
+    /// heartbeat versions with: `aisix_core::HEARTBEAT_VERSION`, stamped the
+    /// way a gateway's is. Not read from the environment.
+    pub cp_version: String,
 }
 
 /// URLs are shown reduced to their origin, and the master key not at all.
@@ -122,6 +126,7 @@ impl fmt::Debug for CpConfig {
             .field("portal_url", &self.portal_url.as_deref().map(redact))
             .field("db_lock_timeout_ms", &self.db_lock_timeout_ms)
             .field("db_statement_timeout_ms", &self.db_statement_timeout_ms)
+            .field("cp_version", &self.cp_version)
             .finish()
     }
 }
@@ -228,6 +233,7 @@ impl CpConfig {
             portal_url,
             db_lock_timeout_ms,
             db_statement_timeout_ms,
+            cp_version: aisix_core::HEARTBEAT_VERSION.to_string(),
         })
     }
 

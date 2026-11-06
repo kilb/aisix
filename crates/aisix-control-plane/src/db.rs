@@ -150,6 +150,18 @@ impl Db {
         &self.pool
     }
 
+    /// A pool of its own on the same database and with the same settings,
+    /// of at most `max_connections`: for work that must not queue behind
+    /// request traffic on this one. It connects on first use.
+    pub fn dedicated(&self, max_connections: u32) -> Db {
+        let options = (*self.pool.connect_options()).clone();
+        Db {
+            pool: PgPoolOptions::new()
+                .max_connections(max_connections)
+                .connect_lazy_with(options),
+        }
+    }
+
     /// Runs `f` in one READ COMMITTED transaction: committed when it returns
     /// `Ok`, rolled back when it returns `Err`.
     ///

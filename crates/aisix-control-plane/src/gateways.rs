@@ -84,6 +84,10 @@ fn etcd_endpoint(cfg: &CpConfig) -> Result<String, ApiError> {
 /// So this view is for display only: anything a gateway is started with,
 /// such as a deployment snippet, is built from a bundle's `env`, never from
 /// these values. A path or userinfo on `CP_DP_BASE_URL` is not here.
+///
+/// `dp_listener` says whether gateways can connect: `serving`, or
+/// `stopped: ca_expired` when the CA could sign no server certificate at
+/// boot.
 pub async fn environment(
     auth: OperatorAuth,
     State(state): State<AppState>,
@@ -94,8 +98,9 @@ pub async fn environment(
         "etcd_prefix": state.env.etcd_prefix,
         "dp_base_url": aisix_core::redact_url_for_log(&state.cfg.dp_base_url),
         "etcd_endpoint": etcd_endpoint(&state.cfg)?,
-        "cp_version": &*aisix_core::HEARTBEAT_VERSION,
+        "cp_version": state.cfg.cp_version,
         "api_contract": API_CONTRACT,
+        "dp_listener": state.dp_listener.as_str(),
     })))
 }
 
@@ -384,7 +389,7 @@ pub async fn list_instances(
     .fetch_all(state.db.pool())
     .await
     .map_err(DbError::from)?;
-    let cp_version = &*aisix_core::HEARTBEAT_VERSION;
+    let cp_version = &state.cfg.cp_version;
     let items: Vec<Value> = rows
         .into_iter()
         .map(|row| {
@@ -409,11 +414,11 @@ pub async fn list_instances(
 }
 
 /// Whether a gateway reporting the heartbeat version `instance` runs the
-/// build of this control plane reporting `cp` (both are
-/// `aisix_core::HEARTBEAT_VERSION`, stamped the same way): the same release
-/// when both are stamped releases (`1.9.0+sha-<sha>`; the sha is build
-/// metadata and does not count, a pre-release such as `-rc.1` does), the
-/// same commit when both are unreleased builds (`dev+sha-<sha>`). `None`
+/// build of this control plane reporting `cp` (`CpConfig::cp_version`; both
+/// are `aisix_core::HEARTBEAT_VERSION`, stamped the same way): the same
+/// release when both are stamped releases (`1.9.0+sha-<sha>`; the sha is
+/// build metadata and does not count, a pre-release such as `-rc.1` does),
+/// the same commit when both are unreleased builds (`dev+sha-<sha>`). `None`
 /// when it cannot be told: an unstamped `dev`, a release against an
 /// unreleased build, or a version of neither shape.
 pub fn version_matches(instance: &str, cp: &str) -> Option<bool> {

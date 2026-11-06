@@ -7,12 +7,32 @@
 //!
 //! The server certificate is minted at boot for `CP_DP_HOSTS`, the names
 //! gateways reach this listener by.
+//!
+//! # What a peer can hold
+//!
+//! The port is open to the network, so what a peer that never authenticates
+//! can hold is bounded ([`ConnLimits`]):
+//! - at most [`MAX_PENDING_HANDSHAKES`] connections in their TLS handshake,
+//!   each for at most [`HANDSHAKE_TIMEOUT`]; a slot frees as soon as its
+//!   handshake ends, whichever way;
+//! - at most [`MAX_CONNECTIONS`] connections in all, handshakes included,
+//!   since a revoked certificate still completes its handshake and is then
+//!   refused per request.
+//!
+//! A connection over either cap is closed at once, unread. The process needs
+//! a file descriptor limit above `MAX_CONNECTIONS` plus what the browser
+//! listener and the database pools use (`ulimit -n` of 8192 or more).
+//!
+//! These caps are per process and say nothing of who is connecting: one
+//! source can still fill them and lock gateways out. Per-source limiting
+//! (connection rate and count per address) belongs in front of the
+//! listener, in the load balancer or firewall that exposes `CP_DP_ADDR`.
 
 use std::convert::Infallible;
 use std::future::Future;
 use std::pin::{pin, Pin};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::Router;
 use hyper::body::Incoming;
@@ -23,7 +43,7 @@ use rustls::server::{VerifierBuilderError, WebPkiClientVerifier};
 use rustls::{RootCertStore, ServerConfig};
 use rustls_pki_types::CertificateDer;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::watch;
+use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 use tokio_rustls::TlsAcceptor;
 use tower::util::Oneshot;
@@ -39,13 +59,57 @@ pub type GrpcRoutes = Router;
 const HTTP_1_1: &[u8] = b"http/1.1";
 const H2: &[u8] = b"h2";
 
-/// A peer that has not finished its TLS handshake by then is dropped, so
-/// connections that never authenticate cannot pile up.
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Connections in their TLS handshake at once.
+pub const MAX_PENDING_HANDSHAKES: usize = 512;
+
+/// Connections at once, in their handshake or past it.
+pub const MAX_CONNECTIONS: usize = 4096;
+
+/// A peer that has not finished its TLS handshake by then is dropped.
+pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// At most one warning this often while connections are refused at
+/// capacity, so a flood does not flood the log too.
+const AT_CAPACITY_WARNING_EVERY: Duration = Duration::from_secs(10);
 
 /// How long to wait after a failed accept (such as running out of file
 /// descriptors) before accepting again, rather than spinning.
 const ACCEPT_ERROR_PAUSE: Duration = Duration::from_secs(1);
+
+/// What connections may hold (see the module docs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConnLimits {
+    pub pending_handshakes: usize,
+    pub connections: usize,
+    pub handshake_timeout: Duration,
+}
+
+impl Default for ConnLimits {
+    fn default() -> ConnLimits {
+        ConnLimits {
+            pending_handshakes: MAX_PENDING_HANDSHAKES,
+            connections: MAX_CONNECTIONS,
+            handshake_timeout: HANDSHAKE_TIMEOUT,
+        }
+    }
+}
+
+/// Whether the gateway listener runs, as `/admin/environment` shows it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListenerState {
+    Serving,
+    /// Not started: the CA could sign no server certificate at boot.
+    CaExpired,
+}
+
+impl ListenerState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ListenerState::Serving => "serving",
+            ListenerState::CaExpired => "stopped: ca_expired",
+        }
+    }
+}
 
 /// Why the listener's TLS configuration could not be built.
 #[derive(Debug, thiserror::Error)]
@@ -87,18 +151,29 @@ pub fn server_tls(
 /// Serves `listener` until `shutdown` turns true (or its sender is gone):
 /// then it stops accepting, lets each connection finish the requests it has
 /// in flight, and returns once all have closed. Every request carries its
-/// connection's [`ConnIdentity`] as an extension. Aborting the task drops
+/// connection's [`ConnIdentity`] as an extension. A connection over
+/// `limits` is closed as soon as it is accepted. Aborting the task drops
 /// every connection at once.
 pub async fn serve_dp(
     listener: TcpListener,
     tls: Arc<ServerConfig>,
     rest: Router,
     grpc: Option<GrpcRoutes>,
+    limits: ConnLimits,
     shutdown: watch::Receiver<bool>,
 ) {
-    let acceptor = TlsAcceptor::from(tls);
+    let serving = Serving {
+        acceptor: TlsAcceptor::from(tls),
+        rest,
+        grpc,
+        handshake_timeout: limits.handshake_timeout,
+    };
+    let handshake_slots = Arc::new(Semaphore::new(limits.pending_handshakes));
+    let connection_slots = Arc::new(Semaphore::new(limits.connections));
     let mut connections = JoinSet::new();
     let mut stop = shutdown.clone();
+    let mut refused = 0u64;
+    let mut warned: Option<Instant> = None;
     loop {
         tokio::select! {
             () = stopped(&mut stop) => break,
@@ -106,11 +181,28 @@ pub async fn serve_dp(
             Some(_) = connections.join_next(), if !connections.is_empty() => {}
             accepted = listener.accept() => match accepted {
                 Ok((tcp, _)) => {
+                    let permits = (
+                        handshake_slots.clone().try_acquire_owned(),
+                        connection_slots.clone().try_acquire_owned(),
+                    );
+                    let (Ok(handshake), Ok(connection)) = permits else {
+                        // Holding it unread would be what the cap is there
+                        // to prevent.
+                        drop(tcp);
+                        refused += 1;
+                        if warned.is_none_or(|at| at.elapsed() >= AT_CAPACITY_WARNING_EVERY) {
+                            tracing::warn!(refused, "the gateway listener is at capacity and \
+                                closes new connections; see its connection caps");
+                            warned = Some(Instant::now());
+                            refused = 0;
+                        }
+                        continue;
+                    };
                     connections.spawn(serve_connection(
                         tcp,
-                        acceptor.clone(),
-                        rest.clone(),
-                        grpc.clone(),
+                        handshake,
+                        connection,
+                        serving.clone(),
                         shutdown.clone(),
                     ));
                 }
@@ -125,14 +217,33 @@ pub async fn serve_dp(
     while connections.join_next().await.is_some() {}
 }
 
-async fn serve_connection(
-    tcp: TcpStream,
+/// What every connection of one listener is served with.
+#[derive(Clone)]
+struct Serving {
     acceptor: TlsAcceptor,
     rest: Router,
     grpc: Option<GrpcRoutes>,
+    handshake_timeout: Duration,
+}
+
+/// `handshake` is held for the handshake only; `_connection` for the
+/// whole connection.
+async fn serve_connection(
+    tcp: TcpStream,
+    handshake: OwnedSemaphorePermit,
+    _connection: OwnedSemaphorePermit,
+    serving: Serving,
     shutdown: watch::Receiver<bool>,
 ) {
-    let tls = match tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(tcp)).await {
+    let Serving {
+        acceptor,
+        rest,
+        grpc,
+        handshake_timeout,
+    } = serving;
+    let handshook = tokio::time::timeout(handshake_timeout, acceptor.accept(tcp)).await;
+    drop(handshake);
+    let tls = match handshook {
         Ok(Ok(tls)) => tls,
         // Scanners and gateways of other control planes end up here: worth
         // a debug line, not a warning.

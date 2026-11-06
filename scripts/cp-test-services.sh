@@ -98,9 +98,12 @@ start() {
   fi
   if ! pg_running; then
     # No Unix socket: its path would have to fit in 107 bytes, and the tests
-    # connect over TCP anyway.
+    # connect over TCP anyway. The test harness runs one test per core, each
+    # with a control plane of its own (a pool of up to 10 connections, plus
+    # its credential pool and the test's own), which the default of 100
+    # connections does not hold on a many-core machine.
     "$PG_BIN/pg_ctl" -D "$DIR/data" -l "$DIR/postgres.log" -w \
-      -o "-p ${PG_PORT} -c listen_addresses=127.0.0.1 -c unix_socket_directories='' -c fsync=off -c synchronous_commit=off -c full_page_writes=off" \
+      -o "-p ${PG_PORT} -c listen_addresses=127.0.0.1 -c unix_socket_directories='' -c max_connections=500 -c fsync=off -c synchronous_commit=off -c full_page_writes=off" \
       start >/dev/null
   fi
   require_own_cluster

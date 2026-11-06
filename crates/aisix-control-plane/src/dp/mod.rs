@@ -34,6 +34,10 @@ use crate::AppState;
 /// listening goes unseen.
 const FULL_REFRESH: Duration = Duration::from_secs(10);
 
+/// Connections of the credential cache's own pool: one held by the
+/// notification listener, one for reads.
+pub const CREDENTIALS_POOL_SIZE: u32 = 2;
+
 /// Who a connection's client certificate names: read once per connection,
 /// after the TLS verifier has checked the chain, and attached to each of its
 /// requests. Not yet checked against anything else; [`DpIdentity`] does
@@ -74,11 +78,7 @@ impl FromRequestParts<AppState> for DpIdentity {
         let Ok(dp_id) = Uuid::parse_str(&conn.dp_id) else {
             return Err(ApiError::forbidden());
         };
-        if !state
-            .creds
-            .check(&state.db, dp_id, &conn.fingerprint)
-            .await?
-        {
+        if !state.creds.check(dp_id, &conn.fingerprint).await? {
             tracing::info!(%dp_id, "refused a gateway credential that is revoked, expired or unlisted");
             return Err(ApiError::forbidden());
         }
@@ -101,16 +101,23 @@ struct Listed {
 /// notification on [`CREDENTIALS_CHANNEL`] (sent when a credential is issued
 /// or revoked, by any instance) reads the list again at once, and it is read
 /// again in full every 10 seconds regardless.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct CredentialCache {
     listed: Arc<RwLock<HashMap<Uuid, Listed>>>,
+    /// Every read of the cache's, and its listening, go through this pool.
+    /// Given one of its own ([`CREDENTIALS_POOL_SIZE`]), a revoke is seen
+    /// however busy request traffic keeps the main pool.
+    db: Db,
 }
 
 impl CredentialCache {
-    /// The cache, filled from the database.
+    /// The cache, filled from the database through `db`, which it keeps.
     pub async fn load(db: &Db) -> Result<CredentialCache, DbError> {
-        let cache = CredentialCache::default();
-        cache.reload(db).await?;
+        let cache = CredentialCache {
+            listed: Arc::default(),
+            db: db.clone(),
+        };
+        cache.reload().await?;
         Ok(cache)
     }
 
@@ -130,19 +137,14 @@ impl CredentialCache {
     /// cache holds none: a credential issued a moment ago may be in use
     /// before its notification has arrived. A credential the cache holds is
     /// judged from the cache.
-    pub(crate) async fn check(
-        &self,
-        db: &Db,
-        dp_id: Uuid,
-        fingerprint: &str,
-    ) -> Result<bool, DbError> {
+    pub(crate) async fn check(&self, dp_id: Uuid, fingerprint: &str) -> Result<bool, DbError> {
         if !self.read().contains_key(&dp_id) {
             let row: Option<(String, DateTime<Utc>, bool)> = sqlx::query_as(
                 "SELECT fingerprint_sha256, not_after, revoked_at IS NOT NULL \
                  FROM dp_credentials WHERE dp_id = $1",
             )
             .bind(dp_id)
-            .fetch_optional(db.pool())
+            .fetch_optional(self.db.pool())
             .await?;
             if let Some((fingerprint, not_after, revoked)) = row {
                 // A reload may have stored it meanwhile, read later than
@@ -158,12 +160,12 @@ impl CredentialCache {
     }
 
     /// Replaces the cache with the credential list as it is now.
-    async fn reload(&self, db: &Db) -> Result<(), DbError> {
+    async fn reload(&self) -> Result<(), DbError> {
         let rows: Vec<(Uuid, String, DateTime<Utc>, bool)> = sqlx::query_as(
             "SELECT dp_id, fingerprint_sha256, not_after, revoked_at IS NOT NULL \
              FROM dp_credentials",
         )
-        .fetch_all(db.pool())
+        .fetch_all(self.db.pool())
         .await?;
         let listed = rows
             .into_iter()
@@ -186,23 +188,23 @@ impl CredentialCache {
     /// again on each notification on [`CREDENTIALS_CHANNEL`], every 10
     /// seconds, and whenever listening (re)starts, which covers what was
     /// sent while nothing listened. Listening holds one pool connection.
-    pub fn spawn_refresh(&self, db: Db) -> JoinHandle<()> {
+    pub fn spawn_refresh(&self) -> JoinHandle<()> {
         let cache = self.clone();
-        tokio::spawn(async move { cache.refresh(db).await })
+        tokio::spawn(async move { cache.refresh().await })
     }
 
-    async fn refresh(self, db: Db) {
+    async fn refresh(self) {
         let mut listener: Option<PgListener> = None;
         let mut every = tokio::time::interval(FULL_REFRESH);
         every.set_missed_tick_behavior(MissedTickBehavior::Delay);
         loop {
             if listener.is_none() {
-                match listen(&db).await {
+                match listen(&self.db).await {
                     Ok(l) => listener = Some(l),
                     Err(e) => tracing::warn!(error = %e,
                         "cannot listen for gateway credential changes; reading them every 10 s"),
                 }
-                self.reload_logged(&db).await;
+                self.reload_logged().await;
             }
             tokio::select! {
                 _ = every.tick() => {}
@@ -217,12 +219,12 @@ impl CredentialCache {
                     }
                 }
             }
-            self.reload_logged(&db).await;
+            self.reload_logged().await;
         }
     }
 
-    async fn reload_logged(&self, db: &Db) {
-        if let Err(e) = self.reload(db).await {
+    async fn reload_logged(&self) {
+        if let Err(e) = self.reload().await {
             tracing::warn!(error = %e, "cannot read the gateway credentials; keeping the last list");
         }
     }

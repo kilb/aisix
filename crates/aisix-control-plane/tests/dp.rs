@@ -12,10 +12,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aisix_control_plane::auth::OperatorRole;
+use aisix_control_plane::dp::heartbeat::MAX_INSTANCES_PER_DAY;
+use aisix_control_plane::dp::listener::{ConnLimits, MAX_PENDING_HANDSHAKES};
 use aisix_control_plane::dp::{listener, ConnIdentity, CredentialCache};
 use aisix_control_plane::gateways::version_matches;
 use aisix_control_plane::housekeeping;
 use aisix_control_plane::pki::Pki;
+use aisix_control_plane::resources::write::RESOURCES_LOCK_KEY;
 use aisix_control_plane::settings::EnvSettings;
 use axum::routing::get;
 use axum::{Extension, Router};
@@ -28,7 +31,9 @@ use rcgen::{
 };
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
 use serde_json::{json, Value};
+use sqlx::{Connection, PgConnection};
 use support::{Bundle, DpClient, OperatorSession, TestCp};
+use tokio::io::AsyncReadExt;
 use uuid::Uuid;
 use x509_parser::pem::parse_x509_pem;
 
@@ -269,26 +274,32 @@ async fn a_heartbeat_records_the_instance_and_its_applied_revision() {
 
 #[tokio::test]
 async fn an_instance_on_the_control_planes_own_version_matches_when_that_can_be_told() {
-    let Some(cp) = TestCp::start().await else {
+    // A control plane built as a release, whatever this test binary is.
+    let Some(cp) = TestCp::start_with(|c| c.cp_version = "1.9.0+sha-cp7c1".to_string()).await
+    else {
         return;
     };
     let (admin, bundle) = setup(&cp).await;
-    let gw = cp.dp_client(&bundle);
-    let cp_version = cp
+    let view = cp
         .get_with_cookie("/admin/environment", admin.cookie())
-        .await
-        .body["cp_version"]
-        .as_str()
-        .expect("cp_version")
-        .to_string();
-    let same = Uuid::new_v4().to_string();
-    let mut beat = bare_beat(&bundle.dp_id, &same);
-    beat["version"] = json!(cp_version);
-    assert_eq!(gw.heartbeat(beat).await.status, 200);
-    let garbled = Uuid::new_v4().to_string();
-    let mut beat = bare_beat(&bundle.dp_id, &garbled);
-    beat["version"] = json!("not-a-version-7c1");
-    assert_eq!(gw.heartbeat(beat).await.status, 200);
+        .await;
+    assert_eq!(view.body["cp_version"], "1.9.0+sha-cp7c1", "{view:?}");
+    let gw = cp.dp_client(&bundle);
+    let mut sent = Vec::new();
+    for version in [
+        // The same release from another image build.
+        "1.9.0+sha-gw7c1",
+        "1.8.2+sha-cp7c1",
+        // The control plane's own commit, but not a release.
+        "dev+sha-cp7c1",
+        "not-a-version-7c1",
+    ] {
+        let instance = Uuid::new_v4().to_string();
+        let mut beat = bare_beat(&bundle.dp_id, &instance);
+        beat["version"] = json!(version);
+        assert_eq!(gw.heartbeat(beat).await.status, 200, "{version}");
+        sent.push((version, instance));
+    }
 
     let items = instances(&cp, &admin).await;
     let matches_of = |id: &str| {
@@ -298,14 +309,10 @@ async fn an_instance_on_the_control_planes_own_version_matches_when_that_can_be_
             .unwrap_or_else(|| panic!("{id} in {items:?}"))["version_matches_cp"]
             .clone()
     };
-    // An unstamped build ("dev") cannot be compared with anything.
-    let expected = if cp_version == "dev" {
-        Value::Null
-    } else {
-        json!(true)
-    };
-    assert_eq!(matches_of(&same), expected, "cp {cp_version}");
-    assert_eq!(matches_of(&garbled), Value::Null);
+    let expected = [json!(true), json!(false), Value::Null, Value::Null];
+    for ((version, instance), expected) in sent.iter().zip(expected) {
+        assert_eq!(matches_of(instance), expected, "gateway {version}");
+    }
 }
 
 #[tokio::test]
@@ -941,6 +948,7 @@ async fn connections_are_dispatched_by_alpn_and_drained_on_shutdown() {
         tls,
         echo("rest"),
         Some(echo("grpc")),
+        ConnLimits::default(),
         stopped,
     ));
     let request = || {
@@ -984,6 +992,474 @@ async fn connections_are_dispatched_by_alpn_and_drained_on_shutdown() {
             .await
             .expect("the connection closes within 5 s");
         assert!(closed.is_ok(), "{closed:?}");
+    }
+}
+
+/// A `serve_dp` on the control plane's own TLS configuration, `echo("rest")`
+/// behind it, with `limits`: its address, and the sender that stops it.
+async fn serve_echo(
+    cp: &TestCp,
+    limits: ConnLimits,
+) -> (std::net::SocketAddr, tokio::sync::watch::Sender<bool>) {
+    let tls = listener::server_tls(&cp.state().pki, &["localhost".to_string()], false)
+        .expect("the listener's TLS");
+    let tcp = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = tcp.local_addr().expect("an address");
+    let (stop, stopped) = tokio::sync::watch::channel(false);
+    tokio::spawn(listener::serve_dp(
+        tcp,
+        tls,
+        echo("rest"),
+        None,
+        limits,
+        stopped,
+    ));
+    (addr, stop)
+}
+
+/// Whether the listener closes a connection that has sent nothing, within
+/// a second: end of stream, or a reset.
+async fn closed_within_a_second(tcp: &mut tokio::net::TcpStream) -> bool {
+    let mut buf = [0u8; 16];
+    matches!(
+        tokio::time::timeout(Duration::from_secs(1), tcp.read(&mut buf)).await,
+        Ok(Ok(0) | Err(_))
+    )
+}
+
+/// `GET /who` over a new mTLS connection as `bundle`, or `None` when the
+/// connection is refused.
+async fn who(addr: std::net::SocketAddr, bundle: &Bundle) -> Option<String> {
+    let tls = tls_connect(addr, pems(bundle), &[b"http/1.1"]).await.ok()?;
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tls))
+        .await
+        .ok()?;
+    tokio::spawn(conn);
+    let request = hyper::Request::builder()
+        .uri("/who")
+        .header("host", "localhost")
+        .body(Full::new(Bytes::new()))
+        .expect("a request");
+    let answer = sender.send_request(request).await.ok()?;
+    Some(text_of(answer).await)
+}
+
+#[tokio::test]
+async fn a_peer_cannot_hold_more_than_the_pending_handshake_cap() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let (_, bundle) = setup(&cp).await;
+    let (addr, _stop) = serve_echo(&cp, ConnLimits::default()).await;
+    // Connections that never start a handshake, up to the cap.
+    let mut silent = Vec::new();
+    for _ in 0..MAX_PENDING_HANDSHAKES {
+        silent.push(tokio::net::TcpStream::connect(addr).await.expect("connect"));
+    }
+    // One more is closed at once, unread, and so is a gateway's.
+    let mut extra = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    assert!(
+        closed_within_a_second(&mut extra).await,
+        "a connection over the cap was held"
+    );
+    assert_eq!(who(addr, &bundle).await, None, "served over the cap");
+    // The rest of the process is unaffected.
+    let health = cp.send("GET", "/healthz", None, None).await;
+    assert_eq!(health.status, 200, "{health:?}");
+
+    // A slot frees as soon as a handshake ends, here by its peer leaving.
+    drop(silent.pop());
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        if let Some(answer) = who(addr, &bundle).await {
+            assert_eq!(answer, format!("rest {}", bundle.dp_id));
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no slot freed after a handshake ended"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn established_connections_are_capped_too() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let (_, bundle) = setup(&cp).await;
+    let limits = ConnLimits {
+        connections: 2,
+        ..ConnLimits::default()
+    };
+    let (addr, _stop) = serve_echo(&cp, limits).await;
+    // Two gateways connected and idle: a revoked certificate gets this far
+    // too, so the handshake cap alone does not bound them.
+    let mut held = Vec::new();
+    for _ in 0..2 {
+        let tls = tls_connect(addr, pems(&bundle), &[b"http/1.1"])
+            .await
+            .expect("the mTLS handshake");
+        let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tls))
+            .await
+            .expect("HTTP/1.1");
+        let task = tokio::spawn(conn);
+        let request = hyper::Request::builder()
+            .uri("/who")
+            .header("host", "localhost")
+            .body(Full::new(Bytes::new()))
+            .expect("a request");
+        let answer = sender.send_request(request).await.expect("an answer");
+        assert_eq!(text_of(answer).await, format!("rest {}", bundle.dp_id));
+        held.push((sender, task));
+    }
+    let mut third = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    assert!(
+        closed_within_a_second(&mut third).await,
+        "a connection over the cap was held"
+    );
+    assert_eq!(who(addr, &bundle).await, None, "served over the cap");
+
+    // One leaves, and its slot is taken again.
+    let (sender, task) = held.pop().expect("a held connection");
+    drop(sender);
+    let _ = task.await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while who(addr, &bundle).await.is_none() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no slot freed after a connection closed"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn a_handshake_slot_frees_when_its_handshake_completes() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let (_, bundle) = setup(&cp).await;
+    let limits = ConnLimits {
+        pending_handshakes: 1,
+        ..ConnLimits::default()
+    };
+    let (addr, _stop) = serve_echo(&cp, limits).await;
+    // One gateway connected and staying connected.
+    let tls = tls_connect(addr, pems(&bundle), &[b"http/1.1"])
+        .await
+        .expect("the mTLS handshake");
+    let (mut first, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tls))
+        .await
+        .expect("HTTP/1.1");
+    tokio::spawn(conn);
+    let request = hyper::Request::builder()
+        .uri("/who")
+        .header("host", "localhost")
+        .body(Full::new(Bytes::new()))
+        .expect("a request");
+    let answer = first.send_request(request).await.expect("an answer");
+    assert_eq!(text_of(answer).await, format!("rest {}", bundle.dp_id));
+    // Its handshake is over, so the one slot takes another.
+    assert_eq!(
+        who(addr, &bundle).await,
+        Some(format!("rest {}", bundle.dp_id)),
+        "the handshake slot is held past the handshake"
+    );
+    assert!(!first.is_closed());
+}
+
+#[tokio::test]
+async fn a_connection_without_a_client_certificate_gets_no_answer() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let (_, bundle) = setup(&cp).await;
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(CertificateDer::from(der_of(&bundle.ca_pem)))
+        .expect("the CA as a root");
+    let mut config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .expect("TLS versions")
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let tcp = tokio::net::TcpStream::connect(cp.dp_addr())
+        .await
+        .expect("connect");
+    let connected = tokio_rustls::TlsConnector::from(Arc::new(config))
+        .connect(ServerName::try_from("localhost").expect("a name"), tcp)
+        .await;
+    // TLS 1.3 lets the client finish its side first; the refusal then
+    // arrives as an alert instead of an answer.
+    if let Ok(tls) = connected {
+        let answered = async {
+            let (mut sender, conn) =
+                hyper::client::conn::http1::handshake(TokioIo::new(tls)).await?;
+            tokio::spawn(conn);
+            let request = hyper::Request::builder()
+                .method("POST")
+                .uri("/dp/heartbeat")
+                .header("host", "localhost")
+                .header("content-type", "application/json")
+                .body(Full::new(Bytes::from(
+                    bare_beat(&bundle.dp_id, "anonymous-7c1").to_string(),
+                )))
+                .expect("a request");
+            sender.send_request(request).await
+        };
+        let answered = tokio::time::timeout(Duration::from_secs(5), answered)
+            .await
+            .expect("refused within 5 s");
+        assert!(
+            answered.is_err(),
+            "answered without a certificate: {answered:?}"
+        );
+    }
+    assert_eq!(instance_rows(&cp).await, 0);
+}
+
+#[tokio::test]
+async fn a_credential_flooding_heartbeats_is_throttled() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let (admin, bundle) = setup(&cp).await;
+    let instance = Uuid::new_v4().to_string();
+    let mut conn = DpConn::open(&cp, &bundle).await;
+    let mut answers = Vec::new();
+    for revision in 0..400 {
+        let mut beat = bare_beat(&bundle.dp_id, &instance);
+        beat["applied_revision"] = json!(revision);
+        answers.push(conn.send("POST", "/dp/heartbeat", Some(&beat)).await);
+    }
+    // A burst well past any real fleet's goes through; a flood does not.
+    assert!(
+        answers[..100].iter().all(|(status, _)| *status == 200),
+        "{:?}",
+        &answers[..100]
+    );
+    let refused = answers
+        .iter()
+        .find(|(status, _)| *status != 200)
+        .expect("a flood of 400 beats was never throttled");
+    assert_eq!(refused.0, 429, "{refused:?}");
+    assert_eq!(refused.1["code"], "busy", "{refused:?}");
+    // Per credential: another one is not held back.
+    let other = cp.issue_bundle(&admin, "gw-dp-7c2").await;
+    let r = cp
+        .dp_client(&other)
+        .heartbeat(bare_beat(&other.dp_id, &Uuid::new_v4().to_string()))
+        .await;
+    assert_eq!(r.status, 200, "{r:?}");
+}
+
+#[tokio::test]
+async fn a_credential_reports_at_most_its_daily_cap_of_instances() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let (_, bundle) = setup(&cp).await;
+    let gw = cp.dp_client(&bundle);
+    // One instance short of the cap heard from today, as that many beats
+    // would have left them.
+    sqlx::query(
+        "INSERT INTO dp_instances (dp_id, instance_id) \
+         SELECT $1::uuid, 'seeded-7c1-' || g FROM generate_series(1, $2) g",
+    )
+    .bind(&bundle.dp_id)
+    .bind(MAX_INSTANCES_PER_DAY - 1)
+    .execute(cp.db().pool())
+    .await
+    .expect("seed instances");
+    let last = Uuid::new_v4().to_string();
+    let r = gw.heartbeat(bare_beat(&bundle.dp_id, &last)).await;
+    assert_eq!(r.status, 200, "the instance that reaches the cap: {r:?}");
+
+    let over = Uuid::new_v4().to_string();
+    let r = gw.heartbeat(bare_beat(&bundle.dp_id, &over)).await;
+    assert_eq!(r.status, 429, "{r:?}");
+    assert_eq!(r.body["code"], "instance_limit", "{r:?}");
+    let stored: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM dp_instances WHERE instance_id = $1")
+            .bind(&over)
+            .fetch_one(cp.db().pool())
+            .await
+            .expect("look the instance up");
+    assert_eq!(stored, 0, "the refused instance was stored");
+    // Instances already known keep reporting.
+    for known in [last.as_str(), "seeded-7c1-1"] {
+        let r = gw.heartbeat(bare_beat(&bundle.dp_id, known)).await;
+        assert_eq!(r.status, 200, "{known}: {r:?}");
+    }
+    // Once one has not been heard from for a day, a new one fits again.
+    sqlx::query(
+        "UPDATE dp_instances SET last_seen_at = now() - interval '25 hours' \
+         WHERE instance_id = 'seeded-7c1-2'",
+    )
+    .execute(cp.db().pool())
+    .await
+    .expect("age an instance");
+    let r = gw.heartbeat(bare_beat(&bundle.dp_id, &over)).await;
+    assert_eq!(r.status, 200, "{r:?}");
+}
+
+#[tokio::test]
+async fn revocation_is_seen_while_the_main_pool_is_exhausted() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let (_, bundle) = setup(&cp).await;
+    let mut conn = DpConn::open(&cp, &bundle).await;
+    let store = "/dp/store/v1/mcp_oauth_token/k-7c1";
+    assert_eq!(conn.send("GET", store, None).await.0, 404);
+
+    // Request traffic holds every connection of the main pool.
+    let pool = cp.db().pool();
+    let mut held = Vec::new();
+    for _ in 0..pool.options().get_max_connections() {
+        held.push(pool.acquire().await.expect("a pool connection"));
+    }
+    // Revoked by another instance, as its revoke route would.
+    let mut other = PgConnection::connect(cp.database_url())
+        .await
+        .expect("connect");
+    let mut tx = other.begin().await.expect("begin");
+    sqlx::query("UPDATE dp_credentials SET revoked_at = now() WHERE dp_id = $1::uuid")
+        .bind(&bundle.dp_id)
+        .execute(&mut *tx)
+        .await
+        .expect("revoke");
+    sqlx::query("SELECT pg_notify('dp_credentials_changed', $1)")
+        .bind(&bundle.dp_id)
+        .execute(&mut *tx)
+        .await
+        .expect("notify");
+    tx.commit().await.expect("commit");
+
+    // The store stub reads nothing but the credentials.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let (status, _) = conn.send("GET", store, None).await;
+        if status == 403 {
+            break;
+        }
+        assert_eq!(status, 404);
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the revoke was not seen within 5 s while the main pool was busy"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    drop(held);
+}
+
+#[tokio::test]
+async fn a_heartbeat_with_every_optional_field_null_is_accepted() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let (admin, bundle) = setup(&cp).await;
+    let instance = Uuid::new_v4().to_string();
+    let mut beat = full_beat(&bundle.dp_id, &instance);
+    for field in [
+        "hostname",
+        "version",
+        "uptime_seconds",
+        "applied_revision",
+        "config_hash",
+        "supported_guardrail_kinds",
+        "exporter_health",
+        "rejected_resources",
+        "partially_compatible_resources",
+    ] {
+        beat[field] = Value::Null;
+    }
+    let r = cp.dp_client(&bundle).heartbeat(beat).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let items = instances(&cp, &admin).await;
+    let item = &items[0];
+    assert_eq!(item["hostname"], "");
+    assert_eq!(item["version"], "");
+    assert_eq!(item["uptime_seconds"], 0);
+    assert_eq!(item["applied_revision"], 0);
+    assert_eq!(item["config_hash"], Value::Null);
+    assert_eq!(item["exporter_health"], json!([]));
+    assert_eq!(item["rejected_count"], 0);
+    assert_eq!(stored_lists(&cp, &instance).await, (json!([]), json!([])));
+}
+
+#[tokio::test]
+async fn housekeeping_prunes_tombstones_projected_more_than_a_day_ago() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    // (deleted, projected_version, age)
+    let rows = [
+        ("old-projected-tombstone", true, Some(3i64), "2 days"),
+        ("recent-projected-tombstone", true, Some(3), "12 hours"),
+        ("old-unprojected-tombstone", true, Some(2), "2 days"),
+        ("old-never-projected-tombstone", true, None, "2 days"),
+        ("old-live-row", false, Some(3), "2 days"),
+    ];
+    let mut ids = Vec::new();
+    for (what, deleted, projected, age) in rows {
+        let id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO gw_resources (kind, id, doc, version, deleted, projected_version, updated_at) \
+             VALUES ('models', $1, '{}', 3, $2, $3, now() - $4::interval)",
+        )
+        .bind(id)
+        .bind(deleted)
+        .bind(projected)
+        .bind(age)
+        .execute(cp.db().pool())
+        .await
+        .unwrap_or_else(|e| panic!("seed {what}: {e}"));
+        ids.push((what, id));
+    }
+
+    // It waits for the resources lock, as a write would: a tombstone being
+    // revived on its id is never pruned under the write.
+    let mut writer = PgConnection::connect(cp.database_url())
+        .await
+        .expect("connect");
+    let mut tx = writer.begin().await.expect("begin");
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(RESOURCES_LOCK_KEY)
+        .execute(&mut *tx)
+        .await
+        .expect("take the resources lock");
+    let db = cp.db().clone();
+    let pass = tokio::spawn(async move { housekeeping::run_once(&db).await });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        !pass.is_finished(),
+        "pruned while a write held the resources lock"
+    );
+    tx.commit().await.expect("release the lock");
+    let pruned = tokio::time::timeout(Duration::from_secs(5), pass)
+        .await
+        .expect("the pass ends once the lock is free")
+        .expect("the pass task")
+        .expect("a housekeeping pass");
+    assert_eq!(pruned.tombstones, 1, "{pruned:?}");
+
+    let left: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM gw_resources")
+        .fetch_all(cp.db().pool())
+        .await
+        .expect("read the resources");
+    for (what, id) in ids {
+        assert_eq!(
+            left.contains(&id),
+            what != "old-projected-tombstone",
+            "{what}"
+        );
     }
 }
 
