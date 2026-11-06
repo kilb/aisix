@@ -389,6 +389,46 @@ describe("client-facing model echo e2e: the response names what the caller asked
     expectAliasNotUpstreamId(await res.text(), "echo-completions");
   });
 
+  /** A streamed completion whose every frame names the upstream's own model. */
+  const completionStream = () =>
+    startOpenAiUpstream({
+      streamEvents: [
+        JSON.stringify({
+          id: "cmpl_echo_stream",
+          object: "text_completion",
+          created: Math.floor(Date.now() / 1000),
+          model: UPSTREAM_REPORTED_MODEL,
+          choices: [{ index: 0, text: "o", finish_reason: null }],
+        }),
+        JSON.stringify({
+          id: "cmpl_echo_stream",
+          object: "text_completion",
+          created: Math.floor(Date.now() / 1000),
+          model: UPSTREAM_REPORTED_MODEL,
+          choices: [{ index: 0, text: "k", finish_reason: "stop" }],
+        }),
+        "[DONE]",
+      ],
+    });
+
+  test("/v1/completions streamed: every frame echoes the alias", async (ctx) => {
+    if (!etcdReachable || !app || !seed) return void ctx.skip();
+
+    const upstream = await completionStream();
+    upstreams.push(upstream);
+    await seedAlias("echo-completions-stream", upstream);
+
+    const res = await fetch(`${app.proxyUrl}/v1/completions`, {
+      method: "POST",
+      headers: HEADERS,
+      body: JSON.stringify({ model: "echo-completions-stream", prompt: "say ok", stream: true }),
+    });
+    expect(res.status).toBe(200);
+    const text = await res.text();
+    expectAliasNotUpstreamId(text, "echo-completions-stream");
+    expect(text.split('"model":"echo-completions-stream"').length - 1).toBe(2);
+  });
+
   test("/v1/rerank: a Jina-shaped response echoes the alias", async (ctx) => {
     if (!etcdReachable || !app || !seed) return void ctx.skip();
 
@@ -675,6 +715,61 @@ describe("client-facing model echo e2e: a buffering output guardrail keeps the a
   // exists to apply — it is cut. (A fragment that PARSES is a different
   // case: it is sealed and released, scanned and masked like any other
   // frame. That one is two tests below.)
+  test("/v1/completions streamed behind a block-capable output guardrail still echoes the alias", async (ctx) => {
+    if (!etcdReachable || !app || !seed) return void ctx.skip();
+
+    const frame = (text: string, finish: string | null) =>
+      JSON.stringify({
+        id: "cmpl_echo_held",
+        object: "text_completion",
+        created: Math.floor(Date.now() / 1000),
+        model: UPSTREAM_REPORTED_MODEL,
+        choices: [{ index: 0, text, finish_reason: finish }],
+      });
+    const upstream = await startOpenAiUpstream({
+      streamEvents: [frame("perfectly ", null), frame("fine", "stop"), "[DONE]"],
+    });
+    upstreams.push(upstream);
+
+    const pk = await seed.createProviderKey({
+      display_name: "pk-echo-guarded-completions",
+      secret: "sk-mock",
+      api_base: `${upstream.baseUrl}/v1`,
+    });
+    await seed.createModel({
+      display_name: "echo-guarded-completions",
+      provider: "openai",
+      model_name: CONFIGURED_MODEL_NAME,
+      provider_key_id: pk.id,
+    });
+    await seed.createApiKey({
+      key_hash: CALLER_KEY_HASH,
+      allowed_models: ["*"],
+    });
+    await waitConfigPropagation(async () => {
+      const r = await fetch(`${app!.proxyUrl}/v1/models`, {
+        headers: { authorization: HEADERS.authorization },
+      });
+      if (r.status !== 200) {
+        await r.text();
+        return false;
+      }
+      const j = (await r.json()) as { data?: Array<{ id?: string }> };
+      return !!j.data?.some((m) => m.id === "echo-guarded-completions");
+    });
+
+    const res = await fetch(`${app.proxyUrl}/v1/completions`, {
+      method: "POST",
+      headers: HEADERS,
+      body: JSON.stringify({ model: "echo-guarded-completions", prompt: "say ok", stream: true }),
+    });
+    expect(res.status).toBe(200);
+    const text = await res.text();
+    expectAliasNotUpstreamId(text, "echo-guarded-completions");
+    expect(text.split('"model":"echo-guarded-completions"').length - 1).toBe(2);
+    expect(text).toContain("data: [DONE]");
+  });
+
   test("/v1/messages hold-back drops an unscannable tail instead of releasing it", async (ctx) => {
     if (!etcdReachable || !app || !seed) return void ctx.skip();
 

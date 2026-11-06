@@ -287,7 +287,11 @@ describe("legacy /v1/completions e2e: text-in / text-out passthrough", () => {
         )
         .filter((data) => data !== "");
       expect(frames.at(-1)).toBe("[DONE]");
-      expect(frames.slice(0, -1).map((frame) => JSON.parse(frame) as unknown)).toEqual(STREAM_CHUNKS);
+      // The upstream's frames as it sent them, naming the model the caller asked
+      // for, as every streamed family does.
+      expect(frames.slice(0, -1).map((frame) => JSON.parse(frame) as unknown)).toEqual(
+        STREAM_CHUNKS.map((chunk) => ({ ...chunk, model: "completions-legacy-stream-model" })),
+      );
 
       const sent = streamUpstream.receivedRequests.slice(baseline);
       expect(sent).toHaveLength(1);

@@ -390,13 +390,15 @@ fn is_usage_only_frame(frame: &[u8]) -> bool {
 }
 
 /// A relayed completion stream in whole frames, without the usage frame unless
-/// the caller asked for it. Whole, because a heartbeat goes out on any silence:
+/// the caller asked for it, and naming the model the caller addressed, as every
+/// other stream does. Whole, because a heartbeat goes out on any silence:
 /// one landing inside a frame an upstream paused halfway through would cut that
 /// event in two. A frame that outgrows the splitter's bound is relayed as it
 /// stands rather than held without limit.
 pub(super) fn relay_whole_frames<S>(
     upstream: S,
     strip_usage: bool,
+    client_facing_model: String,
 ) -> impl futures::Stream<Item = Result<bytes::Bytes, BridgeError>>
 where
     S: futures::Stream<Item = Result<bytes::Bytes, BridgeError>>,
@@ -425,6 +427,7 @@ where
                     // An error event goes out less the credentials this
                     // request sent.
                     Ok(Some(frame)) => {
+                        let frame = restamp_completion_frame(frame, &client_facing_model);
                         out.extend_from_slice(&aisix_gateway::scrub_upstream_error_frame(&frame))
                     }
                     Ok(None) => break,
@@ -440,9 +443,19 @@ where
         }
         let rest = splitter.take_rest();
         if !rest.is_empty() && (!strip_usage || !is_usage_only_frame(&rest)) {
-            yield Ok(bytes::Bytes::from(rest));
+            yield Ok(bytes::Bytes::from(restamp_completion_frame(rest, &client_facing_model)));
         }
     }
+}
+
+/// `frame` with its top-level `model` set to the name the caller addressed.
+fn restamp_completion_frame(frame: Vec<u8>, client_facing_model: &str) -> Vec<u8> {
+    crate::model_echo::restamp_sse_frame(
+        &frame,
+        client_facing_model,
+        crate::model_echo::top_level_model,
+    )
+    .unwrap_or(frame)
 }
 
 pub(super) fn completion_usage_with_estimates(
@@ -1129,15 +1142,51 @@ mod tests {
                 Ok(bytes::Bytes::copy_from_slice(head)),
                 Ok(bytes::Bytes::copy_from_slice(tail)),
             ];
-            let out: Vec<_> = relay_whole_frames(futures::stream::iter(parts), true)
-                .collect()
-                .await;
+            let out: Vec<_> =
+                relay_whole_frames(futures::stream::iter(parts), true, "model".to_string())
+                    .collect()
+                    .await;
             let relayed: Vec<u8> = out
                 .into_iter()
                 .flat_map(|item| item.expect("no upstream error").to_vec())
                 .collect();
             assert_eq!(relayed, expected.as_bytes(), "cut at {cut}");
         }
+    }
+
+    /// A streamed completion names the model the caller addressed, as the
+    /// buffered one and every other stream do, whether a frame ends on its
+    /// terminator or the upstream ends without one.
+    #[tokio::test]
+    async fn a_relayed_completion_names_the_model_the_caller_addressed() {
+        let frame = |terminated: bool| {
+            format!(
+                "data: {{\"id\":\"cmpl-1\",\"object\":\"text_completion\",\"model\":\"gpt-3.5-turbo-instruct-0914\",\"choices\":[{{\"index\":0,\"text\":\"hi\"}}]}}{}",
+                if terminated { "\n\n" } else { "" }
+            )
+        };
+        let parts = vec![
+            Ok(bytes::Bytes::from(frame(true))),
+            Ok(bytes::Bytes::from(frame(false))),
+        ];
+        let out: Vec<_> = relay_whole_frames(
+            futures::stream::iter(parts),
+            false,
+            "my-instruct".to_string(),
+        )
+        .collect()
+        .await;
+        let relayed: Vec<u8> = out
+            .into_iter()
+            .flat_map(|item| item.expect("no upstream error").to_vec())
+            .collect();
+        let relayed = String::from_utf8(relayed).unwrap();
+        assert_eq!(
+            relayed.matches(r#""model":"my-instruct""#).count(),
+            2,
+            "{relayed}"
+        );
+        assert!(!relayed.contains("0914"), "{relayed}");
     }
 
     #[test]
@@ -1409,7 +1458,7 @@ mod tests {
         let parsed =
             build_completion_passthrough_stream(upstream, None, "model".to_string(), |_, _, _| {});
         let relayed = crate::sse_keepalive::with_heartbeat(
-            relay_whole_frames(parsed, false),
+            relay_whole_frames(parsed, false, "model".to_string()),
             Some(Duration::from_secs(15)),
         );
         let mut wire = Vec::new();

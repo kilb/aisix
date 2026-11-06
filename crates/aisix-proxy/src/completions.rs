@@ -1096,7 +1096,7 @@ async fn dispatch(
                     ))
                 };
                 let parsed = crate::sse_keepalive::with_heartbeat(
-                    relay_whole_frames(parsed, !caller_wants_usage),
+                    relay_whole_frames(parsed, !caller_wants_usage, model_name.to_string()),
                     crate::sse_keepalive::interval(),
                 );
                 let mut response = Response::new(axum::body::Body::from_stream(parsed));
