@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aisix_control_plane::auth::OperatorRole;
-use aisix_control_plane::dp::heartbeat::MAX_INSTANCES_PER_DAY;
+use aisix_control_plane::dp::heartbeat::MAX_INSTANCES;
 use aisix_control_plane::dp::listener::{ConnLimits, MAX_PENDING_HANDSHAKES};
 use aisix_control_plane::dp::{listener, ConnIdentity, CredentialCache};
 use aisix_control_plane::gateways::version_matches;
@@ -203,6 +203,18 @@ impl DpConn {
             .to_bytes();
         let body = serde_json::from_slice(&body).unwrap_or(Value::Null);
         (status, body)
+    }
+
+    /// Whether the server closes the connection within `wait`.
+    async fn closed_within(&mut self, wait: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + wait;
+        while tokio::time::Instant::now() < deadline {
+            if self.sender.is_closed() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        false
     }
 }
 
@@ -528,26 +540,34 @@ async fn a_revoked_credential_is_refused_on_an_open_connection() {
     };
     assert_eq!(refused.0, 403, "{refused:?}");
     assert_eq!(refused.1["code"], "forbidden");
-    let (status, _) = conn
+    // One answer, and then the connection: a revoked credential holds no
+    // connection open.
+    assert!(
+        conn.closed_within(Duration::from_secs(1)).await,
+        "the connection stayed open after the 403"
+    );
+
+    // A new connection with it is refused too, and closed with its answer.
+    let gw = cp.dp_client(&bundle);
+    let r = gw
         .send("GET", "/dp/store/v1/mcp_oauth_token/k-7c1", None)
         .await;
-    assert_eq!(status, 403);
+    assert_eq!(r.status, 403, "{r:?}");
+    let closes = r
+        .headers
+        .get(reqwest::header::CONNECTION)
+        .and_then(|v| v.to_str().ok());
+    assert_eq!(closes, Some("close"), "{:?}", r.headers);
     // A refused beat records nothing.
     let mut refused_beat = bare_beat(&bundle.dp_id, &instance);
     refused_beat["applied_revision"] = json!(4242);
-    let (status, _) = conn
-        .send("POST", "/dp/heartbeat", Some(&refused_beat))
-        .await;
-    assert_eq!(status, 403);
+    let r = gw.heartbeat(refused_beat).await;
+    assert_eq!(r.status, 403, "{r:?}");
     let applied: i64 = sqlx::query_scalar("SELECT applied_revision FROM dp_instances")
         .fetch_one(cp.db().pool())
         .await
         .expect("read the instance");
     assert_ne!(applied, 4242);
-
-    // A new connection with it is refused too.
-    let r = cp.dp_client(&bundle).heartbeat(beat).await;
-    assert_eq!(r.status, 403, "{r:?}");
 }
 
 /// A CA of its own, and a leaf of it that names `env_id` and `dp_id` the
@@ -1052,10 +1072,19 @@ async fn a_peer_cannot_hold_more_than_the_pending_handshake_cap() {
         return;
     };
     let (_, bundle) = setup(&cp).await;
-    let (addr, _stop) = serve_echo(&cp, ConnLimits::default()).await;
+    // A cap of its own, and a handshake timeout no runner is slow enough to
+    // reach, so neither the open-file limit nor the runner's speed decides
+    // the outcome. The default caps are pinned below.
+    let pending = 64;
+    let limits = ConnLimits {
+        pending_handshakes: pending,
+        handshake_timeout: Duration::from_secs(60),
+        ..ConnLimits::default()
+    };
+    let (addr, _stop) = serve_echo(&cp, limits).await;
     // Connections that never start a handshake, up to the cap.
     let mut silent = Vec::new();
-    for _ in 0..MAX_PENDING_HANDSHAKES {
+    for _ in 0..pending {
         silent.push(tokio::net::TcpStream::connect(addr).await.expect("connect"));
     }
     // One more is closed at once, unread, and so is a gateway's.
@@ -1259,54 +1288,201 @@ async fn a_credential_flooding_heartbeats_is_throttled() {
     assert_eq!(r.status, 200, "{r:?}");
 }
 
+/// Seeds `count` instances of `dp_id` heard from just now, as that many
+/// gateways beating would leave them.
+async fn seed_online_instances(cp: &TestCp, dp_id: &str, count: i64) {
+    sqlx::query(
+        "INSERT INTO dp_instances (dp_id, instance_id) \
+         SELECT $1::uuid, 'online-7c1-' || g FROM generate_series(1, $2) g",
+    )
+    .bind(dp_id)
+    .bind(count)
+    .execute(cp.db().pool())
+    .await
+    .expect("seed instances");
+}
+
+/// `dp_id`'s instance rows, and when it last hit its instance cap.
+async fn instance_cap_state(
+    cp: &TestCp,
+    dp_id: &str,
+) -> (i64, Option<chrono::DateTime<chrono::Utc>>) {
+    sqlx::query_as(
+        "SELECT (SELECT count(*) FROM dp_instances WHERE dp_id = $1::uuid), \
+         instance_cap_hit_at FROM dp_credentials WHERE dp_id = $1::uuid",
+    )
+    .bind(dp_id)
+    .fetch_one(cp.db().pool())
+    .await
+    .expect("read the credential")
+}
+
 #[tokio::test]
-async fn a_credential_reports_at_most_its_daily_cap_of_instances() {
+async fn at_the_instance_cap_a_new_instance_takes_the_place_of_the_longest_silent_one() {
     let Some(cp) = TestCp::start().await else {
         return;
     };
     let (_, bundle) = setup(&cp).await;
     let gw = cp.dp_client(&bundle);
-    // One instance short of the cap heard from today, as that many beats
-    // would have left them.
-    sqlx::query(
-        "INSERT INTO dp_instances (dp_id, instance_id) \
-         SELECT $1::uuid, 'seeded-7c1-' || g FROM generate_series(1, $2) g",
-    )
-    .bind(&bundle.dp_id)
-    .bind(MAX_INSTANCES_PER_DAY - 1)
-    .execute(cp.db().pool())
-    .await
-    .expect("seed instances");
-    let last = Uuid::new_v4().to_string();
-    let r = gw.heartbeat(bare_beat(&bundle.dp_id, &last)).await;
-    assert_eq!(r.status, 200, "the instance that reaches the cap: {r:?}");
+    // The cap reached: all heard from just now but three, which crashed a
+    // while ago and are offline.
+    seed_online_instances(&cp, &bundle.dp_id, MAX_INSTANCES - 3).await;
+    for (instance, ago) in [
+        ("crashed-5m-7c1", "5 minutes"),
+        ("crashed-20m-7c1", "20 minutes"),
+        ("crashed-10m-7c1", "10 minutes"),
+    ] {
+        sqlx::query(
+            "INSERT INTO dp_instances (dp_id, instance_id, last_seen_at) \
+             VALUES ($1::uuid, $2, now() - $3::interval)",
+        )
+        .bind(&bundle.dp_id)
+        .bind(instance)
+        .bind(ago)
+        .execute(cp.db().pool())
+        .await
+        .expect("seed a crashed instance");
+    }
+    assert_eq!(
+        instance_cap_state(&cp, &bundle.dp_id).await.0,
+        MAX_INSTANCES
+    );
+
+    let ids = |cp: &TestCp| {
+        let pool = cp.db().pool().clone();
+        async move {
+            sqlx::query_scalar::<_, String>("SELECT instance_id FROM dp_instances")
+                .fetch_all(&pool)
+                .await
+                .expect("read the instances")
+        }
+    };
+    // Each new live instance takes the place of the longest silent one.
+    for (n, gone) in ["crashed-20m-7c1", "crashed-10m-7c1"]
+        .into_iter()
+        .enumerate()
+    {
+        let live = format!("live-{n}-7c1");
+        let r = gw.heartbeat(bare_beat(&bundle.dp_id, &live)).await;
+        assert_eq!(r.status, 200, "{live}: {r:?}");
+        let left = ids(&cp).await;
+        assert!(left.contains(&live), "{live} was not stored");
+        assert!(!left.contains(&gone.to_string()), "{gone} is still there");
+        assert!(left.contains(&"crashed-5m-7c1".to_string()));
+        let (rows, hit) = instance_cap_state(&cp, &bundle.dp_id).await;
+        assert_eq!(rows, MAX_INSTANCES, "the rows outgrew the cap");
+        assert_eq!(
+            hit, None,
+            "a cap hit was recorded though nothing was refused"
+        );
+    }
+}
+
+#[tokio::test]
+async fn at_the_instance_cap_with_every_instance_online_a_new_one_is_refused_and_recorded() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let (_, bundle) = setup(&cp).await;
+    let gw = cp.dp_client(&bundle);
+    seed_online_instances(&cp, &bundle.dp_id, MAX_INSTANCES).await;
 
     let over = Uuid::new_v4().to_string();
     let r = gw.heartbeat(bare_beat(&bundle.dp_id, &over)).await;
     assert_eq!(r.status, 429, "{r:?}");
     assert_eq!(r.body["code"], "instance_limit", "{r:?}");
-    let stored: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM dp_instances WHERE instance_id = $1")
-            .bind(&over)
-            .fetch_one(cp.db().pool())
-            .await
-            .expect("look the instance up");
-    assert_eq!(stored, 0, "the refused instance was stored");
+    let (rows, hit) = instance_cap_state(&cp, &bundle.dp_id).await;
+    assert_eq!(rows, MAX_INSTANCES, "the refused instance was stored");
+    let hit = hit.expect("the refusal is recorded on the credential");
+    assert!(
+        (chrono::Utc::now() - hit).num_seconds() < 60,
+        "recorded at {hit}"
+    );
     // Instances already known keep reporting.
-    for known in [last.as_str(), "seeded-7c1-1"] {
-        let r = gw.heartbeat(bare_beat(&bundle.dp_id, known)).await;
-        assert_eq!(r.status, 200, "{known}: {r:?}");
-    }
-    // Once one has not been heard from for a day, a new one fits again.
+    let r = gw.heartbeat(bare_beat(&bundle.dp_id, "online-7c1-1")).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    // Once one goes offline, the new one takes its place.
     sqlx::query(
-        "UPDATE dp_instances SET last_seen_at = now() - interval '25 hours' \
-         WHERE instance_id = 'seeded-7c1-2'",
+        "UPDATE dp_instances SET last_seen_at = now() - interval '2 minutes' \
+         WHERE instance_id = 'online-7c1-2'",
     )
     .execute(cp.db().pool())
     .await
     .expect("age an instance");
     let r = gw.heartbeat(bare_beat(&bundle.dp_id, &over)).await;
     assert_eq!(r.status, 200, "{r:?}");
+    assert_eq!(
+        instance_cap_state(&cp, &bundle.dp_id).await.0,
+        MAX_INSTANCES
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn new_instances_arriving_together_at_the_cap_get_its_one_place() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let (_, bundle) = setup(&cp).await;
+    // One place left, and nothing offline to make room.
+    seed_online_instances(&cp, &bundle.dp_id, MAX_INSTANCES - 1).await;
+    let racers = 24;
+    let gw = Arc::new(cp.dp_client(&bundle));
+    let barrier = Arc::new(tokio::sync::Barrier::new(racers));
+    let beats: Vec<_> = (0..racers)
+        .map(|_| {
+            let (gw, barrier) = (gw.clone(), barrier.clone());
+            let beat = bare_beat(&bundle.dp_id, &Uuid::new_v4().to_string());
+            tokio::spawn(async move {
+                barrier.wait().await;
+                gw.heartbeat(beat).await
+            })
+        })
+        .collect();
+    let mut answers = Vec::new();
+    for beat in beats {
+        answers.push(beat.await.expect("a beat task"));
+    }
+    let admitted = answers.iter().filter(|r| r.status == 200).count();
+    let refused = answers
+        .iter()
+        .filter(|r| r.status == 429 && r.body["code"] == "instance_limit")
+        .count();
+    assert_eq!((admitted, refused), (1, racers - 1), "{answers:?}");
+    assert_eq!(
+        instance_cap_state(&cp, &bundle.dp_id).await.0,
+        MAX_INSTANCES
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn the_first_beats_of_one_instance_arriving_together_at_the_boundary_are_all_admitted() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let (_, bundle) = setup(&cp).await;
+    seed_online_instances(&cp, &bundle.dp_id, MAX_INSTANCES - 1).await;
+    // A gateway retrying its first beat: the same new id, several times
+    // at once. It takes the last place once, and none of them is refused.
+    let instance = Uuid::new_v4().to_string();
+    let gw = Arc::new(cp.dp_client(&bundle));
+    let barrier = Arc::new(tokio::sync::Barrier::new(8));
+    let beats: Vec<_> = (0..8)
+        .map(|_| {
+            let (gw, barrier) = (gw.clone(), barrier.clone());
+            let beat = bare_beat(&bundle.dp_id, &instance);
+            tokio::spawn(async move {
+                barrier.wait().await;
+                gw.heartbeat(beat).await
+            })
+        })
+        .collect();
+    for beat in beats {
+        let r = beat.await.expect("a beat task");
+        assert_eq!(r.status, 200, "{r:?}");
+    }
+    let (rows, hit) = instance_cap_state(&cp, &bundle.dp_id).await;
+    assert_eq!(rows, MAX_INSTANCES);
+    assert_eq!(hit, None);
 }
 
 #[tokio::test]
@@ -1394,19 +1570,12 @@ async fn a_heartbeat_with_every_optional_field_null_is_accepted() {
     assert_eq!(stored_lists(&cp, &instance).await, (json!([]), json!([])));
 }
 
-#[tokio::test]
-async fn housekeeping_prunes_tombstones_projected_more_than_a_day_ago() {
-    let Some(cp) = TestCp::start().await else {
-        return;
-    };
-    // (deleted, projected_version, age)
-    let rows = [
-        ("old-projected-tombstone", true, Some(3i64), "2 days"),
-        ("recent-projected-tombstone", true, Some(3), "12 hours"),
-        ("old-unprojected-tombstone", true, Some(2), "2 days"),
-        ("old-never-projected-tombstone", true, None, "2 days"),
-        ("old-live-row", false, Some(3), "2 days"),
-    ];
+/// Seeds gateway resource rows `(what, deleted, projected_version, age)`,
+/// each at version 3, and returns their ids.
+async fn seed_resources(
+    cp: &TestCp,
+    rows: &[(&'static str, bool, Option<i64>, &str)],
+) -> Vec<(&'static str, Uuid)> {
     let mut ids = Vec::new();
     for (what, deleted, projected, age) in rows {
         let id = Uuid::new_v4();
@@ -1421,8 +1590,36 @@ async fn housekeeping_prunes_tombstones_projected_more_than_a_day_ago() {
         .execute(cp.db().pool())
         .await
         .unwrap_or_else(|e| panic!("seed {what}: {e}"));
-        ids.push((what, id));
+        ids.push((*what, id));
     }
+    ids
+}
+
+async fn resource_ids(cp: &TestCp) -> Vec<Uuid> {
+    sqlx::query_scalar("SELECT id FROM gw_resources")
+        .fetch_all(cp.db().pool())
+        .await
+        .expect("read the resources")
+}
+
+#[tokio::test]
+async fn housekeeping_prunes_tombstones_projected_more_than_a_day_ago() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    // The prune, with a window of an hour: rows the control plane's own
+    // pass (a day) never touches, so what this call reports is all there is.
+    let ids = seed_resources(
+        &cp,
+        &[
+            ("projected-tombstone-2h", true, Some(3), "2 hours"),
+            ("projected-tombstone-30m", true, Some(3), "30 minutes"),
+            ("unprojected-tombstone-2h", true, Some(2), "2 hours"),
+            ("never-projected-tombstone-2h", true, None, "2 hours"),
+            ("live-row-2h", false, Some(3), "2 hours"),
+        ],
+    )
+    .await;
 
     // It waits for the resources lock, as a write would: a tombstone being
     // revived on its id is never pruned under the write.
@@ -1436,7 +1633,9 @@ async fn housekeeping_prunes_tombstones_projected_more_than_a_day_ago() {
         .await
         .expect("take the resources lock");
     let db = cp.db().clone();
-    let pass = tokio::spawn(async move { housekeeping::run_once(&db).await });
+    let pass = tokio::spawn(async move {
+        housekeeping::prune_tombstones(&db, Duration::from_secs(3600)).await
+    });
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert!(
         !pass.is_finished(),
@@ -1445,22 +1644,107 @@ async fn housekeeping_prunes_tombstones_projected_more_than_a_day_ago() {
     tx.commit().await.expect("release the lock");
     let pruned = tokio::time::timeout(Duration::from_secs(5), pass)
         .await
-        .expect("the pass ends once the lock is free")
-        .expect("the pass task")
-        .expect("a housekeeping pass");
-    assert_eq!(pruned.tombstones, 1, "{pruned:?}");
-
-    let left: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM gw_resources")
-        .fetch_all(cp.db().pool())
-        .await
-        .expect("read the resources");
-    for (what, id) in ids {
+        .expect("the prune ends once the lock is free")
+        .expect("the prune task")
+        .expect("a prune");
+    assert_eq!(pruned, 1);
+    let left = resource_ids(&cp).await;
+    for (what, id) in &ids {
         assert_eq!(
-            left.contains(&id),
-            what != "old-projected-tombstone",
+            left.contains(id),
+            *what != "projected-tombstone-2h",
             "{what}"
         );
     }
+
+    // A pass prunes with a day's window. Another pass may run beside it,
+    // so what is left is what is checked.
+    let ids = seed_resources(
+        &cp,
+        &[
+            ("projected-tombstone-2d", true, Some(3), "2 days"),
+            ("projected-tombstone-12h", true, Some(3), "12 hours"),
+        ],
+    )
+    .await;
+    housekeeping::run_once(cp.db())
+        .await
+        .expect("a housekeeping pass");
+    let left = resource_ids(&cp).await;
+    assert!(!left.contains(&ids[0].1), "{}", ids[0].0);
+    assert!(left.contains(&ids[1].1), "{}", ids[1].0);
+}
+
+#[tokio::test]
+async fn a_control_plane_prunes_as_it_boots() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    // Left behind by an instance that restarted before its next pass.
+    let op = cp.seed_operator(OperatorRole::Viewer).await;
+    sqlx::query(
+        "INSERT INTO sessions (token_sha256, principal_kind, principal_id, expires_at) \
+         VALUES ('\\x0b1d'::bytea, 'operator', $1, now() - interval '1 minute')",
+    )
+    .bind(op.id)
+    .execute(cp.db().pool())
+    .await
+    .expect("seed an expired session");
+    let restarted = cp.restart().await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let left: i64 = sqlx::query_scalar("SELECT count(*) FROM sessions WHERE principal_id = $1")
+            .bind(op.id)
+            .fetch_one(restarted.db().pool())
+            .await
+            .expect("count sessions");
+        if left == 0 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "a restarted control plane did not prune within 5 s"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn boot_raises_the_open_file_limit_to_its_hard_limit() {
+    use rustix::process::{getrlimit, setrlimit, Resource, Rlimit};
+
+    let limit = getrlimit(Resource::Nofile);
+    let Some(hard) = limit.maximum else {
+        // No hard limit: there is nothing to raise to.
+        return;
+    };
+    // Just below the hard limit, so the tests beside this one cannot tell.
+    setrlimit(
+        Resource::Nofile,
+        Rlimit {
+            current: Some(hard - 1),
+            maximum: Some(hard),
+        },
+    )
+    .expect("lower the soft limit");
+    let Some(_cp) = TestCp::start().await else {
+        return;
+    };
+    assert_eq!(getrlimit(Resource::Nofile).current, Some(hard));
+}
+
+#[test]
+fn the_listener_caps_512_handshakes_4096_connections_and_5_s() {
+    assert_eq!(MAX_PENDING_HANDSHAKES, 512);
+    assert_eq!(
+        ConnLimits::default(),
+        ConnLimits {
+            pending_handshakes: 512,
+            connections: 4096,
+            handshake_timeout: Duration::from_secs(5),
+        }
+    );
 }
 
 #[test]

@@ -147,6 +147,7 @@ dependencies = [
  "rcgen",
  "reqwest 0.12.28",
  "ring",
+ "rustix",
  "rustls",
  "rustls-pki-types",
  "semver",

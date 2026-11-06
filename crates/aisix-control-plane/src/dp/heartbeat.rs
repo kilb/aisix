@@ -14,17 +14,20 @@
 //!
 //! A credential's holder is trusted to report, not to flood:
 //! - its beats pass a token bucket per `dp_id`, [`BEAT_BURST`] at once and
-//!   [`BEATS_PER_SECOND`] after that: what [`MAX_INSTANCES_PER_DAY`]
+//!   [`BEATS_PER_SECOND`] after that: what [`MAX_INSTANCES`]
 //!   instances beating at the gateway's shortest interval (5 s) send. Past
 //!   it a beat is `429 busy` and writes nothing; the gateway logs a warning
 //!   and beats again at its next tick. The bucket is per control-plane
 //!   process.
-//! - at most [`MAX_INSTANCES_PER_DAY`] of its instances heard from in the
-//!   last day: a beat from a new `instance_id` past that is `429
-//!   instance_limit` and stores nothing, so one credential cannot fill the
-//!   instance table with ids. A gateway mints an id at every boot, so a fleet
-//!   of R replicas restarted K times a day uses R × (K + 1); 128 leaves room
-//!   for one that rolls often.
+//! - at most [`MAX_INSTANCES`] instance rows. A gateway mints an
+//!   `instance_id` at every boot, so a crash-looping one leaves a row behind
+//!   each time; a new instance past the cap therefore takes the place of
+//!   the credential's longest-silent offline instance (not heard from within
+//!   `CP_INSTANCE_STALE_SECS`), and the live ones always get in. Only when
+//!   every row is online is a new instance refused, `429 instance_limit`,
+//!   storing nothing; the time is recorded as the credential's
+//!   `instance_cap_hit_at`, since the instances shown are then not the whole
+//!   fleet.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -41,6 +44,7 @@ use uuid::Uuid;
 use super::DpIdentity;
 use crate::db::DbError;
 use crate::error::{ApiError, Detail};
+use crate::gateways::stale_window_secs;
 use crate::http::ApiJson;
 use crate::AppState;
 
@@ -48,15 +52,15 @@ use crate::AppState;
 /// might mint, and keeps the key short enough to index.
 const MAX_INSTANCE_ID_CHARS: usize = 128;
 
-/// Instances of one credential heard from in the last day, at most.
-pub const MAX_INSTANCES_PER_DAY: i64 = 128;
+/// Instance rows one credential keeps, at most.
+pub const MAX_INSTANCES: i64 = 128;
 
 /// Beats one credential may send at once.
 pub const BEAT_BURST: f64 = 128.0;
 
 /// Beats one credential may send per second, after a burst: as many
 /// instances as it may have, each beating every 5 s.
-pub const BEATS_PER_SECOND: f64 = MAX_INSTANCES_PER_DAY as f64 / 5.0;
+pub const BEATS_PER_SECOND: f64 = MAX_INSTANCES as f64 / 5.0;
 
 /// The beats each credential may still send: a token bucket per `dp_id`,
 /// in this process. Cheap to clone: clones share the buckets. A bucket is
@@ -151,60 +155,103 @@ pub async fn heartbeat(
         return Err(ApiError::busy());
     }
     let dp_id = dp.dp_id;
-    state
+    let stale_secs = stale_window_secs(&state.cfg);
+    let recorded = state
         .db
         .tx(move |conn| {
             async move {
-                let known: bool = sqlx::query_scalar(
-                    "SELECT EXISTS (SELECT 1 FROM dp_instances \
-                     WHERE dp_id = $1 AND instance_id = $2)",
-                )
-                .bind(dp_id)
-                .bind(&body.instance_id)
-                .fetch_one(&mut *conn)
-                .await
-                .map_err(DbError::from)?;
-                if !known {
-                    admit_new_instance(conn, dp_id).await?;
+                let known = is_known(conn, dp_id, &body.instance_id).await?;
+                if !known && !make_room(conn, dp_id, &body.instance_id, stale_secs).await? {
+                    // Committed with the refusal: what the fleet view is
+                    // missing is known.
+                    sqlx::query(
+                        "UPDATE dp_credentials SET instance_cap_hit_at = now() WHERE dp_id = $1",
+                    )
+                    .bind(dp_id)
+                    .execute(&mut *conn)
+                    .await?;
+                    return Ok(false);
                 }
                 record(conn, dp_id, &body).await?;
-                Ok::<_, ApiError>(())
+                Ok::<_, DbError>(true)
             }
             .boxed()
         })
         .await?;
+    if !recorded {
+        tracing::warn!(%dp_id, "refused a new gateway instance: every one of the credential's \
+            instances is online and it has reached its instance cap");
+        return Err(ApiError {
+            code: "instance_limit",
+            message: format!(
+                "此网关凭据的 {MAX_INSTANCES} 个实例都在线，暂不接受新实例；\
+                 更多网关请使用另一份凭据"
+            ),
+            ..ApiError::busy()
+        });
+    }
     Ok(Json(json!({})))
 }
 
-/// Refuses a new instance of `dp_id` once it has [`MAX_INSTANCES_PER_DAY`]
-/// heard from in the last day. The credential's row is locked first, so
-/// two new instances arriving together cannot both take the last place.
-async fn admit_new_instance(conn: &mut PgConnection, dp_id: Uuid) -> Result<(), ApiError> {
+/// Whether `dp_id` already has a row for `instance_id`.
+async fn is_known(
+    conn: &mut PgConnection,
+    dp_id: Uuid,
+    instance_id: &str,
+) -> Result<bool, DbError> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM dp_instances WHERE dp_id = $1 AND instance_id = $2)",
+    )
+    .bind(dp_id)
+    .bind(instance_id)
+    .fetch_one(conn)
+    .await?)
+}
+
+/// Whether `dp_id` has room for its new instance `instance_id`. At
+/// [`MAX_INSTANCES`] rows it makes room by deleting its least recently seen
+/// instance that is offline (silent for longer than `stale_secs`), and has
+/// none when every one is online.
+///
+/// The credential's row is locked first, so new instances arriving together
+/// take the places there are one at a time; and a first beat of
+/// `instance_id` that got in while this one waited is found, rather than
+/// counted against it.
+async fn make_room(
+    conn: &mut PgConnection,
+    dp_id: Uuid,
+    instance_id: &str,
+    stale_secs: f64,
+) -> Result<bool, DbError> {
     sqlx::query("SELECT 1 FROM dp_credentials WHERE dp_id = $1 FOR UPDATE")
         .bind(dp_id)
         .execute(&mut *conn)
-        .await
-        .map_err(DbError::from)?;
-    let recent: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM dp_instances \
-         WHERE dp_id = $1 AND last_seen_at > now() - interval '1 day'",
+        .await?;
+    if is_known(conn, dp_id, instance_id).await? {
+        return Ok(true);
+    }
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM dp_instances WHERE dp_id = $1")
+        .bind(dp_id)
+        .fetch_one(&mut *conn)
+        .await?;
+    if rows < MAX_INSTANCES {
+        return Ok(true);
+    }
+    let evicted = sqlx::query(
+        "DELETE FROM dp_instances WHERE (dp_id, instance_id) IN ( \
+           SELECT dp_id, instance_id FROM dp_instances \
+           WHERE dp_id = $1 AND last_seen_at < now() - make_interval(secs => $2) \
+           ORDER BY last_seen_at LIMIT 1)",
     )
     .bind(dp_id)
-    .fetch_one(&mut *conn)
-    .await
-    .map_err(DbError::from)?;
-    if recent < MAX_INSTANCES_PER_DAY {
-        return Ok(());
+    .bind(stale_secs)
+    .execute(&mut *conn)
+    .await?
+    .rows_affected();
+    if evicted > 0 {
+        tracing::debug!(%dp_id, "a new gateway instance took the place of the longest-silent offline one");
     }
-    tracing::warn!(%dp_id, "refused a new gateway instance: the credential has reached its daily instance cap");
-    Err(ApiError {
-        code: "instance_limit",
-        message: format!(
-            "此网关凭据最近一天内已有 {MAX_INSTANCES_PER_DAY} 个实例上报，暂不接受新实例；\
-             更多网关请使用另一份凭据"
-        ),
-        ..ApiError::busy()
-    })
+    Ok(evicted > 0)
 }
 
 /// Upserts the instance's row with everything `body` reports.

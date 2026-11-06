@@ -351,6 +351,12 @@ pub async fn revoke_credential(
 /// would not fit the timestamp arithmetic.
 const MAX_STALE_SECS: u64 = 10 * 365 * 86_400;
 
+/// `CP_INSTANCE_STALE_SECS`, as applied: an instance silent for longer is
+/// offline.
+pub(crate) fn stale_window_secs(cfg: &CpConfig) -> f64 {
+    cfg.instance_stale_secs.min(MAX_STALE_SECS) as f64
+}
+
 #[derive(sqlx::FromRow)]
 struct InstanceRow {
     dp_id: Uuid,
@@ -376,7 +382,7 @@ pub async fn list_instances(
     State(state): State<AppState>,
 ) -> Result<Json<Value>, ApiError> {
     auth.require(OperatorRole::Viewer)?;
-    let stale_secs = state.cfg.instance_stale_secs.min(MAX_STALE_SECS) as f64;
+    let stale_secs = stale_window_secs(&state.cfg);
     let rows: Vec<InstanceRow> = sqlx::query_as(
         "SELECT i.dp_id, c.name AS credential_name, i.instance_id, i.hostname, i.version, \
          i.uptime_seconds, i.applied_revision, i.config_hash, \

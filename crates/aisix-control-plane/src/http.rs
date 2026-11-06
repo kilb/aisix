@@ -16,7 +16,7 @@
 
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{DefaultBodyLimit, FromRequest, MatchedPath, Request};
-use axum::http::{Method, StatusCode};
+use axum::http::{header, HeaderValue, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, patch, post};
@@ -178,8 +178,21 @@ pub fn dp_router(state: AppState) -> Router {
         .route("/dp/heartbeat", post(dp::heartbeat::heartbeat))
         .route("/dp/store/v1/{*rest}", any(dp::store::not_found))
         .route_layer(axum::middleware::from_fn(only_listed_dp_routes))
+        .layer(axum::middleware::map_response(close_on_forbidden))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(state)
+}
+
+/// Every `403` on the gateway listener ends its connection: a credential it
+/// refuses (revoked, expired, of another environment, speaking for another)
+/// gets one answer, and then holds no connection open.
+async fn close_on_forbidden(mut response: Response) -> Response {
+    if response.status() == StatusCode::FORBIDDEN {
+        response
+            .headers_mut()
+            .insert(header::CONNECTION, HeaderValue::from_static("close"));
+    }
+    response
 }
 
 /// Answers `404 not_found` on the browser listener for a route with no

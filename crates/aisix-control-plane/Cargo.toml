@@ -59,6 +59,11 @@ tower = { version = "0.5", features = ["util"] }
 # (1.0.28 in Cargo.lock).
 semver = "1"
 
+# The open-file limit, raised at boot for the gateway listener's connection
+# caps (1.1.4 in Cargo.lock).
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["process"] }
+
 [dev-dependencies]
 # Tests start a real listener and send real HTTP, as the portal's and the
 # console's do.

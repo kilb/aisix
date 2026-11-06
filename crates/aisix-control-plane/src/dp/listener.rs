@@ -68,6 +68,10 @@ pub const MAX_CONNECTIONS: usize = 4096;
 /// A peer that has not finished its TLS handshake by then is dropped.
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Open files spared beyond the connection cap: the browser listener, the
+/// database pools and the process's own files.
+const FD_HEADROOM: u64 = 512;
+
 /// At most one warning this often while connections are refused at
 /// capacity, so a flood does not flood the log too.
 const AT_CAPACITY_WARNING_EVERY: Duration = Duration::from_secs(10);
@@ -83,6 +87,50 @@ pub struct ConnLimits {
     pub connections: usize,
     pub handshake_timeout: Duration,
 }
+
+impl ConnLimits {
+    /// The open-file limit these caps need: every connection, handshakes
+    /// included, and the rest of the process.
+    pub fn fds_needed(&self) -> u64 {
+        self.connections as u64 + FD_HEADROOM
+    }
+}
+
+/// Raises the soft open-file limit (`RLIMIT_NOFILE`) to the hard one, and
+/// logs an error when even that is below what `limits` needs: past it,
+/// accepting fails, and so do the browser listener and the database pools.
+/// The boot goes on either way.
+#[cfg(unix)]
+pub fn raise_fd_limit(limits: &ConnLimits) {
+    use rustix::process::{getrlimit, setrlimit, Resource, Rlimit};
+
+    let limit = getrlimit(Resource::Nofile);
+    let raised = Rlimit {
+        current: limit.maximum,
+        maximum: limit.maximum,
+    };
+    let current = match setrlimit(Resource::Nofile, raised) {
+        Ok(()) => limit.maximum,
+        Err(e) => {
+            tracing::warn!(error = %e, "cannot raise the open-file limit (RLIMIT_NOFILE)");
+            limit.current
+        }
+    };
+    let needed = limits.fds_needed();
+    // `None` is no limit at all.
+    if let Some(current) = current.filter(|current| *current < needed) {
+        tracing::error!(
+            limit = current,
+            needed,
+            "the open-file limit (RLIMIT_NOFILE) is below what the gateway listener's \
+             connection caps need: raise it (ulimit -n, or LimitNOFILE for a service)"
+        );
+    }
+}
+
+/// Elsewhere there is no such limit to raise.
+#[cfg(not(unix))]
+pub fn raise_fd_limit(_limits: &ConnLimits) {}
 
 impl Default for ConnLimits {
     fn default() -> ConnLimits {

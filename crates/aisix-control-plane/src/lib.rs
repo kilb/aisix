@@ -152,9 +152,11 @@ where
         .await
         .map_err(BootError::Listen)?;
     let http_addr = listener.local_addr().map_err(BootError::Listen)?;
+    let dp_limits = ConnLimits::default();
     let dp = match dp_tls {
         None => None,
         Some(tls) => {
+            dp::listener::raise_fd_limit(&dp_limits);
             let listener = tokio::net::TcpListener::bind(cfg.dp_addr)
                 .await
                 .map_err(BootError::DpListen)?;
@@ -201,7 +203,7 @@ where
             tls,
             http::dp_router(state.clone()),
             None,
-            ConnLimits::default(),
+            dp_limits,
             stopping,
         )));
     }
