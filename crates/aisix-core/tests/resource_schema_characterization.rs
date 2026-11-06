@@ -1084,6 +1084,7 @@ const EXTRA_RELAXATIONS: &[(&str, &[&str])] = &[
         "api_key",
         &[
             "/allOf",
+            "/definitions/EndpointFamily",
             "/definitions/McpAccess/allOf",
             "/definitions/McpAccess/required",
             "/definitions/McpToolRef/properties/server_id/default",
@@ -1091,6 +1092,8 @@ const EXTRA_RELAXATIONS: &[(&str, &[&str])] = &[
             "/definitions/McpToolRef/properties/tool/default",
             "/definitions/McpToolRef/properties/tool/minLength",
             "/definitions/McpToolRef/required",
+            "/properties/allowed_endpoints/items/$ref",
+            "/properties/allowed_endpoints/items/type",
             "/properties/tags/additionalProperties/maxLength",
             "/properties/tags/additionalProperties/minLength",
             "/properties/tags/maxProperties",

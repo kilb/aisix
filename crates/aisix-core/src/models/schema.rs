@@ -1529,6 +1529,19 @@ pub fn apikey_root_schema(strict: bool) -> Value {
             &mut schema,
             vec![require_name_form_beside_ids("mcp_rate_limits", "object")],
         );
+    } else {
+        // An endpoint family a later release adds must not cost this one the
+        // whole key row: the read contract takes any name, and a name this
+        // build does not know loads as `EndpointFamily::Unknown`, which
+        // grants nothing. The write contract keeps the closed enum.
+        *schema
+            .pointer_mut("/properties/allowed_endpoints/items")
+            .expect("api_key schema types allowed_endpoints items") = json!({"type": "string"});
+        schema
+            .pointer_mut("/definitions")
+            .and_then(Value::as_object_mut)
+            .expect("api_key schema has definitions")
+            .remove("EndpointFamily");
     }
     schema
 }

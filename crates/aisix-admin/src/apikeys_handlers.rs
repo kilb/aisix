@@ -38,6 +38,11 @@ pub struct PublicApiKey {
     pub mcp_access: Option<aisix_core::models::McpAccess>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub allowed_agents: Option<Vec<String>>,
+    /// Shown whenever the stored key sets it, because it refuses every route
+    /// outside the listed families whatever the other grants say, so an
+    /// operator reading only those would misread what the key may call.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allowed_endpoints: Option<Vec<aisix_core::models::EndpointFamily>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
@@ -54,6 +59,7 @@ impl From<ApiKey> for PublicApiKey {
             rate_limit: value.rate_limit,
             mcp_access: value.mcp_access,
             allowed_agents: value.allowed_agents,
+            allowed_endpoints: value.allowed_endpoints,
             expires_at: value.expires_at,
             disabled: value.disabled,
         }

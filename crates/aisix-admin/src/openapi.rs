@@ -1638,6 +1638,20 @@ const OPENAPI_JSON_BASE: &str = r##"{
             },
             "description": "A2A agents this key may reach, named by their registered names. Entries are matched as `*` globs: `\"*\"` grants every agent and an entry without a `*` matches one agent exactly. When omitted, set to `null`, or set to an empty list, the key has no A2A agent access \u2014 access is granted explicitly."
           },
+          "allowed_endpoints": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "Endpoint families this key may call, such as `chat_completions` or `models`; a request to a route outside them is refused with `403`. Omitted means the key may call every endpoint, and an empty list that it may call none. A family name this gateway version does not recognize reads back as `unknown` and grants nothing.",
+            "example": [
+              "chat_completions",
+              "models"
+            ]
+          },
           "expires_at": {
             "type": [
               "string",

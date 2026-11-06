@@ -165,7 +165,15 @@ async fn resolve_caller(
                 state, token, server, &source_ip,
             )
             .await
-            {
+            // The session's key keeps its endpoint allow-list: this path
+            // does not pass through the extractor that checks it elsewhere.
+            .and_then(|auth| {
+                crate::endpoint_acl::check_endpoint(
+                    auth.key(),
+                    aisix_core::models::EndpointFamily::Mcp,
+                )?;
+                Ok(auth)
+            }) {
                 Ok(auth) => {
                     auth.publish(parts);
                     if let Some(jwt) = &auth.jwt {
@@ -2581,6 +2589,84 @@ mod tests {
                 40000,
             )));
         request
+    }
+
+    /// The key `ak-1` (`TOKEN`), limited to `endpoints`.
+    fn key_limited_to(endpoints: serde_json::Value) -> ApiKey {
+        serde_json::from_value(serde_json::json!({
+            "key_hash": ApiKey::hash_bearer(TOKEN),
+            "allowed_models": ["*"],
+            "allowed_endpoints": endpoints,
+        }))
+        .expect("valid apikey")
+    }
+
+    /// A key whose `allowed_endpoints` leaves out `mcp` is refused on both
+    /// MCP entries; one that lists it is served.
+    #[tokio::test]
+    async fn a_key_whose_endpoints_leave_out_mcp_is_refused_on_mcp() {
+        for (endpoints, want) in [
+            (serde_json::json!(["mcp"]), StatusCode::OK),
+            (
+                serde_json::json!(["chat_completions"]),
+                StatusCode::FORBIDDEN,
+            ),
+            (serde_json::json!([]), StatusCode::FORBIDDEN),
+        ] {
+            let snapshot = AisixSnapshot::new();
+            snapshot.apikeys.insert(ResourceEntry::new(
+                "ak-1",
+                key_limited_to(endpoints.clone()),
+                1,
+            ));
+            insert_mcp_server(&snapshot, "mcp-docs", "docs", true);
+            let router = router_with(snapshot);
+            for request in [
+                initialize_request(Some(TOKEN)),
+                scoped_request("docs", Some(TOKEN), "initialize", serde_json::json!({})),
+            ] {
+                let path = request.uri().path().to_owned();
+                let response = router
+                    .clone()
+                    .oneshot(request)
+                    .await
+                    .expect("router responds");
+                assert_eq!(response.status(), want, "{endpoints} on {path}");
+                if want == StatusCode::FORBIDDEN {
+                    let body = body_json(response).await;
+                    assert_eq!(body["error"]["type"], "permission_denied", "{body}");
+                }
+            }
+        }
+    }
+
+    /// An anonymous principal whose `allowed_endpoints` leaves out `mcp`
+    /// closes the anonymous entry, answering as an entry with no anonymous
+    /// access does rather than with a 403 a prober could read.
+    #[tokio::test]
+    async fn an_anonymous_principal_whose_endpoints_leave_out_mcp_closes_the_entry() {
+        for (endpoints, want) in [
+            (serde_json::json!(["mcp"]), StatusCode::OK),
+            (
+                serde_json::json!(["chat_completions"]),
+                StatusCode::UNAUTHORIZED,
+            ),
+        ] {
+            let snapshot = snapshot_with_anonymous(serde_json::json!({ "servers": ["docs"] }));
+            snapshot.apikeys.insert(ResourceEntry::new(
+                "ak-1",
+                key_limited_to(endpoints.clone()),
+                2,
+            ));
+            let response = router_with(snapshot)
+                .oneshot(from_ip(
+                    scoped_request("docs", None, "initialize", serde_json::json!({})),
+                    "10.1.2.3",
+                ))
+                .await
+                .expect("router responds");
+            assert_eq!(response.status(), want, "{endpoints}");
+        }
     }
 
     #[tokio::test]
