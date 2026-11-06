@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   EtcdClient,
@@ -138,6 +139,16 @@ async function post(
 }
 
 /**
+ * A JSON body with its top-level `created` left out: a chat hit stamps the
+ * current second there, so a replay of the same answer can carry a later one.
+ */
+function withoutCreated(text: string): unknown {
+  const body = JSON.parse(text) as Record<string, unknown>;
+  delete body.created;
+  return body;
+}
+
+/**
  * Seed every model and the team-scoped policy, then the caller keys last, and
  * wait until the last key authenticates: that implies every row is in the
  * gateway's snapshot.
@@ -266,7 +277,7 @@ describe("cache team scope e2e", () => {
             `(upstream calls +${afterTeammate - before}, want 1; ` +
             `x-aisix-cache=${teammate.cache}, want hit)`,
         );
-      } else if (teammate.text !== first.text) {
+      } else if (!isDeepStrictEqual(withoutCreated(teammate.text), withoutCreated(first.text))) {
         failures.push(`${endpoint}: the teammate's hit differs from the original answer`);
       }
 
