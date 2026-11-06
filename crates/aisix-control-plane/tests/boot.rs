@@ -222,6 +222,7 @@ fn config_defaults_and_the_derived_gateway_url() {
     // An explicit gateway URL wins; its etcd endpoint takes 443 when it names
     // no port.
     let mut vars = required(&key);
+    vars.push(("CP_DP_HOSTS", "cp.example.com, dp.example.com"));
     vars.push(("CP_DP_BASE_URL", "https://dp.example.com"));
     let cfg = CpConfig::from_vars(&vars).expect("a valid configuration");
     assert_eq!(cfg.dp_base_url, "https://dp.example.com");
@@ -244,6 +245,51 @@ fn config_defaults_and_the_derived_gateway_url() {
     }
 }
 
+/// The gateway listener's certificate names only `CP_DP_HOSTS`, so a gateway
+/// URL on any other host would fail every gateway's TLS check.
+#[test]
+fn the_gateway_url_must_name_a_host_the_server_certificate_names() {
+    let key = key_file();
+    let with = |hosts: &str, url: &str| {
+        let mut vars = required(&key);
+        vars.extend([("CP_DP_HOSTS", hosts), ("CP_DP_BASE_URL", url)]);
+        CpConfig::from_vars(&vars).map(|cfg| cfg.dp_base_url)
+    };
+    // Named in any case, with or without a port, a path or userinfo.
+    for (hosts, url) in [
+        (
+            "cp.example.com, gw.example.com",
+            "https://GW.Example.COM:8443/base",
+        ),
+        ("cp.example.com", "https://ops:pw-7c1@cp.example.com"),
+        ("cp.example.com, ::1", "https://[::1]:7943"),
+        ("127.0.0.1", "https://127.0.0.1:7943"),
+    ] {
+        let used = with(hosts, url).unwrap_or_else(|e| panic!("{hosts} / {url}: {e}"));
+        assert_eq!(used, url, "the URL is used as configured");
+    }
+    for (hosts, url) in [
+        ("cp.example.com", "https://gw.example.com"),
+        ("cp.example.com", "https://cp.example.com.evil.test"),
+        ("cp.example.com", "https://cp.example.com@evil.test"),
+        ("cp.example.com", "https://127.0.0.1:7943"),
+        ("::1", "https://[::2]:7943"),
+    ] {
+        let err = match with(hosts, url) {
+            Ok(_) => panic!("{url} was accepted with CP_DP_HOSTS={hosts}"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("CP_DP_BASE_URL") && err.contains("CP_DP_HOSTS"),
+            "{url}: {err}"
+        );
+        assert!(
+            !err.contains("evil.test") && !err.contains("gw.example"),
+            "{err}"
+        );
+    }
+}
+
 #[test]
 fn each_config_error_names_its_variable_and_not_its_value() {
     let key = key_file();
@@ -258,6 +304,7 @@ fn each_config_error_names_its_variable_and_not_its_value() {
         ("CP_DP_ADDR", "not-an-address"),
         ("CP_DP_BASE_URL", "http://plaintext.example.com"),
         ("CP_DP_BASE_URL", "not a url"),
+        ("CP_DP_BASE_URL", "https://other.example.com"),
         ("CP_ETCD_PREFIX", "no-leading-slash"),
         ("CP_ETCD_PREFIX", "/"),
         ("CP_ENV_ID", "not-a-uuid"),

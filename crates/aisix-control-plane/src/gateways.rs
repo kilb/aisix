@@ -47,10 +47,13 @@ const MAX_NAME_CHARS: usize = 128;
 
 const TARGET_KIND: &str = "gateway_credential";
 
-/// Shown with every bundle.
+/// Shown with every bundle. Replicas started from one bundle share its
+/// `dp_id`, but each writes its own copy of the bundle and its own snapshot
+/// cache, so each needs a volume of its own.
 const BUNDLE_NOTE: &str = "私钥只在此处返回一次，控制面不保存，请立即妥善保管。\
     网关会把证书和最近一次的配置快照（含上游凭据明文）写入 /var/lib/aisix，\
-    请为该目录挂载持久卷，并只允许网关进程读取。";
+    请为该目录挂载持久卷，并只允许网关进程读取。\
+    多个网关副本可以共用同一份凭据，但每个网关实例都需要挂载自己独立的卷，不要在实例之间共享。";
 
 /// `GatewayCredential` in the API.
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
@@ -76,6 +79,10 @@ fn etcd_endpoint(cfg: &CpConfig) -> Result<String, ApiError> {
 /// `GET /admin/environment`: what every gateway of this deployment is
 /// given. `dp_base_url` is shown reduced to its origin, as every configured
 /// URL is; the bundle carries it as configured.
+///
+/// So this view is for display only: anything a gateway is started with,
+/// such as a deployment snippet, is built from a bundle's `env`, never from
+/// these values. A path or userinfo on `CP_DP_BASE_URL` is not here.
 pub async fn environment(
     auth: OperatorAuth,
     State(state): State<AppState>,
