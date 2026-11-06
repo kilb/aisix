@@ -247,6 +247,12 @@ impl TestCp {
         Self::start_with(|cfg| cfg.kine_endpoint = endpoint).await
     }
 
+    /// [`TestCp::start`], with the control plane reporting `cp_version`
+    /// (`1.9.0+sha-…`, `dev`) as a stamped build would.
+    pub async fn start_stamped(cp_version: &str) -> Option<TestCp> {
+        Self::start_with(|cfg| cfg.cp_version = cp_version.to_string()).await
+    }
+
     /// [`TestCp::start_with`], with the `seed` statements run on the fresh
     /// database before the control plane first boots on it.
     pub async fn start_seeded(

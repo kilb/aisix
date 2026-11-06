@@ -235,6 +235,14 @@ pub enum BootError {
     DpTls(#[from] crate::dp::listener::TlsSetupError),
     #[error("CP_KINE_ENDPOINT cannot be dialled: {0}")]
     KineEndpoint(tonic::transport::Error),
+    /// The build's version stamp reads as neither a release nor an
+    /// unstamped build, so the gateway-version gate could judge nothing.
+    #[error(
+        "this build's version stamp {0:?} is neither a release (X.Y.Z, optionally with a \
+         pre-release) nor an unstamped build (dev): the gateway-version gate cannot judge \
+         gateways by it"
+    )]
+    UnreadableVersion(String),
 }
 
 #[cfg(test)]

@@ -10,9 +10,11 @@ use super::normalize::normalize;
 use super::store::{self, ResourceRow};
 use super::validate::validate_strict;
 use super::{managed_resource, refs, secrets, Kind};
+use crate::compat;
 use crate::crypto::MasterKey;
 use crate::db::DbError;
 use crate::error::{ApiError, Detail};
+use crate::gateways::stale_window_secs;
 use crate::settings::EnvSettings;
 use crate::AppState;
 
@@ -31,6 +33,13 @@ const MAX_DOC_BYTES: usize = 1 << 20;
 pub struct WriteCtx {
     pub mk: MasterKey,
     pub env: EnvSettings,
+    /// The version this control plane reports (`CpConfig::cp_version`),
+    /// which the gateway-version gate judges [`compat::Since::ThisRelease`]
+    /// by.
+    pub cp_version: String,
+    /// `CP_INSTANCE_STALE_SECS` as applied: a gateway heard from within it
+    /// is online.
+    pub stale_secs: f64,
 }
 
 impl WriteCtx {
@@ -38,6 +47,8 @@ impl WriteCtx {
         WriteCtx {
             mk: MasterKey(state.cfg.master_key.0),
             env: state.env.clone(),
+            cp_version: state.cfg.cp_version.clone(),
+            stale_secs: stale_window_secs(&state.cfg),
         }
     }
 }
@@ -67,7 +78,8 @@ pub enum WriteOp<'a> {
 /// (aliases first, so a redacted credential under its former name is
 /// restored under the canonical one); restoring redacted credentials; the
 /// size check again, on the document as it will be projected; the
-/// gateway's strict validation; the reference check; sealing; the store. A
+/// gateway's strict validation; the reference check; the gateway-version
+/// gate ([`compat::gate`], `422 gateway_too_old`); sealing; the store. A
 /// delete is refused while a live document references the row (`409
 /// in_use`), except the referrers [`non_holding_referrers`] names.
 pub async fn write_resource(
@@ -231,7 +243,7 @@ async fn prepare(
     refuse_reserved_name(w, &doc)?;
     refuse_self_reference(w, &doc)?;
     refs::check_outgoing(conn, w.kind, &doc).await?;
-    // Task 9: the save-time gateway-version gate runs here.
+    compat::gate(conn, ctx, w.kind, &doc, stored).await?;
     secrets::seal(&ctx.mk, w.kind, w.id, &mut doc);
     Ok(doc)
 }

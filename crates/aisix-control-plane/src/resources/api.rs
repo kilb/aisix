@@ -24,8 +24,9 @@ use crate::audit::{self, Actor, AuditEntry};
 use crate::auth::{OperatorAuth, OperatorRole};
 use crate::db::DbError;
 use crate::error::{ApiError, Detail};
+use crate::gateways::stale_window_secs;
 use crate::http::ApiJson;
-use crate::rollout::ResourceRollout;
+use crate::rollout::{Fleet, ResourceRollout, RolloutInput};
 use crate::{tenants, AppState};
 
 /// `ResourceView`: a stored document as the API shows it.
@@ -42,8 +43,9 @@ pub struct ResourceView {
 }
 
 impl ResourceView {
-    fn of(row: ResourceRow) -> ResourceView {
-        let rollout = ResourceRollout::of_row(&row);
+    /// `row` as shown, with its rollout over `fleet`.
+    fn of(row: ResourceRow, fleet: &Fleet) -> ResourceView {
+        let rollout = fleet.rollout(&RolloutInput::of_row(&row));
         let mut doc = row.doc;
         secrets::redact(row.kind, &mut doc);
         ResourceView {
@@ -137,10 +139,11 @@ pub async fn list(
     auth.require(OperatorRole::Viewer)?;
     let kind = kind_of(&kind)?;
     let mut conn = state.db.pool().acquire().await.map_err(DbError::from)?;
+    let fleet = Fleet::load(&mut conn, &state.env, stale_window_secs(&state.cfg)).await?;
     let items: Vec<ResourceView> = store::list(&mut conn, kind)
         .await?
         .into_iter()
-        .map(ResourceView::of)
+        .map(|row| ResourceView::of(row, &fleet))
         .collect();
     Ok(Json(json!({ "items": items })))
 }
@@ -160,7 +163,8 @@ pub async fn get(
         .filter(|row| !row.deleted)
         .ok_or_else(ApiError::not_found)?;
     let etag = format!("\"{}\"", row.version);
-    Ok(([(header::ETAG, etag)], Json(ResourceView::of(row))).into_response())
+    let fleet = Fleet::load(&mut conn, &state.env, stale_window_secs(&state.cfg)).await?;
+    Ok(([(header::ETAG, etag)], Json(ResourceView::of(row, &fleet))).into_response())
 }
 
 /// `POST /admin/resources/{kind}` with `{doc}` → `201 ResourceView`. A
@@ -180,7 +184,7 @@ pub async fn create(
         Uuid::new_v4()
     };
     let ctx = WriteCtx::of(&state);
-    let row = state
+    let (row, fleet) = state
         .db
         .tx(move |conn| {
             async move {
@@ -204,12 +208,14 @@ pub async fn create(
                     },
                 )
                 .await?;
-                Ok::<_, ApiError>(row)
+                // Read in the transaction, so a write that commits is answered.
+                let fleet = Fleet::load(&mut *conn, &ctx.env, ctx.stale_secs).await?;
+                Ok::<_, ApiError>((row, fleet))
             }
             .boxed()
         })
         .await?;
-    Ok((StatusCode::CREATED, Json(ResourceView::of(row))))
+    Ok((StatusCode::CREATED, Json(ResourceView::of(row, &fleet))))
 }
 
 /// `PUT /admin/resources/{kind}/{id}` with `{doc}` and `If-Match` →
@@ -227,7 +233,7 @@ pub async fn replace(
     let id = row_id(&id)?;
     let expected = if_match(&headers)?;
     let ctx = WriteCtx::of(&state);
-    let row = state
+    let (row, fleet) = state
         .db
         .tx(move |conn| {
             async move {
@@ -254,12 +260,14 @@ pub async fn replace(
                     },
                 )
                 .await?;
-                Ok::<_, ApiError>(row)
+                // Read in the transaction, so a write that commits is answered.
+                let fleet = Fleet::load(&mut *conn, &ctx.env, ctx.stale_secs).await?;
+                Ok::<_, ApiError>((row, fleet))
             }
             .boxed()
         })
         .await?;
-    Ok(Json(ResourceView::of(row)))
+    Ok(Json(ResourceView::of(row, &fleet)))
 }
 
 /// `DELETE /admin/resources/{kind}/{id}` with `If-Match` → `200
@@ -280,7 +288,7 @@ pub async fn delete(
     let id = row_id(&id)?;
     let expected = if_match(&headers)?;
     let ctx = WriteCtx::of(&state);
-    let row = state
+    let (row, fleet) = state
         .db
         .tx(move |conn| {
             async move {
@@ -307,10 +315,12 @@ pub async fn delete(
                     },
                 )
                 .await?;
-                Ok::<_, ApiError>(row)
+                // Read in the transaction, so a write that commits is answered.
+                let fleet = Fleet::load(&mut *conn, &ctx.env, ctx.stale_secs).await?;
+                Ok::<_, ApiError>((row, fleet))
             }
             .boxed()
         })
         .await?;
-    Ok(Json(ResourceView::of(row)))
+    Ok(Json(ResourceView::of(row, &fleet)))
 }

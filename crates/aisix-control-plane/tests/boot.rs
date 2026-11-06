@@ -142,6 +142,23 @@ fn key_file() -> TempFile {
     TempFile::with_contents("a7".repeat(32).as_bytes())
 }
 
+#[tokio::test]
+async fn a_version_stamp_that_cannot_be_read_refuses_to_boot() {
+    // Refused before anything is opened: no database is needed.
+    let key = key_file();
+    for stamp in ["1.9", "v1.9.0", "garbled-7c1", ""] {
+        let mut cfg = CpConfig::from_vars(&required(&key)).expect("a valid configuration");
+        cfg.cp_version = stamp.to_string();
+        let Err(err) = aisix_control_plane::start(cfg, std::future::pending()).await else {
+            panic!("booted with the stamp {stamp:?}");
+        };
+        assert!(
+            matches!(err, BootError::UnreadableVersion(_)),
+            "{stamp:?}: {err}"
+        );
+    }
+}
+
 #[test]
 fn config_errors_and_debug_never_show_secrets() {
     let err = CpConfig::from_vars(&[

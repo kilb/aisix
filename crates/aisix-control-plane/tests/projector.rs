@@ -51,6 +51,8 @@ fn ctx(env: &EnvSettings) -> WriteCtx {
     WriteCtx {
         mk: MasterKey(TEST_MASTER_KEY),
         env: env.clone(),
+        cp_version: aisix_core::HEARTBEAT_VERSION.to_string(),
+        stale_secs: 60.0,
     }
 }
 

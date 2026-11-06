@@ -14,6 +14,7 @@ use tokio::task::JoinHandle;
 
 pub mod audit;
 pub mod auth;
+pub mod compat;
 pub mod config;
 pub mod crypto;
 pub mod db;
@@ -135,7 +136,8 @@ impl Drop for Running {
 /// Boots the control plane: opens and migrates the database, pins the
 /// environment, loads the CA and the gateway credentials, and starts the
 /// browser listener, the gateway listener, housekeeping and the projector,
-/// which stop gracefully once `shutdown` resolves.
+/// which stop gracefully once `shutdown` resolves. A version stamp the
+/// gateway-version gate cannot read refuses the boot first.
 pub async fn start<S>(cfg: CpConfig, shutdown: S) -> Result<Running, BootError>
 where
     S: Future<Output = ()> + Send + 'static,
@@ -146,6 +148,10 @@ where
     // the workspace's features also enables aws-lc-rs, and rustls then
     // refuses to pick a default. Already installed is fine.
     let _ = rustls::crypto::ring::default_provider().install_default();
+    // A stamp the gate cannot read would leave it judging nothing, unseen.
+    if compat::GatewayVersion::parse(&cfg.cp_version) == compat::GatewayVersion::Unrecognized {
+        return Err(BootError::UnreadableVersion(cfg.cp_version));
+    }
     let db = Db::connect(
         &cfg.database_url,
         cfg.db_lock_timeout_ms,
@@ -159,6 +165,8 @@ where
     let write_ctx = resources::write::WriteCtx {
         mk: crypto::MasterKey(cfg.master_key.0),
         env: env.clone(),
+        cp_version: cfg.cp_version.clone(),
+        stale_secs: gateways::stale_window_secs(&cfg),
     };
     tenants::ensure_internal_tenant(&db, &write_ctx).await?;
     let passwords = PasswordGate::new(ARGON2_GATE_PERMITS)?;
