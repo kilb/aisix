@@ -21,6 +21,7 @@ members = [
     "crates/aisix-redis",
     "crates/aisix-guardrails",
     "crates/aisix-server",
+    "crates/aisix-pricing",
 ]
 # Build-time tool for the PGO release pipeline (#967): own manifest + lockfile,
 # never part of the product build graph.
