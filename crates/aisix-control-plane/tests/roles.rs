@@ -1,0 +1,95 @@
+//! The role matrix: every route in `ROUTE_ROLES` that needs an operator
+//! refuses an unauthenticated request with 401 and the role just below its
+//! minimum with 403, and lets its minimum role through.
+//!
+//! Each route needs a fixture here: a request that its minimum role may
+//! send. A route added without one fails this test, which is the point.
+
+mod support;
+
+use std::collections::HashMap;
+
+use aisix_control_plane::auth::OperatorRole;
+use aisix_control_plane::http::{MinRole, ROUTE_ROLES};
+use serde_json::{json, Value};
+use support::{SeededOperator, TestCp, TEST_PASSWORD};
+use uuid::Uuid;
+
+/// The request `method path` is tested with: the concrete path and the body.
+fn fixture(method: &str, path: &str, target: &SeededOperator) -> (String, Option<Value>) {
+    match (method, path) {
+        // Rejected as too short, after the role check.
+        ("POST", "/admin/password") => (
+            path.to_string(),
+            Some(json!({"current_password": TEST_PASSWORD, "new_password": "short"})),
+        ),
+        ("GET", "/admin/operators") | ("GET", "/admin/audit") => (path.to_string(), None),
+        ("POST", "/admin/operators") => (
+            path.to_string(),
+            Some(json!({
+                "email": format!("roles-{}@ops.test", Uuid::new_v4().simple()),
+                "role": "viewer",
+                "password": "roles-password-long",
+            })),
+        ),
+        ("PATCH", "/admin/operators/{id}") => (
+            format!("/admin/operators/{}", target.id),
+            Some(json!({"display_name": "roles-target"})),
+        ),
+        _ => panic!("no fixture for {method} {path}: add one to tests/roles.rs"),
+    }
+}
+
+fn below(role: OperatorRole) -> Option<OperatorRole> {
+    match role {
+        OperatorRole::Viewer => None,
+        OperatorRole::Operator => Some(OperatorRole::Viewer),
+        OperatorRole::Admin => Some(OperatorRole::Operator),
+    }
+}
+
+#[tokio::test]
+async fn every_operator_route_refuses_the_role_below_its_minimum() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let target = cp.seed_operator(OperatorRole::Viewer).await;
+    let mut sessions = HashMap::new();
+    for role in [
+        OperatorRole::Viewer,
+        OperatorRole::Operator,
+        OperatorRole::Admin,
+    ] {
+        sessions.insert(role, cp.admin_login_seeded(role).await);
+    }
+
+    let mut checked = 0;
+    for (method, path, min) in ROUTE_ROLES {
+        let MinRole::Op(min) = *min else {
+            continue;
+        };
+        let (uri, body) = fixture(method, path, &target);
+        let r = cp.send(method, &uri, None, body.clone()).await;
+        assert_eq!(r.status, 401, "{method} {path} without a session: {r:?}");
+        assert_eq!(r.body["code"], "unauthenticated", "{method} {path}");
+
+        if let Some(below) = below(min) {
+            let r = cp
+                .send(method, &uri, Some(sessions[&below].cookie()), body.clone())
+                .await;
+            assert_eq!(r.status, 403, "{method} {path} as {below:?}: {r:?}");
+            assert_eq!(r.body["code"], "forbidden", "{method} {path}");
+        }
+
+        // Last, since it may change something.
+        let r = cp
+            .send(method, &uri, Some(sessions[&min].cookie()), body)
+            .await;
+        assert!(
+            r.status != 401 && r.status != 403,
+            "{method} {path} as its minimum {min:?}: {r:?}"
+        );
+        checked += 1;
+    }
+    assert!(checked >= 5, "only {checked} operator routes were checked");
+}

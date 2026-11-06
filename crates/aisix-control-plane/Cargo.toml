@@ -28,6 +28,13 @@ futures = "0.3"
 ring = "0.17"
 hex = "0.4"
 base64 = "0.22"
+# Operator and member passwords, as in crates/aisix-portal and
+# crates/aisix-console; rand_core 0.6 is the version argon2 0.5 uses, and
+# also mints session tokens.
+argon2 = "0.5.3"
+rand_core = { version = "0.6", features = ["getrandom"] }
+# Session tokens are stored as their SHA-256.
+sha2 = "0.10"
 
 [dev-dependencies]
 # Tests start a real listener and send real HTTP, as the portal's and the

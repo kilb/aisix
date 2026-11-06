@@ -14,17 +14,27 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use aisix_control_plane::auth::password;
+use aisix_control_plane::auth::OperatorRole;
 use aisix_control_plane::config::CpConfig;
 use aisix_control_plane::crypto::MasterKey;
 use aisix_control_plane::db::Db;
 use aisix_control_plane::settings::EnvSettings;
-use aisix_control_plane::Running;
+use aisix_control_plane::{AppState, Running};
+use serde_json::Value;
 use sqlx::{Connection, PgConnection};
 use tokio::sync::OnceCell;
 use uuid::Uuid;
 
 /// The master key every test control plane runs with.
 pub const TEST_MASTER_KEY: [u8; 32] = [0x5a; 32];
+
+/// The password of every operator the harness seeds.
+pub const TEST_PASSWORD: &str = "seeded-password-4b7e";
+
+/// The argon2 hash of [`TEST_PASSWORD`], computed once per process: hashing
+/// is slow in a debug build, and every seeded operator can share one.
+static TEST_PASSWORD_HASH: OnceCell<String> = OnceCell::const_new();
 
 /// Serialises template creation across test processes sharing one server.
 const TEMPLATE_LOCK_KEY: i64 = 0x6169_7369_7863_7074;
@@ -252,6 +262,160 @@ impl TestCp {
     pub fn url(&self, path: &str) -> String {
         format!("http://{}{path}", self.running.http_addr)
     }
+
+    pub fn state(&self) -> &AppState {
+        &self.running.state
+    }
+
+    /// How many argon2 verifications this instance has run.
+    pub fn verification_count(&self) -> u64 {
+        self.running.state.passwords.verification_count()
+    }
+
+    /// Inserts an operator whose password is [`TEST_PASSWORD`].
+    pub async fn seed_operator_as(&self, email: &str, role: OperatorRole, disabled: bool) -> Uuid {
+        let hash = TEST_PASSWORD_HASH
+            .get_or_init(|| async {
+                tokio::task::spawn_blocking(|| password::hash(TEST_PASSWORD))
+                    .await
+                    .expect("join the hashing task")
+                    .expect("hash the test password")
+            })
+            .await;
+        let id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO operators (id, email, password_hash, role, disabled) \
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(id)
+        .bind(email)
+        .bind(hash)
+        .bind(role.as_str())
+        .bind(disabled)
+        .execute(self.db().pool())
+        .await
+        .expect("seed an operator");
+        id
+    }
+
+    /// An enabled operator with a fresh email and [`TEST_PASSWORD`].
+    pub async fn seed_operator(&self, role: OperatorRole) -> SeededOperator {
+        let email = format!("{}-{}@ops.test", role.as_str(), Uuid::new_v4().simple());
+        let id = self.seed_operator_as(&email, role, false).await;
+        SeededOperator { id, email, role }
+    }
+
+    /// `POST /admin/login`.
+    pub async fn admin_login(&self, email: &str, password: &str) -> Resp {
+        self.send(
+            "POST",
+            "/admin/login",
+            None,
+            Some(serde_json::json!({ "email": email, "password": password })),
+        )
+        .await
+    }
+
+    /// Logs in as `op`, which must succeed.
+    pub async fn admin_login_as(&self, op: &SeededOperator) -> OperatorSession {
+        let r = self.admin_login(&op.email, TEST_PASSWORD).await;
+        assert_eq!(r.status, 200, "log in as {}: {r:?}", op.email);
+        let cookie = r
+            .set_cookie
+            .as_deref()
+            .and_then(|c| c.split(';').next())
+            .expect("a session cookie")
+            .to_string();
+        OperatorSession {
+            id: op.id,
+            email: op.email.clone(),
+            role: op.role,
+            cookie,
+        }
+    }
+
+    /// Seeds an operator with `role` and logs in as it.
+    pub async fn admin_login_seeded(&self, role: OperatorRole) -> OperatorSession {
+        let op = self.seed_operator(role).await;
+        self.admin_login_as(&op).await
+    }
+
+    pub async fn get_with_cookie(&self, path: &str, cookie: &str) -> Resp {
+        self.send("GET", path, Some(cookie), None).await
+    }
+
+    /// Sends `method path` with `cookie` (the `Cookie` header's value) and a
+    /// JSON `body`.
+    pub async fn send(
+        &self,
+        method: &str,
+        path: &str,
+        cookie: Option<&str>,
+        body: Option<Value>,
+    ) -> Resp {
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("an HTTP client");
+        let method = reqwest::Method::from_bytes(method.as_bytes()).expect("an HTTP method");
+        let mut request = client.request(method, self.url(path));
+        if let Some(cookie) = cookie {
+            request = request.header(reqwest::header::COOKIE, cookie);
+        }
+        if let Some(body) = body {
+            request = request.json(&body);
+        }
+        let response = request.send().await.expect("send the request");
+        let status = response.status().as_u16();
+        let set_cookie = response
+            .headers()
+            .get(reqwest::header::SET_COOKIE)
+            .map(|v| v.to_str().expect("an ASCII Set-Cookie").to_string());
+        let text = response.text().await.expect("read the body");
+        let body = if text.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_str(&text).unwrap_or(Value::String(text))
+        };
+        Resp {
+            status,
+            body,
+            set_cookie,
+        }
+    }
+}
+
+/// An operator the harness inserted.
+#[derive(Debug, Clone)]
+pub struct SeededOperator {
+    pub id: Uuid,
+    pub email: String,
+    pub role: OperatorRole,
+}
+
+/// A logged-in operator.
+#[derive(Debug, Clone)]
+pub struct OperatorSession {
+    pub id: Uuid,
+    pub email: String,
+    pub role: OperatorRole,
+    cookie: String,
+}
+
+impl OperatorSession {
+    /// `aisix_cp_admin=<token>`, for a `Cookie` header.
+    pub fn cookie(&self) -> &str {
+        &self.cookie
+    }
+}
+
+/// An answer: the status, the body (JSON, or the text when it is not JSON,
+/// or null when empty), and the `Set-Cookie` header.
+#[derive(Debug)]
+pub struct Resp {
+    pub status: u16,
+    pub body: Value,
+    pub set_cookie: Option<String>,
 }
 
 /// A file in the system temp directory, removed on drop.

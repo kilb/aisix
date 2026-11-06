@@ -11,13 +11,17 @@ use std::sync::Arc;
 
 use tokio::task::JoinHandle;
 
+pub mod audit;
+pub mod auth;
 pub mod config;
 pub mod crypto;
 pub mod db;
 pub mod error;
 pub mod http;
+pub mod operators;
 pub mod settings;
 
+use auth::password::{LoginThrottle, PasswordGate, ARGON2_GATE_PERMITS};
 use config::CpConfig;
 use db::Db;
 use error::BootError;
@@ -29,6 +33,10 @@ pub struct AppState {
     pub db: Db,
     pub env: EnvSettings,
     pub cfg: Arc<CpConfig>,
+    /// The one gate in front of every argon2 run.
+    pub passwords: PasswordGate,
+    /// The login cooldown for operator emails.
+    pub operator_logins: LoginThrottle,
 }
 
 /// A booted control plane. Dropping it stops its listener.
@@ -77,6 +85,7 @@ where
     )
     .await?;
     let env = settings::ensure_env(&db, cfg.env_id_seed, &cfg.etcd_prefix).await?;
+    let passwords = PasswordGate::new(ARGON2_GATE_PERMITS)?;
     let listener = tokio::net::TcpListener::bind(cfg.http_addr)
         .await
         .map_err(BootError::Listen)?;
@@ -85,6 +94,8 @@ where
         db,
         env,
         cfg: Arc::new(cfg),
+        passwords,
+        operator_logins: LoginThrottle::default(),
     };
     let router = http::browser_router(state.clone());
     let serve = tokio::spawn(async move {

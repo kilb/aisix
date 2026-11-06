@@ -204,6 +204,8 @@ pub enum BootError {
     PrefixChanged { stored: String, configured: String },
     #[error("database (CP_DATABASE_URL): {0}")]
     Db(#[from] DbError),
+    #[error("cannot prepare password checks: {0}")]
+    Password(#[from] crate::auth::password::PasswordError),
     #[error("cannot listen on CP_HTTP_ADDR: {0}")]
     Listen(std::io::Error),
     #[error("the browser listener (CP_HTTP_ADDR) stopped: {0}")]

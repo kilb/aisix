@@ -1,0 +1,76 @@
+//! Request extractors that resolve the session cookie into an identity.
+//!
+//! The identity is checked per request against the database: a session
+//! issued before its account was disabled stops working at once, and any
+//! instance honours a session another one issued.
+
+use axum::extract::FromRequestParts;
+use axum::http::request::Parts;
+use axum::http::HeaderMap;
+use uuid::Uuid;
+
+use super::session::{self, PrincipalKind, ADMIN_COOKIE};
+use super::OperatorRole;
+use crate::db::DbError;
+use crate::error::ApiError;
+use crate::AppState;
+
+/// The operator a request comes from, read from the `aisix_cp_admin` cookie
+/// only. Extracting it answers `401 unauthenticated` without a live session
+/// of an enabled operator; the handler then calls [`OperatorAuth::require`]
+/// with the role its `http::ROUTE_ROLES` row names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperatorAuth {
+    pub id: Uuid,
+    pub email: String,
+    pub role: OperatorRole,
+}
+
+impl OperatorAuth {
+    /// `403 forbidden` unless this operator's role is at least `min`.
+    pub fn require(&self, min: OperatorRole) -> Result<(), ApiError> {
+        if self.role >= min {
+            Ok(())
+        } else {
+            Err(ApiError::forbidden())
+        }
+    }
+
+    /// The operator of the request's session, or `None` when it carries no
+    /// live session of an enabled operator.
+    pub async fn from_session(
+        headers: &HeaderMap,
+        state: &AppState,
+    ) -> Result<Option<OperatorAuth>, ApiError> {
+        let Some(token) = session::token_from_headers(headers, ADMIN_COOKIE) else {
+            return Ok(None);
+        };
+        let Some(id) = session::resolve(&state.db, token, PrincipalKind::Operator).await? else {
+            return Ok(None);
+        };
+        let row: Option<(String, String)> =
+            sqlx::query_as("SELECT email, role FROM operators WHERE id = $1 AND NOT disabled")
+                .bind(id)
+                .fetch_optional(state.db.pool())
+                .await
+                .map_err(DbError::from)?;
+        let Some((email, role)) = row else {
+            return Ok(None);
+        };
+        let role = role.parse().map_err(ApiError::internal)?;
+        Ok(Some(OperatorAuth { id, email, role }))
+    }
+}
+
+impl FromRequestParts<AppState> for OperatorAuth {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<OperatorAuth, ApiError> {
+        Self::from_session(&parts.headers, state)
+            .await?
+            .ok_or_else(ApiError::unauthenticated)
+    }
+}
