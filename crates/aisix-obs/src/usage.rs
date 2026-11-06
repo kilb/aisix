@@ -1131,12 +1131,12 @@ impl UsageEvent {
     /// an upstream total that equals `prompt + completion + reasoning` and
     /// not `prompt + completion`.
     pub fn reasoning_beside_completion(&self) -> bool {
-        let pc = u64::from(self.prompt_tokens) + u64::from(self.completion_tokens);
-        let total = u64::from(self.total_tokens);
-        total > 0
-            && self.reasoning_tokens > 0
-            && pc + u64::from(self.reasoning_tokens) == total
-            && pc != total
+        aisix_core::reasoning_beside_completion(
+            self.prompt_tokens,
+            self.completion_tokens,
+            self.reasoning_tokens,
+            self.total_tokens,
+        )
     }
 
     /// OTel GenAI `gen_ai.usage.output_tokens`, which includes reasoning.

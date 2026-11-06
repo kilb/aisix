@@ -161,6 +161,69 @@ impl InputTokens {
     }
 }
 
+/// USD to micro-USD, the integer unit of the spend counters
+/// (1 USD = 1_000_000).
+///
+/// Rounds rather than truncates: a single call is often around 1e-4 USD, and
+/// always truncating would make spend systematically low. `max(0.0)` catches a
+/// negative price and NaN (`f64::max` returns the other side when one side is
+/// NaN), and `as u64` is a saturating conversion in Rust, so it never wraps.
+pub fn spend_micro_usd(cost_usd: f64) -> u64 {
+    (cost_usd * 1_000_000.0).round().max(0.0) as u64
+}
+
+/// Split the canonical usage counters into the disjoint buckets pricing
+/// needs. The ONLY place that arithmetic lives.
+///
+/// The two upstream shapes disagree about what `prompt_tokens` contains, and
+/// `UsageStats` carries both vocabularies side by side:
+///
+/// - `cached_prompt_tokens` is OpenAI's, a SUBSET of `prompt_tokens`.
+/// - `cache_read_tokens` / `cache_creation_tokens` are Anthropic's, counters
+///   SEPARATE from `prompt_tokens`.
+///
+/// - `cache_write_subset` is `UsageStats::cache_write_tokens`, OpenAI's own
+///   write count, also a SUBSET of `prompt_tokens`.
+///
+/// So the fresh portion subtracts only the two subset ones. Getting this
+/// backwards is silent in both directions — double-charging the cached half on
+/// one provider, or pricing six thousand billed tokens at nothing on the other
+/// — and no request fails either way, which is why it is derived once here
+/// rather than at each of the ten call sites.
+pub fn input_tokens_for_pricing(
+    prompt_tokens: u64,
+    cached_prompt_tokens: u64,
+    cache_write_subset: u64,
+    cache_read_tokens: u64,
+    cache_creation_tokens: u64,
+) -> InputTokens {
+    InputTokens {
+        uncached: prompt_tokens
+            .saturating_sub(cached_prompt_tokens)
+            .saturating_sub(cache_write_subset),
+        cache_read: cached_prompt_tokens.saturating_add(cache_read_tokens),
+        cache_write: cache_creation_tokens.saturating_add(cache_write_subset),
+    }
+}
+
+/// Whether a usage record counts its reasoning BESIDE its completion rather
+/// than inside it — the control plane's additive-billing rule, stated once
+/// here so every exporter and the pricing engine read a record the way
+/// billing does: an upstream total that equals
+/// `prompt + completion + reasoning` and not `prompt + completion`.
+/// `upstream_total_tokens` is the upstream's own total, `0` when it reported
+/// none.
+pub fn reasoning_beside_completion(
+    prompt_tokens: u32,
+    completion_tokens: u32,
+    reasoning_tokens: u32,
+    upstream_total_tokens: u32,
+) -> bool {
+    let pc = u64::from(prompt_tokens) + u64::from(completion_tokens);
+    let total = u64::from(upstream_total_tokens);
+    total > 0 && reasoning_tokens > 0 && pc + u64::from(reasoning_tokens) == total && pc != total
+}
+
 impl ModelCost {
     /// Calculate USD cost, charging every input bucket at its own rate.
     pub fn calculate_with_cache(&self, input: InputTokens, output_tokens: u64) -> f64 {
@@ -840,7 +903,10 @@ impl Resource for Model {
 
 #[cfg(test)]
 mod tests {
-    use super::{InputTokens, ModelCost};
+    use super::{
+        input_tokens_for_pricing, reasoning_beside_completion, spend_micro_usd, InputTokens,
+        ModelCost,
+    };
 
     /// Rates chosen so each bucket is distinguishable in the total: mixing
     /// two of them up cannot produce the same number by coincidence.
@@ -901,7 +967,7 @@ mod tests {
     /// behaviour this replaced.
     ///
     /// Splitting a provider's usage into these buckets is a separate job and
-    /// lives in `aisix_proxy::usage_attr::input_tokens_for_pricing`, which is
+    /// lives in `input_tokens_for_pricing` in this file, which is
     /// where each upstream's vocabulary is interpreted; this type only prices
     /// buckets that are already disjoint.
     #[test]
@@ -978,6 +1044,112 @@ mod tests {
         );
         assert!(read_only < fresh_only, "cache read must be cheaper");
         assert!(write_only > fresh_only, "cache write must be dearer");
+    }
+
+    #[test]
+    fn pricing_buckets_follow_each_upstream_vocabulary() {
+        // OpenAI shape: cached is a subset.
+        let openai = input_tokens_for_pricing(1_000, 800, 0, 0, 0);
+        assert_eq!(
+            openai.uncached, 200,
+            "the subset vocabulary must subtract cached"
+        );
+        assert_eq!(openai.cache_read, 800);
+        assert_eq!(openai.cache_write, 0);
+        assert_eq!(
+            openai.total(),
+            1_000,
+            "the three buckets must still add up to the prompt total the upstream reported",
+        );
+
+        // Anthropic shape: the three counters are disjoint (values taken from
+        // the aisix-provider-anthropic streaming fixture).
+        let anthropic = input_tokens_for_pricing(37, 0, 0, 9, 4);
+        assert_eq!(
+            anthropic.uncached, 37,
+            "subtracting cache tokens under the disjoint vocabulary would make billed tokens free",
+        );
+        assert_eq!(anthropic.cache_read, 9);
+        assert_eq!(anthropic.cache_write, 4);
+        assert_eq!(anthropic.total(), 50, "37 + 9 + 4");
+    }
+
+    /// `cache_creation_tokens` has one source: Anthropic's
+    /// `cache_creation_input_tokens` (the OpenAI wire hard-sets it to 0), and
+    /// it is disjoint from `input_tokens`. So it must never be subtracted from
+    /// the prompt, which is what an early constructor did.
+    #[test]
+    fn cache_writes_are_never_subtracted_from_the_prompt() {
+        let got = input_tokens_for_pricing(1_000, 0, 0, 0, 300);
+        assert_eq!(
+            got.uncached, 1_000,
+            "cache_write was subtracted from the prompt, which is a different upstream vocabulary this repo has no source for",
+        );
+        assert_eq!(got.cache_write, 300);
+    }
+
+    /// An upstream has been seen reporting a cached count larger than its own
+    /// prompt total; the subtraction must saturate rather than wrap into an
+    /// astronomical bill.
+    #[test]
+    fn an_impossible_cached_count_cannot_wrap_the_fresh_bucket() {
+        let got = input_tokens_for_pricing(100, 999, 0, 0, 0);
+        assert_eq!(got.uncached, 0);
+        assert_eq!(got.cache_read, 999);
+    }
+
+    /// An OpenAI-shape cache write is a subset of `prompt_tokens`: it moves
+    /// from fresh input to the write bucket, otherwise a model with
+    /// `cache_write_per_1k` is charged the plain input rate, undercharging
+    /// exactly the part that field's documentation warns about. The three
+    /// buckets still add up to the prompt total the upstream reported.
+    #[test]
+    fn an_openai_shape_cache_write_is_priced_at_the_write_rate() {
+        let got = input_tokens_for_pricing(1_000, 100, 700, 0, 0);
+        assert_eq!(got.uncached, 200);
+        assert_eq!(got.cache_read, 100);
+        assert_eq!(got.cache_write, 700);
+        assert_eq!(got.total(), 1_000);
+
+        let cost = super::ModelCost {
+            input_per_1k: 10.0,
+            output_per_1k: 0.0,
+            cached_input_per_1k: Some(1.0),
+            cache_write_per_1k: Some(12.5),
+        };
+        // 200*10 + 100*1 + 700*12.5 = 10850, divided by 1000.
+        assert!((cost.calculate_with_cache(got, 0) - 10.85).abs() < 1e-9);
+    }
+
+    /// USD to micro-USD must round. A single call is often around 1e-4 USD
+    /// (here 0.00012345 USD = 123.45 micro-USD); truncating would under-record
+    /// every call by under 1 micro-USD, which is negligible alone and a
+    /// systematic shortfall over hundreds of thousands of calls.
+    #[test]
+    fn spend_rounds_rather_than_truncating() {
+        assert_eq!(spend_micro_usd(0.000_123_45), 123);
+        assert_eq!(spend_micro_usd(0.000_123_65), 124);
+        // A call smaller than 1 micro-USD records as 1, not 0.
+        assert_eq!(spend_micro_usd(0.000_000_6), 1);
+        assert_eq!(spend_micro_usd(0.0), 0);
+        // An unpriced model returns 0.0, contributing 0 to the spend bucket.
+        assert_eq!(spend_micro_usd(1.0), 1_000_000);
+    }
+
+    /// A negative price or NaN must never become a huge positive number in
+    /// the bucket.
+    #[test]
+    fn spend_clamps_negative_and_nan_to_zero() {
+        assert_eq!(spend_micro_usd(-1.0), 0);
+        assert_eq!(spend_micro_usd(f64::NAN), 0);
+    }
+
+    #[test]
+    fn reasoning_beside_completion_reads_the_additive_identity() {
+        assert!(reasoning_beside_completion(100, 20, 30, 150)); // Gemini: thoughts outside candidates
+        assert!(!reasoning_beside_completion(100, 50, 30, 150)); // OpenAI: reasoning inside completion
+        assert!(!reasoning_beside_completion(100, 20, 30, 0)); // no upstream total: never beside
+        assert!(!reasoning_beside_completion(100, 20, 0, 120)); // no reasoning
     }
 
     use super::*;

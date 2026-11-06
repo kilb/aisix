@@ -75,7 +75,8 @@ pub use mcp_server::{
     McpTransport,
 };
 pub use model::{
-    Adapter, BackgroundModelCheck, CooldownConfig, EffortAction, InputTokens, MappedEffort, Model,
+    input_tokens_for_pricing, reasoning_beside_completion, spend_micro_usd, Adapter,
+    BackgroundModelCheck, CooldownConfig, EffortAction, InputTokens, MappedEffort, Model,
     ModelCost, DEFAULT_COOLDOWN_TRIGGER_STATUSES,
 };
 pub use model_ref::resolve_model_ref;
