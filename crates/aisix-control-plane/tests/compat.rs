@@ -9,8 +9,13 @@
 mod support;
 
 use aisix_control_plane::auth::OperatorRole;
+use aisix_control_plane::error::ApiError;
+use aisix_control_plane::resources::write::{write_resource, ResourceWrite, WriteCtx, WriteOp};
+use aisix_control_plane::resources::Kind;
+use futures::FutureExt;
 use serde_json::{json, Value};
 use support::{DpClient, OperatorSession, Resp, TestCp};
+use uuid::Uuid;
 
 /// The release this control plane reports, as a stamped build would.
 const CP_VERSION: &str = "1.9.0+sha-cp7c1";
@@ -452,4 +457,81 @@ async fn evicting_a_current_gateway_or_one_gone_a_day_is_no_cap_hit() {
     assert_eq!(cap_hit_at(&cp, &gw).await, None);
     let r = create(&cp, &admin, "cache_policies", team_policy("team-7cb")).await;
     assert_eq!(r.status, 201, "{r:?}");
+}
+
+/// Writes the api key `id` straight through `write_resource`, as the code
+/// deriving keys does: a create, or a replace of the stored version.
+async fn write_key(cp: &TestCp, id: Uuid, doc: Value, replace: bool) -> Result<i64, ApiError> {
+    let ctx = WriteCtx::of(cp.state());
+    cp.db()
+        .tx(move |conn| {
+            async move {
+                let op = if replace {
+                    WriteOp::Replace(&doc)
+                } else {
+                    WriteOp::Create(&doc)
+                };
+                let write = ResourceWrite {
+                    kind: Kind::ApiKeys,
+                    id,
+                    op,
+                    expected_version: None,
+                    managed_by: Some("tenant:keys-7cc"),
+                };
+                Ok(write_resource(conn, &ctx, write).await?.version)
+            }
+            .boxed()
+        })
+        .await
+}
+
+#[tokio::test]
+async fn re_enabling_a_key_an_older_gateway_would_serve_unrestricted_is_refused() {
+    let Some((cp, _admin, gw)) = setup().await else {
+        return;
+    };
+    gw.beat("gw-current-7cc", CURRENT).await;
+    let key = |hash: &str, disabled: bool| {
+        json!({
+            "key_hash": hash,
+            "allowed_model_ids": [],
+            "allowed_provider_groups": ["shared"],
+            "disabled": disabled,
+        })
+    };
+    let (off, on) = (Uuid::new_v4(), Uuid::new_v4());
+    write_key(&cp, off, key("hash-off-7cc", true), false)
+        .await
+        .expect("a disabled key, before any older gateway");
+    write_key(&cp, on, key("hash-on-7cc", false), false)
+        .await
+        .expect("an enabled key, before any older gateway");
+    gw.beat("gw-old-7cc", OLD).await;
+    // An older gateway ignores the groups: switching the key back on would
+    // let it reach every provider key there.
+    let err = write_key(&cp, off, key("hash-off-7cc", false), true)
+        .await
+        .expect_err("re-enabling is judged again");
+    assert_eq!((err.status.as_u16(), err.code), (422, "gateway_too_old"));
+    assert_eq!(err.details[0].path, "/allowed_provider_groups");
+    let err = write_key(
+        &cp,
+        off,
+        json!({"key_hash": "hash-off-7cc", "allowed_model_ids": [],
+               "allowed_provider_groups": ["shared"]}),
+        true,
+    )
+    .await
+    .expect_err("dropping the flag is re-enabling too");
+    assert_eq!(err.code, "gateway_too_old");
+    let stored: Value = sqlx::query_scalar("SELECT doc FROM gw_resources WHERE id = $1")
+        .bind(off)
+        .fetch_one(cp.db().pool())
+        .await
+        .expect("read the key");
+    assert_eq!(stored["disabled"], true, "still off");
+    // Switching one off takes nothing new to an older gateway.
+    write_key(&cp, on, key("hash-on-7cc", true), true)
+        .await
+        .expect("disabling is not refused");
 }

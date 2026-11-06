@@ -27,6 +27,7 @@
 //! itself off. Versions compare by semver precedence (ruling P1-R7):
 //! `1.9.0-rc.1` is older than `1.9.0`, and build metadata never counts.
 
+use chrono::{DateTime, FixedOffset};
 use semver::{BuildMetadata, Version};
 use serde_json::Value;
 use sqlx::PgConnection;
@@ -60,17 +61,16 @@ pub enum Since {
 
 /// A field older gateways would misread: a document of `kind` whose value
 /// at `pointer` (a JSON pointer) meets `trigger` needs gateways at `since`
-/// or later, for the reason `why`. `regrown_by` names the lists (JSON
-/// pointers) whose growth widens what an older gateway serves through the
-/// field it ignores: a replace that keeps the field is judged again when
-/// one of them grows.
+/// or later, for the reason `why`. `widens(stored, doc)` says whether a
+/// replace that keeps the field still widens what an older gateway, which
+/// ignores it, serves; such a replace is judged again.
 #[derive(Debug, Clone, Copy)]
 pub struct FieldFloor {
     pub kind: Kind,
     pub pointer: &'static str,
     pub trigger: Trigger,
     pub since: Since,
-    pub regrown_by: &'static [&'static str],
+    pub widens: fn(&Value, &Value) -> bool,
     pub why: &'static str,
 }
 
@@ -84,9 +84,6 @@ impl FieldFloor {
             .replace('/', ".")
     }
 }
-
-/// The model grants of an api key (`crates/aisix-core/src/models/apikey.rs`).
-const KEY_GRANTS: &[&str] = &["/allowed_model_ids", "/allowed_models"];
 
 /// Every field older gateways would misread in a way that opens what it
 /// closes, or that quietly withholds what it grants. A new field whose
@@ -106,7 +103,7 @@ pub const FIELD_FLOORS: &[FieldFloor] = &[
         pointer: "/scope",
         trigger: Trigger::Equals("team"),
         since: Since::ThisRelease,
-        regrown_by: &[],
+        widens: never,
         why: "an older gateway skips a team-scoped policy and keeps serving the env-scoped \
               one it replaced, or an overlapping env catch-all, which shares cache entries \
               across tenants",
@@ -116,7 +113,7 @@ pub const FIELD_FLOORS: &[FieldFloor] = &[
         pointer: "/allowed_endpoints",
         trigger: Trigger::Present,
         since: Since::ThisRelease,
-        regrown_by: KEY_GRANTS,
+        widens: key_widens,
         why: "an older gateway ignores the field and lets the key call every endpoint",
     },
     FieldFloor {
@@ -124,7 +121,7 @@ pub const FIELD_FLOORS: &[FieldFloor] = &[
         pointer: "/allowed_provider_groups",
         trigger: Trigger::Present,
         since: Since::ThisRelease,
-        regrown_by: KEY_GRANTS,
+        widens: key_widens,
         why: "an older gateway ignores the field and lets the key reach every provider key",
     },
 ];
@@ -215,33 +212,93 @@ fn triggered(floor: &FieldFloor, doc: &Value) -> bool {
     }
 }
 
-/// Whether the list at one of a floor's `regrown_by` pointers grants more
-/// after a replace than before (`null` reads as absent): an item added to a
-/// list, or the list appearing or going away. Neither absence is narrower
-/// than every list on an api key: without `allowed_model_ids` the key
-/// falls back to `allowed_models`, and without `allowed_models` it grants
-/// none, so a list that appears can grant more as well.
-fn grew(before: Option<&Value>, after: Option<&Value>) -> bool {
-    fn given(v: Option<&Value>) -> Option<&Value> {
-        v.filter(|v| !v.is_null())
+/// For a row whose field no kept value can widen.
+fn never(_stored: &Value, _doc: &Value) -> bool {
+    false
+}
+
+/// Whether an api key reaches more after a replace of `stored` by `doc`,
+/// by the key's own semantics (`crates/aisix-core/src/models/apikey.rs`):
+/// switched back on, living longer, or granted a model it was not. A
+/// narrowing edit (a model withdrawn, the key switched off, an earlier
+/// expiry) is not growth.
+fn key_widens(stored: &Value, doc: &Value) -> bool {
+    let disabled = |d: &Value| d.get("disabled").and_then(Value::as_bool) == Some(true);
+    (disabled(stored) && !disabled(doc))
+        || lives_longer(stored, doc)
+        || grants_more(&ModelGrant::of(stored), &ModelGrant::of(doc))
+}
+
+/// Whether `doc` expires later than `stored`, or never while `stored` did.
+/// A time that does not read as RFC 3339 counts as later once it changes.
+fn lives_longer(stored: &Value, doc: &Value) -> bool {
+    fn expiry(d: &Value) -> Option<&Value> {
+        d.get("expires_at").filter(|v| !v.is_null())
     }
-    match (given(before), given(after)) {
-        (None, None) => false,
-        (Some(before), Some(after)) => match (before.as_array(), after.as_array()) {
-            (Some(before), Some(after)) => after.iter().any(|item| !before.contains(item)),
+    fn instant(v: &Value) -> Option<DateTime<FixedOffset>> {
+        DateTime::parse_from_rfc3339(v.as_str()?).ok()
+    }
+    match (expiry(stored), expiry(doc)) {
+        (None, _) => false,
+        (Some(_), None) => true,
+        (Some(before), Some(after)) => match (instant(before), instant(after)) {
+            (Some(before), Some(after)) => after > before,
             _ => before != after,
         },
-        _ => true,
+    }
+}
+
+/// The models an api key may use: by id while it has an id list (`null`
+/// reads as absent), and otherwise by the name list, whose absence grants
+/// none.
+enum ModelGrant<'a> {
+    Ids(&'a [Value]),
+    Names(&'a [Value]),
+}
+
+impl<'a> ModelGrant<'a> {
+    fn of(doc: &'a Value) -> ModelGrant<'a> {
+        let list = |field: &str| -> Option<&'a [Value]> {
+            let value = doc.get(field).filter(|v| !v.is_null())?;
+            Some(value.as_array().map_or(&[][..], Vec::as_slice))
+        };
+        match list("allowed_model_ids") {
+            Some(ids) => ModelGrant::Ids(ids),
+            None => ModelGrant::Names(list("allowed_models").unwrap_or(&[])),
+        }
+    }
+}
+
+/// Whether `after` grants a model `before` did not. Entries compare
+/// literally, except that a `*` in `before` covers everything: a glob
+/// replaced by names it covers (`openai/*` by `openai/gpt-4o`) reads as
+/// growth, a known over-refusal. Ids and names cannot be compared, so a
+/// switch between them grants more unless it lands on no model, or leaves
+/// names that granted everything.
+fn grants_more(before: &ModelGrant<'_>, after: &ModelGrant<'_>) -> bool {
+    fn covers_everything(list: &[Value]) -> bool {
+        list.iter().any(|entry| entry.as_str() == Some("*"))
+    }
+    fn adds(before: &[Value], after: &[Value]) -> bool {
+        !covers_everything(before) && after.iter().any(|entry| !before.contains(entry))
+    }
+    match (before, after) {
+        (ModelGrant::Ids(before), ModelGrant::Ids(after))
+        | (ModelGrant::Names(before), ModelGrant::Names(after)) => adds(before, after),
+        (ModelGrant::Names(before), ModelGrant::Ids(after)) => {
+            !after.is_empty() && !covers_everything(before)
+        }
+        (ModelGrant::Ids(_), ModelGrant::Names(after)) => !after.is_empty(),
     }
 }
 
 /// The rows of `floors` for `kind` that `doc` sets and `stored` (the
 /// document it replaces, `null` for a create) does not, or that both set
-/// while a list the row's `regrown_by` names grew. A field the stored
-/// document already sets is what every gateway already loads, so keeping it
-/// exposes nothing new, unless the grants it guards grow; refusing would
-/// otherwise stop an operator from changing, or switching off, a row the
-/// older gateway already serves.
+/// while the row's `widens` says the replace widens what an older gateway
+/// serves. A field the stored document already sets is what every gateway
+/// already loads, so keeping it exposes nothing new unless the row widens;
+/// refusing would otherwise stop an operator from changing, or switching
+/// off, a row the older gateway already serves.
 fn newly_triggered<'f>(
     floors: &'f [FieldFloor],
     kind: Kind,
@@ -251,12 +308,7 @@ fn newly_triggered<'f>(
     floors
         .iter()
         .filter(|f| f.kind == kind && triggered(f, doc))
-        .filter(|f| {
-            !triggered(f, stored)
-                || f.regrown_by
-                    .iter()
-                    .any(|p| grew(stored.pointer(p), doc.pointer(p)))
-        })
+        .filter(|f| !triggered(f, stored) || (f.widens)(stored, doc))
         .collect()
 }
 
@@ -561,7 +613,7 @@ mod tests {
             pointer: "/allowed_endpoints",
             trigger: Trigger::Contains("videos_7f1"),
             since: Since::Version("1.10.0"),
-            regrown_by: &[],
+            widens: never,
             why: "test row",
         }];
         let with = json!({"key_hash": "h", "allowed_endpoints": ["chat", "videos_7f1"]});
@@ -603,61 +655,137 @@ mod tests {
     }
 
     #[test]
-    fn a_kept_field_is_judged_again_when_the_grants_it_guards_grow() {
+    fn a_kept_field_is_judged_again_when_the_key_reaches_more() {
         fn again(doc: &Value, stored: &Value) -> usize {
             newly_triggered(FIELD_FLOORS, Kind::ApiKeys, doc, stored).len()
         }
-        // A key that kept its provider groups, granted models by `grants`.
-        let key = |grants: Value| {
+        // A key that kept its provider groups, with `rest` beside them.
+        let key = |rest: Value| {
             let mut doc = json!({"key_hash": "h", "allowed_provider_groups": ["shared"]});
-            if let (Some(doc), Some(grants)) = (doc.as_object_mut(), grants.as_object()) {
-                doc.extend(grants.clone());
+            if let (Some(doc), Some(rest)) = (doc.as_object_mut(), rest.as_object()) {
+                doc.extend(rest.clone());
             }
             doc
         };
         let ids = |list: Value| key(json!({ "allowed_model_ids": list }));
         let names = |list: Value| key(json!({ "allowed_models": list }));
-        assert_eq!(
-            again(&ids(json!(["m1", "m2"])), &ids(json!(["m1"]))),
-            1,
-            "a model added"
+        let none = key(json!({}));
+        let widens = |doc: &Value, stored: &Value, label: &str| {
+            assert_eq!(again(doc, stored), 1, "widens: {label}");
+        };
+        let narrows = |doc: &Value, stored: &Value, label: &str| {
+            assert_eq!(again(doc, stored), 0, "does not widen: {label}");
+        };
+        // Lists of the same kind.
+        widens(
+            &ids(json!(["m1", "m2"])),
+            &ids(json!(["m1"])),
+            "an id added",
         );
-        assert_eq!(
-            again(&ids(json!(["m1"])), &ids(json!(["m1", "m2"]))),
-            0,
-            "a model withdrawn"
+        narrows(
+            &ids(json!(["m1"])),
+            &ids(json!(["m1", "m2"])),
+            "an id withdrawn",
         );
-        assert_eq!(
-            again(&ids(json!([])), &ids(json!(["m1"]))),
-            0,
-            "the last one withdrawn"
+        narrows(
+            &ids(json!([])),
+            &ids(json!(["m1"])),
+            "the last id withdrawn",
         );
-        assert_eq!(again(&names(json!(["a", "b"])), &names(json!(["a"]))), 1);
-        assert_eq!(again(&names(json!(["a"])), &names(json!(["a", "b"]))), 0);
-        // Dropping the id list falls back to the names, which may grant more.
-        assert_eq!(
-            again(&key(json!({})), &ids(json!(["m1"]))),
-            1,
-            "present to absent"
+        widens(
+            &names(json!(["a", "b"])),
+            &names(json!(["a"])),
+            "a name added",
         );
-        // Without an id list the names decide, so a new id list can grant
-        // models they did not; without names the key granted none.
-        assert_eq!(
-            again(&ids(json!(["m1"])), &key(json!({}))),
-            1,
-            "absent to present"
+        narrows(
+            &names(json!(["a"])),
+            &names(json!(["a", "b"])),
+            "a name withdrawn",
         );
-        assert_eq!(
-            again(&ids(Value::Null), &key(json!({}))),
-            0,
-            "null is absent"
+        narrows(
+            &names(json!(["*", "b"])),
+            &names(json!(["*"])),
+            "within `*`",
         );
-        // Switching the key off keeps every grant as it was.
-        let mut disabled = ids(json!(["m1"]));
-        disabled["disabled"] = json!(true);
-        assert_eq!(again(&disabled, &ids(json!(["m1"]))), 0);
-        // A cache policy has no grants to grow.
-        let team = json!({"name": "c", "scope": "team", "allowed_model_ids": ["m2"]});
+        // A glob narrowed to what it covers is still read as growth.
+        widens(
+            &names(json!(["openai/gpt-4o"])),
+            &names(json!(["openai/*"])),
+            "known over-refusal",
+        );
+        // Without ids the names decide, and without names the key grants
+        // nothing.
+        widens(&names(json!(["a"])), &none, "names appear without ids");
+        narrows(&none, &names(json!(["a"])), "names go away without ids");
+        widens(&ids(json!(["m1"])), &none, "ids appear over no names");
+        widens(
+            &ids(json!(["m1"])),
+            &names(json!([])),
+            "ids appear over empty names",
+        );
+        widens(
+            &ids(json!(["m1"])),
+            &names(json!(["a"])),
+            "ids appear over names",
+        );
+        narrows(
+            &ids(json!(["m1"])),
+            &names(json!(["*"])),
+            "ids appear under `*`",
+        );
+        narrows(&ids(json!([])), &none, "the standard revoke");
+        narrows(&ids(json!([])), &names(json!(["a"])), "a revoke over names");
+        // Dropping the ids falls back to the names.
+        let both = |i: Value, n: Value| key(json!({"allowed_model_ids": i, "allowed_models": n}));
+        widens(
+            &names(json!(["a"])),
+            &both(json!(["m1"]), json!(["a"])),
+            "ids dropped over names",
+        );
+        narrows(&none, &ids(json!(["m1"])), "ids dropped over no names");
+        narrows(&ids(Value::Null), &none, "null is absent");
+        widens(
+            &both(Value::Null, json!(["a"])),
+            &ids(json!(["m1"])),
+            "null ids fall back to names",
+        );
+        // Switched back on: an older gateway starts serving it.
+        let off = |doc: Value| {
+            let mut doc = doc;
+            doc["disabled"] = json!(true);
+            doc
+        };
+        narrows(&off(ids(json!(["m1"]))), &ids(json!(["m1"])), "disabled");
+        widens(
+            &ids(json!(["m1"])),
+            &off(ids(json!(["m1"]))),
+            "enabled by dropping the flag",
+        );
+        let mut enabled = ids(json!(["m1"]));
+        enabled["disabled"] = json!(false);
+        widens(&enabled, &off(ids(json!(["m1"]))), "enabled by false");
+        narrows(&enabled, &ids(json!(["m1"])), "false is absent");
+        // Living longer, or for ever.
+        let until = |at: &str| key(json!({ "expires_at": at }));
+        widens(
+            &until("2027-01-01T00:00:00Z"),
+            &until("2026-12-01T00:00:00Z"),
+            "expiry later",
+        );
+        narrows(
+            &until("2026-12-01T00:00:00Z"),
+            &until("2027-01-01T00:00:00Z"),
+            "expiry earlier",
+        );
+        narrows(
+            &until("2026-12-01T01:00:00+01:00"),
+            &until("2026-12-01T00:00:00Z"),
+            "the same instant",
+        );
+        widens(&none, &until("2026-12-01T00:00:00Z"), "expiry removed");
+        narrows(&until("2026-12-01T00:00:00Z"), &none, "expiry added");
+        // A cache policy has nothing to widen this way.
+        let team = json!({"name": "c", "scope": "team", "ttl_seconds": 60});
         let kept = json!({"name": "c", "scope": "team"});
         assert_eq!(
             newly_triggered(FIELD_FLOORS, Kind::CachePolicies, &team, &kept).len(),
@@ -688,7 +816,7 @@ mod tests {
             pointer,
             trigger: Trigger::Present,
             since: Since::ThisRelease,
-            regrown_by: &[],
+            widens: never,
             why: "test row",
         };
         assert_eq!(
@@ -708,18 +836,15 @@ mod tests {
             }
             assert!(floor.pointer.starts_with('/'), "{}", floor.pointer);
         }
-        // The rows ruling 26 sets, and the grants each one guards.
-        let rows: Vec<(Kind, &str, &[&str])> = FIELD_FLOORS
-            .iter()
-            .map(|f| (f.kind, f.pointer, f.regrown_by))
-            .collect();
-        let grants: &[&str] = &["/allowed_model_ids", "/allowed_models"];
+        // The rows ruling 26 sets; which replaces each judges again is
+        // pinned by `a_kept_field_is_judged_again_when_the_key_reaches_more`.
+        let rows: Vec<(Kind, &str)> = FIELD_FLOORS.iter().map(|f| (f.kind, f.pointer)).collect();
         assert_eq!(
             rows,
             [
-                (Kind::CachePolicies, "/scope", &[][..]),
-                (Kind::ApiKeys, "/allowed_endpoints", grants),
-                (Kind::ApiKeys, "/allowed_provider_groups", grants),
+                (Kind::CachePolicies, "/scope"),
+                (Kind::ApiKeys, "/allowed_endpoints"),
+                (Kind::ApiKeys, "/allowed_provider_groups"),
             ]
         );
     }
