@@ -19,8 +19,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use argon2::password_hash::{PasswordHasher, PasswordVerifier, SaltString};
+use argon2::password_hash::{PasswordHasher, PasswordVerifier, Salt, SaltString};
 use argon2::{Argon2, PasswordHash};
+use rand_core::RngCore;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::error::ApiError;
@@ -51,7 +52,7 @@ const LOGIN_FAILURES_BEFORE_COOLDOWN: u32 = 5;
 /// by failing five times with their email; too short, and it stops nothing.
 /// A minute holds guessing to five tries a minute, and someone locked out by
 /// mistake waits a minute.
-const LOGIN_COOLDOWN: Duration = Duration::from_secs(60);
+pub const LOGIN_COOLDOWN: Duration = Duration::from_secs(60);
 
 /// The gate was still full after waiting [`GATE_WAIT`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -91,7 +92,13 @@ impl From<HashError> for ApiError {
 /// the async threads, behind the gate ([`PasswordGate::hash`]) where the
 /// caller is a request.
 pub fn hash(password: &str) -> Result<String, PasswordError> {
-    let salt = SaltString::generate(&mut rand_core::OsRng);
+    // A failing system RNG is an error here, not a panic: the caller
+    // answers it like any other hashing failure.
+    let mut bytes = [0u8; Salt::RECOMMENDED_LENGTH];
+    rand_core::OsRng
+        .try_fill_bytes(&mut bytes)
+        .map_err(|e| PasswordError(e.to_string()))?;
+    let salt = SaltString::encode_b64(&bytes).map_err(|e| PasswordError(e.to_string()))?;
     Argon2::default()
         .hash_password(password.as_bytes(), &salt)
         .map(|h| h.to_string())

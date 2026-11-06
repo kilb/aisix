@@ -4,6 +4,10 @@
 //!
 //! Each route needs a fixture here: a request that its minimum role may
 //! send. A route added without one fails this test, which is the point.
+//!
+//! A refused request must also have changed nothing. Every change writes an
+//! audit row in its own transaction, so an unchanged `audit_log` count
+//! stands for "nothing happened".
 
 mod support;
 
@@ -15,7 +19,9 @@ use serde_json::{json, Value};
 use support::{SeededOperator, TestCp, TEST_PASSWORD};
 use uuid::Uuid;
 
-/// The request `method path` is tested with: the concrete path and the body.
+/// The request `method path` is tested with: the concrete path and the
+/// body. Called once per attempt, so a fixture that creates something
+/// creates something new each time.
 fn fixture(method: &str, path: &str, target: &SeededOperator) -> (String, Option<Value>) {
     match (method, path) {
         // Rejected as too short, after the role check.
@@ -38,6 +44,13 @@ fn fixture(method: &str, path: &str, target: &SeededOperator) -> (String, Option
         ),
         _ => panic!("no fixture for {method} {path}: add one to tests/roles.rs"),
     }
+}
+
+async fn audit_rows(cp: &TestCp) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM audit_log")
+        .fetch_one(cp.db().pool())
+        .await
+        .expect("count audit rows")
 }
 
 fn below(role: OperatorRole) -> Option<OperatorRole> {
@@ -68,20 +81,33 @@ async fn every_operator_route_refuses_the_role_below_its_minimum() {
         let MinRole::Op(min) = *min else {
             continue;
         };
+        let before = audit_rows(&cp).await;
         let (uri, body) = fixture(method, path, &target);
-        let r = cp.send(method, &uri, None, body.clone()).await;
+        let r = cp.send(method, &uri, None, body).await;
         assert_eq!(r.status, 401, "{method} {path} without a session: {r:?}");
         assert_eq!(r.body["code"], "unauthenticated", "{method} {path}");
+        assert_eq!(
+            audit_rows(&cp).await,
+            before,
+            "{method} {path} without a session changed something"
+        );
 
         if let Some(below) = below(min) {
+            let (uri, body) = fixture(method, path, &target);
             let r = cp
-                .send(method, &uri, Some(sessions[&below].cookie()), body.clone())
+                .send(method, &uri, Some(sessions[&below].cookie()), body)
                 .await;
             assert_eq!(r.status, 403, "{method} {path} as {below:?}: {r:?}");
             assert_eq!(r.body["code"], "forbidden", "{method} {path}");
+            assert_eq!(
+                audit_rows(&cp).await,
+                before,
+                "{method} {path} as {below:?} changed something"
+            );
         }
 
         // Last, since it may change something.
+        let (uri, body) = fixture(method, path, &target);
         let r = cp
             .send(method, &uri, Some(sessions[&min].cookie()), body)
             .await;

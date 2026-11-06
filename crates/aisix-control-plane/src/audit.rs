@@ -29,10 +29,14 @@ pub enum Actor<'a> {
     },
     /// The control plane itself, or a command run on its host.
     System,
-    /// Someone not logged in, by the email they gave.
+    /// Someone not logged in, by the email they gave. Only for an email that
+    /// names an account: anything else is caller-chosen text.
     Anonymous {
         email: &'a str,
     },
+    /// Someone not logged in who named no account. Nothing they sent is
+    /// stored.
+    Unidentified,
 }
 
 /// One audit row.
@@ -54,6 +58,7 @@ pub async fn record(conn: &mut PgConnection, e: AuditEntry<'_>) -> Result<(), Db
         Actor::Member { id, email } => ("member", Some(id), Some(email)),
         Actor::System => ("system", None, None),
         Actor::Anonymous { email } => ("anonymous", None, Some(email)),
+        Actor::Unidentified => ("anonymous", None, None),
     };
     sqlx::query(
         "INSERT INTO audit_log \

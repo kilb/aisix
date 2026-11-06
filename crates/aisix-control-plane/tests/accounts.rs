@@ -5,9 +5,11 @@ mod support;
 
 use std::process::Stdio;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use aisix_control_plane::auth::OperatorRole;
 use serde_json::{json, Value};
+use sqlx::{Postgres, Transaction};
 use support::{OperatorSession, TempFile, TestCp, TEST_PASSWORD};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Barrier;
@@ -86,6 +88,24 @@ async fn wrong_password_unknown_email_and_disabled_account_answer_alike() {
     // was refused for being disabled.
     let r = cp.admin_login(&live.email, TEST_PASSWORD).await;
     assert_eq!(r.status, 200, "{r:?}");
+
+    // All three failures are audited, but the text a caller chose for an
+    // email no account has is not stored.
+    let failed: Vec<(Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT actor_email, target_id FROM audit_log \
+         WHERE action = 'operator.login_failed' ORDER BY id",
+    )
+    .fetch_all(cp.db().pool())
+    .await
+    .expect("the failed logins");
+    assert_eq!(failed.len(), 3, "{failed:?}");
+    assert_eq!(failed[0].0.as_deref(), Some(live.email.as_str()));
+    assert_eq!(failed[1], (None, None));
+    assert_eq!(failed[2].0.as_deref(), Some(blocked_email.as_str()));
+    assert!(
+        !dump_audit_and_sessions(&cp).await.contains("nobody-7f3a"),
+        "the unknown email was stored"
+    );
 }
 
 #[tokio::test]
@@ -110,6 +130,11 @@ async fn five_failures_put_an_email_into_cooldown() {
         let r = cp.admin_login(&spelling, TEST_PASSWORD).await;
         assert_eq!(r.status, 429, "{spelling}: {r:?}");
         assert_eq!(r.body["code"], "busy");
+        assert_eq!(
+            r.headers.get("retry-after").and_then(|v| v.to_str().ok()),
+            Some("60"),
+            "{r:?}"
+        );
         assert!(r.set_cookie.is_none());
     }
     assert_eq!(cp.verification_count(), before);
@@ -698,4 +723,238 @@ async fn the_create_operator_command_makes_the_first_admin() {
         .await
         .expect("count");
     assert_eq!(count, 1);
+}
+
+/// Backends of `cp`'s database that are waiting for a lock.
+async fn lock_waiters(cp: &TestCp) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM pg_stat_activity \
+         WHERE datname = current_database() AND wait_event_type = 'Lock'",
+    )
+    .fetch_one(cp.db().pool())
+    .await
+    .expect("read pg_stat_activity")
+}
+
+/// Returns once `n` backends wait for a lock. It polls a condition the test
+/// itself sets up, so it does not depend on timing.
+async fn until_lock_waiters(cp: &TestCp, n: i64) {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while lock_waiters(cp).await < n {
+        assert!(Instant::now() < deadline, "{n} lock waiters never appeared");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// A transaction that holds back every insert into `audit_log` until it
+/// ends: a change blocks on its audit row after doing everything else.
+async fn hold_audit_inserts(cp: &TestCp) -> Transaction<'static, Postgres> {
+    let mut holder = cp.db().pool().begin().await.expect("begin");
+    sqlx::query("LOCK TABLE audit_log IN SHARE MODE")
+        .execute(&mut *holder)
+        .await
+        .expect("hold audit_log");
+    holder
+}
+
+async fn live_sessions_of(cp: &TestCp, id: Uuid) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM sessions WHERE principal_id = $1 AND expires_at > now()",
+    )
+    .bind(id)
+    .fetch_one(cp.db().pool())
+    .await
+    .expect("count sessions")
+}
+
+/// The session `login` opened, if any, as a `Cookie` header value.
+fn cookie_of(login: &support::Resp) -> Option<String> {
+    login
+        .set_cookie
+        .as_deref()
+        .and_then(|c| c.split(';').next())
+        .map(str::to_string)
+}
+
+/// Lock waits here last as long as the test needs, however slow argon2 is.
+fn patient(cfg: &mut aisix_control_plane::config::CpConfig) {
+    cfg.db_lock_timeout_ms = 120_000;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_login_racing_a_password_change_gets_no_lasting_session() {
+    let Some(cp) = TestCp::start_with(patient).await else {
+        return;
+    };
+    let cp = Arc::new(cp);
+    let me = cp.seed_operator(OperatorRole::Viewer).await;
+    let changer = cp.admin_login_as(&me).await;
+    let holder = hold_audit_inserts(&cp).await;
+
+    // The change replaces the hash and ends the other sessions, then waits
+    // to write its audit row, uncommitted.
+    let change = tokio::spawn({
+        let (cp, cookie) = (cp.clone(), changer.cookie().to_string());
+        async move {
+            cp.send(
+                "POST",
+                "/admin/password",
+                Some(&cookie),
+                Some(json!({"current_password": TEST_PASSWORD, "new_password": "raced-new-password-1"})),
+            )
+            .await
+        }
+    });
+    until_lock_waiters(&cp, 1).await;
+    // Meanwhile a login with the old password still sees the old hash.
+    let login = tokio::spawn({
+        let (cp, email) = (cp.clone(), me.email.clone());
+        async move { cp.admin_login(&email, TEST_PASSWORD).await }
+    });
+    until_lock_waiters(&cp, 2).await;
+    holder.rollback().await.expect("release audit_log");
+
+    let change = change.await.expect("join");
+    assert_eq!(change.status, 204, "{change:?}");
+    let login = login.await.expect("join");
+    if let Some(cookie) = cookie_of(&login) {
+        let r = cp.get_with_cookie("/admin/session", &cookie).await;
+        assert_eq!(
+            r.body["authed"], false,
+            "the raced login kept a session: {r:?}"
+        );
+    }
+    assert_eq!(login.status, 401, "{login:?}");
+    // Only the changer's own session is left.
+    assert_eq!(live_sessions_of(&cp, me.id).await, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_login_racing_a_disable_gets_no_session_back_on_re_enable() {
+    let Some(cp) = TestCp::start_with(patient).await else {
+        return;
+    };
+    let cp = Arc::new(cp);
+    let admin = cp.admin_login_seeded(OperatorRole::Admin).await;
+    let victim = cp.seed_operator(OperatorRole::Operator).await;
+    let holder = hold_audit_inserts(&cp).await;
+
+    let disable = tokio::spawn({
+        let (cp, admin, id) = (cp.clone(), admin.clone(), victim.id);
+        async move { patch(&cp, &admin, id, json!({"disabled": true})).await }
+    });
+    until_lock_waiters(&cp, 1).await;
+    let login = tokio::spawn({
+        let (cp, email) = (cp.clone(), victim.email.clone());
+        async move { cp.admin_login(&email, TEST_PASSWORD).await }
+    });
+    until_lock_waiters(&cp, 2).await;
+    holder.rollback().await.expect("release audit_log");
+
+    let disable = disable.await.expect("join");
+    assert_eq!(disable.status, 200, "{disable:?}");
+    let login = login.await.expect("join");
+    assert_eq!(live_sessions_of(&cp, victim.id).await, 0);
+    // A session that slipped past the disable would come back with the
+    // account.
+    let r = patch(&cp, &admin, victim.id, json!({"disabled": false})).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    if let Some(cookie) = cookie_of(&login) {
+        let r = cp.get_with_cookie("/admin/session", &cookie).await;
+        assert_eq!(
+            r.body["authed"], false,
+            "the raced login kept a session: {r:?}"
+        );
+    }
+    assert_eq!(login.status, 401, "{login:?}");
+}
+
+/// What is sent, its `Content-Type`, the body, and the expected status and
+/// code.
+type BodyCase = (
+    &'static str,
+    Option<&'static str>,
+    Vec<u8>,
+    u16,
+    &'static str,
+);
+
+#[tokio::test]
+async fn a_body_the_api_cannot_read_answers_in_the_error_envelope() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let admin = cp.admin_login_seeded(OperatorRole::Admin).await;
+    let json_type = Some("application/json");
+    let too_large = serde_json::to_vec(&json!({
+        "email": fresh_email("big"),
+        "role": "viewer",
+        "password": "x".repeat((1 << 20) + 1024),
+    }))
+    .expect("serialize");
+    let cases: Vec<BodyCase> = vec![
+        (
+            "not JSON",
+            json_type,
+            b"{\"email\":".to_vec(),
+            422,
+            "validation_failed",
+        ),
+        (
+            "no content type",
+            None,
+            b"{}".to_vec(),
+            422,
+            "validation_failed",
+        ),
+        (
+            "a missing field",
+            json_type,
+            br#"{"email":"a@b.io"}"#.to_vec(),
+            422,
+            "validation_failed",
+        ),
+        (
+            "an unknown role",
+            json_type,
+            br#"{"email":"a@b.io","role":"root-7c1","password":"long-enough-pw"}"#.to_vec(),
+            422,
+            "validation_failed",
+        ),
+        ("over 1 MiB", json_type, too_large, 413, "payload_too_large"),
+    ];
+    for (what, content_type, body, status, code) in cases {
+        let r = cp
+            .send_raw(
+                "POST",
+                "/admin/operators",
+                Some(admin.cookie()),
+                content_type,
+                Some(body),
+            )
+            .await;
+        assert_eq!(r.status, status, "{what}: {r:?}");
+        assert_eq!(r.body["code"], code, "{what}: {r:?}");
+        assert!(
+            r.body["error"].as_str().is_some_and(|e| !e.is_empty()),
+            "{what}: {r:?}"
+        );
+        assert!(
+            !r.body.to_string().contains("root-7c1"),
+            "{what} echoed: {r:?}"
+        );
+    }
+
+    // A login body that cannot be read is a failed login like any other.
+    for (content_type, body) in [
+        (json_type, b"{\"email\":".to_vec()),
+        (None, br#"{"email":"a@b.io","password":"x"}"#.to_vec()),
+        (json_type, br#"{"email":"a@b.io"}"#.to_vec()),
+    ] {
+        let r = cp
+            .send_raw("POST", "/admin/login", None, content_type, Some(body))
+            .await;
+        assert_eq!(r.status, 401, "{r:?}");
+        assert_eq!(r.body["code"], "invalid_credentials", "{r:?}");
+    }
 }

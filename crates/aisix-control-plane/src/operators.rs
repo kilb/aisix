@@ -17,12 +17,12 @@ use sqlx::PgConnection;
 use uuid::Uuid;
 
 use crate::audit::{self, Actor, AuditEntry};
-use crate::auth::password::{self, normalize_email, MIN_PASSWORD_LEN};
+use crate::auth::password::{self, normalize_email, LOGIN_COOLDOWN, MIN_PASSWORD_LEN};
 use crate::auth::session::{self, Principal, ADMIN_COOKIE, OPERATOR_SESSION_TTL};
 use crate::auth::{OperatorAuth, OperatorRole};
 use crate::db::{Db, DbError};
 use crate::error::{ApiError, Detail};
-use crate::http::API_CONTRACT;
+use crate::http::{ApiJson, API_CONTRACT};
 use crate::AppState;
 
 /// Serialises the operator-wide invariants (at least one enabled admin), so
@@ -111,6 +111,15 @@ fn is_email_taken(e: &DbError) -> bool {
     matches!(e, DbError::UniqueViolation { constraint } if constraint == "operators_email_key")
 }
 
+/// `429 busy` with `Retry-After`, for an email that is cooling down.
+fn cooling_down() -> Response {
+    (
+        [(header::RETRY_AFTER, LOGIN_COOLDOWN.as_secs().to_string())],
+        ApiError::busy(),
+    )
+        .into_response()
+}
+
 fn email_taken() -> ApiError {
     ApiError::conflict("email_taken", "该邮箱已被使用")
 }
@@ -173,11 +182,15 @@ pub struct LoginRequest {
 
 /// `POST /admin/login`. A wrong password, an unknown email and a disabled
 /// account all answer the same `401 invalid_credentials`, after the same
-/// work (one argon2 verification).
+/// work (one argon2 verification and one audit row). A body that cannot be
+/// read answers the same 401.
 pub async fn login(
     State(state): State<AppState>,
-    Json(req): Json<LoginRequest>,
+    body: Result<ApiJson<LoginRequest>, ApiError>,
 ) -> Result<Response, ApiError> {
+    let Ok(ApiJson(req)) = body else {
+        return Err(ApiError::invalid_credentials());
+    };
     // No account has an email of another shape, and refusing it here keeps
     // it out of the cooldown table.
     let Some(email) = normalize_email(&req.email) else {
@@ -185,7 +198,7 @@ pub async fn login(
     };
     // Before any argon2 work: guessing must not get to spend 19 MiB a try.
     if state.operator_logins.in_cooldown(&email) {
-        return Err(ApiError::busy());
+        return Ok(cooling_down());
     }
     let found: Option<(Uuid, String, String, bool)> =
         sqlx::query_as("SELECT id, password_hash, role, disabled FROM operators WHERE email = $1")
@@ -199,16 +212,23 @@ pub async fn login(
         .await?;
     let target = found.as_ref().map(|f| f.0);
     let live = found.filter(|f| matched && !f.3);
-    let Some((id, _, role, _)) = live else {
+    let Some((id, verified_hash, role, _)) = live else {
         state.operator_logins.note_failure(&email);
         state
             .db
             .tx(move |conn| {
                 async move {
+                    // The row is written either way, so an unknown email
+                    // costs what a known one does; only an email that names
+                    // an account is stored, not text a caller made up.
+                    let actor = match target {
+                        Some(_) => Actor::Anonymous { email: &email },
+                        None => Actor::Unidentified,
+                    };
                     audit::record(
                         conn,
                         AuditEntry {
-                            actor: Actor::Anonymous { email: &email },
+                            actor,
                             action: "operator.login_failed",
                             target_kind: TARGET_KIND,
                             target_id: target.map(|id| id.to_string()),
@@ -234,6 +254,27 @@ pub async fn login(
         .db
         .tx(move |conn| {
             async move {
+                // The account was read and verified outside this transaction,
+                // which can take seconds. A password change or a disable
+                // that committed meanwhile has already ended the account's
+                // sessions, before this one existed. So the row is read
+                // again, still with the hash just verified and enabled,
+                // under a share lock: those changes update the row before
+                // ending its sessions, so either this waits for such a
+                // change to commit and then finds no row, or the change
+                // waits for this session to commit and then ends it too.
+                let unchanged: Option<bool> = sqlx::query_scalar(
+                    "SELECT true FROM operators \
+                     WHERE id = $1 AND password_hash = $2 AND NOT disabled FOR SHARE",
+                )
+                .bind(auth.id)
+                .bind(&verified_hash)
+                .fetch_optional(&mut *conn)
+                .await
+                .map_err(DbError::from)?;
+                if unchanged.is_none() {
+                    return Err(ApiError::invalid_credentials());
+                }
                 let token = session::create(
                     &mut *conn,
                     Principal::Operator(auth.id),
@@ -321,8 +362,8 @@ pub async fn change_password(
     auth: OperatorAuth,
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(req): Json<ChangePassword>,
-) -> Result<StatusCode, ApiError> {
+    ApiJson(req): ApiJson<ChangePassword>,
+) -> Result<Response, ApiError> {
     auth.require(OperatorRole::Viewer)?;
     if !password::long_enough(&req.new_password) {
         return Err(ApiError::validation(vec![password_too_short(
@@ -332,7 +373,7 @@ pub async fn change_password(
     // A stolen session must not make guessing the password any easier than
     // the login does: the same cooldown applies.
     if state.operator_logins.in_cooldown(&auth.email) {
-        return Err(ApiError::busy());
+        return Ok(cooling_down());
     }
     let stored: Option<String> =
         sqlx::query_scalar("SELECT password_hash FROM operators WHERE id = $1")
@@ -383,7 +424,7 @@ pub async fn change_password(
             .boxed()
         })
         .await?;
-    Ok(StatusCode::NO_CONTENT)
+    Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 /// `GET /admin/operators`: `{items: [Operator & {disabled, created_at}]}`.
@@ -423,7 +464,7 @@ pub struct CreateOperator {
 pub async fn create(
     auth: OperatorAuth,
     State(state): State<AppState>,
-    Json(req): Json<CreateOperator>,
+    ApiJson(req): ApiJson<CreateOperator>,
 ) -> Result<(StatusCode, Json<OperatorView>), ApiError> {
     auth.require(OperatorRole::Admin)?;
     let mut problems = Vec::new();
@@ -482,7 +523,7 @@ pub async fn update(
     auth: OperatorAuth,
     State(state): State<AppState>,
     Path(id): Path<String>,
-    Json(req): Json<UpdateOperator>,
+    ApiJson(req): ApiJson<UpdateOperator>,
 ) -> Result<Json<OperatorView>, ApiError> {
     auth.require(OperatorRole::Admin)?;
     let id = Uuid::parse_str(&id).map_err(|_| ApiError::not_found())?;

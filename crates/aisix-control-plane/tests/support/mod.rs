@@ -205,6 +205,12 @@ impl TestCp {
     /// A control plane on a fresh database, or `None` when
     /// `CP_TEST_DATABASE_URL` is unset (outside CI).
     pub async fn start() -> Option<TestCp> {
+        Self::start_with(|_| {}).await
+    }
+
+    /// [`TestCp::start`], with `configure` applied to the test
+    /// configuration first.
+    pub async fn start_with(configure: impl FnOnce(&mut CpConfig)) -> Option<TestCp> {
         let server_url = gate_var("CP_TEST_DATABASE_URL")?;
         let template = TEMPLATE
             .get_or_init(|| ensure_template(&server_url))
@@ -225,20 +231,23 @@ impl TestCp {
             server_url,
             name,
         });
-        Some(Self::boot(database).await)
+        let mut cfg = test_config(&database.url);
+        configure(&mut cfg);
+        Some(Self::boot(database, cfg).await)
     }
 
-    async fn boot(database: Arc<TestDatabase>) -> TestCp {
-        let running =
-            aisix_control_plane::start(test_config(&database.url), std::future::pending())
-                .await
-                .expect("the control plane boots");
+    async fn boot(database: Arc<TestDatabase>, cfg: CpConfig) -> TestCp {
+        let running = aisix_control_plane::start(cfg, std::future::pending())
+            .await
+            .expect("the control plane boots");
         TestCp { running, database }
     }
 
-    /// A new control-plane instance on the same database.
+    /// A new control-plane instance on the same database, with the default
+    /// test configuration.
     pub async fn restart(&self) -> TestCp {
-        Self::boot(self.database.clone()).await
+        let cfg = test_config(&self.database.url);
+        Self::boot(self.database.clone(), cfg).await
     }
 
     pub fn db(&self) -> &Db {
@@ -353,6 +362,21 @@ impl TestCp {
         cookie: Option<&str>,
         body: Option<Value>,
     ) -> Resp {
+        let body = body.map(|b| serde_json::to_vec(&b).expect("serialize the body"));
+        self.send_raw(method, path, cookie, Some("application/json"), body)
+            .await
+    }
+
+    /// Sends `method path` with `cookie`, the `Content-Type` given (none when
+    /// `None`) and `body` as raw bytes (none when `None`).
+    pub async fn send_raw(
+        &self,
+        method: &str,
+        path: &str,
+        cookie: Option<&str>,
+        content_type: Option<&str>,
+        body: Option<Vec<u8>>,
+    ) -> Resp {
         let client = reqwest::Client::builder()
             .no_proxy()
             .build()
@@ -363,12 +387,15 @@ impl TestCp {
             request = request.header(reqwest::header::COOKIE, cookie);
         }
         if let Some(body) = body {
-            request = request.json(&body);
+            if let Some(content_type) = content_type {
+                request = request.header(reqwest::header::CONTENT_TYPE, content_type);
+            }
+            request = request.body(body);
         }
         let response = request.send().await.expect("send the request");
         let status = response.status().as_u16();
-        let set_cookie = response
-            .headers()
+        let headers = response.headers().clone();
+        let set_cookie = headers
             .get(reqwest::header::SET_COOKIE)
             .map(|v| v.to_str().expect("an ASCII Set-Cookie").to_string());
         let text = response.text().await.expect("read the body");
@@ -381,6 +408,7 @@ impl TestCp {
             status,
             body,
             set_cookie,
+            headers,
         }
     }
 }
@@ -410,12 +438,13 @@ impl OperatorSession {
 }
 
 /// An answer: the status, the body (JSON, or the text when it is not JSON,
-/// or null when empty), and the `Set-Cookie` header.
+/// or null when empty), the `Set-Cookie` header and all the headers.
 #[derive(Debug)]
 pub struct Resp {
     pub status: u16,
     pub body: Value,
     pub set_cookie: Option<String>,
+    pub headers: reqwest::header::HeaderMap,
 }
 
 /// A file in the system temp directory, removed on drop.
