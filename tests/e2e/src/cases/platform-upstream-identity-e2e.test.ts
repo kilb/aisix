@@ -68,7 +68,12 @@ const ALIASES = {
 /** What must never appear anywhere in a response the caller receives. */
 function expectNoUpstreamIdentity(text: string): void {
   for (const marker of [
-    "bdrk",
+    "_bdrk_",
+    UPSTREAM_MESSAGE_ID,
+    UPSTREAM_TOOL_USE_ID,
+    UPSTREAM_FC_ITEM_ID,
+    UPSTREAM_CALL_ID,
+    "fp_bdrk_7",
     UPSTREAM_CHAT_ID,
     "system_fingerprint",
     "amazon-bedrock-invocationMetrics",
