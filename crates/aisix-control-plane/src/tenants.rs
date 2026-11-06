@@ -36,6 +36,7 @@ use crate::db::{Db, DbError};
 use crate::error::{ApiError, BootError, Detail};
 use crate::gateways::stale_window_secs;
 use crate::http::ApiJson;
+use crate::keys;
 use crate::resources::api::if_match;
 use crate::resources::store::{self, ResourceRow};
 use crate::resources::write::{
@@ -289,6 +290,18 @@ pub async fn lock(conn: &mut PgConnection, id: Uuid) -> Result<TenantRow, ApiErr
     TenantRow::from_raw(raw.ok_or_else(ApiError::not_found)?)
 }
 
+/// Tenant `id` as it stands, without a lock; `404 not_found` when there is
+/// none.
+pub(crate) async fn find(conn: &mut PgConnection, id: Uuid) -> Result<TenantRow, ApiError> {
+    let raw: Option<RawTenant> =
+        sqlx::query_as(&format!("SELECT {COLUMNS} FROM tenants WHERE id = $1"))
+            .bind(id)
+            .fetch_optional(conn)
+            .await
+            .map_err(DbError::from)?;
+    TenantRow::from_raw(raw.ok_or_else(ApiError::not_found)?)
+}
+
 /// Locks the tenants `ids`, in ascending id order (which `ids` is sorted
 /// into, without repeats), so that two transactions locking overlapping
 /// sets cannot deadlock.
@@ -448,10 +461,9 @@ pub async fn project(conn: &mut PgConnection, ctx: &WriteCtx, id: Uuid) -> Resul
                 )
                 .await?;
             }
-            // Task 12: `keys::reproject_tenant(conn, ctx, id)` goes here, and
-            // nowhere else, so that the limit brackets the keys as `steps`
-            // describes.
-            Step::Keys => {}
+            // Here and nowhere else, so that the limit brackets the keys as
+            // `steps` describes.
+            Step::Keys => keys::reproject_tenant(&mut *conn, ctx, id).await?,
             Step::RetirePolicy => {
                 if let Some(policy_id) = tenant.limits_policy_id {
                     retire(&mut *conn, ctx, Kind::RateLimitPolicies, policy_id, &owner).await?;
@@ -477,7 +489,7 @@ async fn mint_policy_id(conn: &mut PgConnection, id: Uuid) -> Result<Uuid, ApiEr
 /// Makes the document `kind`/`id` live with `doc`: unchanged when it
 /// already is, replaced when it is live, created (or its tombstone
 /// revived) otherwise.
-async fn put(
+pub(crate) async fn put(
     conn: &mut PgConnection,
     ctx: &WriteCtx,
     kind: Kind,
@@ -507,7 +519,7 @@ async fn put(
 }
 
 /// Deletes the document `kind`/`id` if it is live.
-async fn retire(
+pub(crate) async fn retire(
     conn: &mut PgConnection,
     ctx: &WriteCtx,
     kind: Kind,
@@ -591,25 +603,32 @@ pub async fn ensure_internal_tenant(db: &Db, ctx: &WriteCtx) -> Result<TenantRow
     .map_err(|e: ApiError| BootError::InternalTenant(format!("{}: {}", e.code, e.message)))
 }
 
-/// The tenants whose grants include `model_id`, in id order.
+/// The tenants whose grants, or whose live keys' selections, include
+/// `model_id`, in id order.
 async fn holders_of(conn: &mut PgConnection, model_id: Uuid) -> Result<Vec<Uuid>, ApiError> {
-    Ok(
-        sqlx::query_scalar("SELECT id FROM tenants WHERE $1 = ANY(allowed_model_ids) ORDER BY id")
-            .bind(model_id)
-            .fetch_all(conn)
-            .await
-            .map_err(DbError::from)?,
+    Ok(sqlx::query_scalar(
+        "SELECT id FROM tenants WHERE $1 = ANY(allowed_model_ids) \
+         UNION SELECT tenant_id FROM tenant_keys WHERE revoked_at IS NULL AND $1 = ANY(model_ids) \
+         ORDER BY 1",
     )
+    .bind(model_id)
+    .fetch_all(conn)
+    .await
+    .map_err(DbError::from)?)
 }
 
-/// Withdraws `model_id` from every tenant grant and re-projects each tenant
-/// it was withdrawn from, ahead of the model's own delete in the same
-/// transaction (ruling 13). Runs before `write_resource` deletes the model,
-/// so the tenant locks are taken before the resources lock.
+/// Withdraws `model_id` from every tenant grant and every live key's
+/// selection, and re-projects each tenant it was withdrawn from with its
+/// keys, ahead of the model's own delete in the same transaction (ruling
+/// 13). A selection that loses its last model is left empty, which grants
+/// none, never cleared, which would follow every grant. Runs before
+/// `write_resource` deletes the model, so the tenant locks are taken before
+/// the resources lock.
 ///
 /// A grant is only ever added under the resources lock (see [`update`]),
-/// and the holders are looked up before that lock can be taken. So the
-/// holders are looked up again once it is held: one that appeared in
+/// and a key selects only from its tenant's grants, under the tenant's
+/// lock. The holders are looked up before the resources lock can be taken,
+/// so they are looked up again once it is held: one that appeared in
 /// between, which cannot be locked now without breaking the lock order,
 /// fails the delete as `503 unavailable`, to be retried.
 pub async fn on_model_deleted(
@@ -628,7 +647,17 @@ pub async fn on_model_deleted(
         sqlx::query(
             "UPDATE tenants SET allowed_model_ids = array_remove(allowed_model_ids, $2), \
                version = version + 1 \
-             WHERE id = $1",
+             WHERE id = $1 AND $2 = ANY(allowed_model_ids)",
+        )
+        .bind(id)
+        .bind(model_id)
+        .execute(&mut *conn)
+        .await
+        .map_err(DbError::from)?;
+        sqlx::query(
+            "UPDATE tenant_keys SET model_ids = array_remove(model_ids, $2), \
+               version = version + 1 \
+             WHERE tenant_id = $1 AND revoked_at IS NULL AND $2 = ANY(model_ids)",
         )
         .bind(id)
         .bind(model_id)
@@ -762,7 +791,7 @@ pub(crate) fn tenant_name(raw: &str) -> Result<String, Detail> {
 /// name that is blank, starts or ends with whitespace, or is longer than 64
 /// characters. Names are matched exactly against provider keys' groups, so
 /// a stray space would match nothing.
-fn checked_groups(groups: &[String], at: &str) -> Result<Vec<String>, Vec<Detail>> {
+pub(crate) fn checked_groups(groups: &[String], at: &str) -> Result<Vec<String>, Vec<Detail>> {
     let problems: Vec<Detail> = groups
         .iter()
         .enumerate()
@@ -797,7 +826,7 @@ fn checked_groups(groups: &[String], at: &str) -> Result<Vec<String>, Vec<Detail
 /// The refusal of an empty group list where a customer's is required: a
 /// key with no groups is served by every upstream, so a customer reaching
 /// every upstream lists every group instead.
-fn no_groups(at: &str) -> Detail {
+pub(crate) fn no_groups(at: &str) -> Detail {
     detail(
         at,
         "至少需要一个分组：不设分组即可使用全部上游；如确需全部上游，请逐一列出各分组",
@@ -846,18 +875,19 @@ pub struct TenantView {
     limits: TenantLimits,
     /// Members that are not removed, disabled ones included.
     member_count: i64,
-    /// Keys arrive with the key task; until then a tenant has none.
+    /// Keys that are not revoked.
     key_count: i64,
     version: i64,
     created_at: DateTime<Utc>,
     approved_at: Option<DateTime<Utc>>,
-    /// The worst rollout among the documents the tenant derives.
+    /// The worst rollout among the documents the tenant and its keys
+    /// derive.
     rollout: ResourceRollout,
 }
 
-/// The views of `tenants`, each with the rollout of its documents (live
-/// ones, and deletes still on their way) over the gateways of `env`, online
-/// when heard from within `stale_secs`.
+/// The views of `tenants`, each with the rollout of its documents and its
+/// keys' (live ones, and deletes still on their way) over the gateways of
+/// `env`, online when heard from within `stale_secs`.
 async fn views(
     conn: &mut PgConnection,
     env: &EnvSettings,
@@ -865,14 +895,40 @@ async fn views(
     tenants: Vec<TenantRow>,
 ) -> Result<Vec<TenantView>, ApiError> {
     let fleet = Fleet::load(&mut *conn, env, stale_secs).await?;
-    let owners: Vec<String> = tenants.iter().map(|t| owner(t.id)).collect();
-    let mut rows: BTreeMap<String, Vec<ResourceRow>> = BTreeMap::new();
+    let ids: Vec<Uuid> = tenants.iter().map(|t| t.id).collect();
+    // Each document's owner, and the tenant it belongs to: the tenant's
+    // own, and its keys', revoked ones included while their delete may be
+    // on its way.
+    let mut tenant_of: BTreeMap<String, Uuid> =
+        tenants.iter().map(|t| (owner(t.id), t.id)).collect();
+    let tenant_keys: Vec<(Uuid, Uuid)> =
+        sqlx::query_as("SELECT id, tenant_id FROM tenant_keys WHERE tenant_id = ANY($1)")
+            .bind(&ids)
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(DbError::from)?;
+    tenant_of.extend(
+        tenant_keys
+            .into_iter()
+            .map(|(key, t)| (keys::owner(key), t)),
+    );
+    let owners: Vec<String> = tenant_of.keys().cloned().collect();
+    let mut rows: BTreeMap<Uuid, Vec<ResourceRow>> = BTreeMap::new();
     for row in store::owned_by(&mut *conn, &owners).await? {
-        if let Some(owner) = row.managed_by.clone() {
-            rows.entry(owner).or_default().push(row);
+        if let Some(t) = row.managed_by.as_ref().and_then(|o| tenant_of.get(o)) {
+            rows.entry(*t).or_default().push(row);
         }
     }
-    let ids: Vec<Uuid> = tenants.iter().map(|t| t.id).collect();
+    let key_counts: BTreeMap<Uuid, i64> = sqlx::query_as::<_, (Uuid, i64)>(
+        "SELECT tenant_id, count(*) FROM tenant_keys \
+         WHERE tenant_id = ANY($1) AND revoked_at IS NULL GROUP BY tenant_id",
+    )
+    .bind(&ids)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(DbError::from)?
+    .into_iter()
+    .collect();
     let member_counts: BTreeMap<Uuid, i64> = sqlx::query_as::<_, (Uuid, i64)>(
         "SELECT tenant_id, count(*) FROM members \
          WHERE tenant_id = ANY($1) AND removed_at IS NULL GROUP BY tenant_id",
@@ -887,7 +943,7 @@ async fn views(
         .into_iter()
         .map(|t| {
             let states: Vec<ResourceRollout> = rows
-                .get(&owner(t.id))
+                .get(&t.id)
                 .map(|rows| {
                     rows.iter()
                         .map(|row| fleet.rollout(&RolloutInput::of_row(row)))
@@ -904,7 +960,7 @@ async fn views(
                 allowed_provider_groups: t.allowed_provider_groups,
                 limits: t.limits,
                 member_count: member_counts.get(&t.id).copied().unwrap_or(0),
-                key_count: 0,
+                key_count: key_counts.get(&t.id).copied().unwrap_or(0),
                 version: t.version,
                 created_at: t.created_at,
                 approved_at: t.approved_at,
@@ -1286,7 +1342,7 @@ pub async fn approve(
 }
 
 /// `POST /admin/tenants/{id}/suspend`: active → suspended. The team stays;
-/// the limits policy goes, and the keys stop working (the key task).
+/// the keys are disabled, and then the limits policy goes.
 pub async fn suspend(
     auth: OperatorAuth,
     State(state): State<AppState>,

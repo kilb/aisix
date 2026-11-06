@@ -27,7 +27,7 @@ use serde_json::{json, Value};
 use crate::auth::{MemberRole, OperatorRole};
 use crate::error::{ApiError, Detail};
 use crate::{
-    audit, dp, gateways, members, operators, projector, resources, rollout, tenants, usage,
+    audit, dp, gateways, keys, members, operators, projector, resources, rollout, tenants, usage,
     AppState,
 };
 
@@ -206,6 +206,28 @@ pub const ROUTE_ROLES: &[(&str, &str, MinRole)] = &[
         "/admin/members/{id}",
         MinRole::Op(OperatorRole::Operator),
     ),
+    // Tenant keys, as operators see them.
+    (
+        "GET",
+        "/admin/tenants/{id}/keys",
+        MinRole::Op(OperatorRole::Viewer),
+    ),
+    (
+        "POST",
+        "/admin/tenants/{id}/keys",
+        MinRole::Op(OperatorRole::Operator),
+    ),
+    ("GET", "/admin/keys/{id}", MinRole::Op(OperatorRole::Viewer)),
+    (
+        "PATCH",
+        "/admin/keys/{id}",
+        MinRole::Op(OperatorRole::Operator),
+    ),
+    (
+        "DELETE",
+        "/admin/keys/{id}",
+        MinRole::Op(OperatorRole::Operator),
+    ),
     // The tenant API.
     ("POST", "/api/signup", MinRole::Public),
     ("POST", "/api/login", MinRole::Public),
@@ -225,6 +247,11 @@ pub const ROUTE_ROLES: &[(&str, &str, MinRole)] = &[
     ),
     ("PATCH", "/api/members/{id}", MinRole::Member(MANAGERS)),
     ("DELETE", "/api/members/{id}", MinRole::Member(MANAGERS)),
+    ("GET", "/api/keys", MinRole::Member(KEY_HOLDERS)),
+    ("POST", "/api/keys", MinRole::Member(KEY_HOLDERS)),
+    ("GET", "/api/keys/{id}", MinRole::Member(KEY_HOLDERS)),
+    ("PATCH", "/api/keys/{id}", MinRole::Member(KEY_HOLDERS)),
+    ("DELETE", "/api/keys/{id}", MinRole::Member(KEY_HOLDERS)),
     // Stored usage.
     (
         "GET",
@@ -257,6 +284,10 @@ const EVERY_MEMBER: &[MemberRole] = &[
 
 /// The tenant roles that manage members.
 const MANAGERS: &[MemberRole] = &[MemberRole::Owner, MemberRole::Admin];
+
+/// The tenant roles that hold keys: a member their own, the managers every
+/// key of the tenant.
+const KEY_HOLDERS: &[MemberRole] = &[MemberRole::Owner, MemberRole::Admin, MemberRole::Member];
 
 /// The member routes a member of a tenant that is not active (pending
 /// approval, or suspended) may still call, to see the tenant's state and
@@ -323,6 +354,16 @@ pub fn browser_router(state: AppState) -> Router {
         .route("/admin/tenants/{id}/members", get(members::admin_list))
         .route("/admin/tenants/{id}/invites", post(members::admin_invite))
         .route("/admin/members/{id}", patch(members::admin_update))
+        .route(
+            "/admin/tenants/{id}/keys",
+            get(keys::admin_list).post(keys::admin_create),
+        )
+        .route(
+            "/admin/keys/{id}",
+            get(keys::admin_get)
+                .patch(keys::admin_update)
+                .delete(keys::admin_revoke),
+        )
         .route("/api/signup", post(members::signup))
         .route("/api/login", post(members::login))
         .route("/api/logout", post(members::logout))
@@ -340,6 +381,11 @@ pub fn browser_router(state: AppState) -> Router {
         .route(
             "/api/members/{id}",
             patch(members::update).delete(members::remove),
+        )
+        .route("/api/keys", get(keys::list).post(keys::create))
+        .route(
+            "/api/keys/{id}",
+            get(keys::get).patch(keys::update).delete(keys::revoke),
         )
         .route("/admin/usage/events", get(usage::list_events))
         .route("/admin/usage/batches", get(usage::list_batches))

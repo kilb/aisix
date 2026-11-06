@@ -44,7 +44,8 @@ impl MemberSession {
 /// The request the tenant route `method path` is tested with: the concrete
 /// path and the body. Ids name nothing and bodies are refused once the
 /// identity checks have passed, except `POST /api/members/invites`, which
-/// creates an invitation. Called once per attempt.
+/// creates an invitation, and `POST /api/keys`, which mints a key. Called
+/// once per attempt.
 pub fn tenant_fixture(method: &str, path: &str) -> (String, Option<Value>) {
     match (method, path) {
         // Rejected as too short, after the identity checks.
@@ -70,6 +71,12 @@ pub fn tenant_fixture(method: &str, path: &str) -> (String, Option<Value>) {
             Some(json!({"role": "member"})),
         ),
         ("DELETE", "/api/members/{id}") => (format!("/api/members/{}", Uuid::new_v4()), None),
+        ("GET", "/api/keys") => (path.to_string(), None),
+        ("POST", "/api/keys") => (path.to_string(), Some(json!({"label": "fixture-key"}))),
+        ("GET" | "PATCH" | "DELETE", "/api/keys/{id}") => (
+            format!("/api/keys/{}", Uuid::new_v4()),
+            (method == "PATCH").then(|| json!({"label": "fixture-key"})),
+        ),
         _ => panic!("no fixture for {method} {path}: add one to tests/support/members.rs"),
     }
 }

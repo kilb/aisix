@@ -24,6 +24,7 @@ pub mod etcd_front;
 pub mod gateways;
 pub mod housekeeping;
 pub mod http;
+pub mod keys;
 pub mod kine;
 pub mod members;
 pub mod operators;

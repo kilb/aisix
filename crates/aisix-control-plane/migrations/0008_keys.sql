@@ -1,0 +1,12 @@
+-- Tenant API keys. Each live key projects one gateway document,
+-- `api_keys/<id>`, built from the key, its tenant and its member. Only the
+-- SHA-256 of the plaintext is kept (`key_hash`); `key_prefix` shows the key
+-- by its first characters. A revoked key keeps its row (`revoked_at`) and
+-- leaves every list.
+CREATE TABLE tenant_keys (id uuid PRIMARY KEY, tenant_id uuid NOT NULL REFERENCES tenants(id), member_id uuid REFERENCES members(id),
+  label text NOT NULL, key_hash text NOT NULL UNIQUE, key_prefix text NOT NULL,
+  model_ids uuid[], allowed_models text[], allowed_provider_groups text[], rate_limit jsonb NOT NULL DEFAULT '{}',
+  disabled boolean NOT NULL DEFAULT false, expires_at timestamptz, version bigint NOT NULL DEFAULT 1,
+  created_by_kind text NOT NULL, created_by uuid, created_at timestamptz NOT NULL DEFAULT now(), revoked_at timestamptz);
+CREATE INDEX tenant_keys_tenant ON tenant_keys (tenant_id) WHERE revoked_at IS NULL;
+CREATE INDEX tenant_keys_member ON tenant_keys (member_id) WHERE revoked_at IS NULL;
