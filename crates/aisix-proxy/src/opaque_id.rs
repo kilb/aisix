@@ -9,10 +9,11 @@
 //!   ([`mint_response_id`]), one per response, shared by every frame of a
 //!   stream.
 //! - A Chat Completions or Messages tool-call id is mapped one way
-//!   ([`map_tool_call_id`]). Both protocols carry the whole conversation on
-//!   every request, and an upstream pairs a tool call with its result only
-//!   inside that one request, so the mapped id travels upstream unchanged on
-//!   the next turn and still pairs.
+//!   ([`map_tool_call_id`]), and so are a Messages answer's server and MCP
+//!   tool-use ids ([`map_messages_tool_id`]). Both protocols carry the whole
+//!   conversation on every request, and an upstream pairs a tool call with
+//!   its result only inside that one request, so the mapped id travels
+//!   upstream unchanged on the next turn and still pairs.
 //! - A Responses output item's ids are sealed reversibly ([`Sealer`]) and
 //!   unsealed on their way back in ([`unseal_responses_input`]): that protocol
 //!   cannot take a substitute id, see there. An item id keeps its upstream's
@@ -71,13 +72,40 @@ pub(crate) fn mint_response_id(surface: Surface) -> String {
 /// `HMAC-SHA256(key, surface || 0x00 || upstream_id)` in hex, behind the
 /// surface's tool-call prefix. The same input always maps to the same id.
 pub(crate) fn map_tool_call_id(key: &[u8; 32], surface: Surface, upstream_id: &str) -> String {
+    mapped_id(key, surface, surface.tool_call_id_prefix(), upstream_id)
+}
+
+/// [`map_tool_call_id`]'s HMAC behind `prefix`.
+fn mapped_id(key: &[u8; 32], surface: Surface, prefix: &str, upstream_id: &str) -> String {
     let tag = hmac_parts(key, &[surface.label(), &[0], upstream_id.as_bytes()]);
-    let mut id = String::with_capacity(surface.tool_call_id_prefix().len() + 32);
-    id.push_str(surface.tool_call_id_prefix());
+    let mut id = String::with_capacity(prefix.len() + 32);
+    id.push_str(prefix);
     for byte in &tag.as_ref()[..16] {
         id.push_str(&format!("{byte:02x}"));
     }
     id
+}
+
+/// The families of tool-use id a Messages answer carries, longest first: a
+/// server tool's (`srvtoolu_`), an MCP tool's (`mcptoolu_`) and a client
+/// tool's (`toolu_`).
+const MESSAGES_TOOL_ID_FAMILIES: [&str; 3] = ["srvtoolu_", "mcptoolu_", "toolu_"];
+
+/// The id a tenant sees for a Messages tool-use id: [`map_tool_call_id`]'s
+/// HMAC behind the family prefix the upstream id starts with, and `toolu_`
+/// when it starts with none. A client tool's id therefore maps exactly as
+/// [`map_tool_call_id`] maps it, and a server tool's keeps the `srvtoolu_`
+/// the Messages API requires of it on the next turn (the request pattern
+/// `^srvtoolu_[a-zA-Z0-9_]+$` of a `server_tool_use` block's `id`, a server
+/// tool result's `tool_use_id` and a `caller`'s `tool_id`,
+/// <https://platform.claude.com/docs/en/api/messages>).
+pub(crate) fn map_messages_tool_id(key: &[u8; 32], upstream_id: &str) -> String {
+    let prefix = MESSAGES_TOOL_ID_FAMILIES
+        .iter()
+        .find(|family| upstream_id.starts_with(*family))
+        .copied()
+        .unwrap_or(Surface::Messages.tool_call_id_prefix());
+    mapped_id(key, Surface::Messages, prefix, upstream_id)
 }
 
 /// Whether `id` has the shape of an id this module mints or maps on `surface`.
@@ -584,6 +612,49 @@ enum MessagesSlot {
     MessageId,
     BlockType,
     BlockId,
+    BlockToolUseId,
+    CallerToolId,
+}
+
+/// Which of a content block's own ids name a tool use, by the block's type:
+/// the `id` of a `tool_use`, `server_tool_use` or `mcp_tool_use` block, and
+/// the `tool_use_id` of a block that answers one (`tool_result` and every
+/// `*_tool_result`, such as `web_search_tool_result` and `mcp_tool_result`).
+/// A `caller`'s `tool_id` names the server tool use that made the call on
+/// any block (anthropic-sdk-python `types/server_tool_caller_param.py`).
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+struct BlockIds {
+    id: bool,
+    tool_use_id: bool,
+}
+
+impl BlockIds {
+    const ALL: Self = Self {
+        id: true,
+        tool_use_id: true,
+    };
+
+    fn of(block_type: Option<&str>) -> Self {
+        let Some(t) = block_type else {
+            return Self::default();
+        };
+        Self {
+            id: matches!(t, "tool_use" | "server_tool_use" | "mcp_tool_use"),
+            tool_use_id: t.ends_with("tool_result"),
+        }
+    }
+
+    /// Whether `self` mapped an id `allowed` does not.
+    fn exceeds(self, allowed: Self) -> bool {
+        (self.id && !allowed.id) || (self.tool_use_id && !allowed.tool_use_id)
+    }
+}
+
+/// One splice pass over a Messages stream event.
+struct MessagesSplice {
+    spliced: Option<Vec<u8>>,
+    block_type: Option<String>,
+    mapped: BlockIds,
 }
 
 impl MessagesIds {
@@ -595,16 +666,22 @@ impl MessagesIds {
     }
 
     fn map_block(&self, block: &mut Value) {
-        if block.get("type").and_then(Value::as_str) != Some("tool_use") {
+        let ids = BlockIds::of(block.get("type").and_then(Value::as_str));
+        let Some(map) = block.as_object_mut() else {
             return;
+        };
+        for (field, wanted) in [("id", ids.id), ("tool_use_id", ids.tool_use_id)] {
+            if let Some(Value::String(id)) = map.get_mut(field).filter(|_| wanted) {
+                *id = map_messages_tool_id(&self.key, id);
+            }
         }
-        if let Some(Value::String(id)) = block.get_mut("id") {
-            *id = map_tool_call_id(&self.key, Surface::Messages, id);
+        if let Some(Value::String(id)) = map.get_mut("caller").and_then(|c| c.get_mut("tool_id")) {
+            *id = map_messages_tool_id(&self.key, id);
         }
     }
 
-    /// A buffered Messages answer: its `id`, each `tool_use` block's `id`,
-    /// and no channel metrics.
+    /// A buffered Messages answer: its `id`, the tool-use ids of its blocks
+    /// ([`BlockIds`]), and no channel metrics.
     pub(crate) fn apply_to_body(&self, body: &mut Value) {
         if let Some(Value::String(id)) = body.get_mut("id") {
             id.clone_from(&self.message_id);
@@ -619,8 +696,8 @@ impl MessagesIds {
         }
     }
 
-    /// One parsed stream event: `message_start.message.id` and a `tool_use`
-    /// `content_block_start`'s block id.
+    /// One parsed stream event: `message_start.message.id` and the tool-use
+    /// ids of a `content_block_start`'s block.
     pub(crate) fn apply_to_event(&self, event: &mut Value) {
         if let Some(Value::String(id)) = event.pointer_mut("/message/id") {
             id.clone_from(&self.message_id);
@@ -642,14 +719,24 @@ impl MessagesIds {
         payload: &[u8],
         client_facing_model: &str,
     ) -> Option<Vec<u8>> {
-        let spliced = match self.splice_event(payload, client_facing_model, true) {
-            // A block id was mapped before its block's `type` said it is
-            // not a tool_use: splice again without it.
-            Ok((_, true)) => self.splice_event(payload, client_facing_model, false),
+        let spliced = match self.splice_event(payload, client_facing_model, BlockIds::ALL) {
+            // A block's id was mapped before its `type` said the block has
+            // no such tool-use id: splice again, mapping what the type says.
+            Ok(pass)
+                if pass
+                    .mapped
+                    .exceeds(BlockIds::of(pass.block_type.as_deref())) =>
+            {
+                self.splice_event(
+                    payload,
+                    client_facing_model,
+                    BlockIds::of(pass.block_type.as_deref()),
+                )
+            }
             other => other,
         };
         let spliced = match spliced {
-            Ok((spliced, _)) => spliced,
+            Ok(pass) => pass.spliced,
             Err(error) => {
                 tracing::debug!(%error, "platform id rewrite skipped; forwarding verbatim");
                 return None;
@@ -658,17 +745,17 @@ impl MessagesIds {
         strip_channel_metrics(spliced.as_deref().unwrap_or(payload)).or(spliced)
     }
 
-    /// One splice pass; the flag says a block id was mapped on a block whose
-    /// `type` is not `tool_use`.
+    /// One splice pass, mapping the block ids `allowed` names; it reports
+    /// the block's type and the ids it mapped.
     fn splice_event(
         &self,
         payload: &[u8],
         client_facing_model: &str,
-        map_block_id: bool,
-    ) -> Result<(Option<Vec<u8>>, bool), json_splice::SpliceError> {
+        allowed: BlockIds,
+    ) -> Result<MessagesSplice, json_splice::SpliceError> {
         let slot = std::cell::Cell::new(None);
         let mut block_type: Option<String> = None;
-        let mut block_id_mapped = false;
+        let mut mapped = BlockIds::default();
         let spliced = json_splice::rewrite_string_values(
             payload,
             |path| {
@@ -678,9 +765,17 @@ impl MessagesIds {
                             ("message", "model") => Some(MessagesSlot::Model),
                             ("message", "id") => Some(MessagesSlot::MessageId),
                             ("content_block", "type") => Some(MessagesSlot::BlockType),
-                            ("content_block", "id") if map_block_id => Some(MessagesSlot::BlockId),
+                            ("content_block", "id") if allowed.id => Some(MessagesSlot::BlockId),
+                            ("content_block", "tool_use_id") if allowed.tool_use_id => {
+                                Some(MessagesSlot::BlockToolUseId)
+                            }
                             _ => None,
                         }
+                    }
+                    [PathSeg::Key(block), PathSeg::Key(caller), PathSeg::Key(field)]
+                        if block == "content_block" && caller == "caller" && field == "tool_id" =>
+                    {
+                        Some(MessagesSlot::CallerToolId)
                     }
                     _ => None,
                 };
@@ -695,15 +790,21 @@ impl MessagesIds {
                     None
                 }
                 MessagesSlot::BlockId => {
-                    block_id_mapped = true;
-                    Some(map_tool_call_id(&self.key, Surface::Messages, value))
+                    mapped.id = true;
+                    Some(map_messages_tool_id(&self.key, value))
                 }
+                MessagesSlot::BlockToolUseId => {
+                    mapped.tool_use_id = true;
+                    Some(map_messages_tool_id(&self.key, value))
+                }
+                MessagesSlot::CallerToolId => Some(map_messages_tool_id(&self.key, value)),
             },
         )?;
-        Ok((
+        Ok(MessagesSplice {
             spliced,
-            block_id_mapped && block_type.as_deref() != Some("tool_use"),
-        ))
+            block_type,
+            mapped,
+        })
     }
 }
 
@@ -1273,8 +1374,11 @@ pub(crate) mod tests {
             body["content"][1]["id"],
             map_tool_call_id(&K, Surface::Messages, "toolu_bdrk_01Y")
         );
-        // Only a tool_use block's id is a tool-call id the client echoes.
-        assert_eq!(body["content"][2]["id"], "srvtoolu_01");
+        // A server tool's id is mapped behind its own family prefix.
+        assert_eq!(
+            body["content"][2]["id"],
+            map_messages_tool_id(&K, "srvtoolu_01")
+        );
         assert!(body.get("amazon-bedrock-invocationMetrics").is_none());
         assert_eq!(
             body["usage"],
@@ -1307,9 +1411,10 @@ pub(crate) mod tests {
                 .contains(&mapped)
         );
 
-        // Another block type's id is not a tool-call id, so the frame is left alone.
-        let server = br#"{"type":"content_block_start","index":2,"content_block":{"id":"srvtoolu_01","type":"server_tool_use"}}"#;
-        assert_eq!(ids.rewrite_event_json(server, "alias"), None);
+        // A block that is not a tool use keeps its ids, even one read ahead
+        // of the type.
+        let text = br#"{"type":"content_block_start","index":2,"content_block":{"id":"x_1","tool_use_id":"toolu_1","type":"text","text":""}}"#;
+        assert_eq!(ids.rewrite_event_json(text, "alias"), None);
 
         let stop = br#"{"type":"message_stop","amazon-bedrock-invocationMetrics":{"inputTokenCount":3,"outputTokenCount":1}}"#;
         assert_eq!(
@@ -1318,6 +1423,116 @@ pub(crate) mod tests {
         );
         let delta = br#"{"type":"content_block_delta","index":0,"delta":{"text":"hi"}}"#;
         assert_eq!(ids.rewrite_event_json(delta, "alias"), None);
+    }
+
+    /// A client tool's id maps exactly as it did before server and MCP tool
+    /// ids were mapped too, whatever its upstream prefix.
+    #[test]
+    fn a_client_tool_id_maps_as_it_always_did() {
+        for upstream in [
+            "toolu_bdrk_01Y",
+            "toolu_vrtx_01",
+            "call_up_1",
+            "tooluse_x",
+            "",
+        ] {
+            assert_eq!(
+                map_messages_tool_id(&K, upstream),
+                map_tool_call_id(&K, Surface::Messages, upstream),
+                "{upstream}"
+            );
+        }
+    }
+
+    /// Server and MCP tool-use ids, and the result blocks and callers that
+    /// name them, are mapped like a tool_use id, behind their own family
+    /// prefix, so they still pair and still match the pattern the Messages
+    /// API sets for them on the next turn.
+    #[test]
+    fn server_and_mcp_tool_ids_are_mapped_behind_their_family_prefix() {
+        let ids = MessagesIds::new(&K);
+        let mut body = json!({
+            "id": "msg_vrtx_01M",
+            "type": "message",
+            "content": [
+                {"type": "server_tool_use", "id": "srvtoolu_vrtx_01S", "name": "web_search",
+                 "input": {"query": "weather"}},
+                {"type": "web_search_tool_result", "tool_use_id": "srvtoolu_vrtx_01S",
+                 "content": [{"type": "web_search_result", "url": "https://example.com", "title": "t",
+                              "encrypted_content": "EC"}]},
+                {"type": "server_tool_use", "id": "srvtoolu_vrtx_02C", "name": "code_execution", "input": {}},
+                {"type": "tool_use", "id": "toolu_vrtx_03", "name": "f", "input": {},
+                 "caller": {"type": "code_execution_20250825", "tool_id": "srvtoolu_vrtx_02C"}},
+                {"type": "code_execution_tool_result", "tool_use_id": "srvtoolu_vrtx_02C", "content": {}},
+                {"type": "mcp_tool_use", "id": "mcptoolu_vrtx_04", "name": "lookup", "server_name": "s",
+                 "input": {}},
+                {"type": "mcp_tool_result", "tool_use_id": "mcptoolu_vrtx_04", "content": []},
+                {"type": "text", "text": "Sunny."},
+            ],
+        });
+        ids.apply_to_body(&mut body);
+        let text = body.to_string();
+        assert!(!text.contains("vrtx"), "{text}");
+        let c = &body["content"];
+        let server = c[0]["id"].as_str().unwrap();
+        assert!(server.starts_with("srvtoolu_"), "{server}");
+        let pattern = |id: &str, prefix: &str| {
+            id.strip_prefix(prefix).is_some_and(|rest| {
+                !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+            })
+        };
+        assert!(pattern(server, "srvtoolu_"), "{server}");
+        assert_eq!(c[1]["tool_use_id"], server, "the result pairs with its use");
+        assert_eq!(c[3]["caller"]["tool_id"], c[2]["id"]);
+        assert_eq!(c[4]["tool_use_id"], c[2]["id"]);
+        assert_eq!(
+            c[3]["id"],
+            map_tool_call_id(&K, Surface::Messages, "toolu_vrtx_03")
+        );
+        let mcp = c[5]["id"].as_str().unwrap();
+        assert!(pattern(mcp, "mcptoolu_"), "{mcp}");
+        assert_eq!(c[6]["tool_use_id"], mcp);
+        assert_eq!(c[1]["content"][0]["encrypted_content"], "EC");
+        assert_eq!(c[7]["text"], "Sunny.");
+    }
+
+    /// The stream splice maps the same ids, whichever order a block writes
+    /// its fields in.
+    #[test]
+    fn a_messages_stream_maps_server_and_mcp_tool_ids() {
+        let ids = MessagesIds::new(&K);
+        let server = map_messages_tool_id(&K, "srvtoolu_vrtx_01S");
+        let mcp = map_messages_tool_id(&K, "mcptoolu_vrtx_04");
+        for (frame, mapped) in [
+            (
+                &br#"{"type":"content_block_start","index":0,"content_block":{"type":"server_tool_use","id":"srvtoolu_vrtx_01S","name":"web_search","input":{}}}"#[..],
+                &server,
+            ),
+            (
+                br#"{"type":"content_block_start","index":0,"content_block":{"id":"srvtoolu_vrtx_01S","name":"web_search","type":"server_tool_use","input":{}}}"#,
+                &server,
+            ),
+            (
+                br#"{"type":"content_block_start","index":1,"content_block":{"tool_use_id":"srvtoolu_vrtx_01S","type":"web_search_tool_result","content":[]}}"#,
+                &server,
+            ),
+            (
+                br#"{"type":"content_block_start","index":2,"content_block":{"type":"mcp_tool_use","id":"mcptoolu_vrtx_04","name":"lookup","server_name":"s","input":{}}}"#,
+                &mcp,
+            ),
+            (
+                br#"{"type":"content_block_start","index":3,"content_block":{"type":"mcp_tool_result","tool_use_id":"mcptoolu_vrtx_04","content":[]}}"#,
+                &mcp,
+            ),
+            (
+                br#"{"type":"content_block_start","index":4,"content_block":{"type":"tool_use","id":"toolu_x","name":"f","input":{},"caller":{"type":"code_execution_20250825","tool_id":"srvtoolu_vrtx_01S"}}}"#,
+                &server,
+            ),
+        ] {
+            let out = String::from_utf8(ids.rewrite_event_json(frame, "alias").unwrap()).unwrap();
+            assert!(!out.contains("vrtx"), "{out}");
+            assert!(out.contains(mapped.as_str()), "{out}");
+        }
     }
 
     #[test]
