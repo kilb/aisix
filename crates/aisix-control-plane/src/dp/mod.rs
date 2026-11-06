@@ -6,7 +6,7 @@
 //! connection ([`ConnIdentity`]); [`DpIdentity`] checks them against this
 //! environment and the credential list on every request, so a credential
 //! revoked while its gateway is connected is refused from the next request
-//! on.
+//! on. The etcd front applies the same check ([`admitted`]) to every RPC.
 
 pub mod heartbeat;
 pub mod listener;
@@ -20,6 +20,7 @@ use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
 use chrono::{DateTime, Utc};
 use sqlx::postgres::{PgListener, PgNotification};
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 use uuid::Uuid;
@@ -27,6 +28,7 @@ use uuid::Uuid;
 use crate::db::{Db, DbError};
 use crate::error::ApiError;
 use crate::gateways::CREDENTIALS_CHANNEL;
+use crate::settings::EnvSettings;
 use crate::AppState;
 
 /// How often the credential list is read again in full, whatever the
@@ -50,10 +52,49 @@ pub struct ConnIdentity {
     pub fingerprint: String,
 }
 
+/// Ends the connection a request came on: the listener attaches one to
+/// every request of an h2 connection, where the etcd front serves watches
+/// that never end on their own. Once closed, the connection sends GOAWAY,
+/// lets what is in flight finish, and is dropped within the listener's
+/// drain deadline. Cheap to clone: clones close the same connection.
+#[derive(Debug, Clone)]
+pub struct ConnClose(Arc<watch::Sender<bool>>);
+
+impl ConnClose {
+    pub fn new() -> ConnClose {
+        ConnClose(Arc::new(watch::channel(false).0))
+    }
+
+    pub fn close(&self) {
+        self.0.send_replace(true);
+    }
+
+    /// Resolves once the connection is closing: closed by a request, or by
+    /// the listener's shutdown.
+    pub async fn closing(&self) {
+        let mut closing = self.0.subscribe();
+        let _ = closing.wait_for(|closing| *closing).await;
+    }
+}
+
+impl Default for ConnClose {
+    fn default() -> ConnClose {
+        ConnClose::new()
+    }
+}
+
+/// Resolves once `close` is closing; never without one.
+pub(crate) async fn closing(close: Option<&ConnClose>) {
+    match close {
+        Some(close) => close.closing().await,
+        None => std::future::pending().await,
+    }
+}
+
 /// The gateway credential a request comes from. Extracting it answers `403
 /// forbidden` unless the connection's certificate names this environment
 /// and a listed credential that is neither revoked nor expired and whose
-/// certificate it is.
+/// certificate it is ([`admitted`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DpIdentity {
     pub dp_id: Uuid,
@@ -70,24 +111,39 @@ impl FromRequestParts<AppState> for DpIdentity {
         let Some(conn) = parts.extensions.get::<ConnIdentity>() else {
             return Err(ApiError::forbidden());
         };
-        if conn.env_id != state.env.env_id.to_string() {
-            tracing::info!(env_id = %conn.env_id, dp_id = %conn.dp_id,
-                "refused a gateway certificate for another environment");
-            return Err(ApiError::forbidden());
+        match admitted(conn, &state.env, &state.creds).await? {
+            Some(dp_id) => Ok(DpIdentity { dp_id }),
+            None => Err(ApiError::forbidden()),
         }
-        let Ok(dp_id) = Uuid::parse_str(&conn.dp_id) else {
-            return Err(ApiError::forbidden());
-        };
-        if !state.creds.check(dp_id, &conn.fingerprint).await? {
-            tracing::info!(%dp_id, "refused a gateway credential that is revoked, expired or unlisted");
-            return Err(ApiError::forbidden());
-        }
-        Ok(DpIdentity { dp_id })
     }
 }
 
+/// The credential `conn` speaks for, when its certificate names `env` and a
+/// listed credential that is neither revoked nor expired and whose
+/// certificate it is; `None`, logged, otherwise. The one rule both the
+/// `/dp` endpoints and the etcd front admit a gateway by.
+pub(crate) async fn admitted(
+    conn: &ConnIdentity,
+    env: &EnvSettings,
+    creds: &CredentialCache,
+) -> Result<Option<Uuid>, DbError> {
+    if conn.env_id != env.env_id.to_string() {
+        tracing::info!(env_id = %conn.env_id, dp_id = %conn.dp_id,
+            "refused a gateway certificate for another environment");
+        return Ok(None);
+    }
+    let Ok(dp_id) = Uuid::parse_str(&conn.dp_id) else {
+        return Ok(None);
+    };
+    if !creds.check(dp_id, &conn.fingerprint).await? {
+        tracing::info!(%dp_id, "refused a gateway credential that is revoked, expired or unlisted");
+        return Ok(None);
+    }
+    Ok(Some(dp_id))
+}
+
 /// A credential as the cache holds it.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Listed {
     fingerprint: String,
     not_after: DateTime<Utc>,
@@ -100,10 +156,13 @@ struct Listed {
 /// It follows the database through [`CredentialCache::spawn_refresh`]: a
 /// notification on [`CREDENTIALS_CHANNEL`] (sent when a credential is issued
 /// or revoked, by any instance) reads the list again at once, and it is read
-/// again in full every 10 seconds regardless.
+/// again in full every 10 seconds regardless. A read that changes the list
+/// is announced to [`CredentialCache::changes`].
 #[derive(Clone)]
 pub struct CredentialCache {
     listed: Arc<RwLock<HashMap<Uuid, Listed>>>,
+    /// Counts the reads that changed the list.
+    changed: Arc<watch::Sender<u64>>,
     /// Every read of the cache's, and its listening, go through this pool.
     /// Given one of its own ([`CREDENTIALS_POOL_SIZE`]), a revoke is seen
     /// however busy request traffic keeps the main pool.
@@ -115,10 +174,18 @@ impl CredentialCache {
     pub async fn load(db: &Db) -> Result<CredentialCache, DbError> {
         let cache = CredentialCache {
             listed: Arc::default(),
+            changed: Arc::new(watch::channel(0).0),
             db: db.clone(),
         };
         cache.reload().await?;
         Ok(cache)
+    }
+
+    /// Marks a change each time a read of the list changes it, so what
+    /// holds a credential's admission open (a watch through the etcd front)
+    /// can check it again at once rather than at its next periodic check.
+    pub fn changes(&self) -> watch::Receiver<u64> {
+        self.changed.subscribe()
     }
 
     /// Whether `dp_id` is a listed credential, not revoked, not expired, and
@@ -180,7 +247,15 @@ impl CredentialCache {
                 )
             })
             .collect();
-        *self.write() = listed;
+        let changed = {
+            let mut held = self.write();
+            let changed = *held != listed;
+            *held = listed;
+            changed
+        };
+        if changed {
+            self.changed.send_modify(|n| *n = n.wrapping_add(1));
+        }
         Ok(())
     }
 

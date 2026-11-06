@@ -45,7 +45,7 @@ const TEMPLATE_LOCK_KEY: i64 = 0x6169_7369_7863_7074;
 static TEMPLATE: OnceCell<String> = OnceCell::const_new();
 
 /// Reads a gate variable: unset skips the test locally and fails it on CI.
-fn gate_var(name: &str) -> Option<String> {
+pub fn gate_var(name: &str) -> Option<String> {
     match std::env::var(name) {
         Ok(v) if !v.trim().is_empty() => Some(v),
         _ => {
@@ -202,7 +202,8 @@ fn test_config(database_url: &str) -> CpConfig {
         dp_base_url: "https://localhost:7943".to_string(),
         // Nothing can listen on port 0: a control plane started without
         // kine runs a projector that never reaches one, and never writes
-        // to an etcd or kine that happens to run on this host.
+        // to an etcd or kine that happens to run on this host. One that
+        // needs the test kine opts in (`TestCp::start_with_kine`).
         kine_endpoint: "http://127.0.0.1:0".to_string(),
         etcd_prefix: "/aisix".to_string(),
         env_id_seed: None,

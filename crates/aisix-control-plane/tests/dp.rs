@@ -923,7 +923,9 @@ async fn without_an_etcd_front_the_gateway_listener_offers_only_http_1_1() {
         return;
     };
     let (_, bundle) = setup(&cp).await;
-    let tls = tls_connect(cp.dp_addr(), pems(&bundle), &[b"h2", b"http/1.1"])
+    // The control plane's own listener has one now: a listener without.
+    let (addr, _stop) = serve_echo(&cp, ConnLimits::default()).await;
+    let tls = tls_connect(addr, pems(&bundle), &[b"h2", b"http/1.1"])
         .await
         .expect("the mTLS handshake");
     assert_eq!(tls.get_ref().1.alpn_protocol(), Some(&b"http/1.1"[..]));
@@ -938,6 +940,42 @@ fn echo(name: &'static str) -> Router {
             format!("{name} {}", id.dp_id)
         }),
     )
+}
+
+/// [`echo`] for h2: gRPC routes with one service, `who`, answering every
+/// path under `/who/` with `grpc <dp_id>`, the dp_id from the connection's
+/// identity.
+fn grpc_echo() -> listener::GrpcRoutes {
+    #[derive(Clone)]
+    struct Who;
+
+    impl tonic::server::NamedService for Who {
+        const NAME: &'static str = "who";
+    }
+
+    impl tower::Service<hyper::Request<tonic::body::BoxBody>> for Who {
+        type Response = hyper::Response<tonic::body::BoxBody>;
+        type Error = std::convert::Infallible;
+        type Future = std::future::Ready<Result<Self::Response, Self::Error>>;
+
+        fn poll_ready(
+            &mut self,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, request: hyper::Request<tonic::body::BoxBody>) -> Self::Future {
+            let dp_id = request
+                .extensions()
+                .get::<ConnIdentity>()
+                .map_or_else(|| "none".to_string(), |id| id.dp_id.clone());
+            let body = tonic::body::boxed(Full::new(Bytes::from(format!("grpc {dp_id}"))));
+            std::future::ready(Ok(hyper::Response::new(body)))
+        }
+    }
+
+    tonic::service::Routes::new(Who)
 }
 
 async fn text_of(response: hyper::Response<hyper::body::Incoming>) -> String {
@@ -967,13 +1005,13 @@ async fn connections_are_dispatched_by_alpn_and_drained_on_shutdown() {
         tcp,
         tls,
         echo("rest"),
-        Some(echo("grpc")),
+        Some(grpc_echo()),
         ConnLimits::default(),
         stopped,
     ));
-    let request = || {
+    let request = |path: &str| {
         hyper::Request::builder()
-            .uri("https://localhost/who")
+            .uri(format!("https://localhost{path}"))
             .body(Full::new(Bytes::new()))
             .expect("a request")
     };
@@ -985,7 +1023,7 @@ async fn connections_are_dispatched_by_alpn_and_drained_on_shutdown() {
         .await
         .expect("HTTP/1.1");
     let h1_conn = tokio::spawn(conn);
-    let answer = h1.send_request(request()).await.expect("an answer");
+    let answer = h1.send_request(request("/who")).await.expect("an answer");
     assert_eq!(text_of(answer).await, format!("rest {}", bundle.dp_id));
 
     let h2 = tls_connect(addr, pems(&bundle), &[b"h2"])
@@ -997,7 +1035,7 @@ async fn connections_are_dispatched_by_alpn_and_drained_on_shutdown() {
             .await
             .expect("HTTP/2");
     let h2_conn = tokio::spawn(conn);
-    let answer = h2.send_request(request()).await.expect("an answer");
+    let answer = h2.send_request(request("/who/x")).await.expect("an answer");
     assert_eq!(text_of(answer).await, format!("grpc {}", bundle.dp_id));
 
     // Both connections are idle and open; shutting down closes them and
