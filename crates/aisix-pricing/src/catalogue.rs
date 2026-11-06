@@ -11,7 +11,7 @@
 //! entry under the same key with an `effective_from` date, and a lookup at an
 //! instant takes the latest entry that is in effect then.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, LazyLock};
 
 use chrono::{DateTime, NaiveDate, NaiveTime, Utc};
@@ -93,6 +93,8 @@ pub enum CatalogueError {
     BadKey(String),
     #[error("`{0}` is named by more than one entry or alias with the same effective date")]
     DuplicateKey(String),
+    #[error("the entries of {0} do not all carry the same aliases")]
+    AliasesDiffer(String),
     #[error("entry {key}: its rate card is invalid: {source}")]
     InvalidCard {
         key: String,
@@ -125,6 +127,8 @@ impl Catalogue {
         let file: CatalogueFile =
             serde_json::from_str(json).map_err(|e| CatalogueError::Parse(e.to_string()))?;
         let mut index: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+        // A key's dated entries are one model, so they name it the same ways.
+        let mut alias_sets: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
         for (i, e) in file.entries.iter().enumerate() {
             let provider = match e.key.split_once('/') {
                 Some((p, m)) if !p.is_empty() && !m.is_empty() => p,
@@ -148,6 +152,10 @@ impl Catalogue {
                     as_of: e.as_of,
                     version: file.version,
                 });
+            }
+            let aliases: BTreeSet<&str> = e.aliases.iter().map(String::as_str).collect();
+            if alias_sets.entry(&e.key).or_insert_with(|| aliases.clone()) != &aliases {
+                return Err(CatalogueError::AliasesDiffer(e.key.clone()));
             }
             let names = std::iter::once(e.key.clone())
                 .chain(e.aliases.iter().map(|a| format!("{provider}/{a}")));
@@ -467,6 +475,32 @@ mod tests {
     }
 
     #[test]
+    fn dated_entries_of_one_key_must_carry_the_same_aliases() {
+        let json = file(&[
+            entry_from(
+                "openai/m",
+                r#"["a"]"#,
+                OK_URL,
+                "2026-11-06",
+                "null",
+                OK_CARD,
+            ),
+            entry_from(
+                "openai/m",
+                r#"["b"]"#,
+                OK_URL,
+                "2026-11-06",
+                r#""2026-12-01""#,
+                NEW_CARD,
+            ),
+        ]);
+        assert!(matches!(
+            Catalogue::from_json(&json),
+            Err(CatalogueError::AliasesDiffer(_))
+        ));
+    }
+
+    #[test]
     fn a_name_may_repeat_only_at_different_effective_dates() {
         let same_date = file(&[
             entry_from(
@@ -621,6 +655,15 @@ mod tests {
         }
     }
 
+    /// `(key, tier)` pairs whose page does not halve the cache read: the
+    /// page prices the cache the same in batch and flex as in standard, or
+    /// at a figure of its own.
+    const CACHE_READ_NOT_HALVED: [(&str, &str); 3] = [
+        ("google/gemini-3.1-pro-preview", "batch"),
+        ("google/gemini-3.1-pro-preview", "flex"),
+        ("google/gemini-3.5-flash-lite", "flex"),
+    ];
+
     #[test]
     fn batch_and_flex_are_half_of_default_where_the_pages_say_fifty_percent() {
         let half = |batch: Rate, default: Rate| batch.0 * 2 == default.0;
@@ -634,22 +677,141 @@ mod tests {
                     let at = format!("{} {name} {band:?}", e.key);
                     assert!(half(b.input, d.input), "{at}: input");
                     assert!(half(b.output, d.output), "{at}: output");
-                    for dim in [Dimension::CacheWrite, Dimension::CacheWrite1h] {
+                    for dim in [
+                        Dimension::CacheWrite,
+                        Dimension::CacheWrite1h,
+                        Dimension::ImageInput,
+                        Dimension::AudioInput,
+                    ] {
                         if let (Some(x), Some(y)) = (b.explicit(dim), d.explicit(dim)) {
                             assert!(half(x, y), "{at}: {dim}");
                         }
                     }
-                    // A cache read is half too, give or take a published
-                    // rounding (a page shows 0.13 for half of 0.25); Google
-                    // does not halve it.
-                    if let (false, Some(x), Some(y)) =
-                        (e.key.starts_with("google/"), b.cache_read, d.cache_read)
-                    {
-                        assert!((x.0 * 2).abs_diff(y.0) <= 10_000, "{at}: cache_read");
+                    if CACHE_READ_NOT_HALVED.contains(&(e.key.as_str(), name)) {
+                        continue;
+                    }
+                    if let (Some(x), Some(y)) = (b.cache_read, d.cache_read) {
+                        // One published rounding: the page shows 0.13 for
+                        // half of 0.25.
+                        let slack = if e.key == "openai/gpt-5.4" { 10_000 } else { 0 };
+                        assert!((x.0 * 2).abs_diff(y.0) <= slack, "{at}: cache_read");
                     }
                 }
             }
         }
+    }
+
+    /// `rate == base * num / den`, exactly.
+    fn ratio(rate: Option<Rate>, base: Rate, num: u64, den: u64) -> bool {
+        rate.is_some_and(|r| r.0 * den == base.0 * num)
+    }
+
+    #[test]
+    fn anthropic_cache_rates_are_the_published_multiples_of_input() {
+        let c = builtin();
+        for e in c
+            .entries()
+            .iter()
+            .filter(|e| e.key.starts_with("anthropic/"))
+        {
+            // 0.025x on Fable 5.1, 0.05x on Opus 5.5 and Sonnet 5.5, else 0.1x.
+            let (num, den) = match e.key.as_str() {
+                "anthropic/claude-fable-5-1" => (1, 40),
+                "anthropic/claude-opus-5-5" | "anthropic/claude-sonnet-5-5" => (1, 20),
+                _ => (1, 10),
+            };
+            for (t, tr) in &e.card.0 {
+                for (band, r) in sets(tr) {
+                    let at = format!("{} {t} {band:?}", e.key);
+                    assert!(ratio(r.cache_write, r.input, 5, 4), "{at}: cache_write");
+                    assert!(
+                        ratio(r.cache_write_1h, r.input, 2, 1),
+                        "{at}: cache_write_1h"
+                    );
+                    assert!(ratio(r.cache_read, r.input, num, den), "{at}: cache_read");
+                    assert_eq!(r.web_search, Rate::parse("10000").ok(), "{at}: web_search");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn openai_writes_flex_priority_and_fast_follow_the_page() {
+        let c = builtin();
+        let flex = tier("flex");
+        let batch = ServiceTier::batch();
+        for e in c.entries().iter().filter(|e| e.key.starts_with("openai/")) {
+            if is_embedding(&e.key) {
+                continue;
+            }
+            assert_eq!(
+                e.card.0[&flex], e.card.0[&batch],
+                "{}: flex != batch",
+                e.key
+            );
+            let default = &e.card.0[&ServiceTier::default_tier()];
+            for name in ["priority", "fast"] {
+                let Some(p) = e.card.0.get(&tier(name)) else {
+                    continue;
+                };
+                for ((band, p), (_, d)) in sets(p).into_iter().zip(sets(default)) {
+                    for dim in Dimension::ALL {
+                        assert_eq!(
+                            p.explicit(dim).map(|r| r.0),
+                            d.explicit(dim).map(|r| r.0 * 2),
+                            "{} {name} {band:?}: {dim}",
+                            e.key
+                        );
+                    }
+                }
+            }
+        }
+        for m in ["gpt-6-astra", "gpt-6.1-sol", "gpt-6.1-terra", "gpt-6-luna"] {
+            let e = c.get("openai", m, read_day()).unwrap();
+            // The Fast mode guide leaves a GPT-6 response's name open, so
+            // `fast` is priced exactly as `priority`.
+            assert_eq!(e.card.0[&tier("fast")], e.card.0[&tier("priority")], "{m}");
+            for (t, tr) in &e.card.0 {
+                for (band, r) in sets(tr) {
+                    assert!(ratio(r.cache_write, r.input, 5, 4), "{m} {t} {band:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_dated_revision_is_twice_its_predecessor_for_the_announced_doublings() {
+        let c = builtin();
+        let mut checked = 0;
+        for later in c.entries().iter().filter(|e| e.effective_from.is_some()) {
+            let earlier = c
+                .entries()
+                .iter()
+                .filter(|e| e.key == later.key && e.effective_from < later.effective_from)
+                .next_back()
+                .unwrap();
+            assert_eq!(
+                earlier.card.0.keys().collect::<Vec<_>>(),
+                later.card.0.keys().collect::<Vec<_>>(),
+                "{}: tiers",
+                later.key
+            );
+            for (t, tr) in &later.card.0 {
+                let before = &earlier.card.0[t];
+                for ((band, a), (_, b)) in sets(tr).into_iter().zip(sets(before)) {
+                    for dim in Dimension::ALL {
+                        assert_eq!(
+                            a.explicit(dim).map(|r| r.0),
+                            b.explicit(dim).map(|r| r.0 * 2),
+                            "{} {t} {band:?}: {dim}",
+                            later.key
+                        );
+                    }
+                }
+            }
+            checked += 1;
+        }
+        assert_eq!(checked, 3);
     }
 
     #[test]
@@ -670,11 +832,11 @@ mod tests {
                         }
                     }
                 }
-                if t.as_str() == "priority" {
+                if matches!(t.as_str(), "priority" | "fast" | "ultrafast") {
                     for ((band, p), (_, d)) in all.iter().zip(sets(default)) {
                         for dim in Dimension::ALL {
                             if let (Some(hi), Some(lo)) = (p.explicit(dim), d.explicit(dim)) {
-                                assert!(hi >= lo, "{} priority {band:?}: {dim}", e.key);
+                                assert!(hi >= lo, "{} {t} {band:?}: {dim}", e.key);
                             }
                         }
                     }
@@ -743,6 +905,29 @@ mod tests {
         assert_eq!(
             rates("google", "gemini-embedding-2", "default", None).audio_input,
             r("6.5")
+        );
+        // Anthropic: per-search pricing in a band, and in fast mode.
+        assert_eq!(
+            rates("anthropic", "claude-haiku-5-5", "batch", Some(100_000)).web_search,
+            r("10000")
+        );
+        assert_eq!(
+            rates("anthropic", "claude-opus-5-5", "fast", None).web_search,
+            r("10000")
+        );
+        // OpenAI: the ultrafast tier and the fast name for priority.
+        assert_eq!(
+            rates("openai", "gpt-6-astra", "ultrafast", Some(272_000)).output,
+            r("450").unwrap()
+        );
+        assert_eq!(
+            rates("openai", "gpt-6.1-terra", "fast", None).output,
+            r("10").unwrap()
+        );
+        // DeepSeek: the Pro input price.
+        assert_eq!(
+            rates("deepseek", "deepseek-v4-pro", "default", None).input,
+            r("0.66").unwrap()
         );
         // DeepSeek: the standard (non-peak) price.
         assert_eq!(
