@@ -1797,7 +1797,7 @@ async fn anthropic_passthrough_dispatch(
     if is_stream {
         // For SSE streaming: pass through the response body as a streaming
         // `text/event-stream` response.
-        let (content_type, upstream_bytes) = answer.into_sse();
+        let (content_type, upstream_bytes) = answer.into_sse(state.platform());
         // #554: enforce the per-chunk read timeout on the forwarded bytes.
         // When a `stream_timeout` is configured, peek the first byte so a
         // slow/erroring first token fails over (the caller loops to the next
@@ -2156,7 +2156,8 @@ async fn anthropic_passthrough_dispatch(
             crate::sse_keepalive::with_heartbeat(parsed_stream, crate::sse_keepalive::interval()),
         ));
 
-        // Copy content-type from upstream (should be text/event-stream).
+        // The upstream's content type (should be text/event-stream); a
+        // fixed one in platform mode.
         response
             .headers_mut()
             .insert(axum::http::header::CONTENT_TYPE, content_type);
@@ -2435,23 +2436,27 @@ enum Upstream {
 }
 
 impl Upstream {
-    /// The SSE body and the content type to answer it under. A platform
-    /// stream's transport failure becomes an Anthropic `error` frame — the
-    /// stream it interrupts is already committed.
+    /// The SSE body and the content type to answer it under: the
+    /// upstream's own over HTTP, except in platform mode
+    /// ([`crate::platform::relayed_content_type`]). A platform stream's
+    /// transport failure becomes an Anthropic `error` frame — the stream it
+    /// interrupts is already committed.
     fn into_sse(
         self,
+        platform_mode: Option<&crate::platform::PlatformSettings>,
     ) -> (
         HeaderValue,
         std::pin::Pin<Box<dyn Stream<Item = reqwest::Result<Bytes>> + Send>>,
     ) {
-        let sse = HeaderValue::from_static("text/event-stream");
+        let sse = HeaderValue::from_static(crate::platform::SSE_CONTENT_TYPE);
         match self {
             Self::Http(resp) => {
-                let ct = resp
-                    .headers()
-                    .get(axum::http::header::CONTENT_TYPE)
-                    .and_then(|v| HeaderValue::from_bytes(v.as_bytes()).ok())
-                    .unwrap_or(sse);
+                let ct = crate::platform::relayed_content_type(
+                    platform_mode,
+                    resp.headers(),
+                    crate::platform::SSE_CONTENT_TYPE,
+                )
+                .unwrap_or(sse);
                 (ct, Box::pin(resp.bytes_stream()))
             }
             Self::Native(aisix_gateway::NativeMessages::Stream(frames)) => {
@@ -10759,5 +10764,58 @@ data: [DONE]\n\n";
             Some("gpt-4o"),
             "an abandoned stream must still name the target it was dispatched to",
         );
+    }
+
+    /// A relayed event stream goes out under the upstream's own content
+    /// type, and in platform mode under a fixed `text/event-stream`: how an
+    /// upstream spells its content type differs by channel.
+    #[tokio::test]
+    async fn platform_mode_relays_a_stream_under_a_fixed_content_type() {
+        let sse = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-3-haiku-20240307\",\"content\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}}\n\n\
+                   event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+        for (platform, expected) in [
+            (false, "text/event-stream; charset=utf-8"),
+            (true, "text/event-stream"),
+        ] {
+            let upstream = MockServer::builder().start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/messages"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_raw(sse, "text/event-stream; charset=utf-8"),
+                )
+                .mount(&upstream)
+                .await;
+            let snap = new_snap_anthropic(&upstream.uri());
+            snap.models.insert(anthropic_model("claude-haiku"));
+            snap.apikeys.insert(apikey_entry(&["*"]));
+            let hub = Arc::new(Hub::new());
+            hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
+            let mut state =
+                crate::ProxyState::new(SnapshotHandle::new(snap), hub, &cfg()).without_cache();
+            if platform {
+                state = state.with_platform(crate::platform::PlatformSettings::from_secret("s"));
+            }
+            let resp = crate::build_router(state)
+                .oneshot(make_req(serde_json::json!({
+                    "model": "claude-haiku",
+                    "messages": [{"role": "user", "content": "Hello"}],
+                    "max_tokens": 100,
+                    "stream": true,
+                })))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(
+                resp.headers()[axum::http::header::CONTENT_TYPE],
+                expected,
+                "platform mode {platform}"
+            );
+            let body = to_bytes(resp.into_body(), 65536).await.unwrap();
+            assert!(
+                String::from_utf8_lossy(&body).contains("message_stop"),
+                "{body:?}"
+            );
+        }
     }
 }

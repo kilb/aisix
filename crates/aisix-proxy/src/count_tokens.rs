@@ -1097,11 +1097,14 @@ async fn count_tokens_to_target(
     state.health.record_success(&model.display_name);
 
     let mut resp = axum::response::Response::new(axum::body::Body::from(body_bytes));
-    if let Some(ct) = upstream_headers.get("content-type") {
-        if let Ok(hv) = HeaderValue::from_bytes(ct.as_bytes()) {
-            resp.headers_mut()
-                .insert(axum::http::header::CONTENT_TYPE, hv);
-        }
+    // The upstream's content type; a fixed one in platform mode.
+    if let Some(hv) = crate::platform::relayed_content_type(
+        state.platform(),
+        &upstream_headers,
+        crate::platform::JSON_CONTENT_TYPE,
+    ) {
+        resp.headers_mut()
+            .insert(axum::http::header::CONTENT_TYPE, hv);
     }
     // Only emit the request-id header when it parses — matching the
     // /v1/messages handler. An empty fallback value would hurt log
@@ -2439,5 +2442,50 @@ mod tests {
             StatusCode::OK,
             "the PK secret x-api-key must survive an operator default_headers override attempt"
         );
+    }
+
+    /// The upstream's answer goes out under its own content type, and in
+    /// platform mode under a fixed `application/json`: how an upstream spells
+    /// its content type differs by channel.
+    #[tokio::test]
+    async fn platform_mode_relays_the_count_under_a_fixed_content_type() {
+        for (platform, expected) in [
+            (false, "application/json; charset=UTF-8"),
+            (true, "application/json"),
+        ] {
+            let upstream = MockServer::builder().start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/messages/count_tokens"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_raw(r#"{"input_tokens":17}"#, "application/json; charset=UTF-8"),
+                )
+                .mount(&upstream)
+                .await;
+            let snap = new_snap(&upstream.uri());
+            snap.models.insert(anthropic_model("claude-haiku"));
+            snap.apikeys.insert(apikey_entry(&["*"]));
+            let mut state =
+                crate::ProxyState::new(SnapshotHandle::new(snap), Arc::new(Hub::new()), &cfg())
+                    .without_cache();
+            if platform {
+                state = state.with_platform(crate::platform::PlatformSettings::from_secret("s"));
+            }
+            let resp = crate::build_router(state)
+                .oneshot(make_req(serde_json::json!({
+                    "model": "claude-haiku",
+                    "messages": [{"role": "user", "content": "hello"}]
+                })))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(
+                resp.headers()[axum::http::header::CONTENT_TYPE],
+                expected,
+                "platform mode {platform}"
+            );
+            let bytes = to_bytes(resp.into_body(), 1024).await.unwrap();
+            assert_eq!(&bytes[..], br#"{"input_tokens":17}"#);
+        }
     }
 }

@@ -18,6 +18,30 @@ impl PlatformSettings {
     }
 }
 
+/// The content type of a server-sent event stream.
+pub(crate) const SSE_CONTENT_TYPE: &str = "text/event-stream";
+/// The content type of a JSON body.
+pub(crate) const JSON_CONTENT_TYPE: &str = "application/json";
+
+/// The `content-type` an answer relayed from an upstream goes out under:
+/// the upstream's own, as it wrote it, or, in platform mode, `fixed` (one of
+/// [`SSE_CONTENT_TYPE`] and [`JSON_CONTENT_TYPE`]). How an upstream spells
+/// its content type, a charset parameter or its case, differs by channel, so
+/// in platform mode every answer of one kind goes out under one value.
+/// `None` when the upstream sent none outside platform mode.
+pub(crate) fn relayed_content_type(
+    platform: Option<&PlatformSettings>,
+    upstream: &axum::http::HeaderMap,
+    fixed: &'static str,
+) -> Option<axum::http::HeaderValue> {
+    if platform.is_some() {
+        return Some(axum::http::HeaderValue::from_static(fixed));
+    }
+    upstream
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| axum::http::HeaderValue::from_bytes(v.as_bytes()).ok())
+}
+
 /// The tenant a platform-mode request belongs to: `team:<team id>` for a key
 /// in a team, `key:<key entry id>` for one without. Every id platform mode
 /// seals for a caller is sealed to it, and opens only for it. The kind tag

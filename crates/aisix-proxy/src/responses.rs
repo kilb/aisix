@@ -2378,7 +2378,7 @@ async fn responses_to_target(
         let mut response = axum::response::Response::new(axum::body::Body::from_stream(
             crate::sse_keepalive::with_heartbeat(parsed_stream, crate::sse_keepalive::interval()),
         ));
-        apply_passthrough_headers(&mut response, &headers, request_id);
+        apply_passthrough_headers(&mut response, &headers, request_id, state.platform());
 
         Ok(ResponseDispatchSuccess {
             response,
@@ -5391,20 +5391,24 @@ fn responses_sse_guardrail_text(bytes: &[u8]) -> String {
     text
 }
 
-/// Copy the upstream `content-type` onto the client response and stamp the
+/// Copy the upstream `content-type` onto the client response, a fixed one in
+/// platform mode ([`crate::platform::relayed_content_type`]), and stamp the
 /// `x-aisix-request-id` header. Shared by the streaming verbatim-passthrough
-/// and buffered hold-back paths.
+/// and buffered hold-back paths, both of which relay an event stream.
 fn apply_passthrough_headers(
     response: &mut Response,
     upstream_headers: &axum::http::HeaderMap,
     request_id: &str,
+    platform: Option<&crate::platform::PlatformSettings>,
 ) {
-    if let Some(ct) = upstream_headers.get("content-type") {
-        if let Ok(hv) = HeaderValue::from_bytes(ct.as_bytes()) {
-            response
-                .headers_mut()
-                .insert(axum::http::header::CONTENT_TYPE, hv);
-        }
+    if let Some(hv) = crate::platform::relayed_content_type(
+        platform,
+        upstream_headers,
+        crate::platform::SSE_CONTENT_TYPE,
+    ) {
+        response
+            .headers_mut()
+            .insert(axum::http::header::CONTENT_TYPE, hv);
     }
     if let Ok(hv) = HeaderValue::from_str(request_id) {
         response
@@ -11057,5 +11061,61 @@ data: [DONE]\n\n";
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// A relayed event stream goes out under the upstream's own content
+    /// type, and in platform mode under a fixed `text/event-stream`: how an
+    /// upstream spells its content type differs by channel. Both the live
+    /// relay and the stream held back for an output guardrail.
+    #[tokio::test]
+    async fn platform_mode_relays_a_stream_under_a_fixed_content_type() {
+        let sse = "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_r\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":1,\"total_tokens\":4}}}\n\n";
+        for held in [false, true] {
+            for (platform, expected) in [
+                (false, "text/event-stream; charset=utf-8"),
+                (true, "text/event-stream"),
+            ] {
+                let upstream = MockServer::builder().start().await;
+                Mock::given(method("POST"))
+                    .and(path("/v1/responses"))
+                    .respond_with(
+                        ResponseTemplate::new(200)
+                            .set_body_raw(sse, "text/event-stream; charset=utf-8"),
+                    )
+                    .mount(&upstream)
+                    .await;
+                let snap = new_snap_openai(&upstream.uri());
+                snap.models.insert(openai_model("gpt-4o-resp"));
+                snap.apikeys.insert(apikey_entry(&["*"]));
+                if held {
+                    crate::seed_env_scoped_guardrail(&snap, keyword_output_guardrail("NEVER-SEEN"));
+                }
+                let hub = Arc::new(Hub::new());
+                hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+                let mut state =
+                    crate::ProxyState::new(SnapshotHandle::new(snap), hub, &cfg()).without_cache();
+                if platform {
+                    state =
+                        state.with_platform(crate::platform::PlatformSettings::from_secret("s"));
+                }
+                let resp = crate::build_router(state)
+                    .oneshot(make_req(
+                        serde_json::json!({"model": "gpt-4o-resp", "input": "hi", "stream": true}),
+                    ))
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), StatusCode::OK);
+                assert_eq!(
+                    resp.headers()[axum::http::header::CONTENT_TYPE],
+                    expected,
+                    "platform mode {platform}, held {held}"
+                );
+                let body = to_bytes(resp.into_body(), 65536).await.unwrap();
+                assert!(
+                    String::from_utf8_lossy(&body).contains("response.completed"),
+                    "{body:?}"
+                );
+            }
+        }
     }
 }
