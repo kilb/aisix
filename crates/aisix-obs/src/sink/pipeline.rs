@@ -449,6 +449,7 @@ impl SinkPipeline {
         let marker = IdempotencyMarker::None;
         let started = Instant::now();
         let mut attempt: u32 = 0;
+        let mut deadline = deadline;
         loop {
             match self.sink.append_batch(batch, &marker).await {
                 Ok(ack) => {
@@ -467,12 +468,14 @@ impl SinkPipeline {
                     }
                     // The drain's deadline is shared by every batch it
                     // still has to send, so a batch that is not the first
-                    // may find little or none of it left.
-                    let deadline = deadline.or_else(|| {
-                        shutdown
-                            .borrow()
-                            .then(|| Instant::now() + DRAIN_RETRY_BUDGET)
-                    });
+                    // may find little or none of it left. A batch that was
+                    // already being retried when the shutdown arrived
+                    // starts that budget once, the first time it sees the
+                    // signal: started afresh at every attempt, it never
+                    // ran out.
+                    if deadline.is_none() && *shutdown.borrow() {
+                        deadline = Some(Instant::now() + DRAIN_RETRY_BUDGET);
+                    }
                     if let Some(delay) = self.next_delay(&err, attempt, started, deadline) {
                         attempt += 1;
                         self.stats.add_retries(1);
@@ -1152,6 +1155,35 @@ mod tests {
         // And nothing vanishes unaccounted: what the deadline cut short
         // is counted as lost, not silently forgotten.
         assert_eq!(handle.stats().dropped, QUEUED as u64);
+    }
+
+    /// A shutdown that arrives while a batch is already being retried, not
+    /// yet in the drain, starts the drain budget once. Started afresh at
+    /// every failed attempt it never ran out, and the exit waited until the
+    /// gateway gave up on the exporter.
+    #[tokio::test]
+    async fn a_shutdown_during_a_retry_ends_within_the_drain_budget() {
+        tokio::time::pause();
+        let sink = FakeSink::new(Mode::AlwaysTransient);
+        let (handle, worker) = SinkPipeline::new(sink.clone(), PipelineConfig::default());
+        assert!(handle.try_enqueue(rec(0)));
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let jh = tokio::spawn(worker.run(cancel_rx));
+        // Into the ordinary flush's retries.
+        while sink.attempts() < 2 {
+            tokio::time::advance(TICK).await;
+            tokio::task::yield_now().await;
+        }
+        let shutdown_at = tokio::time::Instant::now();
+        cancel_tx.send(true).unwrap();
+        jh.await.unwrap();
+
+        assert!(
+            shutdown_at.elapsed() <= DRAIN_RETRY_BUDGET + TICK,
+            "the drain budget runs once, from the shutdown: {:?}",
+            shutdown_at.elapsed()
+        );
+        assert_eq!(handle.stats().dropped, 1, "the batch is accounted");
     }
 
     /// The budget is minutes now, so a shutdown that waited on it would
