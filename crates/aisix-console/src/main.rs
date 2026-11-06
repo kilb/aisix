@@ -1139,27 +1139,17 @@ async fn api_file_put(
         // 网关拒收的那份不会走到这里：它已经被放回去，按失败报。
         //
         // 信号没送到时文件已经换了（校验通过，网关下次重读或重启就会用上），却还没生效：
-        // 回 202 而不是 200，`ok` 为假。不把文件放回去：网关因为坏文件起不来、正等着运维
-        // 在这里改好的时候，信号必然送不到，放回去就是让人永远改不了它。
-        Ok(saved) => {
-            let applied = saved.reload != Reload::SignalFailed;
-            let status = if applied {
-                StatusCode::OK
-            } else {
-                StatusCode::ACCEPTED
-            };
-            (
-                status,
-                Json(json!({
-                    "ok": applied,
-                    "written": true,
-                    "detail": saved.detail,
-                    "warnings": saved.warnings,
-                    "reload": saved.reload.label(),
-                })),
-            )
-                .into_response()
-        }
+        // `ok` 为假，`written` 为真。HTTP 状态仍是 200 —— 请求本身做完了、文件也写了，
+        // 状态码说的是这个；生没生效看 `ok` 与 `reload`。不把文件放回去：网关因为坏文件
+        // 起不来、正等着运维在这里改好的时候，信号必然送不到，放回去就是让人永远改不了它。
+        Ok(saved) => Json(json!({
+            "ok": saved.reload != Reload::SignalFailed,
+            "written": true,
+            "detail": saved.detail,
+            "warnings": saved.warnings,
+            "reload": saved.reload.label(),
+        }))
+        .into_response(),
         // 版本冲突是 409 而不是 400：前端要据此提示「重新载入」，而 400
         // 的其余成员都是「你写的内容不合法」，两者的处理动作完全不同。
         Err(e @ SaveError::Stale) => {
@@ -2851,8 +2841,8 @@ mod tests {
         assert!(main_fn.contains("reload_command: RELOAD_COMMAND"));
     }
 
-    /// 信号没送到：文件已经写了（校验过，下次重读就生效），但不能报成功 —— 回 202、
-    /// `ok` 为假、说清楚没生效。也不把文件放回去：网关起不来、正等着在这里改好的时候，
+    /// 信号没送到：文件已经写了（校验过，下次重读就生效），但不能报成功 —— `ok` 为假、
+    /// 说清楚没生效。也不把文件放回去：网关起不来、正等着在这里改好的时候，
     /// 信号必然送不到。
     #[tokio::test]
     async fn a_reload_signal_that_does_not_arrive_is_not_reported_as_success() {
@@ -2872,7 +2862,7 @@ mod tests {
             .send()
             .await
             .unwrap();
-        assert_eq!(r.status(), 202);
+        assert_eq!(r.status(), 200, "文件写了，请求本身是做完的");
         let body: Value = r.json().await.unwrap();
         assert_eq!(body["ok"], json!(false), "{body}");
         assert_eq!(body["written"], json!(true), "{body}");
