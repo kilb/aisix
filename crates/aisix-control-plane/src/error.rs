@@ -228,6 +228,8 @@ pub enum BootError {
     DpListen(std::io::Error),
     #[error("the gateway listener's TLS (CP_DP_HOSTS): {0}")]
     DpTls(#[from] crate::dp::listener::TlsSetupError),
+    #[error("CP_KINE_ENDPOINT cannot be dialled: {0}")]
+    KineEndpoint(tonic::transport::Error),
 }
 
 #[cfg(test)]

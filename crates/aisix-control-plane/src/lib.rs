@@ -19,6 +19,7 @@ pub mod crypto;
 pub mod db;
 pub mod dp;
 pub mod error;
+pub mod etcd_front;
 pub mod gateways;
 pub mod housekeeping;
 pub mod http;
@@ -152,7 +153,7 @@ where
     tenants::ensure_internal_tenant(&db, &write_ctx).await?;
     let passwords = PasswordGate::new(ARGON2_GATE_PERMITS)?;
     let creds = CredentialCache::load(&db.dedicated(CREDENTIALS_POOL_SIZE)).await?;
-    let dp_tls = match dp::listener::server_tls(&pki, &cfg.dp_hosts, false) {
+    let dp_tls = match dp::listener::server_tls(&pki, &cfg.dp_hosts, true) {
         Ok(tls) => Some(tls),
         // Still a boot, so operators can see why: every gateway certificate
         // has run out with the CA anyway.
@@ -168,6 +169,9 @@ where
     // Connects on first use: a kine that is down at boot only delays the
     // projection.
     let kine: Arc<dyn KineWriter> = Arc::new(KineClient::connect(&cfg.kine_endpoint).await?);
+    // The same kine, read by gateways through the etcd front.
+    let front_kine =
+        etcd_front::kine_endpoint(&cfg.kine_endpoint).map_err(BootError::KineEndpoint)?;
     let listener = tokio::net::TcpListener::bind(cfg.http_addr)
         .await
         .map_err(BootError::Listen)?;
@@ -230,7 +234,11 @@ where
             listener,
             tls,
             http::dp_router(state.clone()),
-            None,
+            Some(etcd_front::routes(etcd_front::Front::new(
+                front_kine,
+                state.creds.clone(),
+                state.env.clone(),
+            ))),
             dp_limits,
             stopping,
         )));
