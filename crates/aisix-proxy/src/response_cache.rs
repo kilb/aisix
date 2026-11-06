@@ -194,6 +194,38 @@ impl CacheTelemetry {
     }
 }
 
+/// Who may share a cache entry under a policy's `scope`, as the value that
+/// enters every cache key: the chat exact key and semantic partition, and
+/// the fingerprint [`BodyCache`] builds for every other endpoint. One
+/// function, so no endpoint can draw the sharing boundary differently.
+///
+/// It keys on the caller alone, never on a model, so every model kind is
+/// scoped the same way.
+///
+/// - `api_key`: the key's id, bare. That is the value every entry stored
+///   under this scope has always been keyed by, so those entries stay
+///   reachable.
+/// - `env`: empty, so every caller shares, as it always has.
+/// - `team`: `team:<team_id>`, shared by the keys of one team. A key with no
+///   team, or an empty `team_id`, gets `key:<id>` and shares with no one: a
+///   key nobody assigned to a tenant must not land in some tenant's entries.
+///   The two prefixes keep a team's value from ever equalling a key's.
+pub(crate) fn cache_scope_value(scope: CacheScope, auth: &AuthenticatedKey) -> String {
+    match scope {
+        CacheScope::ApiKey => auth.entry.id.clone(),
+        CacheScope::Env => String::new(),
+        CacheScope::Team => match auth
+            .key()
+            .team_id
+            .as_deref()
+            .filter(|team| !team.is_empty())
+        {
+            Some(team) => format!("team:{team}"),
+            None => format!("key:{}", auth.entry.id),
+        },
+    }
+}
+
 /// A resolved cache gate for one request on one endpoint.
 pub(crate) struct BodyCache {
     cache: Arc<dyn Cache>,
@@ -243,10 +275,7 @@ impl BodyCache {
             .as_ref()?
             .for_policy_backend(entry.value.backend, &entry.id, &entry.value.name)?
             .clone();
-        let scope_api_key = match entry.value.scope {
-            CacheScope::ApiKey => auth.entry.id.as_str(),
-            CacheScope::Env => "",
-        };
+        let scope_value = cache_scope_value(entry.value.scope, auth);
         let generation = entry.value.purge_generation.to_string();
         let key_material = key_material();
         let vary_tags = crate::routing::cache_vary_tags(model, &client.routing_tags);
@@ -256,7 +285,7 @@ impl BodyCache {
             &key_material,
             &entry.id,
             &generation,
-            scope_api_key,
+            &scope_value,
         ];
         // Only when present, so every entry of a model routing tags cannot
         // steer keeps its fingerprint.
@@ -470,5 +499,198 @@ mod tests {
         ] {
             assert!(body_is_storable(stored.as_bytes()), "{stored}");
         }
+    }
+
+    /// The three cache keys one request is stored under: the chat exact
+    /// key, the chat semantic partition, and the body fingerprint the
+    /// other endpoints use.
+    #[derive(Debug, PartialEq)]
+    struct Keys {
+        exact: String,
+        partition: String,
+        body: String,
+    }
+
+    /// The same request, under a policy of `scope`, from the key `key_id`
+    /// carrying `team_id`.
+    fn key_for(scope: CacheScope, team_id: Option<&str>, key_id: &str) -> Keys {
+        use aisix_core::resource::ResourceEntry;
+        let snap = AisixSnapshot::new();
+        let mut policy: aisix_core::CachePolicy =
+            serde_json::from_value(serde_json::json!({"name": "p"})).unwrap();
+        policy.scope = scope;
+        snap.cache_policies
+            .insert(ResourceEntry::new("policy-1", policy, 1));
+        let state = crate::ProxyState::new(
+            aisix_core::snapshot::SnapshotHandle::new(snap.clone()),
+            Arc::new(aisix_gateway::Hub::new()),
+            &serde_json::from_value::<aisix_core::ProxyConfig>(serde_json::json!({
+                "addr": "127.0.0.1:0"
+            }))
+            .unwrap(),
+        );
+        let key: aisix_core::ApiKey =
+            serde_json::from_value(serde_json::json!({"key_hash": "h", "team_id": team_id}))
+                .unwrap();
+        let auth = AuthenticatedKey::new(
+            &snap,
+            Arc::new(ResourceEntry::new(key_id, key, 1)),
+            None,
+            false,
+        );
+        let model: aisix_core::Model = serde_json::from_value(serde_json::json!({
+            "display_name": "m",
+            "provider": "openai",
+            "model_name": "gpt-4o",
+            "provider_key_id": "pk",
+        }))
+        .unwrap();
+        let gate = BodyCache::resolve(
+            &state,
+            &snap,
+            &auth,
+            &crate::client_ip::ClientContext::default(),
+            "/v1/embeddings",
+            "m",
+            &model,
+            || "{\"input\":\"hi\"}".to_string(),
+        )
+        .expect("the policy covers the request");
+        let req = aisix_gateway::ChatFormat::new("m", vec![ChatMessage::user("hi")]);
+        let chat = aisix_cache::CacheKey::from_request(&req).with_scope(
+            "policy-1",
+            0,
+            &cache_scope_value(scope, &auth),
+        );
+        Keys {
+            exact: chat.fingerprint(),
+            partition: chat.scope_fingerprint(),
+            body: gate.key,
+        }
+    }
+
+    /// Every one of the three keys differs: one shared key family is
+    /// enough to serve one caller's answer to the other.
+    fn assert_isolated(a: &Keys, b: &Keys) {
+        assert_ne!(a.exact, b.exact, "exact keys shared: {a:?} {b:?}");
+        assert_ne!(
+            a.partition, b.partition,
+            "semantic partitions shared: {a:?} {b:?}"
+        );
+        assert_ne!(a.body, b.body, "body keys shared: {a:?} {b:?}");
+    }
+
+    /// Computed with the same inputs on the build before `team` existed, so
+    /// entries already stored under `api_key` and `env` stay reachable.
+    const LEGACY_API_KEY_FINGERPRINT: (&str, &str, &str) = (
+        "c76ef486be681e1e49c7720465407255",
+        "e0838d7341a70de5bbf2fa14c4fb68e5",
+        "dc3096e47cbc7cd79cc54ba3cf79bc7e",
+    );
+    const LEGACY_ENV_FINGERPRINT: (&str, &str, &str) = (
+        "15c70090121c892939eb2f910f8e0e4c",
+        "4a3f897c1b09e90ba260f062e3657e9b",
+        "87cd351069ced1c945daf7b4f40e916a",
+    );
+
+    fn legacy(fp: (&str, &str, &str)) -> Keys {
+        Keys {
+            exact: fp.0.to_string(),
+            partition: fp.1.to_string(),
+            body: fp.2.to_string(),
+        }
+    }
+
+    #[test]
+    fn two_teams_never_share_a_team_scoped_entry() {
+        assert_isolated(
+            &key_for(CacheScope::Team, Some("t1"), "k1"),
+            &key_for(CacheScope::Team, Some("t2"), "k2"),
+        );
+    }
+
+    #[test]
+    fn keys_of_one_team_share_a_team_scoped_entry() {
+        assert_eq!(
+            key_for(CacheScope::Team, Some("t1"), "k1"),
+            key_for(CacheScope::Team, Some("t1"), "k2"),
+        );
+    }
+
+    #[test]
+    fn a_key_without_a_team_is_isolated_under_team_scope() {
+        assert_isolated(
+            &key_for(CacheScope::Team, None, "k1"),
+            &key_for(CacheScope::Team, None, "k2"),
+        );
+        // An empty `team_id` names no team either.
+        assert_isolated(
+            &key_for(CacheScope::Team, Some(""), "k1"),
+            &key_for(CacheScope::Team, Some(""), "k2"),
+        );
+        // A key with no team never lands in a team's entries, even one whose
+        // id is spelled like the key's.
+        assert_isolated(
+            &key_for(CacheScope::Team, None, "k1"),
+            &key_for(CacheScope::Team, Some("k1"), "k2"),
+        );
+    }
+
+    #[test]
+    fn existing_api_key_and_env_keys_are_unchanged() {
+        assert_eq!(
+            key_for(CacheScope::ApiKey, Some("t1"), "k1"),
+            legacy(LEGACY_API_KEY_FINGERPRINT)
+        );
+        assert_eq!(
+            key_for(CacheScope::Env, Some("t1"), "k1"),
+            legacy(LEGACY_ENV_FINGERPRINT)
+        );
+    }
+
+    /// The semantic layer only compares a request against entries in its
+    /// own partition, so a near match from another tenant must not even be
+    /// a candidate, while a teammate's is.
+    #[tokio::test]
+    async fn semantic_partitions_are_per_team_under_team_scope() {
+        use aisix_cache::{MemorySemanticCache, SemanticCacheStore};
+        let partition =
+            |team: Option<&str>, key: &str| key_for(CacheScope::Team, team, key).partition;
+        let store = MemorySemanticCache::new();
+        store
+            .store(
+                "policy-1",
+                0,
+                &partition(Some("t1"), "k1"),
+                "exact",
+                vec![1.0, 0.0],
+                answer(FinishReason::Stop),
+                Duration::from_secs(60),
+                100,
+            )
+            .await
+            .unwrap();
+        let lookup = |fp: String| {
+            let store = &store;
+            async move {
+                store
+                    .lookup("policy-1", 0, &fp, &[1.0, 0.0], 0.5)
+                    .await
+                    .unwrap()
+                    .is_some()
+            }
+        };
+        assert!(
+            lookup(partition(Some("t1"), "k2")).await,
+            "a teammate's entry is a candidate"
+        );
+        assert!(
+            !lookup(partition(Some("t2"), "k3")).await,
+            "another team's entry is not"
+        );
+        assert!(
+            !lookup(partition(None, "k4")).await,
+            "a key with no team sees no team's entries"
+        );
     }
 }

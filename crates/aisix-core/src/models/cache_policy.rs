@@ -42,6 +42,11 @@ pub enum CacheScope {
     /// for shared-knowledge traffic (FAQ, documentation Q&A) where
     /// cross-caller reuse is the point.
     Env,
+    /// Entries are shared by the API keys of one team and never across
+    /// teams, so each tenant reuses its own answers without seeing
+    /// another's. An API key with no `team_id` keeps its entries private,
+    /// as under `api_key`.
+    Team,
 }
 
 /// Embedding-similarity matching for a cache policy. When present, a
@@ -158,7 +163,8 @@ pub struct CachePolicy {
 
     /// Sharing boundary for entries created under this policy:
     /// `api_key` (default) keeps entries private to the caller that
-    /// created them; `env` shares them across the environment.
+    /// created them; `env` shares them across the environment; `team`
+    /// shares them among the API keys of one team.
     #[serde(default)]
     pub scope: CacheScope,
 
@@ -561,6 +567,19 @@ mod tests {
             sem.embedding_timeout(),
             Some(std::time::Duration::from_millis(2000))
         );
+    }
+
+    /// A `team` policy is accepted where it is written and loads where it
+    /// is read: a value the write path takes but the loader rejects would
+    /// drop the stored row.
+    #[test]
+    fn team_scope_is_written_and_loaded() {
+        let v = json!({"name": "tenants", "scope": "team"});
+        crate::models::validate_cache_policy(&v).unwrap();
+        crate::models::validate_cache_policy_lenient(&v).unwrap();
+        let p: CachePolicy = serde_json::from_value(v).unwrap();
+        assert_eq!(p.scope, CacheScope::Team);
+        assert_eq!(serde_json::to_value(p.scope).unwrap(), json!("team"));
     }
 
     #[test]

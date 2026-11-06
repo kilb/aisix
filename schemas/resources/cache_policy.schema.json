@@ -25,6 +25,13 @@
             "env"
           ],
           "type": "string"
+        },
+        {
+          "description": "Entries are shared by the API keys of one team and never across teams, so each tenant reuses its own answers without seeing another's. An API key with no `team_id` keeps its entries private, as under `api_key`.",
+          "enum": [
+            "team"
+          ],
+          "type": "string"
         }
       ]
     },
@@ -149,7 +156,7 @@
         }
       ],
       "default": "api_key",
-      "description": "Sharing boundary for entries created under this policy: `api_key` (default) keeps entries private to the caller that created them; `env` shares them across the environment."
+      "description": "Sharing boundary for entries created under this policy: `api_key` (default) keeps entries private to the caller that created them; `env` shares them across the environment; `team` shares them among the API keys of one team."
     },
     "semantic": {
       "allOf": [

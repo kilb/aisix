@@ -2221,7 +2221,7 @@ fn add_variant_titles(doc: &mut Value) {
         ),
         (
             "/components/schemas/CacheScope/oneOf",
-            &["Per API key", "Environment-wide"],
+            &["Per API key", "Environment-wide", "Per team"],
         ),
         (
             "/components/schemas/Guardrail/oneOf",

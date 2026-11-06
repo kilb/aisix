@@ -6880,7 +6880,7 @@ data: [DONE]\n\n";
         // generation 0, and (scope defaults to `api_key`) the caller.
         let req: aisix_gateway::ChatFormat = serde_json::from_value(body).unwrap();
         let key = CacheKey::from_request(&req)
-            .with_scope("cp-id-redis-cache", 0, Some("key-id-1"))
+            .with_scope("cp-id-redis-cache", 0, "key-id-1")
             .fingerprint();
         assert!(
             redis_standin.get(&key).await.unwrap().is_some(),

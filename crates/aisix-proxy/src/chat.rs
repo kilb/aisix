@@ -18,7 +18,7 @@
 
 use aisix_cache::{semantic_prompt_text, Cache, CacheKey, SemanticCacheStore};
 use aisix_core::models::CacheBackend;
-use aisix_core::models::{CacheScope, SemanticCacheConfig};
+use aisix_core::models::SemanticCacheConfig;
 use aisix_core::{AisixSnapshot, AppliedGuardrail};
 use aisix_gateway::{BridgeError, ChatFormat, ChatResponse};
 use aisix_guardrails::GuardrailVerdict;
@@ -2902,18 +2902,16 @@ async fn dispatch(
 
     // Cache lookup keyed on the *virtual* model name so a re-request
     // hits the cache regardless of which target served the original,
-    // scoped by the matched policy (id + purge generation) and — under
-    // `scope: api_key` — by the caller, so entries never leak across
-    // policies, purges, or callers.
+    // scoped by the matched policy (id + purge generation) and by the
+    // policy's sharing boundary (the caller under `scope: api_key`, its
+    // team under `scope: team`), so entries never leak across policies,
+    // purges, callers, or tenants.
     let cache_key_full = match (policy_cache.as_ref(), matched_policy.as_ref()) {
         (Some(_), Some(entry)) => {
-            let scope_api_key = match entry.value.scope {
-                CacheScope::ApiKey => Some(auth.entry.id.as_str()),
-                CacheScope::Env => None,
-            };
+            let scope_value = crate::response_cache::cache_scope_value(entry.value.scope, auth);
             Some(
                 CacheKey::from_request(req)
-                    .with_scope(&entry.id, entry.value.purge_generation, scope_api_key)
+                    .with_scope(&entry.id, entry.value.purge_generation, &scope_value)
                     .with_routing_tags(crate::routing::cache_vary_tags(
                         &virtual_entry.value,
                         &client.routing_tags,

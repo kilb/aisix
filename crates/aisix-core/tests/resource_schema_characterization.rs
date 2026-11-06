@@ -131,6 +131,12 @@ fn cache_policy_corpus() {
                 false,
                 json!({"name": "x", "backend": "semantic"}),
             ),
+            ("team scope", true, json!({"name": "x", "scope": "team"})),
+            (
+                "unknown scope enum",
+                false,
+                json!({"name": "x", "scope": "org"}),
+            ),
             (
                 "empty applies_to",
                 false,
