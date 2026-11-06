@@ -1575,13 +1575,17 @@ pub(crate) mod tests {
             in_platform_mode(|| unknown().anthropic_body())
         );
 
-        let err = forbidden();
-        assert_eq!(err.status(), StatusCode::FORBIDDEN);
-        assert_eq!(crate::attempt::error_class(&err), "permission_denied");
-        assert_eq!(
-            crate::attempt::gateway_error_message(&err),
-            "API key is not allowed to use model \"x\""
-        );
+        // What the operator reads is written in the same platform-mode scope
+        // the caller's answer is, and still names the real refusal.
+        in_platform_mode(|| {
+            let err = forbidden();
+            assert_eq!(err.status(), StatusCode::FORBIDDEN);
+            assert_eq!(crate::attempt::error_class(&err), "permission_denied");
+            assert_eq!(
+                crate::attempt::gateway_error_message(&err),
+                "API key is not allowed to use model \"x\""
+            );
+        });
         // Off platform mode the refusal is the 403 it always was.
         assert_eq!(forbidden().into_response().status(), StatusCode::FORBIDDEN);
         assert_eq!(

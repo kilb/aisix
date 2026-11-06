@@ -1,5 +1,4 @@
 import { createHash, randomUUID } from "node:crypto";
-import { isDeepStrictEqual } from "node:util";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   EtcdClient,
@@ -139,16 +138,6 @@ async function post(
 }
 
 /**
- * A JSON body with its top-level `created` left out: a chat hit stamps the
- * current second there, so a replay of the same answer can carry a later one.
- */
-function withoutCreated(text: string): unknown {
-  const body = JSON.parse(text) as Record<string, unknown>;
-  delete body.created;
-  return body;
-}
-
-/**
  * Seed every model and the team-scoped policy, then the caller keys last, and
  * wait until the last key authenticates: that implies every row is in the
  * gateway's snapshot.
@@ -263,6 +252,11 @@ describe("cache team scope e2e", () => {
     const failures: string[] = [];
     for (const { endpoint, model, body } of CASES) {
       const request = body(`shared within one tenant via ${endpoint}`);
+      // A chat hit stamps the current second into `created`, so only that
+      // number may differ; every other byte, and every byte the other
+      // endpoints answer, is the answer.
+      const stamp = (t: string) =>
+        endpoint.endsWith("/chat/completions") ? t.replace(/"created":\d+/, '"created":0') : t;
       const before = upstreamCalls(endpoint);
 
       const first = await post(app, KEYS.tenantOneFirst, endpoint, model, request);
@@ -277,7 +271,7 @@ describe("cache team scope e2e", () => {
             `(upstream calls +${afterTeammate - before}, want 1; ` +
             `x-aisix-cache=${teammate.cache}, want hit)`,
         );
-      } else if (!isDeepStrictEqual(withoutCreated(teammate.text), withoutCreated(first.text))) {
+      } else if (stamp(teammate.text) !== stamp(first.text)) {
         failures.push(`${endpoint}: the teammate's hit differs from the original answer`);
       }
 

@@ -447,6 +447,20 @@ describe("platform mode: cache headers and model permissions tell a tenant nothi
     { gateway: "without debug headers", app: () => quiet },
     { gateway: "with debug headers", app: () => debug },
   ])("$gateway", ({ app }) => {
+    test("the model list names the models the key may use and none it may not", async (ctx) => {
+      const gateway = app();
+      if (!etcdReachable || !gateway) return ctx.skip();
+      for (const anthropic of [false, true]) {
+        const list: Endpoint = { name: "model list", path: "/v1/models", family: "gpt", anthropic };
+        const answer = await call(gateway, list, "");
+        const shape = anthropic ? "Anthropic shape" : "OpenAI shape";
+        expect(answer.status, `${shape}: ${answer.text}`).toBe(200);
+        const ids = (JSON.parse(answer.text) as { data: Array<{ id: string }> }).data.map((m) => m.id);
+        expect(ids, shape).toEqual(expect.arrayContaining(Object.values(VISIBLE)));
+        for (const hidden of Object.values(HIDDEN)) expect(ids, shape).not.toContain(hidden);
+      }
+    });
+
     test.for(PROBES.map((probe) => ({ probe, name: probe.name })))(
       "$name: a model the key may not use answers exactly like one that does not exist",
       async ({ probe }, ctx) => {
