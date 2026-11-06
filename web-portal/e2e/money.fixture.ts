@@ -104,6 +104,13 @@ export interface MoneyFixture {
   userId: string;
   readResources(): string;
   writeResources(body: string): void;
+  /**
+   * Whether the gateway serves the resources file exactly as it is on disk now:
+   * `/status/config` names the file it last read and the config it applied, and
+   * both must be this file's sha256. A file that holds a change is not yet a
+   * gateway enforcing it, because the reload runs after the write.
+   */
+  gatewayApplied(): Promise<boolean>;
   /** 用夹具预置的密钥打一次真实 chat，返回状态码。 */
   chat(): Promise<number>;
   /** 用任意明文密钥打一次真实 chat —— 用来验自助建的那把能不能调通。 */
@@ -918,6 +925,16 @@ observability:
     userId,
     readResources: () => readFileSync(resourcesPath, "utf8"),
     writeResources: (b: string) => writeFileSync(resourcesPath, b),
+    async gatewayApplied() {
+      const want = createHash("sha256").update(readFileSync(resourcesPath)).digest("hex");
+      const r = await fetch(`http://127.0.0.1:${metricsPort}/status/config`).catch(() => null);
+      if (!r || r.status !== 200) return false;
+      const view = (await r.json()) as {
+        source?: { source_hash?: string };
+        applied?: { config_hash?: string };
+      };
+      return view.source?.source_hash === want && view.applied?.config_hash === want;
+    },
     async chat() {
       return chatWith(proxyPort, CALLER_KEY);
     },
