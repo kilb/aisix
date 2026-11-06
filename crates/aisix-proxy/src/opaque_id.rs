@@ -113,7 +113,8 @@ fn hmac_parts(key: &[u8], parts: &[&[u8]]) -> hmac::Tag {
     ctx.sign()
 }
 
-fn derive_key(key: &[u8], label: &[u8]) -> [u8; 32] {
+/// A 32-byte key derived from `key` under `label`: `HMAC-SHA256(key, label)`.
+pub(crate) fn derive_key(key: &[u8], label: &[u8]) -> [u8; 32] {
     let mut out = [0u8; 32];
     out.copy_from_slice(hmac_parts(key, &[label]).as_ref());
     out
@@ -152,7 +153,7 @@ fn b64() -> base64::engine::GeneralPurpose {
 /// of 64 for a longer id. Every id up to 63 bytes — every upstream id seen in
 /// practice — therefore seals to one length, so a sealed id's length cannot
 /// tell one upstream's id format from another's.
-const SEAL_BUCKET: usize = 64;
+pub(crate) const SEAL_BUCKET: usize = 64;
 
 /// The shortest id [`Sealer::seal`] produces: no kept prefix, and the
 /// base64url form of a nonce, one bucket and a tag. Anything shorter cannot
@@ -161,18 +162,29 @@ const MIN_SEALED_LEN: usize = ((aead::NONCE_LEN + SEAL_BUCKET + aead::MAX_TAG_LE
 
 /// `id`, a `0x80` marker, then zeros up to the bucket (ISO/IEC 7816-4
 /// padding): unambiguous for any id, of any length, at one byte's cost.
-fn pad(id: &str) -> Vec<u8> {
-    let padded_len = (id.len() + 1).div_ceil(SEAL_BUCKET) * SEAL_BUCKET;
+pub(crate) fn pad(id: &str) -> Vec<u8> {
+    pad_after("", id)
+}
+
+/// [`pad`] for an id behind a fixed `head`: `head || id`, padded to a
+/// multiple of [`SEAL_BUCKET`] that leaves the id a whole bucket of its own,
+/// so every id up to 63 bytes behind the same head pads to one length. With
+/// no head this is exactly [`pad`]'s bucket.
+pub(crate) fn pad_after(head: &str, id: &str) -> Vec<u8> {
+    let padded_len = (head.len() + (id.len() + 1).div_ceil(SEAL_BUCKET) * SEAL_BUCKET)
+        .div_ceil(SEAL_BUCKET)
+        * SEAL_BUCKET;
     let mut out = Vec::with_capacity(padded_len + aead::MAX_TAG_LEN);
+    out.extend_from_slice(head.as_bytes());
     out.extend_from_slice(id.as_bytes());
     out.push(0x80);
     out.resize(padded_len, 0);
     out
 }
 
-/// The id [`pad`] padded; `None` when the bytes do not end in the marker and
-/// zeros.
-fn unpad(padded: &[u8]) -> Option<&[u8]> {
+/// The bytes [`pad`] or [`pad_after`] padded; `None` when they do not end in
+/// the marker and zeros.
+pub(crate) fn unpad(padded: &[u8]) -> Option<&[u8]> {
     let marker = padded.iter().rposition(|&b| b != 0)?;
     (padded[marker] == 0x80).then(|| &padded[..marker])
 }
@@ -772,6 +784,15 @@ pub(crate) mod tests {
         assert_eq!(pad("").len(), SEAL_BUCKET);
         assert_eq!(pad(&"a".repeat(63)).len(), SEAL_BUCKET);
         assert_eq!(pad(&"a".repeat(64)).len(), 2 * SEAL_BUCKET);
+        // Behind a head, the id still gets a whole bucket of its own.
+        let head = "h".repeat(83);
+        assert_eq!(pad_after(&head, "").len(), 3 * SEAL_BUCKET);
+        assert_eq!(pad_after(&head, &"a".repeat(63)).len(), 3 * SEAL_BUCKET);
+        assert_eq!(pad_after(&head, &"a".repeat(64)).len(), 4 * SEAL_BUCKET);
+        assert_eq!(
+            unpad(&pad_after(&head, "ab")),
+            Some(format!("{head}ab").as_bytes())
+        );
         // No marker, or something after it, is not padding.
         assert_eq!(unpad(&[b'a', 0, 0]), None);
         assert_eq!(unpad(&[b'a', 0x80, 1, 0]), None);

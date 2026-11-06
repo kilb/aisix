@@ -20,8 +20,19 @@
 //!
 //! Two targets can read each other's context when they share a provider key
 //! (same credentials, same endpoint) — that is the [`Boundary`].
+//!
+//! In platform mode both tags are sealed instead ([`TenantSeal`]): encrypted
+//! and authenticated under a key only the gateway holds, and bound to the
+//! tenant the response was handed to. A response id is tagged on every
+//! target, not only a group's, so that it names neither the target nor the
+//! upstream's own id, and a continuation from it is admitted only for that
+//! tenant ([`ContextAffinity::admit_continuation`]).
+
+use std::borrow::Cow;
+use std::sync::{Arc, OnceLock};
 
 use base64::Engine as _;
+use ring::aead;
 use serde_json::Value;
 
 use crate::json_splice::PathSeg;
@@ -30,8 +41,207 @@ const ENC_PREFIX: &str = "aisix_enc_v1:";
 const RESP_ID_PREFIX: &str = "resp_";
 const RESP_ID_TAG: &str = "aisix:v1;";
 
+/// Platform mode's ciphertext tag: `aisix_enc_v2:<sealed origin>;<original>`.
+const ENC_PREFIX_V2: &str = "aisix_enc_v2:";
+/// The head of every plaintext platform mode seals.
+const SEALED_TAG: &str = "aisix:v2;";
+/// Associated data of a sealed response id.
+const RESP_ID_AAD: &[u8] = b"aisix-responses-v2";
+/// Associated data of a sealed ciphertext tag, so neither kind of seal opens
+/// as the other.
+const ENC_AAD: &[u8] = b"aisix-encrypted-content-v2";
+
 fn b64() -> base64::engine::GeneralPurpose {
     base64::engine::general_purpose::URL_SAFE_NO_PAD
+}
+
+/// The key platform mode seals response ids and ciphertext tags under:
+/// derived from the platform `id_key` under its own label, so it is neither
+/// that key nor the one output item ids are sealed under.
+pub(crate) fn response_id_key(id_key: &[u8; 32]) -> [u8; 32] {
+    crate::opaque_id::derive_key(id_key, b"resp-v2")
+}
+
+/// A response id sealed to `owner`: `resp_` + base64url(`nonce || ciphertext
+/// || tag`), the AES-256-GCM encryption of
+/// `aisix:v2;<owner>;<target_id>;<upstream_id>` under a random nonce. The
+/// plaintext is padded so the upstream id gets a whole bucket of the size
+/// item ids use ([`crate::opaque_id::pad_after`]): the id's length does not
+/// tell one upstream's id format from another's.
+pub(crate) fn seal_response_id(
+    key: &[u8; 32],
+    owner: &str,
+    target_id: &str,
+    upstream_id: &str,
+) -> String {
+    format!(
+        "{RESP_ID_PREFIX}{}",
+        seal(key, RESP_ID_AAD, owner, target_id, upstream_id)
+    )
+}
+
+/// `(target id, upstream id)` of a [`seal_response_id`] value; `None` for an
+/// id that was not sealed under `key` to `owner`.
+pub(crate) fn open_response_id(
+    key: &[u8; 32],
+    owner: &str,
+    sealed: &str,
+) -> Option<(String, String)> {
+    open(
+        key,
+        RESP_ID_AAD,
+        owner,
+        sealed.strip_prefix(RESP_ID_PREFIX)?,
+    )
+}
+
+fn cipher(key: &[u8; 32]) -> aead::LessSafeKey {
+    aead::LessSafeKey::new(
+        aead::UnboundKey::new(&aead::AES_256_GCM, key)
+            .expect("a 32-byte key is the length AES-256-GCM takes"),
+    )
+}
+
+/// The owner as it is written into a plaintext: `%` and `;` escaped, so an
+/// owner whose name extends another's past a `;` cannot pass for it.
+fn owner_field(owner: &str) -> Cow<'_, str> {
+    if owner.contains(['%', ';']) {
+        Cow::Owned(owner.replace('%', "%25").replace(';', "%3B"))
+    } else {
+        Cow::Borrowed(owner)
+    }
+}
+
+fn seal(key: &[u8; 32], aad: &[u8], owner: &str, target_id: &str, value: &str) -> String {
+    let mut sealed = crate::opaque_id::pad_after(
+        &format!("{SEALED_TAG}{};{target_id};", owner_field(owner)),
+        value,
+    );
+    let mut nonce = [0u8; aead::NONCE_LEN];
+    // The operating system's random source; there is no id to hand out
+    // without it.
+    ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut nonce)
+        .expect("the system random source is readable");
+    cipher(key)
+        .seal_in_place_append_tag(
+            aead::Nonce::assume_unique_for_key(nonce),
+            aead::Aad::from(aad),
+            &mut sealed,
+        )
+        .expect("a sealed value is far below the AES-GCM message limit");
+    let mut payload = Vec::with_capacity(aead::NONCE_LEN + sealed.len());
+    payload.extend_from_slice(&nonce);
+    payload.extend_from_slice(&sealed);
+    b64().encode(payload)
+}
+
+fn open(key: &[u8; 32], aad: &[u8], owner: &str, payload: &str) -> Option<(String, String)> {
+    let raw = b64().decode(payload).ok()?;
+    if raw.len() < aead::NONCE_LEN + crate::opaque_id::SEAL_BUCKET + aead::MAX_TAG_LEN {
+        return None;
+    }
+    let (nonce, sealed) = raw.split_at(aead::NONCE_LEN);
+    let mut buf = sealed.to_vec();
+    let plain = cipher(key)
+        .open_in_place(
+            aead::Nonce::try_assume_unique_for_key(nonce).ok()?,
+            aead::Aad::from(aad),
+            &mut buf,
+        )
+        .ok()?;
+    let text = std::str::from_utf8(crate::opaque_id::unpad(plain)?).ok()?;
+    let (target, value) = text
+        .strip_prefix(SEALED_TAG)?
+        .strip_prefix(&*owner_field(owner))?
+        .strip_prefix(';')?
+        .split_once(';')?;
+    (!target.is_empty()).then(|| (target.to_owned(), value.to_owned()))
+}
+
+/// Platform mode: the key response ids and ciphertext tags are sealed under,
+/// and the tenant they are sealed to — the caller key's team, or the key
+/// itself when it has none.
+#[derive(Clone)]
+pub(crate) struct TenantSeal {
+    key: [u8; 32],
+    owner: String,
+}
+
+impl std::fmt::Debug for TenantSeal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TenantSeal")
+            .field("owner", &self.owner)
+            .finish_non_exhaustive()
+    }
+}
+
+impl TenantSeal {
+    pub(crate) fn new(platform: &crate::platform::PlatformSettings, owner: &str) -> Self {
+        Self {
+            key: response_id_key(&platform.id_key),
+            owner: owner.to_string(),
+        }
+    }
+
+    fn mark_encrypted_content(&self, target_id: &str, original: &str) -> String {
+        format!(
+            "{ENC_PREFIX_V2}{};{original}",
+            seal(&self.key, ENC_AAD, &self.owner, target_id, "")
+        )
+    }
+
+    /// A ciphertext tag as this tenant reads it. A tag sealed to anyone else
+    /// does not decode, and neither does the readable kind platform mode
+    /// never hands out: anyone can write one, naming any target.
+    fn decode_encrypted_content(&self, value: &str) -> EncryptedContent {
+        let Some(rest) = value.strip_prefix(ENC_PREFIX_V2) else {
+            return if value.starts_with(ENC_PREFIX) {
+                EncryptedContent::Undecodable
+            } else {
+                EncryptedContent::Plain
+            };
+        };
+        let opened = rest.split_once(';').and_then(|(tag, original)| {
+            let (origin, _) = open(&self.key, ENC_AAD, &self.owner, tag)?;
+            Some((origin, original.to_string()))
+        });
+        match opened {
+            Some((origin, original)) => EncryptedContent::Marked { origin, original },
+            None => EncryptedContent::Undecodable,
+        }
+    }
+}
+
+/// Platform mode: the one sealed id a response carries, made on first use.
+/// Its nonce is random, so every frame of the response must reuse it.
+#[derive(Debug)]
+struct SealedResponseId {
+    tenant: TenantSeal,
+    /// The target that served the response.
+    target_id: String,
+    /// `(upstream id, sealed id)`.
+    sealed: OnceLock<(String, String)>,
+}
+
+impl SealedResponseId {
+    fn seal(&self, upstream_id: &str) -> String {
+        let fresh = || {
+            seal_response_id(
+                &self.tenant.key,
+                &self.tenant.owner,
+                &self.target_id,
+                upstream_id,
+            )
+        };
+        let (first, sealed) = self
+            .sealed
+            .get_or_init(|| (upstream_id.to_string(), fresh()));
+        if first == upstream_id {
+            sealed.clone()
+        } else {
+            fresh()
+        }
+    }
 }
 
 pub(crate) fn mark_encrypted_content(target_id: &str, original: &str) -> String {
@@ -122,6 +332,11 @@ pub(crate) struct ContextAffinity {
     /// Index into `input[]` of each item whose ciphertext was tagged, with
     /// its origin. Items whose tag did not decode were already stripped.
     encrypted: Vec<(usize, String)>,
+    /// Platform mode: the tenant this request's tags are sealed to.
+    tenant: Option<TenantSeal>,
+    /// Platform mode: the `previous_response_id` names no response this
+    /// tenant was handed.
+    previous_unknown: bool,
 }
 
 impl ContextAffinity {
@@ -133,33 +348,66 @@ impl ContextAffinity {
         let mut affinity = Self::default();
         if let Some(slot) = body.get_mut("previous_response_id") {
             if let Some((origin, original)) = slot.as_str().and_then(decode_response_id) {
-                let sent = std::mem::replace(slot, Value::String(original.clone()));
-                if let Value::String(sent) = sent {
-                    affinity.previous_echo = Some((original, sent));
-                }
-                affinity.previous_origin = Some(origin);
+                affinity.restore_previous(slot, origin, original);
             }
         }
+        affinity.unwrap_input(body, decode_encrypted_content);
+        affinity
+    }
+
+    /// [`Self::unwrap_request`] in platform mode, for a request of `tenant`:
+    /// only what was sealed to it is restored. A `previous_response_id` that
+    /// does not open is left as sent and recorded, for
+    /// [`Self::admit_continuation`] to refuse; a ciphertext tag that does not
+    /// open is stripped like any undecodable one.
+    pub(crate) fn unwrap_sealed_request(body: &mut Value, tenant: TenantSeal) -> Self {
+        let mut affinity = Self::default();
+        if let Some(slot) = body
+            .get_mut("previous_response_id")
+            .filter(|v| v.is_string())
+        {
+            match slot
+                .as_str()
+                .and_then(|id| open_response_id(&tenant.key, &tenant.owner, id))
+            {
+                Some((origin, original)) => affinity.restore_previous(slot, origin, original),
+                None => affinity.previous_unknown = true,
+            }
+        }
+        affinity.unwrap_input(body, |value| tenant.decode_encrypted_content(value));
+        affinity.tenant = Some(tenant);
+        affinity
+    }
+
+    fn restore_previous(&mut self, slot: &mut Value, origin: String, original: String) {
+        let sent = std::mem::replace(slot, Value::String(original.clone()));
+        if let Value::String(sent) = sent {
+            self.previous_echo = Some((original, sent));
+        }
+        self.previous_origin = Some(origin);
+    }
+
+    fn unwrap_input(&mut self, body: &mut Value, decode: impl Fn(&str) -> EncryptedContent) {
         let Some(input) = body.get_mut("input").and_then(Value::as_array_mut) else {
-            return affinity;
+            return;
         };
         if !input.iter().any(|item| {
             item.get("encrypted_content")
                 .and_then(Value::as_str)
-                .is_some_and(|s| s.starts_with(ENC_PREFIX))
+                .is_some_and(|s| s.starts_with(ENC_PREFIX) || s.starts_with(ENC_PREFIX_V2))
         }) {
-            return affinity;
+            return;
         }
         let items = std::mem::take(input);
         for mut item in items {
             let decoded = item
                 .get("encrypted_content")
                 .and_then(Value::as_str)
-                .map(decode_encrypted_content);
+                .map(&decode);
             match decoded {
                 Some(EncryptedContent::Marked { origin, original }) => {
                     item["encrypted_content"] = Value::String(original);
-                    affinity.encrypted.push((input.len(), origin));
+                    self.encrypted.push((input.len(), origin));
                 }
                 Some(EncryptedContent::Undecodable) => match strip_ciphertext(item) {
                     Some(kept) => item = kept,
@@ -169,7 +417,47 @@ impl ContextAffinity {
             }
             input.push(item);
         }
-        affinity
+    }
+
+    /// Platform mode: whether this request may continue from the response
+    /// its `previous_response_id` names. One that was not sealed to the
+    /// caller's tenant is a response it was never handed; one served by a
+    /// target the key's provider groups no longer hold is one the key cannot
+    /// reach. Both are answered as a response that does not exist, before
+    /// anything is sent upstream, so the refusal cannot tell which.
+    ///
+    /// Keys on the DISPATCHED target recorded in the id, never on the model
+    /// this request addresses: the target of a direct or embedding model is
+    /// the model itself, a wildcard alias's the row that served it, and a
+    /// routing group's the member that answered. Semantic and ensemble
+    /// parents never dispatch on this endpoint. A target that no longer
+    /// exists cannot be shown to be in a group, so a grouped key is refused
+    /// it; a key without groups is not held to them. Outside platform mode
+    /// everything is admitted, as before.
+    pub(crate) fn admit_continuation(
+        &self,
+        snapshot: &aisix_core::AisixSnapshot,
+        allowed_groups: &[String],
+    ) -> Result<(), crate::error::ProxyError> {
+        if self.previous_unknown {
+            tracing::debug!("previous_response_id was not issued to this tenant");
+            return Err(crate::error::ProxyError::ResponseNotFound);
+        }
+        let (Some(_), Some(origin)) = (&self.tenant, self.previous_origin.as_deref()) else {
+            return Ok(());
+        };
+        if allowed_groups.is_empty()
+            || snapshot.models.get_by_id(origin).is_some_and(|entry| {
+                crate::routing::target_in_groups(snapshot, &entry.value, allowed_groups)
+            })
+        {
+            return Ok(());
+        }
+        tracing::debug!(
+            origin,
+            "previous response was served outside the API key's provider groups"
+        );
+        Err(crate::error::ProxyError::ResponseNotFound)
     }
 
     /// The target that produced this conversation's context, if a tag named
@@ -216,13 +504,21 @@ impl ContextAffinity {
         Some(body)
     }
 
-    /// How a response to this request is tagged. `target_id` is the routing
-    /// target that served it, `None` outside a routing group.
-    pub(crate) fn response_mark(&self, target_id: Option<&str>) -> ResponseMark {
+    /// How a response to this request is tagged. `target_id` is the target
+    /// that served it; `in_group` says it was reached through a routing
+    /// group, the only case outside platform mode that is tagged.
+    pub(crate) fn response_mark(&self, target_id: &str, in_group: bool) -> ResponseMark {
         ResponseMark {
-            target_id: target_id.map(str::to_string),
+            target_id: in_group.then(|| target_id.to_string()),
             previous_echo: self.previous_echo.clone(),
             seal: None,
+            tenant: self.tenant.clone().map(|tenant| {
+                Arc::new(SealedResponseId {
+                    tenant,
+                    target_id: target_id.to_string(),
+                    sealed: OnceLock::new(),
+                })
+            }),
         }
     }
 }
@@ -255,6 +551,9 @@ pub(crate) struct ResponseMark {
     /// Platform mode: output item ids leave sealed
     /// ([`crate::opaque_id::seal_id`]), and channel metrics do not leave.
     seal: Option<std::sync::Arc<crate::opaque_id::Sealer>>,
+    /// Platform mode: the response id leaves sealed to the tenant, and so
+    /// does a group target's ciphertext tag.
+    tenant: Option<Arc<SealedResponseId>>,
 }
 
 #[derive(Clone, Copy)]
@@ -267,7 +566,10 @@ enum Slot {
 
 impl ResponseMark {
     fn is_noop(&self) -> bool {
-        self.target_id.is_none() && self.previous_echo.is_none() && self.seal.is_none()
+        self.target_id.is_none()
+            && self.previous_echo.is_none()
+            && self.seal.is_none()
+            && self.tenant.is_none()
     }
 
     /// Seal the response's item ids when platform mode is on, with one
@@ -294,6 +596,9 @@ impl ResponseMark {
 
     /// A response id the gateway minted itself (the bridged path).
     pub(crate) fn response_id(&self, id: String) -> String {
+        if let Some(tenant) = &self.tenant {
+            return tenant.seal(&id);
+        }
         match &self.target_id {
             Some(target) => mark_response_id(target, &id),
             None => id,
@@ -302,16 +607,23 @@ impl ResponseMark {
 
     fn rewrite(&self, slot: Slot, value: &str) -> Option<String> {
         match slot {
-            Slot::ResponseId => self
-                .target_id
-                .as_deref()
-                .filter(|_| !value.is_empty())
-                .map(|t| mark_response_id(t, value)),
-            Slot::EncryptedContent => self
-                .target_id
-                .as_deref()
-                .filter(|_| !value.is_empty())
-                .map(|t| mark_encrypted_content(t, value)),
+            Slot::ResponseId => match &self.tenant {
+                Some(tenant) => (!value.is_empty()).then(|| tenant.seal(value)),
+                None => self
+                    .target_id
+                    .as_deref()
+                    .filter(|_| !value.is_empty())
+                    .map(|t| mark_response_id(t, value)),
+            },
+            Slot::EncryptedContent => {
+                self.target_id
+                    .as_deref()
+                    .filter(|_| !value.is_empty())
+                    .map(|t| match &self.tenant {
+                        Some(sealed) => sealed.tenant.mark_encrypted_content(t, value),
+                        None => mark_encrypted_content(t, value),
+                    })
+            }
             Slot::PreviousResponseId => self
                 .previous_echo
                 .as_ref()
@@ -503,6 +815,7 @@ mod tests {
             target_id: Some("m-1".into()),
             previous_echo: Some(("resp_prev".into(), "resp_SENT".into())),
             seal: None,
+            tenant: None,
         };
         let frame = b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_up\",\"previous_response_id\":\"resp_prev\",\"output\":[{\"type\":\"reasoning\",\"encrypted_content\":\"CT\"}]}}\n\n";
         let out = mark.apply_to_sse_frame(frame).unwrap();
@@ -533,7 +846,7 @@ mod tests {
         let platform = crate::platform::PlatformSettings::from_secret("s");
         let key = crate::opaque_id::seal_key(&platform.id_key);
         let mark = ContextAffinity::default()
-            .response_mark(target_id)
+            .response_mark(target_id.unwrap_or("m-1"), target_id.is_some())
             .sealing_ids(Some(&platform));
         (mark, key)
     }
@@ -587,7 +900,7 @@ mod tests {
     #[test]
     fn a_mark_without_platform_mode_leaves_item_ids_alone() {
         let mark = ContextAffinity::default()
-            .response_mark(None)
+            .response_mark("m-1", false)
             .sealing_ids(None);
         let mut body = json!({"id": "resp_up", "output": [{"id": "fc_1", "call_id": "call_1"}],
                               "amazon-bedrock-invocationMetrics": {}});
@@ -602,6 +915,312 @@ mod tests {
         // Platform mode alone, outside a routing group, still seals.
         let (mark, _) = sealing_mark(None);
         assert!(mark.apply_to_sse_frame(frame).is_some());
+    }
+
+    #[test]
+    fn a_sealed_response_id_opens_for_its_owner() {
+        let k = [3u8; 32];
+        let id = seal_response_id(&k, "team-a", "model-1", "resp_up");
+        assert_eq!(
+            open_response_id(&k, "team-a", &id),
+            Some(("model-1".into(), "resp_up".into()))
+        );
+    }
+
+    #[test]
+    fn another_tenants_response_id_is_not_found() {
+        let k = [3u8; 32];
+        let id = seal_response_id(&k, "team-a", "model-1", "resp_up");
+        assert_eq!(open_response_id(&k, "team-b", &id), None);
+    }
+
+    #[test]
+    fn a_sealed_id_reveals_nothing_when_decoded() {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let id = seal_response_id(&[3u8; 32], "team-a", "model-1", "resp_up");
+        let raw = URL_SAFE_NO_PAD
+            .decode(id.trim_start_matches("resp_"))
+            .unwrap();
+        assert!(!String::from_utf8_lossy(&raw).contains("model-1"));
+    }
+
+    /// Platform mode off: the tags are the bytes they always were.
+    #[test]
+    fn without_platform_mode_the_tags_are_unchanged_byte_for_byte() {
+        assert_eq!(
+            mark_response_id("m-1", "resp_abc"),
+            format!("resp_{}", b64().encode("aisix:v1;m-1;resp_abc"))
+        );
+        assert_eq!(
+            mark_encrypted_content("m-1", "CT"),
+            format!("aisix_enc_v1:{};CT", b64().encode("m-1"))
+        );
+    }
+
+    #[test]
+    fn a_sealed_response_id_opens_only_as_it_was_sealed() {
+        let k = [3u8; 32];
+        let id = seal_response_id(&k, "team-a", "model-1", "resp_up;with;semicolons");
+        assert_eq!(
+            open_response_id(&k, "team-a", &id),
+            Some(("model-1".into(), "resp_up;with;semicolons".into()))
+        );
+        // Another key, a flipped byte, a cut, or no prefix: nothing opens.
+        assert_eq!(open_response_id(&[4u8; 32], "team-a", &id), None);
+        let mut flipped = id.clone().into_bytes();
+        let last = flipped.len() - 1;
+        flipped[last] = if flipped[last] == b'A' { b'B' } else { b'A' };
+        assert_eq!(
+            open_response_id(&k, "team-a", &String::from_utf8(flipped).unwrap()),
+            None
+        );
+        assert_eq!(open_response_id(&k, "team-a", &id[..id.len() - 4]), None);
+        assert_eq!(open_response_id(&k, "team-a", &id["resp_".len()..]), None);
+        // Neither an upstream's id nor a tag readable by anyone is one.
+        assert_eq!(open_response_id(&k, "team-a", "resp_up"), None);
+        assert_eq!(
+            open_response_id(&k, "team-a", &mark_response_id("model-1", "resp_up")),
+            None
+        );
+        // Random nonces: the same response sealed twice is two ids.
+        assert_ne!(
+            id,
+            seal_response_id(&k, "team-a", "model-1", "resp_up;with;semicolons")
+        );
+    }
+
+    /// An owner that extends another owner's name past a `;` is still
+    /// another owner.
+    #[test]
+    fn an_owner_whose_name_extends_another_opens_nothing_of_it() {
+        let k = [3u8; 32];
+        let id = seal_response_id(&k, "team;model-x", "model-1", "resp_up");
+        assert_eq!(open_response_id(&k, "team", &id), None);
+        assert_eq!(
+            open_response_id(&k, "team;model-x", &id),
+            Some(("model-1".into(), "resp_up".into()))
+        );
+    }
+
+    /// The length of a sealed id says nothing about the upstream id inside:
+    /// one channel's short ids and another's long ones look alike.
+    #[test]
+    fn sealed_response_ids_are_one_length_whatever_the_upstream_id_was() {
+        let k = [3u8; 32];
+        let owner = "0c0e5f8a-7a8f-4d2b-9a53-6d1e3f2b4c5d";
+        let target = "5a9d2c1b-3e4f-4a6b-8c7d-9e0f1a2b3c4d";
+        let short = seal_response_id(&k, owner, target, "resp_1");
+        // A 53-byte id of one channel, and the longest that shares a bucket.
+        for long in [
+            "resp_67ccd2bed1ec8190b14f964abc0542670bb6a6b452d3795b".to_string(),
+            format!("resp_{}", "b".repeat(58)),
+        ] {
+            assert_eq!(
+                short.len(),
+                seal_response_id(&k, owner, target, &long).len()
+            );
+            assert_eq!(
+                open_response_id(&k, owner, &seal_response_id(&k, owner, target, &long)),
+                Some((target.to_string(), long.clone()))
+            );
+        }
+    }
+
+    #[test]
+    fn the_response_id_key_is_its_own() {
+        let id_key = [9u8; 32];
+        let key = response_id_key(&id_key);
+        assert_ne!(key, id_key);
+        assert_ne!(key, crate::opaque_id::seal_key(&id_key));
+        assert_eq!(key, response_id_key(&id_key));
+    }
+
+    fn tenant(owner: &str) -> TenantSeal {
+        TenantSeal::new(&crate::platform::PlatformSettings::from_secret("s"), owner)
+    }
+
+    fn sealed_for(owner: &str, target: &str, upstream: &str) -> String {
+        let platform = crate::platform::PlatformSettings::from_secret("s");
+        seal_response_id(&response_id_key(&platform.id_key), owner, target, upstream)
+    }
+
+    #[test]
+    fn a_sealed_previous_response_id_is_restored_for_its_owner() {
+        let sent = sealed_for("team-a", "m-1", "resp_up");
+        let mut body = json!({"previous_response_id": sent, "input": "hi"});
+        let a = ContextAffinity::unwrap_sealed_request(&mut body, tenant("team-a"));
+        assert_eq!(body["previous_response_id"], "resp_up");
+        assert_eq!(a.origin(), Some("m-1"));
+        assert!(!a.previous_unknown);
+        // The Response object echoes what the client sent.
+        let mark = a.response_mark("m-1", false);
+        assert_eq!(mark.previous_response_id_sent(), Some(sent.as_str()));
+    }
+
+    #[test]
+    fn a_previous_response_id_that_does_not_open_is_unknown() {
+        for foreign in [
+            sealed_for("team-a", "m-1", "resp_up"),
+            "resp_up".to_string(),
+            mark_response_id("m-1", "resp_up"),
+            String::new(),
+        ] {
+            let mut body = json!({"previous_response_id": foreign, "input": "hi"});
+            let a = ContextAffinity::unwrap_sealed_request(&mut body, tenant("team-b"));
+            assert!(a.previous_unknown, "{foreign}");
+            assert_eq!(a.origin(), None);
+        }
+        // No previous response at all is not an unknown one.
+        for body in [
+            json!({"input": "hi"}),
+            json!({"input": "hi", "previous_response_id": null}),
+        ] {
+            let mut body = body;
+            let a = ContextAffinity::unwrap_sealed_request(&mut body, tenant("team-b"));
+            assert!(!a.previous_unknown, "{body}");
+        }
+    }
+
+    #[test]
+    fn a_previous_response_id_is_admitted_only_inside_the_keys_groups() {
+        use aisix_core::resource::ResourceEntry;
+        let snapshot = aisix_core::AisixSnapshot::new();
+        let pk: aisix_core::ProviderKey = serde_json::from_value(json!({
+            "display_name": "pk-a", "secret": "s", "provider": "openai", "adapter": "openai",
+            "groups": ["ga"],
+        }))
+        .unwrap();
+        snapshot
+            .provider_keys
+            .insert(ResourceEntry::new("pk-1", pk, 1));
+        let model: aisix_core::Model = serde_json::from_value(json!({
+            "display_name": "m", "provider": "openai", "model_name": "gpt-4o",
+            "provider_key_id": "pk-1",
+        }))
+        .unwrap();
+        snapshot.models.insert(ResourceEntry::new("m-1", model, 1));
+        let continuing = |target: &str| {
+            let mut body = json!({"previous_response_id": sealed_for("team-a", target, "resp_up")});
+            ContextAffinity::unwrap_sealed_request(&mut body, tenant("team-a"))
+        };
+        let groups = |g: &[&str]| g.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        assert!(continuing("m-1").admit_continuation(&snapshot, &[]).is_ok());
+        assert!(continuing("m-1")
+            .admit_continuation(&snapshot, &groups(&["ga"]))
+            .is_ok());
+        for (target, allowed) in [("m-1", groups(&["gb"])), ("m-gone", groups(&["ga"]))] {
+            let err = continuing(target)
+                .admit_continuation(&snapshot, &allowed)
+                .unwrap_err();
+            assert!(
+                matches!(err, crate::error::ProxyError::ResponseNotFound),
+                "{target}: {err:?}"
+            );
+        }
+        // A key without groups is not held to them, even for a target that is gone.
+        assert!(continuing("m-gone")
+            .admit_continuation(&snapshot, &[])
+            .is_ok());
+        // An id that did not open is never admitted.
+        let mut body = json!({"previous_response_id": "resp_up"});
+        let unknown = ContextAffinity::unwrap_sealed_request(&mut body, tenant("team-a"));
+        assert!(unknown.admit_continuation(&snapshot, &[]).is_err());
+        // Platform mode off admits everything, as before.
+        let mut body = json!({"previous_response_id": "resp_up"});
+        let off = ContextAffinity::unwrap_request(&mut body);
+        assert!(off.admit_continuation(&snapshot, &groups(&["gb"])).is_ok());
+    }
+
+    #[test]
+    fn a_tenant_mark_seals_the_response_id_once_for_every_frame() {
+        let sent = sealed_for("team-a", "m-0", "resp_prev");
+        let mut req = json!({"previous_response_id": sent});
+        let affinity = ContextAffinity::unwrap_sealed_request(&mut req, tenant("team-a"));
+        let mark = affinity.response_mark("m-1", false);
+        let key = response_id_key(&crate::platform::PlatformSettings::from_secret("s").id_key);
+
+        let mut body = json!({"id": "resp_bdrk_up", "previous_response_id": "resp_prev",
+                              "output": [{"type": "reasoning", "encrypted_content": "CT"}]});
+        mark.apply_to_body(&mut body);
+        let id = body["id"].as_str().unwrap().to_string();
+        assert_eq!(
+            open_response_id(&key, "team-a", &id),
+            Some(("m-1".into(), "resp_bdrk_up".into()))
+        );
+        assert_eq!(body["previous_response_id"], sent.as_str());
+        // Outside a routing group no ciphertext is tagged, as before.
+        assert_eq!(body["output"][0]["encrypted_content"], "CT");
+
+        let created = b"event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_bdrk_up\",\"previous_response_id\":\"resp_prev\"}}\n\n";
+        let completed = b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_bdrk_up\"}}\n\n";
+        for frame in [&created[..], &completed[..]] {
+            let out = String::from_utf8(mark.apply_to_sse_frame(frame).unwrap()).unwrap();
+            assert!(out.contains(&id), "{out}");
+            assert!(!out.contains("resp_bdrk_up"), "{out}");
+        }
+        let buffered = mark.apply_to_sse_buffer([&created[..], &completed[..]].concat());
+        assert_eq!(String::from_utf8(buffered).unwrap().matches(&id).count(), 2);
+        // A response the gateway minted itself gets the same one id.
+        assert_eq!(mark.response_id("resp_bdrk_up".into()), id);
+        let minted = mark.response_id("resp_gw".into());
+        assert_eq!(
+            open_response_id(&key, "team-a", &minted),
+            Some(("m-1".into(), "resp_gw".into()))
+        );
+    }
+
+    #[test]
+    fn a_tenant_mark_in_a_group_seals_the_ciphertext_tag_to_the_tenant() {
+        let affinity = ContextAffinity::unwrap_sealed_request(&mut json!({}), tenant("team-a"));
+        let mark = affinity.response_mark("m-1", true);
+        let mut body = json!({"id": "resp_up", "output": [
+            {"type": "reasoning", "id": "rs_1", "summary": [{"type": "summary_text", "text": "why"}],
+             "encrypted_content": "CT"}]});
+        mark.apply_to_body(&mut body);
+        let tag = body["output"][0]["encrypted_content"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(tag.ends_with(";CT"), "{tag}");
+        let decoded_head = tag
+            .split_once(';')
+            .and_then(|(head, _)| head.rsplit_once(':'))
+            .and_then(|(_, payload)| b64().decode(payload).ok())
+            .unwrap();
+        assert!(
+            !String::from_utf8_lossy(&decoded_head).contains("m-1"),
+            "{tag}"
+        );
+        assert!(!tag.starts_with(ENC_PREFIX), "{tag}");
+
+        let echoed = || {
+            json!({"input": [
+                {"type": "reasoning", "id": "rs_1", "summary": [{"type": "summary_text", "text": "why"}],
+                 "encrypted_content": tag},
+                {"type": "message", "role": "user", "content": "go on"},
+            ]})
+        };
+        // The tenant it was handed to gets its origin back.
+        let mut own = echoed();
+        let a = ContextAffinity::unwrap_sealed_request(&mut own, tenant("team-a"));
+        assert_eq!(own["input"][0]["encrypted_content"], "CT");
+        assert_eq!(a.origin(), Some("m-1"));
+        // Anyone else's request sends no upstream the ciphertext.
+        let mut other = echoed();
+        let b = ContextAffinity::unwrap_sealed_request(&mut other, tenant("team-b"));
+        assert_eq!(b.origin(), None);
+        assert!(
+            other["input"][0].get("encrypted_content").is_none(),
+            "{other}"
+        );
+        assert_eq!(other["input"][0]["summary"][0]["text"], "why");
+        // A tag anyone can write names nothing in platform mode either.
+        let mut forged = json!({"input": [{"type": "reasoning", "summary": [],
+            "encrypted_content": mark_encrypted_content("m-1", "CT")}]});
+        let f = ContextAffinity::unwrap_sealed_request(&mut forged, tenant("team-a"));
+        assert_eq!(f.origin(), None);
+        assert_eq!(forged["input"].as_array().unwrap().len(), 0);
     }
 
     /// The keys are set up once per response, not once per frame or id.

@@ -392,8 +392,18 @@ pub async fn responses(
         }
     };
     // Before anything reads the body: no gateway context tag may reach a
-    // guardrail, a log, or an upstream.
-    let affinity = crate::responses_affinity::ContextAffinity::unwrap_request(&mut body);
+    // guardrail, a log, or an upstream. In platform mode the tags are sealed
+    // to the tenant they were handed to: the key's team, or the key itself.
+    let affinity = match state.platform() {
+        Some(platform) => crate::responses_affinity::ContextAffinity::unwrap_sealed_request(
+            &mut body,
+            crate::responses_affinity::TenantSeal::new(
+                platform,
+                auth.key().team_id.as_deref().unwrap_or(&auth.entry.id),
+            ),
+        ),
+        None => crate::responses_affinity::ContextAffinity::unwrap_request(&mut body),
+    };
     // Platform mode: the item ids a client echoes from an earlier answer
     // leave here sealed; the upstream gets back the ones it issued.
     if let Some(platform) = state.platform() {
@@ -825,6 +835,11 @@ async fn dispatch(
 
     // Client-IP allowlist gate (#557): reject before guardrails / upstream.
     crate::dispatch::check_ip_access(&model_entry.value, &client.source_ip)?;
+
+    // Platform mode: a continuation names a response this tenant was handed,
+    // served by a target the key's provider groups still hold. Anything else
+    // is a response that does not exist, and no upstream hears of it.
+    affinity.admit_continuation(snapshot, &auth.key().allowed_provider_groups)?;
 
     // #719: /v1/responses must run input guardrails like /v1/chat/completions
     // and /v1/messages. Before this, user input reached the upstream without
@@ -1264,7 +1279,7 @@ async fn dispatch(
             };
             let attempt_body = stripped_body.as_ref().unwrap_or(body);
             let mark = affinity
-                .response_mark(is_routing_request.then_some(target.id.as_str()))
+                .response_mark(&target.id, is_routing_request)
                 .sealing_ids(state.platform());
             let result = if crate::dispatch::serves_natively(
                 snapshot,
@@ -10634,5 +10649,386 @@ data: [DONE]\n\n";
             Some("resp_stream"),
             "the id rides the terminal frame, which only the end-of-stream line can see",
         );
+    }
+
+    // ── Platform mode: a response id belongs to the tenant it was handed to ──
+
+    use crate::error::ProxyError;
+    use axum::response::IntoResponse as _;
+    use serde_json::Value;
+
+    const PLATFORM_SECRET: &str = "responses-tenant-secret";
+    /// The plaintext of tenant B's key; tenant A's is `make_req`'s.
+    const TENANT_B_PLAINTEXT: &str = "sk-tenant-b";
+
+    fn tenant_key(id: &str, plaintext: &str, extra: serde_json::Value) -> ResourceEntry<ApiKey> {
+        use sha2::Digest as _;
+        let mut doc = serde_json::json!({
+            "key_hash": sha2::Sha256::digest(plaintext.as_bytes())
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>(),
+            "allowed_models": ["*"],
+        });
+        if let (Some(doc), Some(extra)) = (doc.as_object_mut(), extra.as_object()) {
+            doc.extend(extra.clone());
+        }
+        ResourceEntry::new(id, serde_json::from_value::<ApiKey>(doc).unwrap(), 1)
+    }
+
+    fn build_platform_app(snap: AisixSnapshot) -> axum::Router {
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
+        crate::build_router(
+            crate::ProxyState::new(SnapshotHandle::new(snap), hub, &cfg())
+                .without_cache()
+                .with_platform(crate::platform::PlatformSettings::from_secret(
+                    PLATFORM_SECRET,
+                )),
+        )
+    }
+
+    fn response_key() -> [u8; 32] {
+        crate::responses_affinity::response_id_key(
+            &crate::platform::PlatformSettings::from_secret(PLATFORM_SECRET).id_key,
+        )
+    }
+
+    fn request_as(plaintext: &str, body: serde_json::Value) -> Request<axum::body::Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("authorization", format!("Bearer {plaintext}"))
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    /// Tenant A (`team-a`, `make_req`'s key) and tenant B (`team-b`) on one
+    /// OpenAI target, `m-1`.
+    fn two_tenants(api_base: &str) -> AisixSnapshot {
+        let snap = new_snap_openai(api_base);
+        snap.models.insert(openai_model("gpt-4o-resp"));
+        snap.apikeys.insert(tenant_key(
+            "k-a",
+            "sk-caller",
+            serde_json::json!({"team_id": "team-a"}),
+        ));
+        snap.apikeys.insert(tenant_key(
+            "k-b",
+            TENANT_B_PLAINTEXT,
+            serde_json::json!({"team_id": "team-b"}),
+        ));
+        snap
+    }
+
+    async fn status_and_body(resp: axum::response::Response) -> (StatusCode, bytes::Bytes) {
+        let status = resp.status();
+        (status, to_bytes(resp.into_body(), 65536).await.unwrap())
+    }
+
+    /// What platform mode answers when an upstream says the response does
+    /// not exist.
+    async fn platform_not_found() -> (StatusCode, bytes::Bytes) {
+        let resp = crate::error::tests::in_platform_mode(|| {
+            ProxyError::Bridge(aisix_gateway::BridgeError::upstream_status(
+                404,
+                "Response with id 'resp_x' not found.",
+            ))
+            .into_response()
+        });
+        status_and_body(resp).await
+    }
+
+    #[tokio::test]
+    async fn platform_mode_answers_another_tenants_response_id_as_one_that_does_not_exist() {
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "resp_next", "object": "response", "output": []
+            })))
+            .expect(0)
+            .mount(&upstream)
+            .await;
+        let app = build_platform_app(two_tenants(&upstream.uri()));
+        let not_found = platform_not_found().await;
+        assert_eq!(not_found.0, StatusCode::NOT_FOUND);
+
+        let tenant_a_id = crate::responses_affinity::seal_response_id(
+            &response_key(),
+            "team-a",
+            "m-1",
+            "resp_up",
+        );
+        for previous in [
+            tenant_a_id.as_str(),
+            // An id nobody was handed, and the upstream's own id unsealed.
+            "resp_0123456789abcdef0123456789abcdef",
+            "resp_up",
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(request_as(
+                    TENANT_B_PLAINTEXT,
+                    serde_json::json!({"model": "gpt-4o-resp", "input": "hi",
+                                       "previous_response_id": previous}),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(status_and_body(resp).await, not_found, "{previous}");
+        }
+        // Streamed requests are answered the same way.
+        let resp = app
+            .oneshot(request_as(
+                TENANT_B_PLAINTEXT,
+                serde_json::json!({"model": "gpt-4o-resp", "input": "hi", "stream": true,
+                                   "previous_response_id": tenant_a_id}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(status_and_body(resp).await, not_found);
+    }
+
+    #[tokio::test]
+    async fn platform_mode_continues_a_response_for_the_tenant_it_was_handed_to() {
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .and(body_partial_json(
+                serde_json::json!({"previous_response_id": "resp_up"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "resp_bdrk_next", "object": "response",
+                "previous_response_id": "resp_up", "output": []
+            })))
+            .expect(2)
+            .mount(&upstream)
+            .await;
+        let snap = two_tenants(&upstream.uri());
+        // Another key of tenant A continues too: the id is the tenant's.
+        snap.apikeys.insert(tenant_key(
+            "k-a2",
+            "sk-tenant-a-second",
+            serde_json::json!({"team_id": "team-a"}),
+        ));
+        let app = build_platform_app(snap);
+        let sent = crate::responses_affinity::seal_response_id(
+            &response_key(),
+            "team-a",
+            "m-1",
+            "resp_up",
+        );
+
+        for plaintext in ["sk-caller", "sk-tenant-a-second"] {
+            let resp = app
+                .clone()
+                .oneshot(request_as(
+                    plaintext,
+                    serde_json::json!({"model": "gpt-4o-resp", "input": "go on",
+                                       "previous_response_id": sent}),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let v: serde_json::Value =
+                serde_json::from_slice(&to_bytes(resp.into_body(), 65536).await.unwrap()).unwrap();
+            assert_eq!(v["previous_response_id"], sent.as_str());
+            let id = v["id"].as_str().unwrap();
+            assert!(!id.contains("resp_bdrk_next"), "{id}");
+            assert_eq!(
+                crate::responses_affinity::open_response_id(&response_key(), "team-a", id),
+                Some(("m-1".into(), "resp_bdrk_next".into()))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn platform_mode_seals_every_frame_of_a_stream_to_one_id_of_the_tenant() {
+        let upstream = MockServer::builder().start().await;
+        let sse = "event: response.created\n\
+                   data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_bdrk_s\",\"status\":\"in_progress\",\"output\":[]}}\n\n\
+                   event: response.in_progress\n\
+                   data: {\"type\":\"response.in_progress\",\"response\":{\"id\":\"resp_bdrk_s\",\"status\":\"in_progress\",\"output\":[]}}\n\n\
+                   event: response.completed\n\
+                   data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_bdrk_s\",\"status\":\"completed\",\"output\":[]}}\n\n";
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .mount(&upstream)
+            .await;
+        // Relayed live, and held back for an output scan.
+        for guarded in [false, true] {
+            let snap = two_tenants(&upstream.uri());
+            if guarded {
+                crate::seed_env_scoped_guardrail(&snap, keyword_output_guardrail("BLOCKME"));
+            }
+            let app = build_platform_app(snap);
+            let resp = app
+                .oneshot(make_req(
+                    serde_json::json!({"model": "gpt-4o-resp", "input": "hi", "stream": true}),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = String::from_utf8(to_bytes(resp.into_body(), 65536).await.unwrap().to_vec())
+                .unwrap();
+            assert!(!body.contains("resp_bdrk_s"), "{body}");
+            let ids: Vec<String> = crate::redact::parse_sse_json_stream(body.as_bytes())
+                .0
+                .iter()
+                .filter_map(|e| e.pointer("/response/id").and_then(Value::as_str))
+                .map(str::to_owned)
+                .collect();
+            assert_eq!(ids.len(), 3, "{body}");
+            assert!(ids.iter().all(|id| *id == ids[0]), "{ids:?}");
+            assert_eq!(
+                crate::responses_affinity::open_response_id(&response_key(), "team-a", &ids[0]),
+                Some(("m-1".into(), "resp_bdrk_s".into())),
+                "guarded: {guarded}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn platform_mode_seals_a_translated_answers_id_to_the_tenant() {
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "msg_bdrk_1", "type": "message", "role": "assistant",
+                "model": "claude-3-haiku-20240307",
+                "content": [{"type": "text", "text": "hi"}],
+                "stop_reason": "end_turn", "usage": {"input_tokens": 3, "output_tokens": 1}
+            })))
+            .mount(&upstream)
+            .await;
+        let snap = new_snap_anthropic_at(&upstream.uri());
+        snap.models.insert(anthropic_model("claude-resp"));
+        snap.apikeys.insert(tenant_key(
+            "k-a",
+            "sk-caller",
+            serde_json::json!({"team_id": "team-a"}),
+        ));
+        let app = build_platform_app(snap);
+        let resp = app
+            .clone()
+            .oneshot(make_req(
+                serde_json::json!({"model": "claude-resp", "input": "hi"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v: serde_json::Value =
+            serde_json::from_slice(&to_bytes(resp.into_body(), 65536).await.unwrap()).unwrap();
+        let (target, minted) = crate::responses_affinity::open_response_id(
+            &response_key(),
+            "team-a",
+            v["id"].as_str().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(target, "m-2");
+        assert!(minted.starts_with("resp_"), "{minted}");
+
+        let resp = app
+            .oneshot(make_req(
+                serde_json::json!({"model": "claude-resp", "input": "hi", "stream": true}),
+            ))
+            .await
+            .unwrap();
+        let body =
+            String::from_utf8(to_bytes(resp.into_body(), 65536).await.unwrap().to_vec()).unwrap();
+        let ids: Vec<String> = crate::redact::parse_sse_json_stream(body.as_bytes())
+            .0
+            .iter()
+            .filter_map(|e| e.pointer("/response/id").and_then(Value::as_str))
+            .map(str::to_owned)
+            .collect();
+        assert!(ids.len() >= 2, "{body}");
+        assert!(ids.iter().all(|id| *id == ids[0]), "{ids:?}");
+        assert_eq!(
+            crate::responses_affinity::open_response_id(&response_key(), "team-a", &ids[0])
+                .map(|(target, _)| target),
+            Some("m-2".into())
+        );
+    }
+
+    /// A key restricted to provider groups continues only through a target
+    /// its groups still hold; anything else is the unknown-response answer,
+    /// and no upstream hears of it.
+    #[tokio::test]
+    async fn platform_mode_answers_a_continuation_outside_the_keys_groups_as_unknown() {
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "resp_next", "object": "response", "output": []
+            })))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        // `m-1` is on the provider key of group `ga`; `m-3`, which the key
+        // still reaches, on one of group `gb` at the same upstream.
+        let snap = AisixSnapshot::new();
+        let pk = |id: &str, group: &str| {
+            let doc = serde_json::json!({"display_name": format!("pk-{group}"), "secret": "sk",
+                "api_base": upstream.uri(), "provider": "openai", "adapter": "openai",
+                "groups": [group]});
+            ResourceEntry::new(
+                id,
+                serde_json::from_value::<aisix_core::ProviderKey>(doc).unwrap(),
+                1,
+            )
+        };
+        snap.provider_keys.insert(pk(OPENAI_PK_ID, "ga"));
+        snap.provider_keys.insert(pk("pk-gb", "gb"));
+        snap.models.insert(openai_model("gpt-4o-resp"));
+        let other: Model = serde_json::from_value(serde_json::json!({
+            "display_name": "gpt-4o-gb", "provider": "openai", "model_name": "gpt-4o",
+            "provider_key_id": "pk-gb"}))
+        .unwrap();
+        snap.models.insert(ResourceEntry::new("m-3", other, 1));
+        snap.apikeys.insert(tenant_key(
+            "k-a",
+            "sk-caller",
+            serde_json::json!({"team_id": "team-a", "allowed_provider_groups": ["gb"]}),
+        ));
+        let app = build_platform_app(snap);
+        let from_ga = crate::responses_affinity::seal_response_id(
+            &response_key(),
+            "team-a",
+            "m-1",
+            "resp_up",
+        );
+        let resp = app
+            .clone()
+            .oneshot(make_req(
+                serde_json::json!({"model": "gpt-4o-gb", "input": "go on",
+                                                 "previous_response_id": from_ga}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(status_and_body(resp).await, platform_not_found().await);
+
+        // Inside its groups the same key continues.
+        let from_gb = crate::responses_affinity::seal_response_id(
+            &response_key(),
+            "team-a",
+            "m-3",
+            "resp_up",
+        );
+        let resp = app
+            .oneshot(make_req(
+                serde_json::json!({"model": "gpt-4o-gb", "input": "go on",
+                                                 "previous_response_id": from_gb}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 }

@@ -34,7 +34,8 @@ import {
 // And the same upstream id must come back as the same gateway id every
 // time, or an agent matching calls to results across turns breaks.
 //
-// The response-level id of a Responses answer is outside this spec.
+// The response-level id of a Responses answer is the second suite's subject:
+// it belongs to the tenant it was handed to.
 
 const CALLER_PLAINTEXT = "sk-platform-identity-e2e-caller";
 const CALLER_KEY_HASH = createHash("sha256").update(CALLER_PLAINTEXT).digest("hex");
@@ -737,5 +738,367 @@ describe("platform mode e2e: ids name no upstream channel, and tool use still ro
     const completed = events.find((e) => e.type === "response.completed");
     expect(completed?.response?.usage?.input_tokens_details).toBeDefined();
     expect(completed!.response.usage.input_tokens_details).not.toHaveProperty("cache_creation_tokens");
+  });
+});
+
+// ── A response id belongs to the tenant it was handed to ────────────────
+//
+// A Responses answer's id is what a client continues from
+// (`previous_response_id`). In platform mode one gateway, and one upstream
+// account, serves many tenants, so the id must work as a continuation only
+// for the tenant that received it. Anyone else holding it gets the same "no
+// such response" answer an id nobody was ever handed gets, and nothing
+// reaches an upstream on their behalf. The id names neither the upstream's
+// own id nor the target that served it, read as is or decoded.
+//
+// A key restricted to provider groups continues only through a target its
+// groups still contain: narrowing the groups turns the continuation into the
+// same "no such response", rather than sending it to some other upstream.
+
+const TENANT_KEYS = {
+  /** Tenant A. */
+  a: "sk-platform-tenant-e2e-a",
+  /** Tenant B: another team on the same gateway and upstream. */
+  b: "sk-platform-tenant-e2e-b",
+  /** Tenant A again, restricted to provider groups. */
+  aGrouped: "sk-platform-tenant-e2e-a-grouped",
+};
+
+const TENANT_ALIASES = {
+  target: "pi-tenant-target",
+  streamed: "pi-tenant-streamed",
+  grouped: "pi-tenant-grouped",
+  otherGroup: "pi-tenant-other-group",
+  probe: "pi-tenant-probe",
+};
+
+/** A Responses upstream's answer, under an id that carries a channel marker. */
+function tenantAnswer(id: string, previous: string | null = null): Record<string, unknown> {
+  return {
+    id,
+    object: "response",
+    created_at: 1_760_000_000,
+    status: "completed",
+    model: "upstream-model",
+    previous_response_id: previous,
+    output: [
+      {
+        type: "message",
+        id: `msg_bdrk_${id.slice(-3)}`,
+        role: "assistant",
+        status: "completed",
+        content: [{ type: "output_text", text: "Sunny.", annotations: [] }],
+      },
+    ],
+    usage: { input_tokens: 5, output_tokens: 2, total_tokens: 7 },
+  };
+}
+
+function tenantStream(id: string): string[] {
+  const frame = (event: string, data: Record<string, unknown>) =>
+    `event: ${event}\ndata: ${JSON.stringify({ type: event, ...data })}\n\n`;
+  const answer = tenantAnswer(id);
+  const inProgress = { ...answer, status: "in_progress", output: [] };
+  const message = (answer.output as Array<Record<string, unknown>>)[0]!;
+  return [
+    frame("response.created", { sequence_number: 0, response: inProgress }),
+    frame("response.in_progress", { sequence_number: 1, response: inProgress }),
+    frame("response.output_item.added", {
+      sequence_number: 2,
+      output_index: 0,
+      item: { ...message, status: "in_progress", content: [] },
+    }),
+    frame("response.output_text.delta", {
+      sequence_number: 3,
+      item_id: message.id,
+      output_index: 0,
+      content_index: 0,
+      delta: "Sunny.",
+    }),
+    frame("response.output_item.done", { sequence_number: 4, output_index: 0, item: message }),
+    frame("response.completed", { sequence_number: 5, response: answer }),
+  ];
+}
+
+describe("platform mode e2e: a response id continues only for the tenant it was handed to", () => {
+  let tenantApp: SpawnedApp | undefined;
+  let seed: SeedClient | undefined;
+  let etcdReachable = false;
+  let groupedKeyId = "";
+  const modelIds: Record<keyof typeof TENANT_ALIASES, string> = {
+    target: "",
+    streamed: "",
+    grouped: "",
+    otherGroup: "",
+    probe: "",
+  };
+  const up: Record<keyof typeof TENANT_ALIASES, OpenAiUpstream | undefined> = {
+    target: undefined,
+    streamed: undefined,
+    grouped: undefined,
+    otherGroup: undefined,
+    probe: undefined,
+  };
+
+  async function postAs(
+    key: string,
+    path: string,
+    body: unknown,
+  ): Promise<{ status: number; text: string }> {
+    const res = await fetch(`${tenantApp!.proxyUrl}${path}`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${key}`, "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    return { status: res.status, text: await res.text() };
+  }
+
+  /**
+   * The id names nothing the tenant may not learn, as sent or decoded. The
+   * whole upstream id is what is looked for: a short marker could turn up in
+   * a random-looking id by chance.
+   */
+  function expectSealed(id: string, upstreamId: string, target: keyof typeof TENANT_ALIASES): void {
+    expect(id).toMatch(/^resp_/);
+    const decoded = Buffer.from(id.slice("resp_".length), "base64url").toString("latin1");
+    for (const view of [id, decoded]) {
+      for (const secret of [upstreamId, TENANT_ALIASES[target], modelIds[target]]) {
+        expect(view, `${id} names ${secret}`).not.toContain(secret);
+      }
+    }
+  }
+
+  /** No upstream id of an answer reaches the caller. */
+  function expectNoUpstreamIds(text: string, responseId: string): void {
+    for (const upstreamId of [responseId, `msg_bdrk_${responseId.slice(-3)}`]) {
+      expect(text, `answer carries ${upstreamId}`).not.toContain(upstreamId);
+    }
+  }
+
+  /** What a caller is told for a response id nobody was ever handed. */
+  async function unknownResponseAnswer(key: string, model: string): Promise<{ status: number; text: string }> {
+    return postAs(key, "/v1/responses", {
+      model,
+      input: "and tomorrow?",
+      previous_response_id: "resp_0123456789abcdef0123456789abcdef",
+    });
+  }
+
+  beforeAll(async () => {
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
+    if (!etcdReachable) return;
+
+    up.target = await startOpenAiUpstream({
+      scriptedResponses: [
+        { nonStreamBody: tenantAnswer("resp_bdrk_t01") },
+        { nonStreamBody: tenantAnswer("resp_bdrk_t02", "resp_bdrk_t01") },
+      ],
+    });
+    up.streamed = await startOpenAiUpstream({
+      scriptedResponses: [
+        { rawStreamFrames: tenantStream("resp_bdrk_s01") },
+        { nonStreamBody: tenantAnswer("resp_bdrk_s02", "resp_bdrk_s01") },
+      ],
+    });
+    up.grouped = await startOpenAiUpstream({ nonStreamBody: tenantAnswer("resp_bdrk_g01") });
+    up.otherGroup = await startOpenAiUpstream({ nonStreamBody: tenantAnswer("resp_bdrk_o01") });
+    up.probe = await startOpenAiUpstream();
+
+    tenantApp = await spawnApp({
+      extraEnv: {
+        AISIX_PROXY__PLATFORM__ENABLED: "true",
+        AISIX_PROXY__PLATFORM__ID_KEY_ENV: PLATFORM_SECRET_ENV,
+        [PLATFORM_SECRET_ENV]: PLATFORM_SECRET,
+      },
+    });
+    seed = new SeedClient(etcd, tenantApp.etcdPrefix);
+
+    const groups: Record<keyof typeof TENANT_ALIASES, string[]> = {
+      target: ["ga"],
+      streamed: ["ga"],
+      grouped: ["ga"],
+      otherGroup: ["gb"],
+      probe: ["ga"],
+    };
+    for (const route of Object.keys(TENANT_ALIASES) as Array<keyof typeof TENANT_ALIASES>) {
+      const pk = await seed.createProviderKey({
+        display_name: `pk-${TENANT_ALIASES[route]}`,
+        secret: "sk-mock",
+        api_base: `${up[route]!.baseUrl}/v1`,
+        groups: groups[route],
+      });
+      const model = await seed.createModel({
+        display_name: TENANT_ALIASES[route],
+        provider: "openai",
+        model_name: "upstream-model",
+        provider_key_id: pk.id,
+        retries: 0,
+      });
+      modelIds[route] = model.id;
+    }
+    // The caller keys last: each one authenticating implies every model
+    // above is in the gateway's snapshot.
+    const sha = (plaintext: string) => createHash("sha256").update(plaintext).digest("hex");
+    await seed.createApiKey({ key_hash: sha(TENANT_KEYS.a), allowed_models: ["*"], team_id: "tenant-a" });
+    await seed.createApiKey({ key_hash: sha(TENANT_KEYS.b), allowed_models: ["*"], team_id: "tenant-b" });
+    const grouped = await seed.createApiKey({
+      key_hash: sha(TENANT_KEYS.aGrouped),
+      allowed_models: ["*"],
+      team_id: "tenant-a",
+      allowed_provider_groups: ["ga", "gb"],
+    });
+    groupedKeyId = grouped.id;
+    await waitConfigPropagation(async () => {
+      for (const key of Object.values(TENANT_KEYS)) {
+        const res = await new ProxyClient(tenantApp!.proxyUrl, key).listModels();
+        if (res.status !== 200) return false;
+        const data = (res.body as { data?: Array<{ id?: string }> }).data ?? [];
+        if (!Object.values(TENANT_ALIASES).every((alias) => data.some((m) => m.id === alias))) {
+          return false;
+        }
+      }
+      return true;
+    });
+  });
+
+  afterAll(async () => {
+    await tenantApp?.exit();
+    await Promise.all(Object.values(up).map((u) => u?.close()));
+  });
+
+  test("a buffered answer's id: another tenant gets no such response, the owner continues", async (ctx) => {
+    if (!etcdReachable || !tenantApp) return void ctx.skip();
+    const upstream = up.target!;
+    const model = TENANT_ALIASES.target;
+
+    const first = await postAs(TENANT_KEYS.a, "/v1/responses", { model, input: "weather in Paris?" });
+    expect(first.status, first.text).toBe(200);
+    const firstBody = JSON.parse(first.text);
+    const id = firstBody.id as string;
+    expectSealed(id, "resp_bdrk_t01", "target");
+    expectNoUpstreamIds(first.text, "resp_bdrk_t01");
+    expect(firstBody.output[0].content[0].text).toBe("Sunny.");
+    expect(upstream.receivedRequests).toHaveLength(1);
+
+    // Tenant B holds tenant A's id: it is answered as an id nobody was handed.
+    const foreign = await postAs(TENANT_KEYS.b, "/v1/responses", {
+      model,
+      input: "and tomorrow?",
+      previous_response_id: id,
+    });
+    const unknown = await unknownResponseAnswer(TENANT_KEYS.b, model);
+    expect(foreign.status, foreign.text).toBe(404);
+    expect(unknown.status, unknown.text).toBe(404);
+    expect(foreign.text).toBe(unknown.text);
+    expect(foreign.text).not.toContain(id);
+    expect(upstream.receivedRequests, "nothing reached the upstream for tenant B").toHaveLength(1);
+
+    // Tenant A continues from its own id: the upstream gets its own id back,
+    // and the answer echoes the id the client sent.
+    const next = await postAs(TENANT_KEYS.a, "/v1/responses", {
+      model,
+      input: "and tomorrow?",
+      previous_response_id: id,
+    });
+    expect(next.status, next.text).toBe(200);
+    expect(upstreamBody(upstream, 1).previous_response_id).toBe("resp_bdrk_t01");
+    const nextBody = JSON.parse(next.text);
+    expect(nextBody.previous_response_id).toBe(id);
+    expect(nextBody.id).not.toBe(id);
+    expectSealed(nextBody.id, "resp_bdrk_t02", "target");
+    expectNoUpstreamIds(next.text, "resp_bdrk_t02");
+    expect(next.text).not.toContain("resp_bdrk_t01");
+  });
+
+  test("a streamed answer's id: one id on every frame, and it continues only for its tenant", async (ctx) => {
+    if (!etcdReachable || !tenantApp) return void ctx.skip();
+    const upstream = up.streamed!;
+    const model = TENANT_ALIASES.streamed;
+
+    const streamed = await postAs(TENANT_KEYS.a, "/v1/responses", {
+      model,
+      input: "weather in Paris?",
+      stream: true,
+    });
+    expect(streamed.status, streamed.text).toBe(200);
+    expectNoUpstreamIds(streamed.text, "resp_bdrk_s01");
+    const ids = sseEvents(streamed.text)
+      .filter((e) => typeof e.response?.id === "string")
+      .map((e) => e.response.id as string);
+    expect(ids.length, streamed.text).toBeGreaterThanOrEqual(3);
+    expect(new Set(ids).size, `one id across ${ids.join(",")}`).toBe(1);
+    const id = ids[0]!;
+    expectSealed(id, "resp_bdrk_s01", "streamed");
+
+    const foreign = await postAs(TENANT_KEYS.b, "/v1/responses", {
+      model,
+      input: "and tomorrow?",
+      previous_response_id: id,
+    });
+    expect(foreign.status, foreign.text).toBe(404);
+    expect(foreign.text).toBe((await unknownResponseAnswer(TENANT_KEYS.b, model)).text);
+    expect(upstream.receivedRequests, "nothing reached the upstream for tenant B").toHaveLength(1);
+
+    const next = await postAs(TENANT_KEYS.a, "/v1/responses", {
+      model,
+      input: "and tomorrow?",
+      previous_response_id: id,
+    });
+    expect(next.status, next.text).toBe(200);
+    expect(upstreamBody(upstream, 1).previous_response_id).toBe("resp_bdrk_s01");
+    expect(JSON.parse(next.text).previous_response_id).toBe(id);
+  });
+
+  test("a grouped key whose groups no longer hold the target that answered gets no such response", async (ctx) => {
+    if (!etcdReachable || !tenantApp) return void ctx.skip();
+
+    const first = await postAs(TENANT_KEYS.aGrouped, "/v1/responses", {
+      model: TENANT_ALIASES.grouped,
+      input: "weather in Paris?",
+    });
+    expect(first.status, first.text).toBe(200);
+    const id = JSON.parse(first.text).id as string;
+    expectSealed(id, "resp_bdrk_g01", "grouped");
+
+    // The operator narrows the key to the other group. Propagation shows on
+    // a model of the dropped group, which the key may no longer use.
+    await seed!.update("api_keys", groupedKeyId, {
+      key_hash: createHash("sha256").update(TENANT_KEYS.aGrouped).digest("hex"),
+      allowed_models: ["*"],
+      team_id: "tenant-a",
+      allowed_provider_groups: ["gb"],
+    });
+    await waitConfigPropagation(async () => {
+      const probe = await new ProxyClient(tenantApp!.proxyUrl, TENANT_KEYS.aGrouped).chat({
+        model: TENANT_ALIASES.probe,
+        messages: [{ role: "user", content: "hi" }],
+      });
+      return probe.status !== 200;
+    });
+
+    const groupedBefore = up.grouped!.receivedRequests.length;
+    const otherBefore = up.otherGroup!.receivedRequests.length;
+    // A model the key can still use, continuing from the answer of one it
+    // can no longer reach.
+    const next = await postAs(TENANT_KEYS.aGrouped, "/v1/responses", {
+      model: TENANT_ALIASES.otherGroup,
+      input: "and tomorrow?",
+      previous_response_id: id,
+    });
+    expect(next.status, next.text).toBe(404);
+    expect(next.text).toBe(
+      (await unknownResponseAnswer(TENANT_KEYS.aGrouped, TENANT_ALIASES.otherGroup)).text,
+    );
+    expect(up.grouped!.receivedRequests).toHaveLength(groupedBefore);
+    expect(up.otherGroup!.receivedRequests).toHaveLength(otherBefore);
+
+    // The model it can still use answers it without a continuation.
+    const fresh = await postAs(TENANT_KEYS.aGrouped, "/v1/responses", {
+      model: TENANT_ALIASES.otherGroup,
+      input: "weather in Paris?",
+    });
+    expect(fresh.status, fresh.text).toBe(200);
+    expect(up.otherGroup!.receivedRequests).toHaveLength(otherBefore + 1);
   });
 });

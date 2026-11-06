@@ -160,6 +160,8 @@ pub(crate) fn classify(err: &ProxyError) -> PlatformErrorClass {
         ProxyError::UnusableTarget(_) => PlatformErrorClass::UpstreamUnavailable,
         // The model cannot serve this endpoint, whichever provider is behind it.
         ProxyError::TargetRefused(_) => PlatformErrorClass::InvalidRequest { param: None },
+        // Read exactly as a response the upstream does not have.
+        ProxyError::ResponseNotFound => PlatformErrorClass::NotFound,
         other => match other.status().as_u16() {
             401 => PlatformErrorClass::Authentication,
             404 => PlatformErrorClass::NotFound,
@@ -277,13 +279,16 @@ fn classify_upstream(
 }
 
 /// Whether platform mode replaces `err` for the caller: an upstream's
-/// failure, or a gateway refusal whose text names the target the request
-/// resolved to. The one upstream-side variant left alone is the gateway's own
+/// failure, a gateway refusal whose text names the target the request
+/// resolved to, or a response id refused for what only the gateway knows
+/// about it. The one upstream-side variant left alone is the gateway's own
 /// request size limit, which names nothing.
 fn hides(err: &ProxyError) -> bool {
     match err {
         ProxyError::Bridge(e) => hides_bridge(e),
-        ProxyError::UnusableTarget(_) | ProxyError::TargetRefused(_) => true,
+        ProxyError::UnusableTarget(_)
+        | ProxyError::TargetRefused(_)
+        | ProxyError::ResponseNotFound => true,
         _ => false,
     }
 }
@@ -824,6 +829,22 @@ mod tests {
         let resp = in_platform_mode(|| upstream_status(401, "x").into_anthropic_response());
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body_json(resp).await["error"]["type"], "overloaded_error");
+    }
+
+    /// A response id this tenant was never handed reads exactly like a
+    /// response the upstream does not have.
+    #[tokio::test]
+    async fn an_unknown_response_is_answered_as_an_upstream_not_found() {
+        let unknown = in_platform_mode(|| ProxyError::ResponseNotFound.into_response());
+        let upstream = in_platform_mode(|| {
+            upstream_status(404, "Response with id 'resp_1' not found.").into_response()
+        });
+        assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+        assert_eq!(unknown.status(), upstream.status());
+        assert_eq!(unknown.headers(), upstream.headers());
+        let bytes =
+            |r: Response| async move { axum::body::to_bytes(r.into_body(), 65536).await.unwrap() };
+        assert_eq!(bytes(unknown).await, bytes(upstream).await);
     }
 
     #[test]

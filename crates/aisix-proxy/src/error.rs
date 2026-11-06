@@ -259,6 +259,14 @@ pub enum ProxyError {
     /// caller supplied it, so it leaks nothing.
     #[error("resource {0:?} not found")]
     JobResourceNotFound(String),
+    /// Platform mode: a `previous_response_id` that names no response the
+    /// caller may continue from. It was not issued to the caller's tenant,
+    /// or the target that served it is outside the key's provider groups.
+    /// The caller is answered as for a response the upstream does not have
+    /// (`crate::platform_errors`), so the refusal cannot tell which; the
+    /// text names neither, since it reaches the usage event.
+    #[error("previous response not found")]
+    ResponseNotFound,
     /// A list of files, batches or fine-tuning jobs asked for on a provider key
     /// that keys belonging to a team or user reach. The upstream's list spans
     /// its whole account, and the gateway cannot say which of it the caller
@@ -553,6 +561,7 @@ impl ProxyError {
             ProxyError::ModelNotFound(_) => StatusCode::NOT_FOUND,
             ProxyError::VideoNotFound(_) => StatusCode::NOT_FOUND,
             ProxyError::JobResourceNotFound(_) => StatusCode::NOT_FOUND,
+            ProxyError::ResponseNotFound => StatusCode::NOT_FOUND,
             ProxyError::JobListRefused => StatusCode::FORBIDDEN,
             ProxyError::InvalidRequest(_)
             | ProxyError::UnusableTarget(_)
@@ -610,6 +619,7 @@ impl ProxyError {
             ProxyError::ModelNotFound(_) => "model_not_found",
             ProxyError::VideoNotFound(_) => "video_not_found",
             ProxyError::JobResourceNotFound(_) => "resource_not_found",
+            ProxyError::ResponseNotFound => "response_not_found",
             ProxyError::JobListRefused => "permission_denied",
             ProxyError::InvalidRequest(_)
             | ProxyError::UnusableTarget(_)
