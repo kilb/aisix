@@ -172,6 +172,11 @@ impl From<DbError> for ApiError {
                 tracing::warn!(error = %e, "database lock timeout");
                 ApiError::unavailable()
             }
+            // Every pool connection stayed busy: the same, for the pool.
+            DbError::Db(sqlx::Error::PoolTimedOut) => {
+                tracing::warn!(error = %e, "no database connection was free in time");
+                ApiError::unavailable()
+            }
             e => ApiError::internal(e),
         }
     }
@@ -300,8 +305,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_lock_timeout_is_retryable_and_other_database_errors_are_internal() {
+    async fn a_lock_or_pool_timeout_is_retryable_and_other_database_errors_are_internal() {
         let (status, body) = answer(ApiError::from(DbError::LockTimeout)).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["code"], "unavailable");
+        let (status, body) = answer(ApiError::from(DbError::Db(sqlx::Error::PoolTimedOut))).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body["code"], "unavailable");
 

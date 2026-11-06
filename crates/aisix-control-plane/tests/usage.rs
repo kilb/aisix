@@ -14,10 +14,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aisix_control_plane::auth::OperatorRole;
-use aisix_control_plane::dp::telemetry::{MAX_BODIES_IN_FLIGHT, MAX_EVENTS_PER_BATCH, SLOT_WAIT};
+use aisix_control_plane::dp::telemetry::{
+    BODY_READ_WAIT, MAX_BODIES_IN_FLIGHT, MAX_EVENTS_PER_BATCH, SLOT_WAIT,
+};
 use serde_json::{json, Value};
 use sqlx::{Connection, PgConnection};
-use support::{DpClient, Resp, TestCp};
+use support::{Bundle, DpClient, Resp, TestCp};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Barrier;
 use uuid::Uuid;
 
@@ -30,6 +33,10 @@ const _: () = assert!(MAX_EVENTS_PER_BATCH >= 1000);
 // A delivery waiting for a body slot is answered before the gateway's own
 // 10 s request timeout.
 const _: () = assert!(SLOT_WAIT.as_secs() < 10);
+
+// A body that stops arriving frees its slot within a wait that a delivery
+// queued behind it can outlast, once it has waited part of its own.
+const _: () = assert!(BODY_READ_WAIT.as_secs() > SLOT_WAIT.as_secs());
 
 /// A usage event as the gateway sends it.
 fn event(event_id: &str) -> Value {
@@ -1174,4 +1181,117 @@ async fn operators_page_through_rejected_events() {
     // A query that cannot be read is refused.
     let page = get("/admin/usage/rejects?batch_id=not-a-uuid-7c1".to_string()).await;
     assert_eq!(page.status, 422, "{page:?}");
+}
+
+/// One mTLS connection to the gateway listener as `bundle`'s gateway, for
+/// writing a request by hand.
+async fn raw_dp_connection(
+    cp: &TestCp,
+    bundle: &Bundle,
+) -> tokio_rustls::client::TlsStream<tokio::net::TcpStream> {
+    use rustls_pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
+    let der = |pem: &str| {
+        x509_parser::pem::parse_x509_pem(pem.as_bytes())
+            .expect("a PEM certificate")
+            .1
+            .contents
+    };
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(CertificateDer::from(der(&bundle.ca_pem)))
+        .expect("the CA as a root");
+    let key = rcgen::KeyPair::from_pem(&bundle.key_pem).expect("a PKCS#8 key");
+    let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .expect("TLS versions")
+    .with_root_certificates(roots)
+    .with_client_auth_cert(
+        vec![CertificateDer::from(der(&bundle.cert_pem))],
+        PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der())),
+    )
+    .expect("a client identity");
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let tcp = tokio::net::TcpStream::connect(cp.dp_addr())
+        .await
+        .expect("connect to the gateway listener");
+    tokio_rustls::TlsConnector::from(Arc::new(config))
+        .connect(ServerName::try_from("localhost").expect("a name"), tcp)
+        .await
+        .expect("the mTLS handshake")
+}
+
+/// A delivery whose headers arrive and whose body stops halfway holds a
+/// body slot only for a bounded wait: it is then answered 408, which the
+/// gateway re-sends, and its slot goes to the delivery queued behind it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_body_that_stops_arriving_gives_its_slot_back() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let admin = cp.admin_login_seeded(OperatorRole::Admin).await;
+    let bundle = cp.issue_bundle(&admin, "gw-usage-7c1").await;
+    let dp = Arc::new(cp.dp_client(&bundle));
+    // Every slot but the one the stalled delivery takes.
+    let _rest = slots(&cp)
+        .acquire_many_owned(MAX_BODIES_IN_FLIGHT as u32 - 1)
+        .await
+        .expect("all slots but one");
+
+    let mut stalled = raw_dp_connection(&cp, &bundle).await;
+    let head = format!(
+        "POST /dp/telemetry HTTP/1.1\r\nhost: localhost\r\ncontent-type: application/json\r\n\
+         x-aisix-usage-batch-id: {}\r\ncontent-length: 4096\r\n\r\n{{\"events\": [",
+        Uuid::new_v4()
+    );
+    stalled
+        .write_all(head.as_bytes())
+        .await
+        .expect("send the head");
+    stalled.flush().await.expect("flush");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while slots(&cp).available_permits() > 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the stalled delivery never took a slot"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let stalled_since = tokio::time::Instant::now();
+
+    // A delivery queued behind it, late enough that the stalled one's wait
+    // runs out before its own does.
+    tokio::time::sleep(BODY_READ_WAIT - SLOT_WAIT + Duration::from_secs(2)).await;
+    let b = Uuid::new_v4();
+    let queued = {
+        let dp = dp.clone();
+        tokio::spawn(async move { dp.telemetry(b, &batch(&["queued-7c1"])).await })
+    };
+
+    let mut reply = Vec::new();
+    tokio::time::timeout(
+        BODY_READ_WAIT + Duration::from_secs(5),
+        stalled.read_to_end(&mut reply),
+    )
+    .await
+    .expect("the stalled delivery was never answered")
+    .expect("read the answer");
+    let waited = stalled_since.elapsed();
+    let reply = String::from_utf8_lossy(&reply).to_ascii_lowercase();
+    assert!(reply.starts_with("http/1.1 408"), "{reply}");
+    assert!(
+        reply.contains("x-aisix-usage-batch-dedup: 1\r\n"),
+        "{reply}"
+    );
+    assert!(
+        waited + Duration::from_secs(1) >= BODY_READ_WAIT,
+        "answered after {waited:?}"
+    );
+
+    // Its slot went to the queued delivery.
+    let r = queued.await.expect("the queued delivery");
+    assert_eq!(answer(&r), (200, counts(1, 0, 0)), "{r:?}");
+    assert_eq!(batch_row(&cp, b).await, Some((1, 1, 0, 0, 1)));
+    assert_eq!(cp.count("usage_batches").await, 1);
 }

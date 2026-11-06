@@ -15,7 +15,7 @@
 //!   event age or 8 answered failures.
 //! - any other `4xx`: dropped. So `400` (no usable batch id, a body that is
 //!   not a batch) and `413` (too large) are for batches that re-sending
-//!   would not fix.
+//!   would not fix, and a body that stopped arriving is `408`.
 //!
 //! A store that failed is answered by whether sending the same batch again
 //! can get past the failure ([`transient`]): `503` when it can (a lost
@@ -34,7 +34,9 @@
 //! At most [`MAX_BODIES_IN_FLIGHT`] bodies are held at once ([`BodySlot`]):
 //! a delivery takes a slot before its body is read and keeps it until its
 //! store ends, even if the gateway stops waiting for the answer. One that
-//! finds no slot free within [`SLOT_WAIT`] is answered `503` unread.
+//! finds no slot free within [`SLOT_WAIT`] is answered `503` unread, and one
+//! whose body has not arrived within [`BODY_READ_WAIT`] of taking its slot
+//! is answered `408` (which the gateway re-sends), freeing the slot.
 //!
 //! There is no per-credential rate limit, unlike `/dp/heartbeat`. A
 //! gateway process sends one batch at a time and waits for its answer, so
@@ -76,6 +78,10 @@ pub const MAX_BODIES_IN_FLIGHT: usize = 32;
 /// before it is answered `503`: below the gateway's 10 s request timeout, so
 /// it gets an answer rather than a timeout.
 pub const SLOT_WAIT: Duration = Duration::from_secs(8);
+
+/// How long a delivery's body may take to arrive once its slot is taken,
+/// before it is answered `408` and the slot freed.
+pub const BODY_READ_WAIT: Duration = Duration::from_secs(10);
 
 /// The id the gateway minted for a batch, the same on each re-send.
 pub const BATCH_ID_HEADER: &str = "x-aisix-usage-batch-id";
@@ -148,6 +154,7 @@ pub(crate) fn transient(e: &DbError) -> bool {
             sqlx::Error::PoolTimedOut
             | sqlx::Error::PoolClosed
             | sqlx::Error::Io(_)
+            | sqlx::Error::Tls(_)
             | sqlx::Error::WorkerCrashed,
         ) => true,
         DbError::Db(sqlx::Error::Database(db)) => db.code().is_some_and(|c| transient_sqlstate(&c)),
@@ -156,11 +163,12 @@ pub(crate) fn transient(e: &DbError) -> bool {
 }
 
 /// SQLSTATE classes 08 (connection exception), 40 (transaction rollback:
-/// serialisation failure, deadlock), 53 (insufficient resources) and 57
-/// (operator intervention: shutdown, cancel, statement timeout), and 25006
-/// (a read-only transaction, as on a server that has just become a standby).
+/// serialisation failure, deadlock), 53 (insufficient resources), 57
+/// (operator intervention: shutdown, cancel, statement timeout) and 58
+/// (system error: an I/O failure on the server), and 25006 (a read-only
+/// transaction, as on a server that has just become a standby).
 fn transient_sqlstate(code: &str) -> bool {
-    matches!(code.get(..2), Some("08" | "40" | "53" | "57")) || code == "25006"
+    matches!(code.get(..2), Some("08" | "40" | "53" | "57" | "58")) || code == "25006"
 }
 
 /// What a failed store is logged as: a database error by its SQLSTATE, as
@@ -229,7 +237,8 @@ impl FromRequestParts<AppState> for BodySlot {
 
 /// The batch's events, each as sent: `400` for a body that is not
 /// `{"events": [...]}` JSON, `413` for one over [`MAX_BODY_BYTES`] or
-/// [`MAX_EVENTS_PER_BATCH`] events. Other fields of the body are ignored.
+/// [`MAX_EVENTS_PER_BATCH`] events, `408` for one that has not arrived
+/// whole within [`BODY_READ_WAIT`]. Other fields of the body are ignored.
 pub struct Events(pub Vec<Value>);
 
 #[derive(Deserialize)]
@@ -286,7 +295,23 @@ impl<S: Send + Sync> FromRequest<S> for Events {
     type Rejection = ApiError;
 
     async fn from_request(request: Request, state: &S) -> Result<Events, ApiError> {
-        match Json::<Batch>::from_request(request, state).await {
+        // A body that stops arriving would hold its slot for as long as its
+        // connection stays open.
+        let read =
+            tokio::time::timeout(BODY_READ_WAIT, Json::<Batch>::from_request(request, state));
+        let Ok(read) = read.await else {
+            tracing::warn!(
+                wait_secs = BODY_READ_WAIT.as_secs(),
+                "a usage batch body did not finish arriving; answered 408 and freed its slot"
+            );
+            return Err(ApiError {
+                status: StatusCode::REQUEST_TIMEOUT,
+                code: "request_timeout",
+                message: format!("请求体未在 {} 秒内传完", BODY_READ_WAIT.as_secs()),
+                ..ApiError::unavailable()
+            });
+        };
+        match read {
             Ok(Json(batch)) if batch.events.over_cap => Err(ApiError {
                 message: format!("一个用量批次最多 {MAX_EVENTS_PER_BATCH} 条事件"),
                 ..ApiError::too_large()
@@ -311,7 +336,7 @@ mod tests {
     fn a_failure_is_transient_when_a_re_send_can_get_past_it() {
         for code in [
             "08000", "08006", "08P01", "40001", "40P01", "53100", "53200", "53300", "57014",
-            "57P01", "57P03", "25006",
+            "57P01", "57P03", "25006", "58000", "58030",
         ] {
             assert!(transient_sqlstate(code), "{code}");
         }
@@ -327,6 +352,7 @@ mod tests {
             sqlx::Error::PoolClosed,
             sqlx::Error::WorkerCrashed,
             sqlx::Error::Io(std::io::Error::other("reset")),
+            sqlx::Error::Tls(Box::new(std::io::Error::other("handshake"))),
         ] {
             assert!(transient(&DbError::Db(e)));
         }
