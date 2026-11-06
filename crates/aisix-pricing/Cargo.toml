@@ -8,10 +8,11 @@ repository.workspace = true
 authors.workspace = true
 description = "aisix: the control plane's pricing engine (pure, no I/O)"
 
-# Versions are pinned here, not taken from [workspace.dependencies], like the
-# other control-plane crates: what prices a tenant's usage should not move
-# because a gateway crate bumped a dependency. No sqlx and no async: the
-# engine is a pure function of its inputs.
+# Versions are pinned here rather than taken from [workspace.dependencies],
+# like the other control-plane crates, so this manifest does not move with
+# the gateway's [workspace.dependencies]. The workspace still shares one
+# Cargo.lock, so a semver-compatible bump reaches this crate too. No sqlx and
+# no async: the engine is a pure function of its inputs.
 [dependencies]
 aisix-core = { path = "../aisix-core" }
 chrono = { version = "0.4", features = ["serde"] }
