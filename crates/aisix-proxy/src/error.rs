@@ -304,6 +304,12 @@ pub enum ProxyError {
     /// `allowed_routes` grants.
     #[error("API key is not allowed to use passthrough route {0:?}")]
     RouteForbidden(String),
+    /// The caller's API key lists the endpoint families it may call
+    /// (`allowed_endpoints`) and this route's family is not among them
+    /// (`crate::endpoint_acl`). The message names neither the family nor
+    /// what the key may call.
+    #[error("API key is not allowed to call this endpoint.")]
+    EndpointForbidden(aisix_core::models::EndpointFamily),
     #[error("request payload is invalid: {0}")]
     InvalidRequest(String),
     /// [`Self::InvalidRequest`] on the wire, raised for what a target's own
@@ -566,6 +572,7 @@ impl ProxyError {
             ProxyError::ModelIpRestricted(_) => StatusCode::FORBIDDEN,
             ProxyError::RouteIpRestricted(_) => StatusCode::FORBIDDEN,
             ProxyError::RouteForbidden(_) => StatusCode::FORBIDDEN,
+            ProxyError::EndpointForbidden(_) => StatusCode::FORBIDDEN,
             ProxyError::ModelNotFound(_) => StatusCode::NOT_FOUND,
             ProxyError::VideoNotFound(_) => StatusCode::NOT_FOUND,
             ProxyError::JobResourceNotFound(_) => StatusCode::NOT_FOUND,
@@ -625,6 +632,7 @@ impl ProxyError {
             ProxyError::ModelIpRestricted(_) => "permission_denied",
             ProxyError::RouteIpRestricted(_) => "permission_denied",
             ProxyError::RouteForbidden(_) => "permission_denied",
+            ProxyError::EndpointForbidden(_) => "permission_denied",
             ProxyError::ModelNotFound(_) => "model_not_found",
             ProxyError::VideoNotFound(_) => "video_not_found",
             ProxyError::JobResourceNotFound(_) => "resource_not_found",

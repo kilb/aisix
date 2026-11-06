@@ -43,6 +43,7 @@ mod dispatch;
 mod ebml;
 mod effort_mapping;
 mod embeddings;
+mod endpoint_acl;
 mod ensemble;
 mod error;
 mod error_translate;

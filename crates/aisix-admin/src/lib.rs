@@ -1472,6 +1472,59 @@ mod tests {
             .is_none());
     }
 
+    /// `allowed_endpoints` refuses every route outside the listed families,
+    /// so an operator reading the key back must see it: the read carries it
+    /// when the stored key sets it, an empty list included, and leaves it
+    /// out when it does not. The OpenAPI read projection documents it.
+    #[tokio::test]
+    async fn an_api_key_read_back_shows_its_endpoint_families() {
+        let (state, store) = build_seedable_state();
+        for (id, endpoints) in [
+            ("k-limited", Some(json!(["chat_completions", "models"]))),
+            ("k-none", Some(json!([]))),
+            ("k-open", None),
+        ] {
+            let mut payload = apikey_payload(id, &["*"]);
+            if let Some(endpoints) = endpoints {
+                payload["allowed_endpoints"] = endpoints;
+            }
+            let key: aisix_core::ApiKey = serde_json::from_value(payload).unwrap();
+            store
+                .put_apikey(aisix_core::ResourceEntry::new(id, key, 1))
+                .await
+                .unwrap();
+        }
+        let resp = run(
+            build_router(state),
+            auth_req("GET", "/admin/v1/api_keys", None),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        let by_id = |id: &str| {
+            v.as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["id"] == id)
+                .cloned()
+                .unwrap()
+        };
+        assert_eq!(
+            by_id("k-limited")["value"]["allowed_endpoints"],
+            json!(["chat_completions", "models"])
+        );
+        assert_eq!(by_id("k-none")["value"]["allowed_endpoints"], json!([]));
+        assert!(by_id("k-open")["value"].get("allowed_endpoints").is_none());
+
+        let resp = openapi::openapi_json().await;
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let field =
+            &parsed["components"]["schemas"]["PublicApiKey"]["properties"]["allowed_endpoints"];
+        assert_eq!(field["items"]["type"], "string", "{field}");
+        assert!(field["description"].as_str().is_some_and(|d| !d.is_empty()));
+    }
+
     /// A provider key's `groups` are part of its read projection too.
     #[tokio::test]
     async fn a_provider_key_read_back_shows_its_groups() {

@@ -370,6 +370,12 @@ where
         }
     };
     let authed = authenticate_token(&proxy_state, &token, ctx).await?;
+    // The key's endpoint allow-list, for every route that authenticates
+    // here. Refused through this function's `Err`, so the caller's access-log
+    // line and request metrics are written like any other denial's.
+    if let Some(family) = crate::endpoint_acl::endpoint_family(parts.uri.path()) {
+        crate::endpoint_acl::check_endpoint(authed.key(), family)?;
+    }
     // Publish the resolved key so extractors that run after this one can
     // see who is calling without re-authenticating. `ClientContext` reads
     // it for the `${request.api_key.*}` header templates

@@ -220,14 +220,14 @@ pub(crate) const POSTURE: &[(&str, Posture)] = &[
 ];
 
 /// The router's `.fallback(...)` seat, which has no path literal of its own.
-const FALLBACK_SURFACE: &str = "<fallback>";
+pub(crate) const FALLBACK_SURFACE: &str = "<fallback>";
 
 /// Pull every surface `build_router` mounts out of its own source: the
 /// `.route("<path>", ...)` literals, plus the `.fallback(...)` seat.
 ///
 /// Scoped to the function body so unrelated `.route(` calls elsewhere in
 /// `lib.rs` (tests, doc examples) cannot pad the census.
-fn mounted_surfaces() -> BTreeSet<String> {
+pub(crate) fn mounted_surfaces() -> BTreeSet<String> {
     let start = ROUTER_SRC
         .find("pub fn build_router(")
         .expect("build_router must exist in lib.rs");
