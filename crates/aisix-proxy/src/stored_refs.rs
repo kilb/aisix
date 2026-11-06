@@ -24,10 +24,16 @@
 //!     `response_prompt_param.py:23`.
 //!   - `prompt_cache_options.comparison_response_id`, a stored response:
 //!     `response_create_params.py:169`, `:413`.
-//!   - Every tool definition below, wherever it appears: in `tools[]`, and
-//!     inside `input[]` in an `additional_tools` item
-//!     (`response_input_item_param.py:222`) or a `tool_search_output` item
-//!     (`response_tool_search_output_item_param_param.py:395`).
+//!   - Every tool definition below, wherever it appears: in `tools[]`, in
+//!     `tool_choice` as the definitions of an `allowed_tools` choice
+//!     (`tool_choice_allowed_param.py:23`), and inside `input[]` in an
+//!     `additional_tools` item (`response_input_item_param.py:222`) or a
+//!     `tool_search_output` item
+//!     (`response_tool_search_output_item_param_param.py:395`). The walk
+//!     does not descend into a function tool's JSON Schema, a custom tool's
+//!     grammar or a `tool_search_call`'s arguments
+//!     (`response_input_item_param.py:203`), which the caller or the model
+//!     wrote for their own purposes.
 //!   - A code interpreter's `container` given as an id, or as an automatic
 //!     container with uploaded `file_ids`: `tool_param.py:214` and `:230`.
 //!   - A file search's `vector_store_ids`: `file_search_tool_param.py:58`.
@@ -63,7 +69,7 @@
 //!   - `container`, given as an id or as an object naming one
 //!     (`message_create_params.py:135`, `container_params.py:14`), or
 //!     loading a `custom` skill (`skill_params.py:11`, `:14`);
-//!   - a document or image block whose `source` is a stored file
+//!   - a block of any type whose `source` is a stored file
 //!     (`file_document_source_param.py:9`, `file_image_source_param.py:9`),
 //!     at any depth, but never inside the `input` the model wrote for a tool
 //!     use;
@@ -72,7 +78,12 @@
 //!     (`message_create_params.py:138`, `diagnostics_param.py:16`);
 //!   - `thread`, server-held conversation state
 //!     (`beta/message_create_params.py:271`). The client's `anthropic-beta`
-//!     header is forwarded, so a beta field reaches the upstream.
+//!     header is forwarded, so a beta field reaches the upstream;
+//!   - `fallback_credit_token`, as a string or an object
+//!     (`beta/message_create_params.py:168`, `:389`;
+//!     `beta/beta_fallback_credit_token_param.py`): a server-held token that
+//!     "the same organization and workspace" can redeem, which in platform
+//!     mode is every tenant.
 //!
 //! Left alone, on purpose:
 //!
@@ -178,19 +189,23 @@ fn kind(value: &Value) -> Option<&str> {
 enum Visit {
     /// The node names an object stored upstream, in this field under it.
     Refuse(String),
-    /// Nothing under the node is a request field: the model wrote it.
+    /// Nothing under the node is a request field: the caller or the model
+    /// wrote it for its own purposes.
     Skip,
+    /// Everything under the node but this one member, which the model wrote.
+    DescendExcept(&'static str),
     Descend,
 }
 
 /// The first node under `value`, depth first, that `check` refuses, as the
 /// path of the field it names: `input[0].content[1].file_id`.
 fn find_under(value: &Value, path: &mut String, check: &dyn Fn(&Value) -> Visit) -> Option<String> {
-    match check(value) {
+    let skipped = match check(value) {
         Visit::Refuse(field) => return Some(format!("{path}.{field}")),
         Visit::Skip => return None,
-        Visit::Descend => {}
-    }
+        Visit::DescendExcept(member) => Some(member),
+        Visit::Descend => None,
+    };
     let len = path.len();
     let found = match value {
         Value::Array(items) => items.iter().enumerate().find_map(|(i, item)| {
@@ -198,11 +213,14 @@ fn find_under(value: &Value, path: &mut String, check: &dyn Fn(&Value) -> Visit)
             path.push_str(&format!("[{i}]"));
             find_under(item, path, check)
         }),
-        Value::Object(map) => map.iter().find_map(|(key, item)| {
-            path.truncate(len);
-            push_key(path, key);
-            find_under(item, path, check)
-        }),
+        Value::Object(map) => map
+            .iter()
+            .filter(|(key, _)| Some(key.as_str()) != skipped)
+            .find_map(|(key, item)| {
+                path.truncate(len);
+                push_key(path, key);
+                find_under(item, path, check)
+            }),
         _ => None,
     };
     path.truncate(len);
@@ -223,13 +241,23 @@ fn responses_reference(body: &Value) -> Option<String> {
     if names(body.pointer("/prompt_cache_options/comparison_response_id")) {
         return Some("prompt_cache_options.comparison_response_id".into());
     }
-    // A tool definition can also arrive inside `input[]`, in an
-    // `additional_tools` or `tool_search_output` item, so both trees are
-    // walked with the same check.
-    find_in(body, "tools", &responses_node).or_else(|| find_in(body, "input", &responses_node))
+    // A tool definition can also arrive in `tool_choice` (the full
+    // definitions of an `allowed_tools` choice) and inside `input[]` (an
+    // `additional_tools` or `tool_search_output` item), so all three trees
+    // are walked with the same check.
+    find_in(body, "tools", &responses_node)
+        .or_else(|| find_in(body, "tool_choice", &responses_node))
+        .or_else(|| find_in(body, "input", &responses_node))
 }
 
 fn responses_node(node: &Value) -> Visit {
+    // What lies under these is JSON the caller or the model wrote for its
+    // own purposes: a function tool's JSON Schema, a custom tool's grammar,
+    // a tool search call's arguments. None of them carries a field the
+    // upstream resolves to a stored object.
+    if matches!(kind(node), Some("function" | "custom" | "tool_search_call")) {
+        return Visit::Skip;
+    }
     match responses_tool_reference(node).or_else(|| responses_input_reference(node)) {
         Some(field) => Visit::Refuse(field),
         None => Visit::Descend,
@@ -336,15 +364,19 @@ fn messages_reference(body: &Value) -> Option<String> {
     if names(body.get("thread")) {
         return Some("thread".into());
     }
+    if names(body.get("fallback_credit_token")) {
+        return Some("fallback_credit_token".into());
+    }
     find_in(body, "messages", &messages_node)
 }
 
 fn messages_node(node: &Value) -> Visit {
     match kind(node) {
         // The model wrote a tool use's `input`; nothing in it is a content
-        // block the caller sends.
-        Some(t) if t.ends_with("tool_use") => Visit::Skip,
-        Some("document" | "image") if node.get("source").and_then(kind) == Some("file") => {
+        // block the caller sends. The rest of the block is still read.
+        Some(t) if t.ends_with("tool_use") => Visit::DescendExcept("input"),
+        // Whatever the block's type: a stored file is a stored file.
+        _ if node.get("source").and_then(kind) == Some("file") => {
             Visit::Refuse("source.file_id".into())
         }
         Some("container_upload") if names(node.get("file_id")) => Visit::Refuse("file_id".into()),
@@ -510,6 +542,12 @@ mod tests {
                     {"type": "mcp", "server_label": "s", "tunnel_id": "tun_1"}]}]}),
                 "input[0].tools[0].tunnel_id",
             ),
+            (
+                json!({"tool_choice": {"type": "allowed_tools", "mode": "auto", "tools": [
+                    {"type": "function", "name": "f"},
+                    {"type": "code_interpreter", "container": "cntr_1"}]}}),
+                "tool_choice.tools[1].container",
+            ),
         ];
         for (body, field) in cases {
             assert_eq!(
@@ -531,6 +569,19 @@ mod tests {
                              {"type": "shell", "environment": {"type": "local"}},
                              {"type": "image_generation", "input_image_mask": {"image_url": "data:x"}},
                              {"type": "mcp", "server_label": "s", "server_url": "https://m"}]}),
+            // JSON the caller or the model wrote for its own purposes: a tool
+            // search call's arguments, a function tool's JSON Schema, a
+            // custom tool's grammar.
+            json!({"input": [{"type": "tool_search_call", "call_id": "c", "execution": "server",
+                "arguments": {"filter": {"type": "file_search", "vector_store_ids": ["vs_x"]}}}]}),
+            json!({"tools": [{"type": "function", "name": "f", "parameters": {"type": "object",
+                "properties": {"t": {"type": "object",
+                    "default": {"type": "input_file", "file_id": "file-x"}}}}}]}),
+            json!({"tools": [{"type": "custom", "name": "c", "format": {"type": "grammar",
+                "syntax": "lark", "definition": "start: \"x\"",
+                "examples": {"type": "input_image", "file_id": "file-x"}}}]}),
+            json!({"tool_choice": {"type": "allowed_tools", "mode": "auto",
+                                   "tools": [{"type": "mcp", "server_label": "s"}]}}),
             json!({"prompt_cache_options": {"mode": "explicit"},
                    "input": [{"type": "additional_tools", "role": "developer", "tools": [
                        {"type": "function", "name": "f", "parameters": {"type": "object"}},
@@ -645,6 +696,37 @@ mod tests {
                 json!({"thread": {"type": "create"}, "messages": []}),
                 "thread",
             ),
+            (
+                json!({"fallback_credit_token": "fct_1", "messages": []}),
+                "fallback_credit_token",
+            ),
+            (
+                json!({"fallback_credit_token": {"token": "fct_1", "mode": "best_effort"},
+                       "messages": []}),
+                "fallback_credit_token",
+            ),
+            // Any block type naming a stored file is refused, not only the
+            // document and image blocks the API defines it on today.
+            (
+                user(
+                    json!([{"type": "search_result", "title": "t", "content": [],
+                             "source": {"type": "file", "file_id": "file_1"}}]),
+                ),
+                "messages[0].content[0].source.file_id",
+            ),
+            (
+                user(json!([{"source": {"type": "file", "file_id": "file_1"}}])),
+                "messages[0].content[0].source.file_id",
+            ),
+            // Only a tool use's `input` is the model's; anything else on the
+            // block is still read.
+            (
+                json!({"messages": [{"role": "assistant", "content": [{"type": "tool_use",
+                    "id": "toolu_1", "name": "x", "input": {},
+                    "content": [{"type": "document",
+                                 "source": {"type": "file", "file_id": "file_1"}}]}]}]}),
+                "messages[0].content[0].content[0].source.file_id",
+            ),
         ];
         for (body, field) in cases {
             assert_eq!(
@@ -665,7 +747,8 @@ mod tests {
             json!({"container": {"skills": [{"type": "anthropic", "skill_id": "pptx"}]},
                    "messages": [],
                    "mcp_servers": [{"type": "url", "url": "https://m", "name": "m"}]}),
-            json!({"container": null, "diagnostics": {}, "thread": null, "messages": []}),
+            json!({"container": null, "diagnostics": {}, "thread": null,
+                   "fallback_credit_token": null, "messages": []}),
             // What the model wrote as a tool's input is not a content block,
             // whatever it looks like.
             json!({"messages": [{"role": "assistant", "content": [{"type": "tool_use",

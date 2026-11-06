@@ -279,7 +279,7 @@ fn classify_upstream(
             param: view.and_then(|v| v.param.clone()).filter(|p| {
                 p.len() <= 256
                     && p.bytes()
-                        .all(|b| b.is_ascii_alphanumeric() || b"_.[]-".contains(&b))
+                        .all(|b| b.is_ascii_alphanumeric() || b"_.[]".contains(&b))
             }),
         },
         Some(_) => PlatformErrorClass::UpstreamUnavailable,
@@ -583,6 +583,7 @@ mod tests {
         for unshaped in [
             "model arn:aws:bedrock:us-east-1:123:x".to_string(),
             "a b".to_string(),
+            "us-east-1".to_string(),
             "x".repeat(257),
         ] {
             assert_eq!(

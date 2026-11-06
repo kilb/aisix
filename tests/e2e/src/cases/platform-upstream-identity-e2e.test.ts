@@ -1383,6 +1383,17 @@ describe("platform mode e2e: a response id continues only for the tenant it was 
         field: "thread",
       },
       {
+        family: "messages: a fallback credit token",
+        path: "/v1/messages",
+        body: {
+          model: anthropic,
+          max_tokens: 64,
+          fallback_credit_token: "fct_tenant_a_0001",
+          messages: [{ role: "user", content: "try again" }],
+        },
+        field: "fallback_credit_token",
+      },
+      {
         family: "messages: a container by id",
         path: "/v1/messages",
         body: {
