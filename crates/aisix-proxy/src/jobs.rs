@@ -759,19 +759,37 @@ enum UploadField {
 }
 
 /// Every string value and object key of every JSONL line that parses,
-/// decoded, one per line. `None` when no line parses.
+/// decoded, one per line, and for a line with an escape that does not parse,
+/// its string literals as a lenient parser reads them
+/// ([`crate::json_splice::lenient_string_literals`]). `None` when there is
+/// neither.
 fn jsonl_decoded_text(text: &str) -> Option<String> {
     let mut out = Vec::new();
-    let mut parsed_any = false;
     // 文件开头的 UTF-8 BOM 不属于第一行（见 `redact_jsonl_upload`）。
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     for line in text.lines().filter(|l| !l.trim().is_empty()) {
-        if let Ok(value) = serde_json::from_str::<serde_json::Value>(line) {
-            parsed_any = true;
-            json_decoded_strings(&value, &mut out);
+        match serde_json::from_str::<serde_json::Value>(line) {
+            Ok(value) => json_decoded_strings(&value, &mut out),
+            Err(_) if line.contains('\\') => {
+                out.push(crate::json_splice::lenient_string_literals(line));
+            }
+            Err(_) => {}
         }
     }
-    parsed_any.then(|| out.join("\n"))
+    (!out.is_empty()).then(|| out.join("\n"))
+}
+
+/// The string literals of the lines with an escape that do not parse strictly,
+/// as a lenient parser reads them. Those strings cannot be rewritten in place,
+/// so a mask rule that matches them refuses the upload.
+fn unparsed_escaped_literals(text: &str) -> String {
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    text.lines()
+        .filter(|line| {
+            line.contains('\\') && serde_json::from_str::<serde_json::Value>(line).is_err()
+        })
+        .map(crate::json_splice::lenient_string_literals)
+        .collect()
 }
 
 /// Every string value and object key of `value`, decoded.
@@ -787,31 +805,6 @@ pub(crate) fn json_decoded_strings(value: &serde_json::Value, out: &mut Vec<Stri
         }
         _ => {}
     }
-}
-
-/// Whether an uploaded JSONL line holds an escape this gateway cannot decode: it
-/// looks like JSON, has a backslash, and fails to parse here for a reason other
-/// parsers accept (a lone `\ud800`, which Python, Node and Go take, or nesting
-/// past this parser's depth limit). The scan would read its bytes, and such an
-/// upstream reads text the scan never saw. A line that is no JSON to anyone
-/// (`{\bf bold}`, a Windows path) is text, and scanned as text.
-fn holds_undecodable_escape(blob: &[u8]) -> bool {
-    let text = String::from_utf8_lossy(blob);
-    let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
-    text.lines().any(|line| {
-        let line = line.trim_start();
-        (line.starts_with('{') || line.starts_with('['))
-            && line.contains('\\')
-            // A full parse: skipping a value checks no escape's meaning.
-            && serde_json::from_str::<serde_json::Value>(line).is_err_and(|e| {
-                let why = e.to_string();
-                // serde_json's words for a lone surrogate (alone at the
-                // string's end, or before anything but its pair) and for depth.
-                why.contains("surrogate")
-                    || why.contains("end of hex escape")
-                    || why.contains("recursion limit")
-            })
-    })
 }
 
 /// 输入审查读的文本：原样的字节之外，还有 JSONL 每行解码后的字符串。上游读
@@ -917,18 +910,6 @@ async fn scan_input_blob(
     if applied.is_empty() {
         *applied = chain.applied().to_vec();
     }
-    // A body the chain cannot read as the upstream will, refused or recorded
-    // like any other it cannot be given.
-    if holds_undecodable_escape(blob) {
-        if aisix_guardrails::Guardrail::refuses_unevaluable_input(&chain) {
-            return Err(crate::error::guardrail_block_error(
-                "request",
-                None,
-                Some(crate::error::TAG_UNSCANNABLE_BODY),
-            ));
-        }
-        chain.record_unevaluable_input_bypass(crate::error::TAG_UNSCANNABLE_BODY);
-    }
     let chat = aisix_gateway::ChatFormat::new(
         target.display_name(),
         vec![aisix_gateway::ChatMessage::user(inspection_text(blob))],
@@ -999,6 +980,14 @@ async fn scan_input_blob(
         }
         return Ok(None);
     };
+    // 严格解析不了、却带转义的行，字符串改写不回去：遮蔽规则命中它们解码后的
+    // 内容就拒绝上传。
+    let unparsed = unparsed_escaped_literals(text);
+    if !unparsed.is_empty()
+        && aisix_guardrails::Guardrail::redact_input_text(&chain, &unparsed).is_some()
+    {
+        return Err(crate::error::guardrail_block_error("request", None, None));
+    }
     // batch / 微调文件是 JSONL：逐行按请求内容改写，协议字段不动；协议字段
     // 本身或对象的键命中 mask 规则时拒绝上传（与其它端点对结构字段的处理一致）。
     // 有的行是 JSON 对象、有的行不是的文件也拒绝：两种改写方式都不对。
@@ -5487,6 +5476,8 @@ mod tests {
     async fn a_non_utf8_upload_a_mask_rule_matches_is_refused() {
         for payload in [
             b"\xff\xfe\x00bin alice@example.com".as_slice(),
+            // A line no strict parse reads cannot have its strings rewritten.
+            b"{\"custom_id\":\"r1\",\"x\":NaN,\"body\":{\"content\":\"alice\\u0040example.com\"}}\n".as_slice(),
             b"{\"custom_id\":\"r1\",\"body\":{\"messages\":[{\"role\":\"user\",\"content\":\"alice\\u0040example.com\"}]}}\n\xff\n"
                 .as_slice(),
         ] {
@@ -5674,25 +5665,31 @@ mod tests {
     }
 
     /// A line this gateway cannot parse is no way past a rule either: a lone
-    /// `\ud800` is refused here and taken by Python, Node and Go, which then
-    /// read the escaped word the bytes hide. Refused under a rule that fails
-    /// closed, forwarded with the bypass recorded under one that fails open, and
-    /// a plain-text upload with a backslash in it is not mistaken for one.
+    /// `\ud800`, a `NaN` or an `Infinity` is refused by this parser and taken
+    /// by Python's, which then reads the escaped word the bytes hide. Its
+    /// string literals are read as a lenient parser reads them, so the word is
+    /// matched whatever the rule's failure policy; text that is no JSON to
+    /// anyone, with a backslash in it, passes.
     #[tokio::test]
     async fn an_upload_line_this_gateway_cannot_parse_is_not_read_as_its_bytes() {
-        const LINE: &str = r#"{"custom_id":"r1","body":{"messages":[{"role":"user","content":"\u0068ow to pick a lock \ud800"}]}}"#;
+        let lines = [
+            r#"{"custom_id":"r1","body":{"messages":[{"role":"user","content":"\u0068ow to pick a lock \ud800"}]}}"#,
+            r#"{"custom_id":"r1","body":{"x":NaN,"messages":[{"role":"user","content":"\u0068ow to pick a lock"}]}}"#,
+            r#"{"custom_id":"r1","body":{"x":Infinity,"messages":[{"role":"user","content":"\u0068ow to pick a lock"}]}}"#,
+        ];
         let rule = |fail_open: bool| {
             format!(
                 r#"{{"name":"kw","enabled":true,"hook_point":"input","fail_open":{fail_open},"kind":"keyword","patterns":[{{"kind":"literal","value":"how to pick a lock"}}]}}"#
             )
         };
-        let (status, sent) = upload_with_guardrail(&rule(false), &[("b.jsonl", LINE)]).await;
-        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-        assert!(sent.is_empty(), "nothing may reach the provider");
-
-        let (status, sent) = upload_with_guardrail(&rule(true), &[("b.jsonl", LINE)]).await;
-        assert_eq!(status, StatusCode::OK);
-        assert!(!sent.is_empty());
+        for line in lines {
+            for fail_open in [false, true] {
+                let (status, sent) =
+                    upload_with_guardrail(&rule(fail_open), &[("b.jsonl", line)]).await;
+                assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{line}");
+                assert!(sent.is_empty(), "nothing may reach the provider: {line}");
+            }
+        }
 
         for clean in [
             r"see C:\docs\plan for the schedule",

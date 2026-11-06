@@ -720,9 +720,7 @@ async fn dispatch(
             probe_error.map_or_else(|| try_request_guardrail_text(protocol, &body_bytes), Err);
         let text = match request_text {
             Ok(text) => Some(text),
-            Err(err) if !err.is_unevaluable() => {
-                Some(request_guardrail_text(protocol, &body_bytes))
-            }
+            Err(err) if !err.is_unevaluable() => Some(fallback_request_text(protocol, &body_bytes)),
             Err(err)
                 if !aisix_guardrails::Guardrail::refuses_unevaluable_input(&resolved_chain) =>
             {
@@ -3192,6 +3190,18 @@ fn request_guardrail_text_with_scan_error(
             }
         }
     }
+}
+
+/// The request text when the strict selector failed but the body is not one to
+/// refuse: what the selector still reads, and every string literal in the body
+/// as a lenient parser reads it, since the upstream's parser may take what this
+/// one refused.
+fn fallback_request_text(protocol: PassthroughProtocol, body: &[u8]) -> String {
+    let mut text = request_guardrail_text(protocol, body);
+    text.push_str(&crate::json_splice::lenient_string_literals(
+        &String::from_utf8_lossy(body),
+    ));
+    text
 }
 
 fn request_guardrail_text(protocol: PassthroughProtocol, body: &[u8]) -> String {
@@ -8440,6 +8450,23 @@ mod tests {
         )
         .unwrap();
         assert!(text.contains("forbidden words"));
+    }
+
+    /// Where the strict read fails without making the body one to refuse (a
+    /// body that does not open as a JSON container), the string literals are
+    /// still read as a lenient parser reads them, so an escape hides nothing
+    /// from the raw scan that follows.
+    #[test]
+    fn a_body_the_strict_read_gives_up_on_is_read_as_a_lenient_parser_reads_it() {
+        let body = br#""\u0066orbidden" NaN"#;
+        let err = try_request_guardrail_text(PassthroughProtocol::Raw, body)
+            .expect_err("not one JSON document");
+        assert!(
+            !err.is_unevaluable(),
+            "the raw scan follows rather than a refusal"
+        );
+        assert!(!request_guardrail_text(PassthroughProtocol::Raw, body).contains("forbidden"));
+        assert!(fallback_request_text(PassthroughProtocol::Raw, body).contains("forbidden"));
     }
 
     #[test]

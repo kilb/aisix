@@ -473,8 +473,107 @@ pub fn collect_string_values_where_vec(
     collect_error.map_or(Ok(out), Err)
 }
 
+/// Every double-quoted string literal in `text`, unescaped as a lenient JSON
+/// parser reads it, one per line: the standard escapes, `\uXXXX` with a
+/// surrogate pair joined and a lone surrogate read as U+FFFD, and any other
+/// escape kept as written. For text a strict parse refused (a `NaN`, a lone
+/// surrogate, nesting past a depth limit), which another parser may still take:
+/// whatever it makes of the rest, these are the words its strings hold. Text
+/// that is no JSON to anyone yields literals that are substrings of it, so a
+/// scan of them adds nothing that was not there.
+pub(crate) fn lenient_string_literals(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let hex4 = |at: usize| -> Option<u32> {
+        let digits: String = chars.get(at..at + 4)?.iter().collect();
+        (digits.len() == 4 && digits.bytes().all(|b| b.is_ascii_hexdigit()))
+            .then(|| u32::from_str_radix(&digits, 16).ok())
+            .flatten()
+    };
+    let mut out = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] != '"' {
+            i += 1;
+            continue;
+        }
+        i += 1;
+        let mut literal = String::new();
+        while i < chars.len() && chars[i] != '"' {
+            if chars[i] != '\\' {
+                literal.push(chars[i]);
+                i += 1;
+                continue;
+            }
+            let Some(&escape) = chars.get(i + 1) else {
+                literal.push('\\');
+                i += 1;
+                break;
+            };
+            i += 2;
+            match escape {
+                '"' | '\\' | '/' => literal.push(escape),
+                'b' => literal.push('\u{8}'),
+                'f' => literal.push('\u{c}'),
+                'n' => literal.push('\n'),
+                'r' => literal.push('\r'),
+                't' => literal.push('\t'),
+                'u' => match hex4(i) {
+                    Some(high @ 0xD800..=0xDBFF) => {
+                        i += 4;
+                        let low = (chars.get(i) == Some(&'\\') && chars.get(i + 1) == Some(&'u'))
+                            .then(|| hex4(i + 2))
+                            .flatten()
+                            .filter(|low| (0xDC00..=0xDFFF).contains(low));
+                        match low {
+                            Some(low) => {
+                                i += 6;
+                                let code = 0x10000 + ((high - 0xD800) << 10) + (low - 0xDC00);
+                                literal.push(char::from_u32(code).unwrap_or('\u{fffd}'));
+                            }
+                            None => literal.push('\u{fffd}'),
+                        }
+                    }
+                    Some(code) => {
+                        i += 4;
+                        literal.push(char::from_u32(code).unwrap_or('\u{fffd}'));
+                    }
+                    None => literal.push_str("\\u"),
+                },
+                other => {
+                    literal.push('\\');
+                    literal.push(other);
+                }
+            }
+        }
+        i += 1;
+        if !literal.is_empty() {
+            out.push('\n');
+            out.push_str(&literal);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
+    /// What a lenient parser reads out of strings a strict one refuses: escapes
+    /// decoded, a lone surrogate as U+FFFD, an unknown escape as written.
+    #[test]
+    fn string_literals_read_as_a_lenient_parser_reads_them() {
+        let read = super::lenient_string_literals;
+        assert!(read(r#"{"body":{"x":NaN,"m":"\u0066orbidden"}}"#).contains("\nforbidden"));
+        assert!(read(r#"{"x":Infinity,"m":"\u0066orbidden"}"#).contains("\nforbidden"));
+        assert!(read(r#"{"m":"how \ud800 to"}"#).contains("how \u{fffd} to"));
+        assert!(read(r#"{"m":"pair \ud83d\ude00"}"#).contains("pair \u{1f600}"));
+        assert!(read(r#"{"m":"line\nbreak \"quoted\""}"#).contains("line\nbreak \"quoted\""));
+        assert_eq!(read(r"{\bf bold} and {\em italic}"), "");
+        assert_eq!(
+            read(r#"["C:\Users\me\data.csv"]"#),
+            "\nC:\\Users\\me\\data.csv"
+        );
+        assert!(read(r#""unterminated \u0066orbidden"#).contains("forbidden"));
+    }
+
     use super::*;
 
     fn rewrite_all(input: &str, f: impl FnMut(&str) -> Option<String>) -> Option<String> {

@@ -299,6 +299,28 @@ describe("input rule: request shapes", () => {
     await clean.text();
   });
 
+  test("an upload line this gateway's parser refuses and another takes", async (ctx) => {
+    if (!etcdReachable || !app) return ctx.skip();
+    // Python's json reads NaN and Infinity, and the escape behind them.
+    const escaped = `\\u${WORD.charCodeAt(0).toString(16).padStart(4, "0")}${WORD.slice(1)}`;
+    for (const extra of ["NaN", "Infinity"]) {
+      const line = `{"custom_id":"r1","body":{"x":${extra},"messages":[{"role":"user","content":"${escaped}"}]}}`;
+      const form = new FormData();
+      form.append("model", "shapes-model");
+      form.append("purpose", "batch");
+      form.append("file", new Blob([line], { type: "application/jsonl" }), "in.jsonl");
+      await refused(
+        () =>
+          fetch(`${app!.proxyUrl}/v1/files`, {
+            method: "POST",
+            headers: { authorization: `Bearer ${KEY}` },
+            body: form,
+          }),
+        extra,
+      );
+    }
+  });
+
   test("an upload that is no JSON is read as text, not refused", async (ctx) => {
     if (!etcdReachable || !app) return ctx.skip();
     for (const text of ["{\\bf bold} and {\\em italic}", '["C:\\Users\\me\\data.csv"]']) {
@@ -344,6 +366,7 @@ describe("input rule: request shapes", () => {
     expect(await refusal(item(escaped), false)).toContain("content_filtered");
     // An escape this gateway's parser refuses and a lenient peer takes.
     expect(await refusal(item(`${escaped} \\ud800`), false)).toContain("content_filtered");
+    expect(await refusal(item(escaped).replace("{", '{"x":NaN,'), false)).toContain("content_filtered");
     expect(await refusal(Buffer.from(item(WORD)), true)).toContain("content_filtered");
     expect(realtimeFrames.filter((frame) => frame.includes(WORD.slice(1)))).toEqual([]);
 

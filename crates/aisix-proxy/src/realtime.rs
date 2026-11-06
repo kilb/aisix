@@ -2204,10 +2204,7 @@ async fn guardrail_block_event(
     input_side: bool,
     monitor_hits: &mut Vec<aisix_core::GuardrailMonitorHit>,
 ) -> Option<(String, ProxyError)> {
-    let Some(text) = frame_scan_text(text) else {
-        // A frame the chain cannot be given, as a binary one is.
-        return binary_frame_refusal(chain, input_side);
-    };
+    let text = frame_scan_text(text);
     let (verdict, hits) = if input_side {
         let chat = aisix_gateway::ChatFormat::new(
             model_name,
@@ -2268,17 +2265,25 @@ fn content_filtered_event(refusal: &ProxyError) -> String {
 /// are read beside them. A frame with no backslash has no escape, and reading
 /// its bytes alone keeps an audio frame's cost where it was.
 ///
-/// `None` when the frame has an escape and does not parse here: a peer may
-/// parse it anyway (a lone `\ud800`, or nesting past this parser's depth limit,
-/// is taken by Python, Node and Go), and its bytes are then not what it reads.
-fn frame_scan_text(frame: &str) -> Option<String> {
+/// A frame with an escape that does not parse here may still parse for a peer
+/// (a `NaN`, a lone `\ud800`, nesting past this parser's depth limit), so its
+/// string literals are read as a lenient parser reads them
+/// ([`crate::json_splice::lenient_string_literals`]).
+fn frame_scan_text(frame: &str) -> String {
     if !frame.contains('\\') {
-        return Some(frame.to_owned());
+        return frame.to_owned();
     }
-    let value = serde_json::from_str::<serde_json::Value>(frame).ok()?;
-    let mut decoded = Vec::new();
-    crate::jobs::json_decoded_strings(&value, &mut decoded);
-    Some(format!("{frame}\n{}", decoded.join("\n")))
+    match serde_json::from_str::<serde_json::Value>(frame) {
+        Ok(value) => {
+            let mut decoded = Vec::new();
+            crate::jobs::json_decoded_strings(&value, &mut decoded);
+            format!("{frame}\n{}", decoded.join("\n"))
+        }
+        Err(_) => format!(
+            "{frame}{}",
+            crate::json_splice::lenient_string_literals(frame)
+        ),
+    }
 }
 
 /// A binary frame holds nothing a chain can read. Refused where something reads
@@ -3110,8 +3115,9 @@ mod tests {
             TgMessage::Text(user_item("\\u0066orbidden")),
             TgMessage::Binary(user_item("forbidden").into_bytes()),
             // What this gateway cannot parse and a peer may: a lone surrogate,
-            // and nesting past the parser's depth limit.
+            // a NaN, and nesting past the parser's depth limit.
             TgMessage::Text(user_item("\\u0066orbidden \\ud800")),
+            TgMessage::Text(user_item("\\u0066orbidden").replacen("{", "{\"x\":NaN,", 1)),
             TgMessage::Text(too_deep),
         ] {
             let mut ws = client(addr).await;
