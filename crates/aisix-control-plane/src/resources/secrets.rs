@@ -127,14 +127,61 @@ pub fn redact(kind: Kind, doc: &mut Value) {
     });
 }
 
+/// The fields that decide where a kind's credentials are sent: the host,
+/// the address it is reached at, the trust placed in it, the protocol, and
+/// for a custom guardrail the script that holds them. From the
+/// `provider_key`, `guardrail` and `observability_exporter` schemas.
+fn destination_fields(kind: Kind) -> &'static [&'static str] {
+    match kind {
+        Kind::ProviderKeys => &[
+            "provider",
+            "adapter",
+            "api_base",
+            "apis",
+            "resolve_addresses",
+            "tls",
+        ],
+        Kind::Guardrails => &[
+            "kind",
+            "endpoint",
+            "analyzer_url",
+            "anonymizer_url",
+            "region",
+            "script",
+        ],
+        Kind::ObservabilityExporters => &["kind", "endpoint"],
+        _ => &[],
+    }
+}
+
+/// Whether `incoming` would send credentials anywhere `stored` does not.
+/// Both sides are compared redacted, so the password in a URL does not
+/// count and the rest of the URL does; an explicit `null` is an absent
+/// field.
+fn changed_destination(kind: Kind, incoming: &Value, stored: &Value) -> bool {
+    let destination = |doc: &Value| {
+        let mut doc = doc.clone();
+        redact(kind, &mut doc);
+        destination_fields(kind)
+            .iter()
+            .map(|field| doc.get(*field).filter(|v| !v.is_null()).cloned())
+            .collect::<Vec<_>>()
+    };
+    destination(incoming) != destination(stored)
+}
+
 /// Gives each [`REDACTED`] slot of `incoming` the value `stored` (the row's
 /// sealed document, or `null` for a new row) holds in the same slot, so a
 /// client can save back a document it read without sending the secret.
 ///
 /// Refused, at the slot's label: a placeholder for a slot with nothing
-/// stored, and a value shaped like a sealed one, which no client is ever
-/// shown and which would otherwise be stored unsealed.
+/// stored; a placeholder in a document whose destination differs from the
+/// stored one ([`destination_fields`]), since a kept secret must never
+/// follow a new destination, so every secret is entered again then; and a
+/// value shaped like a sealed one, which no client is ever shown and which
+/// would otherwise be stored unsealed.
 pub fn restore(kind: Kind, incoming: &mut Value, stored: &Value) -> Result<(), Detail> {
+    let moved = changed_destination(kind, incoming, stored);
     // Keyed by field key and label: the label keeps apart names that
     // sanitize to one field key (`x-a` and `x_a`). `None` marks a key two
     // stored slots share, which cannot be told apart.
@@ -166,6 +213,12 @@ pub fn restore(kind: Kind, incoming: &mut Value, stored: &Value) -> Result<(), D
             return;
         }
         match kept.get(&(slot.field_key.clone(), slot.label.clone())) {
+            Some(Some(_)) if moved => {
+                problem = Some(Detail {
+                    path: slot.label.clone(),
+                    message: "发送机密的目标已更改，请重新填写该机密".to_string(),
+                })
+            }
             Some(Some(previous)) => *value = Value::String(previous.clone()),
             Some(None) => {
                 problem = Some(Detail {

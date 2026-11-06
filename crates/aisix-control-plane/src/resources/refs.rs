@@ -41,7 +41,7 @@ fn address(node: &Map<String, Value>) -> usize {
 }
 
 /// `segment` escaped for a JSON pointer.
-fn escaped(segment: &str) -> String {
+pub(crate) fn escaped(segment: &str) -> String {
     segment.replace('~', "~0").replace('/', "~1")
 }
 
@@ -220,7 +220,7 @@ pub async fn check_outgoing(
 }
 
 /// The live documents, of any kind but those in `except`, that reference
-/// the row `kind`/`id`. A row's references to itself do not count.
+/// the row `kind`/`id`. No row references itself: writes refuse that.
 pub async fn incoming(
     conn: &mut PgConnection,
     kind: Kind,
@@ -232,13 +232,10 @@ pub async fn incoming(
     // read before each one's references are worked out exactly.
     let candidates: Vec<(String, Uuid, Value)> = sqlx::query_as(
         "SELECT kind, id, doc FROM gw_resources \
-         WHERE NOT deleted AND NOT (kind = ANY($1)) AND NOT (kind = $2 AND id = $3) \
-           AND strpos(doc::text, $4) > 0 \
+         WHERE NOT deleted AND NOT (kind = ANY($1)) AND strpos(doc::text, $2) > 0 \
          ORDER BY kind, id",
     )
     .bind(&except)
-    .bind(kind.segment())
-    .bind(id)
     .bind(id.to_string())
     .fetch_all(&mut *conn)
     .await?;

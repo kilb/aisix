@@ -12,7 +12,7 @@ use super::validate::validate_strict;
 use super::{managed_resource, refs, secrets, Kind};
 use crate::crypto::MasterKey;
 use crate::db::DbError;
-use crate::error::ApiError;
+use crate::error::{ApiError, Detail};
 use crate::settings::EnvSettings;
 use crate::AppState;
 
@@ -49,9 +49,10 @@ pub struct ResourceWrite<'a> {
     /// Replace and delete only when the row is at this version; `None`
     /// skips the check.
     pub expected_version: Option<i64>,
-    /// Who derives the row. A create stores it; a replace or a delete with
-    /// `None` (an operator's direct write) is refused on a row someone
-    /// derives, which stays theirs to change.
+    /// Who derives the row. A create stores it; a replace or a delete is
+    /// refused unless it names the row's own owner (`None` for a row an
+    /// operator writes directly), so a derived row stays its owner's to
+    /// change and an operator's row stays the operators'.
     pub managed_by: Option<&'a str>,
 }
 
@@ -65,6 +66,7 @@ pub enum WriteOp<'a> {
 /// order: the resources lock; the size check (`413`); normalisation
 /// (aliases first, so a redacted credential under its former name is
 /// restored under the canonical one); restoring redacted credentials; the
+/// size check again, on the document as it will be projected; the
 /// gateway's strict validation; the reference check; sealing; the store. A
 /// delete is refused while a live document references the row (`409
 /// in_use`).
@@ -125,7 +127,7 @@ async fn writable_row(
         .await?
         .filter(|row| !row.deleted)
         .ok_or_else(ApiError::not_found)?;
-    if row.managed_by.is_some() && w.managed_by.is_none() {
+    if row.managed_by.as_deref() != w.managed_by {
         return Err(managed_resource());
     }
     if let Some(expected) = w.expected_version {
@@ -134,6 +136,27 @@ async fn writable_row(
         }
     }
     Ok(row)
+}
+
+/// Refuses a document that references its own row, such as a routing,
+/// semantic or ensemble model targeting itself: a group cannot dispatch to
+/// itself. References between two rows are left to the gateway, which does
+/// not follow a group's targets into further groups.
+fn refuse_self_reference(w: &ResourceWrite<'_>, doc: &Value) -> Result<(), ApiError> {
+    let own = w.id.to_string();
+    let found: Vec<Detail> = refs::outgoing(w.kind, doc)
+        .into_iter()
+        .filter(|r| r.kind == w.kind && r.id == own)
+        .map(|r| Detail {
+            path: r.path,
+            message: "不能引用资源自身".to_string(),
+        })
+        .collect();
+    if found.is_empty() {
+        Ok(())
+    } else {
+        Err(ApiError::validation(found))
+    }
 }
 
 /// The document to store for a create or a replace of a row whose stored
@@ -148,7 +171,13 @@ async fn prepare(
     let mut doc = incoming.clone();
     normalize(conn, w.kind, &mut doc).await?;
     secrets::restore(w.kind, &mut doc, stored).map_err(|d| ApiError::validation(vec![d]))?;
+    // A kept secret is back in the document at its stored size: what the
+    // projector sends is the unsealed document, and kine must take it.
+    let mut projected = doc.clone();
+    secrets::unseal(&ctx.mk, w.kind, w.id, &mut projected).map_err(ApiError::internal)?;
+    check_size(&projected)?;
     validate_strict(w.kind, &doc).map_err(ApiError::validation)?;
+    refuse_self_reference(w, &doc)?;
     refs::check_outgoing(conn, w.kind, &doc).await?;
     // Task 9: the save-time gateway-version gate runs here.
     secrets::seal(&ctx.mk, w.kind, w.id, &mut doc);
