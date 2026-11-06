@@ -1070,9 +1070,51 @@ async fn a_redacted_secret_is_not_kept_when_its_destination_changes() {
                    "headers": {"x-honeycomb-team": SECRET}}),
         )
         .await;
+    let analyzer = format!("http://svc:{SECRET}@presidio-analyzer:3000");
+    let anonymizer = format!("http://svc:{SECRET}@presidio-anonymizer:3000");
+    let presidio = admin
+        .create(
+            "guardrails",
+            json!({"name": "presidio-dest", "kind": "presidio",
+                   "analyzer_url": analyzer, "anonymizer_url": anonymizer}),
+        )
+        .await;
+    let aliyun = admin
+        .create(
+            "guardrails",
+            json!({"name": "aliyun-dest", "kind": "aliyun_text_moderation",
+                   "access_key_id": "AKID-e2e", "access_key_secret": SECRET, "region": "cn-shanghai"}),
+        )
+        .await;
+    let collector = format!("https://svc:{SECRET}@otel.example.com/v1/traces");
+    let basic_exporter = admin
+        .create(
+            "observability_exporters",
+            json!({"name": "otlp-basic-dest", "kind": "otlp_http", "endpoint": collector}),
+        )
+        .await;
 
     // What each row must still unseal to: the slot and its original value.
     let originals: Vec<(&str, &String, &str, String)> = vec![
+        ("guardrails", &presidio, "/analyzer_url", analyzer.clone()),
+        (
+            "guardrails",
+            &presidio,
+            "/anonymizer_url",
+            anonymizer.clone(),
+        ),
+        (
+            "guardrails",
+            &aliyun,
+            "/access_key_secret",
+            SECRET.to_string(),
+        ),
+        (
+            "observability_exporters",
+            &basic_exporter,
+            "/endpoint",
+            collector.clone(),
+        ),
         ("provider_keys", &pk, "/api_key", SECRET.to_string()),
         ("provider_keys", &pk, "/api_base", base.clone()),
         (
@@ -1147,6 +1189,73 @@ async fn a_redacted_secret_is_not_kept_when_its_destination_changes() {
                    "api_key": "[REDACTED]", "api_base": shown_base,
                    "resolve_addresses": ["203.0.113.7"]}),
             "api_base password",
+        ),
+        // One API surface served from another host.
+        (
+            "provider_keys",
+            &pk,
+            json!({"display_name": "acct-dest", "provider": "openai",
+                   "api_key": "[REDACTED]", "api_base": shown_base,
+                   "apis": {"responses": {"base": "https://exfil.example/v1"}}}),
+            "api_base password",
+        ),
+        // The same host, without checking who answers.
+        (
+            "provider_keys",
+            &pk,
+            json!({"display_name": "acct-dest", "provider": "openai",
+                   "api_key": "[REDACTED]", "api_base": shown_base,
+                   "tls": {"verify": false}}),
+            "api_base password",
+        ),
+        // Another protocol, which places the key elsewhere on the request.
+        (
+            "provider_keys",
+            &pk,
+            json!({"display_name": "acct-dest", "provider": "openai",
+                   "api_key": "[REDACTED]", "api_base": shown_base, "adapter": "anthropic"}),
+            "api_base password",
+        ),
+        // Another kind of guardrail, with another service behind it.
+        (
+            "guardrails",
+            &moderation,
+            json!({"name": "mod-dest", "kind": "lakera", "api_key": "[REDACTED]"}),
+            "api_key",
+        ),
+        // A URL's kept password sent to a new host, the other one re-entered.
+        (
+            "guardrails",
+            &presidio,
+            json!({"name": "presidio-dest", "kind": "presidio",
+                   "analyzer_url": "http://svc:[REDACTED]@exfil.example:3000",
+                   "anonymizer_url": format!("http://svc:{ROTATED}@presidio-anonymizer:3000")}),
+            "analyzer_url password",
+        ),
+        (
+            "guardrails",
+            &presidio,
+            json!({"name": "presidio-dest", "kind": "presidio",
+                   "analyzer_url": format!("http://svc:{ROTATED}@presidio-analyzer:3000"),
+                   "anonymizer_url": "http://svc:[REDACTED]@exfil.example:3000"}),
+            "anonymizer_url password",
+        ),
+        (
+            "guardrails",
+            &aliyun,
+            json!({"name": "aliyun-dest", "kind": "aliyun_text_moderation",
+                   "access_key_id": "AKID-e2e", "access_key_secret": "[REDACTED]",
+                   "region": "cn-hangzhou"}),
+            "access_key_secret",
+        ),
+        // Another kind of exporter, at the same URL.
+        (
+            "observability_exporters",
+            &basic_exporter,
+            json!({"name": "otlp-basic-dest", "kind": "object_store", "provider": "s3",
+                   "auth_mode": "cloud_identity", "bucket": "exports", "prefix": "aisix/",
+                   "endpoint": "https://svc:[REDACTED]@otel.example.com/v1/traces"}),
+            "endpoint password",
         ),
         // A script that can send the kept secret anywhere.
         (
@@ -1249,6 +1358,97 @@ async fn a_redacted_secret_is_not_kept_when_its_destination_changes() {
         )
         .await;
     assert_eq!(r.status, 200, "{r:?}");
+}
+
+/// A script that builds where it sends one secret from another.
+const SIBLING_SCRIPT: &str = "export async function checkInput(ctx) { \
+    await fetch(`${ctx.secrets.SCAN_BASE}/scan?key=${ctx.secrets.SCAN_KEY}`); \
+    return { action: 'allow' }; }";
+
+#[tokio::test]
+async fn a_custom_guardrails_kept_secret_cannot_follow_a_rewritten_sibling() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let admin = Admin::as_role(&cp, OperatorRole::Operator).await;
+    let doc = |secrets: Value| json!({"name": "custom-sibling", "kind": "custom", "script": SIBLING_SCRIPT, "secrets": secrets});
+    let id = admin
+        .create(
+            "guardrails",
+            doc(json!({"SCAN_BASE": "https://vendor.example", "SCAN_KEY": SECRET})),
+        )
+        .await;
+    let path = format!("/admin/resources/guardrails/{id}");
+    let guardrail_id = Uuid::parse_str(&id).expect("a uuid");
+    let opened = || {
+        let cp = &cp;
+        let id = &id;
+        async move {
+            let (mut doc, text, version, ..) = stored(cp, "guardrails", id).await;
+            assert!(!text.contains("exfil"), "{text}");
+            secrets::unseal(cp.master_key(), Kind::Guardrails, guardrail_id, &mut doc)
+                .expect("unseal");
+            (version, doc["secrets"].clone())
+        }
+    };
+
+    for (secrets, slot) in [
+        // The key kept, the base it is sent to rewritten.
+        (
+            json!({"SCAN_BASE": "https://exfil.example", "SCAN_KEY": "[REDACTED]"}),
+            "secret SCAN_KEY",
+        ),
+        // The base dropped, so the script builds another address.
+        (json!({"SCAN_KEY": "[REDACTED]"}), "secret SCAN_KEY"),
+        // A new input beside the kept ones.
+        (
+            json!({"EXTRA": "x", "SCAN_BASE": "[REDACTED]", "SCAN_KEY": "[REDACTED]"}),
+            "secret SCAN_BASE",
+        ),
+    ] {
+        let r = admin
+            .put(&path, Some("\"1\""), json!({"doc": doc(secrets)}))
+            .await;
+        assert_eq!(r.status, 422, "{r:?}");
+        assert_eq!(r.body["details"][0]["path"], slot, "{r:?}");
+        let (version, kept) = opened().await;
+        assert_eq!(version, 1);
+        assert_eq!(
+            kept,
+            json!({"SCAN_BASE": "https://vendor.example", "SCAN_KEY": SECRET})
+        );
+    }
+
+    // Every secret kept, nothing else changed: kept.
+    let r = admin
+        .put(
+            &path,
+            Some("\"1\""),
+            json!({"doc": doc(json!({"SCAN_BASE": "[REDACTED]", "SCAN_KEY": "[REDACTED]"}))}),
+        )
+        .await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let (_, kept) = opened().await;
+    assert_eq!(
+        kept,
+        json!({"SCAN_BASE": "https://vendor.example", "SCAN_KEY": SECRET})
+    );
+
+    // Every secret entered again with new values: accepted.
+    let r = admin
+        .put(
+            &path,
+            Some("\"2\""),
+            json!({"doc": doc(json!({"SCAN_BASE": "https://vendor-2.example", "SCAN_KEY": ROTATED}))}),
+        )
+        .await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let (version, kept) = opened().await;
+    assert_eq!(version, 3);
+    assert_eq!(
+        kept,
+        json!({"SCAN_BASE": "https://vendor-2.example", "SCAN_KEY": ROTATED})
+    );
 }
 
 #[tokio::test]
