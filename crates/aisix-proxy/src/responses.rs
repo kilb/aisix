@@ -397,14 +397,17 @@ pub async fn responses(
     let affinity = match state.platform() {
         Some(platform) => {
             let owner = crate::platform::tenant_owner(&auth);
-            let affinity = crate::responses_affinity::ContextAffinity::unwrap_sealed_request(
+            let mut affinity = crate::responses_affinity::ContextAffinity::unwrap_sealed_request(
                 &mut body,
                 crate::responses_affinity::TenantSeal::new(platform, &owner),
             );
             // The item ids a client echoes from an earlier answer leave here
             // sealed; the upstream gets back the ones it issued, for the
-            // tenant they were handed to only.
-            crate::opaque_id::unseal_responses_input(platform, &owner, &mut body);
+            // tenant they were handed to only. An item reference that names
+            // anything else is refused below, with the other stored objects.
+            affinity.note_unopened_item_reference(crate::opaque_id::unseal_responses_input(
+                platform, &owner, &mut body,
+            ));
             affinity
         }
         None => crate::responses_affinity::ContextAffinity::unwrap_request(&mut body),
@@ -839,6 +842,7 @@ async fn dispatch(
     // Platform mode: nothing the request names may be an object stored
     // upstream for another tenant.
     crate::stored_refs::refuse_in_responses(state.platform(), body)?;
+    affinity.refuse_unopened_item_reference()?;
 
     // Platform mode: a continuation names a response this tenant was handed,
     // served by a target the key's provider groups still hold. Anything else
@@ -2378,7 +2382,7 @@ async fn responses_to_target(
         let mut response = axum::response::Response::new(axum::body::Body::from_stream(
             crate::sse_keepalive::with_heartbeat(parsed_stream, crate::sse_keepalive::interval()),
         ));
-        apply_passthrough_headers(&mut response, &headers, request_id);
+        apply_passthrough_headers(&mut response, &headers, request_id, state.platform());
 
         Ok(ResponseDispatchSuccess {
             response,
@@ -3878,14 +3882,10 @@ fn drain_responses_sse_frames(
             attempt_started,
             first_frame_seen,
         );
-        let restamped = crate::model_echo::restamp_sse_frame(
-            &frame,
-            client_facing_model,
-            crate::model_echo::responses_snapshot_model,
-        );
-        let forwarded = restamped.as_deref().unwrap_or(&frame);
-        let tagged = mark.apply_to_sse_frame(forwarded);
-        let forwarded = tagged.as_deref().unwrap_or(forwarded);
+        // The caller-facing model and the context tags (and in platform mode
+        // the sealed ids) in one splice pass.
+        let tagged = mark.restamp_and_tag_sse_frame(&frame, client_facing_model);
+        let forwarded = tagged.as_deref().unwrap_or(&frame);
         // A failure the upstream reported reaches the caller as sent, less the
         // credentials this request sent it; in platform mode, as the class of
         // the error it reports.
@@ -5391,20 +5391,24 @@ fn responses_sse_guardrail_text(bytes: &[u8]) -> String {
     text
 }
 
-/// Copy the upstream `content-type` onto the client response and stamp the
+/// Copy the upstream `content-type` onto the client response, a fixed one in
+/// platform mode ([`crate::platform::relayed_content_type`]), and stamp the
 /// `x-aisix-request-id` header. Shared by the streaming verbatim-passthrough
-/// and buffered hold-back paths.
+/// and buffered hold-back paths, both of which relay an event stream.
 fn apply_passthrough_headers(
     response: &mut Response,
     upstream_headers: &axum::http::HeaderMap,
     request_id: &str,
+    platform: Option<&crate::platform::PlatformSettings>,
 ) {
-    if let Some(ct) = upstream_headers.get("content-type") {
-        if let Ok(hv) = HeaderValue::from_bytes(ct.as_bytes()) {
-            response
-                .headers_mut()
-                .insert(axum::http::header::CONTENT_TYPE, hv);
-        }
+    if let Some(hv) = crate::platform::relayed_content_type(
+        platform,
+        upstream_headers,
+        crate::platform::SSE_CONTENT_TYPE,
+    ) {
+        response
+            .headers_mut()
+            .insert(axum::http::header::CONTENT_TYPE, hv);
     }
     if let Ok(hv) = HeaderValue::from_str(request_id) {
         response
@@ -10752,6 +10756,86 @@ data: [DONE]\n\n";
         status_and_body(resp).await
     }
 
+    /// An item reference that is not the caller's own seal is refused as a
+    /// reference to an object stored upstream, naming the field, and never
+    /// reaches the upstream; the tenant's own reaches it as the upstream's id.
+    #[tokio::test]
+    async fn platform_mode_refuses_an_item_reference_that_is_not_the_callers_own() {
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "resp_next", "object": "response", "output": []
+            })))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        let app = build_platform_app(two_tenants(&upstream.uri()));
+        let item_key = crate::opaque_id::seal_key(
+            &crate::platform::PlatformSettings::from_secret(PLATFORM_SECRET).id_key,
+        );
+        let sealed = crate::opaque_id::seal_id(&item_key, TENANT_A, "msg_up_1");
+        let referencing = |id: &str| {
+            serde_json::json!({"model": "gpt-4o-resp", "input": [
+                {"role": "user", "content": "go on"},
+                {"type": "item_reference", "id": id},
+            ]})
+        };
+
+        for (key, id) in [
+            (TENANT_B_PLAINTEXT, sealed.as_str()),
+            ("sk-caller", "msg_up_1"),
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(request_as(key, referencing(id)))
+                .await
+                .unwrap();
+            let (status, body) = status_and_body(resp).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{id}");
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["error"]["param"], "input[1].id", "{body}");
+            assert!(!body.to_string().contains(id), "{body}");
+        }
+
+        // A decoy beside the reference that does open, the caller's own call
+        // seal, is no warrant for the reference's own id.
+        let own_call = crate::opaque_id::seal_call(&item_key, TENANT_A, "call_up_1");
+        for decoy in [
+            serde_json::json!({"type": "item_reference", "id": "msg_up_1", "call_id": own_call}),
+            serde_json::json!({"id": "msg_up_1", "caller": {"type": "program", "caller_id": own_call}}),
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(request_as(
+                    "sk-caller",
+                    serde_json::json!({"model": "gpt-4o-resp", "input": [
+                        {"role": "user", "content": "go on"},
+                        decoy,
+                    ]}),
+                ))
+                .await
+                .unwrap();
+            let (status, body) = status_and_body(resp).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["error"]["param"], "input[1].id", "{body}");
+        }
+        assert!(
+            upstream.received_requests().await.unwrap().is_empty(),
+            "no refused request reaches the upstream"
+        );
+
+        let resp = app
+            .oneshot(request_as("sk-caller", referencing(&sealed)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let sent: Value =
+            serde_json::from_slice(&upstream.received_requests().await.unwrap()[0].body).unwrap();
+        assert_eq!(sent["input"][1]["id"], "msg_up_1");
+    }
+
     #[tokio::test]
     async fn platform_mode_answers_another_tenants_response_id_as_one_that_does_not_exist() {
         let upstream = MockServer::builder().start().await;
@@ -11057,5 +11141,61 @@ data: [DONE]\n\n";
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// A relayed event stream goes out under the upstream's own content
+    /// type, and in platform mode under a fixed `text/event-stream`: how an
+    /// upstream spells its content type differs by channel. Both the live
+    /// relay and the stream held back for an output guardrail.
+    #[tokio::test]
+    async fn platform_mode_relays_a_stream_under_a_fixed_content_type() {
+        let sse = "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_r\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":1,\"total_tokens\":4}}}\n\n";
+        for held in [false, true] {
+            for (platform, expected) in [
+                (false, "text/event-stream; charset=utf-8"),
+                (true, "text/event-stream"),
+            ] {
+                let upstream = MockServer::builder().start().await;
+                Mock::given(method("POST"))
+                    .and(path("/v1/responses"))
+                    .respond_with(
+                        ResponseTemplate::new(200)
+                            .set_body_raw(sse, "text/event-stream; charset=utf-8"),
+                    )
+                    .mount(&upstream)
+                    .await;
+                let snap = new_snap_openai(&upstream.uri());
+                snap.models.insert(openai_model("gpt-4o-resp"));
+                snap.apikeys.insert(apikey_entry(&["*"]));
+                if held {
+                    crate::seed_env_scoped_guardrail(&snap, keyword_output_guardrail("NEVER-SEEN"));
+                }
+                let hub = Arc::new(Hub::new());
+                hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+                let mut state =
+                    crate::ProxyState::new(SnapshotHandle::new(snap), hub, &cfg()).without_cache();
+                if platform {
+                    state =
+                        state.with_platform(crate::platform::PlatformSettings::from_secret("s"));
+                }
+                let resp = crate::build_router(state)
+                    .oneshot(make_req(
+                        serde_json::json!({"model": "gpt-4o-resp", "input": "hi", "stream": true}),
+                    ))
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), StatusCode::OK);
+                assert_eq!(
+                    resp.headers()[axum::http::header::CONTENT_TYPE],
+                    expected,
+                    "platform mode {platform}, held {held}"
+                );
+                let body = to_bytes(resp.into_body(), 65536).await.unwrap();
+                assert!(
+                    String::from_utf8_lossy(&body).contains("response.completed"),
+                    "{body:?}"
+                );
+            }
+        }
     }
 }

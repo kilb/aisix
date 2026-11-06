@@ -129,6 +129,52 @@ dependencies = [
 ]
 
 [[package]]
+name = "aisix-control-plane"
+version = "0.1.0"
+dependencies = [
+ "aisix-core",
+ "aisix-etcd",
+ "argon2",
+ "async-trait",
+ "axum 0.8.9",
+ "base64 0.22.1",
+ "bytes",
+ "chrono",
+ "etcd-client",
+ "futures",
+ "h2",
+ "hex",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "prost 0.13.5",
+ "rand_core 0.6.4",
+ "rcgen",
+ "reqwest 0.12.28",
+ "ring",
+ "rustix",
+ "rustls",
+ "rustls-pki-types",
+ "semver",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "sqlx",
+ "thiserror 1.0.69",
+ "time",
+ "tokio",
+ "tokio-rustls",
+ "tokio-stream",
+ "tonic",
+ "tonic-build",
+ "tower 0.5.3",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+ "x509-parser",
+]
+
+[[package]]
 name = "aisix-core"
 version = "0.0.0"
 dependencies = [
@@ -590,6 +636,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "ipnet",
+ "rand 0.8.7",
  "rcgen",
  "reqwest 0.12.28",
  "rustls",
@@ -4267,6 +4314,7 @@ dependencies = [
  "ring",
  "rustls-pki-types",
  "time",
+ "x509-parser",
  "yasna",
 ]
 
@@ -5179,6 +5227,7 @@ checksum = "ee6798b1838b6a0f69c007c133b8df5866302197e404e8b6ee8ed3e3a5e68dc6"
 dependencies = [
  "base64 0.22.1",
  "bytes",
+ "chrono",
  "crc",
  "crossbeam-queue",
  "either",
@@ -5194,6 +5243,7 @@ dependencies = [
  "memchr",
  "once_cell",
  "percent-encoding",
+ "rustls",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -5203,6 +5253,8 @@ dependencies = [
  "tokio-stream",
  "tracing",
  "url",
+ "uuid",
+ "webpki-roots 0.26.11",
 ]
 
 [[package]]
@@ -5235,6 +5287,8 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "sqlx-core",
+ "sqlx-mysql",
+ "sqlx-postgres",
  "sqlx-sqlite",
  "syn 2.0.117",
  "tokio",
@@ -5252,6 +5306,7 @@ dependencies = [
  "bitflags",
  "byteorder",
  "bytes",
+ "chrono",
  "crc",
  "digest 0.10.7",
  "dotenvy",
@@ -5272,6 +5327,7 @@ dependencies = [
  "percent-encoding",
  "rand 0.8.7",
  "rsa",
+ "serde",
  "sha1",
  "sha2 0.10.9",
  "smallvec",
@@ -5279,6 +5335,7 @@ dependencies = [
  "stringprep",
  "thiserror 2.0.18",
  "tracing",
+ "uuid",
  "whoami",
 ]
 
@@ -5292,6 +5349,7 @@ dependencies = [
  "base64 0.22.1",
  "bitflags",
  "byteorder",
+ "chrono",
  "crc",
  "dotenvy",
  "etcetera",
@@ -5316,6 +5374,7 @@ dependencies = [
  "stringprep",
  "thiserror 2.0.18",
  "tracing",
+ "uuid",
  "whoami",
 ]
 
@@ -5326,6 +5385,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2d12fe70b2c1b4401038055f90f151b78208de1f9f89a7dbfd41587a10c3eea"
 dependencies = [
  "atoi",
+ "chrono",
  "flume",
  "futures-channel",
  "futures-core",
@@ -5341,6 +5401,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tracing",
  "url",
+ "uuid",
 ]
 
 [[package]]
@@ -6871,6 +6932,7 @@ dependencies = [
  "lazy_static",
  "nom",
  "oid-registry",
+ "ring",
  "rusticata-macros",
  "thiserror 1.0.69",
  "time",

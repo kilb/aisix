@@ -113,16 +113,13 @@ pub const RESOURCES: [&str; 20] = [
 ];
 
 /// Whether a resource's write contract closes unknown top-level fields.
-/// `cache_policy`, `guardrail`, `guardrail_attachment` and
-/// `observability_exporter` historically ship open root schemas (documented
-/// on their producers), so the strict closing pass skips them. Shared by
-/// [`Schemas::compile`] and the resource schema published by `dump-schema`,
-/// so the enforced write contract and the published one cannot drift.
+/// `guardrail` and `observability_exporter` ship open root schemas
+/// (documented on their producers), so the strict closing pass skips them.
+/// Shared by [`Schemas::compile`] and the resource schema published by
+/// `dump-schema`, so the enforced write contract and the published one cannot
+/// drift.
 fn closes_on_write(resource: &str) -> bool {
-    !matches!(
-        resource,
-        "cache_policy" | "guardrail" | "guardrail_attachment" | "observability_exporter"
-    )
+    !matches!(resource, "guardrail" | "observability_exporter")
 }
 
 /// The canonical schema of one resource, as enforced on the given path.
@@ -1532,6 +1529,19 @@ pub fn apikey_root_schema(strict: bool) -> Value {
             &mut schema,
             vec![require_name_form_beside_ids("mcp_rate_limits", "object")],
         );
+    } else {
+        // An endpoint family a later release adds must not cost this one the
+        // whole key row: the read contract takes any name, and a name this
+        // build does not know loads as `EndpointFamily::Unknown`, which
+        // grants nothing. The write contract keeps the closed enum.
+        *schema
+            .pointer_mut("/properties/allowed_endpoints/items")
+            .expect("api_key schema types allowed_endpoints items") = json!({"type": "string"});
+        schema
+            .pointer_mut("/definitions")
+            .and_then(Value::as_object_mut)
+            .expect("api_key schema has definitions")
+            .remove("EndpointFamily");
     }
     schema
 }
@@ -2692,9 +2702,9 @@ fn set_property_additional_properties_description(
 }
 
 /// Canonical JSON Schema for the `cache_policy` resource, derived from the
-/// [`CachePolicy`](crate::models::CachePolicy) struct. The struct intentionally
-/// has no `deny_unknown_fields`, so the schema omits `additionalProperties`
-/// (i.e. `true`) — forward-compat fields from a newer the control plane are tolerated.
+/// [`CachePolicy`](crate::models::CachePolicy) struct. The write contract
+/// refuses unknown fields; the read contract tolerates them, so a field a
+/// newer control plane adds does not take a stored policy down.
 pub fn cache_policy_root_schema() -> Value {
     let mut schema = struct_root_schema::<crate::models::CachePolicy>(false);
     // The similarity layer's embedding model is named either way, like
@@ -2956,14 +2966,37 @@ pub fn rate_limit_policy_root_schema() -> Value {
 /// Canonical JSON Schema for the `guardrail_attachment` resource, derived from
 /// the [`GuardrailAttachment`](crate::models::GuardrailAttachment) struct. Uses
 /// the nullable `Option` representation (`scope_id` is `null` for `env`-scoped
-/// attachments) and stays open (no `deny_unknown_fields`): the control plane includes an
-/// `env_id` the DP ignores.
+/// attachments). The write contract refuses unknown fields, and declares the
+/// `env_id` a control plane may write for its own scoping; the read contract
+/// tolerates unknown fields.
 pub fn guardrail_attachment_root_schema() -> Value {
     struct_root_schema::<crate::models::GuardrailAttachment>(true)
 }
 
 #[cfg(test)]
 mod tests {
+
+    /// Cache policies and guardrail attachments refuse an unknown field on
+    /// write, and a stored row carrying one still loads.
+    #[test]
+    fn cache_policies_and_attachments_close_on_write_only() {
+        let policy_root = serde_json::json!({"name": "c", "from_a_newer_build": 1});
+        let policy_nested = serde_json::json!({"name": "c",
+            "semantic": {"embedding_model": "e", "threshold": 0.9, "from_a_newer_build": 1}});
+        for doc in [&policy_root, &policy_nested] {
+            assert!(validate_cache_policy(doc).is_err(), "{doc}");
+            validate_cache_policy_lenient(doc).expect("a stored policy still loads");
+        }
+        let attachment = serde_json::json!({"guardrail_id": "g", "scope_type": "env",
+            "priority": 1, "from_a_newer_build": 1});
+        assert!(validate_guardrail_attachment(&attachment).is_err());
+        validate_guardrail_attachment_lenient(&attachment)
+            .expect("a stored attachment still loads");
+        // The control plane's own scoping field is declared, not unknown.
+        let scoped = serde_json::json!({"guardrail_id": "g", "scope_type": "env",
+            "priority": 1, "env_id": "e"});
+        validate_guardrail_attachment(&scoped).expect("env_id is declared");
+    }
 
     /// The A2A sibling constrains its `url` as a URI and MCP did not, so a
     /// malformed value was accepted on write — for a row whose `auth`

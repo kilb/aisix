@@ -50,6 +50,11 @@ const RESP_ID_AAD: &[u8] = b"aisix-responses-v2";
 /// Associated data of a sealed ciphertext tag, so neither kind of seal opens
 /// as the other.
 const ENC_AAD: &[u8] = b"aisix-encrypted-content-v2";
+/// The bucket a sealed plaintext's head is padded to: 128 bytes holds the
+/// tag, an owner that names a team or key by UUID and a target id of up to
+/// 75 bytes, so every target of a deployment (UUIDs, in managed and file
+/// mode alike) seals to one length.
+const HEAD_BUCKET: usize = 2 * crate::opaque_id::SEAL_BUCKET;
 
 fn b64() -> base64::engine::GeneralPurpose {
     base64::engine::general_purpose::URL_SAFE_NO_PAD
@@ -65,37 +70,61 @@ pub(crate) fn response_id_key(id_key: &[u8; 32]) -> [u8; 32] {
 /// A response id sealed to `owner`: `resp_` + base64url(`nonce || ciphertext
 /// || tag`), the AES-256-GCM encryption of
 /// `aisix:v2;<owner>;<target_id>;<upstream_id>` under a random nonce. The
-/// plaintext is padded so the upstream id gets a whole bucket of the size
-/// item ids use ([`crate::opaque_id::pad_after`]): the id's length does not
-/// tell one upstream's id format from another's.
+/// head (`aisix:v2;<owner>;<target_id>;`) is padded to a bucket of its own
+/// ([`HEAD_BUCKET`]), and the upstream id to the bucket item ids use
+/// ([`crate::opaque_id::pad`]), so the id's length tells neither which
+/// target served it nor one upstream's id format from another's.
+///
+/// The one-off form, under a key set up for this call; a request seals under
+/// the cipher the platform settings set up once ([`TenantSeal`]).
+#[cfg(test)]
 pub(crate) fn seal_response_id(
     key: &[u8; 32],
     owner: &str,
     target_id: &str,
     upstream_id: &str,
 ) -> String {
+    seal_response_id_with(&cipher(key), owner, target_id, upstream_id)
+}
+
+fn seal_response_id_with(
+    cipher: &aead::LessSafeKey,
+    owner: &str,
+    target_id: &str,
+    upstream_id: &str,
+) -> String {
     format!(
         "{RESP_ID_PREFIX}{}",
-        seal(key, RESP_ID_AAD, owner, target_id, upstream_id)
+        seal(cipher, RESP_ID_AAD, owner, target_id, upstream_id)
     )
 }
 
 /// `(target id, upstream id)` of a [`seal_response_id`] value; `None` for an
 /// id that was not sealed under `key` to `owner`.
+#[cfg(test)]
 pub(crate) fn open_response_id(
     key: &[u8; 32],
     owner: &str,
     sealed: &str,
 ) -> Option<(String, String)> {
+    open_response_id_with(&cipher(key), owner, sealed)
+}
+
+fn open_response_id_with(
+    cipher: &aead::LessSafeKey,
+    owner: &str,
+    sealed: &str,
+) -> Option<(String, String)> {
     open(
-        key,
+        cipher,
         RESP_ID_AAD,
         owner,
         sealed.strip_prefix(RESP_ID_PREFIX)?,
     )
 }
 
-fn cipher(key: &[u8; 32]) -> aead::LessSafeKey {
+/// The AES-256-GCM cipher under `key`.
+pub(crate) fn cipher(key: &[u8; 32]) -> aead::LessSafeKey {
     aead::LessSafeKey::new(
         aead::UnboundKey::new(&aead::AES_256_GCM, key)
             .expect("a 32-byte key is the length AES-256-GCM takes"),
@@ -131,17 +160,24 @@ fn unescaped(field: &str) -> Option<String> {
     Some(out)
 }
 
-fn seal(key: &[u8; 32], aad: &[u8], owner: &str, target_id: &str, value: &str) -> String {
-    let mut sealed = crate::opaque_id::pad_after(
+fn seal(
+    cipher: &aead::LessSafeKey,
+    aad: &[u8],
+    owner: &str,
+    target_id: &str,
+    value: &str,
+) -> String {
+    let mut sealed = crate::opaque_id::pad_to(
         &format!("{SEALED_TAG}{};{};", escaped(owner), escaped(target_id)),
-        value,
+        HEAD_BUCKET,
     );
+    sealed.extend_from_slice(&crate::opaque_id::pad(value));
     let mut nonce = [0u8; aead::NONCE_LEN];
     // The operating system's random source; there is no id to hand out
     // without it.
     ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut nonce)
         .expect("the system random source is readable");
-    cipher(key)
+    cipher
         .seal_in_place_append_tag(
             aead::Nonce::assume_unique_for_key(nonce),
             aead::Aad::from(aad),
@@ -154,27 +190,39 @@ fn seal(key: &[u8; 32], aad: &[u8], owner: &str, target_id: &str, value: &str) -
     b64().encode(payload)
 }
 
-fn open(key: &[u8; 32], aad: &[u8], owner: &str, payload: &str) -> Option<(String, String)> {
+fn open(
+    cipher: &aead::LessSafeKey,
+    aad: &[u8],
+    owner: &str,
+    payload: &str,
+) -> Option<(String, String)> {
     let raw = b64().decode(payload).ok()?;
-    if raw.len() < aead::NONCE_LEN + crate::opaque_id::SEAL_BUCKET + aead::MAX_TAG_LEN {
+    if raw.len() < aead::NONCE_LEN + HEAD_BUCKET + crate::opaque_id::SEAL_BUCKET + aead::MAX_TAG_LEN
+    {
         return None;
     }
     let (nonce, sealed) = raw.split_at(aead::NONCE_LEN);
     let mut buf = sealed.to_vec();
-    let plain = cipher(key)
+    let plain = cipher
         .open_in_place(
             aead::Nonce::try_assume_unique_for_key(nonce).ok()?,
             aead::Aad::from(aad),
             &mut buf,
         )
         .ok()?;
-    let text = std::str::from_utf8(crate::opaque_id::unpad(plain)?).ok()?;
-    let (target, value) = text
-        .strip_prefix(SEALED_TAG)?
-        .strip_prefix(&*escaped(owner))?
-        .strip_prefix(';')?
-        .split_once(';')?;
-    let target = unescaped(target)?;
+    // The head ends at the `;` after the target, and its padding at the
+    // bucket that follows; the upstream id is padded on its own after it.
+    let owner_head = format!("{SEALED_TAG}{};", escaped(owner));
+    let rest = plain.strip_prefix(owner_head.as_bytes())?;
+    let target_len = rest.iter().position(|&b| b == b';')?;
+    let head_len = owner_head.len() + target_len + 1;
+    let padded_head = (head_len + 1).div_ceil(HEAD_BUCKET) * HEAD_BUCKET;
+    let (head, value) = (plain.get(..padded_head)?, plain.get(padded_head..)?);
+    if crate::opaque_id::unpad(head)?.len() != head_len {
+        return None;
+    }
+    let target = unescaped(std::str::from_utf8(&rest[..target_len]).ok()?)?;
+    let value = std::str::from_utf8(crate::opaque_id::unpad(value)?).ok()?;
     (!target.is_empty()).then(|| (target, value.to_owned()))
 }
 
@@ -183,7 +231,8 @@ fn open(key: &[u8; 32], aad: &[u8], owner: &str, payload: &str) -> Option<(Strin
 /// itself when it has none.
 #[derive(Clone)]
 pub(crate) struct TenantSeal {
-    key: [u8; 32],
+    /// The cipher the platform settings set up once.
+    cipher: Arc<aead::LessSafeKey>,
     owner: String,
 }
 
@@ -198,7 +247,7 @@ impl std::fmt::Debug for TenantSeal {
 impl TenantSeal {
     pub(crate) fn new(platform: &crate::platform::PlatformSettings, owner: &str) -> Self {
         Self {
-            key: response_id_key(&platform.id_key),
+            cipher: platform.response_cipher().clone(),
             owner: owner.to_string(),
         }
     }
@@ -206,7 +255,7 @@ impl TenantSeal {
     fn mark_encrypted_content(&self, target_id: &str, original: &str) -> String {
         format!(
             "{ENC_PREFIX_V2}{};{original}",
-            seal(&self.key, ENC_AAD, &self.owner, target_id, "")
+            seal(&self.cipher, ENC_AAD, &self.owner, target_id, "")
         )
     }
 
@@ -222,7 +271,7 @@ impl TenantSeal {
             };
         };
         let opened = rest.split_once(';').and_then(|(tag, original)| {
-            let (origin, _) = open(&self.key, ENC_AAD, &self.owner, tag)?;
+            let (origin, _) = open(&self.cipher, ENC_AAD, &self.owner, tag)?;
             Some((origin, original.to_string()))
         });
         match opened {
@@ -246,8 +295,8 @@ struct SealedResponseId {
 impl SealedResponseId {
     fn seal(&self, upstream_id: &str) -> String {
         let fresh = || {
-            seal_response_id(
-                &self.tenant.key,
+            seal_response_id_with(
+                &self.tenant.cipher,
                 &self.tenant.owner,
                 &self.target_id,
                 upstream_id,
@@ -357,6 +406,10 @@ pub(crate) struct ContextAffinity {
     /// Platform mode: the `previous_response_id` names no response this
     /// tenant was handed.
     previous_unknown: bool,
+    /// Platform mode: the index into `input[]` of the first item reference
+    /// whose id is not this tenant's seal
+    /// ([`crate::opaque_id::unseal_responses_input`]).
+    unopened_item_reference: Option<usize>,
 }
 
 impl ContextAffinity {
@@ -388,7 +441,7 @@ impl ContextAffinity {
         {
             match slot
                 .as_str()
-                .and_then(|id| open_response_id(&tenant.key, &tenant.owner, id))
+                .and_then(|id| open_response_id_with(&tenant.cipher, &tenant.owner, id))
             {
                 Some((origin, original)) => affinity.restore_previous(slot, origin, original),
                 None => affinity.previous_unknown = true,
@@ -436,6 +489,27 @@ impl ContextAffinity {
                 Some(EncryptedContent::Plain) | None => {}
             }
             input.push(item);
+        }
+    }
+
+    /// Platform mode: record what [`crate::opaque_id::unseal_responses_input`]
+    /// found, for [`Self::refuse_unopened_item_reference`].
+    pub(crate) fn note_unopened_item_reference(&mut self, index: Option<usize>) {
+        self.unopened_item_reference = index;
+    }
+
+    /// Platform mode: refuse a request whose `input[]` references an item by
+    /// an id that is not this tenant's own seal: another tenant's, a forged
+    /// one, or a bare upstream id. The upstream would resolve it against
+    /// everything the shared account stored. It is refused like any other
+    /// reference to an object stored upstream, naming the field and never
+    /// the id, and nothing reaches an upstream.
+    pub(crate) fn refuse_unopened_item_reference(&self) -> Result<(), crate::error::ProxyError> {
+        match self.unopened_item_reference {
+            Some(index) => Err(crate::error::ProxyError::StoredObjectReference(format!(
+                "input[{index}].id"
+            ))),
+            None => Ok(()),
         }
     }
 
@@ -578,10 +652,13 @@ pub(crate) struct ResponseMark {
 
 #[derive(Clone, Copy)]
 enum Slot {
+    /// The snapshot's `response.model`, restamped to the caller-facing name.
+    Model,
     ResponseId,
     PreviousResponseId,
     EncryptedContent,
-    ItemId,
+    /// An id platform mode seals, with the kind it holds.
+    Id(crate::opaque_id::IdKind),
 }
 
 impl ResponseMark {
@@ -626,8 +703,9 @@ impl ResponseMark {
         }
     }
 
-    fn rewrite(&self, slot: Slot, value: &str) -> Option<String> {
+    fn rewrite(&self, slot: Slot, value: &str, model: Option<&str>) -> Option<String> {
         match slot {
+            Slot::Model => model.map(str::to_string),
             Slot::ResponseId => match &self.tenant {
                 Some(tenant) => (!value.is_empty()).then(|| tenant.seal(value)),
                 None => self
@@ -650,11 +728,11 @@ impl ResponseMark {
                 .as_ref()
                 .filter(|(original, _)| original == value)
                 .map(|(_, sent)| sent.clone()),
-            Slot::ItemId => self
+            Slot::Id(kind) => self
                 .seal
                 .as_ref()
                 .filter(|_| !value.is_empty())
-                .map(|sealer| sealer.seal(value)),
+                .map(|sealer| sealer.seal(kind, value)),
         }
     }
 
@@ -668,7 +746,7 @@ impl ResponseMark {
             ("previous_response_id", Slot::PreviousResponseId),
         ] {
             if let Some(v) = body.get_mut(key) {
-                if let Some(new) = v.as_str().and_then(|s| self.rewrite(slot, s)) {
+                if let Some(new) = v.as_str().and_then(|s| self.rewrite(slot, s, None)) {
                     *v = Value::String(new);
                 }
             }
@@ -678,7 +756,7 @@ impl ResponseMark {
                 if let Some(v) = item.get_mut("encrypted_content") {
                     if let Some(new) = v
                         .as_str()
-                        .and_then(|s| self.rewrite(Slot::EncryptedContent, s))
+                        .and_then(|s| self.rewrite(Slot::EncryptedContent, s, None))
                     {
                         *v = Value::String(new);
                     }
@@ -698,18 +776,24 @@ impl ResponseMark {
     /// `.queued` / `.completed` / `.incomplete` / `.failed`) and the item of
     /// `response.output_item.added` / `.done`. In platform mode the same pass
     /// seals every item id, the `item_id` of a per-item event included.
-    fn apply_to_event_json(&self, payload: &[u8]) -> Option<Vec<u8>> {
-        let tagged = self.tag_event_json(payload);
+    ///
+    /// With `model`, the same pass restamps the snapshot's `response.model`
+    /// to it ([`crate::model_echo::responses_snapshot_model`]).
+    fn apply_to_event_json(&self, payload: &[u8], model: Option<&str>) -> Option<Vec<u8>> {
+        let tagged = self.tag_event_json(payload, model);
         if self.seal.is_none() {
             return tagged;
         }
         crate::opaque_id::strip_channel_metrics(tagged.as_deref().unwrap_or(payload)).or(tagged)
     }
 
-    fn tag_event_json(&self, payload: &[u8]) -> Option<Vec<u8>> {
+    fn tag_event_json(&self, payload: &[u8], model: Option<&str>) -> Option<Vec<u8>> {
         let slot = std::cell::Cell::new(Slot::ResponseId);
         let select = |path: &[PathSeg]| {
             let picked = match path {
+                _ if model.is_some() && crate::model_echo::responses_snapshot_model(path) => {
+                    Some(Slot::Model)
+                }
                 [PathSeg::Key(r), PathSeg::Key(k)] if r == "response" => match k.as_str() {
                     "id" => Some(Slot::ResponseId),
                     "previous_response_id" => Some(Slot::PreviousResponseId),
@@ -723,8 +807,8 @@ impl ResponseMark {
                 [PathSeg::Key(i), PathSeg::Key(e)] if i == "item" && e == "encrypted_content" => {
                     Some(Slot::EncryptedContent)
                 }
-                _ if self.seal.is_some() && crate::opaque_id::responses_event_id_path(path) => {
-                    Some(Slot::ItemId)
+                _ if self.seal.is_some() => {
+                    crate::opaque_id::responses_event_id_kind(path).map(Slot::Id)
                 }
                 _ => None,
             };
@@ -734,7 +818,7 @@ impl ResponseMark {
             picked.is_some()
         };
         match crate::json_splice::rewrite_string_values(payload, select, |v| {
-            self.rewrite(slot.get(), v)
+            self.rewrite(slot.get(), v, model)
         }) {
             Ok(rewritten) => rewritten,
             Err(error) => {
@@ -745,11 +829,28 @@ impl ResponseMark {
     }
 
     /// Tag one SSE frame; `None` forwards it unchanged.
+    #[cfg(test)]
     pub(crate) fn apply_to_sse_frame(&self, frame: &[u8]) -> Option<Vec<u8>> {
         if self.is_noop() {
             return None;
         }
-        crate::model_echo::splice_sse_frame(frame, |payload| self.apply_to_event_json(payload))
+        crate::model_echo::splice_sse_frame(frame, |payload| {
+            self.apply_to_event_json(payload, None)
+        })
+    }
+
+    /// Restamp one relayed SSE frame's `response.model` to
+    /// `client_facing_model` and tag it, in one splice pass: what
+    /// [`crate::model_echo::restamp_sse_frame`] then [`Self::apply_to_sse_frame`]
+    /// do in two. `None` forwards it unchanged.
+    pub(crate) fn restamp_and_tag_sse_frame(
+        &self,
+        frame: &[u8],
+        client_facing_model: &str,
+    ) -> Option<Vec<u8>> {
+        crate::model_echo::splice_sse_frame(frame, |payload| {
+            self.apply_to_event_json(payload, Some(client_facing_model))
+        })
     }
 
     /// Tag every frame of a complete, buffered SSE document.
@@ -757,7 +858,9 @@ impl ResponseMark {
         if self.is_noop() {
             return buf;
         }
-        crate::model_echo::splice_sse_buffer(&buf, |payload| self.apply_to_event_json(payload))
+        crate::model_echo::splice_sse_buffer(&buf, |payload| {
+            self.apply_to_event_json(payload, None)
+        })
     }
 }
 
@@ -874,7 +977,7 @@ mod tests {
 
     #[test]
     fn a_sealing_mark_seals_item_ids_beside_the_context_tags() {
-        use crate::opaque_id::seal_id;
+        use crate::opaque_id::{seal_call, seal_id};
         let (mark, key) = sealing_mark(Some("m-1"));
         let mut body = json!({
             "id": "resp_up",
@@ -897,7 +1000,7 @@ mod tests {
         );
         assert_eq!(
             body["output"][0]["call_id"],
-            seal_id(&key, "team-a", "call_bdrk_1")
+            seal_call(&key, "team-a", "call_bdrk_1")
         );
         assert_eq!(body["output"][1]["id"], seal_id(&key, "team-a", "rs_1"));
         assert_eq!(
@@ -1045,6 +1148,38 @@ mod tests {
         for broken in ["%", "%3", "%41", "a%2"] {
             assert_eq!(unescaped(broken), None, "{broken}");
         }
+    }
+
+    /// The length of a sealed id says nothing about the target that served
+    /// it: a short target id and a UUID one, behind an owner of either kind,
+    /// seal to one length, and every one opens to what was sealed.
+    #[test]
+    fn sealed_response_ids_are_one_length_whatever_the_target_id_was() {
+        let k = [3u8; 32];
+        let uuid = "5a9d2c1b-3e4f-4a6b-8c7d-9e0f1a2b3c4d";
+        let mut lengths = Vec::new();
+        for owner in [
+            "team:0c0e5f8a-7a8f-4d2b-9a53-6d1e3f2b4c5d",
+            "key:0c0e5f8a-7a8f-4d2b-9a53-6d1e3f2b4c5d",
+            "team:t",
+        ] {
+            for target in ["m-1", uuid, "gpt-4o-mini-on-a-long-routing-target-name"] {
+                let id = seal_response_id(&k, owner, target, "resp_1");
+                assert_eq!(
+                    open_response_id(&k, owner, &id),
+                    Some((target.to_string(), "resp_1".to_string())),
+                    "{owner} {target}"
+                );
+                lengths.push(id.len());
+            }
+        }
+        assert!(lengths.windows(2).all(|w| w[0] == w[1]), "{lengths:?}");
+        // The ciphertext tag carries the same head, and the same length.
+        let tenant = tenant("team:0c0e5f8a-7a8f-4d2b-9a53-6d1e3f2b4c5d");
+        assert_eq!(
+            tenant.mark_encrypted_content("m-1", "CT").len(),
+            tenant.mark_encrypted_content(uuid, "CT").len()
+        );
     }
 
     /// The length of a sealed id says nothing about the upstream id inside:
@@ -1266,6 +1401,55 @@ mod tests {
         let f = ContextAffinity::unwrap_sealed_request(&mut forged, tenant("team-a"));
         assert_eq!(f.origin(), None);
         assert_eq!(forged["input"].as_array().unwrap().len(), 0);
+    }
+
+    /// The one splice pass a relayed frame takes writes exactly what the
+    /// model restamp followed by the tag pass wrote, with platform mode on
+    /// and off, inside a group and outside one.
+    #[test]
+    fn restamping_and_tagging_in_one_pass_matches_the_two_passes() {
+        let frames: [&[u8]; 5] = [
+            b"event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_up\",\"model\":\"gpt-4o-2024\",\"output\":[]}}\n\n",
+            b"data: {\"type\":\"response.output_item.added\",\"item\":{\"id\":\"fc_1\",\"call_id\":\"call_1\",\"type\":\"function_call\"}}\n\n",
+            b"data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"fc_1\",\"delta\":\"{\"}\n\n",
+            b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_up\",\"model\":\"gpt-4o-2024\",\"output\":[{\"id\":\"rs_1\",\"encrypted_content\":\"CT\"}]},\"amazon-bedrock-invocationMetrics\":{\"n\":1}}\n\n",
+            b"data: [DONE]\n\n",
+        ];
+        let off_plain = ContextAffinity::default().response_mark("m-1", false);
+        let off_group = ContextAffinity::default().response_mark("m-1", true);
+        let (on_plain, _) = sealing_mark(None);
+        let (on_group, _) = sealing_mark(Some("m-1"));
+        for mark in [&off_plain, &off_group, &on_plain, &on_group] {
+            for frame in frames {
+                let restamped = crate::model_echo::restamp_sse_frame(
+                    frame,
+                    "alias",
+                    crate::model_echo::responses_snapshot_model,
+                );
+                let after_restamp = restamped.as_deref().unwrap_or(frame);
+                let two_passes = mark.apply_to_sse_frame(after_restamp);
+                let two_passes = two_passes.as_deref().unwrap_or(after_restamp);
+                let one_pass = mark.restamp_and_tag_sse_frame(frame, "alias");
+                let one_pass = one_pass.as_deref().unwrap_or(frame);
+                // The response id's nonce is random but reused within a
+                // mark, so both runs see the same sealed id.
+                assert_eq!(
+                    String::from_utf8_lossy(one_pass),
+                    String::from_utf8_lossy(two_passes)
+                );
+            }
+        }
+        // Off platform mode and outside a group, only the model moves.
+        let out = off_plain
+            .restamp_and_tag_sse_frame(frames[0], "alias")
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            String::from_utf8_lossy(frames[0]).replace("gpt-4o-2024", "alias")
+        );
+        assert!(off_plain
+            .restamp_and_tag_sse_frame(frames[2], "alias")
+            .is_none());
     }
 
     /// The keys are set up once per response, not once per frame or id.

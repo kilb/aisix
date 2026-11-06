@@ -1,0 +1,98 @@
+[package]
+name = "aisix-control-plane"
+version = "0.1.0"
+edition = "2021"
+
+# Pins its own dependency versions and stays out of [workspace.dependencies],
+# as crates/aisix-portal and crates/aisix-console do: the control plane is a
+# separate process, and its dependencies should not be forced onto the gateway
+# crates.
+[dependencies]
+# For `redact_url_for_log`: the one place configured URLs are reduced for
+# display, so this crate does not grow a second copy that drifts.
+aisix-core = { path = "../aisix-core" }
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+# Runtime queries (`sqlx::query`), never the `query!` macros: those need a
+# DATABASE_URL or an offline cache at build time, which the lint job has not.
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-webpki", "postgres", "macros", "migrate", "uuid", "chrono", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "1"
+tracing = "0.1"
+# `env-filter` so RUST_LOG selects what is logged.
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+futures = "0.3"
+ring = "0.17"
+hex = "0.4"
+base64 = "0.22"
+# Operator and member passwords, as in crates/aisix-portal and
+# crates/aisix-console; rand_core 0.6 is the version argon2 0.5 uses, and
+# also mints session tokens.
+argon2 = "0.5.3"
+rand_core = { version = "0.6", features = ["getrandom"] }
+# Session tokens are stored as their SHA-256.
+sha2 = "0.10"
+# The control plane's CA: EC P-256 certificates signed with ring (rcgen
+# 0.13.2). `x509-parser` loads the stored CA certificate back for signing
+# (`CertificateParams::from_ca_cert_pem`, rcgen 0.13.2 `certificate.rs:196-198`).
+rcgen = { version = "0.13", default-features = false, features = ["pem", "ring", "x509-parser"] }
+# Reads a gateway certificate's URI SANs, as the gateway's own bundle loader
+# does (crates/aisix-server/src/cert_bundle.rs).
+x509-parser = "0.16"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-pki-types = "1"
+# Certificate validity, in the type rcgen takes (rcgen 0.13.2 uses time 0.3;
+# 0.3.47 in Cargo.lock).
+time = "0.3"
+# The gateway listener: mTLS accepted with tokio-rustls, then each
+# connection served by hyper's HTTP/1.1 or HTTP/2 server by its negotiated
+# ALPN protocol (0.26.4, 1.9.0, 0.1.20 and 0.5.3 in Cargo.lock).
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
+hyper = { version = "1", features = ["server", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["tokio", "server", "http1", "http2", "service"] }
+# `ServiceExt::oneshot`, to hand each request to the router.
+tower = { version = "0.5", features = ["util"] }
+# Release versions a heartbeat reports, compared with this build's
+# (1.0.28 in Cargo.lock).
+semver = "1"
+# The projector writes kine through the etcd client the gateway reads it
+# with (0.14.1 in Cargo.lock, the gateway's features), behind an
+# `async_trait` seam (0.1.89) so tests can stand in a kine that fails on cue.
+# The etcd front's tests read through it too, as a gateway.
+etcd-client = { version = "0.14", features = ["tls"] }
+async-trait = "0.1"
+# The etcd front: a server and a client generated from proto/ by tonic and
+# prost, at the versions etcd-client 0.14.1 (the gateway's etcd client)
+# builds with (tonic 0.12.3 and prost 0.13.5 in Cargo.lock). Default
+# features: the server half's `Routes`, and the client channel to kine.
+tonic = "=0.12.3"
+prost = "0.13"
+tokio-stream = "0.1"
+
+# The open-file limit, raised at boot for the gateway listener's connection
+# caps (1.1.4 in Cargo.lock).
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["process"] }
+
+[build-dependencies]
+tonic-build = "=0.12.3"
+
+[dev-dependencies]
+# Tests start a real listener and send real HTTP, as the portal's and the
+# console's do.
+reqwest = { version = "0.12", default-features = false, features = ["json", "cookies", "rustls-tls"] }
+# A client that keeps one connection open across requests, and one that
+# speaks h2, for the gateway listener's tests (1.9.0 and 0.1.3 in
+# Cargo.lock).
+hyper = { version = "1", features = ["client", "http1", "http2"] }
+http-body-util = "0.1"
+bytes = "1"
+# The gateway's own loader, which a projected document must load in, and
+# its configuration provider, which the etcd front must serve unchanged.
+aisix-etcd = { path = "../aisix-etcd" }
+# A raw HTTP/2 client, to see the GOAWAY a refused gateway's connection gets
+# (0.4.20 in Cargo.lock).
+h2 = "0.4"

@@ -49,6 +49,10 @@ const UPSTREAM_TOOL_USE_ID = "toolu_bdrk_01Y";
 const UPSTREAM_CHAT_ID = "chatcmpl-up";
 const UPSTREAM_FC_ITEM_ID = "fc_bdrk_01Z";
 const UPSTREAM_CALL_ID = "call_bdrk_01Y";
+/** A tool-call id in the shape a Converse channel hands out. */
+const UPSTREAM_CONVERSE_TOOL_ID = "tooluse_bdrk_01Q";
+/** A server tool's use id in the shape a Vertex channel marks its ids. */
+const UPSTREAM_SERVER_TOOL_ID = "srvtoolu_vrtx_01S";
 const CHANNEL_METRICS = { inputTokenCount: 9, outputTokenCount: 4, invocationLatency: 120 };
 
 const HEADERS = {
@@ -63,6 +67,8 @@ const ALIASES = {
   messagesTranslated: "pi-messages-translated",
   responsesNative: "pi-responses-native",
   responsesTranslated: "pi-responses-translated",
+  responsesChat: "pi-responses-chat",
+  messagesServerTool: "pi-messages-server-tool",
 };
 
 /** What must never appear anywhere in a response the caller receives. */
@@ -106,7 +112,7 @@ function upstreamBody(upstream: OpenAiUpstream, index: number): Record<string, a
 const WEATHER_ARGS = '{"city":"Paris"}';
 
 /** A Chat Completions upstream answering with a tool call. */
-function openAiChatAnswer(): Record<string, unknown> {
+function openAiChatAnswer(toolCallId = UPSTREAM_TOOL_USE_ID): Record<string, unknown> {
   return {
     id: UPSTREAM_CHAT_ID,
     object: "chat.completion",
@@ -121,7 +127,7 @@ function openAiChatAnswer(): Record<string, unknown> {
           content: null,
           tool_calls: [
             {
-              id: UPSTREAM_TOOL_USE_ID,
+              id: toolCallId,
               type: "function",
               function: { name: "get_weather", arguments: WEATHER_ARGS },
             },
@@ -134,7 +140,7 @@ function openAiChatAnswer(): Record<string, unknown> {
   };
 }
 
-function openAiChatStream(): string[] {
+function openAiChatStream(toolCallId = UPSTREAM_TOOL_USE_ID): string[] {
   const chunk = (choices: unknown[], extra: Record<string, unknown> = {}) =>
     JSON.stringify({
       id: UPSTREAM_CHAT_ID,
@@ -154,7 +160,7 @@ function openAiChatStream(): string[] {
           tool_calls: [
             {
               index: 0,
-              id: UPSTREAM_TOOL_USE_ID,
+              id: toolCallId,
               type: "function",
               function: { name: "get_weather", arguments: "" },
             },
@@ -230,6 +236,85 @@ function anthropicStream(): string[] {
       type: "message_stop",
       "amazon-bedrock-invocationMetrics": CHANNEL_METRICS,
     }),
+  ];
+}
+
+/** A web search the upstream ran itself, and the answer it built from it. */
+const SERVER_TOOL_BLOCKS = [
+  {
+    type: "server_tool_use",
+    id: UPSTREAM_SERVER_TOOL_ID,
+    name: "web_search",
+    input: { query: "weather in Paris" },
+  },
+  {
+    type: "web_search_tool_result",
+    tool_use_id: UPSTREAM_SERVER_TOOL_ID,
+    content: [
+      {
+        type: "web_search_result",
+        url: "https://weather.example/paris",
+        title: "Paris weather",
+        encrypted_content: "EqgfCioIARgBIiQ",
+        page_age: null,
+      },
+    ],
+  },
+  { type: "text", text: "Sunny in Paris." },
+];
+
+function serverToolAnswer(): Record<string, unknown> {
+  return {
+    id: "msg_vrtx_01M",
+    type: "message",
+    role: "assistant",
+    model: "upstream-model",
+    content: SERVER_TOOL_BLOCKS,
+    stop_reason: "end_turn",
+    stop_sequence: null,
+    usage: { input_tokens: 9, output_tokens: 4, server_tool_use: { web_search_requests: 1 } },
+  };
+}
+
+function serverToolStream(): string[] {
+  const frame = (event: string, data: unknown) =>
+    `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+  const [use, result, text] = SERVER_TOOL_BLOCKS;
+  return [
+    frame("message_start", {
+      type: "message_start",
+      message: {
+        id: "msg_vrtx_01M",
+        type: "message",
+        role: "assistant",
+        model: "upstream-model",
+        content: [],
+        stop_reason: null,
+        usage: { input_tokens: 9, output_tokens: 1 },
+      },
+    }),
+    frame("content_block_start", { type: "content_block_start", index: 0, content_block: { ...use, input: {} } }),
+    frame("content_block_delta", {
+      type: "content_block_delta",
+      index: 0,
+      delta: { type: "input_json_delta", partial_json: JSON.stringify(use!.input) },
+    }),
+    frame("content_block_stop", { type: "content_block_stop", index: 0 }),
+    frame("content_block_start", { type: "content_block_start", index: 1, content_block: result }),
+    frame("content_block_stop", { type: "content_block_stop", index: 1 }),
+    frame("content_block_start", { type: "content_block_start", index: 2, content_block: { type: "text", text: "" } }),
+    frame("content_block_delta", {
+      type: "content_block_delta",
+      index: 2,
+      delta: { type: "text_delta", text: (text as { text: string }).text },
+    }),
+    frame("content_block_stop", { type: "content_block_stop", index: 2 }),
+    frame("message_delta", {
+      type: "message_delta",
+      delta: { stop_reason: "end_turn", stop_sequence: null },
+      usage: { output_tokens: 4 },
+    }),
+    frame("message_stop", { type: "message_stop" }),
   ];
 }
 
@@ -430,6 +515,8 @@ describe("platform mode e2e: ids name no upstream channel, and tool use still ro
     messagesTranslated: undefined,
     responsesNative: undefined,
     responsesTranslated: undefined,
+    responsesChat: undefined,
+    messagesServerTool: undefined,
   };
 
   beforeAll(async () => {
@@ -462,6 +549,20 @@ describe("platform mode e2e: ids name no upstream channel, and tool use still ro
       ],
     });
     up.responsesTranslated = await startOpenAiUpstream({ scriptedResponses: anthropicScript() });
+    up.responsesChat = await startOpenAiUpstream({
+      scriptedResponses: [
+        { nonStreamBody: openAiChatAnswer(UPSTREAM_CONVERSE_TOOL_ID) },
+        { nonStreamBody: openAiChatAnswer(UPSTREAM_CONVERSE_TOOL_ID) },
+        { streamEvents: openAiChatStream(UPSTREAM_CONVERSE_TOOL_ID) },
+      ],
+    });
+    up.messagesServerTool = await startOpenAiUpstream({
+      scriptedResponses: [
+        { nonStreamBody: serverToolAnswer() },
+        { nonStreamBody: serverToolAnswer() },
+        { rawStreamFrames: serverToolStream() },
+      ],
+    });
 
     app = await spawnApp({
       // The secret reaches the gateway process and nothing else.
@@ -475,13 +576,20 @@ describe("platform mode e2e: ids name no upstream channel, and tool use still ro
 
     const anthropic = { provider: "anthropic", adapter: "anthropic" };
     const openai = { provider: "openai", adapter: "openai" };
-    const routes: Array<[keyof typeof ALIASES, { provider: string; adapter: string }]> = [
+    // An OpenAI-compatible endpoint that declares no `/v1/responses`, so
+    // Responses traffic is translated onto its Chat Completions API.
+    const chatOnly = { ...openai, apis: {} };
+    const routes: Array<
+      [keyof typeof ALIASES, { provider: string; adapter: string; apis?: Record<string, never> }]
+    > = [
       ["chatOpenAi", openai],
       ["chatAnthropic", anthropic],
       ["messagesNative", anthropic],
       ["messagesTranslated", openai],
       ["responsesNative", openai],
       ["responsesTranslated", anthropic],
+      ["responsesChat", chatOnly],
+      ["messagesServerTool", anthropic],
     ];
     for (const [route, kind] of routes) {
       const pk = await seed.createProviderKey({
@@ -490,6 +598,7 @@ describe("platform mode e2e: ids name no upstream channel, and tool use still ro
         api_base: `${up[route]!.baseUrl}/v1`,
         provider: kind.provider,
         adapter: kind.adapter,
+        ...(kind.apis ? { apis: kind.apis } : {}),
       });
       await seed.createModel({
         display_name: ALIASES[route],
@@ -705,7 +814,8 @@ describe("platform mode e2e: ids name no upstream channel, and tool use still ro
     expectNoUpstreamIdentity(first.text);
     const firstBody = JSON.parse(first.text);
     const call = responsesFunctionCall(firstBody.output);
-    expect(call.call_id).toMatch(/^toolu_/);
+    // A call id names no vendor: not the upstream's `toolu_`.
+    expect(call.call_id).toMatch(/^call_/);
     expect(call.call_id).not.toBe(UPSTREAM_TOOL_USE_ID);
     // The answer the gateway built keeps to the Responses usage fields; the
     // upstream's cache write is not named beside them.
@@ -744,6 +854,120 @@ describe("platform mode e2e: ids name no upstream channel, and tool use still ro
     expect(completed?.response?.usage?.input_tokens_details).toBeDefined();
     expect(completed!.response.usage.input_tokens_details).not.toHaveProperty("cache_creation_tokens");
   });
+
+  // A server tool's use id carries the channel's marker like every other id
+  // the upstream hands out. Mapped, it keeps the `srvtoolu_` the Messages
+  // API requires of it, the result that names it still pairs, and the
+  // caller can send both back as history.
+  test("/v1/messages with a server tool: its use id and the result naming it keep srvtoolu_ and lose the channel", async (ctx) => {
+    if (!etcdReachable || !app) return void ctx.skip();
+    const upstream = up.messagesServerTool!;
+    const alias = ALIASES.messagesServerTool;
+    const turn = (messages: unknown[], stream = false) => ({
+      model: alias,
+      max_tokens: 64,
+      messages,
+      tools: [{ type: "web_search_20250305", name: "web_search", max_uses: 1 }],
+      ...(stream ? { stream: true } : {}),
+    });
+    const question = { role: "user", content: "weather in Paris?" };
+    const SERVER_ID = /^srvtoolu_[a-zA-Z0-9_]+$/;
+
+    const first = await post("/v1/messages", turn([question]));
+    expect(first.status, first.text).toBe(200);
+    expect(first.text).not.toContain("vrtx");
+    const content = JSON.parse(first.text).content as Array<Record<string, any>>;
+    const use = content.find((b) => b.type === "server_tool_use");
+    const result = content.find((b) => b.type === "web_search_tool_result");
+    expect(use?.id).toMatch(SERVER_ID);
+    expect(use?.id).not.toBe(UPSTREAM_SERVER_TOOL_ID);
+    expect(result?.tool_use_id).toBe(use?.id);
+    // The rest of the answer survives.
+    expect(result?.content?.[0]?.encrypted_content).toBe("EqgfCioIARgBIiQ");
+    expect(content.find((b) => b.type === "text")?.text).toBe("Sunny in Paris.");
+
+    // The next turn carries the answer as history; the upstream receives
+    // the ids the caller was handed, still paired.
+    const second = await post(
+      "/v1/messages",
+      turn([question, { role: "assistant", content }, { role: "user", content: "and tomorrow?" }]),
+    );
+    expect(second.status, second.text).toBe(200);
+    expect(second.text).not.toContain("vrtx");
+    const history = (upstreamBody(upstream, 1).messages as Array<Record<string, any>>)[1].content as Array<
+      Record<string, any>
+    >;
+    expect(history.find((b) => b.type === "server_tool_use")?.id).toBe(use?.id);
+    expect(history.find((b) => b.type === "web_search_tool_result")?.tool_use_id).toBe(use?.id);
+
+    const streamed = await post("/v1/messages", turn([question], true));
+    expect(streamed.status, streamed.text).toBe(200);
+    expect(streamed.text).not.toContain("vrtx");
+    const blocks = sseEvents(streamed.text)
+      .filter((e) => e.type === "content_block_start")
+      .map((e) => e.content_block as Record<string, any>);
+    expect(blocks.find((b) => b.type === "server_tool_use")?.id).toBe(use?.id);
+    expect(blocks.find((b) => b.type === "web_search_tool_result")?.tool_use_id).toBe(use?.id);
+    expect(streamed.text).toContain("message_stop");
+  });
+
+  // A translated answer's call id is the tool-call id the Chat Completions
+  // upstream handed out, and a Converse channel's start `tooluse_`: the
+  // caller must see a call id in the Responses API's own shape, and the
+  // upstream must get its own id back on the next turn.
+  test("/v1/responses from a Chat Completions upstream: a Converse-shaped call id leaves as call_ and returns as it was", async (ctx) => {
+    if (!etcdReachable || !app) return void ctx.skip();
+    const upstream = up.responsesChat!;
+    const alias = ALIASES.responsesChat;
+    const turn = (input: unknown, extra: Record<string, unknown> = {}) => ({
+      model: alias,
+      input,
+      tools: RESPONSES_TOOLS,
+      ...extra,
+    });
+    const expectNoConverseId = (text: string) => {
+      expectNoUpstreamIdentity(text);
+      expect(text).not.toContain(UPSTREAM_CONVERSE_TOOL_ID);
+      expect(text).not.toContain("tooluse");
+    };
+
+    const first = await post("/v1/responses", turn("weather in Paris?"));
+    expect(first.status, first.text).toBe(200);
+    expectNoConverseId(first.text);
+    const call = responsesFunctionCall(JSON.parse(first.text).output);
+    expect(call.call_id).toMatch(/^call_/);
+    expect(call.arguments).toBe(WEATHER_ARGS);
+
+    // The agent's next turn: the call it was handed, and the call's output.
+    const second = await post(
+      "/v1/responses",
+      turn([
+        { role: "user", content: "weather in Paris?" },
+        { type: "function_call", id: call.id, call_id: call.call_id, name: "get_weather", arguments: WEATHER_ARGS },
+        { type: "function_call_output", call_id: call.call_id, output: "sunny" },
+      ]),
+    );
+    expect(second.status, second.text).toBe(200);
+    expectNoConverseId(second.text);
+    const forwarded = upstreamBody(upstream, 1).messages as Array<Record<string, any>>;
+    const assistant = forwarded.find((m) => m.role === "assistant");
+    const tool = forwarded.find((m) => m.role === "tool");
+    expect(assistant?.tool_calls?.[0]?.id).toBe(UPSTREAM_CONVERSE_TOOL_ID);
+    expect(tool?.tool_call_id).toBe(UPSTREAM_CONVERSE_TOOL_ID);
+    // The same upstream call comes back as the same call id.
+    expect(responsesFunctionCall(JSON.parse(second.text).output).call_id).toBe(call.call_id);
+
+    const streamed = await post("/v1/responses", turn("weather in Paris?", { stream: true }));
+    expect(streamed.status, streamed.text).toBe(200);
+    expectNoConverseId(streamed.text);
+    const events = sseEvents(streamed.text);
+    const added = events.find(
+      (e) => e.type === "response.output_item.added" && e.item?.type === "function_call",
+    );
+    expect(added?.item?.call_id).toBe(call.call_id);
+    const completed = events.find((e) => e.type === "response.completed");
+    expect(responsesFunctionCall(completed?.response?.output ?? []).call_id).toBe(call.call_id);
+  });
 });
 
 // ── A response id belongs to the tenant it was handed to ────────────────
@@ -764,7 +988,9 @@ describe("platform mode e2e: ids name no upstream channel, and tool use still ro
 // upstream account is shared, so an item or call id echoed back is resolved
 // against everything that account stored: echoed by another tenant, it must
 // reach the upstream as the opaque string that tenant sent, which names
-// nothing the upstream has.
+// nothing the upstream has. A reference to a stored item that is not the
+// caller's own id is refused outright, as a reference to another stored
+// object is.
 //
 // The same holds for every other object the shared account stores: a
 // container, a file, a vector store, a conversation, a stored prompt. A
@@ -1185,7 +1411,7 @@ describe("platform mode e2e: a response id continues only for the tenant it was 
     expect(up.otherGroup!.receivedRequests).toHaveLength(otherBefore + 1);
   });
 
-  test("an item id echoed by another tenant reaches the upstream as the opaque string it sent", async (ctx) => {
+  test("an item id echoed by another tenant is refused or reaches the upstream as the opaque string it sent", async (ctx) => {
     if (!etcdReachable || !tenantApp) return void ctx.skip();
     const upstream = up.items!;
     const model = TENANT_ALIASES.items;
@@ -1214,14 +1440,43 @@ describe("platform mode e2e: a response id continues only for the tenant it was 
           { type: "function_call_output", call_id: call.call_id, output: "sunny" },
         ],
       });
+    const refusedParam = (res: { status: number; text: string }) => {
+      expect(res.status, res.text).toBe(400);
+      return JSON.parse(res.text).error?.param;
+    };
 
+    // A reference resolves an item the shared account stored, so one that is
+    // not the caller's own seal is refused naming the field, never the id,
+    // and no upstream hears of it.
     const foreign = await echo(TENANT_KEYS.b);
-    expect(foreign.status, foreign.text).toBe(200);
+    expect(refusedParam(foreign)).toBe("input[0].id");
+    expect(foreign.text).not.toContain(message.id);
+    expect(upstream.receivedRequests).toHaveLength(1);
+    // So is the upstream's own id, which no tenant is ever handed.
+    const bare = await postAs(TENANT_KEYS.a, "/v1/responses", {
+      model,
+      input: [
+        { role: "user", content: "and tomorrow?" },
+        { id: "msg_bdrk_i01" },
+      ],
+    });
+    expect(refusedParam(bare)).toBe("input[1].id");
+    expect(upstream.receivedRequests).toHaveLength(1);
+
+    // A call or item id that is no reference still travels as the opaque
+    // string another tenant sent.
+    const foreignCall = await postAs(TENANT_KEYS.b, "/v1/responses", {
+      model,
+      input: [
+        { type: "function_call", id: call.id, call_id: call.call_id, name: "get_weather", arguments: "{}" },
+        { type: "function_call_output", call_id: call.call_id, output: "sunny" },
+      ],
+    });
+    expect(foreignCall.status, foreignCall.text).toBe(200);
     expect(upstream.receivedRequests).toHaveLength(2);
     const sentForB = upstreamBody(upstream, 1);
-    expect(sentForB.input[0].id).toBe(message.id);
-    expect(sentForB.input[1].id).toBe(call.id);
-    expect(sentForB.input[2].call_id).toBe(call.call_id);
+    expect(sentForB.input[0].id).toBe(call.id);
+    expect(sentForB.input[1].call_id).toBe(call.call_id);
     for (const original of ["msg_bdrk_i01", "fc_bdrk_i01", "call_bdrk_i01"]) {
       expect(upstream.receivedRequests[1]!.body, `tenant B's request names ${original}`).not.toContain(
         original,

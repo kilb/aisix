@@ -198,6 +198,16 @@
         "null"
       ]
     },
+    "allowed_endpoints": {
+      "description": "Endpoint families this key may call. When set, a request to a route outside the listed families is refused with `403` and error type `permission_denied` before it reaches any upstream. When omitted or set to `null`, the key may call every endpoint; an empty array refuses every endpoint.\n\nThe families and the routes each covers: `chat_completions` (`/v1/chat/completions`), `completions` (`/v1/completions`), `embeddings` (`/v1/embeddings`), `messages` (`/v1/messages`), `count_tokens` (`/v1/messages/count_tokens`), `responses` (`/v1/responses`), `models` (`/v1/models` and `/v1/models/{id}`), `images` (`/v1/images/generations` and `/v1/images/edits`), `audio` (`/v1/audio/transcriptions`, `/v1/audio/translations` and `/v1/audio/speech`), `videos` (`/v1/videos` and the routes under it), `rerank` (`/v1/rerank`), `decisions` (`/v1/decisions` and `/v1/systemone`), `realtime` (`/v1/realtime`), `files` (`/v1/files` and the routes under it), `batches` (`/v1/batches` and the routes under it), `fine_tuning` (`/v1/fine_tuning/jobs` and the routes under it), `mcp` (`/mcp`, `/mcp/{server}`, `/mcp/{server}/oauth/credential`, and `/mcp/{server}/oauth/token` when MCP sign-in authenticates the token request with this key), `a2a` (`/a2a/{agent}` and its agent card), and `passthrough` (every passthrough route, whether it matched by path prefix or by host).\n\nWithin the families it may call, the key's other grants still apply: `allowed_models`, `allowed_routes`, `allowed_agents` and `mcp_access`. Health checks, OAuth discovery documents and the MCP sign-in pages take no API key and are not affected. A user whose sign-in to an MCP server maps to this key cannot sign in, and a session issued earlier is refused, while the list leaves out `mcp`. When this key is the principal of anonymous MCP access or of an anonymous passthrough route and the list leaves out that family, the anonymous entry is closed and answers `401`. A family name this gateway version does not recognize grants nothing.",
+      "items": {
+        "type": "string"
+      },
+      "type": [
+        "array",
+        "null"
+      ]
+    },
     "allowed_model_ids": {
       "description": "Models this key may use, named by resource id rather than by name, so renaming a model does not change what this key may reach. Present — including as an empty array — it is authoritative and `allowed_models` is ignored; each id is resolved against the current models in the snapshot and the resolved name is matched with the same `*` glob rule. An id naming a wildcard model therefore grants every name that model's pattern covers — including a name an exact-match model of its own serves, which is how the name form behaves too. An id matching no model grants nothing.\n\nSet to `null` it means the same as omitted: the key falls back to `allowed_models`. A producer must therefore write `[]`, never `null`, for a key that is meant to grant no model — the two are opposite grants, and an empty list is the one that is authoritative.",
       "items": {

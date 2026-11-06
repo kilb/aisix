@@ -250,6 +250,18 @@ pub(crate) fn anonymous_entry(
             .record_auth_decision("anonymous", false, "principal_expired");
         return None;
     }
+    // A principal whose `allowed_endpoints` leaves out MCP closes the entry
+    // the same way, rather than answering a prober with a 403 that says
+    // anonymous access is configured.
+    if !entry
+        .value
+        .can_call(aisix_core::models::EndpointFamily::Mcp)
+    {
+        state
+            .metrics
+            .record_auth_decision("anonymous", false, "principal_endpoint_forbidden");
+        return None;
+    }
     state.metrics.record_auth_decision("anonymous", true, "");
     Some(AnonymousEntry {
         auth: crate::auth::AuthenticatedKey::new(snapshot, entry, None, true),

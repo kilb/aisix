@@ -693,6 +693,7 @@ pub(crate) fn attempt_reached_upstream(err: &ProxyError) -> bool {
         | ProxyError::ModelIpRestricted(_)
         | ProxyError::RouteIpRestricted(_)
         | ProxyError::RouteForbidden(_)
+        | ProxyError::EndpointForbidden(_)
         | ProxyError::InvalidRequest(_)
         | ProxyError::UnusableTarget(_)
         | ProxyError::TargetRefused(_)

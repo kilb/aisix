@@ -103,10 +103,10 @@ fn cache_policy_corpus() {
                 false,
                 json!({"name": "k", "applies_to_model_id": ""}),
             ),
-            // CachePolicy has no deny_unknown_fields → forward-compat fields tolerated.
+            // Closed on write; the lenient read schema still tolerates it.
             (
-                "unknown field tolerated",
-                true,
+                "unknown field refused on write",
+                false,
                 json!({"name": "future", "backend": "memory", "future_knob": "ignored"}),
             ),
             ("missing required name", false, json!({"backend": "memory"})),
@@ -905,9 +905,14 @@ fn guardrail_attachment_corpus() {
                 json!({"guardrail_id": "gid", "scope_type": "api_key", "priority": 1}),
             ),
             (
-                "extra field tolerated (open)",
+                "env_id accepted (declared)",
                 true,
                 json!({"guardrail_id": "gid", "scope_type": "env", "priority": 1, "env_id": "e1"}),
+            ),
+            (
+                "unknown field refused on write",
+                false,
+                json!({"guardrail_id": "gid", "scope_type": "env", "priority": 1, "future_knob": 1}),
             ),
             (
                 "missing guardrail_id",
@@ -1079,6 +1084,7 @@ const EXTRA_RELAXATIONS: &[(&str, &[&str])] = &[
         "api_key",
         &[
             "/allOf",
+            "/definitions/EndpointFamily",
             "/definitions/McpAccess/allOf",
             "/definitions/McpAccess/required",
             "/definitions/McpToolRef/properties/server_id/default",
@@ -1086,6 +1092,8 @@ const EXTRA_RELAXATIONS: &[(&str, &[&str])] = &[
             "/definitions/McpToolRef/properties/tool/default",
             "/definitions/McpToolRef/properties/tool/minLength",
             "/definitions/McpToolRef/required",
+            "/properties/allowed_endpoints/items/$ref",
+            "/properties/allowed_endpoints/items/type",
             "/properties/tags/additionalProperties/maxLength",
             "/properties/tags/additionalProperties/minLength",
             "/properties/tags/maxProperties",
@@ -1773,25 +1781,24 @@ const UNKNOWN_FIELD_TOLERANCE: &[Probe] = &[
         pointer: "",
         document: || json!({"fail_mode": "closed", "closed_grace_seconds": 300}),
     },
-];
-
-/// The two resources whose write contract closes NOTHING — not the root, not
-/// a nested object — so no document can separate their strict and lenient
-/// files. They are checked in the opposite direction: the strict file must
-/// still accept the unknown field. The day one of them closes, that assertion
-/// fails and it moves into the table above.
-const OPEN_ON_WRITE: &[Probe] = &[
+    Probe {
+        resource: "cache_policy",
+        pointer: "/semantic",
+        document: || json!({"name": "c", "semantic": {"embedding_model": "e", "threshold": 0.9}}),
+    },
     Probe {
         resource: "guardrail_attachment",
         pointer: "",
         document: || json!({"guardrail_id": "gid", "scope_type": "env", "priority": 1}),
     },
-    Probe {
-        resource: "cache_policy",
-        pointer: "",
-        document: || json!({"name": "c"}),
-    },
 ];
+
+/// The resources whose write contract closes NOTHING — not the root, not a
+/// nested object — so no document can separate their strict and lenient
+/// files. They are checked in the opposite direction: the strict file must
+/// still accept the unknown field. The day one of them closes, that assertion
+/// fails and it moves into the table above. None today.
+const OPEN_ON_WRITE: &[Probe] = &[];
 
 /// The field name every probe inserts. Long and unmistakable so a failure
 /// message says which key the schema tripped over.

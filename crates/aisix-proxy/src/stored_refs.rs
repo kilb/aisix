@@ -89,7 +89,9 @@
 //!
 //! - Ids the gateway seals and binds, already handled elsewhere:
 //!   `previous_response_id`, and the item, call and approval ids of
-//!   `input[]`.
+//!   `input[]`. An `item_reference` whose id is not the tenant's own seal is
+//!   refused there, as `input[i].id`
+//!   (`responses_affinity::ContextAffinity::refuse_unopened_item_reference`).
 //! - What an earlier answer cites and a client echoes back as history: a
 //!   `file_search_call`'s results, and the file and container citations in
 //!   an `output_text`'s annotations. Neither puts an object in the model's

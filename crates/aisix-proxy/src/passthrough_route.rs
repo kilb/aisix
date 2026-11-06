@@ -548,6 +548,15 @@ async fn dispatch(
     .await
     .map_err(RouteError::pre_auth)?;
 
+    // The key's endpoint allow-list, in every `auth_mode`. A route matched by
+    // host can carry any path, so its family is `passthrough`, never the one
+    // its path would name on the gateway's own API.
+    crate::endpoint_acl::check_endpoint(
+        auth.key(),
+        aisix_core::models::EndpointFamily::Passthrough,
+    )
+    .map_err(|err| RouteError::of(err, &auth))?;
+
     // Route ACL: explicit grant, mirroring allowed_agents.
     if !auth.key().can_access_route(&route.name) {
         return Err(RouteError::of(
@@ -1454,6 +1463,21 @@ async fn authenticate(
             }
             if entry.value.expires_at.is_some() && entry.value.is_expired_at(chrono::Utc::now()) {
                 return Err(ProxyError::ApiKeyExpired);
+            }
+            // A principal whose `allowed_endpoints` leaves out passthrough
+            // closes the route the way anonymous MCP access closes: the
+            // caller is answered as on a route that takes a credential, not
+            // with a refusal of an API key it never sent.
+            if !entry
+                .value
+                .can_call(aisix_core::models::EndpointFamily::Passthrough)
+            {
+                state.metrics.record_auth_decision(
+                    "anonymous",
+                    false,
+                    "principal_endpoint_forbidden",
+                );
+                return Err(ProxyError::MissingAuth(crate::auth::AUTHORIZATION_LABEL));
             }
             state.metrics.record_auth_decision("anonymous", true, "");
             let authed = AuthenticatedKey::new(snapshot, entry, None, true);
@@ -8102,6 +8126,163 @@ mod tests {
             assert_eq!(sent, 0, "the request reached the upstream");
             assert!(!body.contains("grp-"), "{body}");
             assert!(!body.contains("pk-tunnel"), "{body}");
+        }
+    }
+
+    /// A key whose `allowed_endpoints` leaves out `passthrough` is refused on
+    /// a route it is granted, by path or by host, before the upstream hears
+    /// of it. A host-matched request whose path is a typed route's answers
+    /// to `passthrough`, not to the family that path would name.
+    #[tokio::test]
+    async fn a_granted_route_is_refused_to_a_key_whose_endpoints_leave_out_passthrough() {
+        async fn status(
+            endpoints: serde_json::Value,
+            by_host: bool,
+        ) -> (StatusCode, usize, String) {
+            let upstream = MockServer::builder().start().await;
+            Mock::given(wm_method("POST"))
+                .and(wm_path("/v1/chat/completions"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({"routed": "up"})),
+                )
+                .mount(&upstream)
+                .await;
+            let snap = AisixSnapshot::new();
+            snap.provider_keys
+                .insert(provider_key_entry("http://unused"));
+            let key: ApiKey = serde_json::from_value(serde_json::json!({
+                "key_hash": ApiKey::hash_bearer("sk-caller"),
+                "allowed_models": ["*"], "allowed_routes": ["*"],
+                "allowed_endpoints": endpoints,
+            }))
+            .unwrap();
+            snap.apikeys.insert(ResourceEntry::new("k-1", key, 1));
+            snap.passthrough_routes.insert(if by_host {
+                route_entry(
+                    "route-h",
+                    serde_json::json!({
+                        "name": "host-tunnel",
+                        "hosts": ["ai.example.com"],
+                        "target_url": upstream.uri(),
+                        "provider_key_id": PK_ID
+                    }),
+                )
+            } else {
+                inject_route(&upstream.uri())
+            });
+            let uri = if by_host {
+                "/v1/chat/completions"
+            } else {
+                "/passthrough/openai/v1/chat/completions"
+            };
+            let resp = build_app(snap)
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header("host", "ai.example.com")
+                        .header("authorization", "Bearer sk-caller")
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(r#"{"model":"gpt-4o"}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let code = resp.status();
+            let body = to_bytes(resp.into_body(), 65536).await.unwrap();
+            let sent = upstream.received_requests().await.unwrap().len();
+            (code, sent, String::from_utf8_lossy(&body).into_owned())
+        }
+
+        for by_host in [false, true] {
+            for allowed in [serde_json::json!(null), serde_json::json!(["passthrough"])] {
+                let (code, sent, body) = status(allowed.clone(), by_host).await;
+                assert_eq!(code, StatusCode::OK, "{allowed} by_host={by_host}: {body}");
+                assert_eq!(sent, 1);
+            }
+            // `chat_completions` is what a host-matched path would name.
+            for refused in [
+                serde_json::json!(["chat_completions"]),
+                serde_json::json!([]),
+            ] {
+                let (code, sent, body) = status(refused.clone(), by_host).await;
+                assert_eq!(
+                    code,
+                    StatusCode::FORBIDDEN,
+                    "{refused} by_host={by_host}: {body}"
+                );
+                assert_eq!(sent, 0, "the request reached the upstream");
+                let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(v["error"]["type"], "permission_denied");
+                assert_eq!(
+                    v["error"]["message"],
+                    "API key is not allowed to call this endpoint."
+                );
+            }
+        }
+    }
+
+    /// An anonymous route whose bound principal's `allowed_endpoints` leaves
+    /// out `passthrough` closes, answering an uncredentialed caller 401 as a
+    /// route open to nobody anonymously would, rather than with a 403 about
+    /// an API key the caller never sent.
+    #[tokio::test]
+    async fn an_anonymous_route_closes_when_its_principal_may_not_call_passthrough() {
+        async fn status(endpoints: serde_json::Value) -> (StatusCode, usize) {
+            let upstream = MockServer::builder().start().await;
+            Mock::given(wm_method("GET"))
+                .and(wm_path("/x"))
+                .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+                .mount(&upstream)
+                .await;
+            let snap = AisixSnapshot::new();
+            let key: ApiKey = serde_json::from_value(serde_json::json!({
+                "key_hash": ApiKey::hash_bearer("sk-anon"),
+                "allowed_models": ["*"], "allowed_routes": ["*"],
+                "allowed_endpoints": endpoints,
+            }))
+            .unwrap();
+            snap.apikeys.insert(ResourceEntry::new("k-1", key, 1));
+            snap.passthrough_routes.insert(route_entry(
+                "route-a",
+                serde_json::json!({
+                    "name": "anon",
+                    "path_prefix": "/anon",
+                    "target_url": upstream.uri(),
+                    "auth_mode": "anonymous",
+                    "anonymous_key_id": "k-1",
+                    "source_cidrs": ["10.0.0.0/8"],
+                    "credential_mode": "forward_client"
+                }),
+            ));
+            let mut req = Request::builder()
+                .method("GET")
+                .uri("/anon/x")
+                .body(axum::body::Body::empty())
+                .unwrap();
+            req.extensions_mut()
+                .insert(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+                    [10, 1, 2, 3],
+                    40000,
+                ))));
+            let code = build_app(snap).oneshot(req).await.unwrap().status();
+            (code, upstream.received_requests().await.unwrap().len())
+        }
+
+        assert_eq!(
+            status(serde_json::json!(["passthrough"])).await,
+            (StatusCode::OK, 1)
+        );
+        assert_eq!(status(serde_json::json!(null)).await, (StatusCode::OK, 1));
+        for refused in [
+            serde_json::json!(["chat_completions"]),
+            serde_json::json!([]),
+        ] {
+            assert_eq!(
+                status(refused.clone()).await,
+                (StatusCode::UNAUTHORIZED, 0),
+                "{refused}"
+            );
         }
     }
 

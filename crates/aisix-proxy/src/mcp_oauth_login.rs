@@ -679,7 +679,9 @@ fn denial_text(reason: &str) -> &'static str {
         "jwt_bound_claim_mismatch" => {
             "Your account does not meet this gateway's sign-in requirements."
         }
-        "mcp_acl_denied" => "Your account is not allowed to use this MCP server.",
+        "mcp_acl_denied" | "endpoint_forbidden" => {
+            "Your account is not allowed to use this MCP server."
+        }
         "key_disabled" | "key_expired" => {
             "The gateway access assigned to your account is disabled or has expired."
         }
@@ -1041,6 +1043,20 @@ fn session_principal(
         });
     }
     let identity = crate::jwt::resolve_identity(state, snapshot, provider, claims)?;
+    // The key's endpoint allow-list. Here, so a key that may not call MCP
+    // neither signs anyone in (no upstream credential is stored for it) nor
+    // keeps a session it was given before its list changed.
+    if let Err(error) = crate::endpoint_acl::check_endpoint(
+        &identity.entry.value,
+        aisix_core::models::EndpointFamily::Mcp,
+    ) {
+        return Err(crate::jwt::IdentityDenial {
+            reason: "endpoint_forbidden",
+            subject: Some(identity.subject),
+            claim_mapping: identity.claim_mapping,
+            error,
+        });
+    }
     let auth = AuthenticatedKey::for_jwt(
         snapshot,
         identity.entry,

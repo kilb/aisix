@@ -45,7 +45,7 @@ resource closes them — is rejected on those paths. They are generated
 from the same producers the in-repo strict validators compile, so the
 published files and the gateway's own validators cannot drift.
 
-Four top-level resources intentionally **omit**
+Two top-level resources intentionally **omit**
 `additionalProperties: false` even on the write contract (the list is
 `closes_on_write` in `crates/aisix-core/src/models/schema.rs`):
 
@@ -53,8 +53,6 @@ Four top-level resources intentionally **omit**
   serde's `flatten + tag` pattern, which is incompatible with a strict
   outer deny; strict typo-rejection happens earlier via
   `aisix-core::models::schema::validate_guardrail`.
-- `cache_policy.schema.json` — historically open on write as well.
-- `guardrail_attachment.schema.json` — likewise.
 - `observability_exporter.schema.json` — the top level is open, but the
   per-`kind` branches stay closed on the write path, so a misspelled
   field is rejected rather than dropped. On the read path they open like
@@ -76,7 +74,8 @@ the unknown fields ignored and reported as partially compatible on
 `aisix_config_partially_compatible_resources` metric. This keeps an
 older gateway serving documents written by a newer control plane. Every
 other constraint in these files — types, required fields, ranges, closed
-enum value sets — applies on both paths.
+enum value sets — applies on both paths, except where `resources-lenient/`
+below lists a relaxation.
 
 That read contract is published too, as `resources-lenient/` — see below.
 
@@ -113,7 +112,7 @@ so a consumer that models the lenient set as "the strict set with
 | resource | additionally relaxed on read |
 | --- | --- |
 | `a2a_agent` | the URL policy is not enforced: `format`, the HTTP(S) `pattern`, and the credential-query `not` are write-path checks, because A2A rows shipped before the policy did; the loader reports a stored URL that breaks it as `legacy:url_policy` |
-| `api_key` | `McpAccess.allow` is not required; an `McpToolRef` entry needs neither half, and neither has to be non-empty; the write-path guards requiring `deny` beside `deny_ids` and `mcp_rate_limits` beside `mcp_rate_limits_by_id` are absent; the `tags` limits are absent (see `team`) |
+| `api_key` | `McpAccess.allow` is not required; an `McpToolRef` entry needs neither half, and neither has to be non-empty; the write-path guards requiring `deny` beside `deny_ids` and `mcp_rate_limits` beside `mcp_rate_limits_by_id` are absent; the `tags` limits are absent (see `team`); an `allowed_endpoints` entry is any string, and the `EndpointFamily` enum the write path checks it against is not in the file, so a family a later release adds loads as one that grants nothing instead of taking the key row down |
 | `guardrail` | the `semantic` kind requires neither an embedding model (under either spelling) nor a threshold beside each example list; Bedrock `aws_credentials` may carry `external_id` or `role_session_name` without `role_arn` (unused without it) |
 | `mcp_policy` | `allow` is not required; the `McpToolRef` relaxations above apply here too, as does the absent `deny`-beside-`deny_ids` guard (its team-scope guard is on both sets) |
 | `mcp_server` | the label pattern (`name`, and its former spelling `display_name`) still forbids `__` and a trailing `_`, but not a `*` |
@@ -172,7 +171,8 @@ The exact paths at which the two sets diverge are pinned by
 divergence — or a change to one of these — has to be registered before
 the suite goes green. Everything else is identical: field names, types,
 ranges, enum value sets, the `$ref`/`definitions` layout, and the
-`if`/`then`/`oneOf` structure.
+`if`/`then`/`oneOf` structure, with the one exception of `api_key`'s
+`allowed_endpoints` items in the table above.
 
 ### Two gates sit behind the lenient schema
 

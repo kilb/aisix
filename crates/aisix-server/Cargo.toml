@@ -56,6 +56,8 @@ async-trait.workspace = true
 base64.workspace = true
 rcgen.workspace = true
 uuid.workspace = true
+# Spreads the usage sender's re-send waits.
+rand.workspace = true
 hostname.workspace = true
 x509-parser = "0.16"
 # `SO_REUSEPORT` for the thread-per-core proxy listeners. `all` is

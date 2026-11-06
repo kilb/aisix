@@ -203,6 +203,43 @@ pub struct ApiKey {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed_routes: Option<Vec<String>>,
 
+    /// Endpoint families this key may call. When set, a request to a route
+    /// outside the listed families is refused with `403` and error type
+    /// `permission_denied` before it reaches any upstream. When omitted or
+    /// set to `null`, the key may call every endpoint; an empty array refuses
+    /// every endpoint.
+    ///
+    /// The families and the routes each covers: `chat_completions`
+    /// (`/v1/chat/completions`), `completions` (`/v1/completions`),
+    /// `embeddings` (`/v1/embeddings`), `messages` (`/v1/messages`),
+    /// `count_tokens` (`/v1/messages/count_tokens`), `responses`
+    /// (`/v1/responses`), `models` (`/v1/models` and `/v1/models/{id}`),
+    /// `images` (`/v1/images/generations` and `/v1/images/edits`), `audio`
+    /// (`/v1/audio/transcriptions`, `/v1/audio/translations` and
+    /// `/v1/audio/speech`), `videos` (`/v1/videos` and the routes under it),
+    /// `rerank` (`/v1/rerank`), `decisions` (`/v1/decisions` and
+    /// `/v1/systemone`), `realtime` (`/v1/realtime`), `files` (`/v1/files`
+    /// and the routes under it), `batches` (`/v1/batches` and the routes
+    /// under it), `fine_tuning` (`/v1/fine_tuning/jobs` and the routes under
+    /// it), `mcp` (`/mcp`, `/mcp/{server}`, `/mcp/{server}/oauth/credential`,
+    /// and `/mcp/{server}/oauth/token` when MCP sign-in authenticates the
+    /// token request with this key), `a2a` (`/a2a/{agent}` and its agent
+    /// card), and `passthrough` (every passthrough route, whether it matched
+    /// by path prefix or by host).
+    ///
+    /// Within the families it may call, the key's other grants still apply:
+    /// `allowed_models`, `allowed_routes`, `allowed_agents` and `mcp_access`.
+    /// Health checks, OAuth discovery documents and the MCP sign-in pages
+    /// take no API key and are not affected. A user whose sign-in to an MCP
+    /// server maps to this key cannot sign in, and a session issued earlier
+    /// is refused, while the list leaves out `mcp`. When this key is the
+    /// principal of anonymous MCP access or of an anonymous passthrough route
+    /// and the list leaves out that family, the anonymous entry is closed and
+    /// answers `401`. A family name this gateway version does not recognize
+    /// grants nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_endpoints: Option<Vec<EndpointFamily>>,
+
     /// RFC 3339 timestamp after which the key stops authenticating.
     /// Requests presenting an expired key are rejected with `401`.
     /// When omitted or set to `null`, the key never expires.
@@ -218,6 +255,50 @@ pub struct ApiKey {
     /// etcd-key uuid. Filled by the loader and never included in the JSON payload.
     #[serde(skip)]
     pub(crate) runtime_id: String,
+}
+
+/// A family of client-facing endpoints an API key can be limited to with
+/// `allowed_endpoints`, which lists the routes each family covers.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum EndpointFamily {
+    ChatCompletions,
+    Completions,
+    Embeddings,
+    Messages,
+    CountTokens,
+    Responses,
+    Models,
+    Images,
+    Audio,
+    Videos,
+    Rerank,
+    Decisions,
+    Realtime,
+    Files,
+    Batches,
+    FineTuning,
+    Mcp,
+    A2a,
+    Passthrough,
+    /// Any name this build does not know, such as a family a later release
+    /// added. Never written (the write schema does not list it) and never
+    /// matched by a route, so an entry that loads as this grants nothing.
+    #[serde(other)]
+    #[schemars(skip)]
+    Unknown,
 }
 
 impl ApiKey {
@@ -363,6 +444,22 @@ impl ApiKey {
         }
     }
 
+    /// True if this key may call endpoints of `family`.
+    ///
+    /// **The single chokepoint for the key→endpoint ACL**: every route the
+    /// proxy serves asks this before it does anything on the key's behalf.
+    /// A key without `allowed_endpoints` may call every family; one with it
+    /// may call exactly the families listed, so an empty list grants none.
+    /// An entry this build does not know loads as
+    /// [`EndpointFamily::Unknown`] and grants nothing, which keeps a list
+    /// written for a newer release restrictive here rather than open.
+    pub fn can_call(&self, family: EndpointFamily) -> bool {
+        match &self.allowed_endpoints {
+            None => true,
+            Some(listed) => family != EndpointFamily::Unknown && listed.contains(&family),
+        }
+    }
+
     /// Iterate over the names of models this key may access, filtering them
     /// against a known universe of model names. Delegates to [`Self::can_access`]
     /// so the listing can never advertise a name the request path would
@@ -490,6 +587,7 @@ mod tests {
             jwt_provider: None,
             mcp_access: None,
             allowed_routes: None,
+            allowed_endpoints: None,
             mcp_rate_limits: None,
             mcp_rate_limits_by_id: None,
             allowed_agents: None,
@@ -1007,6 +1105,131 @@ mod tests {
         .unwrap();
         let v = serde_json::to_value(&k).unwrap();
         assert!(v["mcp_rate_limits_by_id"]["s-1"].is_object());
+    }
+
+    /// The family names the write schema accepts, each parsed into the family
+    /// it names.
+    fn written_families() -> Vec<(String, EndpointFamily)> {
+        let strict = crate::models::schema::apikey_root_schema(true);
+        let names = strict
+            .pointer("/definitions/EndpointFamily/enum")
+            .and_then(serde_json::Value::as_array)
+            .expect("the write schema closes the family enum")
+            .clone();
+        names
+            .into_iter()
+            .map(|name| {
+                let family: EndpointFamily = serde_json::from_value(name.clone()).unwrap();
+                (name.as_str().unwrap().to_owned(), family)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn an_unknown_family_is_refused_on_write_and_loads_granting_nothing() {
+        use crate::models::schema::{validate_apikey, validate_apikey_lenient};
+        let doc = serde_json::json!({
+            "key_hash": "x",
+            "allowed_endpoints": ["chat_completions", "video_editing_v9"],
+        });
+        assert!(validate_apikey(&doc).is_err());
+        assert!(validate_apikey_lenient(&doc).is_ok());
+        let k: ApiKey = serde_json::from_value(doc).unwrap();
+        assert!(k.can_call(EndpointFamily::ChatCompletions) && !k.can_call(EndpointFamily::Images));
+    }
+
+    /// Fail closed, never open: a list naming only families this build does
+    /// not know still restricts the key, to nothing at all.
+    #[test]
+    fn a_list_of_only_unknown_families_grants_nothing() {
+        use crate::models::schema::{validate_apikey, validate_apikey_lenient};
+        let doc = serde_json::json!({"key_hash": "x", "allowed_endpoints": ["video_editing_v9"]});
+        validate_apikey_lenient(&doc).unwrap();
+        let k: ApiKey = serde_json::from_value(doc).unwrap();
+        for (name, family) in written_families() {
+            assert!(!k.can_call(family), "{name} must be refused");
+        }
+
+        // The catch-all's own spelling is no grant either, and never written.
+        let spelled = serde_json::json!({"key_hash": "x", "allowed_endpoints": ["unknown"]});
+        assert!(validate_apikey(&spelled).is_err());
+        let k: ApiKey = serde_json::from_value(spelled).unwrap();
+        assert!(!k.can_call(EndpointFamily::Unknown));
+        assert!(!k.can_call(EndpointFamily::Models));
+    }
+
+    #[test]
+    fn allowed_endpoints_round_trips_and_is_omitted_when_unset() {
+        use crate::models::schema::validate_apikey;
+        // Unset: every family, and nothing on the wire.
+        let unset = sample();
+        assert!(unset.allowed_endpoints.is_none());
+        for (name, family) in written_families() {
+            assert!(unset.can_call(family), "{name}");
+        }
+        assert!(serde_json::to_value(&unset)
+            .unwrap()
+            .get("allowed_endpoints")
+            .is_none());
+
+        // `null` means the same as omitted.
+        let null = serde_json::json!({"key_hash": "h", "allowed_endpoints": null});
+        validate_apikey(&null).unwrap();
+        let k: ApiKey = serde_json::from_value(null).unwrap();
+        assert!(k.allowed_endpoints.is_none());
+
+        let names = serde_json::json!(["chat_completions", "count_tokens", "fine_tuning", "a2a"]);
+        let doc = serde_json::json!({"key_hash": "h", "allowed_endpoints": names});
+        validate_apikey(&doc).unwrap();
+        let k: ApiKey = serde_json::from_value(doc).unwrap();
+        assert_eq!(
+            k.allowed_endpoints,
+            Some(vec![
+                EndpointFamily::ChatCompletions,
+                EndpointFamily::CountTokens,
+                EndpointFamily::FineTuning,
+                EndpointFamily::A2a,
+            ])
+        );
+        assert_eq!(
+            serde_json::to_value(&k).unwrap()["allowed_endpoints"],
+            names
+        );
+        assert!(k.can_call(EndpointFamily::CountTokens));
+        assert!(!k.can_call(EndpointFamily::Messages));
+
+        // An empty list is present, stays on the wire, and refuses everything.
+        let empty: ApiKey =
+            serde_json::from_str(r#"{"key_hash":"h","allowed_endpoints":[]}"#).unwrap();
+        assert_eq!(
+            serde_json::to_value(&empty).unwrap()["allowed_endpoints"],
+            serde_json::json!([])
+        );
+        for (name, family) in written_families() {
+            assert!(!empty.can_call(family), "{name}");
+        }
+    }
+
+    /// The write schema names every family exactly once, each spelled as
+    /// serde writes it, and never the catch-all; the read schema takes any
+    /// string, so a family a later release adds cannot cost an older one
+    /// the whole key row.
+    #[test]
+    fn the_write_schema_closes_the_families_and_the_read_schema_takes_any_name() {
+        let written = written_families();
+        assert!(written.len() > 10, "{written:?}");
+        let mut seen = std::collections::HashSet::new();
+        for (name, family) in &written {
+            assert_ne!(*family, EndpointFamily::Unknown, "{name}");
+            assert_eq!(serde_json::to_value(family).unwrap(), *name);
+            assert!(seen.insert(*family), "{name} listed twice");
+        }
+
+        let lenient = crate::models::schema::resource_root_schema("api_key", false);
+        assert_eq!(
+            lenient.pointer("/properties/allowed_endpoints/items"),
+            Some(&serde_json::json!({"type": "string"}))
+        );
     }
 
     #[test]

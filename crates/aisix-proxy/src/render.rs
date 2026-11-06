@@ -370,7 +370,11 @@ pub fn render_response(
         if let (Some(p), Some(serde_json::Value::Array(calls))) =
             (platform, message.extra.get_mut("tool_calls"))
         {
-            crate::opaque_id::map_tool_calls(&p.id_key, crate::opaque_id::Surface::Chat, calls);
+            crate::opaque_id::map_tool_calls(
+                p.tool_id_key(),
+                crate::opaque_id::Surface::Chat,
+                calls,
+            );
         }
         RenderedMessage::from_message(message)
     };
@@ -415,7 +419,7 @@ pub fn render_chunk(
     platform: Option<&crate::platform::PlatformSettings>,
 ) -> ChatCompletionChunk {
     if let (Some(p), Some(calls)) = (platform, chunk.delta.tool_calls.as_mut()) {
-        crate::opaque_id::map_tool_calls(&p.id_key, crate::opaque_id::Surface::Chat, calls);
+        crate::opaque_id::map_tool_calls(p.tool_id_key(), crate::opaque_id::Surface::Chat, calls);
     }
     // A frame that carries only usage is the `include_usage` terminal
     // frame, which OpenAI sends with an empty `choices` array.
@@ -974,7 +978,7 @@ mod tests {
     fn platform_mode_maps_tool_call_ids_and_keeps_usage_to_the_openai_shape() {
         use crate::opaque_id::{map_tool_call_id, Surface};
         let platform = crate::platform::PlatformSettings::from_secret("s");
-        let mapped = map_tool_call_id(&platform.id_key, Surface::Chat, "toolu_bdrk_01Y");
+        let mapped = map_tool_call_id(platform.tool_id_key(), Surface::Chat, "toolu_bdrk_01Y");
         let calls = serde_json::json!([{"id": "toolu_bdrk_01Y", "type": "function",
             "function": {"name": "f", "arguments": "{}"}}]);
         let mut message = ChatMessage::assistant("");

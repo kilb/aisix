@@ -181,9 +181,9 @@ impl ListParams {
 /// Names the caller may put in a request's `model` field, sorted.
 ///
 /// Wildcard aliases (`provider/*`) are patterns rather than requestable
-/// ids, so they are the one exclusion. The same `allowed_models` ACL that
-/// authorizes a request decides what appears here, so the list never
-/// advertises a name the caller cannot then use.
+/// ids, so they are excluded. The same `allowed_models` ACL that authorizes
+/// a request decides what appears here, so the list never advertises a name
+/// the caller cannot then use; and so does [`listable`].
 fn permitted_model_names(
     snapshot: &aisix_core::AisixSnapshot,
     auth: &AuthenticatedKey,
@@ -192,7 +192,7 @@ fn permitted_model_names(
         .models
         .entries()
         .into_iter()
-        .filter(|e| !e.value.display_name.contains('*'))
+        .filter(|e| listable(&e.value, auth))
         .map(|e| e.value.display_name.clone())
         .collect();
     let mut names: Vec<String> = auth
@@ -210,6 +210,22 @@ fn permitted_model_names(
     // forever.
     names.dedup();
     names
+}
+
+/// Whether a model is a name this caller may be shown, before the
+/// `allowed_models` ACL: not a wildcard alias, and not an ensemble when the
+/// key is held to provider groups, since every request naming one is
+/// answered as a model that does not exist
+/// ([`crate::model_resolve::refuse_ensemble_to_grouped_key`]). Keys on the
+/// requested entry, the only identity a listing has.
+fn listable(model: &aisix_core::Model, auth: &AuthenticatedKey) -> bool {
+    !model.display_name.contains('*')
+        && crate::model_resolve::refuse_ensemble_to_grouped_key(
+            &model.display_name,
+            model,
+            &auth.key().allowed_provider_groups,
+        )
+        .is_ok()
 }
 
 /// `owned_by` for the OpenAI shape: the model's vendor when it has one.
@@ -407,7 +423,7 @@ fn model_retrieve(
     let known = snapshot
         .models
         .get_by_name(&id)
-        .is_some_and(|e| !e.value.display_name.contains('*'));
+        .is_some_and(|e| listable(&e.value, auth));
     if !known || !auth.key().can_access(&snapshot, &id) {
         return dialect_error(headers, ProxyError::ModelNotFound(id));
     }
@@ -1172,6 +1188,77 @@ mod tests {
             statuses,
             vec![StatusCode::NOT_FOUND, StatusCode::NOT_FOUND],
             "a forbidden model and a missing one must be indistinguishable",
+        );
+    }
+
+    /// A key held to provider groups is answered as if no ensemble existed,
+    /// so neither the list nor a retrieve names one to it; a key without
+    /// groups still sees it.
+    #[tokio::test]
+    async fn a_key_with_provider_groups_is_shown_no_ensemble() {
+        let snap = new_snap();
+        snap.models.insert(model_entry("m1", "gpt4"));
+        let ensemble: Model = serde_json::from_value(serde_json::json!({
+            "display_name": "panel",
+            "ensemble": {"panel": [{"model": "gpt4"}], "judge": {"model": "gpt4"}}
+        }))
+        .unwrap();
+        snap.models.insert(ResourceEntry::new("e1", ensemble, 1));
+        let grouped: ApiKey = serde_json::from_value(serde_json::json!({
+            "key_hash": ApiKey::hash_bearer("sk-grouped"),
+            "allowed_models": ["*"],
+            "allowed_provider_groups": ["grp-alpha"],
+        }))
+        .unwrap();
+        snap.apikeys.insert(ResourceEntry::new("key-g", grouped, 1));
+        snap.apikeys.insert(apikey_entry("sk-caller", &["*"]));
+        let app = build_app(snap);
+        let get = |key: &'static str, uri: String| {
+            let app = app.clone();
+            async move {
+                let req = Request::builder()
+                    .method("GET")
+                    .uri(uri)
+                    .header("authorization", format!("Bearer {key}"))
+                    .body(axum::body::Body::empty())
+                    .unwrap();
+                let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+                let status = resp.status();
+                let body = to_bytes(resp.into_body(), 65536).await.unwrap();
+                (status, String::from_utf8(body.to_vec()).unwrap())
+            }
+        };
+        let ids = |body: &str| -> Vec<String> {
+            serde_json::from_str::<serde_json::Value>(body).unwrap()["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|m| m["id"].as_str().unwrap().to_string())
+                .collect()
+        };
+
+        let (status, body) = get("sk-grouped", "/v1/models".into()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(ids(&body), ["gpt4"]);
+        let ensemble = get("sk-grouped", "/v1/models/panel".into()).await;
+        let missing = get("sk-grouped", "/v1/models/nothing-here".into()).await;
+        assert_eq!(ensemble.0, StatusCode::NOT_FOUND);
+        assert_eq!(
+            ensemble.1.replace("panel", "X"),
+            missing.1.replace("nothing-here", "X"),
+            "an ensemble reads as a model that does not exist"
+        );
+        assert_eq!(
+            get("sk-grouped", "/v1/models/gpt4".into()).await.0,
+            StatusCode::OK
+        );
+
+        // Without groups the ensemble is listed and retrieved, as before.
+        let (_, body) = get("sk-caller", "/v1/models".into()).await;
+        assert_eq!(ids(&body), ["gpt4", "panel"]);
+        assert_eq!(
+            get("sk-caller", "/v1/models/panel".into()).await.0,
+            StatusCode::OK
         );
     }
 }

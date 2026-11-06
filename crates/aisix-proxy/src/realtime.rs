@@ -722,6 +722,23 @@ async fn prepare(
     client: &ClientContext,
     auth: AuthenticatedKey,
 ) -> Result<Prepared, ProxyError> {
+    // The key's endpoint allow-list. Here rather than in `authenticate` so
+    // the refusal is attributed to the key, like every check after it, and
+    // named on the `aisix::auth` line as the extractor's refusals are.
+    let family = aisix_core::models::EndpointFamily::Realtime;
+    if let Err(err) = crate::endpoint_acl::check_endpoint(auth.key(), family) {
+        crate::auth::warn_endpoint_refused(
+            &auth.entry.id,
+            family,
+            crate::auth::DenialContext {
+                method: "GET",
+                path: "/v1/realtime",
+                request_id: &client.request_id,
+                source_ip: crate::auth::LazySourceIp::Ready(&client.source_ip),
+            },
+        );
+        return Err(err);
+    }
     let beta_realtime = client_requested_beta_realtime(headers);
     let requested_model = params
         .get("model")
@@ -3507,6 +3524,78 @@ mod tests {
             assert!(!text.contains("grp-"), "{text}");
             assert!(!text.contains("rt-pk"), "{text}");
         }
+    }
+
+    /// A key whose `allowed_endpoints` leaves out `realtime` opens no
+    /// session, whatever model it may use; one that lists it does.
+    #[tokio::test]
+    async fn a_key_opens_a_session_only_when_its_endpoints_list_realtime() {
+        async fn prepared(endpoints: serde_json::Value) -> Result<(), ProxyError> {
+            let handle = SnapshotHandle::new(snapshot("http://127.0.0.1:1/v1", "openai", "openai"));
+            let live = handle.load();
+            let state = crate::ProxyState::new(handle.clone(), Arc::new(Hub::new()), &cfg());
+            let key: aisix_core::ApiKey = serde_json::from_value(serde_json::json!({
+                "key_hash": "h", "allowed_models": ["*"], "allowed_endpoints": endpoints,
+            }))
+            .unwrap();
+            let auth = crate::auth::AuthenticatedKey::new(
+                &live,
+                Arc::new(ResourceEntry::new("k-1", key, 1)),
+                None,
+                false,
+            );
+            let params = HashMap::from([("model".to_string(), "rt-model".to_string())]);
+            let client = crate::client_ip::ClientContext::default();
+            super::prepare(&state, &live, &params, &HeaderMap::new(), &client, auth)
+                .await
+                .map(|_| ())
+        }
+
+        assert!(prepared(serde_json::json!(null)).await.is_ok());
+        assert!(prepared(serde_json::json!(["realtime"])).await.is_ok());
+        for endpoints in [
+            serde_json::json!(["chat_completions"]),
+            serde_json::json!([]),
+        ] {
+            let err = prepared(endpoints.clone()).await.unwrap_err();
+            assert!(
+                matches!(err, ProxyError::EndpointForbidden(_)),
+                "{endpoints}: {err:?}"
+            );
+        }
+    }
+
+    /// A realtime refusal names its key on the `aisix::auth` line, as the
+    /// extractor's refusal does on every other route.
+    #[tokio::test]
+    async fn a_realtime_refusal_names_its_key() {
+        let capture = crate::test_log::Capture::install();
+        let handle = SnapshotHandle::new(snapshot("http://127.0.0.1:1/v1", "openai", "openai"));
+        let live = handle.load();
+        let state = crate::ProxyState::new(handle.clone(), Arc::new(Hub::new()), &cfg());
+        let key: aisix_core::ApiKey = serde_json::from_value(serde_json::json!({
+            "key_hash": "h", "allowed_models": ["*"], "allowed_endpoints": ["chat_completions"],
+        }))
+        .unwrap();
+        let auth = crate::auth::AuthenticatedKey::new(
+            &live,
+            Arc::new(ResourceEntry::new("k-rt-refused", key, 1)),
+            None,
+            false,
+        );
+        let params = HashMap::from([("model".to_string(), "rt-model".to_string())]);
+        let client = crate::client_ip::ClientContext::default();
+        let refused =
+            super::prepare(&state, &live, &params, &HeaderMap::new(), &client, auth).await;
+        assert!(matches!(refused, Err(ProxyError::EndpointForbidden(_))));
+        let logs = capture.text();
+        assert!(
+            logs.contains(r#"reason="endpoint_forbidden""#),
+            "got: {logs}"
+        );
+        assert!(logs.contains("api_key_id=k-rt-refused"), "got: {logs}");
+        assert!(logs.contains("family=Realtime"), "got: {logs}");
+        assert!(logs.contains("path=/v1/realtime"), "got: {logs}");
     }
 
     /// 会话里从提示缓存读回来的 token 要按缓存费率计价，而不是全价输入。

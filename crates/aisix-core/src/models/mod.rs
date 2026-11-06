@@ -46,7 +46,7 @@ pub mod team;
 pub mod user;
 
 pub use a2a_agent::{A2aAgent, A2aAuthType, A2aProtocolVersion};
-pub use apikey::{ApiKey, McpServerLimit};
+pub use apikey::{ApiKey, EndpointFamily, McpServerLimit};
 pub use budget::{
     Budget, BudgetExhausted, BudgetFailMode, BudgetMemberExhausted, BudgetPeriod, BudgetPolicy,
     BudgetReason, BudgetScope, BudgetTag,
