@@ -22,7 +22,7 @@ use serde_json::{json, Value};
 
 use crate::auth::{MemberRole, OperatorRole};
 use crate::error::{ApiError, Detail};
-use crate::{audit, operators, AppState};
+use crate::{audit, operators, resources, AppState};
 
 /// The largest request body the browser listener reads.
 const MAX_BODY_BYTES: usize = 1 << 20;
@@ -64,6 +64,37 @@ pub const ROUTE_ROLES: &[(&str, &str, MinRole)] = &[
         MinRole::Op(OperatorRole::Admin),
     ),
     ("GET", "/admin/audit", MinRole::Op(OperatorRole::Viewer)),
+    // Gateway resources.
+    (
+        "GET",
+        "/admin/schemas/{resource}",
+        MinRole::Op(OperatorRole::Viewer),
+    ),
+    (
+        "GET",
+        "/admin/resources/{kind}",
+        MinRole::Op(OperatorRole::Viewer),
+    ),
+    (
+        "POST",
+        "/admin/resources/{kind}",
+        MinRole::Op(OperatorRole::Operator),
+    ),
+    (
+        "GET",
+        "/admin/resources/{kind}/{id}",
+        MinRole::Op(OperatorRole::Viewer),
+    ),
+    (
+        "PUT",
+        "/admin/resources/{kind}/{id}",
+        MinRole::Op(OperatorRole::Operator),
+    ),
+    (
+        "DELETE",
+        "/admin/resources/{kind}/{id}",
+        MinRole::Op(OperatorRole::Operator),
+    ),
 ];
 
 /// `/healthz` (no session), `/admin/*` and, as they are added, `/api/*`.
@@ -80,6 +111,17 @@ pub fn browser_router(state: AppState) -> Router {
         )
         .route("/admin/operators/{id}", patch(operators::update))
         .route("/admin/audit", get(audit::list))
+        .route("/admin/schemas/{resource}", get(resources::api::schema))
+        .route(
+            "/admin/resources/{kind}",
+            get(resources::api::list).post(resources::api::create),
+        )
+        .route(
+            "/admin/resources/{kind}/{id}",
+            get(resources::api::get)
+                .put(resources::api::replace)
+                .delete(resources::api::delete),
+        )
         .route_layer(axum::middleware::from_fn(only_listed_routes))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(state)

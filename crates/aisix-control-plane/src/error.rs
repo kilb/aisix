@@ -10,20 +10,14 @@ use serde::Serialize;
 use uuid::Uuid;
 
 use crate::db::DbError;
+/// A resource that still references the one a request tried to delete.
+pub use crate::resources::Referrer;
 
 /// One problem in a request, at a JSON path of its body.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Detail {
     pub path: String,
     pub message: String,
-}
-
-/// A resource that still references the one a request tried to delete.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct Referrer {
-    pub kind: String,
-    pub id: Uuid,
-    pub name: Option<String>,
 }
 
 /// An error answer of the HTTP API:
@@ -74,6 +68,10 @@ impl ApiError {
 
     pub fn not_found() -> ApiError {
         Self::new(StatusCode::NOT_FOUND, "not_found", "资源不存在")
+    }
+
+    pub fn unknown_kind() -> ApiError {
+        Self::new(StatusCode::NOT_FOUND, "unknown_kind", "不支持的资源类型")
     }
 
     pub fn validation(details: Vec<Detail>) -> ApiError {
@@ -242,7 +240,7 @@ mod tests {
     async fn the_envelope_carries_only_the_fields_an_error_has() {
         let id = Uuid::new_v4();
         let (status, body) = answer(ApiError::in_use(vec![Referrer {
-            kind: "models".to_string(),
+            kind: crate::resources::Kind::Models,
             id,
             name: Some("grp-alpha-7c1".to_string()),
         }]))
