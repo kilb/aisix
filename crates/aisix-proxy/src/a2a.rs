@@ -2032,7 +2032,15 @@ fn emit_a2a_usage(
         } else {
             call.text.request.as_str()
         };
-        CapturedContent::new(request, &response_text, cap as usize)
+        // A check that failed open, an answer relayed unread, or one released
+        // past its buffer cap: no guardrail read what went through, so the row
+        // keeps it out, as every route's row does.
+        let response = if event.guardrail_bypassed_reason.is_empty() {
+            response_text.as_str()
+        } else {
+            ""
+        };
+        CapturedContent::new(request, response, cap as usize)
     });
     crate::usage_attr::emit_usage(
         state,
@@ -2194,6 +2202,102 @@ mod tests {
                     "script {script}, agent {agent_status}: {sent}"
                 );
             }
+        }
+    }
+
+    /// An answer no guardrail read stays out of a full-content export: one a
+    /// check failed open on, sent whole or streamed, one the scan could not
+    /// read, and a stream released past its buffer cap. The check that ran is
+    /// the control: its answer is exported.
+    #[tokio::test]
+    async fn an_answer_no_guardrail_read_stays_off_the_export() {
+        const ANSWER: &str = "unread-a2a-answer-5d2e";
+        let script = |body: &str| {
+            serde_json::json!({
+                "name": "a2a-out", "enabled": true, "kind": "custom", "hook_point": "output",
+                "output_fail_open": true, "timeout_ms": 5000,
+                "script": format!("export function checkOutput() {{ {body} }}"),
+            })
+        };
+        let fails_open = script("throw new Error('x');");
+        let passes = script("return { action: 'none' };");
+        let reads_open = serde_json::json!({
+            "name": "a2a-out", "enabled": true, "kind": "keyword", "hook_point": "output",
+            "fail_open": true, "patterns": [{"kind": "literal", "value": "forbiddenword"}],
+        });
+        let cap_open = serde_json::json!({
+            "name": "a2a-out", "enabled": true, "kind": "azure_content_safety_text_moderation",
+            "hook_point": "output", "endpoint": "http://127.0.0.1:1", "api_key": "k",
+            "stream_processing_mode": "buffer_full", "max_buffer_bytes": 4,
+            "on_buffer_exceeded": "fail_open",
+        });
+        let answer = |extra: Option<serde_json::Value>| {
+            let mut parts = vec![serde_json::json!({"kind": "text", "text": ANSWER})];
+            parts.extend(extra);
+            serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": {
+                "kind": "message", "role": "agent", "parts": parts}})
+        };
+        for (row, method, message, exported) in [
+            (&fails_open, "message/send", answer(None), false),
+            (&fails_open, "message/stream", answer(None), false),
+            (
+                &reads_open,
+                "message/send",
+                answer(Some(unreadable_part())),
+                false,
+            ),
+            (&cap_open, "message/stream", answer(None), false),
+            (&passes, "message/send", answer(None), true),
+            (&passes, "message/stream", answer(None), true),
+        ] {
+            let agent = wiremock::MockServer::builder().start().await;
+            let reply = if method == "message/stream" {
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_raw(format!("data: {message}\n\n"), "text/event-stream")
+            } else {
+                wiremock::ResponseTemplate::new(200).set_body_json(&message)
+            };
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .respond_with(reply)
+                .mount(&agent)
+                .await;
+            let snap = snapshot_with(&agent.uri(), true, serde_json::json!(["*"]));
+            let guardrail: aisix_core::Guardrail = serde_json::from_value(row.clone()).unwrap();
+            crate::seed_env_scoped_guardrail(&snap, ResourceEntry::new("g-a2a", guardrail, 1));
+            let collector = crate::seed_full_content_collector(&snap).await;
+            let state = ProxyState::new(
+                SnapshotHandle::new(snap),
+                Arc::new(aisix_gateway::Hub::new()),
+                &proxy_cfg(),
+            )
+            .without_cache();
+            let response = build_router(state)
+                .oneshot(
+                    HttpRequest::post("/a2a/invoice")
+                        .header("host", "gw.example.com")
+                        .header("content-type", "application/json")
+                        .header("authorization", format!("Bearer {TOKEN}"))
+                        .body(Body::from(
+                            serde_json::json!({
+                                "jsonrpc": "2.0", "id": 1, "method": method,
+                                "params": {"message": {"role": "user", "parts": [
+                                    {"kind": "text", "text": "hi"}]}}
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .expect("router responds");
+            let (parts, body) = response.into_parts();
+            let wire = axum::body::to_bytes(body, 1 << 20).await.unwrap();
+            assert!(
+                String::from_utf8_lossy(&wire).contains(ANSWER),
+                "premise: the caller gets the answer: {row} {method}"
+            );
+            let head = axum::response::Response::from_parts(parts, Body::empty());
+            let sent = crate::exported_for(&collector, &head).await;
+            assert_eq!(sent.contains(ANSWER), exported, "{row} {method}: {sent}");
         }
     }
 

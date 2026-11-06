@@ -1172,7 +1172,8 @@ async fn dispatch(
             }
         }
         // Post-mask by construction — cloned after the write-back above.
-        captured_result = capture_cap.map(|_| resp_bytes.clone());
+        captured_result =
+            capture_cap.and_then(|_| exportable_result(guardrail_chain.as_ref(), &resp_bytes));
         Response::from_parts(resp_parts, Body::from(resp_bytes))
     } else {
         response
@@ -1510,6 +1511,20 @@ fn check_local_json(
         }
     }
     aisix_guardrails::Guardrail::check_local_segments(chain, &segments, input)
+}
+
+/// The tool result a full-content export may carry. None once a check on the
+/// call failed open, let a result it could not read past, or released one past
+/// its buffer cap: no guardrail read what went through, so the row keeps it
+/// out, as every route's row does.
+fn exportable_result(
+    chain: Option<&aisix_guardrails::GuardrailChain>,
+    result: &axum::body::Bytes,
+) -> Option<axum::body::Bytes> {
+    chain
+        .and_then(|c| c.bypass_reason())
+        .is_none()
+        .then(|| result.clone())
 }
 
 /// The post-mask content-capture pair for a tool call: `prompt` is the
@@ -3836,6 +3851,39 @@ mod tests {
             None,
             "nothing in this chain reads the result, so nothing was bypassed",
         );
+    }
+
+    /// A tool result a check failed open on went through unread, and so did
+    /// one the scan could not parse: neither reaches a full-content export.
+    /// The check that ran is the control, and with no chain nothing was owed;
+    /// both export the result.
+    #[tokio::test]
+    async fn a_result_no_guardrail_read_stays_off_the_export() {
+        const RESULT: &[u8] = br#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"a tool answer"}]}}"#;
+        const UNPARSEABLE: &[u8] = b"event: message\ndata: {\"jsonrpc\":\"2.0\",\"result\":{}}\n\n";
+        const FAILS_OPEN: &str = r#"{"name":"mcp-out-open","kind":"custom","hook_point":"output","output_fail_open":true,"timeout_ms":5000,"script":"export function checkOutput() { throw new Error('x'); }"}"#;
+        const READS_OPEN: &str = r#"{"name":"mcp-out-open","kind":"keyword","hook_point":"output","fail_open":true,"patterns":[{"kind":"literal","value":"forbidden-token"}]}"#;
+        const PASSES: &str = r#"{"name":"mcp-out-ok","kind":"custom","hook_point":"output","timeout_ms":5000,"script":"export function checkOutput() { return { action: 'none' }; }"}"#;
+        for (row, body, exported) in [
+            (FAILS_OPEN, RESULT, false),
+            (READS_OPEN, UNPARSEABLE, false),
+            (PASSES, RESULT, true),
+        ] {
+            let chain = env_chain_with(row);
+            assert!(
+                output_guardrail_block(&chain, body, "echo", &mut Vec::new())
+                    .await
+                    .is_none(),
+                "premise: the result goes through: {row}"
+            );
+            let body = axum::body::Bytes::from_static(body);
+            assert_eq!(
+                exportable_result(Some(&chain), &body).is_some(),
+                exported,
+                "{row}"
+            );
+        }
+        assert!(exportable_result(None, &axum::body::Bytes::from_static(RESULT)).is_some());
     }
 
     #[tokio::test]

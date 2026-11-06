@@ -12438,6 +12438,73 @@ data: [DONE]\n\n";
         assert!(exported.contains("a clean answer"), "{exported}");
     }
 
+    /// An answer no guardrail read stays out of a full-content export: one a
+    /// check failed open on, buffered or streamed, and a held stream released
+    /// past its buffer cap. The check that ran is the control: its answer is
+    /// exported.
+    #[tokio::test]
+    async fn an_answer_no_guardrail_read_stays_off_the_export() {
+        const ANSWER: &str = "unread-route-answer-3b9a";
+        let script = |body: &str| {
+            format!(
+                r#"{{"name":"out-script","enabled":true,"hook_point":"output","kind":"custom","output_fail_open":true,"timeout_ms":5000,"script":"export function checkOutput() {{ {body} }}"}}"#
+            )
+        };
+        let fails_open = script("throw new Error('x');");
+        let passes = script("return { action: 'none' };");
+        let cap_open = OUTPUT_CAP_FAIL_CLOSED.replace("fail_closed", "fail_open");
+        let sse = OPENAI_SSE.replace("say FORBIDDEN now", ANSWER);
+        let whole = serde_json::json!({"id": "c", "object": "chat.completion", "choices": [{
+            "index": 0, "message": {"role": "assistant", "content": ANSWER},
+            "finish_reason": "stop"}]})
+        .to_string();
+        for (row, streamed, exported) in [
+            (&fails_open, false, false),
+            (&fails_open, true, false),
+            (&cap_open, true, false),
+            (&passes, false, true),
+            (&passes, true, true),
+        ] {
+            let upstream = MockServer::builder().start().await;
+            let reply = if streamed {
+                ResponseTemplate::new(200).set_body_raw(sse.clone(), "text/event-stream")
+            } else {
+                ResponseTemplate::new(200).set_body_raw(whole.clone(), "application/json")
+            };
+            Mock::given(wm_method("POST"))
+                .and(wm_path("/v1/chat/completions"))
+                .respond_with(reply)
+                .mount(&upstream)
+                .await;
+            let snap = AisixSnapshot::new();
+            snap.provider_keys
+                .insert(provider_key_entry("http://unused"));
+            snap.apikeys.insert(apikey_entry("sk-caller", Some(&["*"])));
+            snap.passthrough_routes
+                .insert(inject_route(&upstream.uri()));
+            let g: aisix_core::Guardrail = serde_json::from_str(row).unwrap();
+            crate::seed_env_scoped_guardrail(&snap, ResourceEntry::new("g-1", g, 1));
+            let collector = crate::seed_full_content_collector(&snap).await;
+            let resp = build_app(snap)
+                .oneshot(relay_request("/passthrough/openai/v1/chat/completions"))
+                .await
+                .unwrap();
+            let (parts, body) = resp.into_parts();
+            let wire = to_bytes(body, 1 << 20).await.unwrap();
+            assert!(
+                String::from_utf8_lossy(&wire).contains(ANSWER),
+                "premise: the caller gets the answer: {row} streamed={streamed}"
+            );
+            let head = axum::response::Response::from_parts(parts, axum::body::Body::empty());
+            let exported_text = crate::exported_for(&collector, &head).await;
+            assert_eq!(
+                exported_text.contains(ANSWER),
+                exported,
+                "{row} streamed={streamed}: {exported_text}"
+            );
+        }
+    }
+
     /// An upstream cut off mid-answer must not read as a whole answer: the body
     /// ends in an error, after what was relayed so far.
     #[tokio::test]
