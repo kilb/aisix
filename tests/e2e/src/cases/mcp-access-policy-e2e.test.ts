@@ -44,6 +44,8 @@ const KEY_T2 = "sk-mcp-t2";
 const KEY_NARROW = "sk-mcp-t2-narrow";
 const KEY_BLOCKED = "sk-mcp-blocked";
 const KEY_STALE_MODE = "sk-mcp-stale-mode";
+const KEY_STORED_INHERIT = "sk-mcp-stored-inherit";
+const KEY_STORED_TOOLS = "sk-mcp-stored-tools";
 
 const sha256 = (s: string) => createHash("sha256").update(s).digest("hex");
 
@@ -168,6 +170,8 @@ describe("mcp access policy e2e: env, team and key layers intersect", () => {
     [KEY_NARROW, ["alpha__echo"]],
     [KEY_BLOCKED, []],
     [KEY_STALE_MODE, ["alpha__echo", "alpha__reverse"]],
+    [KEY_STORED_INHERIT, ENV_GRANT],
+    [KEY_STORED_TOOLS, ["alpha__echo"]],
   ];
 
   beforeAll(async () => {
@@ -243,6 +247,11 @@ describe("mcp access policy e2e: env, team and key layers intersect", () => {
         mcp_access: { mode: "deny", allow: ["alpha__*"] },
       }),
     );
+    // Rows written before the layered ACL. There, `{mode: inherit}` took the
+    // policy grant unchanged, and a key with no block was granted exactly its
+    // `allowed_tools`.
+    await seed.createApiKey(keyDoc(KEY_STORED_INHERIT, { mcp_access: { mode: "inherit" } }));
+    await seed.createApiKey(keyDoc(KEY_STORED_TOOLS, { allowed_tools: ["alpha__echo"] }));
 
     // Probe EVERY key to its expected steady state: keys are written at
     // higher revisions than servers/policies, but each key's list also
@@ -272,6 +281,23 @@ describe("mcp access policy e2e: env, team and key layers intersect", () => {
     const ok = await callTool(KEY_STALE_MODE, "alpha__echo", "hi");
     expect(ok).toEqual({ ok: true, text: "alpha:hi" });
     const denied = await callTool(KEY_STALE_MODE, "beta__echo", "hi");
+    expect(denied.ok).toBe(false);
+    expect(denied.error).toContain("not available");
+  });
+
+  test("a key stored before the layered ACL keeps the access it had", async (ctx) => {
+    if (!etcdReachable || !app) return ctx.skip();
+
+    // `inherit` still takes the policy grant, the deny one layer up included.
+    await expectList(KEY_STORED_INHERIT, ENV_GRANT);
+    expect(await callTool(KEY_STORED_INHERIT, "beta__echo", "hi")).toEqual({
+      ok: true,
+      text: "beta:hi",
+    });
+    // `allowed_tools` was the whole grant: the env layer allows more, but the
+    // key never had it.
+    await expectList(KEY_STORED_TOOLS, ["alpha__echo"]);
+    const denied = await callTool(KEY_STORED_TOOLS, "alpha__reverse", "hi");
     expect(denied.ok).toBe(false);
     expect(denied.error).toContain("not available");
   });

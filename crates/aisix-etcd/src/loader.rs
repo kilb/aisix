@@ -24,11 +24,11 @@
 //! rest."
 
 use aisix_core::models::{
-    upgrade_stored_routing, validate_a2a_agent_lenient, validate_a2a_agent_url,
-    validate_apikey_lenient, validate_cache_policy_lenient, validate_claim_mapping_lenient,
-    validate_guardrail_attachment_lenient, validate_guardrail_lenient,
-    validate_mcp_auth_settings_lenient, validate_mcp_policy_lenient, validate_mcp_server_lenient,
-    validate_model_lenient, validate_observability_exporter_lenient,
+    upgrade_stored_mcp_access, upgrade_stored_routing, validate_a2a_agent_lenient,
+    validate_a2a_agent_url, validate_apikey_lenient, validate_cache_policy_lenient,
+    validate_claim_mapping_lenient, validate_guardrail_attachment_lenient,
+    validate_guardrail_lenient, validate_mcp_auth_settings_lenient, validate_mcp_policy_lenient,
+    validate_mcp_server_lenient, validate_model_lenient, validate_observability_exporter_lenient,
     validate_oidc_provider_lenient, validate_passthrough_route_lenient,
     validate_provider_key_lenient, validate_rate_limit_policy_lenient, A2aAgent, ApiKey,
     CachePolicy, ClaimMapping, Guardrail, GuardrailAttachment, McpAuthSettings, McpPolicy,
@@ -340,6 +340,9 @@ pub fn build_snapshot(prefixes: &PrefixSet, entries: &[RawEntry]) -> (AisixSnaps
                 }
             }
             "api_keys" => {
+                let row_kind = parsed.kind;
+                // Ahead of the schema, like the routing settings above.
+                let retired = upgrade_stored_mcp_access(&mut value);
                 if let Some(entry) = validate_and_parse::<ApiKey>(
                     &raw.key,
                     raw.revision,
@@ -348,6 +351,20 @@ pub fn build_snapshot(prefixes: &PrefixSet, entries: &[RawEntry]) -> (AisixSnaps
                     validate_apikey_lenient,
                     &mut stats,
                 ) {
+                    if !retired.is_empty() {
+                        let fields: Vec<String> =
+                            retired.iter().map(|f| (*f).to_string()).collect();
+                        warn_compat_deduped(
+                            &raw.key,
+                            row_kind,
+                            &fields,
+                            "row loaded with retired MCP access, serving what it meant: \
+                             `mcp_access: {mode: inherit}` as no block of its own, and \
+                             `allowed_tools` beside no block as `mcp_access: {allow: [...]}`; \
+                             rewrite the row, a write of this shape is refused",
+                        );
+                        merge_partial_compat_fields(&mut stats, &raw.key, row_kind, fields);
+                    }
                     snapshot.apikeys.insert(entry);
                 }
             }
@@ -964,6 +981,121 @@ mod tests {
             ],
             "the setting's new meaning is reported, not an unknown-field path"
         );
+    }
+
+    /// Every MCP access shape a stored row could carry from before the layered
+    /// ACL loads as what it meant, or fails closed, and the row says so.
+    #[test]
+    fn stored_mcp_access_shapes_load_as_what_they_meant_or_fail_closed() {
+        let key = |mcp: Value| {
+            let mut doc = serde_json::json!({
+                "key_hash": "1460db1b6902f8b1fc2a40d9381a24d0fd22c3bc1b2c6f999c521da73776fbe0",
+                "allowed_models": ["m"],
+            });
+            doc.as_object_mut()
+                .unwrap()
+                .extend(mcp.as_object().unwrap().clone());
+            serde_json::to_vec(&doc).unwrap()
+        };
+        let rows = [
+            (
+                "inherit",
+                key(serde_json::json!({ "mcp_access": { "mode": "inherit" } })),
+            ),
+            (
+                "tools",
+                key(serde_json::json!({ "allowed_tools": ["github__*"] })),
+            ),
+            (
+                "restrict",
+                key(serde_json::json!({ "mcp_access": { "mode": "restrict", "allow": ["a__*"] } })),
+            ),
+            (
+                "deny",
+                key(serde_json::json!({ "mcp_access": { "mode": "deny" } })),
+            ),
+            (
+                "inherit-deny",
+                key(serde_json::json!({ "mcp_access": { "mode": "inherit", "deny": ["a__b"] } })),
+            ),
+        ];
+        let mut entries: Vec<RawEntry> = rows
+            .iter()
+            .enumerate()
+            .map(|(i, (id, doc))| raw(&format!("/aisix/api_keys/{id}"), doc, i as i64 + 2))
+            .collect();
+        for (i, mode) in ["all", "none", "selected"].iter().enumerate() {
+            let mut policy =
+                serde_json::json!({ "scope": "team", "scope_ref": mode, "mode": mode });
+            if *mode == "selected" {
+                policy["allow"] = serde_json::json!(["a__*"]);
+            }
+            entries.push(raw(
+                &format!("/aisix/mcp_policies/{mode}"),
+                &serde_json::to_vec(&policy).unwrap(),
+                i as i64 + 20,
+            ));
+        }
+        let (snap, stats) = build_snapshot(&env_prefixes(), &entries);
+        assert!(stats.rejections.is_empty(), "{:?}", stats.rejections);
+
+        let access = |id: &str| {
+            snap.apikeys
+                .get_by_id(id)
+                .expect("loaded")
+                .value
+                .mcp_access
+                .as_ref()
+                .map(|a| (a.allow.clone(), a.deny.clone()))
+        };
+        let s = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(access("inherit"), None);
+        assert_eq!(access("tools"), Some((s(&["github__*"]), vec![])));
+        assert_eq!(access("restrict"), Some((s(&["a__*"]), vec![])));
+        assert_eq!(access("deny"), Some((vec![], vec![])));
+        assert_eq!(access("inherit-deny"), Some((vec![], s(&["a__b"]))));
+        let allow = |id: &str| {
+            snap.mcp_policies
+                .get_by_id(id)
+                .expect("loaded")
+                .value
+                .allow
+                .clone()
+        };
+        assert!(allow("all").is_empty(), "fails closed");
+        assert!(allow("none").is_empty());
+        assert_eq!(allow("selected"), ["a__*"]);
+
+        let reported = |key: &str| -> Vec<String> {
+            stats
+                .partial_rows
+                .iter()
+                .filter(|r| r.key == key)
+                .flat_map(|r| r.fields.clone())
+                .collect()
+        };
+        assert_eq!(
+            reported("/aisix/api_keys/inherit"),
+            ["legacy:mcp_access.mode_inherit_as_no_key_layer"]
+        );
+        assert_eq!(
+            reported("/aisix/api_keys/tools"),
+            ["legacy:allowed_tools_as_mcp_access_allow"]
+        );
+        for id in ["restrict", "deny", "inherit-deny"] {
+            assert_eq!(
+                reported(&format!("/aisix/api_keys/{id}")),
+                ["mcp_access.mode"],
+                "{id}"
+            );
+        }
+        for mode in ["all", "none", "selected"] {
+            assert_eq!(
+                reported(&format!("/aisix/mcp_policies/{mode}")),
+                ["mode"],
+                "{mode}"
+            );
+        }
     }
 
     /// A stored `weighted` group's `weight: 0` target was its backup. It loads

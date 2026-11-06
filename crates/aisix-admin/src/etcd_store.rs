@@ -205,6 +205,13 @@ fn stored_model(mut doc: serde_json::Value) -> Result<Model, serde_json::Error> 
     serde_json::from_value(doc)
 }
 
+/// A stored API key, read the way the snapshot loader reads it: its MCP
+/// access must read as what the gateway enforces.
+fn stored_apikey(mut doc: serde_json::Value) -> Result<ApiKey, serde_json::Error> {
+    aisix_core::models::upgrade_stored_mcp_access(&mut doc);
+    serde_json::from_value(doc)
+}
+
 #[async_trait::async_trait]
 impl ConfigStore for EtcdConfigStore {
     async fn get_model(&self, id: &str) -> Result<Option<ResourceEntry<Model>>, StoreError> {
@@ -234,18 +241,26 @@ impl ConfigStore for EtcdConfigStore {
 
     async fn get_apikey(&self, id: &str) -> Result<Option<ResourceEntry<ApiKey>>, StoreError> {
         let key = self.key_for(APIKEYS_SUBKEY, id);
-        Ok(self
-            .get_one::<ApiKey>(&key)
-            .await?
-            .map(|(v, rev)| ResourceEntry::new(id, v, rev)))
+        let Some((doc, rev)) = self.get_one::<serde_json::Value>(&key).await? else {
+            return Ok(None);
+        };
+        let apikey =
+            stored_apikey(doc).map_err(|e| StoreError::Backend(format!("decode {key}: {e}")))?;
+        Ok(Some(ResourceEntry::new(id, apikey, rev)))
     }
 
     async fn list_apikeys(&self) -> Result<Vec<ResourceEntry<ApiKey>>, StoreError> {
         Ok(self
-            .list_range::<ApiKey>(APIKEYS_SUBKEY)
+            .list_range::<serde_json::Value>(APIKEYS_SUBKEY)
             .await?
             .into_iter()
-            .map(|(id, v, rev)| ResourceEntry::new(id, v, rev))
+            .filter_map(|(id, doc, rev)| match stored_apikey(doc) {
+                Ok(apikey) => Some(ResourceEntry::new(id, apikey, rev)),
+                Err(error) => {
+                    tracing::warn!(id = %id, %error, "skipping malformed etcd value");
+                    None
+                }
+            })
             .collect())
     }
 
@@ -420,6 +435,24 @@ mod tests {
         assert_eq!(
             model.routing.map(|r| r.strategy),
             Some(aisix_core::models::RoutingStrategy::RoundRobin)
+        );
+    }
+
+    #[test]
+    fn a_stored_retired_mcp_access_reads_like_the_loader_reads_it() {
+        let hash = "1460db1b6902f8b1fc2a40d9381a24d0fd22c3bc1b2c6f999c521da73776fbe0";
+        let inherit = stored_apikey(serde_json::json!({
+            "key_hash": hash, "allowed_models": [], "mcp_access": { "mode": "inherit" },
+        }))
+        .unwrap();
+        assert!(inherit.mcp_access.is_none());
+        let tools = stored_apikey(serde_json::json!({
+            "key_hash": hash, "allowed_models": [], "allowed_tools": ["github__*"],
+        }))
+        .unwrap();
+        assert_eq!(
+            tools.mcp_access.map(|a| a.allow),
+            Some(vec!["github__*".to_string()])
         );
     }
 
