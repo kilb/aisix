@@ -106,6 +106,16 @@ fn fixture(method: &str, path: &str, target: &SeededOperator) -> (String, Option
             format!("/admin/members/{}", Uuid::nil()),
             Some(json!({"disabled": true})),
         ),
+        // This control plane reaches no kine, so no projector leads: past
+        // the role check, the request is refused and nothing is deleted.
+        ("POST", "/admin/rollout/reconcile") => {
+            (path.to_string(), Some(json!({"allow_deletes": false})))
+        }
+        // Past the role check, kine cannot be reached: nothing moves.
+        ("POST", "/admin/rollout/ownership") => (
+            path.to_string(),
+            Some(json!({"take_over_from": Uuid::nil()})),
+        ),
         _ => panic!("no fixture for {method} {path}: add one to tests/roles.rs"),
     }
 }

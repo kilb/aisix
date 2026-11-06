@@ -218,6 +218,8 @@ pub enum BootError {
     Pki(#[from] crate::pki::PkiError),
     #[error("cannot prepare the platform's own tenant: {0}")]
     InternalTenant(String),
+    #[error("kine (CP_KINE_ENDPOINT): {0}")]
+    Kine(#[from] crate::kine::KineError),
     #[error("cannot listen on CP_HTTP_ADDR: {0}")]
     Listen(std::io::Error),
     #[error("the browser listener (CP_HTTP_ADDR) stopped: {0}")]

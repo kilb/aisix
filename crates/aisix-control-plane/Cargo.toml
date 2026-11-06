@@ -58,6 +58,11 @@ tower = { version = "0.5", features = ["util"] }
 # Release versions a heartbeat reports, compared with this build's
 # (1.0.28 in Cargo.lock).
 semver = "1"
+# The projector writes kine through the etcd client the gateway reads it
+# with (0.14.1 in Cargo.lock, the gateway's features), behind an
+# `async_trait` seam (0.1.89) so tests can stand in a kine that fails on cue.
+etcd-client = { version = "0.14", features = ["tls"] }
+async-trait = "0.1"
 
 # The open-file limit, raised at boot for the gateway listener's connection
 # caps (1.1.4 in Cargo.lock).
@@ -74,3 +79,5 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "coo
 hyper = { version = "1", features = ["client", "http1", "http2"] }
 http-body-util = "0.1"
 bytes = "1"
+# The gateway's own loader, which a projected document must load in.
+aisix-etcd = { path = "../aisix-etcd" }

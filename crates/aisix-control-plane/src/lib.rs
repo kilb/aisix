@@ -2,8 +2,8 @@
 //!
 //! Postgres holds all of its state. One deployment serves one environment
 //! (`env_id`), pinned by the first boot. The browser listener serves
-//! operators and tenants, and the gateway listener (mTLS) the gateways;
-//! later tasks add the kine projection.
+//! operators and tenants, the gateway listener (mTLS) the gateways, and a
+//! projector writes the gateway resources to kine.
 
 use std::future::Future;
 use std::net::SocketAddr;
@@ -22,9 +22,11 @@ pub mod error;
 pub mod gateways;
 pub mod housekeeping;
 pub mod http;
+pub mod kine;
 pub mod members;
 pub mod operators;
 pub mod pki;
+pub mod projector;
 pub mod resources;
 pub mod rollout;
 pub mod settings;
@@ -37,7 +39,9 @@ use dp::heartbeat::BeatLimiter;
 use dp::listener::{ConnLimits, ListenerState, TlsSetupError};
 use dp::{CredentialCache, CREDENTIALS_POOL_SIZE};
 use error::BootError;
+use kine::{KineClient, KineWriter};
 use pki::{Pki, PkiError};
+use resources::write::WriteCtx;
 use settings::EnvSettings;
 
 /// What every request handler shares.
@@ -74,7 +78,8 @@ pub struct Running {
     /// expired, or expires within a day).
     pub dp_addr: Option<SocketAddr>,
     serve: Option<JoinHandle<std::io::Result<()>>>,
-    /// The gateway listener and housekeeping: they stop once told to.
+    /// The gateway listener, housekeeping and the projector: they stop once
+    /// told to.
     tasks: Vec<JoinHandle<()>>,
     /// The credential refresh, which holds nothing that needs a clean stop:
     /// aborted, never awaited.
@@ -124,8 +129,8 @@ impl Drop for Running {
 
 /// Boots the control plane: opens and migrates the database, pins the
 /// environment, loads the CA and the gateway credentials, and starts the
-/// browser listener, the gateway listener and housekeeping, which stop
-/// gracefully once `shutdown` resolves.
+/// browser listener, the gateway listener, housekeeping and the projector,
+/// which stop gracefully once `shutdown` resolves.
 pub async fn start<S>(cfg: CpConfig, shutdown: S) -> Result<Running, BootError>
 where
     S: Future<Output = ()> + Send + 'static,
@@ -137,6 +142,8 @@ where
     )
     .await?;
     let env = settings::ensure_env(&db, cfg.env_id_seed, &cfg.etcd_prefix).await?;
+    // The id this database claims its environment's kine prefix under.
+    projector::ensure_database_id(&db).await?;
     let pki = Arc::new(Pki::load_or_init(&db, &cfg.master_key, &env).await?);
     let write_ctx = resources::write::WriteCtx {
         mk: crypto::MasterKey(cfg.master_key.0),
@@ -158,6 +165,9 @@ where
         }
         Err(e) => return Err(e.into()),
     };
+    // Connects on first use: a kine that is down at boot only delays the
+    // projection.
+    let kine: Arc<dyn KineWriter> = Arc::new(KineClient::connect(&cfg.kine_endpoint).await?);
     let listener = tokio::net::TcpListener::bind(cfg.http_addr)
         .await
         .map_err(BootError::Listen)?;
@@ -208,6 +218,13 @@ where
             .await
     });
     let mut tasks = vec![housekeeping::spawn(state.db.clone(), stopping.clone())];
+    let mut projector_stop = stopping.clone();
+    tasks.push(projector::spawn(
+        state.db.clone(),
+        kine,
+        WriteCtx::of(&state),
+        async move { stopped(&mut projector_stop).await },
+    ));
     if let Some((listener, tls, _)) = dp {
         tasks.push(tokio::spawn(dp::listener::serve_dp(
             listener,
