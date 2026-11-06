@@ -839,6 +839,11 @@ async fn check_claim(
 /// when it names another database, or is absent and may not be created: a
 /// database told that another owns the environment takes it only by an
 /// audited takeover, never because the claim went missing.
+///
+/// What it cannot tell apart: a control plane that was superseded and then
+/// restarted on a database with no `projection_blocked` row (it never ran a
+/// pass in between, or the row was removed), finding the claim deleted,
+/// claims the environment again silently, exactly as a first boot does.
 async fn ensure_claim(
     conn: &mut PgConnection,
     kine: &dyn KineWriter,
@@ -1366,6 +1371,10 @@ pub async fn post_ownership(
 /// `from`, when it changed after the read, or when `from` is this database;
 /// `503 unavailable` when kine cannot be reached or a projector of this
 /// database holds the lock at that moment.
+///
+/// A known gap (P1-R15): should the commit fail once the claim has moved,
+/// the environment has changed owner without its audit row. That is logged
+/// at error level and answered `500 internal`.
 pub async fn take_over_with(
     db: &Db,
     kine: &dyn KineWriter,
@@ -1403,7 +1412,13 @@ async fn take_over(
         Some(_) => return Err(owned_elsewhere()),
     };
     let mut tx = conn.begin().await.map_err(DbError::from)?;
-    let detail = json!({"from_database_id": previous, "to_database_id": mine});
+    // `requested_from` keeps what the admin named, which an absent claim
+    // does not.
+    let detail = json!({
+        "from_database_id": previous,
+        "requested_from": from,
+        "to_database_id": mine,
+    });
     audit_environment(
         &mut tx,
         ctx,
@@ -1427,7 +1442,12 @@ async fn take_over(
         Ok(WriteOutcome::Applied { .. }) => {}
         // Dropping `tx` rolls the audit row and the cleared flag back.
         Ok(WriteOutcome::Conflict { .. }) => return Err(owned_elsewhere()),
-        Err(_) => return Err(ApiError::unavailable()),
+        // The answer was lost, a timeout say, but the write may have landed:
+        // the claim says which, and a claim that moved keeps its audit row.
+        Err(_) => match kine.get(&key).await {
+            Ok(Some(kv)) if claim_owner(&kv.value) == Some(mine) => {}
+            _ => return Err(ApiError::unavailable()),
+        },
     }
     if let Err(e) = tx.commit().await {
         tracing::error!(

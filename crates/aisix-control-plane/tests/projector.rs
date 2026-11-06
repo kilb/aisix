@@ -1598,6 +1598,9 @@ enum Injection {
     /// and then another database takes the environment over, rewriting the
     /// claim at `claim` to name `owner`.
     ThenClaimedBy { claim: String, owner: Uuid },
+    /// Leaves the session alone: the write is applied, and its answer is
+    /// lost.
+    LostAnswer,
 }
 
 /// Another projector, or another control plane, taking over in the middle
@@ -1764,6 +1767,13 @@ impl KineWriter for Deposer {
                 self.reassign(&claim, owner).await;
                 created
             }
+            Some(Injection::LostAnswer) => {
+                self.inner.create(key, value).await?;
+                self.note("create:injected", key);
+                Err(KineError::Unavailable(
+                    "injected: the answer was lost".to_string(),
+                ))
+            }
             Some(other) => panic!("a create cannot be armed with {other:?}"),
             None => {
                 self.note_write("create", key).await;
@@ -1783,6 +1793,13 @@ impl KineWriter for Deposer {
             self.reassign(&claim, owner).await;
             return updated;
         }
+        if let Injection::LostAnswer = injection {
+            self.inner.update(key, rev, value).await?;
+            self.note("update:injected", key);
+            return Err(KineError::Unavailable(
+                "injected: the answer was lost".to_string(),
+            ));
+        }
         self.end_session().await;
         self.note("update:injected", key);
         match injection {
@@ -1791,7 +1808,7 @@ impl KineWriter for Deposer {
                 self.delete_as_new_leader(key).await?;
                 Ok(WriteOutcome::Conflict { current: None })
             }
-            Injection::Answered | Injection::ThenClaimedBy { .. } => {
+            Injection::Answered | Injection::ThenClaimedBy { .. } | Injection::LostAnswer => {
                 self.inner.update(key, rev, value).await
             }
         }
@@ -1812,9 +1829,10 @@ impl KineWriter for Deposer {
         self.note("delete:injected", key);
         match injection {
             Injection::Rewritten => self.rewrite_as_new_leader(key).await,
-            Injection::Deleted | Injection::Answered | Injection::ThenClaimedBy { .. } => {
-                self.inner.delete(key, rev).await
-            }
+            Injection::Deleted
+            | Injection::Answered
+            | Injection::ThenClaimedBy { .. }
+            | Injection::LostAnswer => self.inner.delete(key, rev).await,
         }
     }
 
@@ -1835,9 +1853,10 @@ impl KineWriter for Deposer {
                 self.delete_as_new_leader(key).await?;
                 Ok(None)
             }
-            Injection::Rewritten | Injection::Answered | Injection::ThenClaimedBy { .. } => {
-                self.inner.get(key).await
-            }
+            Injection::Rewritten
+            | Injection::Answered
+            | Injection::ThenClaimedBy { .. }
+            | Injection::LostAnswer => self.inner.get(key).await,
         }
     }
 
@@ -2663,7 +2682,11 @@ async fn an_environment_moves_to_another_database_only_by_takeover() {
     assert_eq!(audit.0.as_deref(), Some(admin.email.as_str()));
     assert_eq!(
         audit.1,
-        json!({"from_database_id": first_id, "to_database_id": second_id})
+        json!({
+            "from_database_id": first_id,
+            "requested_from": first_id,
+            "to_database_id": second_id,
+        })
     );
 
     // The new owner projects; the old one, still running, stops.
@@ -2855,7 +2878,7 @@ async fn a_takeover_of_a_vanished_claim_is_audited() {
     assert_eq!(raw_get(&kine, &claim).await, None);
 
     // An absent claim is taken by the takeover, and audited.
-    let r = take_over(&second, admin.cookie(), first_id).await;
+    let r = take_over(&second, admin.cookie(), first_id.clone()).await;
     assert_eq!(r.status, 200, "{r:?}");
     assert_eq!(r.body, json!({ "owner_database_id": second_id }));
     let (value, _) = raw_json(&kine, &claim).await.expect("the claim");
@@ -2868,7 +2891,11 @@ async fn a_takeover_of_a_vanished_claim_is_audited() {
     .expect("read the audit log");
     assert_eq!(
         audit,
-        [json!({"from_database_id": null, "to_database_id": second_id})]
+        [json!({
+            "from_database_id": null,
+            "requested_from": first_id,
+            "to_database_id": second_id,
+        })]
     );
     all_projected(db).await;
     assert!(raw_get(&kine, &key_for(&env, Kind::ProviderKeys, b))
@@ -3156,4 +3183,63 @@ async fn a_projected_tombstone_is_pruned_and_an_unprojected_one_is_kept() {
     assert!(raw_get(&kine, &key_for(env, Kind::ProviderKeys, pending))
         .await
         .is_some());
+}
+
+#[tokio::test]
+async fn a_takeover_whose_answer_was_lost_is_still_audited() {
+    let Some(first) = TestCp::start_with_kine().await else {
+        return;
+    };
+    let endpoint = support::kine_endpoint().expect("kine is configured");
+    let kine = raw_kine(&endpoint).await;
+    let env = first.env().clone();
+    let first_id: Uuid = setting(first.db(), "database_id")
+        .await
+        .and_then(|id| id.as_str().and_then(|id| id.parse().ok()))
+        .expect("an id");
+    all_projected(first.db()).await;
+    let second = TestCp::start_with(|cfg| {
+        cfg.kine_endpoint = endpoint.clone();
+        cfg.env_id_seed = Some(env.env_id);
+    })
+    .await
+    .expect("the second control plane boots");
+    let second_id = setting(second.db(), "database_id").await.expect("an id");
+    let db = second.db();
+    eventually("the second to be blocked", PATIENCE, || async move {
+        blocked_by(db).await == Some(json!(first_id))
+    })
+    .await;
+    drop(first);
+
+    // The claim moves, and the answer saying so never arrives.
+    let claim = claim_key(&env);
+    let deposer = Deposer::new(&endpoint, db).await;
+    deposer.arm("update", &claim, Injection::LostAnswer);
+    let admin = OperatorAuth {
+        id: Uuid::new_v4(),
+        email: "takeover@ops.test".to_string(),
+        role: OperatorRole::Admin,
+    };
+    let taken = projector::take_over_with(db, &*deposer, &ctx(second.env()), &admin, first_id)
+        .await
+        .expect("the takeover is reported done");
+    assert_eq!(taken, json!({ "owner_database_id": second_id }));
+    let (value, _) = raw_json(&kine, &claim).await.expect("the claim");
+    assert_eq!(value, json!({ "database_id": second_id }));
+    let audit: Vec<Value> = sqlx::query_scalar(
+        "SELECT detail FROM audit_log WHERE action = 'rollout.ownership.taken_over'",
+    )
+    .fetch_all(db.pool())
+    .await
+    .expect("read the audit log");
+    assert_eq!(
+        audit,
+        [json!({
+            "from_database_id": first_id,
+            "requested_from": first_id,
+            "to_database_id": second_id,
+        })]
+    );
+    assert_eq!(blocked_by(db).await, None);
 }
