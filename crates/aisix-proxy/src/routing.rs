@@ -5022,6 +5022,12 @@ mod tests {
             // The resolver every other reader must go through.
             "aisix-core/src/models/pricing.rs",
         ];
+        /// Sources whose own `cost` is another price: the control plane's
+        /// pricing engine calls the platform's cost price `cost` (its price
+        /// rows, its lookup, the cost on a priced row), and it takes no
+        /// `Model`, so it cannot read a model's price off the field. Its
+        /// `tests/` stay scanned.
+        const OWN_COST_VOCABULARY: [&str; 1] = ["/crates/aisix-pricing/src/"];
 
         fn walk(dir: &Path, needle: &str, out: &mut Vec<(String, usize, String)>) {
             for e in std::fs::read_dir(dir).expect("crates dir is readable") {
@@ -5033,7 +5039,9 @@ mod tests {
                     walk(&path, needle, out);
                 } else if path.extension().is_some_and(|x| x == "rs") {
                     let name = path.to_string_lossy().replace('\\', "/");
-                    if AUTHORIZED.iter().any(|ok| name.ends_with(ok)) {
+                    if AUTHORIZED.iter().any(|ok| name.ends_with(ok))
+                        || OWN_COST_VOCABULARY.iter().any(|dir| name.contains(dir))
+                    {
                         continue;
                     }
                     let src = std::fs::read_to_string(&path).expect("source is utf-8");
