@@ -1,0 +1,45 @@
+[
+  {
+    "charge": 340,
+    "cost": null,
+    "discount": null,
+    "engine_version": 1,
+    "estimated": false,
+    "event_id": "evt-openai-via-messages-1",
+    "lines": [
+      {
+        "dimension": "input",
+        "quantity": 200,
+        "rate": "0.5"
+      },
+      {
+        "dimension": "cache_read",
+        "quantity": 800,
+        "rate": "0.05"
+      },
+      {
+        "dimension": "output",
+        "quantity": 150,
+        "rate": "1"
+      },
+      {
+        "dimension": "reasoning",
+        "quantity": 50,
+        "rate": "1"
+      }
+    ],
+    "long_context_above": null,
+    "occurred_at": "2026-11-06T00:00:00Z",
+    "outcome": "charged",
+    "price_instant": "2026-11-06T00:00:00Z",
+    "requested_model_id": "model-openai-chat",
+    "requested_service_tier": null,
+    "sell": {
+      "revision_id": 1,
+      "tenant_override": false
+    },
+    "service_tier": "flex",
+    "tenant_id": "tenant-golden",
+    "warnings": []
+  }
+]

@@ -1,0 +1,19 @@
+[
+  {
+    "cache_status": "disabled",
+    "completion_tokens": 0,
+    "cost_usd": 0.000008,
+    "event_id": "evt-openai-embeddings-1",
+    "guardrail_blocked": false,
+    "occurred_at": "2026-11-06T00:00:00.000Z",
+    "operation": "embeddings",
+    "prompt_tokens": 8,
+    "provider_key_id": "pk-openai",
+    "requested_model_id": "model-openai-embeddings",
+    "status_code": 200,
+    "team_id": "tenant-golden",
+    "total_tokens": 8,
+    "upstream_model": "text-embedding-3-small",
+    "upstream_provider": "openai"
+  }
+]

@@ -1,0 +1,23 @@
+[
+  {
+    "cache_creation_1h_tokens": 3,
+    "cache_creation_5m_tokens": 1,
+    "cache_creation_tokens": 4,
+    "cache_read_tokens": 9,
+    "cache_status": "disabled",
+    "completion_tokens": 52,
+    "cost_usd": 0.0001469,
+    "event_id": "evt-anthropic-messages-stream-1",
+    "guardrail_blocked": false,
+    "occurred_at": "2026-11-06T00:00:00.000Z",
+    "operation": "messages",
+    "prompt_tokens": 37,
+    "provider_key_id": "pk-anthropic",
+    "requested_model_id": "model-anthropic-messages",
+    "status_code": 200,
+    "team_id": "tenant-golden",
+    "upstream_model": "claude-sonnet-4-5-20250929",
+    "upstream_provider": "anthropic",
+    "web_search_requests": 2
+  }
+]

@@ -1,0 +1,23 @@
+[
+  {
+    "cache_creation_1h_tokens": 3,
+    "cache_creation_5m_tokens": 1,
+    "cache_creation_tokens": 4,
+    "cache_read_tokens": 9,
+    "cache_status": "disabled",
+    "completion_tokens": 52,
+    "cost_usd": 0.0001469,
+    "event_id": "evt-bedrock-converse-chat-1",
+    "guardrail_blocked": false,
+    "occurred_at": "2026-11-06T00:00:00.000Z",
+    "operation": "chat",
+    "prompt_tokens": 37,
+    "provider_key_id": "pk-bedrock",
+    "requested_model_id": "model-bedrock-converse-chat",
+    "status_code": 200,
+    "team_id": "tenant-golden",
+    "total_tokens": 102,
+    "upstream_model": "us.amazon.nova-pro-v1:0",
+    "upstream_provider": "bedrock"
+  }
+]

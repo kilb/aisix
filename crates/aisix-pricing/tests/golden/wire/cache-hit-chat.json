@@ -1,0 +1,21 @@
+[
+  {
+    "cache_status": "hit",
+    "cached_prompt_tokens": 800,
+    "completion_tokens": 200,
+    "cost_usd": 0,
+    "event_id": "evt-cache-hit-chat-1",
+    "guardrail_blocked": false,
+    "occurred_at": "2026-11-06T00:00:00.000Z",
+    "operation": "chat",
+    "prompt_tokens": 1000,
+    "provider_key_id": "pk-openai",
+    "reasoning_tokens": 50,
+    "requested_model_id": "model-openai-chat",
+    "status_code": 200,
+    "team_id": "tenant-golden",
+    "total_tokens": 1200,
+    "upstream_model": "gpt-5-mini",
+    "upstream_provider": "openai"
+  }
+]
