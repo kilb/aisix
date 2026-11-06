@@ -2132,3 +2132,93 @@ async fn a_watch_answer_longer_than_the_front_reads_is_resource_exhausted() {
     assert_eq!(status.code(), Code::ResourceExhausted, "{status:?}");
     assert_eq!(status.message(), "etcdserver: watch answer too large");
 }
+
+#[tokio::test]
+async fn a_resource_the_projector_writes_reaches_a_gateway_through_the_front() {
+    let Some(t) = Fixture::start().await else {
+        return;
+    };
+    let env = t.env();
+    let provider = provider(&t.cp, &t.bundle, &env).await;
+    let (entries, revision) = provider.load_all().await.expect("the load");
+    assert_eq!(
+        entries.iter().map(|e| e.key.clone()).collect::<Vec<_>>(),
+        t.baseline
+    );
+    let mut events = provider
+        .watch(revision + 1)
+        .await
+        .expect("the gateway's watch");
+
+    // An operator saves an upstream account through the admin API; the
+    // projector writes it to kine, which the gateway reads through the
+    // front.
+    let name = format!("acct-front-{}", &Uuid::new_v4().simple().to_string()[..8]);
+    let secret = "sk-front-7c1-not-a-real-key";
+    let created =
+        t.cp.send(
+            "POST",
+            "/admin/resources/provider_keys",
+            Some(t.admin.cookie()),
+            Some(json!({"doc": {"display_name": name, "provider": "openai", "api_key": secret}})),
+        )
+        .await;
+    assert_eq!(created.status, 201, "{created:?}");
+    let id = created.body["id"].as_str().expect("an id").to_string();
+    let key = format!("{env}provider_keys/{id}");
+
+    // The watch carries it, with the credential the gateway needs in
+    // plaintext (the control plane stores it sealed).
+    match next_event(&mut *events).await {
+        Ok(WatchEvent::Put(entry)) => {
+            assert_eq!(entry.key, key);
+            let doc: serde_json::Value =
+                serde_json::from_slice(&entry.value).expect("a JSON document");
+            assert_eq!(doc["api_key"], secret);
+            assert_eq!(doc["display_name"], name.as_str());
+        }
+        other => panic!("expected the put of {key}, got {other:?}"),
+    }
+    // And a load from scratch has it.
+    let (entries, _) = provider.load_all().await.expect("a fresh load");
+    assert_eq!(
+        entries.iter().map(|e| e.key.clone()).collect::<Vec<_>>(),
+        t.with_baseline(&[key])
+    );
+}
+
+#[tokio::test]
+async fn the_projectors_claim_key_is_not_readable_by_a_gateway() {
+    let Some(t) = Fixture::start().await else {
+        return;
+    };
+    let claim = aisix_control_plane::projector::claim_key(t.cp.env());
+    let env_id = t.cp.env().env_id;
+    assert_eq!(claim, format!("/aisix/_cp/{env_id}/owner"));
+    // The projector has claimed the prefix, so the key is there to refuse.
+    let held = t
+        .kine
+        .clone()
+        .get(claim.clone(), None)
+        .await
+        .expect("read kine");
+    assert_eq!(held.kvs().len(), 1, "the claim is not in kine");
+
+    let mut gw = gateway(&t.cp, &t.bundle).await;
+    for (key, prefix) in [
+        (claim.clone(), false),
+        (format!("/aisix/_cp/{env_id}/"), true),
+        ("/aisix/_cp/".to_string(), true),
+    ] {
+        let options = prefix.then(|| GetOptions::new().with_prefix());
+        let status = status_of(gw.get(key.clone(), options).await);
+        assert_eq!(status.code(), Code::PermissionDenied, "{key}: {status:?}");
+        assert_eq!(status.message(), outside(&t.cp), "{key}");
+    }
+    let status = status_of(
+        gw.watch(claim, None)
+            .await
+            .map(|(watcher, _)| watcher.watch_id()),
+    );
+    assert_eq!(status.code(), Code::PermissionDenied, "{status:?}");
+}
