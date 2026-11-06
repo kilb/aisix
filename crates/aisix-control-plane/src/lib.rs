@@ -170,6 +170,9 @@ where
         stale_secs: gateways::stale_window_secs(&cfg),
     };
     tenants::ensure_internal_tenant(&db, &write_ctx).await?;
+    keys::bring_documents_up_to(&db, &write_ctx, keys::KEY_DOC_VERSION)
+        .await
+        .map_err(|e| BootError::KeyDocuments(format!("{}: {}", e.code, e.message)))?;
     let passwords = PasswordGate::new(ARGON2_GATE_PERMITS)?;
     let creds = CredentialCache::load(&db.dedicated(CREDENTIALS_POOL_SIZE)).await?;
     let dp_tls = match dp::listener::server_tls(&pki, &cfg.dp_hosts, true) {

@@ -24,7 +24,7 @@ use axum::{Json, Router};
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 
-use crate::auth::{MemberRole, OperatorRole};
+use crate::auth::{MemberRole, OperatorRole, KEY_HOLDERS};
 use crate::error::{ApiError, Detail};
 use crate::{
     audit, dp, gateways, keys, members, operators, projector, resources, rollout, tenants, usage,
@@ -285,10 +285,6 @@ const EVERY_MEMBER: &[MemberRole] = &[
 /// The tenant roles that manage members.
 const MANAGERS: &[MemberRole] = &[MemberRole::Owner, MemberRole::Admin];
 
-/// The tenant roles that hold keys: a member their own, the managers every
-/// key of the tenant.
-const KEY_HOLDERS: &[MemberRole] = &[MemberRole::Owner, MemberRole::Admin, MemberRole::Member];
-
 /// The member routes a member of a tenant that is not active (pending
 /// approval, or suspended) may still call, to see the tenant's state and
 /// keep their own account; on every other member route they get `403
@@ -512,6 +508,11 @@ mod tests {
     use std::path::Path;
 
     use super::{MinRole, INACTIVE_TENANT_ROUTES, ROUTE_ROLES};
+    use crate::auth::{MemberRole, KEY_HOLDERS};
+
+    /// The role lists a handler may name in `.require(..)` instead of
+    /// spelling the roles out, by the name it uses.
+    const NAMED_ROLE_LISTS: &[(&str, &[MemberRole])] = &[("KEY_HOLDERS", KEY_HOLDERS)];
 
     /// The part of `src` before its test module.
     fn production(src: &str) -> &str {
@@ -691,8 +692,12 @@ mod tests {
                 let names: Vec<String> =
                     roles.iter().map(|r| format!("MemberRole::{r:?}")).collect();
                 let check = format!(".require(&[{}])", names.join(","));
+                // A named list stands for its roles, and only for them.
+                let named = NAMED_ROLE_LISTS.iter().any(|(name, list)| {
+                    list == roles && compact.contains(&format!(".require({name})"))
+                });
                 assert!(
-                    compact.replace(",])", "])").contains(&check),
+                    compact.replace(",])", "])").contains(&check) || named,
                     "{method} {path}: {handler} must call {check}, the roles its ROUTE_ROLES row names"
                 );
                 let open = INACTIVE_TENANT_ROUTES.contains(&(method.as_str(), path.as_str()));

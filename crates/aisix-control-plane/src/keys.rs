@@ -42,14 +42,16 @@ use sqlx::PgConnection;
 use uuid::Uuid;
 
 use crate::audit::{self, Actor, AuditEntry};
-use crate::auth::{MemberAuth, MemberRole, OperatorAuth, OperatorRole};
-use crate::db::DbError;
+use crate::auth::{MemberAuth, OperatorAuth, OperatorRole, KEY_HOLDERS};
+use crate::compat;
+use crate::db::{Db, DbError};
 use crate::error::{ApiError, Detail};
 use crate::http::ApiJson;
 use crate::members;
 use crate::resources::api::if_match;
 use crate::resources::write::WriteCtx;
 use crate::resources::Kind;
+use crate::settings;
 use crate::tenants::{self, TenantRow, TenantStatus};
 use crate::AppState;
 
@@ -114,9 +116,11 @@ pub struct KeyRow {
     /// The groups set for this key alone; `None` takes the tenant's.
     pub allowed_provider_groups: Option<Vec<String>>,
     pub rate_limit: KeyLimits,
-    /// Switched off by its holder or an operator, whatever the tenant's or
-    /// the member's state.
+    /// Switched off on the tenant's side (by a member who may change the
+    /// key), whatever the tenant's or the member's state.
     pub disabled: bool,
+    /// Switched off by an operator. Only an operator switches it on again.
+    pub operator_disabled: bool,
     pub expires_at: Option<DateTime<Utc>>,
     pub version: i64,
     pub created_at: DateTime<Utc>,
@@ -134,13 +138,15 @@ type RawKey = (
     Option<Vec<String>>,
     Value,
     bool,
+    bool,
     Option<DateTime<Utc>>,
     i64,
     DateTime<Utc>,
 );
 
 const COLUMNS: &str = "id, tenant_id, member_id, label, key_hash, key_prefix, model_ids, \
-     allowed_models, allowed_provider_groups, rate_limit, disabled, expires_at, version, created_at";
+     allowed_models, allowed_provider_groups, rate_limit, disabled, operator_disabled, expires_at, \
+     version, created_at";
 
 impl KeyRow {
     fn from_raw(raw: RawKey) -> Result<KeyRow, ApiError> {
@@ -156,6 +162,7 @@ impl KeyRow {
             allowed_provider_groups,
             rate_limit,
             disabled,
+            operator_disabled,
             expires_at,
             version,
             created_at,
@@ -172,6 +179,7 @@ impl KeyRow {
             allowed_provider_groups,
             rate_limit: serde_json::from_value(rate_limit).map_err(ApiError::internal)?,
             disabled,
+            operator_disabled,
             expires_at,
             version,
             created_at,
@@ -245,19 +253,32 @@ fn effective_limits(t: &TenantRow, k: &KeyRow) -> KeyLimits {
     }
 }
 
-/// Whether the gateway refuses a key of `t`: switched off itself, its
-/// tenant not active, or its member disabled or removed (`member_active`
-/// false). A customer key with no provider group would reach every
-/// upstream; no customer can be saved so, and one found so stays closed.
+/// Whether the gateway refuses a key of `t`: switched off on the tenant's
+/// side or by an operator, its tenant not active, or its member no longer
+/// holding keys (`member_active` false). A customer key with no provider
+/// group would reach every upstream; no customer can be saved so, and one
+/// found so stays closed.
 fn effective_disabled(t: &TenantRow, k: &KeyRow, member_active: bool) -> bool {
     k.disabled
+        || k.operator_disabled
         || t.status != TenantStatus::Active
         || !member_active
         || (!t.is_internal && effective_groups(t, k).is_empty())
 }
 
+/// The shape of the documents [`build_key_doc`] writes. A release that
+/// changes what a key document carries raises it, and that release's first
+/// boot rewrites every key's document ([`bring_documents_up_to`]): nothing
+/// else rewrites a key whose own state did not change.
+pub const KEY_DOC_VERSION: u32 = 1;
+
+/// The `cp_settings` key the shape the stored key documents were last
+/// written in is kept under.
+const KEY_DOC_VERSION_SETTING: &str = "key_doc_version";
+
 /// The gateway `api_keys` document of key `k` of tenant `t`, whose member,
-/// if it has one, is `member_active` (neither disabled nor removed).
+/// if it has one, is `member_active`: neither disabled nor removed, and in
+/// a role that holds keys ([`KEY_HOLDERS`]; a billing member holds none).
 ///
 /// - `key_hash`, `display_name` (the label), `team_id` (the tenant) and
 ///   `user_id` (the member, when there is one).
@@ -349,33 +370,44 @@ async fn live_key(
         .ok_or_else(ApiError::not_found)
 }
 
-/// The members of `tenant_id` who are disabled or removed.
+/// The roles of [`KEY_HOLDERS`], as stored.
+fn holder_roles() -> Vec<&'static str> {
+    KEY_HOLDERS.iter().map(|role| role.as_str()).collect()
+}
+
+/// The members of `tenant_id` whose keys do not work: disabled, removed, or
+/// in a role that holds no keys.
 async fn inactive_members(
     conn: &mut PgConnection,
     tenant_id: Uuid,
 ) -> Result<HashSet<Uuid>, ApiError> {
     let ids: Vec<Uuid> = sqlx::query_scalar(
-        "SELECT id FROM members WHERE tenant_id = $1 AND (disabled OR removed_at IS NOT NULL)",
+        "SELECT id FROM members WHERE tenant_id = $1 \
+           AND (disabled OR removed_at IS NOT NULL OR NOT role = ANY($2))",
     )
     .bind(tenant_id)
+    .bind(holder_roles())
     .fetch_all(conn)
     .await
     .map_err(DbError::from)?;
     Ok(ids.into_iter().collect())
 }
 
-/// Whether a key bound to `member_id` follows an active member: true for a
-/// key bound to nobody.
+/// Whether a key bound to `member_id` follows a member whose keys work
+/// (neither disabled nor removed, and in a role that holds keys): true for
+/// a key bound to nobody.
 async fn member_active(conn: &mut PgConnection, member_id: Option<Uuid>) -> Result<bool, ApiError> {
     let Some(member_id) = member_id else {
         return Ok(true);
     };
-    let active: Option<bool> =
-        sqlx::query_scalar("SELECT NOT disabled AND removed_at IS NULL FROM members WHERE id = $1")
-            .bind(member_id)
-            .fetch_optional(conn)
-            .await
-            .map_err(DbError::from)?;
+    let active: Option<bool> = sqlx::query_scalar(
+        "SELECT NOT disabled AND removed_at IS NULL AND role = ANY($2) FROM members WHERE id = $1",
+    )
+    .bind(member_id)
+    .bind(holder_roles())
+    .fetch_optional(conn)
+    .await
+    .map_err(DbError::from)?;
     Ok(active.unwrap_or(false))
 }
 
@@ -434,12 +466,13 @@ pub async fn reproject_member(
 /// Revokes every live key of member `member_id`, who is being removed: each
 /// is marked revoked and its document deleted, in the removal's transaction
 /// and before the member's `users` document, which the key documents name.
-/// The caller holds the member's tenant's lock. How many were revoked.
+/// The caller holds the member's tenant's lock. The keys revoked, in id
+/// order.
 pub async fn revoke_member(
     conn: &mut PgConnection,
     ctx: &WriteCtx,
     member_id: Uuid,
-) -> Result<u64, ApiError> {
+) -> Result<Vec<Uuid>, ApiError> {
     let mut revoked: Vec<Uuid> = sqlx::query_scalar(
         "UPDATE tenant_keys SET revoked_at = now(), version = version + 1 \
          WHERE member_id = $1 AND revoked_at IS NULL RETURNING id",
@@ -452,7 +485,73 @@ pub async fn revoke_member(
     for id in &revoked {
         tenants::retire(&mut *conn, ctx, Kind::ApiKeys, *id, &owner(*id)).await?;
     }
-    Ok(revoked.len() as u64)
+    Ok(revoked)
+}
+
+/// Rewrites every live key's document when the stored key documents were
+/// written in a shape older than `version` (the boot passes
+/// [`KEY_DOC_VERSION`]), then records `version`. Runs at boot under the
+/// boot lock, with every tenant that has keys locked first, in id order.
+///
+/// Each tenant's keys are rewritten in a savepoint. One the gateway-version
+/// gate refuses (an older gateway is registered, as during every upgrade)
+/// is rolled back and logged, and `version` is then not recorded, so the
+/// next boot rewrites every tenant again; rewriting a document already as
+/// it should be writes nothing. Any other error fails the boot. How many
+/// tenants were left for a later boot.
+pub async fn bring_documents_up_to(
+    db: &Db,
+    ctx: &WriteCtx,
+    version: u32,
+) -> Result<usize, ApiError> {
+    let ctx = WriteCtx {
+        mk: crate::crypto::MasterKey(ctx.mk.0),
+        env: ctx.env.clone(),
+        cp_version: ctx.cp_version.clone(),
+        stale_secs: ctx.stale_secs,
+    };
+    db.tx(move |conn| {
+        async move {
+            sqlx::query("SELECT pg_advisory_xact_lock($1)")
+                .bind(settings::BOOT_LOCK_KEY)
+                .execute(&mut *conn)
+                .await
+                .map_err(DbError::from)?;
+            let stored = settings::get(&mut *conn, KEY_DOC_VERSION_SETTING)
+                .await?
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            if stored >= u64::from(version) {
+                return Ok(0);
+            }
+            let mut holders: Vec<Uuid> = sqlx::query_scalar(
+                "SELECT DISTINCT tenant_id FROM tenant_keys WHERE revoked_at IS NULL",
+            )
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(DbError::from)?;
+            tenants::lock_many(&mut *conn, &mut holders).await?;
+            let mut deferred = 0;
+            for tenant_id in holders {
+                tenants::boot_savepoint(&mut *conn).await?;
+                let outcome = reproject_tenant(&mut *conn, &ctx, tenant_id).await;
+                if !tenants::settle_boot_projection(&mut *conn, outcome).await? {
+                    deferred += 1;
+                    tracing::warn!(
+                        tenant = %tenant_id,
+                        "a tenant's key documents were not rewritten: a registered gateway is \
+                         too old for them; the next boot tries again"
+                    );
+                }
+            }
+            if deferred == 0 {
+                settings::set(&mut *conn, KEY_DOC_VERSION_SETTING, &json!(version)).await?;
+            }
+            Ok::<_, ApiError>(deferred)
+        }
+        .boxed()
+    })
+    .await
 }
 
 fn detail(path: &str, message: impl Into<String>) -> Detail {
@@ -567,7 +666,10 @@ struct Changes {
     allowed_models: Option<Option<Vec<String>>>,
     allowed_provider_groups: Option<Option<Vec<String>>>,
     rate_limit: Option<Option<LimitsBody>>,
+    /// The tenant's switch, set on `/api`.
     disabled: Option<bool>,
+    /// The operators' switch, set on `/admin`.
+    operator_disabled: Option<bool>,
     expires_at: Option<Option<String>>,
 }
 
@@ -580,7 +682,10 @@ impl Changes {
                 "allowed_provider_groups",
                 self.allowed_provider_groups.is_some(),
             ),
-            ("disabled", self.disabled.is_some()),
+            (
+                "disabled",
+                self.disabled.is_some() || self.operator_disabled.is_some(),
+            ),
             ("expires_at", self.expires_at.is_some()),
             ("label", self.label.is_some()),
             ("model_ids", self.model_ids.is_some()),
@@ -589,6 +694,17 @@ impl Changes {
         .into_iter()
         .filter_map(|(field, given)| given.then_some(field))
         .collect()
+    }
+
+    /// What an audit row records of the changes: the fields given, and the
+    /// value of the switch when it was set (the tenant's on `/api`, the
+    /// operators' on `/admin`, as the actor tells).
+    fn audit_detail(&self) -> Value {
+        let mut detail = json!({ "fields": self.fields() });
+        if let Some(disabled) = self.disabled.or(self.operator_disabled) {
+            detail["disabled"] = json!(disabled);
+        }
+        detail
     }
 
     /// Writes the changes onto `key`, each checked against its tenant `t`:
@@ -642,6 +758,9 @@ impl Changes {
         if let Some(disabled) = self.disabled {
             next.disabled = disabled;
         }
+        if let Some(disabled) = self.operator_disabled {
+            next.operator_disabled = disabled;
+        }
         if let Some(raw) = self.expires_at {
             match raw.as_deref().map(checked_expiry).transpose() {
                 Ok(at) => next.expires_at = at,
@@ -666,22 +785,29 @@ where
     Option::<T>::deserialize(d).map(Some)
 }
 
-/// The live member `raw` names in tenant `tenant_id`, for a key to be bound
-/// to; `422` at `/member_id` otherwise, whatever the reason, so a member of
-/// another tenant answers as an id that names nothing.
+/// The live member `raw` names in tenant `tenant_id`, in a role that holds
+/// keys, for a key to be bound to; `422` at `/member_id` otherwise,
+/// whatever the reason, so a member of another tenant answers as an id that
+/// names nothing.
 async fn bound_member(
     conn: &mut PgConnection,
     tenant_id: Uuid,
     raw: &str,
 ) -> Result<Uuid, ApiError> {
-    let refused = || ApiError::validation(vec![detail("/member_id", "成员不存在")]);
+    let refused = || {
+        ApiError::validation(vec![detail(
+            "/member_id",
+            "成员不存在，或该成员的角色不能持有密钥",
+        )])
+    };
     let id = Uuid::parse_str(raw).map_err(|_| refused())?;
     let live: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM members \
-         WHERE id = $1 AND tenant_id = $2 AND removed_at IS NULL)",
+         WHERE id = $1 AND tenant_id = $2 AND removed_at IS NULL AND role = ANY($3))",
     )
     .bind(id)
     .bind(tenant_id)
+    .bind(holder_roles())
     .fetch_one(conn)
     .await
     .map_err(DbError::from)?;
@@ -755,6 +881,7 @@ async fn create_key(
         allowed_provider_groups: None,
         rate_limit: KeyLimits::default(),
         disabled: false,
+        operator_disabled: false,
         expires_at: None,
         version: 1,
         created_at: Utc::now(),
@@ -769,9 +896,9 @@ async fn create_key(
     let rate_limit = serde_json::to_value(key.rate_limit).map_err(ApiError::internal)?;
     let raw: RawKey = sqlx::query_as(&format!(
         "INSERT INTO tenant_keys (id, tenant_id, member_id, label, key_hash, key_prefix, \
-           model_ids, allowed_models, allowed_provider_groups, rate_limit, disabled, expires_at, \
-           created_by_kind, created_by) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) \
+           model_ids, allowed_models, allowed_provider_groups, rate_limit, disabled, \
+           operator_disabled, expires_at, created_by_kind, created_by) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) \
          RETURNING {COLUMNS}"
     ))
     .bind(key.id)
@@ -785,6 +912,7 @@ async fn create_key(
     .bind(&key.allowed_provider_groups)
     .bind(rate_limit)
     .bind(key.disabled)
+    .bind(key.operator_disabled)
     .bind(key.expires_at)
     .bind(created_by_kind)
     .bind(created_by)
@@ -817,7 +945,7 @@ async fn update_key(
     changes: Changes,
     by: Actor<'_>,
 ) -> Result<KeyRow, ApiError> {
-    let fields = changes.fields();
+    let detail = changes.audit_detail();
     let limits_given = changes.rate_limit.is_some();
     changes.apply(t, &mut key)?;
     // Limits left out keep what is stored, including fields a newer release
@@ -829,7 +957,7 @@ async fn update_key(
     let raw: RawKey = sqlx::query_as(&format!(
         "UPDATE tenant_keys SET label = $2, model_ids = $3, allowed_models = $4, \
            allowed_provider_groups = $5, rate_limit = COALESCE($6, rate_limit), disabled = $7, \
-           expires_at = $8, version = version + 1 \
+           operator_disabled = $8, expires_at = $9, version = version + 1 \
          WHERE id = $1 RETURNING {COLUMNS}"
     ))
     .bind(key.id)
@@ -839,6 +967,7 @@ async fn update_key(
     .bind(&key.allowed_provider_groups)
     .bind(rate_limit)
     .bind(key.disabled)
+    .bind(key.operator_disabled)
     .bind(key.expires_at)
     .fetch_one(&mut *conn)
     .await
@@ -846,11 +975,7 @@ async fn update_key(
     let key = KeyRow::from_raw(raw)?;
     let active = member_active(&mut *conn, key.member_id).await?;
     project(&mut *conn, ctx, t, &key, active).await?;
-    audit::record(
-        conn,
-        audit_entry(by, "key.update", &key, json!({ "fields": fields })),
-    )
-    .await?;
+    audit::record(conn, audit_entry(by, "key.update", &key, detail)).await?;
     Ok(key)
 }
 
@@ -902,7 +1027,10 @@ pub struct TenantKeyView {
     owner: Option<KeyOwner>,
     model_ids: Option<Vec<Uuid>>,
     rate_limit: KeyLimits,
+    /// The tenant's own switch, which `PATCH /api/keys/{id}` sets.
     disabled: bool,
+    /// Switched off by the platform; only the platform switches it on.
+    disabled_by_platform: bool,
     expires_at: Option<DateTime<Utc>>,
     created_at: DateTime<Utc>,
     version: i64,
@@ -935,6 +1063,7 @@ async fn tenant_views(
             model_ids: k.model_ids,
             rate_limit: k.rate_limit,
             disabled: k.disabled,
+            disabled_by_platform: k.operator_disabled,
             expires_at: k.expires_at,
             created_at: k.created_at,
             version: k.version,
@@ -963,7 +1092,11 @@ pub struct AdminKeyView {
     allowed_provider_groups: Option<Vec<String>>,
     effective_provider_groups: Vec<String>,
     rate_limit: KeyLimits,
+    /// The operators' switch, which `PATCH /admin/keys/{id}` sets: the key
+    /// stays off while it is set, whatever the tenant does.
     disabled: bool,
+    /// The tenant's own switch, which operators do not set.
+    disabled_by_tenant: bool,
     effective_disabled: bool,
     expires_at: Option<DateTime<Utc>>,
     created_at: DateTime<Utc>,
@@ -983,7 +1116,8 @@ fn admin_view(t: &TenantRow, k: KeyRow, member_active: bool) -> AdminKeyView {
         allowed_models: k.allowed_models,
         allowed_provider_groups: k.allowed_provider_groups,
         rate_limit: k.rate_limit,
-        disabled: k.disabled,
+        disabled: k.operator_disabled,
+        disabled_by_tenant: k.disabled,
         expires_at: k.expires_at,
         created_at: k.created_at,
         version: k.version,
@@ -1005,12 +1139,7 @@ async fn holder(
     conn: &mut PgConnection,
     auth: &MemberAuth,
 ) -> Result<(MemberAuth, TenantRow), ApiError> {
-    let auth = members::current(
-        &mut *conn,
-        auth,
-        &[MemberRole::Owner, MemberRole::Admin, MemberRole::Member],
-    )
-    .await?;
+    let auth = members::current(&mut *conn, auth, KEY_HOLDERS).await?;
     let tenant = tenants::lock(conn, auth.tenant_id).await?;
     Ok((auth, tenant))
 }
@@ -1030,8 +1159,10 @@ fn member_actor(auth: &MemberAuth) -> Actor<'_> {
 
 /// An error as `/api` answers it: a refusal by the gateway-version gate is
 /// a neutral `503 unavailable`, so a tenant learns nothing of the gateways.
-fn on_api(e: ApiError) -> ApiError {
-    if e.code == "gateway_too_old" {
+/// Every `/api` route whose writes reach key documents maps its answer
+/// through this.
+pub(crate) fn on_api(e: ApiError) -> ApiError {
+    if compat::refused(&e) {
         tracing::info!("a tenant key write waits for the gateways to be upgraded");
         return ApiError::unavailable();
     }
@@ -1116,7 +1247,8 @@ impl From<AdminUpdateKey> for Changes {
             allowed_models: req.allowed_models,
             allowed_provider_groups: req.allowed_provider_groups,
             rate_limit: req.rate_limit,
-            disabled: req.disabled,
+            disabled: None,
+            operator_disabled: req.disabled,
             expires_at: req.expires_at,
         }
     }
@@ -1129,7 +1261,7 @@ pub async fn list(
     State(state): State<AppState>,
 ) -> Result<Json<Value>, ApiError> {
     auth.require_active()?;
-    auth.require(&[MemberRole::Owner, MemberRole::Admin, MemberRole::Member])?;
+    auth.require(KEY_HOLDERS)?;
     let mut conn = state.db.pool().acquire().await.map_err(DbError::from)?;
     let keys = select(&mut conn, None, Some(auth.tenant_id), own_only(&auth)).await?;
     let items = tenant_views(&mut conn, keys).await?;
@@ -1143,7 +1275,7 @@ pub async fn get(
     Path(id): Path<String>,
 ) -> Result<Response, ApiError> {
     auth.require_active()?;
-    auth.require(&[MemberRole::Owner, MemberRole::Admin, MemberRole::Member])?;
+    auth.require(KEY_HOLDERS)?;
     let id = key_id(&id)?;
     let mut conn = state.db.pool().acquire().await.map_err(DbError::from)?;
     let key = live_key(&mut conn, id, Some(auth.tenant_id), own_only(&auth)).await?;
@@ -1163,7 +1295,7 @@ pub async fn create(
     ApiJson(req): ApiJson<CreateKey>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     auth.require_active()?;
-    auth.require(&[MemberRole::Owner, MemberRole::Admin, MemberRole::Member])?;
+    auth.require(KEY_HOLDERS)?;
     let ctx = WriteCtx::of(&state);
     let (view, plaintext) = state
         .db
@@ -1215,7 +1347,8 @@ pub async fn create(
 /// `PATCH /api/keys/{id}` with `{label?, model_ids?, rate_limit?,
 /// disabled?, expires_at?}` and `If-Match` → `200 TenantKey`. The key is
 /// looked up before `If-Match` is read, so `428` and `412` answer only for
-/// the caller's own keys.
+/// the caller's own keys. `disabled` is the tenant's own switch; `false`
+/// for a key the platform switched off is `403 forbidden`.
 pub async fn update(
     auth: MemberAuth,
     State(state): State<AppState>,
@@ -1224,7 +1357,7 @@ pub async fn update(
     ApiJson(req): ApiJson<UpdateKey>,
 ) -> Result<Json<TenantKeyView>, ApiError> {
     auth.require_active()?;
-    auth.require(&[MemberRole::Owner, MemberRole::Admin, MemberRole::Member])?;
+    auth.require(KEY_HOLDERS)?;
     let id = key_id(&id)?;
     let expected = if_match(&headers);
     let ctx = WriteCtx::of(&state);
@@ -1235,6 +1368,13 @@ pub async fn update(
                 let (auth, tenant) = holder(&mut *conn, &auth).await?;
                 let key = live_key(&mut *conn, id, Some(tenant.id), own_only(&auth)).await?;
                 check_version(&key, expected)?;
+                // The platform's switch is the platform's to undo.
+                if key.operator_disabled && req.disabled == Some(false) {
+                    return Err(ApiError {
+                        message: "该密钥已被平台停用，只有平台可以重新启用".to_string(),
+                        ..ApiError::forbidden()
+                    });
+                }
                 let key = update_key(
                     &mut *conn,
                     &ctx,
@@ -1261,7 +1401,7 @@ pub async fn revoke(
     headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
     auth.require_active()?;
-    auth.require(&[MemberRole::Owner, MemberRole::Admin, MemberRole::Member])?;
+    auth.require(KEY_HOLDERS)?;
     let id = key_id(&id)?;
     let expected = if_match(&headers);
     let ctx = WriteCtx::of(&state);
@@ -1331,7 +1471,7 @@ pub async fn admin_create(
                     allowed_provider_groups: req.allowed_provider_groups.map(Some),
                     rate_limit: req.rate_limit.map(Some),
                     expires_at: req.expires_at.map(Some),
-                    disabled: None,
+                    ..Changes::default()
                 };
                 let (key, plaintext) = create_key(
                     &mut *conn,
@@ -1381,7 +1521,9 @@ async fn locked_key(conn: &mut PgConnection, id: Uuid) -> Result<(KeyRow, Tenant
 
 /// `PATCH /admin/keys/{id}` with `{label?, model_ids?, allowed_models?,
 /// allowed_provider_groups?, rate_limit?, disabled?, expires_at?}` and
-/// `If-Match` → `200 AdminKey`.
+/// `If-Match` → `200 AdminKey`. `disabled` is the operators' switch: it
+/// keeps the key off whatever the tenant does, and clearing it leaves the
+/// tenant's own switch as it is.
 pub async fn admin_update(
     auth: OperatorAuth,
     State(state): State<AppState>,
@@ -1495,6 +1637,7 @@ mod tests {
             allowed_provider_groups: None,
             rate_limit: KeyLimits::default(),
             disabled: false,
+            operator_disabled: false,
             expires_at: None,
             version: 1,
             created_at: Utc::now(),
@@ -1598,8 +1741,12 @@ mod tests {
             ..key(None)
         };
         assert_eq!(build_key_doc(&active, &off, true)["disabled"], true);
-        // The key's own flag is what an operator or a member set, and stays.
-        assert!(off.disabled);
+        // An operator's switch closes it whatever the tenant's is.
+        let by_platform = KeyRow {
+            operator_disabled: true,
+            ..key(None)
+        };
+        assert_eq!(build_key_doc(&active, &by_platform, true)["disabled"], true);
     }
 
     #[test]

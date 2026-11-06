@@ -32,6 +32,7 @@ use uuid::Uuid;
 
 use crate::audit::{self, Actor, AuditEntry};
 use crate::auth::{OperatorAuth, OperatorRole};
+use crate::compat;
 use crate::db::{Db, DbError};
 use crate::error::{ApiError, BootError, Detail};
 use crate::gateways::stale_window_secs;
@@ -548,7 +549,9 @@ pub(crate) async fn retire(
 
 /// The platform's own tenant (`is_internal`, active, named
 /// [`INTERNAL_TENANT_NAME`], with no limits and no groups), created by the
-/// first boot; later boots find it and bring its documents up to date.
+/// first boot; later boots find it and bring its documents up to date,
+/// unless the gateway-version gate refuses that, which is logged and left
+/// for a later boot ([`settle_boot_projection`]).
 /// The same boot writes the first tenant defaults (ruling 14).
 ///
 /// Runs under the boot lock, so instances booting together create it once;
@@ -576,7 +579,15 @@ pub async fn ensure_internal_tenant(db: &Db, ctx: &WriteCtx) -> Result<TenantRow
             match existing {
                 Some(id) => {
                     lock(&mut *conn, id).await?;
-                    project(&mut *conn, &ctx, id).await?;
+                    boot_savepoint(&mut *conn).await?;
+                    let outcome = project(&mut *conn, &ctx, id).await;
+                    if !settle_boot_projection(&mut *conn, outcome).await? {
+                        tracing::warn!(
+                            tenant = %id,
+                            "the platform's own tenant was not re-projected: a registered \
+                             gateway is too old for its documents; the next boot tries again"
+                        );
+                    }
                     lock(conn, id).await
                 }
                 None => {
@@ -601,6 +612,37 @@ pub async fn ensure_internal_tenant(db: &Db, ctx: &WriteCtx) -> Result<TenantRow
     })
     .await
     .map_err(|e: ApiError| BootError::InternalTenant(format!("{}: {}", e.code, e.message)))
+}
+
+/// Starts the savepoint a projection made at boot runs in; it is ended by
+/// [`settle_boot_projection`].
+pub(crate) async fn boot_savepoint(conn: &mut PgConnection) -> Result<(), ApiError> {
+    sqlx::query("SAVEPOINT boot_projection")
+        .execute(conn)
+        .await
+        .map_err(DbError::from)?;
+    Ok(())
+}
+
+/// Ends a projection made at boot, begun with [`boot_savepoint`], by its
+/// `outcome`: kept when it succeeded (`true`); undone when the
+/// gateway-version gate refused it (`false`), since every upgrade boots the
+/// control plane while older gateways are still registered and the boot
+/// must not fail for that; any other error is returned, and fails the boot.
+pub(crate) async fn settle_boot_projection(
+    conn: &mut PgConnection,
+    outcome: Result<(), ApiError>,
+) -> Result<bool, ApiError> {
+    let (statement, kept) = match outcome {
+        Ok(()) => ("RELEASE SAVEPOINT boot_projection", true),
+        Err(e) if compat::refused(&e) => ("ROLLBACK TO SAVEPOINT boot_projection", false),
+        Err(e) => return Err(e),
+    };
+    sqlx::query(statement)
+        .execute(conn)
+        .await
+        .map_err(DbError::from)?;
+    Ok(kept)
 }
 
 /// The tenants whose grants, or whose live keys' selections, include

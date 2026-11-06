@@ -37,7 +37,7 @@ use uuid::Uuid;
 use crate::audit::{self, Actor, AuditEntry};
 use crate::auth::password::{self, normalize_email, LoginThrottle, MIN_PASSWORD_LEN};
 use crate::auth::session::{self, Principal, PrincipalKind, MEMBER_SESSION_TTL, PORTAL_COOKIE};
-use crate::auth::{MemberAuth, MemberRole, OperatorAuth, OperatorRole};
+use crate::auth::{MemberAuth, MemberRole, OperatorAuth, OperatorRole, KEY_HOLDERS};
 use crate::db::DbError;
 use crate::error::{ApiError, Detail};
 use crate::http::{ApiJson, API_CONTRACT};
@@ -1259,7 +1259,9 @@ pub struct UpdateMember {
 
 /// `PATCH /api/members/{id}` with `{role}` → `200 Member`. Only an owner
 /// changes an owner or makes one; the last enabled owner keeps the role
-/// (`409 last_owner`).
+/// (`409 last_owner`). A move to or from billing closes or reopens the
+/// member's keys in the same transaction; a reopening the gateway-version
+/// gate refuses is `503 unavailable`, as on every `/api` key write.
 pub async fn update(
     auth: MemberAuth,
     State(state): State<AppState>,
@@ -1269,6 +1271,7 @@ pub async fn update(
     auth.require_active()?;
     auth.require(&[MemberRole::Owner, MemberRole::Admin])?;
     let id = parse_id(&id)?;
+    let ctx = WriteCtx::of(&state);
     let view = state
         .db
         .tx(move |conn| {
@@ -1304,6 +1307,11 @@ pub async fn update(
                     Some(all) => revoke_issued_invites(&mut *conn, auth.tenant_id, id, all).await?,
                     None => 0,
                 };
+                // A billing member holds no working key: their keys close
+                // with the demotion and open again with a promotion.
+                if KEY_HOLDERS.contains(&target.role) != KEY_HOLDERS.contains(&req.role) {
+                    keys::reproject_member(&mut *conn, &ctx, id).await?;
+                }
                 audit::record(
                     conn,
                     member_entry(
@@ -1325,7 +1333,8 @@ pub async fn update(
             }
             .boxed()
         })
-        .await?;
+        .await
+        .map_err(keys::on_api)?;
     Ok(Json(view))
 }
 
