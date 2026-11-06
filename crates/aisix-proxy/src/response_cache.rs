@@ -202,27 +202,46 @@ impl CacheTelemetry {
 /// It keys on the caller alone, never on a model, so every model kind is
 /// scoped the same way.
 ///
+/// `None` is the one value that shares an entry with every caller, and only
+/// `env` returns it, so a scope that yields some other value can never widen
+/// to environment-wide by accident.
+///
 /// - `api_key`: the key's id, bare. That is the value every entry stored
 ///   under this scope has always been keyed by, so those entries stay
 ///   reachable.
-/// - `env`: empty, so every caller shares, as it always has.
+/// - `env`: `None`, so every caller shares, as it always has.
 /// - `team`: `team:<team_id>`, shared by the keys of one team. A key with no
 ///   team, or an empty `team_id`, gets `key:<id>` and shares with no one: a
 ///   key nobody assigned to a tenant must not land in some tenant's entries.
 ///   The two prefixes keep a team's value from ever equalling a key's.
-pub(crate) fn cache_scope_value(scope: CacheScope, auth: &AuthenticatedKey) -> String {
+pub(crate) fn cache_scope_value(scope: CacheScope, auth: &AuthenticatedKey) -> Option<String> {
     match scope {
-        CacheScope::ApiKey => auth.entry.id.clone(),
-        CacheScope::Env => String::new(),
-        CacheScope::Team => match auth
-            .key()
-            .team_id
-            .as_deref()
-            .filter(|team| !team.is_empty())
-        {
-            Some(team) => format!("team:{team}"),
-            None => format!("key:{}", auth.entry.id),
-        },
+        CacheScope::ApiKey => Some(auth.entry.id.clone()),
+        CacheScope::Env => None,
+        CacheScope::Team => Some(
+            match auth
+                .key()
+                .team_id
+                .as_deref()
+                .filter(|team| !team.is_empty())
+            {
+                Some(team) => format!("team:{team}"),
+                None => format!("key:{}", auth.entry.id),
+            },
+        ),
+    }
+}
+
+/// A scope value as a part of the body fingerprint. Entries every caller
+/// shares have always been stored under an empty part, so only `None` is
+/// spelled that way. An empty `Some` has no spelling of its own in that
+/// key, so it gets `None` back and the request goes uncached instead of
+/// landing in the shared entries.
+fn body_scope_part(scope_value: Option<&str>) -> Option<&str> {
+    match scope_value {
+        None => Some(""),
+        Some("") => None,
+        Some(value) => Some(value),
     }
 }
 
@@ -240,7 +259,8 @@ pub(crate) struct BodyCache {
 
 impl BodyCache {
     /// Resolve the gate for this request, or `None` when no enabled policy
-    /// covers it or the policy's backend is unavailable.
+    /// covers it, the policy's backend is unavailable, or the caller's scope
+    /// value cannot be keyed (see [`body_scope_part`]).
     ///
     /// `key_material` is the endpoint's canonical request identity. Callers
     /// pass the fields that change the upstream answer; `serde_json`'s maps
@@ -276,6 +296,7 @@ impl BodyCache {
             .for_policy_backend(entry.value.backend, &entry.id, &entry.value.name)?
             .clone();
         let scope_value = cache_scope_value(entry.value.scope, auth);
+        let scope_part = body_scope_part(scope_value.as_deref())?;
         let generation = entry.value.purge_generation.to_string();
         let key_material = key_material();
         let vary_tags = crate::routing::cache_vary_tags(model, &client.routing_tags);
@@ -285,7 +306,7 @@ impl BodyCache {
             &key_material,
             &entry.id,
             &generation,
-            &scope_value,
+            scope_part,
         ];
         // Only when present, so every entry of a model routing tags cannot
         // steer keeps its fingerprint.
@@ -560,7 +581,7 @@ mod tests {
         let chat = aisix_cache::CacheKey::from_request(&req).with_scope(
             "policy-1",
             0,
-            &cache_scope_value(scope, &auth),
+            cache_scope_value(scope, &auth).as_deref(),
         );
         Keys {
             exact: chat.fingerprint(),
@@ -634,6 +655,50 @@ mod tests {
             &key_for(CacheScope::Team, None, "k1"),
             &key_for(CacheScope::Team, Some("k1"), "k2"),
         );
+    }
+
+    /// `None` is the only value that shares with every caller, and only `env`
+    /// produces it: every other scope names a non-empty boundary, with or
+    /// without a team on the key.
+    #[test]
+    fn only_the_env_scope_shares_with_every_caller() {
+        use aisix_core::resource::ResourceEntry;
+        for team_id in [None, Some(""), Some("t1")] {
+            let snap = AisixSnapshot::new();
+            let key: aisix_core::ApiKey =
+                serde_json::from_value(serde_json::json!({"key_hash": "h", "team_id": team_id}))
+                    .unwrap();
+            let auth = AuthenticatedKey::new(
+                &snap,
+                Arc::new(ResourceEntry::new("k1", key, 1)),
+                None,
+                false,
+            );
+            assert_eq!(cache_scope_value(CacheScope::Env, &auth), None);
+            for scope in [CacheScope::ApiKey, CacheScope::Team] {
+                let value = cache_scope_value(scope, &auth);
+                assert!(
+                    value.as_deref().is_some_and(|v| !v.is_empty()),
+                    "{scope:?} with team {team_id:?} gave {value:?}"
+                );
+            }
+        }
+    }
+
+    /// An empty value is not a way into the entries every caller shares, on
+    /// either key family: the chat key hashes it as its own bucket, and the
+    /// body key, which spells the shared entries as an empty part, refuses it.
+    #[test]
+    fn an_empty_scope_value_never_lands_in_the_shared_entries() {
+        let req = aisix_gateway::ChatFormat::new("m", vec![ChatMessage::user("hi")]);
+        let empty = aisix_cache::CacheKey::from_request(&req).with_scope("policy-1", 0, Some(""));
+        let shared = legacy(LEGACY_ENV_FINGERPRINT);
+        assert_ne!(empty.fingerprint(), shared.exact);
+        assert_ne!(empty.scope_fingerprint(), shared.partition);
+
+        assert_eq!(body_scope_part(None), Some(""));
+        assert_eq!(body_scope_part(Some("")), None);
+        assert_eq!(body_scope_part(Some("k1")), Some("k1"));
     }
 
     #[test]

@@ -110,8 +110,9 @@ pub struct CacheKey {
     /// Who may share this entry under the policy's `scope`: the value the
     /// proxy derives from the caller (its api_key id under `api_key`, its
     /// team under `team`), or `None` under `scope: env`, where every caller
-    /// shares. Part of BOTH fingerprints, so entries are invisible across
-    /// scope values.
+    /// shares. Only `None` shares; an empty `Some` is a bucket of its own.
+    /// Part of BOTH fingerprints, so entries are invisible across scope
+    /// values.
     pub scope_value: Option<String>,
 }
 
@@ -138,14 +139,18 @@ impl CacheKey {
     }
 
     /// Attach the matched policy's scope: its resource id, its current
-    /// purge generation, and the caller's scope value. An empty
-    /// `scope_value` means the entry is shared by every caller; it is
-    /// stored as `None`, which is what an environment-wide key has always
-    /// hashed, so those entries keep their fingerprints.
-    pub fn with_scope(mut self, policy_id: &str, purge_generation: u32, scope_value: &str) -> Self {
+    /// purge generation, and the caller's scope value. `None` means the
+    /// entry is shared by every caller; any `Some`, the empty string
+    /// included, keeps it to the callers that produce that value.
+    pub fn with_scope(
+        mut self,
+        policy_id: &str,
+        purge_generation: u32,
+        scope_value: Option<&str>,
+    ) -> Self {
         self.policy_id = policy_id.to_string();
         self.purge_generation = purge_generation;
-        self.scope_value = (!scope_value.is_empty()).then(|| scope_value.to_string());
+        self.scope_value = scope_value.map(str::to_string);
         self
     }
 
@@ -491,13 +496,12 @@ mod tests {
         );
     }
 
-    /// The scope value an environment-wide policy passes is empty, and an
-    /// empty value must hash exactly as the absent caller scope always did,
-    /// or every entry already stored under `scope: env` becomes unreachable.
-    /// The constants were computed on the build before the scope value
-    /// became generic.
+    /// An environment-wide policy passes no scope value, which must hash
+    /// exactly as the absent caller scope always did, or every entry already
+    /// stored under `scope: env` becomes unreachable. The constants were
+    /// computed on the build before the scope value became generic.
     #[test]
-    fn an_empty_scope_value_keeps_the_env_fingerprint() {
+    fn no_scope_value_keeps_the_env_fingerprint() {
         let key = CacheKey {
             model: "gpt-4o".into(),
             messages: vec![("user".into(), "hello".into())],
@@ -509,16 +513,34 @@ mod tests {
             purge_generation: 0,
             scope_value: None,
         }
-        .with_scope("policy-1", 3, "");
+        .with_scope("policy-1", 3, None);
         assert_eq!(key.fingerprint(), "77d81c27c3a73a84c65adb184ee0284a");
         assert_eq!(key.scope_fingerprint(), "8c0377146f1f4c0d3869aa50807db87b");
+    }
+
+    /// Only `None` shares: an empty value that some scope produced is not a
+    /// way into the entries every caller shares.
+    #[test]
+    fn an_empty_scope_value_never_lands_in_the_shared_entries() {
+        let r = req("m", vec![ChatMessage::user("hi")], None);
+        let shared = CacheKey::from_request(&r).with_scope("p", 0, None);
+        let empty = CacheKey::from_request(&r).with_scope("p", 0, Some(""));
+        assert_ne!(shared.fingerprint(), empty.fingerprint());
+        assert_ne!(shared.scope_fingerprint(), empty.scope_fingerprint());
     }
 
     #[test]
     fn distinct_scope_values_never_share_either_fingerprint() {
         let r = req("m", vec![ChatMessage::user("hi")], None);
-        let keys = ["", "key-a", "team:t1", "team:t2", "key:key-a"]
-            .map(|scope| CacheKey::from_request(&r).with_scope("p", 0, scope));
+        let keys = [
+            None,
+            Some(""),
+            Some("key-a"),
+            Some("team:t1"),
+            Some("team:t2"),
+            Some("key:key-a"),
+        ]
+        .map(|scope| CacheKey::from_request(&r).with_scope("p", 0, scope));
         for (i, a) in keys.iter().enumerate() {
             for b in &keys[i + 1..] {
                 assert_ne!(a.fingerprint(), b.fingerprint());
@@ -801,8 +823,8 @@ mod tests {
     #[test]
     fn different_policies_never_share_a_fingerprint() {
         let r = req("m", vec![ChatMessage::user("hi")], None);
-        let a = CacheKey::from_request(&r).with_scope("policy-a", 0, "");
-        let b = CacheKey::from_request(&r).with_scope("policy-b", 0, "");
+        let a = CacheKey::from_request(&r).with_scope("policy-a", 0, None);
+        let b = CacheKey::from_request(&r).with_scope("policy-b", 0, None);
         assert_ne!(a.fingerprint(), b.fingerprint());
         assert_ne!(a.scope_fingerprint(), b.scope_fingerprint());
     }
@@ -810,8 +832,8 @@ mod tests {
     #[test]
     fn purge_generation_bump_invalidates_both_fingerprints() {
         let r = req("m", vec![ChatMessage::user("hi")], None);
-        let a = CacheKey::from_request(&r).with_scope("p", 0, "");
-        let b = CacheKey::from_request(&r).with_scope("p", 1, "");
+        let a = CacheKey::from_request(&r).with_scope("p", 0, None);
+        let b = CacheKey::from_request(&r).with_scope("p", 1, None);
         assert_ne!(a.fingerprint(), b.fingerprint());
         assert_ne!(a.scope_fingerprint(), b.scope_fingerprint());
     }
@@ -819,10 +841,10 @@ mod tests {
     #[test]
     fn api_key_scope_isolates_callers_env_scope_shares() {
         let r = req("m", vec![ChatMessage::user("hi")], None);
-        let a = CacheKey::from_request(&r).with_scope("p", 0, "key-a");
-        let b = CacheKey::from_request(&r).with_scope("p", 0, "key-b");
-        let shared_a = CacheKey::from_request(&r).with_scope("p", 0, "");
-        let shared_b = CacheKey::from_request(&r).with_scope("p", 0, "");
+        let a = CacheKey::from_request(&r).with_scope("p", 0, Some("key-a"));
+        let b = CacheKey::from_request(&r).with_scope("p", 0, Some("key-b"));
+        let shared_a = CacheKey::from_request(&r).with_scope("p", 0, None);
+        let shared_b = CacheKey::from_request(&r).with_scope("p", 0, None);
         assert_ne!(a.fingerprint(), b.fingerprint());
         assert_ne!(a.scope_fingerprint(), b.scope_fingerprint());
         assert_eq!(shared_a.fingerprint(), shared_b.fingerprint());
@@ -834,9 +856,9 @@ mod tests {
         let b = req("m", vec![ChatMessage::user("совершенно другой")], Some(0.2));
         let c = req("m", vec![ChatMessage::user("hello there")], Some(0.7));
         let (ka, kb, kc) = (
-            CacheKey::from_request(&a).with_scope("p", 0, ""),
-            CacheKey::from_request(&b).with_scope("p", 0, ""),
-            CacheKey::from_request(&c).with_scope("p", 0, ""),
+            CacheKey::from_request(&a).with_scope("p", 0, None),
+            CacheKey::from_request(&b).with_scope("p", 0, None),
+            CacheKey::from_request(&c).with_scope("p", 0, None),
         );
         assert_eq!(ka.scope_fingerprint(), kb.scope_fingerprint());
         assert_ne!(ka.fingerprint(), kb.fingerprint());

@@ -2911,7 +2911,11 @@ async fn dispatch(
             let scope_value = crate::response_cache::cache_scope_value(entry.value.scope, auth);
             Some(
                 CacheKey::from_request(req)
-                    .with_scope(&entry.id, entry.value.purge_generation, &scope_value)
+                    .with_scope(
+                        &entry.id,
+                        entry.value.purge_generation,
+                        scope_value.as_deref(),
+                    )
                     .with_routing_tags(crate::routing::cache_vary_tags(
                         &virtual_entry.value,
                         &client.routing_tags,

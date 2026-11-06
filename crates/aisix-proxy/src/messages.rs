@@ -821,8 +821,9 @@ async fn dispatch(
     // The key is taken from the POST-redaction body — the bytes actually
     // sent upstream — matching the chat gate, so two callers whose requests
     // differ only in masked PII share an entry. That sharing is contained by
-    // the policy's default `scope: api_key`; an operator who opts into
-    // `scope: env` is asking for cross-caller reuse.
+    // the policy's scope: the default `api_key` keeps it to one caller and
+    // `team` to the keys of one team; an operator who opts into `scope: env`
+    // is asking for cross-caller reuse.
     let cache_gate = if body.get("stream").and_then(Value::as_bool) == Some(true) {
         None
     } else {
