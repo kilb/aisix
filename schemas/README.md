@@ -45,7 +45,7 @@ resource closes them — is rejected on those paths. They are generated
 from the same producers the in-repo strict validators compile, so the
 published files and the gateway's own validators cannot drift.
 
-Four top-level resources intentionally **omit**
+Two top-level resources intentionally **omit**
 `additionalProperties: false` even on the write contract (the list is
 `closes_on_write` in `crates/aisix-core/src/models/schema.rs`):
 
@@ -53,8 +53,6 @@ Four top-level resources intentionally **omit**
   serde's `flatten + tag` pattern, which is incompatible with a strict
   outer deny; strict typo-rejection happens earlier via
   `aisix-core::models::schema::validate_guardrail`.
-- `cache_policy.schema.json` — historically open on write as well.
-- `guardrail_attachment.schema.json` — likewise.
 - `observability_exporter.schema.json` — the top level is open, but the
   per-`kind` branches stay closed on the write path, so a misspelled
   field is rejected rather than dropped. On the read path they open like

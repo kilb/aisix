@@ -53,6 +53,23 @@ fn fixture(method: &str, path: &str, target: &SeededOperator) -> (String, Option
             format!("/admin/gateways/credentials/{}/revoke", Uuid::new_v4()),
             None,
         ),
+        // Gateway resources. The single-resource routes name an id that
+        // matches nothing: past the role check, a read answers 404 and a
+        // write without If-Match 428, so nothing is written.
+        ("GET", "/admin/schemas/{resource}") => ("/admin/schemas/model".to_string(), None),
+        ("GET", "/admin/resources/{kind}") => ("/admin/resources/provider_keys".to_string(), None),
+        ("POST", "/admin/resources/{kind}") => (
+            "/admin/resources/provider_keys".to_string(),
+            Some(json!({"doc": {
+                "display_name": format!("roles-{}", Uuid::new_v4().simple()),
+                "provider": "openai",
+                "api_key": "sk-roles-7c1",
+            }})),
+        ),
+        ("GET" | "PUT" | "DELETE", "/admin/resources/{kind}/{id}") => (
+            format!("/admin/resources/provider_keys/{}", Uuid::nil()),
+            (method == "PUT").then(|| json!({"doc": {}})),
+        ),
         _ => panic!("no fixture for {method} {path}: add one to tests/roles.rs"),
     }
 }
