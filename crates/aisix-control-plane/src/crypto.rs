@@ -5,7 +5,8 @@
 //! the collision bound for far more seals than the control plane makes (it
 //! seals CA keys and credentials, not traffic). The additional authenticated
 //! data (`aad`) binds a sealed value to the slot it was sealed for, so a
-//! value copied into another slot does not open.
+//! value copied into another slot does not open. A named secret in
+//! `cp_secrets` is sealed for the slot `aisix-cp:<name>`.
 
 use std::fmt;
 use std::io::Read;
@@ -13,6 +14,9 @@ use std::path::Path;
 
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM, NONCE_LEN};
 use ring::rand::{SecureRandom, SystemRandom};
+use sqlx::PgConnection;
+
+use crate::db::DbError;
 
 /// The key's file holds 64 hex characters, optionally followed by one newline.
 const HEX_LEN: usize = 64;
@@ -31,6 +35,9 @@ pub enum CryptoError {
     /// tell these apart, and nothing here should try.
     #[error("the sealed value does not open under this key")]
     Open,
+    /// Reading a sealed secret failed.
+    #[error("database: {0}")]
+    Db(#[from] DbError),
 }
 
 /// The 32-byte key that seals values at rest.
@@ -112,4 +119,46 @@ impl MasterKey {
         body.truncate(plaintext_len);
         Ok(body)
     }
+}
+
+/// The `aad` of the secret `name`: a secret copied under another name does
+/// not open.
+fn secret_aad(name: &str) -> String {
+    format!("aisix-cp:{name}")
+}
+
+/// Stores `bytes` sealed as the secret `name`, unless a secret of that name
+/// exists already. Returns whether this call stored it.
+pub async fn put_secret(
+    conn: &mut PgConnection,
+    mk: &MasterKey,
+    name: &str,
+    bytes: &[u8],
+) -> Result<bool, DbError> {
+    let sealed = mk.seal(secret_aad(name).as_bytes(), bytes);
+    let done = sqlx::query(
+        "INSERT INTO cp_secrets (name, sealed) VALUES ($1, $2) ON CONFLICT (name) DO NOTHING",
+    )
+    .bind(name)
+    .bind(sealed)
+    .execute(conn)
+    .await?;
+    Ok(done.rows_affected() == 1)
+}
+
+/// The secret `name`, opened, or `None` when none is stored.
+pub async fn get_secret(
+    conn: &mut PgConnection,
+    mk: &MasterKey,
+    name: &str,
+) -> Result<Option<Vec<u8>>, CryptoError> {
+    let sealed: Option<Vec<u8>> =
+        sqlx::query_scalar("SELECT sealed FROM cp_secrets WHERE name = $1")
+            .bind(name)
+            .fetch_optional(conn)
+            .await
+            .map_err(DbError::from)?;
+    sealed
+        .map(|s| mk.open(secret_aad(name).as_bytes(), &s))
+        .transpose()
 }

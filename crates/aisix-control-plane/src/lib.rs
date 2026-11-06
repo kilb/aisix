@@ -17,14 +17,17 @@ pub mod config;
 pub mod crypto;
 pub mod db;
 pub mod error;
+pub mod gateways;
 pub mod http;
 pub mod operators;
+pub mod pki;
 pub mod settings;
 
 use auth::password::{LoginThrottle, PasswordGate, ARGON2_GATE_PERMITS};
 use config::CpConfig;
 use db::Db;
 use error::BootError;
+use pki::Pki;
 use settings::EnvSettings;
 
 /// What every request handler shares.
@@ -37,6 +40,8 @@ pub struct AppState {
     pub passwords: PasswordGate,
     /// The login cooldown for operator emails.
     pub operator_logins: LoginThrottle,
+    /// The CA that issues gateway certificates, and the platform id key.
+    pub pki: Arc<Pki>,
 }
 
 /// A booted control plane. Dropping it stops its listener.
@@ -85,6 +90,7 @@ where
     )
     .await?;
     let env = settings::ensure_env(&db, cfg.env_id_seed, &cfg.etcd_prefix).await?;
+    let pki = Arc::new(Pki::load_or_init(&db, &cfg.master_key, &env).await?);
     let passwords = PasswordGate::new(ARGON2_GATE_PERMITS)?;
     let listener = tokio::net::TcpListener::bind(cfg.http_addr)
         .await
@@ -96,6 +102,7 @@ where
         cfg: Arc::new(cfg),
         passwords,
         operator_logins: LoginThrottle::default(),
+        pki,
     };
     let router = http::browser_router(state.clone());
     let serve = tokio::spawn(async move {
