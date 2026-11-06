@@ -303,6 +303,7 @@ mod tests {
             workers: None,
             url_rewrites: Vec::new(),
             expose_debug_headers: false,
+            platform: Default::default(),
         };
         ProxyState::new(
             SnapshotHandle::new(snapshot),

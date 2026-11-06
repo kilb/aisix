@@ -393,6 +393,8 @@ pub struct ProxyStateInner {
     /// to when neither the target Model nor its model group sets one. See
     /// `routing::effective_timeouts`.
     pub default_timeouts: crate::routing::TimeoutDefaults,
+    /// Platform mode settings; `None` while `proxy.platform.enabled` is off.
+    platform: Option<Arc<crate::platform::PlatformSettings>>,
 }
 
 impl std::ops::Deref for ProxyState {
@@ -548,6 +550,7 @@ impl ProxyState {
             client_classifier: Arc::new(ClientTypeClassifier::builtin()),
             default_retries: aisix_core::config::DEFAULT_UPSTREAM_RETRIES,
             default_timeouts: crate::routing::TimeoutDefaults::default(),
+            platform: None,
         })
     }
 
@@ -605,6 +608,7 @@ impl ProxyState {
             client_classifier: Arc::new(ClientTypeClassifier::builtin()),
             default_retries: aisix_core::config::DEFAULT_UPSTREAM_RETRIES,
             default_timeouts: crate::routing::TimeoutDefaults::default(),
+            platform: None,
         })
     }
 
@@ -686,7 +690,19 @@ impl ProxyState {
             client_classifier: Arc::new(ClientTypeClassifier::builtin()),
             default_retries: aisix_core::config::DEFAULT_UPSTREAM_RETRIES,
             default_timeouts: crate::routing::TimeoutDefaults::default(),
+            platform: None,
         })
+    }
+
+    /// Platform mode settings, `None` when platform mode is off.
+    pub fn platform(&self) -> Option<&crate::platform::PlatformSettings> {
+        self.platform.as_deref()
+    }
+
+    /// Install the platform mode settings built at startup.
+    pub fn with_platform(mut self, settings: crate::platform::PlatformSettings) -> Self {
+        self.platform = Some(Arc::new(settings));
+        self
     }
 
     fn from_inner(inner: ProxyStateInner) -> Self {
@@ -776,6 +792,19 @@ impl ProxyState {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn platform_is_none_until_installed() {
+        use super::*;
+        let cfg: ProxyConfig = serde_json::from_str(r#"{"addr": "127.0.0.1:0"}"#).unwrap();
+        let state = ProxyState::new(
+            SnapshotHandle::new(AisixSnapshot::default()),
+            Arc::new(Hub::new()),
+            &cfg,
+        );
+        assert!(state.platform().is_none());
+        let state = state.with_platform(crate::platform::PlatformSettings::from_secret("abc"));
+        assert!(state.platform().is_some());
+    }
 
     /// #720's dedup set is an optimization — the deterministic
     /// `request_id = "batch-<id>"` is what actually makes re-emission
@@ -862,6 +891,7 @@ mod tests {
                 workers: None,
                 url_rewrites: Vec::new(),
                 expose_debug_headers: false,
+                platform: Default::default(),
             },
         )
     }
@@ -961,6 +991,7 @@ mod tests {
                 workers: None,
                 url_rewrites: Vec::new(),
                 expose_debug_headers: false,
+                platform: Default::default(),
             },
         );
         let view = handle.load_versioned();

@@ -806,6 +806,27 @@ pub struct ProxyConfig {
     /// Applied at startup. Changing it requires a restart.
     #[serde(default)]
     pub expose_debug_headers: bool,
+    /// Platform mode for multi-tenant deployments. Off by default.
+    #[serde(default)]
+    pub platform: PlatformConfig,
+}
+
+/// Platform mode settings, under `proxy.platform`.
+///
+/// Platform mode is for a deployment that serves many tenants from one
+/// gateway. It is off unless `enabled` is `true`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+pub struct PlatformConfig {
+    /// Turn platform mode on. Requires `id_key_env`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Name of the environment variable that holds the platform secret,
+    /// at least 32 bytes long. The gateway reads the variable once at
+    /// startup and refuses to start when it is missing or too short. The
+    /// secret itself is never written to the configuration file.
+    #[serde(default)]
+    pub id_key_env: Option<String>,
 }
 
 /// `null` reads as the default, no cap: the field was optional until `0` took
@@ -2523,6 +2544,21 @@ impl Config {
             ));
         }
 
+        if self.proxy.platform.enabled
+            && self
+                .proxy
+                .platform
+                .id_key_env
+                .as_deref()
+                .is_none_or(|name| name.trim().is_empty())
+        {
+            return Err(BootstrapError::Config(
+                "proxy.platform.id_key_env must name the environment variable holding the \
+                 platform secret when proxy.platform.enabled is true"
+                    .to_string(),
+            ));
+        }
+
         // Fail fast on an unusable rewrite rule: a broken rule would
         // otherwise surface at runtime as silently mis-routed or 404ing
         // legacy traffic, which is much harder to trace back to a typo in
@@ -3107,6 +3143,49 @@ admin:
         assert_eq!(from("shutdown.bogus"), Some("aisix_shutdown__bogus"));
         assert_eq!(from("shutdown.bogus_more"), None);
         assert_eq!(from("shutdown.min_drain_secs"), None);
+    }
+
+    fn load_with_platform(platform: &str) -> Result<Config, BootstrapError> {
+        let f = write_yaml(&format!(
+            r#"
+etcd:
+  endpoints: ["http://127.0.0.1:2379"]
+proxy:
+  addr: "0.0.0.0:3000"
+{platform}
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+"#
+        ));
+        Config::load_from_path(Some(f.path()))
+    }
+
+    #[test]
+    fn platform_is_off_by_default() {
+        let cfg = load_with_platform("").unwrap();
+        assert!(!cfg.proxy.platform.enabled);
+        assert!(cfg.proxy.platform.id_key_env.is_none());
+    }
+
+    #[test]
+    fn platform_enabled_without_an_id_key_env_fails_validation() {
+        let err = load_with_platform("  platform: { enabled: true }")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("proxy.platform.id_key_env"), "{err}");
+    }
+
+    #[test]
+    fn platform_enabled_with_an_id_key_env_loads() {
+        let cfg =
+            load_with_platform("  platform: { enabled: true, id_key_env: P0_TEST_PLATFORM_KEY }")
+                .unwrap();
+        assert!(cfg.proxy.platform.enabled);
+        assert_eq!(
+            cfg.proxy.platform.id_key_env.as_deref(),
+            Some("P0_TEST_PLATFORM_KEY")
+        );
     }
 
     #[test]

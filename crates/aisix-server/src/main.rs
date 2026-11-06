@@ -1530,6 +1530,10 @@ async fn run(mut cfg: Config, hangup: Option<HangupSignal>) -> anyhow::Result<()
         aisix_obs::ClientTypeClassifier::compile(&cfg.observability.metrics.client_type_rules)
             .map_err(|e| anyhow::anyhow!(e))?;
     proxy_state = proxy_state.with_client_classifier(Arc::new(client_classifier));
+    if let Some(platform) = platform_settings(&cfg.proxy.platform, |name| std::env::var(name).ok())?
+    {
+        proxy_state = proxy_state.with_platform(platform);
+    }
     proxy_state = proxy_state.with_default_retries(cfg.upstream.retries);
     proxy_state =
         proxy_state.with_default_timeouts(cfg.upstream.timeout_ms, cfg.upstream.stream_timeout_ms);
@@ -2043,6 +2047,34 @@ fn register_memory_probes(metrics: &aisix_obs::Metrics, state: &ProxyState) {
         entries: None,
         bytes: Some(aisix_proxy::holdback_bytes() as u64),
     });
+}
+
+/// 平台模式关闭时返回 `None`；开启时读取 `id_key_env` 指向的变量，
+/// 缺失或短于 32 字节都拒绝启动。错误信息只含变量名，不含变量值。
+fn platform_settings(
+    cfg: &aisix_core::config::PlatformConfig,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> anyhow::Result<Option<aisix_proxy::platform::PlatformSettings>> {
+    const MIN_SECRET_BYTES: usize = 32;
+    if !cfg.enabled {
+        return Ok(None);
+    }
+    let name = cfg
+        .id_key_env
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("proxy.platform.id_key_env is required"))?;
+    let secret = lookup(name).ok_or_else(|| {
+        anyhow::anyhow!("proxy.platform.id_key_env = {name:?} is set but the env var is missing")
+    })?;
+    if secret.len() < MIN_SECRET_BYTES {
+        anyhow::bail!(
+            "proxy.platform.id_key_env = {name:?}: the env var must hold at least \
+             {MIN_SECRET_BYTES} bytes"
+        );
+    }
+    Ok(Some(aisix_proxy::platform::PlatformSettings::from_secret(
+        &secret,
+    )))
 }
 
 /// Build the etcd-client `ConnectOptions` from `cfg.etcd`, wiring in
@@ -4668,6 +4700,36 @@ mcp_servers:
     /// hanging with nothing to end it. The old assertion pinned an
     /// implementation detail with no user-visible behaviour behind it; this
     /// one pins the behaviour that replaced it.
+    #[test]
+    fn platform_refuses_to_boot_when_its_secret_is_shorter_than_32_bytes() {
+        let cfg = aisix_core::config::PlatformConfig {
+            enabled: true,
+            id_key_env: Some("P0_TEST_PLATFORM_KEY".into()),
+        };
+        let short = "short-secret-value-do-not-print";
+        let err = platform_settings(&cfg, |_| Some(short.to_string()))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("P0_TEST_PLATFORM_KEY"), "{err}");
+        assert!(!err.contains(short), "{err}");
+
+        let missing = platform_settings(&cfg, |_| None).unwrap_err().to_string();
+        assert!(missing.contains("P0_TEST_PLATFORM_KEY"), "{missing}");
+
+        let long = "k".repeat(32);
+        let settings = platform_settings(&cfg, |_| Some(long.clone()))
+            .unwrap()
+            .expect("enabled platform yields settings");
+        assert_eq!(
+            settings.id_key,
+            aisix_proxy::platform::PlatformSettings::from_secret(&long).id_key
+        );
+        let off = aisix_core::config::PlatformConfig::default();
+        assert!(platform_settings(&off, |_| Some(long.clone()))
+            .unwrap()
+            .is_none());
+    }
+
     #[test]
     fn build_connect_options_bounds_even_a_plain_http_etcd() {
         let etcd = aisix_core::EtcdConfig {

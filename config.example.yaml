@@ -173,6 +173,13 @@ proxy:
   # logs, metrics and traces record the same facts either way. Applied at
   # startup.
   # expose_debug_headers: false
+  # Platform mode for multi-tenant deployments. Off by default. When
+  # enabled, id_key_env must name an environment variable holding a secret of
+  # at least 32 bytes; the gateway reads it once at startup and refuses to
+  # start when it is missing or too short.
+  # platform:
+  #   enabled: false
+  #   id_key_env: AISIX_PLATFORM_ID_KEY
 
 # Admin listener — read-only resource surface, OpenAPI reference, and
 # playground. Resources are managed declaratively (resources_file or

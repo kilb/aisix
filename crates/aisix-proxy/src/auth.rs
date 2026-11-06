@@ -791,6 +791,7 @@ mod tests {
             request_id: Default::default(),
             url_rewrites: Vec::new(),
             expose_debug_headers: false,
+            platform: Default::default(),
         };
         crate::build_router(
             ProxyState::new(

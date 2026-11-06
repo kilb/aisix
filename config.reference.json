@@ -87,6 +87,10 @@
       "addr": "0.0.0.0:3000",
       "expose_debug_headers": false,
       "listeners": [],
+      "platform": {
+        "enabled": false,
+        "id_key_env": null
+      },
       "real_ip": {
         "header": "x-forwarded-for",
         "recursive": false,

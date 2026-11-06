@@ -72,6 +72,7 @@ mod model_resolve;
 mod models;
 mod operation;
 mod passthrough_route;
+pub mod platform;
 mod policy_index;
 mod quota;
 mod realtime;
@@ -1765,6 +1766,7 @@ mod tests {
             url_rewrites: Vec::new(),
             // The cache tests below read `x-aisix-cache*` off the response.
             expose_debug_headers: true,
+            platform: Default::default(),
             tls: None,
             listeners: Vec::new(),
             thread_per_core: None,
@@ -3096,6 +3098,7 @@ mod tests {
             request_id: Default::default(),
             url_rewrites: Vec::new(),
             expose_debug_headers: false,
+            platform: Default::default(),
             tls: None,
             listeners: Vec::new(),
             thread_per_core: None,

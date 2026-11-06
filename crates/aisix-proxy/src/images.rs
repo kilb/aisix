@@ -1048,6 +1048,7 @@ mod tests {
             request_id: Default::default(),
             url_rewrites: Vec::new(),
             expose_debug_headers: false,
+            platform: Default::default(),
             tls: None,
             listeners: Vec::new(),
             thread_per_core: None,

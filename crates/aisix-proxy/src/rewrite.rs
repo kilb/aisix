@@ -202,6 +202,7 @@ mod tests {
             workers: None,
             url_rewrites: rules,
             expose_debug_headers: false,
+            platform: Default::default(),
         };
         let state = ProxyState::new(
             SnapshotHandle::new(aisix_core::AisixSnapshot::new()),

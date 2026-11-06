@@ -3965,6 +3965,7 @@ mod tests {
                 workers: None,
                 url_rewrites: Vec::new(),
                 expose_debug_headers: false,
+                platform: Default::default(),
             },
         );
         let model = model_with_retries(Some(2));
