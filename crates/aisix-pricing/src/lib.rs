@@ -5,8 +5,10 @@
 //! rates are integer micro-USD per million units; nothing on the charge path
 //! is floating point.
 
+mod catalogue;
 mod rates;
 
+pub use catalogue::{Catalogue, CatalogueEntry, CatalogueError};
 pub use rates::{
     Dimension, LongContextBand, MicroUsd, Rate, RateCard, RateCardError, Rates, ServiceTier,
     TierRates,
