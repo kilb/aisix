@@ -5,6 +5,12 @@
 //! `crates/aisix-server/src/heartbeat.rs`); `h2` is the etcd front, offered
 //! only when there is one.
 //!
+//! An h2 connection can be ended by what it serves ([`ConnClose`]): the
+//! etcd front closes the connection of a credential it refuses, as the
+//! REST surface answers it `Connection: close`. A closing h2 connection
+//! sends GOAWAY, and is dropped after [`DRAIN_DEADLINE`] if its streams
+//! have not finished by then, since a watch never finishes on its own.
+//!
 //! The server certificate is minted at boot for `CP_DP_HOSTS`, the names
 //! gateways reach this listener by.
 //!
@@ -49,12 +55,12 @@ use tokio_rustls::TlsAcceptor;
 use tower::util::Oneshot;
 use tower::ServiceExt;
 
-use super::ConnIdentity;
+use super::{closing, ConnClose, ConnIdentity};
 use crate::pki::{self, Pki, PkiError};
 use crate::stopped;
 
-/// What `h2` connections are served by: the etcd front, once it exists.
-pub type GrpcRoutes = Router;
+/// What `h2` connections are served by: the etcd front's gRPC services.
+pub type GrpcRoutes = tonic::service::Routes;
 
 const HTTP_1_1: &[u8] = b"http/1.1";
 const H2: &[u8] = b"h2";
@@ -67,6 +73,22 @@ pub const MAX_CONNECTIONS: usize = 4096;
 
 /// A peer that has not finished its TLS handshake by then is dropped.
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long a closing h2 connection may take to finish its streams before
+/// it is dropped.
+pub const DRAIN_DEADLINE: Duration = Duration::from_secs(5);
+
+/// Streams one h2 connection may hold at once. A gateway's connection
+/// carries a read and a watch; each watch holds a connection to kine of its
+/// own.
+const MAX_STREAMS_PER_CONNECTION: u32 = 16;
+
+/// How often an idle h2 connection is pinged, and how long a ping may go
+/// unanswered before the connection is dropped: a gateway that vanished
+/// without closing would otherwise hold its watch, and its connection to
+/// kine, until TCP gave up.
+const H2_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
+const H2_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Open files spared beyond the connection cap: the browser listener, the
 /// database pools and the process's own files.
@@ -325,26 +347,37 @@ async fn serve_connection(
     if !negotiated_h2 {
         let conn = http1::Builder::new()
             .timer(TokioTimer::new())
-            .serve_connection(io, WithIdentity::new(rest, identity));
-        drive(conn, |conn| conn.graceful_shutdown(), shutdown).await;
+            .serve_connection(io, WithIdentity::new(rest, identity, None));
+        drive(conn, |conn| conn.graceful_shutdown(), shutdown, None).await;
     } else if let Some(grpc) = grpc {
+        let close = ConnClose::new();
         let conn = http2::Builder::new(TokioExecutor::new())
             .timer(TokioTimer::new())
-            .serve_connection(io, WithIdentity::new(grpc, identity));
-        drive(conn, |conn| conn.graceful_shutdown(), shutdown).await;
+            .max_concurrent_streams(MAX_STREAMS_PER_CONNECTION)
+            .keep_alive_interval(H2_KEEPALIVE_INTERVAL)
+            .keep_alive_timeout(H2_KEEPALIVE_TIMEOUT)
+            .serve_connection(io, WithIdentity::new(grpc, identity, Some(close.clone())));
+        drive(conn, |conn| conn.graceful_shutdown(), shutdown, Some(close)).await;
     }
     // Otherwise h2 was negotiated though not offered: nothing serves it.
 }
 
 /// Runs `conn` to its end, calling `graceful` on it once `shutdown` turns
 /// true (or its sender is gone), so it finishes what is in flight and then
-/// closes.
-async fn drive<C>(conn: C, graceful: impl FnOnce(Pin<&mut C>), mut shutdown: watch::Receiver<bool>)
-where
+/// closes. With `close`, also once `close` is closed; shutting down closes
+/// it, which ends the watches it serves; and a connection still open
+/// [`DRAIN_DEADLINE`] after `graceful` is dropped.
+async fn drive<C>(
+    conn: C,
+    graceful: impl FnOnce(Pin<&mut C>),
+    mut shutdown: watch::Receiver<bool>,
+    close: Option<ConnClose>,
+) where
     C: Future<Output = hyper::Result<()>>,
 {
     let mut conn = pin!(conn);
     let mut graceful = Some(graceful);
+    let mut deadline: Option<Pin<Box<tokio::time::Sleep>>> = None;
     loop {
         tokio::select! {
             served = conn.as_mut() => {
@@ -354,34 +387,79 @@ where
                 return;
             }
             () = stopped(&mut shutdown), if graceful.is_some() => {
-                if let Some(graceful) = graceful.take() {
-                    graceful(conn.as_mut());
+                if let Some(close) = &close {
+                    close.close();
                 }
+            }
+            () = closing(close.as_ref()), if graceful.is_some() => {}
+            () = expired(&mut deadline) => {
+                tracing::debug!("dropped a closing gateway connection whose streams did not finish");
+                return;
+            }
+        }
+        if let Some(graceful) = graceful.take() {
+            graceful(conn.as_mut());
+            if close.is_some() {
+                deadline = Some(Box::pin(tokio::time::sleep(DRAIN_DEADLINE)));
             }
         }
     }
 }
 
-/// `router`, with the connection's identity attached to every request.
-#[derive(Clone)]
-struct WithIdentity {
-    router: Router,
-    identity: ConnIdentity,
-}
-
-impl WithIdentity {
-    fn new(router: Router, identity: ConnIdentity) -> WithIdentity {
-        WithIdentity { router, identity }
+/// Resolves once `deadline` passes; never without one.
+async fn expired(deadline: &mut Option<Pin<Box<tokio::time::Sleep>>>) {
+    match deadline {
+        Some(deadline) => deadline.as_mut().await,
+        None => std::future::pending().await,
     }
 }
 
-impl hyper::service::Service<Request<Incoming>> for WithIdentity {
+/// `service`, with the connection's identity attached to every request,
+/// and on h2 connections the handle that closes the connection.
+#[derive(Clone)]
+struct WithIdentity<S> {
+    service: S,
+    identity: ConnIdentity,
+    close: Option<ConnClose>,
+}
+
+impl<S> WithIdentity<S> {
+    fn new(service: S, identity: ConnIdentity, close: Option<ConnClose>) -> WithIdentity<S> {
+        WithIdentity {
+            service,
+            identity,
+            close,
+        }
+    }
+
+    fn attach<B>(&self, request: &mut Request<B>) {
+        request.extensions_mut().insert(self.identity.clone());
+        if let Some(close) = &self.close {
+            request.extensions_mut().insert(close.clone());
+        }
+    }
+}
+
+impl hyper::service::Service<Request<Incoming>> for WithIdentity<Router> {
     type Response = axum::response::Response;
     type Error = Infallible;
     type Future = Oneshot<Router, Request<Incoming>>;
 
     fn call(&self, mut request: Request<Incoming>) -> Self::Future {
-        request.extensions_mut().insert(self.identity.clone());
-        self.router.clone().oneshot(request)
+        self.attach(&mut request);
+        self.service.clone().oneshot(request)
+    }
+}
+
+impl hyper::service::Service<Request<Incoming>> for WithIdentity<GrpcRoutes> {
+    type Response = hyper::Response<tonic::body::BoxBody>;
+    type Error = Box<dyn std::error::Error + Send + Sync>;
+    type Future = Oneshot<GrpcRoutes, Request<tonic::body::BoxBody>>;
+
+    fn call(&self, mut request: Request<Incoming>) -> Self::Future {
+        self.attach(&mut request);
+        self.service
+            .clone()
+            .oneshot(request.map(tonic::body::boxed))
     }
 }

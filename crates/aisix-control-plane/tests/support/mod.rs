@@ -43,7 +43,7 @@ const TEMPLATE_LOCK_KEY: i64 = 0x6169_7369_7863_7074;
 static TEMPLATE: OnceCell<String> = OnceCell::const_new();
 
 /// Reads a gate variable: unset skips the test locally and fails it on CI.
-fn gate_var(name: &str) -> Option<String> {
+pub fn gate_var(name: &str) -> Option<String> {
     match std::env::var(name) {
         Ok(v) if !v.trim().is_empty() => Some(v),
         _ => {
@@ -183,7 +183,10 @@ fn test_config(database_url: &str) -> CpConfig {
         dp_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
         dp_hosts: vec!["localhost".to_string()],
         dp_base_url: "https://localhost:7943".to_string(),
-        kine_endpoint: "http://127.0.0.1:2379".to_string(),
+        // The test kine when there is one, and otherwise a port nothing
+        // listens on: never a real etcd that may hold the default port.
+        kine_endpoint: std::env::var("CP_TEST_KINE_ENDPOINT")
+            .unwrap_or_else(|_| "http://127.0.0.1:1".to_string()),
         etcd_prefix: "/aisix".to_string(),
         env_id_seed: None,
         instance_stale_secs: 60,

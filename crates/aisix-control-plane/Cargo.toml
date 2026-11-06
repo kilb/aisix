@@ -58,6 +58,16 @@ tower = { version = "0.5", features = ["util"] }
 # Release versions a heartbeat reports, compared with this build's
 # (1.0.28 in Cargo.lock).
 semver = "1"
+# The etcd front: a server and a client generated from proto/ by tonic and
+# prost, at the versions etcd-client 0.14.1 (the gateway's etcd client)
+# builds with (tonic 0.12.3 and prost 0.13.5 in Cargo.lock). Default
+# features: the server half's `Routes`, and the client channel to kine.
+tonic = "=0.12.3"
+prost = "0.13"
+tokio-stream = "0.1"
+
+[build-dependencies]
+tonic-build = "=0.12.3"
 
 # The open-file limit, raised at boot for the gateway listener's connection
 # caps (1.1.4 in Cargo.lock).
@@ -74,3 +84,8 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "coo
 hyper = { version = "1", features = ["client", "http1", "http2"] }
 http-body-util = "0.1"
 bytes = "1"
+# The gateway's own etcd client and its configuration provider, which the
+# etcd front must serve unchanged (etcd-client 0.14.1 in Cargo.lock, with
+# the feature the gateway builds it with).
+etcd-client = { version = "0.14", features = ["tls"] }
+aisix-etcd = { path = "../aisix-etcd" }
