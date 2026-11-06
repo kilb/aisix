@@ -377,39 +377,79 @@ pub async fn create(
     .await
 }
 
-/// Writes the documents tenant `id` derives, as its row now stands: the
-/// team, and, while the tenant is active and limits it tenant-wide, its
-/// limits policy, which is deleted otherwise. A document already as it
-/// should be is not written again. The caller holds the tenant's lock.
+/// One write [`project`] makes.
+#[derive(Debug, Clone, PartialEq)]
+enum Step {
+    /// The tenant's `teams` document.
+    Team(Value),
+    /// The limits policy, written (or revived) with this document.
+    Policy(Value),
+    /// The tenant's keys, re-projected from its row.
+    Keys,
+    /// The limits policy deleted, if it is live.
+    RetirePolicy,
+}
+
+/// The writes [`project`] makes for `tenant`, in the order it makes them.
+///
+/// The projector writes kine in commit order and stops at the first write
+/// it cannot make, so a projection can stall between any two of these. The
+/// order is therefore chosen so that no stall leaves a key enabled and
+/// unlimited: the tenant's limit is in place before its keys are opened (an
+/// approval or a reactivation enables them), and is lifted only after they
+/// are closed (a suspension disables them). The team comes first, since the
+/// keys name it.
+fn steps(tenant: &TenantRow) -> Vec<Step> {
+    let mut steps = vec![Step::Team(team_doc(&tenant.name))];
+    let policy = match tenant.status {
+        TenantStatus::Active => limits_policy_doc(tenant.id, &tenant.limits),
+        TenantStatus::Pending | TenantStatus::Suspended => None,
+    };
+    match policy {
+        Some(doc) => steps.extend([Step::Policy(doc), Step::Keys]),
+        None => steps.extend([Step::Keys, Step::RetirePolicy]),
+    }
+    steps
+}
+
+/// Writes the documents tenant `id` derives, as its row now stands, in the
+/// order [`steps`] gives: the team, its keys, and its limits policy, which
+/// is written while the tenant is active and limits it tenant-wide and
+/// deleted otherwise. A document already as it should be is not written
+/// again. The caller holds the tenant's lock.
 pub async fn project(conn: &mut PgConnection, ctx: &WriteCtx, id: Uuid) -> Result<(), ApiError> {
     let tenant = lock(&mut *conn, id).await?;
     let owner = owner(id);
-    put(
-        &mut *conn,
-        ctx,
-        Kind::Teams,
-        id,
-        &team_doc(&tenant.name),
-        &owner,
-    )
-    .await?;
-    let policy = match tenant.status {
-        TenantStatus::Active => limits_policy_doc(id, &tenant.limits),
-        TenantStatus::Pending | TenantStatus::Suspended => None,
-    };
-    match (policy, tenant.limits_policy_id) {
-        (Some(doc), known) => {
-            let policy_id = match known {
-                Some(policy_id) => policy_id,
-                None => mint_policy_id(&mut *conn, id).await?,
-            };
-            put(conn, ctx, Kind::RateLimitPolicies, policy_id, &doc, &owner).await
+    for step in steps(&tenant) {
+        match step {
+            Step::Team(doc) => put(&mut *conn, ctx, Kind::Teams, id, &doc, &owner).await?,
+            Step::Policy(doc) => {
+                let policy_id = match tenant.limits_policy_id {
+                    Some(policy_id) => policy_id,
+                    None => mint_policy_id(&mut *conn, id).await?,
+                };
+                put(
+                    &mut *conn,
+                    ctx,
+                    Kind::RateLimitPolicies,
+                    policy_id,
+                    &doc,
+                    &owner,
+                )
+                .await?;
+            }
+            // Task 12: `keys::reproject_tenant(conn, ctx, id)` goes here, and
+            // nowhere else, so that the limit brackets the keys as `steps`
+            // describes.
+            Step::Keys => {}
+            Step::RetirePolicy => {
+                if let Some(policy_id) = tenant.limits_policy_id {
+                    retire(&mut *conn, ctx, Kind::RateLimitPolicies, policy_id, &owner).await?;
+                }
+            }
         }
-        (None, Some(policy_id)) => {
-            retire(conn, ctx, Kind::RateLimitPolicies, policy_id, &owner).await
-        }
-        (None, None) => Ok(()),
     }
+    Ok(())
 }
 
 /// The id tenant `id`'s limits policy is written under from now on.
@@ -705,16 +745,21 @@ fn tenant_name(raw: &str) -> Result<String, Detail> {
     Ok(name.to_string())
 }
 
-/// A detail at `<at>/<i>` for each group name that is blank or longer than
-/// 64 characters.
-fn group_problems(groups: &[String], at: &str) -> Vec<Detail> {
-    groups
+/// The group names `groups` as they are stored, a name given twice kept
+/// once (where it first appears); otherwise a detail at `<at>/<i>` for each
+/// name that is blank, starts or ends with whitespace, or is longer than 64
+/// characters. Names are matched exactly against provider keys' groups, so
+/// a stray space would match nothing.
+fn checked_groups(groups: &[String], at: &str) -> Result<Vec<String>, Vec<Detail>> {
+    let problems: Vec<Detail> = groups
         .iter()
         .enumerate()
         .filter_map(|(i, group)| {
             let path = format!("{at}/{i}");
             if group.trim().is_empty() {
                 Some(detail(&path, "分组名称不能为空"))
+            } else if group.trim() != group {
+                Some(detail(&path, "分组名称前后不能有空白"))
             } else if group.chars().count() > MAX_GROUP_CHARS {
                 Some(detail(
                     &path,
@@ -724,7 +769,27 @@ fn group_problems(groups: &[String], at: &str) -> Vec<Detail> {
                 None
             }
         })
-        .collect()
+        .collect();
+    if !problems.is_empty() {
+        return Err(problems);
+    }
+    let mut kept: Vec<String> = Vec::with_capacity(groups.len());
+    for group in groups {
+        if !kept.contains(group) {
+            kept.push(group.clone());
+        }
+    }
+    Ok(kept)
+}
+
+/// The refusal of an empty group list where a customer's is required: a
+/// key with no groups is served by every upstream, so a customer reaching
+/// every upstream lists every group instead.
+fn no_groups(at: &str) -> Detail {
+    detail(
+        at,
+        "至少需要一个分组：不设分组即可使用全部上游；如确需全部上游，请逐一列出各分组",
+    )
 }
 
 /// A detail at `<at>/<field>` for each field of the object `value` that is
@@ -983,9 +1048,18 @@ pub async fn update(
         Some(Ok(name)) => Some(name),
         None => None,
     };
-    if let Some(groups) = &req.allowed_provider_groups {
-        problems.extend(group_problems(groups, "/allowed_provider_groups"));
-    }
+    let groups = match req
+        .allowed_provider_groups
+        .as_deref()
+        .map(|g| checked_groups(g, "/allowed_provider_groups"))
+    {
+        Some(Err(found)) => {
+            problems.extend(found);
+            None
+        }
+        Some(Ok(groups)) => Some(groups),
+        None => None,
+    };
     let limits = match req.limits.as_ref().map(|v| limits_from(v, "/limits")) {
         Some(Err(found)) => {
             problems.extend(found);
@@ -1020,28 +1094,39 @@ pub async fn update(
                 if current.version != expected {
                     return Err(ApiError::version_mismatch(current.version));
                 }
+                if groups.as_ref().is_some_and(Vec::is_empty) && !current.is_internal {
+                    return Err(ApiError::validation(vec![no_groups(
+                        "/allowed_provider_groups",
+                    )]));
+                }
                 let grants = match &req.allowed_model_ids {
                     Some(raw) => {
                         resources_lock(&mut *conn).await?;
-                        checked_grants(&mut *conn, current.is_internal, raw).await?
+                        Some(checked_grants(&mut *conn, current.is_internal, raw).await?)
                     }
-                    None => current.allowed_model_ids.clone(),
+                    None => None,
                 };
-                let limits = limits.unwrap_or(current.limits);
+                let limits = limits
+                    .map(|l| serde_json::to_value(&l))
+                    .transpose()
+                    .map_err(ApiError::internal)?;
+                // Only what the body carries is written: a field left out
+                // keeps what is stored, including limit fields a newer
+                // release added that this one does not read.
                 sqlx::query(
-                    "UPDATE tenants SET name = $2, billing_mode = $3, allowed_model_ids = $4, \
-                       allowed_provider_groups = $5, limits = $6, version = version + 1 \
+                    "UPDATE tenants SET name = COALESCE($2, name), \
+                       billing_mode = COALESCE($3, billing_mode), \
+                       allowed_model_ids = COALESCE($4, allowed_model_ids), \
+                       allowed_provider_groups = COALESCE($5, allowed_provider_groups), \
+                       limits = COALESCE($6, limits), version = version + 1 \
                      WHERE id = $1",
                 )
                 .bind(id)
-                .bind(name.unwrap_or(current.name))
-                .bind(req.billing_mode.unwrap_or(current.billing_mode).as_str())
-                .bind(&grants)
-                .bind(
-                    req.allowed_provider_groups
-                        .unwrap_or(current.allowed_provider_groups),
-                )
-                .bind(serde_json::to_value(&limits).map_err(ApiError::internal)?)
+                .bind(name)
+                .bind(req.billing_mode.map(BillingMode::as_str))
+                .bind(grants)
+                .bind(groups)
+                .bind(limits)
                 .execute(&mut *conn)
                 .await
                 .map_err(DbError::from)?;
@@ -1120,6 +1205,12 @@ async fn transition(
         .tx(move |conn| {
             async move {
                 let current = lock(&mut *conn, id).await?;
+                if current.is_internal && matches!(t, Transition::Suspend) {
+                    return Err(ApiError::conflict(
+                        "tenant_state",
+                        "平台内部租户不能停用：停用会使全部运维密钥失效",
+                    ));
+                }
                 if current.status != t.from() {
                     return Err(ApiError::conflict(
                         "tenant_state",
@@ -1245,20 +1336,24 @@ pub async fn put_defaults(
     if problems.is_empty() && body.get("default_provider_groups").is_none() {
         problems.push(detail(
             "/default_provider_groups",
-            "必须给出新租户的默认分组（可以为空列表）",
+            "必须给出新租户的默认分组",
         ));
     }
     if !problems.is_empty() {
         return Err(ApiError::validation(problems));
     }
-    let defaults: TenantDefaults = serde_json::from_value(body).map_err(|_| {
+    let mut defaults: TenantDefaults = serde_json::from_value(body).map_err(|_| {
         ApiError::validation(vec![detail("", "限制必须是正整数，分组必须是字符串列表")])
     })?;
     let mut problems = defaults.limits().problems("");
-    problems.extend(group_problems(
+    match checked_groups(
         &defaults.default_provider_groups,
         "/default_provider_groups",
-    ));
+    ) {
+        Ok(groups) if groups.is_empty() => problems.push(no_groups("/default_provider_groups")),
+        Ok(groups) => defaults.default_provider_groups = groups,
+        Err(found) => problems.extend(found),
+    }
     if !problems.is_empty() {
         return Err(ApiError::validation(problems));
     }
@@ -1294,4 +1389,69 @@ pub async fn put_defaults(
         })
         .await?;
     Ok(Json(defaults))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tenant(status: TenantStatus, limits: TenantLimits) -> TenantRow {
+        TenantRow {
+            id: Uuid::new_v4(),
+            name: "order-7c1".to_string(),
+            status,
+            is_internal: false,
+            billing_mode: BillingMode::Prepaid,
+            allowed_model_ids: Vec::new(),
+            allowed_provider_groups: vec!["shared".to_string()],
+            limits,
+            limits_policy_id: Some(Uuid::new_v4()),
+            version: 1,
+            created_at: Utc::now(),
+            approved_at: None,
+        }
+    }
+
+    fn at(steps: &[Step], wanted: fn(&Step) -> bool) -> usize {
+        steps
+            .iter()
+            .position(wanted)
+            .unwrap_or_else(|| panic!("missing from {steps:?}"))
+    }
+
+    /// The order `project` writes in: the tenant's limit is in place before
+    /// its keys are opened, and lifted only after they are closed, so a
+    /// projection that stalls between two writes never leaves a key enabled
+    /// and unlimited.
+    #[test]
+    fn a_limit_is_in_place_before_the_keys_open_and_lifted_only_after_they_close() {
+        let limited = TenantLimits {
+            rpm: Some(60),
+            ..TenantLimits::default()
+        };
+        let active = steps(&tenant(TenantStatus::Active, limited.clone()));
+        assert!(matches!(active[0], Step::Team(_)), "{active:?}");
+        assert!(
+            at(&active, |s| matches!(s, Step::Policy(_))) < at(&active, |s| *s == Step::Keys),
+            "{active:?}"
+        );
+        assert!(!active.contains(&Step::RetirePolicy), "{active:?}");
+
+        for t in [
+            tenant(TenantStatus::Suspended, limited.clone()),
+            tenant(TenantStatus::Pending, limited),
+            tenant(TenantStatus::Active, TenantLimits::default()),
+        ] {
+            let closing = steps(&t);
+            assert!(matches!(closing[0], Step::Team(_)), "{closing:?}");
+            assert!(
+                at(&closing, |s| *s == Step::Keys) < at(&closing, |s| *s == Step::RetirePolicy),
+                "{closing:?}"
+            );
+            assert!(
+                !closing.iter().any(|s| matches!(s, Step::Policy(_))),
+                "{closing:?}"
+            );
+        }
+    }
 }

@@ -235,24 +235,29 @@ pub async fn check_outgoing(
     }
 }
 
-/// The live documents, of any kind but those in `except`, that reference
-/// the row `kind`/`id`. No row references itself: writes refuse that.
+/// The live documents that reference the row `kind`/`id`, but none of a
+/// kind in `except`, and none of a kind in `except_unowned` that operators
+/// wrote (no `managed_by`). No row references itself: writes refuse that.
 pub async fn incoming(
     conn: &mut PgConnection,
     kind: Kind,
     id: Uuid,
     except: &[Kind],
+    except_unowned: &[Kind],
 ) -> Result<Vec<Referrer>, DbError> {
-    let except: Vec<&str> = except.iter().map(|k| k.segment()).collect();
+    let segments = |kinds: &[Kind]| -> Vec<&str> { kinds.iter().map(|k| k.segment()).collect() };
     // Any reference holds the id as text, which narrows the documents to
     // read before each one's references are worked out exactly.
     let candidates: Vec<(String, Uuid, Value)> = sqlx::query_as(
         "SELECT kind, id, doc FROM gw_resources \
-         WHERE NOT deleted AND NOT (kind = ANY($1)) AND strpos(doc::text, $2) > 0 \
+         WHERE NOT deleted AND NOT (kind = ANY($1)) \
+           AND NOT (kind = ANY($3) AND managed_by IS NULL) \
+           AND strpos(doc::text, $2) > 0 \
          ORDER BY kind, id",
     )
-    .bind(&except)
+    .bind(segments(except))
     .bind(id.to_string())
+    .bind(segments(except_unowned))
     .fetch_all(&mut *conn)
     .await?;
     let target = id.to_string();

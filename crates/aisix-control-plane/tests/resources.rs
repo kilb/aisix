@@ -2092,6 +2092,14 @@ async fn operator_configuration_scoped_to_a_derived_row_does_not_hold_its_delete
             )
             .await;
     }
+    // A derived document of an operator kind holds it like any derived
+    // referrer: its owner removes it first.
+    let owned = derived(
+        &cp,
+        Kind::GuardrailAttachments,
+        json!({"guardrail_id": guardrail, "priority": 3, "scope_type": "team", "scope_id": team}),
+    )
+    .await;
 
     let id = |s: &str| Uuid::parse_str(s).expect("a uuid");
     let e = write(
@@ -2110,10 +2118,16 @@ async fn operator_configuration_scoped_to_a_derived_row_does_not_hold_its_delete
         .iter()
         .map(|r| (r.kind, r.id.to_string()))
         .collect();
-    assert_eq!(holders, [(Kind::ApiKeys, key.clone())]);
+    let mut expected = vec![
+        (Kind::ApiKeys, key.clone()),
+        (Kind::GuardrailAttachments, owned.clone()),
+    ];
+    expected.sort_by(|a, b| (a.0.segment(), &a.1).cmp(&(b.0.segment(), &b.1)));
+    assert_eq!(holders, expected);
 
     for (kind, row) in [
         (Kind::ApiKeys, &key),
+        (Kind::GuardrailAttachments, &owned),
         (Kind::Users, &user),
         (Kind::Teams, &team),
     ] {
@@ -2132,6 +2146,14 @@ async fn operator_configuration_scoped_to_a_derived_row_does_not_hold_its_delete
         .await;
     assert_eq!(r.status, 422, "{r:?}");
     assert_eq!(r.body["details"][0]["path"], "/scope_id");
+    // Deleting what was left behind still works.
+    let r = admin
+        .delete(
+            &format!("/admin/resources/guardrail_attachments/{attachment}"),
+            Some("\"1\""),
+        )
+        .await;
+    assert_eq!(r.status, 200, "{r:?}");
 }
 
 /// A key's model selection is withdrawn with the model's grants (ruling
@@ -2228,6 +2250,7 @@ async fn managed_kinds_refuse_generic_writes() {
             .expect("count rows")
     };
     let rows_before = count_rows().await;
+    assert_eq!(rows_before, 1, "boot writes only the platform's own team");
     for kind in ["teams", "users", "api_keys", "budgets"] {
         let listed_before =
             admin.get(&format!("/admin/resources/{kind}")).await.body["items"].clone();
@@ -2373,6 +2396,71 @@ async fn creating_again_an_id_whose_row_is_a_tombstone_revives_it() {
     assert_eq!(r.status, 200, "{r:?}");
     assert_eq!(r.body["version"], 3);
     assert_eq!(r.body["doc"]["name"], "rl-2");
+}
+
+#[tokio::test]
+async fn a_tombstone_is_revived_only_by_its_owner() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let team = live_team(&cp).await;
+    let owner = format!("tenant:{}", Uuid::new_v4());
+    let other = format!("tenant:{}", Uuid::new_v4());
+    let id = Uuid::new_v4();
+    write(
+        &cp,
+        Kind::RateLimitPolicies,
+        id,
+        Op::Create(classic_rate_limit("rl-owned-tomb", "team", &team)),
+        None,
+        Some(&owner),
+    )
+    .await
+    .expect("the owner's create");
+    write(
+        &cp,
+        Kind::RateLimitPolicies,
+        id,
+        Op::Delete,
+        None,
+        Some(&owner),
+    )
+    .await
+    .expect("the owner's delete");
+    for intruder in [Some(other.as_str()), None] {
+        let e = write(
+            &cp,
+            Kind::RateLimitPolicies,
+            id,
+            Op::Create(classic_rate_limit("rl-taken-tomb", "team", &team)),
+            None,
+            intruder,
+        )
+        .await
+        .expect_err("another owner's revival");
+        assert_eq!(
+            (e.status.as_u16(), e.code),
+            (409, "managed_resource"),
+            "{intruder:?}"
+        );
+    }
+    let (doc, _, version, _, deleted, managed_by) =
+        stored(&cp, "rate_limit_policies", &id.to_string()).await;
+    assert_eq!((version, deleted), (2, true));
+    assert_eq!(doc["name"], "rl-owned-tomb");
+    assert_eq!(managed_by.as_deref(), Some(owner.as_str()));
+
+    let revived = write(
+        &cp,
+        Kind::RateLimitPolicies,
+        id,
+        Op::Create(classic_rate_limit("rl-owned-again", "team", &team)),
+        None,
+        Some(&owner),
+    )
+    .await
+    .expect("the owner's revival");
+    assert_eq!((revived.version, revived.deleted), (3, false));
 }
 
 #[tokio::test]

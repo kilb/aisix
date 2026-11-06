@@ -47,6 +47,10 @@ pub enum StoreError {
     /// insert, a live row has the same id.
     #[error("the identity is taken")]
     IdentityTaken,
+    /// An insert would revive the tombstone of a row another owner derived
+    /// (or an operator wrote).
+    #[error("the row belongs to another owner")]
+    NotOwner,
     #[error(transparent)]
     Db(#[from] DbError),
 }
@@ -70,6 +74,7 @@ impl From<StoreError> for ApiError {
             StoreError::IdentityTaken => {
                 ApiError::conflict("name_taken", "同类资源中已有相同名称或标识的资源")
             }
+            StoreError::NotOwner => super::managed_resource(),
             StoreError::Db(e) => e.into(),
         }
     }
@@ -118,7 +123,8 @@ async fn notify(conn: &mut PgConnection) -> Result<(), StoreError> {
 }
 
 /// Inserts a new row, or revives the tombstone of `id`: live again, with
-/// the new document and owner, at the next version.
+/// the new document, at the next version. Only the tombstone's own owner
+/// revives it (`NotOwner` otherwise), as only a live row's owner changes it.
 pub async fn insert(
     conn: &mut PgConnection,
     kind: Kind,
@@ -135,6 +141,7 @@ pub async fn insert(
            version = gw_resources.version + 1, seq = nextval('gw_resources_seq'), \
            updated_at = now() \
          WHERE gw_resources.deleted \
+           AND gw_resources.managed_by IS NOT DISTINCT FROM EXCLUDED.managed_by \
          RETURNING {COLUMNS}"
     ))
     .bind(kind.segment())
@@ -144,8 +151,21 @@ pub async fn insert(
     .bind(managed_by)
     .fetch_optional(&mut *conn)
     .await?;
-    // No row back: `id` is live, and is not created twice.
-    let raw = raw.ok_or(StoreError::IdentityTaken)?;
+    // No row back: `id` is live, and is not created twice, or it is
+    // another owner's tombstone.
+    let Some(raw) = raw else {
+        let tombstone: Option<bool> =
+            sqlx::query_scalar("SELECT deleted FROM gw_resources WHERE kind = $1 AND id = $2")
+                .bind(kind.segment())
+                .bind(id)
+                .fetch_optional(&mut *conn)
+                .await?;
+        return Err(if tombstone == Some(true) {
+            StoreError::NotOwner
+        } else {
+            StoreError::IdentityTaken
+        });
+    };
     notify(conn).await?;
     Ok(row(kind, id, raw))
 }
