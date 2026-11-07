@@ -367,7 +367,7 @@ const DEFAULT_LIMIT: i64 = 50;
 const MAX_LIMIT: i64 = 500;
 
 /// The page size a `limit` asks for: 50 when omitted, 1 to 500.
-fn page_limit(limit: Option<i64>) -> i64 {
+pub(crate) fn page_limit(limit: Option<i64>) -> i64 {
     limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT)
 }
 
@@ -379,14 +379,18 @@ fn newest_first(sql: &mut QueryBuilder<'_, Postgres>, limit: i64) {
 
 /// The page `rows` (read one past `limit`) make, and its `next_before`: the
 /// `seq` of its last row when another page follows, `None` on the last.
-fn page<R>(mut rows: Vec<R>, limit: i64, seq: impl Fn(&R) -> i64) -> (Vec<R>, Option<i64>) {
+pub(crate) fn page<R>(
+    mut rows: Vec<R>,
+    limit: i64,
+    seq: impl Fn(&R) -> i64,
+) -> (Vec<R>, Option<i64>) {
     let more = rows.len() as i64 > limit;
     rows.truncate(limit as usize);
     let next_before = if more { rows.last().map(seq) } else { None };
     (rows, next_before)
 }
 
-fn query_rejected(_: QueryRejection) -> ApiError {
+pub(crate) fn query_rejected(_: QueryRejection) -> ApiError {
     ApiError::validation(vec![Detail {
         path: "query".to_string(),
         message: "查询参数不合法".to_string(),

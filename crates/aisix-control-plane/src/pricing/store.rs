@@ -78,18 +78,7 @@ impl PriceBookCache {
     /// ERROR and reloads the book on every call, so intake keeps pricing
     /// from what the tables hold. The lock is never held across an await.
     pub async fn current(&self, conn: &mut PgConnection) -> Result<Arc<PriceBook>, DbError> {
-        // Read only when it is a whole number a bigint holds, so a hand-edited
-        // value is "no version" instead of a cast error that would fail the
-        // batch on every delivery.
-        let version: Option<i64> = sqlx::query_scalar::<_, Option<i64>>(
-            "SELECT CASE WHEN jsonb_typeof(value) = 'number' AND value::text ~ '^-?[0-9]{1,18}$' \
-                         THEN (value::text)::bigint END \
-             FROM cp_settings WHERE key = 'pricing_version'",
-        )
-        .fetch_optional(&mut *conn)
-        .await?
-        .flatten();
-        let Some(version) = version else {
+        let Some(version) = pricing_version(&mut *conn).await? else {
             tracing::error!(
                 "cp_settings.pricing_version is missing or is not a whole number; the price \
                  book is reloaded for every batch until it is restored"
@@ -140,6 +129,22 @@ impl PriceBookCache {
     pub fn catalogue(&self) -> &Arc<Catalogue> {
         &self.catalogue
     }
+}
+
+/// `cp_settings.pricing_version`, read on `conn`; `None` when the row is
+/// missing or its value is not a whole number a bigint holds.
+pub async fn pricing_version(conn: &mut PgConnection) -> Result<Option<i64>, DbError> {
+    // Read only when it is a whole number a bigint holds, so a hand-edited
+    // value is "no version" instead of a cast error that would fail the
+    // batch on every delivery.
+    Ok(sqlx::query_scalar::<_, Option<i64>>(
+        "SELECT CASE WHEN jsonb_typeof(value) = 'number' AND value::text ~ '^-?[0-9]{1,18}$' \
+                     THEN (value::text)::bigint END \
+         FROM cp_settings WHERE key = 'pricing_version'",
+    )
+    .fetch_optional(conn)
+    .await?
+    .flatten())
 }
 
 /// The table an invalid revision is in, as the alert names it.

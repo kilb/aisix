@@ -131,6 +131,40 @@ fn fixture(method: &str, path: &str, target: &SeededOperator) -> (String, Option
         ("GET", "/admin/usage/events")
         | ("GET", "/admin/usage/batches")
         | ("GET", "/admin/usage/rejects") => (path.to_string(), None),
+        // Prices and charges. Each write is refused after the role check
+        // (no such model or tenant, a card without a default tier), so
+        // nothing is written.
+        ("GET", "/admin/pricing/catalogue")
+        | ("GET", "/admin/pricing/sell")
+        | ("GET", "/admin/pricing/cost")
+        | ("GET", "/admin/pricing/discounts")
+        | ("GET", "/admin/pricing/charges")
+        | ("GET", "/admin/pricing/status") => (path.to_string(), None),
+        ("POST", "/admin/pricing/sell") => (
+            path.to_string(),
+            Some(json!({
+                "model_id": Uuid::nil(),
+                "effective_from": chrono::Utc::now(),
+                "card": {"default": {"base": {"input": "1", "output": "2"}}},
+            })),
+        ),
+        ("POST", "/admin/pricing/cost") => (
+            path.to_string(),
+            Some(json!({
+                "upstream_provider": "openai",
+                "upstream_model": "gpt-4o-mini",
+                "effective_from": chrono::Utc::now(),
+                "card": {"flex": {"base": {"input": "1", "output": "2"}}},
+            })),
+        ),
+        ("POST", "/admin/pricing/discounts") => (
+            path.to_string(),
+            Some(json!({
+                "tenant_id": Uuid::nil(),
+                "effective_from": chrono::Utc::now(),
+                "discount_bps": 500,
+            })),
+        ),
         _ => panic!("no fixture for {method} {path}: add one to tests/roles.rs"),
     }
 }
