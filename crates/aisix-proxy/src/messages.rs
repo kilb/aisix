@@ -2240,6 +2240,9 @@ async fn anthropic_passthrough_dispatch(
             || crate::util::outbound_value(&body_bytes),
             || anthropic_estimation_output_text(&json_body),
         );
+        // Billed from here on: a caller that leaves during the scan below, or
+        // the commit and cache write after it, still owes this answer.
+        crate::attribution::note_answered_usage(metrics.answered(snapshot, model_id));
 
         // #448 (#22): run output guardrails on the passthrough response.
         // The body is forwarded verbatim, so extract its text (content
@@ -3380,6 +3383,18 @@ async fn cross_provider_dispatch(
         // Non-streaming: stamped by the handler, which holds the request clock.
         downstream_latency_ms: 0,
     };
+    // Billed from here on: a caller that leaves during the scan below, or the
+    // commit and cache write after it, still owes this answer. The success
+    // path estimates a count the upstream left out only after the scan, so
+    // the note estimates its own.
+    let mut answered = metrics.clone();
+    fill_missing_anthropic_metrics(
+        &mut answered,
+        &upstream_model,
+        || body.clone(),
+        || crate::chat::estimation_output_text(&resp),
+    );
+    crate::attribution::note_answered_usage(answered.answered(snapshot, model_id));
     if !resolved_chain.is_empty() {
         let (verdict, hits) = aisix_guardrails::Guardrail::check_output_non_segment_observed(
             resolved_chain.as_ref(),
@@ -4461,7 +4476,7 @@ impl From<ProxyError> for MessagesDispatchError {
 /// Bundle of optional fields a UsageEvent emit-call wants when the
 /// upstream actually returned tokens. All-defaults when called from
 /// the error path or before token info is available.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct AnthropicUsageMetrics {
     prompt_tokens: u32,
     completion_tokens: u32,
@@ -4506,6 +4521,50 @@ struct AnthropicUsageMetrics {
     /// the same name on chat's `StreamCompletion`.
     upstream_ttft: Option<Duration>,
     downstream_latency_ms: u32,
+}
+
+impl AnthropicUsageMetrics {
+    /// What [`emit_anthropic_usage_event`] bills for these counters on an
+    /// answer `model_id` served, noted for a caller that leaves before that
+    /// row is written ([`crate::attribution::note_answered_usage`]).
+    fn answered(
+        &self,
+        snap: &aisix_core::AisixSnapshot,
+        model_id: &str,
+    ) -> crate::usage_attr::AnsweredUsage {
+        crate::usage_attr::AnsweredUsage {
+            prompt_tokens: self.prompt_tokens,
+            completion_tokens: self.completion_tokens,
+            reasoning_tokens: self.reasoning_tokens,
+            upstream_total_tokens: self.upstream_total_tokens,
+            reasoning_folded_into_completion: self.reasoning_folded_into_completion,
+            cached_prompt_tokens: self.cached_prompt_tokens,
+            cache_write_tokens: self.cache_write_tokens,
+            cache_creation_tokens: self.cache_creation_tokens,
+            cache_creation_ttl: self.cache_creation_ttl,
+            cache_read_tokens: self.cache_read_tokens,
+            modality: self.modality,
+            web_search_requests: self.web_search_requests,
+            web_fetch_requests: self.web_fetch_requests,
+            audio_duration_seconds: 0.0,
+            usage_estimated: self.usage_estimated,
+            cost_usd: crate::usage_attr::request_cost_usd(
+                snap,
+                model_id,
+                crate::usage_attr::input_tokens_for_pricing(
+                    u64::from(self.prompt_tokens),
+                    u64::from(self.cached_prompt_tokens),
+                    u64::from(self.cache_write_tokens.unwrap_or(0)),
+                    u64::from(self.cache_read_tokens),
+                    u64::from(self.cache_creation_tokens),
+                ),
+                u64::from(self.completion_tokens),
+            ),
+            service_tier: self.service_tier.clone(),
+            provider_request_id: self.provider_request_id.clone(),
+            provider_model_version: self.provider_model_version.clone(),
+        }
+    }
 }
 
 /// Emit a UsageEvent for a `/v1/messages` request. Mirrors

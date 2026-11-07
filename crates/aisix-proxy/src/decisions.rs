@@ -672,6 +672,26 @@ async fn dispatch(
         decision_input_tokens(&usage),
         u64::from(usage.output),
     );
+    // Billed from here on: a caller that leaves during the commit still owes
+    // this answer, priced as the success row prices it.
+    crate::attribution::note_answered_usage(crate::usage_attr::AnsweredUsage {
+        prompt_tokens: usage.input,
+        completion_tokens: usage.output,
+        cached_prompt_tokens: usage.cached,
+        cache_write_tokens: usage.cache_write,
+        modality: usage.modality,
+        reasoning_tokens: usage.reasoning,
+        upstream_total_tokens: usage.upstream_total,
+        cost_usd: crate::usage_attr::request_cost_usd(
+            snapshot,
+            &target.id,
+            decision_input_tokens(&usage),
+            u64::from(usage.output),
+        ),
+        provider_request_id: provider_request_id.clone(),
+        provider_model_version: reported_model.clone(),
+        ..Default::default()
+    });
     reservation
         .commit(u64::from(usage.input) + u64::from(usage.output), spend)
         .await;

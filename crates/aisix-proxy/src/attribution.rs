@@ -116,6 +116,22 @@ pub(crate) struct InFlightAttempt {
     pub target_model: String,
     /// UUID of the concrete Model row this attempt dispatched to.
     pub model_id: String,
+    /// When the attempt began, so one that has answered can report its own
+    /// duration ([`note_answered_usage`]).
+    pub started: Instant,
+    /// What the attempt's answer is billed, once it answered and while the
+    /// family is still processing the answer inside the attempt (the
+    /// Messages and Responses output scan runs before their attempt
+    /// settles). See [`crate::usage_attr::AnsweredUsage`].
+    pub answered: Option<AnsweredAttempt>,
+}
+
+/// An attempt in flight that has answered: what its answer is billed, and
+/// how long the upstream took to give it.
+#[derive(Clone)]
+pub(crate) struct AnsweredAttempt {
+    pub usage: crate::usage_attr::AnsweredUsage,
+    pub latency_ms: u32,
 }
 
 /// The attempt that WON, once it has settled.
@@ -135,6 +151,9 @@ pub(crate) struct SettledWinner {
     /// post-dispatch work (the output scan, the cache write) the cancel
     /// actually landed in.
     pub latency_ms: u32,
+    /// What its answer is billed, once the family has computed it. See
+    /// [`crate::usage_attr::AnsweredUsage`].
+    pub usage: Option<crate::usage_attr::AnsweredUsage>,
 }
 
 /// What a route that never names a model reports in place of one.
@@ -220,10 +239,10 @@ pub(crate) struct CancelContext {
     pub last_settled_model_id: String,
     /// Attempts that settled as failures. On the cancel path these never
     /// reach the handler's own `emit_failed_attempts`, so the guard emits
-    /// them. A SUCCESSFUL attempt is not kept: its event is built from the
-    /// response the handler was still processing, of which the attempt
-    /// record holds nothing, so there would be nothing to bill it with —
-    /// and skipping it also keeps the happy path allocation-free here.
+    /// them. A SUCCESSFUL attempt is not kept here: `won` speaks for it,
+    /// billed with what its family noted of the answer
+    /// ([`note_answered_usage`]) — and skipping it also keeps the happy
+    /// path allocation-free here.
     pub failed_attempts: Vec<AttemptRecord>,
     /// Whether a usage event has already been emitted for this request, and
     /// whether one of them was the terminal one.
@@ -1486,7 +1505,13 @@ pub(crate) fn note_attempt_settled(rec: &AttemptRecord) {
         }
     });
     with_cancel(|c| {
-        c.in_flight = None;
+        // An answer noted while the attempt was still in flight is the
+        // winner's from here on.
+        let answered = c
+            .in_flight
+            .take()
+            .filter(|a| a.index == rec.index)
+            .and_then(|a| a.answered);
         c.last_settled_model_id = rec.target_model_id.clone();
         if rec.success {
             c.won = Some(SettledWinner {
@@ -1495,10 +1520,34 @@ pub(crate) fn note_attempt_settled(rec: &AttemptRecord) {
                 target_model: rec.target_model.clone(),
                 model_id: rec.target_model_id.clone(),
                 latency_ms: rec.latency_ms,
+                usage: answered.map(|a| a.usage),
             });
         } else {
             c.failed_attempts.push(rec.clone());
         }
+    });
+}
+
+/// Note what the answer of the attempt that answered is billed, the moment
+/// the family has computed what its success row takes and before its first
+/// await. A caller that hangs up during the work that follows (the output
+/// scan, the reservation commit, the cache write) then leaves a row that
+/// bills the upstream's answer, not zero ([`crate::cancel::emit`]).
+///
+/// It belongs to the attempt in flight when there is one (the Messages and
+/// Responses families scan the answer inside the attempt), otherwise to the
+/// winner that already settled (chat and the single-shot family scan after
+/// it). A streamed answer is not noted: its own stream emitter bills it.
+pub(crate) fn note_answered_usage(usage: crate::usage_attr::AnsweredUsage) {
+    with_cancel(|c| match (c.in_flight.as_mut(), c.won.as_mut()) {
+        (Some(attempt), _) => {
+            attempt.answered = Some(AnsweredAttempt {
+                latency_ms: crate::attempt::measured_ms(attempt.started.elapsed()),
+                usage,
+            });
+        }
+        (None, Some(won)) => won.usage = Some(usage),
+        (None, None) => {}
     });
 }
 
@@ -2336,6 +2385,89 @@ mod tests {
              the cancel guard would now emit a second terminal event for the \
              same request",
         );
+    }
+
+    fn attempt(index: u32, success: bool) -> AttemptRecord {
+        AttemptRecord {
+            index,
+            kind: "initial",
+            target_model: String::new(),
+            target_model_id: format!("m-{index}"),
+            provider_key_id: "pk-1".into(),
+            status: if success { 200 } else { 502 },
+            success,
+            error_class: String::new(),
+            error_message: String::new(),
+            latency_ms: 5,
+            dispatched: true,
+        }
+    }
+
+    fn started(index: u32) {
+        note_attempt_started(InFlightAttempt {
+            index,
+            kind: "initial",
+            target_model: String::new(),
+            model_id: format!("m-{index}"),
+            started: Instant::now(),
+            answered: None,
+        });
+    }
+
+    fn answer(prompt_tokens: u32) -> crate::usage_attr::AnsweredUsage {
+        crate::usage_attr::AnsweredUsage {
+            prompt_tokens,
+            ..Default::default()
+        }
+    }
+
+    /// An answer noted while its attempt is in flight belongs to that
+    /// attempt, follows it when it settles as the winner, and is dropped
+    /// with it when it settles as a failure, so it can never bill a later
+    /// attempt.
+    #[tokio::test]
+    async fn an_answered_usage_follows_its_attempt() {
+        let cell = Arc::new(RequestAttribution::default());
+        scope(cell.clone(), async {
+            started(0);
+            note_answered_usage(answer(7));
+            note_attempt_settled(&attempt(0, false));
+            started(1);
+            note_answered_usage(answer(11));
+            note_attempt_settled(&attempt(1, true));
+        })
+        .await;
+        let ctx = cell.take_cancel_context();
+        assert!(ctx.in_flight.is_none());
+        let won = ctx.won.expect("the second attempt won");
+        assert_eq!(won.index, 1);
+        assert_eq!(won.usage, Some(answer(11)));
+    }
+
+    /// An answer noted after its winner settled (chat and the single-shot
+    /// family scan after the attempt) belongs to that winner.
+    #[tokio::test]
+    async fn an_answer_noted_after_the_winner_settled_is_the_winners() {
+        let cell = Arc::new(RequestAttribution::default());
+        scope(cell.clone(), async {
+            started(0);
+            note_attempt_settled(&attempt(0, true));
+            note_answered_usage(answer(13));
+        })
+        .await;
+        assert_eq!(
+            cell.take_cancel_context().won.unwrap().usage,
+            Some(answer(13))
+        );
+
+        // With no attempt at all there is nothing to bill.
+        let cell = Arc::new(RequestAttribution::default());
+        scope(cell.clone(), async {
+            note_answered_usage(answer(17));
+        })
+        .await;
+        let ctx = cell.take_cancel_context();
+        assert!(ctx.won.is_none() && ctx.in_flight.is_none());
     }
 
     /// The caller-addressed name is the FIRST one noted: a routed request

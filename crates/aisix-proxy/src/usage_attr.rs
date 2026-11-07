@@ -1239,6 +1239,105 @@ pub(crate) fn apply_winning_attempt(
     }
 }
 
+/// What an attempt that answered is billed: the counters, cost and served
+/// tier the request's success row records for it, in the upstream's own
+/// shape.
+///
+/// The upstream charges for an answer the moment it is sent, but a family
+/// writes its success row only after the work that follows: the output
+/// scan, the reservation commit, the cache write. A caller that hangs up in
+/// between drops the handler before that row exists, and the row the
+/// cancel guard writes in its place has to bill what the upstream charged
+/// rather than nothing. So each family notes this
+/// ([`crate::attribution::note_answered_usage`]) as soon as it has
+/// computed the values its success row takes, before its first await, and
+/// [`crate::cancel::emit`] stamps them onto that row with [`Self::apply`].
+/// Each field holds exactly what the family's success row would record:
+/// a family that records no cache counters leaves them at zero here too.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct AnsweredUsage {
+    pub prompt_tokens: u32,
+    /// The completion count before [`aisix_gateway::chat::recorded_completion_tokens`],
+    /// which [`Self::apply`] runs, as every success row does.
+    pub completion_tokens: u32,
+    pub reasoning_tokens: u32,
+    pub upstream_total_tokens: u32,
+    pub reasoning_folded_into_completion: u32,
+    pub cached_prompt_tokens: u32,
+    pub cache_write_tokens: Option<u32>,
+    pub cache_creation_tokens: u32,
+    pub cache_creation_ttl: aisix_gateway::CacheCreationTtl,
+    pub cache_read_tokens: u32,
+    pub modality: aisix_gateway::ModalityTokens,
+    pub web_search_requests: u32,
+    pub web_fetch_requests: u32,
+    pub audio_duration_seconds: f64,
+    pub usage_estimated: bool,
+    pub cost_usd: f64,
+    /// The tier the upstream reports it served, which the price is read at.
+    pub service_tier: Option<String>,
+    pub provider_request_id: String,
+    pub provider_model_version: String,
+}
+
+impl AnsweredUsage {
+    /// Every counter of `stats`, as the chat and messages success rows
+    /// record a [`aisix_gateway::UsageStats`]. The caller sets what the row
+    /// takes from elsewhere: an estimated count, the cost, the response's
+    /// identity.
+    pub(crate) fn from_stats(stats: &aisix_gateway::UsageStats) -> Self {
+        Self {
+            prompt_tokens: stats.prompt_tokens,
+            completion_tokens: stats.completion_tokens,
+            reasoning_tokens: stats.reasoning_tokens,
+            upstream_total_tokens: stats.upstream_total_tokens,
+            reasoning_folded_into_completion: stats.reasoning_folded_into_completion,
+            cached_prompt_tokens: stats.cached_prompt_tokens,
+            cache_write_tokens: stats.cache_write_tokens,
+            cache_creation_tokens: stats.cache_creation_tokens,
+            cache_creation_ttl: stats.cache_creation_ttl,
+            cache_read_tokens: stats.cache_read_tokens,
+            modality: stats.modality,
+            web_search_requests: stats.web_search_requests,
+            web_fetch_requests: stats.web_fetch_requests,
+            ..Self::default()
+        }
+    }
+
+    /// Stamp these onto `event`, with the arithmetic every success row
+    /// applies: the completion recorded without the reasoning the gateway
+    /// folded into it, and the upstream's own total.
+    pub(crate) fn apply(&self, event: &mut UsageEvent) {
+        event.prompt_tokens = self.prompt_tokens;
+        event.completion_tokens = aisix_gateway::chat::recorded_completion_tokens(
+            self.prompt_tokens,
+            self.completion_tokens,
+            self.reasoning_tokens,
+            self.reasoning_folded_into_completion,
+            self.upstream_total_tokens,
+        );
+        event.reasoning_unfolded_from_completion = self
+            .completion_tokens
+            .saturating_sub(event.completion_tokens);
+        event.reasoning_tokens = self.reasoning_tokens;
+        event.total_tokens = self.upstream_total_tokens;
+        event.cached_prompt_tokens = self.cached_prompt_tokens;
+        event.cache_write_tokens = self.cache_write_tokens;
+        event.cache_creation_tokens = self.cache_creation_tokens;
+        event.cache_creation_ttl = self.cache_creation_ttl;
+        event.cache_read_tokens = self.cache_read_tokens;
+        event.modality_tokens = self.modality;
+        event.web_search_requests = self.web_search_requests;
+        event.web_fetch_requests = self.web_fetch_requests;
+        event.audio_duration_seconds = self.audio_duration_seconds;
+        event.usage_estimated = self.usage_estimated;
+        event.cost_usd = self.cost_usd;
+        event.service_tier = self.service_tier.clone();
+        event.provider_request_id = self.provider_request_id.clone();
+        event.provider_model_version = self.provider_model_version.clone();
+    }
+}
+
 /// The [`emit_error_usage_event`] event without the emission, for a caller
 /// that attributes handler-specific fields (e.g. the passthrough route name)
 /// before handing it to [`emit_prepared_usage_event`].

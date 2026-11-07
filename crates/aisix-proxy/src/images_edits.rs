@@ -796,6 +796,11 @@ async fn dispatch(
             u64::from(u.completion_tokens),
         )
     });
+    // Billed from here on: a caller that leaves during the commit or the
+    // output review below still owes this answer.
+    if let Some(u) = usage.as_ref() {
+        crate::images::note_answered_image(snapshot, &target.id, u);
+    }
     reservation.commit(total_tokens, spend).await;
 
     let review = crate::images::review_image_output(

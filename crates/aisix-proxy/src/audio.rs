@@ -1974,6 +1974,24 @@ async fn multipart_dispatch(
             u64::from(u.completion_tokens),
         )
     });
+    // Billed from here on: a caller that leaves during the commit or the
+    // transcript scan below still owes this answer, priced as the success
+    // row prices it, its duration included.
+    let answered_tokens = usage.clone().unwrap_or_default();
+    crate::attribution::note_answered_usage(crate::usage_attr::AnsweredUsage {
+        prompt_tokens: answered_tokens.prompt_tokens,
+        completion_tokens: answered_tokens.completion_tokens,
+        upstream_total_tokens: answered_tokens.upstream_total_tokens,
+        modality: answered_tokens.modality,
+        audio_duration_seconds: duration_seconds,
+        cost_usd: crate::usage_attr::request_cost_usd(
+            snapshot,
+            &target.id,
+            aisix_core::InputTokens::uncached_only(u64::from(answered_tokens.prompt_tokens)),
+            u64::from(answered_tokens.completion_tokens),
+        ),
+        ..Default::default()
+    });
     reservation.commit(total_tokens, spend).await;
 
     // #696: run the output guardrail chain on the transcript — it is

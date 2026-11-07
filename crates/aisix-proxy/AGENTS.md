@@ -285,6 +285,15 @@ already pass through — never held only in a handler local.** A value kept in a
 local is correct on every path except the one nobody tests, and the symptom is a
 missing row rather than an error.
 
+The usage of an answer is one such value. The upstream bills an answer when it
+sends it, and a family writes its row only after the work that follows (the
+output scan, the reservation commit, the cache write), so a buffered answer's
+counters, cost and served tier go to `attribution::note_answered_usage` the
+moment they are computed, before the first await, exactly as the success row
+will record them. A caller that leaves in between then leaves a `499` that
+bills the answer rather than zero. A streamed answer is billed by its stream's
+own emitter instead.
+
 That guard's lifetime does **not** end when the handler returns: it rides the
 response body (`TelemetryBody`), because a streaming family's own terminal
 emitter is built INSIDE its `async_stream!` generator and so does not exist

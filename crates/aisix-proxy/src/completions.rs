@@ -1267,6 +1267,15 @@ async fn dispatch(
                 .as_ref()
                 .map(|u| completion_spend_micro_usd(snapshot, &model_entry_id, u))
                 .unwrap_or(0);
+            // Billed from here on: a caller that leaves during the commit or
+            // the output scan below still owes this answer.
+            if let Some(u) = usage.as_ref() {
+                crate::attribution::note_answered_usage(u.answered(
+                    snapshot,
+                    &model_entry_id,
+                    &provider_request_id,
+                ));
+            }
             reservation.commit(total_tokens, spend).await;
 
             // #911 [23]: /v1/completions must run OUTPUT guardrails too. The
@@ -1430,6 +1439,37 @@ fn completion_input_tokens(usage: &CompletionUsage) -> aisix_core::InputTokens {
         0,
         0,
     )
+}
+
+impl CompletionUsage {
+    /// What the success row ([`emit_usage_event`]) bills for these counters
+    /// on an answer `model_id` served, noted for a caller that leaves before
+    /// that row is written ([`crate::attribution::note_answered_usage`]).
+    fn answered(
+        &self,
+        snap: &aisix_core::AisixSnapshot,
+        model_id: &str,
+        provider_request_id: &str,
+    ) -> crate::usage_attr::AnsweredUsage {
+        crate::usage_attr::AnsweredUsage {
+            prompt_tokens: self.prompt_tokens,
+            completion_tokens: self.completion_tokens,
+            cached_prompt_tokens: self.cached_prompt_tokens,
+            cache_write_tokens: self.cache_write_tokens,
+            modality: self.modality,
+            reasoning_tokens: self.reasoning_tokens,
+            upstream_total_tokens: self.upstream_total_tokens,
+            usage_estimated: self.usage_estimated,
+            cost_usd: crate::usage_attr::request_cost_usd(
+                snap,
+                model_id,
+                completion_input_tokens(self),
+                u64::from(self.completion_tokens),
+            ),
+            provider_request_id: provider_request_id.to_string(),
+            ..Default::default()
+        }
+    }
 }
 
 /// 这次 `/v1/completions` 调用要记进花费桶的量（micro-USD）。
