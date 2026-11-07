@@ -30,8 +30,8 @@ use serde_json::{json, Value};
 use crate::auth::{MemberRole, OperatorRole, KEY_HOLDERS};
 use crate::error::{ApiError, Detail};
 use crate::{
-    audit, dp, gateways, keys, members, operators, pricing, projector, resources, rollout, tenants,
-    usage, AppState,
+    audit, billing, dp, gateways, keys, members, operators, pricing, projector, resources, rollout,
+    tenants, usage, AppState,
 };
 
 /// The largest request body either listener reads.
@@ -317,8 +317,20 @@ pub const ROUTE_ROLES: &[(&str, &str, MinRole)] = &[
         "/admin/pricing/status",
         MinRole::Op(OperatorRole::Viewer),
     ),
+    // Each model's current and upcoming price, and each tenant's plan.
+    (
+        "GET",
+        "/admin/pricing/models",
+        MinRole::Op(OperatorRole::Viewer),
+    ),
+    (
+        "GET",
+        "/admin/pricing/tenants/{id}",
+        MinRole::Op(OperatorRole::Viewer),
+    ),
     // Gateways, on the gateway listener.
     ("POST", "/dp/heartbeat", MinRole::Dp),
+    ("GET", "/dp/v1/keys/{key_id}/prices", MinRole::Dp),
     ("ANY", "/dp/store/v1/{*rest}", MinRole::Dp),
     ("POST", "/dp/telemetry", MinRole::Dp),
 ];
@@ -457,6 +469,8 @@ pub fn browser_router(state: AppState) -> Router {
         )
         .route("/admin/pricing/charges", get(pricing::api::list_charges))
         .route("/admin/pricing/status", get(pricing::api::status))
+        .route("/admin/pricing/models", get(billing::plans::models))
+        .route("/admin/pricing/tenants/{id}", get(billing::plans::tenant))
         .route_layer(axum::middleware::from_fn(json_only))
         .route_layer(axum::middleware::from_fn(only_listed_routes))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
@@ -468,6 +482,10 @@ pub fn browser_router(state: AppState) -> Router {
 pub fn dp_router(state: AppState) -> Router {
     Router::new()
         .route("/dp/heartbeat", post(dp::heartbeat::heartbeat))
+        .route(
+            "/dp/v1/keys/{key_id}/prices",
+            get(billing::lookup_prices::prices),
+        )
         .route("/dp/store/v1/{*rest}", any(dp::store::not_found))
         // A batch may be larger than the other routes' bodies, and every
         // answer, the body limit's included, says batches are deduplicated.
