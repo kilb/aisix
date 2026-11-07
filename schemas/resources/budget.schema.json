@@ -54,7 +54,7 @@
       "description": "The budget is exhausted for everything it applies to.",
       "properties": {
         "period_start": {
-          "description": "Start of the period the budget was exhausted in, as an RFC 3339 timestamp. The block holds only while this is the start of the current period, so it lifts at the next period boundary on its own. Omitted, the block holds in every period.",
+          "description": "Start of the period the budget was exhausted in, as an RFC 3339 timestamp. The block holds only while this is the start of the current period, so it lifts at the next period boundary on its own. Omitted, the block holds in every period. A rejection by a mark without one carries no reset time.",
           "type": "string"
         },
         "reason": {
