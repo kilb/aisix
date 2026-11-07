@@ -4,6 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>AISIX Dashboard</title>
+<!-- A stored dark choice applies before the first paint, not after the app loads (src/lib/useTheme.ts). -->
+<script>try{if(localStorage.getItem("aisix-cp-theme")==="dark")document.documentElement.dataset.theme="dark"}catch(e){}</script>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3' fill='%231C2A39'/%3E%3Cpath d='M3 8h10' stroke='%23F5F7F4' stroke-width='1.5' stroke-linecap='round'/%3E%3Ccircle cx='8' cy='8' r='3' fill='%23FFC72C' stroke='%231C2A39' stroke-width='1'/%3E%3C/svg%3E">
 </head>
 <body>

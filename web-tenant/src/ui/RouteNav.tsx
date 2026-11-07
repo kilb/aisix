@@ -11,7 +11,9 @@ export interface RouteItem<Id extends string> {
  * Sections as stops on a route line: a `tablist` of `tab`s named exactly
  * by their labels, in order, joined by one Ink line. The current tab is a
  * larger Sign-yellow stop. A stop is drawn by CSS and carries no text, so
- * each tab's text is its label alone.
+ * each tab's text is its label alone. Tab `<id>` is `stop-<id>` and
+ * controls `tab-<id>`, the `tabpanel` the caller renders for the open
+ * section, labelled by its tab.
  *
  * Keyboard: Tab reaches the current stop; the arrow keys, Home and End move
  * between stops, and Enter or Space opens one.
@@ -62,8 +64,10 @@ export function RouteNav<Id extends string>({
           key={t.id}
           type="button"
           role="tab"
+          id={`stop-${t.id}`}
           data-tab={t.id}
           aria-selected={t.id === current}
+          aria-controls={`tab-${t.id}`}
           tabIndex={t.id === current ? 0 : -1}
           onClick={() => onSelect(t.id)}
         >

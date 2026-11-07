@@ -582,14 +582,28 @@ label:hover > :is(input[type="checkbox"], input[type="radio"]):checked:not(:disa
 }
 
 /* ── Tables: 36px header, 44px rows, hover in Concrete, no zebra ─ */
+/* The table's box is the containing block of whatever is absolutely
+   placed inside it (a tooltip, visually hidden text), so the box clips it
+   instead of it widening the page past the screen. */
 .dt-wrap {
   --dt-edge: var(--s-3);
+  position: relative;
   overflow-x: auto;
   margin: var(--s-4) 0 0;
 }
 .dt-wrap.dt-scroll {
   max-height: min(70vh, 720px);
   overflow-y: auto;
+}
+/* A table wider than its box scrolls sideways inside it, and a shadow at
+   the edge it continues past says so. The two surface-coloured layers move
+   with the content and cover the shadows while that edge is in view. */
+.dt-wrap {
+  background:
+    linear-gradient(to right, var(--surface) 30%, transparent) left / 32px 100% no-repeat local,
+    linear-gradient(to left, var(--surface) 30%, transparent) right / 32px 100% no-repeat local,
+    radial-gradient(farthest-side at 0 50%, var(--scroll-shadow), transparent) left / 12px 100% no-repeat scroll,
+    radial-gradient(farthest-side at 100% 50%, var(--scroll-shadow), transparent) right / 12px 100% no-repeat scroll;
 }
 .dt {
   width: 100%;
@@ -686,7 +700,12 @@ label:hover > :is(input[type="checkbox"], input[type="radio"]):checked:not(:disa
 .dt code {
   white-space: nowrap;
 }
-/* Actions in a row sit side by side, 8px apart, on one line. */
+/* Actions in a row sit side by side, 8px apart, on one line, lined up at
+   their top, so an open two-step's warning hangs under the row's buttons
+   rather than pushing them down to its middle. */
+.dt td > :is(.btn, .two-step, .has-tip) {
+  vertical-align: top;
+}
 .dt td > .btn + .btn,
 .dt td > .btn + .two-step,
 .dt td > .two-step + .btn,
@@ -764,30 +783,34 @@ label:hover > :is(input[type="checkbox"], input[type="radio"]):checked:not(:disa
 }
 .two-step.is-asking {
   display: inline-grid;
-  grid-template-columns: auto auto;
-  justify-content: start;
+  justify-items: start;
+  gap: var(--s-1);
+}
+.two-step-confirm {
+  display: inline-flex;
   align-items: center;
-  gap: var(--s-1) var(--s-2);
+  gap: var(--s-2);
 }
 .two-step.is-swapping {
   overflow: clip;
   overflow-clip-margin: 4px;
 }
 .two-step-warn {
-  grid-row: 2;
-  grid-column: 1 / -1;
+  /* Its own width up to 44ch, so a table shrinking its columns cannot
+     squeeze a short warning onto two lines; a long one wraps at 44ch. */
+  width: max-content;
   max-width: 44ch;
   color: var(--text-2);
   font-size: var(--fs-13);
   line-height: var(--lh-table);
   white-space: normal;
+  text-wrap: balance;
 }
 /* In a row's actions column, against the column's right edge. */
 .right .two-step.is-asking {
-  justify-content: end;
+  justify-items: end;
 }
 .right .two-step-warn {
-  justify-self: end;
   text-align: right;
 }
 .is-in {

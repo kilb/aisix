@@ -14,10 +14,12 @@
 .tn-mark {
   margin-left: var(--s-2);
 }
+/* Lined up at the top: an open two-step's warning hangs under the row's
+   buttons instead of pushing the others down to its middle. */
 .tn-actions {
   display: flex;
   flex-wrap: wrap;
-  align-items: center;
+  align-items: flex-start;
   gap: var(--s-2);
 }
 td > .tn-actions {

@@ -185,32 +185,34 @@ export function Gate({
         ) : (
           <div className="panel">
             <RouteNav label="登录或注册" items={MODES} current={mode} onSelect={switchMode} />
-            <form className="form gate-form" onSubmit={submit}>
-              {mode === "signup" && (
-                <Field label="组织名称">
+            <div id={`tab-${mode}`} role="tabpanel" aria-labelledby={`stop-${mode}`}>
+              <form className="form gate-form" onSubmit={submit}>
+                {mode === "signup" && (
+                  <Field label="组织名称">
+                    <input
+                      autoComplete="organization"
+                      required
+                      value={orgName}
+                      onChange={(e) => setOrgName(e.target.value)}
+                    />
+                  </Field>
+                )}
+                <Field label="邮箱">
                   <input
-                    autoComplete="organization"
+                    type="email"
+                    autoComplete="username"
                     required
-                    value={orgName}
-                    onChange={(e) => setOrgName(e.target.value)}
+                    value={email}
+                    onChange={(e) => setEmail(e.target.value)}
                   />
                 </Field>
-              )}
-              <Field label="邮箱">
-                <input
-                  type="email"
-                  autoComplete="username"
-                  required
-                  value={email}
-                  onChange={(e) => setEmail(e.target.value)}
-                />
-              </Field>
-              {passwordField}
-              {mode === "signup" && displayNameField}
-              <Button kind="primary" block type="submit" busy={busy}>
-                {mode === "login" ? "登录" : "注册组织"}
-              </Button>
-            </form>
+                {passwordField}
+                {mode === "signup" && displayNameField}
+                <Button kind="primary" block type="submit" busy={busy}>
+                  {mode === "login" ? "登录" : "注册组织"}
+                </Button>
+              </form>
+            </div>
             {alert}
           </div>
         )}

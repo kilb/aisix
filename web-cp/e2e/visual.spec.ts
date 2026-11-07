@@ -8,15 +8,63 @@ import { STACK_START_TIMEOUT_MS, startStack, type Stack } from "./stack";
  * sideways scroll with the section navigation as a bar along the bottom.
  *
  * Each step saves a full-page screenshot (`visual-<page>-<light|dark|360>.png`)
- * for review. Nothing compares pixels: the assertions are the computed
- * background, the page width and where the navigation sits.
+ * for review, with transitions run to their end. Nothing compares pixels:
+ * the assertions are the computed background, the page width and where the
+ * navigation sits. The platform is set up through the real `/admin` and
+ * `/api` first, so the lists show upstream accounts, models, tenants in each
+ * state, keys and a gateway credential as they would.
  */
 
 let stack: Stack;
 
+const PASSWORD = "visual-pass-3c8x";
+
 test.beforeAll(async () => {
   test.setTimeout(STACK_START_TIMEOUT_MS);
   stack = await startStack();
+
+  const accounts: Record<string, string[]> = { "pool-a-01": ["shared", "apac-low"], "pool-e-01": ["eu-pool", "batch"] };
+  const accountIds: string[] = [];
+  for (const [name, groups] of Object.entries(accounts)) {
+    const account = await stack.admin.post("/admin/resources/provider_keys", {
+      doc: {
+        display_name: name,
+        provider: "openai",
+        api_key: `sk-${name}-visual-upstream`,
+        api_base: `${stack.mockUpstreamUrl}/v1`,
+        groups,
+      },
+    });
+    accountIds.push(account.id);
+  }
+  const modelIds: string[] = [];
+  for (const [i, name] of ["chat-small", "chat-large", "embed-v3"].entries()) {
+    const model = await stack.admin.post("/admin/resources/models", {
+      doc: { display_name: name, provider: "openai", model_name: "gpt-4o-mini", provider_key_id: accountIds[i % 2] },
+    });
+    modelIds.push(model.id);
+  }
+
+  // A tenant at work, one waiting for review and one suspended.
+  const signUp = async (org: string, email: string): Promise<string> =>
+    (await stack.tenant().post("/api/signup", { org_name: org, email, password: PASSWORD })).tenant.id;
+  const active = await signUp("北辰数据", "owner@beichen-3c8.test");
+  await stack.admin.post(`/admin/tenants/${active}/approve`);
+  const current = await stack.admin.get(`/admin/tenants/${active}`);
+  await stack.admin.patch(
+    `/admin/tenants/${active}`,
+    { allowed_model_ids: modelIds.slice(0, 2), allowed_provider_groups: ["shared", "apac-low"] },
+    current.version,
+  );
+  await stack.admin.post(`/admin/tenants/${active}/keys`, { label: "prod-backend" });
+  await stack.admin.post(`/admin/tenants/${active}/keys`, { label: "ci-runner" });
+  await signUp("Kestrel Labs", "owner@kestrel-3c8.test");
+  const closed = await signUp("Quarry Lane Research Collective", "owner@quarry-3c8.test");
+  await stack.admin.post(`/admin/tenants/${closed}/approve`);
+  await stack.admin.post(`/admin/tenants/${closed}/suspend`);
+
+  await stack.admin.post("/admin/gateways/credentials", { name: "gw-edge-01" });
+  await stack.admin.post("/admin/operators", { email: "viewer@visual-3c8.test", role: "viewer", password: PASSWORD });
 });
 
 test.afterAll(async () => {
@@ -71,7 +119,7 @@ function background(page: Page): Promise<string> {
 
 async function shoot(page: Page, name: string): Promise<void> {
   const path = test.info().outputPath(name);
-  await page.screenshot({ path, fullPage: true });
+  await page.screenshot({ path, fullPage: true, animations: "disabled" });
   await test.info().attach(name, { path, contentType: "image/png" });
 }
 

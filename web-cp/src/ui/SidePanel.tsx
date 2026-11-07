@@ -7,7 +7,8 @@ import { Button } from "./Button";
  * beside the list from 1400px and stacks under it below that; the list's
  * container is `.with-side` with `is-open` while it shows. Escape or the
  * close button closes it. It takes focus when it opens, which also brings
- * it into view where it stacks.
+ * it into view where it stacks, and gives it back to what opened it when
+ * it closes.
  */
 export function SidePanel({
   title,
@@ -28,9 +29,17 @@ export function SidePanel({
   useEffect(() => {
     const panel = ref.current;
     if (!panel) return;
+    // What opened the panel gets the focus back when it closes.
+    const opener = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     panel.focus({ preventScroll: true });
     // Stacked under the list, it may open below the fold: bring its top into view.
     if (panel.getBoundingClientRect().top > window.innerHeight) panel.scrollIntoView({ block: "start" });
+    return () => {
+      // Only when the focus went with the panel (关闭, Escape): opening
+      // another tenant's detail has put it on that tenant's name already.
+      const lost = document.activeElement === null || document.activeElement === document.body;
+      if (lost && opener?.isConnected) opener.focus({ preventScroll: true });
+    };
   }, []);
   return (
     <section

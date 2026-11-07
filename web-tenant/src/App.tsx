@@ -222,13 +222,19 @@ export function App({ inviteToken }: { inviteToken: string | null }) {
       )}
 
       <main className="wrap page">
-        {current === "keys" ? (
-          <Keys member={member} status={tenant.status} onSelfChanged={() => void boot()} />
-        ) : current === "members" ? (
-          <Members member={member} status={tenant.status} onSelfChanged={() => void boot()} onLeft={leave} />
-        ) : (
-          <Org member={member} status={tenant.status} />
-        )}
+        <section
+          id={`tab-${current}`}
+          role={visible.length > 0 ? "tabpanel" : undefined}
+          aria-labelledby={visible.length > 0 ? `stop-${current}` : undefined}
+        >
+          {current === "keys" ? (
+            <Keys member={member} status={tenant.status} onSelfChanged={() => void boot()} />
+          ) : current === "members" ? (
+            <Members member={member} status={tenant.status} onSelfChanged={() => void boot()} onLeft={leave} />
+          ) : (
+            <Org member={member} status={tenant.status} />
+          )}
+        </section>
       </main>
     </div>
   );

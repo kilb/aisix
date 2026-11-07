@@ -287,22 +287,26 @@ export default function Styleguide() {
         </Fig>
         <Fig caption="第二步：确认才是红色">
           <span className="two-step is-asking">
-            <Button kind="danger" size="sm" tabIndex={-1}>
-              确认停用
-            </Button>
-            <Button size="sm" tabIndex={-1}>
-              取消
-            </Button>
+            <span className="two-step-confirm">
+              <Button kind="danger" size="sm" tabIndex={-1}>
+                确认停用
+              </Button>
+              <Button size="sm" tabIndex={-1}>
+                取消
+              </Button>
+            </span>
           </span>
         </Fig>
         <Fig caption="带说明的两步确认：说明在按钮下方">
           <span className="two-step is-asking">
-            <Button kind="danger" size="sm" tabIndex={-1}>
-              确认吊销
-            </Button>
-            <Button size="sm" tabIndex={-1}>
-              取消
-            </Button>
+            <span className="two-step-confirm">
+              <Button kind="danger" size="sm" tabIndex={-1}>
+                确认吊销
+              </Button>
+              <Button size="sm" tabIndex={-1}>
+                取消
+              </Button>
+            </span>
             <span className="two-step-warn" role="presentation">
               吊销后该密钥永久失效，不能恢复。
             </span>

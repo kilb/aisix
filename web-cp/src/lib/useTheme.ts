@@ -23,7 +23,8 @@ function stored(): Theme | null {
 export function useTheme(): [Theme, () => void] {
   const [theme, setTheme] = useState<Theme>(() => (stored() === "dark" ? "dark" : "light"));
 
-  // Before paint, so a stored dark choice never flashes light first.
+  // index.html applies a stored dark choice before the first paint; this
+  // keeps <html data-theme> in step with the toggle from then on.
   useLayoutEffect(() => {
     document.documentElement.setAttribute("data-theme", theme);
   }, [theme]);

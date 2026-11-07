@@ -18,8 +18,9 @@ function stored(): Theme {
  * The viewer's theme: light unless they chose dark with the toggle, which
  * is remembered in this browser. The system's dark-mode setting is never
  * read: light is the default whatever it says (owner decision, P2c-R10).
- * The choice is applied to `<html data-theme>` before the first paint, so a
- * reload in dark never flashes light.
+ * index.html applies a stored dark choice to `<html data-theme>` before the
+ * first paint, so a reload in dark never flashes light; this hook keeps the
+ * attribute in step with the toggle from then on.
  */
 export function useTheme(): [Theme, () => void] {
   const [theme, setTheme] = useState<Theme>(stored);

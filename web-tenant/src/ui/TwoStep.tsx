@@ -91,22 +91,22 @@ export function TwoStep({
         </Button>
       ) : (
         <>
-          <Button
-            key="confirm"
-            kind="danger"
-            size={size}
-            disabled={disabled}
-            className="is-in"
-            onClick={() => {
-              swap(false);
-              onConfirm();
-            }}
-          >
-            确认{label}
-          </Button>
-          <Button key="cancel" ref={cancel} size={size} className="is-in" onClick={() => swap(false)}>
-            取消
-          </Button>
+          <span className="two-step-confirm is-in">
+            <Button
+              kind="danger"
+              size={size}
+              disabled={disabled}
+              onClick={() => {
+                swap(false);
+                onConfirm();
+              }}
+            >
+              确认{label}
+            </Button>
+            <Button ref={cancel} size={size} onClick={() => swap(false)}>
+              取消
+            </Button>
+          </span>
           {warning && (
             <span className="two-step-warn is-in" role="alert">
               {warning}

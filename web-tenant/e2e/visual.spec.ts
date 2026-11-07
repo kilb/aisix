@@ -255,6 +255,8 @@ test("分区导航只用键盘也能走遍：方向键、Home、End 移动，回
   await page.keyboard.press("Enter");
   await expect(tab("密钥")).toHaveAttribute("aria-selected", "true");
   await expect(page.getByRole("main").getByText("legacy-import", { exact: true })).toBeVisible();
+  // The open section is the tab's panel, named by it.
+  await expect(page.getByRole("tabpanel", { name: "密钥" })).toContainText("legacy-import");
   expect(await focused()).toBe("密钥");
   await page.context().close();
 });
