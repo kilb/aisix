@@ -493,15 +493,24 @@ fn item_field_kind(field: &str) -> Option<IdKind> {
 }
 
 /// Run `visit` over every id field of one item, with the kind it holds. A
-/// `caller` object's `caller_id` names a call.
+/// `caller` object's `caller_id` names a call, and so does the `id` of a
+/// `local_shell_call_output`: that item has no `call_id`, and its `id` is the
+/// call id of the `local_shell_call` it answers (openai-python 3.41.0
+/// `types/responses/response_input_item_param.py`, `LocalShellCallOutput`).
 fn for_each_item_id(item: &mut Value, mut visit: impl FnMut(IdKind, &mut String)) {
+    let names_call_by_id =
+        item.get("type").and_then(Value::as_str) == Some("local_shell_call_output");
     let Value::Object(map) = item else {
         return;
     };
     for (field, value) in map.iter_mut() {
         match value {
             Value::String(s) => {
-                if let Some(kind) = item_field_kind(field) {
+                let kind = match field.as_str() {
+                    "id" if names_call_by_id => Some(IdKind::Call),
+                    field => item_field_kind(field),
+                };
+                if let Some(kind) = kind {
                     visit(kind, s);
                 }
             }
@@ -1703,6 +1712,33 @@ pub(crate) mod tests {
         let mut plain = json!({"model": "m", "input": "hi"});
         unseal_responses_input(&platform, T, &mut plain);
         assert_eq!(plain, json!({"model": "m", "input": "hi"}));
+    }
+
+    /// A `local_shell_call_output` names the call it answers by `id`: the
+    /// call id the answer's `local_shell_call` carried as `call_id`
+    /// (openai-python 3.41.0 `types/responses/response_input_item_param.py`,
+    /// `LocalShellCallOutput`, which has no `call_id`). It is a call seal,
+    /// and opens as one; every other item's `id` is an item seal.
+    #[test]
+    fn a_local_shell_call_output_id_opens_as_the_call_it_answers() {
+        let platform = crate::platform::PlatformSettings::from_secret("s");
+        let k = seal_key(&platform.id_key);
+        let call = seal_call(&k, T, "call_up_1");
+        let mut body = json!({"input": [
+            {"type": "local_shell_call", "id": seal_id(&k, T, "lsh_up_1"), "call_id": call,
+             "action": {"type": "exec", "command": ["ls"], "env": {}}, "status": "completed"},
+            {"type": "local_shell_call_output", "id": call, "output": "a.txt"},
+        ]});
+        unseal_responses_input(&platform, T, &mut body);
+        assert_eq!(body["input"][0]["id"], "lsh_up_1");
+        assert_eq!(body["input"][0]["call_id"], "call_up_1");
+        assert_eq!(body["input"][1]["id"], "call_up_1");
+        // An item seal in that slot is not the call's, and stays as sent.
+        let item = seal_id(&k, T, "call_up_1");
+        let mut body = json!({"input": [
+            {"type": "local_shell_call_output", "id": item.clone(), "output": "a.txt"}]});
+        unseal_responses_input(&platform, T, &mut body);
+        assert_eq!(body["input"][0]["id"], item);
     }
 
     /// A stream names one item on every delta: the sealer seals it once and
