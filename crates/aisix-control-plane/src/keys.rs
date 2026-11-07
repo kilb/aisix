@@ -1512,7 +1512,9 @@ pub async fn admin_list(
 
 /// `POST /admin/tenants/{id}/keys` with `{label, member_id?, model_ids?,
 /// allowed_models?, allowed_provider_groups?, rate_limit?, expires_at?}` →
-/// `201 {key: AdminKey, plaintext}`, in a tenant of any status.
+/// `201 {key: AdminKey, plaintext}`, in an active or a suspended tenant. A
+/// pending tenant is `409 tenant_state`: it gives the gateways nothing until
+/// it is approved, and a key would need its team and its member's user.
 pub async fn admin_create(
     auth: OperatorAuth,
     State(state): State<AppState>,
@@ -1527,6 +1529,12 @@ pub async fn admin_create(
         .tx(move |conn| {
             async move {
                 let tenant = tenants::lock(&mut *conn, tenant_id).await?;
+                if tenant.status == TenantStatus::Pending {
+                    return Err(ApiError::conflict(
+                        "tenant_state",
+                        "租户尚未通过审核，审核通过后才能创建密钥",
+                    ));
+                }
                 let member_id = match req.member_id.as_deref() {
                     None => None,
                     Some(raw) => Some(bound_member(&mut *conn, tenant.id, raw).await?),

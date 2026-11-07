@@ -12,8 +12,10 @@
 //!   decides on, the caller included ([`MemberAuth::fetch`]): a caller
 //!   demoted or removed meanwhile is refused, and two changes cannot each
 //!   count the other's target as the owner who remains.
-//! - Each member has a `users` document, `users/<member id>`, named after
-//!   the display name and never the email, and owned by `member:<id>`.
+//! - Each member of an approved tenant has a `users` document,
+//!   `users/<member id>`, named after the display name and never the email,
+//!   and owned by `member:<id>`. A pending tenant's members have none until
+//!   the approval writes them.
 //! - Login, signup and invitation acceptance end the session the request
 //!   carried and start a new one.
 
@@ -54,8 +56,8 @@ use crate::AppState;
 pub const INVITE_TTL: Duration = Duration::from_secs(7 * 86_400);
 
 /// Signups accepted per minute across the site. Signup is unauthenticated
-/// and verifies no email, and each one creates a tenant, a member and
-/// gateway documents, so it is bounded as a whole: counted in the database
+/// and verifies no email, and each one creates a tenant and a member, so it
+/// is bounded as a whole: counted in the database
 /// (the `tenant.signup` audit rows of the last minute), whichever instance
 /// took them, and first in this process, which turns a flood away before
 /// any argon2 work.
@@ -68,6 +70,13 @@ pub const SIGNUPS_PER_MINUTE: usize = 60;
 pub const SIGNUP_LOCK_KEY: i64 = 0x6169_7369_7863_7073;
 
 const SIGNUP_WINDOW: Duration = Duration::from_secs(60);
+
+/// Tenants waiting for approval, at most. Signup is anonymous and nothing
+/// removes a tenant, so without a cap anyone could grow the tenants table
+/// and the operators' tenant list without bound. Past the cap a signup is
+/// refused as a full signup window refuses it, which tells the caller
+/// nothing new. Counted under [`SIGNUP_LOCK_KEY`].
+pub const MAX_PENDING_TENANTS: i64 = 1_000;
 
 /// The longest display name accepted.
 const MAX_DISPLAY_NAME_CHARS: usize = 128;
@@ -222,20 +231,22 @@ fn email_taken() -> ApiError {
 }
 
 /// Adds a member to `tenant_id` with an `email` already normalised and a
-/// `password_hash`, and writes their `users` document. A live member with
-/// the same email, in any tenant, is `409 email_taken`.
+/// `password_hash`, and writes their `users` document unless the tenant is
+/// pending, whose approval writes it ([`put_missing_users`]). A live member
+/// with the same email, in any tenant, is `409 email_taken`.
 ///
-/// A caller adding to an existing tenant holds that tenant's lock
-/// ([`tenants::lock`]) first: the member row takes a key-share lock on the
-/// tenant row, and taken after the resources lock below, a change holding
-/// the tenant while it waits for the resources lock would deadlock with
-/// this. A signup adds to the tenant it has just created, which it holds.
+/// The tenant's lock ([`tenants::lock`]) comes first, as the lock order
+/// asks: the member row takes a key-share lock on the tenant row, and taken
+/// after the resources lock below, a change holding the tenant while it
+/// waits for the resources lock would deadlock with this. Every caller
+/// holds it already (a signup adds to the tenant it has just created), so
+/// here it is a no-op that reads the tenant's status.
 ///
 /// The resources lock is taken before the member row, not only by the
-/// document write after it. A transaction already holding that lock (a
-/// signup, which wrote its new tenant's team) may be adding a member with
-/// the same email, and it waits for any row this one inserted first: taken
-/// after the insert, the lock would close a deadlock.
+/// document write after it. A transaction already holding that lock
+/// (another member being added, which takes it here first) may be adding a
+/// member with the same email, and it waits for any row this one inserted
+/// first: taken after the insert, the lock would close a deadlock.
 pub async fn create(
     conn: &mut PgConnection,
     ctx: &WriteCtx,
@@ -245,6 +256,7 @@ pub async fn create(
     display_name: Option<&str>,
     role: MemberRole,
 ) -> Result<MemberRow, ApiError> {
+    let tenant = tenants::lock(&mut *conn, tenant_id).await?;
     sqlx::query("SELECT pg_advisory_xact_lock($1)")
         .bind(RESOURCES_LOCK_KEY)
         .execute(&mut *conn)
@@ -269,19 +281,49 @@ pub async fn create(
         }
         e => e.into(),
     })?;
-    write_resource(
-        conn,
-        ctx,
-        ResourceWrite {
-            kind: Kind::Users,
-            id,
-            op: WriteOp::Create(&user_doc(id, display_name)),
-            expected_version: None,
-            managed_by: Some(&owner(id)),
-        },
-    )
-    .await?;
+    if tenant.status != TenantStatus::Pending {
+        write_resource(
+            conn,
+            ctx,
+            ResourceWrite {
+                kind: Kind::Users,
+                id,
+                op: WriteOp::Create(&user_doc(id, display_name)),
+                expected_version: None,
+                managed_by: Some(&owner(id)),
+            },
+        )
+        .await?;
+    }
     MemberRow::from_raw(raw)
+}
+
+/// Writes the `users` document of every live member of `tenant_id` that has
+/// none live, oldest member first: all of them when the tenant is approved,
+/// since a pending tenant's members have none. Run by `tenants::project`,
+/// at its users step, which holds the tenant's lock; one query when nothing
+/// is missing.
+pub(crate) async fn put_missing_users(
+    conn: &mut PgConnection,
+    ctx: &WriteCtx,
+    tenant_id: Uuid,
+) -> Result<(), ApiError> {
+    let missing: Vec<(Uuid, Option<String>)> = sqlx::query_as(
+        "SELECT m.id, m.display_name FROM members m \
+         WHERE m.tenant_id = $1 AND m.removed_at IS NULL AND NOT EXISTS ( \
+           SELECT 1 FROM gw_resources r WHERE r.kind = $2 AND r.id = m.id AND NOT r.deleted) \
+         ORDER BY m.created_at, m.id",
+    )
+    .bind(tenant_id)
+    .bind(Kind::Users.segment())
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(DbError::from)?;
+    for (id, display_name) in missing {
+        let doc = user_doc(id, display_name.as_deref());
+        tenants::put(&mut *conn, ctx, Kind::Users, id, &doc, &owner(id)).await?;
+    }
+    Ok(())
 }
 
 /// The live member `id` of `tenant_id`, or `404 not_found`: a member of
@@ -506,8 +548,9 @@ pub struct SignupRequest {
 /// `POST /api/signup` → `201 Session` and the session cookie: a pending
 /// tenant named `org_name`, with the caller as its owner, logged in. `409
 /// email_taken` when a live member has the email; at most
-/// [`SIGNUPS_PER_MINUTE`] a minute across the site (`429 busy`), a refused
-/// signup handing its slot back.
+/// [`SIGNUPS_PER_MINUTE`] a minute across the site, and at most
+/// [`MAX_PENDING_TENANTS`] tenants waiting for approval (`429 busy` alike),
+/// a refused signup handing its slot back.
 pub async fn signup(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -581,6 +624,19 @@ async fn sign_up(
                 .await
                 .map_err(DbError::from)?;
                 if recent >= SIGNUPS_PER_MINUTE as i64 {
+                    return Err(signups_busy());
+                }
+                // Served by the partial index `tenants_pending`.
+                let pending: i64 =
+                    sqlx::query_scalar("SELECT count(*) FROM tenants WHERE status = 'pending'")
+                        .fetch_one(&mut *conn)
+                        .await
+                        .map_err(DbError::from)?;
+                if pending >= MAX_PENDING_TENANTS {
+                    tracing::warn!(
+                        pending,
+                        "refused a signup: the tenants waiting for approval are at their cap"
+                    );
                     return Err(signups_busy());
                 }
                 let tenant = tenants::create(

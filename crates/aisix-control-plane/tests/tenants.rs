@@ -537,10 +537,9 @@ async fn approving_a_pending_tenant_writes_its_default_limits_policy() {
     };
     let admin = Admin::as_role(&cp, OperatorRole::Operator).await;
     let id = pending_tenant(&cp, "signup-7c1").await;
-    let team = row(&cp, "teams", &id).await.expect("a team document");
-    assert_eq!(team.doc, json!({"name": "signup-7c1"}));
-    assert_eq!(team.managed_by, Some(format!("tenant:{id}")));
-    // A pending tenant is not served, so it is not limited either.
+    // A pending tenant is not served, so the gateways are given nothing of
+    // it: no team, and no limit either.
+    assert!(row(&cp, "teams", &id).await.is_none());
     assert_eq!(owned_policies(&cp, &id).await, 0);
     let t = admin.tenant(&id).await;
     assert_eq!(t["status"], "pending");
@@ -558,6 +557,9 @@ async fn approving_a_pending_tenant_writes_its_default_limits_policy() {
             .await
             .expect("read the tenant");
     assert_eq!(approved_by, Some(admin.id));
+    let team = row(&cp, "teams", &id).await.expect("a team document");
+    assert_eq!(team.doc, json!({"name": "signup-7c1"}));
+    assert_eq!(team.managed_by, Some(format!("tenant:{id}")));
     let pid = limits_policy_id(&cp, &id)
         .await
         .expect("a limits policy id");
