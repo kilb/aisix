@@ -1444,7 +1444,11 @@ pub(crate) fn bound_outside_text(event: &mut UsageEvent) {
         &mut event.a2a_context_id,
         &mut event.provider_model_version,
         &mut event.finish_reason,
-    ] {
+    ]
+    .into_iter()
+    // A wildcard row's upstream model is filled in from the caller's name.
+    .chain(event.upstream_model.as_mut())
+    {
         if text.len() > MAX_OUTSIDE_TEXT_CHARS || text.chars().any(char::is_control) {
             *text = text
                 .chars()
@@ -2283,6 +2287,41 @@ mod tests {
         assert_eq!(row.provider_key_id.as_deref(), Some(PK_ID));
         assert_eq!(row.upstream_provider.as_deref(), Some("openai"));
         assert_eq!(row.upstream_model.as_deref(), Some("gpt-4o-2024-08-06"));
+    }
+
+    /// A wildcard row fills `upstream_model` in from the name the caller
+    /// sent, so it is the caller's text as much as `requested_model` is and
+    /// gets the same bound. Unbounded, a megabyte-long name served by a
+    /// wildcard model would make its row too large to travel, and the
+    /// tokens it bought would never reach the control plane.
+    #[tokio::test]
+    #[allow(clippy::field_reassign_with_default)] // A literal here would read as an emitter to the scans below.
+    async fn a_wildcard_rows_upstream_model_is_bounded_like_the_name_it_came_from() {
+        let snap = snap_with_pk("pk-1", "");
+        let wildcard: aisix_core::Model = serde_json::from_value(serde_json::json!({
+            "display_name": "openai/*",
+            "provider": "openai",
+            "model_name": "*",
+            "provider_key_id": PK_ID,
+        }))
+        .unwrap();
+        snap.models
+            .insert(ResourceEntry::new("m-star", wildcard, 1));
+        let (state, mut rx) = state_reading_rows(snap);
+        let mut event = UsageEvent::default();
+        event.model_id = "m-star".to_string();
+        event.requested_model = format!("openai/\u{0}{}", "x".repeat(1 << 20));
+        let row = emitted_row(&state, &mut rx, event, PK_ID);
+        let upstream = row
+            .upstream_model
+            .expect("a wildcard row names its upstream model");
+        assert!(
+            upstream.chars().count() <= 512 && !upstream.chars().any(char::is_control),
+            "{} chars",
+            upstream.chars().count()
+        );
+        assert!(upstream.starts_with("xxx"), "{:?}", &upstream[..8]);
+        assert!(serde_json::to_vec(&row.requested_model).unwrap().len() < 1024);
     }
 
     /// A row that reached no ProviderKey, or names an entry that is not an

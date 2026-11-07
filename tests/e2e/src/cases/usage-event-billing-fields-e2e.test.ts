@@ -100,6 +100,7 @@ interface Row {
   upstream_model?: string;
   requested_service_tier?: string;
   is_batch?: boolean;
+  prompt_tokens?: number;
 }
 
 describe("usage rows carry the fields billing needs", () => {
@@ -178,6 +179,13 @@ describe("usage rows carry the fields billing needs", () => {
       routing: { strategy: "failover", targets: [{ model: "billing-streamed" }], retries: 0 },
     });
     groupId = group.id;
+    // A wildcard model serves whatever name follows its prefix.
+    await seed.createModel({
+      display_name: "billing-wild/*",
+      provider: "openai",
+      model_name: "*",
+      provider_key_id: bufferedKey.id,
+    });
     await seed.createApiKey({ key_hash: CALLER_KEY_HASH, allowed_models: ["*"] });
 
     await waitConfigPropagation(async () => {
@@ -401,5 +409,22 @@ describe("usage rows carry the fields billing needs", () => {
     for (const body of cp.telemetryBodies.filter((b) => ids.some((id) => b.includes(`"${id}"`)))) {
       expect(body.length).toBeLessThan(1 << 20);
     }
+  }, 90_000);
+
+  test("a megabyte-long name a wildcard model serves is answered and billed on a bounded row", async (ctx) => {
+    if (!etcdReachable || !app || !cp) return ctx.skip();
+    const requestId = "billing-huge-wildcard";
+    const res = await send("/v1/chat/completions", requestId, {
+      model: `billing-wild/${"x".repeat(1 << 20)}`,
+      messages: [{ role: "user", content: "hello" }],
+    });
+    expect(res.status, res.text.slice(0, 200)).toBe(200);
+    await waitConfigPropagation(async () => rowsFor([requestId]).length >= 1, 30_000);
+    const [row] = rowsFor([requestId]);
+    expect(row!.prompt_tokens, "the tokens the call bought are on the row").toBe(7);
+    expect(row!.upstream_model?.length ?? 0).toBeGreaterThan(0);
+    expect(row!.upstream_model!.length).toBeLessThanOrEqual(512);
+    expect(row!.upstream_model!.startsWith("xxx")).toBe(true);
+    expect(JSON.stringify(row).length).toBeLessThan(16 * 1024);
   }, 90_000);
 });
