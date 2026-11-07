@@ -879,7 +879,7 @@ async fn a_suspended_tenants_owner_lists_its_keys_and_members_and_revokes_from_t
     assert_eq!(theirs.status, 200, "{theirs:?}");
     assert_eq!(
         ids(theirs.body["items"].as_array().expect("items")),
-        [members_key.clone()]
+        std::slice::from_ref(&members_key)
     );
     for (cookie, path) in [
         (&member_cookie, "/api/members"),
@@ -909,7 +909,7 @@ async fn a_suspended_tenants_owner_lists_its_keys_and_members_and_revokes_from_t
     let keys = cp.get_with_cookie("/api/keys", owner.cookie()).await;
     assert_eq!(
         ids(keys.body["items"].as_array().expect("items")),
-        [owners_key.clone()]
+        std::slice::from_ref(&owners_key)
     );
 
     // Nothing else opens: a single key, a mint, an invitation.
@@ -972,7 +972,7 @@ async fn a_tenant_that_is_not_active_can_still_revoke_its_keys_and_remove_a_memb
     assert_eq!(status, 204);
     let r = remove_member(&cp, &owner, &leaver).await;
     assert_eq!(r.status, 204, "{r:?}");
-    assert_eq!(member_row(&cp, &leaver).await.2, true, "not removed");
+    assert!(member_row(&cp, &leaver).await.2, "not removed");
     for (kind, id) in [
         ("api_keys", &leaked),
         ("api_keys", &leavers),

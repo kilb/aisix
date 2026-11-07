@@ -1493,6 +1493,9 @@ async fn fire(
         .as_u16()
 }
 
+/// A request in flight, as [`fire`] sends it: its status.
+type Request = std::pin::Pin<Box<dyn std::future::Future<Output = u16> + Send>>;
+
 /// Runs `request` while another transaction holds tenant `tenant`'s row,
 /// and requires that, while it waits for the tenant, it holds no
 /// resources lock: the lock order is the tenant first. Then lets it finish;
@@ -1569,11 +1572,7 @@ async fn every_tenant_write_takes_the_tenant_before_the_resources_lock() {
         .expect("a token")
         .to_string();
 
-    let cases: Vec<(
-        &str,
-        std::pin::Pin<Box<dyn std::future::Future<Output = u16> + Send>>,
-        u16,
-    )> = vec![
+    let cases: Vec<(&str, Request, u16)> = vec![
         (
             "PATCH /admin/tenants/{id}",
             Box::pin(fire(
