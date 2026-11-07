@@ -106,10 +106,17 @@ const keyRow = (page: Page, label: string) => keyTable(page).getByRole("row").fi
 test("新建内部密钥：明文只显示一次，用它能调网关", async ({ page }) => {
   const logged: string[] = [];
   page.on("console", (m) => logged.push(m.text()));
+  // A customer whose name sorts before the platform's own tenant, so that
+  // "first" says something about the order.
+  const internal = ((await stack.admin.get("/admin/tenants")).items as Json[]).find((t) => t.is_internal);
+  const early = "0 T6 Early Co 2b7";
+  expect(early.localeCompare(internal.name)).toBeLessThan(0);
+  await signUpActive(early, "owner@early-t6.test");
 
   await openKeys(page);
   // The platform's own tenant comes first and is the one shown.
   const picker = page.getByLabel("租户");
+  await expect(picker.locator("option")).not.toHaveCount(1);
   await expect(picker.locator("option").first()).toContainText("平台内部");
   expect(await picker.inputValue()).toBe(await picker.locator("option").first().getAttribute("value"));
 
@@ -159,8 +166,10 @@ test("停用后网关返回 401，启用后恢复", async ({ page }) => {
   await expect(row).toContainText("正常");
   await row.getByRole("button", { name: "停用" }).click();
   // Nothing is switched off until it is confirmed.
+  const confirm = row.getByRole("button", { name: "确认停用" });
+  await expect(confirm).toBeVisible();
   expect((await stack.admin.get(`/admin/keys/${key.id}`)).disabled).toBe(false);
-  await row.getByRole("button", { name: "确认停用" }).click();
+  await confirm.click();
   await expect(row).toContainText("已停用");
   await expect.poll(() => chatStatus(plaintext), { timeout: ROLLOUT_BOUND_MS }).toBe(401);
 
@@ -190,8 +199,11 @@ test("吊销后它从列表消失，网关返回 401", async ({ page }) => {
   await openKeys(page, t.org);
   const row = keyRow(page, "revoke-key-t6");
   await row.getByRole("button", { name: "吊销" }).click();
+  // Nothing is revoked until it is confirmed.
+  const confirm = row.getByRole("button", { name: "确认吊销" });
+  await expect(confirm).toBeVisible();
   expect((await stack.admin.request("GET", `/admin/keys/${key.id}`)).status).toBe(200);
-  await row.getByRole("button", { name: "确认吊销" }).click();
+  await confirm.click();
 
   await expect(row).toHaveCount(0);
   await expect(keyRow(page, "keep-key-t6")).toHaveCount(1);
