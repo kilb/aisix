@@ -297,8 +297,10 @@ fn find_under(value: &Value, path: &mut String, check: &dyn Fn(&Value) -> Visit)
     let len = path.len();
     let found = match value {
         Value::Array(items) => items.iter().enumerate().find_map(|(i, item)| {
+            use std::fmt::Write as _;
             path.truncate(len);
-            path.push_str(&format!("[{i}]"));
+            // Into the one buffer the walk carries: no allocation per node.
+            let _ = write!(path, "[{i}]");
             find_under(item, path, check)
         }),
         Value::Object(map) => map
