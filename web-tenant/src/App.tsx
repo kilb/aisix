@@ -1,8 +1,19 @@
 import { useCallback, useEffect, useState } from "react";
-import { ApiError, logout, session, type Session, type SessionMember, type SessionTenant } from "./lib/api";
+import {
+  ApiError,
+  logout,
+  onSessionEnded,
+  session,
+  type Session,
+  type SessionMember,
+  type SessionTenant,
+  type TenantStatus,
+} from "./lib/api";
 import { EXPECTED_API_CONTRACT } from "./lib/contract";
 import { messageFor } from "./lib/errors";
 import { Gate } from "./Gate";
+import { Keys } from "./Keys";
+import { Members } from "./Members";
 import { Org, ROLE_LABEL } from "./Org";
 
 const TABS = [
@@ -14,11 +25,18 @@ const TABS = [
 export type TabId = (typeof TABS)[number]["id"];
 
 /**
- * Whether `member` sees tab `id` of an active organisation. A billing member
- * holds no keys and only owners and admins manage members; a role a newer
- * control plane adds sees the organisation only, until this build knows it.
+ * Whether `member` sees tab `id` of an organisation in state `status`. A
+ * billing member holds no keys and only owners and admins manage members;
+ * a role a newer control plane adds sees the organisation only, until this
+ * build knows it.
+ *
+ * An active organisation has every page. A suspended one keeps its keys and
+ * members pages, which then only close things (revoke a key, remove a
+ * member): a key that leaked must not wait for the reactivation. A pending
+ * one has neither, since nothing can exist there before the approval.
  */
-function canSee(id: TabId, member: SessionMember): boolean {
+function canSee(id: TabId, member: SessionMember, status: TenantStatus): boolean {
+  if (status !== "active" && status !== "suspended") return false;
   switch (id) {
     case "org":
       return true;
@@ -27,16 +45,6 @@ function canSee(id: TabId, member: SessionMember): boolean {
     case "members":
       return member.role === "owner" || member.role === "admin";
   }
-}
-
-/** A tab whose page is not built yet. */
-function NotBuilt({ label }: { label: string }) {
-  return (
-    <div className="panel">
-      <h2>{label}</h2>
-      <p className="hint">此页尚未开放。</p>
-    </div>
-  );
 }
 
 interface SignedIn {
@@ -56,7 +64,19 @@ export function App({ inviteToken }: { inviteToken: string | null }) {
   const [invite, setInvite] = useState(inviteToken);
   const [bootError, setBootError] = useState<string | null>(null);
   const [signOutError, setSignOutError] = useState<string | null>(null);
+  const [expired, setExpired] = useState(false);
   const [tab, setTab] = useState<TabId>("org");
+
+  // Any page's request that finds the session gone drops back to the gate:
+  // what was on screen is no longer the member's to see or act on. (The
+  // gate's own requests never answer `unauthenticated`.)
+  useEffect(() => {
+    onSessionEnded(() => {
+      setMe(null);
+      setExpired(true);
+    });
+    return () => onSessionEnded(null);
+  }, []);
 
   const boot = useCallback(async () => {
     setBootError(null);
@@ -77,6 +97,7 @@ export function App({ inviteToken }: { inviteToken: string | null }) {
     setMe(signedIn(s));
     setInvite(null);
     setSignOutError(null);
+    setExpired(false);
     setTab("org");
   }, []);
 
@@ -129,13 +150,19 @@ export function App({ inviteToken }: { inviteToken: string | null }) {
   // An invitation link opens the acceptance form even over a live session:
   // accepting signs in as the invited member in its place.
   if (!me || invite !== null) {
-    return <Gate invite={invite} signedIn={me !== null} onIn={signIn} onLeaveInvite={() => setInvite(null)} />;
+    return (
+      <Gate
+        invite={invite}
+        signedIn={me !== null}
+        notice={expired ? "登录已过期，请重新登录" : null}
+        onIn={signIn}
+        onLeaveInvite={() => setInvite(null)}
+      />
+    );
   }
 
   const { member, tenant } = me;
-  // Only an active organisation has pages beyond its own: the control plane
-  // refuses a pending or suspended one's members everything else.
-  const visible = tenant.status === "active" ? TABS.filter((t) => canSee(t.id, member)) : [];
+  const visible = TABS.filter((t) => canSee(t.id, member, tenant.status));
   const current: TabId = visible.some((t) => t.id === tab) ? tab : "org";
 
   return (
@@ -176,10 +203,12 @@ export function App({ inviteToken }: { inviteToken: string | null }) {
       )}
 
       <main>
-        {current === "org" ? (
-          <Org member={member} status={tenant.status} />
+        {current === "keys" ? (
+          <Keys member={member} status={tenant.status} />
+        ) : current === "members" ? (
+          <Members member={member} status={tenant.status} onSelfChanged={() => void boot()} />
         ) : (
-          <NotBuilt label={TABS.find((t) => t.id === current)?.label ?? current} />
+          <Org member={member} status={tenant.status} />
         )}
       </main>
     </div>

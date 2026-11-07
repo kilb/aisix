@@ -23,6 +23,7 @@ function longEnough(password: string): boolean {
 export function Gate({
   invite,
   signedIn,
+  notice,
   onIn,
   onLeaveInvite,
 }: {
@@ -30,6 +31,8 @@ export function Gate({
   invite: string | null;
   /** Whether a session is live behind an invitation form opened over it. */
   signedIn: boolean;
+  /** Why the member is here again, such as a session that ended. */
+  notice: string | null;
   onIn: (session: Session) => void;
   onLeaveInvite: () => void;
 }) {
@@ -143,6 +146,12 @@ export function Gate({
         <h1>AISIX 组织门户</h1>
         <span className="sub">组织、成员与 API 密钥</span>
       </header>
+
+      {notice && (
+        <div className="note warn" role="status">
+          {notice}
+        </div>
+      )}
 
       {invite !== null ? (
         <div className="panel">

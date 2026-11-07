@@ -255,7 +255,7 @@ test("已登录时打开邀请链接，可以取消并回到原来的组织", as
   await expect(page.getByRole("button", { name: "接受邀请" })).toHaveCount(0);
 });
 
-test("停用的组织登录后只看到停用说明", async ({ page }) => {
+test("停用的组织登录后看到停用说明，仍有密钥与成员入口", async ({ page }) => {
   await stack.tenant().post("/api/signup", {
     org_name: "Suspend Org 6c4",
     email: "owner@suspend-6c4.test",
@@ -267,8 +267,9 @@ test("停用的组织登录后只看到停用说明", async ({ page }) => {
 
   await login(page, "owner@suspend-6c4.test", "suspend-pass-6c4x");
   await expect(page.getByText("组织已被停用，请联系平台")).toBeVisible();
-  await expect(page.getByRole("tab", { name: "密钥" })).toHaveCount(0);
-  await expect(page.getByRole("tab", { name: "成员" })).toHaveCount(0);
+  // Kept so that a leaked key can be revoked and a member removed meanwhile
+  // (ruling P1b-R4); what those pages offer is pinned in portal-keys.spec.ts.
+  await expect(page.getByRole("tab")).toHaveText(["组织", "密钥", "成员"]);
 });
 
 test("等待审核时也能修改口令，之后旧口令被拒、新口令可登录", async ({ page }) => {

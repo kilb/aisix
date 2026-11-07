@@ -59,6 +59,18 @@ interface Envelope {
   current_version?: number;
 }
 
+let sessionEnded: (() => void) | null = null;
+
+/**
+ * Registers what to do when the control plane answers `401
+ * unauthenticated`: the session ended (it expired, or a password change or
+ * a removal elsewhere ended it), so the page it was behind must go. One
+ * listener, the app's; `null` clears it.
+ */
+export function onSessionEnded(listener: (() => void) | null): void {
+  sessionEnded = listener;
+}
+
 /** The version in an `ETag` (`"12"`, `12` or `W/"12"`), or null. */
 function etagVersion(etag: string | null): number | null {
   if (!etag) return null;
@@ -103,13 +115,15 @@ export async function call<T>(
   }
   if (!r.ok) {
     const e = (parsed ?? {}) as Envelope;
-    throw new ApiError(
+    const err = new ApiError(
       e.error ?? `HTTP ${r.status}`,
       r.status,
       e.code ?? "bad_response",
       e.details ?? [],
       e.current_version ?? null,
     );
+    if (err.code === "unauthenticated") sessionEnded?.();
+    throw err;
   }
   return { data: parsed as T, version: etagVersion(r.headers.get("etag")) };
 }
@@ -206,3 +220,125 @@ export async function org(): Promise<Org> {
 export async function changePassword(current: string, next: string): Promise<void> {
   await call<null>("POST", "/password", { current_password: current, new_password: next });
 }
+
+// ── models, keys and members ────────────────────────────────────────────────
+
+/** A model the organisation is granted, by its platform name only. */
+export interface PortalModel {
+  id: string;
+  name: string;
+}
+
+/** A key's own limits; one left unset follows the organisation's per-key cap. */
+export interface KeyLimits {
+  concurrency?: number;
+  rpm?: number;
+}
+
+/** `TenantKey`: a key as its organisation sees it. It never holds the plaintext. */
+export interface TenantKey {
+  id: string;
+  label: string;
+  prefix: string;
+  /** The member the key belongs to; null for a key of the organisation as a whole. */
+  owner: { id: string; display_name: string | null } | null;
+  /** The models selected from the grants; null follows every grant. */
+  model_ids: string[] | null;
+  rate_limit: KeyLimits;
+  /** The organisation's own switch. */
+  disabled: boolean;
+  /** The platform's switch, which only the platform turns off again. */
+  disabled_by_platform: boolean;
+  expires_at: string | null;
+  created_at: string;
+  version: number;
+}
+
+/** `POST /api/keys`. `member_id` left out binds the key to the caller. */
+export interface NewKey {
+  label: string;
+  member_id?: string;
+  model_ids?: string[];
+  rate_limit?: KeyLimits;
+  expires_at?: string;
+}
+
+/** `Member`. */
+export interface Member {
+  id: string;
+  email: string;
+  display_name: string | null;
+  role: MemberRole;
+  disabled: boolean;
+  created_at: string;
+}
+
+/** An invitation still open. `invited_by` is null for one the platform issued. */
+export interface Invite {
+  id: string;
+  email: string;
+  role: MemberRole;
+  expires_at: string;
+  created_at: string;
+  invited_by: { id: string; display_name: string | null } | null;
+}
+
+/** A new invitation: the token, given this once, and the link when the platform builds one. */
+export interface IssuedInvite {
+  id: string;
+  invite_token: string;
+  invite_url?: string;
+  expires_at: string;
+}
+
+const at = (id: string) => encodeURIComponent(id);
+
+export const models = {
+  async list(): Promise<PortalModel[]> {
+    return (await call<{ items: PortalModel[] }>("GET", "/models")).data.items;
+  },
+};
+
+export const keys = {
+  /** Every key of the organisation for an owner or an admin; a member's own for a member. */
+  async list(): Promise<TenantKey[]> {
+    return (await call<{ items: TenantKey[] }>("GET", "/keys")).data.items;
+  },
+  /** The new key, and its plaintext, which no later answer carries. */
+  async create(body: NewKey): Promise<{ key: TenantKey; plaintext: string }> {
+    return (await call<{ key: TenantKey; plaintext: string }>("POST", "/keys", body)).data;
+  },
+  /**
+   * The organisation's own switch, at `version`. The body names this one
+   * field: an edit that both narrows and widens a key is refused whole while
+   * an older gateway is registered, so no request here mixes the two.
+   */
+  async setDisabled(id: string, disabled: boolean, version: number): Promise<TenantKey> {
+    return (await call<TenantKey>("PATCH", `/keys/${at(id)}`, { disabled }, version)).data;
+  },
+  async revoke(id: string, version: number): Promise<void> {
+    await call<null>("DELETE", `/keys/${at(id)}`, undefined, version);
+  },
+};
+
+export const members = {
+  async list(): Promise<Member[]> {
+    return (await call<{ items: Member[] }>("GET", "/members")).data.items;
+  },
+  async setRole(id: string, role: MemberRole): Promise<Member> {
+    return (await call<Member>("PATCH", `/members/${at(id)}`, { role })).data;
+  },
+  /** Removes the member and revokes every key of theirs. */
+  async remove(id: string): Promise<void> {
+    await call<null>("DELETE", `/members/${at(id)}`);
+  },
+  async invites(): Promise<Invite[]> {
+    return (await call<{ items: Invite[] }>("GET", "/members/invites")).data.items;
+  },
+  async invite(email: string, role: MemberRole): Promise<IssuedInvite> {
+    return (await call<IssuedInvite>("POST", "/members/invites", { email, role })).data;
+  },
+  async revokeInvite(id: string): Promise<void> {
+    await call<null>("DELETE", `/members/invites/${at(id)}`);
+  },
+};
