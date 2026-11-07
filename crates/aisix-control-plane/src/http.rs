@@ -803,7 +803,7 @@ mod tests {
     #[test]
     fn ui_contracts_match() {
         // The app directories that mirror the contract.
-        const APPS: &[&str] = &["web-cp"];
+        const APPS: &[&str] = &["web-cp", "web-tenant"];
         let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         for app in APPS {
             let path = repo.join(app).join("src/lib/contract.ts");
