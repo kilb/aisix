@@ -84,19 +84,56 @@ pub(crate) fn seal_response_id(
     target_id: &str,
     upstream_id: &str,
 ) -> String {
-    seal_response_id_with(&cipher(key), owner, target_id, upstream_id)
+    let nonces = Nonces::new().expect("the system random source is readable");
+    seal_response_id_with(&cipher(key), nonces.next(), owner, target_id, upstream_id)
 }
 
 fn seal_response_id_with(
     cipher: &aead::LessSafeKey,
+    nonce: [u8; aead::NONCE_LEN],
     owner: &str,
     target_id: &str,
     upstream_id: &str,
 ) -> String {
     format!(
         "{RESP_ID_PREFIX}{}",
-        seal(cipher, RESP_ID_AAD, owner, target_id, upstream_id)
+        seal(cipher, RESP_ID_AAD, nonce, owner, target_id, upstream_id)
     )
+}
+
+/// The nonces one request seals under: a random 96-bit base drawn once,
+/// when the request starts, with a counter folded into its last eight
+/// bytes, so every seal of the request gets a nonce of its own. Drawing the
+/// randomness up front is what lets a random source that cannot be read
+/// refuse the request (a `500`) instead of failing in the middle of a
+/// response; the nonces stay as unpredictable across requests as one drawn
+/// per seal (the construction TLS 1.3 uses for its record nonces).
+#[derive(Debug)]
+struct Nonces {
+    base: [u8; aead::NONCE_LEN],
+    counter: std::sync::atomic::AtomicU64,
+}
+
+impl Nonces {
+    fn new() -> Result<Self, ring::error::Unspecified> {
+        let mut base = [0u8; aead::NONCE_LEN];
+        ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut base)?;
+        Ok(Self {
+            base,
+            counter: std::sync::atomic::AtomicU64::new(0),
+        })
+    }
+
+    fn next(&self) -> [u8; aead::NONCE_LEN] {
+        let n = self
+            .counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut nonce = self.base;
+        for (byte, count) in nonce[aead::NONCE_LEN - 8..].iter_mut().zip(n.to_be_bytes()) {
+            *byte ^= count;
+        }
+        nonce
+    }
 }
 
 /// `(target id, upstream id)` of a [`seal_response_id`] value; `None` for an
@@ -163,6 +200,7 @@ fn unescaped(field: &str) -> Option<String> {
 fn seal(
     cipher: &aead::LessSafeKey,
     aad: &[u8],
+    nonce: [u8; aead::NONCE_LEN],
     owner: &str,
     target_id: &str,
     value: &str,
@@ -172,11 +210,6 @@ fn seal(
         HEAD_BUCKET,
     );
     sealed.extend_from_slice(&crate::opaque_id::pad(value));
-    let mut nonce = [0u8; aead::NONCE_LEN];
-    // The operating system's random source; there is no id to hand out
-    // without it.
-    ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut nonce)
-        .expect("the system random source is readable");
     cipher
         .seal_in_place_append_tag(
             aead::Nonce::assume_unique_for_key(nonce),
@@ -234,6 +267,9 @@ pub(crate) struct TenantSeal {
     /// The cipher the platform settings set up once.
     cipher: Arc<aead::LessSafeKey>,
     owner: String,
+    /// The nonces this request seals under, shared by every response mark
+    /// made from it.
+    nonces: Arc<Nonces>,
 }
 
 impl std::fmt::Debug for TenantSeal {
@@ -245,17 +281,36 @@ impl std::fmt::Debug for TenantSeal {
 }
 
 impl TenantSeal {
-    pub(crate) fn new(platform: &crate::platform::PlatformSettings, owner: &str) -> Self {
-        Self {
+    /// The seal of one request. Draws the request's nonce base, so it fails
+    /// only when the system random source cannot be read; the request is
+    /// then refused as an internal error.
+    pub(crate) fn new(
+        platform: &crate::platform::PlatformSettings,
+        owner: &str,
+    ) -> Result<Self, crate::error::ProxyError> {
+        let nonces = Nonces::new().map_err(|_| {
+            crate::error::ProxyError::Bridge(aisix_gateway::BridgeError::Config(
+                "the system random source could not be read".into(),
+            ))
+        })?;
+        Ok(Self {
             cipher: platform.response_cipher().clone(),
             owner: owner.to_string(),
-        }
+            nonces: Arc::new(nonces),
+        })
     }
 
     fn mark_encrypted_content(&self, target_id: &str, original: &str) -> String {
         format!(
             "{ENC_PREFIX_V2}{};{original}",
-            seal(&self.cipher, ENC_AAD, &self.owner, target_id, "")
+            seal(
+                &self.cipher,
+                ENC_AAD,
+                self.nonces.next(),
+                &self.owner,
+                target_id,
+                ""
+            )
         )
     }
 
@@ -297,6 +352,7 @@ impl SealedResponseId {
         let fresh = || {
             seal_response_id_with(
                 &self.tenant.cipher,
+                self.tenant.nonces.next(),
                 &self.tenant.owner,
                 &self.target_id,
                 upstream_id,
@@ -1021,6 +1077,42 @@ mod tests {
         ));
     }
 
+    /// Every seal of one request gets a nonce of its own, and two requests'
+    /// nonces differ from the first one on: the base is drawn per request.
+    #[test]
+    fn every_seal_of_a_request_gets_its_own_nonce() {
+        let nonces = Nonces::new().unwrap();
+        let drawn: std::collections::HashSet<[u8; aead::NONCE_LEN]> =
+            (0..10_000).map(|_| nonces.next()).collect();
+        assert_eq!(drawn.len(), 10_000);
+        let other = Nonces::new().unwrap();
+        assert!(!drawn.contains(&other.next()));
+        // And what one request seals opens.
+        let platform = crate::platform::PlatformSettings::from_secret("s");
+        let tenant = TenantSeal::new(&platform, "team-a").unwrap();
+        let first = seal_response_id_with(
+            &tenant.cipher,
+            tenant.nonces.next(),
+            "team-a",
+            "m-1",
+            "resp_1",
+        );
+        let second = seal_response_id_with(
+            &tenant.cipher,
+            tenant.nonces.next(),
+            "team-a",
+            "m-1",
+            "resp_1",
+        );
+        assert_ne!(first, second);
+        for sealed in [first, second] {
+            assert_eq!(
+                open_response_id_with(&tenant.cipher, "team-a", &sealed),
+                Some(("m-1".to_string(), "resp_1".to_string()))
+            );
+        }
+    }
+
     #[test]
     fn strip_keeps_readable_reasoning_without_its_ciphertext() {
         let kept = strip_ciphertext(json!({
@@ -1396,7 +1488,7 @@ mod tests {
     }
 
     fn tenant(owner: &str) -> TenantSeal {
-        TenantSeal::new(&crate::platform::PlatformSettings::from_secret("s"), owner)
+        TenantSeal::new(&crate::platform::PlatformSettings::from_secret("s"), owner).unwrap()
     }
 
     fn sealed_for(owner: &str, target: &str, upstream: &str) -> String {

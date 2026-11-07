@@ -397,9 +397,24 @@ pub async fn responses(
     let affinity = match state.platform() {
         Some(platform) => {
             let owner = crate::platform::tenant_owner(&auth);
+            let tenant = match crate::responses_affinity::TenantSeal::new(platform, &owner) {
+                Ok(tenant) => tenant,
+                // No random source, so no response id to hand out.
+                Err(err) => {
+                    return crate::reject::reject_before_dispatch(
+                        &state,
+                        "POST",
+                        "/v1/responses",
+                        &client.request_id,
+                        Some(&auth.entry.id),
+                        started,
+                        crate::reject::Envelope::OpenAi,
+                        err,
+                    );
+                }
+            };
             let mut affinity = crate::responses_affinity::ContextAffinity::unwrap_sealed_request(
-                &mut body,
-                crate::responses_affinity::TenantSeal::new(platform, &owner),
+                &mut body, tenant,
             );
             // The item ids a client echoes from an earlier answer leave here
             // sealed; the upstream gets back the ones it issued, for the
