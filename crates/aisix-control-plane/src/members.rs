@@ -369,14 +369,33 @@ pub(crate) async fn current(
     auth: &MemberAuth,
     allowed: &[MemberRole],
 ) -> Result<MemberAuth, ApiError> {
-    tenants::lock(&mut *conn, auth.tenant_id).await?;
-    let now = MemberAuth::fetch(&mut *conn, auth.id)
-        .await?
-        .filter(|m| m.tenant_id == auth.tenant_id)
-        .ok_or_else(ApiError::unauthenticated)?;
+    let now = locked_caller(conn, auth).await?;
     now.require_active()?;
     now.require(allowed)?;
     Ok(now)
+}
+
+/// [`current`] for a route a member of a tenant that is not active may
+/// still call (`http::INACTIVE_TENANT_ROUTES`): the tenant's state is not
+/// checked, the role is.
+pub(crate) async fn current_in_any_state(
+    conn: &mut PgConnection,
+    auth: &MemberAuth,
+    allowed: &[MemberRole],
+) -> Result<MemberAuth, ApiError> {
+    let now = locked_caller(conn, auth).await?;
+    now.require(allowed)?;
+    Ok(now)
+}
+
+/// The caller as they stand now, read under their tenant's lock; `401`
+/// when they are gone.
+async fn locked_caller(conn: &mut PgConnection, auth: &MemberAuth) -> Result<MemberAuth, ApiError> {
+    tenants::lock(&mut *conn, auth.tenant_id).await?;
+    MemberAuth::fetch(&mut *conn, auth.id)
+        .await?
+        .filter(|m| m.tenant_id == auth.tenant_id)
+        .ok_or_else(ApiError::unauthenticated)
 }
 
 /// Revokes the open invitations member `issuer` of `tenant_id` issued:
@@ -1397,13 +1416,14 @@ pub async fn update(
 /// `DELETE /api/members/{id}` → `204`. The member is marked removed (their
 /// email can be invited again), their sessions end, their keys are revoked
 /// and their `users` document is deleted, in one transaction. Only an owner
-/// removes an owner; the last enabled owner stays (`409 last_owner`).
+/// removes an owner; the last enabled owner stays (`409 last_owner`). Open
+/// while the tenant is pending or suspended too: someone who left must not
+/// get their access back with a reactivation.
 pub async fn remove(
     auth: MemberAuth,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    auth.require_active()?;
     auth.require(&[MemberRole::Owner, MemberRole::Admin])?;
     let id = parse_id(&id)?;
     let ctx = WriteCtx::of(&state);
@@ -1411,8 +1431,12 @@ pub async fn remove(
         .db
         .tx(move |conn| {
             async move {
-                let auth =
-                    current(&mut *conn, &auth, &[MemberRole::Owner, MemberRole::Admin]).await?;
+                let auth = current_in_any_state(
+                    &mut *conn,
+                    &auth,
+                    &[MemberRole::Owner, MemberRole::Admin],
+                )
+                .await?;
                 let target = live_member(&mut *conn, auth.tenant_id, id).await?;
                 if target.role == MemberRole::Owner {
                     if auth.role != MemberRole::Owner {
@@ -1432,20 +1456,9 @@ pub async fn remove(
                 session::revoke_all(&mut *conn, Principal::Member(id), None).await?;
                 let revoked = revoke_issued_invites(&mut *conn, auth.tenant_id, id, true).await?;
                 // Before their `users` document goes: a key document names
-                // its user.
+                // its user. A pending tenant's member has none yet.
                 let keys_revoked = keys::revoke_member(&mut *conn, &ctx, id).await?;
-                write_resource(
-                    &mut *conn,
-                    &ctx,
-                    ResourceWrite {
-                        kind: Kind::Users,
-                        id,
-                        op: WriteOp::Delete,
-                        expected_version: None,
-                        managed_by: Some(&owner(id)),
-                    },
-                )
-                .await?;
+                tenants::retire(&mut *conn, &ctx, Kind::Users, id, &owner(id)).await?;
                 audit::record(
                     conn,
                     member_entry(

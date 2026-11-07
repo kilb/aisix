@@ -742,8 +742,15 @@ async fn a_removed_member_can_be_invited_again() {
 }
 
 /// The tenant routes a member of a tenant that is not active may still
-/// call; every other one answers `403 tenant_not_active`.
-const OPEN_WHILE_NOT_ACTIVE: [(&str, &str); 2] = [("GET", "/api/org"), ("POST", "/api/password")];
+/// call: to see the tenant's state, keep their own account, and close what
+/// should not outlive the suspension (a leaked key, a member who left).
+/// Every other one answers `403 tenant_not_active`.
+const OPEN_WHILE_NOT_ACTIVE: [(&str, &str); 4] = [
+    ("GET", "/api/org"),
+    ("POST", "/api/password"),
+    ("DELETE", "/api/keys/{id}"),
+    ("DELETE", "/api/members/{id}"),
+];
 
 /// Every member route outside [`OPEN_WHILE_NOT_ACTIVE`] answers `cookie`
 /// with `403 tenant_not_active` and changes nothing.
@@ -813,6 +820,107 @@ async fn a_pending_tenant_can_read_its_session_and_org_but_nothing_else() {
         .get_with_cookie("/api/org", &cookie_of(&again).expect("a cookie"))
         .await;
     assert_eq!(org.body["status"], "suspended", "{org:?}");
+}
+
+/// A suspended or pending tenant can still close what must not outlive the
+/// suspension: it revokes a leaked key and removes a member who left. A key
+/// revoked meanwhile stays revoked through the reactivation, which opens
+/// only the keys still live; and a member removed before the approval gets
+/// no user document from it.
+#[tokio::test]
+async fn a_tenant_that_is_not_active_can_still_revoke_its_keys_and_remove_a_member() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let op = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let tenant = cp.seed_tenant(TenantStatus::Active).await;
+    let owner = cp.member_login_seeded(tenant, MemberRole::Owner).await;
+    let joined = join(
+        &cp,
+        &owner,
+        &fresh_email("leaver"),
+        "member",
+        "leaver-password-7c1",
+    )
+    .await;
+    let leaver = text(&joined.body, "/member/id");
+    let leaked = mint(&cp, owner.cookie(), "leaked-7c1").await;
+    let kept = mint(&cp, owner.cookie(), "kept-7c1").await;
+    let leavers = mint(&cp, &cookie_of(&joined).expect("a cookie"), "leaver-7c1").await;
+    let tenant = tenant.to_string();
+    act_on_tenant(&cp, &op, &tenant, "suspend").await;
+
+    let status = send_if_match(
+        &cp,
+        owner.cookie(),
+        "DELETE",
+        &format!("/api/keys/{leaked}"),
+        1,
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, 204);
+    let r = remove_member(&cp, &owner, &leaver).await;
+    assert_eq!(r.status, 204, "{r:?}");
+    assert_eq!(member_row(&cp, &leaver).await.2, true, "not removed");
+    for (kind, id) in [
+        ("api_keys", &leaked),
+        ("api_keys", &leavers),
+        ("users", &leaver),
+    ] {
+        let (_, _, deleted) = resource(&cp, kind, id).await.expect("a document");
+        assert!(deleted, "{kind}/{id} outlived its revocation");
+    }
+
+    act_on_tenant(&cp, &op, &tenant, "reactivate").await;
+    let (doc, _, _) = resource(&cp, "api_keys", &kept)
+        .await
+        .expect("a key document");
+    assert_eq!(doc["disabled"], false, "{doc}");
+    for key in [&leaked, &leavers] {
+        let (_, _, deleted) = resource(&cp, "api_keys", key).await.expect("a document");
+        assert!(deleted, "the reactivation brought back {key}");
+    }
+    let listed = cp.get_with_cookie("/api/keys", owner.cookie()).await;
+    assert_eq!(listed.status, 200, "{listed:?}");
+    assert_eq!(ids(listed.body["items"].as_array().expect("items")), [kept]);
+
+    // While the tenant still waits for approval, too.
+    let r = signup(&cp, "waiting-7c1", &fresh_email("waiting"), None).await;
+    assert_eq!(r.status, 201, "{r:?}");
+    let waiting = text(&r.body, "/tenant/id");
+    let founder = text(&r.body, "/member/id");
+    let founder_cookie = cookie_of(&r).expect("a cookie");
+    let invited = cp
+        .send(
+            "POST",
+            &format!("/admin/tenants/{waiting}/invites"),
+            Some(op.cookie()),
+            Some(json!({"email": fresh_email("early"), "role": "member"})),
+        )
+        .await;
+    assert_eq!(invited.status, 201, "{invited:?}");
+    let a = accept(
+        &cp,
+        &text(&invited.body, "/invite_token"),
+        "early-password-7c1",
+        None,
+    )
+    .await;
+    assert_eq!(a.status, 201, "{a:?}");
+    let early = text(&a.body, "/member/id");
+    let r = cp
+        .send(
+            "DELETE",
+            &format!("/api/members/{early}"),
+            Some(&founder_cookie),
+            None,
+        )
+        .await;
+    assert_eq!(r.status, 204, "{r:?}");
+    act_on_tenant(&cp, &op, &waiting, "approve").await;
+    assert_eq!(resource(&cp, "users", &early).await, None);
+    assert!(resource(&cp, "users", &founder).await.is_some());
 }
 
 #[tokio::test]

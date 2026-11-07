@@ -286,12 +286,17 @@ const EVERY_MEMBER: &[MemberRole] = &[
 const MANAGERS: &[MemberRole] = &[MemberRole::Owner, MemberRole::Admin];
 
 /// The member routes a member of a tenant that is not active (pending
-/// approval, or suspended) may still call, to see the tenant's state and
-/// keep their own account; on every other member route they get `403
-/// tenant_not_active`. `every_route_checks_identity` holds each handler to
-/// this list.
-pub const INACTIVE_TENANT_ROUTES: &[(&str, &str)] =
-    &[("POST", "/api/password"), ("GET", "/api/org")];
+/// approval, or suspended) may still call, to see the tenant's state, keep
+/// their own account, and close what must not outlive the suspension (a
+/// leaked key, a member who left); on every other member route they get
+/// `403 tenant_not_active`. `every_route_checks_identity` holds each handler
+/// to this list.
+pub const INACTIVE_TENANT_ROUTES: &[(&str, &str)] = &[
+    ("POST", "/api/password"),
+    ("GET", "/api/org"),
+    ("DELETE", "/api/keys/{id}"),
+    ("DELETE", "/api/members/{id}"),
+];
 
 /// `/healthz` (no session), `/admin/*` and `/api/*`.
 pub fn browser_router(state: AppState) -> Router {

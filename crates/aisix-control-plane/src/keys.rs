@@ -1461,13 +1461,14 @@ pub async fn update(
 }
 
 /// `DELETE /api/keys/{id}` with `If-Match` → `204`: the key is revoked.
+/// Open while the tenant is pending or suspended too: a leaked key must not
+/// come back with a reactivation, which opens only the keys still live.
 pub async fn revoke(
     auth: MemberAuth,
     State(state): State<AppState>,
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
-    auth.require_active()?;
     auth.require(KEY_HOLDERS)?;
     let id = key_id(&id)?;
     let expected = if_match(&headers);
@@ -1476,8 +1477,8 @@ pub async fn revoke(
         .db
         .tx(move |conn| {
             async move {
-                let (auth, tenant) = holder(&mut *conn, &auth).await?;
-                let key = live_key(&mut *conn, id, Some(tenant.id), own_only(&auth)).await?;
+                let auth = members::current_in_any_state(&mut *conn, &auth, KEY_HOLDERS).await?;
+                let key = live_key(&mut *conn, id, Some(auth.tenant_id), own_only(&auth)).await?;
                 check_version(&key, expected)?;
                 revoke_key(conn, &ctx, &key, member_actor(&auth)).await
             }
