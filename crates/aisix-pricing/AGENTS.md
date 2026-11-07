@@ -96,3 +96,10 @@ failing unless it was written for them.
   edits a charge or a revision. Do not add an `UPDATE` or `DELETE` on a
   revision table or on `pricing_charges`, and do not loosen the tolerance to
   let an operator "fix" yesterday.
+
+## What the equivalence test does not pin
+
+- `tests/equivalence.rs` re-implements the proxy's input-token helper, so
+  drift in the gateway's helper is not caught by that property test; it is
+  caught by the proxy unit test `the_spend_reads_the_split_the_usage_event_reports`
+  and by the e2e.
