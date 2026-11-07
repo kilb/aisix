@@ -1225,7 +1225,7 @@ function InvitePart({ tenant }: { tenant: Tenant }) {
               ))}
             </select>
           </label>
-          <Button kind="primary" type="submit" disabled={busy}>
+          <Button kind="primary" type="submit" busy={busy} busyLabel="生成邀请">
             生成邀请
           </Button>
         </div>

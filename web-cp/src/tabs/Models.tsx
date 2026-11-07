@@ -836,8 +836,8 @@ function ModelForm({
         </p>
       ) : (
         <p>
-          <Button kind="primary" type="submit" disabled={busy}>
-            {busy ? "保存中…" : "保存"}
+          <Button kind="primary" type="submit" busy={busy} busyLabel="保存中…">
+            保存
           </Button>{" "}
           <Button type="button" disabled={busy} onClick={onClose}>
             取消

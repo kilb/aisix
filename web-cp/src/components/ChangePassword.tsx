@@ -116,7 +116,7 @@ export function ChangePassword({ onClose }: { onClose: () => void }) {
         </div>
       )}
       <div className="r">
-        <Button kind="primary" type="submit" disabled={busy || mismatch}>
+        <Button kind="primary" type="submit" disabled={mismatch} busy={busy} busyLabel="保存新口令">
           保存新口令
         </Button>
         <Button type="button" onClick={onClose}>

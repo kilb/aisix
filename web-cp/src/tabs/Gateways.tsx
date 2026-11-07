@@ -263,8 +263,8 @@ function IssueForm({ onIssued }: { onIssued: (b: IssuedCredential) => void }) {
         </Field>
       </div>
       <p>
-        <Button kind="primary" type="submit" disabled={busy}>
-          {busy ? "签发中…" : "签发"}
+        <Button kind="primary" type="submit" busy={busy} busyLabel="签发中…">
+          签发
         </Button>{" "}
         <Button type="button" disabled={busy} onClick={() => setOpen(false)}>
           取消

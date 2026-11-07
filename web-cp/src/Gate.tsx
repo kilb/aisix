@@ -92,8 +92,8 @@ export function Gate({
               onChange={(e) => setPassword(e.target.value)}
             />
           </label>
-          <Button kind="primary" type="submit" disabled={busy}>
-            {busy ? "校验中…" : "登录"}
+          <Button kind="primary" type="submit" busy={busy} busyLabel="校验中…">
+            登录
           </Button>
           {err && (
             <div className="note crit" role="alert">

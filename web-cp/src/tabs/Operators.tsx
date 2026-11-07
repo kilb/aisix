@@ -352,7 +352,7 @@ function CreateForm({
         </div>
       )}
       <div className="r">
-        <Button kind="primary" type="submit" disabled={busy}>
+        <Button kind="primary" type="submit" busy={busy} busyLabel="创建">
           创建
         </Button>
         <Button type="button" onClick={onCancel}>
