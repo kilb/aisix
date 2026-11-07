@@ -258,3 +258,31 @@ test("分区导航只用键盘也能走遍：方向键、Home、End 移动，回
   expect(await focused()).toBe("密钥");
   await page.context().close();
 });
+
+test("事实行里的中点有自己的宽度，不压在后面的空格上", async ({ browser }) => {
+  const page = await systemDarkPage(browser);
+  await signIn(page);
+  await openTab(page, "密钥", "prod-backend");
+  // The key's limits read "并发 20 · 每分钟 600": both limits, joined by a dot.
+  const limits = page.getByRole("row").filter({ hasText: "prod-backend" }).getByRole("cell").filter({ hasText: "·" });
+  await expect(limits).toHaveCount(1);
+  const { width, size } = await limits.evaluate(async (cell) => {
+    const style = getComputedStyle(cell);
+    await document.fonts.load(`${style.fontSize} ${style.fontFamily}`, "·");
+    const walker = document.createTreeWalker(cell, NodeFilter.SHOW_TEXT);
+    for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+      const at = (node as Text).data.indexOf("·");
+      if (at < 0) continue;
+      const range = document.createRange();
+      range.setStart(node, at);
+      range.setEnd(node, at + 1);
+      return { width: range.getBoundingClientRect().width, size: parseFloat(style.fontSize) };
+    }
+    return { width: null, size: 0 };
+  });
+  // A Latin dot, spaced: neither drawn over the space after it (no advance)
+  // nor a full-width CJK dot that splits the line into two phrases.
+  expect(width, "the dot's own advance").toBeGreaterThan(2);
+  expect(width, "a half-width dot, not a full-width one").toBeLessThan(size * 0.75);
+  await page.context().close();
+});

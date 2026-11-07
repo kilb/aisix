@@ -459,14 +459,6 @@ label:hover > :is(input[type="checkbox"], input[type="radio"]):checked:not(:disa
   line-height: var(--lh-table);
   color: var(--text-muted);
 }
-/* A long name: one line, an ellipsis, the whole text in its title. */
-.trunc {
-  display: block;
-  max-width: var(--trunc, 200px);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
 /* A row's actions, right-aligned, one control height. */
 .acts {
   display: inline-flex;
