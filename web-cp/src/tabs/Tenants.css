@@ -1,0 +1,39 @@
+/* The Tenants tab. Kept beside its page so the shared stylesheet stays as
+   Task 1 left it. */
+
+.tn-name{
+  background:none;border:0;padding:0;cursor:pointer;font:inherit;
+  color:var(--indigo);text-align:left;
+}
+.tn-name:hover{text-decoration:underline}
+.tn-mark{margin-left:8px}
+.tn-actions{display:flex;gap:6px;flex-wrap:wrap}
+/* A confirmation's warning takes a line of its own above the buttons. */
+.tn-actions > .note{flex-basis:100%;margin:0}
+
+/* A part of the tenant's page: a heading over what it holds. */
+.tn-section{border:0;padding:0;margin:22px 0 0;min-width:0}
+.tn-section > legend,.tn-section > h3{
+  padding:0;margin:0 0 2px;font-size:14px;font-weight:600;color:var(--ink);
+}
+
+.tn-checks{list-style:none;margin:6px 0 12px;padding:0;display:grid;gap:6px}
+.tn-checks label{display:inline-flex;align-items:center;gap:8px;cursor:pointer}
+.tn-note{margin-left:10px;font-size:12px;color:var(--ink-3)}
+.tn-error{display:block;margin-top:3px;font-size:12px;color:var(--oxide)}
+/* Something about a key an operator should look at, on a line of its own. */
+.tn-flag{display:block;margin:3px 0 0;color:var(--oxide)}
+
+.tn-limits{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));column-gap:16px}
+
+/* A one-time secret: selectable as a whole, wrapped rather than cut off. */
+.tn-token{
+  display:block;margin:8px 0;font-family:var(--mono);font-size:12.5px;
+  word-break:break-all;user-select:all;color:var(--ink);
+}
+
+.tn-override{
+  border:1px solid var(--rule);border-radius:calc(var(--r) - 2px);
+  padding:10px 14px;margin:4px 0;min-width:0;
+}
+.tn-override > legend{padding:0 4px;font-size:12.5px;font-weight:600}

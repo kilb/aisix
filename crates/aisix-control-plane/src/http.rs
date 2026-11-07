@@ -893,6 +893,43 @@ mod tests {
         );
     }
 
+    /// Each UI app declares the contract it was built against in its own
+    /// `src/lib/contract.ts`, a mirror of [`super::API_CONTRACT`], the value
+    /// `/admin/session` and `/api/session` serve. In one commit they must
+    /// agree: only then does a mismatch an app reports at run time mean a
+    /// deployment skew, not a forgotten edit on one side.
+    ///
+    /// The files are read when the test runs, not compiled in, so no build
+    /// or package of this crate depends on the apps' directories.
+    #[test]
+    fn ui_contracts_match() {
+        // The app directories that mirror the contract.
+        const APPS: &[&str] = &["web-cp", "web-tenant"];
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        for app in APPS {
+            let path = repo.join(app).join("src/lib/contract.ts");
+            let ts = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+            let declared = ts
+                .lines()
+                .find_map(|l| {
+                    l.trim()
+                        .strip_prefix("export const EXPECTED_API_CONTRACT = ")
+                })
+                .and_then(|v| v.trim_end_matches(';').trim().parse::<u32>().ok())
+                .unwrap_or_else(|| {
+                    panic!("{app}/src/lib/contract.ts must export EXPECTED_API_CONTRACT")
+                });
+            assert_eq!(
+                declared,
+                super::API_CONTRACT,
+                "{app} expects API contract {declared}, the control plane serves {}: change both \
+                 sides together",
+                super::API_CONTRACT
+            );
+        }
+    }
+
     #[tokio::test]
     async fn each_listener_admits_only_its_own_rows() {
         use axum::routing::{get, post};
