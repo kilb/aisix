@@ -643,7 +643,8 @@ pub(crate) struct ResponseMark {
     target_id: Option<String>,
     previous_echo: Option<(String, String)>,
     /// Platform mode: output item ids leave sealed
-    /// ([`crate::opaque_id::seal_id`]), and channel metrics do not leave.
+    /// ([`crate::opaque_id::seal_id`]), and only the members the Responses
+    /// API documents leave ([`crate::opaque_id::RESPONSE_BODY`]).
     seal: Option<std::sync::Arc<crate::opaque_id::Sealer>>,
     /// Platform mode: the response id leaves sealed to the tenant, and so
     /// does a group target's ciphertext tag.
@@ -765,9 +766,7 @@ impl ResponseMark {
         }
         if let Some(sealer) = &self.seal {
             crate::opaque_id::seal_responses_body(sealer, body);
-            if let Some(map) = body.as_object_mut() {
-                map.remove(crate::opaque_id::CHANNEL_METRICS_KEY);
-            }
+            crate::opaque_id::retain_value(body, crate::opaque_id::RESPONSE_BODY);
         }
     }
 
@@ -784,7 +783,11 @@ impl ResponseMark {
         if self.seal.is_none() {
             return tagged;
         }
-        crate::opaque_id::strip_channel_metrics(tagged.as_deref().unwrap_or(payload)).or(tagged)
+        crate::opaque_id::retain_json(
+            tagged.as_deref().unwrap_or(payload),
+            crate::opaque_id::RESPONSES_EVENT,
+        )
+        .or(tagged)
     }
 
     fn tag_event_json(&self, payload: &[u8], model: Option<&str>) -> Option<Vec<u8>> {
@@ -988,10 +991,10 @@ mod tests {
             "usage": {"input_tokens": 9, "input_tokens_details": {"cached_tokens": 1, "cache_creation_tokens": 3}},
         });
         mark.apply_to_body(&mut body);
-        // A relayed answer keeps every usage field its upstream wrote.
+        // A relayed answer keeps the usage counters the API documents.
         assert_eq!(
             body["usage"],
-            json!({"input_tokens": 9, "input_tokens_details": {"cached_tokens": 1, "cache_creation_tokens": 3}})
+            json!({"input_tokens": 9, "input_tokens_details": {"cached_tokens": 1}})
         );
         assert_eq!(body["id"], mark_response_id("m-1", "resp_up"));
         assert_eq!(
@@ -1025,6 +1028,81 @@ mod tests {
         assert!(out.ends_with("]}}\n\n"), "{out}");
         let buffered = mark.apply_to_sse_buffer([&frame[..], &done[..]].concat());
         assert!(!String::from_utf8(buffered).unwrap().contains("bdrk"));
+    }
+
+    /// In platform mode a relayed Response object keeps the members and the
+    /// usage counters the Responses API documents, and a stream event loses
+    /// its `obfuscation` padding: what one channel writes and another does
+    /// not names the channel.
+    #[test]
+    fn a_platform_response_keeps_only_the_documented_members() {
+        let (mark, _) = sealing_mark(None);
+        let usage = json!({"input_tokens": 9, "output_tokens": 2, "total_tokens": 11,
+            "input_tokens_details": {"cached_tokens": 1, "cache_write_tokens": 0,
+                                     "cache_creation_tokens": 3},
+            "output_tokens_details": {"reasoning_tokens": 1, "audio_tokens": 0},
+            "region": "eastus"});
+        let kept_usage = json!({"input_tokens": 9, "output_tokens": 2, "total_tokens": 11,
+            "input_tokens_details": {"cached_tokens": 1, "cache_write_tokens": 0},
+            "output_tokens_details": {"reasoning_tokens": 1}});
+        let mut body = json!({"id": "resp_up", "object": "response", "created_at": 1,
+            "status": "completed", "model": "alias", "output": [], "usage": usage,
+            "content_filters": [{"blocked": false}], "service_tier": "default"});
+        mark.apply_to_body(&mut body);
+        let mut members: Vec<&str> = body
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        members.sort_unstable();
+        assert_eq!(
+            members,
+            [
+                "created_at",
+                "id",
+                "model",
+                "object",
+                "output",
+                "service_tier",
+                "status",
+                "usage"
+            ]
+        );
+        assert_eq!(body["usage"], kept_usage);
+
+        let done = format!(
+            "event: response.completed\ndata: {}\n\n",
+            json!({"type": "response.completed", "sequence_number": 7,
+                   "response": {"id": "resp_up", "object": "response", "output": [],
+                                "usage": usage, "content_filters": []}})
+        );
+        let out = mark.apply_to_sse_frame(done.as_bytes()).unwrap();
+        let (event, _) = crate::redact::parse_sse_json_event(&out);
+        let event = event.unwrap();
+        assert_eq!(event["sequence_number"], 7);
+        assert!(
+            event["response"].get("content_filters").is_none(),
+            "{event}"
+        );
+        assert_eq!(event["response"]["usage"], kept_usage);
+
+        let delta = b"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"sequence_number\":3,\"item_id\":\"\",\"output_index\":0,\"content_index\":0,\"delta\":\"hi\",\"logprobs\":[],\"obfuscation\":\"Xy3\"}\n\n";
+        let out = String::from_utf8(mark.apply_to_sse_frame(delta).unwrap()).unwrap();
+        assert_eq!(
+            out,
+            "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"sequence_number\":3,\"item_id\":\"\",\"output_index\":0,\"content_index\":0,\"delta\":\"hi\",\"logprobs\":[]}\n\n"
+        );
+
+        // Off platform mode both go out as the upstream wrote them.
+        let off = ContextAffinity::default()
+            .response_mark("m-1", false)
+            .sealing_ids(None, "team-a");
+        let mut body = json!({"id": "resp_up", "usage": usage, "content_filters": []});
+        let before = body.clone();
+        off.apply_to_body(&mut body);
+        assert_eq!(body, before);
+        assert!(off.apply_to_sse_frame(delta).is_none());
     }
 
     #[test]

@@ -5254,8 +5254,11 @@ fn drain_anthropic_sse_frames(
         let forwarded = forwarded.as_deref().unwrap_or(&frame);
         // The upstream's error event reaches the caller as sent, less the
         // credentials this request sent it; in platform mode, as the class
-        // of the error it reports.
-        if reports_failure {
+        // of the error it reports. Platform mode relays no frame of a kind
+        // only some channels send (`MessagesIds::relays_event`), read above
+        // like every other.
+        if platform_ids.is_some() && !crate::opaque_id::MessagesIds::relays_event(json.as_ref()) {
+        } else if reports_failure {
             match crate::platform_errors::relayed_anthropic_error(json.as_ref()) {
                 Some(class_frame) => out.extend_from_slice(class_frame.as_bytes()),
                 None => {
@@ -5663,16 +5666,22 @@ where
             // Its counts are as real as any other frame's, so read them
             // whether or not the fragment survives the seal below.
             let (json, malformed) = crate::redact::parse_sse_json_event(&tail);
-            if let Some(json) = json {
+            if let Some(json) = &json {
                 update_anthropic_usage(
                     guard.usage(),
-                    &json,
+                    json,
                     attempt_started,
                     &mut first_token_seen,
                     response_text_cap,
                 );
             }
-            if let Some((max_hold, fail_open)) = hold {
+            if platform_ids.is_some()
+                && !malformed
+                && !crate::opaque_id::MessagesIds::relays_event(json.as_ref())
+            {
+                // Read above; platform mode relays no frame of a kind only
+                // some channels send, as `drain_anthropic_sse_frames` does.
+            } else if let Some((max_hold, fail_open)) = hold {
                 // Scanned like every other frame — hold it with them, but
                 // under the same size policy: this path reaches `held`
                 // outside the loop, so without this the last frame could
@@ -9457,6 +9466,56 @@ event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\"
             })
         ));
         assert!(buf.is_empty(), "both frames drained even without usage");
+    }
+
+    /// Platform mode relays none of a native stream's `ping` frames,
+    /// payload-less frames or undocumented events, and still reads each of
+    /// them first: the `ping` stamps the time to first frame. Off platform
+    /// mode every frame reaches the client byte for byte.
+    #[test]
+    fn platform_mode_relays_no_ping_and_still_reads_it() {
+        use super::{drain_anthropic_sse_frames, AnthropicStreamUsage};
+
+        let frames: &[u8] = b"event: ping\ndata: {\"type\":\"ping\"}\n\n\
+: channel keepalive\n\n\
+event: channel_status\ndata: {\"type\":\"channel_status\"}\n\n\
+event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"model\":\"up\",\"usage\":{\"input_tokens\":11}}}\n\n";
+        let drain = |platform_ids: Option<&crate::opaque_id::MessagesIds>| {
+            let mut acc = AnthropicStreamUsage::default();
+            let mut first_token_seen = false;
+            let mut buf = frames.to_vec();
+            let mut out: Vec<u8> = Vec::new();
+            drain_anthropic_sse_frames(
+                &mut buf,
+                &mut 0,
+                &mut acc,
+                std::time::Instant::now(),
+                &mut first_token_seen,
+                usize::MAX,
+                "gw-alias",
+                platform_ids,
+                &mut out,
+            );
+            assert!(buf.is_empty(), "every frame drained");
+            assert!(acc.upstream_ttft.is_some(), "the first frame was read");
+            assert_eq!(acc.prompt_tokens, 11);
+            String::from_utf8(out).unwrap()
+        };
+        let off = drain(None);
+        assert_eq!(
+            off,
+            String::from_utf8_lossy(frames).replace("\"up\"", "\"gw-alias\"")
+        );
+
+        let ids = crate::opaque_id::MessagesIds::new(&ring::hmac::Key::new(
+            ring::hmac::HMAC_SHA256,
+            &[7u8; 32],
+        ));
+        let on = drain(Some(&ids));
+        assert!(on.starts_with("event: message_start\n"), "{on}");
+        for gone in ["ping", "keepalive", "channel_status"] {
+            assert!(!on.contains(gone), "{gone}: {on}");
+        }
     }
 
     #[test]

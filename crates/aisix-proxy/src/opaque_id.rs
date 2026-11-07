@@ -26,7 +26,7 @@ use base64::Engine as _;
 use ring::{aead, hmac};
 use serde_json::Value;
 
-use crate::json_splice::{self, PathSeg};
+use crate::json_splice::{self, PathSeg, Retain};
 
 /// The client-facing protocols whose ids are rewritten one way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -668,24 +668,289 @@ fn is_item_reference(item: &Value) -> bool {
     }
 }
 
-/// The top-level member a cloud platform adds to a relayed Messages answer:
-/// its own invocation metrics, named after the platform.
-pub(crate) const CHANNEL_METRICS_KEY: &str = "amazon-bedrock-invocationMetrics";
+/// The top-level member a cloud platform adds to a relayed answer: its own
+/// invocation metrics, named after the platform.
+const CHANNEL_METRICS_KEY: &str = "amazon-bedrock-invocationMetrics";
 
-/// `doc` without a top-level [`CHANNEL_METRICS_KEY`] member, byte-preserving;
-/// `None` when it has none or cannot be read, and the caller keeps `doc`.
-pub(crate) fn strip_channel_metrics(doc: &[u8]) -> Option<Vec<u8>> {
-    let key = CHANNEL_METRICS_KEY.as_bytes();
-    if !doc.windows(key.len()).any(|w| w == key) {
-        return None;
+// What platform mode keeps of a relayed answer. An upstream writes members
+// and usage counters of its own beside the ones its API documents, and which
+// of them it writes names the channel: only Anthropic's own API reports
+// `service_tier`, `inference_geo` and `speed` in a Messages usage, a cloud
+// platform adds its invocation metrics, and only OpenAI pads its Responses
+// stream events with `obfuscation`. So an answer keeps what the API's type
+// definitions document, and the rest is left out of what the caller is sent.
+// Telemetry has read the upstream's answer before any of this runs.
+
+/// A Messages answer's top-level members: those anthropic-sdk-python 2.3.0
+/// documents (`types/message.py`, `types/beta/beta_message.py`) but two,
+/// which answer request fields platform mode refuses (`crate::stored_refs`):
+/// `container`, the container a code execution ran in, and `diagnostics`,
+/// which answers `diagnostics.previous_message_id`. `input_transformations`
+/// (beta) reports what the upstream did to the request on its own account.
+fn message_member(key: &str) -> bool {
+    matches!(
+        key,
+        "id" | "type"
+            | "role"
+            | "content"
+            | "model"
+            | "stop_reason"
+            | "stop_sequence"
+            | "stop_details"
+            | "usage"
+            | "context_management"
+    )
+}
+
+/// The usage counters of a Messages answer that every channel serving the
+/// API reports (`types/usage.py`, `types/message_delta_usage.py`), the
+/// 5-minute and 1-hour split of a cache write included.
+fn messages_usage_member(key: &str) -> bool {
+    matches!(
+        key,
+        "input_tokens"
+            | "output_tokens"
+            | "cache_creation_input_tokens"
+            | "cache_read_input_tokens"
+            | "cache_creation"
+    )
+}
+
+/// `types/cache_creation.py`.
+fn cache_creation_member(key: &str) -> bool {
+    matches!(
+        key,
+        "ephemeral_5m_input_tokens" | "ephemeral_1h_input_tokens"
+    )
+}
+
+/// What platform mode keeps of a Messages answer.
+const MESSAGE_BODY: &[Retain<'static>] = &[
+    Retain {
+        path: &[],
+        keep: message_member,
+    },
+    Retain {
+        path: &["usage"],
+        keep: messages_usage_member,
+    },
+    Retain {
+        path: &["usage", "cache_creation"],
+        keep: cache_creation_member,
+    },
+];
+
+/// What platform mode keeps of each Messages stream event, by its `type`:
+/// the members the six events of `types/raw_message_stream_event.py` (and
+/// their beta twins) document, and `error`, which the SDK's stream reader
+/// reads (`_streaming.py`). `None` for an event platform mode does not relay
+/// at all: a `ping`, which one channel sends and another does not, and a
+/// type the API does not document.
+fn messages_event_shape(kind: &str) -> Option<&'static [Retain<'static>]> {
+    Some(match kind {
+        "message_start" => &[
+            Retain {
+                path: &[],
+                keep: |k| matches!(k, "type" | "message"),
+            },
+            Retain {
+                path: &["message"],
+                keep: message_member,
+            },
+            Retain {
+                path: &["message", "usage"],
+                keep: messages_usage_member,
+            },
+            Retain {
+                path: &["message", "usage", "cache_creation"],
+                keep: cache_creation_member,
+            },
+        ],
+        "message_delta" => &[
+            Retain {
+                path: &[],
+                keep: |k| matches!(k, "type" | "delta" | "usage" | "context_management"),
+            },
+            Retain {
+                path: &["delta"],
+                keep: |k| matches!(k, "stop_reason" | "stop_sequence" | "stop_details"),
+            },
+            Retain {
+                path: &["usage"],
+                keep: messages_usage_member,
+            },
+            Retain {
+                path: &["usage", "cache_creation"],
+                keep: cache_creation_member,
+            },
+        ],
+        "message_stop" => &[Retain {
+            path: &[],
+            keep: |k| k == "type",
+        }],
+        "content_block_start" => &[Retain {
+            path: &[],
+            keep: |k| matches!(k, "type" | "index" | "content_block"),
+        }],
+        "content_block_delta" => &[Retain {
+            path: &[],
+            keep: |k| matches!(k, "type" | "index" | "delta"),
+        }],
+        "content_block_stop" => &[Retain {
+            path: &[],
+            keep: |k| matches!(k, "type" | "index"),
+        }],
+        "error" => &[Retain {
+            path: &[],
+            keep: |k| matches!(k, "type" | "error"),
+        }],
+        _ => return None,
+    })
+}
+
+/// A Responses `Response` object's top-level members, as openai-python
+/// 3.41.0 documents them (`types/responses/response.py`).
+fn response_member(key: &str) -> bool {
+    matches!(
+        key,
+        "id" | "access_programs"
+            | "created_at"
+            | "error"
+            | "incomplete_details"
+            | "instructions"
+            | "metadata"
+            | "model"
+            | "object"
+            | "output"
+            | "parallel_tool_calls"
+            | "temperature"
+            | "tool_choice"
+            | "tools"
+            | "top_p"
+            | "background"
+            | "completed_at"
+            | "conversation"
+            | "max_output_tokens"
+            | "max_tool_calls"
+            | "moderation"
+            | "previous_response_id"
+            | "prompt"
+            | "prompt_cache_diagnostics"
+            | "prompt_cache_key"
+            | "prompt_cache_options"
+            | "prompt_cache_retention"
+            | "reasoning"
+            | "safety_identifier"
+            | "service_tier"
+            | "status"
+            | "text"
+            | "tool_usage"
+            | "top_logprobs"
+            | "truncation"
+            | "usage"
+            | "user"
+    )
+}
+
+/// `types/responses/response_usage.py`.
+fn responses_usage_member(key: &str) -> bool {
+    matches!(
+        key,
+        "input_tokens"
+            | "input_tokens_details"
+            | "output_tokens"
+            | "output_tokens_details"
+            | "total_tokens"
+    )
+}
+
+/// What platform mode keeps of a Response object.
+pub(crate) const RESPONSE_BODY: &[Retain<'static>] = &[
+    Retain {
+        path: &[],
+        keep: response_member,
+    },
+    Retain {
+        path: &["usage"],
+        keep: responses_usage_member,
+    },
+    Retain {
+        path: &["usage", "input_tokens_details"],
+        keep: |k| matches!(k, "cached_tokens" | "cache_write_tokens"),
+    },
+    Retain {
+        path: &["usage", "output_tokens_details"],
+        keep: |k| k == "reasoning_tokens",
+    },
+];
+
+/// What platform mode keeps of a Responses stream event: the Response
+/// object of a snapshot event, kept as [`RESPONSE_BODY`] keeps one, and the
+/// event's own members but two. `obfuscation` is the random padding one
+/// channel adds to its delta events (`stream_options.include_obfuscation`,
+/// `types/responses/response_create_params.py:448`); the other is a cloud
+/// platform's invocation metrics.
+pub(crate) const RESPONSES_EVENT: &[Retain<'static>] = &[
+    Retain {
+        path: &[],
+        keep: |k| k != "obfuscation" && k != CHANNEL_METRICS_KEY,
+    },
+    Retain {
+        path: &["response"],
+        keep: response_member,
+    },
+    Retain {
+        path: &["response", "usage"],
+        keep: responses_usage_member,
+    },
+    Retain {
+        path: &["response", "usage", "input_tokens_details"],
+        keep: |k| matches!(k, "cached_tokens" | "cache_write_tokens"),
+    },
+    Retain {
+        path: &["response", "usage", "output_tokens_details"],
+        keep: |k| k == "reasoning_tokens",
+    },
+];
+
+/// `value` with every member `rules` refuses removed from the objects they
+/// name.
+pub(crate) fn retain_value(value: &mut Value, rules: &[Retain<'_>]) {
+    for rule in rules {
+        let mut node = Some(&mut *value);
+        for step in rule.path {
+            node = node.and_then(|n| n.get_mut(*step));
+        }
+        if let Some(Value::Object(map)) = node {
+            map.retain(|key, _| (rule.keep)(key));
+        }
     }
-    match json_splice::remove_top_level_member(doc, CHANNEL_METRICS_KEY) {
-        Ok(stripped) => stripped,
+}
+
+/// [`retain_value`] for a JSON document, byte-preserving
+/// ([`json_splice::retain_members`]); `None` when nothing was removed or the
+/// document cannot be read, and the caller keeps `doc`.
+pub(crate) fn retain_json(doc: &[u8], rules: &[Retain<'_>]) -> Option<Vec<u8>> {
+    match json_splice::retain_members(doc, rules) {
+        Ok(trimmed) => trimmed,
         Err(error) => {
-            tracing::debug!(%error, "channel metrics removal skipped; forwarding verbatim");
+            tracing::debug!(%error, "platform member trim skipped; forwarding verbatim");
             None
         }
     }
+}
+
+/// The `type` of a stream event's JSON, read without building the event.
+fn event_type(payload: &[u8]) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct Typed<'a> {
+        #[serde(rename = "type", borrow, default)]
+        kind: Option<std::borrow::Cow<'a, str>>,
+    }
+    serde_json::from_slice::<Typed<'_>>(payload)
+        .ok()?
+        .kind
+        .map(std::borrow::Cow::into_owned)
 }
 
 /// Per-response id state for an Anthropic Messages answer in platform mode:
@@ -757,6 +1022,17 @@ impl MessagesIds {
         }
     }
 
+    /// Whether platform mode relays a native stream's event at all (see
+    /// [`messages_event_shape`]): `event` is its parsed payload, `None` for
+    /// a frame that carries none, such as a comment, which is not relayed
+    /// either.
+    pub(crate) fn relays_event(event: Option<&Value>) -> bool {
+        event
+            .and_then(|e| e.get("type"))
+            .and_then(Value::as_str)
+            .is_some_and(|kind| messages_event_shape(kind).is_some())
+    }
+
     fn map_block(&self, block: &mut Value) {
         let ids = BlockIds::of(block.get("type").and_then(Value::as_str));
         let Some(map) = block.as_object_mut() else {
@@ -773,7 +1049,7 @@ impl MessagesIds {
     }
 
     /// A buffered Messages answer: its `id`, the tool-use ids of its blocks
-    /// ([`BlockIds`]), and no channel metrics.
+    /// ([`BlockIds`]), and only the members [`MESSAGE_BODY`] keeps.
     pub(crate) fn apply_to_body(&self, body: &mut Value) {
         if let Some(Value::String(id)) = body.get_mut("id") {
             id.clone_from(&self.message_id);
@@ -783,13 +1059,12 @@ impl MessagesIds {
                 self.map_block(block);
             }
         }
-        if let Some(map) = body.as_object_mut() {
-            map.remove(CHANNEL_METRICS_KEY);
-        }
+        retain_value(body, MESSAGE_BODY);
     }
 
-    /// One parsed stream event: `message_start.message.id` and the tool-use
-    /// ids of a `content_block_start`'s block.
+    /// One parsed stream event: `message_start.message.id`, the tool-use
+    /// ids of a `content_block_start`'s block, and only the members
+    /// [`messages_event_shape`] keeps of an event of its type.
     pub(crate) fn apply_to_event(&self, event: &mut Value) {
         if let Some(Value::String(id)) = event.pointer_mut("/message/id") {
             id.clone_from(&self.message_id);
@@ -797,15 +1072,19 @@ impl MessagesIds {
         if let Some(block) = event.get_mut("content_block") {
             self.map_block(block);
         }
-        if let Some(map) = event.as_object_mut() {
-            map.remove(CHANNEL_METRICS_KEY);
+        if let Some(shape) = event
+            .get("type")
+            .and_then(Value::as_str)
+            .and_then(messages_event_shape)
+        {
+            retain_value(event, shape);
         }
     }
 
     /// One relayed stream event's JSON, byte-preserving: the caller-facing
     /// `message.model` and the ids [`Self::apply_to_event`] rewrites, in one
-    /// splice pass, then any channel metrics. `None` when nothing changed or
-    /// the payload cannot be read, and the caller forwards it as it came.
+    /// splice pass, then the members it keeps. `None` when nothing changed
+    /// or the payload cannot be read, and the caller forwards it as it came.
     pub(crate) fn rewrite_event_json(
         &self,
         payload: &[u8],
@@ -834,7 +1113,12 @@ impl MessagesIds {
                 return None;
             }
         };
-        strip_channel_metrics(spliced.as_deref().unwrap_or(payload)).or(spliced)
+        let current = spliced.as_deref().unwrap_or(payload);
+        event_type(current)
+            .as_deref()
+            .and_then(messages_event_shape)
+            .and_then(|shape| retain_json(current, shape))
+            .or(spliced)
     }
 
     /// One splice pass, mapping the block ids `allowed` names; it reports
@@ -1802,6 +2086,130 @@ pub(crate) mod tests {
             block["content_block"]["id"],
             map_tool_call_id(&mac(&K), Surface::Messages, "call_up_1")
         );
+    }
+
+    /// A Messages answer keeps the members and the usage counters the API
+    /// documents and every channel writes; the rest is one channel's own.
+    #[test]
+    fn a_messages_answer_keeps_only_what_every_channel_writes() {
+        let ids = MessagesIds::new(&mac(&K));
+        let usage = json!({
+            "input_tokens": 3, "output_tokens": 1,
+            "cache_creation_input_tokens": 2, "cache_read_input_tokens": 4,
+            "cache_creation": {"ephemeral_5m_input_tokens": 2, "ephemeral_1h_input_tokens": 0,
+                               "ephemeral_2h_input_tokens": 9},
+            "service_tier": "standard", "inference_geo": "us", "speed": "standard",
+            "server_tool_use": {"web_search_requests": 1},
+            "output_tokens_details": {"thinking_tokens": 1},
+        });
+        let kept_usage = json!({
+            "input_tokens": 3, "output_tokens": 1,
+            "cache_creation_input_tokens": 2, "cache_read_input_tokens": 4,
+            "cache_creation": {"ephemeral_5m_input_tokens": 2, "ephemeral_1h_input_tokens": 0},
+        });
+        let mut body = json!({
+            "id": "msg_1", "type": "message", "role": "assistant", "model": "alias",
+            "content": [{"type": "text", "text": "hi"}],
+            "stop_reason": "end_turn", "stop_sequence": null,
+            "stop_details": null, "context_management": {"applied_edits": []},
+            "usage": usage,
+            "container": {"id": "container_1", "expires_at": "2026-01-01T00:00:00Z"},
+            "diagnostics": {"cache_miss_reason": null},
+            "channel_latency_ms": 12,
+        });
+        ids.apply_to_body(&mut body);
+        let mut members: Vec<&str> = body
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        members.sort_unstable();
+        assert_eq!(
+            members,
+            [
+                "content",
+                "context_management",
+                "id",
+                "model",
+                "role",
+                "stop_details",
+                "stop_reason",
+                "stop_sequence",
+                "type",
+                "usage"
+            ]
+        );
+        assert_eq!(body["usage"], kept_usage);
+
+        // The same on the stream, at every event that carries such members.
+        let start = json!({"type": "message_start", "region": "us-east-1", "message": {
+            "id": "msg_1", "type": "message", "role": "assistant", "model": "up",
+            "content": [], "usage": usage, "container": null}})
+        .to_string();
+        let out: Value =
+            serde_json::from_slice(&ids.rewrite_event_json(start.as_bytes(), "alias").unwrap())
+                .unwrap();
+        assert_eq!(
+            out,
+            json!({"type": "message_start", "message": {
+                "id": ids.message_id, "type": "message", "role": "assistant", "model": "alias",
+                "content": [], "usage": kept_usage}})
+        );
+        let delta = json!({"type": "message_delta",
+            "delta": {"stop_reason": "end_turn", "stop_sequence": null,
+                      "container": {"id": "container_1"}},
+            "usage": {"output_tokens": 5, "server_tool_use": {"web_search_requests": 1},
+                      "inference_geo": "us"},
+            "context_management": null})
+        .to_string();
+        let out: Value =
+            serde_json::from_slice(&ids.rewrite_event_json(delta.as_bytes(), "alias").unwrap())
+                .unwrap();
+        assert_eq!(
+            out,
+            json!({"type": "message_delta",
+                "delta": {"stop_reason": "end_turn", "stop_sequence": null},
+                "usage": {"output_tokens": 5}, "context_management": null})
+        );
+        let block_delta = br#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"},"p":"x"}"#;
+        assert_eq!(
+            ids.rewrite_event_json(block_delta, "alias").as_deref(),
+            Some(&br#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}"#[..])
+        );
+        // What the model wrote is not trimmed: a block keeps all it carries.
+        let block = br#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":"","citations":[],"usage":{"x":1}}}"#;
+        assert_eq!(ids.rewrite_event_json(block, "alias"), None);
+    }
+
+    /// Platform mode relays no `ping`, no frame without a payload, and no
+    /// event of a type the Messages API does not document; every documented
+    /// event, `error` included, is relayed.
+    #[test]
+    fn only_the_documented_messages_events_are_relayed() {
+        for kind in [
+            "message_start",
+            "message_delta",
+            "message_stop",
+            "content_block_start",
+            "content_block_delta",
+            "content_block_stop",
+            "error",
+        ] {
+            assert!(
+                MessagesIds::relays_event(Some(&json!({"type": kind}))),
+                "{kind}"
+            );
+        }
+        for dropped in [
+            Some(json!({"type": "ping"})),
+            Some(json!({"type": "channel_status"})),
+            Some(json!({"no_type": 1})),
+            Some(json!("message_stop")),
+            None,
+        ] {
+            assert!(!MessagesIds::relays_event(dropped.as_ref()), "{dropped:?}");
+        }
     }
 
     #[test]
