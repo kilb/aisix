@@ -3,288 +3,474 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="routio-mockup" content="refined-details-2026-11-07">
 <title>routio design</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Overpass:wght@400;600;800&family=Overpass+Mono:wght@400;600&display=swap">
 <style>
+/* Overpass with its vertical metrics fixed: ascent 92% and descent 18% put the centre of the
+   content box 0.37em above the baseline, where both the Latin cap height and the CJK em box
+   are centred, so mixed text sits on one optical line without padding hacks. */
+@font-face{font-family:"Overpass";font-style:normal;font-weight:400 800;font-display:swap;
+  src:url(https://fonts.gstatic.com/s/overpass/v19/qFdH35WCmI96Ajtm81GlU9s.woff2) format("woff2");
+  unicode-range:U+0000-00FF,U+0131,U+0152-0153,U+02BB-02BC,U+02C6,U+02DA,U+02DC,U+0304,U+0308,U+0329,U+2000-206F,U+20AC,U+2122,U+2191,U+2193,U+2212,U+2215,U+FEFF,U+FFFD;
+  ascent-override:92%;descent-override:18%;line-gap-override:0%}
+@font-face{font-family:"Overpass";font-style:normal;font-weight:400 800;font-display:swap;
+  src:url(https://fonts.gstatic.com/s/overpass/v19/qFdH35WCmI96Ajtm81GrU9vyww.woff2) format("woff2");
+  unicode-range:U+0100-02BA,U+02BD-02C5,U+02C7-02CC,U+02CE-02D7,U+02DD-02FF,U+0304,U+0308,U+0329,U+1D00-1DBF,U+1E00-1E9F,U+1EF2-1EFF,U+2020,U+20A0-20AB,U+20AD-20C4,U+2113,U+2C60-2C7F,U+A720-A7FF;
+  ascent-override:92%;descent-override:18%;line-gap-override:0%}
+@font-face{font-family:"Overpass Mono";font-style:normal;font-weight:400 600;font-display:swap;
+  src:url(https://fonts.gstatic.com/s/overpassmono/v21/_Xmq-H86tzKDdAPa-KPQZ-AC1i-0tg.woff2) format("woff2");
+  unicode-range:U+0000-00FF,U+0131,U+0152-0153,U+02BB-02BC,U+02C6,U+02DA,U+02DC,U+0304,U+0308,U+0329,U+2000-206F,U+20AC,U+2122,U+2191,U+2193,U+2212,U+2215,U+FEFF,U+FFFD;
+  ascent-override:92%;descent-override:18%;line-gap-override:0%}
+@font-face{font-family:"Overpass Mono";font-style:normal;font-weight:400 600;font-display:swap;
+  src:url(https://fonts.gstatic.com/s/overpassmono/v21/_Xmq-H86tzKDdAPa-KPQZ-AC1iG0ts-2.woff2) format("woff2");
+  unicode-range:U+0100-02BA,U+02BD-02C5,U+02C7-02CC,U+02CE-02D7,U+02DD-02FF,U+0304,U+0308,U+0329,U+1D00-1DBF,U+1E00-1E9F,U+1EF2-1EFF,U+2020,U+20A0-20AB,U+20AD-20C4,U+2113,U+2C60-2C7F,U+A720-A7FF;
+  ascent-override:92%;descent-override:18%;line-gap-override:0%}
+
 /* Tokens. Light is the default whatever the system setting; dark applies only when the viewer toggles it. */
 :root{
   color-scheme:light;
-  --ink:#1C2A39;--concrete:#F5F7F4;--paper:#FFFFFF;--sign:#FFC72C;--sign-down:#F2B705;
+  --ink:#1C2A39;--concrete:#F5F7F4;--paper:#FFFFFF;
+  --sign:#FFC72C;--sign-1:#F5BA14;--sign-2:#E5A900;
   --n1:#3B4A5A;--n2:#66737F;--n3:#A7B0B7;--n4:#D5DBD8;
   --l1:#2B63D9;--l2:#18916A;--l3:#C2410C;--l4:#7C3AED;--l5:#0E7490;--l6:#B45309;
-  --doc:#FFFFFF;--bg:var(--concrete);--surface:var(--paper);--text:var(--ink);--text-2:var(--n1);--muted:var(--n2);
-  --hair:var(--n4);--edge:var(--n3);--hover:var(--concrete);--route:var(--ink);--off:var(--n3);
-  --ok:#18916A;--info:#2B63D9;--crit:#D2433B;--crit-fill:#D2433B;
-  --float:0 8px 24px rgba(28,42,57,.14);
+  --doc:#FFFFFF;--bg:var(--concrete);--surface:var(--paper);--raise:var(--paper);
+  --text:var(--ink);--text-2:var(--n1);--muted:var(--n2);
+  --line:rgba(28,42,57,.10);--line-in:rgba(28,42,57,.065);
+  --field-edge:var(--n2);--field-hover:var(--n1);--box-edge:var(--n2);
+  --hover:rgba(28,42,57,.05);--press:rgba(28,42,57,.10);--row:var(--concrete);
+  --chip:rgba(28,42,57,.07);--skel:rgba(28,42,57,.07);--scroll:rgba(28,42,57,.28);
+  --route:var(--ink);--off:var(--n3);
+  --ok:#18916A;--info:#2B63D9;--info-2:#1E4DB3;--crit:#D2433B;
+  --crit-fill:#D2433B;--crit-1:#BC3A33;--crit-2:#A3312B;
+  --inset:inset 0 1px 0 rgba(28,42,57,.18);
+  --float:0 1px 2px rgba(28,42,57,.06),0 8px 24px rgba(28,42,57,.12);
+  --tip-bg:var(--ink);--tip-fg:#FFFFFF;--tip-line:transparent;
+  --sel:rgba(255,199,44,.35);
+  --chev:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M4.75 6.25 8 9.5l3.25-3.25' fill='none' stroke='%2366737F' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  --t:120ms ease;
   --sans:"Overpass","PingFang SC","Hiragino Sans GB","Microsoft YaHei","Noto Sans SC","Noto Sans CJK SC",sans-serif;
   --mono:"Overpass Mono",ui-monospace,"SF Mono",Menlo,monospace;
 }
-@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){
-  color-scheme:dark;--doc:#0E1620;--bg:#121C27;--surface:#1A2735;--text:#E6ECEA;--text-2:#C2CCD0;--muted:#93A0AA;
-  --hair:#2C3B4A;--edge:#50606F;--hover:#213142;--route:#E6ECEA;--off:#5E6C78;
-  --ok:#2FB88A;--info:#5B8BF0;--crit:#E8665E;--float:0 8px 24px rgba(0,0,0,.5);
-}}
 :root[data-theme="dark"]{
-  color-scheme:dark;--doc:#0E1620;--bg:#121C27;--surface:#1A2735;--text:#E6ECEA;--text-2:#C2CCD0;--muted:#93A0AA;
-  --hair:#2C3B4A;--edge:#50606F;--hover:#213142;--route:#E6ECEA;--off:#5E6C78;
-  --ok:#2FB88A;--info:#5B8BF0;--crit:#E8665E;--float:0 8px 24px rgba(0,0,0,.5);
+  color-scheme:dark;
+  --doc:#0E1620;--bg:#121C27;--surface:#1A2735;--raise:#243446;
+  --text:#E6ECEA;--text-2:#C2CCD0;--muted:#97A4AE;
+  --line:rgba(230,236,234,.12);--line-in:rgba(230,236,234,.075);
+  --field-edge:#7A8896;--field-hover:#A3AFB8;--box-edge:#8B98A4;
+  /* Line colours lifted one step, like the signal colours, so each bar keeps 3:1 on a dark panel */
+  --l1:#5B8BF0;--l2:#2FB88A;--l3:#E8763E;--l4:#9B7BF5;--l5:#22A6C2;--l6:#D98A2B;
+  --hover:rgba(230,236,234,.06);--press:rgba(230,236,234,.11);--row:#203040;
+  --chip:rgba(230,236,234,.09);--skel:rgba(230,236,234,.08);--scroll:rgba(230,236,234,.24);
+  --route:#E6ECEA;--off:#6B7987;
+  --ok:#2FB88A;--info:#5B8BF0;--info-2:#8AACF6;--crit:#EC6F67;
+  --inset:inset 0 1px 0 rgba(0,0,0,.35);
+  --float:0 0 0 1px rgba(230,236,234,.10);
+  --tip-bg:#2C3D51;--tip-fg:#E6ECEA;--tip-line:rgba(230,236,234,.10);
+  --sel:rgba(255,199,44,.85);
+  --chev:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M4.75 6.25 8 9.5l3.25-3.25' fill='none' stroke='%2397A4AE' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
 }
 
-*{box-sizing:border-box}
+*{box-sizing:border-box;scrollbar-width:thin;scrollbar-color:var(--scroll) transparent}
 html{-webkit-text-size-adjust:100%}
-body{margin:0;background:var(--doc);color:var(--text);font:400 15px/1.55 var(--sans)}
-h1,h2,h3{margin:0;font-weight:800;line-height:1.2;letter-spacing:-.01em}
+body{margin:0;background:var(--doc);color:var(--text);font:400 15px/1.6 var(--sans);-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale}
+::selection{background:var(--sel);color:#1C2A39}
+h1,h2,h3{margin:0;font-weight:700;line-height:1.2}
 p{margin:0}
-button,input,select{font:inherit;color:inherit}
-:focus-visible{outline:2px solid var(--info);outline-offset:2px}
-code,.id{font-family:var(--mono);font-size:.92em}
+button,input,select{font:inherit;color:inherit;margin:0}
+a{color:inherit}
+:focus-visible,.is-focus{outline:2px solid var(--info);outline-offset:2px}
+code,.id{font-family:var(--mono);font-size:13px;font-weight:400}
 .vh{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
 .hint{color:var(--text-2);max-width:72ch}
-.small{font-size:12px;color:var(--muted)}
-.money,.tbl{font-variant-numeric:tabular-nums}
+.small{font-size:13px;line-height:1.4;color:var(--muted)}
+.money,.tbl,.facts,.field,.levels,.matrix{font-variant-numeric:tabular-nums}
+/* Currency signs and units: muted, one scale step under the figure */
+.cur,.unit{color:var(--muted);font-weight:400;font-size:13px}
+.trunc{display:block;max-width:var(--tw,184px);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+/* Icons: 16px, 1.5px stroke, round caps; drawn once below and reused */
+.i{flex:none;width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round}
+.i.i-32{width:32px;height:32px}
 
 /* The page around the mockups */
-.doc{max-width:1520px;margin:0 auto;padding:0 24px 120px}
-.doc-head{display:flex;flex-wrap:wrap;gap:16px 32px;align-items:flex-end;justify-content:space-between;padding:48px 0 28px;border-bottom:1px solid var(--hair)}
+.doc{max-width:1520px;margin:0 auto;padding:0 24px 48px}
+.doc-head{display:flex;flex-wrap:wrap;gap:16px 32px;align-items:flex-end;justify-content:space-between;padding:48px 0 24px;border-bottom:1px solid var(--line)}
 .doc-head h1{font-size:36px}
-.lede{margin-top:10px;color:var(--text-2);max-width:66ch}
-.part{padding-top:64px}
+.lede{margin-top:12px;color:var(--text-2);max-width:66ch}
+.part{padding-top:48px}
 .part>h2{font-size:29px}
-.part>.hint{margin:8px 0 24px}
-.cap{font-size:12px;font-weight:600;color:var(--muted);margin:32px 0 10px}
+.part>.hint{margin:12px 0 24px}
+.cap{font-size:13px;font-weight:600;line-height:1.4;color:var(--muted);margin:32px 0 12px}
 
-/* Buttons */
-.btn{display:inline-flex;align-items:center;justify-content:center;height:36px;padding:2px 16px 0;border-radius:6px;border:1px solid transparent;background:none;font-weight:600;line-height:1;white-space:nowrap;cursor:pointer}
-.btn.sm{height:30px;padding:2px 12px 0}
-.btn.pri{background:var(--sign);color:#1C2A39}
-.btn.pri:hover{background:var(--sign-down)}
-.btn.sec{border-color:var(--text);color:var(--text)}
-.btn.sec:hover,.btn.sec[aria-expanded="true"]{background:var(--hover)}
-.btn.crit{background:var(--crit-fill);color:#fff}
-.btn.crit:hover{background:#B8362F}
-.btn.quiet{color:var(--text-2);padding:2px 10px 0}
-.btn.quiet:hover{background:var(--hover);color:var(--text)}
-.btn:disabled{opacity:.45;cursor:not-allowed}
-.btn.is-focus{outline:2px solid var(--info);outline-offset:2px}
+/* Shared motion: a 120ms colour transition on every interactive element */
+.btn,.field,.pick,.cb,.rd,.tname,.copy,.lnk,.rail button,.hroute button,.stop,.name,.tbl tbody tr{transition:background-color var(--t),border-color var(--t),color var(--t),box-shadow var(--t)}
 
-/* Inputs: 2px radius, a field edge, a 2px Line-blue ring on focus, the error under the field */
-.f{display:flex;flex-direction:column;gap:4px;min-width:0}
-.f>span{color:var(--text-2)}
-.field,.pick{height:36px;width:100%;padding:2px 10px 0;border:1px solid var(--edge);border-radius:2px;background:var(--surface)}
-.field:focus,.field.is-focus{outline:none;border-color:var(--info);box-shadow:0 0 0 1px var(--info)}
+/* Buttons: 36px default, 32px small; icons centred by flex */
+.btn{--fg:var(--text);position:relative;display:inline-flex;align-items:center;justify-content:center;gap:8px;height:36px;padding:0 16px;border-radius:6px;border:1px solid transparent;background:transparent;color:var(--fg);font-weight:600;line-height:16px;white-space:nowrap;text-decoration:none;cursor:pointer;user-select:none}
+.btn.sm{height:32px;padding:0 12px}
+.btn.pri{--fg:#1C2A39;background:var(--sign)}
+.btn.pri:not(:disabled,[aria-disabled="true"]):is(:hover,.is-hover){background:var(--sign-1)}
+.btn.pri:not(:disabled,[aria-disabled="true"]):is(:active,.is-active){background:var(--sign-2);box-shadow:inset 0 1px 0 rgba(28,42,57,.22)}
+.btn.sec{border-color:var(--text)}
+.btn.sec:not(:disabled,[aria-disabled="true"]):is(:hover,.is-hover){background:var(--hover)}
+.btn.sec:not(:disabled,[aria-disabled="true"]):is(:active,.is-active){background:var(--press);box-shadow:var(--inset)}
+.btn.quiet{--fg:var(--text-2);padding:0 8px}
+.btn.quiet:not(:disabled,[aria-disabled="true"]):is(:hover,.is-hover){--fg:var(--text);background:var(--hover)}
+.btn.quiet:not(:disabled,[aria-disabled="true"]):is(:active,.is-active){--fg:var(--text);background:var(--press);box-shadow:var(--inset)}
+.btn.crit{--fg:#FFFFFF;background:var(--crit-fill)}
+.btn.crit:not(:disabled,[aria-disabled="true"]):is(:hover,.is-hover){background:var(--crit-1)}
+.btn.crit:not(:disabled,[aria-disabled="true"]):is(:active,.is-active){background:var(--crit-2);box-shadow:inset 0 1px 0 rgba(0,0,0,.24)}
+.btn.icon{width:36px;padding:0}
+.btn.icon.sm{width:32px}
+.btn:is(:disabled,[aria-disabled="true"]){opacity:.45;cursor:not-allowed}
+/* Loading: a spinner takes the label's place and the button keeps its width */
+.btn.is-busy{color:transparent;cursor:progress}
+.btn.is-busy::after{content:"";position:absolute;width:16px;height:16px;border-radius:50%;border:1.5px solid var(--fg);border-right-color:transparent;animation:spin .7s linear infinite}
+@keyframes spin{to{transform:rotate(1turn)}}
+
+.lnk{display:inline-flex;align-items:center;gap:4px;color:var(--info);font-weight:600;text-decoration:none;border-radius:2px}
+.lnk:is(:hover,.is-hover){text-decoration:underline;text-underline-offset:4px;text-decoration-thickness:1px}
+.lnk:active{color:var(--info-2)}
+
+/* Disabled with a reason: the button stays focusable, the reason shows on hover and focus */
+.has-tip{position:relative;display:inline-flex}
+.tip{position:absolute;z-index:5;right:calc(100% + 8px);top:0;display:flex;align-items:center;height:32px;padding:0 12px;border-radius:6px;background:var(--tip-bg);color:var(--tip-fg);box-shadow:var(--float),inset 0 0 0 1px var(--tip-line);font-size:13px;font-weight:400;line-height:18px;white-space:nowrap;opacity:0;visibility:hidden;pointer-events:none;transition:opacity var(--t),visibility 0s linear 120ms}
+.has-tip:hover .tip,.has-tip:focus-within .tip{opacity:1;visibility:visible;transition:opacity var(--t)}
+.tip.is-static{position:static;opacity:1;visibility:visible}
+
+/* Fields: 2px radius, a field edge, the error under the field */
+.f{display:flex;flex-direction:column;gap:8px;min-width:0}
+.f>span:first-child,.f>label{color:var(--text-2);line-height:1.4}
+.field,.pick{height:36px;width:100%;padding:0 12px;border:1px solid var(--field-edge);border-radius:2px;background-color:var(--surface);color:var(--text);line-height:20px}
+.field::placeholder{color:var(--muted);opacity:1}
+.field::-webkit-inner-spin-button,.field::-webkit-outer-spin-button{-webkit-appearance:none;margin:0}
+.field[type=number]{-moz-appearance:textfield;appearance:textfield}
+.field:not(:disabled):is(:hover,.is-hover),.pick:not(:disabled):is(:hover,.is-hover){border-color:var(--field-hover)}
+.field:focus-visible,.field.is-focus,.pick:focus-visible,.pick.is-focus{border-color:var(--info)}
 .field[aria-invalid="true"]{border-color:var(--crit)}
-.err{font-size:12px;font-weight:600;color:var(--crit)}
-.pick{appearance:none;padding-right:30px;cursor:pointer;background:var(--surface) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%2366737F' stroke-width='1.6'/%3E%3C/svg%3E") no-repeat right 10px center}
-.pick.sm{height:30px;width:auto}
-.inline{display:inline-flex;align-items:center;gap:8px;color:var(--text-2)}
+.field:disabled,.pick:disabled{opacity:.45;cursor:not-allowed;background-color:var(--bg)}
+.err{font-size:13px;font-weight:600;line-height:1.4;color:var(--crit)}
+.pick{appearance:none;padding-right:36px;cursor:pointer;background-image:var(--chev);background-repeat:no-repeat;background-position:right 12px center;background-size:16px 16px}
+.pick:not(:disabled):is(:active,.is-active){background-color:var(--row)}
+.pick.sm{height:32px;width:auto;padding:0 32px 0 12px;background-position:right 8px center}
+.inline{display:inline-flex;align-items:center;gap:8px;color:var(--text-2);white-space:nowrap}
+
+/* Checkbox and radio: native elements, drawn in the system's style */
+.cb,.rd{appearance:none;flex:none;display:inline-block;width:16px;height:16px;margin:0;border:1px solid var(--box-edge);background:var(--surface) no-repeat center/14px 14px;vertical-align:middle;cursor:pointer}
+.cb{border-radius:2px}
+.rd{border-radius:50%}
+.cb:checked{border-color:var(--sign-2);background-color:var(--sign);background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 14 14'%3E%3Cpath d='M3.25 7.25 5.75 9.75 10.75 4.25' fill='none' stroke='%231C2A39' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E")}
+.rd:checked{border-color:var(--sign-2);background-color:var(--sign);background-image:radial-gradient(circle,#1C2A39 0 3px,transparent 3.5px)}
+:is(.cb,.rd):not(:disabled):is(:hover,.is-hover),label:hover>:is(.cb,.rd):not(:disabled){border-color:var(--text)}
+:is(.cb,.rd):not(:disabled,:checked):is(:active,.is-active){background-color:var(--press)}
+:is(.cb,.rd):checked:not(:disabled):is(:hover,.is-hover),label:hover>:is(.cb,.rd):checked:not(:disabled){border-color:var(--sign-2);background-color:var(--sign-1)}
+:is(.cb,.rd):checked:not(:disabled):is(:active,.is-active){background-color:var(--sign-2)}
+:is(.cb,.rd):disabled{opacity:.45;cursor:not-allowed}
+.opt{display:inline-flex;align-items:center;gap:8px;cursor:pointer;line-height:1.4}
+.opts{display:flex;flex-wrap:wrap;gap:8px 24px}
 
 /* Signal lamps: a dot with a word, never colour alone */
-.lamp{position:relative;display:inline-flex;align-items:center;gap:7px;white-space:nowrap}
-.lamp::before{content:"";flex:none;width:9px;height:9px;border-radius:50%;background:var(--c,var(--off));box-shadow:inset 0 0 0 1.5px var(--ring,transparent)}
+.lamp{position:relative;display:inline-flex;align-items:center;gap:8px;white-space:nowrap;line-height:1.4}
+.lamp::before{content:"";flex:none;width:8px;height:8px;border-radius:50%;background:var(--c,var(--off));box-shadow:inset 0 0 0 1.5px var(--ring,transparent)}
 .lamp.ok{--c:var(--ok)}.lamp.info{--c:var(--info)}.lamp.crit{--c:var(--crit)}.lamp.off{--c:var(--off)}
 .lamp.wait{--c:transparent;--ring:var(--text-2)}
-.lamp.pulse::after{content:"";position:absolute;left:0;top:50%;width:9px;height:9px;margin-top:-4.5px;border-radius:50%;background:var(--c);animation:pulse 1.1s ease-out 1 both}
+.lamp.pulse::after{content:"";position:absolute;left:0;top:50%;width:8px;height:8px;margin-top:-4px;border-radius:50%;background:var(--c);animation:pulse 1.1s ease-out 1 both}
 @keyframes pulse{from{transform:scale(1);opacity:.6}to{transform:scale(3.2);opacity:0}}
 
+/* Chips and line-colour bars share the lamp's centre line */
+.tag,.plate{display:inline-flex;align-items:center;height:20px;padding:0 8px;border-radius:6px;font-size:12px;font-weight:600;line-height:12px;white-space:nowrap}
+.tag{background:var(--chip);color:var(--text-2)}
+.plate{background:var(--route);color:var(--surface)}
+.grps{display:flex;flex-wrap:wrap;gap:4px 12px}
+/* In a list row only the first group shows; the rest fold into a +N chip whose title names them */
+.grps.one{flex-wrap:nowrap;align-items:center;gap:8px}
+.grp{display:inline-flex;align-items:center;gap:8px;white-space:nowrap;line-height:1.4}
+.tag.more{position:relative;cursor:default}
+.grp::before{content:"";flex:none;width:4px;height:12px;border-radius:1px;background:var(--c)}
+
 /* Panels sit on Concrete with a hairline and no shadow */
-.panel{background:var(--surface);border:1px solid var(--hair);border-radius:10px}
+.panel{background:var(--surface);border:1px solid var(--line);border-radius:10px}
 .pad{padding:24px}
-.phead{display:flex;flex-wrap:wrap;align-items:center;gap:12px 16px;margin-bottom:8px}
-.phead h1,.phead h2{font-size:23px;margin-right:auto}
+.phead{display:flex;flex-wrap:wrap;align-items:center;gap:12px 16px}
+.phead h1,.phead h2{font-size:23px;margin-right:auto;min-width:0}
 .tools{display:flex;flex-wrap:wrap;align-items:center;gap:8px}
 
-/* Tables: sticky header, hover in Concrete, numbers right, no zebra */
+/* Tables: 36px header, 44px rows (36px compact), hover in Concrete, numbers right, no zebra */
 .scroll{overflow-x:auto}
-.tbl{width:100%;border-collapse:collapse}
-.tbl th{position:sticky;top:0;z-index:1;background:var(--surface);text-align:left;font-size:12px;font-weight:600;color:var(--muted);padding:10px 14px;border-bottom:1px solid var(--hair);white-space:nowrap}
-.tbl td{padding:10px 14px;border-bottom:1px solid var(--hair);vertical-align:middle;white-space:nowrap}
+.scroll.bleed{margin:0 -4px -4px;padding:0 4px 4px}
+.tbl{width:100%;border-collapse:collapse;line-height:1.4}
+.tbl th{position:sticky;top:0;z-index:1;height:36px;padding:0 12px;background:var(--surface);text-align:left;font-size:12px;font-weight:600;color:var(--muted);border-bottom:1px solid var(--line);white-space:nowrap;vertical-align:middle}
+.tbl td{height:44px;padding:4px 12px;border-bottom:1px solid var(--line-in);vertical-align:middle;white-space:nowrap}
+/* A row is 44px; a row whose cells stack a note or tag under the value keeps 8px off each hairline */
+.tbl tr:has(.note,.nm .tag) td{padding-top:8px;padding-bottom:8px}
+/* A lamp is exactly one line tall; top alignment stops it adding to the line box when a note follows */
+.tbl td>.lamp{vertical-align:top}
 .tbl tbody tr:last-child td{border-bottom:0}
-.tbl tbody tr:hover{background:var(--hover)}
+.tbl tbody tr:hover{background:var(--row)}
 .tbl th:first-child,.tbl td:first-child{padding-left:24px}
 .tbl th:last-child,.tbl td:last-child{padding-right:24px}
 .tbl .r{text-align:right}
-.tbl tr.sel{background:var(--hover)}
+.tbl tr.sel{background:var(--row)}
 .tbl tr.sel td:first-child{box-shadow:inset 4px 0 0 var(--sign)}
-.tbl .note{display:block;font-size:12px;color:var(--muted);margin-top:2px;white-space:normal}
-.tname{padding:0;border:0;background:none;font-weight:600;text-align:left;cursor:pointer}
-.tname:hover{color:var(--info);text-decoration:underline}
-.tag{display:table;margin-top:4px;padding:2px 6px 1px;line-height:1.3;border:1px solid var(--edge);border-radius:2px;font-size:12px;font-weight:600;color:var(--text-2);vertical-align:1px}
-.grps{display:flex;flex-wrap:wrap;gap:2px 12px}
-.grp{display:inline-flex;align-items:center;gap:6px;white-space:nowrap}
-.grp::before{content:"";width:4px;height:14px;border-radius:1px;background:var(--c)}
-.acts{display:flex;gap:6px;justify-content:flex-end}
+.tbl .note{display:block;max-width:168px;font-size:13px;color:var(--muted);line-height:1.4;white-space:normal}
+.tbl .note code,.nw{white-space:nowrap}
+.tbl.compact td{height:36px;padding-top:0;padding-bottom:0}
+.nm{display:flex;flex-direction:column;align-items:flex-start;gap:4px}
+.tname{display:block;max-width:128px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding:0;border:0;border-radius:2px;background:none;font-weight:600;line-height:1.4;text-align:left;cursor:pointer}
+.tname:is(:hover,.is-hover){color:var(--info);text-decoration:underline;text-underline-offset:4px;text-decoration-thickness:1px}
+.tname:is(:active,.is-active){color:var(--info-2)}
+.acts{display:flex;gap:8px;justify-content:flex-end}
+
+/* Copy a literal id: the button itself says 已复制 for 1.5s */
+.idc{display:inline-flex;align-items:center;gap:4px;min-width:176px}
+.copy{display:inline-flex;align-items:center;gap:4px;height:24px;min-width:24px;padding:0 4px;border:0;border-radius:6px;background:none;color:var(--muted);font-size:13px;font-weight:600;line-height:14px;cursor:pointer}
+.copy:is(:hover,.is-hover){color:var(--text);background:var(--hover)}
+.copy:is(:active,.is-active){background:var(--press);box-shadow:var(--inset)}
+.copy .ic-done,.copy .done-l,.copy.is-done .ic-copy{display:none}
+.copy.is-done{color:var(--text);padding:0 8px 0 4px}
+.copy.is-done .ic-done{display:block;color:var(--ok)}
+.copy.is-done .done-l{display:inline}
+
+/* The in-place two-step confirm: a 120ms crossfade with a width transition */
+.two{position:relative;display:inline-flex;justify-content:flex-end;vertical-align:middle;transition:width 120ms ease}
+.two>span{display:inline-flex;gap:8px;transition:opacity 120ms ease,visibility 0s linear 120ms}
+.two>.two-b,.two[data-step="2"]>.two-a{position:absolute;top:0;right:0;opacity:0;visibility:hidden}
+.two[data-step="2"]>.two-b{position:static;opacity:1;visibility:visible;transition:opacity 120ms ease}
+.two:not([data-step="2"])>.two-a{transition:opacity 120ms ease}
 
 /* Screen frames */
-.screen{background:var(--bg);border:1px solid var(--hair);border-radius:10px}
+.screen{background:var(--bg);border:1px solid var(--line);border-radius:10px}
 
 /* Dashboard: the vertical route-line navigation is the one bold element */
-.cp{display:grid;grid-template-columns:156px minmax(0,1fr)}
-.rail{background:var(--surface);border-right:1px solid var(--hair);border-radius:10px 0 0 10px;padding:20px 0}
+.cp{display:grid;grid-template-columns:160px minmax(0,1fr)}
+.rail{background:var(--surface);border-right:1px solid var(--line);border-radius:10px 0 0 10px;padding:16px 0}
 .rail ol{position:relative;list-style:none;margin:0;padding:0}
-.rail ol::before{content:"";position:absolute;left:26px;top:18px;bottom:18px;width:4px;border-radius:2px;background:var(--route)}
+.rail ol::before{content:"";position:absolute;left:26px;top:20px;bottom:20px;width:4px;border-radius:2px;background:var(--route)}
 .rail li{position:relative}
-.rail button{position:relative;display:flex;align-items:center;gap:12px;width:100%;height:40px;padding:0 12px 0 14px;border:0;background:none;color:var(--text-2);text-align:left;cursor:pointer}
+/* 8px from each rail edge, so a focus ring clears the rail's hairline */
+.rail button{position:relative;display:flex;align-items:center;gap:12px;width:calc(100% - 16px);height:40px;margin:0 8px;padding:0 8px;border:0;border-radius:6px;background:none;color:var(--text-2);text-align:left;cursor:pointer}
 .box{position:relative;flex:none;display:grid;place-items:center;width:24px;height:24px}
-.stop{width:14px;height:14px;border-radius:50%;background:var(--surface);border:3px solid var(--route)}
-.rail button:hover .stop{background:var(--hover)}
-.rail button:hover .name{color:var(--text)}
+.stop{width:16px;height:16px;border-radius:50%;background:var(--surface);border:3px solid var(--route)}
+.rail button:is(:hover,.is-hover) .stop{background:var(--row)}
+.rail button:is(:hover,.is-hover) .name{color:var(--text)}
+.rail button:active .stop{background:var(--n4)}
 .rail [aria-selected="true"] .stop{width:24px;height:24px;background:var(--sign)}
-.rail [aria-selected="true"] .name{color:var(--text);font-weight:800}
-.box[data-due]::after{content:"";position:absolute;top:-1px;right:-3px;width:9px;height:9px;border-radius:50%;background:var(--crit);box-shadow:0 0 0 2px var(--surface)}
-.due{margin-left:auto;font-size:12px;font-weight:600;color:var(--crit)}
-.name{white-space:nowrap}
+.rail [aria-selected="true"] .name{color:var(--text);font-weight:700}
+.box[data-due]::after{content:"";position:absolute;top:0;right:0;width:8px;height:8px;border-radius:50%;background:var(--crit);box-shadow:0 0 0 2px var(--surface)}
+.rail [aria-selected="true"] .box[data-due]::after{top:-2px;right:-2px}
+.due{margin-left:auto;font-size:12px;font-weight:600;line-height:1;color:var(--crit)}
+.name{white-space:nowrap;line-height:1.4}
 
 .cp-main{min-width:0}
-.bar{display:flex;flex-wrap:wrap;align-items:center;gap:8px 20px;padding:12px 20px 12px 24px;background:var(--surface);border-bottom:1px solid var(--hair);border-radius:0 10px 0 0}
-.mark{font-size:19px;font-weight:800;letter-spacing:-.01em}
-.mark+.app{margin-left:-12px;color:var(--text-2)}
-.ctx{display:flex;flex-wrap:wrap;align-items:center;gap:4px 18px;color:var(--text-2)}
-.ctx>*+*{padding-left:18px;border-left:1px solid var(--hair)}
+.bar,.tbar{display:flex;flex-wrap:wrap;align-items:center;gap:8px 24px;min-height:56px;padding:12px 16px 12px 24px;background:var(--surface);border-bottom:1px solid var(--line)}
+.bar{border-radius:0 10px 0 0}
+.tbar{border-radius:10px 10px 0 0}
+.brand{display:inline-flex;align-items:baseline;gap:8px}
+.mark{font-size:19px;font-weight:800;letter-spacing:-.01em;line-height:1.2}
+.app{color:var(--text-2)}
+.ctx{display:flex;flex-wrap:wrap;align-items:center;gap:4px 16px;color:var(--text-2)}
+.ctx>*+*{padding-left:16px;border-left:1px solid var(--line)}
+.fleet{display:inline-flex;align-items:center;gap:8px}
 .who{display:flex;align-items:center;gap:4px;margin-left:auto;color:var(--text-2)}
 .who>span{margin-right:8px}
 
-.work{display:grid;grid-template-columns:minmax(0,1fr) 452px;gap:12px;align-items:start;padding:16px}
+.work{display:grid;grid-template-columns:minmax(0,1fr) 416px;gap:16px;align-items:start;padding:16px}
 .work.closed{grid-template-columns:minmax(0,1fr)}
 .work.closed .detail{display:none}
-.list .phead,.list>.hint{padding:0 24px}
-.list .phead{padding-top:20px}
-.list>.hint{margin-bottom:16px}
-.list .tbl{border-top:1px solid var(--hair)}
-.list-foot{padding:12px 24px;border-top:1px solid var(--hair)}
+.list .phead{padding:24px 24px 0}
+.list>.hint{padding:0 24px;margin:8px 0 16px}
+.list .tbl{border-top:1px solid var(--line-in)}
+.list-foot{padding:12px 24px;border-top:1px solid var(--line-in)}
 .detail{padding:24px}
 .detail.in{animation:slide .16s ease-out}
 @keyframes slide{from{transform:translateX(24px);opacity:0}}
-.dhead{display:flex;flex-wrap:wrap;align-items:center;gap:8px 14px}
-.dhead h2{font-size:23px}
+.dhead{display:flex;align-items:center;gap:8px 12px;min-width:0}
+.dhead h2{font-size:23px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .dhead .btn{margin-left:auto}
-.facts{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin:16px 0 0;padding:12px 0;border-top:1px solid var(--hair);border-bottom:1px solid var(--hair)}
-.facts dt{font-size:12px;color:var(--muted)}
-.facts dd{margin:0;font-weight:600}
-.part-f{border:0;margin:0;padding:20px 0;border-bottom:1px solid var(--hair);min-width:0}
-.part-f legend,.part-f h3{float:left;width:100%;padding:0;font-size:19px;font-weight:800;margin-bottom:4px}
+.facts{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:16px;margin:20px 0 0;padding:12px 0;border-top:1px solid var(--line-in);border-bottom:1px solid var(--line-in)}
+.facts dt{font-size:13px;line-height:1.4;color:var(--muted)}
+.facts dd{margin:4px 0 0;font-weight:600;line-height:1.4}
+/* Sections of one tenant's access sit 24px apart; a hairline only before the unrelated members list */
+.part-f{border:0;margin:24px 0 0;padding:0;min-width:0}
+.part-f.sep{padding-top:24px;border-top:1px solid var(--line-in)}
+.part-f legend,.part-f h3{float:left;width:100%;padding:0;font-size:19px;font-weight:700;line-height:1.2;margin-bottom:8px}
 .part-f legend+*,.part-f h3+*{clear:both}
-.checks{list-style:none;margin:12px 0 14px;padding:0;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px 16px}
-.checks label{display:flex;align-items:center;gap:8px;cursor:pointer}
-.checks input{width:16px;height:16px;margin:0;accent-color:var(--sign)}
-.checks.one{grid-template-columns:1fr}
-.checks .note{display:block;margin-left:24px;font-size:12px;color:var(--muted)}
-.limits{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px 16px;margin:12px 0 16px}
+.checks{list-style:none;margin:16px 0;padding:0;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px 16px}
+.checks label{display:flex;align-items:center;gap:8px;cursor:pointer;line-height:1.4}
+.checks.one{grid-template-columns:1fr;gap:12px}
+.checks .note{display:block;margin-left:24px;font-size:13px;line-height:1.4;color:var(--muted)}
+.limits{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px;margin:16px 0}
 .save{display:flex;align-items:center;gap:12px}
+.mini{margin-top:4px}
+/* The members table lives inside the 416px panel, so its columns sit 16px apart rather than 24px */
+.mini th,.mini td{padding-left:8px;padding-right:8px}
+.mem{display:flex;flex-direction:column;min-width:0}
+.who1{display:flex;align-items:center;gap:8px}
 .mini th:first-child,.mini td:first-child{padding-left:0}
 .mini th:last-child,.mini td:last-child{padding-right:0}
-.mini th,.mini td{padding:8px 8px}
-.mini{margin-top:8px}
-.pop-room{padding-bottom:20px;margin-bottom:-20px}
-.part-f:last-child{border-bottom:0;padding-bottom:0}
-.anchor{position:relative}
-.pop{position:absolute;right:0;top:calc(100% + 6px);z-index:3;display:flex;gap:8px;padding:10px;background:var(--surface);border:1px solid var(--hair);border-radius:10px;box-shadow:var(--float)}
-.pop[hidden]{display:none}
 
 /* Portal: the same tokens with a lighter hand */
-.tbar{display:flex;flex-wrap:wrap;align-items:center;gap:8px 20px;padding:12px 20px 12px 24px;background:var(--surface);border-bottom:1px solid var(--hair);border-radius:10px 10px 0 0}
-.hroute{padding:18px 24px 4px}
+.hroute{padding:16px 24px 8px}
 .hroute ol{position:relative;display:flex;list-style:none;margin:0;padding:0;width:min(100%,576px)}
 .hroute ol::before{content:"";position:absolute;top:9px;left:calc(100%/12);right:calc(100%/12);height:2px;background:var(--route)}
 .hroute li{flex:1 1 0;min-width:0}
-.hroute button{display:flex;flex-direction:column;align-items:center;gap:6px;width:100%;padding:0 0 6px;border:0;background:none;color:var(--text-2);cursor:pointer}
+.hroute button{display:flex;flex-direction:column;align-items:center;gap:8px;width:100%;padding:0 0 4px;border:0;border-radius:6px;background:none;color:var(--text-2);cursor:pointer}
 .hroute .box{width:20px;height:20px}
 .hroute .stop{width:12px;height:12px;border-width:2px}
+.hroute button:is(:hover,.is-hover) .stop{background:var(--row)}
+.hroute button:is(:hover,.is-hover) .name{color:var(--text)}
+.hroute button:active .stop{background:var(--n4)}
 .hroute [aria-selected="true"] .stop{width:20px;height:20px;background:var(--sign)}
-.hroute [aria-selected="true"] .name{color:var(--text);font-weight:800}
-.hroute button:hover .name{color:var(--text)}
+.hroute [aria-selected="true"] .name{color:var(--text);font-weight:700}
 .tn{max-width:1120px}
-.tn-main{padding:20px 24px 28px}
+.tn-main{padding:16px 24px 24px}
 
-.readout{margin-top:20px}
+.readout{margin-top:24px}
 .rl{color:var(--text-2)}
-.amt{font-size:45px;font-weight:800;letter-spacing:-.01em;line-height:1.1;margin:6px 0 10px}
-.levels{position:relative;display:grid;grid-template-columns:repeat(3,minmax(0,1fr));list-style:none;margin:28px 0 0;padding:0;max-width:760px}
-.levels::before{content:"";position:absolute;left:10px;right:0;top:39px;height:2px;background:var(--route)}
-.levels li{display:flex;flex-direction:column;align-items:flex-start;gap:6px;padding-right:16px;min-width:0}
-.levels .lv{display:flex;align-items:center;gap:8px;height:24px;color:var(--text-2);white-space:nowrap}
+.amt{font-size:45px;font-weight:800;letter-spacing:-.01em;line-height:1.2;margin:4px 0 8px}
+.amt .cur{font-size:29px;font-weight:600;margin-right:4px}
+.levels{position:relative;display:grid;grid-template-columns:repeat(3,minmax(0,1fr));list-style:none;margin:32px 0 0;padding:0;max-width:760px}
+/* The line runs from the first stop to the last, and no further */
+.levels::before{content:"";position:absolute;left:10px;right:calc(100%/3 - 10px);top:41px;height:2px;background:var(--route)}
+.levels li{display:flex;flex-direction:column;align-items:flex-start;gap:8px;padding-right:16px;min-width:0}
+.levels .lv{display:flex;align-items:center;gap:8px;height:24px;color:var(--text-2);white-space:nowrap;line-height:1.4}
 .levels .box{width:20px;height:20px}
 .levels .stop{width:12px;height:12px;border-width:2px}
 .levels .bind .stop{width:20px;height:20px;border:0;background:radial-gradient(circle,var(--surface) 0 3px,var(--route) 3.5px)}
-.levels .m{font-size:19px;font-weight:600;color:var(--text-2)}
+.levels .m{font-size:19px;font-weight:600;line-height:1.2;color:var(--text-2)}
+.levels .m .cur{font-size:15px}
 .levels .bind .m{font-weight:800;color:var(--text)}
 .levels .bind .lv{color:var(--text);font-weight:600}
-.levels .k{font-size:12px;color:var(--muted)}
-.plate{display:inline-block;padding:2px 6px 0;border-radius:2px;background:var(--route);color:var(--surface);font-size:12px;font-weight:600}
-.bal-foot{margin-top:24px;padding-top:12px;border-top:1px solid var(--hair);color:var(--text-2)}
-.empty{display:flex;flex-wrap:wrap;align-items:center;gap:12px 20px;margin-top:8px;padding:20px 0 4px;border-top:1px solid var(--hair)}
+.levels .k{font-size:13px;line-height:1.4;color:var(--muted)}
+.levels .k .cur{font-size:12px}
+.bal-foot{margin-top:24px;padding-top:16px;border-top:1px solid var(--line-in);color:var(--text-2)}
+.keys-head{padding:24px 24px 16px}
+/* Empty state: a 32px muted mark, one sentence, one primary action, centred */
+.empty{display:flex;flex-direction:column;align-items:center;gap:16px;padding:48px 24px;border-top:1px solid var(--line-in);text-align:center}
+.empty .i-32{color:var(--muted)}
 
 /* Component sheet */
-.sheet{border-top:1px solid var(--hair)}
-.row{display:grid;grid-template-columns:160px minmax(0,1fr);gap:16px 24px;padding:24px 0;border-bottom:1px solid var(--hair)}
+.sheet{border-top:1px solid var(--line)}
+.row{display:grid;grid-template-columns:160px minmax(0,1fr);gap:16px 24px;padding:24px 0;border-bottom:1px solid var(--line)}
 .row>h3{font-size:19px}
-.spec{display:flex;flex-wrap:wrap;align-items:flex-start;gap:20px 28px}
-.spec figure{margin:0;display:flex;flex-direction:column;gap:8px}
-.spec figcaption{font-size:12px;color:var(--muted)}
+.spec{display:flex;flex-wrap:wrap;align-items:flex-start;gap:24px 32px;min-width:0}
+.spec figure{margin:0;display:flex;flex-direction:column;align-items:flex-start;gap:8px}
+.spec figcaption{font-size:13px;line-height:1.4;color:var(--muted)}
 .pair{display:flex;gap:8px}
-.spec .f{width:220px}
-.lamps{display:flex;flex-wrap:wrap;gap:12px 28px;align-items:center}
-.toast{display:inline-flex;align-items:center;gap:10px;padding:10px 16px 8px;border-radius:6px;background:var(--text);color:var(--surface);font-weight:600;box-shadow:var(--float)}
-.toast::before{content:"";width:9px;height:9px;border-radius:50%;background:#2FB88A}
-.toasts{position:fixed;left:24px;bottom:24px;z-index:20;display:flex;flex-direction:column;gap:8px}
-.scale{list-style:none;margin:0;padding:0;display:grid;gap:10px}
-.scale li{display:grid;grid-template-columns:44px minmax(0,1fr);align-items:baseline;gap:12px}
+.spec .f{width:224px}
+.lamps{display:flex;flex-wrap:wrap;gap:12px 32px;align-items:center}
+.toast{display:inline-flex;align-items:center;gap:8px;height:40px;padding:0 16px;border-radius:6px;background:var(--tip-bg);color:var(--tip-fg);box-shadow:var(--float),inset 0 0 0 1px var(--tip-line);font-weight:600;line-height:16px;white-space:nowrap;transition:opacity .16s ease-out,transform .16s ease-out}
+.toast::before{content:"";flex:none;width:8px;height:8px;border-radius:50%;background:#2FB88A}
+.toast.is-enter{opacity:0;transform:translateY(8px)}
+.toast.is-leave{opacity:0;transition:opacity .2s ease-in}
+.toast.st-enter{opacity:.5;transform:translateY(4px)}
+.toast.st-leave{opacity:.45}
+.toasts{position:fixed;left:24px;bottom:24px;z-index:20;display:flex;flex-direction:column;align-items:flex-start;gap:8px}
+.scale{list-style:none;margin:0;padding:0;display:grid;gap:12px}
+.scale li{display:grid;grid-template-columns:48px minmax(0,1fr);align-items:baseline;gap:12px}
 .scale .px{font-size:12px;color:var(--muted)}
-.swatches{list-style:none;margin:0;padding:0;display:grid;grid-template-columns:repeat(auto-fill,minmax(176px,1fr));gap:16px 20px;width:100%}
-.swatches li{display:grid;grid-template-columns:40px minmax(0,1fr);gap:2px 12px;align-items:center}
-.chip{grid-row:span 3;width:40px;height:40px;border-radius:6px;box-shadow:inset 0 0 0 1px rgba(28,42,57,.12)}
+.swatches{list-style:none;margin:0;padding:0;display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:16px 24px;width:100%}
+.swatches li{display:grid;grid-template-columns:40px minmax(0,1fr);gap:0 12px;align-items:center;line-height:1.4}
+.chip{grid-row:span 3;width:40px;height:40px;border-radius:6px;box-shadow:inset 0 0 0 1px var(--line)}
 .swatches b{font-weight:600}
-.swatches span{font-size:12px;color:var(--muted)}
+.swatches span{font-size:13px;color:var(--muted)}
+.swatches code{font-size:12px;color:var(--muted)}
 .lines{display:flex;flex-wrap:wrap;gap:8px 20px}
+.iconset{display:flex;flex-wrap:wrap;align-items:flex-end;gap:24px 32px;list-style:none;margin:0;padding:0}
+.iconset li{display:flex;flex-direction:column;align-items:center;gap:8px;color:var(--text)}
+.iconset span{font-size:13px;line-height:1.4;color:var(--muted)}
+
+/* The states matrix: every state side by side, static, for review */
+.matrix{border-collapse:collapse;line-height:1.4}
+.matrix th{height:36px;padding:0 24px 0 0;text-align:left;font-size:12px;font-weight:600;color:var(--muted);white-space:nowrap}
+.matrix tbody th{font-size:13px;font-weight:400;color:var(--text-2)}
+.matrix td{height:56px;padding:0 24px 0 0;vertical-align:middle;white-space:nowrap}
+.matrix tbody tr>*{border-top:1px solid var(--line-in)}
+.matrix .field,.matrix .pick{width:144px}
+.matrix .na{color:var(--muted)}
+.matrix .duo{display:inline-flex;gap:16px;vertical-align:middle}
+.flows{display:flex;flex-wrap:wrap;align-items:flex-start;gap:32px 48px;margin-top:32px}
+.flows figure{margin:0;display:flex;flex-direction:column;gap:12px;max-width:100%;min-width:0}
+.flows figcaption{font-size:13px;line-height:1.4;color:var(--muted);max-width:40ch}
+.steps{display:flex;flex-wrap:wrap;align-items:center;gap:12px 24px}
+.steps>div{display:flex;flex-direction:column;align-items:flex-start;gap:8px}
+.steps .lbl{font-size:12px;font-weight:600;line-height:1.4;color:var(--muted)}
+.skel-box{width:360px;max-width:100%;border:1px solid var(--line);border-radius:10px;background:var(--surface);overflow:hidden}
+.skel-box .tbl td{height:44px}
+.skel{display:block;height:12px;border-radius:2px;background:var(--skel)}
+.skel-box .small{padding:12px 24px;border-top:1px solid var(--line-in)}
+.tipdemo{display:flex;align-items:center;gap:8px}
 
 /* Under 1400px the detail panel stacks under the list */
 @media (max-width:1399px){.work{grid-template-columns:minmax(0,1fr)}}
 /* Under 1200px the rail keeps only its stops; a name shows on hover or focus */
 @media (max-width:1199px){
-  .cp{grid-template-columns:56px minmax(0,1fr)}
-  .rail .name,.rail .due{position:absolute;left:52px;top:50%;transform:translateY(-50%);z-index:4;padding:4px 10px 2px;background:var(--surface);border:1px solid var(--hair);border-radius:6px;box-shadow:var(--float);color:var(--text);font-weight:600;opacity:0;pointer-events:none}
+  .cp{grid-template-columns:48px minmax(0,1fr)}
+  .rail ol::before{left:22px}
+  .rail button{width:32px;padding:0 4px}
+  .rail .name{position:absolute;left:calc(100% + 12px);top:4px;z-index:4;display:flex;align-items:center;height:32px;padding:0 12px;background:var(--raise);border-radius:6px;box-shadow:var(--float);color:var(--text);font-weight:600;opacity:0;visibility:hidden;pointer-events:none;transition:opacity var(--t),visibility 0s linear 120ms}
   .rail .due{display:none}
-  .rail button:hover .name,.rail button:focus-visible .name{opacity:1}
+  .rail button:is(:hover,:focus-visible) .name{opacity:1;visibility:visible;transition:opacity var(--t)}
 }
 /* Phone: the rail becomes a bottom bar */
 @media (max-width:719px){
-  .doc{padding:0 16px 120px}
+  .doc{padding:0 16px 48px}
   .doc-head{padding-top:32px}
   .doc-head h1{font-size:29px}
+  .part>h2{font-size:23px}
   .cp{grid-template-columns:minmax(0,1fr)}
-  .rail{order:2;position:sticky;bottom:0;z-index:6;overflow-x:auto;padding:8px 8px 6px;border-right:0;border-top:1px solid var(--hair);border-radius:0 0 10px 10px}
+  .rail{order:2;position:sticky;bottom:0;z-index:6;overflow-x:auto;padding:8px 8px 4px;border-right:0;border-top:1px solid var(--line);border-radius:0 0 10px 10px}
   .rail ol{display:flex;width:max-content}
   .rail ol::before{left:32px;right:32px;top:10px;bottom:auto;width:auto;height:4px}
-  .rail button{flex-direction:column;gap:2px;width:64px;height:auto;padding:0 0 2px}
-  .rail .name{position:static;transform:none;opacity:1;padding:0;border:0;background:none;box-shadow:none;font-size:12px;font-weight:400;color:var(--muted)}
-  .rail [aria-selected="true"] .name{color:var(--text)}
+  .rail button{flex-direction:column;gap:4px;width:64px;height:auto;margin:0;padding:0 0 4px}
+  .rail .name{position:static;display:block;height:auto;padding:0;background:none;box-shadow:none;font-size:12px;font-weight:400;color:var(--muted);opacity:1;visibility:visible}
+  .rail [aria-selected="true"] .name{color:var(--text);font-weight:600}
   .bar,.tbar{border-radius:10px 10px 0 0;padding:12px 16px}
+  /* The context wraps here, and a separator would start a line */
+  .ctx>*+*{padding-left:0;border-left:0}
   .who{margin-left:0}
   .work{padding:12px}
   .detail{padding:20px 16px}
-  .list .phead,.list>.hint{padding:0 16px}
-  .list .phead{padding-top:16px}
+  .list .phead{padding:16px 16px 0}
+  .list>.hint{padding:0 16px}
+  .list-foot{padding:12px 16px}
   .facts{grid-template-columns:repeat(2,minmax(0,1fr))}
   .checks,.limits{grid-template-columns:minmax(0,1fr)}
-  .hroute{padding:16px 8px 4px}
+  .hroute{padding:16px 8px 8px}
   .tn-main{padding:16px 12px 20px}
   .pad{padding:20px 16px}
+  .keys-head{padding:20px 16px 16px}
   .amt{font-size:36px}
+  .amt .cur{font-size:23px}
   .levels .lv{white-space:normal;height:auto;min-height:24px}
-  .levels::before{top:auto;display:none}
-  .levels{grid-template-columns:minmax(0,1fr);gap:14px;border-left:2px solid var(--route);margin-left:9px;padding-left:0}
-  .levels li{display:grid;grid-template-columns:20px minmax(0,1fr);column-gap:12px;margin-left:-11px;padding-right:0}
-  .levels .box{grid-row:1/span 3;grid-column:1}
+  .levels::before{display:none}
+  .levels{grid-template-columns:minmax(0,1fr);gap:16px}
+  .levels li{position:relative;display:grid;grid-template-columns:20px minmax(0,1fr);column-gap:12px;row-gap:4px;padding-right:0}
+  /* The stop's box is as tall as its label line, so the stop centres on the label; a segment joins each stop to the next */
+  .levels .box{grid-row:1/span 3;grid-column:1;height:24px}
+  .levels li:not(:last-child)::before{content:"";position:absolute;left:9px;top:12px;width:2px;height:calc(100% + 16px);background:var(--route)}
   .levels li>:not(.box){grid-column:2}
   .row{grid-template-columns:minmax(0,1fr)}
   .tbl th:first-child,.tbl td:first-child{padding-left:16px}
   .tbl th:last-child,.tbl td:last-child{padding-right:16px}
+  .mini th:first-child,.mini td:first-child{padding-left:0}
+  .mini th:last-child,.mini td:last-child{padding-right:0}
+  .empty{padding:48px 16px}
 }
 @media (prefers-reduced-motion:reduce){*,*::before,*::after{animation:none!important;transition:none!important}}
 </style>
 </head>
 <body>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false">
+  <symbol id="i-refresh" viewBox="0 0 16 16"><path d="M13.25 8a5.25 5.25 0 1 1-1.54-3.71"/><path d="M11.75 1.75v2.5h-2.5"/></symbol>
+  <symbol id="i-copy" viewBox="0 0 16 16"><rect x="5.75" y="5.75" width="7.5" height="7.5" rx="1.5"/><path d="M10.25 5.75v-1.5a1.5 1.5 0 0 0-1.5-1.5h-4.5a1.5 1.5 0 0 0-1.5 1.5v4.5a1.5 1.5 0 0 0 1.5 1.5h1.5"/></symbol>
+  <symbol id="i-close" viewBox="0 0 16 16"><path d="M4.25 4.25l7.5 7.5M11.75 4.25l-7.5 7.5"/></symbol>
+  <symbol id="i-external" viewBox="0 0 16 16"><path d="M9.75 2.75h3.5v3.5M13.25 2.75 7.75 8.25"/><path d="M12.25 9.25v2.5a1.5 1.5 0 0 1-1.5 1.5h-6.5a1.5 1.5 0 0 1-1.5-1.5v-6.5a1.5 1.5 0 0 1 1.5-1.5h2.5"/></symbol>
+  <symbol id="i-check" viewBox="0 0 16 16"><path d="M3.25 8.5l3 3 6.5-6.75"/></symbol>
+  <symbol id="i-key" viewBox="0 0 32 32"><circle cx="11.25" cy="11.25" r="6.75"/><circle cx="11.25" cy="11.25" r="2"/><path d="M16 16l11.5 11.5M22.5 22.5l-3 3M25.75 25.75l-2.5 2.5"/></symbol>
+</svg>
+
 <div class="doc">
 <header class="doc-head">
   <div>
@@ -319,14 +505,14 @@ code,.id{font-family:var(--mono);font-size:.92em}
 
     <div class="cp-main">
       <header class="bar">
-        <span class="mark">routio</span><span class="app">Dashboard</span>
+        <span class="brand"><span class="mark">routio</span><span class="app">Dashboard</span></span>
         <div class="ctx">
           <span>环境 <code>prod-east</code></span>
           <span>控制面 v1.9.2</span>
-          <span><span class="lamp ok pulse" title="配置下发状态">已生效</span> <span class="small">在线网关 14</span></span>
+          <span class="fleet"><span class="lamp ok pulse" title="配置下发状态">已生效</span><span class="small">在线网关 14</span></span>
         </div>
         <div class="who">
-          <span>宋砚（运维）</span>
+          <span class="who1">宋砚<span class="tag">运维</span></span>
           <button type="button" class="btn quiet sm" data-theme-toggle aria-label="切换到深色">深色</button>
           <button type="button" class="btn quiet sm">修改口令</button>
           <button type="button" class="btn quiet sm">登出</button>
@@ -341,7 +527,7 @@ code,.id{font-family:var(--mono);font-size:.92em}
               <label class="inline">按状态筛选
                 <select class="pick sm"><option>全部</option><option>待审核</option><option>正常</option><option>已停用</option></select>
               </label>
-              <button type="button" class="btn sec sm">刷新</button>
+              <button type="button" class="btn sec sm" data-busy><svg class="i" aria-hidden="true"><use href="#i-refresh"/></svg>刷新</button>
               <button type="button" class="btn sec sm">新租户默认值</button>
             </div>
           </div>
@@ -350,37 +536,38 @@ code,.id{font-family:var(--mono);font-size:.92em}
             <table class="tbl tenants" aria-label="租户列表">
               <thead><tr><th>名称</th><th>状态</th><th>计费方式</th><th>可用分组</th><th class="r">成员</th><th class="r">密钥</th><th>下发</th><th class="r">操作</th></tr></thead>
               <tbody>
-                <tr class="sel"><td><button type="button" class="tname">北辰数据</button></td><td><span class="lamp ok">正常</span></td><td>预付费</td>
-                  <td><span class="grps"><span class="grp" style="--c:var(--l1)">shared</span><span class="grp" style="--c:var(--l5)">apac-low</span></span></td>
+                <tr class="sel"><td><div class="nm"><button type="button" class="tname">北辰数据</button></div></td><td><span class="lamp ok">正常</span></td><td>预付费</td>
+                  <td><span class="grps one"><span class="grp" style="--c:var(--l1)">shared</span><span class="tag more" title="另有 apac-low">+1<span class="vh">：apac-low</span></span></span></td>
                   <td class="r">8</td><td class="r">12</td><td><span class="lamp ok">已生效</span></td><td><div class="acts"><button type="button" class="btn sec sm">停用</button></div></td></tr>
-                <tr><td><button type="button" class="tname">Kestrel Labs</button></td><td><span class="lamp wait">待审核</span></td><td>预付费</td>
+                <tr><td><div class="nm"><button type="button" class="tname">Kestrel Labs</button></div></td><td><span class="lamp wait">待审核</span></td><td>预付费</td>
                   <td><span class="grps"><span class="grp" style="--c:var(--l1)">shared</span></span></td>
                   <td class="r">1</td><td class="r">0</td><td><span class="lamp ok">已生效</span></td><td><div class="acts"><button type="button" class="btn sec sm">批准</button></div></td></tr>
-                <tr><td><button type="button" class="tname">青禾教育</button></td><td><span class="lamp ok">正常</span></td><td>后付费</td>
-                  <td><span class="grps"><span class="grp" style="--c:var(--l1)">shared</span><span class="grp" style="--c:var(--l4)">eu-pool</span></span></td>
+                <tr><td><div class="nm"><button type="button" class="tname">青禾教育</button></div></td><td><span class="lamp ok">正常</span></td><td>后付费</td>
+                  <td><span class="grps one"><span class="grp" style="--c:var(--l1)">shared</span><span class="tag more" title="另有 eu-pool">+1<span class="vh">：eu-pool</span></span></span></td>
                   <td class="r">23</td><td class="r">41</td><td><span class="lamp info pulse">下发中 9/14</span></td><td><div class="acts"><button type="button" class="btn sec sm">停用</button></div></td></tr>
-                <tr><td><button type="button" class="tname">routio 运维</button><span class="tag">平台内部</span></td><td><span class="lamp ok">正常</span></td><td>后付费</td>
+                <tr><td><div class="nm"><button type="button" class="tname">routio 运维</button><span class="tag">平台内部</span></div></td><td><span class="lamp ok">正常</span></td><td>后付费</td>
                   <td><span class="small">全部上游</span></td>
-                  <td class="r">0</td><td class="r">6</td><td><span class="lamp ok">已生效</span></td><td></td></tr>
-                <tr><td><button type="button" class="tname">远岸物流</button></td><td><span class="lamp ok">正常</span></td><td>预付费</td>
+                  <td class="r">0</td><td class="r">6</td><td><span class="lamp ok">已生效</span></td>
+                  <td><div class="acts"><span class="has-tip"><button type="button" class="btn sec sm" aria-disabled="true" aria-describedby="tip-int">停用</button><span class="tip" role="tooltip" id="tip-int">平台内部租户不能停用</span></span></div></td></tr>
+                <tr><td><div class="nm"><button type="button" class="tname">远岸物流</button></div></td><td><span class="lamp ok">正常</span></td><td>预付费</td>
                   <td><span class="grps"><span class="grp" style="--c:var(--l3)">batch</span></span></td>
-                  <td class="r">4</td><td class="r">3</td><td><span class="lamp crit">被拒绝</span><span class="note"><code>gw-east-07</code>：分组 batch 不存在</span></td><td><div class="acts"><button type="button" class="btn sec sm">停用</button></div></td></tr>
-                <tr><td><button type="button" class="tname">Lumen Atlas</button></td><td><span class="lamp off">已停用</span></td><td>预付费</td>
+                  <td class="r">4</td><td class="r">3</td><td><span class="lamp crit">被拒绝</span><span class="note"><code>gw-east-07</code>：<span class="nw">分组 batch 不存在</span></span></td><td><div class="acts"><button type="button" class="btn sec sm">停用</button></div></td></tr>
+                <tr><td><div class="nm"><button type="button" class="tname">Lumen Atlas</button></div></td><td><span class="lamp off">已停用</span></td><td>预付费</td>
                   <td><span class="grps"><span class="grp" style="--c:var(--l1)">shared</span></span></td>
                   <td class="r">5</td><td class="r">7</td><td><span class="lamp ok">已生效</span></td><td><div class="acts"><button type="button" class="btn sec sm">恢复</button></div></td></tr>
-                <tr><td><button type="button" class="tname">Fernhill</button></td><td><span class="lamp wait">待审核</span></td><td>后付费</td>
+                <tr><td><div class="nm"><button type="button" class="tname">Fernhill</button></div></td><td><span class="lamp wait">待审核</span></td><td>后付费</td>
                   <td><span class="grps"><span class="grp" style="--c:var(--l1)">shared</span></span></td>
                   <td class="r">1</td><td class="r">0</td><td><span class="lamp wait">待下发</span></td><td><div class="acts"><button type="button" class="btn sec sm">批准</button></div></td></tr>
-                <tr><td><button type="button" class="tname">墨点科技</button></td><td><span class="lamp ok">正常</span></td><td>预付费</td>
-                  <td><span class="grps"><span class="grp" style="--c:var(--l1)">shared</span><span class="grp" style="--c:var(--l5)">apac-low</span><span class="grp" style="--c:var(--l3)">batch</span></span></td>
+                <tr><td><div class="nm"><button type="button" class="tname">墨点科技</button></div></td><td><span class="lamp ok">正常</span></td><td>预付费</td>
+                  <td><span class="grps one"><span class="grp" style="--c:var(--l1)">shared</span><span class="tag more" title="另有 apac-low、batch">+2<span class="vh">：apac-low、batch</span></span></span></td>
                   <td class="r">11</td><td class="r">19</td><td><span class="lamp ok">已生效</span></td><td><div class="acts"><button type="button" class="btn sec sm">停用</button></div></td></tr>
-                <tr><td><button type="button" class="tname">澄江影像</button></td><td><span class="lamp ok">正常</span></td><td>预付费</td>
+                <tr><td><div class="nm"><button type="button" class="tname">澄江影像</button></div></td><td><span class="lamp ok">正常</span></td><td>预付费</td>
                   <td><span class="grps"><span class="grp" style="--c:var(--l4)">eu-pool</span></span></td>
                   <td class="r">6</td><td class="r">9</td><td><span class="lamp ok">已生效</span></td><td><div class="acts"><button type="button" class="btn sec sm">停用</button></div></td></tr>
-                <tr><td><button type="button" class="tname">Quarry Lane</button></td><td><span class="lamp ok">正常</span></td><td>后付费</td>
-                  <td><span class="grps"><span class="grp" style="--c:var(--l1)">shared</span><span class="grp" style="--c:var(--l4)">eu-pool</span></span></td>
+                <tr><td><div class="nm"><button type="button" class="tname">Quarry Lane Research Collective</button></div></td><td><span class="lamp ok">正常</span></td><td>后付费</td>
+                  <td><span class="grps one"><span class="grp" style="--c:var(--l1)">shared</span><span class="tag more" title="另有 eu-pool">+1<span class="vh">：eu-pool</span></span></span></td>
                   <td class="r">14</td><td class="r">22</td><td><span class="lamp ok">已生效</span></td><td><div class="acts"><button type="button" class="btn sec sm">停用</button></div></td></tr>
-                <tr><td><button type="button" class="tname">云帆出行</button></td><td><span class="lamp off">已停用</span></td><td>预付费</td>
+                <tr><td><div class="nm"><button type="button" class="tname">云帆出行</button></div></td><td><span class="lamp off">已停用</span></td><td>预付费</td>
                   <td><span class="grps"><span class="grp" style="--c:var(--l1)">shared</span></span></td>
                   <td class="r">2</td><td class="r">1</td><td><span class="lamp ok">已生效</span></td><td><div class="acts"><button type="button" class="btn sec sm">恢复</button></div></td></tr>
               </tbody>
@@ -392,7 +579,7 @@ code,.id{font-family:var(--mono);font-size:.92em}
         <section class="panel detail in" id="detail" aria-label="租户详情：北辰数据">
           <div class="dhead">
             <h2 id="d-name">北辰数据</h2><span id="d-roll"><span class="lamp ok">已生效</span></span>
-            <button type="button" class="btn quiet sm" data-close>关闭</button>
+            <button type="button" class="btn quiet sm icon" data-close aria-label="关闭" title="关闭"><svg class="i" aria-hidden="true"><use href="#i-close"/></svg></button>
           </div>
           <dl class="facts">
             <div><dt>状态</dt><dd id="d-st"><span class="lamp ok">正常</span></dd></div>
@@ -405,54 +592,54 @@ code,.id{font-family:var(--mono);font-size:.92em}
             <legend>授权模型</legend>
             <p class="hint">租户只能使用这里授权的模型，按平台名称调用；改名不影响授权。</p>
             <ul class="checks">
-              <li><label><input type="checkbox" checked>chat-large</label></li>
-              <li><label><input type="checkbox" checked>chat-small</label></li>
-              <li><label><input type="checkbox" checked>embed-v3</label></li>
-              <li><label><input type="checkbox">vision-2</label></li>
-              <li><label><input type="checkbox" checked>code-plus</label></li>
-              <li><label><input type="checkbox">rerank-1</label></li>
+              <li><label><input class="cb" type="checkbox" checked>chat-large</label></li>
+              <li><label><input class="cb" type="checkbox" checked>chat-small</label></li>
+              <li><label><input class="cb" type="checkbox" checked>embed-v3</label></li>
+              <li><label><input class="cb" type="checkbox">vision-2</label></li>
+              <li><label><input class="cb" type="checkbox" checked>code-plus</label></li>
+              <li><label><input class="cb" type="checkbox">rerank-1</label></li>
             </ul>
-            <button type="button" class="btn sec">保存授权</button>
+            <div class="save"><button type="button" class="btn sec" data-save="已保存授权">保存授权</button><span class="small dirty" hidden>有未保存的修改</span></div>
           </fieldset>
 
           <fieldset class="part-f">
             <legend>可用分组</legend>
             <ul class="checks one">
-              <li><label><input type="checkbox" checked><span class="grp" style="--c:var(--l1)">shared</span></label><span class="note">上游账号：pool-a-01、pool-a-02、pool-a-03</span></li>
-              <li><label><input type="checkbox" checked><span class="grp" style="--c:var(--l5)">apac-low</span></label><span class="note">上游账号：pool-c-01</span></li>
-              <li><label><input type="checkbox"><span class="grp" style="--c:var(--l4)">eu-pool</span></label><span class="note">上游账号：pool-e-01、pool-e-02</span></li>
-              <li><label><input type="checkbox"><span class="grp" style="--c:var(--l3)">batch</span></label><span class="note">没有上游账号在此分组</span></li>
+              <li><label><input class="cb" type="checkbox" checked><span class="grp" style="--c:var(--l1)">shared</span></label><span class="note">上游账号：<span class="nw">pool-a-01</span>、<span class="nw">pool-a-02</span>、<span class="nw">pool-a-03</span></span></li>
+              <li><label><input class="cb" type="checkbox" checked><span class="grp" style="--c:var(--l5)">apac-low</span></label><span class="note">上游账号：<span class="nw">pool-c-01</span></span></li>
+              <li><label><input class="cb" type="checkbox"><span class="grp" style="--c:var(--l4)">eu-pool</span></label><span class="note">上游账号：<span class="nw">pool-e-01</span>、<span class="nw">pool-e-02</span></span></li>
+              <li><label><input class="cb" type="checkbox"><span class="grp" style="--c:var(--l3)">batch</span></label><span class="note">没有上游账号在此分组</span></li>
             </ul>
-            <button type="button" class="btn sec">保存分组</button>
+            <div class="save"><button type="button" class="btn sec" data-save="已保存分组">保存分组</button><span class="small dirty" hidden>有未保存的修改</span></div>
           </fieldset>
 
           <fieldset class="part-f">
             <legend>限额</legend>
             <p class="hint">前三项限制整个租户；后两项是单个密钥最多能设的值。留空表示不限。</p>
             <div class="limits">
-              <label class="f"><span>租户并发</span><input class="field money" type="number" value="200"></label>
-              <label class="f"><span>租户每分钟请求</span><input class="field money" type="number" value="3000"></label>
-              <label class="f"><span>租户每分钟 token</span><input class="field money" type="number" value="2000000"></label>
-              <label class="f"><span>单 key 并发上限</span><input class="field money" type="number" placeholder="不限"></label>
-              <label class="f"><span>单 key 每分钟请求上限</span><input class="field money" type="number" value="600"></label>
+              <label class="f"><span>租户并发</span><input class="field" type="number" value="200"></label>
+              <label class="f"><span>租户每分钟请求</span><input class="field" type="number" value="3000"></label>
+              <label class="f"><span>租户每分钟 token</span><input class="field" type="number" value="2000000"></label>
+              <label class="f"><span>单 key 并发上限</span><input class="field" type="number" placeholder="不限"></label>
+              <label class="f"><span>单 key 每分钟请求上限</span><input class="field" type="number" value="600"></label>
             </div>
-            <div class="save"><button type="button" class="btn pri" data-toast="已保存限额">保存限额</button><span class="small">有未保存的修改</span></div>
+            <div class="save"><button type="button" class="btn pri" data-save="已保存限额">保存限额</button><span class="small dirty">有未保存的修改</span></div>
           </fieldset>
 
-          <section class="part-f" aria-labelledby="d-members">
+          <section class="part-f sep" aria-labelledby="d-members">
             <h3 id="d-members">成员</h3>
-            <div class="scroll pop-room"><table class="tbl mini" aria-label="成员">
-              <thead><tr><th>名称</th><th>邮箱</th><th>角色</th><th>状态</th><th class="r">操作</th></tr></thead>
+            <div class="scroll bleed"><table class="tbl mini" aria-label="成员">
+              <thead><tr><th>名称</th><th>状态</th><th class="r">操作</th></tr></thead>
               <tbody>
-                <tr><td>周岚</td><td>lan@bcd.example</td><td>所有者</td><td><span class="lamp ok">正常</span></td><td></td></tr>
-                <tr><td>陈一舟</td><td>yz@bcd.example</td><td>管理员</td><td><span class="lamp ok">正常</span></td><td class="r"><button type="button" class="btn sec sm">停用</button></td></tr>
-                <tr><td>林栖</td><td>qi@bcd.example</td><td>成员</td><td id="qi-st"><span class="lamp ok">正常</span></td>
-                  <td class="r anchor"><button type="button" class="btn sec sm" id="ask" aria-expanded="true" aria-controls="pop">停用</button>
-                    <span class="pop" id="pop" role="group" aria-label="停用 林栖">
-                      <button type="button" class="btn crit sm" data-confirm>确认停用</button>
-                      <button type="button" class="btn sec sm" data-cancel>取消</button>
-                    </span></td></tr>
-                <tr><td>何苗</td><td>miao@bcd.example</td><td>计费</td><td><span class="lamp off">已停用</span></td><td class="r"><button type="button" class="btn sec sm">启用</button></td></tr>
+                <tr><td><span class="mem"><span class="who1">周岚<span class="tag">所有者</span></span><span class="note">lan@bcd.example</span></span></td><td><span class="lamp ok">正常</span></td>
+                  <td class="r"><div class="acts"><span class="has-tip"><button type="button" class="btn sec sm" aria-disabled="true" aria-describedby="tip-owner">停用</button><span class="tip" role="tooltip" id="tip-owner">所有者不能停用，先转让所有权</span></span></div></td></tr>
+                <tr><td><span class="mem"><span class="who1">陈一舟<span class="tag">管理员</span></span><span class="note">yz@bcd.example</span></span></td><td><span class="lamp ok">正常</span></td><td class="r"><div class="acts"><button type="button" class="btn sec sm">停用</button></div></td></tr>
+                <tr><td><span class="mem"><span class="who1">林栖<span class="tag">成员</span></span><span class="note">qi@bcd.example</span></span></td><td id="qi-st"><span class="lamp ok">正常</span></td>
+                  <td class="r"><div class="acts"><span class="two" id="two" data-step="2">
+                    <span class="two-a"><button type="button" class="btn sec sm" data-ask>停用</button></span>
+                    <span class="two-b" role="group" aria-label="停用 林栖"><button type="button" class="btn crit sm" data-confirm>确认停用</button><button type="button" class="btn sec sm" data-cancel>取消</button></span>
+                  </span></div></td></tr>
+                <tr><td><span class="mem"><span class="who1">何苗<span class="tag">计费</span></span><span class="note">miao@bcd.example</span></span></td><td><span class="lamp off">已停用</span></td><td class="r"><div class="acts"><button type="button" class="btn sec sm">启用</button></div></td></tr>
               </tbody>
             </table></div>
           </section>
@@ -470,9 +657,9 @@ code,.id{font-family:var(--mono);font-size:.92em}
   <p class="cap">账户</p>
   <div class="screen tn">
     <header class="tbar">
-      <span class="mark">routio</span><span class="app">组织门户</span>
+      <span class="brand"><span class="mark">routio</span><span class="app">组织门户</span></span>
       <div class="ctx"><span>北辰数据</span></div>
-      <div class="who"><span>周岚（所有者）</span><button type="button" class="btn quiet sm">登出</button></div>
+      <div class="who"><span class="who1">周岚<span class="tag">所有者</span></span><button type="button" class="btn quiet sm">登出</button></div>
     </header>
     <nav class="hroute" aria-label="组织门户分区">
       <ol role="tablist" aria-label="组织门户分区">
@@ -487,20 +674,20 @@ code,.id{font-family:var(--mono);font-size:.92em}
     <div class="tn-main">
       <section class="panel pad" aria-labelledby="bal">
         <div class="phead"><h2 id="bal">余额</h2><button type="button" class="btn pri">申请充值</button></div>
-        <label class="inline">按密钥查看
+        <label class="inline" style="margin-top:8px">按密钥查看
           <select class="pick sm"><option>prod-backend</option><option>ci-runner</option><option>nightly-eval</option></select>
         </label>
         <div class="readout">
           <p class="rl">这把密钥现在还能花</p>
-          <p class="amt money">$412.80</p>
+          <p class="amt money"><span class="cur">$</span>412.80</p>
           <span class="lamp ok">可正常调用</span>
         </div>
         <ol class="levels" aria-label="每一级还剩多少">
-          <li><span class="lv">组织</span><span class="box"><span class="stop"></span></span><span class="m money">$2,418.36</span><span class="k">组织余额</span></li>
-          <li class="bind"><span class="lv">成员 周岚 <span class="plate">以此为准</span></span><span class="box"><span class="stop"></span></span><span class="m money">$412.80</span><span class="k">本月预算剩余，限额 $600.00</span></li>
-          <li><span class="lv">密钥 prod-backend</span><span class="box"><span class="stop"></span></span><span class="m money">$1,250.00</span><span class="k">本月预算剩余，限额 $1,500.00</span></li>
+          <li><span class="lv">组织</span><span class="box"><span class="stop"></span></span><span class="m money"><span class="cur">$</span>2,418.36</span><span class="k">组织余额</span></li>
+          <li class="bind"><span class="lv">成员 周岚 <span class="plate">以此为准</span></span><span class="box"><span class="stop"></span></span><span class="m money"><span class="cur">$</span>412.80</span><span class="k">本月预算剩余，限额 <span class="cur">$</span>600.00</span></li>
+          <li><span class="lv">密钥 prod-backend</span><span class="box"><span class="stop"></span></span><span class="m money"><span class="cur">$</span>1,250.00</span><span class="k">本月预算剩余，限额 <span class="cur">$</span>1,500.00</span></li>
         </ol>
-        <p class="bal-foot">待审批的充值 1 笔，金额 $500.00，提交于 2026-11-05。</p>
+        <p class="bal-foot">待审批的充值 1 笔，金额 <span class="money"><span class="cur">$</span>500.00</span>，<span class="nw">提交于 2026-11-05</span>。</p>
       </section>
     </div>
   </div>
@@ -519,20 +706,20 @@ code,.id{font-family:var(--mono);font-size:.92em}
     </nav>
     <div class="tn-main">
       <section class="panel" aria-labelledby="keys-h">
-        <div class="phead pad" style="padding-bottom:16px;margin:0"><h2 id="keys-h">密钥</h2><button type="button" class="btn pri">新建密钥</button></div>
+        <div class="phead keys-head"><h2 id="keys-h">密钥</h2><a class="lnk" href="#" data-mock>接入文档<svg class="i" aria-hidden="true"><use href="#i-external"/></svg></a><button type="button" class="btn pri">新建密钥</button></div>
         <div class="scroll">
-          <table class="tbl" aria-label="密钥" style="border-top:1px solid var(--hair)">
+          <table class="tbl" aria-label="密钥" style="border-top:1px solid var(--line-in)">
             <thead><tr><th>名称</th><th>前缀</th><th>归属</th><th>模型</th><th>限制</th><th>状态</th><th><span class="vh">操作</span></th></tr></thead>
             <tbody>
-              <tr><td>prod-backend</td><td class="id">rt_live_8f2c…</td><td>我</td><td>全部授权模型</td><td>并发 20<span class="note">每分钟 600</span></td><td><span class="lamp ok">可用</span></td>
+              <tr><td>prod-backend</td><td><span class="idc"><code class="id">rt_live_8f2c…</code><button type="button" class="copy" data-copy="rt_live_8f2c" aria-label="复制前缀 rt_live_8f2c"><svg class="i ic-copy" aria-hidden="true"><use href="#i-copy"/></svg><svg class="i ic-done" aria-hidden="true"><use href="#i-check"/></svg><span class="done-l">已复制</span></button></span></td><td>我</td><td>全部授权模型</td><td>并发 20<span class="note">每分钟 600</span></td><td><span class="lamp ok">可用</span></td>
                 <td><div class="acts"><button type="button" class="btn sec sm">停用</button><button type="button" class="btn sec sm">吊销</button></div></td></tr>
-              <tr><td>ci-runner</td><td class="id">rt_live_31aa…</td><td>陈一舟</td><td>chat-small、embed-v3</td><td>并发 4<span class="note">每分钟 120</span></td><td><span class="lamp ok">可用</span><span class="note">2026-12-31 到期</span></td>
+              <tr><td>ci-runner</td><td><span class="idc"><code class="id">rt_live_31aa…</code><button type="button" class="copy" data-copy="rt_live_31aa" aria-label="复制前缀 rt_live_31aa"><svg class="i ic-copy" aria-hidden="true"><use href="#i-copy"/></svg><svg class="i ic-done" aria-hidden="true"><use href="#i-check"/></svg><span class="done-l">已复制</span></button></span></td><td>陈一舟</td><td>chat-small、embed-v3</td><td>并发 4<span class="note">每分钟 120</span></td><td><span class="lamp ok">可用</span><span class="note">2026-12-31 到期</span></td>
                 <td><div class="acts"><button type="button" class="btn sec sm">停用</button><button type="button" class="btn sec sm">吊销</button></div></td></tr>
-              <tr><td>staging</td><td class="id">rt_live_c07e…</td><td>组织</td><td>全部授权模型</td><td>不限</td><td><span class="lamp off">已停用</span></td>
+              <tr><td>staging</td><td><span class="idc"><code class="id">rt_live_c07e…</code><button type="button" class="copy" data-copy="rt_live_c07e" aria-label="复制前缀 rt_live_c07e"><svg class="i ic-copy" aria-hidden="true"><use href="#i-copy"/></svg><svg class="i ic-done" aria-hidden="true"><use href="#i-check"/></svg><span class="done-l">已复制</span></button></span></td><td>组织</td><td>全部授权模型</td><td>不限</td><td><span class="lamp off">已停用</span></td>
                 <td><div class="acts"><button type="button" class="btn sec sm">启用</button><button type="button" class="btn sec sm">吊销</button></div></td></tr>
-              <tr><td>legacy-import</td><td class="id">rt_live_5b19…</td><td>林栖</td><td>chat-large</td><td>不限</td><td><span class="lamp off">已被平台停用</span><span class="note">只有平台可以重新启用</span></td>
+              <tr><td>legacy-import</td><td><span class="idc"><code class="id">rt_live_5b19…</code><button type="button" class="copy" data-copy="rt_live_5b19" aria-label="复制前缀 rt_live_5b19"><svg class="i ic-copy" aria-hidden="true"><use href="#i-copy"/></svg><svg class="i ic-done" aria-hidden="true"><use href="#i-check"/></svg><span class="done-l">已复制</span></button></span></td><td>林栖</td><td>chat-large</td><td>不限</td><td><span class="lamp off">已被平台停用</span><span class="note">只有平台可以重新启用</span></td>
                 <td><div class="acts"><button type="button" class="btn sec sm">吊销</button></div></td></tr>
-              <tr><td>nightly-eval</td><td class="id">rt_live_e4d0…</td><td>我</td><td>chat-large、code-plus</td><td>每分钟 60</td><td><span class="lamp off">已过期</span></td>
+              <tr><td>nightly-eval</td><td><span class="idc"><code class="id">rt_live_e4d0…</code><button type="button" class="copy" data-copy="rt_live_e4d0" aria-label="复制前缀 rt_live_e4d0"><svg class="i ic-copy" aria-hidden="true"><use href="#i-copy"/></svg><svg class="i ic-done" aria-hidden="true"><use href="#i-check"/></svg><span class="done-l">已复制</span></button></span></td><td>我</td><td>chat-large、code-plus</td><td>每分钟 60</td><td><span class="lamp off">已过期</span></td>
                 <td><div class="acts"><button type="button" class="btn sec sm">停用</button><button type="button" class="btn sec sm">吊销</button></div></td></tr>
             </tbody>
           </table>
@@ -543,9 +730,13 @@ code,.id{font-family:var(--mono);font-size:.92em}
 
   <p class="cap">空状态：成员第一次打开密钥页</p>
   <div class="screen tn"><div class="tn-main">
-    <section class="panel pad" aria-labelledby="keys-empty">
-      <h2 id="keys-empty" style="font-size:23px">密钥</h2>
-      <div class="empty"><p>还没有密钥。新建一个，就能用它调用组织获授权的模型。</p><button type="button" class="btn pri">新建密钥</button></div>
+    <section class="panel" aria-labelledby="keys-empty">
+      <div class="phead keys-head"><h2 id="keys-empty">密钥</h2></div>
+      <div class="empty">
+        <svg class="i i-32" aria-hidden="true"><use href="#i-key"/></svg>
+        <p>还没有密钥。新建一个，就能用它调用组织获授权的模型。</p>
+        <button type="button" class="btn pri">新建密钥</button>
+      </div>
     </section>
   </div></div>
 </section>
@@ -553,31 +744,169 @@ code,.id{font-family:var(--mono);font-size:.92em}
 <!-- ───────────── Part 3: component sheet ───────────── -->
 <section class="part" aria-labelledby="p3">
   <h2 id="p3">组件</h2>
-  <p class="hint">两个应用各自实现一份，约定相同。圆角随层级变化：输入框与表格行 2px，按钮 6px，面板与对话框 10px，只有信号灯和站点是正圆。阴影只给浮层。</p>
+  <p class="hint">两个应用各自实现一份，约定相同。圆角随层级变化：输入框与表格行 2px，按钮与标签 6px，面板与对话框 10px，只有信号灯和站点是正圆。阴影只给浮层。</p>
   <div class="sheet">
     <div class="row"><h3>按钮</h3><div class="spec">
       <figure><button type="button" class="btn pri" data-toast="已保存限额">保存限额</button><figcaption>主要：站牌黄底，墨色字</figcaption></figure>
-      <figure><button type="button" class="btn sec">刷新</button><figcaption>次要：墨色描边</figcaption></figure>
+      <figure><button type="button" class="btn sec" data-busy><svg class="i" aria-hidden="true"><use href="#i-refresh"/></svg>刷新</button><figcaption>次要：墨色描边</figcaption></figure>
       <figure><div class="pair"><button type="button" class="btn crit">确认停用</button><button type="button" class="btn sec">取消</button></div><figcaption>危险操作的第二步才变红</figcaption></figure>
       <figure><button type="button" class="btn sec is-focus">新建密钥</button><figcaption>键盘焦点</figcaption></figure>
       <figure><button type="button" class="btn pri" disabled>保存分组</button><figcaption>不可用</figcaption></figure>
     </div></div>
 
     <div class="row"><h3>输入框</h3><div class="spec">
-      <label class="f"><span>租户并发</span><input class="field money" type="number" placeholder="不限"></label>
-      <label class="f"><span>每分钟请求</span><input class="field money is-focus" type="number" value="600"></label>
-      <div class="f"><label class="f" for="bad"><span>并发</span></label><input id="bad" class="field" value="2.5" aria-invalid="true" aria-describedby="bad-e"><span class="err" id="bad-e">请填整数；留空表示不单独限制</span></div>
+      <label class="f"><span>租户并发</span><input class="field" type="number" placeholder="不限"></label>
+      <label class="f"><span>每分钟请求</span><input class="field is-focus" type="number" value="600"></label>
+      <div class="f"><label for="bad">并发</label><input id="bad" class="field" value="2.5" aria-invalid="true" aria-describedby="bad-e"><span class="err" id="bad-e">请填整数；留空表示不单独限制</span></div>
     </div></div>
 
-    <div class="row"><h3>信号灯</h3><div class="spec" style="flex-direction:column;gap:14px">
+    <div class="row"><h3>选择</h3><div class="spec">
+      <figure><label class="inline">按状态筛选 <select class="pick sm"><option>全部</option><option>待审核</option><option>正常</option><option>已停用</option></select></label><figcaption>下拉：原生 select，画出的箭头</figcaption></figure>
+      <figure><div class="opts"><label class="opt"><input class="cb" type="checkbox" checked>chat-large</label><label class="opt"><input class="cb" type="checkbox">vision-2</label></div><figcaption>复选：16px，2px 圆角，选中为站牌黄底墨色勾</figcaption></figure>
+      <figure><div class="opts" role="radiogroup" aria-label="计费方式"><label class="opt"><input class="rd" type="radio" name="bill" checked>预付费</label><label class="opt"><input class="rd" type="radio" name="bill">后付费</label></div><figcaption>单选：同一套颜色，圆形</figcaption></figure>
+    </div></div>
+
+    <div class="row" id="states"><h3>状态</h3><div class="spec" style="display:block">
+      <p class="small" style="max-width:80ch">每个可交互元素都有下面这些状态，这里静态并排，便于检查。悬停是 120ms 的颜色过渡；按下再深一级并内陷 1px；键盘焦点是 2px 线路蓝描边，外扩 2px；不可用是 45% 透明，原因写在提示里；载入中由转圈替换文字，宽度不变。</p>
+      <div class="scroll bleed" style="margin-top:16px">
+      <table class="matrix" inert>
+        <thead><tr><th><span class="vh">组件</span></th><th>默认</th><th>悬停</th><th>按下</th><th>键盘焦点</th><th>不可用</th><th>载入中</th></tr></thead>
+        <tbody>
+          <tr><th>主要按钮</th>
+            <td><button type="button" class="btn pri sm">保存限额</button></td>
+            <td><button type="button" class="btn pri sm is-hover">保存限额</button></td>
+            <td><button type="button" class="btn pri sm is-active">保存限额</button></td>
+            <td><button type="button" class="btn pri sm is-focus">保存限额</button></td>
+            <td><button type="button" class="btn pri sm" disabled>保存限额</button></td>
+            <td><button type="button" class="btn pri sm is-busy" aria-busy="true">保存限额</button></td></tr>
+          <tr><th>次要按钮</th>
+            <td><button type="button" class="btn sec sm"><svg class="i" aria-hidden="true"><use href="#i-refresh"/></svg>刷新</button></td>
+            <td><button type="button" class="btn sec sm is-hover"><svg class="i" aria-hidden="true"><use href="#i-refresh"/></svg>刷新</button></td>
+            <td><button type="button" class="btn sec sm is-active"><svg class="i" aria-hidden="true"><use href="#i-refresh"/></svg>刷新</button></td>
+            <td><button type="button" class="btn sec sm is-focus"><svg class="i" aria-hidden="true"><use href="#i-refresh"/></svg>刷新</button></td>
+            <td><button type="button" class="btn sec sm" disabled><svg class="i" aria-hidden="true"><use href="#i-refresh"/></svg>刷新</button></td>
+            <td><button type="button" class="btn sec sm is-busy" aria-busy="true"><svg class="i" aria-hidden="true"><use href="#i-refresh"/></svg>刷新</button></td></tr>
+          <tr><th>轻按钮</th>
+            <td><button type="button" class="btn quiet sm">修改口令</button></td>
+            <td><button type="button" class="btn quiet sm is-hover">修改口令</button></td>
+            <td><button type="button" class="btn quiet sm is-active">修改口令</button></td>
+            <td><button type="button" class="btn quiet sm is-focus">修改口令</button></td>
+            <td><button type="button" class="btn quiet sm" disabled>修改口令</button></td>
+            <td><button type="button" class="btn quiet sm is-busy" aria-busy="true">修改口令</button></td></tr>
+          <tr><th>危险确认</th>
+            <td><button type="button" class="btn crit sm">确认停用</button></td>
+            <td><button type="button" class="btn crit sm is-hover">确认停用</button></td>
+            <td><button type="button" class="btn crit sm is-active">确认停用</button></td>
+            <td><button type="button" class="btn crit sm is-focus">确认停用</button></td>
+            <td><button type="button" class="btn crit sm" disabled>确认停用</button></td>
+            <td><button type="button" class="btn crit sm is-busy" aria-busy="true">确认停用</button></td></tr>
+          <tr><th>图标按钮</th>
+            <td><button type="button" class="btn quiet sm icon" aria-label="关闭"><svg class="i" aria-hidden="true"><use href="#i-close"/></svg></button></td>
+            <td><button type="button" class="btn quiet sm icon is-hover" aria-label="关闭"><svg class="i" aria-hidden="true"><use href="#i-close"/></svg></button></td>
+            <td><button type="button" class="btn quiet sm icon is-active" aria-label="关闭"><svg class="i" aria-hidden="true"><use href="#i-close"/></svg></button></td>
+            <td><button type="button" class="btn quiet sm icon is-focus" aria-label="关闭"><svg class="i" aria-hidden="true"><use href="#i-close"/></svg></button></td>
+            <td><button type="button" class="btn quiet sm icon" disabled aria-label="关闭"><svg class="i" aria-hidden="true"><use href="#i-close"/></svg></button></td>
+            <td><span class="na">—</span></td></tr>
+          <tr><th>名称链接</th>
+            <td><button type="button" class="tname">北辰数据</button></td>
+            <td><button type="button" class="tname is-hover">北辰数据</button></td>
+            <td><button type="button" class="tname is-hover is-active">北辰数据</button></td>
+            <td><button type="button" class="tname is-focus">北辰数据</button></td>
+            <td><span class="na">—</span></td><td><span class="na">—</span></td></tr>
+          <tr><th>输入框</th>
+            <td><input class="field" type="number" placeholder="不限"></td>
+            <td><input class="field is-hover" type="number" placeholder="不限"></td>
+            <td><span class="na">—</span></td>
+            <td><input class="field is-focus" type="number" value="600"></td>
+            <td><input class="field" type="number" value="600" disabled></td>
+            <td><span class="na">—</span></td></tr>
+          <tr><th>下拉</th>
+            <td><select class="pick sm"><option>全部</option></select></td>
+            <td><select class="pick sm is-hover"><option>全部</option></select></td>
+            <td><select class="pick sm is-active"><option>全部</option></select></td>
+            <td><select class="pick sm is-focus"><option>全部</option></select></td>
+            <td><select class="pick sm" disabled><option>全部</option></select></td>
+            <td><span class="na">—</span></td></tr>
+          <tr><th>复选框</th>
+            <td><span class="duo"><input class="cb" type="checkbox" aria-label="未选"><input class="cb" type="checkbox" checked aria-label="已选"></span></td>
+            <td><span class="duo"><input class="cb is-hover" type="checkbox" aria-label="未选"><input class="cb is-hover" type="checkbox" checked aria-label="已选"></span></td>
+            <td><span class="duo"><input class="cb is-active" type="checkbox" aria-label="未选"><input class="cb is-active" type="checkbox" checked aria-label="已选"></span></td>
+            <td><span class="duo"><input class="cb is-focus" type="checkbox" aria-label="未选"><input class="cb is-focus" type="checkbox" checked aria-label="已选"></span></td>
+            <td><span class="duo"><input class="cb" type="checkbox" disabled aria-label="未选"><input class="cb" type="checkbox" checked disabled aria-label="已选"></span></td>
+            <td><span class="na">—</span></td></tr>
+          <tr><th>单选</th>
+            <td><span class="duo"><input class="rd" type="radio" name="m1" aria-label="未选"><input class="rd" type="radio" name="m1" checked aria-label="已选"></span></td>
+            <td><span class="duo"><input class="rd is-hover" type="radio" name="m2" aria-label="未选"><input class="rd is-hover" type="radio" name="m2" checked aria-label="已选"></span></td>
+            <td><span class="duo"><input class="rd is-active" type="radio" name="m3" aria-label="未选"><input class="rd is-active" type="radio" name="m3" checked aria-label="已选"></span></td>
+            <td><span class="duo"><input class="rd is-focus" type="radio" name="m4" aria-label="未选"><input class="rd is-focus" type="radio" name="m4" checked aria-label="已选"></span></td>
+            <td><span class="duo"><input class="rd" type="radio" name="m5" disabled aria-label="未选"><input class="rd" type="radio" name="m5" checked disabled aria-label="已选"></span></td>
+            <td><span class="na">—</span></td></tr>
+          <tr><th>复制</th>
+            <td><span class="idc" style="min-width:0"><code class="id">rt_live_8f2c…</code><button type="button" class="copy" aria-label="复制前缀"><svg class="i ic-copy" aria-hidden="true"><use href="#i-copy"/></svg><svg class="i ic-done" aria-hidden="true"><use href="#i-check"/></svg><span class="done-l">已复制</span></button></span></td>
+            <td><span class="idc" style="min-width:0"><code class="id">rt_live_8f2c…</code><button type="button" class="copy is-hover" aria-label="复制前缀"><svg class="i ic-copy" aria-hidden="true"><use href="#i-copy"/></svg><svg class="i ic-done" aria-hidden="true"><use href="#i-check"/></svg><span class="done-l">已复制</span></button></span></td>
+            <td><span class="idc" style="min-width:0"><code class="id">rt_live_8f2c…</code><button type="button" class="copy is-active" aria-label="复制前缀"><svg class="i ic-copy" aria-hidden="true"><use href="#i-copy"/></svg><svg class="i ic-done" aria-hidden="true"><use href="#i-check"/></svg><span class="done-l">已复制</span></button></span></td>
+            <td><span class="idc" style="min-width:0"><code class="id">rt_live_8f2c…</code><button type="button" class="copy is-focus" aria-label="复制前缀"><svg class="i ic-copy" aria-hidden="true"><use href="#i-copy"/></svg><svg class="i ic-done" aria-hidden="true"><use href="#i-check"/></svg><span class="done-l">已复制</span></button></span></td>
+            <td><span class="na">—</span></td>
+            <td><span class="na">—</span></td></tr>
+        </tbody>
+      </table>
+      </div>
+
+      <div class="flows" inert>
+        <figure>
+          <div class="steps">
+            <div><span class="lbl">第一步</span><span class="two" data-step="1"><span class="two-a"><button type="button" class="btn sec sm">停用</button></span><span class="two-b"><button type="button" class="btn crit sm">确认停用</button><button type="button" class="btn sec sm">取消</button></span></span></div>
+            <div><span class="lbl">第二步</span><span class="two" data-step="2"><span class="two-a"><button type="button" class="btn sec sm">停用</button></span><span class="two-b"><button type="button" class="btn crit sm">确认停用</button><button type="button" class="btn sec sm">取消</button></span></span></div>
+          </div>
+          <figcaption>两步确认原地切换：120ms 交叉淡入，宽度随之过渡；第二步的确认才是红色，取消留在原按钮的位置。</figcaption>
+        </figure>
+        <figure>
+          <div class="steps">
+            <div><span class="lbl">复制前</span><span class="idc" style="min-width:0"><code class="id">rt_live_8f2c…</code><button type="button" class="copy" aria-label="复制前缀"><svg class="i ic-copy" aria-hidden="true"><use href="#i-copy"/></svg><svg class="i ic-done" aria-hidden="true"><use href="#i-check"/></svg><span class="done-l">已复制</span></button></span></div>
+            <div><span class="lbl">1.5 秒内</span><span class="idc" style="min-width:0"><code class="id">rt_live_8f2c…</code><button type="button" class="copy is-done" aria-label="已复制"><svg class="i ic-copy" aria-hidden="true"><use href="#i-copy"/></svg><svg class="i ic-done" aria-hidden="true"><use href="#i-check"/></svg><span class="done-l">已复制</span></button></span></div>
+          </div>
+          <figcaption>复制后按钮自己显示“已复制”，同时弹出提示。</figcaption>
+        </figure>
+        <figure>
+          <div class="tipdemo"><span class="tip is-static">所有者不能停用，先转让所有权</span><button type="button" class="btn sec sm" aria-disabled="true">停用</button></div>
+          <figcaption>不可用但看不出原因时，悬停或聚焦给出原因。</figcaption>
+        </figure>
+        <figure>
+          <div class="steps">
+            <div><span class="lbl">进入</span><span class="toast st-enter">已保存限额</span></div>
+            <div><span class="lbl">停留</span><span class="toast">已保存限额</span></div>
+            <div><span class="lbl">退出</span><span class="toast st-leave">已保存限额</span></div>
+          </div>
+          <figcaption>提示 160ms 上移 8px 淡入，停留 3 秒，200ms 淡出。</figcaption>
+        </figure>
+        <figure>
+          <div class="skel-box">
+            <table class="tbl" aria-hidden="true">
+              <thead><tr><th>名称</th><th>状态</th><th class="r">密钥</th></tr></thead>
+              <tbody>
+                <tr><td><span class="skel" style="width:96px"></span></td><td><span class="skel" style="width:56px"></span></td><td><span class="skel" style="width:24px;margin-left:auto"></span></td></tr>
+                <tr><td><span class="skel" style="width:120px"></span></td><td><span class="skel" style="width:48px"></span></td><td><span class="skel" style="width:16px;margin-left:auto"></span></td></tr>
+                <tr><td><span class="skel" style="width:80px"></span></td><td><span class="skel" style="width:56px"></span></td><td><span class="skel" style="width:24px;margin-left:auto"></span></td></tr>
+              </tbody>
+            </table>
+            <p class="small" role="status">载入中…</p>
+          </div>
+          <figcaption>列表载入：3 行骨架只是视觉，“载入中…”仍是读屏与测试读取的状态文字。</figcaption>
+        </figure>
+      </div>
+    </div></div>
+
+    <div class="row"><h3>信号灯</h3><div class="spec" style="flex-direction:column;gap:16px">
       <div class="lamps">
         <span class="lamp ok">已生效</span>
         <span class="lamp info pulse">下发中 9/14</span>
         <span class="lamp wait">待下发</span>
         <span class="lamp crit">被拒绝</span>
         <span class="lamp off">已停用</span>
+        <span class="tag">平台内部</span>
+        <span class="grp" style="--c:var(--l1)">shared</span>
       </div>
-      <p class="small">绿：已应用、正常。蓝：传播中，出现时脉冲一次。空心：等待中。红：被拒绝。灰：已停用。同一个组件用于所有出现状态的地方。</p>
+      <p class="small">绿：已应用、正常。蓝：传播中，出现时脉冲一次。空心：等待中。红：被拒绝。灰：已停用。同一个组件用于所有出现状态的地方；信号灯、标签和线路色条共用一条中线。</p>
       <button type="button" class="btn sec sm" id="replay">再播一次脉冲</button>
     </div></div>
 
@@ -587,40 +916,55 @@ code,.id{font-family:var(--mono);font-size:.92em}
       <p class="small" style="max-width:40ch">出现在左下角，自动消失，用动作本身的动词：保存之后是“已保存”。</p>
     </div></div>
 
+    <div class="row"><h3>图标</h3><div class="spec" style="flex-direction:column;gap:16px">
+      <ul class="iconset">
+        <li><svg class="i" aria-hidden="true"><use href="#i-refresh"/></svg><span>刷新</span></li>
+        <li><svg class="i" aria-hidden="true"><use href="#i-copy"/></svg><span>复制</span></li>
+        <li><svg class="i" aria-hidden="true"><use href="#i-close"/></svg><span>关闭</span></li>
+        <li><svg class="i" aria-hidden="true"><use href="#i-external"/></svg><span>外部链接</span></li>
+        <li><svg class="i" aria-hidden="true"><use href="#i-check"/></svg><span>已复制</span></li>
+        <li><svg class="i i-32" aria-hidden="true" style="color:var(--muted)"><use href="#i-key"/></svg><span>空状态 32px</span></li>
+      </ul>
+      <p class="small">16px，1.5px 线宽，圆头圆角，用 currentColor 跟随文字颜色。只给动作用，导航站点不配图标。</p>
+    </div></div>
+
     <div class="row"><h3>字号</h3><div class="spec" style="display:block">
       <ul class="scale">
-        <li><span class="px">36</span><span class="money" style="font-size:36px;font-weight:800;letter-spacing:-.01em;line-height:1.2">$2,418.36</span></li>
-        <li><span class="px">29</span><span style="font-size:29px;font-weight:800;line-height:1.2">租户</span></li>
-        <li><span class="px">23</span><span style="font-size:23px;font-weight:800;line-height:1.2">北辰数据</span></li>
-        <li><span class="px">19</span><span style="font-size:19px;font-weight:800">授权模型</span></li>
+        <li><span class="px">45</span><span class="money" style="font-size:45px;font-weight:800;letter-spacing:-.01em;line-height:1.2"><span class="cur" style="font-size:29px;font-weight:600;margin-right:4px">$</span>412.80</span></li>
+        <li><span class="px">36</span><span class="money" style="font-size:36px;font-weight:800;letter-spacing:-.01em;line-height:1.2"><span class="cur" style="font-size:23px;font-weight:600;margin-right:4px">$</span>2,418.36</span></li>
+        <li><span class="px">29</span><span style="font-size:29px;font-weight:700;line-height:1.2">租户</span></li>
+        <li><span class="px">23</span><span style="font-size:23px;font-weight:700;line-height:1.2">北辰数据</span></li>
+        <li><span class="px">19</span><span style="font-size:19px;font-weight:700;line-height:1.2">授权模型</span></li>
         <li><span class="px">15</span><span>停用租户会让它的全部密钥立即失效，恢复后重新可用。</span></li>
-        <li><span class="px">12</span><span style="font-size:12px;color:var(--muted)">单 key 每分钟请求上限</span></li>
-        <li><span class="px">15</span><span class="id" style="font-size:15px">rt_live_8f2c… req_01JD7Q4M8X</span></li>
+        <li><span class="px">15</span><span class="money">输入 <span class="cur">$</span>2.50<span class="unit"> /1M tokens</span>，输出 <span class="cur">$</span>10.00<span class="unit"> /1M tokens</span></span></li>
+        <li><span class="px">13</span><span class="small" style="color:var(--muted)"><code>gw-east-07</code>：分组 batch 不存在</span></li>
+        <li><span class="px">13</span><span class="id">rt_live_8f2c… req_01JD7Q4M8X</span></li>
+        <li><span class="px">12</span><span style="font-size:12px;font-weight:600;color:var(--muted)">单 key 每分钟请求上限</span></li>
       </ul>
-      <p class="small" style="margin-top:12px">Overpass 400 / 600 / 800 用于拉丁字母和数字，表格与金额用等宽数字。中文用系统字体。Overpass Mono 只用于前缀、id 这类字面标识。</p>
+      <p class="small" style="margin-top:16px">字号只用 12 / 13 / 15 / 19 / 23 / 29 / 36 / 45。Overpass 400 / 600 / 800 用于拉丁字母和数字，表格与金额用等宽数字，货币符号和单位用浅色并小一级。中文标题用 700，系统中文字体没有真正的 800。Overpass Mono 只用于前缀、id 这类字面标识。</p>
     </div></div>
 
     <div class="row"><h3>颜色</h3><div class="spec" style="flex-direction:column;gap:24px">
       <ul class="swatches">
-        <li><span class="chip" style="background:#1C2A39"></span><b>Ink</b><code class="small">--ink #1C2A39</code><span>文字、主线</span></li>
-        <li><span class="chip" style="background:#F5F7F4"></span><b>Concrete</b><code class="small">--concrete #F5F7F4</code><span>页面底色</span></li>
-        <li><span class="chip" style="background:#FFFFFF"></span><b>Paper</b><code class="small">--paper #FFFFFF</code><span>面板、表格、表单</span></li>
-        <li><span class="chip" style="background:#FFC72C"></span><b>Sign yellow</b><code class="small">--sign #FFC72C</code><span>主要操作、当前位置、选中</span></li>
-        <li><span class="chip" style="background:#2B63D9"></span><b>Line blue</b><code class="small">--info #2B63D9</code><span>链接、焦点、传播中</span></li>
-        <li><span class="chip" style="background:#18916A"></span><b>Proceed green</b><code class="small">--ok #18916A</code><span>已应用、正常</span></li>
-        <li><span class="chip" style="background:#D2433B"></span><b>Stop red</b><code class="small">--crit #D2433B</code><span>被拒绝、危险确认</span></li>
-        <li><span class="chip" style="background:#3B4A5A"></span><b>Neutral 1</b><code class="small">--n1 #3B4A5A</code><span>次要文字</span></li>
-        <li><span class="chip" style="background:#66737F"></span><b>Neutral 2</b><code class="small">--n2 #66737F</code><span>说明、表头</span></li>
-        <li><span class="chip" style="background:#A7B0B7"></span><b>Neutral 3</b><code class="small">--n3 #A7B0B7</code><span>输入框边、停用灯</span></li>
-        <li><span class="chip" style="background:#D5DBD8"></span><b>Neutral 4</b><code class="small">--n4 #D5DBD8</code><span>分隔线</span></li>
-        <li><span class="chip" style="background:#121C27"></span><b>Dark page</b><code class="small">#121C27 / #1A2735</code><span>深色：页面 / 面板</span></li>
+        <li><span class="chip" style="background:#1C2A39"></span><b>Ink</b><code>--ink #1C2A39</code><span>文字、主线</span></li>
+        <li><span class="chip" style="background:#F5F7F4"></span><b>Concrete</b><code>--concrete #F5F7F4</code><span>页面底色</span></li>
+        <li><span class="chip" style="background:#FFFFFF"></span><b>Paper</b><code>--paper #FFFFFF</code><span>面板、表格、表单</span></li>
+        <li><span class="chip" style="background:#FFC72C"></span><b>Sign yellow</b><code>--sign #FFC72C</code><span>主要操作、当前位置、选中</span></li>
+        <li><span class="chip" style="background:#2B63D9"></span><b>Line blue</b><code>--info #2B63D9</code><span>链接、焦点、传播中</span></li>
+        <li><span class="chip" style="background:#18916A"></span><b>Proceed green</b><code>--ok #18916A</code><span>已应用、正常</span></li>
+        <li><span class="chip" style="background:#D2433B"></span><b>Stop red</b><code>--crit #D2433B</code><span>被拒绝、危险确认</span></li>
+        <li><span class="chip" style="background:#3B4A5A"></span><b>Neutral 1</b><code>--n1 #3B4A5A</code><span>次要文字</span></li>
+        <li><span class="chip" style="background:#66737F"></span><b>Neutral 2</b><code>--n2 #66737F</code><span>说明、表头、输入框与复选框边</span></li>
+        <li><span class="chip" style="background:#A7B0B7"></span><b>Neutral 3</b><code>--n3 #A7B0B7</code><span>停用灯</span></li>
+        <li><span class="chip" style="background:rgba(28,42,57,.10)"></span><b>Hairline</b><code>Ink 10% / 6.5%</code><span>面板边 / 内部分隔</span></li>
+        <li><span class="chip" style="background:#121C27"></span><b>Dark page</b><code>#121C27 / #1A2735</code><span>深色：页面 / 面板</span></li>
       </ul>
       <div>
-        <p class="small" style="margin-bottom:8px">分组线路色，按名称哈希分配，只出现在 Dashboard</p>
+        <p class="small" style="margin-bottom:8px">分组线路色，按名称哈希分配，只出现在 Dashboard；深色下各提亮一级，保持 3:1</p>
         <div class="lines">
-          <span class="grp" style="--c:#2B63D9">#2B63D9</span><span class="grp" style="--c:#18916A">#18916A</span>
-          <span class="grp" style="--c:#C2410C">#C2410C</span><span class="grp" style="--c:#7C3AED">#7C3AED</span>
-          <span class="grp" style="--c:#0E7490">#0E7490</span><span class="grp" style="--c:#B45309">#B45309</span>
+          <span class="grp" style="--c:var(--l1)">#2B63D9</span><span class="grp" style="--c:var(--l2)">#18916A</span>
+          <span class="grp" style="--c:var(--l3)">#C2410C</span><span class="grp" style="--c:var(--l4)">#7C3AED</span>
+          <span class="grp" style="--c:var(--l5)">#0E7490</span><span class="grp" style="--c:var(--l6)">#B45309</span>
         </div>
       </div>
     </div></div>
@@ -633,6 +977,7 @@ code,.id{font-family:var(--mono);font-size:.92em}
 <script>
 (() => {
   const root = document.documentElement;
+  const $ = (id) => document.getElementById(id);
   const toggles = document.querySelectorAll('[data-theme-toggle]');
   // Light unless the viewer chose dark; the system setting is not consulted.
   function apply(theme) {
@@ -670,45 +1015,84 @@ code,.id{font-family:var(--mono);font-size:.92em}
   const here = rail.querySelector('[aria-selected="true"]');
   if (rail.scrollWidth > rail.clientWidth) rail.scrollLeft = here.getBoundingClientRect().left - rail.getBoundingClientRect().left - rail.clientWidth / 2 + here.offsetWidth / 2;
 
-  // Toasts: bottom left, gone after a few seconds.
-  const zone = document.getElementById('toasts');
+  // Toasts: bottom left; slide up 8px and fade in over 160ms, fade out over 200ms.
+  const zone = $('toasts');
   function toast(text) {
     const el = document.createElement('div');
-    el.className = 'toast';
+    el.className = 'toast is-enter';
     el.textContent = text;
     zone.append(el);
-    setTimeout(() => el.remove(), 3200);
+    requestAnimationFrame(() => requestAnimationFrame(() => el.classList.remove('is-enter')));
+    setTimeout(() => { el.classList.add('is-leave'); setTimeout(() => el.remove(), 200); }, 3000);
   }
   document.querySelectorAll('[data-toast]').forEach((b) => b.addEventListener('click', () => toast(b.dataset.toast)));
 
-  // Tenant selection: the panel slides in beside the list.
-  const work = document.querySelector('.work');
-  const detail = document.getElementById('detail');
-  const $ = (id) => document.getElementById(id);
-  document.querySelectorAll('.tname').forEach((b) => b.addEventListener('click', () => {
-    const tr = b.closest('tr');
-    document.querySelectorAll('.tenants tr.sel').forEach((r) => r.classList.remove('sel'));
-    tr.classList.add('sel');
-    work.classList.remove('closed');
-    $('d-name').textContent = b.textContent;
-    detail.setAttribute('aria-label', '租户详情：' + b.textContent);
-    $('d-st').innerHTML = tr.cells[1].innerHTML;
-    $('d-bill').textContent = tr.cells[2].textContent;
-    $('d-mem').textContent = tr.cells[4].textContent;
-    $('d-keys').textContent = tr.cells[5].textContent;
-    $('d-roll').innerHTML = tr.cells[6].querySelector('.lamp').outerHTML.replace(' pulse', '');
-    detail.classList.remove('in');
-    void detail.offsetWidth;
-    detail.classList.add('in');
-  }));
-  detail.querySelector('[data-close]').addEventListener('click', () => {
-    work.classList.add('closed');
-    document.querySelectorAll('.tenants tr.sel').forEach((r) => r.classList.remove('sel'));
+  // Loading: a spinner takes the label's place; the button keeps its width.
+  function busy(btn, ms, done) {
+    btn.classList.add('is-busy');
+    btn.setAttribute('aria-busy', 'true');
+    setTimeout(() => { btn.classList.remove('is-busy'); btn.removeAttribute('aria-busy'); if (done) done(); }, ms);
+  }
+  document.querySelectorAll('[data-busy]').forEach((b) => b.addEventListener('click', () => { if (!b.classList.contains('is-busy')) busy(b, 800); }));
+
+  // A disabled action that explains itself stays focusable, so its reason can be read; the click does nothing.
+  document.addEventListener('click', (e) => {
+    if (e.target.closest('[aria-disabled="true"]')) { e.preventDefault(); e.stopImmediatePropagation(); }
+  }, true);
+  document.querySelectorAll('[data-mock]').forEach((a) => a.addEventListener('click', (e) => e.preventDefault()));
+
+  // A section's save turns yellow only while that section has unsaved edits.
+  document.querySelectorAll('[data-save]').forEach((btn) => {
+    const sec = btn.closest('fieldset');
+    const note = sec.querySelector('.dirty');
+    const mark = (dirty) => { btn.classList.toggle('pri', dirty); btn.classList.toggle('sec', !dirty); note.hidden = !dirty; };
+    sec.addEventListener('input', () => mark(true));
+    sec.addEventListener('change', () => mark(true));
+    btn.addEventListener('click', () => {
+      if (btn.classList.contains('is-busy')) return;
+      busy(btn, 700, () => { mark(false); toast(btn.dataset.save); });
+    });
   });
 
-  // The two-step confirm, opened at its second step.
-  const ask = $('ask'), pop = $('pop');
-  const setOpen = (open) => { pop.hidden = !open; ask.setAttribute('aria-expanded', String(open)); };
+  // Copy a literal id: the button says 已复制 for 1.5s, and a toast confirms it.
+  function copyText(text) {
+    if (navigator.clipboard && window.isSecureContext) return navigator.clipboard.writeText(text);
+    const ta = document.createElement('textarea');
+    ta.value = text; ta.setAttribute('readonly', ''); ta.style.position = 'fixed'; ta.style.opacity = '0';
+    document.body.append(ta); ta.select();
+    const ok = document.execCommand('copy');
+    ta.remove();
+    return ok ? Promise.resolve() : Promise.reject(new Error('copy refused'));
+  }
+  document.querySelectorAll('[data-copy]').forEach((b) => {
+    let timer;
+    const label = b.getAttribute('aria-label');
+    b.addEventListener('click', () => {
+      copyText(b.dataset.copy).then(() => {
+        b.classList.add('is-done');
+        b.setAttribute('aria-label', '已复制');
+        toast('已复制');
+        clearTimeout(timer);
+        timer = setTimeout(() => { b.classList.remove('is-done'); b.setAttribute('aria-label', label); }, 1500);
+      }, () => toast('复制没有成功，请手动选中前缀'));
+    });
+  });
+
+  // The in-place two-step confirm: a 120ms crossfade, and the width follows.
+  function step(two, n) {
+    const from = two.getBoundingClientRect().width;
+    two.style.width = '';
+    two.dataset.step = String(n);
+    const to = two.getBoundingClientRect().width;
+    if (Math.abs(from - to) < 0.5) return;
+    two.style.width = from + 'px';
+    void two.offsetWidth;
+    two.style.width = to + 'px';
+    clearTimeout(two._t);
+    two._t = setTimeout(() => { two.style.width = ''; }, 140);
+  }
+  const two = $('two');
+  const ask = two.querySelector('[data-ask]');
   ask.addEventListener('click', () => {
     if (ask.dataset.off) {
       delete ask.dataset.off;
@@ -717,18 +1101,56 @@ code,.id{font-family:var(--mono);font-size:.92em}
       toast('已启用');
       return;
     }
-    setOpen(pop.hidden);
+    step(two, 2);
+    two.querySelector('[data-confirm]').focus();
   });
-  pop.querySelector('[data-cancel]').addEventListener('click', () => { setOpen(false); ask.focus(); });
-  pop.querySelector('[data-confirm]').addEventListener('click', () => {
-    setOpen(false);
+  const cancel = () => { step(two, 1); ask.focus(); };
+  two.querySelector('[data-cancel]').addEventListener('click', cancel);
+  two.querySelector('[data-confirm]').addEventListener('click', () => {
     ask.dataset.off = '1';
     ask.textContent = '启用';
+    step(two, 1);
     $('qi-st').innerHTML = '<span class="lamp off">已停用</span>';
     ask.focus();
     toast('已停用');
   });
-  document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !pop.hidden) { setOpen(false); ask.focus(); } });
+  two.addEventListener('keydown', (e) => { if (e.key === 'Escape' && two.dataset.step === '2') cancel(); });
+
+  // Truncated text shows its full value on hover.
+  function titles() {
+    document.querySelectorAll('.trunc, .tname, .dhead h2').forEach((el) => {
+      if (el.scrollWidth > el.clientWidth + 1) el.title = el.textContent.trim();
+      else el.removeAttribute('title');
+    });
+  }
+  if (document.fonts && document.fonts.ready) document.fonts.ready.then(titles); else titles();
+  window.addEventListener('resize', titles);
+
+  // Tenant selection: the panel slides in beside the list.
+  const work = document.querySelector('.work');
+  const detail = $('detail');
+  document.querySelectorAll('.tenants .tname').forEach((b) => b.addEventListener('click', () => {
+    const tr = b.closest('tr');
+    const name = b.textContent.trim();
+    document.querySelectorAll('.tenants tr.sel').forEach((r) => r.classList.remove('sel'));
+    tr.classList.add('sel');
+    work.classList.remove('closed');
+    $('d-name').textContent = name;
+    detail.setAttribute('aria-label', '租户详情：' + name);
+    $('d-st').innerHTML = tr.cells[1].innerHTML;
+    $('d-bill').textContent = tr.cells[2].textContent;
+    $('d-mem').textContent = tr.cells[4].textContent;
+    $('d-keys').textContent = tr.cells[5].textContent;
+    $('d-roll').innerHTML = tr.cells[6].querySelector('.lamp').outerHTML.replace(' pulse', '');
+    detail.classList.remove('in');
+    void detail.offsetWidth;
+    detail.classList.add('in');
+    titles();
+  }));
+  detail.querySelector('[data-close]').addEventListener('click', () => {
+    work.classList.add('closed');
+    document.querySelectorAll('.tenants tr.sel').forEach((r) => r.classList.remove('sel'));
+  });
 
   $('replay').addEventListener('click', () => document.querySelectorAll('.pulse').forEach((l) => {
     l.classList.remove('pulse');
