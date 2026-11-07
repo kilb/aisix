@@ -4922,7 +4922,9 @@ where
         while let Some(item) = upstream.next().await {
             let bytes = match item {
                 Ok(bytes) => bytes,
-                // A mid-stream Err is forwarded as-is.
+                // A mid-stream Err is forwarded as-is; in platform mode the
+                // stream ends on its class instead, as a bridged channel's
+                // stream does for the same fault.
                 Err(error) => {
                     let bridge = raw_stream_bridge_error(&error, attempt_started);
                     let state = guard.state();
@@ -4931,6 +4933,10 @@ where
                         &bridge,
                     );
                     state.failure = Some(error.failure());
+                    if let Some(frame) = crate::platform_errors::responses_stream_failure(&bridge) {
+                        yield Ok(bytes::Bytes::from(frame));
+                        return;
+                    }
                     yield Err(error);
                     return;
                 }
@@ -11253,6 +11259,69 @@ data: [DONE]\n\n";
             sets[0], sets[1]
         );
         assert!(sets[0].contains(&("cache-control".to_owned(), "no-cache".to_owned())));
+    }
+
+    /// A transport failure mid-stream aborts a native Responses body; in
+    /// platform mode the stream ends on its class instead, an event a
+    /// bridged channel's stream would end on as well.
+    #[tokio::test]
+    async fn in_platform_mode_a_mid_stream_transport_error_ends_on_its_class() {
+        use futures::StreamExt;
+        for platform in [false, true] {
+            let upstream = futures::stream::iter(vec![
+                Ok(bytes::Bytes::from_static(
+                    b"event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"output\":[]}}\n\n",
+                )),
+                Err(crate::stream_timeout::RawStreamError::Timeout { elapsed_ms: 5 }),
+            ]);
+            let now = std::time::Instant::now();
+            let mark = crate::responses_affinity::ContextAffinity::default()
+                .response_mark("m-1", false)
+                .sealing_ids(
+                    platform
+                        .then(|| crate::platform::PlatformSettings::from_secret("s"))
+                        .as_ref(),
+                    "team-a",
+                );
+            let cell = std::sync::Arc::new(
+                crate::attribution::RequestAttribution::default().in_platform_mode(platform),
+            );
+            let (wire, aborted) = crate::attribution::scope(cell, async move {
+                let stream = super::build_responses_passthrough_stream(
+                    upstream,
+                    now,
+                    now,
+                    None,
+                    None,
+                    None,
+                    true,
+                    "alias".into(),
+                    mark,
+                    |_, _, _, _, _| {},
+                );
+                futures::pin_mut!(stream);
+                let mut wire = Vec::new();
+                let mut aborted = false;
+                while let Some(item) = stream.next().await {
+                    match item {
+                        Ok(bytes) => wire.extend_from_slice(&bytes),
+                        Err(_) => aborted = true,
+                    }
+                }
+                (String::from_utf8(wire).unwrap(), aborted)
+            })
+            .await;
+            if !platform {
+                assert!(aborted, "off platform mode the body is aborted");
+                continue;
+            }
+            assert!(!aborted);
+            let last = wire.trim_end().rsplit("\n\n").next().unwrap();
+            let (event, _) = crate::redact::parse_sse_json_event(last.as_bytes());
+            let event = event.unwrap();
+            assert_eq!(event["type"], "error", "{last}");
+            assert_eq!(event["code"], "upstream_unavailable", "{last}");
+        }
     }
 
     /// An upstream that serves `body` in 64 KiB chunks, as a network

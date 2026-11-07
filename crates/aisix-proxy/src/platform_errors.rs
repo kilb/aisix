@@ -489,24 +489,47 @@ pub(crate) fn relayed_responses_failure(frame: &[u8]) -> Option<Vec<u8>> {
             failed["response"]["error"] = error;
             ("response.failed", failed)
         }
-        event => {
-            let param = match &class {
-                PlatformErrorClass::InvalidRequest { param } => param.clone(),
-                _ => None,
-            };
-            let mut flat = serde_json::json!({
-                "type": "error",
-                "code": class.code(),
-                "message": platform_message(&class),
-                "param": param,
-            });
-            if let Some(seq) = event.as_ref().and_then(|e| e.get("sequence_number")) {
-                flat["sequence_number"] = seq.clone();
-            }
-            ("error", flat)
-        }
+        event => (
+            "error",
+            flat_responses_error(
+                &class,
+                event.as_ref().and_then(|e| e.get("sequence_number")),
+            ),
+        ),
     };
     Some(format!("event: {}\ndata: {}\n\n", rewritten.0, rewritten.1).into_bytes())
+}
+
+/// The flat Responses `error` event carrying `class`, numbered `seq` when
+/// the frame it replaces was.
+fn flat_responses_error(class: &PlatformErrorClass, seq: Option<&Value>) -> Value {
+    let param = match class {
+        PlatformErrorClass::InvalidRequest { param } => param.clone(),
+        _ => None,
+    };
+    let mut flat = serde_json::json!({
+        "type": "error",
+        "code": class.code(),
+        "message": platform_message(class),
+        "param": param,
+    });
+    if let Some(seq) = seq {
+        flat["sequence_number"] = seq.clone();
+    }
+    flat
+}
+
+/// The Responses `error` event a native stream ends on when `err` cut it
+/// short, in platform mode: its class, as the event a relayed failure
+/// becomes ([`relayed_responses_failure`]).
+pub(crate) fn responses_stream_failure(err: &BridgeError) -> Option<Vec<u8>> {
+    stream_class(err).map(|class| {
+        format!(
+            "event: error\ndata: {}\n\n",
+            flat_responses_error(&class, None)
+        )
+        .into_bytes()
+    })
 }
 
 /// A buffered Responses-API answer that is a failed Response object

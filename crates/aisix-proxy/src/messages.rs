@@ -3789,10 +3789,9 @@ fn build_anthropic_sse_stream(
                                 comp.response_capture_safe = false;
                                 comp.response_text.clear();
                             }
+                            let frame = translation_limit_frame(&aborted);
                             comp.terminal_failure = Some(aborted);
-                            yield Ok(bytes::Bytes::from_static(
-                                b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"stream_aborted\",\"message\":\"upstream tool stream exceeded translation limit\"}}\n\n",
-                            ));
+                            yield Ok(frame);
                             return;
                         }
                         encoder_tool_bytes = total;
@@ -4148,7 +4147,26 @@ pub(crate) fn guardrail_block_frame(
     )
 }
 
+/// The error frame a translated stream ends on when its tool calls outgrew
+/// what the translation holds; in platform mode the class of `aborted`.
+fn translation_limit_frame(aborted: &aisix_gateway::BridgeError) -> bytes::Bytes {
+    match crate::platform_errors::anthropic_stream_frame(aborted) {
+        Some(frame) => bytes::Bytes::from(frame),
+        None => bytes::Bytes::from_static(
+            b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"stream_aborted\",\"message\":\"upstream tool stream exceeded translation limit\"}}\n\n",
+        ),
+    }
+}
+
+/// The error frame a native stream ends on when it was cut short or carried
+/// a frame that could not be read; in platform mode the class of that
+/// failure, which every other stream ending carries too.
 fn upstream_stream_error_frame() -> String {
+    if let Some(frame) =
+        crate::platform_errors::anthropic_stream_frame(&aisix_gateway::BridgeError::StreamAborted)
+    {
+        return frame;
+    }
     format!(
         "event: error\ndata: {}\n\n",
         serde_json::json!({
@@ -5523,6 +5541,13 @@ where
                     if output_guardrail.is_some() {
                         usage.response_capture_safe = false;
                         usage.response_text.clear();
+                    }
+                    // Platform mode: the class frame a bridged channel's
+                    // stream ends on for the same fault, not an aborted
+                    // body that only this kind of channel gives.
+                    if let Some(frame) = crate::platform_errors::anthropic_stream_frame(&bridge) {
+                        yield Ok(Bytes::from(frame));
+                        return;
                     }
                     yield Err(error);
                     return;
@@ -8959,6 +8984,107 @@ event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_toke
         assert!(usage.stream_failure.is_some());
         assert!(usage.response_capture_safe);
         assert!(usage.response_text.contains("partial"));
+    }
+
+    /// A translated stream whose tool calls outgrew the translation ends on
+    /// a fixed frame; in platform mode on the class of the abort.
+    #[test]
+    fn the_translation_limit_frame_is_classed_in_platform_mode() {
+        let aborted = aisix_gateway::BridgeError::StreamAborted;
+        let off = super::translation_limit_frame(&aborted);
+        assert!(
+            String::from_utf8_lossy(&off).contains("\"stream_aborted\""),
+            "{off:?}"
+        );
+        let on = crate::error::tests::in_platform_mode(|| super::translation_limit_frame(&aborted));
+        let (event, _) = crate::redact::parse_sse_json_event(&on);
+        let event = event.unwrap();
+        assert_eq!(event["error"]["code"], "upstream_unavailable");
+        assert!(!String::from_utf8_lossy(&on).contains("translation"));
+    }
+
+    /// Every way a native Messages stream ends on a failure of its own, in
+    /// platform mode: a transport error mid-stream, a truncated stream and a
+    /// frame that does not parse each end on the class frame, not on an
+    /// aborted body or a fixed text whose shape differs by channel. Off
+    /// platform mode each ends as it always has.
+    #[tokio::test]
+    async fn every_native_stream_failure_ends_on_its_class_in_platform_mode() {
+        use futures::StreamExt;
+        let start = bytes::Bytes::from_static(
+            b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"up\",\"content\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}}\n\n",
+        );
+        let ending =
+            |kind: &str| -> Vec<Result<bytes::Bytes, crate::stream_timeout::RawStreamError>> {
+                match kind {
+                    "transport" => vec![
+                        Ok(start.clone()),
+                        Err(crate::stream_timeout::RawStreamError::Timeout { elapsed_ms: 5 }),
+                    ],
+                    "truncated" => vec![Ok(start.clone())],
+                    _ => vec![
+                        Ok(start.clone()),
+                        Ok(bytes::Bytes::from_static(
+                            b"event: content_block_delta\ndata: {not json\n\n",
+                        )),
+                    ],
+                }
+            };
+        for kind in ["transport", "truncated", "malformed"] {
+            for platform in [false, true] {
+                let upstream = futures::stream::iter(ending(kind));
+                let now = std::time::Instant::now();
+                let ids = platform.then(|| {
+                    crate::opaque_id::MessagesIds::new(&ring::hmac::Key::new(
+                        ring::hmac::HMAC_SHA256,
+                        &[7u8; 32],
+                    ))
+                });
+                let cell = std::sync::Arc::new(
+                    crate::attribution::RequestAttribution::default().in_platform_mode(platform),
+                );
+                let (wire, aborted) = crate::attribution::scope(cell, async move {
+                    let mut stream = super::build_anthropic_passthrough_stream(
+                        upstream,
+                        now,
+                        now,
+                        None,
+                        "relay-claude".into(),
+                        ids,
+                        Some(4096),
+                        None,
+                        |_| {},
+                    );
+                    let mut wire = Vec::new();
+                    let mut aborted = false;
+                    while let Some(item) = stream.next().await {
+                        match item {
+                            Ok(bytes) => wire.extend_from_slice(&bytes),
+                            Err(_) => aborted = true,
+                        }
+                    }
+                    (String::from_utf8(wire).unwrap(), aborted)
+                })
+                .await;
+                let last = wire.trim_end().rsplit("\n\n").next().unwrap().to_owned();
+                if !platform {
+                    match kind {
+                        "transport" => assert!(aborted, "off: the body is aborted"),
+                        _ => assert!(last.contains("upstream stream failed"), "{kind}: {last}"),
+                    }
+                    continue;
+                }
+                assert!(!aborted, "{kind}: the body ends on a frame");
+                assert!(last.starts_with("event: error\n"), "{kind}: {last}");
+                let (event, _) = crate::redact::parse_sse_json_event(last.as_bytes());
+                let event = event.unwrap();
+                assert_eq!(
+                    event["error"]["code"], "upstream_unavailable",
+                    "{kind}: {last}"
+                );
+                assert_eq!(event["error"]["type"], "overloaded_error", "{kind}: {last}");
+            }
+        }
     }
 
     /// A final frame the upstream never terminated is released at EOF by its
