@@ -29,10 +29,35 @@ const RANGE_SIZE = 800;
 // beyond this shares a port range with an earlier one.
 export const RANGE_SLOTS = 14; // 21000..32199, below the ephemeral range
 
+/**
+ * The fork's slot (`poolId` when it is a finite number >= 0, else
+ * `pid % RANGE_SLOTS`) plus the `E2E_PORT_SLOT` offset, modulo
+ * RANGE_SLOTS. Lets parallel single-file runs (each pool id 1) sit on
+ * disjoint ranges. Harness-only: not an `AISIX_*` variable.
+ */
+export function rangeSlotFor(
+  poolId: number | undefined,
+  slot: string | undefined,
+  pid: number,
+): number {
+  let offset = 0;
+  if (slot !== undefined && slot !== "") {
+    if (!/^\d+$/.test(slot) || Number(slot) >= RANGE_SLOTS) {
+      throw new Error(`E2E_PORT_SLOT must be an integer from 0 to ${RANGE_SLOTS - 1}`);
+    }
+    offset = Number(slot);
+  }
+  const base =
+    poolId !== undefined && Number.isFinite(poolId) && poolId >= 0 ? poolId : pid;
+  return ((base % RANGE_SLOTS) + offset) % RANGE_SLOTS;
+}
+
 function rangeSlot(): number {
-  const poolId = Number(process.env.VITEST_POOL_ID);
-  if (Number.isFinite(poolId) && poolId >= 0) return poolId % RANGE_SLOTS;
-  return process.pid % RANGE_SLOTS;
+  return rangeSlotFor(
+    Number(process.env.VITEST_POOL_ID),
+    process.env.E2E_PORT_SLOT,
+    process.pid,
+  );
 }
 
 let cursor = 0;
