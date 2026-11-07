@@ -4,10 +4,12 @@
 //!
 //! - Proxy handlers call [`UsageSink::try_emit`] (defined in aisix-obs)
 //!   to push one event per chat completion onto an mpsc channel.
-//! - This worker drains the channel, batches up to [`MAX_BATCH`]
-//!   events or every [`FLUSH_INTERVAL`] (whichever fires first),
-//!   POSTs the batch as `{ events: [...] }` to the CP's
-//!   `/dp/telemetry` URL, and logs the outcome.
+//! - This worker drains the channel, serializing each event once as it
+//!   leaves the queue, batches up to [`MAX_BATCH`] events or
+//!   [`MAX_BATCH_BYTES`], or every [`FLUSH_INTERVAL`] (whichever comes
+//!   first), POSTs the batch as `{ events: [...] }` to the CP's
+//!   `/dp/telemetry` URL, and logs the outcome. An event too large to
+//!   travel with others ([`MAX_EVENT_BYTES`]) is dropped alone.
 //! - On HTTP error the batch is re-sent — but only while the control
 //!   plane's own answer proves re-sending cannot double-count. Every
 //!   POST carries [`USAGE_BATCH_ID_HEADER`], the control plane records
@@ -39,7 +41,8 @@ use std::time::Duration;
 
 use aisix_core::redact_url_for_log;
 use anyhow::{anyhow, Context};
-use serde::{Deserialize, Serialize};
+use hyper::body::Bytes;
+use serde::Deserialize;
 use tokio::sync::watch;
 use tokio::time::Instant;
 use uuid::Uuid;
@@ -48,11 +51,23 @@ use aisix_obs::{Metrics, UsageEvent, UsageEventLabels, UsageSink};
 
 use crate::heartbeat::MtlsBundle;
 
-/// Maximum number of events accumulated per outbound POST. Pinned in
-/// code rather than config — at >100 events/batch the request body
-/// approaches gin's default `MaxMultipartMemory` plumbing on the
-/// receiving side, and we'd rather flush more often than tune that.
-const MAX_BATCH: usize = 100;
+/// Maximum number of events accumulated per outbound POST: the most one
+/// batch may carry at the control plane (`MAX_EVENTS_PER_BATCH`), which
+/// skips any past it. One POST is in flight at a time, so this is what
+/// delivery's throughput is per round trip. A batch of large events is cut
+/// at [`MAX_BATCH_BYTES`] first.
+const MAX_BATCH: usize = 1000;
+
+/// The most bytes one POST's body may carry: half the control plane's 8 MiB
+/// body cap. A body past that cap is answered `413`, which is permanent, and
+/// every event in it would be lost.
+const MAX_BATCH_BYTES: usize = 4 << 20;
+
+/// The most bytes one event may serialize to. One larger is dropped alone,
+/// counted [`DROP_OVERSIZED`], rather than travel with others: far above any
+/// row the emit chokepoint lets through, which bounds every text a caller or
+/// an upstream chose.
+const MAX_EVENT_BYTES: usize = 256 << 10;
 
 /// Cadence at which the worker flushes whatever it has buffered, even
 /// if the buffer hasn't filled. Kept short so the control plane sees
@@ -179,6 +194,11 @@ pub(crate) const FINAL_DRAIN_BUDGET: Duration = Duration::from_secs(20);
 /// failure was not retryable, or the gateway is shutting down.
 const DROP_SEND_FAILED: &str = "send_failed";
 
+/// `aisix_usage_event_drops_total{reason}` for an event that serialized to
+/// more than [`MAX_EVENT_BYTES`], given up on alone as it left the queue so
+/// that it cannot take the events of its batch with it.
+const DROP_OVERSIZED: &str = "oversized";
+
 /// `aisix_usage_event_drops_total{reason}` for a batch that ran out of room
 /// to keep trying: its events aged past [`RETRY_BUDGET`] (with or without
 /// an attempt ever being made), or the answers refusing it reached
@@ -288,7 +308,7 @@ async fn run(
     let mut ticker = tokio::time::interval(cfg.interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-    let mut buffer: Vec<UsageEvent> = Vec::with_capacity(MAX_BATCH);
+    let mut buffer = Buffer::default();
     let mut state = SenderState::default();
 
     tracing::info!(
@@ -308,15 +328,17 @@ async fn run(
                 match maybe_event {
                     Some(event) => {
                         metrics.usage_delivery().note_waiting();
-                        buffer.push(event);
-                        if buffer.len() >= MAX_BATCH {
+                        buffer.push(event, &metrics);
+                        if buffer.holds_a_full_batch() {
                             flush(&client, &cfg, &metrics, &mut state, &mut buffer, Retry::Allowed, cancel).await;
                         }
                     }
                     None => {
                         // All senders dropped — proxy is shutting down.
                         // Drain anything left and exit.
-                        flush(&client, &cfg, &metrics, &mut state, &mut buffer, Retry::Disabled, cancel).await;
+                        while !buffer.is_empty() {
+                            flush(&client, &cfg, &metrics, &mut state, &mut buffer, Retry::Disabled, cancel).await;
+                        }
                         tracing::info!("telemetry sender: channel closed, exiting");
                         return;
                     }
@@ -324,7 +346,7 @@ async fn run(
             }
             _ = ticker.tick() => {
                 if !buffer.is_empty() {
-                    fill_ready_batch(&mut buffer, &mut rx);
+                    fill_ready_batch(&mut buffer, &mut rx, &metrics);
                     flush(&client, &cfg, &metrics, &mut state, &mut buffer, Retry::Allowed, cancel).await;
                 }
             }
@@ -342,11 +364,11 @@ async fn run(
         // the shutdown and the drain would never run.
         if *cancel.borrow() {
             // Final drain — post whatever is still queued, in
-            // batches of at most MAX_BATCH. This is the one path
-            // that can meet a FULL queue (every other flush
-            // happens at or below the ceiling), and one POST of
-            // everything queued is exactly what the ceiling
-            // exists to prevent: cp-api rejects an oversized body
+            // batches within MAX_BATCH and MAX_BATCH_BYTES. This is the
+            // one path that can meet a FULL queue (every other flush
+            // happens at or below the ceilings), and one POST of
+            // everything queued is exactly what the ceilings
+            // exist to prevent: cp-api rejects an oversized body
             // and the whole backlog is gone, unretried.
             //
             // `Retry::Disabled`: every batch here gets one attempt. Waiting
@@ -356,11 +378,11 @@ async fn run(
             // past `FINAL_DRAIN_BUDGET` what is left is counted and given up on.
             let drain_deadline = Instant::now() + FINAL_DRAIN_BUDGET;
             loop {
-                fill_ready_batch(&mut buffer, &mut rx);
+                fill_ready_batch(&mut buffer, &mut rx, &metrics);
                 if buffer.is_empty() {
                     break;
                 }
-                let mut events = std::mem::take(&mut buffer);
+                let mut events = buffer.take_batch();
                 let delivered = tokio::time::timeout_at(
                     drain_deadline,
                     deliver(
@@ -376,8 +398,9 @@ async fn run(
                 .await;
                 if delivered.is_err() {
                     while let Ok(event) = rx.try_recv() {
-                        events.push(event);
+                        buffer.push(event, &metrics);
                     }
+                    events.extend(std::mem::take(&mut buffer).events);
                     drop_batch(
                         &metrics,
                         DROP_SEND_FAILED,
@@ -462,39 +485,160 @@ impl SenderState {
     }
 }
 
+/// One event as it goes out, serialized once as it leaves the queue: its
+/// size is known before it joins a batch, and every re-send of its batch
+/// repeats the same bytes.
+#[derive(Debug)]
+struct Prepared {
+    json: Vec<u8>,
+    /// `occurred_at`, parsed; `None` when it does not parse (see
+    /// [`remaining_budget`]).
+    occurred_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The member pair a drop is counted against (see [`drop_batch`]).
+    user_id: String,
+    user_name: String,
+}
+
+impl Prepared {
+    /// Serialize `event` for the wire, or give it up alone when it is too
+    /// large to travel with others.
+    fn new(event: UsageEvent, metrics: &Metrics) -> Option<Prepared> {
+        let reason = match serde_json::to_vec(&event) {
+            Ok(json) if json.len() <= MAX_EVENT_BYTES => {
+                return Some(Prepared {
+                    json,
+                    occurred_at: chrono::DateTime::parse_from_rfc3339(&event.occurred_at)
+                        .ok()
+                        .map(|at| at.with_timezone(&chrono::Utc)),
+                    user_id: event.user_id,
+                    user_name: event.user_name,
+                });
+            }
+            Ok(_) => DROP_OVERSIZED,
+            Err(_) => DROP_SEND_FAILED,
+        };
+        metrics.record_usage_event_drop(
+            reason,
+            UsageEventLabels {
+                user_id: non_empty(&event.user_id),
+                user_name: non_empty(&event.user_name),
+                ..UsageEventLabels::default()
+            },
+        );
+        tracing::warn!(
+            request_id = event.request_id.as_str(),
+            reason,
+            max_bytes = MAX_EVENT_BYTES,
+            "usage event too large to send (event dropped)",
+        );
+        None
+    }
+}
+
+/// `{"events":[` and `]}`, around the comma-separated events of a body.
+const BODY_OPEN: &[u8] = br#"{"events":["#;
+const BODY_CLOSE: &[u8] = b"]}";
+
+/// The size of the body that carries `count` events of `event_bytes` in all.
+const fn body_len(event_bytes: usize, count: usize) -> usize {
+    BODY_OPEN.len() + event_bytes + count.saturating_sub(1) + BODY_CLOSE.len()
+}
+
+/// The `{ events: [...] }` body of one batch.
+fn batch_body(events: &[Prepared]) -> Bytes {
+    let event_bytes = events.iter().map(|e| e.json.len()).sum();
+    let mut body = Vec::with_capacity(body_len(event_bytes, events.len()));
+    body.extend_from_slice(BODY_OPEN);
+    for (i, event) in events.iter().enumerate() {
+        if i > 0 {
+            body.push(b',');
+        }
+        body.extend_from_slice(&event.json);
+    }
+    body.extend_from_slice(BODY_CLOSE);
+    body.into()
+}
+
+/// The events taken off the queue and not yet sent, in arrival order.
+#[derive(Debug, Default)]
+struct Buffer {
+    events: std::collections::VecDeque<Prepared>,
+    /// The serialized size of `events`, in all.
+    bytes: usize,
+}
+
+impl Buffer {
+    fn push(&mut self, event: UsageEvent, metrics: &Metrics) {
+        if let Some(prepared) = Prepared::new(event, metrics) {
+            self.bytes += prepared.json.len();
+            self.events.push_back(prepared);
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.events.is_empty()
+    }
+
+    /// Whether a whole batch is waiting: [`MAX_BATCH`] events, or enough of
+    /// them to fill [`MAX_BATCH_BYTES`].
+    fn holds_a_full_batch(&self) -> bool {
+        self.events.len() >= MAX_BATCH || body_len(self.bytes, self.events.len()) >= MAX_BATCH_BYTES
+    }
+
+    /// Take the next batch: the events at the front that fit both
+    /// ceilings, and at least one.
+    fn take_batch(&mut self) -> Vec<Prepared> {
+        let mut batch = Vec::new();
+        let mut bytes = 0;
+        while batch.len() < MAX_BATCH {
+            let Some(next) = self.events.front() else {
+                break;
+            };
+            let grown = bytes + next.json.len();
+            if !batch.is_empty() && body_len(grown, batch.len() + 1) > MAX_BATCH_BYTES {
+                break;
+            }
+            let Some(event) = self.events.pop_front() else {
+                break;
+            };
+            bytes = grown;
+            self.bytes -= event.json.len();
+            batch.push(event);
+        }
+        batch
+    }
+}
+
 fn fill_ready_batch(
-    buffer: &mut Vec<UsageEvent>,
+    buffer: &mut Buffer,
     rx: &mut tokio::sync::mpsc::Receiver<UsageEvent>,
+    metrics: &Metrics,
 ) {
-    while buffer.len() < MAX_BATCH {
+    while !buffer.holds_a_full_batch() {
         match rx.try_recv() {
-            Ok(event) => buffer.push(event),
+            Ok(event) => buffer.push(event, metrics),
             Err(_) => break,
         }
     }
 }
 
-/// POST one batch and clear the buffer, re-sending it while that is safe.
+/// POST the next batch off the buffer, re-sending it while that is safe.
 /// Errors are logged, not propagated — telemetry losses must not stall the
-/// worker.
+/// worker. The batch leaves the buffer whatever happens to it, so a hung
+/// control plane cannot grow the buffer (worst case the batch is dropped).
 async fn flush(
     client: &reqwest::Client,
     cfg: &TelemetryConfig,
     metrics: &Metrics,
     state: &mut SenderState,
-    buffer: &mut Vec<UsageEvent>,
+    buffer: &mut Buffer,
     retry: Retry,
     cancel: &mut watch::Receiver<bool>,
 ) {
-    if buffer.is_empty() {
+    let events = buffer.take_batch();
+    if events.is_empty() {
         return;
     }
-    // Move events out into the request body; clear the buffer
-    // unconditionally so a hung CP doesn't grow the buffer
-    // indefinitely (worst case we drop the batch on error).
-    let events: Vec<UsageEvent> = std::mem::take(buffer);
-    buffer.reserve(MAX_BATCH);
-
     deliver(client, cfg, metrics, state, &events, retry, cancel).await;
 }
 
@@ -507,7 +651,7 @@ async fn deliver(
     cfg: &TelemetryConfig,
     metrics: &Metrics,
     state: &mut SenderState,
-    events: &[UsageEvent],
+    events: &[Prepared],
     retry: Retry,
     cancel: &mut watch::Receiver<bool>,
 ) {
@@ -536,10 +680,11 @@ async fn deliver(
     // Flipped when shutdown interrupts a backoff: the batch in hand gets one
     // final attempt, and then this worker stops holding the drain open.
     let mut last_attempt = retry == Retry::Disabled;
+    let body = batch_body(events);
 
     loop {
         attempts += 1;
-        let failure = match send(client, cfg, batch_id, events).await {
+        let failure = match send(client, cfg, batch_id, &body).await {
             Attempt::Delivered { dedup, rejected } => {
                 metrics.usage_delivery().note_reached();
                 state.dedup_seen = dedup;
@@ -663,14 +808,9 @@ fn random_jitter(step: Duration) -> Duration {
 /// An event whose `occurred_at` does not parse cannot be aged, so it does not
 /// shorten anything — what to do with a malformed timestamp is the control
 /// plane's call, by its own rules.
-fn remaining_budget(events: &[UsageEvent]) -> Duration {
+fn remaining_budget(events: &[Prepared]) -> Duration {
     let now = chrono::Utc::now();
-    let Some(oldest) = events
-        .iter()
-        .filter_map(|event| chrono::DateTime::parse_from_rfc3339(&event.occurred_at).ok())
-        .map(|at| at.with_timezone(&chrono::Utc))
-        .min()
-    else {
+    let Some(oldest) = events.iter().filter_map(|event| event.occurred_at).min() else {
         return RETRY_BUDGET;
     };
     // `to_std` fails on a negative span — an event stamped in the future,
@@ -692,7 +832,7 @@ fn remaining_budget(events: &[UsageEvent]) -> Duration {
 fn drop_batch(
     metrics: &Metrics,
     reason: &'static str,
-    events: &[UsageEvent],
+    events: &[Prepared],
     batch_id: Uuid,
     attempts: usize,
     failure: Option<&SendFailure>,
@@ -734,11 +874,6 @@ fn non_empty(value: &str) -> &str {
     } else {
         value
     }
-}
-
-#[derive(Debug, Serialize)]
-struct TelemetryBody<'a> {
-    events: &'a [UsageEvent],
 }
 
 /// The control plane's `2xx` answer to a batch. Decoded loosely — a newer
@@ -821,14 +956,15 @@ async fn send(
     client: &reqwest::Client,
     cfg: &TelemetryConfig,
     batch_id: Uuid,
-    events: &[UsageEvent],
+    body: &Bytes,
 ) -> Attempt {
     let resp = client
         .post(&cfg.url)
         // Same as /dp/heartbeat — no Authorization header; the control plane
         // derives identity from the peer cert SAN URI.
         .header(USAGE_BATCH_ID_HEADER, batch_id.to_string())
-        .json(&TelemetryBody { events })
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(body.clone())
         .send()
         .await
         .map_err(reqwest::Error::without_url)
@@ -992,6 +1128,20 @@ mod tests {
         }
     }
 
+    /// `events` as the worker sends them.
+    fn prepared(events: Vec<UsageEvent>) -> Vec<Prepared> {
+        let metrics = Metrics::new(false);
+        events
+            .into_iter()
+            .map(|event| Prepared::new(event, &metrics).expect("a test event fits"))
+            .collect()
+    }
+
+    /// The body the worker posts for `events`.
+    fn body_of(events: &[UsageEvent]) -> Bytes {
+        batch_body(&prepared(events.to_vec()))
+    }
+
     fn plain_client() -> reqwest::Client {
         reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
@@ -1016,7 +1166,7 @@ mod tests {
         let events = vec![sample_event("req-1"), sample_event("req-2")];
         let batch_id = Uuid::new_v4();
 
-        let attempt = send(&plain_client(), &cfg, batch_id, &events).await;
+        let attempt = send(&plain_client(), &cfg, batch_id, &body_of(&events)).await;
         // A control plane that does not set the header still delivers; it
         // is re-sending that its absence rules out.
         assert!(
@@ -1066,7 +1216,7 @@ mod tests {
         event.upstream_tpot_ms = Some(2.5);
         event.service_tier = Some("priority".into());
         event.modality_tokens.prompt_audio_tokens = Some(7);
-        send(&plain_client(), &cfg, Uuid::new_v4(), &[event]).await;
+        send(&plain_client(), &cfg, Uuid::new_v4(), &body_of(&[event])).await;
 
         let received = server.received_requests().await.unwrap();
         let body: serde_json::Value = serde_json::from_slice(&received[0].body).unwrap();
@@ -1106,7 +1256,7 @@ mod tests {
             &plain_client(),
             &cfg,
             Uuid::new_v4(),
-            &[sample_event("req-1")],
+            &body_of(&[sample_event("req-1")]),
         )
         .await;
         let Attempt::Failed(failure) = attempt else {
@@ -1683,7 +1833,12 @@ mod tests {
         drop(tx);
         finish_sender(sender.as_mut()).await;
         let sizes = assert_recorded_events(&batches, &expected);
-        assert_eq!(sizes, [vec![MAX_BATCH; 10], vec![26]].concat());
+        let total = BACKLOG_QUEUE + 2;
+        let full = total / MAX_BATCH;
+        assert_eq!(
+            sizes,
+            [vec![MAX_BATCH; full], vec![total - full * MAX_BATCH]].concat()
+        );
     }
 
     #[tokio::test]
@@ -1843,6 +1998,151 @@ mod tests {
             sizes.iter().all(|n| *n <= MAX_BATCH),
             "no POST may carry more than the batch ceiling: {sizes:?}"
         );
+    }
+
+    /// [`recording_server`] that also keeps the size of every body it was
+    /// sent.
+    async fn sizing_server() -> (
+        LocalServer,
+        RecordedBatches,
+        Arc<std::sync::Mutex<Vec<usize>>>,
+    ) {
+        let batches: RecordedBatches = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sizes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (recorded, sized) = (Arc::clone(&batches), Arc::clone(&sizes));
+        let server = local_server(move |_, body| {
+            sized.lock().unwrap().push(body.len());
+            recorded
+                .lock()
+                .unwrap()
+                .push(serde_json::from_slice(body).unwrap());
+            Reply::status(200)
+        })
+        .await;
+        (server, batches, sizes)
+    }
+
+    /// `count` events whose `requested_model` makes each about `bytes` long.
+    fn sized_events(count: usize, bytes: usize) -> Vec<UsageEvent> {
+        ordered_events(count)
+            .into_iter()
+            .map(|mut event| {
+                event.requested_model = "m".repeat(bytes);
+                event
+            })
+            .collect()
+    }
+
+    /// The control plane refuses a body over 8 MiB with a `413`, which is
+    /// permanent, so a batch is cut by its size as well as by its count:
+    /// events that would only fit one body by count go out in several, each
+    /// well under the control plane's cap, in order and none lost.
+    #[tokio::test]
+    async fn a_batch_is_cut_by_its_size_as_well_as_by_its_count() {
+        const EVENT_BYTES: usize = 200 * 1024;
+        const EVENTS: usize = 30;
+        let (server, batches, sizes) = sizing_server().await;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(format!("{}/dp/telemetry", server.uri()), &dir);
+        let metrics = Metrics::new(false);
+        let (tx, rx) = tokio::sync::mpsc::channel(BACKLOG_QUEUE);
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        tokio::time::pause();
+        let mut sender = Box::pin(run(cfg, metrics.clone(), rx, &mut cancel_rx));
+        assert!(poll_sender(sender.as_mut()).await.is_pending());
+        let expected = sized_events(EVENTS, EVENT_BYTES);
+        for event in expected.clone() {
+            tx.try_send(event).unwrap();
+        }
+        tokio::time::advance(FLUSH_INTERVAL).await;
+        drive_until(
+            sender.as_mut(),
+            STEP_WHILE_SERVING,
+            || {
+                batches
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|b| b["events"].as_array().unwrap().len())
+                    .sum::<usize>()
+                    >= EVENTS
+            },
+            "the events were not all delivered",
+        )
+        .await;
+        drop(tx);
+        finish_sender(sender.as_mut()).await;
+
+        assert_recorded_events(&batches, &expected);
+        let sizes = sizes.lock().unwrap().clone();
+        assert!(
+            sizes.len() >= 2,
+            "one body for {EVENTS} large events: {sizes:?}"
+        );
+        assert!(
+            sizes.iter().all(|&n| n <= 4 << 20),
+            "a body over 4 MiB: {sizes:?}"
+        );
+        assert_eq!(drops_with_reason(&metrics, DROP_SEND_FAILED), 0);
+    }
+
+    /// The ceilings are set against the control plane's: at most 1000 events
+    /// a batch, which it skips past, and an 8 MiB body, which it answers
+    /// `413` past. Every other test here compares the sender with itself and
+    /// stays green if these move.
+    #[test]
+    fn the_batch_ceilings_sit_within_the_control_planes() {
+        assert_eq!(MAX_BATCH, 1000);
+        assert_eq!(MAX_BATCH_BYTES, 4 << 20);
+        assert_eq!(MAX_EVENT_BYTES, 256 << 10);
+        const {
+            assert!(MAX_EVENT_BYTES + body_len(0, 1) <= MAX_BATCH_BYTES);
+            assert!(MAX_BATCH_BYTES <= (8 << 20) / 2);
+        }
+    }
+
+    /// An event too large to travel with others is dropped alone, counted
+    /// `oversized` against its member, and the events beside it are
+    /// delivered.
+    #[tokio::test]
+    async fn an_event_too_large_to_travel_is_dropped_alone() {
+        let (server, batches, _sizes) = sizing_server().await;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(format!("{}/dp/telemetry", server.uri()), &dir);
+        let metrics = Metrics::new(false);
+        let (tx, rx) = tokio::sync::mpsc::channel(BACKLOG_QUEUE);
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        tokio::time::pause();
+        let mut sender = Box::pin(run(cfg, metrics.clone(), rx, &mut cancel_rx));
+        assert!(poll_sender(sender.as_mut()).await.is_pending());
+        let mut events = ordered_events(3);
+        events[1].requested_model = "m".repeat(300 * 1024);
+        for event in events.clone() {
+            tx.try_send(event).unwrap();
+        }
+        tokio::time::advance(FLUSH_INTERVAL).await;
+        drive_until(
+            sender.as_mut(),
+            STEP_WHILE_SERVING,
+            || !batches.lock().unwrap().is_empty(),
+            "nothing was delivered",
+        )
+        .await;
+        drop(tx);
+        finish_sender(sender.as_mut()).await;
+
+        assert_recorded_events(&batches, &[events[0].clone(), events[2].clone()]);
+        assert_eq!(drops_with_reason(&metrics, "oversized"), 1);
+        let rendered = metrics.render();
+        assert!(
+            rendered
+                .lines()
+                .any(|line| line.starts_with("aisix_usage_event_drops_total{")
+                    && line.contains("reason=\"oversized\"")
+                    && line.contains("user_id=\"user-1\"")),
+            "{rendered}"
+        );
+        assert_eq!(drops_with_reason(&metrics, DROP_SEND_FAILED), 0);
     }
 
     /// A batch this worker gives up on is gone — there is no retry — so the
@@ -2055,7 +2355,13 @@ mod tests {
             .await;
             let dir = tempfile::tempdir().unwrap();
             let cfg = test_config(format!("{}/dp/telemetry", server.uri()), &dir);
-            let attempt = send(&plain_client(), &cfg, Uuid::new_v4(), &[sample_event("r")]).await;
+            let attempt = send(
+                &plain_client(),
+                &cfg,
+                Uuid::new_v4(),
+                &body_of(&[sample_event("r")]),
+            )
+            .await;
             assert!(
                 matches!(attempt, Attempt::Delivered { rejected: 0, .. }),
                 "{attempt:?}"
@@ -2727,7 +3033,7 @@ mod tests {
             ..SenderState::default()
         };
         let client = plain_client();
-        let events = ordered_events(2);
+        let events = prepared(ordered_events(2));
         tokio::time::pause();
         let mut delivering = Box::pin(deliver(
             &client,
@@ -2979,7 +3285,13 @@ mod tests {
         );
         let debug = format!("{answered:?}");
         assert!(!debug.contains("hunter2"), "{debug}");
-        let attempt = send(&plain_client(), &answered, Uuid::new_v4(), &events).await;
+        let attempt = send(
+            &plain_client(),
+            &answered,
+            Uuid::new_v4(),
+            &body_of(&events),
+        )
+        .await;
         let Attempt::Failed(failure @ SendFailure::Response { .. }) = attempt else {
             panic!("expected the 400 back: {attempt:?}");
         };
@@ -2989,7 +3301,13 @@ mod tests {
 
         let (_refusing, addr) = crate::dp_store::test_logs::refusing_addr();
         let unanswered = test_config(format!("http://user:hunter2@{addr}/dp/telemetry"), &dir);
-        let attempt = send(&plain_client(), &unanswered, Uuid::new_v4(), &events).await;
+        let attempt = send(
+            &plain_client(),
+            &unanswered,
+            Uuid::new_v4(),
+            &body_of(&events),
+        )
+        .await;
         let Attempt::Failed(failure @ SendFailure::NoResponse { .. }) = attempt else {
             panic!("expected no response: {attempt:?}");
         };
