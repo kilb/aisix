@@ -490,3 +490,17 @@ tr:hover td button.ghost{border-color:var(--rule-2);color:var(--oxide)}
   font-family:var(--mono);font-size:11.5px;line-height:1.55;
   white-space:pre-wrap;word-break:break-all;max-height:320px;overflow:auto;
 }
+
+/* Upstream accounts: group chips, and a stored secret's state. */
+.tags{list-style:none;margin:0 0 8px;padding:0;display:flex;flex-wrap:wrap;gap:6px}
+.tags li{
+  display:inline-flex;align-items:center;gap:6px;padding:3px 4px 3px 9px;
+  border:1px solid var(--rule-2);font-family:var(--mono);font-size:12px;
+}
+/* The glyph is drawn by CSS, so a chip's text is its name alone. */
+.tags button{border:0;background:none;color:var(--ink-3);cursor:pointer;padding:0 4px;font-size:14px;line-height:1}
+.tags button::before{content:"×"}
+.tags button:hover{color:var(--oxide)}
+.tag-add{display:flex;gap:8px;max-width:420px}
+.secret{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.secret-undo{margin-top:8px}

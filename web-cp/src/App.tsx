@@ -6,6 +6,7 @@ import { useTheme } from "./lib/useTheme";
 import { Gate } from "./Gate";
 import { Gateways } from "./tabs/Gateways";
 import { Overview } from "./tabs/Overview";
+import { Providers } from "./tabs/Providers";
 
 const TABS = [
   { id: "overview", label: "概览" },
@@ -53,6 +54,8 @@ function Page({ tab, ...props }: TabProps & { tab: TabId }) {
       return <Overview {...props} />;
     case "gateways":
       return <Gateways {...props} />;
+    case "providers":
+      return <Providers {...props} />;
     default:
       return <NotBuilt label={TABS.find((t) => t.id === tab)?.label ?? tab} />;
   }

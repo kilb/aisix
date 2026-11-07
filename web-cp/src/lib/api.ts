@@ -364,7 +364,17 @@ export const schemas = {
 };
 
 // Filled in by the tasks that build their pages, one namespace each.
-export const tenants = {};
+
+/** Tenants, and their keys, as operators see them. */
+export const tenants = {
+  async list(status?: Tenant["status"]): Promise<Tenant[]> {
+    const query = status ? `?status=${seg(status)}` : "";
+    return (await call<{ items: Tenant[] }>("GET", `/admin/tenants${query}`)).data.items;
+  },
+  async keys(id: string): Promise<AdminKey[]> {
+    return (await call<{ items: AdminKey[] }>("GET", `/admin/tenants/${seg(id)}/keys`)).data.items;
+  },
+};
 export const keys = {};
 /** Gateway instances and the credentials they boot from. */
 export const gateways = {
@@ -420,4 +430,8 @@ export const environment = {
 
 export const operators = {};
 export const audit = {};
-export const settings = {};
+export const settings = {
+  async tenantDefaults(): Promise<TenantDefaults> {
+    return (await call<TenantDefaults>("GET", "/admin/settings/tenant-defaults")).data;
+  },
+};
