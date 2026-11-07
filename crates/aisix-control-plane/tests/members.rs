@@ -112,7 +112,10 @@ async fn raw(
         .build()
         .expect("an HTTP client");
     let method = reqwest::Method::from_bytes(method.as_bytes()).expect("an HTTP method");
-    let mut request = client.request(method, cp.url(path));
+    // Labelled JSON with or without a body, as the Dashboard sends it.
+    let mut request = client
+        .request(method, cp.url(path))
+        .header(reqwest::header::CONTENT_TYPE, "application/json");
     if let Some(cookie) = cookie {
         request = request.header(reqwest::header::COOKIE, cookie);
     }
@@ -368,13 +371,11 @@ async fn signing_up_makes_a_pending_tenant_with_its_owner_logged_in() {
         "{pending:?}"
     );
 
-    // Its team document exists, and the signup is audited as the owner.
-    let (team, owner, deleted) = resource(&cp, "teams", &tenant_id)
-        .await
-        .expect("the team document");
-    assert_eq!(team, json!({"name": "Acme 7c1"}));
-    assert_eq!(owner, Some(format!("tenant:{tenant_id}")));
-    assert!(!deleted);
+    // A pending tenant gives the gateways nothing: no team and no user
+    // document until an operator approves it. The signup is audited as the
+    // owner.
+    assert_eq!(resource(&cp, "teams", &tenant_id).await, None);
+    assert_eq!(resource(&cp, "users", &member_id).await, None);
     assert_eq!(
         tenant_audit(&cp, &tenant_id).await,
         vec![(
@@ -499,6 +500,212 @@ async fn signups_are_limited_site_wide_and_a_refused_one_gives_its_slot_back() {
     assert!(r.set_cookie.is_none());
 }
 
+/// `(version, seq, deleted)` of the stored document `kind/id`.
+async fn stamp(cp: &TestCp, kind: &str, id: &str) -> (i64, i64, bool) {
+    sqlx::query_as(
+        "SELECT version, seq, deleted FROM gw_resources WHERE kind = $1 AND id = $2::uuid",
+    )
+    .bind(kind)
+    .bind(id)
+    .fetch_one(cp.db().pool())
+    .await
+    .unwrap_or_else(|e| panic!("read {kind}/{id}: {e}"))
+}
+
+/// Mints a key as `cookie`'s member; its id.
+async fn mint(cp: &TestCp, cookie: &str, label: &str) -> String {
+    let r = cp
+        .send(
+            "POST",
+            "/api/keys",
+            Some(cookie),
+            Some(json!({"label": label})),
+        )
+        .await;
+    assert_eq!(r.status, 201, "mint {label}: {r:?}");
+    text(&r.body, "/key/id")
+}
+
+/// A tenant waiting for approval gives the gateways nothing. Its approval
+/// writes the team and the user of every live member, in that transaction
+/// and ahead of the limits policy and the keys; the keys minted afterwards
+/// work; and a suspension and a reactivation leave the team and the users
+/// as they are.
+#[tokio::test]
+async fn approving_a_tenant_writes_its_team_and_every_members_user_and_its_keys_then_work() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let op = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let r = signup(&cp, "approve-7c1", &fresh_email("founder"), Some("Ada 7c1")).await;
+    assert_eq!(r.status, 201, "{r:?}");
+    let tenant = text(&r.body, "/tenant/id");
+    let owner_id = text(&r.body, "/member/id");
+    let owner_cookie = cookie_of(&r).expect("a cookie");
+    // An operator's invitation, accepted while the tenant waits.
+    let invited = cp
+        .send(
+            "POST",
+            &format!("/admin/tenants/{tenant}/invites"),
+            Some(op.cookie()),
+            Some(json!({"email": fresh_email("early"), "role": "member"})),
+        )
+        .await;
+    assert_eq!(invited.status, 201, "{invited:?}");
+    let a = accept(
+        &cp,
+        &text(&invited.body, "/invite_token"),
+        "early-password-7c1",
+        None,
+    )
+    .await;
+    assert_eq!(a.status, 201, "{a:?}");
+    let member_id = text(&a.body, "/member/id");
+    let member_cookie = cookie_of(&a).expect("a cookie");
+    let owners = [
+        format!("tenant:{tenant}"),
+        format!("member:{owner_id}"),
+        format!("member:{member_id}"),
+    ];
+    let owned: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM gw_resources WHERE managed_by = ANY($1)")
+            .bind(&owners[..])
+            .fetch_one(cp.db().pool())
+            .await
+            .expect("count the documents");
+    assert_eq!(owned, 0, "a pending tenant wrote documents");
+
+    act_on_tenant(&cp, &op, &tenant, "approve").await;
+    let short = member_id.replace('-', "");
+    for (kind, id, doc, owner) in [
+        ("teams", &tenant, json!({"name": "approve-7c1"}), &owners[0]),
+        ("users", &owner_id, json!({"name": "Ada 7c1"}), &owners[1]),
+        (
+            "users",
+            &member_id,
+            json!({ "name": format!("member-{}", &short[..8]) }),
+            &owners[2],
+        ),
+    ] {
+        let (stored, managed_by, deleted) = resource(&cp, kind, id)
+            .await
+            .unwrap_or_else(|| panic!("{kind}/{id} after the approval"));
+        assert_eq!(
+            (stored, managed_by.as_ref(), deleted),
+            (doc, Some(owner), false)
+        );
+    }
+    let policy: Uuid =
+        sqlx::query_scalar("SELECT limits_policy_id FROM tenants WHERE id = $1::uuid")
+            .bind(&tenant)
+            .fetch_one(cp.db().pool())
+            .await
+            .expect("a limits policy");
+    let policy_seq = stamp(&cp, "rate_limit_policies", &policy.to_string())
+        .await
+        .1;
+    for (kind, id) in [
+        ("teams", &tenant),
+        ("users", &owner_id),
+        ("users", &member_id),
+    ] {
+        assert!(
+            stamp(&cp, kind, id).await.1 < policy_seq,
+            "{kind}/{id} was written after the limits policy"
+        );
+    }
+
+    // Keys minted now name the team and their member, and work.
+    let owner_key = mint(&cp, &owner_cookie, "owner-key-7c1").await;
+    let member_key = mint(&cp, &member_cookie, "member-key-7c1").await;
+    for (key, member) in [(&owner_key, &owner_id), (&member_key, &member_id)] {
+        let (doc, _, deleted) = resource(&cp, "api_keys", key)
+            .await
+            .expect("a key document");
+        assert!(!deleted);
+        assert_eq!(doc["team_id"], tenant.as_str(), "{doc}");
+        assert_eq!(doc["user_id"], member.as_str(), "{doc}");
+        assert_eq!(doc["disabled"], false, "{doc}");
+    }
+
+    // Suspending closes the keys and keeps the team and the users; so does
+    // reactivating, which opens the keys again.
+    let kept = [
+        ("teams", &tenant),
+        ("users", &owner_id),
+        ("users", &member_id),
+    ];
+    let mut before = Vec::new();
+    for (kind, id) in kept {
+        before.push(stamp(&cp, kind, id).await);
+    }
+    for (action, disabled) in [("suspend", true), ("reactivate", false)] {
+        act_on_tenant(&cp, &op, &tenant, action).await;
+        for ((kind, id), was) in kept.iter().zip(&before) {
+            let now = stamp(&cp, kind, id).await;
+            assert_eq!((now.0, now.2), (was.0, false), "{action}: {kind}/{id}");
+        }
+        for key in [&owner_key, &member_key] {
+            let (doc, _, _) = resource(&cp, "api_keys", key)
+                .await
+                .expect("a key document");
+            assert_eq!(doc["disabled"], disabled, "{action}: {doc}");
+        }
+    }
+}
+
+/// Signup is anonymous, so the tenants waiting for approval are capped at
+/// [`members::MAX_PENDING_TENANTS`]; past the cap a signup is refused with
+/// the very answer a full signup window gives, telling the caller nothing
+/// new. A tenant that stops waiting frees its place.
+#[tokio::test]
+async fn pending_tenants_are_capped_and_past_the_cap_signup_answers_as_a_full_window_does() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let op = cp.admin_login_seeded(OperatorRole::Operator).await;
+    // Every place but one taken.
+    sqlx::query(
+        "INSERT INTO tenants (id, name, status) \
+         SELECT gen_random_uuid(), 'waiting-7c1-' || n, 'pending' FROM generate_series(1, $1) n",
+    )
+    .bind(members::MAX_PENDING_TENANTS - 1)
+    .execute(cp.db().pool())
+    .await
+    .expect("seed pending tenants");
+    let r = signup(&cp, "last-place-7c1", &fresh_email("last"), None).await;
+    assert_eq!(r.status, 201, "{r:?}");
+    let last = text(&r.body, "/tenant/id");
+
+    let counts = || async {
+        sqlx::query_as::<_, (i64, i64)>(
+            "SELECT (SELECT count(*) FROM tenants), (SELECT count(*) FROM audit_log)",
+        )
+        .fetch_one(cp.db().pool())
+        .await
+        .expect("count")
+    };
+    let before = counts().await;
+    let over = signup(&cp, "over-cap-7c1", &fresh_email("over"), None).await;
+    assert_eq!(over.status, 429, "{over:?}");
+    assert!(over.set_cookie.is_none(), "{over:?}");
+    assert_eq!(counts().await, before, "a refused signup changed something");
+
+    // Approved, the last tenant no longer waits, and its place is free.
+    act_on_tenant(&cp, &op, &last, "approve").await;
+    let r = signup(&cp, "freed-place-7c1", &fresh_email("freed"), None).await;
+    assert_eq!(r.status, 201, "{r:?}");
+
+    // A full window answers exactly as the cap did.
+    while cp.state().portal.signups.try_take().is_some() {}
+    let full = signup(&cp, "full-window-7c1", &fresh_email("full"), None).await;
+    assert_eq!(
+        (over.status, &over.body),
+        (full.status, &full.body),
+        "the cap's refusal differs from the window's"
+    );
+}
+
 #[tokio::test]
 async fn a_removed_member_can_be_invited_again() {
     let Some(cp) = TestCp::start().await else {
@@ -538,8 +745,17 @@ async fn a_removed_member_can_be_invited_again() {
 }
 
 /// The tenant routes a member of a tenant that is not active may still
-/// call; every other one answers `403 tenant_not_active`.
-const OPEN_WHILE_NOT_ACTIVE: [(&str, &str); 2] = [("GET", "/api/org"), ("POST", "/api/password")];
+/// call: to see the tenant's state, keep their own account, and close what
+/// should not outlive the suspension (a leaked key, a member who left).
+/// Every other one answers `403 tenant_not_active`.
+const OPEN_WHILE_NOT_ACTIVE: [(&str, &str); 6] = [
+    ("GET", "/api/org"),
+    ("POST", "/api/password"),
+    ("GET", "/api/keys"),
+    ("DELETE", "/api/keys/{id}"),
+    ("GET", "/api/members"),
+    ("DELETE", "/api/members/{id}"),
+];
 
 /// Every member route outside [`OPEN_WHILE_NOT_ACTIVE`] answers `cookie`
 /// with `403 tenant_not_active` and changes nothing.
@@ -565,7 +781,7 @@ async fn every_other_route_is_closed(cp: &TestCp, cookie: &str) {
 }
 
 #[tokio::test]
-async fn a_pending_tenant_can_read_its_session_and_org_but_nothing_else() {
+async fn a_pending_tenant_reaches_only_the_routes_open_while_not_active() {
     let Some(cp) = TestCp::start().await else {
         return;
     };
@@ -609,6 +825,239 @@ async fn a_pending_tenant_can_read_its_session_and_org_but_nothing_else() {
         .get_with_cookie("/api/org", &cookie_of(&again).expect("a cookie"))
         .await;
     assert_eq!(org.body["status"], "suspended", "{org:?}");
+}
+
+/// The ids and versions a revoke or a removal needs come from the lists, so
+/// a suspended tenant's lists stay open, read-only and as each role sees
+/// them: the owner lists the keys and the members and revokes a key at the
+/// version listed; a member lists only their own keys and no members; a
+/// billing member lists no keys. Everything else that reads or writes stays
+/// closed.
+#[tokio::test]
+async fn a_suspended_tenants_owner_lists_its_keys_and_members_and_revokes_from_the_list() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let op = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let tenant = cp.seed_tenant(TenantStatus::Active).await;
+    let owner = cp.member_login_seeded(tenant, MemberRole::Owner).await;
+    let member = join(
+        &cp,
+        &owner,
+        &fresh_email("lister"),
+        "member",
+        "lister-password-7c1",
+    )
+    .await;
+    let member_cookie = cookie_of(&member).expect("a cookie");
+    let billing = join(
+        &cp,
+        &owner,
+        &fresh_email("payer"),
+        "billing",
+        "payer-password-7c1",
+    )
+    .await;
+    let billing_cookie = cookie_of(&billing).expect("a cookie");
+    let owners_key = mint(&cp, owner.cookie(), "owners-7c1").await;
+    let members_key = mint(&cp, &member_cookie, "members-7c1").await;
+    act_on_tenant(&cp, &op, &tenant.to_string(), "suspend").await;
+
+    let keys = cp.get_with_cookie("/api/keys", owner.cookie()).await;
+    assert_eq!(keys.status, 200, "{keys:?}");
+    let items = keys.body["items"].as_array().expect("items").clone();
+    let mut listed = ids(&items);
+    listed.sort();
+    let mut minted = vec![owners_key.clone(), members_key.clone()];
+    minted.sort();
+    assert_eq!(listed, minted);
+    let members = listed_members(&cp, owner.cookie()).await;
+    assert_eq!(members.len(), 3, "{members:?}");
+
+    // A member sees their own key and no member list; billing, no keys.
+    let theirs = cp.get_with_cookie("/api/keys", &member_cookie).await;
+    assert_eq!(theirs.status, 200, "{theirs:?}");
+    assert_eq!(
+        ids(theirs.body["items"].as_array().expect("items")),
+        std::slice::from_ref(&members_key)
+    );
+    for (cookie, path) in [
+        (&member_cookie, "/api/members"),
+        (&billing_cookie, "/api/keys"),
+    ] {
+        let r = cp.get_with_cookie(path, cookie).await;
+        assert_eq!(r.status, 403, "{path}: {r:?}");
+        assert_eq!(r.body["code"], "forbidden", "{path}: {r:?}");
+    }
+
+    // The owner revokes the member's key at the version the list showed.
+    let listed_key = items
+        .iter()
+        .find(|k| k["id"] == members_key.as_str())
+        .expect("the member's key is listed");
+    let version = listed_key["version"].as_i64().expect("a version");
+    let status = send_if_match(
+        &cp,
+        owner.cookie(),
+        "DELETE",
+        &format!("/api/keys/{members_key}"),
+        version,
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, 204);
+    let keys = cp.get_with_cookie("/api/keys", owner.cookie()).await;
+    assert_eq!(
+        ids(keys.body["items"].as_array().expect("items")),
+        std::slice::from_ref(&owners_key)
+    );
+
+    // Nothing else opens: a single key, a mint, an invitation.
+    for (method, path, body) in [
+        ("GET", format!("/api/keys/{owners_key}"), None),
+        (
+            "POST",
+            "/api/keys".to_string(),
+            Some(json!({"label": "late-7c1"})),
+        ),
+        (
+            "POST",
+            "/api/members/invites".to_string(),
+            Some(json!({"email": fresh_email("late"), "role": "member"})),
+        ),
+    ] {
+        let r = cp.send(method, &path, Some(owner.cookie()), body).await;
+        assert_eq!(r.status, 403, "{method} {path}: {r:?}");
+        assert_eq!(r.body["code"], "tenant_not_active", "{method} {path}");
+    }
+}
+
+/// The key and member lists are reads: they answer while a change holds
+/// the tenant's row, rather than queueing behind it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_key_and_member_lists_do_not_wait_for_the_tenants_lock() {
+    let Some(cp) = TestCp::start_with(patient).await else {
+        return;
+    };
+    let tenant = cp.seed_tenant(TenantStatus::Active).await;
+    let owner = cp.member_login_seeded(tenant, MemberRole::Owner).await;
+    let mut holder = cp.db().pool().begin().await.expect("begin");
+    sqlx::query("SELECT 1 FROM tenants WHERE id = $1 FOR UPDATE")
+        .bind(tenant)
+        .execute(&mut *holder)
+        .await
+        .expect("hold the tenant");
+    for path in ["/api/keys", "/api/members"] {
+        let r = tokio::time::timeout(
+            Duration::from_secs(3),
+            cp.get_with_cookie(path, owner.cookie()),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{path} waited for the tenant's lock"));
+        assert_eq!(r.status, 200, "{path}: {r:?}");
+    }
+    holder.rollback().await.expect("release the tenant");
+}
+
+/// A suspended or pending tenant can still close what must not outlive the
+/// suspension: it revokes a leaked key and removes a member who left. A key
+/// revoked meanwhile stays revoked through the reactivation, which opens
+/// only the keys still live; and a member removed before the approval gets
+/// no user document from it.
+#[tokio::test]
+async fn a_tenant_that_is_not_active_can_still_revoke_its_keys_and_remove_a_member() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let op = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let tenant = cp.seed_tenant(TenantStatus::Active).await;
+    let owner = cp.member_login_seeded(tenant, MemberRole::Owner).await;
+    let joined = join(
+        &cp,
+        &owner,
+        &fresh_email("leaver"),
+        "member",
+        "leaver-password-7c1",
+    )
+    .await;
+    let leaver = text(&joined.body, "/member/id");
+    let leaked = mint(&cp, owner.cookie(), "leaked-7c1").await;
+    let kept = mint(&cp, owner.cookie(), "kept-7c1").await;
+    let leavers = mint(&cp, &cookie_of(&joined).expect("a cookie"), "leaver-7c1").await;
+    let tenant = tenant.to_string();
+    act_on_tenant(&cp, &op, &tenant, "suspend").await;
+
+    let status = send_if_match(
+        &cp,
+        owner.cookie(),
+        "DELETE",
+        &format!("/api/keys/{leaked}"),
+        1,
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, 204);
+    let r = remove_member(&cp, &owner, &leaver).await;
+    assert_eq!(r.status, 204, "{r:?}");
+    assert!(member_row(&cp, &leaver).await.2, "not removed");
+    for (kind, id) in [
+        ("api_keys", &leaked),
+        ("api_keys", &leavers),
+        ("users", &leaver),
+    ] {
+        let (_, _, deleted) = resource(&cp, kind, id).await.expect("a document");
+        assert!(deleted, "{kind}/{id} outlived its revocation");
+    }
+
+    act_on_tenant(&cp, &op, &tenant, "reactivate").await;
+    let (doc, _, _) = resource(&cp, "api_keys", &kept)
+        .await
+        .expect("a key document");
+    assert_eq!(doc["disabled"], false, "{doc}");
+    for key in [&leaked, &leavers] {
+        let (_, _, deleted) = resource(&cp, "api_keys", key).await.expect("a document");
+        assert!(deleted, "the reactivation brought back {key}");
+    }
+    let listed = cp.get_with_cookie("/api/keys", owner.cookie()).await;
+    assert_eq!(listed.status, 200, "{listed:?}");
+    assert_eq!(ids(listed.body["items"].as_array().expect("items")), [kept]);
+
+    // While the tenant still waits for approval, too.
+    let r = signup(&cp, "waiting-7c1", &fresh_email("waiting"), None).await;
+    assert_eq!(r.status, 201, "{r:?}");
+    let waiting = text(&r.body, "/tenant/id");
+    let founder = text(&r.body, "/member/id");
+    let founder_cookie = cookie_of(&r).expect("a cookie");
+    let invited = cp
+        .send(
+            "POST",
+            &format!("/admin/tenants/{waiting}/invites"),
+            Some(op.cookie()),
+            Some(json!({"email": fresh_email("early"), "role": "member"})),
+        )
+        .await;
+    assert_eq!(invited.status, 201, "{invited:?}");
+    let a = accept(
+        &cp,
+        &text(&invited.body, "/invite_token"),
+        "early-password-7c1",
+        None,
+    )
+    .await;
+    assert_eq!(a.status, 201, "{a:?}");
+    let early = text(&a.body, "/member/id");
+    let r = cp
+        .send(
+            "DELETE",
+            &format!("/api/members/{early}"),
+            Some(&founder_cookie),
+            None,
+        )
+        .await;
+    assert_eq!(r.status, 204, "{r:?}");
+    act_on_tenant(&cp, &op, &waiting, "approve").await;
+    assert_eq!(resource(&cp, "users", &early).await, None);
+    assert!(resource(&cp, "users", &founder).await.is_some());
 }
 
 #[tokio::test]
@@ -1151,6 +1600,11 @@ async fn the_users_document_names_no_email() {
     let named = signup(&cp, "users-7c1", &named_email, Some("Cyd 7c1")).await;
     let unnamed_email = fresh_email("unnamed-7c1");
     let unnamed = signup(&cp, "users-7c1", &unnamed_email, None).await;
+    // A signup's user is written when its tenant is approved.
+    let op = cp.admin_login_seeded(OperatorRole::Operator).await;
+    for r in [&named, &unnamed] {
+        act_on_tenant(&cp, &op, &text(&r.body, "/tenant/id"), "approve").await;
+    }
     let tenant = cp.seed_tenant(TenantStatus::Active).await;
     let owner = cp.member_login_seeded(tenant, MemberRole::Owner).await;
     let joined_email = fresh_email("joined-7c1");

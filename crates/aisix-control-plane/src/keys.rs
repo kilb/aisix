@@ -1319,12 +1319,15 @@ impl From<AdminUpdateKey> for Changes {
 }
 
 /// `GET /api/keys` → `{items: [TenantKey]}`: every live key of the tenant
-/// for an owner or an admin, a member's own for a member.
+/// for an owner or an admin, a member's own for a member. Open while the
+/// tenant is pending or suspended too, so that a key can be found, with its
+/// version, to be revoked (`DELETE /api/keys/{id}`). A read: the caller is
+/// judged as the session's own read of them found them, and no tenant lock
+/// is waited for.
 pub async fn list(
     auth: MemberAuth,
     State(state): State<AppState>,
 ) -> Result<Json<Value>, ApiError> {
-    auth.require_active()?;
     auth.require(KEY_HOLDERS)?;
     let mut conn = state.db.pool().acquire().await.map_err(DbError::from)?;
     let keys = select(&mut conn, None, Some(auth.tenant_id), own_only(&auth)).await?;
@@ -1461,13 +1464,14 @@ pub async fn update(
 }
 
 /// `DELETE /api/keys/{id}` with `If-Match` → `204`: the key is revoked.
+/// Open while the tenant is pending or suspended too: a leaked key must not
+/// come back with a reactivation, which opens only the keys still live.
 pub async fn revoke(
     auth: MemberAuth,
     State(state): State<AppState>,
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
-    auth.require_active()?;
     auth.require(KEY_HOLDERS)?;
     let id = key_id(&id)?;
     let expected = if_match(&headers);
@@ -1476,8 +1480,8 @@ pub async fn revoke(
         .db
         .tx(move |conn| {
             async move {
-                let (auth, tenant) = holder(&mut *conn, &auth).await?;
-                let key = live_key(&mut *conn, id, Some(tenant.id), own_only(&auth)).await?;
+                let auth = members::current_in_any_state(&mut *conn, &auth, KEY_HOLDERS).await?;
+                let key = live_key(&mut *conn, id, Some(auth.tenant_id), own_only(&auth)).await?;
                 check_version(&key, expected)?;
                 revoke_key(conn, &ctx, &key, member_actor(&auth)).await
             }
@@ -1512,7 +1516,9 @@ pub async fn admin_list(
 
 /// `POST /admin/tenants/{id}/keys` with `{label, member_id?, model_ids?,
 /// allowed_models?, allowed_provider_groups?, rate_limit?, expires_at?}` →
-/// `201 {key: AdminKey, plaintext}`, in a tenant of any status.
+/// `201 {key: AdminKey, plaintext}`, in an active or a suspended tenant. A
+/// pending tenant is `409 tenant_state`: it gives the gateways nothing until
+/// it is approved, and a key would need its team and its member's user.
 pub async fn admin_create(
     auth: OperatorAuth,
     State(state): State<AppState>,
@@ -1527,6 +1533,12 @@ pub async fn admin_create(
         .tx(move |conn| {
             async move {
                 let tenant = tenants::lock(&mut *conn, tenant_id).await?;
+                if tenant.status == TenantStatus::Pending {
+                    return Err(ApiError::conflict(
+                        "tenant_state",
+                        "租户尚未通过审核，审核通过后才能创建密钥",
+                    ));
+                }
                 let member_id = match req.member_id.as_deref() {
                     None => None,
                     Some(raw) => Some(bound_member(&mut *conn, tenant.id, raw).await?),

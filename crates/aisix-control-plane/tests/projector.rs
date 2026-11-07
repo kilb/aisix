@@ -1258,6 +1258,100 @@ async fn reconcile_deletes_nothing_when_strays_exceed_the_threshold() {
     assert_eq!(setting(db, "reconcile_blocked").await, Some(json!(false)));
 }
 
+/// Puts `n` stray keys under `prefix`.
+async fn put_strays(kine: &Client, prefix: &str, n: usize) {
+    for _ in 0..n {
+        raw_put(kine, &format!("{prefix}models/{}", Uuid::new_v4()), b"{}").await;
+    }
+}
+
+/// Runs an unasked reconcile on `cp` with `strays` strays among the
+/// prefix's `base` keys, and requires it to delete them all when `deleted`
+/// and none, blocked, otherwise; strays it leaves are removed with an
+/// admin's `allow_deletes` afterwards.
+async fn reconcile_with(
+    cp: &TestCp,
+    kine: &Client,
+    cookie: &str,
+    base: usize,
+    strays: usize,
+    deleted: bool,
+) {
+    let (db, prefix) = (cp.db(), cp.env().env_prefix());
+    put_strays(kine, &prefix, strays).await;
+    let r = reconcile_api(cp, cookie, false).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let removed = if deleted { strays } else { 0 };
+    assert_eq!(
+        r.body,
+        json!({"deleted_strays": removed, "marked_dirty": 0}),
+        "{strays} strays among {base} keys"
+    );
+    assert_eq!(
+        setting(db, "reconcile_blocked").await,
+        Some(json!(!deleted)),
+        "{strays} strays among {base} keys"
+    );
+    if !deleted {
+        let r = reconcile_api(cp, cookie, true).await;
+        assert_eq!(r.body["deleted_strays"], strays, "{r:?}");
+    }
+    assert_eq!(raw_keys(kine, &prefix).await.len(), base);
+}
+
+/// However few keys the prefix holds, an unasked reconcile deletes up to 10
+/// strays (ruling 28's floor), and blocks at 11.
+#[tokio::test]
+async fn reconcile_deletes_ten_strays_on_its_own_and_blocks_at_eleven() {
+    let Some(cp) = TestCp::start_with_kine().await else {
+        return;
+    };
+    let kine = raw_kine(&support::kine_endpoint().expect("kine is configured")).await;
+    let admin = cp.admin_login_seeded(OperatorRole::Admin).await;
+    let (db, env) = (cp.db(), cp.env());
+    for _ in 0..2 {
+        create_key(db, env, &unique("acct")).await;
+    }
+    all_projected(db).await;
+    let base = raw_keys(&kine, &env.env_prefix()).await.len();
+    // So few keys that 5% of them, strays included, is below the floor.
+    assert!((base + 11) * 5 <= 100 * 10, "{base} keys");
+    reconcile_with(&cp, &kine, admin.cookie(), base, 10, true).await;
+    reconcile_with(&cp, &kine, admin.cookie(), base, 11, false).await;
+}
+
+/// Among enough keys that 5% of them is past the floor, an unasked
+/// reconcile deletes up to 5% of the prefix's keys (strays included,
+/// rounded up), and blocks one past it.
+#[tokio::test]
+async fn reconcile_deletes_up_to_five_percent_of_a_large_prefix_on_its_own() {
+    let Some(cp) = TestCp::start_with_kine().await else {
+        return;
+    };
+    let kine = raw_kine(&support::kine_endpoint().expect("kine is configured")).await;
+    let admin = cp.admin_login_seeded(OperatorRole::Admin).await;
+    let (db, env) = (cp.db(), cp.env());
+    let writes = (0..400)
+        .map(|_| {
+            let doc = provider_key(&unique("bulk"), SECRET);
+            (Kind::ProviderKeys, Uuid::new_v4(), Op::Create(doc))
+        })
+        .collect();
+    write_all(db, env, writes).await;
+    all_projected(db).await;
+    let base = raw_keys(&kine, &env.env_prefix()).await.len();
+    // The most strays that are at most 5% of every key, theirs included,
+    // rounded up.
+    let five_percent = |strays: usize| strays <= ((base + strays) * 5).div_ceil(100);
+    let most = (0..base)
+        .take_while(|&s| five_percent(s))
+        .last()
+        .expect("some strays are 5%");
+    assert!(most > 10, "5% of {base} keys is past the floor");
+    reconcile_with(&cp, &kine, admin.cookie(), base, most, true).await;
+    reconcile_with(&cp, &kine, admin.cookie(), base, most + 1, false).await;
+}
+
 #[tokio::test]
 async fn reconcile_rewrites_a_key_whose_bytes_drifted() {
     let Some(cp) = TestCp::start_with_kine().await else {

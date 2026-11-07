@@ -304,12 +304,7 @@ impl<S: Send + Sync> FromRequest<S> for Events {
                 wait_secs = BODY_READ_WAIT.as_secs(),
                 "a usage batch body did not finish arriving; answered 408 and freed its slot"
             );
-            return Err(ApiError {
-                status: StatusCode::REQUEST_TIMEOUT,
-                code: "request_timeout",
-                message: format!("请求体未在 {} 秒内传完", BODY_READ_WAIT.as_secs()),
-                ..ApiError::unavailable()
-            });
+            return Err(ApiError::request_timeout(BODY_READ_WAIT));
         };
         match read {
             Ok(Json(batch)) if batch.events.over_cap => Err(ApiError {

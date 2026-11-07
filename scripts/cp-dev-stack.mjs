@@ -370,9 +370,11 @@ async function httpOk(url) {
 async function api(httpUrl, method, path, cookie, body) {
   const res = await fetch(`${httpUrl}${path}`, {
     method,
+    // Labelled JSON with or without a body: the control plane refuses a
+    // mutating request that is not.
     headers: {
       ...(cookie ? { cookie } : {}),
-      ...(body === undefined ? {} : { "content-type": "application/json" }),
+      "content-type": "application/json",
     },
     body: body === undefined ? undefined : JSON.stringify(body),
   });

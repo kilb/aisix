@@ -142,6 +142,23 @@ impl ApiError {
         )
     }
 
+    /// A request body that had not arrived whole `after` it was started.
+    pub fn request_timeout(after: std::time::Duration) -> ApiError {
+        Self::new(
+            StatusCode::REQUEST_TIMEOUT,
+            "request_timeout",
+            format!("请求体未在 {} 秒内传完", after.as_secs()),
+        )
+    }
+
+    pub fn unsupported_media_type() -> ApiError {
+        Self::new(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "unsupported_media_type",
+            "请求必须带 Content-Type: application/json 请求头",
+        )
+    }
+
     pub fn unavailable() -> ApiError {
         Self::new(
             StatusCode::SERVICE_UNAVAILABLE,

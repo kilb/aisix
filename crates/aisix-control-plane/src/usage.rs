@@ -290,25 +290,30 @@ fn required(fields: &Map<String, Value>) -> Result<(String, DateTime<Utc>), &'st
 }
 
 /// `value` with every NUL in its strings and keys replaced by U+FFFD.
-/// Bounded in depth by the JSON parser's own nesting limit.
-fn without_nul(value: Value) -> Value {
-    fn text(s: String) -> String {
-        if s.contains('\0') {
-            s.replace('\0', "\u{fffd}")
-        } else {
-            s
-        }
-    }
+/// Bounded in depth by the JSON parser's own nesting limit. Whatever a
+/// gateway sends that is stored as text or `jsonb` goes through this or
+/// [`text_without_nul`] first, so that no character it carries can fail its
+/// write.
+pub(crate) fn without_nul(value: Value) -> Value {
     match value {
-        Value::String(s) => Value::String(text(s)),
+        Value::String(s) => Value::String(text_without_nul(s)),
         Value::Array(items) => Value::Array(items.into_iter().map(without_nul).collect()),
         Value::Object(fields) => Value::Object(
             fields
                 .into_iter()
-                .map(|(k, v)| (text(k), without_nul(v)))
+                .map(|(k, v)| (text_without_nul(k), without_nul(v)))
                 .collect(),
         ),
         other => other,
+    }
+}
+
+/// `s` with every NUL replaced by U+FFFD.
+pub(crate) fn text_without_nul(s: String) -> String {
+    if s.contains('\0') {
+        s.replace('\0', "\u{fffd}")
+    } else {
+        s
     }
 }
 

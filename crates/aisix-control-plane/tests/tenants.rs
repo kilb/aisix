@@ -7,12 +7,14 @@
 
 mod support;
 
+use std::sync::Arc;
+
 use aisix_control_plane::audit::Actor;
-use aisix_control_plane::auth::OperatorRole;
+use aisix_control_plane::auth::{MemberRole, OperatorRole};
 use aisix_control_plane::crypto::MasterKey;
 use aisix_control_plane::db::DbError;
 use aisix_control_plane::resources::validate::{validate_lenient, validate_strict};
-use aisix_control_plane::resources::write::WriteCtx;
+use aisix_control_plane::resources::write::{WriteCtx, RESOURCES_LOCK_KEY};
 use aisix_control_plane::resources::Kind;
 use aisix_control_plane::tenants::{self, BillingMode, TenantLimits, TenantStatus};
 use futures::FutureExt;
@@ -49,8 +51,10 @@ impl Admin<'_> {
             .build()
             .expect("an HTTP client");
         let method = reqwest::Method::from_bytes(method.as_bytes()).expect("an HTTP method");
+        // Labelled JSON with or without a body, as the Dashboard sends it.
         let mut request = client
             .request(method, self.cp.url(path))
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
             .header(reqwest::header::COOKIE, &self.cookie);
         if let Some(v) = if_match {
             request = request.header(reqwest::header::IF_MATCH, v);
@@ -537,10 +541,9 @@ async fn approving_a_pending_tenant_writes_its_default_limits_policy() {
     };
     let admin = Admin::as_role(&cp, OperatorRole::Operator).await;
     let id = pending_tenant(&cp, "signup-7c1").await;
-    let team = row(&cp, "teams", &id).await.expect("a team document");
-    assert_eq!(team.doc, json!({"name": "signup-7c1"}));
-    assert_eq!(team.managed_by, Some(format!("tenant:{id}")));
-    // A pending tenant is not served, so it is not limited either.
+    // A pending tenant is not served, so the gateways are given nothing of
+    // it: no team, and no limit either.
+    assert!(row(&cp, "teams", &id).await.is_none());
     assert_eq!(owned_policies(&cp, &id).await, 0);
     let t = admin.tenant(&id).await;
     assert_eq!(t["status"], "pending");
@@ -558,6 +561,9 @@ async fn approving_a_pending_tenant_writes_its_default_limits_policy() {
             .await
             .expect("read the tenant");
     assert_eq!(approved_by, Some(admin.id));
+    let team = row(&cp, "teams", &id).await.expect("a team document");
+    assert_eq!(team.doc, json!({"name": "signup-7c1"}));
+    assert_eq!(team.managed_by, Some(format!("tenant:{id}")));
     let pid = limits_policy_id(&cp, &id)
         .await
         .expect("a limits policy id");
@@ -1416,11 +1422,284 @@ async fn a_tenant_view_carries_the_worst_rollout_of_its_documents() {
     assert_eq!(entry["rollout"], r.body["rollout"]);
 }
 
-#[tokio::test]
-async fn several_tenants_are_locked_in_ascending_id_order() {
-    let Some(cp) = TestCp::start().await else {
+fn patient(cfg: &mut aisix_control_plane::config::CpConfig) {
+    cfg.db_lock_timeout_ms = 120_000;
+}
+
+/// Sessions of this test's database waiting for a lock.
+async fn lock_waiters(cp: &TestCp) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM pg_stat_activity \
+         WHERE datname = current_database() AND wait_event_type = 'Lock'",
+    )
+    .fetch_one(cp.db().pool())
+    .await
+    .expect("count lock waiters")
+}
+
+async fn until_lock_waiters(cp: &TestCp, n: i64) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while lock_waiters(cp).await < n {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{n} lock waiters never appeared"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+}
+
+/// Whether some other transaction holds the resources lock right now.
+async fn resources_lock_held(cp: &TestCp) -> bool {
+    let mut probe = cp.db().pool().begin().await.expect("begin");
+    let free: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1)")
+        .bind(RESOURCES_LOCK_KEY)
+        .fetch_one(&mut *probe)
+        .await
+        .expect("try the resources lock");
+    probe.rollback().await.expect("end the probe");
+    !free
+}
+
+/// `method path` as `cookie`, labelled JSON, with `If-Match` and a body
+/// when given; the status.
+async fn fire(
+    cp: Arc<TestCp>,
+    method: &'static str,
+    path: String,
+    cookie: String,
+    if_match: Option<i64>,
+    body: Option<Value>,
+) -> u16 {
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("an HTTP client");
+    let method = reqwest::Method::from_bytes(method.as_bytes()).expect("an HTTP method");
+    let mut request = client
+        .request(method, cp.url(&path))
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .header(reqwest::header::COOKIE, cookie);
+    if let Some(v) = if_match {
+        request = request.header(reqwest::header::IF_MATCH, format!("\"{v}\""));
+    }
+    if let Some(body) = body {
+        request = request.json(&body);
+    }
+    request
+        .send()
+        .await
+        .expect("send the request")
+        .status()
+        .as_u16()
+}
+
+/// A request in flight, as [`fire`] sends it: its status.
+type Request = std::pin::Pin<Box<dyn std::future::Future<Output = u16> + Send>>;
+
+/// Runs `request` while another transaction holds tenant `tenant`'s row,
+/// and requires that, while it waits for the tenant, it holds no
+/// resources lock: the lock order is the tenant first. Then lets it finish;
+/// its status.
+async fn waits_for_the_tenant_first(
+    cp: &Arc<TestCp>,
+    tenant: Uuid,
+    what: &str,
+    request: impl std::future::Future<Output = u16> + Send + 'static,
+) -> u16 {
+    let mut holder = cp.db().pool().begin().await.expect("begin");
+    sqlx::query("SELECT 1 FROM tenants WHERE id = $1 FOR UPDATE")
+        .bind(tenant)
+        .execute(&mut *holder)
+        .await
+        .expect("hold the tenant");
+    let request = tokio::spawn(request);
+    until_lock_waiters(cp, 1).await;
+    let inverted = resources_lock_held(cp).await;
+    holder.rollback().await.expect("release the tenant");
+    let status = request.await.expect("join");
+    assert!(
+        !inverted,
+        "{what} took the resources lock before the tenant's: the lock order is inverted"
+    );
+    status
+}
+
+/// Every path that writes a tenant's documents takes the tenant's lock
+/// before the resources lock, which `write_resource` takes: a path that
+/// took them the other way round would deadlock with one that does not.
+/// Each request below is sent while the tenant's row is held elsewhere,
+/// and while it waits for that row the resources lock must be free.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_tenant_write_takes_the_tenant_before_the_resources_lock() {
+    let Some(cp) = TestCp::start_with(patient).await else {
         return;
     };
+    let cp = Arc::new(cp);
+    let session = cp.admin_login_seeded(OperatorRole::Admin).await;
+    let op = session.cookie().to_string();
+    let admin = Admin::as_role(&cp, OperatorRole::Admin).await;
+    let created = admin.create_tenant("order-7c1").await;
+    let tenant = Uuid::parse_str(&id_of(&created)).expect("a uuid");
+    let pk = admin
+        .create(
+            "provider_keys",
+            provider_key("acct-order-7c1", json!(["shared"])),
+        )
+        .await;
+    let model = admin
+        .create("models", direct_model("order-model-7c1", &pk))
+        .await;
+    let r = admin
+        .patch_tenant(
+            &tenant.to_string(),
+            1,
+            json!({"allowed_model_ids": [model]}),
+        )
+        .await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let owner = cp.member_login_seeded(tenant, MemberRole::Owner).await;
+    let member = cp.seed_member(tenant, MemberRole::Member).await;
+    let leaver = cp.seed_member(tenant, MemberRole::Member).await;
+    let r = admin
+        .post(
+            &format!("/admin/tenants/{tenant}/invites"),
+            json!({"email": format!("order-{}@tenant.test", Uuid::new_v4().simple()), "role": "member"}),
+        )
+        .await;
+    assert_eq!(r.status, 201, "{r:?}");
+    let invite = r.body["invite_token"]
+        .as_str()
+        .expect("a token")
+        .to_string();
+
+    let cases: Vec<(&str, Request, u16)> = vec![
+        (
+            "PATCH /admin/tenants/{id}",
+            Box::pin(fire(
+                cp.clone(),
+                "PATCH",
+                format!("/admin/tenants/{tenant}"),
+                op.clone(),
+                Some(2),
+                Some(json!({"name": "order-renamed-7c1"})),
+            )),
+            200,
+        ),
+        (
+            "POST /admin/tenants/{id}/keys",
+            Box::pin(fire(
+                cp.clone(),
+                "POST",
+                format!("/admin/tenants/{tenant}/keys"),
+                op.clone(),
+                None,
+                Some(json!({"label": "order-op-key-7c1"})),
+            )),
+            201,
+        ),
+        (
+            "POST /api/keys",
+            Box::pin(fire(
+                cp.clone(),
+                "POST",
+                "/api/keys".to_string(),
+                owner.cookie().to_string(),
+                None,
+                Some(json!({"label": "order-key-7c1"})),
+            )),
+            201,
+        ),
+        (
+            "PATCH /admin/members/{id}",
+            Box::pin(fire(
+                cp.clone(),
+                "PATCH",
+                format!("/admin/members/{}", member.id),
+                op.clone(),
+                None,
+                Some(json!({"disabled": true})),
+            )),
+            200,
+        ),
+        (
+            "DELETE /api/members/{id}",
+            Box::pin(fire(
+                cp.clone(),
+                "DELETE",
+                format!("/api/members/{}", leaver.id),
+                owner.cookie().to_string(),
+                None,
+                None,
+            )),
+            204,
+        ),
+        (
+            "POST /api/invites/accept",
+            Box::pin(fire(
+                cp.clone(),
+                "POST",
+                "/api/invites/accept".to_string(),
+                String::new(),
+                None,
+                Some(json!({"token": invite, "password": "order-password-7c1"})),
+            )),
+            201,
+        ),
+        (
+            "POST /admin/tenants/{id}/suspend",
+            Box::pin(fire(
+                cp.clone(),
+                "POST",
+                format!("/admin/tenants/{tenant}/suspend"),
+                op.clone(),
+                None,
+                None,
+            )),
+            200,
+        ),
+        (
+            "POST /admin/tenants/{id}/reactivate",
+            Box::pin(fire(
+                cp.clone(),
+                "POST",
+                format!("/admin/tenants/{tenant}/reactivate"),
+                op.clone(),
+                None,
+                None,
+            )),
+            200,
+        ),
+        // A model delete withdraws the model from its holders' grants, so it
+        // locks those tenants first.
+        (
+            "DELETE /admin/resources/models/{id}",
+            Box::pin(fire(
+                cp.clone(),
+                "DELETE",
+                format!("/admin/resources/models/{model}"),
+                op.clone(),
+                Some(1),
+                None,
+            )),
+            200,
+        ),
+    ];
+    for (what, request, expected) in cases {
+        let status = waits_for_the_tenant_first(&cp, tenant, what, request).await;
+        assert_eq!(status, expected, "{what}");
+    }
+}
+
+/// Several tenants are locked in ascending id order, whatever order they
+/// are named in, so two transactions locking overlapping sets cannot
+/// deadlock. While the higher id is held elsewhere, a transaction locking
+/// both has already taken the lower one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn several_tenants_are_locked_in_ascending_id_order() {
+    let Some(cp) = TestCp::start_with(patient).await else {
+        return;
+    };
+    let cp = Arc::new(cp);
     let admin = Admin::as_role(&cp, OperatorRole::Operator).await;
     let mut created = Vec::new();
     for name in ["lock-a-7c1", "lock-b-7c1", "lock-c-7c1"] {
@@ -1428,18 +1707,44 @@ async fn several_tenants_are_locked_in_ascending_id_order() {
     }
     let mut sorted = created.clone();
     sorted.sort();
-    let mut ids = vec![sorted[2], sorted[0], sorted[1], sorted[0]];
-    let locked = cp
-        .db()
-        .tx(move |conn| {
-            async move {
-                let rows = tenants::lock_many(conn, &mut ids).await?;
-                Ok::<_, aisix_control_plane::error::ApiError>((ids, rows))
-            }
-            .boxed()
-        })
+    let (low, high) = (sorted[0], sorted[2]);
+
+    let mut holder = cp.db().pool().begin().await.expect("begin");
+    sqlx::query("SELECT 1 FROM tenants WHERE id = $1 FOR UPDATE")
+        .bind(high)
+        .execute(&mut *holder)
         .await
-        .expect("lock");
+        .expect("hold the highest tenant");
+    let locking = tokio::spawn({
+        let cp = cp.clone();
+        let mut ids = vec![sorted[2], sorted[0], sorted[1], sorted[0]];
+        async move {
+            cp.db()
+                .tx(move |conn| {
+                    async move {
+                        let rows = tenants::lock_many(conn, &mut ids).await?;
+                        Ok::<_, aisix_control_plane::error::ApiError>((ids, rows))
+                    }
+                    .boxed()
+                })
+                .await
+        }
+    });
+    until_lock_waiters(&cp, 1).await;
+    // The lower ids are taken already: a probe cannot have the lowest.
+    let mut probe = cp.db().pool().begin().await.expect("begin");
+    let taken = sqlx::query("SELECT 1 FROM tenants WHERE id = $1 FOR UPDATE NOWAIT")
+        .bind(low)
+        .execute(&mut *probe)
+        .await
+        .is_err();
+    probe.rollback().await.expect("end the probe");
+    holder.rollback().await.expect("release the highest tenant");
+    let locked = locking.await.expect("join").expect("lock");
+    assert!(
+        taken,
+        "the lowest id was not locked while the highest was awaited: not in ascending order"
+    );
     assert_eq!(locked.0, sorted);
     assert_eq!(locked.1.iter().map(|t| t.id).collect::<Vec<_>>(), sorted);
     let missing = cp

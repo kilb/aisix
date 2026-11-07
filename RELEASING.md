@@ -4,6 +4,15 @@ How an AISIX OSS release is cut.
 
 ## 1. Tag
 
+Before tagging a stable `vX.Y.Z`, pin the control plane's gateway-version
+floors: replace every `Since::ThisRelease` in
+`crates/aisix-control-plane/src/compat.rs` with `Since::Version("X.Y.Z")`, the
+version being tagged without its `v`, and tag the commit that carries the
+change. `ThisRelease` means "the release this control plane reports", so a row
+left unpinned would demand the next release's gateways once the next release
+ships. An `-rc.N` tag needs no edit: an rc control plane reads its own stamp
+and asks for that rc.
+
 ```bash
 git tag vX.Y.Z <commit>
 git push origin vX.Y.Z

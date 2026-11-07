@@ -55,6 +55,9 @@ hyper = { version = "1", features = ["server", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["tokio", "server", "http1", "http2", "service"] }
 # `ServiceExt::oneshot`, to hand each request to the router.
 tower = { version = "0.5", features = ["util"] }
+# TCP keepalive on the gateway listener's accepted sockets, which tokio does
+# not set (0.5.10 in Cargo.lock).
+socket2 = "0.5"
 # Release versions a heartbeat reports, compared with this build's
 # (1.0.28 in Cargo.lock).
 semver = "1"
@@ -96,3 +99,5 @@ aisix-etcd = { path = "../aisix-etcd" }
 # A raw HTTP/2 client, to see the GOAWAY a refused gateway's connection gets
 # (0.4.20 in Cargo.lock).
 h2 = "0.4"
+# `test-util` plays a body read's wait out on a paused clock.
+tokio = { version = "1", features = ["test-util"] }
