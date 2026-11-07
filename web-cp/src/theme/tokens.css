@@ -1,0 +1,182 @@
+/* Design tokens: the wayfinding language shared by the operator Dashboard
+   (web-cp) and the tenant portal (web-tenant). Both apps carry a byte-equal
+   copy of this file; a unit test in each pins the two together, so change
+   them together.
+
+   Light is the default whatever the system setting. Dark applies only when
+   the viewer chooses it with the theme toggle, which sets
+   <html data-theme="dark">. Nothing here reads prefers-color-scheme.
+
+   Only custom properties live here. Element styles are in base.css and the
+   components' stylesheet. */
+
+:root {
+  color-scheme: light;
+
+  /* Palette. Sign yellow is only ever a fill with Ink text on it. */
+  --ink: #1C2A39;
+  --concrete: #F5F7F4;
+  --paper: #FFFFFF;
+  --sign: #FFC72C;
+  --sign-hover: #F5BA14;
+  --sign-press: #E5A900;
+  --line: #2B63D9;
+  --line-press: #1E4DB3;
+  --proceed: #18916A;
+  --stop: #D2433B;
+  --n1: #3B4A5A;
+  --n2: #66737F;
+  --n3: #A7B0B7;
+  --n4: #D5DBD8;
+  /* Hairlines are Ink at a low opacity, so they take the hue of whatever
+     they sit on instead of reading as a flat grey. Inner dividers are
+     lighter than panel edges. */
+  --hairline: rgba(28, 42, 57, 0.10);
+  --hairline-inner: rgba(28, 42, 57, 0.065);
+
+  /* Route colours: provider groups and routing lines, assigned by name
+     hash and shown as a short bar beside the name. Dashboard only. */
+  --route-1: #2B63D9;
+  --route-2: #18916A;
+  --route-3: #C2410C;
+  --route-4: #7C3AED;
+  --route-5: #0E7490;
+  --route-6: #B45309;
+
+  /* Roles. Components read these, never the palette directly. */
+  --bg: var(--concrete);
+  --surface: var(--paper);
+  /* A layer above a surface: a tooltip, a menu. The same white in light;
+     a step lighter in dark, where shadows do not read. */
+  --surface-raised: var(--paper);
+  --text: var(--ink);
+  --text-2: var(--n1);
+  --text-muted: var(--n2);
+  --border: var(--hairline);
+  --divider: var(--hairline-inner);
+  /* A field's boundary needs 3:1 against its surface (WCAG 1.4.11); the
+     hairline is about 1.4:1, so inputs take Neutral 2. */
+  --input-border: var(--n2);
+  --input-border-hover: var(--n1);
+  --focus: var(--line);
+  --link: var(--line);
+  --error: var(--stop);
+  --on-sign: var(--ink);
+  /* The destructive fill keeps white text at AA in both themes. */
+  --stop-fill: #D2433B;
+  --stop-fill-hover: #BC3A33;
+  --stop-fill-press: #A3312B;
+  --on-stop: #FFFFFF;
+  --route-line: var(--ink);
+
+  /* Signal lamps: a dot beside a word, never colour alone. */
+  --lamp-applied: var(--proceed);
+  --lamp-progress: var(--line);
+  --lamp-pending: var(--text-2);
+  --lamp-rejected: var(--stop);
+  --lamp-disabled: var(--n3);
+
+  /* Interaction washes. */
+  --hover: rgba(28, 42, 57, 0.05);
+  --press: rgba(28, 42, 57, 0.10);
+  --row-hover: var(--concrete);
+  --chip: rgba(28, 42, 57, 0.07);
+  --skeleton: rgba(28, 42, 57, 0.07);
+  --scrollbar: rgba(28, 42, 57, 0.28);
+  --selection: rgba(255, 199, 44, 0.35);
+  --inset: inset 0 1px 0 rgba(28, 42, 57, 0.18);
+  --tooltip-bg: var(--ink);
+  --tooltip-text: #FFFFFF;
+
+  /* Depth. Panels have a hairline and no shadow; only a floating layer
+     (menu, popover, toast) has one. */
+  --shadow-float: 0 1px 2px rgba(28, 42, 57, 0.06), 0 8px 24px rgba(28, 42, 57, 0.12);
+
+  /* Shape. Radius follows hierarchy: fields and table rows, then buttons
+     and chips, then panels and dialogs. Full round is for lamps and stops. */
+  --r-input: 2px;
+  --r-button: 6px;
+  --r-chip: 6px;
+  --r-panel: 10px;
+  --r-round: 999px;
+
+  /* Spacing: a 4px grid, in these steps only. */
+  --s-1: 4px;
+  --s-2: 8px;
+  --s-3: 12px;
+  --s-4: 16px;
+  --s-5: 20px;
+  --s-6: 24px;
+  --s-8: 32px;
+  --s-10: 40px;
+  --s-12: 48px;
+
+  /* Sizes of controls and rows. */
+  --h-control: 36px;
+  --h-control-sm: 32px;
+  --h-row: 44px;
+  --h-row-compact: 36px;
+  --h-head: 36px;
+  --icon: 16px;
+
+  /* Type. Overpass for Latin and figures, the system face for Chinese. */
+  --font-sans: "Overpass", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans SC", sans-serif;
+  --font-mono: "Overpass Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  --fs-12: 12px;
+  --fs-13: 13px;
+  --fs-15: 15px;
+  --fs-19: 19px;
+  --fs-23: 23px;
+  --fs-29: 29px;
+  --fs-36: 36px;
+  --fs-45: 45px;
+  --lh-body: 1.6;
+  --lh-table: 1.4;
+  --lh-heading: 1.2;
+  --tracking-heading: -0.01em;
+
+  /* Motion. prefers-reduced-motion removes all of it (base.css). */
+  --t-fast: 120ms;
+  --t-panel: 160ms;
+  --t-leave: 200ms;
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+
+  /* Signal colours lifted one step to read on the dark ground. Sign yellow
+     is unchanged, with Ink text on it. */
+  --line: #5B8BF0;
+  --line-press: #8AACF6;
+  --proceed: #2FB88A;
+  --stop: #E8665E;
+  --hairline: rgba(230, 236, 234, 0.12);
+  --hairline-inner: rgba(230, 236, 234, 0.075);
+
+  --bg: #121C27;
+  --surface: #1A2735;
+  --surface-raised: #243446;
+  --text: #E6ECEA;
+  --text-2: #C2CCD0;
+  --text-muted: #A7B0B7;
+  --input-border: #8593A0;
+  --input-border-hover: #A7B0B7;
+  --route-line: #E6ECEA;
+
+  --lamp-disabled: #6B7987;
+
+  --hover: rgba(230, 236, 234, 0.06);
+  --press: rgba(230, 236, 234, 0.11);
+  --row-hover: #203040;
+  --chip: rgba(230, 236, 234, 0.09);
+  --skeleton: rgba(230, 236, 234, 0.08);
+  --scrollbar: rgba(230, 236, 234, 0.24);
+  --selection: rgba(255, 199, 44, 0.85);
+  --inset: inset 0 1px 0 rgba(0, 0, 0, 0.35);
+  --tooltip-bg: #2C3D51;
+  --tooltip-text: #E6ECEA;
+
+  /* Shadows do not read on a dark ground: a floating layer is a lighter
+     surface with a faint edge instead. */
+  --shadow-float: 0 0 0 1px rgba(230, 236, 234, 0.10);
+}
