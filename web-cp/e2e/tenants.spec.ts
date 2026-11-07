@@ -141,13 +141,16 @@ test("给租户设置可用分组后，运维侧的 key 显示生效分组，/ap
 
   await openTenants(page);
   await openTenant(page, t.org);
+  const keyRow = page.getByRole("table", { name: "密钥" }).getByRole("row").filter({ hasText: "groups-key-t5" });
+  // Before the change the key follows the tenant's default group.
+  await expect(keyRow).toContainText("shared");
   const groups = page.getByRole("group", { name: "可用分组" });
   await expect(groups).toContainText("租户看不到分组名");
   await groups.getByRole("checkbox", { name: "shared" }).uncheck();
   await groups.getByRole("checkbox", { name: "grp-eu-5d2" }).check();
+  // grp-eu-5d2 holds an upstream account, so the save asks for no confirmation.
   await groups.getByRole("button", { name: "保存分组" }).click();
 
-  const keyRow = page.getByRole("table", { name: "密钥" }).getByRole("row").filter({ hasText: "groups-key-t5" });
   await expect(keyRow).toContainText("grp-eu-5d2");
   await expect(keyRow).not.toContainText("grp-us-8a4");
   expect((await stack.admin.get(`/admin/tenants/${t.id}`)).allowed_provider_groups).toEqual(["grp-eu-5d2"]);
@@ -193,6 +196,7 @@ test("在 Dashboard 停用成员后，他的 key 在网关上被拒，启用后�
   await expect(page.getByText("停用后该成员的所有密钥立即失效")).toBeVisible();
   const row = page.getByRole("table", { name: "成员" }).getByRole("row").filter({ hasText: memberEmail });
   await row.getByRole("button", { name: "停用" }).click();
+  await row.getByRole("button", { name: "确认停用" }).click();
   await expect(row).toContainText("已停用");
   await expect.poll(() => chatStatus(key), { timeout: ROLLOUT_BOUND_MS }).toBe(401);
 
@@ -209,6 +213,7 @@ test("停用租户后它的 key 在网关上被拒，恢复后可用", async ({ 
   await openTenants(page);
   const row = tenantRow(page, t.org);
   await row.getByRole("button", { name: "停用" }).click();
+  await row.getByRole("button", { name: "确认停用" }).click();
   await expect(row).toContainText("已停用");
   await expect.poll(() => chatStatus(key), { timeout: ROLLOUT_BOUND_MS }).toBe(401);
 
@@ -270,6 +275,51 @@ test("两个运维同时改同一租户的限额：后保存的被拒并提示�
   expect((await stack.admin.get(`/admin/tenants/${t.id}`)).limits.rpm).toBe(600);
 });
 
+test("两个运维同时改同一租户的授权：后保存的被拒，重新载入后显示先保存的", async ({ page }) => {
+  const t = await signUpActive("T5 GrantRace Co 6c2", "owner@grantrace-t5.test");
+
+  await openTenants(page);
+  await openTenant(page, t.org);
+  const grants = page.getByRole("group", { name: "授权模型" });
+  await expect(grants.getByRole("checkbox", { name: "chat-t5-e2e" })).not.toBeChecked();
+  // Another operator grants a different model first.
+  const current = await stack.admin.request("GET", `/admin/tenants/${t.id}`);
+  await stack.admin.patch(`/admin/tenants/${t.id}`, { allowed_model_ids: [models.other.id] }, current.version!);
+
+  await grants.getByRole("checkbox", { name: "chat-t5-e2e" }).check();
+  await grants.getByRole("button", { name: "保存授权" }).click();
+  await expect(grants.getByRole("alert")).toContainText("该资源已被他人修改");
+  await grants.getByRole("button", { name: "重新载入" }).click();
+  await expect(grants.getByRole("checkbox", { name: "other-t5-e2e" })).toBeChecked();
+  await expect(grants.getByRole("checkbox", { name: "chat-t5-e2e" })).not.toBeChecked();
+  await expect(grants.getByRole("alert")).toHaveCount(0);
+  expect((await stack.admin.get(`/admin/tenants/${t.id}`)).allowed_model_ids).toEqual([models.other.id]);
+});
+
+test("一处未保存的修改，不会被另一处的保存冲掉", async ({ page }) => {
+  const t = await signUpActive("T5 Draft Co 7d3", "owner@draft-t5.test");
+
+  await openTenants(page);
+  await openTenant(page, t.org);
+  const limits = page.getByRole("group", { name: "限额" });
+  const grants = page.getByRole("group", { name: "授权模型" });
+  // A limit typed but not saved, then a grant saved.
+  await limits.getByLabel("租户每分钟请求").fill("777");
+  await grants.getByRole("checkbox", { name: "chat-t5-e2e" }).check();
+  await grants.getByRole("button", { name: "保存授权" }).click();
+  await expect(grants).toContainText("已保存授权");
+  await expect(limits.getByLabel("租户每分钟请求")).toHaveValue("777");
+
+  // Both edits land.
+  await limits.getByRole("button", { name: "保存限额" }).click();
+  await expect
+    .poll(async () => {
+      const tenant = await stack.admin.get(`/admin/tenants/${t.id}`);
+      return [tenant.limits.rpm, tenant.allowed_model_ids];
+    })
+    .toEqual([777, [models.chat.id]]);
+});
+
 test("停用租户唯一的所有者被拒，并在该成员旁说明原因", async ({ page }) => {
   const t = await signUpActive("T5 Owner Co 1c9", "owner@owner-t5.test");
 
@@ -277,6 +327,7 @@ test("停用租户唯一的所有者被拒，并在该成员旁说明原因", as
   await openTenant(page, t.org);
   const row = page.getByRole("table", { name: "成员" }).getByRole("row").filter({ hasText: t.email });
   await row.getByRole("button", { name: "停用" }).click();
+  await row.getByRole("button", { name: "确认停用" }).click();
   await expect(row).toContainText("租户至少要保留一位所有者");
   await expect(row).not.toContainText("已停用");
   const members = await stack.admin.get(`/admin/tenants/${t.id}/members`);
@@ -292,9 +343,36 @@ test("客户租户的可用分组不能清空：被拒并在分组处说明，�
   await openTenant(page, t.org);
   const groups = page.getByRole("group", { name: "可用分组" });
   for (const group of before) await groups.getByRole("checkbox", { name: group }).uncheck();
+  // No group at all reaches no upstream: the save is confirmed first.
   await groups.getByRole("button", { name: "保存分组" }).click();
+  await groups.getByRole("button", { name: "确认保存分组" }).click();
   await expect(groups.getByRole("alert")).toBeVisible();
   expect((await stack.admin.get(`/admin/tenants/${t.id}`)).allowed_provider_groups).toEqual(before);
+});
+
+test("保存后租户没有任何带上游账号的分组时，先警告并要求确认", async ({ page }) => {
+  const t = await signUpActive("T5 Unreach Co 8e4", "owner@unreach-t5.test");
+  const current = await stack.admin.request("GET", `/admin/tenants/${t.id}`);
+  // A group no upstream account is in, beside the default one.
+  await stack.admin.patch(
+    `/admin/tenants/${t.id}`,
+    { allowed_provider_groups: ["shared", "grp-none-7d3"] },
+    current.version!,
+  );
+
+  await openTenants(page);
+  await openTenant(page, t.org);
+  const groups = page.getByRole("group", { name: "可用分组" });
+  await expect(groups.getByRole("listitem").filter({ hasText: "grp-none-7d3" })).toContainText("没有上游账号在此分组");
+  await groups.getByRole("checkbox", { name: "shared" }).uncheck();
+  await groups.getByRole("button", { name: "保存分组" }).click();
+  await expect(groups.getByRole("alert")).toContainText("grp-none-7d3");
+  // Nothing is saved until it is confirmed.
+  expect((await stack.admin.get(`/admin/tenants/${t.id}`)).allowed_provider_groups).toEqual(["shared", "grp-none-7d3"]);
+  await groups.getByRole("button", { name: "确认保存分组" }).click();
+  await expect
+    .poll(async () => (await stack.admin.get(`/admin/tenants/${t.id}`)).allowed_provider_groups)
+    .toEqual(["grp-none-7d3"]);
 });
 
 test("在租户页给 key 设置分组覆盖后，该 key 的生效分组随之改变", async ({ page }) => {
@@ -327,6 +405,20 @@ test("只读账号在租户页看不到任何操作", async ({ page }) => {
   await expect(page.getByRole("button", { name: /批准|停用|启用|恢复|保存|邀请|覆盖|默认值/ })).toHaveCount(0);
   await expect(page.getByRole("checkbox", { disabled: false })).toHaveCount(0);
   await expect(page.getByRole("spinbutton", { disabled: false })).toHaveCount(0);
+});
+
+test("新租户默认值的默认分组不能清空：被拒并在该字段说明，原默认值保留", async ({ page }) => {
+  const before: Json = await stack.admin.get("/admin/settings/tenant-defaults");
+  expect(before.default_provider_groups.length).toBeGreaterThan(0);
+
+  await openTenants(page);
+  await page.getByRole("button", { name: "新租户默认值" }).click();
+  const panel = page.getByRole("region", { name: "新租户默认值" });
+  const groups = panel.getByRole("group", { name: "默认分组" });
+  for (const group of before.default_provider_groups) await groups.getByRole("checkbox", { name: group }).uncheck();
+  await panel.getByRole("button", { name: "保存默认值" }).click();
+  await expect(groups.getByRole("alert")).toBeVisible();
+  expect(await stack.admin.get("/admin/settings/tenant-defaults")).toEqual(before);
 });
 
 // Last: it changes what every later signup starts with.

@@ -1,4 +1,4 @@
-import { Fragment, useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useId, useMemo, useRef, useState, type ReactNode } from "react";
 import type { TabProps } from "../App";
 import { ConflictNote } from "../components/ConflictNote";
 import { Msg, type Note } from "../components/Msg";
@@ -102,6 +102,66 @@ function refusal(e: unknown, placed: (path: string) => boolean): Refusal {
   return { conflict: false, at, general: rest.length > 0 ? rest.join("；") : null };
 }
 
+/**
+ * A destructive action in two steps (ruling P1b-R6): the first click turns
+ * the button into `确认<label>` and `取消`, under `warning`, and only the
+ * confirmation acts. `ask` decides, at each first click, whether to ask at all.
+ */
+function TwoStep({
+  label,
+  onConfirm,
+  disabled,
+  className = "ghost",
+  ask = () => true,
+  warning,
+}: {
+  label: string;
+  onConfirm: () => void;
+  disabled?: boolean;
+  className?: string;
+  ask?: () => boolean;
+  warning?: ReactNode;
+}) {
+  const [asking, setAsking] = useState(false);
+  if (!asking) {
+    return (
+      <button
+        type="button"
+        className={className}
+        disabled={disabled}
+        onClick={() => (ask() ? setAsking(true) : onConfirm())}
+      >
+        {label}
+      </button>
+    );
+  }
+  return (
+    <>
+      {warning && (
+        <div className="note warn" role="alert">
+          {warning}
+        </div>
+      )}
+      <span className="tn-actions">
+        <button
+          type="button"
+          className={className}
+          disabled={disabled}
+          onClick={() => {
+            setAsking(false);
+            onConfirm();
+          }}
+        >
+          确认{label}
+        </button>
+        <button type="button" className="ghost" onClick={() => setAsking(false)}>
+          取消
+        </button>
+      </span>
+    </>
+  );
+}
+
 /** A path at the list `field` or one of its entries. */
 const atList = (field: string) => (path: string) => path === field || path.startsWith(`${field}/`);
 
@@ -177,6 +237,17 @@ function useLoad<T>(load: () => Promise<T>, deps: unknown[]) {
     void reload();
   }, [reload]);
   return { data, error, reload, setData };
+}
+
+/**
+ * Clears a part's `412` note once the tenant has moved to another version (a
+ * reload). The part's draft and any `422` stay: only its own stored value
+ * changing resets them, so one part's save never discards another's edit.
+ */
+function useConflictClears(version: number, setRefused: (update: (r: Refusal | null) => Refusal | null) => void) {
+  useEffect(() => {
+    setRefused((r) => (r?.conflict ? null : r));
+  }, [version, setRefused]);
 }
 
 type LimitDraft = Record<keyof TenantLimits, string>;
@@ -383,14 +454,11 @@ export function Tenants({ operator, canEdit }: TabProps) {
                           )}
                           {/* The platform's own tenant holds the operators' keys; it is never suspended. */}
                           {t.status === "active" && !t.is_internal && (
-                            <button
-                              type="button"
-                              className="ghost"
+                            <TwoStep
+                              label="停用"
                               disabled={acting === t.id}
-                              onClick={() => void act(t, tenants.suspend)}
-                            >
-                              停用
-                            </button>
+                              onConfirm={() => void act(t, tenants.suspend)}
+                            />
                           )}
                           {t.status === "suspended" && (
                             <button
@@ -633,11 +701,13 @@ function GrantsPart({
   const [note, setNote] = useState<Note | null>(null);
   const [busy, setBusy] = useState(false);
 
-  // A new version of the tenant (a save, a reload) is what the form edits from now on.
+  // The stored grants changed (a save, a reload): the form edits them from now on.
+  const stored = JSON.stringify(tenant.allowed_model_ids);
   useEffect(() => {
     setChosen(new Set(tenant.allowed_model_ids));
     setRefused(null);
-  }, [tenant.version]);
+  }, [stored]);
+  useConflictClears(tenant.version, setRefused);
 
   const rows = useMemo(
     () =>
@@ -736,13 +806,19 @@ function GroupsPart({
   const [note, setNote] = useState<Note | null>(null);
   const [busy, setBusy] = useState(false);
 
+  const stored = JSON.stringify(tenant.allowed_provider_groups);
   useEffect(() => {
     setChosen(tenant.allowed_provider_groups);
     setRefused(null);
-  }, [tenant.version]);
+  }, [stored]);
+  useConflictClears(tenant.version, setRefused);
+
+  const picked = options.filter((g) => chosen.includes(g));
+  const reachable = (g: string) => (accounts.get(g) ?? []).length > 0;
+  const unreachable = picked.filter((g) => !reachable(g));
 
   async function submit() {
-    const groups = options.filter((g) => chosen.includes(g));
+    const groups = picked;
     setBusy(true);
     setRefused(null);
     setNote(null);
@@ -791,9 +867,20 @@ function GroupsPart({
       {refused?.conflict && <ConflictNote onReload={onReload} />}
       <Msg note={note} />
       {canEdit && (
-        <button type="button" className="act" disabled={busy} onClick={() => void submit()}>
-          保存分组
-        </button>
+        // A choice with no group that holds an upstream account leaves every key of the
+        // tenant with nothing to reach, so it is confirmed first.
+        <TwoStep
+          label="保存分组"
+          className="act"
+          disabled={busy}
+          ask={() => !picked.some(reachable)}
+          warning={
+            unreachable.length > 0
+              ? `${unreachable.join("、")}：没有上游账号在此分组。保存后，该租户的密钥找不到任何上游账号，无法调用模型。`
+              : "没有选择任何分组。保存后，该租户的密钥找不到任何上游账号，无法调用模型。"
+          }
+          onConfirm={() => void submit()}
+        />
       )}
     </fieldset>
   );
@@ -873,10 +960,12 @@ function LimitsPart({ tenant, canEdit, save, onReload }: PartProps) {
   const [note, setNote] = useState<Note | null>(null);
   const [busy, setBusy] = useState(false);
 
+  const stored = JSON.stringify(tenant.limits);
   useEffect(() => {
     setDraft(limitDraft(tenant.limits));
     setRefused(null);
-  }, [tenant.version]);
+  }, [stored]);
+  useConflictClears(tenant.version, setRefused);
 
   async function submit() {
     setBusy(true);
@@ -982,14 +1071,20 @@ function MembersPart({
                   <td>{m.disabled ? "已停用" : "正常"}</td>
                   {canEdit && (
                     <td>
-                      <button
-                        type="button"
-                        className="ghost"
-                        disabled={busy === m.id}
-                        onClick={() => void toggle(m)}
-                      >
-                        {m.disabled ? "启用" : "停用"}
-                      </button>
+                      <div className="tn-actions">
+                        {m.disabled ? (
+                          <button
+                            type="button"
+                            className="ghost"
+                            disabled={busy === m.id}
+                            onClick={() => void toggle(m)}
+                          >
+                            启用
+                          </button>
+                        ) : (
+                          <TwoStep label="停用" disabled={busy === m.id} onConfirm={() => void toggle(m)} />
+                        )}
+                      </div>
                       {rowError?.id === m.id && (
                         <span className="tn-error" role="alert">
                           {rowError.text}
