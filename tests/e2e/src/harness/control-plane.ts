@@ -1,6 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -38,6 +38,36 @@ const MANAGED_CONFIG = join(REPO, "config.managed.yaml");
 /** Above the stack's own readiness budget (60 s), which covers a cold start. */
 const STACK_READY_MS = 90_000;
 const GATEWAY_READY_MS = 20_000;
+
+// ── logs kept for a failed run ───────────────────────────────────────────────
+
+/**
+ * Where the stacks and gateways a run started leave their output when they
+ * stop, for CI to upload when a leg fails (`CP_E2E_LOG_DIR`); nothing is
+ * kept when it is unset. A case that fails mid-run leaves no other trace of
+ * what the control plane, kine and the gateway said.
+ */
+const LOG_DIR = process.env.CP_E2E_LOG_DIR;
+
+/**
+ * `text` with what could be a secret taken out: a URL's userinfo (the
+ * database URL's password), a minted caller key, and each of `secrets`.
+ */
+function scrubbed(text: string, secrets: string[]): string {
+  let out = text
+    .replace(/([a-z][a-z0-9+.-]*:\/\/)[^/@\s]+@/gi, "$1***@")
+    .replace(/sk-aisix-[0-9a-f]{16,}/g, "sk-aisix-***");
+  for (const secret of secrets) {
+    if (secret) out = out.split(secret).join("***");
+  }
+  return out;
+}
+
+async function keepLog(name: string, text: string, secrets: string[] = []): Promise<void> {
+  if (!LOG_DIR) return;
+  await mkdir(LOG_DIR, { recursive: true });
+  await writeFile(join(LOG_DIR, `${name}.log`), scrubbed(text, secrets));
+}
 
 // ── HTTP clients ────────────────────────────────────────────────────────────
 
@@ -323,6 +353,7 @@ export async function startControlPlane(opts: { etcdPrefix?: string } = {}): Pro
     });
   }).catch(async (e: Error) => {
     await stopStack(child, exited);
+    await keepLog(`cp-stack-${httpPort}`, log);
     throw new Error(`${e.message}\n--- stack output ---\n${log}`);
   });
 
@@ -367,6 +398,7 @@ export async function startControlPlane(opts: { etcdPrefix?: string } = {}): Pro
     },
     async stop() {
       await stopStack(child, exited);
+      await keepLog(`cp-stack-${ready.envId}`, log, [ready.operator.password]);
       await Promise.allSettled(gatewayDirs.map((d) => rm(d, { recursive: true, force: true })));
     },
   };
@@ -494,7 +526,13 @@ async function spawnManagedGatewayOnce(
         }),
       ]);
     },
-    exit: () => stopGateway(child),
+    async exit() {
+      await stopGateway(child);
+      // The bundle's two secrets: the gateway's private key and the
+      // platform-mode id key.
+      const secrets = [gw.bundleEnv.AISIX_MANAGED__CP_KEY_PEM, gw.bundleEnv.PLATFORM_ID_KEY];
+      await keepLog(`gateway-${gw.name}-${child.pid}`, out, secrets);
+    },
   };
 }
 
