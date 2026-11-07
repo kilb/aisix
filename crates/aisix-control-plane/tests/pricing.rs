@@ -84,7 +84,8 @@ async fn create(cp: &TestCp, admin: &OperatorSession, path: &str, body: Value) -
     r.body
 }
 
-/// `method path` as `admin` with `If-Match: "<version>"`.
+/// `method path` as `admin` with `If-Match: "<version>"`, and no body,
+/// labelled JSON as the Dashboard sends every request.
 async fn send_if_match(
     cp: &TestCp,
     admin: &OperatorSession,
@@ -101,6 +102,7 @@ async fn send_if_match(
         .request(method, cp.url(path))
         .header(reqwest::header::COOKIE, admin.cookie())
         .header(reqwest::header::IF_MATCH, format!("\"{version}\""))
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
         .send()
         .await
         .expect("send the request")
@@ -1494,6 +1496,62 @@ async fn an_operator_sets_a_price_and_a_viewer_reads_it() {
     listed.remove("later_revisions");
     assert_eq!(r.body["items"], json!([listed]), "{r:?}");
     assert_eq!(r.body["next_before"], Value::Null);
+}
+
+/// A price write that does not say it is JSON is `415` and writes nothing,
+/// as on every mutating browser route: a form another site posts with an
+/// operator's session cannot set a price.
+#[tokio::test]
+async fn a_price_write_that_is_not_json_is_415_and_writes_nothing() {
+    let Some(w) = world().await else { return };
+    let model = seed_model(&w.cp, &w.admin).await;
+    let now = db_now(&w.cp).await;
+    let version = pricing_version(&w.cp).await;
+    let audits = w.cp.count("audit_log").await;
+    let writes = [
+        (
+            "/admin/pricing/sell",
+            json!({"model_id": model, "effective_from": now, "card": card()}),
+        ),
+        (
+            "/admin/pricing/cost",
+            json!({"upstream_provider": "openai", "upstream_model": "gpt-4o-mini",
+                   "effective_from": now, "card": card()}),
+        ),
+        (
+            "/admin/pricing/discounts",
+            json!({"tenant_id": w.tenant, "effective_from": now, "discount_bps": 2000}),
+        ),
+    ];
+    for (path, body) in writes {
+        let bytes = serde_json::to_vec(&body).expect("serialize the body");
+        for content_type in [None, Some("text/plain")] {
+            let r = w
+                .cp
+                .send_raw(
+                    "POST",
+                    path,
+                    Some(w.admin.cookie()),
+                    content_type,
+                    Some(bytes.clone()),
+                )
+                .await;
+            assert_eq!(
+                (r.status, r.body["code"].clone()),
+                (415, json!("unsupported_media_type")),
+                "{path} {content_type:?}: {r:?}"
+            );
+        }
+    }
+    for table in [
+        "pricing_sell_revisions",
+        "pricing_cost_revisions",
+        "pricing_discount_revisions",
+    ] {
+        assert_eq!(w.cp.count(table).await, 0, "{table}");
+    }
+    assert_eq!(pricing_version(&w.cp).await, version);
+    assert_eq!(w.cp.count("audit_log").await, audits);
 }
 
 #[tokio::test]
