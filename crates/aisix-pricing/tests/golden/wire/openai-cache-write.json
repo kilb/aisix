@@ -1,0 +1,22 @@
+[
+  {
+    "cache_status": "disabled",
+    "cache_write_tokens": 200,
+    "cached_prompt_tokens": 300,
+    "completion_tokens": 100,
+    "cost_usd": 0.00098,
+    "event_id": "evt-openai-cache-write-1",
+    "guardrail_blocked": false,
+    "occurred_at": "2026-11-06T00:00:00.000Z",
+    "operation": "chat",
+    "prompt_tokens": 1000,
+    "provider_key_id": "pk-openai",
+    "requested_model_id": "model-openai-cache-write",
+    "service_tier": "default",
+    "status_code": 200,
+    "team_id": "tenant-golden",
+    "total_tokens": 1100,
+    "upstream_model": "gpt-5.1",
+    "upstream_provider": "openai"
+  }
+]

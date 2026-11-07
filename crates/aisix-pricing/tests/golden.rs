@@ -39,11 +39,13 @@ const EXPECTED: &[(&str, &str, i64)] = &[
     ("openai-via-messages", "charged", 340),
     ("openai-responses", "charged", 1250), // 500 + 150 + 600
     ("openai-responses-stream", "charged", 1250),
+    ("openai-cache-write", "charged", 980), // 500 + 300×0.1 + 200×1.25 + 100×2
     ("anthropic-messages", "charged", 20150), // 37 + 0.9 + 1.25 + 6 + 104 + 2×10000 = 20149.15, rounded up
     ("anthropic-messages-stream", "charged", 20150),
     ("anthropic-via-chat", "charged", 20150),
     ("gemini-chat", "charged", 200),           // 100 + (20+30)×2
     ("gemini-cached", "charged", 164),         // 60 + 40×0.1 + (20+30)×2
+    ("gemini-no-total", "charged", 200),       // 100 + (20+30)×2, with no total reported
     ("bedrock-converse-chat", "charged", 150), // 149.15, rounded up
     ("openai-embeddings", "charged", 8),
     ("anthropic-count-tokens", "nothing_to_bill", 0),
@@ -54,11 +56,13 @@ const EXPECTED: &[(&str, &str, i64)] = &[
 /// The families whose rows the gateway's `Model.cost` prices exactly as the
 /// engine does. Every other family is billed at a tier or a web search that
 /// `Model.cost` cannot express.
-const PRICED_ALIKE: [&str; 9] = [
+const PRICED_ALIKE: [&str; 11] = [
     "openai-responses",
     "openai-responses-stream",
+    "openai-cache-write",
     "gemini-chat",
     "gemini-cached",
+    "gemini-no-total",
     "bedrock-converse-chat",
     "openai-embeddings",
     "anthropic-count-tokens",

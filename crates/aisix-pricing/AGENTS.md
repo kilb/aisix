@@ -41,7 +41,11 @@ failing unless it was written for them.
   them here, since a second copy is how the engine and the gateway would come
   to bill one row two ways.
 - A change to how a row is read is made in `aisix_core`, for both sides at
-  once, and `tests/equivalence.rs` must stay green afterwards.
+  once, and `tests/equivalence.rs` and `tests/golden.rs` must stay green
+  afterwards. The equivalence property test alone cannot see a drift inside
+  a function both sides call: what catches one is a hand-computed figure,
+  the equivalence test's fixed rows and each golden family's `EXPECTED`
+  charge. A new way a row can be read gets a golden family of its own.
 - `src/` is exempt from the gateway's `no_one_reads_a_models_price_off_the_field`
   census (`crates/aisix-proxy/src/routing.rs`) only while it never names
   `Model` or `ModelCost`. A line that does is reported as a read.

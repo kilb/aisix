@@ -1,0 +1,19 @@
+[
+  {
+    "cache_status": "disabled",
+    "completion_tokens": 50,
+    "cost_usd": 0.0002,
+    "event_id": "evt-gemini-no-total-1",
+    "guardrail_blocked": false,
+    "occurred_at": "2026-11-06T00:00:00.000Z",
+    "operation": "chat",
+    "prompt_tokens": 100,
+    "provider_key_id": "pk-google",
+    "reasoning_tokens": 30,
+    "requested_model_id": "model-gemini-no-total",
+    "status_code": 200,
+    "team_id": "tenant-golden",
+    "upstream_model": "gemini-2.5-flash-lite",
+    "upstream_provider": "google"
+  }
+]

@@ -38,7 +38,9 @@ import {
 // Usage shapes:
 // - Chat Completions: https://platform.openai.com/docs/api-reference/chat/object
 //   (`prompt_tokens_details.cached_tokens`, `completion_tokens_details.reasoning_tokens`,
-//   `service_tier`) and the final `stream_options.include_usage` chunk.
+//   `service_tier`) and the final `stream_options.include_usage` chunk. A
+//   cache write is `prompt_tokens_details.cache_write_tokens`, a part of
+//   `prompt_tokens` like the cached count.
 // - Responses: https://platform.openai.com/docs/api-reference/responses/object
 //   (`input_tokens_details.cached_tokens`, `output_tokens_details.reasoning_tokens`),
 //   carried on `response.completed` when streamed.
@@ -48,7 +50,8 @@ import {
 //   `message_start` and the cumulative counts on `message_delta`
 //   (https://docs.anthropic.com/en/docs/agents-and-tools/tool-use/web-search-tool).
 // - Count tokens: https://docs.anthropic.com/en/api/messages-count-tokens
-// - Gemini: https://ai.google.dev/api/generate-content#UsageMetadata
+// - Gemini: https://ai.google.dev/api/generate-content#UsageMetadata; one
+//   answer leaves out `totalTokenCount`, so its row has no upstream total.
 // - Bedrock Converse: https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_TokenUsage.html
 //   and API_runtime_CacheDetail.html.
 
@@ -77,11 +80,13 @@ type Provider = "openai" | "anthropic" | "google" | "bedrock";
 const NATIVE = {
   "openai-chat": { provider: "openai", upstreamModel: "gpt-5-mini" },
   "openai-responses": { provider: "openai", upstreamModel: "gpt-5" },
+  "openai-cache-write": { provider: "openai", upstreamModel: "gpt-5.1" },
   "openai-embeddings": { provider: "openai", upstreamModel: "text-embedding-3-small" },
   "anthropic-messages": { provider: "anthropic", upstreamModel: "claude-sonnet-4-5-20250929" },
   "anthropic-count-tokens": { provider: "anthropic", upstreamModel: "claude-haiku-4-5-20251001" },
   "gemini-chat": { provider: "google", upstreamModel: "gemini-2.5-flash" },
   "gemini-cached": { provider: "google", upstreamModel: "gemini-2.5-pro" },
+  "gemini-no-total": { provider: "google", upstreamModel: "gemini-2.5-flash-lite" },
   // A model Bedrock answers through Converse; Claude's chat goes to InvokeModel.
   "bedrock-converse-chat": { provider: "bedrock", upstreamModel: "us.amazon.nova-pro-v1:0" },
 } as const satisfies Record<string, { provider: Provider; upstreamModel: string }>;
@@ -138,6 +143,12 @@ const FAMILIES: Family[] = [
     body: responses("openai-responses", true),
   },
   {
+    name: "openai-cache-write",
+    native: "openai-cache-write",
+    path: "/v1/chat/completions",
+    body: chat("openai-cache-write"),
+  },
+  {
     name: "anthropic-messages",
     native: "anthropic-messages",
     path: "/v1/messages",
@@ -157,6 +168,12 @@ const FAMILIES: Family[] = [
   },
   { name: "gemini-chat", native: "gemini-chat", path: "/v1/chat/completions", body: chat("gemini-chat") },
   { name: "gemini-cached", native: "gemini-cached", path: "/v1/chat/completions", body: chat("gemini-cached") },
+  {
+    name: "gemini-no-total",
+    native: "gemini-no-total",
+    path: "/v1/chat/completions",
+    body: chat("gemini-no-total"),
+  },
   {
     name: "bedrock-converse-chat",
     native: "bedrock-converse-chat",
@@ -247,6 +264,26 @@ function openAiChat(model: unknown): unknown {
     service_tier: "flex",
     choices: [{ index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" }],
     usage: OPENAI_CHAT_USAGE,
+  };
+}
+
+/** A default-tier answer whose prompt was partly read from and partly written to the cache. */
+const OPENAI_CACHE_WRITE_USAGE = {
+  prompt_tokens: 1000,
+  completion_tokens: 100,
+  total_tokens: 1100,
+  prompt_tokens_details: { cached_tokens: 300, cache_write_tokens: 200 },
+};
+
+function openAiCacheWriteChat(model: unknown): unknown {
+  return {
+    id: "chatcmpl-golden-cache-write",
+    object: "chat.completion",
+    created: 1,
+    model,
+    service_tier: "default",
+    choices: [{ index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" }],
+    usage: OPENAI_CACHE_WRITE_USAGE,
   };
 }
 
@@ -382,7 +419,9 @@ function anthropicStream(model: unknown): string {
   ]);
 }
 
-function gemini(cached: boolean): unknown {
+function gemini(upstreamModel: string): unknown {
+  const cached = upstreamModel === NATIVE["gemini-cached"].upstreamModel;
+  const total = upstreamModel !== NATIVE["gemini-no-total"].upstreamModel;
   return {
     candidates: [{ content: { role: "model", parts: [{ text: "ok" }] }, finishReason: "STOP" }],
     usageMetadata: {
@@ -390,9 +429,9 @@ function gemini(cached: boolean): unknown {
       ...(cached ? { cachedContentTokenCount: 40 } : {}),
       candidatesTokenCount: 20,
       thoughtsTokenCount: 30,
-      totalTokenCount: 150,
+      ...(total ? { totalTokenCount: 150 } : {}),
     },
-    modelVersion: cached ? NATIVE["gemini-cached"].upstreamModel : NATIVE["gemini-chat"].upstreamModel,
+    modelVersion: upstreamModel,
   };
 }
 
@@ -430,6 +469,9 @@ async function startUpstream(): Promise<{ server: Server; baseUrl: string }> {
         res.end(payload);
       };
       if (path === "/v1/chat/completions") {
+        if (body.model === NATIVE["openai-cache-write"].upstreamModel) {
+          return json(openAiCacheWriteChat(body.model));
+        }
         return body.stream ? sse(openAiChatStream(body.model)) : json(openAiChat(body.model));
       }
       if (path === "/v1/responses") {
@@ -440,9 +482,8 @@ async function startUpstream(): Promise<{ server: Server; baseUrl: string }> {
       if (path === "/v1/messages") {
         return body.stream ? sse(anthropicStream(body.model)) : json(anthropicMessage(body.model));
       }
-      if (path.endsWith(":generateContent")) {
-        return json(gemini(path.includes(`/models/${NATIVE["gemini-cached"].upstreamModel}:`)));
-      }
+      const generate = /\/models\/([^/]+):generateContent$/.exec(path);
+      if (generate) return json(gemini(generate[1]));
       if (path.endsWith("/converse")) return json(CONVERSE);
       res.writeHead(404, { "content-type": "application/json" });
       res.end(JSON.stringify({ error: { message: `no mock route for ${path}` } }));
@@ -648,6 +689,14 @@ describe("pricing goldens: the usage rows a real gateway sends, one per provider
       completion_tokens: 300,
       reasoning_tokens: 120,
     });
+    expectUsage("openai-cache-write", {
+      prompt_tokens: 1000,
+      cached_prompt_tokens: 300,
+      cache_write_tokens: 200,
+      completion_tokens: 100,
+      total_tokens: 1100,
+      service_tier: "default",
+    });
     expectUsage("anthropic-messages", {
       prompt_tokens: 37,
       cache_read_tokens: 9,
@@ -660,6 +709,9 @@ describe("pricing goldens: the usage rows a real gateway sends, one per provider
     const geminiUsage = { prompt_tokens: 100, completion_tokens: 20, reasoning_tokens: 30, total_tokens: 150 };
     expectUsage("gemini-chat", geminiUsage);
     expectUsage("gemini-cached", { ...geminiUsage, cached_prompt_tokens: 40 });
+    // The upstream reported no total, and the row must not invent one.
+    expectUsage("gemini-no-total", { prompt_tokens: 100, reasoning_tokens: 30 });
+    expect(row("gemini-no-total").total_tokens ?? 0, JSON.stringify(row("gemini-no-total"))).toBe(0);
     expectUsage("bedrock-converse-chat", {
       prompt_tokens: 37,
       cache_read_tokens: 9,
