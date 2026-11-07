@@ -1608,6 +1608,52 @@ async fn a_heartbeat_with_every_optional_field_null_is_accepted() {
     assert_eq!(stored_lists(&cp, &instance).await, (json!([]), json!([])));
 }
 
+/// A NUL, which neither `text` nor `jsonb` can hold, reaches a heartbeat
+/// when an exporter copies a remote error body into `last_error`. The beat
+/// is stored with U+FFFD in its place, wherever it is, so the instance stays
+/// in the fleet view and before the version gate.
+#[tokio::test]
+async fn a_heartbeat_carrying_a_nul_is_stored_with_a_replacement_character() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let (admin, bundle) = setup(&cp).await;
+    let instance = format!("{}\u{0}i", Uuid::new_v4());
+    let mut beat = full_beat(&bundle.dp_id, &instance);
+    beat["exporter_health"][0]["last_error"] = json!("HTTP 502: a\u{0}b");
+    beat["hostname"] = json!("gw\u{0}host");
+    beat["config_hash"] = json!("ab\u{0}cd");
+    beat["supported_guardrail_kinds"] = json!(["keyword\u{0}"]);
+    beat["rejected_resources"][0]["error"] = json!("bad\u{0}row");
+    beat["partially_compatible_resources"][0]["field\u{0}"] = json!(1);
+    let r = cp.dp_client(&bundle).heartbeat(beat).await;
+    assert_eq!(r.status, 200, "{r:?}");
+
+    let stored = instance.replace('\0', "\u{fffd}");
+    let items = instances(&cp, &admin).await;
+    let item = items
+        .iter()
+        .find(|i| i["instance_id"] == stored.as_str())
+        .unwrap_or_else(|| panic!("the instance is listed: {items:?}"));
+    assert_eq!(
+        item["exporter_health"][0]["last_error"],
+        "HTTP 502: a\u{fffd}b"
+    );
+    assert_eq!(item["hostname"], "gw\u{fffd}host");
+    assert_eq!(item["config_hash"], "ab\u{fffd}cd");
+    let (rejected, partial) = stored_lists(&cp, &stored).await;
+    assert_eq!(rejected[0]["error"], "bad\u{fffd}row");
+    assert_eq!(partial[0]["field\u{fffd}"], 1);
+    let kinds: Value = sqlx::query_scalar(
+        "SELECT supported_guardrail_kinds FROM dp_instances WHERE instance_id = $1",
+    )
+    .bind(&stored)
+    .fetch_one(cp.db().pool())
+    .await
+    .expect("read the instance");
+    assert_eq!(kinds, json!(["keyword\u{fffd}"]));
+}
+
 /// Seeds gateway resource rows `(what, deleted, projected_version, age)`,
 /// each at version 3, and returns their ids.
 async fn seed_resources(

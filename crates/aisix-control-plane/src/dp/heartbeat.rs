@@ -52,6 +52,7 @@ use crate::db::DbError;
 use crate::error::{ApiError, Detail};
 use crate::gateways::stale_window_secs;
 use crate::http::ApiJson;
+use crate::usage::{text_without_nul, without_nul};
 use crate::AppState;
 
 /// An `instance_id` is a UUID; this leaves room for any other id a gateway
@@ -127,6 +128,30 @@ pub struct HeartbeatBody {
     partially_compatible_resources: Vec<Value>,
 }
 
+impl HeartbeatBody {
+    /// The body with every NUL replaced by U+FFFD, as usage events are
+    /// stored: neither `text` nor `jsonb` can hold one, and an exporter's
+    /// `last_error` quotes whatever a remote answered. A beat that could
+    /// not be stored would drop its instance from the fleet view, and from
+    /// the gateway-version gate.
+    fn without_nul(self) -> HeartbeatBody {
+        let list = |values: Vec<Value>| values.into_iter().map(without_nul).collect();
+        HeartbeatBody {
+            dp_id: text_without_nul(self.dp_id),
+            instance_id: text_without_nul(self.instance_id),
+            hostname: text_without_nul(self.hostname),
+            version: text_without_nul(self.version),
+            uptime_seconds: self.uptime_seconds,
+            applied_revision: self.applied_revision,
+            config_hash: self.config_hash.map(text_without_nul),
+            supported_guardrail_kinds: list(self.supported_guardrail_kinds),
+            exporter_health: list(self.exporter_health),
+            rejected_resources: list(self.rejected_resources),
+            partially_compatible_resources: list(self.partially_compatible_resources),
+        }
+    }
+}
+
 /// A `null` decodes as the type's default, as an absent field does.
 fn null_as_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
 where
@@ -146,6 +171,7 @@ pub async fn heartbeat(
     State(state): State<AppState>,
     ApiJson(body): ApiJson<HeartbeatBody>,
 ) -> Result<Json<Value>, ApiError> {
+    let body = body.without_nul();
     // A credential speaks only for itself.
     if Uuid::parse_str(&body.dp_id).ok() != Some(dp.dp_id) {
         return Err(ApiError::forbidden());
