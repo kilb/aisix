@@ -286,6 +286,14 @@ impl TestCp {
         Self::boot(self.database.clone(), cfg).await
     }
 
+    /// [`TestCp::restart`], with the new instance reporting `cp_version`, as
+    /// an upgraded stamped build would.
+    pub async fn restart_stamped(&self, cp_version: &str) -> TestCp {
+        let mut cfg = test_config(&self.database.url);
+        cfg.cp_version = cp_version.to_string();
+        Self::boot(self.database.clone(), cfg).await
+    }
+
     pub fn db(&self) -> &Db {
         &self.running.state.db
     }

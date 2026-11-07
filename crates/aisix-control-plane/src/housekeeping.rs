@@ -2,10 +2,12 @@
 //! rows of gateway instances not heard from for a week (a gateway mints a
 //! new `instance_id` at every boot, so each restart leaves one behind), and
 //! the tombstones of deleted gateway resources once their delete has been
-//! projected for a day.
+//! projected for a day; and catching up the key documents an older release
+//! wrote ([`keys::catch_up`]).
 //!
 //! Every instance runs the pass at boot and every 10 minutes after; the
-//! deletes are idempotent, so instances running it together do no harm.
+//! deletes are idempotent, and the catch-up takes one tenant at a time, so
+//! instances running it together do no harm.
 
 use std::time::Duration;
 
@@ -15,7 +17,8 @@ use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 
 use crate::db::{Db, DbError};
-use crate::resources::write::RESOURCES_LOCK_KEY;
+use crate::keys;
+use crate::resources::write::{WriteCtx, RESOURCES_LOCK_KEY};
 use crate::stopped;
 
 const PERIOD: Duration = Duration::from_secs(600);
@@ -51,10 +54,25 @@ pub async fn run_once(db: &Db) -> Result<Pruned, DbError> {
     })
 }
 
-/// Runs a pass now and every 10 minutes until `shutdown` turns true (or its
+/// One tick: a pruning pass ([`run_once`]), then the key documents an
+/// older release wrote are caught up ([`keys::catch_up`]), each half logged
+/// on its own so that one failing leaves the other to run. A tenant the
+/// gateway-version gate refuses is caught up by a later tick.
+pub async fn tick(db: &Db, ctx: &WriteCtx) {
+    match run_once(db).await {
+        Ok(pruned) => tracing::debug!(?pruned, "housekeeping pass"),
+        Err(e) => tracing::warn!(error = %e, "a housekeeping pass failed"),
+    }
+    match keys::catch_up(db, ctx, keys::KEY_DOC_VERSION).await {
+        Ok(caught_up) => tracing::debug!(?caught_up, "key documents caught up"),
+        Err(e) => tracing::warn!(code = e.code, "catching up key documents failed"),
+    }
+}
+
+/// Runs a tick now and every 10 minutes until `shutdown` turns true (or its
 /// sender is gone): a control plane that restarts more often than that
-/// still prunes. A failed pass is logged and retried at the next one.
-pub fn spawn(db: Db, mut shutdown: watch::Receiver<bool>) -> JoinHandle<()> {
+/// still prunes. A failed tick is logged and retried at the next one.
+pub fn spawn(db: Db, ctx: WriteCtx, mut shutdown: watch::Receiver<bool>) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut every = tokio::time::interval(PERIOD);
         every.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -63,10 +81,7 @@ pub fn spawn(db: Db, mut shutdown: watch::Receiver<bool>) -> JoinHandle<()> {
                 () = stopped(&mut shutdown) => return,
                 _ = every.tick() => {}
             }
-            match run_once(&db).await {
-                Ok(pruned) => tracing::debug!(?pruned, "housekeeping pass"),
-                Err(e) => tracing::warn!(error = %e, "a housekeeping pass failed"),
-            }
+            tick(&db, &ctx).await;
         }
     })
 }

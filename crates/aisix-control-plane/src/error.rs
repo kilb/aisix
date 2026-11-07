@@ -223,6 +223,8 @@ pub enum BootError {
     Pki(#[from] crate::pki::PkiError),
     #[error("cannot prepare the platform's own tenant: {0}")]
     InternalTenant(String),
+    #[error("cannot bring the tenants' key documents up to date: {0}")]
+    KeyDocuments(String),
     #[error("kine (CP_KINE_ENDPOINT): {0}")]
     Kine(#[from] crate::kine::KineError),
     #[error("cannot listen on CP_HTTP_ADDR: {0}")]
