@@ -134,7 +134,7 @@ describe("a metric label selection without what billing reads", () => {
     expect(code, logs).not.toBe(0);
     expect(logs).toContain("aisix_llm_spend_micro_usd_total");
     expect(logs).toContain("user_id");
-    expect(logs).toContain("portal");
+    expect(logs).toContain("read per user");
   });
 });
 

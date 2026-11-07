@@ -568,7 +568,7 @@ impl LabelSelection {
                 if !labels.iter().any(|label| label == required) {
                     let why = match (definition.name, *required) {
                         (M_LLM_SPEND_MICRO_USD_TOTAL, "user_id") => {
-                            ": the portal bills each user from this label"
+                            ": spend is read per user from this label"
                         }
                         _ => "",
                     };
@@ -975,8 +975,8 @@ mod tests {
         );
     }
 
-    /// This gateway still emits the spend family and the portal bills from it,
-    /// so a labels entry for it reshapes the series like any other family's,
+    /// This gateway still emits the spend family, so a labels entry for it
+    /// reshapes the series like any other family's,
     /// and is not ignored. Any unknown name still fails.
     #[test]
     fn a_labels_entry_for_the_spend_family_applies_and_an_unknown_one_still_fails() {
@@ -1052,8 +1052,8 @@ mod tests {
         }
     }
 
-    /// Spend is billed per user from `user_id`: a selection without it would
-    /// merge every user's spend into one series the portal cannot bill from.
+    /// Spend is read per user from `user_id`: a selection without it would
+    /// merge every user's spend into one series.
     #[test]
     fn spend_refuses_a_selection_without_the_label_billing_reads() {
         let error = LabelSelection::compile(&selection(
@@ -1062,7 +1062,7 @@ mod tests {
         ))
         .unwrap_err();
         assert!(error.contains("\"user_id\""), "{error}");
-        assert!(error.contains("portal bills"), "{error}");
+        assert!(error.contains("read per user"), "{error}");
         LabelSelection::compile(&selection(M_LLM_SPEND_MICRO_USD_TOTAL, &["user_id"])).unwrap();
     }
 

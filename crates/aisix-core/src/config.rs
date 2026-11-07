@@ -1443,7 +1443,7 @@ impl ObservabilityConfig {
 /// older gateway still loads. Any other unknown family name fails boot.
 ///
 /// `aisix_llm_spend_micro_usd_total` does not belong here: this gateway still
-/// emits it and the portal bills from it.
+/// emits it.
 pub const RETIRED_METRIC_FAMILIES: &[&str] = &[];
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -4262,8 +4262,8 @@ not_a_section:
         }
     }
 
-    /// This gateway still emits the spend family and the portal bills from it,
-    /// so a labels entry for it is a real selection: telling the operator the
+    /// This gateway still emits the spend family, so a labels entry for it is
+    /// a real selection: telling the operator the
     /// family is gone and the entry ignored would be false on both counts.
     #[test]
     fn a_labels_entry_for_the_spend_family_is_not_reported_as_retired() {

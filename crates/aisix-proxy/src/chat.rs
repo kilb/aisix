@@ -4861,8 +4861,8 @@ async fn dispatch_ensemble(
     let total_tokens = panel_total + u64::from(effective_judge.usage.total_tokens);
     crate::attribution::note_ensemble_tokens_charged();
     reservation.commit_tokens_no_spend(total_tokens).await;
-    // One figure per sub-call for its row and for the spend metric the
-    // portal bills from, which `record_success` reads off `Success::cost_usd`.
+    // One figure per sub-call for its row and for the spend metric, which
+    // `record_success` reads off `Success::cost_usd`.
     let judge_cost_usd = crate::usage_attr::request_cost_usd(
         snapshot,
         &resolve_sub(&outcome.judge_model).0,
@@ -6169,7 +6169,7 @@ struct EnsembleCharge {
     entry_keys: Vec<String>,
     /// The panel's (or, abandoned, every returned sub-call's) usage.
     usage: aisix_gateway::chat::UsageStats,
-    /// What that usage cost, for the spend metric the portal bills from.
+    /// What that usage cost, for the spend metric.
     cost_usd: f64,
     bounded_model: String,
     metric_caller: crate::request_metrics::Owned,

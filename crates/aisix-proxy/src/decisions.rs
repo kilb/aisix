@@ -881,8 +881,8 @@ fn emit_usage_event(
 ) {
     let usage = &success.usage;
     let elapsed_ms = crate::attempt::measured_ms(elapsed);
-    // Priced from the dispatched row's `Model.cost`; the spend counter below
-    // is what the portal bills from.
+    // Priced from the dispatched row's `Model.cost`, for the event and the
+    // spend counter below.
     let cost_usd = crate::usage_attr::request_cost_usd(
         snap,
         &success.model_id,
@@ -1069,9 +1069,9 @@ mod tests {
     }
 
     /// The surface's money wiring. `..Default::default()` on the event compiles
-    /// and bills zero, so this pins the number on the event and on the counter
-    /// the portal bills from, cached input at its own rate, and that the
-    /// caller sees the window it spent.
+    /// and bills zero, so this pins the number on the event and on the spend
+    /// counter, cached input at its own rate, and that the caller sees the
+    /// window it spent.
     #[tokio::test]
     async fn a_priced_decision_reaches_the_spend_metric_and_reports_the_window() {
         use aisix_core::resource::ResourceEntry;

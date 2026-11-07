@@ -677,9 +677,9 @@ type HangupSignal = std::convert::Infallible;
 /// a while (loading the resources file, managed-mode provisioning, the etcd
 /// connect):
 /// registering is what replaces SIGHUP's default action, which terminates
-/// the process. A file-mode gateway is the one a co-located portal signals
-/// (`pkill -HUP`) after writing its resources file, and a write that lands
-/// while the gateway is starting used to kill it silently, because the
+/// the process. A file-mode gateway is signalled (`pkill -HUP`) by whatever
+/// writes its resources file, and a write that lands while the gateway is
+/// starting used to kill it silently, because the
 /// handler was only installed once the first load had finished. Signals that
 /// arrive before the draining loop runs are kept by the stream.
 /// `None` when registration fails (logged) or there is no SIGHUP.

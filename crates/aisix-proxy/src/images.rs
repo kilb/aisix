@@ -925,8 +925,7 @@ pub(crate) fn emit_usage_event(
     crate::usage_attr::apply_caller_identity(&mut event, client.jwt.as_ref(), &client.caller);
     let usage_model =
         crate::usage_attr::usage_event_model_label(snap, &event.requested_model).into_owned();
-    // Read before the event is handed over: the spend counter below is what
-    // the portal bills from.
+    // Read before the event is handed over, for the spend counter below.
     let cost_usd = event.cost_usd;
     crate::usage_attr::emit_usage(
         state,

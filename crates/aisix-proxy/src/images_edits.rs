@@ -1496,8 +1496,8 @@ mod tests {
         assert!(!wire.contains("BLOCKME"), "{wire}");
     }
     /// The surface's money wiring. Every token this edit reports is priced off
-    /// the dispatched row, on the event and on the counter the portal bills
-    /// from, and the caller sees the window it spent.
+    /// the dispatched row, on the event and on the spend counter, and the
+    /// caller sees the window it spent.
     #[tokio::test]
     async fn a_priced_edit_reaches_the_spend_metric_and_reports_the_window() {
         use aisix_obs::UsageSink;
