@@ -36,17 +36,21 @@ function inviteLink(issued: IssuedInvite): string {
  * offered neither the role nor an owner's row. While the organisation is
  * suspended the page offers removal only.
  *
- * `onSelfChanged` follows a change to the caller's own row: their role, and
- * with it what the portal shows them, is the control plane's to say.
+ * `onSelfChanged` re-reads the session: after a change to the caller's own
+ * role, and after a refusal that says the organisation is no longer active,
+ * since what the portal shows them is the control plane's to say.
+ * `onLeft` follows the caller removing themself.
  */
 export function Members({
   member,
   status,
   onSelfChanged,
+  onLeft,
 }: {
   member: SessionMember;
   status: TenantStatus;
   onSelfChanged: () => void;
+  onLeft: () => void;
 }) {
   const active = status === "active";
   const isOwner = member.role === "owner";
@@ -77,18 +81,29 @@ export function Members({
     }
   }, [active]);
 
+  // Read again when the caller's own role changes (the session re-read after
+  // a change to their own row): what they may see and do changed with it.
   useEffect(() => {
     void load();
-  }, [load]);
+  }, [load, member.role]);
 
-  /** One change, keyed `key` while it runs; the lists are read again whatever the answer. */
-  async function act(key: string, change: () => Promise<unknown>, self: boolean) {
+  /**
+   * One change, keyed `key` while it runs. On success `done`, when given,
+   * takes over from reading the lists again: a change to the caller's own
+   * row can leave them unable to read them. Otherwise, and on any refusal,
+   * the lists are read again.
+   */
+  async function act(key: string, change: () => Promise<unknown>, done?: () => void) {
     setBusy(key);
     setActionErr(null);
     try {
       await change();
-      if (self) onSelfChanged();
+      if (done) {
+        done();
+        return;
+      }
     } catch (e) {
+      if (e instanceof ApiError && e.code === "tenant_not_active") onSelfChanged();
       setActionErr(failure(e));
     } finally {
       setBusy(null);
@@ -108,6 +123,7 @@ export function Members({
       {active && (
         <InviteForm
           roles={roles}
+          onInactive={onSelfChanged}
           onIssued={(email, invite) => {
             setIssued({ email, link: inviteLink(invite), expiresAt: invite.expires_at });
             void load();
@@ -185,7 +201,11 @@ export function Members({
                                   disabled={busy === m.id}
                                   onClick={() => {
                                     dropDraft(m.id);
-                                    void act(m.id, () => memberApi.setRole(m.id, draft), self);
+                                    void act(
+                                      m.id,
+                                      () => memberApi.setRole(m.id, draft),
+                                      self ? onSelfChanged : undefined,
+                                    );
                                   }}
                                 >
                                   确认更改角色
@@ -207,7 +227,7 @@ export function Members({
                             label="移除"
                             warning="该成员的所有密钥会被吊销"
                             disabled={busy === m.id}
-                            onConfirm={() => void act(m.id, () => memberApi.remove(m.id), self)}
+                            onConfirm={() => void act(m.id, () => memberApi.remove(m.id), self ? onLeft : undefined)}
                           />
                         )}
                       </td>
@@ -256,7 +276,7 @@ export function Members({
                           <button
                             className="ghost"
                             disabled={busy === inv.id}
-                            onClick={() => void act(inv.id, () => memberApi.revokeInvite(inv.id), false)}
+                            onClick={() => void act(inv.id, () => memberApi.revokeInvite(inv.id))}
                           >
                             撤销
                           </button>
@@ -276,9 +296,12 @@ export function Members({
 
 function InviteForm({
   roles,
+  onInactive,
   onIssued,
 }: {
   roles: MemberRole[];
+  /** Called when the control plane says the organisation is no longer active. */
+  onInactive: () => void;
   onIssued: (email: string, invite: IssuedInvite) => void;
 }) {
   const [email, setEmail] = useState("");
@@ -295,6 +318,7 @@ function InviteForm({
       onIssued(email, invite);
       setEmail("");
     } catch (e) {
+      if (e instanceof ApiError && e.code === "tenant_not_active") onInactive();
       setErr(e instanceof ApiError ? formMessageFor(e) : String(e));
     } finally {
       setBusy(false);

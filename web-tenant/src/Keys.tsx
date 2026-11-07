@@ -34,8 +34,18 @@ export function when(at: string): string {
  *
  * While the organisation is suspended its keys do not work, and the page
  * offers revocation only: nothing that makes a key or switches one on.
+ * `onSelfChanged` re-reads the session when a refusal says the organisation
+ * is no longer active, so the page follows the state it is really in.
  */
-export function Keys({ member, status }: { member: SessionMember; status: TenantStatus }) {
+export function Keys({
+  member,
+  status,
+  onSelfChanged,
+}: {
+  member: SessionMember;
+  status: TenantStatus;
+  onSelfChanged: () => void;
+}) {
   const active = status === "active";
   const manager = member.role === "owner" || member.role === "admin";
   const [items, setItems] = useState<TenantKey[] | null>(null);
@@ -80,6 +90,7 @@ export function Keys({ member, status }: { member: SessionMember; status: Tenant
     try {
       await change();
     } catch (e) {
+      if (e instanceof ApiError && e.code === "tenant_not_active") onSelfChanged();
       setActionErr(
         e instanceof ApiError && e.code === "version_mismatch"
           ? "该密钥已被他人修改，列表已重新载入，请再操作一次"
@@ -128,6 +139,7 @@ export function Keys({ member, status }: { member: SessionMember; status: Tenant
           caps={caps}
           people={people}
           readErr={readErr}
+          onInactive={onSelfChanged}
           onCreated={(plaintext) => {
             setMinted(plaintext);
             void load();
@@ -257,6 +269,7 @@ function NewKeyForm({
   caps,
   people,
   readErr,
+  onInactive,
   onCreated,
 }: {
   me: SessionMember;
@@ -265,6 +278,8 @@ function NewKeyForm({
   caps: Caps | null;
   people: Member[] | null;
   readErr: string | null;
+  /** Called when the control plane says the organisation is no longer active. */
+  onInactive: () => void;
   onCreated: (plaintext: string) => void;
 }) {
   const id = useId();
@@ -327,6 +342,9 @@ function NewKeyForm({
         if (rest.length > 0) setErr(rest.join("；"));
       } else if (e instanceof ApiError && e.code === "unavailable") {
         setErr("平台暂时无法创建密钥，请稍后再试");
+      } else if (e instanceof ApiError && e.code === "tenant_not_active") {
+        setErr(messageFor(e));
+        onInactive();
       } else {
         setErr(e instanceof ApiError ? formMessageFor(e) : String(e));
       }

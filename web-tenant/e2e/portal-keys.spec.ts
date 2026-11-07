@@ -135,6 +135,8 @@ test("新建密钥：明文只显示一次，能调用被授权的模型，不�
   await activeOrg("Keys Org 1a7", "owner@keys-1a7.test");
   const consoleLines: string[] = [];
   page.on("console", (m) => consoleLines.push(m.text()));
+  // Chromium's permission names: the suite runs Chromium only (CI installs
+  // it alone), and other engines name or grant clipboard access differently.
   await page.context().grantPermissions(["clipboard-read", "clipboard-write"], { origin: stack.previewUrl });
   await login(page, "owner@keys-1a7.test");
   await openTab(page, "密钥");
@@ -154,10 +156,15 @@ test("新建密钥：明文只显示一次，能调用被授权的模型，不�
   await notice.getByRole("button", { name: "复制" }).click();
   expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(plaintext);
 
-  // The list names the key by a prefix of it, never the whole secret.
+  // The list names the key by the prefix the API keeps of it, never the
+  // whole secret.
+  const { items } = await (await signedIn("owner@keys-1a7.test")).get("/api/keys");
+  const prefix: string = items[0].prefix;
+  expect(plaintext.startsWith(prefix)).toBe(true);
+  expect(prefix.length).toBeLessThan(plaintext.length);
   const listed = row(page, "first-key-1a7");
   await expect(listed).toContainText("chat-e2e");
-  await expect(listed).toContainText(plaintext.slice(0, 6));
+  await expect(listed).toContainText(prefix);
   await expect(listed).not.toContainText(plaintext);
 
   // The key reaches its model through the gateway, and nothing outside chat.
@@ -502,9 +509,51 @@ test("在别处结束会话后，页面上的下一次操作回到登录框", as
   await page.getByLabel("邮箱", { exact: true }).fill("late@expiry-2f9.test");
   await page.getByRole("button", { name: "邀请成员" }).click();
   await expect(page.getByRole("button", { name: "登录", exact: true })).toBeVisible();
-  await expect(page.getByText("请重新登录")).toBeVisible();
+  await expect(page.getByText("登录已过期，请重新登录")).toBeVisible();
   await expect(page.getByText("Expiry Org 2f9")).toHaveCount(0);
   expect((await elsewhere.get("/api/members/invites")).items).toEqual([]);
+});
+
+test("管理员移除自己后回到登录框，提示已离开组织而不是登录过期", async ({ page }) => {
+  const id = await activeOrg("Leave Org 5c3", "owner@leave-5c3.test");
+  await joined(id, "admin@leave-5c3.test", "admin", "Lee 5c3");
+  await login(page, "admin@leave-5c3.test");
+  await openTab(page, "成员");
+  const self = row(page, "admin@leave-5c3.test");
+  await self.getByRole("button", { name: "移除" }).click();
+  await self.getByRole("button", { name: "确认移除" }).click();
+
+  await expect(page.getByRole("button", { name: "登录", exact: true })).toBeVisible();
+  await expect(page.getByText("你已离开该组织")).toBeVisible();
+  await expect(page.getByText("登录已过期，请重新登录")).toHaveCount(0);
+  await expect(page.getByText("Leave Org 5c3")).toHaveCount(0);
+  // Gone for good: no longer a member, and the password no longer signs in.
+  const owner = await signedIn("owner@leave-5c3.test");
+  const emails = (await owner.get("/api/members")).items.map((m: Json) => m.email);
+  expect(emails).toEqual(["owner@leave-5c3.test"]);
+  const again = await stack.tenant().request("POST", "/api/login", { email: "admin@leave-5c3.test", password: PASSWORD });
+  expect(again.status).toBe(401);
+});
+
+test("页面打开期间组织被停用，下一次被拒的操作后页面随之变化", async ({ page }) => {
+  const id = await activeOrg("Stale Org 6d4", "owner@stale-6d4.test");
+  await login(page, "owner@stale-6d4.test");
+  await openTab(page, "密钥");
+  await expect(page.getByLabel("名称", { exact: true })).toBeVisible();
+
+  // Suspended while the page still shows the form.
+  await stack.admin.post(`/admin/tenants/${id}/suspend`);
+  await page.getByLabel("名称", { exact: true }).fill("late-key-6d4");
+  await page.getByRole("button", { name: "新建密钥" }).click();
+
+  // The refusal brings the page to the state the organisation is in. The
+  // note first: while the request is in flight the button reads otherwise,
+  // so its absence alone proves nothing until the answer is in.
+  await expect(page.getByText("组织已被停用", { exact: false })).toBeVisible();
+  await expect(page.getByLabel("名称", { exact: true })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "新建密钥" })).toHaveCount(0);
+  await expect(page.getByRole("tab")).toHaveText(["组织", "密钥", "成员"]);
+  expect((await stack.admin.get(`/admin/tenants/${id}/keys`)).items).toEqual([]);
 });
 
 test("停用的组织：密钥与成员页只剩吊销与移除", async ({ page }) => {

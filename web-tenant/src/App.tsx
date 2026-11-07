@@ -64,7 +64,8 @@ export function App({ inviteToken }: { inviteToken: string | null }) {
   const [invite, setInvite] = useState(inviteToken);
   const [bootError, setBootError] = useState<string | null>(null);
   const [signOutError, setSignOutError] = useState<string | null>(null);
-  const [expired, setExpired] = useState(false);
+  /** Why the gate is showing again, when a session ended under the member. */
+  const [notice, setNotice] = useState<string | null>(null);
   const [tab, setTab] = useState<TabId>("org");
 
   // Any page's request that finds the session gone drops back to the gate:
@@ -73,9 +74,17 @@ export function App({ inviteToken }: { inviteToken: string | null }) {
   useEffect(() => {
     onSessionEnded(() => {
       setMe(null);
-      setExpired(true);
+      setNotice("登录已过期，请重新登录");
     });
     return () => onSessionEnded(null);
+  }, []);
+
+  // The member removed themself, which ended their session on the control
+  // plane already: nothing is left to sign out of, and a logout request
+  // would only answer that the session is gone.
+  const leave = useCallback(() => {
+    setMe(null);
+    setNotice("你已离开该组织");
   }, []);
 
   const boot = useCallback(async () => {
@@ -97,7 +106,7 @@ export function App({ inviteToken }: { inviteToken: string | null }) {
     setMe(signedIn(s));
     setInvite(null);
     setSignOutError(null);
-    setExpired(false);
+    setNotice(null);
     setTab("org");
   }, []);
 
@@ -154,7 +163,7 @@ export function App({ inviteToken }: { inviteToken: string | null }) {
       <Gate
         invite={invite}
         signedIn={me !== null}
-        notice={expired ? "登录已过期，请重新登录" : null}
+        notice={notice}
         onIn={signIn}
         onLeaveInvite={() => setInvite(null)}
       />
@@ -204,9 +213,9 @@ export function App({ inviteToken }: { inviteToken: string | null }) {
 
       <main>
         {current === "keys" ? (
-          <Keys member={member} status={tenant.status} />
+          <Keys member={member} status={tenant.status} onSelfChanged={() => void boot()} />
         ) : current === "members" ? (
-          <Members member={member} status={tenant.status} onSelfChanged={() => void boot()} />
+          <Members member={member} status={tenant.status} onSelfChanged={() => void boot()} onLeft={leave} />
         ) : (
           <Org member={member} status={tenant.status} />
         )}
