@@ -410,6 +410,10 @@ pub(crate) struct ContextAffinity {
     /// whose id is not this tenant's seal
     /// ([`crate::opaque_id::unseal_responses_input`]).
     unopened_item_reference: Option<usize>,
+    /// The positions, in `input[]` as the caller sent it and ascending, of
+    /// the items [`Self::unwrap_input`] dropped, so a refusal can name an
+    /// item by the position the caller knows it at.
+    dropped_inputs: Vec<usize>,
 }
 
 impl ContextAffinity {
@@ -472,7 +476,7 @@ impl ContextAffinity {
             return;
         }
         let items = std::mem::take(input);
-        for mut item in items {
+        for (position, mut item) in items.into_iter().enumerate() {
             let decoded = item
                 .get("encrypted_content")
                 .and_then(Value::as_str)
@@ -484,12 +488,60 @@ impl ContextAffinity {
                 }
                 Some(EncryptedContent::Undecodable) => match strip_ciphertext(item) {
                     Some(kept) => item = kept,
-                    None => continue,
+                    None => {
+                        self.dropped_inputs.push(position);
+                        continue;
+                    }
                 },
                 Some(EncryptedContent::Plain) | None => {}
             }
             input.push(item);
         }
+    }
+
+    /// `err` with the `input[i]` its path starts with given as the item's
+    /// position in the request as the caller sent it: [`Self::unwrap_input`]
+    /// may have dropped items ahead of it. Every other error as it is.
+    pub(crate) fn at_caller_position(
+        &self,
+        err: crate::error::ProxyError,
+    ) -> crate::error::ProxyError {
+        use crate::error::ProxyError;
+        match err {
+            ProxyError::StoredObjectReference(path) => {
+                ProxyError::StoredObjectReference(self.caller_path(path))
+            }
+            ProxyError::ModelSelectorRefused(path) => {
+                ProxyError::ModelSelectorRefused(self.caller_path(path))
+            }
+            other => other,
+        }
+    }
+
+    fn caller_path(&self, path: String) -> String {
+        if self.dropped_inputs.is_empty() {
+            return path;
+        }
+        let parsed = path.strip_prefix("input[").and_then(|rest| {
+            let (digits, tail) = rest.split_once(']')?;
+            Some((digits.parse::<usize>().ok()?, tail))
+        });
+        match parsed {
+            Some((index, tail)) => format!("input[{}]{tail}", self.caller_index(index)),
+            None => path,
+        }
+    }
+
+    /// The position in the request as the caller sent it of what is now
+    /// `input[index]`.
+    fn caller_index(&self, index: usize) -> usize {
+        let mut position = index;
+        for &dropped in &self.dropped_inputs {
+            if dropped <= position {
+                position += 1;
+            }
+        }
+        position
     }
 
     /// Platform mode: record what [`crate::opaque_id::unseal_responses_input`]
@@ -507,7 +559,8 @@ impl ContextAffinity {
     pub(crate) fn refuse_unopened_item_reference(&self) -> Result<(), crate::error::ProxyError> {
         match self.unopened_item_reference {
             Some(index) => Err(crate::error::ProxyError::StoredObjectReference(format!(
-                "input[{index}].id"
+                "input[{}].id",
+                self.caller_index(index)
             ))),
             None => Ok(()),
         }
@@ -917,6 +970,55 @@ mod tests {
         assert_eq!(body["input"][1]["encrypted_content"], "CT");
         assert_eq!(a.origin(), Some("m-1"));
         assert_eq!(a.encrypted, vec![(1, "m-2".to_string())]);
+    }
+
+    /// A refusal names the position of the item in the request as the
+    /// caller sent it, also when an item ahead of it was dropped because its
+    /// ciphertext tag did not decode.
+    #[test]
+    fn a_refused_input_path_names_the_position_the_caller_sent() {
+        let mut body = json!({
+            "input": [
+                {"type": "reasoning", "id": "rs_1", "summary": [],
+                 "encrypted_content": "aisix_enc_v1:%%;junk"},
+                {"type": "message", "role": "user", "content": "hi"},
+                {"type": "item_reference", "id": "msg_foreign"},
+                {"type": "message", "role": "user", "content": [
+                    {"type": "input_file", "file_id": "file-1"}]},
+            ]
+        });
+        let mut a = ContextAffinity::unwrap_request(&mut body);
+        assert_eq!(
+            body["input"].as_array().unwrap().len(),
+            3,
+            "the first item is dropped"
+        );
+        a.note_unopened_item_reference(Some(1));
+        match a.refuse_unopened_item_reference() {
+            Err(crate::error::ProxyError::StoredObjectReference(path)) => {
+                assert_eq!(path, "input[2].id")
+            }
+            other => panic!("{other:?}"),
+        }
+        let refused = crate::stored_refs::refuse_in_responses(
+            Some(&crate::platform::PlatformSettings::from_secret("s")),
+            &body,
+        )
+        .unwrap_err();
+        match a.at_caller_position(refused) {
+            crate::error::ProxyError::StoredObjectReference(path) => {
+                assert_eq!(path, "input[3].content[0].file_id")
+            }
+            other => panic!("{other:?}"),
+        }
+        // Nothing dropped: the path is as found.
+        let mut body = json!({"input": [{"type": "item_reference", "id": "msg_foreign"}]});
+        let mut a = ContextAffinity::unwrap_request(&mut body);
+        a.note_unopened_item_reference(Some(0));
+        assert!(matches!(
+            a.refuse_unopened_item_reference(),
+            Err(crate::error::ProxyError::StoredObjectReference(path)) if path == "input[0].id"
+        ));
     }
 
     #[test]

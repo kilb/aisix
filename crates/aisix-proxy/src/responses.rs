@@ -848,7 +848,8 @@ async fn dispatch(
 
     // Platform mode: nothing the request names may be an object stored
     // upstream for another tenant.
-    crate::stored_refs::refuse_in_responses(state.platform(), body)?;
+    crate::stored_refs::refuse_in_responses(state.platform(), body)
+        .map_err(|err| affinity.at_caller_position(err))?;
     affinity.refuse_unopened_item_reference()?;
 
     // Platform mode: a continuation names a response this tenant was handed,
