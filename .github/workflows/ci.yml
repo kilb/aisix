@@ -610,6 +610,83 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  # The cross-plane suite (tests/e2e/src/cp-cases, vitest.cp.config.ts): a
+  # real gateway in managed mode, booted from the credential bundle, against
+  # the real control plane, kine and Postgres (scripts/cp-dev-stack.mjs). Its
+  # own job because it needs Postgres and kine and no etcd, and because it
+  # builds the control plane, which `build-bin` does not. It uploads no
+  # coverage artifact: the coverage gate expects exactly the eight
+  # `coverage-e2e-*` artifacts of the `e2e` matrix.
+  e2e-cp:
+    name: e2e control plane (vitest, ${{ matrix.serving }})
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      # Both serving modes, as the `e2e` matrix runs them: every spawn site
+      # reads E2E_THREAD_PER_CORE, and a leg that never ran the other mode
+      # would prove nothing about it.
+      fail-fast: false
+      matrix:
+        include:
+          - serving: thread-per-core
+            thread_per_core: "true"
+          - serving: work-stealing
+            thread_per_core: "false"
+    services:
+      # The same image and digest as rust-unit's control-plane database.
+      # Each stack creates and drops two databases of its own on it.
+      postgres:
+        image: postgres:18@sha256:bd5dfa494a5a259704365813dbfa5fa6b3e69be7348d43b547f540c730478583
+        env:
+          POSTGRES_PASSWORD: postgres
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports: ["5432:5432"]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      # The control plane's build.rs generates the etcd front from protos.
+      - uses: ./.github/actions/setup-protoc
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v6
+        with:
+          # Same as the e2e job: pnpm 11 needs Node 22.13 or newer.
+          node-version: 22
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 11
+      - name: fetch kine
+        # The pinned binary, refused by scripts/fetch-kine.sh unless its
+        # sha256 matches. Each stack starts its own kine on it.
+        run: |
+          scripts/fetch-kine.sh "$RUNNER_TEMP/kine"
+          echo "CP_E2E_KINE_BIN=$RUNNER_TEMP/kine" >> "$GITHUB_ENV"
+      - name: require psql
+        # cp-dev-stack.mjs creates and drops its databases with the runner's
+        # psql client.
+        run: psql --version
+      - name: build the gateway and the control plane
+        # Each binary named: `--bin` filters every selected package, so
+        # `-p aisix-server --bin aisix -p aisix-control-plane` alone builds
+        # no control-plane binary.
+        run: cargo build -p aisix-server --bin aisix -p aisix-control-plane --bin aisix-control-plane
+      - name: e2e install
+        working-directory: tests/e2e
+        run: pnpm install --frozen-lockfile
+      - name: e2e typecheck
+        working-directory: tests/e2e
+        run: pnpm exec tsc --noEmit
+      - name: run the cross-plane e2e
+        working-directory: tests/e2e
+        env:
+          CP_E2E_PG_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres
+          E2E_THREAD_PER_CORE: ${{ matrix.thread_per_core }}
+        run: pnpm exec vitest run -c vitest.cp.config.ts
+
   # `vitest` and `vite` transpile without typechecking, so a genuine type
   # error — a helper called with the wrong argument shape, a renamed field
   # still referenced — never fails a run. It just sits in the tree. Nothing
@@ -650,7 +727,7 @@ jobs:
     # other open PRs still report the old name and would all break the
     # moment the required contexts were renamed to the two leg names.
     name: e2e (vitest) + coverage
-    needs: [e2e, mcp-conformance, playwright-e2e, playwright-real-prometheus, typecheck]
+    needs: [e2e, e2e-cp, mcp-conformance, playwright-e2e, playwright-real-prometheus, typecheck]
     # A skipped required check counts as satisfied, so this must still run
     # when the matrix fails — otherwise the gate would vanish exactly when
     # it matters.
@@ -661,6 +738,12 @@ jobs:
         run: |
           if [ "${{ needs.e2e.result }}" != "success" ]; then
             echo "::error::e2e matrix result: ${{ needs.e2e.result }}"
+            exit 1
+          fi
+      - name: assert the cross-plane suite passed in every serving mode
+        run: |
+          if [ "${{ needs.e2e-cp.result }}" != "success" ]; then
+            echo "::error::e2e control plane result: ${{ needs.e2e-cp.result }}"
             exit 1
           fi
       - name: assert MCP conformance passed

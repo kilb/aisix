@@ -275,7 +275,7 @@ export interface SpawnedApp {
   stop(): Promise<void>;
 }
 
-const BIN_PATH =
+export const BIN_PATH =
   process.env.AISIX_BIN ?? join(process.cwd(), "..", "..", "target", "debug", "aisix");
 
 /// Refuse to run against a gateway binary older than the sources.
@@ -297,7 +297,11 @@ const BIN_PATH =
 /// Only real build inputs count: `crates/*/src/**/*.rs` plus the manifests.
 /// Generated output is deliberately excluded — the money fixture includes
 /// `schemas/`, and regenerating those with identical content made every
-/// binary look stale.
+/// binary look stale. So are the crates of the separate binaries the gateway
+/// does not link (`NOT_LINKED`): an edit there leaves the gateway binary
+/// untouched, cargo rightly does not relink it, and the check would then
+/// refuse every run until something else did.
+const NOT_LINKED = new Set(["aisix-console", "aisix-control-plane", "aisix-portal"]);
 /**
  * When this module was loaded — i.e. roughly when the run started.
  *
@@ -311,7 +315,7 @@ const BIN_PATH =
  */
 const RUN_STARTED_MS = Date.now();
 
-function assertGatewayBinaryIsFresh(bin: string): void {
+export function assertGatewayBinaryIsFresh(bin: string): void {
   if (onCI()) return;
 
   let binTime: number;
@@ -358,7 +362,7 @@ function assertGatewayBinaryIsFresh(bin: string): void {
     return; // not a source checkout; nothing to compare against
   }
   for (const c of crates) {
-    if (!c.isDirectory()) continue;
+    if (!c.isDirectory() || NOT_LINKED.has(c.name)) continue;
     walk(join(root, "crates", c.name, "src"));
     try {
       consider(join(root, "crates", c.name, "Cargo.toml"));
