@@ -236,8 +236,12 @@ pub struct ApiKey {
     /// principal of anonymous MCP access or of an anonymous passthrough route
     /// and the list leaves out that family, the anonymous entry is closed and
     /// answers `401`. A family name this gateway version does not recognize
-    /// grants nothing.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// grants nothing, and is left out when the key is read back.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_known_families"
+    )]
     pub allowed_endpoints: Option<Vec<EndpointFamily>>,
 
     /// RFC 3339 timestamp after which the key stops authenticating.
@@ -299,6 +303,26 @@ pub enum EndpointFamily {
     #[serde(other)]
     #[schemars(skip)]
     Unknown,
+}
+
+/// Writes `families` without [`EndpointFamily::Unknown`]: a name this build
+/// does not recognize grants nothing here and the write schema refuses it,
+/// so a key read back shows what it may call and can be written back as
+/// read. Leaving an entry out never widens the key, since a list left empty
+/// grants nothing, as the unknown entries did. The name a later release
+/// gave the family is not kept.
+pub fn serialize_known_families<S: serde::Serializer>(
+    families: &Option<Vec<EndpointFamily>>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    match families {
+        None => serializer.serialize_none(),
+        Some(families) => serializer.collect_seq(
+            families
+                .iter()
+                .filter(|family| **family != EndpointFamily::Unknown),
+        ),
+    }
 }
 
 impl ApiKey {
@@ -1156,6 +1180,40 @@ mod tests {
         let k: ApiKey = serde_json::from_value(spelled).unwrap();
         assert!(!k.can_call(EndpointFamily::Unknown));
         assert!(!k.can_call(EndpointFamily::Models));
+    }
+
+    /// A key read back is valid to write back: a family this build does not
+    /// recognize, which grants nothing here and which the write schema
+    /// refuses, is left out of what the key serializes to, never written as
+    /// `unknown`. Leaving it out grants nothing it did not: a list left with
+    /// no entry still grants nothing.
+    #[test]
+    fn a_key_with_an_unknown_family_serializes_to_what_the_write_schema_accepts() {
+        use crate::models::schema::validate_apikey;
+        for (stored, written) in [
+            (
+                serde_json::json!(["chat_completions", "video_editing_v9", "models"]),
+                serde_json::json!(["chat_completions", "models"]),
+            ),
+            (
+                serde_json::json!(["video_editing_v9"]),
+                serde_json::json!([]),
+            ),
+        ] {
+            let doc = serde_json::json!({"key_hash": "x", "allowed_endpoints": stored});
+            let key: ApiKey = serde_json::from_value(doc).unwrap();
+            let read = serde_json::to_value(&key).unwrap();
+            assert_eq!(read["allowed_endpoints"], written, "{stored}");
+            validate_apikey(&read).unwrap_or_else(|e| panic!("{stored}: {e:?}"));
+            let again: ApiKey = serde_json::from_value(read).unwrap();
+            for (name, family) in written_families() {
+                assert_eq!(
+                    again.can_call(family),
+                    key.can_call(family),
+                    "{stored}: {name}"
+                );
+            }
+        }
     }
 
     #[test]
