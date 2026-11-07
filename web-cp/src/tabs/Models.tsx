@@ -1,7 +1,7 @@
 import { Fragment, useEffect, useRef, useState } from "react";
 import type { TabProps } from "../App";
 import { ConflictNote } from "../components/ConflictNote";
-import { Field } from "../components/Field";
+import { Field } from "../ui/Field";
 import { Msg, type Note } from "../components/Msg";
 import { RolloutBadge } from "../components/RolloutBadge";
 import { ApiError, tenants, type ResourceView, type Tenant } from "../lib/api";
@@ -9,6 +9,9 @@ import { messageFor, problemAt } from "../lib/errors";
 import { errorText } from "../lib/fmt";
 import { defaultAt, enumAt, loadSchema } from "../lib/schema";
 import { useResource } from "../lib/useResource";
+import { Button } from "../ui/Button";
+import { DataTable, Loading } from "../ui/DataTable";
+import { EmptyState } from "../ui/EmptyState";
 
 /** One routing target; fields this page does not edit (such as `tags`) are kept as stored. */
 interface Target {
@@ -226,29 +229,29 @@ export function Models({ canEdit }: TabProps) {
       <div className="panel">
         <h2>
           模型与路由
-          <button
+          <Button
+            size="sm"
             type="button"
-            className="ghost"
-            style={{ marginLeft: "auto" }}
+            icon="refresh"
             onClick={() => {
               void models.reload();
               void accounts.reload();
             }}
           >
             刷新
-          </button>
+          </Button>
         </h2>
         <p className="hint">
           租户按对外名称调用模型。直连模型经一个上游账号调用上游模型；路由模型按选路策略在若干直连模型之间选择。每个模型可服务的分组来自它的上游账号：普通租户只能用到其分组内的账号。
         </p>
         {canEdit && !open && (
           <p>
-            <button className="act" onClick={() => openForm({ mode: "new", shape: "direct" })}>
+            <Button kind="primary" onClick={() => openForm({ mode: "new", shape: "direct" })}>
               新增直连模型
-            </button>{" "}
-            <button className="act" onClick={() => openForm({ mode: "new", shape: "routing" })}>
+            </Button>{" "}
+            <Button kind="primary" onClick={() => openForm({ mode: "new", shape: "routing" })}>
               新增路由模型
-            </button>
+            </Button>
           </p>
         )}
         <Msg note={note} />
@@ -288,79 +291,78 @@ export function Models({ canEdit }: TabProps) {
           </div>
         )}
         {models.items === null ? (
-          !models.error && <p className="hint">载入中…</p>
+          !models.error && <Loading />
         ) : models.items.length === 0 ? (
-          <p className="hint">还没有模型。</p>
+          <EmptyState text="还没有模型。" />
         ) : (
-          <div className="scroll">
-            <table>
-              <thead>
-                <tr>
-                  <th>对外名称</th>
-                  <th>类型</th>
-                  <th>上游账号 / 路由目标</th>
-                  <th>状态</th>
-                  <th className="right">操作</th>
-                </tr>
-              </thead>
-              <tbody>
-                {models.items.map((m) => {
-                  const shape = shapeOf(m.doc);
-                  const hasForm = shape === "direct" || shape === "routing";
-                  return (
-                    <Fragment key={m.id}>
-                      <tr>
-                        <td>{nameOf(m)}</td>
-                        <td>{SHAPE_LABEL[shape]}</td>
-                        <td>
-                          <Upstream model={m} catalog={catalog} />
-                        </td>
-                        <td>
-                          <RolloutBadge rollout={m.rollout} />
-                        </td>
-                        <td className="right">
-                          {deleting?.id === m.id ? (
-                            <>
-                              <button
-                                className="ghost"
-                                disabled={busy || deleting.holders === null}
-                                onClick={() => void remove(m)}
-                              >
-                                确认删除
-                              </button>
-                              <button className="ghost" disabled={busy} onClick={cancelDelete}>
-                                取消
-                              </button>
-                            </>
-                          ) : (
-                            <>
-                              {hasForm && (
-                                <button className="ghost" onClick={() => openForm({ mode: "edit", id: m.id })}>
-                                  {canEdit ? "编辑" : "查看"}
-                                </button>
-                              )}
-                              {canEdit && (
-                                <button className="ghost" disabled={busy} onClick={() => void startDelete(m)}>
-                                  删除
-                                </button>
-                              )}
-                            </>
-                          )}
+          <DataTable>
+            <thead>
+              <tr>
+                <th>对外名称</th>
+                <th>类型</th>
+                <th>上游账号 / 路由目标</th>
+                <th>状态</th>
+                <th className="right">操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              {models.items.map((m) => {
+                const shape = shapeOf(m.doc);
+                const hasForm = shape === "direct" || shape === "routing";
+                return (
+                  <Fragment key={m.id}>
+                    <tr>
+                      <td>{nameOf(m)}</td>
+                      <td>{SHAPE_LABEL[shape]}</td>
+                      <td>
+                        <Upstream model={m} catalog={catalog} />
+                      </td>
+                      <td>
+                        <RolloutBadge rollout={m.rollout} />
+                      </td>
+                      <td className="right">
+                        {deleting?.id === m.id ? (
+                          <>
+                            <Button
+                              kind="danger"
+                              size="sm"
+                              disabled={busy || deleting.holders === null}
+                              onClick={() => void remove(m)}
+                            >
+                              确认删除
+                            </Button>
+                            <Button size="sm" disabled={busy} onClick={cancelDelete}>
+                              取消
+                            </Button>
+                          </>
+                        ) : (
+                          <>
+                            {hasForm && (
+                              <Button size="sm" onClick={() => openForm({ mode: "edit", id: m.id })}>
+                                {canEdit ? "编辑" : "查看"}
+                              </Button>
+                            )}
+                            {canEdit && (
+                              <Button size="sm" disabled={busy} onClick={() => void startDelete(m)}>
+                                删除
+                              </Button>
+                            )}
+                          </>
+                        )}
+                      </td>
+                    </tr>
+                    {deleting?.id === m.id && (
+                      <tr className="dt-detail">
+                        <td colSpan={5}>
+                          <DeleteWarning holders={deleting.holders} />
                         </td>
                       </tr>
-                      {deleting?.id === m.id && (
-                        <tr>
-                          <td colSpan={5}>
-                            <DeleteWarning holders={deleting.holders} />
-                          </td>
-                        </tr>
-                      )}
-                    </Fragment>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
+                    )}
+                  </Fragment>
+                );
+              })}
+            </tbody>
+          </DataTable>
         )}
       </div>
     </>
@@ -645,7 +647,7 @@ function ModelForm({
   return (
     <form className="panel" aria-label={title} onSubmit={submit}>
       <h2>{title}</h2>
-      <Field label="对外名称" problem={at("/display_name")}>
+      <Field label="对外名称" error={at("/display_name")}>
         {(aria) => <input required disabled={locked} value={name} onChange={(e) => setName(e.target.value)} {...aria} />}
       </Field>
       {!isNew && !readOnly && (
@@ -658,7 +660,7 @@ function ModelForm({
       {shape === "direct" ? (
         <>
           <div className="r">
-            <Field label="上游账号" problem={at("/provider_key_id")}>
+            <Field label="上游账号" error={at("/provider_key_id")}>
               {(aria) => (
                 <select
                   required
@@ -676,7 +678,7 @@ function ModelForm({
                 </select>
               )}
             </Field>
-            <Field label="供应商标识" problem={at("/provider")}>
+            <Field label="供应商标识" error={at("/provider")}>
               {(aria) => (
                 <input required disabled={locked} value={provider} onChange={(e) => setProvider(e.target.value)} {...aria} />
               )}
@@ -687,7 +689,7 @@ function ModelForm({
               该账号可服务的分组：{account.doc.groups?.length ? account.doc.groups.join("、") : "—（账号未设分组）"}
             </p>
           )}
-          <Field label="上游模型" problem={at("/model_name")}>
+          <Field label="上游模型" error={at("/model_name")}>
             {(aria) => (
               <input required disabled={locked} value={upstream} onChange={(e) => setUpstream(e.target.value)} {...aria} />
             )}
@@ -703,7 +705,7 @@ function ModelForm({
               </div>
             </div>
           ) : (
-            <Field label="选路策略" problem={at("/routing/strategy")}>
+            <Field label="选路策略" error={at("/routing/strategy")}>
               {(aria) => (
                 <select
                   disabled={locked || strategies === null}
@@ -725,7 +727,7 @@ function ModelForm({
             return (
               <div key={r.key} className="target" role="group" aria-label={`目标 ${i + 1}`}>
                 <div className="r">
-                  <Field label="目标模型" problem={targetAt(r, "model_id")}>
+                  <Field label="目标模型" error={targetAt(r, "model_id")}>
                     {(aria) => (
                       <select
                         required
@@ -743,7 +745,7 @@ function ModelForm({
                       </select>
                     )}
                   </Field>
-                  <Field label="权重" problem={targetAt(r, "weight")}>
+                  <Field label="权重" error={targetAt(r, "weight")}>
                     {(aria) => (
                       <input
                         type="number"
@@ -756,7 +758,7 @@ function ModelForm({
                       />
                     )}
                   </Field>
-                  <Field label="优先级" problem={targetAt(r, "priority")}>
+                  <Field label="优先级" error={targetAt(r, "priority")}>
                     {(aria) => (
                       <input
                         type="number"
@@ -774,8 +776,8 @@ function ModelForm({
                   <p>
                     {removing === r.key ? (
                       <>
-                        <button
-                          className="ghost"
+                        <Button
+                          kind="danger"
                           type="button"
                           disabled={busy}
                           onClick={() => {
@@ -784,15 +786,15 @@ function ModelForm({
                           }}
                         >
                           确认移除
-                        </button>{" "}
-                        <button className="ghost" type="button" disabled={busy} onClick={() => setRemoving(null)}>
+                        </Button>{" "}
+                        <Button type="button" disabled={busy} onClick={() => setRemoving(null)}>
                           取消
-                        </button>
+                        </Button>
                       </>
                     ) : (
-                      <button className="ghost" type="button" disabled={busy} onClick={() => setRemoving(r.key)}>
+                      <Button type="button" disabled={busy} onClick={() => setRemoving(r.key)}>
                         移除
-                      </button>
+                      </Button>
                     )}
                   </p>
                 )}
@@ -801,9 +803,9 @@ function ModelForm({
           })}
           {!readOnly && (
             <p>
-              <button className="ghost" type="button" disabled={busy} onClick={addRow}>
+              <Button type="button" disabled={busy} onClick={addRow}>
                 添加目标
-              </button>
+              </Button>
             </p>
           )}
           <p className="hint">权重、优先级留空时用网关的默认值。优先级高的一组先用，这一组都不可用时才用下一组。</p>
@@ -828,18 +830,18 @@ function ModelForm({
 
       {readOnly ? (
         <p>
-          <button className="ghost" type="button" onClick={onClose}>
+          <Button type="button" onClick={onClose}>
             关闭
-          </button>
+          </Button>
         </p>
       ) : (
         <p>
-          <button className="act" type="submit" disabled={busy}>
+          <Button kind="primary" type="submit" disabled={busy}>
             {busy ? "保存中…" : "保存"}
-          </button>{" "}
-          <button className="ghost" type="button" disabled={busy} onClick={onClose}>
+          </Button>{" "}
+          <Button type="button" disabled={busy} onClick={onClose}>
             取消
-          </button>
+          </Button>
         </p>
       )}
     </form>

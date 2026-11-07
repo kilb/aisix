@@ -3,6 +3,9 @@ import type { TabProps } from "../App";
 import { ApiError, operators, type Detail, type OperatorAccount, type OperatorRole } from "../lib/api";
 import { messageFor } from "../lib/errors";
 import { errorText, fmtTime } from "../lib/fmt";
+import { Button } from "../ui/Button";
+import { DataTable, Loading } from "../ui/DataTable";
+import { Lamp } from "../ui/Lamp";
 
 /** The control plane's operator roles, highest first, by the names this page shows. */
 const ROLES: { role: OperatorRole; label: string }[] = [
@@ -80,20 +83,20 @@ export function Operators({ operator }: TabProps) {
         </p>
         <div className="r">
           {!creating && (
-            <button
+            <Button
+              kind="primary"
               type="button"
-              className="act"
               onClick={() => {
                 setOutcome(null);
                 setCreating(true);
               }}
             >
               新建运维账号
-            </button>
+            </Button>
           )}
-          <button type="button" className="ghost" onClick={() => void reload()}>
+          <Button type="button" icon="refresh" onClick={() => void reload()}>
             刷新
-          </button>
+          </Button>
         </div>
         {outcome && (
           <div className={outcome.ok ? "note" : "note crit"} role={outcome.ok ? "status" : "alert"}>
@@ -105,114 +108,116 @@ export function Operators({ operator }: TabProps) {
             {loadError}
           </div>
         )}
-        {items === null && !loadError && <p className="hint">载入中…</p>}
+        {items === null && !loadError && <Loading />}
         {items !== null && (
-          <div className="scroll">
-            <table>
-              <thead>
-                <tr>
-                  <th>邮箱</th>
-                  <th>显示名</th>
-                  <th>角色</th>
-                  <th>状态</th>
-                  <th>创建时间</th>
-                  <th />
-                </tr>
-              </thead>
-              <tbody>
-                {items.map((a) => {
-                  const mine = pending?.id === a.id ? pending : null;
-                  const shownRole = mine?.kind === "role" ? mine.role : a.role;
-                  return (
-                    <tr key={a.id}>
-                      <td>
-                        {a.email}
-                        {a.id === operator.id && <span className="hint">（当前账号）</span>}
-                      </td>
-                      <td>{a.display_name ?? "—"}</td>
-                      <td>
-                        <select
-                          aria-label="角色"
-                          value={shownRole}
-                          disabled={busy || mine?.kind === "disable"}
-                          onChange={(e) => {
-                            const role = e.target.value as OperatorRole;
+          <DataTable>
+            <thead>
+              <tr>
+                <th>邮箱</th>
+                <th>显示名</th>
+                <th>角色</th>
+                <th>状态</th>
+                <th>创建时间</th>
+                <th />
+              </tr>
+            </thead>
+            <tbody>
+              {items.map((a) => {
+                const mine = pending?.id === a.id ? pending : null;
+                const shownRole = mine?.kind === "role" ? mine.role : a.role;
+                return (
+                  <tr key={a.id}>
+                    <td>
+                      {a.email}
+                      {a.id === operator.id && <span className="hint">（当前账号）</span>}
+                    </td>
+                    <td>{a.display_name ?? "—"}</td>
+                    <td>
+                      <select
+                        aria-label="角色"
+                        value={shownRole}
+                        disabled={busy || mine?.kind === "disable"}
+                        onChange={(e) => {
+                          const role = e.target.value as OperatorRole;
+                          setOutcome(null);
+                          setPending(role === a.role ? null : { id: a.id, kind: "role", role });
+                        }}
+                      >
+                        {ROLES.map((r) => (
+                          <option key={r.role} value={r.role}>
+                            {r.label}
+                          </option>
+                        ))}
+                      </select>
+                    </td>
+                    <td>
+                      <Lamp state={a.disabled ? "disabled" : "applied"}>{a.disabled ? "已停用" : "正常"}</Lamp>
+                    </td>
+                    <td>{fmtTime(a.created_at)}</td>
+                    <td className="right">
+                      {mine?.kind === "role" && (
+                        <>
+                          <Button
+                            kind="primary"
+                            size="sm"
+                            type="button"
+                            disabled={busy}
+                            onClick={() =>
+                              void change(a, { role: mine.role }, `${a.email} 已改为${roleLabel(mine.role)}`)
+                            }
+                          >
+                            确认改为{roleLabel(mine.role)}
+                          </Button>{" "}
+                          <Button size="sm" type="button" disabled={busy} onClick={() => setPending(null)}>
+                            取消
+                          </Button>
+                        </>
+                      )}
+                      {mine?.kind === "disable" && (
+                        <>
+                          <Button
+                            kind="danger"
+                            size="sm"
+                            type="button"
+                            disabled={busy}
+                            onClick={() => void change(a, { disabled: true }, `${a.email} 已停用`)}
+                          >
+                            确认停用
+                          </Button>{" "}
+                          <Button size="sm" type="button" disabled={busy} onClick={() => setPending(null)}>
+                            取消
+                          </Button>
+                        </>
+                      )}
+                      {!mine && !a.disabled && (
+                        <Button
+                          size="sm"
+                          type="button"
+                          disabled={busy}
+                          onClick={() => {
                             setOutcome(null);
-                            setPending(role === a.role ? null : { id: a.id, kind: "role", role });
+                            setPending({ id: a.id, kind: "disable" });
                           }}
                         >
-                          {ROLES.map((r) => (
-                            <option key={r.role} value={r.role}>
-                              {r.label}
-                            </option>
-                          ))}
-                        </select>
-                      </td>
-                      <td>{a.disabled ? "已停用" : "正常"}</td>
-                      <td>{fmtTime(a.created_at)}</td>
-                      <td className="right">
-                        {mine?.kind === "role" && (
-                          <>
-                            <button
-                              type="button"
-                              className="act"
-                              disabled={busy}
-                              onClick={() =>
-                                void change(a, { role: mine.role }, `${a.email} 已改为${roleLabel(mine.role)}`)
-                              }
-                            >
-                              确认改为{roleLabel(mine.role)}
-                            </button>{" "}
-                            <button type="button" className="ghost" disabled={busy} onClick={() => setPending(null)}>
-                              取消
-                            </button>
-                          </>
-                        )}
-                        {mine?.kind === "disable" && (
-                          <>
-                            <button
-                              type="button"
-                              className="act"
-                              disabled={busy}
-                              onClick={() => void change(a, { disabled: true }, `${a.email} 已停用`)}
-                            >
-                              确认停用
-                            </button>{" "}
-                            <button type="button" className="ghost" disabled={busy} onClick={() => setPending(null)}>
-                              取消
-                            </button>
-                          </>
-                        )}
-                        {!mine && !a.disabled && (
-                          <button
-                            type="button"
-                            className="ghost"
-                            disabled={busy}
-                            onClick={() => {
-                              setOutcome(null);
-                              setPending({ id: a.id, kind: "disable" });
-                            }}
-                          >
-                            停用
-                          </button>
-                        )}
-                        {!mine && a.disabled && (
-                          <button
-                            type="button"
-                            className="ghost"
-                            disabled={busy}
-                            onClick={() => void change(a, { disabled: false }, `${a.email} 已启用`)}
-                          >
-                            启用
-                          </button>
-                        )}
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
+                          停用
+                        </Button>
+                      )}
+                      {!mine && a.disabled && (
+                        <Button
+                          size="sm"
+                          type="button"
+                          disabled={busy}
+                          onClick={() => void change(a, { disabled: false }, `${a.email} 已启用`)}
+                        >
+                          启用
+                        </Button>
+                      )}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </DataTable>
         )}
       </div>
 
@@ -347,12 +352,12 @@ function CreateForm({
         </div>
       )}
       <div className="r">
-        <button type="submit" className="act" disabled={busy}>
+        <Button kind="primary" type="submit" disabled={busy}>
           创建
-        </button>
-        <button type="button" className="ghost" onClick={onCancel}>
+        </Button>
+        <Button type="button" onClick={onCancel}>
           取消
-        </button>
+        </Button>
       </div>
     </form>
   );

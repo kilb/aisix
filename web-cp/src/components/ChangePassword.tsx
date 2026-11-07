@@ -1,6 +1,7 @@
 import { useId, useState } from "react";
 import { ApiError, changePassword } from "../lib/api";
 import { messageFor } from "../lib/errors";
+import { Button } from "../ui/Button";
 
 /**
  * The signed-in operator's own password, opened from the header by every
@@ -53,9 +54,9 @@ export function ChangePassword({ onClose }: { onClose: () => void }) {
           口令已修改，此账号在其他浏览器或设备上的会话已全部退出。
         </div>
         <div className="r">
-          <button type="button" className="ghost" onClick={onClose}>
+          <Button type="button" onClick={onClose}>
             关闭
-          </button>
+          </Button>
         </div>
       </div>
     );
@@ -115,12 +116,12 @@ export function ChangePassword({ onClose }: { onClose: () => void }) {
         </div>
       )}
       <div className="r">
-        <button type="submit" className="act" disabled={busy || mismatch}>
+        <Button kind="primary" type="submit" disabled={busy || mismatch}>
           保存新口令
-        </button>
-        <button type="button" className="ghost" onClick={onClose}>
+        </Button>
+        <Button type="button" onClick={onClose}>
           取消
-        </button>
+        </Button>
       </div>
     </form>
   );

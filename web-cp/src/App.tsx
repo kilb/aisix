@@ -1,9 +1,25 @@
 import { useCallback, useEffect, useState } from "react";
-import { ApiError, logout, onSessionEnded, session, type Operator, type OperatorRole } from "./lib/api";
+import {
+  ApiError,
+  environment,
+  logout,
+  onSessionEnded,
+  rollout,
+  session,
+  tenants,
+  type Environment,
+  type Operator,
+  type OperatorRole,
+  type RolloutSummary,
+  type Tenant,
+} from "./lib/api";
 import { EXPECTED_API_CONTRACT } from "./lib/contract";
-import { errorText } from "./lib/fmt";
+import { errorText, fmtInt } from "./lib/fmt";
 import { useTheme } from "./lib/useTheme";
 import { ChangePassword } from "./components/ChangePassword";
+import { Button } from "./ui/Button";
+import { Lamp, type LampState } from "./ui/Lamp";
+import { RouteNav } from "./ui/RouteNav";
 import { Gate } from "./Gate";
 import { Audit } from "./tabs/Audit";
 import { Cache } from "./tabs/Cache";
@@ -44,6 +60,87 @@ const ROLE_LABEL: Record<OperatorRole, string> = {
   operator: "运维",
   viewer: "只读",
 };
+
+/** How often the shell reads the fleet's state again for its header and markers. */
+const SHELL_REFRESH_MS = 10_000;
+
+/** What the shell reads for its header and the sections' attention markers. */
+export interface ShellData {
+  env: Environment | null;
+  summary: RolloutSummary | null;
+  pendingTenants: Tenant[] | null;
+}
+
+/**
+ * The sections whose stop carries an attention marker. Each check reads only
+ * what the shell already holds and says, in words, what needs attention
+ * there; null when nothing does. Entries are appended, one per source.
+ */
+const ATTENTION: { tab: TabId; check: (d: ShellData) => string | null }[] = [
+  {
+    tab: "overview",
+    check: ({ summary }) =>
+      summary && summary.rejected.length > 0 ? `${fmtInt(summary.rejected.length)} 个资源被网关拒绝` : null,
+  },
+  {
+    tab: "tenants",
+    check: ({ pendingTenants }) =>
+      pendingTenants && pendingTenants.length > 0 ? `${fmtInt(pendingTenants.length)} 个租户待审核` : null,
+  },
+];
+
+/** One lamp for the whole fleet: what stops a saved document first, else how far rollouts have got. */
+function fleetLamp(s: RolloutSummary): { state: LampState; text: string } {
+  if (s.projection_blocked || s.projection_stalled) return { state: "rejected", text: "下发已停止" };
+  if (s.rejected.length > 0) return { state: "rejected", text: "有资源被拒绝" };
+  if (s.pending + s.propagating > 0) return { state: "propagating", text: "下发中" };
+  if (s.online_instances === 0) return { state: "disabled", text: "无在线网关" };
+  return { state: "applied", text: "已生效" };
+}
+
+/**
+ * The header's environment, version and fleet lamp, and the attention
+ * markers' data, read while an operator is signed in. A failed read keeps
+ * what was last read; the pages report their own failures.
+ */
+function useShellData(signedIn: boolean, tab: TabId): ShellData {
+  const [env, setEnv] = useState<Environment | null>(null);
+  const [summary, setSummary] = useState<RolloutSummary | null>(null);
+  const [pendingTenants, setPendingTenants] = useState<Tenant[] | null>(null);
+
+  useEffect(() => {
+    if (!signedIn) return;
+    let live = true;
+    environment.get().then(
+      (e) => live && setEnv(e),
+      () => undefined,
+    );
+    return () => {
+      live = false;
+    };
+  }, [signedIn]);
+
+  // Read again on every change of section, so a marker clears once its cause is dealt with.
+  useEffect(() => {
+    if (!signedIn) return;
+    let live = true;
+    let timer: number | undefined;
+    const tick = async () => {
+      const [s, p] = await Promise.allSettled([rollout.summary(), tenants.list("pending")]);
+      if (!live) return;
+      if (s.status === "fulfilled") setSummary(s.value);
+      if (p.status === "fulfilled") setPendingTenants(p.value);
+      timer = window.setTimeout(() => void tick(), SHELL_REFRESH_MS);
+    };
+    void tick();
+    return () => {
+      live = false;
+      window.clearTimeout(timer);
+    };
+  }, [signedIn, tab]);
+
+  return { env, summary, pendingTenants };
+}
 
 /** A tab whose page is not built yet. */
 function NotBuilt({ label }: { label: string }) {
@@ -94,6 +191,7 @@ export function App() {
   const [sessionEnded, setSessionEnded] = useState(false);
   const [passwordOpen, setPasswordOpen] = useState(false);
   const [theme, toggleTheme] = useTheme();
+  const shell = useShellData(operator !== null && apiContract === EXPECTED_API_CONTRACT, tab);
 
   const boot = useCallback(async () => {
     setBootError(null);
@@ -165,9 +263,9 @@ export function App() {
       <div className="centered">
         <div className="note crit" role="alert">
           <strong>无法读取登录状态。</strong> {bootError}{" "}
-          <button className="ghost" onClick={() => void boot()}>
+          <Button size="sm" onClick={() => void boot()}>
             重试
-          </button>
+          </Button>
         </div>
       </div>
     );
@@ -182,7 +280,7 @@ export function App() {
     const stale = apiContract < EXPECTED_API_CONTRACT ? "控制面" : "界面";
     return (
       <div className="centered">
-        <div className="note crit" style={{ margin: "24px" }}>
+        <div className="note crit skew">
           <strong>界面与控制面的接口版本不一致，已停止一切操作。</strong>
           <p>
             界面期望契约 v{EXPECTED_API_CONTRACT}，控制面报告 v{apiContract}——{stale}
@@ -210,68 +308,86 @@ export function App() {
 
   const visible = TABS.filter((t) => !("adminOnly" in t) || operator.role === "admin");
   const current: TabId = visible.some((t) => t.id === tab) ? tab : "overview";
+  const attention: Partial<Record<TabId, string>> = {};
+  for (const { tab: id, check } of ATTENTION) {
+    const note = check(shell);
+    if (note) attention[id] = note;
+  }
+  const fleet = shell.summary && fleetLamp(shell.summary);
 
   return (
-    <div className="frame">
-      <header className="book-head">
-        <div className="book-mark">
-          <h1>AISIX Dashboard</h1>
-          <span className="book-sub">控制面</span>
-        </div>
-        <div className="book-foli">
-          <span className="pill value" title={operator.email}>
-            {operator.display_name || operator.email} · {ROLE_LABEL[operator.role]}
-          </span>
-          <button
-            className="ghost"
-            onClick={toggleTheme}
-            aria-label={theme === "dark" ? "切换到浅色" : "切换到深色"}
-            title={theme === "dark" ? "切换到浅色" : "切换到深色"}
-          >
-            {theme === "dark" ? "浅色" : "深色"}
-          </button>
-          <button className="ghost" aria-expanded={passwordOpen} onClick={() => setPasswordOpen((o) => !o)}>
-            修改口令
-          </button>
-          <button className="ghost" onClick={() => void signOut()}>
-            登出
-          </button>
-        </div>
-      </header>
+    <div className="shell">
+      <RouteNav items={visible} current={current} attention={attention} label="Dashboard 分区" onSelect={setTab} />
 
-      {passwordOpen && <ChangePassword onClose={() => setPasswordOpen(false)} />}
-
-      {signOutError && (
-        <div className="note crit" role="alert">
-          {signOutError}
-        </div>
-      )}
-
-      <div className="leafs">
-        <nav className="tabs" role="tablist" aria-label="Dashboard 分区">
-          {visible.map((t) => (
-            <button
-              key={t.id}
-              role="tab"
-              data-tab={t.id}
-              aria-selected={current === t.id}
-              onClick={() => setTab(t.id)}
+      <div className="shell-main">
+        <header className="topbar">
+          <div className="brand">
+            <h1 className="display">AISIX Dashboard</h1>
+            <span className="brand-sub">控制面</span>
+          </div>
+          {(shell.env || fleet) && (
+            <div className="ctx">
+              {shell.env && (
+                <>
+                  <span>
+                    环境 <code>{shell.env.env_id}</code>
+                  </span>
+                  <span>控制面 {shell.env.cp_version}</span>
+                </>
+              )}
+              {fleet && shell.summary && (
+                <span className="fleet">
+                  <Lamp state={fleet.state} title="配置下发状态">
+                    {fleet.text}
+                  </Lamp>
+                  <span className="ctx-note">在线网关 {fmtInt(shell.summary.online_instances)}</span>
+                </span>
+              )}
+            </div>
+          )}
+          <div className="who">
+            <span className="who-name" title={operator.email}>
+              {operator.display_name || operator.email}
+            </span>
+            <span className="tag">{ROLE_LABEL[operator.role]}</span>
+            <Button
+              kind="quiet"
+              size="sm"
+              onClick={toggleTheme}
+              aria-label={theme === "dark" ? "切换到浅色" : "切换到深色"}
+              title={theme === "dark" ? "切换到浅色" : "切换到深色"}
             >
-              {t.label}
-            </button>
-          ))}
-        </nav>
+              {theme === "dark" ? "浅色" : "深色"}
+            </Button>
+            <Button kind="quiet" size="sm" aria-expanded={passwordOpen} onClick={() => setPasswordOpen((o) => !o)}>
+              修改口令
+            </Button>
+            <Button kind="quiet" size="sm" onClick={() => void signOut()}>
+              登出
+            </Button>
+          </div>
+        </header>
 
-        <main>
-          <section id={`tab-${current}`}>
-            <Page
-              tab={current}
-              operator={operator}
-              canEdit={operator.role !== "viewer"}
-              onGoto={setTab}
-            />
-          </section>
-        </main>
+        <div className="workspace">
+          {passwordOpen && <ChangePassword onClose={() => setPasswordOpen(false)} />}
+
+          {signOutError && (
+            <div className="note crit" role="alert">
+              {signOutError}
+            </div>
+          )}
+
+          <main>
+            <section id={`tab-${current}`} role="tabpanel" aria-labelledby={`stop-${current}`}>
+              <Page
+                tab={current}
+                operator={operator}
+                canEdit={operator.role !== "viewer"}
+                onGoto={setTab}
+              />
+            </section>
+          </main>
+        </div>
       </div>
     </div>
   );

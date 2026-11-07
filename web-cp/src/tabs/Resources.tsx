@@ -6,6 +6,9 @@ import { RolloutBadge } from "../components/RolloutBadge";
 import { ApiError, resources, type Detail, type ResourceView } from "../lib/api";
 import { messageFor } from "../lib/errors";
 import { useResource } from "../lib/useResource";
+import { Button } from "../ui/Button";
+import { DataTable, Loading } from "../ui/DataTable";
+import { EmptyState } from "../ui/EmptyState";
 
 /**
  * Every gateway resource kind the control plane stores, by the segment
@@ -62,7 +65,7 @@ export function Resources({ canEdit }: TabProps) {
         <p className="hint">
           按网关的资源定义直接编辑 JSON 文档。保存时由控制面按网关的规则校验，问题列在编辑框下方。
         </p>
-        <label className="f">
+        <label className="f filter filter-wide">
           <span>资源类型</span>
           <select value={kind} onChange={(e) => setKind(e.target.value)}>
             {KINDS.map((k) => (
@@ -204,56 +207,54 @@ function KindPage({ info, canEdit }: { info: KindInfo; canEdit: boolean }) {
         {!info.writable && <div className="note">{MANAGED_NOTE}</div>}
         <div className="r">
           {canCreate && (
-            <button type="button" className="act" onClick={startNew}>
+            <Button kind="primary" type="button" onClick={startNew}>
               新建
-            </button>
+            </Button>
           )}
-          <button type="button" className="ghost" onClick={() => void reload()}>
+          <Button type="button" icon="refresh" onClick={() => void reload()}>
             刷新
-          </button>
+          </Button>
         </div>
         {error && (
           <div className="note crit" role="alert">
             {messageFor(error)}
           </div>
         )}
-        {items === null && !error && <p className="hint">载入中…</p>}
-        {items !== null && items.length === 0 && <p className="hint">暂无此类资源。</p>}
+        {items === null && !error && <Loading />}
+        {items !== null && items.length === 0 && <EmptyState text="暂无此类资源。" />}
         {items !== null && items.length > 0 && (
-          <div className="scroll">
-            <table>
-              <thead>
-                <tr>
-                  <th>名称</th>
-                  <th>ID</th>
-                  <th className="right">版本</th>
-                  <th>管理方</th>
-                  <th>下发状态</th>
-                  <th />
+          <DataTable>
+            <thead>
+              <tr>
+                <th>名称</th>
+                <th>ID</th>
+                <th className="right">版本</th>
+                <th>管理方</th>
+                <th>下发状态</th>
+                <th />
+              </tr>
+            </thead>
+            <tbody>
+              {items.map((r) => (
+                <tr key={r.id}>
+                  <td>{nameOf(r.doc) ?? <span className="hint">（未命名）</span>}</td>
+                  <td>
+                    <code>{r.id}</code>
+                  </td>
+                  <td className="right">{r.version}</td>
+                  <td>{r.managed_by ?? "—"}</td>
+                  <td>
+                    <RolloutBadge rollout={r.rollout} />
+                  </td>
+                  <td className="right">
+                    <Button size="sm" type="button" onClick={() => open(r)}>
+                      {writable && r.managed_by === null ? "编辑" : "查看"}
+                    </Button>
+                  </td>
                 </tr>
-              </thead>
-              <tbody>
-                {items.map((r) => (
-                  <tr key={r.id}>
-                    <td>{nameOf(r.doc) ?? <span className="hint">（未命名）</span>}</td>
-                    <td>
-                      <code>{r.id}</code>
-                    </td>
-                    <td className="right">{r.version}</td>
-                    <td>{r.managed_by ?? "—"}</td>
-                    <td>
-                      <RolloutBadge rollout={r.rollout} />
-                    </td>
-                    <td className="right">
-                      <button type="button" className="ghost" onClick={() => open(r)}>
-                        {writable && r.managed_by === null ? "编辑" : "查看"}
-                      </button>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+              ))}
+            </tbody>
+          </DataTable>
         )}
       </div>
 
@@ -278,35 +279,35 @@ function KindPage({ info, canEdit }: { info: KindInfo; canEdit: boolean }) {
           )}
           <div className="r">
             {editing.mode === "new" && (
-              <button type="button" className="act" disabled={busy} onClick={() => void submit()}>
+              <Button kind="primary" type="button" disabled={busy} onClick={() => void submit()}>
                 创建
-              </button>
+              </Button>
             )}
             {editing.mode === "edit" && editable && !confirmDelete && (
               <>
-                <button type="button" className="act" disabled={busy} onClick={() => void submit()}>
+                <Button kind="primary" type="button" disabled={busy} onClick={() => void submit()}>
                   保存
-                </button>
-                <button type="button" className="ghost" disabled={busy} onClick={() => setConfirmDelete(true)}>
+                </Button>
+                <Button type="button" disabled={busy} onClick={() => setConfirmDelete(true)}>
                   删除
-                </button>
+                </Button>
               </>
             )}
             {/* Ruling P1b-R6: a destructive action confirms inline, never in a dialog. */}
             {editing.mode === "edit" && editable && confirmDelete && (
               <>
-                <button type="button" className="act" disabled={busy} onClick={() => void del()}>
+                <Button kind="danger" type="button" disabled={busy} onClick={() => void del()}>
                   确认删除
-                </button>
-                <button type="button" className="ghost" disabled={busy} onClick={() => setConfirmDelete(false)}>
+                </Button>
+                <Button type="button" disabled={busy} onClick={() => setConfirmDelete(false)}>
                   取消
-                </button>
+                </Button>
               </>
             )}
             {!confirmDelete && (
-              <button type="button" className="ghost" onClick={close}>
+              <Button type="button" onClick={close}>
                 {editing.mode === "new" || editable ? "取消" : "关闭"}
-              </button>
+              </Button>
             )}
           </div>
         </div>
