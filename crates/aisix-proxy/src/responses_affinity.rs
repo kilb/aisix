@@ -682,14 +682,24 @@ impl ContextAffinity {
         target_id: &str,
         target_provider_key_id: Option<&str>,
     ) -> Option<Value> {
-        let unreadable: Vec<usize> = self
-            .encrypted
-            .iter()
-            .filter(|(_, origin)| {
-                !Boundary::of(snapshot, origin).contains(target_id, target_provider_key_id)
-            })
-            .map(|(idx, _)| *idx)
-            .collect();
+        // One boundary per origin, however many items it tagged, and one
+        // flag per item: a long conversation of tagged items costs one pass.
+        let mut readable_by_origin: std::collections::HashMap<&str, bool> =
+            std::collections::HashMap::new();
+        let mut unreadable: Vec<bool> = Vec::new();
+        for (idx, origin) in &self.encrypted {
+            let readable = *readable_by_origin
+                .entry(origin.as_str())
+                .or_insert_with(|| {
+                    Boundary::of(snapshot, origin).contains(target_id, target_provider_key_id)
+                });
+            if !readable {
+                if unreadable.len() <= *idx {
+                    unreadable.resize(*idx + 1, false);
+                }
+                unreadable[*idx] = true;
+            }
+        }
         if unreadable.is_empty() {
             return None;
         }
@@ -697,7 +707,7 @@ impl ContextAffinity {
         if let Some(input) = body.get_mut("input").and_then(Value::as_array_mut) {
             let items = std::mem::take(input);
             for (idx, item) in items.into_iter().enumerate() {
-                if !unreadable.contains(&idx) {
+                if !unreadable.get(idx).copied().unwrap_or(false) {
                     input.push(item);
                 } else if let Some(kept) = strip_ciphertext(item) {
                     input.push(kept);
@@ -1111,6 +1121,40 @@ mod tests {
                 Some(("m-1".to_string(), "resp_1".to_string()))
             );
         }
+    }
+
+    /// A conversation of many tagged items is read in one pass per target:
+    /// 60 000 items from one origin outside the target's boundary, which a
+    /// lookup per item per item took seconds over.
+    #[test]
+    fn a_long_tagged_conversation_is_read_once_per_target() {
+        let snap = aisix_core::AisixSnapshot::new();
+        let n = 60_000;
+        let input: Vec<Value> = (0..n)
+            .map(|i| {
+                json!({"type": "reasoning", "id": format!("rs_{i}"), "encrypted_content": "CT",
+                       "summary": [{"type": "summary_text", "text": "s"}]})
+            })
+            .collect();
+        let body = json!({"input": input});
+        let a = ContextAffinity {
+            encrypted: (0..n).map(|i| (i, "m-origin".to_string())).collect(),
+            ..Default::default()
+        };
+        let started = std::time::Instant::now();
+        let out = a.body_for_target(&snap, &body, "m-other", None).unwrap();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        let input = out["input"].as_array().unwrap();
+        assert_eq!(input.len(), n);
+        assert!(input
+            .iter()
+            .all(|item| item.get("encrypted_content").is_none()));
+        // A target inside the boundary reads every item as it was.
+        assert!(a.body_for_target(&snap, &body, "m-origin", None).is_none());
     }
 
     #[test]
