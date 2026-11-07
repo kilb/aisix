@@ -154,6 +154,8 @@ test("新建密钥：明文只显示一次，能调用被授权的模型，不�
   const plaintext = await notice.getByRole("textbox").inputValue();
   expect(plaintext.length).toBeGreaterThan(20);
   await notice.getByRole("button", { name: "复制" }).click();
+  // The write is done once the notice says so.
+  await expect(notice.getByRole("status")).toHaveText("已复制");
   expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(plaintext);
 
   // The list names the key by the prefix the API keeps of it, never the
@@ -170,6 +172,12 @@ test("新建密钥：明文只显示一次，能调用被授权的模型，不�
   // The key reaches its model through the gateway, and nothing outside chat.
   await chatSettles(plaintext, 200);
   expect(await gateway(plaintext, "/v1/images/generations", { model: "chat-e2e", prompt: "a cat" })).toBe(403);
+
+  // Away to another page and back: the secret is gone.
+  await openTab(page, "组织");
+  await openTab(page, "密钥");
+  await expect(row(page, "first-key-1a7")).toBeVisible();
+  await expect(page.getByRole("region", { name: SECRET_NOTICE })).toHaveCount(0);
 
   // After a reload the secret is nowhere: not on the page, not in storage,
   // not in the address, not in the console.
@@ -313,7 +321,12 @@ test("最后一个所有者不能被降级", async ({ page }) => {
   await self.getByRole("combobox").selectOption({ label: "管理员" });
   await self.getByRole("button", { name: "确认更改角色" }).click();
   await expect(page.getByRole("alert")).toContainText("组织至少要有一个所有者");
-  // Removing the last owner is refused the same way.
+  // Removing the last owner is refused the same way, on a fresh page whose
+  // only refusal can be this one.
+  await page.reload();
+  await openTab(page, "成员");
+  await expect(self).toBeVisible();
+  await expect(page.getByRole("alert")).toHaveCount(0);
   await self.getByRole("button", { name: "移除" }).click();
   await self.getByRole("button", { name: "确认移除" }).click();
   await expect(page.getByRole("alert")).toContainText("组织至少要有一个所有者");
@@ -567,16 +580,16 @@ test("停用的组织：密钥与成员页只剩吊销与移除", async ({ page 
   await expect(page.getByText("组织已被停用，请联系平台")).toBeVisible();
   await expect(page.getByRole("tab")).toHaveText(["组织", "密钥", "成员"]);
 
-  // Whether or not the control plane lists them while suspended, the pages
-  // offer nothing that makes or opens anything.
+  // The pages list what the organisation has, and offer nothing that makes
+  // or opens anything.
   await openTab(page, "密钥");
-  await expect(row(page, "kept-key-3a1").or(page.getByRole("alert"))).toBeVisible();
+  await expect(row(page, "kept-key-3a1")).toBeVisible();
   await expect(page.getByRole("button", { name: "新建密钥" })).toHaveCount(0);
   await expect(page.getByLabel("名称", { exact: true })).toHaveCount(0);
   await expect(page.getByRole("button", { name: "停用" })).toHaveCount(0);
   await expect(page.getByRole("button", { name: "启用" })).toHaveCount(0);
   await openTab(page, "成员");
-  await expect(row(page, "member@suspended-3a1.test").or(page.getByRole("alert"))).toBeVisible();
+  await expect(row(page, "member@suspended-3a1.test")).toBeVisible();
   await expect(page.getByRole("button", { name: "邀请成员" })).toHaveCount(0);
   await expect(page.getByRole("combobox")).toHaveCount(0);
 });
