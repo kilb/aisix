@@ -41,6 +41,20 @@ interface Envelope {
   current_version?: number;
 }
 
+const sessionEndedListeners = new Set<() => void>();
+
+/**
+ * Calls `listener` whenever a request answers `401 unauthenticated`: the
+ * session has ended (it expired, was signed out elsewhere, or a password
+ * change or a disable ended it). Returns the unsubscribe.
+ */
+export function onSessionEnded(listener: () => void): () => void {
+  sessionEndedListeners.add(listener);
+  return () => {
+    sessionEndedListeners.delete(listener);
+  };
+}
+
 /** The version in an `ETag` (`"12"`, `12` or `W/"12"`), or null. */
 function etagVersion(etag: string | null): number | null {
   if (!etag) return null;
@@ -96,6 +110,9 @@ export async function call<T>(
   }
   if (!r.ok) {
     const e = (parsed ?? {}) as Envelope;
+    if (r.status === 401 && e.code === "unauthenticated") {
+      for (const listener of sessionEndedListeners) listener();
+    }
     throw new ApiError(
       e.error ?? `HTTP ${r.status}`,
       r.status,
@@ -117,6 +134,12 @@ export interface Operator {
   email: string;
   display_name: string | null;
   role: OperatorRole;
+}
+
+/** An operator as the admin's list shows it. */
+export interface OperatorAccount extends Operator {
+  disabled: boolean;
+  created_at: string;
 }
 
 export type RolloutState = "pending" | "propagating" | "applied" | "rejected" | "no_gateways";
@@ -266,6 +289,12 @@ export interface AuditEntry {
   detail: unknown;
 }
 
+/** One page of the audit log; `next_before` is null on the last. */
+export interface AuditPage {
+  items: AuditEntry[];
+  next_before: number | null;
+}
+
 export interface ProviderGroup {
   name: string;
   provider_keys: { id: string; display_name: string | null }[];
@@ -362,6 +391,45 @@ export const schemas = {
 export const tenants = {};
 export const keys = {};
 export const gateways = {};
-export const operators = {};
-export const audit = {};
+
+/** Operator accounts (an admin's). */
+export const operators = {
+  /** Every account, oldest first. */
+  async list(): Promise<OperatorAccount[]> {
+    return (await call<{ items: OperatorAccount[] }>("GET", "/admin/operators")).data.items;
+  },
+  async create(body: {
+    email: string;
+    display_name?: string;
+    role: OperatorRole;
+    password: string;
+  }): Promise<Operator> {
+    return (await call<Operator>("POST", "/admin/operators", body)).data;
+  },
+  /** `409 last_admin` when this would leave no enabled admin; disabling ends the account's sessions. */
+  async update(id: string, changes: { role?: OperatorRole; disabled?: boolean }): Promise<Operator> {
+    return (await call<Operator>("PATCH", `/admin/operators/${seg(id)}`, changes)).data;
+  },
+};
+
+/** The audit log. */
+export const audit = {
+  /**
+   * One page, newest first, at the control plane's own page size. `before`
+   * is the previous page's `next_before`; the filters narrow every page.
+   */
+  async list(q: { before?: number; target_kind?: string; tenant_id?: string }): Promise<AuditPage> {
+    const params = new URLSearchParams();
+    if (q.before !== undefined) params.set("before", String(q.before));
+    if (q.target_kind) params.set("target_kind", q.target_kind);
+    if (q.tenant_id) params.set("tenant_id", q.tenant_id);
+    const query = params.toString();
+    return (await call<AuditPage>("GET", `/admin/audit${query ? `?${query}` : ""}`)).data;
+  },
+  /** The tenants the log can be narrowed to. */
+  async tenants(): Promise<Tenant[]> {
+    return (await call<{ items: Tenant[] }>("GET", "/admin/tenants")).data.items;
+  },
+};
+
 export const settings = {};
