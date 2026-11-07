@@ -52,13 +52,14 @@ const EXPECTED: &[(&str, &str, i64)] = &[
 ];
 
 /// The families whose rows the gateway's `Model.cost` prices exactly as the
-/// engine does. Every other family is billed at a tier, a one-hour write or
-/// a web search that `Model.cost` cannot express.
-const PRICED_ALIKE: [&str; 8] = [
+/// engine does. Every other family is billed at a tier or a web search that
+/// `Model.cost` cannot express.
+const PRICED_ALIKE: [&str; 9] = [
     "openai-responses",
     "openai-responses-stream",
     "gemini-chat",
     "gemini-cached",
+    "bedrock-converse-chat",
     "openai-embeddings",
     "anthropic-count-tokens",
     "cache-hit-messages",
@@ -66,11 +67,12 @@ const PRICED_ALIKE: [&str; 8] = [
 ];
 
 /// The dimensions `Model.cost` has a rate for: input, cache read, cache
-/// write, and output, which also prices reasoning.
-const MODEL_COST_DIMENSIONS: [Dimension; 5] = [
+/// write, the one-hour cache write, and output, which also prices reasoning.
+const MODEL_COST_DIMENSIONS: [Dimension; 6] = [
     Dimension::Input,
     Dimension::CacheRead,
     Dimension::CacheWrite,
+    Dimension::CacheWrite1h,
     Dimension::Output,
     Dimension::Reasoning,
 ];

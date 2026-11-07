@@ -6,7 +6,7 @@
     "cache_read_tokens": 9,
     "cache_status": "disabled",
     "completion_tokens": 52,
-    "cost_usd": 0.0001469,
+    "cost_usd": 0.00014915,
     "event_id": "evt-anthropic-via-chat-1",
     "guardrail_blocked": false,
     "occurred_at": "2026-11-06T00:00:00.000Z",

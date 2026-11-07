@@ -68,6 +68,7 @@ const COST = {
   output_per_1k: 0.002,
   cached_input_per_1k: 0.0001,
   cache_write_per_1k: 0.00125,
+  cache_write_1h_per_1k: 0.002,
 };
 
 type Provider = "openai" | "anthropic" | "google" | "bedrock";

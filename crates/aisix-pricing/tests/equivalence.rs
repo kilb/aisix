@@ -1,7 +1,8 @@
 //! The engine charges what the gateway's own spend computation says.
 //!
 //! The gateway prices a request from the price on its model,
-//! `spend_micro_usd(ModelCost::calculate_with_cache(input_tokens_for_pricing(..), completion))`,
+//! `spend_micro_usd(ModelCost::calculate_with_cache(input_tokens_for_pricing(..)
+//! .with_one_hour_writes(one_hour_cache_writes(..)), completion))`,
 //! on the completion it holds after folding any separately reported
 //! reasoning in (`request_cost_usd` in `aisix-proxy/src/usage_attr.rs`, as
 //! `chat.rs` calls it). Root `CLAUDE.md` requires a control plane that
@@ -13,13 +14,14 @@
 //! # The card a `ModelCost` is
 //!
 //! `book_for` puts the cost's rates on a `default` base and nothing else:
-//! `input`, `output`, and `cache_read` / `cache_write` only where the cost has
-//! them. Every dimension a generated row bills then has a rate (ruling
-//! P2-R15), through the fallbacks a rate set shares with `ModelCost`:
+//! `input`, `output`, and `cache_read` / `cache_write` / `cache_write_1h` only
+//! where the cost has them. Every dimension a generated row bills then has a
+//! rate (ruling P2-R15), through the fallbacks a rate set shares with
+//! `ModelCost`:
 //!
 //! - cache reads and cache writes fall back to `input`, as `ModelCost` does;
-//! - the one-hour write falls back to `cache_write`, then `input`:
-//!   `ModelCost` has one write rate for both lifetimes;
+//! - the one-hour write falls back to `cache_write`, then `input`, as
+//!   `ModelCost` does;
 //! - reasoning, audio output and image output fall back to `output`, and
 //!   audio and image input to `input`: the gateway prices them inside the
 //!   completion and the fresh prompt that contain them.
@@ -41,10 +43,11 @@
 //!
 //! Let `X = Σ quantity × rate / 10⁶` µ$, the exact amount. The engine charges
 //! `⌈X⌉`, in integers. The gateway charges `round(X + ε)`, rounding half away
-//! from zero, where `ε` is the error of evaluating `X` in `f64`: four rate
-//! conversions, four products, three additions, `÷ 1000` and `× 10⁶`, at most
-//! seven roundings of 2⁻⁵³ each on any term, so `|ε| ≤ 7 × 2⁻⁵³ × X` to first
-//! order. Its
+//! from zero, where `ε` is the error of evaluating `X` in `f64`: five rate
+//! conversions, five products, four additions, `÷ 1000` and `× 10⁶`, at most
+//! eight roundings of 2⁻⁵³ each on any term, so `|ε| ≤ 8 × 2⁻⁵³ × X` to first
+//! order (the split of the write into its two lifetimes is integer
+//! arithmetic, exact). Its
 //! `max(0.0)` and its saturating `as u64` never act on a non-negative amount
 //! this size.
 //!
@@ -56,11 +59,11 @@
 //!
 //! The generated rows stay at or below `X = 8 × 10⁸` µ$ (at most 8,000,000
 //! tokens on a row, at most USD 100 per million), so `|ε| < 10⁻⁶` µ$. The
-//! bound holds up to `X ≈ 6 × 10¹⁴` µ$, USD 600 million on one row.
+//! bound holds up to `X ≈ 5.6 × 10¹⁴` µ$ (2⁴⁹), USD 560 million on one row.
 
 use std::sync::Arc;
 
-use aisix_core::{input_tokens_for_pricing, spend_micro_usd, ModelCost};
+use aisix_core::{input_tokens_for_pricing, one_hour_cache_writes, spend_micro_usd, ModelCost};
 use aisix_gateway::chat::recorded_completion_tokens;
 use aisix_gateway::{CacheCreationTtl, ModalityTokens};
 use aisix_obs::UsageEvent;
@@ -93,6 +96,7 @@ struct GatewayPrice {
     output: u64,
     cache_read: Option<u64>,
     cache_write: Option<u64>,
+    cache_write_1h: Option<u64>,
 }
 
 impl GatewayPrice {
@@ -104,7 +108,7 @@ impl GatewayPrice {
             output_per_1k: per_1k(self.output),
             cached_input_per_1k: self.cache_read.map(per_1k),
             cache_write_per_1k: self.cache_write.map(per_1k),
-            cache_write_1h_per_1k: None,
+            cache_write_1h_per_1k: self.cache_write_1h.map(per_1k),
         }
     }
 
@@ -115,7 +119,7 @@ impl GatewayPrice {
             output: Rate(self.output),
             cache_read: self.cache_read.map(Rate),
             cache_write: self.cache_write.map(Rate),
-            cache_write_1h: None,
+            cache_write_1h: self.cache_write_1h.map(Rate),
             reasoning: None,
             audio_input: None,
             audio_output: None,
@@ -145,15 +149,24 @@ struct GatewayUsage {
     upstream_total: u32,
 }
 
-/// The gateway's spend on `g`, by the call chain its chat handler runs.
+/// The gateway's spend on `g`, by the call chain its chat handler runs
+/// (`usage_attr::input_tokens_from_counts`): the one-hour part of the write
+/// marked by the same reading the engine applies, a split it cannot read
+/// priced as no split.
 fn gateway_spend(g: &GatewayUsage, p: &GatewayPrice) -> u64 {
+    let one_hour = one_hour_cache_writes(
+        u64::from(g.creation),
+        g.ttl.cache_creation_5m_tokens,
+        g.ttl.cache_creation_1h_tokens,
+    );
     let input = input_tokens_for_pricing(
         u64::from(g.prompt),
         u64::from(g.cached),
         u64::from(g.write_subset.unwrap_or(0)),
         u64::from(g.cache_read),
         u64::from(g.creation),
-    );
+    )
+    .with_one_hour_writes(one_hour.unwrap_or(0));
     spend_micro_usd(
         p.model_cost()
             .calculate_with_cache(input, u64::from(g.completion_folded)),
@@ -367,14 +380,15 @@ fn gateway_usage() -> impl Strategy<Value = GatewayUsage> {
 }
 
 prop_compose! {
-    /// A `ModelCost` up to USD 100 per million tokens, its two cache rates
+    /// A `ModelCost` up to USD 100 per million tokens, its three cache rates
     /// each optional.
     fn gateway_price()(
         (input, output) in (0..=MAX_RATE, 0..=MAX_RATE),
         cache_read in option::of(0..=MAX_RATE),
         cache_write in option::of(0..=MAX_RATE),
+        cache_write_1h in option::of(0..=MAX_RATE),
     ) -> GatewayPrice {
-        GatewayPrice { input, output, cache_read, cache_write }
+        GatewayPrice { input, output, cache_read, cache_write, cache_write_1h }
     }
 }
 
@@ -404,6 +418,7 @@ const LIST: GatewayPrice = GatewayPrice {
     output: 2_000_000,
     cache_read: Some(100_000),
     cache_write: Some(1_250_000),
+    cache_write_1h: None,
 };
 
 /// 500 fresh + 300 read × 0.1 + 200 written × 1.25 + 500 out × 2
@@ -490,41 +505,35 @@ fn the_engine_and_the_gateway_agree_exactly_on_whole_micro_dollar_rows() {
     );
 }
 
-/// `ModelCost` has one write rate for both cache lifetimes, and a card can
-/// price the one-hour write apart (one provider publishes it at 2x input
-/// against 1.25x for five minutes; see `Dimension::CacheWrite`). With it set,
-/// the engine charges the one-hour tokens at it and the gateway cannot, so on
-/// a row whose amount is otherwise whole the engine is exactly
-/// `⌈h1 × (rate_1h − rate_write) / 10⁶⌉` µ$ above the gateway. This is
-/// intended: the card says more than the gateway's price can.
+/// One provider prices a one-hour cache write at 2x input against 1.25x for
+/// five minutes (see `Dimension::CacheWrite`). With the one-hour rate on both
+/// sides, the gateway charges the one-hour tokens at it as the engine does,
+/// so a row whose amount is whole is charged the same µ$ by both. Without it,
+/// both charge every write at the write rate (the whole-µ$ rows above).
 #[test]
-fn a_one_hour_write_rate_is_where_the_engine_departs_from_the_gateway() {
-    let (rate_write, rate_1h) = (1_250_000, 2_000_000);
-    assert_eq!(LIST.cache_write, Some(rate_write));
-    let one_hour_rate = book(Rates {
-        cache_write_1h: Some(Rate(rate_1h)),
-        ..LIST.rates()
-    });
-    let one_write_rate = book_for(&LIST);
-    // 100 + 200 + 4 × 1.25 + 100 = 405, and 3 × 0.75 = 2.25 rounds up to 3.
-    for (five_m, one_h, gateway_amount, departure) in [(100, 300, 900, 225), (1, 3, 405, 3)] {
+fn a_one_hour_write_is_priced_alike_on_both_sides() {
+    let list_1h = GatewayPrice {
+        cache_write_1h: Some(2_000_000),
+        ..LIST
+    };
+    let book = book_for(&list_1h);
+    // 100 fresh + 2000 read × 0.1 + five_m × 1.25 + one_h × 2 + 50 out × 2.
+    for (five_m, one_h, amount) in [(100, 300, 1125), (4, 8, 421)] {
         let g = anthropic_row(five_m, one_h);
-        let event = usage_event(&g, "miss");
-        assert_eq!(gateway_spend(&g, &LIST), gateway_amount);
         assert_eq!(
-            (u64::from(one_h) * (rate_1h - rate_write)).div_ceil(1_000_000),
-            departure
+            gateway_spend(&g, &list_1h),
+            amount,
+            "{one_h} one-hour tokens: gateway"
         );
-        // Without the one-hour rate, the write rate covers both lifetimes,
-        // as the gateway's does.
-        let same = engine_price(&one_write_rate, &event).unwrap();
-        assert_eq!(charge(&same), gateway_amount, "{one_h} one-hour tokens");
-        let apart = engine_price(&one_hour_rate, &event).unwrap();
+        let priced = engine_price(&book, &usage_event(&g, "miss")).unwrap();
         assert_eq!(
-            charge(&apart),
-            gateway_amount + departure,
-            "{one_h} one-hour tokens"
+            (priced.outcome, charge(&priced)),
+            (Outcome::Charged, amount),
+            "{one_h} one-hour tokens: engine"
         );
+        // The one-hour rate moved the gateway's figure: at the write rate
+        // alone the same row is cheaper.
+        assert!(gateway_spend(&g, &LIST) < amount, "{one_h} one-hour tokens");
     }
 }
 
