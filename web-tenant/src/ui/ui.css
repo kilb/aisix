@@ -1,0 +1,731 @@
+/* The design system's components, the portal's copy (P2c-R4). They read
+   the role tokens in tokens.css, never the palette directly, so both themes
+   follow from the token file alone. Every interactive element has its
+   hover (a 120ms colour transition), pressed (one step darker, a 1px
+   inset), keyboard focus (base.css) and disabled (45%, not-allowed)
+   states. */
+
+/* ── Icons ─────────────────────────────────────────────────── */
+.i {
+  flex: none;
+  width: var(--icon);
+  height: var(--icon);
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.5;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.i.i-32 {
+  width: 32px;
+  height: 32px;
+}
+
+/* ── Buttons: 36px, 32px small; icons centred by flex ──────── */
+.btn {
+  --btn-fg: var(--text);
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--s-2);
+  height: var(--h-control);
+  padding: 0 var(--s-4);
+  border: 1px solid transparent;
+  border-radius: var(--r-button);
+  background: transparent;
+  color: var(--btn-fg);
+  font-weight: 600;
+  line-height: 16px;
+  white-space: nowrap;
+  cursor: pointer;
+  user-select: none;
+  transition:
+    background-color var(--t-fast) ease,
+    border-color var(--t-fast) ease,
+    color var(--t-fast) ease,
+    box-shadow var(--t-fast) ease;
+}
+.btn-sm {
+  height: var(--h-control-sm);
+  padding: 0 var(--s-3);
+}
+.btn-block {
+  width: 100%;
+}
+.btn-primary {
+  --btn-fg: var(--on-sign);
+  background: var(--sign);
+}
+.btn-primary:not(:disabled):hover {
+  background: var(--sign-hover);
+}
+.btn-primary:not(:disabled):active {
+  background: var(--sign-press);
+  box-shadow: var(--inset);
+}
+.btn-secondary {
+  border-color: var(--text);
+}
+.btn-secondary:not(:disabled):hover {
+  background: var(--hover);
+}
+.btn-secondary:not(:disabled):active {
+  background: var(--press);
+  box-shadow: var(--inset);
+}
+.btn-quiet {
+  --btn-fg: var(--text-2);
+  padding: 0 var(--s-2);
+}
+.btn-quiet:not(:disabled):hover {
+  --btn-fg: var(--text);
+  background: var(--hover);
+}
+.btn-quiet:not(:disabled):active {
+  --btn-fg: var(--text);
+  background: var(--press);
+  box-shadow: var(--inset);
+}
+.btn-danger {
+  --btn-fg: var(--on-stop);
+  background: var(--stop-fill);
+}
+.btn-danger:not(:disabled):hover {
+  background: var(--stop-fill-hover);
+}
+.btn-danger:not(:disabled):active {
+  background: var(--stop-fill-press);
+  box-shadow: var(--inset);
+}
+.btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+/* Busy: the label keeps its place (and so the width) under a spinner. */
+.btn.is-busy:disabled {
+  opacity: 1;
+  cursor: progress;
+}
+.btn-label {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--s-2);
+  visibility: hidden;
+}
+.btn.is-busy::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  width: var(--icon);
+  height: var(--icon);
+  margin: auto;
+  border: 1.5px solid var(--btn-fg);
+  border-right-color: transparent;
+  border-radius: var(--r-round);
+  animation: btn-spin 0.7s linear infinite;
+}
+@keyframes btn-spin {
+  to {
+    transform: rotate(1turn);
+  }
+}
+
+/* ── Fields: label above, hint and refusal below ───────────── */
+.fld,
+.f {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-2);
+  min-width: 0;
+}
+.f-label,
+.fld > legend {
+  color: var(--text-2);
+  line-height: var(--lh-table);
+}
+fieldset.fld {
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+fieldset.fld > legend {
+  margin-bottom: var(--s-2);
+  padding: 0;
+}
+.hint {
+  font-size: var(--fs-13);
+  line-height: var(--lh-table);
+  color: var(--text-muted);
+}
+/* A refusal: Stop red on Paper (4.5:1), never on Concrete. */
+.field-err {
+  font-size: var(--fs-13);
+  font-weight: 600;
+  line-height: var(--lh-table);
+  color: var(--error);
+}
+
+/* Text inputs and selects. The base rule has no specificity, so the states
+   below override it in order: hover, then focus, then a refusal. */
+:where(input:not([type="checkbox"], [type="radio"]), select) {
+  width: 100%;
+  height: var(--h-control);
+  padding: 0 var(--s-3);
+  border: 1px solid var(--input-border);
+  border-radius: var(--r-input);
+  background-color: var(--surface);
+  color: var(--text);
+  line-height: 20px;
+  transition:
+    border-color var(--t-fast) ease,
+    background-color var(--t-fast) ease;
+}
+:where(input)::placeholder {
+  color: var(--text-muted);
+  opacity: 1;
+}
+:where(input, select):not(:disabled):hover {
+  border-color: var(--input-border-hover);
+}
+:where(input, select):not(:disabled):focus-visible {
+  border-color: var(--focus);
+}
+:where(input, select)[aria-invalid="true"]:not(:disabled) {
+  border-color: var(--error);
+}
+:where(input, select):disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+  background-color: var(--bg);
+}
+/* A native select with a drawn chevron. */
+:where(select) {
+  appearance: none;
+  padding-right: 36px;
+  cursor: pointer;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M4.75 6.25 8 9.5l3.25-3.25' fill='none' stroke='%2366737F' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 12px center;
+  background-size: 16px 16px;
+}
+:root[data-theme="dark"] :where(select) {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M4.75 6.25 8 9.5l3.25-3.25' fill='none' stroke='%2397A4AE' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+}
+:where(select):not(:disabled):active {
+  background-color: var(--row-hover);
+}
+
+/* Checkbox and radio: native elements, drawn in the system's style. */
+input[type="checkbox"],
+input[type="radio"] {
+  appearance: none;
+  flex: none;
+  display: inline-block;
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  border: 1px solid var(--box-border);
+  border-radius: var(--r-input);
+  background: var(--surface) no-repeat center / 14px 14px;
+  vertical-align: middle;
+  cursor: pointer;
+  transition:
+    background-color var(--t-fast) ease,
+    border-color var(--t-fast) ease;
+}
+input[type="radio"] {
+  border-radius: var(--r-round);
+}
+input[type="checkbox"]:checked {
+  border-color: var(--sign-press);
+  background-color: var(--sign);
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 14 14'%3E%3Cpath d='M3.25 7.25 5.75 9.75 10.75 4.25' fill='none' stroke='%231C2A39' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+}
+input[type="radio"]:checked {
+  border-color: var(--sign-press);
+  background-color: var(--sign);
+  background-image: radial-gradient(circle, var(--on-sign) 0 3px, transparent 3.5px);
+}
+:is(input[type="checkbox"], input[type="radio"]):not(:disabled):hover,
+label:hover > :is(input[type="checkbox"], input[type="radio"]):not(:disabled) {
+  border-color: var(--text);
+}
+:is(input[type="checkbox"], input[type="radio"]):not(:disabled, :checked):active {
+  background-color: var(--press);
+}
+:is(input[type="checkbox"], input[type="radio"]):checked:not(:disabled):hover,
+label:hover > :is(input[type="checkbox"], input[type="radio"]):checked:not(:disabled) {
+  border-color: var(--sign-press);
+  background-color: var(--sign-hover);
+}
+:is(input[type="checkbox"], input[type="radio"]):checked:not(:disabled):active {
+  background-color: var(--sign-press);
+}
+:is(input[type="checkbox"], input[type="radio"]):disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+/* A choice and its label. */
+.picks {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--s-2) var(--s-6);
+}
+.pick {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--s-2);
+  line-height: var(--lh-table);
+  cursor: pointer;
+}
+
+/* ── Signal lamps: a dot with a word, never colour alone ───── */
+/* The dot is placed beside the word rather than laid out with it, so the
+   lamp's baseline is its word's and it lines up with text around it. */
+.lamp {
+  --lamp-c: var(--lamp-disabled);
+  position: relative;
+  display: inline-block;
+  padding-left: calc(8px + var(--s-2));
+  line-height: var(--lh-table);
+  white-space: nowrap;
+}
+.lamp::before {
+  content: "";
+  position: absolute;
+  top: 50%;
+  left: 0;
+  width: 8px;
+  height: 8px;
+  margin-top: -4px;
+  border-radius: var(--r-round);
+  background: var(--lamp-c);
+  box-shadow: inset 0 0 0 1.5px var(--lamp-ring, transparent);
+}
+.lamp-applied {
+  --lamp-c: var(--lamp-applied);
+}
+.lamp-propagating {
+  --lamp-c: var(--lamp-progress);
+}
+.lamp-rejected {
+  --lamp-c: var(--lamp-rejected);
+}
+.lamp-disabled {
+  --lamp-c: var(--lamp-disabled);
+}
+.lamp-pending {
+  --lamp-c: transparent;
+  --lamp-ring: var(--lamp-pending);
+}
+/* Propagating pulses once, then holds. */
+.lamp-propagating::after {
+  content: "";
+  position: absolute;
+  top: 50%;
+  left: 0;
+  width: 8px;
+  height: 8px;
+  margin-top: -4px;
+  border-radius: var(--r-round);
+  background: var(--lamp-c);
+  animation: lamp-pulse 1.1s ease-out 1 both;
+}
+@keyframes lamp-pulse {
+  from {
+    transform: scale(1);
+    opacity: 0.6;
+  }
+  to {
+    transform: scale(3.2);
+    opacity: 0;
+  }
+}
+
+/* Chips share the lamp's centre line and size step. */
+.tag {
+  display: inline-flex;
+  align-items: center;
+  height: 20px;
+  padding: 0 var(--s-2);
+  border-radius: var(--r-chip);
+  background: var(--chip);
+  color: var(--text-2);
+  font-size: var(--fs-12);
+  font-weight: 600;
+  line-height: 12px;
+  white-space: nowrap;
+}
+
+/* ── Notes: a word from the page, on Paper ─────────────────── */
+.note {
+  --note-c: var(--text-muted);
+  position: relative;
+  padding: var(--s-3) var(--s-4) var(--s-3) calc(var(--s-4) + 8px + var(--s-3));
+  border: 1px solid var(--border);
+  border-radius: var(--r-chip);
+  background: var(--surface);
+  color: var(--text-2);
+}
+/* The lamp dot, centred on the first line: 12px padding, then
+   (1.6 × 15px − 8px) / 2. */
+.note::before {
+  content: "";
+  position: absolute;
+  top: calc(var(--s-3) + 8px);
+  left: var(--s-4);
+  width: 8px;
+  height: 8px;
+  border-radius: var(--r-round);
+  background: var(--note-c);
+  box-shadow: inset 0 0 0 1.5px var(--note-ring, transparent);
+}
+.note.ok {
+  --note-c: var(--lamp-applied);
+}
+.note.warn {
+  --note-c: transparent;
+  --note-ring: var(--text-2);
+  color: var(--text);
+}
+.note.crit {
+  --note-c: var(--lamp-rejected);
+  color: var(--error);
+}
+
+/* ── Tables: 36px head, 44px rows (56px with a note) ───────── */
+.scroll {
+  overflow-x: auto;
+}
+.tbl {
+  width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+  line-height: var(--lh-table);
+}
+.tbl th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  height: var(--h-head);
+  padding: 0 var(--s-3);
+  border-top: 1px solid var(--divider);
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text-muted);
+  font-size: var(--fs-12);
+  font-weight: 600;
+  text-align: left;
+  white-space: nowrap;
+  vertical-align: middle;
+}
+.tbl td {
+  height: var(--h-row);
+  padding: var(--s-1) var(--s-3);
+  border-bottom: 1px solid var(--divider);
+  vertical-align: middle;
+  white-space: nowrap;
+}
+/* A row whose cells stack a note under the value keeps 8px off each line. */
+.tbl tr:has(.cell-note) td {
+  padding-top: var(--s-2);
+  padding-bottom: var(--s-2);
+}
+.tbl tbody tr {
+  transition: background-color var(--t-fast) ease;
+}
+.tbl tbody tr:hover {
+  background: var(--row-hover);
+}
+.tbl tbody tr:last-child td {
+  border-bottom: 0;
+}
+.tbl th:first-child,
+.tbl td:first-child {
+  padding-left: var(--s-6);
+}
+.tbl th:last-child,
+.tbl td:last-child {
+  padding-right: var(--s-6);
+}
+.tbl .r {
+  text-align: right;
+}
+.cell-note {
+  display: block;
+  margin-top: 2px;
+  font-size: var(--fs-13);
+  line-height: var(--lh-table);
+  color: var(--text-muted);
+}
+/* A long name: one line, an ellipsis, the whole text in its title. */
+.trunc {
+  display: block;
+  max-width: var(--trunc, 200px);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* A row's actions, right-aligned, one control height. */
+.acts {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--s-2);
+}
+/* In an actions column the buttons line up with a confirm step's first
+   line, not with its middle. */
+.r > .acts {
+  align-items: flex-start;
+}
+.acts > select {
+  width: auto;
+  height: var(--h-control-sm);
+}
+
+/* Loading: three skeleton rows, purely visual. */
+.skeleton {
+  border-top: 1px solid var(--divider);
+}
+.skeleton-row {
+  display: grid;
+  grid-template-columns: 3fr 2fr 4fr;
+  align-items: center;
+  gap: var(--s-6);
+  height: var(--h-row);
+  padding: 0 var(--s-6);
+  border-bottom: 1px solid var(--divider);
+}
+.skeleton-row:last-child {
+  border-bottom: 0;
+}
+.skeleton-row > span {
+  height: 12px;
+  border-radius: var(--r-input);
+  background: var(--skeleton);
+}
+.skeleton-row > span:nth-child(2) {
+  width: 70%;
+}
+
+/* ── Empty state: a mark, one sentence, centred ────────────── */
+.empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--s-4);
+  padding: var(--s-12) var(--s-6);
+  border-top: 1px solid var(--divider);
+  color: var(--text-2);
+  text-align: center;
+}
+.empty .i-32 {
+  color: var(--text-muted);
+}
+
+/* ── Two-step confirm, swapped in place ────────────────────── */
+.two {
+  display: inline-flex;
+  justify-content: flex-end;
+  vertical-align: middle;
+}
+.two.is-swapping {
+  overflow: clip;
+  overflow-clip-margin: 4px;
+}
+/* The second step: the two buttons, and the warning on a line under them,
+   so a row's actions widen by the warning's length at most. */
+.two-step {
+  display: inline-grid;
+  grid-template-columns: auto auto;
+  justify-content: end;
+  align-items: center;
+  gap: var(--s-1) var(--s-2);
+}
+.two-warn {
+  grid-row: 2;
+  grid-column: 1 / -1;
+  font-size: var(--fs-13);
+  line-height: var(--lh-table);
+  color: var(--text-2);
+  text-align: right;
+  white-space: nowrap;
+}
+.is-in {
+  animation: fade-in var(--t-fast) ease-out;
+}
+@keyframes fade-in {
+  from {
+    opacity: 0;
+  }
+}
+
+/* ── Toasts: bottom left, up 8px and in over 160ms, out over 200ms ── */
+.toasts {
+  position: fixed;
+  left: var(--s-6);
+  bottom: var(--s-6);
+  z-index: 20;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--s-2);
+  pointer-events: none;
+}
+.toast {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--s-2);
+  height: 40px;
+  padding: 0 var(--s-4);
+  border-radius: var(--r-button);
+  background: var(--tooltip-bg);
+  color: var(--tooltip-text);
+  box-shadow: var(--shadow-float);
+  font-weight: 600;
+  line-height: 16px;
+  white-space: nowrap;
+  animation: toast-in var(--t-panel) ease-out;
+  transition: opacity var(--t-leave) ease-in;
+}
+.toast::before {
+  content: "";
+  flex: none;
+  width: 8px;
+  height: 8px;
+  border-radius: var(--r-round);
+  background: var(--lamp-applied);
+}
+.toast.is-leaving {
+  opacity: 0;
+}
+@keyframes toast-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+}
+
+/* ── Route nav: stops on one Ink line ──────────────────────── */
+.route {
+  /* A stop is filled with what it sits on, so the line stops at its rim. */
+  --stop-bg: var(--bg);
+  --tab-w: 96px;
+  position: relative;
+  display: flex;
+  width: calc(var(--stops) * var(--tab-w));
+  max-width: 100%;
+}
+/* The line runs from the first stop's centre to the last's, no further. */
+.panel .route {
+  --stop-bg: var(--surface);
+}
+.route::before {
+  content: "";
+  position: absolute;
+  top: 9px;
+  left: calc(100% / (2 * var(--stops)));
+  right: calc(100% / (2 * var(--stops)));
+  height: 2px;
+  background: var(--route-line);
+}
+.route > button {
+  position: relative;
+  flex: 1 1 0;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--s-2);
+  padding: 0 0 var(--s-1);
+  border: 0;
+  border-radius: var(--r-button);
+  background: none;
+  color: var(--text-2);
+  cursor: pointer;
+  transition: color var(--t-fast) ease;
+}
+.route .stop {
+  display: grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+}
+.route .stop::before {
+  content: "";
+  width: 12px;
+  height: 12px;
+  border: 2px solid var(--route-line);
+  border-radius: var(--r-round);
+  background: var(--stop-bg);
+  transition: background-color var(--t-fast) ease;
+}
+.route .name {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  line-height: var(--lh-table);
+}
+.route > button:hover {
+  color: var(--text);
+}
+.route > button:hover .stop::before {
+  background: color-mix(in srgb, var(--route-line) 14%, var(--stop-bg));
+}
+.route > button:active .stop::before {
+  background: color-mix(in srgb, var(--route-line) 28%, var(--stop-bg));
+}
+.route > [aria-selected="true"] {
+  color: var(--text);
+}
+.route > [aria-selected="true"] .stop::before,
+.route > [aria-selected="true"]:hover .stop::before {
+  width: 20px;
+  height: 20px;
+  background: var(--sign);
+}
+.route > [aria-selected="true"] .name {
+  font-weight: 700;
+}
+
+/* On a phone the docked route is a bar along the bottom edge. */
+@media (max-width: 719px) {
+  .route.docked {
+    --stop-bg: var(--surface);
+    --pad: var(--s-2);
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 10;
+    width: auto;
+    margin: 0;
+    padding: var(--pad) var(--pad) calc(var(--pad) + env(safe-area-inset-bottom));
+    border-top: 1px solid var(--border);
+    background: var(--surface);
+  }
+  .route.docked::before {
+    top: calc(var(--pad) + 9px);
+    left: calc(var(--pad) + (100% - 2 * var(--pad)) / (2 * var(--stops)));
+    right: calc(var(--pad) + (100% - 2 * var(--pad)) / (2 * var(--stops)));
+  }
+  .route.docked > button {
+    gap: var(--s-1);
+  }
+  .route.docked .name {
+    font-size: var(--fs-12);
+    color: var(--text-muted);
+  }
+  .route.docked > [aria-selected="true"] .name {
+    color: var(--text);
+    font-weight: 600;
+  }
+  .toasts {
+    left: var(--s-4);
+  }
+  body:has(.route.docked) .toasts {
+    bottom: 88px;
+  }
+}

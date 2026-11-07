@@ -1,8 +1,18 @@
 import { useId, useState } from "react";
 import { ApiError, MIN_PASSWORD_CHARS, acceptInvite, login, signup, type Session } from "./lib/api";
 import { formMessageFor, messageFor } from "./lib/errors";
+import type { Theme } from "./lib/useTheme";
+import { Button } from "./ui/Button";
+import { Field } from "./ui/Field";
+import { RouteNav } from "./ui/RouteNav";
+import { ThemeToggle } from "./ui/ThemeToggle";
 
 type Mode = "login" | "signup";
+
+const MODES = [
+  { id: "login", label: "登录" },
+  { id: "signup", label: "注册组织" },
+] as const satisfies readonly { id: Mode; label: string }[];
 
 const TOO_SHORT = `口令至少需要 ${MIN_PASSWORD_CHARS} 个字符`;
 
@@ -21,12 +31,16 @@ function longEnough(password: string): boolean {
  * "email taken" reads as a plain refusal (lib/errors.ts).
  */
 export function Gate({
+  theme,
+  onToggleTheme,
   invite,
   signedIn,
   notice,
   onIn,
   onLeaveInvite,
 }: {
+  theme: Theme;
+  onToggleTheme: () => void;
   /** The invitation token, when the page was opened from an invitation link. */
   invite: string | null;
   /** Whether a session is live behind an invitation form opened over it. */
@@ -101,37 +115,29 @@ export function Gate({
     onLeaveInvite();
   }
 
+  const hinted = invite !== null || mode === "signup";
   const passwordField = (
-    <>
-      <label className="f">
-        <span>口令</span>
-        <input
-          type="password"
-          autoComplete={invite === null && mode === "login" ? "current-password" : "new-password"}
-          required
-          value={password}
-          onChange={(e) => setPassword(e.target.value)}
-          aria-describedby={invite !== null || mode === "signup" ? hintId : undefined}
-        />
-      </label>
-      {(invite !== null || mode === "signup") && (
-        <p className="hint" id={hintId}>
-          至少 {MIN_PASSWORD_CHARS} 个字符
-        </p>
-      )}
-    </>
+    <Field label="口令" hint={hinted ? <>至少 {MIN_PASSWORD_CHARS} 个字符</> : undefined} hintId={hintId}>
+      <input
+        type="password"
+        autoComplete={invite === null && mode === "login" ? "current-password" : "new-password"}
+        required
+        value={password}
+        onChange={(e) => setPassword(e.target.value)}
+        aria-describedby={hinted ? hintId : undefined}
+      />
+    </Field>
   );
 
   const displayNameField = (
-    <label className="f">
-      <span>显示名</span>
+    <Field label="显示名">
       <input
         autoComplete="name"
         placeholder="选填"
         value={displayName}
         onChange={(e) => setDisplayName(e.target.value)}
       />
-    </label>
+    </Field>
   );
 
   const alert = err && (
@@ -141,79 +147,77 @@ export function Gate({
   );
 
   return (
-    <div id="gate">
-      <header className="plate">
-        <h1>AISIX 组织门户</h1>
-        <span className="sub">组织、成员与 API 密钥</span>
-      </header>
+    <div className="gate-page">
+      <div className="gate-tools">
+        <ThemeToggle theme={theme} onToggle={onToggleTheme} />
+      </div>
+      <div id="gate">
+        <header className="plate">
+          <h1>
+            <span className="mark">AISIX</span> 组织门户
+          </h1>
+          <span className="sub">组织、成员与 API 密钥</span>
+        </header>
 
-      {notice && (
-        <div className="note warn" role="status">
-          {notice}
-        </div>
-      )}
-
-      {invite !== null ? (
-        <div className="panel">
-          <h2>接受邀请</h2>
-          <p className="hint">设置口令后即加入邀请你的组织，之后用受邀的邮箱和这个口令登录。</p>
-          <form onSubmit={submit}>
-            {passwordField}
-            {displayNameField}
-            <button className="act" type="submit" disabled={busy}>
-              {busy ? "处理中…" : "接受邀请"}
-            </button>
-          </form>
-          {alert}
-          <button className="ghost" type="button" onClick={leaveInvite}>
-            {signedIn ? "取消" : "返回登录"}
-          </button>
-        </div>
-      ) : (
-        <div className="panel">
-          <div className="seg" role="tablist" aria-label="登录或注册">
-            <button type="button" role="tab" aria-selected={mode === "login"} onClick={() => switchMode("login")}>
-              登录
-            </button>
-            <button type="button" role="tab" aria-selected={mode === "signup"} onClick={() => switchMode("signup")}>
-              注册组织
-            </button>
+        {notice && (
+          <div className="note warn" role="status">
+            {notice}
           </div>
-          <form onSubmit={submit}>
-            {mode === "signup" && (
-              <label className="f">
-                <span>组织名称</span>
-                <input
-                  autoComplete="organization"
-                  required
-                  value={orgName}
-                  onChange={(e) => setOrgName(e.target.value)}
-                />
-              </label>
-            )}
-            <label className="f">
-              <span>邮箱</span>
-              <input
-                type="email"
-                autoComplete="username"
-                required
-                value={email}
-                onChange={(e) => setEmail(e.target.value)}
-              />
-            </label>
-            {passwordField}
-            {mode === "signup" && displayNameField}
-            <button className="act" type="submit" disabled={busy}>
-              {busy ? "处理中…" : mode === "login" ? "登录" : "注册组织"}
-            </button>
-          </form>
-          {alert}
-        </div>
-      )}
+        )}
 
-      {invite === null && mode === "signup" && (
-        <p className="foot">新注册的组织需要平台审核。审核通过前可以登录查看组织状态、修改口令。</p>
-      )}
+        {invite !== null ? (
+          <div className="panel">
+            <h2>接受邀请</h2>
+            <p className="hint">设置口令后即加入邀请你的组织，之后用受邀的邮箱和这个口令登录。</p>
+            <form className="form gate-form" onSubmit={submit}>
+              {passwordField}
+              {displayNameField}
+              <Button kind="primary" block type="submit" busy={busy}>
+                接受邀请
+              </Button>
+            </form>
+            {alert}
+            <Button block onClick={leaveInvite}>
+              {signedIn ? "取消" : "返回登录"}
+            </Button>
+          </div>
+        ) : (
+          <div className="panel">
+            <RouteNav label="登录或注册" items={MODES} current={mode} onSelect={switchMode} />
+            <form className="form gate-form" onSubmit={submit}>
+              {mode === "signup" && (
+                <Field label="组织名称">
+                  <input
+                    autoComplete="organization"
+                    required
+                    value={orgName}
+                    onChange={(e) => setOrgName(e.target.value)}
+                  />
+                </Field>
+              )}
+              <Field label="邮箱">
+                <input
+                  type="email"
+                  autoComplete="username"
+                  required
+                  value={email}
+                  onChange={(e) => setEmail(e.target.value)}
+                />
+              </Field>
+              {passwordField}
+              {mode === "signup" && displayNameField}
+              <Button kind="primary" block type="submit" busy={busy}>
+                {mode === "login" ? "登录" : "注册组织"}
+              </Button>
+            </form>
+            {alert}
+          </div>
+        )}
+
+        {invite === null && mode === "signup" && (
+          <p className="foot">新注册的组织需要平台审核。审核通过前可以登录查看组织状态、修改口令。</p>
+        )}
+      </div>
     </div>
   );
 }
