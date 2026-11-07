@@ -582,6 +582,48 @@ async fn an_allowance_refuses_while_redis_is_unreachable_and_nothing_else_does()
     );
 }
 
+/// One failed command must not refuse an allowance for long. The command
+/// opens the shared store's breaker, and while it is open the allowance is
+/// refused; a Redis that answers again a moment later is noticed within about
+/// a second, not after the breaker's 30-second window, or every request under
+/// an allowance on this replica is refused for half a minute.
+#[tokio::test]
+async fn an_allowance_is_refused_only_briefly_after_a_blip() {
+    let r = redis_or_skip!();
+    let gate = Gate::in_front_of(&r).await;
+    gate.open();
+    let s = aisix_ratelimit::store::redis::RedisStore::connect(&gate.config())
+        .await
+        .expect("connect through the open gate")
+        .with_env_namespace(&r.ns);
+    s.acquire("spend", &granted(1_000_000), "m-1")
+        .await
+        .expect("a reachable redis admits the allowance");
+
+    gate.close();
+    assert_eq!(
+        s.acquire("spend", &granted(1_000_000), "m-2").await,
+        Err(RateLimitError::AllowanceUnverified),
+        "the blip itself is refused"
+    );
+    gate.open();
+    let started = std::time::Instant::now();
+    let mut attempt = 3;
+    while s
+        .acquire("spend", &granted(1_000_000), &format!("m-{attempt}"))
+        .await
+        .is_err()
+    {
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(8),
+            "the allowance is still refused {:?} after Redis came back",
+            started.elapsed()
+        );
+        attempt += 1;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
 /// 断线期间记下的发放额花费不能丢：它要等 Redis 回来，由记账 worker 补写进
 /// 共享的累计计数器。丢了，这笔钱就永远不计进额度，额度可以被多花这么多。
 #[tokio::test]

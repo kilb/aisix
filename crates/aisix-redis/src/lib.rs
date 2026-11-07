@@ -66,14 +66,15 @@
 //!   return an error immediately, with no round trip, so each consumer's
 //!   existing fail-open branch runs at once.
 //! - **A background prober closes it.** Opening the breaker starts a task
-//!   that PINGs Redis when the window expires, closes the breaker on
-//!   success and re-arms the window on failure. Business commands keep
+//!   that PINGs Redis after [`FIRST_PROBE_WAIT`], closes the breaker on
+//!   success and, on failure, waits twice as long before the next PING, up
+//!   to the window. Business commands keep
 //!   short-circuiting until it closes, so none of them is ever the
 //!   half-open probe: a probe that lands on a still-unreachable Redis
 //!   pays the full command budget, and during a minutes-long outage that
-//!   is one request per window paying it for nothing. The recovery
-//!   latency is unchanged — the breaker still closes within one window of
-//!   Redis coming back — it is simply no longer billed to a caller.
+//!   is one request per window paying it for nothing. The breaker still
+//!   closes within one window of Redis coming back, and within about a
+//!   second of a blip, and the re-test is not billed to a caller.
 //!   What a PING proves is narrower than what the old probe proved,
 //!   because the old probe was a real command: a server that answers
 //!   PING while the operations this subsystem actually runs keep timing
@@ -124,6 +125,16 @@ use tokio::sync::Mutex;
 /// is what a 5s window did, since the non-streaming completions this
 /// cache stores routinely take longer than that.
 pub const BREAKER_WINDOW: Duration = Duration::from_secs(30);
+
+/// How long the prober waits before its first PING after a breaker opens on
+/// a Redis that had been answering. Each round that finds Redis still down
+/// doubles it, up to [`BREAKER_WINDOW`], and so does a breaker that opens
+/// again within a window of closing: a blip costs about a second of
+/// short-circuiting, and a Redis that keeps failing is re-tested no more
+/// often than once a window. The short first wait matters to a consumer
+/// that fails closed (a spend allowance refuses while the breaker is open),
+/// for which a 30-second cool-off after one slow command is an outage.
+pub const FIRST_PROBE_WAIT: Duration = Duration::from_secs(1);
 
 /// A [`RedisConn`] that may not exist yet, shared by every operation of
 /// one subsystem.
@@ -369,7 +380,8 @@ impl Guard {
     }
 }
 
-/// Re-test Redis once per window until the breaker closes. Runs detached,
+/// Re-test Redis until the breaker closes, the wait between PINGs doubling
+/// from [`Breaker::first_probe_wait`] to the window. Runs detached,
 /// off the request path; exactly one of these exists per open breaker
 /// ([`Breaker::claim_prober`]).
 async fn probe_until_closed(guard: Arc<Guard>, conn: ConnKind, claim: u64) {
@@ -382,14 +394,12 @@ async fn probe_until_closed(guard: Arc<Guard>, conn: ConnKind, claim: u64) {
         ConnKind::Sentinel(pool) => pool.discovery_timeout + guard.timeout,
         _ => guard.timeout,
     };
+    let mut wait = guard.breaker.first_probe_wait();
     loop {
-        if !guard
-            .breaker
-            .hold_off(claim, guard.breaker.window + probe_budget)
-        {
+        if !guard.breaker.hold_off(claim, wait + probe_budget) {
             return;
         }
-        tokio::time::sleep(guard.breaker.window).await;
+        tokio::time::sleep(wait).await;
         let seen = guard.breaker.generation();
         match probe_ping(&conn, guard.timeout).await {
             Ok(()) => {
@@ -408,11 +418,12 @@ async fn probe_until_closed(guard: Arc<Guard>, conn: ConnKind, claim: u64) {
                 tracing::debug!(
                     target: "aisix::redis",
                     error = %e,
-                    window_secs = guard.breaker.window.as_secs(),
+                    next_probe_ms = (wait * 2).min(guard.breaker.window).as_millis() as u64,
                     "redis cool-off probe failed; commands keep short-circuiting"
                 );
             }
         }
+        wait = (wait * 2).min(guard.breaker.window);
     }
 }
 
@@ -464,8 +475,8 @@ fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// A fixed-window cool-off. Open until `open_until` has passed, then the
-/// next command probes Redis for real.
+/// A cool-off. Open until `open_until` has passed or the prober closes it on
+/// a PING Redis answered.
 ///
 /// `generation` counts openings, so a success can tell "the breaker I saw
 /// closed when I started" from "a breaker something else opened while I
@@ -492,6 +503,11 @@ struct BreakerState {
     /// Ids handed out so far, so a returning prober cannot match a
     /// claim it no longer owns.
     claims: u64,
+    /// When the breaker last closed on evidence.
+    closed_at: Option<Instant>,
+    /// How many openings in a row each came within a window of the close
+    /// before it: the prober's first wait doubles with each.
+    streak: u32,
 }
 
 impl Breaker {
@@ -564,8 +580,24 @@ impl Breaker {
 
     fn open(&self) {
         let mut st = self.lock();
+        if st.open_until.is_none() {
+            st.streak = match st.closed_at {
+                Some(closed) if closed.elapsed() < self.window => st.streak.saturating_add(1),
+                _ => 0,
+            };
+        }
         st.open_until = Some(Instant::now() + self.window);
         st.generation = st.generation.wrapping_add(1);
+    }
+
+    /// The prober's wait before its first PING: [`FIRST_PROBE_WAIT`],
+    /// doubled for each opening that came within a window of the close
+    /// before it, and never longer than the window.
+    fn first_probe_wait(&self) -> Duration {
+        let streak = self.lock().streak.min(16);
+        FIRST_PROBE_WAIT
+            .saturating_mul(1u32 << streak)
+            .min(self.window)
     }
 
     /// Take charge of probing, if nothing else already has. True means the
@@ -611,14 +643,16 @@ impl Breaker {
         }
         st.open_until = None;
         st.prober = None;
+        st.closed_at = Some(Instant::now());
         true
     }
 
     /// Close the breaker unless it was opened after `seen` was read.
     fn close_unless_reopened(&self, seen: u64) {
         let mut st = self.lock();
-        if st.generation == seen {
+        if st.generation == seen && st.open_until.is_some() {
             st.open_until = None;
+            st.closed_at = Some(Instant::now());
         }
     }
 }
@@ -630,11 +664,9 @@ fn breaker_open_error() -> redis::RedisError {
     redis::RedisError::from((
         redis::ErrorKind::IoError,
         "redis is in a failure cool-off",
-        format!(
-            "a Redis command failed within the last {}s; commands short-circuit until the \
-             cool-off expires so the caller's fallback runs without paying the timeout again",
-            BREAKER_WINDOW.as_secs()
-        ),
+        "a Redis command failed recently; commands short-circuit until Redis answers a \
+         probe again, so the caller's fallback runs without paying the timeout again"
+            .to_string(),
     ))
 }
 
@@ -2494,6 +2526,71 @@ mod probe_tests {
             ..Default::default()
         };
         connect_with(&cfg, policy).await.expect("connect")
+    }
+
+    /// A blip costs about a second of short-circuiting, not a whole
+    /// window: the prober's first PING comes after [`FIRST_PROBE_WAIT`].
+    /// A consumer that fails closed while the breaker is open (a spend
+    /// allowance) is refused for that long, not for the window.
+    #[tokio::test]
+    async fn a_blip_is_noticed_well_inside_the_window() {
+        let fake = FakeRedis::start().await;
+        let window = Duration::from_secs(20);
+        let policy = policy(BUDGET, window);
+        let conn = connected(&fake, &policy).await;
+
+        fake.blackhole();
+        command(&conn)
+            .await
+            .0
+            .expect_err("the blip opens the breaker");
+        fake.heal();
+        let started = Instant::now();
+        while command(&conn).await.0.is_err() {
+            assert!(
+                started.elapsed() < window / 2,
+                "still short-circuiting {:?} after Redis came back",
+                started.elapsed()
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// A Redis that keeps failing is re-tested less and less often: each
+    /// opening within a window of the last close doubles the prober's first
+    /// wait, up to the window, and a quiet window starts it over.
+    #[test]
+    fn openings_in_quick_succession_back_the_first_probe_off_to_the_window() {
+        let window = Duration::from_secs(30);
+        let breaker = Breaker::new(window);
+        let mut waits = Vec::new();
+        for _ in 0..7 {
+            breaker.open();
+            waits.push(breaker.first_probe_wait());
+            let claim = breaker.claim_prober().expect("no prober yet");
+            assert!(breaker.close_from_prober(claim, breaker.generation()));
+        }
+        let secs = |s: u64| Duration::from_secs(s);
+        assert_eq!(
+            waits,
+            [secs(1), secs(2), secs(4), secs(8), secs(16), window, window]
+        );
+
+        // A breaker that stayed closed for a window starts over.
+        let quiet = Breaker::new(Duration::from_millis(20));
+        quiet.open();
+        let claim = quiet.claim_prober().expect("no prober yet");
+        assert!(quiet.close_from_prober(claim, quiet.generation()));
+        quiet.open();
+        let claim = quiet.claim_prober().expect("no prober yet");
+        assert!(quiet.close_from_prober(claim, quiet.generation()));
+        std::thread::sleep(Duration::from_millis(40));
+        quiet.open();
+        assert_eq!(
+            quiet.first_probe_wait(),
+            Duration::from_millis(20).min(FIRST_PROBE_WAIT)
+        );
+        assert_eq!(quiet.lock().streak, 0);
     }
 
     /// The window expiring must not hand the next caller the bill for
