@@ -1,5 +1,5 @@
-//! The control plane's CA, gateway credentials, and the deployment bundle a
-//! gateway boots from.
+//! The control plane's CA, gateway credentials, the deployment bundle a
+//! gateway boots from, and the usage drops each instance reports.
 //!
 //! The bundle is checked against the gateway's own reading of it: the files
 //! and SAN walk of `crates/aisix-server/src/cert_bundle.rs`, the mTLS client
@@ -957,4 +957,169 @@ async fn a_gateway_provisions_and_connects_from_the_bundle() {
     assert!(dockerfile.contains(&baked), "the image bakes no {baked}");
     // And the gateway's loader accepts every variable, ignoring none.
     load_in_a_child(&env);
+}
+
+/// A heartbeat from `instance` of `dp_id`, carrying `drops` as its
+/// `usage_event_drops` when it is `Some`, and no such field when `None`.
+fn beat_with_drops(dp_id: &str, instance: &str, drops: Option<Value>) -> Value {
+    let mut beat = json!({
+        "dp_id": dp_id,
+        "instance_id": instance,
+        "hostname": "gw-drops-15",
+        "uptime_seconds": 30,
+        "version": "1.9.0+sha-abc1234",
+        "supported_guardrail_kinds": [],
+        "applied_revision": 3,
+        "exporter_health": [],
+    });
+    if let Some(drops) = drops {
+        beat["usage_event_drops"] = drops;
+    }
+    beat
+}
+
+/// The `usage_event_drops` the instance list shows for `instance`.
+async fn listed_drops(cp: &TestCp, viewer: &OperatorSession, instance: &str) -> Value {
+    let r = cp
+        .get_with_cookie("/admin/gateways/instances", viewer.cookie())
+        .await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let items = r.body["items"].as_array().expect("items");
+    let item = items
+        .iter()
+        .find(|i| i["instance_id"] == instance)
+        .unwrap_or_else(|| panic!("{instance} in {items:?}"));
+    item.get("usage_event_drops")
+        .unwrap_or_else(|| panic!("usage_event_drops in {item}"))
+        .clone()
+}
+
+#[tokio::test]
+async fn an_instance_reports_its_usage_drops() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let admin = cp.admin_login_seeded(OperatorRole::Admin).await;
+    let viewer = cp.admin_login_seeded(OperatorRole::Viewer).await;
+    let bundle = cp.issue_bundle(&admin, "gw-drops-15").await;
+    let gw = cp.dp_client(&bundle);
+    let (instance, other) = (Uuid::new_v4().to_string(), Uuid::new_v4().to_string());
+
+    let r = gw
+        .heartbeat(beat_with_drops(
+            &bundle.dp_id,
+            &instance,
+            Some(json!({"sink_full": 7})),
+        ))
+        .await;
+    assert_eq!(r.status, 200, "{r:?}");
+    assert_eq!(
+        listed_drops(&cp, &viewer, &instance).await,
+        json!({"sink_full": 7})
+    );
+
+    // Another instance of the same credential reports its own, and one that
+    // never reported any shows none.
+    let r = gw
+        .heartbeat(beat_with_drops(&bundle.dp_id, &other, None))
+        .await;
+    assert_eq!(r.status, 200, "{r:?}");
+    assert_eq!(listed_drops(&cp, &viewer, &other).await, json!({}));
+    assert_eq!(
+        listed_drops(&cp, &viewer, &instance).await,
+        json!({"sink_full": 7})
+    );
+
+    // The counts are cumulative since the gateway started, so each beat
+    // replaces what the last one reported, reason by reason.
+    let r = gw
+        .heartbeat(beat_with_drops(
+            &bundle.dp_id,
+            &instance,
+            Some(json!({"sink_full": 9, "send_unconfirmed": 2})),
+        ))
+        .await;
+    assert_eq!(r.status, 200, "{r:?}");
+    assert_eq!(
+        listed_drops(&cp, &viewer, &instance).await,
+        json!({"sink_full": 9, "send_unconfirmed": 2})
+    );
+
+    // A count past what a signed 64-bit integer holds is kept exactly.
+    let r = gw
+        .heartbeat(beat_with_drops(
+            &bundle.dp_id,
+            &instance,
+            Some(json!({"send_failed": u64::MAX})),
+        ))
+        .await;
+    assert_eq!(r.status, 200, "{r:?}");
+    assert_eq!(
+        listed_drops(&cp, &viewer, &instance).await,
+        json!({"send_failed": u64::MAX})
+    );
+
+    // A gateway omits the field when it dropped nothing (a restarted
+    // process starts again from none): a later beat without it shows none.
+    let r = gw
+        .heartbeat(beat_with_drops(&bundle.dp_id, &instance, None))
+        .await;
+    assert_eq!(r.status, 200, "{r:?}");
+    assert_eq!(listed_drops(&cp, &viewer, &instance).await, json!({}));
+}
+
+#[tokio::test]
+async fn a_malformed_drop_report_is_stored_as_empty() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let admin = cp.admin_login_seeded(OperatorRole::Admin).await;
+    let viewer = cp.admin_login_seeded(OperatorRole::Viewer).await;
+    let bundle = cp.issue_bundle(&admin, "gw-drops-bad-15").await;
+    let gw = cp.dp_client(&bundle);
+    let instance = Uuid::new_v4().to_string();
+
+    for malformed in [
+        json!("x"),
+        json!([1]),
+        json!({"a": -1}),
+        json!(7),
+        json!(true),
+        json!(null),
+        json!({"sink_full": 1.5}),
+        json!({"sink_full": "7"}),
+        json!({"sink_full": null}),
+        json!({"sink_full": {"n": 7}}),
+        // One bad count spoils the report: none of it is kept.
+        json!({"sink_full": 7, "send_failed": -2}),
+    ] {
+        // A good report first, so a malformed one that left it in place
+        // would show.
+        let r = gw
+            .heartbeat(beat_with_drops(
+                &bundle.dp_id,
+                &instance,
+                Some(json!({"sink_full": 4})),
+            ))
+            .await;
+        assert_eq!(r.status, 200, "{r:?}");
+        assert_eq!(
+            listed_drops(&cp, &viewer, &instance).await,
+            json!({"sink_full": 4})
+        );
+
+        let r = gw
+            .heartbeat(beat_with_drops(
+                &bundle.dp_id,
+                &instance,
+                Some(malformed.clone()),
+            ))
+            .await;
+        assert_eq!(r.status, 200, "{malformed}: {r:?}");
+        assert_eq!(
+            listed_drops(&cp, &viewer, &instance).await,
+            json!({}),
+            "{malformed}"
+        );
+    }
 }

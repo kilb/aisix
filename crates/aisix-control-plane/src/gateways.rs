@@ -371,12 +371,15 @@ struct InstanceRow {
     last_seen_at: DateTime<Utc>,
     exporter_health: Value,
     rejected_count: i64,
+    usage_event_drops: Value,
 }
 
 /// `GET /admin/gateways/instances`: every gateway process that has sent a
 /// heartbeat, first seen first. `online` means heard from within
 /// `CP_INSTANCE_STALE_SECS`; `version_matches_cp` is [`version_matches`]
-/// against this control plane's version.
+/// against this control plane's version; `usage_event_drops` is the usage
+/// events the process reported in its last beat as dropped since it
+/// started, by reason, `{}` for none.
 pub async fn list_instances(
     auth: OperatorAuth,
     State(state): State<AppState>,
@@ -387,7 +390,8 @@ pub async fn list_instances(
         "SELECT i.dp_id, c.name AS credential_name, i.instance_id, i.hostname, i.version, \
          i.uptime_seconds, i.applied_revision, i.config_hash, \
          i.last_seen_at > now() - make_interval(secs => $1) AS online, i.last_seen_at, \
-         i.exporter_health, jsonb_array_length(i.rejected_resources)::bigint AS rejected_count \
+         i.exporter_health, jsonb_array_length(i.rejected_resources)::bigint AS rejected_count, \
+         i.usage_event_drops \
          FROM dp_instances i JOIN dp_credentials c ON c.dp_id = i.dp_id \
          ORDER BY i.first_seen_at, i.dp_id, i.instance_id",
     )
@@ -413,6 +417,7 @@ pub async fn list_instances(
                 "last_seen_at": row.last_seen_at,
                 "exporter_health": row.exporter_health,
                 "rejected_count": row.rejected_count,
+                "usage_event_drops": row.usage_event_drops,
             })
         })
         .collect();
