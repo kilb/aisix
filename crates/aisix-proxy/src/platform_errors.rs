@@ -126,6 +126,32 @@ impl PlatformErrorClass {
     }
 }
 
+/// The `error.code` a failed Response carries for `class`: the code of a
+/// `response.failed` event's Response and of a buffered Response object with
+/// `status: "failed"`. That slot takes the Responses API's own vocabulary
+/// (openai-python 3.41.0 `types/responses/response_error.py:47-69`), and a
+/// client reads it to decide what to do with the turn. Codex
+/// (`codex-rs/codex-api/src/sse/responses_error.rs`, `parse_failed_response`)
+/// reads `context_length_exceeded` as a context overflow, `invalid_prompt`
+/// as a request that will fail the same way again, `rate_limit_exceeded` as a
+/// rate limit, and any other code as a stream error worth retrying. So the
+/// classes' own codes (`invalid_request`, `content_filter`, …) would have it
+/// resend a turn that cannot succeed. The flat `error` event and the HTTP
+/// envelopes keep [`PlatformErrorClass::code`].
+pub(crate) fn responses_failed_code(class: &PlatformErrorClass) -> &'static str {
+    match class {
+        PlatformErrorClass::RateLimited => "rate_limit_exceeded",
+        PlatformErrorClass::ContextLengthExceeded => "context_length_exceeded",
+        PlatformErrorClass::InvalidRequest { .. } | PlatformErrorClass::ContentFiltered => {
+            "invalid_prompt"
+        }
+        PlatformErrorClass::Authentication
+        | PlatformErrorClass::NotFound
+        | PlatformErrorClass::UpstreamUnavailable
+        | PlatformErrorClass::Internal => "server_error",
+    }
+}
+
 impl IntoResponse for PlatformErrorClass {
     fn into_response(self) -> Response {
         (self.status(), axum::Json(self.envelope())).into_response()
@@ -496,7 +522,10 @@ pub(crate) fn relayed_responses_failure(frame: &[u8]) -> Option<Vec<u8>> {
         .map_or(PlatformErrorClass::UpstreamUnavailable, |e| {
             classify_bridge(&e)
         });
-    let error = serde_json::json!({ "code": class.code(), "message": platform_message(&class) });
+    let error = serde_json::json!({
+        "code": responses_failed_code(&class),
+        "message": platform_message(&class),
+    });
     let rewritten = match event {
         Some(mut failed)
             if failed.get("type").and_then(Value::as_str) == Some("response.failed")
@@ -560,8 +589,10 @@ pub(crate) fn relayed_failed_response(body: &mut Value) {
         .map_or(PlatformErrorClass::UpstreamUnavailable, |e| {
             classify_bridge(&e)
         });
-    body["error"] =
-        serde_json::json!({ "code": class.code(), "message": platform_message(&class) });
+    body["error"] = serde_json::json!({
+        "code": responses_failed_code(&class),
+        "message": platform_message(&class),
+    });
 }
 
 /// A whole Responses-API SSE body an output guardrail held back, which ends
@@ -1399,7 +1430,7 @@ mod tests {
         in_platform_mode(|| relayed_failed_response(&mut on));
         assert_eq!(on["status"], "failed");
         assert_eq!(on["id"], "resp_1");
-        assert_eq!(on["error"]["code"], "upstream_unavailable");
+        assert_eq!(on["error"]["code"], "server_error");
         assert_eq!(
             on["error"]["message"],
             "The model is temporarily unavailable. Retry later."
@@ -1416,6 +1447,53 @@ mod tests {
         let before = completed.clone();
         in_platform_mode(|| relayed_failed_response(&mut completed));
         assert_eq!(completed, before);
+    }
+
+    /// A failed Response carries a code of the Responses API's own, in the
+    /// buffered object and in a relayed `response.failed` alike, while the
+    /// flat `error` event keeps the class's code.
+    #[test]
+    fn a_failed_response_carries_a_code_the_responses_api_defines() {
+        let table = [
+            (PlatformErrorClass::RateLimited, "rate_limit_exceeded"),
+            (
+                PlatformErrorClass::ContextLengthExceeded,
+                "context_length_exceeded",
+            ),
+            (
+                PlatformErrorClass::InvalidRequest { param: None },
+                "invalid_prompt",
+            ),
+            (PlatformErrorClass::ContentFiltered, "invalid_prompt"),
+            (PlatformErrorClass::Authentication, "server_error"),
+            (PlatformErrorClass::NotFound, "server_error"),
+            (PlatformErrorClass::UpstreamUnavailable, "server_error"),
+            (PlatformErrorClass::Internal, "server_error"),
+        ];
+        for (class, code) in table {
+            assert_eq!(responses_failed_code(&class), code, "{class:?}");
+        }
+
+        // An upstream's own `invalid_prompt`: a turn that fails the same way
+        // however often it is sent.
+        let mut buffered = serde_json::json!({
+            "object": "response",
+            "status": "failed",
+            "error": {"code": "invalid_prompt", "message": "flagged by the Bedrock stack"},
+        });
+        in_platform_mode(|| relayed_failed_response(&mut buffered));
+        assert_eq!(buffered["error"]["code"], "invalid_prompt");
+        assert_eq!(buffered["error"]["message"], "The request is invalid.");
+
+        let failed = b"event: response.failed\ndata: {\"type\":\"response.failed\",\"sequence_number\":3,\"response\":{\"id\":\"resp_1\",\"status\":\"failed\",\"error\":{\"code\":\"invalid_prompt\",\"message\":\"flagged by the Bedrock stack\"}}}\n\n";
+        let out = in_platform_mode(|| relayed_responses_failure(failed)).unwrap();
+        let (v, _) = crate::redact::parse_sse_json_event(&out);
+        assert_eq!(v.unwrap()["response"]["error"]["code"], "invalid_prompt");
+
+        let flat = b"event: error\ndata: {\"type\":\"error\",\"code\":\"invalid_prompt\",\"message\":\"flagged\",\"param\":null,\"sequence_number\":3}\n\n";
+        let out = in_platform_mode(|| relayed_responses_failure(flat)).unwrap();
+        let (v, _) = crate::redact::parse_sse_json_event(&out);
+        assert_eq!(v.unwrap()["code"], "invalid_request");
     }
 
     #[test]

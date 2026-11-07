@@ -647,7 +647,8 @@ describe("platform mode: upstream failures reach the caller as the gateway's own
     const body = JSON.parse(answer.text) as { object?: string; status?: string; error?: Record<string, unknown> };
     expect(body.object, answer.text).toBe("response");
     expect(body.status).toBe("failed");
-    expect(body.error?.code).toBe(UNAVAILABLE.code);
+    // A failed Response's code is one the Responses API defines for it.
+    expect(body.error?.code).toBe("server_error");
     expect(body.error?.message).toBe(UNAVAILABLE.message);
     expectNoLeak(answer);
   });
@@ -657,7 +658,8 @@ describe("platform mode: upstream failures reach the caller as the gateway's own
     const answer = await call(RESPONSES_NATIVE, "caller_fault", false);
     const body = JSON.parse(answer.text) as { status?: string; error?: Record<string, unknown> };
     expect(body.status, answer.text).toBe("failed");
-    expect(body.error?.code).toBe(INVALID.code);
+    // The Responses API's code for a turn that fails the same way again.
+    expect(body.error?.code).toBe("invalid_prompt");
     expect(body.error?.message).toBe(INVALID.message);
     expectNoLeak(answer);
   });

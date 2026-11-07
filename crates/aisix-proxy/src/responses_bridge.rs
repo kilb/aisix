@@ -2950,7 +2950,7 @@ pub fn build_responses_bridge_stream(
                             sent_downstream,
                             false,
                             class.code(),
-                            class.code(),
+                            crate::platform_errors::responses_failed_code(&class),
                             crate::platform_errors::platform_message(&class),
                         ),
                         None => failure_frames(
@@ -3007,7 +3007,7 @@ pub fn build_responses_bridge_stream(
                     sent_downstream,
                     false,
                     class.code(),
-                    class.code(),
+                    crate::platform_errors::responses_failed_code(&class),
                     crate::platform_errors::platform_message(&class),
                 ),
                 None => failure_frames(
@@ -6364,10 +6364,8 @@ mod tests {
             events[2].1["message"],
             "The model is temporarily unavailable. Retry later."
         );
-        assert_eq!(
-            events[3].1["response"]["error"]["code"],
-            "upstream_unavailable"
-        );
+        // The failed Response carries the Responses API's own code for it.
+        assert_eq!(events[3].1["response"]["error"]["code"], "server_error");
         assert!(!events
             .iter()
             .any(|(_, data)| data.to_string().contains("empty stream")));

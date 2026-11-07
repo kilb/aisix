@@ -3603,7 +3603,7 @@ fn responses_stream_error_body(
             !delivered.is_empty(),
             false,
             class.code(),
-            class.code(),
+            crate::platform_errors::responses_failed_code(&class),
             crate::platform_errors::platform_message(&class),
         ),
         None => crate::responses_bridge::failure_frames(
