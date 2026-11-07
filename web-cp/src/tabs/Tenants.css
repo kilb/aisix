@@ -8,6 +8,8 @@
 .tn-name:hover{text-decoration:underline}
 .tn-mark{margin-left:8px}
 .tn-actions{display:flex;gap:6px;flex-wrap:wrap}
+/* A confirmation's warning takes a line of its own above the buttons. */
+.tn-actions > .note{flex-basis:100%;margin:0}
 
 /* A part of the tenant's page: a heading over what it holds. */
 .tn-section{border:0;padding:0;margin:22px 0 0;min-width:0}
@@ -19,6 +21,8 @@
 .tn-checks label{display:inline-flex;align-items:center;gap:8px;cursor:pointer}
 .tn-note{margin-left:10px;font-size:12px;color:var(--ink-3)}
 .tn-error{display:block;margin-top:3px;font-size:12px;color:var(--oxide)}
+/* Something about a key an operator should look at, on a line of its own. */
+.tn-flag{display:block;margin:3px 0 0;color:var(--oxide)}
 
 .tn-limits{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));column-gap:16px}
 

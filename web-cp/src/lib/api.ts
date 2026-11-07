@@ -221,6 +221,25 @@ export interface AdminKey {
   version: number;
 }
 
+/** What `POST /admin/tenants/{id}/keys` takes; a field left out is unset. */
+export interface NewKey {
+  label: string;
+  /** Selected from the tenant's grants; left out, the key follows every grant. */
+  model_ids?: string[];
+  /** Model name patterns, for the platform's own tenant only. */
+  allowed_models?: string[];
+  allowed_provider_groups?: string[];
+  rate_limit?: { concurrency?: number; rpm?: number };
+  /** RFC 3339. */
+  expires_at?: string;
+}
+
+/** A key at creation: the only answer that carries its plaintext. */
+export interface MintedKey {
+  key: AdminKey;
+  plaintext: string;
+}
+
 export interface Instance {
   dp_id: string;
   credential_name: string;
@@ -417,17 +436,31 @@ export const tenants = {
 };
 
 export const keys = {
-  /** `allowed_provider_groups: null` drops the key's own groups, so it follows its tenant's. */
+  /** The answer is the only one that carries the plaintext: never store or log it. */
+  async create(tenantId: string, body: NewKey): Promise<MintedKey> {
+    return (await call<MintedKey>("POST", `/admin/tenants/${seg(tenantId)}/keys`, body)).data;
+  },
+  /**
+   * `disabled` is the operators' switch; `allowed_provider_groups: null` drops
+   * the key's own groups, so it follows its tenant's.
+   */
   async update(
     id: string,
-    changes: { allowed_provider_groups?: string[] | null },
+    changes: { disabled?: boolean; allowed_provider_groups?: string[] | null },
     version: number,
   ): Promise<AdminKey> {
     return (await call<AdminKey>("PATCH", `/admin/keys/${seg(id)}`, changes, version)).data;
   },
+  async revoke(id: string, version: number): Promise<void> {
+    await call<null>("DELETE", `/admin/keys/${seg(id)}`, undefined, version);
+  },
 };
 
-export const gateways = {};
+export const gateways = {
+  async instances(): Promise<Instance[]> {
+    return (await call<{ items: Instance[] }>("GET", "/admin/gateways/instances")).data.items;
+  },
+};
 export const operators = {};
 export const audit = {};
 

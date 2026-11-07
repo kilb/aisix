@@ -1,6 +1,7 @@
 import { Fragment, useCallback, useEffect, useId, useMemo, useRef, useState, type ReactNode } from "react";
 import type { TabProps } from "../App";
 import { ConflictNote } from "../components/ConflictNote";
+import { GatewayTooOld } from "../components/GatewayTooOld";
 import { Msg, type Note } from "../components/Msg";
 import { RolloutBadge } from "../components/RolloutBadge";
 import {
@@ -23,7 +24,7 @@ import {
 import { messageFor } from "../lib/errors";
 import "./Tenants.css";
 
-const STATUS_LABEL: Record<Tenant["status"], string> = {
+export const STATUS_LABEL: Record<Tenant["status"], string> = {
   pending: "待审核",
   active: "正常",
   suspended: "已停用",
@@ -34,7 +35,7 @@ const BILLING_LABEL: Record<Tenant["billing_mode"], string> = {
   postpaid: "后付费",
 };
 
-const ROLE_LABEL: Record<Member["role"], string> = {
+export const ROLE_LABEL: Record<Member["role"], string> = {
   owner: "所有者",
   admin: "管理员",
   member: "成员",
@@ -68,38 +69,61 @@ function ungrantable(doc: ModelDoc): boolean {
   return (doc.display_name ?? "").includes("*") || (doc.ensemble !== undefined && doc.ensemble !== null);
 }
 
-function errorText(e: unknown): string {
+export function errorText(e: unknown): string {
   return e instanceof ApiError ? messageFor(e) : String(e);
 }
 
+/**
+ * Why an action was refused, where it was taken: a `gateway_too_old` refusal
+ * with what it needs and the gateways that hold it back, a `412` with a
+ * reload when `onReload` is given, anything else as its text.
+ */
+export function Failure({ error, onReload }: { error: unknown; onReload?: () => void }) {
+  if (error instanceof ApiError && error.code === "gateway_too_old") return <GatewayTooOld error={error} />;
+  if (error instanceof ApiError && error.code === "version_mismatch" && onReload) {
+    return <ConflictNote onReload={onReload} />;
+  }
+  return (
+    <span className="tn-error" role="alert">
+      {errorText(error)}
+    </span>
+  );
+}
+
 /** A refused write, sorted for the form that made it. */
-interface Refusal {
+export interface Refusal {
   /** `412`: the row changed since this edit started. */
   conflict: boolean;
   /** Validation problems by the JSON path of the request body they are at. */
   at: Map<string, string>;
   /** What no field of the form shows. */
   general: string | null;
+  /** A `422 gateway_too_old`, which a form may show with the gateways that hold it back. */
+  tooOld: ApiError | null;
 }
 
 /**
  * `e` sorted for a form: a `412` is a conflict; each detail of a `422` the
  * form has a place for (`placed(path)`) goes to its field and the rest to the
- * general note; any other refusal is the general note.
+ * general note; a `gateway_too_old` is the general note with its details; any
+ * other refusal is the general note.
  */
-function refusal(e: unknown, placed: (path: string) => boolean): Refusal {
+export function refusal(e: unknown, placed: (path: string) => boolean): Refusal {
   const at = new Map<string, string>();
-  if (!(e instanceof ApiError)) return { conflict: false, at, general: String(e) };
-  if (e.code === "version_mismatch") return { conflict: true, at, general: null };
+  if (!(e instanceof ApiError)) return { conflict: false, at, general: String(e), tooOld: null };
+  if (e.code === "version_mismatch") return { conflict: true, at, general: null, tooOld: null };
+  if (e.code === "gateway_too_old") {
+    return { conflict: false, at, general: [messageFor(e), ...e.details.map((d) => d.message)].join("；"), tooOld: e };
+  }
   if (e.code !== "validation_failed" || e.details.length === 0) {
-    return { conflict: false, at, general: messageFor(e) };
+    return { conflict: false, at, general: messageFor(e), tooOld: null };
   }
   const rest: string[] = [];
   for (const d of e.details) {
     if (!placed(d.path)) rest.push(d.message);
     else at.set(d.path, at.has(d.path) ? `${at.get(d.path)}；${d.message}` : d.message);
   }
-  return { conflict: false, at, general: rest.length > 0 ? rest.join("；") : null };
+  return { conflict: false, at, general: rest.length > 0 ? rest.join("；") : null, tooOld: null };
 }
 
 /**
@@ -107,7 +131,7 @@ function refusal(e: unknown, placed: (path: string) => boolean): Refusal {
  * the button into `确认<label>` and `取消`, under `warning`, and only the
  * confirmation acts. `ask` decides, at each first click, whether to ask at all.
  */
-function TwoStep({
+export function TwoStep({
   label,
   onConfirm,
   disabled,
@@ -163,7 +187,7 @@ function TwoStep({
 }
 
 /** A path at the list `field` or one of its entries. */
-const atList = (field: string) => (path: string) => path === field || path.startsWith(`${field}/`);
+export const atList = (field: string) => (path: string) => path === field || path.startsWith(`${field}/`);
 
 function pause(ms: number, signal: AbortSignal): Promise<void> {
   return new Promise((resolve) => {
@@ -186,7 +210,7 @@ const settling = (t: Tenant) => t.rollout.state === "pending" || t.rollout.state
  * while its documents are on their way to the gateways, handing each view to
  * `onView`. A failed read is skipped; `signal` stops it.
  */
-async function follow(t: Tenant, onView: (t: Tenant) => void, signal: AbortSignal): Promise<void> {
+export async function follow(t: Tenant, onView: (t: Tenant) => void, signal: AbortSignal): Promise<void> {
   const deadline = Date.now() + WATCH_BUDGET_MS;
   let last = t;
   while (settling(last) && !signal.aborted && Date.now() + WATCH_INTERVAL_MS <= deadline) {
@@ -203,7 +227,7 @@ async function follow(t: Tenant, onView: (t: Tenant) => void, signal: AbortSigna
 }
 
 /** A signal that aborts when the component unmounts. */
-function useLifetime(): () => AbortSignal {
+export function useLifetime(): () => AbortSignal {
   const ref = useRef<AbortController | null>(null);
   useEffect(() => {
     const controller = new AbortController();
@@ -217,7 +241,7 @@ function useLifetime(): () => AbortSignal {
  * The result of `load`, read again whenever `deps` change; `data` is null
  * until the first read. A read that a later one overtook is dropped.
  */
-function useLoad<T>(load: () => Promise<T>, deps: unknown[]) {
+export function useLoad<T>(load: () => Promise<T>, deps: unknown[]) {
   const [data, setData] = useState<T | null>(null);
   const [error, setError] = useState<string | null>(null);
   const seq = useRef(0);
@@ -269,20 +293,41 @@ function limitsFrom(draft: LimitDraft): TenantLimits {
 }
 
 /** Every group name worth offering: the accounts' groups and those already chosen, sorted. */
-function groupOptions(available: ProviderGroup[] | null, stored: string[]): string[] {
+export function groupOptions(available: ProviderGroup[] | null, stored: string[]): string[] {
   return [...new Set([...(available ?? []).map((g) => g.name), ...stored])].sort((a, b) => a.localeCompare(b));
 }
 
 /** The upstream accounts in each group, by display name. */
-function accountsByGroup(available: ProviderGroup[] | null): Map<string, string[]> {
+export function accountsByGroup(available: ProviderGroup[] | null): Map<string, string[]> {
   return new Map((available ?? []).map((g) => [g.name, g.provider_keys.map((k) => k.display_name ?? k.id)]));
+}
+
+/**
+ * The groups key `k`'s override names that tenant `t` does not have. A tenant
+ * with no groups reaches every upstream, so nothing is outside it.
+ */
+export function strayGroups(k: AdminKey, t: Tenant): string[] {
+  if (!k.allowed_provider_groups || t.allowed_provider_groups.length === 0) return [];
+  return k.allowed_provider_groups.filter((g) => !t.allowed_provider_groups.includes(g));
+}
+
+/** The note beside a key whose override reaches past its tenant's groups. */
+export function StrayNote({ k, tenant }: { k: AdminKey; tenant: Tenant }) {
+  const stray = strayGroups(k, tenant);
+  if (stray.length === 0) return null;
+  return <span className="tn-note tn-flag">覆盖中的 {stray.join("、")} 不在租户的可用分组中</span>;
+}
+
+/** The warning before a group choice whose groups hold no upstream account is saved. */
+export function unreachableWarning(groups: string[], whose: string): string {
+  return `${groups.join("、")}：没有上游账号在此分组。保存后，${whose}找不到任何上游账号，无法调用模型。`;
 }
 
 export function Tenants({ operator, canEdit }: TabProps) {
   const [filter, setFilter] = useState<Tenant["status"] | "">("");
   const [items, setItems] = useState<Tenant[] | null>(null);
   const [listError, setListError] = useState<string | null>(null);
-  const [rowError, setRowError] = useState<{ id: string; text: string } | null>(null);
+  const [rowError, setRowError] = useState<{ id: string; error: unknown } | null>(null);
   const [acting, setActing] = useState<string | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
   const [detail, setDetail] = useState<Tenant | null>(null);
@@ -362,7 +407,7 @@ export function Tenants({ operator, canEdit }: TabProps) {
       // The filter may leave the tenant out now.
       await loadList();
     } catch (e) {
-      setRowError({ id: t.id, text: errorText(e) });
+      setRowError({ id: t.id, error: e });
     } finally {
       setActing(null);
     }
@@ -471,11 +516,7 @@ export function Tenants({ operator, canEdit }: TabProps) {
                             </button>
                           )}
                         </div>
-                        {rowError?.id === t.id && (
-                          <span className="tn-error" role="alert">
-                            {rowError.text}
-                          </span>
-                        )}
+                        {rowError?.id === t.id && <Failure error={rowError.error} />}
                       </td>
                     )}
                   </tr>
@@ -610,7 +651,7 @@ function TenantDetail({
 }
 
 /** One choice in a list of checkboxes, with a note beside it and its refusal under it. */
-function Check({
+export function Check({
   label,
   checked,
   disabled,
@@ -650,7 +691,7 @@ function Check({
 }
 
 /** A multi-select of provider groups, each with the upstream accounts in it. */
-function GroupPicker({
+export function GroupPicker({
   options,
   chosen,
   onChange,
@@ -876,7 +917,7 @@ function GroupsPart({
           ask={() => !picked.some(reachable)}
           warning={
             unreachable.length > 0
-              ? `${unreachable.join("、")}：没有上游账号在此分组。保存后，该租户的密钥找不到任何上游账号，无法调用模型。`
+              ? unreachableWarning(unreachable, "该租户的密钥")
               : "没有选择任何分组。保存后，该租户的密钥找不到任何上游账号，无法调用模型。"
           }
           onConfirm={() => void submit()}
@@ -914,7 +955,7 @@ function LimitInputs({
   );
 }
 
-function LimitInput({
+export function LimitInput({
   label,
   value,
   disabled,
@@ -1021,7 +1062,7 @@ function MembersPart({
   onChanged: (member: Member) => void;
 }) {
   const [busy, setBusy] = useState<string | null>(null);
-  const [rowError, setRowError] = useState<{ id: string; text: string } | null>(null);
+  const [rowError, setRowError] = useState<{ id: string; error: unknown } | null>(null);
 
   async function toggle(m: Member) {
     setBusy(m.id);
@@ -1029,7 +1070,7 @@ function MembersPart({
     try {
       onChanged(await tenants.setMemberDisabled(m.id, !m.disabled));
     } catch (e) {
-      setRowError({ id: m.id, text: errorText(e) });
+      setRowError({ id: m.id, error: e });
     } finally {
       setBusy(null);
     }
@@ -1085,11 +1126,7 @@ function MembersPart({
                           <TwoStep label="停用" disabled={busy === m.id} onConfirm={() => void toggle(m)} />
                         )}
                       </div>
-                      {rowError?.id === m.id && (
-                        <span className="tn-error" role="alert">
-                          {rowError.text}
-                        </span>
-                      )}
+                      {rowError?.id === m.id && <Failure error={rowError.error} />}
                     </td>
                   )}
                 </tr>
@@ -1208,7 +1245,7 @@ function InvitePart({ tenant }: { tenant: Tenant }) {
 }
 
 /** Why the gateway refuses key `k`, as far as this page can tell. */
-function whyOff(k: AdminKey, tenant: Tenant, members: Member[] | null): string {
+export function whyOff(k: AdminKey, tenant: Tenant, members: Member[] | null): string {
   const why: string[] = [];
   if (k.disabled) why.push("运维停用");
   if (k.disabled_by_tenant) why.push("租户自行停用");
@@ -1286,7 +1323,10 @@ function KeysPart({
                     <td>
                       {k.effective_provider_groups.length > 0 ? k.effective_provider_groups.join("、") : "全部上游"}
                     </td>
-                    <td>{k.allowed_provider_groups?.length ? k.allowed_provider_groups.join("、") : "沿用租户"}</td>
+                    <td>
+                      {k.allowed_provider_groups?.length ? k.allowed_provider_groups.join("、") : "沿用租户"}
+                      <StrayNote k={k} tenant={tenant} />
+                    </td>
                     <td>
                       {k.effective_disabled ? (
                         <>
@@ -1339,7 +1379,7 @@ function KeysPart({
   );
 }
 
-function OverrideEditor({
+export function OverrideEditor({
   k,
   options,
   accounts,
@@ -1374,6 +1414,8 @@ function OverrideEditor({
   }
 
   const whole = refused?.at.get("/allowed_provider_groups");
+  const picked = shown.filter((g) => chosen.includes(g));
+  const reachable = (g: string) => (accounts.get(g) ?? []).length > 0;
   return (
     <fieldset className="tn-override">
       <legend>分组覆盖</legend>
@@ -1391,21 +1433,26 @@ function OverrideEditor({
           {whole}
         </div>
       )}
-      {refused?.general && (
-        <div className="note crit" role="alert">
-          {refused.general}
-        </div>
+      {refused?.tooOld ? (
+        <GatewayTooOld error={refused.tooOld} />
+      ) : (
+        refused?.general && (
+          <div className="note crit" role="alert">
+            {refused.general}
+          </div>
+        )
       )}
       {refused?.conflict && <ConflictNote onReload={onReload} />}
       <div className="tn-actions">
-        <button
-          type="button"
+        {/* Groups none of which holds an upstream account leave the key nothing to reach (ruling P1b-R6). */}
+        <TwoStep
+          label="保存覆盖"
           className="act"
           disabled={busy}
-          onClick={() => void submit(shown.filter((g) => chosen.includes(g)))}
-        >
-          保存覆盖
-        </button>
+          ask={() => picked.length > 0 && !picked.some(reachable)}
+          warning={unreachableWarning(picked, "这个密钥")}
+          onConfirm={() => void submit(picked)}
+        />
         <button
           type="button"
           className="ghost"

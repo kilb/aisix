@@ -4,6 +4,7 @@ import { EXPECTED_API_CONTRACT } from "./lib/contract";
 import { messageFor } from "./lib/errors";
 import { useTheme } from "./lib/useTheme";
 import { Gate } from "./Gate";
+import { Keys } from "./tabs/Keys";
 import { Overview } from "./tabs/Overview";
 import { Tenants } from "./tabs/Tenants";
 
@@ -53,6 +54,8 @@ function Page({ tab, ...props }: TabProps & { tab: TabId }) {
       return <Overview {...props} />;
     case "tenants":
       return <Tenants {...props} />;
+    case "keys":
+      return <Keys {...props} />;
     default:
       return <NotBuilt label={TABS.find((t) => t.id === tab)?.label ?? tab} />;
   }
