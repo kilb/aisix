@@ -55,7 +55,7 @@ export class ApiClient {
 
   async request(method: string, path: string, body?: unknown, ifMatch?: number): Promise<ApiAnswer> {
     const headers: Record<string, string> = {};
-    if (body !== undefined) headers["content-type"] = "application/json";
+    headers["content-type"] = "application/json";
     if (ifMatch !== undefined) headers["if-match"] = `"${ifMatch}"`;
     if (this.cookies.size > 0) {
       headers.cookie = [...this.cookies].map(([k, v]) => `${k}=${v}`).join("; ");
