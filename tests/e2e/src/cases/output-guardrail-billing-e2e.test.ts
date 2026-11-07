@@ -9,6 +9,7 @@ import {
   SeedClient,
   spawnApp,
   waitConfigPropagation,
+  waitForLogLine,
   type MetricSample,
   type SpawnedApp,
 } from "../harness/index.js";
@@ -224,7 +225,8 @@ describe("an answer an output guardrail blocks is billed like one it lets throug
     etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
     mock = await startMock();
-    app = await spawnApp();
+    // The access-log line is `info`; the barrier below waits for one.
+    app = await spawnApp({ logLevel: "info" });
     const seed = new SeedClient(etcd, app.etcdPrefix);
 
     const openai = await seed.createProviderKey({
@@ -317,7 +319,11 @@ describe("an answer an output guardrail blocks is billed like one it lets throug
       },
       body: JSON.stringify(body),
     });
-    return { status: res.status, body: await res.text() };
+    return {
+      status: res.status,
+      body: await res.text(),
+      requestId: res.headers.get("x-aisix-request-id") ?? "",
+    };
   };
 
   const spendSince = async (cell: Cell, before: MetricSample[]) =>
@@ -349,15 +355,13 @@ describe("an answer an output guardrail blocks is billed like one it lets throug
         `you said: please repeat ${MARKER}`,
       );
 
-      // The upstream charged for it, so the spend series counts it: once.
+      // The upstream charged for it, so the spend series counts it.
       await expect
         .poll(() => spendSince(cell, before), {
           timeout: 10_000,
           message: "the blocked answer was paid upstream but never recorded as spend",
         })
         .toBeGreaterThan(0);
-      await new Promise((r) => setTimeout(r, 300));
-      expect(await spendSince(cell, before)).toBe(ONE_ANSWER);
 
       // And the ceiling counts it: two answers spent its whole day, so the
       // next request is refused before it reaches the upstream.
@@ -366,9 +370,24 @@ describe("an answer an output guardrail blocks is billed like one it lets throug
         refused.status,
         `a blocked answer did not count against the caller's ceiling: ${refused.body}`,
       ).toBe(429);
-      expect(await spendSince(cell, before), "the refused request was not billed").toBe(
-        ONE_ANSWER,
+
+      // Once, and the refused request not at all. The barrier is ordered,
+      // not timed: the refused request went out only after the blocked
+      // answer reached the caller, and its own access-log line is written
+      // once that request is done with, so the check below runs after both
+      // requests have finished.
+      expect(refused.requestId, "the refused request has an id").not.toBe("");
+      await waitForLogLine(
+        app!,
+        (l) =>
+          l.includes("proxy request completed") &&
+          l.includes(`request_id="${refused.requestId}"`),
+        `the access-log line for the refused request ${refused.requestId}`,
       );
+      expect(
+        await spendSince(cell, before),
+        "the blocked answer is billed once and the refused request not at all",
+      ).toBe(ONE_ANSWER);
     });
   }
 });

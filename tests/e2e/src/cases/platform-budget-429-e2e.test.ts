@@ -30,6 +30,8 @@ const PLATFORM_SECRET = "ef4c49de00b0d8ff3bd998f2db44d9f2e2fc1c5520907e6bf4010a8
 const TEAM_KEY = "sk-pb-e2e-team";
 const PLAIN_KEY = "sk-pb-e2e-plain";
 const SENTINEL_KEY = "sk-pb-e2e-sentinel";
+/** Seeded after the environment budget, so it authenticating means the budget is in force. */
+const ENV_SENTINEL_KEY = "sk-pb-e2e-env-sentinel";
 const TEAM_ID = randomUUID();
 /** Figures only the platform's budgets carry. */
 const PLATFORM_LIMIT = "777.00";
@@ -100,6 +102,8 @@ describe("platform mode: a 429 shows a tenant only its own limits", () => {
   let seed: SeedClient | undefined;
   let etcdReachable = false;
   const spentPkIds: string[] = [];
+  /** The environment budget and its sentinel key, once the last case seeds them. */
+  const envRows: Array<[string, string]> = [];
 
   const call = async (key: string, route: Route, model: string, stream: boolean) => {
     const res = await fetch(`${app!.proxyUrl}${route.path}`, {
@@ -246,6 +250,8 @@ describe("platform mode: a 429 shows a tenant only its own limits", () => {
   }, 120_000);
 
   afterAll(async () => {
+    // The environment budget refuses every key in the environment.
+    for (const [kind, id] of envRows) await seed?.delete(kind, id);
     await app?.exit();
     await cp?.close();
     await upstream?.close();
@@ -299,17 +305,26 @@ describe("platform mode: a 429 shows a tenant only its own limits", () => {
     expect(Number(answer.headers.get("retry-after"))).toBeGreaterThan(0);
   });
 
-  // Last: it refuses every key in the environment until removed.
+  // Last: it refuses every key in the environment until `afterAll` removes it.
   test("an environment budget refusal reveals nothing on any endpoint", async (ctx) => {
     if (!etcdReachable || !app || !seed) return ctx.skip();
-    await seed.update("budgets", randomUUID(), {
+    const budgetId = randomUUID();
+    envRows.push(["budgets", budgetId]);
+    await seed.update("budgets", budgetId, {
       scope: "environment",
       scope_ref: "env",
       period: "week",
       exhausted: { reason: reason("environment", "env", PLATFORM_LIMIT, PLATFORM_SPENT, "environment") },
     });
-    const chat = ROUTES[0];
-    await waitConfigPropagation(async () => (await call(PLAIN_KEY, chat, cleanModel("chat"), false)).status === 429);
+    // A key written after the budget: once it authenticates, the budget is in
+    // the snapshot. Listing models is not refused by a budget, so the gate is
+    // not the refusal under test.
+    const sentinelId = randomUUID();
+    envRows.push(["api_keys", sentinelId]);
+    await seed.update("api_keys", sentinelId, { key_hash: hash(ENV_SENTINEL_KEY), allowed_models: ["*"] });
+    await waitConfigPropagation(
+      async () => (await new ProxyClient(app!.proxyUrl, ENV_SENTINEL_KEY).listModels()).status === 200,
+    );
     for (const route of ROUTES) {
       for (const stream of route.streams ? [false, true] : [false]) {
         expectHidden(route, await call(PLAIN_KEY, route, cleanModel(route.family), stream));
