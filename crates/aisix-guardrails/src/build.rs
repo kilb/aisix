@@ -1970,13 +1970,15 @@ pub fn sweep_unattached_guardrails(
 }
 
 // ---------------------------------------------------------------------------
-// LiveGuardrailIndex — lazy-rebuild adapter over a snapshot handle
+// LiveGuardrailIndex — rebuild-on-change adapter over a snapshot handle
 // ---------------------------------------------------------------------------
 
 /// Wraps a snapshot handle and rebuilds the runtime index when — and only
 /// when — the `guardrails` or `guardrail_attachments` table changes. The
 /// endpoint handlers call `resolve(ctx)` on each request to get the
-/// applicable `GuardrailChain`.
+/// applicable `GuardrailChain`; in the server, [`rebuild_on_publish`] builds
+/// it as each configuration publishes, so a request normally finds it
+/// current, and one that does not builds it itself.
 ///
 /// Hot path: one snapshot load, one generation-pair compare, one `Arc`
 /// clone. A rebuild walks the attachment rows and constructs a runtime
@@ -2056,8 +2058,8 @@ impl LiveGuardrailIndex {
         Self::new_with_sink_and_status(snapshot, bedrock_endpoint_url, metrics_sink, embedder, None)
     }
 
-    /// Production constructor: additionally reports lazy index-build
-    /// failures through the shared configuration status.
+    /// Production constructor: additionally reports index-build failures
+    /// through the shared configuration status.
     pub fn new_with_sink_and_status(
         snapshot: SnapshotHandle<AisixSnapshot>,
         bedrock_endpoint_url: Option<String>,
@@ -2194,6 +2196,52 @@ impl LiveGuardrailIndex {
     /// on the hot path.
     pub fn is_empty(&self) -> bool {
         self.current().is_empty()
+    }
+}
+
+/// Keeps `index` built for each configuration its snapshot publishes, until
+/// `cancel` turns true or its sender is gone.
+///
+/// Requests build the index lazily, on the first one after the guardrail or
+/// attachment tables change, and a row that fails to build is reported (on
+/// `/status/config` and in the managed heartbeat's `rejected_resources`)
+/// from that build. A gateway taking no traffic therefore never reported a
+/// guardrail it could not build, and its control plane showed the change as
+/// applied. This builds as each configuration publishes instead, on a
+/// blocking thread and single-flighted with the request path's build, so a
+/// request arriving after it finds the index already current.
+pub async fn rebuild_on_publish(
+    index: Arc<LiveGuardrailIndex>,
+    mut cancel: tokio::sync::watch::Receiver<bool>,
+) {
+    let mut published = index.snapshot.subscribe();
+    loop {
+        if *cancel.borrow() {
+            return;
+        }
+        // Most publications change neither table the index reads; those
+        // need no trip to the blocking pool.
+        if index.cache.load().last_key != index_key(&index.snapshot.load()) {
+            let building = Arc::clone(&index);
+            // A build that panics panics on the request path too, which is
+            // where it is reported; there is nothing to add here.
+            let _ = tokio::task::spawn_blocking(move || {
+                building.current();
+            })
+            .await;
+        }
+        tokio::select! {
+            changed = cancel.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+            }
+            changed = published.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+            }
+        }
     }
 }
 
@@ -4878,6 +4926,55 @@ mod tests {
         let repaired = status.view();
         assert_eq!(repaired.state, aisix_core::ConfigState::Synced);
         assert_eq!(repaired.applied.unwrap().resource_counts["guardrails"], 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_published_guardrail_that_cannot_build_is_reported_with_no_request() {
+        // A gateway taking no traffic still reports a row it cannot build,
+        // so its control plane does not show the change as applied.
+        let handle = SnapshotHandle::new(AisixSnapshot::new());
+        let status = ConfigStatus::new(aisix_core::SourceKind::Etcd);
+        let live = LiveGuardrailIndex::new_with_sink_and_status(
+            handle.clone(),
+            None,
+            None,
+            GuardrailEmbedderSlot::none(),
+            Some(status.clone()),
+        );
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(rebuild_on_publish(Arc::clone(&live), cancel_rx));
+
+        let bad = AisixSnapshot::new();
+        bad.guardrails.insert(entry(
+            "unbuildable",
+            "g-1",
+            parse(r#"{"name":"unbuildable","kind":"keyword","patterns":[{"kind":"regex","value":"("}]}"#),
+        ));
+        bad.guardrail_attachments.insert(attachment_entry(
+            "a-1",
+            parse_attachment(r#"{"guardrail_id":"g-1","scope_type":"env","priority":0}"#),
+        ));
+        handle.store(bad);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let keys = loop {
+            let keys: Vec<String> = status
+                .rejection_snapshots()
+                .into_iter()
+                .map(|r| r.key)
+                .collect();
+            if !keys.is_empty() || std::time::Instant::now() > deadline {
+                break keys;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        };
+        assert_eq!(keys, vec!["/aisix/runtime/guardrails/g-1".to_string()]);
+
+        cancel_tx.send(true).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("the task stops when cancelled")
+            .unwrap();
     }
 
     #[test]

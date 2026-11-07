@@ -793,7 +793,7 @@ impl ConfigStatus {
     /// Replace the runtime-builder rejection set while preserving loader
     /// rejections and each still-broken row's first-seen time.
     ///
-    /// Called after a lazy runtime rebuild. Passing an empty vector clears
+    /// Called after each runtime rebuild. Passing an empty vector clears
     /// stale build failures after the offending row is fixed or removed.
     pub fn record_build_rejections(&self, rejected: Vec<IncomingRejection>) {
         let now = Utc::now();

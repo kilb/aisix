@@ -16,14 +16,14 @@ import {
 
 // E2E for what invalidates the runtime guardrail index (AISIX-Cloud#1542).
 //
-// The index is rebuilt lazily, on the first request that resolves a
-// guardrail after the configuration changed, on the worker thread serving
-// that request — and building it constructs one runtime instance per
-// enabled attachment, each with its own HTTP client. So "what counts as a
-// change" is a latency question, not a bookkeeping one: while the index
-// keyed on the single global snapshot version, one API-key edit made every
-// worker reconstruct every attachment before it could answer anything,
-// liveness probes included.
+// The index is rebuilt after a configuration change: in the background as
+// the change publishes, or by the first request that resolves a guardrail
+// if that has not happened yet — and building it constructs one runtime
+// instance per enabled attachment, each with its own HTTP client. So "what
+// counts as a change" is a latency question, not a bookkeeping one: while
+// the index keyed on the single global snapshot version, one API-key edit
+// made every worker reconstruct every attachment before it could answer
+// anything, liveness probes included.
 //
 // The three things a spec has to hold apart here:
 //   - a write to a resource the index does not read must not rebuild it;
@@ -121,10 +121,12 @@ describe("guardrail index invalidation", () => {
   /**
    * A chat, and the barrier that makes `rebuilds()` exact right after it.
    *
-   * The rebuild line is written while the request resolves its
-   * guardrails, so it is queued before that request's own access-log
-   * line; the log queue and its writer thread are both FIFO, so once the
-   * access line is visible every rebuild the request caused is too. That
+   * The rebuild line is written before a request can resolve its
+   * guardrails on the rebuilt index (by that request, or by the
+   * background build it waits for or finds finished), so it is queued
+   * before that request's own access-log line; the log queue and its
+   * writer thread are both FIFO, so once the access line is visible every
+   * rebuild ahead of the request is too. That
    * is what lets the counts below assert "exactly N" rather than "at
    * least N" — including the ones whose point is that NOTHING rebuilt.
    */
@@ -229,7 +231,7 @@ describe("guardrail index invalidation", () => {
   test("an unrelated write does not rebuild the index; an attachment write does, once", async (ctx) => {
     if (!etcdReachable) ctx.skip();
 
-    // Warm: the first request that resolves a guardrail builds the index,
+    // Warm: by the first request that resolves a guardrail the index is built,
     // and the guardrail must actually be in force before anything below
     // means anything.
     expect(await chat(SCREENED_MODEL, BLOCK_MARKER)).toBe(422);
