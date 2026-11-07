@@ -138,6 +138,15 @@ fn status_of<T: std::fmt::Debug>(result: Result<T, etcd_client::Error>) -> tonic
     }
 }
 
+/// Asserts `result` got no answer at all: its connection was closed under
+/// it, as the listener closes one right after the handshake when the
+/// credential is refused.
+fn assert_closed_unserved<T: std::fmt::Debug>(result: Result<T, etcd_client::Error>) {
+    let status = status_of(result);
+    assert_eq!(status.code(), Code::Unknown, "{status:?}");
+    assert_eq!(status.message(), "transport error", "{status:?}");
+}
+
 /// Asserts `result` is the refusal `message`.
 fn assert_denied<T: std::fmt::Debug>(result: Result<T, etcd_client::Error>, message: &str) {
     let status = status_of(result);
@@ -1107,17 +1116,16 @@ async fn a_revoked_credential_loses_its_watch() {
         .expect("the reading connection is closed within 2 s")
         .expect("closed");
 
-    // A new connection with the revoked certificate is refused as well.
+    // A new connection with the revoked certificate is closed right after
+    // its handshake, unserved.
     let mut again = gateway(&t.cp, &t.bundle).await;
-    let status = status_of(again.get(key.clone(), None).await);
-    assert_eq!(status.code(), Code::PermissionDenied, "{status:?}");
-    let status = status_of(
+    assert_closed_unserved(again.get(key.clone(), None).await);
+    assert_closed_unserved(
         again
             .watch(env.clone(), Some(WatchOptions::new().with_prefix()))
             .await
             .map(|(w, _)| w.watch_id()),
     );
-    assert_eq!(status.code(), Code::PermissionDenied, "{status:?}");
 
     // The other gateway's watch never noticed.
     t.put(&key, "v2").await;
@@ -1230,27 +1238,18 @@ async fn a_certificate_for_another_environment_is_refused() {
     };
     t.put(&format!("{}models/m", other.env_prefix()), "its-own-7c1")
         .await;
+    // Its connections are closed right after the handshake, unserved.
     for prefix in [other.env_prefix(), t.env()] {
         let mut gw = gateway(&t.cp, &foreign).await;
-        let status = status_of(
+        assert_closed_unserved(
             gw.get(prefix.clone(), Some(GetOptions::new().with_prefix()))
                 .await,
         );
-        assert_eq!(
-            status.code(),
-            Code::PermissionDenied,
-            "{prefix}: {status:?}"
-        );
         let mut gw = gateway(&t.cp, &foreign).await;
-        let status = status_of(
+        assert_closed_unserved(
             gw.watch(prefix.clone(), Some(WatchOptions::new().with_prefix()))
                 .await
                 .map(|(w, _)| w.watch_id()),
-        );
-        assert_eq!(
-            status.code(),
-            Code::PermissionDenied,
-            "{prefix}: {status:?}"
         );
     }
 }
@@ -1389,6 +1388,7 @@ async fn shutting_down_ends_open_watches_unavailable_and_promptly() {
         tls,
         aisix_control_plane::http::dp_router(t.cp.state().clone()),
         Some(etcd_front::routes(front)),
+        t.cp.admission(),
         ConnLimits::default(),
         stopped,
     ));
@@ -1827,6 +1827,12 @@ async fn a_refused_credential_gets_a_goaway_on_its_h2_connection() {
     let Some(t) = Fixture::start().await else {
         return;
     };
+    // A connection opened while the credential was good: a new one is
+    // closed right after its handshake once the revoke is known.
+    let tls = tls_connect(t.cp.dp_addr(), &t.bundle, &[b"h2"]).await;
+    let (client, connection) = h2::client::handshake(tls).await.expect("HTTP/2");
+    tokio::spawn(connection);
+    let mut client = client.ready().await.expect("ready");
     t.revoke(&t.bundle).await;
     // The revoke is known once a new connection is refused.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -1840,10 +1846,6 @@ async fn a_refused_credential_gets_a_goaway_on_its_h2_connection() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
-    let tls = tls_connect(t.cp.dp_addr(), &t.bundle, &[b"h2"]).await;
-    let (client, connection) = h2::client::handshake(tls).await.expect("HTTP/2");
-    tokio::spawn(connection);
-    let mut client = client.ready().await.expect("ready");
     let request = hyper::Request::builder()
         .method("POST")
         .uri("https://localhost/etcdserverpb.KV/Range")
@@ -2092,6 +2094,7 @@ async fn a_range_that_waits_too_long_for_a_place_is_resource_exhausted() {
         tls,
         aisix_control_plane::http::dp_router(t.cp.state().clone()),
         Some(etcd_front::routes(front)),
+        t.cp.admission(),
         ConnLimits::default(),
         stopped,
     ));

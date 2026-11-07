@@ -352,6 +352,15 @@ impl TestCp {
         }
     }
 
+    /// Whom a gateway listener of this control plane admits past the
+    /// handshake, for a listener a test serves itself.
+    pub fn admission(&self) -> aisix_control_plane::dp::listener::Admission {
+        aisix_control_plane::dp::listener::Admission {
+            env: self.running.state.env.clone(),
+            creds: self.running.state.creds.clone(),
+        }
+    }
+
     /// A gateway's REST client for `bundle`, on this control plane's
     /// gateway listener.
     pub fn dp_client(&self, bundle: &Bundle) -> DpClient {

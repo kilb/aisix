@@ -277,6 +277,10 @@ where
                 state.creds.clone(),
                 state.env.clone(),
             ))),
+            dp::listener::Admission {
+                env: state.env.clone(),
+                creds: state.creds.clone(),
+            },
             dp_limits,
             stopping,
         )));

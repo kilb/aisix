@@ -33,7 +33,7 @@ use rustls_pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, Server
 use serde_json::{json, Value};
 use sqlx::{Connection, PgConnection};
 use support::{Bundle, DpClient, OperatorSession, TestCp};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use uuid::Uuid;
 use x509_parser::pem::parse_x509_pem;
 
@@ -547,22 +547,20 @@ async fn a_revoked_credential_is_refused_on_an_open_connection() {
         "the connection stayed open after the 403"
     );
 
-    // A new connection with it is refused too, and closed with its answer.
+    // A new connection with it is closed right after its handshake,
+    // unanswered.
     let gw = cp.dp_client(&bundle);
     let r = gw
-        .send("GET", "/dp/store/v1/mcp_oauth_token/k-7c1", None)
+        .try_send("GET", "/dp/store/v1/mcp_oauth_token/k-7c1", None)
         .await;
-    assert_eq!(r.status, 403, "{r:?}");
-    let closes = r
-        .headers
-        .get(reqwest::header::CONNECTION)
-        .and_then(|v| v.to_str().ok());
-    assert_eq!(closes, Some("close"), "{:?}", r.headers);
+    assert!(r.is_err(), "answered: {r:?}");
     // A refused beat records nothing.
     let mut refused_beat = bare_beat(&bundle.dp_id, &instance);
     refused_beat["applied_revision"] = json!(4242);
-    let r = gw.heartbeat(refused_beat).await;
-    assert_eq!(r.status, 403, "{r:?}");
+    let r = gw
+        .try_send("POST", "/dp/heartbeat", Some(refused_beat))
+        .await;
+    assert!(r.is_err(), "answered: {r:?}");
     let applied: i64 = sqlx::query_scalar("SELECT applied_revision FROM dp_instances")
         .fetch_one(cp.db().pool())
         .await
@@ -621,7 +619,7 @@ async fn a_certificate_from_another_ca_fails_the_handshake() {
 }
 
 #[tokio::test]
-async fn a_certificate_for_another_environment_is_403() {
+async fn a_certificate_for_another_environment_is_closed_unserved() {
     let Some(cp) = TestCp::start().await else {
         return;
     };
@@ -658,13 +656,14 @@ async fn a_certificate_for_another_environment_is_403() {
         &issued.key_pem,
         cp.state().pki.ca_pem(),
     );
+    // Its handshake completes, and its connection is closed unserved.
+    let beat = bare_beat(&dp_id.to_string(), &Uuid::new_v4().to_string());
+    let r = gw.try_send("POST", "/dp/heartbeat", Some(beat)).await;
+    assert!(r.is_err(), "answered: {r:?}");
     let r = gw
-        .heartbeat(bare_beat(&dp_id.to_string(), &Uuid::new_v4().to_string()))
+        .try_send("GET", "/dp/store/v1/mcp_oauth_token/k", None)
         .await;
-    assert_eq!(r.status, 403, "{r:?}");
-    assert_eq!(r.body["code"], "forbidden");
-    let r = gw.send("GET", "/dp/store/v1/mcp_oauth_token/k", None).await;
-    assert_eq!(r.status, 403, "{r:?}");
+    assert!(r.is_err(), "answered: {r:?}");
     assert!(instances(&cp, &admin).await.is_empty());
 }
 
@@ -1006,6 +1005,7 @@ async fn connections_are_dispatched_by_alpn_and_drained_on_shutdown() {
         tls,
         echo("rest"),
         Some(grpc_echo()),
+        cp.admission(),
         ConnLimits::default(),
         stopped,
     ));
@@ -1053,6 +1053,201 @@ async fn connections_are_dispatched_by_alpn_and_drained_on_shutdown() {
     }
 }
 
+/// Whether the listener closes `tls` within `wait`: end of stream or an
+/// error, past whatever it sent first (an h2 server's settings).
+async fn tls_closed_within(
+    tls: &mut tokio_rustls::client::TlsStream<tokio::net::TcpStream>,
+    wait: Duration,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + wait;
+    let mut buf = [0u8; 1024];
+    loop {
+        match tokio::time::timeout_at(deadline, tls.read(&mut buf)).await {
+            Err(_) => return false,
+            Ok(Ok(0) | Err(_)) => return true,
+            Ok(Ok(_)) => {}
+        }
+    }
+}
+
+/// A credential revoked before it expires still completes its TLS
+/// handshake, and its connection is closed right after it, before any
+/// request, on HTTP/1.1 and on h2 alike: by sending nothing it cannot hold
+/// a connection, and its slot, open. A listed credential's idle connection
+/// stays open.
+#[tokio::test]
+async fn a_revoked_credential_is_closed_right_after_its_handshake() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let (admin, bundle) = setup(&cp).await;
+    let tls = listener::server_tls(&cp.state().pki, &["localhost".to_string()], true)
+        .expect("the listener's TLS");
+    let tcp = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = tcp.local_addr().expect("an address");
+    let (_stop, stopped) = tokio::sync::watch::channel(false);
+    tokio::spawn(listener::serve_dp(
+        tcp,
+        tls,
+        echo("rest"),
+        Some(grpc_echo()),
+        cp.admission(),
+        ConnLimits::default(),
+        stopped,
+    ));
+    let protocols: [&[u8]; 2] = [b"http/1.1", b"h2"];
+    for alpn in protocols {
+        let mut tls = tls_connect(addr, pems(&bundle), &[alpn])
+            .await
+            .expect("the handshake");
+        assert!(
+            !tls_closed_within(&mut tls, Duration::from_secs(1)).await,
+            "{}: a listed credential's idle connection was closed",
+            String::from_utf8_lossy(alpn)
+        );
+    }
+
+    // Revoked, and known to be: a connection opened before is refused.
+    let mut open = DpConn::open(&cp, &bundle).await;
+    let r = cp
+        .send(
+            "POST",
+            &format!("/admin/gateways/credentials/{}/revoke", bundle.dp_id),
+            Some(admin.cookie()),
+            None,
+        )
+        .await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let beat = bare_beat(&bundle.dp_id, &Uuid::new_v4().to_string());
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while open.send("POST", "/dp/heartbeat", Some(&beat)).await.0 == 200 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "still accepted 5 s after the revoke"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    for alpn in protocols {
+        let mut tls = tls_connect(addr, pems(&bundle), &[alpn])
+            .await
+            .expect("the handshake still completes");
+        assert!(
+            tls_closed_within(&mut tls, Duration::from_secs(1)).await,
+            "{}: a revoked credential's connection stayed open",
+            String::from_utf8_lossy(alpn)
+        );
+    }
+}
+
+/// On shutdown an HTTP/1.1 request still in flight, its body stopped
+/// arriving, is given the drain deadline and then dropped, so the listener
+/// returns and the process can exit on SIGTERM.
+#[tokio::test]
+async fn shutdown_drops_an_http_1_1_request_still_in_flight_at_the_drain_deadline() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let (_, bundle) = setup(&cp).await;
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let rest = Router::new().route(
+        "/slow",
+        axum::routing::post({
+            let entered = entered.clone();
+            move |request: axum::extract::Request| async move {
+                entered.notify_one();
+                let _ = request.into_body().collect().await;
+                "done"
+            }
+        }),
+    );
+    let tls = listener::server_tls(&cp.state().pki, &["localhost".to_string()], false)
+        .expect("the listener's TLS");
+    let tcp = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = tcp.local_addr().expect("an address");
+    let (stop, stopped) = tokio::sync::watch::channel(false);
+    let drain = Duration::from_millis(300);
+    let served = tokio::spawn(listener::serve_dp(
+        tcp,
+        tls,
+        rest,
+        None,
+        cp.admission(),
+        ConnLimits {
+            drain_deadline: drain,
+            ..ConnLimits::default()
+        },
+        stopped,
+    ));
+    let mut tls = tls_connect(addr, pems(&bundle), &[b"http/1.1"])
+        .await
+        .expect("the handshake");
+    tls.write_all(b"POST /slow HTTP/1.1\r\nhost: localhost\r\ncontent-length: 100\r\n\r\npartial")
+        .await
+        .expect("send part of a request");
+    tls.flush().await.expect("flush");
+    tokio::time::timeout(Duration::from_secs(5), entered.notified())
+        .await
+        .expect("the request reaches its handler");
+
+    let stopping = tokio::time::Instant::now();
+    stop.send(true).expect("signal shutdown");
+    tokio::time::timeout(Duration::from_secs(5), served)
+        .await
+        .expect("the listener stops while a request is stuck")
+        .expect("the listener task");
+    assert!(
+        stopping.elapsed() >= drain,
+        "the request was dropped before its drain deadline"
+    );
+    assert!(tls_closed_within(&mut tls, Duration::from_secs(1)).await);
+}
+
+/// The listener's accepted sockets have TCP keepalive: an idle connection
+/// of the server's side runs the keepalive timer (`tr` 2 in
+/// `/proc/net/tcp`), so a gateway that vanished without closing is noticed.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn an_accepted_connection_has_tcp_keepalive() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let (_, bundle) = setup(&cp).await;
+    let (addr, _stop) = serve_echo(&cp, ConnLimits::default()).await;
+    let tls = tls_connect(addr, pems(&bundle), &[b"http/1.1"])
+        .await
+        .expect("the handshake");
+    let client = tls.get_ref().0.local_addr().expect("the client's address");
+    // The server's end: local is the listener's port, remote the client's.
+    let hex = |port: u16| format!("{port:04X}");
+    let (local, remote) = (hex(addr.port()), hex(client.port()));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let table = std::fs::read_to_string("/proc/net/tcp").expect("read /proc/net/tcp");
+        let timer = table.lines().find_map(|line| {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            let port = |field: &str| field.rsplit(':').next().map(str::to_string);
+            (fields.len() > 5
+                && port(fields[1]).as_deref() == Some(local.as_str())
+                && port(fields[2]).as_deref() == Some(remote.as_str()))
+            .then(|| fields[5].split(':').next().unwrap_or("").to_string())
+        });
+        if timer.as_deref() == Some("02") {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the server's end of the connection runs no keepalive timer: {timer:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    drop(tls);
+}
+
 /// A `serve_dp` on the control plane's own TLS configuration, `echo("rest")`
 /// behind it, with `limits`: its address, and the sender that stops it.
 async fn serve_echo(
@@ -1071,6 +1266,7 @@ async fn serve_echo(
         tls,
         echo("rest"),
         None,
+        cp.admission(),
         limits,
         stopped,
     ));
@@ -1827,6 +2023,7 @@ fn the_listener_caps_512_handshakes_4096_connections_and_5_s() {
             pending_handshakes: 512,
             connections: 4096,
             handshake_timeout: Duration::from_secs(5),
+            drain_deadline: Duration::from_secs(5),
         }
     );
 }
