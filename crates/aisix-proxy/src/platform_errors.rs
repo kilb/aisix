@@ -78,11 +78,16 @@ impl PlatformErrorClass {
         }
     }
 
-    /// `error.code`, the same in every envelope and stream frame.
+    /// `error.code`, the same in every envelope and stream frame. The
+    /// rate-limit code is the one OpenAI documents
+    /// (<https://platform.openai.com/docs/guides/error-codes>, and
+    /// `rate_limit_exceeded` in openai-python 3.41.0
+    /// `types/responses/response_error.py:49`), which the gateway's own
+    /// `429`s carry too.
     pub(crate) fn code(&self) -> &'static str {
         match self {
             Self::ContextLengthExceeded => "context_length_exceeded",
-            Self::RateLimited => "rate_limited",
+            Self::RateLimited => "rate_limit_exceeded",
             Self::InvalidRequest { .. } => "invalid_request",
             Self::ContentFiltered => "content_filter",
             Self::Authentication => "invalid_api_key",
@@ -709,7 +714,7 @@ mod tests {
                 PlatformErrorClass::RateLimited,
                 429,
                 "rate_limit_error",
-                "rate_limited",
+                "rate_limit_exceeded",
                 "Rate limit exceeded. Retry later.",
             ),
             (
@@ -1146,7 +1151,7 @@ mod tests {
         assert_eq!(limited.headers()["retry-after"], "7");
         let text = body_json(limited).await.to_string();
         assert!(
-            text.contains("\"rate_limited\"") && !text.contains("Anthropic"),
+            text.contains("\"rate_limit_exceeded\"") && !text.contains("Anthropic"),
             "{text}"
         );
     }
@@ -1236,7 +1241,7 @@ mod tests {
         assert_eq!(relayed_anthropic_error(Some(&event)), None);
         let frame = in_platform_mode(|| relayed_anthropic_error(Some(&event))).unwrap();
         assert!(
-            frame.contains("\"rate_limited\"") && !frame.contains("Anthropic"),
+            frame.contains("\"rate_limit_exceeded\"") && !frame.contains("Anthropic"),
             "{frame}"
         );
         // A frame that did not parse still leaves nothing of the upstream's.

@@ -344,7 +344,7 @@ const UNAVAILABLE: Expected = {
 };
 const RATE_LIMITED: Expected = {
   status: 429,
-  code: "rate_limited",
+  code: "rate_limit_exceeded",
   openaiType: "rate_limit_error",
   anthropicType: "rate_limit_error",
   message: "Rate limit exceeded. Retry later.",
