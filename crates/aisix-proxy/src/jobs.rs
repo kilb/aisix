@@ -2877,6 +2877,13 @@ fn prepare_batch_attribution(
     })
 }
 
+/// How many batch attributions download their output file at once
+/// ([`crate::state::ProxyStateInner::batch_attribution_permits`]). A listing
+/// after a restart can name a page of batches that ended earlier, and each
+/// one's output is read whole: unbounded, one `GET /v1/batches` would start
+/// that many downloads together.
+pub(crate) const BATCH_ATTRIBUTION_DOWNLOADS: usize = 4;
+
 /// 请求路径上观察到批次结束：归因放到后台去，这次应答不等它。
 fn maybe_attribute_batch(
     state: &ProxyState,
@@ -2891,6 +2898,8 @@ fn maybe_attribute_batch(
         return;
     };
     tokio::spawn(async move {
+        // Never closed, so a permit always comes.
+        let _permit = job.state.batch_attribution_permits.acquire().await;
         if let Err(e) = attribute_batch_usage(&job).await {
             // Release the guard so a later retrieve can retry the download.
             job.state.billed_batches.remove(&job.raw_batch_id);
@@ -4810,6 +4819,84 @@ mod tests {
             spend_series(&state).await.is_empty(),
             "a batch a previous process may have credited is credited again"
         );
+    }
+
+    /// A listing after a restart can name a page of batches that ended
+    /// earlier, and each one's output file is read whole: the downloads go
+    /// out at most [`BATCH_ATTRIBUTION_DOWNLOADS`] at a time, not all
+    /// together, and every one still emits its row.
+    #[tokio::test]
+    async fn a_listing_downloads_a_few_outputs_at_a_time() {
+        const LISTED: usize = 12;
+        let upstream = MockServer::builder().start().await;
+        let line = serde_json::json!({
+            "id": "batch_req_1",
+            "response": {"status_code": 200, "body": {
+                "model": "gpt-4o",
+                "usage": {"prompt_tokens": 10, "completion_tokens": 10}
+            }}
+        });
+        let batches: Vec<Value> = (0..LISTED)
+            .map(|i| {
+                serde_json::json!({
+                    "id": format!("batch_page_{i}"),
+                    "status": "completed",
+                    "completed_at": 1_000_000_000,
+                    "output_file_id": format!("file-page-{i}"),
+                    "metadata": {BATCH_SUBMITTER_KEY: "k-1", BATCH_MODEL_KEY: "jobs-a"}
+                })
+            })
+            .collect();
+        for i in 0..LISTED {
+            Mock::given(wm_method("GET"))
+                .and(path(format!("/v1/files/file-page-{i}/content")))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_raw(format!("{line}\n"), "application/jsonl")
+                        .set_delay(Duration::from_millis(600)),
+                )
+                .mount(&upstream)
+                .await;
+        }
+        Mock::given(wm_method("GET"))
+            .and(path("/v1/batches"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "object": "list",
+                "data": batches,
+            })))
+            .mount(&upstream)
+            .await;
+        let (app, mut rx, _state) = build_app_with_sink_and_state(ended_batch_snapshot(&upstream));
+        let resp = app
+            .oneshot(get_as("/v1/batches?model=jobs-a".to_string(), "sk-other"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let downloads = || async {
+            upstream
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .iter()
+                .filter(|r| r.url.path().ends_with("/content"))
+                .count()
+        };
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let in_the_first_wait = downloads().await;
+        assert!(
+            (1..=BATCH_ATTRIBUTION_DOWNLOADS).contains(&in_the_first_wait),
+            "{in_the_first_wait} downloads started together"
+        );
+        let mut rows = 0;
+        while rows < LISTED {
+            match tokio::time::timeout(Duration::from_secs(10), rx.recv()).await {
+                Ok(Some(ev)) if ev.inbound_protocol == "batch" => rows += 1,
+                Ok(Some(_)) => {}
+                _ => panic!("{rows} of {LISTED} batch rows emitted"),
+            }
+        }
+        assert_eq!(downloads().await, LISTED);
     }
 
     /// 调用方压根不读批次也要入账：结果可以按 `output_file_id` 直接下，而上游照样
