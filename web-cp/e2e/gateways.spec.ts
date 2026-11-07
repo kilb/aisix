@@ -48,6 +48,11 @@ test("栈里的托管网关在线，并报告已应用的修订号", async ({ pa
   await loginAsAdmin(page);
   await openTab(page, "网关");
   await expect(page.getByRole("row", { name: /stack-gw/ })).toContainText("在线");
+  // The revision it reports, in the column of that name.
+  const headers = await page.getByRole("table").getByRole("columnheader").allTextContents();
+  const col = headers.findIndex((h) => h.trim() === "已应用修订");
+  expect(col, headers.join(" | ")).toBeGreaterThanOrEqual(0);
+  await expect(page.getByRole("row", { name: /stack-gw/ }).getByRole("cell").nth(col)).toHaveText(/^\d+$/);
 });
 
 test("签发凭据：部署包只显示一次，含镜像启动与平台模式变量，不含 etcd 用户", async ({ page }) => {

@@ -44,6 +44,7 @@ export function Gateways({ operator }: TabProps) {
   const [credentials, setCredentials] = useState<Credential[] | null>(null);
   const [credentialsError, setCredentialsError] = useState<string | null>(null);
   const [note, setNote] = useState<Note | null>(null);
+  const [busy, setBusy] = useState(false);
   // Held in this component's state only: it is gone when the tab is left or
   // the page reloads, and is never written to storage, the URL or a log.
   const [bundle, setBundle] = useState<IssuedCredential | null>(null);
@@ -83,6 +84,7 @@ export function Gateways({ operator }: TabProps) {
     if (!confirm(`确认吊销网关凭据「${c.name}」？使用这份凭据的网关将被控制面拒绝连接，且无法恢复。`)) {
       return;
     }
+    setBusy(true);
     setNote(null);
     try {
       const view = await gateways.revoke(c.dp_id);
@@ -90,6 +92,8 @@ export function Gateways({ operator }: TabProps) {
       setNote({ kind: "ok", text: `已吊销「${view.name}」。` });
     } catch (e) {
       setNote({ kind: "crit", text: errorText(e) });
+    } finally {
+      setBusy(false);
     }
   }
 
@@ -188,7 +192,7 @@ export function Gateways({ operator }: TabProps) {
                   <span className="pill">未吊销</span>
                 )}
                 {isAdmin && !c.revoked_at && (
-                  <button className="ghost" onClick={() => void revoke(c)}>
+                  <button className="ghost" disabled={busy} onClick={() => void revoke(c)}>
                     吊销
                   </button>
                 )}

@@ -150,15 +150,18 @@ export function Overview({ operator, onGoto }: TabProps) {
               持有该环境的数据库 <code>{blocked.owner_database_id ?? "未知"}</code>
               ，本控制面的数据库 <code>{blocked.database_id}</code>。
             </p>
-            {isAdmin && blocked.owner_database_id && (
-              <button
-                className="ghost"
-                disabled={busy}
-                onClick={() => void takeOver(blocked.owner_database_id!, blocked.database_id)}
-              >
-                接管该环境
-              </button>
-            )}
+            {isAdmin &&
+              (blocked.owner_database_id ? (
+                <button
+                  className="ghost"
+                  disabled={busy}
+                  onClick={() => void takeOver(blocked.owner_database_id!, blocked.database_id)}
+                >
+                  接管该环境
+                </button>
+              ) : (
+                <p className="hint">kine 中没有记录持有该环境的数据库，暂时无法接管。</p>
+              ))}
           </div>
         )}
 
@@ -170,7 +173,7 @@ export function Overview({ operator, onGoto }: TabProps) {
                 停在 <code>{s.projection_stalled.kind}</code> <code>{s.projection_stalled.id}</code>
               </p>
             )}
-            <p>{s.projection_stalled.error}</p>
+            <p>{s.projection_stalled.error ?? "未知错误"}</p>
           </div>
         )}
 

@@ -253,7 +253,7 @@ export interface RolloutSummary {
   partially_compatible: { instance_id: string; kind: string; field: string; count: number }[];
   unsafe: { instance_id: string; hostname: string; kind: string; field: string }[];
   /** `kind` and `id` are null when projection stopped at no document (kine unreachable). */
-  projection_stalled: { kind: string | null; id: string | null; error: string } | null;
+  projection_stalled: { kind: string | null; id: string | null; error: string | null } | null;
   /** The owner is null when kine holds no claim and this database may not create one. */
   projection_blocked: { owner_database_id: string | null; database_id: string } | null;
   instance_cap_hit_at: string | null;
