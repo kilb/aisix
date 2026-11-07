@@ -511,3 +511,21 @@ tr:hover td button.ghost{border-color:var(--rule-2);color:var(--oxide)}
 .sub{color:var(--ink-3);font-size:12px}
 .target{border-top:1px solid var(--rule);padding:14px 0 2px}
 .target .sub{margin:8px 0 0}
+/* The JSON editor: a document refused at save time is outlined, and each
+   problem names its path in a highlight under it. */
+.json-editor textarea[aria-invalid="true"]{border-color:var(--oxide)}
+.json-editor > .r{margin-top:8px}
+.json-problems{margin:10px 0 0;padding:0 0 0 18px;font-size:13px;color:var(--oxide)}
+.json-problems li{margin:3px 0}
+.json-path{
+  font-family:var(--mono);font-size:12px;padding:1px 5px;
+  background:var(--oxide-wash);color:var(--oxide);border-radius:2px;
+}
+/* A form field the server refused, or that must be filled, with its reason under it. */
+.f input[aria-invalid="true"],.f select[aria-invalid="true"]{border-color:var(--oxide)}
+.field-problem{margin:-9px 0 15px;font-size:12.5px;color:var(--oxide)}
+/* An audit row's detail: each field's name, then its value. */
+.audit-detail{display:flex;flex-wrap:wrap;gap:4px 12px}
+.audit-field{overflow-wrap:anywhere}
+/* A role picker inside a table row takes only the room it needs. */
+td select{width:auto}

@@ -852,6 +852,7 @@ jobs:
           CP_E2E_PG_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres
         run: |
           npm ci
+          npm run test:unit
           npx playwright install --with-deps chromium
           npm run build
           npx playwright test

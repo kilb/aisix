@@ -11,10 +11,13 @@ export function Gate({
   onIn,
   theme,
   onToggleTheme,
+  notice,
 }: {
   onIn: (operator: Operator) => void;
   theme: Theme;
   onToggleTheme: () => void;
+  /** Why the gate is shown again, such as a session that ended mid-use. */
+  notice?: string | null;
 }) {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
@@ -54,6 +57,11 @@ export function Gate({
       </div>
 
       <form className="gate-form panel" onSubmit={submit}>
+        {notice && (
+          <div className="note warn" role="status">
+            {notice}
+          </div>
+        )}
         <label className="f">
           <span>邮箱</span>
           <input

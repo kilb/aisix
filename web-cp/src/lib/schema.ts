@@ -127,3 +127,21 @@ export function defaultAt(schema: JsonSchema, pointer: string): unknown {
   }
   return undefined;
 }
+
+/**
+ * The description of each value at `pointer` that the schema describes on
+ * its own: a schema it stands for that allows exactly that one value and
+ * carries a description, such as each single-value member of a `oneOf`.
+ * Values without one are left out.
+ */
+export function valueDescriptionsAt(schema: JsonSchema, pointer: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const n of expand(schema, nodeAt(schema, pointer), pointer)) {
+    const own = Array.isArray(n.enum) ? n.enum : "const" in n ? [n.const] : [];
+    const [only] = own;
+    if (own.length === 1 && typeof only === "string" && typeof n.description === "string" && !(only in out)) {
+      out[only] = n.description;
+    }
+  }
+  return out;
+}

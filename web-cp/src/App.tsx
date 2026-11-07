@@ -1,14 +1,19 @@
 import { useCallback, useEffect, useState } from "react";
-import { ApiError, logout, session, type Operator, type OperatorRole } from "./lib/api";
+import { ApiError, logout, onSessionEnded, session, type Operator, type OperatorRole } from "./lib/api";
 import { EXPECTED_API_CONTRACT } from "./lib/contract";
 import { messageFor } from "./lib/errors";
 import { useTheme } from "./lib/useTheme";
+import { ChangePassword } from "./components/ChangePassword";
 import { Gate } from "./Gate";
+import { Audit } from "./tabs/Audit";
+import { Cache } from "./tabs/Cache";
 import { Gateways } from "./tabs/Gateways";
 import { Keys } from "./tabs/Keys";
 import { Models } from "./tabs/Models";
+import { Operators } from "./tabs/Operators";
 import { Overview } from "./tabs/Overview";
 import { Providers } from "./tabs/Providers";
+import { Resources } from "./tabs/Resources";
 import { Tenants } from "./tabs/Tenants";
 
 const TABS = [
@@ -65,6 +70,14 @@ function Page({ tab, ...props }: TabProps & { tab: TabId }) {
       return <Tenants {...props} />;
     case "keys":
       return <Keys {...props} />;
+    case "cache":
+      return <Cache {...props} />;
+    case "resources":
+      return <Resources {...props} />;
+    case "operators":
+      return <Operators {...props} />;
+    case "audit":
+      return <Audit {...props} />;
     default:
       return <NotBuilt label={TABS.find((t) => t.id === tab)?.label ?? tab} />;
   }
@@ -78,6 +91,8 @@ export function App() {
   const [bootError, setBootError] = useState<string | null>(null);
   const [signOutError, setSignOutError] = useState<string | null>(null);
   const [tab, setTab] = useState<TabId>("overview");
+  const [sessionEnded, setSessionEnded] = useState(false);
+  const [passwordOpen, setPasswordOpen] = useState(false);
   const [theme, toggleTheme] = useTheme();
 
   const boot = useCallback(async () => {
@@ -95,9 +110,23 @@ export function App() {
     void boot();
   }, [boot]);
 
+  // Any request that finds the session gone, on any page, drops back to the
+  // gate. Only while signed in: a request still in flight when the operator
+  // signed out must not report their own sign-out as an expiry.
+  useEffect(() => {
+    if (!operator) return;
+    return onSessionEnded(() => {
+      setOperator(null);
+      setPasswordOpen(false);
+      setSessionEnded(true);
+    });
+  }, [operator]);
+
   const signIn = useCallback((op: Operator) => {
     setOperator(op);
     setSignOutError(null);
+    setSessionEnded(false);
+    setPasswordOpen(false);
     setTab("overview");
   }, []);
 
@@ -154,7 +183,16 @@ export function App() {
     );
   }
 
-  if (!operator) return <Gate onIn={signIn} theme={theme} onToggleTheme={toggleTheme} />;
+  if (!operator) {
+    return (
+      <Gate
+        onIn={signIn}
+        theme={theme}
+        onToggleTheme={toggleTheme}
+        notice={sessionEnded ? "登录已过期，请重新登录。" : null}
+      />
+    );
+  }
 
   const visible = TABS.filter((t) => !("adminOnly" in t) || operator.role === "admin");
   const current: TabId = visible.some((t) => t.id === tab) ? tab : "overview";
@@ -178,11 +216,16 @@ export function App() {
           >
             {theme === "dark" ? "浅色" : "深色"}
           </button>
+          <button className="ghost" aria-expanded={passwordOpen} onClick={() => setPasswordOpen((o) => !o)}>
+            修改口令
+          </button>
           <button className="ghost" onClick={() => void signOut()}>
             登出
           </button>
         </div>
       </header>
+
+      {passwordOpen && <ChangePassword onClose={() => setPasswordOpen(false)} />}
 
       {signOutError && (
         <div className="note crit" role="alert">
