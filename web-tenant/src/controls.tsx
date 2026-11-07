@@ -1,6 +1,5 @@
 import { useEffect, useState, type ReactNode } from "react";
 import { Button } from "./ui/Button";
-import { Icon } from "./ui/Icon";
 import { useToast } from "./ui/Toast";
 
 /** How long the copy button reads 已复制. */
@@ -44,7 +43,8 @@ export function ShownOnce({
       await navigator.clipboard.writeText(value);
       setCopied(true);
       setFlash(true);
-      toast("已复制");
+      // The status beside the buttons says it to assistive technology already.
+      toast("已复制", { announce: false });
     } catch {
       // No clipboard (an insecure context, a denied permission): the value
       // is still there to select by hand.
@@ -58,15 +58,14 @@ export function ShownOnce({
       <input readOnly value={value} aria-label={title} onFocus={(e) => e.currentTarget.select()} />
       {children}
       <span className="secret-acts">
-        <Button size="sm" onClick={() => void copy()}>
-          <Icon name={flash ? "check" : "copy"} />
+        <Button size="sm" icon={flash ? "check" : "copy"} onClick={() => void copy()}>
           {flash ? "已复制" : "复制"}
         </Button>
         <Button size="sm" onClick={onDone}>
           我已保存
         </Button>
         {copied !== null && (
-          <span className={copied ? "vh" : "field-err"} role="status">
+          <span className={copied ? "vh" : "field-problem"} role="status">
             {copied ? "已复制" : "无法写入剪贴板，请手动选中复制"}
           </span>
         )}

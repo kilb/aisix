@@ -13,13 +13,13 @@ const DONE_MS = 1_500;
 export function CopyButton({
   text,
   label = "复制",
-  size = "md",
+  size,
   kind = "secondary",
   onFailed,
 }: {
   text: string;
   label?: string;
-  size?: "md" | "sm";
+  size?: "sm";
   kind?: "primary" | "secondary";
   onFailed: () => void;
 }) {

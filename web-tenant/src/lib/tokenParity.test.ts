@@ -23,3 +23,24 @@ test("门户与运维台的基础样式逐字节一致", () => {
   const [mine, cp] = both("theme/base.css");
   assert.ok(mine.equals(cp));
 });
+
+// The shared components and their contract: one set of props, states and
+// class names in both apps (web-cp/src/ui/CONTRACT.md).
+const SHARED_UI = [
+  "CONTRACT.md",
+  "Button.tsx",
+  "Field.tsx",
+  "Toast.tsx",
+  "TwoStep.tsx",
+  "Lamp.tsx",
+  "EmptyState.tsx",
+  "DataTable.tsx",
+  "Icon.tsx",
+];
+
+for (const file of SHARED_UI) {
+  test(`门户与运维台的共享组件 ${file} 逐字节一致`, () => {
+    const [mine, cp] = both(`ui/${file}`);
+    assert.ok(mine.equals(cp));
+  });
+}

@@ -286,7 +286,7 @@ export default function Styleguide() {
           <TwoStep label="停用" size="sm" onConfirm={() => toast("已停用")} />
         </Fig>
         <Fig caption="第二步：确认才是红色">
-          <span className="two-step-confirm">
+          <span className="two-step is-asking">
             <Button kind="danger" size="sm" tabIndex={-1}>
               确认停用
             </Button>
@@ -295,7 +295,20 @@ export default function Styleguide() {
             </Button>
           </span>
         </Fig>
-        <Fig caption="带说明的两步确认">
+        <Fig caption="带说明的两步确认：说明在按钮下方">
+          <span className="two-step is-asking">
+            <Button kind="danger" size="sm" tabIndex={-1}>
+              确认吊销
+            </Button>
+            <Button size="sm" tabIndex={-1}>
+              取消
+            </Button>
+            <span className="two-step-warn" role="presentation">
+              吊销后该密钥永久失效，不能恢复。
+            </span>
+          </span>
+        </Fig>
+        <Fig caption="带说明的两步确认，可点击">
           <TwoStep label="吊销" size="sm" warning="吊销后该密钥永久失效，不能恢复。" onConfirm={() => toast("已吊销")} />
         </Fig>
       </Row>

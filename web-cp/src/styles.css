@@ -415,6 +415,10 @@ code.lab {
 .creds li > .two-step {
   justify-content: flex-end;
 }
+.creds li > .two-step .two-step-warn {
+  justify-self: end;
+  text-align: right;
+}
 
 .bundle h3 {
   margin: var(--s-4) 0 var(--s-2);

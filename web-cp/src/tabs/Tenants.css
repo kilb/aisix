@@ -23,15 +23,11 @@
 td > .tn-actions {
   flex-wrap: nowrap;
 }
-/* A confirmation's warning takes a line of its own above the buttons. */
-.tn-actions > .note,
-.tn-actions .two-step > .note {
+/* A note among the actions takes a line of its own above the buttons. */
+.tn-actions > .note {
   flex-basis: 100%;
   margin: 0;
   white-space: normal;
-}
-td .two-step > .note {
-  max-width: 360px;
 }
 
 /* The facts under a tenant's name. */

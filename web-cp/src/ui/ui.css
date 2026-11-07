@@ -57,6 +57,9 @@
   height: var(--h-control-sm);
   padding: 0 var(--s-3);
 }
+.btn-block {
+  width: 100%;
+}
 .btn-icon {
   width: var(--h-control);
   padding: 0;
@@ -127,13 +130,16 @@
   outline-offset: 2px;
 }
 
-/* Loading: a spinner takes the label's place and the button keeps its
-   width. The label stays in the DOM, so the accessible name does not move. */
-.btn.is-busy {
-  color: transparent;
+/* Busy: a spinner takes the label's place, and the label keeps its place
+   (and so the width) underneath it, hidden; the name is the busy label. */
+.btn.is-busy:disabled {
+  opacity: 1;
   cursor: progress;
 }
-.btn.is-busy > * {
+.btn-label {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--s-2);
   visibility: hidden;
 }
 .btn.is-busy::after {
@@ -154,7 +160,8 @@
   }
 }
 
-/* A disabled action whose reason is not on screen keeps it in a tooltip. */
+/* A disabled action whose reason is not on screen keeps it in a tooltip,
+   on hover and on keyboard focus. */
 .has-tip {
   position: relative;
   display: inline-flex;
@@ -166,8 +173,10 @@
   right: 0;
   display: flex;
   align-items: center;
+  width: max-content;
+  max-width: min(320px, 90vw);
   min-height: var(--h-control-sm);
-  padding: 6px var(--s-3);
+  padding: var(--s-1) var(--s-3);
   border-radius: var(--r-button);
   background: var(--tooltip-bg);
   color: var(--tooltip-text);
@@ -175,7 +184,7 @@
   font-size: var(--fs-13);
   font-weight: 400;
   line-height: var(--lh-table);
-  white-space: nowrap;
+  white-space: normal;
   opacity: 0;
   visibility: hidden;
   pointer-events: none;
@@ -267,6 +276,13 @@
 }
 .field > .f + .field-problem {
   margin: var(--s-2) 0 0;
+}
+/* A field's hint, between its control and its refusal. */
+.field > .hint {
+  margin: var(--s-2) 0 0;
+  color: var(--text-muted);
+  font-size: var(--fs-13);
+  line-height: var(--lh-table);
 }
 
 input:not([type="checkbox"], [type="radio"], [type="range"], [type="color"], [type="file"]),
@@ -604,7 +620,7 @@ label:hover > :is(input[type="checkbox"], input[type="radio"]):checked:not(:disa
   vertical-align: middle;
   white-space: nowrap;
 }
-.dt td :is(.cell-note, .tn-note, .tn-flag, .tn-error, .rollout-errors, .audit-detail, .note, .tn-override) {
+.dt td :is(.cell-note, .tn-note, .tn-flag, .tn-error, .rollout-errors, .audit-detail, .note, .tn-override, .two-step-warn) {
   white-space: normal;
 }
 .dt td :is(.cell-note, .tn-note, .tn-flag, .tn-error) {
@@ -657,7 +673,9 @@ label:hover > :is(input[type="checkbox"], input[type="radio"]):checked:not(:disa
 .dt tr:has(+ tr.dt-detail) > td {
   border-bottom: 0;
 }
-/* Secondary text inside a cell: a second line in 13px. */
+/* Secondary text inside a cell: a second line in 13px. Its 2px gap is the
+   one step off the 4px grid, kept so a row with a note stays 56px; the
+   tenant list's notes (Tenants.css) take the same exception. */
 .dt .cell-note {
   display: block;
   margin-top: 2px;
@@ -697,7 +715,7 @@ label:hover > :is(input[type="checkbox"], input[type="radio"]):checked:not(:disa
   --dt-edge: 0px;
 }
 
-/* A list loading: three rows of skeleton beside the status text. */
+/* A list loading: three rows of skeleton, and the status text hidden. */
 .loading {
   margin: var(--s-4) 0 0;
 }
@@ -719,11 +737,6 @@ label:hover > :is(input[type="checkbox"], input[type="radio"]):checked:not(:disa
   border-radius: var(--r-input);
   background: var(--skeleton);
 }
-.loading > p {
-  margin-top: var(--s-3);
-  color: var(--text-muted);
-  font-size: var(--fs-13);
-}
 
 /* ── Empty states: a mark, one sentence, one action ──────────── */
 .empty {
@@ -741,23 +754,43 @@ label:hover > :is(input[type="checkbox"], input[type="radio"]):checked:not(:disa
   color: var(--text-muted);
 }
 
-/* ── The two-step confirm: the swap crossfades in place ───────── */
+/* ── The two-step confirm, swapped in place ───────────────────── */
+/* The second step: the two buttons, then the warning on a line under
+   them, so a row's actions widen by the warning's length at most. The
+   swap fades in while the box eases to its new width (TwoStep.tsx). */
 .two-step {
   display: inline-flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: var(--s-2);
   vertical-align: middle;
 }
-.two-step-confirm {
-  display: inline-flex;
+.two-step.is-asking {
+  display: inline-grid;
+  grid-template-columns: auto auto;
+  justify-content: start;
   align-items: center;
-  gap: var(--s-2);
-  animation: ui-fade var(--t-fast) ease-out both;
+  gap: var(--s-1) var(--s-2);
 }
-.two-step > .note {
-  flex-basis: 100%;
-  margin: 0;
+.two-step.is-swapping {
+  overflow: clip;
+  overflow-clip-margin: 4px;
+}
+.two-step-warn {
+  grid-row: 2;
+  grid-column: 1 / -1;
+  max-width: 44ch;
+  color: var(--text-2);
+  font-size: var(--fs-13);
+  line-height: var(--lh-table);
+  white-space: normal;
+}
+/* In a row's actions column, against the column's right edge. */
+.right .two-step.is-asking {
+  justify-content: end;
+}
+.right .two-step-warn {
+  justify-self: end;
+  text-align: right;
+}
+.is-in {
   animation: ui-fade var(--t-fast) ease-out both;
 }
 @keyframes ui-fade {
@@ -798,7 +831,7 @@ label:hover > :is(input[type="checkbox"], input[type="radio"]):checked:not(:disa
   width: 8px;
   height: 8px;
   border-radius: 50%;
-  background: #2FB88A;
+  background: var(--lamp-applied);
 }
 .toast.is-leaving {
   opacity: 0;

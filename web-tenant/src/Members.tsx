@@ -12,11 +12,11 @@ import {
 import { formMessageFor, messageFor } from "./lib/errors";
 import { ShownOnce } from "./controls";
 import { Button } from "./ui/Button";
-import { ConfirmButton } from "./ui/ConfirmButton";
-import { DataTable, ListLoading } from "./ui/DataTable";
+import { DataTable, Loading } from "./ui/DataTable";
 import { EmptyState } from "./ui/EmptyState";
 import { Field } from "./ui/Field";
 import { Lamp } from "./ui/Lamp";
+import { TwoStep } from "./ui/TwoStep";
 import { when } from "./Keys";
 import { ROLE_LABEL } from "./Org";
 
@@ -162,7 +162,7 @@ export function Members({
           )}
         </div>
         {people === null ? (
-          !listErr && <ListLoading />
+          !listErr && <Loading />
         ) : (
           <DataTable>
             <thead>
@@ -241,10 +241,11 @@ export function Members({
                     <td>
                       <Lamp state={m.disabled ? "disabled" : "applied"}>{m.disabled ? "已被平台停用" : "正常"}</Lamp>
                     </td>
-                    <td className="r">
+                    <td className="right">
                       {manages(m) && (
-                        <ConfirmButton
+                        <TwoStep
                           label="移除"
+                          size="sm"
                           warning="该成员的所有密钥会被吊销"
                           disabled={busy === m.id}
                           onConfirm={() => void act(m.id, () => memberApi.remove(m.id), self ? onLeft : undefined)}
@@ -272,7 +273,7 @@ export function Members({
             )}
           </div>
           {invites === null ? (
-            !invitesErr && <ListLoading />
+            !invitesErr && <Loading />
           ) : invites.length === 0 ? (
             <EmptyState mark="mail" text="没有待接受的邀请。" />
           ) : (
@@ -304,8 +305,8 @@ export function Members({
                           {by}
                         </span>
                       </td>
-                      <td className="num">{when(inv.expires_at)}</td>
-                      <td className="r">
+                      <td className="tabular">{when(inv.expires_at)}</td>
+                      <td className="right">
                         {(isOwner || inv.role !== "owner") && (
                           <Button
                             size="sm"

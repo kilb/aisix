@@ -1,4 +1,4 @@
-import { useEffect, useId, useState, type ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import {
   ApiError,
   MIN_PASSWORD_CHARS,
@@ -107,7 +107,6 @@ function PasswordForm() {
   const [next, setNext] = useState("");
   const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null);
   const [busy, setBusy] = useState(false);
-  const hintId = useId();
 
   async function submit(e: React.FormEvent) {
     e.preventDefault();
@@ -148,15 +147,17 @@ function PasswordForm() {
             onChange={(e) => setCurrent(e.target.value)}
           />
         </Field>
-        <Field label="新口令" hint={<>至少 {MIN_PASSWORD_CHARS} 个字符</>} hintId={hintId}>
-          <input
-            type="password"
-            autoComplete="new-password"
-            required
-            value={next}
-            onChange={(e) => setNext(e.target.value)}
-            aria-describedby={hintId}
-          />
+        <Field label="新口令" hint={<>至少 {MIN_PASSWORD_CHARS} 个字符</>}>
+          {(aria) => (
+            <input
+              type="password"
+              autoComplete="new-password"
+              required
+              value={next}
+              onChange={(e) => setNext(e.target.value)}
+              {...aria}
+            />
+          )}
         </Field>
         <div className="form-actions">
           <Button kind="primary" type="submit" busy={busy}>

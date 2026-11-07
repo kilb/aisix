@@ -1,18 +1,33 @@
-import { useEffect, useRef, useState, type ReactNode } from "react";
+// Shared: web-cp/src/ui and web-tenant/src/ui carry byte-equal copies of
+// this file, pinned by web-tenant/src/lib/tokenParity.test.ts; change both
+// together. The contract is in CONTRACT.md beside it.
+import { useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { Button } from "./Button";
 
+const SWAP_MS = 120;
+
 /**
- * A destructive action in two steps (ruling P1b-R6): the first click swaps
- * the button, in place, for `确认<label>` in Stop red and `取消`, under
- * `warning`, and only the confirmation acts. `ask` decides, at each first
- * click, whether to ask at all. `kind` styles the first step only.
+ * A destructive action in two steps, in place (ruling P1b-R6): the first
+ * click swaps the button for `确认<label>` in Stop red and `取消`, with
+ * `warning` on a line under them, and only the confirmation acts. Never
+ * `window.confirm`, which leaves the page's own flow.
+ *
+ * `ask` decides, at each first click, whether to ask at all; when it says
+ * no, the first click acts. `kind` styles the first step only.
+ *
+ * The swap fades the new step in while the box eases from the old width
+ * to the new one, over 120ms. Focus that was on the swapped control moves
+ * to the safe choice, `取消`, when the step opens, so a second Enter takes
+ * it back rather than acting, and back to the action when it closes.
+ * Escape takes the step back too, and not the panel around it. The
+ * warning is an `alert`, so it is heard when the step opens.
  */
 export function TwoStep({
   label,
   onConfirm,
-  disabled,
+  disabled = false,
   kind = "secondary",
-  size = "md",
+  size,
   ask = () => true,
   warning,
 }: {
@@ -20,73 +35,85 @@ export function TwoStep({
   onConfirm: () => void;
   disabled?: boolean;
   kind?: "primary" | "secondary";
-  size?: "md" | "sm";
+  size?: "sm";
   ask?: () => boolean;
   warning?: ReactNode;
 }) {
   const [asking, setAsking] = useState(false);
-  const cancelRef = useRef<HTMLButtonElement>(null);
-  const firstRef = useRef<HTMLButtonElement>(null);
-  // Focus follows the swap, so the keyboard stays on the action: onto the
-  // safe choice, 取消, when the step opens, so a second Enter takes it back
-  // instead of acting; back onto the action when it closes.
-  const moved = useRef(false);
-  useEffect(() => {
-    if (!moved.current) return;
-    (asking ? cancelRef : firstRef).current?.focus();
+  const [swapped, setSwapped] = useState(false);
+  const box = useRef<HTMLSpanElement>(null);
+  const first = useRef<HTMLButtonElement>(null);
+  const cancel = useRef<HTMLButtonElement>(null);
+  /** The box's width and whether it held focus, just before a swap. */
+  const before = useRef<{ width: number; focused: boolean } | null>(null);
+
+  function swap(next: boolean) {
+    const el = box.current;
+    before.current = el ? { width: el.getBoundingClientRect().width, focused: el.contains(document.activeElement) } : null;
+    setSwapped(true);
+    setAsking(next);
+  }
+
+  useLayoutEffect(() => {
+    const el = box.current;
+    const from = before.current;
+    before.current = null;
+    if (!el || !from) return;
+    if (from.focused) (asking ? cancel : first).current?.focus();
+    const to = el.getBoundingClientRect().width;
+    if (to === from.width || window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+    el.classList.add("is-swapping");
+    const run = el.animate([{ width: `${from.width}px` }, { width: `${to}px` }], { duration: SWAP_MS, easing: "ease-out" });
+    run.onfinish = run.oncancel = () => el.classList.remove("is-swapping");
   }, [asking]);
 
-  const swap = (next: boolean) => {
-    moved.current = true;
-    setAsking(next);
-  };
-
-  if (!asking) {
-    return (
-      <Button
-        ref={firstRef}
-        type="button"
-        kind={kind}
-        size={size}
-        disabled={disabled}
-        onClick={() => (ask() ? swap(true) : onConfirm())}
-      >
-        {label}
-      </Button>
-    );
-  }
   return (
     <span
-      className="two-step"
+      ref={box}
+      className={asking ? "two-step is-asking" : "two-step"}
       onKeyDown={(e) => {
-        if (e.key !== "Escape") return;
-        // Escape takes back this step only, not the panel around it.
+        if (!asking || e.key !== "Escape") return;
         e.preventDefault();
         swap(false);
       }}
     >
-      {warning && (
-        <div className="note warn" role="alert">
-          {warning}
-        </div>
-      )}
-      <span className="two-step-confirm">
+      {!asking ? (
         <Button
-          type="button"
-          kind="danger"
+          key="first"
+          ref={first}
+          kind={kind}
           size={size}
           disabled={disabled}
-          onClick={() => {
-            swap(false);
-            onConfirm();
-          }}
+          className={swapped ? "is-in" : undefined}
+          onClick={() => (ask() ? swap(true) : onConfirm())}
         >
-          确认{label}
+          {label}
         </Button>
-        <Button ref={cancelRef} type="button" size={size} onClick={() => swap(false)}>
-          取消
-        </Button>
-      </span>
+      ) : (
+        <>
+          <Button
+            key="confirm"
+            kind="danger"
+            size={size}
+            disabled={disabled}
+            className="is-in"
+            onClick={() => {
+              swap(false);
+              onConfirm();
+            }}
+          >
+            确认{label}
+          </Button>
+          <Button key="cancel" ref={cancel} size={size} className="is-in" onClick={() => swap(false)}>
+            取消
+          </Button>
+          {warning && (
+            <span className="two-step-warn is-in" role="alert">
+              {warning}
+            </span>
+          )}
+        </>
+      )}
     </span>
   );
 }

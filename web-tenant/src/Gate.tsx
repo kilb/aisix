@@ -1,4 +1,4 @@
-import { useId, useState } from "react";
+import { useState } from "react";
 import { ApiError, MIN_PASSWORD_CHARS, acceptInvite, login, signup, type Session } from "./lib/api";
 import { formMessageFor, messageFor } from "./lib/errors";
 import type { Theme } from "./lib/useTheme";
@@ -57,7 +57,6 @@ export function Gate({
   const [displayName, setDisplayName] = useState("");
   const [err, setErr] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
-  const hintId = useId();
 
   /** Sends one sign-in request; a refusal is shown as `describe` words it. */
   async function attempt(request: () => Promise<Session>, describe: (e: ApiError) => string) {
@@ -117,15 +116,17 @@ export function Gate({
 
   const hinted = invite !== null || mode === "signup";
   const passwordField = (
-    <Field label="口令" hint={hinted ? <>至少 {MIN_PASSWORD_CHARS} 个字符</> : undefined} hintId={hintId}>
-      <input
-        type="password"
-        autoComplete={invite === null && mode === "login" ? "current-password" : "new-password"}
-        required
-        value={password}
-        onChange={(e) => setPassword(e.target.value)}
-        aria-describedby={hinted ? hintId : undefined}
-      />
+    <Field label="口令" hint={hinted ? <>至少 {MIN_PASSWORD_CHARS} 个字符</> : undefined}>
+      {(aria) => (
+        <input
+          type="password"
+          autoComplete={invite === null && mode === "login" ? "current-password" : "new-password"}
+          required
+          value={password}
+          onChange={(e) => setPassword(e.target.value)}
+          {...aria}
+        />
+      )}
     </Field>
   );
 

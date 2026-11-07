@@ -1,11 +1,16 @@
+// Shared: web-cp/src/ui and web-tenant/src/ui carry byte-equal copies of
+// this file, pinned by web-tenant/src/lib/tokenParity.test.ts; change both
+// together. The contract is in CONTRACT.md beside it.
 import type { ReactNode } from "react";
 
 /**
- * A table: a sticky 36px header in 12px muted labels, 44px rows (36px
- * compact) that hover in Concrete, numbers right-aligned in tabular figures
- * (`className="num"` or `"right"` on the cell), no zebra stripes. The
- * children are its `thead` and `tbody`. `scroll` gives a long list its own
- * scroll area, so the header stays in view.
+ * A table: a sticky 36px header in 12px muted labels, 44px rows (56px with
+ * a note line, 36px compact) that hover in Concrete, no zebra stripes.
+ * Numbers sit right-aligned in tabular figures (`className="num"` on the
+ * cell and its header), as do a row's actions (`"right"`). The children
+ * are its `thead` and `tbody`. It scrolls sideways inside its own box when
+ * the screen is narrower than its columns; `scroll` also gives a long list
+ * its own vertical scroll area, so the header stays in view.
  */
 export function DataTable({
   label,
@@ -35,7 +40,8 @@ const WIDTHS = [
 
 /**
  * A list on its way: three rows of skeleton, purely visual, and the
- * `载入中…` text that assistive technology and the specs read.
+ * `载入中…` status text, visually hidden, that assistive technology and the
+ * specs read.
  */
 export function Loading() {
   return (
@@ -49,7 +55,7 @@ export function Loading() {
           </span>
         ))}
       </div>
-      <p>载入中…</p>
+      <p className="vh">载入中…</p>
     </div>
   );
 }

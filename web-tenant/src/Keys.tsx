@@ -16,11 +16,11 @@ import {
 import { formMessageFor, messageFor } from "./lib/errors";
 import { ShownOnce } from "./controls";
 import { Button } from "./ui/Button";
-import { ConfirmButton } from "./ui/ConfirmButton";
-import { DataTable, ListLoading } from "./ui/DataTable";
+import { DataTable, Loading } from "./ui/DataTable";
 import { EmptyState } from "./ui/EmptyState";
 import { Field } from "./ui/Field";
 import { Lamp, type LampState } from "./ui/Lamp";
+import { TwoStep } from "./ui/TwoStep";
 
 type Caps = Org["limits"];
 
@@ -175,7 +175,7 @@ export function Keys({
           )}
         </div>
         {items === null ? (
-          !listErr && <ListLoading />
+          !listErr && <Loading />
         ) : items.length === 0 ? (
           <EmptyState mark="key" text="还没有密钥。" />
         ) : (
@@ -218,12 +218,12 @@ export function Keys({
                         {models}
                       </span>
                     </td>
-                    <td className="num">{limitsOf(k)}</td>
+                    <td className="tabular">{limitsOf(k)}</td>
                     <td>
                       <Lamp state={state.lamp}>{state.text}</Lamp>
                       {state.note && <span className="hint cell-note">{state.note}</span>}
                     </td>
-                    <td className="r">
+                    <td className="right">
                       <span className="acts">
                         {/* The organisation's own switch, which the platform's overrides. */}
                         {active && !k.disabled_by_platform && (
@@ -235,8 +235,9 @@ export function Keys({
                             {k.disabled ? "启用" : "停用"}
                           </Button>
                         )}
-                        <ConfirmButton
+                        <TwoStep
                           label="吊销"
+                          size="sm"
                           warning="吊销后立即失效，且无法恢复"
                           disabled={busy === k.id}
                           onConfirm={() => void act(k, () => keyApi.revoke(k.id, k.version))}
@@ -384,12 +385,9 @@ function NewKeyForm({
     }
   }
 
-  const hintId = (f: Field) => `${id}-${f}-hint`;
-  const errId = (f: Field) => `${id}-${f}-err`;
-  /** The ids describing field `f`: its hint when it has one, then its refusal. */
-  const describedBy = (f: Field, hinted: boolean) =>
-    [hinted ? hintId(f) : null, errs[f] ? errId(f) : null].filter((x) => x !== null).join(" ") || undefined;
-  const invalid = (f: Field) => (errs[f] ? true : undefined);
+  // The models are a fieldset rather than one Field: their hint and refusal are wired here.
+  const modelsHint = `${id}-models-hint`;
+  const modelsErr = `${id}-models-err`;
   const choices = (people ?? []).filter((p) => p.id !== me.id && p.role !== "billing");
 
   return (
@@ -401,17 +399,16 @@ function NewKeyForm({
         </div>
       )}
       <form className="form cols" onSubmit={submit} noValidate>
-        <Field label="名称" wide error={errs.label} errorId={errId("label")}>
-          <input
-            value={label}
-            onChange={(e) => setLabel(e.target.value)}
-            aria-invalid={invalid("label")}
-            aria-describedby={describedBy("label", false)}
-          />
+        <Field label="名称" wide error={errs.label}>
+          {(aria) => <input value={label} onChange={(e) => setLabel(e.target.value)} {...aria} />}
         </Field>
 
-        <div className="fld wide">
-          <fieldset className="fld" aria-describedby={describedBy("models", true)} aria-invalid={invalid("models")}>
+        <div className="field wide">
+          <fieldset
+            className="field"
+            aria-describedby={errs.models ? `${modelsHint} ${modelsErr}` : modelsHint}
+            aria-invalid={errs.models ? true : undefined}
+          >
             <legend>可用模型</legend>
             {catalog === null ? (
               <span className="hint">载入中…</span>
@@ -434,80 +431,45 @@ function NewKeyForm({
               </div>
             )}
           </fieldset>
-          <p className="hint" id={hintId("models")}>
+          <p className="hint" id={modelsHint}>
             不勾选即可使用组织获授权的全部模型，包括以后新授权的
           </p>
           {errs.models && (
-            <p className="field-err" id={errId("models")} role="alert">
+            <p className="field-problem" id={modelsErr}>
               {errs.models}
             </p>
           )}
         </div>
 
-        <Field
-          label="并发"
-          hint={capHint(caps?.key_concurrency_max, caps)}
-          hintId={hintId("concurrency")}
-          error={errs.concurrency}
-          errorId={errId("concurrency")}
-        >
-          <input
-            inputMode="numeric"
-            value={concurrency}
-            onChange={(e) => setConcurrency(e.target.value)}
-            aria-invalid={invalid("concurrency")}
-            aria-describedby={describedBy("concurrency", true)}
-          />
+        <Field label="并发" hint={capHint(caps?.key_concurrency_max, caps)} error={errs.concurrency}>
+          {(aria) => (
+            <input inputMode="numeric" value={concurrency} onChange={(e) => setConcurrency(e.target.value)} {...aria} />
+          )}
         </Field>
 
-        <Field
-          label="每分钟请求"
-          hint={capHint(caps?.key_rpm_max, caps)}
-          hintId={hintId("rpm")}
-          error={errs.rpm}
-          errorId={errId("rpm")}
-        >
-          <input
-            inputMode="numeric"
-            value={rpm}
-            onChange={(e) => setRpm(e.target.value)}
-            aria-invalid={invalid("rpm")}
-            aria-describedby={describedBy("rpm", true)}
-          />
+        <Field label="每分钟请求" hint={capHint(caps?.key_rpm_max, caps)} error={errs.rpm}>
+          {(aria) => <input inputMode="numeric" value={rpm} onChange={(e) => setRpm(e.target.value)} {...aria} />}
         </Field>
 
-        <Field
-          label="过期时间"
-          hint="留空表示永不过期；按本机时区"
-          hintId={hintId("expires")}
-          error={errs.expires}
-          errorId={errId("expires")}
-        >
-          <input
-            type="datetime-local"
-            value={expires}
-            onChange={(e) => setExpires(e.target.value)}
-            aria-invalid={invalid("expires")}
-            aria-describedby={describedBy("expires", true)}
-          />
+        <Field label="过期时间" hint="留空表示永不过期；按本机时区" error={errs.expires}>
+          {(aria) => (
+            <input type="datetime-local" value={expires} onChange={(e) => setExpires(e.target.value)} {...aria} />
+          )}
         </Field>
 
         {manager && (
-          <Field label="归属成员" error={errs.owner} errorId={errId("owner")}>
-            <select
-              value={owner}
-              onChange={(e) => setOwner(e.target.value)}
-              aria-invalid={invalid("owner")}
-              aria-describedby={describedBy("owner", false)}
-            >
-              <option value="">我</option>
-              {choices.map((p) => (
-                <option key={p.id} value={p.id}>
-                  {p.display_name ?? p.email}
-                  {p.disabled ? "（已停用）" : ""}
-                </option>
-              ))}
-            </select>
+          <Field label="归属成员" error={errs.owner}>
+            {(aria) => (
+              <select value={owner} onChange={(e) => setOwner(e.target.value)} {...aria}>
+                <option value="">我</option>
+                {choices.map((p) => (
+                  <option key={p.id} value={p.id}>
+                    {p.display_name ?? p.email}
+                    {p.disabled ? "（已停用）" : ""}
+                  </option>
+                ))}
+              </select>
+            )}
           </Field>
         )}
 

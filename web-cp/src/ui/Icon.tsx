@@ -1,8 +1,14 @@
+// Shared: web-cp/src/ui and web-tenant/src/ui carry byte-equal copies of
+// this file, pinned by web-tenant/src/lib/tokenParity.test.ts; change both
+// together. The contract is in CONTRACT.md beside it.
+
 /**
  * The one icon set: 16px, a 1.5px stroke with round caps, drawn in
  * currentColor so it follows the text it sits beside. Used sparingly, on
- * actions (refresh, copy, close, external) and as the larger mark of an
- * empty state. Navigation stops carry none.
+ * actions (refresh, copy, close, external, the theme switch) and as the
+ * larger mark of an empty state. Navigation stops carry none. An icon is
+ * always decorative (`aria-hidden`): the control around it carries the
+ * words.
  */
 
 const PATHS = {
@@ -27,6 +33,13 @@ const PATHS = {
   ),
   check: <path d="M3.25 8.5l3 3 6.5-6.75" />,
   plus: <path d="M8 3.25v9.5M3.25 8h9.5" />,
+  moon: <path d="M13.25 9.6A5.5 5.5 0 0 1 6.4 2.75a5.5 5.5 0 1 0 6.85 6.85Z" />,
+  sun: (
+    <>
+      <circle cx="8" cy="8" r="2.75" />
+      <path d="M8 1.75v1.25M8 13v1.25M1.75 8H3M13 8h1.25M3.58 3.58l.88.88M11.54 11.54l.88.88M3.58 12.42l.88-.88M11.54 4.46l.88-.88" />
+    </>
+  ),
 } as const;
 
 /** The 32px marks of empty states, on a 32-unit grid. */
@@ -60,6 +73,12 @@ const MARKS = {
       <path d="M11 11h10M11 16h10M11 21h6" />
     </>
   ),
+  mail: (
+    <>
+      <rect x="4.75" y="7.75" width="22.5" height="16.5" rx="2" />
+      <path d="M5.5 9l10.5 8.25L26.5 9" />
+    </>
+  ),
 } as const;
 
 export type IconName = keyof typeof PATHS;
@@ -73,6 +92,7 @@ export function Icon({ name }: { name: IconName }) {
   );
 }
 
+/** The 32px mark an empty state leads with. */
 export function Mark({ name }: { name: MarkName }) {
   return (
     <svg className="icon icon-32" viewBox="0 0 32 32" aria-hidden="true" focusable="false">

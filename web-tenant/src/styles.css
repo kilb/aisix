@@ -273,7 +273,7 @@
   align-items: center;
   gap: var(--s-2);
 }
-.secret-acts .field-err {
+.secret-acts .field-problem {
   margin-left: var(--s-2);
 }
 
@@ -393,13 +393,8 @@
   .panel-notes {
     padding: 0 var(--s-4) var(--s-4);
   }
-  .tbl th:first-child,
-  .tbl td:first-child {
-    padding-left: var(--s-4);
-  }
-  .tbl th:last-child,
-  .tbl td:last-child {
-    padding-right: var(--s-4);
+  .dt-wrap {
+    --dt-edge: var(--s-4);
   }
   .empty {
     padding: var(--s-12) var(--s-4);

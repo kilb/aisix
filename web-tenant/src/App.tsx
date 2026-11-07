@@ -13,7 +13,6 @@ import { EXPECTED_API_CONTRACT } from "./lib/contract";
 import { messageFor } from "./lib/errors";
 import { useTheme } from "./lib/useTheme";
 import { Button } from "./ui/Button";
-import { Icon } from "./ui/Icon";
 import { RouteNav } from "./ui/RouteNav";
 import { ThemeToggle } from "./ui/ThemeToggle";
 import { Gate } from "./Gate";
@@ -137,8 +136,7 @@ export function App({ inviteToken }: { inviteToken: string | null }) {
       <div className="centered">
         <div className="note crit" role="alert">
           <strong>无法读取登录状态。</strong> {bootError}{" "}
-          <Button size="sm" onClick={() => void boot()}>
-            <Icon name="refresh" />
+          <Button size="sm" icon="refresh" onClick={() => void boot()}>
             重试
           </Button>
         </div>

@@ -1,12 +1,19 @@
-/* The design system's components, the portal's copy (P2c-R4). They read
-   the role tokens in tokens.css, never the palette directly, so both themes
-   follow from the token file alone. Every interactive element has its
-   hover (a 120ms colour transition), pressed (one step darker, a 1px
-   inset), keyboard focus (base.css) and disabled (45%, not-allowed)
+/* The design system's components, the portal's copy (P2c-R4). The
+   components themselves (Button, Field, Toast, TwoStep, Lamp, EmptyState,
+   DataTable, Icon) are byte-equal with the Dashboard's, and so are their
+   class names; CONTRACT.md beside them is the contract. This sheet styles
+   them as the Dashboard's ui.css does, with the portal's own layout around
+   them (panels that space their children by gap, lists whose tables run to
+   the panel's edges).
+
+   They read the role tokens in tokens.css, never the palette directly, so
+   both themes follow from the token file alone. Every interactive element
+   has its hover (a 120ms colour transition), pressed (one step darker, a
+   1px inset), keyboard focus (base.css) and disabled (45%, not-allowed)
    states. */
 
 /* ── Icons ─────────────────────────────────────────────────── */
-.i {
+.icon {
   flex: none;
   width: var(--icon);
   height: var(--icon);
@@ -16,14 +23,14 @@
   stroke-linecap: round;
   stroke-linejoin: round;
 }
-.i.i-32 {
+.icon-32 {
   width: 32px;
   height: 32px;
 }
 
 /* ── Buttons: 36px, 32px small; icons centred by flex ──────── */
 .btn {
-  --btn-fg: var(--text);
+  --fg: var(--text);
   position: relative;
   display: inline-flex;
   align-items: center;
@@ -34,7 +41,7 @@
   border: 1px solid transparent;
   border-radius: var(--r-button);
   background: transparent;
-  color: var(--btn-fg);
+  color: var(--fg);
   font-weight: 600;
   line-height: 16px;
   white-space: nowrap;
@@ -53,56 +60,67 @@
 .btn-block {
   width: 100%;
 }
+.btn-icon {
+  width: var(--h-control);
+  padding: 0;
+}
+.btn-icon.btn-sm {
+  width: var(--h-control-sm);
+}
 .btn-primary {
-  --btn-fg: var(--on-sign);
+  --fg: var(--on-sign);
   background: var(--sign);
 }
-.btn-primary:not(:disabled):hover {
+.btn-primary:not(:disabled, [aria-disabled="true"]):hover {
   background: var(--sign-hover);
 }
-.btn-primary:not(:disabled):active {
+.btn-primary:not(:disabled, [aria-disabled="true"]):active {
   background: var(--sign-press);
   box-shadow: var(--inset);
 }
 .btn-secondary {
   border-color: var(--text);
 }
-.btn-secondary:not(:disabled):hover {
+.btn-secondary:not(:disabled, [aria-disabled="true"]):hover {
   background: var(--hover);
 }
-.btn-secondary:not(:disabled):active {
+.btn-secondary:not(:disabled, [aria-disabled="true"]):active {
   background: var(--press);
   box-shadow: var(--inset);
 }
 .btn-quiet {
-  --btn-fg: var(--text-2);
+  --fg: var(--text-2);
   padding: 0 var(--s-2);
 }
-.btn-quiet:not(:disabled):hover {
-  --btn-fg: var(--text);
+.btn-quiet.btn-icon {
+  padding: 0;
+}
+.btn-quiet:not(:disabled, [aria-disabled="true"]):hover {
+  --fg: var(--text);
   background: var(--hover);
 }
-.btn-quiet:not(:disabled):active {
-  --btn-fg: var(--text);
+.btn-quiet:not(:disabled, [aria-disabled="true"]):active {
+  --fg: var(--text);
   background: var(--press);
   box-shadow: var(--inset);
 }
 .btn-danger {
-  --btn-fg: var(--on-stop);
+  --fg: var(--on-stop);
   background: var(--stop-fill);
 }
-.btn-danger:not(:disabled):hover {
+.btn-danger:not(:disabled, [aria-disabled="true"]):hover {
   background: var(--stop-fill-hover);
 }
-.btn-danger:not(:disabled):active {
+.btn-danger:not(:disabled, [aria-disabled="true"]):active {
   background: var(--stop-fill-press);
   box-shadow: var(--inset);
 }
-.btn:disabled {
+.btn:is(:disabled, [aria-disabled="true"]) {
   opacity: 0.45;
   cursor: not-allowed;
 }
-/* Busy: the label keeps its place (and so the width) under a spinner. */
+/* Busy: a spinner takes the label's place, and the label keeps its place
+   (and so the width) underneath it, hidden; the name is the busy label. */
 .btn.is-busy:disabled {
   opacity: 1;
   cursor: progress;
@@ -120,19 +138,57 @@
   width: var(--icon);
   height: var(--icon);
   margin: auto;
-  border: 1.5px solid var(--btn-fg);
+  border: 1.5px solid var(--fg);
   border-right-color: transparent;
   border-radius: var(--r-round);
-  animation: btn-spin 0.7s linear infinite;
+  animation: ui-spin 0.7s linear infinite;
 }
-@keyframes btn-spin {
+@keyframes ui-spin {
   to {
     transform: rotate(1turn);
   }
 }
 
+/* A disabled action whose reason is not on screen keeps it in a tooltip,
+   on hover and on keyboard focus. */
+.has-tip {
+  position: relative;
+  display: inline-flex;
+}
+.tip {
+  position: absolute;
+  z-index: 30;
+  bottom: calc(100% + var(--s-2));
+  right: 0;
+  display: flex;
+  align-items: center;
+  width: max-content;
+  max-width: min(320px, 90vw);
+  min-height: var(--h-control-sm);
+  padding: var(--s-1) var(--s-3);
+  border-radius: var(--r-button);
+  background: var(--tooltip-bg);
+  color: var(--tooltip-text);
+  box-shadow: var(--shadow-float);
+  font-size: var(--fs-13);
+  font-weight: 400;
+  line-height: var(--lh-table);
+  white-space: normal;
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transition:
+    opacity var(--t-fast) ease,
+    visibility 0s linear var(--t-fast);
+}
+.has-tip:is(:hover, :focus-within) .tip {
+  opacity: 1;
+  visibility: visible;
+  transition: opacity var(--t-fast) ease;
+}
+
 /* ── Fields: label above, hint and refusal below ───────────── */
-.fld,
+.field,
 .f {
   display: flex;
   flex-direction: column;
@@ -140,16 +196,16 @@
   min-width: 0;
 }
 .f-label,
-.fld > legend {
+.field > legend {
   color: var(--text-2);
   line-height: var(--lh-table);
 }
-fieldset.fld {
+fieldset.field {
   margin: 0;
   padding: 0;
   border: 0;
 }
-fieldset.fld > legend {
+fieldset.field > legend {
   margin-bottom: var(--s-2);
   padding: 0;
 }
@@ -159,7 +215,7 @@ fieldset.fld > legend {
   color: var(--text-muted);
 }
 /* A refusal, in the error red (4.5:1 on Paper and on a hovered row). */
-.field-err {
+.field-problem {
   font-size: var(--fs-13);
   font-weight: 600;
   line-height: var(--lh-table);
@@ -202,11 +258,11 @@ fieldset.fld > legend {
 /* A native select with a drawn chevron. */
 :where(select) {
   appearance: none;
-  padding-right: 36px;
+  padding-right: var(--s-10);
   cursor: pointer;
   background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M4.75 6.25 8 9.5l3.25-3.25' fill='none' stroke='%2366737F' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
   background-repeat: no-repeat;
-  background-position: right 12px center;
+  background-position: right var(--s-3) center;
   background-size: 16px 16px;
 }
 :root[data-theme="dark"] :where(select) {
@@ -284,7 +340,8 @@ label:hover > :is(input[type="checkbox"], input[type="radio"]):checked:not(:disa
 /* The dot is placed beside the word rather than laid out with it, so the
    lamp's baseline is its word's and it lines up with text around it. */
 .lamp {
-  --lamp-c: var(--lamp-disabled);
+  --c: var(--lamp-disabled);
+  --ring: transparent;
   position: relative;
   display: inline-block;
   padding-left: calc(8px + var(--s-2));
@@ -300,27 +357,27 @@ label:hover > :is(input[type="checkbox"], input[type="radio"]):checked:not(:disa
   height: 8px;
   margin-top: -4px;
   border-radius: var(--r-round);
-  background: var(--lamp-c);
-  box-shadow: inset 0 0 0 1.5px var(--lamp-ring, transparent);
+  background: var(--c);
+  box-shadow: inset 0 0 0 1.5px var(--ring);
 }
-.lamp-applied {
-  --lamp-c: var(--lamp-applied);
+.lamp[data-lamp="applied"] {
+  --c: var(--lamp-applied);
 }
-.lamp-propagating {
-  --lamp-c: var(--lamp-progress);
+.lamp[data-lamp="propagating"] {
+  --c: var(--lamp-progress);
 }
-.lamp-rejected {
-  --lamp-c: var(--lamp-rejected);
+.lamp[data-lamp="pending"] {
+  --c: transparent;
+  --ring: var(--lamp-pending);
 }
-.lamp-disabled {
-  --lamp-c: var(--lamp-disabled);
+.lamp[data-lamp="rejected"] {
+  --c: var(--lamp-rejected);
 }
-.lamp-pending {
-  --lamp-c: transparent;
-  --lamp-ring: var(--lamp-pending);
+.lamp[data-lamp="disabled"] {
+  --c: var(--lamp-disabled);
 }
 /* Propagating pulses once, then holds. */
-.lamp-propagating::after {
+.lamp[data-lamp="propagating"]::after {
   content: "";
   position: absolute;
   top: 50%;
@@ -329,10 +386,11 @@ label:hover > :is(input[type="checkbox"], input[type="radio"]):checked:not(:disa
   height: 8px;
   margin-top: -4px;
   border-radius: var(--r-round);
-  background: var(--lamp-c);
-  animation: lamp-pulse 1.1s ease-out 1 both;
+  background: var(--c);
+  opacity: 0;
+  animation: ui-pulse 1.1s ease-out 1 both;
 }
-@keyframes lamp-pulse {
+@keyframes ui-pulse {
   from {
     transform: scale(1);
     opacity: 0.6;
@@ -358,53 +416,45 @@ label:hover > :is(input[type="checkbox"], input[type="radio"]):checked:not(:disa
   white-space: nowrap;
 }
 
-/* ── Notes: a word from the page, on Paper ─────────────────── */
+/* ── Notes: a passage in a panel, marked by a bar on its left ─── */
+/* The Dashboard's note. Here it has no margin of its own: the portal's
+   panels and forms space their children by gap. */
 .note {
-  --note-c: var(--text-muted);
-  position: relative;
-  padding: var(--s-3) var(--s-4) var(--s-3) calc(var(--s-4) + 8px + var(--s-3));
+  margin: 0;
+  padding: var(--s-3) var(--s-4);
   border: 1px solid var(--border);
-  border-radius: var(--r-chip);
+  border-left: 3px solid var(--n3);
+  border-radius: var(--r-button);
   background: var(--surface);
-  color: var(--text-2);
-}
-/* The lamp dot, centred on the first line: 12px padding, then
-   (1.6 × 15px − 8px) / 2. */
-.note::before {
-  content: "";
-  position: absolute;
-  top: calc(var(--s-3) + 8px);
-  left: var(--s-4);
-  width: 8px;
-  height: 8px;
-  border-radius: var(--r-round);
-  background: var(--note-c);
-  box-shadow: inset 0 0 0 1.5px var(--note-ring, transparent);
+  color: var(--text);
+  line-height: var(--lh-body);
 }
 .note.ok {
-  --note-c: var(--lamp-applied);
+  border-left-color: var(--proceed);
 }
 .note.warn {
-  --note-c: transparent;
-  --note-ring: var(--text-2);
-  color: var(--text);
+  border-left-color: var(--sign);
 }
 .note.crit {
-  --note-c: var(--lamp-rejected);
-  color: var(--error);
+  border-left-color: var(--stop);
+}
+.note > p + p,
+.note > strong + p {
+  margin-top: var(--s-2);
 }
 
 /* ── Tables: 36px head, 44px rows (56px with a note) ───────── */
-.scroll {
+.dt-wrap {
+  --dt-edge: var(--s-6);
   overflow-x: auto;
 }
-.tbl {
+.dt {
   width: 100%;
   border-collapse: separate;
   border-spacing: 0;
   line-height: var(--lh-table);
 }
-.tbl th {
+.dt th {
   position: sticky;
   top: 0;
   z-index: 1;
@@ -420,7 +470,7 @@ label:hover > :is(input[type="checkbox"], input[type="radio"]):checked:not(:disa
   white-space: nowrap;
   vertical-align: middle;
 }
-.tbl td {
+.dt td {
   height: var(--h-row);
   padding: var(--s-1) var(--s-3);
   border-bottom: 1px solid var(--divider);
@@ -428,30 +478,42 @@ label:hover > :is(input[type="checkbox"], input[type="radio"]):checked:not(:disa
   white-space: nowrap;
 }
 /* A row whose cells stack a note under the value keeps 8px off each line. */
-.tbl tr:has(.cell-note) td {
+.dt tr:has(.cell-note) td {
   padding-top: var(--s-2);
   padding-bottom: var(--s-2);
 }
-.tbl tbody tr {
+.dt.dt-compact td {
+  height: var(--h-row-compact);
+}
+.dt tbody tr {
   transition: background-color var(--t-fast) ease;
 }
-.tbl tbody tr:hover {
+.dt tbody tr:hover {
   background: var(--row-hover);
 }
-.tbl tbody tr:last-child td {
+.dt tbody tr:last-child td {
   border-bottom: 0;
 }
-.tbl th:first-child,
-.tbl td:first-child {
-  padding-left: var(--s-6);
+.dt th:first-child,
+.dt td:first-child {
+  padding-left: var(--dt-edge);
 }
-.tbl th:last-child,
-.tbl td:last-child {
-  padding-right: var(--s-6);
+.dt th:last-child,
+.dt td:last-child {
+  padding-right: var(--dt-edge);
 }
-.tbl .r {
+.dt :is(th, td):is(.num, .right) {
   text-align: right;
 }
+.dt :is(th, td).num {
+  font-variant-numeric: tabular-nums lining-nums;
+}
+.dt-wrap.dt-scroll {
+  max-height: min(70vh, 720px);
+  overflow-y: auto;
+}
+/* Secondary text under a value: a second line in 13px. Its 2px gap is the
+   one step off the 4px grid, kept so a row with a note stays 56px. */
 .cell-note {
   display: block;
   margin-top: 2px;
@@ -468,7 +530,7 @@ label:hover > :is(input[type="checkbox"], input[type="radio"]):checked:not(:disa
 }
 /* In an actions column the buttons line up with a confirm step's first
    line, not with its middle. */
-.r > .acts {
+.right > .acts {
   align-items: flex-start;
 }
 .acts > select {
@@ -476,29 +538,26 @@ label:hover > :is(input[type="checkbox"], input[type="radio"]):checked:not(:disa
   height: var(--h-control-sm);
 }
 
-/* Loading: three skeleton rows, purely visual. */
+/* Loading: three skeleton rows, purely visual, beside the hidden status. */
 .skeleton {
   border-top: 1px solid var(--divider);
 }
-.skeleton-row {
-  display: grid;
-  grid-template-columns: 3fr 2fr 4fr;
+.skeleton > span {
+  display: flex;
   align-items: center;
-  gap: var(--s-6);
+  gap: var(--s-8);
   height: var(--h-row);
-  padding: 0 var(--s-6);
+  padding: 0 var(--dt-edge, var(--s-6));
   border-bottom: 1px solid var(--divider);
 }
-.skeleton-row:last-child {
+.skeleton > span:last-child {
   border-bottom: 0;
 }
-.skeleton-row > span {
+.skeleton i {
+  display: block;
   height: 12px;
   border-radius: var(--r-input);
   background: var(--skeleton);
-}
-.skeleton-row > span:nth-child(2) {
-  width: 70%;
 }
 
 /* ── Empty state: a mark, one sentence, centred ────────────── */
@@ -512,42 +571,49 @@ label:hover > :is(input[type="checkbox"], input[type="radio"]):checked:not(:disa
   color: var(--text-2);
   text-align: center;
 }
-.empty .i-32 {
+.empty > .icon {
   color: var(--text-muted);
 }
 
-/* ── Two-step confirm, swapped in place ────────────────────── */
-.two {
+/* ── The two-step confirm, swapped in place ────────────────── */
+/* The second step: the two buttons, then the warning on a line under
+   them, so a row's actions widen by the warning's length at most. */
+.two-step {
   display: inline-flex;
-  justify-content: flex-end;
   vertical-align: middle;
 }
-.two.is-swapping {
-  overflow: clip;
-  overflow-clip-margin: 4px;
-}
-/* The second step: the two buttons, and the warning on a line under them,
-   so a row's actions widen by the warning's length at most. */
-.two-step {
+.two-step.is-asking {
   display: inline-grid;
   grid-template-columns: auto auto;
-  justify-content: end;
+  justify-content: start;
   align-items: center;
   gap: var(--s-1) var(--s-2);
 }
-.two-warn {
+.two-step.is-swapping {
+  overflow: clip;
+  overflow-clip-margin: 4px;
+}
+.two-step-warn {
   grid-row: 2;
   grid-column: 1 / -1;
+  max-width: 44ch;
+  color: var(--text-2);
   font-size: var(--fs-13);
   line-height: var(--lh-table);
-  color: var(--text-2);
+  white-space: normal;
+}
+/* In a row's actions column, against the column's right edge. */
+.right .two-step.is-asking {
+  justify-content: end;
+}
+.right .two-step-warn {
+  justify-self: end;
   text-align: right;
-  white-space: nowrap;
 }
 .is-in {
-  animation: fade-in var(--t-fast) ease-out;
+  animation: ui-fade var(--t-fast) ease-out both;
 }
-@keyframes fade-in {
+@keyframes ui-fade {
   from {
     opacity: 0;
   }
@@ -569,17 +635,15 @@ label:hover > :is(input[type="checkbox"], input[type="radio"]):checked:not(:disa
   display: inline-flex;
   align-items: center;
   gap: var(--s-2);
-  height: 40px;
-  padding: 0 var(--s-4);
+  min-height: 40px;
+  padding: var(--s-2) var(--s-4);
   border-radius: var(--r-button);
   background: var(--tooltip-bg);
   color: var(--tooltip-text);
   box-shadow: var(--shadow-float);
   font-weight: 600;
   line-height: 16px;
-  white-space: nowrap;
-  animation: toast-in var(--t-panel) ease-out;
-  transition: opacity var(--t-leave) ease-in;
+  animation: ui-toast-in var(--t-panel) ease-out both;
 }
 .toast::before {
   content: "";
@@ -591,8 +655,9 @@ label:hover > :is(input[type="checkbox"], input[type="radio"]):checked:not(:disa
 }
 .toast.is-leaving {
   opacity: 0;
+  transition: opacity var(--t-leave) ease-in;
 }
-@keyframes toast-in {
+@keyframes ui-toast-in {
   from {
     opacity: 0;
     transform: translateY(8px);

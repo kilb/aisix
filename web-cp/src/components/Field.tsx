@@ -5,7 +5,10 @@ export type { FieldAria };
 
 /**
  * The P1b signature of `ui/Field` (`problem` for its `error`), kept so a
- * page written against it still resolves. New code uses `ui/Field`.
+ * page written against it still resolves. No page imports it any more; it
+ * is kept only until the owner agrees to delete the file.
+ *
+ * @deprecated Use `Field` from `ui/Field`.
  */
 export function Field({
   label,
