@@ -21,7 +21,9 @@
 //! connection and reloads the book on that same connection only when the
 //! version moved. The version and the revisions commit together, so a book
 //! loaded after reading version `v` holds at least every revision of `v`; a
-//! later commit only makes the next read reload.
+//! later commit only makes the next read reload. A version row that is
+//! missing or not a whole number never stops intake: the book is then
+//! reloaded for every batch, and each such read is logged at ERROR.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, PoisonError, RwLock};
@@ -72,16 +74,42 @@ impl PriceBookCache {
     /// Reads `pricing_version` on `conn`, the caller's transaction. Reloads
     /// the book on the same connection only when the version differs from
     /// the cached one, and logs one ERROR per invalid revision on each
-    /// reload. The lock is never held across an await.
+    /// reload. A version that is missing or not a whole number is logged at
+    /// ERROR and reloads the book on every call, so intake keeps pricing
+    /// from what the tables hold. The lock is never held across an await.
     pub async fn current(&self, conn: &mut PgConnection) -> Result<Arc<PriceBook>, DbError> {
-        let version: i64 = sqlx::query_scalar(
-            "SELECT (value::text)::bigint FROM cp_settings WHERE key = 'pricing_version'",
+        // Read only when it is a whole number a bigint holds, so a hand-edited
+        // value is "no version" instead of a cast error that would fail the
+        // batch on every delivery.
+        let version: Option<i64> = sqlx::query_scalar::<_, Option<i64>>(
+            "SELECT CASE WHEN jsonb_typeof(value) = 'number' AND value::text ~ '^-?[0-9]{1,18}$' \
+                         THEN (value::text)::bigint END \
+             FROM cp_settings WHERE key = 'pricing_version'",
         )
-        .fetch_one(&mut *conn)
-        .await?;
+        .fetch_optional(&mut *conn)
+        .await?
+        .flatten();
+        let Some(version) = version else {
+            tracing::error!(
+                "cp_settings.pricing_version is missing or is not a whole number; the price \
+                 book is reloaded for every batch until it is restored"
+            );
+            // A book cached under an earlier version may predate price
+            // writes made while the version could not move.
+            *self.cached.write().unwrap_or_else(PoisonError::into_inner) = None;
+            return self.load(conn).await;
+        };
         if let Some(book) = self.cached_at(version) {
             return Ok(book);
         }
+        let book = self.load(conn).await?;
+        *self.cached.write().unwrap_or_else(PoisonError::into_inner) =
+            Some((version, book.clone()));
+        Ok(book)
+    }
+
+    /// Loads the book on `conn`, logging each invalid revision.
+    async fn load(&self, conn: &mut PgConnection) -> Result<Arc<PriceBook>, DbError> {
         let book = Arc::new(load_price_book(conn, self.catalogue.clone()).await?);
         for r in book.invalid_revisions() {
             tracing::error!(
@@ -91,8 +119,6 @@ impl PriceBookCache {
                 "price revision cannot be used; its rows are unpriced"
             );
         }
-        *self.cached.write().unwrap_or_else(PoisonError::into_inner) =
-            Some((version, book.clone()));
         self.loads.fetch_add(1, Ordering::Relaxed);
         Ok(book)
     }
@@ -218,8 +244,10 @@ fn engine_version(stored: i64) -> u32 {
     u32::try_from(stored).unwrap_or(u32::MAX)
 }
 
-/// Who a charge is for, read from the stored usage row; `""` when the row
-/// has no such text field.
+/// Who a charge is for. `team_id` (the tenant) and `user_id` (the member)
+/// come from the control plane's record of the row's key, `""` when its key
+/// does not resolve or has no member; `api_key_id` and `requested_model_id`
+/// are the row's own text fields, `""` when it has none.
 #[derive(Debug, Clone, Copy)]
 pub struct ChargeIdentity<'a> {
     pub event_id: &'a str,

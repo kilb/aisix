@@ -12,7 +12,14 @@
 //! row failing either check is stored unpriced, with its reason as the
 //! charge's `error_code`, and logged at ERROR. A row naming neither a key nor
 //! a tenant (a request refused before its key was resolved) claims no one and
-//! goes to the engine as it is, which bills nobody for it.
+//! goes to the engine as it is, which bills nobody for it; one that carries
+//! billable usage is logged at ERROR too.
+//!
+//! The tenant and member a charge is filed under come from the same key
+//! record (`tenant_keys.tenant_id`, `member_id`), never from the row, so a
+//! forged row is filed under the key it names rather than the tenant it
+//! claims; the row's own claims stay in `usage_events`. A row whose key does
+//! not resolve is filed under no tenant and no member.
 //!
 //! The charge is computed from the row's token counts and the control
 //! plane's own price book; the row's `cost_usd` is never read. The gateway
@@ -27,7 +34,7 @@ pub mod store;
 
 use std::collections::{HashMap, HashSet};
 
-use aisix_pricing::{price_event, BillableUsage, Outcome};
+use aisix_pricing::{price_event, BillableUsage, Outcome, PricingError};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::Value;
@@ -70,20 +77,36 @@ pub async fn price_stored(
         return Ok(priced);
     }
     let book = prices.current(&mut *conn).await?;
-    let owners = key_owners(&mut *conn, &stored).await?;
-    // In event_id order, the order intake stored them in.
+    let keys = key_records(&mut *conn, &stored).await?;
+    // A fixed order, by event_id compared as bytes, for the charge inserts.
     stored.sort_by(|a, b| a.event_id.cmp(&b.event_id));
     for row in &stored {
-        let ident = identity(row);
-        let charge = match attribute(&ident, &owners) {
+        let claim = Claim::of(&row.event);
+        let key = key_id(claim.api_key_id).and_then(|id| keys.get(&id));
+        let (tenant_id, member_id) = match key {
+            Some(k) => (
+                k.tenant_id.to_string(),
+                k.member_id.map(|m| m.to_string()).unwrap_or_default(),
+            ),
+            None => (String::new(), String::new()),
+        };
+        if key.is_some() && claim.user_id != member_id {
+            tracing::error!(
+                event_id = row.event_id,
+                %dp_id,
+                %batch_id,
+                key_member = member_id,
+                "a usage row names a member other than its key's; the key's member is recorded"
+            );
+        }
+        let charge = match attribute(&claim, key) {
             Err(e) => {
-                let key_tenant = key_id(ident.api_key_id).and_then(|k| owners.get(&k));
                 tracing::error!(
-                    event_id = ident.event_id,
+                    event_id = row.event_id,
                     %dp_id,
                     %batch_id,
                     code = e.code(),
-                    ?key_tenant,
+                    key_tenant = tenant_id,
                     "a usage row does not name the tenant its key belongs to; it is stored \
                      unpriced"
                 );
@@ -96,11 +119,30 @@ pub async fn price_stored(
                 }
             },
         };
+        if charge == Err(ChargeError::Pricing(PricingError::UnknownTenant)) {
+            // Only a row naming neither a key nor a tenant gets this far
+            // without one.
+            tracing::error!(
+                event_id = row.event_id,
+                %dp_id,
+                %batch_id,
+                "a usage row carries billable usage but names no key and no tenant; it is \
+                 stored unpriced"
+            );
+        }
         match &charge {
             Ok(p) if p.outcome == Outcome::Charged => priced.charged += 1,
             Ok(_) => {}
             Err(_) => priced.unpriced += 1,
         }
+        let ident = ChargeIdentity {
+            event_id: &row.event_id,
+            occurred_at: row.occurred_at,
+            team_id: &tenant_id,
+            api_key_id: claim.api_key_id,
+            user_id: &member_id,
+            requested_model_id: claim.requested_model_id,
+        };
         record_charge(&mut *conn, &ident, &charge).await?;
     }
     Ok(priced)
@@ -111,15 +153,32 @@ fn text<'a>(event: &'a Value, name: &str) -> &'a str {
     event.get(name).and_then(Value::as_str).unwrap_or_default()
 }
 
-fn identity(row: &StoredEvent) -> ChargeIdentity<'_> {
-    ChargeIdentity {
-        event_id: &row.event_id,
-        occurred_at: row.occurred_at,
-        team_id: text(&row.event, "team_id"),
-        api_key_id: text(&row.event, "api_key_id"),
-        user_id: text(&row.event, "user_id"),
-        requested_model_id: text(&row.event, "requested_model_id"),
+/// What a row says about who it is for, each `""` when it does not say.
+#[derive(Debug, Clone, Copy)]
+struct Claim<'a> {
+    team_id: &'a str,
+    api_key_id: &'a str,
+    user_id: &'a str,
+    requested_model_id: &'a str,
+}
+
+impl<'a> Claim<'a> {
+    fn of(event: &'a Value) -> Claim<'a> {
+        Claim {
+            team_id: text(event, "team_id"),
+            api_key_id: text(event, "api_key_id"),
+            user_id: text(event, "user_id"),
+            requested_model_id: text(event, "requested_model_id"),
+        }
     }
+}
+
+/// A key as the control plane recorded it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct KeyRecord {
+    tenant_id: Uuid,
+    /// `None` for a key bound to no member.
+    member_id: Option<Uuid>,
 }
 
 /// The key `text` names: a UUID in the lowercase hyphenated form key ids are
@@ -130,12 +189,12 @@ fn key_id(text: &str) -> Option<Uuid> {
         .filter(|id| id.to_string() == text)
 }
 
-/// The tenant of each key the rows name, from the control plane's own key
+/// The record of each key the rows name, from the control plane's own key
 /// records, revoked keys included.
-async fn key_owners(
+async fn key_records(
     conn: &mut PgConnection,
     stored: &[StoredEvent],
-) -> Result<HashMap<Uuid, Uuid>, DbError> {
+) -> Result<HashMap<Uuid, KeyRecord>, DbError> {
     let keys: HashSet<Uuid> = stored
         .iter()
         .filter_map(|row| key_id(text(&row.event, "api_key_id")))
@@ -144,36 +203,52 @@ async fn key_owners(
         return Ok(HashMap::new());
     }
     let keys: Vec<Uuid> = keys.into_iter().collect();
-    let owners: Vec<(Uuid, Uuid)> =
-        sqlx::query_as("SELECT id, tenant_id FROM tenant_keys WHERE id = ANY($1)")
+    let records: Vec<(Uuid, Uuid, Option<Uuid>)> =
+        sqlx::query_as("SELECT id, tenant_id, member_id FROM tenant_keys WHERE id = ANY($1)")
             .bind(keys)
             .fetch_all(conn)
             .await?;
-    Ok(owners.into_iter().collect())
+    Ok(records
+        .into_iter()
+        .map(|(id, tenant_id, member_id)| {
+            (
+                id,
+                KeyRecord {
+                    tenant_id,
+                    member_id,
+                },
+            )
+        })
+        .collect())
 }
 
 /// Whether the row may be priced for the tenant it names (see the module
-/// docs): its key is one the control plane issued, and the key's tenant is
-/// the row's `team_id`. A row naming neither a key nor a tenant claims no
-/// one, and passes.
-fn attribute(ident: &ChargeIdentity<'_>, owners: &HashMap<Uuid, Uuid>) -> Result<(), ChargeError> {
-    if ident.api_key_id.is_empty() && ident.team_id.is_empty() {
+/// docs): its key resolved to a record of the control plane's (`key`), and
+/// that key's tenant is the row's `team_id`. A row naming neither a key nor a
+/// tenant claims no one, and passes.
+fn attribute(claim: &Claim<'_>, key: Option<&KeyRecord>) -> Result<(), ChargeError> {
+    if claim.api_key_id.is_empty() && claim.team_id.is_empty() {
         return Ok(());
     }
-    let owner = key_id(ident.api_key_id)
-        .and_then(|key| owners.get(&key))
-        .ok_or(ChargeError::UnknownApiKey)?;
-    if owner.to_string() != ident.team_id {
+    let key = key.ok_or(ChargeError::UnknownApiKey)?;
+    if key.tenant_id.to_string() != claim.team_id {
         return Err(ChargeError::TenantMismatch);
     }
     Ok(())
 }
 
-/// Logs at ERROR each of `duplicates` (rows this delivery sent whose
-/// `event_id` was already stored) that another gateway stored first with a
-/// different bill. The stored row stands either way; this only makes the
-/// collision visible, since a credential that can name another gateway's
-/// event ids could keep a row from being billed as it happened.
+/// The `usage_rejects` reason of a row another gateway's differing row
+/// already holds the `event_id` of.
+pub const FOREIGN_DUPLICATE: &str = "foreign_duplicate";
+
+/// Flags each of `duplicates` (rows this delivery sent whose `event_id` was
+/// already stored) that another gateway stored first with a different bill:
+/// it is logged at ERROR and its copy kept in `usage_rejects` with reason
+/// [`FOREIGN_DUPLICATE`]. The stored row stands either way; this only makes
+/// the collision visible, since a credential that can name another gateway's
+/// event ids could keep a row from being billed as it happened. A flagged
+/// copy is not counted as rejected: the gateway delivered it, and nothing it
+/// could do differently would store it.
 pub async fn flag_foreign_duplicates(
     conn: &mut PgConnection,
     dp_id: Uuid,
@@ -190,12 +265,13 @@ pub async fn flag_foreign_duplicates(
     )
     .bind(ids)
     .bind(dp_id)
-    .fetch_all(conn)
+    .fetch_all(&mut *conn)
     .await?;
     let stored: HashMap<&str, (Uuid, Uuid, &Value)> = stored
         .iter()
         .map(|(id, dp, batch, event)| (id.as_str(), (*dp, *batch, event)))
         .collect();
+    let mut flagged: Vec<&Value> = Vec::new();
     for (event_id, sent) in duplicates {
         if let Some((stored_dp_id, stored_batch_id, kept)) = stored.get(event_id) {
             if !bills_alike(kept, sent) {
@@ -206,10 +282,24 @@ pub async fn flag_foreign_duplicates(
                     %stored_dp_id,
                     %stored_batch_id,
                     "a gateway sent a usage row whose event_id another gateway's differing row \
-                     already holds; the stored row stands"
+                     already holds; the stored row stands, and the copy is kept in usage_rejects"
                 );
+                flagged.push(sent);
             }
         }
+    }
+    if !flagged.is_empty() {
+        sqlx::query(
+            "INSERT INTO usage_rejects (dp_id, batch_id, reason, raw) \
+             SELECT $1, $2, $3, u.raw FROM unnest($4::jsonb[]) WITH ORDINALITY AS u(raw, n) \
+             ORDER BY u.n",
+        )
+        .bind(dp_id)
+        .bind(batch_id)
+        .bind(FOREIGN_DUPLICATE)
+        .bind(flagged)
+        .execute(conn)
+        .await?;
     }
     Ok(())
 }
@@ -240,53 +330,44 @@ mod tests {
     const KEY: &str = "0b7e5a52-6a4f-4d3e-9c1b-2f6f4d1d9e10";
     const TENANT: &str = "6f0e8c1a-2b3c-4d5e-8f90-a1b2c3d4e5f6";
 
-    fn ident<'a>(team_id: &'a str, api_key_id: &'a str) -> ChargeIdentity<'a> {
-        ChargeIdentity {
-            event_id: "e",
-            occurred_at: DateTime::<Utc>::default(),
+    /// What `price_stored` decides for a row naming `team_id` and
+    /// `api_key_id`, with one key on record: `KEY`, of `TENANT`.
+    fn decide(team_id: &str, api_key_id: &str) -> Result<(), ChargeError> {
+        let records = HashMap::from([(
+            Uuid::parse_str(KEY).expect("a uuid"),
+            KeyRecord {
+                tenant_id: Uuid::parse_str(TENANT).expect("a uuid"),
+                member_id: None,
+            },
+        )]);
+        let claim = Claim {
             team_id,
             api_key_id,
             user_id: "",
             requested_model_id: "",
-        }
-    }
-
-    fn owners() -> HashMap<Uuid, Uuid> {
-        HashMap::from([(
-            Uuid::parse_str(KEY).expect("a uuid"),
-            Uuid::parse_str(TENANT).expect("a uuid"),
-        )])
+        };
+        attribute(&claim, key_id(api_key_id).and_then(|id| records.get(&id)))
     }
 
     #[test]
     fn a_row_is_priced_only_for_its_keys_tenant() {
-        let owners = owners();
-        assert_eq!(attribute(&ident(TENANT, KEY), &owners), Ok(()));
+        assert_eq!(decide(TENANT, KEY), Ok(()));
         let other = "11111111-2222-4333-8444-555555555555";
-        assert_eq!(
-            attribute(&ident(other, KEY), &owners),
-            Err(ChargeError::TenantMismatch)
-        );
-        assert_eq!(
-            attribute(&ident("", KEY), &owners),
-            Err(ChargeError::TenantMismatch)
-        );
+        assert_eq!(decide(other, KEY), Err(ChargeError::TenantMismatch));
+        assert_eq!(decide("", KEY), Err(ChargeError::TenantMismatch));
         // The tenant in another spelling is not the tenant.
         let upper_tenant = TENANT.to_uppercase();
-        assert_eq!(
-            attribute(&ident(&upper_tenant, KEY), &owners),
-            Err(ChargeError::TenantMismatch)
-        );
+        assert_eq!(decide(&upper_tenant, KEY), Err(ChargeError::TenantMismatch));
         let (upper, simple) = (KEY.to_uppercase(), KEY.replace('-', ""));
         for key in ["", other, "k1", upper.as_str(), simple.as_str()] {
             assert_eq!(
-                attribute(&ident(TENANT, key), &owners),
+                decide(TENANT, key),
                 Err(ChargeError::UnknownApiKey),
                 "{key}"
             );
         }
         // Claims no one.
-        assert_eq!(attribute(&ident("", ""), &owners), Ok(()));
+        assert_eq!(decide("", ""), Ok(()));
     }
 
     fn row(prompt: u32, occurred_at: &str) -> Value {

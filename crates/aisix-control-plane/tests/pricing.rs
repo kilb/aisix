@@ -13,7 +13,7 @@ mod support;
 use std::sync::Arc;
 
 use aisix_control_plane::audit::Actor;
-use aisix_control_plane::auth::OperatorRole;
+use aisix_control_plane::auth::{MemberRole, OperatorRole};
 use aisix_control_plane::error::ApiError;
 use aisix_control_plane::pricing::store::{
     self, CostRevision, DiscountRevision, NewCostPrice, NewDiscount, NewSellPrice, SellRevision,
@@ -147,24 +147,30 @@ async fn seed_tenant(cp: &TestCp, admin: &OperatorSession) -> Uuid {
     Uuid::parse_str(&text(&tenant, "/id")).expect("a tenant id")
 }
 
-/// A key of `tenant`, minted by an operator; its id.
-async fn seed_key(cp: &TestCp, admin: &OperatorSession, tenant: Uuid) -> String {
-    let key = create(
-        cp,
-        admin,
-        &format!("/admin/tenants/{tenant}/keys"),
-        json!({"label": "pricing-7c1"}),
-    )
-    .await;
+/// A key of `tenant`, bound to `member` when given, minted by an operator;
+/// its id.
+async fn seed_key(
+    cp: &TestCp,
+    admin: &OperatorSession,
+    tenant: Uuid,
+    member: Option<Uuid>,
+) -> String {
+    let mut body = json!({"label": "pricing-7c1"});
+    if let Some(member) = member {
+        body["member_id"] = json!(member);
+    }
+    let key = create(cp, admin, &format!("/admin/tenants/{tenant}/keys"), body).await;
     text(&key, "/key/id")
 }
 
-/// A control plane with an operator, a gateway, a tenant and one of its keys.
+/// A control plane with an operator, a gateway, a tenant, one of its members
+/// and that member's key.
 struct World {
     cp: TestCp,
     admin: OperatorSession,
     dp: DpClient,
     tenant: Uuid,
+    member: Uuid,
     key: String,
 }
 
@@ -173,12 +179,14 @@ async fn world() -> Option<World> {
     let admin = cp.admin_login_seeded(OperatorRole::Operator).await;
     let dp = cp.issue_dp_client("gw-pricing-7c1").await;
     let tenant = seed_tenant(&cp, &admin).await;
-    let key = seed_key(&cp, &admin, tenant).await;
+    let member = cp.seed_member(tenant, MemberRole::Member).await.id;
+    let key = seed_key(&cp, &admin, tenant, Some(member)).await;
     Some(World {
         cp,
         admin,
         dp,
         tenant,
+        member,
         key,
     })
 }
@@ -239,9 +247,9 @@ fn assert_refused_at(err: &ApiError, path: &str) {
     );
 }
 
-/// A chat usage row of the world's tenant and key for `model`, occurring now,
-/// with `fields` on top. It claims a `cost_usd` no price would give, which
-/// pricing must never read.
+/// A chat usage row of the world's tenant, member and key for `model`,
+/// occurring now, with `fields` on top. It claims a `cost_usd` no price would
+/// give, which pricing must never read.
 fn usage(w: &World, event_id: &str, model: Uuid, fields: Value) -> Value {
     let mut event = json!({
         "event_id": event_id,
@@ -249,7 +257,7 @@ fn usage(w: &World, event_id: &str, model: Uuid, fields: Value) -> Value {
         "occurred_at": Utc::now().to_rfc3339(),
         "team_id": w.tenant.to_string(),
         "api_key_id": w.key,
-        "user_id": "u1",
+        "user_id": w.member.to_string(),
         "requested_model_id": model.to_string(),
         "operation": "chat",
         "status_code": 200,
@@ -296,7 +304,7 @@ impl Charge {
             error_code: None,
             tenant_id: w.tenant.to_string(),
             api_key_id: w.key.clone(),
-            user_id: "u1".to_string(),
+            user_id: w.member.to_string(),
         }
     }
 
@@ -307,7 +315,7 @@ impl Charge {
             error_code: Some(code.to_string()),
             tenant_id: w.tenant.to_string(),
             api_key_id: w.key.clone(),
-            user_id: "u1".to_string(),
+            user_id: w.member.to_string(),
         }
     }
 }
@@ -363,7 +371,8 @@ async fn concurrent_deliveries_of_one_batch_charge_once() {
     let admin = cp.admin_login_seeded(OperatorRole::Admin).await;
     let bundle = cp.issue_bundle(&admin, "gw-pricing-7c1").await;
     let tenant = seed_tenant(&cp, &admin).await;
-    let key = seed_key(&cp, &admin, tenant).await;
+    let member = cp.seed_member(tenant, MemberRole::Member).await.id;
+    let key = seed_key(&cp, &admin, tenant, Some(member)).await;
     let model = seed_model(&cp, &admin).await;
     price(&cp, model).await;
     // A second instance on the same database, booted after the credential
@@ -374,6 +383,7 @@ async fn concurrent_deliveries_of_one_batch_charge_once() {
         cp,
         admin,
         tenant,
+        member,
         key,
     };
     let dps = [
@@ -632,7 +642,9 @@ async fn the_price_book_is_reloaded_only_when_a_price_changes() {
         assert_eq!(r.status, 200, "{r:?}");
     }
     assert_eq!(prices.loads(), 1);
-    // A batch of nothing but duplicates prices nothing and reads no book.
+    // A batch of nothing but duplicates prices nothing and reads no book,
+    // not even once the version has moved.
+    bump_pricing_version(&w.cp).await;
     let r = deliver(
         &w.dp,
         Uuid::new_v4(),
@@ -1007,38 +1019,47 @@ async fn usage_is_priced_only_for_the_tenant_its_key_belongs_to() {
     .await;
     // Intake keeps every row: pricing never refuses or drops one.
     assert_eq!((r.status, r.body.clone()), (200, counts(6, 0, 0)), "{r:?}");
+    // Filed under the key's tenant and member, never the tenant a row
+    // claims: a forged row does not land in another tenant's records.
+    for id in ["e-foreign-team", "e-no-team"] {
+        assert_eq!(
+            charge_of(&w.cp, id).await,
+            Some(Charge::unpriced(&w, "tenant_mismatch")),
+            "{id}"
+        );
+    }
+    let claimed: Option<String> =
+        sqlx::query_scalar("SELECT team_id FROM usage_events WHERE event_id = 'e-foreign-team'")
+            .fetch_one(w.cp.db().pool())
+            .await
+            .expect("read the stored row");
     assert_eq!(
-        charge_of(&w.cp, "e-foreign-team").await,
-        Some(Charge {
-            tenant_id: other_tenant.to_string(),
-            ..Charge::unpriced(&w, "tenant_mismatch")
-        })
+        claimed,
+        Some(other_tenant.to_string()),
+        "the claim stays in the usage row"
     );
-    assert_eq!(
-        charge_of(&w.cp, "e-no-team").await,
-        Some(Charge {
-            tenant_id: String::new(),
-            ..Charge::unpriced(&w, "tenant_mismatch")
-        })
-    );
-    for (id, key) in [
-        ("e-unknown-key", None),
-        ("e-not-a-key", Some("k1".to_string())),
-        ("e-upper-key", Some(w.key.to_uppercase())),
-    ] {
+    // A key that resolves to nothing files the row under no tenant and no
+    // member, and keeps the key it named.
+    for id in ["e-unknown-key", "e-not-a-key", "e-upper-key"] {
         let found = charge_of(&w.cp, id).await.expect("a charge row");
         assert_eq!(
             (
                 found.status.as_str(),
                 found.charge,
-                found.error_code.as_deref()
+                found.error_code.as_deref(),
+                found.tenant_id.as_str(),
+                found.user_id.as_str(),
             ),
-            ("unpriced", None, Some("unknown_api_key")),
+            ("unpriced", None, Some("unknown_api_key"), "", ""),
             "{id}"
         );
-        if let Some(key) = key {
-            assert_eq!(found.api_key_id, key, "{id}");
-        }
+    }
+    for (id, key) in [
+        ("e-not-a-key", "k1".to_string()),
+        ("e-upper-key", w.key.to_uppercase()),
+    ] {
+        let found = charge_of(&w.cp, id).await.expect("a charge row");
+        assert_eq!(found.api_key_id, key, "{id}");
     }
     assert_eq!(
         charge_of(&w.cp, "e-own").await,
@@ -1164,7 +1185,9 @@ async fn an_identity_too_long_to_index_does_not_fail_its_batch() {
 #[tokio::test]
 async fn a_duplicate_from_another_gateway_is_not_charged_again() {
     let Some(w) = world().await else { return };
-    let other = w.cp.issue_dp_client("gw-pricing-other-7c1").await;
+    let issuer = w.cp.admin_login_seeded(OperatorRole::Admin).await;
+    let bundle = w.cp.issue_bundle(&issuer, "gw-pricing-other-7c1").await;
+    let other = w.cp.dp_client(&bundle);
     let model = seed_model(&w.cp, &w.admin).await;
     price(&w.cp, model).await;
     let r = deliver(
@@ -1174,13 +1197,162 @@ async fn a_duplicate_from_another_gateway_is_not_charged_again() {
     )
     .await;
     assert_eq!(r.status, 200, "{r:?}");
+    let losing = Uuid::new_v4();
     let r = deliver(
         &other,
-        Uuid::new_v4(),
+        losing,
         vec![usage(&w, "e1", model, json!({"prompt_tokens": 999}))],
     )
     .await;
+    // Not counted as refused: re-sending could not store it either.
     assert_eq!((r.status, r.body.clone()), (200, counts(0, 0, 1)), "{r:?}");
+    let batch_rejected: i64 =
+        sqlx::query_scalar("SELECT rejected FROM usage_batches WHERE batch_id = $1")
+            .bind(losing)
+            .fetch_one(w.cp.db().pool())
+            .await
+            .expect("read the batch row");
+    assert_eq!(batch_rejected, 0);
     assert_eq!(w.cp.count("pricing_charges").await, 1);
     assert_eq!(charge_of(&w.cp, "e1").await, Some(Charge::charged(&w, 100)));
+    // The losing copy is kept for operators, under the gateway that sent it.
+    let kept: Vec<(String, Uuid, Value)> = sqlx::query_as(
+        "SELECT dp_id::text, batch_id, raw FROM usage_rejects WHERE reason = 'foreign_duplicate'",
+    )
+    .fetch_all(w.cp.db().pool())
+    .await
+    .expect("read the rejects");
+    assert_eq!(kept.len(), 1, "{kept:?}");
+    let (dp_id, batch_id, raw) = &kept[0];
+    assert_eq!(
+        (
+            dp_id.as_str(),
+            *batch_id,
+            raw["event_id"].clone(),
+            raw["prompt_tokens"].clone()
+        ),
+        (bundle.dp_id.as_str(), losing, json!("e1"), json!(999))
+    );
+
+    // A copy that bills the same (a row emitted again, at its own time) is an
+    // ordinary duplicate.
+    let r = deliver(
+        &other,
+        Uuid::new_v4(),
+        vec![usage(&w, "e1", model, json!({"prompt_tokens": 100}))],
+    )
+    .await;
+    assert_eq!((r.status, r.body.clone()), (200, counts(0, 0, 1)), "{r:?}");
+    assert_eq!(w.cp.count("usage_rejects").await, 1);
+}
+
+/// A key's member never changes, so a charge is filed under the key's member
+/// whatever member the row names, and under none for a key bound to none.
+#[tokio::test]
+async fn a_charge_records_its_keys_member_whatever_the_row_names() {
+    let Some(w) = world().await else { return };
+    let other_tenant = seed_tenant(&w.cp, &w.admin).await;
+    let stranger = w.cp.seed_member(other_tenant, MemberRole::Member).await.id;
+    let unbound_key = seed_key(&w.cp, &w.admin, w.tenant, None).await;
+    let model = seed_model(&w.cp, &w.admin).await;
+    price(&w.cp, model).await;
+    let r = deliver(
+        &w.dp,
+        Uuid::new_v4(),
+        vec![
+            usage(
+                &w,
+                "e-stranger",
+                model,
+                json!({"user_id": stranger.to_string(), "prompt_tokens": 100}),
+            ),
+            usage(
+                &w,
+                "e-unbound",
+                model,
+                json!({"api_key_id": unbound_key, "user_id": "u-forged-7c1", "prompt_tokens": 100}),
+            ),
+        ],
+    )
+    .await;
+    assert_eq!((r.status, r.body.clone()), (200, counts(2, 0, 0)), "{r:?}");
+    assert_eq!(
+        charge_of(&w.cp, "e-stranger").await,
+        Some(Charge::charged(&w, 100))
+    );
+    assert_eq!(
+        charge_of(&w.cp, "e-unbound").await,
+        Some(Charge {
+            api_key_id: unbound_key.clone(),
+            user_id: String::new(),
+            ..Charge::charged(&w, 100)
+        })
+    );
+}
+
+/// Delivers `e<i>` (680 µ$ of usage for `model`), which must be stored and
+/// charged.
+async fn deliver_charged(w: &World, model: Uuid, i: usize) {
+    let id = format!("e{i}");
+    let r = deliver(
+        &w.dp,
+        Uuid::new_v4(),
+        vec![usage(w, &id, model, tokens_680())],
+    )
+    .await;
+    assert_eq!((r.status, r.body.clone()), (200, counts(1, 0, 0)), "{r:?}");
+    assert_eq!(
+        charge_of(&w.cp, &id).await,
+        Some(Charge::charged(w, 680)),
+        "{id}"
+    );
+}
+
+/// A version row that is gone or hand-edited into something that is not a
+/// whole number never stops intake: every batch then reloads the book and
+/// is priced from what the tables hold.
+#[tokio::test]
+async fn a_missing_or_malformed_pricing_version_never_stops_intake() {
+    let Some(w) = world().await else { return };
+    let model = seed_model(&w.cp, &w.admin).await;
+    price(&w.cp, model).await;
+    let prices = w.cp.state().prices.clone();
+    let pool = w.cp.db().pool();
+    deliver_charged(&w, model, 0).await;
+    assert_eq!(prices.loads(), 1);
+
+    sqlx::query("DELETE FROM cp_settings WHERE key = 'pricing_version'")
+        .execute(pool)
+        .await
+        .expect("delete the version row");
+    deliver_charged(&w, model, 1).await;
+    deliver_charged(&w, model, 2).await;
+    assert_eq!(prices.loads(), 3, "reloaded for every batch");
+
+    sqlx::query("INSERT INTO cp_settings (key, value) VALUES ('pricing_version', '\"seven\"')")
+        .execute(pool)
+        .await
+        .expect("write a text version");
+    let mut i = 3;
+    for value in ["\"seven\"", "1.5", "100000000000000000000000", "null"] {
+        sqlx::query("UPDATE cp_settings SET value = $1::jsonb WHERE key = 'pricing_version'")
+            .bind(value)
+            .execute(pool)
+            .await
+            .expect("write a malformed version");
+        let before = prices.loads();
+        deliver_charged(&w, model, i).await;
+        assert_eq!(prices.loads(), before + 1, "{value}");
+        i += 1;
+    }
+
+    // Restored, the version is cached on again.
+    sqlx::query("UPDATE cp_settings SET value = '5' WHERE key = 'pricing_version'")
+        .execute(pool)
+        .await
+        .expect("restore the version");
+    let before = prices.loads();
+    deliver_charged(&w, model, i).await;
+    deliver_charged(&w, model, i + 1).await;
+    assert_eq!(prices.loads(), before + 1);
 }

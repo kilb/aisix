@@ -41,7 +41,10 @@
 //! ([`crate::pricing::price_stored`]) and gets its one charge, keyed on its
 //! `event_id`, so an event already stored, or a batch delivered before, is
 //! never priced again. Pricing never refuses an event: one that cannot be
-//! priced is stored with an `unpriced` charge.
+//! priced is stored with an `unpriced` charge. A copy of an event another
+//! gateway already stored with a different bill is kept in `usage_rejects`
+//! with reason `foreign_duplicate`, and is not counted as refused
+//! ([`crate::pricing::flag_foreign_duplicates`]).
 
 use std::collections::HashSet;
 use std::sync::Arc;
