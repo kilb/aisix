@@ -472,3 +472,14 @@ tr:hover td button.ghost{border-color:var(--rule-2);color:var(--oxide)}
 .rollout{display:inline-flex;flex-direction:column;gap:4px;align-items:flex-start}
 .rollout-errors{margin:0;padding:0 0 0 14px;font-size:12px;color:var(--oxide)}
 .rollout-errors code{font-family:var(--mono);font-size:11.5px}
+
+/* The JSON editor: a document refused at save time is outlined, and each
+   problem names its path in a highlight under it. */
+.json-editor textarea[aria-invalid="true"]{border-color:var(--oxide)}
+.json-editor > .r{margin-top:8px}
+.json-problems{margin:10px 0 0;padding:0 0 0 18px;font-size:13px;color:var(--oxide)}
+.json-problems li{margin:3px 0}
+.json-path{
+  font-family:var(--mono);font-size:12px;padding:1px 5px;
+  background:var(--oxide-wash);color:var(--oxide);border-radius:2px;
+}

@@ -1,0 +1,64 @@
+import { useId, useState } from "react";
+import type { Detail } from "../lib/api";
+
+/**
+ * A JSON document in a monospace textarea, with a `格式化` control and,
+ * under it, each problem the server found (`details`) at its JSON path,
+ * the path highlighted. Without `onChange` the document is read-only and
+ * nothing edits it.
+ */
+export function JsonEditor({
+  value,
+  onChange,
+  details,
+}: {
+  value: string;
+  onChange?: (next: string) => void;
+  details: Detail[];
+}) {
+  const problemsId = useId();
+  const [formatError, setFormatError] = useState<string | null>(null);
+
+  function format() {
+    try {
+      onChange?.(JSON.stringify(JSON.parse(value), null, 2));
+      setFormatError(null);
+    } catch (e) {
+      setFormatError(`不是合法的 JSON，无法格式化：${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+
+  return (
+    <div className="json-editor">
+      <textarea
+        aria-label="资源文档"
+        spellCheck={false}
+        readOnly={!onChange}
+        value={value}
+        onChange={(e) => {
+          setFormatError(null);
+          onChange?.(e.target.value);
+        }}
+        aria-invalid={details.length > 0 ? true : undefined}
+        aria-describedby={details.length > 0 ? problemsId : undefined}
+      />
+      {onChange && (
+        <div className="r">
+          <button type="button" className="ghost" onClick={format}>
+            格式化
+          </button>
+        </div>
+      )}
+      {formatError && <div className="note crit">{formatError}</div>}
+      {details.length > 0 && (
+        <ul id={problemsId} className="json-problems" aria-label="校验问题">
+          {details.map((d, i) => (
+            <li key={i} data-path={d.path}>
+              <mark className="json-path">{d.path || "（文档根）"}</mark> {d.message}
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
