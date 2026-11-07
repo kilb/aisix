@@ -481,7 +481,14 @@ pub struct UsageEvent {
     #[serde(flatten)]
     pub modality_tokens: aisix_gateway::ModalityTokens,
 
-    /// HTTP status code the proxy returned to the downstream caller.
+    /// HTTP status of the outcome as the gateway judged it. Outside platform
+    /// mode it is the status the caller received. In platform mode
+    /// (`proxy.platform.enabled`) the caller may have received another: an
+    /// upstream's error reaches it as one of the gateway's own error classes,
+    /// with that class's status (an upstream `401` is answered `503`), and a
+    /// model the key may not use is answered `404`. This field keeps the
+    /// original status, as `error_message` keeps the original text, so a
+    /// view shown to a tenant reads the class, not these two.
     pub status_code: u16,
 
     /// Provider response `id` — OpenAI's `chat.completion.id`, Anthropic's
