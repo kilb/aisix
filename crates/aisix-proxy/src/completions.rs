@@ -1423,12 +1423,13 @@ async fn dispatch(
 /// 这次 `/v1/completions` 调用的输入分桶：花费桶和用量事件的 `cost_usd` 取同一份。
 /// 这个端点只有 OpenAI 形状，缓存命中是 `prompt_tokens` 的子集，按缓存费率计价。
 fn completion_input_tokens(usage: &CompletionUsage) -> aisix_core::InputTokens {
-    crate::usage_attr::input_tokens_for_pricing(
-        u64::from(usage.prompt_tokens),
-        u64::from(usage.cached_prompt_tokens),
-        u64::from(usage.cache_write_tokens.unwrap_or(0)),
+    crate::usage_attr::input_tokens_from_counts(
+        usage.prompt_tokens,
+        usage.cached_prompt_tokens,
+        usage.cache_write_tokens,
         0,
         0,
+        aisix_gateway::CacheCreationTtl::NONE,
     )
 }
 

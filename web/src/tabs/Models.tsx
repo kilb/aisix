@@ -10,8 +10,8 @@ import type { DocState } from "../lib/useDoc";
  * 这些是各家公开文档写明的倍率，填价时用来一键换算，**不是网关行为** ——
  * 网关只按 `cost` 里填的数字算钱。
  */
-const CACHE_FACTORS: Record<string, { read: number; write: number; note: string }> = {
-  anthropic: { read: 0.1, write: 1.25, note: "读 0.1×、5 分钟写 1.25×（1 小时写为 2×）" },
+const CACHE_FACTORS: Record<string, { read: number; write: number; write1h?: number; note: string }> = {
+  anthropic: { read: 0.1, write: 1.25, write1h: 2.0, note: "读 0.1×、5 分钟写 1.25×（1 小时写为 2×）" },
   openai: { read: 0.5, write: 1.0, note: "缓存输入约为输入价的一半" },
   deepseek: { read: 0.1, write: 1.0, note: "命中缓存约为未命中的十分之一" },
   gemini: { read: 0.25, write: 1.0, note: "缓存读取按折扣计，另有存储费" },
@@ -66,9 +66,10 @@ export function Models({ doc }: { doc: DocState }) {
   const [priceOut, setPriceOut] = useState("");
   const [cacheR, setCacheR] = useState("");
   const [cacheW, setCacheW] = useState("");
+  const [cacheW1h, setCacheW1h] = useState("");
   const [mul, setMul] = useState("1");
   /**
-   * 缓存两格是否还归自动换算所有。
+   * 缓存三格是否还归自动换算所有。
    *
    * 旧界面把它放在模块作用域，于是手改过一次之后，本次会话里后续新增的每个
    * 模型都静默失去换算 —— 用户填了输入价，缓存两栏一直空着，缓存 token 全
@@ -89,19 +90,24 @@ export function Models({ doc }: { doc: DocState }) {
     return Number.isNaN(m) || m < 0 ? 1 : m;
   }, [mul]);
 
-  /** 缓存两格还归自动换算所有时，它们就是输入价乘上这家的倍率。 */
-  function derived(rate: number): string {
+  /**
+   * 缓存三格还归自动换算所有时，它们就是输入价乘上这家的倍率。这家没有公开的
+   * 1 小时写倍率时，那一格留空：网关按缓存写价计 1 小时写。
+   */
+  function derived(rate: number | undefined): string {
     const base = parseFloat(priceIn);
-    return !Number.isNaN(base) && base >= 0 ? trimNum(base * rate) : "";
+    return rate != null && !Number.isNaN(base) && base >= 0 ? trimNum(base * rate) : "";
   }
   const shownCacheR = factorsOwned ? derived(factor.read) : cacheR;
   const shownCacheW = factorsOwned ? derived(factor.write) : cacheW;
+  const shownCacheW1h = factorsOwned ? derived(factor.write1h) : cacheW1h;
 
-  /** 手改其中一格：两格都从此归手工所有，另一格留在当前显示的值上。 */
-  function editCache(r: string, w: string) {
+  /** 手改其中一格：三格都从此归手工所有，其余两格留在当前显示的值上。 */
+  function editCache(r: string, w: string, w1h: string) {
     setFactorsOwned(false);
     setCacheR(r);
     setCacheW(w);
+    setCacheW1h(w1h);
   }
 
   async function add() {
@@ -113,11 +119,12 @@ export function Models({ doc }: { doc: DocState }) {
     const o = parseOrNull(priceOut);
     const cr = parseOrNull(shownCacheR);
     const cw = parseOrNull(shownCacheW);
+    const cw1h = parseOrNull(shownCacheW1h);
 
     // 只填一半的定价此前被整块丢掉：模型于是变成未定价，而未定价的模型
     // 不计入任何花费上限 —— 用户填了价、表单也接受了，得到的却是一个静默
     // 豁免于自己预算的模型。宁可拦下来让他填全。
-    if ([i, o, cr, cw].some((v) => v != null) && (i == null || o == null)) {
+    if ([i, o, cr, cw, cw1h].some((v) => v != null) && (i == null || o == null)) {
       setNote({
         text:
           "填了定价就必须同时给出输入价和输出价——只给一半的话网关会把这个模型当作未定价，" +
@@ -134,8 +141,8 @@ export function Models({ doc }: { doc: DocState }) {
       provider_key: pk || String(pks[0]?.display_name ?? ""),
     };
     if (i != null && o != null) {
-      // 表单里是基础价，系数只在这里乘一次，四个价一视同仁。上游倍率已经含在
-      // 缓存两格的基础价里。
+      // 表单里是基础价，系数只在这里乘一次，五个价一视同仁。上游倍率已经含在
+      // 缓存三格的基础价里。
       const priced = (v: number) => Number(trimNum(v * mulNum));
       const cost: Record<string, number> = {
         input_per_1k: priced(i),
@@ -143,6 +150,7 @@ export function Models({ doc }: { doc: DocState }) {
       };
       if (cr != null) cost.cached_input_per_1k = priced(cr);
       if (cw != null) cost.cache_write_per_1k = priced(cw);
+      if (cw1h != null) cost.cache_write_1h_per_1k = priced(cw1h);
       item.cost = cost;
     }
     const ok = await run((d) => {
@@ -155,6 +163,7 @@ export function Models({ doc }: { doc: DocState }) {
       setPriceOut("");
       setCacheR("");
       setCacheW("");
+      setCacheW1h("");
       setFactorsOwned(true);
     }
   }
@@ -194,13 +203,14 @@ export function Models({ doc }: { doc: DocState }) {
                 <th className="right">输出</th>
                 <th className="right">缓存读</th>
                 <th className="right">缓存写</th>
+                <th className="right">1h 缓存写</th>
                 <th />
               </tr>
             </thead>
             <tbody>
               {models.length === 0 ? (
                 <tr>
-                  <td colSpan={8} style={{ color: "var(--ink-3)" }}>
+                  <td colSpan={9} style={{ color: "var(--ink-3)" }}>
                     还没有配置模型。
                   </td>
                 </tr>
@@ -228,6 +238,9 @@ export function Models({ doc }: { doc: DocState }) {
                       <td className="right num">
                         <Price v={c?.cache_write_per_1k} />
                       </td>
+                      <td className="right num">
+                        <Price v={c?.cache_write_1h_per_1k} />
+                      </td>
                       <td className="right">
                         <button className="ghost" disabled={busy} onClick={() => void del(i)}>
                           删除
@@ -241,8 +254,9 @@ export function Models({ doc }: { doc: DocState }) {
           </table>
         </div>
         <div className="note">
-          缓存读/写未设时，网关按<strong>输入价</strong>计缓存 token。
-          上游对缓存的计价是打折（读）和加价（写）的，所以不填这两项，缓存流量的花费统计会偏。
+          缓存读/写未设时，网关按<strong>输入价</strong>计缓存 token；1 小时缓存写未设时，按
+          <strong>缓存写价</strong>计。
+          上游对缓存的计价是打折（读）和加价（写）的，所以不填这几项，缓存流量的花费统计会偏。
         </div>
       </div>
 
@@ -331,7 +345,7 @@ export function Models({ doc }: { doc: DocState }) {
               step="0.000001"
               min="0"
               value={shownCacheR}
-              onChange={(e) => editCache(e.target.value, shownCacheW)}
+              onChange={(e) => editCache(e.target.value, shownCacheW, shownCacheW1h)}
             />
           </label>
           <label className="f">
@@ -341,17 +355,27 @@ export function Models({ doc }: { doc: DocState }) {
               step="0.000001"
               min="0"
               value={shownCacheW}
-              onChange={(e) => editCache(shownCacheR, e.target.value)}
+              onChange={(e) => editCache(shownCacheR, e.target.value, shownCacheW1h)}
+            />
+          </label>
+          <label className="f">
+            <span>1 小时缓存写 USD / 1k</span>
+            <input
+              type="number"
+              step="0.000001"
+              min="0"
+              value={shownCacheW1h}
+              onChange={(e) => editCache(shownCacheR, shownCacheW, e.target.value)}
             />
           </label>
         </div>
         <div className="note">
           <strong>{provider}</strong> 的公开缓存倍率：{factor.note}
-          。填好输入价后自动换算；保存时系数 {mulNum} 会同时乘到四个价上。
+          。填好输入价后自动换算；保存时系数 {mulNum} 会同时乘到五个价上。
           这些倍率是上游的计价规则，不是网关行为。
         </div>
         <label className="f" style={{ maxWidth: 320 }}>
-          <span>加价 / 折扣系数（对全部四个价生效）</span>
+          <span>加价 / 折扣系数（对全部五个价生效）</span>
           <input
             type="number"
             step="0.01"

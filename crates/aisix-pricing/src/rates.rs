@@ -229,8 +229,8 @@ impl Rates {
     ///
     /// These are the gateway's own pricing rules (`aisix_core::ModelCost`):
     /// a cache read or write without a rate of its own bills at the input
-    /// rate, one write rate covers both durations, and with no rate for
-    /// reasoning, audio or image tokens those bill at the input or output
+    /// rate, a one-hour write without one at the write rate, and with no rate
+    /// for reasoning, audio or image tokens those bill at the input or output
     /// rate of the side they are counted on.
     pub(crate) fn rate_for(&self, d: Dimension) -> Option<Rate> {
         self.explicit(d).or(match d {

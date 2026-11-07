@@ -1,8 +1,10 @@
 import { createHash } from "node:crypto";
+import { createServer, type Server } from "node:http";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   EtcdClient,
   metricDelta,
+  ProxyClient,
   scrapeMetrics,
   SeedClient,
   spawnApp,
@@ -30,6 +32,14 @@ import {
 //
 // So this asserts the NUMBER, computed independently from the configured
 // rates, for both shapes.
+//
+// A cache write has a lifetime, and the longer one costs more: Anthropic
+// prices a five-minute write at 1.25x input and a one-hour write at 2x
+// (https://docs.claude.com/en/docs/build-with-claude/prompt-caching#pricing),
+// and reports the split as `usage.cache_creation.ephemeral_5m_input_tokens` /
+// `ephemeral_1h_input_tokens`, parts of `cache_creation_input_tokens`. A
+// `cost` with a one-hour write rate charges the one-hour part at it, on
+// every endpoint that reaches that upstream, streamed or not.
 
 const CALLER = "sk-cached-pricing-e2e";
 const HASH = createHash("sha256").update(CALLER).digest("hex");
@@ -39,13 +49,86 @@ const IN_PER_1K = 1.0;
 const OUT_PER_1K = 10.0;
 const CACHED_PER_1K = 0.1;
 const WRITE_PER_1K = 1.25;
+const WRITE_1H_PER_1K = 2.0;
 
 const micro = (usd: number) => Math.round(usd * 1e6);
+
+/** What the split upstream reports: a 4000-token write, 1000 of it for one hour. */
+const SPLIT_USAGE = {
+  input_tokens: 1000,
+  cache_read_input_tokens: 2000,
+  cache_creation_input_tokens: 4000,
+  cache_creation: { ephemeral_5m_input_tokens: 3000, ephemeral_1h_input_tokens: 1000 },
+};
+const SPLIT_OUTPUT = 100;
+
+/**
+ * An Anthropic Messages upstream that reports the write-lifetime split,
+ * answering a streamed request with the documented event stream (the input
+ * side on `message_start`, the output count on `message_delta`:
+ * https://docs.anthropic.com/en/docs/build-with-claude/streaming) and any
+ * other with the message object. Which one the gateway asked for depends on
+ * the inbound endpoint, so it reads the request's own `stream` flag.
+ */
+async function startSplitUpstream(): Promise<{ server: Server; baseUrl: string }> {
+  const message = (model: unknown, usage: Record<string, unknown>) => ({
+    id: "msg_ctp_1h",
+    type: "message",
+    role: "assistant",
+    model,
+    content: [],
+    stop_reason: null,
+    stop_sequence: null,
+    usage,
+  });
+  const server = createServer((req, res) => {
+    let raw = "";
+    req.on("data", (c: Buffer) => (raw += c.toString("utf8")));
+    req.on("end", () => {
+      if (!(req.url ?? "").endsWith("/v1/messages")) {
+        res.writeHead(404, { "content-type": "application/json" });
+        res.end(JSON.stringify({ type: "error", error: { type: "not_found_error", message: req.url } }));
+        return;
+      }
+      const body = JSON.parse(raw) as { model?: unknown; stream?: boolean };
+      if (!body.stream) {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(
+          JSON.stringify({
+            ...message(body.model, { ...SPLIT_USAGE, output_tokens: SPLIT_OUTPUT }),
+            content: [{ type: "text", text: "ok" }],
+            stop_reason: "end_turn",
+          }),
+        );
+        return;
+      }
+      const events: Array<Record<string, unknown>> = [
+        { type: "message_start", message: message(body.model, { ...SPLIT_USAGE, output_tokens: 1 }) },
+        { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
+        { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "ok" } },
+        { type: "content_block_stop", index: 0 },
+        {
+          type: "message_delta",
+          delta: { stop_reason: "end_turn", stop_sequence: null },
+          usage: { output_tokens: SPLIT_OUTPUT },
+        },
+        { type: "message_stop" },
+      ];
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.end(events.map((e) => `event: ${String(e.type)}\ndata: ${JSON.stringify(e)}\n\n`).join(""));
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const addr = server.address();
+  if (addr === null || typeof addr === "string") throw new Error("the split upstream has no port");
+  return { server, baseUrl: `http://127.0.0.1:${addr.port}` };
+}
 
 describe("prompt-cached tokens are priced at their own rate", () => {
   let app: SpawnedApp | undefined;
   let upstream: OpenAiUpstream | undefined;
   let streamUpstream: OpenAiUpstream | undefined;
+  let splitUpstream: Awaited<ReturnType<typeof startSplitUpstream>> | undefined;
   let etcdReachable = false;
 
   beforeAll(async () => {
@@ -117,6 +200,7 @@ describe("prompt-cached tokens are priced at their own rate", () => {
         "[DONE]",
       ],
     });
+    splitUpstream = await startSplitUpstream();
     app = await spawnApp();
     const seed = new SeedClient(etcd, app.etcdPrefix);
 
@@ -182,6 +266,29 @@ describe("prompt-cached tokens are priced at their own rate", () => {
       provider_key_id: openaiPk.id,
       cost: { input_per_1k: IN_PER_1K, output_per_1k: OUT_PER_1K },
     });
+    const splitPk = await seed.createProviderKey({
+      display_name: "ctp-split-pk",
+      secret: "sk-mock",
+      api_base: splitUpstream.baseUrl,
+      provider: "anthropic",
+      adapter: "anthropic",
+    });
+    await seed.createModel({
+      display_name: "ctp-1h",
+      provider: "anthropic",
+      model_name: "claude-sonnet-4-5-20250929",
+      provider_key_id: splitPk.id,
+      cost: { ...cost, cache_write_1h_per_1k: WRITE_1H_PER_1K },
+    });
+    // The same upstream, priced by a `cost` written before the one-hour rate
+    // existed.
+    await seed.createModel({
+      display_name: "ctp-1h-norate",
+      provider: "anthropic",
+      model_name: "claude-sonnet-4-5-20250929",
+      provider_key_id: splitPk.id,
+      cost,
+    });
     // Last, per `tests/e2e/AGENTS.md`.
     await seed.createApiKey({
       key_hash: HASH,
@@ -191,6 +298,8 @@ describe("prompt-cached tokens are priced at their own rate", () => {
         "ctp-chat-nocacherate",
         "ctp-messages-openai",
         "ctp-messages-openai-stream",
+        "ctp-1h",
+        "ctp-1h-norate",
       ],
     });
   });
@@ -199,6 +308,9 @@ describe("prompt-cached tokens are priced at their own rate", () => {
     await app?.exit();
     await upstream?.close();
     await streamUpstream?.close();
+    await new Promise<void>((resolve) =>
+      splitUpstream ? splitUpstream.server.close(() => resolve()) : resolve(),
+    );
   });
 
   const scrape = () => scrapeMetrics(app!.metricsUrl);
@@ -221,11 +333,22 @@ describe("prompt-cached tokens are priced at their own rate", () => {
     return 0;
   }
 
-  function chat(model: string) {
+  function chat(model: string, stream = false) {
     return fetch(`${app!.proxyUrl}/v1/chat/completions`, {
       method: "POST",
       headers: { "content-type": "application/json", authorization: `Bearer ${CALLER}` },
-      body: JSON.stringify({ model, messages: [{ role: "user", content: "hi" }] }),
+      body: JSON.stringify({
+        model,
+        messages: [{ role: "user", content: "hi" }],
+        ...(stream ? { stream: true, stream_options: { include_usage: true } } : {}),
+      }),
+    });
+  }
+  function responses(model: string, stream = false) {
+    return fetch(`${app!.proxyUrl}/v1/responses`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${CALLER}` },
+      body: JSON.stringify({ model, input: "hi", ...(stream ? { stream: true } : {}) }),
     });
   }
   function messages(model = "ctp-messages", stream = false) {
@@ -374,5 +497,76 @@ describe("prompt-cached tokens are priced at their own rate", () => {
       "an operator who has not set cache rates must see the same number the " +
         "previous build reported, not a silently changed one",
     ).toBe(want);
+  }, 120_000);
+
+  // 1000 fresh + 2000 read + 3000 written for five minutes + 1000 written for
+  // one hour, and 100 out.
+  const WANT_1H = micro(
+    (1000 * IN_PER_1K +
+      2000 * CACHED_PER_1K +
+      3000 * WRITE_PER_1K +
+      1000 * WRITE_1H_PER_1K +
+      SPLIT_OUTPUT * OUT_PER_1K) /
+      1000,
+  );
+  // Every write at the five-minute rate: what a `cost` without the one-hour
+  // rate charges, and what the gateway charged before it had one.
+  const AT_THE_WRITE_RATE = micro(
+    (1000 * IN_PER_1K + 2000 * CACHED_PER_1K + 4000 * WRITE_PER_1K + SPLIT_OUTPUT * OUT_PER_1K) /
+      1000,
+  );
+
+  /** Every model and key is seeded before the caller key, so its first 200 implies them all. */
+  const callerAuthenticates = () =>
+    waitConfigPropagation(async () => {
+      return (await new ProxyClient(app!.proxyUrl, CALLER).listModels()).status === 200;
+    });
+
+  const ENDPOINTS = [
+    { endpoint: "/v1/messages", send: messages },
+    { endpoint: "/v1/chat/completions", send: chat },
+    { endpoint: "/v1/responses", send: responses },
+  ] as const;
+
+  for (const { endpoint, send } of ENDPOINTS) {
+    for (const stream of [false, true]) {
+      test(`a one-hour cache write is charged at its own rate: ${endpoint}${stream ? ", streamed" : ""}`, async (ctx) => {
+        if (!etcdReachable || !app) {
+          ctx.skip();
+          return;
+        }
+        await callerAuthenticates();
+
+        const before = await scrape();
+        const res = await send("ctp-1h", stream);
+        const text = await res.text();
+        expect(res.status, text).toBe(200);
+        const got = await spendDelta(before, endpoint, "ctp-1h");
+        expect(
+          got,
+          `1000 of the 4000 written tokens were written for one hour and bill at ` +
+            `${WRITE_1H_PER_1K}/1k; ${AT_THE_WRITE_RATE} would mean they were charged ` +
+            `at the five-minute write rate`,
+        ).toBe(WANT_1H);
+      }, 120_000);
+    }
+  }
+
+  test("a cost block with no one-hour rate charges a one-hour write at the write rate", async (ctx) => {
+    if (!etcdReachable || !app) {
+      ctx.skip();
+      return;
+    }
+    await callerAuthenticates();
+
+    const before = await scrape();
+    const res = await messages("ctp-1h-norate");
+    const text = await res.text();
+    expect(res.status, text).toBe(200);
+    const got = await spendDelta(before, "/v1/messages", "ctp-1h-norate");
+    expect(
+      got,
+      "a `cost` written before the one-hour rate existed must report what it reported before",
+    ).toBe(AT_THE_WRITE_RATE);
   }, 120_000);
 });

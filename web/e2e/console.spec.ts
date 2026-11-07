@@ -586,19 +586,21 @@ async function seedDoc(
   expect(r.status).toBe(200);
 }
 
-test("加价系数乘到全部四个价上", async ({ page }) => {
+test("加价系数乘到全部五个价上", async ({ page }) => {
   await signIn(page);
   await page.getByRole("tab", { name: "模型与定价" }).click();
   await page.getByLabel("对外模型名").fill("marked-up");
   await page.getByLabel("上游模型名").fill("gpt-4o-mini");
   await page.getByLabel("输入 USD / 1k").fill("1");
   await page.getByLabel("输出 USD / 1k").fill("2");
+  await expect(page.getByText("加价 / 折扣系数（对全部五个价生效）")).toBeVisible();
   await page.getByLabel(/加价 \/ 折扣系数/).fill("1.5");
   await page.getByRole("button", { name: /保存并重载网关/ }).click();
   await expect(page.getByText(/已保存/)).toBeVisible();
 
-  // 表单写明系数「对全部四个价生效」。openai 的缓存读是输入价的一半、缓存写等于
-  // 输入价，所以四个价是 1.5、3、0.75、1.5。
+  // 表单写明系数「对全部五个价生效」。openai 的缓存读是输入价的一半、缓存写等于
+  // 输入价，1 小时缓存写没有公开倍率、那一格留空，所以有值的四个价是 1.5、3、
+  // 0.75、1.5。
   const row = page.getByRole("row", { name: /marked-up/ });
   await expect(row).toContainText("$1.50000");
   await expect(row).toContainText("$3.00000");
@@ -620,6 +622,76 @@ test("手填的缓存价也吃加价系数", async ({ page }) => {
   const row = page.getByRole("row", { name: /marked-up-by-hand/ });
   await expect(row).toContainText("$2.00000");
   await expect(row).toContainText("$0.40000");
+});
+
+/** 当前文档里名为 `name` 的模型。经页面内 fetch，理由见 `otherClient`。 */
+async function savedModel(
+  browser: import("@playwright/test").Browser,
+  name: string,
+): Promise<Record<string, unknown> | undefined> {
+  const api = await otherClient(browser);
+  const cur = (await api.get("/api/file")).body as { doc: { models?: Record<string, unknown>[] } };
+  return cur.doc.models?.find((m) => m.display_name === name);
+}
+
+/** 模型表里 `model` 那一行、`column` 那一列的格子。 */
+async function priceCell(page: import("@playwright/test").Page, model: string, column: string) {
+  const table = page.locator("table", { has: page.getByRole("columnheader", { name: column, exact: true }) });
+  const headers = await table.locator("thead th").allTextContents();
+  const col = headers.indexOf(column);
+  expect(col, `表头里没有「${column}」：${headers.join(" | ")}`).toBeGreaterThan(-1);
+  return table.getByRole("row", { name: new RegExp(model) }).locator("td").nth(col);
+}
+
+test("anthropic 的 1 小时缓存写按 2 倍自动换算_带系数写进配置_网关校验收下", async ({ page, browser }) => {
+  await seedDoc(browser, (doc) => {
+    doc.provider_keys!.push({
+      display_name: "claude-1h",
+      provider: "anthropic",
+      api_key: "sk-ant-1h-e2e",
+    });
+  });
+  await signIn(page);
+  await page.getByRole("tab", { name: "模型与定价" }).click();
+  await page.getByLabel("对外模型名").fill("claude-1h-priced");
+  await page.getByLabel("绑定供应商").selectOption("claude-1h");
+  await expect(page.getByLabel("供应商类型")).toHaveValue("anthropic");
+  await page.getByLabel("上游模型名").fill("claude-sonnet-4-5");
+  await page.getByLabel("输入 USD / 1k").fill("0.003");
+  // anthropic 公开的 1 小时缓存写是输入价的 2 倍。
+  await expect(page.getByLabel("1 小时缓存写 USD / 1k")).toHaveValue("0.006");
+  await page.getByLabel("输出 USD / 1k").fill("0.015");
+  await page.getByLabel(/加价 \/ 折扣系数/).fill("1.5");
+  await page.getByRole("button", { name: /保存并重载网关/ }).click();
+
+  // 落盘前控制台用网关自己的 `aisix validate` 按严格 schema 校验：网关不认这个
+  // 字段的话，这里不会说「已保存」，文件也不会写 —— 正是「表单动了、校验器没动」。
+  await expect(page.getByText(/已保存/)).toBeVisible();
+  const saved = await savedModel(browser, "claude-1h-priced");
+  // 0.006 × 1.5：系数和别的价一样只乘一次。
+  expect(saved?.cost).toMatchObject({ cache_write_1h_per_1k: 0.009 });
+  await expect(await priceCell(page, "claude-1h-priced", "1h 缓存写")).toHaveText("$0.00900");
+});
+
+test("没有公开 1 小时写倍率的供应商_那一格留空_配置里不写这个字段", async ({ page, browser }) => {
+  await signIn(page);
+  await page.getByRole("tab", { name: "模型与定价" }).click();
+  await page.getByLabel("对外模型名").fill("openai-no-1h");
+  await page.getByLabel("绑定供应商").selectOption("seed-pk");
+  await expect(page.getByLabel("供应商类型")).toHaveValue("openai");
+  await page.getByLabel("上游模型名").fill("gpt-4o-mini");
+  await page.getByLabel("输入 USD / 1k").fill("0.001");
+  // 换算确实在工作（缓存写跟着填上了），只有 1 小时那一格没有倍率可乘。
+  await expect(page.getByLabel("缓存写 USD / 1k", { exact: true })).toHaveValue("0.001");
+  await expect(page.getByLabel("1 小时缓存写 USD / 1k")).toHaveValue("");
+  await page.getByLabel("输出 USD / 1k").fill("0.002");
+  await page.getByRole("button", { name: /保存并重载网关/ }).click();
+  await expect(page.getByText(/已保存/)).toBeVisible();
+
+  const saved = await savedModel(browser, "openai-no-1h");
+  expect(saved?.cost).toMatchObject({ cache_write_per_1k: 0.001 });
+  expect(saved?.cost).not.toHaveProperty("cache_write_1h_per_1k");
+  await expect(await priceCell(page, "openai-no-1h", "1h 缓存写")).toHaveText("未设");
 });
 
 test("新增模型的供应商类型跟着绑定的供应商走_换类型后缓存价跟着换算", async ({ page, browser }) => {

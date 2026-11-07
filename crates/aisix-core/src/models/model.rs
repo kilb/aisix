@@ -92,8 +92,10 @@ pub struct ModelCost {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 0.0))]
     pub cached_input_per_1k: Option<f64>,
-    /// Cost in USD per 1,000 prompt tokens written INTO the provider's cache.
-    /// Omitted, cache writes are charged at `input_per_1k`.
+    /// Cost in USD per 1,000 prompt tokens written INTO the provider's cache:
+    /// writes with a five-minute lifetime, writes whose lifetime the provider
+    /// does not report, and one-hour writes too when `cache_write_1h_per_1k`
+    /// is omitted. Omitted, cache writes are charged at `input_per_1k`.
     ///
     /// Writes are the direction that costs more than plain input — one
     /// provider prices a five-minute write at 1.25x its input rate and a
@@ -102,6 +104,18 @@ pub struct ModelCost {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 0.0))]
     pub cache_write_per_1k: Option<f64>,
+    /// Cost in USD per 1,000 prompt tokens written into the provider's cache
+    /// with a one-hour lifetime. Omitted, one-hour writes are charged at
+    /// `cache_write_per_1k`, or at `input_per_1k` when that is omitted too.
+    ///
+    /// A longer cache lifetime costs more to write: one provider prices a
+    /// one-hour write at 2x its input rate, against 1.25x for a five-minute
+    /// write. Only writes the provider reports as one-hour writes are charged
+    /// at this rate; a write whose lifetime is not reported is charged at
+    /// `cache_write_per_1k`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 0.0))]
+    pub cache_write_1h_per_1k: Option<f64>,
 }
 
 /// The three input-token buckets pricing needs, guaranteed DISJOINT.
@@ -144,6 +158,10 @@ pub struct InputTokens {
     pub cache_read: u64,
     /// Prompt tokens written into the cache.
     pub cache_write: u64,
+    /// The part of `cache_write` written with a one-hour lifetime, which has
+    /// a rate of its own. A part, never a fourth bucket: [`Self::total`] does
+    /// not add it again.
+    pub cache_write_1h: u64,
 }
 
 impl InputTokens {
@@ -152,6 +170,15 @@ impl InputTokens {
         Self {
             uncached: prompt,
             ..Self::default()
+        }
+    }
+
+    /// The same buckets with `n` of the cache writes marked as one-hour
+    /// writes, capped at `cache_write`.
+    pub fn with_one_hour_writes(self, n: u64) -> Self {
+        Self {
+            cache_write_1h: n.min(self.cache_write),
+            ..self
         }
     }
 
@@ -203,6 +230,36 @@ pub fn input_tokens_for_pricing(
             .saturating_sub(cache_write_subset),
         cache_read: cached_prompt_tokens.saturating_add(cache_read_tokens),
         cache_write: cache_creation_tokens.saturating_add(cache_write_subset),
+        cache_write_1h: 0,
+    }
+}
+
+/// The one-hour part of a cache write, read off the upstream's write-lifetime
+/// split (`cache_creation_5m_tokens` / `cache_creation_1h_tokens`, parts of
+/// `cache_creation_tokens`). The ONLY place that reading lives.
+///
+/// - `Some(0)` when neither part is reported: every write is a five-minute
+///   one.
+/// - `Some(one_h)` when both are reported and add up to the whole write.
+/// - `None` otherwise: a split that does not account for the write says
+///   nothing trustworthy about which lifetime each token had.
+///
+/// What `None` means is the caller's: the pricing engine refuses the row,
+/// while the gateway's own spend prices every write at the five-minute rate,
+/// because a spend figure never fails a request.
+pub fn one_hour_cache_writes(
+    cache_creation_tokens: u64,
+    five_m: Option<u32>,
+    one_h: Option<u32>,
+) -> Option<u64> {
+    match (five_m, one_h) {
+        (None, None) => Some(0),
+        (Some(five_m), Some(one_h))
+            if u64::from(five_m) + u64::from(one_h) == cache_creation_tokens =>
+        {
+            Some(u64::from(one_h))
+        }
+        _ => None,
     }
 }
 
@@ -232,9 +289,17 @@ impl ModelCost {
         // keeps reporting exactly what it reported yesterday.
         let cached_rate = self.cached_input_per_1k.unwrap_or(self.input_per_1k);
         let write_rate = self.cache_write_per_1k.unwrap_or(self.input_per_1k);
+        // A one-hour write is taken out of the write bucket only when it has
+        // a rate of its own. Without one it stays there, so the block prices
+        // bit for bit as it did before the field existed.
+        let (write_rate_1h, write_1h) = match self.cache_write_1h_per_1k {
+            Some(rate) => (rate, input.cache_write_1h.min(input.cache_write)),
+            None => (write_rate, 0),
+        };
         (self.input_per_1k * (input.uncached as f64)
             + cached_rate * (input.cache_read as f64)
-            + write_rate * (input.cache_write as f64)
+            + write_rate * ((input.cache_write - write_1h) as f64)
+            + write_rate_1h * (write_1h as f64)
             + self.output_per_1k * (output_tokens as f64))
             / 1000.0
     }
@@ -904,8 +969,8 @@ impl Resource for Model {
 #[cfg(test)]
 mod tests {
     use super::{
-        input_tokens_for_pricing, reasoning_beside_completion, spend_micro_usd, InputTokens,
-        ModelCost,
+        input_tokens_for_pricing, one_hour_cache_writes, reasoning_beside_completion,
+        spend_micro_usd, InputTokens, ModelCost,
     };
 
     /// Rates chosen so each bucket is distinguishable in the total: mixing
@@ -916,6 +981,7 @@ mod tests {
             output_per_1k: 10.0,
             cached_input_per_1k: Some(0.1),
             cache_write_per_1k: Some(1.25),
+            cache_write_1h_per_1k: None,
         }
     }
 
@@ -929,6 +995,7 @@ mod tests {
             output_per_1k: 4.0,
             cached_input_per_1k: None,
             cache_write_per_1k: None,
+            cache_write_1h_per_1k: None,
         };
         // 1000 fresh + 1000 read + 1000 write, all at the input rate.
         let with_cache = c.calculate_with_cache(
@@ -936,6 +1003,7 @@ mod tests {
                 uncached: 1000,
                 cache_read: 1000,
                 cache_write: 1000,
+                cache_write_1h: 0,
             },
             0,
         );
@@ -954,6 +1022,7 @@ mod tests {
                 uncached: 1000,
                 cache_read: 2000,
                 cache_write: 4000,
+                cache_write_1h: 0,
             },
             1000,
         );
@@ -977,6 +1046,7 @@ mod tests {
             uncached: 200,
             cache_read: 800,
             cache_write: 0,
+            cache_write_1h: 0,
         };
         assert_eq!(input.uncached, 200);
         assert_eq!(input.cache_read, 800);
@@ -1001,6 +1071,7 @@ mod tests {
             uncached: 0,
             cache_read: 999,
             cache_write: 0,
+            cache_write_1h: 0,
         };
         let got = cost().calculate_with_cache(input, 0);
         // 999 tokens at the cached rate (0.1 / 1k) — not zero, and not the
@@ -1023,6 +1094,7 @@ mod tests {
                 uncached: 0,
                 cache_read: 1000,
                 cache_write: 0,
+                cache_write_1h: 0,
             },
             0,
         );
@@ -1031,6 +1103,7 @@ mod tests {
                 uncached: 0,
                 cache_read: 0,
                 cache_write: 1000,
+                cache_write_1h: 0,
             },
             0,
         );
@@ -1039,6 +1112,7 @@ mod tests {
                 uncached: 1000,
                 cache_read: 0,
                 cache_write: 0,
+                cache_write_1h: 0,
             },
             0,
         );
@@ -1116,6 +1190,7 @@ mod tests {
             output_per_1k: 0.0,
             cached_input_per_1k: Some(1.0),
             cache_write_per_1k: Some(12.5),
+            cache_write_1h_per_1k: None,
         };
         // 200*10 + 100*1 + 700*12.5 = 10850, divided by 1000.
         assert!((cost.calculate_with_cache(got, 0) - 10.85).abs() < 1e-9);
@@ -1142,6 +1217,73 @@ mod tests {
     fn spend_clamps_negative_and_nan_to_zero() {
         assert_eq!(spend_micro_usd(-1.0), 0);
         assert_eq!(spend_micro_usd(f64::NAN), 0);
+    }
+
+    /// Rates for the one-hour write tests: input 1, write 1.25, one-hour
+    /// write 2, output 10, per 1,000 tokens.
+    fn one_hour_cost() -> ModelCost {
+        ModelCost {
+            input_per_1k: 1.0,
+            output_per_1k: 10.0,
+            cached_input_per_1k: None,
+            cache_write_per_1k: Some(1.25),
+            cache_write_1h_per_1k: Some(2.0),
+        }
+    }
+
+    /// 1000 fresh tokens and a 3000-token cache write, 1000 of it written for
+    /// one hour.
+    fn one_hour_input() -> InputTokens {
+        InputTokens {
+            uncached: 1000,
+            cache_write: 3000,
+            ..InputTokens::default()
+        }
+        .with_one_hour_writes(1000)
+    }
+
+    /// One provider prices a one-hour write at 2x input against 1.25x for
+    /// five minutes; priced at the write rate, the one-hour part is 37.5%
+    /// under.
+    #[test]
+    fn a_one_hour_write_is_charged_at_its_own_rate() {
+        let got = one_hour_cost().calculate_with_cache(one_hour_input(), 0);
+        // (1000×1 + 2000×1.25 + 1000×2) / 1000
+        assert!((got - 5.5).abs() < 1e-9, "got {got}");
+    }
+
+    /// A `cost` block written before the one-hour rate existed must report
+    /// what it reported before: every write at the write rate.
+    #[test]
+    fn a_cost_block_without_a_one_hour_rate_prices_as_before() {
+        let cost = ModelCost {
+            cache_write_1h_per_1k: None,
+            ..one_hour_cost()
+        };
+        let got = cost.calculate_with_cache(one_hour_input(), 0);
+        // (1000 + 3000×1.25) / 1000
+        assert!((got - 4.75).abs() < 1e-9, "got {got}");
+    }
+
+    #[test]
+    fn a_one_hour_write_with_no_write_rate_falls_back_to_input() {
+        let cost = ModelCost {
+            cache_write_per_1k: None,
+            cache_write_1h_per_1k: None,
+            ..one_hour_cost()
+        };
+        let got = cost.calculate_with_cache(one_hour_input(), 0);
+        // 4000×1 / 1000
+        assert!((got - 4.0).abs() < 1e-9, "got {got}");
+    }
+
+    #[test]
+    fn one_hour_cache_writes_reads_only_a_whole_split() {
+        assert_eq!(one_hour_cache_writes(4, None, None), Some(0));
+        assert_eq!(one_hour_cache_writes(4, Some(1), Some(3)), Some(3));
+        assert_eq!(one_hour_cache_writes(4, Some(1), Some(2)), None);
+        assert_eq!(one_hour_cache_writes(4, None, Some(4)), None);
+        assert_eq!(one_hour_cache_writes(0, Some(0), Some(0)), Some(0));
     }
 
     #[test]

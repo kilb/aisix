@@ -104,6 +104,7 @@ impl GatewayPrice {
             output_per_1k: per_1k(self.output),
             cached_input_per_1k: self.cache_read.map(per_1k),
             cache_write_per_1k: self.cache_write.map(per_1k),
+            cache_write_1h_per_1k: None,
         }
     }
 

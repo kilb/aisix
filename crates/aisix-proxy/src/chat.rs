@@ -581,12 +581,13 @@ pub async fn chat_completions(
                     let blocked_cost_usd = crate::usage_attr::request_cost_usd(
                         &snapshot,
                         event_model_id,
-                        crate::usage_attr::input_tokens_for_pricing(
-                            u64::from(c.prompt_tokens),
-                            u64::from(c.cached_prompt_tokens),
-                            u64::from(c.cache_write_tokens.unwrap_or(0)),
-                            u64::from(c.cache_read_tokens),
-                            u64::from(c.cache_creation_tokens),
+                        crate::usage_attr::input_tokens_from_counts(
+                            c.prompt_tokens,
+                            c.cached_prompt_tokens,
+                            c.cache_write_tokens,
+                            c.cache_read_tokens,
+                            c.cache_creation_tokens,
+                            c.cache_creation_ttl,
                         ),
                         u64::from(c.completion_tokens),
                     );
@@ -2579,12 +2580,13 @@ async fn dispatch(
                 let stream_cost_usd = crate::usage_attr::request_cost_usd(
                     &snap,
                     &model_id_for_telem,
-                    crate::usage_attr::input_tokens_for_pricing(
-                        u64::from(comp.prompt_tokens),
-                        u64::from(comp.cached_prompt_tokens),
-                        u64::from(comp.cache_write_tokens.unwrap_or(0)),
-                        u64::from(comp.cache_read_tokens),
-                        u64::from(comp.cache_creation_tokens),
+                    crate::usage_attr::input_tokens_from_counts(
+                        comp.prompt_tokens,
+                        comp.cached_prompt_tokens,
+                        comp.cache_write_tokens,
+                        comp.cache_read_tokens,
+                        comp.cache_creation_tokens,
+                        comp.cache_creation_ttl,
                     ),
                     u64::from(comp.completion_tokens),
                 );
@@ -3768,12 +3770,13 @@ async fn dispatch(
         // `cost`，按它定价就是恒 0 —— 花费指标为空、额度不被消耗、预算形同虚设。
         // 直连模型下两者相等，所以这个洞一直没被看见。
         chosen_target_id.as_deref().unwrap_or(&model_id),
-        crate::usage_attr::input_tokens_for_pricing(
-            prompt,
-            u64::from(cached_prompt_tokens),
-            u64::from(cache_write_tokens.unwrap_or(0)),
-            u64::from(cache_read_tokens),
-            u64::from(cache_creation_tokens),
+        crate::usage_attr::input_tokens_from_counts(
+            prompt_tokens_u32,
+            cached_prompt_tokens,
+            cache_write_tokens,
+            cache_read_tokens,
+            cache_creation_tokens,
+            cache_creation_ttl,
         ),
         completion,
     );
@@ -4627,12 +4630,13 @@ async fn dispatch_ensemble(
                 let judge_cost_usd = crate::usage_attr::request_cost_usd(
                     &snap,
                     &judge_model_id,
-                    crate::usage_attr::input_tokens_for_pricing(
-                        u64::from(comp.prompt_tokens),
-                        u64::from(comp.cached_prompt_tokens),
-                        u64::from(comp.cache_write_tokens.unwrap_or(0)),
-                        u64::from(comp.cache_read_tokens),
-                        u64::from(comp.cache_creation_tokens),
+                    crate::usage_attr::input_tokens_from_counts(
+                        comp.prompt_tokens,
+                        comp.cached_prompt_tokens,
+                        comp.cache_write_tokens,
+                        comp.cache_read_tokens,
+                        comp.cache_creation_tokens,
+                        comp.cache_creation_ttl,
                     ),
                     u64::from(comp.completion_tokens),
                 );
@@ -4854,13 +4858,7 @@ async fn dispatch_ensemble(
     let judge_cost_usd = crate::usage_attr::request_cost_usd(
         snapshot,
         &resolve_sub(&outcome.judge_model).0,
-        crate::usage_attr::input_tokens_for_pricing(
-            u64::from(effective_judge.usage.prompt_tokens),
-            u64::from(effective_judge.usage.cached_prompt_tokens),
-            u64::from(effective_judge.usage.cache_write_tokens.unwrap_or(0)),
-            u64::from(effective_judge.usage.cache_read_tokens),
-            u64::from(effective_judge.usage.cache_creation_tokens),
-        ),
+        crate::usage_attr::input_tokens_of(&effective_judge.usage),
         u64::from(effective_judge.usage.completion_tokens),
     );
     let ensemble_cost_usd = judge_cost_usd
@@ -6053,13 +6051,7 @@ impl EnsembleSubcall {
         crate::usage_attr::request_cost_usd(
             snap,
             &self.model_id,
-            crate::usage_attr::input_tokens_for_pricing(
-                u64::from(self.usage.prompt_tokens),
-                u64::from(self.usage.cached_prompt_tokens),
-                u64::from(self.usage.cache_write_tokens.unwrap_or(0)),
-                u64::from(self.usage.cache_read_tokens),
-                u64::from(self.usage.cache_creation_tokens),
-            ),
+            crate::usage_attr::input_tokens_of(&self.usage),
             u64::from(self.usage.completion_tokens),
         )
     }

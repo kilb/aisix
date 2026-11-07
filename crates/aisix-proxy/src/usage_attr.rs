@@ -513,6 +513,62 @@ pub(crate) fn pricing_index(snap: &AisixSnapshot) -> Arc<aisix_core::models::Pri
 
 pub(crate) use aisix_core::{input_tokens_for_pricing, spend_micro_usd};
 
+/// The input buckets a request is priced from, read off the counters the
+/// upstream reported: the three disjoint buckets
+/// (`aisix_core::input_tokens_for_pricing`), with the one-hour part of the
+/// cache write marked, so a `cost` with a one-hour write rate charges it there.
+///
+/// Every site that prices a request from upstream-reported counters goes
+/// through here, streamed or buffered, ensemble panel and judge included:
+/// the write-lifetime split cannot then be priced on one handler family and
+/// missed on another. Taking `ttl` as an argument makes a site that has no
+/// split say so (`CacheCreationTtl::NONE`) rather than forget it.
+///
+/// The split is read as the usage event will report it
+/// (`CacheCreationTtl::accounting_for`, which every outlet applies) and then
+/// by `aisix_core::one_hour_cache_writes`, as the control plane reads the
+/// event: the spend prices a one-hour write exactly when the event reports
+/// one. A split that does not account for the whole write is reported as no
+/// split, and every write is priced at the five-minute rate.
+pub(crate) fn input_tokens_from_counts(
+    prompt_tokens: u32,
+    cached_prompt_tokens: u32,
+    cache_write_tokens: Option<u32>,
+    cache_read_tokens: u32,
+    cache_creation_tokens: u32,
+    ttl: aisix_gateway::CacheCreationTtl,
+) -> aisix_core::InputTokens {
+    let reported = ttl.accounting_for(cache_creation_tokens);
+    // `None` is a split the control plane would refuse; a spend figure never
+    // fails a request, so it prices every write at the five-minute rate.
+    let one_hour = aisix_core::one_hour_cache_writes(
+        u64::from(cache_creation_tokens),
+        reported.cache_creation_5m_tokens,
+        reported.cache_creation_1h_tokens,
+    )
+    .unwrap_or(0);
+    input_tokens_for_pricing(
+        u64::from(prompt_tokens),
+        u64::from(cached_prompt_tokens),
+        u64::from(cache_write_tokens.unwrap_or(0)),
+        u64::from(cache_read_tokens),
+        u64::from(cache_creation_tokens),
+    )
+    .with_one_hour_writes(one_hour)
+}
+
+/// [`input_tokens_from_counts`] over a `UsageStats`.
+pub(crate) fn input_tokens_of(u: &aisix_gateway::UsageStats) -> aisix_core::InputTokens {
+    input_tokens_from_counts(
+        u.prompt_tokens,
+        u.cached_prompt_tokens,
+        u.cache_write_tokens,
+        u.cache_read_tokens,
+        u.cache_creation_tokens,
+        u.cache_creation_ttl,
+    )
+}
+
 /// 这次调用要记进花费桶的量（micro-USD）。与 [`request_cost_usd`] 同源同参，
 /// 只是换成计数器用的整数单位——两处各算一遍才是它们漂移的方式。
 pub(crate) fn request_spend_micro_usd(
@@ -1917,6 +1973,109 @@ mod tests {
             0.0,
             "a row that no longer resolves must not panic or guess"
         );
+    }
+
+    /// A snapshot holding one model, `m-1h`, priced at input 1, write 1.25,
+    /// one-hour write 2 and output 10 USD per 1,000 tokens.
+    fn one_hour_priced_snapshot() -> AisixSnapshot {
+        use aisix_core::resource::ResourceEntry;
+        use aisix_core::snapshot::ResourceTable;
+
+        let table = ResourceTable::default();
+        let model: aisix_core::Model = serde_json::from_value(serde_json::json!({
+            "display_name": "one-hour",
+            "provider": "anthropic",
+            "model_name": "claude-sonnet-4-5",
+            "provider_key_id": "pk-1",
+            "cost": {
+                "input_per_1k": 1.0,
+                "output_per_1k": 10.0,
+                "cache_write_per_1k": 1.25,
+                "cache_write_1h_per_1k": 2.0,
+            },
+        }))
+        .unwrap();
+        table.insert(ResourceEntry::new("m-1h", model, 1));
+        AisixSnapshot {
+            models: table,
+            ..Default::default()
+        }
+    }
+
+    /// An Anthropic-shape usage: 1000 fresh prompt tokens beside a
+    /// 3000-token cache write, split `five_m` / `one_h` by lifetime.
+    fn written_for(five_m: Option<u32>, one_h: Option<u32>) -> aisix_gateway::UsageStats {
+        aisix_gateway::UsageStats {
+            cache_creation_tokens: 3000,
+            cache_creation_ttl: aisix_gateway::CacheCreationTtl {
+                cache_creation_5m_tokens: five_m,
+                cache_creation_1h_tokens: one_h,
+            },
+            ..aisix_gateway::UsageStats::new(1000, 0)
+        }
+    }
+
+    #[test]
+    fn a_one_hour_split_prices_its_one_hour_part_at_the_one_hour_rate() {
+        let usage = written_for(Some(2000), Some(1000));
+        let input = input_tokens_of(&usage);
+        assert_eq!(
+            (
+                input.uncached,
+                input.cache_read,
+                input.cache_write,
+                input.cache_write_1h
+            ),
+            (1000, 0, 3000, 1000)
+        );
+        let cost = request_cost_usd(&one_hour_priced_snapshot(), "m-1h", input, 0);
+        // (1000×1 + 2000×1.25 + 1000×2) / 1000
+        assert!((cost - 5.5).abs() < 1e-9, "got {cost}");
+    }
+
+    /// A split whose parts miss the write says nothing trustworthy about
+    /// which token had which lifetime. The spend never refuses a request, so
+    /// it prices every write at the write rate.
+    #[test]
+    fn a_split_that_does_not_add_up_prices_every_write_at_the_write_rate() {
+        let usage = written_for(Some(2000), Some(500));
+        let input = input_tokens_of(&usage);
+        assert_eq!((input.cache_write, input.cache_write_1h), (3000, 0));
+        let cost = request_cost_usd(&one_hour_priced_snapshot(), "m-1h", input, 0);
+        // (1000 + 3000×1.25) / 1000
+        assert!((cost - 4.75).abs() < 1e-9, "got {cost}");
+    }
+
+    /// The spend prices a one-hour write exactly when the usage event reports
+    /// one, read the way a control plane re-pricing the event reads it, for
+    /// every shape a split can arrive in.
+    #[test]
+    #[allow(clippy::field_reassign_with_default)] // A literal here would read as an emitter to the scans below.
+    fn the_spend_reads_the_split_the_usage_event_reports() {
+        for (five_m, one_h) in [
+            (None, None),
+            (Some(2000), Some(1000)),
+            (Some(2000), Some(500)),
+            (None, Some(3000)),
+            (Some(3000), None),
+            (Some(0), Some(0)),
+        ] {
+            let usage = written_for(five_m, one_h);
+            let mut event = UsageEvent::default();
+            event.cache_creation_tokens = usage.cache_creation_tokens;
+            event.cache_creation_ttl = usage.cache_creation_ttl;
+            let reported = event.settled_cache_creation_ttl();
+            let read_off_the_event = aisix_core::one_hour_cache_writes(
+                u64::from(event.cache_creation_tokens),
+                reported.cache_creation_5m_tokens,
+                reported.cache_creation_1h_tokens,
+            );
+            assert_eq!(
+                Some(input_tokens_of(&usage).cache_write_1h),
+                read_off_the_event,
+                "split {five_m:?} / {one_h:?}"
+            );
+        }
     }
 
     /// Wrapping a token count understates usage, and the upstream that

@@ -3169,6 +3169,7 @@ async fn attribute_batch_usage(job: &BatchAttribution) -> Result<(), String> {
     let slice_cost_usd = |agg: &Agg| {
         cost.map(|c| {
             c.calculate_with_cache(
+                // OpenAI-shaped lines: no cache creation, so no write-lifetime split.
                 crate::usage_attr::input_tokens_for_pricing(
                     agg.prompt,
                     agg.cached,

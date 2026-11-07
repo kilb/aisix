@@ -1422,12 +1422,13 @@ async fn dispatch(
                                     crate::usage_attr::request_spend_micro_usd(
                                         snapshot,
                                         &target.id,
-                                        crate::usage_attr::input_tokens_for_pricing(
-                                            u64::from(u.prompt_tokens),
-                                            u64::from(u.cached_prompt_tokens),
-                                            u64::from(u.cache_write_tokens.unwrap_or(0)),
-                                            u64::from(u.cache_read_tokens),
-                                            u64::from(u.cache_creation_tokens),
+                                        crate::usage_attr::input_tokens_from_counts(
+                                            u.prompt_tokens,
+                                            u.cached_prompt_tokens,
+                                            u.cache_write_tokens,
+                                            u.cache_read_tokens,
+                                            u.cache_creation_tokens,
+                                            u.cache_creation_ttl,
                                         ),
                                         u64::from(u.completion_tokens),
                                     )
@@ -2305,12 +2306,13 @@ async fn responses_to_target(
                     crate::usage_attr::request_spend_micro_usd(
                         &snap_c,
                         &model_id_c,
-                        crate::usage_attr::input_tokens_for_pricing(
-                            u64::from(usage.prompt_tokens),
-                            u64::from(usage.cached_prompt_tokens),
-                            u64::from(usage.cache_write_tokens.unwrap_or(0)),
-                            u64::from(usage.cache_read_tokens),
-                            u64::from(usage.cache_creation_tokens),
+                        crate::usage_attr::input_tokens_from_counts(
+                            usage.prompt_tokens,
+                            usage.cached_prompt_tokens,
+                            usage.cache_write_tokens,
+                            usage.cache_read_tokens,
+                            usage.cache_creation_tokens,
+                            usage.cache_creation_ttl,
                         ),
                         u64::from(usage.completion_tokens),
                     ),
@@ -2989,12 +2991,13 @@ async fn responses_cross_provider_to_target(
                     crate::usage_attr::request_spend_micro_usd(
                         &snap_c,
                         &model_id_c,
-                        crate::usage_attr::input_tokens_for_pricing(
-                            u64::from(usage.prompt_tokens),
-                            u64::from(usage.cached_prompt_tokens),
-                            u64::from(usage.cache_write_tokens.unwrap_or(0)),
-                            u64::from(usage.cache_read_tokens),
-                            u64::from(usage.cache_creation_tokens),
+                        crate::usage_attr::input_tokens_from_counts(
+                            usage.prompt_tokens,
+                            usage.cached_prompt_tokens,
+                            usage.cache_write_tokens,
+                            usage.cache_read_tokens,
+                            usage.cache_creation_tokens,
+                            usage.cache_creation_ttl,
                         ),
                         u64::from(usage.completion_tokens),
                     ),
@@ -5516,12 +5519,13 @@ fn emit_usage_event(
             // `/v1/responses` carries BOTH vocabularies: the OpenAI subset
             // counter on the verbatim path, the Anthropic separate counters on
             // the cross-provider bridge (#825). The splitter handles either.
-            crate::usage_attr::input_tokens_for_pricing(
-                u64::from(usage.prompt_tokens),
-                u64::from(usage.cached_prompt_tokens),
-                u64::from(usage.cache_write_tokens.unwrap_or(0)),
-                u64::from(usage.cache_read_tokens),
-                u64::from(usage.cache_creation_tokens),
+            crate::usage_attr::input_tokens_from_counts(
+                usage.prompt_tokens,
+                usage.cached_prompt_tokens,
+                usage.cache_write_tokens,
+                usage.cache_read_tokens,
+                usage.cache_creation_tokens,
+                usage.cache_creation_ttl,
             ),
             u64::from(usage.completion_tokens),
         ),

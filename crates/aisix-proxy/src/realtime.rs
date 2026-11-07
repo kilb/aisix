@@ -1160,6 +1160,7 @@ impl SessionMeter<'_> {
         // prompt cache (the OpenAI convention), so `cached_tokens` goes in the
         // subset slot. This surface reports no cache writes and none of the
         // separate read or write counters.
+        // No write-lifetime split to price, so not `input_tokens_from_counts`.
         let input = crate::usage_attr::input_tokens_for_pricing(input, cached, 0, 0, 0);
         self.state
             .pricing
@@ -3601,7 +3602,7 @@ mod tests {
     /// 会话里从提示缓存读回来的 token 要按缓存费率计价，而不是全价输入。
     ///
     /// 这个表面自己算成本（`ModelCost::calculate(input, output)`），而家族其它
-    /// 端点一律走 `usage_attr::request_cost_usd` + `input_tokens_for_pricing`，
+    /// 端点一律走 `usage_attr::request_cost_usd` + `input_tokens_from_counts`，
     /// 那条路会把 `cached_input_per_1k` 应用上。事件里 `cached_prompt_tokens`
     /// 是照报的，所以按事件重算花费的控制面会得到另一个数字 —— 两个平面对同
     /// 一次会话给出不同的钱。

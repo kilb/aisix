@@ -1202,12 +1202,13 @@ async fn dispatch(
                             let spend = crate::usage_attr::request_spend_micro_usd(
                                 snapshot,
                                 &target.id,
-                                crate::usage_attr::input_tokens_for_pricing(
-                                    u64::from(outcome.metrics.prompt_tokens),
-                                    u64::from(outcome.metrics.cached_prompt_tokens),
-                                    u64::from(outcome.metrics.cache_write_tokens.unwrap_or(0)),
-                                    u64::from(outcome.metrics.cache_read_tokens),
-                                    u64::from(outcome.metrics.cache_creation_tokens),
+                                crate::usage_attr::input_tokens_from_counts(
+                                    outcome.metrics.prompt_tokens,
+                                    outcome.metrics.cached_prompt_tokens,
+                                    outcome.metrics.cache_write_tokens,
+                                    outcome.metrics.cache_read_tokens,
+                                    outcome.metrics.cache_creation_tokens,
+                                    outcome.metrics.cache_creation_ttl,
                                 ),
                                 u64::from(outcome.metrics.completion_tokens),
                             );
@@ -2060,12 +2061,13 @@ async fn anthropic_passthrough_dispatch(
                     crate::usage_attr::request_spend_micro_usd(
                         &snap_c,
                         &model_id_c,
-                        crate::usage_attr::input_tokens_for_pricing(
-                            u64::from(metrics.prompt_tokens),
-                            u64::from(metrics.cached_prompt_tokens),
-                            u64::from(metrics.cache_write_tokens.unwrap_or(0)),
-                            u64::from(metrics.cache_read_tokens),
-                            u64::from(metrics.cache_creation_tokens),
+                        crate::usage_attr::input_tokens_from_counts(
+                            metrics.prompt_tokens,
+                            metrics.cached_prompt_tokens,
+                            metrics.cache_write_tokens,
+                            metrics.cache_read_tokens,
+                            metrics.cache_creation_tokens,
+                            metrics.cache_creation_ttl,
                         ),
                         u64::from(metrics.completion_tokens),
                     ),
@@ -3215,12 +3217,13 @@ async fn cross_provider_dispatch(
                     crate::usage_attr::request_spend_micro_usd(
                         &snap_telem,
                         &model_id_for_telem,
-                        crate::usage_attr::input_tokens_for_pricing(
-                            u64::from(metrics.prompt_tokens),
-                            u64::from(metrics.cached_prompt_tokens),
-                            u64::from(metrics.cache_write_tokens.unwrap_or(0)),
-                            u64::from(metrics.cache_read_tokens),
-                            u64::from(metrics.cache_creation_tokens),
+                        crate::usage_attr::input_tokens_from_counts(
+                            metrics.prompt_tokens,
+                            metrics.cached_prompt_tokens,
+                            metrics.cache_write_tokens,
+                            metrics.cache_read_tokens,
+                            metrics.cache_creation_tokens,
+                            metrics.cache_creation_ttl,
                         ),
                         u64::from(metrics.completion_tokens),
                     ),
@@ -4618,12 +4621,13 @@ fn emit_anthropic_usage_event(
         cost_usd: cache.cost_usd(
             snap,
             model_id,
-            crate::usage_attr::input_tokens_for_pricing(
-                u64::from(metrics.prompt_tokens),
-                u64::from(metrics.cached_prompt_tokens),
-                u64::from(metrics.cache_write_tokens.unwrap_or(0)),
-                u64::from(metrics.cache_read_tokens),
-                u64::from(metrics.cache_creation_tokens),
+            crate::usage_attr::input_tokens_from_counts(
+                metrics.prompt_tokens,
+                metrics.cached_prompt_tokens,
+                metrics.cache_write_tokens,
+                metrics.cache_read_tokens,
+                metrics.cache_creation_tokens,
+                metrics.cache_creation_ttl,
             ),
             u64::from(metrics.completion_tokens),
         ),

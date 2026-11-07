@@ -9,10 +9,11 @@
 //! OpenAI-shape `cached_prompt_tokens` and `cache_write_tokens` are subsets
 //! of `prompt_tokens`, while the Anthropic-shape `cache_read_tokens` and
 //! `cache_creation_tokens` sit on top of it. That reading lives once, in
-//! `aisix_core::input_tokens_for_pricing`, which the gateway's own spend
-//! computation calls too; this module calls it and keeps no second copy.
+//! `aisix_core::input_tokens_for_pricing`, and the write-lifetime split's in
+//! `aisix_core::one_hour_cache_writes`; the gateway's own spend computation
+//! calls both too, and this module calls them and keeps no second copy.
 
-use aisix_core::{input_tokens_for_pricing, reasoning_beside_completion};
+use aisix_core::{input_tokens_for_pricing, one_hour_cache_writes, reasoning_beside_completion};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -196,7 +197,8 @@ impl Quantities {
 ///    and the row is refused, never saturated into a guess.
 /// 2. The write-lifetime split is either absent, which bills every write as
 ///    a five-minute one, or present on both sides and adding up to
-///    `cache_creation_tokens`.
+///    `cache_creation_tokens` (`aisix_core::one_hour_cache_writes`). Any
+///    other split is refused.
 /// 3. Prompt audio and image tokens include any cached portion. The cache is
 ///    assumed to hold them first, which favours the tenant whenever a
 ///    modality token is priced above a text one, and the rest is carved
@@ -224,13 +226,12 @@ pub(crate) fn quantities(u: &BillableUsage) -> Result<Quantities, Inconsistency>
     if b.total() != prompt + cache_read + creation {
         return Err(Inconsistency::CachedExceedsPrompt);
     }
-    let one_hour = match (u.cache_creation_5m_tokens, u.cache_creation_1h_tokens) {
-        (None, None) => 0,
-        (Some(five_m), Some(one_h)) if u64::from(five_m) + u64::from(one_h) == creation => {
-            u64::from(one_h)
-        }
-        _ => return Err(Inconsistency::CacheWriteSplitMismatch),
-    };
+    let one_hour = one_hour_cache_writes(
+        creation,
+        u.cache_creation_5m_tokens,
+        u.cache_creation_1h_tokens,
+    )
+    .ok_or(Inconsistency::CacheWriteSplitMismatch)?;
 
     let prompt_audio = u64::from(u.prompt_audio_tokens.unwrap_or(0));
     let prompt_image = u64::from(u.prompt_image_tokens.unwrap_or(0));

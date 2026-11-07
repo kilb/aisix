@@ -359,8 +359,14 @@
       "additionalProperties": false,
       "description": "Per-token cost for budget tracking. Every value is in USD per 1,000 tokens.\n\nPrompt-cached tokens are priced separately because providers charge a different rate for them, in both directions: a cache read is cheaper than fresh input, while writing a prompt into the cache costs more. Priced with `input_per_1k` alone, cached traffic is mis-billed either way.",
       "properties": {
+        "cache_write_1h_per_1k": {
+          "description": "Cost in USD per 1,000 prompt tokens written into the provider's cache with a one-hour lifetime. Omitted, one-hour writes are charged at `cache_write_per_1k`, or at `input_per_1k` when that is omitted too.\n\nA longer cache lifetime costs more to write: one provider prices a one-hour write at 2x its input rate, against 1.25x for a five-minute write. Only writes the provider reports as one-hour writes are charged at this rate; a write whose lifetime is not reported is charged at `cache_write_per_1k`.",
+          "format": "double",
+          "minimum": 0.0,
+          "type": "number"
+        },
         "cache_write_per_1k": {
-          "description": "Cost in USD per 1,000 prompt tokens written INTO the provider's cache. Omitted, cache writes are charged at `input_per_1k`.\n\nWrites are the direction that costs more than plain input — one provider prices a five-minute write at 1.25x its input rate and a one-hour write at 2x. A deployment that caches heavily and prices writes at the plain input rate under-reports its spend.",
+          "description": "Cost in USD per 1,000 prompt tokens written INTO the provider's cache: writes with a five-minute lifetime, writes whose lifetime the provider does not report, and one-hour writes too when `cache_write_1h_per_1k` is omitted. Omitted, cache writes are charged at `input_per_1k`.\n\nWrites are the direction that costs more than plain input — one provider prices a five-minute write at 1.25x its input rate and a one-hour write at 2x. A deployment that caches heavily and prices writes at the plain input rate under-reports its spend.",
           "format": "double",
           "minimum": 0.0,
           "type": "number"

@@ -732,12 +732,13 @@ async fn dispatch(
 /// The buckets a decision call is priced from. `cached` is a subset of
 /// `input`, and so is a reported `cache_write` (OpenAI's usage contract).
 fn decision_input_tokens(usage: &DecisionUsage) -> aisix_core::InputTokens {
-    crate::usage_attr::input_tokens_for_pricing(
-        u64::from(usage.input),
-        u64::from(usage.cached),
-        u64::from(usage.cache_write.unwrap_or(0)),
+    crate::usage_attr::input_tokens_from_counts(
+        usage.input,
+        usage.cached,
+        usage.cache_write,
         0,
         0,
+        aisix_gateway::CacheCreationTtl::NONE,
     )
 }
 

@@ -150,6 +150,7 @@ fn cost_of(p: &Pricing) -> ModelCost {
         // `cost` names cache rates: the document replaces that block whole.
         cached_input_per_1k: None,
         cache_write_per_1k: None,
+        cache_write_1h_per_1k: None,
     }
 }
 
