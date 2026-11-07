@@ -4,7 +4,9 @@ import {
   EtcdClient,
   ProxyClient,
   SeedClient,
+  metricDelta,
   pickFreePort,
+  scrapeMetrics,
   spawnApp,
   startOpenAiUpstream,
   waitConfigPropagation,
@@ -20,7 +22,9 @@ import {
 // "Spending could not be verified right now. Retry later.", with no figures
 // and no `Retry-After`, on every endpoint and before any upstream call.
 // Every other limit keeps serving on the instance's own count: a key under a
-// daily spend ceiling is still answered.
+// daily spend ceiling is still answered. The refusal names no upstream, so it
+// is the same with platform mode on, and it is counted in
+// `aisix_ratelimit_rejections_total` under its own scope.
 
 const hash = (plaintext: string) => createHash("sha256").update(plaintext).digest("hex");
 const ALLOWANCE_KEY = "sk-allowance-outage-e2e-granted";
@@ -29,6 +33,9 @@ const SENTINEL_KEY = "sk-allowance-outage-e2e-sentinel";
 const MESSAGE = "Spending could not be verified right now. Retry later.";
 /** A figure only the allowance carries; no answer may spell it. */
 const GRANTED_MICRO_USD = 7_340_017;
+const PLATFORM_SECRET_ENV = "P0_E2E_ALLOWANCE_PLATFORM_KEY";
+// 32 random bytes as hex digits, the form the gateway requires.
+const PLATFORM_SECRET = "c4e1a9b7d3f25e8a6c0b4d2f9e7a1c3b5d8f0a2c4e6b8d1f3a5c7e9b0d2f4a6c";
 
 type Route = { path: string; anthropic: boolean; stream: boolean; body: Record<string, unknown> };
 const ROUTES: Route[] = [
@@ -60,7 +67,7 @@ const ROUTES: Route[] = [
   { path: "/v1/embeddings", anthropic: false, stream: false, body: { model: "ao-embed", input: "hi" } },
 ];
 
-describe("a spend allowance refuses while the shared rate-limit store does not answer", () => {
+describe.each([false, true])("a spend allowance refuses while the shared rate-limit store does not answer (platform mode: %s)", (platform) => {
   let app: SpawnedApp | undefined;
   let upstream: OpenAiUpstream | undefined;
   let etcdReachable = false;
@@ -89,6 +96,15 @@ describe("a spend allowance refuses while the shared rate-limit store does not a
     const deadRedis = `redis://127.0.0.1:${await pickFreePort()}`;
     app = await spawnApp({
       extra: { ratelimit: { backend: "redis", redis: { url: deadRedis, timeout_secs: 1 } } },
+      ...(platform
+        ? {
+            extraEnv: {
+              AISIX_PROXY__PLATFORM__ENABLED: "true",
+              AISIX_PROXY__PLATFORM__ID_KEY_ENV: PLATFORM_SECRET_ENV,
+              [PLATFORM_SECRET_ENV]: PLATFORM_SECRET,
+            },
+          }
+        : {}),
     });
     const seed = new SeedClient(etcd, app.etcdPrefix);
 
@@ -152,6 +168,7 @@ describe("a spend allowance refuses while the shared rate-limit store does not a
   test.for(ROUTES)("$path (stream: $stream) answers 503 allowance_unverified", async (route, ctx) => {
     if (!etcdReachable || !app) return ctx.skip();
     const before = upstreamCalls();
+    const metricsBefore = await scrapeMetrics(app.metricsUrl);
     const answer = await call(ALLOWANCE_KEY, route);
     expect(answer.status, answer.text).toBe(503);
     const json = JSON.parse(answer.text) as { type?: string; error: Record<string, unknown> };
@@ -166,6 +183,13 @@ describe("a spend allowance refuses while the shared rate-limit store does not a
     expect(answer.text).not.toContain(String(GRANTED_MICRO_USD));
     expect(answer.text).not.toContain("ao-allowance");
     expect(upstreamCalls(), "nothing reached the upstream").toBe(before);
+    const metricsAfter = await scrapeMetrics(app.metricsUrl);
+    expect(
+      metricDelta(metricsBefore, metricsAfter, "aisix_ratelimit_rejections_total", {
+        scope: "spend_allowance_unverified",
+        layer: "policy_spend",
+      }),
+    ).toBe(1);
   });
 
   test("a key under a windowed spend ceiling is still served", async (ctx) => {
