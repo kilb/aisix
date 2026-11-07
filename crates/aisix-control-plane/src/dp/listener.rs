@@ -25,10 +25,12 @@
 //!   since a revoked certificate still completes its handshake.
 //!
 //! A credential that is revoked, expired, unlisted or of another
-//! environment is refused right after its handshake, by the rule every
-//! request is checked by again ([`super::admitted`]): its connection is
-//! closed before it is served, so it holds a slot no longer than a peer in
-//! its handshake does.
+//! environment is found right after its handshake, by the rule every
+//! request is checked by again ([`super::admitted`]). Its connection is
+//! then given one answer, so the gateway learns it is refused (`403` on
+//! HTTP/1.1, `PermissionDenied` and GOAWAY on h2), and closed, within
+//! [`HANDSHAKE_TIMEOUT`]: it holds a slot no longer than a peer in its
+//! handshake does.
 //!
 //! Accepted sockets have TCP keepalive, so a peer that vanished without
 //! closing is noticed even while nothing is being sent. On shutdown each
@@ -256,8 +258,9 @@ pub struct Admission {
 /// in flight for up to `limits.drain_deadline`, and returns once all have
 /// closed. Every request carries its connection's [`ConnIdentity`] as an
 /// extension. A connection over `limits` is closed as soon as it is
-/// accepted, and one whose credential `admission` refuses as soon as its
-/// handshake ends. Aborting the task drops every connection at once.
+/// accepted, and one whose credential `admission` refuses after its first
+/// answer, or the handshake timeout, whichever comes first. Aborting the
+/// task drops every connection at once.
 pub async fn serve_dp(
     listener: TcpListener,
     tls: Arc<ServerConfig>,
@@ -395,48 +398,67 @@ async fn serve_connection(
             return;
         }
     };
-    // Before anything is served, so a revoked credential cannot hold the
-    // connection open by sending nothing. Each request is checked again,
-    // which catches a revocation while the connection is open.
-    match admitted(&identity, &admission.env, &admission.creds).await {
-        Ok(Some(_)) => {}
-        // Logged by `admitted`.
-        Ok(None) => return,
+    // Before anything is served. A refused credential (revoked, expired,
+    // unlisted, of another environment) is still told why, by the answer
+    // its first request gets from the endpoints' own check: `403` with
+    // `Connection: close` on HTTP/1.1, `PermissionDenied` and then GOAWAY
+    // on h2. Without it a refused gateway could not tell a refusal from an
+    // outage. Its connection is served for at most one request, and for no
+    // longer than a handshake may take, so by sending nothing it holds its
+    // slot no longer than a peer in its handshake does. Each request of an
+    // admitted connection is checked again, which catches a revocation
+    // while the connection is open. A credential that cannot be checked
+    // now (the database is out) is served: each request answers the outage.
+    let refused = match admitted(&identity, &admission.env, &admission.creds).await {
+        Ok(found) => found.is_none(),
         Err(e) => {
-            tracing::warn!(error = %e, "cannot check a gateway credential; closed its connection");
-            return;
+            tracing::warn!(error = %e, "cannot check a gateway credential at connect");
+            false
         }
-    }
+    };
     let negotiated_h2 = session.alpn_protocol() == Some(H2);
     let io = TokioIo::new(tls);
-    if !negotiated_h2 {
-        let conn = http1::Builder::new()
-            .timer(TokioTimer::new())
-            .serve_connection(io, WithIdentity::new(rest, identity, None));
-        drive(
-            conn,
-            |conn| conn.graceful_shutdown(),
-            shutdown,
-            None,
-            drain_deadline,
-        )
-        .await;
-    } else if let Some(grpc) = grpc {
-        let close = ConnClose::new();
-        let conn = http2::Builder::new(TokioExecutor::new())
-            .timer(TokioTimer::new())
-            .max_concurrent_streams(MAX_STREAMS_PER_CONNECTION)
-            .keep_alive_interval(H2_KEEPALIVE_INTERVAL)
-            .keep_alive_timeout(H2_KEEPALIVE_TIMEOUT)
-            .serve_connection(io, WithIdentity::new(grpc, identity, Some(close.clone())));
-        drive(
-            conn,
-            |conn| conn.graceful_shutdown(),
-            shutdown,
-            Some(close),
-            drain_deadline,
-        )
-        .await;
+    let served = async {
+        if !negotiated_h2 {
+            let conn = http1::Builder::new()
+                .timer(TokioTimer::new())
+                .keep_alive(!refused)
+                .serve_connection(io, WithIdentity::new(rest, identity, None));
+            drive(
+                conn,
+                |conn| conn.graceful_shutdown(),
+                shutdown,
+                None,
+                drain_deadline,
+            )
+            .await;
+        } else if let Some(grpc) = grpc {
+            let close = ConnClose::new();
+            let conn = http2::Builder::new(TokioExecutor::new())
+                .timer(TokioTimer::new())
+                .max_concurrent_streams(MAX_STREAMS_PER_CONNECTION)
+                .keep_alive_interval(H2_KEEPALIVE_INTERVAL)
+                .keep_alive_timeout(H2_KEEPALIVE_TIMEOUT)
+                .serve_connection(io, WithIdentity::new(grpc, identity, Some(close.clone())));
+            drive(
+                conn,
+                |conn| conn.graceful_shutdown(),
+                shutdown,
+                Some(close),
+                drain_deadline,
+            )
+            .await;
+        }
+    };
+    if refused {
+        if tokio::time::timeout(handshake_timeout, served)
+            .await
+            .is_err()
+        {
+            tracing::debug!("dropped a refused gateway connection that sent no request in time");
+        }
+    } else {
+        served.await;
     }
     // Otherwise h2 was negotiated though not offered: nothing serves it.
 }

@@ -547,20 +547,22 @@ async fn a_revoked_credential_is_refused_on_an_open_connection() {
         "the connection stayed open after the 403"
     );
 
-    // A new connection with it is closed right after its handshake,
-    // unanswered.
+    // A new connection with it is refused too, and closed with its answer.
     let gw = cp.dp_client(&bundle);
     let r = gw
-        .try_send("GET", "/dp/store/v1/mcp_oauth_token/k-7c1", None)
+        .send("GET", "/dp/store/v1/mcp_oauth_token/k-7c1", None)
         .await;
-    assert!(r.is_err(), "answered: {r:?}");
+    assert_eq!(r.status, 403, "{r:?}");
+    let closes = r
+        .headers
+        .get(reqwest::header::CONNECTION)
+        .and_then(|v| v.to_str().ok());
+    assert_eq!(closes, Some("close"), "{:?}", r.headers);
     // A refused beat records nothing.
     let mut refused_beat = bare_beat(&bundle.dp_id, &instance);
     refused_beat["applied_revision"] = json!(4242);
-    let r = gw
-        .try_send("POST", "/dp/heartbeat", Some(refused_beat))
-        .await;
-    assert!(r.is_err(), "answered: {r:?}");
+    let r = gw.heartbeat(refused_beat).await;
+    assert_eq!(r.status, 403, "{r:?}");
     let applied: i64 = sqlx::query_scalar("SELECT applied_revision FROM dp_instances")
         .fetch_one(cp.db().pool())
         .await
@@ -619,7 +621,7 @@ async fn a_certificate_from_another_ca_fails_the_handshake() {
 }
 
 #[tokio::test]
-async fn a_certificate_for_another_environment_is_closed_unserved() {
+async fn a_certificate_for_another_environment_is_403() {
     let Some(cp) = TestCp::start().await else {
         return;
     };
@@ -656,14 +658,23 @@ async fn a_certificate_for_another_environment_is_closed_unserved() {
         &issued.key_pem,
         cp.state().pki.ca_pem(),
     );
-    // Its handshake completes, and its connection is closed unserved.
-    let beat = bare_beat(&dp_id.to_string(), &Uuid::new_v4().to_string());
-    let r = gw.try_send("POST", "/dp/heartbeat", Some(beat)).await;
-    assert!(r.is_err(), "answered: {r:?}");
+    // The handshake completes, and the first request is told why.
+    let pems = (
+        issued.cert_pem.as_str(),
+        issued.key_pem.as_str(),
+        cp.state().pki.ca_pem(),
+    );
+    let tls = tls_connect(cp.dp_addr(), pems, &[b"http/1.1"])
+        .await
+        .expect("the handshake");
+    refused_on_http_1_1(tls).await.assert_told_and_closed();
     let r = gw
-        .try_send("GET", "/dp/store/v1/mcp_oauth_token/k", None)
+        .heartbeat(bare_beat(&dp_id.to_string(), &Uuid::new_v4().to_string()))
         .await;
-    assert!(r.is_err(), "answered: {r:?}");
+    assert_eq!(r.status, 403, "{r:?}");
+    assert_eq!(r.body["code"], "forbidden");
+    let r = gw.send("GET", "/dp/store/v1/mcp_oauth_token/k", None).await;
+    assert_eq!(r.status, 403, "{r:?}");
     assert!(instances(&cp, &admin).await.is_empty());
 }
 
@@ -1070,33 +1081,88 @@ async fn tls_closed_within(
     }
 }
 
+/// What a refused credential's HTTP/1.1 connection answers its first
+/// request, and whether the connection is closed within a second after.
+#[derive(Debug)]
+struct Refusal {
+    status: u16,
+    code: Value,
+    connection: Option<String>,
+    closed: bool,
+}
+
+impl Refusal {
+    /// The gateway is told why, `403 forbidden` with `Connection: close`,
+    /// and the connection ends with that answer.
+    fn assert_told_and_closed(&self) {
+        assert_eq!(
+            (
+                self.status,
+                &self.code,
+                self.connection.as_deref(),
+                self.closed
+            ),
+            (403, &json!("forbidden"), Some("close"), true),
+            "{self:?}"
+        );
+    }
+}
+
+/// `GET /dp/store/v1/ns/k-7c1` over `tls`, and what came back.
+async fn refused_on_http_1_1(
+    tls: tokio_rustls::client::TlsStream<tokio::net::TcpStream>,
+) -> Refusal {
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tls))
+        .await
+        .expect("an HTTP/1.1 connection");
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    let request = hyper::Request::builder()
+        .uri("/dp/store/v1/ns/k-7c1")
+        .header("host", "localhost")
+        .body(Full::new(Bytes::new()))
+        .expect("a request");
+    let response = sender.send_request(request).await.expect("an answer");
+    let status = response.status().as_u16();
+    let connection = response
+        .headers()
+        .get(hyper::header::CONNECTION)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("read the body")
+        .to_bytes();
+    let body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    while !sender.is_closed() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    Refusal {
+        status,
+        code: body["code"].clone(),
+        connection,
+        closed: sender.is_closed(),
+    }
+}
+
 /// A credential revoked before it expires still completes its TLS
-/// handshake, and its connection is closed right after it, before any
-/// request, on HTTP/1.1 and on h2 alike: by sending nothing it cannot hold
-/// a connection, and its slot, open. A listed credential's idle connection
-/// stays open.
+/// handshake, and is then told why, so that its gateway can tell a refusal
+/// from an outage: `403 forbidden` with `Connection: close` on HTTP/1.1,
+/// `PermissionDenied` and then GOAWAY on h2. Either way the connection then
+/// closes, and one that sends nothing is closed within the handshake
+/// timeout: it holds its slot no longer than a peer in its handshake. A
+/// listed credential's idle connection stays open.
 #[tokio::test]
-async fn a_revoked_credential_is_closed_right_after_its_handshake() {
-    let Some(cp) = TestCp::start().await else {
+async fn a_refused_credential_is_told_why_and_closed_within_a_handshakes_time() {
+    let Some(cp) = TestCp::start_with_kine().await else {
         return;
     };
     let (admin, bundle) = setup(&cp).await;
-    let tls = listener::server_tls(&cp.state().pki, &["localhost".to_string()], true)
-        .expect("the listener's TLS");
-    let tcp = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind");
-    let addr = tcp.local_addr().expect("an address");
-    let (_stop, stopped) = tokio::sync::watch::channel(false);
-    tokio::spawn(listener::serve_dp(
-        tcp,
-        tls,
-        echo("rest"),
-        Some(grpc_echo()),
-        cp.admission(),
-        ConnLimits::default(),
-        stopped,
-    ));
+    let addr = cp.dp_addr();
     let protocols: [&[u8]; 2] = [b"http/1.1", b"h2"];
     for alpn in protocols {
         let mut tls = tls_connect(addr, pems(&bundle), &[alpn])
@@ -1109,8 +1175,6 @@ async fn a_revoked_credential_is_closed_right_after_its_handshake() {
         );
     }
 
-    // Revoked, and known to be: a connection opened before is refused.
-    let mut open = DpConn::open(&cp, &bundle).await;
     let r = cp
         .send(
             "POST",
@@ -1120,26 +1184,73 @@ async fn a_revoked_credential_is_closed_right_after_its_handshake() {
         )
         .await;
     assert_eq!(r.status, 200, "{r:?}");
-    let beat = bare_beat(&bundle.dp_id, &Uuid::new_v4().to_string());
+    // Known once a new connection is refused; until then it is served.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    while open.send("POST", "/dp/heartbeat", Some(&beat)).await.0 == 200 {
+    let refusal = loop {
+        let tls = tls_connect(addr, pems(&bundle), &[b"http/1.1"])
+            .await
+            .expect("the handshake");
+        let answer = refused_on_http_1_1(tls).await;
+        if answer.status != 404 {
+            break answer;
+        }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "still accepted 5 s after the revoke"
+            "still served 5 s after the revoke"
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    };
+    refusal.assert_told_and_closed();
 
+    // h2: the first RPC is refused with `PermissionDenied`, and the
+    // connection goes away.
+    let tls = tls_connect(addr, pems(&bundle), &[b"h2"])
+        .await
+        .expect("the handshake");
+    let (client, connection) = h2::client::handshake(tls).await.expect("HTTP/2");
+    let connection = tokio::spawn(connection);
+    let mut client = client.ready().await.expect("ready");
+    let request = hyper::Request::builder()
+        .method("POST")
+        .uri("https://localhost/etcdserverpb.KV/Range")
+        .header("content-type", "application/grpc")
+        .header("te", "trailers")
+        .body(())
+        .expect("a request");
+    let (answer, mut body) = client.send_request(request, false).expect("send");
+    // An empty RangeRequest, framed: the credential is judged first.
+    body.send_data(Bytes::from_static(&[0, 0, 0, 0, 0]), true)
+        .expect("the message");
+    let answer = answer.await.expect("an answer");
+    assert_eq!(
+        answer.headers().get("grpc-status").map(|v| v.as_bytes()),
+        Some(&b"7"[..]),
+        "{answer:?}"
+    );
+    tokio::time::timeout(Duration::from_secs(2), connection)
+        .await
+        .expect("the h2 connection ends within 2 s of the refusal")
+        .expect("the connection task")
+        .expect("ended with GOAWAY, not an error");
+
+    // A refused peer that sends nothing is closed within the handshake
+    // timeout, on either protocol.
+    let mut idle = Vec::new();
     for alpn in protocols {
-        let mut tls = tls_connect(addr, pems(&bundle), &[alpn])
-            .await
-            .expect("the handshake still completes");
-        assert!(
-            tls_closed_within(&mut tls, Duration::from_secs(1)).await,
-            "{}: a revoked credential's connection stayed open",
-            String::from_utf8_lossy(alpn)
+        idle.push(
+            tls_connect(addr, pems(&bundle), &[alpn])
+                .await
+                .expect("the handshake"),
         );
     }
+    let bound = listener::HANDSHAKE_TIMEOUT + Duration::from_secs(1);
+    let (mut h1, mut h2) = (idle.remove(0), idle.remove(0));
+    let (h1_closed, h2_closed) = tokio::join!(
+        tls_closed_within(&mut h1, bound),
+        tls_closed_within(&mut h2, bound)
+    );
+    assert!(h1_closed, "a silent HTTP/1.1 connection outlived {bound:?}");
+    assert!(h2_closed, "a silent h2 connection outlived {bound:?}");
 }
 
 /// On shutdown an HTTP/1.1 request still in flight, its body stopped

@@ -929,15 +929,9 @@ async fn a_revoked_credential_cannot_deliver_usage() {
         )
         .await;
     assert_eq!(r.status, 200, "{r:?}");
-    // Until the revoke is known: then a new connection, on a route that
-    // stores nothing, is closed right after its handshake, unanswered.
+    // Until the revoke is known, on a route that stores nothing.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    while cp
-        .dp_client(&bundle)
-        .try_send("GET", "/dp/store/v1/ns/k-7c1", None)
-        .await
-        .is_ok()
-    {
+    while dp.send("GET", "/dp/store/v1/ns/k-7c1", None).await.status != 403 {
         assert!(
             tokio::time::Instant::now() < deadline,
             "still accepted 5 s after the revoke"
@@ -945,19 +939,10 @@ async fn a_revoked_credential_cannot_deliver_usage() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
-    // The connection that was open before is refused, still saying that
-    // batches are deduplicated.
     let r = dp.telemetry(Uuid::new_v4(), &batch(&["after-7c1"])).await;
     assert_eq!(r.status, 403, "{r:?}");
     assert_eq!(r.body["code"], "forbidden");
     assert_eq!(r.header(DEDUP), Some("1"));
-    // A new one gets no answer.
-    let fresh = cp.dp_client(&bundle);
-    let body = serde_json::to_vec(&batch(&["fresh-7c1"])).expect("serialize the batch");
-    let r = fresh
-        .telemetry_raw(Some(&Uuid::new_v4().to_string()), body)
-        .await;
-    assert!(r.is_err(), "answered: {r:?}");
     assert_eq!(cp.count("usage_events").await, 1);
     assert_eq!(cp.count("usage_batches").await, 1);
 }
@@ -1382,15 +1367,15 @@ async fn a_revoked_gateways_usage_is_refused_and_its_connection_closed() {
         )
         .await;
     assert_eq!(r.status, 200, "{r:?}");
-    // Until the revoke is known, on other connections and a route that
-    // stores nothing: a new connection is then closed right after its
-    // handshake, unanswered. The held one stays as it was.
+    // Until the revoke is known, on another connection and a route that
+    // stores nothing: the held one stays as it was.
+    let other = cp.dp_client(&bundle);
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    while cp
-        .dp_client(&bundle)
-        .try_send("GET", "/dp/store/v1/ns/k-7c1", None)
+    while other
+        .send("GET", "/dp/store/v1/ns/k-7c1", None)
         .await
-        .is_ok()
+        .status
+        != 403
     {
         assert!(
             tokio::time::Instant::now() < deadline,
