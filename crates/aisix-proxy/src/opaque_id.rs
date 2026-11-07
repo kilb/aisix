@@ -669,8 +669,17 @@ pub(crate) fn unseal_responses_input(
 /// `type` is optional and that has no role (openai-python
 /// `types/responses/response_input_item_param.py`, `ItemReference`: "`id`:
 /// The ID of the item to reference", `type: Optional[Literal["item_reference"]]`).
+/// A `reasoning` item with an `id` and no `encrypted_content` is one too:
+/// the upstream looks its reasoning up by that id ("Item with id 'rs_…' not
+/// found", see [`unseal_responses_input`]).
 fn is_item_reference(item: &Value) -> bool {
     match item.get("type") {
+        Some(Value::String(t)) if t == "reasoning" => {
+            item.get("id").is_some()
+                && item
+                    .get("encrypted_content")
+                    .is_none_or(|content| content.is_null())
+        }
         Some(Value::String(t)) => t == "item_reference",
         None | Some(Value::Null) => item.get("role").is_none() && item.get("id").is_some(),
         Some(_) => false,
@@ -1712,6 +1721,43 @@ pub(crate) mod tests {
         let mut plain = json!({"model": "m", "input": "hi"});
         unseal_responses_input(&platform, T, &mut plain);
         assert_eq!(plain, json!({"model": "m", "input": "hi"}));
+    }
+
+    /// A typed `reasoning` item with an `id` and no `encrypted_content` has
+    /// the upstream look the reasoning up by that id ("Item with id 'rs_…'
+    /// not found"), so it is a reference to a stored item like any other:
+    /// refused unless the id is the tenant's own seal. With its encrypted
+    /// content it carries itself and is not a reference.
+    #[test]
+    fn a_reasoning_item_named_only_by_its_id_is_a_reference() {
+        let platform = crate::platform::PlatformSettings::from_secret("s");
+        let k = seal_key(&platform.id_key);
+        let run = |input: Value| {
+            let mut body = json!({"model": "m", "input": input});
+            unseal_responses_input(&platform, T, &mut body)
+        };
+        assert_eq!(
+            run(json!([{"role": "user", "content": "hi"},
+                       {"type": "reasoning", "id": "rs_bdrk_1", "summary": []}])),
+            Some(1)
+        );
+        assert_eq!(
+            run(
+                json!([{"type": "reasoning", "id": seal_id(&k, "team-b", "rs_1"),
+                        "summary": [{"type": "summary_text", "text": "why"}]}])
+            ),
+            Some(0)
+        );
+        assert_eq!(
+            run(json!([{"type": "reasoning", "id": seal_id(&k, T, "rs_1"), "summary": []}])),
+            None
+        );
+        assert_eq!(
+            run(json!([{"type": "reasoning", "id": "rs_1", "summary": [],
+                        "encrypted_content": "gAAAA"}])),
+            None
+        );
+        assert_eq!(run(json!([{"type": "reasoning", "summary": []}])), None);
     }
 
     /// A `local_shell_call_output` names the call it answers by `id`: the
