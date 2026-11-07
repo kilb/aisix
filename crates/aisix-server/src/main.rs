@@ -2070,9 +2070,10 @@ fn register_memory_probes(metrics: &aisix_obs::Metrics, state: &ProxyState) {
 /// does not decode, as hex or base64, to at least 32 bytes: any sealed id a
 /// tenant holds lets it test guesses of the secret offline, so the secret
 /// must be a random value, the form the control plane generates (64 hex
-/// digits). The id key is derived from the value as given, so a secret that
-/// passes keeps every id sealed under it. Errors name the variable, never
-/// its value.
+/// digits). Whitespace around the value is not part of it: it is checked and
+/// the id key derived from it with that whitespace removed, so a variable
+/// filled from a file that ends in a newline seals ids exactly like one set
+/// from a literal. Errors name the variable, never its value.
 fn platform_settings(
     cfg: &aisix_core::config::PlatformConfig,
     lookup: impl Fn(&str) -> Option<String>,
@@ -2085,10 +2086,11 @@ fn platform_settings(
         .id_key_env
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("proxy.platform.id_key_env is required"))?;
-    let secret = lookup(name).ok_or_else(|| {
+    let value = lookup(name).ok_or_else(|| {
         anyhow::anyhow!("proxy.platform.id_key_env = {name:?} is set but the env var is missing")
     })?;
-    if decoded_secret_len(secret.trim()) < MIN_SECRET_BYTES {
+    let secret = value.trim();
+    if decoded_secret_len(secret) < MIN_SECRET_BYTES {
         anyhow::bail!(
             "proxy.platform.id_key_env = {name:?}: the env var must hold at least \
              {MIN_SECRET_BYTES} random bytes written as hex or base64, such as the output \
@@ -2096,7 +2098,7 @@ fn platform_settings(
         );
     }
     Ok(Some(aisix_proxy::platform::PlatformSettings::from_secret(
-        &secret,
+        secret,
     )))
 }
 
@@ -4772,10 +4774,26 @@ mcp_servers:
                 .expect("enabled platform yields settings");
             assert_eq!(
                 settings.id_key,
-                aisix_proxy::platform::PlatformSettings::from_secret(&strong).id_key,
-                "the id key is derived from the value as it was given"
+                aisix_proxy::platform::PlatformSettings::from_secret(strong.trim()).id_key,
+                "the id key is derived from the value that was checked"
             );
         }
+        // Two replicas whose variable differs only by the newline a file left
+        // on one of them seal ids under one key, or an id one minted does not
+        // open on the other.
+        let literal = "-_".repeat(22);
+        let key_of = |value: String| {
+            platform_settings(&cfg, |_| Some(value.clone()))
+                .unwrap()
+                .expect("enabled platform yields settings")
+                .id_key
+        };
+        assert_eq!(
+            key_of(format!("{literal}\n")),
+            key_of(literal.clone()),
+            "a trailing newline changed the id key"
+        );
+        assert_eq!(key_of(format!("  {literal}\r\n")), key_of(literal));
         let off = aisix_core::config::PlatformConfig::default();
         assert!(platform_settings(&off, |_| Some("k".to_string()))
             .unwrap()
