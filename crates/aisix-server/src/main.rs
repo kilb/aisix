@@ -1561,6 +1561,14 @@ async fn run(mut cfg: Config, hangup: Option<HangupSignal>) -> anyhow::Result<()
             Some(config_status.clone()),
         ),
     );
+    // Build that index as each configuration publishes, not only on the
+    // next request: a guardrail row that cannot be built is then reported
+    // (the heartbeat's `rejected_resources`) by a gateway taking no traffic
+    // too, instead of its change showing as applied.
+    tokio::spawn(aisix_guardrails::rebuild_on_publish(
+        Arc::clone(&proxy_state.guardrail_index),
+        cancel_rx.clone(),
+    ));
     // Heartbeat worker — spawned after proxy_state exists so it can read
     // the exporter fan-out's delivery counters. Each tick reports:
     //   - rejected_resources: loader + runtime-build rejections (#115, #1084)
