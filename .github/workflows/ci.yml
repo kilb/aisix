@@ -927,9 +927,19 @@ jobs:
           CP_E2E_PG_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres
         run: |
           npm ci
+          npm run test:unit
           npx playwright install --with-deps chromium
           npm run build
           npx playwright test
+      # visual.spec.ts's screenshots of each page (light, dark, 360px), for
+      # the review against the design direction. Kept on a failure too.
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: tenant-portal-visual
+          path: web-tenant/test-results/**/visual-*.png
+          if-no-files-found: ignore
+          retention-days: 7
 
   # The Playwright suites had no automated gate: nothing in this workflow
   # touched `web/` or `web-portal/`, so the money contracts (what each
