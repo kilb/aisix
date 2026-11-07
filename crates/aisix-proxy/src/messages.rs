@@ -10996,16 +10996,15 @@ data: [DONE]\n\n";
     #[tokio::test]
     async fn platform_mode_ends_on_an_oversized_frame_instead_of_releasing_it() {
         let big = "A".repeat(aisix_gateway::sse::MAX_SSE_FRAME_BYTES + 2 * 1024 * 1024);
+        let start = serde_json::json!({"type": "message_start", "message": {"id": "msg_bdrk_1",
+            "type": "message", "role": "assistant", "model": "claude-3-haiku-20240307",
+            "content": [], "usage": {"input_tokens": 3, "output_tokens": 1}}});
+        // Written in the order the API writes it: the id ahead of the content.
         let sse = format!(
-            "event: message_start\ndata: {}\n\nevent: content_block_start\ndata: {}\n\n",
-            serde_json::json!({"type": "message_start", "message": {"id": "msg_bdrk_1",
-                "type": "message", "role": "assistant", "model": "claude-3-haiku-20240307",
-                "content": [], "usage": {"input_tokens": 3, "output_tokens": 1}}}),
-            // Written in the order the API writes it: the id ahead of the
-            // content.
-            format!(
-                r#"{{"type":"content_block_start","index":0,"content_block":{{"type":"web_fetch_tool_result","tool_use_id":"srvtoolu_bdrk_1","content":{{"type":"web_fetch_result","url":"https://x","content":"{big}"}}}}}}"#
-            ),
+            "event: message_start\ndata: {start}\n\nevent: content_block_start\ndata: \
+             {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\
+             \"web_fetch_tool_result\",\"tool_use_id\":\"srvtoolu_bdrk_1\",\"content\":{{\"type\":\
+             \"web_fetch_result\",\"url\":\"https://x\",\"content\":\"{big}\"}}}}}}\n\n",
         );
         let bytes = bytes::Bytes::from(sse);
         let up = axum::Router::new().route(
