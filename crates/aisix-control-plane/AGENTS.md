@@ -31,7 +31,10 @@ way.
   aisix-core's strict schema and semantic checks, checks references, runs the
   gateway-version gate, seals credentials and assigns `seq`. A direct
   `INSERT` or `UPDATE` skips all of that, and the projector ships the row
-  anyway.
+  anyway. `only_the_resources_module_writes_gw_resources` (`tests/boot.rs`)
+  fails on one outside `src/resources/`, except the two that touch no
+  document: the projector's projection columns and housekeeping's tombstone
+  prune.
 - Within one transaction, write referents before referrers, and delete
   referrers before referents. Each write checks its own references.
 - Every builder of a derived document has a test that loads what it builds on
@@ -48,6 +51,10 @@ way.
   that references a tenant takes a key-share lock on that tenant's row, so a
   path that inserts one counts as touching the tenant and locks it first.
   Operator-wide invariants take `OPERATORS_LOCK_KEY` and touch no tenant.
+  `every_tenant_write_takes_the_tenant_before_the_resources_lock`
+  (`tests/tenants.rs`) sends each path that writes a tenant's documents while
+  the tenant is held elsewhere and fails if it already holds the resources
+  lock; a new such path adds a case there.
 - **Advisory lock keys must be unique.** They are the `*_LOCK_KEY` constants,
   all `0x6169_7369_7863_70xx`: operators `7030`, projector `7031`, resources
   `7032`, boot `7033`, signup `7073`. Postgres has one key space per database.
@@ -133,6 +140,13 @@ way.
   for the caller's own rows.
 - No `/api/*` answer carries a provider, a provider key, a group name or an
   upstream model id.
+- **A pending tenant projects nothing**: no team, no member `users`
+  document and no key until an operator approves it, since signup is
+  anonymous. The approval writes the team and every live member's user ahead
+  of the limits policy and the keys.
+- Every mutating browser request is JSON, bodyless ones included
+  (`http::json_only`, `415` otherwise): with `SameSite=Strict` cookies that
+  is the CSRF defence, so no route may be exempted from it.
 
 ## Credentials are sealed and normalised, and never logged or audited
 
