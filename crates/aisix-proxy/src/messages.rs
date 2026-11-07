@@ -9608,10 +9608,11 @@ event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\"
         assert!(buf.is_empty(), "both frames drained even without usage");
     }
 
-    /// Platform mode relays none of a native stream's `ping` frames,
-    /// payload-less frames or undocumented events, and still reads each of
-    /// them first: the `ping` stamps the time to first frame. Off platform
-    /// mode every frame reaches the client byte for byte.
+    /// Platform mode relays none of a native stream's `ping` frames or
+    /// payload-less frames, and still reads each of them first: the `ping`
+    /// stamps the time to first frame. Every other frame is relayed, one of
+    /// a type the API does not document included. Off platform mode every
+    /// frame reaches the client byte for byte.
     #[test]
     fn platform_mode_relays_no_ping_and_still_reads_it() {
         use super::{drain_anthropic_sse_frames, AnthropicStreamUsage};
@@ -9652,8 +9653,9 @@ event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m1
             &[7u8; 32],
         ));
         let on = drain(Some(&ids));
-        assert!(on.starts_with("event: message_start\n"), "{on}");
-        for gone in ["ping", "keepalive", "channel_status"] {
+        assert!(on.starts_with("event: channel_status\n"), "{on}");
+        assert!(on.contains("event: message_start\n"), "{on}");
+        for gone in ["ping", "keepalive"] {
             assert!(!on.contains(gone), "{gone}: {on}");
         }
     }

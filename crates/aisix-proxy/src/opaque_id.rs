@@ -690,21 +690,20 @@ fn is_item_reference(item: &Value) -> bool {
 /// invocation metrics, named after the platform.
 const CHANNEL_METRICS_KEY: &str = "amazon-bedrock-invocationMetrics";
 
-// What platform mode keeps of a relayed answer. An upstream writes members
-// and usage counters of its own beside the ones its API documents, and which
-// of them it writes names the channel: only Anthropic's own API reports
-// `service_tier`, `inference_geo` and `speed` in a Messages usage, a cloud
-// platform adds its invocation metrics, and only OpenAI pads its Responses
-// stream events with `obfuscation`. So an answer keeps what the API's type
-// definitions document, and the rest is left out of what the caller is sent.
-// Telemetry has read the upstream's answer before any of this runs.
+// What platform mode keeps of an answer it holds parsed: the members and
+// usage counters the API's type definitions document. A member an upstream
+// adds beside them is the channel's own, and nothing a caller can rely on,
+// so it is left out. Every documented member is kept, even one only some
+// channels write (`inference_geo`, `service_tier`): it carries what a caller
+// may act on, and hiding the channel is best effort, never paid for with
+// what the caller gets. Only an answer already parsed is trimmed, buffered
+// or built by the gateway; a relayed stream frame goes out as the upstream
+// wrote it apart from its ids, model and invocation metrics, since trimming
+// it would cost a pass per frame. Telemetry has read the upstream's answer
+// before any of this runs.
 
-/// A Messages answer's top-level members: those anthropic-sdk-python 2.3.0
-/// documents (`types/message.py`, `types/beta/beta_message.py`) but two,
-/// which answer request fields platform mode refuses (`crate::stored_refs`):
-/// `container`, the container a code execution ran in, and `diagnostics`,
-/// which answers `diagnostics.previous_message_id`. `input_transformations`
-/// (beta) reports what the upstream did to the request on its own account.
+/// A Messages answer's top-level members, as anthropic-sdk-python 2.3.0
+/// documents them (`types/message.py`, `types/beta/beta_message.py`).
 fn message_member(key: &str) -> bool {
     matches!(
         key,
@@ -716,13 +715,16 @@ fn message_member(key: &str) -> bool {
             | "stop_sequence"
             | "stop_details"
             | "usage"
+            | "container"
             | "context_management"
+            | "diagnostics"
+            | "input_transformations"
     )
 }
 
-/// The usage counters of a Messages answer that every channel serving the
-/// API reports (`types/usage.py`, `types/message_delta_usage.py`), the
-/// 5-minute and 1-hour split of a cache write included.
+/// The usage counters of a Messages answer, as anthropic-sdk-python 2.3.0
+/// documents them (`types/usage.py`, `types/message_delta_usage.py`,
+/// `types/beta/beta_usage.py`, `types/beta/beta_message_delta_usage.py`).
 fn messages_usage_member(key: &str) -> bool {
     matches!(
         key,
@@ -731,6 +733,13 @@ fn messages_usage_member(key: &str) -> bool {
             | "cache_creation_input_tokens"
             | "cache_read_input_tokens"
             | "cache_creation"
+            | "inference_geo"
+            | "output_tokens_details"
+            | "server_tool_use"
+            | "service_tier"
+            | "speed"
+            | "fallback_credit"
+            | "iterations"
     )
 }
 
@@ -758,12 +767,11 @@ const MESSAGE_BODY: &[Retain<'static>] = &[
     },
 ];
 
-/// What platform mode keeps of each Messages stream event, by its `type`:
-/// the members the six events of `types/raw_message_stream_event.py` (and
-/// their beta twins) document, and `error`, which the SDK's stream reader
-/// reads (`_streaming.py`). `None` for an event platform mode does not relay
-/// at all: a `ping`, which one channel sends and another does not, and a
-/// type the API does not document.
+/// What platform mode keeps of each Messages stream event the gateway
+/// builds, by its `type`: the members the six events of
+/// `types/raw_message_stream_event.py` (and their beta twins) document, and
+/// `error`, which the SDK's stream reader reads (`_streaming.py`). `None`
+/// for a type the API does not document, which is left as it is.
 fn messages_event_shape(kind: &str) -> Option<&'static [Retain<'static>]> {
     Some(match kind {
         "message_start" => &[
@@ -787,11 +795,21 @@ fn messages_event_shape(kind: &str) -> Option<&'static [Retain<'static>]> {
         "message_delta" => &[
             Retain {
                 path: &[],
-                keep: |k| matches!(k, "type" | "delta" | "usage" | "context_management"),
+                keep: |k| {
+                    matches!(
+                        k,
+                        "type" | "delta" | "usage" | "context_management" | "input_transformations"
+                    )
+                },
             },
             Retain {
                 path: &["delta"],
-                keep: |k| matches!(k, "stop_reason" | "stop_sequence" | "stop_details"),
+                keep: |k| {
+                    matches!(
+                        k,
+                        "stop_reason" | "stop_sequence" | "stop_details" | "container"
+                    )
+                },
             },
             Retain {
                 path: &["usage"],
@@ -902,35 +920,6 @@ pub(crate) const RESPONSE_BODY: &[Retain<'static>] = &[
     },
 ];
 
-/// What platform mode keeps of a Responses stream event: the Response
-/// object of a snapshot event, kept as [`RESPONSE_BODY`] keeps one, and the
-/// event's own members but two. `obfuscation` is the random padding one
-/// channel adds to its delta events (`stream_options.include_obfuscation`,
-/// `types/responses/response_create_params.py:448`); the other is a cloud
-/// platform's invocation metrics.
-pub(crate) const RESPONSES_EVENT: &[Retain<'static>] = &[
-    Retain {
-        path: &[],
-        keep: |k| k != "obfuscation" && k != CHANNEL_METRICS_KEY,
-    },
-    Retain {
-        path: &["response"],
-        keep: response_member,
-    },
-    Retain {
-        path: &["response", "usage"],
-        keep: responses_usage_member,
-    },
-    Retain {
-        path: &["response", "usage", "input_tokens_details"],
-        keep: |k| matches!(k, "cached_tokens" | "cache_write_tokens"),
-    },
-    Retain {
-        path: &["response", "usage", "output_tokens_details"],
-        keep: |k| k == "reasoning_tokens",
-    },
-];
-
 /// `value` with every member `rules` refuses removed from the objects they
 /// name.
 pub(crate) fn retain_value(value: &mut Value, rules: &[Retain<'_>]) {
@@ -945,30 +934,25 @@ pub(crate) fn retain_value(value: &mut Value, rules: &[Retain<'_>]) {
     }
 }
 
-/// [`retain_value`] for a JSON document, byte-preserving
-/// ([`json_splice::retain_members`]); `None` when nothing was removed or the
-/// document cannot be read, and the caller keeps `doc`.
-pub(crate) fn retain_json(doc: &[u8], rules: &[Retain<'_>]) -> Option<Vec<u8>> {
-    match json_splice::retain_members(doc, rules) {
-        Ok(trimmed) => trimmed,
+/// `doc` without a top-level [`CHANNEL_METRICS_KEY`] member, byte-preserving;
+/// `None` when it has none or cannot be read, and the caller keeps `doc`.
+/// The member is looked for first, so a frame without it, which is almost
+/// every frame, costs one byte search.
+pub(crate) fn strip_channel_metrics(doc: &[u8]) -> Option<Vec<u8>> {
+    memchr::memmem::find(doc, CHANNEL_METRICS_KEY.as_bytes())?;
+    match json_splice::retain_members(
+        doc,
+        &[Retain {
+            path: &[],
+            keep: |k| k != CHANNEL_METRICS_KEY,
+        }],
+    ) {
+        Ok(stripped) => stripped,
         Err(error) => {
-            tracing::debug!(%error, "platform member trim skipped; forwarding verbatim");
+            tracing::debug!(%error, "channel metrics removal skipped; forwarding verbatim");
             None
         }
     }
-}
-
-/// The `type` of a stream event's JSON, read without building the event.
-fn event_type(payload: &[u8]) -> Option<String> {
-    #[derive(serde::Deserialize)]
-    struct Typed<'a> {
-        #[serde(rename = "type", borrow, default)]
-        kind: Option<std::borrow::Cow<'a, str>>,
-    }
-    serde_json::from_slice::<Typed<'_>>(payload)
-        .ok()?
-        .kind
-        .map(std::borrow::Cow::into_owned)
 }
 
 /// Per-response id state for an Anthropic Messages answer in platform mode:
@@ -1040,15 +1024,13 @@ impl MessagesIds {
         }
     }
 
-    /// Whether platform mode relays a native stream's event at all (see
-    /// [`messages_event_shape`]): `event` is its parsed payload, `None` for
-    /// a frame that carries none, such as a comment, which is not relayed
-    /// either.
+    /// Whether platform mode relays a native stream's frame at all: not a
+    /// `ping`, which one channel sends and another does not, and not a frame
+    /// with no payload, such as a comment, which carries nothing for the
+    /// caller. `event` is the frame's payload as the relay already parsed it
+    /// for telemetry, `None` when it has none; every other frame is relayed.
     pub(crate) fn relays_event(event: Option<&Value>) -> bool {
-        event
-            .and_then(|e| e.get("type"))
-            .and_then(Value::as_str)
-            .is_some_and(|kind| messages_event_shape(kind).is_some())
+        event.is_some_and(|e| e.get("type").and_then(Value::as_str) != Some("ping"))
     }
 
     fn map_block(&self, block: &mut Value) {
@@ -1101,8 +1083,9 @@ impl MessagesIds {
 
     /// One relayed stream event's JSON, byte-preserving: the caller-facing
     /// `message.model` and the ids [`Self::apply_to_event`] rewrites, in one
-    /// splice pass, then the members it keeps. `None` when nothing changed
-    /// or the payload cannot be read, and the caller forwards it as it came.
+    /// splice pass, then any channel metrics. Its other members go out as
+    /// the upstream wrote them. `None` when nothing changed or the payload
+    /// cannot be read, and the caller forwards it as it came.
     pub(crate) fn rewrite_event_json(
         &self,
         payload: &[u8],
@@ -1131,12 +1114,7 @@ impl MessagesIds {
                 return None;
             }
         };
-        let current = spliced.as_deref().unwrap_or(payload);
-        event_type(current)
-            .as_deref()
-            .and_then(messages_event_shape)
-            .and_then(|shape| retain_json(current, shape))
-            .or(spliced)
+        strip_channel_metrics(spliced.as_deref().unwrap_or(payload)).or(spliced)
     }
 
     /// One splice pass, mapping the block ids `allowed` names; it reports
@@ -2170,25 +2148,24 @@ pub(crate) mod tests {
         );
     }
 
-    /// A Messages answer keeps the members and the usage counters the API
-    /// documents and every channel writes; the rest is one channel's own.
+    /// A Messages answer the gateway holds parsed keeps every member and
+    /// usage counter the API documents, those only some channels write
+    /// included, and loses what the API does not document. A relayed stream
+    /// frame keeps what its upstream wrote, less the invocation metrics.
     #[test]
-    fn a_messages_answer_keeps_only_what_every_channel_writes() {
+    fn a_parsed_messages_answer_keeps_what_the_api_documents() {
         let ids = MessagesIds::new(&mac(&K));
-        let usage = json!({
+        let documented_usage = json!({
             "input_tokens": 3, "output_tokens": 1,
             "cache_creation_input_tokens": 2, "cache_read_input_tokens": 4,
-            "cache_creation": {"ephemeral_5m_input_tokens": 2, "ephemeral_1h_input_tokens": 0,
-                               "ephemeral_2h_input_tokens": 9},
+            "cache_creation": {"ephemeral_5m_input_tokens": 2, "ephemeral_1h_input_tokens": 0},
             "service_tier": "standard", "inference_geo": "us", "speed": "standard",
             "server_tool_use": {"web_search_requests": 1},
             "output_tokens_details": {"thinking_tokens": 1},
         });
-        let kept_usage = json!({
-            "input_tokens": 3, "output_tokens": 1,
-            "cache_creation_input_tokens": 2, "cache_read_input_tokens": 4,
-            "cache_creation": {"ephemeral_5m_input_tokens": 2, "ephemeral_1h_input_tokens": 0},
-        });
+        let mut usage = documented_usage.clone();
+        usage["channel_queue_ms"] = json!(12);
+        usage["cache_creation"]["ephemeral_2h_input_tokens"] = json!(9);
         let mut body = json!({
             "id": "msg_1", "type": "message", "role": "assistant", "model": "alias",
             "content": [{"type": "text", "text": "hi"}],
@@ -2210,8 +2187,10 @@ pub(crate) mod tests {
         assert_eq!(
             members,
             [
+                "container",
                 "content",
                 "context_management",
+                "diagnostics",
                 "id",
                 "model",
                 "role",
@@ -2222,53 +2201,33 @@ pub(crate) mod tests {
                 "usage"
             ]
         );
-        assert_eq!(body["usage"], kept_usage);
+        assert_eq!(body["usage"], documented_usage);
 
-        // The same on the stream, at every event that carries such members.
-        let start = json!({"type": "message_start", "region": "us-east-1", "message": {
-            "id": "msg_1", "type": "message", "role": "assistant", "model": "up",
-            "content": [], "usage": usage, "container": null}})
-        .to_string();
-        let out: Value =
-            serde_json::from_slice(&ids.rewrite_event_json(start.as_bytes(), "alias").unwrap())
-                .unwrap();
+        // An event the gateway builds is trimmed the same way.
+        let mut delta = json!({"type": "message_delta", "region": "us-east-1",
+            "delta": {"stop_reason": "end_turn", "stop_sequence": null, "x": 1},
+            "usage": {"output_tokens": 5, "channel_queue_ms": 1}});
+        ids.apply_to_event(&mut delta);
         assert_eq!(
-            out,
-            json!({"type": "message_start", "message": {
-                "id": ids.message_id, "type": "message", "role": "assistant", "model": "alias",
-                "content": [], "usage": kept_usage}})
+            delta,
+            json!({"type": "message_delta", "delta": {"stop_reason": "end_turn",
+                   "stop_sequence": null}, "usage": {"output_tokens": 5}})
         );
-        let delta = json!({"type": "message_delta",
-            "delta": {"stop_reason": "end_turn", "stop_sequence": null,
-                      "container": {"id": "container_1"}},
-            "usage": {"output_tokens": 5, "server_tool_use": {"web_search_requests": 1},
-                      "inference_geo": "us"},
-            "context_management": null})
-        .to_string();
-        let out: Value =
-            serde_json::from_slice(&ids.rewrite_event_json(delta.as_bytes(), "alias").unwrap())
-                .unwrap();
-        assert_eq!(
-            out,
-            json!({"type": "message_delta",
-                "delta": {"stop_reason": "end_turn", "stop_sequence": null},
-                "usage": {"output_tokens": 5}, "context_management": null})
-        );
+
+        // A relayed frame is not trimmed: that would cost a pass per frame.
         let block_delta = br#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"},"p":"x"}"#;
+        assert_eq!(ids.rewrite_event_json(block_delta, "alias"), None);
+        let stop = br#"{"type":"message_stop","p":"x","amazon-bedrock-invocationMetrics":{"n":1}}"#;
         assert_eq!(
-            ids.rewrite_event_json(block_delta, "alias").as_deref(),
-            Some(&br#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}"#[..])
+            ids.rewrite_event_json(stop, "alias").as_deref(),
+            Some(&br#"{"type":"message_stop","p":"x"}"#[..])
         );
-        // What the model wrote is not trimmed: a block keeps all it carries.
-        let block = br#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":"","citations":[],"usage":{"x":1}}}"#;
-        assert_eq!(ids.rewrite_event_json(block, "alias"), None);
     }
 
-    /// Platform mode relays no `ping`, no frame without a payload, and no
-    /// event of a type the Messages API does not document; every documented
-    /// event, `error` included, is relayed.
+    /// A native stream relays every frame but a `ping` and one with no
+    /// payload, a frame of a type the API does not document included.
     #[test]
-    fn only_the_documented_messages_events_are_relayed() {
+    fn a_native_stream_relays_every_frame_but_a_ping_and_a_comment() {
         for kind in [
             "message_start",
             "message_delta",
@@ -2277,21 +2236,16 @@ pub(crate) mod tests {
             "content_block_delta",
             "content_block_stop",
             "error",
+            "channel_status",
         ] {
             assert!(
                 MessagesIds::relays_event(Some(&json!({"type": kind}))),
                 "{kind}"
             );
         }
-        for dropped in [
-            Some(json!({"type": "ping"})),
-            Some(json!({"type": "channel_status"})),
-            Some(json!({"no_type": 1})),
-            Some(json!("message_stop")),
-            None,
-        ] {
-            assert!(!MessagesIds::relays_event(dropped.as_ref()), "{dropped:?}");
-        }
+        assert!(MessagesIds::relays_event(Some(&json!({"no_type": 1}))));
+        assert!(!MessagesIds::relays_event(Some(&json!({"type": "ping"}))));
+        assert!(!MessagesIds::relays_event(None));
     }
 
     #[test]

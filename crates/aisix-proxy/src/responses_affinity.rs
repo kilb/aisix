@@ -902,11 +902,7 @@ impl ResponseMark {
         if self.seal.is_none() {
             return tagged;
         }
-        crate::opaque_id::retain_json(
-            tagged.as_deref().unwrap_or(payload),
-            crate::opaque_id::RESPONSES_EVENT,
-        )
-        .or(tagged)
+        crate::opaque_id::strip_channel_metrics(tagged.as_deref().unwrap_or(payload)).or(tagged)
     }
 
     fn tag_event_json(&self, payload: &[u8], model: Option<&str>) -> Option<Vec<u8>> {
@@ -1268,10 +1264,11 @@ mod tests {
         assert!(!String::from_utf8(buffered).unwrap().contains("bdrk"));
     }
 
-    /// In platform mode a relayed Response object keeps the members and the
-    /// usage counters the Responses API documents, and a stream event loses
-    /// its `obfuscation` padding: what one channel writes and another does
-    /// not names the channel.
+    /// In platform mode a buffered Response object keeps the members and the
+    /// usage counters the Responses API documents: what one channel writes
+    /// and another does not names the channel. A relayed stream frame keeps
+    /// what the upstream wrote apart from its ids: trimming it would cost a
+    /// pass per frame.
     #[test]
     fn a_platform_response_keeps_only_the_documented_members() {
         let (mark, _) = sealing_mark(None);
@@ -1315,22 +1312,9 @@ mod tests {
                    "response": {"id": "resp_up", "object": "response", "output": [],
                                 "usage": usage, "content_filters": []}})
         );
-        let out = mark.apply_to_sse_frame(done.as_bytes()).unwrap();
-        let (event, _) = crate::redact::parse_sse_json_event(&out);
-        let event = event.unwrap();
-        assert_eq!(event["sequence_number"], 7);
-        assert!(
-            event["response"].get("content_filters").is_none(),
-            "{event}"
-        );
-        assert_eq!(event["response"]["usage"], kept_usage);
-
+        assert!(mark.apply_to_sse_frame(done.as_bytes()).is_none());
         let delta = b"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"sequence_number\":3,\"item_id\":\"\",\"output_index\":0,\"content_index\":0,\"delta\":\"hi\",\"logprobs\":[],\"obfuscation\":\"Xy3\"}\n\n";
-        let out = String::from_utf8(mark.apply_to_sse_frame(delta).unwrap()).unwrap();
-        assert_eq!(
-            out,
-            "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"sequence_number\":3,\"item_id\":\"\",\"output_index\":0,\"content_index\":0,\"delta\":\"hi\",\"logprobs\":[]}\n\n"
-        );
+        assert!(mark.apply_to_sse_frame(delta).is_none());
 
         // Off platform mode both go out as the upstream wrote them.
         let off = ContextAffinity::default()
