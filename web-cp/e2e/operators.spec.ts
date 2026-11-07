@@ -23,7 +23,7 @@ test.afterAll(async () => {
  * Buttons that create, change, approve, issue, revoke, reconcile or delete
  * something, or open a form that does.
  */
-const EDIT_CONTROL = /^(新增|新建|创建|保存|删除|编辑|批准|停用|启用|恢复|签发|吊销|允许清理|接管|邀请|生成邀请|分组覆盖|确认)/;
+const EDIT_CONTROL = /^(新增|新建|新租户默认值|创建|保存|删除|编辑|批准|停用|启用|恢复|签发|吊销|允许清理|接管|邀请|生成邀请|分组覆盖|确认)/;
 
 /** Controls only an admin may use, on any tab. */
 const ADMIN_ONLY = /^(新建运维账号|签发|允许清理|接管|新租户默认值|保存默认值)/;
