@@ -2,9 +2,9 @@
 -- append-only ledger. Every entry moves the balance by its amount and records
 -- the balance after it: `usage` debits one charged usage row (`event_id`),
 -- `topup` credits one top-up, and `adjustment` is one re-pricing run's
--- correction for the tenant. A trigger refuses every UPDATE and DELETE of a
--- ledger row. Ingest locks accounts, never tenant rows: a ledger entry
--- references its account, not its tenant.
+-- correction for the tenant. Triggers refuse every UPDATE, DELETE and
+-- TRUNCATE of the ledger. Ingest locks accounts, never tenant rows: a ledger
+-- entry references its account, not its tenant.
 CREATE TABLE billing_accounts (
   tenant_id uuid PRIMARY KEY REFERENCES tenants(id),
   balance_micro_usd bigint NOT NULL DEFAULT 0,
@@ -38,3 +38,6 @@ CREATE FUNCTION billing_append_only() RETURNS trigger LANGUAGE plpgsql AS
   $$ BEGIN RAISE EXCEPTION '% is append-only', TG_TABLE_NAME; END $$;
 CREATE TRIGGER billing_ledger_append_only BEFORE UPDATE OR DELETE ON billing_ledger
   FOR EACH ROW EXECUTE FUNCTION billing_append_only();
+-- A row trigger never fires on TRUNCATE (nor on TRUNCATE billing_accounts CASCADE).
+CREATE TRIGGER billing_ledger_no_truncate BEFORE TRUNCATE ON billing_ledger
+  FOR EACH STATEMENT EXECUTE FUNCTION billing_append_only();

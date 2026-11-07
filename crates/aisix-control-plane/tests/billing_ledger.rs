@@ -10,7 +10,7 @@
 mod support;
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use aisix_control_plane::audit::Actor;
 use aisix_control_plane::auth::MemberRole;
@@ -25,8 +25,9 @@ use sqlx::{Connection, PgConnection};
 use support::world::{
     db_now, deliver, price, seed_key, seed_model, seed_tenant, tokens_680, usage, world, World,
 };
-use support::{TestCp, TEST_PASSWORD};
+use support::{Resp, TestCp, TEST_PASSWORD};
 use tokio::sync::Barrier;
+use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 /// One `billing_ledger` row, as far as these tests read it.
@@ -300,19 +301,11 @@ async fn ingest_never_waits_on_a_held_tenant_row() {
     let Some(w) = world().await else { return };
     let model = seed_model(&w.cp, &w.admin).await;
     price(&w.cp, model).await;
-    // An operator's long tenant edit, as another connection.
-    let mut holder = PgConnection::connect(w.cp.database_url())
+    // An operator's long tenant edit, as the control plane takes it.
+    let mut edit = w.cp.db().pool().begin().await.expect("begin");
+    tenants::lock(&mut edit, w.tenant)
         .await
-        .expect("connect");
-    sqlx::query("BEGIN")
-        .execute(&mut holder)
-        .await
-        .expect("begin");
-    sqlx::query("SELECT 1 FROM tenants WHERE id = $1 FOR UPDATE")
-        .bind(w.tenant)
-        .execute(&mut holder)
-        .await
-        .expect("hold the tenant row");
+        .expect("lock the tenant");
     let r = tokio::time::timeout(
         Duration::from_secs(2),
         deliver(
@@ -322,16 +315,103 @@ async fn ingest_never_waits_on_a_held_tenant_row() {
         ),
     )
     .await
-    .expect("the batch is answered while the tenant row is held");
+    .expect("the batch is answered while the tenant is locked");
     assert_eq!(r.status, 200, "{r:?}");
     assert_eq!(
         entries(&w.cp, w.tenant).await,
         vec![debit(-680, -680, "e1")]
     );
-    sqlx::query("ROLLBACK")
-        .execute(&mut holder)
+    edit.rollback().await.expect("end the edit");
+}
+
+/// Waits until a statement of the control plane's own database waits on a
+/// lock while locking a billing account; fails when `delivery` finishes
+/// first, or when nothing waits within 4 s (below the 5 s lock timeout).
+async fn until_intake_waits_on_an_account(cp: &TestCp, delivery: &JoinHandle<Resp>) {
+    let deadline = Instant::now() + Duration::from_secs(4);
+    loop {
+        assert!(
+            !delivery.is_finished(),
+            "the batch was answered while its account was held"
+        );
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity \
+             WHERE datname = current_database() AND pid <> pg_backend_pid() \
+               AND wait_event_type = 'Lock' AND query LIKE '%FROM billing_accounts%'",
+        )
+        .fetch_one(cp.db().pool())
         .await
-        .expect("release the tenant row");
+        .expect("read pg_stat_activity");
+        if waiting > 0 {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "intake never waited on the account"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_billing_lock_holds_off_its_tenants_intake_until_it_ends() {
+    let Some(w) = world().await else { return };
+    let model = seed_model(&w.cp, &w.admin).await;
+    price(&w.cp, model).await;
+    let (batch, body) = (
+        Uuid::new_v4(),
+        json!({"events": [usage(&w, "e1", model, tokens_680())]}),
+    );
+    // A write that moves the tenant's money, as the control plane takes it.
+    let mut write = w.cp.db().pool().begin().await.expect("begin");
+    tenants::lock_billing(&mut write, w.tenant)
+        .await
+        .expect("lock the tenant for billing");
+    let dp = Arc::new(w.dp);
+    let delivery = tokio::spawn({
+        let dp = dp.clone();
+        async move { dp.telemetry(batch, &body).await }
+    });
+    until_intake_waits_on_an_account(&w.cp, &delivery).await;
+    assert_eq!(entries(&w.cp, w.tenant).await, vec![]);
+    write.commit().await.expect("end the write");
+    let r = delivery.await.expect("the delivery task");
+    assert_eq!(r.status, 200, "{r:?}");
+    assert_eq!(
+        entries(&w.cp, w.tenant).await,
+        vec![debit(-680, -680, "e1")]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_missing_account_never_makes_intake_wait_on_its_tenant() {
+    let Some(w) = world().await else { return };
+    let model = seed_model(&w.cp, &w.admin).await;
+    price(&w.cp, model).await;
+    delete_account(&w.cp, w.tenant).await;
+    let mut edit = w.cp.db().pool().begin().await.expect("begin");
+    tenants::lock(&mut edit, w.tenant)
+        .await
+        .expect("lock the tenant");
+    let batch = Uuid::new_v4();
+    let events = vec![usage(&w, "e1", model, tokens_680())];
+    // The account cannot be opened while the tenant is held: the batch is
+    // refused at once, to be sent again.
+    let r = tokio::time::timeout(
+        Duration::from_secs(2),
+        deliver(&w.dp, batch, events.clone()),
+    )
+    .await
+    .expect("the batch is answered while the tenant is locked");
+    assert_eq!(r.status, 503, "{r:?}");
+    edit.rollback().await.expect("end the edit");
+    let r = deliver(&w.dp, batch, events).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    assert_eq!(
+        entries(&w.cp, w.tenant).await,
+        vec![debit(-680, -680, "e1")]
+    );
+    assert_eq!(balance(&w.cp, w.tenant).await, Some(-680));
 }
 
 #[tokio::test]
@@ -380,6 +460,35 @@ async fn the_ledger_refuses_update_and_delete() {
         entries(&w.cp, w.tenant).await,
         vec![debit(-680, -680, "e1")]
     );
+}
+
+#[tokio::test]
+async fn the_ledger_refuses_truncate() {
+    let Some(w) = world().await else { return };
+    let model = seed_model(&w.cp, &w.admin).await;
+    price(&w.cp, model).await;
+    let r = deliver(
+        &w.dp,
+        Uuid::new_v4(),
+        vec![usage(&w, "e1", model, tokens_680())],
+    )
+    .await;
+    assert_eq!(r.status, 200, "{r:?}");
+    for statement in [
+        "TRUNCATE billing_ledger",
+        "TRUNCATE billing_accounts CASCADE",
+    ] {
+        let e = sqlx::query(statement)
+            .execute(w.cp.db().pool())
+            .await
+            .expect_err(statement);
+        assert!(e.to_string().contains("append-only"), "{statement}: {e}");
+    }
+    assert_eq!(
+        entries(&w.cp, w.tenant).await,
+        vec![debit(-680, -680, "e1")]
+    );
+    assert_eq!(balance(&w.cp, w.tenant).await, Some(-680));
 }
 
 #[tokio::test]
@@ -451,6 +560,30 @@ async fn the_backfill_restores_a_missing_account() {
     assert_eq!(balance(&w.cp, w.tenant).await, Some(0));
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_backfill_skips_a_held_tenant_and_opens_it_later() {
+    let Some(w) = world().await else { return };
+    delete_account(&w.cp, w.tenant).await;
+    let mut edit = w.cp.db().pool().begin().await.expect("begin");
+    tenants::lock(&mut edit, w.tenant)
+        .await
+        .expect("lock the tenant");
+    let mut conn = w.cp.db().pool().acquire().await.expect("a connection");
+    let opened = tokio::time::timeout(Duration::from_secs(2), ledger::backfill_accounts(&mut conn))
+        .await
+        .expect("the backfill does not wait on a held tenant")
+        .expect("backfill");
+    assert_eq!(opened, 0);
+    edit.rollback().await.expect("end the edit");
+    assert_eq!(
+        ledger::backfill_accounts(&mut conn)
+            .await
+            .expect("backfill"),
+        1
+    );
+    assert_eq!(balance(&w.cp, w.tenant).await, Some(0));
+}
+
 #[tokio::test]
 async fn the_boot_and_every_housekeeping_tick_run_the_backfill() {
     let Some(w) = world().await else { return };
@@ -463,28 +596,42 @@ async fn the_boot_and_every_housekeeping_tick_run_the_backfill() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_tenant_lock_also_holds_its_account() {
+async fn only_the_billing_lock_holds_the_account() {
     let Some(w) = world().await else { return };
     let mut other = PgConnection::connect(w.cp.database_url())
         .await
         .expect("connect");
     let grab = "SELECT 1 FROM billing_accounts WHERE tenant_id = $1 FOR UPDATE NOWAIT";
+
     let mut tx = w.cp.db().pool().begin().await.expect("begin");
     tenants::lock(&mut tx, w.tenant)
         .await
         .expect("lock the tenant");
+    sqlx::query(grab)
+        .bind(w.tenant)
+        .fetch_one(&mut other)
+        .await
+        .expect("a plain tenant lock leaves the account free");
+    tx.rollback().await.expect("rollback");
+
+    let mut tx = w.cp.db().pool().begin().await.expect("begin");
+    let (tenant, account) = tenants::lock_billing(&mut tx, w.tenant)
+        .await
+        .expect("lock the tenant for billing");
+    assert_eq!((tenant.id, account.tenant_id), (w.tenant, w.tenant));
+    assert_eq!(account.balance_micro_usd, 0);
     let e = sqlx::query(grab)
         .bind(w.tenant)
         .fetch_one(&mut other)
         .await
-        .expect_err("the account is held with its tenant");
+        .expect_err("the billing lock holds the account");
     let code = match &e {
         sqlx::Error::Database(db) => db.code().map(|c| c.to_string()),
         _ => None,
     };
     assert_eq!(code.as_deref(), Some("55P03"), "{e}");
     tx.rollback().await.expect("rollback");
-    // Free again once the tenant's transaction ends.
+    // Free again once the transaction ends.
     sqlx::query(grab)
         .bind(w.tenant)
         .fetch_one(&mut other)

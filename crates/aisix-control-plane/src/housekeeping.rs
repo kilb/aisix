@@ -72,6 +72,13 @@ pub async fn tick(db: &Db, ctx: &WriteCtx) {
         Ok(caught_up) => tracing::debug!(?caught_up, "key documents caught up"),
         Err(e) => tracing::warn!(code = e.code, "catching up key documents failed"),
     }
+    backfill_accounts(db).await;
+}
+
+/// Opens the billing account of every tenant that has none
+/// ([`ledger::backfill_accounts`]), and logs how many, or why it failed. A
+/// tenant it leaves behind is opened by a later run.
+pub(crate) async fn backfill_accounts(db: &Db) {
     let opened = async {
         let mut conn = db.pool().acquire().await.map_err(DbError::from)?;
         ledger::backfill_accounts(&mut conn).await

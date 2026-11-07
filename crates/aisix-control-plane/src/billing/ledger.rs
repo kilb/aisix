@@ -126,12 +126,16 @@ const ACCOUNT_COLUMNS: &str = "tenant_id, balance_micro_usd, credit_limit_micro_
 /// transaction; locking one the transaction already holds is a no-op.
 ///
 /// An account that is missing is inserted first. That insert references
-/// the tenant row, and so waits on a transaction holding it: it is the one
-/// insert ingest can make that does, which [`backfill_accounts`] keeps
-/// unreachable by opening every tenant's account at boot and on every
-/// housekeeping tick. It is logged, since it means a tenant was created
-/// without its account (by an older control plane during an upgrade, or by
-/// hand).
+/// the tenant row: it is the one insert ingest can make that does, which
+/// [`backfill_accounts`] keeps unreachable by opening every tenant's account
+/// at boot and on every housekeeping tick. The tenant row is key-shared
+/// before the insert, as the lock order has it, and without waiting: ingest
+/// never waits on a tenant row, so when another transaction holds it
+/// (`tenants::lock`) this fails at once with [`DbError::LockTimeout`], and
+/// the batch is answered `503` and sent again. A caller holding the row
+/// itself (`tenants::lock_billing`) is not refused by its own lock. The
+/// insert is logged, since it means a tenant was created without its
+/// account (by an older control plane during an upgrade, or by hand).
 pub async fn lock_account(conn: &mut PgConnection, tenant_id: Uuid) -> Result<Account, DbError> {
     let select =
         format!("SELECT {ACCOUNT_COLUMNS} FROM billing_accounts WHERE tenant_id = $1 FOR UPDATE");
@@ -146,6 +150,10 @@ pub async fn lock_account(conn: &mut PgConnection, tenant_id: Uuid) -> Result<Ac
         tenant = %tenant_id,
         "a tenant had no billing account; it is opened now"
     );
+    sqlx::query("SELECT 1 FROM tenants WHERE id = $1 FOR KEY SHARE NOWAIT")
+        .bind(tenant_id)
+        .execute(&mut *conn)
+        .await?;
     sqlx::query("INSERT INTO billing_accounts (tenant_id) VALUES ($1) ON CONFLICT DO NOTHING")
         .bind(tenant_id)
         .execute(&mut *conn)
@@ -173,10 +181,16 @@ pub async fn lock_accounts(
 }
 
 /// Opens an account for every tenant that has none, and returns how many it
-/// opened.
+/// opened. Each tenant row is key-shared before its account is inserted, in
+/// ascending id, as the lock order has it; one another transaction holds is
+/// skipped rather than waited for, and opened by a later run.
 pub async fn backfill_accounts(conn: &mut PgConnection) -> Result<u64, DbError> {
     Ok(sqlx::query(
-        "INSERT INTO billing_accounts (tenant_id) SELECT id FROM tenants ON CONFLICT DO NOTHING",
+        "INSERT INTO billing_accounts (tenant_id) \
+         SELECT t.id FROM tenants t \
+         WHERE NOT EXISTS (SELECT 1 FROM billing_accounts a WHERE a.tenant_id = t.id) \
+         ORDER BY t.id FOR KEY SHARE OF t SKIP LOCKED \
+         ON CONFLICT DO NOTHING",
     )
     .execute(conn)
     .await?

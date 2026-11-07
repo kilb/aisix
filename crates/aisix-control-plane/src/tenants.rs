@@ -10,9 +10,12 @@
 //! changes them.
 //!
 //! Every tenant-scoped read-then-write starts by locking the tenant rows
-//! ([`lock`], [`lock_many`]), each with its billing account, and only then
-//! reaches `write_resource`, which takes the resources lock: the lock order
-//! everywhere.
+//! ([`lock`], [`lock_many`]) and only then reaches `write_resource`, which
+//! takes the resources lock: the lock order everywhere. A write that moves
+//! money or decides a mark (the ledger, a credit limit, a quota, a balance
+//! document) takes [`lock_billing`] instead, which adds the tenant's billing
+//! account between the two. Every other edit leaves the account alone, so it
+//! never holds up the tenant's usage intake, which locks accounts only.
 //!
 //! A lookup by id answers `404 not_found` for an id that names no tenant,
 //! the same answer whatever the reason, so the tenant routes built on these
@@ -280,21 +283,34 @@ pub fn limits_policy_doc(id: Uuid, limits: &TenantLimits) -> Option<Value> {
     }))
 }
 
-/// Tenant `id`, locked for the rest of the transaction, and then its
-/// billing account ([`ledger::lock_account`]), which comes next in the lock
-/// order; `404 not_found` when there is none. Locking a row the transaction
-/// already holds is a no-op.
+/// Tenant `id`, locked for the rest of the transaction; `404 not_found`
+/// when there is none. Locking a row the transaction already holds is a
+/// no-op. Its billing account is not locked: see [`lock_billing`].
 pub async fn lock(conn: &mut PgConnection, id: Uuid) -> Result<TenantRow, ApiError> {
     let raw: Option<RawTenant> = sqlx::query_as(&format!(
         "SELECT {COLUMNS} FROM tenants WHERE id = $1 FOR UPDATE"
     ))
     .bind(id)
-    .fetch_optional(&mut *conn)
+    .fetch_optional(conn)
     .await
     .map_err(DbError::from)?;
-    let tenant = TenantRow::from_raw(raw.ok_or_else(ApiError::not_found)?)?;
-    ledger::lock_account(conn, id).await?;
-    Ok(tenant)
+    TenantRow::from_raw(raw.ok_or_else(ApiError::not_found)?)
+}
+
+/// Tenant `id` and then its billing account ([`ledger::lock_account`]),
+/// both locked for the rest of the transaction, in the lock order; `404
+/// not_found` when there is no such tenant. Every path that posts to the
+/// ledger, changes a credit limit or a quota, or projects a balance or quota
+/// mark takes this rather than [`lock`]: the account lock is what keeps it
+/// from racing the tenant's usage intake on the balance, which it holds off
+/// for as long as the transaction runs.
+pub async fn lock_billing(
+    conn: &mut PgConnection,
+    id: Uuid,
+) -> Result<(TenantRow, ledger::Account), ApiError> {
+    let tenant = lock(&mut *conn, id).await?;
+    let account = ledger::lock_account(conn, id).await?;
+    Ok((tenant, account))
 }
 
 /// Tenant `id` as it stands, without a lock; `404 not_found` when there is
