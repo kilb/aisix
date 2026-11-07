@@ -163,9 +163,11 @@ pub(crate) fn classify(err: &ProxyError) -> PlatformErrorClass {
         // Read exactly as a response the upstream does not have.
         ProxyError::ResponseNotFound => PlatformErrorClass::NotFound,
         // The caller's own field, which the class names.
-        ProxyError::StoredObjectReference(field) => PlatformErrorClass::InvalidRequest {
-            param: Some(field.clone()),
-        },
+        ProxyError::StoredObjectReference(field) | ProxyError::ModelSelectorRefused(field) => {
+            PlatformErrorClass::InvalidRequest {
+                param: Some(field.clone()),
+            }
+        }
         other => match other.status().as_u16() {
             401 => PlatformErrorClass::Authentication,
             404 => PlatformErrorClass::NotFound,
@@ -300,7 +302,8 @@ fn hides(err: &ProxyError) -> bool {
         ProxyError::UnusableTarget(_)
         | ProxyError::TargetRefused(_)
         | ProxyError::ResponseNotFound
-        | ProxyError::StoredObjectReference(_) => true,
+        | ProxyError::StoredObjectReference(_)
+        | ProxyError::ModelSelectorRefused(_) => true,
         _ => false,
     }
 }

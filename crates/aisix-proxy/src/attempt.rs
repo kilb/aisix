@@ -688,6 +688,7 @@ pub(crate) fn attempt_reached_upstream(err: &ProxyError) -> bool {
         | ProxyError::JobResourceNotFound(_)
         | ProxyError::ResponseNotFound
         | ProxyError::StoredObjectReference(_)
+        | ProxyError::ModelSelectorRefused(_)
         | ProxyError::JobListRefused
         | ProxyError::ModelForbidden(_)
         | ProxyError::ModelIpRestricted(_)

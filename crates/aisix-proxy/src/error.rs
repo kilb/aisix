@@ -275,6 +275,15 @@ pub enum ProxyError {
         "request field `{0}` names an object stored upstream, which platform mode does not allow"
     )]
     StoredObjectReference(String),
+    /// Platform mode: a request field, named by its path, with which the
+    /// caller would choose the model that answers past the key's model
+    /// access, such as a fallback chain or a tool's own model
+    /// (`crate::stored_refs`). Answered as an invalid request naming the
+    /// field.
+    #[error(
+        "request field `{0}` chooses the model that answers, which platform mode does not allow"
+    )]
+    ModelSelectorRefused(String),
     /// A list of files, batches or fine-tuning jobs asked for on a provider key
     /// that keys belonging to a team or user reach. The upstream's list spans
     /// its whole account, and the gateway cannot say which of it the caller
@@ -570,7 +579,9 @@ impl ProxyError {
             ProxyError::VideoNotFound(_) => StatusCode::NOT_FOUND,
             ProxyError::JobResourceNotFound(_) => StatusCode::NOT_FOUND,
             ProxyError::ResponseNotFound => StatusCode::NOT_FOUND,
-            ProxyError::StoredObjectReference(_) => StatusCode::BAD_REQUEST,
+            ProxyError::StoredObjectReference(_) | ProxyError::ModelSelectorRefused(_) => {
+                StatusCode::BAD_REQUEST
+            }
             ProxyError::JobListRefused => StatusCode::FORBIDDEN,
             ProxyError::InvalidRequest(_)
             | ProxyError::UnusableTarget(_)
@@ -629,7 +640,9 @@ impl ProxyError {
             ProxyError::VideoNotFound(_) => "video_not_found",
             ProxyError::JobResourceNotFound(_) => "resource_not_found",
             ProxyError::ResponseNotFound => "response_not_found",
-            ProxyError::StoredObjectReference(_) => "invalid_request_error",
+            ProxyError::StoredObjectReference(_) | ProxyError::ModelSelectorRefused(_) => {
+                "invalid_request_error"
+            }
             ProxyError::JobListRefused => "permission_denied",
             ProxyError::InvalidRequest(_)
             | ProxyError::UnusableTarget(_)
