@@ -16,10 +16,11 @@ import {
 // tenant gets must not tell it anything about the others.
 //
 // - Whether the cache served an answer is a debug fact. A hit is still served,
-//   but unless the operator turned `proxy.expose_debug_headers` on, nothing on
-//   the response says the cache answered: under a shared scope that would tell
-//   a key that somebody else already asked the same thing. With the debug
-//   headers on, a hit says so, on every endpoint.
+//   but nothing on the response says the cache answered: under a shared scope
+//   that would tell a key that somebody else already asked the same thing. The
+//   debug headers that would say so (`proxy.expose_debug_headers`) cannot be
+//   turned on in platform mode: a gateway configured with both refuses to
+//   start.
 // - A model that exists but that the caller's key may not use answers exactly
 //   like a model that does not exist, on every endpoint: status, headers and
 //   body. Otherwise a key could map another tenant's catalog by asking for
@@ -32,7 +33,8 @@ import {
 const hash = (plaintext: string) => createHash("sha256").update(plaintext).digest("hex");
 const CALLER_KEY = "sk-platform-cache-acl-e2e-caller";
 const PLATFORM_SECRET_ENV = "P0_E2E_PLATFORM_ID_KEY";
-const PLATFORM_SECRET = "platform-cache-acl-e2e-secret-0123456789abcdef";
+// 32 random bytes as hex digits, the form the gateway requires.
+const PLATFORM_SECRET = "8728434cd977a71b56b2441edd1d0ee474d38899149f5eee5c962e57929c5469";
 const ACCESS_LINE = "proxy request completed";
 
 /** The models the caller's key may use. */
@@ -374,7 +376,6 @@ async function spawnPlatformGateway(etcd: EtcdClient, upstream: Upstream, expose
 describe("platform mode: cache headers and model permissions tell a tenant nothing", () => {
   let upstream: Upstream | undefined;
   let quiet: SpawnedApp | undefined;
-  let debug: SpawnedApp | undefined;
   let etcdReachable = false;
 
   const upstreamCalls = (path: string) => upstream!.received.filter((r) => r.path.endsWith(path)).length;
@@ -385,12 +386,10 @@ describe("platform mode: cache headers and model permissions tell a tenant nothi
     if (!etcdReachable) return;
     upstream = await startUpstream();
     quiet = await spawnPlatformGateway(etcd, upstream, false);
-    debug = await spawnPlatformGateway(etcd, upstream, true);
   }, 120_000);
 
   afterAll(async () => {
     await quiet?.exit();
-    await debug?.exit();
     await new Promise<void>((resolve) => (upstream ? upstream.server.close(() => resolve()) : resolve()));
   });
 
@@ -426,26 +425,24 @@ describe("platform mode: cache headers and model permissions tell a tenant nothi
     );
   });
 
-  test("with debug headers on, a hit says so on every endpoint", async (ctx) => {
-    if (!etcdReachable || !debug) return ctx.skip();
-    const failures: string[] = [];
-    for (const endpoint of CACHED) {
-      const text = `debug gateway via ${endpoint.name}`;
-      const before = upstreamCalls(endpoint.path);
-      const first = await call(debug, endpoint, VISIBLE[endpoint.family], text);
-      const second = await call(debug, endpoint, VISIBLE[endpoint.family], text);
-      expect(first.status, `${endpoint.name}: ${first.text}`).toBe(200);
-      expect(second.status, `${endpoint.name}: ${second.text}`).toBe(200);
-      expect(upstreamCalls(endpoint.path) - before, `${endpoint.name}: upstream calls`).toBe(1);
-      const said = second.headers.get("x-aisix-cache");
-      if (said !== "hit") failures.push(`${endpoint.name}: x-aisix-cache=${said}, want hit`);
+  test("a platform gateway with the debug headers on refuses to start, naming both settings", async (ctx) => {
+    if (!etcdReachable || !upstream) return ctx.skip();
+    let refused: unknown;
+    try {
+      const app = await spawnPlatformGateway(new EtcdClient(), upstream, true);
+      await app.exit();
+    } catch (e) {
+      refused = e;
     }
-    expect(failures, failures.join("\n")).toEqual([]);
-  });
+    expect(refused, "the gateway started").toBeInstanceOf(Error);
+    const msg = (refused as Error).message;
+    expect(msg).toContain("exited early with code=1");
+    expect(msg).toContain("proxy.expose_debug_headers");
+    expect(msg).toContain("proxy.platform.enabled");
+  }, 60_000);
 
   describe.each([
     { gateway: "without debug headers", app: () => quiet },
-    { gateway: "with debug headers", app: () => debug },
   ])("$gateway", ({ app }) => {
     test("the model list names the models the key may use and none it may not", async (ctx) => {
       const gateway = app();
