@@ -1526,9 +1526,8 @@ async fn a_price_write_that_is_not_json_is_415_and_writes_nothing() {
     for (path, body) in writes {
         let bytes = serde_json::to_vec(&body).expect("serialize the body");
         for content_type in [None, Some("text/plain")] {
-            let r = w
-                .cp
-                .send_raw(
+            let r =
+                w.cp.send_raw(
                     "POST",
                     path,
                     Some(w.admin.cookie()),
