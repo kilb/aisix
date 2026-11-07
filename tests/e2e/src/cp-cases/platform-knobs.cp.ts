@@ -8,7 +8,12 @@ import {
   type Json,
   type ManagedGateway,
 } from "../harness/control-plane.js";
-import { callGateway, startPlatformUpstream, type PlatformUpstream } from "../harness/cp-upstream.js";
+import {
+  callGateway,
+  startPlatformUpstream,
+  type GatewayAnswer,
+  type PlatformUpstream,
+} from "../harness/cp-upstream.js";
 import { ProxyClient } from "../harness/proxy.js";
 
 // E2E: the two configuration rules a platform deployment keeps tenants apart
@@ -120,19 +125,37 @@ describe("platform configuration rules at the gateway", () => {
   });
 
   test("A key's provider groups confine it to upstreams in those groups", async () => {
-    for (let i = 0; i < 10; i++) {
+    // Every answer the key gets here, served or failed, is scanned below.
+    const answers: GatewayAnswer[] = [];
+    const call = async (): Promise<GatewayAnswer> => {
       const res = await callGateway(app!.proxyUrl, keys.t3, "/v1/chat/completions", chat("knob-route-e2e"));
+      answers.push(res);
+      return res;
+    };
+    for (let i = 0; i < 10; i++) {
+      const res = await call();
       expect(res.status, res.text).toBe(200);
     }
     expect(alpha!.count("/v1/chat/completions")).toBe(10);
     expect(beta!.count("/v1/chat/completions")).toBe(0);
 
     alpha!.failWith = 500;
-    const failed = await callGateway(app!.proxyUrl, keys.t3, "/v1/chat/completions", chat("knob-route-e2e"));
+    const failed = await call();
     expect(failed.status, failed.text).toBeGreaterThanOrEqual(400);
     expect(alpha!.count("/v1/chat/completions")).toBeGreaterThan(10);
     expect(beta!.count("/v1/chat/completions")).toBe(0);
-    for (const leak of LEAKS) expect(failed.text, `the answer names ${leak}`).not.toContain(leak);
+
+    // The served answers carry what the upstream issued, the failed one its
+    // error: none names the account or the group behind the routing target,
+    // in its body or its headers.
+    expect(answers.length).toBe(11);
+    for (const answer of answers) {
+      const headers = [...answer.headers.entries()].map(([k, v]) => `${k}: ${v}`).join("\n");
+      for (const leak of LEAKS) {
+        expect(answer.text, `a ${answer.status} body names ${leak}`).not.toContain(leak);
+        expect(headers, `a ${answer.status} answer's headers name ${leak}`).not.toContain(leak);
+      }
+    }
   });
 
   test("An env-scoped cache policy is stopped at the control plane", async () => {

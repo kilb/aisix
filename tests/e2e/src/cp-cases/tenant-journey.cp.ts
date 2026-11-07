@@ -207,7 +207,9 @@ describe("a tenant's journey from signup to a working key, and the switches that
     const ungranted = await call(mainKey.plaintext, "/v1/chat/completions", chatBody("other-e2e"));
     const missing = await call(mainKey.plaintext, "/v1/chat/completions", chatBody("missing-e2e-4b1"));
     const both = `ungranted: ${ungranted.text}\nmissing: ${missing.text}`;
-    expect(ungranted.status, both).toBeGreaterThanOrEqual(400);
+    // A model that does not exist is 404 in the OpenAI contract: pinned, so
+    // that two answers alike for another reason (both 401, both 5xx) fail.
+    expect(missing.status, both).toBe(404);
     expect(ungranted.status, both).toBe(missing.status);
     expect(ungranted.json?.error, both).toBeDefined();
     expect(ungranted.json.error.code, both).toBe(missing.json?.error?.code);
