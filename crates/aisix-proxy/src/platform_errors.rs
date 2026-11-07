@@ -200,9 +200,10 @@ pub(crate) fn classify_bridge(err: &BridgeError) -> PlatformErrorClass {
         BridgeError::InvalidRequest(_) | BridgeError::RequestTooLarge { .. } => {
             PlatformErrorClass::InvalidRequest { param: None }
         }
-        BridgeError::Config(_) | BridgeError::UnsupportedCapability(_) => {
-            PlatformErrorClass::Internal
-        }
+        // The endpoint asked for something this model cannot do: the
+        // request's to change, and not a fault a retry gets past.
+        BridgeError::UnsupportedCapability(_) => PlatformErrorClass::InvalidRequest { param: None },
+        BridgeError::Config(_) => PlatformErrorClass::Internal,
         // The platform's credential or channel configuration, a transport
         // fault, a timeout, or an answer that could not be read.
         BridgeError::InvalidUpstreamConfig(_)
@@ -218,11 +219,36 @@ pub(crate) fn classify_bridge(err: &BridgeError) -> PlatformErrorClass {
 
 /// Codes and types upstreams use for a request their content policy refused:
 /// Azure OpenAI's `content_filter` and its inner `ResponsibleAIPolicyViolation`,
-/// and OpenAI's `content_policy_violation`.
+/// OpenAI's `content_policy_violation`, and the policy codes of a failed
+/// Response (openai-python 3.41.0 `types/responses/response_error.py:47`).
 const CONTENT_FILTER_TOKENS: &[&str] = &[
     "content_filter",
     "content_policy_violation",
     "ResponsibleAIPolicyViolation",
+    "image_content_policy_violation",
+    "bio_policy",
+    "misalignment_policy_violation",
+];
+
+/// The codes of a failed Response that blame the request itself, its prompt
+/// or an image it carries (`types/responses/response_error.py:47`). An
+/// in-band failure has no status to say so, and such a request fails the
+/// same way however often it is retried.
+const CALLER_FAULT_TOKENS: &[&str] = &[
+    "invalid_prompt",
+    "invalid_image",
+    "invalid_image_format",
+    "invalid_base64_image",
+    "invalid_image_url",
+    "image_too_large",
+    "image_too_small",
+    "image_parse_error",
+    "invalid_image_mode",
+    "image_file_too_large",
+    "unsupported_image_media_type",
+    "empty_image_file",
+    "failed_to_download_image",
+    "image_file_not_found",
 ];
 
 /// What upstreams write for a prompt that does not fit the model's context
@@ -269,23 +295,30 @@ fn classify_upstream(
             return PlatformErrorClass::ContextLengthExceeded;
         }
     }
+    // Only what has the shape of a field name of the caller's request:
+    // anything else is the upstream's own text.
+    let param = || {
+        view.and_then(|v| v.param.clone()).filter(|p| {
+            p.len() <= 256
+                && p.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"_.[]".contains(&b))
+        })
+    };
     match status {
         Some(429) => PlatformErrorClass::RateLimited,
         // The platform's account was refused: not the caller's credential,
         // and not something the caller may learn about.
         Some(401 | 403) => PlatformErrorClass::UpstreamUnavailable,
         Some(404) => PlatformErrorClass::NotFound,
-        Some(400..=499) => PlatformErrorClass::InvalidRequest {
-            // Only what has the shape of a field name of the caller's
-            // request: anything else is the upstream's own text.
-            param: view.and_then(|v| v.param.clone()).filter(|p| {
-                p.len() <= 256
-                    && p.bytes()
-                        .all(|b| b.is_ascii_alphanumeric() || b"_.[]".contains(&b))
-            }),
-        },
+        // A timeout and a conflict, which the OpenAI SDKs retry
+        // (openai-python 3.41.0 `_base_client.py:944`), and a failed
+        // dependency upstream (Bedrock's `ModelErrorException`): the
+        // platform's to get past, not a request the caller must change.
+        Some(408 | 409 | 424) => PlatformErrorClass::UpstreamUnavailable,
+        Some(400..=499) => PlatformErrorClass::InvalidRequest { param: param() },
         Some(_) => PlatformErrorClass::UpstreamUnavailable,
         None if names(RATE_LIMIT_TOKENS) => PlatformErrorClass::RateLimited,
+        None if names(CALLER_FAULT_TOKENS) => PlatformErrorClass::InvalidRequest { param: param() },
         None => PlatformErrorClass::UpstreamUnavailable,
     }
 }
@@ -783,6 +816,93 @@ mod tests {
             classify_bridge(&in_band(None)),
             PlatformErrorClass::UpstreamUnavailable
         );
+    }
+
+    /// A status the OpenAI SDKs retry, and an upstream's failed dependency,
+    /// are the platform's to retry, not a caller's invalid request; a
+    /// missing capability is the request's, not an internal fault. Exact
+    /// codes, so a class that moves is caught.
+    #[test]
+    fn a_retryable_status_and_a_caller_fault_get_their_own_class() {
+        for status in [408, 409, 424] {
+            let class = classify(&upstream_status(status, "upstream text"));
+            assert_eq!(class, PlatformErrorClass::UpstreamUnavailable, "{status}");
+            assert_eq!(class.status().as_u16(), 503, "{status}");
+            assert_eq!(class.code(), "upstream_unavailable", "{status}");
+        }
+        let unsupported =
+            BridgeError::UnsupportedCapability(aisix_gateway::BridgeCapability::Embeddings);
+        assert_eq!(
+            classify_bridge(&unsupported),
+            PlatformErrorClass::InvalidRequest { param: None }
+        );
+        assert_eq!(classify_bridge(&unsupported).status().as_u16(), 400);
+
+        // In-band failures with no status, by their code
+        // (openai-python `types/responses/response_error.py`).
+        let in_band = |code: &str, param: Option<&str>| BridgeError::UpstreamInBand {
+            status: None,
+            message: "upstream text".into(),
+            parsed: Some(Box::new(UpstreamErrorView {
+                code: Some(code.into()),
+                param: param.map(str::to_owned),
+                ..Default::default()
+            })),
+            wire: UpstreamWire::OpenAI,
+        };
+        for code in [
+            "image_content_policy_violation",
+            "bio_policy",
+            "misalignment_policy_violation",
+        ] {
+            let class = classify_bridge(&in_band(code, None));
+            assert_eq!(class, PlatformErrorClass::ContentFiltered, "{code}");
+            assert_eq!(class.code(), "content_filter", "{code}");
+        }
+        for code in [
+            "invalid_prompt",
+            "invalid_image",
+            "invalid_image_format",
+            "invalid_base64_image",
+            "invalid_image_url",
+            "image_too_large",
+            "image_too_small",
+            "image_parse_error",
+            "invalid_image_mode",
+            "image_file_too_large",
+            "unsupported_image_media_type",
+            "empty_image_file",
+            "failed_to_download_image",
+            "image_file_not_found",
+        ] {
+            let class = classify_bridge(&in_band(code, None));
+            assert_eq!(
+                class,
+                PlatformErrorClass::InvalidRequest { param: None },
+                "{code}"
+            );
+            assert_eq!(class.code(), "invalid_request", "{code}");
+        }
+        assert_eq!(
+            classify_bridge(&in_band(
+                "invalid_image_url",
+                Some("input[0].content[1].image_url")
+            )),
+            PlatformErrorClass::InvalidRequest {
+                param: Some("input[0].content[1].image_url".into())
+            }
+        );
+        for code in [
+            "server_error",
+            "vector_store_timeout",
+            "data_residency_mismatch",
+        ] {
+            assert_eq!(
+                classify_bridge(&in_band(code, None)),
+                PlatformErrorClass::UpstreamUnavailable,
+                "{code}"
+            );
+        }
     }
 
     #[test]
