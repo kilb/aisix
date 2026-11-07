@@ -27,8 +27,8 @@ use serde_json::{json, Value};
 use crate::auth::{MemberRole, OperatorRole, KEY_HOLDERS};
 use crate::error::{ApiError, Detail};
 use crate::{
-    audit, dp, gateways, keys, members, operators, projector, resources, rollout, tenants, usage,
-    AppState,
+    audit, dp, gateways, keys, members, operators, pricing, projector, resources, rollout, tenants,
+    usage, AppState,
 };
 
 /// The largest request body either listener reads.
@@ -268,6 +268,52 @@ pub const ROUTE_ROLES: &[(&str, &str, MinRole)] = &[
         "/admin/usage/rejects",
         MinRole::Op(OperatorRole::Viewer),
     ),
+    // Prices, and what each stored usage event was charged.
+    (
+        "GET",
+        "/admin/pricing/catalogue",
+        MinRole::Op(OperatorRole::Viewer),
+    ),
+    (
+        "GET",
+        "/admin/pricing/sell",
+        MinRole::Op(OperatorRole::Viewer),
+    ),
+    (
+        "POST",
+        "/admin/pricing/sell",
+        MinRole::Op(OperatorRole::Operator),
+    ),
+    (
+        "GET",
+        "/admin/pricing/cost",
+        MinRole::Op(OperatorRole::Viewer),
+    ),
+    (
+        "POST",
+        "/admin/pricing/cost",
+        MinRole::Op(OperatorRole::Operator),
+    ),
+    (
+        "GET",
+        "/admin/pricing/discounts",
+        MinRole::Op(OperatorRole::Viewer),
+    ),
+    (
+        "POST",
+        "/admin/pricing/discounts",
+        MinRole::Op(OperatorRole::Operator),
+    ),
+    (
+        "GET",
+        "/admin/pricing/charges",
+        MinRole::Op(OperatorRole::Viewer),
+    ),
+    (
+        "GET",
+        "/admin/pricing/status",
+        MinRole::Op(OperatorRole::Viewer),
+    ),
     // Gateways, on the gateway listener.
     ("POST", "/dp/heartbeat", MinRole::Dp),
     ("ANY", "/dp/store/v1/{*rest}", MinRole::Dp),
@@ -386,6 +432,21 @@ pub fn browser_router(state: AppState) -> Router {
         .route("/admin/usage/events", get(usage::list_events))
         .route("/admin/usage/batches", get(usage::list_batches))
         .route("/admin/usage/rejects", get(usage::list_rejects))
+        .route("/admin/pricing/catalogue", get(pricing::api::catalogue))
+        .route(
+            "/admin/pricing/sell",
+            get(pricing::api::list_sell).post(pricing::api::create_sell),
+        )
+        .route(
+            "/admin/pricing/cost",
+            get(pricing::api::list_cost).post(pricing::api::create_cost),
+        )
+        .route(
+            "/admin/pricing/discounts",
+            get(pricing::api::list_discounts).post(pricing::api::create_discount),
+        )
+        .route("/admin/pricing/charges", get(pricing::api::list_charges))
+        .route("/admin/pricing/status", get(pricing::api::status))
         .route_layer(axum::middleware::from_fn(only_listed_routes))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(state)

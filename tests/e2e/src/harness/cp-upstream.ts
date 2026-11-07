@@ -21,17 +21,74 @@ export interface PlatformUpstream {
   count(path: string): number;
   /** When set, every request is answered with this status and an error naming `marker`. */
   failWith: number | undefined;
+  /**
+   * When true, a streamed chat answer sends a content chunk every 200 ms and
+   * reports no usage, until the gateway closes the connection (or 20 s pass):
+   * a client that leaves mid-stream leaves before the upstream reports usage.
+   */
+  stallStreams: boolean;
   close(): Promise<void>;
+}
+
+/** The token counts every answer reports. */
+export interface PlatformUsage {
+  /** Prompt tokens, `cached` of them prompt-cache hits. */
+  prompt: number;
+  cached: number;
+  completion: number;
+}
+
+export interface PlatformUpstreamOptions {
+  /**
+   * What chat (buffered, and the final chunk of a stream that asked for
+   * usage) and responses (buffered, and `response.completed`) answers
+   * report, in each API's own shape. Default: 5 prompt, 2 completion, no
+   * cache detail.
+   */
+  usage?: PlatformUsage;
+  /** The `prompt_tokens` an embeddings answer reports. Default 2. */
+  embeddingTokens?: number;
 }
 
 const sseData = (payload: unknown) => `data: ${JSON.stringify(payload)}\n\n`;
 const sseEvent = (event: string, payload: unknown) =>
   `event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`;
 
-function chat(res: ServerResponse, body: Record<string, unknown>, marker: string): void {
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+/** A chat completion's `usage`, in the Chat Completions shape. */
+function chatUsage(usage: PlatformUsage | undefined): Record<string, unknown> {
+  if (!usage) return { prompt_tokens: 5, completion_tokens: 2, total_tokens: 7 };
+  return {
+    prompt_tokens: usage.prompt,
+    completion_tokens: usage.completion,
+    total_tokens: usage.prompt + usage.completion,
+    prompt_tokens_details: { cached_tokens: usage.cached },
+  };
+}
+
+/** A response's `usage`, in the Responses shape. */
+function responsesUsage(usage: PlatformUsage | undefined): Record<string, unknown> {
+  if (!usage) return { input_tokens: 5, output_tokens: 2, total_tokens: 7 };
+  return {
+    input_tokens: usage.prompt,
+    input_tokens_details: { cached_tokens: usage.cached },
+    output_tokens: usage.completion,
+    output_tokens_details: { reasoning_tokens: 0 },
+    total_tokens: usage.prompt + usage.completion,
+  };
+}
+
+async function chat(
+  res: ServerResponse,
+  body: Record<string, unknown>,
+  marker: string,
+  opts: PlatformUpstreamOptions,
+  stall: boolean,
+): Promise<void> {
   const id = `chatcmpl-${marker}`;
   const model = String(body.model ?? "");
-  const usage = { prompt_tokens: 5, completion_tokens: 2, total_tokens: 7 };
+  const usage = chatUsage(opts.usage);
   if (body.stream === true) {
     const chunk = (delta: unknown, finish: string | null) => ({
       id,
@@ -41,8 +98,19 @@ function chat(res: ServerResponse, body: Record<string, unknown>, marker: string
       system_fingerprint: `fp_${marker}`,
       choices: [{ index: 0, delta, finish_reason: finish }],
     });
+    let closed = false;
+    res.on("close", () => (closed = true));
     res.writeHead(200, { "content-type": "text/event-stream" });
     res.write(sseData(chunk({ role: "assistant", content: "ok" }, null)));
+    if (stall) {
+      const until = Date.now() + 20_000;
+      while (!closed && Date.now() < until) {
+        await sleep(200);
+        if (!closed) res.write(sseData(chunk({ content: "." }, null)));
+      }
+      if (!closed) res.end("data: [DONE]\n\n");
+      return;
+    }
     res.write(sseData(chunk({}, "stop")));
     const options = body.stream_options as { include_usage?: boolean } | undefined;
     if (options?.include_usage) res.write(sseData({ ...chunk({}, null), choices: [], usage }));
@@ -63,7 +131,12 @@ function chat(res: ServerResponse, body: Record<string, unknown>, marker: string
   );
 }
 
-function responses(res: ServerResponse, body: Record<string, unknown>, marker: string): void {
+function responses(
+  res: ServerResponse,
+  body: Record<string, unknown>,
+  marker: string,
+  opts: PlatformUpstreamOptions,
+): void {
   const model = String(body.model ?? "");
   const item = {
     type: "message",
@@ -79,10 +152,7 @@ function responses(res: ServerResponse, body: Record<string, unknown>, marker: s
     status,
     model,
     output,
-    usage:
-      status === "completed"
-        ? { input_tokens: 5, output_tokens: 2, total_tokens: 7 }
-        : null,
+    usage: status === "completed" ? responsesUsage(opts.usage) : null,
   });
   if (body.stream === true) {
     res.writeHead(200, { "content-type": "text/event-stream" });
@@ -115,12 +185,16 @@ function responses(res: ServerResponse, body: Record<string, unknown>, marker: s
   res.end(JSON.stringify(response("completed", [item])));
 }
 
-export async function startPlatformUpstream(marker: string): Promise<PlatformUpstream> {
+export async function startPlatformUpstream(
+  marker: string,
+  opts: PlatformUpstreamOptions = {},
+): Promise<PlatformUpstream> {
   const upstream: PlatformUpstream = {
     baseUrl: "",
     requests: [],
     count: (path) => upstream.requests.filter((r) => r.path === path).length,
     failWith: undefined,
+    stallStreams: false,
     close: async () => {},
   };
   const server = createServer((req: IncomingMessage, res: ServerResponse) => {
@@ -147,9 +221,10 @@ export async function startPlatformUpstream(marker: string): Promise<PlatformUps
       }
       switch (path) {
         case "/v1/chat/completions":
-          return chat(res, body, marker);
+          void chat(res, body, marker, opts, upstream.stallStreams);
+          return;
         case "/v1/responses":
-          return responses(res, body, marker);
+          return responses(res, body, marker, opts);
         case "/v1/embeddings":
           res.writeHead(200, { "content-type": "application/json" });
           res.end(
@@ -157,7 +232,10 @@ export async function startPlatformUpstream(marker: string): Promise<PlatformUps
               object: "list",
               data: [{ object: "embedding", index: 0, embedding: [0.25, 0.5] }],
               model: String(body.model ?? ""),
-              usage: { prompt_tokens: 2, total_tokens: 2 },
+              usage: {
+                prompt_tokens: opts.embeddingTokens ?? 2,
+                total_tokens: opts.embeddingTokens ?? 2,
+              },
             }),
           );
           return;

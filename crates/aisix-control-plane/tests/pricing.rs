@@ -3,7 +3,8 @@
 //! in the transaction that stores it, from token counts and the control
 //! plane's own price book.
 //!
-//! Prices are written through `pricing::store`; usage arrives over
+//! Prices are written through `pricing::store`, or through the operators'
+//! API (`/admin/pricing/*`) in the cases at the end; usage arrives over
 //! `POST /dp/telemetry` exactly as a gateway sends it. The tenant a row is
 //! billed to comes from the control plane's own key record, never from the
 //! row's word alone.
@@ -18,7 +19,7 @@ use aisix_control_plane::error::ApiError;
 use aisix_control_plane::pricing::store::{
     self, CostRevision, DiscountRevision, NewCostPrice, NewDiscount, NewSellPrice, SellRevision,
 };
-use aisix_pricing::{RateCard, ENGINE_VERSION};
+use aisix_pricing::{Catalogue, Rate, RateCard, ENGINE_VERSION};
 use chrono::{DateTime, TimeDelta, Utc};
 use futures::FutureExt;
 use serde_json::{json, Value};
@@ -107,8 +108,8 @@ async fn send_if_match(
         .as_u16()
 }
 
-/// A platform model on a provider key of its own, created as an operator.
-async fn seed_model(cp: &TestCp, admin: &OperatorSession) -> Uuid {
+/// An upstream account (a provider key), created as an operator; its id.
+async fn seed_provider_key(cp: &TestCp, admin: &OperatorSession) -> Uuid {
     let pk = create(
         cp,
         admin,
@@ -121,6 +122,12 @@ async fn seed_model(cp: &TestCp, admin: &OperatorSession) -> Uuid {
         }}),
     )
     .await;
+    Uuid::parse_str(&text(&pk, "/id")).expect("a provider key id")
+}
+
+/// A platform model on a provider key of its own, created as an operator.
+async fn seed_model(cp: &TestCp, admin: &OperatorSession) -> Uuid {
+    let pk = seed_provider_key(cp, admin).await;
     let model = create(
         cp,
         admin,
@@ -129,7 +136,7 @@ async fn seed_model(cp: &TestCp, admin: &OperatorSession) -> Uuid {
             "display_name": format!("priced-{}", Uuid::new_v4().simple()),
             "provider": "openai",
             "model_name": "gpt-4o-mini",
-            "provider_key_id": text(&pk, "/id"),
+            "provider_key_id": pk,
         }}),
     )
     .await;
@@ -1355,4 +1362,1030 @@ async fn a_missing_or_malformed_pricing_version_never_stops_intake() {
     deliver_charged(&w, model, i).await;
     deliver_charged(&w, model, i + 1).await;
     assert_eq!(prices.loads(), before + 1);
+}
+
+// ---- the operators' pricing API: /admin/pricing/* ----
+
+/// `method path` as `who`, with `body`.
+async fn as_op(
+    cp: &TestCp,
+    who: &OperatorSession,
+    method: &str,
+    path: &str,
+    body: Option<Value>,
+) -> Resp {
+    cp.send(method, path, Some(who.cookie()), body).await
+}
+
+/// `r` is a 422 `validation_failed` at exactly `path`.
+fn assert_422_at(r: &Resp, path: &str) {
+    assert_eq!(
+        (r.status, r.body["code"].clone()),
+        (422, json!("validation_failed")),
+        "{r:?}"
+    );
+    let paths: Vec<&str> = r.body["details"]
+        .as_array()
+        .map(|d| d.iter().filter_map(|x| x["path"].as_str()).collect())
+        .unwrap_or_default();
+    assert_eq!(paths, vec![path], "{r:?}");
+}
+
+/// The one charge `GET /admin/pricing/charges?event_id=` lists for `event_id`.
+async fn charge_via_api(w: &World, event_id: &str) -> Value {
+    let r = as_op(
+        &w.cp,
+        &w.admin,
+        "GET",
+        &format!("/admin/pricing/charges?event_id={event_id}"),
+        None,
+    )
+    .await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let items = r.body["items"].as_array().expect("items");
+    assert_eq!(items.len(), 1, "{r:?}");
+    assert_eq!(r.body["next_before"], Value::Null, "{r:?}");
+    items[0].clone()
+}
+
+#[tokio::test]
+async fn an_operator_sets_a_price_and_a_viewer_reads_it() {
+    let Some(w) = world().await else { return };
+    let viewer = w.cp.admin_login_seeded(OperatorRole::Viewer).await;
+    let model = seed_model(&w.cp, &w.admin).await;
+    let other = seed_model(&w.cp, &w.admin).await;
+    let audits = w.cp.count("audit_log").await;
+    let body = json!({
+        "model_id": model,
+        "effective_from": db_now(&w.cp).await,
+        "card": {"default": {"base": {"input": "1", "output": "2", "cache_read": "0.1"}}},
+    });
+    let r = as_op(
+        &w.cp,
+        &viewer,
+        "POST",
+        "/admin/pricing/sell",
+        Some(body.clone()),
+    )
+    .await;
+    assert_eq!(
+        (r.status, r.body["code"].clone()),
+        (403, json!("forbidden")),
+        "{r:?}"
+    );
+    assert_eq!(w.cp.count("pricing_sell_revisions").await, 0);
+    assert_eq!(w.cp.count("audit_log").await, audits);
+
+    let r = as_op(&w.cp, &w.admin, "POST", "/admin/pricing/sell", Some(body)).await;
+    assert_eq!(r.status, 201, "{r:?}");
+    let rev = r.body.clone();
+    assert_eq!(rev["model_id"], json!(model));
+    assert_eq!(rev["tenant_id"], Value::Null);
+    assert_eq!(rev["source"], "manual");
+    assert_eq!(rev["engine_version"], ENGINE_VERSION);
+    assert_eq!(rev["created_by"], json!(w.admin.id));
+    assert_eq!(rev["card"]["default"]["base"]["input"], "1");
+    assert_eq!(rev["warnings"], json!([]));
+    // A price for another model, which the filter must leave out.
+    let r = as_op(
+        &w.cp,
+        &w.admin,
+        "POST",
+        "/admin/pricing/sell",
+        Some(json!({"model_id": other, "effective_from": db_now(&w.cp).await, "card": card()})),
+    )
+    .await;
+    assert_eq!(r.status, 201, "{r:?}");
+    // Written by the operator, in the audit log.
+    let audit: (String, Option<Uuid>, String) = sqlx::query_as(
+        "SELECT actor_kind, actor_id, action FROM audit_log WHERE target_id = $1 \
+         AND target_kind = 'pricing_sell_revision'",
+    )
+    .bind(
+        rev["revision_id"]
+            .as_i64()
+            .expect("a revision id")
+            .to_string(),
+    )
+    .fetch_one(w.cp.db().pool())
+    .await
+    .expect("the audit row");
+    assert_eq!(
+        audit,
+        (
+            "operator".to_string(),
+            Some(w.admin.id),
+            "pricing.sell.create".to_string()
+        )
+    );
+
+    let r = as_op(
+        &w.cp,
+        &viewer,
+        "GET",
+        &format!("/admin/pricing/sell?model_id={model}"),
+        None,
+    )
+    .await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let mut listed = rev.clone();
+    let listed = listed.as_object_mut().expect("an object");
+    listed.remove("warnings");
+    listed.remove("later_revisions");
+    assert_eq!(r.body["items"], json!([listed]), "{r:?}");
+    assert_eq!(r.body["next_before"], Value::Null);
+}
+
+#[tokio::test]
+async fn a_catalogue_price_is_imported_with_its_markup() {
+    let Some(w) = world().await else { return };
+    let viewer = w.cp.admin_login_seeded(OperatorRole::Viewer).await;
+    let model = seed_model(&w.cp, &w.admin).await;
+    let r = as_op(&w.cp, &viewer, "GET", "/admin/pricing/catalogue", None).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let version = r.body["version"].as_str().expect("a version").to_string();
+    let items = r.body["items"].as_array().expect("items").clone();
+    assert!(items.len() > 1, "{r:?}");
+    let first = &items[0];
+    let key = first["key"].as_str().expect("a key");
+    assert!(first["source_url"].as_str().is_some(), "{first}");
+
+    let list_input = Rate::parse(
+        first["card"]["default"]["base"]["input"]
+            .as_str()
+            .expect("a list input rate"),
+    )
+    .expect("a rate");
+    let r = as_op(
+        &w.cp,
+        &w.admin,
+        "POST",
+        "/admin/pricing/sell",
+        Some(json!({
+            "model_id": model,
+            "effective_from": db_now(&w.cp).await,
+            "catalogue_key": key,
+            "markup_bps": 2000,
+        })),
+    )
+    .await;
+    assert_eq!(r.status, 201, "{r:?}");
+    // List × 1.2, rounded half up.
+    let expected = Rate((list_input.0 * 12 + 5) / 10);
+    let input = Rate::parse(
+        r.body["card"]["default"]["base"]["input"]
+            .as_str()
+            .expect("an input rate"),
+    )
+    .expect("a rate");
+    assert_eq!(input, expected, "{r:?}");
+    let source = r.body["source"].as_str().expect("a source");
+    assert!(source.starts_with("catalogue:"), "{source}");
+    let dated = first["effective_from"]
+        .as_str()
+        .map_or("-".to_string(), str::to_string);
+    assert_eq!(source, format!("catalogue:{version}:{key}@{dated}"));
+    assert_eq!(r.body["warnings"], json!([]), "{r:?}");
+
+    // A list price that holds only off peak says so.
+    let off_peak = items
+        .iter()
+        .find(|e| {
+            e["key"]
+                .as_str()
+                .is_some_and(|k| k.starts_with("deepseek/"))
+        })
+        .expect("a DeepSeek entry in the catalogue");
+    let r = as_op(
+        &w.cp,
+        &w.admin,
+        "POST",
+        "/admin/pricing/sell",
+        Some(json!({
+            "model_id": model,
+            "tenant_id": w.tenant,
+            "effective_from": db_now(&w.cp).await,
+            "catalogue_key": off_peak["key"],
+        })),
+    )
+    .await;
+    assert_eq!(r.status, 201, "{r:?}");
+    let warnings = r.body["warnings"].as_array().expect("warnings");
+    assert_eq!(warnings.len(), 1, "{r:?}");
+    assert_eq!(warnings[0]["code"], "time_of_day_price", "{r:?}");
+    assert!(
+        warnings[0]["message"]
+            .as_str()
+            .is_some_and(|m| !m.is_empty()),
+        "{r:?}"
+    );
+    // Without a markup the list price is stored as it is.
+    assert_eq!(r.body["card"], off_peak["card"], "{r:?}");
+    assert_eq!(r.body["tenant_id"], json!(w.tenant));
+
+    // An alias names its entry, which the source records by its key.
+    let alias = off_peak["aliases"][0].as_str().expect("an alias");
+    let provider = off_peak["key"]
+        .as_str()
+        .and_then(|k| k.split_once('/'))
+        .map(|(p, _)| p)
+        .expect("a provider");
+    let r = as_op(
+        &w.cp,
+        &w.admin,
+        "POST",
+        "/admin/pricing/sell",
+        Some(json!({
+            "model_id": model,
+            "effective_from": db_now(&w.cp).await,
+            "catalogue_key": format!("{provider}/{alias}"),
+        })),
+    )
+    .await;
+    assert_eq!(r.status, 201, "{r:?}");
+    assert_eq!(
+        r.body["source"],
+        json!(format!(
+            "catalogue:{version}:{}@-",
+            off_peak["key"].as_str().unwrap_or_default()
+        ))
+    );
+}
+
+#[tokio::test]
+async fn a_bad_price_is_422_with_the_field_path() {
+    let Some(w) = world().await else { return };
+    let model = seed_model(&w.cp, &w.admin).await;
+    let now = db_now(&w.cp).await;
+    let audits = w.cp.count("audit_log").await;
+    let version = pricing_version(&w.cp).await;
+    let sell = |body: Value| as_op(&w.cp, &w.admin, "POST", "/admin/pricing/sell", Some(body));
+
+    let no_default = json!({"priority": {"base": {"input": "1", "output": "2"}}});
+    assert_422_at(
+        &sell(json!({"model_id": model, "effective_from": now, "card": no_default})).await,
+        "/card",
+    );
+    assert_422_at(
+        &sell(json!({"model_id": model, "effective_from": now, "card": {"default": {"base": {"input": "one", "output": "2"}}}})).await,
+        "/card",
+    );
+    assert_422_at(
+        &sell(json!({"model_id": model, "effective_from": now, "card": card(), "catalogue_key": "openai/gpt-5.4"})).await,
+        "/card",
+    );
+    assert_422_at(
+        &sell(json!({"model_id": model, "effective_from": now})).await,
+        "/card",
+    );
+    assert_422_at(
+        &sell(json!({"model_id": model, "effective_from": now, "card": null})).await,
+        "/card",
+    );
+    assert_422_at(
+        &sell(json!({"model_id": model, "effective_from": now, "catalogue_key": "openai/no-such-model-7c1"})).await,
+        "/catalogue_key",
+    );
+    assert_422_at(
+        &sell(
+            json!({"model_id": model, "effective_from": now, "catalogue_key": "no-provider-7c1"}),
+        )
+        .await,
+        "/catalogue_key",
+    );
+    // A markup applies only to a catalogue import.
+    assert_422_at(
+        &sell(
+            json!({"model_id": model, "effective_from": now, "card": card(), "markup_bps": 2000}),
+        )
+        .await,
+        "/markup_bps",
+    );
+    assert_422_at(
+        &sell(json!({"model_id": model, "tenant_id": Uuid::new_v4(), "effective_from": now, "card": card()})).await,
+        "/tenant_id",
+    );
+    assert_422_at(
+        &sell(json!({"model_id": Uuid::new_v4(), "effective_from": now, "card": card()})).await,
+        "/model_id",
+    );
+    assert_422_at(
+        &sell(
+            json!({"model_id": model, "effective_from": now - TimeDelta::hours(1), "card": card()}),
+        )
+        .await,
+        "/effective_from",
+    );
+
+    let discount = |body: Value| {
+        as_op(
+            &w.cp,
+            &w.admin,
+            "POST",
+            "/admin/pricing/discounts",
+            Some(body),
+        )
+    };
+    for bps in [10_001, -1, 70_000] {
+        assert_422_at(
+            &discount(json!({"tenant_id": w.tenant, "effective_from": now, "discount_bps": bps}))
+                .await,
+            "/discount_bps",
+        );
+    }
+    assert_422_at(
+        &discount(json!({"tenant_id": Uuid::new_v4(), "effective_from": now, "discount_bps": 500}))
+            .await,
+        "/tenant_id",
+    );
+    assert_422_at(
+        &discount(json!({"tenant_id": w.tenant, "effective_from": now - TimeDelta::hours(1), "discount_bps": 500})).await,
+        "/effective_from",
+    );
+
+    let cost = |body: Value| as_op(&w.cp, &w.admin, "POST", "/admin/pricing/cost", Some(body));
+    let upstream = |card: Value| json!({"upstream_provider": "openai", "upstream_model": "gpt-4o-mini", "effective_from": now, "card": card});
+    assert_422_at(&cost(upstream(Value::Null)).await, "/card");
+    assert_422_at(&cost(upstream(no_default.clone())).await, "/card");
+    assert_422_at(
+        &cost(json!({"upstream_provider": "", "upstream_model": "gpt-4o-mini", "effective_from": now, "card": card()})).await,
+        "/upstream_provider",
+    );
+    assert_422_at(
+        &cost(json!({"upstream_provider": "openai", "upstream_model": "", "effective_from": now, "card": card()})).await,
+        "/upstream_model",
+    );
+
+    // Nothing reached a table.
+    for table in [
+        "pricing_sell_revisions",
+        "pricing_cost_revisions",
+        "pricing_discount_revisions",
+    ] {
+        assert_eq!(w.cp.count(table).await, 0, "{table}");
+    }
+    assert_eq!(w.cp.count("audit_log").await, audits);
+    assert_eq!(pricing_version(&w.cp).await, version);
+}
+
+#[tokio::test]
+async fn ending_an_override_restores_the_platform_price_and_discount() {
+    let Some(w) = world().await else { return };
+    let model = seed_model(&w.cp, &w.admin).await;
+    let wr = &w;
+    let post = move |path: &'static str, body: Value| async move {
+        let r = as_op(&wr.cp, &wr.admin, "POST", path, Some(body)).await;
+        assert_eq!(r.status, 201, "POST {path}: {r:?}");
+        r.body
+    };
+    let input = |rate: &str| json!({"default": {"base": {"input": rate, "output": "2"}}});
+    post(
+        "/admin/pricing/sell",
+        json!({"model_id": model, "effective_from": db_now(&w.cp).await, "card": input("1")}),
+    )
+    .await;
+    let discount = post(
+        "/admin/pricing/discounts",
+        json!({"tenant_id": w.tenant, "effective_from": db_now(&w.cp).await, "discount_bps": 5000}),
+    )
+    .await;
+    assert_eq!(discount["discount_bps"], 5000);
+    assert_eq!(discount["tenant_id"], json!(w.tenant));
+    let r#override = post(
+        "/admin/pricing/sell",
+        json!({"model_id": model, "tenant_id": w.tenant, "effective_from": db_now(&w.cp).await, "card": input("3")}),
+    )
+    .await;
+
+    let thousand_in = json!({"prompt_tokens": 1000});
+    let r = deliver(
+        &w.dp,
+        Uuid::new_v4(),
+        vec![usage(&w, "e-override", model, thousand_in.clone())],
+    )
+    .await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let charged = charge_via_api(&w, "e-override").await;
+    // The override replaces the price, and is not discounted again.
+    assert_eq!(
+        (
+            charged["status"].clone(),
+            charged["charge_micro_usd"].clone(),
+            charged["tenant_override"].clone(),
+            charged["sell_revision_id"].clone(),
+        ),
+        (
+            json!("charged"),
+            json!(3000),
+            json!(true),
+            r#override["revision_id"].clone()
+        )
+    );
+
+    let ended = post(
+        "/admin/pricing/sell",
+        json!({"model_id": model, "tenant_id": w.tenant, "effective_from": db_now(&w.cp).await, "card": null}),
+    )
+    .await;
+    assert_eq!(ended["card"], Value::Null);
+    let r = deliver(
+        &w.dp,
+        Uuid::new_v4(),
+        vec![usage(&w, "e-platform", model, thousand_in)],
+    )
+    .await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let charged = charge_via_api(&w, "e-platform").await;
+    // The platform's 1000 µ$, at the tenant's 50%.
+    assert_eq!(
+        (
+            charged["status"].clone(),
+            charged["charge_micro_usd"].clone(),
+            charged["tenant_override"].clone(),
+            charged["discount_bps"].clone(),
+            charged["discount_revision_id"].clone(),
+        ),
+        (
+            json!("charged"),
+            json!(500),
+            json!(false),
+            json!(5000),
+            discount["revision_id"].clone()
+        )
+    );
+    let audit = pricing_audit(&w.cp).await;
+    assert_eq!(
+        audit.last().map(|a| a.0.as_str()),
+        Some("pricing.sell.end_override")
+    );
+}
+
+#[tokio::test]
+async fn unpriced_charges_and_invalid_revisions_are_shown_to_operators() {
+    let Some(w) = world().await else { return };
+    let viewer = w.cp.admin_login_seeded(OperatorRole::Viewer).await;
+    let (unpriced, broken) = (
+        seed_model(&w.cp, &w.admin).await,
+        seed_model(&w.cp, &w.admin).await,
+    );
+    // No output rate: a card no engine can bill with.
+    let bad: i64 = sqlx::query_scalar(
+        "INSERT INTO pricing_sell_revisions (engine_version, model_id, effective_from, card, source) \
+         VALUES ($1, $2, now(), '{\"default\":{\"base\":{\"input\":\"1\"}}}', 'manual') \
+         RETURNING revision_id",
+    )
+    .bind(i64::from(ENGINE_VERSION))
+    .bind(broken)
+    .fetch_one(w.cp.db().pool())
+    .await
+    .expect("write a bad revision");
+    bump_pricing_version(&w.cp).await;
+    // And a row that is charged, which neither listing nor count may hold.
+    let priced = seed_model(&w.cp, &w.admin).await;
+    price(&w.cp, priced).await;
+    let r = deliver(
+        &w.dp,
+        Uuid::new_v4(),
+        vec![
+            usage(&w, "e-unpriced", unpriced, tokens_680()),
+            usage(&w, "e-charged", priced, tokens_680()),
+        ],
+    )
+    .await;
+    assert_eq!((r.status, r.body.clone()), (200, counts(2, 0, 0)), "{r:?}");
+
+    let r = as_op(
+        &w.cp,
+        &viewer,
+        "GET",
+        "/admin/pricing/charges?status=unpriced",
+        None,
+    )
+    .await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let items = r.body["items"].as_array().expect("items");
+    assert_eq!(items.len(), 1, "{r:?}");
+    assert_eq!(
+        (
+            items[0]["event_id"].clone(),
+            items[0]["error_code"].clone(),
+            items[0]["charge_micro_usd"].clone()
+        ),
+        (json!("e-unpriced"), json!("missing_price"), Value::Null)
+    );
+    assert_eq!(items[0]["tenant_id"], json!(w.tenant));
+    assert_eq!(items[0]["lines"], json!([]));
+    assert_eq!(items[0]["warnings"], json!([]));
+
+    let r = as_op(&w.cp, &viewer, "GET", "/admin/pricing/status", None).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    assert_eq!(
+        r.body["pricing_version"],
+        json!(pricing_version(&w.cp).await)
+    );
+    let invalid = r.body["invalid_revisions"]
+        .as_array()
+        .expect("invalid revisions");
+    assert_eq!(invalid.len(), 1, "{r:?}");
+    assert_eq!(
+        (
+            invalid[0]["table"].clone(),
+            invalid[0]["revision_id"].clone()
+        ),
+        (json!("sell"), json!(bad))
+    );
+    assert!(
+        invalid[0]["reason"].as_str().is_some_and(|m| !m.is_empty()),
+        "{r:?}"
+    );
+    assert_eq!(
+        r.body["unpriced_last_24h"],
+        json!({"total": 1, "by_code": {"missing_price": 1}})
+    );
+}
+
+/// `by_code` counts every reason a row was stored unpriced, the control
+/// plane's own (a row it cannot attribute or read) as well as the engine's,
+/// and only rows priced in the last 24 hours.
+#[tokio::test]
+async fn every_unpriced_code_is_counted_over_the_last_day() {
+    let Some(w) = world().await else { return };
+    let other_tenant = seed_tenant(&w.cp, &w.admin).await;
+    let (priced, unpriced) = (
+        seed_model(&w.cp, &w.admin).await,
+        seed_model(&w.cp, &w.admin).await,
+    );
+    price(&w.cp, priced).await;
+    let r = deliver(
+        &w.dp,
+        Uuid::new_v4(),
+        vec![
+            usage(
+                &w,
+                "e-key",
+                priced,
+                json!({"api_key_id": Uuid::new_v4().to_string(), "prompt_tokens": 100}),
+            ),
+            usage(
+                &w,
+                "e-team",
+                priced,
+                json!({"team_id": other_tenant.to_string(), "prompt_tokens": 100}),
+            ),
+            usage(&w, "e-many", priced, json!({"prompt_tokens": "many"})),
+            usage(
+                &w,
+                "e-search",
+                priced,
+                json!({"prompt_tokens": 100, "web_search_requests": 2}),
+            ),
+            usage(&w, "e-price", unpriced, tokens_680()),
+            usage(&w, "e-old", unpriced, tokens_680()),
+            usage(&w, "e-ok", priced, tokens_680()),
+        ],
+    )
+    .await;
+    assert_eq!((r.status, r.body.clone()), (200, counts(7, 0, 0)), "{r:?}");
+    sqlx::query("UPDATE pricing_charges SET priced_at = now() - interval '25 hours' WHERE event_id = 'e-old'")
+        .execute(w.cp.db().pool())
+        .await
+        .expect("age a charge");
+    let r = as_op(&w.cp, &w.admin, "GET", "/admin/pricing/status", None).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    assert_eq!(
+        r.body["unpriced_last_24h"],
+        json!({"total": 5, "by_code": {
+            "unknown_api_key": 1,
+            "tenant_mismatch": 1,
+            "undecodable_usage": 1,
+            "missing_dimension_price": 1,
+            "missing_price": 1,
+        }}),
+        "{r:?}"
+    );
+    assert_eq!(r.body["invalid_revisions"], json!([]));
+}
+
+/// Charges are listed by event, key, tenant and status, newest first and
+/// paged; a tenant's listing holds only the rows its own keys made, however
+/// a row names its tenant.
+#[tokio::test]
+async fn charges_are_listed_by_event_key_tenant_and_status() {
+    let Some(w) = world().await else { return };
+    let victim = seed_tenant(&w.cp, &w.admin).await;
+    let model = seed_model(&w.cp, &w.admin).await;
+    price(&w.cp, model).await;
+    let events: Vec<Value> = (0..3)
+        .map(|i| usage(&w, &format!("e{i}"), model, tokens_680()))
+        .collect();
+    let r = deliver(&w.dp, Uuid::new_v4(), events).await;
+    assert_eq!((r.status, r.body.clone()), (200, counts(3, 0, 0)), "{r:?}");
+    // The world's key, claiming another tenant, in a later batch.
+    let forged = usage(
+        &w,
+        "e-forged",
+        model,
+        json!({"team_id": victim.to_string(), "prompt_tokens": 100}),
+    );
+    let r = deliver(&w.dp, Uuid::new_v4(), vec![forged]).await;
+    assert_eq!((r.status, r.body.clone()), (200, counts(1, 0, 0)), "{r:?}");
+    let wr = &w;
+    let list = move |query: String| async move {
+        let r = as_op(
+            &wr.cp,
+            &wr.admin,
+            "GET",
+            &format!("/admin/pricing/charges?{query}"),
+            None,
+        )
+        .await;
+        assert_eq!(r.status, 200, "{query}: {r:?}");
+        let ids: Vec<String> = r.body["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .map(|c| c["event_id"].as_str().expect("an event id").to_string())
+            .collect();
+        (ids, r.body["next_before"].clone(), r.body["items"].clone())
+    };
+
+    let (ids, next, items) = list("event_id=e1".to_string()).await;
+    assert_eq!((ids, next), (vec!["e1".to_string()], Value::Null));
+    assert_eq!(items[0]["charge_micro_usd"], 680);
+    assert_eq!(items[0]["api_key_id"], json!(w.key));
+    assert_eq!(items[0]["user_id"], json!(w.member));
+    assert_eq!(items[0]["requested_model_id"], json!(model));
+    assert_eq!(items[0]["estimated"], false);
+    assert!(items[0]["seq"].as_i64().is_some(), "{items}");
+    assert!(
+        items[0]["lines"].as_array().is_some_and(|l| !l.is_empty()),
+        "{items}"
+    );
+    assert!(list("event_id=e-none".to_string()).await.0.is_empty());
+
+    // The forged row is filed under the key's tenant, never the victim's.
+    assert!(list(format!("tenant_id={victim}")).await.0.is_empty());
+    let (ids, ..) = list(format!("tenant_id={}", w.tenant)).await;
+    assert_eq!(ids, ["e-forged", "e2", "e1", "e0"]);
+    let (ids, ..) = list(format!("tenant_id={}&status=unpriced", w.tenant)).await;
+    assert_eq!(ids, ["e-forged"]);
+    let (ids, ..) = list(format!("api_key_id={}&status=charged", w.key)).await;
+    assert_eq!(ids, ["e2", "e1", "e0"]);
+
+    // Paged on seq, newest first.
+    let (first, next, _) = list(format!("api_key_id={}&limit=2", w.key)).await;
+    assert_eq!(first, ["e-forged", "e2"]);
+    let before = next.as_i64().expect("a next page");
+    let (rest, next, _) = list(format!("api_key_id={}&limit=2&before={before}", w.key)).await;
+    assert_eq!(
+        (rest, next),
+        (vec!["e1".to_string(), "e0".to_string()], Value::Null)
+    );
+
+    let r = as_op(
+        &w.cp,
+        &w.admin,
+        "GET",
+        "/admin/pricing/charges?status=billed",
+        None,
+    )
+    .await;
+    assert_422_at(&r, "status");
+}
+
+#[tokio::test]
+async fn cost_prices_and_discounts_are_written_and_listed() {
+    let Some(w) = world().await else { return };
+    let viewer = w.cp.admin_login_seeded(OperatorRole::Viewer).await;
+    let other_tenant = seed_tenant(&w.cp, &w.admin).await;
+    let key_id = seed_provider_key(&w.cp, &w.admin).await;
+    let wr = &w;
+    let post = move |path: &'static str, body: Value| async move {
+        let r = as_op(&wr.cp, &wr.admin, "POST", path, Some(body)).await;
+        assert_eq!(r.status, 201, "POST {path}: {r:?}");
+        r.body
+    };
+    let now = db_now(&w.cp).await;
+    let general = post(
+        "/admin/pricing/cost",
+        json!({"upstream_provider": "openai", "upstream_model": "gpt-4o-mini", "effective_from": now, "card": card()}),
+    )
+    .await;
+    assert_eq!(
+        (
+            general["source"].clone(),
+            general["provider_key_id"].clone(),
+            general["created_by"].clone()
+        ),
+        (json!("manual"), Value::Null, json!(w.admin.id))
+    );
+    let keyed = post(
+        "/admin/pricing/cost",
+        json!({"upstream_provider": "openai", "upstream_model": "gpt-4o-mini", "provider_key_id": key_id, "effective_from": now, "card": card()}),
+    )
+    .await;
+    post(
+        "/admin/pricing/cost",
+        json!({"upstream_provider": "openai", "upstream_model": "gpt-4o", "effective_from": now, "card": card()}),
+    )
+    .await;
+    let ids = |r: &Resp| -> Vec<i64> {
+        r.body["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .map(|x| x["revision_id"].as_i64().expect("a revision id"))
+            .collect()
+    };
+    let r = as_op(
+        &w.cp,
+        &viewer,
+        "GET",
+        "/admin/pricing/cost?upstream_provider=openai&upstream_model=gpt-4o-mini",
+        None,
+    )
+    .await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let (g, k) = (
+        general["revision_id"].as_i64().expect("an id"),
+        keyed["revision_id"].as_i64().expect("an id"),
+    );
+    assert_eq!(ids(&r), vec![k, g], "newest first: {r:?}");
+    let r = as_op(
+        &w.cp,
+        &viewer,
+        "GET",
+        &format!("/admin/pricing/cost?provider_key_id={key_id}"),
+        None,
+    )
+    .await;
+    assert_eq!(ids(&r), vec![k]);
+    let r = as_op(&w.cp, &viewer, "GET", "/admin/pricing/cost?limit=1", None).await;
+    assert_eq!(r.body["items"].as_array().map(Vec::len), Some(1));
+    assert!(r.body["next_before"].as_i64().is_some(), "{r:?}");
+
+    let mine = post(
+        "/admin/pricing/discounts",
+        json!({"tenant_id": w.tenant, "effective_from": db_now(&w.cp).await, "discount_bps": 2000}),
+    )
+    .await;
+    post(
+        "/admin/pricing/discounts",
+        json!({"tenant_id": other_tenant, "effective_from": db_now(&w.cp).await, "discount_bps": 0}),
+    )
+    .await;
+    let r = as_op(
+        &w.cp,
+        &viewer,
+        "GET",
+        &format!("/admin/pricing/discounts?tenant_id={}", w.tenant),
+        None,
+    )
+    .await;
+    assert_eq!(r.status, 200, "{r:?}");
+    assert_eq!(r.body["items"], json!([mine]), "{r:?}");
+    let r = as_op(&w.cp, &viewer, "GET", "/admin/pricing/discounts", None).await;
+    assert_eq!(r.body["items"].as_array().map(Vec::len), Some(2), "{r:?}");
+    let r = as_op(
+        &w.cp,
+        &viewer,
+        "GET",
+        "/admin/pricing/discounts?tenant_id=not-a-uuid",
+        None,
+    )
+    .await;
+    assert_422_at(&r, "query");
+}
+
+/// A cost price for one provider key must name a key that exists: a
+/// revision for any other would never apply.
+#[tokio::test]
+async fn a_cost_price_names_a_live_provider_key() {
+    let Some(w) = world().await else { return };
+    let now = db_now(&w.cp).await;
+    let cost = |key: Uuid| {
+        json!({
+            "upstream_provider": "openai",
+            "upstream_model": "gpt-4o-mini",
+            "provider_key_id": key,
+            "effective_from": now,
+            "card": card(),
+        })
+    };
+    let r = as_op(
+        &w.cp,
+        &w.admin,
+        "POST",
+        "/admin/pricing/cost",
+        Some(cost(Uuid::new_v4())),
+    )
+    .await;
+    assert_422_at(&r, "/provider_key_id");
+
+    let deleted = seed_provider_key(&w.cp, &w.admin).await;
+    let version: i64 = sqlx::query_scalar(
+        "SELECT version FROM gw_resources WHERE kind = 'provider_keys' AND id = $1",
+    )
+    .bind(deleted)
+    .fetch_one(w.cp.db().pool())
+    .await
+    .expect("read the key's version");
+    let status = send_if_match(
+        &w.cp,
+        &w.admin,
+        "DELETE",
+        &format!("/admin/resources/provider_keys/{deleted}"),
+        version,
+    )
+    .await;
+    assert_eq!(status, 200, "delete the provider key");
+    let r = as_op(
+        &w.cp,
+        &w.admin,
+        "POST",
+        "/admin/pricing/cost",
+        Some(cost(deleted)),
+    )
+    .await;
+    assert_422_at(&r, "/provider_key_id");
+    assert_eq!(w.cp.count("pricing_cost_revisions").await, 0);
+
+    let live = seed_provider_key(&w.cp, &w.admin).await;
+    let r = as_op(
+        &w.cp,
+        &w.admin,
+        "POST",
+        "/admin/pricing/cost",
+        Some(cost(live)),
+    )
+    .await;
+    assert_eq!(r.status, 201, "{r:?}");
+    assert_eq!(r.body["provider_key_id"], json!(live));
+}
+
+/// A catalogue whose `openai/fixture-7c1` announces two price changes far
+/// ahead (input 1, then 3 from 2099-01-01, then 5 from 2099-06-01).
+fn announcing_catalogue() -> Arc<Catalogue> {
+    let entry = |extra: &str, input: &str| {
+        format!(
+            r#"{{"key":"openai/fixture-7c1","source_url":"https://openai.com/api/pricing","as_of":"2026-11-01",{extra}"card":{{"default":{{"base":{{"input":"{input}","output":"2"}}}}}}}}"#
+        )
+    };
+    let file = format!(
+        r#"{{"version":"2026-11-06","entries":[{},{},{}]}}"#,
+        entry("", "1"),
+        entry(r#""effective_from":"2099-01-01","#, "3"),
+        entry(r#""effective_from":"2099-06-01","#, "5"),
+    );
+    Arc::new(Catalogue::from_json(&file).expect("the fixture catalogue loads"))
+}
+
+fn instant(v: &Value) -> DateTime<Utc> {
+    v.as_str()
+        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+        .map(|t| t.with_timezone(&Utc))
+        .unwrap_or_else(|| panic!("an RFC 3339 instant: {v}"))
+}
+
+/// An import writes the price in effect now, and each price change the
+/// catalogue announces as a further revision at its own date, marked up the
+/// same.
+#[tokio::test]
+async fn an_import_writes_each_announced_price_change_at_its_own_date() {
+    let Some(cp) = TestCp::start_with_catalogue(announcing_catalogue()).await else {
+        return;
+    };
+    let admin = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let model = seed_model(&cp, &admin).await;
+    let now = db_now(&cp).await;
+    let r = cp
+        .send(
+            "POST",
+            "/admin/pricing/sell",
+            Some(admin.cookie()),
+            Some(json!({
+                "model_id": model,
+                "effective_from": now,
+                "catalogue_key": "openai/fixture-7c1",
+                "markup_bps": 5000,
+            })),
+        )
+        .await;
+    assert_eq!(r.status, 201, "{r:?}");
+    let input = |rev: &Value| rev["card"]["default"]["base"]["input"].clone();
+    assert_eq!(instant(&r.body["effective_from"]), now);
+    assert_eq!(
+        r.body["source"],
+        "catalogue:2026-11-06:openai/fixture-7c1@-"
+    );
+    assert_eq!(input(&r.body), "1.5");
+    let later = r.body["later_revisions"]
+        .as_array()
+        .expect("later revisions");
+    let seen: Vec<(DateTime<Utc>, Value, Value, Value)> = later
+        .iter()
+        .map(|rev| {
+            (
+                instant(&rev["effective_from"]),
+                rev["source"].clone(),
+                input(rev),
+                rev["model_id"].clone(),
+            )
+        })
+        .collect();
+    let day = |s: &str| instant(&json!(s));
+    assert_eq!(
+        seen,
+        vec![
+            (
+                day("2099-01-01T00:00:00Z"),
+                json!("catalogue:2026-11-06:openai/fixture-7c1@2099-01-01"),
+                json!("4.5"),
+                json!(model),
+            ),
+            (
+                day("2099-06-01T00:00:00Z"),
+                json!("catalogue:2026-11-06:openai/fixture-7c1@2099-06-01"),
+                json!("7.5"),
+                json!(model),
+            ),
+        ],
+        "{r:?}"
+    );
+    // The changes the import itself wrote are not news to the operator.
+    assert_eq!(r.body["warnings"], json!([]), "{r:?}");
+    assert_eq!(cp.count("pricing_sell_revisions").await, 3);
+    let audit = pricing_audit(&cp).await;
+    assert_eq!(audit.len(), 3, "{audit:?}");
+}
+
+/// A price written now that a revision already scheduled for later will
+/// replace is still written, and the answer names the revision that takes
+/// over and when; a later revision of another tenant does not count.
+#[tokio::test]
+async fn a_price_a_scheduled_revision_will_replace_says_so() {
+    let Some(w) = world().await else { return };
+    let model = seed_model(&w.cp, &w.admin).await;
+    let wr = &w;
+    let post = move |body: Value| async move {
+        let r = as_op(&wr.cp, &wr.admin, "POST", "/admin/pricing/sell", Some(body)).await;
+        assert_eq!(r.status, 201, "{r:?}");
+        r.body
+    };
+    let now = db_now(&w.cp).await;
+    let scheduled = post(json!({
+        "model_id": model,
+        "effective_from": now + TimeDelta::days(1),
+        "card": card(),
+    }))
+    .await;
+    assert_eq!(scheduled["warnings"], json!([]));
+    let tenant_scheduled = post(json!({
+        "model_id": model,
+        "tenant_id": w.tenant,
+        "effective_from": now + TimeDelta::days(2),
+        "card": card(),
+    }))
+    .await;
+
+    let written =
+        post(json!({"model_id": model, "effective_from": db_now(&w.cp).await, "card": card()}))
+            .await;
+    let warnings = written["warnings"].as_array().expect("warnings");
+    assert_eq!(warnings.len(), 1, "{written}");
+    assert_eq!(
+        (
+            warnings[0]["code"].clone(),
+            warnings[0]["revision_id"].clone(),
+            warnings[0]["effective_from"].clone(),
+        ),
+        (
+            json!("superseded_later"),
+            scheduled["revision_id"].clone(),
+            scheduled["effective_from"].clone(),
+        )
+    );
+    assert!(
+        warnings[0]["message"]
+            .as_str()
+            .is_some_and(|m| !m.is_empty()),
+        "{written}"
+    );
+    assert_eq!(w.cp.count("pricing_sell_revisions").await, 3);
+
+    // The tenant's own override, written now, meets only the tenant's.
+    let override_now = post(json!({
+        "model_id": model,
+        "tenant_id": w.tenant,
+        "effective_from": db_now(&w.cp).await,
+        "card": card(),
+    }))
+    .await;
+    let ids: Vec<Value> = override_now["warnings"]
+        .as_array()
+        .expect("warnings")
+        .iter()
+        .map(|x| x["revision_id"].clone())
+        .collect();
+    assert_eq!(ids, vec![tenant_scheduled["revision_id"].clone()]);
 }

@@ -1,6 +1,6 @@
-//! Pricing in the control plane: the price tables ([`store`]), and pricing
+//! Pricing in the control plane: the price tables ([`store`]), pricing
 //! each usage row intake stores, inside the transaction that stores it
-//! ([`price_stored`]).
+//! ([`price_stored`]), and the operators' API over both ([`api`]).
 //!
 //! # Who a row bills
 //!
@@ -30,6 +30,7 @@
 //! stored with an `unpriced` charge. Only a database error fails the batch,
 //! which the gateway then sends again.
 
+pub mod api;
 pub mod store;
 
 use std::collections::{HashMap, HashSet};

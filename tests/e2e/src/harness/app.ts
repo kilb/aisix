@@ -298,10 +298,11 @@ export const BIN_PATH =
 /// Generated output is deliberately excluded — the money fixture includes
 /// `schemas/`, and regenerating those with identical content made every
 /// binary look stale. So are the crates of the separate binaries the gateway
-/// does not link (`NOT_LINKED`): an edit there leaves the gateway binary
-/// untouched, cargo rightly does not relink it, and the check would then
-/// refuse every run until something else did.
-const NOT_LINKED = new Set(["aisix-console", "aisix-control-plane", "aisix-portal"]);
+/// does not link, and the control plane's pricing engine (`NOT_LINKED`): an
+/// edit there leaves the gateway binary untouched, cargo rightly does not
+/// relink it, and the check would then refuse every run until something else
+/// did.
+const NOT_LINKED = new Set(["aisix-console", "aisix-control-plane", "aisix-portal", "aisix-pricing"]);
 /**
  * When this module was loaded — i.e. roughly when the run started.
  *

@@ -112,9 +112,10 @@ function freePort() {
 
 /// Refuse a binary older than the sources it is built from: a stale build
 /// turns a green run into a description of whatever was last compiled. The
-/// control plane links one workspace crate, aisix-core; its migrations and
-/// protos are compiled in. Skipped on CI, where the job builds the binary
-/// right before the run.
+/// control plane links two workspace crates, aisix-core and aisix-pricing
+/// (whose catalogue file is compiled in); its migrations and protos are
+/// compiled in too. Skipped on CI, where the job builds the binary right
+/// before the run.
 function assertFresh(bin) {
   if (process.env.CI) return;
   let binTime;
@@ -150,10 +151,12 @@ function assertFresh(bin) {
   const cp = join(REPO, "crates", "aisix-control-plane");
   for (const dir of ["src", "migrations", "proto"]) walk(join(cp, dir));
   walk(join(REPO, "crates", "aisix-core", "src"));
+  for (const dir of ["src", "catalogue"]) walk(join(REPO, "crates", "aisix-pricing", dir));
   for (const file of [
     join(cp, "Cargo.toml"),
     join(cp, "build.rs"),
     join(REPO, "crates", "aisix-core", "Cargo.toml"),
+    join(REPO, "crates", "aisix-pricing", "Cargo.toml"),
     join(REPO, "Cargo.toml"),
     join(REPO, "Cargo.lock"),
   ]) {

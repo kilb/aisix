@@ -149,6 +149,21 @@ pub async fn start<S>(cfg: CpConfig, shutdown: S) -> Result<Running, BootError>
 where
     S: Future<Output = ()> + Send + 'static,
 {
+    start_with_catalogue(cfg, shutdown, None).await
+}
+
+/// [`start`], pricing from `catalogue` instead of the built-in one when it is
+/// given. Only a caller of this library can pass one (the tests, for a
+/// catalogue with prices announced far ahead); no configuration or
+/// environment variable reaches it.
+pub async fn start_with_catalogue<S>(
+    cfg: CpConfig,
+    shutdown: S,
+    catalogue: Option<Arc<aisix_pricing::Catalogue>>,
+) -> Result<Running, BootError>
+where
+    S: Future<Output = ()> + Send + 'static,
+{
     // Every TLS client that takes the process default (the Postgres driver,
     // the kine client, a gateway client in a test) gets ring, the provider
     // this crate builds its own configurations with. A build that unifies
@@ -161,7 +176,10 @@ where
     }
     // A catalogue this build cannot read would leave cost prices unknown
     // everywhere, unseen.
-    let catalogue = aisix_pricing::Catalogue::builtin()?;
+    let catalogue = match catalogue {
+        Some(catalogue) => catalogue,
+        None => aisix_pricing::Catalogue::builtin()?,
+    };
     let db = Db::connect(
         &cfg.database_url,
         cfg.db_lock_timeout_ms,

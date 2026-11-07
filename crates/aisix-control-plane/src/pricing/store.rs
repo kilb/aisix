@@ -78,18 +78,7 @@ impl PriceBookCache {
     /// ERROR and reloads the book on every call, so intake keeps pricing
     /// from what the tables hold. The lock is never held across an await.
     pub async fn current(&self, conn: &mut PgConnection) -> Result<Arc<PriceBook>, DbError> {
-        // Read only when it is a whole number a bigint holds, so a hand-edited
-        // value is "no version" instead of a cast error that would fail the
-        // batch on every delivery.
-        let version: Option<i64> = sqlx::query_scalar::<_, Option<i64>>(
-            "SELECT CASE WHEN jsonb_typeof(value) = 'number' AND value::text ~ '^-?[0-9]{1,18}$' \
-                         THEN (value::text)::bigint END \
-             FROM cp_settings WHERE key = 'pricing_version'",
-        )
-        .fetch_optional(&mut *conn)
-        .await?
-        .flatten();
-        let Some(version) = version else {
+        let Some(version) = pricing_version(&mut *conn).await? else {
             tracing::error!(
                 "cp_settings.pricing_version is missing or is not a whole number; the price \
                  book is reloaded for every batch until it is restored"
@@ -140,6 +129,22 @@ impl PriceBookCache {
     pub fn catalogue(&self) -> &Arc<Catalogue> {
         &self.catalogue
     }
+}
+
+/// `cp_settings.pricing_version`, read on `conn`; `None` when the row is
+/// missing or its value is not a whole number a bigint holds.
+pub async fn pricing_version(conn: &mut PgConnection) -> Result<Option<i64>, DbError> {
+    // Read only when it is a whole number a bigint holds, so a hand-edited
+    // value is "no version" instead of a cast error that would fail the
+    // batch on every delivery.
+    Ok(sqlx::query_scalar::<_, Option<i64>>(
+        "SELECT CASE WHEN jsonb_typeof(value) = 'number' AND value::text ~ '^-?[0-9]{1,18}$' \
+                     THEN (value::text)::bigint END \
+         FROM cp_settings WHERE key = 'pricing_version'",
+    )
+    .fetch_optional(conn)
+    .await?
+    .flatten())
 }
 
 /// The table an invalid revision is in, as the alert names it.
@@ -641,8 +646,9 @@ pub async fn insert_sell_price(
 }
 
 /// Writes a cost revision starting at `row.effective_from`, refusing with
-/// `422` one that starts in the past (`/effective_from`) and a card that
-/// does not validate (`/card`).
+/// `422` one that starts in the past (`/effective_from`), a card that does
+/// not validate (`/card`) and a provider key that is not live
+/// (`/provider_key_id`).
 pub async fn insert_cost_price(
     conn: &mut PgConnection,
     row: &NewCostPrice,
@@ -650,6 +656,20 @@ pub async fn insert_cost_price(
 ) -> Result<CostRevision, ApiError> {
     starts_now_or_later(&mut *conn, row.effective_from).await?;
     check_card(&row.card)?;
+    if let Some(key) = row.provider_key_id {
+        // A revision for a key that does not exist would never apply.
+        let live: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM gw_resources \
+                            WHERE kind = 'provider_keys' AND id = $1 AND NOT deleted)",
+        )
+        .bind(key)
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(DbError::from)?;
+        if !live {
+            return Err(refused("/provider_key_id", "供应商密钥不存在"));
+        }
+    }
     let revision: CostRevision = sqlx::query_as(
         "INSERT INTO pricing_cost_revisions \
          (engine_version, upstream_provider, upstream_model, provider_key_id, effective_from, \
