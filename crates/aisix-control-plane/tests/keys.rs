@@ -35,7 +35,10 @@ async fn request(
         .build()
         .expect("an HTTP client");
     let method = reqwest::Method::from_bytes(method.as_bytes()).expect("an HTTP method");
-    let mut request = client.request(method, cp.url(path));
+    // Labelled JSON with or without a body, as the Dashboard sends it.
+    let mut request = client
+        .request(method, cp.url(path))
+        .header(reqwest::header::CONTENT_TYPE, "application/json");
     if let Some(cookie) = cookie {
         request = request.header(reqwest::header::COOKIE, cookie);
     }

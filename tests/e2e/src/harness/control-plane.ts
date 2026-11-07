@@ -69,9 +69,11 @@ class CpClient {
   ): Promise<CpResponse> {
     const res = await harnessRequest(`${this.baseUrl}${path}`, {
       method,
+      // Labelled JSON with or without a body, as the Dashboard sends every
+      // request: the control plane refuses a mutating one that is not.
       headers: {
         ...(this.cookie ? { cookie: this.cookie } : {}),
-        ...(body === undefined ? {} : { "content-type": "application/json" }),
+        "content-type": "application/json",
         ...headers,
       },
       body: body === undefined ? undefined : JSON.stringify(body),

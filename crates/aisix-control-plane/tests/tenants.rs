@@ -49,8 +49,10 @@ impl Admin<'_> {
             .build()
             .expect("an HTTP client");
         let method = reqwest::Method::from_bytes(method.as_bytes()).expect("an HTTP method");
+        // Labelled JSON with or without a body, as the Dashboard sends it.
         let mut request = client
             .request(method, self.cp.url(path))
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
             .header(reqwest::header::COOKIE, &self.cookie);
         if let Some(v) = if_match {
             request = request.header(reqwest::header::IF_MATCH, v);

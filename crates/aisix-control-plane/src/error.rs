@@ -142,6 +142,14 @@ impl ApiError {
         )
     }
 
+    pub fn unsupported_media_type() -> ApiError {
+        Self::new(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "unsupported_media_type",
+            "请求必须带 Content-Type: application/json 请求头",
+        )
+    }
+
     pub fn unavailable() -> ApiError {
         Self::new(
             StatusCode::SERVICE_UNAVAILABLE,

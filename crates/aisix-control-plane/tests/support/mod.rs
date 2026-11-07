@@ -461,7 +461,8 @@ impl TestCp {
     }
 
     /// Sends `method path` with `cookie` (the `Cookie` header's value) and a
-    /// JSON `body`.
+    /// JSON `body`, labelled JSON whether or not there is one, as the
+    /// Dashboard sends every request.
     pub async fn send(
         &self,
         method: &str,
@@ -493,10 +494,10 @@ impl TestCp {
         if let Some(cookie) = cookie {
             request = request.header(reqwest::header::COOKIE, cookie);
         }
+        if let Some(content_type) = content_type {
+            request = request.header(reqwest::header::CONTENT_TYPE, content_type);
+        }
         if let Some(body) = body {
-            if let Some(content_type) = content_type {
-                request = request.header(reqwest::header::CONTENT_TYPE, content_type);
-            }
             request = request.body(body);
         }
         let response = request.send().await.expect("send the request");

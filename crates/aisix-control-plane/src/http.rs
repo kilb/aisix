@@ -8,6 +8,9 @@
 //!   it names.
 //! - A request body is taken as [`ApiJson`], never as `axum::Json`, so a
 //!   body that cannot be read answers in the error envelope.
+//! - On the browser listener every mutating request is JSON, bodyless ones
+//!   included ([`json_only`]): that, with `SameSite=Strict` cookies, is the
+//!   CSRF defence, and no handler has to take a body for it.
 //! - Routes are added with `.route(...)` only, before the router's listing
 //!   layer: `only_listed_routes` on the browser router, which admits the
 //!   rows of every role but [`MinRole::Dp`], and `only_listed_dp_routes` on
@@ -391,6 +394,7 @@ pub fn browser_router(state: AppState) -> Router {
         .route("/admin/usage/events", get(usage::list_events))
         .route("/admin/usage/batches", get(usage::list_batches))
         .route("/admin/usage/rejects", get(usage::list_rejects))
+        .route_layer(axum::middleware::from_fn(json_only))
         .route_layer(axum::middleware::from_fn(only_listed_routes))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(state)
@@ -426,6 +430,33 @@ async fn close_on_forbidden(mut response: Response) -> Response {
             .insert(header::CONNECTION, HeaderValue::from_static("close"));
     }
     response
+}
+
+/// Answers `415 unsupported_media_type` on the browser listener for a
+/// mutating request (POST, PUT, PATCH, DELETE) that does not carry
+/// `Content-Type: application/json`, whether or not it has a body, before
+/// any handler runs. Cookies are `SameSite=Strict`, so only a same-site
+/// page can still make a browser send a session; it cannot send this
+/// content type without a CORS preflight, which this listener never
+/// passes, while a form posts another type and a `no-cors` fetch with no
+/// body sends none. A route that takes no body would otherwise never be
+/// held to it. Runs inside [`only_listed_routes`], so a route nobody serves
+/// is still `404`.
+async fn json_only(request: Request, next: Next) -> Response {
+    let mutating = matches!(
+        *request.method(),
+        Method::POST | Method::PUT | Method::PATCH | Method::DELETE
+    );
+    let json = request
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(';').next())
+        .is_some_and(|essence| essence.trim().eq_ignore_ascii_case("application/json"));
+    if mutating && !json {
+        return ApiError::unsupported_media_type().into_response();
+    }
+    next.run(request).await
 }
 
 /// Answers `404 not_found` on the browser listener for a route with no
@@ -474,7 +505,9 @@ fn is_listed(request: &Request, dp: bool) -> bool {
 /// `Content-Type: application/json`, a missing or mistyped field) answers
 /// `422 validation_failed`, and one over the size limit `413
 /// payload_too_large`, in the error envelope. The rejection's own text is
-/// not passed on: it is English and can quote the body.
+/// not passed on: it is English and can quote the body. On the browser
+/// listener a request without the content type is refused earlier, `415`
+/// ([`json_only`]).
 pub struct ApiJson<T>(pub T);
 
 impl<T, S> FromRequest<S> for ApiJson<T>
