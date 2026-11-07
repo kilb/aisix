@@ -27,7 +27,9 @@
 //! wait there would stall every other in-flight request on that core, not
 //! just the stream that ended. A distributed store therefore hands the update
 //! to its own I/O worker and returns; the shared counters converge shortly
-//! after, not synchronously.
+//! after, not synchronously. What the worker cannot deliver is lost, except
+//! for a bucket carrying a spend allowance, whose spend waits for Redis and is
+//! retried (see [`redis`]).
 
 use std::time::Duration;
 

@@ -1274,6 +1274,10 @@ async fn a_slot_taken_while_degraded_is_released_by_a_commit_after_recovery() {
 /// 降级接着用。累计额度的那份不能因为空闲被回收：桶的 acquire 走的是 Redis，本地
 /// 从没见过它带的限额，回收认不出这是一份额度，空闲一天后整个收走 —— 下一次断线时
 /// 本地降级从 0 起算，用完的额度又放行了。
+///
+/// 带发放额的桶如今在断线时根本不按本地计数放行（`AllowanceUnverified`）：本地
+/// 计数只记着这一个副本花的钱。这条用例守的仍是那件事 —— 回收之后的断线里，用完
+/// 的额度不能被再放行。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stream_spend_on_an_allowance_survives_reaping_into_the_next_outage() {
     let Some(url) = redis_url() else {
@@ -1308,18 +1312,21 @@ async fn stream_spend_on_an_allowance_survives_reaping_into_the_next_outage() {
     tokio::time::sleep(Duration::from_millis(1_100)).await;
     flaky.reap(Duration::from_secs(0));
 
-    // 断线：降级到本地，那份累计额度必须还在。
+    // 断线：用完的额度不能被再放行。
     proxy.down();
     let r = flaky.acquire(&key, &limits, "m2").await;
     assert!(
-        matches!(r, Err(RateLimitError::AllowanceExhausted)),
-        "the local fallback started the allowance over after reaping: {r:?}"
+        matches!(r, Err(RateLimitError::AllowanceUnverified)),
+        "an outage after reaping admitted the spent allowance: {r:?}"
     );
 }
 
 /// 非流式的花费（`commit`）同样要记一份进本地备份，与流式的 `add_tokens_all`
 /// 一致。只记流式的话，Redis 断线时本地降级看到的累计额度里没有非流式花掉的
 /// 那部分 —— 已经用完的额度在断线期间又放行了。
+///
+/// 带发放额的桶如今在断线时不按本地计数放行（`AllowanceUnverified`），所以断线
+/// 期间它总是拒绝；这条用例仍守着「用完的额度在断线期间不被再放行」。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unary_spend_on_an_allowance_is_enforced_by_the_local_fallback() {
     let Some(url) = redis_url() else {
@@ -1355,12 +1362,12 @@ async fn unary_spend_on_an_allowance_is_enforced_by_the_local_fallback() {
         "the commit did not reach Redis: {seen:?}"
     );
 
-    // 断线：降级到本地，这笔非流式花费必须也在本地那份里。
+    // 断线：用完的额度不能被再放行。
     proxy.down();
     let r = flaky.acquire(&key, &limits, "m2").await;
     assert!(
-        matches!(r, Err(RateLimitError::AllowanceExhausted)),
-        "the local fallback never saw the unary spend: {r:?}"
+        matches!(r, Err(RateLimitError::AllowanceUnverified)),
+        "an outage admitted the spent allowance: {r:?}"
     );
 }
 

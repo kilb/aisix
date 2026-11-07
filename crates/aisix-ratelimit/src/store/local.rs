@@ -142,6 +142,13 @@ impl<C: Clock> LocalStore<C> {
         }
     }
 
+    /// Whether this bucket was last seen carrying a `granted_micro_usd`.
+    pub(crate) fn carries_allowance(&self, key: &str) -> bool {
+        self.states
+            .get(key)
+            .is_some_and(|state| state.lock().carries_allowance)
+    }
+
     /// Drop buckets untouched for longer than `idle_for`, so state for
     /// api keys, models and policies the control plane deleted does not
     /// accrue for the process lifetime. Bucket keys are config-derived, so

@@ -35,6 +35,15 @@
 //! diverge from Redis until it recovers — availability over strict global
 //! enforcement, matching the cache's "Redis error → proceed" stance.
 //!
+//! A bucket that carries a `granted_micro_usd` allowance is the exception:
+//! it fails **closed** ([`RateLimitError::AllowanceUnverified`]). An
+//! allowance is a sum of money that must not be overspent, and the local
+//! count holds only what this replica spent itself, so admitting on it would
+//! let a caller spend the allowance once per replica. The spend recorded
+//! against such a bucket is never shed either: an update that cannot reach
+//! Redis, or that meets a full accounting queue, waits in a per-bucket total
+//! that the accounting worker retries every [`PENDING_ALLOWANCE_SWEEP`].
+//!
 //! The connection is the shared [`aisix_redis::RedisConn`], so `single`,
 //! `cluster`, and `sentinel` topologies all work. Because every script
 //! touches several keys, each `EVAL` declares the bucket key (carrying the
@@ -80,6 +89,9 @@ const POST_STREAM_QUEUE_DEPTH: usize = 8192;
 /// what the queue's bound and the shed metric are there for, instead of growing
 /// a task per update.
 const POST_STREAM_IN_FLIGHT: usize = 256;
+/// How often the accounting worker retries the allowance spend that has not
+/// reached Redis yet.
+const PENDING_ALLOWANCE_SWEEP: std::time::Duration = std::time::Duration::from_secs(1);
 /// How often a gateway that started without its shared backend re-states
 /// that it is still counting per replica. Long enough that a Redis which
 /// is merely late says nothing beyond the boot WARN, short enough that a
@@ -308,6 +320,9 @@ pub struct RedisStore {
     grace: u64,
     /// Per-process fallback used when Redis is unreachable (fail-open).
     local: Arc<LocalStore>,
+    /// Allowance spend that has not reached Redis yet, by bucket prefix,
+    /// shared with the accounting worker that retries it.
+    pending_allowance: PendingAllowance,
     /// Per-reservation ownership provenance for stream lease refreshes.
     /// Only a `ConfirmedRedis` member may turn a healthy ZSET miss into a
     /// terminal signal; a timeout after dispatch is deliberately `Unknown`.
@@ -329,8 +344,46 @@ pub struct RedisStore {
 struct PostStreamTokenAdd {
     prefix: String,
     tokens: u64,
+    /// The bucket carries an allowance, so a failed update is kept for a
+    /// retry instead of lost.
+    allowance: bool,
     /// 随命令带上：worker 在 `with_metrics` 之前就已经起来了。
     metrics: Option<Arc<dyn aisix_core::RateLimitMetricsSink>>,
+}
+
+/// Spend against allowance buckets that has not reached Redis yet, summed
+/// per bucket prefix. One entry per bucket, however many updates it holds,
+/// so its size is bounded by configuration rather than by traffic.
+type PendingAllowance = Arc<DashMap<String, u64>>;
+
+/// Keep `tokens` of allowance spend for `prefix` until Redis takes it.
+fn park_allowance(pending: &DashMap<String, u64>, prefix: String, tokens: u64) {
+    let mut total = pending.entry(prefix).or_insert(0);
+    *total = total.saturating_add(tokens);
+}
+
+/// Retry the parked allowance spend every [`PENDING_ALLOWANCE_SWEEP`], each
+/// bucket's total in one update, until Redis takes it. A failure puts the
+/// total back and ends the round: Redis is down, and the next round is soon.
+async fn sweep_pending_allowance(conn: ConnSlot, pending: PendingAllowance, grace: u64) {
+    let mut tick = tokio::time::interval(PENDING_ALLOWANCE_SWEEP);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tick.tick().await;
+        let prefixes: Vec<String> = pending.iter().map(|entry| entry.key().clone()).collect();
+        for prefix in prefixes {
+            let Some((prefix, tokens)) = pending.remove(&prefix) else {
+                continue;
+            };
+            if add_tokens_remote(&conn, &prefix, tokens, grace)
+                .await
+                .is_err()
+            {
+                park_allowance(&pending, prefix, tokens);
+                break;
+            }
+        }
+    }
 }
 
 /// What happened to one update offered to the accounting queue.
@@ -426,7 +479,12 @@ impl RedisStore {
         conn: ConnSlot,
         degraded_logged: Arc<AtomicBool>,
     ) -> Result<Self, redis::RedisError> {
-        let post_stream_tx = spawn_post_stream_worker(conn.clone(), DEFAULT_GRACE_SECS)?;
+        let pending_allowance = PendingAllowance::default();
+        let post_stream_tx = spawn_post_stream_worker(
+            conn.clone(),
+            DEFAULT_GRACE_SECS,
+            Arc::clone(&pending_allowance),
+        )?;
         Ok(Self {
             conn,
             post_stream_tx,
@@ -434,6 +492,7 @@ impl RedisStore {
             conc_ttl: DEFAULT_CONC_TTL_SECS,
             grace: DEFAULT_GRACE_SECS,
             local: Arc::new(LocalStore::new()),
+            pending_allowance,
             lease_members: DashMap::new(),
             degraded_logged,
             shed_logged: AtomicBool::new(false),
@@ -517,8 +576,16 @@ impl RedisStore {
                 error = %err,
                 "shared rate-limit Redis unavailable; failing open to per-replica \
                  in-memory counting until it recovers (cluster limits not enforced \
-                 during the outage)"
+                 during the outage), except that a bucket carrying a spend allowance \
+                 refuses its requests"
             );
+        }
+    }
+
+    /// Keep spend Redis did not take for a retry, when it is an allowance's.
+    fn park_if_allowance(&self, key: &str, prefix: &str, tokens: u64) {
+        if tokens > 0 && self.local.carries_allowance(key) {
+            park_allowance(&self.pending_allowance, prefix.to_string(), tokens);
         }
     }
 
@@ -547,6 +614,7 @@ fn post_stream_worker_error(detail: impl Into<String>) -> redis::RedisError {
 fn spawn_post_stream_worker(
     conn: ConnSlot,
     grace: u64,
+    pending: PendingAllowance,
 ) -> Result<tokio::sync::mpsc::Sender<PostStreamTokenAdd>, redis::RedisError> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -557,12 +625,19 @@ fn spawn_post_stream_worker(
         .name("aisix-ratelimit-commit".to_string())
         .spawn(move || {
             runtime.block_on(async move {
+                // Ends with the runtime, once the store is gone.
+                tokio::spawn(sweep_pending_allowance(
+                    conn.clone(),
+                    Arc::clone(&pending),
+                    grace,
+                ));
                 // 启动时没连上的 store 每笔记账都会失败，可能持续几个小时：
                 // 计数每笔都记，日志一轮故障只打一条。
                 let warned = Arc::new(AtomicBool::new(false));
                 drain_post_stream(rx, POST_STREAM_IN_FLIGHT, move |command| {
                     let conn = conn.clone();
                     let warned = Arc::clone(&warned);
+                    let pending = Arc::clone(&pending);
                     async move {
                         let result =
                             add_tokens_remote(&conn, &command.prefix, command.tokens, grace).await;
@@ -571,6 +646,9 @@ fn spawn_post_stream_worker(
                         match result {
                             Ok(()) => warned.store(false, Ordering::Relaxed),
                             Err(err) => {
+                                if command.allowance {
+                                    park_allowance(&pending, command.prefix, command.tokens);
+                                }
                                 record_failure(&command.metrics, "add_tokens");
                                 if !warned.swap(true, Ordering::Relaxed) {
                                     tracing::warn!(
@@ -782,6 +860,12 @@ impl RateStore for RedisStore {
                 .unwrap_or_else(|| "-1".to_string()),
         );
 
+        // Told before Redis answers or fails, so the spend a request admitted
+        // here records afterwards is known to be an allowance's and is never
+        // shed (see `add_tokens_all`).
+        self.local.note_allowance(key, limits);
+        let allowance = limits.granted_micro_usd.is_some();
+
         let script = Script::new(ACQUIRE_LUA);
         let mut invocation = script.prepare_invoke();
         // KEYS[1] carries the {bucket} hash tag for Redis Cluster routing;
@@ -794,6 +878,9 @@ impl RateStore for RedisStore {
             Ok(c) => c,
             Err(e) => {
                 self.note_failure("acquire", &e);
+                if allowance {
+                    return Err(RateLimitError::AllowanceUnverified);
+                }
                 let acquired = self.local.acquire(key, limits, member).await;
                 if acquired.is_ok() && limits.concurrency.is_some() {
                     self.lease_members.insert(
@@ -807,9 +894,6 @@ impl RateStore for RedisStore {
         match invocation.invoke_async::<Vec<i64>>(&mut conn).await {
             Ok(reply) => {
                 self.mark_ok();
-                // 本地备份要知道这个桶带不带累计额度，否则断线前攒下的流式花费会在
-                // 空闲回收时连桶一起丢掉（见 `LocalStore::note_allowance`）。
-                self.local.note_allowance(key, limits);
                 let code = reply.first().copied().unwrap_or(CODE_OK);
                 let retry = reply.get(1).copied().unwrap_or(0).max(0) as u64;
                 // The script reports which dimension refused as its
@@ -860,6 +944,14 @@ impl RateStore for RedisStore {
             Err(e) => {
                 self.note_failure("acquire", &e);
                 self.conn.note_error().await;
+                if allowance {
+                    // The reply can be lost after Redis applied the acquire:
+                    // hand back the slot it may hold.
+                    if limits.concurrency.is_some() {
+                        self.release(key, member);
+                    }
+                    return Err(RateLimitError::AllowanceUnverified);
+                }
                 let acquired = self.local.acquire(key, limits, member).await;
                 if acquired.is_ok() && limits.concurrency.is_some() {
                     // A reply can be lost after Redis has already applied the
@@ -883,6 +975,7 @@ impl RateStore for RedisStore {
             Ok(c) => c,
             Err(e) => {
                 self.note_failure("commit", &e);
+                self.park_if_allowance(key, &prefix, tokens);
                 return self.local.commit(key, tokens, member).await;
             }
         };
@@ -909,6 +1002,10 @@ impl RateStore for RedisStore {
             Err(e) => {
                 self.note_failure("commit", &e);
                 self.conn.note_error().await;
+                // A lost reply may mean Redis took it already: counted twice,
+                // the allowance refuses a little early, which is the side to
+                // err on.
+                self.park_if_allowance(key, &prefix, tokens);
                 self.local.commit(key, tokens, member).await;
             }
         }
@@ -975,16 +1072,25 @@ impl RateStore for RedisStore {
             // Record locally too so the count is right if a later request
             // falls back during an outage.
             self.local.add_tokens(key, tokens);
+            let allowance = self.local.carries_allowance(key);
+            let prefix = self.bucket_prefix(key);
             if offer_post_stream(
                 &self.post_stream_tx,
                 PostStreamTokenAdd {
-                    prefix: self.bucket_prefix(key),
+                    prefix: prefix.clone(),
                     tokens,
+                    allowance,
                     metrics: self.metrics.clone(),
                 },
             ) == Enqueued::Dropped
             {
-                shed += 1;
+                // An allowance's spend waits for the worker's next sweep
+                // rather than being shed.
+                if allowance {
+                    park_allowance(&self.pending_allowance, prefix, tokens);
+                } else {
+                    shed += 1;
+                }
             }
         }
         if shed > 0 {
@@ -1168,6 +1274,7 @@ mod tests {
         PostStreamTokenAdd {
             prefix: prefix.to_string(),
             tokens: 10,
+            allowance: false,
             metrics: None,
         }
     }
@@ -1223,6 +1330,127 @@ mod tests {
         assert_eq!(started.load(Ordering::Relaxed), 2);
         // 两个在跑、一个等许可、四个排队。
         assert_eq!(accepted, 7);
+    }
+
+    /// A store whose Redis has not answered yet: every command fails, the
+    /// way it does through an outage.
+    fn unreachable_store() -> RedisStore {
+        RedisStore::with_slot(ConnSlot::empty(), Arc::new(AtomicBool::new(true)))
+            .expect("the accounting worker starts")
+    }
+
+    fn granted(micro_usd: u64) -> RateLimit {
+        RateLimit {
+            granted_micro_usd: Some(micro_usd),
+            ..RateLimit::default()
+        }
+    }
+
+    /// Wait for `key`'s pending allowance total to read `expected`. Polled:
+    /// the worker's sweep takes a total out while it retries it and puts it
+    /// back when Redis does not answer.
+    async fn wait_pending(store: &RedisStore, key: &str, expected: u64) {
+        let prefix = store.bucket_prefix(key);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let total = store.pending_allowance.get(&prefix).map(|t| *t);
+            if total == Some(expected) {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{key} pending {total:?}, expected {expected}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Every other bucket counts on this replica while Redis is down; one
+    /// carrying an allowance refuses, because that count starts near zero on
+    /// every replica and would let a caller spend the allowance once per
+    /// replica.
+    #[tokio::test]
+    async fn an_allowance_bucket_refuses_while_redis_does_not_answer() {
+        let store = unreachable_store();
+        assert_eq!(
+            store.acquire("spend", &granted(1_000), "m-1").await,
+            Err(RateLimitError::AllowanceUnverified)
+        );
+        let windowed = RateLimit {
+            rpm: Some(10),
+            concurrency: Some(2),
+            ..RateLimit::default()
+        };
+        assert_eq!(store.acquire("rpm", &windowed, "m-2").await, Ok(()));
+        // Refused, so it holds no slot in the local fallback either.
+        assert_eq!(
+            store
+                .acquire(
+                    "spend-conc",
+                    &RateLimit {
+                        concurrency: Some(1),
+                        ..granted(1_000)
+                    },
+                    "m-3",
+                )
+                .await,
+            Err(RateLimitError::AllowanceUnverified)
+        );
+    }
+
+    /// The spend an allowance bucket records after a stream is never shed:
+    /// when the accounting queue is full it waits in the bucket's pending
+    /// total for the worker's next sweep. Every other bucket's update is shed
+    /// as before.
+    #[tokio::test]
+    async fn a_full_queue_sheds_no_allowance_spend() {
+        #[derive(Default)]
+        struct Shed(std::sync::Mutex<u64>);
+        impl aisix_core::RateLimitMetricsSink for Shed {
+            fn record_redis_failure(&self, _op: &str) {}
+            fn record_post_stream_shed(&self, dropped: u64) {
+                *self.0.lock().unwrap() += dropped;
+            }
+        }
+        let shed = Arc::new(Shed::default());
+        let mut store = unreachable_store().with_metrics(shed.clone());
+        let (tx, _held) = tokio::sync::mpsc::channel(1);
+        tx.try_send(add("filler")).unwrap();
+        store.post_stream_tx = tx;
+        store.local.note_allowance("spend", &granted(1_000));
+
+        store.add_tokens_all(&["spend".to_string(), "tokens".to_string()], 7);
+        store.add_tokens("spend", 5);
+
+        wait_pending(&store, "spend", 12).await;
+        assert!(store
+            .pending_allowance
+            .get(&store.bucket_prefix("tokens"))
+            .is_none());
+        assert_eq!(
+            *shed.0.lock().unwrap(),
+            1,
+            "the token bucket's update is shed"
+        );
+    }
+
+    /// An allowance update the worker could not deliver waits for the next
+    /// sweep instead of being lost.
+    #[tokio::test]
+    async fn an_allowance_update_redis_did_not_take_waits_for_a_retry() {
+        let store = unreachable_store();
+        store.local.note_allowance("spend", &granted(1_000));
+        store.add_tokens("spend", 40);
+        store.add_tokens("tokens", 40);
+        wait_pending(&store, "spend", 40).await;
+        assert!(store
+            .pending_allowance
+            .get(&store.bucket_prefix("tokens"))
+            .is_none());
+
+        // A commit Redis did not take is kept the same way.
+        store.commit("spend", 2, "m").await;
+        wait_pending(&store, "spend", 42).await;
     }
 
     #[test]

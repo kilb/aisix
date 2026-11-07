@@ -475,3 +475,156 @@ async fn a_dead_redis_falls_open_and_says_so() {
         "the failure must name the operation that degraded; got {ops:?}"
     );
 }
+
+/// A TCP gate in front of a Redis: while closed it drops every connection,
+/// and closing it cuts the ones it is forwarding, the way an outage does —
+/// on a shared Redis too, which these cases may not stop.
+struct Gate {
+    url: String,
+    open: tokio::sync::watch::Sender<bool>,
+}
+
+impl Gate {
+    async fn in_front_of(r: &Redis) -> Gate {
+        let url = r.url();
+        let rest = url.strip_prefix("redis://").expect("a redis:// URL");
+        let (authority, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
+        let (userinfo, target) = match authority.rfind('@') {
+            Some(at) => (&authority[..=at], &authority[at + 1..]),
+            None => ("", authority),
+        };
+        let target = target.to_string();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind the gate");
+        let addr = listener.local_addr().expect("the gate's address");
+        let (open, watch) = tokio::sync::watch::channel(false);
+        tokio::spawn(async move {
+            while let Ok((mut inbound, _)) = listener.accept().await {
+                if !*watch.borrow() {
+                    continue;
+                }
+                let mut watch = watch.clone();
+                let target = target.clone();
+                tokio::spawn(async move {
+                    let Ok(mut outbound) = tokio::net::TcpStream::connect(&target).await else {
+                        return;
+                    };
+                    tokio::select! {
+                        _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound) => {}
+                        _ = watch.wait_for(|open| !*open) => {}
+                    }
+                });
+            }
+        });
+        Gate {
+            url: format!("redis://{userinfo}{addr}{path}"),
+            open,
+        }
+    }
+
+    fn open(&self) {
+        self.open.send_replace(true);
+    }
+
+    fn close(&self) {
+        self.open.send_replace(false);
+    }
+
+    fn config(&self) -> RedisConnConfig {
+        RedisConnConfig {
+            mode: RedisMode::Single,
+            url: Some(self.url.clone()),
+            timeout_secs: 1,
+            ..RedisConnConfig::default()
+        }
+    }
+}
+
+/// 发放额是一笔不能超支的钱。共享计数器读不到时，本地计数只记着这一个副本自己
+/// 花的那点，按它放行等于让调用方在每个副本上把额度各花一遍。所以带发放额的桶
+/// 在 Redis 不应答时拒绝（`AllowanceUnverified`，代理答 `503`），其余的桶照旧
+/// 退到本地计数放行。
+#[tokio::test]
+async fn an_allowance_refuses_while_redis_is_unreachable_and_nothing_else_does() {
+    let r = redis_or_skip!();
+    let gate = Gate::in_front_of(&r).await;
+    gate.open();
+    let s = aisix_ratelimit::store::redis::RedisStore::connect(&gate.config())
+        .await
+        .expect("connect through the open gate")
+        .with_env_namespace(&r.ns);
+    let windowed = RateLimit {
+        rpm: Some(1_000),
+        ..RateLimit::default()
+    };
+    s.acquire("spend", &granted(1_000_000), "m-1")
+        .await
+        .expect("a reachable redis admits the allowance");
+    s.acquire("rpm", &windowed, "m-2")
+        .await
+        .expect("and the windowed bucket");
+
+    gate.close();
+    let started = std::time::Instant::now();
+    assert_eq!(
+        s.acquire("spend", &granted(1_000_000), "m-3").await,
+        Err(RateLimitError::AllowanceUnverified),
+        "an allowance must not be admitted on a count this replica alone keeps"
+    );
+    s.acquire("rpm", &windowed, "m-4")
+        .await
+        .expect("every other bucket still falls open");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "deciding took {:?}",
+        started.elapsed()
+    );
+}
+
+/// 断线期间记下的发放额花费不能丢：它要等 Redis 回来，由记账 worker 补写进
+/// 共享的累计计数器。丢了，这笔钱就永远不计进额度，额度可以被多花这么多。
+#[tokio::test]
+async fn allowance_spend_recorded_while_redis_is_unreachable_reaches_it_once_it_is_back() {
+    let r = redis_or_skip!();
+    let gate = Gate::in_front_of(&r).await;
+    let (s, unreachable) =
+        aisix_ratelimit::store::redis::RedisStore::connect_or_attach_later(&gate.config())
+            .await
+            .expect("an unreachable redis is degraded around, not fatal");
+    assert!(
+        unreachable.is_some(),
+        "the gate is closed: redis is unreachable"
+    );
+    let s = s.with_env_namespace(&r.ns);
+
+    // The request is refused, and the spend of one admitted before the outage
+    // arrives meanwhile, from its stream's end.
+    assert_eq!(
+        s.acquire("spend", &granted(1_000_000), "m-1").await,
+        Err(RateLimitError::AllowanceUnverified)
+    );
+    s.add_tokens("spend", 700);
+    tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
+
+    gate.open();
+    let key = format!("aisix:rl:{}:{{spend}}:consumed", r.ns);
+    let mut c = r.raw().await;
+    let mut consumed = 0;
+    for _ in 0..200 {
+        consumed = redis::cmd("GET")
+            .arg(&key)
+            .query_async::<Option<i64>>(&mut c)
+            .await
+            .expect("GET")
+            .unwrap_or(0);
+        if consumed == 700 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert_eq!(consumed, 700, "the spend never reached the shared counter");
+    s.acquire("spend", &granted(1_000_000), "m-2")
+        .await
+        .expect("an attached redis admits the allowance again");
+}

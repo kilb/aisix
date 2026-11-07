@@ -900,6 +900,9 @@ fn spend_scope_label(
     if matches!(err, aisix_ratelimit::RateLimitError::AllowanceExhausted) {
         return "spend_allowance";
     }
+    if matches!(err, aisix_ratelimit::RateLimitError::AllowanceUnverified) {
+        return "spend_allowance_unverified";
+    }
     match window {
         Some(PolicyWindow::Minute) => "spend_minute",
         Some(PolicyWindow::Hour) => "spend_hour",
@@ -946,6 +949,12 @@ fn reject_spend(
         "policy_spend",
         Some((policy_id, policy.name.as_str())),
     );
+    // The shared store did not answer for a bucket carrying an allowance:
+    // whether it has room cannot be known, which is a budget that cannot be
+    // verified (`503`), not one that ran out.
+    if matches!(err, aisix_ratelimit::RateLimitError::AllowanceUnverified) {
+        return ProxyError::BudgetUnverified;
+    }
     let retry_after_seconds = err.retry_after_secs();
     let usd = |micro: u64| format!("{:.6}", micro as f64 / 1_000_000.0);
     let scope_ref = match (policy.scope, member) {
@@ -2225,6 +2234,81 @@ mod tests {
         );
         assert_eq!(err.status().as_u16(), 429);
         assert_eq!(err.kind(), "billing_error");
+    }
+
+    /// A spend allowance is not admitted while the shared rate-limit store
+    /// does not answer: the caller gets `503` `budget_unverified`, the answer
+    /// a budget that cannot be checked already gets, not a `429` that says
+    /// the money ran out. A policy without an allowance still falls open.
+    #[tokio::test]
+    async fn an_allowance_the_shared_store_cannot_check_is_answered_503() {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let (store, unreachable) =
+            aisix_ratelimit::RedisStore::connect_or_attach_later(&aisix_core::RedisConnConfig {
+                mode: aisix_core::config::RedisMode::Single,
+                url: Some(format!("redis://127.0.0.1:{port}")),
+                timeout_secs: 1,
+                ..Default::default()
+            })
+            .await
+            .expect("an unreachable redis is degraded around");
+        assert!(unreachable.is_some());
+        let limiter = std::sync::Arc::new(aisix_ratelimit::Limiter::with_store(
+            std::sync::Arc::new(store),
+        ));
+        let state_with = |snap: &aisix_core::AisixSnapshot| {
+            crate::state::ProxyState::with_limiter(
+                aisix_core::snapshot::SnapshotHandle::new(snap.clone()),
+                std::sync::Arc::new(aisix_gateway::Hub::new()),
+                limiter.clone(),
+                &aisix_core::ProxyConfig {
+                    addr: "127.0.0.1:0".into(),
+                    request_body_limit_bytes: 0,
+                    tls: None,
+                    real_ip: Default::default(),
+                    request_id: Default::default(),
+                    thread_per_core: None,
+                    workers: None,
+                    url_rewrites: Vec::new(),
+                    expose_debug_headers: false,
+                    platform: Default::default(),
+                    listeners: Vec::new(),
+                },
+            )
+        };
+        let auth = test_auth_key("k1");
+
+        let granted: RateLimitPolicy = serde_json::from_value(serde_json::json!({
+            "name": "allowance",
+            "scope": "api_key",
+            "scope_ref": "k1",
+            "granted_micro_usd": 1_000_000,
+        }))
+        .unwrap();
+        let snap = snapshot_with_policy(granted);
+        let err = reserve_layers(&state_with(&snap), &snap, &auth, None, None)
+            .await
+            .expect_err("an allowance nobody can check is not admitted");
+        assert!(
+            matches!(err, ProxyError::BudgetUnverified),
+            "expected BudgetUnverified, got {err:?}"
+        );
+        assert_eq!(err.status().as_u16(), 503);
+
+        let windowed = snapshot_with_policy(make_spend_policy(
+            "api_key",
+            "k1",
+            "day",
+            Some(100),
+            Some(10_000_000),
+        ));
+        reserve_layers(&state_with(&windowed), &windowed, &auth, None, None)
+            .await
+            .expect("a policy without an allowance still falls open");
     }
 
     /// R17：`team_member` 作用域下真正记满的是*那一个成员*的花费桶

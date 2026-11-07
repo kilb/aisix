@@ -96,6 +96,16 @@ pub enum RateLimitError {
     /// something untrue. Someone has to raise the granted figure.
     #[error("spend allowance exhausted")]
     AllowanceExhausted,
+    /// The bucket carries a spend allowance, and the shared store that holds
+    /// what it has spent did not answer.
+    ///
+    /// Refused rather than admitted on this process's own count, which every
+    /// other bucket falls back to: that count holds only what this replica
+    /// recorded itself, so admitting on it would let a caller spend the
+    /// allowance once per replica. Carries no retry hint: the store's
+    /// recovery cannot be predicted.
+    #[error("spend allowance could not be verified: the shared rate-limit store did not answer")]
+    AllowanceUnverified,
 }
 
 impl RateLimitError {
@@ -104,7 +114,9 @@ impl RateLimitError {
             RateLimitError::Requests { scope, .. } => *scope,
             RateLimitError::Tokens { scope, .. } => *scope,
             RateLimitError::Concurrency { .. } => RateLimitScope::Requests,
-            RateLimitError::AllowanceExhausted => RateLimitScope::Tokens,
+            RateLimitError::AllowanceExhausted | RateLimitError::AllowanceUnverified => {
+                RateLimitScope::Tokens
+            }
         }
     }
 
@@ -117,7 +129,7 @@ impl RateLimitError {
             RateLimitError::Requests { detail, .. }
             | RateLimitError::Tokens { detail, .. }
             | RateLimitError::Concurrency { detail } => Some(*detail),
-            RateLimitError::AllowanceExhausted => None,
+            RateLimitError::AllowanceExhausted | RateLimitError::AllowanceUnverified => None,
         }
     }
 
