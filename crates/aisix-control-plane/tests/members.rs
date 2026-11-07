@@ -932,6 +932,33 @@ async fn a_suspended_tenants_owner_lists_its_keys_and_members_and_revokes_from_t
     }
 }
 
+/// The key and member lists are reads: they answer while a change holds
+/// the tenant's row, rather than queueing behind it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_key_and_member_lists_do_not_wait_for_the_tenants_lock() {
+    let Some(cp) = TestCp::start_with(patient).await else {
+        return;
+    };
+    let tenant = cp.seed_tenant(TenantStatus::Active).await;
+    let owner = cp.member_login_seeded(tenant, MemberRole::Owner).await;
+    let mut holder = cp.db().pool().begin().await.expect("begin");
+    sqlx::query("SELECT 1 FROM tenants WHERE id = $1 FOR UPDATE")
+        .bind(tenant)
+        .execute(&mut *holder)
+        .await
+        .expect("hold the tenant");
+    for path in ["/api/keys", "/api/members"] {
+        let r = tokio::time::timeout(
+            Duration::from_secs(3),
+            cp.get_with_cookie(path, owner.cookie()),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{path} waited for the tenant's lock"));
+        assert_eq!(r.status, 200, "{path}: {r:?}");
+    }
+    holder.rollback().await.expect("release the tenant");
+}
+
 /// A suspended or pending tenant can still close what must not outlive the
 /// suspension: it revokes a leaked key and removes a member who left. A key
 /// revoked meanwhile stays revoked through the reactivation, which opens
