@@ -1058,6 +1058,10 @@ impl RateStore for RedisStore {
         self.add_tokens_all(&keys, tokens);
     }
 
+    fn note_allowance(&self, key: &str, limits: &RateLimit) {
+        self.local.note_allowance(key, limits);
+    }
+
     fn add_tokens_all(&self, keys: &[String], tokens: u64) {
         if tokens == 0 || keys.is_empty() {
             return;
@@ -1451,6 +1455,18 @@ mod tests {
         // A commit Redis did not take is kept the same way.
         store.commit("spend", 2, "m").await;
         wait_pending(&store, "spend", 42).await;
+    }
+
+    /// A credit to an allowance bucket this process never admitted a request
+    /// for (a batch's spend, settled on whichever replica sees the batch
+    /// finish) is allowance spend once the caller has noted the bucket's
+    /// shape: Redis not taking it parks it like any other.
+    #[tokio::test]
+    async fn a_credit_to_a_noted_allowance_bucket_waits_for_a_retry_without_an_acquire() {
+        let store = unreachable_store();
+        RateStore::note_allowance(&store, "spend", &granted(1_000));
+        store.add_tokens_all(&["spend".to_string()], 40);
+        wait_pending(&store, "spend", 40).await;
     }
 
     #[test]

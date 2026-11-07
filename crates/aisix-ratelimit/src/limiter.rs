@@ -166,6 +166,13 @@ impl Limiter {
         self.store.add_tokens(key, tokens);
     }
 
+    /// Record whether the bucket `key` carries a spend allowance, ahead of a
+    /// credit this process makes to it without having admitted a request
+    /// for it ([`RateStore::note_allowance`]).
+    pub fn note_allowance(&self, key: &str, limits: &aisix_core::RateLimit) {
+        self.store.note_allowance(key, limits);
+    }
+
     /// Credit every reservation layer in one batch. Prefer this over a loop
     /// of [`Limiter::add_tokens_post_stream`]: a distributed store waits
     /// once for the whole batch instead of once per layer, and this runs

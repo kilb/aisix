@@ -769,6 +769,11 @@ async fn reserve_policy_layers(
 /// 给事后才知道花了多少的路径用：批处理跑几天才结束，付钱的那把密钥当时可能根本
 /// 没有在途请求，手上没有预留可以取键。与 [`reserve_policy_layers`] 走同一个匹配，
 /// 所以两边记的是同一组桶。批处理只路由到直连模型，模型层策略也在这一相位匹配。
+///
+/// Every bucket handed back has its shape noted on the limiter
+/// (`Limiter::note_allowance`): this replica may never have admitted a
+/// request for it, and a credit to an allowance bucket must still be kept,
+/// not shed, when Redis does not take it.
 pub(crate) fn spend_bucket_keys(
     state: &ProxyState,
     snapshot: &aisix_core::AisixSnapshot,
@@ -788,7 +793,13 @@ pub(crate) fn spend_bucket_keys(
         .candidates(&input)
         .filter(|entry| !entry.value.suspended_at(now))
         .filter_map(|entry| match_policy_layer(&entry.value, &entry.id, &input, phase))
-        .filter_map(|layer| layer.spend.map(|spend| spend.bucket_key))
+        .filter_map(|layer| layer.spend)
+        .map(|spend| {
+            state
+                .limiter
+                .note_allowance(&spend.bucket_key, &spend.limits);
+            spend.bucket_key
+        })
         .collect()
 }
 
@@ -2113,6 +2124,85 @@ mod tests {
         // 策略不覆盖的密钥没有桶。
         let other = test_auth_key("k2");
         assert!(spend_bucket_keys(&state, &snap, &other, &model_rl).is_empty());
+    }
+
+    /// A batch's spend is credited to the buckets `spend_bucket_keys` hands
+    /// back, on whichever replica sees the batch finish, which may never have
+    /// admitted a request for them. Each bucket's shape is noted on the
+    /// limiter first, so the store keeps an allowance's credit rather than
+    /// shedding it when Redis does not take it.
+    #[tokio::test]
+    async fn spend_bucket_keys_note_which_buckets_carry_an_allowance() {
+        #[derive(Default)]
+        struct Noting(std::sync::Mutex<Vec<(String, bool)>>);
+        #[async_trait::async_trait]
+        impl aisix_ratelimit::RateStore for Noting {
+            async fn acquire(
+                &self,
+                _key: &str,
+                _limits: &RateLimit,
+                _member: &str,
+            ) -> Result<(), aisix_ratelimit::RateLimitError> {
+                Ok(())
+            }
+            async fn commit(&self, _key: &str, _tokens: u64, _member: &str) {}
+            fn release(&self, _key: &str, _member: &str) {}
+            fn add_tokens(&self, _key: &str, _tokens: u64) {}
+            async fn peek(
+                &self,
+                _key: &str,
+                _limits: &RateLimit,
+            ) -> Option<aisix_ratelimit::RateLimitStatus> {
+                None
+            }
+            async fn claim_once(&self, _key: &str, _ttl: std::time::Duration) -> bool {
+                true
+            }
+            fn note_allowance(&self, key: &str, limits: &RateLimit) {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push((key.to_string(), limits.granted_micro_usd.is_some()));
+            }
+        }
+        let granted: RateLimitPolicy = serde_json::from_value(serde_json::json!({
+            "name": "allowance",
+            "scope": "api_key",
+            "scope_ref": "k1",
+            "granted_micro_usd": 1_000_000,
+        }))
+        .unwrap();
+        let snap = snapshot_with_policy(granted);
+        let store = std::sync::Arc::new(Noting::default());
+        let state = crate::state::ProxyState::with_limiter(
+            aisix_core::snapshot::SnapshotHandle::new(snap.clone()),
+            std::sync::Arc::new(aisix_gateway::Hub::new()),
+            std::sync::Arc::new(aisix_ratelimit::Limiter::with_store(store.clone())),
+            &aisix_core::ProxyConfig {
+                addr: "127.0.0.1:0".into(),
+                request_body_limit_bytes: 0,
+                tls: None,
+                real_ip: Default::default(),
+                request_id: Default::default(),
+                thread_per_core: None,
+                workers: None,
+                url_rewrites: Vec::new(),
+                expose_debug_headers: false,
+                platform: Default::default(),
+                listeners: Vec::new(),
+            },
+        );
+        let model: aisix_core::Model = serde_json::from_value(serde_json::json!({
+            "display_name": "m",
+            "provider": "openai",
+            "model_name": "gpt-4o",
+            "provider_key_id": "pk",
+        }))
+        .unwrap();
+        let model_rl = ModelRateLimit::from_model("m", "m-id", &model);
+        let keys = spend_bucket_keys(&state, &snap, &test_auth_key("k1"), &model_rl);
+        assert_eq!(keys.len(), 1);
+        assert_eq!(*store.0.lock().unwrap(), vec![(keys[0].clone(), true)]);
     }
 
     /// 只设花费上限的策略——预算的典型形态——也必须预留花费层。

@@ -180,6 +180,14 @@ pub trait RateStore: Send + Sync + 'static {
         }
     }
 
+    /// Record whether the bucket `key` carries a spend allowance
+    /// (`limits.granted_micro_usd`), for a credit this process makes to it
+    /// without having admitted a request for it: a batch's spend, settled on
+    /// whichever replica sees the batch finish. An acquire records it too. A
+    /// store that keeps an allowance's spend safe across a failure of its
+    /// own reads it there; the default keeps nothing.
+    fn note_allowance(&self, _key: &str, _limits: &RateLimit) {}
+
     /// Drop per-key state untouched for longer than `idle_for`.
     ///
     /// Bucket keys are config-derived (api key, model, policy), so a
