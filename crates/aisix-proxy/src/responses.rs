@@ -5441,6 +5441,14 @@ fn apply_passthrough_headers(
             .headers_mut()
             .insert(axum::http::header::CONTENT_TYPE, hv);
     }
+    // Platform mode: the header a bridged stream sends, so the two kinds of
+    // channel answer under one header set.
+    if platform.is_some() {
+        response.headers_mut().insert(
+            axum::http::header::CACHE_CONTROL,
+            HeaderValue::from_static("no-cache"),
+        );
+    }
     if let Ok(hv) = HeaderValue::from_str(request_id) {
         response
             .headers_mut()
@@ -11172,6 +11180,72 @@ data: [DONE]\n\n";
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// A native stream and a bridged one go out under the same headers in
+    /// platform mode: a header only one of them sends tells a tenant which
+    /// kind of channel served it.
+    #[tokio::test]
+    async fn platform_mode_sends_native_and_bridged_streams_under_one_header_set() {
+        let upstream = MockServer::builder().start().await;
+        let responses_sse = "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_r\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":1,\"total_tokens\":4}}}\n\n";
+        let messages_sse = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-3-haiku-20240307\",\"content\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}}\n\n\
+            event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
+            event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n\
+            event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+            event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n\
+            event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+        for (route, sse) in [
+            ("/v1/responses", responses_sse),
+            ("/v1/messages", messages_sse),
+        ] {
+            Mock::given(method("POST"))
+                .and(path(route))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_raw(sse, "text/event-stream; charset=utf-8"),
+                )
+                .mount(&upstream)
+                .await;
+        }
+        let snap = new_snap_openai(&upstream.uri());
+        snap.provider_keys.insert(anthropic_pk_at(&upstream.uri()));
+        snap.models.insert(openai_model("gpt-4o-resp"));
+        snap.models.insert(anthropic_model("claude-resp"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        let app = build_platform_app(snap);
+        let mut sets = Vec::new();
+        for model in ["gpt-4o-resp", "claude-resp"] {
+            let resp = app
+                .clone()
+                .oneshot(make_req(
+                    serde_json::json!({"model": model, "input": "hi", "stream": true}),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{model}");
+            let mut set: Vec<(String, String)> = resp
+                .headers()
+                .iter()
+                .map(|(name, value)| {
+                    let value = if name == "x-aisix-request-id" {
+                        String::new()
+                    } else {
+                        value.to_str().unwrap().to_owned()
+                    };
+                    (name.to_string(), value)
+                })
+                .collect();
+            set.sort();
+            let _ = to_bytes(resp.into_body(), 65536).await.unwrap();
+            sets.push(set);
+        }
+        assert_eq!(
+            sets[0], sets[1],
+            "native {:?}, bridged {:?}",
+            sets[0], sets[1]
+        );
+        assert!(sets[0].contains(&("cache-control".to_owned(), "no-cache".to_owned())));
     }
 
     /// An upstream that serves `body` in 64 KiB chunks, as a network
