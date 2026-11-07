@@ -59,9 +59,23 @@ async function pageButtons(page: Page): Promise<string[]> {
   return (await page.locator("main button").allInnerTexts()).map((t) => t.trim());
 }
 
-/** Each tab's edit controls, by `data-tab`. */
-async function editControlsByTab(page: Page): Promise<Record<string, string[]>> {
+/** Every tab of the Dashboard, in order. Every role but admin sees all of them but `operators`. */
+const ADMIN_TABS = ["overview", "gateways", "providers", "models", "tenants", "keys", "cache", "resources", "operators", "audit"];
+const STAFF_TABS = ADMIN_TABS.filter((t) => t !== "operators");
+
+/**
+ * Each tab's edit controls, by `data-tab`. The tab bar must hold exactly
+ * `expected`: a tab that goes missing fails here instead of slipping out
+ * of the checks.
+ *
+ * TODO(Task 11): on p1b-t8 the gateways, providers, models, tenants and
+ * keys tabs are still placeholders, so the role checks pass on them
+ * trivially. Once the lanes are merged, make this strict: require that
+ * each of them renders its real page before its controls are counted.
+ */
+async function editControlsByTab(page: Page, expected: string[]): Promise<Record<string, string[]>> {
   const tabs = await page.locator("[data-tab]").evaluateAll((els) => els.map((e) => e.getAttribute("data-tab") ?? ""));
+  expect(tabs, "the tabs this role sees").toEqual(expected);
   const out: Record<string, string[]> = {};
   for (const tab of tabs) {
     await openTab(page, tab);
@@ -150,7 +164,7 @@ test("只读运维看不到任何编辑入口，从页面直接发写请求被�
 
   await loginAsAdmin(page);
   // The check finds edit controls where an admin has them.
-  const adminControls = await editControlsByTab(page);
+  const adminControls = await editControlsByTab(page, ADMIN_TABS);
   expect(adminControls.cache).toContain("新建缓存策略");
   expect(adminControls.resources).toContain("新建");
   expect(adminControls.operators).toContain("新建运维账号");
@@ -175,7 +189,7 @@ test("只读运维看不到任何编辑入口，从页面直接发写请求被�
   const vpage = await viewerContext.newPage();
   await login(vpage, viewer.email, viewer.password);
   await expect(vpage.locator('[data-tab="operators"]')).toHaveCount(0);
-  for (const [tab, names] of Object.entries(await editControlsByTab(vpage))) {
+  for (const [tab, names] of Object.entries(await editControlsByTab(vpage, STAFF_TABS))) {
     expect(names, `edit controls on ${tab}`).toEqual([]);
   }
 
@@ -218,7 +232,7 @@ test("运维角色看不到运维账号、网关凭据与清理入口，越权�
   const mine = await createOperator(op.email, "operator", op.password);
   await login(page, op.email, op.password);
   await expect(page.locator('[data-tab="operators"]')).toHaveCount(0);
-  const controls = await editControlsByTab(page);
+  const controls = await editControlsByTab(page, STAFF_TABS);
   for (const [tab, names] of Object.entries(controls)) {
     const adminOnly = names.filter((n) => ADMIN_ONLY.test(n) || (ADMIN_ONLY_ON[tab]?.test(n) ?? false));
     expect(adminOnly, `admin-only controls on ${tab}`).toEqual([]);
@@ -504,5 +518,14 @@ test("会话在别处登出后，下一次操作就回到登录框", async ({ pa
   await expect(page.getByRole("button", { name: "登录" })).toBeVisible();
   await expect(page.locator("[data-tab]")).toHaveCount(0);
   await expect(page.getByText("登录已过期")).toBeVisible();
+
+  // Signing in again with a wrong password reports that, and not a second expiry.
+  await page.getByLabel("邮箱").fill(stack.operator.email);
+  await page.getByLabel("口令", { exact: true }).fill("wrong-password-e2e-1");
+  await page.getByRole("button", { name: "登录" }).click();
+  await expect(page.getByRole("alert")).toContainText("邮箱或口令不正确");
+  await expect(page.getByRole("alert")).not.toContainText("登录已过期");
+  await expect(page.getByText("登录已过期")).toHaveCount(1);
+  await expect(page.locator("[data-tab]")).toHaveCount(0);
   await copy.close();
 });

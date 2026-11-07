@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { TabProps } from "../App";
 import { ApiError, audit, type AuditEntry, type Tenant } from "../lib/api";
+import { redacted } from "../lib/auditDetail";
 import { messageFor } from "../lib/errors";
 
 /**
@@ -29,26 +30,8 @@ const TARGET_KINDS: { kind: string; label: string }[] = [
 
 const ACTOR_KIND: Record<string, string> = { member: "租户成员", system: "系统", anonymous: "匿名" };
 
-/**
- * Detail fields whose values are never shown. The control plane writes
- * field names and non-secret values only; this holds even for a row that
- * broke that rule.
- */
-const SECRET_FIELD = /(^|_)(password|passphrase|secret|token|api_key|apikey|private_key|key_pem|hash|cookie|authorization)(_|$)/i;
-const HIDDEN = "（不显示）";
-
 function fmtTime(iso: string): string {
   return new Date(iso).toLocaleString("zh-CN", { hour12: false });
-}
-
-function redacted(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(redacted);
-  if (value !== null && typeof value === "object") {
-    return Object.fromEntries(
-      Object.entries(value).map(([k, v]) => [k, SECRET_FIELD.test(k) ? HIDDEN : redacted(v)]),
-    );
-  }
-  return value;
 }
 
 /** A value as stored: strings bare, a list of plain values comma-separated, anything else as JSON. */
