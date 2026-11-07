@@ -330,6 +330,7 @@ pub const ROUTE_ROLES: &[(&str, &str, MinRole)] = &[
     ),
     // Gateways, on the gateway listener.
     ("POST", "/dp/heartbeat", MinRole::Dp),
+    ("GET", "/dp/v1/keys/{key_id}/prices", MinRole::Dp),
     ("ANY", "/dp/store/v1/{*rest}", MinRole::Dp),
     ("POST", "/dp/telemetry", MinRole::Dp),
 ];
@@ -481,6 +482,10 @@ pub fn browser_router(state: AppState) -> Router {
 pub fn dp_router(state: AppState) -> Router {
     Router::new()
         .route("/dp/heartbeat", post(dp::heartbeat::heartbeat))
+        .route(
+            "/dp/v1/keys/{key_id}/prices",
+            get(billing::lookup_prices::prices),
+        )
         .route("/dp/store/v1/{*rest}", any(dp::store::not_found))
         // A batch may be larger than the other routes' bodies, and every
         // answer, the body limit's included, says batches are deduplicated.

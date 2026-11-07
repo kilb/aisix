@@ -15,6 +15,7 @@
 //! on every housekeeping tick, keeps unreachable in practice.
 
 pub mod ledger;
+pub mod lookup_prices;
 pub mod money;
 pub mod plans;
 pub mod range;
