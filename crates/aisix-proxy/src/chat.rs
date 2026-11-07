@@ -576,8 +576,8 @@ pub async fn chat_completions(
                     // 上游已经为这些 token 收过钱了，所以这一发和成功的一发对
                     // 网关来说成本相同 —— 网关自己的额度闸也正是这么算的。定价
                     // 按调度到的目标（虚拟父级不带 `cost`），与成功路径同一条
-                    // 规则。写 0 会让客户账本上出现「有 token、没金额」，而门户
-                    // 按花费序列扣款，那笔钱就永远扣不到，两本账各说各话。
+                    // 规则。写 0 会让客户账本上出现「有 token、没金额」，花费
+                    // 序列也漏掉这笔钱，两本账各说各话。
                     let blocked_cost_usd = crate::usage_attr::request_cost_usd(
                         &snapshot,
                         event_model_id,
@@ -1054,7 +1054,7 @@ struct SemanticGateCtx {
 /// 「同族没有齐步走」—— 而那正是这个仓库反复吃亏的形状。
 ///
 /// 与路由那条的一个差别：命中缓存时这次请求根本不会走到提交预留那一步，所以这里
-/// 只发指标（门户按 user_id 求和照样扣得到），网关侧的额度计数器不包含它。
+/// 只发指标（花费序列里照样有它），网关侧的额度计数器不包含它。
 async fn cache_semantic_embed(
     state: &ProxyState,
     snapshot: &AisixSnapshot,
@@ -3070,7 +3070,7 @@ async fn dispatch(
                 // 命中缓存：没有上游 chat 调用，所以 token 记 0。但**分类调用
                 // 已经发生了** —— 语义路由为了决定路由，在缓存查询之前就打了一发
                 // 嵌入调用。用 `commit_tokens_no_spend` 会把它从额度里漏掉（指标
-                // 里还在，所以门户照扣，但网关侧的闸不认它）。非语义请求这个数
+                // 里还在，但网关侧的闸不认它）。非语义请求这个数
                 // 是 0，行为与原来完全一致。
                 reservation.commit(0, semantic_embed_spend).await;
                 // Counted HERE, at the gate's decision — the same rule the
@@ -3394,7 +3394,7 @@ async fn dispatch(
     // DISPATCHED row, not the caller-addressed one** — for a routing group
     // or a semantic router the addressed entry is a virtual parent with no
     // `cost`, so pricing against it silently yields 0: no spend series, no
-    // allowance consumed, no budget enforced. Equal to `model_id` for a
+    // spend ceiling consumed, no budget enforced. Equal to `model_id` for a
     // direct model, which is why it went unnoticed. The streaming branch
     // already carries the winner's id (`winner_target_id`, #790).
     let mut chosen_target_id: Option<String> = None;

@@ -45,8 +45,7 @@ pub const M_REQUESTS_TOTAL: &str = "aisix_requests_total";
 pub const M_REQUEST_DURATION: &str = "aisix_request_duration_seconds";
 pub const M_RATELIMIT_REJECTIONS: &str = "aisix_ratelimit_rejections_total";
 pub const M_TOKENS_CONSUMED: &str = "aisix_tokens_consumed_total";
-/// Micro-USD spent, per the gateway's own pricing. Its label selection must
-/// keep `user_id`, so spend can be read per user.
+/// Micro-USD spent, per the gateway's own pricing.
 pub const M_LLM_SPEND_MICRO_USD_TOTAL: &str = "aisix_llm_spend_micro_usd_total";
 pub const M_LLM_INPUT_TOKENS_TOTAL: &str = "aisix_llm_input_tokens_total";
 pub const M_LLM_OUTPUT_TOKENS_TOTAL: &str = "aisix_llm_output_tokens_total";

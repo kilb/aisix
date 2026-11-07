@@ -4427,8 +4427,8 @@ struct DispatchOutcome {
     cache: crate::response_cache::CacheTelemetry,
     /// 输出护栏拦下了这个应答。上游已经调用并计费，所以它带着账走成功那条
     /// 收尾路径（`response` 是 422），而不是当成错误丢掉 —— 记 0 会让客户
-    /// 账本少报他们已经向供应商付过的量，也会让花费指标漏掉这笔钱，于是
-    /// 门户永远扣不到它。`/v1/responses` 一直是这么做的。
+    /// 账本少报他们已经向供应商付过的量，也会让花费指标漏掉这笔钱。
+    /// `/v1/responses` 一直是这么做的。
     refusal: Option<crate::attempt::StreamRefusal>,
 }
 
