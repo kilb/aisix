@@ -2548,3 +2548,54 @@ async fn a_tenant_busy_past_the_lock_timeout_is_left_for_a_later_pass() {
     assert_eq!(key_doc(&cp, &key).await["display_name"], "busy-7c1");
     assert_eq!(doc_version(&cp, &key).await, next);
 }
+
+/// A tenant whose catch-up fails for a reason other than the gate or a busy
+/// lock does not stop the control plane booting: it is logged, stays behind
+/// for the housekeeping ticks to retry, and the other tenants catch up.
+/// Here the failure is a grant naming a model that no longer exists, which
+/// only a change behind the control plane's back can leave: the key's
+/// document would name it, and the reference check refuses the write.
+#[tokio::test]
+async fn a_tenant_whose_catch_up_fails_does_not_stop_a_boot() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let broken = cp.seed_tenant(TenantStatus::Active).await;
+    let healthy = cp.seed_tenant(TenantStatus::Active).await;
+    let owner_b = cp.member_login_seeded(broken, MemberRole::Owner).await;
+    let owner_h = cp.member_login_seeded(healthy, MemberRole::Owner).await;
+    let (kb, _) = mint_ok(&cp, &owner_b, json!({"label": "broken-7c1"})).await;
+    let (kh, _) = mint_ok(&cp, &owner_h, json!({"label": "healthy-7c1"})).await;
+    sqlx::query("UPDATE tenants SET allowed_model_ids = ARRAY[$2::uuid] WHERE id = $1")
+        .bind(broken)
+        .bind(Uuid::new_v4())
+        .execute(cp.db().pool())
+        .await
+        .expect("grant a model that does not exist");
+    make_stale(&cp, &[&kh]).await;
+    set_doc_version(&cp, &[&kb, &kh], 0).await;
+
+    let restarted = cp.restart().await;
+    assert_eq!(doc_version(&restarted, &kb).await, 0);
+    assert_eq!(
+        key_doc(&restarted, &kb).await["allowed_model_ids"],
+        json!([])
+    );
+    assert_eq!(
+        key_doc(&restarted, &kh).await["display_name"],
+        "healthy-7c1"
+    );
+    assert_eq!(doc_version(&restarted, &kh).await, KEY_DOC_VERSION);
+    // A later pass names it again, and only it.
+    let ctx = WriteCtx::of(restarted.state());
+    let pass = keys::catch_up(restarted.db(), &ctx, KEY_DOC_VERSION)
+        .await
+        .expect("catch up");
+    assert_eq!(
+        pass,
+        keys::CatchUp {
+            failed: vec![broken],
+            ..keys::CatchUp::default()
+        }
+    );
+}

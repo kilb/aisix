@@ -170,16 +170,19 @@ where
         stale_secs: gateways::stale_window_secs(&cfg),
     };
     tenants::ensure_internal_tenant(&db, &write_ctx).await?;
-    // Keys an older release wrote; a tenant the gateway-version gate refuses
-    // is left to the housekeeping ticks, any other failure stops the boot.
+    // Keys an older release wrote. A tenant left behind, whatever the reason,
+    // is tried again by every housekeeping tick, so it does not stop the
+    // boot: refusing to start would only stop the control plane serving
+    // everything else.
     let caught_up = keys::catch_up(&db, &write_ctx, keys::KEY_DOC_VERSION)
         .await
         .map_err(|e| BootError::KeyDocuments(format!("{}: {}", e.code, e.message)))?;
-    if caught_up.failed > 0 {
-        return Err(BootError::KeyDocuments(format!(
-            "{} tenants' key documents could not be rewritten; the log names them",
-            caught_up.failed
-        )));
+    if !caught_up.failed.is_empty() {
+        tracing::error!(
+            tenants = ?caught_up.failed,
+            "the key documents of these tenants could not be rewritten at boot (each \
+             reason is logged above); housekeeping tries them again every tick"
+        );
     }
     let passwords = PasswordGate::new(ARGON2_GATE_PERMITS)?;
     let creds = CredentialCache::load(&db.dedicated(CREDENTIALS_POOL_SIZE)).await?;

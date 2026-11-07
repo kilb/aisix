@@ -519,15 +519,16 @@ pub async fn revoke_member(
 }
 
 /// What one [`catch_up`] did, by tenant.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CatchUp {
     /// Tenants whose keys were rewritten.
     pub rewritten: usize,
     /// Tenants the gateway-version gate refused, or that stayed busy past
     /// the lock timeout, left for a later pass.
     pub deferred: usize,
-    /// Tenants whose rewrite failed for another reason, logged.
-    pub failed: usize,
+    /// Tenants whose rewrite failed for another reason, each logged with
+    /// it, in the order they were tried; a later pass tries them again.
+    pub failed: Vec<Uuid>,
 }
 
 /// Rewrites the documents of every tenant that holds a live key whose
@@ -546,8 +547,9 @@ pub struct CatchUp {
 /// registered, as during every upgrade) keeps its documents and its
 /// `doc_version`, is logged, and is rewritten by a later pass once that
 /// gateway is gone; so is one held by another transaction for longer than
-/// the lock timeout. A tenant that fails otherwise is logged and counted as
-/// failed. Only the first query's failure is an error.
+/// the lock timeout. A tenant that fails otherwise is logged, listed as
+/// failed, and tried again by every later pass. Only the first query's
+/// failure is an error.
 pub async fn catch_up(db: &Db, ctx: &WriteCtx, version: i32) -> Result<CatchUp, ApiError> {
     let behind: Vec<Uuid> = sqlx::query_scalar(
         "SELECT DISTINCT tenant_id FROM tenant_keys \
@@ -594,11 +596,12 @@ pub async fn catch_up(db: &Db, ctx: &WriteCtx, version: i32) -> Result<CatchUp, 
                 );
             }
             Err(e) => {
-                outcome.failed += 1;
+                outcome.failed.push(tenant_id);
                 tracing::warn!(
                     tenant = %tenant_id,
                     code = e.code,
                     reason = %e.message,
+                    details = ?e.details,
                     "a tenant's key documents could not be rewritten"
                 );
             }
