@@ -7085,6 +7085,16 @@ where
                     {
                         continue;
                     }
+                    // Platform mode: a chunk with nothing for the caller is
+                    // one channel's habit (a stream opening on a frame with
+                    // no choice), never another's, so relaying it would name
+                    // the channel.
+                    if platform.is_some()
+                        && chunk.finish_reason.is_none()
+                        && chunk.has_no_payload()
+                    {
+                        continue;
+                    }
                     Some(chunk)
                 }
                 Err(err) => {
@@ -9606,5 +9616,97 @@ mod delivery_counter_tests {
             out.chunks_delivered, 4,
             "exact match — DeliveryCounter fires on every Ready(Some)"
         );
+    }
+}
+
+#[cfg(test)]
+mod platform_stream_tests {
+    use super::{build_sse_stream, StreamCompletion};
+    use aisix_gateway::{ChatChunk, ChatChunkStream};
+    use axum::response::{IntoResponse, Sse};
+    use std::sync::{Arc, Mutex};
+    use std::time::Instant;
+
+    /// The chunks the OpenAI wire relays for one upstream frame.
+    fn wire_chunks(frame: serde_json::Value) -> Vec<ChatChunk> {
+        let raw: aisix_provider_openai::wire::OpenAiStreamChunk =
+            serde_json::from_value(frame).expect("an OpenAI stream frame");
+        aisix_provider_openai::wire::stream_chunk_into_chat_chunks(raw, &mut Default::default())
+    }
+
+    /// What the caller receives from `chunks`, as `data:` payloads.
+    async fn payloads(
+        chunks: Vec<ChatChunk>,
+        platform: Option<crate::platform::PlatformSettings>,
+    ) -> Vec<String> {
+        let upstream: ChatChunkStream = Box::pin(futures::stream::iter(chunks.into_iter().map(Ok)));
+        let captured = Arc::new(Mutex::new(None::<StreamCompletion>));
+        let out = Arc::clone(&captured);
+        let stream = build_sse_stream(
+            upstream,
+            1,
+            None,
+            Instant::now(),
+            Instant::now(),
+            "gw".into(),
+            None,
+            false,
+            aisix_gateway::chat::UsageStats::default(),
+            platform,
+            None,
+            move |completion| {
+                *out.lock().unwrap() = Some(completion);
+            },
+        );
+        let body = axum::body::to_bytes(Sse::new(stream).into_response().into_body(), usize::MAX)
+            .await
+            .unwrap();
+        String::from_utf8_lossy(&body)
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: ").map(str::to_owned))
+            .collect()
+    }
+
+    /// One channel's stream opens on a frame with no choice (`choices: []`
+    /// beside its prompt filter results), which the OpenAI wire relays as a
+    /// chunk with an empty delta. Other channels never send it, so in
+    /// platform mode, where it would name the channel on every stream, a
+    /// chunk with nothing for the caller is dropped. Off platform mode it
+    /// is relayed as before.
+    #[tokio::test]
+    async fn a_chunk_with_nothing_for_the_caller_is_dropped_only_in_platform_mode() {
+        let frames = || {
+            let mut chunks = wire_chunks(serde_json::json!({
+                "id": "",
+                "model": "",
+                "choices": [],
+                "prompt_filter_results": [{"prompt_index": 0, "content_filter_results": {}}],
+            }));
+            chunks.extend(wire_chunks(serde_json::json!({
+                "id": "x",
+                "model": "m",
+                "choices": [{"index": 0, "delta": {"role": "assistant", "content": "hi"}, "finish_reason": null}],
+            })));
+            chunks.extend(wire_chunks(serde_json::json!({
+                "id": "x",
+                "model": "m",
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            })));
+            chunks
+        };
+
+        let off = payloads(frames(), None).await;
+        assert_eq!(off.len(), 4, "prelude, answer, finish, [DONE]: {off:?}");
+        assert!(off[0].contains(r#""delta":{}"#), "{off:?}");
+
+        let on = payloads(
+            frames(),
+            Some(crate::platform::PlatformSettings::from_secret("s")),
+        )
+        .await;
+        assert_eq!(on.len(), 3, "answer, finish, [DONE]: {on:?}");
+        assert!(on[0].contains(r#""role":"assistant""#), "{on:?}");
+        assert!(on[1].contains(r#""finish_reason":"stop""#), "{on:?}");
+        assert_eq!(on[2], "[DONE]");
     }
 }
