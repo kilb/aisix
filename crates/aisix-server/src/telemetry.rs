@@ -205,7 +205,9 @@ const RETRY_BUDGET: Duration = Duration::from_secs(30 * 60);
 /// [`SendFailure::counts_toward_the_cap`].
 const MAX_ANSWERED_FAILURES: usize = 8;
 
-/// How long the shutdown drain keeps posting what is queued.
+/// How long the shutdown drain keeps posting what is queued, from the moment
+/// the worker first sees the stop: an attempt that was on the wire then, or a
+/// re-send's final attempt, counts against it too.
 ///
 /// A control plane that answers gets through a full queue well inside this.
 /// One that has stopped answering costs the request timeout per batch, and the
@@ -413,67 +415,37 @@ async fn run(
             // out a backoff would hold the whole shutdown open for a
             // control plane that is already failing, and so would posting
             // into one that has stopped answering, one timeout per batch:
-            // past `FINAL_DRAIN_BUDGET` what is left is counted and given up on.
-            let drain_deadline = Instant::now() + FINAL_DRAIN_BUDGET;
+            // past the shutdown deadline what is left is counted and given
+            // up on. The deadline is the one fixed when this worker first saw
+            // the stop, which may have been during a re-send that ended
+            // before the drain began ([`SenderState::shutdown_deadline`]):
+            // that re-send and every attempt since count against it.
+            let drain_deadline = state.shutdown_deadline();
             loop {
                 fill_ready_batch(&mut buffer, &mut rx, &metrics);
                 if buffer.is_empty() {
                     break;
                 }
+                if Instant::now() >= drain_deadline {
+                    give_up_unsent(&metrics, &mut buffer, &mut rx);
+                    break;
+                }
                 let Some(batch) = buffer.take_next() else {
                     break;
                 };
-                let delivered = tokio::time::timeout_at(
-                    drain_deadline,
-                    deliver(
-                        &client,
-                        &cfg,
-                        &metrics,
-                        &mut state,
-                        &batch,
-                        Retry::Disabled,
-                        cancel,
-                        None,
-                    ),
+                // Its one attempt is cut off at `drain_deadline` (`attempt`),
+                // which drops the batch as possibly stored.
+                deliver(
+                    &client,
+                    &cfg,
+                    &metrics,
+                    &mut state,
+                    &batch,
+                    Retry::Disabled,
+                    cancel,
+                    None,
                 )
                 .await;
-                if delivered.is_err() {
-                    // The batch in flight may have been stored; what is still
-                    // queued was never sent.
-                    drop_batch(
-                        &metrics,
-                        DROP_SEND_UNCONFIRMED,
-                        &batch.events,
-                        batch.id,
-                        0,
-                        Some(&SendFailure::NoResponse {
-                            never_sent: false,
-                            error: anyhow::anyhow!(
-                                "the shutdown drain ran out of time before this batch was answered"
-                            ),
-                        }),
-                    );
-                    while let Ok(event) = rx.try_recv() {
-                        buffer.push(event, &metrics);
-                    }
-                    let unsent: Vec<Prepared> = std::mem::take(&mut buffer).events.into();
-                    if !unsent.is_empty() {
-                        drop_batch(
-                            &metrics,
-                            DROP_SEND_FAILED,
-                            &unsent,
-                            Uuid::new_v4(),
-                            0,
-                            Some(&SendFailure::NoResponse {
-                                never_sent: true,
-                                error: anyhow::anyhow!(
-                                    "the shutdown drain ran out of time before this batch was sent"
-                                ),
-                            }),
-                        );
-                    }
-                    break;
-                }
             }
             tracing::info!("telemetry sender shutting down");
             return;
@@ -503,6 +475,9 @@ struct SenderState {
     /// [`random_jitter`], except in a test that has to see every wait go
     /// through it.
     jitter: fn(Duration) -> Duration,
+    /// When the shutdown drain must be over: [`FINAL_DRAIN_BUDGET`] after
+    /// this worker first saw the stop. `None` until it has.
+    shutdown_by: Option<Instant>,
 }
 
 impl Default for SenderState {
@@ -510,11 +485,21 @@ impl Default for SenderState {
         SenderState {
             dedup_seen: false,
             jitter: random_jitter,
+            shutdown_by: None,
         }
     }
 }
 
 impl SenderState {
+    /// The deadline every attempt after the stop is held to, fixed the first
+    /// time this is asked: by the run loop, by a re-send's backoff, or by an
+    /// attempt that was on the wire when the stop came.
+    fn shutdown_deadline(&mut self) -> Instant {
+        *self
+            .shutdown_by
+            .get_or_insert_with(|| Instant::now() + FINAL_DRAIN_BUDGET)
+    }
+
     /// Decide whether the batch that just produced `failure` may be re-sent,
     /// and record what the exchange said about the control plane.
     ///
@@ -704,6 +689,90 @@ impl Buffer {
     }
 }
 
+/// The shutdown drain ran out of time: count everything still queued as
+/// dropped. A parked batch may have reached the control plane on an earlier
+/// attempt; the rest was never sent.
+fn give_up_unsent(
+    metrics: &Metrics,
+    buffer: &mut Buffer,
+    rx: &mut tokio::sync::mpsc::Receiver<UsageEvent>,
+) {
+    while let Ok(event) = rx.try_recv() {
+        buffer.push(event, metrics);
+    }
+    let Buffer { parked, events, .. } = std::mem::take(buffer);
+    if let Some(parked) = parked {
+        drop_batch(
+            metrics,
+            if parked.maybe_stored {
+                DROP_SEND_UNCONFIRMED
+            } else {
+                DROP_SEND_FAILED
+            },
+            &parked.events,
+            parked.id,
+            0,
+            Some(&SendFailure::NoResponse {
+                never_sent: !parked.maybe_stored,
+                error: anyhow!("the shutdown drain ran out of time before this batch was re-sent"),
+            }),
+        );
+    }
+    let unsent: Vec<Prepared> = events.into();
+    if !unsent.is_empty() {
+        drop_batch(
+            metrics,
+            DROP_SEND_FAILED,
+            &unsent,
+            Uuid::new_v4(),
+            0,
+            Some(&SendFailure::NoResponse {
+                never_sent: true,
+                error: anyhow!("the shutdown drain ran out of time before this batch was sent"),
+            }),
+        );
+    }
+}
+
+/// One POST of a batch. Once this worker has seen the stop, the attempt is
+/// cut off at the shutdown deadline ([`SenderState::shutdown_deadline`]),
+/// and that includes a stop that arrives while the attempt is on the wire:
+/// the exit then stays within [`FINAL_DRAIN_BUDGET`] of the stop rather
+/// than waiting out a request timeout first. An attempt cut off went out
+/// unanswered, so it may have been stored.
+async fn attempt(
+    client: &reqwest::Client,
+    cfg: &TelemetryConfig,
+    state: &mut SenderState,
+    cancel: &mut watch::Receiver<bool>,
+    batch_id: Uuid,
+    body: &Bytes,
+) -> Attempt {
+    let post = send(client, cfg, batch_id, body);
+    tokio::pin!(post);
+    if state.shutdown_by.is_none() && !*cancel.borrow() {
+        loop {
+            tokio::select! {
+                answered = &mut post => return answered,
+                // `Err` means the watch itself is gone, which only happens as
+                // the process tears down: treated as the stop.
+                changed = cancel.changed() => {
+                    if changed.is_err() || *cancel.borrow() {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    match tokio::time::timeout_at(state.shutdown_deadline(), post).await {
+        Ok(answered) => answered,
+        Err(_) => Attempt::Failed(SendFailure::NoResponse {
+            never_sent: false,
+            error: anyhow!("the shutdown drain ran out of time before this batch was answered"),
+        }),
+    }
+}
+
 fn fill_ready_batch(
     buffer: &mut Buffer,
     rx: &mut tokio::sync::mpsc::Receiver<UsageEvent>,
@@ -768,12 +837,22 @@ async fn probe_with_the_next_batch(
     metrics: &Metrics,
     state: &mut SenderState,
     behind: &mut Behind<'_>,
+    cancel: &mut watch::Receiver<bool>,
 ) -> bool {
     fill_ready_batch(behind.buffer, behind.rx, metrics);
     let Some(probe) = behind.buffer.take_next() else {
         return false;
     };
-    match send(client, cfg, probe.id, &batch_body(&probe.events)).await {
+    match attempt(
+        client,
+        cfg,
+        state,
+        cancel,
+        probe.id,
+        &batch_body(&probe.events),
+    )
+    .await
+    {
         Attempt::Delivered { dedup, rejected } => {
             metrics.usage_delivery().note_reached();
             state.dedup_seen = dedup;
@@ -883,7 +962,7 @@ async fn deliver(
 
     loop {
         attempts += 1;
-        let failure = match send(client, cfg, batch_id, &body).await {
+        let failure = match attempt(client, cfg, state, cancel, batch_id, &body).await {
             Attempt::Delivered { dedup, rejected } => {
                 metrics.usage_delivery().note_reached();
                 state.dedup_seen = dedup;
@@ -975,7 +1054,7 @@ async fn deliver(
             // it again.
             reported_outage_ends = None;
             if let Some(behind) = behind.as_mut() {
-                if probe_with_the_next_batch(client, cfg, metrics, state, behind).await {
+                if probe_with_the_next_batch(client, cfg, metrics, state, behind, cancel).await {
                     // Re-sent at once: the store took the batch behind it.
                     the_store_answers = true;
                     continue;
@@ -1004,6 +1083,12 @@ async fn deliver(
             );
         }
 
+        // The stop came while that attempt was on the wire: no backoff, and
+        // the final attempt is held to the shutdown deadline.
+        if state.shutdown_by.is_some() {
+            last_attempt = true;
+            continue;
+        }
         // Never sleep past the budget: the last attempt happens at the
         // deadline, not one backoff after it.
         let wait = (state.jitter)(backoff).min(deadline - now);
@@ -1021,6 +1106,10 @@ async fn deliver(
         }
         if *cancel.borrow() {
             last_attempt = true;
+        }
+        if last_attempt {
+            // From here every attempt counts against the drain.
+            state.shutdown_deadline();
         }
         backoff = (backoff * 2).min(RETRY_MAX_BACKOFF);
     }
@@ -3922,6 +4011,64 @@ mod tests {
             "the batches the drain never sent: {unsent}"
         );
         assert!(tx.is_closed());
+    }
+
+    /// The stop can arrive while a batch is being re-sent, with that attempt
+    /// on the wire and a control plane that has stopped answering. The exit
+    /// still comes within [`FINAL_DRAIN_BUDGET`] of the stop, the bound the
+    /// shipped configs promise, and not after the attempt in flight, a final
+    /// attempt and a drain of its own, one after another. What it could not
+    /// deliver is counted.
+    #[tokio::test]
+    async fn a_stop_during_a_re_send_still_exits_within_the_drain_budget() {
+        const STEP: Duration = Duration::from_millis(250);
+
+        let (server, posts) = scripted_server(vec![dedups(503), stalls()]).await;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(format!("{}/dp/telemetry", server.uri()), &dir);
+        let metrics = Metrics::new(false);
+        let (cancel_tx, mut cancel_rx) = watch::channel(false);
+        tokio::time::pause();
+        let (mut sender, tx) = staged_sender(cfg, metrics.clone(), &mut cancel_rx, 2).await;
+
+        // The first attempt is refused as re-sendable; the re-send is on the
+        // wire, and nothing will answer it.
+        drive_until(
+            sender.as_mut(),
+            STEP_WHILE_SERVING,
+            || posts.lock().unwrap().len() >= 2,
+            "the failed batch was never re-sent",
+        )
+        .await;
+        for event in ordered_events(2) {
+            tx.try_send(event).unwrap();
+        }
+        cancel_tx.send(true).unwrap();
+
+        let stopped = Instant::now();
+        let wall_clock_deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while poll_sender(sender.as_mut()).await.is_pending() {
+            assert!(
+                stopped.elapsed() <= FINAL_DRAIN_BUDGET + Duration::from_secs(1),
+                "still running {:?} after the stop, after {} POSTs",
+                stopped.elapsed(),
+                posts.lock().unwrap().len(),
+            );
+            assert!(
+                std::time::Instant::now() < wall_clock_deadline,
+                "wall clock"
+            );
+            tokio::time::advance(STEP).await;
+            tokio::task::yield_now().await;
+        }
+
+        // The batch in hand went out unanswered, so it may be stored; the
+        // two queued behind it are counted either way.
+        let unconfirmed = drops_with_reason(&metrics, DROP_SEND_UNCONFIRMED);
+        let unsent = drops_with_reason(&metrics, DROP_SEND_FAILED);
+        assert_eq!(unconfirmed + unsent, 4, "everything undelivered is counted");
+        assert!(unconfirmed >= 2, "the batch in hand: {unconfirmed}");
+        drop(tx);
     }
 
     /// `managed.cp_base_url` may carry a password. It is used as configured
