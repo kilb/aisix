@@ -217,7 +217,8 @@ export interface Instance {
   last_seen_at: string;
   exporter_health: unknown;
   rejected_count: number;
-  version_matches_cp: boolean;
+  /** null when the two versions cannot be compared, such as an unstamped build. */
+  version_matches_cp: boolean | null;
 }
 
 export interface Credential {
@@ -239,6 +240,8 @@ export interface IssuedCredential {
   key_pem: string;
   ca_pem: string;
   env: Record<string, string>;
+  /** The control plane's own notes on keeping the bundle. */
+  note: string;
 }
 
 export interface RolloutSummary {
@@ -249,8 +252,10 @@ export interface RolloutSummary {
   rejected: { kind: string; id: string; name: string | null; errors: Rejection[] }[];
   partially_compatible: { instance_id: string; kind: string; field: string; count: number }[];
   unsafe: { instance_id: string; hostname: string; kind: string; field: string }[];
-  projection_stalled: { kind: string; id: string; error: string } | null;
-  projection_blocked: { reason?: string; owner_database_id: string; database_id: string } | null;
+  /** `kind` and `id` are null when projection stopped at no document (kine unreachable). */
+  projection_stalled: { kind: string | null; id: string | null; error: string } | null;
+  /** The owner is null when kine holds no claim and this database may not create one. */
+  projection_blocked: { owner_database_id: string | null; database_id: string } | null;
   instance_cap_hit_at: string | null;
   rejections_truncated: string[];
 }
@@ -361,7 +366,58 @@ export const schemas = {
 // Filled in by the tasks that build their pages, one namespace each.
 export const tenants = {};
 export const keys = {};
-export const gateways = {};
+/** Gateway instances and the credentials they boot from. */
+export const gateways = {
+  async instances(): Promise<Instance[]> {
+    return (await call<{ items: Instance[] }>("GET", "/admin/gateways/instances")).data.items;
+  },
+  async credentials(): Promise<Credential[]> {
+    return (await call<{ items: Credential[] }>("GET", "/admin/gateways/credentials")).data.items;
+  },
+  /** The only answer that carries the private key: never store or log it. */
+  async issue(name: string, validityDays?: number): Promise<IssuedCredential> {
+    return (
+      await call<IssuedCredential>("POST", "/admin/gateways/credentials", {
+        name,
+        validity_days: validityDays,
+      })
+    ).data;
+  },
+  async revoke(dpId: string): Promise<Credential> {
+    return (await call<Credential>("POST", `/admin/gateways/credentials/${seg(dpId)}/revoke`)).data;
+  },
+};
+
+/** The environment's rollout, and the two admin actions that unblock it. */
+export const rollout = {
+  async summary(): Promise<RolloutSummary> {
+    return (await call<RolloutSummary>("GET", "/admin/rollout")).data;
+  },
+  async reconcile(allowDeletes: boolean): Promise<{ deleted_strays: number; marked_dirty: number }> {
+    return (
+      await call<{ deleted_strays: number; marked_dirty: number }>(
+        "POST",
+        "/admin/rollout/reconcile",
+        { allow_deletes: allowDeletes },
+      )
+    ).data;
+  },
+  /** Moves the environment to this control plane's database, from `fromDatabaseId`. */
+  async takeOver(fromDatabaseId: string): Promise<{ owner_database_id: string }> {
+    return (
+      await call<{ owner_database_id: string }>("POST", "/admin/rollout/ownership", {
+        take_over_from: fromDatabaseId,
+      })
+    ).data;
+  },
+};
+
+export const environment = {
+  async get(): Promise<Environment> {
+    return (await call<Environment>("GET", "/admin/environment")).data;
+  },
+};
+
 export const operators = {};
 export const audit = {};
 export const settings = {};

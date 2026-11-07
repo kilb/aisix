@@ -4,6 +4,7 @@ import { EXPECTED_API_CONTRACT } from "./lib/contract";
 import { messageFor } from "./lib/errors";
 import { useTheme } from "./lib/useTheme";
 import { Gate } from "./Gate";
+import { Gateways } from "./tabs/Gateways";
 import { Overview } from "./tabs/Overview";
 
 const TABS = [
@@ -50,6 +51,8 @@ function Page({ tab, ...props }: TabProps & { tab: TabId }) {
   switch (tab) {
     case "overview":
       return <Overview {...props} />;
+    case "gateways":
+      return <Gateways {...props} />;
     default:
       return <NotBuilt label={TABS.find((t) => t.id === tab)?.label ?? tab} />;
   }
