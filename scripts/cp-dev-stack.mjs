@@ -1,15 +1,24 @@
 #!/usr/bin/env node
 // A throwaway control-plane stack for development and end-to-end tests: two
 // fresh Postgres databases, one kine process, the control plane with a first
-// admin operator, and optionally one AISIX gateway in managed mode booted from
-// a credential the control plane issues. Node built-ins only.
+// admin operator, optionally one AISIX gateway in managed mode booted from a
+// credential the control plane issues, and optionally an OpenAI-compatible
+// upstream stand-in for the gateway to call. Node built-ins only.
 //
 // Usage:
 //   node scripts/cp-dev-stack.mjs [--http-port N] [--dp-port N] [--kine-port N]
 //     [--etcd-prefix /aisix] [--gateway <aisix binary> [--gateway-name stack-gw]
-//     [--proxy-port N]] [--stale-secs 10]
+//     [--proxy-port N]] [--stale-secs 10] [--mock-upstream]
 //
 // Ports default to free ones picked on 127.0.0.1.
+//
+// --mock-upstream starts an HTTP server on a free port that answers
+// `POST /v1/chat/completions` with one fixed OpenAI chat completion and
+// `POST /v1/embeddings` with one fixed vector per input, and records every
+// request it gets as `{method, path, authorization, body}`: `GET /__requests`
+// returns the records, `DELETE /__requests` clears them. An upstream account
+// reaches it with `api_base` set to `<url>/v1`. It stands in for a provider,
+// never for the control plane.
 //
 // Environment:
 //   CP_E2E_PG_URL    required: a Postgres URL whose role may CREATE DATABASE.
@@ -23,7 +32,8 @@
 //
 // When everything is up it prints ONE line of JSON to stdout:
 //   {"ready": true, "httpUrl", "dpUrl", "envId", "kineEndpoint", "etcdPrefix",
-//    "operator": {"email", "password"}, "gateway"?: {"proxyUrl", "dpId", "name"}}
+//    "operator": {"email", "password"}, "gateway"?: {"proxyUrl", "dpId", "name"},
+//    "mockUpstream"?: {"url"}}
 // Everything else (its own progress and every child's output, line-prefixed)
 // goes to stderr.
 //
@@ -36,6 +46,7 @@
 import { spawn, spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { mkdtempSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { createServer as createHttpServer } from "node:http";
 import { createServer, connect } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -57,6 +68,7 @@ function fail(message) {
 
 // ── arguments ───────────────────────────────────────────────────────────────
 
+/** Flags that take a value. */
 const FLAGS = new Set([
   "--http-port",
   "--dp-port",
@@ -67,21 +79,28 @@ const FLAGS = new Set([
   "--proxy-port",
   "--stale-secs",
 ]);
+/** Flags that take none. */
+const SWITCHES = new Set(["--mock-upstream"]);
 
 function parseArgs(argv) {
   const out = {};
-  for (let i = 0; i < argv.length; i += 2) {
+  for (let i = 0; i < argv.length; i += 1) {
     const flag = argv[i];
+    if (SWITCHES.has(flag)) {
+      out[flag.slice(2)] = true;
+      continue;
+    }
     const value = argv[i + 1];
     if (!FLAGS.has(flag) || value === undefined) {
       process.stderr.write(
         "usage: node scripts/cp-dev-stack.mjs [--http-port N] [--dp-port N] [--kine-port N] " +
           "[--etcd-prefix /aisix] [--gateway <aisix binary>] [--gateway-name stack-gw] " +
-          "[--proxy-port N] [--stale-secs 10]\n",
+          "[--proxy-port N] [--stale-secs 10] [--mock-upstream]\n",
       );
       process.exit(2);
     }
     out[flag.slice(2)] = value;
+    i += 1;
   }
   return out;
 }
@@ -362,6 +381,103 @@ async function api(httpUrl, method, path, cookie, body) {
   return { res, body: text ? JSON.parse(text) : null };
 }
 
+// ── the upstream stand-in (--mock-upstream) ─────────────────────────────────
+
+function sendJson(res, status, body) {
+  res.writeHead(status, { "content-type": "application/json" });
+  res.end(JSON.stringify(body));
+}
+
+/** The one completion every chat request gets, naming the model it asked for. */
+function mockCompletion(body) {
+  return {
+    id: "chatcmpl-mock-upstream",
+    object: "chat.completion",
+    created: 1,
+    model: typeof body?.model === "string" ? body.model : "",
+    choices: [
+      {
+        index: 0,
+        message: { role: "assistant", content: "mock upstream reply" },
+        finish_reason: "stop",
+      },
+    ],
+    usage: { prompt_tokens: 5, completion_tokens: 3, total_tokens: 8 },
+  };
+}
+
+/** The same vector for every input of an embeddings request. */
+function mockEmbeddings(body) {
+  const inputs = Array.isArray(body?.input) ? body.input.length : 1;
+  return {
+    object: "list",
+    data: Array.from({ length: inputs }, (_, index) => ({
+      object: "embedding",
+      index,
+      embedding: [0.25, -0.5, 0.75],
+    })),
+    model: typeof body?.model === "string" ? body.model : "",
+    usage: { prompt_tokens: 3, total_tokens: 3 },
+  };
+}
+
+/**
+ * Starts the stand-in on a free port and resolves to its base URL. It lives
+ * in this process, so the stack's exit takes it down with everything else.
+ */
+function startMockUpstream() {
+  const requests = [];
+  const server = createHttpServer((req, res) => {
+    res.on("error", () => {});
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      const path = (req.url ?? "/").split("?")[0];
+      if (path === "/__requests") {
+        if (req.method === "GET") return sendJson(res, 200, requests);
+        if (req.method === "DELETE") {
+          requests.length = 0;
+          res.writeHead(204);
+          return res.end();
+        }
+        return sendJson(res, 405, { error: "GET or DELETE" });
+      }
+      const raw = Buffer.concat(chunks).toString("utf8");
+      let body = raw;
+      try {
+        body = raw ? JSON.parse(raw) : null;
+      } catch {
+        // Not JSON: recorded as the text it was.
+      }
+      requests.push({
+        method: req.method,
+        path,
+        authorization: req.headers.authorization ?? null,
+        body,
+      });
+      if (req.method === "POST" && path === "/v1/chat/completions") {
+        return sendJson(res, 200, mockCompletion(body));
+      }
+      if (req.method === "POST" && path === "/v1/embeddings") {
+        return sendJson(res, 200, mockEmbeddings(body));
+      }
+      sendJson(res, 404, {
+        error: {
+          message: `no route for ${req.method} ${path}`,
+          type: "invalid_request_error",
+          code: "not_found",
+        },
+      });
+    });
+  });
+  return new Promise((resolveUrl, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      resolveUrl(`http://127.0.0.1:${server.address().port}`);
+    });
+  });
+}
+
 // ── main ────────────────────────────────────────────────────────────────────
 
 async function main() {
@@ -486,6 +602,10 @@ async function main() {
       return instances.body.items.some((i) => i.dp_id === dpId);
     });
     out.gateway = { proxyUrl, dpId, name };
+  }
+
+  if (args["mock-upstream"]) {
+    out.mockUpstream = { url: await startMockUpstream() };
   }
 
   process.stdout.write(`${JSON.stringify(out)}\n`);

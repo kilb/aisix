@@ -711,7 +711,7 @@ jobs:
           echo "::group::tests/e2e"
           (cd tests/e2e && pnpm install --frozen-lockfile && pnpm exec tsc --noEmit)
           echo "::endgroup::"
-          for d in web web-portal; do
+          for d in web web-portal web-cp; do
             echo "::group::$d"
             (cd "$d" && npm ci --no-audit --no-fund && npx tsc --noEmit)
             echo "::endgroup::"
@@ -727,7 +727,7 @@ jobs:
     # other open PRs still report the old name and would all break the
     # moment the required contexts were renamed to the two leg names.
     name: e2e (vitest) + coverage
-    needs: [e2e, e2e-cp, mcp-conformance, playwright-e2e, playwright-real-prometheus, typecheck]
+    needs: [e2e, e2e-cp, mcp-conformance, playwright-e2e, playwright-real-prometheus, typecheck, playwright-cp-dashboard]
     # A skipped required check counts as satisfied, so this must still run
     # when the matrix fails — otherwise the gate would vanish exactly when
     # it matters.
@@ -777,6 +777,64 @@ jobs:
             echo "::error::typecheck result: ${{ needs.typecheck.result }}"
             exit 1
           fi
+      - name: assert the Dashboard Playwright suite passed
+        run: |
+          if [ "${{ needs.playwright-cp-dashboard.result }}" != "success" ]; then
+            echo "::error::dashboard playwright result: ${{ needs.playwright-cp-dashboard.result }}"
+            exit 1
+          fi
+
+  # The control plane's Dashboard (web-cp/) against the real stack:
+  # Postgres, kine, the control plane and a managed gateway, started per spec
+  # file by scripts/cp-dev-stack.mjs, with the built dist/ served through
+  # `vite preview`. The only stand-in is the upstream provider. It uploads
+  # no coverage artifact.
+  playwright-cp-dashboard:
+    name: e2e (playwright, control-plane dashboard)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    services:
+      # The same image and digest as rust-unit's control-plane database.
+      # Each stack creates and drops two databases of its own on it.
+      postgres:
+        image: postgres:18@sha256:bd5dfa494a5a259704365813dbfa5fa6b3e69be7348d43b547f540c730478583
+        env:
+          POSTGRES_PASSWORD: postgres
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports: ["5432:5432"]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      # The control plane's build.rs generates the etcd front from protos.
+      - uses: ./.github/actions/setup-protoc
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+      - name: fetch kine
+        run: |
+          scripts/fetch-kine.sh "$RUNNER_TEMP/kine"
+          echo "CP_E2E_KINE_BIN=$RUNNER_TEMP/kine" >> "$GITHUB_ENV"
+      - name: require psql
+        # cp-dev-stack.mjs creates and drops its databases with psql.
+        run: psql --version
+      - name: build the gateway and the control plane
+        # Each binary named: `--bin` filters every selected package.
+        run: cargo build -p aisix-server --bin aisix -p aisix-control-plane --bin aisix-control-plane
+      - name: dashboard UI e2e
+        working-directory: web-cp
+        env:
+          CP_E2E_PG_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
+          npm run build
+          npx playwright test
 
   # The Playwright suites had no automated gate: nothing in this workflow
   # touched `web/` or `web-portal/`, so the money contracts (what each

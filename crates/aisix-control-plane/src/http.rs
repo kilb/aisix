@@ -792,6 +792,38 @@ mod tests {
         );
     }
 
+    /// Each UI app declares the contract it was built against in its own
+    /// `src/lib/contract.ts`, a mirror of [`super::API_CONTRACT`], the value
+    /// `/admin/session` and `/api/session` serve. In one commit they must
+    /// agree: only then does a mismatch an app reports at run time mean a
+    /// deployment skew, not a forgotten edit on one side.
+    #[test]
+    fn ui_contracts_match() {
+        let apps = [(
+            "web-cp",
+            include_str!("../../../web-cp/src/lib/contract.ts"),
+        )];
+        for (app, ts) in apps {
+            let declared = ts
+                .lines()
+                .find_map(|l| {
+                    l.trim()
+                        .strip_prefix("export const EXPECTED_API_CONTRACT = ")
+                })
+                .and_then(|v| v.trim_end_matches(';').trim().parse::<u32>().ok())
+                .unwrap_or_else(|| {
+                    panic!("{app}/src/lib/contract.ts must export EXPECTED_API_CONTRACT")
+                });
+            assert_eq!(
+                declared,
+                super::API_CONTRACT,
+                "{app} expects API contract {declared}, the control plane serves {}: change both \
+                 sides together",
+                super::API_CONTRACT
+            );
+        }
+    }
+
     #[tokio::test]
     async fn each_listener_admits_only_its_own_rows() {
         use axum::routing::{get, post};

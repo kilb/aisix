@@ -1,0 +1,474 @@
+/* Copied from web/src/styles.css; comments translated. Additions for the
+   Dashboard are in the last section.
+
+   ════════════════════════════════════════════════════════════════
+   The ledger.
+
+   The product is bookkeeping at heart: metering by the token, pricing it,
+   closing against a ceiling. So the interface borrows the trade's own object:
+   a page of an account book.
+
+   Paper is the ground, but this is a console used every day, not something
+   to read. An earlier version confused the two: thin rules everywhere, no
+   shadows, no radii, inputs as a bare underline. Those are rules for reading
+   matter; on a tool they leave no hierarchy and no sign of what is clickable.
+
+   Four rules hold throughout:
+
+   1. Whatever can be operated has a surface. Sections are raised sheets,
+      controls are bounded objects; hierarchy comes from surface and shadow,
+      not only from lines. Lines are for rows within one surface.
+   2. Only two inks. Ledgers were kept in black for entries and red for
+      differences: here it is blue-black (headings, clickable, online) and
+      oxide red (over limit, balance, negative). No third colour means a
+      state.
+   3. Figures are tabular serif, right-aligned. Spend goes down to a
+      thousandth of a cent; columns that do not align hide the orders of
+      magnitude. Serif is for figures only; body text and controls are sans:
+      large serif across a page reads a console as a weekly report.
+   4. Latin conventions apply to Latin text only. Letter-spacing and small
+      caps are Latin grammar; on Chinese they only pull words apart.
+
+   Dark is not the paper inverted but another object: carbon paper. The
+   ground is a surface soaked in ink, rules recede to dark brown, and the two
+   inks are lifted until they read on the dark ground.
+   ════════════════════════════════════════════════════════════════ */
+
+:root{
+  color-scheme:light dark;
+
+  /* Paper: a warm white with a hint of yellow. Grey grounds look old, paper
+     grounds look used. */
+  --ground:#eeeae0;    /* the desk: a little darker than the sheet, so sheets lift */
+  --paper:#fdfbf6;     /* a sheet */
+  --paper-2:#f5f1e7;   /* alternate rows, insets */
+  --edge:#e7e1d2;
+
+  /* Ink: two of them, plus three greys. */
+  --ink:#1e1b15;
+  --ink-2:#4d463b;
+  --ink-3:#736a59;     /* column names, units, notes; kept above 4.5:1 */
+  --indigo:#26407c;    /* blue-black */
+  --oxide:#9e3521;     /* red */
+  --on-indigo:#fff;   /* text on --indigo; flips with the theme */
+  --indigo-wash:#e6ebf6;
+  --oxide-wash:#f7e7e1;
+
+  /* Rules in two weights: thin between rows, heavy between sections. */
+  --rule:#e4ddcb;
+  --rule-2:#bdb298;
+
+  --r:7px;
+  /* Two levels: sheets sit on the desk, floating menus sit higher. Warm
+     shadows, not grey: a grey shadow on warm paper looks dirty. */
+  --lift:0 1px 2px rgba(74,62,38,.07), 0 6px 16px -8px rgba(74,62,38,.16);
+  --float:0 2px 6px rgba(74,62,38,.09), 0 18px 40px -16px rgba(74,62,38,.30);
+
+  --fig:"Source Serif 4",Georgia,"Times New Roman",serif;
+  --body:system-ui,-apple-system,"PingFang SC","Hiragino Sans GB",
+         "Microsoft YaHei",sans-serif;
+  --mono:"IBM Plex Mono",ui-monospace,"SF Mono",Menlo,monospace;
+
+  /* Data series: five pens. A ledger with several accounts uses several pen
+     colours, at the saturation of document inks, not interface accents.
+     There is no red among them: red ink means over limit here, and a normal
+     traffic line drawn in it reads as an alarm. */
+  --s1:#26407c; --s2:#6b5230; --s3:#3a5560; --s4:#5c3550; --s5:#4a5d2f;
+
+  /* The page width. A page is a page; it does not fill the monitor. */
+  --leaf:1320px;
+}
+
+/* Carbon paper. */
+@media (prefers-color-scheme:dark){
+  :root:not([data-theme="light"]){
+    --ground:#100e0a;
+    --paper:#1a1712;
+    --paper-2:#221e17;
+    --edge:#2a251c;
+    --ink:#ece6d7;
+    --ink-2:#b5ad9a;
+    --ink-3:#918876;
+    --indigo:#93aae6;
+    --oxide:#e07d60;
+    --on-indigo:#12100b;
+    --indigo-wash:#1b2033;
+    --oxide-wash:#2c1d17;
+    --rule:#302b21;
+    --rule-2:#4c4434;
+    --lift:0 1px 2px rgba(0,0,0,.4), 0 6px 16px -8px rgba(0,0,0,.5);
+    --float:0 2px 6px rgba(0,0,0,.45), 0 18px 40px -16px rgba(0,0,0,.7);
+    --s1:#93aae6; --s2:#cba873; --s3:#87a9b7; --s4:#c79bbe; --s5:#a9bd7d;
+  }
+}
+:root[data-theme="dark"]{
+  --ground:#100e0a;
+  --paper:#1a1712;
+  --paper-2:#221e17;
+  --edge:#2a251c;
+  --ink:#ece6d7;
+  --ink-2:#b5ad9a;
+  --ink-3:#918876;
+  --indigo:#93aae6;
+  --oxide:#e07d60;
+  --on-indigo:#12100b;
+  --indigo-wash:#1b2033;
+  --oxide-wash:#2c1d17;
+  --rule:#302b21;
+  --rule-2:#4c4434;
+  --lift:0 1px 2px rgba(0,0,0,.4), 0 6px 16px -8px rgba(0,0,0,.5);
+  --float:0 2px 6px rgba(0,0,0,.45), 0 18px 40px -16px rgba(0,0,0,.7);
+  --s1:#93aae6; --s2:#cba873; --s3:#87a9b7; --s4:#c79bbe; --s5:#a9bd7d;
+}
+
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{
+  margin:0;
+  /* Paper fibre. A large flat fill reads as unfinished; real paper has a
+     texture. */
+  background:
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='120' height='120'%3E%3Cfilter id='f'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='4'/%3E%3C/filter%3E%3Crect width='120' height='120' filter='url(%23f)' opacity='.04'/%3E%3C/svg%3E"),
+    var(--ground);
+  background-attachment:fixed;
+  color:var(--ink);font-family:var(--body);font-size:14.5px;line-height:1.6;
+  /* Chinese may break between characters, but splitting a word such as
+     「客户端」 down the middle reads wrong. */
+  line-break:strict;
+  -webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale;
+}
+h1,h2,h3{margin:0;font-family:var(--fig);font-weight:600;text-wrap:balance}
+button,input,select,textarea{font:inherit;color:inherit}
+a{color:var(--indigo);text-underline-offset:2px}
+:focus-visible{outline:2px solid var(--indigo);outline-offset:1px}
+
+/* Tabular serif figures. Figures on a ledger page must align by place:
+   this is the foundation of the whole typography. */
+.fig,.num,.val,.now{
+  font-family:var(--fig);font-variant-numeric:tabular-nums lining-nums;
+}
+
+/* ── The book ────────────────────────────────────────────────
+   One column. The side bar became a row of tabs under the header, so the
+   body gets the whole page width: a ledger page needs column width, not a
+   strip down the left. */
+.frame{
+  width:min(var(--leaf),100%);margin:0 auto;
+  padding:clamp(20px,3.4vw,44px) clamp(16px,3vw,40px) 96px;
+  min-height:100vh;
+}
+
+.book-head{
+  display:flex;align-items:baseline;gap:16px;flex-wrap:wrap;
+  padding-bottom:14px;margin-bottom:clamp(14px,1.8vw,20px);
+  border-bottom:1px solid var(--rule-2);
+}
+.book-mark{display:flex;align-items:baseline;gap:14px;flex-wrap:wrap}
+.book-head h1{
+  font-size:clamp(19px,2.6vw,26px);font-weight:600;line-height:1.1;
+  font-variant:small-caps;letter-spacing:.03em;
+}
+.book-sub{
+  font-family:var(--mono);font-size:10.5px;color:var(--ink-3);
+}
+.book-foli{
+  margin-left:auto;display:flex;align-items:center;gap:10px;flex-wrap:wrap;
+}
+
+/* ── The floating menu ───────────────────────────────────────
+   A sheet that really floats: set off from the page edge, with its own
+   surface and shadow, staying put as the page scrolls. */
+.leafs{
+  display:grid;grid-template-columns:minmax(0,196px) minmax(0,1fr);
+  gap:clamp(18px,2.2vw,30px);
+  align-items:start;
+}
+nav.tabs{
+  position:sticky;top:clamp(14px,1.8vw,22px);
+  display:flex;flex-direction:column;gap:1px;
+  background:var(--paper);border:1px solid var(--rule);border-radius:var(--r);
+  box-shadow:var(--float);
+  padding:8px;
+  max-height:calc(100vh - 44px);overflow-y:auto;scrollbar-width:thin;
+}
+nav.tabs button{
+  background:none;border:0;cursor:pointer;text-align:left;
+  padding:8px 11px;border-radius:calc(var(--r) - 3px);
+  color:var(--ink-2);font-size:13.5px;
+  transition:background .12s ease,color .12s ease;
+}
+nav.tabs button:hover{background:var(--paper-2);color:var(--ink)}
+/* The selected tab: a solid wash and ink. In a tool, "I am on this page"
+   must show at a glance; a thin line is not enough. */
+nav.tabs button[aria-selected="true"]{
+  background:var(--indigo-wash);color:var(--indigo);font-weight:600;
+}
+
+@media (max-width:860px){
+  .leafs{grid-template-columns:minmax(0,1fr);gap:0}
+  nav.tabs{
+    position:static;flex-direction:row;overflow-x:auto;gap:2px;
+    margin-bottom:clamp(16px,2vw,24px);max-height:none;
+  }
+  nav.tabs button{flex:none;white-space:nowrap}
+}
+
+/* A small stamp on the ledger, not a glowing pill. */
+.pill{
+  display:inline-flex;align-items:center;gap:7px;
+  font-family:var(--mono);font-size:11px;padding:3px 9px;
+  border:1px solid var(--rule-2);color:var(--ink-3);
+}
+.pill.value{font-size:11.5px;color:var(--ink-2)}
+.pill.ok{color:var(--indigo);border-color:var(--indigo)}
+.pill.crit{color:var(--oxide);border-color:var(--oxide)}
+.pill .dot{width:5px;height:5px;background:currentColor;flex:none}
+
+/* ── A section of the page ───────────────────────────────────
+   This was a shadowed card. A ledger has no cards: a section is a small
+   heading, a rule, and what is under the rule. */
+.panel{
+  background:var(--paper);border:1px solid var(--rule);border-radius:var(--r);
+  box-shadow:var(--lift);
+  padding:clamp(16px,1.8vw,22px) clamp(16px,2vw,26px) clamp(14px,1.6vw,20px);
+  margin:0 0 clamp(14px,1.6vw,20px);
+}
+.panel > h2{
+  font-family:var(--body);
+  font-size:clamp(14px,1.5vw,16px);font-weight:600;letter-spacing:0;
+  padding-bottom:9px;border-bottom:1px solid var(--rule);
+  display:flex;align-items:baseline;gap:12px;flex-wrap:wrap;
+}
+.panel > h2 .pill{margin-left:auto}
+.hint{margin:7px 0 12px;color:var(--ink-3);font-size:13px;max-width:74ch}
+
+/* ── Entries ─────────────────────────────────────────────────
+   The overview's readings are not four cards but ledger entries: the item
+   on the left, the figure right-aligned on the rule, the note indented on a
+   line below the item. */
+.entries{display:grid;grid-template-columns:1fr auto}
+.entry{
+  display:grid;grid-template-columns:subgrid;grid-column:1 / -1;
+  align-items:baseline;column-gap:clamp(18px,3vw,44px);
+  padding:9px 0 8px;border-bottom:1px solid var(--rule);
+}
+.entry .lab{
+  font-size:14.5px;color:var(--ink);font-family:var(--body);
+  /* The generic .lab carries mono letter-spacing and capitals; this is a
+     Chinese item name, so all of it is reset, or 「本 日 上 限」 is pulled
+     apart (rule 4 above). */
+  letter-spacing:0;text-transform:none;font-weight:400;
+}
+.entry .foot{grid-column:1;font-size:12px;color:var(--ink-3);margin-top:3px}
+/* No rule under the last row: a line along the sheet's bottom edge reads as
+   unfinished. */
+.entries > .entry:last-child{border-bottom:0;padding-bottom:0}
+.entry .val{
+  grid-column:2;grid-row:1;text-align:right;
+  font-size:clamp(18px,1.9vw,21px);font-weight:600;line-height:1.15;
+  white-space:nowrap;
+}
+/* Leading zeros are muted, significant digits stay in ink. Spend goes to a
+   thousandth of a cent, and two decimals would show real spend as $0.00,
+   which on paper is no different from spending nothing. */
+.val .lead{color:var(--ink-3);font-weight:400}
+.val .sep{color:var(--ink-3);padding:0 .26em;font-weight:400}
+.val.absent{color:var(--ink-3);font-weight:400}
+
+/* ── The balance: this page's signature ──────────────────────
+   The ledger's own device. The ceiling is one entry, the spend another, a
+   double rule closes them, and the balance is in red ink: exactly the
+   question operators ask ("how far from the ceiling"), in bookkeeping terms.
+
+   With no ceiling there is nothing to close: say none is set rather than
+   invent a balance. A difference against a ceiling that does not exist is
+   worse than none. */
+.balance .entry:last-of-type{border-bottom:0}
+
+/* The overview's top half sits side by side: readings in one column, the
+   closing in the other. Three sheets stacked take two screens to read, and
+   these two are read together. */
+.deck{
+  display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));
+  gap:clamp(14px,1.6vw,20px);align-items:start;
+}
+.deck > .panel{margin:0}
+.balance-rule{
+  height:0;border-top:1px solid var(--ink);
+  box-shadow:0 3px 0 -1px var(--ink);   /* a double rule: the accountant's closing line */
+  margin:9px 0 0;
+}
+.balance-sum{
+  display:grid;grid-template-columns:1fr auto;
+  column-gap:clamp(18px,3vw,44px);align-items:baseline;
+  padding:12px 0 0;
+}
+.balance-sum .lab{
+  font-size:15.5px;font-weight:600;letter-spacing:0;
+  font-family:var(--body);color:var(--ink);text-transform:none;
+}
+.balance-sum .val{
+  text-align:right;font-size:clamp(24px,2.8vw,32px);font-weight:600;
+  line-height:1.05;color:var(--oxide);white-space:nowrap;
+}
+.balance-sum .val .lead{color:color-mix(in srgb,var(--oxide) 45%,var(--paper))}
+.balance-sum .foot{grid-column:1 / -1;margin-top:8px;font-size:12px;color:var(--ink-3)}
+.balance-note{padding:15px 0 0;font-size:13px;color:var(--ink-3)}
+
+/* ── Tables: what a ledger page is ───────────────────────────*/
+table{width:100%;border-collapse:collapse;font-size:13.5px}
+th{
+  text-align:left;font-family:var(--mono);font-size:11px;
+  color:var(--ink-3);font-weight:500;
+  padding:0 11px 8px;border-bottom:1px solid var(--rule-2);white-space:nowrap;
+}
+th:first-child,td:first-child{padding-left:0}
+th:last-child,td:last-child{padding-right:0}
+td{padding:11px;border-bottom:1px solid var(--rule);vertical-align:top}
+tbody tr:nth-child(even){background:color-mix(in srgb,var(--paper-2) 60%,transparent)}
+tbody tr:hover{background:var(--paper-2)}
+/* .num only sets figures; alignment is .right's job. Both used to share .r,
+   which is also the form row's flex container: on a <td> it took the cell
+   out of table layout and the right-hand columns collapsed into a stack. */
+.right{text-align:right}
+.scroll{overflow-x:auto;margin:0 -2px;padding:0 2px}
+
+/* ── Controls ────────────────────────────────────────────────
+   A ledger's blank is a line one writes on, which is where the underlined
+   input came from; the rule below replaced it with a bounded field. */
+.f{display:block;margin-bottom:15px}
+.f > span{
+  display:block;margin-bottom:5px;
+  font-family:var(--mono);font-size:11px;color:var(--ink-3);
+}
+/* Controls must look operable. An underline is handsome, but on a tool used
+   every day it reads as "typeset text", not "a field to fill". */
+input,select,textarea{
+  width:100%;background:var(--paper-2);color:var(--ink);
+  border:1px solid var(--rule-2);border-radius:calc(var(--r) - 2px);
+  padding:8px 10px;
+  transition:border-color .13s ease,box-shadow .13s ease,background .13s ease;
+}
+input:hover:not(:focus),select:hover:not(:focus){border-color:var(--ink-3)}
+input:focus,select:focus,textarea:focus{
+  outline:0;border-color:var(--indigo);background:var(--paper);
+  box-shadow:0 0 0 3px color-mix(in srgb,var(--indigo) 14%,transparent);
+}
+input::placeholder{color:var(--ink-3)}
+textarea{
+  font-family:var(--mono);font-size:12.5px;line-height:1.65;
+  padding:12px;min-height:340px;resize:vertical;
+}
+select{appearance:none;padding-right:26px;cursor:pointer}
+input[type=checkbox]{width:auto;border:0}
+
+button.act{
+  background:var(--indigo);color:var(--on-indigo);border:0;
+  border-radius:calc(var(--r) - 2px);
+  padding:9px 18px;cursor:pointer;font-size:13.5px;font-weight:600;
+  box-shadow:var(--lift);
+  transition:filter .13s ease,transform .09s ease;
+}
+button.act:hover:not(:disabled){filter:brightness(1.12)}
+button.act:active:not(:disabled){transform:translateY(1px)}
+button.act:disabled{opacity:.42;cursor:not-allowed}
+button.ghost{
+  background:var(--paper);border:1px solid var(--rule-2);color:var(--ink-2);
+  border-radius:calc(var(--r) - 2px);padding:7px 13px;cursor:pointer;
+  font-size:13px;
+  transition:border-color .13s ease,color .13s ease,background .13s ease;
+}
+button.ghost:hover:not(:disabled){
+  border-color:var(--ink-3);color:var(--ink);background:var(--paper-2);
+}
+button.ghost:disabled{opacity:.42;cursor:not-allowed}
+/* Actions in a table stay quiet: an outlined box on every row would be
+   louder than the row it deletes. They show on hover. */
+td button.ghost{border-color:transparent;color:var(--ink-3);padding:4px 8px}
+tr:hover td button.ghost{border-color:var(--rule-2);color:var(--oxide)}
+
+/* ── Notes ───────────────────────────────────────────────────
+   A note on a ledger is a passage in the margin, marked by a heavy ink
+   stroke, not a block of colour. */
+.note{
+  margin:13px 0;padding:10px 13px;font-size:13px;
+  background:var(--paper-2);border-radius:calc(var(--r) - 2px);
+  border-left:3px solid var(--rule-2);color:var(--ink-2);
+}
+.note.warn{border-left-color:var(--ink)}
+.note.crit{border-left-color:var(--oxide);color:var(--oxide);background:var(--oxide-wash)}
+.note strong{color:var(--ink)}
+
+/* ── Charts ──────────────────────────────────────────────────*/
+.chart{margin-top:4px}
+.chart svg{display:block;width:100%;height:auto}
+.grid-line{stroke:var(--rule);stroke-width:1}
+.zero-line{stroke:var(--rule-2);stroke-width:1}
+.axis{font-family:var(--mono);font-size:10px;fill:var(--ink-3)}
+.legend{
+  display:flex;flex-wrap:wrap;gap:6px 22px;margin-top:12px;
+  padding-top:11px;border-top:1px solid var(--rule);font-size:12px;
+}
+.legend .item{display:inline-flex;align-items:center;gap:7px}
+.legend .bar{width:15px;height:2px;flex:none}
+.legend .now{color:var(--ink-3)}
+
+/* ── Small parts ─────────────────────────────────────────────*/
+.grid{display:grid;gap:clamp(12px,1.6vw,20px)}
+.g2{grid-template-columns:repeat(auto-fit,minmax(240px,1fr))}
+.g3{grid-template-columns:repeat(auto-fit,minmax(190px,1fr))}
+.r{display:flex;gap:14px;flex-wrap:wrap;align-items:flex-end}
+.r > .f{flex:1 1 190px;margin-bottom:0}
+.swatch{
+  width:13px;height:13px;border:1px solid var(--rule-2);flex:none;
+  display:inline-block;vertical-align:-2px;
+}
+.q{font-family:var(--mono);letter-spacing:.08em}
+.lab{
+  font-family:var(--mono);font-size:11px;color:var(--ink-3);
+}
+.centered{min-height:100vh;display:grid;place-content:center;text-align:center;padding:40px}
+.boot{color:var(--ink-3);font-family:var(--mono);font-size:12px}
+
+/* ── The cover (login gate) ────────────────────────────────
+   All that someone signed out sees, so it is the book's cover: the title,
+   and a lock. */
+#gate{
+  min-height:100vh;display:grid;place-content:center;
+  width:min(620px,100%);margin:0 auto;padding:clamp(24px,6vw,56px);
+}
+.gate-plate{
+  display:flex;align-items:flex-start;gap:20px;
+  padding-bottom:14px;border-bottom:2px solid var(--ink);
+}
+.gate-mark{flex:1;min-width:0}
+.gate-plate h1{
+  font-size:clamp(24px,4vw,38px);font-weight:600;line-height:1.06;
+  font-variant:small-caps;letter-spacing:.03em;
+}
+.gate-sub{
+  display:block;margin-top:8px;
+  font-family:var(--mono);font-size:11px;color:var(--ink-3);
+}
+.gate-plate > button.ghost{flex:none}
+
+.gate-form{margin:22px 0 0}
+.gate-form .act{width:100%;margin-top:8px}
+
+@media (max-width:640px){
+  .frame{padding-left:14px;padding-right:14px}
+  .entry .val{font-size:21px}
+  .balance-sum .val{font-size:30px}
+  .book-foli{margin-left:0;width:100%}
+}
+
+@media (prefers-reduced-motion:reduce){
+  *,*::after,*::before{animation:none !important;transition:none !important}
+}
+
+/* ── Dashboard additions ─────────────────────────────────────*/
+
+/* A rollout badge: the stamp, and under it each gateway's refusal. */
+.rollout{display:inline-flex;flex-direction:column;gap:4px;align-items:flex-start}
+.rollout-errors{margin:0;padding:0 0 0 14px;font-size:12px;color:var(--oxide)}
+.rollout-errors code{font-family:var(--mono);font-size:11.5px}
