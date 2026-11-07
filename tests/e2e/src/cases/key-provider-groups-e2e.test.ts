@@ -60,13 +60,24 @@ const RESPONSE_BODY = {
   usage: { input_tokens: 3, output_tokens: 1, total_tokens: 4 },
 };
 
+const EMBEDDING_BODY = {
+  object: "list",
+  model: "gpt-4o-mini",
+  data: [{ object: "embedding", index: 0, embedding: [0.1, 0.2] }],
+  usage: { prompt_tokens: 1, total_tokens: 1 },
+};
+
 // One mock answers whichever API the gateway calls it on: `/v1/messages` is
 // translated to chat completions for an OpenAI-compatible upstream, and
 // `/v1/responses` goes to the upstream's own `/v1/responses`.
 const PATH_BODIES = {
   "/v1/chat/completions": CHAT_BODY,
   "/v1/responses": RESPONSE_BODY,
+  "/v1/embeddings": EMBEDDING_BODY,
 };
+
+/** A prompt the input guardrail on the ensemble below refuses. */
+const REFUSED_PROMPT = "groups-e2e-forbidden-phrase";
 
 const STREAM_EVENTS = [
   JSON.stringify({
@@ -85,7 +96,7 @@ const STREAM_EVENTS = [
   "[DONE]",
 ];
 
-type Endpoint = "chat" | "messages" | "responses";
+type Endpoint = "chat" | "messages" | "responses" | "embeddings" | "count_tokens";
 const ENDPOINTS: Endpoint[] = ["chat", "messages", "responses"];
 
 interface Answer {
@@ -105,6 +116,8 @@ describe("an API key routes only within its allowed provider groups", () => {
   // Streaming pair behind `groups-route-stream`.
   let mockAStream: OpenAiUpstream | undefined;
   let mockBStream: OpenAiUpstream | undefined;
+  // Behind `groups-cache-b`, out of the grouped key's groups and cached.
+  let mockCache: OpenAiUpstream | undefined;
 
   beforeAll(async () => {
     const etcd = new EtcdClient();
@@ -120,6 +133,7 @@ describe("an API key routes only within its allowed provider groups", () => {
     mockBUp = await startOpenAiUpstream({ pathBodies: PATH_BODIES });
     mockAStream = await startOpenAiUpstream({ streamEvents: STREAM_EVENTS });
     mockBStream = await startOpenAiUpstream({ streamEvents: STREAM_EVENTS });
+    mockCache = await startOpenAiUpstream({ pathBodies: PATH_BODIES });
 
     app = await spawnApp();
     const seed = new SeedClient(etcd, app.etcdPrefix);
@@ -150,6 +164,34 @@ describe("an API key routes only within its allowed provider groups", () => {
     await model("groups-model-b-up", "pk-beta-up", ["grp-beta"], mockBUp);
     await model("groups-model-a-stream", "pk-alpha-stream", ["grp-alpha"], mockAStream);
     await model("groups-model-b-stream", "pk-beta-stream", ["grp-beta"], mockBStream);
+    await model("groups-cache-b", "pk-beta-cache", ["grp-beta"], mockCache);
+    // Every caller shares this model's entries, so a cached answer is there
+    // for a grouped key to be offered.
+    await seed.createCachePolicy({
+      name: "groups-cache",
+      enabled: true,
+      backend: "memory",
+      ttl_seconds: 300,
+      applies_to: "model:groups-cache-b",
+      scope: "env",
+    });
+    // An ensemble of in-group members, behind an input guardrail of its own:
+    // a grouped key must not be able to tell it from a name nobody serves.
+    const council = await seed.createModel({
+      display_name: "groups-council",
+      ensemble: { panel: [{ model: "groups-model-a" }], judge: { model: "groups-model-a" } },
+    });
+    const guardrail = await seed.createGuardrail(
+      {
+        name: "groups-council-input",
+        enabled: true,
+        hook_point: "input",
+        kind: "keyword",
+        patterns: [{ kind: "literal", value: REFUSED_PROMPT }],
+      },
+      { attach: false },
+    );
+    await seed.attachGuardrailToModel(guardrail.id, council.id);
 
     // Round robin, so without the group constraint traffic splits across
     // both targets. The tags name the groups, so a header asking for
@@ -196,7 +238,7 @@ describe("an API key routes only within its allowed provider groups", () => {
   afterAll(async () => {
     await app?.exit();
     await Promise.all(
-      [mockA, mockB, mockADown, mockBUp, mockAStream, mockBStream].map((u) => u?.close()),
+      [mockA, mockB, mockADown, mockBUp, mockAStream, mockBStream, mockCache].map((u) => u?.close()),
     );
   });
 
@@ -205,25 +247,27 @@ describe("an API key routes only within its allowed provider groups", () => {
     key: string,
     model: string,
     headers: Record<string, string> = {},
+    text = "hi",
   ): Promise<Answer> {
-    const [path, body, auth] =
+    const bearer = { authorization: `Bearer ${key}` };
+    const [path, body, auth]: [string, Record<string, unknown>, Record<string, string>] =
       endpoint === "chat"
-        ? [
-            "/v1/chat/completions",
-            { model, messages: [{ role: "user", content: "hi" }] },
-            { authorization: `Bearer ${key}` },
-          ]
+        ? ["/v1/chat/completions", { model, messages: [{ role: "user", content: text }] }, bearer]
         : endpoint === "messages"
           ? [
               "/v1/messages",
-              { model, max_tokens: 5, messages: [{ role: "user", content: "hi" }] },
+              { model, max_tokens: 5, messages: [{ role: "user", content: text }] },
               { "x-api-key": key },
             ]
-          : [
-              "/v1/responses",
-              { model, input: "hi" },
-              { authorization: `Bearer ${key}` },
-            ];
+          : endpoint === "count_tokens"
+            ? [
+                "/v1/messages/count_tokens",
+                { model, messages: [{ role: "user", content: text }] },
+                { "x-api-key": key },
+              ]
+            : endpoint === "embeddings"
+              ? ["/v1/embeddings", { model, input: text }, bearer]
+              : ["/v1/responses", { model, input: text }, bearer];
     const res = await fetch(`${app!.proxyUrl}${path}`, {
       method: "POST",
       headers: { "content-type": "application/json", ...auth, ...headers },
@@ -320,6 +364,68 @@ describe("an API key routes only within its allowed provider groups", () => {
       const open = await send(endpoint, OPEN_PLAINTEXT, "groups-model-b");
       expect(open.status, open.text).toBe(200);
       expect(mockB!.receivedRequests.length - b0).toBe(1);
+    },
+  );
+
+  test.for(["embeddings", "count_tokens"] as Endpoint[])(
+    "%s: a model outside the key's groups is refused before any upstream",
+    async (endpoint, ctx) => {
+      if (!etcdReachable || !app) {
+        ctx.skip();
+        return;
+      }
+      const b0 = mockB!.receivedRequests.length;
+      const answer = await send(endpoint, GROUPED_PLAINTEXT, "groups-model-b");
+      expect(answer.status, answer.text).toBe(503);
+      expect(mockB!.receivedRequests.length - b0).toBe(0);
+      expectNoLeak(answer, endpoint);
+      // A key without groups is answered otherwise for the same model, so the
+      // 503 is the constraint at work: embeddings are served, and count_tokens
+      // is refused for a model whose upstream cannot count.
+      const open = await send(endpoint, OPEN_PLAINTEXT, "groups-model-b");
+      expect(open.status, open.text).toBe(endpoint === "embeddings" ? 200 : 400);
+    },
+  );
+
+  test.for(["messages", "responses", "embeddings"] as Endpoint[])(
+    "%s: a cached answer from a model outside the key's groups is not served to it",
+    async (endpoint, ctx) => {
+      if (!etcdReachable || !app) {
+        ctx.skip();
+        return;
+      }
+      const text = `cache-under-groups ${endpoint}`;
+      const c0 = mockCache!.receivedRequests.length;
+      const stored = await send(endpoint, OPEN_PLAINTEXT, "groups-cache-b", {}, text);
+      expect(stored.status, stored.text).toBe(200);
+      expect(mockCache!.receivedRequests.length - c0).toBe(1);
+      // The entry is there: the same request is answered without the upstream.
+      const again = await send(endpoint, OPEN_PLAINTEXT, "groups-cache-b", {}, text);
+      expect(again.status, again.text).toBe(200);
+      expect(mockCache!.receivedRequests.length - c0).toBe(1);
+
+      const grouped = await send(endpoint, GROUPED_PLAINTEXT, "groups-cache-b", {}, text);
+      expect(grouped.status, grouped.text).toBe(503);
+      expect(mockCache!.receivedRequests.length - c0).toBe(1);
+      expectNoLeak(grouped, endpoint);
+    },
+  );
+
+  test.for(["chat", "messages", "count_tokens", "responses", "embeddings"] as Endpoint[])(
+    "%s: a grouped key naming an ensemble is answered as for a name nobody serves",
+    async (endpoint, ctx) => {
+      if (!etcdReachable || !app) {
+        ctx.skip();
+        return;
+      }
+      const masked = async (model: string) => {
+        const answer = await send(endpoint, GROUPED_PLAINTEXT, model, {}, REFUSED_PROMPT);
+        return { status: answer.status, text: answer.text.split(model).join("<model>") };
+      };
+      const unknown = await masked("groups-nobody");
+      expect(unknown.status, unknown.text).toBe(404);
+      // Not the guardrail's refusal, which would say the ensemble is there.
+      expect(await masked("groups-council")).toEqual(unknown);
     },
   );
 
