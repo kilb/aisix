@@ -126,6 +126,32 @@ impl PlatformErrorClass {
     }
 }
 
+/// The `error.code` a failed Response carries for `class`: the code of a
+/// `response.failed` event's Response and of a buffered Response object with
+/// `status: "failed"`. That slot takes the Responses API's own vocabulary
+/// (openai-python 3.41.0 `types/responses/response_error.py:47-69`), and a
+/// client reads it to decide what to do with the turn. Codex
+/// (`codex-rs/codex-api/src/sse/responses_error.rs`, `parse_failed_response`)
+/// reads `context_length_exceeded` as a context overflow, `invalid_prompt`
+/// as a request that will fail the same way again, `rate_limit_exceeded` as a
+/// rate limit, and any other code as a stream error worth retrying. So the
+/// classes' own codes (`invalid_request`, `content_filter`, …) would have it
+/// resend a turn that cannot succeed. The flat `error` event and the HTTP
+/// envelopes keep [`PlatformErrorClass::code`].
+pub(crate) fn responses_failed_code(class: &PlatformErrorClass) -> &'static str {
+    match class {
+        PlatformErrorClass::RateLimited => "rate_limit_exceeded",
+        PlatformErrorClass::ContextLengthExceeded => "context_length_exceeded",
+        PlatformErrorClass::InvalidRequest { .. } | PlatformErrorClass::ContentFiltered => {
+            "invalid_prompt"
+        }
+        PlatformErrorClass::Authentication
+        | PlatformErrorClass::NotFound
+        | PlatformErrorClass::UpstreamUnavailable
+        | PlatformErrorClass::Internal => "server_error",
+    }
+}
+
 impl IntoResponse for PlatformErrorClass {
     fn into_response(self) -> Response {
         (self.status(), axum::Json(self.envelope())).into_response()
@@ -133,10 +159,17 @@ impl IntoResponse for PlatformErrorClass {
 }
 
 /// The fixed, neutral message of each class.
+///
+/// A context overflow's message opens with Anthropic's own words for it,
+/// because a client that compacts its conversation on an overflow reads it
+/// off the message, never the code: Claude Code (2.1.319) treats an error as
+/// a prompt too long when its lowercased message contains
+/// "prompt is too long", and only then compacts and retries. Any other
+/// wording leaves such a client failing every later turn.
 pub(crate) fn platform_message(class: &PlatformErrorClass) -> &'static str {
     match class {
         PlatformErrorClass::ContextLengthExceeded => {
-            "The request exceeds the model's context length."
+            "prompt is too long: the request exceeds the model's context length."
         }
         PlatformErrorClass::RateLimited => "Rate limit exceeded. Retry later.",
         PlatformErrorClass::InvalidRequest { .. } => "The request is invalid.",
@@ -165,10 +198,19 @@ pub(crate) fn classify(err: &ProxyError) -> PlatformErrorClass {
         // The target's own configuration: the platform's to fix, not the
         // caller's, like an upstream that refuses the platform's account.
         ProxyError::UnusableTarget(_) => PlatformErrorClass::UpstreamUnavailable,
-        // The model cannot serve this endpoint, whichever provider is behind it.
-        ProxyError::TargetRefused(_) => PlatformErrorClass::InvalidRequest { param: None },
-        // Read exactly as a response the upstream does not have.
-        ProxyError::ResponseNotFound => PlatformErrorClass::NotFound,
+        // The model cannot serve this endpoint, whichever provider is behind
+        // it: the caller's `model` is the field to change.
+        ProxyError::TargetRefused(_) => PlatformErrorClass::InvalidRequest {
+            param: Some("model".into()),
+        },
+        // Read exactly as the upstream's own answer for a `previous_response_id`
+        // it does not have: a 400 `invalid_request_error` with `param`
+        // `previous_response_id` and code `previous_response_not_found`
+        // (<https://developers.openai.com/api/docs/guides/websocket-mode>),
+        // which [`classify_upstream`] makes this same class.
+        ProxyError::ResponseNotFound => PlatformErrorClass::InvalidRequest {
+            param: Some("previous_response_id".into()),
+        },
         // The caller's own field, which the class names.
         ProxyError::StoredObjectReference(field) | ProxyError::ModelSelectorRefused(field) => {
             PlatformErrorClass::InvalidRequest {
@@ -194,14 +236,15 @@ pub(crate) fn classify_bridge(err: &BridgeError) -> PlatformErrorClass {
             status,
             message,
             parsed,
+            wire,
             ..
-        } => classify_upstream(Some(*status), parsed.as_deref(), message),
+        } => classify_upstream(Some(*status), parsed.as_deref(), message, *wire),
         BridgeError::UpstreamInBand {
             status,
             message,
             parsed,
-            ..
-        } => classify_upstream(*status, parsed.as_deref(), message),
+            wire,
+        } => classify_upstream(*status, parsed.as_deref(), message, *wire),
         // A request field this provider's bridge cannot translate: the text
         // names the provider, the refusal is still of the request.
         BridgeError::InvalidRequest(_) | BridgeError::RequestTooLarge { .. } => {
@@ -260,16 +303,20 @@ const CALLER_FAULT_TOKENS: &[&str] = &[
 
 /// What upstreams write for a prompt that does not fit the model's context
 /// window, lowercased: OpenAI and the OpenAI-compatible servers ("maximum
-/// context length"), Anthropic ("prompt is too long"), Gemini ("exceeds the
-/// maximum number of tokens"), Bedrock's publishers ("input is too long"),
-/// and the code itself where a server writes it into the text. The
-/// mainstream gateways read a context overflow off the same phrases.
+/// context length"), Anthropic ("prompt is too long", and "input length and
+/// `max_tokens` exceed context limit" when the prompt fits but leaves no
+/// room for the requested output), Gemini ("exceeds the maximum number of
+/// tokens"), Bedrock's publishers ("input is too long"), and the code itself
+/// where a server writes it into the text. The mainstream gateways read a
+/// context overflow off the same phrases, and Claude Code reads both of
+/// Anthropic's phrasings as one ("prompt_too_long").
 const CONTEXT_OVERFLOW_MARKERS: &[&str] = &[
     "context_length_exceeded",
     "maximum context length",
     "context window",
     "prompt is too long",
     "input is too long",
+    "exceed context limit",
     "exceeds the maximum number of tokens",
 ];
 
@@ -278,10 +325,28 @@ const CONTEXT_OVERFLOW_MARKERS: &[&str] = &[
 /// `rate_limit_error`.
 const RATE_LIMIT_TOKENS: &[&str] = &["rate_limit_exceeded", "rate_limit_error"];
 
+/// The field an Anthropic error names, which it writes at the head of its
+/// message rather than in a `param` of its own: `max_tokens: 64001 > 64000,
+/// which is the maximum allowed number of output tokens for this model`, or
+/// `messages.1.content.0.image.source.base64.media_type: Input should be …`
+/// (<https://docs.anthropic.com/en/api/errors>; Claude Code 2.1.319 matches
+/// these very texts). Only a head that starts with a lowercase letter, as
+/// every field of the Messages API does, and is followed by `": "`; the
+/// field-shape check in [`classify_upstream`] then applies to it as to any
+/// `param`.
+fn anthropic_field_path(view: &UpstreamErrorView) -> Option<String> {
+    let (head, _) = view.message.as_deref()?.split_once(": ")?;
+    head.as_bytes()
+        .first()
+        .is_some_and(u8::is_ascii_lowercase)
+        .then(|| head.to_string())
+}
+
 fn classify_upstream(
     status: Option<u16>,
     view: Option<&UpstreamErrorView>,
     message: &str,
+    wire: UpstreamWire,
 ) -> PlatformErrorClass {
     let names = |tokens: &[&str]| {
         view.is_some_and(|v| {
@@ -306,15 +371,19 @@ fn classify_upstream(
     // anything else is the upstream's own text. And only from a native
     // dispatch: after a translation it names a field of the request the
     // gateway built, in the upstream's protocol, which tells the caller what
-    // that protocol is.
+    // that protocol is. An Anthropic error names its field in its message.
     let param = || {
-        view.and_then(|v| v.param.clone())
-            .filter(|_| !crate::attribution::translated_dispatch())
-            .filter(|p| {
-                p.len() <= 256
-                    && p.bytes()
-                        .all(|b| b.is_ascii_alphanumeric() || b"_.[]".contains(&b))
-            })
+        view.and_then(|v| match (&v.param, wire) {
+            (Some(param), _) => Some(param.clone()),
+            (None, UpstreamWire::Anthropic) => anthropic_field_path(v),
+            (None, _) => None,
+        })
+        .filter(|_| !crate::attribution::translated_dispatch())
+        .filter(|p| {
+            p.len() <= 256
+                && p.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"_.[]".contains(&b))
+        })
     };
     match status {
         Some(429) => PlatformErrorClass::RateLimited,
@@ -485,7 +554,10 @@ pub(crate) fn relayed_responses_failure(frame: &[u8]) -> Option<Vec<u8>> {
         .map_or(PlatformErrorClass::UpstreamUnavailable, |e| {
             classify_bridge(&e)
         });
-    let error = serde_json::json!({ "code": class.code(), "message": platform_message(&class) });
+    let error = serde_json::json!({
+        "code": responses_failed_code(&class),
+        "message": platform_message(&class),
+    });
     let rewritten = match event {
         Some(mut failed)
             if failed.get("type").and_then(Value::as_str) == Some("response.failed")
@@ -549,8 +621,10 @@ pub(crate) fn relayed_failed_response(body: &mut Value) {
         .map_or(PlatformErrorClass::UpstreamUnavailable, |e| {
             classify_bridge(&e)
         });
-    body["error"] =
-        serde_json::json!({ "code": class.code(), "message": platform_message(&class) });
+    body["error"] = serde_json::json!({
+        "code": responses_failed_code(&class),
+        "message": platform_message(&class),
+    });
 }
 
 /// A whole Responses-API SSE body an output guardrail held back, which ends
@@ -664,6 +738,36 @@ mod tests {
         assert_eq!(classify(&e), PlatformErrorClass::ContextLengthExceeded);
     }
 
+    /// Anthropic's second phrasing of an overflow: the prompt fits, but not
+    /// with the output the request asked room for.
+    #[test]
+    fn an_overflow_that_leaves_no_room_for_max_tokens_is_a_context_overflow() {
+        let e = upstream_status(
+            400,
+            "input length and `max_tokens` exceed context limit: 190000 + 32000 > 200000, \
+             decrease input length or `max_tokens` and try again",
+        );
+        assert_eq!(classify(&e), PlatformErrorClass::ContextLengthExceeded);
+    }
+
+    /// A client that compacts on an overflow reads it off the message. Claude
+    /// Code (2.1.319) lowercases the message and looks for "prompt is too
+    /// long"; whatever envelope the class goes out in, it must find it.
+    #[tokio::test]
+    async fn a_context_overflow_reads_as_one_to_a_client_that_compacts() {
+        let overflow =
+            || upstream_status(400, "prompt is too long: 250000 tokens > 200000 maximum");
+        let openai = in_platform_mode(|| overflow().into_response());
+        let anthropic = in_platform_mode(|| overflow().into_anthropic_response());
+        for resp in [openai, anthropic] {
+            let message = body_json(resp).await["error"]["message"]
+                .as_str()
+                .unwrap()
+                .to_lowercase();
+            assert!(message.contains("prompt is too long"), "{message}");
+        }
+    }
+
     #[test]
     fn an_upstream_param_error_keeps_the_field_name() {
         let e = upstream_status_with_param(400, "Invalid value for 'temperature'", "temperature");
@@ -760,7 +864,7 @@ mod tests {
                 400,
                 "invalid_request_error",
                 "context_length_exceeded",
-                "The request exceeds the model's context length.",
+                "prompt is too long: the request exceeds the model's context length.",
             ),
             (
                 PlatformErrorClass::RateLimited,
@@ -1228,7 +1332,7 @@ mod tests {
         assert_eq!(body["error"]["code"], "context_length_exceeded");
         assert_eq!(
             body["error"]["message"],
-            "The request exceeds the model's context length."
+            "prompt is too long: the request exceeds the model's context length."
         );
 
         let resp = in_platform_mode(|| upstream_status(401, "x").into_anthropic_response());
@@ -1237,19 +1341,38 @@ mod tests {
     }
 
     /// A response id this tenant was never handed reads exactly like a
-    /// response the upstream does not have.
+    /// `previous_response_id` the upstream does not have, which the upstream
+    /// answers with a 400 naming the field.
     #[tokio::test]
-    async fn an_unknown_response_is_answered_as_an_upstream_not_found() {
+    async fn an_unknown_previous_response_is_answered_as_the_upstream_answers_one() {
         let unknown = in_platform_mode(|| ProxyError::ResponseNotFound.into_response());
         let upstream = in_platform_mode(|| {
-            upstream_status(404, "Response with id 'resp_1' not found.").into_response()
+            let message = "Previous response with id 'resp_1' not found.";
+            ProxyError::Bridge(BridgeError::UpstreamStatus {
+                status: 400,
+                message: message.into(),
+                parsed: Some(Box::new(UpstreamErrorView {
+                    kind: Some("invalid_request_error".into()),
+                    message: Some(message.into()),
+                    code: Some("previous_response_not_found".into()),
+                    param: Some("previous_response_id".into()),
+                })),
+                wire: UpstreamWire::OpenAI,
+                retry_after: None,
+                diagnostic: None,
+            })
+            .into_response()
         });
-        assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+        assert_eq!(unknown.status(), StatusCode::BAD_REQUEST);
         assert_eq!(unknown.status(), upstream.status());
         assert_eq!(unknown.headers(), upstream.headers());
         let bytes =
             |r: Response| async move { axum::body::to_bytes(r.into_body(), 65536).await.unwrap() };
-        assert_eq!(bytes(unknown).await, bytes(upstream).await);
+        let (unknown, upstream) = (bytes(unknown).await, bytes(upstream).await);
+        assert_eq!(unknown, upstream);
+        let body: Value = serde_json::from_slice(&unknown).unwrap();
+        assert_eq!(body["error"]["param"], "previous_response_id");
+        assert_eq!(body["error"]["type"], "invalid_request_error");
     }
 
     #[test]
@@ -1267,7 +1390,82 @@ mod tests {
         assert_eq!(refusal.status(), StatusCode::BAD_REQUEST);
         let on = render_platform(&refusal);
         assert_eq!(on["error"]["code"], "invalid_request");
+        // The field to change is the model the caller named.
+        assert_eq!(on["error"]["param"], "model");
         assert!(!on.to_string().contains("bedrock"), "{on}");
+    }
+
+    /// An Anthropic error names the field at the head of its message. A
+    /// native Messages caller keeps it as `param`; the rest of the text, and
+    /// a head that is no field, stay the upstream's.
+    #[test]
+    fn an_anthropic_error_keeps_the_field_its_message_names() {
+        let on_wire = |wire: UpstreamWire, message: &str| {
+            ProxyError::Bridge(BridgeError::UpstreamStatus {
+                status: 400,
+                message: message.into(),
+                parsed: Some(Box::new(UpstreamErrorView {
+                    kind: Some("invalid_request_error".into()),
+                    message: Some(message.into()),
+                    code: None,
+                    param: None,
+                })),
+                wire,
+                retry_after: None,
+                diagnostic: None,
+            })
+        };
+        let anthropic = |_status: u16, message: &str| on_wire(UpstreamWire::Anthropic, message);
+        for (message, field) in [
+            (
+                "messages.1.content.0.image.source.base64.media_type: Input should be \
+                 'image/jpeg', 'image/png', 'image/gif' or 'image/webp'",
+                Some("messages.1.content.0.image.source.base64.media_type"),
+            ),
+            (
+                "max_tokens: 64001 > 64000, which is the maximum allowed number of output \
+                 tokens for this model",
+                Some("max_tokens"),
+            ),
+            // No field heads these.
+            ("Bedrock: ValidationException in us-east-1", None),
+            ("the request was malformed: try again", None),
+            ("Your credit balance is too low", None),
+        ] {
+            assert_eq!(
+                classify(&anthropic(400, message)),
+                PlatformErrorClass::InvalidRequest {
+                    param: field.map(str::to_owned)
+                },
+                "{message}"
+            );
+        }
+        // Only from a native dispatch, as any `param`.
+        let translated = in_platform_mode(|| {
+            crate::attribution::note_translated_dispatch(true);
+            caller_class(&anthropic(400, "max_tokens: Field required"))
+        });
+        assert_eq!(
+            translated,
+            Some(PlatformErrorClass::InvalidRequest { param: None })
+        );
+        // Another wire's message is not read for a field.
+        for wire in [UpstreamWire::OpenAI, UpstreamWire::Bedrock] {
+            assert_eq!(
+                classify(&on_wire(wire, "max_tokens: Field required")),
+                PlatformErrorClass::InvalidRequest { param: None },
+                "{wire:?}"
+            );
+        }
+        // And the Anthropic envelope carries it.
+        let body: Value = serde_json::from_str(&in_platform_mode(|| {
+            crate::error::anthropic_platform_body(&classify(&anthropic(
+                400,
+                "max_tokens: Field required",
+            )))
+        }))
+        .unwrap();
+        assert_eq!(body["error"]["param"], "max_tokens");
     }
 
     #[test]
@@ -1358,7 +1556,7 @@ mod tests {
         in_platform_mode(|| relayed_failed_response(&mut on));
         assert_eq!(on["status"], "failed");
         assert_eq!(on["id"], "resp_1");
-        assert_eq!(on["error"]["code"], "upstream_unavailable");
+        assert_eq!(on["error"]["code"], "server_error");
         assert_eq!(
             on["error"]["message"],
             "The model is temporarily unavailable. Retry later."
@@ -1375,6 +1573,53 @@ mod tests {
         let before = completed.clone();
         in_platform_mode(|| relayed_failed_response(&mut completed));
         assert_eq!(completed, before);
+    }
+
+    /// A failed Response carries a code of the Responses API's own, in the
+    /// buffered object and in a relayed `response.failed` alike, while the
+    /// flat `error` event keeps the class's code.
+    #[test]
+    fn a_failed_response_carries_a_code_the_responses_api_defines() {
+        let table = [
+            (PlatformErrorClass::RateLimited, "rate_limit_exceeded"),
+            (
+                PlatformErrorClass::ContextLengthExceeded,
+                "context_length_exceeded",
+            ),
+            (
+                PlatformErrorClass::InvalidRequest { param: None },
+                "invalid_prompt",
+            ),
+            (PlatformErrorClass::ContentFiltered, "invalid_prompt"),
+            (PlatformErrorClass::Authentication, "server_error"),
+            (PlatformErrorClass::NotFound, "server_error"),
+            (PlatformErrorClass::UpstreamUnavailable, "server_error"),
+            (PlatformErrorClass::Internal, "server_error"),
+        ];
+        for (class, code) in table {
+            assert_eq!(responses_failed_code(&class), code, "{class:?}");
+        }
+
+        // An upstream's own `invalid_prompt`: a turn that fails the same way
+        // however often it is sent.
+        let mut buffered = serde_json::json!({
+            "object": "response",
+            "status": "failed",
+            "error": {"code": "invalid_prompt", "message": "flagged by the Bedrock stack"},
+        });
+        in_platform_mode(|| relayed_failed_response(&mut buffered));
+        assert_eq!(buffered["error"]["code"], "invalid_prompt");
+        assert_eq!(buffered["error"]["message"], "The request is invalid.");
+
+        let failed = b"event: response.failed\ndata: {\"type\":\"response.failed\",\"sequence_number\":3,\"response\":{\"id\":\"resp_1\",\"status\":\"failed\",\"error\":{\"code\":\"invalid_prompt\",\"message\":\"flagged by the Bedrock stack\"}}}\n\n";
+        let out = in_platform_mode(|| relayed_responses_failure(failed)).unwrap();
+        let (v, _) = crate::redact::parse_sse_json_event(&out);
+        assert_eq!(v.unwrap()["response"]["error"]["code"], "invalid_prompt");
+
+        let flat = b"event: error\ndata: {\"type\":\"error\",\"code\":\"invalid_prompt\",\"message\":\"flagged\",\"param\":null,\"sequence_number\":3}\n\n";
+        let out = in_platform_mode(|| relayed_responses_failure(flat)).unwrap();
+        let (v, _) = crate::redact::parse_sse_json_event(&out);
+        assert_eq!(v.unwrap()["code"], "invalid_request");
     }
 
     #[test]

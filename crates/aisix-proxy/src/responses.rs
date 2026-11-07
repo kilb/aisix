@@ -862,9 +862,11 @@ async fn dispatch(
     crate::dispatch::check_ip_access(&model_entry.value, &client.source_ip)?;
 
     // Platform mode: nothing the request names may be an object stored
-    // upstream for another tenant.
-    crate::stored_refs::refuse_in_responses(state.platform(), body)
-        .map_err(|err| affinity.at_caller_position(err))?;
+    // upstream for another tenant. A container it was handed is its own.
+    crate::opaque_id::with_own_containers(state.platform(), auth, body, |body| {
+        crate::stored_refs::refuse_in_responses(state.platform(), body)
+    })
+    .map_err(|err| affinity.at_caller_position(err))?;
     affinity.refuse_unopened_item_reference()?;
 
     // Platform mode: a continuation names a response this tenant was handed,
@@ -3650,7 +3652,7 @@ fn responses_stream_error_body(
             !delivered.is_empty(),
             false,
             class.code(),
-            class.code(),
+            crate::platform_errors::responses_failed_code(&class),
             crate::platform_errors::platform_message(&class),
         ),
         None => crate::responses_bridge::failure_frames(
@@ -10835,14 +10837,25 @@ data: [DONE]\n\n";
         (status, to_bytes(resp.into_body(), 65536).await.unwrap())
     }
 
-    /// What platform mode answers when an upstream says the response does
-    /// not exist.
+    /// What platform mode answers when an upstream says it does not have
+    /// the previous response: a 400 naming `previous_response_id`
+    /// (<https://developers.openai.com/api/docs/guides/websocket-mode>).
     async fn platform_not_found() -> (StatusCode, bytes::Bytes) {
         let resp = crate::error::tests::in_platform_mode(|| {
-            ProxyError::Bridge(aisix_gateway::BridgeError::upstream_status(
-                404,
-                "Response with id 'resp_x' not found.",
-            ))
+            let message = "Previous response with id 'resp_x' not found.";
+            ProxyError::Bridge(aisix_gateway::BridgeError::UpstreamStatus {
+                status: 400,
+                message: message.into(),
+                parsed: Some(Box::new(aisix_gateway::UpstreamErrorView {
+                    kind: Some("invalid_request_error".into()),
+                    message: Some(message.into()),
+                    code: Some("previous_response_not_found".into()),
+                    param: Some("previous_response_id".into()),
+                })),
+                wire: aisix_gateway::UpstreamWire::OpenAI,
+                retry_after: None,
+                diagnostic: None,
+            })
             .into_response()
         });
         status_and_body(resp).await
@@ -10941,7 +10954,7 @@ data: [DONE]\n\n";
             .await;
         let app = build_platform_app(two_tenants(&upstream.uri()));
         let not_found = platform_not_found().await;
-        assert_eq!(not_found.0, StatusCode::NOT_FOUND);
+        assert_eq!(not_found.0, StatusCode::BAD_REQUEST);
 
         let tenant_a_id = crate::responses_affinity::seal_response_id(
             &response_key(),

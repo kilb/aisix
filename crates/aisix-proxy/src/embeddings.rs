@@ -539,6 +539,10 @@ async fn dispatch(
     // Client-IP allowlist gate (#557): reject before guardrails / upstream.
     crate::dispatch::check_ip_access(&model_entry.value, &client_ctx.source_ip)?;
 
+    // Platform mode: the request cannot choose a model other than the one
+    // the key's model access admitted.
+    crate::stored_refs::refuse_in_embeddings(state.platform(), &body.extra)?;
+
     // A Model Group has no provider of its own — the group walk below
     // resolves one per target. Only the shapes this endpoint cannot serve
     // at all are refused up front.

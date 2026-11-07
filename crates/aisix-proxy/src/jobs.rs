@@ -463,6 +463,13 @@ pub(crate) fn resolve_target(
             if !auth.key().can_access(snapshot, name) {
                 return Err(ProxyError::ModelForbidden(name.to_string()));
             }
+            // A grouped key is answered as if no ensemble existed, as on
+            // every other endpoint, ahead of the refusal below that names it.
+            crate::model_resolve::refuse_ensemble_to_grouped_key(
+                name,
+                &entry.value,
+                &auth.key().allowed_provider_groups,
+            )?;
             let m = &entry.value;
             if m.is_routing() || m.is_ensemble() || m.is_semantic() {
                 return Err(ProxyError::InvalidRequest(format!(

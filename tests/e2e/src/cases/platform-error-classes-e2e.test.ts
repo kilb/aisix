@@ -77,9 +77,11 @@ type Scenario =
   // An upstream that stops answering: before its answer, or mid-stream.
   | "stall"
   // A stream that carries nothing at all.
-  | "empty";
+  | "empty"
+  // A refusal of one field of the request.
+  | "field";
 const MATRIX: Scenario[] = ["unauthorized", "rate_limited", "context", "midstream"];
-const ALL_SCENARIOS: Scenario[] = [...MATRIX, "truncated", "failed_object", "caller_fault", "stall", "empty"];
+const ALL_SCENARIOS: Scenario[] = [...MATRIX, "truncated", "failed_object", "caller_fault", "stall", "empty", "field"];
 /** How long the mock stalls: far past the models' own timeouts below. */
 const STALL_MS = 3_000;
 
@@ -102,6 +104,9 @@ function upstreamText(scenario: Scenario, tag: string, wire: "openai" | "anthrop
       return `Bedrock ThrottlingException from Anthropic in us-east-1 [${tag}]`;
     case "caller_fault":
       return `Invalid prompt: flagged by the Bedrock safety stack in us-east-1 [${tag}]`;
+    case "field":
+      // Anthropic names the field at the head of its message.
+      return `max_tokens: 64001 > 64000, which is the maximum allowed number of output tokens for Anthropic on Bedrock us-east-1 [${tag}]`;
   }
 }
 
@@ -218,6 +223,8 @@ function answerOpenAi(path: string, tag: string, scenario: Scenario, res: Server
       return fail(429, { type: "requests", code: "rate_limit_exceeded" }, { "retry-after": "7" });
     case "context":
       return fail(400, { type: "invalid_request_error", param: "messages", code: "context_length_exceeded" });
+    case "field":
+      return fail(400, { type: "invalid_request_error", param: "max_tokens", code: null });
     case "failed_object":
     case "caller_fault":
       res.writeHead(200, { "content-type": "application/json", ...CHANNEL_HEADERS });
@@ -295,6 +302,7 @@ function answerAnthropic(tag: string, scenario: Scenario, res: ServerResponse): 
     case "rate_limited":
       return fail(429, "rate_limit_error", { "retry-after": "7" });
     case "context":
+    case "field":
       return fail(400, "invalid_request_error");
     // The connection ends after some text: no `message_stop`, no error.
     case "truncated":
@@ -439,7 +447,7 @@ const CONTEXT: Expected = {
   code: "context_length_exceeded",
   openaiType: "invalid_request_error",
   anthropicType: "invalid_request_error",
-  message: "The request exceeds the model's context length.",
+  message: "prompt is too long: the request exceeds the model's context length.",
 };
 const INVALID: Expected = {
   status: 400,
@@ -578,6 +586,7 @@ describe("platform mode: upstream failures reach the caller as the gateway's own
     await model(CHAT, "stall", undefined, { timeout: 500, retries: 0 });
     await model(RESPONSES_NATIVE, "caller_fault");
     await model(RESPONSES_BRIDGED, "empty");
+    await model(MESSAGES_NATIVE, "field");
     // A block-capable output guardrail holds the whole stream back before
     // releasing it, which is a path of its own.
     const held = await seed.createGuardrail(
@@ -647,7 +656,8 @@ describe("platform mode: upstream failures reach the caller as the gateway's own
     const body = JSON.parse(answer.text) as { object?: string; status?: string; error?: Record<string, unknown> };
     expect(body.object, answer.text).toBe("response");
     expect(body.status).toBe("failed");
-    expect(body.error?.code).toBe(UNAVAILABLE.code);
+    // A failed Response's code is one the Responses API defines for it.
+    expect(body.error?.code).toBe("server_error");
     expect(body.error?.message).toBe(UNAVAILABLE.message);
     expectNoLeak(answer);
   });
@@ -657,9 +667,17 @@ describe("platform mode: upstream failures reach the caller as the gateway's own
     const answer = await call(RESPONSES_NATIVE, "caller_fault", false);
     const body = JSON.parse(answer.text) as { status?: string; error?: Record<string, unknown> };
     expect(body.status, answer.text).toBe("failed");
-    expect(body.error?.code).toBe(INVALID.code);
+    // The Responses API's code for a turn that fails the same way again.
+    expect(body.error?.code).toBe("invalid_prompt");
     expect(body.error?.message).toBe(INVALID.message);
     expectNoLeak(answer);
+  });
+
+  test("messages-native: an upstream refusal of one field keeps the field it names", async (ctx) => {
+    if (!etcdReachable || !app) return ctx.skip();
+    const answer = await call(MESSAGES_NATIVE, "field", false);
+    expectClass(MESSAGES_NATIVE, answer, INVALID);
+    expect(JSON.parse(answer.text).error.param).toBe("max_tokens");
   });
 
   test("messages-native: a stream the upstream cuts off ends with the class", async (ctx) => {
@@ -702,7 +720,10 @@ describe("platform mode: upstream failures reach the caller as the gateway's own
 
   test("count_tokens: a model whose upstream cannot count is an invalid request that names no provider", async (ctx) => {
     if (!etcdReachable || !app) return ctx.skip();
-    expectClass(COUNT_OPENAI, await call(COUNT_OPENAI, "unauthorized", false), INVALID);
+    const answer = await call(COUNT_OPENAI, "unauthorized", false);
+    expectClass(COUNT_OPENAI, answer, INVALID);
+    // The field the caller can change is the model it named.
+    expect(JSON.parse(answer.text).error.param).toBe("model");
   });
 
   test("embeddings: an upstream 429 is a rate limit that keeps the upstream's Retry-After", async (ctx) => {
