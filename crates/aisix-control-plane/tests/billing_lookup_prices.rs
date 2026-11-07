@@ -299,14 +299,18 @@ async fn a_tiered_card_shows_its_default_base_rates() {
     grant(&cp, &admin, tenant, &[model]).await;
     let card = json!({
         "default": {
-            "base": {"input": "2", "output": "8", "cache_read": "0.2"},
+            "base": {"input": "2", "output": "8", "cache_read": "0.2",
+                     "cache_write": "2.5", "cache_write_1h": "4"},
             "long_context": [{"above_input_tokens": 200000,
-                              "rates": {"input": "4", "output": "12", "cache_read": "0.4"}}],
+                              "rates": {"input": "4", "output": "12", "cache_read": "0.4",
+                                        "cache_write": "5", "cache_write_1h": "8"}}],
         },
         "priority": {
-            "base": {"input": "5", "output": "20", "cache_read": "0.5"},
+            "base": {"input": "5", "output": "20", "cache_read": "0.5",
+                     "cache_write": "6", "cache_write_1h": "9"},
             "long_context": [{"above_input_tokens": 200000,
-                              "rates": {"input": "6", "output": "24", "cache_read": "0.6"}}],
+                              "rates": {"input": "6", "output": "24", "cache_read": "0.6",
+                                        "cache_write": "7", "cache_write_1h": "10"}}],
         },
     });
     sell(&cp, &admin, model, None, db_now(&cp).await, card).await;
@@ -314,6 +318,8 @@ async fn a_tiered_card_shows_its_default_base_rates() {
     assert_eq!(m["input"], "0.000002", "{m}");
     assert_eq!(m["output"], "0.000008", "{m}");
     assert_eq!(m["input_cache_read"], "0.0000002", "{m}");
+    assert_eq!(m["input_cache_write"], "0.0000025", "{m}");
+    assert_eq!(m["input_cache_write_1h"], "0.000004", "{m}");
 }
 
 #[tokio::test]
@@ -357,4 +363,89 @@ async fn the_prices_lookup_is_served_only_on_the_gateway_listener() {
     let (_, key) = tenant_with_key(&cp, &admin).await;
     let r = get(&cp, &admin, &format!("/dp/v1/keys/{key}/prices")).await;
     assert_eq!(r.status, 404, "{r:?}");
+}
+
+/// Raw-inserts an override of `model` for `tenant` at engine version
+/// `engine_version`, which the write path would refuse when it is newer.
+async fn raw_override(
+    cp: &TestCp,
+    model: Uuid,
+    tenant: Uuid,
+    engine_version: i64,
+    card: Option<Value>,
+) {
+    sqlx::query(
+        "INSERT INTO pricing_sell_revisions \
+         (engine_version, model_id, tenant_id, effective_from, card, source) \
+         VALUES ($1, $2, $3, now(), $4, 'test')",
+    )
+    .bind(engine_version)
+    .bind(model)
+    .bind(tenant)
+    .bind(card)
+    .execute(cp.db().pool())
+    .await
+    .expect("insert the override");
+}
+
+#[tokio::test]
+async fn an_ended_override_gives_way_to_the_discounted_platform_price() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let admin = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let dp = cp.issue_dp_client("gw-prices-f").await;
+    let model = seed_model(&cp, &admin, &format!("pr-{}", Uuid::new_v4().simple())).await;
+    let (tenant, key) = tenant_with_key(&cp, &admin).await;
+    grant(&cp, &admin, tenant, &[model]).await;
+    let now = db_now(&cp).await;
+    sell(&cp, &admin, model, None, now, full_card()).await;
+    discount(&cp, &admin, tenant, now, 2000).await;
+    sell(&cp, &admin, model, Some(tenant), now, card("3")).await;
+    assert_eq!(entry(&prices(&dp, key).await, model)["input"], "0.000003");
+    // A later revision ends the override.
+    raw_override(&cp, model, tenant, 1, None).await;
+    let m = entry(&prices(&dp, key).await, model);
+    assert_eq!(m["input"], "0.0000048", "{m}");
+}
+
+#[tokio::test]
+async fn an_unreadable_revision_in_force_leaves_the_model_unpriced() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let admin = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let dp = cp.issue_dp_client("gw-prices-g").await;
+    let tag = Uuid::new_v4().simple();
+    let a = seed_model(&cp, &admin, &format!("pr-a-{tag}")).await;
+    let b = seed_model(&cp, &admin, &format!("pr-b-{tag}")).await;
+    let (tenant, key) = tenant_with_key(&cp, &admin).await;
+    grant(&cp, &admin, tenant, &[a, b]).await;
+    let now = db_now(&cp).await;
+    sell(&cp, &admin, a, None, now, full_card()).await;
+    sell(&cp, &admin, b, None, now, full_card()).await;
+    let r = prices(&dp, key).await;
+    assert!(!entry(&r, a).is_null() && !entry(&r, b).is_null(), "{r:?}");
+
+    // An override a newer engine wrote: the engine prices nothing from it
+    // and does not fall back to the platform card.
+    raw_override(&cp, a, tenant, 999, Some(card("1"))).await;
+    let r = prices(&dp, key).await;
+    assert!(entry(&r, a).is_null(), "{r:?}");
+    assert!(!entry(&r, b).is_null(), "{r:?}");
+
+    // A discount a newer engine wrote leaves platform-priced models
+    // unpriced, and an override (never discounted) stays priced.
+    sqlx::query(
+        "INSERT INTO pricing_discount_revisions (engine_version, tenant_id, effective_from, \
+         discount_bps) VALUES (999, $1, now(), 1000)",
+    )
+    .bind(tenant)
+    .execute(cp.db().pool())
+    .await
+    .expect("insert the discount");
+    let r = prices(&dp, key).await;
+    assert!(entry(&r, b).is_null(), "{r:?}");
+    sell(&cp, &admin, b, Some(tenant), db_now(&cp).await, card("3")).await;
+    assert_eq!(entry(&prices(&dp, key).await, b)["input"], "0.000003");
 }

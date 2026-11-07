@@ -71,18 +71,43 @@ pub struct TenantPrices {
     pub models: Vec<ModelPrice>,
 }
 
-/// The `default` tier's base rates of `revision`, at `kept_bps`. `None` when
-/// the revision ends an override, is of a newer engine than this one, or
-/// holds no usable `default` tier.
-fn model_price(revision: &SellRevision, kept_bps: u32) -> Option<ModelPrice> {
-    if revision.engine_version > i64::from(ENGINE_VERSION) {
-        return None;
+/// A stored `engine_version` as the price book reads it: one no `u32` holds
+/// reads as the newest.
+fn engine_version(stored: i64) -> u32 {
+    u32::try_from(stored).unwrap_or(u32::MAX)
+}
+
+/// What one sell revision in force says, as the price book reads it.
+enum Sold {
+    /// A usable card.
+    Card(RateCard),
+    /// An override that ended: the platform price applies.
+    Ended,
+    /// Unreadable (a newer engine, or a card that does not decode): the
+    /// engine prices nothing from it and never gives way to another price.
+    Invalid,
+}
+
+fn read_sell(revision: &SellRevision) -> Sold {
+    if engine_version(revision.engine_version) > ENGINE_VERSION {
+        return Sold::Invalid;
     }
-    let card: RateCard = serde_json::from_value(revision.card.clone()?).ok()?;
+    match &revision.card {
+        None if revision.tenant_id.is_some() => Sold::Ended,
+        None => Sold::Invalid,
+        Some(card) => match serde_json::from_value(card.clone()) {
+            Ok(card) => Sold::Card(card),
+            Err(_) => Sold::Invalid,
+        },
+    }
+}
+
+/// The `default` tier's base rates of `card` at `kept_bps`.
+fn model_price(model_id: Uuid, card: &RateCard, kept_bps: u32) -> Option<ModelPrice> {
     let base = &card.0.get(&ServiceTier::default_tier())?.base;
     let show = |r: Rate| per_token_usd(r, kept_bps);
     Some(ModelPrice {
-        model_id: revision.model_id,
+        model_id,
         input: show(base.input),
         output: show(base.output),
         input_cache_read: base.cache_read.map(show),
@@ -106,6 +131,12 @@ pub async fn tenant_prices(
     let Some((tenant_id, granted)) = tenant else {
         return Ok(None);
     };
+    // Read first. Price writes bump it in their own transaction, and this
+    // transaction does not see one snapshot, so a write racing these reads
+    // can only leave the version older than the prices, never newer: a
+    // gateway that keys its cache on it then refetches, and never keeps
+    // stale prices under a fresh version.
+    let pricing_version = pricing_version(&mut *conn).await?.unwrap_or(0);
     // Granted models that still exist.
     let granted: Vec<Uuid> = sqlx::query_scalar(
         "SELECT id FROM gw_resources WHERE kind = $1 AND NOT deleted AND id = ANY($2) ORDER BY id",
@@ -115,9 +146,16 @@ pub async fn tenant_prices(
     .fetch_all(&mut *conn)
     .await?;
 
-    let kept_bps = match current_discount(&mut *conn, tenant_id).await? {
-        Some(d) => 10_000u32.saturating_sub(u32::try_from(d.discount_bps).unwrap_or(10_000)),
-        None => 10_000,
+    // The discount in force, as the engine reads it: `None` when the
+    // tenant has none, `Err` when it is unreadable, which leaves every
+    // platform-priced model unpriced. An override is never discounted.
+    let discount: Result<u32, ()> = match current_discount(&mut *conn, tenant_id).await? {
+        None => Ok(10_000),
+        Some(d) if engine_version(d.engine_version) > ENGINE_VERSION => Err(()),
+        Some(d) => u32::try_from(d.discount_bps)
+            .ok()
+            .and_then(|bps| 10_000u32.checked_sub(bps))
+            .ok_or(()),
     };
     let overrides: HashMap<Uuid, SellRevision> =
         current_revisions(&mut *conn, &granted, Some(tenant_id))
@@ -133,12 +171,18 @@ pub async fn tenant_prices(
     let models = granted
         .iter()
         .filter_map(|id| {
-            // An override with a usable card wins, undiscounted; one that
-            // ended it (no card) leaves the platform price.
-            overrides
-                .get(id)
-                .and_then(|r| model_price(r, 10_000))
-                .or_else(|| platform.get(id).and_then(|r| model_price(r, kept_bps)))
+            // The tenant's override in force wins, undiscounted; one that
+            // ended gives way to the platform card less the discount; an
+            // unreadable revision, either one, leaves the model unpriced.
+            match overrides.get(id).map(read_sell) {
+                Some(Sold::Card(card)) => return model_price(*id, &card, 10_000),
+                Some(Sold::Invalid) => return None,
+                Some(Sold::Ended) | None => {}
+            }
+            match read_sell(platform.get(id)?) {
+                Sold::Card(card) => model_price(*id, &card, discount.ok()?),
+                Sold::Ended | Sold::Invalid => None,
+            }
         })
         .collect();
 
@@ -159,7 +203,7 @@ pub async fn tenant_prices(
 
     Ok(Some(TenantPrices {
         tenant_id,
-        pricing_version: pricing_version(conn).await?.unwrap_or(0),
+        pricing_version,
         valid_until,
         models,
     }))
@@ -172,7 +216,8 @@ pub async fn prices(
     Path(key_id): Path<String>,
 ) -> Result<Json<TenantPrices>, ApiError> {
     let key_id = Uuid::parse_str(&key_id).map_err(|_| ApiError::not_found())?;
-    // One transaction, so every query shares one `now()`.
+    // One transaction, so every query shares one `now()` (not one data
+    // snapshot: see the order of the reads in `tenant_prices`).
     let found = state
         .db
         .tx(move |conn| async move { tenant_prices(conn, key_id).await }.boxed())
