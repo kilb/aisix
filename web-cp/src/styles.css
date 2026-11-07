@@ -504,3 +504,10 @@ tr:hover td button.ghost{border-color:var(--rule-2);color:var(--oxide)}
 .tag-add{display:flex;gap:8px;max-width:420px}
 .secret{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
 .secret-undo{margin-top:8px}
+
+/* Models: a routing model's targets, each with the groups it can serve. */
+.targets{list-style:none;margin:0;padding:0}
+.targets li + li{margin-top:4px}
+.sub{color:var(--ink-3);font-size:12px}
+.target{border-top:1px solid var(--rule);padding:14px 0 2px}
+.target .sub{margin:8px 0 0}
