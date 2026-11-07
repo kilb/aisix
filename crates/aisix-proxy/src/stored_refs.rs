@@ -59,6 +59,11 @@
 //!       (<https://developers.openai.com/api/docs/guides/tools-code-interpreter>);
 //!     - a `container_reference` environment of a shell call
 //!       (`response_input_item_param.py:393`).
+//!
+//!     Both are refused unless they are the tenant's own seal: the gateway
+//!     seals the container of a code interpreter or shell call it hands a
+//!     tenant, and takes that tenant's own out of sight of this check
+//!     (`crate::opaque_id::with_own_containers`).
 //! - Chat Completions (`chat/`):
 //!   - the `file.file_id` of a `file` content part
 //!     (`chat_completion_content_part_param.py:22`);

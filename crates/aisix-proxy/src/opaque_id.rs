@@ -65,6 +65,15 @@ pub(crate) enum IdKind {
     /// Completions or Messages upstream that served it, and that id's prefix
     /// (`tooluse_`, `toolu_`, `call_`) names the channel.
     Call,
+    /// The container a hosted tool ran in: a `code_interpreter_call`'s
+    /// `container_id`, and the `container_id` of a shell call's
+    /// `container_reference` environment (openai-python 3.41.0
+    /// `types/responses/response_code_interpreter_tool_call.py`,
+    /// `response_container_reference.py`). The seal keeps the upstream's
+    /// own prefix, as an item id's does. Unlike an item or call id, it is
+    /// never passed upstream unopened: a container is an object the
+    /// upstream stores ([`with_own_containers`]).
+    Container,
 }
 
 impl IdKind {
@@ -74,13 +83,14 @@ impl IdKind {
         match self {
             IdKind::Item => b'i',
             IdKind::Call => b'c',
+            IdKind::Container => b'k',
         }
     }
 
     /// The prefix a seal of `id` is shown behind.
     fn shown_prefix(self, id: &str) -> &str {
         match self {
-            IdKind::Item => kept_prefix(id),
+            IdKind::Item | IdKind::Container => kept_prefix(id),
             IdKind::Call => CALL_PREFIX,
         }
     }
@@ -291,7 +301,7 @@ impl Sealer {
         match kind {
             // The payload's alphabet includes `_`, so an id sealed without a
             // prefix is also tried whole.
-            IdKind::Item => id
+            IdKind::Item | IdKind::Container => id
                 .find('_')
                 .and_then(|end| self.open(kind, &id[..=end], &id[end + 1..]))
                 .or_else(|| self.open(kind, "", id)),
@@ -352,21 +362,29 @@ pub(crate) fn unseal_call(key: &[u8; 32], owner: &str, id: &str) -> Option<Strin
 }
 
 /// The kind of id a field of a Responses item holds, for the fields that
-/// name an item or a call — the values a client echoes back in a later
-/// request's `input[]`.
+/// name an item, a call or a container — the values a client echoes back in
+/// a later request's `input[]`.
 fn item_field_kind(field: &str) -> Option<IdKind> {
     match field {
         "id" | "approval_request_id" => Some(IdKind::Item),
         "call_id" => Some(IdKind::Call),
+        "container_id" => Some(IdKind::Container),
         _ => None,
     }
 }
+
+/// Where an item names its container, as JSON pointers into the item: a
+/// code interpreter call's own `container_id`, and a shell call's
+/// `environment`.
+const CONTAINER_SLOTS: [&str; 2] = ["/container_id", "/environment/container_id"];
 
 /// Run `visit` over every id field of one item, with the kind it holds. A
 /// `caller` object's `caller_id` names a call, and so does the `id` of a
 /// `local_shell_call_output`: that item has no `call_id`, and its `id` is the
 /// call id of the `local_shell_call` it answers (openai-python 3.41.0
 /// `types/responses/response_input_item_param.py`, `LocalShellCallOutput`).
+/// An `environment` object's `container_id` names a container
+/// ([`CONTAINER_SLOTS`]).
 fn for_each_item_id(item: &mut Value, mut visit: impl FnMut(IdKind, &mut String)) {
     let names_call_by_id =
         item.get("type").and_then(Value::as_str) == Some("local_shell_call_output");
@@ -387,6 +405,11 @@ fn for_each_item_id(item: &mut Value, mut visit: impl FnMut(IdKind, &mut String)
             Value::Object(caller) if field == "caller" => {
                 if let Some(Value::String(s)) = caller.get_mut("caller_id") {
                     visit(IdKind::Call, s);
+                }
+            }
+            Value::Object(environment) if field == "environment" => {
+                if let Some(Value::String(s)) = environment.get_mut("container_id") {
+                    visit(IdKind::Container, s);
                 }
             }
             _ => {}
@@ -453,6 +476,11 @@ pub(crate) fn responses_event_id_kind(path: &[PathSeg]) -> Option<IdKind> {
             {
                 Some(IdKind::Call)
             }
+            [PathSeg::Key(environment), PathSeg::Key(field)]
+                if environment == "environment" && field == "container_id" =>
+            {
+                Some(IdKind::Container)
+            }
             _ => None,
         }
     }
@@ -513,7 +541,9 @@ pub(crate) fn unseal_responses_input(
         // that opens (a `call_id`, a `caller`) is no warrant for it.
         let reference_id = is_item_reference(item).then(|| item.get("id").cloned());
         for_each_item_id(item, |kind, slot| {
-            if slot.len() < MIN_SEALED_LEN {
+            // A container opens where the stored-object check runs
+            // ([`with_own_containers`]).
+            if kind == IdKind::Container || slot.len() < MIN_SEALED_LEN {
                 return;
             }
             let sealer = sealer.get_or_insert_with(|| Sealer::of(platform, owner));
@@ -532,6 +562,74 @@ pub(crate) fn unseal_responses_input(
         }
     }
     unopened_reference
+}
+
+/// Run `check`, the stored-object refusal of a `/v1/responses` request, with
+/// every container this tenant's own seal names taken out of `input[]`, then
+/// give the upstream back the container ids it issued. With platform mode
+/// off, `check` runs on the body as sent.
+///
+/// A container is an object the upstream stores, so the stored-object check
+/// refuses a request that names one (`crate::stored_refs`). But the
+/// container of a code interpreter or shell call the gateway handed this
+/// tenant is the tenant's own: the stateless way to continue a conversation
+/// sends the earlier output back in `input[]` (openai-python 3.41.0
+/// `types/responses/response_code_interpreter_tool_call_param.py:43`, where
+/// `container_id` is required), and an automatic container "reuses an active
+/// container that was used by a previous `code_interpreter_call` item in the
+/// model's context"
+/// (<https://developers.openai.com/api/docs/guides/tools-code-interpreter>).
+/// So such a container id is opened here, kept out of `check`'s sight, and
+/// written back as the upstream's own id afterwards, whatever `check` said.
+/// A container id that does not open (a bare upstream id, another tenant's
+/// seal, a forged one) stays where it is, and `check` refuses it as before.
+///
+/// Runs where the stored-object check runs, before guardrails, the cache and
+/// any upstream; the earlier unseal of item and call ids
+/// ([`unseal_responses_input`]) passes containers over. A sealer is built
+/// only when a value could be a seal.
+pub(crate) fn with_own_containers<E>(
+    platform: Option<&crate::platform::PlatformSettings>,
+    auth: &crate::auth::AuthenticatedKey,
+    body: &mut Value,
+    check: impl FnOnce(&Value) -> Result<(), E>,
+) -> Result<(), E> {
+    let Some(platform) = platform else {
+        return check(body);
+    };
+    let owner = crate::platform::tenant_owner(auth);
+    let owner = owner.as_str();
+    let mut opened: Vec<(usize, &'static str, String)> = Vec::new();
+    if let Some(items) = body.get_mut("input").and_then(Value::as_array_mut) {
+        let mut sealer: Option<Sealer> = None;
+        for (index, item) in items.iter_mut().enumerate() {
+            for slot in CONTAINER_SLOTS {
+                let Some(Value::String(id)) = item.pointer_mut(slot) else {
+                    continue;
+                };
+                if id.len() < MIN_SEALED_LEN {
+                    continue;
+                }
+                let sealer = sealer.get_or_insert_with(|| Sealer::of(platform, owner));
+                if let Some(original) = sealer.unseal(IdKind::Container, id) {
+                    // Empty names nothing, so the check passes it over.
+                    id.clear();
+                    opened.push((index, slot, original));
+                }
+            }
+        }
+    }
+    let checked = check(body);
+    for (index, slot, original) in opened {
+        if let Some(id) = body
+            .get_mut("input")
+            .and_then(|input| input.get_mut(index))
+            .and_then(|item| item.pointer_mut(slot))
+        {
+            *id = Value::String(original);
+        }
+    }
+    checked
 }
 
 /// Whether an `input[]` item is an item reference: `type` is
@@ -1299,5 +1397,162 @@ pub(crate) mod tests {
         let sealer = Sealer::new(&K, T);
         assert_eq!(sealer.unseal(IdKind::Item, &shortest).as_deref(), Some(""));
         assert_eq!(sealer.unseal(IdKind::Item, &shortest[1..]), None);
+    }
+
+    /// The caller a request's ids are sealed to: tenant `team:<team>`.
+    fn caller(team: &str) -> crate::auth::AuthenticatedKey {
+        let snap = aisix_core::AisixSnapshot::new();
+        let key: aisix_core::ApiKey = serde_json::from_value(
+            json!({"key_hash": "h", "allowed_models": ["*"], "team_id": team}),
+        )
+        .unwrap();
+        crate::auth::AuthenticatedKey::new(
+            &snap,
+            std::sync::Arc::new(aisix_core::resource::ResourceEntry::new("k-1", key, 1)),
+            None,
+            false,
+        )
+    }
+
+    /// The container a hosted tool ran in leaves sealed, buffered and
+    /// streamed, keeping its prefix; it opens only as a container.
+    #[test]
+    fn a_container_id_leaves_sealed_in_every_slot_an_answer_names_it() {
+        let sealer = Sealer::new(&K, T);
+        let mut body = json!({"output": [
+            {"type": "code_interpreter_call", "id": "ci_bdrk_1", "container_id": "cntr_bdrk_1",
+             "code": "1+1", "outputs": [], "status": "completed"},
+            {"type": "shell_call", "id": "sh_bdrk_1", "call_id": "call_bdrk_1",
+             "action": {"commands": ["ls"]}, "status": "completed",
+             "environment": {"type": "container_reference", "container_id": "cntr_bdrk_2"}},
+        ]});
+        seal_responses_body(&sealer, &mut body);
+        for (pointer, original) in [
+            ("/output/0/container_id", "cntr_bdrk_1"),
+            ("/output/1/environment/container_id", "cntr_bdrk_2"),
+        ] {
+            let sealed = body.pointer(pointer).and_then(Value::as_str).unwrap();
+            assert!(sealed.starts_with("cntr_"), "{sealed}");
+            assert!(!sealed.contains("bdrk"), "{sealed}");
+            assert_eq!(
+                sealer.unseal(IdKind::Container, sealed).as_deref(),
+                Some(original)
+            );
+            assert_eq!(sealer.unseal(IdKind::Item, sealed), None, "{sealed}");
+            assert_eq!(
+                Sealer::new(&K, "team-b").unseal(IdKind::Container, sealed),
+                None
+            );
+        }
+
+        // A stream names it on the item and on the snapshot's output.
+        let key = |path: &[&str]| {
+            let path: Vec<PathSeg> = path
+                .iter()
+                .map(|seg| match seg.parse::<usize>() {
+                    Ok(i) => PathSeg::Index(i),
+                    Err(_) => PathSeg::Key((*seg).to_string()),
+                })
+                .collect();
+            responses_event_id_kind(&path)
+        };
+        for path in [
+            &["item", "container_id"][..],
+            &["item", "environment", "container_id"],
+            &["response", "output", "0", "container_id"],
+            &["response", "output", "1", "environment", "container_id"],
+        ] {
+            assert_eq!(key(path), Some(IdKind::Container), "{path:?}");
+        }
+        // A citation of a file in a container is history, not an item's own
+        // container, and is left as written.
+        assert_eq!(
+            key(&["item", "content", "0", "annotations", "0", "container_id"]),
+            None
+        );
+    }
+
+    /// A stateless conversation sends a code interpreter's or shell's own
+    /// container back: the tenant it was handed to passes the stored-object
+    /// check with it and the upstream gets its own id back; anyone else, and
+    /// a bare upstream id, is refused as before.
+    #[test]
+    fn a_tenants_own_container_passes_the_stored_object_check_and_returns_as_issued() {
+        let platform = crate::platform::PlatformSettings::from_secret("s");
+        let own = Sealer::of(&platform, "team:team-a");
+        let body = |container: &str, environment: &str| {
+            json!({"model": "m", "input": [
+                {"role": "user", "content": "run it"},
+                {"type": "code_interpreter_call", "id": "ci_1", "container_id": container,
+                 "code": "1+1", "outputs": null, "status": "completed"},
+                {"type": "shell_call", "call_id": "call_1", "action": {"commands": ["ls"]},
+                 "environment": {"type": "container_reference", "container_id": environment}},
+                {"role": "user", "content": "and again"},
+            ]})
+        };
+        let refusal = |team: &str, mut sent: Value| {
+            let result = with_own_containers(Some(&platform), &caller(team), &mut sent, |b| {
+                crate::stored_refs::refuse_in_responses(Some(&platform), b)
+            });
+            (result, sent)
+        };
+
+        let (ci, sh) = (
+            own.seal(IdKind::Container, "cntr_up_1"),
+            own.seal(IdKind::Container, "cntr_up_2"),
+        );
+        let (result, sent) = refusal("team-a", body(&ci, &sh));
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(
+            sent,
+            body("cntr_up_1", "cntr_up_2"),
+            "the upstream's own ids"
+        );
+
+        // Another tenant's, an item seal of the same id, a bare upstream id.
+        for (team, container) in [
+            ("team-b", ci.clone()),
+            ("team-a", own.seal(IdKind::Item, "cntr_up_1")),
+            ("team-a", "cntr_up_1".to_string()),
+        ] {
+            let sent = body(&container, &sh);
+            let (result, after) = refusal(team, sent.clone());
+            match result {
+                Err(crate::error::ProxyError::StoredObjectReference(field)) => {
+                    assert_eq!(field, "input[1].container_id", "{team} {container}")
+                }
+                other => panic!("{team} {container}: {other:?}"),
+            }
+            if team == "team-a" {
+                // Its own shell container is still given back as issued.
+                assert_eq!(
+                    after["input"][2]["environment"]["container_id"],
+                    "cntr_up_2"
+                );
+            }
+        }
+        let (result, _) = refusal("team-a", body(&ci, "cntr_up_2"));
+        match result {
+            Err(crate::error::ProxyError::StoredObjectReference(field)) => {
+                assert_eq!(field, "input[2].environment.container_id")
+            }
+            other => panic!("{other:?}"),
+        }
+
+        // Platform mode off: the check reads the body as sent.
+        let mut sent = body(&ci, &sh);
+        let seen = std::cell::RefCell::new(None);
+        let result: Result<(), ()> = with_own_containers(None, &caller("team-a"), &mut sent, |b| {
+            *seen.borrow_mut() = Some(b.clone());
+            Ok(())
+        });
+        assert!(result.is_ok());
+        assert_eq!(seen.into_inner(), Some(body(&ci, &sh)));
+        assert_eq!(sent, body(&ci, &sh));
+
+        // The earlier unseal of item and call ids leaves a container as sent.
+        let mut sent = body(&ci, &sh);
+        unseal_responses_input(&platform, "team:team-a", &mut sent);
+        assert_eq!(sent["input"][1]["container_id"], ci.as_str());
     }
 }

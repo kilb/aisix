@@ -862,9 +862,11 @@ async fn dispatch(
     crate::dispatch::check_ip_access(&model_entry.value, &client.source_ip)?;
 
     // Platform mode: nothing the request names may be an object stored
-    // upstream for another tenant.
-    crate::stored_refs::refuse_in_responses(state.platform(), body)
-        .map_err(|err| affinity.at_caller_position(err))?;
+    // upstream for another tenant. A container it was handed is its own.
+    crate::opaque_id::with_own_containers(state.platform(), auth, body, |body| {
+        crate::stored_refs::refuse_in_responses(state.platform(), body)
+    })
+    .map_err(|err| affinity.at_caller_position(err))?;
     affinity.refuse_unopened_item_reference()?;
 
     // Platform mode: a continuation names a response this tenant was handed,
