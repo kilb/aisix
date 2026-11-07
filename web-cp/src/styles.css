@@ -483,3 +483,6 @@ tr:hover td button.ghost{border-color:var(--rule-2);color:var(--oxide)}
   font-family:var(--mono);font-size:12px;padding:1px 5px;
   background:var(--oxide-wash);color:var(--oxide);border-radius:2px;
 }
+/* A form field the server refused, or that must be filled, with its reason under it. */
+.f input[aria-invalid="true"],.f select[aria-invalid="true"]{border-color:var(--oxide)}
+.field-problem{margin:-9px 0 15px;font-size:12.5px;color:var(--oxide)}

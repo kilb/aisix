@@ -60,7 +60,7 @@ export function Resources({ canEdit }: TabProps) {
       <div className="panel">
         <h2>全部资源</h2>
         <p className="hint">
-          按网关的资源定义直接编辑 JSON 文档。保存时由控制面按网关的规则校验，问题按字段路径列在编辑框下方。
+          按网关的资源定义直接编辑 JSON 文档。保存时由控制面按网关的规则校验，问题列在编辑框下方。
         </p>
         <label className="f">
           <span>资源类型</span>
@@ -282,25 +282,32 @@ function KindPage({ info, canEdit }: { info: KindInfo; canEdit: boolean }) {
                 创建
               </button>
             )}
-            {editing.mode === "edit" && editable && (
+            {editing.mode === "edit" && editable && !confirmDelete && (
               <>
                 <button type="button" className="act" disabled={busy} onClick={() => void submit()}>
                   保存
                 </button>
-                {confirmDelete ? (
-                  <button type="button" className="ghost" disabled={busy} onClick={() => void del()}>
-                    确认删除
-                  </button>
-                ) : (
-                  <button type="button" className="ghost" disabled={busy} onClick={() => setConfirmDelete(true)}>
-                    删除
-                  </button>
-                )}
+                <button type="button" className="ghost" disabled={busy} onClick={() => setConfirmDelete(true)}>
+                  删除
+                </button>
               </>
             )}
-            <button type="button" className="ghost" onClick={close}>
-              {editing.mode === "new" || editable ? "取消" : "关闭"}
-            </button>
+            {/* Ruling P1b-R6: a destructive action confirms inline, never in a dialog. */}
+            {editing.mode === "edit" && editable && confirmDelete && (
+              <>
+                <button type="button" className="act" disabled={busy} onClick={() => void del()}>
+                  确认删除
+                </button>
+                <button type="button" className="ghost" disabled={busy} onClick={() => setConfirmDelete(false)}>
+                  取消
+                </button>
+              </>
+            )}
+            {!confirmDelete && (
+              <button type="button" className="ghost" onClick={close}>
+                {editing.mode === "new" || editable ? "取消" : "关闭"}
+              </button>
+            )}
           </div>
         </div>
       )}

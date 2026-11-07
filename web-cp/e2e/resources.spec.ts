@@ -211,7 +211,8 @@ test("通用页：未知字段被服务端拒绝，路径标在编辑器下方�
   await page.getByRole("button", { name: "保存" }).click();
 
   const problems = page.getByRole("list", { name: "校验问题" });
-  await expect(problems).toContainText("ttl_second");
+  // A whole word: `ttl_second` is also the start of the valid `ttl_seconds`.
+  await expect(problems).toContainText(/ttl_second\b/);
   await expect(editor).toHaveAttribute("aria-invalid", "true");
   const editorBox = await editor.boundingBox();
   const problemsBox = await problems.boundingBox();
@@ -372,8 +373,47 @@ test("通用页：基于旧版本的保存被拒绝，先保存的保留；重�
     .poll(async () => (await stack.admin.get(`/admin/resources/cache_policies/${created.id}`)).doc.ttl_seconds)
     .toBe(300);
 
+  // Deleting asks once more on the page; 取消 leaves the row alone.
+  await page.getByRole("button", { name: "删除" }).click();
+  await page.getByRole("button", { name: "取消" }).click();
+  await expect(page.getByRole("button", { name: "确认删除" })).toHaveCount(0);
+  await expect(row(page, "gen-conflict-e2e")).toHaveCount(1);
+  expect((await stack.admin.request("GET", `/admin/resources/cache_policies/${created.id}`)).status).toBe(200);
   await page.getByRole("button", { name: "删除" }).click();
   await page.getByRole("button", { name: "确认删除" }).click();
   await expect(row(page, "gen-conflict-e2e")).toHaveCount(0);
   expect((await stack.admin.request("GET", `/admin/resources/cache_policies/${created.id}`)).status).toBe(404);
+});
+
+test("缓存策略表单：作用于列出后建的模型，缓存时长必填，被拒绝的原因标在该字段旁", async ({ page }) => {
+  await seedModel("early-e2e", "upstream-early-e2e");
+  await loginAsAdmin(page);
+  await openTab(page, "cache");
+  const target = page.getByLabel("作用于");
+  await page.getByRole("button", { name: "新建缓存策略" }).click();
+  await expect(target.locator("option", { hasText: "early-e2e" })).toHaveCount(1);
+  await page.getByRole("button", { name: "取消" }).click();
+
+  // A model created elsewhere while this page is open.
+  await seedModel("late-e2e", "upstream-late-e2e");
+  await page.getByRole("button", { name: "新建缓存策略" }).click();
+  await expect(target.locator("option", { hasText: "late-e2e" })).toHaveCount(1);
+
+  await page.getByLabel("名称").fill("cache-field-e2e");
+  const ttl = page.getByLabel("缓存时长（秒）");
+  const save = page.getByRole("button", { name: "保存" });
+  await ttl.fill("");
+  await expect(save).toBeDisabled();
+  await expect(ttl).toHaveAttribute("aria-invalid", "true");
+
+  // Below the schema's one-second minimum: refused, and the reason sits at the field.
+  await ttl.fill("0");
+  await expect(save).toBeEnabled();
+  await save.click();
+  await expect(ttl).toHaveAttribute("aria-invalid", "true");
+  await expect(ttl).toHaveAccessibleDescription(/\S/);
+  const stored = (await stack.admin.get("/admin/resources/cache_policies")).items.find(
+    (i: Json) => i.doc.name === "cache-field-e2e",
+  );
+  expect(stored, "nothing was saved").toBeUndefined();
 });

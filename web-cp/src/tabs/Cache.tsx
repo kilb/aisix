@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useId, useState } from "react";
 import type { TabProps } from "../App";
 import { ConflictNote } from "../components/ConflictNote";
 import { RolloutBadge } from "../components/RolloutBadge";
@@ -23,6 +23,8 @@ const ENV_SCOPE = "env";
 const ENV_NOTE = "平台部署不提供 env 范围，请改为 team";
 /** What a new policy's scope starts at: entries shared within one tenant. */
 const PRESELECTED_SCOPE = "team";
+/** Refusal details shown beside their own input; the others stay in the list under the form. */
+const FIELD_PATHS = ["/scope", "/ttl_seconds"];
 
 interface Options {
   scopes: string[];
@@ -76,6 +78,8 @@ export function Cache({ canEdit, onGoto }: TabProps) {
   const [failure, setFailure] = useState<{ text: string; details: Detail[] } | null>(null);
   const [conflict, setConflict] = useState(false);
   const [busy, setBusy] = useState(false);
+  const scopeProblemId = useId();
+  const ttlProblemId = useId();
 
   useEffect(() => {
     let live = true;
@@ -122,6 +126,8 @@ export function Cache({ canEdit, onGoto }: TabProps) {
   function startNew() {
     if (!options) return;
     clearOutcome();
+    // Models created elsewhere since this page read them belong in 作用于.
+    void models.reload();
     setForm({
       id: null,
       version: null,
@@ -153,16 +159,16 @@ export function Cache({ canEdit, onGoto }: TabProps) {
   }
 
   async function submit() {
-    if (!form) return;
+    // A cleared TTL is never sent as "no TTL": 保存 waits for one.
+    if (!form || form.ttl.trim() === "") return;
     clearOutcome();
     const doc: CachePolicyDoc = {
       ...form.base,
       name: form.name,
       scope: form.scope,
-      ttl_seconds: form.ttl.trim() === "" ? undefined : Number(form.ttl),
+      ttl_seconds: Number(form.ttl),
       enabled: form.enabled,
     };
-    if (doc.ttl_seconds === undefined) delete doc.ttl_seconds;
     if (form.otherTarget === null) {
       delete doc.applies_to;
       delete doc.applies_to_model_id;
@@ -196,6 +202,15 @@ export function Cache({ canEdit, onGoto }: TabProps) {
   const readOnly = !canEdit || (form?.envScoped ?? false);
   const current = form?.id ? policies.items?.find((p) => p.id === form.id) : undefined;
   const set = (patch: Partial<Form>) => setForm((f) => (f ? { ...f, ...patch } : f));
+  const problemAt = (path: string) =>
+    failure?.details
+      .filter((d) => d.path === path)
+      .map((d) => d.message)
+      .join("；") || null;
+  const scopeProblem = problemAt("/scope");
+  const ttlProblem = problemAt("/ttl_seconds");
+  const listedDetails = failure?.details.filter((d) => !FIELD_PATHS.includes(d.path)) ?? [];
+  const ttlMissing = form !== null && !readOnly && form.ttl.trim() === "";
 
   return (
     <>
@@ -288,7 +303,13 @@ export function Cache({ canEdit, onGoto }: TabProps) {
             {form.envScoped ? (
               <input value={ENV_SCOPE} disabled />
             ) : (
-              <select value={form.scope} disabled={readOnly} onChange={(e) => set({ scope: e.target.value })}>
+              <select
+                value={form.scope}
+                disabled={readOnly}
+                aria-invalid={scopeProblem ? true : undefined}
+                aria-describedby={scopeProblem ? scopeProblemId : undefined}
+                onChange={(e) => set({ scope: e.target.value })}
+              >
                 {(options?.scopes ?? []).map((s) => (
                   <option key={s} value={s}>
                     {s}
@@ -297,6 +318,11 @@ export function Cache({ canEdit, onGoto }: TabProps) {
               </select>
             )}
           </label>
+          {scopeProblem && (
+            <p id={scopeProblemId} className="field-problem">
+              {scopeProblem}
+            </p>
+          )}
           {options?.descriptions[form.scope] && <p className="hint">{options.descriptions[form.scope]}</p>}
           <label className="f">
             <span>作用于</span>
@@ -323,11 +349,19 @@ export function Cache({ canEdit, onGoto }: TabProps) {
               type="number"
               min={1}
               step={1}
+              required
               value={form.ttl}
               disabled={readOnly}
+              aria-invalid={ttlMissing || ttlProblem ? true : undefined}
+              aria-describedby={ttlMissing || ttlProblem ? ttlProblemId : undefined}
               onChange={(e) => set({ ttl: e.target.value })}
             />
           </label>
+          {(ttlMissing || ttlProblem) && (
+            <p id={ttlProblemId} className="field-problem">
+              {ttlMissing ? "必填" : ttlProblem}
+            </p>
+          )}
           <label className="f">
             <span>启用</span>
             <input
@@ -341,9 +375,9 @@ export function Cache({ canEdit, onGoto }: TabProps) {
           {failure && (
             <div className="note crit" role="alert">
               {failure.text}
-              {failure.details.length > 0 && (
+              {listedDetails.length > 0 && (
                 <ul className="json-problems">
-                  {failure.details.map((d, i) => (
+                  {listedDetails.map((d, i) => (
                     <li key={i} data-path={d.path}>
                       <mark className="json-path">{d.path || "（文档根）"}</mark> {d.message}
                     </li>
@@ -354,7 +388,7 @@ export function Cache({ canEdit, onGoto }: TabProps) {
           )}
           <div className="r">
             {!readOnly && (
-              <button type="button" className="act" disabled={busy} onClick={() => void submit()}>
+              <button type="button" className="act" disabled={busy || ttlMissing} onClick={() => void submit()}>
                 保存
               </button>
             )}
