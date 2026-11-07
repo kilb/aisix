@@ -3247,6 +3247,9 @@ async fn attribute_batch_usage(job: &BatchAttribution) -> Result<(), String> {
         // Attribution names the identity that observed completion — the
         // same caller the event's api_key_id already reflects.
         crate::usage_attr::apply_caller_identity(&mut event, jwt, caller);
+        // The chokepoint's bound on outside text, for the same reason as the
+        // tier above: the model name comes from the upstream's output file.
+        crate::usage_attr::bound_outside_text(&mut event);
         let usage_model =
             crate::usage_attr::usage_event_model_label(&snap, &event.requested_model).into_owned();
         state.usage_sink.try_emit(
@@ -4693,6 +4696,61 @@ mod tests {
             vec![("k-1".to_string(), 1_000_000)],
             "只有带标记的那一批入账，而且记在提交者头上"
         );
+    }
+
+    /// The batch row does not pass the emit chokepoint, so it applies the
+    /// chokepoint's bound itself: the model name an output file reports is
+    /// the upstream's text, and is kept to 512 characters like every other
+    /// row's.
+    #[tokio::test]
+    async fn a_batch_row_bounds_the_model_its_output_reports() {
+        let upstream = MockServer::builder().start().await;
+        Mock::given(wm_method("GET"))
+            .and(path("/v1/batches/batch_long"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "batch_long",
+                "status": "completed",
+                "completed_at": aisix_obs::metrics::process_start_time_seconds() + 1.0,
+                "output_file_id": "file-out"
+            })))
+            .mount(&upstream)
+            .await;
+        let long_model = format!("m{}", "x".repeat(4096));
+        let line = serde_json::json!({
+            "id": "batch_req_1",
+            "response": {"status_code": 200, "body": {
+                "model": long_model,
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5}
+            }}
+        });
+        Mock::given(wm_method("GET"))
+            .and(path("/v1/files/file-out/content"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(format!("{line}\n"), "application/jsonl"),
+            )
+            .mount(&upstream)
+            .await;
+        let (app, mut rx, _state) = build_app_with_sink_and_state(ended_batch_snapshot(&upstream));
+        let encoded = encode_routed_id("batch_long", "jobs-a", None);
+        let resp = app
+            .oneshot(get_as(format!("/v1/batches/{encoded}"), "sk-caller"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let mut row = None;
+        for _ in 0..40 {
+            match tokio::time::timeout(Duration::from_millis(100), rx.recv()).await {
+                Ok(Some(ev)) if ev.inbound_protocol == "batch" => {
+                    row = Some(ev);
+                    break;
+                }
+                Ok(Some(_)) => continue,
+                _ => {}
+            }
+        }
+        let row = row.expect("the batch row");
+        assert_eq!(row.provider_model_version.chars().count(), 512);
+        assert!(row.provider_model_version.starts_with("mxxx"));
     }
 
     /// A listed batch that ended before this process started is not credited

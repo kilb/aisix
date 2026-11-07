@@ -1431,7 +1431,7 @@ const MAX_ERROR_MESSAGE_CHARS: usize = 2048;
 /// with. The text that is already bounded where it is written (`api_key_name`,
 /// the tiers, `error_class`) is left to that bound; text within the bound is
 /// unchanged.
-fn bound_outside_text(event: &mut UsageEvent) {
+pub(crate) fn bound_outside_text(event: &mut UsageEvent) {
     for text in [
         &mut event.requested_model,
         &mut event.client_user_agent,
