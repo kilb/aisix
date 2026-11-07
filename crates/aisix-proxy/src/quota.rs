@@ -950,10 +950,12 @@ fn reject_spend(
         Some((policy_id, policy.name.as_str())),
     );
     // The shared store did not answer for a bucket carrying an allowance:
-    // whether it has room cannot be known, which is a budget that cannot be
-    // verified (`503`), not one that ran out.
+    // whether it has room cannot be known, so the caller is told spending
+    // could not be verified (`503` `allowance_unverified`), not that the
+    // money ran out. Not `BudgetUnverified`: that one names the usage
+    // delivery to the control plane, which is not what failed here.
     if matches!(err, aisix_ratelimit::RateLimitError::AllowanceUnverified) {
-        return ProxyError::BudgetUnverified;
+        return ProxyError::AllowanceUnverified;
     }
     let retry_after_seconds = err.retry_after_secs();
     let usd = |micro: u64| format!("{:.6}", micro as f64 / 1_000_000.0);
@@ -2237,9 +2239,11 @@ mod tests {
     }
 
     /// A spend allowance is not admitted while the shared rate-limit store
-    /// does not answer: the caller gets `503` `budget_unverified`, the answer
-    /// a budget that cannot be checked already gets, not a `429` that says
-    /// the money ran out. A policy without an allowance still falls open.
+    /// does not answer: the caller gets `503` `allowance_unverified`, "Spending
+    /// could not be verified right now. Retry later.", with no `Retry-After`,
+    /// platform mode on or off, not a `429` that says the money ran out and
+    /// not `budget_unverified`, which names the usage delivery. A policy
+    /// without an allowance still falls open.
     #[tokio::test]
     async fn an_allowance_the_shared_store_cannot_check_is_answered_503() {
         let port = std::net::TcpListener::bind("127.0.0.1:0")
@@ -2294,10 +2298,39 @@ mod tests {
             .await
             .expect_err("an allowance nobody can check is not admitted");
         assert!(
-            matches!(err, ProxyError::BudgetUnverified),
-            "expected BudgetUnverified, got {err:?}"
+            matches!(err, ProxyError::AllowanceUnverified),
+            "expected AllowanceUnverified, got {err:?}"
         );
-        assert_eq!(err.status().as_u16(), 503);
+        // The refusal itself as the caller receives it, then the same variant
+        // rendered as a platform-mode request renders it.
+        use axum::response::IntoResponse as _;
+        let mut refused = Some(err);
+        for platform in [false, true] {
+            let resp = match refused.take() {
+                Some(err) => err.into_response(),
+                None => crate::error::tests::in_platform_mode(|| {
+                    ProxyError::AllowanceUnverified.into_response()
+                }),
+            };
+            assert_eq!(resp.status().as_u16(), 503, "platform {platform}");
+            assert!(
+                resp.headers().get("retry-after").is_none(),
+                "platform {platform}"
+            );
+            let body: serde_json::Value = serde_json::from_slice(
+                &axum::body::to_bytes(resp.into_body(), 65536).await.unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                body["error"]["code"], "allowance_unverified",
+                "platform {platform}"
+            );
+            assert_eq!(body["error"]["type"], "api_error", "platform {platform}");
+            assert_eq!(
+                body["error"]["message"], "Spending could not be verified right now. Retry later.",
+                "platform {platform}"
+            );
+        }
 
         let windowed = snapshot_with_policy(make_spend_policy(
             "api_key",

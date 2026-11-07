@@ -330,6 +330,12 @@ pub struct RateLimitPolicy {
     /// only: it is not shared between instances, and a restart returns every
     /// allowance to unspent. Configure a shared store for any allowance that
     /// has to outlive the process.
+    ///
+    /// While a shared Redis store does not answer, a request this allowance
+    /// applies to is refused with `503` and the code `allowance_unverified`,
+    /// because one instance's own count cannot tell what the others spent.
+    /// Every other limit keeps serving on each instance's own count during
+    /// the outage.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1))]
     pub granted_micro_usd: Option<u64>,
