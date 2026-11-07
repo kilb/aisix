@@ -22,6 +22,15 @@ test("令牌配色在两种主题下都达到 AA 对比度", () => {
   assert.ok(contrastRatio(D["--proceed"]!, D["--surface"]!) >= 3);
 });
 
+test("线路色条与输入框边在两种主题的面板上都达到 3:1", () => {
+  const css = readFileSync(new URL("../theme/tokens.css", import.meta.url), "utf8");
+  for (const theme of ["light", "dark"] as const) {
+    const T = readTokens(css, theme);
+    for (const fg of ["--route-1", "--route-2", "--route-3", "--route-4", "--route-5", "--route-6", "--input-border", "--box-border"])
+      assert.ok(contrastRatio(T[fg]!, T["--surface"]!) >= 3, `${theme} ${fg} on --surface`);
+  }
+});
+
 test("对比度按 WCAG 公式计算", () => {
   assert.equal(contrastRatio("#000000", "#FFFFFF").toFixed(2), "21.00");
   assert.equal(contrastRatio("#FFFFFF", "#FFFFFF").toFixed(2), "1.00");
