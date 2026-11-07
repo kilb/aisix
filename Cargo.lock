@@ -134,6 +134,7 @@ version = "0.1.0"
 dependencies = [
  "aisix-core",
  "aisix-etcd",
+ "aisix-pricing",
  "argon2",
  "async-trait",
  "axum 0.8.9",

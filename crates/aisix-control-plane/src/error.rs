@@ -245,6 +245,8 @@ pub enum BootError {
          gateways by it"
     )]
     UnreadableVersion(String),
+    #[error("the built-in price catalogue does not load: {0}")]
+    Catalogue(#[from] aisix_pricing::CatalogueError),
 }
 
 #[cfg(test)]

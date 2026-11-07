@@ -29,7 +29,12 @@
 //! [`MAX_BODY_BYTES`], and holds at most [`MAX_EVENTS_PER_BATCH`] events:
 //! ten times the gateway's largest batch. Past the cap the rest are skipped
 //! while the body is read, not held. Storing a batch takes four statements
-//! whatever its size, and no lock beyond the rows it writes.
+//! whatever its size, and no lock beyond the rows it writes. Pricing what it
+//! stored adds a read of the price-book version (and, after a price write,
+//! three reads to reload the book), one read of the keys the events name, a
+//! read of the stored copies when the batch carried duplicates, and one
+//! insert per stored event; no lock either, beyond the rows it writes and the
+//! key-share locks their foreign keys take.
 //!
 //! At most [`MAX_BODIES_IN_FLIGHT`] bodies are held at once ([`BodySlot`]):
 //! a delivery takes a slot before its body is read and keeps it until its
@@ -104,7 +109,8 @@ pub async fn telemetry(
 ) -> Result<Json<Value>, ApiError> {
     let dp_id = dp.dp_id;
     let count = events.len();
-    let outcome = usage::ingest(&state.db, dp_id, batch_id, events, slot)
+    let prices = state.prices.clone();
+    let outcome = usage::ingest(&state.db, prices, dp_id, batch_id, events, slot)
         .await
         .map_err(|e| {
             if transient(&e) {
@@ -127,6 +133,11 @@ pub async fn telemetry(
         tracing::warn!(%dp_id, %batch_id, events = count, rejected = outcome.rejected,
             "refused usage events without a usable event_id or occurred_at; they are kept \
              in usage_rejects");
+    }
+    if outcome.unpriced > 0 {
+        tracing::warn!(%dp_id, %batch_id, unpriced = outcome.unpriced,
+            "stored usage events that could not be priced; each has an unpriced charge \
+             naming why (pricing_charges.error_code)");
     }
     Ok(Json(json!({
         "accepted": outcome.inserted,

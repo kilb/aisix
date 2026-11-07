@@ -5027,7 +5027,11 @@ mod tests {
         /// row). Each stays exempt only while it cannot name a gateway
         /// model's price: a code line in it naming `Model` or `ModelCost`
         /// is reported like a read. `tests/` directories stay scanned.
-        const OWN_COST_VOCABULARY: [&str; 1] = ["/crates/aisix-pricing/src/"];
+        const OWN_COST_VOCABULARY: [&str; 2] = [
+            "/crates/aisix-pricing/src/",
+            // The control plane's price tables and the charges it records.
+            "/crates/aisix-control-plane/src/pricing/",
+        ];
         const MODEL_PRICE_TYPES: [&str; 2] = ["Model", "ModelCost"];
 
         /// `ident` occurs in `line` as a whole identifier.

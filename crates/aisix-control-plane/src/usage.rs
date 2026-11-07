@@ -34,6 +34,17 @@
 //! filter value too long to index stays only in the event.
 //!
 //! Logs and errors name counts and ids, never what an event contains.
+//!
+//! # Each stored event priced once
+//!
+//! Every event a delivery stores is priced in the same transaction
+//! ([`crate::pricing::price_stored`]) and gets its one charge, keyed on its
+//! `event_id`, so an event already stored, or a batch delivered before, is
+//! never priced again. Pricing never refuses an event: one that cannot be
+//! priced is stored with an `unpriced` charge.
+
+use std::collections::HashSet;
+use std::sync::Arc;
 
 use axum::extract::rejection::QueryRejection;
 use axum::extract::{Query, State};
@@ -49,6 +60,7 @@ use uuid::Uuid;
 use crate::auth::{OperatorAuth, OperatorRole};
 use crate::db::{Db, DbError};
 use crate::error::{ApiError, Detail};
+use crate::pricing::{self, store::PriceBookCache, StoredEvent};
 use crate::AppState;
 
 /// The most characters an `event_id` may have.
@@ -71,6 +83,11 @@ pub struct IngestOutcome {
     /// The batch had been delivered before: nothing was stored, and
     /// `rejected` is what its first stored delivery refused.
     pub batch_duplicate: bool,
+    /// Events this delivery stored that were charged at a sell price.
+    pub charged: u64,
+    /// Events this delivery stored that could not be priced; each is stored
+    /// with an `unpriced` charge.
+    pub unpriced: u64,
 }
 
 /// An event that can be stored.
@@ -90,14 +107,16 @@ struct Reject {
 }
 
 /// Stores the events of `dp_id`'s batch `batch_id`, once (see the module
-/// docs), in one transaction: either all of it is stored, the batch id
-/// included, or nothing is, and the batch can be delivered again.
+/// docs), and prices each event it stores from `prices`, in one transaction:
+/// either all of it is stored, the batch id and the charges included, or
+/// nothing is, and the batch can be delivered again.
 ///
 /// `slot` is the batch body's place among those the process holds at once
 /// (`dp::telemetry::BodySlot`). It is held until the transaction ends, which
 /// runs to its end even when the request that brought the batch is gone.
 pub async fn ingest(
     db: &Db,
+    prices: Arc<PriceBookCache>,
     dp_id: Uuid,
     batch_id: Uuid,
     events: Vec<Value>,
@@ -114,7 +133,7 @@ pub async fn ingest(
     db.tx(move |conn| {
         async move {
             let _slot = slot;
-            store(conn, dp_id, batch_id, total, rows, rejects).await
+            store(conn, &prices, dp_id, batch_id, total, rows, rejects).await
         }
         .boxed()
     })
@@ -123,6 +142,7 @@ pub async fn ingest(
 
 async fn store(
     conn: &mut PgConnection,
+    prices: &PriceBookCache,
     dp_id: Uuid,
     batch_id: Uuid,
     total: usize,
@@ -170,40 +190,68 @@ async fn store(
 
     let valid = rows.len();
     let mut inserted = 0;
+    let mut priced = pricing::Priced::default();
     if !rows.is_empty() {
         let mut columns = EventColumns::default();
         for row in rows {
             columns.push(row);
         }
         // In event_id order, so two batches sharing events wait for each
-        // other in the same order and cannot deadlock.
-        inserted = sqlx::query(
+        // other in the same order and cannot deadlock; rows sharing an
+        // event_id in the order sent, so the first of them is the one kept.
+        // The rows this statement inserted come back as stored, and only
+        // they are priced.
+        let fresh: Vec<(String, DateTime<Utc>, Value, DateTime<Utc>)> = sqlx::query_as(
             "INSERT INTO usage_events \
              (event_id, dp_id, batch_id, occurred_at, team_id, api_key_id, request_id, event) \
              SELECT u.event_id, $1, $2, u.occurred_at, u.team_id, u.api_key_id, u.request_id, u.event \
              FROM unnest($3::text[], $4::timestamptz[], $5::text[], $6::text[], $7::text[], \
-                         $8::jsonb[]) \
-               AS u(event_id, occurred_at, team_id, api_key_id, request_id, event) \
-             ORDER BY u.event_id \
-             ON CONFLICT (event_id) DO NOTHING",
+                         $8::jsonb[]) WITH ORDINALITY \
+               AS u(event_id, occurred_at, team_id, api_key_id, request_id, event, n) \
+             ORDER BY u.event_id, u.n \
+             ON CONFLICT (event_id) DO NOTHING \
+             RETURNING event_id, occurred_at, event, received_at",
         )
         .bind(dp_id)
         .bind(batch_id)
-        .bind(columns.event_ids)
-        .bind(columns.occurred_at)
-        .bind(columns.team_ids)
-        .bind(columns.api_key_ids)
-        .bind(columns.request_ids)
-        .bind(columns.events)
-        .execute(&mut *conn)
-        .await?
-        .rows_affected();
+        .bind(&columns.event_ids)
+        .bind(&columns.occurred_at)
+        .bind(&columns.team_ids)
+        .bind(&columns.api_key_ids)
+        .bind(&columns.request_ids)
+        .bind(&columns.events)
+        .fetch_all(&mut *conn)
+        .await?;
+        inserted = fresh.len() as u64;
+        if fresh.len() < valid {
+            let stored_here: HashSet<&str> = fresh.iter().map(|f| f.0.as_str()).collect();
+            let duplicates: Vec<(&str, &Value)> = columns
+                .event_ids
+                .iter()
+                .zip(&columns.events)
+                .filter(|(id, _)| !stored_here.contains(id.as_str()))
+                .map(|(id, event)| (id.as_str(), event))
+                .collect();
+            pricing::flag_foreign_duplicates(conn, dp_id, batch_id, &duplicates).await?;
+        }
+        let fresh = fresh
+            .into_iter()
+            .map(|(event_id, occurred_at, event, received_at)| StoredEvent {
+                event_id,
+                occurred_at,
+                event,
+                received_at,
+            })
+            .collect();
+        priced = pricing::price_stored(conn, prices, dp_id, batch_id, fresh).await?;
     }
     let outcome = IngestOutcome {
         inserted,
         duplicates: (valid as u64).saturating_sub(inserted),
         rejected: rejected as u64,
         batch_duplicate: false,
+        charged: priced.charged,
+        unpriced: priced.unpriced,
     };
 
     sqlx::query(

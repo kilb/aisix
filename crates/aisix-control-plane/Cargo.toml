@@ -11,6 +11,9 @@ edition = "2021"
 # For `redact_url_for_log`: the one place configured URLs are reduced for
 # display, so this crate does not grow a second copy that drifts.
 aisix-core = { path = "../aisix-core" }
+# The pricing engine: each stored usage row is priced by it, inside the
+# transaction that stores the row.
+aisix-pricing = { path = "../aisix-pricing" }
 axum = "0.8"
 tokio = { version = "1", features = ["full"] }
 # Runtime queries (`sqlx::query`), never the `query!` macros: those need a

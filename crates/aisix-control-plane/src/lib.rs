@@ -29,6 +29,7 @@ pub mod kine;
 pub mod members;
 pub mod operators;
 pub mod pki;
+pub mod pricing;
 pub mod projector;
 pub mod resources;
 pub mod rollout;
@@ -45,6 +46,7 @@ use dp::{CredentialCache, CREDENTIALS_POOL_SIZE};
 use error::BootError;
 use kine::{KineClient, KineWriter};
 use pki::{Pki, PkiError};
+use pricing::store::PriceBookCache;
 use resources::write::WriteCtx;
 use settings::EnvSettings;
 
@@ -72,6 +74,9 @@ pub struct AppState {
     /// The usage-batch bodies this process may hold at once
     /// ([`dp::telemetry::MAX_BODIES_IN_FLIGHT`]).
     pub telemetry_bodies: Arc<Semaphore>,
+    /// The price book every stored usage event is priced from, reloaded when
+    /// a price write moves `pricing_version`.
+    pub prices: Arc<PriceBookCache>,
 }
 
 /// A booted control plane. Dropping it stops everything it runs.
@@ -134,11 +139,12 @@ impl Drop for Running {
     }
 }
 
-/// Boots the control plane: opens and migrates the database, pins the
-/// environment, loads the CA and the gateway credentials, and starts the
-/// browser listener, the gateway listener, housekeeping and the projector,
-/// which stop gracefully once `shutdown` resolves. A version stamp the
-/// gateway-version gate cannot read refuses the boot first.
+/// Boots the control plane: loads the built-in price catalogue, opens and
+/// migrates the database, pins the environment, loads the CA and the gateway
+/// credentials, and starts the browser listener, the gateway listener,
+/// housekeeping and the projector, which stop gracefully once `shutdown`
+/// resolves. A version stamp the gateway-version gate cannot read refuses
+/// the boot first, and a catalogue that does not load next.
 pub async fn start<S>(cfg: CpConfig, shutdown: S) -> Result<Running, BootError>
 where
     S: Future<Output = ()> + Send + 'static,
@@ -153,6 +159,9 @@ where
     if compat::GatewayVersion::parse(&cfg.cp_version) == compat::GatewayVersion::Unrecognized {
         return Err(BootError::UnreadableVersion(cfg.cp_version));
     }
+    // A catalogue this build cannot read would leave cost prices unknown
+    // everywhere, unseen.
+    let catalogue = aisix_pricing::Catalogue::builtin()?;
     let db = Db::connect(
         &cfg.database_url,
         cfg.db_lock_timeout_ms,
@@ -239,6 +248,7 @@ where
         beats: BeatLimiter::default(),
         dp_listener,
         telemetry_bodies: Arc::new(Semaphore::new(dp::telemetry::MAX_BODIES_IN_FLIGHT)),
+        prices: Arc::new(PriceBookCache::new(catalogue)),
     };
 
     // Nothing fails from here on, so nothing spawned below is left behind
