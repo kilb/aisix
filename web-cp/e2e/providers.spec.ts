@@ -315,9 +315,21 @@ test("移除分组前，点名因此用不到该账号的租户与密钥；取�
     api_key: "sk-e2e-solo-upstream-6b2",
     groups: ["shared", "grp-solo-6b2"],
   });
-  // Reaches the account only through grp-solo-6b2: loses it.
+  // Reaches the account only through grp-solo-6b2, with a key that follows it: loses it.
   const solo = await stack.admin.post("/admin/tenants", { name: "tenant-solo-e2e" });
   await stack.admin.patch(`/admin/tenants/${solo.id}`, { allowed_provider_groups: ["grp-solo-6b2"] }, solo.version);
+  await stack.admin.post(`/admin/tenants/${solo.id}/keys`, { label: "key-follows-e2e" });
+  // Its groups lose the account, but its only key has groups of its own that keep it.
+  const covered = await stack.admin.post("/admin/tenants", { name: "tenant-covered-e2e" });
+  await stack.admin.patch(
+    `/admin/tenants/${covered.id}`,
+    { allowed_provider_groups: ["grp-solo-6b2"] },
+    covered.version,
+  );
+  await stack.admin.post(`/admin/tenants/${covered.id}/keys`, {
+    label: "key-covered-e2e",
+    allowed_provider_groups: ["shared"],
+  });
   // Also reaches it through shared: keeps it.
   const both = await stack.admin.post("/admin/tenants", { name: "tenant-both-e2e" });
   await stack.admin.patch(
@@ -339,9 +351,13 @@ test("移除分组前，点名因此用不到该账号的租户与密钥；取�
   await page.getByRole("button", { name: "保存" }).click();
   const confirm = page.getByRole("region", { name: "移除分组" });
   await expect(confirm).toContainText("grp-solo-6b2");
-  await expect(confirm).toContainText("tenant-solo-e2e");
+  await expect(confirm.getByRole("listitem").filter({ hasText: "tenant-solo-e2e" })).toContainText(
+    "租户默认分组不再包含该账号",
+  );
   await expect(confirm).toContainText("key-solo-e2e");
   await expect(confirm).not.toContainText("tenant-both-e2e");
+  await expect(confirm).not.toContainText("tenant-covered-e2e");
+  await expect(confirm).not.toContainText("key-covered-e2e");
   // Nothing is saved before the confirmation.
   expect((await account(created.id)).doc.groups).toEqual(["shared", "grp-solo-6b2"]);
 
@@ -356,4 +372,46 @@ test("移除分组前，点名因此用不到该账号的租户与密钥；取�
   await expect(accountRow(page, "acct-solo-e2e")).toContainText("shared");
   await expect(accountRow(page, "acct-solo-e2e")).not.toContainText("grp-solo-6b2");
   expect((await account(created.id)).doc.groups).toEqual(["shared"]);
+});
+
+test("取消后改为移除另一个分组：确认框只列这一次的影响，没人用的分组确认后移除", async ({ page }) => {
+  const created = await createAccount({
+    display_name: "acct-swap-e2e",
+    provider: "openai",
+    api_key: "sk-e2e-swap-upstream-a1c",
+    groups: ["shared", "grp-swap-a1c", "grp-idle-4e1"],
+  });
+  // Uses grp-swap-a1c; nobody uses grp-idle-4e1.
+  const swap = await stack.admin.post("/admin/tenants", { name: "tenant-swap-e2e" });
+  await stack.admin.patch(`/admin/tenants/${swap.id}`, { allowed_provider_groups: ["grp-swap-a1c"] }, swap.version);
+  await stack.admin.post(`/admin/tenants/${swap.id}/keys`, { label: "key-swap-e2e" });
+
+  await loginAsOperator(page);
+  await openTab(page, "上游账号");
+  await accountRow(page, "acct-swap-e2e").getByRole("button", { name: "编辑" }).click();
+  const confirm = page.getByRole("region", { name: "移除分组" });
+  // The first removal names the tenant that uses the group.
+  await page.getByRole("button", { name: "移除 grp-swap-a1c" }).click();
+  await page.getByRole("button", { name: "保存" }).click();
+  await expect(confirm).toContainText("tenant-swap-e2e");
+  await confirm.getByRole("button", { name: "取消" }).click();
+
+  // The same removal again, cancelled while its lookup may still run, then
+  // a different one: what is offered for confirmation is the second's.
+  await page.getByRole("button", { name: "保存" }).click();
+  await confirm.getByRole("button", { name: "取消" }).click();
+  await addGroup(page, "grp-swap-a1c");
+  await page.getByRole("button", { name: "移除 grp-idle-4e1" }).click();
+  await page.getByRole("button", { name: "保存" }).click();
+  await expect(confirm.getByRole("button", { name: "确认移除分组" })).toBeEnabled();
+  // Read once, the moment confirming is offered: a stale list would be showing now.
+  const offered = (await confirm.textContent()) ?? "";
+  expect(offered).toContain("grp-idle-4e1");
+  expect(offered).toContain("没有租户或密钥会因此用不到该账号");
+  expect(offered).not.toContain("tenant-swap-e2e");
+
+  await confirm.getByRole("button", { name: "确认移除分组" }).click();
+  await expect(page.getByRole("form", { name: /acct-swap-e2e/ })).toHaveCount(0);
+  await expect(accountRow(page, "acct-swap-e2e")).not.toContainText("grp-idle-4e1");
+  expect((await account(created.id)).doc.groups).toEqual(["shared", "grp-swap-a1c"]);
 });

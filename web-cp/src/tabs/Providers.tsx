@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { TabProps } from "../App";
 import { ConflictNote } from "../components/ConflictNote";
 import { Msg, type Note } from "../components/Msg";
@@ -272,26 +272,57 @@ export function Providers({ canEdit }: TabProps) {
   );
 }
 
-/** Tenants and keys that would no longer reach an account. */
+/** Tenants and keys an account's group change affects. */
 interface Impact {
+  /** Tenants whose default groups no longer include the account. */
   tenants: Tenant[];
+  /** Keys whose own groups no longer include the account. */
   keys: { key: AdminKey; tenant: Tenant }[];
 }
 
+/** The most tenants whose keys are read at once. */
+const KEY_READS_IN_FLIGHT = 6;
+
 /**
- * Who loses an account whose groups go from `before` to `after`: a tenant
- * whose groups meet `before` but not `after`, and a key with groups of its
- * own that do the same (a key without follows its tenant, listed already).
- * No groups at all (the platform's own tenant) reaches every account.
+ * Who loses an account whose groups go from `before` to `after`. Groups
+ * "lose" it when they meet `before` but not `after`; no groups at all (the
+ * platform's own tenant) reach every account.
+ *
+ * - Active and suspended tenants only: a suspended tenant's keys come back
+ *   on reactivation. Pending sign-ups are not read.
+ * - A key is named when it sets groups of its own that lose the account. A
+ *   key without them follows its tenant.
+ * - A tenant is named when its groups lose the account, unless every key it
+ *   has sets groups of its own that still reach it. A tenant with no key yet
+ *   is named: its next key takes those groups.
+ *
+ * Every tenant's keys are read, at most `KEY_READS_IN_FLIGHT` at a time.
+ * This per-tenant cost stands until a backend endpoint reports the impact.
  */
 async function whoLoses(before: string[], after: string[]): Promise<Impact> {
   const loses = (groups: string[]) =>
     groups.length > 0 && groups.some((g) => before.includes(g)) && !groups.some((g) => after.includes(g));
-  const all = await tenants.list();
-  const keys = (await Promise.all(all.map(async (t) => (await tenants.keys(t.id)).map((key) => ({ key, tenant: t })))))
-    .flat()
-    .filter(({ key }) => (key.allowed_provider_groups?.length ?? 0) > 0 && loses(key.effective_provider_groups));
-  return { tenants: all.filter((t) => loses(t.allowed_provider_groups)), keys };
+  const ownGroups = (k: AdminKey) => (k.allowed_provider_groups?.length ?? 0) > 0;
+  const live = (await tenants.list()).filter((t) => t.status === "active" || t.status === "suspended");
+  const keysOf = new Map<string, AdminKey[]>();
+  let next = 0;
+  const worker = async () => {
+    for (let t = live[next++]; t !== undefined; t = live[next++]) keysOf.set(t.id, await tenants.keys(t.id));
+  };
+  await Promise.all(Array.from({ length: Math.min(KEY_READS_IN_FLIGHT, live.length) }, worker));
+
+  const impact: Impact = { tenants: [], keys: [] };
+  for (const tenant of live) {
+    const keys = keysOf.get(tenant.id) ?? [];
+    for (const key of keys) {
+      if (ownGroups(key) && loses(key.effective_provider_groups)) impact.keys.push({ key, tenant });
+    }
+    const covered =
+      keys.length > 0 &&
+      keys.every((k) => ownGroups(k) && k.effective_provider_groups.some((g) => after.includes(g)));
+    if (loses(tenant.allowed_provider_groups) && !covered) impact.tenants.push(tenant);
+  }
+  return impact;
 }
 
 function sameList(a: string[], b: string[]): boolean {
@@ -352,6 +383,8 @@ function AccountForm({
   // Set while a save that drops groups awaits `确认移除分组`; the impact is
   // null while it is read.
   const [removal, setRemoval] = useState<{ dropped: string[]; impact: Impact | string | null } | null>(null);
+  // Numbers each impact lookup; a result is applied only while its number is the latest.
+  const lookup = useRef(0);
 
   // A new account takes the first protocol family once the schema arrives.
   useEffect(() => {
@@ -426,14 +459,18 @@ function AccountForm({
       return;
     }
     // Removing a group can close keys that reach this account only through
-    // it: name them first, and save only on confirmation.
+    // it: name them first, and save only on confirmation. Only the latest
+    // lookup may fill the confirmation: one started for a removal that was
+    // cancelled can finish after the next removal opened.
+    const ticket = ++lookup.current;
     setRemoval({ dropped, impact: null });
+    let impact: Impact | string;
     try {
-      const impact = await whoLoses(initial.groups, groups);
-      setRemoval((r) => r && { ...r, impact });
+      impact = await whoLoses(initial.groups, groups);
     } catch (e) {
-      setRemoval((r) => r && { ...r, impact: errorText(e) });
+      impact = errorText(e);
     }
+    if (lookup.current === ticket) setRemoval((r) => r && { ...r, impact });
   }
 
   return (
@@ -518,14 +555,14 @@ function AccountForm({
             <p>没有租户或密钥会因此用不到该账号。</p>
           ) : (
             <>
-              <p>以下租户与密钥将无法再通过该账号调用模型：</p>
+              <p>以下租户与密钥会受影响：</p>
               <ul>
                 {removal.impact.tenants.map((t) => (
-                  <li key={t.id}>租户「{t.name}」</li>
+                  <li key={t.id}>租户「{t.name}」：租户默认分组不再包含该账号</li>
                 ))}
                 {removal.impact.keys.map(({ key, tenant }) => (
                   <li key={key.id}>
-                    密钥「{key.label}」（租户「{tenant.name}」）
+                    密钥「{key.label}」（租户「{tenant.name}」）：密钥自己的分组不再包含该账号
                   </li>
                 ))}
               </ul>
