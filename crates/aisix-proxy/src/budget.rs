@@ -31,7 +31,7 @@ use aisix_core::resource::ResourceEntry;
 use aisix_core::snapshot::ResourceTable;
 use aisix_core::AisixSnapshot;
 use arc_swap::ArcSwapOption;
-use chrono::{DateTime, Datelike, NaiveTime, Utc};
+use chrono::{DateTime, Utc};
 
 use crate::auth::AuthenticatedKey;
 use crate::error::ProxyError;
@@ -241,11 +241,11 @@ impl BudgetGate {
     pub(crate) fn key_verdict(&self, auth: &AuthenticatedKey) -> Verdict {
         let user_id = auth.entry.value.user_id.as_deref();
         let mut applies = false;
-        let mut denied: Option<(u8, BudgetScope, &Entry, &aisix_core::models::BudgetReason)> = None;
+        let mut denied: Option<(u8, BudgetScope, &Entry, InForce<'_>)> = None;
         for entry in self.index.applicable(auth) {
             applies = true;
             let budget = &entry.value;
-            let Some(reason) = self.in_force_reason(budget, user_id) else {
+            let Some(mark) = self.in_force_reason(budget, user_id) else {
                 continue;
             };
             let rank = scope_rank(budget.scope);
@@ -255,12 +255,12 @@ impl BudgetGate {
                 rank > *r || (rank == *r && budget.scope.as_str() < scope.as_str())
             });
             if better {
-                denied = Some((rank, budget.scope, entry, reason));
+                denied = Some((rank, budget.scope, entry, mark));
             }
         }
         match denied {
-            Some((_, _, entry, reason)) => {
-                Verdict::Exceeded(Box::new(self.reason(&entry.value, reason)))
+            Some((_, _, entry, mark)) => {
+                Verdict::Exceeded(Box::new(self.reason(&entry.value, mark)))
             }
             None if applies && self.unverified => Verdict::Unverified,
             None => Verdict::Allow,
@@ -273,8 +273,8 @@ impl BudgetGate {
             return Verdict::Allow;
         };
         for entry in budgets {
-            if let Some(reason) = self.in_force_reason(&entry.value, None) {
-                return Verdict::Exceeded(Box::new(self.reason(&entry.value, reason)));
+            if let Some(mark) = self.in_force_reason(&entry.value, None) {
+                return Verdict::Exceeded(Box::new(self.reason(&entry.value, mark)));
             }
         }
         if self.unverified {
@@ -304,7 +304,7 @@ impl BudgetGate {
         &self,
         budget: &'a Budget,
         user_id: Option<&str>,
-    ) -> Option<&'a aisix_core::models::BudgetReason> {
+    ) -> Option<InForce<'a>> {
         let current = period_start(self.now, budget.period);
         let in_force = |start: Option<&str>| {
             start.is_none_or(|s| {
@@ -313,20 +313,33 @@ impl BudgetGate {
         };
         if let Some(exhausted) = &budget.exhausted {
             if in_force(exhausted.period_start.as_deref()) {
-                return Some(&exhausted.reason);
+                return Some(InForce {
+                    reason: &exhausted.reason,
+                    has_period_start: exhausted.period_start.is_some(),
+                });
             }
         }
         if budget.scope == BudgetScope::TeamMember {
             let member = budget.exhausted_members.get(user_id?)?;
             if in_force(Some(&member.period_start)) {
-                return Some(&member.reason);
+                return Some(InForce {
+                    reason: &member.reason,
+                    has_period_start: true,
+                });
             }
         }
         None
     }
 
-    fn reason(&self, budget: &Budget, doc: &aisix_core::models::BudgetReason) -> BudgetReason {
-        let resets_at = next_period_start(period_start(self.now, budget.period), budget.period);
+    /// The caller-facing reason for `mark`. A mark without a period start
+    /// (a cumulative quota, the balance mark) holds until the control plane
+    /// lifts it, so it advertises no reset and keeps the reason's own
+    /// `period`: the document's is only a placeholder there.
+    fn reason(&self, budget: &Budget, mark: InForce<'_>) -> BudgetReason {
+        let doc = mark.reason;
+        let resets_at = mark
+            .has_period_start
+            .then(|| next_period_start(period_start(self.now, budget.period), budget.period));
         // Amounts are restated in the dollar-string form the response has
         // always carried.
         let amount = |v: &Option<String>| {
@@ -351,11 +364,22 @@ impl BudgetGate {
             limit_usd: amount(&doc.limit_usd),
             spent_usd: amount(&doc.spent_usd),
             remaining_usd: amount(&doc.remaining_usd),
-            period: Some(budget.period.as_str().to_string()),
-            period_resets_at: Some(resets_at.format("%Y-%m-%dT%H:%M:%SZ").to_string()),
-            retry_after_seconds: Some((resets_at - self.now).num_seconds().max(0) as u64),
+            period: if mark.has_period_start {
+                Some(budget.period.as_str().to_string())
+            } else {
+                doc.period.clone()
+            },
+            period_resets_at: resets_at.map(|t| t.format("%Y-%m-%dT%H:%M:%SZ").to_string()),
+            retry_after_seconds: resets_at.map(|t| (t - self.now).num_seconds().max(0) as u64),
         }
     }
+}
+
+/// An exhausted mark in force, and whether it named the period it was set in.
+#[derive(Clone, Copy)]
+struct InForce<'a> {
+    reason: &'a aisix_core::models::BudgetReason,
+    has_period_start: bool,
 }
 
 /// The control plane's precedence among scopes when several deny at once:
@@ -374,23 +398,11 @@ fn scope_rank(scope: BudgetScope) -> u8 {
 
 /// Start of the UTC calendar period containing `now`.
 pub(crate) fn period_start(now: DateTime<Utc>, period: BudgetPeriod) -> DateTime<Utc> {
-    let day = now.date_naive();
-    let first = match period {
-        BudgetPeriod::Day => day,
-        BudgetPeriod::Week => {
-            day - chrono::Days::new(u64::from(day.weekday().num_days_from_monday()))
-        }
-        BudgetPeriod::Month => day.with_day(1).expect("the 1st exists in every month"),
-    };
-    first.and_time(NaiveTime::MIN).and_utc()
+    period.start_of(now)
 }
 
 fn next_period_start(start: DateTime<Utc>, period: BudgetPeriod) -> DateTime<Utc> {
-    match period {
-        BudgetPeriod::Day => start + chrono::Days::new(1),
-        BudgetPeriod::Week => start + chrono::Days::new(7),
-        BudgetPeriod::Month => start + chrono::Months::new(1),
-    }
+    period.next_start(start)
 }
 
 /// The key-level budget decision for one request: refreshes the
@@ -696,6 +708,88 @@ mod tests {
         assert_eq!(r.period_resets_at.as_deref(), Some("2026-11-01T00:00:00Z"));
         assert_eq!(r.retry_after_seconds, Some(3600));
         assert_eq!(r.gauges().remaining_usd, Some(-0.5));
+    }
+
+    #[test]
+    fn a_mark_without_a_period_start_advertises_no_reset() {
+        // A cumulative quota: the document's period is a placeholder, the
+        // reason names the quota's own.
+        let doc = |period_start: Option<&str>| {
+            let mut doc = exhausted(
+                "api_key",
+                serde_json::json!({"scope_ref": "k-1"}),
+                period_start,
+            );
+            doc["exhausted"]["reason"] =
+                serde_json::json!({"scope": "api_key", "period": "total", "limit_usd": "0.05"});
+            doc
+        };
+        let now = at(2026, 11, 7, 13);
+        let snap = snapshot_with(&[("b-1", doc(None))]);
+        let k = key(&snap, "k-1", serde_json::json!({}));
+        let Verdict::Exceeded(r) = gate_at(&snap, now, false).key_verdict(&k) else {
+            panic!("the key is denied")
+        };
+        assert_eq!(r.period_resets_at, None);
+        assert_eq!(r.retry_after_seconds, None);
+        assert_eq!(r.period.as_deref(), Some("total"));
+        assert_eq!(r.limit_usd.as_deref(), Some("0.05"));
+        assert_eq!(
+            ProxyError::BudgetExceeded(r).retry_after_secs(),
+            None,
+            "no Retry-After"
+        );
+
+        // The same mark with a period start keeps the document's period
+        // and its reset.
+        let snap = snapshot_with(&[("b-1", doc(Some("2026-11-01T00:00:00Z")))]);
+        let Verdict::Exceeded(r) = gate_at(&snap, now, false).key_verdict(&k) else {
+            panic!("the key is denied")
+        };
+        assert_eq!(r.period.as_deref(), Some("month"));
+        assert_eq!(r.period_resets_at.as_deref(), Some("2026-12-01T00:00:00Z"));
+        assert!(r.retry_after_seconds.is_some());
+    }
+
+    #[test]
+    fn the_balance_mark_carries_no_period() {
+        let snap = snapshot_with(&[(
+            "b-1",
+            serde_json::json!({
+                "scope": "team", "scope_ref": "team-1", "period": "day",
+                "exhausted": {"reason": {"message": "Insufficient balance.", "scope": "team"}}
+            }),
+        )]);
+        let k = key(&snap, "k-1", serde_json::json!({"team_id": "team-1"}));
+        let Verdict::Exceeded(r) = gate_at(&snap, at(2026, 11, 7, 13), false).key_verdict(&k)
+        else {
+            panic!("the key is denied")
+        };
+        assert_eq!(r.message, "Insufficient balance.");
+        assert_eq!(r.period, None);
+        assert_eq!(r.period_resets_at, None);
+        assert_eq!(r.retry_after_seconds, None);
+    }
+
+    #[test]
+    fn a_member_mark_advertises_its_reset() {
+        let doc = serde_json::json!({
+            "scope": "team_member", "scope_ref": "team-1", "period": "day",
+            "exhausted_members": {"user-1": {"period_start": "2026-11-07T00:00:00Z", "reason": {"message": "you"}}}
+        });
+        let snap = snapshot_with(&[("b-1", doc)]);
+        let k = key(
+            &snap,
+            "k-1",
+            serde_json::json!({"team_id": "team-1", "user_id": "user-1"}),
+        );
+        let Verdict::Exceeded(r) = gate_at(&snap, at(2026, 11, 7, 13), false).key_verdict(&k)
+        else {
+            panic!("the member is denied")
+        };
+        assert_eq!(r.period.as_deref(), Some("day"));
+        assert_eq!(r.period_resets_at.as_deref(), Some("2026-11-08T00:00:00Z"));
+        assert_eq!(r.retry_after_seconds, Some(10 * 3600 + 30 * 60));
     }
 
     #[test]

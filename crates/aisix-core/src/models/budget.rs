@@ -11,6 +11,7 @@
 
 use std::collections::BTreeMap;
 
+use chrono::{DateTime, Datelike, Days, Months, NaiveTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::resource::Resource;
@@ -121,6 +122,26 @@ impl BudgetPeriod {
             Self::Month => "month",
         }
     }
+
+    /// Start of the UTC calendar period containing `at`.
+    pub fn start_of(self, at: DateTime<Utc>) -> DateTime<Utc> {
+        let day = at.date_naive();
+        let first = match self {
+            Self::Day => day,
+            Self::Week => day - Days::new(u64::from(day.weekday().num_days_from_monday())),
+            Self::Month => day - Days::new(u64::from(day.day0())),
+        };
+        first.and_time(NaiveTime::MIN).and_utc()
+    }
+
+    /// Start of the period after the one that starts at `start`.
+    pub fn next_start(self, start: DateTime<Utc>) -> DateTime<Utc> {
+        match self {
+            Self::Day => start + Days::new(1),
+            Self::Week => start + Days::new(7),
+            Self::Month => start + Months::new(1),
+        }
+    }
 }
 
 /// The budget is exhausted for everything it applies to.
@@ -129,7 +150,8 @@ pub struct BudgetExhausted {
     /// Start of the period the budget was exhausted in, as an RFC 3339
     /// timestamp. The block holds only while this is the start of the
     /// current period, so it lifts at the next period boundary on its own.
-    /// Omitted, the block holds in every period.
+    /// Omitted, the block holds in every period. A rejection by a mark
+    /// without one carries no reset time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub period_start: Option<String>,
     /// What a rejected request is told.
@@ -252,8 +274,40 @@ impl Resource for BudgetPolicy {
 
 #[cfg(test)]
 mod tests {
+    use super::BudgetPeriod;
     use crate::models::{validate_budget, validate_budget_lenient, validate_budget_policy};
+    use chrono::{DateTime, Utc};
     use serde_json::json;
+
+    fn utc(s: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    }
+
+    #[test]
+    fn a_period_starts_on_the_utc_calendar() {
+        assert_eq!(
+            BudgetPeriod::Day.start_of(utc("2026-11-07T23:59:59.999Z")),
+            utc("2026-11-07T00:00:00Z")
+        );
+        // 2026-11-08 is a Sunday: its week began on Monday the 2nd.
+        assert_eq!(
+            BudgetPeriod::Week.start_of(utc("2026-11-08T23:59:59.999Z")),
+            utc("2026-11-02T00:00:00Z")
+        );
+        // A Monday at midnight is its own week's start.
+        assert_eq!(
+            BudgetPeriod::Week.start_of(utc("2026-11-09T00:00:00Z")),
+            utc("2026-11-09T00:00:00Z")
+        );
+        assert_eq!(
+            BudgetPeriod::Month.start_of(utc("2026-12-31T23:59:59Z")),
+            utc("2026-12-01T00:00:00Z")
+        );
+        assert_eq!(
+            BudgetPeriod::Month.next_start(utc("2026-12-01T00:00:00Z")),
+            utc("2027-01-01T00:00:00Z")
+        );
+    }
 
     /// The per-scope shape is a write-path rule only: the stored row still
     /// loads, and a row without its target matches nothing.
