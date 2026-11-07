@@ -187,6 +187,17 @@ where
         cfg.db_statement_timeout_ms,
     )
     .await?;
+    // A tenant an older release created has no billing account yet.
+    let opened = billing::ledger::backfill_accounts(
+        &mut *db.pool().acquire().await.map_err(db::DbError::from)?,
+    )
+    .await?;
+    if opened > 0 {
+        tracing::info!(
+            opened,
+            "opened the billing accounts of tenants that had none"
+        );
+    }
     let env = settings::ensure_env(&db, cfg.env_id_seed, &cfg.etcd_prefix).await?;
     // The id this database claims its environment's kine prefix under.
     projector::ensure_database_id(&db).await?;

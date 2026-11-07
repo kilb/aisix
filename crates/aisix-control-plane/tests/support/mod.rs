@@ -11,6 +11,7 @@
 #![allow(dead_code)]
 
 pub mod members;
+pub mod world;
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};

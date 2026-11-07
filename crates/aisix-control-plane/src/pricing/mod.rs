@@ -42,8 +42,9 @@ use serde_json::Value;
 use sqlx::PgConnection;
 use uuid::Uuid;
 
+use crate::billing::ledger::{self, Posting, Source};
 use crate::db::DbError;
-use store::{record_charge, ChargeError, ChargeIdentity, PriceBookCache};
+use store::{record_charge, ChargeError, ChargeIdentity, PriceBookCache, Recorded};
 
 /// A usage row the intake transaction has just stored, as stored.
 pub struct StoredEvent {
@@ -66,6 +67,14 @@ pub struct Priced {
 /// records its one charge, on `conn`. The book is read on `conn` too, so a
 /// database error anywhere fails the whole transaction and nothing of the
 /// batch is kept.
+///
+/// Each row charged above 0 debits its tenant's balance with one ledger
+/// entry, posted in the same transaction once every charge is recorded. A
+/// charge of 0 (a free model, a full discount) posts nothing, and neither
+/// does a row that is not charged. The accounts of every tenant the rows'
+/// keys belong to are locked first, in ascending tenant id, so that two
+/// batches naming the same tenants cannot deadlock; no tenant row is locked,
+/// so a tenant an operator is editing does not hold up intake.
 pub async fn price_stored(
     conn: &mut PgConnection,
     prices: &PriceBookCache,
@@ -79,8 +88,12 @@ pub async fn price_stored(
     }
     let book = prices.current(&mut *conn).await?;
     let keys = key_records(&mut *conn, &stored).await?;
-    // A fixed order, by event_id compared as bytes, for the charge inserts.
+    let mut tenants: Vec<Uuid> = keys.values().map(|k| k.tenant_id).collect();
+    ledger::lock_accounts(&mut *conn, &mut tenants).await?;
+    // A fixed order, by event_id compared as bytes, for the charge inserts
+    // and the ledger entries.
     stored.sort_by(|a, b| a.event_id.cmp(&b.event_id));
+    let mut debits = Vec::new();
     for row in &stored {
         let claim = Claim::of(&row.event);
         let key = key_id(claim.api_key_id).and_then(|id| keys.get(&id));
@@ -144,7 +157,21 @@ pub async fn price_stored(
             user_id: &member_id,
             requested_model_id: claim.requested_model_id,
         };
-        record_charge(&mut *conn, &ident, &charge).await?;
+        let recorded = record_charge(&mut *conn, &ident, &charge).await?;
+        if let (Recorded::Inserted, Ok(p), Some(k)) = (recorded, &charge, key) {
+            if p.outcome == Outcome::Charged && p.charge.0 > 0 {
+                debits.push(Posting {
+                    tenant_id: k.tenant_id,
+                    amount_micro_usd: -p.charge.0,
+                    source: Source::Usage {
+                        event_id: &row.event_id,
+                    },
+                });
+            }
+        }
+    }
+    if !debits.is_empty() {
+        ledger::post(&mut *conn, &debits).await?;
     }
     Ok(priced)
 }

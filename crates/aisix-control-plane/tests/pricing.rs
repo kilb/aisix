@@ -17,36 +17,22 @@ use aisix_control_plane::audit::Actor;
 use aisix_control_plane::auth::{MemberRole, OperatorRole};
 use aisix_control_plane::error::ApiError;
 use aisix_control_plane::pricing::store::{
-    self, CostRevision, DiscountRevision, NewCostPrice, NewDiscount, NewSellPrice, SellRevision,
+    self, CostRevision, DiscountRevision, NewCostPrice, NewDiscount,
 };
 use aisix_pricing::{Catalogue, Rate, RateCard, ENGINE_VERSION};
 use chrono::{DateTime, TimeDelta, Utc};
 use futures::FutureExt;
 use serde_json::{json, Value};
 use sqlx::{Connection, PgConnection};
-use support::{DpClient, OperatorSession, Resp, TestCp};
+use support::world::{
+    card, db_now, deliver, insert_sell, price, seed_key, seed_model, seed_provider_key,
+    seed_tenant, tokens_680, usage, world, World,
+};
+use support::{OperatorSession, Resp, TestCp};
 use tokio::sync::Barrier;
 use uuid::Uuid;
 
 const DEDUP: &str = "x-aisix-usage-batch-dedup";
-
-/// USD per million: input 1, output 2, cache read 0.1. So 1000 prompt tokens
-/// of which 800 were cache hits, and 200 completion tokens, cost
-/// 200 × 1 + 800 × 0.1 + 200 × 2 = 680 µ$.
-fn card() -> RateCard {
-    serde_json::from_value(json!({
-        "default": {"base": {"input": "1", "output": "2", "cache_read": "0.1"}}
-    }))
-    .expect("the test card decodes")
-}
-
-/// The database's clock: what a price write compares `effective_from` with.
-async fn db_now(cp: &TestCp) -> DateTime<Utc> {
-    sqlx::query_scalar("SELECT now()")
-        .fetch_one(cp.db().pool())
-        .await
-        .expect("read now()")
-}
 
 async fn pricing_version(cp: &TestCp) -> i64 {
     sqlx::query_scalar(
@@ -66,22 +52,6 @@ async fn bump_pricing_version(cp: &TestCp) {
     .execute(cp.db().pool())
     .await
     .expect("bump pricing_version");
-}
-
-fn text(v: &Value, pointer: &str) -> String {
-    v.pointer(pointer)
-        .and_then(Value::as_str)
-        .unwrap_or_else(|| panic!("{pointer} in {v}"))
-        .to_string()
-}
-
-/// `POST path` as `admin`, which must answer 201.
-async fn create(cp: &TestCp, admin: &OperatorSession, path: &str, body: Value) -> Value {
-    let r = cp
-        .send("POST", path, Some(admin.cookie()), Some(body))
-        .await;
-    assert_eq!(r.status, 201, "POST {path}: {r:?}");
-    r.body
 }
 
 /// `method path` as `admin` with `If-Match: "<version>"`, and no body,
@@ -108,123 +78,6 @@ async fn send_if_match(
         .expect("send the request")
         .status()
         .as_u16()
-}
-
-/// An upstream account (a provider key), created as an operator; its id.
-async fn seed_provider_key(cp: &TestCp, admin: &OperatorSession) -> Uuid {
-    let pk = create(
-        cp,
-        admin,
-        "/admin/resources/provider_keys",
-        json!({"doc": {
-            "display_name": format!("acct-pricing-{}", Uuid::new_v4().simple()),
-            "provider": "openai",
-            "api_key": "sk-pricing-upstream-7c1",
-            "groups": ["shared"],
-        }}),
-    )
-    .await;
-    Uuid::parse_str(&text(&pk, "/id")).expect("a provider key id")
-}
-
-/// A platform model on a provider key of its own, created as an operator.
-async fn seed_model(cp: &TestCp, admin: &OperatorSession) -> Uuid {
-    let pk = seed_provider_key(cp, admin).await;
-    let model = create(
-        cp,
-        admin,
-        "/admin/resources/models",
-        json!({"doc": {
-            "display_name": format!("priced-{}", Uuid::new_v4().simple()),
-            "provider": "openai",
-            "model_name": "gpt-4o-mini",
-            "provider_key_id": pk,
-        }}),
-    )
-    .await;
-    Uuid::parse_str(&text(&model, "/id")).expect("a model id")
-}
-
-async fn seed_tenant(cp: &TestCp, admin: &OperatorSession) -> Uuid {
-    let tenant = create(
-        cp,
-        admin,
-        "/admin/tenants",
-        json!({"name": format!("tenant-{}", Uuid::new_v4().simple())}),
-    )
-    .await;
-    Uuid::parse_str(&text(&tenant, "/id")).expect("a tenant id")
-}
-
-/// A key of `tenant`, bound to `member` when given, minted by an operator;
-/// its id.
-async fn seed_key(
-    cp: &TestCp,
-    admin: &OperatorSession,
-    tenant: Uuid,
-    member: Option<Uuid>,
-) -> String {
-    let mut body = json!({"label": "pricing-7c1"});
-    if let Some(member) = member {
-        body["member_id"] = json!(member);
-    }
-    let key = create(cp, admin, &format!("/admin/tenants/{tenant}/keys"), body).await;
-    text(&key, "/key/id")
-}
-
-/// A control plane with an operator, a gateway, a tenant, one of its members
-/// and that member's key.
-struct World {
-    cp: TestCp,
-    admin: OperatorSession,
-    dp: DpClient,
-    tenant: Uuid,
-    member: Uuid,
-    key: String,
-}
-
-async fn world() -> Option<World> {
-    let cp = TestCp::start().await?;
-    let admin = cp.admin_login_seeded(OperatorRole::Operator).await;
-    let dp = cp.issue_dp_client("gw-pricing-7c1").await;
-    let tenant = seed_tenant(&cp, &admin).await;
-    let member = cp.seed_member(tenant, MemberRole::Member).await.id;
-    let key = seed_key(&cp, &admin, tenant, Some(member)).await;
-    Some(World {
-        cp,
-        admin,
-        dp,
-        tenant,
-        member,
-        key,
-    })
-}
-
-async fn insert_sell(
-    cp: &TestCp,
-    model_id: Uuid,
-    tenant_id: Option<Uuid>,
-    effective_from: DateTime<Utc>,
-    card: Option<RateCard>,
-) -> Result<SellRevision, ApiError> {
-    let row = NewSellPrice {
-        model_id,
-        tenant_id,
-        effective_from,
-        card,
-        source: "manual".to_string(),
-    };
-    cp.db()
-        .tx(move |c| async move { store::insert_sell_price(c, &row, Actor::System).await }.boxed())
-        .await
-}
-
-/// The platform price `card()` for `model`, starting now.
-async fn price(cp: &TestCp, model: Uuid) -> SellRevision {
-    let now = db_now(cp).await;
-    insert_sell(cp, model, None, now, Some(card()))
-        .await
-        .expect("price the model")
 }
 
 async fn insert_cost(cp: &TestCp, row: NewCostPrice) -> Result<CostRevision, ApiError> {
@@ -254,40 +107,6 @@ fn assert_refused_at(err: &ApiError, path: &str) {
         vec![path],
         "{err:?}"
     );
-}
-
-/// A chat usage row of the world's tenant, member and key for `model`,
-/// occurring now, with `fields` on top. It claims a `cost_usd` no price would
-/// give, which pricing must never read.
-fn usage(w: &World, event_id: &str, model: Uuid, fields: Value) -> Value {
-    let mut event = json!({
-        "event_id": event_id,
-        "request_id": format!("req-{event_id}"),
-        "occurred_at": Utc::now().to_rfc3339(),
-        "team_id": w.tenant.to_string(),
-        "api_key_id": w.key,
-        "user_id": w.member.to_string(),
-        "requested_model_id": model.to_string(),
-        "operation": "chat",
-        "status_code": 200,
-        "prompt_tokens": 0,
-        "completion_tokens": 0,
-        "cost_usd": 12.5,
-    });
-    for (k, v) in fields.as_object().expect("fields are an object") {
-        event[k] = v.clone();
-    }
-    event
-}
-
-/// 1000 prompt tokens, 800 of them cache hits, and 200 completion tokens:
-/// 680 µ$ at `card()`.
-fn tokens_680() -> Value {
-    json!({"prompt_tokens": 1000, "cached_prompt_tokens": 800, "completion_tokens": 200})
-}
-
-async fn deliver(dp: &DpClient, batch_id: Uuid, events: Vec<Value>) -> Resp {
-    dp.telemetry(batch_id, &json!({ "events": events })).await
 }
 
 fn counts(accepted: u64, rejected: u64, duplicates: u64) -> Value {

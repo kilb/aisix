@@ -1078,6 +1078,12 @@ async fn the_internal_tenant_exists_exactly_once_and_has_no_groups() {
             .expect("count")
     };
     for round in 0..10 {
+        sqlx::query(
+            "DELETE FROM billing_accounts WHERE tenant_id IN (SELECT id FROM tenants WHERE is_internal)",
+        )
+        .execute(cp.db().pool())
+        .await
+        .expect("the internal tenant's account goes with it");
         sqlx::query("DELETE FROM tenants WHERE is_internal")
             .execute(cp.db().pool())
             .await

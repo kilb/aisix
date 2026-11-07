@@ -10,8 +10,9 @@
 //! changes them.
 //!
 //! Every tenant-scoped read-then-write starts by locking the tenant rows
-//! ([`lock`], [`lock_many`]) and only then reaches `write_resource`, which
-//! takes the resources lock: the lock order everywhere.
+//! ([`lock`], [`lock_many`]), each with its billing account, and only then
+//! reaches `write_resource`, which takes the resources lock: the lock order
+//! everywhere.
 //!
 //! A lookup by id answers `404 not_found` for an id that names no tenant,
 //! the same answer whatever the reason, so the tenant routes built on these
@@ -33,6 +34,7 @@ use uuid::Uuid;
 
 use crate::audit::{self, Actor, AuditEntry};
 use crate::auth::{OperatorAuth, OperatorRole};
+use crate::billing::ledger;
 use crate::compat;
 use crate::db::{Db, DbError};
 use crate::error::{ApiError, BootError, Detail};
@@ -278,18 +280,21 @@ pub fn limits_policy_doc(id: Uuid, limits: &TenantLimits) -> Option<Value> {
     }))
 }
 
-/// Tenant `id`, locked for the rest of the transaction; `404 not_found`
-/// when there is none. Locking a row the transaction already holds is a
-/// no-op.
+/// Tenant `id`, locked for the rest of the transaction, and then its
+/// billing account ([`ledger::lock_account`]), which comes next in the lock
+/// order; `404 not_found` when there is none. Locking a row the transaction
+/// already holds is a no-op.
 pub async fn lock(conn: &mut PgConnection, id: Uuid) -> Result<TenantRow, ApiError> {
     let raw: Option<RawTenant> = sqlx::query_as(&format!(
         "SELECT {COLUMNS} FROM tenants WHERE id = $1 FOR UPDATE"
     ))
     .bind(id)
-    .fetch_optional(conn)
+    .fetch_optional(&mut *conn)
     .await
     .map_err(DbError::from)?;
-    TenantRow::from_raw(raw.ok_or_else(ApiError::not_found)?)
+    let tenant = TenantRow::from_raw(raw.ok_or_else(ApiError::not_found)?)?;
+    ledger::lock_account(conn, id).await?;
+    Ok(tenant)
 }
 
 /// Tenant `id` as it stands, without a lock; `404 not_found` when there is
@@ -331,6 +336,8 @@ struct NewTenant<'a> {
     approved_by: Option<Uuid>,
 }
 
+/// Inserts the tenant row `new` and its billing account, and writes its
+/// documents.
 async fn insert(
     conn: &mut PgConnection,
     ctx: &WriteCtx,
@@ -355,15 +362,20 @@ async fn insert(
     .execute(&mut *conn)
     .await
     .map_err(DbError::from)?;
+    sqlx::query("INSERT INTO billing_accounts (tenant_id) VALUES ($1)")
+        .bind(id)
+        .execute(&mut *conn)
+        .await
+        .map_err(DbError::from)?;
     project(&mut *conn, ctx, id).await?;
     lock(conn, id).await
 }
 
 /// Creates an ordinary tenant in `status`, with a copy of the current
-/// tenant defaults (its limits and its provider groups, ruling 27), and
-/// writes its documents. An active tenant counts as approved by `actor`.
-/// Recording it in the audit log is the caller's: signup and the operator
-/// API record it differently.
+/// tenant defaults (its limits and its provider groups, ruling 27), opens
+/// its billing account and writes its documents. An active tenant counts as
+/// approved by `actor`. Recording it in the audit log is the caller's: signup
+/// and the operator API record it differently.
 pub async fn create(
     conn: &mut PgConnection,
     ctx: &WriteCtx,

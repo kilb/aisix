@@ -677,6 +677,22 @@ fn an_uncast_sum_is_reported() {
         vec!["SUM(CASE WHEN a THEN (b) ELSE 0 END)"]
     );
     assert!(uncast_sums("SELECT SUM(CASE WHEN a THEN (b) ELSE 0 END)::bigint FROM t").is_empty());
+    // A window call's result is what follows its window clause.
+    assert!(
+        uncast_sums("SELECT SUM(a) OVER (PARTITION BY t ORDER BY (n))::bigint FROM t").is_empty()
+    );
+    assert!(
+        uncast_sums("SELECT sum(a) over w :: bigint FROM t WINDOW w AS (ORDER BY n)").is_empty()
+    );
+    assert_eq!(
+        uncast_sums("SELECT SUM(a) OVER (ORDER BY n) FROM t"),
+        vec!["SUM(a)"]
+    );
+    assert_eq!(uncast_sums("SELECT SUM(a) OVER w FROM t").len(), 1);
+    assert_eq!(
+        uncast_sums("SELECT SUM(a) overtime::bigint FROM t").len(),
+        1
+    );
     // A cast on some other call does not count.
     assert_eq!(
         uncast_sums("SELECT GREATEST(SUM(a), 0)::bigint FROM t").len(),

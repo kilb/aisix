@@ -2,8 +2,9 @@
 //! rows of gateway instances not heard from for a week (a gateway mints a
 //! new `instance_id` at every boot, so each restart leaves one behind), and
 //! the tombstones of deleted gateway resources once their delete has been
-//! projected for a day; and catching up the key documents an older release
-//! wrote ([`keys::catch_up`]).
+//! projected for a day; catching up the key documents an older release
+//! wrote ([`keys::catch_up`]); and opening the billing account of any tenant
+//! that has none ([`ledger::backfill_accounts`]).
 //!
 //! Every instance runs the pass at boot and every 10 minutes after; the
 //! deletes are idempotent, and the catch-up takes one tenant at a time, so
@@ -16,6 +17,7 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 
+use crate::billing::ledger;
 use crate::db::{Db, DbError};
 use crate::keys;
 use crate::resources::write::{WriteCtx, RESOURCES_LOCK_KEY};
@@ -55,9 +57,12 @@ pub async fn run_once(db: &Db) -> Result<Pruned, DbError> {
 }
 
 /// One tick: a pruning pass ([`run_once`]), then the key documents an
-/// older release wrote are caught up ([`keys::catch_up`]), each half logged
-/// on its own so that one failing leaves the other to run. A tenant the
-/// gateway-version gate refuses is caught up by a later tick.
+/// older release wrote are caught up ([`keys::catch_up`]), then every tenant
+/// without a billing account gets one ([`ledger::backfill_accounts`]: an
+/// older release, during a rolling upgrade, creates tenants without one).
+/// Each part is logged on its own so that one failing leaves the others to
+/// run. A tenant the gateway-version gate refuses is caught up by a later
+/// tick.
 pub async fn tick(db: &Db, ctx: &WriteCtx) {
     match run_once(db).await {
         Ok(pruned) => tracing::debug!(?pruned, "housekeeping pass"),
@@ -66,6 +71,18 @@ pub async fn tick(db: &Db, ctx: &WriteCtx) {
     match keys::catch_up(db, ctx, keys::KEY_DOC_VERSION).await {
         Ok(caught_up) => tracing::debug!(?caught_up, "key documents caught up"),
         Err(e) => tracing::warn!(code = e.code, "catching up key documents failed"),
+    }
+    let opened = async {
+        let mut conn = db.pool().acquire().await.map_err(DbError::from)?;
+        ledger::backfill_accounts(&mut conn).await
+    };
+    match opened.await {
+        Ok(0) => {}
+        Ok(opened) => tracing::info!(
+            opened,
+            "opened the billing accounts of tenants that had none"
+        ),
+        Err(e) => tracing::warn!(error = %e, "opening missing billing accounts failed"),
     }
 }
 

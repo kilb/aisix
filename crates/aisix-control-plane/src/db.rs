@@ -218,8 +218,9 @@ impl Db {
 }
 
 /// Every SUM aggregate call in `sql_source` whose result is not cast to
-/// `bigint`, either directly (`::bigint` right after the call) or as the
-/// first argument of a COALESCE that is (`COALESCE(…, 0)::bigint`).
+/// `bigint`, either directly (`::bigint` right after the call, or right
+/// after its window clause: `SUM(…) OVER (…)::bigint`) or as the first
+/// argument of a COALESCE that is (`COALESCE(…, 0)::bigint`).
 ///
 /// It reads any text, Rust source included: a call is the word `sum`, in
 /// any case, followed by `(`. A longer identifier ending in `sum`, a method
@@ -248,7 +249,7 @@ pub fn uncast_sums(sql_source: &str) -> Vec<String> {
             found.push(sql_source[start..line_end].to_string());
             continue;
         };
-        if !is_bigint_cast(b, close + 1) && !in_bigint_coalesce(b, start) {
+        if !is_bigint_cast(b, past_window(b, close + 1)) && !in_bigint_coalesce(b, start) {
             found.push(sql_source[start..=close].to_string());
         }
     }
@@ -282,6 +283,20 @@ fn matching_paren(b: &[u8], open: usize) -> Option<usize> {
         }
     }
     None
+}
+
+/// Where the result of a call ending at `pos` ends: past its window clause
+/// (`OVER (…)` or `OVER name`) when it has one, `pos` otherwise.
+fn past_window(b: &[u8], pos: usize) -> usize {
+    let over = skip_ws(b, pos);
+    if !b[over..].starts_with(b"over") || b.get(over + 4).is_some_and(|&c| is_ident(c)) {
+        return pos;
+    }
+    let window = skip_ws(b, over + 4);
+    if b.get(window) == Some(&b'(') {
+        return matching_paren(b, window).map_or(pos, |close| close + 1);
+    }
+    window + b[window..].iter().take_while(|&&c| is_ident(c)).count()
 }
 
 /// Whether `::bigint` (spaces allowed, any case) starts at `pos`.
