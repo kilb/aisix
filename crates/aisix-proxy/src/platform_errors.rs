@@ -198,8 +198,11 @@ pub(crate) fn classify(err: &ProxyError) -> PlatformErrorClass {
         // The target's own configuration: the platform's to fix, not the
         // caller's, like an upstream that refuses the platform's account.
         ProxyError::UnusableTarget(_) => PlatformErrorClass::UpstreamUnavailable,
-        // The model cannot serve this endpoint, whichever provider is behind it.
-        ProxyError::TargetRefused(_) => PlatformErrorClass::InvalidRequest { param: None },
+        // The model cannot serve this endpoint, whichever provider is behind
+        // it: the caller's `model` is the field to change.
+        ProxyError::TargetRefused(_) => PlatformErrorClass::InvalidRequest {
+            param: Some("model".into()),
+        },
         // Read exactly as the upstream's own answer for a `previous_response_id`
         // it does not have: a 400 `invalid_request_error` with `param`
         // `previous_response_id` and code `previous_response_not_found`
@@ -233,14 +236,15 @@ pub(crate) fn classify_bridge(err: &BridgeError) -> PlatformErrorClass {
             status,
             message,
             parsed,
+            wire,
             ..
-        } => classify_upstream(Some(*status), parsed.as_deref(), message),
+        } => classify_upstream(Some(*status), parsed.as_deref(), message, *wire),
         BridgeError::UpstreamInBand {
             status,
             message,
             parsed,
-            ..
-        } => classify_upstream(*status, parsed.as_deref(), message),
+            wire,
+        } => classify_upstream(*status, parsed.as_deref(), message, *wire),
         // A request field this provider's bridge cannot translate: the text
         // names the provider, the refusal is still of the request.
         BridgeError::InvalidRequest(_) | BridgeError::RequestTooLarge { .. } => {
@@ -321,10 +325,28 @@ const CONTEXT_OVERFLOW_MARKERS: &[&str] = &[
 /// `rate_limit_error`.
 const RATE_LIMIT_TOKENS: &[&str] = &["rate_limit_exceeded", "rate_limit_error"];
 
+/// The field an Anthropic error names, which it writes at the head of its
+/// message rather than in a `param` of its own: `max_tokens: 64001 > 64000,
+/// which is the maximum allowed number of output tokens for this model`, or
+/// `messages.1.content.0.image.source.base64.media_type: Input should be …`
+/// (<https://docs.anthropic.com/en/api/errors>; Claude Code 2.1.319 matches
+/// these very texts). Only a head that starts with a lowercase letter, as
+/// every field of the Messages API does, and is followed by `": "`; the
+/// field-shape check in [`classify_upstream`] then applies to it as to any
+/// `param`.
+fn anthropic_field_path(view: &UpstreamErrorView) -> Option<String> {
+    let (head, _) = view.message.as_deref()?.split_once(": ")?;
+    head.as_bytes()
+        .first()
+        .is_some_and(u8::is_ascii_lowercase)
+        .then(|| head.to_string())
+}
+
 fn classify_upstream(
     status: Option<u16>,
     view: Option<&UpstreamErrorView>,
     message: &str,
+    wire: UpstreamWire,
 ) -> PlatformErrorClass {
     let names = |tokens: &[&str]| {
         view.is_some_and(|v| {
@@ -349,15 +371,19 @@ fn classify_upstream(
     // anything else is the upstream's own text. And only from a native
     // dispatch: after a translation it names a field of the request the
     // gateway built, in the upstream's protocol, which tells the caller what
-    // that protocol is.
+    // that protocol is. An Anthropic error names its field in its message.
     let param = || {
-        view.and_then(|v| v.param.clone())
-            .filter(|_| !crate::attribution::translated_dispatch())
-            .filter(|p| {
-                p.len() <= 256
-                    && p.bytes()
-                        .all(|b| b.is_ascii_alphanumeric() || b"_.[]".contains(&b))
-            })
+        view.and_then(|v| match (&v.param, wire) {
+            (Some(param), _) => Some(param.clone()),
+            (None, UpstreamWire::Anthropic) => anthropic_field_path(v),
+            (None, _) => None,
+        })
+        .filter(|_| !crate::attribution::translated_dispatch())
+        .filter(|p| {
+            p.len() <= 256
+                && p.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"_.[]".contains(&b))
+        })
     };
     match status {
         Some(429) => PlatformErrorClass::RateLimited,
@@ -1364,7 +1390,82 @@ mod tests {
         assert_eq!(refusal.status(), StatusCode::BAD_REQUEST);
         let on = render_platform(&refusal);
         assert_eq!(on["error"]["code"], "invalid_request");
+        // The field to change is the model the caller named.
+        assert_eq!(on["error"]["param"], "model");
         assert!(!on.to_string().contains("bedrock"), "{on}");
+    }
+
+    /// An Anthropic error names the field at the head of its message. A
+    /// native Messages caller keeps it as `param`; the rest of the text, and
+    /// a head that is no field, stay the upstream's.
+    #[test]
+    fn an_anthropic_error_keeps_the_field_its_message_names() {
+        let on_wire = |wire: UpstreamWire, message: &str| {
+            ProxyError::Bridge(BridgeError::UpstreamStatus {
+                status: 400,
+                message: message.into(),
+                parsed: Some(Box::new(UpstreamErrorView {
+                    kind: Some("invalid_request_error".into()),
+                    message: Some(message.into()),
+                    code: None,
+                    param: None,
+                })),
+                wire,
+                retry_after: None,
+                diagnostic: None,
+            })
+        };
+        let anthropic = |_status: u16, message: &str| on_wire(UpstreamWire::Anthropic, message);
+        for (message, field) in [
+            (
+                "messages.1.content.0.image.source.base64.media_type: Input should be \
+                 'image/jpeg', 'image/png', 'image/gif' or 'image/webp'",
+                Some("messages.1.content.0.image.source.base64.media_type"),
+            ),
+            (
+                "max_tokens: 64001 > 64000, which is the maximum allowed number of output \
+                 tokens for this model",
+                Some("max_tokens"),
+            ),
+            // No field heads these.
+            ("Bedrock: ValidationException in us-east-1", None),
+            ("the request was malformed: try again", None),
+            ("Your credit balance is too low", None),
+        ] {
+            assert_eq!(
+                classify(&anthropic(400, message)),
+                PlatformErrorClass::InvalidRequest {
+                    param: field.map(str::to_owned)
+                },
+                "{message}"
+            );
+        }
+        // Only from a native dispatch, as any `param`.
+        let translated = in_platform_mode(|| {
+            crate::attribution::note_translated_dispatch(true);
+            caller_class(&anthropic(400, "max_tokens: Field required"))
+        });
+        assert_eq!(
+            translated,
+            Some(PlatformErrorClass::InvalidRequest { param: None })
+        );
+        // Another wire's message is not read for a field.
+        for wire in [UpstreamWire::OpenAI, UpstreamWire::Bedrock] {
+            assert_eq!(
+                classify(&on_wire(wire, "max_tokens: Field required")),
+                PlatformErrorClass::InvalidRequest { param: None },
+                "{wire:?}"
+            );
+        }
+        // And the Anthropic envelope carries it.
+        let body: Value = serde_json::from_str(&in_platform_mode(|| {
+            crate::error::anthropic_platform_body(&classify(&anthropic(
+                400,
+                "max_tokens: Field required",
+            )))
+        }))
+        .unwrap();
+        assert_eq!(body["error"]["param"], "max_tokens");
     }
 
     #[test]
