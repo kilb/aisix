@@ -571,7 +571,8 @@ Platform mode is a property of each exit, and a missed exit fails silently: noth
 These surfaces are not adapted. Until each is, a platform deployment must not let tenant keys reach it.
 
 - `/v1/completions` returns the upstream's `id` and `system_fingerprint`.
-- Realtime frames inside an established session (connect failures, relayed upstream `error` events) are not classed, because the session runs outside the request's attribution scope. Realtime and `/v1/audio/speech` voice ids are not checked as stored objects.
+- `/v1/rerank`, `/v1/decisions` and `/v1/systemone` relay the upstream's body as sent apart from `model`, its ids and every channel-specific member included.
+- Realtime frames inside an established session (connect failures, relayed upstream `error` events) are not classed, because the session runs outside the request's attribution scope, and the relay hands out every upstream id as sent: session, conversation item and response ids, and `event_id`. Realtime and `/v1/audio/speech` voice ids are not checked as stored objects.
 - Passthrough routes relay the upstream's headers and body as sent, Responses bodies included, and the stored-object check does not read them.
 - The files, batches and fine-tuning surface, including Responses requests inside a batch file, is outside the id and stored-object rules. Its relayed error bodies are classed.
 - Images, audio, video, MCP and A2A have no adaptation beyond the shared error renderers.
