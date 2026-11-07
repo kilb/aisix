@@ -134,6 +134,15 @@
 //! Messages `fallback` block echoed in `messages[]`
 //! (`beta/beta_fallback_block_param.py`), which the API documents as not
 //! read for routing.
+//!
+//! Refused the same way, because the platform would pay for an answer the
+//! gateway never reads: a Responses `background: true`
+//! (`responses/response_create_params.py:49`). The upstream then runs the
+//! response after the request returns, and a caller reads the result by
+//! polling `GET /v1/responses/{id}`
+//! (<https://developers.openai.com/api/docs/guides/background>), or by
+//! continuing from it. The gateway serves no poll and reads no result, so
+//! no usage row could bill what the upstream charges for the response.
 
 use serde_json::Value;
 
@@ -213,6 +222,9 @@ fn responses_selector(body: &Value) -> Option<String> {
         .or_else(|| find_in(body, "tools", &responses_model_node))
         .or_else(|| find_in(body, "tool_choice", &responses_model_node))
         .or_else(|| find_in(body, "input", &responses_model_node))
+        .or_else(|| {
+            (body.get("background") == Some(&Value::Bool(true))).then(|| "background".into())
+        })
 }
 
 /// A Responses tool definition that names the model it runs, walked
@@ -1008,6 +1020,32 @@ mod tests {
         assert!(refuse_in_responses(None, &body).is_ok());
         let req: aisix_gateway::ChatFormat = serde_json::from_value(body).unwrap();
         assert!(refuse_in_chat(None, &req).is_ok());
+    }
+
+    /// A Responses request run in the background is refused: the upstream
+    /// would bill an answer the gateway never reads, so no row could bill
+    /// it. Only `true` asks for one.
+    #[test]
+    fn a_background_response_is_refused() {
+        let responses = |body: Value| selector(refuse_in_responses(Some(&platform()), &body));
+        assert_eq!(
+            responses(json!({"model": "m", "input": "hi", "background": true})).as_deref(),
+            Some("background")
+        );
+        assert_eq!(
+            responses(json!({"model": "m", "input": "hi", "background": true,
+                             "stream": true, "store": true}))
+            .as_deref(),
+            Some("background")
+        );
+        for value in [json!(false), Value::Null] {
+            assert_eq!(
+                responses(json!({"model": "m", "input": "hi", "background": value})),
+                None
+            );
+        }
+        // Off platform mode it is forwarded as before.
+        assert!(refuse_in_responses(None, &json!({"input": "hi", "background": true})).is_ok());
     }
 
     #[test]

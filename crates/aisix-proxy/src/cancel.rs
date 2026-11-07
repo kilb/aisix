@@ -20,8 +20,9 @@
 //!   no exit of the handler settled, with its tokens charged as the run
 //!   would have charged them (`crate::chat::PendingEnsemble`);
 //! - one terminal event for the request itself, `499` /
-//!   `client_disconnected`, zero tokens and zero cost, naming the target
-//!   that was in flight when the caller went away.
+//!   `client_disconnected`, naming the target that was in flight when the
+//!   caller went away. It carries zero tokens and zero cost, unless that
+//!   target had already answered: then it bills the answer (below).
 //!
 //! Exactly one emitter ever speaks for a given request. The guard rides the
 //! request from the middleware to the end of its response body and writes
@@ -31,19 +32,29 @@
 //! not yet exist. Once the body has been polled, or once the handler has
 //! emitted its own terminal event, the guard stays silent.
 //!
-//! Two things this path deliberately does NOT carry. A cancelled request's
-//! events have no guardrail attribution (`applied_guardrails`,
-//! `guardrail_enforced_hits`, `guardrail_scores`, the bypass reason): those
-//! come off a chain each handler resolves for itself, with no chokepoint a
-//! guard could read, and ten opt-in call sites is the drift this design
-//! exists to avoid. And an attempt that had already SUCCEEDED is not
-//! re-emitted: its token counts live in the handler's response processing,
-//! not in the attempt record, so there is nothing to bill it with.
+//! A cancelled request's events deliberately have no guardrail attribution
+//! (`applied_guardrails`, `guardrail_enforced_hits`, `guardrail_scores`, the
+//! bypass reason): those come off a chain each handler resolves for itself,
+//! with no chokepoint a guard could read, and ten opt-in call sites is the
+//! drift this design exists to avoid.
 //!
-//! An ensemble's returned sub-calls are the exception to both: the ensemble
-//! publishes each one's accounting as it returns, together with the input-side
-//! guardrail attribution its rows carry on every other path, so those rows
-//! are re-emitted with their tokens and that attribution.
+//! An attempt that had already ANSWERED is billed on the terminal event. The
+//! upstream charges for an answer when it sends it, and a handler writes its
+//! success row only after the work that follows (the output scan, the
+//! reservation commit, the cache write), so a caller that leaves in between
+//! would otherwise be billed nothing for an answer the upstream billed in
+//! full. Each family publishes the answer's counters, cost and served tier
+//! the moment it has computed them, before its first await
+//! ([`crate::attribution::note_answered_usage`]), and the terminal event
+//! carries them exactly as the success row would have
+//! ([`crate::usage_attr::AnsweredUsage`]). A streamed answer is billed by the
+//! stream's own emitter instead.
+//!
+//! An ensemble's returned sub-calls are the exception to the first rule, and
+//! bill on rows of their own: the ensemble publishes each one's accounting
+//! as it returns, together with the input-side guardrail attribution its
+//! rows carry on every other path, so those rows are re-emitted with their
+//! tokens and that attribution.
 
 use aisix_obs::UsageEvent;
 
@@ -235,9 +246,15 @@ pub(crate) fn emit(
             // case as false. Claiming it would make `emit_usage` fabricate
             // an upstream span for a call nobody made, and there is no
             // latency to report that would mean what an attempt's normally
-            // means.
-            dispatched: false,
-            latency_ms: 0,
+            // means. One that has ANSWERED, and was being processed inside
+            // the attempt when the caller left, did reach it, and took the
+            // time it took to answer.
+            dispatched: a.answered.is_some(),
+            latency_ms: a
+                .answered
+                .as_ref()
+                .map_or(0, |answered| answered.latency_ms),
+            usage: a.answered.as_ref().map(|answered| &answered.usage),
         })
         .or_else(|| {
             ctx.won.as_ref().map(|w| Attempt {
@@ -249,10 +266,11 @@ pub(crate) fn emit(
                 // duration is what the winner's event would have carried.
                 dispatched: true,
                 latency_ms: w.latency_ms,
+                usage: w.usage.as_ref(),
             })
         });
     let pk = ResolvedPk::resolve(&snap, &resolved.provider_key_id);
-    let event = UsageEvent {
+    let mut event = UsageEvent {
         // NO-GUARDRAIL-CHAIN: this emitter runs from `Drop` with no
         // handler. `applied_guardrails`, the enforced hits, the scores
         // and the bypass reason all come off a chain each handler
@@ -297,6 +315,12 @@ pub(crate) fn emit(
         error_message: phase.message().to_string(),
         ..base_event(request_id, resolved, &ctx, &client, inbound_protocol, &pk)
     };
+    // An attempt that answered is billed what the upstream charged for the
+    // answer, exactly as the success row the handler never wrote would have
+    // billed it: the caller leaving does not refund the upstream.
+    if let Some(usage) = attempt.as_ref().and_then(|a| a.usage) {
+        usage.apply(&mut event);
+    }
     let dispatched = attempt.as_ref().is_some_and(|a| a.dispatched);
     emit_one(
         state,
@@ -323,6 +347,9 @@ struct Attempt<'a> {
     /// whole reason this type exists rather than a bare `Option<&…>`.
     dispatched: bool,
     latency_ms: u32,
+    /// What the attempt's answer is billed, when it answered and the family
+    /// noted it before the caller left.
+    usage: Option<&'a crate::usage_attr::AnsweredUsage>,
 }
 
 /// The fields every event on this path shares: who called, what they asked

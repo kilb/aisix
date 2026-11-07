@@ -672,6 +672,11 @@ async fn dispatch(
                     u64::from(u.completion_tokens),
                 )
             });
+            // Billed from here on: a caller that leaves during the commit or
+            // the output review below still owes this answer.
+            if let Some(u) = usage.as_ref() {
+                note_answered_image(snapshot, &target.id, u);
+            }
             reservation.commit(total_tokens, spend).await;
             let review = review_image_output(
                 &resolved_chain,
@@ -838,6 +843,29 @@ pub(crate) async fn review_image_output(
         capture_safe: moderation.capture_safe,
         refusal,
     }
+}
+
+/// What [`emit_usage_event`] bills for an image answer `model_id` served,
+/// on either image surface, noted for a caller that leaves before that row
+/// is written ([`crate::attribution::note_answered_usage`]).
+pub(crate) fn note_answered_image(
+    snap: &aisix_core::AisixSnapshot,
+    model_id: &str,
+    usage: &aisix_gateway::UsageStats,
+) {
+    crate::attribution::note_answered_usage(crate::usage_attr::AnsweredUsage {
+        prompt_tokens: usage.prompt_tokens,
+        completion_tokens: usage.completion_tokens,
+        upstream_total_tokens: usage.upstream_total_tokens,
+        modality: usage.modality,
+        cost_usd: crate::usage_attr::request_cost_usd(
+            snap,
+            model_id,
+            aisix_core::InputTokens::uncached_only(u64::from(usage.prompt_tokens)),
+            u64::from(usage.completion_tokens),
+        ),
+        ..Default::default()
+    });
 }
 
 #[allow(clippy::too_many_arguments)]

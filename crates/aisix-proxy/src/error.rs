@@ -277,11 +277,13 @@ pub enum ProxyError {
     StoredObjectReference(String),
     /// Platform mode: a request field, named by its path, with which the
     /// caller would choose the model that answers past the key's model
-    /// access, such as a fallback chain or a tool's own model
-    /// (`crate::stored_refs`). Answered as an invalid request naming the
-    /// field.
+    /// access, such as a fallback chain or a tool's own model, or have the
+    /// upstream run a response the gateway cannot bill, a Responses
+    /// `background` (`crate::stored_refs`). Answered as an invalid request
+    /// naming the field.
     #[error(
-        "request field `{0}` chooses the model that answers, which platform mode does not allow"
+        "request field `{0}` chooses the model that answers or runs a response the gateway \
+         cannot bill, which platform mode does not allow"
     )]
     ModelSelectorRefused(String),
     /// A list of files, batches or fine-tuning jobs asked for on a provider key

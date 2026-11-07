@@ -2497,6 +2497,11 @@ async fn responses_to_target(
             }
             Some(u)
         };
+        // Billed from here on: a caller that leaves during the scan below, or
+        // the commit and cache write after it, still owes this answer.
+        if let Some(u) = usage.as_ref() {
+            crate::attribution::note_answered_usage(u.answered(snapshot, model_id));
+        }
 
         // #719: run the output guardrail chain on the assistant's text so a
         // configured output block isn't bypassable by calling /v1/responses
@@ -3186,6 +3191,9 @@ async fn responses_cross_provider_to_target(
         }
         u
     };
+    // Billed from here on: a caller that leaves during the scan below, or the
+    // commit and cache write after it, still owes this answer.
+    crate::attribution::note_answered_usage(usage.answered(snapshot, model_id));
 
     // #719: run output guardrails on the bridged response before re-encoding
     // it as Responses JSON — the assistant text + tool calls are
@@ -3463,6 +3471,45 @@ fn parse_responses_terminal_usage(json: &Value) -> Option<ResponseUsage> {
 }
 
 impl ResponseUsage {
+    /// What [`emit_usage_event`] bills for these counters on an answer
+    /// `model_id` served, noted for a caller that leaves before that row is
+    /// written ([`crate::attribution::note_answered_usage`]).
+    fn answered(
+        &self,
+        snap: &aisix_core::AisixSnapshot,
+        model_id: &str,
+    ) -> crate::usage_attr::AnsweredUsage {
+        crate::usage_attr::AnsweredUsage {
+            prompt_tokens: self.prompt_tokens,
+            completion_tokens: self.completion_tokens,
+            reasoning_tokens: self.reasoning_tokens,
+            upstream_total_tokens: self.upstream_total_tokens,
+            reasoning_folded_into_completion: self.reasoning_folded_into_completion,
+            cached_prompt_tokens: self.cached_prompt_tokens,
+            cache_write_tokens: self.cache_write_tokens,
+            cache_creation_tokens: self.cache_creation_tokens,
+            cache_creation_ttl: self.cache_creation_ttl,
+            cache_read_tokens: self.cache_read_tokens,
+            modality: self.modality,
+            usage_estimated: self.usage_estimated,
+            cost_usd: crate::usage_attr::request_cost_usd(
+                snap,
+                model_id,
+                crate::usage_attr::input_tokens_for_pricing(
+                    u64::from(self.prompt_tokens),
+                    u64::from(self.cached_prompt_tokens),
+                    u64::from(self.cache_write_tokens.unwrap_or(0)),
+                    u64::from(self.cache_read_tokens),
+                    u64::from(self.cache_creation_tokens),
+                ),
+                u64::from(self.completion_tokens),
+            ),
+            service_tier: self.service_tier.clone(),
+            provider_request_id: self.provider_request_id.clone(),
+            ..Default::default()
+        }
+    }
+
     fn usage_stats(&self) -> aisix_gateway::UsageStats {
         aisix_gateway::UsageStats {
             cached_prompt_tokens: self.cached_prompt_tokens,

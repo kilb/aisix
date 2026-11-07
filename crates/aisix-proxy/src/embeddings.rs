@@ -936,6 +936,21 @@ async fn dispatch(
                 aisix_core::InputTokens::uncached_only(u64::from(prompt_tokens)),
                 0,
             );
+            // Billed from here on: a caller that leaves during the commit or
+            // the cache write below still owes this answer, priced as the
+            // success row prices it.
+            crate::attribution::note_answered_usage(crate::usage_attr::AnsweredUsage {
+                prompt_tokens,
+                upstream_total_tokens: embed_resp.usage.upstream_total_tokens,
+                usage_estimated,
+                cost_usd: crate::usage_attr::request_cost_usd(
+                    snapshot,
+                    &target.id,
+                    aisix_core::InputTokens::uncached_only(u64::from(prompt_tokens)),
+                    0,
+                ),
+                ..Default::default()
+            });
             reservation
                 .commit(
                     u64::from((embed_resp.usage.total_tokens).max(prompt_tokens)),

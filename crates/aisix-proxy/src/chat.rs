@@ -3789,6 +3789,18 @@ async fn dispatch(
         ),
         completion,
     );
+    // Billed from here on, whatever the work below does or how long it takes:
+    // a caller that leaves during it still owes this answer.
+    crate::attribution::note_answered_usage(crate::usage_attr::AnsweredUsage {
+        prompt_tokens: prompt_tokens_u32,
+        completion_tokens: completion_tokens_u32,
+        usage_estimated,
+        cost_usd,
+        service_tier: service_tier.clone(),
+        provider_request_id: provider_request_id.clone(),
+        provider_model_version: provider_model_version.clone(),
+        ..crate::usage_attr::AnsweredUsage::from_stats(&upstream.usage)
+    });
     reservation
         .commit(total, crate::usage_attr::spend_micro_usd(cost_usd))
         .await;
