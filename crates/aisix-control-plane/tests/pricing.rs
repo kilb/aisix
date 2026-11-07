@@ -2148,12 +2148,11 @@ async fn charges_are_listed_by_event_key_tenant_and_status() {
 #[tokio::test]
 async fn the_charge_status_filter_has_its_own_index() {
     let Some(w) = world().await else { return };
-    let defs: Vec<String> = sqlx::query_scalar(
-        "SELECT indexdef FROM pg_indexes WHERE tablename = 'pricing_charges'",
-    )
-    .fetch_all(w.cp.db().pool())
-    .await
-    .expect("read the indexes");
+    let defs: Vec<String> =
+        sqlx::query_scalar("SELECT indexdef FROM pg_indexes WHERE tablename = 'pricing_charges'")
+            .fetch_all(w.cp.db().pool())
+            .await
+            .expect("read the indexes");
     assert!(
         defs.iter().any(|d| d.contains("(status, seq)")),
         "no (status, seq) index on pricing_charges: {defs:?}"
@@ -2388,7 +2387,10 @@ async fn a_cost_price_that_can_never_apply_says_so() {
         json!(codes(&post("openai", "GPT-4o-mini", None).await)),
         none
     );
-    assert_eq!(json!(codes(&post("openai", "gpt-5-nope", None).await)), none);
+    assert_eq!(
+        json!(codes(&post("openai", "gpt-5-nope", None).await)),
+        none
+    );
     // A key of another provider than the revision's.
     assert_eq!(
         json!(codes(&post("anthropic", "gpt-4o-mini", Some(key)).await)),

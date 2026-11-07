@@ -580,7 +580,8 @@ async fn unmatched_upstream(
     if !model_exists {
         warnings.push(PriceWarning {
             code: "no_matching_upstream",
-            message: "没有任何模型使用这个上游提供方和模型名，这条成本价格暂时不会被用到".to_string(),
+            message: "没有任何模型使用这个上游提供方和模型名，这条成本价格暂时不会被用到"
+                .to_string(),
             revision_id: None,
             effective_from: None,
         });
