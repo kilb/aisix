@@ -693,10 +693,13 @@ pub(crate) async fn token(
             // `invalid_client` tells a client to discard its registration, so
             // it is not for a gateway that merely cannot judge the credential,
             // nor for a valid key whose `allowed_endpoints` leaves out MCP:
-            // that client is authenticated and not allowed (RFC 6749 §5.2).
+            // that client is authenticated and not allowed, which RFC 6749
+            // §5.2 calls `unauthorized_client` and answers, as every token
+            // error but `invalid_client`, with 400 Bad Request
+            // (https://www.rfc-editor.org/rfc/rfc6749#section-5.2).
             if matches!(err, ProxyError::EndpointForbidden(_)) {
                 return oauth_error(
-                    StatusCode::FORBIDDEN,
+                    StatusCode::BAD_REQUEST,
                     "unauthorized_client",
                     "this gateway credential is not allowed to call this endpoint",
                 );
@@ -1097,7 +1100,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             answer(refused).await,
-            (StatusCode::FORBIDDEN, "unauthorized_client".to_owned())
+            (StatusCode::BAD_REQUEST, "unauthorized_client".to_owned())
         );
         assert_eq!(
             store.calls.load(std::sync::atomic::Ordering::SeqCst),
