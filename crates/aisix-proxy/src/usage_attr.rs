@@ -1412,6 +1412,56 @@ fn stamp_billing_fields(snap: &AisixSnapshot, event: &mut UsageEvent, provider_k
     apply_upstream_identity(event, provider_key_id, model.as_deref().map(|e| &*e.value));
 }
 
+/// The most characters a usage row keeps of any one text a caller or an
+/// upstream chose.
+const MAX_OUTSIDE_TEXT_CHARS: usize = 512;
+
+/// The most characters a usage row keeps of its `error_message`: the cap
+/// every typed error is already rendered under, applied again here for a
+/// message built some other way.
+const MAX_ERROR_MESSAGE_CHARS: usize = 2048;
+
+/// Bound the text a caller or an upstream chose before the row leaves: control
+/// characters stripped and at most [`MAX_OUTSIDE_TEXT_CHARS`] characters kept.
+///
+/// A row is delivered in a batch with other tenants' rows, and the control
+/// plane refuses a batch whose body is too large, permanently. Nothing else
+/// bounds a caller's `model` (a request body may be any size), so without this
+/// one request could make its row large enough to sink every row it travels
+/// with. The text that is already bounded where it is written (`api_key_name`,
+/// the tiers, `error_class`) is left to that bound; text within the bound is
+/// unchanged.
+fn bound_outside_text(event: &mut UsageEvent) {
+    for text in [
+        &mut event.requested_model,
+        &mut event.client_user_agent,
+        &mut event.client_identity,
+        &mut event.jwt_subject,
+        &mut event.mcp_server_name,
+        &mut event.mcp_tool_name,
+        &mut event.a2a_method,
+        &mut event.a2a_task_id,
+        &mut event.a2a_context_id,
+        &mut event.provider_model_version,
+        &mut event.finish_reason,
+    ] {
+        if text.len() > MAX_OUTSIDE_TEXT_CHARS || text.chars().any(char::is_control) {
+            *text = text
+                .chars()
+                .filter(|c| !c.is_control())
+                .take(MAX_OUTSIDE_TEXT_CHARS)
+                .collect();
+        }
+    }
+    if event.error_message.len() > MAX_ERROR_MESSAGE_CHARS {
+        event.error_message = event
+            .error_message
+            .chars()
+            .take(MAX_ERROR_MESSAGE_CHARS)
+            .collect();
+    }
+}
+
 /// Name the upstream credential and model a row's call used: the
 /// ProviderKey `provider_key_id` names, and the `provider` and upstream
 /// model of `model` when that model calls an upstream itself. A routing,
@@ -1477,6 +1527,9 @@ pub(crate) fn emit_usage(
     event.is_final_attempt = terminal;
     stamp_requested_model_id(&mut event);
     stamp_billing_fields(snap, &mut event, labels.provider_key_id);
+    // After the name has looked up its entry, and before the access log and
+    // every consumer read the row.
+    bound_outside_text(&mut event);
     // Upstream-supplied text bound for line-oriented stores: the same
     // control-character strip and cap as the provider's response id.
     event.service_tier = event
@@ -2279,6 +2332,65 @@ mod tests {
             );
         })
         .await;
+    }
+
+    /// Text a caller or an upstream chose is bound on the row: control
+    /// characters stripped and at most 512 characters kept, so one request
+    /// cannot make its row large enough for the control plane to refuse the
+    /// batch it travels in. The model name an unknown-model request carries
+    /// is the one a caller can make as long as its body.
+    #[tokio::test]
+    #[allow(clippy::field_reassign_with_default)] // A literal here would read as an emitter to the scans below.
+    async fn caller_and_upstream_text_is_bounded_before_it_leaves() {
+        let (state, mut rx) = state_reading_rows(AisixSnapshot::new());
+        let huge = format!("m\u{0}\n{}", "x".repeat(1 << 20));
+        let bounded = format!("m{}", "x".repeat(511));
+        let mut event = UsageEvent::default();
+        event.requested_model = huge.clone();
+        event.client_user_agent = huge.clone();
+        event.client_identity = huge.clone();
+        event.jwt_subject = huge.clone();
+        event.mcp_server_name = huge.clone();
+        event.mcp_tool_name = huge.clone();
+        event.a2a_method = huge.clone();
+        event.a2a_task_id = huge.clone();
+        event.a2a_context_id = huge.clone();
+        event.provider_model_version = huge.clone();
+        event.finish_reason = huge.clone();
+        event.error_class = "upstream_status".into();
+        event.error_message = "e".repeat(1 << 20);
+        let row = emitted_row(&state, &mut rx, event, "");
+        for (field, value) in [
+            ("requested_model", &row.requested_model),
+            ("client_user_agent", &row.client_user_agent),
+            ("client_identity", &row.client_identity),
+            ("jwt_subject", &row.jwt_subject),
+            ("mcp_server_name", &row.mcp_server_name),
+            ("mcp_tool_name", &row.mcp_tool_name),
+            ("a2a_method", &row.a2a_method),
+            ("a2a_task_id", &row.a2a_task_id),
+            ("a2a_context_id", &row.a2a_context_id),
+            ("provider_model_version", &row.provider_model_version),
+            ("finish_reason", &row.finish_reason),
+        ] {
+            assert!(
+                value == &bounded,
+                "{field}: {} chars, starting {:?}",
+                value.chars().count(),
+                value.chars().take(8).collect::<String>(),
+            );
+        }
+        assert_eq!(row.error_message.chars().count(), 2048);
+        let wire = serde_json::to_vec(&row).unwrap();
+        assert!(wire.len() < 16 * 1024, "a row of {} bytes", wire.len());
+
+        // Text within the bound is left exactly as it was.
+        let mut event = UsageEvent::default();
+        event.requested_model = "gpt-4o".into();
+        event.client_user_agent = "codex-cli/1.2".into();
+        let row = emitted_row(&state, &mut rx, event, "");
+        assert_eq!(row.requested_model, "gpt-4o");
+        assert_eq!(row.client_user_agent, "codex-cli/1.2");
     }
 
     /// Every row of a request carries the tier its body asked for, the
