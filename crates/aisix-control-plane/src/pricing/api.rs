@@ -170,6 +170,11 @@ pub struct SellBody {
 pub struct PriceWarning {
     pub code: &'static str,
     pub message: String,
+    /// For `superseded_later`: the revision that takes over, and when.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revision_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effective_from: Option<DateTime<Utc>>,
 }
 
 /// One sell revision a catalogue import writes.
@@ -262,6 +267,8 @@ fn import_plan(
                     "{} 的目录价格是非高峰时段价格，高峰时段上游按更高价格收费；请通过加价覆盖高峰时段的成本",
                     entry.key
                 ),
+                revision_id: None,
+                effective_from: None,
             });
         }
     }
@@ -284,6 +291,10 @@ fn import_plan(
 ///
 /// Both `card` and `catalogue_key`, or neither, is `422 /card`; a markup
 /// without `catalogue_key` is `422 /markup_bps`.
+///
+/// A revision of the same model and tenant that already starts later than
+/// the one written takes over from it then; each is named in a
+/// `superseded_later` warning, and the write still succeeds.
 pub async fn create_sell(
     auth: OperatorAuth,
     State(state): State<AppState>,
@@ -342,7 +353,7 @@ pub async fn create_sell(
             source: "manual".to_string(),
         }],
     };
-    let written: Vec<SellRevision> = state
+    let (written, superseded) = state
         .db
         .tx(move |conn| {
             async move {
@@ -352,25 +363,63 @@ pub async fn create_sell(
                         store::insert_sell_price(&mut *conn, row, Actor::Operator(&auth)).await?,
                     );
                 }
-                Ok::<_, ApiError>(written)
+                let superseded = superseded_later(&mut *conn, &written).await?;
+                Ok::<_, ApiError>((written, superseded))
             }
             .boxed()
         })
         .await?;
+    let mut warnings: Vec<PriceWarning> = plan.map(|p| p.warnings).unwrap_or_default();
+    warnings.extend(superseded);
     let mut written = written.into_iter();
     let first = written
         .next()
         .ok_or_else(|| ApiError::internal("a sell price write wrote no revision"))?;
     let mut view = to_object(&first)?;
-    view.insert(
-        "warnings".to_string(),
-        json!(plan.as_ref().map_or(&[][..], |p| &p.warnings[..])),
-    );
+    view.insert("warnings".to_string(), json!(warnings));
     view.insert(
         "later_revisions".to_string(),
         json!(written.collect::<Vec<_>>()),
     );
     Ok((StatusCode::CREATED, Json(Value::Object(view))))
+}
+
+/// The revisions of the model and tenant of `written` (the revisions one
+/// write made, first the one it was asked for) that were already there and
+/// start later than the first, oldest start first, as `superseded_later`
+/// warnings: from each one's start, it prices instead.
+async fn superseded_later(
+    conn: &mut sqlx::PgConnection,
+    written: &[SellRevision],
+) -> Result<Vec<PriceWarning>, DbError> {
+    let Some(first) = written.first() else {
+        return Ok(Vec::new());
+    };
+    let ours: Vec<i64> = written.iter().map(|r| r.revision_id).collect();
+    let later: Vec<(i64, DateTime<Utc>)> = sqlx::query_as(
+        "SELECT revision_id, effective_from FROM pricing_sell_revisions \
+         WHERE model_id = $1 AND tenant_id IS NOT DISTINCT FROM $2 AND effective_from > $3 \
+           AND NOT (revision_id = ANY($4)) \
+         ORDER BY effective_from, revision_id",
+    )
+    .bind(first.model_id)
+    .bind(first.tenant_id)
+    .bind(first.effective_from)
+    .bind(ours)
+    .fetch_all(conn)
+    .await?;
+    Ok(later
+        .into_iter()
+        .map(|(revision_id, effective_from)| PriceWarning {
+            code: "superseded_later",
+            message: format!(
+                "已有一条更晚生效的价格（修订 {revision_id}），将从 {} 起取代这次写入的价格",
+                effective_from.to_rfc3339()
+            ),
+            revision_id: Some(revision_id),
+            effective_from: Some(effective_from),
+        })
+        .collect())
 }
 
 /// `value` as a JSON object, to add fields to.
@@ -856,18 +905,34 @@ mod tests {
     }
 
     #[test]
-    fn only_the_builtin_entries_that_speak_of_peak_hours_warn() {
+    fn every_builtin_deepseek_entry_warns_and_nothing_else_does() {
         let builtin = Catalogue::builtin().expect("the builtin catalogue");
-        let warned: Vec<&str> = builtin
+        // DeepSeek lists an off-peak price; every entry of it must say so,
+        // and a note reworded past the check fails here.
+        let deepseek: Vec<&CatalogueEntry> = builtin
+            .entries()
+            .iter()
+            .filter(|e| e.key.starts_with("deepseek/"))
+            .collect();
+        assert!(!deepseek.is_empty());
+        for e in &deepseek {
+            let plan = import_plan(&builtin, &e.key, at("2026-11-06T09:30:00Z"), 0)
+                .unwrap_or_else(|err| panic!("import {}: {err:?}", e.key));
+            let codes: Vec<&str> = plan.warnings.iter().map(|w| w.code).collect();
+            assert_eq!(codes, ["time_of_day_price"], "{}", e.key);
+        }
+        let warned: std::collections::BTreeSet<&str> = builtin
             .entries()
             .iter()
             .filter(|e| has_time_of_day_price(e))
             .map(|e| e.key.as_str())
             .collect();
-        assert!(!warned.is_empty());
-        assert!(
-            warned.iter().all(|k| k.starts_with("deepseek/")),
-            "{warned:?}"
+        assert_eq!(
+            warned,
+            std::collections::BTreeSet::from([
+                "deepseek/deepseek-flash",
+                "deepseek/deepseek-v4-pro"
+            ])
         );
     }
 }

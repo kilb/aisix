@@ -646,8 +646,9 @@ pub async fn insert_sell_price(
 }
 
 /// Writes a cost revision starting at `row.effective_from`, refusing with
-/// `422` one that starts in the past (`/effective_from`) and a card that
-/// does not validate (`/card`).
+/// `422` one that starts in the past (`/effective_from`), a card that does
+/// not validate (`/card`) and a provider key that is not live
+/// (`/provider_key_id`).
 pub async fn insert_cost_price(
     conn: &mut PgConnection,
     row: &NewCostPrice,
@@ -655,6 +656,20 @@ pub async fn insert_cost_price(
 ) -> Result<CostRevision, ApiError> {
     starts_now_or_later(&mut *conn, row.effective_from).await?;
     check_card(&row.card)?;
+    if let Some(key) = row.provider_key_id {
+        // A revision for a key that does not exist would never apply.
+        let live: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM gw_resources \
+                            WHERE kind = 'provider_keys' AND id = $1 AND NOT deleted)",
+        )
+        .bind(key)
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(DbError::from)?;
+        if !live {
+            return Err(refused("/provider_key_id", "供应商密钥不存在"));
+        }
+    }
     let revision: CostRevision = sqlx::query_as(
         "INSERT INTO pricing_cost_revisions \
          (engine_version, upstream_provider, upstream_model, provider_key_id, effective_from, \

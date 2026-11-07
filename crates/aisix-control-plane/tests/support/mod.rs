@@ -272,6 +272,18 @@ impl TestCp {
         Some(Self::boot(database, cfg).await)
     }
 
+    /// [`TestCp::start`], pricing from `catalogue` instead of the built-in
+    /// one.
+    pub async fn start_with_catalogue(catalogue: Arc<aisix_pricing::Catalogue>) -> Option<TestCp> {
+        let database = new_database().await?;
+        let cfg = test_config(&database.url);
+        let running =
+            aisix_control_plane::start_with_catalogue(cfg, std::future::pending(), Some(catalogue))
+                .await
+                .expect("the control plane boots");
+        Some(TestCp { running, database })
+    }
+
     async fn boot(database: Arc<TestDatabase>, cfg: CpConfig) -> TestCp {
         let running = aisix_control_plane::start(cfg, std::future::pending())
             .await

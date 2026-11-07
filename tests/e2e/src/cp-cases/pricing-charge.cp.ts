@@ -54,12 +54,15 @@ describe("every request a tenant key makes becomes one charge at the configured 
   const models: Record<string, Json> = {};
   /** The non-streaming chat a later request repeats from the response cache. */
   const cachedChat = chat("what does a cached answer cost?");
+  /** The request id of every model request the tenant's key has sent, in order. */
+  const sent: string[] = [];
 
   /** One call with the tenant's key; returns the answer and its request id. */
   const send = async (path: string, body: unknown, headers: Record<string, string> = {}) => {
     const answer = await callGateway(app!.proxyUrl, key, path, body, headers);
     const requestId = answer.headers.get("x-aisix-request-id");
     expect(requestId, `${path} answered without a request id: ${answer.status}`).toBeTruthy();
+    sent.push(requestId!);
     return { answer, requestId: requestId! };
   };
   const ok = (answer: GatewayAnswer) => expect(answer.status, answer.text).toBe(200);
@@ -257,6 +260,7 @@ describe("every request a tenant key makes becomes one charge at the configured 
       expect(res.status).toBe(200);
       const abandonedId = res.headers.get("x-aisix-request-id") ?? "";
       expect(abandonedId).toBeTruthy();
+      sent.push(abandonedId);
       abort.abort();
       const abandoned = await chargeFor(abandonedId, 40_000);
       expect(abandoned.status, JSON.stringify(abandoned)).toBe("charged");
@@ -282,12 +286,16 @@ describe("every request a tenant key makes becomes one charge at the configured 
     ok(barrier.answer);
     await waitEvents(`request_id=${barrier.requestId}`, 1);
 
+    // Twelve model requests so far: six chat-family calls, embeddings and a
+    // token count; the cache hit, the abandoned stream and the blocked chat;
+    // and the barrier. Each is one usage row and one charge.
+    expect(sent.length).toBe(12);
     const rows = await events(`api_key_id=${keyId}`);
+    expect(rows.map((r) => r.request_id).sort()).toEqual([...sent].sort());
     const charges = await cp!.admin.get(`/admin/pricing/charges?limit=500&api_key_id=${keyId}`);
     expect(charges.status, charges.text).toBe(200);
+    expect(charges.body.items.length, charges.text).toBe(12);
     const charged = (charges.body.items as Json[]).map((c) => c.event_id).sort();
-    expect(rows.length).toBeGreaterThanOrEqual(11);
-    expect(charges.body.items.length).toBe(rows.length);
     expect(charged).toEqual(rows.map((r) => r.event_id).sort());
   });
 
@@ -330,8 +338,8 @@ describe("every request a tenant key makes becomes one charge at the configured 
 
     const status = await cp!.admin.get("/admin/pricing/status");
     expect(status.status, status.text).toBe(200);
-    expect(status.body.unpriced_last_24h.by_code.missing_price, status.text).toBeGreaterThanOrEqual(1);
-    expect(status.body.unpriced_last_24h.total, status.text).toBeGreaterThanOrEqual(1);
+    // The only request to a model without a price so far.
+    expect(status.body.unpriced_last_24h, status.text).toEqual({ total: 1, by_code: { missing_price: 1 } });
 
     const priced = await price(models.unpriced.id);
     expect(priced.status, priced.text).toBe(201);
