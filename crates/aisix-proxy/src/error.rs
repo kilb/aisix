@@ -501,6 +501,28 @@ pub(crate) fn guardrail_block_message(
     }
 }
 
+/// [`guardrail_block_message`] as the caller is sent it. In platform mode a
+/// fail-closed refusal names no failure tag: the tag can name the
+/// guardrail's vendor and the state of its account (`bedrock_throttled`),
+/// which is the platform's. The refusal still says the guardrail could not
+/// evaluate it, its code is still `guardrail_unavailable`, and the error and
+/// the usage row keep the tag.
+pub(crate) fn caller_guardrail_block_message(
+    side: &str,
+    guardrail_name: Option<&str>,
+    unavailable: Option<&str>,
+) -> String {
+    match (unavailable, guardrail_name) {
+        (Some(_), Some(name)) if crate::platform_errors::active() => {
+            format!("{side} rejected: guardrail '{name}' could not evaluate it")
+        }
+        (Some(_), None) if crate::platform_errors::active() => {
+            format!("{side} rejected: a guardrail could not evaluate it")
+        }
+        _ => guardrail_block_message(side, guardrail_name, unavailable),
+    }
+}
+
 /// [`guardrail_block_message`] wrapped in the error the LLM handlers
 /// return. The `Option<String>` sites (SSE error frames, `/mcp` tool
 /// results, hand-built JSON bodies) use the message helper directly; every
@@ -782,6 +804,17 @@ impl ProxyError {
         }
         let env = ErrorEnvelope::new(self.to_string(), self.kind());
         match self {
+            // In platform mode a fail-closed refusal names no failure tag
+            // (`caller_guardrail_block_message`); the error keeps it.
+            ProxyError::ContentFiltered {
+                message,
+                unavailable: Some(tag),
+            } if crate::platform_errors::active() => {
+                let message = message
+                    .strip_suffix(&format!(" ({tag})"))
+                    .unwrap_or(message);
+                ErrorEnvelope::new(message, self.kind()).with_code("guardrail_unavailable")
+            }
             // In platform mode a budget outside the caller's own scope says
             // nothing but that a limit was reached.
             ProxyError::BudgetExceeded(r) if hides_budget_scope(r) => {
@@ -1452,6 +1485,49 @@ pub(crate) mod tests {
     /// for `err`.
     pub(crate) fn render_platform(err: &ProxyError) -> serde_json::Value {
         in_platform_mode(|| serde_json::to_value(err.envelope()).expect("an envelope serializes"))
+    }
+
+    /// A fail-closed guardrail refusal names its failure tag, which can name
+    /// the guardrail's vendor and the state of its account. In platform mode
+    /// the caller is told the guardrail could not evaluate the request, by
+    /// name and code, without the tag; the error itself keeps it for the
+    /// usage row. Every shape: the buffered bodies and the stream frames.
+    #[test]
+    fn in_platform_mode_a_fail_closed_refusal_names_no_tag() {
+        let err = guardrail_block_error("request", Some("pii-check"), Some("bedrock_throttled"));
+        let off = serde_json::to_value(err.envelope()).unwrap();
+        assert_eq!(
+            off["error"]["message"],
+            "request rejected: guardrail 'pii-check' could not evaluate it (bedrock_throttled)"
+        );
+        let on = render_platform(&err);
+        assert_eq!(
+            on["error"]["message"],
+            "request rejected: guardrail 'pii-check' could not evaluate it"
+        );
+        assert_eq!(on["error"]["code"], "guardrail_unavailable");
+        let anthropic = in_platform_mode(|| err.anthropic_body());
+        assert!(!anthropic.contains("bedrock"), "{anthropic}");
+        assert!(anthropic.contains("guardrail_unavailable"), "{anthropic}");
+        assert!(
+            err.to_string().contains("bedrock_throttled"),
+            "the error keeps it"
+        );
+
+        let payload =
+            in_platform_mode(|| guardrail_block_frame_payload(None, Some("bedrock_throttled")));
+        assert!(!payload.contains("bedrock"), "{payload}");
+        let frame = in_platform_mode(|| {
+            crate::messages::guardrail_block_frame(None, Some("bedrock_throttled"))
+        });
+        assert!(
+            !frame.contains("bedrock") && frame.contains("could not evaluate"),
+            "{frame}"
+        );
+        assert!(
+            crate::messages::guardrail_block_frame(None, Some("bedrock_throttled"))
+                .contains("bedrock_throttled")
+        );
     }
 
     /// #1093 carries the transport cause on a timeout so an

@@ -4142,7 +4142,7 @@ pub(crate) fn guardrail_block_frame(
             "error": {
                 "type": "invalid_request_error",
                 "code": crate::error::anthropic_guardrail_code(unavailable),
-                "message": crate::error::guardrail_block_message("response", guardrail_name, unavailable),
+                "message": crate::error::caller_guardrail_block_message("response", guardrail_name, unavailable),
             }
         })
     )

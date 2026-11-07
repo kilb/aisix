@@ -3436,7 +3436,7 @@ pub(crate) fn guardrail_failure_frames(
         terminal_sent,
         "content_filter",
         "invalid_prompt",
-        &crate::error::guardrail_block_message("response", guardrail_name, unavailable),
+        &crate::error::caller_guardrail_block_message("response", guardrail_name, unavailable),
     )
 }
 
