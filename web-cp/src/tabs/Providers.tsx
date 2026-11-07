@@ -197,7 +197,7 @@ export function Providers({ canEdit }: TabProps) {
           </div>
         )}
         {pk.items === null ? (
-          !pk.error && <p className="hint">读取中…</p>
+          !pk.error && <p className="hint">载入中…</p>
         ) : pk.items.length === 0 ? (
           <p className="hint">还没有上游账号。</p>
         ) : (

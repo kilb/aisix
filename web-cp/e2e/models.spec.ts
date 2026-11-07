@@ -110,6 +110,11 @@ async function chat(key: string, model: string): Promise<number> {
   return res.status;
 }
 
+/** `"client error"` for a 4xx status, else the status itself, so a failed check names what it got. */
+function clientError(status: number): string | number {
+  return status >= 400 && status < 500 ? "client error" : status;
+}
+
 /** The upstream `model` of each chat request the stand-in received. */
 async function upstreamModels(): Promise<string[]> {
   const res = await fetch(`${stack.mockUpstreamUrl}/__requests`);
@@ -213,30 +218,40 @@ test("路由模型：选路策略的选项来自 schema，目标行显示各自�
 });
 
 test("改名后，按 id 获授权的租户 key 用新名字调用仍成功", async ({ page }) => {
-  // The direct model of the first test, or the same model set up here when it runs alone.
-  const model =
-    (await modelNamed("chat-e2e")) ??
-    (await directModel("chat-e2e", (await mockAccount("acct-chat-e2e", ["shared"])).id));
+  const account = await mockAccount("acct-rename-e2e", ["shared"]);
+  const model = await directModel("chat-rename-e2e", account.id, "gpt-rename-up-e2e");
+  // A route that names the model by id, and a key for the route.
+  await createModel({ display_name: "route-rename-e2e", routing: { targets: [{ model_id: model.id }] } });
+  const routeKey = await internalKey("route-rename-e2e-key", ["route-rename-e2e"]);
   const { tenant, key } = await grantedTenant("tenant-rename-e2e", [model.id]);
-  await expect.poll(() => chat(key, "chat-e2e"), { timeout: APPLIED_WITHIN_MS }).toBe(200);
+  // Before the rename: the grant and the route both reach the model.
+  await expect.poll(() => chat(key, "chat-rename-e2e"), { timeout: APPLIED_WITHIN_MS }).toBe(200);
+  await clearUpstream();
+  await expect.poll(() => chat(routeKey, "route-rename-e2e"), { timeout: APPLIED_WITHIN_MS }).toBe(200);
+  expect(await upstreamModels()).toEqual(["gpt-rename-up-e2e"]);
 
   await openModels(page);
-  await modelRow(page, "chat-e2e").getByRole("button", { name: "编辑" }).click();
-  const form = page.getByRole("form", { name: /chat-e2e/ });
+  await modelRow(page, "chat-rename-e2e").getByRole("button", { name: "编辑" }).click();
+  const form = page.getByRole("form", { name: /chat-rename-e2e/ });
   await expect(form).toContainText("改名不会影响已授权的租户和引用它的路由、缓存策略");
   await form.getByLabel("对外名称").fill("chat-e2e-renamed");
   await form.getByRole("button", { name: "保存" }).click();
 
   const row = modelRow(page, "chat-e2e-renamed");
   await expect(badge(row)).toHaveAttribute("data-state", "applied", { timeout: APPLIED_WITHIN_MS });
-  await expect(modelRow(page, "chat-e2e")).toHaveCount(0);
+  await expect(modelRow(page, "chat-rename-e2e")).toHaveCount(0);
+  await expect(modelRow(page, "route-rename-e2e")).toContainText("chat-e2e-renamed");
   // The same model under its new name, and the grant still names it.
   const renamed = await stack.admin.get(`/admin/resources/models/${model.id}`);
   expect(renamed.doc.display_name).toBe("chat-e2e-renamed");
   expect((await stack.admin.get(`/admin/tenants/${tenant.id}`)).allowed_model_ids).toEqual([model.id]);
 
   expect(await chat(key, "chat-e2e-renamed")).toBe(200);
-  expect(await chat(key, "chat-e2e")).not.toBe(200);
+  expect(clientError(await chat(key, "chat-rename-e2e"))).toBe("client error");
+  // The route still reaches the same upstream model.
+  await clearUpstream();
+  expect(await chat(routeKey, "route-rename-e2e")).toBe(200);
+  expect(await upstreamModels()).toEqual(["gpt-rename-up-e2e"]);
 });
 
 test("被路由目标引用的模型不能删", async ({ page }) => {
@@ -278,7 +293,9 @@ test("删除已授权给租户的模型：确认前点名受影响的租户，�
   await expect(modelRow(page, "chat-grant-e2e")).toHaveCount(0);
   expect(await status(`/admin/resources/models/${model.id}`)).toBe(404);
   expect((await stack.admin.get(`/admin/tenants/${tenant.id}`)).allowed_model_ids).toEqual([]);
-  await expect.poll(() => chat(key, "chat-grant-e2e"), { timeout: APPLIED_WITHIN_MS }).not.toBe(200);
+  await expect
+    .poll(async () => clientError(await chat(key, "chat-grant-e2e")), { timeout: APPLIED_WITHIN_MS })
+    .toBe("client error");
 });
 
 test("移除路由目标要两步确认：取消保留，确认后移除，保存后网关只走剩下的目标", async ({ page }) => {

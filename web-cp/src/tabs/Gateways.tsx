@@ -108,7 +108,7 @@ export function Gateways({ operator }: TabProps) {
           </div>
         )}
         {instances === null ? (
-          !instancesError && <p className="hint">读取中…</p>
+          !instancesError && <p className="hint">载入中…</p>
         ) : instances.length === 0 ? (
           <p className="hint">还没有网关发来心跳。</p>
         ) : (
@@ -176,7 +176,7 @@ export function Gateways({ operator }: TabProps) {
           </div>
         )}
         {credentials === null ? (
-          !credentialsError && <p className="hint">读取中…</p>
+          !credentialsError && <p className="hint">载入中…</p>
         ) : credentials.length === 0 ? (
           <p className="hint">还没有签发过网关凭据。</p>
         ) : (

@@ -149,6 +149,13 @@ export function Models({ canEdit }: TabProps) {
     accounts: new Map((accounts.items ?? []).map((a) => [a.id, a])),
   };
 
+  // Opening a form clears the last result, a refused delete included.
+  function openForm(next: Open) {
+    setNote(null);
+    setDeleteFailure(null);
+    setOpen(next);
+  }
+
   function saved(view: Model) {
     setOpen(null);
     setNote({ kind: "ok", text: `已保存「${nameOf(view)}」。` });
@@ -225,10 +232,10 @@ export function Models({ canEdit }: TabProps) {
         </p>
         {canEdit && !open && (
           <p>
-            <button className="act" onClick={() => setOpen({ mode: "new", shape: "direct" })}>
+            <button className="act" onClick={() => openForm({ mode: "new", shape: "direct" })}>
               新增直连模型
             </button>{" "}
-            <button className="act" onClick={() => setOpen({ mode: "new", shape: "routing" })}>
+            <button className="act" onClick={() => openForm({ mode: "new", shape: "routing" })}>
               新增路由模型
             </button>
           </p>
@@ -317,13 +324,7 @@ export function Models({ canEdit }: TabProps) {
                           ) : (
                             <>
                               {hasForm && (
-                                <button
-                                  className="ghost"
-                                  onClick={() => {
-                                    setNote(null);
-                                    setOpen({ mode: "edit", id: m.id });
-                                  }}
-                                >
+                                <button className="ghost" onClick={() => openForm({ mode: "edit", id: m.id })}>
                                   {canEdit ? "编辑" : "查看"}
                                 </button>
                               )}
@@ -684,6 +685,7 @@ function ModelForm({
                   <label className="f">
                     <span>目标模型</span>
                     <select
+                      required
                       disabled={locked}
                       value={r.modelId}
                       onChange={(e) => setRow(r.key, { modelId: e.target.value })}
