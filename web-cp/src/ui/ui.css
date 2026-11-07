@@ -1070,6 +1070,11 @@ label:hover > :is(input[type="checkbox"], input[type="radio"]):checked:not(:disa
   .route-nav::-webkit-scrollbar {
     display: none;
   }
+  /* The bar scrolls sideways: its ends fade, so a stop cut at the edge
+     reads as more of the line, not as a broken label. */
+  .route-nav {
+    mask-image: linear-gradient(90deg, transparent, #000 24px, #000 calc(100% - 24px), transparent);
+  }
   .route-nav ol {
     display: flex;
     width: max-content;

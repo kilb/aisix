@@ -104,6 +104,18 @@
     padding: var(--s-3) var(--s-4);
     gap: var(--s-2) var(--s-4);
   }
+  /* Two rows: the brand and the fleet's lamp, then the operator and their
+     buttons. The environment id and the control plane's version are on
+     概览, so the phone header leaves them out, and with them the
+     separators that would start a wrapped line. */
+  .brand-sub,
+  .ctx > :not(.fleet) {
+    display: none;
+  }
+  .ctx > * + * {
+    padding-left: 0;
+    border-left: 0;
+  }
   .who {
     margin-left: 0;
     width: 100%;
@@ -223,12 +235,17 @@ form.panel .r > .field {
 .g3 {
   grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
 }
-/* A filter above a list: its label beside one small control. */
+/* A filter above a list: its label beside one small control. The label
+   keeps its one line however narrow the screen; the control shrinks. */
 .f.filter {
   flex-direction: row;
   align-items: center;
   gap: var(--s-2);
   margin: 0;
+}
+.f.filter > span {
+  flex: none;
+  white-space: nowrap;
 }
 .f.filter > select {
   width: auto;
