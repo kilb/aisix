@@ -1233,6 +1233,56 @@ fn is_zero_f64(n: &f64) -> bool {
 pub struct UsageSink {
     tx: Option<tokio::sync::mpsc::Sender<UsageEvent>>,
     metrics: Option<crate::metrics::Metrics>,
+    drop_warnings: std::sync::Arc<DropWarnings>,
+}
+
+/// How often the log may say that the queue dropped events. A queue that
+/// stays full (a control plane down for minutes) drops every event emitted
+/// meanwhile: the counter takes each one, the log one line per interval.
+const DROP_WARNING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The WARN for events the queue could not take, at most once per
+/// [`DROP_WARNING_INTERVAL`], each line carrying how many drops since the
+/// last one it did not report.
+#[derive(Debug)]
+struct DropWarnings {
+    origin: std::time::Instant,
+    /// Milliseconds after `origin` of the last line, `u64::MAX` before the
+    /// first.
+    last_ms: std::sync::atomic::AtomicU64,
+    /// Drops since the last line that no line reported.
+    suppressed: std::sync::atomic::AtomicU64,
+}
+
+impl Default for DropWarnings {
+    fn default() -> Self {
+        DropWarnings {
+            origin: std::time::Instant::now(),
+            last_ms: std::sync::atomic::AtomicU64::new(u64::MAX),
+            suppressed: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+}
+
+impl DropWarnings {
+    fn note(&self, reason: &'static str) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let now = u64::try_from(self.origin.elapsed().as_millis()).unwrap_or(u64::MAX - 1);
+        let last = self.last_ms.load(Relaxed);
+        let due = last == u64::MAX
+            || now.saturating_sub(last) >= DROP_WARNING_INTERVAL.as_millis() as u64;
+        if due
+            && self
+                .last_ms
+                .compare_exchange(last, now, Relaxed, Relaxed)
+                .is_ok()
+        {
+            let suppressed = self.suppressed.swap(0, Relaxed);
+            tracing::warn!(reason = reason, suppressed, "usage event dropped");
+        } else {
+            self.suppressed.fetch_add(1, Relaxed);
+        }
+    }
 }
 
 /// Log one line per provider call that came back with a response id
@@ -1323,6 +1373,7 @@ impl UsageSink {
         Self {
             tx: Some(tx),
             metrics: None,
+            drop_warnings: Default::default(),
         }
     }
 
@@ -1333,6 +1384,7 @@ impl UsageSink {
         Self {
             tx: None,
             metrics: None,
+            drop_warnings: Default::default(),
         }
     }
 
@@ -1349,7 +1401,8 @@ impl UsageSink {
     /// Non-blocking emit. Returns immediately:
     /// - `Ok(())` on enqueue success;
     /// - `Ok(())` and a tracing::warn! on `try_send` failure (queue
-    ///   full / receiver dropped). We deliberately don't propagate the
+    ///   full / receiver dropped), at most once per
+    ///   [`DROP_WARNING_INTERVAL`]. We deliberately don't propagate the
     ///   error to the caller — request handlers must NOT fail because
     ///   telemetry can't keep up.
     /// - `Ok(())` no-op on a `disabled()` sink.
@@ -1438,7 +1491,7 @@ impl UsageSink {
             if let Some(m) = &self.metrics {
                 m.record_usage_event_drop(reason, labels);
             }
-            tracing::warn!(reason = reason, "usage event dropped");
+            self.drop_warnings.note(reason);
         }
     }
 }
@@ -1572,6 +1625,56 @@ mod tests {
         }
         let bytes = buf.lock().unwrap().clone();
         String::from_utf8(bytes).unwrap()
+    }
+
+    /// A queue that stays full — the control plane down for minutes — drops
+    /// every event emitted meanwhile. Each is counted, but the log says so
+    /// once a second, with how many drops the line stands for, rather than
+    /// once per request.
+    #[test]
+    fn a_full_queue_logs_its_drops_once_a_second() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let metrics = crate::metrics::Metrics::new(false);
+        let sink = UsageSink::new(tx).with_metrics(metrics.clone());
+        sink.try_emit("chat", sample_event("fills"), UsageEventLabels::default());
+        let burst = capture_logs(|| {
+            for i in 0..100 {
+                sink.clone().try_emit(
+                    "chat",
+                    sample_event(&format!("r{i}")),
+                    UsageEventLabels::default(),
+                );
+            }
+        });
+        let lines: Vec<&str> = burst
+            .lines()
+            .filter(|l| l.contains("usage event dropped"))
+            .collect();
+        assert_eq!(lines.len(), 1, "{burst}");
+        assert!(
+            lines[0].contains("WARN") && lines[0].contains("reason=\"sink_full\""),
+            "{burst}"
+        );
+        assert!(
+            metrics
+                .render()
+                .lines()
+                .any(|l| l.starts_with("aisix_usage_event_drops_total{")
+                    && l.contains("reason=\"sink_full\"")
+                    && l.ends_with(" 100")),
+            "every drop is still counted: {}",
+            metrics.render()
+        );
+
+        std::thread::sleep(std::time::Duration::from_millis(1_100));
+        let later = capture_logs(|| {
+            sink.try_emit("chat", sample_event("later"), UsageEventLabels::default())
+        });
+        let line = later
+            .lines()
+            .find(|l| l.contains("usage event dropped"))
+            .unwrap_or_else(|| panic!("a second later the next drop logs again: {later}"));
+        assert!(line.contains("suppressed=99"), "{line}");
     }
 
     /// #1289: a provider call that came back with a response id
