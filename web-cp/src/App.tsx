@@ -61,6 +61,7 @@ export function App() {
   const [apiContract, setApiContract] = useState<number | null>(null);
   const [operator, setOperator] = useState<Operator | null>(null);
   const [bootError, setBootError] = useState<string | null>(null);
+  const [signOutError, setSignOutError] = useState<string | null>(null);
   const [tab, setTab] = useState<TabId>("overview");
   const [theme, toggleTheme] = useTheme();
 
@@ -81,14 +82,22 @@ export function App() {
 
   const signIn = useCallback((op: Operator) => {
     setOperator(op);
+    setSignOutError(null);
     setTab("overview");
   }, []);
 
+  // Signed out only once the control plane has revoked the session (or says
+  // there was none): a failed request leaves the session live, and showing
+  // the gate then would tell the operator they are out while they are not.
   const signOut = useCallback(async () => {
+    setSignOutError(null);
     try {
       await logout();
-    } catch {
-      // Signed out here either way; the session cookie lapses on its own.
+    } catch (e) {
+      if (!(e instanceof ApiError && e.code === "unauthenticated")) {
+        setSignOutError("登出失败，请重试");
+        return;
+      }
     }
     setOperator(null);
   }, []);
@@ -159,6 +168,12 @@ export function App() {
           </button>
         </div>
       </header>
+
+      {signOutError && (
+        <div className="note crit" role="alert">
+          {signOutError}
+        </div>
+      )}
 
       <div className="leafs">
         <nav className="tabs" role="tablist" aria-label="Dashboard 分区">

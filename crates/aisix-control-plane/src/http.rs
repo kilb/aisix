@@ -797,13 +797,18 @@ mod tests {
     /// `/admin/session` and `/api/session` serve. In one commit they must
     /// agree: only then does a mismatch an app reports at run time mean a
     /// deployment skew, not a forgotten edit on one side.
+    ///
+    /// The files are read when the test runs, not compiled in, so no build
+    /// or package of this crate depends on the apps' directories.
     #[test]
     fn ui_contracts_match() {
-        let apps = [(
-            "web-cp",
-            include_str!("../../../web-cp/src/lib/contract.ts"),
-        )];
-        for (app, ts) in apps {
+        // The app directories that mirror the contract.
+        const APPS: &[&str] = &["web-cp"];
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        for app in APPS {
+            let path = repo.join(app).join("src/lib/contract.ts");
+            let ts = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
             let declared = ts
                 .lines()
                 .find_map(|l| {

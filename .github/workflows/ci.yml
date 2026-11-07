@@ -816,6 +816,13 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: 22
+          cache: npm
+          cache-dependency-path: web-cp/package-lock.json
+      # The browser build is pinned by @playwright/test in the lockfile.
+      - uses: actions/cache@v6
+        with:
+          path: ~/.cache/ms-playwright
+          key: ms-playwright-${{ runner.os }}-${{ hashFiles('web-cp/package-lock.json') }}
       - name: fetch kine
         run: |
           scripts/fetch-kine.sh "$RUNNER_TEMP/kine"

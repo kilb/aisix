@@ -50,13 +50,16 @@ function etagVersion(etag: string | null): number | null {
 
 /**
  * One request. `ifMatch` sends `If-Match: "<n>"`, which the versioned routes
- * require on PUT, PATCH and DELETE; `version` is the answer's `ETag`.
+ * require on PUT, PATCH and DELETE; `version` is the answer's `ETag`. A
+ * request `signal` aborted rejects with the abort's own error, not an
+ * `ApiError`.
  */
 export async function call<T>(
   method: string,
   path: string,
   body?: unknown,
   ifMatch?: number,
+  signal?: AbortSignal,
 ): Promise<{ data: T; version: number | null }> {
   const headers: Record<string, string> = { "content-type": "application/json" };
   if (ifMatch !== undefined) headers["if-match"] = `"${ifMatch}"`;
@@ -67,8 +70,10 @@ export async function call<T>(
       credentials: "same-origin",
       headers,
       body: body === undefined ? undefined : JSON.stringify(body),
+      signal,
     });
-  } catch {
+  } catch (e) {
+    if (signal?.aborted) throw e;
     throw new ApiError("无法连接控制面", 0, "network", [], [], null);
   }
   const text = await r.text();
@@ -320,8 +325,16 @@ export const resources = {
     return (await call<{ items: ResourceView<D>[] }>("GET", `/admin/resources/${seg(kind)}`)).data
       .items;
   },
-  async get<D>(kind: string, id: string): Promise<ResourceView<D>> {
-    return (await call<ResourceView<D>>("GET", `/admin/resources/${seg(kind)}/${seg(id)}`)).data;
+  async get<D>(kind: string, id: string, signal?: AbortSignal): Promise<ResourceView<D>> {
+    return (
+      await call<ResourceView<D>>(
+        "GET",
+        `/admin/resources/${seg(kind)}/${seg(id)}`,
+        undefined,
+        undefined,
+        signal,
+      )
+    ).data;
   },
   async create<D>(kind: string, doc: D): Promise<ResourceView<D>> {
     return (await call<ResourceView<D>>("POST", `/admin/resources/${seg(kind)}`, { doc })).data;
