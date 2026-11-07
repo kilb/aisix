@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import type { TabProps } from "../App";
+import { Field } from "../components/Field";
 import { Msg, type Note } from "../components/Msg";
 import {
   ApiError,
@@ -9,19 +10,12 @@ import {
   type Instance,
   type IssuedCredential,
 } from "../lib/api";
-import { messageFor } from "../lib/errors";
+import { problemAt } from "../lib/errors";
+import { errorText, fmtTime } from "../lib/fmt";
 import { TwoStep } from "./Tenants";
 
 /** How often the instances are read again: about one gateway heartbeat. */
 const REFRESH_MS = 5_000;
-
-function errorText(e: unknown): string {
-  return e instanceof ApiError ? messageFor(e) : String(e);
-}
-
-function fmtTime(iso: string): string {
-  return new Date(iso).toLocaleString("zh-CN", { hour12: false });
-}
 
 /**
  * The bundle's `env` as `KEY=value` lines, values as issued. A value
@@ -206,6 +200,9 @@ export function Gateways({ operator }: TabProps) {
   );
 }
 
+/** Refusal details shown beside their own input; the others stay in the list under the form. */
+const ISSUE_FIELDS = ["/name", "/validity_days"];
+
 /** `签发网关凭据`: a toggle that opens the form in its place. */
 function IssueForm({ onIssued }: { onIssued: (b: IssuedCredential) => void }) {
   const [open, setOpen] = useState(false);
@@ -242,24 +239,28 @@ function IssueForm({ onIssued }: { onIssued: (b: IssuedCredential) => void }) {
     }
   }
 
+  const at = (path: string) => problemAt(details, (p) => p === path);
+  const listed = details.filter((d) => !ISSUE_FIELDS.includes(d.path));
+
   return (
     <form onSubmit={submit}>
       <div className="r">
-        <label className="f">
-          <span>名称</span>
-          <input required value={name} onChange={(e) => setName(e.target.value)} />
-        </label>
-        <label className="f">
-          <span>有效期（天）</span>
-          <input
-            type="number"
-            min={1}
-            step={1}
-            placeholder="留空用控制面的默认值"
-            value={days}
-            onChange={(e) => setDays(e.target.value)}
-          />
-        </label>
+        <Field label="名称" problem={at("/name")}>
+          {(aria) => <input required value={name} onChange={(e) => setName(e.target.value)} {...aria} />}
+        </Field>
+        <Field label="有效期（天）" problem={at("/validity_days")}>
+          {(aria) => (
+            <input
+              type="number"
+              min={1}
+              step={1}
+              placeholder="留空用控制面的默认值"
+              value={days}
+              onChange={(e) => setDays(e.target.value)}
+              {...aria}
+            />
+          )}
+        </Field>
       </div>
       <p>
         <button className="act" type="submit" disabled={busy}>
@@ -272,9 +273,9 @@ function IssueForm({ onIssued }: { onIssued: (b: IssuedCredential) => void }) {
       {err && (
         <div className="note crit" role="alert">
           {err}
-          {details.length > 0 && (
+          {listed.length > 0 && (
             <ul>
-              {details.map((d) => (
+              {listed.map((d) => (
                 <li key={d.path}>
                   <code>{d.path}</code>：{d.message}
                 </li>

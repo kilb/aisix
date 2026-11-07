@@ -417,3 +417,37 @@ test("缓存策略表单：作用于列出后建的模型，缓存时长必填�
   );
   expect(stored, "nothing was saved").toBeUndefined();
 });
+
+test("缓存策略的删除要两步确认：取消不删，确认后删除", async ({ page }) => {
+  const created = await createResource("cache_policies", { name: "cache-delete-e2e", scope: "team", ttl_seconds: 60 });
+  const status = async () => (await stack.admin.request("GET", `/admin/resources/cache_policies/${created.id}`)).status;
+
+  await loginAsAdmin(page);
+  await openTab(page, "cache");
+  const policy = row(page, "cache-delete-e2e");
+  await policy.getByRole("button", { name: "删除", exact: true }).click();
+  await policy.getByRole("button", { name: "取消" }).click();
+  await expect(policy.getByRole("button", { name: "确认删除" })).toHaveCount(0);
+  expect(await status()).toBe(200);
+
+  await policy.getByRole("button", { name: "删除", exact: true }).click();
+  // Nothing is deleted until it is confirmed.
+  await expect(policy.getByRole("button", { name: "确认删除" })).toBeVisible();
+  expect(await status()).toBe(200);
+  await policy.getByRole("button", { name: "确认删除" }).click();
+  await expect(row(page, "cache-delete-e2e")).toHaveCount(0);
+  expect(await status()).toBe(404);
+});
+
+test("缓存策略页刷新后列出页面打开后才新建的策略", async ({ page }) => {
+  await loginAsAdmin(page);
+  await openTab(page, "cache");
+  // The page has read its list before the policy is written.
+  await expect(page.getByRole("button", { name: "新建缓存策略" })).toBeVisible();
+  await expect(page.locator("main").getByText("载入中…")).toHaveCount(0);
+  await createResource("cache_policies", { name: "cache-late-e2e", scope: "team", ttl_seconds: 60 });
+  await expect(row(page, "cache-late-e2e")).toHaveCount(0);
+
+  await page.getByRole("button", { name: "刷新" }).click();
+  await expect(row(page, "cache-late-e2e")).toBeVisible();
+});

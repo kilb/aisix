@@ -1,4 +1,4 @@
-import type { ApiError } from "./api";
+import type { ApiError, Detail } from "./api";
 
 /**
  * The Dashboard's own text for each error code it knows. A code missing
@@ -31,4 +31,10 @@ const TEXT: Record<string, string> = {
 
 export function messageFor(e: ApiError): string {
   return TEXT[e.code] ?? e.message;
+}
+
+/** The messages of the refusal details at a path `at` accepts, joined; null when there are none. */
+export function problemAt(details: Detail[], at: (path: string) => boolean): string | null {
+  const messages = details.filter((d) => at(d.path)).map((d) => d.message);
+  return messages.length > 0 ? messages.join("；") : null;
 }

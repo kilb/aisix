@@ -4,8 +4,10 @@ import { ConflictNote } from "../components/ConflictNote";
 import { RolloutBadge } from "../components/RolloutBadge";
 import { ApiError, resources, type Detail, type ResourceView } from "../lib/api";
 import { messageFor } from "../lib/errors";
+import { errorText } from "../lib/fmt";
 import { defaultAt, enumAt, loadSchema, SchemaShapeError, valueDescriptionsAt } from "../lib/schema";
 import { useResource } from "../lib/useResource";
+import { Failure, TwoStep } from "./Tenants";
 
 /** A cache policy document; fields the form does not show are kept as stored. */
 interface CachePolicyDoc {
@@ -78,6 +80,8 @@ export function Cache({ canEdit, onGoto }: TabProps) {
   const [failure, setFailure] = useState<{ text: string; details: Detail[] } | null>(null);
   const [conflict, setConflict] = useState(false);
   const [busy, setBusy] = useState(false);
+  // A refused delete, shown on the row it was asked on.
+  const [deleteFailure, setDeleteFailure] = useState<{ id: string; error: unknown } | null>(null);
   const scopeProblemId = useId();
   const ttlProblemId = useId();
 
@@ -100,7 +104,7 @@ export function Cache({ canEdit, onGoto }: TabProps) {
         }
       },
       (e) => {
-        if (live) setOptionsError(e instanceof ApiError ? messageFor(e) : String(e));
+        if (live) setOptionsError(errorText(e));
       },
     );
     return () => {
@@ -189,6 +193,19 @@ export function Cache({ canEdit, onGoto }: TabProps) {
     }
   }
 
+  async function remove(p: ResourceView<CachePolicyDoc>) {
+    setBusy(true);
+    setDeleteFailure(null);
+    try {
+      await policies.remove(p.id, p.version);
+      if (form?.id === p.id) setForm(null);
+    } catch (e) {
+      setDeleteFailure({ id: p.id, error: e });
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function reloadForm() {
     if (!form?.id) return;
     try {
@@ -215,7 +232,20 @@ export function Cache({ canEdit, onGoto }: TabProps) {
   return (
     <>
       <div className="panel">
-        <h2>缓存策略</h2>
+        <h2>
+          缓存策略
+          <button
+            type="button"
+            className="ghost"
+            style={{ marginLeft: "auto" }}
+            onClick={() => {
+              void policies.reload();
+              void models.reload();
+            }}
+          >
+            刷新
+          </button>
+        </h2>
         <p className="hint">
           命中缓存的请求直接由网关应答，不再转发给上游。平台部署中缓存条目只在同一租户的 API 密钥之间共享（team 范围）。
         </p>
@@ -269,6 +299,23 @@ export function Cache({ canEdit, onGoto }: TabProps) {
                       <button type="button" className="ghost" onClick={() => open(p)}>
                         {canEdit && p.doc.scope !== ENV_SCOPE ? "编辑" : "查看"}
                       </button>
+                      {canEdit && (
+                        <TwoStep
+                          label="删除"
+                          disabled={busy}
+                          warning={`删除「${p.doc.name ?? p.id}」后，它覆盖的请求不再由网关缓存应答。`}
+                          onConfirm={() => void remove(p)}
+                        />
+                      )}
+                      {deleteFailure?.id === p.id && (
+                        <Failure
+                          error={deleteFailure.error}
+                          onReload={() => {
+                            setDeleteFailure(null);
+                            void policies.reload();
+                          }}
+                        />
+                      )}
                     </td>
                   </tr>
                 ))}

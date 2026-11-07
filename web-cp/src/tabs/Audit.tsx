@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { TabProps } from "../App";
-import { ApiError, audit, type AuditEntry, type Tenant } from "../lib/api";
+import { audit, tenants as tenantsApi, type AuditEntry, type Tenant } from "../lib/api";
 import { redacted } from "../lib/auditDetail";
-import { messageFor } from "../lib/errors";
+import { errorText, fmtTime } from "../lib/fmt";
 
 /**
  * The `target_kind` values the control plane records, by the names this
@@ -29,10 +29,6 @@ const TARGET_KINDS: { kind: string; label: string }[] = [
 ];
 
 const ACTOR_KIND: Record<string, string> = { member: "租户成员", system: "系统", anonymous: "匿名" };
-
-function fmtTime(iso: string): string {
-  return new Date(iso).toLocaleString("zh-CN", { hour12: false });
-}
 
 /** A value as stored: strings bare, a list of plain values comma-separated, anything else as JSON. */
 function valueText(value: unknown): string {
@@ -67,7 +63,6 @@ interface Filter {
 }
 
 const query = (f: Filter) => ({ target_kind: f.kind || undefined, tenant_id: f.tenant || undefined });
-const failed = (e: unknown) => (e instanceof ApiError ? messageFor(e) : String(e));
 
 /**
  * "审计日志": who changed what, newest first, a page at a time as the
@@ -95,7 +90,7 @@ export function Audit(_: TabProps) {
       setRows(page.items);
       setNext(page.next_before);
     } catch (e) {
-      if (g === generation.current) setError(failed(e));
+      if (g === generation.current) setError(errorText(e));
     }
   }, []);
 
@@ -104,7 +99,7 @@ export function Audit(_: TabProps) {
   }, [filter, loadFirst]);
 
   useEffect(() => {
-    audit.tenants().then(setTenants, (e) => setTenantsError(failed(e)));
+    tenantsApi.list().then(setTenants, (e) => setTenantsError(errorText(e)));
   }, []);
 
   async function loadMore() {
@@ -118,7 +113,7 @@ export function Audit(_: TabProps) {
       setRows((prev) => [...(prev ?? []), ...page.items]);
       setNext(page.next_before);
     } catch (e) {
-      if (g === generation.current) setError(failed(e));
+      if (g === generation.current) setError(errorText(e));
     } finally {
       setLoadingMore(false);
     }

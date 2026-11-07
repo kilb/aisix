@@ -2,6 +2,7 @@ import { useCallback, useEffect, useId, useState } from "react";
 import type { TabProps } from "../App";
 import { ApiError, operators, type Detail, type OperatorAccount, type OperatorRole } from "../lib/api";
 import { messageFor } from "../lib/errors";
+import { errorText, fmtTime } from "../lib/fmt";
 
 /** The control plane's operator roles, highest first, by the names this page shows. */
 const ROLES: { role: OperatorRole; label: string }[] = [
@@ -14,10 +15,6 @@ const ROLES: { role: OperatorRole; label: string }[] = [
 const NEW_ROLE: OperatorRole = "viewer";
 
 const roleLabel = (role: OperatorRole) => ROLES.find((r) => r.role === role)?.label ?? role;
-
-function fmtTime(iso: string): string {
-  return new Date(iso).toLocaleString("zh-CN", { hour12: false });
-}
 
 /** A row action waiting for its confirmation (ruling P1b-R6: inline, never a dialog). */
 type Pending = { id: string; kind: "disable" } | { id: string; kind: "role"; role: OperatorRole };
@@ -41,7 +38,7 @@ export function Operators({ operator }: TabProps) {
       setItems(await operators.list());
       setLoadError(null);
     } catch (e) {
-      setLoadError(e instanceof ApiError ? messageFor(e) : String(e));
+      setLoadError(errorText(e));
     }
   }, []);
 
@@ -61,7 +58,7 @@ export function Operators({ operator }: TabProps) {
       void reload();
     } catch (e) {
       // The row keeps what is stored: a refused change was not made.
-      setOutcome({ ok: false, text: `${account.email}：${e instanceof ApiError ? messageFor(e) : String(e)}` });
+      setOutcome({ ok: false, text: `${account.email}：${errorText(e)}` });
     } finally {
       setPending(null);
       setBusy(false);

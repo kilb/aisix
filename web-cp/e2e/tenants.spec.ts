@@ -296,6 +296,63 @@ test("两个运维同时改同一租户的授权：后保存的被拒，重新�
   expect((await stack.admin.get(`/admin/tenants/${t.id}`)).allowed_model_ids).toEqual([models.other.id]);
 });
 
+test("另一位运维新建并授权的模型，页面重新载入后再保存别的授权，它仍在授权里", async ({ page }) => {
+  const t = await signUpActive("T5 Catalog Co 2e6", "owner@catalog-t5.test", [models.chat]);
+
+  await openTenants(page);
+  await openTenant(page, t.org);
+  const grants = page.getByRole("group", { name: "授权模型" });
+  await expect(grants.getByRole("checkbox", { name: "chat-t5-e2e" })).toBeChecked();
+  // Meanwhile another operator adds a model to the catalog and grants it.
+  const late = await stack.admin.post("/admin/resources/models", {
+    doc: { display_name: "late-t5-e2e", provider: "openai", model_name: "gpt-4.1", provider_key_id: models.chat.doc.provider_key_id },
+  });
+  const current = await stack.admin.request("GET", `/admin/tenants/${t.id}`);
+  await stack.admin.patch(`/admin/tenants/${t.id}`, { allowed_model_ids: [models.chat.id, late.id] }, current.version!);
+
+  // A save elsewhere on the page meets that change and reads the tenant again.
+  const limits = page.getByRole("group", { name: "限额" });
+  await limits.getByLabel("租户每分钟请求").fill("90");
+  await limits.getByRole("button", { name: "保存限额" }).click();
+  await limits.getByRole("button", { name: "重新载入" }).click();
+  await expect(grants.getByRole("checkbox", { name: "late-t5-e2e" })).toBeChecked();
+
+  // A different grant, saved from the page.
+  await grants.getByRole("checkbox", { name: "other-t5-e2e" }).check();
+  await grants.getByRole("button", { name: "保存授权" }).click();
+  await expect(grants).toContainText("已保存授权");
+  const stored = (await stack.admin.get(`/admin/tenants/${t.id}`)).allowed_model_ids as string[];
+  expect([...stored].sort()).toEqual([models.chat.id, models.other.id, late.id].sort());
+});
+
+test("撤销授权要先确认：确认前不保存，确认后该模型从授权中移除", async ({ page }) => {
+  const t = await signUpActive("T5 Ungrant Co 3f8", "owner@ungrant-t5.test", [models.chat, models.other]);
+
+  await openTenants(page);
+  await openTenant(page, t.org);
+  const grants = page.getByRole("group", { name: "授权模型" });
+  await grants.getByRole("checkbox", { name: "chat-t5-e2e" }).uncheck();
+  await grants.getByRole("button", { name: "保存授权" }).click();
+  // The model about to be withdrawn is named, and nothing is saved yet.
+  await expect(grants.getByRole("alert")).toContainText("chat-t5-e2e");
+  const before = (await stack.admin.get(`/admin/tenants/${t.id}`)).allowed_model_ids as string[];
+  expect([...before].sort()).toEqual([models.chat.id, models.other.id].sort());
+
+  await grants.getByRole("button", { name: "确认保存授权" }).click();
+  await expect(grants).toContainText("已保存授权");
+  expect((await stack.admin.get(`/admin/tenants/${t.id}`)).allowed_model_ids).toEqual([models.other.id]);
+});
+
+test("刷新后列出页面打开后才注册的租户", async ({ page }) => {
+  await openTenants(page);
+  await expect(tenantRow(page, "平台内部")).toHaveCount(1);
+  const t = await signUp("T5 Late Co 9d1", "owner@late-t5.test");
+  await expect(tenantRow(page, t.org)).toHaveCount(0);
+
+  await page.getByRole("button", { name: "刷新" }).click();
+  await expect(tenantRow(page, t.org)).toContainText("待审核");
+});
+
 test("一处未保存的修改，不会被另一处的保存冲掉", async ({ page }) => {
   const t = await signUpActive("T5 Draft Co 7d3", "owner@draft-t5.test");
 

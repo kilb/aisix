@@ -1,4 +1,4 @@
-import { expect, test, type Page } from "@playwright/test";
+import { expect, test, type Locator, type Page } from "@playwright/test";
 import { STACK_START_TIMEOUT_MS, startStack, type Json, type Stack } from "./stack";
 
 /**
@@ -414,4 +414,52 @@ test("取消后改为移除另一个分组：确认框只列这一次的影响�
   await expect(page.getByRole("form", { name: /acct-swap-e2e/ })).toHaveCount(0);
   await expect(accountRow(page, "acct-swap-e2e")).not.toContainText("grp-idle-4e1");
   expect((await account(created.id)).doc.groups).toEqual(["shared", "grp-swap-a1c"]);
+});
+
+/** The text of the elements that describe `field` (its refusal, when there is one). */
+function description(field: Locator): Promise<string> {
+  return field.evaluate((el) =>
+    (el.getAttribute("aria-describedby") ?? "")
+      .split(/\s+/)
+      .filter(Boolean)
+      .map((id) => document.getElementById(id)?.textContent ?? "")
+      .join(" "),
+  );
+}
+
+test("改了接口地址却没有重填密钥：被拒的原因标在密钥旁，地址没有保存", async ({ page }) => {
+  const created = await createAccount({
+    display_name: "acct-moved-e2e",
+    provider: "openai",
+    api_key: "sk-e2e-moved-upstream-8c3",
+    api_base: `${stack.mockUpstreamUrl}/v1`,
+  });
+  await loginAsOperator(page);
+  await openTab(page, "上游账号");
+  await accountRow(page, "acct-moved-e2e").getByRole("button", { name: "编辑" }).click();
+  const form = page.getByRole("form", { name: /acct-moved-e2e/ });
+  await form.getByLabel("接口地址").fill("https://moved.example.test/v1");
+  await form.getByRole("button", { name: "保存" }).click();
+
+  const secret = form.getByRole("group", { name: "密钥" });
+  await expect(secret).toHaveAttribute("aria-invalid", "true");
+  await expect(secret).toHaveAccessibleDescription(/\S/);
+  // The reason is at the field, not repeated in the note under the form.
+  await expect(form.getByRole("alert")).toBeVisible();
+  await expect(form.getByRole("alert")).not.toContainText(await description(secret));
+  await expect(form.getByLabel("接口地址")).not.toHaveAttribute("aria-invalid", "true");
+  expect((await account(created.id)).doc.api_base).toBe(`${stack.mockUpstreamUrl}/v1`);
+});
+
+test("刷新后列出页面打开后才新增的上游账号", async ({ page }) => {
+  await loginAsOperator(page);
+  await openTab(page, "上游账号");
+  // The page has read its list before the account is written.
+  await expect(page.getByRole("button", { name: "新增上游账号" })).toBeVisible();
+  await expect(page.locator("main").getByText("载入中…")).toHaveCount(0);
+  await createAccount({ display_name: "acct-late-e2e", provider: "openai", api_key: "sk-e2e-late-upstream-1d5" });
+  await expect(accountRow(page, "acct-late-e2e")).toHaveCount(0);
+
+  await page.getByRole("button", { name: "刷新" }).click();
+  await expect(accountRow(page, "acct-late-e2e")).toBeVisible();
 });

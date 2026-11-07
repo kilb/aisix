@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { ApiError, logout, onSessionEnded, session, type Operator, type OperatorRole } from "./lib/api";
 import { EXPECTED_API_CONTRACT } from "./lib/contract";
-import { messageFor } from "./lib/errors";
+import { errorText } from "./lib/fmt";
 import { useTheme } from "./lib/useTheme";
 import { ChangePassword } from "./components/ChangePassword";
 import { Gate } from "./Gate";
@@ -102,13 +102,27 @@ export function App() {
       setApiContract(s.apiContract);
       setOperator(s.authed ? s.operator : null);
     } catch (e) {
-      setBootError(e instanceof ApiError ? messageFor(e) : String(e));
+      setBootError(errorText(e));
     }
   }, []);
 
   useEffect(() => {
     void boot();
   }, [boot]);
+
+  // The contract is read again whenever the window regains focus: a control
+  // plane redeployed while the page stayed open stops it as a skew at boot
+  // would. A failed read changes nothing; the next request reports it.
+  useEffect(() => {
+    const recheck = () => {
+      session().then(
+        (s) => setApiContract(s.apiContract),
+        () => undefined,
+      );
+    };
+    window.addEventListener("focus", recheck);
+    return () => window.removeEventListener("focus", recheck);
+  }, []);
 
   // Any request that finds the session gone, on any page, drops back to the
   // gate. Only while signed in: a request still in flight when the operator

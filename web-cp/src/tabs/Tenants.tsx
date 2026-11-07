@@ -22,6 +22,7 @@ import {
   type TenantLimits,
 } from "../lib/api";
 import { messageFor } from "../lib/errors";
+import { errorText, fmtTime } from "../lib/fmt";
 import "./Tenants.css";
 
 export const STATUS_LABEL: Record<Tenant["status"], string> = {
@@ -55,6 +56,9 @@ const LIMIT_FIELDS: { field: keyof TenantLimits; label: string }[] = [
 /** Shown beside a model the control plane refused to grant because of its kind. */
 const UNGRANTABLE = "通配模型与 ensemble 模型不能授给租户";
 
+/** Shown beside a granted model the model catalog, as last read, does not list. */
+const NOT_IN_CATALOG = "目录中未找到";
+
 const WATCH_INTERVAL_MS = 1_000;
 const WATCH_BUDGET_MS = 30_000;
 
@@ -67,10 +71,6 @@ interface ModelDoc {
 /** A model a customer tenant cannot be granted: a wildcard row or an ensemble. */
 function ungrantable(doc: ModelDoc): boolean {
   return (doc.display_name ?? "").includes("*") || (doc.ensemble !== undefined && doc.ensemble !== null);
-}
-
-export function errorText(e: unknown): string {
-  return e instanceof ApiError ? messageFor(e) : String(e);
 }
 
 /**
@@ -311,6 +311,16 @@ export function strayGroups(k: AdminKey, t: Tenant): string[] {
   return k.allowed_provider_groups.filter((g) => !t.allowed_provider_groups.includes(g));
 }
 
+/**
+ * A key's effective groups, as listed. None reaches every upstream for the
+ * platform's own tenant; a customer tenant's key with none is refused by the
+ * gateway.
+ */
+export function groupsText(groups: string[], tenant: Tenant): string {
+  if (groups.length > 0) return groups.join("、");
+  return tenant.is_internal ? "全部上游" : "无分组（密钥不可用）";
+}
+
 /** The note beside a key whose override reaches past its tenant's groups. */
 export function StrayNote({ k, tenant }: { k: AdminKey; tenant: Tenant }) {
   const stray = strayGroups(k, tenant);
@@ -333,6 +343,8 @@ export function Tenants({ operator, canEdit }: TabProps) {
   const [detail, setDetail] = useState<Tenant | null>(null);
   const [detailError, setDetailError] = useState<string | null>(null);
   const [showDefaults, setShowDefaults] = useState(false);
+  // Bumped by 刷新: the open tenant's page reads its lists again.
+  const [tick, setTick] = useState(0);
   const lifetime = useLifetime();
   const selectedRef = useRef(selected);
   selectedRef.current = selected;
@@ -399,6 +411,12 @@ export function Tenants({ operator, canEdit }: TabProps) {
     [settle],
   );
 
+  function refreshAll() {
+    void loadList();
+    if (selected) void loadDetail(selected);
+    setTick((n) => n + 1);
+  }
+
   async function act(t: Tenant, run: (id: string) => Promise<Tenant>) {
     setActing(t.id);
     setRowError(null);
@@ -418,11 +436,13 @@ export function Tenants({ operator, canEdit }: TabProps) {
       <div className="panel">
         <h2>
           租户
+          <button type="button" className="ghost" style={{ marginLeft: "auto" }} onClick={refreshAll}>
+            刷新
+          </button>
           {operator.role === "admin" && (
             <button
               type="button"
               className="ghost"
-              style={{ marginLeft: "auto" }}
               aria-expanded={showDefaults}
               onClick={() => setShowDefaults((open) => !open)}
             >
@@ -542,6 +562,7 @@ export function Tenants({ operator, canEdit }: TabProps) {
           key={detail.id}
           tenant={detail}
           canEdit={canEdit}
+          tick={tick}
           onView={settle}
           onRefresh={() => void refresh(detail.id)}
           onReload={() => void loadDetail(detail.id)}
@@ -565,6 +586,7 @@ interface PartProps {
 function TenantDetail({
   tenant,
   canEdit,
+  tick,
   onView,
   onRefresh,
   onReload,
@@ -572,16 +594,20 @@ function TenantDetail({
 }: {
   tenant: Tenant;
   canEdit: boolean;
+  /** Changes when the operator asks for everything to be read again. */
+  tick: number;
   onView: (view: Tenant) => void;
   onRefresh: () => void;
   onReload: () => void;
   onClose: () => void;
 }) {
-  const catalog = useLoad(() => resources.list<ModelDoc>("models"), []);
-  const groups = useLoad(() => providerGroups.list(), []);
-  const members = useLoad(() => tenants.members(tenant.id), [tenant.id]);
+  // Read again with every version of the tenant: a grant made elsewhere can
+  // name a model created after the last read.
+  const catalog = useLoad(() => resources.list<ModelDoc>("models"), [tenant.version, tick]);
+  const groups = useLoad(() => providerGroups.list(), [tick]);
+  const members = useLoad(() => tenants.members(tenant.id), [tenant.id, tick]);
   // Every change to the tenant's row can change what its keys are given.
-  const keyList = useLoad(() => tenants.keys(tenant.id), [tenant.id, tenant.version]);
+  const keyList = useLoad(() => tenants.keys(tenant.id), [tenant.id, tenant.version, tick]);
 
   const save = useCallback(
     async (changes: TenantChanges) => {
@@ -750,20 +776,31 @@ function GrantsPart({
   }, [stored]);
   useConflictClears(tenant.version, setRefused);
 
-  const rows = useMemo(
-    () =>
-      (catalog ?? [])
-        .map((m) => ({ id: m.id, name: m.doc.display_name || m.id, doc: m.doc }))
-        .sort((a, b) => a.name.localeCompare(b.name)),
-    [catalog],
-  );
+  // The catalog's models, then every granted or chosen model it does not
+  // list: a save sends the whole list, so a grant made since the catalog was
+  // read must stay in it rather than be withdrawn unseen.
+  const rows = useMemo(() => {
+    const listed: { id: string; name: string; doc: ModelDoc | null }[] = (catalog ?? [])
+      .map((m) => ({ id: m.id, name: m.doc.display_name || m.id, doc: m.doc }))
+      .sort((a, b) => a.name.localeCompare(b.name));
+    const known = new Set(listed.map((r) => r.id));
+    const unknown = [...new Set([...tenant.allowed_model_ids, ...chosen])]
+      .filter((id) => !known.has(id))
+      .sort()
+      .map((id) => ({ id, name: id, doc: null }));
+    return [...listed, ...unknown];
+  }, [catalog, tenant.allowed_model_ids, chosen]);
 
   function reasonFor(row: (typeof rows)[number]): string | undefined {
     const i = sent.indexOf(row.id);
     const refusedHere = i >= 0 ? refused?.at.get(`/allowed_model_ids/${i}`) : undefined;
     if (refusedHere === undefined) return undefined;
-    return ungrantable(row.doc) ? UNGRANTABLE : refusedHere;
+    return row.doc && ungrantable(row.doc) ? UNGRANTABLE : refusedHere;
   }
+
+  // Grants the save takes away: every key of the tenant loses those models.
+  const withdrawn = tenant.allowed_model_ids.filter((id) => !chosen.has(id));
+  const nameOf = (id: string) => rows.find((r) => r.id === id)?.name ?? id;
 
   async function submit() {
     const ids = rows.filter((r) => chosen.has(r.id)).map((r) => r.id);
@@ -810,6 +847,7 @@ function GrantsPart({
                   return next;
                 })
               }
+              note={r.doc ? undefined : NOT_IN_CATALOG}
               error={reasonFor(r)}
             />
           ))}
@@ -823,10 +861,17 @@ function GrantsPart({
       {refused?.conflict && <ConflictNote onReload={onReload} />}
       <Msg note={note} />
       {canEdit && (
-        // Without the catalog the form shows no choices, and saving would withdraw every grant.
-        <button type="button" className="act" disabled={busy || catalog === null} onClick={() => void submit()}>
-          保存授权
-        </button>
+        // Until the catalog is read the form shows no choices. A save that takes a
+        // grant away cuts every key of the tenant off from it, so it is confirmed
+        // first (ruling P1b-R6).
+        <TwoStep
+          label="保存授权"
+          className="act"
+          disabled={busy || catalog === null}
+          ask={() => withdrawn.length > 0}
+          warning={`将撤销 ${withdrawn.map(nameOf).join("、")} 的授权。保存后，该租户的所有密钥都不能再调用这些模型。`}
+          onConfirm={() => void submit()}
+        />
       )}
     </fieldset>
   );
@@ -1235,7 +1280,7 @@ function InvitePart({ tenant }: { tenant: Tenant }) {
                 </button>
               </>
             )}
-            <p className="hint">有效期至 {new Date(issued.expires_at).toLocaleString()}。</p>
+            <p className="hint">有效期至 {fmtTime(issued.expires_at)}。</p>
             {copied && <p className="hint">{copied}</p>}
           </div>
         )}
@@ -1320,9 +1365,7 @@ function KeysPart({
                       <code>{k.prefix}…</code>
                     </td>
                     <td>{ownerOf(k)}</td>
-                    <td>
-                      {k.effective_provider_groups.length > 0 ? k.effective_provider_groups.join("、") : "全部上游"}
-                    </td>
+                    <td>{groupsText(k.effective_provider_groups, tenant)}</td>
                     <td>
                       {k.allowed_provider_groups?.length ? k.allowed_provider_groups.join("、") : "沿用租户"}
                       <StrayNote k={k} tenant={tenant} />
@@ -1395,6 +1438,10 @@ export function OverrideEditor({
   onReload: () => void;
 }) {
   const [chosen, setChosen] = useState<string[]>(k.allowed_provider_groups ?? []);
+  // The version the edit started from. A list read while the editor is open
+  // brings a newer `k`; a change made meanwhile must refuse this save (412),
+  // not be overwritten by it.
+  const [version] = useState(k.version);
   const [sent, setSent] = useState<string[]>([]);
   const [refused, setRefused] = useState<Refusal | null>(null);
   const [busy, setBusy] = useState(false);
@@ -1405,7 +1452,7 @@ export function OverrideEditor({
     setRefused(null);
     setSent(groups ?? []);
     try {
-      onSaved(await keysApi.update(k.id, { allowed_provider_groups: groups }, k.version));
+      onSaved(await keysApi.update(k.id, { allowed_provider_groups: groups }, version));
     } catch (e) {
       setRefused(refusal(e, atList("/allowed_provider_groups")));
     } finally {

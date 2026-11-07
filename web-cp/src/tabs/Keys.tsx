@@ -13,15 +13,16 @@ import {
   type NewKey,
   type Tenant,
 } from "../lib/api";
+import { errorText, fmtTime } from "../lib/fmt";
 import {
   accountsByGroup,
   atList,
   Check,
-  errorText,
   Failure,
   follow,
   GroupPicker,
   groupOptions,
+  groupsText,
   LimitInput,
   OverrideEditor,
   refusal,
@@ -54,11 +55,26 @@ export function Keys({ canEdit }: TabProps) {
   const ordered = useMemo(() => [...(list.data ?? [])].sort(byPicker), [list.data]);
   const [chosen, setChosen] = useState<string | null>(null);
   const tenantId = chosen ?? ordered[0]?.id ?? null;
+  // Bumped by 刷新: the tenant shown reads its lists again.
+  const [tick, setTick] = useState(0);
 
   return (
     <>
       <div className="panel">
-        <h2>密钥</h2>
+        <h2>
+          密钥
+          <button
+            type="button"
+            className="ghost"
+            style={{ marginLeft: "auto" }}
+            onClick={() => {
+              void list.reload();
+              setTick((n) => n + 1);
+            }}
+          >
+            刷新
+          </button>
+        </h2>
         <p className="hint">
           平台内部租户的密钥是运维自用的，可以按名称模式授权模型；其他租户的密钥只能使用该租户已授权的模型。明文只在创建时显示一次，之后只显示前缀。
         </p>
@@ -88,7 +104,7 @@ export function Keys({ canEdit }: TabProps) {
         )}
       </div>
       {/* Keyed by tenant: switching drops everything shown for the last one, a new key's plaintext included. */}
-      {tenantId && <TenantKeys key={tenantId} tenantId={tenantId} canEdit={canEdit} />}
+      {tenantId && <TenantKeys key={tenantId} tenantId={tenantId} canEdit={canEdit} tick={tick} />}
     </>
   );
 }
@@ -128,7 +144,7 @@ function Status({ k, tenant, members }: { k: AdminKey; tenant: Tenant; members: 
       ) : (
         "正常"
       )}
-      {k.expires_at && !expired && <span className="tn-note">到期 {new Date(k.expires_at).toLocaleString()}</span>}
+      {k.expires_at && !expired && <span className="tn-note">到期 {fmtTime(k.expires_at)}</span>}
     </>
   );
 }
@@ -153,14 +169,14 @@ function Creator({ k, members }: { k: AdminKey; members: Member[] | null }) {
   );
 }
 
-function TenantKeys({ tenantId, canEdit }: { tenantId: string; canEdit: boolean }) {
+function TenantKeys({ tenantId, canEdit, tick }: { tenantId: string; canEdit: boolean; tick: number }) {
   const lifetime = useLifetime();
   const [tenant, setTenant] = useState<Tenant | null>(null);
   const [tenantError, setTenantError] = useState<string | null>(null);
-  const keyList = useLoad(() => tenants.keys(tenantId), [tenantId]);
-  const members = useLoad(() => tenants.members(tenantId), [tenantId]);
-  const catalog = useLoad(() => resources.list<{ display_name?: string }>("models"), []);
-  const groups = useLoad(() => providerGroups.list(), []);
+  const keyList = useLoad(() => tenants.keys(tenantId), [tenantId, tick]);
+  const members = useLoad(() => tenants.members(tenantId), [tenantId, tick]);
+  const catalog = useLoad(() => resources.list<{ display_name?: string }>("models"), [tick]);
+  const groups = useLoad(() => providerGroups.list(), [tick]);
   const [creating, setCreating] = useState(false);
   // Held only here: switching tenant or leaving the tab drops it for good.
   const [minted, setMinted] = useState<MintedKey | null>(null);
@@ -182,7 +198,8 @@ function TenantKeys({ tenantId, canEdit }: { tenantId: string; canEdit: boolean 
     } catch (e) {
       setTenantError(errorText(e));
     }
-  }, [tenantId, applyView, lifetime]);
+    // `tick`: 刷新 reads the tenant again too.
+  }, [tenantId, applyView, lifetime, tick]);
 
   useEffect(() => {
     void refresh();
@@ -226,7 +243,8 @@ function TenantKeys({ tenantId, canEdit }: { tenantId: string; canEdit: boolean 
       <h2>
         {tenant.name}
         <RolloutBadge rollout={tenant.rollout} />
-        {canEdit && (
+        {/* A pending tenant has no keys until it is approved; the control plane refuses one. */}
+        {canEdit && tenant.status !== "pending" && (
           <button
             type="button"
             className="ghost"
@@ -239,8 +257,7 @@ function TenantKeys({ tenantId, canEdit }: { tenantId: string; canEdit: boolean 
         )}
       </h2>
       <p className="hint">
-        {STATUS_LABEL[tenant.status] ?? tenant.status} · 可用分组{" "}
-        {tenant.allowed_provider_groups.length > 0 ? tenant.allowed_provider_groups.join("、") : "全部上游"}
+        {STATUS_LABEL[tenant.status] ?? tenant.status} · 可用分组 {groupsText(tenant.allowed_provider_groups, tenant)}
         。密钥未设的限额按租户的单 key 上限；运维停用的密钥只有运维能重新启用。
       </p>
       {tenantError && (
@@ -249,7 +266,7 @@ function TenantKeys({ tenantId, canEdit }: { tenantId: string; canEdit: boolean 
         </div>
       )}
 
-      {creating && canEdit && (
+      {creating && canEdit && tenant.status !== "pending" && (
         <CreateForm
           tenant={tenant}
           names={names}
@@ -308,7 +325,7 @@ function TenantKeys({ tenantId, canEdit }: { tenantId: string; canEdit: boolean 
                     <td>{ownerOf(k, tenant, members.data)}</td>
                     <td>{modelsOf(k, tenant, names)}</td>
                     <td>
-                      {k.effective_provider_groups.length > 0 ? k.effective_provider_groups.join("、") : "全部上游"}
+                      {groupsText(k.effective_provider_groups, tenant)}
                       {k.allowed_provider_groups?.length ? <span className="tn-note">覆盖</span> : null}
                       <StrayNote k={k} tenant={tenant} />
                     </td>

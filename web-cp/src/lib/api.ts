@@ -576,10 +576,6 @@ export const audit = {
     const query = params.toString();
     return (await call<AuditPage>("GET", `/admin/audit${query ? `?${query}` : ""}`)).data;
   },
-  /** The tenants the log can be narrowed to. */
-  async tenants(): Promise<Tenant[]> {
-    return (await call<{ items: Tenant[] }>("GET", "/admin/tenants")).data.items;
-  },
 };
 
 export const settings = {

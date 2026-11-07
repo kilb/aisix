@@ -1,11 +1,11 @@
-import { useState } from "react";
+import { useId, useState } from "react";
 
 /**
  * A list of short names, such as provider groups: one chip per name with
  * its own remove button, and a box that adds the typed name on Enter or
  * `添加`. Names are trimmed; an empty or repeated name is not added.
  * `readOnly` (a viewer, or a form awaiting confirmation) shows the chips
- * only.
+ * only. `problem` is the control plane's refusal of the list, shown under it.
  */
 export function TagInput({
   label,
@@ -13,14 +13,17 @@ export function TagInput({
   onChange,
   readOnly = false,
   hint,
+  problem = null,
 }: {
   label: string;
   value: string[];
   onChange: (next: string[]) => void;
   readOnly?: boolean;
   hint?: string;
+  problem?: string | null;
 }) {
   const [draft, setDraft] = useState("");
+  const problemId = useId();
 
   const add = () => {
     const name = draft.trim();
@@ -29,7 +32,13 @@ export function TagInput({
   };
 
   return (
-    <div className="f" role="group" aria-label={label}>
+    <div
+      className="f"
+      role="group"
+      aria-label={label}
+      aria-invalid={problem ? true : undefined}
+      aria-describedby={problem ? problemId : undefined}
+    >
       <span>{label}</span>
       {value.length === 0 ? (
         <p className="hint">未设置</p>
@@ -71,6 +80,11 @@ export function TagInput({
         </div>
       )}
       {hint && <p className="hint">{hint}</p>}
+      {problem && (
+        <p id={problemId} className="field-problem">
+          {problem}
+        </p>
+      )}
     </div>
   );
 }

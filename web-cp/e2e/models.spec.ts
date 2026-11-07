@@ -368,3 +368,50 @@ test("只读运维看得到模型与目标，没有任何编辑入口", async ({
   }
   await expect(form.getByRole("button", { name: "关闭" })).toBeVisible();
 });
+
+/** The text of the elements that describe `field` (its refusal, when there is one). */
+function description(field: Locator): Promise<string> {
+  return field.evaluate((el) =>
+    (el.getAttribute("aria-describedby") ?? "")
+      .split(/\s+/)
+      .filter(Boolean)
+      .map((id) => document.getElementById(id)?.textContent ?? "")
+      .join(" "),
+  );
+}
+
+test("所选上游账号在保存前被删掉：被拒的原因标在上游账号旁，模型没有保存", async ({ page }) => {
+  const account = await mockAccount("acct-gone-e2e", ["shared"]);
+
+  await openModels(page);
+  await page.getByRole("button", { name: "新增直连模型" }).click();
+  const form = page.getByRole("form", { name: "新增直连模型" });
+  await form.getByLabel("对外名称").fill("gone-e2e");
+  await form.getByLabel("上游账号").selectOption({ label: "acct-gone-e2e" });
+  await form.getByLabel("上游模型").fill("gpt-4o-mini");
+  // Another operator deletes the account before the save.
+  await stack.admin.del(`/admin/resources/provider_keys/${account.id}`, account.version);
+  await form.getByRole("button", { name: "保存" }).click();
+
+  const field = form.getByLabel("上游账号");
+  await expect(field).toHaveAttribute("aria-invalid", "true");
+  await expect(field).toHaveAccessibleDescription(/\S/);
+  // The reason is at the field, not repeated in the note under the form.
+  await expect(form.getByRole("alert")).toBeVisible();
+  await expect(form.getByRole("alert")).not.toContainText(await description(field));
+  await expect(form.getByLabel("对外名称")).not.toHaveAttribute("aria-invalid", "true");
+  expect(await modelNamed("gone-e2e")).toBeUndefined();
+});
+
+test("刷新后列出页面打开后才新增的模型", async ({ page }) => {
+  const account = await mockAccount("acct-late-model-e2e", ["shared"]);
+  await openModels(page);
+  // The page has read its list before the model is written.
+  await expect(page.getByRole("button", { name: "新增直连模型" })).toBeVisible();
+  await expect(page.locator("main").getByText("载入中…")).toHaveCount(0);
+  await directModel("late-model-e2e", account.id);
+  await expect(modelRow(page, "late-model-e2e")).toHaveCount(0);
+
+  await page.getByRole("button", { name: "刷新" }).click();
+  await expect(modelRow(page, "late-model-e2e")).toBeVisible();
+});

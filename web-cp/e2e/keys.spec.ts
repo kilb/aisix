@@ -448,6 +448,42 @@ test("两个运维同时操作同一密钥：后操作的被拒并提示重新�
   expect([stored.label, stored.disabled]).toEqual(["race-key-t6-renamed", false]);
 });
 
+test("分组覆盖打开期间另一位运维改了它：刷新后再保存被拒，另一位的修改保留", async ({ page }) => {
+  const t = await signUpActive("T6 Override Race Co 2d8", "owner@orace-t6.test", [models.chat]);
+  const { key } = await mint(t, "orace-key-t6");
+
+  await openKeys(page, t.org);
+  const row = keyRow(page, "orace-key-t6");
+  await expect(row).toContainText("shared");
+  await row.getByRole("button", { name: "分组覆盖" }).click();
+  const editor = keyTable(page).getByRole("group", { name: "分组覆盖" });
+  await editor.getByRole("checkbox", { name: "shared" }).check();
+  // Meanwhile another operator gives the key an override of its own.
+  const current = await stack.admin.request("GET", `/admin/keys/${key.id}`);
+  await stack.admin.patch(`/admin/keys/${key.id}`, { allowed_provider_groups: ["grp-alpha-7c1"] }, current.version!);
+  // The page reads the list again while the editor stays open.
+  await page.getByRole("button", { name: "刷新" }).click();
+  await expect(row).toContainText("grp-alpha-7c1");
+
+  await editor.getByRole("button", { name: "保存覆盖" }).click();
+  await expect(editor.getByRole("alert")).toContainText("该资源已被他人修改");
+  expect((await stack.admin.get(`/admin/keys/${key.id}`)).allowed_provider_groups).toEqual(["grp-alpha-7c1"]);
+});
+
+test("待审核的租户在密钥页没有新建密钥", async ({ page }) => {
+  const pending = "T6 Pending Co 7b3";
+  await stack.tenant().post("/api/signup", { org_name: pending, email: "owner@pending-t6.test", password: PASSWORD });
+  const active = await signUpActive("T6 Approved Co 7b4", "owner@approved-t6.test");
+
+  await openKeys(page, active.org);
+  await expect(page.getByRole("button", { name: "新建密钥" })).toBeVisible();
+  const picker = page.getByLabel("租户");
+  const option = await picker.locator("option", { hasText: pending }).getAttribute("value");
+  await picker.selectOption(option!);
+  await expect(page.getByRole("region", { name: new RegExp(pending) })).toBeVisible();
+  await expect(page.getByRole("button", { name: "新建密钥" })).toHaveCount(0);
+});
+
 test("管理员被降为成员后，他代租户创建的密钥标出创建者并建议轮换", async ({ page }) => {
   const t = await signUpActive("T6 Demote Co 9c5", "owner@demote-t6.test", [models.chat]);
   const leadEmail = "lead@demote-t6.test";

@@ -527,6 +527,10 @@ tr:hover td button.ghost{border-color:var(--rule-2);color:var(--oxide)}
 /* A form field the server refused, or that must be filled, with its reason under it. */
 .f input[aria-invalid="true"],.f select[aria-invalid="true"]{border-color:var(--oxide)}
 .field-problem{margin:-9px 0 15px;font-size:12.5px;color:var(--oxide)}
+/* A field with its reason (components/Field.tsx), placed in a row like a bare field. */
+.r > .field{flex:1 1 190px}
+.r > .field > .f{margin-bottom:0}
+.r > .field > .field-problem{margin:5px 0 0}
 /* An audit row's detail: each field's name, then its value. */
 .audit-detail{display:flex;flex-wrap:wrap;gap:4px 12px}
 .audit-field{overflow-wrap:anywhere}

@@ -1,10 +1,12 @@
 import { Fragment, useEffect, useRef, useState } from "react";
 import type { TabProps } from "../App";
 import { ConflictNote } from "../components/ConflictNote";
+import { Field } from "../components/Field";
 import { Msg, type Note } from "../components/Msg";
 import { RolloutBadge } from "../components/RolloutBadge";
 import { ApiError, tenants, type ResourceView, type Tenant } from "../lib/api";
-import { messageFor } from "../lib/errors";
+import { messageFor, problemAt } from "../lib/errors";
+import { errorText } from "../lib/fmt";
 import { defaultAt, enumAt, loadSchema } from "../lib/schema";
 import { useResource } from "../lib/useResource";
 
@@ -68,10 +70,6 @@ const KIND_LABEL: Record<string, string> = {
 const RENAME_HINT = "改名不会影响已授权的租户和引用它的路由、缓存策略。";
 /** References written by name are not rewritten on a rename. */
 const RENAME_BY_NAME = "按名称写的配置不会跟着改名：平台自有密钥的模型名单、按模型名匹配的限流条件需要同步修改。";
-
-function errorText(e: unknown): string {
-  return e instanceof ApiError ? messageFor(e) : String(e);
-}
 
 function shapeOf(doc: ModelDoc): Shape {
   if (doc.routing != null) return "routing";
@@ -226,7 +224,20 @@ export function Models({ canEdit }: TabProps) {
       )}
 
       <div className="panel">
-        <h2>模型与路由</h2>
+        <h2>
+          模型与路由
+          <button
+            type="button"
+            className="ghost"
+            style={{ marginLeft: "auto" }}
+            onClick={() => {
+              void models.reload();
+              void accounts.reload();
+            }}
+          >
+            刷新
+          </button>
+        </h2>
         <p className="hint">
           租户按对外名称调用模型。直连模型经一个上游账号调用上游模型；路由模型按选路策略在若干直连模型之间选择。每个模型可服务的分组来自它的上游账号：普通租户只能用到其分组内的账号。
         </p>
@@ -498,6 +509,8 @@ function ModelForm({
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<ApiError | string | null>(null);
   const [conflict, setConflict] = useState(false);
+  // The target rows in the order last sent: a refusal names a target by its index.
+  const [sentRows, setSentRows] = useState<number[]>([]);
 
   const title = isNew
     ? shape === "direct"
@@ -597,6 +610,7 @@ function ModelForm({
     setBusy(true);
     setErr(null);
     setConflict(false);
+    setSentRows(rows.map((r) => r.key));
     try {
       const body = changedDoc();
       const view = model ? await save(model.id, body, model.version) : await create(body);
@@ -609,13 +623,31 @@ function ModelForm({
     }
   }
 
+  // Each refusal detail goes to the field it names; the others stay in the list under the form.
+  const details = err instanceof ApiError ? err.details : [];
+  const at = (path: string) => problemAt(details, (p) => p === path);
+  const targetAt = (r: Row, field: string) => at(`/routing/targets/${sentRows.indexOf(r.key)}/${field}`);
+  const strategyShown = !(schema && "error" in schema);
+  const shown =
+    shape === "direct"
+      ? ["/display_name", "/provider_key_id", "/provider", "/model_name"]
+      : [
+          "/display_name",
+          ...(strategyShown ? ["/routing/strategy"] : []),
+          ...rows
+            .filter((r) => sentRows.includes(r.key))
+            .flatMap((r) =>
+              ["model_id", "weight", "priority"].map((f) => `/routing/targets/${sentRows.indexOf(r.key)}/${f}`),
+            ),
+        ];
+  const listed = details.filter((d) => !shown.includes(d.path));
+
   return (
     <form className="panel" aria-label={title} onSubmit={submit}>
       <h2>{title}</h2>
-      <label className="f">
-        <span>对外名称</span>
-        <input required disabled={locked} value={name} onChange={(e) => setName(e.target.value)} />
-      </label>
+      <Field label="对外名称" problem={at("/display_name")}>
+        {(aria) => <input required disabled={locked} value={name} onChange={(e) => setName(e.target.value)} {...aria} />}
+      </Field>
       {!isNew && !readOnly && (
         <p className="hint">
           {RENAME_HINT}
@@ -626,31 +658,40 @@ function ModelForm({
       {shape === "direct" ? (
         <>
           <div className="r">
-            <label className="f">
-              <span>上游账号</span>
-              <select required disabled={locked} value={accountId} onChange={(e) => chooseAccount(e.target.value)}>
-                <option value="">（选择上游账号）</option>
-                {accountOptions.map((o) => (
-                  <option key={o.id} value={o.id}>
-                    {o.label}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <label className="f">
-              <span>供应商标识</span>
-              <input required disabled={locked} value={provider} onChange={(e) => setProvider(e.target.value)} />
-            </label>
+            <Field label="上游账号" problem={at("/provider_key_id")}>
+              {(aria) => (
+                <select
+                  required
+                  disabled={locked}
+                  value={accountId}
+                  onChange={(e) => chooseAccount(e.target.value)}
+                  {...aria}
+                >
+                  <option value="">（选择上游账号）</option>
+                  {accountOptions.map((o) => (
+                    <option key={o.id} value={o.id}>
+                      {o.label}
+                    </option>
+                  ))}
+                </select>
+              )}
+            </Field>
+            <Field label="供应商标识" problem={at("/provider")}>
+              {(aria) => (
+                <input required disabled={locked} value={provider} onChange={(e) => setProvider(e.target.value)} {...aria} />
+              )}
+            </Field>
           </div>
           {account && (
             <p className="hint">
               该账号可服务的分组：{account.doc.groups?.length ? account.doc.groups.join("、") : "—（账号未设分组）"}
             </p>
           )}
-          <label className="f">
-            <span>上游模型</span>
-            <input required disabled={locked} value={upstream} onChange={(e) => setUpstream(e.target.value)} />
-          </label>
+          <Field label="上游模型" problem={at("/model_name")}>
+            {(aria) => (
+              <input required disabled={locked} value={upstream} onChange={(e) => setUpstream(e.target.value)} {...aria} />
+            )}
+          </Field>
         </>
       ) : (
         <>
@@ -662,63 +703,71 @@ function ModelForm({
               </div>
             </div>
           ) : (
-            <label className="f">
-              <span>选路策略</span>
-              <select
-                disabled={locked || strategies === null}
-                value={shownStrategy}
-                onChange={(e) => setStrategy(e.target.value)}
-              >
-                {strategyOptions.map((v) => (
-                  <option key={v} value={v}>
-                    {v}
-                  </option>
-                ))}
-              </select>
-            </label>
+            <Field label="选路策略" problem={at("/routing/strategy")}>
+              {(aria) => (
+                <select
+                  disabled={locked || strategies === null}
+                  value={shownStrategy}
+                  onChange={(e) => setStrategy(e.target.value)}
+                  {...aria}
+                >
+                  {strategyOptions.map((v) => (
+                    <option key={v} value={v}>
+                      {v}
+                    </option>
+                  ))}
+                </select>
+              )}
+            </Field>
           )}
           {rows.map((r, i) => {
             const target = catalog.models.get(r.modelId);
             return (
               <div key={r.key} className="target" role="group" aria-label={`目标 ${i + 1}`}>
                 <div className="r">
-                  <label className="f">
-                    <span>目标模型</span>
-                    <select
-                      required
-                      disabled={locked}
-                      value={r.modelId}
-                      onChange={(e) => setRow(r.key, { modelId: e.target.value })}
-                    >
-                      <option value="">（选择直连模型）</option>
-                      {targetOptions(r).map((o) => (
-                        <option key={o.id} value={o.id}>
-                          {o.label}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-                  <label className="f">
-                    <span>权重</span>
-                    <input
-                      type="number"
-                      min={0}
-                      step={1}
-                      disabled={locked}
-                      value={r.weight}
-                      onChange={(e) => setRow(r.key, { weight: e.target.value })}
-                    />
-                  </label>
-                  <label className="f">
-                    <span>优先级</span>
-                    <input
-                      type="number"
-                      step={1}
-                      disabled={locked}
-                      value={r.priority}
-                      onChange={(e) => setRow(r.key, { priority: e.target.value })}
-                    />
-                  </label>
+                  <Field label="目标模型" problem={targetAt(r, "model_id")}>
+                    {(aria) => (
+                      <select
+                        required
+                        disabled={locked}
+                        value={r.modelId}
+                        onChange={(e) => setRow(r.key, { modelId: e.target.value })}
+                        {...aria}
+                      >
+                        <option value="">（选择直连模型）</option>
+                        {targetOptions(r).map((o) => (
+                          <option key={o.id} value={o.id}>
+                            {o.label}
+                          </option>
+                        ))}
+                      </select>
+                    )}
+                  </Field>
+                  <Field label="权重" problem={targetAt(r, "weight")}>
+                    {(aria) => (
+                      <input
+                        type="number"
+                        min={0}
+                        step={1}
+                        disabled={locked}
+                        value={r.weight}
+                        onChange={(e) => setRow(r.key, { weight: e.target.value })}
+                        {...aria}
+                      />
+                    )}
+                  </Field>
+                  <Field label="优先级" problem={targetAt(r, "priority")}>
+                    {(aria) => (
+                      <input
+                        type="number"
+                        step={1}
+                        disabled={locked}
+                        value={r.priority}
+                        onChange={(e) => setRow(r.key, { priority: e.target.value })}
+                        {...aria}
+                      />
+                    )}
+                  </Field>
                 </div>
                 {r.modelId && <p className="sub">可服务分组：{groupsOf(target, catalog)}</p>}
                 {!readOnly && rows.length > 1 && (
@@ -765,9 +814,9 @@ function ModelForm({
       {err && (
         <div className="note crit" role="alert">
           {typeof err === "string" ? err : messageFor(err)}
-          {typeof err !== "string" && err.details.length > 0 && (
+          {listed.length > 0 && (
             <ul>
-              {err.details.map((d) => (
+              {listed.map((d) => (
                 <li key={d.path}>
                   <code>{d.path}</code>：{d.message}
                 </li>

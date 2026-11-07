@@ -1,9 +1,8 @@
 import { useCallback, useEffect, useState } from "react";
 import type { TabId, TabProps } from "../App";
 import { Msg, type Note } from "../components/Msg";
-import { ApiError, environment, rollout, type Environment, type RolloutSummary } from "../lib/api";
-import { messageFor } from "../lib/errors";
-import { fmtInt } from "../lib/fmt";
+import { environment, rollout, type Environment, type RolloutSummary } from "../lib/api";
+import { errorText, fmtInt } from "../lib/fmt";
 import { TwoStep } from "./Tenants";
 
 /** How often the summary is read again: about one gateway heartbeat. */
@@ -23,10 +22,6 @@ const TAB_OF_KIND: Record<string, { tab: TabId; label: string }> = {
   users: { tab: "tenants", label: "租户" },
 };
 const GENERIC = { tab: "resources", label: "全部资源" } as const;
-
-function errorText(e: unknown): string {
-  return e instanceof ApiError ? messageFor(e) : String(e);
-}
 
 /**
  * The environment at a glance: which environment and control plane this
@@ -209,7 +204,7 @@ export function Overview({ operator, onGoto }: TabProps) {
         <h2>被拒绝的资源</h2>
         <p className="hint">网关加载时拒绝了这些资源，它们没有生效。原因由网关给出。</p>
         {s === null ? (
-          <p className="hint">载入中…</p>
+          !error && <p className="hint">载入中…</p>
         ) : s.rejected.length === 0 ? (
           <p className="hint">没有被拒绝的资源。</p>
         ) : (
@@ -240,7 +235,7 @@ export function Overview({ operator, onGoto }: TabProps) {
         <h2>部分兼容</h2>
         <p className="hint">网关加载了这些资源，但忽略了其中的部分字段。</p>
         {s === null ? (
-          <p className="hint">载入中…</p>
+          !error && <p className="hint">载入中…</p>
         ) : s.partially_compatible.length === 0 ? (
           <p className="hint">所有网关都完整加载了配置。</p>
         ) : (

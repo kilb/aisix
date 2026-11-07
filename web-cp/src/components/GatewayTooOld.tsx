@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { ApiError, gateways, type Instance } from "../lib/api";
 import { messageFor } from "../lib/errors";
+import { errorText } from "../lib/fmt";
 import { blockingInstances, minimumIn } from "../lib/gatewayFloor";
 
 /**
@@ -16,7 +17,7 @@ export function GatewayTooOld({ error }: { error: ApiError }) {
     let live = true;
     gateways.instances().then(
       (list) => live && setInstances(list),
-      (e: unknown) => live && setReadError(e instanceof ApiError ? messageFor(e) : String(e)),
+      (e: unknown) => live && setReadError(errorText(e)),
     );
     return () => {
       live = false;

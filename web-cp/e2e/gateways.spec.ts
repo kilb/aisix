@@ -1,4 +1,4 @@
-import { expect, test, type Page } from "@playwright/test";
+import { expect, test, type Locator, type Page } from "@playwright/test";
 import { STACK_START_TIMEOUT_MS, startStack, type Json, type Stack } from "./stack";
 
 /**
@@ -200,4 +200,35 @@ test("非管理员看得到凭据，但没有签发与吊销", async ({ page }) 
   await expect(page.getByRole("listitem").filter({ hasText: "stack-gw" })).toBeVisible();
   await expect(page.getByRole("button", { name: "签发网关凭据" })).toHaveCount(0);
   await expect(page.getByRole("button", { name: "吊销" })).toHaveCount(0);
+});
+
+/** The text of the elements that describe `field` (its refusal, when there is one). */
+function description(field: Locator): Promise<string> {
+  return field.evaluate((el) =>
+    (el.getAttribute("aria-describedby") ?? "")
+      .split(/\s+/)
+      .filter(Boolean)
+      .map((id) => document.getElementById(id)?.textContent ?? "")
+      .join(" "),
+  );
+}
+
+test("有效期超出上限：被拒的原因标在有效期旁，没有签发", async ({ page }) => {
+  await loginAsAdmin(page);
+  await openTab(page, "网关");
+  await page.getByRole("button", { name: "签发网关凭据" }).click();
+  await page.getByLabel("名称").fill("gw-long-e2e");
+  const days = page.getByLabel("有效期（天）");
+  await days.fill("100000");
+  await page.getByRole("button", { name: "签发" }).click();
+
+  await expect(days).toHaveAttribute("aria-invalid", "true");
+  await expect(days).toHaveAccessibleDescription(/\S/);
+  // The reason is at the field, not repeated in the note under the form.
+  const note = page.locator("main form").getByRole("alert");
+  await expect(note).toBeVisible();
+  await expect(note).not.toContainText(await description(days));
+  await expect(page.getByLabel("名称")).not.toHaveAttribute("aria-invalid", "true");
+  const { items } = await stack.admin.get("/admin/gateways/credentials");
+  expect((items as Json[]).map((c) => c.name)).not.toContain("gw-long-e2e");
 });

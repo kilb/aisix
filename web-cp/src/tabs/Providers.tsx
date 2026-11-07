@@ -1,13 +1,14 @@
 import { useEffect, useRef, useState } from "react";
 import type { TabProps } from "../App";
 import { ConflictNote } from "../components/ConflictNote";
+import { Field } from "../components/Field";
 import { Msg, type Note } from "../components/Msg";
 import { RolloutBadge } from "../components/RolloutBadge";
 import { REDACTED, SecretInput } from "../components/SecretInput";
 import { TagInput } from "../components/TagInput";
 import { ApiError, settings, tenants, type AdminKey, type ResourceView, type Tenant } from "../lib/api";
-import { messageFor } from "../lib/errors";
-import { maskUrl } from "../lib/fmt";
+import { messageFor, problemAt } from "../lib/errors";
+import { errorText, maskUrl } from "../lib/fmt";
 import { describeAt, enumAt, loadSchema } from "../lib/schema";
 import { useResource } from "../lib/useResource";
 
@@ -37,9 +38,23 @@ const GROUPS_HINT = "分组名只有运维可见；普通租户只能用到其�
 /** How a referrer's kind is named on this page. */
 const KIND_LABEL: Record<string, string> = { models: "模型" };
 
-function errorText(e: unknown): string {
-  return e instanceof ApiError ? messageFor(e) : String(e);
-}
+/**
+ * The refusal details each field of the account form shows beside itself;
+ * the others stay in the list under the form. A credential's refusal names
+ * its slot, `api_key` or its former spelling `secret`.
+ */
+const ACCOUNT_FIELDS = {
+  name: ["/display_name"],
+  adapter: ["/adapter"],
+  provider: ["/provider"],
+  apiBase: ["/api_base"],
+  secret: ["api_key", "/api_key", "secret", "/secret"],
+  groups: ["/groups"],
+};
+
+/** Whether `path` is at `field` or inside it. */
+const within = (fields: string[]) => (path: string) =>
+  fields.some((f) => path === f || (f.startsWith("/") && path.startsWith(`${f}/`)));
 
 function nameOf(a: Account): string {
   return a.doc.display_name || a.id;
@@ -158,7 +173,12 @@ export function Providers({ canEdit }: TabProps) {
       )}
 
       <div className="panel">
-        <h2>上游账号</h2>
+        <h2>
+          上游账号
+          <button type="button" className="ghost" style={{ marginLeft: "auto" }} onClick={() => void pk.reload()}>
+            刷新
+          </button>
+        </h2>
         <p className="hint">网关调用上游供应商所用的账号。密钥保存后不再显示。{GROUPS_HINT}。</p>
         {canEdit && !open && (
           <button className="act" disabled={opening} onClick={() => void openNew()}>
@@ -394,6 +414,13 @@ function AccountForm({
 
   const title = isNew ? "新增上游账号" : readOnly ? `上游账号「${initial.name}」` : `编辑上游账号「${initial.name}」`;
   const locked = readOnly || busy || removal !== null;
+  const details = err instanceof ApiError ? err.details : [];
+  const at = (field: keyof typeof ACCOUNT_FIELDS) => problemAt(details, within(ACCOUNT_FIELDS[field]));
+  // Without its schema the adapter has no field to show a refusal at.
+  const shown = Object.entries(ACCOUNT_FIELDS).flatMap(([field, paths]) =>
+    field === "adapter" && schema && "error" in schema ? [] : paths,
+  );
+  const listed = details.filter((d) => !within(shown)(d.path));
 
   // The adapter's options: the schema's, plus what is stored when the
   // schema lacks it, plus "unset" for an existing account without one, so
@@ -477,10 +504,9 @@ function AccountForm({
     <form className="panel" aria-label={title} onSubmit={submit}>
       <h2>{title}</h2>
       <div className="r">
-        <label className="f">
-          <span>名称</span>
-          <input required disabled={locked} value={name} onChange={(e) => setName(e.target.value)} />
-        </label>
+        <Field label="名称" problem={at("name")}>
+          {(aria) => <input required disabled={locked} value={name} onChange={(e) => setName(e.target.value)} {...aria} />}
+        </Field>
         {schema && "error" in schema ? (
           <div className="f">
             <span>协议族</span>
@@ -489,50 +515,65 @@ function AccountForm({
             </div>
           </div>
         ) : (
-          <label className="f">
-            <span>协议族</span>
-            <select disabled={locked || adapters === null} value={adapter} onChange={(e) => setAdapter(e.target.value)}>
-              {adapterOptions.map((v) => (
-                <option key={v} value={v}>
-                  {v === "" ? "（未设置）" : v}
-                </option>
-              ))}
-            </select>
-          </label>
+          <Field label="协议族" problem={at("adapter")}>
+            {(aria) => (
+              <select
+                disabled={locked || adapters === null}
+                value={adapter}
+                onChange={(e) => setAdapter(e.target.value)}
+                {...aria}
+              >
+                {adapterOptions.map((v) => (
+                  <option key={v} value={v}>
+                    {v === "" ? "（未设置）" : v}
+                  </option>
+                ))}
+              </select>
+            )}
+          </Field>
         )}
       </div>
-      <label className="f">
-        <span>供应商标识</span>
-        <input disabled={locked} value={provider} onChange={(e) => setProvider(e.target.value)} />
-      </label>
+      <Field label="供应商标识" problem={at("provider")}>
+        {(aria) => <input disabled={locked} value={provider} onChange={(e) => setProvider(e.target.value)} {...aria} />}
+      </Field>
       {schema && "providerHint" in schema && schema.providerHint && <p className="hint">{schema.providerHint}</p>}
-      <label className="f">
-        <span>接口地址</span>
-        <input
-          disabled={locked}
-          placeholder="https://…"
-          value={apiBase}
-          onChange={(e) => setApiBase(e.target.value)}
-        />
-      </label>
+      <Field label="接口地址" problem={at("apiBase")}>
+        {(aria) => (
+          <input
+            disabled={locked}
+            placeholder="https://…"
+            value={apiBase}
+            onChange={(e) => setApiBase(e.target.value)}
+            {...aria}
+          />
+        )}
+      </Field>
       <SecretInput
         label="密钥"
         stored={stored}
         required
         readOnly={locked}
         hint={stored && !readOnly ? "不替换则保留已保存的密钥。改动协议族、供应商标识或接口地址时，需要重新填写密钥。" : undefined}
+        problem={at("secret")}
         onChange={setSecret}
       />
-      <TagInput label="分组" value={groups} onChange={setGroups} readOnly={locked} hint={GROUPS_HINT} />
+      <TagInput
+        label="分组"
+        value={groups}
+        onChange={setGroups}
+        readOnly={locked}
+        hint={GROUPS_HINT}
+        problem={at("groups")}
+      />
       {groupsNote && <div className="note warn">{groupsNote}</div>}
 
       {conflict && <ConflictNote onReload={onReload} />}
       {err && (
         <div className="note crit" role="alert">
           {typeof err === "string" ? err : messageFor(err)}
-          {typeof err !== "string" && err.details.length > 0 && (
+          {listed.length > 0 && (
             <ul>
-              {err.details.map((d) => (
+              {listed.map((d) => (
                 <li key={d.path}>
                   <code>{d.path}</code>：{d.message}
                 </li>

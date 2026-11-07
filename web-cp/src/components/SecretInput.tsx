@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useId, useState } from "react";
 
 /** What the control plane reads every stored credential back as. */
 export const REDACTED = "[REDACTED]";
@@ -14,6 +14,7 @@ export const REDACTED = "[REDACTED]";
  * - A replacement is required to be non-empty: an empty string is never
  *   sent in place of a stored secret.
  * - `readOnly` (a viewer) shows the state without any control.
+ * - `problem` is the control plane's refusal of the field, shown under it.
  */
 export function SecretInput({
   label,
@@ -21,6 +22,7 @@ export function SecretInput({
   required,
   readOnly = false,
   hint,
+  problem = null,
   onChange,
 }: {
   label: string;
@@ -28,10 +30,18 @@ export function SecretInput({
   required: boolean;
   readOnly?: boolean;
   hint?: string;
+  problem?: string | null;
   onChange: (value: string | undefined) => void;
 }) {
   const [mode, setMode] = useState<"keep" | "replace" | "clear">(stored ? "keep" : "replace");
   const [typed, setTyped] = useState("");
+  const problemId = useId();
+  const aria = problem ? { "aria-invalid": true as const, "aria-describedby": problemId } : {};
+  const why = problem && (
+    <p id={problemId} className="field-problem">
+      {problem}
+    </p>
+  );
 
   const keep = () => {
     setMode("keep");
@@ -41,7 +51,7 @@ export function SecretInput({
 
   if (mode === "keep" || mode === "clear") {
     return (
-      <div className="f" role="group" aria-label={label}>
+      <div className="f" role="group" aria-label={label} {...aria}>
         <span>{label}</span>
         <div className="secret">
           {mode === "keep" ? (
@@ -80,6 +90,7 @@ export function SecretInput({
           )}
         </div>
         {hint && <p className="hint">{hint}</p>}
+        {why}
       </div>
     );
   }
@@ -99,6 +110,7 @@ export function SecretInput({
             setTyped(e.target.value);
             onChange(e.target.value === "" && !stored && !required ? undefined : e.target.value);
           }}
+          {...aria}
         />
       </label>
       {stored && !readOnly && (
@@ -107,6 +119,7 @@ export function SecretInput({
         </button>
       )}
       {hint && <p className="hint">{hint}</p>}
+      {why}
     </div>
   );
 }
