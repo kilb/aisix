@@ -748,10 +748,12 @@ async fn a_removed_member_can_be_invited_again() {
 /// call: to see the tenant's state, keep their own account, and close what
 /// should not outlive the suspension (a leaked key, a member who left).
 /// Every other one answers `403 tenant_not_active`.
-const OPEN_WHILE_NOT_ACTIVE: [(&str, &str); 4] = [
+const OPEN_WHILE_NOT_ACTIVE: [(&str, &str); 6] = [
     ("GET", "/api/org"),
     ("POST", "/api/password"),
+    ("GET", "/api/keys"),
     ("DELETE", "/api/keys/{id}"),
+    ("GET", "/api/members"),
     ("DELETE", "/api/members/{id}"),
 ];
 
@@ -779,7 +781,7 @@ async fn every_other_route_is_closed(cp: &TestCp, cookie: &str) {
 }
 
 #[tokio::test]
-async fn a_pending_tenant_can_read_its_session_and_org_but_nothing_else() {
+async fn a_pending_tenant_reaches_only_the_routes_open_while_not_active() {
     let Some(cp) = TestCp::start().await else {
         return;
     };
@@ -823,6 +825,111 @@ async fn a_pending_tenant_can_read_its_session_and_org_but_nothing_else() {
         .get_with_cookie("/api/org", &cookie_of(&again).expect("a cookie"))
         .await;
     assert_eq!(org.body["status"], "suspended", "{org:?}");
+}
+
+/// The ids and versions a revoke or a removal needs come from the lists, so
+/// a suspended tenant's lists stay open, read-only and as each role sees
+/// them: the owner lists the keys and the members and revokes a key at the
+/// version listed; a member lists only their own keys and no members; a
+/// billing member lists no keys. Everything else that reads or writes stays
+/// closed.
+#[tokio::test]
+async fn a_suspended_tenants_owner_lists_its_keys_and_members_and_revokes_from_the_list() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let op = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let tenant = cp.seed_tenant(TenantStatus::Active).await;
+    let owner = cp.member_login_seeded(tenant, MemberRole::Owner).await;
+    let member = join(
+        &cp,
+        &owner,
+        &fresh_email("lister"),
+        "member",
+        "lister-password-7c1",
+    )
+    .await;
+    let member_cookie = cookie_of(&member).expect("a cookie");
+    let billing = join(
+        &cp,
+        &owner,
+        &fresh_email("payer"),
+        "billing",
+        "payer-password-7c1",
+    )
+    .await;
+    let billing_cookie = cookie_of(&billing).expect("a cookie");
+    let owners_key = mint(&cp, owner.cookie(), "owners-7c1").await;
+    let members_key = mint(&cp, &member_cookie, "members-7c1").await;
+    act_on_tenant(&cp, &op, &tenant.to_string(), "suspend").await;
+
+    let keys = cp.get_with_cookie("/api/keys", owner.cookie()).await;
+    assert_eq!(keys.status, 200, "{keys:?}");
+    let items = keys.body["items"].as_array().expect("items").clone();
+    let mut listed = ids(&items);
+    listed.sort();
+    let mut minted = vec![owners_key.clone(), members_key.clone()];
+    minted.sort();
+    assert_eq!(listed, minted);
+    let members = listed_members(&cp, owner.cookie()).await;
+    assert_eq!(members.len(), 3, "{members:?}");
+
+    // A member sees their own key and no member list; billing, no keys.
+    let theirs = cp.get_with_cookie("/api/keys", &member_cookie).await;
+    assert_eq!(theirs.status, 200, "{theirs:?}");
+    assert_eq!(
+        ids(theirs.body["items"].as_array().expect("items")),
+        [members_key.clone()]
+    );
+    for (cookie, path) in [
+        (&member_cookie, "/api/members"),
+        (&billing_cookie, "/api/keys"),
+    ] {
+        let r = cp.get_with_cookie(path, cookie).await;
+        assert_eq!(r.status, 403, "{path}: {r:?}");
+        assert_eq!(r.body["code"], "forbidden", "{path}: {r:?}");
+    }
+
+    // The owner revokes the member's key at the version the list showed.
+    let listed_key = items
+        .iter()
+        .find(|k| k["id"] == members_key.as_str())
+        .expect("the member's key is listed");
+    let version = listed_key["version"].as_i64().expect("a version");
+    let status = send_if_match(
+        &cp,
+        owner.cookie(),
+        "DELETE",
+        &format!("/api/keys/{members_key}"),
+        version,
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, 204);
+    let keys = cp.get_with_cookie("/api/keys", owner.cookie()).await;
+    assert_eq!(
+        ids(keys.body["items"].as_array().expect("items")),
+        [owners_key.clone()]
+    );
+
+    // Nothing else opens: a single key, a mint, an invitation.
+    for (method, path, body) in [
+        ("GET", format!("/api/keys/{owners_key}"), None),
+        (
+            "POST",
+            "/api/keys".to_string(),
+            Some(json!({"label": "late-7c1"})),
+        ),
+        (
+            "POST",
+            "/api/members/invites".to_string(),
+            Some(json!({"email": fresh_email("late"), "role": "member"})),
+        ),
+    ] {
+        let r = cp.send(method, &path, Some(owner.cookie()), body).await;
+        assert_eq!(r.status, 403, "{method} {path}: {r:?}");
+        assert_eq!(r.body["code"], "tenant_not_active", "{method} {path}");
+    }
 }
 
 /// A suspended or pending tenant can still close what must not outlive the

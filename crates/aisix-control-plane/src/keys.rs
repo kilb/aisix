@@ -1319,14 +1319,16 @@ impl From<AdminUpdateKey> for Changes {
 }
 
 /// `GET /api/keys` → `{items: [TenantKey]}`: every live key of the tenant
-/// for an owner or an admin, a member's own for a member.
+/// for an owner or an admin, a member's own for a member. Open while the
+/// tenant is pending or suspended too, so that a key can be found, with its
+/// version, to be revoked (`DELETE /api/keys/{id}`).
 pub async fn list(
     auth: MemberAuth,
     State(state): State<AppState>,
 ) -> Result<Json<Value>, ApiError> {
-    auth.require_active()?;
     auth.require(KEY_HOLDERS)?;
     let mut conn = state.db.pool().acquire().await.map_err(DbError::from)?;
+    let auth = members::current_in_any_state(&mut conn, &auth, KEY_HOLDERS).await?;
     let keys = select(&mut conn, None, Some(auth.tenant_id), own_only(&auth)).await?;
     let items = tenant_views(&mut conn, keys).await?;
     Ok(Json(json!({ "items": items })))

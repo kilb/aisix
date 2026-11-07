@@ -1315,14 +1315,17 @@ pub async fn models(
     Ok(Json(json!({ "items": items })))
 }
 
-/// `GET /api/members` → `{items: [Member]}`.
+/// `GET /api/members` → `{items: [Member]}`. Open while the tenant is
+/// pending or suspended too, so that a member can be found to be removed
+/// (`DELETE /api/members/{id}`).
 pub async fn list(
     auth: MemberAuth,
     State(state): State<AppState>,
 ) -> Result<Json<Value>, ApiError> {
-    auth.require_active()?;
     auth.require(&[MemberRole::Owner, MemberRole::Admin])?;
     let mut conn = state.db.pool().acquire().await.map_err(DbError::from)?;
+    let auth =
+        current_in_any_state(&mut conn, &auth, &[MemberRole::Owner, MemberRole::Admin]).await?;
     Ok(Json(members_of(&mut conn, auth.tenant_id).await?))
 }
 
