@@ -1853,6 +1853,41 @@ pub(crate) fn check_member_ip_access(
     }
 }
 
+/// Refuse a key restricted to provider groups the model it addressed, when
+/// nothing of the model is in those groups, for an answer that will not
+/// reach [`resolve_attempt_models`]: a cache hit dispatches nothing, and the
+/// key's groups have to hold for it all the same, as they do on
+/// `/v1/chat/completions`, whose cache is read after its attempts are
+/// resolved. The provider-group half of that walk, answered with the same
+/// [`no_target_in_groups`]; `Ok` for a semantic parent, which the endpoints
+/// that read their cache first refuse on their own.
+///
+/// Keys on the dispatched targets, as [`target_in_groups`] does: a direct
+/// model and a wildcard alias by their row's provider key, a routing model
+/// by whether any of its targets is in the groups. An ensemble has no
+/// provider key, so a grouped key is refused here too; the endpoints refuse
+/// it earlier, as a model that does not exist
+/// ([`crate::model_resolve::refuse_ensemble_to_grouped_key`]).
+pub(crate) fn check_group_access(
+    snapshot: &AisixSnapshot,
+    virtual_name: &str,
+    model: &Model,
+    allowed: &[String],
+) -> Result<(), ProxyError> {
+    if allowed.is_empty() || model.is_semantic() {
+        return Ok(());
+    }
+    let admitted = match model.routing.as_ref() {
+        Some(routing) => !targets_in_groups(snapshot, &routing.targets, allowed).is_empty(),
+        None => target_in_groups(snapshot, model, allowed),
+    };
+    if admitted {
+        Ok(())
+    } else {
+        Err(no_target_in_groups(virtual_name))
+    }
+}
+
 /// Drop the targets whose provider key has an exhausted `provider_key`
 /// budget (or, in strict mode, any budget it can no longer verify). With
 /// every target dropped, the request is refused with the budget's own
@@ -3640,6 +3675,37 @@ mod tests {
         ] {
             assert!(!text.contains(secret), "{secret} leaked: {text}");
         }
+    }
+
+    /// The check an answer that skips dispatch passes: a model with nothing
+    /// in the key's groups is refused as dispatch refuses it, one with
+    /// something in them is not, and a key without groups never is.
+    #[test]
+    fn a_cached_answer_needs_something_of_the_model_in_the_keys_groups() {
+        let snap = groups_snapshot();
+        let model = |name: &str| snap.models.get_by_name(name).unwrap().value.clone();
+        let alpha = groups(&["grp-alpha"]);
+        assert!(check_group_access(&snap, "model-a", &model("model-a"), &alpha).is_ok());
+        for outside in ["model-b", "model-none"] {
+            let err = check_group_access(&snap, outside, &model(outside), &alpha).unwrap_err();
+            assert!(
+                matches!(err, ProxyError::AllCandidatesUnavailable { .. }),
+                "{err:?}"
+            );
+            assert_names_no_group_or_member(&err);
+            assert!(check_group_access(&snap, outside, &model(outside), &[]).is_ok());
+        }
+        let mixed = group_model(r(RoutingStrategy::Failover, every_grouped_target(), None));
+        assert!(check_group_access(&snap, "group", &mixed, &alpha).is_ok());
+        let outside = group_model(r(
+            RoutingStrategy::Failover,
+            vec![
+                RoutingTarget::new("model-b"),
+                RoutingTarget::new("model-none"),
+            ],
+            None,
+        ));
+        assert!(check_group_access(&snap, "group", &outside, &alpha).is_err());
     }
 
     #[test]

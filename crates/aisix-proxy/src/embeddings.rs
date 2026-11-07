@@ -714,6 +714,12 @@ async fn dispatch(
         },
     );
     if let Some(gate) = gate.as_ref() {
+        crate::routing::check_group_access(
+            snapshot,
+            &body.model,
+            &model_entry.value,
+            &auth.key().allowed_provider_groups,
+        )?;
         crate::routing::check_member_ip_access(
             snapshot,
             &body.model,

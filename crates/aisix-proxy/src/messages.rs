@@ -858,6 +858,12 @@ async fn dispatch(
         )
     };
     if let Some(gate) = cache_gate.as_ref() {
+        crate::routing::check_group_access(
+            snapshot,
+            &model_name,
+            &model_entry.value,
+            &auth.key().allowed_provider_groups,
+        )?;
         crate::routing::check_member_ip_access(
             snapshot,
             &model_name,
