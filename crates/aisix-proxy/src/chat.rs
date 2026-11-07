@@ -6682,8 +6682,8 @@ fn build_sse_stream<F>(
     // `on_complete` (`comp`) counts stay stream-only. Zero for single-upstream
     // callers, where the fold is a no-op.
     base_usage: aisix_gateway::chat::UsageStats,
-    // Platform mode: every frame carries one minted id and mapped tool-call
-    // ids (see `render::render_chunk`).
+    // Platform mode: usage keeps to OpenAI's counters and an empty opening
+    // chunk is dropped; ids are the upstream's (see `render::render_chunk`).
     platform: Option<crate::platform::PlatformSettings>,
     // Token-estimation fallback context (#1074); see
     // `CompleteOnDrop::estimator`.

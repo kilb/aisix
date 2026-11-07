@@ -889,8 +889,10 @@ describe("platform mode e2e: ids a tenant is handed, and tool use still round-tr
     const completed = events.find((e) => e.type === "response.completed");
     expect(responsesFunctionCall(completed?.response?.output ?? []).call_id).toBe(call.call_id);
     // A relayed stream frame goes out as the upstream wrote it, apart from
-    // its ids and model (a known limit: trimming it costs a pass per frame).
+    // its ids and model (a known limit: trimming it costs a pass per frame),
+    // a cloud platform's invocation metrics included.
     expect(completed?.response?.usage).toEqual(RESPONSES_USAGE);
+    expect(completed?.["amazon-bedrock-invocationMetrics"]).toEqual(CHANNEL_METRICS);
   });
 
   test("/v1/responses from an Anthropic upstream: call ids leave sealed and the upstream gets its own back", async (ctx) => {
