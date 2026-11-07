@@ -4935,7 +4935,7 @@ where
             buf.extend_from_slice(&bytes);
             let mut forward: Vec<u8> = Vec::new();
             let state = guard.state();
-            let terminal_seen = drain_responses_sse_frames(
+            let mut terminal_seen = drain_responses_sse_frames(
                 &mut buf,
                 &mut scanned,
                 &mut state.usage,
@@ -4951,6 +4951,31 @@ where
                 // Parsed through the exact semantic-terminal boundary. Later
                 // frames coalesced into this transport item are discarded.
                 buf.clear();
+            } else if buf.len() > aisix_gateway::sse::MAX_SSE_FRAME_BYTES && mark.sealer().is_some() {
+                // Platform mode releases no byte it could not rewrite: this
+                // frame would carry the upstream's own ids and model. The
+                // stream ends as on a frame that could not be read, on its
+                // class.
+                tracing::warn!(
+                    buffered = buf.len(),
+                    "responses stream: SSE frame buffer exceeded cap without a \
+                     terminator; ending the stream (platform mode releases no \
+                     unrewritten frame)"
+                );
+                let decode = crate::stream_timeout::RawStreamFailure::UpstreamDecode;
+                crate::attempt::StreamFailure::record(
+                    &mut state.usage.get_or_insert_with(Default::default).failure,
+                    &decode.bridge_error(),
+                );
+                state.failure = Some(decode);
+                forward.extend_from_slice(
+                    &crate::platform_errors::relayed_responses_failure(b"").unwrap_or_default(),
+                );
+                buf.clear();
+                if scan_owed {
+                    state.capture_safe = false;
+                }
+                terminal_seen = true;
             } else if buf.len() > aisix_gateway::sse::MAX_SSE_FRAME_BYTES {
                 // Bound the frame buffer: the happy path drains complete frames
                 // above so `buf` only holds a partial trailing frame. A
@@ -11147,6 +11172,85 @@ data: [DONE]\n\n";
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// An upstream that serves `body` in 64 KiB chunks, as a network
+    /// delivers a large stream, at its own address.
+    async fn chunked_upstream(route: &'static str, body: String) -> String {
+        let bytes = bytes::Bytes::from(body);
+        let app = axum::Router::new().route(
+            route,
+            axum::routing::post(move || {
+                let bytes = bytes.clone();
+                async move {
+                    let chunks: Vec<Result<bytes::Bytes, std::io::Error>> = bytes
+                        .chunks(64 * 1024)
+                        .map(|c| Ok(bytes::Bytes::copy_from_slice(c)))
+                        .collect();
+                    axum::response::Response::builder()
+                        .header("content-type", "text/event-stream")
+                        .body(axum::body::Body::from_stream(futures::stream::iter(chunks)))
+                        .unwrap()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    /// A stream frame larger than the frame cap is still arriving when the
+    /// cap is reached, so it cannot be rewritten. Off platform mode it is
+    /// released as it came. In platform mode it would carry the upstream's
+    /// response id, item ids and model, so the stream ends on the class of
+    /// a frame that could not be read instead, and none of it is sent.
+    #[tokio::test]
+    async fn platform_mode_ends_on_an_oversized_frame_instead_of_releasing_it() {
+        let big = "A".repeat(aisix_gateway::sse::MAX_SSE_FRAME_BYTES + 2 * 1024 * 1024);
+        let sse = format!(
+            "event: response.created\ndata: {}\n\nevent: response.completed\ndata: {}\n\n",
+            serde_json::json!({"type": "response.created", "response": {"id": "resp_bdrk_big",
+                "status": "in_progress", "model": "upstream-real-model-x", "output": []}}),
+            serde_json::json!({"type": "response.completed", "response": {
+                "id": "resp_bdrk_big", "status": "completed", "model": "upstream-real-model-x",
+                "output": [{"type": "image_generation_call", "id": "ig_bdrk_1",
+                            "status": "completed", "result": big}]}}),
+        );
+        let up = chunked_upstream("/v1/responses", sse).await;
+        for platform in [false, true] {
+            let snap = two_tenants(&up);
+            let app = if platform {
+                build_platform_app(snap)
+            } else {
+                build_app(snap)
+            };
+            let resp = app
+                .oneshot(make_req(
+                    serde_json::json!({"model": "gpt-4o-resp", "input": "draw", "stream": true}),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = to_bytes(resp.into_body(), 64 * 1024 * 1024).await.unwrap();
+            let text = String::from_utf8_lossy(&body);
+            if !platform {
+                assert!(
+                    text.contains("ig_bdrk_1"),
+                    "off platform mode it is relayed"
+                );
+                continue;
+            }
+            for raw in ["resp_bdrk_big", "ig_bdrk_1", "upstream-real-model-x"] {
+                assert!(!text.contains(raw), "{raw} leaked");
+            }
+            assert!(text.len() < 1024 * 1024, "the frame was not sent");
+            let last = text.trim_end().rsplit("\n\n").next().unwrap();
+            let (event, _) = crate::redact::parse_sse_json_event(last.as_bytes());
+            let event = event.expect("the stream ends on an event");
+            assert_eq!(event["type"], "error", "{last}");
+            assert_eq!(event["code"], "upstream_unavailable", "{last}");
+        }
     }
 
     /// A relayed event stream goes out under the upstream's own content

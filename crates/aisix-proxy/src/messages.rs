@@ -5527,7 +5527,7 @@ where
             // trailing remainder until its terminator arrives.
             buf.extend_from_slice(&bytes);
             let mut forward: Vec<u8> = Vec::new();
-            let terminal_seen = drain_anthropic_sse_frames(
+            let mut terminal_seen = drain_anthropic_sse_frames(
                 &mut buf,
                 &mut scanned,
                 guard.usage(),
@@ -5584,15 +5584,34 @@ where
                     yield Ok(Bytes::from(guardrail_block_frame(None, Some(crate::error::TAG_UNSCANNABLE_BODY))));
                     return;
                 }
-                tracing::warn!(
-                    buffered = buf.len(),
-                    "anthropic stream: SSE frame buffer exceeded cap without a \
-                     terminator; releasing it unparsed (usage parsing and model \
-                     restamp skipped for the oversized frame)"
-                );
-                guard.usage().released_unparsed_frame = true;
-                forward.append(&mut buf);
-                scanned = 0;
+                if platform_ids.is_some() {
+                    // Platform mode releases no byte it could not rewrite:
+                    // this frame would carry the upstream's own ids. The
+                    // stream fails as on a frame that could not be read.
+                    tracing::warn!(
+                        buffered = buf.len(),
+                        "anthropic stream: SSE frame buffer exceeded cap without a \
+                         terminator; ending the stream (platform mode releases no \
+                         unrewritten frame)"
+                    );
+                    let usage = guard.usage();
+                    usage.malformed_sse_data = true;
+                    usage.note_stream_failure(
+                        crate::stream_timeout::RawStreamFailure::UpstreamDecode,
+                    );
+                    buf.clear();
+                    terminal_seen = true;
+                } else {
+                    tracing::warn!(
+                        buffered = buf.len(),
+                        "anthropic stream: SSE frame buffer exceeded cap without a \
+                         terminator; releasing it unparsed (usage parsing and model \
+                         restamp skipped for the oversized frame)"
+                    );
+                    guard.usage().released_unparsed_frame = true;
+                    forward.append(&mut buf);
+                    scanned = 0;
+                }
             }
             if let Some((max_hold, fail_open)) = hold {
                 // Hold-back: withhold the bytes until the end-of-stream
@@ -10833,6 +10852,84 @@ data: [DONE]\n\n";
             Some("gpt-4o"),
             "an abandoned stream must still name the target it was dispatched to",
         );
+    }
+
+    /// A stream frame larger than the frame cap is still arriving when the
+    /// cap is reached, so it cannot be rewritten. Off platform mode it is
+    /// released as it came. In platform mode it would carry the upstream's
+    /// own tool-use ids, so the stream ends on an error frame instead, and
+    /// none of it is sent.
+    #[tokio::test]
+    async fn platform_mode_ends_on_an_oversized_frame_instead_of_releasing_it() {
+        let big = "A".repeat(aisix_gateway::sse::MAX_SSE_FRAME_BYTES + 2 * 1024 * 1024);
+        let sse = format!(
+            "event: message_start\ndata: {}\n\nevent: content_block_start\ndata: {}\n\n",
+            serde_json::json!({"type": "message_start", "message": {"id": "msg_bdrk_1",
+                "type": "message", "role": "assistant", "model": "claude-3-haiku-20240307",
+                "content": [], "usage": {"input_tokens": 3, "output_tokens": 1}}}),
+            // Written in the order the API writes it: the id ahead of the
+            // content.
+            format!(
+                r#"{{"type":"content_block_start","index":0,"content_block":{{"type":"web_fetch_tool_result","tool_use_id":"srvtoolu_bdrk_1","content":{{"type":"web_fetch_result","url":"https://x","content":"{big}"}}}}}}"#
+            ),
+        );
+        let bytes = bytes::Bytes::from(sse);
+        let up = axum::Router::new().route(
+            "/v1/messages",
+            axum::routing::post(move || {
+                let bytes = bytes.clone();
+                async move {
+                    let chunks: Vec<Result<bytes::Bytes, std::io::Error>> = bytes
+                        .chunks(64 * 1024)
+                        .map(|c| Ok(bytes::Bytes::copy_from_slice(c)))
+                        .collect();
+                    axum::response::Response::builder()
+                        .header("content-type", "text/event-stream")
+                        .body(axum::body::Body::from_stream(futures::stream::iter(chunks)))
+                        .unwrap()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, up).await.unwrap() });
+        for platform in [false, true] {
+            let snap = new_snap_anthropic(&format!("http://{addr}"));
+            snap.models.insert(anthropic_model("claude-haiku"));
+            snap.apikeys.insert(apikey_entry(&["*"]));
+            let hub = Arc::new(Hub::new());
+            hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
+            let mut state =
+                crate::ProxyState::new(SnapshotHandle::new(snap), hub, &cfg()).without_cache();
+            if platform {
+                state = state.with_platform(crate::platform::PlatformSettings::from_secret("s"));
+            }
+            let resp = crate::build_router(state)
+                .oneshot(make_req(serde_json::json!({
+                    "model": "claude-haiku",
+                    "messages": [{"role": "user", "content": "fetch"}],
+                    "max_tokens": 100,
+                    "stream": true,
+                })))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = to_bytes(resp.into_body(), 64 * 1024 * 1024).await.unwrap();
+            let text = String::from_utf8_lossy(&body);
+            if !platform {
+                assert!(
+                    text.contains("srvtoolu_bdrk_1"),
+                    "off platform mode it is relayed"
+                );
+                continue;
+            }
+            for raw in ["srvtoolu_bdrk_1", "msg_bdrk_1"] {
+                assert!(!text.contains(raw), "{raw} leaked");
+            }
+            assert!(text.len() < 1024 * 1024, "the frame was not sent");
+            let last = text.trim_end().rsplit("\n\n").next().unwrap();
+            assert!(last.starts_with("event: error\n"), "{last}");
+        }
     }
 
     /// A relayed event stream goes out under the upstream's own content
