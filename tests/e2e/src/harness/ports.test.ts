@@ -1,7 +1,7 @@
 import { createServer, type Server } from "node:net";
 import { describe, expect, test } from "vitest";
 import { isAddrInUseStartupFailure } from "./app.js";
-import { pickFreePort, pickFreePorts } from "./ports.js";
+import { pickFreePort, pickFreePorts, rangeSlotFor } from "./ports.js";
 
 function listen(port: number): Promise<Server> {
   return new Promise((resolve, reject) => {
@@ -72,4 +72,13 @@ describe("isAddrInUseStartupFailure", () => {
       ),
     ).toBe(false);
   });
+});
+
+test("an e2e port slot offsets the fork's port range", () => {
+  expect(rangeSlotFor(1, undefined, 99)).toBe(1);
+  expect(rangeSlotFor(1, "", 99)).toBe(1);
+  expect(rangeSlotFor(1, "3", 99)).toBe(4);
+  expect(rangeSlotFor(13, "2", 99)).toBe(1);
+  expect(rangeSlotFor(undefined, "2", 29)).toBe(3); // 29 % 14 = 1, + 2
+  for (const bad of ["x", "-1", "14", "1.5"]) expect(() => rangeSlotFor(1, bad, 99)).toThrow("E2E_PORT_SLOT");
 });

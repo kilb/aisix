@@ -127,6 +127,11 @@ pub struct HeartbeatBody {
     /// Omitted when empty.
     #[serde(default, deserialize_with = "null_as_default")]
     partially_compatible_resources: Vec<Value>,
+    /// The usage events the gateway process dropped since it started, by
+    /// reason (`{"sink_full": 7}`); omitted when it dropped none. Stored as
+    /// [`drop_counts`] reads it.
+    #[serde(default)]
+    usage_event_drops: Value,
 }
 
 impl HeartbeatBody {
@@ -149,7 +154,20 @@ impl HeartbeatBody {
             exporter_health: list(self.exporter_health),
             rejected_resources: list(self.rejected_resources),
             partially_compatible_resources: list(self.partially_compatible_resources),
+            usage_event_drops: without_nul(self.usage_event_drops),
         }
+    }
+}
+
+/// The drop counts a beat's `usage_event_drops` stores: the object as sent
+/// when every count in it is a non-negative integer, and `{}` for anything
+/// else, absent and `null` included. A malformed report is not kept in part,
+/// and does not fail the beat: the instance would drop out of the fleet view
+/// for a field only the usage-loss view reads.
+fn drop_counts(reported: &Value) -> Value {
+    match reported {
+        Value::Object(counts) if counts.values().all(Value::is_u64) => reported.clone(),
+        _ => json!({}),
     }
 }
 
@@ -188,9 +206,9 @@ where
 
 /// `POST /dp/heartbeat` → `200 {}`. The instance's row takes everything
 /// this beat reports, so a list the gateway now omits (it omits empty ones)
-/// is empty, and a rejection it no longer reports is gone. A body naming
-/// another credential's `dp_id` is `403`; a credential over its caps (see
-/// the module docs) is `429`.
+/// is empty, a rejection it no longer reports is gone, and drop counts it
+/// no longer reports are `{}`. A body naming another credential's `dp_id`
+/// is `403`; a credential over its caps (see the module docs) is `429`.
 pub async fn heartbeat(
     dp: DpIdentity,
     State(state): State<AppState>,
@@ -333,8 +351,8 @@ async fn record(conn: &mut PgConnection, dp_id: Uuid, body: &HeartbeatBody) -> R
     sqlx::query(
         "INSERT INTO dp_instances (dp_id, instance_id, hostname, version, uptime_seconds, \
          applied_revision, config_hash, supported_guardrail_kinds, exporter_health, \
-         rejected_resources, partially_compatible_resources) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
+         rejected_resources, partially_compatible_resources, usage_event_drops) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
          ON CONFLICT (dp_id, instance_id) DO UPDATE SET hostname = EXCLUDED.hostname, \
          version = EXCLUDED.version, uptime_seconds = EXCLUDED.uptime_seconds, \
          applied_revision = EXCLUDED.applied_revision, config_hash = EXCLUDED.config_hash, \
@@ -342,7 +360,7 @@ async fn record(conn: &mut PgConnection, dp_id: Uuid, body: &HeartbeatBody) -> R
          exporter_health = EXCLUDED.exporter_health, \
          rejected_resources = EXCLUDED.rejected_resources, \
          partially_compatible_resources = EXCLUDED.partially_compatible_resources, \
-         last_seen_at = now()",
+         usage_event_drops = EXCLUDED.usage_event_drops, last_seen_at = now()",
     )
     .bind(dp_id)
     .bind(&body.instance_id)
@@ -355,6 +373,7 @@ async fn record(conn: &mut PgConnection, dp_id: Uuid, body: &HeartbeatBody) -> R
     .bind(sqlx::types::Json(&body.exporter_health))
     .bind(sqlx::types::Json(&body.rejected_resources))
     .bind(sqlx::types::Json(&body.partially_compatible_resources))
+    .bind(sqlx::types::Json(drop_counts(&body.usage_event_drops)))
     .execute(conn)
     .await?;
     Ok(())
