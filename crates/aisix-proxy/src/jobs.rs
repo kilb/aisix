@@ -2926,10 +2926,9 @@ fn attribute_listed_batches(
         if require_safe_upstream_id(raw_id).is_err() || batch_submitter(&snap, batch).is_none() {
             continue;
         }
-        // 列表回头会看到同一批：记不进计数器的就不必再下载一遍结果文件。
-        if batch_ended_at(batch).is_some_and(|t| batch_credit_is_ruled_out(state, t)) {
-            continue;
-        }
+        // A batch that ended before this process started still gets its row:
+        // only its credit to the spend counter is ruled out, and
+        // `attribute_batch_usage` gates that alone.
         maybe_attribute_batch(state, auth, client, target, raw_id, batch);
     }
 }
@@ -4693,6 +4692,65 @@ mod tests {
             spend_series(&state).await,
             vec![("k-1".to_string(), 1_000_000)],
             "只有带标记的那一批入账，而且记在提交者头上"
+        );
+    }
+
+    /// A listed batch that ended before this process started is not credited
+    /// to the spend counter again (the in-process store cannot tell whether a
+    /// previous process did), but its usage row is still emitted: the control
+    /// plane drops a copy by the row's fixed id, and a caller that only lists
+    /// batches never reaches the by-id path that would emit it.
+    #[tokio::test]
+    async fn a_listed_batch_that_ended_before_this_process_still_emits_its_row() {
+        let upstream = MockServer::builder().start().await;
+        mount_ended_batch(
+            &upstream,
+            serde_json::json!({"id": "batch_unused", "status": "completed"}),
+        )
+        .await;
+        Mock::given(wm_method("GET"))
+            .and(path("/v1/batches"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "object": "list",
+                "data": [{
+                    "id": "batch_old",
+                    "status": "completed",
+                    "completed_at": 1_000_000_000,
+                    "output_file_id": "file-out",
+                    "metadata": {BATCH_SUBMITTER_KEY: "k-1", BATCH_MODEL_KEY: "jobs-a"}
+                }]
+            })))
+            .mount(&upstream)
+            .await;
+        let (app, mut rx, state) = build_app_with_sink_and_state(ended_batch_snapshot(&upstream));
+        assert!(!state.limiter.claims_outlive_process());
+
+        let resp = app
+            .oneshot(get_as("/v1/batches?model=jobs-a".to_string(), "sk-other"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let mut batch_row = None;
+        for _ in 0..40 {
+            match tokio::time::timeout(Duration::from_millis(100), rx.recv()).await {
+                Ok(Some(ev)) if ev.inbound_protocol == "batch" => {
+                    batch_row = Some(ev);
+                    break;
+                }
+                Ok(Some(_)) => continue,
+                _ => {}
+            }
+        }
+        let row = batch_row.expect("the listed batch's usage row was never emitted");
+        assert!(row.is_batch);
+        assert_eq!(
+            row.event_id,
+            batch_attribution_request_id("batch_old", 0, false)
+        );
+        assert!(
+            spend_series(&state).await.is_empty(),
+            "a batch a previous process may have credited is credited again"
         );
     }
 
