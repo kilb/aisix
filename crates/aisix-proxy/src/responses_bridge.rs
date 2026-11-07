@@ -2998,14 +2998,28 @@ pub fn build_responses_bridge_stream(
                 )
             });
             guard.comp().terminal_failure = Some(aisix_gateway::BridgeError::StreamAborted);
-            yield Ok(failure_frames(
-                &mut encoder,
-                sent_downstream,
-                false,
-                EMPTY_STREAM_CODE,
-                EMPTY_STREAM_CODE,
-                EMPTY_STREAM_MESSAGE,
-            ));
+            // Platform mode: the class every other stream failure carries.
+            let frames = match crate::platform_errors::stream_class(
+                &aisix_gateway::BridgeError::StreamAborted,
+            ) {
+                Some(class) => failure_frames(
+                    &mut encoder,
+                    sent_downstream,
+                    false,
+                    class.code(),
+                    class.code(),
+                    crate::platform_errors::platform_message(&class),
+                ),
+                None => failure_frames(
+                    &mut encoder,
+                    sent_downstream,
+                    false,
+                    EMPTY_STREAM_CODE,
+                    EMPTY_STREAM_CODE,
+                    EMPTY_STREAM_MESSAGE,
+                ),
+            };
+            yield Ok(frames);
             return;
         }
         // Token-estimation fallback (AISIX-Cloud#1074), run HERE rather than
@@ -3422,7 +3436,7 @@ pub(crate) fn guardrail_failure_frames(
         terminal_sent,
         "content_filter",
         "invalid_prompt",
-        &crate::error::guardrail_block_message("response", guardrail_name, unavailable),
+        &crate::error::caller_guardrail_block_message("response", guardrail_name, unavailable),
     )
 }
 
@@ -6334,6 +6348,29 @@ mod tests {
         let (events, _) = relay(Vec::new()).await;
         assert_eq!(event_names(&events), FAILED_BEFORE_ANY_OUTPUT);
         assert_opened_then_failed(&events);
+    }
+
+    /// In platform mode an empty upstream stream ends on the class every
+    /// other stream failure carries, not on the bridge's own wording.
+    #[tokio::test]
+    async fn in_platform_mode_an_empty_upstream_stream_fails_on_its_class() {
+        let cell = std::sync::Arc::new(
+            crate::attribution::RequestAttribution::default().in_platform_mode(true),
+        );
+        let (events, _) = crate::attribution::scope(cell, relay(Vec::new())).await;
+        assert_eq!(event_names(&events), FAILED_BEFORE_ANY_OUTPUT);
+        assert_eq!(events[2].1["code"], "upstream_unavailable");
+        assert_eq!(
+            events[2].1["message"],
+            "The model is temporarily unavailable. Retry later."
+        );
+        assert_eq!(
+            events[3].1["response"]["error"]["code"],
+            "upstream_unavailable"
+        );
+        assert!(!events
+            .iter()
+            .any(|(_, data)| data.to_string().contains("empty stream")));
     }
 
     const FAILED_BEFORE_ANY_OUTPUT: [&str; 4] = [

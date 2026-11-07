@@ -84,6 +84,10 @@ function expectNoUpstreamIdentity(text: string): void {
     UPSTREAM_CHAT_ID,
     "system_fingerprint",
     "amazon-bedrock-invocationMetrics",
+    // The native Responses upstream's own response id.
+    "resp_up01",
+    // A frame only one channel sends.
+    "event: ping",
   ]) {
     expect(text, `response carries ${marker}`).not.toContain(marker);
   }
@@ -196,7 +200,7 @@ function anthropicAnswer(): Record<string, unknown> {
     ],
     stop_reason: "tool_use",
     stop_sequence: null,
-    usage: { input_tokens: 9, output_tokens: 4, cache_creation_input_tokens: 2 },
+    usage: { input_tokens: 9, output_tokens: 4, cache_creation_input_tokens: 2, channel_queue_ms: 12 },
     "amazon-bedrock-invocationMetrics": CHANNEL_METRICS,
   };
 }
@@ -217,6 +221,7 @@ function anthropicStream(): string[] {
         usage: { input_tokens: 9, output_tokens: 1, cache_creation_input_tokens: 2 },
       },
     }),
+    frame("ping", { type: "ping" }),
     frame("content_block_start", {
       type: "content_block_start",
       index: 0,
@@ -335,6 +340,15 @@ const RESPONSES_USAGE = {
   output_tokens: 4,
   total_tokens: 13,
 };
+/** [`RESPONSES_USAGE`] as the Responses API documents it. */
+const RESPONSES_USAGE_DOCUMENTED = {
+  input_tokens: 9,
+  input_tokens_details: { cached_tokens: 0 },
+  output_tokens: 4,
+  total_tokens: 13,
+};
+/** A member one channel adds to its Response objects. */
+const CHANNEL_FILTERS = [{ blocked: false, source_type: "completion" }];
 
 /** A Responses upstream answering with a function call. */
 function responsesAnswer(): Record<string, unknown> {
@@ -346,6 +360,7 @@ function responsesAnswer(): Record<string, unknown> {
     model: "upstream-model",
     output: [FUNCTION_CALL_ITEM],
     usage: RESPONSES_USAGE,
+    content_filters: CHANNEL_FILTERS,
     "amazon-bedrock-invocationMetrics": CHANNEL_METRICS,
   };
 }
@@ -360,6 +375,7 @@ function responsesStream(): string[] {
     status,
     model: "upstream-model",
     output,
+    content_filters: CHANNEL_FILTERS,
   });
   return [
     frame("response.created", { response: snapshot("in_progress", []) }),
@@ -371,6 +387,7 @@ function responsesStream(): string[] {
       item_id: UPSTREAM_FC_ITEM_ID,
       output_index: 0,
       delta: WEATHER_ARGS,
+      obfuscation: "Zq3wX",
     }),
     frame("response.function_call_arguments.done", {
       item_id: UPSTREAM_FC_ITEM_ID,
@@ -639,7 +656,9 @@ describe("platform mode e2e: ids name no upstream channel, and tool use still ro
       expectNoUpstreamIdentity(first.text);
       const toolCallId = chatToolCallId(first.text);
       expect(toolCallId).not.toBe(UPSTREAM_TOOL_USE_ID);
-      expect(JSON.parse(first.text).id).not.toBe(UPSTREAM_MESSAGE_ID);
+      expect(JSON.parse(first.text).id).not.toBe(
+        route === "chatOpenAi" ? UPSTREAM_CHAT_ID : UPSTREAM_MESSAGE_ID,
+      );
 
       // The agent's next turn carries the id it was handed.
       const second = await post("/v1/chat/completions", chatTurn(alias, toolCallId));
@@ -687,6 +706,11 @@ describe("platform mode e2e: ids name no upstream channel, and tool use still ro
       expectNoUpstreamIdentity(first.text);
       const firstBody = JSON.parse(first.text);
       expect(firstBody.id).toMatch(/^msg_/);
+      // A buffered answer keeps the usage counters the API documents; the
+      // one the upstream added beside them is the channel's own.
+      if (route === "messagesNative") {
+        expect(firstBody.usage).toEqual({ input_tokens: 9, output_tokens: 4, cache_creation_input_tokens: 2 });
+      }
       const toolUseId = messagesToolUseId(first.text);
       expect(toolUseId).toMatch(/^toolu_/);
       // Every other part of the answer survives.
@@ -749,9 +773,10 @@ describe("platform mode e2e: ids name no upstream channel, and tool use still ro
     expect(call.id).not.toBe(UPSTREAM_FC_ITEM_ID);
     expect(call.call_id).not.toBe(UPSTREAM_CALL_ID);
     expect(call.arguments).toBe(WEATHER_ARGS);
-    // A relayed answer comes back in full: the upstream's own usage counters
-    // included, buffered and streamed alike (asserted on the stream below).
-    expect(firstBody.usage).toEqual(RESPONSES_USAGE);
+    // A buffered answer keeps the members and usage counters the Responses
+    // API documents; what the upstream added beside them is the channel's own.
+    expect(firstBody.usage).toEqual(RESPONSES_USAGE_DOCUMENTED);
+    expect(firstBody).not.toHaveProperty("content_filters");
 
     // A stateless continuation: the whole history, echoed.
     const stateless = await post(
@@ -796,6 +821,8 @@ describe("platform mode e2e: ids name no upstream channel, and tool use still ro
     for (const e of perItem) expect(e.item_id, e.type).toBe(call.id);
     const completed = events.find((e) => e.type === "response.completed");
     expect(responsesFunctionCall(completed?.response?.output ?? []).call_id).toBe(call.call_id);
+    // A relayed stream frame goes out as the upstream wrote it, apart from
+    // its ids and model (a known limit: trimming it costs a pass per frame).
     expect(completed?.response?.usage).toEqual(RESPONSES_USAGE);
   });
 
@@ -1463,6 +1490,16 @@ describe("platform mode e2e: a response id continues only for the tenant it was 
     });
     expect(refusedParam(bare)).toBe("input[1].id");
     expect(upstream.receivedRequests).toHaveLength(1);
+    // A reference opens by its own id only: an id field of the caller's own
+    // seal beside it is no warrant for a foreign one.
+    for (const decoy of [
+      { type: "item_reference", id: "msg_bdrk_i01", call_id: call.call_id },
+      { id: "msg_bdrk_i01", caller: { type: "program", caller_id: call.call_id } },
+    ]) {
+      const refused = await postAs(TENANT_KEYS.a, "/v1/responses", { model, input: [decoy] });
+      expect(refusedParam(refused), JSON.stringify(decoy)).toBe("input[0].id");
+      expect(upstream.receivedRequests).toHaveLength(1);
+    }
 
     // A call or item id that is no reference still travels as the opaque
     // string another tenant sent.
@@ -1682,6 +1719,66 @@ describe("platform mode e2e: a response id continues only for the tenant it was 
           ],
         },
         field: "messages[0].content[1].source.file_id",
+      },
+      // A request may not choose the model that answers past the key's
+      // model access: an aggregator's model list or provider routing, a
+      // fallback chain, a tool that names its own model.
+      {
+        family: "chat: an aggregator's model list",
+        path: "/v1/chat/completions",
+        body: { model: openai, models: ["openai/o1-pro"], messages: [{ role: "user", content: "hi" }] },
+        field: "models",
+      },
+      {
+        family: "chat: provider routing",
+        path: "/v1/chat/completions",
+        body: { model: openai, provider: { order: ["x"] }, messages: [{ role: "user", content: "hi" }] },
+        field: "provider",
+      },
+      {
+        family: "responses: an aggregator's model list",
+        path: "/v1/responses",
+        body: { model: openai, models: ["openai/o1-pro"], input: "hi" },
+        field: "models",
+      },
+      {
+        family: "responses: an image generation tool's own model",
+        path: "/v1/responses",
+        body: { model: openai, input: "draw", tools: [{ type: "image_generation", model: "gpt-image-1" }] },
+        field: "tools[0].model",
+      },
+      {
+        family: "messages: a fallback chain",
+        path: "/v1/messages",
+        body: { model: anthropic, max_tokens: 64, fallbacks: "default", messages: [{ role: "user", content: "hi" }] },
+        field: "fallbacks",
+      },
+      {
+        family: "messages: a tool that runs a model of its own",
+        path: "/v1/messages",
+        body: {
+          model: anthropic,
+          max_tokens: 64,
+          tools: [{ type: "advisor_20260301", name: "advisor", model: "claude-opus-4-1" }],
+          messages: [{ role: "user", content: "hi" }],
+        },
+        field: "tools[0].model",
+      },
+      {
+        family: "count_tokens: a fallback chain",
+        path: "/v1/messages/count_tokens",
+        body: { model: anthropic, fallbacks: [{ model: "claude-opus-4-1" }], messages: [{ role: "user", content: "hi" }] },
+        field: "fallbacks",
+      },
+      // A reasoning item named only by its id makes the upstream look it up.
+      {
+        family: "responses: a reasoning item named by an id the caller was not handed",
+        path: "/v1/responses",
+        body: {
+          model: openai,
+          input: [{ role: "user", content: "go on" }, { type: "reasoning", id: "rs_tenant_a_0001", summary: [] }],
+        },
+        field: "input[1].id",
       },
       {
         family: "count_tokens: a stored file",

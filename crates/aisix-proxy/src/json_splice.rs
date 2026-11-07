@@ -371,122 +371,186 @@ pub fn rewrite_string_values(
     Ok(Some(out))
 }
 
-/// Remove every top-level member named `key` from a JSON object document,
+/// One object a [`retain_members`] pass trims: the chain of member names
+/// from the document root to it (empty for the root itself), and which of
+/// its members stay.
+pub(crate) struct Retain<'a> {
+    pub(crate) path: &'a [&'a str],
+    pub(crate) keep: fn(&str) -> bool,
+}
+
+/// Remove from every object a rule names each member its `keep` refuses,
 /// leaving every other byte as written. Only the separator in front of a
 /// removed member goes with it (or the one after it, for the first member).
+/// Keys are compared decoded, so an escaped spelling is the same key, and a
+/// path step that several duplicate members match leads into each of them. A
+/// rule whose path does not lead to an object is passed over.
 ///
-/// Returns `Ok(None)` when the document is not an object or has no such
-/// member, and an error for a document [`validate_json`] refuses — nothing is
-/// ever half-removed.
-pub(crate) fn remove_top_level_member(
+/// Returns `Ok(None)` when nothing was removed, and an error for a document
+/// [`validate_json`] refuses: nothing is ever half-removed.
+pub(crate) fn retain_members(
     input: &[u8],
-    key: &str,
+    rules: &[Retain<'_>],
 ) -> Result<Option<Vec<u8>>, SpliceError> {
     validate_json(input)?;
-    let invalid = |at: usize| SpliceError {
-        at,
-        kind: SpliceErrorKind::Invalid,
-    };
-    let skip_ws = |pos: &mut usize| {
-        while *pos < input.len() && matches!(input[*pos], b' ' | b'\t' | b'\n' | b'\r') {
-            *pos += 1;
-        }
-    };
-    // The document is valid, so a string ends at the first unescaped quote.
-    let string_end = |start: usize| -> usize {
-        let mut i = start + 1;
-        while input[i] != b'"' {
-            i += if input[i] == b'\\' { 2 } else { 1 };
-        }
-        i + 1
-    };
-    let value_end = |start: usize| -> usize {
-        match input[start] {
-            b'"' => string_end(start),
-            b'{' | b'[' => {
-                let mut depth = 0usize;
-                let mut i = start;
-                loop {
-                    match input[i] {
-                        b'"' => {
-                            i = string_end(i);
-                            continue;
-                        }
-                        b'{' | b'[' => depth += 1,
-                        b'}' | b']' => {
-                            depth -= 1;
-                            if depth == 0 {
-                                return i + 1;
-                            }
-                        }
-                        _ => {}
-                    }
-                    i += 1;
-                }
-            }
-            _ => {
-                let mut i = start;
-                while i < input.len()
-                    && !matches!(input[i], b',' | b'}' | b']' | b' ' | b'\t' | b'\n' | b'\r')
-                {
-                    i += 1;
-                }
-                i
-            }
-        }
-    };
-
     let mut pos = 0;
-    skip_ws(&mut pos);
+    skip_ws(input, &mut pos);
     if input.get(pos) != Some(&b'{') {
         return Ok(None);
     }
-    pos += 1;
-    // `(start of the key, end of the value, removed)` per member.
-    let mut members: Vec<(usize, usize, bool)> = Vec::new();
+    let mut out = Vec::with_capacity(input.len());
+    out.extend_from_slice(&input[..pos]);
+    let mut path = Vec::new();
+    let (end, removed) = retain_in_object(input, pos, &mut path, rules, &mut out)?;
+    if !removed {
+        return Ok(None);
+    }
+    out.extend_from_slice(&input[end..]);
+    Ok(Some(out))
+}
+
+/// The members of the object at `start` (its `{`), in a document
+/// [`validate_json`] accepted: for each, the start of its key, its decoded
+/// name, the start and the end of its value. Also the end of the object.
+#[allow(clippy::type_complexity)]
+fn object_members(
+    input: &[u8],
+    start: usize,
+) -> Result<(Vec<(usize, String, usize, usize)>, usize), SpliceError> {
+    let mut members = Vec::new();
+    let mut pos = start + 1;
     loop {
-        skip_ws(&mut pos);
+        skip_ws(input, &mut pos);
         if input.get(pos) == Some(&b'}') {
-            break;
+            return Ok((members, pos + 1));
         }
         let key_start = pos;
-        let key_end = string_end(pos);
+        let key_end = string_end(input, pos);
         let name: String =
-            serde_json::from_slice(&input[key_start..key_end]).map_err(|_| invalid(key_start))?;
+            serde_json::from_slice(&input[key_start..key_end]).map_err(|_| SpliceError {
+                at: key_start,
+                kind: SpliceErrorKind::Invalid,
+            })?;
         pos = key_end;
-        skip_ws(&mut pos);
+        skip_ws(input, &mut pos);
         pos += 1; // `:`
-        skip_ws(&mut pos);
-        let end = value_end(pos);
-        members.push((key_start, end, name == key));
-        pos = end;
-        skip_ws(&mut pos);
+        skip_ws(input, &mut pos);
+        let value_start = pos;
+        let value_end = value_end(input, pos);
+        members.push((key_start, name, value_start, value_end));
+        pos = value_end;
+        skip_ws(input, &mut pos);
         if input.get(pos) == Some(&b',') {
             pos += 1;
         }
     }
-    if !members.iter().any(|&(_, _, removed)| removed) {
-        return Ok(None);
+}
+
+/// Write the object at `start`, which `path` names, to `out` with the
+/// members the rules refuse left out. Returns the end of the object and
+/// whether anything was removed, at this object or under it.
+fn retain_in_object(
+    input: &[u8],
+    start: usize,
+    path: &mut Vec<String>,
+    rules: &[Retain<'_>],
+    out: &mut Vec<u8>,
+) -> Result<(usize, bool), SpliceError> {
+    let (members, end) = object_members(input, start)?;
+    // Whether `rule` names the object at `path` or one under it.
+    fn on_path(rule: &Retain<'_>, path: &[String]) -> bool {
+        rule.path.len() >= path.len() && rule.path.iter().zip(path).all(|(a, b)| a == b)
     }
+    let here: Vec<&Retain<'_>> = rules
+        .iter()
+        .filter(|rule| rule.path.len() == path.len() && on_path(rule, path))
+        .collect();
     let (Some(first), Some(last)) = (members.first(), members.last()) else {
-        return Ok(None);
+        out.extend_from_slice(&input[start..end]);
+        return Ok((end, false));
     };
-    let mut out = Vec::with_capacity(input.len());
-    out.extend_from_slice(&input[..first.0]);
+    out.extend_from_slice(&input[start..first.0]);
+    let mut removed = false;
     let mut wrote_one = false;
-    for (i, &(start, end, removed)) in members.iter().enumerate() {
-        if removed {
+    for (i, (key_start, name, value_start, value_end)) in members.iter().enumerate() {
+        if !here.iter().all(|rule| (rule.keep)(name)) {
+            removed = true;
             continue;
         }
         if wrote_one {
             // The separator this member had in front of it.
-            out.extend_from_slice(&input[members[i - 1].1..start]);
+            out.extend_from_slice(&input[members[i - 1].3..*key_start]);
         }
-        out.extend_from_slice(&input[start..end]);
         wrote_one = true;
+        out.extend_from_slice(&input[*key_start..*value_start]);
+        let descends = input[*value_start] == b'{'
+            && rules.iter().any(|rule| {
+                on_path(rule, path) && rule.path.get(path.len()) == Some(&name.as_str())
+            });
+        if descends {
+            path.push(name.clone());
+            let (_, under) = retain_in_object(input, *value_start, path, rules, out)?;
+            path.pop();
+            removed |= under;
+        } else {
+            out.extend_from_slice(&input[*value_start..*value_end]);
+        }
     }
-    out.extend_from_slice(&input[last.1..]);
-    Ok(Some(out))
+    out.extend_from_slice(&input[last.3..end]);
+    Ok((end, removed))
+}
+
+fn skip_ws(input: &[u8], pos: &mut usize) {
+    while *pos < input.len() && matches!(input[*pos], b' ' | b'\t' | b'\n' | b'\r') {
+        *pos += 1;
+    }
+}
+
+/// The end of the string at `start`, in a valid document: the first
+/// unescaped quote.
+fn string_end(input: &[u8], start: usize) -> usize {
+    let mut i = start + 1;
+    while input[i] != b'"' {
+        i += if input[i] == b'\\' { 2 } else { 1 };
+    }
+    i + 1
+}
+
+/// The end of the value at `start`, in a valid document.
+fn value_end(input: &[u8], start: usize) -> usize {
+    match input[start] {
+        b'"' => string_end(input, start),
+        b'{' | b'[' => {
+            let mut depth = 0usize;
+            let mut i = start;
+            loop {
+                match input[i] {
+                    b'"' => {
+                        i = string_end(input, i);
+                        continue;
+                    }
+                    b'{' | b'[' => depth += 1,
+                    b'}' | b']' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return i + 1;
+                        }
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+        }
+        _ => {
+            let mut i = start;
+            while i < input.len()
+                && !matches!(input[i], b',' | b'}' | b']' | b' ' | b'\t' | b'\n' | b'\r')
+            {
+                i += 1;
+            }
+            i
+        }
+    }
 }
 
 /// Decode and collect every JSON string **value** in source order.
@@ -918,12 +982,23 @@ mod tests {
             .is_none());
     }
 
+    fn retain(doc: &str, rules: &[Retain<'_>]) -> Option<String> {
+        retain_members(doc.as_bytes(), rules)
+            .unwrap()
+            .map(|b| String::from_utf8(b).unwrap())
+    }
+
     #[test]
     fn removes_a_top_level_member_and_keeps_every_other_byte() {
+        let not_drop = |k: &str| k != "drop";
         let remove = |doc: &str| {
-            remove_top_level_member(doc.as_bytes(), "drop")
-                .unwrap()
-                .map(|b| String::from_utf8(b).unwrap())
+            retain(
+                doc,
+                &[Retain {
+                    path: &[],
+                    keep: not_drop,
+                }],
+            )
         };
         assert_eq!(
             remove(r#"{"type":"message_stop","drop":{"n":[1,"}",2e1]}}"#).as_deref(),
@@ -954,6 +1029,11 @@ mod tests {
 
     #[test]
     fn removing_an_absent_or_nested_member_changes_nothing() {
+        let not_drop = |k: &str| k != "drop";
+        let rules = [Retain {
+            path: &[],
+            keep: not_drop,
+        }];
         for doc in [
             r#"{"a":{"drop":1}}"#,
             r#"[{"drop":1}]"#,
@@ -962,12 +1042,59 @@ mod tests {
             r#"{"a":"drop"}"#,
         ] {
             assert_eq!(
-                remove_top_level_member(doc.as_bytes(), "drop").unwrap(),
+                retain_members(doc.as_bytes(), &rules).unwrap(),
                 None,
                 "{doc}"
             );
         }
-        assert!(remove_top_level_member(br#"{"drop":1"#, "drop").is_err());
+        assert!(retain_members(br#"{"drop":1"#, &rules).is_err());
+    }
+
+    /// A rule trims only the object its path names, each duplicate of a
+    /// step included, and leaves a value that is not an object alone.
+    #[test]
+    fn a_nested_object_keeps_only_what_its_rule_keeps() {
+        let top = |k: &str| k != "x";
+        let usage = |k: &str| matches!(k, "in" | "out" | "detail");
+        let detail = |k: &str| k == "keep";
+        let rules = [
+            Retain {
+                path: &[],
+                keep: top,
+            },
+            Retain {
+                path: &["m", "usage"],
+                keep: usage,
+            },
+            Retain {
+                path: &["m", "usage", "detail"],
+                keep: detail,
+            },
+        ];
+        assert_eq!(
+            retain(
+                r#"{"m":{"id":"a","usage":{"in":1, "geo":"us","out":2,"detail":{"keep":1,"x":2}},"x":3},"x":4,"usage":{"geo":1}}"#,
+                &rules
+            )
+            .as_deref(),
+            Some(r#"{"m":{"id":"a","usage":{"in":1,"out":2,"detail":{"keep":1}},"x":3},"usage":{"geo":1}}"#)
+        );
+        assert_eq!(
+            retain(
+                r#"{"m":{"usage":{"geo":1}},"m":{"usage":{"tier":"p","in":1}}}"#,
+                &rules
+            )
+            .as_deref(),
+            Some(r#"{"m":{"usage":{}},"m":{"usage":{"in":1}}}"#)
+        );
+        for unchanged in [
+            r#"{"m":{"usage":null}}"#,
+            r#"{"m":{"usage":[{"geo":1}]}}"#,
+            r#"{"m":"usage"}"#,
+            r#"{"m":{"usage":{"in":1}}}"#,
+        ] {
+            assert_eq!(retain(unchanged, &rules), None, "{unchanged}");
+        }
     }
 
     #[test]

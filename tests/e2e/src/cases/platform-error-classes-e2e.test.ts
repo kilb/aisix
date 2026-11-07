@@ -29,7 +29,37 @@ const CALLER_KEY = "sk-platform-errors-e2e-caller";
 const PLATFORM_SECRET_ENV = "P0_E2E_PLATFORM_ID_KEY";
 // 32 random bytes as hex digits, the form the gateway requires.
 const PLATFORM_SECRET = "962887e2a142f4af6a987d72d3e4446a63007120157fc194c00b6c4bcefa9d5b";
-const LEAKS = ["Anthropic", "Bedrock", "Vertex", "us-east-1"];
+const LEAKS = ["Anthropic", "Bedrock", "Vertex", "us-east-1", "bdrk", "awselb"];
+/**
+ * Headers real channels put on their answers, every one of which names the
+ * channel, its account or its edge. The mock sends them on every answer.
+ */
+const CHANNEL_HEADERS: Record<string, string> = {
+  "x-request-id": "req_bdrk_0123",
+  "x-amzn-requestid": "bdrk-amzn-0123",
+  "anthropic-organization-id": "org-bdrk-0123",
+  "openai-organization": "org-bdrk",
+  "openai-processing-ms": "123",
+  "x-ratelimit-limit-requests": "9999",
+  "x-ratelimit-remaining-requests": "9998",
+  server: "awselb/2.0",
+  via: "1.1 bdrk-edge",
+  "cf-ray": "bdrk-ray-0123",
+};
+/** Every header the gateway itself sends on these answers. */
+const GATEWAY_HEADERS = new Set([
+  "cache-control",
+  "connection",
+  "content-length",
+  "content-type",
+  "date",
+  "keep-alive",
+  "retry-after",
+  "server",
+  "transfer-encoding",
+  "vary",
+  "x-aisix-request-id",
+]);
 /** A word no answer in this spec contains: the output guardrail never blocks. */
 const NEVER_SAID = "zq-never-in-any-answer-9x";
 
@@ -41,9 +71,17 @@ type Scenario =
   // A stream the upstream ends with no terminal event.
   | "truncated"
   // A buffered answer that is a failed Response object.
-  | "failed_object";
+  | "failed_object"
+  // A failed Response object whose code blames the request.
+  | "caller_fault"
+  // An upstream that stops answering: before its answer, or mid-stream.
+  | "stall"
+  // A stream that carries nothing at all.
+  | "empty";
 const MATRIX: Scenario[] = ["unauthorized", "rate_limited", "context", "midstream"];
-const ALL_SCENARIOS: Scenario[] = [...MATRIX, "truncated", "failed_object"];
+const ALL_SCENARIOS: Scenario[] = [...MATRIX, "truncated", "failed_object", "caller_fault", "stall", "empty"];
+/** How long the mock stalls: far past the models' own timeouts below. */
+const STALL_MS = 3_000;
 
 /** What the upstream says for `scenario` when `tag` is the route asking. */
 function upstreamText(scenario: Scenario, tag: string, wire: "openai" | "anthropic"): string {
@@ -59,7 +97,11 @@ function upstreamText(scenario: Scenario, tag: string, wire: "openai" | "anthrop
     case "midstream":
     case "truncated":
     case "failed_object":
+    case "stall":
+    case "empty":
       return `Bedrock ThrottlingException from Anthropic in us-east-1 [${tag}]`;
+    case "caller_fault":
+      return `Invalid prompt: flagged by the Bedrock safety stack in us-east-1 [${tag}]`;
   }
 }
 
@@ -89,7 +131,10 @@ const ROUTES: Route[] = [
   // …an OpenAI-compatible vendor through chat completions.
   { tag: "responses-bridged", path: "/v1/responses", envelope: "openai", pk: "compatible", provider: "deepseek" },
 ];
+const CHAT = ROUTES[0];
+const MESSAGES_NATIVE = ROUTES[1];
 const RESPONSES_NATIVE = ROUTES[3];
+const RESPONSES_BRIDGED = ROUTES[4];
 /** OpenAI's own `/v1/responses`, behind an output guardrail that can block. */
 const RESPONSES_HELD: Route = {
   tag: "responses-held",
@@ -129,9 +174,13 @@ const upstreamModel = (route: Route, scenario: Scenario) => `${route.tag}--${sce
 
 // ── the upstream ────────────────────────────────────────────────────────────
 
-function sse(res: ServerResponse, frames: string[]): void {
-  res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+function sse(res: ServerResponse, frames: string[], stallAfter = false): void {
+  res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", ...CHANNEL_HEADERS });
   for (const frame of frames) res.write(frame);
+  if (stallAfter) {
+    setTimeout(() => res.end(), STALL_MS);
+    return;
+  }
   res.end();
 }
 
@@ -158,7 +207,7 @@ const responsesOpening = () => [
 function answerOpenAi(path: string, tag: string, scenario: Scenario, res: ServerResponse): void {
   const text = upstreamText(scenario, tag, "openai");
   const fail = (status: number, error: Record<string, unknown>, headers: Record<string, string> = {}) => {
-    res.writeHead(status, { "content-type": "application/json", ...headers });
+    res.writeHead(status, { "content-type": "application/json", ...CHANNEL_HEADERS, ...headers });
     res.end(JSON.stringify({ error: { message: text, param: null, ...error } }));
   };
   const responses = path.endsWith("/responses");
@@ -170,7 +219,8 @@ function answerOpenAi(path: string, tag: string, scenario: Scenario, res: Server
     case "context":
       return fail(400, { type: "invalid_request_error", param: "messages", code: "context_length_exceeded" });
     case "failed_object":
-      res.writeHead(200, { "content-type": "application/json" });
+    case "caller_fault":
+      res.writeHead(200, { "content-type": "application/json", ...CHANNEL_HEADERS });
       res.end(
         JSON.stringify({
           id: "resp_up_1",
@@ -179,10 +229,16 @@ function answerOpenAi(path: string, tag: string, scenario: Scenario, res: Server
           status: "failed",
           model: "m",
           output: [],
-          error: { code: "server_error", message: text },
+          error: { code: scenario === "caller_fault" ? "invalid_prompt" : "server_error", message: text },
         }),
       );
       return;
+    case "stall":
+      // No answer before the model's timeout runs out.
+      setTimeout(() => fail(500, { type: "server_error" }), STALL_MS);
+      return;
+    case "empty":
+      return sse(res, ["data: [DONE]\n\n"]);
     case "truncated":
       // The connection ends after some text, with no terminal event.
       return sse(res, responsesOpening());
@@ -209,9 +265,30 @@ function answerOpenAi(path: string, tag: string, scenario: Scenario, res: Server
 function answerAnthropic(tag: string, scenario: Scenario, res: ServerResponse): void {
   const text = upstreamText(scenario, tag, "anthropic");
   const fail = (status: number, type: string, headers: Record<string, string> = {}) => {
-    res.writeHead(status, { "content-type": "application/json", ...headers });
+    res.writeHead(status, { "content-type": "application/json", ...CHANNEL_HEADERS, ...headers });
     res.end(JSON.stringify({ type: "error", error: { type, message: text } }));
   };
+  const opening = [
+    eventFrame("message_start", {
+      type: "message_start",
+      message: {
+        id: "msg_up_1",
+        type: "message",
+        role: "assistant",
+        model: "m",
+        content: [],
+        stop_reason: null,
+        stop_sequence: null,
+        usage: { input_tokens: 5, output_tokens: 1 },
+      },
+    }),
+    eventFrame("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }),
+    eventFrame("content_block_delta", {
+      type: "content_block_delta",
+      index: 0,
+      delta: { type: "text_delta", text: "Hel" },
+    }),
+  ];
   switch (scenario) {
     case "unauthorized":
       return fail(401, "authentication_error");
@@ -219,8 +296,15 @@ function answerAnthropic(tag: string, scenario: Scenario, res: ServerResponse): 
       return fail(429, "rate_limit_error", { "retry-after": "7" });
     case "context":
       return fail(400, "invalid_request_error");
+    // The connection ends after some text: no `message_stop`, no error.
     case "truncated":
+      return sse(res, opening);
+    // Some text, then nothing more until long past the model's timeout.
+    case "stall":
+      return sse(res, opening, true);
     case "failed_object":
+    case "caller_fault":
+    case "empty":
     case "midstream":
       return sse(res, [
         eventFrame("message_start", {
@@ -345,7 +429,7 @@ const UNAVAILABLE: Expected = {
 };
 const RATE_LIMITED: Expected = {
   status: 429,
-  code: "rate_limited",
+  code: "rate_limit_exceeded",
   openaiType: "rate_limit_error",
   anthropicType: "rate_limit_error",
   message: "Rate limit exceeded. Retry later.",
@@ -386,13 +470,19 @@ describe("platform mode: upstream failures reach the caller as the gateway's own
   const call = (route: Route, scenario: Scenario, stream: boolean) =>
     callModel(route, modelName(route, scenario), stream);
 
-  /** Nothing the upstream wrote about itself is anywhere in what the caller got. */
+  /**
+   * Nothing the upstream wrote about itself is anywhere in what the caller
+   * got: not in the body, and no header the gateway does not send itself,
+   * though the upstream sent a channel's worth of them.
+   */
   const expectNoLeak = (answer: Answer) => {
     const headerText = [...answer.headers.entries()].map(([k, v]) => `${k}: ${v}`).join("\n");
     for (const leak of LEAKS) {
       expect(answer.text, `body leaks ${leak}`).not.toContain(leak);
       expect(headerText, `headers leak ${leak}`).not.toContain(leak);
     }
+    const foreign = [...answer.headers.keys()].filter((name) => !GATEWAY_HEADERS.has(name));
+    expect(foreign, headerText).toEqual([]);
   };
 
   /** The buffered answer's error block, in the route's envelope. */
@@ -460,12 +550,18 @@ describe("platform mode: upstream failures reach the caller as the gateway's own
         api_base: `${upstream.base}/v1`,
       }),
     };
-    const model = (route: Route, scenario: Scenario, name = modelName(route, scenario)) =>
+    const model = (
+      route: Route,
+      scenario: Scenario,
+      name = modelName(route, scenario),
+      extra: Record<string, unknown> = {},
+    ) =>
       seed.createModel({
         display_name: name,
         provider: route.provider,
         model_name: upstreamModel(route, scenario),
         provider_key_id: pks[route.pk].id,
+        ...extra,
       });
     for (const route of ROUTES) {
       for (const scenario of MATRIX) {
@@ -477,6 +573,11 @@ describe("platform mode: upstream failures reach the caller as the gateway's own
     await model(COUNT_NATIVE, "unauthorized");
     await model(COUNT_OPENAI, "unauthorized");
     await model(EMBEDDINGS, "rate_limited");
+    await model(MESSAGES_NATIVE, "truncated");
+    await model(MESSAGES_NATIVE, "stall", undefined, { stream_timeout: 500, retries: 0 });
+    await model(CHAT, "stall", undefined, { timeout: 500, retries: 0 });
+    await model(RESPONSES_NATIVE, "caller_fault");
+    await model(RESPONSES_BRIDGED, "empty");
     // A block-capable output guardrail holds the whole stream back before
     // releasing it, which is a path of its own.
     const held = await seed.createGuardrail(
@@ -549,6 +650,37 @@ describe("platform mode: upstream failures reach the caller as the gateway's own
     expect(body.error?.code).toBe(UNAVAILABLE.code);
     expect(body.error?.message).toBe(UNAVAILABLE.message);
     expectNoLeak(answer);
+  });
+
+  test("responses-native: a failed Response whose code blames the request is an invalid request", async (ctx) => {
+    if (!etcdReachable || !app) return ctx.skip();
+    const answer = await call(RESPONSES_NATIVE, "caller_fault", false);
+    const body = JSON.parse(answer.text) as { status?: string; error?: Record<string, unknown> };
+    expect(body.status, answer.text).toBe("failed");
+    expect(body.error?.code).toBe(INVALID.code);
+    expect(body.error?.message).toBe(INVALID.message);
+    expectNoLeak(answer);
+  });
+
+  test("messages-native: a stream the upstream cuts off ends with the class", async (ctx) => {
+    if (!etcdReachable || !app) return ctx.skip();
+    expectStreamEndsUnavailable(await call(MESSAGES_NATIVE, "truncated", true));
+  });
+
+  test("messages-native: an upstream that stops answering mid-stream ends the stream with the class", async (ctx) => {
+    if (!etcdReachable || !app) return ctx.skip();
+    // The body ends on the class's frame rather than being cut off.
+    expectStreamEndsUnavailable(await call(MESSAGES_NATIVE, "stall", true));
+  });
+
+  test("chat: an upstream that does not answer in time is the model being unavailable", async (ctx) => {
+    if (!etcdReachable || !app) return ctx.skip();
+    expectClass(CHAT, await call(CHAT, "stall", false), UNAVAILABLE);
+  });
+
+  test("responses-bridged: an upstream stream that carries nothing ends with the class", async (ctx) => {
+    if (!etcdReachable || !app) return ctx.skip();
+    expectStreamEndsUnavailable(await call(RESPONSES_BRIDGED, "empty", true));
   });
 
   describe("responses-held: behind an output guardrail that holds the stream back", () => {

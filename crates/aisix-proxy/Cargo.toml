@@ -52,6 +52,8 @@ http-body.workspace = true
 http-body-util.workspace = true
 bytes.workspace = true
 regex.workspace = true
+# Byte search for the one channel-metrics member a relayed frame may carry.
+memchr.workspace = true
 serde.workspace = true
 serde_json = { workspace = true, features = ["raw_value"] }
 # Token-estimation fallback for usage telemetry (token_estimate.rs).

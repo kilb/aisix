@@ -617,6 +617,13 @@ async fn dispatch(
     if !auth.key().can_access(snapshot, &model_name) {
         return Err(ProxyError::ModelForbidden(model_name.clone()).into());
     }
+    // A grouped key is answered as if no ensemble existed, ahead of
+    // everything that could tell the two apart (the IP check, guardrails).
+    crate::model_resolve::refuse_ensemble_to_grouped_key(
+        &model_name,
+        &model_entry.value,
+        &auth.key().allowed_provider_groups,
+    )?;
 
     // Client-IP allowlist gate (#557): reject before guardrails / upstream.
     crate::dispatch::check_ip_access(&model_entry.value, &client.source_ip)?;
@@ -858,6 +865,12 @@ async fn dispatch(
         )
     };
     if let Some(gate) = cache_gate.as_ref() {
+        crate::routing::check_group_access(
+            snapshot,
+            &model_name,
+            &model_entry.value,
+            &auth.key().allowed_provider_groups,
+        )?;
         crate::routing::check_member_ip_access(
             snapshot,
             &model_name,
@@ -1387,6 +1400,7 @@ async fn dispatch_to_target(
         std::borrow::Cow::Borrowed(_) => body,
     };
     let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
+    crate::attribution::note_translated_dispatch(!speaks_anthropic);
 
     if !speaks_anthropic {
         return cross_provider_dispatch(
@@ -3776,10 +3790,9 @@ fn build_anthropic_sse_stream(
                                 comp.response_capture_safe = false;
                                 comp.response_text.clear();
                             }
+                            let frame = translation_limit_frame(&aborted);
                             comp.terminal_failure = Some(aborted);
-                            yield Ok(bytes::Bytes::from_static(
-                                b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"stream_aborted\",\"message\":\"upstream tool stream exceeded translation limit\"}}\n\n",
-                            ));
+                            yield Ok(frame);
                             return;
                         }
                         encoder_tool_bytes = total;
@@ -4129,13 +4142,32 @@ pub(crate) fn guardrail_block_frame(
             "error": {
                 "type": "invalid_request_error",
                 "code": crate::error::anthropic_guardrail_code(unavailable),
-                "message": crate::error::guardrail_block_message("response", guardrail_name, unavailable),
+                "message": crate::error::caller_guardrail_block_message("response", guardrail_name, unavailable),
             }
         })
     )
 }
 
+/// The error frame a translated stream ends on when its tool calls outgrew
+/// what the translation holds; in platform mode the class of `aborted`.
+fn translation_limit_frame(aborted: &aisix_gateway::BridgeError) -> bytes::Bytes {
+    match crate::platform_errors::anthropic_stream_frame(aborted) {
+        Some(frame) => bytes::Bytes::from(frame),
+        None => bytes::Bytes::from_static(
+            b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"stream_aborted\",\"message\":\"upstream tool stream exceeded translation limit\"}}\n\n",
+        ),
+    }
+}
+
+/// The error frame a native stream ends on when it was cut short or carried
+/// a frame that could not be read; in platform mode the class of that
+/// failure, which every other stream ending carries too.
 fn upstream_stream_error_frame() -> String {
+    if let Some(frame) =
+        crate::platform_errors::anthropic_stream_frame(&aisix_gateway::BridgeError::StreamAborted)
+    {
+        return frame;
+    }
     format!(
         "event: error\ndata: {}\n\n",
         serde_json::json!({
@@ -5254,8 +5286,11 @@ fn drain_anthropic_sse_frames(
         let forwarded = forwarded.as_deref().unwrap_or(&frame);
         // The upstream's error event reaches the caller as sent, less the
         // credentials this request sent it; in platform mode, as the class
-        // of the error it reports.
-        if reports_failure {
+        // of the error it reports. Platform mode relays no frame of a kind
+        // only some channels send (`MessagesIds::relays_event`), read above
+        // like every other.
+        if platform_ids.is_some() && !crate::opaque_id::MessagesIds::relays_event(json.as_ref()) {
+        } else if reports_failure {
             match crate::platform_errors::relayed_anthropic_error(json.as_ref()) {
                 Some(class_frame) => out.extend_from_slice(class_frame.as_bytes()),
                 None => {
@@ -5508,6 +5543,13 @@ where
                         usage.response_capture_safe = false;
                         usage.response_text.clear();
                     }
+                    // Platform mode: the class frame a bridged channel's
+                    // stream ends on for the same fault, not an aborted
+                    // body that only this kind of channel gives.
+                    if let Some(frame) = crate::platform_errors::anthropic_stream_frame(&bridge) {
+                        yield Ok(Bytes::from(frame));
+                        return;
+                    }
                     yield Err(error);
                     return;
                 }
@@ -5663,16 +5705,22 @@ where
             // Its counts are as real as any other frame's, so read them
             // whether or not the fragment survives the seal below.
             let (json, malformed) = crate::redact::parse_sse_json_event(&tail);
-            if let Some(json) = json {
+            if let Some(json) = &json {
                 update_anthropic_usage(
                     guard.usage(),
-                    &json,
+                    json,
                     attempt_started,
                     &mut first_token_seen,
                     response_text_cap,
                 );
             }
-            if let Some((max_hold, fail_open)) = hold {
+            if platform_ids.is_some()
+                && !malformed
+                && !crate::opaque_id::MessagesIds::relays_event(json.as_ref())
+            {
+                // Read above; platform mode relays no frame of a kind only
+                // some channels send, as `drain_anthropic_sse_frames` does.
+            } else if let Some((max_hold, fail_open)) = hold {
                 // Scanned like every other frame — hold it with them, but
                 // under the same size policy: this path reaches `held`
                 // outside the loop, so without this the last frame could
@@ -8920,6 +8968,107 @@ event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_toke
         assert!(usage.response_text.contains("partial"));
     }
 
+    /// A translated stream whose tool calls outgrew the translation ends on
+    /// a fixed frame; in platform mode on the class of the abort.
+    #[test]
+    fn the_translation_limit_frame_is_classed_in_platform_mode() {
+        let aborted = aisix_gateway::BridgeError::StreamAborted;
+        let off = super::translation_limit_frame(&aborted);
+        assert!(
+            String::from_utf8_lossy(&off).contains("\"stream_aborted\""),
+            "{off:?}"
+        );
+        let on = crate::error::tests::in_platform_mode(|| super::translation_limit_frame(&aborted));
+        let (event, _) = crate::redact::parse_sse_json_event(&on);
+        let event = event.unwrap();
+        assert_eq!(event["error"]["code"], "upstream_unavailable");
+        assert!(!String::from_utf8_lossy(&on).contains("translation"));
+    }
+
+    /// Every way a native Messages stream ends on a failure of its own, in
+    /// platform mode: a transport error mid-stream, a truncated stream and a
+    /// frame that does not parse each end on the class frame, not on an
+    /// aborted body or a fixed text whose shape differs by channel. Off
+    /// platform mode each ends as it always has.
+    #[tokio::test]
+    async fn every_native_stream_failure_ends_on_its_class_in_platform_mode() {
+        use futures::StreamExt;
+        let start = bytes::Bytes::from_static(
+            b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"up\",\"content\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}}\n\n",
+        );
+        let ending =
+            |kind: &str| -> Vec<Result<bytes::Bytes, crate::stream_timeout::RawStreamError>> {
+                match kind {
+                    "transport" => vec![
+                        Ok(start.clone()),
+                        Err(crate::stream_timeout::RawStreamError::Timeout { elapsed_ms: 5 }),
+                    ],
+                    "truncated" => vec![Ok(start.clone())],
+                    _ => vec![
+                        Ok(start.clone()),
+                        Ok(bytes::Bytes::from_static(
+                            b"event: content_block_delta\ndata: {not json\n\n",
+                        )),
+                    ],
+                }
+            };
+        for kind in ["transport", "truncated", "malformed"] {
+            for platform in [false, true] {
+                let upstream = futures::stream::iter(ending(kind));
+                let now = std::time::Instant::now();
+                let ids = platform.then(|| {
+                    crate::opaque_id::MessagesIds::new(&ring::hmac::Key::new(
+                        ring::hmac::HMAC_SHA256,
+                        &[7u8; 32],
+                    ))
+                });
+                let cell = std::sync::Arc::new(
+                    crate::attribution::RequestAttribution::default().in_platform_mode(platform),
+                );
+                let (wire, aborted) = crate::attribution::scope(cell, async move {
+                    let mut stream = super::build_anthropic_passthrough_stream(
+                        upstream,
+                        now,
+                        now,
+                        None,
+                        "relay-claude".into(),
+                        ids,
+                        Some(4096),
+                        None,
+                        |_| {},
+                    );
+                    let mut wire = Vec::new();
+                    let mut aborted = false;
+                    while let Some(item) = stream.next().await {
+                        match item {
+                            Ok(bytes) => wire.extend_from_slice(&bytes),
+                            Err(_) => aborted = true,
+                        }
+                    }
+                    (String::from_utf8(wire).unwrap(), aborted)
+                })
+                .await;
+                let last = wire.trim_end().rsplit("\n\n").next().unwrap().to_owned();
+                if !platform {
+                    match kind {
+                        "transport" => assert!(aborted, "off: the body is aborted"),
+                        _ => assert!(last.contains("upstream stream failed"), "{kind}: {last}"),
+                    }
+                    continue;
+                }
+                assert!(!aborted, "{kind}: the body ends on a frame");
+                assert!(last.starts_with("event: error\n"), "{kind}: {last}");
+                let (event, _) = crate::redact::parse_sse_json_event(last.as_bytes());
+                let event = event.unwrap();
+                assert_eq!(
+                    event["error"]["code"], "upstream_unavailable",
+                    "{kind}: {last}"
+                );
+                assert_eq!(event["error"]["type"], "overloaded_error", "{kind}: {last}");
+            }
+        }
+    }
+
     /// A final frame the upstream never terminated is released at EOF by its
     /// own code path, one per delivery mode. When that frame is the
     /// `message_start`, it is the only one naming the message, so platform
@@ -9457,6 +9606,58 @@ event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\"
             })
         ));
         assert!(buf.is_empty(), "both frames drained even without usage");
+    }
+
+    /// Platform mode relays none of a native stream's `ping` frames or
+    /// payload-less frames, and still reads each of them first: the `ping`
+    /// stamps the time to first frame. Every other frame is relayed, one of
+    /// a type the API does not document included. Off platform mode every
+    /// frame reaches the client byte for byte.
+    #[test]
+    fn platform_mode_relays_no_ping_and_still_reads_it() {
+        use super::{drain_anthropic_sse_frames, AnthropicStreamUsage};
+
+        let frames: &[u8] = b"event: ping\ndata: {\"type\":\"ping\"}\n\n\
+: channel keepalive\n\n\
+event: channel_status\ndata: {\"type\":\"channel_status\"}\n\n\
+event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"model\":\"up\",\"usage\":{\"input_tokens\":11}}}\n\n";
+        let drain = |platform_ids: Option<&crate::opaque_id::MessagesIds>| {
+            let mut acc = AnthropicStreamUsage::default();
+            let mut first_token_seen = false;
+            let mut buf = frames.to_vec();
+            let mut out: Vec<u8> = Vec::new();
+            drain_anthropic_sse_frames(
+                &mut buf,
+                &mut 0,
+                &mut acc,
+                std::time::Instant::now(),
+                &mut first_token_seen,
+                usize::MAX,
+                "gw-alias",
+                platform_ids,
+                &mut out,
+            );
+            assert!(buf.is_empty(), "every frame drained");
+            assert!(acc.upstream_ttft.is_some(), "the first frame was read");
+            assert_eq!(acc.prompt_tokens, 11);
+            String::from_utf8(out).unwrap()
+        };
+        let off = drain(None);
+        assert_eq!(
+            off,
+            String::from_utf8_lossy(frames).replace("\"up\"", "\"gw-alias\"")
+        );
+
+        let ids = crate::opaque_id::MessagesIds::new(&ring::hmac::Key::new(
+            ring::hmac::HMAC_SHA256,
+            &[7u8; 32],
+        ));
+        let on = drain(Some(&ids));
+        assert!(on.starts_with("event: channel_status\n"), "{on}");
+        assert!(on.contains("event: message_start\n"), "{on}");
+        for gone in ["ping", "keepalive"] {
+            assert!(!on.contains(gone), "{gone}: {on}");
+        }
     }
 
     #[test]

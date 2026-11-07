@@ -26,7 +26,7 @@ use base64::Engine as _;
 use ring::{aead, hmac};
 use serde_json::Value;
 
-use crate::json_splice::{self, PathSeg};
+use crate::json_splice::{self, PathSeg, Retain};
 
 /// The client-facing protocols whose ids are rewritten one way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -493,15 +493,24 @@ fn item_field_kind(field: &str) -> Option<IdKind> {
 }
 
 /// Run `visit` over every id field of one item, with the kind it holds. A
-/// `caller` object's `caller_id` names a call.
+/// `caller` object's `caller_id` names a call, and so does the `id` of a
+/// `local_shell_call_output`: that item has no `call_id`, and its `id` is the
+/// call id of the `local_shell_call` it answers (openai-python 3.41.0
+/// `types/responses/response_input_item_param.py`, `LocalShellCallOutput`).
 fn for_each_item_id(item: &mut Value, mut visit: impl FnMut(IdKind, &mut String)) {
+    let names_call_by_id =
+        item.get("type").and_then(Value::as_str) == Some("local_shell_call_output");
     let Value::Object(map) = item else {
         return;
     };
     for (field, value) in map.iter_mut() {
         match value {
             Value::String(s) => {
-                if let Some(kind) = item_field_kind(field) {
+                let kind = match field.as_str() {
+                    "id" if names_call_by_id => Some(IdKind::Call),
+                    field => item_field_kind(field),
+                };
+                if let Some(kind) = kind {
                     visit(kind, s);
                 }
             }
@@ -660,26 +669,284 @@ pub(crate) fn unseal_responses_input(
 /// `type` is optional and that has no role (openai-python
 /// `types/responses/response_input_item_param.py`, `ItemReference`: "`id`:
 /// The ID of the item to reference", `type: Optional[Literal["item_reference"]]`).
+/// A `reasoning` item with an `id` and no `encrypted_content` is one too:
+/// the upstream looks its reasoning up by that id ("Item with id 'rs_…' not
+/// found", see [`unseal_responses_input`]).
 fn is_item_reference(item: &Value) -> bool {
     match item.get("type") {
+        Some(Value::String(t)) if t == "reasoning" => {
+            item.get("id").is_some()
+                && item
+                    .get("encrypted_content")
+                    .is_none_or(|content| content.is_null())
+        }
         Some(Value::String(t)) => t == "item_reference",
         None | Some(Value::Null) => item.get("role").is_none() && item.get("id").is_some(),
         Some(_) => false,
     }
 }
 
-/// The top-level member a cloud platform adds to a relayed Messages answer:
-/// its own invocation metrics, named after the platform.
-pub(crate) const CHANNEL_METRICS_KEY: &str = "amazon-bedrock-invocationMetrics";
+/// The top-level member a cloud platform adds to a relayed answer: its own
+/// invocation metrics, named after the platform.
+const CHANNEL_METRICS_KEY: &str = "amazon-bedrock-invocationMetrics";
+
+// What platform mode keeps of an answer it holds parsed: the members and
+// usage counters the API's type definitions document. A member an upstream
+// adds beside them is the channel's own, and nothing a caller can rely on,
+// so it is left out. Every documented member is kept, even one only some
+// channels write (`inference_geo`, `service_tier`): it carries what a caller
+// may act on, and hiding the channel is best effort, never paid for with
+// what the caller gets. Only an answer already parsed is trimmed, buffered
+// or built by the gateway; a relayed stream frame goes out as the upstream
+// wrote it apart from its ids, model and invocation metrics, since trimming
+// it would cost a pass per frame. Telemetry has read the upstream's answer
+// before any of this runs.
+
+/// A Messages answer's top-level members, as anthropic-sdk-python 2.3.0
+/// documents them (`types/message.py`, `types/beta/beta_message.py`).
+fn message_member(key: &str) -> bool {
+    matches!(
+        key,
+        "id" | "type"
+            | "role"
+            | "content"
+            | "model"
+            | "stop_reason"
+            | "stop_sequence"
+            | "stop_details"
+            | "usage"
+            | "container"
+            | "context_management"
+            | "diagnostics"
+            | "input_transformations"
+    )
+}
+
+/// The usage counters of a Messages answer, as anthropic-sdk-python 2.3.0
+/// documents them (`types/usage.py`, `types/message_delta_usage.py`,
+/// `types/beta/beta_usage.py`, `types/beta/beta_message_delta_usage.py`).
+fn messages_usage_member(key: &str) -> bool {
+    matches!(
+        key,
+        "input_tokens"
+            | "output_tokens"
+            | "cache_creation_input_tokens"
+            | "cache_read_input_tokens"
+            | "cache_creation"
+            | "inference_geo"
+            | "output_tokens_details"
+            | "server_tool_use"
+            | "service_tier"
+            | "speed"
+            | "fallback_credit"
+            | "iterations"
+    )
+}
+
+/// `types/cache_creation.py`.
+fn cache_creation_member(key: &str) -> bool {
+    matches!(
+        key,
+        "ephemeral_5m_input_tokens" | "ephemeral_1h_input_tokens"
+    )
+}
+
+/// What platform mode keeps of a Messages answer.
+const MESSAGE_BODY: &[Retain<'static>] = &[
+    Retain {
+        path: &[],
+        keep: message_member,
+    },
+    Retain {
+        path: &["usage"],
+        keep: messages_usage_member,
+    },
+    Retain {
+        path: &["usage", "cache_creation"],
+        keep: cache_creation_member,
+    },
+];
+
+/// What platform mode keeps of each Messages stream event the gateway
+/// builds, by its `type`: the members the six events of
+/// `types/raw_message_stream_event.py` (and their beta twins) document, and
+/// `error`, which the SDK's stream reader reads (`_streaming.py`). `None`
+/// for a type the API does not document, which is left as it is.
+fn messages_event_shape(kind: &str) -> Option<&'static [Retain<'static>]> {
+    Some(match kind {
+        "message_start" => &[
+            Retain {
+                path: &[],
+                keep: |k| matches!(k, "type" | "message"),
+            },
+            Retain {
+                path: &["message"],
+                keep: message_member,
+            },
+            Retain {
+                path: &["message", "usage"],
+                keep: messages_usage_member,
+            },
+            Retain {
+                path: &["message", "usage", "cache_creation"],
+                keep: cache_creation_member,
+            },
+        ],
+        "message_delta" => &[
+            Retain {
+                path: &[],
+                keep: |k| {
+                    matches!(
+                        k,
+                        "type" | "delta" | "usage" | "context_management" | "input_transformations"
+                    )
+                },
+            },
+            Retain {
+                path: &["delta"],
+                keep: |k| {
+                    matches!(
+                        k,
+                        "stop_reason" | "stop_sequence" | "stop_details" | "container"
+                    )
+                },
+            },
+            Retain {
+                path: &["usage"],
+                keep: messages_usage_member,
+            },
+            Retain {
+                path: &["usage", "cache_creation"],
+                keep: cache_creation_member,
+            },
+        ],
+        "message_stop" => &[Retain {
+            path: &[],
+            keep: |k| k == "type",
+        }],
+        "content_block_start" => &[Retain {
+            path: &[],
+            keep: |k| matches!(k, "type" | "index" | "content_block"),
+        }],
+        "content_block_delta" => &[Retain {
+            path: &[],
+            keep: |k| matches!(k, "type" | "index" | "delta"),
+        }],
+        "content_block_stop" => &[Retain {
+            path: &[],
+            keep: |k| matches!(k, "type" | "index"),
+        }],
+        "error" => &[Retain {
+            path: &[],
+            keep: |k| matches!(k, "type" | "error"),
+        }],
+        _ => return None,
+    })
+}
+
+/// A Responses `Response` object's top-level members, as openai-python
+/// 3.41.0 documents them (`types/responses/response.py`).
+fn response_member(key: &str) -> bool {
+    matches!(
+        key,
+        "id" | "access_programs"
+            | "created_at"
+            | "error"
+            | "incomplete_details"
+            | "instructions"
+            | "metadata"
+            | "model"
+            | "object"
+            | "output"
+            | "parallel_tool_calls"
+            | "temperature"
+            | "tool_choice"
+            | "tools"
+            | "top_p"
+            | "background"
+            | "completed_at"
+            | "conversation"
+            | "max_output_tokens"
+            | "max_tool_calls"
+            | "moderation"
+            | "previous_response_id"
+            | "prompt"
+            | "prompt_cache_diagnostics"
+            | "prompt_cache_key"
+            | "prompt_cache_options"
+            | "prompt_cache_retention"
+            | "reasoning"
+            | "safety_identifier"
+            | "service_tier"
+            | "status"
+            | "text"
+            | "tool_usage"
+            | "top_logprobs"
+            | "truncation"
+            | "usage"
+            | "user"
+    )
+}
+
+/// `types/responses/response_usage.py`.
+fn responses_usage_member(key: &str) -> bool {
+    matches!(
+        key,
+        "input_tokens"
+            | "input_tokens_details"
+            | "output_tokens"
+            | "output_tokens_details"
+            | "total_tokens"
+    )
+}
+
+/// What platform mode keeps of a Response object.
+pub(crate) const RESPONSE_BODY: &[Retain<'static>] = &[
+    Retain {
+        path: &[],
+        keep: response_member,
+    },
+    Retain {
+        path: &["usage"],
+        keep: responses_usage_member,
+    },
+    Retain {
+        path: &["usage", "input_tokens_details"],
+        keep: |k| matches!(k, "cached_tokens" | "cache_write_tokens"),
+    },
+    Retain {
+        path: &["usage", "output_tokens_details"],
+        keep: |k| k == "reasoning_tokens",
+    },
+];
+
+/// `value` with every member `rules` refuses removed from the objects they
+/// name.
+pub(crate) fn retain_value(value: &mut Value, rules: &[Retain<'_>]) {
+    for rule in rules {
+        let mut node = Some(&mut *value);
+        for step in rule.path {
+            node = node.and_then(|n| n.get_mut(*step));
+        }
+        if let Some(Value::Object(map)) = node {
+            map.retain(|key, _| (rule.keep)(key));
+        }
+    }
+}
 
 /// `doc` without a top-level [`CHANNEL_METRICS_KEY`] member, byte-preserving;
 /// `None` when it has none or cannot be read, and the caller keeps `doc`.
+/// The member is looked for first, so a frame without it, which is almost
+/// every frame, costs one byte search.
 pub(crate) fn strip_channel_metrics(doc: &[u8]) -> Option<Vec<u8>> {
-    let key = CHANNEL_METRICS_KEY.as_bytes();
-    if !doc.windows(key.len()).any(|w| w == key) {
-        return None;
-    }
-    match json_splice::remove_top_level_member(doc, CHANNEL_METRICS_KEY) {
+    memchr::memmem::find(doc, CHANNEL_METRICS_KEY.as_bytes())?;
+    match json_splice::retain_members(
+        doc,
+        &[Retain {
+            path: &[],
+            keep: |k| k != CHANNEL_METRICS_KEY,
+        }],
+    ) {
         Ok(stripped) => stripped,
         Err(error) => {
             tracing::debug!(%error, "channel metrics removal skipped; forwarding verbatim");
@@ -757,6 +1024,15 @@ impl MessagesIds {
         }
     }
 
+    /// Whether platform mode relays a native stream's frame at all: not a
+    /// `ping`, which one channel sends and another does not, and not a frame
+    /// with no payload, such as a comment, which carries nothing for the
+    /// caller. `event` is the frame's payload as the relay already parsed it
+    /// for telemetry, `None` when it has none; every other frame is relayed.
+    pub(crate) fn relays_event(event: Option<&Value>) -> bool {
+        event.is_some_and(|e| e.get("type").and_then(Value::as_str) != Some("ping"))
+    }
+
     fn map_block(&self, block: &mut Value) {
         let ids = BlockIds::of(block.get("type").and_then(Value::as_str));
         let Some(map) = block.as_object_mut() else {
@@ -773,7 +1049,7 @@ impl MessagesIds {
     }
 
     /// A buffered Messages answer: its `id`, the tool-use ids of its blocks
-    /// ([`BlockIds`]), and no channel metrics.
+    /// ([`BlockIds`]), and only the members [`MESSAGE_BODY`] keeps.
     pub(crate) fn apply_to_body(&self, body: &mut Value) {
         if let Some(Value::String(id)) = body.get_mut("id") {
             id.clone_from(&self.message_id);
@@ -783,13 +1059,12 @@ impl MessagesIds {
                 self.map_block(block);
             }
         }
-        if let Some(map) = body.as_object_mut() {
-            map.remove(CHANNEL_METRICS_KEY);
-        }
+        retain_value(body, MESSAGE_BODY);
     }
 
-    /// One parsed stream event: `message_start.message.id` and the tool-use
-    /// ids of a `content_block_start`'s block.
+    /// One parsed stream event: `message_start.message.id`, the tool-use
+    /// ids of a `content_block_start`'s block, and only the members
+    /// [`messages_event_shape`] keeps of an event of its type.
     pub(crate) fn apply_to_event(&self, event: &mut Value) {
         if let Some(Value::String(id)) = event.pointer_mut("/message/id") {
             id.clone_from(&self.message_id);
@@ -797,15 +1072,20 @@ impl MessagesIds {
         if let Some(block) = event.get_mut("content_block") {
             self.map_block(block);
         }
-        if let Some(map) = event.as_object_mut() {
-            map.remove(CHANNEL_METRICS_KEY);
+        if let Some(shape) = event
+            .get("type")
+            .and_then(Value::as_str)
+            .and_then(messages_event_shape)
+        {
+            retain_value(event, shape);
         }
     }
 
     /// One relayed stream event's JSON, byte-preserving: the caller-facing
     /// `message.model` and the ids [`Self::apply_to_event`] rewrites, in one
-    /// splice pass, then any channel metrics. `None` when nothing changed or
-    /// the payload cannot be read, and the caller forwards it as it came.
+    /// splice pass, then any channel metrics. Its other members go out as
+    /// the upstream wrote them. `None` when nothing changed or the payload
+    /// cannot be read, and the caller forwards it as it came.
     pub(crate) fn rewrite_event_json(
         &self,
         payload: &[u8],
@@ -1421,6 +1701,70 @@ pub(crate) mod tests {
         assert_eq!(plain, json!({"model": "m", "input": "hi"}));
     }
 
+    /// A typed `reasoning` item with an `id` and no `encrypted_content` has
+    /// the upstream look the reasoning up by that id ("Item with id 'rs_…'
+    /// not found"), so it is a reference to a stored item like any other:
+    /// refused unless the id is the tenant's own seal. With its encrypted
+    /// content it carries itself and is not a reference.
+    #[test]
+    fn a_reasoning_item_named_only_by_its_id_is_a_reference() {
+        let platform = crate::platform::PlatformSettings::from_secret("s");
+        let k = seal_key(&platform.id_key);
+        let run = |input: Value| {
+            let mut body = json!({"model": "m", "input": input});
+            unseal_responses_input(&platform, T, &mut body)
+        };
+        assert_eq!(
+            run(json!([{"role": "user", "content": "hi"},
+                       {"type": "reasoning", "id": "rs_bdrk_1", "summary": []}])),
+            Some(1)
+        );
+        assert_eq!(
+            run(
+                json!([{"type": "reasoning", "id": seal_id(&k, "team-b", "rs_1"),
+                        "summary": [{"type": "summary_text", "text": "why"}]}])
+            ),
+            Some(0)
+        );
+        assert_eq!(
+            run(json!([{"type": "reasoning", "id": seal_id(&k, T, "rs_1"), "summary": []}])),
+            None
+        );
+        assert_eq!(
+            run(json!([{"type": "reasoning", "id": "rs_1", "summary": [],
+                        "encrypted_content": "gAAAA"}])),
+            None
+        );
+        assert_eq!(run(json!([{"type": "reasoning", "summary": []}])), None);
+    }
+
+    /// A `local_shell_call_output` names the call it answers by `id`: the
+    /// call id the answer's `local_shell_call` carried as `call_id`
+    /// (openai-python 3.41.0 `types/responses/response_input_item_param.py`,
+    /// `LocalShellCallOutput`, which has no `call_id`). It is a call seal,
+    /// and opens as one; every other item's `id` is an item seal.
+    #[test]
+    fn a_local_shell_call_output_id_opens_as_the_call_it_answers() {
+        let platform = crate::platform::PlatformSettings::from_secret("s");
+        let k = seal_key(&platform.id_key);
+        let call = seal_call(&k, T, "call_up_1");
+        let mut body = json!({"input": [
+            {"type": "local_shell_call", "id": seal_id(&k, T, "lsh_up_1"), "call_id": call,
+             "action": {"type": "exec", "command": ["ls"], "env": {}}, "status": "completed"},
+            {"type": "local_shell_call_output", "id": call, "output": "a.txt"},
+        ]});
+        unseal_responses_input(&platform, T, &mut body);
+        assert_eq!(body["input"][0]["id"], "lsh_up_1");
+        assert_eq!(body["input"][0]["call_id"], "call_up_1");
+        assert_eq!(body["input"][1]["id"], "call_up_1");
+        // An item seal in that slot is not the call's, and stays as sent.
+        let item = seal_id(&k, T, "call_up_1");
+        let mut body = json!({"input": [
+            {"type": "local_shell_call_output", "id": item.clone(), "output": "a.txt"}]});
+        unseal_responses_input(&platform, T, &mut body);
+        assert_eq!(body["input"][0]["id"], item);
+    }
+
     /// A stream names one item on every delta: the sealer seals it once and
     /// hands back the same value, and a different id is sealed afresh.
     #[test]
@@ -1802,6 +2146,106 @@ pub(crate) mod tests {
             block["content_block"]["id"],
             map_tool_call_id(&mac(&K), Surface::Messages, "call_up_1")
         );
+    }
+
+    /// A Messages answer the gateway holds parsed keeps every member and
+    /// usage counter the API documents, those only some channels write
+    /// included, and loses what the API does not document. A relayed stream
+    /// frame keeps what its upstream wrote, less the invocation metrics.
+    #[test]
+    fn a_parsed_messages_answer_keeps_what_the_api_documents() {
+        let ids = MessagesIds::new(&mac(&K));
+        let documented_usage = json!({
+            "input_tokens": 3, "output_tokens": 1,
+            "cache_creation_input_tokens": 2, "cache_read_input_tokens": 4,
+            "cache_creation": {"ephemeral_5m_input_tokens": 2, "ephemeral_1h_input_tokens": 0},
+            "service_tier": "standard", "inference_geo": "us", "speed": "standard",
+            "server_tool_use": {"web_search_requests": 1},
+            "output_tokens_details": {"thinking_tokens": 1},
+        });
+        let mut usage = documented_usage.clone();
+        usage["channel_queue_ms"] = json!(12);
+        usage["cache_creation"]["ephemeral_2h_input_tokens"] = json!(9);
+        let mut body = json!({
+            "id": "msg_1", "type": "message", "role": "assistant", "model": "alias",
+            "content": [{"type": "text", "text": "hi"}],
+            "stop_reason": "end_turn", "stop_sequence": null,
+            "stop_details": null, "context_management": {"applied_edits": []},
+            "usage": usage,
+            "container": {"id": "container_1", "expires_at": "2026-01-01T00:00:00Z"},
+            "diagnostics": {"cache_miss_reason": null},
+            "channel_latency_ms": 12,
+        });
+        ids.apply_to_body(&mut body);
+        let mut members: Vec<&str> = body
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        members.sort_unstable();
+        assert_eq!(
+            members,
+            [
+                "container",
+                "content",
+                "context_management",
+                "diagnostics",
+                "id",
+                "model",
+                "role",
+                "stop_details",
+                "stop_reason",
+                "stop_sequence",
+                "type",
+                "usage"
+            ]
+        );
+        assert_eq!(body["usage"], documented_usage);
+
+        // An event the gateway builds is trimmed the same way.
+        let mut delta = json!({"type": "message_delta", "region": "us-east-1",
+            "delta": {"stop_reason": "end_turn", "stop_sequence": null, "x": 1},
+            "usage": {"output_tokens": 5, "channel_queue_ms": 1}});
+        ids.apply_to_event(&mut delta);
+        assert_eq!(
+            delta,
+            json!({"type": "message_delta", "delta": {"stop_reason": "end_turn",
+                   "stop_sequence": null}, "usage": {"output_tokens": 5}})
+        );
+
+        // A relayed frame is not trimmed: that would cost a pass per frame.
+        let block_delta = br#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"},"p":"x"}"#;
+        assert_eq!(ids.rewrite_event_json(block_delta, "alias"), None);
+        let stop = br#"{"type":"message_stop","p":"x","amazon-bedrock-invocationMetrics":{"n":1}}"#;
+        assert_eq!(
+            ids.rewrite_event_json(stop, "alias").as_deref(),
+            Some(&br#"{"type":"message_stop","p":"x"}"#[..])
+        );
+    }
+
+    /// A native stream relays every frame but a `ping` and one with no
+    /// payload, a frame of a type the API does not document included.
+    #[test]
+    fn a_native_stream_relays_every_frame_but_a_ping_and_a_comment() {
+        for kind in [
+            "message_start",
+            "message_delta",
+            "message_stop",
+            "content_block_start",
+            "content_block_delta",
+            "content_block_stop",
+            "error",
+            "channel_status",
+        ] {
+            assert!(
+                MessagesIds::relays_event(Some(&json!({"type": kind}))),
+                "{kind}"
+            );
+        }
+        assert!(MessagesIds::relays_event(Some(&json!({"no_type": 1}))));
+        assert!(!MessagesIds::relays_event(Some(&json!({"type": "ping"}))));
+        assert!(!MessagesIds::relays_event(None));
     }
 
     #[test]

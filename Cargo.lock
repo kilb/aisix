@@ -492,6 +492,7 @@ dependencies = [
  "ipnet",
  "jsonwebtoken",
  "lofty",
+ "memchr",
  "percent-encoding",
  "rand 0.8.7",
  "regex",
