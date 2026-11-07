@@ -1307,11 +1307,13 @@ async fn dispatch(
             let mark = affinity
                 .response_mark(&target.id, is_routing_request)
                 .sealing_ids(state.platform(), &owner);
-            let result = if crate::dispatch::serves_natively(
+            let native = crate::dispatch::serves_natively(
                 snapshot,
                 &target.model,
                 aisix_core::ApiSurface::Responses,
-            ) {
+            );
+            crate::attribution::note_translated_dispatch(!native);
+            let result = if native {
                 responses_to_target(
                     state,
                     snapshot,

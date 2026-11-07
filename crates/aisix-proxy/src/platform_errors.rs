@@ -303,13 +303,18 @@ fn classify_upstream(
         }
     }
     // Only what has the shape of a field name of the caller's request:
-    // anything else is the upstream's own text.
+    // anything else is the upstream's own text. And only from a native
+    // dispatch: after a translation it names a field of the request the
+    // gateway built, in the upstream's protocol, which tells the caller what
+    // that protocol is.
     let param = || {
-        view.and_then(|v| v.param.clone()).filter(|p| {
-            p.len() <= 256
-                && p.bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b"_.[]".contains(&b))
-        })
+        view.and_then(|v| v.param.clone())
+            .filter(|_| !crate::attribution::translated_dispatch())
+            .filter(|p| {
+                p.len() <= 256
+                    && p.bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b"_.[]".contains(&b))
+            })
     };
     match status {
         Some(429) => PlatformErrorClass::RateLimited,
@@ -696,6 +701,30 @@ mod tests {
                 "{unshaped}"
             );
         }
+    }
+
+    /// The upstream's `param` names a field of the request the upstream
+    /// received. After a translation that is not the caller's request, so
+    /// the class keeps it only when the attempt was dispatched natively.
+    #[test]
+    fn a_param_is_kept_only_from_a_native_dispatch() {
+        let err = upstream_status_with_param(400, "bad", "messages[1].content");
+        let class = |translated: bool| {
+            in_platform_mode(|| {
+                crate::attribution::note_translated_dispatch(translated);
+                caller_class(&err)
+            })
+        };
+        assert_eq!(
+            class(false),
+            Some(PlatformErrorClass::InvalidRequest {
+                param: Some("messages[1].content".into())
+            })
+        );
+        assert_eq!(
+            class(true),
+            Some(PlatformErrorClass::InvalidRequest { param: None })
+        );
     }
 
     #[test]

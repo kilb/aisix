@@ -788,6 +788,9 @@ pub(crate) struct RequestAttribution {
     /// of its response body, which is where every error a caller receives is
     /// rendered, streamed frames included.
     platform: bool,
+    /// Whether the request's latest attempt reached an upstream of another
+    /// protocol through a translation ([`note_translated_dispatch`]).
+    translated: std::sync::atomic::AtomicBool,
 }
 
 impl RequestAttribution {
@@ -801,6 +804,7 @@ impl RequestAttribution {
             gateway_embedding_ledger: Arc::clone(&self.gateway_embedding_ledger),
             response_tap: Arc::default(),
             platform: self.platform,
+            translated: std::sync::atomic::AtomicBool::default(),
         }
     }
 
@@ -1187,6 +1191,25 @@ pub(crate) fn current() -> Option<Resolved> {
 /// outside a request scope.
 pub(crate) fn platform_mode() -> bool {
     CURRENT.try_with(|a| a.platform).unwrap_or(false)
+}
+
+/// Record whether the attempt about to be dispatched reaches an upstream of
+/// another protocol than the request's, through a translation. Each attempt
+/// records it before it calls the upstream, so the flag describes the one
+/// whose failure the caller is answered with.
+pub(crate) fn note_translated_dispatch(translated: bool) {
+    let _ = CURRENT.try_with(|a| {
+        a.translated
+            .store(translated, std::sync::atomic::Ordering::Relaxed)
+    });
+}
+
+/// Whether the request's latest attempt went through a translation
+/// ([`note_translated_dispatch`]). `false` outside a request scope.
+pub(crate) fn translated_dispatch() -> bool {
+    CURRENT
+        .try_with(|a| a.translated.load(std::sync::atomic::Ordering::Relaxed))
+        .unwrap_or(false)
 }
 
 /// Record one actual gateway-initiated embedding bridge call. This is safe

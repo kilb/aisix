@@ -1400,6 +1400,7 @@ async fn dispatch_to_target(
         std::borrow::Cow::Borrowed(_) => body,
     };
     let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
+    crate::attribution::note_translated_dispatch(!speaks_anthropic);
 
     if !speaks_anthropic {
         return cross_provider_dispatch(
