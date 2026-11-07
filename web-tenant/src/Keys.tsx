@@ -165,7 +165,7 @@ export function Keys({
           </div>
         )}
         {items === null ? (
-          !listErr && <p className="hint">读取中…</p>
+          !listErr && <p className="hint">载入中…</p>
         ) : items.length === 0 ? (
           <p className="hint">还没有密钥。</p>
         ) : (
@@ -258,7 +258,7 @@ function limit(raw: string): { value?: number; problem?: string } {
 }
 
 function capHint(cap: number | undefined, caps: Caps | null): string {
-  if (caps === null) return "组织上限读取中…";
+  if (caps === null) return "组织上限载入中…";
   return cap === undefined ? "组织未设上限；留空表示不限" : `组织上限 ${cap}；留空则按此上限`;
 }
 
@@ -390,7 +390,7 @@ function NewKeyForm({
         <fieldset className="f" aria-describedby={describedBy("models", true)} aria-invalid={invalid("models")}>
           <legend>可用模型</legend>
           {catalog === null ? (
-            <span className="hint">读取中…</span>
+            <span className="hint">载入中…</span>
           ) : catalog.length === 0 ? (
             <span className="hint">组织还没有获授权的模型</span>
           ) : (

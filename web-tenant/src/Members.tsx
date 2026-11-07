@@ -152,7 +152,7 @@ export function Members({
           </div>
         )}
         {people === null ? (
-          !listErr && <p className="hint">读取中…</p>
+          !listErr && <p className="hint">载入中…</p>
         ) : (
           <div className="scroll">
             <table>
@@ -249,7 +249,7 @@ export function Members({
             </div>
           )}
           {invites === null ? (
-            !invitesErr && <p className="hint">读取中…</p>
+            !invitesErr && <p className="hint">载入中…</p>
           ) : invites.length === 0 ? (
             <p className="hint">没有待接受的邀请。</p>
           ) : (
