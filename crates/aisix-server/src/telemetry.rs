@@ -363,8 +363,10 @@ async fn run(
             maybe_event = rx.recv() => {
                 match maybe_event {
                     Some(event) => {
-                        metrics.usage_delivery().note_waiting();
-                        buffer.push(event, &metrics);
+                        // An event dropped as too large waits for nothing.
+                        if buffer.push(event, &metrics) {
+                            metrics.usage_delivery().note_waiting();
+                        }
                         if buffer.holds_a_full_batch() {
                             flush(&client, &cfg, &metrics, &mut state, &mut buffer, &mut rx, Retry::Allowed, cancel).await;
                         }
@@ -643,11 +645,15 @@ struct Parked {
 }
 
 impl Buffer {
-    fn push(&mut self, event: UsageEvent, metrics: &Metrics) {
-        if let Some(prepared) = Prepared::new(event, metrics) {
-            self.bytes += prepared.json.len();
-            self.events.push_back(prepared);
-        }
+    /// Queue `event` for its batch. `false` when it was too large to travel
+    /// and was dropped instead ([`Prepared::new`]).
+    fn push(&mut self, event: UsageEvent, metrics: &Metrics) -> bool {
+        let Some(prepared) = Prepared::new(event, metrics) else {
+            return false;
+        };
+        self.bytes += prepared.json.len();
+        self.events.push_back(prepared);
+        true
     }
 
     fn is_empty(&self) -> bool {
@@ -705,7 +711,9 @@ fn fill_ready_batch(
 ) {
     while !buffer.holds_a_full_batch() {
         match rx.try_recv() {
-            Ok(event) => buffer.push(event, metrics),
+            Ok(event) => {
+                buffer.push(event, metrics);
+            }
             Err(_) => break,
         }
     }
@@ -2430,6 +2438,39 @@ mod tests {
             "{rendered}"
         );
         assert_eq!(drops_with_reason(&metrics, DROP_SEND_FAILED), 0);
+    }
+
+    /// An event dropped as too large to travel leaves nothing waiting to be
+    /// delivered: with nothing else queued, delivery is not marked as
+    /// waiting, or a budget in strict mode would start refusing an idle
+    /// gateway once the grace period passed.
+    #[tokio::test]
+    async fn an_event_dropped_as_too_large_leaves_nothing_waiting() {
+        let (server, _batches, _sizes) = sizing_server().await;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(format!("{}/dp/telemetry", server.uri()), &dir);
+        let metrics = Metrics::new(false);
+        let (tx, rx) = tokio::sync::mpsc::channel(BACKLOG_QUEUE);
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        tokio::time::pause();
+        let mut sender = Box::pin(run(cfg, metrics.clone(), rx, &mut cancel_rx));
+        assert!(poll_sender(sender.as_mut()).await.is_pending());
+        let mut event = sample_event("too-large");
+        event.requested_model = "m".repeat(300 * 1024);
+        tx.try_send(event).unwrap();
+        drive_until(
+            sender.as_mut(),
+            STEP_WHILE_SERVING,
+            || drops_with_reason(&metrics, "oversized") == 1,
+            "the event was never dropped",
+        )
+        .await;
+        tokio::time::advance(FLUSH_INTERVAL).await;
+        assert!(poll_sender(sender.as_mut()).await.is_pending());
+        assert!(
+            !metrics.usage_delivery().is_waiting(),
+            "delivery waits for an event that was dropped"
+        );
     }
 
     /// A batch this worker gives up on is gone — there is no retry — so the
