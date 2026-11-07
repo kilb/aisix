@@ -10,6 +10,7 @@ import {
   type IssuedCredential,
 } from "../lib/api";
 import { messageFor } from "../lib/errors";
+import { TwoStep } from "./Tenants";
 
 /** How often the instances are read again: about one gateway heartbeat. */
 const REFRESH_MS = 5_000;
@@ -81,9 +82,6 @@ export function Gateways({ operator }: TabProps) {
   }, [readCredentials]);
 
   async function revoke(c: Credential) {
-    if (!confirm(`确认吊销网关凭据「${c.name}」？使用这份凭据的网关将被控制面拒绝连接，且无法恢复。`)) {
-      return;
-    }
     setBusy(true);
     setNote(null);
     try {
@@ -192,9 +190,12 @@ export function Gateways({ operator }: TabProps) {
                   <span className="pill">未吊销</span>
                 )}
                 {isAdmin && !c.revoked_at && (
-                  <button className="ghost" disabled={busy} onClick={() => void revoke(c)}>
-                    吊销
-                  </button>
+                  <TwoStep
+                    label="吊销"
+                    disabled={busy}
+                    warning={`吊销网关凭据「${c.name}」后，使用这份凭据的网关将被控制面拒绝连接，且无法恢复。`}
+                    onConfirm={() => void revoke(c)}
+                  />
                 )}
               </li>
             ))}

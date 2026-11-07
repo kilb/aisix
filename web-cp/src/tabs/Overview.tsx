@@ -4,6 +4,7 @@ import { Msg, type Note } from "../components/Msg";
 import { ApiError, environment, rollout, type Environment, type RolloutSummary } from "../lib/api";
 import { messageFor } from "../lib/errors";
 import { fmtInt } from "../lib/fmt";
+import { TwoStep } from "./Tenants";
 
 /** How often the summary is read again: about one gateway heartbeat. */
 const REFRESH_MS = 5_000;
@@ -71,7 +72,6 @@ export function Overview({ operator, onGoto }: TabProps) {
   }, [readSummary]);
 
   async function allowDeletes() {
-    if (!confirm("确认删除 kine 中所有控制面不认识的键？删除后无法恢复。")) return;
     setBusy(true);
     setNote(null);
     try {
@@ -85,12 +85,7 @@ export function Overview({ operator, onGoto }: TabProps) {
     }
   }
 
-  async function takeOver(owner: string, mine: string) {
-    const ok = confirm(
-      `确认把该环境从数据库 ${owner} 接管到本控制面的数据库 ${mine}？` +
-        "请先停止旧控制面的所有实例。此操作会记入审计日志。",
-    );
-    if (!ok) return;
+  async function takeOver(owner: string) {
     setBusy(true);
     setNote(null);
     try {
@@ -152,13 +147,15 @@ export function Overview({ operator, onGoto }: TabProps) {
             </p>
             {isAdmin &&
               (blocked.owner_database_id ? (
-                <button
-                  className="ghost"
+                <TwoStep
+                  label="接管该环境"
                   disabled={busy}
-                  onClick={() => void takeOver(blocked.owner_database_id!, blocked.database_id)}
-                >
-                  接管该环境
-                </button>
+                  warning={
+                    `将把该环境从数据库 ${blocked.owner_database_id} 接管到本控制面的数据库 ${blocked.database_id}。` +
+                    "请先停止旧控制面的所有实例。此操作会记入审计日志。"
+                  }
+                  onConfirm={() => void takeOver(blocked.owner_database_id!)}
+                />
               ) : (
                 <p className="hint">kine 中没有记录持有该环境的数据库，暂时无法接管。</p>
               ))}
@@ -181,11 +178,14 @@ export function Overview({ operator, onGoto }: TabProps) {
           <div className="note crit">
             <strong>kine 中有大量控制面不认识的键，已暂停删除</strong>
             {isAdmin && (
-              <p>
-                <button className="ghost" disabled={busy} onClick={() => void allowDeletes()}>
-                  允许清理
-                </button>
-              </p>
+              <div>
+                <TwoStep
+                  label="允许清理"
+                  disabled={busy}
+                  warning="将删除 kine 中所有控制面不认识的键，删除后无法恢复。"
+                  onConfirm={() => void allowDeletes()}
+                />
+              </div>
             )}
           </div>
         )}

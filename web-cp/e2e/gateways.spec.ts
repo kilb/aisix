@@ -126,19 +126,17 @@ test("吊销后凭据显示为已吊销", async ({ page }) => {
   await expect(item).toBeVisible();
   await expect(item).not.toContainText("已吊销");
 
-  // Declining the confirmation revokes nothing.
-  let asked = "";
-  page.once("dialog", (d) => {
-    asked = d.message();
-    void d.dismiss();
-  });
+  // The first click only asks, naming the credential; 取消 revokes nothing.
   await item.getByRole("button", { name: "吊销" }).click();
-  await expect.poll(() => asked).toContain("gw-revoke-e2e");
+  await expect(item.getByRole("button", { name: "确认吊销" })).toBeVisible();
+  await expect(item.getByRole("alert")).toContainText("gw-revoke-e2e");
+  await item.getByRole("button", { name: "取消" }).click();
+  await expect(item.getByRole("button", { name: "确认吊销" })).toHaveCount(0);
   expect((await credentialOf("gw-revoke-e2e")).revoked_at).toBeNull();
   await expect(item).not.toContainText("已吊销");
 
-  page.once("dialog", (d) => void d.accept());
   await item.getByRole("button", { name: "吊销" }).click();
+  await item.getByRole("button", { name: "确认吊销" }).click();
   await expect(item).toContainText("已吊销");
   expect((await credentialOf("gw-revoke-e2e")).revoked_at).not.toBeNull();
   // The control plane's record, not the page's memory.

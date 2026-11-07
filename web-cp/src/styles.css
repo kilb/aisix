@@ -482,6 +482,9 @@ tr:hover td button.ghost{border-color:var(--rule-2);color:var(--oxide)}
 .creds li:last-child{border-bottom:0}
 .creds code{font-family:var(--mono);font-size:12px;color:var(--ink-3)}
 .creds button.ghost{margin-left:auto;padding:4px 10px}
+/* A revoke awaiting its confirmation: the warning on its own line, the pair at the end. */
+.creds li > .note{flex-basis:100%;margin:0}
+.creds .tn-actions{margin-left:auto}
 
 /* The one-time deployment bundle. */
 .bundle h3{font-size:13px;margin:14px 0 6px}
