@@ -579,7 +579,7 @@ These surfaces are not adapted. Until each is, a platform deployment must not le
 
 On the tenant endpoints themselves:
 
-- Paths that fail open forward an upstream's ids as sent rather than corrupt the frame: a frame the JSON splice cannot rewrite. An oversized unterminated frame ends a native stream on a decode failure instead.
+- Paths that fail open forward an upstream's ids as sent rather than corrupt the frame: a frame the JSON splice cannot rewrite, or an oversized unterminated one.
 - An operator's `param_renames` runs after the stored-object check, so it could map a caller's field onto a refused one.
 - Skills are refused by type `custom`. An allow-list of type `anthropic` would be stricter.
 - A bare-string `audio.voice` that names a custom voice is not refused; the object form is.
