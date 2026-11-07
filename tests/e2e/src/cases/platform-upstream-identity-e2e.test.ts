@@ -633,8 +633,13 @@ describe("platform mode e2e: ids a tenant is handed, and tool use still round-tr
     up.messagesServerTool = await startOpenAiUpstream({ scriptedResponses: serverToolScript() });
     offUp.chatOpenAi = await startOpenAiUpstream({ scriptedResponses: chatScript() });
     offUp.chatAnthropic = await startOpenAiUpstream({ scriptedResponses: anthropicScript() });
-    offUp.messagesNative = await startOpenAiUpstream({ scriptedResponses: anthropicScript() });
-    offUp.messagesTranslated = await startOpenAiUpstream({ scriptedResponses: chatScript() });
+    // The Messages routes ask the platform-off gateway for the stream twice.
+    offUp.messagesNative = await startOpenAiUpstream({
+      scriptedResponses: [...anthropicScript(), { rawStreamFrames: anthropicStream() }],
+    });
+    offUp.messagesTranslated = await startOpenAiUpstream({
+      scriptedResponses: [...chatScript(), { streamEvents: openAiChatStream() }],
+    });
     offUp.messagesServerTool = await startOpenAiUpstream({ scriptedResponses: serverToolScript() });
 
     app = await spawnApp({
@@ -807,7 +812,26 @@ describe("platform mode e2e: ids a tenant is handed, and tool use still round-tr
       expect(upstreamBody(upstream, 1)).toEqual(upstreamBody(offUp[route]!, 1));
 
       const streamed = await postBoth("/v1/messages", messagesTurn(alias, undefined, true));
-      expect(messagesStreamAllIds(streamed.on.text)).toEqual(messagesStreamAllIds(streamed.off.text));
+      // An id the gateway mints for each response differs between two
+      // requests, so its value cannot be compared across the two gateways.
+      // Ask the platform-off gateway once more: an id it hands out both times
+      // must be handed out unchanged with platform mode on, and an id it
+      // mints anew each time must come in the same form.
+      const offAgain = await postTo(offApp!, "/v1/messages", messagesTurn(alias, undefined, true));
+      expect(offAgain.status, offAgain.text).toBe(200);
+      const onIds = messagesStreamAllIds(streamed.on.text);
+      const offIds = messagesStreamAllIds(streamed.off.text);
+      const offAgainIds = messagesStreamAllIds(offAgain.text);
+      expect(offAgainIds).toHaveLength(offIds.length);
+      expect(onIds).toHaveLength(offIds.length);
+      const form = (id: string) => [id.replace(/[0-9a-f]+$/i, ""), id.length];
+      offIds.forEach((offId, i) => {
+        if (offId === offAgainIds[i]) {
+          expect(onIds[i], `stream id #${i}, the same every time with platform mode off`).toBe(offId);
+        } else {
+          expect(form(onIds[i]), `stream id #${i}, minted per response`).toEqual(form(offId));
+        }
+      });
       expect(messagesStreamIds(streamed.on.text).toolUseId).toBe(UPSTREAM_TOOL_USE_ID);
       if (route === "messagesNative") {
         // Relayed frame for frame as platform mode off relays them.
