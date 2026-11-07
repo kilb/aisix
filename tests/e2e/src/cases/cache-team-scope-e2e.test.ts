@@ -146,6 +146,7 @@ async function seedTeamScope(
   etcd: EtcdClient,
   app: SpawnedApp,
   upstream: OpenAiUpstream,
+  scope: "team" | "env" = "team",
 ): Promise<void> {
   const seed = new SeedClient(etcd, app.etcdPrefix);
   const anthropicPk = await seed.createProviderKey({
@@ -190,7 +191,7 @@ async function seedTeamScope(
     backend: "memory",
     ttl_seconds: 300,
     applies_to: "all",
-    scope: "team",
+    scope,
   });
 
   // The caller keys come last, so the gate below on the last of them
@@ -398,5 +399,84 @@ describe("cache team scope in platform mode e2e", () => {
       failures,
       `under a team-scoped cache policy in platform mode:\n${failures.map((f) => `  ${f}`).join("\n")}`,
     ).toEqual([]);
+  });
+
+  test("another tenant is not served the team's entry", async (ctx) => {
+    if (!etcdReachable || !app) {
+      ctx.skip();
+      return;
+    }
+    const failures: string[] = [];
+    for (const { endpoint, model, body } of CASES) {
+      const request = body(`kept within one tenant in platform mode via ${endpoint}`);
+      const before = upstreamCalls(endpoint);
+      const first = await post(app, KEYS.tenantOneFirst, endpoint, model, request);
+      expect(first.status, `${endpoint}: tenant one`).toBe(200);
+      const other = await post(app, KEYS.tenantTwo, endpoint, model, request);
+      expect(other.status, `${endpoint}: tenant two`).toBe(200);
+      const calls = upstreamCalls(endpoint) - before;
+      if (calls !== 2) {
+        failures.push(
+          `${endpoint}: tenant two was served tenant one's entry (upstream calls +${calls}, want 2)`,
+        );
+      }
+    }
+    expect(failures, failures.join("\n")).toEqual([]);
+  });
+});
+
+// Every tenant of a platform deployment is in its one environment, so an
+// `env`-scoped policy there would replay one tenant's answers to another. In
+// platform mode it shares no further than a team: a teammate is served the
+// entry, another tenant is not.
+describe("an env-scoped cache in platform mode e2e", () => {
+  const PLATFORM_SECRET_ENV = "P0_E2E_PLATFORM_ID_KEY";
+  let upstream: OpenAiUpstream | undefined;
+  let app: SpawnedApp | undefined;
+  let etcdReachable = false;
+
+  const upstreamCalls = (endpoint: string) =>
+    upstream!.receivedRequests.filter((r) => r.path.endsWith(endpoint)).length;
+
+  beforeAll(async () => {
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
+    if (!etcdReachable) return;
+    upstream = await startOpenAiUpstream({ pathBodies: pathBodies() });
+    app = await spawnApp({
+      extraEnv: {
+        AISIX_PROXY__PLATFORM__ENABLED: "true",
+        AISIX_PROXY__PLATFORM__ID_KEY_ENV: PLATFORM_SECRET_ENV,
+        [PLATFORM_SECRET_ENV]: "cache-env-scope-e2e-platform-secret-0123456789",
+      },
+    });
+    await seedTeamScope(etcd, app, upstream, "env");
+  });
+
+  afterAll(async () => {
+    await app?.exit();
+    await upstream?.close();
+  });
+
+  test("a teammate is served the entry, another tenant is not", async (ctx) => {
+    if (!etcdReachable || !app) {
+      ctx.skip();
+      return;
+    }
+    const failures: string[] = [];
+    for (const { endpoint, model, body } of CASES) {
+      const request = body(`env scope in platform mode via ${endpoint}`);
+      const before = upstreamCalls(endpoint);
+      for (const key of [KEYS.tenantOneFirst, KEYS.tenantOneSecond, KEYS.tenantTwo]) {
+        const answer = await post(app, key, endpoint, model, request);
+        expect(answer.status, `${endpoint}: ${key}`).toBe(200);
+      }
+      // One call for tenant one's two keys, and one for tenant two.
+      const calls = upstreamCalls(endpoint) - before;
+      if (calls !== 2) {
+        failures.push(`${endpoint}: upstream calls +${calls}, want 2 (one per tenant)`);
+      }
+    }
+    expect(failures, failures.join("\n")).toEqual([]);
   });
 });
