@@ -66,12 +66,8 @@ const STAFF_TABS = ADMIN_TABS.filter((t) => t !== "operators");
 /**
  * Each tab's edit controls, by `data-tab`. The tab bar must hold exactly
  * `expected`: a tab that goes missing fails here instead of slipping out
- * of the checks.
- *
- * TODO(Task 11): on p1b-t8 the gateways, providers, models, tenants and
- * keys tabs are still placeholders, so the role checks pass on them
- * trivially. Once the lanes are merged, make this strict: require that
- * each of them renders its real page before its controls are counted.
+ * of the checks. Every tab must show its real page, never the placeholder
+ * of a page not built yet, so the controls counted are the page's own.
  */
 async function editControlsByTab(page: Page, expected: string[]): Promise<Record<string, string[]>> {
   const tabs = await page.locator("[data-tab]").evaluateAll((els) => els.map((e) => e.getAttribute("data-tab") ?? ""));
@@ -79,6 +75,7 @@ async function editControlsByTab(page: Page, expected: string[]): Promise<Record
   const out: Record<string, string[]> = {};
   for (const tab of tabs) {
     await openTab(page, tab);
+    await expect(page.locator("main").getByText("此页尚未开放"), `${tab} shows its real page`).toHaveCount(0);
     out[tab] = (await pageButtons(page)).filter((n) => EDIT_CONTROL.test(n));
   }
   return out;
@@ -165,6 +162,11 @@ test("只读运维看不到任何编辑入口，从页面直接发写请求被�
   await loginAsAdmin(page);
   // The check finds edit controls where an admin has them.
   const adminControls = await editControlsByTab(page, ADMIN_TABS);
+  expect(adminControls.gateways).toEqual(expect.arrayContaining(["签发网关凭据", "吊销"]));
+  expect(adminControls.providers).toContain("新增上游账号");
+  expect(adminControls.models).toContain("新增直连模型");
+  expect(adminControls.tenants).toContain("新租户默认值");
+  expect(adminControls.keys).toContain("新建密钥");
   expect(adminControls.cache).toContain("新建缓存策略");
   expect(adminControls.resources).toContain("新建");
   expect(adminControls.operators).toContain("新建运维账号");
@@ -237,7 +239,10 @@ test("运维角色看不到运维账号、网关凭据与清理入口，越权�
     const adminOnly = names.filter((n) => ADMIN_ONLY.test(n) || (ADMIN_ONLY_ON[tab]?.test(n) ?? false));
     expect(adminOnly, `admin-only controls on ${tab}`).toEqual([]);
   }
-  // An operator does write gateway resources.
+  // An operator does write gateway resources, and manages tenants' keys.
+  expect(controls.providers).toContain("新增上游账号");
+  expect(controls.models).toContain("新增直连模型");
+  expect(controls.keys).toContain("新建密钥");
   expect(controls.resources).toContain("新建");
   expect(controls.cache).toContain("新建缓存策略");
 
