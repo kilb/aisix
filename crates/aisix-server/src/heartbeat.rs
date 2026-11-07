@@ -55,6 +55,13 @@ pub type RejectionFetcher = Arc<dyn Fn() -> Vec<ConfigRejectionSnapshot> + Send 
 /// supervisor has not completed its first load yet.
 pub type AppliedRevisionFetcher = Arc<dyn Fn() -> i64 + Send + Sync>;
 
+/// Brings what the rejection fetcher reports up to the configuration
+/// published now: the guardrail index, whose build records the rows it
+/// cannot build, is built for the current snapshot. Called on a blocking
+/// thread, after the applied revision is read and before the rejections
+/// are, so a beat never pairs a revision with rejections older than it.
+pub type RejectionSettler = Arc<dyn Fn() + Send + Sync>;
+
 /// Per-tick source of the observability exporters' delivery counters,
 /// keyed by exporter name (`OtlpHttpFanOut::exporter_stats`). Reported
 /// as `exporter_health` so the control plane can surface silently-failing
@@ -144,6 +151,10 @@ pub struct HeartbeatConfig {
     /// `None` (tests / no supervisor) reports `applied_revision: 0`,
     /// the same value as "not yet loaded". See #519 B.3.
     pub applied_revision_fetcher: Option<AppliedRevisionFetcher>,
+    /// Optional step that brings the rejections up to the published
+    /// configuration before they are read. `None` (tests / no guardrail
+    /// index) reads them as they stand.
+    pub rejection_settler: Option<RejectionSettler>,
     /// Optional source of per-exporter delivery counters. `None`
     /// reports an empty `exporter_health` array. See #519 D.2.
     pub exporter_health_fetcher: Option<ExporterHealthFetcher>,
@@ -174,6 +185,10 @@ impl std::fmt::Debug for HeartbeatConfig {
             .field(
                 "applied_revision_fetcher",
                 &self.applied_revision_fetcher.as_ref().map(|_| "<fn>"),
+            )
+            .field(
+                "rejection_settler",
+                &self.rejection_settler.as_ref().map(|_| "<fn>"),
             )
             .field(
                 "exporter_health_fetcher",
@@ -212,6 +227,7 @@ impl HeartbeatConfig {
             mtls,
             rejection_fetcher: None,
             applied_revision_fetcher: None,
+            rejection_settler: None,
             exporter_health_fetcher: None,
             config_hash_fetcher: None,
             partial_compat_fetcher: None,
@@ -228,6 +244,13 @@ impl HeartbeatConfig {
     /// Wire the supervisor's applied-revision source (#519 B.3).
     pub fn with_applied_revision_fetcher(mut self, fetcher: AppliedRevisionFetcher) -> Self {
         self.applied_revision_fetcher = Some(fetcher);
+        self
+    }
+
+    /// Wire the step that brings the rejections up to the published
+    /// configuration before each beat reads them.
+    pub fn with_rejection_settler(mut self, settler: RejectionSettler) -> Self {
+        self.rejection_settler = Some(settler);
         self
     }
 
@@ -454,16 +477,26 @@ impl From<PartialCompatEntry> for PartialCompatWire {
 }
 
 async fn send(client: &reqwest::Client, cfg: &HeartbeatConfig, uptime: i64) -> anyhow::Result<()> {
-    let rejections: Vec<RejectedResourceWire> = cfg
-        .rejection_fetcher
-        .as_ref()
-        .map(|fetcher| fetcher().iter().map(RejectedResourceWire::from).collect())
-        .unwrap_or_default();
+    // The revision first, the rejections last, with the guardrail index
+    // built in between: the configuration is published before its revision
+    // is recorded, so the index then builds against a snapshot at least as
+    // new as the revision this beat reports. Read the other way round, a
+    // guardrail that cannot be built would read as applied for one beat.
     let applied_revision = cfg
         .applied_revision_fetcher
         .as_ref()
         .map(|fetcher| fetcher())
         .unwrap_or(0);
+    if let Some(settler) = cfg.rejection_settler.clone() {
+        if let Err(error) = tokio::task::spawn_blocking(move || settler()).await {
+            tracing::error!(%error, "bringing the rejections up to date failed");
+        }
+    }
+    let rejections: Vec<RejectedResourceWire> = cfg
+        .rejection_fetcher
+        .as_ref()
+        .map(|fetcher| fetcher().iter().map(RejectedResourceWire::from).collect())
+        .unwrap_or_default();
     // Off the runtime's own threads: the configuration status computes
     // this digest when something reports it rather than on every apply,
     // so the first heartbeat after an apply walks the whole
@@ -839,6 +872,67 @@ managed:
         assert!(
             body.get("partially_compatible_resources").is_none(),
             "empty partially_compatible_resources must stay off the wire",
+        );
+    }
+
+    /// The applied revision is read first, the rejections are brought up to
+    /// the configuration published by then, and only then read: a beat
+    /// never reports a revision with rejections older than it, so a
+    /// guardrail that cannot be built never reads as applied.
+    #[tokio::test]
+    async fn send_reads_the_revision_then_settles_then_reads_the_rejections() {
+        let server = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path("/dp/heartbeat"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true
+            })))
+            .mount(&server)
+            .await;
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let built = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let dir = tempfile::tempdir().unwrap();
+        let mtls = write_test_bundle(dir.path());
+        let cfg = cfg_with_bundle(format!("{}/dp/heartbeat", server.uri()), mtls)
+            .with_applied_revision_fetcher(Arc::new({
+                let order = Arc::clone(&order);
+                move || {
+                    order.lock().unwrap().push("revision");
+                    42
+                }
+            }))
+            .with_rejection_settler(Arc::new({
+                let (order, built) = (Arc::clone(&order), Arc::clone(&built));
+                move || {
+                    order.lock().unwrap().push("settle");
+                    built.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            }))
+            .with_rejection_fetcher(Arc::new({
+                let (order, built) = (Arc::clone(&order), Arc::clone(&built));
+                move || {
+                    order.lock().unwrap().push("rejections");
+                    if !built.load(std::sync::atomic::Ordering::SeqCst) {
+                        return Vec::new();
+                    }
+                    vec![ConfigRejectionSnapshot {
+                        key: "/aisix/guardrails/unbuildable".into(),
+                        kind: "build_failed".into(),
+                        error: "invalid pattern".into(),
+                        timestamp_unix_secs: 1_770_000_100,
+                        stale_serving_since_unix_secs: None,
+                    }]
+                }
+            }));
+        send(&plain_client(), &cfg, 7).await.unwrap();
+
+        assert_eq!(*order.lock().unwrap(), ["revision", "settle", "rejections"]);
+        let received = server.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&received[0].body).unwrap();
+        assert_eq!(body["applied_revision"], 42);
+        assert_eq!(
+            body["rejected_resources"][0]["key"],
+            "/aisix/guardrails/unbuildable"
         );
     }
 

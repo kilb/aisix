@@ -1594,6 +1594,13 @@ async fn run(mut cfg: Config, hangup: Option<HangupSignal>) -> anyhow::Result<()
         }));
         let watch_status = supervisor.watch_status();
         h = h.with_applied_revision_fetcher(Arc::new(move || watch_status.snapshot().revision));
+        // Builds the guardrail index for the snapshot published now, if it
+        // is behind, so a guardrail that cannot be built is among the
+        // rejections of the beat that reports its revision.
+        let guardrail_index = Arc::clone(&proxy_state.guardrail_index);
+        h = h.with_rejection_settler(Arc::new(move || {
+            let _ = guardrail_index.is_empty();
+        }));
         let config_status_for_heartbeat = supervisor.config_status();
         h = h.with_config_hash_fetcher(Arc::new(move || {
             config_status_for_heartbeat.applied_config_hash()
