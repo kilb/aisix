@@ -2,21 +2,18 @@
 
 use std::sync::Arc;
 
-use ring::{aead, hmac};
+use ring::aead;
 use sha2::{Digest, Sha256};
 
 /// Settings read once at startup when `proxy.platform.enabled` is true.
 ///
-/// Every key an id is mapped or sealed under is derived here, once, from
+/// Every key an id is sealed under is derived here, once, from
 /// [`Self::id_key`], and shared by every request: setting a key up costs
-/// more than the one id most requests map or seal with it.
+/// more than the one id most requests seal with it.
 #[derive(Clone)]
 pub struct PlatformSettings {
     /// Key derived from the platform secret: SHA-256 of its bytes.
     pub id_key: [u8; 32],
-    /// The HMAC key tool-call ids are mapped under
-    /// ([`crate::opaque_id::map_tool_call_id`]).
-    tool_id_key: hmac::Key,
     /// The keys Responses item and call ids are sealed under
     /// ([`crate::opaque_id::Sealer`]).
     seal_keys: Arc<crate::opaque_id::SealKeys>,
@@ -26,11 +23,10 @@ pub struct PlatformSettings {
 }
 
 impl PlatformSettings {
-    /// 由平台密钥派生 id_key（SHA-256），并一次派生出各个映射、封装所用的密钥。
+    /// 由平台密钥派生 id_key（SHA-256），并一次派生出各个封装所用的密钥。
     pub fn from_secret(secret: &str) -> PlatformSettings {
         let id_key: [u8; 32] = Sha256::digest(secret.as_bytes()).into();
         PlatformSettings {
-            tool_id_key: hmac::Key::new(hmac::HMAC_SHA256, &id_key),
             seal_keys: Arc::new(crate::opaque_id::SealKeys::new(
                 &crate::opaque_id::seal_key(&id_key),
             )),
@@ -39,10 +35,6 @@ impl PlatformSettings {
             )),
             id_key,
         }
-    }
-
-    pub(crate) fn tool_id_key(&self) -> &hmac::Key {
-        &self.tool_id_key
     }
 
     pub(crate) fn seal_keys(&self) -> &Arc<crate::opaque_id::SealKeys> {

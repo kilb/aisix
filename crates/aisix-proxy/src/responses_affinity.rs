@@ -898,14 +898,6 @@ impl ResponseMark {
     /// With `model`, the same pass restamps the snapshot's `response.model`
     /// to it ([`crate::model_echo::responses_snapshot_model`]).
     fn apply_to_event_json(&self, payload: &[u8], model: Option<&str>) -> Option<Vec<u8>> {
-        let tagged = self.tag_event_json(payload, model);
-        if self.seal.is_none() {
-            return tagged;
-        }
-        crate::opaque_id::strip_channel_metrics(tagged.as_deref().unwrap_or(payload)).or(tagged)
-    }
-
-    fn tag_event_json(&self, payload: &[u8], model: Option<&str>) -> Option<Vec<u8>> {
         let slot = std::cell::Cell::new(Slot::ResponseId);
         let select = |path: &[PathSeg]| {
             let picked = match path {
@@ -1259,7 +1251,12 @@ mod tests {
         let out = String::from_utf8(mark.apply_to_sse_frame(done).unwrap()).unwrap();
         assert!(!out.contains("bdrk"), "{out}");
         assert!(out.contains(&mark_response_id("m-1", "resp_up")), "{out}");
-        assert!(out.ends_with("]}}\n\n"), "{out}");
+        // A cloud platform's invocation metrics go out as the upstream wrote
+        // them, in platform mode as without it.
+        assert!(
+            out.ends_with("]},\"amazon-bedrock-invocationMetrics\":{\"n\":1}}\n\n"),
+            "{out}"
+        );
         let buffered = mark.apply_to_sse_buffer([&frame[..], &done[..]].concat());
         assert!(!String::from_utf8(buffered).unwrap().contains("bdrk"));
     }

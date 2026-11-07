@@ -6819,7 +6819,7 @@ where
         let mut last_usage: Option<aisix_gateway::chat::UsageStats> = None;
         let fold_base = base_usage != aisix_gateway::chat::UsageStats::default();
         let mut last_chunk_id = String::new();
-        let mut stream_id = crate::render::StreamId::new(platform.is_some());
+        let mut stream_id = crate::render::StreamId::default();
         let mut last_chunk_model = String::new();
         let mut last_chunk_tier = None;
         // Render + serialise one held/live chunk into an SSE Event.

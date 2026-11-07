@@ -11,28 +11,26 @@ import {
   type SpawnedApp,
 } from "../harness/index.js";
 
-// E2E: in platform mode a tenant cannot tell which upstream channel served
-// it from the ids it is handed, and multi-turn tool use still works.
+// E2E: what platform mode does to the ids a tenant is handed, and that
+// multi-turn tool use still works.
 //
 // Every upstream below answers the way a model resold through a cloud
 // platform does: its message id and tool-call ids carry a channel marker
 // (`bdrk`), a Chat Completions answer names its own id and a
 // `system_fingerprint`, and a relayed answer carries the platform's
-// invocation metrics. None of it may reach the caller, on any surface,
-// buffered or streamed, translated or relayed as the upstream wrote it.
+// invocation metrics.
 //
-// The tool-call round trip is what a real agent does next: it puts the id
-// it was handed into the next turn's history.
-//
-// - Chat Completions and Messages carry the whole conversation on every
-//   request, so the upstream only needs the ids in that one request to
-//   agree: the id the caller was handed is the id the upstream receives.
-// - Responses can continue a conversation the upstream stored
-//   (`previous_response_id`), where only the ids it issued itself pair, so
-//   the upstream must receive its OWN ids back.
-//
-// And the same upstream id must come back as the same gateway id every
-// time, or an agent matching calls to results across turns breaks.
+// - Chat Completions and Messages ids pass through as the upstream issued
+//   them, in platform mode exactly as without it: an upstream that signs its
+//   reasoning must get back exactly the ids it issued. Each answer is
+//   compared with the same answer from a gateway with platform mode off, and
+//   the next turn must reach the upstream with its own ids.
+// - Responses ids are sealed to the tenant: no upstream id reaches the
+//   caller, and a continuation, stateless or through
+//   `previous_response_id` (where only the ids the upstream issued itself
+//   pair), must reach the upstream with its OWN ids back. The same upstream
+//   id comes back as the same sealed id every time, or an agent matching
+//   calls to results across turns breaks.
 //
 // The response-level id of a Responses answer is the second suite's subject:
 // it belongs to the tenant it was handed to.
@@ -72,7 +70,7 @@ const ALIASES = {
   messagesServerTool: "pi-messages-server-tool",
 };
 
-/** What must never appear anywhere in a response the caller receives. */
+/** What must never appear anywhere in a Responses answer the caller receives. */
 function expectNoUpstreamIdentity(text: string): void {
   for (const marker of [
     "_bdrk_",
@@ -83,11 +81,8 @@ function expectNoUpstreamIdentity(text: string): void {
     "fp_bdrk_7",
     UPSTREAM_CHAT_ID,
     "system_fingerprint",
-    "amazon-bedrock-invocationMetrics",
     // The native Responses upstream's own response id.
     "resp_up01",
-    // A frame only one channel sends.
-    "event: ping",
   ]) {
     expect(text, `response carries ${marker}`).not.toContain(marker);
   }
@@ -471,8 +466,8 @@ function messagesTurn(model: string, toolUseId?: string, stream = false): Record
   };
 }
 
-async function post(path: string, body: unknown): Promise<{ status: number; text: string }> {
-  const res = await fetch(`${app!.proxyUrl}${path}`, {
+async function postTo(target: SpawnedApp, path: string, body: unknown): Promise<{ status: number; text: string }> {
+  const res = await fetch(`${target.proxyUrl}${path}`, {
     method: "POST",
     headers: HEADERS,
     body: JSON.stringify(body),
@@ -480,7 +475,53 @@ async function post(path: string, body: unknown): Promise<{ status: number; text
   return { status: res.status, text: await res.text() };
 }
 
+async function post(path: string, body: unknown): Promise<{ status: number; text: string }> {
+  return postTo(app!, path, body);
+}
+
 let app: SpawnedApp | undefined;
+/** The same routes, the same upstream answers, platform mode off. */
+let offApp: SpawnedApp | undefined;
+
+/** Every id a Chat Completions answer carries: its own and its tool calls'. */
+function chatAnswerIds(text: string): string[] {
+  const body = JSON.parse(text);
+  return [
+    body.id,
+    ...(body.choices as Array<Record<string, any>>).flatMap((c) =>
+      ((c.message?.tool_calls as Array<Record<string, any>>) ?? []).map((t) => t.id),
+    ),
+  ];
+}
+
+/** Every id a Chat Completions stream carries, frame by frame. */
+function chatStreamAllIds(text: string): string[] {
+  return sseEvents(text).flatMap((e) => [
+    e.id as string,
+    ...((e.choices as Array<Record<string, any>>) ?? []).flatMap((c) =>
+      ((c.delta?.tool_calls as Array<Record<string, any>>) ?? []).flatMap((t) => (t.id ? [t.id] : [])),
+    ),
+  ]);
+}
+
+/** Every id a content block names: its own, the one it answers, its caller's. */
+function blockIds(block: Record<string, any>): string[] {
+  return [block.id, block.tool_use_id, block.caller?.tool_id].filter((id): id is string => typeof id === "string");
+}
+
+/** Every id a Messages answer carries: its own and its blocks'. */
+function messagesAnswerIds(text: string): string[] {
+  const body = JSON.parse(text);
+  return [body.id, ...(body.content as Array<Record<string, any>>).flatMap(blockIds)];
+}
+
+/** Every id a Messages stream carries, event by event. */
+function messagesStreamAllIds(text: string): string[] {
+  return sseEvents(text).flatMap((e) => [
+    ...(typeof e.message?.id === "string" ? [e.message.id as string] : []),
+    ...(e.content_block ? blockIds(e.content_block) : []),
+  ]);
+}
 
 /** The tool-call id a Chat Completions answer hands out. */
 function chatToolCallId(text: string): string {
@@ -523,9 +564,19 @@ function messagesStreamIds(text: string): { messageId: string; toolUseId: string
   return { messageId: start?.message?.id, toolUseId: block?.content_block?.id };
 }
 
-describe("platform mode e2e: ids name no upstream channel, and tool use still round-trips", () => {
+/** The routes whose ids pass through, mirrored on the platform-off gateway. */
+const PASS_THROUGH_ROUTES = [
+  "chatOpenAi",
+  "chatAnthropic",
+  "messagesNative",
+  "messagesTranslated",
+  "messagesServerTool",
+] as const;
+
+describe("platform mode e2e: ids a tenant is handed, and tool use still round-trips", () => {
   let seed: SeedClient | undefined;
   let etcdReachable = false;
+  const offUp: Partial<Record<(typeof PASS_THROUGH_ROUTES)[number], OpenAiUpstream>> = {};
   const up: Record<keyof typeof ALIASES, OpenAiUpstream | undefined> = {
     chatOpenAi: undefined,
     chatAnthropic: undefined,
@@ -574,13 +625,17 @@ describe("platform mode e2e: ids name no upstream channel, and tool use still ro
         { streamEvents: openAiChatStream(UPSTREAM_CONVERSE_TOOL_ID) },
       ],
     });
-    up.messagesServerTool = await startOpenAiUpstream({
-      scriptedResponses: [
-        { nonStreamBody: serverToolAnswer() },
-        { nonStreamBody: serverToolAnswer() },
-        { rawStreamFrames: serverToolStream() },
-      ],
-    });
+    const serverToolScript = () => [
+      { nonStreamBody: serverToolAnswer() },
+      { nonStreamBody: serverToolAnswer() },
+      { rawStreamFrames: serverToolStream() },
+    ];
+    up.messagesServerTool = await startOpenAiUpstream({ scriptedResponses: serverToolScript() });
+    offUp.chatOpenAi = await startOpenAiUpstream({ scriptedResponses: chatScript() });
+    offUp.chatAnthropic = await startOpenAiUpstream({ scriptedResponses: anthropicScript() });
+    offUp.messagesNative = await startOpenAiUpstream({ scriptedResponses: anthropicScript() });
+    offUp.messagesTranslated = await startOpenAiUpstream({ scriptedResponses: chatScript() });
+    offUp.messagesServerTool = await startOpenAiUpstream({ scriptedResponses: serverToolScript() });
 
     app = await spawnApp({
       // The secret reaches the gateway process and nothing else.
@@ -591,6 +646,8 @@ describe("platform mode e2e: ids name no upstream channel, and tool use still ro
       },
     });
     seed = new SeedClient(etcd, app.etcdPrefix);
+    offApp = await spawnApp();
+    const offSeed = new SeedClient(etcd, offApp.etcdPrefix);
 
     const anthropic = { provider: "anthropic", adapter: "anthropic" };
     const openai = { provider: "openai", adapter: "openai" };
@@ -609,86 +666,103 @@ describe("platform mode e2e: ids name no upstream channel, and tool use still ro
       ["responsesChat", chatOnly],
       ["messagesServerTool", anthropic],
     ];
-    for (const [route, kind] of routes) {
-      const pk = await seed.createProviderKey({
+    const seedRoute = async (
+      into: SeedClient,
+      route: keyof typeof ALIASES,
+      kind: { provider: string; adapter: string; apis?: Record<string, never> },
+      upstream: OpenAiUpstream,
+    ) => {
+      const pk = await into.createProviderKey({
         display_name: `pk-${ALIASES[route]}`,
         secret: "sk-mock",
-        api_base: `${up[route]!.baseUrl}/v1`,
+        api_base: `${upstream.baseUrl}/v1`,
         provider: kind.provider,
         adapter: kind.adapter,
         ...(kind.apis ? { apis: kind.apis } : {}),
       });
-      await seed.createModel({
+      await into.createModel({
         display_name: ALIASES[route],
         provider: kind.provider,
         model_name: "upstream-model",
         provider_key_id: pk.id,
       });
+    };
+    for (const [route, kind] of routes) {
+      await seedRoute(seed, route, kind, up[route]!);
+      const mirror = (PASS_THROUGH_ROUTES as readonly string[]).includes(route)
+        ? offUp[route as (typeof PASS_THROUGH_ROUTES)[number]]
+        : undefined;
+      if (mirror) await seedRoute(offSeed, route, kind, mirror);
     }
     // The caller key last: its authenticating implies every model above
     // is in the gateway's snapshot.
     await seed.createApiKey({ key_hash: CALLER_KEY_HASH, allowed_models: ["*"] });
-    const probe = new ProxyClient(app.proxyUrl, CALLER_PLAINTEXT);
-    await waitConfigPropagation(async () => {
-      const res = await probe.listModels();
-      if (res.status !== 200) return false;
-      const data = (res.body as { data?: Array<{ id?: string }> }).data ?? [];
-      return Object.values(ALIASES).every((alias) => data.some((m) => m.id === alias));
-    });
+    await offSeed.createApiKey({ key_hash: CALLER_KEY_HASH, allowed_models: ["*"] });
+    for (const [target, aliases] of [
+      [app, Object.values(ALIASES)],
+      [offApp, PASS_THROUGH_ROUTES.map((route) => ALIASES[route])],
+    ] as const) {
+      const probe = new ProxyClient(target.proxyUrl, CALLER_PLAINTEXT);
+      await waitConfigPropagation(async () => {
+        const res = await probe.listModels();
+        if (res.status !== 200) return false;
+        const data = (res.body as { data?: Array<{ id?: string }> }).data ?? [];
+        return aliases.every((alias) => data.some((m) => m.id === alias));
+      });
+    }
   });
 
   afterAll(async () => {
     await app?.exit();
-    await Promise.all(Object.values(up).map((u) => u?.close()));
+    await offApp?.exit();
+    await Promise.all([...Object.values(up), ...Object.values(offUp)].map((u) => u?.close()));
   });
+
+  /** The same request against both gateways: platform mode on, then off. */
+  const postBoth = async (path: string, body: unknown) => {
+    const on = await post(path, body);
+    const off = await postTo(offApp!, path, body);
+    expect(on.status, on.text).toBe(200);
+    expect(off.status, off.text).toBe(200);
+    return { on, off };
+  };
 
   for (const [route, label] of [
     ["chatOpenAi", "a Chat Completions upstream"],
     ["chatAnthropic", "an Anthropic Messages upstream"],
   ] as const) {
-    test(`/v1/chat/completions from ${label}: no upstream id, one id per stream, tool calls round-trip`, async (ctx) => {
-      if (!etcdReachable || !app) return void ctx.skip();
+    test(`/v1/chat/completions from ${label}: every id is what platform mode off hands out, and the upstream gets its own back`, async (ctx) => {
+      if (!etcdReachable || !app || !offApp) return void ctx.skip();
       const upstream = up[route]!;
       const alias = ALIASES[route];
 
-      const first = await post("/v1/chat/completions", chatTurn(alias));
-      expect(first.status, first.text).toBe(200);
-      expectNoUpstreamIdentity(first.text);
-      const toolCallId = chatToolCallId(first.text);
-      expect(toolCallId).not.toBe(UPSTREAM_TOOL_USE_ID);
-      expect(JSON.parse(first.text).id).not.toBe(
-        route === "chatOpenAi" ? UPSTREAM_CHAT_ID : UPSTREAM_MESSAGE_ID,
-      );
+      const first = await postBoth("/v1/chat/completions", chatTurn(alias));
+      expect(chatAnswerIds(first.on.text)).toEqual(chatAnswerIds(first.off.text));
+      const toolCallId = chatToolCallId(first.on.text);
+      expect(toolCallId, "the upstream's own tool-call id").toBe(UPSTREAM_TOOL_USE_ID);
 
-      // The agent's next turn carries the id it was handed.
-      const second = await post("/v1/chat/completions", chatTurn(alias, toolCallId));
-      expect(second.status, second.text).toBe(200);
-      expectNoUpstreamIdentity(second.text);
+      // The agent's next turn carries the id it was handed, and the upstream
+      // receives exactly the id it issued.
+      const second = await postBoth("/v1/chat/completions", chatTurn(alias, toolCallId));
+      expect(chatAnswerIds(second.on.text)).toEqual(chatAnswerIds(second.off.text));
       const forwarded = upstreamBody(upstream, 1);
-      const forwardedText = JSON.stringify(forwarded);
-      expect(forwardedText).toContain(toolCallId);
-      expect(forwardedText).not.toContain(UPSTREAM_TOOL_USE_ID);
       if (route === "chatOpenAi") {
-        expect(forwarded.messages[1].tool_calls[0].id).toBe(toolCallId);
-        expect(forwarded.messages[2].tool_call_id).toBe(toolCallId);
+        expect(forwarded.messages[1].tool_calls[0].id).toBe(UPSTREAM_TOOL_USE_ID);
+        expect(forwarded.messages[2].tool_call_id).toBe(UPSTREAM_TOOL_USE_ID);
       } else {
         const blocks = (forwarded.messages as Array<Record<string, any>>).flatMap((m) =>
           Array.isArray(m.content) ? m.content : [],
         );
-        expect(blocks.find((b) => b.type === "tool_use")?.id).toBe(toolCallId);
-        expect(blocks.find((b) => b.type === "tool_result")?.tool_use_id).toBe(toolCallId);
+        expect(blocks.find((b) => b.type === "tool_use")?.id).toBe(UPSTREAM_TOOL_USE_ID);
+        expect(blocks.find((b) => b.type === "tool_result")?.tool_use_id).toBe(UPSTREAM_TOOL_USE_ID);
       }
-      // The upstream named the same tool call again: so does the gateway.
-      expect(chatToolCallId(second.text)).toBe(toolCallId);
+      expect(upstreamBody(upstream, 1)).toEqual(upstreamBody(offUp[route]!, 1));
 
-      const streamed = await post("/v1/chat/completions", chatTurn(alias, undefined, true));
-      expect(streamed.status, streamed.text).toBe(200);
-      expectNoUpstreamIdentity(streamed.text);
-      const { frameIds, toolCallId: streamedToolCallId } = chatStreamIds(streamed.text);
+      const streamed = await postBoth("/v1/chat/completions", chatTurn(alias, undefined, true));
+      const { frameIds, toolCallId: streamedToolCallId } = chatStreamIds(streamed.on.text);
       expect(frameIds.length).toBeGreaterThan(1);
-      expect(new Set(frameIds).size, `one id across ${frameIds.join(",")}`).toBe(1);
-      expect(frameIds[0]).not.toBe(JSON.parse(first.text).id);
-      expect(streamedToolCallId).toBe(toolCallId);
+      expect(chatStreamAllIds(streamed.on.text)).toEqual(chatStreamAllIds(streamed.off.text));
+      expect(streamedToolCallId).toBe(UPSTREAM_TOOL_USE_ID);
     });
   }
 
@@ -696,58 +770,50 @@ describe("platform mode e2e: ids name no upstream channel, and tool use still ro
     ["messagesNative", "an Anthropic upstream relayed as written"],
     ["messagesTranslated", "a Chat Completions upstream"],
   ] as const) {
-    test(`/v1/messages from ${label}: no upstream id, tool_use round-trips`, async (ctx) => {
-      if (!etcdReachable || !app) return void ctx.skip();
+    test(`/v1/messages from ${label}: every id is what platform mode off hands out, and tool_use round-trips`, async (ctx) => {
+      if (!etcdReachable || !app || !offApp) return void ctx.skip();
       const upstream = up[route]!;
       const alias = ALIASES[route];
 
-      const first = await post("/v1/messages", messagesTurn(alias));
-      expect(first.status, first.text).toBe(200);
-      expectNoUpstreamIdentity(first.text);
-      const firstBody = JSON.parse(first.text);
-      expect(firstBody.id).toMatch(/^msg_/);
-      // A buffered answer keeps the usage counters the API documents; the
-      // one the upstream added beside them is the channel's own.
+      const first = await postBoth("/v1/messages", messagesTurn(alias));
+      expect(messagesAnswerIds(first.on.text)).toEqual(messagesAnswerIds(first.off.text));
+      const firstBody = JSON.parse(first.on.text);
       if (route === "messagesNative") {
-        expect(firstBody.usage).toEqual({ input_tokens: 9, output_tokens: 4, cache_creation_input_tokens: 2 });
+        // A native answer gets no rewrite platform mode off does not make.
+        expect(firstBody).toEqual(JSON.parse(first.off.text));
+        expect(firstBody.id).toBe(UPSTREAM_MESSAGE_ID);
       }
-      const toolUseId = messagesToolUseId(first.text);
-      expect(toolUseId).toMatch(/^toolu_/);
-      // Every other part of the answer survives.
+      const toolUseId = messagesToolUseId(first.on.text);
+      expect(toolUseId, "the upstream's own tool-use id").toBe(UPSTREAM_TOOL_USE_ID);
       expect(firstBody.stop_reason).toBe("tool_use");
       expect(firstBody.content.find((b: any) => b.type === "tool_use").input).toEqual({
         city: "Paris",
       });
 
-      const second = await post("/v1/messages", messagesTurn(alias, toolUseId));
-      expect(second.status, second.text).toBe(200);
-      expectNoUpstreamIdentity(second.text);
+      const second = await postBoth("/v1/messages", messagesTurn(alias, toolUseId));
+      expect(messagesAnswerIds(second.on.text)).toEqual(messagesAnswerIds(second.off.text));
       const forwarded = upstreamBody(upstream, 1);
-      const forwardedText = JSON.stringify(forwarded);
-      expect(forwardedText).toContain(toolUseId);
-      expect(forwardedText).not.toContain(UPSTREAM_TOOL_USE_ID);
       if (route === "messagesNative") {
-        expect(forwarded.messages[1].content[0].id).toBe(toolUseId);
-        expect(forwarded.messages[2].content[0].tool_use_id).toBe(toolUseId);
+        expect(forwarded.messages[1].content[0].id).toBe(UPSTREAM_TOOL_USE_ID);
+        expect(forwarded.messages[2].content[0].tool_use_id).toBe(UPSTREAM_TOOL_USE_ID);
       } else {
         const assistant = (forwarded.messages as Array<Record<string, any>>).find(
           (m) => m.role === "assistant",
         );
         const tool = (forwarded.messages as Array<Record<string, any>>).find((m) => m.role === "tool");
-        expect(assistant?.tool_calls?.[0]?.id).toBe(toolUseId);
-        expect(tool?.tool_call_id).toBe(toolUseId);
+        expect(assistant?.tool_calls?.[0]?.id).toBe(UPSTREAM_TOOL_USE_ID);
+        expect(tool?.tool_call_id).toBe(UPSTREAM_TOOL_USE_ID);
       }
-      expect(messagesToolUseId(second.text)).toBe(toolUseId);
-      // Two answers, two message ids.
-      expect(JSON.parse(second.text).id).not.toBe(firstBody.id);
+      expect(upstreamBody(upstream, 1)).toEqual(upstreamBody(offUp[route]!, 1));
 
-      const streamed = await post("/v1/messages", messagesTurn(alias, undefined, true));
-      expect(streamed.status, streamed.text).toBe(200);
-      expectNoUpstreamIdentity(streamed.text);
-      const ids = messagesStreamIds(streamed.text);
-      expect(ids.messageId).toMatch(/^msg_/);
-      expect(ids.toolUseId).toBe(toolUseId);
-      expect(streamed.text).toContain("message_stop");
+      const streamed = await postBoth("/v1/messages", messagesTurn(alias, undefined, true));
+      expect(messagesStreamAllIds(streamed.on.text)).toEqual(messagesStreamAllIds(streamed.off.text));
+      expect(messagesStreamIds(streamed.on.text).toolUseId).toBe(UPSTREAM_TOOL_USE_ID);
+      if (route === "messagesNative") {
+        // Relayed frame for frame as platform mode off relays them.
+        expect(streamed.on.text).toBe(streamed.off.text);
+      }
+      expect(streamed.on.text).toContain("message_stop");
     });
   }
 
@@ -777,6 +843,7 @@ describe("platform mode e2e: ids name no upstream channel, and tool use still ro
     // API documents; what the upstream added beside them is the channel's own.
     expect(firstBody.usage).toEqual(RESPONSES_USAGE_DOCUMENTED);
     expect(firstBody).not.toHaveProperty("content_filters");
+    expect(firstBody).not.toHaveProperty("amazon-bedrock-invocationMetrics");
 
     // A stateless continuation: the whole history, echoed.
     const stateless = await post(
@@ -883,12 +950,11 @@ describe("platform mode e2e: ids name no upstream channel, and tool use still ro
     expect(completed!.response.usage.input_tokens_details).not.toHaveProperty("cache_creation_tokens");
   });
 
-  // A server tool's use id carries the channel's marker like every other id
-  // the upstream hands out. Mapped, it keeps the `srvtoolu_` the Messages
-  // API requires of it, the result that names it still pairs, and the
-  // caller can send both back as history.
-  test("/v1/messages with a server tool: its use id and the result naming it keep srvtoolu_ and lose the channel", async (ctx) => {
-    if (!etcdReachable || !app) return void ctx.skip();
+  // A server tool's use id passes through like every other Messages id: the
+  // result that names it still pairs, and the next turn hands the upstream
+  // back exactly what it issued.
+  test("/v1/messages with a server tool: its use id and the result naming it are the upstream's own", async (ctx) => {
+    if (!etcdReachable || !app || !offApp) return void ctx.skip();
     const upstream = up.messagesServerTool!;
     const alias = ALIASES.messagesServerTool;
     const turn = (messages: unknown[], stream = false) => ({
@@ -899,44 +965,37 @@ describe("platform mode e2e: ids name no upstream channel, and tool use still ro
       ...(stream ? { stream: true } : {}),
     });
     const question = { role: "user", content: "weather in Paris?" };
-    const SERVER_ID = /^srvtoolu_[a-zA-Z0-9_]+$/;
 
-    const first = await post("/v1/messages", turn([question]));
-    expect(first.status, first.text).toBe(200);
-    expect(first.text).not.toContain("vrtx");
-    const content = JSON.parse(first.text).content as Array<Record<string, any>>;
+    const first = await postBoth("/v1/messages", turn([question]));
+    expect(JSON.parse(first.on.text)).toEqual(JSON.parse(first.off.text));
+    const content = JSON.parse(first.on.text).content as Array<Record<string, any>>;
     const use = content.find((b) => b.type === "server_tool_use");
     const result = content.find((b) => b.type === "web_search_tool_result");
-    expect(use?.id).toMatch(SERVER_ID);
-    expect(use?.id).not.toBe(UPSTREAM_SERVER_TOOL_ID);
-    expect(result?.tool_use_id).toBe(use?.id);
-    // The rest of the answer survives.
+    expect(use?.id).toBe(UPSTREAM_SERVER_TOOL_ID);
+    expect(result?.tool_use_id).toBe(UPSTREAM_SERVER_TOOL_ID);
     expect(result?.content?.[0]?.encrypted_content).toBe("EqgfCioIARgBIiQ");
     expect(content.find((b) => b.type === "text")?.text).toBe("Sunny in Paris.");
 
     // The next turn carries the answer as history; the upstream receives
-    // the ids the caller was handed, still paired.
-    const second = await post(
+    // its own ids, still paired.
+    const second = await postBoth(
       "/v1/messages",
       turn([question, { role: "assistant", content }, { role: "user", content: "and tomorrow?" }]),
     );
-    expect(second.status, second.text).toBe(200);
-    expect(second.text).not.toContain("vrtx");
+    expect(messagesAnswerIds(second.on.text)).toEqual(messagesAnswerIds(second.off.text));
     const history = (upstreamBody(upstream, 1).messages as Array<Record<string, any>>)[1].content as Array<
       Record<string, any>
     >;
-    expect(history.find((b) => b.type === "server_tool_use")?.id).toBe(use?.id);
-    expect(history.find((b) => b.type === "web_search_tool_result")?.tool_use_id).toBe(use?.id);
+    expect(history.find((b) => b.type === "server_tool_use")?.id).toBe(UPSTREAM_SERVER_TOOL_ID);
+    expect(history.find((b) => b.type === "web_search_tool_result")?.tool_use_id).toBe(UPSTREAM_SERVER_TOOL_ID);
 
-    const streamed = await post("/v1/messages", turn([question], true));
-    expect(streamed.status, streamed.text).toBe(200);
-    expect(streamed.text).not.toContain("vrtx");
-    const blocks = sseEvents(streamed.text)
+    const streamed = await postBoth("/v1/messages", turn([question], true));
+    expect(streamed.on.text).toBe(streamed.off.text);
+    const blocks = sseEvents(streamed.on.text)
       .filter((e) => e.type === "content_block_start")
       .map((e) => e.content_block as Record<string, any>);
-    expect(blocks.find((b) => b.type === "server_tool_use")?.id).toBe(use?.id);
-    expect(blocks.find((b) => b.type === "web_search_tool_result")?.tool_use_id).toBe(use?.id);
-    expect(streamed.text).toContain("message_stop");
+    expect(blocks.find((b) => b.type === "server_tool_use")?.id).toBe(UPSTREAM_SERVER_TOOL_ID);
+    expect(streamed.on.text).toContain("message_stop");
   });
 
   // A translated answer's call id is the tool-call id the Chat Completions
