@@ -109,3 +109,39 @@ for (const [tab, label] of PAGES) {
     await page.context().close();
   });
 }
+
+test("两步确认用键盘打开时焦点落在「取消」，再按回车只是收回，不会执行", async ({ browser }) => {
+  const org = "Focus Co 2b7";
+  const signedUp = await stack.tenant().post("/api/signup", {
+    org_name: org,
+    email: "owner@focus-2b7.test",
+    password: "focus-pass-2b7x",
+  });
+  const id: string = signedUp.tenant.id;
+  await stack.admin.post(`/admin/tenants/${id}/approve`);
+
+  const page = await systemDark(browser);
+  await login(page);
+  await open(page, "tenants");
+  const row = page.getByRole("row").filter({ hasText: org });
+  const suspend = row.getByRole("button", { name: "停用", exact: true });
+  const cancel = row.getByRole("button", { name: "取消" });
+
+  await suspend.focus();
+  await page.keyboard.press("Enter");
+  await expect(row.getByRole("button", { name: "确认停用" })).toBeVisible();
+  await expect(cancel).toBeFocused();
+  // The second Enter lands on 取消: the step closes and the keyboard is back on the action.
+  await page.keyboard.press("Enter");
+  await expect(row.getByRole("button", { name: "确认停用" })).toHaveCount(0);
+  await expect(suspend).toBeFocused();
+  // Escape takes the step back as well.
+  await page.keyboard.press("Enter");
+  await expect(cancel).toBeFocused();
+  await page.keyboard.press("Escape");
+  await expect(row.getByRole("button", { name: "确认停用" })).toHaveCount(0);
+  await expect(suspend).toBeFocused();
+
+  expect((await stack.admin.get(`/admin/tenants/${id}`)).status, "nothing was suspended").toBe("active");
+  await page.context().close();
+});

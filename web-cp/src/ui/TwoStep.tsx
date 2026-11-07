@@ -25,13 +25,15 @@ export function TwoStep({
   warning?: ReactNode;
 }) {
   const [asking, setAsking] = useState(false);
-  const confirmRef = useRef<HTMLButtonElement>(null);
+  const cancelRef = useRef<HTMLButtonElement>(null);
   const firstRef = useRef<HTMLButtonElement>(null);
-  // Focus follows the swap, so the keyboard stays on the action.
+  // Focus follows the swap, so the keyboard stays on the action: onto the
+  // safe choice, 取消, when the step opens, so a second Enter takes it back
+  // instead of acting; back onto the action when it closes.
   const moved = useRef(false);
   useEffect(() => {
     if (!moved.current) return;
-    (asking ? confirmRef : firstRef).current?.focus();
+    (asking ? cancelRef : firstRef).current?.focus();
   }, [asking]);
 
   const swap = (next: boolean) => {
@@ -70,7 +72,6 @@ export function TwoStep({
       )}
       <span className="two-step-confirm">
         <Button
-          ref={confirmRef}
           type="button"
           kind="danger"
           size={size}
@@ -82,7 +83,7 @@ export function TwoStep({
         >
           确认{label}
         </Button>
-        <Button type="button" size={size} onClick={() => swap(false)}>
+        <Button ref={cancelRef} type="button" size={size} onClick={() => swap(false)}>
           取消
         </Button>
       </span>
