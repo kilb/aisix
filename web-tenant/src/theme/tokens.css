@@ -62,7 +62,10 @@
   --box-border: var(--n2);
   --focus: var(--line);
   --link: var(--line);
-  --error: var(--stop);
+  /* Error text is a step deeper than Stop red, so it keeps 4.5:1 on a
+     hovered or selected row (Concrete) as well as on Paper. Stop red stays
+     for fills, dots and markers. */
+  --error: #C23A32;
   --on-sign: var(--ink);
   /* The destructive fill keeps white text at AA in both themes. */
   --stop-fill: #D2433B;
@@ -173,6 +176,10 @@
   --input-border-hover: #A3AFB8;
   --box-border: #8B98A4;
   --route-line: #E6ECEA;
+  /* Text in red or blue is lifted one more step than the signal, so it
+     keeps 4.5:1 on a hovered row as well as on a panel. */
+  --error: #EE776F;
+  --link: #7199F2;
 
   --lamp-disabled: #6B7987;
 

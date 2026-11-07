@@ -158,7 +158,7 @@ fieldset.fld > legend {
   line-height: var(--lh-table);
   color: var(--text-muted);
 }
-/* A refusal: Stop red on Paper (4.5:1), never on Concrete. */
+/* A refusal, in the error red (4.5:1 on Paper and on a hovered row). */
 .field-err {
   font-size: var(--fs-13);
   font-weight: 600;

@@ -22,6 +22,18 @@ test("令牌配色在两种主题下都达到 AA 对比度", () => {
   assert.ok(contrastRatio(D["--proceed"]!, D["--surface"]!) >= 3);
 });
 
+// Red and blue text also sits on a hovered row and on the selected row,
+// both --row-hover, and on the page itself (--bg), not only on a panel.
+test("错误文字与链接在悬停行、选中行与页面底色上也达到 AA", () => {
+  const css = readFileSync(new URL("../theme/tokens.css", import.meta.url), "utf8");
+  for (const theme of ["light", "dark"] as const) {
+    const T = readTokens(css, theme);
+    for (const [fg, bg] of [["--error", "--surface"], ["--error", "--row-hover"], ["--error", "--bg"],
+                            ["--link", "--surface"], ["--link", "--row-hover"], ["--link", "--bg"]] as [string, string][])
+      assert.ok(contrastRatio(T[fg]!, T[bg]!) >= 4.5, `${theme} ${fg} on ${bg}: ${contrastRatio(T[fg]!, T[bg]!).toFixed(2)}`);
+  }
+});
+
 test("线路色条与输入框边在两种主题的面板上都达到 3:1", () => {
   const css = readFileSync(new URL("../theme/tokens.css", import.meta.url), "utf8");
   for (const theme of ["light", "dark"] as const) {
