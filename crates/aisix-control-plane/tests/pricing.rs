@@ -2110,6 +2110,24 @@ async fn charges_are_listed_by_event_key_tenant_and_status() {
     assert_422_at(&r, "status");
 }
 
+/// The `?status=` filter of the charge listing pages on `(status, seq)`, so
+/// it must not rely on the planner choosing another index: that pair has an
+/// index of its own.
+#[tokio::test]
+async fn the_charge_status_filter_has_its_own_index() {
+    let Some(w) = world().await else { return };
+    let defs: Vec<String> = sqlx::query_scalar(
+        "SELECT indexdef FROM pg_indexes WHERE tablename = 'pricing_charges'",
+    )
+    .fetch_all(w.cp.db().pool())
+    .await
+    .expect("read the indexes");
+    assert!(
+        defs.iter().any(|d| d.contains("(status, seq)")),
+        "no (status, seq) index on pricing_charges: {defs:?}"
+    );
+}
+
 #[tokio::test]
 async fn cost_prices_and_discounts_are_written_and_listed() {
     let Some(w) = world().await else { return };
