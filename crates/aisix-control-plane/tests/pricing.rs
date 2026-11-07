@@ -2298,6 +2298,74 @@ async fn a_cost_price_names_a_live_provider_key() {
     assert_eq!(r.body["provider_key_id"], json!(live));
 }
 
+/// A provider or model with spaces around it matches no usage: it is `422`
+/// at its field, and nothing is written.
+#[tokio::test]
+async fn a_cost_price_with_spaces_around_the_upstream_is_refused() {
+    let Some(w) = world().await else { return };
+    let now = db_now(&w.cp).await;
+    for (field, provider, model) in [
+        ("/upstream_provider", " openai", "gpt-4o-mini"),
+        ("/upstream_model", "openai", "gpt-4o-mini\n"),
+    ] {
+        let r = as_op(
+            &w.cp,
+            &w.admin,
+            "POST",
+            "/admin/pricing/cost",
+            Some(json!({"upstream_provider": provider, "upstream_model": model, "effective_from": now, "card": card()})),
+        )
+        .await;
+        assert_422_at(&r, field);
+    }
+    assert_eq!(w.cp.count("pricing_cost_revisions").await, 0);
+}
+
+/// A cost revision no usage can match is written, with a
+/// `no_matching_upstream` warning; one that names a live model's provider
+/// and name, and a key of that provider, has none.
+#[tokio::test]
+async fn a_cost_price_that_can_never_apply_says_so() {
+    let Some(w) = world().await else { return };
+    let _model = seed_model(&w.cp, &w.admin).await; // openai / gpt-4o-mini
+    let key = seed_provider_key(&w.cp, &w.admin).await; // an openai key
+    let wr = &w;
+    let post = move |provider: &'static str, model: &'static str, key: Option<Uuid>| async move {
+        let now = db_now(&wr.cp).await;
+        let mut body = json!({"upstream_provider": provider, "upstream_model": model, "effective_from": now, "card": card()});
+        if let Some(key) = key {
+            body["provider_key_id"] = json!(key);
+        }
+        let r = as_op(&wr.cp, &wr.admin, "POST", "/admin/pricing/cost", Some(body)).await;
+        assert_eq!(r.status, 201, "{r:?}");
+        r.body["warnings"].clone()
+    };
+    let codes = |w: &Value| -> Vec<Value> {
+        w.as_array()
+            .expect("warnings")
+            .iter()
+            .map(|x| x["code"].clone())
+            .collect()
+    };
+    let none = json!(["no_matching_upstream"]);
+    // The pair a live model has, alone and through a key of that provider.
+    assert_eq!(post("openai", "gpt-4o-mini", None).await, json!([]));
+    assert_eq!(post("openai", "gpt-4o-mini", Some(key)).await, json!([]));
+    // A pair no model has (the case differs too).
+    assert_eq!(
+        json!(codes(&post("openai", "GPT-4o-mini", None).await)),
+        none
+    );
+    assert_eq!(json!(codes(&post("openai", "gpt-5-nope", None).await)), none);
+    // A key of another provider than the revision's.
+    assert_eq!(
+        json!(codes(&post("anthropic", "gpt-4o-mini", Some(key)).await)),
+        json!(["no_matching_upstream", "no_matching_upstream"])
+    );
+    // Every one was still written.
+    assert_eq!(w.cp.count("pricing_cost_revisions").await, 5);
+}
+
 /// A catalogue whose `openai/fixture-7c1` announces two price changes far
 /// ahead (input 1, then 3 from 2099-01-01, then 5 from 2099-06-01).
 fn announcing_catalogue() -> Arc<Catalogue> {

@@ -496,19 +496,30 @@ pub struct CostBody {
     card: Option<Value>,
 }
 
-/// `POST /admin/pricing/cost` → `201 CostRevision`. An empty provider or
-/// model is `422` at its path, and a missing or `null` card `422 /card`.
+/// `POST /admin/pricing/cost` → `201 CostRevision` plus `warnings`. An empty
+/// provider or model, or one with spaces around it (it would match no
+/// usage), is `422` at its path, and a missing or `null` card `422 /card`.
+///
+/// A `no_matching_upstream` warning says the revision can never apply: no
+/// live model has that provider and model name, or the given provider key
+/// belongs to another provider. The write still succeeds.
 pub async fn create_cost(
     auth: OperatorAuth,
     State(state): State<AppState>,
     ApiJson(body): ApiJson<CostBody>,
-) -> Result<(StatusCode, Json<CostRevision>), ApiError> {
+) -> Result<(StatusCode, Json<Value>), ApiError> {
     auth.require(OperatorRole::Operator)?;
     if body.upstream_provider.trim().is_empty() {
         return Err(refused("/upstream_provider", "上游提供方不能为空"));
     }
+    if body.upstream_provider.trim() != body.upstream_provider {
+        return Err(refused("/upstream_provider", "上游提供方请去掉首尾空格"));
+    }
     if body.upstream_model.trim().is_empty() {
         return Err(refused("/upstream_model", "上游模型不能为空"));
+    }
+    if body.upstream_model.trim() != body.upstream_model {
+        return Err(refused("/upstream_model", "上游模型请去掉首尾空格"));
     }
     let card = match body.card {
         None | Some(Value::Null) => return Err(refused("/card", "成本价格必须带价目卡")),
@@ -522,14 +533,67 @@ pub async fn create_cost(
         card,
         source: "manual".to_string(),
     };
-    let revision = state
+    let (revision, warnings) = state
         .db
         .tx(move |conn| {
-            async move { store::insert_cost_price(conn, &row, Actor::Operator(&auth)).await }
-                .boxed()
+            async move {
+                let revision =
+                    store::insert_cost_price(&mut *conn, &row, Actor::Operator(&auth)).await?;
+                let warnings = unmatched_upstream(&mut *conn, &revision).await?;
+                Ok::<_, ApiError>((revision, warnings))
+            }
+            .boxed()
         })
         .await?;
-    Ok((StatusCode::CREATED, Json(revision)))
+    let mut view = to_object(&revision)?;
+    view.insert("warnings".to_string(), json!(warnings));
+    Ok((StatusCode::CREATED, Json(Value::Object(view))))
+}
+
+/// A `no_matching_upstream` warning for a cost revision that no usage can
+/// ever match: no live model has its provider and model name exactly, or its
+/// provider key is another provider's.
+async fn unmatched_upstream(
+    conn: &mut sqlx::PgConnection,
+    revision: &CostRevision,
+) -> Result<Vec<PriceWarning>, DbError> {
+    let model_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM gw_resources WHERE kind = 'models' AND NOT deleted \
+                          AND doc->>'provider' = $1 AND doc->>'model_name' = $2)",
+    )
+    .bind(&revision.upstream_provider)
+    .bind(&revision.upstream_model)
+    .fetch_one(&mut *conn)
+    .await?;
+    let key_provider_differs: bool = match revision.provider_key_id {
+        Some(key) => sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM gw_resources WHERE kind = 'provider_keys' \
+                              AND id = $1 AND NOT deleted AND doc->>'provider' IS DISTINCT FROM $2)",
+        )
+        .bind(key)
+        .bind(&revision.upstream_provider)
+        .fetch_one(&mut *conn)
+        .await?,
+        None => false,
+    };
+    let mut warnings = Vec::new();
+    if !model_exists {
+        warnings.push(PriceWarning {
+            code: "no_matching_upstream",
+            message: "没有任何模型使用这个上游提供方和模型名，这条成本价格暂时不会被用到".to_string(),
+            revision_id: None,
+            effective_from: None,
+        });
+    }
+    if key_provider_differs {
+        warnings.push(PriceWarning {
+            code: "no_matching_upstream",
+            message: "所选供应商密钥属于另一个提供方，这条成本价格不会被用到".to_string(),
+            revision_id: None,
+            effective_from: None,
+        });
+    }
+    Ok(warnings)
 }
 
 // ---- discounts ----
