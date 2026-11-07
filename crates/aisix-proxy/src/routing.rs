@@ -1780,6 +1780,25 @@ pub(crate) fn no_target_in_groups(addressed: &str) -> ProxyError {
     }
 }
 
+/// [`no_target_in_groups`] for a routing group. In platform mode it answers
+/// as the group's own outage does, `Retry-After` included: under
+/// `when_all_unavailable: fail` (the default) a group whose every target is
+/// down is refused with [`FALLBACK_ALL_UNHEALTHY_RETRY_AFTER`], so a refusal
+/// without it would tell "outside my groups" from "temporarily down". A
+/// group that dispatches anyway fails on its upstream's error, which carries
+/// none. Off platform mode the refusal carries none, as it always has.
+fn no_routing_target_in_groups(addressed: &str, routing: &Routing) -> ProxyError {
+    let err = no_target_in_groups(addressed);
+    if crate::platform_errors::active()
+        && routing.when_all_unavailable_or_default() == WhenAllUnavailablePolicy::Fail
+    {
+        return ProxyError::AllCandidatesUnavailable {
+            retry_after_secs: Some(FALLBACK_ALL_UNHEALTHY_RETRY_AFTER.as_secs()),
+        };
+    }
+    err
+}
+
 /// Drop the targets whose own `allowed_cidrs` excludes `source_ip`.
 ///
 /// Deliberately NOT folded into [`filter_attempt_models`]: that filter's
@@ -1877,14 +1896,13 @@ pub(crate) fn check_group_access(
     if allowed.is_empty() || model.is_semantic() {
         return Ok(());
     }
-    let admitted = match model.routing.as_ref() {
-        Some(routing) => !targets_in_groups(snapshot, &routing.targets, allowed).is_empty(),
-        None => target_in_groups(snapshot, model, allowed),
-    };
-    if admitted {
-        Ok(())
-    } else {
-        Err(no_target_in_groups(virtual_name))
+    match model.routing.as_ref() {
+        Some(routing) if targets_in_groups(snapshot, &routing.targets, allowed).is_empty() => {
+            Err(no_routing_target_in_groups(virtual_name, routing))
+        }
+        Some(_) => Ok(()),
+        None if target_in_groups(snapshot, model, allowed) => Ok(()),
+        None => Err(no_target_in_groups(virtual_name)),
     }
 }
 
@@ -1989,7 +2007,7 @@ pub(crate) fn resolve_attempt_models(
     // `default` target nor a `when_all_unavailable` policy reaches past it.
     let grouped = targets_in_groups(snapshot, &routing.targets, req.allowed_groups);
     if grouped.is_empty() {
-        return Err(no_target_in_groups(virtual_name));
+        return Err(no_routing_target_in_groups(virtual_name, routing));
     }
     // Tag/metadata pre-filter: narrow the targets to those eligible for this
     // request's routing tags, then let the configured strategy order whatever
@@ -2000,7 +2018,7 @@ pub(crate) fn resolve_attempt_models(
         // that lists the tags: what a tag matches outside the key's groups
         // is none of its business.
         if !req.allowed_groups.is_empty() {
-            return Err(no_target_in_groups(virtual_name));
+            return Err(no_routing_target_in_groups(virtual_name, routing));
         }
         return Err(ProxyError::InvalidRequest(format!(
             "no routing target matches request tags {:?}",
@@ -3851,6 +3869,65 @@ mod tests {
             "{err:?}"
         );
         assert_names_no_group_or_member(&err);
+    }
+
+    /// In platform mode a provider-group refusal answers exactly as an
+    /// outage of the same model: for a group under `when_all_unavailable:
+    /// fail`, the all-unhealthy answer's `Retry-After`; for a direct model,
+    /// or a group that dispatches anyway, none, as its upstream's own
+    /// failure has none. Off platform mode it carries none, as before.
+    #[test]
+    fn in_platform_mode_a_group_refusal_answers_as_an_outage_of_the_same_model() {
+        use axum::response::IntoResponse as _;
+        let snap = groups_snapshot();
+        let allowed = groups(&["grp-alpha"]);
+        let outside = || {
+            vec![
+                RoutingTarget::new("model-b"),
+                RoutingTarget::new("model-none"),
+            ]
+        };
+        let refuse = |policy: Option<WhenAllUnavailablePolicy>| {
+            let mut routing = r(RoutingStrategy::Failover, outside(), None);
+            routing.when_all_unavailable = policy;
+            let model = group_model(routing);
+            resolve_attempt_models(
+                &RoutingRegistry::new(),
+                &crate::ModelRuntimeStatusTracker::new(),
+                &LivePricingIndex::new(),
+                &snap,
+                "group",
+                "group-id",
+                &model,
+                RoutingRequest {
+                    allowed_groups: &allowed,
+                    ..Default::default()
+                },
+            )
+            .map(|_| ())
+            .unwrap_err()
+        };
+        let retry_after = |err: ProxyError| err.retry_after_secs();
+        use crate::error::tests::in_platform_mode as platform;
+        for policy in [None, Some(WhenAllUnavailablePolicy::Fail)] {
+            assert_eq!(retry_after(refuse(policy)), None, "off: {policy:?}");
+            assert_eq!(
+                platform(|| retry_after(refuse(policy))),
+                Some(FALLBACK_ALL_UNHEALTHY_RETRY_AFTER.as_secs()),
+                "{policy:?}"
+            );
+        }
+        assert_eq!(
+            platform(|| retry_after(refuse(Some(WhenAllUnavailablePolicy::TryAnyway)))),
+            None
+        );
+        assert_eq!(
+            platform(|| retry_after(resolve_direct(&snap, "model-b", &allowed).unwrap_err())),
+            None
+        );
+        let resp = platform(|| refuse(None).into_response());
+        assert_eq!(resp.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(resp.headers()["retry-after"], "30");
     }
 
     fn resolve_direct(
