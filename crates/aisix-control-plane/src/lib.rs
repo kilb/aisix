@@ -145,9 +145,9 @@ where
 {
     // Every TLS client that takes the process default (the kine client, a
     // gateway client in a test) gets ring, the provider this crate builds its
-    // own configurations with. The Postgres driver picks ring itself. A build that unifies
-    // the workspace's features also enables aws-lc-rs, and rustls then
-    // refuses to pick a default. Already installed is fine.
+    // own configurations with. The Postgres driver picks ring itself. A
+    // build that unifies the workspace's features also enables aws-lc-rs,
+    // and rustls then refuses to pick a default. Already installed is fine.
     let _ = rustls::crypto::ring::default_provider().install_default();
     // A stamp the gate cannot read would leave it judging nothing, unseen.
     if compat::GatewayVersion::parse(&cfg.cp_version) == compat::GatewayVersion::Unrecognized {
