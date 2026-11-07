@@ -593,6 +593,10 @@ On the tenant endpoints themselves:
 - A bare-string `audio.voice` that names a custom voice is not refused; the object form is.
 - A broad `forward_client_headers` rule can forward `anthropic-workspace-id` or `anthropic-user-profile-id` upstream.
 
+Keeping tenants apart, which is not best effort either, still has this gap:
+
+- Tenants share the platform's upstream accounts, and an upstream's prompt cache is shared within one account ("Caches are not shared across organizations", <https://developers.openai.com/api/docs/guides/prompt-caching>, so they are within one). A tenant can therefore send a candidate prompt of a cacheable length and read from its answer's cache counters (`cached_tokens`, `cache_read_input_tokens`), which every endpoint reports, whether another tenant sent the same prefix before: the probing the same page names. Nothing in the gateway scopes the upstream cache per tenant today. On the OpenAI wire a per-tenant `prompt_cache_key` would ("separate keys help prevent cache-hit probing across users"), written by the gateway in place of or around the caller's own, as a platform-mode exception to the request-field rule; the Messages API has no such key.
+
 Billing, which is not best effort, still has this gap:
 
 - A batch whose spend is credited after a restart (the batch attribution path credits spend keys this process never acquired) can still have that credit shed when the accounting queue is full.
