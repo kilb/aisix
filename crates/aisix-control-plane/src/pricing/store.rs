@@ -59,6 +59,10 @@ const MAX_ID_CHARS: usize = 256;
 pub struct PriceBookCache {
     catalogue: Arc<Catalogue>,
     cached: RwLock<Option<(i64, Arc<PriceBook>)>>,
+    /// Held across a reload, so readers that find the book stale together
+    /// share one load. It guards no data: a failed load just releases it and
+    /// the next reader tries again.
+    reload: tokio::sync::Mutex<()>,
     loads: AtomicU64,
 }
 
@@ -67,6 +71,7 @@ impl PriceBookCache {
         PriceBookCache {
             catalogue,
             cached: RwLock::new(None),
+            reload: tokio::sync::Mutex::new(()),
             loads: AtomicU64::new(0),
         }
     }
@@ -74,9 +79,10 @@ impl PriceBookCache {
     /// Reads `pricing_version` on `conn`, the caller's transaction. Reloads
     /// the book on the same connection only when the version differs from
     /// the cached one, and logs one ERROR per invalid revision on each
-    /// reload. A version that is missing or not a whole number is logged at
-    /// ERROR and reloads the book on every call, so intake keeps pricing
-    /// from what the tables hold. The lock is never held across an await.
+    /// reload. Readers that find it stale at the same time share one reload.
+    /// A version that is missing or not a whole number is logged at ERROR and
+    /// reloads the book on every call, so intake keeps pricing from what the
+    /// tables hold. The cache lock is never held across an await.
     pub async fn current(&self, conn: &mut PgConnection) -> Result<Arc<PriceBook>, DbError> {
         let Some(version) = pricing_version(&mut *conn).await? else {
             tracing::error!(
@@ -88,6 +94,11 @@ impl PriceBookCache {
             *self.cached.write().unwrap_or_else(PoisonError::into_inner) = None;
             return self.load(conn).await;
         };
+        if let Some(book) = self.cached_at(version) {
+            return Ok(book);
+        }
+        // One reader reloads; the rest wait here and then find its book.
+        let _reloading = self.reload.lock().await;
         if let Some(book) = self.cached_at(version) {
             return Ok(book);
         }

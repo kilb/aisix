@@ -675,6 +675,38 @@ async fn the_price_book_is_reloaded_only_when_a_price_changes() {
     assert_eq!(w.cp.count("pricing_charges").await, 4);
 }
 
+/// Readers that all find the book stale after a price write share one load:
+/// none of them loads it again once the first has.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn readers_of_a_stale_book_share_one_load() {
+    let Some(w) = world().await else { return };
+    let model = seed_model(&w.cp, &w.admin).await;
+    price(&w.cp, model).await;
+    let prices = w.cp.state().prices.clone();
+    // Connections are opened first, so the readers do not queue on the pool.
+    let mut conns = Vec::new();
+    for _ in 0..6 {
+        conns.push(w.cp.db().pool().acquire().await.expect("a connection"));
+    }
+    let mut first = conns.pop().expect("a connection");
+    prices.current(&mut first).await.expect("the book");
+    assert_eq!(prices.loads(), 1);
+    bump_pricing_version(&w.cp).await;
+    let readers: Vec<_> = conns
+        .into_iter()
+        .map(|mut conn| {
+            let prices = prices.clone();
+            tokio::spawn(async move { prices.current(&mut conn).await.expect("the book") })
+        })
+        .collect();
+    let mut books = Vec::new();
+    for reader in readers {
+        books.push(reader.await.expect("the reader finished"));
+    }
+    assert_eq!(prices.loads(), 2, "five readers, one load");
+    assert!(books.windows(2).all(|p| Arc::ptr_eq(&p[0], &p[1])));
+}
+
 #[tokio::test]
 async fn a_row_without_a_price_is_stored_unpriced_with_its_reason() {
     let Some(w) = world().await else { return };
