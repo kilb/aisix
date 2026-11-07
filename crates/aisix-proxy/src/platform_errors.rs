@@ -133,10 +133,17 @@ impl IntoResponse for PlatformErrorClass {
 }
 
 /// The fixed, neutral message of each class.
+///
+/// A context overflow's message opens with Anthropic's own words for it,
+/// because a client that compacts its conversation on an overflow reads it
+/// off the message, never the code: Claude Code (2.1.319) treats an error as
+/// a prompt too long when its lowercased message contains
+/// "prompt is too long", and only then compacts and retries. Any other
+/// wording leaves such a client failing every later turn.
 pub(crate) fn platform_message(class: &PlatformErrorClass) -> &'static str {
     match class {
         PlatformErrorClass::ContextLengthExceeded => {
-            "The request exceeds the model's context length."
+            "prompt is too long: the request exceeds the model's context length."
         }
         PlatformErrorClass::RateLimited => "Rate limit exceeded. Retry later.",
         PlatformErrorClass::InvalidRequest { .. } => "The request is invalid.",
@@ -260,16 +267,20 @@ const CALLER_FAULT_TOKENS: &[&str] = &[
 
 /// What upstreams write for a prompt that does not fit the model's context
 /// window, lowercased: OpenAI and the OpenAI-compatible servers ("maximum
-/// context length"), Anthropic ("prompt is too long"), Gemini ("exceeds the
-/// maximum number of tokens"), Bedrock's publishers ("input is too long"),
-/// and the code itself where a server writes it into the text. The
-/// mainstream gateways read a context overflow off the same phrases.
+/// context length"), Anthropic ("prompt is too long", and "input length and
+/// `max_tokens` exceed context limit" when the prompt fits but leaves no
+/// room for the requested output), Gemini ("exceeds the maximum number of
+/// tokens"), Bedrock's publishers ("input is too long"), and the code itself
+/// where a server writes it into the text. The mainstream gateways read a
+/// context overflow off the same phrases, and Claude Code reads both of
+/// Anthropic's phrasings as one ("prompt_too_long").
 const CONTEXT_OVERFLOW_MARKERS: &[&str] = &[
     "context_length_exceeded",
     "maximum context length",
     "context window",
     "prompt is too long",
     "input is too long",
+    "exceed context limit",
     "exceeds the maximum number of tokens",
 ];
 
@@ -664,6 +675,36 @@ mod tests {
         assert_eq!(classify(&e), PlatformErrorClass::ContextLengthExceeded);
     }
 
+    /// Anthropic's second phrasing of an overflow: the prompt fits, but not
+    /// with the output the request asked room for.
+    #[test]
+    fn an_overflow_that_leaves_no_room_for_max_tokens_is_a_context_overflow() {
+        let e = upstream_status(
+            400,
+            "input length and `max_tokens` exceed context limit: 190000 + 32000 > 200000, \
+             decrease input length or `max_tokens` and try again",
+        );
+        assert_eq!(classify(&e), PlatformErrorClass::ContextLengthExceeded);
+    }
+
+    /// A client that compacts on an overflow reads it off the message. Claude
+    /// Code (2.1.319) lowercases the message and looks for "prompt is too
+    /// long"; whatever envelope the class goes out in, it must find it.
+    #[tokio::test]
+    async fn a_context_overflow_reads_as_one_to_a_client_that_compacts() {
+        let overflow =
+            || upstream_status(400, "prompt is too long: 250000 tokens > 200000 maximum");
+        let openai = in_platform_mode(|| overflow().into_response());
+        let anthropic = in_platform_mode(|| overflow().into_anthropic_response());
+        for resp in [openai, anthropic] {
+            let message = body_json(resp).await["error"]["message"]
+                .as_str()
+                .unwrap()
+                .to_lowercase();
+            assert!(message.contains("prompt is too long"), "{message}");
+        }
+    }
+
     #[test]
     fn an_upstream_param_error_keeps_the_field_name() {
         let e = upstream_status_with_param(400, "Invalid value for 'temperature'", "temperature");
@@ -760,7 +801,7 @@ mod tests {
                 400,
                 "invalid_request_error",
                 "context_length_exceeded",
-                "The request exceeds the model's context length.",
+                "prompt is too long: the request exceeds the model's context length.",
             ),
             (
                 PlatformErrorClass::RateLimited,
@@ -1228,7 +1269,7 @@ mod tests {
         assert_eq!(body["error"]["code"], "context_length_exceeded");
         assert_eq!(
             body["error"]["message"],
-            "The request exceeds the model's context length."
+            "prompt is too long: the request exceeds the model's context length."
         );
 
         let resp = in_platform_mode(|| upstream_status(401, "x").into_anthropic_response());

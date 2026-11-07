@@ -439,7 +439,7 @@ const CONTEXT: Expected = {
   code: "context_length_exceeded",
   openaiType: "invalid_request_error",
   anthropicType: "invalid_request_error",
-  message: "The request exceeds the model's context length.",
+  message: "prompt is too long: the request exceeds the model's context length.",
 };
 const INVALID: Expected = {
   status: 400,
