@@ -170,9 +170,17 @@ where
         stale_secs: gateways::stale_window_secs(&cfg),
     };
     tenants::ensure_internal_tenant(&db, &write_ctx).await?;
-    keys::bring_documents_up_to(&db, &write_ctx, keys::KEY_DOC_VERSION)
+    // Keys an older release wrote; a tenant the gateway-version gate refuses
+    // is left to the housekeeping ticks, any other failure stops the boot.
+    let caught_up = keys::catch_up(&db, &write_ctx, keys::KEY_DOC_VERSION)
         .await
         .map_err(|e| BootError::KeyDocuments(format!("{}: {}", e.code, e.message)))?;
+    if caught_up.failed > 0 {
+        return Err(BootError::KeyDocuments(format!(
+            "{} tenants' key documents could not be rewritten; the log names them",
+            caught_up.failed
+        )));
+    }
     let passwords = PasswordGate::new(ARGON2_GATE_PERMITS)?;
     let creds = CredentialCache::load(&db.dedicated(CREDENTIALS_POOL_SIZE)).await?;
     let dp_tls = match dp::listener::server_tls(&pki, &cfg.dp_hosts, true) {
@@ -244,7 +252,11 @@ where
             .with_graceful_shutdown(async move { stopped(&mut browser_stop).await })
             .await
     });
-    let mut tasks = vec![housekeeping::spawn(state.db.clone(), stopping.clone())];
+    let mut tasks = vec![housekeeping::spawn(
+        state.db.clone(),
+        WriteCtx::of(&state),
+        stopping.clone(),
+    )];
     let mut projector_stop = stopping.clone();
     tasks.push(projector::spawn(
         state.db.clone(),

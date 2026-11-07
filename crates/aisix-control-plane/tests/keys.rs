@@ -9,11 +9,13 @@ mod support;
 use std::collections::BTreeSet;
 
 use aisix_control_plane::auth::{MemberRole, OperatorRole};
+use aisix_control_plane::housekeeping;
 use aisix_control_plane::keys::{self, KEY_DOC_VERSION};
 use aisix_control_plane::resources::write::WriteCtx;
 use aisix_control_plane::tenants::TenantStatus;
 use aisix_core::models::ApiKey;
 use serde_json::{json, Value};
+use sqlx::Connection;
 use support::members::MemberSession;
 use support::{DpClient, OperatorSession, Resp, TestCp};
 use uuid::Uuid;
@@ -1558,6 +1560,7 @@ async fn operators_mint_and_manage_any_tenants_keys() {
             "allowed_models",
             "allowed_provider_groups",
             "created_at",
+            "created_by",
             "disabled",
             "disabled_by_tenant",
             "effective_disabled",
@@ -1575,6 +1578,10 @@ async fn operators_mint_and_manage_any_tenants_keys() {
     );
     assert_eq!(r.body["key"]["member_id"], json!(member.id));
     assert_eq!(r.body["key"]["tenant_id"], json!(tenant));
+    assert_eq!(
+        r.body["key"]["created_by"],
+        json!({"kind": "operator", "id": admin.id})
+    );
     assert_eq!(
         r.body["key"]["effective_provider_groups"],
         json!(["shared"])
@@ -2046,6 +2053,11 @@ async fn a_member_moved_to_billing_holds_no_working_key() {
         ),
         (json!(false), json!(true))
     );
+    // Who minted it stays visible, to suggest rotating it.
+    assert_eq!(
+        r.body["created_by"],
+        json!({"kind": "member", "id": member.id})
+    );
     // A re-projection of the tenant keeps it closed.
     patch_tenant_ok(&cp, &admin, tenant, json!({"limits": {"rpm": 600}})).await;
     assert_eq!(key_doc(&cp, &key).await["disabled"], true);
@@ -2133,6 +2145,26 @@ async fn an_operators_disable_sticks() {
         ),
         (json!(false), json!(true))
     );
+    // The tenant's own switch is already off: `false` changes nothing, and
+    // the rest of the request saves.
+    let r = on_key(
+        &cp,
+        &owner,
+        "PATCH",
+        &key,
+        Some(json!({"disabled": false, "label": "renamed-7c1"})),
+    )
+    .await;
+    assert_eq!(r.status, 200, "{r:?}");
+    assert_eq!(
+        (r.body["label"].clone(), r.body["disabled"].clone()),
+        (json!("renamed-7c1"), json!(false))
+    );
+    assert_eq!(key_doc(&cp, &key).await["disabled"], true);
+    // The tenant switches its own off too; switching it back on while the
+    // platform's is set is refused.
+    let r = on_key(&cp, &owner, "PATCH", &key, Some(json!({"disabled": true}))).await;
+    assert_eq!(r.status, 200, "{r:?}");
     let version = key_version(&cp, &key).await;
     let r = on_key(&cp, &owner, "PATCH", &key, Some(json!({"disabled": false}))).await;
     assert_eq!(
@@ -2146,18 +2178,6 @@ async fn an_operators_disable_sticks() {
     );
     assert_eq!(key_version(&cp, &key).await, version);
     assert_eq!(key_doc(&cp, &key).await["disabled"], true);
-    // The tenant still renames it, and sets its own switch.
-    let r = on_key(
-        &cp,
-        &owner,
-        "PATCH",
-        &key,
-        Some(json!({"label": "renamed-7c1"})),
-    )
-    .await;
-    assert_eq!(r.status, 200, "{r:?}");
-    let r = on_key(&cp, &owner, "PATCH", &key, Some(json!({"disabled": true}))).await;
-    assert_eq!(r.status, 200, "{r:?}");
     // A suspension and a reactivation leave it off.
     assert_eq!(act(&cp, &admin, tenant, "suspend").await.status, 200);
     assert_eq!(act(&cp, &admin, tenant, "reactivate").await.status, 200);
@@ -2181,23 +2201,25 @@ async fn an_operators_disable_sticks() {
     assert_eq!(key_doc(&cp, &key).await["disabled"], false);
 }
 
-/// Sets `key_doc_version` as a release older than this one left it.
-async fn set_key_doc_version(cp: &TestCp, version: u32) {
-    sqlx::query(
-        "INSERT INTO cp_settings (key, value) VALUES ('key_doc_version', $1) \
-         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
-    )
-    .bind(json!(version))
-    .execute(cp.db().pool())
-    .await
-    .expect("set the key document version");
-}
-
-async fn key_doc_version(cp: &TestCp) -> Value {
-    sqlx::query_scalar("SELECT value FROM cp_settings WHERE key = 'key_doc_version'")
+/// The shape key `key`'s document was last written in.
+async fn doc_version(cp: &TestCp, key: &str) -> i32 {
+    sqlx::query_scalar("SELECT doc_version FROM tenant_keys WHERE id = $1::uuid")
+        .bind(key)
         .fetch_one(cp.db().pool())
         .await
-        .expect("read the key document version")
+        .expect("read the key")
+}
+
+/// Marks the documents of `keys` as written by an older release.
+async fn set_doc_version(cp: &TestCp, keys: &[&str], version: i32) {
+    for key in keys {
+        sqlx::query("UPDATE tenant_keys SET doc_version = $2 WHERE id = $1::uuid")
+            .bind(key)
+            .bind(version)
+            .execute(cp.db().pool())
+            .await
+            .expect("set a key's document version");
+    }
 }
 
 /// Switches the stored documents of `keys` off behind the control plane's
@@ -2216,10 +2238,26 @@ async fn close_behind_its_back(cp: &TestCp, keys: &[&str]) {
     }
 }
 
+/// Gives the stored documents of `keys` a stale label behind the control
+/// plane's back: writing them as they should be is a change the gate lets
+/// through.
+async fn make_stale(cp: &TestCp, keys: &[&str]) {
+    for key in keys {
+        sqlx::query(
+            "UPDATE gw_resources SET doc = jsonb_set(doc, '{display_name}', '\"stale-7c1\"') \
+             WHERE kind = 'api_keys' AND id = $1::uuid",
+        )
+        .bind(key)
+        .execute(cp.db().pool())
+        .await
+        .expect("tamper with a key document");
+    }
+}
+
 /// Every upgrade boots the control plane while older gateways are still
 /// registered: a boot whose rewrites the gateway-version gate refuses
-/// leaves them for a later boot instead of failing, and makes them once
-/// the gateways are upgraded.
+/// leaves them for later instead of failing, and makes them once the
+/// gateways are upgraded.
 #[tokio::test]
 async fn a_boot_leaves_a_rewrite_an_older_gateway_refuses_for_later() {
     let Some(cp) = TestCp::start_stamped(CP_VERSION).await else {
@@ -2247,18 +2285,13 @@ async fn a_boot_leaves_a_rewrite_an_older_gateway_refuses_for_later() {
     // tenant as a rewrite it refuses: a tenant's keys move together.
     let (first, _) = mint_ok(&cp, &owner, json!({"label": "first-7c1"})).await;
     let (customer, _) = mint_ok(&cp, &owner, json!({"label": "customer-7c1"})).await;
-    assert_eq!(key_doc_version(&cp).await, json!(KEY_DOC_VERSION));
+    for key in [&ops, &first, &customer] {
+        assert_eq!(doc_version(&cp, key).await, KEY_DOC_VERSION, "{key}");
+    }
 
     close_behind_its_back(&cp, &[&ops, &customer]).await;
-    sqlx::query(
-        "UPDATE gw_resources SET doc = jsonb_set(doc, '{display_name}', '\"stale-7c1\"') \
-         WHERE kind = 'api_keys' AND id = $1::uuid",
-    )
-    .bind(&first)
-    .execute(cp.db().pool())
-    .await
-    .expect("tamper with a key document");
-    set_key_doc_version(&cp, 0).await;
+    make_stale(&cp, &[&first]).await;
+    set_doc_version(&cp, &[&first, &customer], 0).await;
     beat(&gw, "gw-7c1", "1.8.2+sha-old7c1").await;
     let upgraded = cp.restart_stamped(CP_VERSION).await;
     assert_eq!(key_doc(&upgraded, &ops).await["disabled"], true);
@@ -2267,7 +2300,8 @@ async fn a_boot_leaves_a_rewrite_an_older_gateway_refuses_for_later() {
         key_doc(&upgraded, &first).await["display_name"],
         "stale-7c1"
     );
-    assert_eq!(key_doc_version(&upgraded).await, json!(0));
+    assert_eq!(doc_version(&upgraded, &first).await, 0);
+    assert_eq!(doc_version(&upgraded, &customer).await, 0);
     drop(upgraded);
 
     beat(&gw, "gw-7c1", "1.9.0+sha-new7c1").await;
@@ -2275,13 +2309,16 @@ async fn a_boot_leaves_a_rewrite_an_older_gateway_refuses_for_later() {
     assert_eq!(key_doc(&again, &ops).await["disabled"], false);
     assert_eq!(key_doc(&again, &customer).await["disabled"], false);
     assert_eq!(key_doc(&again, &first).await["display_name"], "first-7c1");
-    assert_eq!(key_doc_version(&again).await, json!(KEY_DOC_VERSION));
+    for key in [&ops, &first, &customer] {
+        assert_eq!(doc_version(&again, key).await, KEY_DOC_VERSION, "{key}");
+    }
 }
 
 /// A release that changes what key documents carry rewrites every live key
-/// once, at its first boot, and not again; a revoked key stays deleted.
+/// whose document an older shape wrote, and advances its row; a key already
+/// at the shape is left alone, and a revoked key stays deleted.
 #[tokio::test]
-async fn a_new_key_document_version_rewrites_every_key_once() {
+async fn a_new_key_document_version_rewrites_every_key_and_advances_its_row() {
     let Some(cp) = TestCp::start().await else {
         return;
     };
@@ -2294,48 +2331,220 @@ async fn a_new_key_document_version_rewrites_every_key_once() {
     let (gone, _) = mint_ok(&cp, &owner_b, json!({"label": "gone-7c1"})).await;
     let r = on_key(&cp, &owner_b, "DELETE", &gone, None).await;
     assert_eq!(r.status, 204, "{r:?}");
-    let stale = |cp: &TestCp, key: String| {
-        let pool = cp.db().pool().clone();
-        async move {
-            sqlx::query(
-                "UPDATE gw_resources SET doc = jsonb_set(doc, '{display_name}', '\"stale-7c1\"') \
-                 WHERE kind = 'api_keys' AND id = $1::uuid",
-            )
-            .bind(key)
-            .execute(&pool)
-            .await
-            .expect("tamper with a key document");
-        }
-    };
-    stale(&cp, ka.clone()).await;
-    stale(&cp, kb.clone()).await;
+    make_stale(&cp, &[&ka, &kb]).await;
     let ctx = WriteCtx::of(cp.state());
 
-    // The stored version is this release's: nothing is rewritten.
-    let deferred = keys::bring_documents_up_to(cp.db(), &ctx, KEY_DOC_VERSION)
+    // Every key is at this release's shape: nothing is rewritten.
+    let pass = keys::catch_up(cp.db(), &ctx, KEY_DOC_VERSION)
         .await
-        .expect("bring the documents up to date");
-    assert_eq!(deferred, 0);
+        .expect("catch up");
+    assert_eq!(pass, keys::CatchUp::default());
     assert_eq!(key_doc(&cp, &ka).await["display_name"], "stale-7c1");
 
-    // A newer shape rewrites every key's document, once.
-    let deferred = keys::bring_documents_up_to(cp.db(), &ctx, KEY_DOC_VERSION + 1)
-        .await
-        .expect("bring the documents up to date");
-    assert_eq!(deferred, 0);
+    // A newer shape rewrites every live key, tenant by tenant.
+    let next = KEY_DOC_VERSION + 1;
+    let pass = keys::catch_up(cp.db(), &ctx, next).await.expect("catch up");
+    assert_eq!(
+        pass,
+        keys::CatchUp {
+            rewritten: 2,
+            ..keys::CatchUp::default()
+        }
+    );
     assert_eq!(key_doc(&cp, &ka).await["display_name"], "a-7c1");
     assert_eq!(key_doc(&cp, &kb).await["display_name"], "b-7c1");
+    assert_eq!(doc_version(&cp, &ka).await, next);
+    assert_eq!(doc_version(&cp, &kb).await, next);
     assert!(stored(&cp, "api_keys", &gone).await.deleted);
-    assert_eq!(key_doc_version(&cp).await, json!(KEY_DOC_VERSION + 1));
-    stale(&cp, ka.clone()).await;
-    keys::bring_documents_up_to(cp.db(), &ctx, KEY_DOC_VERSION + 1)
-        .await
-        .expect("bring the documents up to date");
+    assert_eq!(doc_version(&cp, &gone).await, KEY_DOC_VERSION);
+    // Caught up: the next pass finds nothing behind.
+    make_stale(&cp, &[&ka]).await;
+    let pass = keys::catch_up(cp.db(), &ctx, next).await.expect("catch up");
+    assert_eq!(pass, keys::CatchUp::default());
     assert_eq!(key_doc(&cp, &ka).await["display_name"], "stale-7c1");
 
-    // So does a boot that finds an older version stored.
-    set_key_doc_version(&cp, 0).await;
+    // A key an older replica wrote is caught up by a boot.
+    set_doc_version(&cp, &[&ka], 0).await;
     let restarted = cp.restart().await;
     assert_eq!(key_doc(&restarted, &ka).await["display_name"], "a-7c1");
-    assert_eq!(key_doc_version(&restarted).await, json!(KEY_DOC_VERSION));
+    assert_eq!(doc_version(&restarted, &ka).await, KEY_DOC_VERSION);
+}
+
+/// A tenant the gate refuses keeps its documents and its `doc_version`,
+/// and a later housekeeping tick catches it up once the older gateway has
+/// not reported for a day.
+#[tokio::test]
+async fn a_refused_tenant_is_caught_up_by_a_later_tick() {
+    let Some(cp) = TestCp::start_stamped(CP_VERSION).await else {
+        return;
+    };
+    let admin = cp.admin_login_seeded(OperatorRole::Admin).await;
+    let gw = register_gateway(&cp, &admin).await;
+    beat(&gw, "current-7c1", "1.9.0+sha-new7c1").await;
+    let refused = cp.seed_tenant(TenantStatus::Active).await;
+    let allowed = cp.seed_tenant(TenantStatus::Active).await;
+    let owner_r = cp.member_login_seeded(refused, MemberRole::Owner).await;
+    let owner_a = cp.member_login_seeded(allowed, MemberRole::Owner).await;
+    let (kr, _) = mint_ok(&cp, &owner_r, json!({"label": "refused-7c1"})).await;
+    let (ka, _) = mint_ok(&cp, &owner_a, json!({"label": "allowed-7c1"})).await;
+    close_behind_its_back(&cp, &[&kr]).await;
+    make_stale(&cp, &[&ka]).await;
+    set_doc_version(&cp, &[&kr, &ka], 0).await;
+    beat(&gw, "old-7c1", "1.8.2+sha-old7c1").await;
+    let ctx = WriteCtx::of(cp.state());
+
+    housekeeping::tick(cp.db(), &ctx).await;
+    assert_eq!(key_doc(&cp, &kr).await["disabled"], true);
+    assert_eq!(doc_version(&cp, &kr).await, 0);
+    assert_eq!(key_doc(&cp, &ka).await["display_name"], "allowed-7c1");
+    assert_eq!(doc_version(&cp, &ka).await, KEY_DOC_VERSION);
+
+    // Still registered an hour later: still refused.
+    sqlx::query(
+        "UPDATE dp_instances SET last_seen_at = now() - interval '1 hour' \
+         WHERE instance_id = 'old-7c1'",
+    )
+    .execute(cp.db().pool())
+    .await
+    .expect("age the older gateway");
+    housekeeping::tick(cp.db(), &ctx).await;
+    assert_eq!(doc_version(&cp, &kr).await, 0);
+
+    // Not heard from for a day: no longer judged, and the tick catches up.
+    sqlx::query(
+        "UPDATE dp_instances SET last_seen_at = now() - interval '25 hours' \
+         WHERE instance_id = 'old-7c1'",
+    )
+    .execute(cp.db().pool())
+    .await
+    .expect("age the older gateway");
+    housekeeping::tick(cp.db(), &ctx).await;
+    assert_eq!(key_doc(&cp, &kr).await["disabled"], false);
+    assert_eq!(doc_version(&cp, &kr).await, KEY_DOC_VERSION);
+}
+
+/// A catch-up holds one tenant at a time: while it waits for one tenant, a
+/// write in another tenant goes through at once, well within the database's
+/// lock timeout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_catch_up_blocks_no_write_beyond_the_tenant_it_holds() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let admin = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let mut ids = Vec::new();
+    for _ in 0..3 {
+        ids.push(cp.seed_tenant(TenantStatus::Active).await);
+    }
+    ids.sort();
+    // Caught up in id order: `done` first, then `held`, which the test
+    // keeps locked; `other` has nothing behind and takes a write meanwhile.
+    let (done, held, other) = (ids[0], ids[1], ids[2]);
+    let owner_done = cp.member_login_seeded(done, MemberRole::Owner).await;
+    let owner_held = cp.member_login_seeded(held, MemberRole::Owner).await;
+    let (k_done, _) = mint_ok(&cp, &owner_done, json!({"label": "done-7c1"})).await;
+    let (k_held, _) = mint_ok(&cp, &owner_held, json!({"label": "held-7c1"})).await;
+    make_stale(&cp, &[&k_done, &k_held]).await;
+    let next = KEY_DOC_VERSION + 1;
+
+    let mut holder = sqlx::PgConnection::connect(cp.database_url())
+        .await
+        .expect("a second connection");
+    sqlx::query("BEGIN")
+        .execute(&mut holder)
+        .await
+        .expect("begin");
+    sqlx::query("SELECT id FROM tenants WHERE id = $1 FOR UPDATE")
+        .bind(held)
+        .execute(&mut holder)
+        .await
+        .expect("hold a tenant");
+
+    let state = cp.state().clone();
+    let pass = tokio::spawn(async move {
+        let ctx = WriteCtx::of(&state);
+        keys::catch_up(&state.db, &ctx, next).await
+    });
+    // The pass has finished `done` and waits for `held`.
+    let started = std::time::Instant::now();
+    while doc_version(&cp, &k_done).await != next {
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "the catch-up never finished the first tenant"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    let before = std::time::Instant::now();
+    patch_tenant_ok(&cp, &admin, other, json!({"name": "written-meanwhile-7c1"})).await;
+    let waited = before.elapsed();
+    assert!(
+        waited < std::time::Duration::from_secs(3),
+        "a write in another tenant waited {waited:?} for the catch-up"
+    );
+    assert!(
+        !pass.is_finished(),
+        "the catch-up did not wait for the held tenant"
+    );
+
+    sqlx::query("ROLLBACK")
+        .execute(&mut holder)
+        .await
+        .expect("release the tenant");
+    let pass = pass.await.expect("join").expect("catch up");
+    assert_eq!(
+        pass,
+        keys::CatchUp {
+            rewritten: 2,
+            ..keys::CatchUp::default()
+        }
+    );
+    assert_eq!(key_doc(&cp, &k_held).await["display_name"], "held-7c1");
+    assert_eq!(doc_version(&cp, &k_held).await, next);
+}
+
+/// A tenant another transaction holds past the lock timeout is left for a
+/// later pass, not counted as a failure (which would stop a boot).
+#[tokio::test]
+async fn a_tenant_busy_past_the_lock_timeout_is_left_for_a_later_pass() {
+    let Some(cp) = TestCp::start_with(|cfg| cfg.db_lock_timeout_ms = 300).await else {
+        return;
+    };
+    let tenant = cp.seed_tenant(TenantStatus::Active).await;
+    let owner = cp.member_login_seeded(tenant, MemberRole::Owner).await;
+    let (key, _) = mint_ok(&cp, &owner, json!({"label": "busy-7c1"})).await;
+    make_stale(&cp, &[&key]).await;
+    let next = KEY_DOC_VERSION + 1;
+    let ctx = WriteCtx::of(cp.state());
+
+    let mut holder = sqlx::PgConnection::connect(cp.database_url())
+        .await
+        .expect("a second connection");
+    sqlx::query("BEGIN")
+        .execute(&mut holder)
+        .await
+        .expect("begin");
+    sqlx::query("SELECT id FROM tenants WHERE id = $1 FOR UPDATE")
+        .bind(tenant)
+        .execute(&mut holder)
+        .await
+        .expect("hold the tenant");
+    let pass = keys::catch_up(cp.db(), &ctx, next).await.expect("catch up");
+    assert_eq!(
+        pass,
+        keys::CatchUp {
+            deferred: 1,
+            ..keys::CatchUp::default()
+        }
+    );
+    assert_eq!(doc_version(&cp, &key).await, KEY_DOC_VERSION);
+    sqlx::query("ROLLBACK")
+        .execute(&mut holder)
+        .await
+        .expect("release the tenant");
+
+    let pass = keys::catch_up(cp.db(), &ctx, next).await.expect("catch up");
+    assert_eq!(pass.rewritten, 1, "{pass:?}");
+    assert_eq!(key_doc(&cp, &key).await["display_name"], "busy-7c1");
+    assert_eq!(doc_version(&cp, &key).await, next);
 }

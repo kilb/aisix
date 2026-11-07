@@ -51,7 +51,6 @@ use crate::members;
 use crate::resources::api::if_match;
 use crate::resources::write::WriteCtx;
 use crate::resources::Kind;
-use crate::settings;
 use crate::tenants::{self, TenantRow, TenantStatus};
 use crate::AppState;
 
@@ -97,6 +96,13 @@ pub struct KeyLimits {
     pub rpm: Option<u32>,
 }
 
+/// Who minted a key: `kind` is `member` or `operator`, `id` theirs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeyCreator {
+    pub kind: String,
+    pub id: Option<Uuid>,
+}
+
 /// One row of `tenant_keys`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct KeyRow {
@@ -124,6 +130,7 @@ pub struct KeyRow {
     pub expires_at: Option<DateTime<Utc>>,
     pub version: i64,
     pub created_at: DateTime<Utc>,
+    pub created_by: KeyCreator,
 }
 
 type RawKey = (
@@ -142,11 +149,14 @@ type RawKey = (
     Option<DateTime<Utc>>,
     i64,
     DateTime<Utc>,
+    Value,
 );
 
+// `created_by` as one value, so the row stays within the 16 columns a
+// tuple decodes.
 const COLUMNS: &str = "id, tenant_id, member_id, label, key_hash, key_prefix, model_ids, \
      allowed_models, allowed_provider_groups, rate_limit, disabled, operator_disabled, expires_at, \
-     version, created_at";
+     version, created_at, jsonb_build_object('kind', created_by_kind, 'id', created_by)";
 
 impl KeyRow {
     fn from_raw(raw: RawKey) -> Result<KeyRow, ApiError> {
@@ -166,6 +176,7 @@ impl KeyRow {
             expires_at,
             version,
             created_at,
+            created_by,
         ) = raw;
         Ok(KeyRow {
             id,
@@ -183,6 +194,7 @@ impl KeyRow {
             expires_at,
             version,
             created_at,
+            created_by: serde_json::from_value(created_by).map_err(ApiError::internal)?,
         })
     }
 }
@@ -267,14 +279,13 @@ fn effective_disabled(t: &TenantRow, k: &KeyRow, member_active: bool) -> bool {
 }
 
 /// The shape of the documents [`build_key_doc`] writes. A release that
-/// changes what a key document carries raises it, and that release's first
-/// boot rewrites every key's document ([`bring_documents_up_to`]): nothing
-/// else rewrites a key whose own state did not change.
-pub const KEY_DOC_VERSION: u32 = 1;
-
-/// The `cp_settings` key the shape the stored key documents were last
-/// written in is kept under.
-const KEY_DOC_VERSION_SETTING: &str = "key_doc_version";
+/// changes what a key document carries raises it. Every write of a key's
+/// document records the version it was written in (`tenant_keys.doc_version`),
+/// and [`catch_up`] rewrites the keys behind it: nothing else rewrites a key
+/// whose own state did not change. Kept per row, so a key an older replica
+/// writes during a rolling upgrade, or one written before a rollback and a
+/// second upgrade, is caught up too.
+pub const KEY_DOC_VERSION: i32 = 1;
 
 /// The gateway `api_keys` document of key `k` of tenant `t`, whose member,
 /// if it has one, is `member_active`: neither disabled nor removed, and in
@@ -412,16 +423,24 @@ async fn member_active(conn: &mut PgConnection, member_id: Option<Uuid>) -> Resu
 }
 
 /// Writes key `k`'s document as it should now be (nothing when it already
-/// is).
+/// is), and records that it is written in shape `version`.
 async fn project(
     conn: &mut PgConnection,
     ctx: &WriteCtx,
     t: &TenantRow,
     k: &KeyRow,
     member_active: bool,
+    version: i32,
 ) -> Result<(), ApiError> {
     let doc = build_key_doc(t, k, member_active);
-    tenants::put(conn, ctx, Kind::ApiKeys, k.id, &doc, &owner(k.id)).await
+    tenants::put(&mut *conn, ctx, Kind::ApiKeys, k.id, &doc, &owner(k.id)).await?;
+    sqlx::query("UPDATE tenant_keys SET doc_version = $2 WHERE id = $1 AND doc_version <> $2")
+        .bind(k.id)
+        .bind(version)
+        .execute(conn)
+        .await
+        .map_err(DbError::from)?;
+    Ok(())
 }
 
 /// Rewrites the document of every live key of `tenant_id` from the tenant's
@@ -432,11 +451,22 @@ pub async fn reproject_tenant(
     ctx: &WriteCtx,
     tenant_id: Uuid,
 ) -> Result<(), ApiError> {
+    reproject_tenant_at(conn, ctx, tenant_id, KEY_DOC_VERSION).await
+}
+
+/// [`reproject_tenant`], recording the documents as written in shape
+/// `version`.
+async fn reproject_tenant_at(
+    conn: &mut PgConnection,
+    ctx: &WriteCtx,
+    tenant_id: Uuid,
+    version: i32,
+) -> Result<(), ApiError> {
     let tenant = tenants::lock(&mut *conn, tenant_id).await?;
     let inactive = inactive_members(&mut *conn, tenant_id).await?;
     for key in select(&mut *conn, None, Some(tenant_id), None).await? {
         let active = key.member_id.is_none_or(|m| !inactive.contains(&m));
-        project(&mut *conn, ctx, &tenant, &key, active).await?;
+        project(&mut *conn, ctx, &tenant, &key, active, version).await?;
     }
     Ok(())
 }
@@ -458,7 +488,7 @@ pub async fn reproject_member(
     let tenant = tenants::lock(&mut *conn, tenant_id).await?;
     let active = member_active(&mut *conn, Some(member_id)).await?;
     for key in select(&mut *conn, None, Some(tenant_id), Some(member_id)).await? {
-        project(&mut *conn, ctx, &tenant, &key, active).await?;
+        project(&mut *conn, ctx, &tenant, &key, active, KEY_DOC_VERSION).await?;
     }
     Ok(())
 }
@@ -488,70 +518,93 @@ pub async fn revoke_member(
     Ok(revoked)
 }
 
-/// Rewrites every live key's document when the stored key documents were
-/// written in a shape older than `version` (the boot passes
-/// [`KEY_DOC_VERSION`]), then records `version`. Runs at boot under the
-/// boot lock, with every tenant that has keys locked first, in id order.
+/// What one [`catch_up`] did, by tenant.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CatchUp {
+    /// Tenants whose keys were rewritten.
+    pub rewritten: usize,
+    /// Tenants the gateway-version gate refused, or that stayed busy past
+    /// the lock timeout, left for a later pass.
+    pub deferred: usize,
+    /// Tenants whose rewrite failed for another reason, logged.
+    pub failed: usize,
+}
+
+/// Rewrites the documents of every tenant that holds a live key whose
+/// document is behind `version` (its `doc_version`; the running release
+/// passes [`KEY_DOC_VERSION`]). Runs at boot and on every housekeeping
+/// tick, on every instance; while nothing is behind it costs one indexed
+/// query.
 ///
-/// Each tenant's keys are rewritten in a savepoint. One the gateway-version
-/// gate refuses (an older gateway is registered, as during every upgrade)
-/// is rolled back and logged, and `version` is then not recorded, so the
-/// next boot rewrites every tenant again; rewriting a document already as
-/// it should be writes nothing. Any other error fails the boot. How many
-/// tenants were left for a later boot.
-pub async fn bring_documents_up_to(
-    db: &Db,
-    ctx: &WriteCtx,
-    version: u32,
-) -> Result<usize, ApiError> {
-    let ctx = WriteCtx {
-        mk: crate::crypto::MasterKey(ctx.mk.0),
-        env: ctx.env.clone(),
-        cp_version: ctx.cp_version.clone(),
-        stale_secs: ctx.stale_secs,
-    };
-    db.tx(move |conn| {
-        async move {
-            sqlx::query("SELECT pg_advisory_xact_lock($1)")
-                .bind(settings::BOOT_LOCK_KEY)
-                .execute(&mut *conn)
-                .await
-                .map_err(DbError::from)?;
-            let stored = settings::get(&mut *conn, KEY_DOC_VERSION_SETTING)
-                .await?
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
-            if stored >= u64::from(version) {
-                return Ok(0);
-            }
-            let mut holders: Vec<Uuid> = sqlx::query_scalar(
-                "SELECT DISTINCT tenant_id FROM tenant_keys WHERE revoked_at IS NULL",
-            )
-            .fetch_all(&mut *conn)
-            .await
-            .map_err(DbError::from)?;
-            tenants::lock_many(&mut *conn, &mut holders).await?;
-            let mut deferred = 0;
-            for tenant_id in holders {
-                tenants::boot_savepoint(&mut *conn).await?;
-                let outcome = reproject_tenant(&mut *conn, &ctx, tenant_id).await;
-                if !tenants::settle_boot_projection(&mut *conn, outcome).await? {
-                    deferred += 1;
-                    tracing::warn!(
-                        tenant = %tenant_id,
-                        "a tenant's key documents were not rewritten: a registered gateway is \
-                         too old for them; the next boot tries again"
-                    );
-                }
-            }
-            if deferred == 0 {
-                settings::set(&mut *conn, KEY_DOC_VERSION_SETTING, &json!(version)).await?;
-            }
-            Ok::<_, ApiError>(deferred)
-        }
-        .boxed()
-    })
+/// Each tenant is one transaction of its own (its lock, then the resources
+/// lock for each write), so a pass holds no lock across tenants, and a
+/// write anywhere else waits for one tenant's rewrite at most. Two
+/// instances running a pass together each take a tenant in turn, and the
+/// second finds it caught up.
+///
+/// A tenant the gateway-version gate refuses (an older gateway is still
+/// registered, as during every upgrade) keeps its documents and its
+/// `doc_version`, is logged, and is rewritten by a later pass once that
+/// gateway is gone; so is one held by another transaction for longer than
+/// the lock timeout. A tenant that fails otherwise is logged and counted as
+/// failed. Only the first query's failure is an error.
+pub async fn catch_up(db: &Db, ctx: &WriteCtx, version: i32) -> Result<CatchUp, ApiError> {
+    let behind: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT DISTINCT tenant_id FROM tenant_keys \
+         WHERE revoked_at IS NULL AND doc_version < $1 ORDER BY tenant_id",
+    )
+    .bind(version)
+    .fetch_all(db.pool())
     .await
+    .map_err(DbError::from)?;
+    let mut outcome = CatchUp::default();
+    for tenant_id in behind {
+        let ctx = WriteCtx {
+            mk: crate::crypto::MasterKey(ctx.mk.0),
+            env: ctx.env.clone(),
+            cp_version: ctx.cp_version.clone(),
+            stale_secs: ctx.stale_secs,
+        };
+        let rewritten = db
+            .tx(move |conn| {
+                async move {
+                    tenants::lock(&mut *conn, tenant_id).await?;
+                    reproject_tenant_at(&mut *conn, &ctx, tenant_id, version).await
+                }
+                .boxed()
+            })
+            .await;
+        match rewritten {
+            Ok(()) => outcome.rewritten += 1,
+            Err(e) if compat::refused(&e) => {
+                outcome.deferred += 1;
+                tracing::warn!(
+                    tenant = %tenant_id,
+                    "a tenant's key documents were not rewritten: a registered gateway is too \
+                     old for them; a later pass tries again"
+                );
+            }
+            // Busy past the lock timeout: contention, not a fault.
+            Err(e) if e.status == StatusCode::SERVICE_UNAVAILABLE => {
+                outcome.deferred += 1;
+                tracing::warn!(
+                    tenant = %tenant_id,
+                    "a tenant's key documents were not rewritten: the tenant stayed busy; a \
+                     later pass tries again"
+                );
+            }
+            Err(e) => {
+                outcome.failed += 1;
+                tracing::warn!(
+                    tenant = %tenant_id,
+                    code = e.code,
+                    reason = %e.message,
+                    "a tenant's key documents could not be rewritten"
+                );
+            }
+        }
+    }
+    Ok(outcome)
 }
 
 fn detail(path: &str, message: impl Into<String>) -> Detail {
@@ -885,6 +938,10 @@ async fn create_key(
         expires_at: None,
         version: 1,
         created_at: Utc::now(),
+        created_by: KeyCreator {
+            kind: String::new(),
+            id: None,
+        },
     };
     changes.apply(t, &mut key)?;
     let (plaintext, key_hash) = mint()?;
@@ -921,7 +978,7 @@ async fn create_key(
     .map_err(DbError::from)?;
     let key = KeyRow::from_raw(raw)?;
     let active = member_active(&mut *conn, key.member_id).await?;
-    project(&mut *conn, ctx, t, &key, active).await?;
+    project(&mut *conn, ctx, t, &key, active, KEY_DOC_VERSION).await?;
     audit::record(
         conn,
         audit_entry(
@@ -974,7 +1031,7 @@ async fn update_key(
     .map_err(DbError::from)?;
     let key = KeyRow::from_raw(raw)?;
     let active = member_active(&mut *conn, key.member_id).await?;
-    project(&mut *conn, ctx, t, &key, active).await?;
+    project(&mut *conn, ctx, t, &key, active, KEY_DOC_VERSION).await?;
     audit::record(conn, audit_entry(by, "key.update", &key, detail)).await?;
     Ok(key)
 }
@@ -1100,6 +1157,9 @@ pub struct AdminKeyView {
     effective_disabled: bool,
     expires_at: Option<DateTime<Utc>>,
     created_at: DateTime<Utc>,
+    /// Who minted it, so a key a member minted before they were demoted or
+    /// removed can be found.
+    created_by: KeyCreator,
     version: i64,
 }
 
@@ -1120,6 +1180,7 @@ fn admin_view(t: &TenantRow, k: KeyRow, member_active: bool) -> AdminKeyView {
         disabled_by_tenant: k.disabled,
         expires_at: k.expires_at,
         created_at: k.created_at,
+        created_by: k.created_by,
         version: k.version,
     }
 }
@@ -1347,8 +1408,9 @@ pub async fn create(
 /// `PATCH /api/keys/{id}` with `{label?, model_ids?, rate_limit?,
 /// disabled?, expires_at?}` and `If-Match` → `200 TenantKey`. The key is
 /// looked up before `If-Match` is read, so `428` and `412` answer only for
-/// the caller's own keys. `disabled` is the tenant's own switch; `false`
-/// for a key the platform switched off is `403 forbidden`.
+/// the caller's own keys. `disabled` is the tenant's own switch: switching
+/// it back on while the platform's switch is set is `403 forbidden`, and
+/// `false` for a switch already off is no change.
 pub async fn update(
     auth: MemberAuth,
     State(state): State<AppState>,
@@ -1369,7 +1431,9 @@ pub async fn update(
                 let key = live_key(&mut *conn, id, Some(tenant.id), own_only(&auth)).await?;
                 check_version(&key, expected)?;
                 // The platform's switch is the platform's to undo.
-                if key.operator_disabled && req.disabled == Some(false) {
+                // Only a change of the tenant's own switch is refused: one
+                // already off is no change.
+                if key.operator_disabled && key.disabled && req.disabled == Some(false) {
                     return Err(ApiError {
                         message: "该密钥已被平台停用，只有平台可以重新启用".to_string(),
                         ..ApiError::forbidden()
@@ -1641,6 +1705,10 @@ mod tests {
             expires_at: None,
             version: 1,
             created_at: Utc::now(),
+            created_by: KeyCreator {
+                kind: "member".to_string(),
+                id: None,
+            },
         }
     }
 
