@@ -182,6 +182,23 @@ export interface Member {
   created_at: string;
 }
 
+/** What `PATCH /admin/tenants/{id}` takes: each field given replaces the stored one. */
+export interface TenantChanges {
+  allowed_model_ids?: string[];
+  allowed_provider_groups?: string[];
+  /** Replaces every limit: a limit left out is unset. */
+  limits?: TenantLimits;
+}
+
+/** An invitation at issue: the only answer that carries its token. */
+export interface Invite {
+  id: string;
+  invite_token: string;
+  /** Only when the control plane knows the tenant portal's address. */
+  invite_url?: string;
+  expires_at: string;
+}
+
 export interface AdminKey {
   id: string;
   tenant_id: string;
@@ -202,6 +219,25 @@ export interface AdminKey {
   created_at: string;
   created_by: { kind: string; id: string | null };
   version: number;
+}
+
+/** What `POST /admin/tenants/{id}/keys` takes; a field left out is unset. */
+export interface NewKey {
+  label: string;
+  /** Selected from the tenant's grants; left out, the key follows every grant. */
+  model_ids?: string[];
+  /** Model name patterns, for the platform's own tenant only. */
+  allowed_models?: string[];
+  allowed_provider_groups?: string[];
+  rate_limit?: { concurrency?: number; rpm?: number };
+  /** RFC 3339. */
+  expires_at?: string;
+}
+
+/** A key at creation: the only answer that carries its plaintext. */
+export interface MintedKey {
+  key: AdminKey;
+  plaintext: string;
 }
 
 export interface Instance {
@@ -365,17 +401,66 @@ export const schemas = {
 
 // Filled in by the tasks that build their pages, one namespace each.
 
-/** Tenants, and their keys, as operators see them. */
+/** Tenants, and their members and keys, as operators see them. */
 export const tenants = {
   async list(status?: Tenant["status"]): Promise<Tenant[]> {
     const query = status ? `?status=${seg(status)}` : "";
     return (await call<{ items: Tenant[] }>("GET", `/admin/tenants${query}`)).data.items;
   },
+  async get(id: string, signal?: AbortSignal): Promise<Tenant> {
+    return (await call<Tenant>("GET", `/admin/tenants/${seg(id)}`, undefined, undefined, signal)).data;
+  },
+  async update(id: string, changes: TenantChanges, version: number): Promise<Tenant> {
+    return (await call<Tenant>("PATCH", `/admin/tenants/${seg(id)}`, changes, version)).data;
+  },
+  /** pending → active. */
+  async approve(id: string): Promise<Tenant> {
+    return (await call<Tenant>("POST", `/admin/tenants/${seg(id)}/approve`)).data;
+  },
+  /** active → suspended: the tenant's keys stop working. */
+  async suspend(id: string): Promise<Tenant> {
+    return (await call<Tenant>("POST", `/admin/tenants/${seg(id)}/suspend`)).data;
+  },
+  /** suspended → active. */
+  async reactivate(id: string): Promise<Tenant> {
+    return (await call<Tenant>("POST", `/admin/tenants/${seg(id)}/reactivate`)).data;
+  },
+  async members(id: string): Promise<Member[]> {
+    return (await call<{ items: Member[] }>("GET", `/admin/tenants/${seg(id)}/members`)).data.items;
+  },
+  /** Disabling a member ends their sessions and switches their keys off with them. */
+  async setMemberDisabled(memberId: string, disabled: boolean): Promise<Member> {
+    return (await call<Member>("PATCH", `/admin/members/${seg(memberId)}`, { disabled })).data;
+  },
+  async invite(id: string, email: string, role: Member["role"]): Promise<Invite> {
+    return (await call<Invite>("POST", `/admin/tenants/${seg(id)}/invites`, { email, role })).data;
+  },
   async keys(id: string): Promise<AdminKey[]> {
     return (await call<{ items: AdminKey[] }>("GET", `/admin/tenants/${seg(id)}/keys`)).data.items;
   },
 };
-export const keys = {};
+
+export const keys = {
+  /** The answer is the only one that carries the plaintext: never store or log it. */
+  async create(tenantId: string, body: NewKey): Promise<MintedKey> {
+    return (await call<MintedKey>("POST", `/admin/tenants/${seg(tenantId)}/keys`, body)).data;
+  },
+  /**
+   * `disabled` is the operators' switch; `allowed_provider_groups: null` drops
+   * the key's own groups, so it follows its tenant's.
+   */
+  async update(
+    id: string,
+    changes: { disabled?: boolean; allowed_provider_groups?: string[] | null },
+    version: number,
+  ): Promise<AdminKey> {
+    return (await call<AdminKey>("PATCH", `/admin/keys/${seg(id)}`, changes, version)).data;
+  },
+  async revoke(id: string, version: number): Promise<void> {
+    await call<null>("DELETE", `/admin/keys/${seg(id)}`, undefined, version);
+  },
+};
+
 /** Gateway instances and the credentials they boot from. */
 export const gateways = {
   async instances(): Promise<Instance[]> {
@@ -430,8 +515,20 @@ export const environment = {
 
 export const operators = {};
 export const audit = {};
+
 export const settings = {
   async tenantDefaults(): Promise<TenantDefaults> {
     return (await call<TenantDefaults>("GET", "/admin/settings/tenant-defaults")).data;
+  },
+  /** Replaces the whole defaults: a limit left out is unset. */
+  async saveTenantDefaults(defaults: TenantDefaults): Promise<TenantDefaults> {
+    return (await call<TenantDefaults>("PUT", "/admin/settings/tenant-defaults", defaults)).data;
+  },
+};
+
+/** Every group a live upstream account is in, with its accounts. */
+export const providerGroups = {
+  async list(): Promise<ProviderGroup[]> {
+    return (await call<{ items: ProviderGroup[] }>("GET", "/admin/provider-groups")).data.items;
   },
 };

@@ -5,9 +5,11 @@ import { messageFor } from "./lib/errors";
 import { useTheme } from "./lib/useTheme";
 import { Gate } from "./Gate";
 import { Gateways } from "./tabs/Gateways";
+import { Keys } from "./tabs/Keys";
 import { Models } from "./tabs/Models";
 import { Overview } from "./tabs/Overview";
 import { Providers } from "./tabs/Providers";
+import { Tenants } from "./tabs/Tenants";
 
 const TABS = [
   { id: "overview", label: "概览" },
@@ -59,6 +61,10 @@ function Page({ tab, ...props }: TabProps & { tab: TabId }) {
       return <Providers {...props} />;
     case "models":
       return <Models {...props} />;
+    case "tenants":
+      return <Tenants {...props} />;
+    case "keys":
+      return <Keys {...props} />;
     default:
       return <NotBuilt label={TABS.find((t) => t.id === tab)?.label ?? tab} />;
   }
