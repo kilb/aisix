@@ -166,13 +166,6 @@ impl Limiter {
         self.store.add_tokens(key, tokens);
     }
 
-    /// Record whether the bucket `key` carries a spend allowance, ahead of a
-    /// credit this process makes to it without having admitted a request
-    /// for it ([`RateStore::note_allowance`]).
-    pub fn note_allowance(&self, key: &str, limits: &aisix_core::RateLimit) {
-        self.store.note_allowance(key, limits);
-    }
-
     /// Credit every reservation layer in one batch. Prefer this over a loop
     /// of [`Limiter::add_tokens_post_stream`]: a distributed store waits
     /// once for the whole batch instead of once per layer, and this runs
@@ -659,7 +652,6 @@ mod tests {
             tph: None,
             tpd: None,
             concurrency,
-            granted_micro_usd: None,
         }
     }
 
@@ -679,7 +671,6 @@ mod tests {
             tph: None,
             tpd: None,
             concurrency: None,
-            granted_micro_usd: None,
         }
     }
 
@@ -718,12 +709,7 @@ mod tests {
         let l = limits_full(Some(1), Some(100), None, None);
 
         let _r1 = limiter.pre_commit("k", &l).await.unwrap();
-        let detail = limiter
-            .pre_commit("k", &l)
-            .await
-            .unwrap_err()
-            .detail()
-            .unwrap();
+        let detail = limiter.pre_commit("k", &l).await.unwrap_err().detail();
         assert_eq!(detail.dimension, "rps");
         assert_eq!(detail.limit, 1);
         assert_eq!(detail.remaining, 0);
@@ -733,12 +719,7 @@ mod tests {
         let l = limits_full(Some(100), Some(1), None, None);
         clock.advance(1);
         let _r2 = limiter.pre_commit("k2", &l).await.unwrap();
-        let detail = limiter
-            .pre_commit("k2", &l)
-            .await
-            .unwrap_err()
-            .detail()
-            .unwrap();
+        let detail = limiter.pre_commit("k2", &l).await.unwrap_err().detail();
         assert_eq!(detail.dimension, "rpm");
         assert_eq!(detail.limit, 1);
     }
@@ -757,12 +738,7 @@ mod tests {
         let r = limiter.pre_commit("k", &l).await.unwrap();
         r.commit_tokens(1_000).await;
 
-        let detail = limiter
-            .pre_commit("k", &l)
-            .await
-            .unwrap_err()
-            .detail()
-            .unwrap();
+        let detail = limiter.pre_commit("k", &l).await.unwrap_err().detail();
         assert_eq!(detail.dimension, "tpm");
         assert_eq!(detail.limit, 50);
         // The counter overran the cap; remaining floors at zero.
@@ -783,12 +759,7 @@ mod tests {
         let _r = limiter.pre_commit("k", &l).await.unwrap();
 
         for offset in 0..60u64 {
-            let detail = limiter
-                .pre_commit("k", &l)
-                .await
-                .unwrap_err()
-                .detail()
-                .unwrap();
+            let detail = limiter.pre_commit("k", &l).await.unwrap_err().detail();
             assert_eq!(
                 detail.reset_secs,
                 60 - offset,
@@ -814,12 +785,7 @@ mod tests {
 
         let _r1 = limiter.pre_commit("k", &l).await.unwrap();
         let _r2 = limiter.pre_commit("k", &l).await.unwrap();
-        let detail = limiter
-            .pre_commit("k", &l)
-            .await
-            .unwrap_err()
-            .detail()
-            .unwrap();
+        let detail = limiter.pre_commit("k", &l).await.unwrap_err().detail();
 
         assert_eq!(detail.dimension, "concurrency");
         assert_eq!(detail.limit, 2);
@@ -1063,7 +1029,6 @@ mod tests {
             tph: None,
             tpd: None,
             concurrency: None,
-            granted_micro_usd: None,
         };
         // Soak up 19 RPM = 19 RPD across two minutes so RPD is at 19.
         for i in 0..19 {
@@ -1104,7 +1069,6 @@ mod tests {
             tph: None,
             tpd: None,
             concurrency: None,
-            granted_micro_usd: None,
         };
         for _ in 0..5 {
             let _r = limiter.pre_commit("k1", &l).await.unwrap();

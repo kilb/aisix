@@ -228,10 +228,7 @@ fn match_policy_layer(
     if !applies {
         return None;
     }
-    // `classic_rate_limit` 需要 window，而只配累计发放额的策略没有窗口 ——
-    // 用 `?` 会让整条策略在这里就被丢掉，字段配了也不生效（正是仓库反复吃过的
-    // 那种「接受但不读」的形态）。没有窗口时退成空限制，由下面的花费层承载。
-    let limits = classic_rate_limit(policy).unwrap_or_default();
+    let limits = classic_rate_limit(policy)?;
     // Most scopes share one counter across every key the policy matches
     // (`policy:<scope>:<scope_ref>:<id>`). `team_member` appends the
     // request's `user_id` so each member of the team counts against an
@@ -244,20 +241,9 @@ fn match_policy_layer(
         _ => String::new(),
     };
     let bucket_key = format!("policy:{scope}:{scope_ref}:{policy_entry_id}{member_suffix}");
-    // 花费桶：窗口上限与累计发放额共用同一个桶。
-    //
-    // 共用是有意的 —— 那次 acquire 本来就要发生，累计额搭上去零新增往返
-    // （reserve_layers 的各层是顺序 await 的）。两者也不是替代关系：一个是
-    // 「总共给了多少」，一个是「每天最多花多快」，同时设时都生效。
-    //
-    // 累计额不看窗口：`second` 窗口下花费上限失效，但发放额照样成立，因为它
-    // 根本不按窗口结算。所以「只配了发放额、没配窗口」这条策略也必须建桶。
-    let spend = {
-        let mut limits = match (policy.max_spend_micro_usd, policy.window) {
-            (Some(max_spend), Some(window)) => spend_limits_for(window, max_spend),
-            _ => RateLimit::default(),
-        };
-        apply_granted(&mut limits, policy.granted_micro_usd);
+    let spend = policy.max_spend_micro_usd.and_then(|max_spend| {
+        let limits = spend_limits_for(policy.window?, max_spend);
+        // second 窗口投影为空，此时不预留（已在 `classic_rate_limit` 报警）。
         (!limits.is_unrestricted()).then(|| SpendLayer {
             bucket_key: format!(
                 "{}{member_suffix}",
@@ -265,7 +251,7 @@ fn match_policy_layer(
             ),
             limits,
         })
-    };
+    });
     // 只设了花费上限的策略也要生效：token 侧无限制不代表整条策略无限制。
     if limits.is_unrestricted() && spend.is_none() {
         return None;
@@ -561,21 +547,6 @@ fn spend_limits_for(window: PolicyWindow, max_spend_micro_usd: u64) -> RateLimit
     rl
 }
 
-/// 把累计发放额投影到同一个花费桶上。
-///
-/// 刻意跟窗口上限**共用一个桶**：那次 `acquire` 本来就要发生，累计额度搭上去
-/// 是零新增往返（`reserve_layers` 的各层是顺序 await 的，多一层就多一次串行
-/// 往返）。两者可以同时设，互不替代 —— 一个是「总共给了多少」，一个是「每天
-/// 最多花多快」。
-///
-/// 累计额不看窗口：`second` 窗口下花费上限是失效的，但发放额照样生效，因为它
-/// 根本不按窗口结算。
-fn apply_granted(rl: &mut RateLimit, granted_micro_usd: Option<u64>) {
-    if let Some(g) = granted_micro_usd {
-        rl.granted_micro_usd = Some(g);
-    }
-}
-
 /// Reserve across all applicable rate-limit layers (api_key, model,
 /// mcp_server, policies). `mcp_server` is the MCP server an in-flight
 /// `tools/call` targets; `None` for every non-MCP endpoint.
@@ -769,11 +740,6 @@ async fn reserve_policy_layers(
 /// 给事后才知道花了多少的路径用：批处理跑几天才结束，付钱的那把密钥当时可能根本
 /// 没有在途请求，手上没有预留可以取键。与 [`reserve_policy_layers`] 走同一个匹配，
 /// 所以两边记的是同一组桶。批处理只路由到直连模型，模型层策略也在这一相位匹配。
-///
-/// Every bucket handed back has its shape noted on the limiter
-/// (`Limiter::note_allowance`): this replica may never have admitted a
-/// request for it, and a credit to an allowance bucket must still be kept,
-/// not shed, when Redis does not take it.
 pub(crate) fn spend_bucket_keys(
     state: &ProxyState,
     snapshot: &aisix_core::AisixSnapshot,
@@ -793,13 +759,7 @@ pub(crate) fn spend_bucket_keys(
         .candidates(&input)
         .filter(|entry| !entry.value.suspended_at(now))
         .filter_map(|entry| match_policy_layer(&entry.value, &entry.id, &input, phase))
-        .filter_map(|layer| layer.spend)
-        .map(|spend| {
-            state
-                .limiter
-                .note_allowance(&spend.bucket_key, &spend.limits);
-            spend.bucket_key
-        })
+        .filter_map(|layer| layer.spend.map(|spend| spend.bucket_key))
         .collect()
 }
 
@@ -901,19 +861,7 @@ pub(crate) fn policy_bucket_is_callers(policy: &RateLimitPolicy) -> bool {
 /// 字符串，不掺调用方数据（基数规则）。花费层只在 minute/hour/day 上预留
 /// （`second` 下从不建层，见 [`warn_inert_dimension_once`] 的调用点），
 /// `Second`/`None` 分支理论上不可达，给一个不会被误读成具体窗口的兜底值。
-fn spend_scope_label(
-    window: Option<PolicyWindow>,
-    err: &aisix_ratelimit::RateLimitError,
-) -> &'static str {
-    // 累计发放额没有窗口，所以不能按窗口打标签 —— 那会落进 `spend_unknown`，
-    // 把「额度用尽」跟一个说不清的状况混在一起。这两件事的处置完全不同：
-    // 当日上限打满等到明天就好了，额度用尽要有人去充值。
-    if matches!(err, aisix_ratelimit::RateLimitError::AllowanceExhausted) {
-        return "spend_allowance";
-    }
-    if matches!(err, aisix_ratelimit::RateLimitError::AllowanceUnverified) {
-        return "spend_allowance_unverified";
-    }
+fn spend_scope_label(window: Option<PolicyWindow>) -> &'static str {
     match window {
         Some(PolicyWindow::Minute) => "spend_minute",
         Some(PolicyWindow::Hour) => "spend_hour",
@@ -956,18 +904,10 @@ fn reject_spend(
     member: Option<&str>,
 ) -> ProxyError {
     state.metrics.record_ratelimit_rejection(
-        spend_scope_label(policy.window, &err),
+        spend_scope_label(policy.window),
         "policy_spend",
         Some((policy_id, policy.name.as_str())),
     );
-    // The shared store did not answer for a bucket carrying an allowance:
-    // whether it has room cannot be known, so the caller is told spending
-    // could not be verified (`503` `allowance_unverified`), not that the
-    // money ran out. Not `BudgetUnverified`: that one names the usage
-    // delivery to the control plane, which is not what failed here.
-    if matches!(err, aisix_ratelimit::RateLimitError::AllowanceUnverified) {
-        return ProxyError::AllowanceUnverified;
-    }
     let retry_after_seconds = err.retry_after_secs();
     let usd = |micro: u64| format!("{:.6}", micro as f64 / 1_000_000.0);
     let scope_ref = match (policy.scope, member) {
@@ -979,13 +919,8 @@ fn reject_spend(
     };
     // Platform mode must not name the policy, so the caller reads a message
     // without it; `message` keeps the name for telemetry.
-    let caller_message = if matches!(err, aisix_ratelimit::RateLimitError::AllowanceExhausted) {
-        "Spend allowance exhausted. Top up to continue."
-    } else {
-        "Spend ceiling reached."
-    };
     ProxyError::BudgetExceeded(Box::new(crate::budget::BudgetReason {
-        caller_message: Some(caller_message.to_string()),
+        caller_message: Some("Spend ceiling reached.".to_string()),
         scope_kind: policy.scope.and_then(|s| match s {
             PolicyScope::ApiKey => Some(aisix_core::models::BudgetScope::ApiKey),
             PolicyScope::Team => Some(aisix_core::models::BudgetScope::Team),
@@ -994,25 +929,10 @@ fn reject_spend(
             // A model-scoped ceiling is shared by every caller of the model.
             PolicyScope::Model => None,
         }),
-        message: if matches!(err, aisix_ratelimit::RateLimitError::AllowanceExhausted) {
-            // 措辞要说清「等不回来」。窗口上限的文案会让人以为再等等就好了，
-            // 而这个要有人去充值。
-            format!(
-                "spend allowance exhausted for policy {} — top up to continue",
-                policy.name
-            )
-        } else {
-            format!("spend ceiling reached for policy {}", policy.name)
-        },
+        message: format!("spend ceiling reached for policy {}", policy.name),
         scope: policy.scope.map(|s| s.as_str().to_string()),
         scope_ref,
-        limit_usd: Some(usd(
-            if matches!(err, aisix_ratelimit::RateLimitError::AllowanceExhausted) {
-                policy.granted_micro_usd.unwrap_or_default()
-            } else {
-                policy.max_spend_micro_usd.unwrap_or_default()
-            },
-        )),
+        limit_usd: Some(usd(policy.max_spend_micro_usd.unwrap_or_default())),
         // 窗口计数器（`FixedWindowCounter`）只按桶存当前累加值，不区分
         // "花费"与"token"这两种量纲的读回接口——`Limiter::peek`
         // （store/local.rs:263-287）确实存在，但它只读 rpm/tpm 这两个
@@ -2126,85 +2046,6 @@ mod tests {
         assert!(spend_bucket_keys(&state, &snap, &other, &model_rl).is_empty());
     }
 
-    /// A batch's spend is credited to the buckets `spend_bucket_keys` hands
-    /// back, on whichever replica sees the batch finish, which may never have
-    /// admitted a request for them. Each bucket's shape is noted on the
-    /// limiter first, so the store keeps an allowance's credit rather than
-    /// shedding it when Redis does not take it.
-    #[tokio::test]
-    async fn spend_bucket_keys_note_which_buckets_carry_an_allowance() {
-        #[derive(Default)]
-        struct Noting(std::sync::Mutex<Vec<(String, bool)>>);
-        #[async_trait::async_trait]
-        impl aisix_ratelimit::RateStore for Noting {
-            async fn acquire(
-                &self,
-                _key: &str,
-                _limits: &RateLimit,
-                _member: &str,
-            ) -> Result<(), aisix_ratelimit::RateLimitError> {
-                Ok(())
-            }
-            async fn commit(&self, _key: &str, _tokens: u64, _member: &str) {}
-            fn release(&self, _key: &str, _member: &str) {}
-            fn add_tokens(&self, _key: &str, _tokens: u64) {}
-            async fn peek(
-                &self,
-                _key: &str,
-                _limits: &RateLimit,
-            ) -> Option<aisix_ratelimit::RateLimitStatus> {
-                None
-            }
-            async fn claim_once(&self, _key: &str, _ttl: std::time::Duration) -> bool {
-                true
-            }
-            fn note_allowance(&self, key: &str, limits: &RateLimit) {
-                self.0
-                    .lock()
-                    .unwrap()
-                    .push((key.to_string(), limits.granted_micro_usd.is_some()));
-            }
-        }
-        let granted: RateLimitPolicy = serde_json::from_value(serde_json::json!({
-            "name": "allowance",
-            "scope": "api_key",
-            "scope_ref": "k1",
-            "granted_micro_usd": 1_000_000,
-        }))
-        .unwrap();
-        let snap = snapshot_with_policy(granted);
-        let store = std::sync::Arc::new(Noting::default());
-        let state = crate::state::ProxyState::with_limiter(
-            aisix_core::snapshot::SnapshotHandle::new(snap.clone()),
-            std::sync::Arc::new(aisix_gateway::Hub::new()),
-            std::sync::Arc::new(aisix_ratelimit::Limiter::with_store(store.clone())),
-            &aisix_core::ProxyConfig {
-                addr: "127.0.0.1:0".into(),
-                request_body_limit_bytes: 0,
-                tls: None,
-                real_ip: Default::default(),
-                request_id: Default::default(),
-                thread_per_core: None,
-                workers: None,
-                url_rewrites: Vec::new(),
-                expose_debug_headers: false,
-                platform: Default::default(),
-                listeners: Vec::new(),
-            },
-        );
-        let model: aisix_core::Model = serde_json::from_value(serde_json::json!({
-            "display_name": "m",
-            "provider": "openai",
-            "model_name": "gpt-4o",
-            "provider_key_id": "pk",
-        }))
-        .unwrap();
-        let model_rl = ModelRateLimit::from_model("m", "m-id", &model);
-        let keys = spend_bucket_keys(&state, &snap, &test_auth_key("k1"), &model_rl);
-        assert_eq!(keys.len(), 1);
-        assert_eq!(*store.0.lock().unwrap(), vec![(keys[0].clone(), true)]);
-    }
-
     /// 只设花费上限的策略——预算的典型形态——也必须预留花费层。
     /// token 侧无限制不等于整条策略无限制；早退会让预算完全不执行。
     #[tokio::test]
@@ -2326,112 +2167,6 @@ mod tests {
         );
         assert_eq!(err.status().as_u16(), 429);
         assert_eq!(err.kind(), "billing_error");
-    }
-
-    /// A spend allowance is not admitted while the shared rate-limit store
-    /// does not answer: the caller gets `503` `allowance_unverified`, "Spending
-    /// could not be verified right now. Retry later.", with no `Retry-After`,
-    /// platform mode on or off, not a `429` that says the money ran out and
-    /// not `budget_unverified`, which names the usage delivery. A policy
-    /// without an allowance still falls open.
-    #[tokio::test]
-    async fn an_allowance_the_shared_store_cannot_check_is_answered_503() {
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        let (store, unreachable) =
-            aisix_ratelimit::RedisStore::connect_or_attach_later(&aisix_core::RedisConnConfig {
-                mode: aisix_core::config::RedisMode::Single,
-                url: Some(format!("redis://127.0.0.1:{port}")),
-                timeout_secs: 1,
-                ..Default::default()
-            })
-            .await
-            .expect("an unreachable redis is degraded around");
-        assert!(unreachable.is_some());
-        let limiter = std::sync::Arc::new(aisix_ratelimit::Limiter::with_store(
-            std::sync::Arc::new(store),
-        ));
-        let state_with = |snap: &aisix_core::AisixSnapshot| {
-            crate::state::ProxyState::with_limiter(
-                aisix_core::snapshot::SnapshotHandle::new(snap.clone()),
-                std::sync::Arc::new(aisix_gateway::Hub::new()),
-                limiter.clone(),
-                &aisix_core::ProxyConfig {
-                    addr: "127.0.0.1:0".into(),
-                    request_body_limit_bytes: 0,
-                    tls: None,
-                    real_ip: Default::default(),
-                    request_id: Default::default(),
-                    thread_per_core: None,
-                    workers: None,
-                    url_rewrites: Vec::new(),
-                    expose_debug_headers: false,
-                    platform: Default::default(),
-                    listeners: Vec::new(),
-                },
-            )
-        };
-        let auth = test_auth_key("k1");
-
-        let granted: RateLimitPolicy = serde_json::from_value(serde_json::json!({
-            "name": "allowance",
-            "scope": "api_key",
-            "scope_ref": "k1",
-            "granted_micro_usd": 1_000_000,
-        }))
-        .unwrap();
-        let snap = snapshot_with_policy(granted);
-        let err = reserve_layers(&state_with(&snap), &snap, &auth, None, None)
-            .await
-            .expect_err("an allowance nobody can check is not admitted");
-        assert!(
-            matches!(err, ProxyError::AllowanceUnverified),
-            "expected AllowanceUnverified, got {err:?}"
-        );
-        // The refusal itself as the caller receives it, then the same variant
-        // rendered as a platform-mode request renders it.
-        use axum::response::IntoResponse as _;
-        let mut refused = Some(err);
-        for platform in [false, true] {
-            let resp = match refused.take() {
-                Some(err) => err.into_response(),
-                None => crate::error::tests::in_platform_mode(|| {
-                    ProxyError::AllowanceUnverified.into_response()
-                }),
-            };
-            assert_eq!(resp.status().as_u16(), 503, "platform {platform}");
-            assert!(
-                resp.headers().get("retry-after").is_none(),
-                "platform {platform}"
-            );
-            let body: serde_json::Value = serde_json::from_slice(
-                &axum::body::to_bytes(resp.into_body(), 65536).await.unwrap(),
-            )
-            .unwrap();
-            assert_eq!(
-                body["error"]["code"], "allowance_unverified",
-                "platform {platform}"
-            );
-            assert_eq!(body["error"]["type"], "api_error", "platform {platform}");
-            assert_eq!(
-                body["error"]["message"], "Spending could not be verified right now. Retry later.",
-                "platform {platform}"
-            );
-        }
-
-        let windowed = snapshot_with_policy(make_spend_policy(
-            "api_key",
-            "k1",
-            "day",
-            Some(100),
-            Some(10_000_000),
-        ));
-        reserve_layers(&state_with(&windowed), &windowed, &auth, None, None)
-            .await
-            .expect("a policy without an allowance still falls open");
     }
 
     /// R17：`team_member` 作用域下真正记满的是*那一个成员*的花费桶

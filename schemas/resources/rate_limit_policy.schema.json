@@ -325,34 +325,6 @@
   },
   "oneOf": [
     {
-      "allOf": [
-        {
-          "if": {
-            "anyOf": [
-              {
-                "required": [
-                  "max_requests"
-                ]
-              },
-              {
-                "required": [
-                  "max_tokens"
-                ]
-              },
-              {
-                "required": [
-                  "max_spend_micro_usd"
-                ]
-              }
-            ]
-          },
-          "then": {
-            "required": [
-              "window"
-            ]
-          }
-        }
-      ],
       "anyOf": [
         {
           "required": [
@@ -367,11 +339,6 @@
         {
           "required": [
             "max_spend_micro_usd"
-          ]
-        },
-        {
-          "required": [
-            "granted_micro_usd"
           ]
         }
       ],
@@ -401,7 +368,8 @@
       },
       "required": [
         "scope",
-        "scope_ref"
+        "scope_ref",
+        "window"
       ]
     },
     {
@@ -436,11 +404,6 @@
             "required": [
               "max_spend_micro_usd"
             ]
-          },
-          {
-            "required": [
-              "granted_micro_usd"
-            ]
           }
         ]
       },
@@ -464,12 +427,6 @@
         "$ref": "#/definitions/ConditionNode"
       },
       "type": "array"
-    },
-    "granted_micro_usd": {
-      "description": "Cumulative spend allowance in micro-USD — the total ever granted to this subject, not what is left of it.\n\nThis is the prepaid figure, and it differs from `max_spend_micro_usd` in the one way that matters: it has no window. The counter behind it only grows and is never reset, so an allowance that runs out stays run out until this number is raised. A ceiling with a `day` window refills every midnight, which makes it a spending rate and not a balance.\n\nBoth can be set on one policy and both are checked. A useful pairing is a granted total for the prepaid amount and a daily ceiling as a cap on how fast it can be drawn down.\n\nEnforced against *recorded* spend, with the same overshoot as `max_spend_micro_usd`: requests already in flight when the allowance runs out still complete and still count, so recorded spend can finish above the granted figure by their combined cost. `concurrency` and `max_requests` bound that, and both are counted at admission.\n\nRaising this is how more spending is allowed. Nothing has to be reset, and because both the granted figure and the consumed counter only ever increase, no reconciliation is needed between them.\n\nThe consumed counter lives in the configured rate-limit store, and its lifetime is the store's. A shared Redis store keeps it across gateway restarts and shares it between gateway instances, which is what a prepaid balance needs. The default in-process store holds it in memory only: it is not shared between instances, and a restart returns every allowance to unspent. Configure a shared store for any allowance that has to outlive the process.\n\nWhile a shared Redis store does not answer, a request this allowance applies to is refused with `503` and the code `allowance_unverified`, because one instance's own count cannot tell what the others spent. Every other limit keeps serving on each instance's own count during the outage.",
-      "format": "uint64",
-      "minimum": 1.0,
-      "type": "integer"
     },
     "group_by": {
       "description": "Dimensions the counters split on; `[]`/absent = one shared bucket for every matched request. A matched request missing a `group_by` dimension — a `team` or `member` its key does not carry, or a `tag:<key>` it has no value for — is not subject to the policy (mirrors `team_member` only applying to keys that carry a `user_id`).",

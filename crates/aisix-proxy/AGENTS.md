@@ -546,7 +546,6 @@ Platform mode covers the tenant endpoints: `/v1/chat/completions`, `/v1/messages
 - **A forbidden model answers like an unknown one** (`platform_errors::caller_error`). A `ModelForbidden` reaches the caller with the status, headers and body of a `ModelNotFound` for the same name, so a key cannot map the catalog by asking for names. It is applied at the three render primitives in `error.rs`, and telemetry still records `403` `permission_denied`.
 - **A `429` shows only the caller's own limits** (`error.rs`).
   - A `budget_exceeded` keeps its structured fields (`scope`, `scope_ref`, `limit_usd`, `spent_usd`, `period`, `period_resets_at`) and its `Retry-After` only when the budget is the caller's own: scope `api_key`, `member`, `team` or `team_member`, by both its typed scope and its text. Any other budget (`org`, `environment`, `tag`, `provider_key`, or one with no scope) is answered with the same type and code, the message `Spending limit reached.`, and no `Retry-After`, because its reset time is a figure of the platform's budget. A spend ceiling raised by a policy gets a neutral message of its own.
-  - A spend allowance (`granted_micro_usd`) that cannot be checked, because the shared Redis rate-limit store does not answer, is not a `429`: it is refused with `503` `allowance_unverified` and a fixed message, with no figures and no `Retry-After`, platform mode on or off (`quota::reject_spend`). It keeps its envelope, as a budget.
   - A rate-limit `429` names no policy: no `error.policy` block, and no policy name in the message. A bucket that several callers share (a model's inline limit, or a policy not grouped by key, member or team, `quota::policy_bucket_is_callers`) sends none of `x-ratelimit-limit`, `-remaining`, `-reset` and `-scope`. `Retry-After` stays.
 - **Model listings name no vendor** (`models::owned_by`). `/v1/models` and `/v1/models/{id}` in the OpenAI shape report `owned_by: "aisix"` for every model. The Anthropic shape names no owner.
 
@@ -593,7 +592,6 @@ On the tenant endpoints themselves:
 - A bare-string `audio.voice` that names a custom voice is not refused; the object form is.
 - A broad `forward_client_headers` rule can forward `anthropic-workspace-id` or `anthropic-user-profile-id` upstream.
 
-Billing, which is not best effort, still has these gaps:
+Billing, which is not best effort, still has this gap:
 
-- Spend recorded against an allowance while Redis does not take it waits in a per-bucket total in the process (`aisix-ratelimit` `PendingAllowance`). A replica that exits before Redis answers again loses it, so that spend is never counted against the allowance.
 - A batch whose spend is credited after a restart (the batch attribution path credits spend keys this process never acquired) can still have that credit shed when the accounting queue is full.

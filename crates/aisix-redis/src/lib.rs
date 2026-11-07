@@ -131,9 +131,9 @@ pub const BREAKER_WINDOW: Duration = Duration::from_secs(30);
 /// doubles it, up to [`BREAKER_WINDOW`], and so does a breaker that opens
 /// again within a window of closing: a blip costs about a second of
 /// short-circuiting, and a Redis that keeps failing is re-tested no more
-/// often than once a window. The short first wait matters to a consumer
-/// that fails closed (a spend allowance refuses while the breaker is open),
-/// for which a 30-second cool-off after one slow command is an outage.
+/// often than once a window. One slow command therefore no longer sends the
+/// cache past Redis, or the rate limiter to per-replica counting, for a
+/// whole window.
 pub const FIRST_PROBE_WAIT: Duration = Duration::from_secs(1);
 
 /// A [`RedisConn`] that may not exist yet, shared by every operation of
@@ -2530,8 +2530,6 @@ mod probe_tests {
 
     /// A blip costs about a second of short-circuiting, not a whole
     /// window: the prober's first PING comes after [`FIRST_PROBE_WAIT`].
-    /// A consumer that fails closed while the breaker is open (a spend
-    /// allowance) is refused for that long, not for the window.
     #[tokio::test]
     async fn a_blip_is_noticed_well_inside_the_window() {
         let fake = FakeRedis::start().await;

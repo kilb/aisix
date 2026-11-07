@@ -383,7 +383,6 @@ fn keeps_own_envelope(err: &ProxyError) -> bool {
             | ProxyError::ContentFiltered { .. }
             | ProxyError::BudgetExceeded(_)
             | ProxyError::BudgetUnverified
-            | ProxyError::AllowanceUnverified
             | ProxyError::RateLimit(_)
             | ProxyError::ModelRateLimit(_)
             | ProxyError::PolicyRateLimit { .. }
@@ -1071,7 +1070,6 @@ mod tests {
             | ProxyError::ContentFiltered { .. }
             | ProxyError::BudgetExceeded(_)
             | ProxyError::BudgetUnverified
-            | ProxyError::AllowanceUnverified
             | ProxyError::RateLimit(_)
             | ProxyError::ModelRateLimit(_)
             | ProxyError::PolicyRateLimit { .. } => true,
@@ -1091,7 +1089,14 @@ mod tests {
 
     /// One of every variant.
     fn every_variant() -> Vec<ProxyError> {
-        let limited = || aisix_ratelimit::RateLimitError::AllowanceExhausted;
+        let limited = || aisix_ratelimit::RateLimitError::Concurrency {
+            detail: aisix_ratelimit::LimitDetail {
+                dimension: "concurrency",
+                limit: 1,
+                remaining: 0,
+                reset_secs: 60,
+            },
+        };
         vec![
             ProxyError::MissingAuth("authorization"),
             ProxyError::MissingRouteAuthHeader("x-key".into()),
@@ -1143,7 +1148,6 @@ mod tests {
             },
             budget_exceeded_for_team(),
             ProxyError::BudgetUnverified,
-            ProxyError::AllowanceUnverified,
             ProxyError::RequestTooLarge { limit_bytes: 1 },
             ProxyError::RateLimit(limited()),
             ProxyError::ModelRateLimit(limited()),

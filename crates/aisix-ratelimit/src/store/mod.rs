@@ -27,9 +27,7 @@
 //! wait there would stall every other in-flight request on that core, not
 //! just the stream that ended. A distributed store therefore hands the update
 //! to its own I/O worker and returns; the shared counters converge shortly
-//! after, not synchronously. What the worker cannot deliver is lost, except
-//! for a bucket carrying a spend allowance, whose spend waits for Redis and is
-//! retried (see [`redis`]).
+//! after, not synchronously.
 
 use std::time::Duration;
 
@@ -180,14 +178,6 @@ pub trait RateStore: Send + Sync + 'static {
         }
     }
 
-    /// Record whether the bucket `key` carries a spend allowance
-    /// (`limits.granted_micro_usd`), for a credit this process makes to it
-    /// without having admitted a request for it: a batch's spend, settled on
-    /// whichever replica sees the batch finish. An acquire records it too. A
-    /// store that keeps an allowance's spend safe across a failure of its
-    /// own reads it there; the default keeps nothing.
-    fn note_allowance(&self, _key: &str, _limits: &RateLimit) {}
-
     /// Drop per-key state untouched for longer than `idle_for`.
     ///
     /// Bucket keys are config-derived (api key, model, policy), so a
@@ -232,7 +222,7 @@ pub trait RateStore: Send + Sync + 'static {
     /// For work that may legitimately be redone but whose accounting must
     /// not repeat. The after-the-fact spend attribution of a completed batch
     /// is the case: its usage event carries a deterministic id the consumer
-    /// dedups on, but crediting a monotonic spend counter and incrementing a
+    /// dedups on, but crediting a spend counter and incrementing a
     /// Prometheus counter are not idempotent, and the attribution replays
     /// whenever a process that has forgotten the batch sees it completed
     /// again.
