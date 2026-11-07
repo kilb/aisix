@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import OpenAI, { toFile } from "openai";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   EtcdClient,
@@ -17,8 +18,11 @@ import {
 // carries what billing prices it by: an id of the gateway's own for the row,
 // the provider key and upstream model that served it, and the service tier
 // the caller asked for. Driven on /v1/chat/completions (buffered and
-// streamed), /v1/messages and /v1/responses, read off the `/dp/telemetry`
-// bodies the control plane receives.
+// streamed, direct and through a routing group), /v1/messages,
+// /v1/responses, /v1/embeddings and a finished batch, read off the
+// `/dp/telemetry` bodies the control plane receives. A row also stays
+// bounded whatever the caller names: a megabyte-long model name cannot make
+// its row, or the batch it travels in, large.
 //
 // The request id is the caller's to choose, and nothing stops two requests
 // from sharing one, so it cannot be what tells two rows apart. Two of the
@@ -30,6 +34,25 @@ const SHARED_REQUEST_ID = "dup";
 
 const BUFFERED_UPSTREAM_MODEL = "gpt-4o-2024-08-06";
 const STREAMED_UPSTREAM_MODEL = "gpt-4o-mini-2024-07-18";
+
+const BATCH_ID = "batch_billing";
+const BATCH_OUTPUT_FILE = "file-billing-out";
+
+const EMBEDDINGS_BODY = {
+  object: "list",
+  data: [{ object: "embedding", index: 0, embedding: [0.1, 0.2] }],
+  model: BUFFERED_UPSTREAM_MODEL,
+  usage: { prompt_tokens: 3, total_tokens: 3 },
+};
+
+const BATCH_OUTPUT_LINE = JSON.stringify({
+  id: "batch_req_1",
+  custom_id: "r1",
+  response: {
+    status_code: 200,
+    body: { model: BUFFERED_UPSTREAM_MODEL, usage: { prompt_tokens: 11, completion_tokens: 4 } },
+  },
+});
 
 const CHAT_BODY = {
   id: "chatcmpl-billing",
@@ -69,6 +92,8 @@ const chunk = (delta: Record<string, unknown>, finishReason: string | null, usag
 interface Row {
   request_id: string;
   requested_model?: string;
+  model_id?: string;
+  requested_model_id?: string;
   event_id?: string;
   provider_key_id?: string;
   upstream_provider?: string;
@@ -84,6 +109,8 @@ describe("usage rows carry the fields billing needs", () => {
   let etcdReachable = false;
   let bufferedKeyId = "";
   let streamedKeyId = "";
+  let streamedModelId = "";
+  let groupId = "";
 
   beforeAll(async () => {
     const etcd = new EtcdClient();
@@ -92,7 +119,21 @@ describe("usage rows carry the fields billing needs", () => {
 
     const buffered = await startOpenAiUpstream({
       nonStreamBody: CHAT_BODY,
-      pathBodies: { "/v1/chat/completions": CHAT_BODY, "/v1/responses": RESPONSES_BODY },
+      pathBodies: {
+        "/v1/chat/completions": CHAT_BODY,
+        "/v1/responses": RESPONSES_BODY,
+        "/v1/embeddings": EMBEDDINGS_BODY,
+        "/v1/files": { id: "file-billing-in", object: "file", purpose: "batch", filename: "in.jsonl" },
+        "/v1/batches": { id: BATCH_ID, object: "batch", status: "validating", input_file_id: "file-billing-in" },
+        [`/v1/batches/${BATCH_ID}`]: {
+          id: BATCH_ID,
+          object: "batch",
+          status: "completed",
+          input_file_id: "file-billing-in",
+          output_file_id: BATCH_OUTPUT_FILE,
+        },
+        [`/v1/files/${BATCH_OUTPUT_FILE}/content`]: `${BATCH_OUTPUT_LINE}\n`,
+      },
     });
     const streamed = await startOpenAiUpstream({
       streamEvents: [
@@ -125,12 +166,18 @@ describe("usage rows carry the fields billing needs", () => {
       model_name: BUFFERED_UPSTREAM_MODEL,
       provider_key_id: bufferedKey.id,
     });
-    await seed.createModel({
+    const streamedModel = await seed.createModel({
       display_name: "billing-streamed",
       provider: "openai",
       model_name: STREAMED_UPSTREAM_MODEL,
       provider_key_id: streamedKey.id,
     });
+    streamedModelId = streamedModel.id;
+    const group = await seed.createModel({
+      display_name: "billing-group",
+      routing: { strategy: "failover", targets: [{ model: "billing-streamed" }], retries: 0 },
+    });
+    groupId = group.id;
     await seed.createApiKey({ key_hash: CALLER_KEY_HASH, allowed_models: ["*"] });
 
     await waitConfigPropagation(async () => {
@@ -209,6 +256,12 @@ describe("usage rows carry the fields billing needs", () => {
 
     const ids = [SHARED_REQUEST_ID, "billing-streamed-tier", "billing-messages", "billing-responses"];
     await waitConfigPropagation(async () => rowsFor(ids).length >= 5, 30_000);
+    // A barrier before the exact count: delivery is in order, one batch at a
+    // time, so once this later request's row has landed every row the five
+    // above produced has too, a duplicate included.
+    const barrier = await send("/v1/chat/completions", "billing-barrier", { model: "billing-buffered", messages });
+    expect(barrier.status, barrier.text).toBe(200);
+    await waitConfigPropagation(async () => rowsFor(["billing-barrier"]).length >= 1, 30_000);
     const rows = rowsFor(ids);
     expect(rows, JSON.stringify(rows)).toHaveLength(5);
 
@@ -256,5 +309,97 @@ describe("usage rows carry the fields billing needs", () => {
     // None of these is a batch row, and a field that does not apply is left
     // off the wire rather than written as `false`.
     for (const row of rows) expect("is_batch" in row, JSON.stringify(row)).toBe(false);
+  }, 90_000);
+
+  test("a routing group's row names its target, an embeddings row and a batch row carry the fields too", async (ctx) => {
+    if (!etcdReachable || !app || !cp) return ctx.skip();
+    // The group's one target is served by the streaming upstream.
+    const grouped = await send("/v1/chat/completions", "billing-group", {
+      model: "billing-group",
+      messages: [{ role: "user", content: "hello" }],
+      stream: true,
+      stream_options: { include_usage: true },
+    });
+    expect(grouped.status, grouped.text).toBe(200);
+    const embedded = await send("/v1/embeddings", "billing-embeddings", { model: "billing-buffered", input: "hello" });
+    expect(embedded.status, embedded.text).toBe(200);
+
+    // A batch, through the SDK: upload, create, and retrieve it finished.
+    const client = new OpenAI({ apiKey: CALLER, baseURL: `${app.proxyUrl}/v1` });
+    const file = await client.files.create(
+      { file: await toFile(Buffer.from('{"custom_id":"r1"}\n'), "in.jsonl"), purpose: "batch" },
+      { headers: { "x-aisix-model": "billing-buffered" } },
+    );
+    const batch = await client.batches.create({
+      input_file_id: file.id,
+      endpoint: "/v1/chat/completions",
+      completion_window: "24h",
+    });
+    const finished = await client.batches.retrieve(batch.id);
+    expect(finished.status).toBe("completed");
+
+    const allRows = (): Row[] =>
+      cp!.telemetryBodies.flatMap((body) => (JSON.parse(body) as { events: Row[] }).events);
+    const batchRows = () => allRows().filter((row) => row.is_batch === true);
+    await waitConfigPropagation(
+      async () => rowsFor(["billing-group", "billing-embeddings"]).length >= 2 && batchRows().length >= 1,
+      30_000,
+    );
+
+    // The group's row: the entry the caller addressed, and the target's own
+    // key and upstream model, never the group's (it has neither).
+    const [group] = rowsFor(["billing-group"]);
+    expect(group.requested_model, JSON.stringify(group)).toBe("billing-group");
+    expect(group.requested_model_id, JSON.stringify(group)).toBe(groupId);
+    expect(group.model_id, JSON.stringify(group)).toBe(streamedModelId);
+    expect(group.provider_key_id, JSON.stringify(group)).toBe(streamedKeyId);
+    expect(group.upstream_provider, JSON.stringify(group)).toBe("openai");
+    expect(group.upstream_model, JSON.stringify(group)).toBe(STREAMED_UPSTREAM_MODEL);
+
+    const [embedding] = rowsFor(["billing-embeddings"]);
+    expect(embedding.event_id?.length ?? 0, JSON.stringify(embedding)).toBeGreaterThan(0);
+    expect(embedding.provider_key_id, JSON.stringify(embedding)).toBe(bufferedKeyId);
+    expect(embedding.upstream_model, JSON.stringify(embedding)).toBe(BUFFERED_UPSTREAM_MODEL);
+    expect("is_batch" in embedding, JSON.stringify(embedding)).toBe(false);
+
+    // The batch's row: marked, priced by the key and model that ran it, and
+    // carrying the batch's fixed id so a copy another replica emits is
+    // dropped.
+    const batchRow = batchRows().find((row) => row.requested_model === "billing-buffered");
+    expect(batchRow, JSON.stringify(batchRows())).toBeDefined();
+    expect(batchRow!.is_batch).toBe(true);
+    expect(batchRow!.event_id, JSON.stringify(batchRow)).toBe(batchRow!.request_id);
+    expect(batchRow!.provider_key_id, JSON.stringify(batchRow)).toBe(bufferedKeyId);
+    expect(batchRow!.upstream_model, JSON.stringify(batchRow)).toBe(BUFFERED_UPSTREAM_MODEL);
+  }, 90_000);
+
+  test("a megabyte-long model name makes no row, and no batch, large", async (ctx) => {
+    if (!etcdReachable || !app || !cp) return ctx.skip();
+    const huge = `m${"x".repeat(1 << 20)}`;
+    const messages = [{ role: "user", content: "hello" }];
+    const requests: Array<[string, string, Record<string, unknown>]> = [
+      ["billing-huge-chat", "/v1/chat/completions", { model: huge, messages }],
+      ["billing-huge-messages", "/v1/messages", { model: huge, max_tokens: 16, messages }],
+      ["billing-huge-responses", "/v1/responses", { model: huge, input: "hello" }],
+      ["billing-huge-embeddings", "/v1/embeddings", { model: huge, input: "hello" }],
+    ];
+    for (const [requestId, path, body] of requests) {
+      const res = await send(path, requestId, body);
+      expect(res.status, `${path}: ${res.text.slice(0, 200)}`).toBe(404);
+    }
+    const ids = requests.map(([requestId]) => requestId);
+    await waitConfigPropagation(
+      async () => ids.every((id) => rowsFor([id]).length >= 1),
+      30_000,
+    );
+    for (const row of rowsFor(ids)) {
+      const wire = JSON.stringify(row);
+      expect(row.requested_model?.length ?? 0, row.request_id).toBeLessThanOrEqual(512);
+      expect(row.requested_model?.startsWith("mxxx"), row.request_id).toBe(true);
+      expect(wire.length, row.request_id).toBeLessThan(16 * 1024);
+    }
+    for (const body of cp.telemetryBodies.filter((b) => ids.some((id) => b.includes(`"${id}"`)))) {
+      expect(body.length).toBeLessThan(1 << 20);
+    }
   }, 90_000);
 });
