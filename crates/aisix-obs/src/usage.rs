@@ -1224,7 +1224,8 @@ fn is_zero_f64(n: &f64) -> bool {
 ///
 /// The sender worker adds more reasons to the SAME counter for events it
 /// accepted here and then could not deliver to the control plane —
-/// `send_failed`, `retry_budget_exhausted` and `oversized` (see
+/// `send_failed`, `retry_budget_exhausted`, `oversized` and
+/// `send_unconfirmed`, the last for a batch that may have been stored (see
 /// aisix-server's `telemetry` module). They carry only the member pair off the event, so
 /// "delivered" reads as "reached the control plane" in aggregate, and the
 /// per-model slice of the invariant covers the queue side only.

@@ -16,16 +16,21 @@
 //!   that id in the same transaction as the usage rows, and it answers
 //!   every response from that handler with [`USAGE_BATCH_DEDUP_HEADER`].
 //!   A failure whose response lacks that header — or carries it with an
-//!   undefined value — is dropped, exactly as every failure was before.
+//!   undefined value — is dropped, exactly as every failure was before. A
+//!   connection that could not be made is the exception: nothing was sent,
+//!   so it is re-sent whatever the control plane last said.
 //!   There is still no persistent disk queue: a batch is given up on once
 //!   its OLDEST event is [`RETRY_BUDGET`] old (which can be before its
 //!   first attempt, since the sender is single in-flight), or once the
 //!   control plane has answered and refused it [`MAX_ANSWERED_FAILURES`]
-//!   times in a row. Two failures do not count toward that cap and are
-//!   bounded by the budget alone: an attempt that got no response, and a
-//!   `503` carrying the de-duplication header, which is the control plane
+//!   times in a row. Two failures do not count toward that cap: an attempt
+//!   that got no response, bounded by the budget alone, and a `503`
+//!   carrying the de-duplication header, which is the control plane
 //!   reporting a transient store failure that the same batch, re-sent
-//!   unchanged, gets past. Every wait between re-sends is spread by
+//!   unchanged, gets past, bounded by [`REPORTED_OUTAGE_BUDGET`] from the
+//!   first of them. A batch given up on after an attempt that may have
+//!   reached the control plane unanswered is counted as unconfirmed rather
+//!   than as lost. Every wait between re-sends is spread by
 //!   [`RETRY_JITTER`], so gateways that failed together do not re-send
 //!   together. The `received_at` column on the control plane side
 //!   records when CP saw the row, so dashboards distinguish "DP never sent"
@@ -130,6 +135,19 @@ const RETRY_MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// on the same beat for as long as the outage lasts.
 const RETRY_JITTER: f64 = 0.2;
 
+/// How long one batch may keep meeting `503`s that carry
+/// [`USAGE_BATCH_DEDUP_HEADER`], from the first of them, spread by
+/// [`RETRY_JITTER`] for each batch.
+///
+/// The control plane answers that for a store failure the same batch,
+/// re-sent unchanged, gets past, so those answers do not count toward
+/// [`MAX_ANSWERED_FAILURES`]. But one batch that keeps meeting them would
+/// otherwise hold the single in-flight sender for the whole
+/// [`RETRY_BUDGET`] while everything queued behind it overflows. Five
+/// minutes outlasts a database failover; a store failure longer than that
+/// on one batch is treated as one that batch will not get past.
+const REPORTED_OUTAGE_BUDGET: Duration = Duration::from_secs(5 * 60);
+
 /// How long a batch may be re-sent, measured from its OLDEST event's
 /// `occurred_at` — NOT from its first attempt.
 ///
@@ -172,8 +190,8 @@ const RETRY_BUDGET: Duration = Duration::from_secs(30 * 60);
 /// timeout, an admin shutdown — and answers a permanent one `500`. Counted,
 /// a store outage longer than the backoff to the eighth answer (about a
 /// minute and a half) would drop the batch at the head of every gateway's
-/// queue although none of them was ever stored; it too is bounded by the
-/// budget instead, on the same backoff. Every other answered failure counts,
+/// queue although none of them was ever stored; it is bounded by
+/// [`REPORTED_OUTAGE_BUDGET`] instead, on the same backoff. Every other answered failure counts,
 /// including a `503` WITHOUT the header, which a proxy in front of the
 /// control plane can send and which says nothing about the store. See
 /// [`SendFailure::counts_toward_the_cap`].
@@ -194,6 +212,15 @@ pub(crate) const FINAL_DRAIN_BUDGET: Duration = Duration::from_secs(20);
 /// failure was not retryable, or the gateway is shutting down.
 const DROP_SEND_FAILED: &str = "send_failed";
 
+/// `aisix_usage_event_drops_total{reason}` for a batch given up on although
+/// it may have been stored: an attempt of it reached the wire and got no
+/// response (a timeout, a connection lost after the request went out), or
+/// the shutdown drain ran out of time with it in flight. Distinct from the
+/// other reasons, which each say the control plane does not hold the
+/// events, so that `expected - drops` stays a bound the stored rows reach
+/// and `expected - drops - unconfirmed` one they do not fall below.
+const DROP_SEND_UNCONFIRMED: &str = "send_unconfirmed";
+
 /// `aisix_usage_event_drops_total{reason}` for an event that serialized to
 /// more than [`MAX_EVENT_BYTES`], given up on alone as it left the queue so
 /// that it cannot take the events of its batch with it.
@@ -201,8 +228,9 @@ const DROP_OVERSIZED: &str = "oversized";
 
 /// `aisix_usage_event_drops_total{reason}` for a batch that ran out of room
 /// to keep trying: its events aged past [`RETRY_BUDGET`] (with or without
-/// an attempt ever being made), or the answers refusing it reached
-/// [`MAX_ANSWERED_FAILURES`]. Distinct from
+/// an attempt ever being made), the answers refusing it reached
+/// [`MAX_ANSWERED_FAILURES`], or the control plane kept reporting a store
+/// outage on it past [`REPORTED_OUTAGE_BUDGET`]. Distinct from
 /// [`DROP_SEND_FAILED`], which says the very first failure could not be
 /// re-sent at all.
 const DROP_RETRY_BUDGET_EXHAUSTED: &str = "retry_budget_exhausted";
@@ -382,7 +410,7 @@ async fn run(
                 if buffer.is_empty() {
                     break;
                 }
-                let mut events = buffer.take_batch();
+                let events = buffer.take_batch();
                 let delivered = tokio::time::timeout_at(
                     drain_deadline,
                     deliver(
@@ -397,22 +425,40 @@ async fn run(
                 )
                 .await;
                 if delivered.is_err() {
-                    while let Ok(event) = rx.try_recv() {
-                        buffer.push(event, &metrics);
-                    }
-                    events.extend(std::mem::take(&mut buffer).events);
+                    // The batch in flight may have been stored; what is still
+                    // queued was never sent.
                     drop_batch(
                         &metrics,
-                        DROP_SEND_FAILED,
+                        DROP_SEND_UNCONFIRMED,
                         &events,
                         Uuid::new_v4(),
                         0,
                         Some(&SendFailure::NoResponse {
+                            never_sent: false,
                             error: anyhow::anyhow!(
                                 "the shutdown drain ran out of time before this batch was answered"
                             ),
                         }),
                     );
+                    while let Ok(event) = rx.try_recv() {
+                        buffer.push(event, &metrics);
+                    }
+                    let unsent: Vec<Prepared> = std::mem::take(&mut buffer).events.into();
+                    if !unsent.is_empty() {
+                        drop_batch(
+                            &metrics,
+                            DROP_SEND_FAILED,
+                            &unsent,
+                            Uuid::new_v4(),
+                            0,
+                            Some(&SendFailure::NoResponse {
+                                never_sent: true,
+                                error: anyhow::anyhow!(
+                                    "the shutdown drain ran out of time before this batch was sent"
+                                ),
+                            }),
+                        );
+                    }
                     break;
                 }
             }
@@ -467,10 +513,14 @@ impl SenderState {
     /// So: a response that carries the header and a retryable status may be
     /// re-sent; a response without the header may not, and clears the flag.
     ///
-    /// A failure with NO response — connect error, timeout — carries no
-    /// evidence at all, and that is the failure a control-plane outage
-    /// actually produces. It falls back to the flag: re-send only if the
-    /// most recent response this sender received carried the header and
+    /// A failure with NO response carries no evidence at all, and that is
+    /// the failure a control-plane outage actually produces. A connection
+    /// that could not be made sent nothing, so re-sending it can never count
+    /// anything twice, and it is re-sent whatever the flag says: a gateway
+    /// that boots while the control plane is down has seen no response yet.
+    /// Any other — a timeout, a connection lost after the request went out —
+    /// may have been stored, so it falls back to the flag: re-send only if
+    /// the most recent response this sender received carried the header and
     /// nothing since has come back without it.
     fn may_resend(&mut self, failure: &SendFailure) -> bool {
         match failure {
@@ -480,7 +530,7 @@ impl SenderState {
                 self.dedup_seen = *dedup;
                 *dedup && *retryable
             }
-            SendFailure::NoResponse { .. } => self.dedup_seen,
+            SendFailure::NoResponse { never_sent, .. } => *never_sent || self.dedup_seen,
         }
     }
 }
@@ -677,6 +727,12 @@ async fn deliver(
     let mut attempts = 0usize;
     let mut answered_failures = 0usize;
     let mut resending = false;
+    // When the control plane's report of a store outage on this batch stops
+    // being believed: set at the first such report.
+    let mut reported_outage_ends: Option<Instant> = None;
+    // Whether an attempt may have reached the control plane unanswered, so a
+    // drop cannot say the events are not stored.
+    let mut maybe_stored = false;
     // Flipped when shutdown interrupts a backoff: the batch in hand gets one
     // final attempt, and then this worker stops holding the drain open.
     let mut last_attempt = retry == Retry::Disabled;
@@ -719,6 +775,22 @@ async fn deliver(
         if failure.counts_toward_the_cap() {
             answered_failures += 1;
         }
+        if matches!(
+            failure,
+            SendFailure::NoResponse {
+                never_sent: false,
+                ..
+            }
+        ) {
+            maybe_stored = true;
+        }
+        let unconfirmed_or = |reason| {
+            if maybe_stored {
+                DROP_SEND_UNCONFIRMED
+            } else {
+                reason
+            }
+        };
         if let SendFailure::Response { status, .. } = &failure {
             // A content rejection is the control plane judging the batch:
             // delivery works, these events just will not be counted.
@@ -730,7 +802,7 @@ async fn deliver(
         if !may_resend || last_attempt {
             drop_batch(
                 metrics,
-                DROP_SEND_FAILED,
+                unconfirmed_or(DROP_SEND_FAILED),
                 events,
                 batch_id,
                 attempts,
@@ -740,10 +812,14 @@ async fn deliver(
         }
 
         let now = Instant::now();
-        if answered_failures >= MAX_ANSWERED_FAILURES || now >= deadline {
+        let outage_over = failure.is_reported_outage()
+            && now
+                >= *reported_outage_ends
+                    .get_or_insert_with(|| now + spread(REPORTED_OUTAGE_BUDGET, rand::random()));
+        if answered_failures >= MAX_ANSWERED_FAILURES || now >= deadline || outage_over {
             drop_batch(
                 metrics,
-                DROP_RETRY_BUDGET_EXHAUSTED,
+                unconfirmed_or(DROP_RETRY_BUDGET_EXHAUSTED),
                 events,
                 batch_id,
                 attempts,
@@ -789,8 +865,13 @@ async fn deliver(
 /// `[0, 1)`, picks across ±[`RETRY_JITTER`] of it. The hold comes first, so a
 /// wait at the ceiling is still drawn from the whole band, 20 s to 30 s.
 fn jittered(step: Duration, unit: f64) -> Duration {
-    step.min(RETRY_MAX_BACKOFF * 5 / 6)
-        .mul_f64(1.0 + RETRY_JITTER * (2.0 * unit - 1.0))
+    spread(step.min(RETRY_MAX_BACKOFF * 5 / 6), unit)
+}
+
+/// `span` moved to the point `unit`, a draw from `[0, 1)`, picks across
+/// ±[`RETRY_JITTER`] of it.
+fn spread(span: Duration, unit: f64) -> Duration {
+    span.mul_f64(1.0 + RETRY_JITTER * (2.0 * unit - 1.0))
 }
 
 /// [`jittered`] with a fresh draw for every wait.
@@ -913,13 +994,18 @@ enum SendFailure {
     },
     /// No response at all — connect failure, timeout, TLS error. This
     /// exchange says nothing about what the control plane supports.
-    NoResponse { error: anyhow::Error },
+    /// `never_sent` says the connection itself could not be made, so
+    /// nothing of the request reached the control plane.
+    NoResponse {
+        never_sent: bool,
+        error: anyhow::Error,
+    },
 }
 
 impl std::fmt::Display for SendFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SendFailure::Response { error, .. } | SendFailure::NoResponse { error } => {
+            SendFailure::Response { error, .. } | SendFailure::NoResponse { error, .. } => {
                 write!(f, "{error:#}")
             }
         }
@@ -939,6 +1025,13 @@ impl SendFailure {
             }
             SendFailure::NoResponse { .. } => false,
         }
+    }
+
+    /// Whether this is the control plane reporting a store outage on the
+    /// batch: a `503` that carries [`USAGE_BATCH_DEDUP_HEADER`]. Bounded by
+    /// [`REPORTED_OUTAGE_BUDGET`] rather than by the cap.
+    fn is_reported_outage(&self) -> bool {
+        matches!(self, SendFailure::Response { .. }) && !self.counts_toward_the_cap()
     }
 }
 
@@ -966,12 +1059,16 @@ async fn send(
         .header(reqwest::header::CONTENT_TYPE, "application/json")
         .body(body.clone())
         .send()
-        .await
-        .map_err(reqwest::Error::without_url)
-        .with_context(|| format!("POST {}", redact_url_for_log(&cfg.url)));
+        .await;
     let resp = match resp {
         Ok(resp) => resp,
-        Err(error) => return Attempt::Failed(SendFailure::NoResponse { error }),
+        Err(error) => {
+            return Attempt::Failed(SendFailure::NoResponse {
+                never_sent: error.is_connect(),
+                error: anyhow::Error::new(error.without_url())
+                    .context(format!("POST {}", redact_url_for_log(&cfg.url))),
+            })
+        }
     };
 
     // Read off THIS response, never remembered: see `SenderState::may_resend`.
@@ -1279,7 +1376,8 @@ mod tests {
 
     /// The capability rule, stated at the one place that decides it: judge
     /// each response on its own, and fall back to the last response seen
-    /// only when an exchange produced none at all.
+    /// only when an exchange produced none at all — unless nothing was sent,
+    /// which is re-sent whatever was seen.
     #[test]
     fn resend_permission_is_judged_per_response_and_never_cached() {
         let response = |dedup: bool, retryable: bool| SendFailure::Response {
@@ -1289,15 +1387,23 @@ mod tests {
             error: anyhow!("boom"),
         };
         let no_response = || SendFailure::NoResponse {
+            never_sent: false,
+            error: anyhow!("operation timed out"),
+        };
+        let not_connected = || SendFailure::NoResponse {
+            never_sent: true,
             error: anyhow!("connection refused"),
         };
 
         let mut state = SenderState::default();
-        // Nothing seen yet: a connect failure cannot be re-sent.
+        // Nothing seen yet: a timeout cannot be re-sent, a connection that
+        // was never made can.
         assert!(!state.may_resend(&no_response()));
+        assert!(state.may_resend(&not_connected()));
+        assert!(!state.dedup_seen, "sending nothing proves nothing");
         // A retryable failure whose response proves de-duplication.
         assert!(state.may_resend(&response(true, true)));
-        // …and a connect failure after it inherits that evidence.
+        // …and a timeout after it inherits that evidence.
         assert!(state.may_resend(&no_response()));
         // A non-retryable status is never re-sent, header or not.
         assert!(!state.may_resend(&response(true, false)));
@@ -1305,8 +1411,10 @@ mod tests {
         // A header-less response — an older replica behind the same
         // Service, or a rolled-back control plane — clears the evidence…
         assert!(!state.may_resend(&response(false, true)));
-        // …so the connect failures after it are dropped again.
+        // …so the timeouts after it are dropped again, while a connection
+        // that was never made is still re-sent.
         assert!(!state.may_resend(&no_response()));
+        assert!(state.may_resend(&not_connected()));
     }
 
     /// Which failures use up [`MAX_ANSWERED_FAILURES`], pinned as a table
@@ -1345,7 +1453,8 @@ mod tests {
         );
         assert!(
             !SendFailure::NoResponse {
-                error: anyhow!("connection refused"),
+                never_sent: false,
+                error: anyhow!("operation timed out"),
             }
             .counts_toward_the_cap(),
             "a failure with no response is bounded by the budget alone",
@@ -1441,9 +1550,19 @@ mod tests {
     async fn local_server(
         respond: impl Fn(&axum::http::HeaderMap, &[u8]) -> Reply + Send + Sync + 'static,
     ) -> LocalServer {
+        local_server_on(
+            tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap(),
+            respond,
+        )
+    }
+
+    /// [`local_server`] on a listener the test made.
+    fn local_server_on(
+        listener: tokio::net::TcpListener,
+        respond: impl Fn(&axum::http::HeaderMap, &[u8]) -> Reply + Send + Sync + 'static,
+    ) -> LocalServer {
         use http_body_util::BodyExt;
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let respond = Arc::new(respond);
         tokio::spawn(async move {
@@ -1598,9 +1717,20 @@ mod tests {
     /// one dp-manager Service a rolling upgrade answers from both kinds of
     /// replica.
     async fn scripted_server(script: Vec<Answer>) -> (LocalServer, RecordedPosts) {
+        scripted_server_on(
+            tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap(),
+            script,
+        )
+    }
+
+    /// [`scripted_server`] on a listener the test made.
+    fn scripted_server_on(
+        listener: tokio::net::TcpListener,
+        script: Vec<Answer>,
+    ) -> (LocalServer, RecordedPosts) {
         let posts: RecordedPosts = Arc::new(std::sync::Mutex::new(Vec::new()));
         let recorded = Arc::clone(&posts);
-        let server = local_server(move |headers, body| {
+        let server = local_server_on(listener, move |headers, body| {
             // Read before locking: a failed expectation here must fail
             // the test, not poison the recording behind a confusing
             // second error.
@@ -1627,8 +1757,7 @@ mod tests {
                 reply.delay = Some(BEYOND_THE_REQUEST_TIMEOUT);
             }
             reply
-        })
-        .await;
+        });
         (server, posts)
     }
 
@@ -2538,7 +2667,9 @@ mod tests {
     /// all. It proves nothing about the far side, so the worker falls back
     /// to the last response it DID see — here one that carried the header,
     /// so the batch is re-sent, and re-sent, until the budget that keeps it
-    /// inside the billing window runs out.
+    /// inside the billing window runs out. Its attempts reached the wire
+    /// unanswered, so any of them may have been stored: the batch is counted
+    /// as unconfirmed, not as lost.
     #[tokio::test]
     async fn no_response_after_a_dedup_bearing_response_resends_until_the_budget_ends() {
         // A retryable failure that proves de-duplication, and from then on
@@ -2581,7 +2712,7 @@ mod tests {
         drive_until(
             sender.as_mut(),
             STEP_WHILE_UNREACHABLE,
-            || drops_with_reason(&metrics, DROP_RETRY_BUDGET_EXHAUSTED) == 2,
+            || drops_with_reason(&metrics, DROP_SEND_UNCONFIRMED) == 2,
             "the batch was not re-sent until the budget ran out",
         )
         .await;
@@ -2613,12 +2744,19 @@ mod tests {
             "a batch re-sent to exhaustion is accounted apart from one \
              that was never re-sent",
         );
+        assert_eq!(
+            drops_with_reason(&metrics, DROP_RETRY_BUDGET_EXHAUSTED),
+            0,
+            "a batch that may have been stored is not counted as lost",
+        );
     }
 
     /// The other direction of the same rule: the last response carried no
     /// header — an older replica behind the same Service, or a rolled-back
     /// control plane — so the failures that follow it are dropped where they
-    /// fall. Caching "we saw the header once" is what this forbids.
+    /// fall. Caching "we saw the header once" is what this forbids. The
+    /// attempt went out and was never answered, so the drop is counted as
+    /// unconfirmed.
     #[tokio::test]
     async fn no_response_after_a_header_less_response_is_dropped_at_once() {
         // Fails with the header first, so the evidence IS set before the
@@ -2659,7 +2797,7 @@ mod tests {
         drive_until(
             sender.as_mut(),
             STEP_WHILE_UNREACHABLE,
-            || drops_with_reason(&metrics, DROP_SEND_FAILED) == 2,
+            || drops_with_reason(&metrics, DROP_SEND_UNCONFIRMED) == 2,
             "the batch was not dropped after a header-less response",
         )
         .await;
@@ -2670,6 +2808,7 @@ mod tests {
             "the batch that met no response was not re-sent",
         );
         assert_eq!(drops_with_reason(&metrics, DROP_RETRY_BUDGET_EXHAUSTED), 0);
+        assert_eq!(drops_with_reason(&metrics, DROP_SEND_FAILED), 0);
     }
 
     /// While a batch is being re-sent nothing else is sent — the worker is
@@ -2952,6 +3091,176 @@ mod tests {
         );
     }
 
+    /// A reported outage that does not end holds one batch for minutes, not
+    /// for the whole budget: the sender is single in-flight, and everything
+    /// queued behind the batch would overflow meanwhile. Past
+    /// [`REPORTED_OUTAGE_BUDGET`], spread per batch, the batch is given up on
+    /// and the next one goes out.
+    #[tokio::test]
+    async fn a_reported_outage_holds_one_batch_for_minutes_not_the_whole_budget() {
+        let (server, posts) = scripted_server(vec![dedups(503)]).await;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(format!("{}/dp/telemetry", server.uri()), &dir);
+        let metrics = Metrics::new(false);
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        tokio::time::pause();
+        let (mut sender, tx) = staged_sender(cfg, metrics.clone(), &mut cancel_rx, 2).await;
+
+        drive_until(
+            sender.as_mut(),
+            STEP_WHILE_SERVING,
+            || !posts.lock().unwrap().is_empty(),
+            "the batch never went out",
+        )
+        .await;
+        let first = Instant::now();
+        drive_until(
+            sender.as_mut(),
+            STEP_WHILE_SERVING,
+            || drops_with_reason(&metrics, DROP_RETRY_BUDGET_EXHAUSTED) == 2,
+            "a batch the control plane kept reporting an outage on was never given up on",
+        )
+        .await;
+        let held = first.elapsed();
+        let low = REPORTED_OUTAGE_BUDGET.mul_f64(1.0 - RETRY_JITTER);
+        let high = REPORTED_OUTAGE_BUDGET.mul_f64(1.0 + RETRY_JITTER) + RETRY_MAX_BACKOFF;
+        assert!(
+            (low..=high).contains(&held),
+            "given up on {held:?} after its first answer"
+        );
+        assert_eq!(drops_with_reason(&metrics, DROP_SEND_FAILED), 0);
+
+        // …and the channel is free for what queued up behind it.
+        let attempts = posts.lock().unwrap().len();
+        for event in ordered_events(2) {
+            tx.try_send(event).unwrap();
+        }
+        tokio::time::advance(FLUSH_INTERVAL).await;
+        drive_until(
+            sender.as_mut(),
+            STEP_WHILE_SERVING,
+            || posts.lock().unwrap().len() > attempts,
+            "the next batch never got its turn",
+        )
+        .await;
+        let posts = posts.lock().unwrap();
+        assert_ne!(
+            posts[attempts].0, posts[0].0,
+            "the next batch has its own id"
+        );
+    }
+
+    /// The window is drawn per batch, within a fifth of it either way, so
+    /// gateways that met one outage together do not all give up together.
+    #[test]
+    fn a_reported_outage_window_is_spread_around_five_minutes() {
+        assert_eq!(REPORTED_OUTAGE_BUDGET, Duration::from_secs(5 * 60));
+        assert_eq!(
+            spread(REPORTED_OUTAGE_BUDGET, 0.0),
+            Duration::from_secs(4 * 60)
+        );
+        assert_eq!(
+            spread(REPORTED_OUTAGE_BUDGET, 0.5),
+            Duration::from_secs(5 * 60)
+        );
+    }
+
+    /// A gateway that boots while the control plane is unreachable has seen
+    /// no response yet, so nothing says re-sending is safe — but a
+    /// connection that could not be made sent nothing, and re-sending it
+    /// cannot count anything twice. The batch waits for the control plane,
+    /// within the budget, and lands once it answers, even from one that does
+    /// not de-duplicate.
+    #[tokio::test]
+    async fn a_batch_that_could_not_connect_waits_for_the_control_plane() {
+        // Bound but not listening: every connection is refused until the
+        // control plane "comes up" on the same address.
+        let (socket, addr) = crate::dp_store::test_logs::refusing_addr();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(format!("http://{addr}/dp/telemetry"), &dir);
+        let metrics = Metrics::new(false);
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        tokio::time::pause();
+        let (mut sender, tx) = staged_sender(cfg, metrics.clone(), &mut cancel_rx, 2).await;
+
+        let down_until = Instant::now() + Duration::from_secs(10);
+        drive_until(
+            sender.as_mut(),
+            STEP_WHILE_SERVING,
+            || Instant::now() >= down_until,
+            "the sender stopped while the control plane was down",
+        )
+        .await;
+        for reason in [
+            DROP_SEND_FAILED,
+            DROP_SEND_UNCONFIRMED,
+            DROP_RETRY_BUDGET_EXHAUSTED,
+        ] {
+            assert_eq!(drops_with_reason(&metrics, reason), 0, "{reason}");
+        }
+
+        socket.listen(128).unwrap();
+        socket.set_nonblocking(true).unwrap();
+        let listener = tokio::net::TcpListener::from_std(socket.into()).unwrap();
+        let (_server, posts) = scripted_server_on(listener, vec![no_dedup(200)]);
+        drive_until(
+            sender.as_mut(),
+            STEP_WHILE_SERVING,
+            || !posts.lock().unwrap().is_empty(),
+            "the batch never reached the control plane once it was up",
+        )
+        .await;
+        drop(tx);
+        finish_sender(sender.as_mut()).await;
+
+        assert_identical_resends(&posts, 1);
+        assert_eq!(
+            posts.lock().unwrap()[0].1["events"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(drops_with_reason(&metrics, DROP_SEND_FAILED), 0);
+    }
+
+    /// An attempt that went out and was never answered may have been
+    /// stored, so giving its batch up is counted as unconfirmed: the stored
+    /// rows then lie between `expected - drops - unconfirmed` and
+    /// `expected - drops`.
+    #[tokio::test]
+    async fn a_batch_given_up_on_after_an_unanswered_attempt_is_unconfirmed() {
+        let (server, posts) = scripted_server(vec![stalls()]).await;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(format!("{}/dp/telemetry", server.uri()), &dir);
+        let metrics = Metrics::new(false);
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        tokio::time::pause();
+        let (mut sender, tx) = staged_sender(cfg, metrics.clone(), &mut cancel_rx, 2).await;
+
+        drive_until(
+            sender.as_mut(),
+            STEP_WHILE_SERVING,
+            || !posts.lock().unwrap().is_empty(),
+            "the batch never went out",
+        )
+        .await;
+        drive_until(
+            sender.as_mut(),
+            STEP_WHILE_UNREACHABLE,
+            || drops_with_reason(&metrics, DROP_SEND_UNCONFIRMED) == 2,
+            "the unanswered batch was not counted as unconfirmed",
+        )
+        .await;
+        drop(tx);
+        assert_eq!(drops_with_reason(&metrics, DROP_SEND_FAILED), 0);
+        assert_eq!(
+            posts.lock().unwrap().len(),
+            1,
+            "nothing proved a re-send safe"
+        );
+    }
+
     /// The exemption is read off the header, never off the status alone. A
     /// `503` without it — from a proxy in front of the control plane, or an
     /// older control plane — proves nothing about de-duplication, so it ends
@@ -3070,7 +3379,9 @@ mod tests {
     /// The cap counts answered failures only. A control plane that has
     /// stopped answering is the outage this feature exists for, and it is
     /// bounded by the budget instead — so attempts that time out neither
-    /// consume the cap nor are stopped by it.
+    /// consume the cap nor are stopped by it. The batch given up on at the
+    /// cap had attempts that went unanswered, so it is counted as
+    /// unconfirmed.
     #[tokio::test]
     async fn failures_with_no_response_do_not_consume_the_cap() {
         // Alternating: every second attempt is answered with a failure that
@@ -3092,7 +3403,7 @@ mod tests {
         drive_until(
             sender.as_mut(),
             STEP_WHILE_SERVING,
-            || drops_with_reason(&metrics, DROP_RETRY_BUDGET_EXHAUSTED) == 2,
+            || drops_with_reason(&metrics, DROP_SEND_UNCONFIRMED) == 2,
             "the batch was never given up on",
         )
         .await;
@@ -3256,10 +3567,23 @@ mod tests {
             tokio::task::yield_now().await;
         }
 
+        // A batch that went out unanswered may have been stored — the first
+        // timed out on its own, the second was still in flight at the
+        // deadline — and one the drain never reached was not.
+        let unconfirmed = drops_with_reason(&metrics, DROP_SEND_UNCONFIRMED);
+        let unsent = drops_with_reason(&metrics, DROP_SEND_FAILED);
         assert_eq!(
-            drops_with_reason(&metrics, DROP_SEND_FAILED),
+            unconfirmed + unsent,
             QUEUED as u64,
             "everything the drain could not deliver is counted",
+        );
+        assert!(
+            unconfirmed >= 2 * MAX_BATCH as u64,
+            "the batches that went out unanswered: {unconfirmed}"
+        );
+        assert!(
+            unsent >= MAX_BATCH as u64,
+            "the batches the drain never sent: {unsent}"
         );
         assert!(tx.is_closed());
     }
