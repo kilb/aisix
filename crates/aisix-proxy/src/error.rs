@@ -406,6 +406,14 @@ pub enum ProxyError {
     /// cannot be known.
     #[error("budget could not be verified: usage has not reached the control plane")]
     BudgetUnverified,
+    /// A rate-limit bucket that carries a spend allowance could not be
+    /// checked, because the shared store that holds what it has spent did
+    /// not answer. Refused rather than admitted on one replica's own count.
+    /// Answered `503` with no figures and no `Retry-After`: the store's
+    /// recovery cannot be predicted, and the allowance is the platform's
+    /// to state, not this refusal's.
+    #[error("Spending could not be verified right now. Retry later.")]
+    AllowanceUnverified,
     /// Per RFC 9110 §15.5.14, a request body that exceeds a server-
     /// imposed limit gets a `413 Content Too Large`. The caller-visible
     /// `message` is intentionally bare of the actual incoming size
@@ -614,7 +622,9 @@ impl ProxyError {
             ProxyError::AllCandidatesUnavailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
             ProxyError::ContentFiltered { .. } => StatusCode::UNPROCESSABLE_ENTITY,
             ProxyError::BudgetExceeded(_) => StatusCode::TOO_MANY_REQUESTS,
-            ProxyError::BudgetUnverified => StatusCode::SERVICE_UNAVAILABLE,
+            ProxyError::BudgetUnverified | ProxyError::AllowanceUnverified => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
             ProxyError::RequestTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
             ProxyError::RateLimit(_) | ProxyError::ModelRateLimit(_) => {
                 StatusCode::TOO_MANY_REQUESTS
@@ -680,7 +690,7 @@ impl ProxyError {
             ProxyError::BudgetExceeded(_) => "billing_error",
             // A gateway-side dependency failed, like `JwksUnavailable`;
             // `error.code` carries the distinction.
-            ProxyError::BudgetUnverified => "api_error",
+            ProxyError::BudgetUnverified | ProxyError::AllowanceUnverified => "api_error",
             ProxyError::RateLimit(_) | ProxyError::ModelRateLimit(_) => "rate_limit_exceeded",
             ProxyError::PolicyRateLimit { .. } => "rate_limit_exceeded",
             ProxyError::Bridge(b) => b.error_type(),
@@ -829,6 +839,7 @@ impl ProxyError {
                 env
             }
             ProxyError::BudgetUnverified => env.with_code("budget_unverified"),
+            ProxyError::AllowanceUnverified => env.with_code("allowance_unverified"),
             // Attribution for policy-layer 429s (#892): the
             // OpenAI envelope names the offending policy. The Anthropic
             // envelope keeps its strict {type,message} shape.
@@ -1485,6 +1496,33 @@ pub(crate) mod tests {
     /// for `err`.
     pub(crate) fn render_platform(err: &ProxyError) -> serde_json::Value {
         in_platform_mode(|| serde_json::to_value(err.envelope()).expect("an envelope serializes"))
+    }
+
+    /// A spend allowance that could not be checked is a `503` of its own:
+    /// its own code, a fixed message with no figures, no `Retry-After`, and
+    /// the same answer in platform mode.
+    #[tokio::test]
+    async fn an_unverified_allowance_is_a_503_with_its_own_code() {
+        use axum::response::IntoResponse as _;
+        for platform in [false, true] {
+            let resp = if platform {
+                in_platform_mode(|| ProxyError::AllowanceUnverified.into_response())
+            } else {
+                ProxyError::AllowanceUnverified.into_response()
+            };
+            assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE, "{platform}");
+            assert!(resp.headers().get("retry-after").is_none(), "{platform}");
+            let body: serde_json::Value = serde_json::from_slice(
+                &axum::body::to_bytes(resp.into_body(), 65536).await.unwrap(),
+            )
+            .unwrap();
+            assert_eq!(body["error"]["code"], "allowance_unverified", "{platform}");
+            assert_eq!(body["error"]["type"], "api_error", "{platform}");
+            assert_eq!(
+                body["error"]["message"], "Spending could not be verified right now. Retry later.",
+                "{platform}"
+            );
+        }
     }
 
     /// A fail-closed guardrail refusal names its failure tag, which can name
