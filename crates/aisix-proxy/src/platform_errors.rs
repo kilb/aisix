@@ -200,8 +200,14 @@ pub(crate) fn classify(err: &ProxyError) -> PlatformErrorClass {
         ProxyError::UnusableTarget(_) => PlatformErrorClass::UpstreamUnavailable,
         // The model cannot serve this endpoint, whichever provider is behind it.
         ProxyError::TargetRefused(_) => PlatformErrorClass::InvalidRequest { param: None },
-        // Read exactly as a response the upstream does not have.
-        ProxyError::ResponseNotFound => PlatformErrorClass::NotFound,
+        // Read exactly as the upstream's own answer for a `previous_response_id`
+        // it does not have: a 400 `invalid_request_error` with `param`
+        // `previous_response_id` and code `previous_response_not_found`
+        // (<https://developers.openai.com/api/docs/guides/websocket-mode>),
+        // which [`classify_upstream`] makes this same class.
+        ProxyError::ResponseNotFound => PlatformErrorClass::InvalidRequest {
+            param: Some("previous_response_id".into()),
+        },
         // The caller's own field, which the class names.
         ProxyError::StoredObjectReference(field) | ProxyError::ModelSelectorRefused(field) => {
             PlatformErrorClass::InvalidRequest {
@@ -1309,19 +1315,38 @@ mod tests {
     }
 
     /// A response id this tenant was never handed reads exactly like a
-    /// response the upstream does not have.
+    /// `previous_response_id` the upstream does not have, which the upstream
+    /// answers with a 400 naming the field.
     #[tokio::test]
-    async fn an_unknown_response_is_answered_as_an_upstream_not_found() {
+    async fn an_unknown_previous_response_is_answered_as_the_upstream_answers_one() {
         let unknown = in_platform_mode(|| ProxyError::ResponseNotFound.into_response());
         let upstream = in_platform_mode(|| {
-            upstream_status(404, "Response with id 'resp_1' not found.").into_response()
+            let message = "Previous response with id 'resp_1' not found.";
+            ProxyError::Bridge(BridgeError::UpstreamStatus {
+                status: 400,
+                message: message.into(),
+                parsed: Some(Box::new(UpstreamErrorView {
+                    kind: Some("invalid_request_error".into()),
+                    message: Some(message.into()),
+                    code: Some("previous_response_not_found".into()),
+                    param: Some("previous_response_id".into()),
+                })),
+                wire: UpstreamWire::OpenAI,
+                retry_after: None,
+                diagnostic: None,
+            })
+            .into_response()
         });
-        assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+        assert_eq!(unknown.status(), StatusCode::BAD_REQUEST);
         assert_eq!(unknown.status(), upstream.status());
         assert_eq!(unknown.headers(), upstream.headers());
         let bytes =
             |r: Response| async move { axum::body::to_bytes(r.into_body(), 65536).await.unwrap() };
-        assert_eq!(bytes(unknown).await, bytes(upstream).await);
+        let (unknown, upstream) = (bytes(unknown).await, bytes(upstream).await);
+        assert_eq!(unknown, upstream);
+        let body: Value = serde_json::from_slice(&unknown).unwrap();
+        assert_eq!(body["error"]["param"], "previous_response_id");
+        assert_eq!(body["error"]["type"], "invalid_request_error");
     }
 
     #[test]

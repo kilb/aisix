@@ -1090,7 +1090,9 @@ describe("platform mode e2e: ids a tenant is handed, and tool use still round-tr
 // account, serves many tenants, so the id must work as a continuation only
 // for the tenant that received it. Anyone else holding it gets the same "no
 // such response" answer an id nobody was ever handed gets, and nothing
-// reaches an upstream on their behalf. The id names neither the upstream's
+// reaches an upstream on their behalf. That answer is the one the upstream
+// itself gives for a previous response it does not have: an invalid request
+// naming `previous_response_id`. The id names neither the upstream's
 // own id nor the target that served it, read as is or decoded.
 //
 // A key restricted to provider groups continues only through a target its
@@ -1278,6 +1280,18 @@ describe("platform mode e2e: a response id continues only for the tenant it was 
       scriptedResponses: [
         { nonStreamBody: tenantAnswer("resp_bdrk_t01") },
         { nonStreamBody: tenantAnswer("resp_bdrk_t02", "resp_bdrk_t01") },
+        // The upstream no longer has the first response.
+        {
+          status: 400,
+          errorBody: {
+            error: {
+              message: "Previous response with id 'resp_bdrk_t01' not found.",
+              type: "invalid_request_error",
+              param: "previous_response_id",
+              code: "previous_response_not_found",
+            },
+          },
+        },
       ],
     });
     up.streamed = await startOpenAiUpstream({
@@ -1410,8 +1424,9 @@ describe("platform mode e2e: a response id continues only for the tenant it was 
       previous_response_id: id,
     });
     const unknown = await unknownResponseAnswer(TENANT_KEYS.b, model);
-    expect(foreign.status, foreign.text).toBe(404);
-    expect(unknown.status, unknown.text).toBe(404);
+    expect(foreign.status, foreign.text).toBe(400);
+    expect(unknown.status, unknown.text).toBe(400);
+    expect(JSON.parse(foreign.text).error?.param).toBe("previous_response_id");
     expect(foreign.text).toBe(unknown.text);
     expect(foreign.text).not.toContain(id);
     expect(upstream.receivedRequests, "nothing reached the upstream for tenant B").toHaveLength(1);
@@ -1431,6 +1446,19 @@ describe("platform mode e2e: a response id continues only for the tenant it was 
     expectSealed(nextBody.id, "resp_bdrk_t02", "target");
     expectNoUpstreamIds(next.text, "resp_bdrk_t02");
     expect(next.text).not.toContain("resp_bdrk_t01");
+
+    // The upstream itself no longer has the response: the owner is told so
+    // in the very words a tenant who was never handed the id is told.
+    const forgotten = await postAs(TENANT_KEYS.a, "/v1/responses", {
+      model,
+      input: "and the day after?",
+      previous_response_id: id,
+    });
+    expect(upstream.receivedRequests).toHaveLength(3);
+    expect(upstreamBody(upstream, 2).previous_response_id).toBe("resp_bdrk_t01");
+    expect(forgotten.status, forgotten.text).toBe(400);
+    expect(forgotten.text).toBe((await unknownResponseAnswer(TENANT_KEYS.a, model)).text);
+    expect(forgotten.text).not.toContain("resp_bdrk_t01");
   });
 
   test("a streamed answer's id: one id on every frame, and it continues only for its tenant", async (ctx) => {
@@ -1458,7 +1486,7 @@ describe("platform mode e2e: a response id continues only for the tenant it was 
       input: "and tomorrow?",
       previous_response_id: id,
     });
-    expect(foreign.status, foreign.text).toBe(404);
+    expect(foreign.status, foreign.text).toBe(400);
     expect(foreign.text).toBe((await unknownResponseAnswer(TENANT_KEYS.b, model)).text);
     expect(upstream.receivedRequests, "nothing reached the upstream for tenant B").toHaveLength(1);
 
@@ -1508,7 +1536,7 @@ describe("platform mode e2e: a response id continues only for the tenant it was 
       input: "and tomorrow?",
       previous_response_id: id,
     });
-    expect(next.status, next.text).toBe(404);
+    expect(next.status, next.text).toBe(400);
     expect(next.text).toBe(
       (await unknownResponseAnswer(TENANT_KEYS.aGrouped, TENANT_ALIASES.otherGroup)).text,
     );
