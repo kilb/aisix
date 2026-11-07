@@ -148,6 +148,13 @@ test("新建内部密钥：明文只显示一次，用它能调网关", async ({
   await expect(row).toContainText(`${plaintext.slice(0, 12)}…`);
   await expect(row).not.toContainText(plaintext);
 
+  // Away to another tab and back: the plaintext is gone.
+  await page.locator('[data-tab="tenants"]').click();
+  await page.locator('[data-tab="keys"]').click();
+  await expect(keyRow(page, "ops-key-t6")).toContainText(`${plaintext.slice(0, 12)}…`);
+  await expect(page.getByLabel("密钥明文")).toHaveCount(0);
+  expect(await page.content()).not.toContain(plaintext);
+
   // After a reload: the list shows the prefix only, and the plaintext is gone.
   await page.reload();
   await page.locator('[data-tab="keys"]').click();
@@ -173,20 +180,57 @@ test("停用后网关返回 401，启用后恢复", async ({ page }) => {
   await expect(row).toContainText("已停用");
   await expect.poll(() => chatStatus(plaintext), { timeout: ROLLOUT_BOUND_MS }).toBe(401);
 
-  // The operator's switch sticks: the tenant switching its own back on does not reopen the key.
-  const own = await t.client.request("GET", `/api/keys/${key.id}`);
-  expect(own.body.disabled_by_platform).toBe(true);
-  const reopened = await t.client.request("PATCH", `/api/keys/${key.id}`, { disabled: false }, own.version!);
-  expect(reopened.status, reopened.text).toBeLessThan(500);
-  expect((await stack.admin.get(`/admin/keys/${key.id}`)).effective_disabled).toBe(true);
-  expect(await chatStatus(plaintext)).toBe(401);
+  // The tenant sees the platform's switch on its key.
+  expect((await t.client.get(`/api/keys/${key.id}`)).disabled_by_platform).toBe(true);
 
+  // After a reload the page shows what the control plane holds: still off.
   await page.reload();
   await page.locator('[data-tab="keys"]').click();
   await page.getByLabel("租户").selectOption({ label: t.org });
+  await expect(row).toContainText("已停用");
   await row.getByRole("button", { name: "启用" }).click();
   await expect(row).toContainText("正常");
   await expect(row).not.toContainText("已停用");
+  await expect.poll(() => chatStatus(plaintext), { timeout: ROLLOUT_BOUND_MS }).toBe(200);
+});
+
+test("租户也停用了的密钥：运维停用后租户不能自行重新启用，运维启用后仍按租户的开关", async ({ page }) => {
+  const t = await signUpActive("T6 Sticky Co 3d4", "owner@sticky-t6.test", [models.chat]);
+  const { key, plaintext } = await mint(t, "sticky-key-t6");
+  await expect.poll(() => chatStatus(plaintext), { timeout: KEY_READY_MS }).toBe(200);
+  /** The tenant's own switch, set on `/api` against the key's current version. */
+  const tenantSwitch = async (disabled: boolean) => {
+    const own = await t.client.request("GET", `/api/keys/${key.id}`);
+    return t.client.request("PATCH", `/api/keys/${key.id}`, { disabled }, own.version!);
+  };
+  // The tenant switches its key off first.
+  const off = await tenantSwitch(true);
+  expect(off.status, off.text).toBe(200);
+  await expect.poll(() => chatStatus(plaintext), { timeout: ROLLOUT_BOUND_MS }).toBe(401);
+
+  await openKeys(page, t.org);
+  const row = keyRow(page, "sticky-key-t6");
+  await expect(row).toContainText("租户自行停用");
+  await row.getByRole("button", { name: "停用" }).click();
+  await row.getByRole("button", { name: "确认停用" }).click();
+  await expect(row).toContainText("运维停用");
+
+  // The operator's switch sticks: the tenant cannot switch the key back on.
+  const refused = await tenantSwitch(false);
+  expect(refused.status, refused.text).toBe(403);
+  let stored = await stack.admin.get(`/admin/keys/${key.id}`);
+  expect([stored.disabled, stored.disabled_by_tenant, stored.effective_disabled]).toEqual([true, true, true]);
+  expect(await chatStatus(plaintext)).toBe(401);
+
+  // 启用 clears the operator's switch only: the tenant's stays off.
+  await row.getByRole("button", { name: "启用" }).click();
+  await expect(row).not.toContainText("运维停用");
+  await expect(row).toContainText("租户自行停用");
+  stored = await stack.admin.get(`/admin/keys/${key.id}`);
+  expect([stored.disabled, stored.disabled_by_tenant, stored.effective_disabled]).toEqual([false, true, true]);
+  // Now the tenant may switch it back on.
+  const on = await tenantSwitch(false);
+  expect(on.status, on.text).toBe(200);
   await expect.poll(() => chatStatus(plaintext), { timeout: ROLLOUT_BOUND_MS }).toBe(200);
 });
 
@@ -263,6 +307,11 @@ test("给客户租户新建密钥：只能调用所选模型，限额与过期�
   await expect.poll(() => chatStatus(plaintext), { timeout: KEY_READY_MS }).toBe(200);
   expect(await chatStatus(plaintext, "other-t6-e2e")).not.toBe(200);
 
+  // Closed: gone from the page.
+  await page.getByRole("button", { name: "关闭" }).click();
+  await expect(page.getByLabel("密钥明文")).toHaveCount(0);
+  expect(await page.content()).not.toContain(plaintext);
+
   const row = keyRow(page, "scoped-key-t6");
   await expect(row).toContainText("chat-t6-e2e");
   await expect(row).not.toContainText("other-t6-e2e");
@@ -295,6 +344,51 @@ test("分组覆盖只选没有上游账号的分组时，先警告并要求确�
   await expect
     .poll(async () => (await stack.admin.get(`/admin/keys/${key.id}`)).allowed_provider_groups)
     .toEqual(["grp-none-6b2"]);
+});
+
+test("分组覆盖里只要有一个分组带上游账号，保存就不需确认", async ({ page }) => {
+  const t = await signUpActive("T6 Mixed Co 6f1", "owner@mixed-t6.test", [models.chat]);
+  const current = await stack.admin.request("GET", `/admin/tenants/${t.id}`);
+  await stack.admin.patch(`/admin/tenants/${t.id}`, { allowed_provider_groups: ["shared", "grp-none-4c8"] }, current.version!);
+  const { key } = await mint(t, "mixed-key-t6");
+
+  await openKeys(page, t.org);
+  await keyRow(page, "mixed-key-t6").getByRole("button", { name: "分组覆盖" }).click();
+  const editor = keyTable(page).getByRole("group", { name: "分组覆盖" });
+  await expect(editor.getByRole("listitem").filter({ hasText: "grp-none-4c8" })).toContainText("没有上游账号在此分组");
+  await editor.getByRole("checkbox", { name: "shared" }).check();
+  await editor.getByRole("checkbox", { name: "grp-none-4c8" }).check();
+  // shared holds an upstream account, so one click saves.
+  await editor.getByRole("button", { name: "保存覆盖" }).click();
+  await expect
+    .poll(async () => [...((await stack.admin.get(`/admin/keys/${key.id}`)).allowed_provider_groups ?? [])].sort())
+    .toEqual(["grp-none-4c8", "shared"]);
+  await expect(keyTable(page).getByRole("button", { name: "确认保存覆盖" })).toHaveCount(0);
+});
+
+test("成员被改为计费角色后，他的密钥在网关上被拒，密钥页说明原因", async ({ page }) => {
+  const t = await signUpActive("T6 Billing Co 5e9", "owner@billing-t6.test", [models.chat]);
+  const join = async (email: string, role: string) => {
+    const invite = await t.client.post("/api/members/invites", { email, role });
+    return (await stack.tenant().post("/api/invites/accept", { token: invite.invite_token, password: PASSWORD })).member;
+  };
+  // A billing member cannot be given a key at all.
+  const ledger = await join("ledger@billing-t6.test", "billing");
+  const forLedger = await t.client.request("POST", "/api/keys", { label: "ledger-key-t6", member_id: ledger.id });
+  expect(forLedger.status, forLedger.text).toBeGreaterThanOrEqual(400);
+  expect(forLedger.status, forLedger.text).toBeLessThan(500);
+  // So the key goes to a member, who is then moved to billing.
+  const payer = await join("payer@billing-t6.test", "member");
+  const { plaintext } = await t.client.post("/api/keys", { label: "payer-key-t6", member_id: payer.id });
+  await expect.poll(() => chatStatus(plaintext), { timeout: KEY_READY_MS }).toBe(200);
+  await t.client.patch(`/api/members/${payer.id}`, { role: "billing" });
+  await expect.poll(() => chatStatus(plaintext), { timeout: ROLLOUT_BOUND_MS }).toBe(401);
+
+  await openKeys(page, t.org);
+  const row = keyRow(page, "payer-key-t6");
+  await expect(row).toContainText("payer@billing-t6.test");
+  await expect(row).toContainText("已停用");
+  await expect(row).toContainText("计费成员不持有可用的密钥");
 });
 
 test("密钥的分组覆盖指向租户已没有的分组时，在租户页和密钥页都标出", async ({ page }) => {
