@@ -37,10 +37,11 @@ use uuid::Uuid;
 use crate::audit::{self, Actor, AuditEntry};
 use crate::auth::password::{self, normalize_email, LoginThrottle, MIN_PASSWORD_LEN};
 use crate::auth::session::{self, Principal, PrincipalKind, MEMBER_SESSION_TTL, PORTAL_COOKIE};
-use crate::auth::{MemberAuth, MemberRole, OperatorAuth, OperatorRole};
+use crate::auth::{MemberAuth, MemberRole, OperatorAuth, OperatorRole, KEY_HOLDERS};
 use crate::db::DbError;
 use crate::error::{ApiError, Detail};
 use crate::http::{ApiJson, API_CONTRACT};
+use crate::keys;
 use crate::operators::cooling_down;
 use crate::resources::write::{
     write_resource, ResourceWrite, WriteCtx, WriteOp, RESOURCES_LOCK_KEY,
@@ -321,7 +322,7 @@ async fn members_of(conn: &mut PgConnection, tenant_id: Uuid) -> Result<Value, A
 /// The caller as they stand now, under their tenant's lock, checked again
 /// for an active tenant and one of the `allowed` roles: the request was
 /// authorised from a read made before the lock.
-async fn current(
+pub(crate) async fn current(
     conn: &mut PgConnection,
     auth: &MemberAuth,
     allowed: &[MemberRole],
@@ -1258,7 +1259,9 @@ pub struct UpdateMember {
 
 /// `PATCH /api/members/{id}` with `{role}` → `200 Member`. Only an owner
 /// changes an owner or makes one; the last enabled owner keeps the role
-/// (`409 last_owner`).
+/// (`409 last_owner`). A move to or from billing closes or reopens the
+/// member's keys in the same transaction; a reopening the gateway-version
+/// gate refuses is `503 unavailable`, as on every `/api` key write.
 pub async fn update(
     auth: MemberAuth,
     State(state): State<AppState>,
@@ -1268,6 +1271,7 @@ pub async fn update(
     auth.require_active()?;
     auth.require(&[MemberRole::Owner, MemberRole::Admin])?;
     let id = parse_id(&id)?;
+    let ctx = WriteCtx::of(&state);
     let view = state
         .db
         .tx(move |conn| {
@@ -1303,6 +1307,11 @@ pub async fn update(
                     Some(all) => revoke_issued_invites(&mut *conn, auth.tenant_id, id, all).await?,
                     None => 0,
                 };
+                // A billing member holds no working key: their keys close
+                // with the demotion and open again with a promotion.
+                if KEY_HOLDERS.contains(&target.role) != KEY_HOLDERS.contains(&req.role) {
+                    keys::reproject_member(&mut *conn, &ctx, id).await?;
+                }
                 audit::record(
                     conn,
                     member_entry(
@@ -1324,14 +1333,15 @@ pub async fn update(
             }
             .boxed()
         })
-        .await?;
+        .await
+        .map_err(keys::on_api)?;
     Ok(Json(view))
 }
 
 /// `DELETE /api/members/{id}` → `204`. The member is marked removed (their
-/// email can be invited again), their sessions end and their `users`
-/// document is deleted, in one transaction. Only an owner removes an
-/// owner; the last enabled owner stays (`409 last_owner`).
+/// email can be invited again), their sessions end, their keys are revoked
+/// and their `users` document is deleted, in one transaction. Only an owner
+/// removes an owner; the last enabled owner stays (`409 last_owner`).
 pub async fn remove(
     auth: MemberAuth,
     State(state): State<AppState>,
@@ -1365,8 +1375,9 @@ pub async fn remove(
                     .map_err(DbError::from)?;
                 session::revoke_all(&mut *conn, Principal::Member(id), None).await?;
                 let revoked = revoke_issued_invites(&mut *conn, auth.tenant_id, id, true).await?;
-                // Task 12: the member's keys are revoked here, before their
-                // `users` document goes (a key document names its user).
+                // Before their `users` document goes: a key document names
+                // its user.
+                let keys_revoked = keys::revoke_member(&mut *conn, &ctx, id).await?;
                 write_resource(
                     &mut *conn,
                     &ctx,
@@ -1386,7 +1397,7 @@ pub async fn remove(
                         "member.remove",
                         auth.tenant_id,
                         id,
-                        json!({ "invites_revoked": revoked }),
+                        json!({ "invites_revoked": revoked, "keys_revoked": keys_revoked }),
                     ),
                 )
                 .await?;
@@ -1460,8 +1471,10 @@ pub struct AdminUpdateMember {
 }
 
 /// `PATCH /admin/members/{id}` with `{disabled}` → `200 Member`. Disabling
-/// ends the member's sessions in the same transaction; the last enabled
-/// owner of a tenant cannot be disabled (`409 last_owner`).
+/// ends the member's sessions, and the member's keys are disabled or
+/// enabled again with them (a key switched off itself stays off), in the
+/// same transaction; the last enabled owner of a tenant cannot be disabled
+/// (`409 last_owner`).
 pub async fn admin_update(
     auth: OperatorAuth,
     State(state): State<AppState>,
@@ -1470,6 +1483,7 @@ pub async fn admin_update(
 ) -> Result<Json<MemberView>, ApiError> {
     auth.require(OperatorRole::Operator)?;
     let id = parse_id(&id)?;
+    let ctx = WriteCtx::of(&state);
     let view = state
         .db
         .tx(move |conn| {
@@ -1505,8 +1519,8 @@ pub async fn admin_update(
                 } else {
                     json!({})
                 };
-                // Task 12: `keys::reproject_member(conn, ctx, id)` goes here,
-                // so the member's keys follow in the same transaction.
+                // The member's keys follow, in the same transaction.
+                keys::reproject_member(&mut *conn, &ctx, id).await?;
                 let action = if req.disabled {
                     "member.disable"
                 } else {

@@ -106,6 +106,16 @@ fn fixture(method: &str, path: &str, target: &SeededOperator) -> (String, Option
             format!("/admin/members/{}", Uuid::nil()),
             Some(json!({"disabled": true})),
         ),
+        // Keys. The ids match nothing: past the role check, a read or a
+        // create answers 404, and a change without If-Match 428.
+        ("GET" | "POST", "/admin/tenants/{id}/keys") => (
+            format!("/admin/tenants/{}/keys", Uuid::nil()),
+            (method == "POST").then(|| json!({"label": "roles-key"})),
+        ),
+        ("GET" | "PATCH" | "DELETE", "/admin/keys/{id}") => (
+            format!("/admin/keys/{}", Uuid::nil()),
+            (method == "PATCH").then(|| json!({"label": "roles-key"})),
+        ),
         ("GET", "/admin/rollout") => (path.to_string(), None),
         // This control plane reaches no kine, so no projector leads: past
         // the role check, the request is refused and nothing is deleted.

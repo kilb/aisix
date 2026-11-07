@@ -410,10 +410,19 @@ pub fn check_against(
     Ok(())
 }
 
+/// The code of the gate's refusal.
+const GATEWAY_TOO_OLD: &str = "gateway_too_old";
+
+/// Whether `e` is the gate's refusal ([`gate`]), which a caller may treat
+/// as "not now" rather than as a fault.
+pub fn refused(e: &ApiError) -> bool {
+    e.code == GATEWAY_TOO_OLD
+}
+
 /// `422 gateway_too_old` at `pointer`.
 fn too_old(pointer: &str, message: String) -> ApiError {
     ApiError {
-        code: "gateway_too_old",
+        code: GATEWAY_TOO_OLD,
         message: "部分网关版本过低或无法确认版本，暂不能保存此配置".to_string(),
         ..ApiError::validation(vec![Detail {
             path: pointer.to_string(),

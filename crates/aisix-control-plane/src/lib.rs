@@ -24,6 +24,7 @@ pub mod etcd_front;
 pub mod gateways;
 pub mod housekeeping;
 pub mod http;
+pub mod keys;
 pub mod kine;
 pub mod members;
 pub mod operators;
@@ -169,6 +170,20 @@ where
         stale_secs: gateways::stale_window_secs(&cfg),
     };
     tenants::ensure_internal_tenant(&db, &write_ctx).await?;
+    // Keys an older release wrote. A tenant left behind, whatever the reason,
+    // is tried again by every housekeeping tick, so it does not stop the
+    // boot: refusing to start would only stop the control plane serving
+    // everything else.
+    let caught_up = keys::catch_up(&db, &write_ctx, keys::KEY_DOC_VERSION)
+        .await
+        .map_err(|e| BootError::KeyDocuments(format!("{}: {}", e.code, e.message)))?;
+    if !caught_up.failed.is_empty() {
+        tracing::error!(
+            tenants = ?caught_up.failed,
+            "the key documents of these tenants could not be rewritten at boot (each \
+             reason is logged above); housekeeping tries them again every tick"
+        );
+    }
     let passwords = PasswordGate::new(ARGON2_GATE_PERMITS)?;
     let creds = CredentialCache::load(&db.dedicated(CREDENTIALS_POOL_SIZE)).await?;
     let dp_tls = match dp::listener::server_tls(&pki, &cfg.dp_hosts, true) {
@@ -240,7 +255,11 @@ where
             .with_graceful_shutdown(async move { stopped(&mut browser_stop).await })
             .await
     });
-    let mut tasks = vec![housekeeping::spawn(state.db.clone(), stopping.clone())];
+    let mut tasks = vec![housekeeping::spawn(
+        state.db.clone(),
+        WriteCtx::of(&state),
+        stopping.clone(),
+    )];
     let mut projector_stop = stopping.clone();
     tasks.push(projector::spawn(
         state.db.clone(),

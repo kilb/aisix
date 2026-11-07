@@ -124,10 +124,7 @@ impl MemberAuth {
 
     /// Whether the member may hold and use keys at all.
     pub fn can_use_keys(&self) -> bool {
-        matches!(
-            self.role,
-            MemberRole::Owner | MemberRole::Admin | MemberRole::Member
-        )
+        super::KEY_HOLDERS.contains(&self.role)
     }
 
     /// The member of the request's session, or `None` when it carries no

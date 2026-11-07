@@ -74,6 +74,11 @@ pub enum MemberRole {
     Billing,
 }
 
+/// The tenant roles that hold and use keys: a member their own, an owner or
+/// an admin every key of the tenant. A billing member holds none, and a
+/// key bound to one does not work.
+pub const KEY_HOLDERS: &[MemberRole] = &[MemberRole::Owner, MemberRole::Admin, MemberRole::Member];
+
 impl MemberRole {
     /// The name stored in the database and used on the wire.
     pub fn as_str(self) -> &'static str {
