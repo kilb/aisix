@@ -66,8 +66,10 @@ pub(crate) fn resolve_model(
 /// filter in `routing::resolve_attempt_models` or `semantic::select_eligible`.
 ///
 /// Called right after the model access check on `/v1/chat/completions`,
-/// `/v1/messages`, `/v1/messages/count_tokens`, `/v1/responses` and
-/// `/v1/embeddings`, ahead of the client-IP check, guardrails and the cache,
+/// `/v1/messages`, `/v1/messages/count_tokens`, `/v1/responses`,
+/// `/v1/embeddings`, `/v1/decisions` and `/v1/systemone`, the files, batches
+/// and fine-tuning surface, and `/v1/realtime`, ahead of the client-IP check,
+/// guardrails, the cache and every refusal of its own that names the kind,
 /// so nothing those do can tell an ensemble from a name nothing serves; and
 /// from `routing::resolve_attempt_models`, which every other endpoint passes
 /// through before it dispatches.
@@ -490,10 +492,41 @@ mod grouped_ensemble_tests {
             "/v1/messages/count_tokens",
             "/v1/responses",
             "/v1/embeddings",
+            "/v1/decisions",
+            "/v1/systemone",
         ] {
             let unknown = answer(uri, "nobody").await;
             assert_eq!(unknown.0, StatusCode::NOT_FOUND, "{uri}: {unknown:?}");
             assert_eq!(answer(uri, "council").await, unknown, "{uri}");
         }
+
+        // The files, batches and fine-tuning surface names its model in the
+        // query (or a form field, or a header).
+        let listed = |model: &str| {
+            let app = app.clone();
+            let model = model.to_string();
+            async move {
+                let resp = app
+                    .oneshot(
+                        Request::builder()
+                            .method("GET")
+                            .uri(format!("/v1/batches?model={model}"))
+                            .header("authorization", "Bearer sk-caller")
+                            .body(axum::body::Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let status = resp.status();
+                let bytes = axum::body::to_bytes(resp.into_body(), 65536).await.unwrap();
+                (
+                    status,
+                    String::from_utf8_lossy(&bytes).replace(&model, "<model>"),
+                )
+            }
+        };
+        let unknown = listed("nobody").await;
+        assert_eq!(unknown.0, StatusCode::NOT_FOUND, "/v1/batches: {unknown:?}");
+        assert_eq!(listed("council").await, unknown, "/v1/batches");
     }
 }

@@ -377,6 +377,13 @@ async fn dispatch(
     if !auth.key().can_access(snapshot, &model_name) {
         return Err(ProxyError::ModelForbidden(model_name.clone()));
     }
+    // A grouped key is answered as if no ensemble existed, as on every other
+    // endpoint, ahead of the IP check and of the refusal below that names it.
+    crate::model_resolve::refuse_ensemble_to_grouped_key(
+        &model_name,
+        &model_entry.value,
+        &auth.key().allowed_provider_groups,
+    )?;
     crate::dispatch::check_ip_access(&model_entry.value, &client_ctx.source_ip)?;
     if let Some(kind) = unserved_kind(&model_entry.value) {
         return Err(unserved_kind_error(
