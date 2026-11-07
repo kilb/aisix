@@ -105,9 +105,28 @@ test("邀请链接：设置口令后以成员身份登录，同一链接再次�
       acceptBodies.push(r.postData() ?? "");
     }
   });
+  // The page's address at the moment it first calls the API, recorded in the
+  // page itself: every call still goes through to the real control plane.
+  await pb.addInitScript(() => {
+    const w = window as unknown as { __hrefAtFirstApi: string | null };
+    w.__hrefAtFirstApi = null;
+    const realFetch = window.fetch;
+    window.fetch = function (input: RequestInfo | URL, init?: RequestInit) {
+      const url = input instanceof Request ? input.url : String(input);
+      if (w.__hrefAtFirstApi === null && new URL(url, location.href).pathname.startsWith("/api/")) {
+        w.__hrefAtFirstApi = location.href;
+      }
+      return realFetch.call(this, input, init);
+    };
+  });
   await pb.goto(link);
   await expect(pb.getByRole("button", { name: "接受邀请" })).toBeVisible();
-  // The token is out of the address bar as soon as the page is up.
+  // The token left the address bar before the first request, and stays out.
+  const hrefAtFirstApi = await pb.evaluate(
+    () => (window as unknown as { __hrefAtFirstApi: string | null }).__hrefAtFirstApi,
+  );
+  expect(hrefAtFirstApi).not.toBeNull();
+  expect(hrefAtFirstApi).not.toContain("token");
   expect(pb.url()).not.toContain(token);
   expect(new URL(pb.url()).hash).toBe("");
   await pb.getByLabel("口令", { exact: true }).fill("member-pass-2c9x");
@@ -116,12 +135,13 @@ test("邀请链接：设置口令后以成员身份登录，同一链接再次�
 
   // Signed in as a member of that organisation: no members page.
   await expect(pb.getByRole("banner")).toContainText("Invite Org 2c9");
-  await expect(pb.getByRole("banner")).toContainText("Mia 2c9");
-  await expect(pb.getByRole("banner")).toContainText("成员");
+  await expect(pb.getByRole("banner")).toContainText("Mia 2c9 · 成员");
   await expect(pb.getByRole("tab")).toHaveText(["组织", "密钥"]);
-  // The token went out once, in a request body, and nowhere else.
+  // The token went out once, in a request body.
   expect(acceptBodies).toHaveLength(1);
   expect(acceptBodies[0]).toContain(token);
+  // A request URL never carries the page's fragment, so this catches only a
+  // token moved into a query string or a path.
   expect(sentUrls.filter((u) => u.includes(token))).toEqual([]);
   const stored = await pb.evaluate(() => JSON.stringify([{ ...localStorage }, { ...sessionStorage }, document.cookie]));
   expect(stored).not.toContain(token);
@@ -179,13 +199,60 @@ test("用已有账号的邮箱注册组织，提示不透露该邮箱已有账�
   });
   await page.goto(stack.previewUrl);
   await signup(page, "Second Org 8f2", "owner@taken-8f2.test", "second-pass-8f2x");
-  await expect(page.getByRole("alert")).toBeVisible();
-  const text = (await page.getByRole("alert").textContent()) ?? "";
+  const alert = page.getByRole("alert");
+  await expect(alert).toBeVisible();
+  const text = (await alert.textContent()) ?? "";
+  // Soft, so a regression reports every check it breaks. A denylist alone
+  // would let new wording that gives the account away pass.
   for (const tell of ["已被使用", "已被注册", "已注册", "已存在", "email_taken"]) {
-    expect(text).not.toContain(tell);
+    expect.soft(text).not.toContain(tell);
   }
+  expect.soft(text).not.toContain("owner@taken-8f2.test");
+  await expect.soft(alert).toHaveText("无法完成注册，请检查填写的信息");
   await expect(page.getByRole("button", { name: "注册组织" })).toBeVisible();
   expect(await tenantNames()).not.toContain("Second Org 8f2");
+});
+
+test("受邀邮箱已有账号时，接受邀请的提示不透露这一点", async ({ page }) => {
+  await stack.tenant().post("/api/signup", {
+    org_name: "Holder Org 0b3",
+    email: "holder@holder-0b3.test",
+    password: "holder-pass-0b3x",
+  });
+  const tenant = await stack.admin.post("/admin/tenants", { name: "Inviting Org 0b3" });
+  const invite = await stack.admin.post(`/admin/tenants/${tenant.id}/invites`, {
+    email: "holder@holder-0b3.test",
+    role: "member",
+  });
+  await page.goto(`${stack.previewUrl}/invite#token=${invite.invite_token}`);
+  await page.getByLabel("口令", { exact: true }).fill("invited-pass-0b3x");
+  await page.getByRole("button", { name: "接受邀请" }).click();
+  await expect(page.getByRole("alert")).toHaveText("无法接受邀请，请联系邀请人");
+  await expect(page.getByText("Inviting Org 0b3")).toHaveCount(0);
+});
+
+test("空的邀请令牌不打开接受邀请表单", async ({ page }) => {
+  await page.goto(`${stack.previewUrl}/invite#token=`);
+  await expect(page.getByLabel("邮箱")).toBeVisible();
+  await expect(page.getByRole("button", { name: "接受邀请" })).toHaveCount(0);
+  expect(new URL(page.url()).hash).toBe("");
+});
+
+test("已登录时打开邀请链接，可以取消并回到原来的组织", async ({ page }) => {
+  await page.goto(stack.previewUrl);
+  await signup(page, "Present Org 4a8", "owner@present-4a8.test", "present-pass-4a8x");
+  await expect(page.getByRole("banner")).toContainText("Present Org 4a8");
+  const tenant = await stack.admin.post("/admin/tenants", { name: "Elsewhere Org 4a8" });
+  const invite = await stack.admin.post(`/admin/tenants/${tenant.id}/invites`, {
+    email: "guest@elsewhere-4a8.test",
+    role: "member",
+  });
+
+  await page.goto(`${stack.previewUrl}/invite#token=${invite.invite_token}`);
+  await expect(page.getByRole("button", { name: "接受邀请" })).toBeVisible();
+  await page.getByRole("button", { name: "取消" }).click();
+  await expect(page.getByRole("banner")).toContainText("Present Org 4a8");
+  await expect(page.getByRole("button", { name: "接受邀请" })).toHaveCount(0);
 });
 
 test("停用的组织登录后只看到停用说明", async ({ page }) => {

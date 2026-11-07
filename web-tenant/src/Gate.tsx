@@ -22,11 +22,14 @@ function longEnough(password: string): boolean {
  */
 export function Gate({
   invite,
+  signedIn,
   onIn,
   onLeaveInvite,
 }: {
   /** The invitation token, when the page was opened from an invitation link. */
   invite: string | null;
+  /** Whether a session is live behind an invitation form opened over it. */
+  signedIn: boolean;
   onIn: (session: Session) => void;
   onLeaveInvite: () => void;
 }) {
@@ -67,10 +70,17 @@ export function Gate({
     }
     if (invite !== null) {
       // An invitation that was used, revoked, has expired or never existed
-      // answers 404 alike.
+      // answers 404 alike. One whose email has an account by now answers 409
+      // `email_taken`, which only the inviter can sort out; the text does not
+      // say why.
       void attempt(
         () => acceptInvite(invite, password, name),
-        (e) => (e.code === "not_found" ? "邀请无效或已过期" : formMessageFor(e)),
+        (e) =>
+          e.code === "not_found"
+            ? "邀请无效或已过期"
+            : e.code === "email_taken"
+              ? "无法接受邀请，请联系邀请人"
+              : formMessageFor(e),
       );
     } else {
       void attempt(() => signup(orgName.trim(), email.trim(), password, name), formMessageFor);
@@ -147,7 +157,7 @@ export function Gate({
           </form>
           {alert}
           <button className="ghost" type="button" onClick={leaveInvite}>
-            返回登录
+            {signedIn ? "取消" : "返回登录"}
           </button>
         </div>
       ) : (

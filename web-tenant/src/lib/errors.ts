@@ -11,10 +11,11 @@ const TEXT: Record<string, string> = {
   forbidden: "当前账号没有执行此操作的权限",
   not_found: "资源不存在或已被删除",
   validation_failed: "提交的内容未通过校验",
-  // Sign-up and invitation acceptance answer this when the email already
-  // belongs to an account. The text does not say so: a page that tells
-  // whoever types an address whether it has an account is an oracle for it.
-  email_taken: "无法完成注册，请检查填写的信息，或直接登录",
+  // Sign-up answers this when the email already belongs to an account. The
+  // text does not say so: a page that tells whoever types an address whether
+  // it has an account is an oracle for it. (Invitation acceptance words it
+  // its own way, in Gate.tsx.)
+  email_taken: "无法完成注册，请检查填写的信息",
   last_owner: "组织至少要有一个所有者",
   tenant_not_active: "组织尚未通过审核或已被停用",
   version_mismatch: "该资源已被他人修改。重新载入后再编辑。",

@@ -129,7 +129,7 @@ export function App({ inviteToken }: { inviteToken: string | null }) {
   // An invitation link opens the acceptance form even over a live session:
   // accepting signs in as the invited member in its place.
   if (!me || invite !== null) {
-    return <Gate invite={invite} onIn={signIn} onLeaveInvite={() => setInvite(null)} />;
+    return <Gate invite={invite} signedIn={me !== null} onIn={signIn} onLeaveInvite={() => setInvite(null)} />;
   }
 
   const { member, tenant } = me;
