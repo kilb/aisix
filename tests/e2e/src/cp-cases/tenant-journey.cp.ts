@@ -16,7 +16,6 @@ import {
   type GatewayAnswer,
   type PlatformUpstream,
 } from "../harness/cp-upstream.js";
-import { ProxyClient } from "../harness/proxy.js";
 
 // E2E: the whole tenant journey across both planes. An operator sets up an
 // upstream account and platform models; a company signs up, is approved and
@@ -48,7 +47,7 @@ describe("a tenant's journey from signup to a working key, and the switches that
   /** The owner's main key, and a second one that only counts tokens. */
   let mainKey: { id: string; plaintext: string };
   let countKey: { id: string; plaintext: string; version: number };
-  /** Every answer a tenant key got, for the channel-marker check. */
+  /** Every answer a tenant key got from the gateway, for the last test's scan. */
   const answers: GatewayAnswer[] = [];
 
   const call = async (key: string, path: string, body: unknown, headers?: Record<string, string>) => {
@@ -56,7 +55,7 @@ describe("a tenant's journey from signup to a working key, and the switches that
     answers.push(answer);
     return answer;
   };
-  const listStatus = async (key: string) => (await new ProxyClient(app!.proxyUrl, key).listModels()).status;
+  const listStatus = async (key: string) => (await call(key, "/v1/models", undefined)).status;
   const waitListStatus = (key: string, status: number, what: string) => {
     let last = 0;
     return pollUntil(what, async () => ((last = await listStatus(key)) === status ? true : undefined), {
@@ -152,8 +151,8 @@ describe("a tenant's journey from signup to a working key, and the switches that
     await waitListStatus(countKey.plaintext, 200, "the count key to authenticate");
     await waitListStatus(mainKey.plaintext, 200, "the main key to authenticate");
 
-    const listed = await new ProxyClient(app!.proxyUrl, mainKey.plaintext).listModels();
-    const ids = ((listed.body as Json).data as Json[]).map((m) => m.id).sort();
+    const listed = await call(mainKey.plaintext, "/v1/models", undefined);
+    const ids = (listed.json.data as Json[]).map((m) => m.id).sort();
     expect(ids).toEqual(["chat-e2e", "embed-e2e"]);
 
     for (const stream of [false, true]) {
@@ -186,25 +185,22 @@ describe("a tenant's journey from signup to a working key, and the switches that
     expect(embedded.status, embedded.text).toBe(200);
     expect(embedded.json.data[0].embedding).toEqual([0.25, 0.5]);
 
-    // Every call reached the upstream, and none of what it said about its
-    // channel or account reached the tenant.
+    // Every one of those calls reached the upstream.
     expect(upstream!.requests.length).toBeGreaterThanOrEqual(8);
-    const leaks = [MARKER, "acct-e2e-1", "acct-e2e-ant", accounts[0].id, accounts[1].id];
-    for (const answer of answers) {
-      const headers = [...answer.headers.entries()].map(([k, v]) => `${k}: ${v}`).join("\n");
-      for (const leak of leaks) {
-        expect(answer.text, `body leaks ${leak}`).not.toContain(leak);
-        expect(headers, `headers leak ${leak}`).not.toContain(leak);
-      }
-    }
   });
 
-  test("a route outside the first phase is refused to the tenant key before any upstream call", async () => {
-    const before = upstream!.count("/v1/images/generations");
-    const refused = await call(mainKey.plaintext, "/v1/images/generations", { model: "chat-e2e", prompt: "a cat" });
-    expect(refused.status, refused.text).toBe(403);
-    expect(refused.json?.error?.type, refused.text).toBe("permission_denied");
-    expect(upstream!.count("/v1/images/generations")).toBe(before);
+  test("routes outside the first phase are refused to the tenant key before any upstream call", async () => {
+    const outside: Array<[string, Record<string, unknown>]> = [
+      ["/v1/images/generations", { model: "chat-e2e", prompt: "a cat" }],
+      ["/v1/completions", { model: "chat-e2e", prompt: "hi" }],
+    ];
+    for (const [path, body] of outside) {
+      const before = upstream!.count(path);
+      const refused = await call(mainKey.plaintext, path, body);
+      expect(refused.status, `${path}: ${refused.text}`).toBe(403);
+      expect(refused.json?.error?.type, `${path}: ${refused.text}`).toBe("permission_denied");
+      expect(upstream!.count(path), path).toBe(before);
+    }
   });
 
   test("a model the tenant was not granted answers exactly like one that does not exist", async () => {
@@ -278,8 +274,8 @@ describe("a tenant's journey from signup to a working key, and the switches that
     const reactivated = await cp!.admin.post(`/admin/tenants/${tenantId}/reactivate`);
     expect(reactivated.status, reactivated.text).toBe(200);
     await waitListStatus(mainKey.plaintext, 200, "the reactivated tenant's key to be served");
-    // Both keys were rewritten in the reactivation's one write, so the
-    // main key being served means the count key's document is current too.
+    // Every document the reactivation rewrote has reached the gateway.
+    await cp!.admin.waitTenantApplied(tenantId);
     expect(await listStatus(countKey.plaintext)).toBe(401);
   });
 
@@ -303,7 +299,7 @@ describe("a tenant's journey from signup to a working key, and the switches that
         const sent: Array<{ at: number; status: number }> = [];
         const deadline = Date.now() + 70_000;
         for (;;) {
-          const res = await callGateway(app!.proxyUrl, mainKey.plaintext, "/v1/chat/completions", chatBody("chat-e2e-renamed"));
+          const res = await call(mainKey.plaintext, "/v1/chat/completions", chatBody("chat-e2e-renamed"));
           sent.push({ at: Date.now(), status: res.status });
           if (res.status === 429) break;
           expect(res.status, res.text).toBe(200);
@@ -323,4 +319,34 @@ describe("a tenant's journey from signup to a working key, and the switches that
     },
     170_000,
   );
+
+  test("no answer a tenant key got names the upstream channel, account or model", () => {
+    // At least these 15: the model list, chat, messages and responses
+    // buffered and streamed (6), count_tokens, embeddings, the two refused
+    // routes, the ungranted and the missing model, the chat after the
+    // rename, and the rpm limit's 429. The readiness and switch polls come
+    // on top.
+    expect(answers.length).toBeGreaterThanOrEqual(15);
+    expect(answers.filter((a) => a.status === 403).length).toBeGreaterThanOrEqual(2);
+    expect(answers.some((a) => a.status === 429)).toBe(true);
+    const leaks = [
+      MARKER,
+      "acct-e2e-1",
+      "acct-e2e-ant",
+      accounts[0].id,
+      accounts[1].id,
+      // The upstream model ids behind chat-e2e, other-e2e, embed-e2e and count-e2e.
+      "gpt-4o-mini",
+      "gpt-4o",
+      "text-embedding-3-small",
+      "claude-haiku-4-5",
+    ];
+    for (const answer of answers) {
+      const headers = [...answer.headers.entries()].map(([k, v]) => `${k}: ${v}`).join("\n");
+      for (const leak of leaks) {
+        expect(answer.text, `a ${answer.status} body names ${leak}`).not.toContain(leak);
+        expect(headers, `a ${answer.status} answer's headers name ${leak}`).not.toContain(leak);
+      }
+    }
+  });
 });

@@ -200,7 +200,8 @@ export interface GatewayAnswer {
 /**
  * One request to the gateway with a caller key, sent the way each endpoint's
  * own SDK sends it: `x-api-key` and `anthropic-version` on `/v1/messages*`,
- * a bearer token elsewhere.
+ * a bearer token elsewhere. A POST of `body`, or a GET when `body` is
+ * `undefined`.
  */
 export async function callGateway(
   proxyUrl: string,
@@ -211,15 +212,15 @@ export async function callGateway(
 ): Promise<GatewayAnswer> {
   const anthropic = path.startsWith("/v1/messages");
   const res = await fetch(`${proxyUrl}${path}`, {
-    method: "POST",
+    method: body === undefined ? "GET" : "POST",
     headers: {
-      "content-type": "application/json",
+      ...(body === undefined ? {} : { "content-type": "application/json" }),
       ...(anthropic
         ? { "x-api-key": key, "anthropic-version": "2023-06-01" }
         : { authorization: `Bearer ${key}` }),
       ...headers,
     },
-    body: JSON.stringify(body),
+    body: body === undefined ? undefined : JSON.stringify(body),
   });
   const text = await res.text();
   let json: unknown;

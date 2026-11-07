@@ -1970,13 +1970,15 @@ pub fn sweep_unattached_guardrails(
 }
 
 // ---------------------------------------------------------------------------
-// LiveGuardrailIndex — lazy-rebuild adapter over a snapshot handle
+// LiveGuardrailIndex — rebuild-on-change adapter over a snapshot handle
 // ---------------------------------------------------------------------------
 
 /// Wraps a snapshot handle and rebuilds the runtime index when — and only
 /// when — the `guardrails` or `guardrail_attachments` table changes. The
 /// endpoint handlers call `resolve(ctx)` on each request to get the
-/// applicable `GuardrailChain`.
+/// applicable `GuardrailChain`; in the server, [`rebuild_on_publish`] builds
+/// it as each configuration publishes, so a request normally finds it
+/// current, and one that does not builds it itself.
 ///
 /// Hot path: one snapshot load, one generation-pair compare, one `Arc`
 /// clone. A rebuild walks the attachment rows and constructs a runtime
@@ -2056,8 +2058,8 @@ impl LiveGuardrailIndex {
         Self::new_with_sink_and_status(snapshot, bedrock_endpoint_url, metrics_sink, embedder, None)
     }
 
-    /// Production constructor: additionally reports lazy index-build
-    /// failures through the shared configuration status.
+    /// Production constructor: additionally reports index-build failures
+    /// through the shared configuration status.
     pub fn new_with_sink_and_status(
         snapshot: SnapshotHandle<AisixSnapshot>,
         bedrock_endpoint_url: Option<String>,
@@ -2217,13 +2219,17 @@ pub async fn rebuild_on_publish(
         if *cancel.borrow() {
             return;
         }
-        let building = Arc::clone(&index);
-        // A build that panics panics on the request path too, which is
-        // where it is reported; there is nothing to add here.
-        let _ = tokio::task::spawn_blocking(move || {
-            building.current();
-        })
-        .await;
+        // Most publications change neither table the index reads; those
+        // need no trip to the blocking pool.
+        if index.cache.load().last_key != index_key(&index.snapshot.load()) {
+            let building = Arc::clone(&index);
+            // A build that panics panics on the request path too, which is
+            // where it is reported; there is nothing to add here.
+            let _ = tokio::task::spawn_blocking(move || {
+                building.current();
+            })
+            .await;
+        }
         tokio::select! {
             changed = cancel.changed() => {
                 if changed.is_err() {

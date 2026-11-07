@@ -212,6 +212,9 @@ function pipeLines(stream, tag) {
  * anything it started. An exit nobody asked for stops the whole stack.
  */
 function startChild(tag, bin, args, env) {
+  // A stop that arrived while main() was still starting things has already
+  // stopped every child it knew of; one started now would be left behind.
+  if (stopping) throw new Error(`not starting ${tag}: the stack is stopping`);
   const child = spawn(bin, args, { env, detached: true, stdio: ["ignore", "pipe", "pipe"] });
   const entry = { tag, child, exited: false };
   entry.exit = new Promise((resolveExit) => {
@@ -474,7 +477,15 @@ async function main() {
     startChild("gw", resolve(args.gateway), ["--config", join(REPO, "config.managed.yaml")], gwEnv);
     const proxyUrl = `http://127.0.0.1:${proxyPort}`;
     await waitFor(`${proxyUrl}/livez`, () => httpOk(`${proxyUrl}/livez`));
-    out.gateway = { proxyUrl, dpId: issued.body.dp_id, name };
+    // Registered too: a control plane with a release stamp judges key writes
+    // by the versions registered gateways report, so whoever uses the stack
+    // must not mint keys before this gateway has sent its first heartbeat.
+    const dpId = issued.body.dp_id;
+    await waitFor(`the gateway ${dpId} to register`, async () => {
+      const instances = await api(httpUrl, "GET", "/admin/gateways/instances", cookie);
+      return instances.body.items.some((i) => i.dp_id === dpId);
+    });
+    out.gateway = { proxyUrl, dpId, name };
   }
 
   process.stdout.write(`${JSON.stringify(out)}\n`);

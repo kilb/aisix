@@ -1538,8 +1538,10 @@ async fn run(mut cfg: Config, hangup: Option<HangupSignal>) -> anyhow::Result<()
     proxy_state =
         proxy_state.with_default_timeouts(cfg.upstream.timeout_ms, cfg.upstream.stream_timeout_ms);
     // Live guardrail index: resolves per-request chains from
-    // attachment scope + priority, rebuilding lazily whenever the
-    // etcd watch supervisor stores a fresh snapshot. Dashboard
+    // attachment scope + priority, rebuilt whenever the etcd watch
+    // supervisor stores a snapshot that changes the guardrail or
+    // attachment tables (by `rebuild_on_publish` below, or by the first
+    // request that finds it stale). Dashboard
     // mutations (`/guardrails` and `/guardrail_attachments` CRUD)
     // take effect within one watch tick. Empty attachment table →
     // every resolved chain is empty (no-op). See

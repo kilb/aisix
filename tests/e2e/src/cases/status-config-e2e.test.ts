@@ -611,7 +611,7 @@ describe("status/config: etcd watch source", () => {
     await seed.delete("api_keys", key.id);
   });
 
-  test("a lazy guardrail build failure degrades status and clears after repair", async (ctx) => {
+  test("a guardrail that fails to build degrades status and clears after repair", async (ctx) => {
     if (!etcdReachable || !app || !seed) {
       ctx.skip();
       return;
@@ -639,9 +639,9 @@ describe("status/config: etcd watch source", () => {
       return (await proxy.listModels()).status === 200;
     });
 
-    // Index construction is lazy: the first request after the snapshot swap
-    // is what discovers the script the loader deliberately accepted cannot
-    // compile. A rule that cannot run, under a fail-closed policy, refuses.
+    // The index build after the snapshot swap, not the loader, is what
+    // discovers the script the loader deliberately accepted cannot compile.
+    // A rule that cannot run, under a fail-closed policy, refuses.
     expect(
       (
         await proxy.chat({
