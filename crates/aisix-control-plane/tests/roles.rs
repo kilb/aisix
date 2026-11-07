@@ -165,6 +165,12 @@ fn fixture(method: &str, path: &str, target: &SeededOperator) -> (String, Option
                 "discount_bps": 500,
             })),
         ),
+        // Price views. The tenant matches nothing: 404 once the role check
+        // passed.
+        ("GET", "/admin/pricing/models") => (path.to_string(), None),
+        ("GET", "/admin/pricing/tenants/{id}") => {
+            (format!("/admin/pricing/tenants/{}", Uuid::nil()), None)
+        }
         _ => panic!("no fixture for {method} {path}: add one to tests/roles.rs"),
     }
 }
