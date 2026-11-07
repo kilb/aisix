@@ -40,8 +40,13 @@ pub struct PublicApiKey {
     pub allowed_agents: Option<Vec<String>>,
     /// Shown whenever the stored key sets it, because it refuses every route
     /// outside the listed families whatever the other grants say, so an
-    /// operator reading only those would misread what the key may call.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// operator reading only those would misread what the key may call. A
+    /// family this build does not recognize is left out, so what is read can
+    /// be written back.
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "aisix_core::models::apikey::serialize_known_families"
+    )]
     pub allowed_endpoints: Option<Vec<aisix_core::models::EndpointFamily>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -110,4 +115,32 @@ pub async fn get_apikey(
         .await?
         .ok_or(AdminError::NotFound)?;
     Ok(Json(public_entry(entry)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// What `GET /admin/v1/api_keys` shows can be sent back with `PUT`: a
+    /// family this build does not recognize grants nothing here and the
+    /// write schema refuses it, so it is left out of the view rather than
+    /// shown as `unknown`.
+    #[test]
+    fn a_key_read_with_an_unknown_family_can_be_written_back() {
+        let stored = serde_json::json!({
+            "key_hash": "x",
+            "allowed_endpoints": ["video_editing_v9", "chat_completions"],
+        });
+        let key: ApiKey = serde_json::from_value(stored).unwrap();
+        let view = serde_json::to_value(PublicApiKey::from(key)).unwrap();
+        assert_eq!(
+            view["allowed_endpoints"],
+            serde_json::json!(["chat_completions"])
+        );
+        let written_back = serde_json::json!({
+            "key_hash": "x",
+            "allowed_endpoints": view["allowed_endpoints"],
+        });
+        aisix_core::models::schema::validate_apikey(&written_back).unwrap();
+    }
 }

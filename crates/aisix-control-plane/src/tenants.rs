@@ -1,6 +1,7 @@
 //! Tenants: the platform's customers, as operators manage them.
 //!
-//! The gateways see a tenant as a team, `teams/<tenant id>`, named after it.
+//! The gateways see a tenant as a team, `teams/<tenant id>`, named after it,
+//! once it is approved: a pending tenant gives them nothing (see `steps`).
 //! A tenant reaches the global model catalog only through its grants
 //! (`allowed_model_ids`). Its default protection (`limits`) is projected,
 //! while it is active, as one conditional rate-limit policy over the team,
@@ -37,7 +38,6 @@ use crate::db::{Db, DbError};
 use crate::error::{ApiError, BootError, Detail};
 use crate::gateways::stale_window_secs;
 use crate::http::ApiJson;
-use crate::keys;
 use crate::resources::api::if_match;
 use crate::resources::store::{self, ResourceRow};
 use crate::resources::write::{
@@ -47,6 +47,7 @@ use crate::resources::Kind;
 use crate::rollout::{self, Fleet, ResourceRollout, RolloutInput};
 use crate::settings::{self, EnvSettings, TenantDefaults, BOOT_LOCK_KEY};
 use crate::AppState;
+use crate::{keys, members};
 
 /// The platform's own tenant, which operator keys belong to.
 pub const INTERNAL_TENANT_NAME: &str = "平台内部";
@@ -406,6 +407,8 @@ pub async fn create(
 enum Step {
     /// The tenant's `teams` document.
     Team(Value),
+    /// The `users` document of every live member that has none live.
+    Users,
     /// The limits policy, written (or revived) with this document.
     Policy(Value),
     /// The tenant's keys, re-projected from its row.
@@ -416,19 +419,26 @@ enum Step {
 
 /// The writes [`project`] makes for `tenant`, in the order it makes them.
 ///
+/// A pending tenant makes none: signup is anonymous, and a tenant nobody
+/// has approved must not grow what every gateway loads. It has no keys
+/// (an operator cannot mint one before the approval), and its members'
+/// `users` documents wait too, so the approval writes the team and every
+/// member's user ahead of everything that names them.
+///
 /// The projector writes kine in commit order and stops at the first write
 /// it cannot make, so a projection can stall between any two of these. The
 /// order is therefore chosen so that no stall leaves a key enabled and
 /// unlimited: the tenant's limit is in place before its keys are opened (an
 /// approval or a reactivation enables them), and is lifted only after they
-/// are closed (a suspension disables them). The team comes first, since the
-/// keys name it.
+/// are closed (a suspension disables them). The team and the users come
+/// first, since the keys name them.
 fn steps(tenant: &TenantRow) -> Vec<Step> {
-    let mut steps = vec![Step::Team(team_doc(&tenant.name))];
     let policy = match tenant.status {
+        TenantStatus::Pending => return Vec::new(),
         TenantStatus::Active => limits_policy_doc(tenant.id, &tenant.limits),
-        TenantStatus::Pending | TenantStatus::Suspended => None,
+        TenantStatus::Suspended => None,
     };
+    let mut steps = vec![Step::Team(team_doc(&tenant.name)), Step::Users];
     match policy {
         Some(doc) => steps.extend([Step::Policy(doc), Step::Keys]),
         None => steps.extend([Step::Keys, Step::RetirePolicy]),
@@ -437,16 +447,18 @@ fn steps(tenant: &TenantRow) -> Vec<Step> {
 }
 
 /// Writes the documents tenant `id` derives, as its row now stands, in the
-/// order [`steps`] gives: the team, its keys, and its limits policy, which
-/// is written while the tenant is active and limits it tenant-wide and
-/// deleted otherwise. A document already as it should be is not written
-/// again. The caller holds the tenant's lock.
+/// order [`steps`] gives: the team, its members' users, its keys, and its
+/// limits policy, which is written while the tenant is active and limits it
+/// tenant-wide and deleted otherwise; nothing while it is pending. A
+/// document already as it should be is not written again. The caller holds
+/// the tenant's lock.
 pub async fn project(conn: &mut PgConnection, ctx: &WriteCtx, id: Uuid) -> Result<(), ApiError> {
     let tenant = lock(&mut *conn, id).await?;
     let owner = owner(id);
     for step in steps(&tenant) {
         match step {
             Step::Team(doc) => put(&mut *conn, ctx, Kind::Teams, id, &doc, &owner).await?,
+            Step::Users => members::put_missing_users(&mut *conn, ctx, id).await?,
             Step::Policy(doc) => {
                 let policy_id = match tenant.limits_policy_id {
                     Some(policy_id) => policy_id,
@@ -1572,6 +1584,10 @@ mod tests {
         let active = steps(&tenant(TenantStatus::Active, limited.clone()));
         assert!(matches!(active[0], Step::Team(_)), "{active:?}");
         assert!(
+            at(&active, |s| *s == Step::Users) < at(&active, |s| *s == Step::Keys),
+            "{active:?}"
+        );
+        assert!(
             at(&active, |s| matches!(s, Step::Policy(_))) < at(&active, |s| *s == Step::Keys),
             "{active:?}"
         );
@@ -1579,11 +1595,14 @@ mod tests {
 
         for t in [
             tenant(TenantStatus::Suspended, limited.clone()),
-            tenant(TenantStatus::Pending, limited),
             tenant(TenantStatus::Active, TenantLimits::default()),
         ] {
             let closing = steps(&t);
             assert!(matches!(closing[0], Step::Team(_)), "{closing:?}");
+            assert!(
+                at(&closing, |s| *s == Step::Users) < at(&closing, |s| *s == Step::Keys),
+                "{closing:?}"
+            );
             assert!(
                 at(&closing, |s| *s == Step::Keys) < at(&closing, |s| *s == Step::RetirePolicy),
                 "{closing:?}"
@@ -1592,6 +1611,20 @@ mod tests {
                 !closing.iter().any(|s| matches!(s, Step::Policy(_))),
                 "{closing:?}"
             );
+        }
+    }
+
+    /// A tenant waiting for approval gives the gateways nothing: signup is
+    /// anonymous, and what it creates must not grow what every gateway
+    /// loads.
+    #[test]
+    fn a_pending_tenant_writes_nothing() {
+        let limited = TenantLimits {
+            rpm: Some(60),
+            ..TenantLimits::default()
+        };
+        for limits in [limited, TenantLimits::default()] {
+            assert_eq!(steps(&tenant(TenantStatus::Pending, limits)), []);
         }
     }
 }

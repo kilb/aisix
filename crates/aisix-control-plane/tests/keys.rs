@@ -35,7 +35,10 @@ async fn request(
         .build()
         .expect("an HTTP client");
     let method = reqwest::Method::from_bytes(method.as_bytes()).expect("an HTTP method");
-    let mut request = client.request(method, cp.url(path));
+    // Labelled JSON with or without a body, as the Dashboard sends it.
+    let mut request = client
+        .request(method, cp.url(path))
+        .header(reqwest::header::CONTENT_TYPE, "application/json");
     if let Some(cookie) = cookie {
         request = request.header(reqwest::header::COOKIE, cookie);
     }
@@ -1059,17 +1062,25 @@ async fn a_tenants_limit_is_written_before_its_keys_open_and_retired_after_they_
         assert!(revived.seq < key.seq, "key {k} opened before the policy");
     }
 
-    // A pending tenant's keys, which an operator minted, open only after the
-    // approval writes the policy.
+    // A pending tenant has no keys: it gives the gateways nothing until it is
+    // approved, so an operator cannot mint one before then. Once approved,
+    // its keys open behind the policy.
     let pending = cp.seed_tenant(TenantStatus::Pending).await;
     let r = admin_mint(&cp, &admin, pending, json!({"label": "early-7c1"})).await;
-    assert_eq!(r.status, 201, "{r:?}");
-    let early = text(&r.body, "/key/id");
-    assert_eq!(key_doc(&cp, &early).await["disabled"], true);
+    assert_eq!(r.status, 409, "{r:?}");
+    assert_eq!(r.body["code"], "tenant_state", "{r:?}");
+    let keys: i64 = sqlx::query_scalar("SELECT count(*) FROM tenant_keys WHERE tenant_id = $1")
+        .bind(pending)
+        .fetch_one(cp.db().pool())
+        .await
+        .expect("count keys");
+    assert_eq!(keys, 0);
     let r = act(&cp, &admin, pending, "approve").await;
     assert_eq!(r.status, 200, "{r:?}");
+    let r = admin_mint(&cp, &admin, pending, json!({"label": "later-7c1"})).await;
+    assert_eq!(r.status, 201, "{r:?}");
     let policy = stored(&cp, "rate_limit_policies", &policy_id(&cp, pending).await).await;
-    let key = stored(&cp, "api_keys", &early).await;
+    let key = stored(&cp, "api_keys", &text(&r.body, "/key/id")).await;
     assert_eq!(key.doc["disabled"], false);
     assert!(policy.seq < key.seq, "the key opened before the policy");
 }

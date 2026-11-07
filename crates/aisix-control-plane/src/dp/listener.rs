@@ -8,7 +8,7 @@
 //! An h2 connection can be ended by what it serves ([`ConnClose`]): the
 //! etcd front closes the connection of a credential it refuses, as the
 //! REST surface answers it `Connection: close`. A closing h2 connection
-//! sends GOAWAY, and is dropped after [`DRAIN_DEADLINE`] if its streams
+//! sends GOAWAY, and is dropped after its drain deadline if its streams
 //! have not finished by then, since a watch never finishes on its own.
 //!
 //! The server certificate is minted at boot for `CP_DP_HOSTS`, the names
@@ -22,8 +22,20 @@
 //!   each for at most [`HANDSHAKE_TIMEOUT`]; a slot frees as soon as its
 //!   handshake ends, whichever way;
 //! - at most [`MAX_CONNECTIONS`] connections in all, handshakes included,
-//!   since a revoked certificate still completes its handshake and is then
-//!   refused per request.
+//!   since a revoked certificate still completes its handshake.
+//!
+//! A credential that is revoked, expired, unlisted or of another
+//! environment is found right after its handshake, by the rule every
+//! request is checked by again ([`super::admitted`]). Its connection is
+//! then given one answer, so the gateway learns it is refused (`403` on
+//! HTTP/1.1, `PermissionDenied` and GOAWAY on h2), and closed, within
+//! [`HANDSHAKE_TIMEOUT`]: it holds a slot no longer than a peer in its
+//! handshake does.
+//!
+//! Accepted sockets have TCP keepalive, so a peer that vanished without
+//! closing is noticed even while nothing is being sent. On shutdown each
+//! connection finishes what is in flight, and is dropped after its drain
+//! deadline ([`DRAIN_DEADLINE`] by default) if it has not by then.
 //!
 //! A connection over either cap is closed at once, unread. The process needs
 //! a file descriptor limit above `MAX_CONNECTIONS`, plus the etcd front's
@@ -56,9 +68,10 @@ use tokio_rustls::TlsAcceptor;
 use tower::util::Oneshot;
 use tower::ServiceExt;
 
-use super::{closing, ConnClose, ConnIdentity};
+use super::{admitted, closing, ConnClose, ConnIdentity, CredentialCache};
 use crate::etcd_front::service::MAX_WATCHES;
 use crate::pki::{self, Pki, PkiError};
+use crate::settings::EnvSettings;
 use crate::stopped;
 
 /// What `h2` connections are served by: the etcd front's gRPC services.
@@ -76,9 +89,17 @@ pub const MAX_CONNECTIONS: usize = 4096;
 /// A peer that has not finished its TLS handshake by then is dropped.
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// How long a closing h2 connection may take to finish its streams before
-/// it is dropped.
+/// How long a closing connection may take to finish what it has in flight
+/// before it is dropped: an h2 connection its streams, which a watch never
+/// does on its own; an HTTP/1.1 one its request, whose body may have
+/// stopped arriving. Both REST endpoints are safe to send again, so a
+/// request cut off by a shutdown is re-sent by the gateway.
 pub const DRAIN_DEADLINE: Duration = Duration::from_secs(5);
+
+/// How long an accepted socket may stay idle before TCP keepalive probes
+/// it, and how often it probes then.
+const TCP_KEEPALIVE_IDLE: Duration = Duration::from_secs(30);
+const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Streams one h2 connection may hold at once. A gateway's connection
 /// carries a read and a watch; each watch holds a connection to kine of its
@@ -110,6 +131,8 @@ pub struct ConnLimits {
     pub pending_handshakes: usize,
     pub connections: usize,
     pub handshake_timeout: Duration,
+    /// How long a connection may take to close once shutting down.
+    pub drain_deadline: Duration,
 }
 
 impl ConnLimits {
@@ -163,6 +186,7 @@ impl Default for ConnLimits {
             pending_handshakes: MAX_PENDING_HANDSHAKES,
             connections: MAX_CONNECTIONS,
             handshake_timeout: HANDSHAKE_TIMEOUT,
+            drain_deadline: DRAIN_DEADLINE,
         }
     }
 }
@@ -221,17 +245,28 @@ pub fn server_tls(
     Ok(config.into())
 }
 
+/// Who may hold a connection past its handshake: a certificate of a
+/// credential of `env` that `creds` admits ([`super::admitted`]).
+#[derive(Clone)]
+pub struct Admission {
+    pub env: EnvSettings,
+    pub creds: CredentialCache,
+}
+
 /// Serves `listener` until `shutdown` turns true (or its sender is gone):
 /// then it stops accepting, lets each connection finish the requests it has
-/// in flight, and returns once all have closed. Every request carries its
-/// connection's [`ConnIdentity`] as an extension. A connection over
-/// `limits` is closed as soon as it is accepted. Aborting the task drops
-/// every connection at once.
+/// in flight for up to `limits.drain_deadline`, and returns once all have
+/// closed. Every request carries its connection's [`ConnIdentity`] as an
+/// extension. A connection over `limits` is closed as soon as it is
+/// accepted, and one whose credential `admission` refuses after its first
+/// answer, or the handshake timeout, whichever comes first. Aborting the
+/// task drops every connection at once.
 pub async fn serve_dp(
     listener: TcpListener,
     tls: Arc<ServerConfig>,
     rest: Router,
     grpc: Option<GrpcRoutes>,
+    admission: Admission,
     limits: ConnLimits,
     shutdown: watch::Receiver<bool>,
 ) {
@@ -239,7 +274,9 @@ pub async fn serve_dp(
         acceptor: TlsAcceptor::from(tls),
         rest,
         grpc,
+        admission,
         handshake_timeout: limits.handshake_timeout,
+        drain_deadline: limits.drain_deadline,
     };
     let handshake_slots = Arc::new(Semaphore::new(limits.pending_handshakes));
     let connection_slots = Arc::new(Semaphore::new(limits.connections));
@@ -271,6 +308,9 @@ pub async fn serve_dp(
                         }
                         continue;
                     };
+                    if let Err(e) = keep_alive(&tcp) {
+                        tracing::debug!(error = %e, "cannot set TCP keepalive on a gateway connection");
+                    }
                     connections.spawn(serve_connection(
                         tcp,
                         handshake,
@@ -290,13 +330,24 @@ pub async fn serve_dp(
     while connections.join_next().await.is_some() {}
 }
 
+/// Turns on TCP keepalive for an accepted socket: without it a peer that
+/// vanished mid-request, with nothing left to send to it, is never noticed.
+pub fn keep_alive(tcp: &TcpStream) -> std::io::Result<()> {
+    let keepalive = socket2::TcpKeepalive::new()
+        .with_time(TCP_KEEPALIVE_IDLE)
+        .with_interval(TCP_KEEPALIVE_INTERVAL);
+    socket2::SockRef::from(tcp).set_tcp_keepalive(&keepalive)
+}
+
 /// What every connection of one listener is served with.
 #[derive(Clone)]
 struct Serving {
     acceptor: TlsAcceptor,
     rest: Router,
     grpc: Option<GrpcRoutes>,
+    admission: Admission,
     handshake_timeout: Duration,
+    drain_deadline: Duration,
 }
 
 /// `handshake` is held for the handshake only; `_connection` for the
@@ -312,7 +363,9 @@ async fn serve_connection(
         acceptor,
         rest,
         grpc,
+        admission,
         handshake_timeout,
+        drain_deadline,
     } = serving;
     let handshook = tokio::time::timeout(handshake_timeout, acceptor.accept(tcp)).await;
     drop(handshake);
@@ -345,22 +398,67 @@ async fn serve_connection(
             return;
         }
     };
+    // Before anything is served. A refused credential (revoked, expired,
+    // unlisted, of another environment) is still told why, by the answer
+    // its first request gets from the endpoints' own check: `403` with
+    // `Connection: close` on HTTP/1.1, `PermissionDenied` and then GOAWAY
+    // on h2. Without it a refused gateway could not tell a refusal from an
+    // outage. Its connection is served for at most one request, and for no
+    // longer than a handshake may take, so by sending nothing it holds its
+    // slot no longer than a peer in its handshake does. Each request of an
+    // admitted connection is checked again, which catches a revocation
+    // while the connection is open. A credential that cannot be checked
+    // now (the database is out) is served: each request answers the outage.
+    let refused = match admitted(&identity, &admission.env, &admission.creds).await {
+        Ok(found) => found.is_none(),
+        Err(e) => {
+            tracing::warn!(error = %e, "cannot check a gateway credential at connect");
+            false
+        }
+    };
     let negotiated_h2 = session.alpn_protocol() == Some(H2);
     let io = TokioIo::new(tls);
-    if !negotiated_h2 {
-        let conn = http1::Builder::new()
-            .timer(TokioTimer::new())
-            .serve_connection(io, WithIdentity::new(rest, identity, None));
-        drive(conn, |conn| conn.graceful_shutdown(), shutdown, None).await;
-    } else if let Some(grpc) = grpc {
-        let close = ConnClose::new();
-        let conn = http2::Builder::new(TokioExecutor::new())
-            .timer(TokioTimer::new())
-            .max_concurrent_streams(MAX_STREAMS_PER_CONNECTION)
-            .keep_alive_interval(H2_KEEPALIVE_INTERVAL)
-            .keep_alive_timeout(H2_KEEPALIVE_TIMEOUT)
-            .serve_connection(io, WithIdentity::new(grpc, identity, Some(close.clone())));
-        drive(conn, |conn| conn.graceful_shutdown(), shutdown, Some(close)).await;
+    let served = async {
+        if !negotiated_h2 {
+            let conn = http1::Builder::new()
+                .timer(TokioTimer::new())
+                .keep_alive(!refused)
+                .serve_connection(io, WithIdentity::new(rest, identity, None));
+            drive(
+                conn,
+                |conn| conn.graceful_shutdown(),
+                shutdown,
+                None,
+                drain_deadline,
+            )
+            .await;
+        } else if let Some(grpc) = grpc {
+            let close = ConnClose::new();
+            let conn = http2::Builder::new(TokioExecutor::new())
+                .timer(TokioTimer::new())
+                .max_concurrent_streams(MAX_STREAMS_PER_CONNECTION)
+                .keep_alive_interval(H2_KEEPALIVE_INTERVAL)
+                .keep_alive_timeout(H2_KEEPALIVE_TIMEOUT)
+                .serve_connection(io, WithIdentity::new(grpc, identity, Some(close.clone())));
+            drive(
+                conn,
+                |conn| conn.graceful_shutdown(),
+                shutdown,
+                Some(close),
+                drain_deadline,
+            )
+            .await;
+        }
+    };
+    if refused {
+        if tokio::time::timeout(handshake_timeout, served)
+            .await
+            .is_err()
+        {
+            tracing::debug!("dropped a refused gateway connection that sent no request in time");
+        }
+    } else {
+        served.await;
     }
     // Otherwise h2 was negotiated though not offered: nothing serves it.
 }
@@ -368,13 +466,14 @@ async fn serve_connection(
 /// Runs `conn` to its end, calling `graceful` on it once `shutdown` turns
 /// true (or its sender is gone), so it finishes what is in flight and then
 /// closes. With `close`, also once `close` is closed; shutting down closes
-/// it, which ends the watches it serves; and a connection still open
-/// [`DRAIN_DEADLINE`] after `graceful` is dropped.
+/// it, which ends the watches it serves. A connection still open
+/// `drain_deadline` after `graceful` is dropped, so a shutdown ends.
 async fn drive<C>(
     conn: C,
     graceful: impl FnOnce(Pin<&mut C>),
     mut shutdown: watch::Receiver<bool>,
     close: Option<ConnClose>,
+    drain_deadline: Duration,
 ) where
     C: Future<Output = hyper::Result<()>>,
 {
@@ -402,9 +501,7 @@ async fn drive<C>(
         }
         if let Some(graceful) = graceful.take() {
             graceful(conn.as_mut());
-            if close.is_some() {
-                deadline = Some(Box::pin(tokio::time::sleep(DRAIN_DEADLINE)));
-            }
+            deadline = Some(Box::pin(tokio::time::sleep(drain_deadline)));
         }
     }
 }

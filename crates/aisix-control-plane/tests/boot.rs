@@ -717,3 +717,140 @@ fn the_crate_has_no_uncast_sum() {
     }
     assert!(found.is_empty(), "cast every SUM to ::bigint: {found:#?}");
 }
+
+/// Every statement in `text` that inserts into, updates or deletes from
+/// `gw_resources`, lowercased, with Rust string continuations joined and
+/// whitespace collapsed, each up to the end of its string literal.
+fn gw_resources_writes(text: &str) -> Vec<String> {
+    let mut joined = String::new();
+    let mut lines = text.lines().peekable();
+    while let Some(line) = lines.next() {
+        // A `\` at the end of a line continues the string on the next one,
+        // whose leading whitespace is not part of it.
+        match line.strip_suffix('\\') {
+            Some(head) => {
+                joined.push_str(head);
+                if let Some(next) = lines.peek_mut() {
+                    *next = next.trim_start();
+                }
+            }
+            None => {
+                joined.push_str(line);
+                joined.push('\n');
+            }
+        }
+    }
+    let flat = joined
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase();
+    let mut found = Vec::new();
+    for verb in [
+        "insert into gw_resources",
+        "update gw_resources",
+        "delete from gw_resources",
+    ] {
+        for (at, _) in flat.match_indices(verb) {
+            let rest = &flat[at + verb.len()..];
+            if rest.starts_with(|c: char| c.is_alphanumeric() || c == '_') {
+                continue; // a longer name, such as `gw_resources_seq`
+            }
+            let end = rest.find('"').unwrap_or(rest.len());
+            found.push(format!("{verb}{}", &rest[..end]));
+        }
+    }
+    found
+}
+
+#[test]
+fn a_gw_resources_write_is_found_however_it_is_spelled() {
+    let src = "q(\"UPDATE gw_resources SET doc = $1 \\\n   WHERE id = $2\"); \
+               q(\"delete\n  from   gw_resources\"); q(\"SELECT nextval('gw_resources_seq')\"); \
+               q(\"UPDATE gw_resources_dirty SET x = 1\")";
+    assert_eq!(
+        gw_resources_writes(src),
+        [
+            "update gw_resources set doc = $1 where id = $2",
+            "delete from gw_resources",
+        ]
+    );
+}
+
+/// The crate's first rule: a gateway document is written only through
+/// `resources::write::write_resource`, the one place that normalises,
+/// validates, checks references, runs the version gate and seals. So no
+/// production source outside `src/resources/` inserts into, updates or
+/// deletes from `gw_resources`, and only `write_resource` calls the store's
+/// writers. Two statements outside it touch no document and are named
+/// here: the projector records what it projected (its projection columns
+/// only), and housekeeping prunes tombstones kine already has.
+#[test]
+fn only_the_resources_module_writes_gw_resources() {
+    const PROJECTION_COLUMNS: [&str; 3] =
+        ["projected_version", "kine_mod_revision", "kine_revision"];
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut pending = vec![src.clone()];
+    let mut scanned = Vec::new();
+    let mut found = Vec::new();
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(&dir).expect("read a directory") {
+            let path = entry.expect("a directory entry").path();
+            if path.is_dir() {
+                pending.push(path);
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("read a source file");
+            let production = text
+                .split_once("\n#[cfg(test)]")
+                .map_or(text.as_str(), |(before, _)| before);
+            let relative = path.strip_prefix(&src).expect("under src").to_path_buf();
+            let file = relative.to_string_lossy().replace('\\', "/");
+            scanned.push(file.clone());
+            if !file.starts_with("resources/") {
+                for statement in gw_resources_writes(production) {
+                    let allowed = match file.as_str() {
+                        "projector.rs" => statement
+                            .strip_prefix("update gw_resources set ")
+                            .and_then(|rest| rest.split(" where ").next())
+                            .is_some_and(|set| {
+                                set.split(',').all(|assignment| {
+                                    let column = assignment.split('=').next().unwrap_or("").trim();
+                                    PROJECTION_COLUMNS.contains(&column)
+                                })
+                            }),
+                        "housekeeping.rs" => statement.starts_with(
+                            "delete from gw_resources where deleted and projected_version = version",
+                        ),
+                        _ => false,
+                    };
+                    if !allowed {
+                        found.push(format!("src/{file}: {statement}"));
+                    }
+                }
+            }
+            if file != "resources/write.rs" {
+                for writer in ["store::insert(", "store::update(", "store::mark_deleted("] {
+                    if production.contains(writer) {
+                        found.push(format!("src/{file}: calls {writer}"));
+                    }
+                }
+            }
+        }
+    }
+    for expected in [
+        "projector.rs",
+        "housekeeping.rs",
+        "tenants.rs",
+        "resources/write.rs",
+    ] {
+        assert!(
+            scanned.iter().any(|f| f == expected),
+            "{expected} not among {scanned:?}"
+        );
+    }
+    assert!(
+        found.is_empty(),
+        "write gateway documents through resources::write::write_resource: {found:#?}"
+    );
+}

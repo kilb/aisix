@@ -904,8 +904,8 @@ async fn a_body_the_api_cannot_read_answers_in_the_error_envelope() {
             "no content type",
             None,
             b"{}".to_vec(),
-            422,
-            "validation_failed",
+            415,
+            "unsupported_media_type",
         ),
         (
             "a missing field",
@@ -946,15 +946,119 @@ async fn a_body_the_api_cannot_read_answers_in_the_error_envelope() {
     }
 
     // A login body that cannot be read is a failed login like any other.
-    for (content_type, body) in [
-        (json_type, b"{\"email\":".to_vec()),
-        (None, br#"{"email":"a@b.io","password":"x"}"#.to_vec()),
-        (json_type, br#"{"email":"a@b.io"}"#.to_vec()),
-    ] {
+    for body in [b"{\"email\":".to_vec(), br#"{"email":"a@b.io"}"#.to_vec()] {
         let r = cp
-            .send_raw("POST", "/admin/login", None, content_type, Some(body))
+            .send_raw("POST", "/admin/login", None, json_type, Some(body))
             .await;
         assert_eq!(r.status, 401, "{r:?}");
         assert_eq!(r.body["code"], "invalid_credentials", "{r:?}");
     }
+    // One that is not JSON at all is refused before the login is tried, as
+    // on every mutating route.
+    let r = cp
+        .send_raw(
+            "POST",
+            "/admin/login",
+            None,
+            None,
+            Some(br#"{"email":"a@b.io","password":"x"}"#.to_vec()),
+        )
+        .await;
+    assert_eq!(r.status, 415, "{r:?}");
+    assert_eq!(r.body["code"], "unsupported_media_type", "{r:?}");
+}
+
+/// Every mutating request on the browser listener must say it is JSON,
+/// bodyless ones included, or it is `415 unsupported_media_type` and
+/// changes nothing. With `SameSite=Strict` only a same-site page can still
+/// make a browser send a session cookie, and it cannot send this content
+/// type without a CORS preflight it does not pass: a form posts another
+/// type, and a `no-cors` fetch with no body sends none.
+#[tokio::test]
+async fn a_mutating_request_that_is_not_json_is_415_and_changes_nothing() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let op = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let tenant = cp
+        .seed_tenant(aisix_control_plane::tenants::TenantStatus::Pending)
+        .await;
+    let approve = format!("/admin/tenants/{tenant}/approve");
+    let status = || async {
+        sqlx::query_scalar::<_, String>("SELECT status FROM tenants WHERE id = $1")
+            .bind(tenant)
+            .fetch_one(cp.db().pool())
+            .await
+            .expect("read the tenant")
+    };
+    for content_type in [
+        None,
+        Some("text/plain"),
+        Some("application/x-www-form-urlencoded"),
+        Some("multipart/form-data; boundary=x"),
+        Some("application/jsonx"),
+    ] {
+        let r = cp
+            .send_raw("POST", &approve, Some(op.cookie()), content_type, None)
+            .await;
+        assert_eq!(r.status, 415, "{content_type:?}: {r:?}");
+        assert_eq!(r.body["code"], "unsupported_media_type", "{r:?}");
+        assert_eq!(status().await, "pending", "{content_type:?} approved it");
+    }
+    // A body does not help without the type.
+    let r = cp
+        .send_raw(
+            "POST",
+            &approve,
+            Some(op.cookie()),
+            Some("text/plain"),
+            Some(b"{}".to_vec()),
+        )
+        .await;
+    assert_eq!(r.status, 415, "{r:?}");
+    assert_eq!(status().await, "pending");
+
+    // Logout, on both APIs, is held to it too: the session survives.
+    for path in ["/admin/logout", "/api/logout"] {
+        let r = cp
+            .send_raw("POST", path, Some(op.cookie()), None, None)
+            .await;
+        assert_eq!(r.status, 415, "{path}: {r:?}");
+    }
+    let session = cp.get_with_cookie("/admin/session", op.cookie()).await;
+    assert_eq!(session.body["authed"], true, "{session:?}");
+    // So is a DELETE.
+    let r = cp
+        .send_raw(
+            "DELETE",
+            &format!("/admin/resources/models/{}", Uuid::new_v4()),
+            Some(op.cookie()),
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(r.status, 415, "{r:?}");
+
+    // Reads need no type, and a route nobody serves is still not found.
+    let r = cp
+        .send_raw("GET", "/admin/session", Some(op.cookie()), None, None)
+        .await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let r = cp
+        .send_raw("POST", "/admin/nothing-7c1", Some(op.cookie()), None, None)
+        .await;
+    assert_eq!(r.status, 404, "{r:?}");
+
+    // JSON with a charset, and no body, is what the Dashboard sends.
+    let r = cp
+        .send_raw(
+            "POST",
+            &approve,
+            Some(op.cookie()),
+            Some("Application/JSON; charset=utf-8"),
+            None,
+        )
+        .await;
+    assert_eq!(r.status, 200, "{r:?}");
+    assert_eq!(status().await, "active");
 }

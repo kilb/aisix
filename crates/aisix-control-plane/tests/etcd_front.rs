@@ -912,6 +912,38 @@ async fn tls_connect(
         .expect("the mTLS handshake")
 }
 
+/// The `grpc-status` the first RPC over `tls` (an h2 connection) is
+/// answered with, and whether the connection then ends, without an error,
+/// within two seconds.
+async fn first_rpc_status(
+    tls: tokio_rustls::client::TlsStream<tokio::net::TcpStream>,
+) -> (Option<Vec<u8>>, bool) {
+    let (client, connection) = h2::client::handshake(tls).await.expect("HTTP/2");
+    let connection = tokio::spawn(connection);
+    let mut client = client.ready().await.expect("ready");
+    let request = hyper::Request::builder()
+        .method("POST")
+        .uri("https://localhost/etcdserverpb.KV/Range")
+        .header("content-type", "application/grpc")
+        .header("te", "trailers")
+        .body(())
+        .expect("a request");
+    let (answer, mut body) = client.send_request(request, false).expect("send");
+    // An empty RangeRequest, framed: the credential is judged first.
+    body.send_data(vec![0u8; 5].into(), true)
+        .expect("the message");
+    let answer = answer.await.expect("an answer");
+    let status = answer
+        .headers()
+        .get("grpc-status")
+        .map(|v| v.as_bytes().to_vec());
+    let ended = matches!(
+        tokio::time::timeout(Duration::from_secs(2), connection).await,
+        Ok(Ok(Ok(())))
+    );
+    (status, ended)
+}
+
 /// A connection that says when it is gone: `gone` fires when the client
 /// drops it, which it does once the server has closed it.
 struct Tracked {
@@ -1230,6 +1262,10 @@ async fn a_certificate_for_another_environment_is_refused() {
     };
     t.put(&format!("{}models/m", other.env_prefix()), "its-own-7c1")
         .await;
+    // The handshake completes, and the first RPC is told why before the
+    // connection goes away.
+    let tls = tls_connect(t.cp.dp_addr(), &foreign, &[b"h2"]).await;
+    assert_eq!(first_rpc_status(tls).await, (Some(b"7".to_vec()), true));
     for prefix in [other.env_prefix(), t.env()] {
         let mut gw = gateway(&t.cp, &foreign).await;
         let status = status_of(
@@ -1389,6 +1425,7 @@ async fn shutting_down_ends_open_watches_unavailable_and_promptly() {
         tls,
         aisix_control_plane::http::dp_router(t.cp.state().clone()),
         Some(etcd_front::routes(front)),
+        t.cp.admission(),
         ConnLimits::default(),
         stopped,
     ));
@@ -2092,6 +2129,7 @@ async fn a_range_that_waits_too_long_for_a_place_is_resource_exhausted() {
         tls,
         aisix_control_plane::http::dp_router(t.cp.state().clone()),
         Some(etcd_front::routes(front)),
+        t.cp.admission(),
         ConnLimits::default(),
         stopped,
     ));

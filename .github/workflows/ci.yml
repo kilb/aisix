@@ -685,7 +685,20 @@ jobs:
         env:
           CP_E2E_PG_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres
           E2E_THREAD_PER_CORE: ${{ matrix.thread_per_core }}
+          # Each stack and gateway writes its output here as it stops, with
+          # URL passwords, caller keys, the operator's password and the
+          # bundle's values taken out (harness/control-plane.ts).
+          CP_E2E_LOG_DIR: ${{ runner.temp }}/cp-e2e-logs
         run: pnpm exec vitest run -c vitest.cp.config.ts
+      - uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          # Per leg: a failure mid-case otherwise leaves no control-plane,
+          # kine or gateway output behind.
+          name: e2e-cp-logs-${{ matrix.serving }}
+          path: ${{ runner.temp }}/cp-e2e-logs
+          if-no-files-found: ignore
+          retention-days: 7
 
   # `vitest` and `vite` transpile without typechecking, so a genuine type
   # error — a helper called with the wrong argument shape, a renamed field

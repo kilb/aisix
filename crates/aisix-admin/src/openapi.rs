@@ -1646,7 +1646,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
             "items": {
               "type": "string"
             },
-            "description": "Endpoint families this key may call, such as `chat_completions` or `models`; a request to a route outside them is refused with `403`. Omitted means the key may call every endpoint, and an empty list that it may call none. A family name this gateway version does not recognize reads back as `unknown` and grants nothing.",
+            "description": "Endpoint families this key may call, such as `chat_completions` or `models`; a request to a route outside them is refused with `403`. Omitted means the key may call every endpoint, and an empty list that it may call none. A family name this gateway version does not recognize grants nothing and is left out when the key is read, so a key read can be written back as it is.",
             "example": [
               "chat_completions",
               "models"

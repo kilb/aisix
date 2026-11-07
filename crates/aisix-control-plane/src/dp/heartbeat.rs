@@ -37,7 +37,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
-use axum::extract::State;
+use axum::extract::{FromRequest, Request, State};
 use axum::Json;
 use chrono::{DateTime, Utc};
 use futures::FutureExt;
@@ -46,12 +46,14 @@ use serde_json::{json, Value};
 use sqlx::PgConnection;
 use uuid::Uuid;
 
+use super::telemetry::BODY_READ_WAIT;
 use super::DpIdentity;
 use crate::compat::{self, FLEET_WINDOW};
 use crate::db::DbError;
 use crate::error::{ApiError, Detail};
 use crate::gateways::stale_window_secs;
 use crate::http::ApiJson;
+use crate::usage::{text_without_nul, without_nul};
 use crate::AppState;
 
 /// An `instance_id` is a UUID; this leaves room for any other id a gateway
@@ -127,6 +129,54 @@ pub struct HeartbeatBody {
     partially_compatible_resources: Vec<Value>,
 }
 
+impl HeartbeatBody {
+    /// The body with every NUL replaced by U+FFFD, as usage events are
+    /// stored: neither `text` nor `jsonb` can hold one, and an exporter's
+    /// `last_error` quotes whatever a remote answered. A beat that could
+    /// not be stored would drop its instance from the fleet view, and from
+    /// the gateway-version gate.
+    fn without_nul(self) -> HeartbeatBody {
+        let list = |values: Vec<Value>| values.into_iter().map(without_nul).collect();
+        HeartbeatBody {
+            dp_id: text_without_nul(self.dp_id),
+            instance_id: text_without_nul(self.instance_id),
+            hostname: text_without_nul(self.hostname),
+            version: text_without_nul(self.version),
+            uptime_seconds: self.uptime_seconds,
+            applied_revision: self.applied_revision,
+            config_hash: self.config_hash.map(text_without_nul),
+            supported_guardrail_kinds: list(self.supported_guardrail_kinds),
+            exporter_health: list(self.exporter_health),
+            rejected_resources: list(self.rejected_resources),
+            partially_compatible_resources: list(self.partially_compatible_resources),
+        }
+    }
+}
+
+/// A heartbeat's body, as [`ApiJson`] reads it, within [`BODY_READ_WAIT`]
+/// as a usage batch's: a gateway that vanished mid-body would otherwise
+/// hold its connection, and on shutdown the process, until TCP noticed.
+/// Past it the beat is `408`, and the gateway beats again at its next tick.
+pub struct Beat(HeartbeatBody);
+
+impl<S: Send + Sync> FromRequest<S> for Beat {
+    type Rejection = ApiError;
+
+    async fn from_request(request: Request, state: &S) -> Result<Beat, ApiError> {
+        let read = ApiJson::<HeartbeatBody>::from_request(request, state);
+        match tokio::time::timeout(BODY_READ_WAIT, read).await {
+            Ok(read) => read.map(|ApiJson(body)| Beat(body)),
+            Err(_) => {
+                tracing::warn!(
+                    wait_secs = BODY_READ_WAIT.as_secs(),
+                    "a heartbeat body did not finish arriving; answered 408"
+                );
+                Err(ApiError::request_timeout(BODY_READ_WAIT))
+            }
+        }
+    }
+}
+
 /// A `null` decodes as the type's default, as an absent field does.
 fn null_as_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
 where
@@ -144,8 +194,9 @@ where
 pub async fn heartbeat(
     dp: DpIdentity,
     State(state): State<AppState>,
-    ApiJson(body): ApiJson<HeartbeatBody>,
+    Beat(body): Beat,
 ) -> Result<Json<Value>, ApiError> {
+    let body = body.without_nul();
     // A credential speaks only for itself.
     if Uuid::parse_str(&body.dp_id).ok() != Some(dp.dp_id) {
         return Err(ApiError::forbidden());
@@ -313,7 +364,35 @@ async fn record(conn: &mut PgConnection, dp_id: Uuid, body: &HeartbeatBody) -> R
 mod tests {
     use std::time::Duration;
 
+    use axum::body::Body;
+    use axum::http::{header, StatusCode};
+    use bytes::Bytes;
+
     use super::*;
+
+    /// A beat whose body stops arriving is answered `408` once
+    /// [`BODY_READ_WAIT`] has passed, and not before. The clock is paused,
+    /// so the wait costs no real time.
+    #[tokio::test(start_paused = true)]
+    async fn a_heartbeat_body_that_stops_arriving_is_408_after_the_read_wait() {
+        let stalled = futures::stream::pending::<Result<Bytes, std::io::Error>>();
+        let request = Request::builder()
+            .method("POST")
+            .uri("/dp/heartbeat")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from_stream(stalled))
+            .expect("a request");
+        let started = tokio::time::Instant::now();
+        let read = tokio::time::timeout(BODY_READ_WAIT * 6, Beat::from_request(request, &()))
+            .await
+            .expect("the read gave up within its wait");
+        let Err(refused) = read else {
+            panic!("a body that never arrived was read");
+        };
+        assert_eq!(refused.status, StatusCode::REQUEST_TIMEOUT);
+        assert_eq!(refused.code, "request_timeout");
+        assert_eq!(started.elapsed(), BODY_READ_WAIT);
+    }
 
     #[test]
     fn a_bucket_allows_a_burst_then_its_rate() {
