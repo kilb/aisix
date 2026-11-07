@@ -65,9 +65,12 @@ pub(crate) fn resolve_model(
 /// ensemble has; every other kind passes, and its targets meet the group
 /// filter in `routing::resolve_attempt_models` or `semantic::select_eligible`.
 ///
-/// Called from `routing::resolve_attempt_models`, which `/v1/chat/completions`
-/// runs before it branches to the ensemble dispatch; the other endpoints
-/// cannot dispatch an ensemble and pass through it too.
+/// Called right after the model access check on `/v1/chat/completions`,
+/// `/v1/messages`, `/v1/messages/count_tokens`, `/v1/responses` and
+/// `/v1/embeddings`, ahead of the client-IP check, guardrails and the cache,
+/// so nothing those do can tell an ensemble from a name nothing serves; and
+/// from `routing::resolve_attempt_models`, which every other endpoint passes
+/// through before it dispatches.
 pub(crate) fn refuse_ensemble_to_grouped_key(
     requested: &str,
     model: &Model,
@@ -393,5 +396,104 @@ mod tests {
             Some("gpt-4o")
         );
         assert_eq!(wildcard_upstream_model(&row, "anthropic/claude"), None);
+    }
+}
+
+/// A grouped key that names an ensemble is answered as for a name nothing
+/// serves on every endpoint, ahead of everything that could tell the two
+/// apart: here, an input guardrail that would refuse the prompt.
+#[cfg(test)]
+mod grouped_ensemble_tests {
+    use std::sync::Arc;
+
+    use aisix_core::models::AisixSnapshot;
+    use aisix_core::resource::ResourceEntry;
+    use aisix_core::snapshot::SnapshotHandle;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt as _;
+
+    #[tokio::test]
+    async fn a_grouped_key_naming_an_ensemble_is_answered_as_for_an_unknown_name() {
+        let snap = AisixSnapshot::new();
+        let pk: aisix_core::ProviderKey = serde_json::from_value(serde_json::json!({
+            "display_name": "pk-g", "secret": "sk-up", "api_base": "http://127.0.0.1:9",
+            "provider": "openai", "adapter": "openai", "groups": ["g"]}))
+        .unwrap();
+        snap.provider_keys.insert(ResourceEntry::new("pk-1", pk, 1));
+        let member: aisix_core::Model = serde_json::from_value(serde_json::json!({
+            "display_name": "member", "provider": "openai", "model_name": "gpt-4o",
+            "provider_key_id": "pk-1"}))
+        .unwrap();
+        snap.models.insert(ResourceEntry::new("m-1", member, 1));
+        let ensemble: aisix_core::Model = serde_json::from_value(serde_json::json!({
+            "display_name": "council",
+            "ensemble": {"panel": [{"model": "member"}], "judge": {"model": "member"}}}))
+        .unwrap();
+        snap.models.insert(ResourceEntry::new("m-2", ensemble, 1));
+        let key: aisix_core::ApiKey = serde_json::from_value(serde_json::json!({
+            "key_hash": "8b6712790a2089c67aa97a2d80022df18cc65c7814350e33baebe79aab508891",
+            "allowed_models": ["*"], "allowed_provider_groups": ["g"]}))
+        .unwrap();
+        snap.apikeys.insert(ResourceEntry::new("k-1", key, 1));
+        let row: aisix_core::Guardrail = serde_json::from_value(serde_json::json!({
+            "name": "blocks-secret", "enabled": true, "hook_point": "input", "fail_open": false,
+            "kind": "keyword", "patterns": [{"kind": "literal", "value": "SECRET"}]}))
+        .unwrap();
+        crate::seed_env_scoped_guardrail(&snap, ResourceEntry::new("g-1", row, 1));
+        let config: aisix_core::ProxyConfig =
+            serde_json::from_value(serde_json::json!({"addr": "127.0.0.1:0"})).unwrap();
+        let app = crate::build_router(
+            crate::ProxyState::new(
+                SnapshotHandle::new(snap),
+                Arc::new(aisix_gateway::Hub::new()),
+                &config,
+            )
+            .without_cache(),
+        );
+
+        let answer = |uri: &'static str, model: &str| {
+            let text = "SECRET";
+            let body = match uri {
+                "/v1/chat/completions" => serde_json::json!({"model": model,
+                    "messages": [{"role": "user", "content": text}]}),
+                "/v1/messages" | "/v1/messages/count_tokens" => serde_json::json!({
+                    "model": model, "max_tokens": 8,
+                    "messages": [{"role": "user", "content": text}]}),
+                _ => serde_json::json!({"model": model, "input": text}),
+            };
+            let app = app.clone();
+            let model = model.to_string();
+            async move {
+                let resp = app
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri(uri)
+                            .header("authorization", "Bearer sk-caller")
+                            .header("content-type", "application/json")
+                            .body(axum::body::Body::from(body.to_string()))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let status = resp.status();
+                let bytes = axum::body::to_bytes(resp.into_body(), 65536).await.unwrap();
+                (
+                    status,
+                    String::from_utf8_lossy(&bytes).replace(&model, "<model>"),
+                )
+            }
+        };
+        for uri in [
+            "/v1/chat/completions",
+            "/v1/messages",
+            "/v1/messages/count_tokens",
+            "/v1/responses",
+            "/v1/embeddings",
+        ] {
+            let unknown = answer(uri, "nobody").await;
+            assert_eq!(unknown.0, StatusCode::NOT_FOUND, "{uri}: {unknown:?}");
+            assert_eq!(answer(uri, "council").await, unknown, "{uri}");
+        }
     }
 }

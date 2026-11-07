@@ -527,6 +527,14 @@ async fn dispatch(
     if !auth.key().can_access(snapshot, &body.model) {
         return Err(ProxyError::ModelForbidden(body.model.clone()));
     }
+    // A grouped key is answered as if no ensemble existed, ahead of
+    // everything that could tell the two apart (the IP check, the shape
+    // check, guardrails).
+    crate::model_resolve::refuse_ensemble_to_grouped_key(
+        &body.model,
+        &model_entry.value,
+        &auth.key().allowed_provider_groups,
+    )?;
 
     // Client-IP allowlist gate (#557): reject before guardrails / upstream.
     crate::dispatch::check_ip_access(&model_entry.value, &client_ctx.source_ip)?;
