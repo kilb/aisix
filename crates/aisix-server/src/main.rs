@@ -775,8 +775,9 @@ fn select_managed_boot_path(bundle_on_disk: bool, bundle_provided: bool) -> Mana
 /// it can never drop a bucket whose daily window is still open.
 const RATE_LIMIT_BUCKET_IDLE_TTL: Duration = Duration::from_secs(24 * 60 * 60 + 300);
 
-/// Run `job` every `period` until cancelled. Three callers: the metrics
-/// upkeep sweep, the rate-limit bucket reaper and the inert-guardrail sweep.
+/// Run `job` every `period` until cancelled. Four callers: the metrics
+/// upkeep sweep, the rate-limit bucket reaper, the inert-guardrail sweep and
+/// the billed-batch sweep.
 async fn run_periodic<F, Fut>(mut cancel: watch::Receiver<bool>, period: Duration, job: F)
 where
     F: Fn() -> Fut,
@@ -1628,6 +1629,21 @@ async fn run(mut cfg: Config, hangup: Option<HangupSignal>) -> anyhow::Result<()
                     &snap.guardrails,
                     &snap.guardrail_attachments,
                 );
+                std::future::ready(())
+            },
+        ));
+    }
+
+    // The billed-batch dedup map is reclaimed here rather than on the request
+    // path: a batch listing re-observes a whole page of batches, and each
+    // sighting touches only its own entry.
+    {
+        let sweep = proxy_state.billed_batch_sweep();
+        tokio::spawn(run_periodic(
+            cancel_rx.clone(),
+            Duration::from_secs(60),
+            move || {
+                sweep();
                 std::future::ready(())
             },
         ));
