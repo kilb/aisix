@@ -42,7 +42,8 @@ const CALLER_KEY_HASH = createHash("sha256").update(CALLER_PLAINTEXT).digest("he
 
 /** The variable holding the platform secret — handed to the gateway process only. */
 const PLATFORM_SECRET_ENV = "P0_E2E_PLATFORM_SECRET";
-const PLATFORM_SECRET = "platform-identity-e2e-secret-0123456789abcdef";
+// 32 random bytes as hex digits, the form the gateway requires.
+const PLATFORM_SECRET = "f2dd7bd5123e88b82182ebd1a00b3f8c9a107d729fcc7db3afaf96e6cb10d1a8";
 
 const UPSTREAM_MESSAGE_ID = "msg_bdrk_01X";
 const UPSTREAM_TOOL_USE_ID = "toolu_bdrk_01Y";

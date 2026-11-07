@@ -2049,8 +2049,14 @@ fn register_memory_probes(metrics: &aisix_obs::Metrics, state: &ProxyState) {
     });
 }
 
-/// 平台模式关闭时返回 `None`；开启时读取 `id_key_env` 指向的变量，
-/// 缺失或短于 32 字节都拒绝启动。错误信息只含变量名，不含变量值。
+/// `None` with platform mode off. With it on, the secret is read from the
+/// variable `id_key_env` names, and startup is refused when it is missing or
+/// does not decode, as hex or base64, to at least 32 bytes: any sealed id a
+/// tenant holds lets it test guesses of the secret offline, so the secret
+/// must be a random value, the form the control plane generates (64 hex
+/// digits). The id key is derived from the value as given, so a secret that
+/// passes keeps every id sealed under it. Errors name the variable, never
+/// its value.
 fn platform_settings(
     cfg: &aisix_core::config::PlatformConfig,
     lookup: impl Fn(&str) -> Option<String>,
@@ -2066,15 +2072,31 @@ fn platform_settings(
     let secret = lookup(name).ok_or_else(|| {
         anyhow::anyhow!("proxy.platform.id_key_env = {name:?} is set but the env var is missing")
     })?;
-    if secret.len() < MIN_SECRET_BYTES {
+    if decoded_secret_len(secret.trim()) < MIN_SECRET_BYTES {
         anyhow::bail!(
             "proxy.platform.id_key_env = {name:?}: the env var must hold at least \
-             {MIN_SECRET_BYTES} bytes"
+             {MIN_SECRET_BYTES} random bytes written as hex or base64, such as the output \
+             of `openssl rand -base64 48`"
         );
     }
     Ok(Some(aisix_proxy::platform::PlatformSettings::from_secret(
         &secret,
     )))
+}
+
+/// How many bytes `value` decodes to as hex (when it is written in hex
+/// digits) or else as base64, standard or URL-safe, padded or not; `0` when
+/// it is neither.
+fn decoded_secret_len(value: &str) -> usize {
+    use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
+    use base64::Engine as _;
+    if value.len().is_multiple_of(2) && value.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return value.len() / 2;
+    }
+    [STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD]
+        .iter()
+        .find_map(|engine| engine.decode(value).ok())
+        .map_or(0, |bytes| bytes.len())
 }
 
 /// Build the etcd-client `ConnectOptions` from `cfg.etcd`, wiring in
@@ -4691,6 +4713,59 @@ mcp_servers:
         );
     }
 
+    /// The platform secret must be at least 32 random bytes written as hex or
+    /// base64. Any sealed id a tenant holds lets it test guesses of the
+    /// secret offline, so a passphrase a person chose, however long, is
+    /// refused; the control plane's generated value (64 hex digits) and
+    /// `openssl rand -base64` output are taken. Neither error prints the
+    /// value.
+    #[test]
+    fn platform_refuses_to_boot_without_32_random_bytes_of_secret() {
+        let cfg = aisix_core::config::PlatformConfig {
+            enabled: true,
+            id_key_env: Some("P0_TEST_PLATFORM_KEY".into()),
+        };
+        for weak in [
+            "short-secret-value-do-not-print".to_string(),
+            "k".repeat(32),
+            "correct horse battery staple, correct horse battery staple".to_string(),
+            "ab".repeat(31),
+        ] {
+            let err = platform_settings(&cfg, |_| Some(weak.clone()))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("P0_TEST_PLATFORM_KEY"), "{err}");
+            assert!(!err.contains(&weak), "{err}");
+        }
+
+        let missing = platform_settings(&cfg, |_| None).unwrap_err().to_string();
+        assert!(missing.contains("P0_TEST_PLATFORM_KEY"), "{missing}");
+
+        for strong in [
+            // What the control plane generates: 32 bytes as 64 hex digits.
+            "42".repeat(32),
+            // `openssl rand -base64 48`, and 32 bytes padded.
+            "A".repeat(64),
+            format!("{}A=", "q".repeat(42)),
+            // URL-safe base64, as some generators write it, and a trailing
+            // newline from a file the variable was filled from.
+            format!("{}\n", "-_".repeat(22)),
+        ] {
+            let settings = platform_settings(&cfg, |_| Some(strong.clone()))
+                .unwrap()
+                .expect("enabled platform yields settings");
+            assert_eq!(
+                settings.id_key,
+                aisix_proxy::platform::PlatformSettings::from_secret(&strong).id_key,
+                "the id key is derived from the value as it was given"
+            );
+        }
+        let off = aisix_core::config::PlatformConfig::default();
+        assert!(platform_settings(&off, |_| Some("k".to_string()))
+            .unwrap()
+            .is_none());
+    }
+
     /// Retired assertion: this used to require `None` for the plain-HTTP
     /// case, on the grounds that no auth and no TLS means nothing to
     /// configure. That was true of the AUTH/TLS extras and false of the
@@ -4700,36 +4775,6 @@ mcp_servers:
     /// hanging with nothing to end it. The old assertion pinned an
     /// implementation detail with no user-visible behaviour behind it; this
     /// one pins the behaviour that replaced it.
-    #[test]
-    fn platform_refuses_to_boot_when_its_secret_is_shorter_than_32_bytes() {
-        let cfg = aisix_core::config::PlatformConfig {
-            enabled: true,
-            id_key_env: Some("P0_TEST_PLATFORM_KEY".into()),
-        };
-        let short = "short-secret-value-do-not-print";
-        let err = platform_settings(&cfg, |_| Some(short.to_string()))
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("P0_TEST_PLATFORM_KEY"), "{err}");
-        assert!(!err.contains(short), "{err}");
-
-        let missing = platform_settings(&cfg, |_| None).unwrap_err().to_string();
-        assert!(missing.contains("P0_TEST_PLATFORM_KEY"), "{missing}");
-
-        let long = "k".repeat(32);
-        let settings = platform_settings(&cfg, |_| Some(long.clone()))
-            .unwrap()
-            .expect("enabled platform yields settings");
-        assert_eq!(
-            settings.id_key,
-            aisix_proxy::platform::PlatformSettings::from_secret(&long).id_key
-        );
-        let off = aisix_core::config::PlatformConfig::default();
-        assert!(platform_settings(&off, |_| Some(long.clone()))
-            .unwrap()
-            .is_none());
-    }
-
     #[test]
     fn build_connect_options_bounds_even_a_plain_http_etcd() {
         let etcd = aisix_core::EtcdConfig {

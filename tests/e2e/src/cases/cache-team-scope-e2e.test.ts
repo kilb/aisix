@@ -348,7 +348,8 @@ describe("cache team scope in platform mode e2e", () => {
       extraEnv: {
         AISIX_PROXY__PLATFORM__ENABLED: "true",
         AISIX_PROXY__PLATFORM__ID_KEY_ENV: PLATFORM_SECRET_ENV,
-        [PLATFORM_SECRET_ENV]: "cache-team-scope-e2e-platform-secret-0123456789",
+        // 32 random bytes as hex digits, the form the gateway requires.
+        [PLATFORM_SECRET_ENV]: "7f4c155f7eed0594e4d600ae4dadde1b9454198b268ba9319f4249b9d87d286c",
       },
     });
     await seedTeamScope(etcd, app, upstream);

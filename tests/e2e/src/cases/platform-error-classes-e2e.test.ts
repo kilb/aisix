@@ -27,7 +27,8 @@ import {
 const hash = (plaintext: string) => createHash("sha256").update(plaintext).digest("hex");
 const CALLER_KEY = "sk-platform-errors-e2e-caller";
 const PLATFORM_SECRET_ENV = "P0_E2E_PLATFORM_ID_KEY";
-const PLATFORM_SECRET = "platform-errors-e2e-secret-0123456789abcdef";
+// 32 random bytes as hex digits, the form the gateway requires.
+const PLATFORM_SECRET = "962887e2a142f4af6a987d72d3e4446a63007120157fc194c00b6c4bcefa9d5b";
 const LEAKS = ["Anthropic", "Bedrock", "Vertex", "us-east-1"];
 /** A word no answer in this spec contains: the output guardrail never blocks. */
 const NEVER_SAID = "zq-never-in-any-answer-9x";

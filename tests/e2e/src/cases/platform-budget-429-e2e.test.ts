@@ -25,7 +25,8 @@ const now = new Date();
 const MONTH_START = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1);
 
 const PLATFORM_SECRET_ENV = "P0_E2E_PLATFORM_BUDGET_KEY";
-const PLATFORM_SECRET = "platform-budget-e2e-secret-0123456789abcdef";
+// 32 random bytes as hex digits, the form the gateway requires.
+const PLATFORM_SECRET = "ef4c49de00b0d8ff3bd998f2db44d9f2e2fc1c5520907e6bf4010a8dd173a311";
 const TEAM_KEY = "sk-pb-e2e-team";
 const PLAIN_KEY = "sk-pb-e2e-plain";
 const SENTINEL_KEY = "sk-pb-e2e-sentinel";
