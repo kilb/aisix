@@ -62,8 +62,11 @@ export function RouteNav<Id extends string>({
   }
 
   return (
-    <nav className="route-nav" aria-label={label}>
-      <ol ref={list} role="tablist" aria-label={label} aria-orientation="vertical" onKeyDown={onKeyDown}>
+    // The list carries the name, not the landmark too, so it is announced
+    // once. No aria-orientation: the line is vertical on a wide screen and a
+    // horizontal bar on a phone, and both arrow axes move along it.
+    <nav className="route-nav">
+      <ol ref={list} role="tablist" aria-label={label} onKeyDown={onKeyDown}>
         {items.map((t) => {
           const note = attention[t.id];
           return (

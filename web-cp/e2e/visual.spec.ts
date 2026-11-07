@@ -145,3 +145,48 @@ test("两步确认用键盘打开时焦点落在「取消」，再按回车只�
   expect((await stack.admin.get(`/admin/tenants/${id}`)).status, "nothing was suspended").toBe("active");
   await page.context().close();
 });
+
+test("分区导航只用键盘也能走遍：方向键、Home、End 移动，回车或空格打开", async ({ browser }) => {
+  const page = await systemDark(browser);
+  await login(page);
+  const tab = (name: string) => page.getByRole("tab", { name, exact: true });
+  const role = () => page.evaluate(() => document.activeElement?.getAttribute("role") ?? null);
+
+  // Shift+Tab from the header reaches the route at its current stop, and Tab
+  // leaves the route again rather than walking its stops.
+  await page.getByRole("button", { name: "切换到深色" }).focus();
+  await page.keyboard.press("Shift+Tab");
+  await expect(tab("概览")).toBeFocused();
+  await page.keyboard.press("Tab");
+  expect(await role()).not.toBe("tab");
+  await page.keyboard.press("Shift+Tab");
+  await expect(tab("概览")).toBeFocused();
+
+  // Down and up along the line, wrapping at both ends; the other axis too.
+  await page.keyboard.press("ArrowDown");
+  await expect(tab("网关")).toBeFocused();
+  await page.keyboard.press("ArrowUp");
+  await expect(tab("概览")).toBeFocused();
+  await page.keyboard.press("ArrowUp");
+  await expect(tab("审计日志")).toBeFocused();
+  await page.keyboard.press("ArrowDown");
+  await expect(tab("概览")).toBeFocused();
+  await page.keyboard.press("End");
+  await expect(tab("审计日志")).toBeFocused();
+  await page.keyboard.press("Home");
+  await expect(tab("概览")).toBeFocused();
+  await page.keyboard.press("ArrowRight");
+  await expect(tab("网关")).toBeFocused();
+  // Moving the focus opens nothing by itself.
+  await expect(tab("概览")).toHaveAttribute("aria-selected", "true");
+
+  await page.keyboard.press("Enter");
+  await expect(tab("网关")).toHaveAttribute("aria-selected", "true");
+  await expect(page.getByRole("tabpanel", { name: "网关" })).toBeVisible();
+  await expect(tab("网关")).toBeFocused();
+  await page.keyboard.press("ArrowDown");
+  await page.keyboard.press("Space");
+  await expect(tab("上游账号")).toHaveAttribute("aria-selected", "true");
+  await expect(page.getByRole("tabpanel", { name: "上游账号" })).toBeVisible();
+  await page.context().close();
+});
