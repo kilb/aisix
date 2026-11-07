@@ -149,9 +149,11 @@ pub(crate) fn platform_message(class: &PlatformErrorClass) -> &'static str {
 
 /// The class `err` belongs to.
 ///
-/// Platform mode replaces only the errors [`hides`] selects; for the
-/// gateway's own refusals this is the class by status, and they keep their
-/// own envelope on the wire.
+/// Platform mode replaces only the errors [`hides`] selects. A variant with
+/// no arm of its own is classed by its status, which is how one added later
+/// is classed until it gets one; `Authentication` is reached that way only,
+/// by a 401 refusal not on [`keeps_own_envelope`]'s list, and none is today
+/// (an upstream 401 is the platform's account, `UpstreamUnavailable`).
 pub(crate) fn classify(err: &ProxyError) -> PlatformErrorClass {
     match err {
         ProxyError::Bridge(e) => classify_bridge(e),
@@ -323,24 +325,62 @@ fn classify_upstream(
     }
 }
 
-/// Whether platform mode replaces `err` for the caller: an upstream's
-/// failure, a gateway refusal whose text names the target the request
-/// resolved to, or a refusal of what a request names that is decided on what
-/// only the gateway knows about it (a response id, an object stored
-/// upstream). The one upstream-side variant left alone is the gateway's own
-/// request size limit, which names nothing.
+/// Whether platform mode replaces `err` for the caller: everything but the
+/// gateway's own refusals that name no upstream, which keep their own
+/// envelope ([`keeps_own_envelope`]). A variant that is not on that list is
+/// replaced, so one added later is replaced until someone decides
+/// otherwise: a refusal whose text names the provider, provider key or
+/// account cannot reach a tenant by being forgotten here.
 fn hides(err: &ProxyError) -> bool {
     match err {
         ProxyError::Bridge(e) => hides_bridge(e),
-        ProxyError::UnusableTarget(_)
-        | ProxyError::TargetRefused(_)
-        | ProxyError::ResponseNotFound
-        | ProxyError::StoredObjectReference(_)
-        | ProxyError::ModelSelectorRefused(_) => true,
-        _ => false,
+        other => !keeps_own_envelope(other),
     }
 }
 
+/// The gateway's own refusals that keep their envelope in platform mode:
+/// authentication, a model or route the key may not reach, request
+/// validation, guardrails, budgets and rate limits. Each is decided on the
+/// caller's own key, request or limits and names no upstream, and its
+/// envelope is what a caller acts on (a budget's figures, a rate limit's
+/// `Retry-After`, a guardrail's name). Also the MCP token refusals, which
+/// are about the caller's identity at its own identity provider.
+fn keeps_own_envelope(err: &ProxyError) -> bool {
+    matches!(
+        err,
+        ProxyError::MissingAuth(_)
+            | ProxyError::MissingRouteAuthHeader(_)
+            | ProxyError::InvalidApiKey
+            | ProxyError::ApiKeyExpired
+            | ProxyError::ApiKeyDisabled
+            | ProxyError::JwtInvalid
+            | ProxyError::JwtExpired
+            | ProxyError::JwtClaimsRejected
+            | ProxyError::JwtInsufficientScope { .. }
+            | ProxyError::JwtIdentityUnmapped
+            | ProxyError::JwksUnavailable
+            | ProxyError::McpTokenExchange(_)
+            | ProxyError::McpUserOAuth { .. }
+            | ProxyError::ModelNotFound(_)
+            | ProxyError::ModelForbidden(_)
+            | ProxyError::ModelIpRestricted(_)
+            | ProxyError::RouteIpRestricted(_)
+            | ProxyError::RouteForbidden(_)
+            | ProxyError::JobListRefused
+            | ProxyError::InvalidRequest(_)
+            | ProxyError::RequestTooLarge { .. }
+            | ProxyError::WebSocketUpgradeRequired { .. }
+            | ProxyError::ContentFiltered { .. }
+            | ProxyError::BudgetExceeded(_)
+            | ProxyError::BudgetUnverified
+            | ProxyError::RateLimit(_)
+            | ProxyError::ModelRateLimit(_)
+            | ProxyError::PolicyRateLimit { .. }
+    )
+}
+
+/// The one upstream-side variant left alone is the gateway's own request
+/// size limit, which names nothing.
 fn hides_bridge(err: &BridgeError) -> bool {
     !matches!(err, BridgeError::RequestTooLarge { .. })
 }
@@ -941,6 +981,144 @@ mod tests {
                 assert_eq!(caller_class(&own), None, "{own:?}");
             }
         });
+    }
+
+    /// Whether a variant keeps its own envelope in platform mode. Written as
+    /// a match with no catch-all, so a new variant does not compile here
+    /// until someone decides; the census below then checks `hides` agrees.
+    fn keeps_its_envelope(err: &ProxyError) -> bool {
+        match err {
+            ProxyError::MissingAuth(_)
+            | ProxyError::MissingRouteAuthHeader(_)
+            | ProxyError::InvalidApiKey
+            | ProxyError::ApiKeyExpired
+            | ProxyError::ApiKeyDisabled
+            | ProxyError::JwtInvalid
+            | ProxyError::JwtExpired
+            | ProxyError::JwtClaimsRejected
+            | ProxyError::JwtInsufficientScope { .. }
+            | ProxyError::JwtIdentityUnmapped
+            | ProxyError::JwksUnavailable
+            | ProxyError::McpTokenExchange(_)
+            | ProxyError::McpUserOAuth { .. }
+            | ProxyError::ModelNotFound(_)
+            | ProxyError::ModelForbidden(_)
+            | ProxyError::ModelIpRestricted(_)
+            | ProxyError::RouteIpRestricted(_)
+            | ProxyError::RouteForbidden(_)
+            | ProxyError::JobListRefused
+            | ProxyError::InvalidRequest(_)
+            | ProxyError::RequestTooLarge { .. }
+            | ProxyError::WebSocketUpgradeRequired { .. }
+            | ProxyError::ContentFiltered { .. }
+            | ProxyError::BudgetExceeded(_)
+            | ProxyError::BudgetUnverified
+            | ProxyError::RateLimit(_)
+            | ProxyError::ModelRateLimit(_)
+            | ProxyError::PolicyRateLimit { .. } => true,
+            ProxyError::VideoNotFound(_)
+            | ProxyError::JobResourceNotFound(_)
+            | ProxyError::ResponseNotFound
+            | ProxyError::StoredObjectReference(_)
+            | ProxyError::ModelSelectorRefused(_)
+            | ProxyError::UnusableTarget(_)
+            | ProxyError::TargetRefused(_)
+            | ProxyError::ProviderUnavailable
+            | ProxyError::SemanticDecisionFailed { .. }
+            | ProxyError::AllCandidatesUnavailable { .. } => false,
+            ProxyError::Bridge(e) => matches!(e, BridgeError::RequestTooLarge { .. }),
+        }
+    }
+
+    /// One of every variant.
+    fn every_variant() -> Vec<ProxyError> {
+        let limited = || aisix_ratelimit::RateLimitError::AllowanceExhausted;
+        vec![
+            ProxyError::MissingAuth("authorization"),
+            ProxyError::MissingRouteAuthHeader("x-key".into()),
+            ProxyError::InvalidApiKey,
+            ProxyError::ApiKeyExpired,
+            ProxyError::ApiKeyDisabled,
+            ProxyError::JwtInvalid,
+            ProxyError::JwtExpired,
+            ProxyError::JwtClaimsRejected,
+            ProxyError::JwtInsufficientScope {
+                required_scopes: vec!["s".into()],
+            },
+            ProxyError::JwtIdentityUnmapped,
+            ProxyError::JwksUnavailable,
+            ProxyError::McpTokenExchange(aisix_mcp::TokenExchangeFailure::Unavailable),
+            ProxyError::McpUserOAuth {
+                failure: aisix_mcp::UserOAuthFailure::AuthorizationRequired,
+                server: "s".into(),
+            },
+            ProxyError::ModelNotFound("m".into()),
+            ProxyError::VideoNotFound("v".into()),
+            ProxyError::JobResourceNotFound("file-1".into()),
+            ProxyError::ResponseNotFound,
+            ProxyError::StoredObjectReference("conversation".into()),
+            ProxyError::ModelSelectorRefused("models".into()),
+            ProxyError::JobListRefused,
+            ProxyError::ModelForbidden("m".into()),
+            ProxyError::ModelIpRestricted("m".into()),
+            ProxyError::RouteIpRestricted("r".into()),
+            ProxyError::RouteForbidden("r".into()),
+            ProxyError::InvalidRequest("bad".into()),
+            ProxyError::UnusableTarget("pk 'acct-7' has no secret".into()),
+            ProxyError::TargetRefused("provider bedrock".into()),
+            ProxyError::WebSocketUpgradeRequired {
+                status: StatusCode::UPGRADE_REQUIRED,
+                detail: "d".into(),
+            },
+            ProxyError::ProviderUnavailable,
+            ProxyError::SemanticDecisionFailed {
+                router: "r".into(),
+                reason: crate::semantic::DecisionFailure::ClassifierTimeout,
+            },
+            ProxyError::AllCandidatesUnavailable {
+                retry_after_secs: Some(30),
+            },
+            ProxyError::ContentFiltered {
+                message: "blocked".into(),
+                unavailable: None,
+            },
+            budget_exceeded_for_team(),
+            ProxyError::BudgetUnverified,
+            ProxyError::RequestTooLarge { limit_bytes: 1 },
+            ProxyError::RateLimit(limited()),
+            ProxyError::ModelRateLimit(limited()),
+            ProxyError::PolicyRateLimit {
+                source: limited(),
+                policy_id: "p".into(),
+                policy_name: "p".into(),
+                callers_bucket: true,
+            },
+            upstream_status(500, "x"),
+            ProxyError::Bridge(BridgeError::RequestTooLarge {
+                limit_bytes: 1,
+                inbound_bytes: 1,
+                downloaded_bytes: 1,
+            }),
+        ]
+    }
+
+    /// Platform mode classes every variant but the gateway's own refusals
+    /// that name no upstream: a variant left off that list is classed, so
+    /// one added later fails closed.
+    #[test]
+    fn every_variant_is_classed_unless_it_keeps_its_own_envelope() {
+        in_platform_mode(|| {
+            for err in every_variant() {
+                assert_eq!(
+                    caller_class(&err).is_none(),
+                    keeps_its_envelope(&err),
+                    "{err:?}"
+                );
+            }
+        });
+        for err in every_variant() {
+            assert_eq!(caller_class(&err), None, "off platform mode: {err:?}");
+        }
     }
 
     #[tokio::test]
