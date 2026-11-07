@@ -259,6 +259,23 @@ describe("budgets pushed as documents decide requests locally", () => {
     expect(Math.abs(retryAfter - (nextMonth - Date.now()) / 1000)).toBeLessThan(60);
   });
 
+  test("a block with no period start names no reset time", async (ctx) => {
+    if (!etcdReachable || !app) return ctx.skip();
+    // The api_key mark names no period it was set in: it holds until it is
+    // withdrawn, so there is no boundary for the caller to wait for.
+    const raw = await fetch(`${app.proxyUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${KEYS.apiKey}`, "content-type": "application/json" },
+      body: JSON.stringify({ model: "bd-direct", messages: [{ role: "user", content: "hello" }] }),
+    });
+    const res = { status: raw.status, body: await raw.json(), headers: raw.headers };
+    const error = refusal(res);
+    expect(error.scope).toBe("api_key");
+    expect(error).not.toHaveProperty("period_resets_at");
+    expect(error).not.toHaveProperty("retry_after_seconds");
+    expect(res.headers.get("retry-after")).toBeNull();
+  });
+
   test("/v1/messages refuses with the Anthropic envelope", async (ctx) => {
     if (!etcdReachable || !app) return ctx.skip();
     const res = await fetch(`${app.proxyUrl}/v1/messages`, {
