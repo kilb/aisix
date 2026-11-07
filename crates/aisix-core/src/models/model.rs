@@ -1263,6 +1263,12 @@ mod tests {
         let got = cost.calculate_with_cache(one_hour_input(), 0);
         // (1000 + 3000×1.25) / 1000
         assert!((got - 4.75).abs() < 1e-9, "got {got}");
+        // Bit for bit, not merely close: the formula before the field
+        // existed, in its own term order.
+        assert_eq!(
+            got.to_bits(),
+            ((1000.0 * 1.0 + 3000.0 * 1.25 + 0.0 * 10.0) / 1000.0_f64).to_bits()
+        );
     }
 
     #[test]

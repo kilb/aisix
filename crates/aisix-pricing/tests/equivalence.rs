@@ -150,14 +150,16 @@ struct GatewayUsage {
 }
 
 /// The gateway's spend on `g`, by the call chain its chat handler runs
-/// (`usage_attr::input_tokens_from_counts`): the one-hour part of the write
-/// marked by the same reading the engine applies, a split it cannot read
-/// priced as no split.
+/// (`usage_attr::input_tokens_from_counts`): the split settled as the usage
+/// event reports it (`CacheCreationTtl::accounting_for`), then the one-hour
+/// part of the write marked by the same reading the engine applies, a split
+/// it cannot read priced as no split.
 fn gateway_spend(g: &GatewayUsage, p: &GatewayPrice) -> u64 {
+    let reported = g.ttl.accounting_for(g.creation);
     let one_hour = one_hour_cache_writes(
         u64::from(g.creation),
-        g.ttl.cache_creation_5m_tokens,
-        g.ttl.cache_creation_1h_tokens,
+        reported.cache_creation_5m_tokens,
+        reported.cache_creation_1h_tokens,
     );
     let input = input_tokens_for_pricing(
         u64::from(g.prompt),
