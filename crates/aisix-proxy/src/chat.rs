@@ -2913,7 +2913,11 @@ async fn dispatch(
     // purges, callers, or tenants.
     let cache_key_full = match (policy_cache.as_ref(), matched_policy.as_ref()) {
         (Some(_), Some(entry)) => {
-            let scope_value = crate::response_cache::cache_scope_value(entry.value.scope, auth);
+            let scope_value = crate::response_cache::cache_scope_value(
+                entry.value.scope,
+                auth,
+                state.platform().is_some(),
+            );
             Some(
                 CacheKey::from_request(req)
                     .with_scope(

@@ -209,16 +209,26 @@ impl CacheTelemetry {
 /// - `api_key`: the key's id, bare. That is the value every entry stored
 ///   under this scope has always been keyed by, so those entries stay
 ///   reachable.
-/// - `env`: `None`, so every caller shares, as it always has.
+/// - `env`: `None`, so every caller shares, as it always has; in platform
+///   mode, what `team` gives.
 /// - `team`: `team:<team_id>`, shared by the keys of one team. A key with no
 ///   team, or an empty `team_id`, gets `key:<id>` and shares with no one: a
 ///   key nobody assigned to a tenant must not land in some tenant's entries.
 ///   The two prefixes keep a team's value from ever equalling a key's.
-pub(crate) fn cache_scope_value(scope: CacheScope, auth: &AuthenticatedKey) -> Option<String> {
+///
+/// In platform mode (`platform`) `env` is read as `team`: every tenant is
+/// in the platform's one environment, so an entry every caller shares would
+/// replay one tenant's answer, semantic matches and sealed ids included, to
+/// another.
+pub(crate) fn cache_scope_value(
+    scope: CacheScope,
+    auth: &AuthenticatedKey,
+    platform: bool,
+) -> Option<String> {
     match scope {
         CacheScope::ApiKey => Some(auth.entry.id.clone()),
-        CacheScope::Env => None,
-        CacheScope::Team => Some(
+        CacheScope::Env if !platform => None,
+        CacheScope::Env | CacheScope::Team => Some(
             match auth
                 .key()
                 .team_id
@@ -295,7 +305,7 @@ impl BodyCache {
             .as_ref()?
             .for_policy_backend(entry.value.backend, &entry.id, &entry.value.name)?
             .clone();
-        let scope_value = cache_scope_value(entry.value.scope, auth);
+        let scope_value = cache_scope_value(entry.value.scope, auth, state.platform().is_some());
         let scope_part = body_scope_part(scope_value.as_deref())?;
         let generation = entry.value.purge_generation.to_string();
         let key_material = key_material();
@@ -545,6 +555,11 @@ mod tests {
     /// The same request, under a policy of `scope`, from the key `key_id`
     /// carrying `team_id`.
     fn key_for(scope: CacheScope, team_id: Option<&str>, key_id: &str) -> Keys {
+        key_for_in(false, scope, team_id, key_id)
+    }
+
+    /// [`key_for`] on a gateway in platform mode, or not.
+    fn key_for_in(platform: bool, scope: CacheScope, team_id: Option<&str>, key_id: &str) -> Keys {
         use aisix_core::resource::ResourceEntry;
         let snap = AisixSnapshot::new();
         let mut policy: aisix_core::CachePolicy =
@@ -560,6 +575,11 @@ mod tests {
             }))
             .unwrap(),
         );
+        let state = if platform {
+            state.with_platform(crate::platform::PlatformSettings::from_secret("s"))
+        } else {
+            state
+        };
         let key: aisix_core::ApiKey =
             serde_json::from_value(serde_json::json!({"key_hash": "h", "team_id": team_id}))
                 .unwrap();
@@ -591,7 +611,7 @@ mod tests {
         let chat = aisix_cache::CacheKey::from_request(&req).with_scope(
             "policy-1",
             0,
-            cache_scope_value(scope, &auth).as_deref(),
+            cache_scope_value(scope, &auth, platform).as_deref(),
         );
         Keys {
             exact: chat.fingerprint(),
@@ -640,6 +660,38 @@ mod tests {
         );
     }
 
+    /// In platform mode an `env` scope shares no further than a `team` one:
+    /// tenants share the platform's environment, and an entry shared across
+    /// it would replay one tenant's answer, and its sealed ids, to another.
+    /// Off platform mode it shares with every caller, as it always has.
+    #[test]
+    fn in_platform_mode_an_env_scope_shares_only_within_a_team() {
+        assert_eq!(
+            key_for_in(true, CacheScope::Env, Some("t1"), "k1"),
+            key_for_in(true, CacheScope::Team, Some("t1"), "k1"),
+        );
+        assert_eq!(
+            key_for_in(true, CacheScope::Env, Some("t1"), "k1"),
+            key_for_in(true, CacheScope::Env, Some("t1"), "k2"),
+        );
+        assert_isolated(
+            &key_for_in(true, CacheScope::Env, Some("t1"), "k1"),
+            &key_for_in(true, CacheScope::Env, Some("t2"), "k2"),
+        );
+        assert_isolated(
+            &key_for_in(true, CacheScope::Env, None, "k1"),
+            &key_for_in(true, CacheScope::Env, None, "k2"),
+        );
+        assert_eq!(
+            key_for_in(false, CacheScope::Env, Some("t1"), "k1"),
+            key_for_in(false, CacheScope::Env, Some("t2"), "k2"),
+        );
+        assert_eq!(
+            key_for_in(false, CacheScope::Env, Some("t1"), "k1"),
+            legacy(LEGACY_ENV_FINGERPRINT)
+        );
+    }
+
     #[test]
     fn keys_of_one_team_share_a_team_scoped_entry() {
         assert_eq!(
@@ -684,9 +736,9 @@ mod tests {
                 None,
                 false,
             );
-            assert_eq!(cache_scope_value(CacheScope::Env, &auth), None);
+            assert_eq!(cache_scope_value(CacheScope::Env, &auth, false), None);
             for scope in [CacheScope::ApiKey, CacheScope::Team] {
-                let value = cache_scope_value(scope, &auth);
+                let value = cache_scope_value(scope, &auth, false);
                 assert!(
                     value.as_deref().is_some_and(|v| !v.is_empty()),
                     "{scope:?} with team {team_id:?} gave {value:?}"
