@@ -1305,7 +1305,15 @@ describe("platform mode e2e: a response id continues only for the tenant it was 
     up.probe = await startOpenAiUpstream();
     up.items = await startOpenAiUpstream({ nonStreamBody: itemsAnswer() });
     up.refs = await startOpenAiUpstream({
-      pathBodies: { "/responses": tenantAnswer("resp_bdrk_r01") },
+      pathBodies: {
+        "/responses": tenantAnswer("resp_bdrk_r01"),
+        "/embeddings": {
+          object: "list",
+          data: [{ object: "embedding", index: 0, embedding: [0.1, 0.2] }],
+          model: "upstream-model",
+          usage: { prompt_tokens: 1, total_tokens: 1 },
+        },
+      },
     });
     refsAnthropic = await startOpenAiUpstream({
       pathBodies: {
@@ -1861,6 +1869,18 @@ describe("platform mode e2e: a response id continues only for the tenant it was 
         field: "tools[0].model",
       },
       {
+        family: "embeddings: provider routing",
+        path: "/v1/embeddings",
+        body: { model: openai, input: "hi", provider: { order: ["x"] } },
+        field: "provider",
+      },
+      {
+        family: "embeddings: an aggregator's model list",
+        path: "/v1/embeddings",
+        body: { model: openai, input: "hi", models: ["openai/text-embedding-3-large"] },
+        field: "models",
+      },
+      {
         family: "messages: a fallback chain",
         path: "/v1/messages",
         body: { model: anthropic, max_tokens: 64, fallbacks: "default", messages: [{ role: "user", content: "hi" }] },
@@ -1930,6 +1950,9 @@ describe("platform mode e2e: a response id continues only for the tenant it was 
     });
     expect(fresh.status, fresh.text).toBe(200);
     expect(up.refs!.receivedRequests).toHaveLength(1);
+    const embedded = await postAs(TENANT_KEYS.b, "/v1/embeddings", { model: openai, input: "hi" });
+    expect(embedded.status, embedded.text).toBe(200);
+    expect(up.refs!.receivedRequests).toHaveLength(2);
     const plain = await postAs(TENANT_KEYS.b, "/v1/messages", {
       model: anthropic,
       max_tokens: 64,

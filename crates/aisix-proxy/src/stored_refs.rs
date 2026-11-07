@@ -178,6 +178,19 @@ pub(crate) fn refuse_in_messages(
     )
 }
 
+/// Refuse a `/v1/embeddings` request choosing its own model: a top-level
+/// `models`, `provider` or `fallbacks`, which an aggregator channel reads on
+/// embeddings as on chat (<https://openrouter.ai/docs/api/reference/embeddings>).
+/// An embeddings request names no object stored upstream, so nothing else is
+/// read. `extra` is every member of the body the endpoint does not model
+/// itself, all of which reach the upstream.
+pub(crate) fn refuse_in_embeddings(
+    platform: Option<&crate::platform::PlatformSettings>,
+    extra: &serde_json::Map<String, Value>,
+) -> Result<(), ProxyError> {
+    refuse(platform, || model_selector(extra), || None)
+}
+
 fn refuse(
     platform: Option<&crate::platform::PlatformSettings>,
     selector: impl FnOnce() -> Option<String>,
@@ -509,6 +522,31 @@ mod tests {
             Err(ProxyError::StoredObjectReference(field)) => Some(field),
             Err(other) => panic!("unexpected refusal {other:?}"),
             Ok(()) => None,
+        }
+    }
+
+    /// An embeddings request cannot choose its own model either, and only
+    /// in platform mode is it refused.
+    #[test]
+    fn an_embeddings_request_choosing_its_own_model_names_the_field() {
+        let extra = |body: Value| body.as_object().cloned().unwrap();
+        for (field, value) in [
+            ("models", json!(["openai/text-embedding-3-large"])),
+            ("provider", json!({"order": ["x"]})),
+            ("fallbacks", json!(["other-model"])),
+        ] {
+            let body = extra(json!({ "user": "u", field: value }));
+            match refuse_in_embeddings(Some(&platform()), &body) {
+                Err(ProxyError::ModelSelectorRefused(refused)) => assert_eq!(refused, field),
+                other => panic!("{field}: {other:?}"),
+            }
+            assert!(refuse_in_embeddings(None, &body).is_ok(), "{field}");
+        }
+        for body in [
+            json!({}),
+            json!({"user": "u", "models": [], "provider": null}),
+        ] {
+            assert!(refuse_in_embeddings(Some(&platform()), &extra(body)).is_ok());
         }
     }
 
