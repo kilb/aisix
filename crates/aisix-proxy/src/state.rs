@@ -403,9 +403,15 @@ pub struct ProxyStateInner {
     /// deterministic `request_id = "batch-<id>"` on the emitted events is
     /// what keeps cross-restart re-emission idempotent on the control plane side.
     pub billed_batches: Arc<dashmap::DashMap<String, std::time::Instant>>,
-    /// Permits for a batch attribution's output download, so only
-    /// [`crate::jobs::BATCH_ATTRIBUTION_DOWNLOADS`] run at once.
+    /// Permits for the output download of a batch attribution that can
+    /// credit spend, so only [`crate::jobs::BATCH_ATTRIBUTION_DOWNLOADS`] run
+    /// at once.
     pub(crate) batch_attribution_permits: Arc<tokio::sync::Semaphore>,
+    /// Permits for the output download of a batch attribution whose credit is
+    /// ruled out, which only re-emits a usage row:
+    /// [`crate::jobs::BATCH_BACKFILL_DOWNLOADS`] at once, in a lane of its
+    /// own so that it never waits ahead of a batch that can be credited.
+    pub(crate) batch_backfill_permits: Arc<tokio::sync::Semaphore>,
     /// How often [`crate::jobs`] re-reads a batch it created until it ends.
     pub batch_watch_interval: std::time::Duration,
     /// Boot-compiled User-Agent → `client_type` classifier: operator
@@ -586,6 +592,9 @@ impl ProxyState {
             batch_attribution_permits: Arc::new(tokio::sync::Semaphore::new(
                 crate::jobs::BATCH_ATTRIBUTION_DOWNLOADS,
             )),
+            batch_backfill_permits: Arc::new(tokio::sync::Semaphore::new(
+                crate::jobs::BATCH_BACKFILL_DOWNLOADS,
+            )),
             batch_watch_interval: DEFAULT_BATCH_WATCH_INTERVAL,
             client_classifier: Arc::new(ClientTypeClassifier::builtin()),
             default_retries: aisix_core::config::DEFAULT_UPSTREAM_RETRIES,
@@ -646,6 +655,9 @@ impl ProxyState {
             billed_batches: Arc::new(dashmap::DashMap::new()),
             batch_attribution_permits: Arc::new(tokio::sync::Semaphore::new(
                 crate::jobs::BATCH_ATTRIBUTION_DOWNLOADS,
+            )),
+            batch_backfill_permits: Arc::new(tokio::sync::Semaphore::new(
+                crate::jobs::BATCH_BACKFILL_DOWNLOADS,
             )),
             batch_watch_interval: DEFAULT_BATCH_WATCH_INTERVAL,
             client_classifier: Arc::new(ClientTypeClassifier::builtin()),
@@ -731,6 +743,9 @@ impl ProxyState {
             billed_batches: Arc::new(dashmap::DashMap::new()),
             batch_attribution_permits: Arc::new(tokio::sync::Semaphore::new(
                 crate::jobs::BATCH_ATTRIBUTION_DOWNLOADS,
+            )),
+            batch_backfill_permits: Arc::new(tokio::sync::Semaphore::new(
+                crate::jobs::BATCH_BACKFILL_DOWNLOADS,
             )),
             batch_watch_interval: DEFAULT_BATCH_WATCH_INTERVAL,
             client_classifier: Arc::new(ClientTypeClassifier::builtin()),
