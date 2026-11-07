@@ -58,6 +58,8 @@
      hairline is about 1.4:1, so inputs take Neutral 2. */
   --input-border: var(--n2);
   --input-border-hover: var(--n1);
+  /* A checkbox's or radio's edge. */
+  --box-border: var(--n2);
   --focus: var(--line);
   --link: var(--line);
   --error: var(--stop);
@@ -120,7 +122,7 @@
   --icon: 16px;
 
   /* Type. Overpass for Latin and figures, the system face for Chinese. */
-  --font-sans: "Overpass", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans SC", sans-serif;
+  --font-sans: "Overpass", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans SC", "Noto Sans CJK SC", sans-serif;
   --font-mono: "Overpass Mono", ui-monospace, "SF Mono", Menlo, monospace;
   --fs-12: 12px;
   --fs-13: 13px;
@@ -152,15 +154,24 @@
   --stop: #E8665E;
   --hairline: rgba(230, 236, 234, 0.12);
   --hairline-inner: rgba(230, 236, 234, 0.075);
+  /* Route colours lifted the same step, so each bar keeps 3:1 on a dark
+     panel. */
+  --route-1: #5B8BF0;
+  --route-2: #2FB88A;
+  --route-3: #E8763E;
+  --route-4: #9B7BF5;
+  --route-5: #22A6C2;
+  --route-6: #D98A2B;
 
   --bg: #121C27;
   --surface: #1A2735;
   --surface-raised: #243446;
   --text: #E6ECEA;
   --text-2: #C2CCD0;
-  --text-muted: #A7B0B7;
-  --input-border: #8593A0;
-  --input-border-hover: #A7B0B7;
+  --text-muted: #97A4AE;
+  --input-border: #7A8896;
+  --input-border-hover: #A3AFB8;
+  --box-border: #8B98A4;
   --route-line: #E6ECEA;
 
   --lamp-disabled: #6B7987;
