@@ -328,3 +328,43 @@ test("两步确认在请求途中显示载入、不能再次确认也不能取�
   expect(after.version, "one save, not two").toBe(before.version + 1);
   await page.context().close();
 });
+
+test("价格 · 基准价：深色与手机宽度下不横向滚动", async ({ browser }) => {
+  // One priced, one unpriced, so the page shows both of its states.
+  const account = await stack.admin.post("/admin/resources/provider_keys", {
+    doc: {
+      display_name: "acct-visual-base-2f4",
+      provider: "openai",
+      api_key: "sk-acct-visual-base-2f4-upstream",
+      api_base: `${stack.mockUpstreamUrl}/v1`,
+      groups: ["shared"],
+    },
+  });
+  const model = await stack.admin.post("/admin/resources/models", {
+    doc: { display_name: "base-visual-2f4", provider: "openai", model_name: "gpt-5.4-mini", provider_key_id: account.id },
+  });
+  await stack.admin.post("/admin/pricing/baselines", {
+    model_id: model.id,
+    effective_from: new Date().toISOString(),
+    card: { default: { base: { input: "0.75", output: "4.5" } } },
+    note: "视觉检查用的手工价",
+  });
+
+  const page = await systemDark(browser);
+  await login(page);
+  await open(page, "pricing");
+  await page.getByRole("group", { name: "价格分区" }).getByRole("button", { name: "基准价", exact: true }).click();
+  await expect(page.getByRole("table", { name: "基准价" })).toBeVisible();
+  await expect(page.locator("main").getByText("载入中…")).toHaveCount(0);
+  await expect(page.locator("main").getByText("手动录入").first()).toBeVisible();
+  await page.evaluate(() => document.fonts.ready.then(() => undefined));
+  await expect.poll(() => background(page)).toBe(LIGHT_BG);
+  await shoot(page, "visual-pricing-baselines-light.png");
+  await page.getByRole("button", { name: "切换到深色" }).click();
+  await expect.poll(() => background(page)).toBe(DARK_BG);
+  await shoot(page, "visual-pricing-baselines-dark.png");
+  await page.setViewportSize(PHONE);
+  await shoot(page, "visual-pricing-baselines-360.png");
+  expect(await page.evaluate(() => document.documentElement.scrollWidth), "no sideways scroll").toBeLessThanOrEqual(PHONE.width);
+  await page.context().close();
+});
