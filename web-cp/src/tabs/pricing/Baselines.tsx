@@ -20,6 +20,7 @@ import { messageFor, problemAt, warningText } from "../../lib/errors";
 import { errorText } from "../../lib/fmt";
 import { catalogueUpdateWords } from "../../lib/baselineUpdate";
 import { fmtUtc } from "../../lib/money";
+import { safeHttpUrl } from "../../lib/safeUrl";
 import { Button } from "../../ui/Button";
 import { DataTable, Loading } from "../../ui/DataTable";
 import { EmptyState } from "../../ui/EmptyState";
@@ -60,13 +61,21 @@ export function BaselineSourceBadge({ revision }: { revision: BaselineRevision }
   switch (source.source_kind) {
     case "catalogue": {
       const s = source.source;
+      const href = safeHttpUrl(s.source_url);
       return (
         <div className="baseline-source">
           <span className="tag">官方目录</span>
           <span className="cell-note">
-            <a href={s.source_url} target="_blank" rel="noreferrer">
-              来源页
-            </a>
+            {href ? (
+              <a href={href} target="_blank" rel="noopener noreferrer">
+                来源页
+              </a>
+            ) : (
+              // Not an http(s) page: the text stays readable, and never as a link.
+              <span className="trunc" title={s.source_url}>
+                {s.source_url}
+              </span>
+            )}
             {" · "}
             <span className="tabular">抄录于 {s.as_of}</span>
           </span>
@@ -75,8 +84,11 @@ export function BaselineSourceBadge({ revision }: { revision: BaselineRevision }
     }
     case "third_party": {
       // The provider page the dataset cites: what the attestation was checked
-      // against, so it is shown beside the date and left out when absent.
+      // against, so it is shown beside the date. A dataset is third-party text,
+      // so the URL is linked only when it is an http(s) page; anything else stays
+      // plain text, never an href.
       const s = source.source;
+      const href = safeHttpUrl(s.pricing_url);
       return (
         <div className="baseline-source">
           <span className="tag">第三方数据</span>
@@ -88,9 +100,15 @@ export function BaselineSourceBadge({ revision }: { revision: BaselineRevision }
             {s.pricing_url && (
               <>
                 {" · "}
-                <a href={s.pricing_url} target="_blank" rel="noreferrer">
-                  核对页面
-                </a>
+                {href ? (
+                  <a href={href} target="_blank" rel="noopener noreferrer">
+                    核对页面
+                  </a>
+                ) : (
+                  <span className="trunc" title={s.pricing_url}>
+                    {s.pricing_url}
+                  </span>
+                )}
               </>
             )}
           </span>
