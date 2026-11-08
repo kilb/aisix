@@ -10838,8 +10838,9 @@ data: [DONE]\n\n";
     }
 
     /// What platform mode answers for a `previous_response_id` the gateway
-    /// cannot open: its own 400 naming `previous_response_id`, the status
-    /// and field of the upstream's answer for one it does not have
+    /// cannot open: its own 400 naming `previous_response_id` under code
+    /// `previous_response_not_found`, the status, field and code of the
+    /// upstream's answer for one it does not have
     /// (<https://developers.openai.com/api/docs/guides/websocket-mode>).
     async fn platform_not_found() -> (StatusCode, bytes::Bytes) {
         let resp =
@@ -10847,6 +10848,7 @@ data: [DONE]\n\n";
         let (status, body) = status_and_body(resp).await;
         let v: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["error"]["param"], "previous_response_id", "{v}");
+        assert_eq!(v["error"]["code"], "previous_response_not_found", "{v}");
         (status, body)
     }
 

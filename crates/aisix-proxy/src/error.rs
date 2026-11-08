@@ -1282,12 +1282,7 @@ impl AnthropicErrorEnvelope {
                 kind: class.anthropic_kind().to_string(),
                 message: crate::platform_errors::platform_message(class).to_string(),
                 code: Some(class.code()),
-                param: match class {
-                    crate::platform_errors::PlatformErrorClass::InvalidRequest { param } => {
-                        param.clone()
-                    }
-                    _ => None,
-                },
+                param: class.param(),
             },
         }
     }

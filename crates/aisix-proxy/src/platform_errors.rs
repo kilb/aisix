@@ -69,6 +69,9 @@ pub(crate) enum PlatformErrorClass {
     ContentFiltered,
     Authentication,
     NotFound,
+    /// The gateway's own refusal of a `previous_response_id` it cannot open,
+    /// under the code of the upstream's own answer for one it does not have.
+    PreviousResponseNotFound,
     UpstreamUnavailable,
     Internal,
 }
@@ -76,9 +79,10 @@ pub(crate) enum PlatformErrorClass {
 impl PlatformErrorClass {
     pub(crate) fn status(&self) -> StatusCode {
         match self {
-            Self::ContextLengthExceeded | Self::InvalidRequest { .. } | Self::ContentFiltered => {
-                StatusCode::BAD_REQUEST
-            }
+            Self::ContextLengthExceeded
+            | Self::InvalidRequest { .. }
+            | Self::ContentFiltered
+            | Self::PreviousResponseNotFound => StatusCode::BAD_REQUEST,
             Self::RateLimited => StatusCode::TOO_MANY_REQUESTS,
             Self::Authentication => StatusCode::UNAUTHORIZED,
             Self::NotFound => StatusCode::NOT_FOUND,
@@ -93,7 +97,8 @@ impl PlatformErrorClass {
             Self::ContextLengthExceeded
             | Self::InvalidRequest { .. }
             | Self::ContentFiltered
-            | Self::NotFound => "invalid_request_error",
+            | Self::NotFound
+            | Self::PreviousResponseNotFound => "invalid_request_error",
             Self::RateLimited => "rate_limit_error",
             Self::Authentication => "authentication_error",
             Self::UpstreamUnavailable | Self::Internal => "server_error",
@@ -105,7 +110,10 @@ impl PlatformErrorClass {
     /// (<https://platform.openai.com/docs/guides/error-codes>, and
     /// `rate_limit_exceeded` in openai-python 3.41.0
     /// `types/responses/response_error.py:49`), which the gateway's own
-    /// `429`s carry too.
+    /// `429`s carry too. `previous_response_not_found` is the code a client
+    /// resends its history on (openai-python 3.41.0
+    /// `lib/responses_websocket/README.md`), whether the upstream or the
+    /// gateway could not find the response.
     pub(crate) fn code(&self) -> &'static str {
         match self {
             Self::ContextLengthExceeded => "context_length_exceeded",
@@ -114,6 +122,7 @@ impl PlatformErrorClass {
             Self::ContentFiltered => "content_filter",
             Self::Authentication => "invalid_api_key",
             Self::NotFound => "not_found",
+            Self::PreviousResponseNotFound => "previous_response_not_found",
             Self::UpstreamUnavailable => "upstream_unavailable",
             Self::Internal => "internal_error",
         }
@@ -129,17 +138,23 @@ impl PlatformErrorClass {
         crate::error::anthropic_kind_from_status(self.status())
     }
 
+    /// The field of the caller's request the class names, in every envelope
+    /// and stream frame.
+    pub(crate) fn param(&self) -> Option<String> {
+        match self {
+            Self::InvalidRequest { param } => param.clone(),
+            Self::PreviousResponseNotFound => Some("previous_response_id".into()),
+            _ => None,
+        }
+    }
+
     /// The OpenAI-shape envelope a caller receives for this class.
     pub(crate) fn envelope(&self) -> ErrorEnvelope {
-        let param = match self {
-            Self::InvalidRequest { param } => param.clone(),
-            _ => None,
-        };
         ErrorEnvelope {
             error: ErrorBody {
                 message: platform_message(self).to_string(),
                 kind: self.kind().to_string(),
-                param,
+                param: self.param(),
                 code: Some(self.code().to_string()),
                 budget: None,
                 policy: None,
@@ -164,9 +179,9 @@ pub(crate) fn responses_failed_code(class: &PlatformErrorClass) -> &'static str 
     match class {
         PlatformErrorClass::RateLimited => "rate_limit_exceeded",
         PlatformErrorClass::ContextLengthExceeded => "context_length_exceeded",
-        PlatformErrorClass::InvalidRequest { .. } | PlatformErrorClass::ContentFiltered => {
-            "invalid_prompt"
-        }
+        PlatformErrorClass::InvalidRequest { .. }
+        | PlatformErrorClass::ContentFiltered
+        | PlatformErrorClass::PreviousResponseNotFound => "invalid_prompt",
         PlatformErrorClass::Authentication
         | PlatformErrorClass::NotFound
         | PlatformErrorClass::UpstreamUnavailable
@@ -200,6 +215,7 @@ pub(crate) fn platform_message(class: &PlatformErrorClass) -> &'static str {
         }
         PlatformErrorClass::Authentication => "Invalid API key.",
         PlatformErrorClass::NotFound => "The requested resource was not found.",
+        PlatformErrorClass::PreviousResponseNotFound => "Previous response not found.",
         PlatformErrorClass::UpstreamUnavailable => {
             "The model is temporarily unavailable. Retry later."
         }
@@ -226,15 +242,14 @@ pub(crate) fn classify(err: &ProxyError) -> PlatformErrorClass {
             param: Some("model".into()),
         },
         // The gateway's own refusal of a `previous_response_id` it cannot
-        // open: a 400 `invalid_request_error` naming the field, the status,
-        // type and `param` of the upstream's own answer for one it does not
-        // have (<https://developers.openai.com/api/docs/guides/websocket-mode>).
-        // That answer is relayed with its own code and message
-        // ([`relayed_status`]); this refusal is the gateway's, and keeps the
-        // class.
-        ProxyError::ResponseNotFound => PlatformErrorClass::InvalidRequest {
-            param: Some("previous_response_id".into()),
-        },
+        // open (another tenant's, a forged one, one sealed under another
+        // secret): the status, type, `param` and code of the upstream's own
+        // answer for one it does not have
+        // (<https://developers.openai.com/api/docs/guides/websocket-mode>),
+        // which is relayed as sent ([`relayed_status`]). A client that
+        // resends its history on that code recovers either way, and the id
+        // still never opens.
+        ProxyError::ResponseNotFound => PlatformErrorClass::PreviousResponseNotFound,
         // The caller's own field, which the class names.
         ProxyError::StoredObjectReference(field) | ProxyError::ModelSelectorRefused(field) => {
             PlatformErrorClass::InvalidRequest {
@@ -693,15 +708,11 @@ pub(crate) fn relayed_responses_failure(frame: &[u8]) -> Option<Vec<u8>> {
 /// The flat Responses `error` event carrying `class`, numbered `seq` when
 /// the frame it replaces was.
 fn flat_responses_error(class: &PlatformErrorClass, seq: Option<&Value>) -> Value {
-    let param = match class {
-        PlatformErrorClass::InvalidRequest { param } => param.clone(),
-        _ => None,
-    };
     let mut flat = serde_json::json!({
         "type": "error",
         "code": class.code(),
         "message": platform_message(class),
-        "param": param,
+        "param": class.param(),
     });
     if let Some(seq) = seq {
         flat["sequence_number"] = seq.clone();
@@ -1164,6 +1175,13 @@ mod tests {
                 "The requested resource was not found.",
             ),
             (
+                PlatformErrorClass::PreviousResponseNotFound,
+                400,
+                "invalid_request_error",
+                "previous_response_not_found",
+                "Previous response not found.",
+            ),
+            (
                 PlatformErrorClass::UpstreamUnavailable,
                 503,
                 "server_error",
@@ -1602,13 +1620,14 @@ mod tests {
         assert_eq!(body_json(resp).await["error"]["type"], "overloaded_error");
     }
 
-    /// A response id the gateway cannot open is its own refusal: a 400 naming
-    /// the field, as the upstream answers a `previous_response_id` it does
-    /// not have. The upstream's own answer is relayed with its code, which
-    /// the OpenAI SDK tells clients to handle
-    /// (openai-python 3.41.0 `lib/responses_websocket/README.md`).
+    /// A response id the gateway cannot open is refused with the status,
+    /// type, field and code of the upstream's own answer for a
+    /// `previous_response_id` it does not have, which is relayed as sent. A
+    /// client that resends its history on that code
+    /// (openai-python 3.41.0 `lib/responses_websocket/README.md`) recovers
+    /// either way; only the message differs, the gateway's naming nothing.
     #[tokio::test]
-    async fn an_unknown_previous_response_is_the_gateways_class_and_the_upstreams_is_relayed() {
+    async fn an_unknown_previous_response_carries_the_upstreams_code_either_way() {
         let unknown = in_platform_mode(|| ProxyError::ResponseNotFound.into_response());
         let upstream = in_platform_mode(|| {
             let message = "Previous response with id 'resp_1' not found.";
@@ -1633,10 +1652,12 @@ mod tests {
         for body in [&unknown, &upstream] {
             assert_eq!(body["error"]["param"], "previous_response_id", "{body}");
             assert_eq!(body["error"]["type"], "invalid_request_error", "{body}");
+            assert_eq!(
+                body["error"]["code"], "previous_response_not_found",
+                "{body}"
+            );
         }
-        assert_eq!(unknown["error"]["code"], "invalid_request");
-        assert_eq!(unknown["error"]["message"], "The request is invalid.");
-        assert_eq!(upstream["error"]["code"], "previous_response_not_found");
+        assert_eq!(unknown["error"]["message"], "Previous response not found.");
         assert_eq!(
             upstream["error"]["message"],
             "Previous response with id 'resp_1' not found."
@@ -1831,6 +1852,10 @@ mod tests {
             (PlatformErrorClass::ContentFiltered, "invalid_prompt"),
             (PlatformErrorClass::Authentication, "server_error"),
             (PlatformErrorClass::NotFound, "server_error"),
+            (
+                PlatformErrorClass::PreviousResponseNotFound,
+                "invalid_prompt",
+            ),
             (PlatformErrorClass::UpstreamUnavailable, "server_error"),
             (PlatformErrorClass::Internal, "server_error"),
         ];

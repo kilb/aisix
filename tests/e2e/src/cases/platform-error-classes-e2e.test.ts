@@ -926,6 +926,32 @@ describe("platform mode: upstream failures reach the caller as the gateway's own
     });
   });
 
+  test("responses-native: a previous_response_id the gateway cannot open carries the code clients resend on", async (ctx) => {
+    if (!etcdReachable || !app) return ctx.skip();
+    // An id nobody was handed. Had it reached the upstream, the model's
+    // scenario would have answered with an outage.
+    const res = await fetch(`${app!.proxyUrl}/v1/responses`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${CALLER_KEY}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        model: modelName(RESPONSES_NATIVE, "unauthorized"),
+        input: "hi",
+        previous_response_id: "resp_0123456789abcdef0123456789abcdef",
+      }),
+    });
+    const answer: Answer = { status: res.status, headers: res.headers, text: await res.text() };
+    expect(answer.status, answer.text).toBe(400);
+    expect(JSON.parse(answer.text)).toEqual({
+      error: {
+        message: "Previous response not found.",
+        type: "invalid_request_error",
+        param: "previous_response_id",
+        code: "previous_response_not_found",
+      },
+    });
+    expectNoLeak(answer);
+  });
+
   test("messages-native: a stream the upstream cuts off ends with the class", async (ctx) => {
     if (!etcdReachable || !app) return ctx.skip();
     expectStreamEndsUnavailable(await call(MESSAGES_NATIVE, "truncated", true));
