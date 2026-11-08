@@ -1,6 +1,7 @@
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 
 import {
+  fundTenant,
   pollUntil,
   spawnManagedGateway,
   startControlPlane,
@@ -131,6 +132,7 @@ describe("a tenant's journey from signup to a working key, and the switches that
       current.version,
     );
     expect(granted.status, granted.text).toBe(200);
+    await fundTenant(cp!, tenantId, "100.00");
     await cp!.admin.waitTenantApplied(tenantId);
   });
 

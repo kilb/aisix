@@ -110,7 +110,7 @@ impl BillingMode {
         }
     }
 
-    fn parse(s: &str) -> Option<BillingMode> {
+    pub(crate) fn parse(s: &str) -> Option<BillingMode> {
         [BillingMode::Prepaid, BillingMode::Postpaid]
             .into_iter()
             .find(|mode| mode.as_str() == s)

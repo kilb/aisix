@@ -1,6 +1,7 @@
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 
 import {
+  fundTenant,
   pollUntil,
   spawnManagedGateway,
   startControlPlane,
@@ -42,6 +43,7 @@ describe("platform configuration rules at the gateway", () => {
     expect(created.status, created.text).toBe(201);
     const updated = await cp!.admin.patch(`/admin/tenants/${created.body.id}`, patch, created.body.version);
     expect(updated.status, updated.text).toBe(200);
+    await fundTenant(cp!, created.body.id, "100.00");
     return created.body.id;
   };
   const mint = async (tenantId: string, label: string): Promise<string> => {

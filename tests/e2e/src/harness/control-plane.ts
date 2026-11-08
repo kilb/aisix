@@ -580,3 +580,23 @@ export async function pollUntil<T>(
 export function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
+
+/**
+ * Funds `tenantId` so that its model calls are not refused for want of
+ * money, through the operator API: the tenant becomes postpaid with a credit
+ * limit of `creditLimitUsd` dollars. A prepaid tenant an operator creates
+ * holds nothing, and a prepaid tenant at 0 is refused at the gateway.
+ *
+ * The credit limit is settled before the answer, but the gateway learns of
+ * it with the next documents written for the tenant: a case calls this
+ * before it mints the tenant's key, whose authenticating is its readiness
+ * gate.
+ */
+export async function fundTenant(cp: ControlPlaneStack, tenantId: string, creditLimitUsd: string): Promise<void> {
+  const current = await cp.admin.get(`/admin/tenants/${tenantId}`);
+  if (current.status !== 200) throw new Error(`reading tenant ${tenantId} answered ${current.status}: ${current.text}`);
+  const mode = await cp.admin.patch(`/admin/tenants/${tenantId}`, { billing_mode: "postpaid" }, current.version);
+  if (mode.status !== 200) throw new Error(`making tenant ${tenantId} postpaid answered ${mode.status}: ${mode.text}`);
+  const limit = await cp.admin.patch(`/admin/tenants/${tenantId}/billing`, { credit_limit_usd: creditLimitUsd });
+  if (limit.status !== 200) throw new Error(`setting the credit limit of ${tenantId} answered ${limit.status}: ${limit.text}`);
+}

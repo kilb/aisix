@@ -1,6 +1,7 @@
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 
 import {
+  fundTenant,
   pollUntil,
   spawnManagedGateway,
   startControlPlane,
@@ -93,6 +94,7 @@ describe("usage delivered to the control plane", () => {
       tenant.body.version,
     );
     expect(granted.status, granted.text).toBe(200);
+    await fundTenant(cp, tenantId, "100.00");
     const minted = await cp.admin.post(`/admin/tenants/${tenantId}/keys`, { label: "usage-caller" });
     expect(minted.status, minted.text).toBe(201);
     keyId = minted.body.key.id;

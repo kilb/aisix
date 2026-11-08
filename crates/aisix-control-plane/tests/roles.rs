@@ -171,6 +171,13 @@ fn fixture(method: &str, path: &str, target: &SeededOperator) -> (String, Option
         ("GET", "/admin/pricing/tenants/{id}") => {
             (format!("/admin/pricing/tenants/{}", Uuid::nil()), None)
         }
+        // Billing accounts. The tenant matches nothing: 404 once the role
+        // check passed, so no limit is written.
+        ("GET", "/admin/billing/accounts") => (path.to_string(), None),
+        ("GET" | "PATCH", "/admin/tenants/{id}/billing") => (
+            format!("/admin/tenants/{}/billing", Uuid::nil()),
+            (method == "PATCH").then(|| json!({"credit_limit_usd": "1.00"})),
+        ),
         _ => panic!("no fixture for {method} {path}: add one to tests/roles.rs"),
     }
 }
