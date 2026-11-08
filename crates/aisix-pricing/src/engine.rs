@@ -11,7 +11,7 @@ use chrono::{DateTime, TimeDelta, Utc};
 use serde::Serialize;
 
 use crate::book::{CostSource, PriceBook};
-use crate::rates::{Dimension, MicroUsd, Rate, Rates, ServiceTier};
+use crate::rates::{CnyPerUsd, Dimension, MicroCny, MicroUsd, Rate, Rates, ServiceTier};
 use crate::usage::{quantities, BillableUsage, Inconsistency, Quantities};
 use crate::ENGINE_VERSION;
 
@@ -189,8 +189,10 @@ pub enum PricingError {
     /// A successful row with no tokens of an operation priced in other units.
     #[error("operation {0} reported no quantity this engine can price")]
     UnpricedOperation(String),
-    /// Unreachable within `Rate::MAX` and `u32` counters.
-    #[error("the amount does not fit in i64 micro-USD")]
+    /// A discount above 10000 bps, or an amount past `i64`. The USD charge
+    /// cannot get there within `Rate::MAX` and `u32` counters; the CNY charge
+    /// can, at the largest quantities and rates.
+    #[error("the amount does not fit in i64")]
     Overflow,
 }
 
@@ -390,6 +392,38 @@ pub fn price_event(
     })
 }
 
+/// What `lines` cost a tenant at `cny` CNY per USD after a discount of
+/// `discount_bps`: `⌈Σ quantity × rate × cny × (10000 − bps) / 10¹⁴⌉` µ¥.
+///
+/// The CNY rate and the discount are inside the one rounding, upward, so no
+/// factor is rounded on its own and any amount above zero is at least 1 µ¥.
+/// A discount above 10000 bps, and an amount past `i64`, are `Overflow`.
+/// Lines a row produces stay exact in `u128` (`MAX_QUANTITY` in `rates.rs`);
+/// lines past that bound are `Overflow` too, never a wrapped amount.
+pub fn charge_micro_cny(
+    lines: &[ChargeLine],
+    cny: CnyPerUsd,
+    discount_bps: u16,
+) -> Result<MicroCny, PricingError> {
+    let kept_bps = WHOLE_BPS
+        .checked_sub(u128::from(discount_bps))
+        .ok_or(PricingError::Overflow)?;
+    let factor = u128::from(cny.0) * kept_bps;
+    // A u64 × u64 product is below u128::MAX; only the rest is checked.
+    let numerator = lines
+        .iter()
+        .try_fold(0u128, |n, l| {
+            (u128::from(l.quantity) * u128::from(l.rate.0))
+                .checked_mul(factor)
+                .and_then(|line| n.checked_add(line))
+        })
+        .ok_or(PricingError::Overflow)?;
+    let divisor = PER_MILLION * u128::from(CnyPerUsd::ONE.0) * WHOLE_BPS;
+    i64::try_from(numerator.div_ceil(divisor))
+        .map(MicroCny)
+        .map_err(|_| PricingError::Overflow)
+}
+
 /// What the dispatched upstream cost the platform, at `tier` and the band
 /// the row selects. `None` when the row does not name its upstream, or the
 /// book knows no usable cost for it: no readable cost price, no rates for
@@ -491,7 +525,7 @@ mod tests {
 
     use crate::book::{CostPriceRow, DiscountRow, PriceRows, SellPriceRow};
     use crate::catalogue::Catalogue;
-    use crate::rates::RateCard;
+    use crate::rates::{RateCard, MAX_QUANTITY};
 
     /// 2026-11-06T00:00:01Z: when the control plane received the test rows.
     const RECEIVED: DateTime<Utc> = match DateTime::from_timestamp(1_793_923_201, 0) {
@@ -1617,6 +1651,87 @@ mod tests {
         );
     }
 
+    // ---- the CNY charge ----
+
+    fn line(dimension: Dimension, quantity: u64, rate: &str) -> ChargeLine {
+        ChargeLine {
+            dimension,
+            quantity,
+            rate: Rate::parse(rate).unwrap(),
+        }
+    }
+
+    #[test]
+    fn the_rate_and_the_discount_are_inside_the_one_rounding() {
+        let lines = [
+            line(Dimension::Input, 1_000, "4"),
+            line(Dimension::Output, 500, "20"),
+        ];
+        let at = CnyPerUsd::parse("7.2").unwrap();
+        assert_eq!(charge_micro_cny(&lines, at, 0), Ok(MicroCny(100_800)));
+        assert_eq!(charge_micro_cny(&lines, at, 1_000), Ok(MicroCny(90_720)));
+        // 1.08 µ¥, rounded up once. Rounding the USD amount first would give
+        // ⌈0.15⌉ = 1 µ$, so ⌈7.2⌉ = 8 µ¥.
+        let one = [line(Dimension::Input, 1, "0.15")];
+        assert_eq!(charge_micro_cny(&one, at, 0), Ok(MicroCny(2)));
+        // 0.972 µ¥ with the discount. Rounding at the rate first would give
+        // ⌈1.08⌉ = 2 µ¥, so ⌈1.8⌉ = 2 µ¥.
+        assert_eq!(charge_micro_cny(&one, at, 1_000), Ok(MicroCny(1)));
+        assert_eq!(charge_micro_cny(&lines, CnyPerUsd(0), 0), Ok(MicroCny(0)));
+        assert_eq!(charge_micro_cny(&lines, at, 10_000), Ok(MicroCny(0)));
+        assert_eq!(
+            charge_micro_cny(&lines, at, 10_001),
+            Err(PricingError::Overflow)
+        );
+    }
+
+    #[test]
+    fn every_quantity_at_its_largest_never_panics() {
+        let largest = u64::try_from(MAX_QUANTITY).unwrap();
+        let lines: Vec<_> = Dimension::ALL
+            .into_iter()
+            .map(|dimension| ChargeLine {
+                dimension,
+                quantity: largest,
+                rate: Rate::MAX,
+            })
+            .collect();
+        assert_eq!(
+            charge_micro_cny(&lines, CnyPerUsd::MAX, 0),
+            Err(PricingError::Overflow)
+        );
+    }
+
+    /// The function takes any lines, not only those a row produces.
+    #[test]
+    fn a_charge_is_exact_up_to_i64_max_and_never_wraps_past_it() {
+        let input = |quantity, rate| ChargeLine {
+            dimension: Dimension::Input,
+            quantity,
+            rate,
+        };
+        // USD 1 per million units: 1 µ$, so 1 µ¥ at a rate of one, per unit.
+        let usd_one = Rate(1_000_000);
+        let edge = u64::try_from(i64::MAX).unwrap();
+        assert_eq!(
+            charge_micro_cny(&[input(edge, usd_one)], CnyPerUsd::ONE, 0),
+            Ok(MicroCny(i64::MAX))
+        );
+        assert_eq!(
+            charge_micro_cny(&[input(edge + 1, usd_one)], CnyPerUsd::ONE, 0),
+            Err(PricingError::Overflow)
+        );
+        // Past every bound, so past u128 too: still an error.
+        assert_eq!(
+            charge_micro_cny(
+                &[input(u64::MAX, Rate(u64::MAX)); 11],
+                CnyPerUsd(u32::MAX),
+                0
+            ),
+            Err(PricingError::Overflow)
+        );
+    }
+
     // ---- properties ----
 
     /// A counter up to 5,000,000: small ones meet at the boundaries.
@@ -1688,6 +1803,84 @@ mod tests {
     /// A rate of at least `min`, in micro-USD per million units, up to the cap.
     fn rate(min: u64) -> impl Strategy<Value = u64> {
         prop_oneof![min..=64, min..=100_000_000, min..=Rate::MAX.0]
+    }
+
+    /// A quantity up to `MAX_QUANTITY`, the most one dimension of a row
+    /// bills: small ones meet the rounding, large ones the bound.
+    fn quantity() -> impl Strategy<Value = u64> {
+        let largest = u64::try_from(MAX_QUANTITY).unwrap();
+        prop_oneof![0u64..=64, 0u64..=5_000_000, 0..=largest]
+    }
+
+    /// Lines as `price_event` writes them: at most one per dimension, in
+    /// `Dimension` order, each quantity up to `MAX_QUANTITY` and each rate
+    /// up to `Rate::MAX`. Half of them carry every dimension in the top
+    /// eighth of its quantity and rate: only there can a charge pass
+    /// `i64::MAX`, and ordinary lines never reach it.
+    fn any_lines() -> impl Strategy<Value = Vec<ChargeLine>> {
+        let largest = u64::try_from(MAX_QUANTITY).unwrap();
+        let ordinary = proptest::array::uniform11(proptest::option::of((quantity(), rate(0))));
+        let top = proptest::array::uniform11(
+            (
+                largest - largest / 8..=largest,
+                Rate::MAX.0 - Rate::MAX.0 / 8..=Rate::MAX.0,
+            )
+                .prop_map(Some),
+        );
+        prop_oneof![ordinary, top].prop_map(|picked| {
+            Dimension::ALL
+                .into_iter()
+                .zip(picked)
+                .filter_map(|(dimension, line)| {
+                    line.map(|(quantity, rate)| ChargeLine {
+                        dimension,
+                        quantity,
+                        rate: Rate(rate),
+                    })
+                })
+                .collect()
+        })
+    }
+
+    /// `Σ quantity × rate`, in units of 10⁻¹² USD.
+    fn exact_usd(lines: &[ChargeLine]) -> u128 {
+        lines
+            .iter()
+            .map(|l| u128::from(l.quantity) * u128::from(l.rate.0))
+            .sum()
+    }
+
+    proptest! {
+        /// At a rate of one and no discount, the CNY charge is the P2a USD
+        /// charge, `⌈Σ quantity × rate / 10⁶⌉`, in the same number.
+        #[test]
+        fn at_rate_one_the_cny_charge_is_the_usd_charge(lines in any_lines()) {
+            let usd = i64::try_from(exact_usd(&lines).div_ceil(1_000_000)).unwrap();
+            prop_assert_eq!(charge_micro_cny(&lines, CnyPerUsd::ONE, 0), Ok(MicroCny(usd)));
+        }
+
+        /// The charge is the least whole µ¥ at or above the exact amount, and
+        /// `Overflow` exactly when that does not fit in `i64`.
+        #[test]
+        fn the_charge_is_the_exact_amount_rounded_up_once(
+            lines in any_lines(),
+            e4 in 0u32..=1_000_000,
+            bps in 0u16..=10_000,
+        ) {
+            let n = exact_usd(&lines) * u128::from(e4) * u128::from(10_000 - bps);
+            let per = 10u128.pow(14);
+            match charge_micro_cny(&lines, CnyPerUsd(e4), bps) {
+                Ok(MicroCny(c)) => {
+                    let c = u128::try_from(c).unwrap();
+                    prop_assert!(c * per >= n, "{} µ¥ is below {}e-14", c, n);
+                    prop_assert!(c == 0 || (c - 1) * per < n, "{} µ¥ is above ⌈{}e-14⌉", c, n);
+                }
+                Err(e) => {
+                    prop_assert_eq!(e, PricingError::Overflow);
+                    prop_assert!(n.div_ceil(per) > u128::try_from(i64::MAX).unwrap(), "{}", n);
+                }
+            }
+        }
     }
 
     /// One rate set: `values` in `Dimension::ALL` order, each optional rate
