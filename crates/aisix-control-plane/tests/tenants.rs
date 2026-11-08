@@ -1635,6 +1635,19 @@ async fn every_tenant_write_takes_the_tenant_before_the_resources_lock() {
             )),
             200,
         ),
+        // A grant change takes the resources lock before it projects.
+        (
+            "PATCH /admin/tenants/{id} (grants)",
+            Box::pin(fire(
+                cp.clone(),
+                "PATCH",
+                format!("/admin/tenants/{tenant}"),
+                op.clone(),
+                Some(3),
+                Some(json!({"allowed_model_ids": [model]})),
+            )),
+            200,
+        ),
         (
             "POST /admin/tenants/{id}/keys",
             Box::pin(fire(

@@ -1245,14 +1245,10 @@ async fn every_marking_path_takes_the_account_before_the_resources_lock() {
     assert_eq!(r.body["changed"], 1, "{r:?}");
     let run = r.body["id"].as_str().expect("a run id").to_string();
     let applier = Arc::new(cp.admin_login_seeded(OperatorRole::Admin).await);
+    // A tenant edit that moves no money and a model delete take no account
+    // (`no_edit_that_moves_no_money_waits_on_a_held_account`); their lock
+    // order is in `every_tenant_write_takes_the_tenant_before_the_resources_lock`.
     let cases: Vec<(&str, Uuid, Request, u16)> = vec![
-        // A grant change takes the resources lock before it projects.
-        (
-            "PATCH /admin/tenants/{id} (grants)",
-            tenant,
-            patch(json!({"allowed_model_ids": [model]})),
-            200,
-        ),
         (
             "PATCH /admin/tenants/{id} (billing mode)",
             tenant,
@@ -1275,19 +1271,6 @@ async fn every_marking_path_takes_the_account_before_the_resources_lock() {
             "POST /admin/tenants/{id}/approve",
             pending,
             post(format!("/admin/tenants/{pending}/approve")),
-            200,
-        ),
-        // A model delete re-projects every tenant it is withdrawn from.
-        (
-            "DELETE /admin/resources/models/{id}",
-            tenant,
-            {
-                let (cp, admin) = (cp.clone(), admin.clone());
-                let path = format!("/admin/resources/models/{model}");
-                Box::pin(async move {
-                    send_at(&cp, &admin, reqwest::Method::DELETE, &path, 1, None).await
-                })
-            },
             200,
         ),
         (
@@ -1387,4 +1370,112 @@ async fn every_marking_path_takes_the_account_before_the_resources_lock() {
         let status = waits_for_the_account_first(&cp, held, what, request).await;
         assert_eq!(status, expected, "{what}");
     }
+}
+
+/// A tenant edit that moves no money and decides no mark (a rename, a grant,
+/// its limits or its groups), and a model delete, which only withdraws a
+/// model from the tenants that hold it, leave the tenant's billing account
+/// to usage intake: each is answered while another transaction holds it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn no_edit_that_moves_no_money_waits_on_a_held_account() {
+    let Some(cp) = TestCp::start_with(|cfg| cfg.db_lock_timeout_ms = 60_000).await else {
+        return;
+    };
+    let admin = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let tenant = support::world::seed_tenant(&cp, &admin).await;
+    let model = seed_model(&cp, &admin).await;
+    let r = patch_tenant(&cp, &admin, tenant, json!({"allowed_model_ids": [model]})).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    seed_key(&cp, &admin, tenant, None).await;
+    let before = live_mark(cp.db(), tenant).await.doc;
+
+    let mut holder = cp.db().pool().begin().await.expect("begin");
+    sqlx::query("SELECT 1 FROM billing_accounts WHERE tenant_id = $1 FOR UPDATE")
+        .bind(tenant)
+        .execute(&mut *holder)
+        .await
+        .expect("hold the account");
+    for (what, body) in [
+        ("a rename", json!({"name": "renamed-7c1"})),
+        ("a grant", json!({"allowed_model_ids": [model]})),
+        ("limits", json!({"limits": {"rpm": 600}})),
+        (
+            "groups",
+            json!({"allowed_provider_groups": ["shared", "extra-7c1"]}),
+        ),
+    ] {
+        let r = tokio::time::timeout(
+            Duration::from_secs(10),
+            patch_tenant(&cp, &admin, tenant, body),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("PATCH /admin/tenants/{{id}} ({what}) waited for the account"));
+        assert_eq!(r.status, 200, "{what}: {r:?}");
+    }
+    let path = format!("/admin/resources/models/{model}");
+    let r = tokio::time::timeout(
+        Duration::from_secs(10),
+        send_at(&cp, &admin, reqwest::Method::DELETE, &path, 1, None),
+    )
+    .await
+    .expect("DELETE /admin/resources/models/{id} waited for the account");
+    assert_eq!(r.status, 200, "{r:?}");
+    holder.rollback().await.expect("release the account");
+    assert_eq!(live_mark(cp.db(), tenant).await.doc, before);
+}
+
+/// While a model delete waits for the resources lock behind another write,
+/// a batch charging a tenant that holds the model is stored: the delete
+/// holds the tenant's row, which intake never waits on, and not its
+/// account.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_model_delete_never_makes_intake_wait() {
+    let Some(w) = world().await else { return };
+    let model = seed_model(&w.cp, &w.admin).await;
+    price(&w.cp, model).await;
+    let r = patch_tenant(
+        &w.cp,
+        &w.admin,
+        w.tenant,
+        json!({"allowed_model_ids": [model]}),
+    )
+    .await;
+    assert_eq!(r.status, 200, "{r:?}");
+    set_account(w.cp.db(), w.tenant, 1_000_000, None).await;
+    settle(&w.cp, w.tenant).await;
+
+    // A long write of gateway documents, as every one takes the lock.
+    let mut writer = w.cp.db().pool().begin().await.expect("begin");
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(RESOURCES_LOCK_KEY)
+        .execute(&mut *writer)
+        .await
+        .expect("hold the resources lock");
+    let path = format!("/admin/resources/models/{model}");
+    let delete = send_at(&w.cp, &w.admin, reqwest::Method::DELETE, &path, 1, None);
+    let probe = async {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !resources_lock_queued(w.cp.db()).await {
+            assert!(
+                Instant::now() < deadline,
+                "the model delete never queued for the resources lock"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let delivered = tokio::time::timeout(
+            Duration::from_secs(2),
+            deliver(&w.dp, Uuid::new_v4(), rows(&w, model, "deleting", 1)),
+        )
+        .await;
+        writer.rollback().await.expect("end the write");
+        delivered
+    };
+    let (deleted, delivered) = tokio::join!(delete, probe);
+    let delivered = delivered.expect("the batch waited behind the model delete");
+    assert_eq!(delivered.status, 200, "{delivered:?}");
+    assert_eq!(deleted.status, 200, "{deleted:?}");
+    assert_eq!(
+        account(w.cp.db(), w.tenant).await.balance_micro_usd,
+        1_000_000 - 680
+    );
 }

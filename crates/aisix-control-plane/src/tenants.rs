@@ -497,6 +497,19 @@ fn steps(tenant: &TenantRow) -> Vec<Step> {
     steps
 }
 
+/// Whether a projection runs its billing step, which writes the tenant's
+/// balance and quota marks (`marks::project`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BillingStep {
+    /// Run it: the status, the billing mode or the money moved, and the
+    /// caller holds the tenant's billing lock ([`lock_billing`]).
+    Run,
+    /// Skip it: nothing a mark is decided from moved, so the marks stand,
+    /// and the caller holds the tenant's row alone ([`lock`]), leaving its
+    /// account to usage intake.
+    Skip,
+}
+
 /// Writes the documents tenant `id` derives, as its row now stands, in the
 /// order [`steps`] gives: the team, its members' users, its balance mark,
 /// its keys, and its limits policy, which is written while the tenant is
@@ -505,15 +518,41 @@ fn steps(tenant: &TenantRow) -> Vec<Step> {
 /// caller holds the tenant's billing lock ([`lock_billing`]), taken before
 /// anything that takes the resources lock, since the balance mark is decided
 /// on the account; the transaction creating the tenant holds its new account
-/// already, and the internal tenant has no mark.
+/// already, and the internal tenant has no mark. A caller that moves nothing
+/// a mark depends on calls [`project_without_marks`] instead.
 pub async fn project(conn: &mut PgConnection, ctx: &WriteCtx, id: Uuid) -> Result<(), ApiError> {
+    project_with(conn, ctx, id, BillingStep::Run).await
+}
+
+/// [`project`] without the billing step, for a caller holding only the
+/// tenant's row: an edit that changes neither the status nor the billing
+/// mode nor any money (a rename, a grant, limits, groups), and a model
+/// delete. None of them can open a key, so the marks already written stand.
+async fn project_without_marks(
+    conn: &mut PgConnection,
+    ctx: &WriteCtx,
+    id: Uuid,
+) -> Result<(), ApiError> {
+    project_with(conn, ctx, id, BillingStep::Skip).await
+}
+
+async fn project_with(
+    conn: &mut PgConnection,
+    ctx: &WriteCtx,
+    id: Uuid,
+    billing: BillingStep,
+) -> Result<(), ApiError> {
     let tenant = lock(&mut *conn, id).await?;
     let owner = owner(id);
     for step in steps(&tenant) {
         match step {
             Step::Team(doc) => put(&mut *conn, ctx, Kind::Teams, id, &doc, &owner).await?,
             Step::Users => members::put_missing_users(&mut *conn, ctx, id).await?,
-            Step::Billing => marks::project(&mut *conn, ctx, &tenant).await?,
+            Step::Billing => {
+                if billing == BillingStep::Run {
+                    marks::project(&mut *conn, ctx, &tenant).await?
+                }
+            }
             Step::Policy(doc) => {
                 let policy_id = match tenant.limits_policy_id {
                     Some(policy_id) => policy_id,
@@ -741,9 +780,9 @@ async fn holders_of(conn: &mut PgConnection, model_id: Uuid) -> Result<Vec<Uuid>
 /// between, which cannot be locked now without breaking the lock order,
 /// fails the delete as `503 unavailable`, to be retried.
 ///
-/// Each holder's projection decides its balance mark, so the holders'
-/// billing accounts are locked too, after their rows and before the
-/// resources lock, as [`lock_billing`] takes them.
+/// A model delete moves no money and opens no key, so each holder is
+/// projected without its marks ([`project_without_marks`]) and its billing
+/// account is not taken: its usage intake goes on while the delete runs.
 pub async fn on_model_deleted(
     conn: &mut PgConnection,
     ctx: &WriteCtx,
@@ -751,7 +790,6 @@ pub async fn on_model_deleted(
 ) -> Result<(), ApiError> {
     let mut holders = holders_of(&mut *conn, model_id).await?;
     lock_many(&mut *conn, &mut holders).await?;
-    ledger::lock_accounts(&mut *conn, &mut holders).await?;
     resources_lock(&mut *conn).await?;
     if holders_of(&mut *conn, model_id).await? != holders {
         tracing::warn!(%model_id, "a grant of the model was added while it was being deleted");
@@ -778,7 +816,7 @@ pub async fn on_model_deleted(
         .execute(&mut *conn)
         .await
         .map_err(DbError::from)?;
-        project(&mut *conn, ctx, id).await?;
+        project_without_marks(&mut *conn, ctx, id).await?;
     }
     Ok(())
 }
@@ -1297,14 +1335,23 @@ pub async fn update(
     .filter_map(|(field, given)| given.then_some(field))
     .collect();
     fields.sort_unstable();
+    // A billing mode change moves the balance mark, so it takes the billing
+    // lock and the projection writes the marks. Every other field moves no
+    // money and decides no mark: the tenant's row alone, and the marks stand.
+    let billing = if req.billing_mode.is_some() {
+        BillingStep::Run
+    } else {
+        BillingStep::Skip
+    };
     let ctx = WriteCtx::of(&state);
     let view = state
         .db
         .tx(move |conn| {
             async move {
-                // The billing lock: the projection below decides the balance
-                // mark, and a billing mode change moves it.
-                let (current, _) = lock_billing(&mut *conn, id).await?;
+                let current = match billing {
+                    BillingStep::Run => lock_billing(&mut *conn, id).await?.0,
+                    BillingStep::Skip => lock(&mut *conn, id).await?,
+                };
                 if current.version != expected {
                     return Err(ApiError::version_mismatch(current.version));
                 }
@@ -1344,7 +1391,7 @@ pub async fn update(
                 .execute(&mut *conn)
                 .await
                 .map_err(DbError::from)?;
-                project(&mut *conn, &ctx, id).await?;
+                project_with(&mut *conn, &ctx, id, billing).await?;
                 audit::record(
                     &mut *conn,
                     audit_entry(&auth, "tenant.update", id, json!({ "fields": fields })),

@@ -59,15 +59,22 @@ way.
   account right after its row**: `tenants::lock_billing`, as the first lock of
   its transaction, or `tenants::lock_many_billing` (each row, then its
   account, in ascending id) for several, as a re-pricing apply does. That is
-  every ledger posting, credit-limit or quota change, and every
-  `tenants::project`, whose billing step writes the balance mark
-  (`marks::project`). An account is never taken after the resources lock, so
-  a path that locks its tenant twice moves only the first lock to
-  `lock_billing`. Every other tenant edit keeps `tenants::lock`, which leaves
-  the account to usage intake. Intake locks accounts only, in ascending tenant
-  id, never waits on a tenant row and never takes the resources lock: it flags
-  a crossing, and the settler (`billing::settler`) writes the mark after
-  commit. Intake updates each account once, flag included
+  every ledger posting, credit-limit or quota change, and every tenant
+  projection that runs its billing step: `tenants::project`, whose billing
+  step writes the balance and quota marks (`marks::project`), called by a
+  tenant's creation, its approval, suspension and reactivation, and a change
+  of its billing mode. A tenant edit that moves no money and decides no mark
+  (a rename, a grant, its limits or its groups) and a model delete, which
+  withdraws the model from every tenant holding it, project with
+  `tenants::project_without_marks`, which skips the billing step, and take
+  the tenant's row alone (`no_edit_that_moves_no_money_waits_on_a_held_account`,
+  `a_model_delete_never_makes_intake_wait`). An account is never taken after
+  the resources lock, so a path that locks its tenant twice moves only the
+  first lock to `lock_billing`. Every other tenant edit keeps `tenants::lock`,
+  which leaves the account to usage intake. Intake locks accounts only, in
+  ascending tenant id, never waits on a tenant row and never takes the
+  resources lock: it flags a crossing, and the settler (`billing::settler`)
+  writes the mark after commit. Intake updates each account once, flag included
   (`ledger::post_flagging`): a second update of a row in one transaction has
   the foreign key's check key-share its tenant row, which a held tenant would
   make intake wait on. So every flag is decided before the posting, the
