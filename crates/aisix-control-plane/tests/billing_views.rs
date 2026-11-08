@@ -55,6 +55,7 @@ const LINE_KEYS: [&str; 3] = ["dimension", "quantity", "rate"];
 /// A model named `name` for tenants, on a provider key and groups that carry
 /// the channel fixture tokens; granted to `tenant` when given.
 async fn model(w: &World, name: &str, grant_to: Option<Uuid>) -> Uuid {
+    support::seed_group(&w.cp, &w.admin, GROUP).await;
     let pk =
         w.cp.send(
             "POST",

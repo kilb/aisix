@@ -15,6 +15,7 @@ use tokio::task::JoinHandle;
 pub mod audit;
 pub mod auth;
 pub mod billing;
+pub mod channels;
 pub mod compat;
 pub mod config;
 pub mod crypto;

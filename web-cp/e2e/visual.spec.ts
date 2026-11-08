@@ -21,8 +21,13 @@ let stack: Stack;
 const PASSWORD = "visual-pass-3c8x";
 
 test.beforeAll(async () => {
+
   test.setTimeout(STACK_START_TIMEOUT_MS);
   stack = await startStack();
+  // Every write that names a group names a live one: the accounts and the
+  // tenant edits below included. A name a test here creates itself is
+  // skipped.
+  await stack.admin.seedGroups(["apac-low", "eu-pool", "batch"]);
 
   const accounts: Record<string, string[]> = { "pool-a-01": ["shared", "apac-low"], "pool-e-01": ["eu-pool", "batch"] };
   const accountIds: string[] = [];
@@ -57,8 +62,13 @@ test.beforeAll(async () => {
     { allowed_model_ids: modelIds.slice(0, 2), allowed_provider_groups: ["shared", "apac-low"] },
     current.version,
   );
-  await stack.admin.post(`/admin/tenants/${active}/keys`, { label: "prod-backend" });
-  await stack.admin.post(`/admin/tenants/${active}/keys`, { label: "ci-runner" });
+  // A tenant with two groups names one for each key, by id from the groups
+  // list.
+  const { items: groups } = await stack.admin.get("/admin/provider-groups");
+  const shared = (groups as { id: string; name: string }[]).find((g) => g.name === "shared");
+  if (!shared) throw new Error(`no shared group in ${JSON.stringify(groups)}`);
+  await stack.admin.post(`/admin/tenants/${active}/keys`, { label: "prod-backend", group_id: shared.id });
+  await stack.admin.post(`/admin/tenants/${active}/keys`, { label: "ci-runner", group_id: shared.id });
   await signUp("Kestrel Labs", "owner@kestrel-3c8.test");
   const closed = await signUp("Quarry Lane Research Collective", "owner@quarry-3c8.test");
   await stack.admin.post(`/admin/tenants/${closed}/approve`);

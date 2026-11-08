@@ -91,6 +91,7 @@ describe("platform configuration rules at the gateway", () => {
     // The group a tenant is assigned must exist: a key names it, and
     // `grp-alpha-7c1` was only a name in the account's document.
     await cp.admin.createGroup("grp-alpha-7c1", "甲组 7c1");
+    await cp.admin.createGroup("grp-beta-3e9", "乙组 3e9");
     const alphaModel = await direct("knob-alpha-e2e", await account("acct-alpha-e2e", alpha, ["grp-alpha-7c1"]));
     const betaModel = await direct("knob-beta-e2e", await account("acct-beta-e2e", beta, ["grp-beta-3e9"]));
     // B first, round robin: a group check that let B through would show.

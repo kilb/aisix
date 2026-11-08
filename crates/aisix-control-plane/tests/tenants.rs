@@ -382,6 +382,9 @@ async fn a_new_tenant_starts_in_the_default_groups() {
     );
 
     // Changed defaults reach the tenants created afterwards, and only them.
+    // A default names only live groups.
+    let session = cp.admin_login_seeded(OperatorRole::Admin).await;
+    support::seed_group(&cp, &session, "grp-eu-5d2").await;
     let changed = json!({"rpm": 600, "tpm": 50000, "key_rpm_max": 60, "default_provider_groups": ["grp-eu-5d2", "shared"]});
     let r = admin
         .put("/admin/settings/tenant-defaults", changed.clone())
@@ -477,6 +480,82 @@ async fn a_new_tenant_starts_in_the_default_groups() {
     );
     let r = admin.get("/admin/settings/tenant-defaults").await;
     assert_eq!(r.status, 200, "{r:?}");
+}
+
+/// A control character in a group name is refused at its own index, on both
+/// paths that carry a tenant's group list. Postgres rejects such a
+/// parameter, so a name reaching `groups::lock_named`'s bind answers `500`
+/// instead of naming the field; the tenant's own name is refused the same
+/// way by `tenant_name`.
+#[tokio::test]
+async fn a_control_character_in_a_group_name_is_422_at_its_index() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let admin = Admin::as_role(&cp, OperatorRole::Admin).await;
+    let session = cp.admin_login_seeded(OperatorRole::Admin).await;
+    let tenant = support::world::seed_tenant(&cp, &session).await;
+    let name = "grp\u{0}ctl-7c1";
+
+    let r = admin
+        .patch_tenant(
+            &tenant.to_string(),
+            1,
+            json!({"allowed_provider_groups": ["shared", name]}),
+        )
+        .await;
+    assert_eq!(r.status, 422, "{r:?}");
+    assert_eq!(r.body["code"], "validation_failed", "{r:?}");
+    assert_eq!(
+        r.body["details"][0]["path"], "/allowed_provider_groups/1",
+        "{r:?}"
+    );
+    assert_eq!(
+        r.body["details"][0]["message"], "分组名称不能包含控制字符",
+        "{r:?}"
+    );
+
+    let r = cp
+        .send(
+            "PUT",
+            "/admin/settings/tenant-defaults",
+            Some(&admin.cookie),
+            Some(json!({"concurrency": 20, "default_provider_groups": ["shared", name]})),
+        )
+        .await;
+    assert_eq!(r.status, 422, "{r:?}");
+    assert_eq!(r.body["code"], "validation_failed", "{r:?}");
+    assert_eq!(
+        r.body["details"][0]["path"], "/default_provider_groups/1",
+        "{r:?}"
+    );
+    assert_eq!(
+        r.body["details"][0]["message"], "分组名称不能包含控制字符",
+        "{r:?}"
+    );
+
+    // Neither refusal wrote anything: the tenant and the defaults keep the
+    // group they had, and no `500` reached either path.
+    let groups: Vec<String> =
+        sqlx::query_scalar("SELECT unnest(allowed_provider_groups) FROM tenants WHERE id = $1")
+            .bind(tenant)
+            .fetch_all(cp.db().pool())
+            .await
+            .expect("read the tenant's groups");
+    assert_eq!(groups, vec!["shared".to_string()]);
+    let r = cp
+        .send(
+            "GET",
+            "/admin/settings/tenant-defaults",
+            Some(&admin.cookie),
+            None,
+        )
+        .await;
+    assert_eq!(
+        r.body["default_provider_groups"],
+        json!(["shared"]),
+        "{r:?}"
+    );
 }
 
 /// Defaults that name no group (an edit made outside the API, or a row
@@ -973,7 +1052,10 @@ async fn a_wildcard_or_ensemble_model_cannot_be_granted_to_a_customer() {
         .await;
     assert_eq!(r.status, 200, "{r:?}");
 
-    // Group names are checked as well.
+    // Group names are checked as well: a well-formed name that is no live
+    // group is refused at its index, as a malformed one is.
+    let session = cp.admin_login_seeded(OperatorRole::Admin).await;
+    support::seed_group(&cp, &session, "grp-eu-5d2").await;
     let r = admin
         .patch_tenant(
             &id,
@@ -1244,57 +1326,11 @@ async fn tenant_names_may_repeat() {
     );
 }
 
-#[tokio::test]
-async fn provider_groups_are_summarised_from_provider_keys() {
-    let Some(cp) = TestCp::start().await else {
-        return;
-    };
-    let admin = Admin::as_role(&cp, OperatorRole::Operator).await;
-    let beta = admin
-        .create(
-            "provider_keys",
-            provider_key("acct-beta-7c1", json!(["grp-b-7c1", "grp-a-7c1"])),
-        )
-        .await;
-    let alpha = admin
-        .create(
-            "provider_keys",
-            provider_key("acct-alpha-7c1", json!(["grp-a-7c1"])),
-        )
-        .await;
-    admin
-        .create("provider_keys", provider_key("acct-none-7c1", json!([])))
-        .await;
-    let gone = admin
-        .create(
-            "provider_keys",
-            provider_key("acct-gone-7c1", json!(["grp-gone-7c1"])),
-        )
-        .await;
-    let r = admin
-        .delete(
-            &format!("/admin/resources/provider_keys/{gone}"),
-            Some("\"1\""),
-        )
-        .await;
-    assert_eq!(r.status, 200, "{r:?}");
-
-    let viewer = Admin::as_role(&cp, OperatorRole::Viewer).await;
-    let r = viewer.get("/admin/provider-groups").await;
-    assert_eq!(r.status, 200, "{r:?}");
-    assert_eq!(
-        r.body,
-        json!({"items": [
-            {"name": "grp-a-7c1", "provider_keys": [
-                {"id": alpha, "display_name": "acct-alpha-7c1"},
-                {"id": beta, "display_name": "acct-beta-7c1"},
-            ]},
-            {"name": "grp-b-7c1", "provider_keys": [
-                {"id": beta, "display_name": "acct-beta-7c1"},
-            ]},
-        ]})
-    );
-}
+// The provider-groups list is the group table's own list now, not a summary
+// of the accounts that name a group: `tests/groups.rs`'
+// `the_groups_list_reads_the_table` covers it, a group with no account
+// included and a retired one left out. What this file still pins is that a
+// tenant edit names only live groups: `a_wildcard_or_ensemble_model_cannot_be_granted_to_a_customer`.
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_stale_tenant_patch_is_412() {
@@ -1645,6 +1681,24 @@ async fn every_tenant_write_takes_the_tenant_before_the_resources_lock() {
                 op.clone(),
                 Some(3),
                 Some(json!({"allowed_model_ids": [model]})),
+            )),
+            200,
+        ),
+        // A group edit takes no resources lock of its own, so this case can
+        // only observe that lock: what it pins is that the path is enumerated
+        // (a step added ahead of its groups, taking the resources lock, would
+        // fail here) and that it answers `200`. The group row's own place in
+        // the order is `a_group_edit_takes_its_groups_before_the_resources_lock`
+        // in `tests/groups.rs`.
+        (
+            "PATCH /admin/tenants/{id} (unassigning a group)",
+            Box::pin(fire(
+                cp.clone(),
+                "PATCH",
+                format!("/admin/tenants/{tenant}"),
+                op.clone(),
+                Some(4),
+                Some(json!({"allowed_provider_groups": ["shared"]})),
             )),
             200,
         ),
@@ -2078,4 +2132,114 @@ fn every_tenant_derived_document_loads_on_the_lenient_schema() {
         validate_strict(kind, &doc).unwrap_or_else(|e| panic!("{kind:?} strict: {e:?} {doc}"));
         validate_lenient(kind, &doc).unwrap_or_else(|e| panic!("{kind:?} lenient: {e} {doc}"));
     }
+}
+
+/// A channel edit takes no tenant row at all.
+///
+/// The owner's decision on the channel-style configuration: disabling the
+/// last serving account withdraws no grant, so a channel edit cannot wait on
+/// a tenant. It takes the public model's row (between the tenant rows and the
+/// resources lock in the documented order) and then the resources lock, and a
+/// tenant held elsewhere never blocks it — the counter-case to the model
+/// delete above, which does take its holders first. A grant that did
+/// disappear here would mean a withdrawal crept back in.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_channel_edit_takes_no_tenant_lock() {
+    let Some(cp) = TestCp::start_with(patient).await else {
+        return;
+    };
+    let cp = Arc::new(cp);
+    let op = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let created = cp
+        .send(
+            "POST",
+            "/admin/tenants",
+            Some(op.cookie()),
+            Some(json!({"name": "order-chan-7c1"})),
+        )
+        .await;
+    assert_eq!(created.status, 201, "{created:?}");
+    let tenant = Uuid::parse_str(&id_of(&created.body)).expect("a uuid");
+    let pk = cp
+        .send(
+            "POST",
+            "/admin/resources/provider_keys",
+            Some(op.cookie()),
+            Some(json!({"doc": provider_key("acct-order-chan-7c1", json!(["shared"]))})),
+        )
+        .await;
+    assert_eq!(pk.status, 201, "{pk:?}");
+    let key = pk.body["id"]
+        .as_str()
+        .expect("a provider key id")
+        .to_string();
+    let public = cp
+        .send(
+            "POST",
+            "/admin/public-models",
+            Some(op.cookie()),
+            Some(json!({"name": "order-pub-7c1"})),
+        )
+        .await;
+    assert_eq!(public.status, 201, "{public:?}");
+    let public_id = public.body["id"]
+        .as_str()
+        .expect("a public model id")
+        .to_string();
+    let channel = format!("/admin/provider-keys/{key}/channel-models/{public_id}");
+    let put = cp
+        .send("PUT", &channel, Some(op.cookie()), Some(json!({})))
+        .await;
+    assert_eq!(put.status, 200, "{put:?}");
+
+    // The tenant holds the public model, so a withdrawal would have something
+    // to withdraw from.
+    let current = cp
+        .get_with_cookie(&format!("/admin/tenants/{tenant}"), op.cookie())
+        .await;
+    assert_eq!(current.status, 200, "{current:?}");
+    let version = current.body["version"].as_i64().expect("a version");
+    let granted = fire(
+        cp.clone(),
+        "PATCH",
+        format!("/admin/tenants/{tenant}"),
+        op.cookie().to_string(),
+        Some(version),
+        Some(json!({"allowed_model_ids": [public_id]})),
+    )
+    .await;
+    assert_eq!(granted, 200);
+
+    // Held tenant row: the disable runs to completion anyway, taking no
+    // tenant lock, and the grant survives.
+    let mut holder = cp.db().pool().begin().await.expect("begin");
+    sqlx::query("SELECT 1 FROM tenants WHERE id = $1 FOR UPDATE")
+        .bind(tenant)
+        .execute(&mut *holder)
+        .await
+        .expect("hold the tenant");
+    let disabled = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        cp.send(
+            "PUT",
+            &channel,
+            Some(op.cookie()),
+            Some(json!({"enabled": false})),
+        ),
+    )
+    .await
+    .expect("a channel edit takes no tenant lock");
+    holder.rollback().await.expect("release the tenant");
+    assert_eq!(disabled.status, 200, "{disabled:?}");
+    let grants: Vec<Uuid> =
+        sqlx::query_scalar("SELECT allowed_model_ids FROM tenants WHERE id = $1")
+            .bind(tenant)
+            .fetch_one(cp.db().pool())
+            .await
+            .expect("read the grants");
+    assert_eq!(
+        grants,
+        vec![Uuid::parse_str(&public_id).expect("a uuid")],
+        "disabling the last account withdraws no grant"
+    );
 }

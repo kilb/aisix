@@ -186,6 +186,46 @@ impl ApiError {
         Self::new(StatusCode::CONFLICT, "group_retired", "该分组已停用")
     }
 
+    /// A public model still named by something live, with what names it:
+    /// `counts: {tenants, keys, channels}`.
+    pub fn public_model_in_use(counts: serde_json::Value) -> ApiError {
+        ApiError {
+            counts: Some(Box::new(counts)),
+            ..Self::new(
+                StatusCode::CONFLICT,
+                "public_model_in_use",
+                "该公共模型仍在使用中，无法停用",
+            )
+        }
+    }
+
+    /// A provider key some channel model names, with
+    /// `counts: {public_models}`: the same `in_use` every delete answers in,
+    /// in the terms the operator used.
+    pub fn provider_key_served(counts: serde_json::Value) -> ApiError {
+        ApiError {
+            counts: Some(Box::new(counts)),
+            ..Self::new(StatusCode::CONFLICT, "in_use", "该资源仍被引用，无法删除")
+        }
+    }
+
+    /// A retired public model, which cannot be regenerated or retired again.
+    pub fn public_model_retired() -> ApiError {
+        Self::new(
+            StatusCode::CONFLICT,
+            "public_model_retired",
+            "该公共模型已停用",
+        )
+    }
+
+    /// A public model name a live model already carries.
+    pub fn public_model_name_taken() -> ApiError {
+        ApiError::validation(vec![Detail {
+            path: "/name".to_string(),
+            message: "已有同名模型；请先删除或改名，或改用该模型现有的名称".to_string(),
+        }])
+    }
+
     /// A proposal of an import that has already been decided, or superseded
     /// by a newer upload: the review page is showing a stale row.
     pub fn proposal_state() -> ApiError {
@@ -458,6 +498,28 @@ mod tests {
             without_message(body),
             json!({"code": "group_retired"}),
             "a refusal with no figures carries no counts"
+        );
+
+        // A public model's two refusals: the retire carries what holds it,
+        // the served account the plain `in_use` every delete answers in.
+        let (status, body) = answer(ApiError::public_model_in_use(
+            json!({"tenants": 1, "keys": 0, "channels": 2}),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            without_message(body),
+            json!({
+                "code": "public_model_in_use",
+                "counts": {"tenants": 1, "keys": 0, "channels": 2},
+            })
+        );
+        let (status, body) =
+            answer(ApiError::provider_key_served(json!({"public_models": 2}))).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            without_message(body),
+            json!({"code": "in_use", "counts": {"public_models": 2}})
         );
 
         let (status, body) = answer(ApiError::internal("pw-7c1")).await;

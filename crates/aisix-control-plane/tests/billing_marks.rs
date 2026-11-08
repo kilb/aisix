@@ -1388,6 +1388,8 @@ async fn no_edit_that_moves_no_money_waits_on_a_held_account() {
     assert_eq!(r.status, 200, "{r:?}");
     seed_key(&cp, &admin, tenant, None).await;
     let before = live_mark(cp.db(), tenant).await.doc;
+    // A group edit names only live groups.
+    support::seed_group(&cp, &admin, "extra-7c1").await;
 
     let mut holder = cp.db().pool().begin().await.expect("begin");
     sqlx::query("SELECT 1 FROM billing_accounts WHERE tenant_id = $1 FOR UPDATE")

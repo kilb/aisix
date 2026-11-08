@@ -66,16 +66,20 @@ const catalogues = new WeakMap<Stack, Catalogue>();
 function catalogueOf(stack: Stack, opts: WorldOptions): Catalogue {
   let c = catalogues.get(stack);
   if (!c) {
-    const account = stack.admin
-      .post("/admin/resources/provider_keys", {
-        doc: {
-          display_name: "acct-ui-7c1",
-          provider: "openai",
-          api_key: "sk-acct-ui-7c1-upstream",
-          api_base: `${stack.mockUpstreamUrl}/v1`,
-          groups: ["shared", "grp-ui-5d2"],
-        },
-      })
+    // The account names only live groups, so the second one exists first.
+    const group = stack.admin.createGroup("grp-ui-5d2", "UI 分组 5d2");
+    const account = group
+      .then(() =>
+        stack.admin.post("/admin/resources/provider_keys", {
+          doc: {
+            display_name: "acct-ui-7c1",
+            provider: "openai",
+            api_key: "sk-acct-ui-7c1-upstream",
+            api_base: `${stack.mockUpstreamUrl}/v1`,
+            groups: ["shared", "grp-ui-5d2"],
+          },
+        }),
+      )
       .then((r: Json) => r.id as string);
     const priced = account.then(async (accountId) => {
       const model = await stack.admin.post("/admin/resources/models", {
@@ -242,4 +246,9 @@ export async function waitClearOfUtcMidnight(marginMs = 120_000): Promise<void> 
   const sinceMidnight = Date.now() % DAY;
   if (sinceMidnight < marginMs) await sleep(marginMs - sinceMidnight);
   else if (DAY - sinceMidnight < marginMs) await sleep(DAY - sinceMidnight + marginMs);
+}
+
+/** Ticks public model `publicModelId` on upstream account `providerKeyId`, which writes its documents. */
+export async function createChannelModel(stack: Stack, providerKeyId: string, publicModelId: string, body: Record<string, unknown> = {}): Promise<Json> {
+  return stack.admin.put(`/admin/provider-keys/${providerKeyId}/channel-models/${publicModelId}`, body);
 }

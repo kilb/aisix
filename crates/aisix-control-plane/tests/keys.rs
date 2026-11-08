@@ -1205,6 +1205,9 @@ async fn changing_a_tenants_grants_reprojects_its_keys() {
         return;
     };
     let admin = cp.admin_login_seeded(OperatorRole::Operator).await;
+    // The group the tenant is moved to below; a group edit names only live
+    // groups.
+    let _ = seed_group(&cp, &admin, "grp-eu-5d2", "欧洲分组 7c1").await;
     let ids = models(&cp, &admin, &["grant-a-7c1", "grant-b-7c1"]).await;
     let (m1, m2) = (&ids[0], &ids[1]);
     let tenant = cp.seed_tenant(TenantStatus::Active).await;
@@ -3151,9 +3154,6 @@ async fn api_groups_lists_the_tenants_assigned_groups() {
     let b = seed_group(&cp, &admin, "grp-b-7c1", "乙分组 7c1").await;
     let a = seed_group(&cp, &admin, "grp-a-7c1", "甲分组 7c1").await;
     let gone = seed_group(&cp, &admin, "grp-gone-7c1", "已停用 7c1").await;
-    // Retired before the tenant names it, so the retire is not refused: an
-    // assignment made before would count, and Task 12 makes that PATCH
-    // check that a named group is live.
     let r = call(
         &cp,
         "POST",
@@ -3164,7 +3164,20 @@ async fn api_groups_lists_the_tenants_assigned_groups() {
     )
     .await;
     assert_eq!(r.status, 200, "{r:?}");
-    let tenant = tenant_with_groups(&cp, &admin, &["grp-b-7c1", "grp-a-7c1", "grp-gone-7c1"]).await;
+    let tenant = tenant_with_groups(&cp, &admin, &["grp-b-7c1", "grp-a-7c1"]).await;
+    // The tenant does name the retired group, which no API write can produce
+    // any more: a group retired after the assignment, or a row written before
+    // the assignment refused one. It is written directly so the filter under
+    // test — the listing's `retired_at IS NULL`, not the assignment's
+    // refusal — is what keeps the group out of the answer.
+    sqlx::query(
+        "UPDATE tenants SET allowed_provider_groups = \
+           ARRAY['grp-b-7c1', 'grp-a-7c1', 'grp-gone-7c1'] WHERE id = $1",
+    )
+    .bind(tenant)
+    .execute(cp.db().pool())
+    .await
+    .expect("assign the retired group to the tenant");
     // Every member role may list them, a billing one included.
     for role in [MemberRole::Owner, MemberRole::Billing, MemberRole::Member] {
         let who = cp.member_login_seeded(tenant, role).await;

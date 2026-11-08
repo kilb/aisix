@@ -1676,6 +1676,8 @@ async fn tenant_models_list_names_and_ids_only() {
             text(&r.body, "/id")
         }
     };
+    // A provider key names only live groups.
+    support::seed_group(&cp, &op, "grp-eu-5d2").await;
     let account = create(
         "provider_keys",
         json!({"display_name": "acct-e2e-1", "provider": "openai",
