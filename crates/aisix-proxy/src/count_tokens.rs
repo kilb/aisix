@@ -894,6 +894,8 @@ async fn count_tokens_to_target(
     let attempt_started = Instant::now();
     let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
     let upstream_model = crate::dispatch::require_upstream_model(model)?.to_string();
+    // Every target this route dispatches to speaks the caller's protocol.
+    crate::attribution::note_translated_dispatch(false);
     if let Some(bridge) = crate::dispatch::anthropic_platform_bridge(&state.hub, snapshot, model) {
         return platform_count_tokens(
             state,

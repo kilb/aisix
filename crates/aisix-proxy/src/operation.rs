@@ -122,9 +122,10 @@ pub(crate) const BATCH_COMPLETION: Surface = Surface::split("batch", "batch_comp
 ///
 /// `None` is only for a route that emits no usage event AT ALL, whatever
 /// the outcome: the health probes, the two OAuth/agent-card discovery
-/// routes, `/v1/models`, and the two `/v1/videos/:id` polls, whose work was
-/// already metered by the submission. They have no `operation` to report
-/// and would have to mint one to say anything here.
+/// routes, `/v1/models`, the `/v1/key` account lookup, and the two
+/// `/v1/videos/:id` polls, whose work was already metered by the
+/// submission. They have no `operation` to report and would have to mint
+/// one to say anything here.
 pub(crate) fn surface_for_endpoint(endpoint: &str) -> Option<Surface> {
     Some(match endpoint {
         "/v1/chat/completions" => CHAT,
@@ -197,6 +198,10 @@ mod tests {
         (
             "/v1/models/:id",
             Emits::Nothing("one catalog row; reaches no upstream and meters nothing"),
+        ),
+        (
+            "/v1/key",
+            Emits::Nothing("account lookup; reaches no upstream and meters nothing"),
         ),
         ("/v1/chat/completions", Emits::Usage(CHAT)),
         ("/v1/completions", Emits::Usage(COMPLETIONS)),

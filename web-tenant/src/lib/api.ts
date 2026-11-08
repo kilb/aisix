@@ -461,3 +461,50 @@ export const billing = {
     return (await call<KeyQuota>("GET", `/keys/${at(keyId)}/quota`)).data;
   },
 };
+
+// ── budgets: organisation, member and key quotas ────────────────────────────
+
+/** `Budget`: one quota with its spend now. `target.label` is the organisation, member or key it caps. */
+export interface Budget {
+  id: string;
+  scope: "team" | "member" | "api_key";
+  target: { id: string; label: string };
+  /** False once the member or key is gone; the quota keeps its label. */
+  target_live: boolean;
+  set_by: "operator" | "org_admin" | "member";
+  kind: "periodic" | "cumulative";
+  period: "day" | "week" | "month" | null;
+  limit_micro_usd: number;
+  spent_micro_usd: number;
+  remaining_micro_usd: number;
+  period_start: string | null;
+  counted_from: string | null;
+  exhausted: boolean;
+  created_at: string;
+}
+
+/** `POST /api/budgets`. `kind` and `period` left out are `periodic` and `month`. */
+export interface NewBudget {
+  scope: "member" | "api_key";
+  scope_ref: string;
+  kind?: Budget["kind"];
+  period?: "day" | "week" | "month";
+  /** Dollars with at most two decimals. */
+  limit_usd: string;
+}
+
+export const budgets = {
+  /** Every level for an owner, an admin or a billing member; a member's own for a member. */
+  async list(): Promise<Budget[]> {
+    return (await call<{ items: Budget[] }>("GET", "/budgets")).data.items;
+  },
+  async create(body: NewBudget): Promise<Budget> {
+    return (await call<Budget>("POST", "/budgets", body)).data;
+  },
+  async setLimit(id: string, limitUsd: string): Promise<Budget> {
+    return (await call<Budget>("PATCH", `/budgets/${at(id)}`, { limit_usd: limitUsd })).data;
+  },
+  async remove(id: string): Promise<void> {
+    await call<null>("DELETE", `/budgets/${at(id)}`);
+  },
+};

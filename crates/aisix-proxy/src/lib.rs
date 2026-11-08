@@ -25,6 +25,7 @@
 #![deny(rust_2018_idioms)]
 
 mod a2a;
+mod account;
 mod attempt;
 mod attribution;
 mod audio;
@@ -76,6 +77,8 @@ mod operation;
 mod passthrough_route;
 pub mod platform;
 mod platform_errors;
+#[cfg(test)]
+mod platform_relay_tests;
 mod policy_index;
 mod quota;
 mod realtime;
@@ -113,6 +116,7 @@ pub use usage_attr::UNRESOLVED_MODEL_LABEL;
 mod util;
 mod videos;
 
+pub use account::{AccountClient, ACCOUNT_TIMEOUT};
 pub use auth::AuthenticatedKey;
 pub use error::{ErrorEnvelope, ProxyError};
 pub use health::{
@@ -150,6 +154,9 @@ pub fn build_router(state: ProxyState) -> Router {
         .route("/readyz", get(readyz))
         .route("/v1/models", get(models::list_models))
         .route("/v1/models/:id", get(models::get_model))
+        // The caller's own key: its quota at every level, from the control
+        // plane (account.rs). Reaches no upstream.
+        .route("/v1/key", get(account::key::key_info))
         .route("/v1/chat/completions", post(chat::chat_completions))
         .route("/v1/completions", post(completions::completions))
         .route("/v1/embeddings", post(embeddings::embeddings))
@@ -402,6 +409,7 @@ fn normalize_endpoint_label(path: &str) -> &'static str {
         "/livez" => "/livez",
         "/readyz" => "/readyz",
         "/v1/models" => "/v1/models",
+        "/v1/key" => "/v1/key",
         "/.well-known/oauth-protected-resource" => "/.well-known/oauth-protected-resource",
         "/.well-known/oauth-protected-resource/mcp" => "/.well-known/oauth-protected-resource/mcp",
         "/v1/chat/completions" => "/v1/chat/completions",
@@ -2663,6 +2671,34 @@ mod tests {
 
         let resp = run(app, req).await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// A gateway with no control plane has no account to read: a valid key's
+    /// lookup is `404` `not_found`, and a request without a valid key is
+    /// still refused as on every route.
+    #[tokio::test]
+    async fn the_key_route_answers_not_found_without_a_control_plane() {
+        let hub = Arc::new(Hub::new());
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], "http://unused");
+        let app = build_router(build_state(snap, hub));
+        let lookup = |bearer: &str| {
+            Request::builder()
+                .method("GET")
+                .uri("/v1/key")
+                .header("authorization", format!("Bearer {bearer}"))
+                .body(Body::empty())
+                .unwrap()
+        };
+
+        let resp = run(app.clone(), lookup("sk-caller")).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let bytes = to_bytes(resp.into_body(), 4096).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"]["code"], "not_found", "{body}");
+        assert_eq!(body["error"]["type"], "invalid_request_error", "{body}");
+
+        let resp = run(app, lookup("sk-does-not-exist")).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
