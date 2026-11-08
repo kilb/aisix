@@ -296,6 +296,108 @@ async fn a_failed_failover_attempt_shows_no_upstream_status() {
         items(&all).iter().all(|c| c["status_code"] != 529),
         "{all:?}"
     );
+
+    // The hidden attempt is no request of the summary either: two requests
+    // (r1's final attempt and r2), not three.
+    let s = get(&w.cp, &format!("/api/usage/summary?{}", around_now()), &o).await;
+    let requests: i64 = items(&s)
+        .iter()
+        .map(|i| i["requests"].as_i64().unwrap_or(0))
+        .sum();
+    assert_eq!(requests, 2, "{s:?}");
+}
+
+#[tokio::test]
+async fn hidden_attempts_do_not_shorten_a_page() {
+    let Some(w) = world().await else { return };
+    let m = model(&w, "chat-bill", Some(w.tenant)).await;
+    // Two visible rows first, then three hidden attempts newer than both.
+    send_all(
+        &w,
+        vec![
+            row(&w, "v1", m, "chat-bill", json!({})),
+            row(&w, "v2", m, "chat-bill", json!({})),
+        ],
+    )
+    .await;
+    for id in ["h1", "h2", "h3"] {
+        let mut a = row(
+            &w,
+            id,
+            m,
+            "chat-bill",
+            failure(529, "upstream_status", UPSTREAM_ERROR),
+        );
+        a["is_final_attempt"] = json!(false);
+        send_all(&w, vec![a]).await;
+    }
+    let o = owner(&w).await;
+    let r = get(&w.cp, "/api/usage/calls?limit=2", &o).await;
+    assert_eq!(event_ids(&r), ids(&["v1", "v2"]), "{r:?}");
+    assert_eq!(r.body["next_before"], Value::Null, "{r:?}");
+}
+
+#[tokio::test]
+async fn a_stream_that_broke_after_a_200_is_a_failed_call() {
+    let Some(w) = world().await else { return };
+    let m = model(&w, "chat-bill", Some(w.tenant)).await;
+    send_all(
+        &w,
+        vec![row(
+            &w,
+            "broke",
+            m,
+            "chat-bill",
+            failure(200, "stream_aborted", UPSTREAM_ERROR),
+        )],
+    )
+    .await;
+    let o = owner(&w).await;
+    let r = get(&w.cp, "/api/usage/calls", &o).await;
+    let c = &items(&r)[0];
+    assert_eq!(c["status"], "failed", "{c}");
+    assert_eq!(c["status_code"], Value::Null);
+    assert_eq!(c["error_class"], "upstream_unavailable");
+}
+
+#[tokio::test]
+async fn a_summary_groups_by_model_id_not_by_the_name_sent() {
+    let Some(w) = world().await else { return };
+    let m = model(&w, "chat-bill", Some(w.tenant)).await;
+    // Many distinct bogus names, none resolving to a model, and an
+    // ungranted model: one row with no id and no name.
+    let hidden = model(&w, "chat-hidden", None).await;
+    let mut events = vec![row(&w, "g0", m, "chat-bill", json!({}))];
+    for i in 0..5 {
+        let mut f = failure(404, "model_not_found", "model not found");
+        f["requested_model_id"] = json!("");
+        events.push(row(
+            &w,
+            &format!("bogus{i}"),
+            m,
+            &format!("bogus-name-{i}"),
+            f,
+        ));
+    }
+    events.push(row(&w, "forb", hidden, "chat-hidden", json!({})));
+    send_all(&w, events).await;
+    let o = owner(&w).await;
+    let r = get(&w.cp, &format!("/api/usage/summary?{}", around_now()), &o).await;
+    let rows = items(&r);
+    assert_eq!(rows.len(), 2, "{r:?}");
+    let granted = rows
+        .iter()
+        .find(|i| i["model"]["id"] == m.to_string())
+        .expect("granted");
+    assert_eq!(granted["model"]["name"], "chat-bill");
+    assert_eq!(granted["requests"], 1);
+    let rest = rows
+        .iter()
+        .find(|i| i["model"]["id"].is_null())
+        .expect("the rest");
+    assert_eq!(rest["model"]["name"], "");
+    assert_eq!(rest["requests"], 6);
+    assert!(!r.body.to_string().contains("bogus-name"), "{r:?}");
 }
 
 #[tokio::test]

@@ -188,7 +188,8 @@ impl Models {
 pub fn call_model(models: &Models, requested_model_id: &str, event_name: &str) -> ModelRef {
     let id = Uuid::parse_str(requested_model_id).ok();
     let name = if event_name.is_empty() {
-        id.and_then(|id| models.names.get(&id).cloned())
+        id.filter(|id| models.granted.contains(id))
+            .and_then(|id| models.names.get(&id).cloned())
             .unwrap_or_default()
     } else {
         event_name.to_string()
@@ -525,9 +526,36 @@ pub struct UsageSummaryRow {
     pub quantities: BTreeMap<String, i64>,
 }
 
-/// `(period_start, requested_model_id, requested model name)`.
-type Bucket = (DateTime<Utc>, String, String);
+/// The most rows (a period and a model) a summary lists; the rest are rolled
+/// into one `other` row, so the answer's size does not depend on how much
+/// traffic the range holds.
+pub const MAX_SUMMARY_ROWS: usize = 1000;
 
+/// The name of the row that holds everything past [`MAX_SUMMARY_ROWS`].
+const OTHER: &str = "other";
+
+/// Runs `summarize` in one read-only repeatable-read transaction, so its
+/// queries see the same rows.
+async fn summarize_snapshot(
+    state: &AppState,
+    scope: &Scope,
+    group: Group,
+) -> Result<Vec<UsageSummaryRow>, ApiError> {
+    let mut tx = state.db.pool().begin().await.map_err(DbError::from)?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        .execute(&mut *tx)
+        .await
+        .map_err(DbError::from)?;
+    let rows = summarize(&mut tx, scope, group).await?;
+    tx.commit().await.map_err(DbError::from)?;
+    Ok(rows)
+}
+
+/// Rows by period and model. A row is grouped by the model's id, which the
+/// gateway resolved, never by the name a caller sent: calls whose model is
+/// not in the tenant's grants (or never resolved) share one row per period
+/// with `id` null and an empty name, and a granted model is named by its
+/// current display name.
 async fn summarize(
     conn: &mut PgConnection,
     scope: &Scope,
@@ -537,16 +565,16 @@ async fn summarize(
         Group::Day => "day",
         Group::Month => "month",
     };
+
     let mut sql = QueryBuilder::<Postgres>::new("SELECT date_trunc(");
     sql.push_bind(unit).push(
-        ", pc.occurred_at, 'UTC'), pc.requested_model_id, \
-         COALESCE(ue.event->>'requested_model', ''), count(*)::bigint, \
+        ", pc.occurred_at, 'UTC'), pc.requested_model_id, count(*)::bigint, \
          COALESCE(sum(pc.charge_micro_usd) FILTER (WHERE pc.status = 'charged'), 0)::bigint, \
          (count(*) FILTER (WHERE pc.estimated))::bigint",
     );
     scope.push_from(&mut sql, false);
-    sql.push(" GROUP BY 1, 2, 3 ORDER BY 1, 3, 2");
-    let rows: Vec<(DateTime<Utc>, String, String, i64, i64, i64)> = sql
+    sql.push(" GROUP BY 1, 2 ORDER BY 1, 2");
+    let rows: Vec<(DateTime<Utc>, String, i64, i64, i64)> = sql
         .build_query_as()
         .fetch_all(&mut *conn)
         .await
@@ -554,46 +582,77 @@ async fn summarize(
 
     let mut sql = QueryBuilder::<Postgres>::new("SELECT date_trunc(");
     sql.push_bind(unit).push(
-        ", pc.occurred_at, 'UTC'), pc.requested_model_id, \
-         COALESCE(ue.event->>'requested_model', ''), l->>'dimension', \
+        ", pc.occurred_at, 'UTC'), pc.requested_model_id, l->>'dimension', \
          COALESCE(sum((l->>'quantity')::bigint), 0)::bigint",
     );
     scope.push_from(&mut sql, true);
-    sql.push(" GROUP BY 1, 2, 3, 4");
-    let quantity_rows: Vec<(DateTime<Utc>, String, String, String, i64)> = sql
+    sql.push(" GROUP BY 1, 2, 3");
+    let quantity_rows: Vec<(DateTime<Utc>, String, String, i64)> = sql
         .build_query_as()
         .fetch_all(&mut *conn)
         .await
         .map_err(DbError::from)?;
-    let mut quantities: HashMap<Bucket, BTreeMap<String, i64>> = HashMap::new();
-    for (period, model, name, dimension, quantity) in quantity_rows {
-        quantities
-            .entry((period, model, name))
-            .or_default()
-            .insert(dimension, quantity);
-    }
 
     let model_ids: Vec<Uuid> = rows
         .iter()
         .filter_map(|r| Uuid::parse_str(&r.1).ok())
         .collect();
     let models = Models::load(conn, scope.tenant, &model_ids).await?;
-    Ok(rows
-        .into_iter()
-        .map(|(period, model, name, requests, charged, estimated)| {
-            let quantities = quantities
-                .remove(&(period, model.clone(), name.clone()))
-                .unwrap_or_default();
-            UsageSummaryRow {
+
+    // The shown model of a stored id: granted ids by name, all others as one.
+    let shown = |raw: &str| call_model(&models, raw, "");
+    let mut merged: BTreeMap<(DateTime<Utc>, Option<Uuid>), UsageSummaryRow> = BTreeMap::new();
+    for (period, raw, requests, charged, estimated) in rows {
+        let model = shown(&raw);
+        let row = merged
+            .entry((period, model.id))
+            .or_insert_with(|| UsageSummaryRow {
                 period_start: period,
-                model: call_model(&models, &model, &name),
-                requests,
-                charged_micro_usd: charged,
-                estimated_requests: estimated,
-                quantities,
+                model: ModelRef {
+                    id: model.id,
+                    name: model.name.clone(),
+                },
+                requests: 0,
+                charged_micro_usd: 0,
+                estimated_requests: 0,
+                quantities: BTreeMap::new(),
+            });
+        row.requests += requests;
+        row.charged_micro_usd += charged;
+        row.estimated_requests += estimated;
+    }
+    for (period, raw, dimension, quantity) in quantity_rows {
+        let model = shown(&raw);
+        if let Some(row) = merged.get_mut(&(period, model.id)) {
+            *row.quantities.entry(dimension).or_insert(0) += quantity;
+        }
+    }
+
+    let mut items: Vec<UsageSummaryRow> = merged.into_values().collect();
+    if items.len() > MAX_SUMMARY_ROWS {
+        let rest = items.split_off(MAX_SUMMARY_ROWS);
+        let mut other = UsageSummaryRow {
+            period_start: rest[0].period_start,
+            model: ModelRef {
+                id: None,
+                name: OTHER.to_string(),
+            },
+            requests: 0,
+            charged_micro_usd: 0,
+            estimated_requests: 0,
+            quantities: BTreeMap::new(),
+        };
+        for row in rest {
+            other.requests += row.requests;
+            other.charged_micro_usd += row.charged_micro_usd;
+            other.estimated_requests += row.estimated_requests;
+            for (dimension, quantity) in row.quantities {
+                *other.quantities.entry(dimension).or_insert(0) += quantity;
             }
-        })
-        .collect())
+        }
+        items.push(other);
+    }
+    Ok(items)
 }
 
 fn summary_scope(tenant: Uuid, member: Option<Uuid>, q: &SummaryQuery) -> Result<Scope, ApiError> {
@@ -629,8 +688,7 @@ pub async fn tenant_summary(
         (auth.role == MemberRole::Member).then_some(auth.id),
         &q,
     )?;
-    let mut conn = state.db.pool().acquire().await.map_err(DbError::from)?;
-    let items = summarize(&mut conn, &scope, q.group).await?;
+    let items = summarize_snapshot(&state, &scope, q.group).await?;
     Ok(Json(json!({ "items": items })))
 }
 
@@ -655,7 +713,8 @@ pub async fn admin_summary(
     if !exists {
         return Err(ApiError::not_found());
     }
-    let items = summarize(&mut conn, &scope, q.group).await?;
+    drop(conn);
+    let items = summarize_snapshot(&state, &scope, q.group).await?;
     Ok(Json(json!({ "items": items })))
 }
 
