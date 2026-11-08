@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useState } from "react";
 import type { TabId, TabProps } from "../App";
 import { Msg, type Note } from "../components/Msg";
-import { environment, rollout, type Environment, type RolloutSummary } from "../lib/api";
+import { openSectionNext } from "../components/SectionHost";
+import { environment, pricingStatus, rollout, type Environment, type PricingStatus, type RolloutSummary } from "../lib/api";
 import { errorText, fmtInt } from "../lib/fmt";
 import { Button } from "../ui/Button";
 import { Loading } from "../ui/DataTable";
@@ -36,6 +37,8 @@ export function Overview({ operator, onGoto }: TabProps) {
   const isAdmin = operator.role === "admin";
   const [env, setEnv] = useState<Environment | null>(null);
   const [envError, setEnvError] = useState<string | null>(null);
+  const [pricing, setPricing] = useState<PricingStatus | null>(null);
+  const [pricingError, setPricingError] = useState<string | null>(null);
   const [summary, setSummary] = useState<RolloutSummary | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [note, setNote] = useState<Note | null>(null);
@@ -53,6 +56,15 @@ export function Overview({ operator, onGoto }: TabProps) {
     }
   }, []);
 
+  const readPricing = useCallback(async () => {
+    try {
+      setPricing(await pricingStatus.get());
+      setPricingError(null);
+    } catch (e) {
+      setPricingError(errorText(e));
+    }
+  }, []);
+
   useEffect(() => {
     let live = true;
     let timer: number | undefined;
@@ -61,7 +73,7 @@ export function Overview({ operator, onGoto }: TabProps) {
       (e) => live && setEnvError(errorText(e)),
     );
     const tick = async () => {
-      await readSummary();
+      await Promise.all([readSummary(), readPricing()]);
       if (live) timer = window.setTimeout(() => void tick(), REFRESH_MS);
     };
     void tick();
@@ -69,7 +81,7 @@ export function Overview({ operator, onGoto }: TabProps) {
       live = false;
       window.clearTimeout(timer);
     };
-  }, [readSummary]);
+  }, [readSummary, readPricing]);
 
   async function allowDeletes() {
     setBusy(true);
@@ -209,6 +221,37 @@ export function Overview({ operator, onGoto }: TabProps) {
             </ul>
           </div>
         )}
+      </div>
+
+      <div className="panel" role="region" aria-label="计价异常">
+        <h2>计价异常</h2>
+        <p className="hint">最近 24 小时没能计价的调用，以及计价引擎不能使用的价格版本。</p>
+        {pricingError && (
+          <div className="note crit" role="alert">
+            读取计价状态失败：{pricingError}
+          </div>
+        )}
+        <div className="entries">
+          <div className="entry">
+            <span className="lab">未计价调用</span>
+            <span className="val">{pricing ? fmtInt(pricing.unpriced_last_24h.total) : "…"}</span>
+            <span className="foot">最近 24 小时</span>
+          </div>
+          <div className="entry">
+            <span className="lab">不可用的价格版本</span>
+            <span className="val">{pricing ? fmtInt(pricing.invalid_revisions.length) : "…"}</span>
+            <span className="foot">计价引擎跳过的版本</span>
+          </div>
+        </div>
+        <Button
+          size="sm"
+          onClick={() => {
+            openSectionNext("status");
+            onGoto("pricing");
+          }}
+        >
+          去「价格 · 计价状态」
+        </Button>
       </div>
 
       <div className="panel">

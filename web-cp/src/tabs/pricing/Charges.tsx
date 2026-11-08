@@ -8,7 +8,7 @@ import { DataTable, Loading } from "../../ui/DataTable";
 import { EmptyState } from "../../ui/EmptyState";
 
 /** The pricing code behind an unpriced charge. A code not listed is shown as it came. */
-const REASONS: Record<string, string> = {
+export const REASONS: Record<string, string> = {
   missing_price: "未定价",
   invalid_price: "价格不可用",
   missing_tier_price: "缺少档位价",

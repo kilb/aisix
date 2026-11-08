@@ -655,3 +655,23 @@ export const charges = {
     return (await call<{ items: Charge[]; next_before: number | null }>("GET", `/admin/pricing/charges${qs ? `?${qs}` : ""}`)).data;
   },
 };
+
+/** A price revision the pricing engine cannot use; charges that need it come out unpriced. */
+export interface InvalidRevision {
+  table: string;
+  revision_id: string | number;
+  reason: string;
+}
+
+/** The pricing health: version, unusable revisions and the last 24 hours' unpriced charges by code. */
+export interface PricingStatus {
+  pricing_version: number | null;
+  invalid_revisions: InvalidRevision[];
+  unpriced_last_24h: { total: number; by_code: Record<string, number> };
+}
+
+export const pricingStatus = {
+  async get(): Promise<PricingStatus> {
+    return (await call<PricingStatus>("GET", "/admin/pricing/status")).data;
+  },
+};
