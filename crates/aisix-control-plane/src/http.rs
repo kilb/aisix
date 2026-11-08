@@ -497,6 +497,7 @@ pub const ROUTE_ROLES: &[(&str, &str, MinRole)] = &[
     ("POST", "/dp/heartbeat", MinRole::Dp),
     ("GET", "/dp/v1/keys/{key_id}/prices", MinRole::Dp),
     ("GET", "/dp/v1/keys/{key_id}/quota", MinRole::Dp),
+    ("GET", "/dp/v1/keys/{key_id}/requests", MinRole::Dp),
     ("ANY", "/dp/store/v1/{*rest}", MinRole::Dp),
     ("POST", "/dp/telemetry", MinRole::Dp),
 ];
@@ -728,6 +729,10 @@ pub fn dp_router(state: AppState) -> Router {
         .route(
             "/dp/v1/keys/{key_id}/quota",
             get(billing::lookup_quota::dp_quota),
+        )
+        .route(
+            "/dp/v1/keys/{key_id}/requests",
+            get(billing::lookup_requests::dp_requests),
         )
         .route("/dp/store/v1/{*rest}", any(dp::store::not_found))
         // A batch may be larger than the other routes' bodies, and every

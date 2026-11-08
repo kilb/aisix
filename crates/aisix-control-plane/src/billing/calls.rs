@@ -132,15 +132,17 @@ pub fn visible_to_tenant(is_final_attempt: bool, charge_status: &str, repriced: 
 }
 
 /// [`visible_to_tenant`] over the joined `pc` (charge) and `ue` (usage row).
-const VISIBLE: &str = "(ue.event->'is_final_attempt' = 'true'::jsonb OR pc.status = 'charged' \
+pub(super) const VISIBLE: &str =
+    "(ue.event->'is_final_attempt' = 'true'::jsonb OR pc.status = 'charged' \
      OR EXISTS (SELECT 1 FROM pricing_adjustments pa WHERE pa.event_id = pc.event_id))";
 
 /// The sum of the adjustments of the charge `pc`, `NULL` when it has none.
-const ADJUSTED: &str = "(SELECT SUM(pa.delta_micro_usd)::bigint FROM pricing_adjustments pa \
+pub(super) const ADJUSTED: &str =
+    "(SELECT SUM(pa.delta_micro_usd)::bigint FROM pricing_adjustments pa \
      WHERE pa.event_id = pc.event_id)";
 
 /// The only keys read out of a usage row's event.
-const EVENT_FIELDS: &str = "jsonb_build_object(\
+pub(super) const EVENT_FIELDS: &str = "jsonb_build_object(\
     'requested_model', ue.event->'requested_model', \
     'operation', ue.event->'operation', \
     'status_code', ue.event->'status_code', \
@@ -172,7 +174,7 @@ impl Models {
         conn: &mut PgConnection,
         tenant: Uuid,
         ids: &[Uuid],
-    ) -> Result<Models, ApiError> {
+    ) -> Result<Models, DbError> {
         let rows: Vec<(Uuid, String, bool)> = sqlx::query_as(
             "SELECT r.id, COALESCE(r.doc->>'display_name', ''), r.id = ANY(t.allowed_model_ids) \
              FROM gw_resources r, tenants t \
@@ -182,8 +184,7 @@ impl Models {
         .bind(ids)
         .bind(Kind::Models.segment())
         .fetch_all(conn)
-        .await
-        .map_err(DbError::from)?;
+        .await?;
         let mut models = Models {
             granted: HashSet::new(),
             names: HashMap::new(),

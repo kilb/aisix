@@ -24,6 +24,7 @@ pub mod credits;
 pub mod ledger;
 pub mod lookup_prices;
 pub mod lookup_quota;
+pub mod lookup_requests;
 pub mod marks;
 pub mod money;
 pub mod plans;
