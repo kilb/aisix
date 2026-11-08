@@ -1188,7 +1188,8 @@ mod tests {
             | ProxyError::TargetRefused(_)
             | ProxyError::ProviderUnavailable
             | ProxyError::SemanticDecisionFailed { .. }
-            | ProxyError::AllCandidatesUnavailable { .. } => false,
+            | ProxyError::AllCandidatesUnavailable { .. }
+            | ProxyError::AccountUnavailable => false,
             ProxyError::Bridge(e) => matches!(e, BridgeError::RequestTooLarge { .. }),
         }
     }
@@ -1255,6 +1256,7 @@ mod tests {
             },
             budget_exceeded_for_team(),
             ProxyError::BudgetUnverified,
+            ProxyError::AccountUnavailable,
             ProxyError::RequestTooLarge { limit_bytes: 1 },
             ProxyError::RateLimit(limited()),
             ProxyError::ModelRateLimit(limited()),

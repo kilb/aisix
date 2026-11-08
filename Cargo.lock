@@ -516,6 +516,7 @@ dependencies = [
  "jsonwebtoken",
  "lofty",
  "memchr",
+ "moka",
  "percent-encoding",
  "rand 0.8.7",
  "regex",

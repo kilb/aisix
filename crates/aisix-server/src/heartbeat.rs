@@ -610,6 +610,28 @@ async fn send(client: &reqwest::Client, cfg: &HeartbeatConfig, uptime: i64) -> a
 /// time) so an unreadable/rotated bundle surfaces an actionable error
 /// at the same place every other heartbeat error does.
 pub(crate) fn build_client(mtls: &MtlsBundle) -> anyhow::Result<reqwest::Client> {
+    mtls_client_builder(mtls, Duration::from_secs(10))?
+        .build()
+        .context("build reqwest client with mTLS")
+}
+
+/// The client of the account lookups (`GET /v1/key`): the heartbeat's TLS
+/// setup, with a connection pool of its own and the lookups' own deadline,
+/// [`aisix_proxy::ACCOUNT_TIMEOUT`]. Nothing else uses it, so a lookup never
+/// waits behind a heartbeat, a telemetry delivery or a store call, and none of
+/// those waits behind a lookup.
+pub fn build_account_client(mtls: &MtlsBundle) -> anyhow::Result<reqwest::Client> {
+    mtls_client_builder(mtls, aisix_proxy::ACCOUNT_TIMEOUT)?
+        .build()
+        .context("build the account lookups' reqwest client with mTLS")
+}
+
+/// A client builder that presents the bundle's client certificate and trusts
+/// its CA, with every request bounded by `timeout`.
+fn mtls_client_builder(
+    mtls: &MtlsBundle,
+    timeout: Duration,
+) -> anyhow::Result<reqwest::ClientBuilder> {
     let ca_pem = std::fs::read(&mtls.ca_cert_path)
         .with_context(|| format!("read {}", mtls.ca_cert_path.display()))?;
     let cert_pem = std::fs::read(&mtls.client_cert_path)
@@ -634,7 +656,7 @@ pub(crate) fn build_client(mtls: &MtlsBundle) -> anyhow::Result<reqwest::Client>
     let ca = reqwest::Certificate::from_pem(&ca_pem).context("parse CA certificate")?;
 
     let mut builder = aisix_gateway::control_plane_client_builder()
-        .timeout(Duration::from_secs(10))
+        .timeout(timeout)
         .user_agent(format!("aisix-dp/{}", &*aisix_core::BUILD_VERSION))
         .identity(identity)
         .add_root_certificate(ca)
@@ -659,7 +681,7 @@ pub(crate) fn build_client(mtls: &MtlsBundle) -> anyhow::Result<reqwest::Client>
             .context("parse managed.cp_ca_cert_file as PEM certificate")?;
         builder = builder.add_root_certificate(extra_ca);
     }
-    builder.build().context("build reqwest client with mTLS")
+    Ok(builder)
 }
 
 #[cfg(test)]
@@ -1339,6 +1361,48 @@ managed:
         let dir = tempfile::tempdir().unwrap();
         let mtls = write_test_bundle(dir.path());
         let _client = build_client(&mtls).expect("build_client should succeed with valid bundle");
+    }
+
+    #[test]
+    fn build_account_client_loads_real_mtls_bundle() {
+        let dir = tempfile::tempdir().unwrap();
+        let mtls = write_test_bundle(dir.path());
+        build_account_client(&mtls).expect("the account client builds from a valid bundle");
+        let missing = MtlsBundle {
+            ca_cert_path: dir.path().join("absent-ca.crt"),
+            ..mtls
+        };
+        let err = build_account_client(&missing).unwrap_err();
+        assert!(format!("{err:#}").contains("absent-ca.crt"), "{err:#}");
+    }
+
+    /// The account client gives up on a control plane that does not answer
+    /// at the lookups' deadline, not the heartbeat's ten seconds.
+    #[tokio::test]
+    async fn the_account_client_gives_up_at_the_lookup_deadline() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Accepts and never answers.
+        let _hold = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                held.push(socket);
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let client = build_account_client(&write_test_bundle(dir.path())).unwrap();
+        let started = std::time::Instant::now();
+        let err = client
+            .get(format!("http://{addr}/dp/v1/keys/k/quota"))
+            .send()
+            .await
+            .unwrap_err();
+        let waited = started.elapsed();
+        assert!(err.is_timeout(), "{err:?}");
+        assert!(
+            waited >= aisix_proxy::ACCOUNT_TIMEOUT && waited < Duration::from_secs(5),
+            "gave up after {waited:?}"
+        );
     }
 
     #[test]

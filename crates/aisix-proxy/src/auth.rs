@@ -380,11 +380,16 @@ where
     // Not recorded on `aisix_auth_decisions_total`: that counts credential
     // judgments, and this credential was judged valid above. Like a model
     // the key may not use, this is what the key may do with it.
-    let family = crate::endpoint_acl::endpoint_family(parts.uri.path())
-        .unwrap_or(aisix_core::models::EndpointFamily::Unknown);
-    if let Err(err) = crate::endpoint_acl::check_endpoint(authed.key(), family) {
-        warn_endpoint_refused(&authed.entry.id, family, ctx);
-        return Err(err);
+    //
+    // The account routes are open to every key: they read the caller's own
+    // key and reach no upstream.
+    if !crate::endpoint_acl::is_account_route(parts.uri.path()) {
+        let family = crate::endpoint_acl::endpoint_family(parts.uri.path())
+            .unwrap_or(aisix_core::models::EndpointFamily::Unknown);
+        if let Err(err) = crate::endpoint_acl::check_endpoint(authed.key(), family) {
+            warn_endpoint_refused(&authed.entry.id, family, ctx);
+            return Err(err);
+        }
     }
     // Publish the resolved key so extractors that run after this one can
     // see who is calling without re-authenticating. `ClientContext` reads

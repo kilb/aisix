@@ -1521,6 +1521,24 @@ async fn run(mut cfg: Config, hangup: Option<HangupSignal>) -> anyhow::Result<()
             &h.mtls,
         )));
     }
+    // The account lookups (`GET /v1/key`) ask the control plane through a
+    // client of their own, never one model traffic or another control-plane
+    // channel uses. Without a bundle there is no control plane to ask, and the
+    // route answers 404.
+    if let Some(h) = heartbeat_cfg.as_ref() {
+        match heartbeat::build_account_client(&h.mtls) {
+            Ok(http) => {
+                proxy_state = proxy_state.with_account(Arc::new(aisix_proxy::AccountClient::new(
+                    http,
+                    dpmgr_origin(&h.url),
+                )));
+            }
+            Err(error) => tracing::error!(
+                error = %format_args!("{error:#}"),
+                "account lookups are unavailable: could not build their control-plane client",
+            ),
+        }
+    }
     // OTLP exports report the configured service name as `service.name`.
     proxy_state
         .otlp_fan_out

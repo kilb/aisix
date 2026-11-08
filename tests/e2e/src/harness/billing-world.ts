@@ -5,6 +5,7 @@ import {
   type ControlPlaneStack,
   type Json,
   type ManagedGateway,
+  type ManagedGatewayOptions,
 } from "./control-plane.js";
 import { startPlatformUpstream, type PlatformUpstream } from "./cp-upstream.js";
 import { ProxyClient } from "./proxy.js";
@@ -68,7 +69,16 @@ function check(what: string, res: { status: number; text: string }, status: numb
   if (res.status !== status) throw new Error(`${what} answered ${res.status}: ${res.text}`);
 }
 
-export async function billingWorld(): Promise<BillingWorld> {
+export interface BillingWorldOptions {
+  /**
+   * How the gateway is booted, decided once the control plane runs: a case
+   * that puts a relay in front of the control plane's gateway listener
+   * starts it here and points `cp_base_url` at it.
+   */
+  gateway?: (cp: ControlPlaneStack) => Promise<ManagedGatewayOptions>;
+}
+
+export async function billingWorld(opts: BillingWorldOptions = {}): Promise<BillingWorld> {
   const upstream = await startPlatformUpstream("billing-up-e2e", {
     usage: BILLING_USAGE,
     embeddingTokens: 1000,
@@ -78,7 +88,7 @@ export async function billingWorld(): Promise<BillingWorld> {
   try {
     cp = await startControlPlane();
     const gw = await cp.issueGateway();
-    gateway = await spawnManagedGateway(gw);
+    gateway = await spawnManagedGateway(gw, await opts.gateway?.(cp));
     await cp.admin.waitRegistered(gw.dpId);
 
     const account = await cp.admin.create("provider_keys", {

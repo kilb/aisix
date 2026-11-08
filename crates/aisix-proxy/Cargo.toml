@@ -63,6 +63,8 @@ tokio-tungstenite.workspace = true
 async-trait.workspace = true
 async-stream = "0.3"
 dashmap.workspace = true
+# Bounded, expiring caches of the account lookups' answers (account/).
+moka.workspace = true
 arc-swap.workspace = true
 base64.workspace = true
 # Scheme validation of provider-supplied redirect targets on
