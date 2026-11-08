@@ -1233,6 +1233,7 @@ mod tests {
         "/v1/models",
         "/v1/models/gpt-4o",
         "/v1/key",
+        "/v1/generation",
         "/.well-known/oauth-protected-resource",
         "/.well-known/oauth-protected-resource/mcp",
         "/.well-known/oauth-protected-resource/mcp/some-server",

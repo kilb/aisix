@@ -52,7 +52,7 @@ const MAX_REQUEST_ID_LEN: usize = 256;
 /// nginx `$request_id`) while keeping the value safe to echo back onto the
 /// wire verbatim — in a response header, in the upstream request, and in a
 /// telemetry field.
-fn is_acceptable(id: &str) -> bool {
+pub(crate) fn is_acceptable(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= MAX_REQUEST_ID_LEN
         && id.bytes().all(|b| (0x21..=0x7E).contains(&b))

@@ -411,6 +411,9 @@ describe("every proxy route emits every per-request metric family", () => {
     // The caller's own key, from the control plane; with none (this gateway
     // reads etcd directly) it answers 404 — still a request.
     { route: "/v1/key", name: "GET /v1/key", endpoint: "/v1/key", families: [...REQUEST], drive: async () => void (await expectCall("/v1/key", {}, 404)) },
+    // What one request id cost the caller, from the control plane; with none
+    // (this gateway reads etcd directly) it answers 404 — still a request.
+    { route: "/v1/generation", name: "GET /v1/generation", endpoint: "/v1/generation", families: [...REQUEST], drive: async () => void (await expectCall("/v1/generation?id=par-req-1", {}, 404)) },
     {
       route: "/v1/chat/completions",
       name: "chat",
@@ -855,6 +858,7 @@ describe("every proxy route emits every per-request metric family", () => {
     ["GET", "/v1/models", "/v1/models"],
     ["GET", "/v1/models/x", "/v1/models/:id"],
     ["GET", "/v1/key", "/v1/key"],
+    ["GET", "/v1/generation?id=par-req-1", "/v1/generation"],
     ["POST", "/v1/chat/completions", "/v1/chat/completions"],
     ["POST", "/v1/completions", "/v1/completions"],
     ["POST", "/v1/embeddings", "/v1/embeddings"],

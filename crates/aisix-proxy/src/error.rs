@@ -414,11 +414,11 @@ pub enum ProxyError {
     /// cannot be known.
     #[error("budget could not be verified: usage has not reached the control plane")]
     BudgetUnverified,
-    /// An account lookup (`GET /v1/key`) the control plane could not answer:
-    /// it timed out, could not be reached, failed, or answered with something
-    /// that does not decode. Only the lookup fails; model requests never ask
-    /// the control plane. It names no upstream, so it keeps this envelope in
-    /// platform mode.
+    /// An account lookup (`GET /v1/key`, `GET /v1/generation`) the control
+    /// plane could not answer: it timed out, could not be reached, failed, or
+    /// answered with something that does not decode. Only the lookup fails;
+    /// model requests never ask the control plane. It names no upstream, so
+    /// it keeps this envelope in platform mode.
     #[error("Account information is temporarily unavailable.")]
     AccountUnavailable,
     /// Per RFC 9110 §15.5.14, a request body that exceeds a server-

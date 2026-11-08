@@ -10,7 +10,7 @@
 //! plane that cannot answer fails only the lookup, with `503`
 //! ([`crate::ProxyError::AccountUnavailable`]). A failure is cached too, for
 //! [`FAILURE_TTL`], so a failing control plane is asked at most once a second
-//! per key, and its failures are logged at WARN at most once per
+//! per cache entry, and its failures are logged at WARN at most once per
 //! [`WARN_INTERVAL`].
 //!
 //! Without a control plane (a gateway reading a resources file, or a managed
@@ -23,6 +23,7 @@
 //! client shape from what it decoded, so a field a newer control plane adds
 //! reaches no caller until the gateway names it.
 
+pub(crate) mod generation;
 pub(crate) mod key;
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -84,6 +85,7 @@ pub struct AccountClient {
     /// The control plane's origin, as configured, without a trailing slash.
     base: String,
     quotas: key::QuotaCache,
+    requests: generation::RequestCache,
 }
 
 impl AccountClient {
@@ -95,6 +97,7 @@ impl AccountClient {
             http,
             base: cp_base_url.trim_end_matches('/').to_string(),
             quotas: key::quota_cache(),
+            requests: generation::request_cache(),
         }
     }
 

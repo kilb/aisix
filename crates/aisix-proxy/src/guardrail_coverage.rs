@@ -79,6 +79,10 @@ pub(crate) const POSTURE: &[(&str, Posture)] = &[
         Posture::NoUpstreamContent("reads the caller's own account from the control plane"),
     ),
     (
+        "/v1/generation",
+        Posture::NoUpstreamContent("reads the caller's own account from the control plane"),
+    ),
+    (
         "/.well-known/oauth-protected-resource",
         Posture::NoUpstreamContent("RFC 9728 metadata served by the gateway itself"),
     ),

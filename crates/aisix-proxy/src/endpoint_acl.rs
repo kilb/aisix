@@ -76,7 +76,10 @@ pub(crate) fn endpoint_family(path: &str) -> Option<EndpointFamily> {
 /// The routes every key may call whatever its endpoint list, by route
 /// template, each with why. The extractor consults this before
 /// [`endpoint_family`].
-pub(crate) const ACCOUNT_ROUTES: &[(&str, &str)] = &[("/v1/key", "reads the caller's own key")];
+pub(crate) const ACCOUNT_ROUTES: &[(&str, &str)] = &[
+    ("/v1/key", "reads the caller's own key"),
+    ("/v1/generation", "reads the caller's own request"),
+];
 
 /// Whether `path` is one of [`ACCOUNT_ROUTES`].
 pub(crate) fn is_account_route(path: &str) -> bool {
@@ -154,6 +157,7 @@ mod tests {
         ("/v1/models", Family(F::Models)),
         ("/v1/models/:id", Family(F::Models)),
         ("/v1/key", Account),
+        ("/v1/generation", Account),
         ("/v1/chat/completions", Family(F::ChatCompletions)),
         ("/v1/completions", Family(F::Completions)),
         ("/v1/embeddings", Family(F::Embeddings)),
@@ -564,6 +568,26 @@ mod tests {
         let resp = router.oneshot(get("/v1/models")).await.unwrap();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
         assert_eq!(json(resp).await["error"]["message"], REFUSAL);
+    }
+
+    /// A key confined to chat may still look up what its own request cost:
+    /// `GET /v1/generation` is answered as the route answers without a
+    /// control plane (`404`), never refused.
+    #[tokio::test]
+    async fn the_generation_route_is_open_to_a_restricted_key() {
+        let upstream = embeddings_upstream().await;
+        let router = router_with_key(&upstream, vec![F::ChatCompletions]);
+        let req = Request::builder()
+            .method("GET")
+            .uri("/v1/generation?id=req-1")
+            .header("authorization", format!("Bearer {ALLOWED}"))
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let body = json(resp).await;
+        assert_eq!(body["error"]["code"], "not_found", "{body}");
     }
 
     /// `/v1/messages/count_tokens` is its own family, and its refusal comes

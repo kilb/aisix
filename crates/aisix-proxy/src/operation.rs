@@ -203,6 +203,10 @@ mod tests {
             "/v1/key",
             Emits::Nothing("account lookup; reaches no upstream and meters nothing"),
         ),
+        (
+            "/v1/generation",
+            Emits::Nothing("account lookup; reaches no upstream and meters nothing"),
+        ),
         ("/v1/chat/completions", Emits::Usage(CHAT)),
         ("/v1/completions", Emits::Usage(COMPLETIONS)),
         ("/v1/embeddings", Emits::Usage(EMBEDDINGS)),
