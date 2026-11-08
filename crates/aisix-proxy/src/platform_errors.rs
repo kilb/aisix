@@ -596,6 +596,7 @@ fn keeps_own_envelope(err: &ProxyError) -> bool {
             | ProxyError::ContentFiltered { .. }
             | ProxyError::BudgetExceeded(_)
             | ProxyError::BudgetUnverified
+            | ProxyError::AccountUnavailable
             | ProxyError::RateLimit(_)
             | ProxyError::ModelRateLimit(_)
             | ProxyError::PolicyRateLimit { .. }
@@ -1594,6 +1595,7 @@ mod tests {
             | ProxyError::ContentFiltered { .. }
             | ProxyError::BudgetExceeded(_)
             | ProxyError::BudgetUnverified
+            | ProxyError::AccountUnavailable
             | ProxyError::RateLimit(_)
             | ProxyError::ModelRateLimit(_)
             | ProxyError::PolicyRateLimit { .. } => true,
@@ -1673,6 +1675,7 @@ mod tests {
             },
             budget_exceeded_for_team(),
             ProxyError::BudgetUnverified,
+            ProxyError::AccountUnavailable,
             ProxyError::RequestTooLarge { limit_bytes: 1 },
             ProxyError::RateLimit(limited()),
             ProxyError::ModelRateLimit(limited()),
