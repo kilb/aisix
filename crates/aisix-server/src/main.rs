@@ -1521,10 +1521,11 @@ async fn run(mut cfg: Config, hangup: Option<HangupSignal>) -> anyhow::Result<()
             &h.mtls,
         )));
     }
-    // The account lookups (`GET /v1/key`) ask the control plane through a
-    // client of their own, never one model traffic or another control-plane
-    // channel uses. Without a bundle there is no control plane to ask, and the
-    // route answers 404.
+    // The account lookups (`GET /v1/key`, `GET /v1/generation` and the
+    // prices of the model listing) ask the control plane through a client of
+    // their own, never one model traffic or another control-plane channel
+    // uses. Without a bundle there is no control plane to ask, and the
+    // routes answer 404.
     if let Some(h) = heartbeat_cfg.as_ref() {
         match heartbeat::build_account_client(&h.mtls) {
             Ok(http) => {

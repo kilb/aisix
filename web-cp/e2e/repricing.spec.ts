@@ -110,8 +110,8 @@ test("重新计价：先预览影响的调用数与各租户差额，再由管�
   await login(page, stack.operator.email, stack.operator.password);
   await preview(page, world, model);
 
-  await expect(totals(page).getByRole("row", { name: /选中的调用/ })).toContainText("3");
-  await expect(totals(page).getByRole("row", { name: /有变化/ })).toContainText("3");
+  await expect(totals(page).getByRole("row", { name: /选中的调用/ }).getByRole("cell")).toHaveText("3");
+  await expect(totals(page).getByRole("row", { name: /有变化/ }).getByRole("cell")).toHaveText("3");
   await expect(totals(page).getByRole("row", { name: /合计差额/ })).toContainText("$0.033");
   expect(CALL_MICRO_USD * 3).toBe(33_000);
   await expect(page.getByRole("table", { name: "各租户差额" }).getByRole("row", { name: new RegExp(world.tenantName) })).toContainText("$0.033");
@@ -261,4 +261,31 @@ test("价格调低之后重新计价是退还，合计与运行记录都写明�
   await expect(total).toContainText("退还");
   await expect(page.getByRole("table", { name: "重新计价运行" }).getByRole("row", { name: /退还-ui/ })).toContainText("退还");
   await expect(page.getByRole("table", { name: "各租户差额" }).getByRole("row", { name: new RegExp(world.tenantName) })).toContainText("退还");
+});
+
+test("预览了另一次运行后，上一次打开的确认执行不会带过去", async ({ page }) => {
+  const { world, model } = await unpricedWorld();
+  await price(model.id, CARD);
+  await login(page, stack.operator.email, stack.operator.password);
+  await preview(page, world, model, "键-A-ui");
+  await page.getByRole("button", { name: "执行", exact: true }).click();
+  await expect(page.getByRole("button", { name: "确认执行" })).toBeVisible();
+
+  // Previewing another run swaps what is shown: the armed step belongs to run A and must be gone.
+  const form = page.getByRole("form", { name: "新建重新计价" });
+  await form.getByLabel("原因").fill("键-B-ui");
+  await form.getByRole("button", { name: "预览", exact: true }).click();
+  await expect(page.getByRole("region", { name: "预览结果" }).getByText("键-B-ui")).toBeVisible();
+  await expect(page.getByRole("button", { name: "确认执行" })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "执行", exact: true })).toBeVisible();
+  expect((await ledger(world)).filter((e) => e.kind === "adjustment")).toHaveLength(0);
+});
+
+test("对账里未计价的原因显示中文名称", async ({ page }) => {
+  await unpricedWorld();
+  await login(page, stack.operator.email, stack.operator.password);
+  await page.getByRole("button", { name: "对账", exact: true }).click();
+  const unpriced = page.getByRole("region", { name: "近 24 小时未计价", exact: true });
+  await expect(unpriced.getByRole("rowheader", { name: "未定价", exact: true })).toBeVisible();
+  await expect(unpriced).not.toContainText("missing_price");
 });

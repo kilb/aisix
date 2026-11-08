@@ -217,7 +217,7 @@ pub async fn dp_quota(
 ) -> Result<Json<Value>, ApiError> {
     let key_id = Uuid::parse_str(&key_id).map_err(|_| ApiError::not_found())?;
     let found = state
-        .db
+        .lookups
         .tx(move |conn| {
             async move {
                 match key_access(&mut *conn, key_id).await? {

@@ -934,3 +934,99 @@ async fn a_lookups_statement_timeout_ends_with_its_transaction() {
         held.push(c);
     }
 }
+
+/// How many sessions of the test database wait on a lock now, read on
+/// `conn` (which may hold a transaction open: the activity snapshot is
+/// cleared first).
+async fn sessions_waiting_on_a_lock(conn: &mut sqlx::PgConnection) -> i64 {
+    sqlx::query("SELECT pg_stat_clear_snapshot()")
+        .execute(&mut *conn)
+        .await
+        .expect("clear the activity snapshot");
+    sqlx::query_scalar(
+        "SELECT count(*)::bigint FROM pg_stat_activity \
+         WHERE datname = current_database() AND wait_event_type = 'Lock'",
+    )
+    .fetch_one(&mut *conn)
+    .await
+    .expect("count the waiting sessions")
+}
+
+/// The gateway lookups run on a pool of their own: however many lookups a
+/// gateway sends and however long they take, they hold at most that pool's
+/// connections, and a usage batch delivered meanwhile commits in its usual
+/// time. Each lookup that finds no connection is refused within a second.
+///
+/// A request lookup reads the re-pricing adjustments, which intake never
+/// touches; with that table locked, every lookup that has a connection
+/// waits on it until its statement timeout.
+#[tokio::test]
+async fn stalled_lookups_never_hold_up_usage_intake() {
+    use aisix_control_plane::billing::access::LOOKUP_POOL_SIZE;
+    use std::time::{Duration, Instant};
+
+    const LOOKUPS: usize = 12;
+    let Some(w) = world().await else { return };
+    let m = model(&w, "chat-bill", true).await;
+    let t0 = base(&w.cp).await;
+    send_all(
+        &w,
+        vec![row(&w, "pool-1", "req-lk-pool", m, t0, tokens_680())],
+    )
+    .await;
+
+    let mut holder = w.cp.db().pool().begin().await.expect("begin");
+    sqlx::query("LOCK TABLE pricing_adjustments IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *holder)
+        .await
+        .expect("hold the adjustments");
+
+    let lookups = futures::future::join_all((0..LOOKUPS).map(|_| async {
+        let started = Instant::now();
+        let r = lookup(&w.dp, &w.key, "req-lk-pool").await;
+        (r, started.elapsed())
+    }));
+    let intake = async {
+        // Once the lookups hold connections and wait on the lock, deliver.
+        let mut most = 0;
+        while most < i64::from(LOOKUP_POOL_SIZE) {
+            most = most.max(sessions_waiting_on_a_lock(&mut holder).await);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let started = Instant::now();
+        send_all(
+            &w,
+            vec![row(&w, "pool-2", "req-lk-pool-2", m, t0, tokens_680())],
+        )
+        .await;
+        let took = started.elapsed();
+        most = most.max(sessions_waiting_on_a_lock(&mut holder).await);
+        (took, most)
+    };
+    let (answers, (intake_took, most_waiting)) = tokio::join!(lookups, intake);
+    holder.rollback().await.expect("release the adjustments");
+
+    assert!(
+        intake_took < Duration::from_secs(1),
+        "the batch took {intake_took:?} while the lookups were stalled"
+    );
+    assert_eq!(
+        most_waiting,
+        i64::from(LOOKUP_POOL_SIZE),
+        "lookups holding a connection"
+    );
+    for (r, took) in &answers {
+        assert_eq!(
+            (r.status, &r.body["code"]),
+            (503, &json!("unavailable")),
+            "{r:?}"
+        );
+        assert!(*took < Duration::from_secs(3), "a lookup took {took:?}");
+    }
+
+    // Released, the lookups are served again, and the batch was stored.
+    assert_eq!(
+        items(&lookup(&w.dp, &w.key, "req-lk-pool-2").await).len(),
+        1
+    );
+}

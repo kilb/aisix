@@ -219,7 +219,7 @@ pub async fn prices(
     // One transaction, so every query shares one `now()` (not one data
     // snapshot: see the order of the reads in `tenant_prices`).
     let found = state
-        .db
+        .lookups
         .tx(move |conn| async move { tenant_prices(conn, key_id).await }.boxed())
         .await?;
     found.map(Json).ok_or_else(ApiError::not_found)

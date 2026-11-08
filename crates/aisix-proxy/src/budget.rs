@@ -340,13 +340,7 @@ impl BudgetGate {
         let resets_at = mark
             .has_period_start
             .then(|| next_period_start(period_start(self.now, budget.period), budget.period));
-        // Amounts are restated in the dollar-string form the response has
-        // always carried.
-        let amount = |v: &Option<String>| {
-            v.as_deref()
-                .and_then(|s| s.trim().parse::<f64>().ok())
-                .map(|n| format!("{n:.2}"))
-        };
+        let amount = |v: &Option<String>| v.as_deref().and_then(restate_usd);
         let scope = doc
             .scope
             .clone()
@@ -373,6 +367,30 @@ impl BudgetGate {
             retry_after_seconds: resets_at.map(|t| (t - self.now).num_seconds().max(0) as u64),
         }
     }
+}
+
+/// `s`, a dollar amount a budget document wrote, as a refusal states it:
+/// with at least two decimals, as budgets have always been shown, and every
+/// decimal `s` carries, so an exact amount is never rounded. No float is
+/// involved: an amount with at most two decimals reads exactly as it always
+/// has (`"12.5"` is `"12.50"`, `"007"` is `"7.00"`). `None` for anything
+/// that is not a plain decimal.
+fn restate_usd(s: &str) -> Option<String> {
+    let s = s.trim();
+    let (sign, digits) = match s.strip_prefix('-') {
+        Some(rest) => ("-", rest),
+        None => ("", s.strip_prefix('+').unwrap_or(s)),
+    };
+    let (whole, frac) = digits.split_once('.').unwrap_or((digits, ""));
+    let numeric = |part: &str| part.bytes().all(|b| b.is_ascii_digit());
+    if (whole.is_empty() && frac.is_empty()) || !numeric(whole) || !numeric(frac) {
+        return None;
+    }
+    let whole = match whole.trim_start_matches('0') {
+        "" => "0",
+        whole => whole,
+    };
+    Some(format!("{sign}{whole}.{frac:0<2}"))
 }
 
 /// An exhausted mark in force, and whether it named the period it was set in.
@@ -708,6 +726,61 @@ mod tests {
         assert_eq!(r.period_resets_at.as_deref(), Some("2026-11-01T00:00:00Z"));
         assert_eq!(r.retry_after_seconds, Some(3600));
         assert_eq!(r.gauges().remaining_usd, Some(-0.5));
+    }
+
+    /// The control plane writes a mark's amounts as exact six-decimal
+    /// strings; a refusal states them as written, never rounded to cents.
+    #[test]
+    fn an_exact_amount_is_restated_as_written_never_rounded() {
+        let mut doc = exhausted("api_key", serde_json::json!({"scope_ref": "k-1"}), None);
+        doc["exhausted"]["reason"] = serde_json::json!({
+            "scope": "api_key", "scope_ref": "k-1", "period": "total",
+            "limit_usd": "0.050000", "spent_usd": "0.054321", "remaining_usd": "-0.004321",
+        });
+        let snap = snapshot_with(&[("b-1", doc)]);
+        let k = key(&snap, "k-1", serde_json::json!({}));
+        let Verdict::Exceeded(r) = gate_at(&snap, at(2026, 11, 7, 13), false).key_verdict(&k)
+        else {
+            panic!("the key is denied")
+        };
+        assert_eq!(r.spent_usd.as_deref(), Some("0.054321"));
+        assert_eq!(r.limit_usd.as_deref(), Some("0.050000"));
+        assert_eq!(r.remaining_usd.as_deref(), Some("-0.004321"));
+        assert_eq!(r.gauges().remaining_usd, Some(-0.004321));
+    }
+
+    /// An amount with at most two decimals reads exactly as the float
+    /// restatement used to give it, whatever spelling of a plain decimal it
+    /// came in; anything else is left out.
+    #[test]
+    fn an_amount_with_at_most_two_decimals_keeps_its_old_bytes() {
+        for s in [
+            "0",
+            "-0",
+            "0.00",
+            "5",
+            "+5",
+            "5.",
+            ".5",
+            "-.5",
+            "007.5",
+            "12.5",
+            "100",
+            "10.25",
+            "-0.25",
+            " 3.1 ",
+            "1234567.89",
+            "-1234567.8",
+        ] {
+            let old = format!("{:.2}", s.trim().parse::<f64>().unwrap());
+            assert_eq!(restate_usd(s), Some(old), "{s:?}");
+        }
+        for s in [
+            "", " ", "-", "+", ".", "-.", "+-1", "--1", "abc", "1.2.3", "1,5", "1 000", "1e2",
+            "inf", "NaN", "0x10",
+        ] {
+            assert_eq!(restate_usd(s), None, "{s:?}");
+        }
     }
 
     #[test]

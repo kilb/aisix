@@ -219,6 +219,17 @@ statement.
   `another_tenants_request_id_answers_like_an_unknown_one`,
   `a_role_change_shows_at_the_next_lookup` and
   `an_unknown_or_revoked_key_is_not_found` pin it.
+- **The `/dp/v1` lookups run on a pool of their own, so they can never starve
+  intake.** `GET /dp/v1/keys/{key_id}/{quota,prices,requests}` run on
+  `AppState::lookups`: `access::LOOKUP_POOL_SIZE` (3) connections, each
+  waited for at most `access::LOOKUP_ACQUIRE_TIMEOUT` (1 s) before the lookup
+  answers `503`, which a gateway reads as the control plane being
+  unavailable. A gateway asks on its callers' behalf, as often as they ask;
+  it caps each key's request-cost lookups in flight, but nothing caps the
+  keys or the gateways, so on the shared pool the lookups could hold every
+  connection usage intake and the browser routes need. A new gateway lookup
+  runs on `state.lookups`, never `state.db`, and takes no lock.
+  `stalled_lookups_never_hold_up_usage_intake` pins it.
 - **Each quota level writes only its own rows, and no write compares
   levels.** A quota is a `billing_budgets` row with its own document, one per
   setter: the operators' `team` rows (`set_by 'operator'`), an owner's or

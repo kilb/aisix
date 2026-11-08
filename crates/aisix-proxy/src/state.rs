@@ -430,9 +430,10 @@ pub struct ProxyStateInner {
     pub default_timeouts: crate::routing::TimeoutDefaults,
     /// Platform mode settings; `None` while `proxy.platform.enabled` is off.
     platform: Option<Arc<crate::platform::PlatformSettings>>,
-    /// The client of the account lookups (`GET /v1/key`), `None` without a
-    /// control plane to ask: a resources file, or managed mode without a
-    /// certificate bundle.
+    /// The client of the account lookups (`GET /v1/key`, `GET /v1/generation`
+    /// and the prices of the model listing), `None` without a control plane
+    /// to ask: a resources file, or managed mode without a certificate
+    /// bundle.
     pub(crate) account: Option<Arc<crate::account::AccountClient>>,
 }
 

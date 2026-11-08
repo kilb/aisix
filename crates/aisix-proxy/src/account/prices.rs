@@ -19,8 +19,8 @@
 //! [`crate::platform::tenant_owner`]: the key document's team, or the key
 //! itself for a key in no team, so one tenant's entry, a failure included,
 //! never answers another. An answer lives [`PRICES_TTL`], or until its
-//! `valid_until` (the next scheduled price change) when that comes sooner. A
-//! `None` lives [`PRICES_FAILURE_TTL`], so a control plane that cannot answer
+//! `valid_until` (the next scheduled price change) when that comes sooner,
+//! but never less than [`PRICES_MIN_TTL`]. A `None` lives [`PRICES_FAILURE_TTL`], so a control plane that cannot answer
 //! costs a tenant's listings at most one [`PRICES_TIMEOUT`] per
 //! [`PRICES_FAILURE_TTL`]. Concurrent listings of one tenant share one fetch,
 //! which a listing hanging up never cancels ([`SharedLookup`]), and the cache
@@ -43,6 +43,10 @@ use super::{key_path, AccountClient, SharedLookup};
 pub const PRICES_TIMEOUT: Duration = Duration::from_millis(500);
 /// How long a tenant's prices are served from the cache, at most.
 pub const PRICES_TTL: Duration = Duration::from_secs(10);
+/// How long a tenant's prices are served from the cache, at least: a
+/// gateway clock past an answer's `valid_until` (ahead of the control
+/// plane's) must not turn every listing into a fetch.
+pub const PRICES_MIN_TTL: Duration = Duration::from_secs(1);
 /// How long a tenant whose prices could not be fetched is listed without
 /// them before the control plane is asked again.
 pub const PRICES_FAILURE_TTL: Duration = Duration::from_secs(2);
@@ -113,19 +117,20 @@ type Prices = Option<Arc<TenantPricesAnswer>>;
 pub(crate) type PricesCache = SharedLookup<Prices>;
 
 /// An answer lives [`PRICES_TTL`], or until its `valid_until` when that is
-/// sooner; a `404`, like a failure, lives [`PRICES_FAILURE_TTL`].
+/// sooner, and at least [`PRICES_MIN_TTL`]; a `404`, like a failure, lives
+/// [`PRICES_FAILURE_TTL`].
 fn prices_ttl(prices: &Prices) -> Duration {
     let Some(answer) = prices else {
         return PRICES_FAILURE_TTL;
     };
     match answer.valid_until {
         None => PRICES_TTL,
-        // A `valid_until` already past (or a clock behind the control
-        // plane's) keeps nothing: the next listing asks again.
+        // A `valid_until` already past by this gateway's clock (one ahead of
+        // the control plane's) still keeps the answer for PRICES_MIN_TTL.
         Some(until) => (until - Utc::now())
             .to_std()
             .unwrap_or(Duration::ZERO)
-            .min(PRICES_TTL),
+            .clamp(PRICES_MIN_TTL, PRICES_TTL),
     }
 }
 
@@ -396,7 +401,32 @@ mod tests {
             soon > Duration::from_millis(2_500) && soon <= Duration::from_secs(3),
             "{soon:?}"
         );
+        // A change due in less than PRICES_MIN_TTL, or one this gateway's
+        // clock already shows as past, keeps the answer PRICES_MIN_TTL.
+        let imminent = Utc::now() + chrono::Duration::milliseconds(300);
+        assert_eq!(prices_ttl(&answer(Some(imminent))), PRICES_MIN_TTL);
         let past = Utc::now() - chrono::Duration::seconds(3);
-        assert_eq!(prices_ttl(&answer(Some(past))), Duration::ZERO);
+        assert_eq!(prices_ttl(&answer(Some(past))), PRICES_MIN_TTL);
+    }
+
+    /// An answer whose `valid_until` this gateway's clock shows as past (a
+    /// clock ahead of the control plane's) is still served from the cache
+    /// for `PRICES_MIN_TTL`, so listings back to back share one fetch.
+    #[tokio::test]
+    async fn an_answer_already_past_its_valid_until_is_kept_a_moment() {
+        let stand_in = StandIn::start(Arc::new(|_| {
+            let mut body = priced("m-1");
+            body["valid_until"] = json!((Utc::now() - chrono::Duration::seconds(5)).to_rfc3339());
+            ok(body)
+        }))
+        .await;
+        let client = stand_in.client();
+        for key in ["k-1", "k-2", "k-3"] {
+            assert!(client.tenant_prices("team:a", key).await.is_some());
+        }
+        assert_eq!(stand_in.hits(), 1, "within PRICES_MIN_TTL");
+        tokio::time::sleep(PRICES_MIN_TTL + Duration::from_millis(300)).await;
+        assert!(client.tenant_prices("team:a", "k-4").await.is_some());
+        assert_eq!(stand_in.hits(), 2, "past PRICES_MIN_TTL");
     }
 }

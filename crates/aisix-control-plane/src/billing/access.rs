@@ -4,12 +4,29 @@
 //! One query decides every lookup's "unknown or revoked key" (`None`, which
 //! the routes answer as `404`), and reads the key's member's CURRENT role in
 //! the same statement, so a role change shows at the next lookup.
+//!
+//! The gateway routes (`GET /dp/v1/keys/{key_id}/{quota,prices,requests}`)
+//! run on a pool of their own ([`crate::AppState::lookups`]), of
+//! [`LOOKUP_POOL_SIZE`] connections: a gateway asks on its callers' behalf,
+//! as often as they ask, and a lookup on the shared pool would take the
+//! connections usage intake needs. A lookup that finds no connection free
+//! within [`LOOKUP_ACQUIRE_TIMEOUT`] answers `503`, which a gateway already
+//! reads as the control plane being unavailable.
+
+use std::time::Duration;
 
 use sqlx::PgConnection;
 use uuid::Uuid;
 
 use crate::auth::MemberRole;
 use crate::db::DbError;
+
+/// Connections of the gateway lookups' own pool.
+pub const LOOKUP_POOL_SIZE: u32 = 3;
+
+/// How long a gateway lookup waits for a connection of its pool before it
+/// answers `503`.
+pub const LOOKUP_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// How much of the organization a lookup shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

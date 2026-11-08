@@ -53,8 +53,8 @@ describe("a tenant's own levels cap members and keys at the gateway", () => {
     expect(answer.status, answer.text).toBe(200);
   };
 
-  async function seat(email: string, role: string): Promise<{ portal: CpPortal; id: string }> {
-    const invite = await world!.cp.admin.post(`/admin/tenants/${tenant.id}/invites`, { email, role });
+  async function seat(email: string, role: string, tenantId = tenant.id): Promise<{ portal: CpPortal; id: string }> {
+    const invite = await world!.cp.admin.post(`/admin/tenants/${tenantId}/invites`, { email, role });
     expect(invite.status, invite.text).toBe(201);
     const accepted = await world!.cp.portal().post("/api/invites/accept", {
       token: invite.body.invite_token,
@@ -64,13 +64,13 @@ describe("a tenant's own levels cap members and keys at the gateway", () => {
     const portal = world!.cp.portal();
     const login = await portal.login(email, PASSWORD);
     expect(login.status, login.text).toBe(200);
-    const members = await world!.cp.admin.get(`/admin/tenants/${tenant.id}/members`);
+    const members = await world!.cp.admin.get(`/admin/tenants/${tenantId}/members`);
     const id = (members.body.items as Json[]).find((m) => m.email === email).id as string;
     return { portal, id };
   }
 
-  async function mint(label: string, memberId: string): Promise<{ plaintext: string; id: string }> {
-    const minted = await world!.cp.admin.post(`/admin/tenants/${tenant.id}/keys`, { label, member_id: memberId });
+  async function mint(label: string, memberId: string, tenantId = tenant.id): Promise<{ plaintext: string; id: string }> {
+    const minted = await world!.cp.admin.post(`/admin/tenants/${tenantId}/keys`, { label, member_id: memberId });
     expect(minted.status, minted.text).toBe(201);
     const proxy = new ProxyClient(world!.gateway.proxyUrl, minted.body.plaintext);
     await pollUntil(`${label} to authenticate`, async () =>
@@ -148,6 +148,53 @@ describe("a tenant's own levels cap members and keys at the gateway", () => {
     const raised = await member.patch(`/api/budgets/${cap.body.id}`, { limit_usd: "1.00" });
     expect(raised.status, raised.text).toBe(200);
     await chatsAnswer(k2, 200, "K2 to be served after the cap was raised");
+  });
+
+  test("A refusal states the cap's figures exactly as the key's own lookup does", async () => {
+    // A tenant with a 20 % discount pays $0.008 a call, so its spend is not
+    // whole cents. Its member caps key KX at $0.01 in total, which the second
+    // call passes, at $0.016.
+    const exact = await world!.tenant("Quotas Exact Co", {
+      setup: async (id) => {
+        await fundTenant(world!.cp, id, "1.00");
+        const discount = await world!.cp.admin.post("/admin/pricing/discounts", {
+          tenant_id: id,
+          effective_from: new Date().toISOString(),
+          discount_bps: 2000,
+        });
+        expect(discount.status, discount.text).toBe(201);
+      },
+    });
+    const holder = await seat("member@quotas-exact-e2e.test", "member", exact.id);
+    const kx = await mint("kx", holder.id, exact.id);
+    const cap = await holder.portal.post("/api/budgets", { scope: "api_key", scope_ref: kx.id, kind: "cumulative", limit_usd: "0.01" });
+    expect(cap.status, cap.text).toBe(201);
+    await served(kx.plaintext);
+    await served(kx.plaintext);
+
+    // Nothing more is sent until the gateway holds the cap's mark, so the
+    // spend stays at the two calls.
+    let last = "no read";
+    await pollUntil(
+      "KX's cap to carry its mark at the gateway",
+      async () => {
+        const res = await world!.cp.admin.get(`/admin/resources/budgets/${cap.body.id}`);
+        last = res.text;
+        return res.status === 200 && res.body.doc?.exhausted && res.body.rollout?.state === "applied" ? true : undefined;
+      },
+      { timeoutMs: 30_000, intervalMs: 250, describe: () => last },
+    );
+    const refused = await chat(kx.plaintext);
+    expect(refused.status, refused.text).toBe(429);
+    expect(refused.json?.error?.code, refused.text).toBe("budget_exceeded");
+    expect(refused.json?.error?.scope, refused.text).toBe("api_key");
+
+    const lookup = await callGateway(world!.gateway.proxyUrl, kx.plaintext, "/v1/key", undefined);
+    expect(lookup.status, lookup.text).toBe(200);
+    const keyCap = (lookup.json.data.budgets as Json[]).find((b) => b.scope === "api_key");
+    expect(keyCap?.spend_usd, lookup.text).toBe("0.016000");
+    expect(refused.json.error.spent_usd, refused.text).toBe(keyCap.spend_usd);
+    expect(refused.json.error.limit_usd, refused.text).toBe(keyCap.limit_usd);
   });
 
   test("A member cannot touch what an owner set", async () => {

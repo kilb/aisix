@@ -1,4 +1,4 @@
-// One copy per app (ruling P2c-R4): web-cp/src/lib/money.ts is the same file.
+// One copy per app (ruling P2c-R4): web-cp/src/lib/money.ts and web-tenant/src/lib/money.ts are byte-equal (pinned by tokenParity.test.ts).
 // Change both in the same commit.
 
 const MICRO_PER_USD = 1_000_000n;
