@@ -82,6 +82,14 @@ export function PricingImport({ canEdit, onGoto }: TabProps) {
   const [selected, setSelected] = useState<string | null>(null);
   /** The dataset's own notes for each entry, read from the file uploaded in this session. */
   const [comments, setComments] = useState<Record<string, string>>({});
+  /**
+   * The batch whose file those notes came from. One file's notes are a claim
+   * about that file's prices, so they are shown only while its batch is on
+   * screen: uploading B and stepping back to A must not put B's notes beside
+   * A's proposals. Held with its batch and compared on every read, the way the
+   * attestation is, rather than cleared by each handler that changes one.
+   */
+  const [commentsFor, setCommentsFor] = useState<string | null>(null);
   const [picked, setPicked] = useState<Set<string>>(new Set());
   /**
    * The batch the attestation was ticked under, not a bare boolean: a tick is
@@ -169,6 +177,8 @@ export function PricingImport({ canEdit, onGoto }: TabProps) {
    * stale one by remembering `true`.
    */
   const attested = attestedFor !== null && attestedFor === batchId;
+  /** The notes this page may show: its own file's, and no other batch's. */
+  const notes = commentsFor !== null && commentsFor === batchId ? comments : {};
 
   /** Switching what is reviewed drops every claim about the last one. */
   function switchBatch(next: string | null) {
@@ -222,13 +232,16 @@ export function PricingImport({ canEdit, onGoto }: TabProps) {
       <div className="side-main">
         <ImportUpload
           canEdit={canEdit}
-          onUploaded={async (batch) => {
+          onUploaded={async (batch, fileNotes) => {
             setFilter("");
             switchBatch(batch.id);
+            // Installed with the batch, not before it: a note is a claim about
+            // the file this batch came from, so it is held with that batch's id.
+            setComments(fileNotes);
+            setCommentsFor(batch.id);
             await loadBatches();
             await loadProposals(batch.id, all);
           }}
-          onNotes={(c) => setComments(c)}
         />
 
         <div className="panel">
@@ -408,11 +421,11 @@ export function PricingImport({ canEdit, onGoto }: TabProps) {
                             </button>
                             <span className="cell-note">
                               <span className="tag">第三方数据</span>
-                              {comments[entry] && (
+                              {notes[entry] && (
                                 <>
                                   {" "}
-                                  <span className="trunc" title={comments[entry]}>
-                                    {comments[entry]}
+                                  <span className="trunc" title={notes[entry]}>
+                                    {notes[entry]}
                                   </span>
                                 </>
                               )}
@@ -441,7 +454,7 @@ export function PricingImport({ canEdit, onGoto }: TabProps) {
           key={detail.id}
           batchId={batchId}
           proposal={detail}
-          comment={comments[`${detail.provider}/${detail.model}`] ?? null}
+          comment={notes[`${detail.provider}/${detail.model}`] ?? null}
           models={models}
           canEdit={canEdit}
           onClose={() => setSelected(null)}
@@ -457,11 +470,9 @@ export function PricingImport({ canEdit, onGoto }: TabProps) {
 function ImportUpload({
   canEdit,
   onUploaded,
-  onNotes,
 }: {
   canEdit: boolean;
-  onUploaded: (batch: ImportBatch) => Promise<void>;
-  onNotes: (notes: Record<string, string>) => void;
+  onUploaded: (batch: ImportBatch, notes: Record<string, string>) => Promise<void>;
 }) {
   const toast = useToast();
   const [ref, focusRefusal] = useRefusalFocus<HTMLFormElement>();
@@ -504,11 +515,10 @@ function ImportUpload({
       // refused must not leave its notes beside an earlier file's proposals —
       // and replacing the last file's rather than merging with them, since the
       // label says which dataset they come from.
-      onNotes(datasetNotes(text));
       toast("已上传");
       setFile(null);
       setRevision("");
-      await onUploaded(batch);
+      await onUploaded(batch, datasetNotes(text));
     } catch (err) {
       if (err instanceof ApiError && err.code === "payload_too_large") {
         setFailure("数据集文件过大，控制面拒绝接收（上限 8 MiB）");
