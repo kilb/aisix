@@ -28,6 +28,8 @@ const TEXT: Record<string, string> = {
   payload_too_large: "提交的内容过大（上限 1 MiB）",
   internal: "控制面内部错误，请稍后重试",
   unavailable: "控制面暂时不可用，请稍后重试",
+  stale_preview: "预览之后价格或数据有变化，请重新预览",
+  run_state: "这次重新计价已经执行过，无法再次执行",
 };
 
 export function messageFor(e: ApiError): string {
