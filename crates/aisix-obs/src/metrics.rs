@@ -845,7 +845,81 @@ struct MetricsInner {
     /// [`Metrics::usage_event_drop_totals`]. Kept apart from the recorder
     /// because the operator's label selection may leave `reason` out of
     /// the rendered series, and the control plane needs it either way.
-    usage_event_drops: Mutex<BTreeMap<String, u64>>,
+    usage_event_drops: UsageDropTally,
+}
+
+/// Every `reason` `aisix_usage_event_drops_total` is recorded with today,
+/// one [`UsageDropTally`] slot each: the queue's (`sink_full`,
+/// `sink_closed`, `sink_disabled`) and the sender's.
+const USAGE_DROP_REASONS: [&str; 7] = [
+    "sink_full",
+    "sink_closed",
+    "sink_disabled",
+    "send_failed",
+    "send_unconfirmed",
+    "oversized",
+    "retry_budget_exhausted",
+];
+
+/// The per-reason drop counts behind [`Metrics::usage_event_drop_totals`].
+///
+/// A known reason is one atomic add on its own slot, so the drop branch of
+/// the request path takes no lock even while the queue is full and every
+/// request drops. A slot adds with `fetch_add`, which wraps instead of
+/// saturating: at a billion drops a second a `u64` takes over 580 years to
+/// wrap, so no process lives to see it.
+#[derive(Default)]
+struct UsageDropTally {
+    known: [std::sync::atomic::AtomicU64; USAGE_DROP_REASONS.len()],
+    /// A reason missing from [`USAGE_DROP_REASONS`], counted under its own
+    /// name as the metric does. No caller records one today; a reason added
+    /// later without a slot stays counted, behind a lock.
+    other: Mutex<BTreeMap<&'static str, u64>>,
+}
+
+impl UsageDropTally {
+    fn add(&self, reason: &'static str, n: u64) {
+        if n == 0 {
+            return;
+        }
+        match USAGE_DROP_REASONS.iter().position(|known| *known == reason) {
+            Some(slot) => {
+                self.known[slot].fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+            }
+            None => {
+                let mut other = self
+                    .other
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let count = other.entry(reason).or_default();
+                *count = count.saturating_add(n);
+            }
+        }
+    }
+
+    fn totals(&self) -> BTreeMap<String, u64> {
+        let mut totals: BTreeMap<String, u64> = USAGE_DROP_REASONS
+            .iter()
+            .zip(&self.known)
+            .map(|(reason, count)| {
+                (
+                    reason.to_string(),
+                    count.load(std::sync::atomic::Ordering::Relaxed),
+                )
+            })
+            .filter(|(_, count)| *count > 0)
+            .collect();
+        let other = self
+            .other
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        totals.extend(
+            other
+                .iter()
+                .map(|(reason, count)| (reason.to_string(), *count)),
+        );
+        totals
+    }
 }
 
 /// A gauge family whose label set can outlive what it describes.
@@ -1270,7 +1344,7 @@ impl Metrics {
                 memory: crate::memory::MemoryProbes::new(),
                 last_exporters: Mutex::new(Vec::new()),
                 usage_delivery: crate::usage_delivery::UsageDeliveryHealth::default(),
-                usage_event_drops: Mutex::new(BTreeMap::new()),
+                usage_event_drops: UsageDropTally::default(),
             }),
         })
     }
@@ -2967,45 +3041,48 @@ impl Metrics {
     ///
     /// Each drop is also tallied by `reason` alone, for the heartbeat
     /// ([`Self::usage_event_drop_totals`]).
-    pub fn record_usage_event_drop(&self, reason: &str, labels: UsageEventLabels<'_>) {
-        {
-            let mut drops = self
-                .inner
-                .usage_event_drops
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            match drops.get_mut(reason) {
-                Some(count) => *count = count.saturating_add(1),
-                None => {
-                    drops.insert(reason.to_string(), 1);
-                }
-            }
+    pub fn record_usage_event_drop(&self, reason: &'static str, labels: UsageEventLabels<'_>) {
+        self.record_usage_event_drops(reason, [labels]);
+    }
+
+    /// [`Self::record_usage_event_drop`] for several events dropped for one
+    /// `reason`, one label set each (a batch the sender gives up on). The
+    /// per-reason tally takes the whole count in one add.
+    pub fn record_usage_event_drops<'a>(
+        &self,
+        reason: &'static str,
+        labels: impl IntoIterator<Item = UsageEventLabels<'a>>,
+    ) {
+        let mut dropped = 0u64;
+        for labels in labels {
+            dropped += 1;
+            self.cached_counter(
+                M_USAGE_EVENT_DROPS_TOTAL,
+                1,
+                |k| {
+                    k.label(reason);
+                    k.label(labels.model);
+                    k.label(labels.provider_key_id);
+                    k.label(labels.provider_key_name);
+                    k.label(labels.user_id);
+                    k.label(labels.user_name);
+                    k.label(labels.upstream_protocol);
+                },
+                || {
+                    metrics::counter!(
+                        M_USAGE_EVENT_DROPS_TOTAL,
+                        "reason" => reason.to_string(),
+                        "model" => labels.model.to_string(),
+                        "provider_key_id" => labels.provider_key_id.to_string(),
+                        "provider_key_name" => labels.provider_key_name.to_string(),
+                        "user_id" => labels.user_id.to_string(),
+                        "user_name" => labels.user_name.to_string(),
+                        "upstream_protocol" => labels.upstream_protocol.to_string(),
+                    )
+                },
+            );
         }
-        self.cached_counter(
-            M_USAGE_EVENT_DROPS_TOTAL,
-            1,
-            |k| {
-                k.label(reason);
-                k.label(labels.model);
-                k.label(labels.provider_key_id);
-                k.label(labels.provider_key_name);
-                k.label(labels.user_id);
-                k.label(labels.user_name);
-                k.label(labels.upstream_protocol);
-            },
-            || {
-                metrics::counter!(
-                    M_USAGE_EVENT_DROPS_TOTAL,
-                    "reason" => reason.to_string(),
-                    "model" => labels.model.to_string(),
-                    "provider_key_id" => labels.provider_key_id.to_string(),
-                    "provider_key_name" => labels.provider_key_name.to_string(),
-                    "user_id" => labels.user_id.to_string(),
-                    "user_name" => labels.user_name.to_string(),
-                    "upstream_protocol" => labels.upstream_protocol.to_string(),
-                )
-            },
-        );
+        self.inner.usage_event_drops.add(reason, dropped);
     }
 
     /// The usage events dropped since the process started, by `reason`:
@@ -3014,11 +3091,7 @@ impl Metrics {
     /// heartbeat reports it to the control plane, so lost usage shows there
     /// and not only on this gateway's scrape.
     pub fn usage_event_drop_totals(&self) -> BTreeMap<String, u64> {
-        self.inner
-            .usage_event_drops
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
+        self.inner.usage_event_drops.totals()
     }
 
     /// Issue #408: bump on every `UsageSink::try_emit` call (the
@@ -6467,8 +6540,9 @@ mod tests {
 
     /// The per-reason tally the heartbeat reports counts exactly what the
     /// drops metric counts: the telemetry worker records on its own clone
-    /// of `Metrics`, the heartbeat reads another, and one reason's drops
-    /// spread over several label sets.
+    /// of `Metrics`, the heartbeat reads another, one reason's drops spread
+    /// over several label sets, a batch is counted whole, and a reason
+    /// without a slot of its own is still counted under its name.
     #[test]
     fn drop_totals_count_every_reason_the_metric_counts() {
         let m = Metrics::new(false);
@@ -6483,11 +6557,21 @@ mod tests {
             },
         );
         worker.record_usage_event_drop("send_failed", UsageEventLabels::default());
+        worker.record_usage_event_drops(
+            "retry_budget_exhausted",
+            [PK_A, PK_A, UsageEventLabels::default()],
+        );
+        worker.record_usage_event_drop("a_reason_without_a_slot", PK_A);
 
         let totals = m.usage_event_drop_totals();
         assert_eq!(
             totals,
-            BTreeMap::from([("send_failed".to_string(), 1), ("sink_full".to_string(), 2)]),
+            BTreeMap::from([
+                ("a_reason_without_a_slot".to_string(), 1),
+                ("retry_budget_exhausted".to_string(), 3),
+                ("send_failed".to_string(), 1),
+                ("sink_full".to_string(), 2),
+            ]),
         );
 
         let rendered = m.render();

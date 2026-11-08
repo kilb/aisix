@@ -241,12 +241,13 @@ describe("usage the gateway cannot deliver", () => {
       const unconfirmed = metric.send_unconfirmed ?? 0;
       const stored = await storedRows();
       const accounting = `sent ${sent}, stored ${stored}, dropped ${JSON.stringify(metric)}`;
-      if (unconfirmed === 0) {
-        expect(stored + dropped, accounting).toBe(sent);
-      } else {
-        expect(stored, accounting).toBeGreaterThanOrEqual(sent - dropped);
-        expect(stored, accounting).toBeLessThanOrEqual(sent - (dropped - unconfirmed));
-      }
+      // No delivery here is given up on as possibly stored: the first chat's
+      // answer told the gateway the control plane de-duplicates, so a send
+      // the relay held unanswered is re-sent, never abandoned, well inside
+      // this case's time. An unconfirmed drop would be a gateway bug, so
+      // the accounting is exact.
+      expect(unconfirmed, accounting).toBe(0);
+      expect(stored + dropped, accounting).toBe(sent);
     },
     600_000,
   );
