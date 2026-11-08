@@ -430,6 +430,10 @@ pub struct ProxyStateInner {
     pub default_timeouts: crate::routing::TimeoutDefaults,
     /// Platform mode settings; `None` while `proxy.platform.enabled` is off.
     platform: Option<Arc<crate::platform::PlatformSettings>>,
+    /// The client of the account lookups (`GET /v1/key`), `None` without a
+    /// control plane to ask: a resources file, or managed mode without a
+    /// certificate bundle.
+    pub(crate) account: Option<Arc<crate::account::AccountClient>>,
 }
 
 impl std::ops::Deref for ProxyState {
@@ -600,6 +604,7 @@ impl ProxyState {
             default_retries: aisix_core::config::DEFAULT_UPSTREAM_RETRIES,
             default_timeouts: crate::routing::TimeoutDefaults::default(),
             platform: None,
+            account: None,
         })
     }
 
@@ -664,6 +669,7 @@ impl ProxyState {
             default_retries: aisix_core::config::DEFAULT_UPSTREAM_RETRIES,
             default_timeouts: crate::routing::TimeoutDefaults::default(),
             platform: None,
+            account: None,
         })
     }
 
@@ -752,6 +758,7 @@ impl ProxyState {
             default_retries: aisix_core::config::DEFAULT_UPSTREAM_RETRIES,
             default_timeouts: crate::routing::TimeoutDefaults::default(),
             platform: None,
+            account: None,
         })
     }
 
@@ -763,6 +770,12 @@ impl ProxyState {
     /// Install the platform mode settings built at startup.
     pub fn with_platform(mut self, settings: crate::platform::PlatformSettings) -> Self {
         self.platform = Some(Arc::new(settings));
+        self
+    }
+
+    /// Install the account lookups' client, built at startup in managed mode.
+    pub fn with_account(mut self, client: Arc<crate::account::AccountClient>) -> Self {
+        Arc::make_mut(&mut self.inner).account = Some(client);
         self
     }
 

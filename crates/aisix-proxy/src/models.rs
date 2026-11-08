@@ -298,7 +298,7 @@ fn paginate(names: &[String], params: &ListParams) -> (Vec<String>, bool) {
 
 /// The access-log line and request metrics a discovery request owes: these
 /// routes have no dispatch path to write them.
-fn record_discovery(
+pub(crate) fn record_discovery(
     state: &ProxyState,
     auth: &AuthenticatedKey,
     method: &axum::http::Method,
