@@ -186,6 +186,16 @@ impl ApiError {
         Self::new(StatusCode::CONFLICT, "group_retired", "该分组已停用")
     }
 
+    /// A proposal of an import that has already been decided, or superseded
+    /// by a newer upload: the review page is showing a stale row.
+    pub fn proposal_state() -> ApiError {
+        Self::new(
+            StatusCode::CONFLICT,
+            "proposal_state",
+            "该提议已被处理，请刷新",
+        )
+    }
+
     pub fn in_use(referenced_by: Vec<Referrer>) -> ApiError {
         ApiError {
             referenced_by,
