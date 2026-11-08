@@ -18,6 +18,7 @@
 pub mod accounts;
 pub mod budgets;
 pub mod calls;
+pub mod credits;
 pub mod ledger;
 pub mod lookup_prices;
 pub mod marks;

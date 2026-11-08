@@ -211,6 +211,12 @@ fn fixture(method: &str, path: &str, target: &SeededOperator) -> (String, Option
             format!("/admin/billing/topups/{}/reject", Uuid::nil()),
             Some(json!({"reason": "roles"})),
         ),
+        // Operator credits. The tenant matches nothing: 404 once the role
+        // check passed, so nothing is credited.
+        ("POST", "/admin/tenants/{id}/credits") => (
+            format!("/admin/tenants/{}/credits", Uuid::nil()),
+            Some(json!({"amount_usd": "0.05", "reason": "roles"})),
+        ),
         _ => panic!("no fixture for {method} {path}: add one to tests/roles.rs"),
     }
 }

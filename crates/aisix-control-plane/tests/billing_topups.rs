@@ -399,6 +399,10 @@ async fn rejecting_needs_a_reason_and_credits_nothing() {
         json!({"reason": ""}),
         json!({"reason": "   "}),
         json!({"reason": "因".repeat(501)}),
+        // A NUL, which Postgres cannot store, and a line break: refused as
+        // input, not failed in the database.
+        json!({"reason": "未收到\u{0}款项"}),
+        json!({"reason": "未收到\n款项"}),
     ] {
         let r = reject(&s.cp, &s.op, &id, body.clone()).await;
         assert_eq!(r.status, 422, "{body}: {r:?}");
