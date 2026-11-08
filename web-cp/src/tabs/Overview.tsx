@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useState } from "react";
 import type { TabId, TabProps } from "../App";
 import { Msg, type Note } from "../components/Msg";
-import { environment, rollout, type Environment, type RolloutSummary } from "../lib/api";
+import { environment, pricingStatus, rollout, type Environment, type PricingStatus, type RolloutSummary } from "../lib/api";
 import { errorText, fmtInt } from "../lib/fmt";
+import { statusView } from "../lib/pricingStatus";
 import { Button } from "../ui/Button";
 import { Loading } from "../ui/DataTable";
 import { Lamp } from "../ui/Lamp";
@@ -10,6 +11,8 @@ import { TwoStep } from "../ui/TwoStep";
 
 /** How often the summary is read again: about one gateway heartbeat. */
 const REFRESH_MS = 5_000;
+/** The pricing status costs the control plane a query over the charges, so it is read less often. */
+const PRICING_REFRESH_MS = 60_000;
 
 /**
  * Where a document of each kind is edited. Kinds the tenant and key pages
@@ -36,6 +39,8 @@ export function Overview({ operator, onGoto }: TabProps) {
   const isAdmin = operator.role === "admin";
   const [env, setEnv] = useState<Environment | null>(null);
   const [envError, setEnvError] = useState<string | null>(null);
+  const [pricing, setPricing] = useState<PricingStatus | null>(null);
+  const [pricingError, setPricingError] = useState<string | null>(null);
   const [summary, setSummary] = useState<RolloutSummary | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [note, setNote] = useState<Note | null>(null);
@@ -53,6 +58,15 @@ export function Overview({ operator, onGoto }: TabProps) {
     }
   }, []);
 
+  const readPricing = useCallback(async () => {
+    try {
+      setPricing(await pricingStatus.get());
+      setPricingError(null);
+    } catch (e) {
+      setPricingError(errorText(e));
+    }
+  }, []);
+
   useEffect(() => {
     let live = true;
     let timer: number | undefined;
@@ -65,11 +79,14 @@ export function Overview({ operator, onGoto }: TabProps) {
       if (live) timer = window.setTimeout(() => void tick(), REFRESH_MS);
     };
     void tick();
+    void readPricing();
+    const slow = window.setInterval(() => void readPricing(), PRICING_REFRESH_MS);
     return () => {
       live = false;
       window.clearTimeout(timer);
+      window.clearInterval(slow);
     };
-  }, [readSummary]);
+  }, [readSummary, readPricing]);
 
   async function allowDeletes() {
     setBusy(true);
@@ -103,6 +120,7 @@ export function Overview({ operator, onGoto }: TabProps) {
     }
   }
 
+  const pricingView = pricing ? statusView(pricing) : null;
   const s = summary;
   const blocked = s?.projection_blocked;
   return (
@@ -209,6 +227,41 @@ export function Overview({ operator, onGoto }: TabProps) {
             </ul>
           </div>
         )}
+      </div>
+
+      <div className="panel" role="region" aria-label="计价异常">
+        <h2>计价异常</h2>
+        <p className="hint">最近 24 小时没能计价的调用，以及计价引擎不能使用的价格版本。</p>
+        {pricingError && (
+          <div className="note crit" role="alert">
+            读取计价状态失败：{pricingError}
+          </div>
+        )}
+        {pricingView && (pricingView.unpricedTotal > 0 || pricingView.invalid.length > 0) && (
+          <div className="note warn" role="status">
+            有调用没能计价或有价格版本不可用，请查看计价状态。
+          </div>
+        )}
+        <div className="entries">
+          <div className="entry">
+            <span className="lab">未计价调用</span>
+            <span className="val">{pricingView ? fmtInt(pricingView.unpricedTotal) : "…"}</span>
+            <span className="foot">最近 24 小时</span>
+          </div>
+          <div className="entry">
+            <span className="lab">不可用的价格版本</span>
+            <span className="val">{pricingView ? fmtInt(pricingView.invalid.length) : "…"}</span>
+            <span className="foot">计价引擎跳过的版本</span>
+          </div>
+        </div>
+        <Button
+          size="sm"
+          onClick={() => {
+            onGoto("pricing", "status");
+          }}
+        >
+          去「价格 · 计价状态」
+        </Button>
       </div>
 
       <div className="panel">
