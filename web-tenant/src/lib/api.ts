@@ -343,6 +343,125 @@ export const members = {
   },
 };
 
+// ── billing: balance, top-ups, ledger and a key's quota ─────────────────────
+
+/** `GET /api/billing/balance`. `available` is the balance for prepaid, balance plus credit limit for postpaid. */
+export interface Balance {
+  billing_mode: "prepaid" | "postpaid";
+  balance_micro_usd: number;
+  credit_limit_micro_usd: number;
+  available_micro_usd: number;
+  exhausted: boolean;
+  pending_topups: number;
+}
+
+export type LedgerKind = "usage" | "topup" | "adjustment";
+
+export interface LedgerItem {
+  seq: number;
+  posted_at: string;
+  kind: LedgerKind;
+  amount_micro_usd: number;
+  balance_after_micro_usd: number;
+  event_id: string | null;
+  /** Only a usage entry has a model; its `id` is null unless the model is currently granted. */
+  model: { id: string | null; name: string } | null;
+  topup_id: string | null;
+  repricing_run_id: string | null;
+}
+
+export interface LedgerSummaryRow {
+  period_start: string;
+  usage_micro_usd: number;
+  topups_micro_usd: number;
+  adjustments_micro_usd: number;
+  closing_balance_micro_usd: number;
+}
+
+/** A top-up: requested by the organisation, or credited by the platform (`origin "operator"`, `requested_by` null). */
+export interface Topup {
+  id: string;
+  origin: "tenant" | "operator";
+  amount_micro_usd: number;
+  note: string | null;
+  reference: string | null;
+  status: "pending" | "approved" | "rejected";
+  requested_by: { id: string; display_name: string | null } | null;
+  requested_at: string;
+  decided_at: string | null;
+  reject_reason: string | null;
+  credit_reason: string | null;
+}
+
+/** One quota that applies to a key, with its spend now. */
+export interface QuotaFigure {
+  id: string;
+  scope: "team" | "member" | "api_key";
+  set_by: "operator" | "org_admin" | "member";
+  kind: "periodic" | "cumulative";
+  period: "day" | "week" | "month" | null;
+  limit_micro_usd: number;
+  spent_micro_usd: number;
+  remaining_micro_usd: number;
+  period_start: string | null;
+  counted_from: string | null;
+  exhausted: boolean;
+}
+
+export type QuotaLevel = "organization" | "member" | "key";
+
+/** `GET /api/keys/{id}/quota`: every level that applies to one key, and the smallest remaining amount. */
+export interface KeyQuota {
+  key_id: string;
+  as_of: string;
+  org: {
+    billing_mode: "prepaid" | "postpaid";
+    balance_micro_usd: number;
+    credit_limit_micro_usd: number;
+    available_micro_usd: number;
+  } | null;
+  quotas: QuotaFigure[];
+  effective_remaining_micro_usd: number | null;
+  binding_level: QuotaLevel | null;
+}
+
+/** A page of the ledger or of the top-ups: `next_before` is null on the last. */
+export interface Page<T> {
+  items: T[];
+  next_before: number | null;
+}
+
+/** The query a ledger or summary request takes; a left-out part is not sent. */
+function queryOf(q: Record<string, string | number | undefined>): string {
+  const p = new URLSearchParams();
+  for (const [k, v] of Object.entries(q)) if (v !== undefined && v !== "") p.set(k, String(v));
+  const s = p.toString();
+  return s ? `?${s}` : "";
+}
+
+export const billing = {
+  async balance(): Promise<Balance> {
+    return (await call<Balance>("GET", "/billing/balance")).data;
+  },
+  /** Newest first; `before` is the previous page's `next_before`. `from` and `to` are RFC 3339, half-open. */
+  async ledger(q: { from?: string; to?: string; kind?: LedgerKind; limit?: number; before?: number }): Promise<Page<LedgerItem>> {
+    return (await call<Page<LedgerItem>>("GET", `/billing/ledger${queryOf(q)}`)).data;
+  },
+  async ledgerSummary(q: { group: "day" | "month"; from: string; to: string }): Promise<LedgerSummaryRow[]> {
+    return (await call<{ items: LedgerSummaryRow[] }>("GET", `/billing/summary${queryOf(q)}`)).data.items;
+  },
+  async topups(q: { status?: Topup["status"]; limit?: number; before?: number } = {}): Promise<Page<Topup>> {
+    return (await call<Page<Topup>>("GET", `/billing/topups${queryOf(q)}`)).data;
+  },
+  /** `amount_usd` is dollars with at most two decimals. */
+  async requestTopup(body: { amount_usd: string; note?: string; reference?: string }): Promise<Topup> {
+    return (await call<Topup>("POST", "/billing/topups", body)).data;
+  },
+  async keyQuota(keyId: string): Promise<KeyQuota> {
+    return (await call<KeyQuota>("GET", `/keys/${at(keyId)}/quota`)).data;
+  },
+};
+
 // ── usage: the call log and the summary ─────────────────────────────────────
 
 /** A model as a call or a summary row names it; `id` is null once it is not in the organisation's grants. */
@@ -415,18 +534,11 @@ export interface UsageSummaryQuery {
   model_id?: string;
 }
 
-function queryString(q: object): string {
-  const p = new URLSearchParams();
-  for (const [k, v] of Object.entries(q)) if (v !== undefined && v !== "") p.set(k, String(v));
-  const s = p.toString();
-  return s ? `?${s}` : "";
-}
-
 /** The call log, newest first; `next_before` is the cursor of the next page, null on the last. */
 export async function usageCalls(q: CallsQuery): Promise<{ items: Call[]; next_before: number | null }> {
-  return (await call<{ items: Call[]; next_before: number | null }>("GET", `/usage/calls${queryString(q)}`)).data;
+  return (await call<{ items: Call[]; next_before: number | null }>("GET", `/usage/calls${queryOf({ ...q })}`)).data;
 }
 
 export async function usageSummary(q: UsageSummaryQuery): Promise<UsageSummaryRow[]> {
-  return (await call<{ items: UsageSummaryRow[] }>("GET", `/usage/summary${queryString(q)}`)).data.items;
+  return (await call<{ items: UsageSummaryRow[] }>("GET", `/usage/summary${queryOf({ ...q })}`)).data.items;
 }
