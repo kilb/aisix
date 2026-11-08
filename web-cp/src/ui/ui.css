@@ -400,7 +400,7 @@ input[type="checkbox"]:checked {
 input[type="radio"]:checked {
   border-color: var(--sign-press);
   background-color: var(--sign);
-  background-image: radial-gradient(circle, #1C2A39 0 3px, transparent 3.5px);
+  background-image: radial-gradient(circle, var(--on-sign) 0 3px, transparent 3.5px);
 }
 :is(input[type="checkbox"], input[type="radio"]):not(:disabled):is(:hover, .is-hover),
 label:hover > :is(input[type="checkbox"], input[type="radio"]):not(:disabled) {

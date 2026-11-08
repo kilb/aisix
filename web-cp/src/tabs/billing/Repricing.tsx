@@ -459,6 +459,8 @@ export function Repricing({ operator, canEdit, refreshShell }: TabProps) {
                 </Button>
               ) : isAdmin ? (
                 <TwoStep
+                  // Keyed by run: an armed 确认执行 never carries over to another run.
+                  key={shown.id}
                   label="执行"
                   kind="primary"
                   warning={APPLY_WARNING}

@@ -24,6 +24,11 @@ test("门户与运维台的基础样式逐字节一致", () => {
   assert.ok(mine.equals(cp));
 });
 
+test("门户与运维台的金额工具逐字节一致", () => {
+  const [mine, cp] = both("lib/money.ts");
+  assert.ok(mine.equals(cp));
+});
+
 // The shared components and their contract: one set of props, states and
 // class names in both apps (web-cp/src/ui/CONTRACT.md).
 const SHARED_UI = [
