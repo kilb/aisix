@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { checkLabel, dropLabel, fmtCount, isPositive } from "./reconcile.ts";
+import { checkLabel, dropLabel, failureText } from "./reconcile.ts";
+
+// Shaped like the client's `ApiError`, whose class needs a TypeScript transform to load here.
+const err = (status: number) => Object.assign(new Error("raw"), { status, code: "x" });
+const fallback = (e: unknown) => `fallback:${(e as Error).message}`;
 
 test("checks and drop reasons are labelled, and unknown ones show raw", () => {
   assert.equal(checkLabel("running_balance"), "逐笔余额");
@@ -10,16 +14,9 @@ test("checks and drop reasons are labelled, and unknown ones show raw", () => {
   assert.equal(dropLabel("new_reason"), "new_reason");
 });
 
-test("counts format exactly past 2^53, up to i64::MAX and u64::MAX", () => {
-  assert.equal(fmtCount(0), "0");
-  assert.equal(fmtCount(1234567), "1,234,567");
-  assert.equal(fmtCount("9223372036854775807"), "9,223,372,036,854,775,807");
-  assert.equal(fmtCount("18446744073709551615"), "18,446,744,073,709,551,615");
-  assert.equal(fmtCount("not a number"), "not a number");
-});
-
-test("a positive count is told from zero at any size", () => {
-  assert.equal(isPositive(0), false);
-  assert.equal(isPositive("0"), false);
-  assert.equal(isPositive("9223372036854775807"), true);
+test("an unknown tenant and a timeout are worded plainly, never as a code", () => {
+  assert.match(failureText(err(404), fallback), /找不到所选租户/);
+  assert.match(failureText(err(503), fallback), /对账超时/);
+  assert.equal(failureText(err(500), fallback), "fallback:raw");
+  assert.equal(failureText(new Error("boom"), fallback), "fallback:boom");
 });

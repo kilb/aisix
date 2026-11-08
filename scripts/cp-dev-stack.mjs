@@ -534,8 +534,8 @@ async function startTelemetryRelay(host, targetPort) {
     });
     if (!paused) openUpstream(link);
   });
-  const port = await freePort();
-  await new Promise((r) => relay.listen(port, "127.0.0.1", r));
+  await new Promise((r) => relay.listen(0, "127.0.0.1", r));
+  const port = relay.address().port;
 
   const resume = () => {
     paused = false;

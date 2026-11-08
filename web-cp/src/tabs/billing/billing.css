@@ -63,3 +63,9 @@
   align-items: center;
   gap: var(--s-2);
 }
+
+/* Long instance and host names wrap inside their cell instead of widening the table. */
+.dt td.bl-wrap {
+  white-space: normal;
+  overflow-wrap: anywhere;
+}

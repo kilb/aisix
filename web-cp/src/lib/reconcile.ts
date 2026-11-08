@@ -1,5 +1,3 @@
-import type { Count } from "./api";
-
 /** What each check of the reconciliation is called on the page. */
 const CHECK_LABEL: Record<string, string> = {
   balance: "余额与流水",
@@ -31,26 +29,13 @@ export function dropLabel(reason: string): string {
 }
 
 /**
- * A count with thousands separators, exact at any size: counts the control
- * plane saturates or the gateways report can pass 2^53, so this is `BigInt`
- * arithmetic on the digits, never a `Number` sum.
+ * What the operator reads when the check fails: plain words for an unknown
+ * tenant (404) and a check that outran its time bound (503). Any other
+ * failure is worded by `fallback`.
  */
-export function fmtCount(n: Count): string {
-  let digits: bigint;
-  try {
-    digits = BigInt(n);
-  } catch {
-    return String(n);
-  }
-  const text = (digits < 0n ? -digits : digits).toString().replace(/\B(?=(\d{3})+$)/g, ",");
-  return digits < 0n ? `-${text}` : text;
-}
-
-/** Whether a count is above zero, exact at any size. */
-export function isPositive(n: Count): boolean {
-  try {
-    return BigInt(n) > 0n;
-  } catch {
-    return false;
-  }
+export function failureText(e: unknown, fallback: (e: unknown) => string): string {
+  const status = (e as { status?: unknown } | null)?.status;
+  if (status === 404) return "找不到所选租户，可能已被删除。请重新选择租户。";
+  if (status === 503) return "对账超时，控制面暂时无法完成这次检查。请稍后点「刷新」重试。";
+  return fallback(e);
 }

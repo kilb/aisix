@@ -1,23 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { TabProps } from "../../App";
 import { ApiError, reconciliation, tenants, type Reconciliation as Answer, type Tenant } from "../../lib/api";
-import { errorText } from "../../lib/fmt";
+import { errorText, fmtInt } from "../../lib/fmt";
 import { fmtMicroUsd, fmtUtc } from "../../lib/money";
-import { checkLabel, dropLabel, fmtCount, isPositive } from "../../lib/reconcile";
+import { checkLabel, dropLabel, failureText } from "../../lib/reconcile";
 import { Button } from "../../ui/Button";
 import { DataTable, Loading } from "../../ui/DataTable";
 import { Field } from "../../ui/Field";
 import { Lamp } from "../../ui/Lamp";
-
-/** What the operator reads when the check fails, by status; any other failure shows the Dashboard's usual text. */
-function failureText(e: unknown): string {
-  if (e instanceof ApiError && e.status === 404) return "找不到所选租户，可能已被删除。请重新选择租户。";
-  if (e instanceof ApiError && e.status === 503) return "对账超时，控制面暂时无法完成这次检查。请稍后点「刷新」重试。";
-  return errorText(e);
-}
-
-/** Micro-dollars as money; an amount past 2^53 arrives as text and is read as the nearest number. */
-const money = (n: number | string) => fmtMicroUsd(Number(n));
 
 /**
  * "对账": whether each tenant's ledger matches what moved it, the calls
@@ -32,10 +22,13 @@ export function Reconciliation(_props: TabProps) {
   const [answer, setAnswer] = useState<Answer | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  // Said once when the chosen tenant turned out not to exist; cleared by the next choice or refresh.
+  const [reset, setReset] = useState<string | null>(null);
+  const [tenantsFailed, setTenantsFailed] = useState(false);
   const latest = useRef(0);
 
   useEffect(() => {
-    tenants.list().then(setTenantList, () => undefined);
+    tenants.list().then(setTenantList, () => setTenantsFailed(true));
   }, []);
 
   const load = useCallback(async (tenant: string) => {
@@ -49,7 +42,15 @@ export function Reconciliation(_props: TabProps) {
     } catch (e) {
       if (mine !== latest.current) return;
       setAnswer(null);
-      setError(failureText(e));
+      if (tenant && e instanceof ApiError && e.status === 404) {
+        // The tenant is gone: look at everyone instead of retrying the same 404, and say so.
+        setReset(failureText(e, errorText));
+        setError(null);
+        setTenantId("");
+        tenants.list().then(setTenantList, () => undefined);
+        return;
+      }
+      setError(failureText(e, errorText));
     } finally {
       if (mine === latest.current) setLoading(false);
     }
@@ -59,7 +60,8 @@ export function Reconciliation(_props: TabProps) {
     void load(tenantId);
   }, [load, tenantId]);
 
-  const filtered = tenantId !== "";
+  // What the answer on screen covers, not what the select says while a new answer is on its way.
+  const filtered = answer?.tenant_id != null;
   const loss = answer?.usage_loss;
   const unpriced = answer?.unpriced_last_24h;
 
@@ -69,7 +71,10 @@ export function Reconciliation(_props: TabProps) {
       <p className="hint">核对账本与扣费、调整、充值是否一致，并列出网关报告丢弃的用量。这里只读，不会改动任何数据。</p>
       <div className="r">
         <Field label="租户">
-          <select value={tenantId} disabled={loading} onChange={(e) => setTenantId(e.target.value)}>
+          <select value={tenantId} disabled={loading} onChange={(e) => {
+              setReset(null);
+              setTenantId(e.target.value);
+            }}>
             <option value="">全部</option>
             {tenantList.map((t) => (
               <option key={t.id} value={t.id}>
@@ -78,11 +83,20 @@ export function Reconciliation(_props: TabProps) {
             ))}
           </select>
         </Field>
-        <Button type="button" icon="refresh" busy={loading} busyLabel="刷新" onClick={() => void load(tenantId)}>
+        <Button type="button" icon="refresh" busy={loading} busyLabel="刷新" onClick={() => {
+            setReset(null);
+            void load(tenantId);
+          }}>
           刷新
         </Button>
       </div>
 
+      {tenantsFailed && <p className="hint">租户列表载入失败，目前只能查看全部租户。刷新页面后重试。</p>}
+      {reset && (
+        <div className="note crit" role="alert">
+          {reset}
+        </div>
+      )}
       {error && (
         <div className="note crit" role="alert">
           {error}
@@ -115,8 +129,8 @@ export function Reconciliation(_props: TabProps) {
                       <tr key={`${m.tenant_id}-${m.check}`}>
                         <td>{m.tenant_name || m.tenant_id}</td>
                         <td>{checkLabel(m.check)}</td>
-                        <td className="num money">{money(m.expected_micro_usd)}</td>
-                        <td className="num money">{money(m.actual_micro_usd)}</td>
+                        <td className="num money">{fmtMicroUsd(m.expected_micro_usd)}</td>
+                        <td className="num money">{fmtMicroUsd(m.actual_micro_usd)}</td>
                         <td className="num">{m.seq ?? "—"}</td>
                       </tr>
                     ))}
@@ -130,7 +144,7 @@ export function Reconciliation(_props: TabProps) {
           <section aria-label="已计费但未入账" className="bl-region">
             <h3>已计费但未入账</h3>
             <p className="num">
-              <strong>{fmtCount(answer.charged_without_entry)}</strong> 笔
+              <strong>{fmtInt(answer.charged_without_entry)}</strong> 笔
             </p>
             <p className="hint">{filtered ? "仅统计所选租户。" : "统计全部租户。"}已计费的调用在账本里没有对应流水。</p>
           </section>
@@ -142,12 +156,12 @@ export function Reconciliation(_props: TabProps) {
               <tbody>
                 <tr>
                   <th scope="row">合计</th>
-                  <td className="num">{fmtCount(unpriced.total)}</td>
+                  <td className="num">{fmtInt(unpriced.total)}</td>
                 </tr>
                 {Object.entries(unpriced.by_code).map(([code, n]) => (
                   <tr key={code}>
                     <th scope="row">{code}</th>
-                    <td className="num">{fmtCount(n)}</td>
+                    <td className="num">{fmtInt(n)}</td>
                   </tr>
                 ))}
               </tbody>
@@ -164,11 +178,11 @@ export function Reconciliation(_props: TabProps) {
               <tbody>
                 <tr>
                   <th scope="row">已丢弃</th>
-                  <td className="num">{fmtCount(loss.dropped_total)}</td>
+                  <td className="num">{fmtInt(loss.dropped_total)}</td>
                 </tr>
                 <tr>
                   <th scope="row">未确认送达（可能已入账）</th>
-                  <td className="num">{fmtCount(loss.unconfirmed_total)}</td>
+                  <td className="num">{fmtInt(loss.unconfirmed_total)}</td>
                 </tr>
               </tbody>
             </DataTable>
@@ -187,12 +201,12 @@ export function Reconciliation(_props: TabProps) {
                 </thead>
                 <tbody>
                   {loss.instances.map((i) => {
-                    const reasons = Object.entries(i.drops).filter(([, n]) => isPositive(n));
+                    const reasons = Object.entries(i.drops).filter(([, n]) => n > 0);
                     return (
                       <tr key={i.dp_id + i.instance_id}>
                         <td>{i.credential_name}</td>
-                        <td className="tabular">{i.instance_id}</td>
-                        <td>{i.hostname}</td>
+                        <td className="tabular bl-wrap">{i.instance_id}</td>
+                        <td className="bl-wrap">{i.hostname}</td>
                         <td className="tabular">{fmtUtc(i.last_seen_at)}</td>
                         <td>
                           {reasons.length === 0 ? (
@@ -200,7 +214,7 @@ export function Reconciliation(_props: TabProps) {
                           ) : (
                             reasons.map(([reason, n]) => (
                               <span key={reason} className="cell-note">
-                                {dropLabel(reason)}：{fmtCount(n)}
+                                {dropLabel(reason)}：{fmtInt(n)}
                               </span>
                             ))
                           )}
