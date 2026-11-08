@@ -1130,3 +1130,87 @@ export const repricing = {
     return (await call<RepricingRun>("POST", `/admin/billing/repricing/${seg(id)}/apply`, {})).data;
   },
 };
+
+/**
+ * A count the control plane may report past 2^53: an integer that fits a
+ * JS number arrives as one, a larger one as its decimal text (see `reconciliation`).
+ */
+export type Count = number | string;
+
+export type ReconcileCheck = "balance" | "usage" | "adjustments" | "topups" | "running_balance";
+
+export interface ReconcileMismatch {
+  tenant_id: string;
+  tenant_name: string;
+  check: ReconcileCheck | string;
+  expected_micro_usd: Count;
+  actual_micro_usd: Count;
+  /** The ledger entry that breaks the running balance; null for the other checks. */
+  seq: number | null;
+}
+
+export interface InstanceDrops {
+  dp_id: string;
+  credential_name: string;
+  instance_id: string;
+  hostname: string;
+  last_seen_at: string;
+  /** Usage events dropped since the process started, by reason. */
+  drops: Record<string, Count>;
+}
+
+export interface Reconciliation {
+  checked_at: string;
+  tenant_id: string | null;
+  mismatches: ReconcileMismatch[];
+  /** The asked-for tenant's count when a tenant is given, otherwise every tenant's. */
+  charged_without_entry: Count;
+  /** Every tenant's, whichever tenant is asked for. */
+  unpriced_last_24h: { total: Count; by_code: Record<string, Count> };
+  /** Every gateway's, whichever tenant is asked for. */
+  usage_loss: {
+    since: string;
+    dropped_total: Count;
+    unconfirmed_total: Count;
+    instances: InstanceDrops[];
+  };
+}
+
+/** Quotes every integer of 16 or more digits that follows a colon, so `JSON.parse` cannot round it. */
+function quoteLargeIntegers(text: string): string {
+  return text.replace(/(:\s*)(-?\d{16,})(?=\s*[,}\]])/g, '$1"$2"');
+}
+
+/** Reconciliation: whether the ledger matches what moved it, and the usage the gateways report dropped. */
+export const reconciliation = {
+  /**
+   * `404` when `tenantId` names no tenant; `503` when the check outran its time bound.
+   * Drop counts can reach 2^64, past what a JS number holds, so the body is read as text
+   * and an integer that large stays exact, as a string.
+   */
+  async get(tenantId?: string): Promise<Reconciliation> {
+    const query = tenantId ? `?tenant_id=${seg(tenantId)}` : "";
+    let r: Response;
+    try {
+      r = await fetch(`/admin/billing/reconciliation${query}`, { credentials: "same-origin" });
+    } catch {
+      throw new ApiError("无法连接控制面", 0, "network", [], [], null);
+    }
+    const text = await r.text();
+    if (!r.ok) {
+      let e: Envelope = {};
+      try {
+        e = JSON.parse(text) as Envelope;
+      } catch {
+        // Not JSON: the status speaks for itself.
+      }
+      if (r.status === 401 && e.code === "unauthenticated") for (const l of sessionEndedListeners) l();
+      throw new ApiError(e.error ?? `HTTP ${r.status}`, r.status, e.code ?? "bad_response", e.details ?? [], [], null);
+    }
+    try {
+      return JSON.parse(quoteLargeIntegers(text)) as Reconciliation;
+    } catch {
+      throw new ApiError(`服务端返回了非 JSON 响应（HTTP ${r.status}）`, r.status, "bad_response", [], [], null);
+    }
+  },
+};
