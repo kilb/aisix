@@ -1,6 +1,7 @@
 import { useState } from "react";
 import type { TabProps } from "../App";
 import { ConflictNote } from "../components/ConflictNote";
+import { FailModeView, failModeOf } from "../components/FailModeNote";
 import { JsonEditor } from "../components/JsonEditor";
 import { RolloutBadge } from "../components/RolloutBadge";
 import { ApiError, resources, type Detail, type ResourceView } from "../lib/api";
@@ -56,8 +57,11 @@ function pretty(doc: unknown): string {
 }
 
 /** "全部资源": a JSON editor over every kind, validated by the server. */
-export function Resources({ canEdit }: TabProps) {
-  const [kind, setKind] = useState<string>(KINDS[0].kind);
+export function Resources({ canEdit, initialSection }: TabProps) {
+  // A link from another tab may name the kind to open first.
+  const [kind, setKind] = useState<string>(
+    KINDS.some((k) => k.kind === initialSection) ? (initialSection as string) : KINDS[0].kind,
+  );
   const info = KINDS.find((k) => k.kind === kind) ?? KINDS[0];
   return (
     <>
@@ -211,6 +215,7 @@ function KindPage({ info, canEdit }: { info: KindInfo; canEdit: boolean }) {
           {info.label} <code className="lab">{info.kind}</code>
         </h2>
         {!info.writable && <div className="note">{MANAGED_NOTE}</div>}
+        {info.kind === "budget_policy" && items !== null && <FailModeView mode={failModeOf(items.map((i) => i.doc))} />}
         <div className="r">
           {canCreate && (
             <Button kind="primary" type="button" onClick={startNew}>

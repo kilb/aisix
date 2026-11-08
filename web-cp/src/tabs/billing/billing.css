@@ -1,0 +1,65 @@
+/* The billing pages: accounts and the tenant panel. Every value comes from the tokens. */
+
+.bl-region {
+  min-width: 0;
+  margin: var(--s-6) 0 0;
+}
+.bl-region > h3 {
+  margin: 0 0 var(--s-2);
+  color: var(--text);
+  font-size: var(--fs-19);
+  font-weight: 700;
+  line-height: var(--lh-heading);
+}
+.bl-region > .note,
+.bl-region > .hint {
+  margin-bottom: var(--s-3);
+}
+.bl-region > .btn {
+  margin-top: var(--s-3);
+}
+
+/* Name, figures and status of the account, as a small definition list. */
+.bl-facts {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: var(--s-2) var(--s-4);
+  margin: 0;
+}
+.bl-facts dt {
+  color: var(--text-2);
+}
+.bl-facts dd {
+  margin: 0;
+}
+
+/* A control row: fields and their button on one line, wrapping when narrow. */
+.bl-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: var(--s-3);
+  margin-bottom: var(--s-3);
+}
+
+/* The tenant whose panel is open: Concrete, with a Sign-yellow edge. */
+.dt tr:has(.bl-name[aria-expanded="true"]) {
+  background: var(--row-hover);
+}
+.dt tr:has(.bl-name[aria-expanded="true"]) > td:first-child {
+  box-shadow: inset 4px 0 0 var(--sign);
+}
+.bl-name {
+  max-width: 220px;
+}
+.bl-mark {
+  margin-left: var(--s-2);
+}
+
+/* 组织额度: the row's own controls sit on one line, wrapping when narrow. */
+.bl-row-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--s-2);
+}

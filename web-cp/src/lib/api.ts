@@ -595,6 +595,358 @@ export const providerGroups = {
   },
 };
 
+// ── pricing ─────────────────────────────────────────────────────────────────
+
+/** Rates of one tier or band: decimal strings in USD per million units, at most 6 decimals. */
+export type RateMap = Record<string, string>;
+
+/** One tier of a price card: its base rates, and any further parts (long-context bands) as the API has them. */
+export interface TierRates {
+  base: RateMap;
+  [more: string]: unknown;
+}
+
+/** A price card: tiers by name; `default` is the one a request without a tier is priced at. */
+export type RateCard = Record<string, TierRates>;
+
+/** One sell price revision. A tenant override ended by a later revision has `card` null. */
+export interface SellRevision {
+  revision_id: number;
+  engine_version: number;
+  model_id: string;
+  tenant_id: string | null;
+  effective_from: string;
+  card: RateCard | null;
+  source: string;
+  created_by: string | null;
+  created_at: string;
+}
+
+/** Something to know about a price that was written all the same. */
+export interface PriceWarning {
+  code: string;
+  message: string;
+  revision_id?: number;
+  effective_from?: string;
+}
+
+/** The answer to a sell price write: the revision starting as asked, what to know about it, and the later revisions an import also wrote. */
+export type SellCreated = SellRevision & { warnings: PriceWarning[]; later_revisions: SellRevision[] };
+
+export interface CatalogueEntry {
+  key: string;
+  aliases: string[];
+  source_url: string | null;
+  as_of: string | null;
+  effective_from: string | null;
+  notes: string | null;
+  card: RateCard;
+}
+
+/** One model's platform price: in force now, and scheduled by ascending start. */
+export interface PriceRow {
+  model_id: string;
+  name: string;
+  current: SellRevision | null;
+  upcoming: SellRevision[];
+}
+
+/** What `POST /admin/pricing/sell` takes: exactly one of `card` and `catalogue_key`. */
+export interface NewSellPrice {
+  model_id: string;
+  tenant_id?: string;
+  effective_from: string;
+  card?: RateCard | null;
+  catalogue_key?: string;
+  markup_bps?: number;
+}
+
+export const pricing = {
+  async catalogue(): Promise<{ version: string | number; items: CatalogueEntry[] }> {
+    return (await call<{ version: string | number; items: CatalogueEntry[] }>("GET", "/admin/pricing/catalogue")).data;
+  },
+  /** Sell revisions, newest first; `before` is the previous page's `next_before`. */
+  async listSell(q: {
+    model_id?: string;
+    tenant_id?: string;
+    /** Only the platform's own prices, never a tenant override. */
+    platform?: boolean;
+    limit?: number;
+    before?: number;
+  }): Promise<{ items: SellRevision[]; next_before: number | null }> {
+    const params = new URLSearchParams();
+    if (q.model_id) params.set("model_id", q.model_id);
+    if (q.platform) params.set("platform", "true");
+    if (q.tenant_id) params.set("tenant_id", q.tenant_id);
+    if (q.limit !== undefined) params.set("limit", String(q.limit));
+    if (q.before !== undefined) params.set("before", String(q.before));
+    const query = params.toString();
+    return (
+      await call<{ items: SellRevision[]; next_before: number | null }>(
+        "GET",
+        `/admin/pricing/sell${query ? `?${query}` : ""}`,
+      )
+    ).data;
+  },
+  async createSell(body: NewSellPrice): Promise<SellCreated> {
+    return (await call<SellCreated>("POST", "/admin/pricing/sell", body)).data;
+  },
+  /** Every live model's platform price, the unpriced ones first. */
+  async models(): Promise<PriceRow[]> {
+    return (await call<{ items: PriceRow[] }>("GET", "/admin/pricing/models")).data.items;
+  },
+};
+
+// ── pricing: cost prices ────────────────────────────────────────────────────
+
+/** One cost price revision: what an upstream model costs the platform, through one account or any. */
+export interface CostRevision {
+  revision_id: number;
+  engine_version: number;
+  upstream_provider: string;
+  upstream_model: string;
+  provider_key_id: string | null;
+  effective_from: string;
+  card: RateCard;
+  source: string;
+  created_by: string | null;
+  created_at: string;
+}
+
+export type CostCreated = CostRevision & { warnings: PriceWarning[] };
+
+export interface NewCostPrice {
+  upstream_provider: string;
+  upstream_model: string;
+  provider_key_id?: string;
+  effective_from: string;
+  card: RateCard;
+}
+
+export const costPricing = {
+  /** Cost revisions, newest first; `before` is the previous page's `next_before`. */
+  async listCost(q: {
+    upstream_provider?: string;
+    upstream_model?: string;
+    provider_key_id?: string;
+    limit?: number;
+    before?: number;
+  }): Promise<{ items: CostRevision[]; next_before: number | null }> {
+    const params = new URLSearchParams();
+    if (q.upstream_provider) params.set("upstream_provider", q.upstream_provider);
+    if (q.upstream_model) params.set("upstream_model", q.upstream_model);
+    if (q.provider_key_id) params.set("provider_key_id", q.provider_key_id);
+    if (q.limit !== undefined) params.set("limit", String(q.limit));
+    if (q.before !== undefined) params.set("before", String(q.before));
+    const query = params.toString();
+    return (
+      await call<{ items: CostRevision[]; next_before: number | null }>("GET", `/admin/pricing/cost${query ? `?${query}` : ""}`)
+    ).data;
+  },
+  async createCost(body: NewCostPrice): Promise<CostCreated> {
+    return (await call<CostCreated>("POST", "/admin/pricing/cost", body)).data;
+  },
+};
+
+// ── pricing: tenant plans ───────────────────────────────────────────────────
+
+/** One discount revision: basis points off every charge of the tenant, from `effective_from`. */
+export interface DiscountRevision {
+  revision_id: number;
+  engine_version: number;
+  tenant_id: string;
+  effective_from: string;
+  discount_bps: number;
+  created_by: string | null;
+  created_at: string;
+}
+
+/** A tenant's plan: its discount, and the models it has override prices for. An override whose `current.card` is null has ended. */
+export interface TenantPlan {
+  tenant_id: string;
+  discount: { current: DiscountRevision | null; upcoming: DiscountRevision[] };
+  overrides: PriceRow[];
+}
+
+export const tenantPricing = {
+  async listDiscounts(q: { tenant_id?: string; limit?: number; before?: number }): Promise<{ items: DiscountRevision[]; next_before: number | null }> {
+    const params = new URLSearchParams();
+    if (q.tenant_id) params.set("tenant_id", q.tenant_id);
+    if (q.limit !== undefined) params.set("limit", String(q.limit));
+    if (q.before !== undefined) params.set("before", String(q.before));
+    const query = params.toString();
+    return (
+      await call<{ items: DiscountRevision[]; next_before: number | null }>("GET", `/admin/pricing/discounts${query ? `?${query}` : ""}`)
+    ).data;
+  },
+  async createDiscount(body: { tenant_id: string; effective_from: string; discount_bps: number }): Promise<DiscountRevision> {
+    return (await call<DiscountRevision>("POST", "/admin/pricing/discounts", body)).data;
+  },
+  async tenantPlan(tenantId: string): Promise<TenantPlan> {
+    return (await call<TenantPlan>("GET", `/admin/pricing/tenants/${seg(tenantId)}`)).data;
+  },
+};
+
+// ── billing (accounts, ledger, usage, quotas) ───────────────────────────────
+
+/** One tenant's billing account. All amounts are integer micro-dollars. */
+export interface BillingAccount {
+  tenant_id: string;
+  tenant_name: string;
+  status: string;
+  is_internal: boolean;
+  billing_mode: "prepaid" | "postpaid";
+  balance_micro_usd: number;
+  credit_limit_micro_usd: number;
+  available_micro_usd: number;
+  /** Whether the balance rule blocks the tenant now; never for the internal tenant. */
+  exhausted: boolean;
+  pending_topups: number;
+}
+
+export interface LedgerItem {
+  seq: number;
+  posted_at: string;
+  kind: "usage" | "topup" | "adjustment";
+  amount_micro_usd: number;
+  balance_after_micro_usd: number;
+  event_id: string | null;
+  model: { id: string | null; name: string } | null;
+  topup_id: string | null;
+  repricing_run_id: string | null;
+}
+
+export interface LedgerPage {
+  items: LedgerItem[];
+  /** The `before` of the next page; null on the last. */
+  next_before: number | null;
+}
+
+export interface LedgerSummaryRow {
+  period_start: string;
+  usage_micro_usd: number;
+  topups_micro_usd: number;
+  adjustments_micro_usd: number;
+  closing_balance_micro_usd: number;
+}
+
+export interface UsageSummaryRow {
+  period_start: string;
+  /** `id` null: calls outside the tenant's grants, or the row that rolls up everything past the row cap (`name` `other`). */
+  model: { id: string | null; name: string };
+  requests: number;
+  charged_micro_usd: number;
+  estimated_requests: number;
+  quantities: Record<string, number>;
+}
+
+export interface Budget {
+  id: string;
+  scope: "team" | "member" | "api_key";
+  target: { id: string; label: string };
+  target_live: boolean;
+  set_by: "operator" | "org_admin" | "member";
+  kind: "periodic" | "cumulative";
+  period: "day" | "week" | "month" | null;
+  limit_micro_usd: number;
+  spent_micro_usd: number;
+  remaining_micro_usd: number;
+  period_start: string | null;
+  counted_from: string | null;
+  exhausted: boolean;
+  created_at: string;
+}
+
+/** A UTC half-open interval, as the ledger and summary routes take it. */
+export interface TimeRange {
+  from?: string;
+  to?: string;
+}
+
+function rangeQuery(params: URLSearchParams, q: TimeRange): void {
+  if (q.from) params.set("from", q.from);
+  if (q.to) params.set("to", q.to);
+}
+
+/** Billing accounts and one tenant's ledger, usage and quotas, as operators read them. */
+export const billing = {
+  /** Every tenant but pending ones: customers by name, the internal tenant last. */
+  async accounts(): Promise<BillingAccount[]> {
+    return (await call<{ items: BillingAccount[] }>("GET", "/admin/billing/accounts")).data.items;
+  },
+  async account(tenantId: string, signal?: AbortSignal): Promise<BillingAccount> {
+    return (await call<BillingAccount>("GET", `/admin/tenants/${seg(tenantId)}/billing`, undefined, undefined, signal)).data;
+  },
+  /** Operator and up; `creditLimitUsd` is dollars and cents, 0 allowed. Answers the settled account. */
+  async setCreditLimit(tenantId: string, creditLimitUsd: string): Promise<BillingAccount> {
+    return (await call<BillingAccount>("PATCH", `/admin/tenants/${seg(tenantId)}/billing`, { credit_limit_usd: creditLimitUsd })).data;
+  },
+  /** One page of entries, newest first; `before` is the previous page's `next_before`. */
+  async ledger(
+    tenantId: string,
+    q: TimeRange & { kind?: LedgerItem["kind"]; before?: number; limit?: number },
+    signal?: AbortSignal,
+  ): Promise<LedgerPage> {
+    const params = new URLSearchParams();
+    rangeQuery(params, q);
+    if (q.kind) params.set("kind", q.kind);
+    if (q.before !== undefined) params.set("before", String(q.before));
+    if (q.limit !== undefined) params.set("limit", String(q.limit));
+    const query = params.toString();
+    return (
+      await call<LedgerPage>("GET", `/admin/tenants/${seg(tenantId)}/billing/ledger${query ? `?${query}` : ""}`, undefined, undefined, signal)
+    ).data;
+  },
+  async ledgerSummary(
+    tenantId: string,
+    q: { group: "day" | "month"; from: string; to: string },
+    signal?: AbortSignal,
+  ): Promise<LedgerSummaryRow[]> {
+    const params = new URLSearchParams({ group: q.group, from: q.from, to: q.to });
+    return (
+      await call<{ items: LedgerSummaryRow[] }>(
+        "GET",
+        `/admin/tenants/${seg(tenantId)}/billing/summary?${params}`,
+        undefined,
+        undefined,
+        signal,
+      )
+    ).data.items;
+  },
+  async usageSummary(
+    tenantId: string,
+    q: { group: "day" | "month"; from: string; to: string },
+    signal?: AbortSignal,
+  ): Promise<UsageSummaryRow[]> {
+    const params = new URLSearchParams({ group: q.group, from: q.from, to: q.to });
+    return (
+      await call<{ items: UsageSummaryRow[] }>(
+        "GET",
+        `/admin/tenants/${seg(tenantId)}/usage/summary?${params}`,
+        undefined,
+        undefined,
+        signal,
+      )
+    ).data.items;
+  },
+  /** Every live quota of the tenant at every level, oldest first. */
+  async budgets(tenantId: string, signal?: AbortSignal): Promise<Budget[]> {
+    return (await call<{ items: Budget[] }>("GET", `/admin/tenants/${seg(tenantId)}/budgets`, undefined, undefined, signal)).data.items;
+  },
+  /** Admin only: credits the tenant now. `amountUsd` is dollars and cents above 0; answers the top-up the backend recorded. Not idempotent: send once. */
+  async credit(tenantId: string, body: { amount_usd: string; reason: string; reference?: string }): Promise<CreditedTopup> {
+    return (await call<CreditedTopup>("POST", `/admin/tenants/${seg(tenantId)}/credits`, body)).data;
+  },
+};
+
+/** The top-up an operator credit recorded. */
+export interface CreditedTopup {
+  id: string;
+  origin: "operator";
+  amount_micro_usd: number;
+  reference: string;
+  credit_reason: string | null;
+}
 /** One top-up as an operator reads it: a tenant's request, or an operator's credit. */
 export interface Topup {
   id: string;
@@ -643,27 +995,24 @@ export const topups = {
   },
 };
 
-/** One entry of the built-in price catalogue: a model's public list prices and where they came from. */
-export interface CatalogueEntry {
-  /** `<provider>/<model_name>`. */
-  key: string;
-  aliases: string[];
-  source_url: string;
-  /** The day the provider's page was read (`YYYY-MM-DD`). */
-  as_of: string;
-  /** The first UTC day these rates apply; null means from the beginning. */
-  effective_from: string | null;
-  notes: string | null;
-  /** The entry's rate card, as the control plane stores it. */
-  card: Record<string, unknown>;
+// ── organization quotas (operator-set `team` quotas) ────────────────────────
+
+/** Operator and up. A periodic quota's `period` defaults to month; a cumulative one has none. `409 budget_exists` for the same kind and period. */
+export async function createOrgQuota(
+  tenantId: string,
+  body: { kind: "periodic" | "cumulative"; period?: "day" | "week" | "month"; limit_usd: string },
+): Promise<Budget> {
+  return (await call<Budget>("POST", `/admin/tenants/${seg(tenantId)}/budgets`, body)).data;
 }
 
-/** The built-in price catalogue. */
-export const catalogue = {
-  async entries(): Promise<{ version: number; items: CatalogueEntry[] }> {
-    return (await call<{ version: number; items: CatalogueEntry[] }>("GET", "/admin/pricing/catalogue")).data;
-  },
-};
+/** Operator and up; only a quota the operator set (`403 budget_managed` otherwise). */
+export async function updateOrgQuota(tenantId: string, id: string, limitUsd: string): Promise<Budget> {
+  return (await call<Budget>("PATCH", `/admin/tenants/${seg(tenantId)}/budgets/${seg(id)}`, { limit_usd: limitUsd })).data;
+}
+
+export async function deleteOrgQuota(tenantId: string, id: string): Promise<void> {
+  await call<null>("DELETE", `/admin/tenants/${seg(tenantId)}/budgets/${seg(id)}`);
+}
 
 /** One charge: what a stored usage row was billed, or why it could not be. Amounts are integer micro-dollars. */
 export interface Charge {
