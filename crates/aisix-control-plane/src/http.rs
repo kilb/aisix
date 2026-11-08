@@ -542,6 +542,22 @@ pub const ROUTE_ROLES: &[(&str, &str, MinRole)] = &[
         "/admin/pricing/baselines",
         MinRole::Op(OperatorRole::Operator),
     ),
+    // The price import: an upload of a public dataset, and its proposals.
+    (
+        "GET",
+        "/admin/pricing/imports",
+        MinRole::Op(OperatorRole::Viewer),
+    ),
+    (
+        "POST",
+        "/admin/pricing/imports",
+        MinRole::Op(OperatorRole::Operator),
+    ),
+    (
+        "GET",
+        "/admin/pricing/imports/{id}",
+        MinRole::Op(OperatorRole::Viewer),
+    ),
     // Gateways, on the gateway listener.
     ("POST", "/dp/heartbeat", MinRole::Dp),
     ("GET", "/dp/v1/keys/{key_id}/prices", MinRole::Dp),
@@ -781,6 +797,16 @@ pub fn browser_router(state: AppState) -> Router {
             "/admin/pricing/baselines",
             get(pricing::baselines::list).post(pricing::baselines::create),
         )
+        // A dataset is far larger than any other body: the upload's own
+        // limit, as `/dp/telemetry` has. The listing takes no body, so the
+        // limit binds only the upload.
+        .route(
+            "/admin/pricing/imports",
+            get(pricing::import::list)
+                .post(pricing::import::upload)
+                .layer(DefaultBodyLimit::max(pricing::import::MAX_IMPORT_BYTES)),
+        )
+        .route("/admin/pricing/imports/{id}", get(pricing::import::detail))
         .route_layer(axum::middleware::from_fn(json_only))
         .route_layer(axum::middleware::from_fn(only_listed_routes))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
