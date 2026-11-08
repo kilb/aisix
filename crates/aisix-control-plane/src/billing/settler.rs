@@ -12,14 +12,17 @@
 //! **Intake never waits on the resources lock; only the settler may.** A
 //! settle normally takes its tenant's row (`NOWAIT`), then the account, and
 //! the resources lock only if it is free, so it never holds an account while
-//! queued behind a gateway-document write. A tenant whose settle has found
+//! queued behind a gateway-document write. Once a tenant's settle has found
 //! the resources lock busy for [`Timing::escalate_after`] (steady document
-//! writes leave it free at no instant a try can see) is reported once at
-//! WARN and from then on queues for the lock, for at most
-//! [`Timing::queued_wait`], holding only the tenant's row; it takes the
-//! account after the lock, without waiting. A lock taken without waiting is
-//! never part of a wait cycle, and intake, which never waits on a tenant
-//! row, is not held up by the queued settle.
+//! writes leave it free at no instant a try can see), its attempts queue for
+//! the lock instead, for at most [`Timing::queued_wait`] each, holding only
+//! the tenant's row, and take the account after the lock, without waiting.
+//! The attempt that first queues logs a WARN naming the tenant and how long
+//! it had been skipped; while the tenant stays unsettled the WARN repeats at
+//! most once per [`Timing::warn_every`], and an INFO line reports it once it
+//! is settled. A lock taken without waiting is never part of a wait cycle,
+//! and intake, which never waits on a tenant row, is not held up by the
+//! queued settle.
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -228,11 +231,20 @@ impl Settler {
     async fn settle(&mut self, tenant_id: Uuid) -> bool {
         let now = Instant::now();
         let timing = self.timing;
-        let queued = self
-            .tracks
-            .get(&tenant_id)
-            .is_some_and(|t| t.escalated(now, &timing))
-            .then_some(timing.queued_wait);
+        let queued = match self.tracks.get_mut(&tenant_id) {
+            Some(track) if track.escalated(now, &timing) => {
+                if let Some(waited) = track.busy(now, &timing) {
+                    tracing::warn!(
+                        tenant = %tenant_id,
+                        waited_secs = waited.as_secs(),
+                        "a tenant's balance mark has waited this long for the resources lock, \
+                         which gateway-document writes keep busy; its settle now queues for it"
+                    );
+                }
+                Some(timing.queued_wait)
+            }
+            _ => None,
+        };
         match settle_one(&self.db, &self.ctx, tenant_id, queued).await {
             Ok(()) => {
                 if let Some(t) = self.tracks.remove(&tenant_id) {
@@ -268,8 +280,8 @@ impl Settler {
                     Some(waited) => tracing::warn!(
                         tenant = %tenant_id,
                         waited_secs = waited.as_secs(),
-                        "a tenant's balance mark has waited this long for the resources lock, \
-                         which gateway-document writes keep busy; its settle now queues for it"
+                        "a tenant's balance mark is still waiting for the resources lock: its \
+                         queued settle timed out, and the next pass queues again"
                     ),
                     None => tracing::debug!(
                         tenant = %tenant_id,

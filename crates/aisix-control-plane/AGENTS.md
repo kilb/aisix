@@ -74,13 +74,16 @@ way.
   elsewhere; a new one adds a case there.
 - **The settler is the one exception to the account-before-resources order,
   and never waits while it is out of order.** It takes each tenant row
-  `NOWAIT`; then the account and the resources lock only if that is free. A
-  tenant that has found the resources lock busy for 10 s is reported at WARN,
-  and its settle then queues for the resources lock (for at most 2 s, holding
-  only the tenant row) and takes the account after it, `NOWAIT`. A lock taken
-  without waiting is in no wait cycle, and no settle holds an account while
-  queued, so intake never waits behind the resources lock
-  (`an_escalated_settle_never_holds_up_intake`,
+  `NOWAIT`; then the account and the resources lock only if that is free.
+  Once a tenant's settle has found the resources lock busy for 10 s, its
+  attempts queue for the resources lock instead (for at most 2 s each,
+  holding only the tenant row) and take the account after it, `NOWAIT`. The
+  attempt that first queues logs a WARN naming the tenant and how long it had
+  been skipped, repeated at most once a minute while the tenant stays
+  unsettled. A lock taken without waiting is in no wait cycle, and no settle
+  holds an account while queued, so intake never waits behind the resources
+  lock (`an_escalated_settle_never_holds_up_intake`,
+  `an_escalated_settle_never_waits_for_the_account_while_it_holds_the_resources_lock`,
   `a_crossing_batch_never_waits_on_a_held_tenant_row`).
 - **Advisory lock keys must be unique.** They are the `*_LOCK_KEY` constants,
   all `0x6169_7369_7863_70xx`: operators `7030`, projector `7031`, resources

@@ -618,6 +618,47 @@ async fn ingest_never_waits_on_the_resources_lock() {
     .await;
 }
 
+/// What is logged at WARN and above on the thread that set it up.
+#[derive(Clone, Default)]
+struct Logs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for Logs {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .expect("the log buffer")
+            .extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Logs {
+    /// Captures this thread's WARN and ERROR lines until the guard drops.
+    fn capture(&self) -> tracing::subscriber::DefaultGuard {
+        let logs = self.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || logs.clone())
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::set_default(subscriber)
+    }
+
+    /// The captured lines that contain every one of `parts`.
+    fn lines_with(&self, parts: &[&str]) -> Vec<String> {
+        let bytes = self.0.lock().expect("the log buffer").clone();
+        String::from_utf8_lossy(&bytes)
+            .lines()
+            .filter(|line| parts.iter().all(|part| line.contains(part)))
+            .map(str::to_string)
+            .collect()
+    }
+}
+
 /// Takes the resources lock in short transactions back to back, as steady
 /// gateway-document writes do, until `stop` is set; how many it took.
 async fn write_steadily(db: Db, stop: Arc<AtomicBool>) -> u64 {
@@ -658,6 +699,9 @@ async fn a_mark_lands_while_document_writes_keep_the_resources_lock_busy() {
         ..Timing::default()
     };
     let mut settler = Settler::new(b.db().clone(), copy(&b.ctx), timing);
+    // The passes run on this thread; their log lines are captured.
+    let logs = Logs::default();
+    let capture = logs.capture();
     let started = Instant::now();
     while account(b.db(), tenant).await.marks_dirty {
         assert!(
@@ -667,11 +711,15 @@ async fn a_mark_lands_while_document_writes_keep_the_resources_lock_busy() {
         settler.pass().await.expect("a pass");
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
+    drop(capture);
     stop.store(true, Ordering::Relaxed);
     for writer in writers {
         let writes = writer.await.expect("a writer");
         assert!(writes >= 10, "a writer took the lock only {writes} times");
     }
+    // The settle that queued said so, once, naming the tenant.
+    let warned = logs.lines_with(&["WARN", &tenant.to_string(), "now queues for it"]);
+    assert_eq!(warned.len(), 1, "{warned:?}");
     assert_eq!(
         live_mark(b.db(), tenant).await.doc,
         exhausted_doc(tenant, BALANCE_MESSAGE_PREPAID)
@@ -729,6 +777,47 @@ async fn an_escalated_settle_never_holds_up_intake() {
         live_mark(w.cp.db(), w.tenant).await.doc,
         exhausted_doc(w.tenant, BALANCE_MESSAGE_PREPAID)
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_escalated_settle_never_waits_for_the_account_while_it_holds_the_resources_lock() {
+    let Some(b) = Bare::new().await else { return };
+    let tenant = b.tenant(1_000).await;
+    set_account(b.db(), tenant, -1, None).await;
+    flag(b.db(), tenant).await;
+    let timing = Timing {
+        escalate_after: Duration::ZERO,
+        queued_wait: Duration::from_secs(5),
+        ..Timing::default()
+    };
+    let mut settler = Settler::new(b.db().clone(), copy(&b.ctx), timing);
+    let mut writer = b.db().pool().begin().await.expect("begin");
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(RESOURCES_LOCK_KEY)
+        .execute(&mut *writer)
+        .await
+        .expect("hold the resources lock");
+    assert_eq!(settler.pass().await.expect("a pass"), 0, "the lock is busy");
+    writer.rollback().await.expect("end the write");
+    let mut intake = b.db().pool().begin().await.expect("begin");
+    sqlx::query("SELECT 1 FROM billing_accounts WHERE tenant_id = $1 FOR UPDATE")
+        .bind(tenant)
+        .execute(&mut *intake)
+        .await
+        .expect("hold the account");
+    let started = Instant::now();
+    assert_eq!(
+        settler.pass().await.expect("a pass"),
+        0,
+        "intake holds the account"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "the escalated settle waited {:?} for the account while it held the resources lock",
+        started.elapsed()
+    );
+    intake.rollback().await.expect("end intake");
+    assert_eq!(settler.pass().await.expect("a pass"), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
