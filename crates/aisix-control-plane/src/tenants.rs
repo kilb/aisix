@@ -1362,6 +1362,14 @@ pub async fn update(
                         "/allowed_provider_groups",
                     )]));
                 }
+                // Every group the body names must be live, taken `FOR SHARE`
+                // here: after the tenant's lock and before the resources
+                // lock a grant change takes, so an assignment and a retire
+                // of the same group serialise on the group's row.
+                if let Some(names) = &groups {
+                    crate::groups::lock_named(&mut *conn, names, "/allowed_provider_groups")
+                        .await?;
+                }
                 let grants = match &req.allowed_model_ids {
                     Some(raw) => {
                         resources_lock(&mut *conn).await?;
@@ -1530,52 +1538,6 @@ pub async fn reactivate(
     transition(state, auth, &id, Transition::Reactivate).await
 }
 
-/// `GET /admin/provider-groups` → `{items: [{name, provider_keys: [{id,
-/// display_name}]}]}`: every group a live provider key is in, by name, each
-/// with its provider keys by display name.
-pub async fn provider_groups(
-    auth: OperatorAuth,
-    State(state): State<AppState>,
-) -> Result<Json<Value>, ApiError> {
-    auth.require(OperatorRole::Viewer)?;
-    let mut conn = state.db.pool().acquire().await.map_err(DbError::from)?;
-    let mut groups: BTreeMap<String, Vec<(String, Uuid)>> = BTreeMap::new();
-    for row in store::list(&mut conn, Kind::ProviderKeys).await? {
-        let name = row
-            .doc
-            .get("display_name")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        let members = row
-            .doc
-            .get("groups")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_str);
-        for group in members {
-            groups
-                .entry(group.to_string())
-                .or_default()
-                .push((name.clone(), row.id));
-        }
-    }
-    let items: Vec<Value> = groups
-        .into_iter()
-        .map(|(group, mut keys)| {
-            keys.sort();
-            keys.dedup();
-            let keys: Vec<Value> = keys
-                .into_iter()
-                .map(|(display_name, id)| json!({"id": id, "display_name": display_name}))
-                .collect();
-            json!({"name": group, "provider_keys": keys})
-        })
-        .collect();
-    Ok(Json(json!({ "items": items })))
-}
-
 /// `GET /admin/settings/tenant-defaults` → `TenantDefaults`.
 pub async fn get_defaults(
     auth: OperatorAuth,
@@ -1627,6 +1589,15 @@ pub async fn put_defaults(
         .db
         .tx(move |conn| {
             async move {
+                // Every group the defaults name must be live, taken `FOR
+                // SHARE` in this transaction: the stored defaults are what
+                // every tenant created afterwards copies.
+                crate::groups::lock_named(
+                    &mut *conn,
+                    &stored.default_provider_groups,
+                    "/default_provider_groups",
+                )
+                .await?;
                 settings::set_tenant_defaults(&mut *conn, &stored).await?;
                 let mut fields: Vec<&str> = stored
                     .limits()

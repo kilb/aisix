@@ -661,6 +661,35 @@ impl DpClient {
     }
 }
 
+/// A live provider group named `name`, created through the API as `admin`
+/// at the default rate `"1"`; its id.
+///
+/// Every write that names a group names a live one, so a fixture that lists
+/// `name` in a provider key, a tenant or the tenant defaults creates it
+/// first with this.
+pub async fn seed_group(cp: &TestCp, admin: &OperatorSession, name: &str) -> Uuid {
+    let r = cp
+        .send(
+            "POST",
+            "/admin/provider-groups",
+            Some(admin.cookie()),
+            Some(serde_json::json!({
+                "name": name,
+                "display_name": name,
+                "description": "测试分组",
+                "default_cny_per_usd": "1",
+            })),
+        )
+        .await;
+    assert_eq!(r.status, 201, "create group {name}: {r:?}");
+    Uuid::parse_str(
+        r.body["id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("a group id in {}", r.body)),
+    )
+    .expect("a group id")
+}
+
 /// An operator the harness inserted.
 #[derive(Debug, Clone)]
 pub struct SeededOperator {

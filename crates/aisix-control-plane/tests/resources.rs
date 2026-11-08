@@ -96,6 +96,23 @@ impl Admin<'_> {
         self.send("DELETE", path, if_match, None).await
     }
 
+    /// `POST /admin/provider-groups`: a live group named `name`, which a
+    /// provider key must name before it lists it.
+    async fn seed_group(&self, name: &str) {
+        let r = self
+            .post(
+                "/admin/provider-groups",
+                json!({
+                    "name": name,
+                    "display_name": name,
+                    "description": "测试分组",
+                    "default_cny_per_usd": "1",
+                }),
+            )
+            .await;
+        assert_eq!(r.status, 201, "create group {name}: {r:?}");
+    }
+
     /// `POST /admin/resources/{kind}` with `{doc}`, which must answer 201;
     /// the created resource's id.
     async fn create(&self, kind: &str, doc: Value) -> String {
@@ -636,6 +653,8 @@ async fn a_stale_if_match_is_412_and_the_newer_doc_survives() {
         .create("provider_keys", provider_key("acct-412"))
         .await;
     let path = format!("/admin/resources/provider_keys/{pk}");
+    admin.seed_group("grp-newer-7c1").await;
+    admin.seed_group("grp-stale-7c1").await;
 
     let mut newer = provider_key("acct-412");
     newer["groups"] = json!(["grp-newer-7c1"]);
@@ -673,6 +692,7 @@ async fn a_put_without_if_match_is_428() {
         .create("provider_keys", provider_key("acct-428"))
         .await;
     let path = format!("/admin/resources/provider_keys/{pk}");
+    admin.seed_group("grp-428-7c1").await;
 
     let mut changed = provider_key("acct-428");
     changed["groups"] = json!(["grp-428-7c1"]);
@@ -957,6 +977,7 @@ async fn a_redacted_secret_sent_back_keeps_the_stored_one() {
         .await;
     let pk_id = Uuid::parse_str(&pk).expect("a uuid");
     let path = format!("/admin/resources/provider_keys/{pk}");
+    admin.seed_group("grp-keep-7c1").await;
     let opened = |doc: &Value| {
         let mut doc = doc.clone();
         secrets::unseal(cp.master_key(), Kind::ProviderKeys, pk_id, &mut doc).expect("unseal");
@@ -1377,6 +1398,7 @@ async fn a_redacted_secret_is_not_kept_when_its_destination_changes() {
     }
 
     // Kept, while every destination stays as it is.
+    admin.seed_group("grp-dest-7c1").await;
     let mut doc = admin
         .get(&format!("/admin/resources/provider_keys/{pk}"))
         .await
@@ -2580,6 +2602,7 @@ async fn every_write_is_audited_without_secret_values() {
         let id = admin.create(kind.segment(), doc).await;
         created.push((kind.segment(), id));
     }
+    admin.seed_group("grp-audit-7c1").await;
     let mut changed = provider_key("acct-audit");
     changed["groups"] = json!(["grp-audit-7c1"]);
     let r = admin
@@ -2706,6 +2729,7 @@ async fn a_provider_key_with_groups_is_accepted() {
         return;
     };
     let admin = Admin::as_role(&cp, OperatorRole::Operator).await;
+    admin.seed_group("grp-alpha-7c1").await;
     let mut doc = provider_key("acct-groups");
     doc["groups"] = json!(["shared", "grp-alpha-7c1"]);
     let id = admin.create("provider_keys", doc).await;

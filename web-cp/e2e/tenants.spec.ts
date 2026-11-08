@@ -25,6 +25,11 @@ test.beforeAll(async () => {
     stack.admin.post("/admin/resources/provider_keys", {
       doc: { display_name, provider: "openai", api_key, api_base, groups },
     });
+  // Every write that names a group names a live one, the accounts below and
+  // the tenant and defaults edits in the specs included.
+  for (const name of ["grp-eu-5d2", "grp-us-8a4", "grp-none-7d3"]) {
+    await stack.admin.createGroup(name, name);
+  }
   // Every account a tenant key reaches by default is in `shared`.
   const shared = await account("acct-t5-shared", ["shared"], "sk-t5-upstream-shared-1");
   await account("acct-t5-eu", ["grp-eu-5d2"], "sk-t5-upstream-eu-2");

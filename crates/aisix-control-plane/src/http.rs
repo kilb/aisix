@@ -657,7 +657,7 @@ pub fn browser_router(state: AppState) -> Router {
         )
         .route(
             "/admin/provider-groups",
-            get(tenants::provider_groups).post(groups::create),
+            get(groups::list).post(groups::create),
         )
         .route("/admin/provider-groups/{id}", patch(groups::update))
         .route("/admin/provider-groups/{id}/retire", post(groups::retire))

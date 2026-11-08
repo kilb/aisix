@@ -382,6 +382,9 @@ async fn a_new_tenant_starts_in_the_default_groups() {
     );
 
     // Changed defaults reach the tenants created afterwards, and only them.
+    // A default names only live groups.
+    let session = cp.admin_login_seeded(OperatorRole::Admin).await;
+    support::seed_group(&cp, &session, "grp-eu-5d2").await;
     let changed = json!({"rpm": 600, "tpm": 50000, "key_rpm_max": 60, "default_provider_groups": ["grp-eu-5d2", "shared"]});
     let r = admin
         .put("/admin/settings/tenant-defaults", changed.clone())
@@ -973,7 +976,10 @@ async fn a_wildcard_or_ensemble_model_cannot_be_granted_to_a_customer() {
         .await;
     assert_eq!(r.status, 200, "{r:?}");
 
-    // Group names are checked as well.
+    // Group names are checked as well: a well-formed name that is no live
+    // group is refused at its index, as a malformed one is.
+    let session = cp.admin_login_seeded(OperatorRole::Admin).await;
+    support::seed_group(&cp, &session, "grp-eu-5d2").await;
     let r = admin
         .patch_tenant(
             &id,
@@ -1244,57 +1250,11 @@ async fn tenant_names_may_repeat() {
     );
 }
 
-#[tokio::test]
-async fn provider_groups_are_summarised_from_provider_keys() {
-    let Some(cp) = TestCp::start().await else {
-        return;
-    };
-    let admin = Admin::as_role(&cp, OperatorRole::Operator).await;
-    let beta = admin
-        .create(
-            "provider_keys",
-            provider_key("acct-beta-7c1", json!(["grp-b-7c1", "grp-a-7c1"])),
-        )
-        .await;
-    let alpha = admin
-        .create(
-            "provider_keys",
-            provider_key("acct-alpha-7c1", json!(["grp-a-7c1"])),
-        )
-        .await;
-    admin
-        .create("provider_keys", provider_key("acct-none-7c1", json!([])))
-        .await;
-    let gone = admin
-        .create(
-            "provider_keys",
-            provider_key("acct-gone-7c1", json!(["grp-gone-7c1"])),
-        )
-        .await;
-    let r = admin
-        .delete(
-            &format!("/admin/resources/provider_keys/{gone}"),
-            Some("\"1\""),
-        )
-        .await;
-    assert_eq!(r.status, 200, "{r:?}");
-
-    let viewer = Admin::as_role(&cp, OperatorRole::Viewer).await;
-    let r = viewer.get("/admin/provider-groups").await;
-    assert_eq!(r.status, 200, "{r:?}");
-    assert_eq!(
-        r.body,
-        json!({"items": [
-            {"name": "grp-a-7c1", "provider_keys": [
-                {"id": alpha, "display_name": "acct-alpha-7c1"},
-                {"id": beta, "display_name": "acct-beta-7c1"},
-            ]},
-            {"name": "grp-b-7c1", "provider_keys": [
-                {"id": beta, "display_name": "acct-beta-7c1"},
-            ]},
-        ]})
-    );
-}
+// The provider-groups list is the group table's own list now, not a summary
+// of the accounts that name a group: `tests/groups.rs`'
+// `the_groups_list_reads_the_table` covers it, a group with no account
+// included and a retired one left out. What this file still pins is that a
+// tenant edit names only live groups: `a_wildcard_or_ensemble_model_cannot_be_granted_to_a_customer`.
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_stale_tenant_patch_is_412() {
@@ -1645,6 +1605,20 @@ async fn every_tenant_write_takes_the_tenant_before_the_resources_lock() {
                 op.clone(),
                 Some(3),
                 Some(json!({"allowed_model_ids": [model]})),
+            )),
+            200,
+        ),
+        // A group edit takes the tenant first, then the named group's row,
+        // and only then the resources lock a grant change takes.
+        (
+            "PATCH /admin/tenants/{id} (unassigning a group)",
+            Box::pin(fire(
+                cp.clone(),
+                "PATCH",
+                format!("/admin/tenants/{tenant}"),
+                op.clone(),
+                Some(4),
+                Some(json!({"allowed_provider_groups": ["shared"]})),
             )),
             200,
         ),

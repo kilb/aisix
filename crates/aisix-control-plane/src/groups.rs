@@ -191,6 +191,75 @@ pub async fn tenant_groups(
     Ok(Json(json!({ "items": items })))
 }
 
+/// The live groups `names` name, each locked `FOR SHARE` in ascending id
+/// order; `422` at `{at}/{i}` for every name that is not one.
+///
+/// This is the one check behind "every write that names a group names a
+/// live one": a name with no row and a retired group are the same refusal,
+/// so nothing leaks which groups exist. The share lock is what makes an
+/// assignment and a retire of the same group serialise — the retire takes
+/// the row `FOR UPDATE`, so it lands either before (and the assigner then
+/// finds the group retired) or after (and then counts the assignment).
+///
+/// Runs after any tenant lock and before [`crate::resources::write::
+/// write_resource`], which takes `RESOURCES_LOCK_KEY`: a provider-key write
+/// then waits on the group row rather than on the resources lock, and a
+/// retire, which takes both in that order, cannot be overtaken through the
+/// resources lock.
+pub async fn lock_named(
+    conn: &mut PgConnection,
+    names: &[String],
+    at: &str,
+) -> Result<Vec<GroupRow>, ApiError> {
+    if names.is_empty() {
+        return Ok(Vec::new());
+    }
+    let rows: Vec<GroupRow> = sqlx::query_as(&format!(
+        "SELECT {COLUMNS} FROM provider_groups \
+         WHERE name = ANY($1) AND retired_at IS NULL ORDER BY id FOR SHARE"
+    ))
+    .bind(names)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(DbError::from)?;
+    let found: Vec<&str> = rows.iter().map(|row| row.name.as_str()).collect();
+    let problems: Vec<Detail> = names
+        .iter()
+        .enumerate()
+        .filter(|(_, name)| !found.contains(&name.as_str()))
+        .map(|(i, _)| Detail {
+            path: format!("{at}/{i}"),
+            message: "分组不存在或已停用".to_string(),
+        })
+        .collect();
+    if !problems.is_empty() {
+        return Err(ApiError::validation(problems));
+    }
+    Ok(rows)
+}
+
+/// `GET /admin/provider-groups` → `{items: [Group]}`: every live group, by
+/// name, including ones no upstream account is in. A retired group is not
+/// listed.
+pub async fn list(
+    auth: OperatorAuth,
+    State(state): State<AppState>,
+) -> Result<Json<Value>, ApiError> {
+    auth.require(OperatorRole::Viewer)?;
+    let mut conn = state.db.pool().acquire().await.map_err(DbError::from)?;
+    let rows: Vec<GroupRow> = sqlx::query_as(&format!(
+        "SELECT {COLUMNS} FROM provider_groups WHERE retired_at IS NULL ORDER BY name, id"
+    ))
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(DbError::from)?;
+    let mut items = Vec::with_capacity(rows.len());
+    for row in rows {
+        items.push(view_json(&mut conn, &row).await?);
+    }
+    Ok(Json(json!({ "items": items })))
+}
+
 /// The live groups `names` assigns, by display name then id.
 async fn groups_of(conn: &mut PgConnection, names: &[String]) -> Result<Vec<GroupRow>, DbError> {
     sqlx::query_as(&format!(

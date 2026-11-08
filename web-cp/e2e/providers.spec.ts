@@ -12,6 +12,26 @@ import { STACK_START_TIMEOUT_MS, startStack, type Json, type Stack } from "./sta
 let stack: Stack;
 
 test.beforeAll(async () => {
+  // Every write that names a group names a live one: the accounts and the
+  // tenant edits below included. A name a test here creates itself is
+  // skipped.
+  const seededGroups = new Set<string>();
+  const seedGroups = async (names: string[]): Promise<void> => {
+    for (const name of names) {
+      if (seededGroups.has(name)) continue;
+      seededGroups.add(name);
+      const r = await stack.admin.post("/admin/provider-groups", {
+        name,
+        display_name: name,
+        default_cny_per_usd: "1",
+      });
+      if (r.status !== 201 && r.status !== 422) {
+        throw new Error(`creating group ${name} answered ${r.status}: ${r.text}`);
+      }
+    }
+  };
+  await seedGroups(["grp-alpha-7c1", "grp-beta-3e9", "grp-covered-6b2", "grp-dflt-8a3", "grp-idle-4e1", "grp-internal-keep-7c1", "grp-solo-6b2", "grp-swap-a1c", "grp-x-41f", "grp-y-92c"]);
+
   test.setTimeout(STACK_START_TIMEOUT_MS);
   stack = await startStack();
 });

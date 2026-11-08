@@ -10,6 +10,7 @@
 
 mod support;
 
+use aisix_control_plane::auth::OperatorRole;
 use aisix_control_plane::resources::write::RESOURCES_LOCK_KEY;
 use chrono::TimeDelta;
 use serde_json::{json, Value};
@@ -1609,4 +1610,436 @@ async fn designation_leaves_a_live_default_even_when_default_is_retired() {
         "a retired `default` does not block designating a live group"
     );
     drop_database(pool).await;
+}
+
+/// Every write that names a group names a live one: a name with no row, and
+/// a retired group, are the same `422` at the field's own index, on all four
+/// paths that take group names.
+#[tokio::test]
+async fn a_group_name_must_name_a_live_group() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let admin = cp.admin_login_seeded(OperatorRole::Admin).await;
+    let missing = "grp-nope-7c1";
+    // A retired group, which answers exactly as a name with no row does.
+    let retired = create_group(&cp, &admin, body("grp-gone-7c1", "已停用", json!("1"))).await;
+    let r = retire(&cp, &admin, &id_of(&retired)).await;
+    assert_eq!(r.status, 200, "{r:?}");
+
+    // A tenant's own groups, after its lock.
+    let tenant = seed_tenant(&cp, &admin).await;
+    for name in [missing, "grp-gone-7c1"] {
+        let version: i64 = sqlx::query_scalar("SELECT version FROM tenants WHERE id = $1")
+            .bind(tenant)
+            .fetch_one(cp.db().pool())
+            .await
+            .expect("the tenant's version");
+        let r = cp
+            .send_raw(
+                "PATCH",
+                &format!("/admin/tenants/{tenant}"),
+                Some(admin.cookie()),
+                Some("application/json"),
+                Some(
+                    serde_json::to_vec(&json!({"allowed_provider_groups": [name]}))
+                        .expect("a body"),
+                ),
+            )
+            .await;
+        assert_eq!(r.status, 428, "a PATCH without If-Match: {r:?}");
+        let r = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("an HTTP client")
+            .patch(cp.url(&format!("/admin/tenants/{tenant}")))
+            .header(reqwest::header::COOKIE, admin.cookie())
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .header(reqwest::header::IF_MATCH, format!("\"{version}\""))
+            .json(&json!({"allowed_provider_groups": ["shared", name]}))
+            .send()
+            .await
+            .expect("send the PATCH");
+        assert_eq!(r.status(), 422, "{name}");
+        let body: Value = r.json().await.expect("a JSON answer");
+        assert_eq!(body["code"], "validation_failed", "{name}: {body}");
+        assert_eq!(
+            body["details"][0]["path"], "/allowed_provider_groups/1",
+            "{name}: {body}"
+        );
+        assert_eq!(
+            body["details"][0]["message"], "分组不存在或已停用",
+            "{name}: {body}"
+        );
+    }
+    // Nothing was written: the tenant keeps the group it had.
+    let groups: Vec<String> =
+        sqlx::query_scalar("SELECT unnest(allowed_provider_groups) FROM tenants WHERE id = $1")
+            .bind(tenant)
+            .fetch_all(cp.db().pool())
+            .await
+            .expect("read the tenant's groups");
+    assert_eq!(groups, vec!["shared".to_string()]);
+
+    // The stored tenant defaults, in their own transaction.
+    for name in [missing, "grp-gone-7c1"] {
+        let r = cp
+            .send(
+                "PUT",
+                "/admin/settings/tenant-defaults",
+                Some(admin.cookie()),
+                Some(json!({"concurrency": 20, "default_provider_groups": ["shared", name]})),
+            )
+            .await;
+        assert_eq!(r.status, 422, "{name}: {r:?}");
+        assert_eq!(r.body["code"], "validation_failed", "{name}: {r:?}");
+        assert_eq!(
+            r.body["details"][0]["path"], "/default_provider_groups/1",
+            "{name}: {r:?}"
+        );
+        assert_eq!(
+            r.body["details"][0]["message"], "分组不存在或已停用",
+            "{name}: {r:?}"
+        );
+    }
+    let r = cp
+        .send(
+            "GET",
+            "/admin/settings/tenant-defaults",
+            Some(admin.cookie()),
+            None,
+        )
+        .await;
+    assert_eq!(
+        r.body["default_provider_groups"],
+        json!(["shared"]),
+        "{r:?}"
+    );
+
+    // A provider key, on create and on replace.
+    for name in [missing, "grp-gone-7c1"] {
+        let r = post_provider_key(
+            &cp,
+            &admin,
+            provider_key_body("acct-nope-7c1", &["shared", name]),
+        )
+        .await;
+        assert_422_at(&r, "/groups/1");
+        assert_eq!(
+            r.body["details"][0]["message"], "分组不存在或已停用",
+            "{r:?}"
+        );
+    }
+    let live = create_group(&cp, &admin, body("grp-live-7c1", "在用", json!("1"))).await;
+    let r = post_provider_key(
+        &cp,
+        &admin,
+        provider_key_body("acct-live-7c1", &["grp-live-7c1"]),
+    )
+    .await;
+    assert_eq!(r.status, 201, "{r:?}");
+    let pk = r.body["id"]
+        .as_str()
+        .expect("a provider key id")
+        .to_string();
+    for name in [missing, "grp-gone-7c1"] {
+        let mut doc = provider_key_body("acct-live-7c1", &["shared", name]);
+        let doc = doc["doc"].take();
+        let r = cp
+            .send_raw(
+                "PUT",
+                &format!("/admin/resources/provider_keys/{pk}"),
+                Some(admin.cookie()),
+                Some("application/json"),
+                Some(serde_json::to_vec(&json!({"doc": doc})).expect("a body")),
+            )
+            .await;
+        assert_eq!(r.status, 428, "a PUT without If-Match: {r:?}");
+        let r = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("an HTTP client")
+            .put(cp.url(&format!("/admin/resources/provider_keys/{pk}")))
+            .header(reqwest::header::COOKIE, admin.cookie())
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .header(reqwest::header::IF_MATCH, "\"1\"")
+            .json(&json!({"doc": doc}))
+            .send()
+            .await
+            .expect("send the PUT");
+        assert_eq!(r.status(), 422, "{name}");
+        let body: Value = r.json().await.expect("a JSON answer");
+        assert_eq!(body["details"][0]["path"], "/groups/1", "{name}: {body}");
+        assert_eq!(
+            body["details"][0]["message"], "分组不存在或已停用",
+            "{name}: {body}"
+        );
+    }
+    // The replace changed nothing: the account still lists only its group.
+    let r = cp
+        .send(
+            "GET",
+            &format!("/admin/resources/provider_keys/{pk}"),
+            Some(admin.cookie()),
+            None,
+        )
+        .await;
+    assert_eq!(r.body["doc"]["groups"], json!(["grp-live-7c1"]), "{r:?}");
+    assert_eq!(r.body["version"], 1, "{r:?}");
+    assert_eq!(live["name"], "grp-live-7c1");
+    let _ = id_of(&live);
+}
+
+/// `GET /admin/provider-groups` reads the table: every live group, by name,
+/// a group no upstream account is in included; a retired group is left out.
+#[tokio::test]
+async fn the_groups_list_reads_the_table() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let admin = cp.admin_login_seeded(OperatorRole::Operator).await;
+    // A group nothing joins, and one an account joins.
+    let lone = create_group(&cp, &admin, body("grp-lone-7c1", "单独分组", json!("1"))).await;
+    let used = create_group(&cp, &admin, body("grp-used-7c1", "在用分组", json!("1"))).await;
+    let gone = create_group(&cp, &admin, body("grp-list-gone-7c1", "已停用", json!("1"))).await;
+    let r = post_provider_key(
+        &cp,
+        &admin,
+        provider_key_body("acct-list-7c1", &["grp-used-7c1"]),
+    )
+    .await;
+    assert_eq!(r.status, 201, "{r:?}");
+    let pk = r.body["id"].clone();
+    let r = retire(&cp, &admin, &id_of(&gone)).await;
+    assert_eq!(r.status, 200, "{r:?}");
+
+    let viewer = cp.admin_login_seeded(OperatorRole::Viewer).await;
+    let r = cp
+        .send("GET", "/admin/provider-groups", Some(viewer.cookie()), None)
+        .await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let items = r.body["items"].as_array().expect("items");
+    let names: Vec<&str> = items
+        .iter()
+        .map(|g| g["name"].as_str().expect("a name"))
+        .collect();
+    // By name: the designated default, the first-boot group and this test's
+    // two live ones; never the retired one.
+    assert_eq!(
+        names,
+        vec!["default", "grp-lone-7c1", "grp-used-7c1", "shared"],
+        "{r:?}"
+    );
+    let lone_view = items
+        .iter()
+        .find(|g| g["name"] == "grp-lone-7c1")
+        .expect("the group no account joins");
+    assert_eq!(lone_view["id"], json!(id_of(&lone)), "{lone_view}");
+    assert_eq!(lone_view["display_name"], "单独分组", "{lone_view}");
+    assert_eq!(lone_view["provider_keys"], json!([]), "{lone_view}");
+    assert_eq!(lone_view["retired_at"], Value::Null, "{lone_view}");
+    let used_view = items
+        .iter()
+        .find(|g| g["name"] == "grp-used-7c1")
+        .expect("the group an account joins");
+    assert_eq!(used_view["id"], json!(id_of(&used)), "{used_view}");
+    assert_eq!(
+        used_view["provider_keys"],
+        json!([{"id": pk, "display_name": "acct-list-7c1"}]),
+        "{used_view}"
+    );
+    assert!(!r.body.to_string().contains("grp-list-gone-7c1"), "{r:?}");
+}
+
+/// An assignment racing a retire of the group it names: whichever commits
+/// first, the other loses. The assigner takes the row `FOR SHARE`, so it
+/// waits for the retire, and then finds the group retired.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn retiring_races_an_assignment_and_one_of_them_loses() {
+    let Some(cp) = TestCp::start_with(|cfg| cfg.db_lock_timeout_ms = 60_000).await else {
+        return;
+    };
+    let admin = cp.admin_login_seeded(OperatorRole::Admin).await;
+    let group = create_group(&cp, &admin, body("grp-race-7c1", "竞态", json!("1"))).await;
+    let id = id_of(&group);
+    let group_uuid = Uuid::parse_str(&id).expect("a group id");
+    let tenant = seed_tenant(&cp, &admin).await;
+    let version: i64 = sqlx::query_scalar("SELECT version FROM tenants WHERE id = $1")
+        .bind(tenant)
+        .fetch_one(cp.db().pool())
+        .await
+        .expect("the tenant's version");
+
+    // The retire's own lock, and its update, held while the PATCH queues.
+    let mut holder = cp.db().pool().begin().await.expect("begin");
+    let holder_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *holder)
+        .await
+        .expect("this session's pid");
+    sqlx::query("SELECT 1 FROM provider_groups WHERE id = $1 FOR UPDATE")
+        .bind(group_uuid)
+        .execute(&mut *holder)
+        .await
+        .expect("hold the group");
+    let url = cp.url(&format!("/admin/tenants/{tenant}"));
+    let cookie = admin.cookie().to_string();
+    let assign = tokio::spawn(async move {
+        reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("an HTTP client")
+            .patch(url)
+            .header(reqwest::header::COOKIE, cookie)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .header(reqwest::header::IF_MATCH, format!("\"{version}\""))
+            .json(&json!({"allowed_provider_groups": ["grp-race-7c1"]}))
+            .send()
+            .await
+            .expect("send the PATCH")
+            .text()
+            .await
+            .expect("read the answer")
+            .to_string()
+    });
+    // It waits on the group row, not on anything else: a PATCH that took no
+    // share lock on the group would answer at once.
+    until_blocked(cp.db().pool(), holder_pid).await;
+    sqlx::query("UPDATE provider_groups SET retired_at = now() WHERE id = $1")
+        .bind(group_uuid)
+        .execute(&mut *holder)
+        .await
+        .expect("retire the group");
+    holder.commit().await.expect("release the group");
+    let answer: Value = serde_json::from_str(&assign.await.expect("join")).expect("a JSON answer");
+    assert_eq!(answer["code"], "validation_failed", "{answer}");
+    assert_eq!(
+        answer["details"][0]["path"], "/allowed_provider_groups/0",
+        "{answer}"
+    );
+    assert_eq!(
+        answer["details"][0]["message"], "分组不存在或已停用",
+        "{answer}"
+    );
+    // The tenant never names the retired group.
+    let groups: Vec<String> =
+        sqlx::query_scalar("SELECT unnest(allowed_provider_groups) FROM tenants WHERE id = $1")
+            .bind(tenant)
+            .fetch_all(cp.db().pool())
+            .await
+            .expect("read the tenant's groups");
+    assert_eq!(groups, vec!["shared".to_string()]);
+
+    // The other order: the tenant names it first, and the retire is refused.
+    let group = create_group(&cp, &admin, body("grp-race2-7c1", "竞态二", json!("1"))).await;
+    let id = id_of(&group);
+    let version: i64 = sqlx::query_scalar("SELECT version FROM tenants WHERE id = $1")
+        .bind(tenant)
+        .fetch_one(cp.db().pool())
+        .await
+        .expect("the tenant's version");
+    let r = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("an HTTP client")
+        .patch(cp.url(&format!("/admin/tenants/{tenant}")))
+        .header(reqwest::header::COOKIE, admin.cookie())
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .header(reqwest::header::IF_MATCH, format!("\"{version}\""))
+        .json(&json!({"allowed_provider_groups": ["grp-race2-7c1"]}))
+        .send()
+        .await
+        .expect("send the PATCH");
+    assert_eq!(r.status(), 200);
+    let r = retire(&cp, &admin, &id).await;
+    assert_status(&r, 409, "group_in_use");
+    assert_eq!(r.body["counts"]["tenants"], 1, "{r:?}");
+}
+
+/// A tenant edit that names a group and changes its grants takes the group
+/// row before the resources lock the grant change takes: while it waits for
+/// a retire's `FOR UPDATE` on the group, the resources lock is still free.
+/// The reverse order would hold the resources lock while it waited.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_group_edit_takes_its_groups_before_the_resources_lock() {
+    let Some(cp) = TestCp::start_with(|cfg| cfg.db_lock_timeout_ms = 60_000).await else {
+        return;
+    };
+    let admin = cp.admin_login_seeded(OperatorRole::Admin).await;
+    let group = create_group(&cp, &admin, body("grp-order-7c1", "顺序", json!("1"))).await;
+    let group_uuid = Uuid::parse_str(&id_of(&group)).expect("a group id");
+    let pk = post_provider_key(
+        &cp,
+        &admin,
+        provider_key_body("acct-order-7c1", &["shared"]),
+    )
+    .await;
+    assert_eq!(pk.status, 201, "{pk:?}");
+    let model = sqlx::query_scalar::<_, Uuid>(
+        "INSERT INTO gw_resources (kind, id, doc) VALUES ('models', gen_random_uuid(), \
+         jsonb_build_object('display_name', 'chat-order-7c1', 'provider', 'openai', \
+           'model_name', 'gpt-4o-mini', 'provider_key_id', $1::text)) RETURNING id",
+    )
+    .bind(pk.body["id"].as_str().expect("a provider key id"))
+    .fetch_one(cp.db().pool())
+    .await
+    .expect("a model");
+    let tenant = seed_tenant(&cp, &admin).await;
+    let version: i64 = sqlx::query_scalar("SELECT version FROM tenants WHERE id = $1")
+        .bind(tenant)
+        .fetch_one(cp.db().pool())
+        .await
+        .expect("the tenant's version");
+
+    let mut holder = cp.db().pool().begin().await.expect("begin");
+    let holder_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *holder)
+        .await
+        .expect("this session's pid");
+    sqlx::query("SELECT 1 FROM provider_groups WHERE id = $1 FOR UPDATE")
+        .bind(group_uuid)
+        .execute(&mut *holder)
+        .await
+        .expect("hold the group");
+    let url = cp.url(&format!("/admin/tenants/{tenant}"));
+    let cookie = admin.cookie().to_string();
+    let edit = tokio::spawn(async move {
+        reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("an HTTP client")
+            .patch(url)
+            .header(reqwest::header::COOKIE, cookie)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .header(reqwest::header::IF_MATCH, format!("\"{version}\""))
+            .json(&json!({
+                "allowed_provider_groups": ["shared", "grp-order-7c1"],
+                "allowed_model_ids": [model],
+            }))
+            .send()
+            .await
+            .expect("send the PATCH")
+            .status()
+            .as_u16()
+    });
+    until_blocked(cp.db().pool(), holder_pid).await;
+    let resources_free = !resources_lock_held(&cp).await;
+    holder.commit().await.expect("release the group");
+    assert_eq!(edit.await.expect("join the edit"), 200);
+    assert!(
+        resources_free,
+        "the edit took the resources lock before the group's: the lock order is inverted"
+    );
+}
+
+/// Whether some session holds `RESOURCES_LOCK_KEY`, tried from a session of
+/// the test's own.
+async fn resources_lock_held(cp: &TestCp) -> bool {
+    let mut probe = cp.db().pool().begin().await.expect("begin");
+    let free: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1)")
+        .bind(RESOURCES_LOCK_KEY)
+        .fetch_one(&mut *probe)
+        .await
+        .expect("try the resources lock");
+    probe.rollback().await.expect("end the probe");
+    !free
 }
