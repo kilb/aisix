@@ -30,8 +30,8 @@ use serde_json::{json, Value};
 use crate::auth::{MemberRole, OperatorRole, KEY_HOLDERS};
 use crate::error::{ApiError, Detail};
 use crate::{
-    audit, billing, dp, gateways, keys, members, operators, pricing, projector, resources, rollout,
-    tenants, usage, AppState,
+    audit, billing, dp, gateways, groups, keys, members, operators, pricing, projector, resources,
+    rollout, tenants, usage, AppState,
 };
 
 /// The largest request body either listener reads.
@@ -192,6 +192,38 @@ pub const ROUTE_ROLES: &[(&str, &str, MinRole)] = &[
         "GET",
         "/admin/provider-groups",
         MinRole::Op(OperatorRole::Viewer),
+    ),
+    // Groups as data: the routing name, what tenants see, its rates, and the
+    // one designated default.
+    (
+        "POST",
+        "/admin/provider-groups",
+        MinRole::Op(OperatorRole::Operator),
+    ),
+    (
+        "PATCH",
+        "/admin/provider-groups/{id}",
+        MinRole::Op(OperatorRole::Operator),
+    ),
+    (
+        "POST",
+        "/admin/provider-groups/{id}/retire",
+        MinRole::Op(OperatorRole::Operator),
+    ),
+    (
+        "POST",
+        "/admin/provider-groups/{id}/make-default",
+        MinRole::Op(OperatorRole::Operator),
+    ),
+    (
+        "GET",
+        "/admin/provider-groups/{id}/rates",
+        MinRole::Op(OperatorRole::Viewer),
+    ),
+    (
+        "POST",
+        "/admin/provider-groups/{id}/rates",
+        MinRole::Op(OperatorRole::Operator),
     ),
     // Tenant members, as operators see them.
     (
@@ -614,7 +646,20 @@ pub fn browser_router(state: AppState) -> Router {
             "/admin/settings/tenant-defaults",
             get(tenants::get_defaults).put(tenants::put_defaults),
         )
-        .route("/admin/provider-groups", get(tenants::provider_groups))
+        .route(
+            "/admin/provider-groups",
+            get(tenants::provider_groups).post(groups::create),
+        )
+        .route("/admin/provider-groups/{id}", patch(groups::update))
+        .route("/admin/provider-groups/{id}/retire", post(groups::retire))
+        .route(
+            "/admin/provider-groups/{id}/make-default",
+            post(groups::make_default),
+        )
+        .route(
+            "/admin/provider-groups/{id}/rates",
+            get(groups::list_rates).post(groups::create_rate),
+        )
         .route("/admin/tenants/{id}/members", get(members::admin_list))
         .route("/admin/tenants/{id}/invites", post(members::admin_invite))
         .route("/admin/members/{id}", patch(members::admin_update))
