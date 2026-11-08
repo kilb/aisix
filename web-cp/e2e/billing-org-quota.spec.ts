@@ -75,6 +75,11 @@ test("运维为组织分配月度额度，用尽后该组织所有密钥被拒",
   await expect(cell(row, 3)).toHaveText("$0.00");
   await expect(cell(row, 4)).toHaveText("$0.02");
   await expect(cell(row, 5)).toHaveText("正常");
+  // The read-only 额度 region follows the write without a reopen.
+  const allQuotas = region(panel, "额度").getByRole("row").filter({ has: panel.page().getByRole("cell") });
+  await expect(allQuotas).toHaveCount(1);
+  await expect(cell(allQuotas, 0)).toHaveText("组织");
+  await expect(cell(allQuotas, 2)).toHaveText("平台");
   const stored = await budgets(world);
   expect(stored).toHaveLength(1);
   expect(stored[0]).toMatchObject({ scope: "team", set_by: "operator", kind: "periodic", period: "month", limit_micro_usd: 20_000 });
@@ -159,6 +164,10 @@ test("运维只能修改平台分配的额度", async ({ page }) => {
   await orgRows(panel).getByRole("button", { name: "确认删除" }).click();
   await expect(org.getByText("这个租户没有组织额度。")).toBeVisible();
   expect((await budgets(world)).some((b) => b.id === team.id)).toBe(false);
+  // The 额度 region no longer lists the deleted quota (the member quota stays).
+  await expect(all.getByRole("row").filter({ hasText: "$5.00" })).toHaveCount(0);
+  await expect(all.getByRole("row").filter({ hasText: "$7.25" })).toHaveCount(0);
+  await expect(memberRow).toHaveCount(1);
   // The member quota is untouched.
   expect((await budgets(world)).some((b) => b.scope === "member")).toBe(true);
 });
@@ -177,4 +186,17 @@ test("只读运维看不到组织额度的编辑控件", async ({ page }) => {
   await expect(cell(row, 2)).toHaveText("$3.00");
   await expect(org.getByRole("button")).toHaveCount(0);
   await expect(org.getByLabel("限额（美元）")).toHaveCount(0);
+});
+
+test("切换租户后，面板里不再出现上一个租户的额度", async ({ page }) => {
+  const a = await seedTenant(stack, { mode: "prepaid", creditUsd: "10.00" });
+  const b = await seedTenant(stack, { mode: "prepaid", creditUsd: "10.00" });
+  await stack.admin.post(`/admin/tenants/${a.tenantId}/budgets`, { kind: "cumulative", limit_usd: "7.77" });
+  await login(page);
+  const panelA = await openPanel(page, a);
+  await expect(orgRows(panelA)).toHaveCount(1);
+  await expect(panelA).toContainText("$7.77");
+  const panelB = await openPanel(page, b);
+  await expect(panelB.getByRole("region", { name: "组织额度", exact: true }).getByText("这个租户没有组织额度。")).toBeVisible();
+  await expect(panelB).not.toContainText("$7.77");
 });

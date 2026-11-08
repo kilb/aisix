@@ -213,11 +213,12 @@ function RowActions({ tenantId, budget, onChanged }: { tenantId: string; budget:
  * 组织额度: the tenant's `team` quotas, which only operators set. A quota the
  * tenant set at another level (member, key) is in the read-only 额度 region.
  */
-export function OrgQuota({ account, canEdit }: RegionProps) {
+export function OrgQuota({ account, canEdit, onQuotasChanged }: RegionProps) {
   const budgets = useLoad(() => billing.budgets(account.tenant_id), [account.tenant_id]);
   const rows = budgets.data?.filter((b) => b.scope === "team") ?? null;
   const reload = async () => {
     await budgets.reload();
+    onQuotasChanged?.();
   };
   return (
     <Region label="组织额度">

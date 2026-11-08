@@ -36,6 +36,9 @@ export interface RegionProps {
   onChanged: (account: BillingAccount) => void;
   /** Opens another tab, as the shell's `onGoto` does. */
   onGoto?: TabProps["onGoto"];
+  /** Bumped whenever an organization quota is written, so the read-only 额度 region reloads. */
+  quotaRev?: number;
+  onQuotasChanged?: () => void;
 }
 
 export const MONEY_HINT = "请输入金额，最多两位小数";
@@ -490,11 +493,11 @@ export function budgetPeriod(b: Budget): string {
   return b.period ? (PERIOD_LABEL[b.period] ?? b.period) : "—";
 }
 
-function Quotas({ account }: RegionProps) {
-  const budgets = useLoad(() => billing.budgets(account.tenant_id), [account.tenant_id, account.balance_micro_usd]);
+function Quotas({ account, quotaRev }: RegionProps) {
+  const budgets = useLoad(() => billing.budgets(account.tenant_id), [account.tenant_id, account.balance_micro_usd, quotaRev]);
   return (
     <Region label="额度">
-      <p className="hint">这个租户在每一级设置的额度。组织额度在「计费」的额度分配里设置；成员与密钥的额度由租户自己管理，这里只读。</p>
+      <p className="hint">这个租户在每一级设置的额度。组织额度在下方的「组织额度」里设置；成员与密钥的额度由租户自己管理，这里只读。</p>
       {budgets.error ? (
         <Failed message={budgets.error} onRetry={() => void budgets.reload()} />
       ) : budgets.data === null ? (
@@ -586,6 +589,7 @@ export function AccountPanel({
   onClose: () => void;
 }) {
   const [note, setNote] = useState<Note | null>(null);
+  const [quotaRev, setQuotaRev] = useState(0);
   const tenantId = account.tenant_id;
   useEffect(() => {
     const controller = new AbortController();
@@ -610,7 +614,16 @@ export function AccountPanel({
     >
       <Msg note={note} />
       {PANEL_REGIONS.map(({ id, Component }) => (
-        <Component key={id} account={account} canEdit={canEdit} isAdmin={isAdmin} onChanged={onChanged} onGoto={onGoto} />
+        <Component
+          key={`${tenantId}/${id}`}
+          account={account}
+          canEdit={canEdit}
+          isAdmin={isAdmin}
+          onChanged={onChanged}
+          onGoto={onGoto}
+          quotaRev={quotaRev}
+          onQuotasChanged={() => setQuotaRev((n) => n + 1)}
+        />
       ))}
     </SidePanel>
   );

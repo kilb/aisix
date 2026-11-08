@@ -24,6 +24,7 @@ const TEXT: Record<string, string> = {
   version_mismatch: "该资源已被他人修改。重新载入后再编辑。",
   if_match_required: "缺少版本号，请重新载入后再保存",
   budget_exists: "该租户已有同类型、同周期的组织额度，请直接修改限额",
+  budget_limit: "额度数量已达上限",
   budget_managed: "该额度由租户设置，运维无法修改",
   topup_state: "该申请已被处理，请刷新",
   busy: "操作过于频繁，请稍后再试",
