@@ -31,6 +31,7 @@
 //! which the gateway then sends again.
 
 pub mod api;
+pub mod baselines;
 pub mod import;
 pub mod store;
 

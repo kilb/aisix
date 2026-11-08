@@ -307,6 +307,21 @@ impl TestCp {
         Self::boot(self.database.clone(), cfg).await
     }
 
+    /// [`TestCp::restart`], with the new instance pricing from `catalogue`
+    /// instead of the built-in one, as an upgraded build shipping a newer
+    /// catalogue would.
+    pub async fn restart_with_catalogue(&self, catalogue: Arc<aisix_pricing::Catalogue>) -> TestCp {
+        let cfg = test_config(&self.database.url);
+        let running =
+            aisix_control_plane::start_with_catalogue(cfg, std::future::pending(), Some(catalogue))
+                .await
+                .expect("the control plane boots");
+        TestCp {
+            running,
+            database: self.database.clone(),
+        }
+    }
+
     pub fn db(&self) -> &Db {
         &self.running.state.db
     }

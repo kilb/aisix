@@ -253,6 +253,18 @@ fn fixture(method: &str, path: &str, target: &SeededOperator) -> (String, Option
         ),
         // Reconciliation reads and changes nothing.
         ("GET", "/admin/billing/reconciliation") => (path.to_string(), None),
+        // Baselines. The model matches nothing: 422 once the role check
+        // passed, so nothing is written.
+        ("GET", "/admin/pricing/baselines") => (path.to_string(), None),
+        ("POST", "/admin/pricing/baselines") => (
+            path.to_string(),
+            Some(json!({
+                "model_id": Uuid::nil(),
+                "effective_from": chrono::Utc::now(),
+                "card": {"default": {"base": {"input": "1", "output": "2"}}},
+                "note": "roles",
+            })),
+        ),
         _ => panic!("no fixture for {method} {path}: add one to tests/roles.rs"),
     }
 }
