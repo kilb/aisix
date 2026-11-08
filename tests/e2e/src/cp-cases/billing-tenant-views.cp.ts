@@ -11,7 +11,8 @@ import { ProxyClient } from "../harness/proxy.js";
 // them. Only the upstream model is a stand-in.
 
 /** What the channel is called, which no tenant answer may carry. */
-const CHANNEL_TOKENS = ["acct-bill-7c1", "grp-bill-5d2", "upstream-mdl-9f3", "upstream secret 4b7"];
+const GROUP = "grp-bill-5d2";
+const CHANNEL_TOKENS = ["acct-bill-7c1", GROUP, "upstream-mdl-9f3", "upstream secret 4b7"];
 const REQUEST_ID = "req-tv-7c1";
 const PASSWORD = "billing-views-e2e-pass-7c1";
 
@@ -88,6 +89,10 @@ describe("a tenant's call log and usage summary carry its calls and nothing of t
     failing.failWith = 500;
     busy = await startPlatformUpstream("overload-views-e2e");
     busy.failWith = 529;
+
+    // A provider account names only live groups, so the second group the
+    // channel accounts list exists before them.
+    await w.cp.admin.createGroup(GROUP, "账单视图 5d2");
 
     // Two models on accounts that carry the channel's names, and one the
     // tenant is not granted.

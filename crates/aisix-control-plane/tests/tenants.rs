@@ -382,6 +382,9 @@ async fn a_new_tenant_starts_in_the_default_groups() {
     );
 
     // Changed defaults reach the tenants created afterwards, and only them.
+    // A default names only live groups.
+    let session = cp.admin_login_seeded(OperatorRole::Admin).await;
+    support::seed_group(&cp, &session, "grp-eu-5d2").await;
     let changed = json!({"rpm": 600, "tpm": 50000, "key_rpm_max": 60, "default_provider_groups": ["grp-eu-5d2", "shared"]});
     let r = admin
         .put("/admin/settings/tenant-defaults", changed.clone())
@@ -477,6 +480,82 @@ async fn a_new_tenant_starts_in_the_default_groups() {
     );
     let r = admin.get("/admin/settings/tenant-defaults").await;
     assert_eq!(r.status, 200, "{r:?}");
+}
+
+/// A control character in a group name is refused at its own index, on both
+/// paths that carry a tenant's group list. Postgres rejects such a
+/// parameter, so a name reaching `groups::lock_named`'s bind answers `500`
+/// instead of naming the field; the tenant's own name is refused the same
+/// way by `tenant_name`.
+#[tokio::test]
+async fn a_control_character_in_a_group_name_is_422_at_its_index() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let admin = Admin::as_role(&cp, OperatorRole::Admin).await;
+    let session = cp.admin_login_seeded(OperatorRole::Admin).await;
+    let tenant = support::world::seed_tenant(&cp, &session).await;
+    let name = "grp\u{0}ctl-7c1";
+
+    let r = admin
+        .patch_tenant(
+            &tenant.to_string(),
+            1,
+            json!({"allowed_provider_groups": ["shared", name]}),
+        )
+        .await;
+    assert_eq!(r.status, 422, "{r:?}");
+    assert_eq!(r.body["code"], "validation_failed", "{r:?}");
+    assert_eq!(
+        r.body["details"][0]["path"], "/allowed_provider_groups/1",
+        "{r:?}"
+    );
+    assert_eq!(
+        r.body["details"][0]["message"], "分组名称不能包含控制字符",
+        "{r:?}"
+    );
+
+    let r = cp
+        .send(
+            "PUT",
+            "/admin/settings/tenant-defaults",
+            Some(&admin.cookie),
+            Some(json!({"concurrency": 20, "default_provider_groups": ["shared", name]})),
+        )
+        .await;
+    assert_eq!(r.status, 422, "{r:?}");
+    assert_eq!(r.body["code"], "validation_failed", "{r:?}");
+    assert_eq!(
+        r.body["details"][0]["path"], "/default_provider_groups/1",
+        "{r:?}"
+    );
+    assert_eq!(
+        r.body["details"][0]["message"], "分组名称不能包含控制字符",
+        "{r:?}"
+    );
+
+    // Neither refusal wrote anything: the tenant and the defaults keep the
+    // group they had, and no `500` reached either path.
+    let groups: Vec<String> =
+        sqlx::query_scalar("SELECT unnest(allowed_provider_groups) FROM tenants WHERE id = $1")
+            .bind(tenant)
+            .fetch_all(cp.db().pool())
+            .await
+            .expect("read the tenant's groups");
+    assert_eq!(groups, vec!["shared".to_string()]);
+    let r = cp
+        .send(
+            "GET",
+            "/admin/settings/tenant-defaults",
+            Some(&admin.cookie),
+            None,
+        )
+        .await;
+    assert_eq!(
+        r.body["default_provider_groups"],
+        json!(["shared"]),
+        "{r:?}"
+    );
 }
 
 /// Defaults that name no group (an edit made outside the API, or a row
@@ -973,7 +1052,10 @@ async fn a_wildcard_or_ensemble_model_cannot_be_granted_to_a_customer() {
         .await;
     assert_eq!(r.status, 200, "{r:?}");
 
-    // Group names are checked as well.
+    // Group names are checked as well: a well-formed name that is no live
+    // group is refused at its index, as a malformed one is.
+    let session = cp.admin_login_seeded(OperatorRole::Admin).await;
+    support::seed_group(&cp, &session, "grp-eu-5d2").await;
     let r = admin
         .patch_tenant(
             &id,
@@ -1244,57 +1326,11 @@ async fn tenant_names_may_repeat() {
     );
 }
 
-#[tokio::test]
-async fn provider_groups_are_summarised_from_provider_keys() {
-    let Some(cp) = TestCp::start().await else {
-        return;
-    };
-    let admin = Admin::as_role(&cp, OperatorRole::Operator).await;
-    let beta = admin
-        .create(
-            "provider_keys",
-            provider_key("acct-beta-7c1", json!(["grp-b-7c1", "grp-a-7c1"])),
-        )
-        .await;
-    let alpha = admin
-        .create(
-            "provider_keys",
-            provider_key("acct-alpha-7c1", json!(["grp-a-7c1"])),
-        )
-        .await;
-    admin
-        .create("provider_keys", provider_key("acct-none-7c1", json!([])))
-        .await;
-    let gone = admin
-        .create(
-            "provider_keys",
-            provider_key("acct-gone-7c1", json!(["grp-gone-7c1"])),
-        )
-        .await;
-    let r = admin
-        .delete(
-            &format!("/admin/resources/provider_keys/{gone}"),
-            Some("\"1\""),
-        )
-        .await;
-    assert_eq!(r.status, 200, "{r:?}");
-
-    let viewer = Admin::as_role(&cp, OperatorRole::Viewer).await;
-    let r = viewer.get("/admin/provider-groups").await;
-    assert_eq!(r.status, 200, "{r:?}");
-    assert_eq!(
-        r.body,
-        json!({"items": [
-            {"name": "grp-a-7c1", "provider_keys": [
-                {"id": alpha, "display_name": "acct-alpha-7c1"},
-                {"id": beta, "display_name": "acct-beta-7c1"},
-            ]},
-            {"name": "grp-b-7c1", "provider_keys": [
-                {"id": beta, "display_name": "acct-beta-7c1"},
-            ]},
-        ]})
-    );
-}
+// The provider-groups list is the group table's own list now, not a summary
+// of the accounts that name a group: `tests/groups.rs`'
+// `the_groups_list_reads_the_table` covers it, a group with no account
+// included and a retired one left out. What this file still pins is that a
+// tenant edit names only live groups: `a_wildcard_or_ensemble_model_cannot_be_granted_to_a_customer`.
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_stale_tenant_patch_is_412() {
@@ -1645,6 +1681,24 @@ async fn every_tenant_write_takes_the_tenant_before_the_resources_lock() {
                 op.clone(),
                 Some(3),
                 Some(json!({"allowed_model_ids": [model]})),
+            )),
+            200,
+        ),
+        // A group edit takes no resources lock of its own, so this case can
+        // only observe that lock: what it pins is that the path is enumerated
+        // (a step added ahead of its groups, taking the resources lock, would
+        // fail here) and that it answers `200`. The group row's own place in
+        // the order is `a_group_edit_takes_its_groups_before_the_resources_lock`
+        // in `tests/groups.rs`.
+        (
+            "PATCH /admin/tenants/{id} (unassigning a group)",
+            Box::pin(fire(
+                cp.clone(),
+                "PATCH",
+                format!("/admin/tenants/{tenant}"),
+                op.clone(),
+                Some(4),
+                Some(json!({"allowed_provider_groups": ["shared"]})),
             )),
             200,
         ),

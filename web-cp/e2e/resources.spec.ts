@@ -11,8 +11,13 @@ import { STACK_START_TIMEOUT_MS, fundTenant, startStack, type Json, type Stack }
 let stack: Stack;
 
 test.beforeAll(async () => {
+
   test.setTimeout(STACK_START_TIMEOUT_MS);
   stack = await startStack();
+  // Every write that names a group names a live one: the accounts and the
+  // tenant edits below included. A name a test here creates itself is
+  // skipped.
+  await stack.admin.seedGroups(["grp-resources-ui-7c1"]);
 });
 
 test.afterAll(async () => {
@@ -308,21 +313,20 @@ test("托管资源与租户派生的限流策略只读", async ({ page }) => {
 
 test("通用页：原样带回的上游密钥保持不变", async ({ page }) => {
   const secret = "sk-keep-e2e-secret-41c";
-  await seedModel("keep-e2e", "upstream-keep-e2e", secret);
   const internal = (await stack.admin.get("/admin/tenants")).items.find((t: Json) => t.is_internal);
   expect(internal, "the platform's own tenant").toBeDefined();
+  await seedModel("keep-e2e", "upstream-keep-e2e", secret);
   // Every key names one group, and the platform's own tenant has no
-  // assignment list to take it from.
-  const group = await stack.admin.post("/admin/provider-groups", {
-    name: "grp-resources-ui-7c1",
-    display_name: "资源页自用 7c1",
-    default_cny_per_usd: "7.2",
-  });
+  // assignment list to take it from: the one every account of this spec
+  // lists, created before any of them, found by name in the groups list.
+  const { items: groups } = await stack.admin.get("/admin/provider-groups");
+  const group = (groups as Json[]).find((g) => g.name === "grp-resources-ui-7c1");
+  expect(group, JSON.stringify(groups)).toBeDefined();
   const caller = (
     await stack.admin.post(`/admin/tenants/${internal.id}/keys`, {
       label: "keep-caller-e2e",
       allowed_models: ["*"],
-      group_id: group.id,
+      group_id: group!.id,
     })
   ).plaintext;
 

@@ -13,8 +13,13 @@ import { STACK_START_TIMEOUT_MS, fundTenant, startStack, type Json, type Stack }
 let stack: Stack;
 
 test.beforeAll(async () => {
+
   test.setTimeout(STACK_START_TIMEOUT_MS);
   stack = await startStack();
+  // Every write that names a group names a live one: the accounts and the
+  // tenant edits below included. A name a test here creates itself is
+  // skipped.
+  await stack.admin.seedGroups(["grp-alpha-7c1", "grp-beta-3e9", "grp-view-5e8"]);
 });
 
 test.afterAll(async () => {

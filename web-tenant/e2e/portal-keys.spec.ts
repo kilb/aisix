@@ -25,8 +25,13 @@ const GATEWAY_TEST_MS = 90_000;
 const SECRET_NOTICE = "明文只显示这一次";
 
 test.beforeAll(async () => {
+
   test.setTimeout(STACK_START_TIMEOUT_MS);
   stack = await startStack();
+  // Every write that names a group names a live one: the accounts and the
+  // tenant edits below included. A name a test here creates itself is
+  // skipped.
+  await stack.admin.seedGroups(["grp-eu-5d2"]);
   // The platform's catalog: one upstream account, in the default group the
   // tenants here reach and in a second, named group, and one model on it.
   const account = await stack.admin.post("/admin/resources/provider_keys", {

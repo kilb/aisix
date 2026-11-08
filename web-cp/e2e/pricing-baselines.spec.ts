@@ -85,12 +85,12 @@ test("从基准价打开「导入审核」会切换当前分区", async ({ page 
     page.getByRole("group", { name: "价格分区" }).getByRole("button", { name, exact: true });
   await expect(switchTo("基准价")).toHaveAttribute("aria-pressed", "true");
 
-  await page.getByRole("button", { name: /导入审核/ }).click();
+  // The baseline page's own link; 「导入审核」 is also the section switch's label now.
+  await page.getByRole("button", { name: "去「导入审核」确认第三方数据", exact: true }).click();
 
-  // Nothing has registered `imports` yet, so the first section stands in. What
-  // must hold either way is that the click switches away from 基准价.
+  // The section is registered, so the link lands on it, not on the first section.
   await expect(switchTo("基准价")).toHaveAttribute("aria-pressed", "false");
-  await expect(switchTo("平台价格")).toHaveAttribute("aria-pressed", "true");
+  await expect(switchTo("导入审核")).toHaveAttribute("aria-pressed", "true");
   await expect(page.getByRole("table", { name: "基准价" })).toHaveCount(0);
 });
 

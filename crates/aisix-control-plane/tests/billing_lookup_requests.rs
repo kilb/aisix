@@ -48,6 +48,7 @@ const ITEM_KEYS: [&str; 8] = [
 /// fixture tokens, priced at `card()` since a day ago when `priced`, and
 /// granted to the world's tenant.
 async fn model(w: &World, name: &str, priced: bool) -> Uuid {
+    support::seed_group(&w.cp, &w.admin, GROUP).await;
     let pk =
         w.cp.send(
             "POST",
