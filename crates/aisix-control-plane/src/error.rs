@@ -110,6 +110,60 @@ impl ApiError {
         }
     }
 
+    /// An adapter with no model-list endpoint: guessing a URL for one would be
+    /// the one place this route could reach somewhere it should not.
+    pub fn upstream_models_unsupported() -> ApiError {
+        Self::new(
+            StatusCode::CONFLICT,
+            "upstream_models_unsupported",
+            "该类型的上游不提供模型列表，请直接填写模型名称",
+        )
+    }
+
+    /// The upstream could not be reached: a blocked or unresolvable host, or a
+    /// connection that failed. `hint` names what an operator would change, and
+    /// is scrubbed by its caller.
+    pub fn upstream_unreachable(hint: impl Into<String>) -> ApiError {
+        ApiError {
+            details: vec![Detail {
+                path: "/upstream".to_string(),
+                message: hint.into(),
+            }],
+            ..Self::new(
+                StatusCode::BAD_GATEWAY,
+                "upstream_unreachable",
+                "无法连接该上游，请检查地址与网络",
+            )
+        }
+    }
+
+    /// The upstream did not answer within the route's bound.
+    pub fn upstream_timeout() -> ApiError {
+        Self::new(
+            StatusCode::GATEWAY_TIMEOUT,
+            "upstream_timeout",
+            "该上游响应超时",
+        )
+    }
+
+    /// The upstream answered something that is not a model list: a non-2xx, a
+    /// `3xx`, an oversized body or unparseable JSON. The detail is the
+    /// upstream's own words after scrubbing, never a raw body and never a
+    /// status it chose.
+    pub fn upstream_bad_response(detail: impl Into<String>) -> ApiError {
+        ApiError {
+            details: vec![Detail {
+                path: "/upstream".to_string(),
+                message: detail.into(),
+            }],
+            ..Self::new(
+                StatusCode::BAD_GATEWAY,
+                "upstream_bad_response",
+                "该上游的回答不是有效的模型列表",
+            )
+        }
+    }
+
     /// A 409 with its own code, such as `name_taken`.
     pub fn conflict(code: &'static str, message: impl Into<String>) -> ApiError {
         Self::new(StatusCode::CONFLICT, code, message)
@@ -309,6 +363,10 @@ pub enum BootError {
     UnreadableVersion(String),
     #[error("the built-in price catalogue does not load: {0}")]
     Catalogue(#[from] aisix_pricing::CatalogueError),
+    /// `outbound.ssrf_protection.allowed_hosts` has an entry that does not
+    /// parse, so the upstream-model route could judge nothing.
+    #[error("outbound.ssrf_protection: {0}")]
+    OutboundPolicy(String),
 }
 
 #[cfg(test)]

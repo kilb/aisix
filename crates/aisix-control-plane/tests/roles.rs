@@ -302,6 +302,12 @@ fn fixture(method: &str, path: &str, target: &SeededOperator) -> (String, Option
         ("GET", "/admin/pricing/imports/{id}") => {
             (format!("/admin/pricing/imports/{}", Uuid::nil()), None)
         }
+        // An upstream account's own model list. The account matches nothing:
+        // past the role check it answers 404 and never dials an upstream.
+        ("GET", "/admin/provider-keys/{id}/upstream-models") => (
+            format!("/admin/provider-keys/{}/upstream-models", Uuid::nil()),
+            None,
+        ),
         // Deciding a proposal. Both ids match nothing: past the role check,
         // 404, so nothing is written.
         ("POST", "/admin/pricing/imports/{id}/proposals/{pid}/confirm") => (

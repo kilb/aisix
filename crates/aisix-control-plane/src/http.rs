@@ -31,7 +31,7 @@ use crate::auth::{MemberRole, OperatorRole, KEY_HOLDERS};
 use crate::error::{ApiError, Detail};
 use crate::{
     audit, billing, dp, gateways, groups, keys, members, operators, pricing, projector, resources,
-    rollout, tenants, usage, AppState,
+    rollout, tenants, upstream_models, usage, AppState,
 };
 
 /// The largest request body either listener reads.
@@ -261,6 +261,13 @@ pub const ROUTE_ROLES: &[(&str, &str, MinRole)] = &[
     (
         "DELETE",
         "/admin/keys/{id}",
+        MinRole::Op(OperatorRole::Operator),
+    ),
+    // An upstream account's own model list, for the pickers. Operator, not
+    // Viewer: it spends the account's credential on a call to the upstream.
+    (
+        "GET",
+        "/admin/provider-keys/{id}/upstream-models",
         MinRole::Op(OperatorRole::Operator),
     ),
     // The tenant API.
@@ -684,6 +691,10 @@ pub fn browser_router(state: AppState) -> Router {
             get(keys::admin_get)
                 .patch(keys::admin_update)
                 .delete(keys::admin_revoke),
+        )
+        .route(
+            "/admin/provider-keys/{id}/upstream-models",
+            get(upstream_models::list),
         )
         .route("/api/signup", post(members::signup))
         .route("/api/login", post(members::login))

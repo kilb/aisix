@@ -14,6 +14,14 @@ aisix-core = { path = "../aisix-core" }
 # The pricing engine: each stored usage row is priced by it, inside the
 # transaction that stores the row.
 aisix-pricing = { path = "../aisix-pricing" }
+# The one outbound fetch the control plane makes (`upstream_http`): its
+# `ssrf` route check, its `response_tap` scope, and its error scrubber.
+# Default features: the `aws` feature exists for the Bedrock arms, which
+# this binary has no dispatch for.
+aisix-gateway = { path = "../aisix-gateway" }
+# The one outbound client, for `GET /admin/provider-keys/{id}/upstream-models`.
+# No `stream`: the body is read to a cap and buffered, never streamed on.
+reqwest = { version = "0.12", default-features = false, features = ["json", "cookies", "rustls-tls"] }
 axum = "0.8"
 tokio = { version = "1", features = ["full"] }
 # Runtime queries (`sqlx::query`), never the `query!` macros: those need a
@@ -90,9 +98,6 @@ rustix = { version = "1", features = ["process"] }
 tonic-build = "=0.12.3"
 
 [dev-dependencies]
-# Tests start a real listener and send real HTTP, as the portal's and the
-# console's do.
-reqwest = { version = "0.12", default-features = false, features = ["json", "cookies", "rustls-tls"] }
 # A client that keeps one connection open across requests, and one that
 # speaks h2, for the gateway listener's tests (1.9.0 and 0.1.3 in
 # Cargo.lock).

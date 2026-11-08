@@ -46,6 +46,15 @@
 //! Any other flag leaves the card in place for the comparison, but a flagged
 //! proposal is never confirmable.
 //!
+//! Two rules bound what a card may be made of. A price field carries at most
+//! [`MAX_TIERS_PER_FIELD`] tiers, since a card's bands are the union of every
+//! field's tier starts; a field over the cap is left off and flagged
+//! `unsupported_field`. And a map with no output-side price is no card
+//! (`invalid_card`), because a chat model with a missing output price is a
+//! gap in the dataset rather than a free completion; the one exception is a
+//! model in [`FREE_OUTPUT`] whose `price_comments` say in so many words that
+//! its output is free, which becomes `output: 0`.
+//!
 //! # Uploads and proposals
 //!
 //! `POST /admin/pricing/imports` writes the batch and its proposals in one
@@ -98,6 +107,12 @@ pub const MAX_IMPORT_BYTES: usize = 8 << 20;
 
 /// The most proposals one upload may make.
 pub const MAX_IMPORT_PROPOSALS: usize = 10_000;
+
+/// The most tiers one price field may carry. A card's bands are the union of
+/// every field's tier starts, so a field's cost grows with its tier count;
+/// the real dataset's largest is 2, and a body up to [`MAX_IMPORT_BYTES`]
+/// could otherwise ask for hundreds of thousands of bands in one card.
+pub const MAX_TIERS_PER_FIELD: usize = 64;
 
 /// Why a proposal cannot be confirmed as it stands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -159,11 +174,22 @@ pub fn parse(data: &RawValue, now: DateTime<Utc>) -> Result<Vec<ParsedProposal>,
     let today = now.date_naive();
     let mut proposals = Vec::new();
     for provider in &providers {
-        let pricing_url = provider.pricing_urls.first().cloned();
+        // The page is shown as a link beside the attestation. Anything but a
+        // page on the web is dropped rather than stored: a `javascript:` or
+        // `data:` URL there would run in the operator's session.
+        let pricing_url = provider
+            .pricing_urls
+            .iter()
+            .find(|url| is_web_page(url))
+            .cloned();
         for model in &provider.models {
             let entries = conditionals(model.prices).ok_or_else(unrecognised)?;
             let variants = model.price_variants.as_deref().unwrap_or_default();
-            for (effective_from, card, flags) in model_proposals(&entries, variants, today) {
+            let comments = model.price_comments.as_deref();
+            let entry = (provider.id.as_str(), model.id.as_str());
+            for (effective_from, card, flags) in
+                model_proposals(&entries, variants, today, entry, comments)
+            {
                 if proposals.len() == MAX_IMPORT_PROPOSALS {
                     return Err(refused(
                         "/data",
@@ -252,6 +278,8 @@ pub struct Proposal {
     pub decided_by: Option<Uuid>,
     pub decided_at: Option<DateTime<Utc>>,
     pub reject_reason: Option<String>,
+    /// The operator who attested a confirmation's price, written once.
+    pub attested_by: Option<Uuid>,
     /// The baseline a confirmation wrote.
     pub baseline_revision_id: Option<i64>,
     /// The suggested model's baseline in force now, if it has one.
@@ -288,7 +316,7 @@ impl CatalogueEntryView {
 const PROPOSAL_COLUMNS: &str = "p.id, p.batch_id, p.provider, p.model, p.effective_from, p.card, \
                                 p.flags, p.pricing_url, p.prices_checked, p.suggested_model_id, \
                                 p.status, p.decided_by, p.decided_at, p.reject_reason, \
-                                p.baseline_revision_id";
+                                p.attested_by, p.baseline_revision_id";
 
 impl<'r> sqlx::FromRow<'r, PgRow> for Proposal {
     /// The stored row; what it is compared to is added by [`read_proposals`].
@@ -311,6 +339,7 @@ impl<'r> sqlx::FromRow<'r, PgRow> for Proposal {
             decided_by: row.try_get("decided_by")?,
             decided_at: row.try_get("decided_at")?,
             reject_reason: row.try_get("reject_reason")?,
+            attested_by: row.try_get("attested_by")?,
             baseline_revision_id: row.try_get("baseline_revision_id")?,
             current_baseline: None,
             catalogue_entry: None,
@@ -348,6 +377,16 @@ async fn read_proposals(
             .into_iter()
             .map(|r| (r.model_id, r))
             .collect();
+    // A model deleted after the upload keeps its baseline but can take no new
+    // one, so a proposal naming it is not "nothing to confirm" — it is
+    // something that can no longer be confirmed. Its baseline still shows.
+    let live: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM gw_resources WHERE kind = $1 AND NOT deleted AND id = ANY($2)",
+    )
+    .bind(Kind::Models.segment())
+    .bind(models.as_slice())
+    .fetch_all(&mut *conn)
+    .await?;
     let card = |v: &Value| serde_json::from_value::<RateCard>(v.clone()).ok();
     for proposal in &mut proposals {
         proposal.catalogue_entry = catalogue
@@ -358,10 +397,12 @@ async fn read_proposals(
             )
             .map(CatalogueEntryView::of);
         let baseline = proposal.suggested_model_id.and_then(|m| current.get(&m));
-        // A stored card this engine cannot read equals nothing.
+        // A stored card this engine cannot read equals nothing, and so does a
+        // baseline its model can no longer be given.
         proposal.same_as_current = match (baseline, proposal.card.as_ref()) {
             (Some(baseline), Some(proposed)) => {
-                card(&baseline.card).is_some_and(|b| card(proposed) == Some(b))
+                live.contains(&baseline.model_id)
+                    && card(&baseline.card).is_some_and(|b| card(proposed) == Some(b))
             }
             _ => false,
         };
@@ -974,6 +1015,10 @@ struct Model<'a> {
     price_variants: Option<Vec<Variant<'a>>>,
     #[serde(default)]
     prices_checked: Option<NaiveDate>,
+    /// The dataset's own remarks on the model's pricing; a few state that
+    /// output is free, which no price field says.
+    #[serde(default)]
+    price_comments: Option<String>,
 }
 
 /// One entry of a model's list of prices.
@@ -1055,6 +1100,8 @@ fn model_proposals(
     entries: &[Conditional<'_>],
     variants: &[Variant<'_>],
     today: NaiveDate,
+    entry: (&str, &str),
+    comments: Option<&str>,
 ) -> Vec<Dated> {
     let entry_conditions: Vec<Condition> = entries
         .iter()
@@ -1123,7 +1170,7 @@ fn model_proposals(
                 resolved.extend(prices);
                 tiers.insert(tier, resolved);
             }
-            let card = card(&tiers, &mut flags);
+            let card = card(&tiers, entry, comments, &mut flags);
             (
                 from.map(|d| d.and_time(NaiveTime::MIN).and_utc()),
                 card,
@@ -1186,11 +1233,19 @@ enum Price {
     Tiered(Rate, Vec<(u64, Rate)>),
 }
 
+/// Why a field's value is not a price.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Unreadable {
+    /// Not a number [`Rate::parse`] reads: digits, then at most six decimals,
+    /// or a tiered price of such numbers with whole-number starts.
+    Number,
+    /// More tiers than [`MAX_TIERS_PER_FIELD`].
+    Tiers,
+}
+
 impl Price {
-    /// The value's text, multiplied by `per`. `None` for anything that is not
-    /// a number [`Rate::parse`] reads (digits, then at most six decimals) or
-    /// a tiered price of such numbers with whole-number starts.
-    fn read(value: &RawValue, per: u64) -> Option<Price> {
+    /// The value's text, multiplied by `per`.
+    fn read(value: &RawValue, per: u64) -> Result<Price, Unreadable> {
         #[derive(Deserialize)]
         struct Tiered<'a> {
             #[serde(borrow)]
@@ -1207,18 +1262,25 @@ impl Price {
         }
         let text = value.get();
         if !text.starts_with('{') {
-            return rate(text, per).map(Price::Flat);
+            return rate(text, per).map(Price::Flat).ok_or(Unreadable::Number);
         }
-        let tiered: Tiered<'_> = serde_json::from_str(text).ok()?;
-        let mut tiers = tiered
-            .tiers
-            .iter()
-            .map(|t| Some((start(t.start.get())?, rate(t.price.get(), per)?)))
-            .collect::<Option<Vec<_>>>()?;
+        let tiered: Tiered<'_> = serde_json::from_str(text).map_err(|_| Unreadable::Number)?;
+        if tiered.tiers.len() > MAX_TIERS_PER_FIELD {
+            return Err(Unreadable::Tiers);
+        }
+        let mut tiers: Vec<(u64, Rate)> = Vec::with_capacity(tiered.tiers.len());
+        for tier in &tiered.tiers {
+            let start = start(tier.start.get()).ok_or(Unreadable::Number)?;
+            let price = rate(tier.price.get(), per).ok_or(Unreadable::Number)?;
+            tiers.push((start, price));
+        }
         // Stable, so of two tiers with one start the later one wins, as in
         // the dataset's own resolution.
         tiers.sort_by_key(|(start, _)| *start);
-        Some(Price::Tiered(rate(tiered.base.get(), per)?, tiers))
+        Ok(Price::Tiered(
+            rate(tiered.base.get(), per).ok_or(Unreadable::Number)?,
+            tiers,
+        ))
     }
 
     fn starts(&self) -> impl Iterator<Item = u64> + '_ {
@@ -1234,13 +1296,68 @@ impl Price {
     fn in_band(&self, threshold: Option<u64>) -> Rate {
         match (self, threshold) {
             (Price::Flat(rate), _) | (Price::Tiered(rate, _), None) => *rate,
-            (Price::Tiered(base, tiers), Some(threshold)) => tiers
-                .iter()
-                .rev()
-                .find(|(start, _)| *start <= threshold)
-                .map_or(*base, |(_, rate)| *rate),
+            (Price::Tiered(base, tiers), Some(threshold)) => {
+                // Tier starts rise, so this is the last one at or below the
+                // threshold: a band's price is found without walking them.
+                match tiers.partition_point(|(start, _)| *start <= threshold) {
+                    0 => *base,
+                    below => tiers[below - 1].1,
+                }
+            }
         }
     }
+}
+
+/// Whether `url` is an `http` or `https` page: a scheme, then a host.
+fn is_web_page(url: &str) -> bool {
+    let (scheme, rest) = match url.split_once("://") {
+        Some(parts) => parts,
+        None => return false,
+    };
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+        return false;
+    }
+    let host = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    // The dataset's own entries all name a host; a scheme alone names none.
+    !host.is_empty()
+}
+
+/// The dataset's models whose output price is a stated zero rather than a
+/// missing one.
+///
+/// A Decisions-style model answers without billing its completion, and the
+/// dataset publishes only its input price while `price_comments` says why.
+/// These two are the entries this build knows that for. The list is by entry
+/// on purpose: several other entries carry a comment that says "output is
+/// free" and are ordinary chat models, so a statement alone decides nothing.
+const FREE_OUTPUT: [(&str, &str); 2] = [
+    ("perplexity", "pplx-decider-v1.2"),
+    ("perplexity", "pplx-decider-flash-v1.2"),
+];
+
+/// Whether this provider's model states that its output is free, in its
+/// `price_comments` as well as in [`FREE_OUTPUT`].
+///
+/// The statements are the phrases a pricing page writes for such a model:
+/// "output tokens are free", "output free", "output is free". A comment about
+/// a free *tier*, free allowances, or a free input or cache price says
+/// nothing about output and does not match.
+fn free_output(provider: &str, model: &str, comments: Option<&str>) -> bool {
+    if !FREE_OUTPUT.contains(&(provider, model)) {
+        return false;
+    }
+    let Some(comments) = comments else {
+        return false;
+    };
+    let comments = comments.to_ascii_lowercase();
+    const STATEMENTS: [&str; 3] = ["output tokens are free", "output free", "output is free"];
+    // Sentence by sentence, so a statement owes nothing to its neighbours.
+    comments.split(['.', ';']).any(|sentence| {
+        let sentence = sentence.trim();
+        STATEMENTS.iter().any(|statement| {
+            sentence.starts_with(statement) || sentence.contains(&format!(" {statement}"))
+        })
+    })
 }
 
 /// `text` as a rate, times `per`; `None` past [`Rate::MAX`].
@@ -1284,6 +1401,8 @@ fn rates(prices: &BTreeMap<Dimension, Rate>) -> Option<Rates> {
 /// `flags` what keeps them from one.
 fn card(
     tiers: &BTreeMap<ServiceTier, PriceMap<'_>>,
+    entry: (&str, &str),
+    comments: Option<&str>,
     flags: &mut BTreeSet<Flag>,
 ) -> Option<RateCard> {
     let mut priced: BTreeMap<&ServiceTier, BTreeMap<Dimension, Price>> = BTreeMap::new();
@@ -1295,13 +1414,39 @@ fn card(
                 continue;
             };
             match Price::read(value, per) {
-                Some(price) => {
+                Ok(price) => {
                     prices.insert(dimension, price);
                 }
-                None => {
+                Err(Unreadable::Number) => {
                     flags.insert(Flag::BadNumber);
                 }
+                Err(Unreadable::Tiers) => {
+                    // The value is a price this card cannot carry, not a
+                    // malformed one: it is left off like any other field no
+                    // dimension meters.
+                    tracing::warn!(
+                        field,
+                        tiers = MAX_TIERS_PER_FIELD + 1,
+                        limit = MAX_TIERS_PER_FIELD,
+                        "a price field carries more tiers than a card may hold; it is left off"
+                    );
+                    flags.insert(Flag::UnsupportedField);
+                }
             }
+        }
+        // A map with no output-side price is no card. A missing output price
+        // on a chat model is a gap in the dataset, not a free completion, so
+        // the one exception is a model this build names and the dataset says
+        // in so many words bills its output at nothing. Both are required:
+        // a comment that says "output is free" on an unnamed model changes
+        // nothing.
+        let names_output = fields.keys().any(|f| f.starts_with("output_"));
+        if !names_output
+            && prices.contains_key(&Dimension::Input)
+            && !prices.contains_key(&Dimension::Output)
+            && free_output(entry.0, entry.1, comments)
+        {
+            prices.insert(Dimension::Output, Price::Flat(Rate(0)));
         }
     }
     if flags.contains(&Flag::BadNumber) {
@@ -1660,16 +1805,198 @@ mod tests {
     fn a_card_the_rate_model_refuses_is_kept_flagged_without_a_card() {
         let all = proposals(&dataset(
             r#"{"id":"m-input-only","prices":{"input_mtok":0.02}},
-               {"id":"m-zero-start","prices":{"input_mtok":{"base":1,"tiers":[{"start":0,"price":2}]},"output_mtok":1}}"#,
+               {"id":"m-zero-start","prices":{"input_mtok":{"base":1,"tiers":[{"start":0,"price":2}]},"output_mtok":1}},
+               {"id":"m-empty","prices":{}},
+               {"id":"m-unmappable","prices":{"audio_hours":3,"input_mchars":1,
+                 "input_document_kpages":2}},
+               {"id":"m-search-only","prices":{"web_searches_kcount":10}},
+               {"id":"m-output-image","prices":{"input_mtok":1,"output_image_mtok":30}}"#,
         ));
-        for id in ["m-input-only", "m-zero-start"] {
+        for (id, flags) in [
+            // A chat model with no output price is a gap in the dataset, not
+            // a free completion.
+            ("m-input-only", vec![Flag::InvalidCard]),
+            ("m-zero-start", vec![Flag::InvalidCard]),
+            // No price at all.
+            ("m-empty", vec![Flag::InvalidCard]),
+            // Prices in units no card meters, and so no card.
+            (
+                "m-unmappable",
+                vec![Flag::UnsupportedField, Flag::InvalidCard],
+            ),
+            // Neither side of a prompt, and no output.
+            ("m-search-only", vec![Flag::InvalidCard]),
+            // An output side the card has no slot for.
+            (
+                "m-output-image",
+                vec![Flag::UnsupportedField, Flag::InvalidCard],
+            ),
+        ] {
             let p = current(&all, id);
+            assert_eq!((p.card.as_ref(), &p.flags[..]), (None, &flags[..]), "{id}");
+        }
+    }
+
+    #[test]
+    fn output_stated_free_is_a_zero_and_never_inferred() {
+        /// A dataset with one provider `p` whose models are `models`.
+        fn provider(p: &str, models: &str) -> String {
+            format!(r#"[{{"id":"{p}","models":[{models}]}}]"#)
+        }
+        let decider = r#"{"id":"pplx-decider-v1.2","prices":{"input_mtok":0.02},
+             "price_comments":"Decisions API: output tokens are free and there is no per-request fee."}"#;
+        let flash = r#"{"id":"pplx-decider-flash-v1.2","prices":{"input_mtok":0.01},
+             "price_comments":"Decisions API: output tokens are free and there is no per-request fee."}"#;
+
+        // The two entries the dataset states a free output for, at the
+        // provider that states it.
+        let all = proposals(&provider("perplexity", &format!("{decider},{flash}")));
+        for (id, input) in [
+            ("pplx-decider-v1.2", "0.02"),
+            ("pplx-decider-flash-v1.2", "0.01"),
+        ] {
+            let p = current(&all, id);
+            assert!(p.flags.is_empty(), "{id}: {:?}", p.flags);
+            let base = default_base(p);
+            assert_eq!(base.output, Rate(0), "{id}");
+            // The input price is still the file's own.
+            assert_eq!(base.input, Rate::parse(input).unwrap(), "{id}");
+        }
+
+        // The same two names under another provider: the statement is not
+        // read there.
+        let all = proposals(&provider("elsewhere", &format!("{decider},{flash}")));
+        for id in ["pplx-decider-v1.2", "pplx-decider-flash-v1.2"] {
             assert_eq!(
-                (p.card.as_ref(), &p.flags[..]),
+                (
+                    current(&all, id).card.as_ref(),
+                    &current(&all, id).flags[..]
+                ),
+                (None, &[Flag::InvalidCard][..]),
+                "{id} under another provider"
+            );
+        }
+
+        // A named model whose comment says the output is free but whose
+        // prices name output: the price stands.
+        let priced = provider(
+            "perplexity",
+            r#"{"id":"pplx-decider-v1.2","prices":{"input_mtok":0.02,"output_mtok":1.5},
+                 "price_comments":"Output is free for the first million tokens."}"#,
+        );
+        let all = proposals(&priced);
+        assert!(current(&all, "pplx-decider-v1.2").flags.is_empty());
+        assert_eq!(
+            default_base(current(&all, "pplx-decider-v1.2")).output,
+            Rate::parse("1.5").unwrap()
+        );
+
+        // A model the build does not name keeps its card-less flag, whatever
+        // its comment says. Several real chat models carry "Output is free."
+        let other = provider(
+            "typesafe",
+            r#"{"id":"jev-1.13","prices":{"input_mtok":0.042},
+                 "price_comments":"Same $0.042 per million input tokens as TypeSafe. Output is free."}"#,
+        );
+        let all = proposals(&other);
+        assert_eq!(
+            (
+                current(&all, "jev-1.13").card.as_ref(),
+                &current(&all, "jev-1.13").flags[..]
+            ),
+            (None, &[Flag::InvalidCard][..])
+        );
+
+        // A free tier, a free cache read and a free input price say nothing
+        // about output, and neither does the named model without a comment.
+        let silent = provider(
+            "perplexity",
+            r#"{"id":"pplx-decider-v1.2","prices":{"input_mtok":0.02}},
+               {"id":"m-free-cache","prices":{"input_mtok":0.02},
+                 "price_comments":"Prompt cache reads are free on this model."},
+               {"id":"m-free-input","prices":{"input_mtok":0.02},
+                 "price_comments":"Input is free; output is billed per million tokens."},
+               {"id":"m-free-tier","prices":{"input_mtok":0.99,"output_mtok":1.49},
+                 "price_comments":"Developer tier pricing. Free tier: 65k context."}"#,
+        );
+        let all = proposals(&silent);
+        for id in ["pplx-decider-v1.2", "m-free-cache", "m-free-input"] {
+            assert_eq!(
+                (
+                    current(&all, id).card.as_ref(),
+                    &current(&all, id).flags[..]
+                ),
                 (None, &[Flag::InvalidCard][..]),
                 "{id}"
             );
         }
+        // One that prices output keeps it.
+        let tiered = current(&all, "m-free-tier");
+        assert_eq!(default_base(tiered).output, Rate::parse("1.49").unwrap());
+    }
+
+    #[test]
+    fn a_price_field_carries_a_bounded_number_of_tiers() {
+        let tiers = |n: usize| {
+            (1..=n)
+                .map(|i| format!(r#"{{"start":{},"price":2}}"#, i * 1000))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let body = |n: usize| {
+            dataset(&format!(
+                r#"{{"id":"m-{n}","prices":{{"input_mtok":{{"base":1,"tiers":[{}]}},"output_mtok":1}}}}"#,
+                tiers(n)
+            ))
+        };
+
+        // The boundary is written out, not derived from the constant, so
+        // moving the cap fails this test rather than moving its input too.
+        assert_eq!(MAX_TIERS_PER_FIELD, 64);
+        let (at_cap, over) = (64, 65);
+
+        // At the cap, the card carries every band.
+        let all = proposals(&body(at_cap));
+        let p = current(&all, &format!("m-{at_cap}"));
+        assert!(p.flags.is_empty(), "{:?}", p.flags);
+        let card = p.card.as_ref().expect("a card");
+        let tiered = &card.0[&ServiceTier::default_tier()];
+        assert_eq!(tiered.long_context.len(), at_cap);
+        assert_eq!(
+            tiered.long_context.last().map(|b| b.above_input_tokens),
+            Some(at_cap as u64 * 1000)
+        );
+        card.validate().expect("the card validates");
+
+        // One past it, the field is left off. For an input price that costs
+        // the card, since a card needs one.
+        let all = proposals(&body(over));
+        let p = current(&all, &format!("m-{over}"));
+        assert_eq!(
+            p.flags,
+            vec![Flag::UnsupportedField, Flag::InvalidCard],
+            "over the cap"
+        );
+        assert_eq!(p.card, None);
+
+        // Left off, not fatal: a field the card can do without is dropped and
+        // the card stands.
+        let optional = dataset(&format!(
+            r#"{{"id":"m-optional","prices":{{"input_mtok":1,"output_mtok":2,
+                 "cache_read_mtok":{{"base":0.1,"tiers":[{}]}}}}}}"#,
+            tiers(over)
+        ));
+        let all = proposals(&optional);
+        let p = current(&all, "m-optional");
+        assert_eq!(p.flags, vec![Flag::UnsupportedField]);
+        let card = p
+            .card
+            .as_ref()
+            .expect("a card without its cache-read price");
+        let tiered = &card.0[&ServiceTier::default_tier()];
+        assert!(tiered.long_context.is_empty(), "{tiered:?}");
+        assert_eq!(tiered.base.cache_read, None, "left off, not rounded");
+        card.validate().expect("the card validates");
     }
 
     #[test]
@@ -1678,7 +2005,11 @@ mod tests {
             r#"[{"id":"p","pricing_urls":["https://p.example/a","https://p.example/b"],"models":[
                   {"id":"m-checked","prices_checked":"2026-10-19","prices":{"input_mtok":1,"output_mtok":2}},
                   {"id":"m-unchecked","prices":{"input_mtok":1,"output_mtok":2}}]},
-                {"id":"q","models":[{"id":"m-uncited","prices":{"input_mtok":1,"output_mtok":2}}]}]"#,
+                {"id":"q","models":[{"id":"m-uncited","prices":{"input_mtok":1,"output_mtok":2}}]},
+                {"id":"r","pricing_urls":["javascript:alert(1)","http://r.example/p"],
+                 "models":[{"id":"m-untrusted","prices":{"input_mtok":1,"output_mtok":2}}]},
+                {"id":"s","pricing_urls":["data:text/html,<script>alert(1)</script>","ftp://s.example/p"],
+                 "models":[{"id":"m-no-page","prices":{"input_mtok":1,"output_mtok":2}}]}]"#,
         );
         let checked = current(&all, "m-checked");
         assert_eq!(checked.provider, "p");
@@ -1693,6 +2024,13 @@ mod tests {
             (uncited.provider.as_str(), uncited.pricing_url.as_deref()),
             ("q", None)
         );
+        // A page is a page: the first `http(s)` URL wins, and a provider
+        // that cites none keeps none.
+        assert_eq!(
+            current(&all, "m-untrusted").pricing_url.as_deref(),
+            Some("http://r.example/p")
+        );
+        assert_eq!(current(&all, "m-no-page").pricing_url, None);
     }
 
     #[test]
