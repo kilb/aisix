@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 
 use aisix_control_plane::audit::Actor;
 use aisix_control_plane::auth::OperatorRole;
+use aisix_control_plane::billing::budgets::{self, BudgetScope, Kind, NewBudget, SetBy};
 use aisix_control_plane::billing::ledger;
 use aisix_control_plane::billing::ledger::Account;
 use aisix_control_plane::billing::marks::{
@@ -28,6 +29,7 @@ use aisix_control_plane::crypto::MasterKey;
 use aisix_control_plane::db::Db;
 use aisix_control_plane::resources::write::{WriteCtx, RESOURCES_LOCK_KEY};
 use aisix_control_plane::tenants::{self, BillingMode, TenantStatus};
+use aisix_core::models::BudgetPeriod;
 use futures::FutureExt;
 use serde_json::{json, Value};
 use sqlx::postgres::PgListener;
@@ -1045,10 +1047,17 @@ async fn waits_for_the_account_first(
     r.status
 }
 
-/// Every path that projects a tenant decides its balance mark, so it takes
-/// the tenant's account before the resources lock, which the projection's
-/// first write takes. Each request below is sent while the account is held
-/// elsewhere.
+/// A quota write the lock-order census sends.
+enum QuotaWrite {
+    Create(NewBudget),
+    SetLimit(Uuid),
+    Delete(Uuid),
+}
+
+/// Every path that projects a tenant decides its balance mark, and every
+/// quota write its quota marks, so it takes the tenant's account before the
+/// resources lock, which the projection's first write takes. Each request
+/// below is sent while the account is held elsewhere.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn every_marking_path_takes_the_account_before_the_resources_lock() {
     let Some(cp) = TestCp::start_with(|cfg| cfg.db_lock_timeout_ms = 60_000).await else {
@@ -1070,6 +1079,70 @@ async fn every_marking_path_takes_the_account_before_the_resources_lock() {
     let post = |path: String| -> Request {
         let (cp, admin) = (cp.clone(), admin.clone());
         Box::pin(async move { cp.send("POST", &path, Some(admin.cookie()), None).await })
+    };
+    // A quota write, as its route will send it: in a transaction that has
+    // taken only the tenant's row (`tenants::lock`) before it, answered with
+    // the write's status.
+    let organization_quota = |period: BudgetPeriod| NewBudget {
+        scope: BudgetScope::Team,
+        scope_ref: tenant,
+        set_by: SetBy::Operator,
+        kind: Kind::Periodic,
+        period: Some(period),
+        limit_micro_usd: 10_000,
+        created_by_kind: "system",
+        created_by: None,
+    };
+    let quota_write = |write: QuotaWrite| -> Request {
+        let cp = cp.clone();
+        Box::pin(async move {
+            let ctx = WriteCtx::of(cp.state());
+            let result = cp
+                .db()
+                .tx(move |conn| {
+                    async move {
+                        let row = tenants::lock(&mut *conn, tenant).await?;
+                        match write {
+                            QuotaWrite::Create(new) => {
+                                budgets::create(conn, &ctx, &row, new, Actor::System)
+                                    .await
+                                    .map(drop)
+                            }
+                            QuotaWrite::SetLimit(id) => {
+                                budgets::set_limit(conn, &ctx, &row, id, 20_000, Actor::System)
+                                    .await
+                                    .map(drop)
+                            }
+                            QuotaWrite::Delete(id) => {
+                                budgets::delete(conn, &ctx, &row, id, Actor::System).await
+                            }
+                        }
+                    }
+                    .boxed()
+                })
+                .await;
+            Resp {
+                status: result.map_or_else(|e| e.status.as_u16(), |()| 200),
+                body: Value::Null,
+                set_cookie: None,
+                headers: reqwest::header::HeaderMap::new(),
+            }
+        })
+    };
+    let existing = {
+        let ctx = WriteCtx::of(cp.state());
+        let new = organization_quota(BudgetPeriod::Month);
+        cp.db()
+            .tx(move |conn| {
+                async move {
+                    let (row, _) = tenants::lock_billing(&mut *conn, tenant).await?;
+                    budgets::create(conn, &ctx, &row, new, Actor::System).await
+                }
+                .boxed()
+            })
+            .await
+            .expect("a quota to edit")
+            .id
     };
     let cases: Vec<(&str, Uuid, Request, u16)> = vec![
         // A grant change takes the resources lock before it projects.
@@ -1114,6 +1187,24 @@ async fn every_marking_path_takes_the_account_before_the_resources_lock() {
                     send_at(&cp, &admin, reqwest::Method::DELETE, &path, 1, None).await
                 })
             },
+            200,
+        ),
+        (
+            "budgets::create",
+            tenant,
+            quota_write(QuotaWrite::Create(organization_quota(BudgetPeriod::Day))),
+            200,
+        ),
+        (
+            "budgets::set_limit",
+            tenant,
+            quota_write(QuotaWrite::SetLimit(existing)),
+            200,
+        ),
+        (
+            "budgets::delete",
+            tenant,
+            quota_write(QuotaWrite::Delete(existing)),
             200,
         ),
     ];
