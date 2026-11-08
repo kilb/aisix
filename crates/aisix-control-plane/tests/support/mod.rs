@@ -11,6 +11,7 @@
 #![allow(dead_code)]
 
 pub mod members;
+pub mod migrate;
 pub mod world;
 
 use std::net::SocketAddr;

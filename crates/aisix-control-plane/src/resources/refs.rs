@@ -281,6 +281,61 @@ pub async fn incoming(
         .collect())
 }
 
+/// Takes `RESOURCES_LOCK_KEY` to the end of this transaction: every gateway
+/// document write, and a group's retire, which must not count a provider
+/// key that is about to land ([`crate::groups::retire`]).
+pub async fn lock_resources(conn: &mut PgConnection) -> Result<(), ApiError> {
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(crate::resources::write::RESOURCES_LOCK_KEY)
+        .execute(&mut *conn)
+        .await
+        .map_err(DbError::from)?;
+    Ok(())
+}
+
+/// The provider groups `doc` names that are retired, each by the path the
+/// document names it at. Empty for every other kind, and for a name no group
+/// has: a name with no row is not this check's business (Task 12 checks
+/// provider keys against live groups).
+///
+/// Read under `RESOURCES_LOCK_KEY`, which a retire also holds across its
+/// count and its update, so a document can never be written naming a group
+/// the retire it raced has just retired.
+pub async fn retired_groups(
+    conn: &mut PgConnection,
+    kind: Kind,
+    doc: &Value,
+) -> Result<Vec<(String, String)>, ApiError> {
+    if kind != Kind::ProviderKeys {
+        return Ok(Vec::new());
+    }
+    let names: Vec<String> = doc
+        .get("groups")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect();
+    if names.is_empty() {
+        return Ok(Vec::new());
+    }
+    let retired: Vec<String> = sqlx::query_scalar(
+        "SELECT name FROM provider_groups WHERE name = ANY($1) AND retired_at IS NOT NULL",
+    )
+    .bind(&names)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(DbError::from)?;
+    Ok(retired
+        .into_iter()
+        .map(|name| {
+            let at = names.iter().position(|n| *n == name).unwrap_or_default();
+            (format!("/groups/{at}"), name)
+        })
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;

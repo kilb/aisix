@@ -1,0 +1,44 @@
+/* 价格 · 基准价. Every value comes from the tokens. */
+
+/* A model with no baseline in force: the word in the error red. */
+.baseline-unpriced {
+  color: var(--error);
+  font-weight: 700;
+}
+
+/* Where a card came from: the badge, then its details under it. */
+.baseline-source {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-1);
+}
+.baseline-source .tag {
+  align-self: flex-start;
+}
+
+/* The catalogue's word on a baseline that departs from the built-in list. */
+.baseline-update {
+  color: var(--text-2);
+}
+
+.baseline-form > .rate-card {
+  margin: 0 0 var(--s-4);
+}
+.baseline-warnings {
+  margin: var(--s-3) 0 0;
+  padding-left: var(--s-5);
+}
+
+.baseline-now {
+  margin-top: var(--s-6);
+}
+.baseline-revision {
+  margin: 0 0 var(--s-4);
+}
+.baseline-revision > .hint {
+  margin: var(--s-1) 0 var(--s-2);
+}
+.baseline-rates {
+  font-size: var(--fs-19);
+  font-weight: 700;
+}

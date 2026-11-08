@@ -28,7 +28,10 @@ tokio = { version = "1", features = ["full"] }
 # DATABASE_URL or an offline cache at build time, which the lint job has not.
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-webpki", "postgres", "macros", "migrate", "uuid", "chrono", "json"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# `raw_value`: the price import reads each price as its decimal text, never
+# through a binary float. The gateway crates already turn it on, so the
+# workspace build is unchanged.
+serde_json = { version = "1", features = ["raw_value"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 thiserror = "1"

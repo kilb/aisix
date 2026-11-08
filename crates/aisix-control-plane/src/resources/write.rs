@@ -12,7 +12,6 @@ use super::validate::validate_strict;
 use super::{managed_resource, refs, secrets, Kind};
 use crate::compat;
 use crate::crypto::MasterKey;
-use crate::db::DbError;
 use crate::error::{ApiError, Detail};
 use crate::gateways::stale_window_secs;
 use crate::settings::EnvSettings;
@@ -89,11 +88,7 @@ pub async fn write_resource(
     ctx: &WriteCtx,
     w: ResourceWrite<'_>,
 ) -> Result<ResourceRow, ApiError> {
-    sqlx::query("SELECT pg_advisory_xact_lock($1)")
-        .bind(RESOURCES_LOCK_KEY)
-        .execute(&mut *conn)
-        .await
-        .map_err(DbError::from)?;
+    super::refs::lock_resources(conn).await?;
     // A singleton lives at the environment's id and nowhere else.
     if w.kind.is_singleton() && w.id != ctx.env.env_id {
         return Err(ApiError::not_found());
@@ -245,10 +240,31 @@ async fn prepare(
     platform_rules(w.kind, &mut doc)?;
     refuse_reserved_name(w, &doc)?;
     refuse_self_reference(w, &doc)?;
+    refuse_retired_groups(&refs::retired_groups(conn, w.kind, &doc).await?)?;
     refs::check_outgoing(conn, w.kind, &doc).await?;
     compat::gate(conn, ctx, w.kind, &doc, stored).await?;
     secrets::seal(&ctx.mk, w.kind, w.id, &mut doc);
     Ok(doc)
+}
+
+/// Refuses a provider-key document that lists a retired group: a retired
+/// group takes no rate, leaves every picker, and must not gain upstream
+/// accounts it can never be used with. The check runs under
+/// `RESOURCES_LOCK_KEY`, which `groups::retire` holds across its count and
+/// its update, so this is the second half of "a group is never retired while
+/// a live provider key names it".
+fn refuse_retired_groups(retired: &[(String, String)]) -> Result<(), ApiError> {
+    if retired.is_empty() {
+        return Ok(());
+    }
+    let details: Vec<Detail> = retired
+        .iter()
+        .map(|(path, name)| Detail {
+            path: path.clone(),
+            message: format!("分组 {name} 已停用，不能加入新的上游账号"),
+        })
+        .collect();
+    Err(ApiError::validation(details))
 }
 
 /// Rules only a platform deployment has, run after strict validation and

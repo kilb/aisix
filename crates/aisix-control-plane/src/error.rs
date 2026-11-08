@@ -21,7 +21,8 @@ pub struct Detail {
 }
 
 /// An error answer of the HTTP API:
-/// `{"error": "<message>", "code": "<code>", "details"?, "referenced_by"?, "current_version"?}`.
+/// `{"error": "<message>", "code": "<code>", "details"?, "referenced_by"?,
+/// "counts"?, "current_version"?}`.
 ///
 /// `message` is shown to users and is in Chinese; `code` is for programs.
 #[derive(Debug)]
@@ -31,6 +32,10 @@ pub struct ApiError {
     pub message: String,
     pub details: Vec<Detail>,
     pub referenced_by: Vec<Referrer>,
+    /// Figures a refusal explains itself with, such as the counts of what
+    /// still names a group (`group_in_use`). Boxed so the struct stays small
+    /// enough for the many `Result<_, ApiError>` returns it flows through.
+    pub counts: Option<Box<serde_json::Value>>,
     pub current_version: Option<i64>,
 }
 
@@ -42,6 +47,7 @@ impl ApiError {
             message: message.into(),
             details: Vec::new(),
             referenced_by: Vec::new(),
+            counts: None,
             current_version: None,
         }
     }
@@ -163,6 +169,23 @@ impl ApiError {
         Self::new(StatusCode::CONFLICT, code, message)
     }
 
+    /// A group something still names, with what still names it.
+    pub fn group_in_use(counts: &crate::groups::GroupUse) -> ApiError {
+        ApiError {
+            counts: serde_json::to_value(counts).ok().map(Box::new),
+            ..Self::new(
+                StatusCode::CONFLICT,
+                "group_in_use",
+                "分组仍在使用中，无法停用",
+            )
+        }
+    }
+
+    /// A retired group, which takes no rate and cannot be designated.
+    pub fn group_retired() -> ApiError {
+        Self::new(StatusCode::CONFLICT, "group_retired", "该分组已停用")
+    }
+
     pub fn in_use(referenced_by: Vec<Referrer>) -> ApiError {
         ApiError {
             referenced_by,
@@ -271,6 +294,8 @@ struct Envelope {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     referenced_by: Vec<Referrer>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    counts: Option<Box<serde_json::Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     current_version: Option<i64>,
 }
 
@@ -281,6 +306,7 @@ impl IntoResponse for ApiError {
             code: self.code,
             details: self.details,
             referenced_by: self.referenced_by,
+            counts: self.counts,
             current_version: self.current_version,
         };
         (self.status, Json(envelope)).into_response()
@@ -396,6 +422,32 @@ mod tests {
                 "code": "validation_failed",
                 "details": [{"path": "/display_name", "message": "必填"}],
             })
+        );
+
+        // A refusal that explains itself with figures carries them, and one
+        // that does not carries nothing.
+        let (status, body) = answer(ApiError::group_in_use(&crate::groups::GroupUse {
+            tenants: 1,
+            defaults: 0,
+            keys: 2,
+            provider_keys: 0,
+            default_group: 0,
+        }))
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            without_message(body),
+            json!({
+                "code": "group_in_use",
+                "counts": {"tenants": 1, "defaults": 0, "keys": 2, "provider_keys": 0, "default_group": 0},
+            })
+        );
+        let (status, body) = answer(ApiError::group_retired()).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            without_message(body),
+            json!({"code": "group_retired"}),
+            "a refusal with no figures carries no counts"
         );
 
         let (status, body) = answer(ApiError::internal("pw-7c1")).await;

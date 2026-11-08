@@ -32,6 +32,8 @@
 
 pub mod api;
 pub mod baselines;
+pub mod import;
+pub mod rates;
 pub mod store;
 
 use std::collections::{HashMap, HashSet};

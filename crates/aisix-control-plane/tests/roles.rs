@@ -79,6 +79,33 @@ fn fixture(method: &str, path: &str, target: &SeededOperator) -> (String, Option
         ("GET", "/admin/tenants")
         | ("GET", "/admin/settings/tenant-defaults")
         | ("GET", "/admin/provider-groups") => (path.to_string(), None),
+        // Groups as data. The id matches nothing: past the role check, a read
+        // answers 404 and a write 404 too, so nothing is written.
+        ("POST", "/admin/provider-groups") => (
+            path.to_string(),
+            Some(json!({
+                "name": format!("roles-{}", Uuid::new_v4().simple()),
+                "display_name": "roles-group",
+                "default_cny_per_usd": "7.2",
+            })),
+        ),
+        ("PATCH", "/admin/provider-groups/{id}") => (
+            format!("/admin/provider-groups/{}", Uuid::nil()),
+            Some(json!({"display_name": "roles-group"})),
+        ),
+        ("POST", "/admin/provider-groups/{id}/retire")
+        | ("POST", "/admin/provider-groups/{id}/make-default") => (
+            path.replace("{id}", &Uuid::nil().to_string()),
+            Some(json!({})),
+        ),
+        ("GET", "/admin/provider-groups/{id}/rates") => (
+            format!("/admin/provider-groups/{}/rates", Uuid::nil()),
+            None,
+        ),
+        ("POST", "/admin/provider-groups/{id}/rates") => (
+            format!("/admin/provider-groups/{}/rates", Uuid::nil()),
+            Some(json!({"model_id": null, "cny_per_usd": "7.2", "effective_from": chrono::Utc::now()})),
+        ),
         ("POST", "/admin/tenants") => (path.to_string(), Some(json!({"name": "roles-tenant"}))),
         ("GET", "/admin/tenants/{id}") => (format!("/admin/tenants/{}", Uuid::nil()), None),
         ("PATCH", "/admin/tenants/{id}") => (
@@ -265,6 +292,16 @@ fn fixture(method: &str, path: &str, target: &SeededOperator) -> (String, Option
                 "note": "roles",
             })),
         ),
+        // The price import. The upload is refused at `/dataset_ref`, so
+        // nothing is written; the batch matches nothing: 404.
+        ("GET", "/admin/pricing/imports") => (path.to_string(), None),
+        ("POST", "/admin/pricing/imports") => (
+            path.to_string(),
+            Some(json!({"dataset_ref": "not a ref", "data": []})),
+        ),
+        ("GET", "/admin/pricing/imports/{id}") => {
+            (format!("/admin/pricing/imports/{}", Uuid::nil()), None)
+        }
         // An upstream account's own model list. The account matches nothing:
         // past the role check it answers 404 and never dials an upstream.
         ("GET", "/admin/provider-keys/{id}/upstream-models") => (
