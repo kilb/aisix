@@ -60,7 +60,7 @@ async function pageButtons(page: Page): Promise<string[]> {
 }
 
 /** Every tab of the Dashboard, in order. Every role but admin sees all of them but `operators`. */
-const ADMIN_TABS = ["overview", "gateways", "providers", "models", "tenants", "keys", "cache", "resources", "operators", "audit"];
+const ADMIN_TABS = ["overview", "gateways", "providers", "models", "pricing", "tenants", "billing", "keys", "cache", "resources", "operators", "audit"];
 const STAFF_TABS = ADMIN_TABS.filter((t) => t !== "operators");
 
 /**
