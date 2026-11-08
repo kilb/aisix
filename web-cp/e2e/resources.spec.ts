@@ -40,8 +40,9 @@ function createResource(kind: string, doc: Json): Promise<Json> {
 }
 
 /**
- * An upstream account at the stand-in, in the default group `shared`, and
- * one direct model on it that asks the upstream for `upstreamModel`.
+ * An upstream account at the stand-in, in the default group `shared` and in
+ * the group the internal key of the last case names, and one direct model on
+ * it that asks the upstream for `upstreamModel`.
  */
 async function seedModel(name: string, upstreamModel: string, apiKey = `sk-${name}-upstream`): Promise<{ account: Json; model: Json }> {
   const account = await createResource("provider_keys", {
@@ -49,7 +50,7 @@ async function seedModel(name: string, upstreamModel: string, apiKey = `sk-${nam
     provider: "openai",
     api_key: apiKey,
     api_base: `${stack.mockUpstreamUrl}/v1`,
-    groups: ["shared"],
+    groups: ["shared", "grp-resources-ui-7c1"],
   });
   const model = await createResource("models", {
     display_name: name,
@@ -310,8 +311,19 @@ test("通用页：原样带回的上游密钥保持不变", async ({ page }) => 
   await seedModel("keep-e2e", "upstream-keep-e2e", secret);
   const internal = (await stack.admin.get("/admin/tenants")).items.find((t: Json) => t.is_internal);
   expect(internal, "the platform's own tenant").toBeDefined();
+  // Every key names one group, and the platform's own tenant has no
+  // assignment list to take it from.
+  const group = await stack.admin.post("/admin/provider-groups", {
+    name: "grp-resources-ui-7c1",
+    display_name: "资源页自用 7c1",
+    default_cny_per_usd: "7.2",
+  });
   const caller = (
-    await stack.admin.post(`/admin/tenants/${internal.id}/keys`, { label: "keep-caller-e2e", allowed_models: ["*"] })
+    await stack.admin.post(`/admin/tenants/${internal.id}/keys`, {
+      label: "keep-caller-e2e",
+      allowed_models: ["*"],
+      group_id: group.id,
+    })
   ).plaintext;
 
   await loginAsAdmin(page);
