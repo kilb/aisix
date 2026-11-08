@@ -171,6 +171,19 @@ impl Db {
         }
     }
 
+    /// [`Db::dedicated`], waiting at most `acquire_timeout` for a connection:
+    /// for work that should be refused at once rather than queue when its
+    /// pool is busy.
+    pub fn dedicated_within(&self, max_connections: u32, acquire_timeout: Duration) -> Db {
+        let options = (*self.pool.connect_options()).clone();
+        Db {
+            pool: PgPoolOptions::new()
+                .max_connections(max_connections)
+                .acquire_timeout(acquire_timeout)
+                .connect_lazy_with(options),
+        }
+    }
+
     /// Runs `f` in one READ COMMITTED transaction: committed when it returns
     /// `Ok`, rolled back when it returns `Err`.
     ///
