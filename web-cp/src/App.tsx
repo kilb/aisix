@@ -7,11 +7,13 @@ import {
   rollout,
   session,
   tenants,
+  topups,
   type Environment,
   type Operator,
   type OperatorRole,
   type RolloutSummary,
   type Tenant,
+  type Topup,
 } from "./lib/api";
 import { EXPECTED_API_CONTRACT } from "./lib/contract";
 import { errorText, fmtInt } from "./lib/fmt";
@@ -57,6 +59,8 @@ export interface TabProps {
   /** False for a viewer: the page renders no edit controls. */
   canEdit: boolean;
   onGoto: (tab: TabId) => void;
+  /** Reads the shell's attention markers again, after a page changed what they show. */
+  refreshShell: () => void;
 }
 
 const ROLE_LABEL: Record<OperatorRole, string> = {
@@ -73,6 +77,7 @@ export interface ShellData {
   env: Environment | null;
   summary: RolloutSummary | null;
   pendingTenants: Tenant[] | null;
+  pendingTopups: Topup[] | null;
 }
 
 /**
@@ -91,6 +96,10 @@ const ATTENTION: { tab: TabId; check: (d: ShellData) => string | null }[] = [
     check: ({ pendingTenants }) =>
       pendingTenants && pendingTenants.length > 0 ? `${fmtInt(pendingTenants.length)} 个租户待审核` : null,
   },
+  {
+    tab: "billing",
+    check: ({ pendingTopups }) => (pendingTopups && pendingTopups.length > 0 ? "有待处理事项" : null),
+  },
 ];
 
 /** One lamp for the whole fleet: what stops a saved document first, else how far rollouts have got. */
@@ -107,10 +116,12 @@ function fleetLamp(s: RolloutSummary): { state: LampState; text: string } {
  * markers' data, read while an operator is signed in. A failed read keeps
  * what was last read; the pages report their own failures.
  */
-function useShellData(signedIn: boolean, tab: TabId): ShellData {
+function useShellData(signedIn: boolean, tab: TabId): ShellData & { refresh: () => void } {
   const [env, setEnv] = useState<Environment | null>(null);
   const [summary, setSummary] = useState<RolloutSummary | null>(null);
   const [pendingTenants, setPendingTenants] = useState<Tenant[] | null>(null);
+  const [pendingTopups, setPendingTopups] = useState<Topup[] | null>(null);
+  const [reads, setReads] = useState(0);
 
   useEffect(() => {
     if (!signedIn) return;
@@ -130,10 +141,15 @@ function useShellData(signedIn: boolean, tab: TabId): ShellData {
     let live = true;
     let timer: number | undefined;
     const tick = async () => {
-      const [s, p] = await Promise.allSettled([rollout.summary(), tenants.list("pending")]);
+      const [s, p, t] = await Promise.allSettled([
+        rollout.summary(),
+        tenants.list("pending"),
+        topups.list({ status: "pending" }),
+      ]);
       if (!live) return;
       if (s.status === "fulfilled") setSummary(s.value);
       if (p.status === "fulfilled") setPendingTenants(p.value);
+      if (t.status === "fulfilled") setPendingTopups(t.value.items);
       timer = window.setTimeout(() => void tick(), SHELL_REFRESH_MS);
     };
     void tick();
@@ -141,9 +157,10 @@ function useShellData(signedIn: boolean, tab: TabId): ShellData {
       live = false;
       window.clearTimeout(timer);
     };
-  }, [signedIn, tab]);
+  }, [signedIn, tab, reads]);
 
-  return { env, summary, pendingTenants };
+  const refresh = useCallback(() => setReads((n) => n + 1), []);
+  return { env, summary, pendingTenants, pendingTopups, refresh };
 }
 
 /** A tab whose page is not built yet. */
@@ -392,6 +409,7 @@ export function App() {
                 operator={operator}
                 canEdit={operator.role !== "viewer"}
                 onGoto={setTab}
+                refreshShell={shell.refresh}
               />
             </section>
           </main>
