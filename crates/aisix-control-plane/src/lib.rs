@@ -23,6 +23,7 @@ pub mod dp;
 pub mod error;
 pub mod etcd_front;
 pub mod gateways;
+pub mod groups;
 pub mod housekeeping;
 pub mod http;
 pub mod keys;
