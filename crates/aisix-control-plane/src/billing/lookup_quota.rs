@@ -66,6 +66,7 @@ pub struct QuotaFigure {
     pub period_start: Option<DateTime<Utc>>,
     pub counted_from: Option<DateTime<Utc>>,
     pub exhausted: bool,
+    pub created_at: DateTime<Utc>,
 }
 
 /// What applies to one key, now.
@@ -102,6 +103,7 @@ fn figure(b: &BudgetRow, spent: i64, now: DateTime<Utc>) -> QuotaFigure {
         period_start: b.period.map(|p| p.start_of(now)),
         counted_from: b.counted_from,
         exhausted: spent >= b.limit_micro_usd,
+        created_at: b.created_at,
     }
 }
 

@@ -318,6 +318,36 @@ async fn a_cumulative_and_a_periodic_quota_on_one_key() {
     assert!(cumulative["counted_from"].is_string());
 }
 
+/// Each figure of a key's quota is the quota as `GET /api/budgets` shows it,
+/// without its target: the same keys, `created_at` included, and the same
+/// values.
+#[tokio::test]
+async fn a_key_quotas_figures_are_the_budgets_without_their_target() {
+    let Some(q) = setup().await else { return };
+    let figures = portal(&q, &q.owner, q.key).await;
+    assert_eq!(figures.status, 200, "{figures:?}");
+    let budgets =
+        q.cp.send("GET", "/api/budgets", Some(q.owner.cookie()), None)
+            .await;
+    assert_eq!(budgets.status, 200, "{budgets:?}");
+    let figures = figures.body["quotas"].as_array().expect("quotas").clone();
+    assert_eq!(figures.len(), 3, "{figures:?}");
+    for figure in figures {
+        let mut budget = budgets.body["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .find(|b| b["id"] == figure["id"])
+            .unwrap_or_else(|| panic!("no budget for {figure}"))
+            .clone();
+        let fields = budget.as_object_mut().expect("an object");
+        fields.remove("target");
+        fields.remove("target_live");
+        assert!(fields["created_at"].is_string(), "{budget}");
+        assert_eq!(figure, budget);
+    }
+}
+
 #[tokio::test]
 async fn the_quota_lookup_names_no_channel() {
     let Some(q) = setup().await else { return };
