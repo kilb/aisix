@@ -694,6 +694,57 @@ export const pricing = {
   },
 };
 
+// ── pricing: cost prices ────────────────────────────────────────────────────
+
+/** One cost price revision: what an upstream model costs the platform, through one account or any. */
+export interface CostRevision {
+  revision_id: number;
+  engine_version: number;
+  upstream_provider: string;
+  upstream_model: string;
+  provider_key_id: string | null;
+  effective_from: string;
+  card: RateCard;
+  source: string;
+  created_by: string | null;
+  created_at: string;
+}
+
+export type CostCreated = CostRevision & { warnings: PriceWarning[] };
+
+export interface NewCostPrice {
+  upstream_provider: string;
+  upstream_model: string;
+  provider_key_id?: string;
+  effective_from: string;
+  card: RateCard;
+}
+
+export const costPricing = {
+  /** Cost revisions, newest first; `before` is the previous page's `next_before`. */
+  async listCost(q: {
+    upstream_provider?: string;
+    upstream_model?: string;
+    provider_key_id?: string;
+    limit?: number;
+    before?: number;
+  }): Promise<{ items: CostRevision[]; next_before: number | null }> {
+    const params = new URLSearchParams();
+    if (q.upstream_provider) params.set("upstream_provider", q.upstream_provider);
+    if (q.upstream_model) params.set("upstream_model", q.upstream_model);
+    if (q.provider_key_id) params.set("provider_key_id", q.provider_key_id);
+    if (q.limit !== undefined) params.set("limit", String(q.limit));
+    if (q.before !== undefined) params.set("before", String(q.before));
+    const query = params.toString();
+    return (
+      await call<{ items: CostRevision[]; next_before: number | null }>("GET", `/admin/pricing/cost${query ? `?${query}` : ""}`)
+    ).data;
+  },
+  async createCost(body: NewCostPrice): Promise<CostCreated> {
+    return (await call<CostCreated>("POST", "/admin/pricing/cost", body)).data;
+  },
+};
+
 // ── pricing: tenant plans ───────────────────────────────────────────────────
 
 /** One discount revision: basis points off every charge of the tenant, from `effective_from`. */
