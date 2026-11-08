@@ -414,6 +414,33 @@ async fn a_missing_account_never_makes_intake_wait_on_its_tenant() {
     assert_eq!(balance(&w.cp, w.tenant).await, Some(-680));
 }
 
+/// A top-up request inserts a row that references its tenant's account,
+/// whose foreign-key check key-shares the account. Intake's lock of the
+/// account leaves that share free, so a request never waits on a batch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_topup_request_never_waits_on_intakes_account_lock() {
+    let Some(w) = world().await else { return };
+    let owner = w.cp.member_login_seeded(w.tenant, MemberRole::Owner).await;
+    // The account as intake holds it while it prices a batch.
+    let mut intake = w.cp.db().pool().begin().await.expect("begin");
+    ledger::lock_account(&mut intake, w.tenant)
+        .await
+        .expect("lock the account");
+    let r = tokio::time::timeout(
+        Duration::from_secs(2),
+        w.cp.send(
+            "POST",
+            "/api/billing/topups",
+            Some(owner.cookie()),
+            Some(json!({"amount_usd": "5"})),
+        ),
+    )
+    .await
+    .expect("the request is answered while intake holds the account");
+    assert_eq!(r.status, 201, "{r:?}");
+    intake.rollback().await.expect("end intake");
+}
+
 #[tokio::test]
 async fn a_row_attributed_to_no_tenant_posts_nothing() {
     let Some(w) = world().await else { return };
