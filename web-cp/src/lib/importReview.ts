@@ -26,12 +26,70 @@ const STATUS_TEXT: Record<string, string> = {
 
 /** A flag in Chinese; one this build does not know is shown as it came. */
 export function flagText(flag: string): string {
-  return FLAG_TEXT[flag as ProposalFlag] ?? flag;
+  return (Object.hasOwn(FLAG_TEXT, flag) ? FLAG_TEXT[flag as ProposalFlag] : undefined) ?? flag;
 }
 
 /** A state in Chinese; one this build does not know is shown as it came. */
 export function statusText(status: string): string {
-  return STATUS_TEXT[status] ?? status;
+  return (Object.hasOwn(STATUS_TEXT, status) ? STATUS_TEXT[status] : undefined) ?? status;
+}
+
+/**
+ * The dimensions the price comparison renders, by the card's own key. Anything
+ * a card carries beyond these is refused below rather than shown as covered.
+ */
+export const COMPARED_DIMENSIONS: [string, string][] = [
+  ["input", "输入"],
+  ["output", "输出"],
+  ["cache_read", "缓存读"],
+  ["cache_write", "缓存写"],
+  ["cache_write_1h", "1 小时缓存写"],
+  ["web_search", "联网搜索"],
+];
+
+/** Every rate a card may carry (`Rates`), by the key the engine writes. */
+const DIMENSION_TEXT: Record<string, string> = {
+  ...Object.fromEntries(COMPARED_DIMENSIONS),
+  reasoning: "推理",
+  audio_input: "音频输入",
+  audio_output: "音频输出",
+  image_input: "图像输入",
+  image_output: "图像输出",
+};
+
+const COMPARED = new Set(COMPARED_DIMENSIONS.map(([d]) => d));
+
+/** A tier name as the engine spells it (`ServiceTier`); `default` is the one compared. */
+const TIER_TEXT: Record<string, string> = {
+  default: "标准",
+  batch: "批量",
+};
+
+/**
+ * The parts of a card the price comparison cannot show, in Chinese: any tier
+ * but `default`, any long-context band, and any rate outside
+ * [`COMPARED_DIMENSIONS`]. A card carrying one of these bills rates the
+ * operator never saw, so the page refuses to confirm it as it stands and names
+ * the part here, rather than widening the table to every dimension a card may
+ * ever carry.
+ *
+ * The card's own text is the only source, so a part this comparison does not
+ * know — a tier or rate a later engine adds — is reported, never skipped.
+ */
+export function unshownParts(card: Record<string, unknown> | null): string[] {
+  if (!card) return [];
+  const parts = new Set<string>();
+  for (const [tier, rates] of Object.entries(card)) {
+    if (tier !== "default") parts.add(`档位「${TIER_TEXT[tier] ?? tier}」的价格`);
+    const tierRates = (rates ?? {}) as { base?: Record<string, unknown>; long_context?: unknown };
+    for (const dimension of Object.keys(tierRates.base ?? {})) {
+      if (!COMPARED.has(dimension)) parts.add(`价格项「${DIMENSION_TEXT[dimension] ?? dimension}」`);
+    }
+    if (Array.isArray(tierRates.long_context) && tierRates.long_context.length > 0) {
+      parts.add("长上下文分段价");
+    }
+  }
+  return [...parts];
 }
 
 /**

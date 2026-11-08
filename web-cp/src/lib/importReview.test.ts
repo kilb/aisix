@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { datasetNotes, flagText, statusText } from "./importReview.ts";
+import { datasetNotes, flagText, statusText, unshownParts } from "./importReview.ts";
 
 test("每项标记都有中文说法，未知的标记原样显示", () => {
   assert.equal(flagText("bad_number"), "价格数字无法读取");
@@ -46,4 +46,35 @@ test("不是数据集的内容读不出备注，也不抛出", () => {
   for (const body of ["", "not json", "{}", "[]", "[1]", '[{"id":1,"models":[]}]', '[{"id":"a","models":{}}]']) {
     assert.deepEqual(datasetNotes(body), {}, body);
   }
+});
+
+test("价格对照能展示的卡没有隐藏部分", () => {
+  // Every compared dimension, in the default tier, with no band.
+  assert.deepEqual(
+    unshownParts({
+      default: {
+        base: { input: "1", output: "2", cache_read: "0.1", cache_write: "0.25", cache_write_1h: "0.5", web_search: "10" },
+      },
+    }),
+    [],
+  );
+  // No card at all is nothing to hide: the flags say why there is none.
+  assert.deepEqual(unshownParts(null), []);
+});
+
+test("价格对照展示不了的档位、分段与价格项都说出来", () => {
+  assert.deepEqual(unshownParts({ default: { base: { input: "1", output: "2" }, long_context: [{ above_input_tokens: 200000 }] } }), [
+    "长上下文分段价",
+  ]);
+  assert.deepEqual(unshownParts({ default: { base: { input: "1", output: "2" } }, batch: { base: { input: "0.5", output: "1" } } }), [
+    "档位「批量」的价格",
+  ]);
+  // A rate the comparison never renders — audio here — is named, so the operator
+  // knows which part of the card is off screen.
+  assert.deepEqual(unshownParts({ default: { base: { input: "0.06", output: "0.24", audio_input: "3.4", audio_output: "13.6" } } }), [
+    "价格项「音频输入」",
+    "价格项「音频输出」",
+  ]);
+  // A key this build cannot name is still reported, never skipped.
+  assert.deepEqual(unshownParts({ default: { base: { input: "1", output: "2", video_input: "9" } } }), ["价格项「video_input」"]);
 });

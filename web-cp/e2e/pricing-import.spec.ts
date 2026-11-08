@@ -5,9 +5,10 @@ import { STACK_START_TIMEOUT_MS, startStack, type Stack } from "./stack";
 
 /**
  * 价格 · 导入审核 against the real control plane through the built `dist/`.
- * Every test uploads the committed snapshot of the public dataset through the
- * page itself, so the whole journey is the operator's: read the file, post it,
- * review what it proposes, and decide.
+ * Every test uploads the public dataset through the page itself, so the whole
+ * journey is the operator's: read the file, post it, review what it proposes,
+ * and decide. The committed snapshot is what most of them upload; the two that
+ * need one known entry build their own, and say so where they do.
  */
 
 let stack: Stack;
@@ -114,11 +115,13 @@ test("上传数据集快照后列出提议，标注第三方数据并致谢数�
 });
 
 test("未勾选核对声明时确认按钮不可用", async ({ page }) => {
-  const model = await newModel("att", "anthropic", "claude-opus-5-5");
+  // A plain entry: one tier, no bands, so the card is fully comparable and the
+  // only thing between the operator and 确认 is the attestation.
+  const model = await newModel("att", "anthropic", "claude-v1");
   await openImports(page);
   await upload(page);
 
-  const panel = await openProposal(page, "anthropic/claude-opus-5-5");
+  const panel = await openProposal(page, "anthropic/claude-v1");
   const confirm = panel.getByRole("button", { name: "确认", exact: true });
   // Preselected to the model the upload matched, and ready but for the attestation.
   await expect(panel.getByLabel("模型")).toHaveValue(model.id);
@@ -129,12 +132,13 @@ test("未勾选核对声明时确认按钮不可用", async ({ page }) => {
 });
 
 test("确认后在基准价页显示第三方数据来源与确认人", async ({ page }) => {
-  // Its own entry, so the upload suggests this model and no other test's.
-  const model = await newModel("conf", "anthropic", "claude-haiku-5-5");
+  // Its own entry, so the upload suggests this model and no other test's: a
+  // plain one, which the comparison can show in full.
+  const model = await newModel("conf", "cohere", "command-a");
   await openImports(page);
   await upload(page);
 
-  const panel = await openProposal(page, "anthropic/claude-haiku-5-5");
+  const panel = await openProposal(page, "cohere/command-a");
   await panel.getByRole("checkbox", { name: "已对照官方价格页核对" }).check();
   await panel.getByRole("button", { name: "确认", exact: true }).click();
   await expect(panel.getByText("已确认").first()).toBeVisible();
@@ -171,6 +175,30 @@ test("带标记的提议不能确认，只提供手动录入入口", async ({ pa
   );
 });
 
+test("构成价目卡但带标记的提议也不能确认", async ({ page }) => {
+  await openImports(page);
+  await upload(page);
+
+  // A card it can build — input, cache read and output all priced — kept from
+  // confirmation by its flag alone: the dataset bills a connected minute
+  // (`audio_hours`), which no rate of a card meters.
+  const panel = await openProposal(page, "elevenlabs/eleven_realtime_v1_max");
+  await expect(panel.getByRole("table", { name: "价格对照" })).toContainText("$1.8 / 百万 tokens");
+  await expect(panel.getByRole("table", { name: "价格对照" })).toContainText("$9 / 百万 tokens");
+  await expect(panel).toContainText("含无法计价的收费项");
+  await expect(panel.getByRole("button", { name: "确认", exact: true })).toHaveCount(0);
+  await expect(panel.getByRole("checkbox", { name: "已对照官方价格页核对" })).toHaveCount(0);
+});
+
+/**
+ * The page refuses an empty reason, and this says so end to end — but it
+ * cannot show *which* layer refused: the page's own text and the route's are
+ * the same sentence ("请填写拒绝原因"), so removing the client check leaves
+ * this green. The client-only proofs are the ones whose two texts differ: an
+ * empty model (the page's "请选择这项价格对应的模型" against the route's
+ * "模型不存在"), and a file over 8 MiB (the page's own limit against the
+ * route's `payload_too_large`).
+ */
 test("驳回需要填写原因，驳回后不再待处理", async ({ page }) => {
   await openImports(page);
   await upload(page);
@@ -189,6 +217,117 @@ test("驳回需要填写原因，驳回后不再待处理", async ({ page }) => 
   await expect(row(page, entry)).toContainText("已驳回");
   await expect(row(page, entry)).not.toContainText("待处理");
   await expect(row(page, entry)).toContainText(reason);
+});
+
+test("价格对照展示不全的价目卡不能确认，并说明缺哪部分", async ({ page }) => {
+  await openImports(page);
+  await upload(page);
+
+  // The card bills audio at $3.4 / $13.6 per million tokens, and the comparison
+  // renders input and output only. Confirming it would attest prices never shown.
+  const panel = await openProposal(page, "aws/amazon.nova-sonic-v1:0");
+  const comparison = panel.getByRole("table", { name: "价格对照" });
+  await expect(comparison).toContainText("$0.06 / 百万 tokens");
+  await expect(comparison).toContainText("$0.24 / 百万 tokens");
+  await expect(comparison).not.toContainText("3.4");
+
+  // Refused, and the panel names what it could not show.
+  await expect(panel.getByRole("button", { name: "确认", exact: true })).toHaveCount(0);
+  await expect(panel.getByRole("checkbox", { name: "已对照官方价格页核对" })).toHaveCount(0);
+  await expect(panel.getByRole("status")).toContainText("价格对照无法展示的部分");
+  await expect(panel.getByRole("status")).toContainText("音频输入");
+  await expect(panel.getByRole("status")).toContainText("音频输出");
+  // The way on is the same manual entry page.
+  await expect(panel.getByRole("button", { name: "去「基准价」手动录入" })).toBeVisible();
+});
+
+test("切换上传批次会丢掉上一个批次的核对声明和勾选", async ({ page }) => {
+  // A model for each entry, so each is bulk-selectable: the tick under test is
+  // the bulk one, and it only exists while a picked row can be confirmed.
+  await newModel("switch", "cohere", "command-r");
+  await newModel("switch", "cohere", "command-a");
+  await openImports(page);
+
+  // Two batches, each one entry, so switching between them is quick and the
+  // one on screen is unmistakable.
+  const one = (provider: string, model: string, input: number, output: number, ref: string) => ({
+    name: `${ref}.json`,
+    mimeType: "application/json",
+    buffer: Buffer.from(
+      JSON.stringify([{ id: provider, models: [{ id: model, prices: { input_mtok: input, output_mtok: output } }] }]),
+    ),
+  });
+  const uploadIt = async (file: { name: string; mimeType: string; buffer: Buffer }, ref: string) => {
+    await page.getByLabel("数据集文件").setInputFiles(file);
+    await page.getByLabel("数据集版本").fill(ref);
+    await page.getByRole("button", { name: "上传", exact: true }).click();
+    await expect(page.getByLabel("上传批次")).toContainText(ref);
+  };
+  await uploadIt(one("cohere", "command-r", 0.15, 0.6, "batch-a"), "batch-a");
+  await expect(row(page, "cohere/command-r")).toBeVisible();
+  await uploadIt(one("cohere", "command-a", 2.5, 10, "batch-b"), "batch-b");
+  await expect(row(page, "cohere/command-a")).toBeVisible();
+
+  // The two batches by id, from the API: the selector's labels are prose.
+  const { items } = await stack.admin.get("/admin/pricing/imports");
+  const idOf = (ref: string) => items.find((b: { dataset_ref: string }) => b.dataset_ref === ref).id as string;
+
+  // B is on screen, reviewed, ticked and picked.
+  const bulk = page.getByRole("group", { name: "批量确认" });
+  await row(page, "cohere/command-a").getByRole("checkbox", { name: "选择 cohere/command-a" }).check();
+  await bulk.getByRole("checkbox", { name: "已对照官方价格页核对" }).check();
+  await expect(bulk.getByRole("button", { name: /^确认所选/ })).toBeEnabled();
+
+  // Switching to A drops the tick with its picks: A's rows were not reviewed,
+  // so nothing about them may confirm on B's attestation.
+  await page.getByLabel("上传批次").selectOption(idOf("batch-a"));
+  await expect(row(page, "cohere/command-r")).toBeVisible();
+
+  // Back on B, the tick and the picks are gone rather than restored, and the
+  // control is disabled: a tick never survives its batch leaving the selector.
+  await page.getByLabel("上传批次").selectOption(idOf("batch-b"));
+  await expect(row(page, "cohere/command-a")).toBeVisible();
+  await expect(bulk.getByRole("checkbox", { name: "已对照官方价格页核对" })).not.toBeChecked();
+  await expect(bulk.getByRole("button", { name: /^确认所选/ })).toBeDisabled();
+  await expect(bulk.getByRole("button", { name: /^确认所选/ })).toHaveText("确认所选（0）");
+
+  // The same claim does not carry over the 显示与当前基准价相同的提议 toggle:
+  // the rows it reveals were not on screen when the tick was given.
+  await row(page, "cohere/command-a").getByRole("checkbox", { name: "选择 cohere/command-a" }).check();
+  await bulk.getByRole("checkbox", { name: "已对照官方价格页核对" }).check();
+  await expect(bulk.getByRole("button", { name: /^确认所选/ })).toBeEnabled();
+  await page.getByRole("checkbox", { name: "显示与当前基准价相同的提议" }).check();
+  await expect(bulk.getByRole("checkbox", { name: "已对照官方价格页核对" })).not.toBeChecked();
+  await expect(bulk.getByRole("button", { name: /^确认所选/ })).toBeDisabled();
+});
+
+test("在生效时间输入框里按回车也绕不过核对声明", async ({ page }) => {
+  // A plain entry: one tier, no bands, so the card is fully comparable.
+  const model = await newModel("enter", "mistral", "mistral-nemo");
+  await openImports(page);
+  await upload(page);
+
+  const panel = await openProposal(page, "mistral/mistral-nemo");
+  await expect(panel.getByLabel("模型")).toHaveValue(model.id);
+  // A typable 生效时间, which is where a keyboard submit starts.
+  await panel.getByRole("checkbox", { name: "立即生效" }).uncheck();
+  const when = panel.getByLabel("生效时间（UTC）");
+  await when.fill("2026-11-09 00:00");
+
+  // Enter from that field submits the form without going through the button,
+  // so the disabled attribute is not what holds: the submit guard is.
+  await when.press("Enter");
+  await expect(page.getByRole("alert").filter({ hasText: "请确认已对照官方价格页核对" })).toHaveCount(0);
+  await expect(panel.getByRole("checkbox", { name: "已对照官方价格页核对" })).not.toBeChecked();
+  // Not written: still pending, so a later read shows it undecided.
+  const proposal = await proposalOf("mistral/mistral-nemo");
+  const detail = await stack.admin.get(`/admin/pricing/imports/${proposal.batch}?all=true`);
+  expect(detail.proposals.find((p: { id: string }) => p.id === proposal.id).status).toBe("pending");
+
+  // Ticking it makes the same keystroke work.
+  await panel.getByRole("checkbox", { name: "已对照官方价格页核对" }).check();
+  await when.press("Enter");
+  await expect(panel.getByText("已确认").first()).toBeVisible();
 });
 
 test("从基准价页进入导入审核，落在本页", async ({ page }) => {
@@ -244,6 +383,80 @@ test("只读运维看不到上传与决定入口", async ({ page }) => {
   await expect(page.getByRole("button", { name: "上传", exact: true })).toHaveCount(0);
 });
 
+test("核对前没选模型时，确认被页面拦下，不发请求", async ({ page }) => {
+  // Its own entry, and a plain one, so the only reason a confirm could fail is
+  // the empty model. The page's own text differs from the server's ("模型不存在"),
+  // so this proves the client check rather than a refusal that would come back
+  // with the same words either way.
+  const model = await newModel("nomodel", "openai", "gpt-oss-20b");
+  await openImports(page);
+  await upload(page);
+
+  const panel = await openProposal(page, "openai/gpt-oss-20b");
+  await expect(panel.getByLabel("模型")).toHaveValue(model.id);
+  await panel.getByLabel("模型").selectOption("");
+  await panel.getByRole("checkbox", { name: "已对照官方价格页核对" }).check();
+  await panel.getByRole("button", { name: "确认", exact: true }).click();
+
+  // The page's own refusal, on the field it names, before anything is sent.
+  await expect(panel.getByText("请选择这项价格对应的模型")).toBeVisible();
+  await expect(panel).not.toContainText("模型不存在");
+  // Nothing was sent, so the proposal is still pending.
+  const proposal = await proposalOf("openai/gpt-oss-20b");
+  const detail = await stack.admin.get(`/admin/pricing/imports/${proposal.batch}?all=true`);
+  expect(detail.proposals.find((p: { id: string }) => p.id === proposal.id).status).toBe("pending");
+});
+
+test("数据集备注只来自上传成功的那个文件，并替换上一个文件的", async ({ page }) => {
+  await openImports(page);
+
+  /** One JSON dataset file under its revision. */
+  const file = (models: unknown[], ref: string) => ({
+    name: `${ref}.json`,
+    mimeType: "application/json",
+    buffer: Buffer.from(JSON.stringify([{ id: "openai", models }])),
+  });
+  const priced = (id: string, comment?: string) => ({
+    id,
+    prices: { input_mtok: 3, output_mtok: 12 },
+    ...(comment ? { price_comments: comment } : {}),
+  });
+  const uploadIt = async (f: { name: string; mimeType: string; buffer: Buffer }, ref: string) => {
+    await page.getByLabel("数据集文件").setInputFiles(f);
+    await page.getByLabel("数据集版本").fill(ref);
+    await page.getByRole("button", { name: "上传", exact: true }).click();
+    // Uploaded when the selector names this revision and its first row is there.
+    await expect(page.getByLabel("上传批次")).toContainText(ref);
+    await expect(row(page, "openai/gpt-4-vision-preview")).toBeVisible();
+  };
+
+  // File A notes two entries.
+  await uploadIt(file([priced("gpt-4-vision-preview", "第一个文件的备注"), priced("computer-use", "只在第一个文件里的备注")], "notes-a"), "notes-a");
+  await expect(row(page, "openai/gpt-4-vision-preview")).toContainText("第一个文件的备注");
+
+  // A file the control plane refuses makes no batch, so its note must not reach
+  // the proposals that came from A. `prices` is absent, which the upload refuses.
+  await page.getByLabel("数据集文件").setInputFiles({
+    name: "refused.json",
+    mimeType: "application/json",
+    buffer: Buffer.from(JSON.stringify([{ id: "openai", models: [{ id: "gpt-4-vision-preview", price_comments: "被拒文件的备注" }] }])),
+  });
+  await page.getByLabel("数据集版本").fill("notes-refused");
+  await page.getByRole("button", { name: "上传", exact: true }).click();
+  // Refused: the batch on screen is still A's, and its notes are unchanged.
+  await expect(page.getByLabel("上传批次")).toContainText("notes-a");
+  await expect(row(page, "openai/gpt-4-vision-preview")).toContainText("第一个文件的备注");
+  await only(page, "openai/gpt-4-vision-preview");
+  await expect(page.getByText("被拒文件的备注")).toHaveCount(0);
+
+  // File B notes only the first entry. The second keeps no note at all: the
+  // notes are the file's, replaced rather than merged with A's.
+  await uploadIt(file([priced("gpt-4-vision-preview", "第二个文件的备注"), priced("computer-use")], "notes-b"), "notes-b");
+  await expect(row(page, "openai/gpt-4-vision-preview")).toContainText("第二个文件的备注");
+  await only(page, "openai/computer-use");
+  await expect(row(page, "openai/computer-use")).not.toContainText("只在第一个文件里的备注");
+});
+
 /** The proposal of the open batch for `entry`, through the real `/admin`. */
 async function proposalOf(entry: string): Promise<{ batch: string; id: string }> {
   const { items } = await stack.admin.get("/admin/pricing/imports");
@@ -257,10 +470,12 @@ async function proposalOf(entry: string): Promise<{ batch: string; id: string }>
 }
 
 test("他人先处理了提议时，确认显示中文提示并刷新该行", async ({ page }) => {
-  await newModel("race", "anthropic", "claude-haiku-4-5");
+  // A plain entry, so the card is comparable and the only reason the confirm
+  // fails is the other operator's decision.
+  await newModel("race", "mistral", "magistral-medium");
   await openImports(page);
   await upload(page);
-  const entry = "anthropic/claude-haiku-4-5";
+  const entry = "mistral/magistral-medium";
 
   const panel = await openProposal(page, entry);
   await panel.getByRole("checkbox", { name: "已对照官方价格页核对" }).check();
@@ -299,7 +514,10 @@ test("批量确认需要核对声明，并逐条显示结果", async ({ page }) 
   await bulk.getByRole("checkbox", { name: "已对照官方价格页核对" }).check();
   await confirm.click();
 
-  const results = page.getByRole("status").filter({ hasText: "已确认 cohere/command-r7b" });
+  // One results region, found by its own name rather than by the text under
+  // test, so the filter cannot be doing the assertion's work.
+  const results = page.getByRole("status", { name: "确认结果" });
+  await expect(results).toBeVisible();
   await expect(results).toContainText("已确认 cohere/command-r7b");
   await expect(results).toContainText("已确认 deepseek/deepseek-v3.2");
   // Each became its model's baseline, from the third party.

@@ -15,7 +15,7 @@ import {
 } from "../../lib/api";
 import { messageFor, problemAt } from "../../lib/errors";
 import { errorText } from "../../lib/fmt";
-import { datasetNotes, flagText, statusText } from "../../lib/importReview";
+import { COMPARED_DIMENSIONS, datasetNotes, flagText, statusText, unshownParts } from "../../lib/importReview";
 import { fmtUtc } from "../../lib/money";
 import { safeHttpUrl } from "../../lib/safeUrl";
 import { Button } from "../../ui/Button";
@@ -44,9 +44,9 @@ function headline(card: RateCard | null): { input: string; output: string } | nu
   return { input: base.input, output: base.output };
 }
 
-/** Whether a proposal can be confirmed as it stands: pending, unflagged, and with a readable card. */
+/** Whether a proposal can be confirmed as it stands: pending, unflagged, and with a card fully shown. */
 function confirmable(p: Proposal): boolean {
-  return p.status === "pending" && p.flags.length === 0 && p.card !== null;
+  return p.status === "pending" && p.flags.length === 0 && p.card !== null && unshownParts(p.card).length === 0;
 }
 
 /**
@@ -57,16 +57,6 @@ function confirmable(p: Proposal): boolean {
 function bulkable(p: Proposal): boolean {
   return confirmable(p) && p.suggested_model_id !== null;
 }
-
-/** The dimensions the price comparison shows, in a card's own order. */
-const DIMENSIONS: [string, string][] = [
-  ["input", "输入"],
-  ["output", "输出"],
-  ["cache_read", "缓存读"],
-  ["cache_write", "缓存写"],
-  ["cache_write_1h", "1 小时缓存写"],
-  ["web_search", "联网搜索"],
-];
 
 /** One card's rate of `dimension`, as the card wrote it, or null. */
 function rate(card: RateCard | null, dimension: string): string | null {
@@ -93,7 +83,14 @@ export function PricingImport({ canEdit, onGoto }: TabProps) {
   /** The dataset's own notes for each entry, read from the file uploaded in this session. */
   const [comments, setComments] = useState<Record<string, string>>({});
   const [picked, setPicked] = useState<Set<string>>(new Set());
-  const [attested, setAttested] = useState(false);
+  /**
+   * The batch the attestation was ticked under, not a bare boolean: a tick is
+   * a claim about the pages of the batch on screen when it was given, so it
+   * may not survive that batch leaving the selector. Held with its batch and
+   * compared on every read below, rather than cleared by every handler that
+   * could change one.
+   */
+  const [attestedFor, setAttestedFor] = useState<string | null>(null);
   const [running, setRunning] = useState(false);
   const [results, setResults] = useState<string[]>([]);
   const [view, setView] = useState<"proposals" | "updates">("proposals");
@@ -120,9 +117,11 @@ export function PricingImport({ canEdit, onGoto }: TabProps) {
       if (!quiet) setProposals(null);
       const detail = await imports.detail(id, every);
       setProposals(detail.proposals);
+      setError(null);
     } catch (e) {
+      // The list is not emptied: "nothing to review" and "the read failed" are
+      // different answers, and the second one is already the alert above.
       setError(errorText(e));
-      setProposals([]);
     }
   }, []);
 
@@ -163,8 +162,25 @@ export function PricingImport({ canEdit, onGoto }: TabProps) {
   // proposal picked and then filtered out of view is still confirmed.
   const chosen = (proposals ?? []).filter((p) => picked.has(p.id) && bulkable(p));
   const pages = [...new Set(chosen.flatMap((p) => (p.pricing_url ? [p.pricing_url] : [])))];
+  /**
+   * The attestation this page holds for the batch on screen. A tick given while
+   * another batch was selected is not one: `attestedFor` is read here, at the
+   * one place both the checkbox and the button read it, so no caller can hold a
+   * stale one by remembering `true`.
+   */
+  const attested = attestedFor !== null && attestedFor === batchId;
+
+  /** Switching what is reviewed drops every claim about the last one. */
+  function switchBatch(next: string | null) {
+    setBatchId(next);
+    setAttestedFor(null);
+    setPicked(new Set());
+    setResults([]);
+  }
 
   async function confirmSelection() {
+    // The guard, not the button's `disabled`: a tick given under another batch
+    // must not authorize this one's prices, however the confirm was invoked.
     if (!batchId || !attested || running) return;
     setRunning(true);
     setResults([]);
@@ -179,14 +195,23 @@ export function PricingImport({ canEdit, onGoto }: TabProps) {
         });
         done.push(`已确认 ${entry}`);
       } catch (e) {
+        // A lost answer is not a refusal: the row is read again below, and its
+        // state — not this line — is what the operator should act on.
+        const lost = e instanceof ApiError && (e.code === "network" || e.code === "bad_response");
         done.push(
-          `${entry}：${e instanceof ApiError && e.code === "proposal_state" ? messageFor(e) : errorText(e)}`,
+          `${entry}：${
+            e instanceof ApiError && e.code === "proposal_state"
+              ? messageFor(e)
+              : lost
+                ? `${messageFor(e)}；是否已写入未知，请看该行刷新后的状态`
+                : errorText(e)
+          }`,
         );
       }
     }
     setResults(done);
     setPicked(new Set());
-    setAttested(false);
+    setAttestedFor(null);
     setRunning(false);
     toast(`确认了 ${done.filter((d) => d.startsWith("已确认")).length} 条`);
     await afterDecision();
@@ -199,14 +224,11 @@ export function PricingImport({ canEdit, onGoto }: TabProps) {
           canEdit={canEdit}
           onUploaded={async (batch) => {
             setFilter("");
-            setPicked(new Set());
-            setAttested(false);
-            setResults([]);
-            setBatchId(batch.id);
+            switchBatch(batch.id);
             await loadBatches();
             await loadProposals(batch.id, all);
           }}
-          onNotes={(c) => setComments((old) => ({ ...old, ...c }))}
+          onNotes={(c) => setComments(c)}
         />
 
         <div className="panel">
@@ -241,7 +263,7 @@ export function PricingImport({ canEdit, onGoto }: TabProps) {
               <div className="import-controls">
                 <Field label="上传批次">
                   {(aria) => (
-                    <select {...aria} value={batchId ?? ""} onChange={(e) => setBatchId(e.target.value)}>
+                    <select {...aria} value={batchId ?? ""} onChange={(e) => switchBatch(e.target.value)}>
                       {batches.map((b) => (
                         <option key={b.id} value={b.id}>
                           {b.dataset_ref} · {fmtUtc(b.created_at)} · {b.status === "open" ? "待审" : "已被取代"} ·{" "}
@@ -257,7 +279,18 @@ export function PricingImport({ canEdit, onGoto }: TabProps) {
                   )}
                 </Field>
                 <label className="check">
-                  <input type="checkbox" checked={all} onChange={(e) => setAll(e.target.checked)} />
+                  <input
+                    type="checkbox"
+                    checked={all}
+                    onChange={(e) => {
+                      // The rows this brings into view were not on screen when
+                      // any tick was given, so the claim does not carry to them.
+                      setAll(e.target.checked);
+                      setAttestedFor(null);
+                      setPicked(new Set());
+                      setResults([]);
+                    }}
+                  />
                   <span>显示与当前基准价相同的提议</span>
                 </label>
               </div>
@@ -275,7 +308,7 @@ export function PricingImport({ canEdit, onGoto }: TabProps) {
                     <input
                       type="checkbox"
                       checked={attested}
-                      onChange={(e) => setAttested(e.target.checked)}
+                      onChange={(e) => setAttestedFor(e.target.checked ? batchId : null)}
                     />
                     <span>已对照官方价格页核对</span>
                   </label>
@@ -314,7 +347,7 @@ export function PricingImport({ canEdit, onGoto }: TabProps) {
                 </div>
               )}
               {results.length > 0 && (
-                <div className="note" role="status">
+                <div className="note" role="status" aria-label="确认结果">
                   <ul className="import-results">
                     {results.map((r, i) => (
                       <li key={i}>{r}</li>
@@ -324,7 +357,7 @@ export function PricingImport({ canEdit, onGoto }: TabProps) {
               )}
 
               {proposals === null ? (
-                <Loading />
+                error ? null : <Loading />
               ) : shown.length === 0 ? (
                 <EmptyState text="这一批没有待处理的提议。换一个批次，或勾选「显示与当前基准价相同的提议」。" />
               ) : (
@@ -464,10 +497,14 @@ function ImportUpload({
     setUploading(true);
     try {
       const text = await file!.text();
-      // The dataset's own notes, keyed by the entry they belong to: they are
-      // not stored with a proposal, so this session's file is where they come from.
-      onNotes(datasetNotes(text));
       const batch = await imports.upload(ref, text);
+      // The dataset's own notes, keyed by the entry they belong to: they are
+      // not stored with a proposal, so this session's file is where they come
+      // from. Installed only once the batch exists — a file the control plane
+      // refused must not leave its notes beside an earlier file's proposals —
+      // and replacing the last file's rather than merging with them, since the
+      // label says which dataset they come from.
+      onNotes(datasetNotes(text));
       toast("已上传");
       setFile(null);
       setRevision("");
@@ -557,6 +594,8 @@ function ProposalPanel({
     setStale(notice ?? null);
     await onDecided();
   };
+  /** What the comparison cannot show, so a refusal can say which part. */
+  const unshown = unshownParts(proposal.card);
   return (
     <SidePanel title={entry} label={`${entry} 的提议`} onClose={onClose}>
       {stale && (
@@ -604,11 +643,21 @@ function ProposalPanel({
       ) : !canEdit ? null : confirmable(proposal) ? (
         <ConfirmForm batchId={batchId} proposal={proposal} models={models} onDecided={decided} />
       ) : (
-        <p className="actions">
-          <Button type="button" onClick={onManual}>
-            去「基准价」手动录入
-          </Button>
-        </p>
+        <>
+          {/* A card whose whole bill the comparison cannot show is refused,
+              not confirmed on a fraction of it: the operator is told what is
+              off screen so they can price it by hand from the source page. */}
+          {proposal.flags.length === 0 && unshown.length > 0 && (
+            <div className="note warn" role="status">
+              这项价格含价格对照无法展示的部分：{unshown.join("、")}。确认后会按这些价格计费，因此不能在这里确认，请到「基准价」手动录入。
+            </div>
+          )}
+          <p className="actions">
+            <Button type="button" onClick={onManual}>
+              去「基准价」手动录入
+            </Button>
+          </p>
+        </>
       )}
       {proposal.status === "pending" && canEdit && (
         <RejectForm batchId={batchId} proposal={proposal} onDecided={decided} />
@@ -617,12 +666,18 @@ function ProposalPanel({
   );
 }
 
+/** One comparison cell: the card's own rate text, in the page's one money format. */
+function shownRate(card: RateCard | null, dimension: string): string {
+  const r = rate(card, dimension);
+  return r === null ? "—" : usdPerMillion(r);
+}
+
 /** The dataset's card against the model's baseline in force and the catalogue's entry. */
 function PriceComparison({ proposal }: { proposal: Proposal }) {
   const dataset = proposal.card;
   const current = (proposal.current_baseline?.card ?? null) as RateCard | null;
   const catalogue = proposal.catalogue_entry?.card ?? null;
-  const rows = DIMENSIONS.filter(
+  const rows = COMPARED_DIMENSIONS.filter(
     ([d]) => rate(dataset, d) !== null || rate(current, d) !== null || rate(catalogue, d) !== null,
   );
   if (rows.length === 0) return null;
@@ -642,9 +697,9 @@ function PriceComparison({ proposal }: { proposal: Proposal }) {
           {rows.map(([dimension, label]) => (
             <tr key={dimension}>
               <td>{label}</td>
-              <td className="num tabular">{rate(dataset, dimension) ?? "—"}</td>
-              <td className="num tabular">{rate(current, dimension) ?? "—"}</td>
-              <td className="num tabular">{rate(catalogue, dimension) ?? "—"}</td>
+              <td className="num tabular">{shownRate(dataset, dimension)}</td>
+              <td className="num tabular">{shownRate(current, dimension)}</td>
+              <td className="num tabular">{shownRate(catalogue, dimension)}</td>
             </tr>
           ))}
         </tbody>
@@ -714,6 +769,12 @@ function ConfirmForm({
       } else if (err instanceof ApiError && err.status === 422 && err.details.length > 0) {
         setDetails(err.details);
         focusRefusal();
+      } else if (err instanceof ApiError && (err.code === "network" || err.code === "bad_response")) {
+        // The answer was lost, so whether this confirmation was written is
+        // unknown. Reading the proposal again is how to find out: a second
+        // attempt is safe, but one that lands on a proposal already decided
+        // answers `proposal_state` and reads as someone else's decision.
+        setFailure(`${messageFor(err)}。这次确认是否已写入无法确定：刷新这一行即可看到实际状态。`);
       } else {
         setFailure(err instanceof ApiError ? messageFor(err) : errorText(err));
       }
@@ -927,13 +988,14 @@ function CatalogueUpdates({
           {rows.map((row) => {
             const update = row.catalogue_update!;
             const first = update.entries[0] ?? null;
+            const rates = headline(first?.card ?? null);
             return (
               <tr key={row.model_id}>
                 <td>{row.name}</td>
                 <td className="tabular">{update.entry_key}</td>
                 <td className="tabular">{update.catalogue_version}</td>
-                <td className="num tabular">{first ? (headline(first.card)?.input ?? "—") : "—"}</td>
-                <td className="num tabular">{first ? (headline(first.card)?.output ?? "—") : "—"}</td>
+                <td className="num tabular">{rates ? usdPerMillion(rates.input) : "—"}</td>
+                <td className="num tabular">{rates ? usdPerMillion(rates.output) : "—"}</td>
                 {canEdit && (
                   <td className="right">
                     <Button

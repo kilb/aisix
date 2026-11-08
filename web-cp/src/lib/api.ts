@@ -63,37 +63,18 @@ function etagVersion(etag: string | null): number | null {
 }
 
 /**
- * One request. `ifMatch` sends `If-Match: "<n>"`, which the versioned routes
- * require on PUT, PATCH and DELETE; `version` is the answer's `ETag`. A
- * request `signal` aborted rejects with the abort's own error, not an
- * `ApiError`.
+ * Reads a response into `{data, version}` or throws an [`ApiError`]: a body
+ * that is not JSON is `bad_response` (a proxy's 502 page, or a transport
+ * failure, would otherwise reach the caller as a parse error), a `401
+ * unauthenticated` ends the session for every listener, and any other `!ok`
+ * keeps the envelope's own message, code, details, references and version.
+ *
+ * Shared by [`call`] and the upload that splices the dataset in as raw text,
+ * so the session listener cannot be wired at one and missed at the other.
  */
-export async function call<T>(
-  method: string,
-  path: string,
-  body?: unknown,
-  ifMatch?: number,
-  signal?: AbortSignal,
-): Promise<{ data: T; version: number | null }> {
-  const headers: Record<string, string> = { "content-type": "application/json" };
-  if (ifMatch !== undefined) headers["if-match"] = `"${ifMatch}"`;
-  let r: Response;
-  try {
-    r = await fetch(path, {
-      method,
-      credentials: "same-origin",
-      headers,
-      body: body === undefined ? undefined : JSON.stringify(body),
-      signal,
-    });
-  } catch (e) {
-    if (signal?.aborted) throw e;
-    throw new ApiError("无法连接控制面", 0, "network", [], [], null);
-  }
+async function readAnswer<T>(r: Response): Promise<{ data: T; version: number | null }> {
   const text = await r.text();
   let parsed: unknown = null;
-  // A proxy's 502 page or a transport failure is not JSON. Without this the
-  // caller would see a parse error instead of the failed request.
   if (text) {
     try {
       parsed = JSON.parse(text);
@@ -123,6 +104,37 @@ export async function call<T>(
     );
   }
   return { data: parsed as T, version: etagVersion(r.headers.get("etag")) };
+}
+
+/**
+ * One request. `ifMatch` sends `If-Match: "<n>"`, which the versioned routes
+ * require on PUT, PATCH and DELETE; `version` is the answer's `ETag`. A
+ * request `signal` aborted rejects with the abort's own error, not an
+ * `ApiError`.
+ */
+export async function call<T>(
+  method: string,
+  path: string,
+  body?: unknown,
+  ifMatch?: number,
+  signal?: AbortSignal,
+): Promise<{ data: T; version: number | null }> {
+  const headers: Record<string, string> = { "content-type": "application/json" };
+  if (ifMatch !== undefined) headers["if-match"] = `"${ifMatch}"`;
+  let r: Response;
+  try {
+    r = await fetch(path, {
+      method,
+      credentials: "same-origin",
+      headers,
+      body: body === undefined ? undefined : JSON.stringify(body),
+      signal,
+    });
+  } catch (e) {
+    if (signal?.aborted) throw e;
+    throw new ApiError("无法连接控制面", 0, "network", [], [], null);
+  }
+  return readAnswer<T>(r);
 }
 
 // ── types (the API's field names) ───────────────────────────────────────────
@@ -1345,30 +1357,9 @@ async function callWithDataset<T>(path: string, datasetRef: string, data: string
   } catch {
     throw new ApiError("无法连接控制面", 0, "network", [], [], null);
   }
-  const text = await r.text();
-  let parsed: unknown = null;
-  if (text) {
-    try {
-      parsed = JSON.parse(text);
-    } catch {
-      throw new ApiError(`服务端返回了非 JSON 响应（HTTP ${r.status}）`, r.status, "bad_response", [], [], null);
-    }
-  }
-  if (!r.ok) {
-    const e = (parsed ?? {}) as Envelope;
-    if (r.status === 401 && e.code === "unauthenticated") {
-      for (const listener of sessionEndedListeners) listener();
-    }
-    throw new ApiError(
-      e.error ?? `HTTP ${r.status}`,
-      r.status,
-      e.code ?? "bad_response",
-      e.details ?? [],
-      e.referenced_by ?? [],
-      e.current_version ?? null,
-    );
-  }
-  return parsed as T;
+  // `readAnswer`'s `version` is the upload's `ETag`, which the route does not
+  // send and its caller does not read.
+  return (await readAnswer<T>(r)).data;
 }
 
 export const imports = {
