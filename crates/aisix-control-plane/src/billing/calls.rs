@@ -108,8 +108,13 @@ pub fn tenant_outcome(
     )
 }
 
-/// A charge's status as a tenant reads it: a row not priced yet is pending.
-pub fn tenant_charge_status(status: &str) -> &'static str {
+/// A charge's status as a tenant reads it: a row not priced yet is pending,
+/// and one a re-pricing run adjusted (`repriced`) is charged, whatever it was
+/// stored as: a run adjusts only a row it charges.
+pub fn tenant_charge_status(status: &str, repriced: bool) -> &'static str {
+    if repriced {
+        return "charged";
+    }
     match status {
         "charged" => "charged",
         "exempt" => "exempt",
@@ -512,7 +517,7 @@ pub async fn list_calls(
                     .and_then(|ms| u32::try_from(ms).ok())
                     .filter(|ms| *ms > 0),
                 charge: ChargeView {
-                    status: tenant_charge_status(&r.status),
+                    status: tenant_charge_status(&r.status, r.adjusted.is_some()),
                     amount_micro_usd: r.charge_micro_usd,
                     adjusted_micro_usd: r.adjusted.unwrap_or(0),
                     service_tier: r.service_tier,
@@ -807,10 +812,15 @@ mod tests {
 
     #[test]
     fn an_unpriced_row_is_pending_to_a_tenant() {
-        assert_eq!(tenant_charge_status("unpriced"), "pending");
-        assert_eq!(tenant_charge_status("charged"), "charged");
-        assert_eq!(tenant_charge_status("exempt"), "exempt");
-        assert_eq!(tenant_charge_status("nothing_to_bill"), "nothing_to_bill");
+        assert_eq!(tenant_charge_status("unpriced", false), "pending");
+        assert_eq!(tenant_charge_status("charged", false), "charged");
+        assert_eq!(tenant_charge_status("exempt", false), "exempt");
+        assert_eq!(
+            tenant_charge_status("nothing_to_bill", false),
+            "nothing_to_bill"
+        );
+        // A re-pricing run charged it.
+        assert_eq!(tenant_charge_status("unpriced", true), "charged");
     }
 
     #[test]

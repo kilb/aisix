@@ -140,7 +140,10 @@ describe("re-pricing corrects past charges with ledger adjustments", () => {
     expect(applied.body.status).toBe("applied");
     expect(await balance()).toBe(before - 3 * CALL_MICRO_USD);
     const calls = await callsOf(LATE_MODEL, 3, () => true);
-    for (const c of calls) expect(c.charge.adjusted_micro_usd, JSON.stringify(c)).toBe(CALL_MICRO_USD);
+    for (const c of calls) {
+      expect(c.charge.status, JSON.stringify(c)).toBe("charged");
+      expect(c.charge.adjusted_micro_usd, JSON.stringify(c)).toBe(CALL_MICRO_USD);
+    }
 
     const ledger = await owner.get("/api/billing/ledger?kind=adjustment");
     expect(ledger.status, ledger.text).toBe(200);

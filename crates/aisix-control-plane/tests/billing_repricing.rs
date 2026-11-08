@@ -879,6 +879,7 @@ async fn a_tenants_call_log_shows_the_adjusted_charge() {
     // The billed attempt is now charged by the run, and listed.
     assert_eq!(items.len(), 3, "{calls:?}");
     for c in items {
+        assert_eq!(c["charge"]["status"], "charged", "{c}");
         assert_eq!(c["charge"]["adjusted_micro_usd"], 680, "{c}");
         assert!(c["charge"]["amount_micro_usd"].is_null(), "{c}");
     }
