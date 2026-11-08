@@ -45,7 +45,7 @@ use sqlx::{PgConnection, Row};
 use uuid::Uuid;
 
 use super::api::PriceWarning;
-use super::store::{bump_pricing_version, starts_now_or_later};
+use super::store::{bump_pricing_version, created_by, starts_now_or_later};
 use crate::audit::{self, Actor, AuditEntry};
 use crate::auth::{OperatorAuth, OperatorRole};
 use crate::db::DbError;
@@ -230,15 +230,6 @@ pub async fn upcoming_baselines(
     .await?)
 }
 
-/// The operator a revision is written by; `None` for the control plane
-/// itself (and anyone who is not an operator, who the audit row names).
-fn created_by(actor: Actor<'_>) -> Option<Uuid> {
-    match actor {
-        Actor::Operator(op) => Some(op.id),
-        _ => None,
-    }
-}
-
 /// Writes a baseline starting at `row.effective_from`, refusing with `422`
 /// one that starts in the past (`/effective_from`), a card that does not
 /// validate (`/card`) and a model that is not live (`/model_id`). The
@@ -253,6 +244,27 @@ pub async fn insert_baseline(
     row: &NewBaseline,
     actor: Actor<'_>,
 ) -> Result<(BaselineRevision, Vec<PriceWarning>), ApiError> {
+    let revision = write_row(&mut *conn, row, actor).await?;
+    let warnings = superseded_later(
+        &mut *conn,
+        row.model_id,
+        row.effective_from,
+        &[row.effective_from],
+    )
+    .await
+    .map_err(ApiError::from)?;
+    Ok((revision, warnings))
+}
+
+/// Writes `row` and nothing else: its checks, the revision, the
+/// `pricing_version` bump and the audit row. [`insert_baseline`] adds the
+/// `superseded_later` warnings; [`create`] computes them once, over every
+/// baseline the request wrote.
+async fn write_row(
+    conn: &mut PgConnection,
+    row: &NewBaseline,
+    actor: Actor<'_>,
+) -> Result<BaselineRevision, ApiError> {
     starts_now_or_later(&mut *conn, row.effective_from).await?;
     row.card
         .validate()
@@ -303,17 +315,31 @@ pub async fn insert_baseline(
         },
     )
     .await?;
+    Ok(revision)
+}
+
+/// The `superseded_later` warnings of a write of model `model_id` starting
+/// at `starts`: each baseline of the model already there that starts later
+/// than `starts` and at none of `own` (the instants this write covered with
+/// a revision of its own, which no older revision supersedes) takes over
+/// from it then.
+async fn superseded_later(
+    conn: &mut PgConnection,
+    model_id: Uuid,
+    starts: DateTime<Utc>,
+    own: &[DateTime<Utc>],
+) -> Result<Vec<PriceWarning>, DbError> {
     let later: Vec<(i64, DateTime<Utc>)> = sqlx::query_as(
         "SELECT revision_id, effective_from FROM pricing_baselines \
-         WHERE model_id = $1 AND effective_from > $2 \
+         WHERE model_id = $1 AND effective_from > $2 AND effective_from <> ALL($3) \
          ORDER BY effective_from, revision_id",
     )
-    .bind(row.model_id)
-    .bind(row.effective_from)
+    .bind(model_id)
+    .bind(starts)
+    .bind(own)
     .fetch_all(&mut *conn)
-    .await
-    .map_err(DbError::from)?;
-    let warnings = later
+    .await?;
+    Ok(later
         .into_iter()
         .map(|(revision_id, effective_from)| PriceWarning {
             code: "superseded_later",
@@ -324,8 +350,7 @@ pub async fn insert_baseline(
             revision_id: Some(revision_id),
             effective_from: Some(effective_from),
         })
-        .collect();
-    Ok((revision, warnings))
+        .collect())
 }
 
 /// Whether an entry's list price holds only at some times of day: its notes
@@ -395,6 +420,28 @@ pub fn catalogue_plan<'c>(
     Ok((plan, warnings))
 }
 
+/// The baseline of model `model_id` starting at `starts` from catalogue
+/// entry `entry`, under `catalogue`'s provenance.
+fn catalogue_row(
+    catalogue: &Catalogue,
+    model_id: Uuid,
+    starts: DateTime<Utc>,
+    entry: &CatalogueEntry,
+) -> NewBaseline {
+    NewBaseline {
+        model_id,
+        effective_from: starts,
+        card: entry.card.clone(),
+        source: BaselineSource::Catalogue {
+            catalogue_version: catalogue.version().to_string(),
+            entry_key: entry.key.clone(),
+            entry_effective_from: entry.effective_from,
+            source_url: entry.source_url.clone(),
+            as_of: entry.as_of,
+        },
+    }
+}
+
 /// `catalogue_update`: what the catalogue now says for an entry key, from
 /// the entry in effect now on.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -416,16 +463,20 @@ pub struct CatalogueUpdateEntry {
 /// come from the catalogue, and when the catalogue no longer has its key in
 /// effect at `now` (there is nothing to confirm then).
 ///
-/// The two schedules compared, from `now` on, each a list of (entry date,
-/// card) with consecutive repeats collapsed:
-/// - the catalogue's for the key: the entry in effect at `now`, then each
-///   later-dated entry ([`catalogue_plan`] at `now`);
-/// - the baselines': `current`, then each of `upcoming` (the ones that will
-///   apply, by start) written from the same key.
+/// The two price schedules from `now` on are compared as what they charge at
+/// each instant either of them changes: every start of the catalogue's
+/// ([`catalogue_plan`] at `now`) and of the baselines written from the same
+/// entry key (`current`, then each of `upcoming`). A schedule this engine
+/// cannot read agrees with nothing at its instants, so it is an update too.
 ///
-/// So a new card, a new or moved dated entry, or a dated entry dropped shows
-/// as an update, and a newer catalogue that says the same, or a re-read date
-/// (`as_of`), does not. A baseline written from the update agrees again.
+/// So a different card, a new dated entry, a dated entry moved either way
+/// and a dated entry dropped all show as an update; a newer catalogue that
+/// charges the same, or a re-read date (`as_of`), does not. A baseline
+/// written from the update agrees again.
+///
+/// An instant where a baseline from *another* entry key (or a manual or
+/// third-party one) starts is not judged: the operator departed from the
+/// catalogue there, and the update's confirm would write over that choice.
 pub fn catalogue_update(
     catalogue: &Catalogue,
     current: &BaselineRevision,
@@ -445,22 +496,41 @@ pub fn catalogue_update(
         }
     }
     let (key, _) = origin(current)?;
+    let (provider, model) = key.split_once('/')?;
+    // `None` when the key has no entry in effect now.
     let (plan, _) = catalogue_plan(catalogue, &key, now).ok()?;
-    let mut says: Vec<(Option<NaiveDate>, Option<RateCard>)> = plan
-        .iter()
-        .map(|(_, e)| (e.effective_from, Some(e.card.clone())))
-        .collect();
-    let mut written: Vec<(Option<NaiveDate>, Option<RateCard>)> = std::iter::once(current)
+    // What the baselines of this key charge, by start.
+    let mut ours: Vec<(DateTime<Utc>, Option<RateCard>)> = std::iter::once(current)
         .chain(upcoming)
-        .filter_map(|r| {
-            let (entry_key, dated) = origin(r)?;
+        .filter(|r| origin(r).is_some_and(|(k, _)| k == key))
+        .map(|r| {
             // A card this engine cannot read agrees with no entry.
-            (entry_key == key).then(|| (dated, serde_json::from_value(r.card.clone()).ok()))
+            let card = serde_json::from_value(r.card.clone()).ok();
+            (r.effective_from, card)
         })
         .collect();
-    says.dedup();
-    written.dedup();
-    if says == written {
+    ours.sort_by_key(|(starts, _)| *starts);
+    let masked: std::collections::HashSet<DateTime<Utc>> = upcoming
+        .iter()
+        .filter(|r| origin(r).is_none_or(|(k, _)| k != key))
+        .map(|r| r.effective_from)
+        .collect();
+    let mut instants: Vec<DateTime<Utc>> = std::iter::once(now)
+        .chain(plan.iter().map(|(starts, _)| *starts))
+        .chain(ours.iter().map(|(starts, _)| *starts))
+        .filter(|t| *t >= now && !masked.contains(t))
+        .collect();
+    instants.sort();
+    instants.dedup();
+    let differs = instants.into_iter().any(|t| {
+        let says = catalogue.get(provider, model, t).map(|e| e.card.clone());
+        let written = ours
+            .iter()
+            .rfind(|(starts, _)| *starts <= t)
+            .and_then(|(_, card)| card.clone());
+        says != written
+    });
+    if !differs {
         return None;
     }
     Some(CatalogueUpdate {
@@ -579,6 +649,12 @@ pub struct BaselineBody {
 /// without a note, and a note beside a catalogue key, `422 /note`. A
 /// proposal of an import is confirmed only through its own route. The write
 /// is one transaction however many baselines it writes.
+///
+/// A catalogue write also re-asserts every later instant at which a baseline
+/// from the same key is scheduled and the plan carries no row (see
+/// [`reassert_later`]), so confirming an update that shows a moved or
+/// dropped dated entry leaves the schedule agreeing with the catalogue, and
+/// the update gone. `revision` is the one at `effective_from`.
 pub async fn create(
     auth: OperatorAuth,
     State(state): State<AppState>,
@@ -592,7 +668,9 @@ pub async fn create(
         catalogue_key,
         note,
     } = body;
-    let (rows, mut warnings) = match (card, catalogue_key) {
+    // The rows the request writes by itself, and, for a catalogue key, the
+    // catalogue and entry key the write re-asserts the later instants from.
+    let (rows, mut warnings, reassert) = match (card, catalogue_key) {
         (Some(_), Some(_)) | (None, None) => {
             return Err(refused(
                 "/card",
@@ -614,7 +692,7 @@ pub async fn create(
                 card,
                 source: BaselineSource::Manual { note },
             };
-            (vec![row], Vec::new())
+            (vec![row], Vec::new(), None)
         }
         (None, Some(key)) => {
             if note.is_some() {
@@ -623,45 +701,61 @@ pub async fn create(
             let catalogue = state.prices.catalogue();
             let (plan, warnings) = catalogue_plan(catalogue, &key, effective_from)?;
             let rows: Vec<NewBaseline> = plan
-                .into_iter()
-                .map(|(starts, e)| NewBaseline {
-                    model_id,
-                    effective_from: starts,
-                    card: e.card.clone(),
-                    source: BaselineSource::Catalogue {
-                        catalogue_version: catalogue.version().to_string(),
-                        entry_key: e.key.clone(),
-                        entry_effective_from: e.effective_from,
-                        source_url: e.source_url.clone(),
-                        as_of: e.as_of,
-                    },
-                })
+                .iter()
+                .map(|(starts, e)| catalogue_row(catalogue, model_id, *starts, e))
                 .collect();
-            (rows, warnings)
+            // The key the plan's entries carry, which the later instants'
+            // re-assertion matches a scheduled baseline's provenance against.
+            let entry_key = plan
+                .first()
+                .map(|(_, e)| e.key.clone())
+                .ok_or_else(|| ApiError::internal("a catalogue plan with no entry"))?;
+            (rows, warnings, Some((catalogue.clone(), entry_key)))
         }
     };
     let written = state
         .db
         .tx(move |conn| {
             async move {
+                let actor = Actor::Operator(&auth);
+                let mut rows = rows;
+                if let Some((catalogue, entry_key)) = &reassert {
+                    reassert_later(
+                        &mut *conn,
+                        catalogue,
+                        entry_key,
+                        model_id,
+                        effective_from,
+                        &mut rows,
+                    )
+                    .await?;
+                }
+                // The requested start first, then each other by start: a
+                // re-asserted instant may well fall before one the plan
+                // carried.
+                rows.sort_by_key(|r| r.effective_from);
+                let starts: Vec<DateTime<Utc>> = rows.iter().map(|r| r.effective_from).collect();
                 let mut written = Vec::with_capacity(rows.len());
                 for row in &rows {
-                    written.push(insert_baseline(&mut *conn, row, Actor::Operator(&auth)).await?);
+                    written.push(write_row(&mut *conn, row, actor).await?);
                 }
-                Ok::<_, ApiError>(written)
+                // Once, over every instant the write covered: a baseline
+                // that one of them starts at is superseded by ours, not by
+                // an older one.
+                let superseded =
+                    superseded_later(&mut *conn, model_id, effective_from, &starts).await?;
+                Ok::<_, ApiError>((written, superseded))
             }
             .boxed()
         })
         .await?;
+    let (written, superseded) = written;
+    warnings.extend(superseded);
     let mut written = written.into_iter();
-    let (revision, superseded) = written
+    let revision = written
         .next()
         .ok_or_else(|| ApiError::internal("a baseline write wrote no revision"))?;
-    // A baseline already there that starts later than one of the later
-    // ones also starts later than the first, so the first one's warnings
-    // name them all.
-    warnings.extend(superseded);
-    let later: Vec<BaselineRevision> = written.map(|(r, _)| r).collect();
+    let later: Vec<BaselineRevision> = written.collect();
     Ok((
         StatusCode::CREATED,
         Json(json!({
@@ -670,6 +764,62 @@ pub async fn create(
             "warnings": warnings,
         })),
     ))
+}
+
+/// Appends to `rows` what the catalogue says at each instant a scheduled
+/// baseline written from catalogue entry `entry_key` starts, where this
+/// write's plan carries no row of its own: the dated entry was moved or
+/// dropped, and left alone the stale revision would bill its old card from
+/// its date.
+///
+/// The row is written even when the schedule would already charge the same
+/// from that instant (a change brought forward leaves the old date charging
+/// the new price). Same card or not, it supersedes the stale revision of the
+/// same instant, so the listed schedule names only what the catalogue says.
+///
+/// A scheduled baseline written from another key, or a manual or third-party
+/// one, is the operator's own choice and is left alone.
+async fn reassert_later(
+    conn: &mut PgConnection,
+    catalogue: &Catalogue,
+    entry_key: &str,
+    model_id: Uuid,
+    effective_from: DateTime<Utc>,
+    rows: &mut Vec<NewBaseline>,
+) -> Result<(), ApiError> {
+    let (provider, model) = entry_key
+        .split_once('/')
+        .ok_or_else(|| ApiError::internal("a catalogue entry key is not <provider>/<model>"))?;
+    let ours: std::collections::HashSet<DateTime<Utc>> =
+        rows.iter().map(|r| r.effective_from).collect();
+    for stale in upcoming_baselines(&mut *conn, &[model_id]).await? {
+        let from_key = matches!(
+            stale.typed_source(),
+            Some(BaselineSource::Catalogue { entry_key: k, .. }) if k == entry_key
+        );
+        if !from_key
+            || stale.effective_from <= effective_from
+            || ours.contains(&stale.effective_from)
+        {
+            continue;
+        }
+        let entry = catalogue
+            .get(provider, model, stale.effective_from)
+            .ok_or_else(|| {
+                ApiError::internal(format!(
+                    "{entry_key} has no entry in effect at {}, where a revision of it starts, \
+                     though it has one at the end of time",
+                    stale.effective_from
+                ))
+            })?;
+        rows.push(catalogue_row(
+            catalogue,
+            model_id,
+            stale.effective_from,
+            entry,
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -937,6 +1087,21 @@ mod tests {
         assert_eq!(catalogue_update(&c, &current, &with_manual, now), None);
         // Nor is a baseline in force that did not come from the catalogue.
         assert_eq!(catalogue_update(&c, &manual, &upcoming, now), None);
+        // Nor is an instant where the operator's own baseline starts: the
+        // first change of openai/m1 is the catalogue's, and a manual
+        // revision at that same instant leaves the rest of the schedule
+        // agreeing with it.
+        let at_first_change = revision(
+            "2026-12-01T00:00:00Z",
+            "9",
+            BaselineSource::Manual {
+                note: "n".to_string(),
+            },
+        );
+        assert_eq!(
+            catalogue_update(&c, &current, &[at_first_change, upcoming[1].clone()], now),
+            None
+        );
     }
 
     #[test]

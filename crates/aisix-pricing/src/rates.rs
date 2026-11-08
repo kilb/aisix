@@ -103,6 +103,117 @@ impl<'de> Deserialize<'de> for Rate {
 #[serde(transparent)]
 pub struct MicroUsd(pub i64);
 
+/// CNY per USD, in ten-thousandths: `72_000` is 7.2 CNY for each USD of a
+/// model's baseline price. A rate of 0 makes a model free.
+///
+/// Read and written as a decimal string of 1–3 digits and at most 4
+/// decimals, from `"0"` to `"100"`, e.g. `"7.2"`; a JSON number is refused,
+/// as it is for [`Rate`].
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct CnyPerUsd(pub u32);
+
+impl CnyPerUsd {
+    /// One CNY per USD: the charge in µ¥ is the baseline's in µ$.
+    pub const ONE: CnyPerUsd = CnyPerUsd(10_000);
+    /// One hundred CNY per USD.
+    pub const MAX: CnyPerUsd = CnyPerUsd(1_000_000);
+
+    /// Reads `^\d{1,3}(\.\d{1,4})?$` in ASCII digits, up to `CnyPerUsd::MAX`.
+    /// Anything else is `BadCnyPerUsd`.
+    pub fn parse(s: &str) -> Result<CnyPerUsd, RateCardError> {
+        let bad = || RateCardError::BadCnyPerUsd(s.to_owned());
+        let (whole, frac) = match s.split_once('.') {
+            Some((whole, frac)) if (1..=4).contains(&frac.len()) => (whole, frac),
+            Some(_) => return Err(bad()),
+            None => (s, ""),
+        };
+        let all_digits = |p: &str| p.bytes().all(|b| b.is_ascii_digit());
+        if !(1..=3).contains(&whole.len()) || !all_digits(whole) || !all_digits(frac) {
+            return Err(bad());
+        }
+        // Three digits, then the decimals padded to four: below 10^7.
+        let e4 = whole
+            .bytes()
+            .chain(frac.bytes().chain(std::iter::repeat(b'0')).take(4))
+            .fold(0u32, |n, b| n * 10 + u32::from(b - b'0'));
+        if e4 > CnyPerUsd::MAX.0 {
+            return Err(bad());
+        }
+        Ok(CnyPerUsd(e4))
+    }
+}
+
+/// The shortest exact form: `"7.2"`, `"100"`.
+impl fmt::Display for CnyPerUsd {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&exact_decimal(u128::from(self.0), 4))
+    }
+}
+
+impl Serialize for CnyPerUsd {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for CnyPerUsd {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<CnyPerUsd, D::Error> {
+        CnyPerUsd::parse(&String::deserialize(d)?).map_err(de::Error::custom)
+    }
+}
+
+/// An amount of money in micro-CNY, millionths of a yuan. A charge is never
+/// negative.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize)]
+#[serde(transparent)]
+pub struct MicroCny(pub i64);
+
+/// The most one dimension of one row bills. The three input buckets add up
+/// to the prompt plus the cache reads and writes, three `u32` counters
+/// (`usage.rs`, `quantities`), and no other quantity is larger.
+pub(crate) const MAX_QUANTITY: u128 = 3 * u32::MAX as u128;
+
+// Ruling R1: the CNY charge is Σ quantity × rate × CNY rate × (10_000 − bps)
+// in u128, over at most one line per dimension. With every quantity at
+// MAX_QUANTITY and every factor at its cap, that sum stays inside u128, so a
+// row's only overflow is an amount past i64.
+const _: () = assert!(
+    Dimension::ALL.len() as u128 * Rate::MAX.0 as u128 * CnyPerUsd::MAX.0 as u128 * 10_000
+        <= u128::MAX / MAX_QUANTITY
+);
+
+/// What one million units cost at `rate`, in CNY, after the CNY rate and a
+/// discount of `discount_bps`: `rate × cny × (10000 − bps) / 10¹⁴`, exact,
+/// in its shortest form. `None` for a discount above 10000 bps.
+pub fn cny_per_million(rate: Rate, cny: CnyPerUsd, discount_bps: u16) -> Option<String> {
+    Some(exact_decimal(listed(rate, cny, discount_bps)?, 14))
+}
+
+/// What one unit costs at `rate`, in CNY: [`cny_per_million`] over another
+/// million, `/ 10²⁰`.
+pub fn cny_per_token(rate: Rate, cny: CnyPerUsd, discount_bps: u16) -> Option<String> {
+    Some(exact_decimal(listed(rate, cny, discount_bps)?, 20))
+}
+
+/// `rate × cny × (10000 − bps)`, or `None` for a discount above 10000 bps.
+/// A `u64` × `u32` × 10⁴ is below 2¹¹⁰, so it is exact for any rate.
+fn listed(rate: Rate, cny: CnyPerUsd, discount_bps: u16) -> Option<u128> {
+    let kept_bps = 10_000u128.checked_sub(u128::from(discount_bps))?;
+    Some(u128::from(rate.0) * u128::from(cny.0) * kept_bps)
+}
+
+/// `n / 10^scale`, exact and shortest: no trailing zeros, and no `.` for a
+/// whole number.
+fn exact_decimal(n: u128, scale: u32) -> String {
+    let unit = 10u128.pow(scale);
+    let (whole, frac) = (n / unit, n % unit);
+    if frac == 0 {
+        return whole.to_string();
+    }
+    let frac = format!("{frac:0width$}", width = scale as usize);
+    format!("{whole}.{}", frac.trim_end_matches('0'))
+}
+
 /// A metered quantity a rate card can price. Each name is also the name of
 /// its field in [`Rates`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -576,6 +687,8 @@ pub enum RateCardError {
     BadRate(String),
     #[error("rate is above USD 1000000 per million units")]
     RateTooLarge,
+    #[error("CNY per USD {0:?} is not a number from 0 to 100 with at most 4 decimals")]
+    BadCnyPerUsd(String),
     #[error("rate card does not decode: {0}")]
     Malformed(String),
     #[error("rate card has no default tier")]
@@ -744,6 +857,101 @@ mod tests {
             let json = serde_json::to_string(&r).unwrap();
             prop_assert_eq!(serde_json::from_str::<Rate>(&json).unwrap(), r);
         }
+    }
+
+    // ---- CnyPerUsd ----
+
+    #[test]
+    fn a_cny_per_usd_rate_has_at_most_four_decimals_up_to_one_hundred() {
+        for (text, e4) in [
+            ("7.2", 72_000),
+            ("0", 0),
+            ("100", 1_000_000),
+            ("6.6667", 66_667),
+            ("007.20", 72_000),
+            ("0.0001", 1),
+            ("100.0000", 1_000_000),
+        ] {
+            assert_eq!(CnyPerUsd::parse(text), Ok(CnyPerUsd(e4)), "{text}");
+        }
+        assert_eq!(CnyPerUsd::parse("007.20").unwrap().to_string(), "7.2");
+        for bad in [
+            "100.0001", "101", "7.23456", "-1", "1e2", "", " 7", "7.", ".5", "１", "0100", "+1",
+            "1.2.3",
+            // A digit outside ASCII among the decimals, whose bytes would
+            // otherwise read as a value under the cap.
+            "0.１",
+        ] {
+            assert_eq!(
+                CnyPerUsd::parse(bad),
+                Err(RateCardError::BadCnyPerUsd(bad.to_owned())),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_cny_per_usd_rate_round_trips_as_a_string() {
+        let r: CnyPerUsd = serde_json::from_str(r#""7.2""#).unwrap();
+        assert_eq!(r, CnyPerUsd(72_000));
+        assert_eq!(serde_json::to_string(&r).unwrap(), r#""7.2""#);
+        // A JSON number is a binary float by the time serde sees it.
+        assert!(serde_json::from_str::<CnyPerUsd>("7.2").is_err());
+        assert!(serde_json::from_str::<CnyPerUsd>("7").is_err());
+        assert!(serde_json::from_str::<CnyPerUsd>(r#""101""#).is_err());
+        for (e4, text) in [
+            (0, "0"),
+            (1, "0.0001"),
+            (10_000, "1"),
+            (66_667, "6.6667"),
+            (72_000, "7.2"),
+            (1_000_000, "100"),
+        ] {
+            assert_eq!(CnyPerUsd(e4).to_string(), text, "{e4}");
+        }
+        assert_eq!(
+            (CnyPerUsd::ONE, CnyPerUsd::MAX),
+            (CnyPerUsd(10_000), CnyPerUsd(1_000_000))
+        );
+        // Every rate there is reads back from its own text.
+        for e4 in 0..=CnyPerUsd::MAX.0 {
+            let r = CnyPerUsd(e4);
+            assert_eq!(CnyPerUsd::parse(&r.to_string()), Ok(r));
+        }
+    }
+
+    #[test]
+    fn listed_cny_prices_are_exact() {
+        let r = |s| Rate::parse(s).unwrap();
+        let at = CnyPerUsd::parse("7.2").unwrap();
+        assert_eq!(cny_per_million(r("4"), at, 0).as_deref(), Some("28.8"));
+        assert_eq!(cny_per_million(r("0.15"), at, 0).as_deref(), Some("1.08"));
+        assert_eq!(cny_per_token(r("4"), at, 0).as_deref(), Some("0.0000288"));
+        assert_eq!(
+            cny_per_token(r("4"), at, 1_000).as_deref(),
+            Some("0.00002592")
+        );
+        assert_eq!(
+            cny_per_million(Rate(1), CnyPerUsd(1), 9_999).as_deref(),
+            Some("0.00000000000001")
+        );
+        assert_eq!(
+            cny_per_token(Rate(1), CnyPerUsd(1), 9_999).as_deref(),
+            Some("0.00000000000000000001")
+        );
+        assert_eq!(
+            cny_per_million(Rate::MAX, CnyPerUsd::MAX, 0).as_deref(),
+            Some("100000000")
+        );
+        assert_eq!(
+            cny_per_token(Rate::MAX, CnyPerUsd::MAX, 0).as_deref(),
+            Some("100")
+        );
+        assert_eq!(cny_per_million(Rate(0), at, 0).as_deref(), Some("0"));
+        assert_eq!(cny_per_token(Rate(0), at, 0).as_deref(), Some("0"));
+        assert_eq!(cny_per_million(r("4"), at, 10_000).as_deref(), Some("0"));
+        assert_eq!(cny_per_million(r("4"), at, 10_001), None);
+        assert_eq!(cny_per_token(r("4"), at, 10_001), None);
     }
 
     // ---- Dimension and Rates ----

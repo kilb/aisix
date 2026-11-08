@@ -159,6 +159,13 @@ fn catalogue(version: &str, entries: &[String]) -> Arc<Catalogue> {
     Arc::new(Catalogue::from_json(&file).expect("the test catalogue loads"))
 }
 
+/// One entry of `key`, read on `as_of` (and dated `effective_from` when
+/// given): input `input` and output 2 USD per million.
+fn entry_of(key: &str, as_of: &str, dated: Option<NaiveDate>, input: &str) -> String {
+    let extra = dated.map_or_else(String::new, |d| format!(r#""effective_from":"{d}","#));
+    entry(key, as_of, &extra, input)
+}
+
 /// The card `GET /admin/pricing/catalogue` lists for `key`'s entry dated
 /// `dated` (`None` for its undated one).
 async fn listed_card(
@@ -408,15 +415,23 @@ async fn a_baseline_is_a_card_or_a_catalogue_key() {
     )
     .await;
     assert_422_at(&r, "/model_id");
-    // A proposal of an import is confirmed only through its own route.
-    let r = post(
-        &cp,
-        &admin,
+    // A proposal of an import is confirmed only through its own route: its
+    // fields are no baseline body's, so the body is refused whole.
+    for body in [
         json!({"model_id": m, "effective_from": now, "proposal_id": Uuid::new_v4(),
                "attested": true}),
-    )
-    .await;
-    assert_eq!(r.status, 422, "{r:?}");
+        json!({"model_id": m, "effective_from": now, "card": card(), "note": note,
+               "proposal_id": Uuid::new_v4()}),
+        json!({"model_id": m, "effective_from": now, "card": card(), "note": note,
+               "attested": true}),
+    ] {
+        let r = post(&cp, &admin, body).await;
+        assert_eq!(
+            (r.status, r.body["code"].clone()),
+            (422, json!("validation_failed")),
+            "{r:?}"
+        );
+    }
 
     assert_eq!(cp.count("pricing_baselines").await, 0);
     assert_eq!(pricing_version(&cp).await, version);
@@ -546,6 +561,29 @@ async fn the_baseline_list_puts_models_without_one_first() {
     assert_eq!(item_e["upcoming"], json!([e_rev]), "{item_e}");
 }
 
+/// Two baselines starting at one instant: the later write is the one in
+/// force, as the price book reads it.
+#[tokio::test]
+async fn of_two_baselines_starting_at_once_the_later_write_is_in_force() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let admin = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let m = model(&cp, &admin, "bl-tie-7c1").await;
+    let now = db_now(&cp).await;
+    let manual = |input: &str| {
+        json!({"model_id": m, "effective_from": now, "note": "手动",
+               "card": {"default": {"base": {"input": input, "output": "20"}}}})
+    };
+    let first = write(&cp, &admin, manual("1")).await["revision"].clone();
+    let second = write(&cp, &admin, manual("2")).await["revision"].clone();
+    // A second write at one instant is not a scheduled replacement.
+    let listed = item(&list(&cp, &admin).await, m);
+    assert_eq!(listed["current"], second, "{listed}");
+    assert_ne!(listed["current"], first);
+    assert_eq!(listed["upcoming"], json!([]));
+}
+
 #[tokio::test]
 async fn a_changed_catalogue_shows_as_an_update() {
     let change = day_in(3);
@@ -671,6 +709,154 @@ async fn a_changed_catalogue_shows_as_an_update() {
         item(&items, changes)["current"]["source"]["catalogue_version"],
         "2026-11-07"
     );
+}
+
+/// A control plane on one model priced from `v1`, then restarted with `v2`
+/// on the same database; the item it lists for the model, and the admin.
+async fn versioned(
+    key: &str,
+    v1: Arc<Catalogue>,
+    v2: Arc<Catalogue>,
+) -> Option<(TestCp, OperatorSession, Uuid, Value)> {
+    let cp = TestCp::start_with_catalogue(v1).await?;
+    let admin = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let m = model(&cp, &admin, "bl-moved-7c1").await;
+    write(
+        &cp,
+        &admin,
+        json!({"model_id": m, "effective_from": db_now(&cp).await, "catalogue_key": key}),
+    )
+    .await;
+    let upgraded = cp.restart_with_catalogue(v2).await;
+    let listed = item(&list(&upgraded, &admin).await, m);
+    Some((upgraded, admin, m, listed))
+}
+
+/// The input rate of `model`'s baseline in force at the instant `n` of its
+/// schedule from now on: `current`, then `upcoming` in order, is a step
+/// function, so each entry names the input in force from its start.
+fn step_inputs(listed: &Value) -> Vec<(&str, &str)> {
+    let mut out: Vec<(&str, &str)> = Vec::new();
+    if let Some(current) = listed["current"].as_object() {
+        out.push((
+            current["effective_from"].as_str().expect("a start"),
+            current["card"]["default"]["base"]["input"]
+                .as_str()
+                .expect("an input rate"),
+        ));
+    }
+    for rev in listed["upcoming"].as_array().expect("upcoming") {
+        out.push((
+            rev["effective_from"].as_str().expect("a start"),
+            rev["card"]["default"]["base"]["input"]
+                .as_str()
+                .expect("an input rate"),
+        ));
+    }
+    out
+}
+
+/// When a step of a baseline schedule starts: at the instant the write was
+/// given, or at UTC midnight of a date.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Starts {
+    Write,
+    Day(NaiveDate),
+}
+
+/// Confirming the update a moved or dropped dated catalogue entry shows
+/// writes what the catalogue says at every instant a stale revision of the
+/// same key started, so the update clears and the stale card never bills.
+#[tokio::test]
+async fn confirming_a_moved_or_dropped_catalogue_change_clears_the_update() {
+    let key = "openai/moved-7c1";
+    // v1: undated "1", a change to "3" from D1.
+    let d1 = day_in(6);
+    let v1 = catalogue(
+        "2026-11-06",
+        &[
+            entry_of(key, "2026-11-01", None, "1"),
+            entry_of(key, "2026-11-01", Some(d1), "3"),
+        ],
+    );
+    // v2 postpones the change to D2, brings it forward to D0, or drops it.
+    let d2 = day_in(8);
+    let d0 = day_in(4);
+    let later = [
+        entry_of(key, "2026-11-06", None, "1"),
+        entry_of(key, "2026-11-06", Some(d2), "3"),
+    ];
+    let earlier = [
+        entry_of(key, "2026-11-06", None, "1"),
+        entry_of(key, "2026-11-06", Some(d0), "3"),
+    ];
+    let dropped = [entry_of(key, "2026-11-06", None, "1")];
+    for (label, v2, expected) in [
+        // From D1 the stale card gives way to the entry in effect then,
+        // which is the undated one, until D2 moves the price.
+        (
+            "moved later",
+            &later[..],
+            vec![
+                (Starts::Write, "1"),
+                (Starts::Day(d1), "1"),
+                (Starts::Day(d2), "3"),
+            ],
+        ),
+        // The change is in effect from D0, and the stale instant still gets
+        // a row of its own, carrying what the catalogue says there.
+        (
+            "moved earlier",
+            &earlier[..],
+            vec![
+                (Starts::Write, "1"),
+                (Starts::Day(d0), "3"),
+                (Starts::Day(d1), "3"),
+            ],
+        ),
+        // The change was dropped: nothing above "1" is ever charged.
+        (
+            "dropped",
+            &dropped[..],
+            vec![(Starts::Write, "1"), (Starts::Day(d1), "1")],
+        ),
+    ] {
+        let Some((cp, admin, m, listed)) =
+            versioned(key, v1.clone(), catalogue("2026-11-07", v2)).await
+        else {
+            return;
+        };
+        assert!(
+            listed["catalogue_update"].is_object(),
+            "{label}: before the confirm {listed}"
+        );
+        let at = db_now(&cp).await;
+        write(
+            &cp,
+            &admin,
+            json!({"model_id": m, "effective_from": at, "catalogue_key": key}),
+        )
+        .await;
+        let listed = item(&list(&cp, &admin).await, m);
+        assert_eq!(
+            listed["catalogue_update"],
+            Value::Null,
+            "{label}: after the confirm {listed}"
+        );
+        let schedule: Vec<(Starts, &str)> = step_inputs(&listed)
+            .into_iter()
+            .map(|(start, input)| {
+                let start = instant(&json!(start));
+                let starts = if start == at {
+                    Starts::Write
+                } else {
+                    Starts::Day(start.date_naive())
+                };
+                (starts, input)
+            })
+            .collect();
+        assert_eq!(schedule, expected, "{label}: {listed}");
+    }
 }
 
 #[tokio::test]
@@ -871,6 +1057,37 @@ async fn a_baseline_a_scheduled_one_will_replace_says_so() {
             .is_some_and(|m| !m.is_empty()),
         "{body}"
     );
+}
+
+/// A baseline written now, over a scheduled one this same write covers, is
+/// not displaced by it: the warning names only revisions that will still
+/// take over.
+#[tokio::test]
+async fn a_scheduled_baseline_this_write_rewrites_is_no_warning() {
+    let key = "openai/rewrite-7c1";
+    let dated = day_in(5);
+    let cat = catalogue(
+        "2026-11-06",
+        &[
+            entry_of(key, "2026-11-01", None, "1"),
+            entry_of(key, "2026-11-01", Some(dated), "2"),
+        ],
+    );
+    let Some(cp) = TestCp::start_with_catalogue(cat).await else {
+        return;
+    };
+    let admin = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let m = model(&cp, &admin, "bl-rewrite-7c1").await;
+    let post =
+        |at: DateTime<Utc>| json!({"model_id": m, "effective_from": at, "catalogue_key": key});
+    write(&cp, &admin, post(db_now(&cp).await)).await;
+    let again = write(&cp, &admin, post(db_now(&cp).await)).await;
+    assert_eq!(again["warnings"], json!([]), "{again}");
+    assert_eq!(again["later_revisions"].as_array().map(Vec::len), Some(1));
+
+    // The model keeps the one scheduled revision, and no others.
+    let listed = item(&list(&cp, &admin).await, m);
+    assert_eq!(listed["upcoming"].as_array().map(Vec::len), Some(1));
 }
 
 /// What an attested import confirmation writes, through the function it
