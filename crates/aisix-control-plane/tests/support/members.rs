@@ -77,7 +77,12 @@ pub fn tenant_fixture(method: &str, path: &str) -> (String, Option<Value>) {
             format!("/api/keys/{}", Uuid::new_v4()),
             (method == "PATCH").then(|| json!({"label": "fixture-key"})),
         ),
-        ("GET", "/api/billing/balance") => (path.to_string(), None),
+        ("GET", "/api/billing/balance" | "/api/billing/ledger") => (path.to_string(), None),
+        // A range of one hour, so the summary answers 200.
+        ("GET", "/api/billing/summary") => (
+            format!("{path}?group=day&from=2026-01-01T00:00:00Z&to=2026-01-01T01:00:00Z"),
+            None,
+        ),
         _ => panic!("no fixture for {method} {path}: add one to tests/support/members.rs"),
     }
 }
