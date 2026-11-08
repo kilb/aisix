@@ -546,7 +546,7 @@ fn refused(path: &str, message: impl Into<String>) -> ApiError {
 
 /// Refuses a revision that would start more than [`BACKDATE_TOLERANCE`]
 /// before the database's `now()`.
-async fn starts_now_or_later(
+pub(crate) async fn starts_now_or_later(
     conn: &mut PgConnection,
     effective_from: DateTime<Utc>,
 ) -> Result<(), ApiError> {
@@ -579,7 +579,7 @@ async fn tenant_exists(conn: &mut PgConnection, id: Uuid) -> Result<bool, DbErro
 
 /// Tells every cached price book to reload. It also serializes concurrent
 /// price writes on this one row.
-async fn bump_pricing_version(conn: &mut PgConnection) -> Result<(), DbError> {
+pub(crate) async fn bump_pricing_version(conn: &mut PgConnection) -> Result<(), DbError> {
     sqlx::query(
         "UPDATE cp_settings SET value = to_jsonb((value::text)::bigint + 1), updated_at = now() \
          WHERE key = 'pricing_version'",
@@ -591,7 +591,7 @@ async fn bump_pricing_version(conn: &mut PgConnection) -> Result<(), DbError> {
 
 /// The operator a revision is written by; `None` for the control plane
 /// itself (and anyone who is not an operator, who the audit row names).
-fn created_by(actor: Actor<'_>) -> Option<Uuid> {
+pub(crate) fn created_by(actor: Actor<'_>) -> Option<Uuid> {
     match actor {
         Actor::Operator(op) => Some(op.id),
         _ => None,
