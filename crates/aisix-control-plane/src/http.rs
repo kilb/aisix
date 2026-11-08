@@ -349,6 +349,27 @@ pub const ROUTE_ROLES: &[(&str, &str, MinRole)] = &[
         "/api/billing/balance",
         MinRole::Member(&[MemberRole::Owner, MemberRole::Admin, MemberRole::Billing]),
     ),
+    // The ledger and its per-period totals.
+    (
+        "GET",
+        "/admin/tenants/{id}/billing/ledger",
+        MinRole::Op(OperatorRole::Viewer),
+    ),
+    (
+        "GET",
+        "/admin/tenants/{id}/billing/summary",
+        MinRole::Op(OperatorRole::Viewer),
+    ),
+    (
+        "GET",
+        "/api/billing/ledger",
+        MinRole::Member(&[MemberRole::Owner, MemberRole::Admin, MemberRole::Billing]),
+    ),
+    (
+        "GET",
+        "/api/billing/summary",
+        MinRole::Member(&[MemberRole::Owner, MemberRole::Admin, MemberRole::Billing]),
+    ),
     // Gateways, on the gateway listener.
     ("POST", "/dp/heartbeat", MinRole::Dp),
     ("GET", "/dp/v1/keys/{key_id}/prices", MinRole::Dp),
@@ -498,6 +519,16 @@ pub fn browser_router(state: AppState) -> Router {
             get(billing::accounts::get).patch(billing::accounts::set_credit_limit),
         )
         .route("/api/billing/balance", get(billing::accounts::balance))
+        .route(
+            "/admin/tenants/{id}/billing/ledger",
+            get(billing::statements::admin_ledger),
+        )
+        .route(
+            "/admin/tenants/{id}/billing/summary",
+            get(billing::statements::admin_summary),
+        )
+        .route("/api/billing/ledger", get(billing::statements::ledger))
+        .route("/api/billing/summary", get(billing::statements::summary))
         .route_layer(axum::middleware::from_fn(json_only))
         .route_layer(axum::middleware::from_fn(only_listed_routes))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
