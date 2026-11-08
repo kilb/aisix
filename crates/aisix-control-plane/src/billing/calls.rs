@@ -424,6 +424,25 @@ pub(super) fn tenant_view(ev: &Value, charge_status: &str, repriced: bool) -> Op
     })
 }
 
+/// A charge's stored `lines` as a tenant reads them: each line's dimension,
+/// quantity and rate, and nothing else a stored line may carry.
+fn tenant_lines(lines: &Value) -> Value {
+    Value::Array(
+        lines
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|l| {
+                json!({
+                    "dimension": l.get("dimension"),
+                    "quantity": l.get("quantity"),
+                    "rate": l.get("rate"),
+                })
+            })
+            .collect(),
+    )
+}
+
 /// `GET /api/usage/calls` → `{items: [Call], next_before}`, newest first.
 pub async fn list_calls(
     auth: MemberAuth,
@@ -552,7 +571,7 @@ pub async fn list_calls(
                     service_tier: r.service_tier,
                     estimated: r.estimated,
                     discount_bps: r.discount_bps,
-                    lines: r.lines,
+                    lines: tenant_lines(&r.lines),
                 },
                 event_id: r.event_id,
                 occurred_at: r.occurred_at,

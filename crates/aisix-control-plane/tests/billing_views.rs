@@ -38,6 +38,20 @@ const CALL_KEYS: [&str; 14] = [
     "charge",
 ];
 
+/// The keys of a `Call`'s `charge`.
+const CHARGE_KEYS: [&str; 7] = [
+    "status",
+    "amount_micro_usd",
+    "adjusted_micro_usd",
+    "service_tier",
+    "estimated",
+    "discount_bps",
+    "lines",
+];
+
+/// The keys of one line of a charge, as a tenant reads it.
+const LINE_KEYS: [&str; 3] = ["dimension", "quantity", "rate"];
+
 /// A model named `name` for tenants, on a provider key and groups that carry
 /// the channel fixture tokens; granted to `tenant` when given.
 async fn model(w: &World, name: &str, grant_to: Option<Uuid>) -> Uuid {
@@ -171,6 +185,22 @@ async fn a_tenants_call_log_names_no_channel_and_no_cost() {
         ],
     )
     .await;
+    // A later engine may store more on a charge line than a tenant reads,
+    // such as a line's cost rate: written here as such an engine would.
+    let stored = sqlx::query(
+        "UPDATE pricing_charges SET lines = (SELECT jsonb_agg(l || $1::jsonb) \
+         FROM jsonb_array_elements(lines) l) \
+         WHERE event_id = 'ok1' AND jsonb_array_length(lines) > 0",
+    )
+    .bind(json!({"cost_rate": "0.4", "cost_revision_id": 9_301}))
+    .execute(w.cp.db().pool())
+    .await
+    .expect("store a later engine's lines");
+    assert_eq!(
+        stored.rows_affected(),
+        1,
+        "the charge has no lines to extend"
+    );
     let o = owner(&w).await;
     let r = get(&w.cp, "/api/usage/calls", &o).await;
     assert_eq!(event_ids(&r), ids(&["ok1", "bad1"]));
@@ -182,19 +212,27 @@ async fn a_tenants_call_log_names_no_channel_and_no_cost() {
         UPSTREAM_ERROR,
         "cost_usd",
         "error_code",
+        "cost_rate",
+        "cost_revision_id",
     ] {
         assert!(!body.contains(token), "{token} in {body}");
     }
     let want: BTreeSet<String> = CALL_KEYS.iter().map(|k| k.to_string()).collect();
+    let keys = |v: &Value| -> BTreeSet<String> {
+        v.as_object().expect("an object").keys().cloned().collect()
+    };
+    let charge_keys: BTreeSet<String> = CHARGE_KEYS.iter().map(|k| k.to_string()).collect();
+    let line_keys: BTreeSet<String> = LINE_KEYS.iter().map(|k| k.to_string()).collect();
+    let mut lines_seen = 0;
     for item in items(&r) {
-        let got: BTreeSet<String> = item
-            .as_object()
-            .expect("an object")
-            .keys()
-            .cloned()
-            .collect();
-        assert_eq!(got, want, "{item}");
+        assert_eq!(keys(item), want, "{item}");
+        assert_eq!(keys(&item["charge"]), charge_keys, "{item}");
+        for line in item["charge"]["lines"].as_array().expect("lines") {
+            assert_eq!(keys(line), line_keys, "{line}");
+            lines_seen += 1;
+        }
     }
+    assert!(lines_seen > 0, "no charge line was checked: {body}");
     let summary = get(&w.cp, &format!("/api/usage/summary?{}", around_now()), &o).await;
     let body = summary.body.to_string();
     for token in [
