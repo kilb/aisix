@@ -57,8 +57,10 @@ way.
   lock; a new such path adds a case there.
 - **A path that moves money or decides a mark takes the tenant's billing
   account right after its row**: `tenants::lock_billing`, as the first lock of
-  its transaction. That is every ledger posting, credit-limit or quota change,
-  and every `tenants::project`, whose billing step writes the balance mark
+  its transaction, or `tenants::lock_many_billing` (each row, then its
+  account, in ascending id) for several, as a re-pricing apply does. That is
+  every ledger posting, credit-limit or quota change, and every
+  `tenants::project`, whose billing step writes the balance mark
   (`marks::project`). An account is never taken after the resources lock, so
   a path that locks its tenant twice moves only the first lock to
   `lock_billing`. Every other tenant edit keeps `tenants::lock`, which leaves

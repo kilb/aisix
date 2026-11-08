@@ -19,6 +19,7 @@ use aisix_control_plane::resources::Kind;
 use aisix_control_plane::tenants::{self, BillingMode, TenantLimits, TenantStatus};
 use futures::FutureExt;
 use serde_json::{json, Value};
+use support::world::{insert_unpriced_charges, price};
 use support::{Resp, TestCp, TEST_MASTER_KEY};
 use uuid::Uuid;
 
@@ -1591,6 +1592,36 @@ async fn every_tenant_write_takes_the_tenant_before_the_resources_lock() {
         topups.push(r.body["id"].as_str().expect("an id").to_string());
     }
 
+    // A re-pricing run that charges one of the tenant's unpriced rows.
+    let model_id = Uuid::parse_str(&model).expect("a model id");
+    let occurred = chrono::Utc::now() - chrono::TimeDelta::minutes(10);
+    insert_unpriced_charges(
+        cp.db(),
+        "order-7c1",
+        1,
+        tenant,
+        Uuid::new_v4(),
+        model_id,
+        occurred,
+    )
+    .await;
+    price(&cp, model_id).await;
+    let r = cp
+        .send(
+            "POST",
+            "/admin/billing/repricing",
+            Some(op.as_str()),
+            Some(json!({
+                "from": occurred - chrono::TimeDelta::minutes(1),
+                "to": occurred + chrono::TimeDelta::minutes(1),
+                "reason": "补录价格 7c1",
+            })),
+        )
+        .await;
+    assert_eq!(r.status, 201, "{r:?}");
+    assert_eq!(r.body["changed"], 1, "{r:?}");
+    let run = r.body["id"].as_str().expect("a run id").to_string();
+
     let cases: Vec<(&str, Request, u16)> = vec![
         (
             "PATCH /admin/tenants/{id}",
@@ -1784,6 +1815,19 @@ async fn every_tenant_write_takes_the_tenant_before_the_resources_lock() {
                 })),
             )),
             201,
+        ),
+        // A re-pricing run posts to the ledger and settles the balance mark.
+        (
+            "POST /admin/billing/repricing/{id}/apply",
+            Box::pin(fire(
+                cp.clone(),
+                "POST",
+                format!("/admin/billing/repricing/{run}/apply"),
+                op.clone(),
+                None,
+                Some(json!({})),
+            )),
+            200,
         ),
     ];
     for (what, request, expected) in cases {

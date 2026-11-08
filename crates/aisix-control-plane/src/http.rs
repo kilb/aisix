@@ -472,6 +472,27 @@ pub const ROUTE_ROLES: &[(&str, &str, MinRole)] = &[
         "/api/budgets/{id}",
         MinRole::Member(&[MemberRole::Owner, MemberRole::Admin, MemberRole::Member]),
     ),
+    // Re-pricing runs: an operator previews one, an admin applies it.
+    (
+        "GET",
+        "/admin/billing/repricing",
+        MinRole::Op(OperatorRole::Viewer),
+    ),
+    (
+        "POST",
+        "/admin/billing/repricing",
+        MinRole::Op(OperatorRole::Operator),
+    ),
+    (
+        "GET",
+        "/admin/billing/repricing/{id}",
+        MinRole::Op(OperatorRole::Viewer),
+    ),
+    (
+        "POST",
+        "/admin/billing/repricing/{id}/apply",
+        MinRole::Op(OperatorRole::Admin),
+    ),
     // Gateways, on the gateway listener.
     ("POST", "/dp/heartbeat", MinRole::Dp),
     ("GET", "/dp/v1/keys/{key_id}/prices", MinRole::Dp),
@@ -676,6 +697,18 @@ pub fn browser_router(state: AppState) -> Router {
             "/api/budgets/{id}",
             patch(billing::budget_routes::member_update)
                 .delete(billing::budget_routes::member_delete),
+        )
+        .route(
+            "/admin/billing/repricing",
+            get(billing::repricing::list).post(billing::repricing::preview),
+        )
+        .route(
+            "/admin/billing/repricing/{id}",
+            get(billing::repricing::get),
+        )
+        .route(
+            "/admin/billing/repricing/{id}/apply",
+            post(billing::repricing::apply),
         )
         .route_layer(axum::middleware::from_fn(json_only))
         .route_layer(axum::middleware::from_fn(only_listed_routes))
