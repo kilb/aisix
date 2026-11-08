@@ -54,6 +54,9 @@ pub struct StoredEvent {
     pub occurred_at: DateTime<Utc>,
     pub event: Value,
     pub received_at: DateTime<Utc>,
+    /// `usage_events.request_id`: the row's request id as stored, which its
+    /// charge carries too.
+    pub request_id: Option<String>,
 }
 
 /// What pricing a delivery's stored rows came to.
@@ -167,6 +170,7 @@ pub async fn price_stored(
             api_key_id: claim.api_key_id,
             user_id: &member_id,
             requested_model_id: claim.requested_model_id,
+            request_id: row.request_id.as_deref(),
         };
         let recorded = record_charge(&mut *conn, &ident, &charge).await?;
         if let (Recorded::Inserted, Ok(p), Some(k), Some(api_key_id)) =
