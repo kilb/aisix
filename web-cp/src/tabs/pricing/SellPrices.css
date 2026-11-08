@@ -1,0 +1,35 @@
+/* 价格 · 平台价格. Every value comes from the tokens. */
+
+/* A model with no price in force: the word in the error red, on Paper. */
+.price-unpriced {
+  color: var(--error);
+  font-weight: 700;
+}
+.rate-card {
+  min-width: 0;
+  margin: 0 0 var(--s-4);
+  padding: 0;
+  border: 0;
+}
+.rate-card > legend {
+  padding: 0;
+  margin: 0 0 var(--s-2);
+  color: var(--text);
+  font-weight: 700;
+}
+.rate-card > .note {
+  margin: 0 0 var(--s-3);
+}
+.check {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  margin: 0 0 var(--s-3);
+}
+.sell-history {
+  margin-top: var(--s-6);
+}
+.sell-warnings {
+  margin: var(--s-3) 0 0;
+  padding-left: var(--s-5);
+}

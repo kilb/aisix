@@ -379,7 +379,8 @@
   }
   .page {
     padding-top: var(--s-4);
-    padding-bottom: 96px;
+    /* Room for the route bar fixed along the bottom edge. */
+    padding-bottom: calc(var(--s-12) * 2 + env(safe-area-inset-bottom));
   }
   .panel {
     padding: var(--s-5) var(--s-4);
@@ -402,5 +403,218 @@
   .form.cols,
   .form.inline {
     grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+/* ── 账户: the balance, the readout and the ledger ───────────── */
+.billing-top {
+  grid-template-columns: minmax(0, 2fr) minmax(0, 3fr);
+  align-items: start;
+}
+.balance-state {
+  line-height: var(--lh-table);
+}
+
+/* The balance readout: what can still be spent, large, then one stop per
+   level on a route line, the level that binds filled and marked. Its
+   geometry is named once here and every offset derives from it. */
+.readout {
+  --stop: var(--s-5); /* the binding stop's box */
+  --dot: var(--s-3); /* an ordinary stop */
+  --eye: var(--s-1); /* the binding stop's centre */
+  --lv-h: var(--s-6); /* the label row above a stop */
+  --gap: var(--s-2);
+  --rail: 2px; /* a hairline: the route line and a stop's rim */
+}
+.readout-pick {
+  max-width: 24ch;
+}
+.readout-label {
+  color: var(--text-2);
+}
+.readout-amt {
+  margin-top: var(--s-1);
+  font-size: var(--fs-45);
+  line-height: var(--lh-heading);
+}
+.readout-amt .cur {
+  margin-right: var(--s-1);
+  font-size: var(--fs-29);
+  font-weight: 600;
+}
+.readout-open {
+  font-weight: 700;
+}
+.levels {
+  --n: 3;
+  position: relative;
+  display: grid;
+  grid-template-columns: repeat(var(--n), minmax(0, 1fr));
+  margin: var(--s-4) 0 0;
+  padding: 0;
+  list-style: none;
+}
+/* The line runs from the first stop's centre to the last's, and no further. */
+.levels::before {
+  content: "";
+  position: absolute;
+  top: calc(var(--lv-h) + var(--gap) + (var(--stop) - var(--rail)) / 2);
+  left: calc(var(--stop) / 2);
+  right: calc(100% / var(--n) - var(--stop) / 2);
+  height: var(--rail);
+  background: var(--route-line);
+}
+.levels:has(> :only-child)::before {
+  display: none;
+}
+.levels li {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--gap);
+  min-width: 0;
+  padding-right: var(--s-4);
+}
+.levels .lv {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  height: var(--lv-h);
+  color: var(--text-2);
+  line-height: var(--lh-table);
+  white-space: nowrap;
+}
+.levels .box {
+  position: relative;
+  display: grid;
+  place-items: center;
+  width: var(--stop);
+  height: var(--stop);
+}
+.levels .stop {
+  width: var(--dot);
+  height: var(--dot);
+  border: var(--rail) solid var(--route-line);
+  border-radius: 50%;
+  background: var(--surface);
+  box-sizing: border-box;
+}
+.levels .bind .stop {
+  width: var(--stop);
+  height: var(--stop);
+  border: 0;
+  /* The half pixel is the edge's antialiasing. */
+  background: radial-gradient(circle, var(--surface) 0 var(--eye), var(--route-line) calc(var(--eye) + 0.5px));
+}
+.levels .m {
+  font-size: var(--fs-19);
+  font-weight: 600;
+  line-height: var(--lh-heading);
+  color: var(--text-2);
+}
+.levels .m .cur {
+  font-size: var(--fs-15);
+}
+.levels .bind .m {
+  font-weight: 800;
+  color: var(--text);
+}
+.levels .bind .lv {
+  color: var(--text);
+  font-weight: 600;
+}
+.levels .k {
+  font-size: var(--fs-13);
+  line-height: var(--lh-table);
+  color: var(--text-muted);
+}
+/* 以此为准: a small plate on the level that binds. */
+.bind-plate {
+  display: inline-flex;
+  align-items: center;
+  height: var(--stop);
+  padding: 0 var(--s-2);
+  border-radius: var(--r-chip);
+  background: var(--route-line);
+  color: var(--surface);
+  font-size: var(--fs-12);
+  font-weight: 600;
+  line-height: 1;
+}
+
+/* The ledger's filters, on one row where there is room. */
+.filters {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: start;
+  gap: var(--s-4);
+}
+.filters .field {
+  min-width: 14em;
+}
+.panel-more {
+  display: flex;
+  justify-content: center;
+  padding: var(--s-4) var(--s-6);
+  border-top: 1px solid var(--divider);
+}
+
+@media (max-width: 959px) {
+  .billing-top {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+/* A phone: the levels run down a vertical line, the stop beside its text. */
+@media (max-width: 719px) {
+  .readout-amt {
+    font-size: var(--fs-36);
+  }
+  .readout-amt .cur {
+    font-size: var(--fs-23);
+  }
+  .levels {
+    display: block;
+  }
+  .levels::before {
+    display: none;
+  }
+  .levels li {
+    position: relative;
+    display: grid;
+    grid-template-columns: var(--stop) minmax(0, 1fr);
+    column-gap: var(--s-3);
+    row-gap: var(--s-1);
+    padding: 0 0 var(--s-5);
+  }
+  .levels li:last-child {
+    padding-bottom: 0;
+  }
+  .levels li > .box {
+    grid-column: 1;
+    grid-row: 1 / span 3;
+    align-self: start;
+    margin-top: calc((var(--lv-h) - var(--stop)) / 2);
+  }
+  .levels li > :is(.lv, .m, .k) {
+    grid-column: 2;
+  }
+  .levels li:not(:last-child)::after {
+    content: "";
+    position: absolute;
+    left: calc((var(--stop) - var(--rail)) / 2);
+    top: calc(var(--lv-h) / 2);
+    bottom: calc(var(--lv-h) / -2);
+    width: var(--rail);
+    background: var(--route-line);
+  }
+  .levels .box {
+    z-index: 1;
+  }
+  .filters .field {
+    flex: 1 1 100%;
+  }
+  .panel-more {
+    padding: var(--s-4);
   }
 }

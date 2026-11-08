@@ -595,6 +595,198 @@ export const providerGroups = {
   },
 };
 
+// ── pricing ─────────────────────────────────────────────────────────────────
+
+/** Rates of one tier or band: decimal strings in USD per million units, at most 6 decimals. */
+export type RateMap = Record<string, string>;
+
+/** One tier of a price card: its base rates, and any further parts (long-context bands) as the API has them. */
+export interface TierRates {
+  base: RateMap;
+  [more: string]: unknown;
+}
+
+/** A price card: tiers by name; `default` is the one a request without a tier is priced at. */
+export type RateCard = Record<string, TierRates>;
+
+/** One sell price revision. A tenant override ended by a later revision has `card` null. */
+export interface SellRevision {
+  revision_id: number;
+  engine_version: number;
+  model_id: string;
+  tenant_id: string | null;
+  effective_from: string;
+  card: RateCard | null;
+  source: string;
+  created_by: string | null;
+  created_at: string;
+}
+
+/** Something to know about a price that was written all the same. */
+export interface PriceWarning {
+  code: string;
+  message: string;
+  revision_id?: number;
+  effective_from?: string;
+}
+
+/** The answer to a sell price write: the revision starting as asked, what to know about it, and the later revisions an import also wrote. */
+export type SellCreated = SellRevision & { warnings: PriceWarning[]; later_revisions: SellRevision[] };
+
+export interface CatalogueEntry {
+  key: string;
+  aliases: string[];
+  source_url: string | null;
+  as_of: string | null;
+  effective_from: string | null;
+  notes: string | null;
+  card: RateCard;
+}
+
+/** One model's platform price: in force now, and scheduled by ascending start. */
+export interface PriceRow {
+  model_id: string;
+  name: string;
+  current: SellRevision | null;
+  upcoming: SellRevision[];
+}
+
+/** What `POST /admin/pricing/sell` takes: exactly one of `card` and `catalogue_key`. */
+export interface NewSellPrice {
+  model_id: string;
+  tenant_id?: string;
+  effective_from: string;
+  card?: RateCard | null;
+  catalogue_key?: string;
+  markup_bps?: number;
+}
+
+export const pricing = {
+  async catalogue(): Promise<{ version: string | number; items: CatalogueEntry[] }> {
+    return (await call<{ version: string | number; items: CatalogueEntry[] }>("GET", "/admin/pricing/catalogue")).data;
+  },
+  /** Sell revisions, newest first; `before` is the previous page's `next_before`. */
+  async listSell(q: {
+    model_id?: string;
+    tenant_id?: string;
+    /** Only the platform's own prices, never a tenant override. */
+    platform?: boolean;
+    limit?: number;
+    before?: number;
+  }): Promise<{ items: SellRevision[]; next_before: number | null }> {
+    const params = new URLSearchParams();
+    if (q.model_id) params.set("model_id", q.model_id);
+    if (q.platform) params.set("platform", "true");
+    if (q.tenant_id) params.set("tenant_id", q.tenant_id);
+    if (q.limit !== undefined) params.set("limit", String(q.limit));
+    if (q.before !== undefined) params.set("before", String(q.before));
+    const query = params.toString();
+    return (
+      await call<{ items: SellRevision[]; next_before: number | null }>(
+        "GET",
+        `/admin/pricing/sell${query ? `?${query}` : ""}`,
+      )
+    ).data;
+  },
+  async createSell(body: NewSellPrice): Promise<SellCreated> {
+    return (await call<SellCreated>("POST", "/admin/pricing/sell", body)).data;
+  },
+  /** Every live model's platform price, the unpriced ones first. */
+  async models(): Promise<PriceRow[]> {
+    return (await call<{ items: PriceRow[] }>("GET", "/admin/pricing/models")).data.items;
+  },
+};
+
+// ── pricing: cost prices ────────────────────────────────────────────────────
+
+/** One cost price revision: what an upstream model costs the platform, through one account or any. */
+export interface CostRevision {
+  revision_id: number;
+  engine_version: number;
+  upstream_provider: string;
+  upstream_model: string;
+  provider_key_id: string | null;
+  effective_from: string;
+  card: RateCard;
+  source: string;
+  created_by: string | null;
+  created_at: string;
+}
+
+export type CostCreated = CostRevision & { warnings: PriceWarning[] };
+
+export interface NewCostPrice {
+  upstream_provider: string;
+  upstream_model: string;
+  provider_key_id?: string;
+  effective_from: string;
+  card: RateCard;
+}
+
+export const costPricing = {
+  /** Cost revisions, newest first; `before` is the previous page's `next_before`. */
+  async listCost(q: {
+    upstream_provider?: string;
+    upstream_model?: string;
+    provider_key_id?: string;
+    limit?: number;
+    before?: number;
+  }): Promise<{ items: CostRevision[]; next_before: number | null }> {
+    const params = new URLSearchParams();
+    if (q.upstream_provider) params.set("upstream_provider", q.upstream_provider);
+    if (q.upstream_model) params.set("upstream_model", q.upstream_model);
+    if (q.provider_key_id) params.set("provider_key_id", q.provider_key_id);
+    if (q.limit !== undefined) params.set("limit", String(q.limit));
+    if (q.before !== undefined) params.set("before", String(q.before));
+    const query = params.toString();
+    return (
+      await call<{ items: CostRevision[]; next_before: number | null }>("GET", `/admin/pricing/cost${query ? `?${query}` : ""}`)
+    ).data;
+  },
+  async createCost(body: NewCostPrice): Promise<CostCreated> {
+    return (await call<CostCreated>("POST", "/admin/pricing/cost", body)).data;
+  },
+};
+
+// ── pricing: tenant plans ───────────────────────────────────────────────────
+
+/** One discount revision: basis points off every charge of the tenant, from `effective_from`. */
+export interface DiscountRevision {
+  revision_id: number;
+  engine_version: number;
+  tenant_id: string;
+  effective_from: string;
+  discount_bps: number;
+  created_by: string | null;
+  created_at: string;
+}
+
+/** A tenant's plan: its discount, and the models it has override prices for. An override whose `current.card` is null has ended. */
+export interface TenantPlan {
+  tenant_id: string;
+  discount: { current: DiscountRevision | null; upcoming: DiscountRevision[] };
+  overrides: PriceRow[];
+}
+
+export const tenantPricing = {
+  async listDiscounts(q: { tenant_id?: string; limit?: number; before?: number }): Promise<{ items: DiscountRevision[]; next_before: number | null }> {
+    const params = new URLSearchParams();
+    if (q.tenant_id) params.set("tenant_id", q.tenant_id);
+    if (q.limit !== undefined) params.set("limit", String(q.limit));
+    if (q.before !== undefined) params.set("before", String(q.before));
+    const query = params.toString();
+    return (
+      await call<{ items: DiscountRevision[]; next_before: number | null }>("GET", `/admin/pricing/discounts${query ? `?${query}` : ""}`)
+    ).data;
+  },
+  async createDiscount(body: { tenant_id: string; effective_from: string; discount_bps: number }): Promise<DiscountRevision> {
+    return (await call<DiscountRevision>("POST", "/admin/pricing/discounts", body)).data;
+  },
+  async tenantPlan(tenantId: string): Promise<TenantPlan> {
+    return (await call<TenantPlan>("GET", `/admin/pricing/tenants/${seg(tenantId)}`)).data;
+  },
+};
+
 /** One top-up as an operator reads it: a tenant's request, or an operator's credit. */
 export interface Topup {
   id: string;
@@ -640,5 +832,64 @@ export const topups = {
   /** The reason (1 to 500 characters) is what the tenant reads. `409 topup_state` when it is no longer pending. */
   async reject(id: string, reason: string): Promise<Topup> {
     return (await call<Topup>("POST", `/admin/billing/topups/${seg(id)}/reject`, { reason })).data;
+  },
+};
+
+/** One charge: what a stored usage row was billed, or why it could not be. Amounts are integer micro-dollars. */
+export interface Charge {
+  seq: number;
+  event_id: string;
+  tenant_id: string;
+  api_key_id: string;
+  user_id: string;
+  requested_model_id: string;
+  occurred_at: string;
+  status: "charged" | "exempt" | "nothing_to_bill" | "unpriced";
+  charge_micro_usd: number | null;
+  cost_micro_usd: number | null;
+  service_tier: string | null;
+  requested_service_tier: string | null;
+  long_context_above: number | null;
+  estimated: boolean;
+  exemption: string | null;
+  /** The pricing code behind an `unpriced` charge. */
+  error_code: string | null;
+}
+
+export interface ChargeFilter {
+  status?: string;
+  tenant_id?: string;
+  api_key_id?: string;
+  event_id?: string;
+  before?: number;
+}
+
+/** The per-call charges, newest first. */
+export const charges = {
+  async list(f: ChargeFilter = {}): Promise<{ items: Charge[]; next_before: number | null }> {
+    const q = new URLSearchParams();
+    for (const [k, v] of Object.entries(f)) if (v !== undefined && v !== "") q.set(k, String(v));
+    const qs = q.toString();
+    return (await call<{ items: Charge[]; next_before: number | null }>("GET", `/admin/pricing/charges${qs ? `?${qs}` : ""}`)).data;
+  },
+};
+
+/** A price revision the pricing engine cannot use; charges that need it come out unpriced. */
+export interface InvalidRevision {
+  table: string;
+  revision_id: string | number;
+  reason: string;
+}
+
+/** The pricing health: version, unusable revisions and the last 24 hours' unpriced charges by code. */
+export interface PricingStatus {
+  pricing_version: number | null;
+  invalid_revisions: InvalidRevision[];
+  unpriced_last_24h: { total: number; by_code: Record<string, number> };
+}
+
+export const pricingStatus = {
+  async get(): Promise<PricingStatus> {
+    return (await call<PricingStatus>("GET", "/admin/pricing/status")).data;
   },
 };
