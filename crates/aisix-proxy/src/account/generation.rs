@@ -24,6 +24,8 @@
 //!   usage appears a few seconds after a request completes.
 //! - A control plane that cannot answer: `503`
 //!   ([`ProxyError::AccountUnavailable`]).
+//! - A key that already has [`REQUEST_LOOKUPS_PER_KEY`] lookups waiting on
+//!   the control plane: `429` `rate_limit_exceeded`, at once.
 //!
 //! A found request is cached per key and id for [`REQUEST_TTL`], and a
 //! failure for [`FAILURE_TTL`]. A `404` is kept for no time at all, so a
@@ -31,6 +33,13 @@
 //! plane has it. Concurrent lookups of one key and id share one fetch, run on
 //! a task of its own ([`SharedLookup`]), so a caller that hangs up never
 //! cancels the fetch another caller is waiting for.
+//!
+//! Every id never sent, and every fresh one, costs a control-plane query, so
+//! a key may have at most [`REQUEST_LOOKUPS_PER_KEY`] fetches in flight. A
+//! fetch takes its key's slot when it starts and gives it back when it ends,
+//! a caller hanging up included, so a key cannot pile up queries by hanging
+//! up and asking again. A lookup answered from the cache, or one that joins
+//! a fetch already running for the same id, takes no slot.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -41,9 +50,14 @@ use axum::extract::{Query, State};
 use axum::http::{Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
+use moka::future::Cache;
 use serde::{Deserialize, Serialize};
+use tokio::sync::Semaphore;
 
-use super::{key_path, AccountClient, AccountError, SharedLookup, ACCOUNT_TIMEOUT, FAILURE_TTL};
+use super::{
+    key_path, AccountClient, AccountError, SharedLookup, ACCOUNT_TIMEOUT, CACHE_CAPACITY,
+    FAILURE_TTL,
+};
 use crate::auth::AuthenticatedKey;
 use crate::error::{ErrorEnvelope, ProxyError};
 use crate::request_id::RequestId;
@@ -51,6 +65,15 @@ use crate::state::ProxyState;
 
 /// How long a found request's answer is served from the cache.
 pub const REQUEST_TTL: Duration = Duration::from_secs(3);
+
+/// The most request-cost fetches one key may have waiting on the control
+/// plane at once.
+pub const REQUEST_LOOKUPS_PER_KEY: usize = 4;
+
+/// How long a key's slots are kept once it stops asking. Far longer than a
+/// fetch can run ([`ACCOUNT_TIMEOUT`]), so a key's slots are never dropped
+/// while one of its fetches holds one.
+const SLOTS_IDLE: Duration = Duration::from_secs(60);
 
 /// One usage row recorded under the request id.
 #[derive(Debug, Default, Deserialize)]
@@ -87,21 +110,59 @@ pub(crate) struct RequestCostAnswer {
     items: Vec<RequestItem>,
 }
 
-/// The request lookups, by [`request_key`].
-pub(crate) type RequestCache = SharedLookup<Option<Arc<RequestCostAnswer>>>;
+/// What one lookup found.
+#[derive(Debug, Clone)]
+pub(crate) enum RequestLookup {
+    /// The rows the key may see under the id.
+    Found(Arc<RequestCostAnswer>),
+    /// Nothing the key may see is recorded under the id (the control
+    /// plane's `404`).
+    NotRecorded,
+    /// The key already had [`REQUEST_LOOKUPS_PER_KEY`] fetches in flight, so
+    /// the control plane was not asked.
+    Busy,
+}
 
-/// A found request lives [`REQUEST_TTL`] from when it was fetched; a `404`
-/// lives no time at all, so the next lookup asks again. A failure lives
-/// [`FAILURE_TTL`].
-fn request_ttl(answer: &Option<Arc<RequestCostAnswer>>) -> Duration {
-    match answer {
-        Some(_) => REQUEST_TTL,
-        None => Duration::ZERO,
+/// The request lookups: their answers by [`request_key`], and each key's
+/// slots for fetches in flight.
+#[derive(Clone)]
+pub(crate) struct RequestCache {
+    answers: SharedLookup<RequestLookup>,
+    /// One semaphore of [`REQUEST_LOOKUPS_PER_KEY`] permits per key id,
+    /// bounded at [`CACHE_CAPACITY`] keys and dropped [`SLOTS_IDLE`] after the
+    /// key's last lookup.
+    slots: Cache<String, Arc<Semaphore>>,
+}
+
+impl RequestCache {
+    /// Key `key_id`'s slots.
+    async fn slots_of(&self, key_id: &str) -> Arc<Semaphore> {
+        self.slots
+            .get_with(key_id.to_string(), async {
+                Arc::new(Semaphore::new(REQUEST_LOOKUPS_PER_KEY))
+            })
+            .await
+    }
+}
+
+/// A found request lives [`REQUEST_TTL`] from when it was fetched. A `404`
+/// lives no time at all, so the next lookup asks again, and so does a
+/// lookup refused for want of a slot. A failure lives [`FAILURE_TTL`].
+fn request_ttl(lookup: &RequestLookup) -> Duration {
+    match lookup {
+        RequestLookup::Found(_) => REQUEST_TTL,
+        RequestLookup::NotRecorded | RequestLookup::Busy => Duration::ZERO,
     }
 }
 
 pub(super) fn request_cache() -> RequestCache {
-    SharedLookup::new(ACCOUNT_TIMEOUT, request_ttl, FAILURE_TTL)
+    RequestCache {
+        answers: SharedLookup::new(ACCOUNT_TIMEOUT, request_ttl, FAILURE_TTL),
+        slots: Cache::builder()
+            .max_capacity(CACHE_CAPACITY)
+            .time_to_idle(SLOTS_IDLE)
+            .build(),
+    }
 }
 
 /// The cache key of request id `request_id` asked with key `key_id`: the
@@ -113,16 +174,21 @@ fn request_key(key_id: &str, request_id: &str) -> String {
 }
 
 impl AccountClient {
-    /// What `request_id` cost, as far as key `key_id` may see; `None` when
-    /// it may see no row under the id. `request_id` must be acceptable
-    /// ([`crate::request_id::is_acceptable`]). Concurrent lookups of one key
-    /// and id share one fetch, which a caller hanging up never cancels.
+    /// What `request_id` cost, as far as key `key_id` may see.
+    /// `request_id` must be acceptable ([`crate::request_id::is_acceptable`]).
+    /// Concurrent lookups of one key and id share one fetch, which a caller
+    /// hanging up never cancels; a fetch that would be the key's
+    /// [`REQUEST_LOOKUPS_PER_KEY`]-plus-first in flight is
+    /// [`RequestLookup::Busy`] without asking.
     pub(crate) async fn request_cost(
         &self,
         key_id: &str,
         request_id: &str,
-    ) -> Result<Option<Arc<RequestCostAnswer>>, AccountError> {
+    ) -> Result<RequestLookup, AccountError> {
+        debug_assert!(crate::request_id::is_acceptable(request_id));
+        let slots = self.requests.slots_of(key_id).await;
         self.requests
+            .answers
             .get(&request_key(key_id, request_id), || {
                 let (client, path, id) = (
                     self.clone(),
@@ -130,10 +196,20 @@ impl AccountClient {
                     request_id.to_string(),
                 );
                 async move {
-                    client
-                        .get_json::<RequestCostAnswer>(&path, &[("id", &id)], ACCOUNT_TIMEOUT)
-                        .await
-                        .map(|answer| answer.map(Arc::new))
+                    // Taken by the fetch itself, on its own task, and held
+                    // until the fetch ends or reaches its deadline.
+                    let Ok(_slot) = slots.try_acquire_owned() else {
+                        return Ok(RequestLookup::Busy);
+                    };
+                    Ok(
+                        match client
+                            .get_json::<RequestCostAnswer>(&path, &[("id", &id)], ACCOUNT_TIMEOUT)
+                            .await?
+                        {
+                            Some(answer) => RequestLookup::Found(Arc::new(answer)),
+                            None => RequestLookup::NotRecorded,
+                        },
+                    )
                 }
             })
             .await
@@ -201,11 +277,28 @@ const NOT_RECORDED: &str = "No usage is recorded for this request id yet. Usage 
                             seconds after a request completes.";
 /// The `404` of a gateway with no control plane to ask.
 const NO_CONTROL_PLANE: &str = "Usage lookups are not available on this gateway.";
+/// The `429` of a key with every slot taken.
+const TOO_MANY_LOOKUPS: &str =
+    "Too many usage lookups are in progress for this API key. Retry when one completes.";
 
 fn not_found(message: &str) -> Response {
     (
         StatusCode::NOT_FOUND,
         Json(ErrorEnvelope::new(message, "invalid_request_error").with_code("not_found")),
+    )
+        .into_response()
+}
+
+/// The `429` for a key whose slots are all taken: the gateway's own
+/// rate-limit class, with no `Retry-After`, since a slot frees when a fetch
+/// ends rather than at a time the gateway knows.
+fn too_many_lookups() -> Response {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        Json(
+            ErrorEnvelope::new(TOO_MANY_LOOKUPS, "rate_limit_exceeded")
+                .with_code("rate_limit_exceeded"),
+        ),
     )
         .into_response()
 }
@@ -251,8 +344,11 @@ pub(crate) async fn generation(
         Some(account) => match asked_id(query) {
             None => invalid_id(),
             Some(id) => match account.request_cost(&auth.entry.id, &id).await {
-                Ok(Some(answer)) => Json(Generation::new(&id, &answer)).into_response(),
-                Ok(None) => not_found(NOT_RECORDED),
+                Ok(RequestLookup::Found(answer)) => {
+                    Json(Generation::new(&id, &answer)).into_response()
+                }
+                Ok(RequestLookup::NotRecorded) => not_found(NOT_RECORDED),
+                Ok(RequestLookup::Busy) => too_many_lookups(),
                 Err(AccountError::Unavailable) => ProxyError::AccountUnavailable.into_response(),
             },
         },
@@ -272,16 +368,14 @@ pub(crate) async fn generation(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::account::CACHE_CAPACITY;
+    use crate::account::stand_in::{QueryAnswer, StandIn};
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Mutex;
 
     use aisix_core::resource::ResourceEntry;
     use aisix_core::snapshot::SnapshotHandle;
     use aisix_core::{AisixSnapshot, ApiKey, ProxyConfig};
     use axum::body::{to_bytes, Body};
-    use axum::http::{Request, Uri};
-    use futures::StreamExt;
+    use axum::http::Request;
     use serde_json::{json, Value};
     use tower::ServiceExt;
 
@@ -325,75 +419,29 @@ mod tests {
         })
     }
 
-    /// How the stand-in answers, by the key id in the path and the `id` in
-    /// the query.
-    type Answer = Arc<dyn Fn(&str, Option<&str>) -> (StatusCode, String) + Send + Sync>;
-
-    /// One request the stand-in received: its path and its query pairs.
-    type Seen = (String, Vec<(String, String)>);
-
-    /// A stand-in for the control plane's gateway listener on a local port.
-    /// Records every request's path and query pairs, decoded as the control
-    /// plane's own router decodes them.
-    struct StandIn {
-        base: String,
-        seen: Arc<Mutex<Vec<Seen>>>,
+    /// The shared stand-in, answering by key id and `id`.
+    async fn stand_in(answer: QueryAnswer) -> StandIn {
+        StandIn::start_answering(answer, Duration::ZERO).await
     }
 
-    impl StandIn {
-        async fn start(answer: Answer) -> StandIn {
-            Self::start_with_delay(answer, Duration::ZERO).await
-        }
+    /// [`stand_in`], every answer after `delay`.
+    async fn stand_in_with_delay(answer: QueryAnswer, delay: Duration) -> StandIn {
+        StandIn::start_answering(answer, delay).await
+    }
 
-        /// Every answer is sent after `delay`.
-        async fn start_with_delay(answer: Answer, delay: Duration) -> StandIn {
-            let seen = Arc::new(Mutex::new(Vec::new()));
-            let s = Arc::clone(&seen);
-            let app = axum::Router::new().fallback(
-                move |uri: Uri, Query(pairs): Query<Vec<(String, String)>>| {
-                    let (answer, s) = (Arc::clone(&answer), Arc::clone(&s));
-                    async move {
-                        let path = uri.path().to_string();
-                        let key = path
-                            .strip_prefix("/dp/v1/keys/")
-                            .and_then(|rest| rest.strip_suffix("/requests"))
-                            .unwrap_or("")
-                            .to_string();
-                        let id = pairs
-                            .iter()
-                            .find(|(name, _)| name == "id")
-                            .map(|(_, v)| v.clone());
-                        s.lock().unwrap().push((path, pairs));
-                        let (status, body) = answer(&key, id.as_deref());
-                        tokio::time::sleep(delay).await;
-                        (
-                            status,
-                            [(axum::http::header::CONTENT_TYPE, "application/json")],
-                            body,
-                        )
-                    }
-                },
-            );
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = listener.local_addr().unwrap();
-            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-            StandIn {
-                base: format!("http://{addr}"),
-                seen,
-            }
-        }
-
-        fn hits(&self) -> usize {
-            self.seen.lock().unwrap().len()
-        }
-
-        fn seen(&self) -> Vec<Seen> {
-            self.seen.lock().unwrap().clone()
-        }
-
-        fn client(&self) -> AccountClient {
-            let http = reqwest::Client::builder().no_proxy().build().unwrap();
-            AccountClient::new(http, &format!("{}/", self.base))
+    impl AccountClient {
+        /// [`AccountClient::request_cost`], read as found or not: a lookup
+        /// refused for want of a slot fails the test.
+        async fn request_found(
+            &self,
+            key_id: &str,
+            request_id: &str,
+        ) -> Result<Option<Arc<RequestCostAnswer>>, AccountError> {
+            Ok(match self.request_cost(key_id, request_id).await? {
+                RequestLookup::Found(answer) => Some(answer),
+                RequestLookup::NotRecorded => None,
+                RequestLookup::Busy => panic!("refused for want of a slot"),
+            })
         }
     }
 
@@ -415,7 +463,7 @@ mod tests {
         // it.
         let asked = Arc::new(AtomicUsize::new(0));
         let a = Arc::clone(&asked);
-        let stand_in = StandIn::start(Arc::new(move |_, _| {
+        let stand_in = stand_in(Arc::new(move |_, _| {
             if a.fetch_add(1, Ordering::SeqCst) == 0 {
                 not_found_upstream()
             } else {
@@ -425,12 +473,12 @@ mod tests {
         .await;
         let client = stand_in.client();
         assert!(client
-            .request_cost("k-owner", "req-7c1")
+            .request_found("k-owner", "req-7c1")
             .await
             .unwrap()
             .is_none());
         let found = client
-            .request_cost("k-owner", "req-7c1")
+            .request_found("k-owner", "req-7c1")
             .await
             .unwrap()
             .expect("found on the next lookup");
@@ -438,7 +486,7 @@ mod tests {
         assert_eq!(stand_in.hits(), 2);
         // A found request is cached.
         assert!(client
-            .request_cost("k-owner", "req-7c1")
+            .request_found("k-owner", "req-7c1")
             .await
             .unwrap()
             .is_some());
@@ -451,11 +499,11 @@ mod tests {
     async fn the_request_id_reaches_the_control_plane_encoded() {
         const ID: &str = "a+b&c=d%e#f/g";
         assert!(crate::request_id::is_acceptable(ID));
-        let stand_in = StandIn::start(Arc::new(|_, _| ok(owners_answer()))).await;
+        let stand_in = stand_in(Arc::new(|_, _| ok(owners_answer()))).await;
 
         assert!(stand_in
             .client()
-            .request_cost("k-owner", ID)
+            .request_found("k-owner", ID)
             .await
             .unwrap()
             .is_some());
@@ -474,7 +522,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_request_id_that_is_not_acceptable_is_refused() {
-        let stand_in = StandIn::start(Arc::new(|_, _| ok(owners_answer()))).await;
+        let stand_in = stand_in(Arc::new(|_, _| ok(owners_answer()))).await;
         let app = router(Some(stand_in.client()), false);
         let too_long = format!("id={}", "a".repeat(257));
         for query in [
@@ -506,7 +554,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_answer_without_its_items_is_unavailable() {
-        let stand_in = StandIn::start(Arc::new(|_, id| {
+        let stand_in = stand_in(Arc::new(|_, id| {
             let mut body = owners_answer();
             match id {
                 Some("missing") => {
@@ -520,7 +568,7 @@ mod tests {
         let client = stand_in.client();
         for id in ["missing", "null"] {
             assert_eq!(
-                client.request_cost("k-owner", id).await.unwrap_err(),
+                client.request_found("k-owner", id).await.unwrap_err(),
                 AccountError::Unavailable,
                 "{id}"
             );
@@ -529,7 +577,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_failure_is_unavailable_and_cached_for_its_own_ttl() {
-        let stand_in = StandIn::start(Arc::new(|_, id| match id {
+        let stand_in = stand_in(Arc::new(|_, id| match id {
             Some("garbled") => (StatusCode::OK, "not json".to_string()),
             _ => (StatusCode::INTERNAL_SERVER_ERROR, "{}".to_string()),
         }))
@@ -537,47 +585,47 @@ mod tests {
         let client = stand_in.client();
         for id in ["failing", "garbled"] {
             assert_eq!(
-                client.request_cost("k-owner", id).await.unwrap_err(),
+                client.request_found("k-owner", id).await.unwrap_err(),
                 AccountError::Unavailable,
                 "{id}"
             );
         }
         let before = stand_in.hits();
-        assert!(client.request_cost("k-owner", "failing").await.is_err());
+        assert!(client.request_found("k-owner", "failing").await.is_err());
         assert_eq!(stand_in.hits(), before, "within FAILURE_TTL");
         tokio::time::sleep(FAILURE_TTL + Duration::from_millis(300)).await;
-        assert!(client.request_cost("k-owner", "failing").await.is_err());
+        assert!(client.request_found("k-owner", "failing").await.is_err());
         assert_eq!(stand_in.hits(), before + 1, "past FAILURE_TTL");
     }
 
     #[tokio::test]
     async fn a_request_cost_is_cached_per_key_and_id_for_its_ttl() {
         // Slow enough that all ten lookups below are in flight together.
-        let stand_in = StandIn::start_with_delay(
+        let stand_in = stand_in_with_delay(
             Arc::new(|_, _| ok(owners_answer())),
             Duration::from_millis(200),
         )
         .await;
         let client = stand_in.client();
-        let lookups = (0..10).map(|_| client.request_cost("key-a", "req-1"));
+        let lookups = (0..10).map(|_| client.request_found("key-a", "req-1"));
         for answer in futures::future::join_all(lookups).await {
             assert!(answer.unwrap().is_some());
         }
         assert_eq!(stand_in.hits(), 1, "ten concurrent lookups of one id");
         assert!(client
-            .request_cost("key-a", "req-2")
+            .request_found("key-a", "req-2")
             .await
             .unwrap()
             .is_some());
         assert_eq!(stand_in.hits(), 2, "another id is its own entry");
         assert!(client
-            .request_cost("key-b", "req-1")
+            .request_found("key-b", "req-1")
             .await
             .unwrap()
             .is_some());
         assert_eq!(stand_in.hits(), 3, "another key is its own entry");
         assert!(client
-            .request_cost("key-a", "req-1")
+            .request_found("key-a", "req-1")
             .await
             .unwrap()
             .is_some());
@@ -585,7 +633,7 @@ mod tests {
 
         tokio::time::sleep(REQUEST_TTL + Duration::from_millis(300)).await;
         assert!(client
-            .request_cost("key-a", "req-1")
+            .request_found("key-a", "req-1")
             .await
             .unwrap()
             .is_some());
@@ -599,26 +647,26 @@ mod tests {
     #[tokio::test]
     async fn a_caller_that_hangs_up_leaves_another_callers_lookup_alone() {
         const ROUND_TRIP: Duration = Duration::from_millis(1_000);
-        let stand_in =
-            StandIn::start_with_delay(Arc::new(|_, _| ok(owners_answer())), ROUND_TRIP).await;
+        let stand_in = stand_in_with_delay(Arc::new(|_, _| ok(owners_answer())), ROUND_TRIP).await;
         let client = Arc::new(stand_in.client());
 
         let first = {
             let client = Arc::clone(&client);
-            tokio::spawn(async move { client.request_cost("key-a", "req-1").await })
+            tokio::spawn(async move { client.request_found("key-a", "req-1").await })
         };
         tokio::time::sleep(Duration::from_millis(50)).await;
         let second = {
             let client = Arc::clone(&client);
             tokio::spawn(async move {
                 let started = Instant::now();
-                let answer = client.request_cost("key-a", "req-1").await;
+                let answer = client.request_found("key-a", "req-1").await;
                 (answer, started.elapsed())
             })
         };
         // The first caller hangs up just before its answer would arrive.
         tokio::time::sleep(Duration::from_millis(850)).await;
         first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
 
         let (answer, waited) = second.await.unwrap();
         assert!(answer.unwrap().is_some());
@@ -636,22 +684,57 @@ mod tests {
         assert_ne!(request_key("bc", "a"), request_key("c", "ab"));
     }
 
+    /// The answers are bounded by the shared lookup (its own test, in
+    /// `key.rs`); the slots are a cache of their own, bounded too.
     #[tokio::test]
-    async fn the_request_cache_is_bounded() {
-        let stand_in = StandIn::start(Arc::new(|_, _| ok(owners_answer()))).await;
-        let client = stand_in.client();
-        let ids = CACHE_CAPACITY as usize + 100;
-        futures::stream::iter(0..ids)
+    async fn the_slots_are_bounded() {
+        let cache = request_cache();
+        for i in 0..CACHE_CAPACITY + 100 {
+            cache.slots_of(&format!("key-{i}")).await;
+        }
+        cache.slots.run_pending_tasks().await;
+        let held = cache.slots.entry_count();
+        assert!(held > 0 && held <= CACHE_CAPACITY, "{held} keys held");
+    }
+
+    /// A caller that hangs up does not give its fetch's slot back: four
+    /// lookups whose callers all left still hold the key's four slots until
+    /// their fetches end, so asking again is refused meanwhile.
+    #[tokio::test]
+    async fn a_caller_hanging_up_does_not_give_its_slot_back() {
+        let stand_in =
+            stand_in_with_delay(Arc::new(|_, _| ok(owners_answer())), Duration::from_secs(1)).await;
+        let client = Arc::new(stand_in.client());
+        let callers: Vec<_> = (0..REQUEST_LOOKUPS_PER_KEY)
             .map(|i| {
-                let client = &client;
-                async move { client.request_cost("key-a", &format!("req-{i}")).await }
+                let client = Arc::clone(&client);
+                tokio::spawn(async move { client.request_cost("key-a", &format!("req-{i}")).await })
             })
-            .buffer_unordered(64)
-            .for_each(|answer| async move { assert!(answer.unwrap().is_some()) })
-            .await;
-        assert_eq!(stand_in.hits(), ids);
-        let held = client.requests.entry_count().await;
-        assert!(held > 0 && held <= CACHE_CAPACITY, "{held} entries held");
+            .collect();
+        while stand_in.hits() < REQUEST_LOOKUPS_PER_KEY {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // Every caller hangs up, and is gone before the key asks again.
+        for caller in callers {
+            caller.abort();
+            assert!(caller.await.unwrap_err().is_cancelled());
+        }
+        assert!(matches!(
+            client.request_cost("key-a", "req-again").await,
+            Ok(RequestLookup::Busy)
+        ));
+        assert_eq!(stand_in.hits(), REQUEST_LOOKUPS_PER_KEY, "not asked");
+
+        // Once the fetches end their slots are back.
+        let slots = client.requests.slots_of("key-a").await;
+        while slots.available_permits() < REQUEST_LOOKUPS_PER_KEY {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(client
+            .request_found("key-a", "req-again")
+            .await
+            .unwrap()
+            .is_some());
     }
 
     // ── the route ───────────────────────────────────────────────────────────
@@ -721,7 +804,7 @@ mod tests {
     /// organization, so both get its `404`, as every key does for an id
     /// nobody sent.
     async fn tenant_stand_in() -> StandIn {
-        StandIn::start(Arc::new(|key, id| match (key, id) {
+        stand_in(Arc::new(|key, id| match (key, id) {
             ("k-owner", Some("req-7c1")) => ok(owners_answer()),
             _ => not_found_upstream(),
         }))
@@ -790,7 +873,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_answer_missing_an_optional_field_still_decodes() {
-        let stand_in = StandIn::start(Arc::new(|_, _| ok(json!({"items": [{}]})))).await;
+        let stand_in = stand_in(Arc::new(|_, _| ok(json!({"items": [{}]})))).await;
         let (status, body) = lookup(router(Some(stand_in.client()), false), OWNER, "req-7c1").await;
         assert_eq!(status, StatusCode::OK, "{body}");
         // What the control plane did not say is rendered `null`, never
@@ -817,49 +900,130 @@ mod tests {
     }
 
     /// Another key's request, another organization's, and an id nobody
-    /// sent all answer the same bytes.
+    /// sent all answer the same bytes, in either mode, the owner's request
+    /// included while the owner's answer is cached.
     #[tokio::test]
     async fn a_request_the_key_may_not_see_answers_like_one_never_sent() {
-        let stand_in = tenant_stand_in().await;
-        let app = router(Some(stand_in.client()), false);
+        for platform in [false, true] {
+            let stand_in = tenant_stand_in().await;
+            let app = router(Some(stand_in.client()), platform);
 
-        let (status, never) = lookup_bytes(app.clone(), MEMBER, "id=req-never-sent").await;
-        assert_eq!(status, StatusCode::NOT_FOUND);
-        let body: Value = serde_json::from_slice(&never).unwrap();
-        assert_eq!(
-            body,
-            json!({"error": {
-                "message": "No usage is recorded for this request id yet. Usage appears a few seconds after a request completes.",
-                "type": "invalid_request_error",
-                "code": "not_found",
-            }})
-        );
-        for (bearer, id) in [
-            (MEMBER, "req-7c1"),
-            (STRANGER, "req-7c1"),
-            (STRANGER, "req-never-sent"),
-        ] {
-            let (status, bytes) = lookup_bytes(app.clone(), bearer, &format!("id={id}")).await;
-            assert_eq!(status, StatusCode::NOT_FOUND, "{bearer} {id}");
-            assert_eq!(bytes, never, "{bearer} {id}");
+            let (status, never) = lookup_bytes(app.clone(), MEMBER, "id=req-never-sent").await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "platform {platform}");
+            let body: Value = serde_json::from_slice(&never).unwrap();
+            assert_eq!(
+                body,
+                json!({"error": {
+                    "message": "No usage is recorded for this request id yet. Usage appears a few seconds after a request completes.",
+                    "type": "invalid_request_error",
+                    "code": "not_found",
+                }}),
+                "platform {platform}"
+            );
+            // The owner's answer is cached under the owner's key only.
+            let (status, _) = lookup_bytes(app.clone(), OWNER, "id=req-7c1").await;
+            assert_eq!(status, StatusCode::OK, "platform {platform}");
+            for (bearer, id) in [
+                (MEMBER, "req-7c1"),
+                (STRANGER, "req-7c1"),
+                (STRANGER, "req-never-sent"),
+            ] {
+                let (status, bytes) = lookup_bytes(app.clone(), bearer, &format!("id={id}")).await;
+                assert_eq!(
+                    status,
+                    StatusCode::NOT_FOUND,
+                    "{bearer} {id} platform {platform}"
+                );
+                assert_eq!(bytes, never, "{bearer} {id} platform {platform}");
+            }
+            // Each asked with the caller's own key.
+            let keys: Vec<String> = stand_in.seen().into_iter().map(|(path, _)| path).collect();
+            assert_eq!(
+                keys,
+                [
+                    "/dp/v1/keys/k-member/requests",
+                    "/dp/v1/keys/k-owner/requests",
+                    "/dp/v1/keys/k-member/requests",
+                    "/dp/v1/keys/k-stranger/requests",
+                    "/dp/v1/keys/k-stranger/requests",
+                ],
+                "platform {platform}"
+            );
         }
-        // Each asked with the caller's own key.
-        let keys: Vec<String> = stand_in.seen().into_iter().map(|(path, _)| path).collect();
-        assert_eq!(
-            keys,
-            [
-                "/dp/v1/keys/k-member/requests",
-                "/dp/v1/keys/k-member/requests",
-                "/dp/v1/keys/k-stranger/requests",
-                "/dp/v1/keys/k-stranger/requests",
-            ]
-        );
+    }
+
+    /// A key may have at most four fetches waiting on the control plane:
+    /// a fifth lookup of another id is answered `429` at once, with the
+    /// gateway's own rate-limit class and no `Retry-After`, and asks
+    /// nothing. Another key is not held back by it, and the refused id is
+    /// asked about again once a slot is free.
+    #[tokio::test]
+    async fn a_key_has_at_most_four_lookups_in_flight() {
+        const ROUND_TRIP: Duration = Duration::from_millis(1_000);
+        for platform in [false, true] {
+            let stand_in =
+                stand_in_with_delay(Arc::new(|_, _| ok(owners_answer())), ROUND_TRIP).await;
+            let app = router(Some(stand_in.client()), platform);
+            let ask = |bearer: &'static str, id: String| {
+                let app = app.clone();
+                async move {
+                    let started = Instant::now();
+                    let req = Request::builder()
+                        .uri(format!("/v1/generation?id={id}"))
+                        .header("authorization", format!("Bearer {bearer}"))
+                        .body(Body::empty())
+                        .unwrap();
+                    let resp = app.oneshot(req).await.unwrap();
+                    let (status, headers) = (resp.status(), resp.headers().clone());
+                    let bytes = to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+                    let body: Value = serde_json::from_slice(&bytes).unwrap();
+                    (id, status, headers, body, started.elapsed())
+                }
+            };
+
+            let owners = (0..5).map(|i| ask(OWNER, format!("req-{i}")));
+            let (owners, member) = tokio::join!(
+                futures::future::join_all(owners),
+                ask(MEMBER, "req-m".to_string())
+            );
+            let refused: Vec<_> = owners
+                .iter()
+                .filter(|(_, status, ..)| *status == StatusCode::TOO_MANY_REQUESTS)
+                .collect();
+            assert_eq!(refused.len(), 1, "platform {platform}: {owners:?}");
+            let (refused_id, _, headers, body, took) = refused[0].clone();
+            assert_eq!(
+                body,
+                json!({"error": {
+                    "message": "Too many usage lookups are in progress for this API key. Retry when one completes.",
+                    "type": "rate_limit_exceeded",
+                    "code": "rate_limit_exceeded",
+                }}),
+                "platform {platform}"
+            );
+            assert!(headers.get("retry-after").is_none(), "platform {platform}");
+            assert!(
+                took < ROUND_TRIP / 2,
+                "platform {platform}: waited {took:?}"
+            );
+            for (id, status, ..) in &owners {
+                if *id != refused_id {
+                    assert_eq!(*status, StatusCode::OK, "platform {platform}: {id}");
+                }
+            }
+            assert_eq!(member.1, StatusCode::OK, "platform {platform}: {member:?}");
+            assert_eq!(stand_in.hits(), 5, "four of the owner's and the member's");
+
+            // The four fetches have ended: the refused id is asked about now.
+            let (_, status, ..) = ask(OWNER, refused_id).await;
+            assert_eq!(status, StatusCode::OK, "platform {platform}");
+            assert_eq!(stand_in.hits(), 6);
+        }
     }
 
     #[tokio::test]
     async fn an_unavailable_control_plane_fails_the_lookup_with_503() {
-        let stand_in =
-            StandIn::start(Arc::new(|_, _| (StatusCode::BAD_GATEWAY, "{}".to_string()))).await;
+        let stand_in = stand_in(Arc::new(|_, _| (StatusCode::BAD_GATEWAY, "{}".to_string()))).await;
         for platform in [false, true] {
             let app = router(Some(stand_in.client()), platform);
             let (status, body) = lookup(app, OWNER, "req-7c1").await;

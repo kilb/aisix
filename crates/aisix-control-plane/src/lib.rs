@@ -78,6 +78,10 @@ pub struct AppState {
     /// The price book every stored usage event is priced from, reloaded when
     /// a price write moves `pricing_version`.
     pub prices: Arc<PriceBookCache>,
+    /// The pool the gateway lookups (`/dp/v1/keys/*`) run on, of its own so
+    /// they never take the connections usage intake needs
+    /// ([`billing::access::LOOKUP_POOL_SIZE`]).
+    pub lookups: Db,
 }
 
 /// A booted control plane. Dropping it stops everything it runs.
@@ -258,6 +262,10 @@ where
     } else {
         ListenerState::CaExpired
     };
+    let lookups = db.dedicated_within(
+        billing::access::LOOKUP_POOL_SIZE,
+        billing::access::LOOKUP_ACQUIRE_TIMEOUT,
+    );
     let state = AppState {
         db,
         env,
@@ -271,6 +279,7 @@ where
         dp_listener,
         telemetry_bodies: Arc::new(Semaphore::new(dp::telemetry::MAX_BODIES_IN_FLIGHT)),
         prices: Arc::new(PriceBookCache::new(catalogue)),
+        lookups,
     };
 
     // Nothing fails from here on, so nothing spawned below is left behind

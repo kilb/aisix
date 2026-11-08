@@ -183,17 +183,33 @@ function CreditLimit({ account, canEdit, onChanged }: RegionProps) {
 
 // ── date range and period controls ──────────────────────────────────────────
 
-/** The two date fields: whole UTC days, inclusive at both ends. */
-function useDays() {
+/** The longest span the backend sums, by period (billing/range.rs). */
+const MAX_SUMMARY_DAYS = { day: 92, month: 731 } as const;
+
+/**
+ * The two date fields: whole UTC days, inclusive at both ends. `group` is set for a summary,
+ * whose span the backend caps: a range it would refuse is refused here, with its reason, so
+ * 重试 never resends the same refused query.
+ */
+function useDays(group?: "day" | "month") {
   const [from, setFrom] = useState("");
   const [to, setTo] = useState("");
-  const backwards = from !== "" && to !== "" && to < from;
+  let problem: string | null = null;
+  if (from !== "" && to !== "" && to < from) problem = "结束日期不能早于开始日期";
+  else if (from !== "" && to === "" && from > todayUtc()) problem = "开始日期不能晚于今天";
+  else if (group) {
+    const range = summaryRange(group, from, to);
+    const span = (Date.parse(range.to) - Date.parse(range.from)) / 86_400_000;
+    if (span <= 0) problem = "结束日期须晚于开始日期";
+    else if (span > MAX_SUMMARY_DAYS[group]) problem = "按天最多汇总 92 天，按月最多 731 天，请缩短日期范围。";
+  }
+  const backwards = problem !== null;
   const fields = (
     <>
       <Field label="开始日期（UTC）">
         <input type="date" value={from} onChange={(e) => setFrom(e.target.value)} />
       </Field>
-      <Field label="结束日期（UTC）" error={backwards ? "结束日期不能早于开始日期" : null}>
+      <Field label="结束日期（UTC）" error={problem}>
         {(aria) => <input type="date" value={to} onChange={(e) => setTo(e.target.value)} {...aria} />}
       </Field>
     </>
@@ -353,8 +369,8 @@ function Summary<T>({
   load: (q: { group: "day" | "month"; from: string; to: string }) => Promise<T[]>;
   render: (rows: T[], group: "day" | "month") => ReactNode;
 }) {
-  const days = useDays();
   const [group, setGroup] = useState<"day" | "month">("day");
+  const days = useDays(group);
   const rows = useLoad(
     () => (days.backwards ? Promise.resolve(null) : load({ group, ...summaryRange(group, days.from, days.to) })),
     [tenantId, stamp, group, days.from, days.to, days.backwards],

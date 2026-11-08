@@ -26,10 +26,12 @@
 //!   read: no provider, upstream model, cost price, error code or upstream
 //!   status or text.
 //!
-//! This is a lookup on its own route: it never touches model traffic. Its
-//! statements run under [`LOOKUP_STATEMENT_TIMEOUT_MS`], the time a gateway
-//! waits for it, so a slow lookup gives its pool connection back instead of
-//! holding one that usage intake shares; one that runs out answers `503`.
+//! This is a lookup on its own route: it never touches model traffic, and
+//! it runs on the gateway lookups' own pool (`access::LOOKUP_POOL_SIZE`), so
+//! it never takes a connection usage intake needs. Its statements run under
+//! [`LOOKUP_STATEMENT_TIMEOUT_MS`], the time a gateway waits for it, so a slow
+//! lookup gives its connection back to the other lookups; one that runs out
+//! answers `503`.
 
 use std::collections::BTreeMap;
 
@@ -299,7 +301,7 @@ pub async fn dp_requests(
     };
     let request_id = q.id.filter(|id| acceptable(id)).ok_or_else(refused_id)?;
     let found = state
-        .db
+        .lookups
         .tx(move |conn| {
             async move {
                 sqlx::query(&format!(

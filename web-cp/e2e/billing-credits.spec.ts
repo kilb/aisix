@@ -134,3 +134,39 @@ test("非管理员看不到直接入账", async ({ page }) => {
     await page.context().clearCookies();
   }
 });
+
+test("入账请求没有得到回答时，表单锁定，关闭面板后重开仍然锁定", async ({ page, context }) => {
+  const world = await seedTenant(stack, { mode: "prepaid", creditUsd: "0" });
+  await login(page);
+  let panel = await openPanel(page, world);
+  let form = credit(panel);
+  await form.getByLabel("金额（美元）").fill("0.06");
+  await form.getByLabel("原因").fill("未知-ui-7c3");
+  await form.getByRole("button", { name: "入账", exact: true }).click();
+  // The browser loses its connection: the request never gets an answer.
+  await context.setOffline(true);
+  await form.getByRole("button", { name: "确认入账" }).click();
+  await expect(form.getByRole("alert").filter({ hasText: "入账结果未知" })).toBeVisible();
+  await expect(form.getByRole("button", { name: /^(确认)?入账$/ })).toHaveCount(0);
+  await context.setOffline(false);
+
+  // Closing the panel must not hand a fresh, unlocked form back.
+  await panel.getByRole("button", { name: "关闭" }).click();
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+  panel = await openPanel(page, world);
+  form = credit(panel);
+  await expect(form.getByRole("alert").filter({ hasText: "入账结果未知" })).toBeVisible();
+  await expect(form.getByRole("button", { name: /^(确认)?入账$/ })).toHaveCount(0);
+  // The note says how to tell a platform credit from an approved tenant top-up.
+  await expect(form.getByRole("alert")).toContainText("平台入账");
+  expect(await topups(world)).toHaveLength(0);
+
+  // Once the operator has checked, the form starts over and credits again.
+  await form.getByRole("button", { name: "我已确认，重新填写" }).click();
+  await form.getByLabel("金额（美元）").fill("0.06");
+  await form.getByLabel("原因").fill("未知-ui-7c3");
+  await form.getByRole("button", { name: "入账", exact: true }).click();
+  await form.getByRole("button", { name: "确认入账" }).click();
+  await expect(page.getByText("已入账", { exact: true })).toBeVisible();
+  expect(await topups(world)).toHaveLength(1);
+});

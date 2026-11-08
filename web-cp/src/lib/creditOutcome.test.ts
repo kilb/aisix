@@ -25,6 +25,12 @@ test("a definite 4xx refusal: not an unknown outcome", async () => {
   assert.equal((await sendCredit(fail({ status: 403, code: "forbidden" }))).kind, "refused");
 });
 
+test("a 2xx answer that is not JSON: the credit outcome is unknown", async () => {
+  // The request was stored (201) but an intermediary answered with a body the client could not parse.
+  assert.equal((await sendCredit(fail({ status: 201, code: "bad_response" }))).kind, "unknown");
+  assert.equal((await sendCredit(fail({ status: 413, code: "bad_response" }))).kind, "unknown");
+});
+
 test("success", async () => {
   assert.deepEqual(await sendCredit(() => Promise.resolve(7)), { kind: "done", value: 7 });
 });

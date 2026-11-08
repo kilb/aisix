@@ -22,19 +22,32 @@ function check(amount: string, reason: string): Problems {
   return problems;
 }
 
+/**
+ * Tenants whose last credit ended with an unknown outcome, kept outside the form so closing
+ * the panel (or opening another tenant) does not hand a fresh, unlocked form back. It lives
+ * for this page load only; a reload starts clean, as the operator then reads the ledger anyway.
+ */
+const unknownCredits = new Set<string>();
+
 function Form({ account, onChanged }: RegionProps) {
   const toast = useToast();
   const [amount, setAmount] = useState("");
   const [reason, setReason] = useState("");
   const [reference, setReference] = useState("");
   const [busy, setBusy] = useState(false);
-  // 同步的重入保护：状态更新前的第二次确认也进不来
+  // Synchronous re-entry guard: a second confirm before the state update cannot get in.
   const inFlight = useRef(false);
   const [local, setLocal] = useState<Problems>({});
   const [refused, setRefused] = useState<ReturnType<typeof refusal> | null>(null);
   const [stale, setStale] = useState<string | null>(null);
-  // 请求可能已落库而应答丢了：表单保持锁定，直到操作员确认过并明确放弃。
-  const [unknown, setUnknown] = useState(false);
+  // The credit may have been stored while its answer was lost: the form stays locked until the operator has checked and starts over.
+  const [unknown, setUnknownState] = useState(() => unknownCredits.has(account.tenant_id));
+  const setUnknown = (on: boolean) => {
+    if (on) unknownCredits.add(account.tenant_id);
+    else unknownCredits.delete(account.tenant_id);
+    // A no-op when the panel was closed before the answer came; the lock above still holds.
+    setUnknownState(on);
+  };
   const [checking, setChecking] = useState(false);
   const [form, focusRefusal] = useRefusalFocus<HTMLFormElement>();
 
@@ -90,13 +103,13 @@ function Form({ account, onChanged }: RegionProps) {
     }
   }
 
-  /** 重新读取余额：入账若已落库，余额变化会让流水区重新加载。 */
+  /** Reads the balance again: if the credit was stored, the balance change reloads the ledger region. */
   async function recheck() {
     setChecking(true);
     try {
       onChanged(await billing.account(account.tenant_id));
     } catch {
-      // 读取失败时保持原样，操作员可以再点一次。
+      // A failed read leaves everything as it was; the operator can click again.
     } finally {
       setChecking(false);
     }
@@ -141,7 +154,7 @@ function Form({ account, onChanged }: RegionProps) {
       </form>
       {unknown && (
         <div className="note crit" role="alert">
-          入账结果未知：请先在该租户的充值记录中确认是否已入账，再决定是否重试。本面板的「余额流水」里类型为「充值」的条目就是入账记录。
+          入账结果未知：请先在「计费 · 充值审批」中把状态选为「已批准」、来源选为「平台入账」，按租户、原因与凭证号确认这笔入账是否已记录，再决定是否重试。本面板「余额流水」里的「充值」条目不分租户申请的充值与平台入账，不能据此判断。
           <div className="bl-row-actions">
             <Button type="button" size="sm" busy={checking} busyLabel="刷新中…" onClick={() => void recheck()}>
               刷新余额与流水

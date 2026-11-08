@@ -168,3 +168,28 @@ test("只读运维看不到修改额度", async ({ page }) => {
   await expect(panel.getByRole("button", { name: "保存" })).toHaveCount(0);
   await expect(panel.getByLabel("信用额度（美元）")).toHaveCount(0);
 });
+
+test("按期汇总：后端会拒绝的日期范围在本地说明原因，不发出请求", async ({ page }) => {
+  const world = await seedTenant(stack, { mode: "prepaid", creditUsd: "0" });
+  await login(page);
+  await accountRow(page, world).getByRole("button", { name: world.tenantName }).click();
+  const periods = region(page, "按期汇总");
+  await expect(periods.getByRole("alert")).toHaveCount(0);
+
+  // 按天 over 92 days is refused by the backend, so it is never asked.
+  let asked = 0;
+  page.on("request", (r) => {
+    if (r.url().includes("/summary?")) asked += 1;
+  });
+  await periods.getByLabel("开始日期（UTC）").fill("2020-01-01");
+  await expect(periods.getByText("按天最多汇总 92 天，按月最多 731 天，请缩短日期范围。")).toBeVisible();
+  await expect(periods.getByRole("button", { name: "重试" })).toHaveCount(0);
+  await expect(periods.getByText("提交的内容未通过校验")).toHaveCount(0);
+
+  // A start date after today, with no end date.
+  const tomorrow = new Date(Date.now() + 2 * 86_400_000).toISOString().slice(0, 10);
+  await periods.getByLabel("开始日期（UTC）").fill(tomorrow);
+  await expect(periods.getByText("开始日期不能晚于今天")).toBeVisible();
+  await expect(periods.getByRole("button", { name: "重试" })).toHaveCount(0);
+  expect(asked).toBe(0);
+});

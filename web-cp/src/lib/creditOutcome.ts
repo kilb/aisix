@@ -6,10 +6,11 @@
  * loads directly under node:test.
  */
 export function isUnknownOutcome(e: unknown): boolean {
-  const status = typeof e === "object" && e !== null ? (e as { status?: unknown }).status : undefined;
-  // Not an ApiError (a network-layer exception, a parse failure): unknown whether the request reached the backend.
-  if (typeof status !== "number") return true;
-  return status === 0 || status >= 500;
+  const answer = typeof e === "object" && e !== null ? (e as { status?: unknown; code?: unknown }) : {};
+  // Only the control plane's own 4xx answer proves nothing was stored. Anything else (a network failure,
+  // a 5xx, a 2xx whose body was not JSON, a proxy's 4xx page) leaves it unknown whether the request landed.
+  const status = typeof answer.status === "number" ? answer.status : 0;
+  return !(status >= 400 && status < 500 && typeof answer.code === "string" && answer.code !== "bad_response");
 }
 
 export type CreditOutcome<T> = { kind: "done"; value: T } | { kind: "refused"; error: unknown } | { kind: "unknown"; error: unknown };
