@@ -1455,8 +1455,9 @@ describe("platform mode e2e: a response id continues only for the tenant it was 
     expectNoUpstreamIds(next.text, "resp_bdrk_t02");
     expect(next.text).not.toContain("resp_bdrk_t01");
 
-    // The upstream itself no longer has the response: the owner is told so
-    // in the very words a tenant who was never handed the id is told.
+    // The upstream itself no longer has the response: its own answer, a
+    // request error, reaches the owner as the upstream sent it, with the code
+    // clients handle by resending their history.
     const forgotten = await postAs(TENANT_KEYS.a, "/v1/responses", {
       model,
       input: "and the day after?",
@@ -1465,8 +1466,12 @@ describe("platform mode e2e: a response id continues only for the tenant it was 
     expect(upstream.receivedRequests).toHaveLength(3);
     expect(upstreamBody(upstream, 2).previous_response_id).toBe("resp_bdrk_t01");
     expect(forgotten.status, forgotten.text).toBe(400);
-    expect(forgotten.text).toBe((await unknownResponseAnswer(TENANT_KEYS.a, model)).text);
-    expect(forgotten.text).not.toContain("resp_bdrk_t01");
+    expect(JSON.parse(forgotten.text).error).toEqual({
+      message: "Previous response with id 'resp_bdrk_t01' not found.",
+      type: "invalid_request_error",
+      param: "previous_response_id",
+      code: "previous_response_not_found",
+    });
   });
 
   test("a streamed answer's id: one id on every frame, and it continues only for its tenant", async (ctx) => {
