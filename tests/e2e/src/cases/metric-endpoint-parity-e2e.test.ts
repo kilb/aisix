@@ -408,6 +408,9 @@ describe("every proxy route emits every per-request metric family", () => {
   const ROWS: Row[] = [
     { route: "/v1/models", name: "GET /v1/models", endpoint: "/v1/models", families: [...REQUEST], drive: async () => void (await expectCall("/v1/models")) },
     { route: "/v1/models/:id", name: "GET /v1/models/:id", endpoint: "/v1/models/:id", families: [...REQUEST], drive: async () => void (await expectCall("/v1/models/par-chat")) },
+    // The caller's own key, from the control plane; with none (this gateway
+    // reads etcd directly) it answers 404 — still a request.
+    { route: "/v1/key", name: "GET /v1/key", endpoint: "/v1/key", families: [...REQUEST], drive: async () => void (await expectCall("/v1/key", {}, 404)) },
     {
       route: "/v1/chat/completions",
       name: "chat",
@@ -851,6 +854,7 @@ describe("every proxy route emits every per-request metric family", () => {
   const AUTH_ROUTES: Array<[string, string, string]> = [
     ["GET", "/v1/models", "/v1/models"],
     ["GET", "/v1/models/x", "/v1/models/:id"],
+    ["GET", "/v1/key", "/v1/key"],
     ["POST", "/v1/chat/completions", "/v1/chat/completions"],
     ["POST", "/v1/completions", "/v1/completions"],
     ["POST", "/v1/embeddings", "/v1/embeddings"],
