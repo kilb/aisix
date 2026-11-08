@@ -51,6 +51,24 @@
 //! only correct over a total order that does not shift between pages. A
 //! total order also needs distinct ids, which is why the name list is
 //! deduplicated: two model rows may carry the same `display_name`.
+//!
+//! ## Prices, in platform mode
+//!
+//! In platform mode, with a control plane to ask, each model the caller's
+//! tenant has a price for carries `pricing`: `input`, `output` and, when the
+//! price has them, `input_cache_read`, `input_cache_write` and
+//! `input_cache_write_1h`, in USD per token as the control plane's exact
+//! decimal strings ([`crate::account::prices`]), in both shapes and on both
+//! routes. The field names follow the hosted gateways' listings, which carry
+//! the same per-token prices as strings. A price is found by the listed
+//! row's resource id: it keys on the entry the caller addresses, whatever
+//! its kind (a direct model, an embedding model, or a routing, semantic or
+//! ensemble alias, each priced as itself; a wildcard alias is never listed).
+//! A model without a price, or a listing whose prices the control plane did
+//! not give in time, is listed exactly as it is without platform mode's
+//! prices; with platform mode off nothing is asked and nothing changes.
+
+use std::sync::Arc;
 
 use axum::extract::{Query, State};
 use axum::http::HeaderMap;
@@ -58,6 +76,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Serialize;
 
+use crate::account::prices::{ModelPricing, TenantPricesAnswer};
 use crate::auth::AuthenticatedKey;
 use crate::error::ProxyError;
 use crate::state::ProxyState;
@@ -102,6 +121,9 @@ pub struct ModelObject {
     pub object: &'static str,
     pub created: i64,
     pub owned_by: String,
+    /// The caller's tenant's price, in platform mode only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pricing: Option<ModelPricing>,
 }
 
 /// OpenAI-style list envelope.
@@ -128,6 +150,9 @@ pub struct AnthropicModelObject {
     pub capabilities: Option<()>,
     pub max_input_tokens: Option<u32>,
     pub max_tokens: Option<u32>,
+    /// The caller's tenant's price, in platform mode only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pricing: Option<ModelPricing>,
 }
 
 /// Anthropic's paginated list envelope.
@@ -244,16 +269,26 @@ fn owned_by(snapshot: &aisix_core::AisixSnapshot, name: &str, platform: bool) ->
         .unwrap_or_else(|| "aisix".to_string())
 }
 
-fn openai_model(snapshot: &aisix_core::AisixSnapshot, name: &str, platform: bool) -> ModelObject {
+fn openai_model(
+    snapshot: &aisix_core::AisixSnapshot,
+    name: &str,
+    platform: bool,
+    prices: Option<&TenantPricesAnswer>,
+) -> ModelObject {
     ModelObject {
         id: name.to_string(),
         object: "model",
         created: UNKNOWN_CREATED_UNIX,
         owned_by: owned_by(snapshot, name, platform),
+        pricing: pricing(snapshot, name, prices),
     }
 }
 
-fn anthropic_model(name: &str) -> AnthropicModelObject {
+fn anthropic_model(
+    snapshot: &aisix_core::AisixSnapshot,
+    name: &str,
+    prices: Option<&TenantPricesAnswer>,
+) -> AnthropicModelObject {
     AnthropicModelObject {
         id: name.to_string(),
         kind: "model",
@@ -264,7 +299,34 @@ fn anthropic_model(name: &str) -> AnthropicModelObject {
         capabilities: None,
         max_input_tokens: None,
         max_tokens: None,
+        pricing: pricing(snapshot, name, prices),
     }
+}
+
+/// The caller's tenant's prices, in platform mode with a control plane to
+/// ask; `None` otherwise, without asking. Never fails the listing, and never
+/// holds it much past [`crate::account::prices::PRICES_TIMEOUT`].
+async fn tenant_prices(
+    state: &ProxyState,
+    auth: &AuthenticatedKey,
+) -> Option<Arc<TenantPricesAnswer>> {
+    state.platform()?;
+    let account = state.account.as_deref()?;
+    account
+        .tenant_prices(&crate::platform::tenant_owner(auth), &auth.entry.id)
+        .await
+}
+
+/// The listed model `name`'s price, by the resource id of the row that name
+/// lists.
+fn pricing(
+    snapshot: &aisix_core::AisixSnapshot,
+    name: &str,
+    prices: Option<&TenantPricesAnswer>,
+) -> Option<ModelPricing> {
+    let prices = prices?;
+    let row = snapshot.models.get_by_name(name)?;
+    prices.price_of(&row.id).cloned()
 }
 
 /// Apply Anthropic's cursor pagination to the sorted name list.
@@ -334,7 +396,7 @@ pub async fn list_models(
     Query(raw): Query<std::collections::HashMap<String, String>>,
 ) -> Response {
     let started = std::time::Instant::now();
-    let response = model_list(&state, &auth, &headers, &raw);
+    let response = model_list(&state, &auth, &headers, &raw).await;
     record_discovery(
         &state,
         &auth,
@@ -347,7 +409,7 @@ pub async fn list_models(
     response
 }
 
-fn model_list(
+async fn model_list(
     state: &ProxyState,
     auth: &AuthenticatedKey,
     headers: &HeaderMap,
@@ -357,6 +419,8 @@ fn model_list(
         Ok(p) => p,
         Err(e) => return dialect_error(headers, e),
     };
+    let prices = tenant_prices(state, auth).await;
+    let prices = prices.as_deref();
     let snapshot = state.snapshot.load();
     let names = permitted_model_names(&snapshot, auth);
 
@@ -367,7 +431,7 @@ fn model_list(
             object: "list",
             data: names
                 .iter()
-                .map(|n| openai_model(&snapshot, n, state.platform().is_some()))
+                .map(|n| openai_model(&snapshot, n, state.platform().is_some(), prices))
                 .collect(),
         })
         .into_response();
@@ -377,7 +441,10 @@ fn model_list(
     Json(AnthropicModelList {
         first_id: page.first().cloned(),
         last_id: page.last().cloned(),
-        data: page.iter().map(|n| anthropic_model(n)).collect(),
+        data: page
+            .iter()
+            .map(|n| anthropic_model(&snapshot, n, prices))
+            .collect(),
         has_more,
     })
     .into_response()
@@ -400,7 +467,7 @@ pub async fn get_model(
     crate::reject::AisixPath(id): crate::reject::AisixPath<String>,
 ) -> Response {
     let started = std::time::Instant::now();
-    let response = model_retrieve(&state, &auth, &headers, id);
+    let response = model_retrieve(&state, &auth, &headers, id).await;
     record_discovery(
         &state,
         &auth,
@@ -413,7 +480,7 @@ pub async fn get_model(
     response
 }
 
-fn model_retrieve(
+async fn model_retrieve(
     state: &ProxyState,
     auth: &AuthenticatedKey,
     headers: &HeaderMap,
@@ -428,10 +495,20 @@ fn model_retrieve(
         return dialect_error(headers, ProxyError::ModelNotFound(id));
     }
 
+    // Asked only for a model the caller may see, so a missing and a
+    // forbidden model still answer alike, in the same time.
+    let prices = tenant_prices(state, auth).await;
+    let prices = prices.as_deref();
     if wants_anthropic_shape(headers) {
-        Json(anthropic_model(&id)).into_response()
+        Json(anthropic_model(&snapshot, &id, prices)).into_response()
     } else {
-        Json(openai_model(&snapshot, &id, state.platform().is_some())).into_response()
+        Json(openai_model(
+            &snapshot,
+            &id,
+            state.platform().is_some(),
+            prices,
+        ))
+        .into_response()
     }
 }
 
@@ -444,9 +521,16 @@ mod tests {
     use aisix_gateway::Hub;
     use aisix_provider_openai::OpenAiBridge;
     use axum::body::to_bytes;
-    use axum::http::{Request, StatusCode};
+    use axum::http::{HeaderMap, Request, StatusCode};
     use axum::Router;
+    use serde_json::{json, Value};
+    use std::collections::HashMap;
     use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use crate::account::prices::stand_in::PricesStandIn;
+    use crate::account::prices::{PRICES_FAILURE_TTL, PRICES_TIMEOUT};
+    use crate::account::AccountClient;
 
     fn cfg() -> ProxyConfig {
         ProxyConfig {
@@ -1260,5 +1344,268 @@ mod tests {
             get("sk-caller", "/v1/models/panel".into()).await.0,
             StatusCode::OK
         );
+    }
+
+    // ── prices, in platform mode ────────────────────────────────────────────
+
+    /// Two models' resource ids, as the control plane names them.
+    const M1: &str = "0b3e8a2c-5d41-4f6e-9a7b-1c2d3e4f5a61";
+    const M2: &str = "0b3e8a2c-5d41-4f6e-9a7b-1c2d3e4f5a62";
+
+    /// A key of `team` (none for a key of no team), seeing every model.
+    fn tenant_key(id: &str, plaintext: &str, team: Option<&str>) -> ResourceEntry<ApiKey> {
+        let key: ApiKey = serde_json::from_value(json!({
+            "key_hash": ApiKey::hash_bearer(plaintext),
+            "allowed_models": ["*"],
+            "team_id": team,
+        }))
+        .unwrap();
+        ResourceEntry::new(id, key, 1)
+    }
+
+    /// `chat-1` (M1) and `chat-2` (M2), and two keys of tenant A.
+    fn priced_snap() -> AisixSnapshot {
+        let snap = new_snap();
+        snap.models.insert(model_entry(M1, "chat-1"));
+        snap.models.insert(model_entry(M2, "chat-2"));
+        snap.apikeys
+            .insert(tenant_key("key-a1", "sk-a1", Some("tenant-a")));
+        snap.apikeys
+            .insert(tenant_key("key-a2", "sk-a2", Some("tenant-a")));
+        snap
+    }
+
+    fn app_with(platform: bool, account: Option<AccountClient>) -> Router {
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let handle = SnapshotHandle::new(priced_snap());
+        let mut state = crate::ProxyState::new(handle, hub, &cfg()).without_cache();
+        if platform {
+            state = state.with_platform(crate::platform::PlatformSettings::from_secret("s"));
+        }
+        if let Some(account) = account {
+            state = state.with_account(Arc::new(account));
+        }
+        crate::build_router(state)
+    }
+
+    struct Answer {
+        status: StatusCode,
+        /// Every header but the request id, which is new on every request.
+        headers: HeaderMap,
+        body: Vec<u8>,
+    }
+
+    impl Answer {
+        fn json(&self) -> Value {
+            serde_json::from_slice(&self.body).unwrap()
+        }
+    }
+
+    async fn get(app: &Router, uri: &str, bearer: &str, anthropic: bool) -> Answer {
+        let mut req = Request::builder()
+            .method("GET")
+            .uri(uri)
+            .header("authorization", format!("Bearer {bearer}"));
+        if anthropic {
+            req = req.header("anthropic-version", "2023-06-01");
+        }
+        let req = req.body(axum::body::Body::empty()).unwrap();
+        let resp = tower::ServiceExt::oneshot(app.clone(), req).await.unwrap();
+        let status = resp.status();
+        let mut headers = resp.headers().clone();
+        headers.remove("x-aisix-request-id");
+        let body = to_bytes(resp.into_body(), 65536).await.unwrap().to_vec();
+        Answer {
+            status,
+            headers,
+            body,
+        }
+    }
+
+    fn ok(body: Value) -> (StatusCode, String) {
+        (StatusCode::OK, body.to_string())
+    }
+
+    /// Tenant A's prices: M1 only.
+    fn m1_priced() -> Value {
+        json!({
+            "tenant_id": "tenant-a",
+            "pricing_version": 7,
+            "valid_until": null,
+            "models": [{"model_id": M1, "input": "0.000006", "output": "0.00002"}],
+        })
+    }
+
+    /// The listed model `id` of a listing in either shape.
+    fn listed<'a>(listing: &'a Value, id: &str) -> &'a Value {
+        listing["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["id"] == id)
+            .unwrap_or_else(|| panic!("{id} is not listed: {listing}"))
+    }
+
+    #[tokio::test]
+    async fn the_listing_without_platform_mode_is_unchanged() {
+        let stand_in = PricesStandIn::start(Arc::new(|_| ok(m1_priced()))).await;
+        let with = app_with(false, Some(stand_in.client()));
+        let without = app_with(false, None);
+        for (uri, anthropic) in [
+            ("/v1/models", false),
+            ("/v1/models", true),
+            ("/v1/models/chat-1", false),
+            ("/v1/models/chat-1", true),
+        ] {
+            let a = get(&with, uri, "sk-a1", anthropic).await;
+            let b = get(&without, uri, "sk-a1", anthropic).await;
+            assert_eq!(a.status, StatusCode::OK, "{uri}");
+            assert_eq!(a.status, b.status, "{uri}");
+            assert_eq!(a.headers, b.headers, "{uri}");
+            assert_eq!(a.body, b.body, "{uri}");
+            let text = String::from_utf8(a.body).unwrap();
+            assert!(!text.contains("pricing"), "{uri}: {text}");
+        }
+        assert_eq!(stand_in.hits(), 0, "nothing is asked off platform mode");
+    }
+
+    #[tokio::test]
+    async fn a_platform_listing_carries_each_models_price() {
+        let stand_in = PricesStandIn::start(Arc::new(|_| ok(m1_priced()))).await;
+        let app = app_with(true, Some(stand_in.client()));
+        let answer = get(&app, "/v1/models", "sk-a1", false).await;
+        assert_eq!(answer.status, StatusCode::OK);
+        let mut listing = answer.json();
+        assert_eq!(
+            listed(&listing, "chat-1")["pricing"],
+            json!({"input": "0.000006", "output": "0.00002"})
+        );
+        assert!(
+            listed(&listing, "chat-2").get("pricing").is_none(),
+            "{listing}"
+        );
+
+        // Everything else is what a platform listing without prices says.
+        let plain = get(&app_with(true, None), "/v1/models", "sk-a1", false).await;
+        assert_eq!(answer.headers, plain.headers);
+        for model in listing["data"].as_array_mut().unwrap() {
+            model.as_object_mut().unwrap().remove("pricing");
+        }
+        assert_eq!(listing, plain.json());
+
+        // The Anthropic shape carries the same price.
+        let anthropic = get(&app, "/v1/models", "sk-a1", true).await.json();
+        assert_eq!(
+            listed(&anthropic, "chat-1")["pricing"],
+            json!({"input": "0.000006", "output": "0.00002"})
+        );
+        assert!(listed(&anthropic, "chat-2").get("pricing").is_none());
+
+        // Asked once, with the caller's own key.
+        let paths = stand_in.paths.lock().unwrap().clone();
+        assert_eq!(
+            paths,
+            HashMap::from([("/dp/v1/keys/key-a1/prices".to_string(), 1)])
+        );
+    }
+
+    #[tokio::test]
+    async fn a_slow_control_plane_never_holds_the_listing() {
+        let stand_in =
+            PricesStandIn::start_with_delay(Arc::new(|_| ok(m1_priced())), Duration::from_secs(3))
+                .await;
+        let app = app_with(true, Some(stand_in.client()));
+
+        let started = Instant::now();
+        let answer = get(&app, "/v1/models", "sk-a1", false).await;
+        let waited = started.elapsed();
+        assert_eq!(answer.status, StatusCode::OK);
+        assert!(
+            waited < PRICES_TIMEOUT + Duration::from_millis(200),
+            "the listing waited {waited:?}"
+        );
+        let listing = answer.json();
+        assert_eq!(listing["data"].as_array().unwrap().len(), 2);
+        assert!(
+            !String::from_utf8(answer.body).unwrap().contains("pricing"),
+            "{listing}"
+        );
+        assert_eq!(stand_in.hits(), 1);
+
+        // Within PRICES_FAILURE_TTL the tenant is listed without asking.
+        let started = Instant::now();
+        let again = get(&app, "/v1/models", "sk-a2", false).await;
+        assert_eq!(again.status, StatusCode::OK);
+        assert!(started.elapsed() < PRICES_FAILURE_TTL);
+        assert!(!String::from_utf8(again.body).unwrap().contains("pricing"));
+        assert_eq!(
+            stand_in.hits(),
+            1,
+            "a second listing within 2 s asks nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn prices_are_cached_per_tenant_until_valid_until() {
+        // Every answer says the prices change one second from now.
+        let stand_in = PricesStandIn::start(Arc::new(|_| {
+            let mut body = m1_priced();
+            body["valid_until"] = json!(chrono::Utc::now() + chrono::Duration::seconds(1));
+            ok(body)
+        }))
+        .await;
+        let app = app_with(true, Some(stand_in.client()));
+        for key in ["sk-a1", "sk-a2"] {
+            let listing = get(&app, "/v1/models", key, false).await.json();
+            assert_eq!(listed(&listing, "chat-1")["pricing"]["input"], "0.000006");
+        }
+        assert_eq!(stand_in.hits(), 1, "two keys of one tenant share its entry");
+
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        let listing = get(&app, "/v1/models", "sk-a2", false).await.json();
+        assert_eq!(listed(&listing, "chat-1")["pricing"]["input"], "0.000006");
+        assert_eq!(
+            stand_in.hits(),
+            2,
+            "past valid_until the tenant is asked again"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_single_model_route_carries_the_same_pricing() {
+        let stand_in = PricesStandIn::start(Arc::new(|_| {
+            ok(json!({"models": [{
+                "model_id": M1,
+                "input": "0.000006",
+                "output": "0.00002",
+                "input_cache_read": "0.0000006",
+                "input_cache_write": "0.0000075",
+                "input_cache_write_1h": "0.000012",
+            }]}))
+        }))
+        .await;
+        let app = app_with(true, Some(stand_in.client()));
+        let listing = get(&app, "/v1/models", "sk-a1", false).await.json();
+        let expected = json!({
+            "input": "0.000006",
+            "output": "0.00002",
+            "input_cache_read": "0.0000006",
+            "input_cache_write": "0.0000075",
+            "input_cache_write_1h": "0.000012",
+        });
+        assert_eq!(listed(&listing, "chat-1")["pricing"], expected);
+
+        for anthropic in [false, true] {
+            let one = get(&app, "/v1/models/chat-1", "sk-a1", anthropic).await;
+            assert_eq!(one.status, StatusCode::OK);
+            assert_eq!(one.json()["pricing"], expected, "anthropic: {anthropic}");
+            let other = get(&app, "/v1/models/chat-2", "sk-a1", anthropic).await;
+            assert_eq!(other.status, StatusCode::OK);
+            assert!(
+                other.json().get("pricing").is_none(),
+                "anthropic: {anthropic}"
+            );
+        }
     }
 }

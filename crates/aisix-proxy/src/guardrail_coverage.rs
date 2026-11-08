@@ -66,7 +66,9 @@ pub(crate) const POSTURE: &[(&str, Posture)] = &[
     ("/readyz", Posture::NoUpstreamContent("readiness probe")),
     (
         "/v1/models",
-        Posture::NoUpstreamContent("lists the gateway's own snapshot; contacts no upstream"),
+        Posture::NoUpstreamContent(
+            "lists the gateway's own snapshot and, in platform mode, the tenant's prices from the control plane; contacts no upstream",
+        ),
     ),
     (
         "/v1/models/:id",

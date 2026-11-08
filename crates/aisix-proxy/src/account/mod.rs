@@ -17,6 +17,11 @@
 //! gateway with no certificate bundle) there is no client, and every lookup
 //! answers `404`.
 //!
+//! The tenant prices of the model listing ([`prices`]) are the exception to
+//! the `503` and the `404`: they decorate a route that answers without them,
+//! so a fetch has a shorter deadline of its own and no answer leaves the
+//! listing as it is without them.
+//!
 //! Every answer decodes loosely: the control plane may be many releases newer
 //! than this gateway, so no answer type denies unknown fields, and every field
 //! but the one the lookup hinges on has a default. A route renders its own
@@ -24,6 +29,7 @@
 //! reaches no caller until the gateway names it.
 
 pub(crate) mod key;
+pub(crate) mod prices;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -84,6 +90,7 @@ pub struct AccountClient {
     /// The control plane's origin, as configured, without a trailing slash.
     base: String,
     quotas: key::QuotaCache,
+    prices: prices::PricesCache,
 }
 
 impl AccountClient {
@@ -95,6 +102,7 @@ impl AccountClient {
             http,
             base: cp_base_url.trim_end_matches('/').to_string(),
             quotas: key::quota_cache(),
+            prices: prices::prices_cache(),
         }
     }
 
