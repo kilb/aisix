@@ -31,6 +31,13 @@ use crate::AppState;
 const DEFAULT_LIMIT: i64 = 50;
 const MAX_LIMIT: i64 = 500;
 
+/// What a charge's recorded model id looks like when it is a model's id; the
+/// column is text and may hold anything else.
+const UUID_TEXT: &str = "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$";
+
+/// What a usage entry's model is called when nothing names it.
+const UNKNOWN_MODEL: &str = "未知模型";
+
 #[derive(Deserialize)]
 pub struct LedgerQuery {
     from: Option<DateTime<Utc>>,
@@ -95,7 +102,8 @@ async fn ledger_of(
                           AND c.requested_model_id = ANY(t.allowed_model_ids::text[])), \
                 u.event->>'requested_model', \
                 (SELECT r.doc->>'display_name' FROM gw_resources r \
-                  WHERE r.kind = $6 AND r.id::text = c.requested_model_id) \
+                  WHERE r.kind = $6 AND r.id = CASE WHEN c.requested_model_id ~ $8 \
+                        THEN c.requested_model_id::uuid END) \
          FROM billing_ledger l \
          LEFT JOIN pricing_charges c ON c.event_id = l.event_id \
          LEFT JOIN usage_events u ON u.event_id = l.event_id \
@@ -113,6 +121,7 @@ async fn ledger_of(
     .bind(q.before)
     .bind(Kind::Models.segment())
     .bind(limit + 1)
+    .bind(UUID_TEXT)
     .fetch_all(conn)
     .await
     .map_err(DbError::from)?;
@@ -139,10 +148,11 @@ async fn ledger_of(
                 // Only a usage entry has a model. Its id is shown while the
                 // tenant may still use the model.
                 let model = (kind == "usage").then(|| {
-                    let name = event_name
-                        .filter(|n| !n.is_empty())
-                        .or(current_name)
-                        .unwrap_or_default();
+                    let name = [event_name, current_name, model_id.clone()]
+                        .into_iter()
+                        .flatten()
+                        .find(|n| !n.is_empty())
+                        .unwrap_or_else(|| UNKNOWN_MODEL.to_string());
                     let id = model_id.filter(|_| granted == Some(true));
                     json!({ "id": id, "name": name })
                 });
@@ -181,9 +191,9 @@ async fn summary_of(
                 COALESCE(SUM(amount_micro_usd) FILTER (WHERE kind = 'usage'), 0)::bigint, \
                 COALESCE(SUM(amount_micro_usd) FILTER (WHERE kind = 'topup'), 0)::bigint, \
                 COALESCE(SUM(amount_micro_usd) FILTER (WHERE kind = 'adjustment'), 0)::bigint, \
-                (array_agg(balance_after_micro_usd ORDER BY seq DESC))[1] \
-         FROM billing_ledger \
-         WHERE tenant_id = $1 AND posted_at >= $2 AND posted_at < $3 \
+                (SELECT b.balance_after_micro_usd FROM billing_ledger b WHERE b.seq = MAX(l.seq)) \
+         FROM billing_ledger l \
+         WHERE l.tenant_id = $1 AND l.posted_at >= $2 AND l.posted_at < $3 \
          GROUP BY period ORDER BY period",
     )
     .bind(tenant)

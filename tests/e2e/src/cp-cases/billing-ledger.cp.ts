@@ -72,16 +72,23 @@ describe("a tenant reads its ledger and its daily totals", () => {
   });
 
   test("Today's summary adds them up", async () => {
-    const today = new Date();
-    today.setUTCHours(0, 0, 0, 0);
-    const from = today.toISOString();
-    const to = new Date(today.getTime() + 86_400_000).toISOString();
+    // The day the debits were posted on, read from the ledger itself, so a
+    // run across 00:00 UTC still asks for the right day.
+    const posted = await entries(2);
+    const day = new Date(posted[0].posted_at);
+    day.setUTCHours(0, 0, 0, 0);
+    const from = day.toISOString();
+    const to = new Date(day.getTime() + 86_400_000).toISOString();
     const res = await owner.get(`/api/billing/summary?group=day&from=${from}&to=${to}`);
     expect(res.status, res.text).toBe(200);
+    // Both debits are in the one period when they share a day; when the run
+    // crossed midnight the first day holds only the first, and the totals
+    // still have to match the entries of that day.
+    const sameDay = posted.filter((e) => Date.parse(e.posted_at) < day.getTime() + 86_400_000);
     expect(res.body.items).toHaveLength(1);
     const row = res.body.items[0];
-    expect(Date.parse(row.period_start)).toBe(today.getTime());
-    expect(row.usage_micro_usd).toBe(-2 * CALL_MICRO_USD);
-    expect(row.closing_balance_micro_usd).toBe(-2 * CALL_MICRO_USD);
+    expect(Date.parse(row.period_start)).toBe(day.getTime());
+    expect(row.usage_micro_usd).toBe(-sameDay.length * CALL_MICRO_USD);
+    expect(row.closing_balance_micro_usd).toBe(-sameDay.length * CALL_MICRO_USD);
   });
 });

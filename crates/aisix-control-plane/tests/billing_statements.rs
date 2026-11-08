@@ -411,3 +411,180 @@ async fn a_tenant_reads_only_its_own_entries() {
             .await;
     assert_eq!(r.body, json!({"items": [], "next_before": null}), "{r:?}");
 }
+
+fn at(rfc3339: &str) -> DateTime<Utc> {
+    DateTime::parse_from_rfc3339(rfc3339)
+        .expect("a time")
+        .with_timezone(&Utc)
+}
+
+/// Posts a top-up or an adjustment entry by raw INSERT. The foreign keys to
+/// top-ups and re-pricing runs are switched off for the transaction, since
+/// the tables behind them are not what these tests are about.
+async fn raw_entry(
+    pool: &PgPool,
+    tenant: Uuid,
+    kind: &str,
+    amount: i64,
+    balance_after: i64,
+    posted_at: DateTime<Utc>,
+) {
+    let mut tx = pool.begin().await.expect("begin");
+    sqlx::query("SET LOCAL session_replication_role = replica")
+        .execute(&mut *tx)
+        .await
+        .expect("relax the foreign keys");
+    sqlx::query(
+        "INSERT INTO billing_ledger (tenant_id, kind, amount_micro_usd, balance_after_micro_usd, \
+         topup_id, repricing_run_id, posted_at) \
+         VALUES ($1, $2, $3, $4, CASE WHEN $2 = 'topup' THEN gen_random_uuid() END, \
+                 CASE WHEN $2 = 'adjustment' THEN gen_random_uuid() END, $5)",
+    )
+    .bind(tenant)
+    .bind(kind)
+    .bind(amount)
+    .bind(balance_after)
+    .bind(posted_at)
+    .execute(&mut *tx)
+    .await
+    .expect("insert the entry");
+    tx.commit().await.expect("commit");
+}
+
+#[tokio::test]
+async fn a_month_cut_by_the_range_closes_at_its_last_entry_inside_it() {
+    let Some(w) = world().await else { return };
+    let pool = w.cp.db().pool();
+    raw_usage(
+        pool,
+        w.tenant,
+        "cut-a",
+        -100,
+        -100,
+        at("2026-01-10T12:00:00Z"),
+    )
+    .await;
+    raw_usage(
+        pool,
+        w.tenant,
+        "cut-b",
+        -200,
+        -300,
+        at("2026-01-20T12:00:00Z"),
+    )
+    .await;
+    raw_usage(
+        pool,
+        w.tenant,
+        "cut-c",
+        -50,
+        -350,
+        at("2026-01-25T12:00:00Z"),
+    )
+    .await;
+    let summary = |to: &str| {
+        let path = format!(
+            "/admin/tenants/{}/billing/summary?group=month&from=2026-01-01T00:00:00Z&to={to}",
+            w.tenant
+        );
+        let (cp, admin) = (&w.cp, &w.admin);
+        async move { cp.send("GET", &path, Some(admin.cookie()), None).await }
+    };
+    let r = summary("2026-01-22T00:00:00Z").await;
+    assert_eq!(r.status, 200, "{r:?}");
+    assert_eq!(r.body["items"].as_array().map(Vec::len), Some(1), "{r:?}");
+    assert_eq!(r.body["items"][0]["usage_micro_usd"], -300, "{r:?}");
+    assert_eq!(
+        r.body["items"][0]["closing_balance_micro_usd"], -300,
+        "{r:?}"
+    );
+    let r = summary("2026-02-01T00:00:00Z").await;
+    assert_eq!(r.body["items"][0]["usage_micro_usd"], -350, "{r:?}");
+    assert_eq!(
+        r.body["items"][0]["closing_balance_micro_usd"], -350,
+        "{r:?}"
+    );
+}
+
+#[tokio::test]
+async fn topups_and_adjustments_are_listed_and_summed_beside_usage() {
+    let Some(w) = world().await else { return };
+    let pool = w.cp.db().pool();
+    raw_usage(
+        pool,
+        w.tenant,
+        "mix-a",
+        -100,
+        -100,
+        at("2026-02-03T10:00:00Z"),
+    )
+    .await;
+    raw_entry(
+        pool,
+        w.tenant,
+        "topup",
+        500,
+        400,
+        at("2026-02-03T11:00:00Z"),
+    )
+    .await;
+    raw_entry(
+        pool,
+        w.tenant,
+        "adjustment",
+        -7,
+        393,
+        at("2026-02-03T12:00:00Z"),
+    )
+    .await;
+
+    let r = admin_ledger(&w, "?kind=topup").await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let item = &r.body["items"][0];
+    assert_eq!(item["kind"], "topup");
+    assert_eq!(item["model"], Value::Null);
+    assert!(
+        item["topup_id"].is_string() && item["event_id"].is_null(),
+        "{r:?}"
+    );
+    let r = admin_ledger(&w, "?kind=adjustment").await;
+    assert!(r.body["items"][0]["repricing_run_id"].is_string(), "{r:?}");
+    assert_eq!(r.body["items"][0]["model"], Value::Null);
+
+    // The usage entry names no model anywhere: it is never shown unnamed.
+    let r = admin_ledger(&w, "?kind=usage").await;
+    assert_eq!(
+        r.body["items"][0]["model"],
+        json!({"id": null, "name": "未知模型"}),
+        "{r:?}"
+    );
+
+    // A from/to window on the listing.
+    let r = admin_ledger(&w, "?from=2026-02-03T10:30:00Z&to=2026-02-03T11:30:00Z").await;
+    assert_eq!(r.body["items"].as_array().map(Vec::len), Some(1), "{r:?}");
+    assert_eq!(r.body["items"][0]["kind"], "topup");
+
+    let r =
+        w.cp.send(
+            "GET",
+            &format!(
+                "/admin/tenants/{}/billing/summary?group=day\
+                 &from=2026-02-01T00:00:00Z&to=2026-02-10T00:00:00Z",
+                w.tenant
+            ),
+            Some(w.admin.cookie()),
+            None,
+        )
+        .await;
+    assert_eq!(
+        r.body["items"],
+        json!([{
+            "period_start": "2026-02-03T00:00:00Z",
+            "usage_micro_usd": -100,
+            "topups_micro_usd": 500,
+            "adjustments_micro_usd": -7,
+            "closing_balance_micro_usd": 393,
+        }]),
+        "{r:?}"
+    );
+}
