@@ -38,3 +38,13 @@ export function problemAt(details: Detail[], at: (path: string) => boolean): str
   const messages = details.filter((d) => at(d.path)).map((d) => d.message);
   return messages.length > 0 ? messages.join("；") : null;
 }
+
+/** The Dashboard's text for each price-write warning code it knows; any other shows the backend's message. */
+const WARNING_TEXT: Record<string, string> = {
+  time_of_day_price: "该目录价是非高峰价，高峰时段请用加价覆盖",
+  superseded_later: "目录中该条目之后还有更新的价格，已一并写入",
+};
+
+export function warningText(code: string, message: string): string {
+  return WARNING_TEXT[code] ?? message;
+}

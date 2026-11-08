@@ -594,3 +594,102 @@ export const providerGroups = {
     return (await call<{ items: ProviderGroup[] }>("GET", "/admin/provider-groups")).data.items;
   },
 };
+
+// ── pricing ─────────────────────────────────────────────────────────────────
+
+/** Rates of one tier or band: decimal strings in USD per million units, at most 6 decimals. */
+export type RateMap = Record<string, string>;
+
+/** One tier of a price card: its base rates, and any further parts (long-context bands) as the API has them. */
+export interface TierRates {
+  base: RateMap;
+  [more: string]: unknown;
+}
+
+/** A price card: tiers by name; `default` is the one a request without a tier is priced at. */
+export type RateCard = Record<string, TierRates>;
+
+/** One sell price revision. A tenant override ended by a later revision has `card` null. */
+export interface SellRevision {
+  revision_id: number;
+  engine_version: number;
+  model_id: string;
+  tenant_id: string | null;
+  effective_from: string;
+  card: RateCard | null;
+  source: string;
+  created_by: string | null;
+  created_at: string;
+}
+
+/** Something to know about a price that was written all the same. */
+export interface PriceWarning {
+  code: string;
+  message: string;
+  revision_id?: number;
+  effective_from?: string;
+}
+
+/** The answer to a sell price write: the revision starting as asked, what to know about it, and the later revisions an import also wrote. */
+export type SellCreated = SellRevision & { warnings: PriceWarning[]; later_revisions: SellRevision[] };
+
+export interface CatalogueEntry {
+  key: string;
+  aliases: string[];
+  source_url: string | null;
+  as_of: string | null;
+  effective_from: string | null;
+  notes: string | null;
+  card: RateCard;
+}
+
+/** One model's platform price: in force now, and scheduled by ascending start. */
+export interface PriceRow {
+  model_id: string;
+  name: string;
+  current: SellRevision | null;
+  upcoming: SellRevision[];
+}
+
+/** What `POST /admin/pricing/sell` takes: exactly one of `card` and `catalogue_key`. */
+export interface NewSellPrice {
+  model_id: string;
+  tenant_id?: string;
+  effective_from: string;
+  card?: RateCard | null;
+  catalogue_key?: string;
+  markup_bps?: number;
+}
+
+export const pricing = {
+  async catalogue(): Promise<{ version: string | number; items: CatalogueEntry[] }> {
+    return (await call<{ version: string | number; items: CatalogueEntry[] }>("GET", "/admin/pricing/catalogue")).data;
+  },
+  /** Sell revisions, newest first; `before` is the previous page's `next_before`. */
+  async listSell(q: {
+    model_id?: string;
+    tenant_id?: string;
+    limit?: number;
+    before?: number;
+  }): Promise<{ items: SellRevision[]; next_before: number | null }> {
+    const params = new URLSearchParams();
+    if (q.model_id) params.set("model_id", q.model_id);
+    if (q.tenant_id) params.set("tenant_id", q.tenant_id);
+    if (q.limit !== undefined) params.set("limit", String(q.limit));
+    if (q.before !== undefined) params.set("before", String(q.before));
+    const query = params.toString();
+    return (
+      await call<{ items: SellRevision[]; next_before: number | null }>(
+        "GET",
+        `/admin/pricing/sell${query ? `?${query}` : ""}`,
+      )
+    ).data;
+  },
+  async createSell(body: NewSellPrice): Promise<SellCreated> {
+    return (await call<SellCreated>("POST", "/admin/pricing/sell", body)).data;
+  },
+  /** Every live model's platform price, the unpriced ones first. */
+  async models(): Promise<PriceRow[]> {
+    return (await call<{ items: PriceRow[] }>("GET", "/admin/pricing/models")).data.items;
+  },
+};
