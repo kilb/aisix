@@ -25,8 +25,8 @@
 //!
 //! Tenants and key overrides hold the group's name in a text array, and a
 //! provider key's document holds it in `groups`; [`references`] is how a
-//! retire learns whether anything still names the group. A key's own
-//! `group_id` column is Task 5's and is counted there.
+//! retire learns whether anything still names the group. A key may name it
+//! by id instead, in `tenant_keys.group_id`, which the same count reads.
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -141,7 +141,9 @@ pub struct GroupUse {
     pub tenants: i64,
     /// 1 when the stored tenant defaults name it, else 0.
     pub defaults: i64,
-    /// Live keys whose own override names it.
+    /// Live keys that name it: a key's `group_id`, or its own override. A
+    /// key with neither counts for nothing, so an absent override never
+    /// reads as naming the group.
     pub keys: i64,
     /// Live provider-key documents that list it.
     pub provider_keys: i64,
@@ -181,9 +183,11 @@ pub async fn references(conn: &mut PgConnection, g: &GroupRow) -> Result<GroupUs
     .await?;
     let keys: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM tenant_keys \
-         WHERE revoked_at IS NULL AND $1::text = ANY(allowed_provider_groups)",
+         WHERE revoked_at IS NULL \
+           AND (group_id = $2 OR $1::text = ANY(allowed_provider_groups))",
     )
     .bind(name)
+    .bind(g.id)
     .fetch_one(&mut *conn)
     .await?;
     let provider_keys: i64 = sqlx::query_scalar(

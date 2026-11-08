@@ -14,7 +14,7 @@ use chrono::{TimeDelta, Utc};
 use serde_json::{json, Value};
 use sqlx::PgPool;
 use support::migrate::{database_at, drop_database, migrate_rest};
-use support::world::{db_now, seed_model, seed_tenant};
+use support::world::{db_now, seed_key, seed_model, seed_tenant};
 use support::{OperatorSession, Resp, TestCp};
 use uuid::Uuid;
 
@@ -1063,4 +1063,252 @@ async fn a_group_lists_its_provider_keys() {
         json!([{"id": pk, "display_name": "acct-keys-7c1"}])
     );
     let _ = Utc::now();
+}
+
+/// `group_id` of each key by label, from `tenant_keys`.
+async fn key_groups(pool: &PgPool) -> Vec<(String, Option<String>)> {
+    sqlx::query_as(
+        "SELECT k.label, g.name FROM tenant_keys k \
+         LEFT JOIN provider_groups g ON g.id = k.group_id ORDER BY k.label",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("read the keys' groups")
+}
+
+/// `group_id` of the key labelled `label`.
+async fn key_group(pool: &PgPool, label: &str) -> Option<String> {
+    let groups = key_groups(pool).await;
+    groups
+        .into_iter()
+        .find(|(l, _)| l == label)
+        .unwrap_or_else(|| panic!("a key labelled {label}"))
+        .1
+}
+
+/// The `detail` of the one audit row `action` names.
+async fn audit_detail(pool: &PgPool, action: &str) -> Value {
+    let detail: Value = sqlx::query_scalar(
+        "SELECT detail FROM audit_log WHERE action = $1 AND actor_kind = 'system' ORDER BY id",
+    )
+    .bind(action)
+    .fetch_one(pool)
+    .await
+    .unwrap_or_else(|e| panic!("read the {action} audit row: {e}"));
+    detail
+}
+
+#[tokio::test]
+async fn the_migration_gives_each_key_the_group_it_can_only_mean() {
+    let Some(pool) = database_at(23).await else {
+        return;
+    };
+    // Two customer groups, created as an operator would before the upgrade,
+    // and one tenant of each shape the backfill reads.
+    let a = Uuid::new_v4();
+    let b = Uuid::new_v4();
+    let customer_one = Uuid::new_v4();
+    let customer_two = Uuid::new_v4();
+    let internal = Uuid::new_v4();
+    for sql in [
+        format!(
+            "INSERT INTO provider_groups (id, name, display_name) VALUES \
+             ('{a}', 'grp-a-7c1', '分组甲'), ('{b}', 'grp-b-7c1', '分组乙')"
+        ),
+        format!(
+            "INSERT INTO tenants (id, name, status, allowed_provider_groups) VALUES \
+             ('{customer_one}', 'one-7c1', 'active', '{{\"grp-b-7c1\"}}'), \
+             ('{customer_two}', 'two-7c1', 'active', '{{\"grp-a-7c1\",\"grp-b-7c1\"}}')"
+        ),
+        format!(
+            "INSERT INTO tenants (id, name, status, is_internal) VALUES \
+             ('{internal}', 'platform-7c1', 'active', true)"
+        ),
+        format!(
+            "INSERT INTO tenant_keys (id, tenant_id, label, key_hash, key_prefix, \
+             allowed_provider_groups, created_by_kind) VALUES \
+             (gen_random_uuid(), '{customer_one}', 'override-one-7c1', 'h1-7c1', 'k1', \
+              '{{\"grp-a-7c1\"}}', 'operator'), \
+             (gen_random_uuid(), '{customer_one}', 'tenant-one-7c1', 'h2-7c1', 'k2', \
+              NULL, 'operator'), \
+             (gen_random_uuid(), '{customer_two}', 'tenant-two-7c1', 'h3-7c1', 'k3', \
+              NULL, 'operator'), \
+             (gen_random_uuid(), '{internal}', 'internal-override-7c1', 'h4-7c1', 'k4', \
+              '{{\"grp-a-7c1\"}}', 'operator'), \
+             (gen_random_uuid(), '{internal}', 'internal-none-7c1', 'h5-7c1', 'k5', \
+              NULL, 'operator'), \
+             (gen_random_uuid(), '{internal}', 'internal-two-7c1', 'h6-7c1', 'k6', \
+              '{{\"grp-a-7c1\",\"grp-b-7c1\"}}', 'operator'), \
+             (gen_random_uuid(), '{customer_one}', 'revoked-7c1', 'h7-7c1', 'k7', \
+              '{{\"grp-a-7c1\"}}', 'operator')"
+        ),
+        "UPDATE tenant_keys SET revoked_at = now() WHERE label = 'revoked-7c1'".to_string(),
+    ] {
+        sqlx::query(&sql)
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+
+    migrate_rest(&pool).await.expect("the rest migrates");
+
+    // The one group a key's own override names is the group it can only
+    // mean, whoever its tenant is.
+    assert_eq!(
+        key_group(&pool, "override-one-7c1").await.as_deref(),
+        Some("grp-a-7c1")
+    );
+    assert_eq!(
+        key_group(&pool, "internal-override-7c1").await.as_deref(),
+        Some("grp-a-7c1")
+    );
+    // A customer key with no override takes the one group its tenant names.
+    assert_eq!(
+        key_group(&pool, "tenant-one-7c1").await.as_deref(),
+        Some("grp-b-7c1")
+    );
+    // Two groups are two readings, and the key is closed until one is set.
+    assert_eq!(key_group(&pool, "tenant-two-7c1").await, None);
+    // Every internal key still without one takes the designated default,
+    // which an operator can see it reaches.
+    assert_eq!(
+        key_group(&pool, "internal-none-7c1").await.as_deref(),
+        Some("default")
+    );
+    assert_eq!(
+        key_group(&pool, "internal-two-7c1").await.as_deref(),
+        Some("default")
+    );
+    // A revoked key takes none: it is not routed, and not priced.
+    assert_eq!(key_group(&pool, "revoked-7c1").await, None);
+    drop_database(pool).await;
+}
+
+#[tokio::test]
+async fn the_upgrade_reports_what_the_default_group_reaches() {
+    let Some(pool) = database_at(23).await else {
+        return;
+    };
+    let internal = Uuid::new_v4();
+    for sql in [
+        format!(
+            "INSERT INTO tenants (id, name, status, is_internal) VALUES \
+             ('{internal}', 'platform-7c1', 'active', true)"
+        ),
+        format!(
+            "INSERT INTO tenant_keys (id, tenant_id, label, key_hash, key_prefix, \
+             created_by_kind) VALUES \
+             (gen_random_uuid(), '{internal}', 'internal-none-7c1', 'h1-7c1', 'k1', 'operator'), \
+             (gen_random_uuid(), '{internal}', 'internal-none-too-7c1', 'h2-7c1', 'k2', 'operator')"
+        ),
+        "INSERT INTO gw_resources (kind, id, doc) VALUES ('provider_keys', gen_random_uuid(), \
+         '{\"display_name\": \"acct-def-7c1\", \"provider\": \"openai\", \"api_key\": \
+         \"sk-def-7c1\", \"groups\": [\"default\"]}')"
+            .to_string(),
+    ] {
+        sqlx::query(&sql)
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+
+    migrate_rest(&pool).await.expect("the rest migrates");
+
+    // The report names the keys it gave the group, and the upstreams that
+    // group reaches, so an operator can see what they now reach.
+    let detail = audit_detail(&pool, "provider_group.default_assigned").await;
+    assert_eq!(detail["name"], "default");
+    assert_eq!(detail["keys"], 2, "{detail}");
+    assert_eq!(detail["provider_keys"], json!(["acct-def-7c1"]));
+    drop_database(pool).await;
+}
+
+#[tokio::test]
+async fn the_upgrade_reports_a_default_group_that_reaches_no_upstream() {
+    let Some(pool) = database_at(23).await else {
+        return;
+    };
+    sqlx::query(
+        "INSERT INTO tenants (id, name, status, is_internal) VALUES \
+         (gen_random_uuid(), 'platform-7c1', 'active', true)",
+    )
+    .execute(&pool)
+    .await
+    .expect("seed the internal tenant");
+    sqlx::query(
+        "INSERT INTO tenant_keys (id, tenant_id, label, key_hash, key_prefix, created_by_kind) \
+         SELECT gen_random_uuid(), id, 'internal-none-7c1', 'h1-7c1', 'k1', 'operator' \
+         FROM tenants WHERE is_internal",
+    )
+    .execute(&pool)
+    .await
+    .expect("seed an internal key");
+    // An upstream account that lists another group: the report names the
+    // accounts the default group reaches, not every account there is.
+    sqlx::query(
+        "INSERT INTO gw_resources (kind, id, doc) VALUES ('provider_keys', gen_random_uuid(), \
+         '{\"display_name\": \"acct-shared-7c1\", \"provider\": \"openai\", \"api_key\": \
+         \"sk-shared-7c1\", \"groups\": [\"shared\"]}')",
+    )
+    .execute(&pool)
+    .await
+    .expect("seed an account of another group");
+
+    migrate_rest(&pool).await.expect("the rest migrates");
+
+    // routio.ai's shape: the internal tenant, and no account that reaches the
+    // default group. The report says so rather than leaving the question open.
+    let detail = audit_detail(&pool, "provider_group.default_assigned").await;
+    assert_eq!(detail["keys"], 1, "{detail}");
+    assert_eq!(detail["provider_keys"], json!([]), "{detail}");
+    drop_database(pool).await;
+}
+
+#[tokio::test]
+async fn retiring_counts_keys_by_their_group() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let admin = cp
+        .admin_login_seeded(aisix_control_plane::auth::OperatorRole::Operator)
+        .await;
+    let group = create_group(&cp, &admin, body("grp-keycount-7c1", "标准", json!("7.2"))).await;
+    let id = id_of(&group);
+    let tenant = seed_tenant(&cp, &admin).await;
+    let key = seed_key(&cp, &admin, tenant, None).await;
+    let key_id = Uuid::parse_str(&key).expect("a key id");
+    // The column, as Task 11 sets it: a key names its group, and its own
+    // override may say nothing at all.
+    sqlx::query("UPDATE tenant_keys SET group_id = $1::uuid WHERE id = $2")
+        .bind(&id)
+        .bind(key_id)
+        .execute(cp.db().pool())
+        .await
+        .expect("set the key's group");
+
+    let r = retire(&cp, &admin, &id).await;
+    assert_status(&r, 409, "group_in_use");
+    assert_eq!(r.body["counts"]["keys"], 1, "{r:?}");
+
+    // A key of the same tenant with no group counts for nothing: an absent
+    // override must not read as naming the group.
+    let ungrouped = seed_key(&cp, &admin, tenant, None).await;
+    let ungrouped: Uuid = Uuid::parse_str(&ungrouped).expect("a key id");
+    sqlx::query("UPDATE tenant_keys SET group_id = NULL WHERE id = $1")
+        .bind(ungrouped)
+        .execute(cp.db().pool())
+        .await
+        .expect("clear the second key's group");
+    let r = retire(&cp, &admin, &id).await;
+    assert_status(&r, 409, "group_in_use");
+    assert_eq!(r.body["counts"]["keys"], 1, "{r:?}");
+
+    sqlx::query("UPDATE tenant_keys SET group_id = NULL WHERE id = $1")
+        .bind(key_id)
+        .execute(cp.db().pool())
+        .await
+        .expect("clear the key's group");
+    let r = retire(&cp, &admin, &id).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    assert_eq!(r.body["keys"], 0, "{r:?}");
 }
