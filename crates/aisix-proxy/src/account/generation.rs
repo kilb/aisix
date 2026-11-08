@@ -26,11 +26,11 @@
 //!   ([`ProxyError::AccountUnavailable`]).
 //!
 //! A found request is cached per key and id for [`REQUEST_TTL`], and a
-//! failure for [`FAILURE_TTL`]. A `404` is never cached, so a caller polling
-//! for a request it just sent sees it as soon as the control plane has it. A
-//! lookup the cache cannot answer asks the control plane itself and shares
-//! that request with no other caller, so a caller that hangs up cancels only
-//! its own request and never one another caller waits on.
+//! failure for [`FAILURE_TTL`]. A `404` is kept for no time at all, so a
+//! caller polling for a request it just sent sees it as soon as the control
+//! plane has it. Concurrent lookups of one key and id share one fetch, run on
+//! a task of its own ([`SharedLookup`]), so a caller that hangs up never
+//! cancels the fetch another caller is waiting for.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -41,11 +41,9 @@ use axum::extract::{Query, State};
 use axum::http::{Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
-use moka::future::Cache;
-use moka::Expiry;
 use serde::{Deserialize, Serialize};
 
-use super::{key_path, AccountClient, AccountError, ACCOUNT_TIMEOUT, CACHE_CAPACITY, FAILURE_TTL};
+use super::{key_path, AccountClient, AccountError, SharedLookup, ACCOUNT_TIMEOUT, FAILURE_TTL};
 use crate::auth::AuthenticatedKey;
 use crate::error::{ErrorEnvelope, ProxyError};
 use crate::request_id::RequestId;
@@ -89,86 +87,56 @@ pub(crate) struct RequestCostAnswer {
     items: Vec<RequestItem>,
 }
 
-/// A cached lookup: a found request, or a failure. A `404` is never cached.
-type CachedCost = Result<Arc<RequestCostAnswer>, AccountError>;
+/// The request lookups, by [`request_key`].
+pub(crate) type RequestCache = SharedLookup<Option<Arc<RequestCostAnswer>>>;
 
-/// The request lookups by key id and request id.
-pub(crate) type RequestCache = Cache<(String, String), CachedCost>;
-
-/// A found request lives [`REQUEST_TTL`] from when it was fetched, a failure
+/// A found request lives [`REQUEST_TTL`] from when it was fetched; a `404`
+/// lives no time at all, so the next lookup asks again. A failure lives
 /// [`FAILURE_TTL`].
-struct RequestExpiry;
-
-impl RequestExpiry {
-    fn ttl(cached: &CachedCost) -> Duration {
-        match cached {
-            Ok(_) => REQUEST_TTL,
-            Err(_) => FAILURE_TTL,
-        }
-    }
-}
-
-impl Expiry<(String, String), CachedCost> for RequestExpiry {
-    fn expire_after_create(
-        &self,
-        _key: &(String, String),
-        cached: &CachedCost,
-        _created_at: Instant,
-    ) -> Option<Duration> {
-        Some(Self::ttl(cached))
-    }
-
-    fn expire_after_update(
-        &self,
-        _key: &(String, String),
-        cached: &CachedCost,
-        _updated_at: Instant,
-        _duration_until_expiry: Option<Duration>,
-    ) -> Option<Duration> {
-        Some(Self::ttl(cached))
+fn request_ttl(answer: &Option<Arc<RequestCostAnswer>>) -> Duration {
+    match answer {
+        Some(_) => REQUEST_TTL,
+        None => Duration::ZERO,
     }
 }
 
 pub(super) fn request_cache() -> RequestCache {
-    Cache::builder()
-        .max_capacity(CACHE_CAPACITY)
-        .expire_after(RequestExpiry)
-        .build()
+    SharedLookup::new(ACCOUNT_TIMEOUT, request_ttl, FAILURE_TTL)
+}
+
+/// The cache key of request id `request_id` asked with key `key_id`: the
+/// request id, a space, then the key id. An acceptable request id holds no
+/// space ([`crate::request_id::is_acceptable`]), so the first space tells the
+/// two apart and no two pairs share a key.
+fn request_key(key_id: &str, request_id: &str) -> String {
+    format!("{request_id} {key_id}")
 }
 
 impl AccountClient {
     /// What `request_id` cost, as far as key `key_id` may see; `None` when
-    /// it may see no row under the id.
+    /// it may see no row under the id. `request_id` must be acceptable
+    /// ([`crate::request_id::is_acceptable`]). Concurrent lookups of one key
+    /// and id share one fetch, which a caller hanging up never cancels.
     pub(crate) async fn request_cost(
         &self,
         key_id: &str,
         request_id: &str,
     ) -> Result<Option<Arc<RequestCostAnswer>>, AccountError> {
-        let key = (key_id.to_string(), request_id.to_string());
-        if let Some(cached) = self.requests.get(&key).await {
-            return cached.map(Some);
-        }
-        let fetched = self.fetch_request_cost(key_id, request_id).await;
-        match &fetched {
-            Ok(Some(answer)) => self.requests.insert(key, Ok(Arc::clone(answer))).await,
-            // Not cached: the row may be stored a moment later.
-            Ok(None) => {}
-            Err(error) => self.requests.insert(key, Err(*error)).await,
-        }
-        fetched
-    }
-
-    /// One ask of the control plane, driven by the caller's own request and
-    /// shared with no other caller.
-    async fn fetch_request_cost(
-        &self,
-        key_id: &str,
-        request_id: &str,
-    ) -> Result<Option<Arc<RequestCostAnswer>>, AccountError> {
-        let path = key_path(key_id, "requests");
-        self.get_json::<RequestCostAnswer>(&path, &[("id", request_id)], ACCOUNT_TIMEOUT)
+        self.requests
+            .get(&request_key(key_id, request_id), || {
+                let (client, path, id) = (
+                    self.clone(),
+                    key_path(key_id, "requests"),
+                    request_id.to_string(),
+                );
+                async move {
+                    client
+                        .get_json::<RequestCostAnswer>(&path, &[("id", &id)], ACCOUNT_TIMEOUT)
+                        .await
+                        .map(|answer| answer.map(Arc::new))
+                }
+            })
             .await
-            .map(|answer| answer.map(Arc::new))
     }
 }
 
@@ -304,6 +272,7 @@ pub(crate) async fn generation(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::account::CACHE_CAPACITY;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
 
@@ -441,7 +410,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_request_cost_404_is_not_cached() {
-        // The row is stored between the first lookup and the second.
+        // The row is stored between the first lookup and the second, and the
+        // second follows at once: a 404 kept for any time at all would answer
+        // it.
         let asked = Arc::new(AtomicUsize::new(0));
         let a = Arc::clone(&asked);
         let stand_in = StandIn::start(Arc::new(move |_, _| {
@@ -581,16 +552,18 @@ mod tests {
 
     #[tokio::test]
     async fn a_request_cost_is_cached_per_key_and_id_for_its_ttl() {
-        let stand_in = StandIn::start(Arc::new(|_, _| ok(owners_answer()))).await;
+        // Slow enough that all ten lookups below are in flight together.
+        let stand_in = StandIn::start_with_delay(
+            Arc::new(|_, _| ok(owners_answer())),
+            Duration::from_millis(200),
+        )
+        .await;
         let client = stand_in.client();
-        for _ in 0..10 {
-            assert!(client
-                .request_cost("key-a", "req-1")
-                .await
-                .unwrap()
-                .is_some());
+        let lookups = (0..10).map(|_| client.request_cost("key-a", "req-1"));
+        for answer in futures::future::join_all(lookups).await {
+            assert!(answer.unwrap().is_some());
         }
-        assert_eq!(stand_in.hits(), 1, "ten lookups of one id");
+        assert_eq!(stand_in.hits(), 1, "ten concurrent lookups of one id");
         assert!(client
             .request_cost("key-a", "req-2")
             .await
@@ -620,8 +593,8 @@ mod tests {
     }
 
     /// A caller that hangs up while its lookup waits on the control plane
-    /// cancels only its own request: a second caller of the same id, already
-    /// waiting, is answered one control-plane round trip after it asked, and
+    /// cancels nothing another caller waits on: a second caller of the same
+    /// id, already waiting, is answered by the one fetch already running, and
     /// is never made to start over.
     #[tokio::test]
     async fn a_caller_that_hangs_up_leaves_another_callers_lookup_alone() {
@@ -653,6 +626,14 @@ mod tests {
             waited < ROUND_TRIP + Duration::from_millis(500),
             "the second caller waited {waited:?}"
         );
+        assert_eq!(stand_in.hits(), 1, "one fetch, never restarted");
+    }
+
+    #[test]
+    fn the_cache_key_names_the_key_and_the_id_apart() {
+        assert_eq!(request_key("k-owner", "req-7c1"), "req-7c1 k-owner");
+        // Without the space both would be "abc".
+        assert_ne!(request_key("bc", "a"), request_key("c", "ab"));
     }
 
     #[tokio::test]
@@ -669,8 +650,7 @@ mod tests {
             .for_each(|answer| async move { assert!(answer.unwrap().is_some()) })
             .await;
         assert_eq!(stand_in.hits(), ids);
-        client.requests.run_pending_tasks().await;
-        let held = client.requests.entry_count();
+        let held = client.requests.entry_count().await;
         assert!(held > 0 && held <= CACHE_CAPACITY, "{held} entries held");
     }
 

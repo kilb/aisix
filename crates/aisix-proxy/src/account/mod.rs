@@ -165,8 +165,8 @@ impl AccountClient {
 }
 
 /// One lookup's answers by key, shared by every caller asking for the same
-/// key. Each lookup ([`key`], [`prices`]) keeps one, built with its own
-/// deadline and TTLs.
+/// key. Each lookup ([`key`], [`generation`], [`prices`]) keeps one, built
+/// with its own deadline and TTLs.
 ///
 /// [`SharedLookup::get`] answers from the cache when it can. Otherwise the
 /// fetch runs on a task of its own, so a caller that goes away (a client
