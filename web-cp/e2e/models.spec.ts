@@ -333,6 +333,10 @@ test("移除路由目标要两步确认：取消保留，确认后移除，保�
   expect((await stack.admin.get(`/admin/resources/models/${route.id}`)).doc.routing.targets).toHaveLength(2);
   await form.getByRole("button", { name: "保存" }).click();
 
+  // Until the save is answered the row shows the rollout it was listed with,
+  // which may already read `applied`: wait for the answer (the form closes),
+  // so the badge below is the saved version's.
+  await expect(form).toHaveCount(0);
   await expect(badge(modelRow(page, "route-trim-e2e"))).toHaveAttribute("data-state", "applied", {
     timeout: APPLIED_WITHIN_MS,
   });
