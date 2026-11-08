@@ -349,6 +349,37 @@ pub const ROUTE_ROLES: &[(&str, &str, MinRole)] = &[
         "/api/billing/balance",
         MinRole::Member(&[MemberRole::Owner, MemberRole::Admin, MemberRole::Billing]),
     ),
+    // Top-ups: tenants request them, operators decide them.
+    (
+        "GET",
+        "/admin/billing/topups",
+        MinRole::Op(OperatorRole::Viewer),
+    ),
+    (
+        "POST",
+        "/admin/billing/topups/{id}/approve",
+        MinRole::Op(OperatorRole::Operator),
+    ),
+    (
+        "POST",
+        "/admin/billing/topups/{id}/reject",
+        MinRole::Op(OperatorRole::Operator),
+    ),
+    (
+        "GET",
+        "/api/billing/topups",
+        MinRole::Member(&[MemberRole::Owner, MemberRole::Admin, MemberRole::Billing]),
+    ),
+    (
+        "POST",
+        "/api/billing/topups",
+        MinRole::Member(&[MemberRole::Owner, MemberRole::Admin, MemberRole::Billing]),
+    ),
+    (
+        "GET",
+        "/api/billing/topups/{id}",
+        MinRole::Member(&[MemberRole::Owner, MemberRole::Admin, MemberRole::Billing]),
+    ),
     // Gateways, on the gateway listener.
     ("POST", "/dp/heartbeat", MinRole::Dp),
     ("GET", "/dp/v1/keys/{key_id}/prices", MinRole::Dp),
@@ -498,6 +529,20 @@ pub fn browser_router(state: AppState) -> Router {
             get(billing::accounts::get).patch(billing::accounts::set_credit_limit),
         )
         .route("/api/billing/balance", get(billing::accounts::balance))
+        .route("/admin/billing/topups", get(billing::topups::admin_list))
+        .route(
+            "/admin/billing/topups/{id}/approve",
+            post(billing::topups::approve),
+        )
+        .route(
+            "/admin/billing/topups/{id}/reject",
+            post(billing::topups::reject),
+        )
+        .route(
+            "/api/billing/topups",
+            get(billing::topups::list).post(billing::topups::request),
+        )
+        .route("/api/billing/topups/{id}", get(billing::topups::get))
         .route_layer(axum::middleware::from_fn(json_only))
         .route_layer(axum::middleware::from_fn(only_listed_routes))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))

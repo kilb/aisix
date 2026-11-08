@@ -1577,6 +1577,19 @@ async fn every_tenant_write_takes_the_tenant_before_the_resources_lock() {
         .as_str()
         .expect("a token")
         .to_string();
+    let mut topups = Vec::new();
+    for _ in 0..2 {
+        let r = cp
+            .send(
+                "POST",
+                "/api/billing/topups",
+                Some(owner.cookie()),
+                Some(json!({"amount_usd": "0.05"})),
+            )
+            .await;
+        assert_eq!(r.status, 201, "{r:?}");
+        topups.push(r.body["id"].as_str().expect("an id").to_string());
+    }
 
     let cases: Vec<(&str, Request, u16)> = vec![
         (
@@ -1699,6 +1712,31 @@ async fn every_tenant_write_takes_the_tenant_before_the_resources_lock() {
                 op.clone(),
                 None,
                 Some(json!({"credit_limit_usd": "1.00"})),
+            )),
+            200,
+        ),
+        // An approval posts to the ledger and settles the balance mark.
+        (
+            "POST /admin/billing/topups/{id}/approve",
+            Box::pin(fire(
+                cp.clone(),
+                "POST",
+                format!("/admin/billing/topups/{}/approve", topups[0]),
+                op.clone(),
+                None,
+                Some(json!({})),
+            )),
+            200,
+        ),
+        (
+            "POST /admin/billing/topups/{id}/reject",
+            Box::pin(fire(
+                cp.clone(),
+                "POST",
+                format!("/admin/billing/topups/{}/reject", topups[1]),
+                op.clone(),
+                None,
+                Some(json!({"reason": "未收到款项"})),
             )),
             200,
         ),

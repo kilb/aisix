@@ -78,6 +78,12 @@ pub fn tenant_fixture(method: &str, path: &str) -> (String, Option<Value>) {
             (method == "PATCH").then(|| json!({"label": "fixture-key"})),
         ),
         ("GET", "/api/billing/balance") => (path.to_string(), None),
+        ("GET", "/api/billing/topups") => (path.to_string(), None),
+        // An amount of 0 is refused after the identity checks.
+        ("POST", "/api/billing/topups") => (path.to_string(), Some(json!({"amount_usd": "0"}))),
+        ("GET", "/api/billing/topups/{id}") => {
+            (format!("/api/billing/topups/{}", Uuid::new_v4()), None)
+        }
         _ => panic!("no fixture for {method} {path}: add one to tests/support/members.rs"),
     }
 }
