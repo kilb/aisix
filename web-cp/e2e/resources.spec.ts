@@ -1,5 +1,5 @@
 import { expect, test, type Locator, type Page } from "@playwright/test";
-import { STACK_START_TIMEOUT_MS, startStack, type Json, type Stack } from "./stack";
+import { STACK_START_TIMEOUT_MS, fundTenant, startStack, type Json, type Stack } from "./stack";
 
 /**
  * The cache policies page and the generic resource page ("全部资源"), against
@@ -178,6 +178,7 @@ test("同租户两把 key 命中同一缓存条目", async ({ page }) => {
 
   // Tenant T1 and its two keys, written after the policy.
   const t1 = await stack.admin.post("/admin/tenants", { name: "Cache E2E Tenant" });
+  await fundTenant(stack.admin, t1.id);
   await stack.admin.patch(`/admin/tenants/${t1.id}`, { allowed_model_ids: [model.id] }, t1.version);
   const keyA = (await stack.admin.post(`/admin/tenants/${t1.id}/keys`, { label: "cache-e2e-a" })).plaintext;
   const keyB = (await stack.admin.post(`/admin/tenants/${t1.id}/keys`, { label: "cache-e2e-b" })).plaintext;

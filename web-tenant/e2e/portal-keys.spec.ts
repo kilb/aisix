@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { expect, test, type Locator, type Page } from "@playwright/test";
-import { STACK_START_TIMEOUT_MS, startStack, type ApiClient, type Json, type Stack } from "./stack";
+import { STACK_START_TIMEOUT_MS, fundTenant, startStack, type ApiClient, type Json, type Stack } from "./stack";
 
 /**
  * The tenant portal's keys and members pages: who sees which keys, a new
@@ -56,6 +56,7 @@ async function activeOrg(name: string, ownerEmail: string, limits?: Json): Promi
   const signedUp = await stack.tenant().post("/api/signup", { org_name: name, email: ownerEmail, password: PASSWORD });
   const id: string = signedUp.tenant.id;
   await stack.admin.post(`/admin/tenants/${id}/approve`);
+  await fundTenant(stack.admin, id);
   const current = await stack.admin.get(`/admin/tenants/${id}`);
   await stack.admin.patch(
     `/admin/tenants/${id}`,

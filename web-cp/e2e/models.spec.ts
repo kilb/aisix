@@ -1,5 +1,5 @@
 import { expect, test, type Locator, type Page } from "@playwright/test";
-import { STACK_START_TIMEOUT_MS, startStack, type Json, type Stack } from "./stack";
+import { STACK_START_TIMEOUT_MS, fundTenant, startStack, type Json, type Stack } from "./stack";
 
 /**
  * The model catalog and routing tab: direct models on an upstream account,
@@ -95,6 +95,7 @@ async function internalKey(label: string, models: string[]): Promise<string> {
 /** A customer tenant granted `modelIds`, and one key that follows its grants. */
 async function grantedTenant(name: string, modelIds: string[]): Promise<{ tenant: Json; key: string }> {
   const created = await stack.admin.post("/admin/tenants", { name });
+  await fundTenant(stack.admin, created.id);
   const tenant = await stack.admin.patch(`/admin/tenants/${created.id}`, { allowed_model_ids: modelIds }, created.version);
   const { plaintext } = await stack.admin.post(`/admin/tenants/${created.id}/keys`, { label: `key-${name}` });
   return { tenant, key: plaintext };
