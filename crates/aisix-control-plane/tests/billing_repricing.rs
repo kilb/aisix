@@ -1,8 +1,9 @@
 //! Re-pricing: an operator previews a run over past charges at the prices in
 //! force now, which posts nothing; an admin applies it, which records one
 //! adjustment per changed charge, posts one `adjustment` ledger entry per
-//! tenant, counts the corrections against cumulative quotas and settles the
-//! tenants' marks, in one transaction, and refuses a stale preview.
+//! tenant and counts the corrections against cumulative quotas, in one
+//! transaction, then settles each tenant's marks before it answers, and
+//! refuses a stale preview.
 //!
 //! Usage arrives over `POST /dp/telemetry` exactly as a gateway sends it, in
 //! rows of 680 µ$ at `card()` (`tokens_680`), except where a test needs more
@@ -23,7 +24,7 @@ use aisix_control_plane::billing::ledger::{self, Posting, Source};
 use aisix_control_plane::billing::repricing::{MAX_REPRICE_EVENTS, MAX_REPRICE_TENANTS};
 use aisix_control_plane::db::Db;
 use aisix_control_plane::pricing::store::{self, NewDiscount};
-use aisix_control_plane::resources::write::WriteCtx;
+use aisix_control_plane::resources::write::{WriteCtx, RESOURCES_LOCK_KEY};
 use aisix_control_plane::tenants;
 use aisix_core::models::BudgetPeriod;
 use aisix_pricing::RateCard;
@@ -1032,9 +1033,10 @@ async fn the_runs_list_pages_newest_first() {
 
 /// Times one apply of `MAX_REPRICE_EVENTS` charges spread over
 /// `MAX_REPRICE_TENANTS` tenants, on a debug build. The apply locks every
-/// tenant it changes and settles each one's marks in its transaction, and
-/// intake for those tenants waits on their accounts while it runs. Run with
-/// `--ignored`; the report records the figure.
+/// tenant it changes for its transaction, and intake for those tenants waits
+/// on their accounts while it runs; it then settles each one's marks in a
+/// transaction of its own. Run with `--ignored`; the report records the
+/// figure.
 #[tokio::test]
 #[ignore]
 async fn a_full_run_applies_within_three_seconds() {
@@ -1304,6 +1306,111 @@ async fn a_run_changing_two_tenants_posts_and_settles_each() {
         );
         assert_eq!(balance(db, tenant).await, after);
         // Each tenant's balance mark is settled exhausted by the apply.
+        let doc = balance_doc(db, tenant).await;
+        assert!(doc["exhausted"].is_object(), "{tenant}: {doc}");
+    }
+}
+
+/// Whether some session is queued for the resources lock.
+async fn resources_lock_queued(db: &Db) -> bool {
+    sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'advisory' AND NOT granted \
+           AND classid::bigint = $1 AND objid::bigint = $2 AND objsubid = 1)",
+    )
+    .bind(RESOURCES_LOCK_KEY >> 32)
+    .bind(RESOURCES_LOCK_KEY & 0xffff_ffff)
+    .fetch_one(db.pool())
+    .await
+    .expect("read the queued locks")
+}
+
+/// A run that changes two tenants holds neither one's usage intake while it
+/// writes the other's marks: while the gateway documents are busy, and the
+/// marks of the tenant settled first wait for them, a batch charging the
+/// other tenant is stored. Both marks are still settled by the answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_apply_holds_no_other_tenants_intake_while_it_settles_marks() {
+    let Some(r) = setup(false).await else { return };
+    let (cp, db) = (&r.w.cp, r.w.cp.db());
+    let a = r.w.tenant;
+    let b = seed_tenant(cp, &r.w.admin).await;
+    let b_key = seed_key(cp, &r.w.admin, b, None).await;
+    // A usage row of tenant `t` on `model`, as the gateway records it.
+    let row_of = |t: Uuid, id: &str, model: Uuid, fields: Value| {
+        let mut row = usage(&r.w, id, model, fields);
+        if t == b {
+            row["team_id"] = json!(b.to_string());
+            row["api_key_id"] = json!(b_key);
+            row["user_id"] = json!("");
+        }
+        row
+    };
+    // Each prepaid tenant holds $0.01 and spends 20 000 µ$ on a model with
+    // no price yet, so the run takes each one below its floor.
+    for tenant in [a, b] {
+        let credited = cp
+            .send(
+                "POST",
+                &format!("/admin/tenants/{tenant}/credits"),
+                Some(r.admin.cookie()),
+                Some(json!({"amount_usd": "0.01", "reason": "重新定价测试 7c1"})),
+            )
+            .await;
+        assert_eq!(credited.status, 201, "{credited:?}");
+    }
+    send(
+        &r.w,
+        vec![
+            row_of(a, "hold-a", r.model, json!({"prompt_tokens": 20_000})),
+            row_of(b, "hold-b", r.model, json!({"prompt_tokens": 20_000})),
+        ],
+    )
+    .await;
+    // A second model, priced before the preview (a price written after it
+    // makes it stale), for a batch that is not in the run.
+    let other = seed_model(cp, &r.w.admin).await;
+    price(cp, other).await;
+    price(cp, r.model).await;
+    let (from, to) = last_hour(cp).await;
+    let (id, run) = previewed(cp, &r.w.admin, run_body(from, to, json!({}))).await;
+    assert_eq!(run["changed"], 2, "{run}");
+    // The tenants are settled in ascending id order: the later one is free
+    // while the first one's marks wait.
+    let later = a.max(b);
+
+    let mut writer = db.pool().begin().await.expect("begin");
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(RESOURCES_LOCK_KEY)
+        .execute(&mut *writer)
+        .await
+        .expect("hold the resources lock");
+    let applying = apply(cp, &r.admin, &id);
+    let probe = async {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !resources_lock_queued(db).await {
+            assert!(
+                Instant::now() < deadline,
+                "the apply never queued for the resources lock"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let delivered = tokio::time::timeout(
+            Duration::from_secs(2),
+            deliver(
+                &r.w.dp,
+                Uuid::new_v4(),
+                vec![row_of(later, "during-apply", other, tokens_680())],
+            ),
+        )
+        .await;
+        writer.rollback().await.expect("end the write");
+        delivered
+    };
+    let (applied, delivered) = tokio::join!(applying, probe);
+    let delivered = delivered.expect("the batch waited behind the apply");
+    assert_eq!(delivered.status, 200, "{delivered:?}");
+    assert_eq!(applied.status, 200, "{applied:?}");
+    for tenant in [a, b] {
         let doc = balance_doc(db, tenant).await;
         assert!(doc["exhausted"].is_object(), "{tenant}: {doc}");
     }

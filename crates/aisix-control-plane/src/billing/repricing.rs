@@ -18,8 +18,15 @@
 //! 5. one `pricing_adjustments` row per changed charge, one `adjustment`
 //!    ledger entry per tenant whose deltas do not sum to 0, the deltas
 //!    counted against cumulative quotas at each charge's own price instant
-//!    (`budgets::count_charges` in `Adjustment` mode), and the tenants' marks
-//!    settled.
+//!    (`budgets::count_charges` in `Adjustment` mode), and every changed
+//!    tenant's account flagged for the settler.
+//!
+//! Once it commits, each changed tenant's marks are settled in a transaction
+//! of its own (`marks::settle`), so the answer already stands in the
+//! gateway's documents; one that fails is left to the settler, which the
+//! flag wakes. Settling them inside the apply would hold every changed
+//! tenant's usage intake, and the resources lock from the first mark that
+//! moves, for as long as all of them take.
 //!
 //! A charge's effective amount is its `charge_micro_usd` (0 when it has
 //! none) plus its adjustments, and a run's delta for a row is the new charge
@@ -40,9 +47,10 @@
 //! The lock order is the order of every other money path: the tenants and
 //! their accounts, then the run, then `pricing_version` (a price write
 //! key-shares a tenant before it bumps the version, so the version is taken
-//! after the tenants), then the resources lock in the settle. Intake for
-//! those tenants waits on their accounts while an apply runs, which
-//! [`MAX_REPRICE_EVENTS`] and [`MAX_REPRICE_TENANTS`] bound.
+//! after the tenants). The apply takes no resources lock. Intake for those
+//! tenants waits on their accounts while an apply runs, which
+//! [`MAX_REPRICE_EVENTS`] and [`MAX_REPRICE_TENANTS`] bound; each settle after
+//! it holds one tenant's account at a time.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -78,13 +86,11 @@ use crate::AppState;
 pub const MAX_REPRICE_EVENTS: i64 = 10_000;
 
 /// The most tenants one run may change. An apply locks each tenant it changes
-/// for its whole transaction and settles each one's marks inside it, about
-/// nine round trips per tenant plus one or more per live quota, which the
-/// event cap does not bound: against a database 1 ms away, 200 tenants with
-/// few quotas hold their intake, and the resources lock, for about 2 s, the
-/// block-latency target and well under the 5 s `lock_timeout` at which
-/// intake gives up, where 1,000 would reach it. Tenants with many quotas
-/// each take longer, so this is a floor on the hold, not a ceiling.
+/// for its whole transaction, a few round trips per tenant beside the
+/// charges it prices, and then settles each one's marks in a transaction of
+/// its own, about nine round trips plus one or more per live quota, holding
+/// that tenant's account alone. The cap bounds how long the apply holds every
+/// changed tenant's intake, and how long its answer takes.
 pub const MAX_REPRICE_TENANTS: usize = 200;
 
 /// The charge statuses a run may select by.
@@ -628,7 +634,8 @@ async fn hold_pricing_version(conn: &mut PgConnection) -> Result<Option<i64>, Db
 
 /// `POST /admin/billing/repricing/{id}/apply` with `{}` → `200
 /// RepricingRun`: the run's corrections recorded, posted, counted and
-/// settled in one transaction (see the module docs), and the run `applied`.
+/// flagged in one transaction, then each changed tenant's marks settled
+/// (see the module docs), and the run `applied`.
 /// `404 not_found` for no such run; `409 run_state` when it is no longer
 /// `previewed`; `409 stale_preview` when a price, the engine or the selected
 /// charges changed since the preview; `422` at `/tenant_id` when the run, as
@@ -641,9 +648,8 @@ pub async fn apply(
 ) -> Result<Json<Value>, ApiError> {
     auth.require(OperatorRole::Admin)?;
     let id = Uuid::parse_str(&id).map_err(|_| ApiError::not_found())?;
-    let ctx = WriteCtx::of(&state);
     let prices = state.prices.clone();
-    let view = state
+    let (view, settle) = state
         .db
         .tx(move |conn| {
             async move {
@@ -751,9 +757,20 @@ pub async fn apply(
                         });
                     }
                     ledger::post_flagging(&mut *conn, &postings, &flag).await?;
-                    for tenant in &changed_tenants {
-                        marks::settle_locked(&mut *conn, &ctx, *tenant).await?;
-                    }
+                    // Every changed tenant is flagged, a tenant whose deltas
+                    // sum to 0 included, which the posting does not reach.
+                    // A second update of an account is safe here: this
+                    // transaction holds each tenant's row, so the foreign
+                    // key's key-share is its own.
+                    sqlx::query(
+                        "UPDATE billing_accounts SET marks_dirty = true \
+                         WHERE tenant_id = ANY($1)",
+                    )
+                    .bind(&changed_tenants)
+                    .execute(&mut *conn)
+                    .await
+                    .map_err(DbError::from)?;
+                    marks::notify(&mut *conn).await?;
                 }
                 sqlx::query(
                     "UPDATE billing_repricing_runs \
@@ -783,11 +800,21 @@ pub async fn apply(
                 let run = read(&mut *conn, id)
                     .await?
                     .ok_or_else(ApiError::not_found)?;
-                view(conn, run).await
+                Ok::<_, ApiError>((view(conn, run).await?, changed_tenants))
             }
             .boxed()
         })
         .await?;
+    let ctx = WriteCtx::of(&state);
+    for tenant in settle {
+        if let Err(e) = marks::settle(&state.db, &ctx, tenant).await {
+            tracing::warn!(
+                %tenant,
+                code = e.code,
+                "a re-pricing run's tenant was not settled at once; the settler retries it"
+            );
+        }
+    }
     Ok(Json(view))
 }
 

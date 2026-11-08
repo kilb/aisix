@@ -165,10 +165,15 @@ statement.
   quota's, under the tenant's billing lock, from the account and spend as
   they stand. Its callers are the billing step of `tenants::project` and
   `marks::settle` / `settle_locked`: the settler after intake's commit, and
-  each admin money path inline in its own transaction. Intake writes no
-  document and never takes the resources lock; it only flags the account in
-  its one update and notifies `billing_marks_dirty`, which is delivered at
-  commit. A mark written from intake would take the resources lock there,
+  each admin money path inline in its own transaction, except a re-pricing
+  apply, which changes up to `MAX_REPRICE_TENANTS` tenants at once: it flags
+  them in its transaction and settles each after it commits, in a
+  transaction of its own, so it never holds every tenant's intake, or the
+  resources lock, while their marks are written
+  (`an_apply_holds_no_other_tenants_intake_while_it_settles_marks`). Intake
+  writes no document and never takes the resources lock; it only flags the
+  account in its one update and notifies `billing_marks_dirty`, which is
+  delivered at commit. A mark written from intake would take the resources lock there,
   and a document `write_resource` refused would fail every batch; a mark
   written anywhere else could be decided from a balance or spend another
   transaction is still moving. The one other write of a `budgets` document
