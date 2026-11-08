@@ -445,6 +445,7 @@ fn keeps_own_envelope(err: &ProxyError) -> bool {
             | ProxyError::ModelIpRestricted(_)
             | ProxyError::RouteIpRestricted(_)
             | ProxyError::RouteForbidden(_)
+            | ProxyError::EndpointForbidden(_)
             | ProxyError::JobListRefused
             | ProxyError::InvalidRequest(_)
             | ProxyError::RequestTooLarge { .. }
@@ -1167,6 +1168,7 @@ mod tests {
             | ProxyError::ModelIpRestricted(_)
             | ProxyError::RouteIpRestricted(_)
             | ProxyError::RouteForbidden(_)
+            | ProxyError::EndpointForbidden(_)
             | ProxyError::JobListRefused
             | ProxyError::InvalidRequest(_)
             | ProxyError::RequestTooLarge { .. }
@@ -1231,6 +1233,7 @@ mod tests {
             ProxyError::ModelIpRestricted("m".into()),
             ProxyError::RouteIpRestricted("r".into()),
             ProxyError::RouteForbidden("r".into()),
+            ProxyError::EndpointForbidden(aisix_core::models::EndpointFamily::Embeddings),
             ProxyError::InvalidRequest("bad".into()),
             ProxyError::UnusableTarget("pk 'acct-7' has no secret".into()),
             ProxyError::TargetRefused("provider bedrock".into()),
