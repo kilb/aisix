@@ -695,6 +695,303 @@ pub async fn detail(
     view.map(Json).ok_or_else(ApiError::not_found)
 }
 
+/// The most characters a rejection's reason holds.
+const MAX_REASON_CHARS: usize = 500;
+
+/// A proposal of batch `batch_id`, read `FOR UPDATE` with its batch's
+/// `dataset_ref`: everything a decision needs of the row itself.
+struct LockedProposal {
+    provider: String,
+    model: String,
+    effective_from: Option<DateTime<Utc>>,
+    card: Option<Value>,
+    flags: Value,
+    pricing_url: Option<String>,
+    prices_checked: Option<NaiveDate>,
+    status: String,
+    dataset_ref: String,
+}
+
+impl<'r> sqlx::FromRow<'r, PgRow> for LockedProposal {
+    fn from_row(row: &'r PgRow) -> Result<LockedProposal, sqlx::Error> {
+        Ok(LockedProposal {
+            provider: row.try_get("provider")?,
+            model: row.try_get("model")?,
+            effective_from: row.try_get("effective_from")?,
+            card: row.try_get("card")?,
+            flags: row.try_get("flags")?,
+            pricing_url: row.try_get("pricing_url")?,
+            prices_checked: row.try_get("prices_checked")?,
+            status: row.try_get("status")?,
+            dataset_ref: row.try_get("dataset_ref")?,
+        })
+    }
+}
+
+/// The proposal `pid` of batch `id`, locked for decision; `404` for a
+/// proposal of another batch, and for one that does not exist.
+async fn lock_proposal(
+    conn: &mut PgConnection,
+    id: Uuid,
+    pid: Uuid,
+) -> Result<LockedProposal, ApiError> {
+    let proposal: Option<LockedProposal> = sqlx::query_as(
+        "SELECT p.id, p.provider, p.model, p.effective_from, p.card, p.flags, p.pricing_url, \
+                p.prices_checked, p.status, b.dataset_ref \
+         FROM pricing_import_proposals p JOIN pricing_import_batches b ON b.id = p.batch_id \
+         WHERE p.id = $1 AND p.batch_id = $2 \
+         FOR UPDATE OF p",
+    )
+    .bind(pid)
+    .bind(id)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(DbError::from)?;
+    proposal.ok_or_else(ApiError::not_found)
+}
+
+/// Whether `proposal` may be decided at all: only while it is `pending`. A
+/// superseded one is not, and neither is one already confirmed or rejected.
+fn check_pending(proposal: &LockedProposal) -> Result<(), ApiError> {
+    if proposal.status == "pending" {
+        Ok(())
+    } else {
+        Err(ApiError::proposal_state())
+    }
+}
+
+/// Whether `proposal` carries a card this engine can read and no flag at
+/// all: the only kind a confirmation may write. A stored flag this build
+/// does not know still counts, since the column holds whatever flagged it.
+fn check_confirmable(proposal: &LockedProposal) -> Result<RateCard, ApiError> {
+    let flagged = match &proposal.flags {
+        Value::Array(flags) => !flags.is_empty(),
+        other => !other.is_null(),
+    };
+    let card = proposal
+        .card
+        .as_ref()
+        .and_then(|c| serde_json::from_value::<RateCard>(c.clone()).ok());
+    match card {
+        Some(card) if !flagged => Ok(card),
+        _ => Err(refused("/flags", "该提议含无法自动换算的价格，请手动录入")),
+    }
+}
+
+/// `POST /admin/pricing/imports/{id}/proposals/{pid}/confirm`, body
+/// `{model_id, effective_from, attested}` → `201 BaselineRevision`.
+///
+/// Refused with `422`: an `attested` that is not `true` (`/attested`, "请
+/// 确认已对照官方价格页核对"), a proposal that carries any flag or no card
+/// (`/flags`), and an `effective_from` before the proposal's own
+/// (`/effective_from`). Refused with `409 proposal_state` unless the proposal
+/// is still `pending`; a superseded one counts as not pending. `404` for a
+/// `pid` outside batch `{id}`.
+///
+/// One transaction: the proposal row is taken `FOR UPDATE`, so of two
+/// decisions on it exactly one commits, and the other answers
+/// `409 proposal_state`. [`baselines::insert_baseline`] writes the revision
+/// labelled third-party, carrying the batch's `dataset_ref`, the proposal's
+/// own page and checked date, and this operator's attestation at `now()`; the
+/// proposal becomes `confirmed` and names the revision. The confirmation's
+/// audit row is `pricing.import.confirm`, beside the baseline's own
+/// `pricing.baseline.create`.
+pub async fn confirm(
+    auth: OperatorAuth,
+    State(state): State<AppState>,
+    Path((id, pid)): Path<(String, String)>,
+    ApiJson(body): ApiJson<ConfirmBody>,
+) -> Result<(StatusCode, Json<BaselineRevision>), ApiError> {
+    auth.require(OperatorRole::Operator)?;
+    if body.attested != Some(true) {
+        return Err(refused("/attested", "请确认已对照官方价格页核对"));
+    }
+    let id = Uuid::parse_str(&id).map_err(|_| ApiError::not_found())?;
+    let pid = Uuid::parse_str(&pid).map_err(|_| ApiError::not_found())?;
+    let revision = state
+        .db
+        .tx(move |conn| {
+            async move {
+                let proposal = lock_proposal(&mut *conn, id, pid).await?;
+                check_pending(&proposal)?;
+                let card = check_confirmable(&proposal)?;
+                if proposal
+                    .effective_from
+                    .is_some_and(|starts| body.effective_from < starts)
+                {
+                    return Err(refused(
+                        "/effective_from",
+                        "生效时间不能早于该提议自己的生效时间",
+                    ));
+                }
+                let now: DateTime<Utc> = sqlx::query_scalar("SELECT now()")
+                    .fetch_one(&mut *conn)
+                    .await
+                    .map_err(DbError::from)?;
+                let row = super::baselines::NewBaseline {
+                    model_id: body.model_id,
+                    effective_from: body.effective_from,
+                    card,
+                    source: super::baselines::BaselineSource::ThirdParty {
+                        dataset: DATASET.to_string(),
+                        dataset_ref: proposal.dataset_ref.clone(),
+                        pricing_url: proposal.pricing_url.clone(),
+                        prices_checked: proposal.prices_checked,
+                        import_id: id,
+                        proposal_id: pid,
+                        attested_by: auth.id,
+                        attested_at: now,
+                    },
+                };
+                let (revision, _) =
+                    super::baselines::insert_baseline(&mut *conn, &row, Actor::Operator(&auth))
+                        .await?;
+                sqlx::query(
+                    "UPDATE pricing_import_proposals \
+                     SET status = 'confirmed', decided_by = $1, decided_at = $2, \
+                         baseline_revision_id = $3 \
+                     WHERE id = $4",
+                )
+                .bind(auth.id)
+                .bind(now)
+                .bind(revision.revision_id)
+                .bind(pid)
+                .execute(&mut *conn)
+                .await
+                .map_err(DbError::from)?;
+                audit::record(
+                    &mut *conn,
+                    AuditEntry {
+                        actor: Actor::Operator(&auth),
+                        action: "pricing.import.confirm",
+                        target_kind: "pricing_import_proposal",
+                        target_id: Some(pid.to_string()),
+                        tenant_id: None,
+                        detail: serde_json::json!({
+                            "proposal_id": pid,
+                            "model_id": body.model_id,
+                            "attested": true,
+                        }),
+                    },
+                )
+                .await?;
+                Ok::<_, ApiError>(revision)
+            }
+            .boxed()
+        })
+        .await?;
+    Ok((StatusCode::CREATED, Json(revision)))
+}
+
+/// `POST /admin/pricing/imports/{id}/proposals/{pid}/confirm`'s body.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfirmBody {
+    /// The model the baseline prices.
+    model_id: Uuid,
+    /// When it starts; no earlier than the proposal's own date.
+    effective_from: DateTime<Utc>,
+    /// The operator's attestation that the price was checked against the
+    /// provider's page. Must be `true`.
+    #[serde(default)]
+    attested: Option<bool>,
+}
+
+/// `POST /admin/pricing/imports/{id}/proposals/{pid}/reject`, body
+/// `{reason}` → `200 Proposal`.
+///
+/// The reason is 1 to 500 characters (`/reason`). The same `409
+/// proposal_state` as a confirmation, and the same `404`; the row is taken
+/// `FOR UPDATE`, so a decision made meanwhile is refused rather than
+/// overwritten. Nothing is written but the decision: the proposal becomes
+/// `rejected` with the reason, and the audit row is `pricing.import.reject`.
+pub async fn reject(
+    auth: OperatorAuth,
+    State(state): State<AppState>,
+    Path((id, pid)): Path<(String, String)>,
+    ApiJson(body): ApiJson<RejectBody>,
+) -> Result<Json<Proposal>, ApiError> {
+    auth.require(OperatorRole::Operator)?;
+    let reason = body
+        .reason
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_string();
+    if reason.is_empty() {
+        return Err(refused("/reason", "请填写拒绝原因"));
+    }
+    if reason.chars().count() > MAX_REASON_CHARS {
+        return Err(refused("/reason", "拒绝原因最多 500 个字符"));
+    }
+    let id = Uuid::parse_str(&id).map_err(|_| ApiError::not_found())?;
+    let pid = Uuid::parse_str(&pid).map_err(|_| ApiError::not_found())?;
+    let catalogue = state.prices.catalogue().clone();
+    let proposal = state
+        .db
+        .tx(move |conn| {
+            async move {
+                let proposal = lock_proposal(&mut *conn, id, pid).await?;
+                check_pending(&proposal)?;
+                sqlx::query(
+                    "UPDATE pricing_import_proposals \
+                     SET status = 'rejected', reject_reason = $1, decided_by = $2, \
+                         decided_at = now() \
+                     WHERE id = $3",
+                )
+                .bind(&reason)
+                .bind(auth.id)
+                .bind(pid)
+                .execute(&mut *conn)
+                .await
+                .map_err(DbError::from)?;
+                audit::record(
+                    &mut *conn,
+                    AuditEntry {
+                        actor: Actor::Operator(&auth),
+                        action: "pricing.import.reject",
+                        target_kind: "pricing_import_proposal",
+                        target_id: Some(pid.to_string()),
+                        tenant_id: None,
+                        detail: serde_json::json!({
+                            "proposal_id": pid,
+                            "provider": proposal.provider,
+                            "model": proposal.model,
+                        }),
+                    },
+                )
+                .await?;
+                // The decision, in the shape the review page lists it in.
+                read_proposals(
+                    &mut *conn,
+                    |sql| {
+                        sql.push(format!(
+                            "SELECT {PROPOSAL_COLUMNS} FROM pricing_import_proposals p \
+                             WHERE p.id = "
+                        ))
+                        .push_bind(pid);
+                    },
+                    &catalogue,
+                )
+                .await?
+                .pop()
+                .ok_or_else(|| ApiError::internal("the proposal just decided is gone"))
+            }
+            .boxed()
+        })
+        .await?;
+    Ok(Json(proposal))
+}
+
+/// `POST /admin/pricing/imports/{id}/proposals/{pid}/reject`'s body.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RejectBody {
+    /// 1 to 500 characters, stored as given.
+    #[serde(default)]
+    reason: Option<String>,
+}
+
 /// A price map: each price field to its value, kept as the text the file
 /// wrote.
 type PriceMap<'a> = BTreeMap<String, &'a RawValue>;

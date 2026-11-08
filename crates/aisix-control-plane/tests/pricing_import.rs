@@ -742,3 +742,586 @@ async fn an_unknown_batch_is_not_found() {
         assert_eq!(r.body["code"], "not_found");
     }
 }
+
+// ---- Deciding a proposal -------------------------------------------------
+
+/// `POST /admin/pricing/imports/{id}/proposals/{pid}/{action}` with `body`:
+/// `confirm` or `reject`.
+async fn decide(
+    cp: &TestCp,
+    op: &OperatorSession,
+    batch: &Value,
+    proposal: &Value,
+    action: &str,
+    body: Value,
+) -> Resp {
+    let path = format!("{PATH}/{}/proposals/{}/{action}", id(batch), id(proposal));
+    cp.send("POST", &path, Some(op.cookie()), Some(body)).await
+}
+
+/// The `details` paths of a refusal.
+fn refusal_paths(r: &Resp) -> Vec<String> {
+    r.body["details"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no details in {r:?}"))
+        .iter()
+        .map(|d| d["path"].as_str().expect("a path").to_string())
+        .collect()
+}
+
+/// The model's baseline in force now, `null` when it has none.
+async fn current_baseline(cp: &TestCp, op: &OperatorSession, model_id: Uuid) -> Value {
+    let r = cp
+        .send("GET", "/admin/pricing/baselines", Some(op.cookie()), None)
+        .await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let item = r.body["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .find(|i| i["model_id"] == json!(model_id))
+        .unwrap_or_else(|| panic!("no baseline item for {model_id}"));
+    item["current"].clone()
+}
+
+/// The pricing audit rows, in the order they were written: `(action,
+/// target_id, detail)`.
+async fn audits(cp: &TestCp) -> Vec<(String, Option<String>, Value)> {
+    sqlx::query_as(
+        "SELECT action, target_id, detail FROM audit_log \
+         WHERE action LIKE 'pricing.%' ORDER BY id",
+    )
+    .fetch_all(cp.db().pool())
+    .await
+    .expect("read the audit log")
+}
+
+/// The count `pricing_version` holds.
+async fn pricing_version(cp: &TestCp) -> i64 {
+    sqlx::query_scalar(
+        "SELECT (value::text)::bigint FROM cp_settings WHERE key = 'pricing_version'",
+    )
+    .fetch_one(cp.db().pool())
+    .await
+    .expect("read pricing_version")
+}
+
+#[tokio::test]
+async fn confirming_writes_a_third_party_baseline_with_its_attestation() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let op = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let model_id = model(&cp, &op, "anthropic", "claude-opus-5-5").await;
+    let batch = upload(&cp, &op).await;
+    let proposal = current(
+        &proposals(&cp, &op, &batch).await,
+        "anthropic",
+        "claude-opus-5-5",
+    )
+    .clone();
+    assert_eq!(proposal["flags"], json!([]), "confirmable as it stands");
+    let (pricing_url, _) = source("anthropic", "claude-opus-5-5");
+    let version = pricing_version(&cp).await;
+
+    let r = decide(
+        &cp,
+        &op,
+        &batch,
+        &proposal,
+        "confirm",
+        json!({
+            "model_id": model_id,
+            "effective_from": db_now(&cp).await,
+            "attested": true,
+        }),
+    )
+    .await;
+    assert_eq!(r.status, 201, "{r:?}");
+    let revision = &r.body;
+    assert_eq!(revision["model_id"], json!(model_id));
+    assert_eq!(revision["card"], proposal["card"]);
+    assert_eq!(revision["source_kind"], "third_party");
+    assert_eq!(revision["source"]["dataset"], DATASET);
+    assert_eq!(revision["source"]["dataset_ref"], "v2-7de757d");
+    assert_eq!(revision["source"]["pricing_url"], json!(pricing_url));
+    assert_eq!(revision["source"]["prices_checked"], Value::Null);
+    assert_eq!(revision["source"]["import_id"], batch["id"]);
+    assert_eq!(revision["source"]["proposal_id"], proposal["id"]);
+    assert_eq!(revision["source"]["attested_by"], json!(op.id));
+    assert!(revision["source"]["attested_at"].is_string(), "{revision}");
+    assert_eq!(
+        revision["created_by"],
+        json!({"id": op.id, "email": op.email})
+    );
+
+    // The proposal is decided, by whom, and names the revision it wrote.
+    let all = proposals(&cp, &op, &batch).await;
+    let confirmed = all
+        .iter()
+        .find(|p| p["id"] == proposal["id"])
+        .expect("the proposal");
+    assert_eq!(confirmed["status"], "confirmed");
+    assert_eq!(confirmed["decided_by"], json!(op.id));
+    assert!(confirmed["decided_at"].is_string(), "{confirmed}");
+    assert_eq!(confirmed["baseline_revision_id"], revision["revision_id"]);
+
+    // It is what the model bills from now.
+    let current = current_baseline(&cp, &op, model_id).await;
+    assert_eq!(current["revision_id"], revision["revision_id"]);
+    assert_eq!(current["card"], proposal["card"]);
+    assert_eq!(pricing_version(&cp).await, version + 1);
+
+    // Two audit rows: the baseline's own, then the decision.
+    let rows = audits(&cp).await;
+    let actions: Vec<&str> = rows.iter().map(|(a, _, _)| a.as_str()).collect();
+    assert_eq!(
+        actions,
+        vec![
+            "pricing.import.upload",
+            "pricing.baseline.create",
+            "pricing.import.confirm"
+        ],
+        "{rows:?}"
+    );
+    assert_eq!(
+        rows[2].2,
+        json!({"proposal_id": proposal["id"], "model_id": model_id, "attested": true})
+    );
+    assert_eq!(rows[2].1, Some(id(&proposal).to_string()));
+}
+
+#[tokio::test]
+async fn confirming_needs_the_attestation() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let op = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let model_id = model(&cp, &op, "anthropic", "claude-opus-5-5").await;
+    let batch = upload(&cp, &op).await;
+    let proposal = current(
+        &proposals(&cp, &op, &batch).await,
+        "anthropic",
+        "claude-opus-5-5",
+    )
+    .clone();
+    let effective_from = db_now(&cp).await;
+
+    for attested in [Some(json!(false)), None, Some(Value::Null)] {
+        let mut body = json!({"model_id": model_id, "effective_from": effective_from});
+        if let Some(value) = attested.clone() {
+            body["attested"] = value;
+        }
+        let r = decide(&cp, &op, &batch, &proposal, "confirm", body.clone()).await;
+        assert_eq!(r.status, 422, "{body}: {r:?}");
+        assert_eq!(r.body["code"], "validation_failed", "{body}");
+        assert_eq!(refusal_paths(&r), vec!["/attested"], "{body}");
+        assert_eq!(
+            r.body["details"][0]["message"],
+            "请确认已对照官方价格页核对"
+        );
+    }
+
+    assert_eq!(cp.count("pricing_baselines").await, 0);
+    let all = proposals(&cp, &op, &batch).await;
+    assert_eq!(
+        current(&all, "anthropic", "claude-opus-5-5")["status"],
+        "pending"
+    );
+    assert_eq!(audits(&cp).await.len(), 1, "only the upload's own row");
+}
+
+#[tokio::test]
+async fn a_flagged_proposal_cannot_be_confirmed() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let op = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let model_id = model(&cp, &op, "anthropic", "claude-opus-5-5").await;
+    let batch = upload(&cp, &op).await;
+    let all = proposals(&cp, &op, &batch).await;
+
+    // One the import flagged but still carded, and one whose prices made no
+    // card at all.
+    let flagged = all
+        .iter()
+        .find(|p| p["flags"] != json!([]) && !p["card"].is_null())
+        .expect("a flagged proposal with a card");
+    let card_less = all
+        .iter()
+        .find(|p| p["card"].is_null())
+        .expect("a proposal with no card");
+    assert_ne!(card_less["flags"], json!([]), "a card-less one is flagged");
+
+    for proposal in [flagged, card_less] {
+        let r = decide(
+            &cp,
+            &op,
+            &batch,
+            proposal,
+            "confirm",
+            json!({
+                "model_id": model_id,
+                "effective_from": db_now(&cp).await,
+                "attested": true,
+            }),
+        )
+        .await;
+        assert_eq!(r.status, 422, "{proposal}: {r:?}");
+        assert_eq!(r.body["code"], "validation_failed", "{proposal}");
+        assert_eq!(refusal_paths(&r), vec!["/flags"], "{proposal}");
+        assert_eq!(
+            r.body["details"][0]["message"],
+            "该提议含无法自动换算的价格，请手动录入"
+        );
+    }
+
+    assert_eq!(cp.count("pricing_baselines").await, 0);
+    let after = proposals(&cp, &op, &batch).await;
+    for proposal in [flagged, card_less] {
+        let p = after
+            .iter()
+            .find(|p| p["id"] == proposal["id"])
+            .expect("it");
+        assert_eq!(p["status"], "pending", "{p}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_proposal_is_decided_once() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let op = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let model_id = model(&cp, &op, "anthropic", "claude-opus-5-5").await;
+    let batch = upload(&cp, &op).await;
+    let proposal = current(
+        &proposals(&cp, &op, &batch).await,
+        "anthropic",
+        "claude-opus-5-5",
+    )
+    .clone();
+    let body = json!({
+        "model_id": model_id,
+        "effective_from": db_now(&cp).await,
+        "attested": true,
+    });
+
+    let (a, b) = tokio::join!(
+        decide(&cp, &op, &batch, &proposal, "confirm", body.clone()),
+        decide(&cp, &op, &batch, &proposal, "confirm", body.clone()),
+    );
+    let mut statuses = [a.status, b.status];
+    statuses.sort();
+    assert_eq!(statuses, [201, 409], "{a:?} {b:?}");
+    let late = if a.status == 409 { &a } else { &b };
+    assert_eq!(late.body["code"], "proposal_state", "{late:?}");
+    assert_eq!(late.body["error"], "该提议已被处理，请刷新");
+    assert_eq!(cp.count("pricing_baselines").await, 1, "one write, not two");
+
+    // Either verb, afterwards, is the same answer.
+    for (action, body) in [("confirm", body), ("reject", json!({"reason": "重复提交"}))] {
+        let r = decide(&cp, &op, &batch, &proposal, action, body).await;
+        assert_eq!(r.status, 409, "{action}: {r:?}");
+        assert_eq!(r.body["code"], "proposal_state", "{action}");
+    }
+    assert_eq!(cp.count("pricing_baselines").await, 1);
+}
+
+#[tokio::test]
+async fn rejecting_writes_nothing_but_the_decision() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let op = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let model_id = model(&cp, &op, "anthropic", "claude-opus-5-5").await;
+    let batch = upload(&cp, &op).await;
+    let proposal = current(
+        &proposals(&cp, &op, &batch).await,
+        "anthropic",
+        "claude-opus-5-5",
+    )
+    .clone();
+
+    for reason in [json!({}), json!({"reason": ""}), json!({"reason": "   "})] {
+        let r = decide(&cp, &op, &batch, &proposal, "reject", reason.clone()).await;
+        assert_eq!(r.status, 422, "{reason}: {r:?}");
+        assert_eq!(refusal_paths(&r), vec!["/reason"], "{reason}");
+    }
+    let long = "很".repeat(501);
+    let r = decide(
+        &cp,
+        &op,
+        &batch,
+        &proposal,
+        "reject",
+        json!({"reason": long}),
+    )
+    .await;
+    assert_eq!(r.status, 422, "{r:?}");
+    assert_eq!(refusal_paths(&r), vec!["/reason"]);
+    assert_eq!(r.body["details"][0]["message"], "拒绝原因最多 500 个字符");
+
+    let version = pricing_version(&cp).await;
+    let r = decide(
+        &cp,
+        &op,
+        &batch,
+        &proposal,
+        "reject",
+        json!({"reason": "与官方价格页不符"}),
+    )
+    .await;
+    assert_eq!(r.status, 200, "{r:?}");
+    assert_eq!(r.body["id"], proposal["id"]);
+    assert_eq!(r.body["status"], "rejected");
+    assert_eq!(r.body["reject_reason"], "与官方价格页不符");
+    assert_eq!(r.body["decided_by"], json!(op.id));
+    assert!(r.body["decided_at"].is_string(), "{r:?}");
+    assert_eq!(r.body["baseline_revision_id"], Value::Null);
+    // What the review compares it to still reads.
+    assert_eq!(r.body["card"], proposal["card"]);
+
+    // No price, no version bump, and one audit row.
+    assert_eq!(cp.count("pricing_baselines").await, 0);
+    assert_eq!(current_baseline(&cp, &op, model_id).await, Value::Null);
+    assert_eq!(pricing_version(&cp).await, version);
+    let rows = audits(&cp).await;
+    let actions: Vec<&str> = rows.iter().map(|(a, _, _)| a.as_str()).collect();
+    assert_eq!(
+        actions,
+        vec!["pricing.import.upload", "pricing.import.reject"]
+    );
+    assert_eq!(rows[1].1, Some(id(&proposal).to_string()));
+
+    // A reject is a decision: confirming afterwards is refused.
+    let r = decide(
+        &cp,
+        &op,
+        &batch,
+        &proposal,
+        "confirm",
+        json!({
+            "model_id": model_id,
+            "effective_from": db_now(&cp).await,
+            "attested": true,
+        }),
+    )
+    .await;
+    assert_eq!(r.status, 409, "{r:?}");
+    assert_eq!(r.body["code"], "proposal_state");
+}
+
+#[tokio::test]
+async fn a_dated_proposal_starts_no_earlier_than_its_date() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let op = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let model_id = model(&cp, &op, "google", "gemini-3.6-flash").await;
+    let batch = upload(&cp, &op).await;
+    let all = proposals(&cp, &op, &batch).await;
+    let dated = all
+        .iter()
+        .find(|p| {
+            p["provider"] == "google"
+                && p["model"] == "gemini-3.6-flash"
+                && !p["effective_from"].is_null()
+                && p["flags"] == json!([])
+                && !p["card"].is_null()
+        })
+        .unwrap_or_else(|| panic!("no dated, unflagged google/gemini-3.6-flash: {all:?}"))
+        .clone();
+    let starts: chrono::DateTime<chrono::Utc> =
+        serde_json::from_value(dated["effective_from"].clone()).expect("a date");
+
+    let early = decide(
+        &cp,
+        &op,
+        &batch,
+        &dated,
+        "confirm",
+        json!({
+            "model_id": model_id,
+            "effective_from": starts - chrono::TimeDelta::seconds(1),
+            "attested": true,
+        }),
+    )
+    .await;
+    assert_eq!(early.status, 422, "{early:?}");
+    assert_eq!(refusal_paths(&early), vec!["/effective_from"]);
+    assert_eq!(
+        early.body["details"][0]["message"],
+        "生效时间不能早于该提议自己的生效时间"
+    );
+    assert_eq!(cp.count("pricing_baselines").await, 0);
+    let still = proposals(&cp, &op, &batch).await;
+    let p = still.iter().find(|p| p["id"] == dated["id"]).expect("it");
+    assert_eq!(p["status"], "pending", "{p}");
+
+    // From its own date on, it is written.
+    let r = decide(
+        &cp,
+        &op,
+        &batch,
+        &dated,
+        "confirm",
+        json!({"model_id": model_id, "effective_from": starts, "attested": true}),
+    )
+    .await;
+    assert_eq!(r.status, 201, "{r:?}");
+    assert_eq!(r.body["effective_from"], dated["effective_from"]);
+    let current = current_baseline(&cp, &op, model_id).await;
+    assert_eq!(
+        current["revision_id"],
+        Value::Null,
+        "scheduled, not in force"
+    );
+}
+
+#[tokio::test]
+async fn a_superseded_proposal_cannot_be_confirmed() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let op = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let model_id = model(&cp, &op, "anthropic", "claude-opus-5-5").await;
+    let first = upload(&cp, &op).await;
+    let proposal = current(
+        &proposals(&cp, &op, &first).await,
+        "anthropic",
+        "claude-opus-5-5",
+    )
+    .clone();
+    // A newer upload supersedes what the older one left pending.
+    let second = upload(&cp, &op).await;
+    let all = proposals(&cp, &op, &first).await;
+    let superseded = all.iter().find(|p| p["id"] == proposal["id"]).expect("it");
+    assert_eq!(superseded["status"], "superseded");
+
+    for (action, body) in [
+        (
+            "confirm",
+            json!({
+                "model_id": model_id,
+                "effective_from": db_now(&cp).await,
+                "attested": true,
+            }),
+        ),
+        ("reject", json!({"reason": "过期批次"})),
+    ] {
+        let r = decide(&cp, &op, &first, &proposal, action, body).await;
+        assert_eq!(r.status, 409, "{action}: {r:?}");
+        assert_eq!(r.body["code"], "proposal_state", "{action}");
+    }
+    assert_eq!(cp.count("pricing_baselines").await, 0);
+    // The newer batch is untouched and still confirmable.
+    let newer = current(
+        &proposals(&cp, &op, &second).await,
+        "anthropic",
+        "claude-opus-5-5",
+    )
+    .clone();
+    assert_eq!(newer["status"], "pending");
+}
+
+#[tokio::test]
+async fn another_batchs_proposal_is_not_found() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let op = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let model_id = model(&cp, &op, "anthropic", "claude-opus-5-5").await;
+    let first = upload(&cp, &op).await;
+    let proposal = current(
+        &proposals(&cp, &op, &first).await,
+        "anthropic",
+        "claude-opus-5-5",
+    )
+    .clone();
+    let second = upload(&cp, &op).await;
+    let body = json!({
+        "model_id": model_id,
+        "effective_from": db_now(&cp).await,
+        "attested": true,
+    });
+
+    // The older batch's proposal addressed under the newer batch: not found,
+    // though it exists and is superseded.
+    let path = format!("{PATH}/{}/proposals/{}/confirm", id(&second), id(&proposal));
+    let r = cp
+        .send("POST", &path, Some(op.cookie()), Some(body.clone()))
+        .await;
+    assert_eq!(r.status, 404, "{r:?}");
+    assert_eq!(r.body["code"], "not_found");
+    for pid in [Uuid::new_v4().to_string(), "not-a-uuid".to_string()] {
+        let path = format!("{PATH}/{}/proposals/{pid}/confirm", id(&second));
+        let r = cp
+            .send("POST", &path, Some(op.cookie()), Some(body.clone()))
+            .await;
+        assert_eq!(r.status, 404, "{pid}: {r:?}");
+        let path = format!("{PATH}/{}/proposals/{pid}/reject", id(&second));
+        let r = cp
+            .send(
+                "POST",
+                &path,
+                Some(op.cookie()),
+                Some(json!({"reason": "无此提议"})),
+            )
+            .await;
+        assert_eq!(r.status, 404, "{pid}: {r:?}");
+    }
+    assert_eq!(cp.count("pricing_baselines").await, 0);
+}
+
+#[tokio::test]
+async fn who_may_decide() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let viewer = cp.admin_login_seeded(OperatorRole::Viewer).await;
+    let op = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let model_id = model(&cp, &op, "anthropic", "claude-opus-5-5").await;
+    let batch = upload(&cp, &op).await;
+    let all = proposals(&cp, &op, &batch).await;
+    let proposal = current(&all, "anthropic", "claude-opus-5-5").clone();
+    let other = all
+        .iter()
+        .find(|p| p["id"] != proposal["id"] && p["flags"] == json!([]))
+        .expect("a second confirmable proposal")
+        .clone();
+    let body = json!({
+        "model_id": model_id,
+        "effective_from": db_now(&cp).await,
+        "attested": true,
+    });
+
+    let r = decide(&cp, &viewer, &batch, &proposal, "confirm", body.clone()).await;
+    assert_eq!(r.status, 403, "{r:?}");
+    assert_eq!(r.body["code"], "forbidden");
+    let r = decide(
+        &cp,
+        &viewer,
+        &batch,
+        &proposal,
+        "reject",
+        json!({"reason": "x"}),
+    )
+    .await;
+    assert_eq!(r.status, 403, "{r:?}");
+    assert_eq!(cp.count("pricing_baselines").await, 0);
+    assert_eq!(audits(&cp).await.len(), 1, "only the upload's own row");
+
+    let r = decide(&cp, &op, &batch, &proposal, "confirm", body).await;
+    assert_eq!(r.status, 201, "{r:?}");
+    let r = decide(
+        &cp,
+        &op,
+        &batch,
+        &other,
+        "reject",
+        json!({"reason": "与官方价格页不符"}),
+    )
+    .await;
+    assert_eq!(r.status, 200, "{r:?}");
+}
