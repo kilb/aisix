@@ -4,6 +4,7 @@ import { ApiError, operators, type Detail, type OperatorAccount, type OperatorRo
 import { messageFor } from "../lib/errors";
 import { errorText, fmtTime } from "../lib/fmt";
 import { Button } from "../ui/Button";
+import { useRefusalFocus } from "../ui/Field";
 import { DataTable, Loading } from "../ui/DataTable";
 import { Lamp } from "../ui/Lamp";
 
@@ -241,6 +242,7 @@ function CreateForm({
   const [failure, setFailure] = useState<{ text: string; details: Detail[] } | null>(null);
   const [busy, setBusy] = useState(false);
   const ids = { email: useId(), name: useId(), password: useId() };
+  const [form, focusRefusal] = useRefusalFocus<HTMLFormElement>();
 
   async function submit(e: React.FormEvent) {
     e.preventDefault();
@@ -262,6 +264,7 @@ function CreateForm({
           ? { text: messageFor(err), details: err.details }
           : { text: err instanceof Error ? err.message : String(err), details: [] },
       );
+      focusRefusal();
     } finally {
       setBusy(false);
     }
@@ -276,7 +279,7 @@ function CreateForm({
   const listed = failure?.details.filter((d) => !["/email", "/display_name", "/password"].includes(d.path)) ?? [];
 
   return (
-    <form className="panel" aria-label="新建运维账号" onSubmit={(e) => void submit(e)}>
+    <form ref={form} className="panel" aria-label="新建运维账号" onSubmit={(e) => void submit(e)}>
       <h2>新建运维账号</h2>
       <label className="f">
         <span>邮箱</span>

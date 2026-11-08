@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import type { TabProps } from "../App";
-import { Field } from "../ui/Field";
+import { Field, useRefusalFocus } from "../ui/Field";
 import { Msg, type Note } from "../components/Msg";
 import {
   ApiError,
@@ -211,6 +211,7 @@ function IssueForm({ onIssued }: { onIssued: (b: IssuedCredential) => void }) {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [details, setDetails] = useState<Detail[]>([]);
+  const [form, focusRefusal] = useRefusalFocus<HTMLFormElement>();
 
   if (!open) {
     return (
@@ -234,6 +235,7 @@ function IssueForm({ onIssued }: { onIssued: (b: IssuedCredential) => void }) {
     } catch (e) {
       setErr(errorText(e));
       if (e instanceof ApiError) setDetails(e.details);
+      focusRefusal();
     } finally {
       setBusy(false);
     }
@@ -243,7 +245,7 @@ function IssueForm({ onIssued }: { onIssued: (b: IssuedCredential) => void }) {
   const listed = details.filter((d) => !ISSUE_FIELDS.includes(d.path));
 
   return (
-    <form onSubmit={submit}>
+    <form ref={form} onSubmit={submit}>
       <div className="r">
         <Field label="名称" error={at("/name")}>
           {(aria) => <input required value={name} onChange={(e) => setName(e.target.value)} {...aria} />}

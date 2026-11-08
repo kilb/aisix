@@ -288,3 +288,25 @@ test("事实行里的中点有自己的宽度，不压在后面的空格上", as
   expect(width, "a half-width dot, not a full-width one").toBeLessThan(size * 0.75);
   await page.context().close();
 });
+
+test("提交被拒时焦点落在第一个被拒的字段上，读屏能读到原因", async ({ browser }) => {
+  const page = await systemDarkPage(browser);
+  await signIn(page);
+  await openTab(page, "密钥", "legacy-import");
+  const label = page.getByLabel("名称", { exact: true });
+  const concurrency = page.getByLabel("并发", { exact: true });
+  const rpm = page.getByLabel("每分钟请求", { exact: true });
+  await label.fill("focus-key-7e4");
+  await concurrency.fill("3");
+  // Over the organisation's cap of 600 a minute; the concurrency is within its cap.
+  await rpm.fill("9000");
+  await page.getByRole("button", { name: "新建密钥" }).click();
+
+  // Only the per-minute limit is refused, and the focus goes to it, past the
+  // fields before it, so a screen reader reads the field and its refusal.
+  await expect(rpm).toHaveAttribute("aria-invalid", "true");
+  await expect(concurrency).not.toHaveAttribute("aria-invalid", "true");
+  await expect(rpm).toBeFocused();
+  await expect(page.getByRole("main").getByText("focus-key-7e4", { exact: true })).toHaveCount(0);
+  await page.context().close();
+});

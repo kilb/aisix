@@ -1,7 +1,7 @@
 // Shared: web-cp/src/ui and web-tenant/src/ui carry byte-equal copies of
 // this file, pinned by web-tenant/src/lib/tokenParity.test.ts; change both
 // together. The contract is in CONTRACT.md beside it.
-import { useId, type ReactNode } from "react";
+import { useCallback, useEffect, useId, useRef, useState, type ReactNode, type RefObject } from "react";
 
 /** What a control under a `Field` carries so its hint and its refusal describe it. */
 export interface FieldAria {
@@ -60,4 +60,34 @@ export function Field({
       )}
     </div>
   );
+}
+
+/** What can take the focus, in a refused control or inside a refused group. */
+const FOCUSABLE = "input:not([type='hidden']):not(:disabled), select:not(:disabled), textarea:not(:disabled), button:not(:disabled), [tabindex]:not([tabindex='-1'])";
+
+/**
+ * Focus for a refused submit. Put the returned ref on the form (or the
+ * part of a page that holds its fields), and call the returned function
+ * whenever a submit comes back with field refusals, from the server or
+ * from the form's own checks. Once those refusals have rendered, the focus
+ * moves to the first refused control in document order (the first
+ * `aria-invalid="true"`), so a screen reader reads its label and, through
+ * its `aria-describedby`, the refusal; a refused group (a fieldset) passes
+ * the focus to its first control. When no field was refused, the focus
+ * stays where it is and the form's own `role="alert"` note speaks.
+ */
+export function useRefusalFocus<T extends HTMLElement>(): [RefObject<T | null>, () => void] {
+  const container = useRef<T>(null);
+  const [asked, setAsked] = useState(0);
+  useEffect(() => {
+    if (asked === 0) return;
+    for (const refused of container.current?.querySelectorAll<HTMLElement>('[aria-invalid="true"]') ?? []) {
+      const target = refused.matches(FOCUSABLE) ? refused : refused.querySelector<HTMLElement>(FOCUSABLE);
+      if (target) {
+        target.focus();
+        return;
+      }
+    }
+  }, [asked]);
+  return [container, useCallback(() => setAsked((n) => n + 1), [])];
 }

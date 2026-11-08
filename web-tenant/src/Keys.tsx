@@ -18,7 +18,7 @@ import { ShownOnce } from "./controls";
 import { Button } from "./ui/Button";
 import { DataTable, Loading } from "./ui/DataTable";
 import { EmptyState } from "./ui/EmptyState";
-import { Field } from "./ui/Field";
+import { Field, useRefusalFocus } from "./ui/Field";
 import { Lamp, type LampState } from "./ui/Lamp";
 import { TwoStep } from "./ui/TwoStep";
 
@@ -325,6 +325,7 @@ function NewKeyForm({
   const [errs, setErrs] = useState<FieldErrors>({});
   const [err, setErr] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [form, focusRefusal] = useRefusalFocus<HTMLFormElement>();
 
   async function submit(e: React.FormEvent) {
     e.preventDefault();
@@ -341,7 +342,10 @@ function NewKeyForm({
       else expiresAt = at.toISOString();
     }
     setErrs(found);
-    if (Object.keys(found).length > 0) return;
+    if (Object.keys(found).length > 0) {
+      focusRefusal();
+      return;
+    }
 
     // Only what was set is sent: no model picked follows every grant, and a
     // limit left empty follows the organisation's cap.
@@ -372,6 +376,7 @@ function NewKeyForm({
         }
         setErrs(byField);
         if (rest.length > 0) setErr(rest.join("；"));
+        focusRefusal();
       } else if (e instanceof ApiError && e.code === "unavailable") {
         setErr("平台暂时无法创建密钥，请稍后再试");
       } else if (e instanceof ApiError && e.code === "tenant_not_active") {
@@ -398,7 +403,7 @@ function NewKeyForm({
           {readErr}
         </div>
       )}
-      <form className="form cols" onSubmit={submit} noValidate>
+      <form ref={form} className="form cols" onSubmit={submit} noValidate>
         <Field label="名称" wide error={errs.label}>
           {(aria) => <input value={label} onChange={(e) => setLabel(e.target.value)} {...aria} />}
         </Field>

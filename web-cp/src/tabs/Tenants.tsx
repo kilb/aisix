@@ -24,6 +24,7 @@ import {
 import { messageFor } from "../lib/errors";
 import { errorText, fmtInt, fmtTime } from "../lib/fmt";
 import { Button } from "../ui/Button";
+import { useRefusalFocus } from "../ui/Field";
 import { CopyButton } from "../ui/CopyButton";
 import { DataTable, Loading } from "../ui/DataTable";
 import { EmptyState } from "../ui/EmptyState";
@@ -739,6 +740,7 @@ function GrantsPart({
   catalogError,
 }: PartProps & { catalog: ResourceView<ModelDoc>[] | null; catalogError: string | null }) {
   const [chosen, setChosen] = useState(() => new Set(tenant.allowed_model_ids));
+  const [part, focusRefusal] = useRefusalFocus<HTMLFieldSetElement>();
   // The ids in the order last sent: a refusal names an entry by its index.
   const [sent, setSent] = useState<string[]>([]);
   const [refused, setRefused] = useState<Refusal | null>(null);
@@ -792,13 +794,14 @@ function GrantsPart({
       setNote({ kind: "ok", text: "已保存授权。" });
     } catch (e) {
       setRefused(refusal(e, (p) => /^\/allowed_model_ids\/\d+$/.test(p)));
+      focusRefusal();
     } finally {
       setBusy(false);
     }
   }
 
   return (
-    <fieldset className="tn-section">
+    <fieldset ref={part} className="tn-section">
       <legend>授权模型</legend>
       <p className="hint">租户只能使用这里授权的模型，按平台名称调用；改名不影响授权。删除模型会把它从所有授权里移除。</p>
       {catalogError && (
@@ -866,6 +869,7 @@ function GroupsPart({
   groupsError,
 }: PartProps & { options: string[]; accounts: Map<string, string[]>; groupsError: string | null }) {
   const [chosen, setChosen] = useState<string[]>(tenant.allowed_provider_groups);
+  const [part, focusRefusal] = useRefusalFocus<HTMLFieldSetElement>();
   const [sent, setSent] = useState<string[]>([]);
   const [refused, setRefused] = useState<Refusal | null>(null);
   const [note, setNote] = useState<Note | null>(null);
@@ -894,6 +898,7 @@ function GroupsPart({
       setNote({ kind: "ok", text: "已保存分组。" });
     } catch (e) {
       setRefused(refusal(e, atList("/allowed_provider_groups")));
+      focusRefusal();
     } finally {
       setBusy(false);
     }
@@ -901,7 +906,7 @@ function GroupsPart({
 
   const whole = refused?.at.get("/allowed_provider_groups");
   return (
-    <fieldset className="tn-section">
+    <fieldset ref={part} className="tn-section">
       <legend>可用分组</legend>
       <p className="hint">
         租户看不到分组名。该租户的密钥只会路由到这些分组里的上游账号；单个密钥设了分组覆盖时以覆盖为准。
@@ -1022,6 +1027,7 @@ export function LimitInput({
 
 function LimitsPart({ tenant, canEdit, save, onReload }: PartProps) {
   const [draft, setDraft] = useState(() => limitDraft(tenant.limits));
+  const [part, focusRefusal] = useRefusalFocus<HTMLFieldSetElement>();
   const [refused, setRefused] = useState<Refusal | null>(null);
   const [note, setNote] = useState<Note | null>(null);
   const [busy, setBusy] = useState(false);
@@ -1042,13 +1048,14 @@ function LimitsPart({ tenant, canEdit, save, onReload }: PartProps) {
       setNote({ kind: "ok", text: "已保存限额。" });
     } catch (e) {
       setRefused(refusal(e, (p) => LIMIT_FIELDS.some(({ field }) => p === `/limits/${field}`)));
+      focusRefusal();
     } finally {
       setBusy(false);
     }
   }
 
   return (
-    <fieldset className="tn-section">
+    <fieldset ref={part} className="tn-section">
       <legend>限额</legend>
       <p className="hint">
         前三项限制整个租户（全部密钥合计）；后两项是单个密钥最多能设的值，密钥自己不设时就按这个上限。留空表示不限。
@@ -1178,6 +1185,7 @@ function InvitePart({ tenant }: { tenant: Tenant }) {
   const [copied, setCopied] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const emailErrorId = useId();
+  const [form, focusRefusal] = useRefusalFocus<HTMLFormElement>();
 
   async function submit(e: React.FormEvent) {
     e.preventDefault();
@@ -1190,6 +1198,7 @@ function InvitePart({ tenant }: { tenant: Tenant }) {
       setEmail("");
     } catch (err) {
       setRefused(refusal(err, (p) => p === "/email"));
+      focusRefusal();
     } finally {
       setBusy(false);
     }
@@ -1200,7 +1209,7 @@ function InvitePart({ tenant }: { tenant: Tenant }) {
   const emailError = refused?.at.get("/email");
   return (
     // The control plane judges the address: its refusal is shown at the field.
-    <form onSubmit={(e) => void submit(e)} noValidate>
+    <form ref={form} onSubmit={(e) => void submit(e)} noValidate>
       <fieldset className="tn-section">
         <legend>邀请成员</legend>
         <p className="hint">生成一次性的邀请 token，交给受邀人在租户门户接受邀请、设置口令。</p>
@@ -1413,6 +1422,7 @@ export function OverrideEditor({
   onReload: () => void;
 }) {
   const [chosen, setChosen] = useState<string[]>(k.allowed_provider_groups ?? []);
+  const [part, focusRefusal] = useRefusalFocus<HTMLFieldSetElement>();
   // The version the edit started from. A list read while the editor is open
   // brings a newer `k`; a change made meanwhile must refuse this save (412),
   // not be overwritten by it.
@@ -1430,6 +1440,7 @@ export function OverrideEditor({
       onSaved(await keysApi.update(k.id, { allowed_provider_groups: groups }, version));
     } catch (e) {
       setRefused(refusal(e, atList("/allowed_provider_groups")));
+      focusRefusal();
     } finally {
       setBusy(false);
     }
@@ -1439,7 +1450,7 @@ export function OverrideEditor({
   const picked = shown.filter((g) => chosen.includes(g));
   const reachable = (g: string) => (accounts.get(g) ?? []).length > 0;
   return (
-    <fieldset className="tn-override">
+    <fieldset ref={part} className="tn-override">
       <legend>分组覆盖</legend>
       <p className="hint">只对这个密钥生效，取代租户的可用分组；清除覆盖后沿用租户的分组。</p>
       <GroupPicker
@@ -1522,6 +1533,7 @@ function DefaultsForm({
   onSaved: (defaults: TenantDefaults) => void;
 }) {
   const [draft, setDraft] = useState(() => limitDraft(stored));
+  const [panel, focusRefusal] = useRefusalFocus<HTMLElement>();
   const [chosen, setChosen] = useState<string[]>(stored.default_provider_groups);
   const [sent, setSent] = useState<string[]>([]);
   const [refused, setRefused] = useState<Refusal | null>(null);
@@ -1549,6 +1561,7 @@ function DefaultsForm({
           (p) => atList("/default_provider_groups")(p) || LIMIT_FIELDS.some(({ field }) => p === `/${field}`),
         ),
       );
+      focusRefusal();
     } finally {
       setBusy(false);
     }
@@ -1556,7 +1569,7 @@ function DefaultsForm({
 
   const whole = refused?.at.get("/default_provider_groups");
   return (
-    <section className="panel" aria-label="新租户默认值">
+    <section ref={panel} className="panel" aria-label="新租户默认值">
       <h2>新租户默认值</h2>
       <p className="hint">新租户创建时复制这里的限额与默认分组；修改不影响已有租户。留空的限额表示不限。</p>
       <LimitInputs draft={draft} onChange={setDraft} disabled={false} errorFor={(field) => refused?.at.get(`/${field}`)} />

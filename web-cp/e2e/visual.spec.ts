@@ -238,3 +238,25 @@ test("分区导航只用键盘也能走遍：方向键、Home、End 移动，回
   await expect(page.getByRole("tabpanel", { name: "上游账号" })).toBeVisible();
   await page.context().close();
 });
+
+test("提交被拒时焦点落在第一个被拒的字段上，表单的提示照常播报", async ({ browser }) => {
+  const page = await systemDark(browser);
+  await login(page);
+  await open(page, "gateways");
+  await page.getByRole("button", { name: "签发网关凭据" }).click();
+  const name = page.getByLabel("名称");
+  const days = page.getByLabel("有效期（天）");
+  await name.fill("gw-focus-3c8");
+  await days.fill("100000");
+  await page.getByRole("button", { name: "签发" }).click();
+
+  // Only the validity is refused, and the focus goes to it, past the name
+  // before it; the form's own note still speaks for the whole refusal.
+  await expect(days).toHaveAttribute("aria-invalid", "true");
+  await expect(name).not.toHaveAttribute("aria-invalid", "true");
+  await expect(days).toBeFocused();
+  await expect(page.locator("main form").getByRole("alert")).toBeVisible();
+  const { items } = await stack.admin.get("/admin/gateways/credentials");
+  expect((items as { name: string }[]).map((c) => c.name)).not.toContain("gw-focus-3c8");
+  await page.context().close();
+});

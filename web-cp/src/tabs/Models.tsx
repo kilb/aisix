@@ -1,7 +1,7 @@
 import { Fragment, useEffect, useRef, useState } from "react";
 import type { TabProps } from "../App";
 import { ConflictNote } from "../components/ConflictNote";
-import { Field } from "../ui/Field";
+import { Field, useRefusalFocus } from "../ui/Field";
 import { Msg, type Note } from "../components/Msg";
 import { RolloutBadge } from "../components/RolloutBadge";
 import { ApiError, tenants, type ResourceView, type Tenant } from "../lib/api";
@@ -508,6 +508,7 @@ function ModelForm({
   // The target row whose `移除` was clicked once, awaiting `确认移除`.
   const [removing, setRemoving] = useState<number | null>(null);
   const nextKey = useRef(initial.rows.length);
+  const [form, focusRefusal] = useRefusalFocus<HTMLFormElement>();
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<ApiError | string | null>(null);
   const [conflict, setConflict] = useState(false);
@@ -620,6 +621,7 @@ function ModelForm({
     } catch (e) {
       if (e instanceof ApiError && e.code === "version_mismatch") setConflict(true);
       else setErr(e instanceof ApiError ? e : String(e));
+      focusRefusal();
     } finally {
       setBusy(false);
     }
@@ -645,7 +647,7 @@ function ModelForm({
   const listed = details.filter((d) => !shown.includes(d.path));
 
   return (
-    <form className="panel" aria-label={title} onSubmit={submit}>
+    <form ref={form} className="panel" aria-label={title} onSubmit={submit}>
       <h2>{title}</h2>
       <Field label="对外名称" error={at("/display_name")}>
         {(aria) => <input required disabled={locked} value={name} onChange={(e) => setName(e.target.value)} {...aria} />}

@@ -7,6 +7,7 @@ import { ApiError, resources, type Detail, type ResourceView } from "../lib/api"
 import { messageFor } from "../lib/errors";
 import { useResource } from "../lib/useResource";
 import { Button } from "../ui/Button";
+import { useRefusalFocus } from "../ui/Field";
 import { DataTable, Loading } from "../ui/DataTable";
 import { EmptyState } from "../ui/EmptyState";
 
@@ -96,6 +97,7 @@ function KindPage({ info, canEdit }: { info: KindInfo; canEdit: boolean }) {
   const [conflict, setConflict] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [panel, focusRefusal] = useRefusalFocus<HTMLDivElement>();
 
   const current = editing?.mode === "edit" ? items?.find((i) => i.id === editing.id) : undefined;
   const writable = canEdit && info.writable;
@@ -156,7 +158,10 @@ function KindPage({ info, canEdit }: { info: KindInfo; canEdit: boolean }) {
     if (!editing) return;
     clearOutcome();
     const doc = parsed();
-    if (doc === null) return;
+    if (doc === null) {
+      focusRefusal();
+      return;
+    }
     setBusy(true);
     try {
       const view =
@@ -167,6 +172,7 @@ function KindPage({ info, canEdit }: { info: KindInfo; canEdit: boolean }) {
       void watch(view.id).catch(() => undefined);
     } catch (e) {
       refused(e);
+      focusRefusal();
     } finally {
       setBusy(false);
     }
@@ -259,7 +265,7 @@ function KindPage({ info, canEdit }: { info: KindInfo; canEdit: boolean }) {
       </div>
 
       {editing && (
-        <div className="panel">
+        <div ref={panel} className="panel">
           <h2>
             {editing.mode === "new" ? `新建${info.label}` : (current && nameOf(current.doc)) || editing.id}
             {current && <RolloutBadge rollout={current.rollout} />}

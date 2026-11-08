@@ -37,6 +37,7 @@ import {
   type Refusal,
 } from "./Tenants";
 import { Button } from "../ui/Button";
+import { useRefusalFocus } from "../ui/Field";
 import { CopyButton } from "../ui/CopyButton";
 import { DataTable, Loading } from "../ui/DataTable";
 import { EmptyState } from "../ui/EmptyState";
@@ -565,6 +566,7 @@ function CreateForm({
   const [sent, setSent] = useState<NewKey | null>(null);
   const [refused, setRefused] = useState<Refusal | null>(null);
   const [busy, setBusy] = useState(false);
+  const [part, focusRefusal] = useRefusalFocus<HTMLFieldSetElement>();
 
   const grants = useMemo(
     () =>
@@ -604,6 +606,7 @@ function CreateForm({
       onMinted(await keysApi.create(tenant.id, b));
     } catch (e) {
       setRefused(refusal(e, placedInForm));
+      focusRefusal();
     } finally {
       setBusy(false);
     }
@@ -616,7 +619,7 @@ function CreateForm({
     .join("；");
 
   return (
-    <fieldset className="tn-section">
+    <fieldset ref={part} className="tn-section">
       <legend>新建密钥</legend>
       <TextField label="名称" value={label} onChange={setLabel} error={at("/label")} />
       {tenant.is_internal ? (

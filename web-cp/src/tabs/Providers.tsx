@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import type { TabProps } from "../App";
 import { ConflictNote } from "../components/ConflictNote";
-import { Field } from "../ui/Field";
+import { Field, useRefusalFocus } from "../ui/Field";
 import { Msg, type Note } from "../components/Msg";
 import { RolloutBadge } from "../components/RolloutBadge";
 import { REDACTED, SecretInput } from "../components/SecretInput";
@@ -407,6 +407,7 @@ function AccountForm({
   const [removal, setRemoval] = useState<{ dropped: string[]; impact: Impact | string | null } | null>(null);
   // Numbers each impact lookup; a result is applied only while its number is the latest.
   const lookup = useRef(0);
+  const [form, focusRefusal] = useRefusalFocus<HTMLFormElement>();
 
   // A new account takes the first protocol family once the schema arrives.
   useEffect(() => {
@@ -470,6 +471,7 @@ function AccountForm({
       setRemoval(null);
       if (e instanceof ApiError && e.code === "version_mismatch") setConflict(true);
       else setErr(e instanceof ApiError ? e : String(e));
+      focusRefusal();
     } finally {
       setBusy(false);
     }
@@ -503,7 +505,7 @@ function AccountForm({
   }
 
   return (
-    <form className="panel" aria-label={title} onSubmit={submit}>
+    <form ref={form} className="panel" aria-label={title} onSubmit={submit}>
       <h2>{title}</h2>
       <div className="r">
         <Field label="名称" error={at("name")}>

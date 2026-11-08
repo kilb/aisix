@@ -9,6 +9,7 @@ import { defaultAt, enumAt, loadSchema, SchemaShapeError, valueDescriptionsAt } 
 import { useResource } from "../lib/useResource";
 import { Failure } from "./Tenants";
 import { Button } from "../ui/Button";
+import { useRefusalFocus } from "../ui/Field";
 import { DataTable, Loading } from "../ui/DataTable";
 import { EmptyState } from "../ui/EmptyState";
 import { Lamp } from "../ui/Lamp";
@@ -89,6 +90,7 @@ export function Cache({ canEdit, onGoto }: TabProps) {
   const [deleteFailure, setDeleteFailure] = useState<{ id: string; error: unknown } | null>(null);
   const scopeProblemId = useId();
   const ttlProblemId = useId();
+  const [panel, focusRefusal] = useRefusalFocus<HTMLDivElement>();
 
   useEffect(() => {
     let live = true;
@@ -193,6 +195,7 @@ export function Cache({ canEdit, onGoto }: TabProps) {
       void policies.watch(view.id).catch(() => undefined);
     } catch (e) {
       refused(e);
+      focusRefusal();
     } finally {
       setBusy(false);
     }
@@ -332,7 +335,7 @@ export function Cache({ canEdit, onGoto }: TabProps) {
       </div>
 
       {form && (
-        <div className="panel">
+        <div ref={panel} className="panel">
           <h2>
             {form.id === null ? "新建缓存策略" : `缓存策略 ${form.base.name ?? ""}`}
             {current && <RolloutBadge rollout={current.rollout} />}
