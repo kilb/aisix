@@ -642,3 +642,84 @@ export const topups = {
     return (await call<Topup>("POST", `/admin/billing/topups/${seg(id)}/reject`, { reason })).data;
   },
 };
+
+/** One entry of the built-in price catalogue: a model's public list prices and where they came from. */
+export interface CatalogueEntry {
+  /** `<provider>/<model_name>`. */
+  key: string;
+  aliases: string[];
+  source_url: string;
+  /** The day the provider's page was read (`YYYY-MM-DD`). */
+  as_of: string;
+  /** The first UTC day these rates apply; null means from the beginning. */
+  effective_from: string | null;
+  notes: string | null;
+  /** The entry's rate card, as the control plane stores it. */
+  card: Record<string, unknown>;
+}
+
+/** The built-in price catalogue. */
+export const catalogue = {
+  async entries(): Promise<{ version: number; items: CatalogueEntry[] }> {
+    return (await call<{ version: number; items: CatalogueEntry[] }>("GET", "/admin/pricing/catalogue")).data;
+  },
+};
+
+/** One charge: what a stored usage row was billed, or why it could not be. Amounts are integer micro-dollars. */
+export interface Charge {
+  seq: number;
+  event_id: string;
+  tenant_id: string;
+  api_key_id: string;
+  user_id: string;
+  requested_model_id: string;
+  occurred_at: string;
+  status: "charged" | "exempt" | "nothing_to_bill" | "unpriced";
+  charge_micro_usd: number | null;
+  cost_micro_usd: number | null;
+  service_tier: string | null;
+  requested_service_tier: string | null;
+  long_context_above: number | null;
+  estimated: boolean;
+  exemption: string | null;
+  /** The pricing code behind an `unpriced` charge. */
+  error_code: string | null;
+}
+
+export interface ChargeFilter {
+  status?: string;
+  tenant_id?: string;
+  api_key_id?: string;
+  event_id?: string;
+  before?: number;
+}
+
+/** The per-call charges, newest first. */
+export const charges = {
+  async list(f: ChargeFilter = {}): Promise<{ items: Charge[]; next_before: number | null }> {
+    const q = new URLSearchParams();
+    for (const [k, v] of Object.entries(f)) if (v !== undefined && v !== "") q.set(k, String(v));
+    const qs = q.toString();
+    return (await call<{ items: Charge[]; next_before: number | null }>("GET", `/admin/pricing/charges${qs ? `?${qs}` : ""}`)).data;
+  },
+};
+
+/** A price revision the pricing engine cannot use; charges that need it come out unpriced. */
+export interface InvalidRevision {
+  table: string;
+  revision_id: string | number;
+  reason: string;
+}
+
+/** The pricing health: version, unusable revisions and the last 24 hours' unpriced charges by code. */
+export interface PricingStatus {
+  pricing_version: number | null;
+  invalid_revisions: InvalidRevision[];
+  unpriced_last_24h: { total: number; by_code: Record<string, number> };
+}
+
+export const pricingStatus = {
+  async get(): Promise<PricingStatus> {
+    return (await call<PricingStatus>("GET", "/admin/pricing/status")).data;
+  },
+};
