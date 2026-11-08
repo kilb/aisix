@@ -282,6 +282,8 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
+    use crate::rates::MAX_QUANTITY;
+
     /// A wire row as the gateway sends it, with the two required fields
     /// filled in when the JSON leaves them out.
     fn row(json: &str) -> BillableUsage {
@@ -816,6 +818,76 @@ mod tests {
             web_search: 1024,
         };
         assert_eq!(q.input_total(), 1 + 2 + 4 + 8 + 64 + 256);
+    }
+
+    /// Ruling R1: `MAX_QUANTITY` bounds every quantity a row can bill, which
+    /// is what keeps a charge's numerator exact in `u128` (asserted in
+    /// `rates.rs`). Each row is consistent and pushes some quantity to its
+    /// largest; a counter widened past `u32` stops this from compiling.
+    #[test]
+    fn no_quantity_exceeds_max_quantity() {
+        let max = u32::MAX;
+        let rows = [
+            // Every counter at its largest. No u32 total can place the
+            // reasoning beside the completion, so it is part of it.
+            BillableUsage {
+                prompt_tokens: max,
+                cache_read_tokens: max,
+                cache_creation_tokens: max,
+                completion_tokens: max,
+                reasoning_tokens: max,
+                web_search_requests: max,
+                ..BillableUsage::default()
+            },
+            // Both cache reads, the subset one and the additive one.
+            BillableUsage {
+                prompt_tokens: max,
+                cached_prompt_tokens: max,
+                cache_read_tokens: max,
+                cache_creation_tokens: max,
+                ..BillableUsage::default()
+            },
+            // Both cache writes, with no lifetime split.
+            BillableUsage {
+                prompt_tokens: max,
+                cache_write_tokens: Some(max),
+                cache_creation_tokens: max,
+                cache_read_tokens: max,
+                ..BillableUsage::default()
+            },
+            // Reasoning beside the completion, as large as a u32 total allows.
+            BillableUsage {
+                completion_tokens: 1,
+                reasoning_tokens: max - 1,
+                total_tokens: max,
+                ..BillableUsage::default()
+            },
+            // Every modality at its largest.
+            BillableUsage {
+                prompt_tokens: max,
+                completion_tokens: max,
+                prompt_audio_tokens: Some(max),
+                prompt_image_tokens: Some(max),
+                completion_audio_tokens: Some(max),
+                completion_image_tokens: Some(max),
+                ..BillableUsage::default()
+            },
+        ];
+        for (i, u) in rows.iter().enumerate() {
+            let q = quantities(u).unwrap();
+            for d in Dimension::ALL {
+                assert!(u128::from(q.get(d)) <= MAX_QUANTITY, "row {i}: {d}");
+            }
+            // The six input buckets together, the largest sum a row holds.
+            assert!(u128::from(q.input_total()) <= MAX_QUANTITY, "row {i}");
+        }
+        // The first row reaches the bound, so it is no looser than it says.
+        let q = quantities(&rows[0]).unwrap();
+        assert_eq!(u128::from(q.input_total()), MAX_QUANTITY);
+        assert_eq!(
+            (q.reasoning, q.web_search),
+            (u64::from(max), u64::from(max))
+        );
     }
 
     // ---- properties over consistent rows ----
