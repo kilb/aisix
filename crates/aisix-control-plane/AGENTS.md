@@ -68,7 +68,18 @@ way.
   commit. Intake updates each account once, flag included
   (`ledger::post_flagging`): a second update of a row in one transaction has
   the foreign key's check key-share its tenant row, which a held tenant would
-  make intake wait on.
+  make intake wait on. So every flag is decided before the posting, the
+  balance's (`marks::crossings`) and the quotas' (`budgets::count_charges`,
+  which writes only spend rows);
+  `a_crossing_batch_never_waits_on_a_held_tenant_row` and
+  `a_batch_that_crosses_only_a_quota_never_waits_on_a_held_tenant_row` pin
+  it. The account lock is `FOR NO KEY UPDATE` (`ledger::lock_account`), so a
+  row that references an account, such as a top-up request, is inserted
+  without waiting on intake
+  (`a_topup_request_never_waits_on_intakes_account_lock`). A quota row is
+  locked only by the writes in `billing::budgets`, after the billing lock:
+  intake's spend upsert key-shares it while holding the account, so a lock
+  on a quota row taken before the account would deadlock with intake.
   `every_marking_path_takes_the_account_before_the_resources_lock`
   (`tests/billing_marks.rs`) sends each such path while the account is held
   elsewhere; a new one adds a case there.

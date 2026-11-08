@@ -42,6 +42,7 @@ use serde_json::Value;
 use sqlx::PgConnection;
 use uuid::Uuid;
 
+use crate::billing::budgets::{self, ChargedRow, CountMode};
 use crate::billing::ledger::{self, Account, Posting, Source};
 use crate::billing::marks;
 use crate::db::DbError;
@@ -70,16 +71,19 @@ pub struct Priced {
 /// batch is kept.
 ///
 /// Each row charged above 0 debits its tenant's balance with one ledger
-/// entry, posted in the same transaction once every charge is recorded. A
-/// charge of 0 (a free model, a full discount) posts nothing, and neither
-/// does a row that is not charged. The accounts of every tenant the rows'
-/// keys belong to are locked first, in ascending tenant id, so that two
-/// batches naming the same tenants cannot deadlock; no tenant row is locked,
-/// so a tenant an operator is editing does not hold up intake. An account
-/// whose balance the batch moves across its tenant's floor is flagged for
-/// the settler (`marks::crossings`) in the posting's own update of the
-/// account, so no tenant row is key-shared either; no gateway document is
-/// written here, so intake never waits on the resources lock.
+/// entry, posted in the same transaction once every charge is recorded, and
+/// counts against every quota of its tenant it falls under
+/// (`budgets::count_charges`), before the posting. A charge of 0 (a free
+/// model, a full discount) posts and counts nothing, and neither does a row
+/// that is not charged. The accounts of every tenant the rows' keys belong
+/// to are locked first, in ascending tenant id, so that two batches naming
+/// the same tenants cannot deadlock; no tenant row is locked, so a tenant an
+/// operator is editing does not hold up intake. An account whose balance
+/// the batch moves across its tenant's floor (`marks::crossings`), or one
+/// of whose quotas it moves across a limit, is flagged for the settler in
+/// the posting's own update of the account, its one update in the batch, so
+/// no tenant row is key-shared either; no gateway document is written here,
+/// so intake never waits on the resources lock.
 pub async fn price_stored(
     conn: &mut PgConnection,
     prices: &PriceBookCache,
@@ -99,9 +103,11 @@ pub async fn price_stored(
     // and the ledger entries.
     stored.sort_by(|a, b| a.event_id.cmp(&b.event_id));
     let mut debits = Vec::new();
+    let mut charged = Vec::new();
     for row in &stored {
         let claim = Claim::of(&row.event);
-        let key = key_id(claim.api_key_id).and_then(|id| keys.get(&id));
+        let key_uuid = key_id(claim.api_key_id);
+        let key = key_uuid.and_then(|id| keys.get(&id));
         let (tenant_id, member_id) = match key {
             Some(k) => (
                 k.tenant_id.to_string(),
@@ -163,7 +169,9 @@ pub async fn price_stored(
             requested_model_id: claim.requested_model_id,
         };
         let recorded = record_charge(&mut *conn, &ident, &charge).await?;
-        if let (Recorded::Inserted, Ok(p), Some(k)) = (recorded, &charge, key) {
+        if let (Recorded::Inserted, Ok(p), Some(k), Some(api_key_id)) =
+            (recorded, &charge, key, key_uuid)
+        {
             if p.outcome == Outcome::Charged && p.charge.0 > 0 {
                 debits.push(Posting {
                     tenant_id: k.tenant_id,
@@ -172,11 +180,23 @@ pub async fn price_stored(
                         event_id: &row.event_id,
                     },
                 });
+                charged.push(ChargedRow {
+                    tenant_id: k.tenant_id,
+                    member_id: k.member_id,
+                    api_key_id,
+                    price_instant: p.price_instant,
+                    amount: p.charge.0,
+                });
             }
         }
     }
     if !debits.is_empty() {
-        let flag = marks::crossings(&mut *conn, &balances_after(accounts, &debits)).await?;
+        // Counted before the posting, so that every flag, a quota's or the
+        // balance's, goes into the posting's one update of each account.
+        let mut flag = budgets::count_charges(&mut *conn, &charged, CountMode::Usage).await?;
+        flag.extend(marks::crossings(&mut *conn, &balances_after(accounts, &debits)).await?);
+        flag.sort();
+        flag.dedup();
         ledger::post_flagging(&mut *conn, &debits, &flag).await?;
         if !flag.is_empty() {
             marks::notify(&mut *conn).await?;

@@ -66,6 +66,15 @@ impl ApiError {
         Self::new(StatusCode::FORBIDDEN, "forbidden", "没有执行此操作的权限")
     }
 
+    /// A quota set at another level than the caller's.
+    pub fn budget_managed() -> ApiError {
+        Self::new(
+            StatusCode::FORBIDDEN,
+            "budget_managed",
+            "该额度由其他层级设置，无法在此修改",
+        )
+    }
+
     /// A member of a tenant that is pending approval or suspended, on a
     /// route only an active tenant may use.
     pub fn tenant_not_active() -> ApiError {

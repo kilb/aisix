@@ -1753,6 +1753,20 @@ async fn every_tenant_write_takes_the_tenant_before_the_resources_lock() {
             )),
             201,
         ),
+        // The operators' quota routes write a quota, settle the marks and
+        // retire documents.
+        (
+            "POST /admin/tenants/{id}/budgets",
+            Box::pin(fire(
+                cp.clone(),
+                "POST",
+                format!("/admin/tenants/{tenant}/budgets"),
+                op.clone(),
+                None,
+                Some(json!({"limit_usd": "0.05"})),
+            )),
+            201,
+        ),
     ];
     for (what, request, expected) in cases {
         let status = waits_for_the_tenant_first(&cp, tenant, what, request).await;

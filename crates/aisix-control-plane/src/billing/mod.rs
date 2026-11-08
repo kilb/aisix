@@ -16,6 +16,8 @@
 //! on every housekeeping tick, keeps unreachable in practice.
 
 pub mod accounts;
+pub mod budget_routes;
+pub mod budgets;
 pub mod calls;
 pub mod credits;
 pub mod ledger;

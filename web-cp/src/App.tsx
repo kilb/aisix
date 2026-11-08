@@ -26,8 +26,10 @@ import { Cache } from "./tabs/Cache";
 import { Gateways } from "./tabs/Gateways";
 import { Keys } from "./tabs/Keys";
 import { Models } from "./tabs/Models";
+import { Billing } from "./tabs/Billing";
 import { Operators } from "./tabs/Operators";
 import { Overview } from "./tabs/Overview";
+import { Pricing } from "./tabs/Pricing";
 import { Providers } from "./tabs/Providers";
 import { Resources } from "./tabs/Resources";
 import { Tenants } from "./tabs/Tenants";
@@ -37,7 +39,9 @@ const TABS = [
   { id: "gateways", label: "网关" },
   { id: "providers", label: "上游账号" },
   { id: "models", label: "模型与路由" },
+  { id: "pricing", label: "价格" },
   { id: "tenants", label: "租户" },
+  { id: "billing", label: "计费" },
   { id: "keys", label: "密钥" },
   { id: "cache", label: "缓存策略" },
   { id: "resources", label: "全部资源" },
@@ -163,8 +167,12 @@ function Page({ tab, ...props }: TabProps & { tab: TabId }) {
       return <Providers {...props} />;
     case "models":
       return <Models {...props} />;
+    case "pricing":
+      return <Pricing {...props} />;
     case "tenants":
       return <Tenants {...props} />;
+    case "billing":
+      return <Billing {...props} />;
     case "keys":
       return <Keys {...props} />;
     case "cache":

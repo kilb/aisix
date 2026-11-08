@@ -241,11 +241,11 @@ test("分区导航只用键盘也能走遍：方向键、Home、End 移动，回
   await page.keyboard.press("ArrowRight");
   await expect(tab("密钥")).toBeFocused();
   await page.keyboard.press("End");
-  await expect(tab("成员")).toBeFocused();
+  await expect(tab("账户")).toBeFocused();
   await page.keyboard.press("ArrowRight");
   await expect(tab("组织")).toBeFocused();
   await page.keyboard.press("ArrowLeft");
-  await expect(tab("成员")).toBeFocused();
+  await expect(tab("账户")).toBeFocused();
   await page.keyboard.press("Home");
   await expect(tab("组织")).toBeFocused();
   // Moving the focus opens nothing by itself.

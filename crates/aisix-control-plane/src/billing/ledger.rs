@@ -122,8 +122,12 @@ pub struct LedgerEntry {
 const ACCOUNT_COLUMNS: &str = "tenant_id, balance_micro_usd, credit_limit_micro_usd, \
      balance_budget_id, marked_exhausted, marks_dirty";
 
-/// Tenant `tenant_id`'s account, locked (`FOR UPDATE`) for the rest of the
-/// transaction; locking one the transaction already holds is a no-op.
+/// Tenant `tenant_id`'s account, locked (`FOR NO KEY UPDATE`) for the rest
+/// of the transaction; locking one the transaction already holds is a
+/// no-op. Every holder of the account excludes every other, but a row that
+/// references the account, such as a top-up request, can still be inserted
+/// beside it: its foreign key's check only key-shares the account, which
+/// this lock leaves alone, so such an insert never waits on intake.
 ///
 /// An account that is missing is inserted first. That insert references
 /// the tenant row: it is the one insert ingest can make that does, which
@@ -140,8 +144,9 @@ const ACCOUNT_COLUMNS: &str = "tenant_id, balance_micro_usd, credit_limit_micro_
 /// [`backfill_accounts`] opens it, so that its first balance mark is
 /// written.
 pub async fn lock_account(conn: &mut PgConnection, tenant_id: Uuid) -> Result<Account, DbError> {
-    let select =
-        format!("SELECT {ACCOUNT_COLUMNS} FROM billing_accounts WHERE tenant_id = $1 FOR UPDATE");
+    let select = format!(
+        "SELECT {ACCOUNT_COLUMNS} FROM billing_accounts WHERE tenant_id = $1 FOR NO KEY UPDATE"
+    );
     if let Some(account) = sqlx::query_as(&select)
         .bind(tenant_id)
         .fetch_optional(&mut *conn)
