@@ -321,6 +321,96 @@ async fn an_anthropic_account_lists_its_models_by_api_key() {
     );
 }
 
+/// `adapter` is optional, so a document naming only the vendor is a real one.
+/// The wire, the path and the header set all have to follow the vendor then,
+/// or an Anthropic account answers its own URL with OpenAI-only headers.
+#[tokio::test]
+async fn a_vendor_with_no_adapter_is_still_listed_its_own_way() {
+    let fixture = Fixture::start(|| {
+        Answer::new(
+            StatusCode::OK,
+            r#"{"object":"list","data":[{"id":"same-host"}]}"#,
+        )
+    })
+    .await;
+    let Some(cp) = TestCp::start_reaching_loopback().await else {
+        return;
+    };
+    let admin = cp.admin_login_seeded(OperatorRole::Admin).await;
+
+    // The OpenAI vendor, no adapter: `GET /models` by bearer.
+    let id = account(&cp, &admin, &fixture, json!({"adapter": null})).await;
+    let r = list(&cp, &admin, id).await;
+    assert_eq!(r.status, 200, "openai without an adapter: {r:?}");
+    let hit = fixture.last();
+    assert_eq!(hit.path, "/models");
+    assert_eq!(
+        hit.headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok()),
+        Some(format!("Bearer {KEY}").as_str())
+    );
+    assert!(hit.headers.get("x-api-key").is_none(), "{hit:?}");
+
+    // The Anthropic vendor, no adapter: `GET /v1/models` with every
+    // Anthropic header. This is the half a second copy of the form table
+    // would get wrong, since 200 here is also what a wrong URL answers.
+    let id = account(
+        &cp,
+        &admin,
+        &fixture,
+        json!({"provider": "anthropic", "adapter": null}),
+    )
+    .await;
+    let r = list(&cp, &admin, id).await;
+    assert_eq!(r.status, 200, "anthropic without an adapter: {r:?}");
+    let hit = fixture.last();
+    assert_eq!(hit.path, "/v1/models");
+    assert_eq!(hit.query, "limit=1000");
+    assert_eq!(
+        hit.headers.get("x-api-key").and_then(|v| v.to_str().ok()),
+        Some(KEY),
+        "the Anthropic header set follows the vendor, not the missing adapter"
+    );
+    assert_eq!(
+        hit.headers
+            .get("anthropic-version")
+            .and_then(|v| v.to_str().ok()),
+        Some("2023-06-01")
+    );
+}
+
+/// The Anthropic wire asks for one page and does not page. An account with
+/// more models than fit must not be reported as a complete list.
+#[tokio::test]
+async fn an_anthropic_page_with_more_says_so() {
+    let fixture = Fixture::start(|| {
+        Answer::new(
+            StatusCode::OK,
+            r#"{"data":[{"id":"claude-x"}],"has_more":true,"first_id":"claude-x","last_id":"claude-x"}"#,
+        )
+    })
+    .await;
+    let Some(cp) = TestCp::start_reaching_loopback().await else {
+        return;
+    };
+    let admin = cp.admin_login_seeded(OperatorRole::Admin).await;
+    let id = account(
+        &cp,
+        &admin,
+        &fixture,
+        json!({"provider": "anthropic", "adapter": "anthropic"}),
+    )
+    .await;
+
+    let r = list(&cp, &admin, id).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    assert_eq!(r.body["items"], json!([{"id": "claude-x"}]));
+    assert_eq!(r.body["truncated"], true, "has_more was ignored");
+    let warnings = r.body["warnings"].as_array().expect("warnings");
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+}
+
 // ---------------------------------------------------------------------------
 // The cache.
 // ---------------------------------------------------------------------------
@@ -430,6 +520,15 @@ async fn the_error_text_is_scrubbed_and_500_characters_at_most() {
     assert!(
         detail.contains("Incorrect API key provided"),
         "the upstream's own words survive: {detail}"
+    );
+    assert!(
+        !detail.contains("401"),
+        "the status the upstream chose reached the caller: {detail}"
+    );
+    assert!(
+        !r.body.to_string().contains("401"),
+        "the answer carries the upstream's status: {:?}",
+        r.body
     );
 }
 

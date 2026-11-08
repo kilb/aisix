@@ -159,6 +159,11 @@ impl Client {
             Err(Refusal::Unresolvable) => {
                 Err(ApiError::upstream_unreachable("该上游的域名无法解析"))
             }
+            // The one English text in this route's 中文 answers, and
+            // deliberately: the hint is the gateway's own `blocked_hint`,
+            // which names the startup-config key an operator has to edit
+            // (`outbound.ssrf_protection.allowed_hosts`). Restating it here
+            // would be a second copy of the authority that drifts from it.
             Err(_) => Err(ApiError::upstream_unreachable(Refusal::blocked_hint(Some(
                 url,
             )))),
@@ -166,20 +171,42 @@ impl Client {
     }
 }
 
-/// The URL `pk`'s models are listed at, or why this adapter has none.
+/// The wire `pk` speaks, or `None` for a platform that cannot list models.
 ///
-/// `api_base` is used as configured, userinfo included; a URL that is not
-/// `http`/`https` or does not parse is refused. With no `api_base`, a vendor
-/// default applies only when the key's own vendor is that vendor, so a
-/// vendor's credential never reaches another vendor's host.
+/// Read exactly as [`aisix_gateway::hub::upstream_protocol`] reads it: the
+/// vendor decides first, because a key naming `openai` or `anthropic` speaks
+/// that wire whatever `adapter` says, and `adapter` decides for every other
+/// vendor. `adapter` is not a required field, so an older or hand-written
+/// document that names only the vendor is a case this must serve.
+fn form(pk: &ProviderKey) -> Option<Form> {
+    match pk.provider.as_str() {
+        OPENAI_VENDOR => Some(Form::Openai),
+        ANTHROPIC_VENDOR => Some(Form::Anthropic),
+        _ => match pk.adapter {
+            Some(Adapter::Openai) => Some(Form::Openai),
+            Some(Adapter::Anthropic) => Some(Form::Anthropic),
+            Some(Adapter::Bedrock | Adapter::Vertex | Adapter::AzureOpenai) | None => None,
+        },
+    }
+}
+
+/// A `422 /api_base` naming the base as the field at fault.
+fn bad_api_base(message: &str) -> ApiError {
+    ApiError::validation(vec![crate::error::Detail {
+        path: "/api_base".to_string(),
+        message: message.to_string(),
+    }])
+}
+
+/// The URL `pk`'s models are listed at, or why this upstream has none.
+///
+/// `api_base` is used as configured, userinfo included. With no `api_base`, a
+/// vendor default applies only when the key's own vendor is that vendor, so a
+/// vendor's credential never reaches another vendor's host. Every way the base
+/// can be unusable is the operator's own configuration and answers
+/// `422 /api_base`.
 pub fn base_url(pk: &ProviderKey) -> Result<Url, ApiError> {
-    let form = match pk.adapter {
-        Some(Adapter::Openai) => Form::Openai,
-        Some(Adapter::Anthropic) => Form::Anthropic,
-        Some(Adapter::Bedrock | Adapter::Vertex | Adapter::AzureOpenai) | None => {
-            return Err(ApiError::upstream_models_unsupported())
-        }
-    };
+    let wire = form(pk).ok_or_else(ApiError::upstream_models_unsupported)?;
     let base = match pk
         .api_base
         .as_deref()
@@ -187,22 +214,21 @@ pub fn base_url(pk: &ProviderKey) -> Result<Url, ApiError> {
         .filter(|b| !b.is_empty())
     {
         Some(base) => base.to_string(),
-        None => default_base(form, &pk.provider)?,
+        None => default_base(wire, &pk.provider)?,
     };
-    let shaped = match form {
+    // The endpoint path is appended to this base, so a query or a fragment
+    // would end up in the middle of the shaped URL. The bridges' own
+    // `validate_api_base` refuses both for the same reason.
+    if base.contains(['?', '#']) {
+        return Err(bad_api_base("基础地址不能带查询参数或锚点"));
+    }
+    let shaped = match wire {
         Form::Openai => format!("{}/models", normalize_openai(&base)),
         Form::Anthropic => format!("{}/v1/models?limit=1000", normalize_anthropic(&base)),
     };
-    let url = Url::parse(&shaped).map_err(|_| {
-        ApiError::validation(vec![crate::error::Detail {
-            path: "/api_base".to_string(),
-            message: "基础地址不是一个合法的 URL".to_string(),
-        }])
-    })?;
+    let url = Url::parse(&shaped).map_err(|_| bad_api_base("基础地址不是一个合法的 URL"))?;
     if !matches!(url.scheme(), "http" | "https") {
-        return Err(ApiError::upstream_unreachable(
-            "基础地址必须使用 http 或 https",
-        ));
+        return Err(bad_api_base("基础地址必须使用 http 或 https"));
     }
     Ok(url)
 }
@@ -212,10 +238,7 @@ fn default_base(form: Form, provider: &str) -> Result<String, ApiError> {
     match (form, provider) {
         (Form::Openai, OPENAI_VENDOR) => Ok(OPENAI_DEFAULT_BASE.to_string()),
         (Form::Anthropic, ANTHROPIC_VENDOR) => Ok(ANTHROPIC_DEFAULT_BASE.to_string()),
-        _ => Err(ApiError::validation(vec![crate::error::Detail {
-            path: "/api_base".to_string(),
-            message: "该上游需要填写基础地址".to_string(),
-        }])),
+        _ => Err(bad_api_base("该上游需要填写基础地址")),
     }
 }
 
@@ -255,11 +278,8 @@ pub async fn fetch_models(
     pk: &ProviderKey,
     api_key: &str,
 ) -> Result<Fetched, ApiError> {
+    let wire = form(pk).ok_or_else(ApiError::upstream_models_unsupported)?;
     let url = base_url(pk)?;
-    let form = match pk.adapter {
-        Some(Adapter::Anthropic) => Form::Anthropic,
-        _ => Form::Openai,
-    };
     let tap = std::sync::Arc::new(ResponseHeaderTap::new(
         Vec::new(),
         false,
@@ -272,7 +292,7 @@ pub async fn fetch_models(
         // A password in `api_base`'s userinfo rides the request too.
         response_tap::note_url_userinfo(url.as_str());
         let target = client.route(&url).await?;
-        let request = match form {
+        let request = match wire {
             Form::Openai => target.get(url.clone()).bearer_auth(api_key),
             Form::Anthropic => target
                 .get(url.clone())
@@ -284,18 +304,24 @@ pub async fn fetch_models(
             Ok(response) => response,
             Err(error) => return Err(transport_failure(&error, &url)),
         };
-        let status = response.status();
-        if !status.is_success() {
-            let body = read_body(response).await.unwrap_or_default();
-            let text = String::from_utf8_lossy(&body);
-            return Err(ApiError::upstream_bad_response(detail_capped(format!(
-                "该上游没有返回模型列表（HTTP {}）：{}",
-                status.as_u16(),
-                scrub_upstream_error_text(text.trim())
-            ))));
+        // The answer's own status is read here and nowhere else: a non-2xx
+        // becomes the fixed `502`, so no status the upstream chose reaches
+        // the caller. Its words do, scrubbed.
+        if !response.status().is_success() {
+            let detail = match read_body(response).await {
+                Ok(body) => scrub_upstream_error_text(String::from_utf8_lossy(&body).trim()),
+                // A body too large to read carries no text to relay; say why
+                // rather than leave the detail empty.
+                Err(error) => error
+                    .details
+                    .first()
+                    .map(|detail| detail.message.clone())
+                    .unwrap_or(error.message),
+            };
+            return Err(ApiError::upstream_bad_response(detail_capped(detail)));
         }
         let body = read_body(response).await?;
-        parse(&body)
+        parse(wire, &body)
     })
     .await
 }
@@ -326,7 +352,12 @@ async fn read_body(mut response: reqwest::Response) -> Result<Vec<u8>, ApiError>
 }
 
 /// `data[].id` as strings, deduplicated, sorted and capped.
-fn parse(body: &[u8]) -> Result<Fetched, ApiError> {
+///
+/// The answer is complete only when the [`MAX_IDS`] cap was not passed **and**
+/// the upstream did not say it had more: the Anthropic wire asks for one page
+/// of 1 000 and does not page, so `has_more` is the only signal that the list
+/// was cut. Either way the truncation is stated in `warnings`, never hidden.
+fn parse(wire: Form, body: &[u8]) -> Result<Fetched, ApiError> {
     let value: serde_json::Value = serde_json::from_slice(body)
         .map_err(|_| ApiError::upstream_bad_response("该上游的回答不是有效的 JSON".to_string()))?;
     let data = value
@@ -337,7 +368,7 @@ fn parse(body: &[u8]) -> Result<Fetched, ApiError> {
         })?;
     let mut ids: Vec<String> = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    let mut over = false;
+    let mut capped = false;
     for entry in data {
         let Some(id) = entry.get("id").and_then(serde_json::Value::as_str) else {
             continue;
@@ -346,22 +377,39 @@ fn parse(body: &[u8]) -> Result<Fetched, ApiError> {
             continue;
         }
         if ids.len() == MAX_IDS {
-            over = true;
+            capped = true;
             break;
         }
         ids.push(id.to_string());
     }
     ids.sort_unstable();
-    let warnings = if over {
-        vec![format!(
+    // A page the upstream flagged, and a page this side cut, are both "there
+    // are more". `last_id` rides along so an operator can say which model the
+    // list stopped after.
+    let more = wire == Form::Anthropic
+        && value
+            .get("has_more")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+    let mut warnings = Vec::new();
+    if capped {
+        warnings.push(format!(
             "该上游的模型超过 {MAX_IDS} 个，只列出前 {MAX_IDS} 个，仍可直接填写名称"
-        )]
-    } else {
-        Vec::new()
-    };
+        ));
+    } else if more {
+        let after = value
+            .get("last_id")
+            .and_then(serde_json::Value::as_str)
+            .map(|id| format!("，最后一个是 {id}"))
+            .unwrap_or_default();
+        warnings.push(format!(
+            "该上游的模型不止这一页，只列出前 {} 个{after}，仍可直接填写名称",
+            ids.len()
+        ));
+    }
     Ok(Fetched {
         ids,
-        truncated: over,
+        truncated: capped || more,
         warnings,
         fetched_at: Utc::now(),
     })
@@ -484,47 +532,116 @@ mod tests {
     }
 
     #[test]
+    fn the_wire_comes_from_the_vendor_first_and_the_adapter_second() {
+        // Exactly `upstream_protocol`'s order: a key naming the vendor
+        // speaks that wire whatever `adapter` says, which is the case a
+        // hand-written or older document is in, since `adapter` is optional.
+        for adapter in [None, Some(Adapter::Openai)] {
+            let pk = key(adapter, "openai", None);
+            assert_eq!(form(&pk), Some(Form::Openai), "{adapter:?}");
+            assert_eq!(
+                url(&pk),
+                "https://api.openai.com/v1/models",
+                "no adapter, the vendor decides: {adapter:?}"
+            );
+        }
+        for adapter in [None, Some(Adapter::Anthropic)] {
+            let pk = key(adapter, "anthropic", None);
+            assert_eq!(form(&pk), Some(Form::Anthropic), "{adapter:?}");
+            assert_eq!(
+                url(&pk),
+                "https://api.anthropic.com/v1/models?limit=1000",
+                "no adapter, the vendor decides: {adapter:?}"
+            );
+        }
+        // The vendor wins over a disagreeing adapter, as the gateway's own
+        // dispatch does.
+        assert_eq!(
+            form(&key(Some(Adapter::Bedrock), "anthropic", None)),
+            Some(Form::Anthropic)
+        );
+        // Any other vendor takes its adapter, and only those two adapters
+        // have a list at all.
+        assert_eq!(
+            form(&key(Some(Adapter::Openai), "deepseek", None)),
+            Some(Form::Openai)
+        );
+        assert_eq!(
+            form(&key(Some(Adapter::Anthropic), "deepseek", None)),
+            Some(Form::Anthropic)
+        );
+        for adapter in [
+            None,
+            Some(Adapter::Bedrock),
+            Some(Adapter::Vertex),
+            Some(Adapter::AzureOpenai),
+        ] {
+            assert_eq!(form(&key(adapter, "aws", None)), None, "{adapter:?}");
+        }
+    }
+
+    #[test]
     fn an_unsupported_adapter_has_no_url_and_a_mismatched_vendor_has_no_default() {
         for adapter in [
             Some(Adapter::Bedrock),
             Some(Adapter::Vertex),
             Some(Adapter::AzureOpenai),
-            None,
         ] {
-            let error = base_url(&key(adapter, "openai", Some("https://x.example.com/v1")))
+            let error = base_url(&key(adapter, "aws", Some("https://x.example.com/v1")))
                 .expect_err("no model list");
             assert_eq!(error.code, "upstream_models_unsupported", "{adapter:?}");
+            assert_eq!(
+                error.message, "该类型的上游不提供模型列表，请直接填写模型名称",
+                "{adapter:?}"
+            );
         }
+        // No vendor, no adapter: nothing to guess from.
+        let error = base_url(&key(None, "aws", Some("https://x.example.com/v1")))
+            .expect_err("no model list");
+        assert_eq!(error.code, "upstream_models_unsupported");
+
         // No base, and a vendor that is not the form's: the credential must
-        // not reach another vendor's host.
-        let error =
-            base_url(&key(Some(Adapter::Openai), "deepseek", None)).expect_err("no default base");
-        assert_eq!(error.code, "validation_failed");
-        assert_eq!(error.details[0].path, "/api_base");
-        let error =
-            base_url(&key(Some(Adapter::Anthropic), "openai", None)).expect_err("no default base");
-        assert_eq!(error.details[0].path, "/api_base");
+        // not reach another vendor's host. An adapter decides the wire for a
+        // vendor it alone names, and still gets no default base from it.
+        for (adapter, provider) in [
+            (Some(Adapter::Openai), "deepseek"),
+            (Some(Adapter::Anthropic), "deepseek"),
+        ] {
+            let error = base_url(&key(adapter, provider, None)).expect_err("no default base");
+            assert_eq!(error.code, "validation_failed", "{adapter:?} {provider}");
+            assert_eq!(error.details[0].path, "/api_base");
+            assert_eq!(error.details[0].message, "该上游需要填写基础地址");
+        }
+        // The vendor party to the wire wins, so its own default applies
+        // whatever a disagreeing adapter says.
+        assert_eq!(
+            url(&key(Some(Adapter::Bedrock), "openai", None)),
+            "https://api.openai.com/v1/models"
+        );
     }
 
     #[test]
-    fn a_url_that_is_not_http_is_refused() {
-        let error = base_url(&key(
-            Some(Adapter::Openai),
-            "openai",
-            Some("file:///etc/passwd"),
-        ))
-        .expect_err("not http");
-        assert_eq!(error.code, "upstream_unreachable");
-        let error = base_url(&key(Some(Adapter::Openai), "openai", Some("not a url")))
-            .expect_err("not a url");
-        assert_eq!(error.code, "validation_failed");
+    fn a_base_that_is_not_usable_is_the_fields_fault() {
+        for base in [
+            "file:///etc/passwd",
+            "not a url",
+            "https://host/v1?x=1",
+            "https://host#a",
+        ] {
+            let error = base_url(&key(Some(Adapter::Openai), "openai", Some(base)))
+                .expect_err("not usable");
+            assert_eq!(error.code, "validation_failed", "{base}");
+            assert_eq!(error.details[0].path, "/api_base", "{base}");
+        }
     }
 
     #[test]
     fn ids_are_deduped_sorted_and_capped() {
-        let fetched =
-            parse(br#"{"object":"list","data":[{"id":"b"},{"id":"a"},{"id":"a"},{"nope":1}]}"#)
-                .expect("a list");
+        let fetched = parse(
+            Form::Openai,
+            br#"{"object":"list","data":[{"id":"b"},{"id":"a"},{"id":"a"},{"nope":1}]}"#,
+        )
+        .expect("a list");
         assert_eq!(fetched.ids, ["a", "b"]);
         assert!(!fetched.truncated);
         assert!(fetched.warnings.is_empty());
@@ -533,15 +650,42 @@ mod tests {
             .map(|i| format!(r#"{{"id":"m{i:05}"}}"#))
             .collect();
         let body = format!(r#"{{"data":[{}]}}"#, many.join(","));
-        let fetched = parse(body.as_bytes()).expect("a long list");
+        let fetched = parse(Form::Openai, body.as_bytes()).expect("a long list");
         assert_eq!(fetched.ids.len(), MAX_IDS);
         assert!(fetched.truncated);
         assert_eq!(fetched.warnings.len(), 1);
 
         for bad in [&b"not json"[..], br#"{"nope":1}"#, br#"{"data":1}"#] {
-            let error = parse(bad).expect_err("not a list");
+            let error = parse(Form::Openai, bad).expect_err("not a list");
             assert_eq!(error.code, "upstream_bad_response");
         }
+    }
+
+    /// The Anthropic wire asks for one page and does not page, so `has_more`
+    /// is the only sign that the list was cut — and a cut list reported as
+    /// complete is what the design forbids.
+    #[test]
+    fn an_anthropic_page_that_has_more_is_truncated() {
+        let page = br#"{"data":[{"id":"c-1"}],"has_more":true,"first_id":"c-1","last_id":"c-1"}"#;
+        let fetched = parse(Form::Anthropic, page).expect("a page");
+        assert!(fetched.truncated, "has_more was ignored");
+        assert_eq!(fetched.warnings.len(), 1);
+        assert!(
+            fetched.warnings[0].contains("c-1"),
+            "{:?}",
+            fetched.warnings
+        );
+
+        let whole = br#"{"data":[{"id":"c-1"}],"has_more":false}"#;
+        let fetched = parse(Form::Anthropic, whole).expect("a page");
+        assert!(!fetched.truncated);
+        assert!(fetched.warnings.is_empty());
+
+        // The OpenAI wire documents no pagination, so its `has_more` is not
+        // read: a stray field there must not invent a truncation.
+        let openai =
+            parse(Form::Openai, br#"{"data":[{"id":"a"}],"has_more":true}"#).expect("a list");
+        assert!(!openai.truncated);
     }
 
     #[test]

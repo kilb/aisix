@@ -31,8 +31,9 @@ use crate::AppState;
 /// How long one answer is reused.
 pub const CACHE_TTL: Duration = Duration::from_secs(60);
 
-/// The most provider keys whose answers are held at once. The entry used
-/// least recently goes before a new one is added.
+/// The most provider keys whose answers are held at once. Every entry has the
+/// same lifetime, so the first that would expire is the one fetched first:
+/// that one goes before a new one is added.
 pub const CACHE_ENTRIES: usize = 64;
 
 /// Every cached answer, and the one call in flight per provider key.
@@ -119,7 +120,9 @@ pub async fn list(
     auth.require(OperatorRole::Operator)?;
     // A connection is held only while the row is read; the fetch below runs
     // without one, so an upstream that takes five seconds never ties one up.
-    let (pk, version) = {
+    // The document is parsed sealed — nothing read here needs the credential
+    // — so a cache hit never pays a decrypt.
+    let (doc, version) = {
         let mut conn = state
             .db
             .pool()
@@ -130,18 +133,29 @@ pub async fn list(
             .await?
             .filter(|row| !row.deleted)
             .ok_or_else(ApiError::not_found)?;
-        let mut doc = row.doc.clone();
-        resources::secrets::unseal(&state.cfg.master_key, Kind::ProviderKeys, id, &mut doc)
-            .map_err(ApiError::internal)?;
-        let pk: ProviderKey = serde_json::from_value(doc)
-            .map_err(|e| ApiError::upstream_bad_response(format!("该上游账号无法读取：{e}")))?;
-        (pk, row.version)
+        (row.doc.clone(), row.version)
     };
+    let shape: ProviderKey = serde_json::from_value(doc.clone())
+        .map_err(|e| ApiError::upstream_bad_response(format!("该上游账号无法读取：{e}")))?;
+    // Where the call would go, reduced to the origin for the log line: a key
+    // with no `api_base` has no URL of its own, and printing
+    // `redact_url_for_log("")`'s `<invalid URL>` would only confuse.
+    let where_ = upstream_http::base_url(&shape)
+        .map(|url| aisix_core::redact_url_for_log(url.as_str()))
+        .unwrap_or_else(|_| "-".to_string());
 
     let key = (id, version);
     let fetched = match state.upstream_models.get(key) {
         Some(fetched) => fetched,
         None => {
+            // Only a request that reaches the upstream unseals: the gate is
+            // held across the call, so the other waiters reuse its answer
+            // and decrypt nothing.
+            let mut doc = doc;
+            resources::secrets::unseal(&state.cfg.master_key, Kind::ProviderKeys, id, &mut doc)
+                .map_err(ApiError::internal)?;
+            let pk: ProviderKey = serde_json::from_value(doc)
+                .map_err(|e| ApiError::upstream_bad_response(format!("该上游账号无法读取：{e}")))?;
             let gate = state.upstream_models.gate(id);
             let answer: Result<Fetched, ApiError> = {
                 let gate = gate.clone();
@@ -165,7 +179,7 @@ pub async fn list(
 
     tracing::info!(
         provider_key = %id,
-        api_base = %aisix_core::redact_url_for_log(pk.api_base.as_deref().unwrap_or("")),
+        upstream = %where_,
         models = fetched.ids.len(),
         truncated = fetched.truncated,
         "listed an upstream account's models"
