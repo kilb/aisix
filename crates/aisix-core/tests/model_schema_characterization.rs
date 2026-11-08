@@ -456,14 +456,27 @@ fn reject_ensemble_plus_provider() {
 }
 
 // ---------------------------------------------------------------------------
-// REJECT — nested object constraints.
+// ACCEPT — a routing model with no target.
+//
+// A public model whose every serving account is disabled keeps its routing
+// document so the name stays listed, and a request for it answers the
+// gateway's `upstream_unavailable` 503 rather than a 404. The field stays
+// required, so `reject_routing_missing_targets` below still holds.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn reject_routing_empty_targets() {
-    reject(
+fn accept_routing_empty_targets() {
+    accept(
         "routing targets empty",
         json!({"display_name": "r", "routing": {"targets": []}}),
+    );
+}
+
+#[test]
+fn reject_routing_missing_targets() {
+    reject(
+        "routing targets absent",
+        json!({"display_name": "r", "routing": {}}),
     );
 }
 

@@ -30,8 +30,8 @@ use serde_json::{json, Value};
 use crate::auth::{MemberRole, OperatorRole, KEY_HOLDERS};
 use crate::error::{ApiError, Detail};
 use crate::{
-    audit, billing, dp, gateways, groups, keys, members, operators, pricing, projector, resources,
-    rollout, tenants, usage, AppState,
+    audit, billing, channels, dp, gateways, groups, keys, members, operators, pricing, projector,
+    resources, rollout, tenants, usage, AppState,
 };
 
 /// The largest request body either listener reads.
@@ -542,6 +542,42 @@ pub const ROUTE_ROLES: &[(&str, &str, MinRole)] = &[
         "/admin/pricing/baselines",
         MinRole::Op(OperatorRole::Operator),
     ),
+    // Public models, and the accounts that serve them.
+    (
+        "GET",
+        "/admin/public-models",
+        MinRole::Op(OperatorRole::Viewer),
+    ),
+    (
+        "POST",
+        "/admin/public-models",
+        MinRole::Op(OperatorRole::Operator),
+    ),
+    (
+        "GET",
+        "/admin/public-models/{id}",
+        MinRole::Op(OperatorRole::Viewer),
+    ),
+    (
+        "POST",
+        "/admin/public-models/{id}/retire",
+        MinRole::Op(OperatorRole::Operator),
+    ),
+    (
+        "GET",
+        "/admin/provider-keys/{id}/channel-models",
+        MinRole::Op(OperatorRole::Viewer),
+    ),
+    (
+        "PUT",
+        "/admin/provider-keys/{id}/channel-models/{public_model_id}",
+        MinRole::Op(OperatorRole::Operator),
+    ),
+    (
+        "DELETE",
+        "/admin/provider-keys/{id}/channel-models/{public_model_id}",
+        MinRole::Op(OperatorRole::Operator),
+    ),
     // Gateways, on the gateway listener.
     ("POST", "/dp/heartbeat", MinRole::Dp),
     ("GET", "/dp/v1/keys/{key_id}/prices", MinRole::Dp),
@@ -780,6 +816,20 @@ pub fn browser_router(state: AppState) -> Router {
         .route(
             "/admin/pricing/baselines",
             get(pricing::baselines::list).post(pricing::baselines::create),
+        )
+        .route(
+            "/admin/public-models",
+            get(channels::list).post(channels::create),
+        )
+        .route("/admin/public-models/{id}", get(channels::get))
+        .route("/admin/public-models/{id}/retire", post(channels::retire))
+        .route(
+            "/admin/provider-keys/{id}/channel-models",
+            get(channels::list_channels),
+        )
+        .route(
+            "/admin/provider-keys/{id}/channel-models/{public_model_id}",
+            axum::routing::put(channels::put_channel).delete(channels::delete_channel),
         )
         .route_layer(axum::middleware::from_fn(json_only))
         .route_layer(axum::middleware::from_fn(only_listed_routes))

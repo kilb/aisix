@@ -292,6 +292,42 @@ fn fixture(method: &str, path: &str, target: &SeededOperator) -> (String, Option
                 "note": "roles",
             })),
         ),
+        // Public models and the accounts that serve them. A public model is
+        // created per attempt under a fresh name, since its row is all the
+        // create writes; every id matches nothing, so a read answers 404 and
+        // a channel write 422 at the account, and nothing else is written.
+        ("GET", "/admin/public-models") => (path.to_string(), None),
+        ("POST", "/admin/public-models") => (
+            path.to_string(),
+            Some(json!({"name": format!("roles-{}", Uuid::new_v4().simple())})),
+        ),
+        ("GET", "/admin/public-models/{id}") => {
+            (format!("/admin/public-models/{}", Uuid::nil()), None)
+        }
+        ("POST", "/admin/public-models/{id}/retire") => (
+            format!("/admin/public-models/{}/retire", Uuid::nil()),
+            Some(json!({})),
+        ),
+        ("GET", "/admin/provider-keys/{id}/channel-models") => (
+            format!("/admin/provider-keys/{}/channel-models", Uuid::nil()),
+            None,
+        ),
+        ("PUT", "/admin/provider-keys/{id}/channel-models/{public_model_id}") => (
+            format!(
+                "/admin/provider-keys/{}/channel-models/{}",
+                Uuid::nil(),
+                Uuid::nil()
+            ),
+            Some(json!({"enabled": true})),
+        ),
+        ("DELETE", "/admin/provider-keys/{id}/channel-models/{public_model_id}") => (
+            format!(
+                "/admin/provider-keys/{}/channel-models/{}",
+                Uuid::nil(),
+                Uuid::nil()
+            ),
+            None,
+        ),
         _ => panic!("no fixture for {method} {path}: add one to tests/roles.rs"),
     }
 }

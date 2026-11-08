@@ -140,8 +140,13 @@ class CpClient {
     return this.request("POST", path, body);
   }
 
-  put(path: string, body: unknown, version: number): Promise<CpResponse> {
-    return this.request("PUT", path, body, { "if-match": `"${version}"` });
+  async put(path: string, body: unknown, version?: number): Promise<CpResponse> {
+    return this.request(
+      "PUT",
+      path,
+      body,
+      version === undefined ? {} : { "if-match": `"${version}"` },
+    );
   }
 
   patch(path: string, body: unknown, version?: number): Promise<CpResponse> {

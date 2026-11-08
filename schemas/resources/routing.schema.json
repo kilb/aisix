@@ -261,11 +261,10 @@
       "description": "Strategy used to select a target for each request."
     },
     "targets": {
-      "description": "Ordered set of direct models available to this routing model.",
+      "description": "Ordered set of direct models available to this routing model.\n\nMay be empty: a public model whose every serving account is disabled keeps its routing document so the name stays listed, and a request for it then answers the gateway's `upstream_unavailable` `503`, the same answer every upstream being down gets. A written empty list is therefore a served-nothing state, never a default — the field stays required, so a document that omits it is still refused.",
       "items": {
         "$ref": "#/definitions/RoutingTarget"
       },
-      "minItems": 1,
       "type": "array"
     },
     "when_all_unavailable": {

@@ -2079,3 +2079,113 @@ fn every_tenant_derived_document_loads_on_the_lenient_schema() {
         validate_lenient(kind, &doc).unwrap_or_else(|e| panic!("{kind:?} lenient: {e} {doc}"));
     }
 }
+
+/// A channel edit takes no tenant row at all.
+///
+/// The owner's decision on the channel-style configuration: disabling the
+/// last serving account withdraws no grant, so a channel edit cannot wait on
+/// a tenant. It takes the public model's row (between the tenant rows and the
+/// resources lock in the documented order) and then the resources lock, and a
+/// tenant held elsewhere never blocks it — the counter-case to the model
+/// delete above, which does take its holders first. A grant that did
+/// disappear here would mean a withdrawal crept back in.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_channel_edit_takes_no_tenant_lock() {
+    let Some(cp) = TestCp::start_with(patient).await else {
+        return;
+    };
+    let cp = Arc::new(cp);
+    let op = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let created = cp
+        .send(
+            "POST",
+            "/admin/tenants",
+            Some(op.cookie()),
+            Some(json!({"name": "order-chan-7c1"})),
+        )
+        .await;
+    assert_eq!(created.status, 201, "{created:?}");
+    let tenant = Uuid::parse_str(&id_of(&created.body)).expect("a uuid");
+    let pk = cp
+        .send(
+            "POST",
+            "/admin/resources/provider_keys",
+            Some(op.cookie()),
+            Some(json!({"doc": provider_key("acct-order-chan-7c1", json!(["shared"]))})),
+        )
+        .await;
+    assert_eq!(pk.status, 201, "{pk:?}");
+    let key = pk.body["id"]
+        .as_str()
+        .expect("a provider key id")
+        .to_string();
+    let public = cp
+        .send(
+            "POST",
+            "/admin/public-models",
+            Some(op.cookie()),
+            Some(json!({"name": "order-pub-7c1"})),
+        )
+        .await;
+    assert_eq!(public.status, 201, "{public:?}");
+    let public_id = public.body["id"]
+        .as_str()
+        .expect("a public model id")
+        .to_string();
+    let channel = format!("/admin/provider-keys/{key}/channel-models/{public_id}");
+    let put = cp
+        .send("PUT", &channel, Some(op.cookie()), Some(json!({})))
+        .await;
+    assert_eq!(put.status, 200, "{put:?}");
+
+    // The tenant holds the public model, so a withdrawal would have something
+    // to withdraw from.
+    let current = cp
+        .get_with_cookie(&format!("/admin/tenants/{tenant}"), op.cookie())
+        .await;
+    assert_eq!(current.status, 200, "{current:?}");
+    let version = current.body["version"].as_i64().expect("a version");
+    let granted = fire(
+        cp.clone(),
+        "PATCH",
+        format!("/admin/tenants/{tenant}"),
+        op.cookie().to_string(),
+        Some(version),
+        Some(json!({"allowed_model_ids": [public_id]})),
+    )
+    .await;
+    assert_eq!(granted, 200);
+
+    // Held tenant row: the disable runs to completion anyway, taking no
+    // tenant lock, and the grant survives.
+    let mut holder = cp.db().pool().begin().await.expect("begin");
+    sqlx::query("SELECT 1 FROM tenants WHERE id = $1 FOR UPDATE")
+        .bind(tenant)
+        .execute(&mut *holder)
+        .await
+        .expect("hold the tenant");
+    let disabled = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        cp.send(
+            "PUT",
+            &channel,
+            Some(op.cookie()),
+            Some(json!({"enabled": false})),
+        ),
+    )
+    .await
+    .expect("a channel edit takes no tenant lock");
+    holder.rollback().await.expect("release the tenant");
+    assert_eq!(disabled.status, 200, "{disabled:?}");
+    let grants: Vec<Uuid> =
+        sqlx::query_scalar("SELECT allowed_model_ids FROM tenants WHERE id = $1")
+            .bind(tenant)
+            .fetch_one(cp.db().pool())
+            .await
+            .expect("read the grants");
+    assert_eq!(
+        grants,
+        vec![Uuid::parse_str(&public_id).expect("a uuid")],
+        "disabling the last account withdraws no grant"
+    );
+}
