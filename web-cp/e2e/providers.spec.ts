@@ -344,7 +344,6 @@ test("移除分组前，点名因此用不到该账号的租户与密钥；取�
     display_name: "已覆盖 6b2",
     default_cny_per_usd: "7.2",
   });
-  await stack.admin.get("/admin/resources/provider_keys");
   const covered = await stack.admin.post("/admin/tenants", { name: "tenant-covered-e2e" });
   await stack.admin.patch(
     `/admin/tenants/${covered.id}`,

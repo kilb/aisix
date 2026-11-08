@@ -3080,6 +3080,22 @@ async fn a_key_whose_group_leaves_its_tenant_closes_and_reopens() {
     let _ = b;
 }
 
+/// `r` is the refusal of a body that names a field the route does not take:
+/// one detail, at the body itself, saying the body is not the route's shape.
+/// A field the route took and judged would answer at its own path instead.
+fn assert_unknown_field(r: &Resp) {
+    assert_eq!(r.status, 422, "{r:?}");
+    assert_eq!(r.body["code"], "validation_failed", "{r:?}");
+    assert_eq!(
+        r.body["details"],
+        json!([{
+            "path": "",
+            "message": "请求体必须是符合接口定义的 JSON（Content-Type: application/json）",
+        }]),
+        "{r:?}"
+    );
+}
+
 #[tokio::test]
 async fn operators_no_longer_set_a_keys_group_override() {
     let Some(cp) = TestCp::start().await else {
@@ -3094,8 +3110,7 @@ async fn operators_no_longer_set_a_keys_group_override() {
         json!({"label": "x-7c1", "allowed_provider_groups": ["grp-eu-5d2"]}),
     )
     .await;
-    assert_eq!(r.status, 422, "{r:?}");
-    assert_eq!(r.body["code"], "validation_failed", "{r:?}");
+    assert_unknown_field(&r);
 
     let (id, _) = {
         let owner = cp.member_login_seeded(tenant, MemberRole::Owner).await;
@@ -3109,8 +3124,7 @@ async fn operators_no_longer_set_a_keys_group_override() {
         Some(json!({"allowed_provider_groups": ["grp-eu-5d2"]})),
     )
     .await;
-    assert_eq!(r.status, 422, "{r:?}");
-    assert_eq!(r.body["code"], "validation_failed", "{r:?}");
+    assert_unknown_field(&r);
     // Its view still reports what the gateway is given, read-only.
     let view = call(
         &cp,

@@ -513,10 +513,6 @@ pub struct UpdateBody {
 /// The default rate creating a group takes no `note`: it is the rate the
 /// group starts at, not a hand-entered revision, and a later one may be
 /// written with its own note through `POST /admin/provider-groups/{id}/rates`.
-///
-/// The default rate creating a group takes no `note`: it is the rate the
-/// group starts at, not a hand-entered revision, and a later one may be
-/// written with its own through `POST /admin/provider-groups/{id}/rates`.
 pub async fn create(
     auth: OperatorAuth,
     State(state): State<AppState>,

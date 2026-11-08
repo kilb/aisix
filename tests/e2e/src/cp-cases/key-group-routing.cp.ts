@@ -21,6 +21,10 @@ import { ProxyClient } from "../harness/proxy.js";
 // the outage answer though B is healthy. Removing A from the tenant refuses
 // the key at the gateway, and assigning it back reopens it.
 //
+// A model the tenant is granted but whose every upstream is outside the key's
+// group, a direct one or a routing one, answers that key as no upstream
+// available, and never reaches A's account; a key in B is served by it.
+//
 // The platform's own tenant's keys name a group too, and route by it: its key
 // in B is served by B's account, and is unaffected while A is down.
 //
@@ -28,10 +32,14 @@ import { ProxyClient } from "../harness/proxy.js";
 // the upstream provider.
 
 const ROUTE = "route-gp-e2e";
+/** A routing model whose only target is on B's account. */
+const B_ROUTE = "route-gp-b-only-e2e";
 const ACCOUNT_A = "acct-gp-a";
 const ACCOUNT_B = "acct-gp-b";
 const GROUP_A = { name: "grp-route-9f3", display: "A 分组 9f3" };
 const GROUP_B = { name: "grp-gp-7c1", display: "B 分组 7c1" };
+/** The direct model on B's account, which `channel` names after it. */
+const B_DIRECT = `${ACCOUNT_B}-direct`;
 
 const chat = (model: string) => ({ model, messages: [{ role: "user", content: "hi" }] });
 
@@ -49,6 +57,13 @@ describe("a key routes to the upstream accounts of the one group it names", () =
 
   const modelsStatus = async (key: string): Promise<number> =>
     (await new ProxyClient(app!.proxyUrl, key).listModels()).status;
+
+  /** The model ids `key`'s `GET /v1/models` lists. */
+  async function listed(key: string): Promise<string[]> {
+    const res = await new ProxyClient(app!.proxyUrl, key).listModels();
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    return ((res.body as { data: Json[] }).data ?? []).map((m) => m.id as string);
+  }
 
   /** `n` chats through `key`, each answered 200. */
   async function calls(key: string, n: number): Promise<void> {
@@ -118,6 +133,10 @@ describe("a key routes to the upstream accounts of the one group it names", () =
         targets: [{ model_id: a.modelId }, { model_id: b.modelId }],
       },
     });
+    const bRoute = await cp.admin.create("models", {
+      display_name: B_ROUTE,
+      routing: { strategy: "round_robin", targets: [{ model_id: b.modelId }] },
+    });
 
     // A tenant assigned both groups, with a key in each: the keys differ only
     // in the group each names at creation.
@@ -127,7 +146,8 @@ describe("a key routes to the upstream accounts of the one group it names", () =
     const granted = await cp.admin.patch(
       `/admin/tenants/${tenantId}`,
       {
-        allowed_model_ids: [route.id],
+        // The shared route, and the two models only B's account serves.
+        allowed_model_ids: [route.id, b.modelId, bRoute.id],
         allowed_provider_groups: [GROUP_A.name, GROUP_B.name],
       },
       created.body.version,
@@ -205,11 +225,38 @@ describe("a key routes to the upstream accounts of the one group it names", () =
     expect(throughB?.effective_provider_groups, JSON.stringify(throughB)).toEqual([GROUP_B.name]);
   });
 
+  test("A model outside the key's group answers it as no upstream available, a direct one and a routing one", async () => {
+    for (const model of [B_DIRECT, B_ROUTE]) {
+      const before = { a: upA!.requests.length, b: upB!.requests.length };
+      const refused = await callGateway(app!.proxyUrl, keyA, "/v1/chat/completions", chat(model));
+      expect(refused.status, `${model}: ${refused.text}`).toBe(503);
+      // Nothing reached A's account for it: the refusal is the gateway's.
+      expect(upA!.requests.length - before.a, model).toBe(0);
+      expect(upB!.requests.length - before.b, model).toBe(0);
+      const served = await callGateway(app!.proxyUrl, keyB, "/v1/chat/completions", chat(model));
+      expect(served.status, `${model}: ${served.text}`).toBe(200);
+      expect(upB!.requests.length - before.b, model).toBe(1);
+      expect(upA!.requests.length - before.a, model).toBe(0);
+    }
+    // The key in B is shown the two models only B serves.
+    const shownB = await listed(keyB);
+    expect(shownB, JSON.stringify(shownB)).toEqual(expect.arrayContaining([B_DIRECT, B_ROUTE]));
+  });
+
   test("With its group's upstream down, a key gets the outage answer though another group is healthy", async () => {
+    // What the key in A is told for a model outside its group: the answer an
+    // outage must be indistinguishable from.
+    const refusal = await callGateway(app!.proxyUrl, keyA, "/v1/chat/completions", chat(B_ROUTE));
+    expect(refusal.status, refusal.text).toBe(503);
     upA!.failWith = 500;
     try {
       const res = await callGateway(app!.proxyUrl, keyA, "/v1/chat/completions", chat(ROUTE));
-      expect(res.status, res.text).not.toBe(200);
+      expect(res.status, res.text).toBe(503);
+      const error = (answer: { json: unknown }) => {
+        const e = (answer.json as { error?: { type?: unknown; code?: unknown } } | undefined)?.error;
+        return { type: e?.type, code: e?.code };
+      };
+      expect(error(res), `outage ${res.text} / refusal ${refusal.text}`).toEqual(error(refusal));
       // The other group's keys still work, so the outage is A's alone: no
       // request crosses from A's key to B's account.
       expect(await modelsStatus(keyB)).toBe(200);
