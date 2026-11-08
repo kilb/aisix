@@ -1,0 +1,26 @@
+/* 用量: the filters of the two panels and a call's expanded detail. Tokens only. */
+.usage-filters {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: var(--s-4);
+  align-items: end;
+}
+.usage-detail > td {
+  padding: var(--s-3) var(--s-6) var(--s-4);
+  background: var(--surface);
+  white-space: normal;
+}
+.usage-detail h3 {
+  margin-bottom: var(--s-2);
+  font-size: var(--fs-15);
+}
+.usage-qty {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: var(--s-1) var(--s-3);
+}
+.usage-more {
+  display: flex;
+  justify-content: center;
+  padding: var(--s-4);
+}

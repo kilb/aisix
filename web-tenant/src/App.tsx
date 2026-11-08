@@ -249,7 +249,7 @@ export function App({ inviteToken }: { inviteToken: string | null }) {
           ) : current === "members" ? (
             <Members member={member} status={tenant.status} onSelfChanged={() => void boot()} onLeft={leave} />
           ) : current === "usage" ? (
-            <Usage />
+            <Usage member={member} />
           ) : current === "budgets" ? (
             <Budgets />
           ) : current === "billing" ? (
