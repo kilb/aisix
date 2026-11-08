@@ -307,12 +307,18 @@ pub(crate) fn classify_bridge(err: &BridgeError) -> PlatformErrorClass {
 }
 
 /// Error codes an upstream gives, under a request-error status, when the
-/// platform's own account is at fault rather than the request: OpenAI's
-/// `billing_hard_limit_reached`, a 400 an organization over its own monthly
-/// budget gets (reported at
-/// <https://community.openai.com/t/billing-hard-limit-reached-api-error/572481>;
-/// not on OpenAI's error-codes page, whose own spend codes are 429s).
-const ACCOUNT_STATE_CODES: &[&str] = &["billing_hard_limit_reached"];
+/// platform's own account or channel is at fault rather than the request:
+/// - OpenAI's `billing_hard_limit_reached`, a 400 an organization over its
+///   own monthly budget gets (reported at
+///   <https://community.openai.com/t/billing-hard-limit-reached-api-error/572481>;
+///   not on OpenAI's error-codes page, whose own spend codes are 429s);
+/// - Bedrock's `ServiceQuotaExceededException`, documented as a 400 that
+///   "exceeds the service quota for your account"
+///   (<https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_InvokeModel.html#API_runtime_InvokeModel_Errors>).
+const ACCOUNT_STATE_CODES: &[&str] = &[
+    "billing_hard_limit_reached",
+    "ServiceQuotaExceededException",
+];
 
 /// What an upstream writes, lowercased, when the platform's own account is at
 /// fault under a request-error status and no code of its own says so. Each is
@@ -327,13 +333,25 @@ const ACCOUNT_STATE_CODES: &[&str] = &["billing_hard_limit_reached"];
 ///   (2.1.319) matches as account state rather than a request error;
 /// - OpenAI's "Your organization must be verified to stream this model" (code
 ///   `unsupported_value`, `param` `stream`; reported at
-///   <https://community.openai.com/t/requests-fail-even-after-verifying-organization/1231444>).
+///   <https://community.openai.com/t/requests-fail-even-after-verifying-organization/1231444>);
+/// - the platform's channel configuration on Bedrock, which answers it with
+///   the same `ValidationException` (400) as a malformed request
+///   (<https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_InvokeModel.html#API_runtime_InvokeModel_Errors>),
+///   so only its words tell it apart: a model id that must be called through
+///   an inference profile ("Invocation of model ID … with on-demand
+///   throughput isn't supported. Retry your request with the ID or ARN of an
+///   inference profile", reported at
+///   <https://repost.aws/questions/QUEU82wbYVQk2oU4eNwyiong>), and a model
+///   id the region or account does not offer ("The provided model identifier
+///   is invalid.").
 const ACCOUNT_STATE_MARKERS: &[&str] = &[
     "you have reached your specified api usage limits",
     "you have reached your specified workspace api usage limits",
     "credit balance is too low",
     "organization has been disabled",
     "organization must be verified",
+    "with on-demand throughput isn",
+    "the provided model identifier is invalid",
 ];
 
 /// Codes and types upstreams use for a request their content policy refused:
@@ -2149,5 +2167,65 @@ mod tests {
         };
         assert_eq!(v.unwrap()["message"], buffered.as_str());
         assert!(buffered.len() < long.len(), "{}", buffered.len());
+    }
+
+    /// Bedrock answers the platform's channel configuration with the
+    /// `ValidationException` (400) a malformed request gets, and its account
+    /// quota with `ServiceQuotaExceededException` (400). Neither is the
+    /// tenant's request: both are the model being unavailable, never
+    /// relayed; a request error under the same exception still is.
+    #[test]
+    fn a_bedrock_channel_configuration_400_is_the_model_being_unavailable() {
+        let bedrock = |kind: &str, message: &str| BridgeError::UpstreamStatus {
+            status: 400,
+            message: message.into(),
+            parsed: Some(Box::new(UpstreamErrorView {
+                kind: Some(kind.into()),
+                message: Some(message.into()),
+                code: None,
+                param: None,
+            })),
+            wire: UpstreamWire::Bedrock,
+            retry_after: None,
+            diagnostic: None,
+        };
+        let native = |err: &BridgeError| {
+            in_platform_mode(|| {
+                crate::attribution::note_translated_dispatch(false);
+                (relayed_status(err), classify_bridge(err))
+            })
+        };
+        for err in [
+            bedrock(
+                "ValidationException",
+                "Invocation of model ID anthropic.claude-sonnet-4-20250514-v1:0 with on-demand \
+                 throughput isn't supported. Retry your request with the ID or ARN of an \
+                 inference profile that contains this model.",
+            ),
+            bedrock(
+                "ValidationException",
+                "Invocation of model ID anthropic.claude-sonnet-4-20250514-v1:0 with on-demand \
+                 throughput isn’t supported.",
+            ),
+            bedrock(
+                "ValidationException",
+                "The provided model identifier is invalid.",
+            ),
+            bedrock(
+                "ServiceQuotaExceededException",
+                "Your request exceeds the service quota for your account.",
+            ),
+        ] {
+            assert_eq!(
+                native(&err),
+                (None, PlatformErrorClass::UpstreamUnavailable),
+                "{err}"
+            );
+        }
+        let request = bedrock(
+            "ValidationException",
+            "messages.0.content.0.image.source.base64: image exceeds 5 MB maximum",
+        );
+        assert_eq!(native(&request).0, Some(400));
     }
 }

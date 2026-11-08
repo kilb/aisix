@@ -640,7 +640,8 @@ where
 /// carrying Vertex's own error message. The upstream's `error.status` (a
 /// gRPC canonical code such as `"RESOURCE_EXHAUSTED"`) is read into
 /// [`UpstreamErrorView::kind`] so the envelope-translation layer can derive
-/// an OpenAI `code`.
+/// an OpenAI `code`. Claude on Vertex answers in Anthropic's own envelope
+/// instead, whose `error.type` is read there the same way.
 async fn map_http_error(status: StatusCode, resp: reqwest::Response) -> BridgeError {
     let retry_after = aisix_gateway::parse_retry_after(resp.headers());
     let is_json = aisix_gateway::response_is_json(&resp);
@@ -650,7 +651,9 @@ async fn map_http_error(status: StatusCode, resp: reqwest::Response) -> BridgeEr
     } = aisix_gateway::read_body_capped(resp, aisix_gateway::MAX_UPSTREAM_ERROR_BODY_BYTES).await;
     // Only a body labelled JSON is read for `error.status`; this is Vertex's own
     // check, and `capture_upstream_error_http` parses whatever the label says.
-    let kind = is_json.then(|| parse_vertex_error_status(&body)).flatten();
+    let kind = is_json
+        .then(|| parse_vertex_error_status(&body).or_else(|| parse_anthropic_error_type(&body)))
+        .flatten();
     let message = aisix_gateway::upstream_error_message(&body);
     let parsed = kind.as_ref().map(|_| {
         Box::new(aisix_gateway::UpstreamErrorView {
@@ -687,6 +690,27 @@ fn parse_vertex_error_status(body: &[u8]) -> Option<String> {
     }
     let outer: Outer = serde_json::from_slice(body).ok()?;
     outer.error.status
+}
+
+/// Extract `error.type` from the Anthropic envelope Claude on Vertex answers
+/// a `:rawPredict` / `:streamRawPredict` / `count-tokens` error with,
+/// `{"type":"error","error":{"type":"invalid_request_error","message":"..."}}`
+/// (<https://docs.anthropic.com/en/api/errors>). Returns `None` for any
+/// other body.
+fn parse_anthropic_error_type(body: &[u8]) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct Outer {
+        #[serde(rename = "type")]
+        kind: String,
+        error: Inner,
+    }
+    #[derive(serde::Deserialize)]
+    struct Inner {
+        #[serde(rename = "type")]
+        kind: String,
+    }
+    let outer: Outer = serde_json::from_slice(body).ok()?;
+    (outer.kind == "error").then_some(outer.error.kind)
 }
 
 /// Parse one OpenAI-shaped SSE `data:` payload from a Vertex shim /

@@ -55,6 +55,9 @@ enum Upstream {
     /// An Anthropic-wire key: Messages and count_tokens natively, chat
     /// through a translation.
     Anthropic,
+    /// Claude on Vertex AI: Messages and count_tokens natively, on Vertex's
+    /// own Anthropic Messages routes, with a pre-minted access token.
+    VertexClaude,
 }
 
 fn cfg() -> ProxyConfig {
@@ -80,17 +83,30 @@ fn app(upstream: &MockServer, kind: Upstream, platform: bool) -> axum::Router {
 /// [`app`], with a block-capable output guardrail that holds a stream back
 /// whole when `held`. Its keyword is in no answer here.
 fn app_with(upstream: &MockServer, kind: Upstream, platform: bool, held: bool) -> axum::Router {
-    let (provider, model_name) = match kind {
-        Upstream::OpenAi => ("openai", "gpt-4o"),
-        Upstream::Anthropic => ("anthropic", "claude-haiku-4-5"),
+    let (provider, adapter, model_name, secret) = match kind {
+        Upstream::OpenAi => ("openai", "openai", "gpt-4o", SECRET.to_string()),
+        Upstream::Anthropic => (
+            "anthropic",
+            "anthropic",
+            "claude-haiku-4-5",
+            SECRET.to_string(),
+        ),
+        // The access token is the credential sent upstream.
+        Upstream::VertexClaude => (
+            "google",
+            "vertex",
+            "claude-sonnet-4-5@20250929",
+            json!({"access_token": SECRET, "project": "proj-relay", "region": "us-east5"})
+                .to_string(),
+        ),
     };
     let snap = AisixSnapshot::new();
     let pk: aisix_core::ProviderKey = serde_json::from_value(json!({
         "display_name": "relay-up",
-        "secret": SECRET,
+        "secret": secret,
         "api_base": upstream.uri(),
         "provider": provider,
-        "adapter": provider,
+        "adapter": adapter,
     }))
     .unwrap();
     snap.provider_keys.insert(ResourceEntry::new(PK_ID, pk, 1));
@@ -129,6 +145,12 @@ fn app_with(upstream: &MockServer, kind: Upstream, platform: bool, held: bool) -
     hub.register_specialized(
         "anthropic",
         Arc::new(aisix_provider_anthropic::AnthropicBridge::new()),
+    );
+    hub.register_family(
+        aisix_core::Adapter::Vertex,
+        Arc::new(aisix_provider_vertex::VertexBridge::with_client(
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+        )),
     );
     let state = crate::ProxyState::new(SnapshotHandle::new(snap), hub, &cfg()).without_cache();
     let state = if platform {
@@ -1002,4 +1024,116 @@ async fn a_native_request_error_that_is_no_error_envelope_keeps_its_class() {
         !body.contains("<html") && !body.contains("awselb"),
         "{body}"
     );
+}
+
+// ── Claude on Vertex AI ────────────────────────────────────────────────────
+
+/// Claude on Vertex answers a request error in Anthropic's own envelope, on
+/// `:rawPredict` and `count-tokens:rawPredict`, and its overflow as a `413`
+/// "Prompt is too long". It speaks the caller's own protocol, so each is
+/// relayed with its own status and the scrubbed text, as Anthropic's own API
+/// would be, and as the same error mid-stream is.
+#[tokio::test]
+async fn claude_on_vertex_relays_its_request_errors() {
+    let invalid =
+        format!("messages.1.content.0: `thinking` blocks cannot be modified ({SECRET}) {INFRA}");
+    let too_long = format!("Prompt is too long ({SECRET}) {INFRA}");
+    let count = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]});
+    for (uri, request, status, kind, text, expected_status, expected_kind) in [
+        (
+            "/v1/messages",
+            messages_body(false),
+            400,
+            "invalid_request_error",
+            &invalid,
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+        ),
+        (
+            "/v1/messages",
+            messages_body(true),
+            413,
+            "invalid_request_error",
+            &too_long,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "request_too_large",
+        ),
+        (
+            "/v1/messages/count_tokens",
+            count,
+            400,
+            "invalid_request_error",
+            &invalid,
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+        ),
+    ] {
+        let up = json_upstream("(?i)rawpredict", status, anthropic_error(kind, text)).await;
+        let (got, body) = post(app(&up, Upstream::VertexClaude, true), uri, request).await;
+        assert_eq!(got, expected_status, "{uri} {status}: {body}");
+        assert_no_leak(&body);
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            v,
+            anthropic_error(expected_kind, &scrubbed(text)),
+            "{uri} {status}: {body}"
+        );
+    }
+
+    // The same request error mid-stream is relayed in the same words.
+    let up = sse_upstream(
+        "(?i)rawpredict",
+        &[
+            format!(
+                "event: message_start\ndata: {}\n\n",
+                json!({"type": "message_start", "message": {"id": "msg_1", "type": "message",
+                       "role": "assistant", "model": "claude-sonnet-4-5", "content": [],
+                       "stop_reason": null, "stop_sequence": null,
+                       "usage": {"input_tokens": 5, "output_tokens": 1}}})
+            ),
+            format!(
+                "event: error\ndata: {}\n\n",
+                anthropic_error("invalid_request_error", &invalid)
+            ),
+        ],
+    )
+    .await;
+    let (status, body) = post(
+        app(&up, Upstream::VertexClaude, true),
+        "/v1/messages",
+        messages_body(true),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_no_leak(&body);
+    let (_, error) = sse_payloads(&body)
+        .into_iter()
+        .find(|(_, v)| v["type"] == "error")
+        .unwrap_or_else(|| panic!("no error event: {body}"));
+    assert_eq!(
+        error,
+        anthropic_error("invalid_request_error", &scrubbed(&invalid)),
+        "{body}"
+    );
+}
+
+/// Off platform mode a Vertex Claude request error renders as it always has.
+#[tokio::test]
+async fn off_platform_mode_a_vertex_claude_request_error_renders_as_it_always_has() {
+    let text = "messages.1.content.0: `thinking` blocks cannot be modified";
+    let up = json_upstream(
+        "(?i)rawpredict",
+        400,
+        anthropic_error("invalid_request_error", text),
+    )
+    .await;
+    let (status, body) = post(
+        app(&up, Upstream::VertexClaude, false),
+        "/v1/messages",
+        messages_body(false),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v, anthropic_error("invalid_request_error", text), "{body}");
 }
