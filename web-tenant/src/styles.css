@@ -618,3 +618,25 @@
     padding: var(--s-4);
   }
 }
+
+/* ── A key's group, as radio cards ─────────────────────────── */
+/* One card per group the organisation is assigned, its display name over
+   its description: what a key is priced at, chosen with the key. */
+.picks .pick {
+  align-items: flex-start;
+  padding: var(--s-2) var(--s-3);
+  border: 1px solid var(--border);
+  border-radius: var(--r-button);
+}
+.picks .pick:has(input:checked) {
+  border-color: var(--ink);
+}
+.picks .pick input {
+  margin-top: var(--s-1);
+}
+.pick-text {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-1);
+  min-width: 0;
+}

@@ -648,6 +648,10 @@ async function main() {
     envId: environment.body.env_id,
     kineEndpoint,
     etcdPrefix,
+    // This stack's own control-plane database, so a test can set up a state
+    // no API write produces. Named, never a credential: the caller builds
+    // the URL from the PG URL it already holds.
+    cpDatabase: cpDb,
     operator: { email: OPERATOR_EMAIL, password },
   };
 

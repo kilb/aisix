@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useId, useState, type CSSProperties } from "react";
 import {
   ApiError,
+  groups as groupApi,
   keys as keyApi,
   members as memberApi,
   models as modelApi,
@@ -8,6 +9,7 @@ import {
   type Member,
   type NewKey,
   type Org,
+  type PortalGroup,
   type PortalModel,
   type SessionMember,
   type TenantKey,
@@ -57,6 +59,7 @@ export function Keys({
   const [items, setItems] = useState<TenantKey[] | null>(null);
   const [listErr, setListErr] = useState<string | null>(null);
   const [catalog, setCatalog] = useState<PortalModel[] | null>(null);
+  const [groups, setGroups] = useState<PortalGroup[] | null>(null);
   const [caps, setCaps] = useState<Caps | null>(null);
   const [people, setPeople] = useState<Member[] | null>(null);
   const [readErr, setReadErr] = useState<string | null>(null);
@@ -66,7 +69,7 @@ export function Keys({
   const [actionErr, setActionErr] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   // Which action on that key is in flight.
-  const [acting, setActing] = useState<"switch" | "revoke" | null>(null);
+  const [acting, setActing] = useState<"switch" | "revoke" | "group" | null>(null);
 
   const load = useCallback(async () => {
     try {
@@ -81,18 +84,20 @@ export function Keys({
     void load();
   }, [load]);
 
-  // The caps hold in any state; the models and the members feed the form,
-  // which only an active organisation has.
+  // The caps hold in any state; the models, the groups and the members feed
+  // the form, which only an active organisation has. A member still reads
+  // the groups, since every member holds keys and sees the page.
   useEffect(() => {
     const failed = (e: unknown) => setReadErr(failure(e));
     readOrg().then((o) => setCaps(o.limits), failed);
     if (!active) return;
     modelApi.list().then(setCatalog, failed);
+    groupApi.list().then(setGroups, failed);
     if (manager) memberApi.list().then(setPeople, failed);
   }, [active, manager]);
 
   /** One change of key `k`; the list is read again whatever the answer. */
-  async function act(k: TenantKey, what: "switch" | "revoke", change: () => Promise<unknown>) {
+  async function act(k: TenantKey, what: "switch" | "revoke" | "group", change: () => Promise<unknown>) {
     setBusy(k.id);
     setActing(what);
     setActionErr(null);
@@ -146,6 +151,7 @@ export function Keys({
           me={member}
           manager={manager}
           catalog={catalog}
+          groups={groups}
           caps={caps}
           people={people}
           readErr={readErr}
@@ -190,6 +196,7 @@ export function Keys({
                 <th>前缀</th>
                 <th>归属</th>
                 <th>模型</th>
+                <th>分组</th>
                 <th>限制</th>
                 <th>状态</th>
                 <th>
@@ -221,6 +228,16 @@ export function Keys({
                       <span className="trunc" style={{ "--trunc": "216px" } as CSSProperties} title={models}>
                         {models}
                       </span>
+                    </td>
+                    <td>
+                      <GroupCell
+                        k={k}
+                        groups={groups}
+                        active={active}
+                        busy={busy === k.id}
+                        acting={acting}
+                        onChoose={(groupId) => void act(k, "group", () => keyApi.setGroup(k.id, groupId, k.version))}
+                      />
                     </td>
                     <td className="tabular">{limitsOf(k)}</td>
                     <td>
@@ -267,19 +284,98 @@ function count(n: number): string {
   return n.toLocaleString("en-US");
 }
 
+/**
+ * The group a key routes to, by display name: what it is called, whether it
+ * still routes, and, for a key an older release left without one, the one
+ * time it may take one. Never a routing name, which no answer carries.
+ *
+ * A key whose group its operator unassigned stays named by that group and
+ * is closed instead: the page says so, and the gateway refuses it.
+ */
+function GroupCell({
+  k,
+  groups,
+  active,
+  busy,
+  acting,
+  onChoose,
+}: {
+  k: TenantKey;
+  groups: PortalGroup[] | null;
+  active: boolean;
+  busy: boolean;
+  acting: "switch" | "revoke" | "group" | null;
+  onChoose: (groupId: string) => void;
+}) {
+  const [choosing, setChoosing] = useState(false);
+  const [choice, setChoice] = useState("");
+
+  if (k.group === null) {
+    if (!active || !choosing) {
+      return (
+        <span className="acts">
+          <span className="hint">未选分组</span>
+          {active && (
+            <Button size="sm" disabled={busy} onClick={() => setChoosing(true)}>
+              选择分组
+            </Button>
+          )}
+        </span>
+      );
+    }
+    return (
+      <span className="acts">
+        <select aria-label="分组" value={choice} onChange={(e) => setChoice(e.target.value)}>
+          <option value="">请选择</option>
+          {(groups ?? []).map((g) => (
+            <option key={g.id} value={g.id}>
+              {g.display_name}
+            </option>
+          ))}
+        </select>
+        <Button
+          size="sm"
+          disabled={busy || choice === ""}
+          busy={busy && acting === "group"}
+          busyLabel="选择分组"
+          onClick={() => onChoose(choice)}
+        >
+          确认选择
+        </Button>
+        <Button size="sm" disabled={busy} onClick={() => setChoosing(false)}>
+          取消
+        </Button>
+      </span>
+    );
+  }
+
+  return (
+    <span>
+      <span className="trunc" style={{ "--trunc": "144px" } as CSSProperties} title={k.group.display_name}>
+        {k.group.display_name}
+      </span>
+      {!k.group_available && <span className="hint cell-note">分组已停用</span>}
+    </span>
+  );
+}
+
 function stateOf(k: TenantKey): { text: string; lamp: LampState; note?: string } {
   if (k.disabled_by_platform) return { text: "已被平台停用", lamp: "disabled", note: "只有平台可以重新启用" };
   if (k.disabled) return { text: "已停用", lamp: "disabled" };
   if (k.expires_at && Date.parse(k.expires_at) <= Date.now()) return { text: "已过期", lamp: "disabled" };
+  // A key with no group, or whose group its organisation no longer has, is
+  // closed by the gateway whatever its switches say; the group cell says why.
+  if (!k.group_available) return { text: "已停用", lamp: "disabled" };
   return { text: "可用", lamp: "applied", note: k.expires_at ? `${when(k.expires_at)} 到期` : undefined };
 }
 
-type Field = "label" | "models" | "concurrency" | "rpm" | "expires" | "owner";
+type Field = "label" | "group" | "models" | "concurrency" | "rpm" | "expires" | "owner";
 type FieldErrors = Partial<Record<Field, string>>;
 
 /** The form field a refusal's JSON path names, or null for one the form has no field for. */
 function fieldOf(path: string): Field | null {
   if (path === "/label") return "label";
+  if (path === "/group_id") return "group";
   if (path === "/model_ids" || path.startsWith("/model_ids/")) return "models";
   if (path === "/rate_limit/concurrency") return "concurrency";
   if (path === "/rate_limit/rpm") return "rpm";
@@ -305,6 +401,7 @@ function NewKeyForm({
   me,
   manager,
   catalog,
+  groups,
   caps,
   people,
   readErr,
@@ -314,6 +411,7 @@ function NewKeyForm({
   me: SessionMember;
   manager: boolean;
   catalog: PortalModel[] | null;
+  groups: PortalGroup[] | null;
   caps: Caps | null;
   people: Member[] | null;
   readErr: string | null;
@@ -323,6 +421,9 @@ function NewKeyForm({
 }) {
   const id = useId();
   const [label, setLabel] = useState("");
+  // The group the key is bought in: what it is priced at, so it is chosen
+  // with the key and never changed afterwards.
+  const [group, setGroup] = useState("");
   const [picked, setPicked] = useState<string[]>([]);
   const [concurrency, setConcurrency] = useState("");
   const [rpm, setRpm] = useState("");
@@ -334,10 +435,20 @@ function NewKeyForm({
   const [busy, setBusy] = useState(false);
   const [form, focusRefusal] = useRefusalFocus<HTMLFormElement>();
 
+  // One group is the organisation's only choice, so it is preselected; it is
+  // still shown, since it is what the key is priced at.
+  useEffect(() => {
+    if (groups !== null && groups.length === 1) setGroup(groups[0]?.id ?? "");
+  }, [groups]);
+
   async function submit(e: React.FormEvent) {
     e.preventDefault();
     setErr(null);
     const found: FieldErrors = {};
+    // The group is what the key is priced at, so it is never left to the
+    // backend's guess: with several offered, one is chosen or the submit is
+    // refused here, and with none the button is disabled below.
+    if (groups !== null && groups.length > 0 && group === "") found.group = "请选择分组";
     const c = limit(concurrency);
     const r = limit(rpm);
     if (c.problem) found.concurrency = c.problem;
@@ -357,6 +468,7 @@ function NewKeyForm({
     // Only what was set is sent: no model picked follows every grant, and a
     // limit left empty follows the organisation's cap.
     const body: NewKey = { label };
+    if (group !== "") body.group_id = group;
     if (picked.length > 0) body.model_ids = picked;
     if (c.value !== undefined || r.value !== undefined) body.rate_limit = { concurrency: c.value, rpm: r.value };
     if (expiresAt) body.expires_at = expiresAt;
@@ -365,6 +477,7 @@ function NewKeyForm({
     try {
       const { plaintext } = await keyApi.create(body);
       setLabel("");
+      setGroup(groups !== null && groups.length === 1 ? (groups[0]?.id ?? "") : "");
       setPicked([]);
       setConcurrency("");
       setRpm("");
@@ -400,7 +513,17 @@ function NewKeyForm({
   // The models are a fieldset rather than one Field: their hint and refusal are wired here.
   const modelsHint = `${id}-models-hint`;
   const modelsErr = `${id}-models-err`;
+  const groupHint = `${id}-group-hint`;
+  const groupErr = `${id}-group-err`;
   const choices = (people ?? []).filter((p) => p.id !== me.id && p.role !== "billing");
+  // The hint is rendered only when there is a group to choose, so it is
+  // described by only then.
+  const groupDescribedBy = [groups !== null && groups.length > 0 ? groupHint : null, errs.group ? groupErr : null]
+    .filter(Boolean)
+    .join(" ");
+  // With no group assigned the form cannot create anything: the button says
+  // why and the submit never reaches the server to earn its refusal.
+  const noGroup = groups !== null && groups.length === 0;
 
   return (
     <div className="panel">
@@ -414,6 +537,52 @@ function NewKeyForm({
         <Field label="名称" wide error={errs.label}>
           {(aria) => <input value={label} onChange={(e) => setLabel(e.target.value)} {...aria} />}
         </Field>
+
+        {/* The group, as radio cards: one per group the organisation is
+            assigned, by display name and description. With one it is
+            preselected and still shown, since it is what the key is priced
+            at; with none the form cannot create anything and says why. */}
+        <div className="field wide">
+          <fieldset
+            className="field"
+            aria-describedby={groupDescribedBy || undefined}
+            aria-invalid={errs.group ? true : undefined}
+          >
+            <legend>分组</legend>
+            {groups === null ? (
+              <span className="hint">载入中…</span>
+            ) : groups.length === 0 ? (
+              <span className="hint">运营尚未为本组织分配分组。请联系平台运营分配分组后，再新建密钥。</span>
+            ) : (
+              <div className="picks">
+                {groups.map((g) => (
+                  <label key={g.id} className="pick">
+                    <input
+                      type="radio"
+                      name={`${id}-group`}
+                      checked={group === g.id}
+                      onChange={() => setGroup(g.id)}
+                    />
+                    <span className="pick-text">
+                      <strong>{g.display_name}</strong>
+                      {g.description !== "" && <span className="hint">{g.description}</span>}
+                    </span>
+                  </label>
+                ))}
+              </div>
+            )}
+          </fieldset>
+          {groups !== null && groups.length > 0 && (
+            <p className="hint" id={groupHint}>
+              分组建好密钥后不能更换；如需更换分组，请新建密钥
+            </p>
+          )}
+          {errs.group && (
+            <p className="field-problem" id={groupErr}>
+              {errs.group}
+            </p>
+          )}
+        </div>
 
         <div className="field wide">
           <fieldset
@@ -491,7 +660,7 @@ function NewKeyForm({
           </div>
         )}
         <div className="form-actions">
-          <Button kind="primary" type="submit" busy={busy}>
+          <Button kind="primary" type="submit" busy={busy} disabled={noGroup}>
             新建密钥
           </Button>
         </div>
