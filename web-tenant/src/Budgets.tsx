@@ -45,8 +45,43 @@ function usdToMicro(s: string): number {
 
 /** A limit as the dollars it was typed in (`1.50`), for an edit field. */
 function microToUsd(micro: number): string {
-  const cents = String(Math.floor((micro % 1_000_000) / 10_000)).padStart(2, "0");
-  return `${Math.floor(micro / 1_000_000)}.${cents}`;
+  const v = BigInt(micro);
+  return `${v / 1_000_000n}.${String((v % 1_000_000n) / 10_000n).padStart(2, "0")}`;
+}
+
+/** Quota reads in flight at once: the page's share of the control plane's small connection pool. */
+export const QUOTA_READS_IN_FLIGHT = 4;
+/** Keys the 实际可用 table lists before 显示更多; only the keys listed are read. */
+const KEYS_PER_VIEW = 25;
+
+/** `f` over `items`, at most `limit` at a time, settled like `Promise.allSettled`; stops starting reads once `live()` is false. */
+async function settledLimited<T, R>(
+  items: T[],
+  limit: number,
+  live: () => boolean,
+  f: (t: T) => Promise<R>,
+): Promise<PromiseSettledResult<R>[]> {
+  const out: PromiseSettledResult<R>[] = [];
+  let next = 0;
+  const worker = async () => {
+    while (next < items.length && live()) {
+      const i = next++;
+      try {
+        out[i] = { status: "fulfilled", value: await f(items[i]!) };
+      } catch (reason) {
+        out[i] = { status: "rejected", reason };
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return out.filter(Boolean);
+}
+
+/** The keys the 实际可用 table lists: the viewer's keys, then keys that only carry a quota. */
+function keyEntries(keys: TenantKey[] | null, rows: Budget[]): [string, string][] {
+  const seen = new Map<string, string>((keys ?? []).map((k) => [k.id, k.label]));
+  for (const b of rows) if (b.target_live && !seen.has(b.target.id)) seen.set(b.target.id, b.target.label);
+  return [...seen];
 }
 
 // ── comparing with the level above ──────────────────────────────────────────
@@ -129,6 +164,8 @@ export function Budgets({ member }: { member: SessionMember }) {
   const [quotas, setQuotas] = useState<Record<string, KeyQuota>>({});
   const [quotaErr, setQuotaErr] = useState<string | null>(null);
   const [tick, setTick] = useState(0);
+  const [listed, setListed] = useState(0);
+  const [shown, setShown] = useState(KEYS_PER_VIEW);
   const [reloading, setReloading] = useState(true);
   const reload = useCallback(() => setTick((n) => n + 1), []);
 
@@ -151,14 +188,22 @@ export function Budgets({ member }: { member: SessionMember }) {
       }
       setKeys(keyList.status === "fulfilled" ? keyList.value : []);
       if (peopleList.status === "fulfilled") setPeople(peopleList.value);
+      setListed((n) => n + 1);
+    })();
+    return () => {
+      live = false;
+    };
+  }, [role, manager, tick]);
 
-      // Each key's own answer: what is left on it and which level binds.
-      const ids = new Set<string>();
-      if (keyList.status === "fulfilled") for (const k of keyList.value) ids.add(k.id);
-      if (list.status === "fulfilled") {
-        for (const b of list.value) if (b.scope === "api_key" && b.target_live) ids.add(b.target.id);
-      }
-      const answers = await Promise.allSettled([...ids].map((id) => billing.keyQuota(id)));
+  // Each key's own answer: what is left on it and which level binds. Only the
+  // keys in view are read, and at most QUOTA_READS_IN_FLIGHT at a time.
+  useEffect(() => {
+    if (listed === 0 || keys === null) return;
+    let live = true;
+    void (async () => {
+      const ids = new Set(keyEntries(keys, (rows ?? []).filter((b) => b.scope === "api_key")).slice(0, shown).map(([id]) => id));
+      for (const b of rows ?? []) if (b.scope === "api_key" && b.target_live) ids.add(b.target.id);
+      const answers = await settledLimited([...ids], QUOTA_READS_IN_FLIGHT, () => live, (id) => billing.keyQuota(id));
       if (!live) return;
       const next: Record<string, KeyQuota> = {};
       let failed: unknown = null;
@@ -173,7 +218,9 @@ export function Budgets({ member }: { member: SessionMember }) {
     return () => {
       live = false;
     };
-  }, [role, manager, tick]);
+    // `listed` moves once per list read; `rows` and `keys` are the ones it set.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [listed, shown]);
 
   const team = (rows ?? []).filter((b) => b.scope === "team");
   const memberRows = (rows ?? []).filter((b) => b.scope === "member");
@@ -205,7 +252,7 @@ export function Budgets({ member }: { member: SessionMember }) {
         <QuotaTable
           label="成员额度"
           rows={rows === null ? null : memberRows}
-          empty={manager ? "还没有成员额度，在上方新建" : "还没有给你设置成员额度"}
+          empty={manager ? "还没有成员额度，在上方新建" : role === "billing" ? "还没有成员额度" : "还没有给你设置成员额度"}
           role={role}
           parentsOf={() => team.map(termsOf)}
           onChanged={reload}
@@ -224,11 +271,11 @@ export function Budgets({ member }: { member: SessionMember }) {
             </Button>
           </div>
         </div>
-        <KeyFigures keys={keys} rows={keyRows} quotas={quotas} />
+        <KeyFigures keys={keys} rows={keyRows} quotas={quotas} shown={shown} onMore={() => setShown((n) => n + KEYS_PER_VIEW)} />
         <QuotaTable
           label="密钥额度"
           rows={rows === null ? null : keyRows}
-          empty="还没有密钥额度，在上方新建"
+          empty={creator ? "还没有密钥额度，在上方新建" : "还没有密钥额度"}
           role={role}
           parentsOf={(b) => keyParents(quotas[b.target.id])}
           onChanged={reload}
@@ -241,13 +288,25 @@ export function Budgets({ member }: { member: SessionMember }) {
 // ── what each key can still spend ───────────────────────────────────────────
 
 /** Per key, what it can still spend and the level that stops it first. */
-function KeyFigures({ keys, rows, quotas }: { keys: TenantKey[] | null; rows: Budget[]; quotas: Record<string, KeyQuota> }) {
+function KeyFigures({
+  keys,
+  rows,
+  quotas,
+  shown,
+  onMore,
+}: {
+  keys: TenantKey[] | null;
+  rows: Budget[];
+  quotas: Record<string, KeyQuota>;
+  shown: number;
+  onMore: () => void;
+}) {
   if (keys === null) return <Loading />;
   // A viewer who cannot list keys (billing) still reads the keys that carry a quota.
-  const seen = new Map<string, string>(keys.map((k) => [k.id, k.label]));
-  for (const b of rows) if (b.target_live && !seen.has(b.target.id)) seen.set(b.target.id, b.target.label);
-  if (seen.size === 0) return null;
+  const seen = keyEntries(keys, rows);
+  if (seen.length === 0) return null;
   return (
+    <>
     <DataTable label="密钥实际可用">
       <thead>
         <tr>
@@ -257,7 +316,7 @@ function KeyFigures({ keys, rows, quotas }: { keys: TenantKey[] | null; rows: Bu
         </tr>
       </thead>
       <tbody>
-        {[...seen].map(([id, label]) => {
+        {seen.slice(0, shown).map(([id, label]) => {
           const q = quotas[id];
           return (
             <tr key={id}>
@@ -269,12 +328,20 @@ function KeyFigures({ keys, rows, quotas }: { keys: TenantKey[] | null; rows: Bu
               <td className="num">
                 {!q ? "—" : q.effective_remaining_micro_usd === null ? "不限" : <Money micro={q.effective_remaining_micro_usd} />}
               </td>
-              <td>{q?.binding_level ? LEVEL[q.binding_level] : "—"}</td>
+              <td>{q?.binding_level ? (LEVEL[q.binding_level] ?? q.binding_level) : "—"}</td>
             </tr>
           );
         })}
       </tbody>
     </DataTable>
+    {seen.length > shown && (
+      <div className="panel-notes">
+        <Button size="sm" onClick={onMore}>
+          显示更多
+        </Button>
+      </div>
+    )}
+    </>
   );
 }
 
@@ -326,7 +393,7 @@ function QuotaTable({
 /** A cumulative quota counts from the day it was set; a periodic one is its period. */
 function periodText(b: Budget): string {
   if (b.kind === "cumulative") return b.counted_from ? `自 ${fmtUtc(b.counted_from).slice(0, 10)} 起` : "自设置起";
-  return b.period ? PERIOD[b.period] : "—";
+  return b.period ? (PERIOD[b.period] ?? b.period) : "—";
 }
 
 function QuotaRow({
@@ -394,8 +461,8 @@ function QuotaRow({
           {!b.target_live && "（已失效）"}
         </span>
       </td>
-      <td>{SET_BY[b.set_by]}</td>
-      <td>{KIND[b.kind]}</td>
+      <td>{SET_BY[b.set_by] ?? b.set_by}</td>
+      <td>{KIND[b.kind] ?? b.kind}</td>
       <td className="tabular">{periodText(b)}</td>
       <td className="num">
         {editing ? (
