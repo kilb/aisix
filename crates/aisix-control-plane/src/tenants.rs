@@ -341,6 +341,25 @@ pub async fn lock_many(
     Ok(rows)
 }
 
+/// [`lock_billing`] for several tenants: each tenant row and then its
+/// billing account, tenant by tenant in ascending id order (which `ids` is
+/// sorted into, without repeats), so that two transactions locking
+/// overlapping sets cannot deadlock and usage intake, which locks accounts
+/// alone in the same order, cannot either. A path that posts to several
+/// tenants' ledgers takes this as the first locks of its transaction.
+pub async fn lock_many_billing(
+    conn: &mut PgConnection,
+    ids: &mut Vec<Uuid>,
+) -> Result<Vec<(TenantRow, ledger::Account)>, ApiError> {
+    ids.sort();
+    ids.dedup();
+    let mut rows = Vec::with_capacity(ids.len());
+    for id in ids.iter() {
+        rows.push(lock_billing(&mut *conn, *id).await?);
+    }
+    Ok(rows)
+}
+
 /// What a new tenant row holds.
 struct NewTenant<'a> {
     name: &'a str,

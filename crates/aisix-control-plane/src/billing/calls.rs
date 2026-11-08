@@ -20,8 +20,13 @@
 //! and [`tenant_error`], so an upstream's own status, the recorded error
 //! class and its message never reach an answer, and a model the key may not
 //! use reads exactly like one that does not exist. A request's failed
-//! failover attempts are hidden unless the upstream billed them
-//! ([`visible_to_tenant`]).
+//! failover attempts are hidden unless the upstream billed them or a
+//! re-pricing run adjusted them ([`visible_to_tenant`]).
+//!
+//! A charge is written once; a re-pricing run corrects it with adjustments
+//! (`pricing_adjustments`). A call shows their sum beside its charge
+//! (`adjusted_micro_usd`), and a summary's `charged_micro_usd` is the
+//! corrected charge: the charges plus their adjustments.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -103,8 +108,13 @@ pub fn tenant_outcome(
     )
 }
 
-/// A charge's status as a tenant reads it: a row not priced yet is pending.
-pub fn tenant_charge_status(status: &str) -> &'static str {
+/// A charge's status as a tenant reads it: a row not priced yet is pending,
+/// and one a re-pricing run adjusted (`repriced`) is charged, whatever it was
+/// stored as: a run adjusts only a row it charges.
+pub fn tenant_charge_status(status: &str, repriced: bool) -> &'static str {
+    if repriced {
+        return "charged";
+    }
     match status {
         "charged" => "charged",
         "exempt" => "exempt",
@@ -114,17 +124,25 @@ pub fn tenant_charge_status(status: &str) -> &'static str {
 }
 
 /// Whether a tenant sees the row: every final attempt, and a non-final one
-/// only when its charge is `charged` (the upstream billed it). The listing
-/// applies the same rule in SQL ([`VISIBLE`]) so a page is never short.
-pub fn visible_to_tenant(is_final_attempt: bool, charge_status: &str) -> bool {
-    is_final_attempt || charge_status == "charged"
+/// only when it is billed: its charge is `charged` (the upstream billed it),
+/// or a re-pricing run adjusted it (`repriced`). The listing applies the
+/// same rule in SQL ([`VISIBLE`]) so a page is never short.
+pub fn visible_to_tenant(is_final_attempt: bool, charge_status: &str, repriced: bool) -> bool {
+    is_final_attempt || charge_status == "charged" || repriced
 }
 
 /// [`visible_to_tenant`] over the joined `pc` (charge) and `ue` (usage row).
-const VISIBLE: &str = "(ue.event->'is_final_attempt' = 'true'::jsonb OR pc.status = 'charged')";
+pub(super) const VISIBLE: &str =
+    "(ue.event->'is_final_attempt' = 'true'::jsonb OR pc.status = 'charged' \
+     OR EXISTS (SELECT 1 FROM pricing_adjustments pa WHERE pa.event_id = pc.event_id))";
+
+/// The sum of the adjustments of the charge `pc`, `NULL` when it has none.
+pub(super) const ADJUSTED: &str =
+    "(SELECT SUM(pa.delta_micro_usd)::bigint FROM pricing_adjustments pa \
+     WHERE pa.event_id = pc.event_id)";
 
 /// The only keys read out of a usage row's event.
-const EVENT_FIELDS: &str = "jsonb_build_object(\
+pub(super) const EVENT_FIELDS: &str = "jsonb_build_object(\
     'requested_model', ue.event->'requested_model', \
     'operation', ue.event->'operation', \
     'status_code', ue.event->'status_code', \
@@ -156,7 +174,7 @@ impl Models {
         conn: &mut PgConnection,
         tenant: Uuid,
         ids: &[Uuid],
-    ) -> Result<Models, ApiError> {
+    ) -> Result<Models, DbError> {
         let rows: Vec<(Uuid, String, bool)> = sqlx::query_as(
             "SELECT r.id, COALESCE(r.doc->>'display_name', ''), r.id = ANY(t.allowed_model_ids) \
              FROM gw_resources r, tenants t \
@@ -166,8 +184,7 @@ impl Models {
         .bind(ids)
         .bind(Kind::Models.segment())
         .fetch_all(conn)
-        .await
-        .map_err(DbError::from)?;
+        .await?;
         let mut models = Models {
             granted: HashSet::new(),
             names: HashMap::new(),
@@ -217,7 +234,7 @@ pub struct MemberRef {
 pub struct ChargeView {
     pub status: &'static str,
     pub amount_micro_usd: Option<i64>,
-    /// The sum of the event's re-pricing adjustments; 0 until a run adjusts
+    /// The sum of the event's re-pricing adjustments; 0 when no run adjusted
     /// it.
     pub adjusted_micro_usd: i64,
     pub service_tier: Option<String>,
@@ -352,6 +369,8 @@ struct CallRow {
     estimated: bool,
     discount_bps: i64,
     lines: Value,
+    /// The sum of the charge's adjustments, `None` when it has none.
+    adjusted: Option<i64>,
     request_id: Option<String>,
     ev: Value,
 }
@@ -400,6 +419,7 @@ pub async fn list_calls(
          pc.requested_model_id, pc.status, pc.charge_micro_usd, pc.service_tier, pc.estimated, \
          pc.discount_bps, pc.lines, ue.request_id, ",
     );
+    sql.push(ADJUSTED).push(" AS adjusted, ");
     sql.push(EVENT_FIELDS).push(" AS ev");
     scope.push_from(&mut sql, false);
     sql.push(" ORDER BY pc.seq DESC LIMIT ")
@@ -451,7 +471,7 @@ pub async fn list_calls(
         .into_iter()
         .filter_map(|r| {
             let is_final = r.ev.get("is_final_attempt").and_then(Value::as_bool) == Some(true);
-            if !visible_to_tenant(is_final, &r.status) {
+            if !visible_to_tenant(is_final, &r.status, r.adjusted.is_some()) {
                 return None;
             }
             let status_code =
@@ -498,9 +518,9 @@ pub async fn list_calls(
                     .and_then(|ms| u32::try_from(ms).ok())
                     .filter(|ms| *ms > 0),
                 charge: ChargeView {
-                    status: tenant_charge_status(&r.status),
+                    status: tenant_charge_status(&r.status, r.adjusted.is_some()),
                     amount_micro_usd: r.charge_micro_usd,
-                    adjusted_micro_usd: 0,
+                    adjusted_micro_usd: r.adjusted.unwrap_or(0),
                     service_tier: r.service_tier,
                     estimated: r.estimated,
                     discount_bps: r.discount_bps,
@@ -555,7 +575,9 @@ async fn summarize_snapshot(
 /// gateway resolved, never by the name a caller sent: calls whose model is
 /// not in the tenant's grants (or never resolved) share one row per period
 /// with `id` null and an empty name, and a granted model is named by its
-/// current display name.
+/// current display name. `charged_micro_usd` is the corrected charge: the
+/// charged rows' charges plus every row's re-pricing adjustments, in the
+/// period the row occurred in.
 async fn summarize(
     conn: &mut PgConnection,
     scope: &Scope,
@@ -567,11 +589,12 @@ async fn summarize(
     };
 
     let mut sql = QueryBuilder::<Postgres>::new("SELECT date_trunc(");
-    sql.push_bind(unit).push(
+    sql.push_bind(unit).push(format!(
         ", pc.occurred_at, 'UTC'), pc.requested_model_id, count(*)::bigint, \
-         COALESCE(sum(pc.charge_micro_usd) FILTER (WHERE pc.status = 'charged'), 0)::bigint, \
-         (count(*) FILTER (WHERE pc.estimated))::bigint",
-    );
+         COALESCE(sum(pc.charge_micro_usd) FILTER (WHERE pc.status = 'charged'), 0)::bigint \
+           + sum(COALESCE({ADJUSTED}, 0))::bigint, \
+         (count(*) FILTER (WHERE pc.estimated))::bigint"
+    ));
     scope.push_from(&mut sql, false);
     sql.push(" GROUP BY 1, 2 ORDER BY 1, 2");
     let rows: Vec<(DateTime<Utc>, String, i64, i64, i64)> = sql
@@ -790,17 +813,24 @@ mod tests {
 
     #[test]
     fn an_unpriced_row_is_pending_to_a_tenant() {
-        assert_eq!(tenant_charge_status("unpriced"), "pending");
-        assert_eq!(tenant_charge_status("charged"), "charged");
-        assert_eq!(tenant_charge_status("exempt"), "exempt");
-        assert_eq!(tenant_charge_status("nothing_to_bill"), "nothing_to_bill");
+        assert_eq!(tenant_charge_status("unpriced", false), "pending");
+        assert_eq!(tenant_charge_status("charged", false), "charged");
+        assert_eq!(tenant_charge_status("exempt", false), "exempt");
+        assert_eq!(
+            tenant_charge_status("nothing_to_bill", false),
+            "nothing_to_bill"
+        );
+        // A re-pricing run charged it.
+        assert_eq!(tenant_charge_status("unpriced", true), "charged");
     }
 
     #[test]
     fn only_final_or_billed_attempts_are_visible() {
-        assert!(visible_to_tenant(true, "unpriced"));
-        assert!(visible_to_tenant(false, "charged"));
-        assert!(!visible_to_tenant(false, "unpriced"));
-        assert!(!visible_to_tenant(false, "nothing_to_bill"));
+        assert!(visible_to_tenant(true, "unpriced", false));
+        assert!(visible_to_tenant(false, "charged", false));
+        assert!(!visible_to_tenant(false, "unpriced", false));
+        assert!(!visible_to_tenant(false, "nothing_to_bill", false));
+        // A run billed it.
+        assert!(visible_to_tenant(false, "unpriced", true));
     }
 }

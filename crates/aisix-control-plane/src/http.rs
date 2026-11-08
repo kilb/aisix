@@ -472,10 +472,32 @@ pub const ROUTE_ROLES: &[(&str, &str, MinRole)] = &[
         "/api/budgets/{id}",
         MinRole::Member(&[MemberRole::Owner, MemberRole::Admin, MemberRole::Member]),
     ),
+    // Re-pricing runs: an operator previews one, an admin applies it.
+    (
+        "GET",
+        "/admin/billing/repricing",
+        MinRole::Op(OperatorRole::Viewer),
+    ),
+    (
+        "POST",
+        "/admin/billing/repricing",
+        MinRole::Op(OperatorRole::Operator),
+    ),
+    (
+        "GET",
+        "/admin/billing/repricing/{id}",
+        MinRole::Op(OperatorRole::Viewer),
+    ),
+    (
+        "POST",
+        "/admin/billing/repricing/{id}/apply",
+        MinRole::Op(OperatorRole::Admin),
+    ),
     // Gateways, on the gateway listener.
     ("POST", "/dp/heartbeat", MinRole::Dp),
     ("GET", "/dp/v1/keys/{key_id}/prices", MinRole::Dp),
     ("GET", "/dp/v1/keys/{key_id}/quota", MinRole::Dp),
+    ("GET", "/dp/v1/keys/{key_id}/requests", MinRole::Dp),
     ("ANY", "/dp/store/v1/{*rest}", MinRole::Dp),
     ("POST", "/dp/telemetry", MinRole::Dp),
 ];
@@ -677,6 +699,18 @@ pub fn browser_router(state: AppState) -> Router {
             patch(billing::budget_routes::member_update)
                 .delete(billing::budget_routes::member_delete),
         )
+        .route(
+            "/admin/billing/repricing",
+            get(billing::repricing::list).post(billing::repricing::preview),
+        )
+        .route(
+            "/admin/billing/repricing/{id}",
+            get(billing::repricing::get),
+        )
+        .route(
+            "/admin/billing/repricing/{id}/apply",
+            post(billing::repricing::apply),
+        )
         .route_layer(axum::middleware::from_fn(json_only))
         .route_layer(axum::middleware::from_fn(only_listed_routes))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
@@ -695,6 +729,10 @@ pub fn dp_router(state: AppState) -> Router {
         .route(
             "/dp/v1/keys/{key_id}/quota",
             get(billing::lookup_quota::dp_quota),
+        )
+        .route(
+            "/dp/v1/keys/{key_id}/requests",
+            get(billing::lookup_requests::dp_requests),
         )
         .route("/dp/store/v1/{*rest}", any(dp::store::not_found))
         // A batch may be larger than the other routes' bodies, and every
