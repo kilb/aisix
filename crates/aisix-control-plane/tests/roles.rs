@@ -192,6 +192,14 @@ fn fixture(method: &str, path: &str, target: &SeededOperator) -> (String, Option
             ),
             None,
         ),
+        // The tenant matches nothing: 404 once the role check passed.
+        ("GET", "/admin/tenants/{id}/usage/summary") => (
+            format!(
+                "/admin/tenants/{}/usage/summary?group=day&from=2026-01-01T00:00:00Z&to=2026-01-02T00:00:00Z",
+                Uuid::nil()
+            ),
+            None,
+        ),
         _ => panic!("no fixture for {method} {path}: add one to tests/roles.rs"),
     }
 }

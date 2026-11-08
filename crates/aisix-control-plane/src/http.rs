@@ -370,6 +370,14 @@ pub const ROUTE_ROLES: &[(&str, &str, MinRole)] = &[
         "/api/billing/summary",
         MinRole::Member(&[MemberRole::Owner, MemberRole::Admin, MemberRole::Billing]),
     ),
+    // Call log and usage summaries.
+    ("GET", "/api/usage/calls", MinRole::Member(EVERY_MEMBER)),
+    ("GET", "/api/usage/summary", MinRole::Member(EVERY_MEMBER)),
+    (
+        "GET",
+        "/admin/tenants/{id}/usage/summary",
+        MinRole::Op(OperatorRole::Viewer),
+    ),
     // Gateways, on the gateway listener.
     ("POST", "/dp/heartbeat", MinRole::Dp),
     ("GET", "/dp/v1/keys/{key_id}/prices", MinRole::Dp),
@@ -529,6 +537,12 @@ pub fn browser_router(state: AppState) -> Router {
         )
         .route("/api/billing/ledger", get(billing::statements::ledger))
         .route("/api/billing/summary", get(billing::statements::summary))
+        .route("/api/usage/calls", get(billing::calls::list_calls))
+        .route("/api/usage/summary", get(billing::calls::tenant_summary))
+        .route(
+            "/admin/tenants/{id}/usage/summary",
+            get(billing::calls::admin_summary),
+        )
         .route_layer(axum::middleware::from_fn(json_only))
         .route_layer(axum::middleware::from_fn(only_listed_routes))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
