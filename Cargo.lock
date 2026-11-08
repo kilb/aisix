@@ -500,6 +500,7 @@ dependencies = [
  "aisix-provider-anthropic",
  "aisix-provider-azure-openai",
  "aisix-provider-openai",
+ "aisix-provider-vertex",
  "aisix-ratelimit",
  "arc-swap",
  "async-stream",

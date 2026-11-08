@@ -76,6 +76,8 @@ mod operation;
 mod passthrough_route;
 pub mod platform;
 mod platform_errors;
+#[cfg(test)]
+mod platform_relay_tests;
 mod policy_index;
 mod quota;
 mod realtime;

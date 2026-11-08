@@ -807,10 +807,15 @@ pub(crate) struct RequestAttribution {
     /// of its response body, which is where every error a caller receives is
     /// rendered, streamed frames included.
     platform: bool,
-    /// Whether the request's latest attempt reached an upstream of another
-    /// protocol through a translation ([`note_translated_dispatch`]).
-    translated: std::sync::atomic::AtomicBool,
+    /// How the request's latest attempt reached its upstream, when its
+    /// handler records it ([`note_translated_dispatch`]): one of
+    /// `DISPATCH_UNRECORDED`, `DISPATCH_NATIVE` and `DISPATCH_TRANSLATED`.
+    dispatch: std::sync::atomic::AtomicU8,
 }
+
+const DISPATCH_UNRECORDED: u8 = 0;
+const DISPATCH_NATIVE: u8 = 1;
+const DISPATCH_TRANSLATED: u8 = 2;
 
 impl RequestAttribution {
     /// A sub-call scope that cannot change the parent request's target
@@ -823,7 +828,7 @@ impl RequestAttribution {
             gateway_embedding_ledger: Arc::clone(&self.gateway_embedding_ledger),
             response_tap: Arc::default(),
             platform: self.platform,
-            translated: std::sync::atomic::AtomicBool::default(),
+            dispatch: std::sync::atomic::AtomicU8::new(DISPATCH_UNRECORDED),
         }
     }
 
@@ -1217,18 +1222,29 @@ pub(crate) fn platform_mode() -> bool {
 /// records it before it calls the upstream, so the flag describes the one
 /// whose failure the caller is answered with.
 pub(crate) fn note_translated_dispatch(translated: bool) {
+    let dispatch = if translated {
+        DISPATCH_TRANSLATED
+    } else {
+        DISPATCH_NATIVE
+    };
     let _ = CURRENT.try_with(|a| {
-        a.translated
-            .store(translated, std::sync::atomic::Ordering::Relaxed)
+        a.dispatch
+            .store(dispatch, std::sync::atomic::Ordering::Relaxed)
     });
 }
 
-/// Whether the request's latest attempt went through a translation
-/// ([`note_translated_dispatch`]). `false` outside a request scope.
-pub(crate) fn translated_dispatch() -> bool {
-    CURRENT
-        .try_with(|a| a.translated.load(std::sync::atomic::Ordering::Relaxed))
-        .unwrap_or(false)
+/// Whether the request's latest attempt went through a translation, as its
+/// handler recorded it ([`note_translated_dispatch`]). `None` outside a
+/// request scope and on a route that records nothing.
+pub(crate) fn translated_dispatch() -> Option<bool> {
+    match CURRENT
+        .try_with(|a| a.dispatch.load(std::sync::atomic::Ordering::Relaxed))
+        .unwrap_or(DISPATCH_UNRECORDED)
+    {
+        DISPATCH_NATIVE => Some(false),
+        DISPATCH_TRANSLATED => Some(true),
+        _ => None,
+    }
 }
 
 /// Record one actual gateway-initiated embedding bridge call. This is safe
