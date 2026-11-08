@@ -68,6 +68,11 @@ const TIME_BOUND: Duration = Duration::from_secs(10);
 /// it was stored.
 const UNCONFIRMED: &str = "send_unconfirmed";
 
+/// How recently an instance must have reported for `usage_loss` to count
+/// its drops, as a Postgres interval. The instance cap never evicts an
+/// instance whose drops it still counts (`dp::heartbeat`).
+pub const USAGE_LOSS_WINDOW: &str = "interval '24 hours'";
+
 /// A per-tenant check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -175,12 +180,13 @@ pub async fn check(
     tenant_id: Option<Uuid>,
 ) -> Result<Reconciliation, DbError> {
     let deadline = Instant::now() + TIME_BOUND;
-    let (checked_at, since, session_ms): (DateTime<Utc>, DateTime<Utc>, i64) = sqlx::query_as(
-        "SELECT now(), now() - interval '24 hours', \
-           (SELECT reset_val::bigint FROM pg_settings WHERE name = 'statement_timeout')",
-    )
-    .fetch_one(&mut *conn)
-    .await?;
+    let (checked_at, since, session_ms): (DateTime<Utc>, DateTime<Utc>, i64) =
+        sqlx::query_as(&format!(
+            "SELECT now(), now() - {USAGE_LOSS_WINDOW}, \
+               (SELECT reset_val::bigint FROM pg_settings WHERE name = 'statement_timeout')"
+        ))
+        .fetch_one(&mut *conn)
+        .await?;
     bound(&mut *conn, deadline, session_ms).await?;
     let mut mismatches = totals(&mut *conn, tenant_id).await?;
     bound(&mut *conn, deadline, session_ms).await?;

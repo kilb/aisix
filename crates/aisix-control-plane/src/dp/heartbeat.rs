@@ -23,11 +23,14 @@
 //!   `instance_id` at every boot, so a crash-looping one leaves a row behind
 //!   each time; a new instance past the cap therefore takes the place of
 //!   the credential's longest-silent offline instance (not heard from within
-//!   `CP_INSTANCE_STALE_SECS`), and the live ones always get in. Only when
-//!   every row is online is a new instance refused, `429 instance_limit`,
-//!   storing nothing; the time is recorded as the credential's
-//!   `instance_cap_hit_at`, since the instances shown are then not the whole
-//!   fleet. An evicted instance the gateway-version gate still judges (heard
+//!   `CP_INSTANCE_STALE_SECS`), and the live ones always get in. An offline
+//!   instance whose reported usage drops reconciliation still counts (one
+//!   heard from within `billing::reconcile::USAGE_LOSS_WINDOW` that reported
+//!   any) is never evicted, since its drops would vanish from the
+//!   reconciliation. When every row is online or such an instance, a new
+//!   instance is refused, `429 instance_limit`, storing nothing; the time is
+//!   recorded as the credential's `instance_cap_hit_at`, since the instances
+//!   shown are then not the whole fleet. An evicted instance the gateway-version gate still judges (heard
 //!   from within `compat::FLEET_WINDOW`) whose version fails a floor
 //!   (`compat::meets_every_floor`) is recorded there too, as of when it was
 //!   last heard from: the gate no longer sees it, and keeps judging the fleet
@@ -48,6 +51,7 @@ use uuid::Uuid;
 
 use super::telemetry::BODY_READ_WAIT;
 use super::DpIdentity;
+use crate::billing::reconcile::USAGE_LOSS_WINDOW;
 use crate::compat::{self, FLEET_WINDOW};
 use crate::db::DbError;
 use crate::error::{ApiError, Detail};
@@ -257,13 +261,14 @@ pub async fn heartbeat(
         })
         .await?;
     if !recorded {
-        tracing::warn!(%dp_id, "refused a new gateway instance: every one of the credential's \
-            instances is online and it has reached its instance cap");
+        tracing::warn!(%dp_id, "refused a new gateway instance: the credential has reached its \
+            instance cap, and each of its instances is online or reported usage drops that \
+            reconciliation still counts");
         return Err(ApiError {
             code: "instance_limit",
             message: format!(
-                "此网关凭据的 {MAX_INSTANCES} 个实例都在线，暂不接受新实例；\
-                 更多网关请使用另一份凭据"
+                "此网关凭据已有 {MAX_INSTANCES} 个实例，均在线或在 24 小时内报告过用量丢失，\
+                 暂不接受新实例；更多网关请使用另一份凭据"
             ),
             ..ApiError::busy()
         });
@@ -288,8 +293,9 @@ async fn is_known(
 
 /// Whether `dp_id` has room for its new instance `instance_id`. At
 /// [`MAX_INSTANCES`] rows it makes room by deleting its least recently seen
-/// instance that is offline (silent for longer than `stale_secs`), and has
-/// none when every one is online. An evicted instance the version gate
+/// instance that is offline (silent for longer than `stale_secs`) and whose
+/// reported usage drops reconciliation no longer counts, and has none when
+/// every one is online or still counted. An evicted instance the version gate
 /// still judged, whose version fails a floor by `cp_version`'s judgement,
 /// is recorded in `instance_cap_hit_at` (see the module docs).
 ///
@@ -322,6 +328,9 @@ async fn make_room(
         "DELETE FROM dp_instances WHERE (dp_id, instance_id) IN ( \
            SELECT dp_id, instance_id FROM dp_instances \
            WHERE dp_id = $1 AND last_seen_at < now() - make_interval(secs => $2) \
+             AND NOT (last_seen_at >= now() - {USAGE_LOSS_WINDOW} \
+                      AND EXISTS (SELECT 1 FROM jsonb_each(usage_event_drops) AS d(key, value) \
+                                  WHERE d.value::numeric > 0)) \
            ORDER BY last_seen_at LIMIT 1) \
          RETURNING version, last_seen_at, last_seen_at > now() - {FLEET_WINDOW}"
     ))

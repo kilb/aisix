@@ -1723,6 +1723,93 @@ async fn at_the_instance_cap_a_new_instance_takes_the_place_of_the_longest_silen
     }
 }
 
+/// Reconciliation adds up the drops each instance heard from in the last
+/// 24 hours reported. At the cap, a new instance never takes the place of an
+/// offline one whose reported drops that window still counts: it takes the
+/// longest-silent of the others, and is refused when there is none, until
+/// those drops age out of the window.
+#[tokio::test]
+async fn at_the_instance_cap_an_instance_whose_drops_still_count_is_never_evicted() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let (admin, bundle) = setup(&cp).await;
+    let gw = cp.dp_client(&bundle);
+    seed_online_instances(&cp, &bundle.dp_id, MAX_INSTANCES - 3).await;
+    for (instance, ago, drops) in [
+        ("zeros-30m-7c1", "30 minutes", json!({"sink_full": 0})),
+        ("dropped-20m-7c1", "20 minutes", json!({"sink_full": 3})),
+        ("clean-10m-7c1", "10 minutes", json!({})),
+    ] {
+        sqlx::query(
+            "INSERT INTO dp_instances (dp_id, instance_id, last_seen_at, usage_event_drops) \
+             VALUES ($1::uuid, $2, now() - $3::interval, $4)",
+        )
+        .bind(&bundle.dp_id)
+        .bind(instance)
+        .bind(ago)
+        .bind(drops)
+        .execute(cp.db().pool())
+        .await
+        .expect("seed an offline instance");
+    }
+    let present = |instance: &'static str| {
+        let pool = cp.db().pool().clone();
+        async move {
+            sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS (SELECT 1 FROM dp_instances WHERE instance_id = $1)",
+            )
+            .bind(instance)
+            .fetch_one(&pool)
+            .await
+            .expect("read the instances")
+        }
+    };
+    let dropped_total = || async {
+        let r = cp
+            .get_with_cookie("/admin/billing/reconciliation", admin.cookie())
+            .await;
+        assert_eq!(r.status, 200, "{r:?}");
+        r.body["usage_loss"]["dropped_total"].clone()
+    };
+    assert_eq!(dropped_total().await, json!(3));
+
+    // The two that count nothing go first, the longest silent first.
+    for gone in ["zeros-30m-7c1", "clean-10m-7c1"] {
+        let r = gw
+            .heartbeat(bare_beat(&bundle.dp_id, &Uuid::new_v4().to_string()))
+            .await;
+        assert_eq!(r.status, 200, "{r:?}");
+        assert!(!present(gone).await, "{gone} is still there");
+        assert!(
+            present("dropped-20m-7c1").await,
+            "evicted in place of {gone}"
+        );
+    }
+    // Then a new one is refused rather than erase the drops.
+    let over = Uuid::new_v4().to_string();
+    let r = gw.heartbeat(bare_beat(&bundle.dp_id, &over)).await;
+    assert_eq!(r.status, 429, "{r:?}");
+    assert_eq!(r.body["code"], "instance_limit", "{r:?}");
+    assert!(present("dropped-20m-7c1").await);
+    assert_eq!(dropped_total().await, json!(3));
+    let (rows, hit) = instance_cap_state(&cp, &bundle.dp_id).await;
+    assert_eq!(rows, MAX_INSTANCES);
+    assert!(hit.is_some(), "the refusal was not recorded");
+
+    // Once its last beat has left the window, it makes room.
+    sqlx::query(
+        "UPDATE dp_instances SET last_seen_at = now() - interval '25 hours' \
+         WHERE instance_id = 'dropped-20m-7c1'",
+    )
+    .execute(cp.db().pool())
+    .await
+    .expect("age the instance");
+    let r = gw.heartbeat(bare_beat(&bundle.dp_id, &over)).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    assert!(!present("dropped-20m-7c1").await);
+}
+
 #[tokio::test]
 async fn at_the_instance_cap_with_every_instance_online_a_new_one_is_refused_and_recorded() {
     let Some(cp) = TestCp::start().await else {
