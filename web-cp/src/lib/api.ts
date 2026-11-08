@@ -616,3 +616,42 @@ export const catalogue = {
     return (await call<{ version: number; items: CatalogueEntry[] }>("GET", "/admin/pricing/catalogue")).data;
   },
 };
+
+/** One charge: what a stored usage row was billed, or why it could not be. Amounts are integer micro-dollars. */
+export interface Charge {
+  seq: number;
+  event_id: string;
+  tenant_id: string;
+  api_key_id: string;
+  user_id: string;
+  requested_model_id: string;
+  occurred_at: string;
+  status: "charged" | "exempt" | "nothing_to_bill" | "unpriced";
+  charge_micro_usd: number | null;
+  cost_micro_usd: number | null;
+  service_tier: string | null;
+  requested_service_tier: string | null;
+  long_context_above: number | null;
+  estimated: boolean;
+  exemption: string | null;
+  /** The pricing code behind an `unpriced` charge. */
+  error_code: string | null;
+}
+
+export interface ChargeFilter {
+  status?: string;
+  tenant_id?: string;
+  api_key_id?: string;
+  event_id?: string;
+  before?: number;
+}
+
+/** The per-call charges, newest first. */
+export const charges = {
+  async list(f: ChargeFilter = {}): Promise<{ items: Charge[]; next_before: number | null }> {
+    const q = new URLSearchParams();
+    for (const [k, v] of Object.entries(f)) if (v !== undefined && v !== "") q.set(k, String(v));
+    const qs = q.toString();
+    return (await call<{ items: Charge[]; next_before: number | null }>("GET", `/admin/pricing/charges${qs ? `?${qs}` : ""}`)).data;
+  },
+};
