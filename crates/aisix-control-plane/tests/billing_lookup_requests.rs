@@ -784,3 +784,97 @@ async fn a_lookup_past_its_statement_timeout_answers_503() {
 
     assert_eq!(items(&lookup(&w.dp, &w.key, "req-lk-5c9").await).len(), 1);
 }
+
+/// Intake stores a row's request id on its charge too, as the usage row
+/// stores it, and the lookup and the call log find a charge by the id it
+/// carries, among its own tenant's charges (`pricing_charges_tenant_request`).
+#[tokio::test]
+async fn a_charge_carries_its_rows_request_id() {
+    let Some(w) = world().await else { return };
+    let m = model(&w, "chat-bill", true).await;
+    let t0 = base(&w.cp).await;
+    let mut none = row(&w, "rq-none", "unused", m, t0, tokens_680());
+    none["request_id"] = Value::Null;
+    let too_long = "r".repeat(257);
+    send_all(
+        &w,
+        vec![
+            row(&w, "rq-1", "req-lk-3e6", m, t0, tokens_680()),
+            none,
+            row(&w, "rq-long", &too_long, m, t0, tokens_680()),
+        ],
+    )
+    .await;
+    let stored: Vec<(String, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT pc.event_id, pc.request_id, ue.request_id FROM pricing_charges pc \
+         JOIN usage_events ue ON ue.event_id = pc.event_id ORDER BY pc.event_id",
+    )
+    .fetch_all(w.cp.db().pool())
+    .await
+    .expect("read the charges");
+    let id = Some("req-lk-3e6".to_string());
+    assert_eq!(
+        stored,
+        [
+            ("rq-1".to_string(), id.clone(), id),
+            ("rq-long".to_string(), None, None),
+            ("rq-none".to_string(), None, None),
+        ]
+    );
+
+    let defs: Vec<String> =
+        sqlx::query_scalar("SELECT indexdef FROM pg_indexes WHERE tablename = 'pricing_charges'")
+            .fetch_all(w.cp.db().pool())
+            .await
+            .expect("read the indexes");
+    assert!(
+        defs.iter()
+            .any(|d| d.contains("(tenant_id, request_id, occurred_at, seq)")),
+        "{defs:?}"
+    );
+
+    // A charge whose own request id is unset is not found by the id its
+    // usage row carries: both views read the charge's.
+    sqlx::query(
+        "INSERT INTO usage_events (event_id, dp_id, batch_id, occurred_at, team_id, api_key_id, \
+         request_id, event) \
+         VALUES ('rq-raw', gen_random_uuid(), gen_random_uuid(), $1, $2::text, $3, 'req-lk-raw', \
+                 '{\"is_final_attempt\": true, \"status_code\": 200}')",
+    )
+    .bind(t0)
+    .bind(w.tenant)
+    .bind(&w.key)
+    .execute(w.cp.db().pool())
+    .await
+    .expect("insert the usage row");
+    sqlx::query(
+        "INSERT INTO pricing_charges (event_id, tenant_id, api_key_id, user_id, \
+         requested_model_id, occurred_at, status, charge_micro_usd, engine_version) \
+         VALUES ('rq-raw', $1::text, $2, $3::text, $4::text, $5, 'charged', 680, 1)",
+    )
+    .bind(w.tenant)
+    .bind(&w.key)
+    .bind(w.member)
+    .bind(m)
+    .bind(t0)
+    .execute(w.cp.db().pool())
+    .await
+    .expect("insert the charge");
+    let owner = w.cp.member_login_seeded(w.tenant, MemberRole::Owner).await;
+    let calls =
+        w.cp.send(
+            "GET",
+            "/api/usage/calls?request_id=req-lk-raw",
+            Some(owner.cookie()),
+            None,
+        )
+        .await;
+    assert_eq!(calls.status, 200, "{calls:?}");
+    assert_eq!(calls.body["items"], json!([]), "{calls:?}");
+    assert_eq!(lookup(&w.dp, &w.key, "req-lk-raw").await.status, 404);
+    sqlx::query("UPDATE pricing_charges SET request_id = 'req-lk-raw' WHERE event_id = 'rq-raw'")
+        .execute(w.cp.db().pool())
+        .await
+        .expect("set the charge's request id");
+    assert_eq!(items(&lookup(&w.dp, &w.key, "req-lk-raw").await).len(), 1);
+}

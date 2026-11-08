@@ -346,7 +346,7 @@ impl Scope {
                 .push("::text");
         }
         if let Some(request_id) = &self.request_id {
-            sql.push(" AND ue.request_id = ")
+            sql.push(" AND pc.request_id = ")
                 .push_bind(request_id.clone());
         }
         if let Some(before) = self.before {

@@ -12,10 +12,10 @@
 //! differ on purpose.
 //!
 //! - Rows are found by the request id as a bind parameter, matched exactly,
-//!   and filed under the tenant of the control plane's own key record
-//!   (`pricing_charges.tenant_id`), never under the row's `team_id`. Another
-//!   tenant's rows under the same id, and an id never sent, answer the same
-//!   `404`.
+//!   among the charges filed under the tenant of the control plane's own key
+//!   record (`pricing_charges.tenant_id` and `request_id`), never under the
+//!   row's `team_id`. Another tenant's rows under the same id are never
+//!   read, and they and an id never sent answer the same `404`.
 //! - What the key sees follows its member's current role ([`Visibility`]):
 //!   an owner's, admin's or billing member's key sees the tenant's rows, a
 //!   member's key the rows of the member's keys, and a key bound to no member
@@ -143,7 +143,10 @@ fn overflow() -> DbError {
 }
 
 /// The rows the key of `access` may see under `request_id`; `None` when it
-/// may see none, whether another tenant used the id or nobody did.
+/// may see none, whether another tenant used the id or nobody did. The
+/// query starts from the key's tenant's charges under the id
+/// (`pricing_charges_tenant_request`), so it never reads another tenant's
+/// rows, and stops after [`MAX_REQUEST_ROWS`] + 1 visible ones.
 pub async fn request_cost(
     conn: &mut PgConnection,
     access: &KeyAccess,
@@ -156,13 +159,12 @@ pub async fn request_cost(
     sql.push(ADJUSTED).push(" AS adjusted, ");
     sql.push(EVENT_FIELDS).push(" AS ev");
     sql.push(
-        " FROM usage_events ue JOIN pricing_charges pc ON pc.event_id = ue.event_id \
-         WHERE ue.request_id = ",
+        " FROM pricing_charges pc JOIN usage_events ue ON ue.event_id = pc.event_id \
+         WHERE pc.tenant_id = ",
     )
+    .push_bind(access.tenant_id)
+    .push("::text AND pc.request_id = ")
     .push_bind(request_id.to_string());
-    sql.push(" AND pc.tenant_id = ")
-        .push_bind(access.tenant_id)
-        .push("::text");
     match (access.visibility, access.member_id) {
         (Visibility::Full, _) => {}
         (Visibility::Own, Some(member)) => {
