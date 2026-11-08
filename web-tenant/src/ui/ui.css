@@ -1,0 +1,806 @@
+/* The design system's components, the portal's copy (P2c-R4). The
+   components themselves (Button, Field, Toast, TwoStep, Lamp, EmptyState,
+   DataTable, Icon) are byte-equal with the Dashboard's, and so are their
+   class names; CONTRACT.md beside them is the contract. This sheet styles
+   them as the Dashboard's ui.css does, with the portal's own layout around
+   them (panels that space their children by gap, lists whose tables run to
+   the panel's edges).
+
+   They read the role tokens in tokens.css, never the palette directly, so
+   both themes follow from the token file alone. Every interactive element
+   has its hover (a 120ms colour transition), pressed (one step darker, a
+   1px inset), keyboard focus (base.css) and disabled (45%, not-allowed)
+   states. */
+
+/* ── Icons ─────────────────────────────────────────────────── */
+.icon {
+  flex: none;
+  width: var(--icon);
+  height: var(--icon);
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.5;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.icon-32 {
+  width: 32px;
+  height: 32px;
+}
+
+/* ── Buttons: 36px, 32px small; icons centred by flex ──────── */
+.btn {
+  --fg: var(--text);
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--s-2);
+  height: var(--h-control);
+  padding: 0 var(--s-4);
+  border: 1px solid transparent;
+  border-radius: var(--r-button);
+  background: transparent;
+  color: var(--fg);
+  font-weight: 600;
+  line-height: 16px;
+  white-space: nowrap;
+  cursor: pointer;
+  user-select: none;
+  transition:
+    background-color var(--t-fast) ease,
+    border-color var(--t-fast) ease,
+    color var(--t-fast) ease,
+    box-shadow var(--t-fast) ease;
+}
+.btn-sm {
+  height: var(--h-control-sm);
+  padding: 0 var(--s-3);
+}
+.btn-block {
+  width: 100%;
+}
+.btn-icon {
+  width: var(--h-control);
+  padding: 0;
+}
+.btn-icon.btn-sm {
+  width: var(--h-control-sm);
+}
+.btn-primary {
+  --fg: var(--on-sign);
+  background: var(--sign);
+}
+.btn-primary:not(:disabled, [aria-disabled="true"]):hover {
+  background: var(--sign-hover);
+}
+.btn-primary:not(:disabled, [aria-disabled="true"]):active {
+  background: var(--sign-press);
+  box-shadow: var(--inset);
+}
+.btn-secondary {
+  border-color: var(--text);
+}
+.btn-secondary:not(:disabled, [aria-disabled="true"]):hover {
+  background: var(--hover);
+}
+.btn-secondary:not(:disabled, [aria-disabled="true"]):active {
+  background: var(--press);
+  box-shadow: var(--inset);
+}
+.btn-quiet {
+  --fg: var(--text-2);
+  padding: 0 var(--s-2);
+}
+.btn-quiet.btn-icon {
+  padding: 0;
+}
+.btn-quiet:not(:disabled, [aria-disabled="true"]):hover {
+  --fg: var(--text);
+  background: var(--hover);
+}
+.btn-quiet:not(:disabled, [aria-disabled="true"]):active {
+  --fg: var(--text);
+  background: var(--press);
+  box-shadow: var(--inset);
+}
+.btn-danger {
+  --fg: var(--on-stop);
+  background: var(--stop-fill);
+}
+.btn-danger:not(:disabled, [aria-disabled="true"]):hover {
+  background: var(--stop-fill-hover);
+}
+.btn-danger:not(:disabled, [aria-disabled="true"]):active {
+  background: var(--stop-fill-press);
+  box-shadow: var(--inset);
+}
+.btn:is(:disabled, [aria-disabled="true"]) {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+/* Busy: a spinner takes the label's place, and the label keeps its place
+   (and so the width) underneath it, hidden; the name is the busy label. */
+.btn.is-busy:disabled {
+  opacity: 1;
+  cursor: progress;
+}
+.btn-label {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--s-2);
+  visibility: hidden;
+}
+.btn.is-busy::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  width: var(--icon);
+  height: var(--icon);
+  margin: auto;
+  border: 1.5px solid var(--fg);
+  border-right-color: transparent;
+  border-radius: var(--r-round);
+  animation: ui-spin 0.7s linear infinite;
+}
+@keyframes ui-spin {
+  to {
+    transform: rotate(1turn);
+  }
+}
+
+/* A disabled action whose reason is not on screen keeps it in a tooltip,
+   on hover and on keyboard focus. */
+.has-tip {
+  position: relative;
+  display: inline-flex;
+}
+.tip {
+  position: absolute;
+  z-index: 30;
+  bottom: calc(100% + var(--s-2));
+  right: 0;
+  display: flex;
+  align-items: center;
+  width: max-content;
+  max-width: min(320px, 90vw);
+  min-height: var(--h-control-sm);
+  padding: var(--s-1) var(--s-3);
+  border-radius: var(--r-button);
+  background: var(--tooltip-bg);
+  color: var(--tooltip-text);
+  box-shadow: var(--shadow-float);
+  font-size: var(--fs-13);
+  font-weight: 400;
+  line-height: var(--lh-table);
+  white-space: normal;
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transition:
+    opacity var(--t-fast) ease,
+    visibility 0s linear var(--t-fast);
+}
+.has-tip:is(:hover, :focus-within) .tip {
+  opacity: 1;
+  visibility: visible;
+  transition: opacity var(--t-fast) ease;
+}
+
+/* ── Fields: label above, hint and refusal below ───────────── */
+.field,
+.f {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-2);
+  min-width: 0;
+}
+.f-label,
+.field > legend {
+  color: var(--text-2);
+  line-height: var(--lh-table);
+}
+fieldset.field {
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+fieldset.field > legend {
+  margin-bottom: var(--s-2);
+  padding: 0;
+}
+.hint {
+  font-size: var(--fs-13);
+  line-height: var(--lh-table);
+  color: var(--text-muted);
+}
+/* A refusal, in the error red (4.5:1 on Paper and on a hovered row). */
+.field-problem {
+  font-size: var(--fs-13);
+  font-weight: 600;
+  line-height: var(--lh-table);
+  color: var(--error);
+}
+
+/* Text inputs and selects. The base rule has no specificity, so the states
+   below override it in order: hover, then focus, then a refusal. */
+:where(input:not([type="checkbox"], [type="radio"]), select) {
+  width: 100%;
+  height: var(--h-control);
+  padding: 0 var(--s-3);
+  border: 1px solid var(--input-border);
+  border-radius: var(--r-input);
+  background-color: var(--surface);
+  color: var(--text);
+  line-height: 20px;
+  transition:
+    border-color var(--t-fast) ease,
+    background-color var(--t-fast) ease;
+}
+:where(input)::placeholder {
+  color: var(--text-muted);
+  opacity: 1;
+}
+:where(input, select):not(:disabled):hover {
+  border-color: var(--input-border-hover);
+}
+:where(input, select):not(:disabled):focus-visible {
+  border-color: var(--focus);
+}
+:where(input, select)[aria-invalid="true"]:not(:disabled) {
+  border-color: var(--error);
+}
+:where(input, select):disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+  background-color: var(--bg);
+}
+/* A native select with a drawn chevron. */
+:where(select) {
+  appearance: none;
+  padding-right: var(--s-10);
+  cursor: pointer;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M4.75 6.25 8 9.5l3.25-3.25' fill='none' stroke='%2366737F' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right var(--s-3) center;
+  background-size: 16px 16px;
+}
+:root[data-theme="dark"] :where(select) {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M4.75 6.25 8 9.5l3.25-3.25' fill='none' stroke='%2397A4AE' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+}
+:where(select):not(:disabled):active {
+  background-color: var(--row-hover);
+}
+
+/* Checkbox and radio: native elements, drawn in the system's style. */
+input[type="checkbox"],
+input[type="radio"] {
+  appearance: none;
+  flex: none;
+  display: inline-block;
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  border: 1px solid var(--box-border);
+  border-radius: var(--r-input);
+  background: var(--surface) no-repeat center / 14px 14px;
+  vertical-align: middle;
+  cursor: pointer;
+  transition:
+    background-color var(--t-fast) ease,
+    border-color var(--t-fast) ease;
+}
+input[type="radio"] {
+  border-radius: var(--r-round);
+}
+input[type="checkbox"]:checked {
+  border-color: var(--sign-press);
+  background-color: var(--sign);
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 14 14'%3E%3Cpath d='M3.25 7.25 5.75 9.75 10.75 4.25' fill='none' stroke='%231C2A39' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+}
+input[type="radio"]:checked {
+  border-color: var(--sign-press);
+  background-color: var(--sign);
+  background-image: radial-gradient(circle, var(--on-sign) 0 3px, transparent 3.5px);
+}
+:is(input[type="checkbox"], input[type="radio"]):not(:disabled):hover,
+label:hover > :is(input[type="checkbox"], input[type="radio"]):not(:disabled) {
+  border-color: var(--text);
+}
+:is(input[type="checkbox"], input[type="radio"]):not(:disabled, :checked):active {
+  background-color: var(--press);
+}
+:is(input[type="checkbox"], input[type="radio"]):checked:not(:disabled):hover,
+label:hover > :is(input[type="checkbox"], input[type="radio"]):checked:not(:disabled) {
+  border-color: var(--sign-press);
+  background-color: var(--sign-hover);
+}
+:is(input[type="checkbox"], input[type="radio"]):checked:not(:disabled):active {
+  background-color: var(--sign-press);
+}
+:is(input[type="checkbox"], input[type="radio"]):disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+/* A choice and its label. */
+.picks {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--s-2) var(--s-6);
+}
+.pick {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--s-2);
+  line-height: var(--lh-table);
+  cursor: pointer;
+}
+
+/* ── Signal lamps: a dot with a word, never colour alone ───── */
+/* The dot is placed beside the word rather than laid out with it, so the
+   lamp's baseline is its word's and it lines up with text around it. */
+.lamp {
+  --c: var(--lamp-disabled);
+  --ring: transparent;
+  position: relative;
+  display: inline-block;
+  padding-left: calc(8px + var(--s-2));
+  line-height: var(--lh-table);
+  white-space: nowrap;
+}
+.lamp::before {
+  content: "";
+  position: absolute;
+  top: 50%;
+  left: 0;
+  width: 8px;
+  height: 8px;
+  margin-top: -4px;
+  border-radius: var(--r-round);
+  background: var(--c);
+  box-shadow: inset 0 0 0 1.5px var(--ring);
+}
+.lamp[data-lamp="applied"] {
+  --c: var(--lamp-applied);
+}
+.lamp[data-lamp="propagating"] {
+  --c: var(--lamp-progress);
+}
+.lamp[data-lamp="pending"] {
+  --c: transparent;
+  --ring: var(--lamp-pending);
+}
+.lamp[data-lamp="rejected"] {
+  --c: var(--lamp-rejected);
+}
+.lamp[data-lamp="disabled"] {
+  --c: var(--lamp-disabled);
+}
+/* Propagating pulses once, then holds. */
+.lamp[data-lamp="propagating"]::after {
+  content: "";
+  position: absolute;
+  top: 50%;
+  left: 0;
+  width: 8px;
+  height: 8px;
+  margin-top: -4px;
+  border-radius: var(--r-round);
+  background: var(--c);
+  opacity: 0;
+  animation: ui-pulse 1.1s ease-out 1 both;
+}
+@keyframes ui-pulse {
+  from {
+    transform: scale(1);
+    opacity: 0.6;
+  }
+  to {
+    transform: scale(3.2);
+    opacity: 0;
+  }
+}
+
+/* Chips share the lamp's centre line and size step. */
+.tag {
+  display: inline-flex;
+  align-items: center;
+  height: 20px;
+  padding: 0 var(--s-2);
+  border-radius: var(--r-chip);
+  background: var(--chip);
+  color: var(--text-2);
+  font-size: var(--fs-12);
+  font-weight: 600;
+  line-height: 12px;
+  white-space: nowrap;
+}
+
+/* ── Notes: a passage in a panel, marked by a bar on its left ─── */
+/* The Dashboard's note. Here it has no margin of its own: the portal's
+   panels and forms space their children by gap. */
+.note {
+  margin: 0;
+  padding: var(--s-3) var(--s-4);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--n3);
+  border-radius: var(--r-button);
+  background: var(--surface);
+  color: var(--text);
+  line-height: var(--lh-body);
+}
+.note.ok {
+  border-left-color: var(--proceed);
+}
+.note.warn {
+  border-left-color: var(--sign);
+}
+.note.crit {
+  border-left-color: var(--stop);
+}
+.note > p + p,
+.note > strong + p {
+  margin-top: var(--s-2);
+}
+
+/* ── Tables: 36px head, 44px rows (56px with a note) ───────── */
+/* The table's box is the containing block of whatever is absolutely
+   placed inside it (a tooltip, visually hidden text), so the box clips it
+   instead of it widening the page past the screen. */
+.dt-wrap {
+  --dt-edge: var(--s-6);
+  position: relative;
+  overflow-x: auto;
+}
+.dt {
+  width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+  line-height: var(--lh-table);
+}
+.dt th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  height: var(--h-head);
+  padding: 0 var(--s-3);
+  border-top: 1px solid var(--divider);
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text-muted);
+  font-size: var(--fs-12);
+  font-weight: 600;
+  text-align: left;
+  white-space: nowrap;
+  vertical-align: middle;
+}
+.dt td {
+  height: var(--h-row);
+  padding: var(--s-1) var(--s-3);
+  border-bottom: 1px solid var(--divider);
+  vertical-align: middle;
+  white-space: nowrap;
+}
+/* A row whose cells stack a note under the value keeps 8px off each line. */
+.dt tr:has(.cell-note) td {
+  padding-top: var(--s-2);
+  padding-bottom: var(--s-2);
+}
+.dt.dt-compact td {
+  height: var(--h-row-compact);
+}
+.dt tbody tr {
+  transition: background-color var(--t-fast) ease;
+}
+.dt tbody tr:hover {
+  background: var(--row-hover);
+}
+.dt tbody tr:last-child td {
+  border-bottom: 0;
+}
+.dt th:first-child,
+.dt td:first-child {
+  padding-left: var(--dt-edge);
+}
+.dt th:last-child,
+.dt td:last-child {
+  padding-right: var(--dt-edge);
+}
+.dt :is(th, td):is(.num, .right) {
+  text-align: right;
+}
+.dt :is(th, td).num {
+  font-variant-numeric: tabular-nums lining-nums;
+}
+.dt-wrap.dt-scroll {
+  max-height: min(70vh, 720px);
+  overflow-y: auto;
+}
+/* A table wider than its box scrolls sideways inside it, and a shadow at
+   the edge it continues past says so. The two surface-coloured layers move
+   with the content and cover the shadows while that edge is in view. */
+.dt-wrap {
+  background:
+    linear-gradient(to right, var(--surface) 30%, transparent) left / 32px 100% no-repeat local,
+    linear-gradient(to left, var(--surface) 30%, transparent) right / 32px 100% no-repeat local,
+    radial-gradient(farthest-side at 0 50%, var(--scroll-shadow), transparent) left / 12px 100% no-repeat scroll,
+    radial-gradient(farthest-side at 100% 50%, var(--scroll-shadow), transparent) right / 12px 100% no-repeat scroll;
+}
+/* Secondary text under a value: a second line in 13px. Its 2px gap is the
+   one step off the 4px grid, kept so a row with a note stays 56px. */
+.cell-note {
+  display: block;
+  margin-top: 2px;
+  font-size: var(--fs-13);
+  line-height: var(--lh-table);
+  color: var(--text-muted);
+}
+/* A row's actions, right-aligned, one control height. */
+.acts {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--s-2);
+}
+/* In an actions column the buttons line up with a confirm step's first
+   line, not with its middle. */
+.right > .acts {
+  align-items: flex-start;
+}
+.acts > select {
+  width: auto;
+  height: var(--h-control-sm);
+}
+
+/* Loading: three skeleton rows, purely visual, beside the hidden status. */
+.skeleton {
+  border-top: 1px solid var(--divider);
+}
+.skeleton > span {
+  display: flex;
+  align-items: center;
+  gap: var(--s-8);
+  height: var(--h-row);
+  padding: 0 var(--dt-edge, var(--s-6));
+  border-bottom: 1px solid var(--divider);
+}
+.skeleton > span:last-child {
+  border-bottom: 0;
+}
+.skeleton i {
+  display: block;
+  height: 12px;
+  border-radius: var(--r-input);
+  background: var(--skeleton);
+}
+
+/* ── Empty state: a mark, one sentence, centred ────────────── */
+.empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--s-4);
+  padding: var(--s-12) var(--s-6);
+  border-top: 1px solid var(--divider);
+  color: var(--text-2);
+  text-align: center;
+}
+.empty > .icon {
+  color: var(--text-muted);
+}
+
+/* ── The two-step confirm, swapped in place ────────────────── */
+/* The second step: the two buttons, then the warning on a line under
+   them, so a row's actions widen by the warning's length at most. */
+.two-step {
+  display: inline-flex;
+  vertical-align: middle;
+}
+.two-step.is-asking {
+  display: inline-grid;
+  justify-items: start;
+  gap: var(--s-1);
+}
+.two-step-confirm {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--s-2);
+}
+.two-step.is-swapping {
+  overflow: clip;
+  overflow-clip-margin: 4px;
+}
+.two-step-warn {
+  /* Its own width up to 44ch, so a table shrinking its columns cannot
+     squeeze a short warning onto two lines; a long one wraps at 44ch. */
+  width: max-content;
+  max-width: 44ch;
+  color: var(--text-2);
+  font-size: var(--fs-13);
+  line-height: var(--lh-table);
+  white-space: normal;
+  text-wrap: balance;
+}
+/* In a row's actions column, against the column's right edge. */
+.right .two-step.is-asking {
+  justify-items: end;
+}
+.right .two-step-warn {
+  text-align: right;
+}
+.is-in {
+  animation: ui-fade var(--t-fast) ease-out both;
+}
+@keyframes ui-fade {
+  from {
+    opacity: 0;
+  }
+}
+
+/* ── Toasts: bottom left, up 8px and in over 160ms, out over 200ms ── */
+.toasts {
+  position: fixed;
+  left: var(--s-6);
+  bottom: var(--s-6);
+  z-index: 20;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--s-2);
+  pointer-events: none;
+}
+.toast {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--s-2);
+  min-height: 40px;
+  padding: var(--s-2) var(--s-4);
+  border-radius: var(--r-button);
+  background: var(--tooltip-bg);
+  color: var(--tooltip-text);
+  box-shadow: var(--shadow-float);
+  font-weight: 600;
+  line-height: 16px;
+  animation: ui-toast-in var(--t-panel) ease-out both;
+}
+.toast::before {
+  content: "";
+  flex: none;
+  width: 8px;
+  height: 8px;
+  border-radius: var(--r-round);
+  background: var(--lamp-applied);
+}
+.toast.is-leaving {
+  opacity: 0;
+  transition: opacity var(--t-leave) ease-in;
+}
+@keyframes ui-toast-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+}
+
+/* ── Route nav: stops on one Ink line ──────────────────────── */
+.route {
+  /* A stop is filled with what it sits on, so the line stops at its rim. */
+  --stop-bg: var(--bg);
+  --tab-w: 96px;
+  position: relative;
+  display: flex;
+  width: calc(var(--stops) * var(--tab-w));
+  max-width: 100%;
+}
+/* The line runs from the first stop's centre to the last's, no further. */
+.panel .route {
+  --stop-bg: var(--surface);
+}
+.route::before {
+  content: "";
+  position: absolute;
+  top: 9px;
+  left: calc(100% / (2 * var(--stops)));
+  right: calc(100% / (2 * var(--stops)));
+  height: 2px;
+  background: var(--route-line);
+}
+.route > button {
+  position: relative;
+  flex: 1 1 0;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--s-2);
+  padding: 0 0 var(--s-1);
+  border: 0;
+  border-radius: var(--r-button);
+  background: none;
+  color: var(--text-2);
+  cursor: pointer;
+  transition: color var(--t-fast) ease;
+}
+.route .stop {
+  display: grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+}
+.route .stop::before {
+  content: "";
+  width: 12px;
+  height: 12px;
+  border: 2px solid var(--route-line);
+  border-radius: var(--r-round);
+  background: var(--stop-bg);
+  transition: background-color var(--t-fast) ease;
+}
+.route .name {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  line-height: var(--lh-table);
+}
+.route > button:hover {
+  color: var(--text);
+}
+.route > button:hover .stop::before {
+  background: color-mix(in srgb, var(--route-line) 14%, var(--stop-bg));
+}
+.route > button:active .stop::before {
+  background: color-mix(in srgb, var(--route-line) 28%, var(--stop-bg));
+}
+.route > [aria-selected="true"] {
+  color: var(--text);
+}
+.route > [aria-selected="true"] .stop::before,
+.route > [aria-selected="true"]:hover .stop::before {
+  width: 20px;
+  height: 20px;
+  background: var(--sign);
+}
+.route > [aria-selected="true"] .name {
+  font-weight: 700;
+}
+
+/* On a phone the docked route is a bar along the bottom edge. */
+@media (max-width: 719px) {
+  .route.docked {
+    --stop-bg: var(--surface);
+    --pad: var(--s-2);
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 10;
+    width: auto;
+    margin: 0;
+    padding: var(--pad) var(--pad) calc(var(--pad) + env(safe-area-inset-bottom));
+    border-top: 1px solid var(--border);
+    background: var(--surface);
+  }
+  .route.docked::before {
+    top: calc(var(--pad) + 9px);
+    left: calc(var(--pad) + (100% - 2 * var(--pad)) / (2 * var(--stops)));
+    right: calc(var(--pad) + (100% - 2 * var(--pad)) / (2 * var(--stops)));
+  }
+  .route.docked > button {
+    gap: var(--s-1);
+  }
+  .route.docked .name {
+    font-size: var(--fs-12);
+    color: var(--text-muted);
+  }
+  .route.docked > [aria-selected="true"] .name {
+    color: var(--text);
+    font-weight: 600;
+  }
+  .toasts {
+    left: var(--s-4);
+  }
+  body:has(.route.docked) .toasts {
+    bottom: 88px;
+  }
+}

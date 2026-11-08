@@ -1,4 +1,14 @@
 import type { Rollout } from "../lib/api";
+import { Lamp, type LampState } from "../ui/Lamp";
+
+/** The lamp each rollout state shows; a state a newer control plane added is grey. */
+const LAMP: Record<string, LampState> = {
+  pending: "pending",
+  propagating: "propagating",
+  applied: "applied",
+  rejected: "rejected",
+  no_gateways: "disabled",
+};
 
 /**
  * Where a saved document stands on its way to the gateways. `data-state`
@@ -19,13 +29,9 @@ export function RolloutBadge({ rollout }: { rollout: Rollout }) {
               ? "无在线网关"
               : // A state a newer control plane added: shown as it is named.
                 String(state);
-  const tone = state === "applied" ? "ok" : state === "rejected" ? "crit" : "";
   return (
     <span className="rollout" data-state={state}>
-      <span className={`pill ${tone}`}>
-        <span className="dot" />
-        {label}
-      </span>
+      <Lamp state={LAMP[state] ?? "disabled"}>{label}</Lamp>
       {state === "rejected" && rollout.rejections.length > 0 && (
         <ul className="rollout-errors">
           {rollout.rejections.map((r) => (

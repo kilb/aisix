@@ -3,7 +3,10 @@ import type { TabId, TabProps } from "../App";
 import { Msg, type Note } from "../components/Msg";
 import { environment, rollout, type Environment, type RolloutSummary } from "../lib/api";
 import { errorText, fmtInt } from "../lib/fmt";
-import { TwoStep } from "./Tenants";
+import { Button } from "../ui/Button";
+import { Loading } from "../ui/DataTable";
+import { Lamp } from "../ui/Lamp";
+import { TwoStep } from "../ui/TwoStep";
 
 /** How often the summary is read again: about one gateway heartbeat. */
 const REFRESH_MS = 5_000;
@@ -37,6 +40,8 @@ export function Overview({ operator, onGoto }: TabProps) {
   const [error, setError] = useState<string | null>(null);
   const [note, setNote] = useState<Note | null>(null);
   const [busy, setBusy] = useState(false);
+  // Which recovery is in flight.
+  const [acting, setActing] = useState<"take-over" | "clean" | null>(null);
 
   // A failed read keeps the last summary on screen, under the error.
   const readSummary = useCallback(async () => {
@@ -68,6 +73,7 @@ export function Overview({ operator, onGoto }: TabProps) {
 
   async function allowDeletes() {
     setBusy(true);
+    setActing("clean");
     setNote(null);
     try {
       const r = await rollout.reconcile(true);
@@ -76,12 +82,14 @@ export function Overview({ operator, onGoto }: TabProps) {
       setNote({ kind: "crit", text: errorText(e) });
     } finally {
       setBusy(false);
+      setActing(null);
       await readSummary();
     }
   }
 
   async function takeOver(owner: string) {
     setBusy(true);
+    setActing("take-over");
     setNote(null);
     try {
       await rollout.takeOver(owner);
@@ -90,6 +98,7 @@ export function Overview({ operator, onGoto }: TabProps) {
       setNote({ kind: "crit", text: errorText(e) });
     } finally {
       setBusy(false);
+      setActing(null);
       await readSummary();
     }
   }
@@ -145,6 +154,7 @@ export function Overview({ operator, onGoto }: TabProps) {
                 <TwoStep
                   label="接管该环境"
                   disabled={busy}
+                  busy={acting === "take-over"}
                   warning={
                     `将把该环境从数据库 ${blocked.owner_database_id} 接管到本控制面的数据库 ${blocked.database_id}。` +
                     "请先停止旧控制面的所有实例。此操作会记入审计日志。"
@@ -177,6 +187,7 @@ export function Overview({ operator, onGoto }: TabProps) {
                 <TwoStep
                   label="允许清理"
                   disabled={busy}
+                  busy={acting === "clean"}
                   warning="将删除 kine 中所有控制面不认识的键，删除后无法恢复。"
                   onConfirm={() => void allowDeletes()}
                 />
@@ -204,20 +215,22 @@ export function Overview({ operator, onGoto }: TabProps) {
         <h2>被拒绝的资源</h2>
         <p className="hint">网关加载时拒绝了这些资源，它们没有生效。原因由网关给出。</p>
         {s === null ? (
-          !error && <p className="hint">载入中…</p>
+          !error && <Loading />
         ) : s.rejected.length === 0 ? (
-          <p className="hint">没有被拒绝的资源。</p>
+          <p className="status-line">
+            <Lamp state="applied">没有被拒绝的资源。</Lamp>
+          </p>
         ) : (
-          <ul>
+          <ul className="rows">
             {s.rejected.map((r) => {
               const where = TAB_OF_KIND[r.kind] ?? GENERIC;
               return (
                 <li key={`${r.kind}/${r.id}`}>
-                  <div>
+                  <div className="row-head">
                     <code>{r.kind}</code> <strong>{r.name ?? r.id}</strong>{" "}
-                    <button className="ghost" onClick={() => onGoto(where.tab)}>
+                    <Button size="sm" onClick={() => onGoto(where.tab)}>
                       去「{where.label}」
-                    </button>
+                    </Button>
                   </div>
                   {r.errors.map((e) => (
                     <div className="rollout-errors" key={e.instance_id}>
@@ -235,11 +248,13 @@ export function Overview({ operator, onGoto }: TabProps) {
         <h2>部分兼容</h2>
         <p className="hint">网关加载了这些资源，但忽略了其中的部分字段。</p>
         {s === null ? (
-          !error && <p className="hint">载入中…</p>
+          !error && <Loading />
         ) : s.partially_compatible.length === 0 ? (
-          <p className="hint">所有网关都完整加载了配置。</p>
+          <p className="status-line">
+            <Lamp state="applied">所有网关都完整加载了配置。</Lamp>
+          </p>
         ) : (
-          <ul>
+          <ul className="rows">
             {s.partially_compatible.map((p) => (
               <li key={`${p.instance_id}/${p.kind}/${p.field}`}>
                 <code>{p.instance_id}</code>：<code>{p.kind}</code> 的 <code>{p.field}</code>（

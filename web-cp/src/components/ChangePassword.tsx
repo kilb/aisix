@@ -1,6 +1,8 @@
 import { useId, useState } from "react";
 import { ApiError, changePassword } from "../lib/api";
 import { messageFor } from "../lib/errors";
+import { Button } from "../ui/Button";
+import { useRefusalFocus } from "../ui/Field";
 
 /**
  * The signed-in operator's own password, opened from the header by every
@@ -15,6 +17,7 @@ export function ChangePassword({ onClose }: { onClose: () => void }) {
   const [done, setDone] = useState(false);
   const [busy, setBusy] = useState(false);
   const nextProblemId = useId();
+  const [form, focusRefusal] = useRefusalFocus<HTMLFormElement>();
   const againProblemId = useId();
   const mismatch = again !== "" && again !== next;
 
@@ -38,6 +41,7 @@ export function ChangePassword({ onClose }: { onClose: () => void }) {
         const atNext = err.details.filter((d) => d.path === "/new_password").map((d) => d.message);
         setNextProblem(atNext.length > 0 ? atNext.join("；") : null);
         setFailure(messageFor(err));
+        focusRefusal();
       } else {
         setFailure(err instanceof Error ? err.message : String(err));
       }
@@ -53,16 +57,16 @@ export function ChangePassword({ onClose }: { onClose: () => void }) {
           口令已修改，此账号在其他浏览器或设备上的会话已全部退出。
         </div>
         <div className="r">
-          <button type="button" className="ghost" onClick={onClose}>
+          <Button type="button" onClick={onClose}>
             关闭
-          </button>
+          </Button>
         </div>
       </div>
     );
   }
 
   return (
-    <form className="panel" aria-label="修改口令" onSubmit={(e) => void submit(e)}>
+    <form ref={form} className="panel" aria-label="修改口令" onSubmit={(e) => void submit(e)}>
       <h2>修改口令</h2>
       <p className="hint">修改后，此账号在其他浏览器或设备上的会话都会退出，当前会话保留。</p>
       <label className="f">
@@ -115,12 +119,12 @@ export function ChangePassword({ onClose }: { onClose: () => void }) {
         </div>
       )}
       <div className="r">
-        <button type="submit" className="act" disabled={busy || mismatch}>
+        <Button kind="primary" type="submit" disabled={mismatch} busy={busy} busyLabel="保存新口令">
           保存新口令
-        </button>
-        <button type="button" className="ghost" onClick={onClose}>
+        </Button>
+        <Button type="button" onClick={onClose}>
           取消
-        </button>
+        </Button>
       </div>
     </form>
   );

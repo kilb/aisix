@@ -1,4 +1,4 @@
-import { useEffect, useId, useState } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import {
   ApiError,
   MIN_PASSWORD_CHARS,
@@ -10,6 +10,9 @@ import {
   type TenantStatus,
 } from "./lib/api";
 import { formMessageFor, messageFor } from "./lib/errors";
+import { Button } from "./ui/Button";
+import { Field } from "./ui/Field";
+import { Lamp, type LampState } from "./ui/Lamp";
 
 export const ROLE_LABEL: Record<MemberRole, string> = {
   owner: "所有者",
@@ -24,16 +27,24 @@ const STATUS_LABEL: Record<TenantStatus, string> = {
   suspended: "已停用",
 };
 
+const STATUS_LAMP: Record<TenantStatus, LampState> = {
+  pending: "pending",
+  active: "applied",
+  suspended: "disabled",
+};
+
 /** A cap a key may be given, or none. */
 function cap(value: number | undefined): string {
-  return value === undefined ? "不限" : String(value);
+  return value === undefined ? "不限" : value.toLocaleString("en-US");
 }
 
-function Reading({ label, value }: { label: string; value: string }) {
+function Reading({ label, value, title }: { label: string; value: ReactNode; title?: string }) {
   return (
     <div className="entry">
       <span className="lab">{label}</span>
-      <span className="val">{value}</span>
+      <span className="val" title={title}>
+        {value}
+      </span>
     </div>
   );
 }
@@ -74,8 +85,11 @@ export function Org({ member, status }: { member: SessionMember; status: TenantS
           </div>
         )}
         <div className="entries">
-          <Reading label="名称" value={org?.name ?? "—"} />
-          <Reading label="状态" value={STATUS_LABEL[shown] ?? shown} />
+          <Reading label="名称" value={org?.name ?? "—"} title={org?.name} />
+          <Reading
+            label="状态"
+            value={STATUS_LAMP[shown] ? <Lamp state={STATUS_LAMP[shown]}>{STATUS_LABEL[shown]}</Lamp> : shown}
+          />
           <Reading label="你的角色" value={ROLE_LABEL[member.role] ?? member.role} />
           <Reading label="单个密钥的并发上限" value={org ? cap(org.limits.key_concurrency_max) : "—"} />
           <Reading label="单个密钥的每分钟请求上限" value={org ? cap(org.limits.key_rpm_max) : "—"} />
@@ -93,7 +107,6 @@ function PasswordForm() {
   const [next, setNext] = useState("");
   const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null);
   const [busy, setBusy] = useState(false);
-  const hintId = useId();
 
   async function submit(e: React.FormEvent) {
     e.preventDefault();
@@ -124,9 +137,8 @@ function PasswordForm() {
   return (
     <div className="panel">
       <h2>修改口令</h2>
-      <form onSubmit={submit}>
-        <label className="f">
-          <span>当前口令</span>
+      <form className="form" onSubmit={submit}>
+        <Field label="当前口令">
           <input
             type="password"
             autoComplete="current-password"
@@ -134,28 +146,28 @@ function PasswordForm() {
             value={current}
             onChange={(e) => setCurrent(e.target.value)}
           />
-        </label>
-        <label className="f">
-          <span>新口令</span>
-          <input
-            type="password"
-            autoComplete="new-password"
-            required
-            value={next}
-            onChange={(e) => setNext(e.target.value)}
-            aria-describedby={hintId}
-          />
-        </label>
-        <p className="hint" id={hintId}>
-          至少 {MIN_PASSWORD_CHARS} 个字符
-        </p>
-        <button className="act" type="submit" disabled={busy}>
-          {busy ? "处理中…" : "修改口令"}
-        </button>
+        </Field>
+        <Field label="新口令" hint={<>至少 {MIN_PASSWORD_CHARS} 个字符</>}>
+          {(aria) => (
+            <input
+              type="password"
+              autoComplete="new-password"
+              required
+              value={next}
+              onChange={(e) => setNext(e.target.value)}
+              {...aria}
+            />
+          )}
+        </Field>
+        <div className="form-actions">
+          <Button kind="primary" type="submit" busy={busy}>
+            修改口令
+          </Button>
+        </div>
       </form>
       {msg &&
         (msg.ok ? (
-          <div className="note" role="status">
+          <div className="note ok" role="status">
             {msg.text}
           </div>
         ) : (

@@ -1,0 +1,222 @@
+/* The style guide page (development builds only). Layout only: every
+   component it shows is styled by ui/ui.css. */
+
+.sg {
+  max-width: 1280px;
+  margin: 0 auto;
+  padding: var(--s-12) var(--s-6);
+}
+.sg-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: var(--s-4) var(--s-8);
+  padding-bottom: var(--s-6);
+  border-bottom: 1px solid var(--border);
+}
+.sg-head h1 {
+  font-size: var(--fs-36);
+}
+.sg-head .hint {
+  margin-top: var(--s-3);
+}
+.sg-row {
+  display: grid;
+  grid-template-columns: 160px minmax(0, 1fr);
+  gap: var(--s-4) var(--s-6);
+  padding: var(--s-6) 0;
+  border-bottom: 1px solid var(--border);
+}
+.sg-row > h2 {
+  font-size: var(--fs-19);
+}
+.sg-spec {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: var(--s-6) var(--s-8);
+  min-width: 0;
+}
+.sg-fig {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--s-2);
+  margin: 0;
+}
+.sg-fig figcaption,
+.sg-note,
+.sg-px,
+.sg-na {
+  color: var(--text-muted);
+  font-size: var(--fs-13);
+  line-height: var(--lh-table);
+}
+.sg-note {
+  flex-basis: 100%;
+  max-width: 80ch;
+}
+.sg-matrix {
+  border-collapse: collapse;
+  line-height: var(--lh-table);
+}
+.sg-matrix th {
+  height: var(--h-head);
+  padding: 0 var(--s-6) 0 0;
+  color: var(--text-muted);
+  font-size: var(--fs-12);
+  font-weight: 600;
+  text-align: left;
+  white-space: nowrap;
+}
+.sg-matrix tbody th {
+  color: var(--text-2);
+  font-size: var(--fs-13);
+  font-weight: 400;
+}
+.sg-matrix td {
+  height: 56px;
+  padding: 0 var(--s-6) 0 0;
+  vertical-align: middle;
+  white-space: nowrap;
+}
+.sg-matrix tbody tr > * {
+  border-top: 1px solid var(--divider);
+}
+.sg-matrix :is(input, select):not([type="checkbox"], [type="radio"]) {
+  width: 144px;
+}
+.sg-duo {
+  display: inline-flex;
+  gap: var(--s-4);
+  vertical-align: middle;
+}
+.sg-fields {
+  display: grid;
+  grid-template-columns: repeat(3, 224px);
+  gap: var(--s-6);
+}
+.sg-inline {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--s-3) var(--s-8);
+  flex-basis: 100%;
+}
+.sg-opt {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--s-2);
+  cursor: pointer;
+}
+.sg-stack {
+  display: grid;
+  gap: 0;
+  width: min(560px, 100%);
+}
+.sg-stack > .note {
+  margin: 0 0 var(--s-3);
+}
+.sg-wide {
+  display: grid;
+  gap: var(--s-4);
+  width: 100%;
+}
+.sg-wide > .panel {
+  margin: 0;
+}
+.sg-nav {
+  width: 184px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-panel);
+  overflow: hidden;
+}
+.sg-nav .route-nav {
+  position: static;
+  height: auto;
+  border-right: 0;
+}
+.sg-panel {
+  width: min(416px, 100%);
+}
+.sg-icons {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: var(--s-6) var(--s-8);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.sg-icons li {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--s-2);
+}
+.sg-icons span {
+  color: var(--text-muted);
+  font-size: var(--fs-13);
+}
+.sg-mark {
+  color: var(--text-muted);
+}
+.sg-scale {
+  display: grid;
+  gap: var(--s-3);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.sg-scale li {
+  display: grid;
+  grid-template-columns: 48px minmax(0, 1fr);
+  align-items: baseline;
+  gap: var(--s-3);
+}
+.sg-swatches {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: var(--s-4) var(--s-5);
+  width: 100%;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.sg-swatches li {
+  display: grid;
+  grid-template-columns: 40px minmax(0, 1fr);
+  align-items: center;
+  gap: 0 var(--s-3);
+  line-height: var(--lh-table);
+}
+.sg-chip {
+  grid-row: span 3;
+  width: 40px;
+  height: 40px;
+  border-radius: var(--r-button);
+  box-shadow: inset 0 0 0 1px var(--border);
+}
+.sg-swatches b {
+  font-weight: 600;
+}
+.sg-swatches span:last-child,
+.sg-swatches code {
+  color: var(--text-muted);
+  font-size: var(--fs-12);
+}
+@media (max-width: 719px) {
+  .sg {
+    padding: var(--s-8) var(--s-4);
+  }
+  .sg-row {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .sg-fields {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .sg-spec {
+    overflow-x: auto;
+  }
+}
