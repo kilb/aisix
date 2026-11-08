@@ -33,12 +33,10 @@ use axum::extract::State;
 use axum::http::{Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
-use moka::future::Cache;
-use moka::Expiry;
 use serde::{Deserialize, Deserializer, Serialize};
 
 use super::{
-    key_path, AccountClient, AccountError, ACCOUNT_TIMEOUT, CACHE_CAPACITY, FAILURE_TTL,
+    key_path, AccountClient, AccountError, SharedLookup, ACCOUNT_TIMEOUT, FAILURE_TTL,
     NOT_FOUND_TTL, QUOTA_TTL,
 };
 use crate::auth::AuthenticatedKey;
@@ -104,59 +102,35 @@ fn present<'de, D: Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> 
 type QuotaLookup = Result<Option<Arc<KeyQuotaAnswer>>, AccountError>;
 
 /// The quota lookups by key id.
-pub(crate) type QuotaCache = Cache<String, QuotaLookup>;
+pub(crate) type QuotaCache = SharedLookup<Option<Arc<KeyQuotaAnswer>>>;
 
 /// An answer lives [`QUOTA_TTL`] from when it was fetched, a `404`
-/// [`NOT_FOUND_TTL`], a failure [`FAILURE_TTL`].
-struct QuotaExpiry;
-
-impl QuotaExpiry {
-    fn ttl(lookup: &QuotaLookup) -> Duration {
-        match lookup {
-            Ok(Some(_)) => QUOTA_TTL,
-            Ok(None) => NOT_FOUND_TTL,
-            Err(_) => FAILURE_TTL,
-        }
-    }
-}
-
-impl Expiry<String, QuotaLookup> for QuotaExpiry {
-    fn expire_after_create(
-        &self,
-        _key: &String,
-        answer: &QuotaLookup,
-        _created_at: Instant,
-    ) -> Option<Duration> {
-        Some(Self::ttl(answer))
-    }
-
-    fn expire_after_update(
-        &self,
-        _key: &String,
-        answer: &QuotaLookup,
-        _updated_at: Instant,
-        _duration_until_expiry: Option<Duration>,
-    ) -> Option<Duration> {
-        Some(Self::ttl(answer))
+/// [`NOT_FOUND_TTL`]; a failure lives [`FAILURE_TTL`].
+fn quota_ttl(answer: &Option<Arc<KeyQuotaAnswer>>) -> Duration {
+    match answer {
+        Some(_) => QUOTA_TTL,
+        None => NOT_FOUND_TTL,
     }
 }
 
 pub(super) fn quota_cache() -> QuotaCache {
-    Cache::builder()
-        .max_capacity(CACHE_CAPACITY)
-        .expire_after(QuotaExpiry)
-        .build()
+    SharedLookup::new(ACCOUNT_TIMEOUT, quota_ttl, FAILURE_TTL)
 }
 
 impl AccountClient {
     /// The quota answer for key `key_id`, `None` for a key the control plane
-    /// does not know. Concurrent lookups of one key share one request.
+    /// does not know. Concurrent lookups of one key share one request, which
+    /// a caller hanging up never cancels.
     pub(crate) async fn key_quota(&self, key_id: &str) -> QuotaLookup {
         self.quotas
-            .get_with(key_id.to_string(), async {
-                self.get_json::<KeyQuotaAnswer>(&key_path(key_id, "quota"), &[], ACCOUNT_TIMEOUT)
-                    .await
-                    .map(|answer| answer.map(Arc::new))
+            .get(key_id, || {
+                let (client, path) = (self.clone(), key_path(key_id, "quota"));
+                async move {
+                    client
+                        .get_json::<KeyQuotaAnswer>(&path, &[], ACCOUNT_TIMEOUT)
+                        .await
+                        .map(|answer| answer.map(Arc::new))
+                }
             })
             .await
     }
@@ -239,17 +213,18 @@ pub(crate) async fn key_info(
 mod tests {
     use super::*;
     use std::collections::HashMap;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Mutex;
 
     use aisix_core::resource::ResourceEntry;
     use aisix_core::snapshot::SnapshotHandle;
     use aisix_core::{AisixSnapshot, ApiKey, ProxyConfig};
     use axum::body::{to_bytes, Body};
-    use axum::http::{Request, Uri};
+    use axum::http::Request;
     use futures::StreamExt;
     use serde_json::{json, Value};
     use tower::ServiceExt;
+
+    use crate::account::stand_in::StandIn;
+    use crate::account::CACHE_CAPACITY;
 
     /// A control plane's answer for a key with every level visible.
     fn full_answer() -> Value {
@@ -277,67 +252,6 @@ mod tests {
             "effective_remaining_usd": "0.470000",
             "binding_level": "organization",
         })
-    }
-
-    /// How the stand-in answers a key, by the key id in the path.
-    type Answer = Arc<dyn Fn(&str) -> (StatusCode, String) + Send + Sync>;
-
-    /// A stand-in for the control plane's gateway listener on a local port.
-    /// Counts every quota request, in total and by path.
-    struct StandIn {
-        base: String,
-        hits: Arc<AtomicUsize>,
-        paths: Arc<Mutex<HashMap<String, usize>>>,
-    }
-
-    impl StandIn {
-        async fn start(answer: Answer) -> StandIn {
-            Self::start_with_delay(answer, Duration::ZERO).await
-        }
-
-        /// Every answer is sent after `delay`.
-        async fn start_with_delay(answer: Answer, delay: Duration) -> StandIn {
-            let hits = Arc::new(AtomicUsize::new(0));
-            let paths = Arc::new(Mutex::new(HashMap::new()));
-            let (h, p) = (Arc::clone(&hits), Arc::clone(&paths));
-            let app = axum::Router::new().fallback(move |uri: Uri| {
-                let (answer, h, p) = (Arc::clone(&answer), Arc::clone(&h), Arc::clone(&p));
-                async move {
-                    h.fetch_add(1, Ordering::SeqCst);
-                    *p.lock().unwrap().entry(uri.path().to_string()).or_insert(0) += 1;
-                    let key = uri
-                        .path()
-                        .strip_prefix("/dp/v1/keys/")
-                        .and_then(|rest| rest.strip_suffix("/quota"))
-                        .unwrap_or("")
-                        .to_string();
-                    let (status, body) = answer(&key);
-                    tokio::time::sleep(delay).await;
-                    (
-                        status,
-                        [(axum::http::header::CONTENT_TYPE, "application/json")],
-                        body,
-                    )
-                }
-            });
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = listener.local_addr().unwrap();
-            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-            StandIn {
-                base: format!("http://{addr}"),
-                hits,
-                paths,
-            }
-        }
-
-        fn hits(&self) -> usize {
-            self.hits.load(Ordering::SeqCst)
-        }
-
-        fn client(&self) -> AccountClient {
-            let http = reqwest::Client::builder().no_proxy().build().unwrap();
-            AccountClient::new(http, &format!("{}/", self.base))
-        }
     }
 
     fn ok(body: Value) -> (StatusCode, String) {
@@ -473,6 +387,43 @@ mod tests {
         assert_eq!(stand_in.hits(), 3, "past the TTL");
     }
 
+    /// The caller that started a lookup going away (its client hung up)
+    /// cancels nothing: a caller waiting meanwhile gets that lookup's
+    /// answer, and the answer is cached.
+    #[tokio::test]
+    async fn a_caller_that_hangs_up_never_cancels_the_shared_lookup() {
+        let stand_in =
+            StandIn::start_with_delay(Arc::new(|_| ok(full_answer())), Duration::from_millis(300))
+                .await;
+        let client = stand_in.client();
+        let first = tokio::time::timeout(Duration::from_millis(50), client.key_quota("k-owner"));
+        let waiting = async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            client.key_quota("k-owner").await
+        };
+        let (first, waiting) = tokio::join!(first, waiting);
+        assert!(first.is_err(), "the first caller hung up");
+        assert!(
+            waiting.unwrap().is_some(),
+            "the waiting caller got the answer"
+        );
+        assert_eq!(stand_in.hits(), 1, "one lookup, never restarted");
+        assert!(client.key_quota("k-owner").await.unwrap().is_some());
+        assert_eq!(stand_in.hits(), 1, "the answer was cached");
+    }
+
+    /// An answer is kept for `QUOTA_TTL`, past the shorter TTLs of a `404`
+    /// and a failure.
+    #[tokio::test]
+    async fn a_quota_answer_outlives_the_shorter_ttls() {
+        let stand_in = StandIn::start(Arc::new(|_| ok(full_answer()))).await;
+        let client = stand_in.client();
+        assert!(client.key_quota("key-a").await.unwrap().is_some());
+        tokio::time::sleep(FAILURE_TTL.max(NOT_FOUND_TTL) + Duration::from_millis(300)).await;
+        assert!(client.key_quota("key-a").await.unwrap().is_some());
+        assert_eq!(stand_in.hits(), 1, "still within QUOTA_TTL");
+    }
+
     #[tokio::test]
     async fn a_not_found_is_cached_for_its_own_shorter_ttl() {
         let stand_in =
@@ -501,8 +452,7 @@ mod tests {
             .for_each(|answer| async move { assert!(answer.unwrap().is_some()) })
             .await;
         assert_eq!(stand_in.hits(), keys);
-        client.quotas.run_pending_tasks().await;
-        let held = client.quotas.entry_count();
+        let held = client.quotas.entry_count().await;
         assert!(held > 0 && held <= CACHE_CAPACITY, "{held} entries held");
     }
 
