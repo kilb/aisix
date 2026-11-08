@@ -58,7 +58,10 @@ export interface TabProps {
   operator: Operator;
   /** False for a viewer: the page renders no edit controls. */
   canEdit: boolean;
-  onGoto: (tab: TabId) => void;
+  /** Opens `tab`, and on a tab of sections the section named `section`. */
+  onGoto: (tab: TabId, section?: string) => void;
+  /** The section a link asked this tab to open first. */
+  initialSection?: string;
   /** Reads the shell's attention markers again, after a page changed what they show. */
   refreshShell: () => void;
 }
@@ -212,7 +215,12 @@ export function App() {
   const [operator, setOperator] = useState<Operator | null>(null);
   const [bootError, setBootError] = useState<string | null>(null);
   const [signOutError, setSignOutError] = useState<string | null>(null);
-  const [tab, setTab] = useState<TabId>("overview");
+  const [tab, setTabOnly] = useState<TabId>("overview");
+  const [section, setSection] = useState<string | undefined>(undefined);
+  const setTab = useCallback((t: TabId, s?: string) => {
+    setTabOnly(t);
+    setSection(s);
+  }, []);
   const [sessionEnded, setSessionEnded] = useState(false);
   const [passwordOpen, setPasswordOpen] = useState(false);
   const [theme, toggleTheme] = useTheme();
@@ -342,7 +350,7 @@ export function App() {
 
   return (
     <div className="shell">
-      <RouteNav items={visible} current={current} attention={attention} label="Dashboard 分区" onSelect={setTab} />
+      <RouteNav items={visible} current={current} attention={attention} label="Dashboard 分区" onSelect={(t) => setTab(t)} />
 
       <div className="shell-main">
         <header className="topbar">
@@ -410,6 +418,7 @@ export function App() {
                 canEdit={operator.role !== "viewer"}
                 onGoto={setTab}
                 refreshShell={shell.refresh}
+                initialSection={section}
               />
             </section>
           </main>

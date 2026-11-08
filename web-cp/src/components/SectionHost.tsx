@@ -21,7 +21,7 @@ const RANK: Record<OperatorRole, number> = { viewer: 0, operator: 1, admin: 2 };
  */
 export function SectionHost({ label, sections, ...props }: TabProps & { label: string; sections: readonly Section[] }) {
   const shown = sections.filter((s) => RANK[props.operator.role] >= RANK[s.minRole]);
-  const [open, setOpen] = useState<string | null>(null);
+  const [open, setOpen] = useState<string | null>(props.initialSection ?? null);
   const current = shown.find((s) => s.id === open) ?? shown[0];
 
   if (!current) {
