@@ -2,7 +2,7 @@ import { afterAll, beforeAll, describe, expect, test } from "vitest";
 
 import {
   billingWorld,
-  CALL_MICRO_USD,
+  CALL_MICRO_CNY,
   CHAT_CARD,
   CHAT_MODEL,
   type BillingTenant,
@@ -56,7 +56,7 @@ describe("re-pricing corrects past charges with ledger adjustments", () => {
   const balance = async (): Promise<number> => {
     const res = await world!.cp.admin.get(`/admin/tenants/${tenant.id}/billing`);
     expect(res.status, res.text).toBe(200);
-    return res.body.balance_micro_usd as number;
+    return res.body.balance_micro_cny as number;
   };
 
   const preview = async (body: Json): Promise<Json> => {
@@ -68,10 +68,11 @@ describe("re-pricing corrects past charges with ledger adjustments", () => {
   const apply = (id: string) => world!.cp.admin.post(`/admin/billing/repricing/${id}/apply`, {});
 
   const price = async (modelId: string, card: Json): Promise<void> => {
-    const res = await world!.cp.admin.post("/admin/pricing/sell", {
+    const res = await world!.cp.admin.post("/admin/pricing/baselines", {
       model_id: modelId,
       effective_from: new Date().toISOString(),
       card,
+      note: "the re-pricing case's card",
     });
     expect(res.status, res.text).toBe(201);
   };
@@ -127,9 +128,9 @@ describe("re-pricing corrects past charges with ledger adjustments", () => {
     expect(run.status).toBe("previewed");
     expect(run.events).toBe(3);
     expect(run.changed).toBe(3);
-    expect(run.delta_micro_usd).toBe(3 * CALL_MICRO_USD);
-    expect(run.by_tenant.map((t: Json) => [t.tenant_id, t.delta_micro_usd])).toEqual([
-      [tenant.id, 3 * CALL_MICRO_USD],
+    expect(run.delta_micro_cny).toBe(3 * CALL_MICRO_CNY);
+    expect(run.by_tenant.map((t: Json) => [t.tenant_id, t.delta_micro_cny])).toEqual([
+      [tenant.id, 3 * CALL_MICRO_CNY],
     ]);
     // A preview moves no money.
     expect(await balance()).toBe(before);
@@ -138,23 +139,23 @@ describe("re-pricing corrects past charges with ledger adjustments", () => {
     const applied = await apply(run.id);
     expect(applied.status, applied.text).toBe(200);
     expect(applied.body.status).toBe("applied");
-    expect(await balance()).toBe(before - 3 * CALL_MICRO_USD);
+    expect(await balance()).toBe(before - 3 * CALL_MICRO_CNY);
     const calls = await callsOf(LATE_MODEL, 3, () => true);
     for (const c of calls) {
       expect(c.charge.status, JSON.stringify(c)).toBe("charged");
-      expect(c.charge.adjusted_micro_usd, JSON.stringify(c)).toBe(CALL_MICRO_USD);
+      expect(c.charge.adjusted_micro_cny, JSON.stringify(c)).toBe(CALL_MICRO_CNY);
     }
 
     const ledger = await owner.get("/api/billing/ledger?kind=adjustment");
     expect(ledger.status, ledger.text).toBe(200);
-    expect(ledger.body.items.map((e: Json) => [e.amount_micro_usd, e.repricing_run_id])).toEqual([
-      [-3 * CALL_MICRO_USD, run.id],
+    expect(ledger.body.items.map((e: Json) => [e.amount_micro_cny, e.repricing_run_id])).toEqual([
+      [-3 * CALL_MICRO_CNY, run.id],
     ]);
 
     const again = await apply(run.id);
     expect(again.status, again.text).toBe(409);
     expect(again.body.code).toBe("run_state");
-    expect(await balance()).toBe(before - 3 * CALL_MICRO_USD);
+    expect(await balance()).toBe(before - 3 * CALL_MICRO_CNY);
   });
 
   test("A run that lowers a price credits the tenant", async () => {
@@ -172,14 +173,14 @@ describe("re-pricing corrects past charges with ledger adjustments", () => {
       tenant_id: tenant.id,
     });
     expect(run.changed).toBe(2);
-    expect(run.delta_micro_usd).toBe(-CALL_MICRO_USD);
+    expect(run.delta_micro_cny).toBe(-CALL_MICRO_CNY);
     const applied = await apply(run.id);
     expect(applied.status, applied.text).toBe(200);
-    expect(await balance()).toBe(before + CALL_MICRO_USD);
+    expect(await balance()).toBe(before + CALL_MICRO_CNY);
     const calls = await callsOf(CHAT_MODEL, 2, () => true);
     for (const c of calls) {
-      expect(c.charge.amount_micro_usd, JSON.stringify(c)).toBe(CALL_MICRO_USD);
-      expect(c.charge.adjusted_micro_usd, JSON.stringify(c)).toBe(-CALL_MICRO_USD / 2);
+      expect(c.charge.amount_micro_cny, JSON.stringify(c)).toBe(CALL_MICRO_CNY);
+      expect(c.charge.adjusted_micro_cny, JSON.stringify(c)).toBe(-CALL_MICRO_CNY / 2);
     }
   });
 });

@@ -84,11 +84,13 @@ function catalogueOf(stack: Stack, opts: WorldOptions): Catalogue {
       // A price cannot start in the past, so it starts a moment ahead, and the
       // world waits that moment out: no call may be made before it is in effect.
       const startsAt = Date.now() + PRICE_LEAD_MS;
-      await stack.admin.post("/admin/pricing/sell", {
+      await stack.admin.post("/admin/pricing/baselines", {
         model_id: model.id,
         effective_from: new Date(startsAt).toISOString(),
         card: PRICE_CARD,
+        note: "the billing world's card",
       });
+      await ensureSharedRate(stack);
       await sleep(Math.max(0, startsAt - Date.now()) + 250);
       return { id: model.id as string, name: "chat-ui" };
     });
@@ -124,6 +126,33 @@ function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+/**
+ * The rate every seeded key's group charges: `shared` at 1 CNY per USD, so a
+ * figure in µ¥ is the baseline's own in µ$. Written once per stack.
+ */
+const sharedRates = new WeakMap<Stack, Promise<void>>();
+function ensureSharedRate(stack: Stack): Promise<void> {
+  let rate = sharedRates.get(stack);
+  if (!rate) {
+    rate = (async () => {
+      const groups = await stack.admin.get("/admin/provider-groups");
+      const shared = (groups.items as Json[]).find((g) => g.name === "shared");
+      if (!shared) throw new Error("the first-boot shared group is missing");
+      // The group is created by the migration with `shared` as its routing
+      // name, so a rate for it is all that is missing.
+      // A price cannot start more than five seconds in the past, so it starts
+      // at the earliest instant that rule allows.
+      await stack.admin.post(`/admin/provider-groups/${shared.id}/rates`, {
+        model_id: null,
+        cny_per_usd: "1",
+        effective_from: new Date(Date.now() - 4_000).toISOString(),
+      });
+    })();
+    sharedRates.set(stack, rate);
+  }
+  return rate;
+}
+
 /** A `/api` client signed in as `login`. */
 async function signedIn(stack: Stack, login: Login): Promise<ApiClient> {
   const client = stack.tenant();
@@ -157,11 +186,11 @@ export async function seedBillingWorld(stack: Stack, opts: WorldOptions = {}): P
     current.version,
   );
   if (opts.creditLimitUsd !== undefined) {
-    await stack.admin.patch(`/admin/tenants/${tenantId}/billing`, { credit_limit_usd: opts.creditLimitUsd });
+    await stack.admin.patch(`/admin/tenants/${tenantId}/billing`, { credit_limit_cny: opts.creditLimitUsd });
   }
   const credit = opts.creditUsd ?? (opts.mode === "postpaid" ? "0" : "10.00");
   if (credit !== "0") {
-    await stack.admin.post(`/admin/tenants/${tenantId}/credits`, { amount_usd: credit, reason: "billing world funding" });
+    await stack.admin.post(`/admin/tenants/${tenantId}/credits`, { amount_cny: credit, reason: "billing world funding" });
   }
 
   const members: BillingWorld["members"] = [];

@@ -74,6 +74,9 @@ describe("a tenant's journey from signup to a working key, and the switches that
     // The gateway has registered before anything it would be judged by is
     // written (the save-time version gate of a stamped control plane).
     await cp.admin.waitRegistered(gw.dpId);
+    // `shared` at 1 CNY per USD: a charge in µ¥ is the card's own µ$, so the
+    // amounts these cases were written with hold.
+    await cp.admin.ensureSharedRate();
 
     // The operator's catalog. Every account a tenant reaches is in `shared`.
     accounts.push(

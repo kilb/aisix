@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 
-import { billingWorld, CALL_MICRO_USD, CHAT_MODEL, type BillingTenant, type BillingWorld } from "../harness/billing-world.js";
+import { billingWorld, CALL_MICRO_CNY, CHAT_MODEL, type BillingTenant, type BillingWorld } from "../harness/billing-world.js";
 import { fundTenant, pollUntil, type CpPortal, type Json } from "../harness/control-plane.js";
 import { callGateway } from "../harness/cp-upstream.js";
 
@@ -64,10 +64,10 @@ describe("a tenant reads its ledger and its daily totals", () => {
     }
     const items = await entries(2);
     expect(
-      items.map((i) => [i.kind, i.amount_micro_usd, i.balance_after_micro_usd, i.model?.name]),
+      items.map((i) => [i.kind, i.amount_micro_cny, i.balance_after_micro_cny, i.model?.name]),
     ).toEqual([
-      ["usage", -CALL_MICRO_USD, -CALL_MICRO_USD, CHAT_MODEL],
-      ["usage", -CALL_MICRO_USD, -2 * CALL_MICRO_USD, CHAT_MODEL],
+      ["usage", -CALL_MICRO_CNY, -CALL_MICRO_CNY, CHAT_MODEL],
+      ["usage", -CALL_MICRO_CNY, -2 * CALL_MICRO_CNY, CHAT_MODEL],
     ]);
   });
 
@@ -88,7 +88,7 @@ describe("a tenant reads its ledger and its daily totals", () => {
     expect(res.body.items).toHaveLength(1);
     const row = res.body.items[0];
     expect(Date.parse(row.period_start)).toBe(day.getTime());
-    expect(row.usage_micro_usd).toBe(-sameDay.length * CALL_MICRO_USD);
-    expect(row.closing_balance_micro_usd).toBe(-sameDay.length * CALL_MICRO_USD);
+    expect(row.usage_micro_cny).toBe(-sameDay.length * CALL_MICRO_CNY);
+    expect(row.closing_balance_micro_cny).toBe(-sameDay.length * CALL_MICRO_CNY);
   });
 });

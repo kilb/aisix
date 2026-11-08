@@ -81,6 +81,9 @@ describe("platform configuration rules at the gateway", () => {
     const gw = await cp.issueGateway();
     app = await spawnManagedGateway(gw);
     await cp.admin.waitRegistered(gw.dpId);
+    // `shared` at 1 CNY per USD: a charge in µ¥ is the card's own µ$, so the
+    // amounts these cases were written with hold.
+    await cp.admin.ensureSharedRate();
 
     const cachedModel = await direct("knob-cached-e2e", await account("knob-cache-account", cached, ["shared"]));
     await cp.admin.create("cache_policies", {

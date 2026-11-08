@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 
-import { billingWorld, CALL_MICRO_USD, CHAT_MODEL, type BillingTenant, type BillingWorld } from "../harness/billing-world.js";
+import { billingWorld, CALL_MICRO_CNY, CHAT_MODEL, type BillingTenant, type BillingWorld } from "../harness/billing-world.js";
 import { pollUntil } from "../harness/control-plane.js";
 import { callGateway, type GatewayAnswer } from "../harness/cp-upstream.js";
 
@@ -52,7 +52,7 @@ describe("an operator-set credit limit blocks a postpaid tenant at the gateway",
     tenant = await world.tenant("Credit Limit E2E Co", {
       billingMode: "postpaid",
       setup: async (id) => {
-        const limit = await world!.cp.admin.patch(`/admin/tenants/${id}/billing`, { credit_limit_usd: "0.03" });
+        const limit = await world!.cp.admin.patch(`/admin/tenants/${id}/billing`, { credit_limit_cny: "0.03" });
         expect(limit.status, limit.text).toBe(200);
       },
     });
@@ -65,13 +65,13 @@ describe("an operator-set credit limit blocks a postpaid tenant at the gateway",
   test("A postpaid tenant spends down to its credit limit and is then refused", async () => {
     const before = await account();
     expect(before.billing_mode).toBe("postpaid");
-    expect(before.credit_limit_micro_usd).toBe(LIMIT_MICRO_USD);
+    expect(before.credit_limit_micro_cny).toBe(LIMIT_MICRO_USD);
     expect(before.exhausted).toBe(false);
 
     // Each call costs 10 000 µ$: three calls take the balance to the limit.
     // Sent one at a time, each is served, since the balance is above the
     // limit when it is sent.
-    for (let call = 1; call <= LIMIT_MICRO_USD / CALL_MICRO_USD; call++) {
+    for (let call = 1; call <= LIMIT_MICRO_USD / CALL_MICRO_CNY; call++) {
       const answer = await chat();
       expect(answer.status, `call ${call}: ${answer.text}`).toBe(200);
     }
@@ -85,8 +85,8 @@ describe("an operator-set credit limit blocks a postpaid tenant at the gateway",
       },
       { timeoutMs: WITHIN_MS, intervalMs: 250 },
     );
-    expect(spent.balance_micro_usd).toBeLessThanOrEqual(-LIMIT_MICRO_USD);
-    expect(spent.available_micro_usd).toBeLessThanOrEqual(0);
+    expect(spent.balance_micro_cny).toBeLessThanOrEqual(-LIMIT_MICRO_USD);
+    expect(spent.available_micro_cny).toBeLessThanOrEqual(0);
 
     // The gateway's: chats are refused, with the credit-limit message.
     const refused = await chatsAnswer(429, "chats to be refused at the credit limit");
@@ -95,11 +95,11 @@ describe("an operator-set credit limit blocks a postpaid tenant at the gateway",
   });
 
   test("Raising the credit limit lets it call again; switching it to prepaid refuses it again", async () => {
-    const raised = await world!.cp.admin.patch(`/admin/tenants/${tenant.id}/billing`, { credit_limit_usd: "1.00" });
+    const raised = await world!.cp.admin.patch(`/admin/tenants/${tenant.id}/billing`, { credit_limit_cny: "1.00" });
     expect(raised.status, raised.text).toBe(200);
     // Settled before the answer: the account already says it is not blocked.
     expect(raised.body.exhausted, raised.text).toBe(false);
-    expect(raised.body.credit_limit_micro_usd).toBe(1_000_000);
+    expect(raised.body.credit_limit_micro_cny).toBe(1_000_000);
     await chatsAnswer(200, "chats to be served after the credit limit was raised");
 
     const current = await world!.cp.admin.get(`/admin/tenants/${tenant.id}`);

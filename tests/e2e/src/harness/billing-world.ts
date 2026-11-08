@@ -18,10 +18,10 @@ import { ProxyClient } from "./proxy.js";
  * - The upstream reports 1000 prompt and 200 completion tokens on every
  *   chat, messages (bridged through chat) and responses answer, buffered or
  *   streamed, and 1000 prompt tokens on every embeddings answer.
- * - `chat-bill` is priced at input 6 and output 20 USD per million tokens,
- *   so one call costs 1000 × 6 + 200 × 20 = 10 000 µ$ ($0.01).
- * - `embed-bill` is priced at input 10 (output 0), so one call costs
- *   10 000 µ$ too.
+ * - `chat-bill` has a baseline of input 6 and output 20 USD per million
+ *   tokens; `embed-bill` of input 10 (output 0). `shared`, the group every
+ *   seeded key names, charges 1 CNY per USD, so a call of either costs
+ *   10 000 µ¥ (¥0.01).
  *
  * Everything is seeded through the control plane's API. A tenant is created
  * by [`BillingWorld.tenant`], granted both models, and its key is minted
@@ -33,12 +33,17 @@ import { ProxyClient } from "./proxy.js";
 
 /** What every chat-family answer of the upstream reports. */
 export const BILLING_USAGE = { prompt: 1000, cached: 0, completion: 200 };
-/** USD per million tokens. */
+/** What `shared` charges: 1 CNY per USD, so a µ¥ figure is the µ$ one. */
+export const SHARED_GROUP = "shared";
+export const SHARED_RATE = "1";
+/** A baseline card, in USD per million tokens. */
 export const CHAT_CARD = { default: { base: { input: "6", output: "20" } } };
 /** Embeddings report no output tokens; the card still names an output rate. */
 export const EMBED_CARD = { default: { base: { input: "10", output: "0" } } };
-/** What one call of either model costs, in µ$. */
-export const CALL_MICRO_USD = 10_000;
+/** What one call of either model costs, in µ¥. */
+export const CALL_MICRO_CNY = 10_000;
+/** @deprecated The same amount; the name predates the money path moving to CNY. */
+export const CALL_MICRO_USD = CALL_MICRO_CNY;
 export const CHAT_MODEL = "chat-bill";
 export const EMBED_MODEL = "embed-bill";
 
@@ -115,13 +120,16 @@ export async function billingWorld(opts: BillingWorldOptions = {}): Promise<Bill
       [CHAT_MODEL, chat, CHAT_CARD],
       [EMBED_MODEL, embed, EMBED_CARD],
     ] as const) {
-      const priced = await cp.admin.post("/admin/pricing/sell", {
+      const priced = await cp.admin.post("/admin/pricing/baselines", {
         model_id: model.id,
         effective_from: new Date().toISOString(),
         card,
+        note: "the billing world's card",
       });
       check(`pricing ${name}`, priced, 201);
     }
+    // `shared`'s default rate, which every seeded key is charged at.
+    await cp.admin.ensureSharedRate(SHARED_RATE);
 
     const stack = cp;
     const app = gateway;

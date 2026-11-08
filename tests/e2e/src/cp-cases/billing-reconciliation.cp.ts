@@ -2,7 +2,7 @@ import { afterAll, beforeAll, describe, expect, test } from "vitest";
 
 import {
   billingWorld,
-  CALL_MICRO_USD,
+  CALL_MICRO_CNY,
   CHAT_MODEL,
   EMBED_MODEL,
   type BillingTenant,
@@ -74,7 +74,7 @@ describe("the ledger matches the price table", () => {
     tenant = await world.tenant("Money Check E2E Co", {
       setup: async (id) => {
         const credited = await world!.cp.admin.post(`/admin/tenants/${id}/credits`, {
-          amount_usd: CREDIT_USD,
+          amount_cny: CREDIT_USD,
           reason: "对账核验 e2e",
         });
         expect(credited.status, credited.text).toBe(201);
@@ -144,7 +144,7 @@ describe("the ledger matches the price table", () => {
       // what did reach the ledger.
       const dropped = (await drops()) - dropsBefore;
       expect.soft(dropped, "the gateway dropped usage events during the money check").toBe(0);
-      const expected = (sent.size - dropped) * CALL_MICRO_USD;
+      const expected = (sent.size - dropped) * CALL_MICRO_CNY;
 
       // The key's stored usage rows, and the tenant's usage entries.
       const rows = await everyPage(`/admin/usage/events?limit=500&api_key_id=${tenant.keyId}`);
@@ -153,7 +153,7 @@ describe("the ledger matches the price table", () => {
       const keyEntries = entries.filter((e) => pathOf.has(e.event_id));
       // What each endpoint was debited, for the message of any mismatch below.
       const byPath: Record<string, number[]> = {};
-      for (const e of keyEntries) (byPath[pathOf.get(e.event_id)!] ??= []).push(e.amount_micro_usd);
+      for (const e of keyEntries) (byPath[pathOf.get(e.event_id)!] ??= []).push(e.amount_micro_cny);
       const books = `dropped ${dropped}, rows ${rows.length}, entries ${entries.length}, debits ${JSON.stringify(byPath)}`;
 
       expect.soft(rows.length, `every call's usage row is stored: ${books}`).toBe(sent.size - dropped);
@@ -166,8 +166,8 @@ describe("the ledger matches the price table", () => {
       expect
         .soft(
           keyEntries
-            .filter((e) => e.amount_micro_usd !== -CALL_MICRO_USD)
-            .map((e) => [pathOf.get(e.event_id), e.amount_micro_usd]),
+            .filter((e) => e.amount_micro_cny !== -CALL_MICRO_CNY)
+            .map((e) => [pathOf.get(e.event_id), e.amount_micro_cny]),
           `every usage entry is exactly the price table's amount: ${books}`,
         )
         .toEqual([]);
@@ -182,14 +182,14 @@ describe("the ledger matches the price table", () => {
         .toBe(rows.find((r) => r.request_id === barrier)?.batch_id);
       expect
         .soft(
-          keyEntries.reduce((sum, e) => sum + e.amount_micro_usd, 0),
+          keyEntries.reduce((sum, e) => sum + e.amount_micro_cny, 0),
           `the key's usage entries add up to the price table's amount: ${books}`,
         )
         .toBe(-expected);
 
       const account = await world!.cp.admin.get(`/admin/tenants/${tenant.id}/billing`);
       expect(account.status, account.text).toBe(200);
-      expect.soft(account.body.balance_micro_usd, account.text).toBe(CREDIT_MICRO_USD - expected);
+      expect.soft(account.body.balance_micro_cny, account.text).toBe(CREDIT_MICRO_USD - expected);
 
       const reconciled = await world!.cp.admin.get(`/admin/billing/reconciliation?tenant_id=${tenant.id}`);
       expect(reconciled.status, reconciled.text).toBe(200);

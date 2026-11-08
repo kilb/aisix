@@ -100,10 +100,11 @@ describe("every request a tenant key makes becomes one charge at the configured 
     return chargeOf(rows[0].event_id);
   };
   const price = (modelId: string) =>
-    cp!.admin.post("/admin/pricing/sell", {
+    cp!.admin.post("/admin/pricing/baselines", {
       model_id: modelId,
       effective_from: new Date().toISOString(),
       card: CARD,
+      note: "the charge case's card",
     });
 
   beforeAll(async () => {
@@ -115,6 +116,9 @@ describe("every request a tenant key makes becomes one charge at the configured 
       managed: { cp_base_url: `https://127.0.0.1:${relay.port}`, heartbeat_interval_secs: 300 },
     });
     await cp.admin.waitRegistered(gw.dpId);
+    // `shared` at 1 CNY per USD: a charge in µ¥ is the card's own µ$, so the
+    // amounts these cases were written with hold.
+    await cp.admin.ensureSharedRate();
 
     const openai = await cp.admin.create("provider_keys", {
       display_name: "price-account-e2e",
@@ -217,7 +221,7 @@ describe("every request a tenant key makes becomes one charge at the configured 
       const charge = await chargeFor(requestId);
       const what = `${path} ${JSON.stringify(body)}: ${JSON.stringify(charge)}`;
       expect(charge.status, what).toBe("charged");
-      expect(charge.charge_micro_usd, what).toBe(FULL_CHARGE);
+      expect(charge.charge_micro_cny, what).toBe(FULL_CHARGE);
       expect(charge.estimated, what).toBe(false);
       expect(charge.tenant_id, what).toBe(tenantId);
       expect(charge.api_key_id, what).toBe(keyId);
@@ -227,7 +231,7 @@ describe("every request a tenant key makes becomes one charge at the configured 
     ok(embedded.answer);
     const embedCharge = await chargeFor(embedded.requestId);
     expect(embedCharge.status, JSON.stringify(embedCharge)).toBe("charged");
-    expect(embedCharge.charge_micro_usd, JSON.stringify(embedCharge)).toBe(EMBED_CHARGE);
+    expect(embedCharge.charge_micro_cny, JSON.stringify(embedCharge)).toBe(EMBED_CHARGE);
 
     const counted = await send("/v1/messages/count_tokens", {
       model: "counted",
@@ -236,7 +240,7 @@ describe("every request a tenant key makes becomes one charge at the configured 
     ok(counted.answer);
     const countCharge = await chargeFor(counted.requestId);
     expect(countCharge.status, JSON.stringify(countCharge)).toBe("nothing_to_bill");
-    expect(countCharge.charge_micro_usd, JSON.stringify(countCharge)).toBe(0);
+    expect(countCharge.charge_micro_cny, JSON.stringify(countCharge)).toBe(0);
   });
 
   test("A cache hit, a stream the client abandons, and a guardrail block bill by the rules", async () => {
@@ -246,7 +250,7 @@ describe("every request a tenant key makes becomes one charge at the configured 
     expect(upstream!.count("/v1/chat/completions"), "the repeat reached the upstream").toBe(before);
     const hitCharge = await chargeFor(hit.requestId);
     expect(hitCharge.status, JSON.stringify(hitCharge)).toBe("exempt");
-    expect(hitCharge.charge_micro_usd, JSON.stringify(hitCharge)).toBe(0);
+    expect(hitCharge.charge_micro_cny, JSON.stringify(hitCharge)).toBe(0);
 
     // The upstream streams without end and reports no usage; the client
     // leaves as soon as the answer's head arrives.
@@ -267,7 +271,7 @@ describe("every request a tenant key makes becomes one charge at the configured 
       const abandoned = await chargeFor(abandonedId, 40_000);
       expect(abandoned.status, JSON.stringify(abandoned)).toBe("charged");
       expect(abandoned.estimated, JSON.stringify(abandoned)).toBe(true);
-      expect(abandoned.charge_micro_usd, JSON.stringify(abandoned)).toBeGreaterThanOrEqual(1);
+      expect(abandoned.charge_micro_cny, JSON.stringify(abandoned)).toBeGreaterThanOrEqual(1);
     } finally {
       upstream!.stallStreams = false;
     }
@@ -279,7 +283,7 @@ describe("every request a tenant key makes becomes one charge at the configured 
     expect(leaked.length, "the blocked input reached the upstream").toBe(0);
     const blockCharge = await chargeFor(blocked.requestId);
     expect(blockCharge.status, JSON.stringify(blockCharge)).toBe("nothing_to_bill");
-    expect(blockCharge.charge_micro_usd, JSON.stringify(blockCharge)).toBe(0);
+    expect(blockCharge.charge_micro_cny, JSON.stringify(blockCharge)).toBe(0);
   }, 120_000);
 
   test("Charges match usage rows exactly", async () => {
@@ -327,7 +331,7 @@ describe("every request a tenant key makes becomes one charge at the configured 
     expect(rows[0].batch_id).toBe(resent.batch_id);
     const charge = await chargeOf(rows[0].event_id);
     expect(charge.status, JSON.stringify(charge)).toBe("charged");
-    expect(charge.charge_micro_usd, JSON.stringify(charge)).toBe(FULL_CHARGE);
+    expect(charge.charge_micro_cny, JSON.stringify(charge)).toBe(FULL_CHARGE);
   });
 
   test("Usage on a model without a price is kept and shown as unpriced", async () => {
@@ -336,7 +340,7 @@ describe("every request a tenant key makes becomes one charge at the configured 
     const earlyCharge = await chargeFor(early.requestId);
     expect(earlyCharge.status, JSON.stringify(earlyCharge)).toBe("unpriced");
     expect(earlyCharge.error_code, JSON.stringify(earlyCharge)).toBe("missing_price");
-    expect(earlyCharge.charge_micro_usd, JSON.stringify(earlyCharge)).toBeNull();
+    expect(earlyCharge.charge_micro_cny, JSON.stringify(earlyCharge)).toBeNull();
 
     const status = await cp!.admin.get("/admin/pricing/status");
     expect(status.status, status.text).toBe(200);
@@ -349,7 +353,7 @@ describe("every request a tenant key makes becomes one charge at the configured 
     ok(later.answer);
     const laterCharge = await chargeFor(later.requestId);
     expect(laterCharge.status, JSON.stringify(laterCharge)).toBe("charged");
-    expect(laterCharge.charge_micro_usd, JSON.stringify(laterCharge)).toBe(FULL_CHARGE);
+    expect(laterCharge.charge_micro_cny, JSON.stringify(laterCharge)).toBe(FULL_CHARGE);
 
     // Charges are written once: the earlier row stays as it was priced.
     const again = await chargeOf(earlyCharge.event_id);
@@ -373,7 +377,7 @@ describe("every request a tenant key makes becomes one charge at the configured 
     for (const row of rows) {
       const charge = await chargeOf(row.event_id);
       expect(charge.status, JSON.stringify(charge)).toBe("charged");
-      expect(charge.charge_micro_usd, JSON.stringify(charge)).toBe(FULL_CHARGE);
+      expect(charge.charge_micro_cny, JSON.stringify(charge)).toBe(FULL_CHARGE);
     }
   });
 });

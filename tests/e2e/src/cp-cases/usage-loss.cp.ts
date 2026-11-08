@@ -100,6 +100,9 @@ describe("usage the gateway cannot deliver", () => {
       managed: { cp_base_url: `https://127.0.0.1:${relay.port}`, heartbeat_interval_secs: 5 },
     });
     await cp.admin.waitRegistered(gw.dpId);
+    // `shared` at 1 CNY per USD: a charge in µ¥ is the card's own µ$, so the
+    // amounts these cases were written with hold.
+    await cp.admin.ensureSharedRate();
 
     // The platform's own key below names the group it reaches, so this case
     // creates one and puts the account in it beside `shared`.

@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 
-import { billingWorld, CALL_MICRO_USD, CHAT_MODEL, type BillingTenant, type BillingWorld } from "../harness/billing-world.js";
+import { billingWorld, CALL_MICRO_CNY, CHAT_MODEL, type BillingTenant, type BillingWorld } from "../harness/billing-world.js";
 import { pollUntil, type CpPortal } from "../harness/control-plane.js";
 import { callGateway, type GatewayAnswer } from "../harness/cp-upstream.js";
 
@@ -79,7 +79,7 @@ describe("money blocks a tenant at the gateway within 2 s", () => {
       // top-up repays them, so every trial starts with one call's worth.
       let k = 0;
       for (let trial = 1; trial <= TRIALS; trial++) {
-        const requested = await owner.post("/api/billing/topups", { amount_usd: dollars((1 + k) * CALL_MICRO_USD) });
+        const requested = await owner.post("/api/billing/topups", { amount_cny: dollars((1 + k) * CALL_MICRO_CNY) });
         expect(requested.status, requested.text).toBe(201);
         const approved = await world!.cp.admin.post(`/admin/billing/topups/${requested.body.id}/approve`, {});
         expect(approved.status, approved.text).toBe(200);

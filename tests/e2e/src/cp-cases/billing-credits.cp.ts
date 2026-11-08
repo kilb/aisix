@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 
-import { billingWorld, CALL_MICRO_USD, CHAT_MODEL, type BillingTenant, type BillingWorld } from "../harness/billing-world.js";
+import { billingWorld, CALL_MICRO_CNY, CHAT_MODEL, type BillingTenant, type BillingWorld } from "../harness/billing-world.js";
 import { pollUntil, type CpPortal, type Json } from "../harness/control-plane.js";
 import { callGateway, type GatewayAnswer } from "../harness/cp-upstream.js";
 
@@ -61,11 +61,28 @@ describe("operators credit tenants directly", () => {
     await world?.close();
   });
 
+  test("A credit of 0.001 yuan answers 422 at /amount_cny", async () => {
+    const tenant = await world!.tenant("Credit Fen E2E Co");
+    // A third decimal is not yuan: an amount is yuan and fen at most, and the
+    // refusal names the field rather than rounding.
+    const refused = await world!.cp.admin.post(`/admin/tenants/${tenant.id}/credits`, {
+      amount_cny: "0.001",
+      reason: "精度检查 7c1",
+    });
+    expect(refused.status, refused.text).toBe(422);
+    expect(refused.body.code, refused.text).toBe("validation_failed");
+    const details = refused.body.details as { path?: string }[];
+    expect(details.map((d) => d.path), refused.text).toEqual(["/amount_cny"]);
+    // Nothing moved: a credit is written only once the amount is accepted.
+    const balance = await world!.cp.admin.get(`/admin/tenants/${tenant.id}/billing`);
+    expect(balance.body.balance_micro_cny, balance.text).toBe(0);
+  });
+
   test("An operator credit settles a postpaid debt and lifts the block", async () => {
     const tenant = await world!.tenant("Credit Postpaid E2E Co", {
       billingMode: "postpaid",
       setup: async (id) => {
-        const limit = await world!.cp.admin.patch(`/admin/tenants/${id}/billing`, { credit_limit_usd: "0.01" });
+        const limit = await world!.cp.admin.patch(`/admin/tenants/${id}/billing`, { credit_limit_cny: "0.01" });
         expect(limit.status, limit.text).toBe(200);
       },
     });
@@ -83,19 +100,19 @@ describe("operators credit tenants directly", () => {
     // too. The credit below (five calls, over a limit of one) lifts the block
     // only while they number four or fewer.
     expect(
-      blocked.body.balance_micro_usd,
+      blocked.body.balance_micro_cny,
       `more calls were served past the credit limit than this scenario's credit covers: ${blocked.text}`,
-    ).toBeGreaterThan(-6 * CALL_MICRO_USD);
+    ).toBeGreaterThan(-6 * CALL_MICRO_CNY);
 
     // The stack's operator is an admin.
     const credited = await world!.cp.admin.post(`/admin/tenants/${tenant.id}/credits`, {
-      amount_usd: "0.05",
+      amount_cny: "0.05",
       reason: REASON,
     });
     expect(credited.status, credited.text).toBe(201);
     expect(credited.body.origin).toBe("operator");
     expect(credited.body.status).toBe("approved");
-    expect(credited.body.amount_micro_usd).toBe(5 * CALL_MICRO_USD);
+    expect(credited.body.amount_micro_cny).toBe(5 * CALL_MICRO_CNY);
     expect(credited.body.credit_reason).toBe(REASON);
     expect(credited.body.requested_by).toBeNull();
     expect(credited.body.tenant_id).toBe(tenant.id);
@@ -106,13 +123,13 @@ describe("operators credit tenants directly", () => {
     expect(ledger.status, ledger.text).toBe(200);
     const entries = ledger.body.items as Json[]; // newest first
     const credits = entries.filter((e) => e.kind === "topup");
-    expect(credits.map((e) => [e.amount_micro_usd, e.topup_id]), ledger.text).toEqual([
-      [5 * CALL_MICRO_USD, credited.body.id],
+    expect(credits.map((e) => [e.amount_micro_cny, e.topup_id]), ledger.text).toEqual([
+      [5 * CALL_MICRO_CNY, credited.body.id],
     ]);
     const before = entries[entries.indexOf(credits[0]) + 1]; // the first chat's debit at the latest
     expect(before, ledger.text).toBeDefined();
-    expect(credits[0].balance_after_micro_usd - 5 * CALL_MICRO_USD, ledger.text).toBe(
-      before.balance_after_micro_usd,
+    expect(credits[0].balance_after_micro_cny - 5 * CALL_MICRO_CNY, ledger.text).toBe(
+      before.balance_after_micro_cny,
     );
 
     await chatsAnswer(tenant, 200, "chats to be served after the operator's credit");

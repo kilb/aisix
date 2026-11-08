@@ -188,6 +188,29 @@ export class CpAdmin extends CpClient {
   }
 
   /**
+   * Gives `shared` a default rate of 1 CNY per USD, once per stack: the rate
+   * every seeded key is charged at unless a case writes another. Writing
+   * `1` makes a charge in µ¥ numerically the baseline's in µ$, so a case's
+   * amounts hold whatever its card says. A group's creation already writes a
+   * rate, so this overwrites it with the one the cases expect.
+   */
+  async ensureSharedRate(cnyPerUsd = "1"): Promise<void> {
+    const groups = await this.get("/admin/provider-groups");
+    if (groups.status !== 200) throw new Error(`listing provider groups answered ${groups.status}: ${groups.text}`);
+    const shared = (groups.body.items as Json[]).find((g) => g.name === "shared");
+    if (!shared) throw new Error("the first-boot shared group is missing");
+    // A price cannot start more than five seconds in the past, so it starts
+    // at the earliest instant that rule allows: every later one would leave
+    // the first call of a case unpriced while it waited.
+    const res = await this.post(`/admin/provider-groups/${shared.id}/rates`, {
+      model_id: null,
+      cny_per_usd: cnyPerUsd,
+      effective_from: new Date(Date.now() - 4_000).toISOString(),
+    });
+    if (res.status !== 201) throw new Error(`rating the shared group answered ${res.status}: ${res.text}`);
+  }
+
+  /**
    * Creates a provider group and returns its view, whose `id` a key names as
    * `group_id`: every key names exactly one group. A case that routes a key
    * to one group gives that group a provider account (`groups`) and mints
@@ -611,7 +634,7 @@ export function sleep(ms: number): Promise<void> {
 /**
  * Funds `tenantId` so that its model calls are not refused for want of
  * money, through the operator API: the tenant becomes postpaid with a credit
- * limit of `creditLimitUsd` dollars. A prepaid tenant an operator creates
+ * limit of `creditLimitUsd` yuan. A prepaid tenant an operator creates
  * holds nothing, and a prepaid tenant at 0 is refused at the gateway.
  *
  * The credit limit is settled before the answer, but the gateway learns of
@@ -624,6 +647,6 @@ export async function fundTenant(cp: ControlPlaneStack, tenantId: string, credit
   if (current.status !== 200) throw new Error(`reading tenant ${tenantId} answered ${current.status}: ${current.text}`);
   const mode = await cp.admin.patch(`/admin/tenants/${tenantId}`, { billing_mode: "postpaid" }, current.version);
   if (mode.status !== 200) throw new Error(`making tenant ${tenantId} postpaid answered ${mode.status}: ${mode.text}`);
-  const limit = await cp.admin.patch(`/admin/tenants/${tenantId}/billing`, { credit_limit_usd: creditLimitUsd });
+  const limit = await cp.admin.patch(`/admin/tenants/${tenantId}/billing`, { credit_limit_cny: creditLimitUsd });
   if (limit.status !== 200) throw new Error(`setting the credit limit of ${tenantId} answered ${limit.status}: ${limit.text}`);
 }

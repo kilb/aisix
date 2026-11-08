@@ -116,10 +116,11 @@ describe("a tenant's call log and usage summary carry its calls and nothing of t
     });
     hiddenModelId = hidden.id;
     for (const model of [fail, slow, hidden]) {
-      const priced = await w.cp.admin.post("/admin/pricing/sell", {
+      const priced = await w.cp.admin.post("/admin/pricing/baselines", {
         model_id: model.id,
         effective_from: new Date().toISOString(),
         card: { default: { base: { input: "6", output: "20" } } },
+        note: "the views case's card",
       });
       expect(priced.status, priced.text).toBe(201);
     }

@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 
-import { billingWorld, CALL_MICRO_USD, CHAT_MODEL, type BillingTenant, type BillingWorld } from "../harness/billing-world.js";
+import { billingWorld, CALL_MICRO_CNY, CHAT_MODEL, type BillingTenant, type BillingWorld } from "../harness/billing-world.js";
 import { pollUntil, type CpPortal, type Json } from "../harness/control-plane.js";
 import { callGateway, type GatewayAnswer } from "../harness/cp-upstream.js";
 
@@ -78,8 +78,8 @@ describe("tenants top up and operators decide", () => {
     const before = await chat(tenant);
     expect(before.status, before.text).toBe(429);
 
-    const topup = await request(owner, { amount_usd: "0.02" });
-    expect(topup.amount_micro_usd).toBe(2 * CALL_MICRO_USD);
+    const topup = await request(owner, { amount_cny: "0.02" });
+    expect(topup.amount_micro_cny).toBe(2 * CALL_MICRO_CNY);
     const queue = await world!.cp.admin.get("/admin/billing/topups?status=pending");
     expect(queue.status, queue.text).toBe(200);
     const queued = (queue.body.items as Json[]).find((t) => t.id === topup.id);
@@ -100,7 +100,7 @@ describe("tenants top up and operators decide", () => {
       async () => {
         const res = await owner.get("/api/billing/balance");
         expect(res.status, res.text).toBe(200);
-        return res.body.balance_micro_usd === 0 ? res.body : undefined;
+        return res.body.balance_micro_cny === 0 ? res.body : undefined;
       },
       { timeoutMs: WITHIN_MS, intervalMs: 250 },
     );
@@ -112,10 +112,30 @@ describe("tenants top up and operators decide", () => {
     expect(refused.json?.error?.code, refused.text).toBe("budget_exceeded");
   });
 
+  test("A top-up of 100.50 yuan is approved and the balance becomes 100,500,000 µ¥", async () => {
+    const tenant = await world!.tenant("Topup CNY E2E Co");
+    const owner = await ownerOf(tenant, "cny");
+    // 100.50 CNY is 100 500 000 µ¥: yuan and fen in, micro-CNY out.
+    const topup = await request(owner, { amount_cny: "100.50", note: "人民币充值" });
+    expect(topup.amount_micro_cny, JSON.stringify(topup)).toBe(100_500_000);
+    const approved = await world!.cp.admin.post(`/admin/billing/topups/${topup.id}/approve`, {});
+    expect(approved.status, approved.text).toBe(200);
+    expect(approved.body.amount_micro_cny, approved.text).toBe(100_500_000);
+    const balance = await owner.get("/api/billing/balance");
+    expect(balance.status, balance.text).toBe(200);
+    expect(balance.body.balance_micro_cny, balance.text).toBe(100_500_000);
+    const ledger = await owner.get("/api/billing/ledger");
+    expect(ledger.status, ledger.text).toBe(200);
+    const entries = ledger.body.items as Json[];
+    expect(entries.map((e) => [e.kind, e.amount_micro_cny]), ledger.text).toEqual([
+      ["topup", 100_500_000],
+    ]);
+  });
+
   test("A rejected request credits nothing and the tenant sees the reason", async () => {
     const tenant = await world!.tenant("Topup Reject E2E Co");
     const owner = await ownerOf(tenant, "reject");
-    const topup = await request(owner, { amount_usd: "0.05", note: "银行转账", reference: "wire-9d2" });
+    const topup = await request(owner, { amount_cny: "0.05", note: "银行转账", reference: "wire-9d2" });
     const pending = await owner.get("/api/billing/balance");
     expect(pending.body.pending_topups, pending.text).toBe(1);
 
@@ -137,7 +157,7 @@ describe("tenants top up and operators decide", () => {
 
     const balance = await owner.get("/api/billing/balance");
     expect(balance.status, balance.text).toBe(200);
-    expect(balance.body.balance_micro_usd, balance.text).toBe(0);
+    expect(balance.body.balance_micro_cny, balance.text).toBe(0);
     expect(balance.body.pending_topups, balance.text).toBe(0);
     expect(balance.body.exhausted, balance.text).toBe(true);
 
@@ -146,7 +166,7 @@ describe("tenants top up and operators decide", () => {
     expect(late.status, late.text).toBe(409);
     expect(late.body.code).toBe("topup_state");
     const after = await owner.get("/api/billing/balance");
-    expect(after.body.balance_micro_usd, after.text).toBe(0);
+    expect(after.body.balance_micro_cny, after.text).toBe(0);
     const refused = await chat(tenant);
     expect(refused.status, refused.text).toBe(429);
   });
@@ -155,7 +175,7 @@ describe("tenants top up and operators decide", () => {
     const tenant = await world!.tenant("Topup Postpaid E2E Co", {
       billingMode: "postpaid",
       setup: async (id) => {
-        const limit = await world!.cp.admin.patch(`/admin/tenants/${id}/billing`, { credit_limit_usd: "0.01" });
+        const limit = await world!.cp.admin.patch(`/admin/tenants/${id}/billing`, { credit_limit_cny: "0.01" });
         expect(limit.status, limit.text).toBe(200);
       },
     });
@@ -166,11 +186,11 @@ describe("tenants top up and operators decide", () => {
     expect(first.status, first.text).toBe(200);
     await chatsAnswer(tenant, 429, "chats to be refused at the credit limit");
 
-    const topup = await request(owner, { amount_usd: "0.05", reference: "pay-4b7" });
+    const topup = await request(owner, { amount_cny: "0.05", reference: "pay-4b7" });
     const approved = await world!.cp.admin.post(`/admin/billing/topups/${topup.id}/approve`, {});
     expect(approved.status, approved.text).toBe(200);
     expect(approved.body.reference).toBe("pay-4b7");
-    expect(approved.body.amount_micro_usd).toBe(5 * CALL_MICRO_USD);
+    expect(approved.body.amount_micro_cny).toBe(5 * CALL_MICRO_CNY);
     const account = await world!.cp.admin.get(`/admin/tenants/${tenant.id}/billing`);
     expect(account.body.exhausted, account.text).toBe(false);
 
