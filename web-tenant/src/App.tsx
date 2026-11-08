@@ -251,7 +251,7 @@ export function App({ inviteToken }: { inviteToken: string | null }) {
           ) : current === "usage" ? (
             <Usage />
           ) : current === "budgets" ? (
-            <Budgets />
+            <Budgets member={member} />
           ) : current === "billing" ? (
             <Billing member={member} />
           ) : (
