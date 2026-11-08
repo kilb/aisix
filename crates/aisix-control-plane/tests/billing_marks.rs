@@ -33,7 +33,9 @@ use aisix_core::models::BudgetPeriod;
 use futures::FutureExt;
 use serde_json::{json, Value};
 use sqlx::postgres::PgListener;
-use support::world::{deliver, price, seed_key, seed_model, tokens_680, usage, world, World};
+use support::world::{
+    deliver, insert_unpriced_charges, price, seed_key, seed_model, tokens_680, usage, world, World,
+};
 use support::{BareDatabase, OperatorSession, Resp, TestCp, TEST_MASTER_KEY, TEST_PASSWORD};
 use uuid::Uuid;
 
@@ -1144,6 +1146,36 @@ async fn every_marking_path_takes_the_account_before_the_resources_lock() {
             .expect("a quota to edit")
             .id
     };
+    // A re-pricing run that charges one of the tenant's unpriced rows,
+    // previewed now and applied by an admin as the last case.
+    let occurred = chrono::Utc::now() - chrono::TimeDelta::minutes(10);
+    insert_unpriced_charges(
+        cp.db(),
+        "marks-order-7c1",
+        1,
+        tenant,
+        Uuid::new_v4(),
+        model,
+        occurred,
+    )
+    .await;
+    price(&cp, model).await;
+    let r = cp
+        .send(
+            "POST",
+            "/admin/billing/repricing",
+            Some(admin.cookie()),
+            Some(json!({
+                "from": occurred - chrono::TimeDelta::minutes(1),
+                "to": occurred + chrono::TimeDelta::minutes(1),
+                "reason": "补录价格 7c1",
+            })),
+        )
+        .await;
+    assert_eq!(r.status, 201, "{r:?}");
+    assert_eq!(r.body["changed"], 1, "{r:?}");
+    let run = r.body["id"].as_str().expect("a run id").to_string();
+    let applier = Arc::new(cp.admin_login_seeded(OperatorRole::Admin).await);
     let cases: Vec<(&str, Uuid, Request, u16)> = vec![
         // A grant change takes the resources lock before it projects.
         (
@@ -1205,6 +1237,20 @@ async fn every_marking_path_takes_the_account_before_the_resources_lock() {
             "budgets::delete",
             tenant,
             quota_write(QuotaWrite::Delete(existing)),
+            200,
+        ),
+        // A re-pricing run posts to the ledger and settles the marks.
+        (
+            "POST /admin/billing/repricing/{id}/apply",
+            tenant,
+            {
+                let (cp, applier) = (cp.clone(), applier.clone());
+                let path = format!("/admin/billing/repricing/{run}/apply");
+                Box::pin(async move {
+                    cp.send("POST", &path, Some(applier.cookie()), Some(json!({})))
+                        .await
+                })
+            },
             200,
         ),
     ];

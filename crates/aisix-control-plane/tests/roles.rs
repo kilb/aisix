@@ -217,6 +217,26 @@ fn fixture(method: &str, path: &str, target: &SeededOperator) -> (String, Option
             format!("/admin/tenants/{}/credits", Uuid::nil()),
             Some(json!({"amount_usd": "0.05", "reason": "roles"})),
         ),
+        // Re-pricing runs. The preview selects nothing (a past window with no
+        // usage) and posts nothing; the run matches nothing: 404 once the
+        // role check passed, so nothing is applied.
+        ("GET", "/admin/billing/repricing") => (path.to_string(), None),
+        ("POST", "/admin/billing/repricing") => (
+            path.to_string(),
+            Some(json!({
+                "from": "2026-01-01T00:00:00Z",
+                "to": "2026-01-02T00:00:00Z",
+                "reason": "roles",
+            })),
+        ),
+        ("GET", "/admin/billing/repricing/{id}") => (
+            format!("/admin/billing/repricing/{}", Uuid::nil()),
+            None,
+        ),
+        ("POST", "/admin/billing/repricing/{id}/apply") => (
+            format!("/admin/billing/repricing/{}/apply", Uuid::nil()),
+            Some(json!({})),
+        ),
         _ => panic!("no fixture for {method} {path}: add one to tests/roles.rs"),
     }
 }

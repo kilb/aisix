@@ -233,3 +233,60 @@ pub fn tokens_680() -> Value {
 pub async fn deliver(dp: &DpClient, batch_id: Uuid, events: Vec<Value>) -> Resp {
     dp.telemetry(batch_id, &json!({ "events": events })).await
 }
+
+/// `count` usage rows of key `key` of `tenant` for `model`, written by raw
+/// SQL with an `unpriced` (`missing_price`) charge each, as intake stores a
+/// row on a model without a price: event ids `<prefix>-1` to
+/// `<prefix>-<count>`, occurring `from` plus 1 ms, 2 ms and so on, each of
+/// 1000 prompt tokens (800 cache hits) and 200 completion tokens, which is
+/// 680 µ$ at `card()`. For volumes the gateway path would take minutes to
+/// deliver, and for tests with no gateway.
+pub async fn insert_unpriced_charges(
+    db: &Db,
+    prefix: &str,
+    count: i64,
+    tenant: Uuid,
+    key: Uuid,
+    model: Uuid,
+    from: DateTime<Utc>,
+) {
+    let mut tx = db.pool().begin().await.expect("begin");
+    sqlx::query(
+        "INSERT INTO usage_events (event_id, dp_id, batch_id, occurred_at, team_id, api_key_id, event) \
+         SELECT $1 || '-' || n, $2, $2, $3 + n * interval '1 millisecond', $4::text, $5::text, \
+                jsonb_build_object('event_id', $1 || '-' || n, \
+                  'occurred_at', to_char(($3 + n * interval '1 millisecond') AT TIME ZONE 'UTC', \
+                                         'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'), \
+                  'team_id', $4::text, 'api_key_id', $5::text, 'user_id', '', \
+                  'requested_model_id', $6::text, 'operation', 'chat', 'status_code', 200, \
+                  'is_final_attempt', true, 'prompt_tokens', 1000, 'cached_prompt_tokens', 800, \
+                  'completion_tokens', 200) \
+         FROM generate_series(1, $7::bigint) AS n",
+    )
+    .bind(prefix)
+    .bind(Uuid::new_v4())
+    .bind(from)
+    .bind(tenant)
+    .bind(key)
+    .bind(model)
+    .bind(count)
+    .execute(&mut *tx)
+    .await
+    .expect("insert the usage rows");
+    sqlx::query(
+        "INSERT INTO pricing_charges \
+         (event_id, tenant_id, api_key_id, user_id, requested_model_id, occurred_at, status, \
+          error_code, engine_version) \
+         SELECT event_id, team_id, api_key_id, '', $3::text, occurred_at, 'unpriced', \
+                'missing_price', $4 \
+         FROM usage_events WHERE event_id LIKE $1 || '-%' AND team_id = $2::text",
+    )
+    .bind(prefix)
+    .bind(tenant)
+    .bind(model)
+    .bind(i64::from(ENGINE_VERSION))
+    .execute(&mut *tx)
+    .await
+    .expect("insert their charges");
+    tx.commit().await.expect("commit");
+}
