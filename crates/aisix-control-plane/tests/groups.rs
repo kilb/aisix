@@ -1103,16 +1103,27 @@ async fn key_group(pool: &PgPool, label: &str) -> Option<String> {
         .1
 }
 
-/// The `detail` of the one audit row `action` names.
+/// The `detail` of the one audit row `action` names. Exactly one: a migration
+/// that wrote it twice would otherwise read as correct.
 async fn audit_detail(pool: &PgPool, action: &str) -> Value {
-    let detail: Value = sqlx::query_scalar(
+    let details: Vec<Value> = sqlx::query_scalar(
         "SELECT detail FROM audit_log WHERE action = $1 AND actor_kind = 'system' ORDER BY id",
     )
     .bind(action)
-    .fetch_one(pool)
+    .fetch_all(pool)
     .await
-    .unwrap_or_else(|e| panic!("read the {action} audit row: {e}"));
-    detail
+    .unwrap_or_else(|e| panic!("read the {action} audit rows: {e}"));
+    assert_eq!(details.len(), 1, "one {action} row: {details:?}");
+    details[0].clone()
+}
+
+/// How many audit rows carry `action`.
+async fn audit_rows(pool: &PgPool, action: &str) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM audit_log WHERE action = $1")
+        .bind(action)
+        .fetch_one(pool)
+        .await
+        .unwrap_or_else(|e| panic!("count the {action} audit rows: {e}"))
 }
 
 #[tokio::test]
@@ -1278,6 +1289,30 @@ async fn the_upgrade_reports_a_default_group_that_reaches_no_upstream() {
     let detail = audit_detail(&pool, "provider_group.default_assigned").await;
     assert_eq!(detail["keys"], 1, "{detail}");
     assert_eq!(detail["provider_keys"], json!([]), "{detail}");
+    drop_database(pool).await;
+}
+
+#[tokio::test]
+async fn a_fresh_install_writes_no_default_assigned_row() {
+    let Some(pool) = database_at(23).await else {
+        return;
+    };
+    // A fresh install's shape: the migrations run before
+    // `ensure_internal_tenant` creates the tenant, so there is no key to give
+    // the default group, and the upgrade records no change.
+    migrate_rest(&pool).await.expect("the rest migrates");
+    assert_eq!(
+        audit_rows(&pool, "provider_group.default_assigned").await,
+        0,
+        "an assignment that touched no key records no change"
+    );
+    // The default group is still designated, and the table still works.
+    let designated: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM provider_groups WHERE is_default")
+            .fetch_all(&pool)
+            .await
+            .expect("read the designated group");
+    assert_eq!(designated, vec!["default".to_string()]);
     drop_database(pool).await;
 }
 
