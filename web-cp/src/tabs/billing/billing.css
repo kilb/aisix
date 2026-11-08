@@ -55,3 +55,11 @@
 .bl-mark {
   margin-left: var(--s-2);
 }
+
+/* 组织额度: the row's own controls sit on one line, wrapping when narrow. */
+.bl-row-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--s-2);
+}

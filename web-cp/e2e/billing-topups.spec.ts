@@ -31,6 +31,8 @@ async function login(page: Page, email: string, password: string): Promise<void>
 async function openTopups(page: Page, email = stack.operator.email, password = stack.operator.password): Promise<void> {
   await login(page, email, password);
   await page.locator('[data-tab="billing"]').click();
+  // 计费 now has more than one section; 账户 is first.
+  await page.getByRole("group", { name: "计费分区" }).getByRole("button", { name: "充值审批" }).click();
   await expect(page.getByRole("heading", { name: "充值审批" })).toBeVisible();
   await expect(page.locator("main").getByText("载入中…")).toHaveCount(0);
 }
@@ -155,6 +157,7 @@ test("有待审批的申请时，计费在导航上有提示", async ({ page }) 
   await expect(tab).toHaveText("计费");
 
   await tab.click();
+  await page.getByRole("group", { name: "计费分区" }).getByRole("button", { name: "充值审批" }).click();
   await rowOf(page, world).getByRole("button", { name: "批准", exact: true }).click();
   await rowOf(page, world).getByRole("button", { name: "确认批准" }).click();
   await expect(rowOf(page, world)).toHaveCount(0);

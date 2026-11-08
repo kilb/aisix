@@ -20,6 +20,7 @@ import { SidePanel } from "../../ui/SidePanel";
 import { useToast } from "../../ui/Toast";
 import { refusal, useLoad } from "../Tenants";
 import { CreditForm } from "./CreditForm";
+import { OrgQuota } from "./OrgQuota";
 import "./billing.css";
 
 /** What every region of the panel is given. */
@@ -474,13 +475,13 @@ function UsageSummary({ account }: RegionProps) {
 
 const SCOPE_LABEL: Record<Budget["scope"], string> = { team: "组织", member: "成员", api_key: "密钥" };
 const SET_BY_LABEL: Record<Budget["set_by"], string> = { operator: "平台", org_admin: "组织管理员", member: "成员" };
-const PERIOD_LABEL: Record<NonNullable<Budget["period"]>, string> = {
+export const PERIOD_LABEL: Record<NonNullable<Budget["period"]>, string> = {
   day: "每天",
   week: "每周（周一起）",
   month: "每月",
 };
 
-function budgetPeriod(b: Budget): string {
+export function budgetPeriod(b: Budget): string {
   if (b.kind === "cumulative") return b.counted_from ? `自 ${periodLabel(b.counted_from, "day")} 起` : "—";
   return b.period ? (PERIOD_LABEL[b.period] ?? b.period) : "—";
 }
@@ -551,6 +552,7 @@ export const PANEL_REGIONS: { id: string; Component: ComponentType<RegionProps> 
   { id: "period-summary", Component: PeriodSummary },
   { id: "usage-summary", Component: UsageSummary },
   { id: "quotas", Component: Quotas },
+  { id: "org-quota", Component: OrgQuota },
   { id: "credit", Component: CreditForm },
 ];
 

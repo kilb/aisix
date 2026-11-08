@@ -802,3 +802,22 @@ export const topups = {
     return (await call<Topup>("POST", `/admin/billing/topups/${seg(id)}/reject`, { reason })).data;
   },
 };
+
+// ── organization quotas (operator-set `team` quotas) ────────────────────────
+
+/** Operator and up. A periodic quota's `period` defaults to month; a cumulative one has none. `409 budget_exists` for the same kind and period. */
+export async function createOrgQuota(
+  tenantId: string,
+  body: { kind: "periodic" | "cumulative"; period?: "day" | "week" | "month"; limit_usd: string },
+): Promise<Budget> {
+  return (await call<Budget>("POST", `/admin/tenants/${seg(tenantId)}/budgets`, body)).data;
+}
+
+/** Operator and up; only a quota the operator set (`403 budget_managed` otherwise). */
+export async function updateOrgQuota(tenantId: string, id: string, limitUsd: string): Promise<Budget> {
+  return (await call<Budget>("PATCH", `/admin/tenants/${seg(tenantId)}/budgets/${seg(id)}`, { limit_usd: limitUsd })).data;
+}
+
+export async function deleteOrgQuota(tenantId: string, id: string): Promise<void> {
+  await call<null>("DELETE", `/admin/tenants/${seg(tenantId)}/budgets/${seg(id)}`);
+}
