@@ -1512,6 +1512,7 @@ fn takeover_unconfirmed() -> ApiError {
             .to_string(),
         details: Vec::new(),
         referenced_by: Vec::new(),
+        counts: None,
         current_version: None,
     }
 }
