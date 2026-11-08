@@ -305,7 +305,13 @@ pub struct Routing {
     #[serde(default)]
     pub strategy: RoutingStrategy,
     /// Ordered set of direct models available to this routing model.
-    #[schemars(length(min = 1))]
+    ///
+    /// May be empty: a public model whose every serving account is disabled
+    /// keeps its routing document so the name stays listed, and a request
+    /// for it then answers the gateway's `upstream_unavailable` `503`, the
+    /// same answer every upstream being down gets. A written empty list is
+    /// therefore a served-nothing state, never a default — the field stays
+    /// required, so a document that omits it is still refused.
     pub targets: Vec<RoutingTarget>,
     /// Retry attempts on the current target before failing over, applied to every target that does not set its own `retries`. Absent falls back to the deployment-wide `upstream.retries` default.
     #[serde(default, skip_serializing_if = "Option::is_none")]

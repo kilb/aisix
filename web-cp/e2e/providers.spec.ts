@@ -158,7 +158,7 @@ test("只改分组不碰密钥：网关发给上游的仍是原来的密钥", as
     provider: "openai",
     api_key: SECRET,
     api_base: `${stack.mockUpstreamUrl}/v1`,
-    groups: ["shared"],
+    groups: ["shared", "grp-internal-keep-7c1"],
   });
   await stack.admin.post("/admin/resources/models", {
     doc: { display_name: "chat-keep-e2e", provider: "openai", model_name: "gpt-4o-mini", provider_key_id: created.id },
@@ -166,9 +166,17 @@ test("只改分组不碰密钥：网关发给上游的仍是原来的密钥", as
   const { items: tenants } = await stack.admin.get("/admin/tenants");
   const internal = (tenants as Json[]).find((t) => t.is_internal);
   expect(internal, JSON.stringify(tenants)).toBeDefined();
+  // Every key names one group, and the platform's own tenant has no
+  // assignment list to take it from: this group holds the account too.
+  const group = await stack.admin.post("/admin/provider-groups", {
+    name: "grp-internal-keep-7c1",
+    display_name: "保留自用 7c1",
+    default_cny_per_usd: "7.2",
+  });
   const { plaintext } = await stack.admin.post(`/admin/tenants/${internal.id}/keys`, {
     label: "keep-e2e",
     allowed_models: ["chat-keep-e2e"],
+    group_id: group.id,
   });
   // Before any edit: the gateway serves the account with its stored key.
   await clearUpstream();
@@ -194,7 +202,9 @@ test("只改分组不碰密钥：网关发给上游的仍是原来的密钥", as
   await expect.poll(async () => (await account(created.id)).rollout.state, { timeout: APPLIED_WITHIN_MS }).toBe("applied");
   const saved = await account(created.id);
   expect(saved.version).toBeGreaterThan(created.version);
-  expect(saved.doc.groups).toEqual(["shared", "grp-beta-3e9"]);
+  expect([...(saved.doc.groups as string[])].sort()).toEqual(
+    ["grp-beta-3e9", "grp-internal-keep-7c1", "shared"].sort(),
+  );
   expect(saved.rollout.state).toBe("applied");
 
   await clearUpstream();
@@ -313,22 +323,36 @@ test("移除分组前，点名因此用不到该账号的租户与密钥；取�
     display_name: "acct-solo-e2e",
     provider: "openai",
     api_key: "sk-e2e-solo-upstream-6b2",
-    groups: ["shared", "grp-solo-6b2"],
+    groups: ["shared", "grp-solo-6b2", "grp-covered-6b2"],
   });
+  // A tenant may only be assigned a group that exists, and a key names it by
+  // id.
+  const soloGroup = await stack.admin.post("/admin/provider-groups", {
+    name: "grp-solo-6b2",
+    display_name: "单租户 6b2",
+    default_cny_per_usd: "7.2",
+  });
+  const soloGroupId: string = soloGroup.id;
   // Reaches the account only through grp-solo-6b2, with a key that follows it: loses it.
   const solo = await stack.admin.post("/admin/tenants", { name: "tenant-solo-e2e" });
   await stack.admin.patch(`/admin/tenants/${solo.id}`, { allowed_provider_groups: ["grp-solo-6b2"] }, solo.version);
   await stack.admin.post(`/admin/tenants/${solo.id}/keys`, { label: "key-follows-e2e" });
-  // Its groups lose the account, but its only key has groups of its own that keep it.
+  // Its groups lose the account, but its only key names a group that keeps
+  // it: every key names one group from creation.
+  const keepGroup = await stack.admin.post("/admin/provider-groups", {
+    name: "grp-covered-6b2",
+    display_name: "已覆盖 6b2",
+    default_cny_per_usd: "7.2",
+  });
   const covered = await stack.admin.post("/admin/tenants", { name: "tenant-covered-e2e" });
   await stack.admin.patch(
     `/admin/tenants/${covered.id}`,
-    { allowed_provider_groups: ["grp-solo-6b2"] },
+    { allowed_provider_groups: ["grp-solo-6b2", "grp-covered-6b2"] },
     covered.version,
   );
   await stack.admin.post(`/admin/tenants/${covered.id}/keys`, {
     label: "key-covered-e2e",
-    allowed_provider_groups: ["shared"],
+    group_id: keepGroup.id,
   });
   // Also reaches it through shared: keeps it.
   const both = await stack.admin.post("/admin/tenants", { name: "tenant-both-e2e" });
@@ -337,11 +361,17 @@ test("移除分组前，点名因此用不到该账号的租户与密钥；取�
     { allowed_provider_groups: ["shared", "grp-solo-6b2"] },
     both.version,
   );
-  // A key of its own groups, in a tenant that keeps the account: loses it.
+  // A key naming the account's group, in a tenant that keeps the account
+  // through another group: loses the account when `grp-solo-6b2` goes.
   const host = await stack.admin.post("/admin/tenants", { name: "tenant-host-e2e" });
+  await stack.admin.patch(
+    `/admin/tenants/${host.id}`,
+    { allowed_provider_groups: ["shared", "grp-solo-6b2"] },
+    host.version,
+  );
   await stack.admin.post(`/admin/tenants/${host.id}/keys`, {
     label: "key-solo-e2e",
-    allowed_provider_groups: ["grp-solo-6b2"],
+    group_id: soloGroupId,
   });
 
   await loginAsOperator(page);
@@ -359,11 +389,11 @@ test("移除分组前，点名因此用不到该账号的租户与密钥；取�
   await expect(confirm).not.toContainText("tenant-covered-e2e");
   await expect(confirm).not.toContainText("key-covered-e2e");
   // Nothing is saved before the confirmation.
-  expect((await account(created.id)).doc.groups).toEqual(["shared", "grp-solo-6b2"]);
+  expect((await account(created.id)).doc.groups).toEqual(["shared", "grp-solo-6b2", "grp-covered-6b2"]);
 
   await confirm.getByRole("button", { name: "取消" }).click();
   await expect(confirm).toHaveCount(0);
-  expect((await account(created.id)).doc.groups).toEqual(["shared", "grp-solo-6b2"]);
+  expect((await account(created.id)).doc.groups).toEqual(["shared", "grp-solo-6b2", "grp-covered-6b2"]);
 
   await page.getByRole("button", { name: "保存" }).click();
   await confirm.getByRole("button", { name: "确认移除分组" }).click();
@@ -371,7 +401,7 @@ test("移除分组前，点名因此用不到该账号的租户与密钥；取�
   await expect(page.getByRole("form", { name: /acct-solo-e2e/ })).toHaveCount(0);
   await expect(accountRow(page, "acct-solo-e2e")).toContainText("shared");
   await expect(accountRow(page, "acct-solo-e2e")).not.toContainText("grp-solo-6b2");
-  expect((await account(created.id)).doc.groups).toEqual(["shared"]);
+  expect((await account(created.id)).doc.groups).toEqual(["shared", "grp-covered-6b2"]);
 });
 
 test("取消后改为移除另一个分组：确认框只列这一次的影响，没人用的分组确认后移除", async ({ page }) => {
@@ -382,6 +412,8 @@ test("取消后改为移除另一个分组：确认框只列这一次的影响�
     groups: ["shared", "grp-swap-a1c", "grp-idle-4e1"],
   });
   // Uses grp-swap-a1c; nobody uses grp-idle-4e1.
+  await stack.admin.post("/admin/provider-groups", { name: "grp-swap-a1c", display_name: "换组 a1c", default_cny_per_usd: "7.2" });
+  await stack.admin.post("/admin/provider-groups", { name: "grp-idle-4e1", display_name: "闲置 4e1", default_cny_per_usd: "7.2" });
   const swap = await stack.admin.post("/admin/tenants", { name: "tenant-swap-e2e" });
   await stack.admin.patch(`/admin/tenants/${swap.id}`, { allowed_provider_groups: ["grp-swap-a1c"] }, swap.version);
   await stack.admin.post(`/admin/tenants/${swap.id}/keys`, { label: "key-swap-e2e" });

@@ -58,13 +58,15 @@ use sqlx::PgConnection;
 use uuid::Uuid;
 
 use crate::audit::{self, Actor, AuditEntry};
-use crate::auth::{OperatorAuth, OperatorRole};
+use crate::auth::{MemberAuth, MemberRole, OperatorAuth, OperatorRole};
 use crate::db::DbError;
 use crate::error::{ApiError, Detail};
 use crate::http::ApiJson;
+use crate::keys::KeyGroup;
 use crate::pricing::rates::{self, NewGroupRate, RatePlan};
 use crate::pricing::store;
 use crate::resources::{refs, Kind};
+use crate::tenants::{self, TenantRow};
 use crate::AppState;
 
 /// The longest a routing name may be, in characters: the same bound every
@@ -79,6 +81,126 @@ const MAX_DESCRIPTION_CHARS: usize = 500;
 /// a path does.
 fn group_id(raw: &str) -> Result<Uuid, ApiError> {
     Uuid::parse_str(raw).map_err(|_| ApiError::not_found())
+}
+
+/// The one refusal every `/group_id` a tenant may not name shares: an id
+/// that names nothing to it, a retired group and another tenant's group are
+/// the same answer, so nothing leaks which groups exist.
+fn group_unavailable() -> ApiError {
+    store::refused("/group_id", "分组不存在或不可用")
+}
+
+/// The group a key of tenant `t` should name, given the `group_id` its body
+/// carries (`None` when it left it out). Takes the group's row `FOR SHARE`,
+/// so the caller must hold `t`'s lock and must call this before
+/// `write_resource`, as [`crate::keys::create_key`] does.
+///
+/// - An id: the live group it names. For a customer it must be one of `t`'s
+///   assigned groups; the platform's own tenant may name any live group.
+/// - Omitted: the one live group `t` is assigned, when it is assigned
+///   exactly one. A customer with several, and the platform's own tenant,
+///   which has no assignment list, must choose.
+///
+/// Refused `422 /group_id`: "分组不存在或不可用" for an id that names
+/// nothing, a retired group or another tenant's, and "请选择分组" when the
+/// id was omitted and no single group applies.
+pub async fn key_group(
+    conn: &mut PgConnection,
+    t: &TenantRow,
+    raw: Option<&str>,
+) -> Result<KeyGroup, ApiError> {
+    let Some(raw) = raw else {
+        let only = match t.allowed_provider_groups.as_slice() {
+            [only] => Some(only.clone()),
+            _ => None,
+        };
+        // The platform's own tenant has no assignment list, so it never has
+        // a single group to fall back on: its keys always choose.
+        let only = match only {
+            Some(name) if !t.is_internal => Some(name),
+            _ => None,
+        };
+        let Some(name) = only else {
+            return Err(store::refused("/group_id", "请选择分组"));
+        };
+        let row: Option<GroupRow> = sqlx::query_as(&format!(
+            "SELECT {COLUMNS} FROM provider_groups \
+             WHERE name = $1 AND retired_at IS NULL FOR SHARE"
+        ))
+        .bind(&name)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(DbError::from)?;
+        let row = row.ok_or_else(group_unavailable)?;
+        return Ok(row.key_group());
+    };
+    let id = Uuid::parse_str(raw).map_err(|_| group_unavailable())?;
+    let row = sqlx::query_as::<_, GroupRow>(&format!(
+        "SELECT {COLUMNS} FROM provider_groups WHERE id = $1 FOR SHARE"
+    ))
+    .bind(id)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(DbError::from)?
+    .ok_or_else(group_unavailable)?;
+    if row.retired_at.is_some() {
+        return Err(group_unavailable());
+    }
+    if !t.is_internal && !t.allowed_provider_groups.contains(&row.name) {
+        return Err(group_unavailable());
+    }
+    Ok(row.key_group())
+}
+
+impl GroupRow {
+    /// The group as a key records it: its id, its routing name and what a
+    /// tenant sees.
+    fn key_group(&self) -> KeyGroup {
+        KeyGroup {
+            id: self.id,
+            name: self.name.clone(),
+            display_name: self.display_name.clone(),
+        }
+    }
+}
+
+/// `GET /api/groups` → `{items: [{id, display_name, description}]}`: the
+/// live groups `t` assigns, by display name, which is what a tenant chooses
+/// its keys' group from. Never a routing `name`, and never a group its tenant
+/// is not assigned.
+pub async fn tenant_groups(
+    auth: MemberAuth,
+    State(state): State<AppState>,
+) -> Result<Json<Value>, ApiError> {
+    auth.require_active()?;
+    auth.require(&[
+        MemberRole::Owner,
+        MemberRole::Admin,
+        MemberRole::Member,
+        MemberRole::Billing,
+    ])?;
+    let mut conn = state.db.pool().acquire().await.map_err(DbError::from)?;
+    let tenant = tenants::find(&mut conn, auth.tenant_id).await?;
+    let items: Vec<Value> = groups_of(&mut conn, &tenant.allowed_provider_groups)
+        .await?
+        .into_iter()
+        .map(|row| {
+            json!({"id": row.id, "display_name": row.display_name, "description": row.description})
+        })
+        .collect();
+    Ok(Json(json!({ "items": items })))
+}
+
+/// The live groups `names` assigns, by display name then id.
+async fn groups_of(conn: &mut PgConnection, names: &[String]) -> Result<Vec<GroupRow>, DbError> {
+    sqlx::query_as(&format!(
+        "SELECT {COLUMNS} FROM provider_groups \
+         WHERE name = ANY($1) AND retired_at IS NULL ORDER BY display_name, id"
+    ))
+    .bind(names)
+    .fetch_all(conn)
+    .await
+    .map_err(DbError::from)
 }
 
 /// The decimal-string message a rate or a description of one is refused
@@ -391,10 +513,6 @@ pub struct UpdateBody {
 /// The default rate creating a group takes no `note`: it is the rate the
 /// group starts at, not a hand-entered revision, and a later one may be
 /// written with its own note through `POST /admin/provider-groups/{id}/rates`.
-///
-/// The default rate creating a group takes no `note`: it is the rate the
-/// group starts at, not a hand-entered revision, and a later one may be
-/// written with its own through `POST /admin/provider-groups/{id}/rates`.
 pub async fn create(
     auth: OperatorAuth,
     State(state): State<AppState>,

@@ -292,6 +292,42 @@ fn fixture(method: &str, path: &str, target: &SeededOperator) -> (String, Option
                 "note": "roles",
             })),
         ),
+        // Public models and the accounts that serve them. A public model is
+        // created per attempt under a fresh name, since its row is all the
+        // create writes; every id matches nothing, so a read answers 404 and
+        // a channel write 422 at the account, and nothing else is written.
+        ("GET", "/admin/public-models") => (path.to_string(), None),
+        ("POST", "/admin/public-models") => (
+            path.to_string(),
+            Some(json!({"name": format!("roles-{}", Uuid::new_v4().simple())})),
+        ),
+        ("GET", "/admin/public-models/{id}") => {
+            (format!("/admin/public-models/{}", Uuid::nil()), None)
+        }
+        ("POST", "/admin/public-models/{id}/retire") => (
+            format!("/admin/public-models/{}/retire", Uuid::nil()),
+            Some(json!({})),
+        ),
+        ("GET", "/admin/provider-keys/{id}/channel-models") => (
+            format!("/admin/provider-keys/{}/channel-models", Uuid::nil()),
+            None,
+        ),
+        ("PUT", "/admin/provider-keys/{id}/channel-models/{public_model_id}") => (
+            format!(
+                "/admin/provider-keys/{}/channel-models/{}",
+                Uuid::nil(),
+                Uuid::nil()
+            ),
+            Some(json!({"enabled": true})),
+        ),
+        ("DELETE", "/admin/provider-keys/{id}/channel-models/{public_model_id}") => (
+            format!(
+                "/admin/provider-keys/{}/channel-models/{}",
+                Uuid::nil(),
+                Uuid::nil()
+            ),
+            None,
+        ),
         // The price import. The upload is refused at `/dataset_ref`, so
         // nothing is written; the batch matches nothing: 404.
         ("GET", "/admin/pricing/imports") => (path.to_string(), None),
@@ -302,6 +338,34 @@ fn fixture(method: &str, path: &str, target: &SeededOperator) -> (String, Option
         ("GET", "/admin/pricing/imports/{id}") => {
             (format!("/admin/pricing/imports/{}", Uuid::nil()), None)
         }
+        // An upstream account's own model list. The account matches nothing:
+        // past the role check it answers 404 and never dials an upstream.
+        ("GET", "/admin/provider-keys/{id}/upstream-models") => (
+            format!("/admin/provider-keys/{}/upstream-models", Uuid::nil()),
+            None,
+        ),
+        // Deciding a proposal. Both ids match nothing: past the role check,
+        // 404, so nothing is written.
+        ("POST", "/admin/pricing/imports/{id}/proposals/{pid}/confirm") => (
+            format!(
+                "/admin/pricing/imports/{}/proposals/{}/confirm",
+                Uuid::nil(),
+                Uuid::nil()
+            ),
+            Some(json!({
+                "model_id": Uuid::nil(),
+                "effective_from": chrono::Utc::now(),
+                "attested": true,
+            })),
+        ),
+        ("POST", "/admin/pricing/imports/{id}/proposals/{pid}/reject") => (
+            format!(
+                "/admin/pricing/imports/{}/proposals/{}/reject",
+                Uuid::nil(),
+                Uuid::nil()
+            ),
+            Some(json!({"reason": "roles"})),
+        ),
         _ => panic!("no fixture for {method} {path}: add one to tests/roles.rs"),
     }
 }

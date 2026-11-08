@@ -110,6 +110,60 @@ impl ApiError {
         }
     }
 
+    /// An adapter with no model-list endpoint: guessing a URL for one would be
+    /// the one place this route could reach somewhere it should not.
+    pub fn upstream_models_unsupported() -> ApiError {
+        Self::new(
+            StatusCode::CONFLICT,
+            "upstream_models_unsupported",
+            "该类型的上游不提供模型列表，请直接填写模型名称",
+        )
+    }
+
+    /// The upstream could not be reached: a blocked or unresolvable host, or a
+    /// connection that failed. `hint` names what an operator would change, and
+    /// is scrubbed by its caller.
+    pub fn upstream_unreachable(hint: impl Into<String>) -> ApiError {
+        ApiError {
+            details: vec![Detail {
+                path: "/upstream".to_string(),
+                message: hint.into(),
+            }],
+            ..Self::new(
+                StatusCode::BAD_GATEWAY,
+                "upstream_unreachable",
+                "无法连接该上游，请检查地址与网络",
+            )
+        }
+    }
+
+    /// The upstream did not answer within the route's bound.
+    pub fn upstream_timeout() -> ApiError {
+        Self::new(
+            StatusCode::GATEWAY_TIMEOUT,
+            "upstream_timeout",
+            "该上游响应超时",
+        )
+    }
+
+    /// The upstream answered something that is not a model list: a non-2xx, a
+    /// `3xx`, an oversized body or unparseable JSON. The detail is the
+    /// upstream's own words after scrubbing, never a raw body and never a
+    /// status it chose.
+    pub fn upstream_bad_response(detail: impl Into<String>) -> ApiError {
+        ApiError {
+            details: vec![Detail {
+                path: "/upstream".to_string(),
+                message: detail.into(),
+            }],
+            ..Self::new(
+                StatusCode::BAD_GATEWAY,
+                "upstream_bad_response",
+                "该上游的回答不是有效的模型列表",
+            )
+        }
+    }
+
     /// A 409 with its own code, such as `name_taken`.
     pub fn conflict(code: &'static str, message: impl Into<String>) -> ApiError {
         Self::new(StatusCode::CONFLICT, code, message)
@@ -130,6 +184,56 @@ impl ApiError {
     /// A retired group, which takes no rate and cannot be designated.
     pub fn group_retired() -> ApiError {
         Self::new(StatusCode::CONFLICT, "group_retired", "该分组已停用")
+    }
+
+    /// A public model still named by something live, with what names it:
+    /// `counts: {tenants, keys, channels}`.
+    pub fn public_model_in_use(counts: serde_json::Value) -> ApiError {
+        ApiError {
+            counts: Some(Box::new(counts)),
+            ..Self::new(
+                StatusCode::CONFLICT,
+                "public_model_in_use",
+                "该公共模型仍在使用中，无法停用",
+            )
+        }
+    }
+
+    /// A provider key some channel model names, with
+    /// `counts: {public_models}`: the same `in_use` every delete answers in,
+    /// in the terms the operator used.
+    pub fn provider_key_served(counts: serde_json::Value) -> ApiError {
+        ApiError {
+            counts: Some(Box::new(counts)),
+            ..Self::new(StatusCode::CONFLICT, "in_use", "该资源仍被引用，无法删除")
+        }
+    }
+
+    /// A retired public model, which cannot be regenerated or retired again.
+    pub fn public_model_retired() -> ApiError {
+        Self::new(
+            StatusCode::CONFLICT,
+            "public_model_retired",
+            "该公共模型已停用",
+        )
+    }
+
+    /// A public model name a live model already carries.
+    pub fn public_model_name_taken() -> ApiError {
+        ApiError::validation(vec![Detail {
+            path: "/name".to_string(),
+            message: "已有同名模型；请先删除或改名，或改用该模型现有的名称".to_string(),
+        }])
+    }
+
+    /// A proposal of an import that has already been decided, or superseded
+    /// by a newer upload: the review page is showing a stale row.
+    pub fn proposal_state() -> ApiError {
+        Self::new(
+            StatusCode::CONFLICT,
+            "proposal_state",
+            "该提议已被处理，请刷新",
+        )
     }
 
     pub fn in_use(referenced_by: Vec<Referrer>) -> ApiError {
@@ -299,6 +403,10 @@ pub enum BootError {
     UnreadableVersion(String),
     #[error("the built-in price catalogue does not load: {0}")]
     Catalogue(#[from] aisix_pricing::CatalogueError),
+    /// `outbound.ssrf_protection.allowed_hosts` has an entry that does not
+    /// parse, so the upstream-model route could judge nothing.
+    #[error("outbound.ssrf_protection: {0}")]
+    OutboundPolicy(String),
 }
 
 #[cfg(test)]
@@ -390,6 +498,28 @@ mod tests {
             without_message(body),
             json!({"code": "group_retired"}),
             "a refusal with no figures carries no counts"
+        );
+
+        // A public model's two refusals: the retire carries what holds it,
+        // the served account the plain `in_use` every delete answers in.
+        let (status, body) = answer(ApiError::public_model_in_use(
+            json!({"tenants": 1, "keys": 0, "channels": 2}),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            without_message(body),
+            json!({
+                "code": "public_model_in_use",
+                "counts": {"tenants": 1, "keys": 0, "channels": 2},
+            })
+        );
+        let (status, body) =
+            answer(ApiError::provider_key_served(json!({"public_models": 2}))).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            without_message(body),
+            json!({"code": "in_use", "counts": {"public_models": 2}})
         );
 
         let (status, body) = answer(ApiError::internal("pw-7c1")).await;

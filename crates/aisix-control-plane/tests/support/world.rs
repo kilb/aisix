@@ -96,20 +96,47 @@ pub async fn seed_tenant(cp: &TestCp, admin: &OperatorSession) -> Uuid {
     Uuid::parse_str(&text(&tenant, "/id")).expect("a tenant id")
 }
 
-/// A key of `tenant`, bound to `member` when given, minted by an operator;
-/// its id.
+/// The group a seeded tenant is assigned by the first-boot defaults
+/// (`settings::TenantDefaults::first_boot`), which every seeded tenant and
+/// its keys therefore use.
+pub const SHARED_GROUP: &str = "shared";
+
+/// The id of the live group `name`, which a migration or a `POST
+/// /admin/provider-groups` created.
+pub async fn group_id(cp: &TestCp, name: &str) -> Uuid {
+    sqlx::query_scalar("SELECT id FROM provider_groups WHERE name = $1 AND retired_at IS NULL")
+        .bind(name)
+        .fetch_one(cp.db().pool())
+        .await
+        .unwrap_or_else(|e| panic!("group {name}: {e}"))
+}
+
+/// A key of `tenant`, bound to `member` when given, minted by an operator
+/// and naming group `group`; its id.
+pub async fn seed_key_in_group(
+    cp: &TestCp,
+    admin: &OperatorSession,
+    tenant: Uuid,
+    member: Option<Uuid>,
+    group: &str,
+) -> String {
+    let mut body = json!({"label": "pricing-7c1", "group_id": group_id(cp, group).await});
+    if let Some(member) = member {
+        body["member_id"] = json!(member);
+    }
+    let key = create(cp, admin, &format!("/admin/tenants/{tenant}/keys"), body).await;
+    text(&key, "/key/id")
+}
+
+/// A key of `tenant`, bound to `member` when given, minted by an operator
+/// and naming the group a seeded tenant is assigned; its id.
 pub async fn seed_key(
     cp: &TestCp,
     admin: &OperatorSession,
     tenant: Uuid,
     member: Option<Uuid>,
 ) -> String {
-    let mut body = json!({"label": "pricing-7c1"});
-    if let Some(member) = member {
-        body["member_id"] = json!(member);
-    }
-    let key = create(cp, admin, &format!("/admin/tenants/{tenant}/keys"), body).await;
-    text(&key, "/key/id")
+    seed_key_in_group(cp, admin, tenant, member, SHARED_GROUP).await
 }
 
 /// A control plane with an operator, a gateway, a tenant, one of its members
@@ -289,4 +316,14 @@ pub async fn insert_unpriced_charges(
     .await
     .expect("insert their charges");
     tx.commit().await.expect("commit");
+}
+
+/// A public model named `name`, created as `admin`; its id.
+///
+/// A public model on its own writes no document: tick it on an upstream
+/// account through `PUT /admin/provider-keys/{key}/channel-models/{id}` for
+/// the routing document to exist.
+pub async fn public_model(cp: &TestCp, admin: &OperatorSession, name: &str) -> Uuid {
+    let body = create(cp, admin, "/admin/public-models", json!({"name": name})).await;
+    Uuid::parse_str(&text(&body, "/id")).expect("a public model id")
 }

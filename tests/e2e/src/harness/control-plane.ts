@@ -140,8 +140,13 @@ class CpClient {
     return this.request("POST", path, body);
   }
 
-  put(path: string, body: unknown, version: number): Promise<CpResponse> {
-    return this.request("PUT", path, body, { "if-match": `"${version}"` });
+  async put(path: string, body: unknown, version?: number): Promise<CpResponse> {
+    return this.request(
+      "PUT",
+      path,
+      body,
+      version === undefined ? {} : { "if-match": `"${version}"` },
+    );
   }
 
   patch(path: string, body: unknown, version?: number): Promise<CpResponse> {
@@ -181,6 +186,28 @@ export class CpAdmin extends CpClient {
     if (res.status !== 201) throw new Error(`creating ${kind} answered ${res.status}: ${res.text}`);
     return res.body;
   }
+
+  /**
+   * Creates a provider group and returns its view, whose `id` a key names as
+   * `group_id`: every key names exactly one group. A case that routes a key
+   * to one group gives that group a provider account (`groups`) and mints
+   * the key into it.
+   */
+  async createGroup(
+    name: string,
+    displayName: string,
+    cnyPerUsd = "7.2",
+  ): Promise<Json> {
+    const res = await this.post("/admin/provider-groups", {
+      name,
+      display_name: displayName,
+      description: "e2e 分组",
+      default_cny_per_usd: cnyPerUsd,
+    });
+    if (res.status !== 201) throw new Error(`creating group ${name} answered ${res.status}: ${res.text}`);
+    return res.body;
+  }
+
 
   /** The gateway instance running under credential `dpId`, if it has reported. */
   async instance(dpId: string): Promise<Json | undefined> {

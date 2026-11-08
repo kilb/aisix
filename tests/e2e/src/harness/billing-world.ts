@@ -144,6 +144,8 @@ export async function billingWorld(opts: BillingWorldOptions = {}): Promise<Bill
         );
         check(`granting tenant ${name}`, granted, 200);
         await opts.setup?.(id);
+        // The tenant's one assigned group is `shared`, by the first boot's
+        // defaults, so its key takes it without naming it.
         const minted = await stack.admin.post(`/admin/tenants/${id}/keys`, { label: `${name} key` });
         check(`minting a key of ${name}`, minted, 201);
         const key: string = minted.body.plaintext;
@@ -165,4 +167,11 @@ export async function billingWorld(opts: BillingWorldOptions = {}): Promise<Bill
     await upstream.close();
     throw err;
   }
+}
+
+/** Ticks public model `publicModelId` on upstream account `providerKeyId`, which writes its documents. */
+export async function createChannelModel(cp: ControlPlaneStack, providerKeyId: string, publicModelId: string, body: Record<string, unknown> = {}): Promise<Json> {
+  const res = await cp.admin.put(`/admin/provider-keys/${providerKeyId}/channel-models/${publicModelId}`, body);
+  check(`ticking a public model on an account`, res, 200);
+  return res.body;
 }
