@@ -220,6 +220,19 @@ pub async fn post(
     conn: &mut PgConnection,
     postings: &[Posting<'_>],
 ) -> Result<Vec<LedgerEntry>, DbError> {
+    post_flagging(conn, postings, &[]).await
+}
+
+/// [`post`], also flagging the accounts of the tenants `flag` for the
+/// settler (`marks_dirty`) in the same update of each account. Usage intake
+/// flags this way and never with an update of its own: an account row
+/// updated a second time in one transaction has its tenant row key-shared by
+/// the foreign key's check, and intake must never wait on a tenant row.
+pub async fn post_flagging(
+    conn: &mut PgConnection,
+    postings: &[Posting<'_>],
+    flag: &[Uuid],
+) -> Result<Vec<LedgerEntry>, DbError> {
     if postings.is_empty() {
         return Ok(Vec::new());
     }
@@ -270,7 +283,8 @@ pub async fn post(
     entries.sort_by_key(|entry| entry.seq);
     sqlx::query(
         "UPDATE billing_accounts AS a \
-         SET balance_micro_usd = a.balance_micro_usd + d.delta, updated_at = now() \
+         SET balance_micro_usd = a.balance_micro_usd + d.delta, \
+             marks_dirty = a.marks_dirty OR a.tenant_id = ANY($3), updated_at = now() \
          FROM (SELECT p.tenant_id, SUM(p.amount)::bigint AS delta \
                FROM unnest($1::uuid[], $2::bigint[]) AS p(tenant_id, amount) \
                GROUP BY p.tenant_id) AS d \
@@ -278,6 +292,7 @@ pub async fn post(
     )
     .bind(&tenant_ids)
     .bind(&amounts)
+    .bind(flag)
     .execute(conn)
     .await?;
     Ok(entries)

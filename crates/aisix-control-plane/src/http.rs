@@ -349,6 +349,35 @@ pub const ROUTE_ROLES: &[(&str, &str, MinRole)] = &[
         "/api/billing/balance",
         MinRole::Member(&[MemberRole::Owner, MemberRole::Admin, MemberRole::Billing]),
     ),
+    // The ledger and its per-period totals.
+    (
+        "GET",
+        "/admin/tenants/{id}/billing/ledger",
+        MinRole::Op(OperatorRole::Viewer),
+    ),
+    (
+        "GET",
+        "/admin/tenants/{id}/billing/summary",
+        MinRole::Op(OperatorRole::Viewer),
+    ),
+    (
+        "GET",
+        "/api/billing/ledger",
+        MinRole::Member(&[MemberRole::Owner, MemberRole::Admin, MemberRole::Billing]),
+    ),
+    (
+        "GET",
+        "/api/billing/summary",
+        MinRole::Member(&[MemberRole::Owner, MemberRole::Admin, MemberRole::Billing]),
+    ),
+    // Call log and usage summaries.
+    ("GET", "/api/usage/calls", MinRole::Member(EVERY_MEMBER)),
+    ("GET", "/api/usage/summary", MinRole::Member(EVERY_MEMBER)),
+    (
+        "GET",
+        "/admin/tenants/{id}/usage/summary",
+        MinRole::Op(OperatorRole::Viewer),
+    ),
     // Top-ups: tenants request them, operators decide them.
     (
         "GET",
@@ -535,6 +564,22 @@ pub fn browser_router(state: AppState) -> Router {
             get(billing::accounts::get).patch(billing::accounts::set_credit_limit),
         )
         .route("/api/billing/balance", get(billing::accounts::balance))
+        .route(
+            "/admin/tenants/{id}/billing/ledger",
+            get(billing::statements::admin_ledger),
+        )
+        .route(
+            "/admin/tenants/{id}/billing/summary",
+            get(billing::statements::admin_summary),
+        )
+        .route("/api/billing/ledger", get(billing::statements::ledger))
+        .route("/api/billing/summary", get(billing::statements::summary))
+        .route("/api/usage/calls", get(billing::calls::list_calls))
+        .route("/api/usage/summary", get(billing::calls::tenant_summary))
+        .route(
+            "/admin/tenants/{id}/usage/summary",
+            get(billing::calls::admin_summary),
+        )
         .route("/admin/billing/topups", get(billing::topups::admin_list))
         .route(
             "/admin/billing/topups/{id}/approve",

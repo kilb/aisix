@@ -15,7 +15,7 @@
 //! (`tenants::lock_billing`, so the account is held and the balance cannot
 //! move underneath): at the billing step of every tenant projection, and
 //! from [`settle`]. Usage intake never writes a document, and never takes
-//! the resources lock: it only flags the account ([`flag_crossings`]) when a
+//! the resources lock: it only flags the account ([`crossings`]) when a
 //! batch moves its balance across the floor, and the settler
 //! (`billing::settler`) settles the flag once the batch has committed.
 
@@ -122,18 +122,19 @@ pub async fn project(
     Ok(())
 }
 
-/// Flags each account of `after` whose balance has crossed its tenant's
-/// floor since its mark was last written (or that has never had one), and
-/// notifies [`DIRTY_CHANNEL`] once when it flagged any. `after` holds the
-/// accounts a batch posted to, each with the balance its last entry left;
-/// the caller holds their locks.
+/// The tenants among `after` whose accounts are to be flagged: each one
+/// whose balance has crossed its tenant's floor since its mark was last
+/// written (or that has never had one). `after` holds the accounts a batch
+/// posts to, each with the balance its last entry will leave; the caller
+/// holds their locks, and sets the flags in the posting's own update
+/// (`ledger::post_flagging`), then calls [`notify`].
 ///
-/// Each tenant's billing mode is read here, after the account lock: a mode
-/// change holds that lock too, so the mode read is current. The internal
-/// tenant is never flagged.
-pub async fn flag_crossings(conn: &mut PgConnection, after: &[Account]) -> Result<(), DbError> {
+/// Each tenant's billing mode is read here with a plain read, after the
+/// account lock: a mode change holds that lock too, so the mode read is
+/// current. The internal tenant is never flagged.
+pub async fn crossings(conn: &mut PgConnection, after: &[Account]) -> Result<Vec<Uuid>, DbError> {
     if after.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let ids: Vec<Uuid> = after.iter().map(|a| a.tenant_id).collect();
     let tenants: Vec<(Uuid, bool, bool)> = sqlx::query_as(
@@ -165,13 +166,11 @@ pub async fn flag_crossings(conn: &mut PgConnection, after: &[Account]) -> Resul
         })
         .map(|account| account.tenant_id)
         .collect();
-    if dirty.is_empty() {
-        return Ok(());
-    }
-    sqlx::query("UPDATE billing_accounts SET marks_dirty = true WHERE tenant_id = ANY($1)")
-        .bind(&dirty)
-        .execute(&mut *conn)
-        .await?;
+    Ok(dirty)
+}
+
+/// Wakes every instance's settler, once this transaction commits.
+pub async fn notify(conn: &mut PgConnection) -> Result<(), DbError> {
     sqlx::query("SELECT pg_notify($1, '')")
         .bind(DIRTY_CHANNEL)
         .execute(conn)
@@ -194,16 +193,16 @@ pub async fn settle(db: &Db, ctx: &WriteCtx, tenant_id: Uuid) -> Result<(), ApiE
 }
 
 /// Takes tenant `tenant_id`'s billing lock and projects its marks, unless
-/// it is pending: a pending tenant projects nothing, and its approval writes
-/// the marks. A pending tenant's flag is cleared, since nothing would
-/// settle it before then.
+/// it is pending or the internal tenant. A pending tenant projects nothing,
+/// and its approval writes the marks; the internal tenant is never marked.
+/// Either one's flag is cleared, so that no pass finds it again.
 pub(crate) async fn settle_locked(
     conn: &mut PgConnection,
     ctx: &WriteCtx,
     tenant_id: Uuid,
 ) -> Result<(), ApiError> {
     let (tenant, _) = tenants::lock_billing(&mut *conn, tenant_id).await?;
-    if tenant.status == TenantStatus::Pending {
+    if tenant.status == TenantStatus::Pending || tenant.is_internal {
         sqlx::query("UPDATE billing_accounts SET marks_dirty = false WHERE tenant_id = $1")
             .bind(tenant_id)
             .execute(conn)

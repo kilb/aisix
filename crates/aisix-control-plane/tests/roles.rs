@@ -178,6 +178,28 @@ fn fixture(method: &str, path: &str, target: &SeededOperator) -> (String, Option
             format!("/admin/tenants/{}/billing", Uuid::nil()),
             (method == "PATCH").then(|| json!({"credit_limit_usd": "1.00"})),
         ),
+        // The ledger and its totals. The tenant matches nothing: 404 once
+        // the role check passed.
+        ("GET", "/admin/tenants/{id}/billing/ledger") => (
+            format!("/admin/tenants/{}/billing/ledger", Uuid::nil()),
+            None,
+        ),
+        ("GET", "/admin/tenants/{id}/billing/summary") => (
+            format!(
+                "/admin/tenants/{}/billing/summary?group=day\
+                 &from=2026-01-01T00:00:00Z&to=2026-01-01T01:00:00Z",
+                Uuid::nil()
+            ),
+            None,
+        ),
+        // The tenant matches nothing: 404 once the role check passed.
+        ("GET", "/admin/tenants/{id}/usage/summary") => (
+            format!(
+                "/admin/tenants/{}/usage/summary?group=day&from=2026-01-01T00:00:00Z&to=2026-01-02T00:00:00Z",
+                Uuid::nil()
+            ),
+            None,
+        ),
         // Top-ups. The top-up matches nothing: 404 once the role check
         // passed, so nothing is decided.
         ("GET", "/admin/billing/topups") => (path.to_string(), None),
