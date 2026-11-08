@@ -18,6 +18,7 @@ import {
 } from "../../lib/api";
 import { messageFor, problemAt, warningText } from "../../lib/errors";
 import { errorText } from "../../lib/fmt";
+import { catalogueUpdateWords } from "../../lib/baselineUpdate";
 import { fmtUtc } from "../../lib/money";
 import { Button } from "../../ui/Button";
 import { DataTable, Loading } from "../../ui/DataTable";
@@ -73,6 +74,8 @@ export function BaselineSourceBadge({ revision }: { revision: BaselineRevision }
       );
     }
     case "third_party": {
+      // The provider page the dataset cites: what the attestation was checked
+      // against, so it is shown beside the date and left out when absent.
       const s = source.source;
       return (
         <div className="baseline-source">
@@ -82,7 +85,23 @@ export function BaselineSourceBadge({ revision }: { revision: BaselineRevision }
           </span>
           <span className="cell-note">
             <span className="tabular">核对日期 {s.prices_checked ?? "未提供"}</span>
-            {who && <> · 确认人 {who}</>}
+            {s.pricing_url && (
+              <>
+                {" · "}
+                <a href={s.pricing_url} target="_blank" rel="noreferrer">
+                  核对页面
+                </a>
+              </>
+            )}
+          </span>
+          <span className="cell-note">
+            {who && <>确认人 {who}</>}
+            {s.attested_at && (
+              <>
+                {who && " · "}
+                <span className="tabular">确认于 {fmtUtc(s.attested_at)}</span>
+              </>
+            )}
           </span>
         </div>
       );
@@ -190,9 +209,7 @@ export function Baselines({ canEdit, onGoto }: TabProps) {
                           {r.name}
                         </button>
                         {r.catalogue_update && (
-                          <span className="cell-note baseline-update">
-                            官方目录已更新（目录 {r.catalogue_update.catalogue_version}）
-                          </span>
+                          <span className="cell-note baseline-update">{catalogueUpdateWords(r.catalogue_update).row}</span>
                         )}
                       </td>
                       <td className="num">
@@ -262,7 +279,7 @@ function BaselinePanel({
   const [cardOk, setCardOk] = useState(true);
   const [note, setNote] = useState("");
   const resolver = useRef<EffectiveResolver>({ immediate: true, stamp: () => new Date().toISOString() });
-  const [entry, setEntry] = useState("");
+  const [entry, setEntry] = useState(row.catalogue_update?.entry_key ?? "");
   const [saving, setSaving] = useState(false);
   const [details, setDetails] = useState<Detail[]>([]);
   const [failure, setFailure] = useState<string | null>(null);
@@ -364,7 +381,7 @@ function BaselinePanel({
           ) : (
             <>
               <RateCardEditor value={card} onChange={setCard} details={details} onValidity={setCardOk} />
-              <Field label="说明" hint="写明这份价格是从哪里抄来的，最迟 500 字" error={problemAt(details, (p) => p === "/note")}>
+              <Field label="说明" hint="写明这份价格是从哪里抄来的，最多 500 字" error={problemAt(details, (p) => p === "/note")}>
                 {(aria) => (
                   <textarea {...aria} rows={3} autoComplete="off" value={note} onChange={(e) => setNote(e.target.value)} />
                 )}
@@ -459,7 +476,7 @@ function BaselinePanel({
         )}
         {row.catalogue_update && (
           <div className="note warn" role="status">
-            官方目录已更新（{row.catalogue_update.catalogue_version}，条目 {row.catalogue_update.entry_key}）：保存一份新的官方目录基准价即可确认。
+            {catalogueUpdateWords(row.catalogue_update).panel}
           </div>
         )}
       </section>

@@ -54,7 +54,9 @@ async function openBaselines(page: Page, who = stack.operator): Promise<void> {
   await login(page, who.email, who.password);
   await page.locator('[data-tab="pricing"]').click();
   await page.getByRole("button", { name: "基准价", exact: true }).click();
-  await expect(page.getByRole("table", { name: "基准价" })).toBeVisible();
+  // The heading is up at once; the list under it is still being read.
+  await expect(page.getByRole("heading", { name: "基准价" })).toBeVisible();
+  await expect(page.locator("main").getByText("载入中…")).toHaveCount(0);
 }
 
 function table(page: Page): Locator {
@@ -73,6 +75,24 @@ async function openModel(page: Page, name: string): Promise<Locator> {
   await expect(panel).toBeVisible();
   return panel;
 }
+
+test("从基准价打开「导入审核」会切换当前分区", async ({ page }) => {
+  // Named so it sorts after the order test's fixture: it leaves an unpriced
+  // model behind, and that test names the row it expects first.
+  await newModel("zz-nav-base", "gpt-5.4-nano");
+  await openBaselines(page);
+  const switchTo = (name: string) =>
+    page.getByRole("group", { name: "价格分区" }).getByRole("button", { name, exact: true });
+  await expect(switchTo("基准价")).toHaveAttribute("aria-pressed", "true");
+
+  await page.getByRole("button", { name: /导入审核/ }).click();
+
+  // Nothing has registered `imports` yet, so the first section stands in. What
+  // must hold either way is that the click switches away from 基准价.
+  await expect(switchTo("基准价")).toHaveAttribute("aria-pressed", "false");
+  await expect(switchTo("平台价格")).toHaveAttribute("aria-pressed", "true");
+  await expect(page.getByRole("table", { name: "基准价" })).toHaveCount(0);
+});
 
 test("未定价的模型排在最前，并标为未定价", async ({ page }) => {
   // Names chosen so that the alphabet says the opposite of the order under test.
