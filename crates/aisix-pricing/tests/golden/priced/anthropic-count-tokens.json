@@ -1,19 +1,21 @@
 [
   {
+    "baseline": null,
     "charge": 0,
     "cost": null,
     "discount": null,
-    "engine_version": 1,
+    "engine_version": 2,
     "estimated": false,
     "event_id": "evt-anthropic-count-tokens-1",
+    "group_id": "group-golden",
     "lines": [],
     "long_context_above": null,
     "occurred_at": "2026-11-06T00:00:00Z",
     "outcome": "nothing_to_bill",
     "price_instant": "2026-11-06T00:00:00Z",
+    "rate": null,
     "requested_model_id": "model-anthropic-count-tokens",
     "requested_service_tier": null,
-    "sell": null,
     "service_tier": null,
     "tenant_id": "tenant-golden",
     "warnings": []

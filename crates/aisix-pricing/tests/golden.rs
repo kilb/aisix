@@ -11,18 +11,19 @@
 //! - `golden/priced/<family>.json` is every row's `PricedEvent`. This file
 //!   rewrites it with `UPDATE_GOLDEN=1`; otherwise a priced event that
 //!   differs from it fails.
-//! - `golden/book.json` prices every family's model at one card, with no
-//!   tenant discount and no cost price. Its `default` base rates are the
-//!   `Model.cost` every seeded model carries, so a row's `cost_usd` is the
-//!   gateway's own figure for the same price.
+//! - `golden/book.json` prices every family's model at one baseline card,
+//!   for one group at a rate of 1.0000 CNY per USD, with no tenant discount
+//!   and no cost price. Its `default` base rates are the `Model.cost` every
+//!   seeded model carries, so a row's `cost_usd` is the gateway's own figure
+//!   for the same price.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use aisix_core::spend_micro_usd;
 use aisix_pricing::{
-    price_event, BillableUsage, Catalogue, Dimension, Outcome, PriceBook, PriceRows, PricedEvent,
-    ServiceTier,
+    price_event, BillableUsage, Catalogue, Dimension, Outcome, Payer, PriceBook, PriceRows,
+    PricedEvent, ServiceTier,
 };
 use chrono::{DateTime, Utc};
 use serde_json::Value;
@@ -129,14 +130,19 @@ fn received_at() -> DateTime<Utc> {
     RECEIVED_AT.parse().expect("a valid instant")
 }
 
-/// Every row of `family`, priced, beside the row it priced.
+/// Every row of `family`, priced, beside the row it priced. The payer is the
+/// tenant the goldens are stamped with, whose key names the book's group.
 fn priced(book: &PriceBook, family: &str) -> Vec<(Value, PricedEvent)> {
     wire(family)
         .into_iter()
         .map(|row| {
             let usage: BillableUsage = serde_json::from_value(row.clone())
                 .unwrap_or_else(|e| panic!("{family}: not a usage row: {e}: {row}"));
-            let priced = price_event(book, &usage, received_at())
+            let payer = Payer {
+                tenant_id: usage.team_id.clone(),
+                group_id: Some("group-golden".into()),
+            };
+            let priced = price_event(book, &usage, &payer, received_at())
                 .unwrap_or_else(|e| panic!("{family}: unpriced ({}): {e}", e.code()));
             (row, priced)
         })

@@ -1,10 +1,9 @@
 {
-  "sell": [
+  "baselines": [
     {
       "revision_id": 1,
-      "engine_version": 1,
+      "engine_version": 2,
       "model_id": "model-openai-chat",
-      "tenant_id": null,
       "effective_from": "2026-01-01T00:00:00Z",
       "card": {
         "default": {
@@ -80,9 +79,8 @@
     },
     {
       "revision_id": 2,
-      "engine_version": 1,
+      "engine_version": 2,
       "model_id": "model-openai-responses",
-      "tenant_id": null,
       "effective_from": "2026-01-01T00:00:00Z",
       "card": {
         "default": {
@@ -158,9 +156,8 @@
     },
     {
       "revision_id": 3,
-      "engine_version": 1,
+      "engine_version": 2,
       "model_id": "model-anthropic-messages",
-      "tenant_id": null,
       "effective_from": "2026-01-01T00:00:00Z",
       "card": {
         "default": {
@@ -236,9 +233,8 @@
     },
     {
       "revision_id": 4,
-      "engine_version": 1,
+      "engine_version": 2,
       "model_id": "model-gemini-chat",
-      "tenant_id": null,
       "effective_from": "2026-01-01T00:00:00Z",
       "card": {
         "default": {
@@ -314,9 +310,8 @@
     },
     {
       "revision_id": 5,
-      "engine_version": 1,
+      "engine_version": 2,
       "model_id": "model-gemini-cached",
-      "tenant_id": null,
       "effective_from": "2026-01-01T00:00:00Z",
       "card": {
         "default": {
@@ -392,9 +387,8 @@
     },
     {
       "revision_id": 6,
-      "engine_version": 1,
+      "engine_version": 2,
       "model_id": "model-bedrock-converse-chat",
-      "tenant_id": null,
       "effective_from": "2026-01-01T00:00:00Z",
       "card": {
         "default": {
@@ -470,9 +464,8 @@
     },
     {
       "revision_id": 7,
-      "engine_version": 1,
+      "engine_version": 2,
       "model_id": "model-openai-embeddings",
-      "tenant_id": null,
       "effective_from": "2026-01-01T00:00:00Z",
       "card": {
         "default": {
@@ -548,9 +541,8 @@
     },
     {
       "revision_id": 8,
-      "engine_version": 1,
+      "engine_version": 2,
       "model_id": "model-anthropic-count-tokens",
-      "tenant_id": null,
       "effective_from": "2026-01-01T00:00:00Z",
       "card": {
         "default": {
@@ -626,9 +618,8 @@
     },
     {
       "revision_id": 9,
-      "engine_version": 1,
+      "engine_version": 2,
       "model_id": "model-openai-cache-write",
-      "tenant_id": null,
       "effective_from": "2026-01-01T00:00:00Z",
       "card": {
         "default": {
@@ -704,9 +695,8 @@
     },
     {
       "revision_id": 10,
-      "engine_version": 1,
+      "engine_version": 2,
       "model_id": "model-gemini-no-total",
-      "tenant_id": null,
       "effective_from": "2026-01-01T00:00:00Z",
       "card": {
         "default": {
@@ -779,6 +769,16 @@
           ]
         }
       }
+    }
+  ],
+  "rates": [
+    {
+      "revision_id": 1,
+      "engine_version": 2,
+      "group_id": "group-golden",
+      "model_id": null,
+      "effective_from": "2026-01-01T00:00:00Z",
+      "cny_per_usd_e4": 10000
     }
   ],
   "cost": [],

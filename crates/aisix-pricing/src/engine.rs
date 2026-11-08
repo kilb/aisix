@@ -4,8 +4,9 @@
 //! [`price_event`] reads one stored row against a [`PriceBook`] and gives
 //! exactly one result: a [`PricedEvent`] (charged, exempt, or nothing to
 //! bill), or a [`PricingError`] that leaves the row unpriced. Every amount
-//! is an integer, and the charge is rounded once, upward, so any amount
-//! above zero charges at least 1 µ$.
+//! is an integer, and the charge is rounded once, upward: the model's USD
+//! baseline list price, times the payer's group rate in CNY per USD, times
+//! the tenant's discount, so any amount above zero charges at least 1 µ¥.
 
 use chrono::{DateTime, TimeDelta, Utc};
 use serde::Serialize;
@@ -50,20 +51,23 @@ const PRICED_IN_OTHER_UNITS: [&str; 7] = [
 #[derive(Serialize, Debug, Clone, PartialEq, Eq)]
 pub struct PricedEvent {
     pub event_id: String,
-    /// The row's `team_id`.
+    /// The payer's tenant, never the row's own `team_id`.
     pub tenant_id: String,
+    /// The group the payer's key names, if it names one.
+    pub group_id: Option<String>,
     pub requested_model_id: String,
     pub occurred_at: DateTime<Utc>,
     /// The instant every price was looked up at:
     /// `min(occurred_at, received_at + 5 min)`.
     pub price_instant: DateTime<Utc>,
     pub outcome: Outcome,
-    /// What the tenant owes; 0 unless `Charged`.
-    pub charge: MicroUsd,
-    /// The sell revision that priced the row.
-    pub sell: Option<SellRef>,
-    /// The discount applied; `None` when an override priced the row or the
-    /// tenant has no discount in effect.
+    /// What the tenant owes in micro-CNY; 0 unless `Charged`.
+    pub charge: MicroCny,
+    /// The baseline that priced the row.
+    pub baseline: Option<BaselineRef>,
+    /// The group rate that priced the row.
+    pub rate: Option<RateRef>,
+    /// The discount applied; `None` when the tenant has none in effect.
     pub discount: Option<DiscountRef>,
     /// The tier whose rates were used.
     pub service_tier: Option<ServiceTier>,
@@ -80,6 +84,18 @@ pub struct PricedEvent {
     pub estimated: bool,
     pub warnings: Vec<PricingWarning>,
     pub engine_version: u32,
+}
+
+/// Who pays for a row: the tenant, and the group its key names.
+///
+/// The tenant is the payer's, never the row's own `team_id`: a row is
+/// priced for whoever its key belongs to, whatever it claims.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Payer {
+    pub tenant_id: String,
+    /// The group the key names. `None`: the key names none, so the row is
+    /// `NoGroup` rather than priced at a guessed rate.
+    pub group_id: Option<String>,
 }
 
 /// What became of a row that priced.
@@ -116,12 +132,20 @@ pub enum Exemption {
     NotModelUsage,
 }
 
-/// The sell revision that priced a row.
+/// The baseline that priced a row.
 #[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SellRef {
+pub struct BaselineRef {
     pub revision_id: i64,
-    /// The tenant's own override priced it, so no discount applied.
-    pub tenant_override: bool,
+}
+
+/// The group rate that priced a row.
+#[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RateRef {
+    pub revision_id: i64,
+    /// The rate in effect, ten-thousandths of a CNY per USD.
+    pub cny_per_usd: CnyPerUsd,
+    /// The model's own override priced it, not the group's default.
+    pub model_override: bool,
 }
 
 /// The discount revision applied to a row.
@@ -170,8 +194,18 @@ pub enum PricingError {
     /// Billable usage with an empty `requested_model_id`.
     #[error("billable usage names no model")]
     UnknownModel,
-    #[error("model {model_id} has no sell price in effect at {at}")]
+    /// The payer's key names no group, so no rate can price the row.
+    #[error("the payer's key names no provider group")]
+    NoGroup,
+    #[error("model {model_id} has no baseline in effect at {at}")]
     MissingPrice { model_id: String, at: DateTime<Utc> },
+    /// No rate is in effect for the payer's group and the requested model.
+    #[error("group {group_id} has no rate for model {model_id} in effect at {at}")]
+    MissingRate {
+        group_id: String,
+        model_id: String,
+        at: DateTime<Utc>,
+    },
     /// The revision in effect cannot be read by this engine; it is listed in
     /// `PriceBook::invalid_revisions`.
     #[error("price revision {revision_id} is in effect and cannot be read by this engine")]
@@ -203,7 +237,9 @@ impl PricingError {
             PricingError::MissingEventId => "missing_event_id",
             PricingError::UnknownTenant => "unknown_tenant",
             PricingError::UnknownModel => "unknown_model",
+            PricingError::NoGroup => "no_group",
             PricingError::MissingPrice { .. } => "missing_price",
+            PricingError::MissingRate { .. } => "missing_rate",
             PricingError::InvalidPrice { .. } => "invalid_price",
             PricingError::MissingTierPrice { .. } => "missing_tier_price",
             PricingError::MissingDimensionPrice { .. } => "missing_dimension_price",
@@ -221,10 +257,11 @@ impl PricingError {
 ///
 /// A row names two models: the entry the caller addressed
 /// (`requested_model_id`) and the upstream that served it
-/// (`upstream_provider`, `upstream_model`, `provider_key_id`). The **sell**
-/// price keys on the requested entry and the **cost** on the dispatched
-/// upstream, so one platform model costs a tenant the same whichever channel
-/// served it. By model shape:
+/// (`upstream_provider`, `upstream_model`, `provider_key_id`). The
+/// **baseline** keys on the requested entry, the **rate** on the payer's
+/// group and the requested entry, and the **cost** on the dispatched
+/// upstream, so one platform model costs a tenant what its group charges
+/// whichever channel served it. By model shape:
 ///
 /// - direct and embedding models are one entry, so both keys name it;
 /// - a routing or semantic group bills the group's price whichever member
@@ -249,24 +286,28 @@ impl PricingError {
 ///    refused, never clamped.
 /// 6. With every quantity 0, a successful operation priced in other units is
 ///    `UnpricedOperation`; any other row is `NothingToBill`, with no lookup.
-/// 7. Billable usage without a tenant is `UnknownTenant`, and without a
-///    model `UnknownModel`.
-/// 8. The sell price in effect for that tenant and model: none is
-///    `MissingPrice`, an unreadable revision `InvalidPrice`.
-/// 9. The rates are the served tier's (`batch` for a batch row), at the band
-///    the whole prompt selects, cache reads and writes included. A tier the
-///    card lacks is `MissingTierPrice`, never another tier's rates. When the
-///    caller requested a tier and the upstream reported none, the row is
-///    billed at `default` and warned `ServedTierUnreported`; a batch row is
-///    billed at `batch` and not warned.
-/// 10. Each dimension with a quantity is a line at its rate. A quantity the
+/// 7. Without a payer tenant the row is `UnknownTenant`, and without a model
+///    `UnknownModel`. A payer whose key names no group is `NoGroup`.
+/// 8. The model's baseline in effect: none is `MissingPrice`, an unreadable
+///    revision `InvalidPrice`.
+/// 9. The payer's group rate for that model in effect, its own override or
+///    the group's default: none is `MissingRate`, an unreadable revision
+///    `InvalidPrice`.
+/// 10. The rates are the served tier's (`batch` for a batch row), at the band
+///     the whole prompt selects, cache reads and writes included. A tier the
+///     card lacks is `MissingTierPrice`, never another tier's rates. When the
+///     caller requested a tier and the upstream reported none, the row is
+///     billed at `default` and warned `ServedTierUnreported`; a batch row is
+///     billed at `batch` and not warned.
+/// 11. Each dimension with a quantity is a line at its rate. A quantity the
 ///     rates carry no rate for, even by fallback, is `MissingDimensionPrice`:
 ///     the upstream charged for it, so it is never billed at nothing.
-/// 11. The tenant's discount in effect applies, unless its own override
-///     priced the row; an unreadable discount revision is `InvalidPrice`.
-/// 12. The charge is `⌈Σ quantity × rate × (10000 − bps) / 10¹⁰⌉` µ$: the
-///     one rounding, upward, with the discount inside it.
-/// 13. The cost is the dispatched upstream's cost price at the same tier and
+/// 12. The tenant's discount in effect always applies; an unreadable
+///     discount revision is `InvalidPrice`.
+/// 13. The charge is
+///     `⌈Σ quantity × rate × cny_per_usd_e4 × (10000 − bps) / 10¹⁴⌉` µ¥: the
+///     one rounding, upward, with the rate and the discount inside it.
+/// 14. The cost is the dispatched upstream's cost price at the same tier and
 ///     band, `⌈Σ quantity × rate / 10⁶⌉` µ$, with no discount and no
 ///     warnings. A tier it lacks, a quantity it has no rate for, or an
 ///     unreadable cost revision leaves the cost unknown, never a cost that
@@ -274,6 +315,7 @@ impl PricingError {
 pub fn price_event(
     book: &PriceBook,
     usage: &BillableUsage,
+    payer: &Payer,
     received_at: DateTime<Utc>,
 ) -> Result<PricedEvent, PricingError> {
     let u = usage;
@@ -296,11 +338,11 @@ pub fn price_event(
 
     if u.cache_status == "hit" {
         let exempt = Outcome::Exempt(Exemption::ResponseCacheHit);
-        return Ok(unbilled(u, price_instant, exempt, warnings));
+        return Ok(unbilled(u, payer, price_instant, exempt, warnings));
     }
     if NOT_MODEL_USAGE.contains(&u.operation.as_str()) {
         let exempt = Outcome::Exempt(Exemption::NotModelUsage);
-        return Ok(unbilled(u, price_instant, exempt, warnings));
+        return Ok(unbilled(u, payer, price_instant, exempt, warnings));
     }
 
     let q = quantities(u).map_err(PricingError::InconsistentUsage)?;
@@ -311,16 +353,19 @@ pub fn price_event(
             return Err(PricingError::UnpricedOperation(u.operation.clone()));
         }
         let nothing = Outcome::NothingToBill;
-        return Ok(unbilled(u, price_instant, nothing, warnings));
+        return Ok(unbilled(u, payer, price_instant, nothing, warnings));
     }
 
-    if u.team_id.is_empty() {
+    if payer.tenant_id.is_empty() {
         return Err(PricingError::UnknownTenant);
     }
     if u.requested_model_id.is_empty() {
         return Err(PricingError::UnknownModel);
     }
-    let sell = match book.sell(&u.team_id, &u.requested_model_id, price_instant) {
+    let Some(group_id) = &payer.group_id else {
+        return Err(PricingError::NoGroup);
+    };
+    let baseline = match book.baseline(&u.requested_model_id, price_instant) {
         None => {
             return Err(PricingError::MissingPrice {
                 model_id: u.requested_model_id.clone(),
@@ -328,13 +373,24 @@ pub fn price_event(
             })
         }
         Some(Err(revision_id)) => return Err(PricingError::InvalidPrice { revision_id }),
-        Some(Ok(sell)) => sell,
+        Some(Ok(baseline)) => baseline,
+    };
+    let rate = match book.rate(group_id, &u.requested_model_id, price_instant) {
+        None => {
+            return Err(PricingError::MissingRate {
+                group_id: group_id.clone(),
+                model_id: u.requested_model_id.clone(),
+                at: price_instant,
+            })
+        }
+        Some(Err(revision_id)) => return Err(PricingError::InvalidPrice { revision_id }),
+        Some(Ok(rate)) => rate,
     };
 
     let served = u.service_tier.as_deref();
     let input_total = q.input_total();
     let selected = ServiceTier::normalize(served, u.is_batch)
-        .and_then(|tier| Some((sell.card.select(&tier, input_total)?, tier)));
+        .and_then(|tier| Some((baseline.card.select(&tier, input_total)?, tier)));
     let Some((selected, tier)) = selected else {
         // Every card carries `default`, so an unbatched row lands here only
         // with a tier its upstream reported.
@@ -360,46 +416,43 @@ pub fn price_event(
     let lines = lines_at(selected.rates, &q)
         .map_err(|dimension| PricingError::MissingDimensionPrice { dimension })?;
 
-    let discount = if sell.tenant_override {
-        None
-    } else {
-        match book.discount(&u.team_id, price_instant) {
-            None => None,
-            Some(Ok((revision_id, bps))) => Some(DiscountRef { revision_id, bps }),
-            Some(Err(revision_id)) => return Err(PricingError::InvalidPrice { revision_id }),
-        }
+    let discount = match book.discount(&payer.tenant_id, price_instant) {
+        None => None,
+        Some(Ok((revision_id, bps))) => Some(DiscountRef { revision_id, bps }),
+        Some(Err(revision_id)) => return Err(PricingError::InvalidPrice { revision_id }),
     };
-    // The book admits only 0..=10000 bps.
-    let kept_bps = WHOLE_BPS
-        .checked_sub(discount.map_or(0, |d| u128::from(d.bps)))
-        .ok_or(PricingError::Overflow)?;
-    let charge = ceil_micro_usd(sum(&lines) * kept_bps, PER_MILLION * WHOLE_BPS)?;
+    let charge = charge_micro_cny(&lines, rate.cny, discount.map_or(0, |d| d.bps))?;
 
     let cost = cost_of(book, u, &tier, &q, price_instant)?;
 
     Ok(PricedEvent {
         charge,
-        sell: Some(SellRef {
-            revision_id: sell.revision_id,
-            tenant_override: sell.tenant_override,
+        baseline: Some(BaselineRef {
+            revision_id: baseline.revision_id,
+        }),
+        rate: Some(RateRef {
+            revision_id: rate.revision_id,
+            cny_per_usd: rate.cny,
+            model_override: rate.model_override,
         }),
         discount,
         service_tier: Some(tier),
         long_context_above: selected.band_above,
         lines,
         cost,
-        ..unbilled(u, price_instant, Outcome::Charged, warnings)
+        ..unbilled(u, payer, price_instant, Outcome::Charged, warnings)
     })
 }
 
-/// What `lines` cost a tenant at `cny` CNY per USD after a discount of
-/// `discount_bps`: `⌈Σ quantity × rate × cny × (10000 − bps) / 10¹⁴⌉` µ¥.
+/// What `lines` cost a tenant at `cny_per_usd_e4` ten-thousandths of a CNY
+/// per USD after a discount of `discount_bps`:
+/// `⌈Σ quantity × rate × cny_per_usd_e4 × (10000 − bps) / 10¹⁴⌉` µ¥.
 ///
 /// The CNY rate and the discount are inside the one rounding, upward, so no
 /// factor is rounded on its own and any amount above zero is at least 1 µ¥.
 /// A discount above 10000 bps, and an amount past `i64`, are `Overflow`.
-/// Lines a row produces stay exact in `u128` (`MAX_QUANTITY` in `rates.rs`);
-/// lines past that bound are `Overflow` too, never a wrapped amount.
+/// A line whose product would pass `u128::MAX` is `Overflow`, never a
+/// wrapped amount; any line inside that bound returns its exact charge.
 pub fn charge_micro_cny(
     lines: &[ChargeLine],
     cny: CnyPerUsd,
@@ -454,19 +507,22 @@ fn cost_of(
 /// A result that bills nothing: the row's own facts and nothing priced.
 fn unbilled(
     u: &BillableUsage,
+    payer: &Payer,
     price_instant: DateTime<Utc>,
     outcome: Outcome,
     warnings: Vec<PricingWarning>,
 ) -> PricedEvent {
     PricedEvent {
         event_id: u.event_id.clone(),
-        tenant_id: u.team_id.clone(),
+        tenant_id: payer.tenant_id.clone(),
+        group_id: payer.group_id.clone(),
         requested_model_id: u.requested_model_id.clone(),
         occurred_at: u.occurred_at,
         price_instant,
         outcome,
-        charge: MicroUsd(0),
-        sell: None,
+        charge: MicroCny(0),
+        baseline: None,
+        rate: None,
         discount: None,
         service_tier: None,
         requested_service_tier: u.requested_service_tier.clone(),
@@ -523,7 +579,9 @@ mod tests {
     use proptest::prelude::*;
     use serde_json::{json, Value};
 
-    use crate::book::{CostPriceRow, DiscountRow, PriceRows, SellPriceRow};
+    use crate::book::{
+        BaselineRow, CostPriceRow, DiscountRow, GroupRateRow, PriceRows, RevisionTable,
+    };
     use crate::catalogue::Catalogue;
     use crate::rates::{RateCard, MAX_QUANTITY};
 
@@ -534,6 +592,10 @@ mod tests {
     };
     const T0: &str = "2026-01-01T00:00:00Z";
     const OCCURRED: &str = "2026-11-06T00:00:00Z";
+    const T1: &str = "2026-01-15T00:00:00Z";
+    /// After every test row occurs, so a rate that starts here is out of
+    /// force at the row's instant.
+    const LATER: &str = "2027-01-01T00:00:00Z";
 
     fn ts(s: &str) -> DateTime<Utc> {
         s.parse().unwrap()
@@ -578,21 +640,34 @@ mod tests {
         card
     }
 
-    fn sell(
-        revision_id: i64,
-        model_id: &str,
-        tenant_id: Option<&str>,
-        from: &str,
-        card: Option<Value>,
-    ) -> SellPriceRow {
-        SellPriceRow {
+    /// A model's baseline: `card` is its official USD list price.
+    fn baseline(revision_id: i64, model_id: &str, from: &str, card: Value) -> BaselineRow {
+        BaselineRow {
             revision_id,
             engine_version: ENGINE_VERSION,
             model_id: model_id.to_owned(),
-            tenant_id: tenant_id.map(str::to_owned),
             effective_from: ts(from),
             card,
         }
+    }
+
+    /// Group `g`'s default rate at `e4` ten-thousandths of a CNY per USD.
+    fn group_rate(revision_id: i64, from: &str, e4: i64) -> GroupRateRow {
+        GroupRateRow {
+            revision_id,
+            engine_version: ENGINE_VERSION,
+            group_id: "g".to_owned(),
+            model_id: None,
+            effective_from: ts(from),
+            cny_per_usd_e4: Some(e4),
+        }
+    }
+
+    /// Group `g`'s default rate of one CNY per USD: the rate at which a
+    /// charge in µ¥ is the baseline's in µ$, so ported rows keep their
+    /// amounts.
+    fn rate_one(revision_id: i64, from: &str) -> GroupRateRow {
+        group_rate(revision_id, from, CnyPerUsd::ONE.0.into())
     }
 
     fn cost(
@@ -623,14 +698,16 @@ mod tests {
     }
 
     fn book_of(
-        sell: Vec<SellPriceRow>,
+        baselines: Vec<BaselineRow>,
+        rates: Vec<GroupRateRow>,
         cost: Vec<CostPriceRow>,
         discounts: Vec<DiscountRow>,
     ) -> PriceBook {
         let catalogue = Catalogue::from_json(r#"{"version":"2026-11-06","entries":[]}"#).unwrap();
         PriceBook::from_rows(
             PriceRows {
-                sell,
+                baselines,
+                rates,
                 cost,
                 discounts,
             },
@@ -638,10 +715,12 @@ mod tests {
         )
     }
 
-    /// Model `m` at `test_card`; tenant `t` has no plan of its own.
+    /// Model `m` at `test_card`, for group `g` at a rate of one; tenant `t`
+    /// has no discount of its own.
     fn test_book() -> PriceBook {
         book_of(
-            vec![sell(1, "m", None, T0, Some(test_card()))],
+            vec![baseline(1, "m", T0, test_card())],
+            vec![rate_one(1, T0)],
             vec![],
             vec![],
         )
@@ -649,7 +728,8 @@ mod tests {
 
     fn book_without_web_search() -> PriceBook {
         book_of(
-            vec![sell(1, "m", None, T0, Some(card_without_web_search()))],
+            vec![baseline(1, "m", T0, card_without_web_search())],
+            vec![rate_one(1, T0)],
             vec![],
             vec![],
         )
@@ -673,8 +753,16 @@ mod tests {
         serde_json::from_value(v).unwrap()
     }
 
+    /// The default payer: tenant `t`, group `g`.
+    fn payer() -> Payer {
+        Payer {
+            tenant_id: "t".into(),
+            group_id: Some("g".into()),
+        }
+    }
+
     fn price(json: &str) -> Result<PricedEvent, PricingError> {
-        price_event(&test_book(), &row(json), RECEIVED)
+        price_event(&test_book(), &row(json), &payer(), RECEIVED)
     }
 
     fn charge(json: &str) -> i64 {
@@ -683,42 +771,15 @@ mod tests {
 
     fn charge_for_tenant_with_discount(json: &str, bps: i64) -> i64 {
         let book = book_of(
-            vec![sell(1, "m", None, T0, Some(test_card()))],
+            vec![baseline(1, "m", T0, test_card())],
+            vec![rate_one(1, T0)],
             vec![],
             vec![discount(2, "t", T0, bps)],
         );
-        price_event(&book, &row(json), RECEIVED).unwrap().charge.0
-    }
-
-    /// acme has an override on `m` (input 1) and none on `m2`; acme's
-    /// discount is 5000 bps.
-    fn acme_book(acme_discount_bps: i64) -> PriceBook {
-        book_of(
-            vec![
-                sell(1, "m", None, T0, Some(test_card())),
-                sell(2, "m2", None, T0, Some(test_card())),
-                sell(
-                    3,
-                    "m",
-                    Some("acme"),
-                    T0,
-                    Some(json!({"default": {"base": {"input": "1", "output": "2"}}})),
-                ),
-            ],
-            vec![],
-            vec![discount(4, "acme", T0, acme_discount_bps)],
-        )
-    }
-
-    fn price_acme(model: &str, json: &str) -> Result<PricedEvent, PricingError> {
-        let mut u = row(json);
-        u.team_id = "acme".into();
-        u.requested_model_id = model.into();
-        price_event(&acme_book(5_000), &u, RECEIVED)
-    }
-
-    fn charge_acme(model: &str, json: &str) -> i64 {
-        price_acme(model, json).unwrap().charge.0
+        price_event(&book, &row(json), &payer(), RECEIVED)
+            .unwrap()
+            .charge
+            .0
     }
 
     // ---- one test per cache-token shape ----
@@ -767,10 +828,10 @@ mod tests {
     #[test]
     fn a_zero_token_row_bills_nothing_and_needs_no_price() {
         let p = price(r#"{"team_id":"","requested_model_id":"nope"}"#).unwrap();
-        assert_eq!((p.outcome, p.charge), (Outcome::NothingToBill, MicroUsd(0)));
+        assert_eq!((p.outcome, p.charge), (Outcome::NothingToBill, MicroCny(0)));
         // A request whose model name resolved to no entry, and used nothing.
         let p = price(r#"{"requested_model_id":"","status_code":404}"#).unwrap();
-        assert_eq!((p.outcome, p.charge), (Outcome::NothingToBill, MicroUsd(0)));
+        assert_eq!((p.outcome, p.charge), (Outcome::NothingToBill, MicroCny(0)));
     }
 
     #[test]
@@ -780,7 +841,7 @@ mod tests {
             price(r#"{"cache_status":"hit","prompt_tokens":500,"completion_tokens":100}"#).unwrap();
         assert_eq!(
             (p.outcome, p.charge),
-            (Outcome::Exempt(Exemption::ResponseCacheHit), MicroUsd(0))
+            (Outcome::Exempt(Exemption::ResponseCacheHit), MicroCny(0))
         );
     }
 
@@ -795,8 +856,8 @@ mod tests {
         .unwrap();
         assert_eq!(p.outcome, Outcome::Exempt(Exemption::ResponseCacheHit));
         assert_eq!(
-            (p.charge, p.sell, p.lines, p.cost),
-            (MicroUsd(0), None, vec![], None)
+            (p.charge, p.rate, p.lines, p.cost),
+            (MicroCny(0), None, vec![], None)
         );
     }
 
@@ -814,7 +875,7 @@ mod tests {
             .unwrap();
             assert_eq!(
                 (p.outcome, p.charge),
-                (Outcome::Exempt(Exemption::NotModelUsage), MicroUsd(0)),
+                (Outcome::Exempt(Exemption::NotModelUsage), MicroCny(0)),
                 "{op}"
             );
         }
@@ -846,8 +907,21 @@ mod tests {
             price(r#"{"requested_model_id":"","prompt_tokens":1}"#),
             Err(PricingError::UnknownModel)
         );
+        // The payer names the tenant: the row's own empty `team_id` prices
+        // nothing differently.
+        let p = price(r#"{"team_id":"","prompt_tokens":1}"#).unwrap();
+        assert_eq!((p.tenant_id.as_str(), p.charge), ("t", MicroCny(1)));
+        let anonymous = Payer {
+            tenant_id: String::new(),
+            group_id: Some("g".into()),
+        };
         assert_eq!(
-            price(r#"{"team_id":"","prompt_tokens":1}"#),
+            price_event(
+                &test_book(),
+                &row(r#"{"prompt_tokens":1}"#),
+                &anonymous,
+                RECEIVED
+            ),
             Err(PricingError::UnknownTenant)
         );
     }
@@ -867,26 +941,21 @@ mod tests {
     fn a_model_whose_revision_is_invalid_is_unpriced_with_that_revision() {
         let book = book_of(
             vec![
-                sell(
-                    7,
-                    "bad",
-                    None,
-                    T0,
-                    Some(json!({"default": {"base": {"input": "1"}}})),
-                ),
-                sell(8, "m", None, T0, Some(test_card())),
+                baseline(7, "bad", T0, json!({"default": {"base": {"input": "1"}}})),
+                baseline(8, "m", T0, test_card()),
             ],
+            vec![rate_one(1, T0)],
             vec![],
             vec![],
         );
         let mut u = row(r#"{"prompt_tokens":1000}"#);
         assert_eq!(
-            price_event(&book, &u, RECEIVED).unwrap().charge,
-            MicroUsd(1000)
+            price_event(&book, &u, &payer(), RECEIVED).unwrap().charge,
+            MicroCny(1000)
         );
         u.requested_model_id = "bad".into();
         assert_eq!(
-            price_event(&book, &u, RECEIVED),
+            price_event(&book, &u, &payer(), RECEIVED),
             Err(PricingError::InvalidPrice { revision_id: 7 })
         );
     }
@@ -920,7 +989,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             (p.charge, p.service_tier.unwrap().as_str()),
-            (MicroUsd(600), "batch")
+            (MicroCny(600), "batch")
         );
     }
 
@@ -939,7 +1008,7 @@ mod tests {
             let mut u = row(r#"{"prompt_tokens":1000}"#);
             u.service_tier = Some(raw.into());
             assert_eq!(
-                price_event(&test_book(), &u, RECEIVED),
+                price_event(&test_book(), &u, &payer(), RECEIVED),
                 Err(PricingError::MissingTierPrice { tier: raw.into() }),
                 "{raw}"
             );
@@ -949,19 +1018,19 @@ mod tests {
     #[test]
     fn a_batch_row_on_a_card_without_a_batch_tier_is_unpriced() {
         let book = book_of(
-            vec![sell(
+            vec![baseline(
                 1,
                 "m",
-                None,
                 T0,
-                Some(json!({"default": {"base": {"input": "1", "output": "2"}}})),
+                json!({"default": {"base": {"input": "1", "output": "2"}}}),
             )],
+            vec![rate_one(1, T0)],
             vec![],
             vec![],
         );
         let u = row(r#"{"is_batch":true,"service_tier":"default","prompt_tokens":1000}"#);
         assert_eq!(
-            price_event(&book, &u, RECEIVED),
+            price_event(&book, &u, &payer(), RECEIVED),
             Err(PricingError::MissingTierPrice {
                 tier: "batch".into()
             })
@@ -979,7 +1048,7 @@ mod tests {
     #[test]
     fn a_requested_tier_the_upstream_did_not_report_bills_default_and_says_so() {
         let p = price(r#"{"requested_service_tier":"flex","prompt_tokens":1000}"#).unwrap();
-        assert_eq!(p.charge, MicroUsd(1000));
+        assert_eq!(p.charge, MicroCny(1000));
         assert_eq!(
             p.warnings,
             vec![PricingWarning::ServedTierUnreported {
@@ -1107,52 +1176,278 @@ mod tests {
         );
     }
 
+    // ---- baselines, group rates and the discount ----
+
+    /// Model `m`'s official list price: USD 4 per million input tokens and
+    /// USD 20 per million output tokens.
+    fn baseline_card() -> Value {
+        json!({"default": {"base": {"input": "4", "output": "20"}}})
+    }
+
+    /// Group `g` at `default_e4`, with `overrides` of `(revision_id, model,
+    /// from, e4)`; `e4` `None` ends that model's override.
+    fn rate_book(default_e4: i64, overrides: &[(i64, &str, &str, Option<i64>)]) -> PriceBook {
+        let rates = std::iter::once(group_rate(1, T0, default_e4))
+            .chain(overrides.iter().map(|&(id, model, from, e4)| GroupRateRow {
+                revision_id: id,
+                engine_version: ENGINE_VERSION,
+                group_id: "g".to_owned(),
+                model_id: Some(model.to_owned()),
+                effective_from: ts(from),
+                cny_per_usd_e4: e4,
+            }))
+            .collect();
+        book_of(
+            vec![baseline(1, "m", T0, baseline_card())],
+            rates,
+            vec![],
+            vec![],
+        )
+    }
+
+    /// The brief's row: 1,000 input and 500 output tokens, which is USD 14
+    /// per million at `baseline_card`.
+    fn rate_row() -> BillableUsage {
+        row(r#"{"prompt_tokens":1000,"completion_tokens":500}"#)
+    }
+
+    fn charged_at(book: &PriceBook, payer: &Payer) -> Result<PricedEvent, PricingError> {
+        price_event(book, &rate_row(), payer, RECEIVED)
+    }
+
+    /// A payer of group `g`, tenant `t` unless `tenant` names another.
+    fn payer_of(tenant: &str) -> Payer {
+        Payer {
+            tenant_id: tenant.into(),
+            group_id: Some("g".into()),
+        }
+    }
+
     #[test]
-    fn an_override_is_not_discounted_again() {
-        assert_eq!(charge_acme("m", r#"{"prompt_tokens":1000}"#), 1000);
-        assert_eq!(charge_acme("m2", r#"{"prompt_tokens":1000}"#), 500);
-        // The override priced the first, and the discount the second.
-        let p = price_acme("m", r#"{"prompt_tokens":1000}"#).unwrap();
+    fn a_row_bills_its_baseline_at_its_groups_rate() {
+        let book = rate_book(72_000, &[]);
+        let p = charged_at(&book, &payer_of("t")).unwrap();
+        assert_eq!((p.outcome, p.charge), (Outcome::Charged, MicroCny(100_800)));
+        assert_eq!(p.baseline, Some(BaselineRef { revision_id: 1 }));
         assert_eq!(
-            (p.sell, p.discount),
-            (
-                Some(SellRef {
-                    revision_id: 3,
-                    tenant_override: true
-                }),
-                None
-            )
+            p.rate,
+            Some(RateRef {
+                revision_id: 1,
+                cny_per_usd: CnyPerUsd::parse("7.2").unwrap(),
+                model_override: false
+            })
         );
-        let p = price_acme("m2", r#"{"prompt_tokens":1000}"#).unwrap();
+        assert_eq!(p.group_id, Some("g".into()));
+        assert_eq!(p.discount, None);
+    }
+
+    #[test]
+    fn a_models_override_beats_the_group_default() {
+        // Review Focus: the group default is 5.0, and `m`'s own 6.0 prices it.
+        let book = rate_book(50_000, &[(2, "m", T0, Some(60_000))]);
+        let p = charged_at(&book, &payer_of("t")).unwrap();
+        assert_eq!(p.charge, MicroCny(84_000));
         assert_eq!(
-            (p.sell, p.discount),
-            (
-                Some(SellRef {
-                    revision_id: 2,
-                    tenant_override: false
-                }),
-                Some(DiscountRef {
-                    revision_id: 4,
-                    bps: 5_000
-                })
-            )
+            p.rate,
+            Some(RateRef {
+                revision_id: 2,
+                cny_per_usd: CnyPerUsd::parse("6").unwrap(),
+                model_override: true
+            })
         );
     }
 
     #[test]
-    fn an_invalid_discount_unprices_the_rows_it_would_discount_only() {
-        let mut u = row(r#"{"prompt_tokens":1000}"#);
-        u.team_id = "acme".into();
-        let book = acme_book(10_001);
-        // The override is not discounted, so the discount is never read.
+    fn an_ended_override_gives_way_to_the_default() {
+        // The 6.0 override ended at T1, so the default 5.0 prices a row at T1.
+        let book = rate_book(50_000, &[(2, "m", T0, Some(60_000)), (3, "m", T1, None)]);
+        let mut u = rate_row();
+        u.occurred_at = ts(T1);
+        let p = price_event(&book, &u, &payer_of("t"), RECEIVED).unwrap();
+        assert_eq!(p.charge, MicroCny(70_000));
         assert_eq!(
-            price_event(&book, &u, RECEIVED).unwrap().charge,
-            MicroUsd(1000)
+            p.rate,
+            Some(RateRef {
+                revision_id: 1,
+                cny_per_usd: CnyPerUsd::parse("5").unwrap(),
+                model_override: false
+            })
         );
-        u.requested_model_id = "m2".into();
+    }
+
+    #[test]
+    fn a_group_with_no_rate_in_force_is_missing_rate() {
+        // No override, and the group's default starts after the row.
+        let book = book_of(
+            vec![baseline(1, "m", T0, baseline_card())],
+            vec![group_rate(1, LATER, 72_000)],
+            vec![],
+            vec![],
+        );
         assert_eq!(
-            price_event(&book, &u, RECEIVED),
+            charged_at(&book, &payer_of("t")),
+            Err(PricingError::MissingRate {
+                group_id: "g".into(),
+                model_id: "m".into(),
+                at: ts(OCCURRED),
+            })
+        );
+        assert_eq!(
+            PricingError::MissingRate {
+                group_id: "g".into(),
+                model_id: "m".into(),
+                at: ts(OCCURRED)
+            }
+            .code(),
+            "missing_rate"
+        );
+    }
+
+    #[test]
+    fn a_payer_with_no_group_is_no_group() {
+        let book = rate_book(72_000, &[]);
+        let no_group = Payer {
+            tenant_id: "t".into(),
+            group_id: None,
+        };
+        assert_eq!(charged_at(&book, &no_group), Err(PricingError::NoGroup));
+        assert_eq!(PricingError::NoGroup.code(), "no_group");
+        // A row that bills nothing needs no group: it is not billed at all.
+        let p = price_event(&book, &row("{}"), &no_group, RECEIVED).unwrap();
+        assert_eq!((p.outcome, p.charge), (Outcome::NothingToBill, MicroCny(0)));
+    }
+
+    #[test]
+    fn an_unreadable_rate_is_invalid_and_never_falls_back() {
+        // An override stamped by a newer engine decides "invalid", never the
+        // default in effect behind it.
+        let newer = GroupRateRow {
+            revision_id: 4,
+            engine_version: ENGINE_VERSION + 1,
+            group_id: "g".to_owned(),
+            model_id: Some("m".to_owned()),
+            effective_from: ts(T0),
+            cny_per_usd_e4: Some(60_000),
+        };
+        let book = book_of(
+            vec![baseline(1, "m", T0, baseline_card())],
+            vec![group_rate(1, T0, 50_000), newer],
+            vec![],
+            vec![],
+        );
+        assert_eq!(
+            charged_at(&book, &payer_of("t")),
             Err(PricingError::InvalidPrice { revision_id: 4 })
+        );
+        assert_eq!(
+            book.invalid_revisions()
+                .iter()
+                .map(|r| (r.table, r.revision_id))
+                .collect::<Vec<_>>(),
+            [(RevisionTable::Rate, 4)]
+        );
+        // A default carrying a rate past the cap is listed invalid too, and
+        // leaves every row of the group unpriced.
+        let book = rate_book(2_000_000, &[]);
+        assert_eq!(
+            charged_at(&book, &payer_of("t")),
+            Err(PricingError::InvalidPrice { revision_id: 1 })
+        );
+        assert_eq!(
+            book.invalid_revisions()
+                .iter()
+                .map(|r| (r.table, r.revision_id))
+                .collect::<Vec<_>>(),
+            [(RevisionTable::Rate, 1)]
+        );
+    }
+
+    #[test]
+    fn a_model_without_a_baseline_is_missing_price() {
+        let book = book_of(Vec::new(), vec![group_rate(1, T0, 72_000)], vec![], vec![]);
+        assert_eq!(
+            charged_at(&book, &payer_of("t")),
+            Err(PricingError::MissingPrice {
+                model_id: "m".into(),
+                at: ts(OCCURRED),
+            })
+        );
+    }
+
+    #[test]
+    fn the_tenant_discount_applies_after_the_rate() {
+        // 100,800 µ¥ at 7.2, less 1000 bps.
+        let book = book_of(
+            vec![baseline(1, "m", T0, baseline_card())],
+            vec![group_rate(1, T0, 72_000)],
+            vec![],
+            vec![discount(4, "t", T0, 1_000)],
+        );
+        let p = charged_at(&book, &payer_of("t")).unwrap();
+        assert_eq!(p.charge, MicroCny(90_720));
+        assert_eq!(
+            p.discount,
+            Some(DiscountRef {
+                revision_id: 4,
+                bps: 1_000
+            })
+        );
+    }
+
+    #[test]
+    fn the_payer_not_the_row_names_the_tenant() {
+        // The row claims `claimed`; the key belongs to `filed`, whose discount
+        // applies.
+        let book = book_of(
+            vec![baseline(1, "m", T0, baseline_card())],
+            vec![group_rate(1, T0, 72_000)],
+            vec![],
+            vec![discount(4, "filed", T0, 2_000)],
+        );
+        let mut u = rate_row();
+        u.team_id = "claimed".into();
+        let p = price_event(&book, &u, &payer_of("filed"), RECEIVED).unwrap();
+        assert_eq!(p.tenant_id, "filed");
+        assert_eq!(
+            p.discount,
+            Some(DiscountRef {
+                revision_id: 4,
+                bps: 2_000
+            })
+        );
+        // 100,800 less 2000 bps.
+        assert_eq!(p.charge, MicroCny(80_640));
+        // The row's own tenant has no discount: the same row prices higher.
+        let p = price_event(&book, &u, &payer_of("claimed"), RECEIVED).unwrap();
+        assert_eq!(
+            (p.tenant_id.as_str(), p.charge),
+            ("claimed", MicroCny(100_800))
+        );
+    }
+
+    #[test]
+    fn a_free_group_is_charged_zero() {
+        let book = rate_book(0, &[]);
+        let p = charged_at(&book, &payer_of("t")).unwrap();
+        assert_eq!((p.outcome, p.charge), (Outcome::Charged, MicroCny(0)));
+    }
+
+    #[test]
+    fn an_invalid_discount_unprices_the_rows_it_would_discount_only() {
+        // A discount above 10000 bps is isolated to its tenant.
+        let book = book_of(
+            vec![baseline(1, "m", T0, baseline_card())],
+            vec![group_rate(1, T0, 72_000)],
+            vec![],
+            vec![discount(4, "t", T0, 10_001)],
+        );
+        assert_eq!(
+            charged_at(&book, &payer_of("t")),
+            Err(PricingError::InvalidPrice { revision_id: 4 })
+        );
+        assert_eq!(
+            charged_at(&book, &payer_of("other")).unwrap().charge,
+            MicroCny(100_800)
         );
     }
 
@@ -1166,6 +1461,7 @@ mod tests {
             price_event(
                 &book,
                 &row(r#"{"prompt_tokens":10,"web_search_requests":2}"#),
+                &payer(),
                 RECEIVED
             ),
             Err(PricingError::MissingDimensionPrice {
@@ -1173,8 +1469,8 @@ mod tests {
             })
         );
         // The same card prices a row that searched nothing.
-        let p = price_event(&book, &row(r#"{"prompt_tokens":10}"#), RECEIVED).unwrap();
-        assert_eq!((p.charge, p.warnings), (MicroUsd(10), vec![]));
+        let p = price_event(&book, &row(r#"{"prompt_tokens":10}"#), &payer(), RECEIVED).unwrap();
+        assert_eq!((p.charge, p.warnings), (MicroCny(10), vec![]));
     }
 
     #[test]
@@ -1226,7 +1522,7 @@ mod tests {
             r#"{"status_code":499,"usage_estimated":true,"prompt_tokens":100,"completion_tokens":20}"#,
         )
         .unwrap();
-        assert_eq!((p.charge, p.estimated), (MicroUsd(140), true));
+        assert_eq!((p.charge, p.estimated), (MicroCny(140), true));
         assert!(!price(r#"{"prompt_tokens":100}"#).unwrap().estimated);
     }
 
@@ -1265,9 +1561,10 @@ mod tests {
         let one = |input: &str| json!({"default": {"base": {"input": input, "output": "1"}}});
         let book = book_of(
             vec![
-                sell(1, "m", None, T0, Some(one("1"))),
-                sell(2, "m", None, &later, Some(one("9"))),
+                baseline(1, "m", T0, one("1")),
+                baseline(2, "m", &later, one("9")),
             ],
+            vec![rate_one(1, T0)],
             vec![
                 cost(3, None, T0, one("0.4")),
                 cost(4, None, &later, one("0.8")),
@@ -1279,7 +1576,7 @@ mod tests {
                 r#"{"prompt_tokens":1000,"upstream_provider":"openai","upstream_model":"up-1"}"#,
             );
             u.occurred_at = occurred_at;
-            price_event(&book, &u, RECEIVED).unwrap()
+            price_event(&book, &u, &payer(), RECEIVED).unwrap()
         };
 
         let occurred_at = RECEIVED + TimeDelta::hours(1);
@@ -1292,8 +1589,8 @@ mod tests {
         );
         // Every lookup is at the clamped instant: rev 1, cost rev 3 and no
         // discount yet.
-        assert_eq!(p.sell.unwrap().revision_id, 1);
-        assert_eq!((p.charge, p.discount), (MicroUsd(1000), None));
+        assert_eq!(p.baseline.unwrap().revision_id, 1);
+        assert_eq!((p.charge, p.discount), (MicroCny(1000), None));
         assert_eq!(
             p.cost,
             Some(CostPriced {
@@ -1323,19 +1620,20 @@ mod tests {
         let one = |input: &str| json!({"default": {"base": {"input": input, "output": "1"}}});
         let book = book_of(
             vec![
-                sell(1, "m", None, T0, Some(one("1"))),
-                sell(2, "m", None, &b, Some(one("9"))),
+                baseline(1, "m", T0, one("1")),
+                baseline(2, "m", &b, one("9")),
             ],
+            vec![rate_one(1, T0)],
             vec![cost(3, None, T0, one("0.4")), cost(4, None, &b, one("0.8"))],
             vec![discount(5, "t", &b, 5_000)],
         );
         let u =
             row(r#"{"prompt_tokens":1000,"upstream_provider":"openai","upstream_model":"up-1"}"#);
-        let p = price_event(&book, &u, received).unwrap();
+        let p = price_event(&book, &u, &payer(), received).unwrap();
         assert_eq!(p.price_instant, ts(OCCURRED));
         assert_eq!(
-            (p.sell.unwrap().revision_id, p.charge, p.discount),
-            (1, MicroUsd(1000), None)
+            (p.baseline.unwrap().revision_id, p.charge, p.discount),
+            (1, MicroCny(1000), None)
         );
         assert_eq!(
             p.cost.map(|c| c.source),
@@ -1344,8 +1642,11 @@ mod tests {
         // At the boundary instant the new revisions price it.
         let mut at_boundary = u.clone();
         at_boundary.occurred_at = boundary;
-        let p = price_event(&book, &at_boundary, received).unwrap();
-        assert_eq!((p.sell.unwrap().revision_id, p.charge), (2, MicroUsd(4500)));
+        let p = price_event(&book, &at_boundary, &payer(), received).unwrap();
+        assert_eq!(
+            (p.baseline.unwrap().revision_id, p.charge),
+            (2, MicroCny(4500))
+        );
         assert_eq!(p.cost.map(|c| c.amount), Some(MicroUsd(800)));
     }
 
@@ -1356,7 +1657,8 @@ mod tests {
         let cost_card = json!({"default": {"base": {"input": "0.4", "output": "1"},
             "long_context": [{"above_input_tokens": 200_000, "rates": {"input": "0.8", "output": "1.5"}}]}});
         let book = book_of(
-            vec![sell(1, "m", None, T0, Some(test_card()))],
+            vec![baseline(1, "m", T0, test_card())],
+            vec![rate_one(1, T0)],
             vec![
                 cost(2, None, T0, cost_card),
                 cost(
@@ -1368,11 +1670,11 @@ mod tests {
             ],
             vec![discount(4, "t", T0, 5_000)],
         );
-        let at = |json: &str| price_event(&book, &row(json), RECEIVED).unwrap();
+        let at = |json: &str| price_event(&book, &row(json), &payer(), RECEIVED).unwrap();
         let upstream = r#""upstream_provider":"openai","upstream_model":"up-1""#;
 
         let p = at(&format!(r#"{{"prompt_tokens":1000,{upstream}}}"#));
-        assert_eq!(p.charge, MicroUsd(500));
+        assert_eq!(p.charge, MicroCny(500));
         assert_eq!(
             p.cost,
             Some(CostPriced {
@@ -1407,13 +1709,13 @@ mod tests {
         let p = at(&format!(
             r#"{{"prompt_tokens":1000,"service_tier":"flex",{upstream}}}"#
         ));
-        assert_eq!((p.charge, p.cost), (MicroUsd(250), None));
+        assert_eq!((p.charge, p.cost), (MicroCny(250), None));
         // A quantity the cost card has no rate for leaves the cost unknown,
         // never a cost without it; the sell card prices the search.
         let p = at(&format!(
             r#"{{"prompt_tokens":1000,"web_search_requests":1,{upstream}}}"#
         ));
-        assert_eq!((p.charge, p.cost), (MicroUsd(5_500), None));
+        assert_eq!((p.charge, p.cost), (MicroCny(5_500), None));
         // Without both halves of the upstream's name there is no cost.
         for json in [
             r#"{"prompt_tokens":1000}"#,
@@ -1427,13 +1729,14 @@ mod tests {
     #[test]
     fn the_cost_band_and_tier_are_the_rows_own() {
         let book = book_of(
-            vec![sell(1, "m", None, T0, Some(test_card()))],
+            vec![baseline(1, "m", T0, test_card())],
+            vec![rate_one(1, T0)],
             vec![cost(2, None, T0, test_card())],
             vec![],
         );
         let up = r#""upstream_provider":"openai","upstream_model":"up-1""#;
         let cost = |json: String| {
-            price_event(&book, &row(&json), RECEIVED)
+            price_event(&book, &row(&json), &payer(), RECEIVED)
                 .unwrap()
                 .cost
                 .map(|c| c.amount)
@@ -1461,7 +1764,8 @@ mod tests {
         // P2-R14 at the engine: the upstream's own cost is never substituted
         // for the key's unreadable one.
         let book = book_of(
-            vec![sell(1, "m", None, T0, Some(test_card()))],
+            vec![baseline(1, "m", T0, test_card())],
+            vec![rate_one(1, T0)],
             vec![
                 cost(
                     2,
@@ -1481,10 +1785,10 @@ mod tests {
         let u = row(
             r#"{"prompt_tokens":1000,"provider_key_id":"pk-1","upstream_provider":"openai","upstream_model":"up-1"}"#,
         );
-        let p = price_event(&book, &u, RECEIVED).unwrap();
+        let p = price_event(&book, &u, &payer(), RECEIVED).unwrap();
         assert_eq!(
             (p.outcome, p.charge, p.cost),
-            (Outcome::Charged, MicroUsd(1000), None)
+            (Outcome::Charged, MicroCny(1000), None)
         );
     }
 
@@ -1497,7 +1801,7 @@ mod tests {
             "web_search_requests":1,"requested_service_tier":"auto","service_tier":"default"}"#,
         );
         u.event_id = "evt-1".into();
-        let p = price_event(&test_book(), &u, RECEIVED).unwrap();
+        let p = price_event(&test_book(), &u, &payer(), RECEIVED).unwrap();
         let line = |dimension, quantity, rate: &str| ChargeLine {
             dimension,
             quantity,
@@ -1508,14 +1812,17 @@ mod tests {
             PricedEvent {
                 event_id: "evt-1".into(),
                 tenant_id: "t".into(),
+                group_id: Some("g".into()),
                 requested_model_id: "m".into(),
                 occurred_at: ts(OCCURRED),
                 price_instant: ts(OCCURRED),
                 outcome: Outcome::Charged,
-                charge: MicroUsd(10_680),
-                sell: Some(SellRef {
+                charge: MicroCny(10_680),
+                baseline: Some(BaselineRef { revision_id: 1 }),
+                rate: Some(RateRef {
                     revision_id: 1,
-                    tenant_override: false
+                    cny_per_usd: CnyPerUsd::ONE,
+                    model_override: false
                 }),
                 discount: None,
                 service_tier: Some(ServiceTier::default_tier()),
@@ -1538,7 +1845,8 @@ mod tests {
     #[test]
     fn a_priced_event_serializes_with_the_stored_names() {
         let book = book_of(
-            vec![sell(1, "m", None, T0, Some(test_card()))],
+            vec![baseline(1, "m", T0, test_card())],
+            vec![rate_one(1, T0)],
             vec![cost(
                 2,
                 None,
@@ -1550,14 +1858,16 @@ mod tests {
         let u = row(
             r#"{"prompt_tokens":10,"requested_service_tier":"flex","upstream_provider":"openai","upstream_model":"up-1"}"#,
         );
-        let p = serde_json::to_value(price_event(&book, &u, RECEIVED).unwrap()).unwrap();
+        let p = serde_json::to_value(price_event(&book, &u, &payer(), RECEIVED).unwrap()).unwrap();
         assert_eq!(
             p,
             json!({
-                "event_id": "e", "tenant_id": "t", "requested_model_id": "m",
+                "event_id": "e", "tenant_id": "t", "group_id": "g",
+                "requested_model_id": "m",
                 "occurred_at": "2026-11-06T00:00:00Z", "price_instant": "2026-11-06T00:00:00Z",
                 "outcome": "charged", "charge": 8,
-                "sell": {"revision_id": 1, "tenant_override": false},
+                "baseline": {"revision_id": 1},
+                "rate": {"revision_id": 1, "cny_per_usd": "1", "model_override": false},
                 "discount": {"revision_id": 3, "bps": 2500},
                 "service_tier": "default", "requested_service_tier": "flex",
                 "long_context_above": null,
@@ -1598,12 +1908,21 @@ mod tests {
             (PricingError::MissingEventId, "missing_event_id"),
             (PricingError::UnknownTenant, "unknown_tenant"),
             (PricingError::UnknownModel, "unknown_model"),
+            (PricingError::NoGroup, "no_group"),
             (
                 PricingError::MissingPrice {
                     model_id: "m".into(),
                     at,
                 },
                 "missing_price",
+            ),
+            (
+                PricingError::MissingRate {
+                    group_id: "g".into(),
+                    model_id: "m".into(),
+                    at,
+                },
+                "missing_rate",
             ),
             (
                 PricingError::InvalidPrice { revision_id: 1 },
@@ -1646,8 +1965,8 @@ mod tests {
     fn pricing_twice_gives_the_same_result() {
         let u = row(r#"{"prompt_tokens":1000,"completion_tokens":3}"#);
         assert_eq!(
-            price_event(&test_book(), &u, RECEIVED),
-            price_event(&test_book(), &u, RECEIVED)
+            price_event(&test_book(), &u, &payer(), RECEIVED),
+            price_event(&test_book(), &u, &payer(), RECEIVED)
         );
     }
 
@@ -1677,6 +1996,18 @@ mod tests {
         // 0.972 µ¥ with the discount. Rounding at the rate first would give
         // ⌈1.08⌉ = 2 µ¥, so ⌈1.8⌉ = 2 µ¥.
         assert_eq!(charge_micro_cny(&one, at, 1_000), Ok(MicroCny(1)));
+        // No lines, or a line of no quantity, charges nothing.
+        assert_eq!(charge_micro_cny(&[], at, 0), Ok(MicroCny(0)));
+        assert_eq!(
+            charge_micro_cny(&[line(Dimension::Input, 0, "4")], at, 0),
+            Ok(MicroCny(0))
+        );
+        // The smallest charge there is: 1 rate unit at one e4 is 10⁻¹⁴ µ¥,
+        // which rounds up to 1 rather than down to nothing.
+        assert_eq!(
+            charge_micro_cny(&[line(Dimension::Input, 1, "0.000001")], CnyPerUsd(1), 0),
+            Ok(MicroCny(1))
+        );
         assert_eq!(charge_micro_cny(&lines, CnyPerUsd(0), 0), Ok(MicroCny(0)));
         assert_eq!(charge_micro_cny(&lines, at, 10_000), Ok(MicroCny(0)));
         assert_eq!(
@@ -1931,7 +2262,8 @@ mod tests {
     /// Model `m` at `card`, and tenant `t`'s discount of `bps`.
     fn book_with(card: &Value, bps: u16) -> PriceBook {
         let book = book_of(
-            vec![sell(1, "m", None, T0, Some(card.clone()))],
+            vec![baseline(1, "m", T0, card.clone())],
+            vec![rate_one(1, T0)],
             vec![],
             vec![discount(2, "t", T0, i64::from(bps))],
         );
@@ -2048,13 +2380,13 @@ mod tests {
                 }
             }
             let book = book_with(&card, bps);
-            let before = price_event(&book, &u, RECEIVED).unwrap();
+            let before = price_event(&book, &u, &payer(), RECEIVED).unwrap();
             let units_before = units(&q);
             for d in Dimension::ALL {
                 let more = one_more(&u, d);
                 // The row really carries one more token, and nothing else.
                 prop_assert_eq!(units(&quantities(&more).unwrap()), units_before + 1, "{}", d);
-                let after = price_event(&book, &more, RECEIVED).unwrap();
+                let after = price_event(&book, &more, &payer(), RECEIVED).unwrap();
                 prop_assert!(after.charge >= before.charge, "{}: {:?} < {:?}", d, after.charge, before.charge);
             }
         }
@@ -2065,7 +2397,7 @@ mod tests {
             card in synthetic_card(0),
             (a, b) in (0u16..=10_000, 0u16..=10_000),
         ) {
-            let at = |bps| price_event(&book_with(&card, bps), &u, RECEIVED).unwrap().charge;
+            let at = |bps| price_event(&book_with(&card, bps), &u, &payer(), RECEIVED).unwrap().charge;
             prop_assert!(at(a.min(b)) >= at(a.max(b)));
         }
 
@@ -2081,12 +2413,12 @@ mod tests {
             card in synthetic_card(1),
             bps in 0u16..10_000,
         ) {
-            let p = price_event(&book_with(&card, bps), &u, RECEIVED).unwrap();
+            let p = price_event(&book_with(&card, bps), &u, &payer(), RECEIVED).unwrap();
             if quantities(&u).unwrap().is_zero() {
                 prop_assert_eq!(p.outcome, Outcome::NothingToBill);
             } else {
                 prop_assert_eq!(p.outcome, Outcome::Charged);
-                prop_assert!(p.charge >= MicroUsd(1), "{:?}", p);
+                prop_assert!(p.charge >= MicroCny(1), "{:?}", p);
             }
         }
 
@@ -2099,7 +2431,7 @@ mod tests {
             card in synthetic_card(0),
             bps in 0u16..=10_000,
         ) {
-            let p = price_event(&book_with(&card, bps), &u, RECEIVED).unwrap();
+            let p = price_event(&book_with(&card, bps), &u, &payer(), RECEIVED).unwrap();
             let q = quantities(&u).unwrap();
             let billed: Vec<_> = Dimension::ALL.into_iter().filter(|d| q.get(*d) > 0).collect();
             let lines: Vec<_> = p.lines.iter().map(|l| l.dimension).collect();

@@ -1,11 +1,15 @@
 [
   {
+    "baseline": {
+      "revision_id": 3
+    },
     "charge": 20150,
     "cost": null,
     "discount": null,
-    "engine_version": 1,
+    "engine_version": 2,
     "estimated": false,
     "event_id": "evt-anthropic-messages-stream-1",
+    "group_id": "group-golden",
     "lines": [
       {
         "dimension": "input",
@@ -42,12 +46,13 @@
     "occurred_at": "2026-11-06T00:00:00Z",
     "outcome": "charged",
     "price_instant": "2026-11-06T00:00:00Z",
+    "rate": {
+      "cny_per_usd": "1",
+      "model_override": false,
+      "revision_id": 1
+    },
     "requested_model_id": "model-anthropic-messages",
     "requested_service_tier": null,
-    "sell": {
-      "revision_id": 3,
-      "tenant_override": false
-    },
     "service_tier": "default",
     "tenant_id": "tenant-golden",
     "warnings": []

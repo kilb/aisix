@@ -196,7 +196,8 @@ pub fn cny_per_token(rate: Rate, cny: CnyPerUsd, discount_bps: u16) -> Option<St
 }
 
 /// `rate × cny × (10000 − bps)`, or `None` for a discount above 10000 bps.
-/// A `u64` × `u32` × 10⁴ is below 2¹¹⁰, so it is exact for any rate.
+/// A reachable rate is at most `Rate::MAX` × `CnyPerUsd::MAX` × 10⁴ = 10²²,
+/// below 2⁷⁴, so it is exact for any rate this engine admits.
 fn listed(rate: Rate, cny: CnyPerUsd, discount_bps: u16) -> Option<u128> {
     let kept_bps = 10_000u128.checked_sub(u128::from(discount_bps))?;
     Some(u128::from(rate.0) * u128::from(cny.0) * kept_bps)

@@ -68,9 +68,9 @@ use aisix_gateway::chat::recorded_completion_tokens;
 use aisix_gateway::{CacheCreationTtl, ModalityTokens};
 use aisix_obs::UsageEvent;
 use aisix_pricing::{
-    price_event, BillableUsage, Catalogue, ChargeLine, Dimension, Exemption, Outcome, PriceBook,
-    PriceRows, PricedEvent, PricingError, Rate, RateCard, Rates, SellPriceRow, ServiceTier,
-    TierRates, ENGINE_VERSION,
+    price_event, BaselineRow, BillableUsage, Catalogue, ChargeLine, CnyPerUsd, Dimension,
+    Exemption, GroupRateRow, Outcome, Payer, PriceBook, PriceRows, PricedEvent, PricingError, Rate,
+    RateCard, Rates, ServiceTier, TierRates, ENGINE_VERSION,
 };
 use chrono::{DateTime, Utc};
 use proptest::option;
@@ -207,8 +207,10 @@ fn usage_event(g: &GatewayUsage, cache_status: &str) -> UsageEvent {
     }
 }
 
-/// Model `m` at `rates` on a `default` base, with no other tier, band,
-/// tenant plan or cost price.
+/// Model `m` at `rates` on a `default` base, with no other tier or band, for
+/// group `g` at a rate of one: the rate at which a charge in µ¥ is the
+/// baseline's in µ$, so these rows pin the gateway's own USD spend. No tenant
+/// discount and no cost price.
 fn book(rates: Rates) -> PriceBook {
     let card = RateCard(
         [(
@@ -223,13 +225,20 @@ fn book(rates: Rates) -> PriceBook {
     let catalogue = Catalogue::from_json(r#"{"version":"2026-11-06","entries":[]}"#).unwrap();
     let book = PriceBook::from_rows(
         PriceRows {
-            sell: vec![SellPriceRow {
+            baselines: vec![BaselineRow {
                 revision_id: 1,
                 engine_version: ENGINE_VERSION,
                 model_id: "m".into(),
-                tenant_id: None,
                 effective_from: "2026-01-01T00:00:00Z".parse().unwrap(),
-                card: Some(serde_json::to_value(&card).unwrap()),
+                card: serde_json::to_value(&card).unwrap(),
+            }],
+            rates: vec![GroupRateRow {
+                revision_id: 1,
+                engine_version: ENGINE_VERSION,
+                group_id: "g".into(),
+                model_id: None,
+                effective_from: "2026-01-01T00:00:00Z".parse().unwrap(),
+                cny_per_usd_e4: Some(CnyPerUsd::ONE.0.into()),
             }],
             cost: vec![],
             discounts: vec![],
@@ -239,6 +248,14 @@ fn book(rates: Rates) -> PriceBook {
     let refused = book.invalid_revisions();
     assert!(refused.is_empty(), "the book refused the card: {refused:?}");
     book
+}
+
+/// Tenant `t`, whose key names group `g`.
+fn payer() -> Payer {
+    Payer {
+        tenant_id: "t".into(),
+        group_id: Some("g".into()),
+    }
 }
 
 /// The card that says what `p` says.
@@ -251,7 +268,7 @@ fn book_for(p: &GatewayPrice) -> PriceBook {
 fn engine_price(book: &PriceBook, event: &UsageEvent) -> Result<PricedEvent, PricingError> {
     let wire = serde_json::to_value(event).unwrap();
     let usage: BillableUsage = serde_json::from_value(wire).unwrap();
-    price_event(book, &usage, RECEIVED)
+    price_event(book, &usage, &payer(), RECEIVED)
 }
 
 fn charge(priced: &PricedEvent) -> u64 {
