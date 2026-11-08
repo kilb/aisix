@@ -3,6 +3,7 @@ import type { TabProps } from "../../App";
 import { ApiError, reconciliation, tenants, type Reconciliation as Answer, type Tenant } from "../../lib/api";
 import { errorText, fmtInt } from "../../lib/fmt";
 import { fmtMicroUsd, fmtUtc } from "../../lib/money";
+import { reasonLabel } from "../../lib/pricingStatus";
 import { checkLabel, dropLabel, failureText } from "../../lib/reconcile";
 import { Button } from "../../ui/Button";
 import { DataTable, Loading } from "../../ui/DataTable";
@@ -160,7 +161,7 @@ export function Reconciliation(_props: TabProps) {
                 </tr>
                 {Object.entries(unpriced.by_code).map(([code, n]) => (
                   <tr key={code}>
-                    <th scope="row">{code}</th>
+                    <th scope="row">{reasonLabel(code)}</th>
                     <td className="num">{fmtInt(n)}</td>
                   </tr>
                 ))}

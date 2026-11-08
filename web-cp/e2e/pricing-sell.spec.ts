@@ -283,7 +283,7 @@ test("平台价格历史不含租户专属价", async ({ page }) => {
   await openPrices(page);
   const panel = await openModel(page, world.model.name);
   const table = panel.getByRole("table", { name: "价格历史" });
-  await expect(table).toContainText("11");
+  await expect(table.getByRole("row").filter({ has: page.getByRole("cell", { name: "11", exact: true }) })).toHaveCount(1);
   await expect(table).not.toContainText("777");
   await expect(table).not.toContainText("888");
 });

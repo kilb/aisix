@@ -50,7 +50,7 @@
   box-shadow: inset 4px 0 0 var(--sign);
 }
 .bl-name {
-  max-width: 220px;
+  max-width: var(--trunc, 200px);
 }
 .bl-mark {
   margin-left: var(--s-2);
