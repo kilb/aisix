@@ -1,7 +1,7 @@
 import { Fragment, useEffect, useState } from "react";
 import type { TabProps } from "../../App";
 import { JsonEditor } from "../../components/JsonEditor";
-import { catalogue, type CatalogueEntry } from "../../lib/api";
+import { pricing, type CatalogueEntry } from "../../lib/api";
 import { errorText } from "../../lib/fmt";
 import { Button } from "../../ui/Button";
 import { DataTable, Loading } from "../../ui/DataTable";
@@ -18,8 +18,8 @@ export function Catalogue(_props: TabProps) {
 
   useEffect(() => {
     const live = { on: true };
-    catalogue
-      .entries()
+    pricing
+      .catalogue()
       .then((r) => live.on && setItems(r.items))
       .catch((e: unknown) => live.on && setFailure(errorText(e)));
     return () => {
@@ -62,13 +62,17 @@ export function Catalogue(_props: TabProps) {
                     </td>
                     <td>{e.aliases.length ? e.aliases.join("、") : "—"}</td>
                     <td>
-                      <a href={e.source_url} target="_blank" rel="noreferrer noopener" className="trunc" title={e.source_url}>
-                        {e.source_url}
-                      </a>
+                      {e.source_url ? (
+                        <a href={e.source_url} target="_blank" rel="noreferrer noopener" className="trunc" title={e.source_url}>
+                          {e.source_url}
+                        </a>
+                      ) : (
+                        "—"
+                      )}
                     </td>
                     <td className="tabular">
-                      {e.effective_from ? `${e.effective_from} 起` : e.as_of}
-                      {e.effective_from && <div className="cell-note">抄录于 {e.as_of}</div>}
+                      {e.effective_from ? `${e.effective_from} 起` : (e.as_of ?? "—")}
+                      {e.effective_from && e.as_of && <div className="cell-note">抄录于 {e.as_of}</div>}
                     </td>
                     <td>{e.notes ?? "—"}</td>
                     <td className="right">

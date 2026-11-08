@@ -24,6 +24,8 @@ async function openCatalogue(page: Page): Promise<void> {
   await page.getByLabel("口令").fill(stack.operator.password);
   await page.getByRole("button", { name: "登录" }).click();
   await page.getByRole("tab", { name: "价格", exact: true }).click();
+  // With every section registered, 价格 opens on its first; this page is one switch away.
+  await page.getByRole("button", { name: "价格目录" }).click();
 }
 
 test("价格目录可浏览，带来源链接与日期", async ({ page }) => {
