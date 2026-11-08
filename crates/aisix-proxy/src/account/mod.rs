@@ -8,7 +8,10 @@
 //! request is bounded by [`ACCOUNT_TIMEOUT`], answers are cached for a few
 //! seconds in caches bounded at [`CACHE_CAPACITY`] entries, and a control
 //! plane that cannot answer fails only the lookup, with `503`
-//! ([`crate::ProxyError::AccountUnavailable`]).
+//! ([`crate::ProxyError::AccountUnavailable`]). A failure is cached too, for
+//! [`FAILURE_TTL`], so a failing control plane is asked at most once a second
+//! per key, and its failures are logged at WARN at most once per
+//! [`WARN_INTERVAL`].
 //!
 //! Without a control plane (a gateway reading a resources file, or a managed
 //! gateway with no certificate bundle) there is no client, and every lookup
@@ -22,7 +25,8 @@
 
 pub(crate) mod key;
 
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 use serde::de::DeserializeOwned;
@@ -33,8 +37,38 @@ pub const ACCOUNT_TIMEOUT: Duration = Duration::from_secs(2);
 pub const QUOTA_TTL: Duration = Duration::from_secs(3);
 /// How long the control plane's "no such key" is served from the cache.
 pub const NOT_FOUND_TTL: Duration = Duration::from_secs(1);
+/// How long a lookup the control plane could not answer is answered `503`
+/// from the cache.
+pub const FAILURE_TTL: Duration = Duration::from_secs(1);
 /// The most entries any one lookup cache holds.
 pub const CACHE_CAPACITY: u64 = 10_000;
+/// At most one WARN per this interval for the lookups' failures; the rest
+/// are logged at debug.
+pub const WARN_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Whether a lookup failure may be logged at WARN now ([`WARN_INTERVAL`]).
+fn warn_due() -> bool {
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let last = LAST.load(Ordering::Relaxed);
+    now.saturating_sub(last) >= WARN_INTERVAL.as_secs()
+        && LAST
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+}
+
+/// A lookup failure, at WARN when [`warn_due`] and at debug otherwise.
+macro_rules! lookup_failed {
+    ($($arg:tt)*) => {
+        if warn_due() {
+            tracing::warn!($($arg)*)
+        } else {
+            tracing::debug!($($arg)*)
+        }
+    };
+}
 
 /// Why a lookup has no answer to give.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,7 +120,7 @@ impl AccountClient {
         // The URL is left out of every line logged here: a configured
         // control-plane URL may carry a password.
         let response = request.send().await.map_err(|error| {
-            tracing::warn!(
+            lookup_failed!(
                 error = %aisix_gateway::transport_error_message(&error.without_url()),
                 "account lookup: the control plane could not be reached",
             );
@@ -97,7 +131,7 @@ impl AccountClient {
             return Ok(None);
         }
         if !status.is_success() {
-            tracing::warn!(%status, "account lookup: the control plane answered with a failure");
+            lookup_failed!(%status, "account lookup: the control plane answered with a failure");
             return Err(AccountError::Unavailable);
         }
         let body = response.bytes().await.map_err(|error| {
@@ -105,7 +139,7 @@ impl AccountClient {
             AccountError::Unavailable
         })?;
         serde_json::from_slice(&body).map(Some).map_err(|error| {
-            tracing::warn!(%error, "account lookup: the control plane's answer does not decode");
+            lookup_failed!(%error, "account lookup: the control plane's answer does not decode");
             AccountError::Unavailable
         })
     }

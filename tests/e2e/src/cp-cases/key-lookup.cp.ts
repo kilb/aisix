@@ -18,6 +18,12 @@ import { startSwallowRelay, type SwallowRelay } from "../harness/swallow-relay.j
 const QUOTA_TTL_MS = 3_000;
 /** How long the gateway waits for the control plane on a lookup. */
 const ACCOUNT_TIMEOUT_MS = 2_000;
+/**
+ * A chat during the outage must answer well inside the lookup's deadline: a
+ * model request that waited on the control plane would take the whole
+ * deadline. The margin is for a loaded machine.
+ */
+const CHAT_DURING_OUTAGE_MS = 1_500;
 const PASSWORD = "key-lookup-e2e-pass-4d2";
 
 describe("a caller looks up its own quota with its API key", () => {
@@ -42,6 +48,11 @@ describe("a caller looks up its own quota with its API key", () => {
       model: CHAT_MODEL,
       messages: [{ role: "user", content: "spend a little" }],
     });
+  const timedChat = async (key: string): Promise<{ answer: GatewayAnswer; tookMs: number }> => {
+    const started = Date.now();
+    const answer = await chat(key);
+    return { answer, tookMs: Date.now() - started };
+  };
   const served = async (key: string): Promise<void> => {
     const answer = await chat(key);
     expect(answer.status, answer.text).toBe(200);
@@ -215,18 +226,37 @@ describe("a caller looks up its own quota with its API key", () => {
         async () => {
           const { answer, tookMs } = await timedLookup(ko);
           last = `${answer.status} after ${tookMs} ms: ${answer.text}`;
-          return answer.status === 200 ? undefined : { status: answer.status, tookMs };
+          return answer.status === 200
+            ? undefined
+            : { status: answer.status, tookMs, code: answer.json?.error?.code };
         },
         { timeoutMs: QUOTA_TTL_MS + ACCOUNT_TIMEOUT_MS + 2_000, intervalMs: 250, describe: () => last },
       );
       expect(failed.status, last).toBe(503);
+      expect(failed.code, last).toBe("control_plane_unavailable");
       expect(failed.tookMs, last).toBeLessThanOrEqual(ACCOUNT_TIMEOUT_MS + 1_000);
 
-      // While the lookup fails, a chat on the same key is served.
-      const [again, chatted] = await Promise.all([timedLookup(ko), chat(ko)]);
-      expect(again.answer.status, again.answer.text).toBe(503);
-      expect(again.tookMs, again.answer.text).toBeLessThanOrEqual(ACCOUNT_TIMEOUT_MS + 1_000);
-      expect(chatted.status, chatted.text).toBe(200);
+      // While a lookup waits on the held control plane, a chat on the same key
+      // is served, and waits on nothing the lookup waits on. A lookup that
+      // returns at once was answered without asking the control plane, so
+      // the pair is sent again until its lookup is one that waited.
+      let pairLast = "no pair";
+      const pair = await pollUntil(
+        "a lookup that waits on the held control plane, beside a chat",
+        async () => {
+          const [lookup, chatted] = await Promise.all([timedLookup(ko), timedChat(ko)]);
+          pairLast =
+            `lookup ${lookup.answer.status} after ${lookup.tookMs} ms: ${lookup.answer.text}; ` +
+            `chat ${chatted.answer.status} after ${chatted.tookMs} ms`;
+          expect(chatted.answer.status, chatted.answer.text).toBe(200);
+          expect(chatted.tookMs, pairLast).toBeLessThan(CHAT_DURING_OUTAGE_MS);
+          return lookup.tookMs >= ACCOUNT_TIMEOUT_MS - 250 ? lookup : undefined;
+        },
+        { timeoutMs: 10_000, intervalMs: 300, describe: () => pairLast },
+      );
+      expect(pair.answer.status, pairLast).toBe(503);
+      expect(pair.answer.json?.error?.code, pairLast).toBe("control_plane_unavailable");
+      expect(pair.tookMs, pairLast).toBeLessThanOrEqual(ACCOUNT_TIMEOUT_MS + 1_000);
     } finally {
       relay!.resume();
     }

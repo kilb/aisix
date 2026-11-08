@@ -453,6 +453,7 @@ fn keeps_own_envelope(err: &ProxyError) -> bool {
             | ProxyError::ContentFiltered { .. }
             | ProxyError::BudgetExceeded(_)
             | ProxyError::BudgetUnverified
+            | ProxyError::AccountUnavailable
             | ProxyError::RateLimit(_)
             | ProxyError::ModelRateLimit(_)
             | ProxyError::PolicyRateLimit { .. }
@@ -1176,6 +1177,7 @@ mod tests {
             | ProxyError::ContentFiltered { .. }
             | ProxyError::BudgetExceeded(_)
             | ProxyError::BudgetUnverified
+            | ProxyError::AccountUnavailable
             | ProxyError::RateLimit(_)
             | ProxyError::ModelRateLimit(_)
             | ProxyError::PolicyRateLimit { .. } => true,
@@ -1188,8 +1190,7 @@ mod tests {
             | ProxyError::TargetRefused(_)
             | ProxyError::ProviderUnavailable
             | ProxyError::SemanticDecisionFailed { .. }
-            | ProxyError::AllCandidatesUnavailable { .. }
-            | ProxyError::AccountUnavailable => false,
+            | ProxyError::AllCandidatesUnavailable { .. } => false,
             ProxyError::Bridge(e) => matches!(e, BridgeError::RequestTooLarge { .. }),
         }
     }

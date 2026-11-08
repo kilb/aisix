@@ -23,8 +23,8 @@
 //!   ([`ProxyError::AccountUnavailable`]).
 //!
 //! Answers are cached per key for [`QUOTA_TTL`], a `404` for
-//! [`NOT_FOUND_TTL`], so the figures lag spend by a few seconds; `as_of` says
-//! when the control plane computed them. A failure is never cached.
+//! [`NOT_FOUND_TTL`] and a failure for [`FAILURE_TTL`], so the figures lag
+//! spend by a few seconds; `as_of` says when the control plane computed them.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -38,8 +38,8 @@ use moka::Expiry;
 use serde::{Deserialize, Deserializer, Serialize};
 
 use super::{
-    key_path, AccountClient, AccountError, ACCOUNT_TIMEOUT, CACHE_CAPACITY, NOT_FOUND_TTL,
-    QUOTA_TTL,
+    key_path, AccountClient, AccountError, ACCOUNT_TIMEOUT, CACHE_CAPACITY, FAILURE_TTL,
+    NOT_FOUND_TTL, QUOTA_TTL,
 };
 use crate::auth::AuthenticatedKey;
 use crate::error::{ErrorEnvelope, ProxyError};
@@ -100,28 +100,31 @@ fn present<'de, D: Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> 
     Option::deserialize(d)
 }
 
-/// The quota answers by key id; `None` is the control plane's `404`.
-pub(crate) type QuotaCache = Cache<String, Option<Arc<KeyQuotaAnswer>>>;
+/// A lookup's outcome: `Ok(None)` is the control plane's `404`.
+type QuotaLookup = Result<Option<Arc<KeyQuotaAnswer>>, AccountError>;
+
+/// The quota lookups by key id.
+pub(crate) type QuotaCache = Cache<String, QuotaLookup>;
 
 /// An answer lives [`QUOTA_TTL`] from when it was fetched, a `404`
-/// [`NOT_FOUND_TTL`].
+/// [`NOT_FOUND_TTL`], a failure [`FAILURE_TTL`].
 struct QuotaExpiry;
 
 impl QuotaExpiry {
-    fn ttl(answer: &Option<Arc<KeyQuotaAnswer>>) -> Duration {
-        if answer.is_some() {
-            QUOTA_TTL
-        } else {
-            NOT_FOUND_TTL
+    fn ttl(lookup: &QuotaLookup) -> Duration {
+        match lookup {
+            Ok(Some(_)) => QUOTA_TTL,
+            Ok(None) => NOT_FOUND_TTL,
+            Err(_) => FAILURE_TTL,
         }
     }
 }
 
-impl Expiry<String, Option<Arc<KeyQuotaAnswer>>> for QuotaExpiry {
+impl Expiry<String, QuotaLookup> for QuotaExpiry {
     fn expire_after_create(
         &self,
         _key: &String,
-        answer: &Option<Arc<KeyQuotaAnswer>>,
+        answer: &QuotaLookup,
         _created_at: Instant,
     ) -> Option<Duration> {
         Some(Self::ttl(answer))
@@ -130,7 +133,7 @@ impl Expiry<String, Option<Arc<KeyQuotaAnswer>>> for QuotaExpiry {
     fn expire_after_update(
         &self,
         _key: &String,
-        answer: &Option<Arc<KeyQuotaAnswer>>,
+        answer: &QuotaLookup,
         _updated_at: Instant,
         _duration_until_expiry: Option<Duration>,
     ) -> Option<Duration> {
@@ -148,18 +151,14 @@ pub(super) fn quota_cache() -> QuotaCache {
 impl AccountClient {
     /// The quota answer for key `key_id`, `None` for a key the control plane
     /// does not know. Concurrent lookups of one key share one request.
-    pub(crate) async fn key_quota(
-        &self,
-        key_id: &str,
-    ) -> Result<Option<Arc<KeyQuotaAnswer>>, AccountError> {
+    pub(crate) async fn key_quota(&self, key_id: &str) -> QuotaLookup {
         self.quotas
-            .try_get_with(key_id.to_string(), async {
+            .get_with(key_id.to_string(), async {
                 self.get_json::<KeyQuotaAnswer>(&key_path(key_id, "quota"), &[], ACCOUNT_TIMEOUT)
                     .await
                     .map(|answer| answer.map(Arc::new))
             })
             .await
-            .map_err(|error| *error)
     }
 }
 
@@ -428,10 +427,14 @@ mod tests {
             client.key_quota("garbled").await.unwrap_err(),
             AccountError::Unavailable
         );
-        // A failure is not cached: the next lookup asks again.
+        // A failure is answered from the cache for FAILURE_TTL, then asked
+        // again.
         let before = stand_in.hits();
         assert!(client.key_quota("failing").await.is_err());
-        assert_eq!(stand_in.hits(), before + 1);
+        assert_eq!(stand_in.hits(), before, "within FAILURE_TTL");
+        tokio::time::sleep(FAILURE_TTL + Duration::from_millis(300)).await;
+        assert!(client.key_quota("failing").await.is_err());
+        assert_eq!(stand_in.hits(), before + 1, "past FAILURE_TTL");
 
         let stalled =
             StandIn::start_with_delay(Arc::new(|_| ok(full_answer())), Duration::from_secs(3))
@@ -660,10 +663,14 @@ mod tests {
             "Account information is temporarily unavailable."
         );
 
-        // In platform mode it is classed like any refusal that does not keep
-        // its own envelope: still a 503.
+        // It names no upstream, so platform mode answers it as itself.
         let (status, body) = get_key(router(Some(stand_in.client()), true), OWNER).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
-        assert_eq!(body["error"]["code"], "upstream_unavailable");
+        assert_eq!(body["error"]["type"], "api_error");
+        assert_eq!(body["error"]["code"], "control_plane_unavailable");
+        assert_eq!(
+            body["error"]["message"],
+            "Account information is temporarily unavailable."
+        );
     }
 }
