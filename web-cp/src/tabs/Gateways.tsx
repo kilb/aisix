@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import type { TabProps } from "../App";
-import { Field } from "../components/Field";
+import { Field, useRefusalFocus } from "../ui/Field";
 import { Msg, type Note } from "../components/Msg";
 import {
   ApiError,
@@ -12,7 +12,12 @@ import {
 } from "../lib/api";
 import { problemAt } from "../lib/errors";
 import { errorText, fmtTime } from "../lib/fmt";
-import { TwoStep } from "./Tenants";
+import { Button } from "../ui/Button";
+import { CopyButton } from "../ui/CopyButton";
+import { DataTable, Loading } from "../ui/DataTable";
+import { EmptyState } from "../ui/EmptyState";
+import { Lamp } from "../ui/Lamp";
+import { TwoStep } from "../ui/TwoStep";
 
 /** How often the instances are read again: about one gateway heartbeat. */
 const REFRESH_MS = 5_000;
@@ -40,6 +45,8 @@ export function Gateways({ operator }: TabProps) {
   const [credentialsError, setCredentialsError] = useState<string | null>(null);
   const [note, setNote] = useState<Note | null>(null);
   const [busy, setBusy] = useState(false);
+  // The credential whose revoke is in flight.
+  const [revoking, setRevoking] = useState<string | null>(null);
   // Held in this component's state only: it is gone when the tab is left or
   // the page reloads, and is never written to storage, the URL or a log.
   const [bundle, setBundle] = useState<IssuedCredential | null>(null);
@@ -77,6 +84,7 @@ export function Gateways({ operator }: TabProps) {
 
   async function revoke(c: Credential) {
     setBusy(true);
+    setRevoking(c.dp_id);
     setNote(null);
     try {
       const view = await gateways.revoke(c.dp_id);
@@ -86,6 +94,7 @@ export function Gateways({ operator }: TabProps) {
       setNote({ kind: "crit", text: errorText(e) });
     } finally {
       setBusy(false);
+      setRevoking(null);
     }
   }
 
@@ -100,51 +109,45 @@ export function Gateways({ operator }: TabProps) {
           </div>
         )}
         {instances === null ? (
-          !instancesError && <p className="hint">载入中…</p>
+          !instancesError && <Loading />
         ) : instances.length === 0 ? (
-          <p className="hint">还没有网关发来心跳。</p>
+          <EmptyState mark="gateway" text="还没有网关发来心跳。" />
         ) : (
-          <div className="scroll">
-            <table>
-              <thead>
-                <tr>
-                  <th>凭据</th>
-                  <th>主机</th>
-                  <th>版本</th>
-                  <th className="right">已应用修订</th>
-                  <th>最近心跳</th>
-                  <th>状态</th>
-                </tr>
-              </thead>
-              <tbody>
-                {instances.map((i) => (
-                  <tr key={`${i.dp_id}/${i.instance_id}`}>
-                    <td>{i.credential_name}</td>
-                    <td>
-                      <code>{i.hostname}</code>
-                    </td>
-                    <td>
-                      <code>{i.version}</code>
-                      {i.version_matches_cp === false && (
-                        <>
-                          {" "}
-                          <span className="pill crit">版本与控制面不一致</span>
-                        </>
-                      )}
-                    </td>
-                    <td className="right num">{i.applied_revision}</td>
-                    <td>{fmtTime(i.last_seen_at)}</td>
-                    <td>
-                      <span className={`pill ${i.online ? "ok" : ""}`}>
-                        <span className="dot" />
-                        {i.online ? "在线" : "离线"}
+          <DataTable>
+            <thead>
+              <tr>
+                <th>凭据</th>
+                <th>主机</th>
+                <th>版本</th>
+                <th className="right">已应用修订</th>
+                <th>最近心跳</th>
+                <th>状态</th>
+              </tr>
+            </thead>
+            <tbody>
+              {instances.map((i) => (
+                <tr key={`${i.dp_id}/${i.instance_id}`}>
+                  <td>{i.credential_name}</td>
+                  <td>
+                    <code>{i.hostname}</code>
+                  </td>
+                  <td>
+                    <code>{i.version}</code>
+                    {i.version_matches_cp === false && (
+                      <span className="cell-note">
+                        <Lamp state="rejected">版本与控制面不一致</Lamp>
                       </span>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+                    )}
+                  </td>
+                  <td className="right num">{i.applied_revision}</td>
+                  <td>{fmtTime(i.last_seen_at)}</td>
+                  <td>
+                    <Lamp state={i.online ? "applied" : "disabled"}>{i.online ? "在线" : "离线"}</Lamp>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </DataTable>
         )}
       </div>
 
@@ -168,9 +171,9 @@ export function Gateways({ operator }: TabProps) {
           </div>
         )}
         {credentials === null ? (
-          !credentialsError && <p className="hint">载入中…</p>
+          !credentialsError && <Loading />
         ) : credentials.length === 0 ? (
-          <p className="hint">还没有签发过网关凭据。</p>
+          <EmptyState mark="gateway" text="还没有签发过网关凭据。" />
         ) : (
           <ul className="creds">
             {credentials.map((c) => (
@@ -179,14 +182,16 @@ export function Gateways({ operator }: TabProps) {
                 <code>{c.dp_id}</code>
                 <span className="hint">有效期至 {fmtTime(c.not_after)}</span>
                 {c.revoked_at ? (
-                  <span className="pill crit">已吊销 · {fmtTime(c.revoked_at)}</span>
+                  <Lamp state="disabled">已吊销 · {fmtTime(c.revoked_at)}</Lamp>
                 ) : (
-                  <span className="pill">未吊销</span>
+                  <Lamp state="applied">未吊销</Lamp>
                 )}
                 {isAdmin && !c.revoked_at && (
                   <TwoStep
                     label="吊销"
+                    size="sm"
                     disabled={busy}
+                    busy={revoking === c.dp_id}
                     warning={`吊销网关凭据「${c.name}」后，使用这份凭据的网关将被控制面拒绝连接，且无法恢复。`}
                     onConfirm={() => void revoke(c)}
                   />
@@ -211,12 +216,13 @@ function IssueForm({ onIssued }: { onIssued: (b: IssuedCredential) => void }) {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [details, setDetails] = useState<Detail[]>([]);
+  const [form, focusRefusal] = useRefusalFocus<HTMLFormElement>();
 
   if (!open) {
     return (
-      <button className="act" onClick={() => setOpen(true)}>
+      <Button kind="primary" onClick={() => setOpen(true)}>
         签发网关凭据
-      </button>
+      </Button>
     );
   }
 
@@ -234,6 +240,7 @@ function IssueForm({ onIssued }: { onIssued: (b: IssuedCredential) => void }) {
     } catch (e) {
       setErr(errorText(e));
       if (e instanceof ApiError) setDetails(e.details);
+      focusRefusal();
     } finally {
       setBusy(false);
     }
@@ -243,12 +250,12 @@ function IssueForm({ onIssued }: { onIssued: (b: IssuedCredential) => void }) {
   const listed = details.filter((d) => !ISSUE_FIELDS.includes(d.path));
 
   return (
-    <form onSubmit={submit}>
+    <form ref={form} onSubmit={submit}>
       <div className="r">
-        <Field label="名称" problem={at("/name")}>
+        <Field label="名称" error={at("/name")}>
           {(aria) => <input required value={name} onChange={(e) => setName(e.target.value)} {...aria} />}
         </Field>
-        <Field label="有效期（天）" problem={at("/validity_days")}>
+        <Field label="有效期（天）" error={at("/validity_days")}>
           {(aria) => (
             <input
               type="number"
@@ -263,12 +270,12 @@ function IssueForm({ onIssued }: { onIssued: (b: IssuedCredential) => void }) {
         </Field>
       </div>
       <p>
-        <button className="act" type="submit" disabled={busy}>
-          {busy ? "签发中…" : "签发"}
-        </button>{" "}
-        <button className="ghost" type="button" disabled={busy} onClick={() => setOpen(false)}>
+        <Button kind="primary" type="submit" busy={busy} busyLabel="签发中…">
+          签发
+        </Button>{" "}
+        <Button type="button" disabled={busy} onClick={() => setOpen(false)}>
           取消
-        </button>
+        </Button>
       </p>
       {err && (
         <div className="note crit" role="alert">
@@ -293,14 +300,7 @@ function Bundle({ bundle, onClose }: { bundle: IssuedCredential; onClose: () => 
   const [copied, setCopied] = useState<Note | null>(null);
   const lines = envLines(bundle.env);
 
-  async function copyAll() {
-    try {
-      await navigator.clipboard.writeText(lines);
-      setCopied({ kind: "ok", text: "已复制。" });
-    } catch {
-      setCopied({ kind: "crit", text: "浏览器不允许复制，请手动选中上面的内容复制。" });
-    }
-  }
+  const copyFailed = () => setCopied({ kind: "crit", text: "浏览器不允许复制，请手动选中上面的内容复制。" });
 
   return (
     <section className="note warn bundle" aria-label="部署包">
@@ -318,9 +318,7 @@ function Bundle({ bundle, onClose }: { bundle: IssuedCredential; onClose: () => 
       <p className="hint">官方镜像以这些变量启动为托管模式的网关。多行的值用单引号括起。</p>
       <pre>{lines}</pre>
       <p>
-        <button className="act" type="button" onClick={() => void copyAll()}>
-          复制全部
-        </button>
+        <CopyButton text={lines} label="复制全部" kind="primary" onFailed={copyFailed} />
       </p>
       <Msg note={copied} />
       <h3>证书</h3>
@@ -330,9 +328,9 @@ function Bundle({ bundle, onClose }: { bundle: IssuedCredential; onClose: () => 
       <h3>CA 证书</h3>
       <pre>{bundle.ca_pem}</pre>
       <p>
-        <button className="ghost" type="button" onClick={onClose}>
+        <Button type="button" onClick={onClose}>
           我已保存，关闭
-        </button>
+        </Button>
       </p>
     </section>
   );

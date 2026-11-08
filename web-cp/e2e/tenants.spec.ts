@@ -403,6 +403,8 @@ test("客户租户的可用分组不能清空：被拒并在分组处说明，�
   // No group at all reaches no upstream: the save is confirmed first.
   await groups.getByRole("button", { name: "保存分组" }).click();
   await groups.getByRole("button", { name: "确认保存分组" }).click();
+  // The two-step warning fades out after the answer; wait for it to go.
+  await expect(groups.getByRole("alert")).toHaveCount(1);
   await expect(groups.getByRole("alert")).toBeVisible();
   expect((await stack.admin.get(`/admin/tenants/${t.id}`)).allowed_provider_groups).toEqual(before);
 });

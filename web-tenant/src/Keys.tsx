@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useId, useState } from "react";
+import { useCallback, useEffect, useId, useState, type CSSProperties } from "react";
 import {
   ApiError,
   keys as keyApi,
@@ -14,7 +14,13 @@ import {
   type TenantStatus,
 } from "./lib/api";
 import { formMessageFor, messageFor } from "./lib/errors";
-import { ConfirmButton, ShownOnce } from "./controls";
+import { ShownOnce } from "./controls";
+import { Button } from "./ui/Button";
+import { DataTable, Loading } from "./ui/DataTable";
+import { EmptyState } from "./ui/EmptyState";
+import { Field, useRefusalFocus } from "./ui/Field";
+import { Lamp, type LampState } from "./ui/Lamp";
+import { TwoStep } from "./ui/TwoStep";
 
 type Caps = Org["limits"];
 
@@ -59,6 +65,8 @@ export function Keys({
   const [minted, setMinted] = useState<string | null>(null);
   const [actionErr, setActionErr] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
+  // Which action on that key is in flight.
+  const [acting, setActing] = useState<"switch" | "revoke" | null>(null);
 
   const load = useCallback(async () => {
     try {
@@ -84,8 +92,9 @@ export function Keys({
   }, [active, manager]);
 
   /** One change of key `k`; the list is read again whatever the answer. */
-  async function act(k: TenantKey, change: () => Promise<unknown>) {
+  async function act(k: TenantKey, what: "switch" | "revoke", change: () => Promise<unknown>) {
     setBusy(k.id);
+    setActing(what);
     setActionErr(null);
     try {
       await change();
@@ -98,6 +107,7 @@ export function Keys({
       );
     } finally {
       setBusy(null);
+      setActing(null);
     }
     await load();
   }
@@ -121,7 +131,7 @@ export function Keys({
   function limitsOf(k: TenantKey): string {
     // A limit the key leaves unset follows the organisation's cap.
     const one = (label: string, own?: number, cap?: number) =>
-      own !== undefined ? `${label} ${own}` : cap !== undefined ? `${label} ≤${cap}` : null;
+      own !== undefined ? `${label} ${count(own)}` : cap !== undefined ? `${label} ≤${count(cap)}` : null;
     const parts = [
       one("并发", k.rate_limit.concurrency, caps?.key_concurrency_max),
       one("每分钟", k.rate_limit.rpm, caps?.key_rpm_max),
@@ -146,93 +156,122 @@ export function Keys({
           }}
         />
       )}
-      <div className="panel">
-        <h2>密钥</h2>
-        {!active && <div className="note crit">组织已被停用，所有密钥暂时无法调用；这里只能吊销密钥。</div>}
-        {minted && (
-          <ShownOnce title="明文只显示这一次" value={minted} onDone={() => setMinted(null)}>
-            <span className="hint">请立即复制并妥善保存；关闭、刷新或离开此页后无法再次查看。</span>
-          </ShownOnce>
-        )}
-        {listErr && (
-          <div className="note crit" role="alert">
-            {listErr}
-          </div>
-        )}
-        {actionErr && (
-          <div className="note crit" role="alert">
-            {actionErr}
-          </div>
-        )}
+      <div className="panel list">
+        <div className="panel-head">
+          <h2>密钥</h2>
+        </div>
+        <div className="panel-notes">
+          {!active && <div className="note crit">组织已被停用，所有密钥暂时无法调用；这里只能吊销密钥。</div>}
+          {minted && (
+            <ShownOnce title="明文只显示这一次" value={minted} onDone={() => setMinted(null)}>
+              <span className="hint">请立即复制并妥善保存；关闭、刷新或离开此页后无法再次查看。</span>
+            </ShownOnce>
+          )}
+          {listErr && (
+            <div className="note crit" role="alert">
+              {listErr}
+            </div>
+          )}
+          {actionErr && (
+            <div className="note crit" role="alert">
+              {actionErr}
+            </div>
+          )}
+        </div>
         {items === null ? (
-          !listErr && <p className="hint">载入中…</p>
+          !listErr && <Loading />
         ) : items.length === 0 ? (
-          <p className="hint">还没有密钥。</p>
+          <EmptyState mark="key" text="还没有密钥。" />
         ) : (
-          <div className="scroll">
-            <table>
-              <thead>
-                <tr>
-                  <th>名称</th>
-                  <th>前缀</th>
-                  <th>归属</th>
-                  <th>模型</th>
-                  <th>限制</th>
-                  <th>状态</th>
-                  <th />
-                </tr>
-              </thead>
-              <tbody>
-                {items.map((k) => {
-                  const state = stateOf(k);
-                  return (
-                    <tr key={k.id}>
-                      <td>{k.label}</td>
-                      <td className="num">{k.prefix}…</td>
-                      <td>{ownerOf(k)}</td>
-                      <td>{modelsOf(k)}</td>
-                      <td>{limitsOf(k)}</td>
-                      <td>
-                        {state.text}
-                        {state.note && <span className="hint cell-note">{state.note}</span>}
-                      </td>
-                      <td className="right">
-                        <span className="acts">
-                          {/* The organisation's own switch, which the platform's overrides. */}
-                          {active && !k.disabled_by_platform && (
-                            <button
-                              className="ghost"
-                              disabled={busy === k.id}
-                              onClick={() => void act(k, () => keyApi.setDisabled(k.id, !k.disabled, k.version))}
-                            >
-                              {k.disabled ? "启用" : "停用"}
-                            </button>
-                          )}
-                          <ConfirmButton
-                            label="吊销"
-                            warning="吊销后立即失效，且无法恢复"
+          <DataTable>
+            <thead>
+              <tr>
+                <th>名称</th>
+                <th>前缀</th>
+                <th>归属</th>
+                <th>模型</th>
+                <th>限制</th>
+                <th>状态</th>
+                <th>
+                  <span className="vh">操作</span>
+                </th>
+              </tr>
+            </thead>
+            <tbody>
+              {items.map((k) => {
+                const state = stateOf(k);
+                const owner = ownerOf(k);
+                const models = modelsOf(k);
+                return (
+                  <tr key={k.id}>
+                    <td>
+                      <span className="trunc" style={{ "--trunc": "160px" } as CSSProperties} title={k.label}>
+                        {k.label}
+                      </span>
+                    </td>
+                    <td>
+                      <code>{k.prefix}…</code>
+                    </td>
+                    <td>
+                      <span className="trunc" style={{ "--trunc": "128px" } as CSSProperties} title={owner}>
+                        {owner}
+                      </span>
+                    </td>
+                    <td>
+                      <span className="trunc" style={{ "--trunc": "216px" } as CSSProperties} title={models}>
+                        {models}
+                      </span>
+                    </td>
+                    <td className="tabular">{limitsOf(k)}</td>
+                    <td>
+                      <Lamp state={state.lamp}>{state.text}</Lamp>
+                      {state.note && <span className="hint cell-note">{state.note}</span>}
+                    </td>
+                    <td className="right">
+                      <span className="acts">
+                        {/* The organisation's own switch, which the platform's overrides. */}
+                        {active && !k.disabled_by_platform && (
+                          <Button
+                            size="sm"
                             disabled={busy === k.id}
-                            onConfirm={() => void act(k, () => keyApi.revoke(k.id, k.version))}
-                          />
-                        </span>
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
+                            busy={busy === k.id && acting === "switch"}
+                            busyLabel={k.disabled ? "启用" : "停用"}
+                            onClick={() => void act(k, "switch", () => keyApi.setDisabled(k.id, !k.disabled, k.version))}
+                          >
+                            {k.disabled ? "启用" : "停用"}
+                          </Button>
+                        )}
+                        <TwoStep
+                          label="吊销"
+                          size="sm"
+                          warning="吊销后立即失效，且无法恢复"
+                          disabled={busy === k.id}
+                          busy={busy === k.id && acting === "revoke"}
+                          onConfirm={() => void act(k, "revoke", () => keyApi.revoke(k.id, k.version))}
+                        />
+                      </span>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </DataTable>
         )}
       </div>
     </div>
   );
 }
 
-function stateOf(k: TenantKey): { text: string; note?: string } {
-  if (k.disabled_by_platform) return { text: "已被平台停用", note: "只有平台可以重新启用" };
-  if (k.disabled) return { text: "已停用" };
-  if (k.expires_at && Date.parse(k.expires_at) <= Date.now()) return { text: "已过期" };
-  return { text: "可用", note: k.expires_at ? `${when(k.expires_at)} 到期` : undefined };
+/** A count, with thousands separators. */
+function count(n: number): string {
+  return n.toLocaleString("en-US");
+}
+
+function stateOf(k: TenantKey): { text: string; lamp: LampState; note?: string } {
+  if (k.disabled_by_platform) return { text: "已被平台停用", lamp: "disabled", note: "只有平台可以重新启用" };
+  if (k.disabled) return { text: "已停用", lamp: "disabled" };
+  if (k.expires_at && Date.parse(k.expires_at) <= Date.now()) return { text: "已过期", lamp: "disabled" };
+  return { text: "可用", lamp: "applied", note: k.expires_at ? `${when(k.expires_at)} 到期` : undefined };
 }
 
 type Field = "label" | "models" | "concurrency" | "rpm" | "expires" | "owner";
@@ -259,7 +298,7 @@ function limit(raw: string): { value?: number; problem?: string } {
 
 function capHint(cap: number | undefined, caps: Caps | null): string {
   if (caps === null) return "组织上限载入中…";
-  return cap === undefined ? "组织未设上限；留空表示不限" : `组织上限 ${cap}；留空则按此上限`;
+  return cap === undefined ? "组织未设上限；留空表示不限" : `组织上限 ${count(cap)}；留空则按此上限`;
 }
 
 function NewKeyForm({
@@ -293,6 +332,7 @@ function NewKeyForm({
   const [errs, setErrs] = useState<FieldErrors>({});
   const [err, setErr] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [form, focusRefusal] = useRefusalFocus<HTMLFormElement>();
 
   async function submit(e: React.FormEvent) {
     e.preventDefault();
@@ -309,7 +349,10 @@ function NewKeyForm({
       else expiresAt = at.toISOString();
     }
     setErrs(found);
-    if (Object.keys(found).length > 0) return;
+    if (Object.keys(found).length > 0) {
+      focusRefusal();
+      return;
+    }
 
     // Only what was set is sent: no model picked follows every grant, and a
     // limit left empty follows the organisation's cap.
@@ -340,6 +383,7 @@ function NewKeyForm({
         }
         setErrs(byField);
         if (rest.length > 0) setErr(rest.join("；"));
+        focusRefusal();
       } else if (e instanceof ApiError && e.code === "unavailable") {
         setErr("平台暂时无法创建密钥，请稍后再试");
       } else if (e instanceof ApiError && e.code === "tenant_not_active") {
@@ -353,18 +397,9 @@ function NewKeyForm({
     }
   }
 
-  const hintId = (f: Field) => `${id}-${f}-hint`;
-  const errId = (f: Field) => `${id}-${f}-err`;
-  /** The ids describing field `f`: its hint when it has one, then its refusal. */
-  const describedBy = (f: Field, hinted: boolean) =>
-    [hinted ? hintId(f) : null, errs[f] ? errId(f) : null].filter((x) => x !== null).join(" ") || undefined;
-  const invalid = (f: Field) => (errs[f] ? true : undefined);
-  const refusal = (f: Field) =>
-    errs[f] && (
-      <p className="field-err" id={errId(f)} role="alert">
-        {errs[f]}
-      </p>
-    );
+  // The models are a fieldset rather than one Field: their hint and refusal are wired here.
+  const modelsHint = `${id}-models-hint`;
+  const modelsErr = `${id}-models-err`;
   const choices = (people ?? []).filter((p) => p.id !== me.id && p.role !== "billing");
 
   return (
@@ -375,99 +410,69 @@ function NewKeyForm({
           {readErr}
         </div>
       )}
-      <form onSubmit={submit} noValidate>
-        <label className="f">
-          <span>名称</span>
-          <input
-            value={label}
-            onChange={(e) => setLabel(e.target.value)}
-            aria-invalid={invalid("label")}
-            aria-describedby={describedBy("label", false)}
-          />
-        </label>
-        {refusal("label")}
+      <form ref={form} className="form cols" onSubmit={submit} noValidate>
+        <Field label="名称" wide error={errs.label}>
+          {(aria) => <input value={label} onChange={(e) => setLabel(e.target.value)} {...aria} />}
+        </Field>
 
-        <fieldset className="f" aria-describedby={describedBy("models", true)} aria-invalid={invalid("models")}>
-          <legend>可用模型</legend>
-          {catalog === null ? (
-            <span className="hint">载入中…</span>
-          ) : catalog.length === 0 ? (
-            <span className="hint">组织还没有获授权的模型</span>
-          ) : (
-            catalog.map((m) => (
-              <label key={m.id} className="pick">
-                <input
-                  type="checkbox"
-                  checked={picked.includes(m.id)}
-                  onChange={(e) =>
-                    setPicked(e.target.checked ? [...picked, m.id] : picked.filter((p) => p !== m.id))
-                  }
-                />
-                {m.name}
-              </label>
-            ))
+        <div className="field wide">
+          <fieldset
+            className="field"
+            aria-describedby={errs.models ? `${modelsHint} ${modelsErr}` : modelsHint}
+            aria-invalid={errs.models ? true : undefined}
+          >
+            <legend>可用模型</legend>
+            {catalog === null ? (
+              <span className="hint">载入中…</span>
+            ) : catalog.length === 0 ? (
+              <span className="hint">组织还没有获授权的模型</span>
+            ) : (
+              <div className="picks">
+                {catalog.map((m) => (
+                  <label key={m.id} className="pick">
+                    <input
+                      type="checkbox"
+                      checked={picked.includes(m.id)}
+                      onChange={(e) =>
+                        setPicked(e.target.checked ? [...picked, m.id] : picked.filter((p) => p !== m.id))
+                      }
+                    />
+                    {m.name}
+                  </label>
+                ))}
+              </div>
+            )}
+          </fieldset>
+          <p className="hint" id={modelsHint}>
+            不勾选即可使用组织获授权的全部模型，包括以后新授权的
+          </p>
+          {errs.models && (
+            <p className="field-problem" id={modelsErr}>
+              {errs.models}
+            </p>
           )}
-        </fieldset>
-        <p className="hint" id={hintId("models")}>
-          不勾选即可使用组织获授权的全部模型，包括以后新授权的
-        </p>
-        {refusal("models")}
+        </div>
 
-        <label className="f">
-          <span>并发</span>
-          <input
-            inputMode="numeric"
-            value={concurrency}
-            onChange={(e) => setConcurrency(e.target.value)}
-            aria-invalid={invalid("concurrency")}
-            aria-describedby={describedBy("concurrency", true)}
-          />
-        </label>
-        <p className="hint" id={hintId("concurrency")}>
-          {capHint(caps?.key_concurrency_max, caps)}
-        </p>
-        {refusal("concurrency")}
+        <Field label="并发" hint={capHint(caps?.key_concurrency_max, caps)} error={errs.concurrency}>
+          {(aria) => (
+            <input inputMode="numeric" value={concurrency} onChange={(e) => setConcurrency(e.target.value)} {...aria} />
+          )}
+        </Field>
 
-        <label className="f">
-          <span>每分钟请求</span>
-          <input
-            inputMode="numeric"
-            value={rpm}
-            onChange={(e) => setRpm(e.target.value)}
-            aria-invalid={invalid("rpm")}
-            aria-describedby={describedBy("rpm", true)}
-          />
-        </label>
-        <p className="hint" id={hintId("rpm")}>
-          {capHint(caps?.key_rpm_max, caps)}
-        </p>
-        {refusal("rpm")}
+        <Field label="每分钟请求" hint={capHint(caps?.key_rpm_max, caps)} error={errs.rpm}>
+          {(aria) => <input inputMode="numeric" value={rpm} onChange={(e) => setRpm(e.target.value)} {...aria} />}
+        </Field>
 
-        <label className="f">
-          <span>过期时间</span>
-          <input
-            type="datetime-local"
-            value={expires}
-            onChange={(e) => setExpires(e.target.value)}
-            aria-invalid={invalid("expires")}
-            aria-describedby={describedBy("expires", true)}
-          />
-        </label>
-        <p className="hint" id={hintId("expires")}>
-          留空表示永不过期；按本机时区
-        </p>
-        {refusal("expires")}
+        <Field label="过期时间" hint="留空表示永不过期；按本机时区" error={errs.expires}>
+          {(aria) => (
+            <input type="datetime-local" value={expires} onChange={(e) => setExpires(e.target.value)} {...aria} />
+          )}
+        </Field>
 
         {manager && (
-          <>
-            <label className="f">
-              <span>归属成员</span>
-              <select
-                value={owner}
-                onChange={(e) => setOwner(e.target.value)}
-                aria-invalid={invalid("owner")}
-                aria-describedby={describedBy("owner", false)}
-              >
+          <Field label="归属成员" error={errs.owner}>
+            {(aria) => (
+              <select value={owner} onChange={(e) => setOwner(e.target.value)} {...aria}>
                 <option value="">我</option>
                 {choices.map((p) => (
                   <option key={p.id} value={p.id}>
@@ -476,9 +481,8 @@ function NewKeyForm({
                   </option>
                 ))}
               </select>
-            </label>
-            {refusal("owner")}
-          </>
+            )}
+          </Field>
         )}
 
         {err && (
@@ -486,9 +490,11 @@ function NewKeyForm({
             {err}
           </div>
         )}
-        <button className="act narrow" type="submit" disabled={busy}>
-          {busy ? "处理中…" : "新建密钥"}
-        </button>
+        <div className="form-actions">
+          <Button kind="primary" type="submit" busy={busy}>
+            新建密钥
+          </Button>
+        </div>
       </form>
     </div>
   );

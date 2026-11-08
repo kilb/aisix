@@ -1,4 +1,5 @@
 import { useId, useState } from "react";
+import { Button } from "../ui/Button";
 
 /**
  * A list of short names, such as provider groups: one chip per name with
@@ -74,9 +75,9 @@ export function TagInput({
               }
             }}
           />
-          <button type="button" className="ghost" onClick={add}>
+          <Button type="button" onClick={add}>
             添加
-          </button>
+          </Button>
         </div>
       )}
       {hint && <p className="hint">{hint}</p>}

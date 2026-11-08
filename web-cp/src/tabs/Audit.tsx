@@ -3,6 +3,9 @@ import type { TabProps } from "../App";
 import { audit, tenants as tenantsApi, type AuditEntry, type Tenant } from "../lib/api";
 import { redacted } from "../lib/auditDetail";
 import { errorText, fmtTime } from "../lib/fmt";
+import { Button } from "../ui/Button";
+import { DataTable, Loading } from "../ui/DataTable";
+import { EmptyState } from "../ui/EmptyState";
 
 /**
  * The `target_kind` values the control plane records, by the names this
@@ -126,7 +129,7 @@ export function Audit(_: TabProps) {
       <h2>审计日志</h2>
       <p className="hint">每一项变更都与它的审计记录在同一事务里写入，最新的在前。详情只列字段名和非机密的值。</p>
       <div className="r">
-        <label className="f">
+        <label className="f filter">
           <span>对象类型</span>
           <select value={filter.kind} onChange={(e) => setFilter((f) => ({ ...f, kind: e.target.value }))}>
             <option value="">全部</option>
@@ -137,7 +140,7 @@ export function Audit(_: TabProps) {
             ))}
           </select>
         </label>
-        <label className="f">
+        <label className="f filter">
           <span>租户</span>
           <select value={filter.tenant} onChange={(e) => setFilter((f) => ({ ...f, tenant: e.target.value }))}>
             <option value="">全部</option>
@@ -149,9 +152,9 @@ export function Audit(_: TabProps) {
             ))}
           </select>
         </label>
-        <button type="button" className="ghost" onClick={() => void loadFirst(filter)}>
+        <Button type="button" size="sm" icon="refresh" onClick={() => void loadFirst(filter)}>
           刷新
-        </button>
+        </Button>
       </div>
       {tenantsError && <div className="note crit">无法读取租户列表：{tenantsError}</div>}
       {error && (
@@ -159,57 +162,55 @@ export function Audit(_: TabProps) {
           {error}
         </div>
       )}
-      {rows === null && !error && <p className="hint">载入中…</p>}
-      {rows !== null && rows.length === 0 && <p className="hint">没有符合条件的记录。</p>}
+      {rows === null && !error && <Loading />}
+      {rows !== null && rows.length === 0 && <EmptyState mark="log" text="没有符合条件的记录。" />}
       {rows !== null && rows.length > 0 && (
-        <div className="scroll">
-          <table>
-            <thead>
-              <tr>
-                <th>编号</th>
-                <th>时间</th>
-                <th>操作者</th>
-                <th>动作</th>
-                <th>对象</th>
-                <th>租户</th>
-                <th>详情</th>
+        <DataTable scroll>
+          <thead>
+            <tr>
+              <th>编号</th>
+              <th>时间</th>
+              <th>操作者</th>
+              <th>动作</th>
+              <th>对象</th>
+              <th>租户</th>
+              <th>详情</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((r) => (
+              <tr key={r.id}>
+                <td>{r.id}</td>
+                <td title={r.at}>{fmtTime(r.at)}</td>
+                <td>
+                  {r.actor.email ?? ""}
+                  {ACTOR_KIND[r.actor.kind] && (
+                    <span className="hint">
+                      {r.actor.email ? " · " : ""}
+                      {ACTOR_KIND[r.actor.kind]}
+                    </span>
+                  )}
+                </td>
+                <td>
+                  <code>{r.action}</code>
+                </td>
+                <td>
+                  {r.target_kind ? <code>{r.target_kind}</code> : "—"} {r.target_id && <code>{r.target_id}</code>}
+                </td>
+                <td>{r.tenant_id ? tenantName(r.tenant_id) : "—"}</td>
+                <td>
+                  <DetailSummary detail={r.detail} />
+                </td>
               </tr>
-            </thead>
-            <tbody>
-              {rows.map((r) => (
-                <tr key={r.id}>
-                  <td>{r.id}</td>
-                  <td title={r.at}>{fmtTime(r.at)}</td>
-                  <td>
-                    {r.actor.email ?? ""}
-                    {ACTOR_KIND[r.actor.kind] && (
-                      <span className="hint">
-                        {r.actor.email ? " · " : ""}
-                        {ACTOR_KIND[r.actor.kind]}
-                      </span>
-                    )}
-                  </td>
-                  <td>
-                    <code>{r.action}</code>
-                  </td>
-                  <td>
-                    {r.target_kind ? <code>{r.target_kind}</code> : "—"} {r.target_id ?? ""}
-                  </td>
-                  <td>{r.tenant_id ? tenantName(r.tenant_id) : "—"}</td>
-                  <td>
-                    <DetailSummary detail={r.detail} />
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
+            ))}
+          </tbody>
+        </DataTable>
       )}
       {next !== null && (
         <div className="r">
-          <button type="button" className="ghost" disabled={loadingMore} onClick={() => void loadMore()}>
+          <Button type="button" disabled={loadingMore} onClick={() => void loadMore()}>
             加载更多
-          </button>
+          </Button>
         </div>
       )}
     </div>
