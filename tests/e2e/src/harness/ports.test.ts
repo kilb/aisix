@@ -1,7 +1,7 @@
 import { createServer, type Server } from "node:net";
 import { describe, expect, test } from "vitest";
 import { isAddrInUseStartupFailure } from "./app.js";
-import { pickFreePort, pickFreePorts, rangeSlotFor } from "./ports.js";
+import { pickFreePort, pickFreePorts, rangeBase, rangeSlotFor } from "./ports.js";
 
 function listen(port: number): Promise<Server> {
   return new Promise((resolve, reject) => {
@@ -22,7 +22,7 @@ describe("harness port allocator", () => {
     const ports = await pickFreePorts(10);
     expect(new Set(ports).size).toBe(ports.length);
     for (const p of ports) {
-      expect(p).toBeGreaterThanOrEqual(21000);
+      expect(p).toBeGreaterThanOrEqual(13000);
       expect(p).toBeLessThan(32200);
       const srv = await listen(p); // must not be handed out already bound
       await close(srv);
@@ -78,7 +78,24 @@ test("an e2e port slot offsets the fork's port range", () => {
   expect(rangeSlotFor(1, undefined, 99)).toBe(1);
   expect(rangeSlotFor(1, "", 99)).toBe(1);
   expect(rangeSlotFor(1, "3", 99)).toBe(4);
-  expect(rangeSlotFor(13, "2", 99)).toBe(1);
-  expect(rangeSlotFor(undefined, "2", 29)).toBe(3); // 29 % 14 = 1, + 2
-  for (const bad of ["x", "-1", "14", "1.5"]) expect(() => rangeSlotFor(1, bad, 99)).toThrow("E2E_PORT_SLOT");
+  expect(rangeSlotFor(13, "2", 99)).toBe(15);
+  expect(rangeSlotFor(undefined, "2", 29)).toBe(7); // 29 % 24 = 5, + 2
+  for (const bad of ["x", "-1", "24", "1.5"]) expect(() => rangeSlotFor(1, bad, 99)).toThrow("E2E_PORT_SLOT");
+});
+
+test("slots 14 to 23 sit below the first fourteen ranges", () => {
+  expect(rangeBase(0)).toBe(21000);
+  expect(rangeBase(13)).toBe(31400);
+  expect(rangeBase(14)).toBe(20200);
+  expect(rangeBase(23)).toBe(13000);
+  expect(rangeSlotFor(1, "21", 99)).toBe(22);
+  expect(() => rangeSlotFor(1, "24", 99)).toThrow("from 0 to 23");
+});
+
+test("slots 0 to 13 keep their original ranges and no range overlaps", () => {
+  for (let s = 0; s <= 13; s++) expect(rangeBase(s)).toBe(21000 + s * 800);
+  const bases = Array.from({ length: 24 }, (_, s) => rangeBase(s)).sort((a, b) => a - b);
+  for (let i = 1; i < bases.length; i++) expect(bases[i] - bases[i - 1]).toBeGreaterThanOrEqual(800);
+  expect(bases[0]).toBe(13000);
+  expect(bases[23] + 799).toBeLessThan(32768);
 });

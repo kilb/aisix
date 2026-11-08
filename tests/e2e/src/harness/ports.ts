@@ -25,9 +25,22 @@ import { createServer } from "node:net";
 
 const RANGE_BASE = 21000;
 const RANGE_SIZE = 800;
+// Slots 0..13 are the original layout; slots 14..23 sit below them.
 // Exported so vitest.config.ts can cap fork concurrency at it: a fork
 // beyond this shares a port range with an earlier one.
-export const RANGE_SLOTS = 14; // 21000..32199, below the ephemeral range
+export const RANGE_SLOTS = 24; // 13000..32199, below the ephemeral range
+
+/**
+ * First port of a slot's range. Slots 0..13 keep the original
+ * `21000 + slot * 800`, so a lane still on the old harness never
+ * overlaps; slots 14..23 count down from 21000 (20200 .. 13000), below
+ * the old ranges and the ephemeral range.
+ */
+export function rangeBase(slot: number): number {
+  return slot <= 13
+    ? RANGE_BASE + slot * RANGE_SIZE
+    : RANGE_BASE - (slot - 13) * RANGE_SIZE;
+}
 
 /**
  * The fork's slot (`poolId` when it is a finite number >= 0, else
@@ -78,7 +91,7 @@ function canBind(port: number): Promise<boolean> {
  * See the module comment for why this is not "ask the OS for :0".
  */
 export async function pickFreePort(): Promise<number> {
-  const base = RANGE_BASE + rangeSlot() * RANGE_SIZE;
+  const base = rangeBase(rangeSlot());
   for (let i = 0; i < RANGE_SIZE; i++) {
     const port = base + (cursor++ % RANGE_SIZE);
     if (await canBind(port)) return port;
