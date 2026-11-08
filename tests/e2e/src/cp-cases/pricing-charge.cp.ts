@@ -1,6 +1,7 @@
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 
 import {
+  fundTenant,
   pollUntil,
   spawnManagedGateway,
   startControlPlane,
@@ -168,6 +169,7 @@ describe("every request a tenant key makes becomes one charge at the configured 
       tenant.body.version,
     );
     expect(granted.status, granted.text).toBe(200);
+    await fundTenant(cp, tenantId, "100.00");
 
     // Priced: `priced`, and `counted` so that a token count billed by
     // mistake would show as a charge. `unpriced` has no price.
