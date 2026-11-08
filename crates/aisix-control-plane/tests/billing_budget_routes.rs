@@ -397,3 +397,451 @@ async fn who_may_call_the_operator_quota_routes() {
     assert_eq!(r.status, 403, "{r:?}");
     assert_eq!(live_docs(&w.cp, id).await, 1);
 }
+
+// The tenant's own levels, through `/api/budgets`.
+
+use support::members::MemberSession;
+
+async fn tsend(
+    cp: &TestCp,
+    who: &MemberSession,
+    method: &str,
+    path: &str,
+    body: Option<Value>,
+) -> Resp {
+    cp.send(method, path, Some(who.cookie()), body).await
+}
+
+fn quota(scope: &str, target: impl std::fmt::Display, limit: &str) -> Value {
+    json!({"scope": scope, "scope_ref": target.to_string(), "limit_usd": limit})
+}
+
+/// A tenant with an owner O, a member M, a key of each and the sessions.
+struct Tenant {
+    owner: MemberSession,
+    m: MemberSession,
+    k_owner: Uuid,
+    k_m: Uuid,
+}
+
+async fn tenant(w: &World) -> Tenant {
+    let owner = w.cp.member_login_seeded(w.tenant, MemberRole::Owner).await;
+    let m = w.cp.member_login_seeded(w.tenant, MemberRole::Member).await;
+    let key = |member: Uuid| async move {
+        Uuid::parse_str(&support::world::seed_key(&w.cp, &w.admin, w.tenant, Some(member)).await)
+            .expect("a key id")
+    };
+    Tenant {
+        k_owner: key(owner.id).await,
+        k_m: key(m.id).await,
+        owner,
+        m,
+    }
+}
+
+fn id(r: &Resp) -> String {
+    r.body["id"].as_str().expect("an id").to_string()
+}
+
+#[tokio::test]
+async fn owners_set_member_quotas_and_cap_any_key() {
+    let Some(w) = world().await else { return };
+    let t = tenant(&w).await;
+    let r = tsend(
+        &w.cp,
+        &t.owner,
+        "POST",
+        "/api/budgets",
+        Some(quota("member", t.m.id, "0.05")),
+    )
+    .await;
+    assert_eq!(r.status, 201, "{r:?}");
+    assert_eq!(
+        (&r.body["scope"], &r.body["set_by"]),
+        (&json!("member"), &json!("org_admin"))
+    );
+    assert_eq!(r.body["target"]["id"], json!(t.m.id));
+    let admin = w.cp.member_login_seeded(w.tenant, MemberRole::Admin).await;
+    let r = tsend(
+        &w.cp,
+        &admin,
+        "POST",
+        "/api/budgets",
+        Some(quota("api_key", t.k_m, "0.05")),
+    )
+    .await;
+    assert_eq!(r.status, 201, "{r:?}");
+    assert_eq!(
+        (&r.body["scope"], &r.body["set_by"]),
+        (&json!("api_key"), &json!("org_admin"))
+    );
+    assert_eq!(audits(&w.cp, "budget.create").await, 2);
+    assert_eq!(live_docs(&w.cp, &id(&r)).await, 1);
+}
+
+#[tokio::test]
+async fn a_member_caps_only_its_own_keys() {
+    let Some(w) = world().await else { return };
+    let t = tenant(&w).await;
+    let r = tsend(
+        &w.cp,
+        &t.m,
+        "POST",
+        "/api/budgets",
+        Some(quota("api_key", t.k_m, "0.05")),
+    )
+    .await;
+    assert_eq!(r.status, 201, "{r:?}");
+    assert_eq!(r.body["set_by"], json!("member"));
+
+    let r = tsend(
+        &w.cp,
+        &t.m,
+        "POST",
+        "/api/budgets",
+        Some(quota("api_key", t.k_owner, "0.05")),
+    )
+    .await;
+    assert_eq!(
+        (r.status, &r.body["code"]),
+        (403, &json!("forbidden")),
+        "{r:?}"
+    );
+
+    // Another tenant's key reads exactly as a key that does not exist.
+    let other = seed_tenant(&w.cp, &w.admin).await;
+    let theirs = support::world::seed_key(&w.cp, &w.admin, other, None).await;
+    let a = tsend(
+        &w.cp,
+        &t.m,
+        "POST",
+        "/api/budgets",
+        Some(quota("api_key", &theirs, "0.05")),
+    )
+    .await;
+    let b = tsend(
+        &w.cp,
+        &t.m,
+        "POST",
+        "/api/budgets",
+        Some(quota("api_key", Uuid::new_v4(), "0.05")),
+    )
+    .await;
+    assert_eq!(
+        (a.status, detail_path(&a)),
+        (422, &json!("/scope_ref")),
+        "{a:?}"
+    );
+    assert_eq!((a.status, &a.body), (b.status, &b.body), "{a:?} {b:?}");
+    assert_eq!(audits(&w.cp, "budget.create").await, 1);
+}
+
+#[tokio::test]
+async fn each_level_edits_only_its_own_rows() {
+    let Some(w) = world().await else { return };
+    let t = tenant(&w).await;
+    let op = post(&w, w.tenant, json!({"limit_usd": "1"})).await;
+    let op_path = format!("/api/budgets/{}", id(&op));
+    let owners_cap =
+        other_level(&w.cp, w.tenant, BudgetScope::ApiKey, t.k_m, SetBy::OrgAdmin).await;
+    let cap_path = format!("/api/budgets/{}", owners_cap.id);
+    let members_cap = other_level(
+        &w.cp,
+        w.tenant,
+        BudgetScope::ApiKey,
+        t.k_owner,
+        SetBy::Member,
+    )
+    .await;
+    let managed = |r: &Resp| (r.status, r.body["code"].clone());
+    let want = (403, json!("budget_managed"));
+
+    // The owner meets the operator's row.
+    let r = tsend(
+        &w.cp,
+        &t.owner,
+        "PATCH",
+        &op_path,
+        Some(json!({"limit_usd": "2"})),
+    )
+    .await;
+    assert_eq!(managed(&r), want, "{r:?}");
+    let r = tsend(&w.cp, &t.owner, "DELETE", &op_path, None).await;
+    assert_eq!(managed(&r), want, "{r:?}");
+    // The member meets the owner's cap on its own key.
+    let r = tsend(
+        &w.cp,
+        &t.m,
+        "PATCH",
+        &cap_path,
+        Some(json!({"limit_usd": "2"})),
+    )
+    .await;
+    assert_eq!(managed(&r), want, "{r:?}");
+    let r = tsend(&w.cp, &t.m, "DELETE", &cap_path, None).await;
+    assert_eq!(managed(&r), want, "{r:?}");
+    assert_eq!(live_docs(&w.cp, &owners_cap.id.to_string()).await, 1);
+    // A member quota and a team quota are refused to POST.
+    let r = tsend(
+        &w.cp,
+        &t.m,
+        "POST",
+        "/api/budgets",
+        Some(quota("member", t.m.id, "1")),
+    )
+    .await;
+    assert_eq!(managed(&r), want, "{r:?}");
+    for who in [&t.owner, &t.m] {
+        let r = tsend(
+            &w.cp,
+            who,
+            "POST",
+            "/api/budgets",
+            Some(quota("team", w.tenant, "1")),
+        )
+        .await;
+        assert_eq!(managed(&r), want, "{r:?}");
+    }
+    assert_eq!(audits(&w.cp, "budget.update").await, 0);
+    assert_eq!(audits(&w.cp, "budget.delete").await, 0);
+
+    // A member's row on the owner's key is not the member's to see: 404.
+    let hidden = format!("/api/budgets/{}", members_cap.id);
+    let r = tsend(&w.cp, &t.m, "DELETE", &hidden, None).await;
+    assert_eq!(r.status, 404, "{r:?}");
+    // The owner edits the member's row and the owner's own; the member its own.
+    let r = tsend(
+        &w.cp,
+        &t.owner,
+        "PATCH",
+        &hidden,
+        Some(json!({"limit_usd": "3"})),
+    )
+    .await;
+    assert_eq!(
+        (r.status, &r.body["limit_micro_usd"]),
+        (200, &json!(3_000_000)),
+        "{r:?}"
+    );
+    let r = tsend(
+        &w.cp,
+        &t.owner,
+        "PATCH",
+        &cap_path,
+        Some(json!({"limit_usd": "4"})),
+    )
+    .await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let mine = tsend(
+        &w.cp,
+        &t.m,
+        "POST",
+        "/api/budgets",
+        Some(quota("api_key", t.k_m, "1")),
+    )
+    .await;
+    // Same key and kind as the owner's cap, from another setter: allowed.
+    assert_eq!(mine.status, 201, "{mine:?}");
+    let own = format!("/api/budgets/{}", id(&mine));
+    let r = tsend(
+        &w.cp,
+        &t.m,
+        "PATCH",
+        &own,
+        Some(json!({"limit_usd": "0.50"})),
+    )
+    .await;
+    assert_eq!(
+        (r.status, &r.body["limit_micro_usd"]),
+        (200, &json!(500_000)),
+        "{r:?}"
+    );
+    let r = tsend(&w.cp, &t.m, "DELETE", &own, None).await;
+    assert_eq!(r.status, 204, "{r:?}");
+    let r = tsend(&w.cp, &t.owner, "DELETE", &cap_path, None).await;
+    assert_eq!(r.status, 204, "{r:?}");
+
+    // Another tenant's quota is a 404.
+    let other = seed_tenant(&w.cp, &w.admin).await;
+    let theirs = post(&w, other, json!({"limit_usd": "1"})).await;
+    for p in [
+        format!("/api/budgets/{}", id(&theirs)),
+        format!("/api/budgets/{}", Uuid::new_v4()),
+    ] {
+        for who in [&t.owner, &t.m] {
+            let r = tsend(&w.cp, who, "DELETE", &p, None).await;
+            assert_eq!(r.status, 404, "{r:?}");
+            let r = tsend(&w.cp, who, "PATCH", &p, Some(json!({"limit_usd": "1"}))).await;
+            assert_eq!(r.status, 404, "{r:?}");
+        }
+    }
+    assert_eq!(live_docs(&w.cp, &id(&theirs)).await, 1);
+}
+
+#[tokio::test]
+async fn a_member_reads_its_own_levels_only() {
+    let Some(w) = world().await else { return };
+    let t = tenant(&w).await;
+    let team = post(&w, w.tenant, json!({"limit_usd": "9"})).await;
+    let mine = other_level(
+        &w.cp,
+        w.tenant,
+        BudgetScope::Member,
+        t.m.id,
+        SetBy::OrgAdmin,
+    )
+    .await;
+    let on_key = other_level(&w.cp, w.tenant, BudgetScope::ApiKey, t.k_m, SetBy::Member).await;
+    let others_member = other_level(
+        &w.cp,
+        w.tenant,
+        BudgetScope::Member,
+        t.owner.id,
+        SetBy::OrgAdmin,
+    )
+    .await;
+    let others_key = other_level(
+        &w.cp,
+        w.tenant,
+        BudgetScope::ApiKey,
+        t.k_owner,
+        SetBy::OrgAdmin,
+    )
+    .await;
+    let ids = |r: &Resp| -> Vec<String> {
+        let mut v: Vec<String> = r.body["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .map(|b| b["id"].as_str().expect("an id").to_string())
+            .collect();
+        v.sort();
+        v
+    };
+    let sorted = |rows: &[String]| {
+        let mut v = rows.to_vec();
+        v.sort();
+        v
+    };
+
+    let r = tsend(&w.cp, &t.m, "GET", "/api/budgets", None).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    assert_eq!(
+        ids(&r),
+        sorted(&[mine.id.to_string(), on_key.id.to_string()]),
+        "{r:?}"
+    );
+    let everything = sorted(&[
+        id(&team),
+        mine.id.to_string(),
+        on_key.id.to_string(),
+        others_member.id.to_string(),
+        others_key.id.to_string(),
+    ]);
+    let billing =
+        w.cp.member_login_seeded(w.tenant, MemberRole::Billing)
+            .await;
+    for who in [&t.owner, &billing] {
+        let r = tsend(&w.cp, who, "GET", "/api/budgets", None).await;
+        assert_eq!(ids(&r), everything, "{r:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_quota_defaults_to_monthly() {
+    let Some(w) = world().await else { return };
+    let t = tenant(&w).await;
+    let r = tsend(
+        &w.cp,
+        &t.owner,
+        "POST",
+        "/api/budgets",
+        Some(quota("member", t.m.id, "1")),
+    )
+    .await;
+    assert_eq!(r.status, 201, "{r:?}");
+    assert_eq!(
+        (&r.body["kind"], &r.body["period"]),
+        (&json!("periodic"), &json!("month"))
+    );
+    let r = tsend(
+        &w.cp,
+        &t.owner,
+        "POST",
+        "/api/budgets",
+        Some(json!({"scope": "member", "scope_ref": t.owner.id, "kind": "cumulative", "limit_usd": "1"})),
+    )
+    .await;
+    assert_eq!(
+        (&r.body["kind"], &r.body["period"]),
+        (&json!("cumulative"), &Value::Null),
+        "{r:?}"
+    );
+    let r = tsend(
+        &w.cp,
+        &t.owner,
+        "POST",
+        "/api/budgets",
+        Some(quota("tenant", w.tenant, "1")),
+    )
+    .await;
+    assert_eq!(
+        (r.status, detail_path(&r)),
+        (422, &json!("/scope")),
+        "{r:?}"
+    );
+}
+
+#[tokio::test]
+async fn who_may_call_the_tenant_quota_routes() {
+    let Some(w) = world().await else { return };
+    let t = tenant(&w).await;
+    let billing =
+        w.cp.member_login_seeded(w.tenant, MemberRole::Billing)
+            .await;
+    let admin = w.cp.member_login_seeded(w.tenant, MemberRole::Admin).await;
+    let r = tsend(&w.cp, &billing, "GET", "/api/budgets", None).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let r = tsend(
+        &w.cp,
+        &billing,
+        "POST",
+        "/api/budgets",
+        Some(quota("member", t.m.id, "1")),
+    )
+    .await;
+    assert_eq!(
+        (r.status, &r.body["code"]),
+        (403, &json!("forbidden")),
+        "{r:?}"
+    );
+    let r = tsend(&w.cp, &t.m, "GET", "/api/budgets", None).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let r = tsend(
+        &w.cp,
+        &admin,
+        "POST",
+        "/api/budgets",
+        Some(quota("member", t.m.id, "1")),
+    )
+    .await;
+    assert_eq!(r.status, 201, "{r:?}");
+    let one = format!("/api/budgets/{}", id(&r));
+    let r = tsend(
+        &w.cp,
+        &billing,
+        "PATCH",
+        &one,
+        Some(json!({"limit_usd": "2"})),
+    )
+    .await;
+    assert_eq!(r.status, 403, "{r:?}");
+    let r = tsend(&w.cp, &billing, "DELETE", &one, None).await;
+    assert_eq!(r.status, 403, "{r:?}");
+    assert_eq!(
+        live_docs(&w.cp, one.rsplit('/').next().expect("an id")).await,
+        1
+    );
+    let r = w.cp.send("GET", "/api/budgets", None, None).await;
+    assert_eq!(r.status, 401, "{r:?}");
+}

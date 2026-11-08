@@ -94,6 +94,21 @@ pub fn tenant_fixture(method: &str, path: &str) -> (String, Option<Value>) {
         ("GET", "/api/billing/topups/{id}") => {
             (format!("/api/billing/topups/{}", Uuid::new_v4()), None)
         }
+        // Quotas. The target and the quota match nothing: refused after the
+        // identity checks, so nothing is written.
+        ("GET", "/api/budgets") => (path.to_string(), None),
+        ("POST", "/api/budgets") => (
+            path.to_string(),
+            Some(json!({
+                "scope": "api_key",
+                "scope_ref": Uuid::new_v4(),
+                "limit_usd": "1.00",
+            })),
+        ),
+        ("PATCH" | "DELETE", "/api/budgets/{id}") => (
+            format!("/api/budgets/{}", Uuid::new_v4()),
+            (method == "PATCH").then(|| json!({"limit_usd": "1.00"})),
+        ),
         _ => panic!("no fixture for {method} {path}: add one to tests/support/members.rs"),
     }
 }
