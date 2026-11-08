@@ -615,8 +615,9 @@ pub(crate) fn build_client(mtls: &MtlsBundle) -> anyhow::Result<reqwest::Client>
         .context("build reqwest client with mTLS")
 }
 
-/// The client of the account lookups (`GET /v1/key`): the heartbeat's TLS
-/// setup, with a connection pool of its own and the lookups' own deadline,
+/// The client of the account lookups (`GET /v1/key`, `GET /v1/generation`
+/// and the prices of the model listing): the heartbeat's TLS setup, with a
+/// connection pool of its own and the lookups' own deadline,
 /// [`aisix_proxy::ACCOUNT_TIMEOUT`]. Nothing else uses it, so a lookup never
 /// waits behind a heartbeat, a telemetry delivery or a store call, and none of
 /// those waits behind a lookup.

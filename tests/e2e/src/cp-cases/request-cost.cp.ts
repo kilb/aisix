@@ -29,6 +29,8 @@ const PASSWORD = "request-cost-e2e-pass-8e1";
 
 /** The owner's request, the one every case asks about. */
 const OWNERS_REQUEST = "req-e2e-7c1";
+/** How many lookups one key may have waiting on the control plane at once. */
+const LOOKUPS_PER_KEY = 4;
 /** An id nobody ever sent. */
 const NEVER_SENT = "req-never-sent-3a1";
 /** The member's own request. */
@@ -257,5 +259,45 @@ describe("a caller looks up what one request cost with its API key", () => {
     } finally {
       relay!.resume();
     }
+  });
+
+  test("A key with four lookups waiting on the control plane is refused a fifth at once", async () => {
+    relay!.pause();
+    let refusedId = "";
+    try {
+      // Fresh ids, so every lookup has to ask the held control plane.
+      const ids = Array.from({ length: LOOKUPS_PER_KEY + 1 }, (_, i) => `req-cap-${i}-6d4`);
+      const [owners, members] = await Promise.all([
+        Promise.all(ids.map(async (id) => ({ id, ...(await timedLookup(ko, id)) }))),
+        timedLookup(km, "req-cap-member-6d4"),
+      ]);
+      const summary = owners.map((o) => `${o.id}: ${o.answer.status} after ${o.tookMs} ms`).join("; ");
+      const refused = owners.filter((o) => o.answer.status === 429);
+      expect(refused, summary).toHaveLength(1);
+      refusedId = refused[0].id;
+      expect(refused[0].tookMs, summary).toBeLessThan(ACCOUNT_TIMEOUT_MS / 2);
+      expect(refused[0].answer.json?.error?.type, refused[0].answer.text).toBe("rate_limit_exceeded");
+      expect(refused[0].answer.json?.error?.code, refused[0].answer.text).toBe("rate_limit_exceeded");
+      expect(refused[0].answer.headers.get("retry-after"), refused[0].answer.text).toBeNull();
+      for (const o of owners.filter((o) => o.id !== refusedId)) {
+        expect(o.answer.status, summary).toBe(503);
+      }
+      // Another key of the same organization has slots of its own.
+      expect(members.answer.status, members.answer.text).toBe(503);
+      expect(members.answer.json?.error?.code, members.answer.text).toBe("control_plane_unavailable");
+    } finally {
+      relay!.resume();
+    }
+    // The refused id is asked about again once the control plane answers.
+    let last = "no lookup";
+    await pollUntil(
+      "the refused id to be asked about again",
+      async () => {
+        const answer = await lookup(ko, refusedId);
+        last = `${answer.status} ${answer.text}`;
+        return answer.status === 404 ? true : undefined;
+      },
+      { timeoutMs: 10_000, intervalMs: 500, describe: () => last },
+    );
   });
 });

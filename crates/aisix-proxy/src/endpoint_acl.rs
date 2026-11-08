@@ -78,7 +78,10 @@ pub(crate) fn endpoint_family(path: &str) -> Option<EndpointFamily> {
 /// [`endpoint_family`].
 pub(crate) const ACCOUNT_ROUTES: &[(&str, &str)] = &[
     ("/v1/key", "reads the caller's own key"),
-    ("/v1/generation", "reads the caller's own request"),
+    (
+        "/v1/generation",
+        "reads what the caller's organization recorded under a request id, as the key may see it",
+    ),
 ];
 
 /// Whether `path` is one of [`ACCOUNT_ROUTES`].

@@ -306,6 +306,7 @@ pub(crate) mod stand_in {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
+    use axum::extract::Query;
     use axum::http::{StatusCode, Uri};
 
     use super::AccountClient;
@@ -313,12 +314,23 @@ pub(crate) mod stand_in {
     /// How the stand-in answers, by the key id in the path.
     pub(crate) type Answer = Arc<dyn Fn(&str) -> (StatusCode, String) + Send + Sync>;
 
+    /// How the stand-in answers, by the key id in the path and the `id` in
+    /// the query.
+    pub(crate) type QueryAnswer =
+        Arc<dyn Fn(&str, Option<&str>) -> (StatusCode, String) + Send + Sync>;
+
+    /// One request the stand-in received: its path and its query pairs,
+    /// decoded as the control plane's own router decodes them.
+    pub(crate) type Seen = (String, Vec<(String, String)>);
+
     /// Serves every `GET /dp/v1/keys/{key_id}/{lookup}` on a local port,
-    /// answering by key id, and counts every request, in total and by path.
+    /// answering by key id (and `id`, for [`StandIn::start_answering`]), and
+    /// counts every request, in total and by path.
     pub(crate) struct StandIn {
         base: String,
         hits: Arc<AtomicUsize>,
         pub(crate) paths: Arc<Mutex<HashMap<String, usize>>>,
+        seen: Arc<Mutex<Vec<Seen>>>,
     }
 
     impl StandIn {
@@ -328,29 +340,47 @@ pub(crate) mod stand_in {
 
         /// Every answer is sent after `delay`.
         pub(crate) async fn start_with_delay(answer: Answer, delay: Duration) -> StandIn {
+            Self::start_answering(Arc::new(move |key, _| answer(key)), delay).await
+        }
+
+        /// Answers by key id and `id`, every answer after `delay`.
+        pub(crate) async fn start_answering(answer: QueryAnswer, delay: Duration) -> StandIn {
             let hits = Arc::new(AtomicUsize::new(0));
             let paths = Arc::new(Mutex::new(HashMap::new()));
-            let (h, p) = (Arc::clone(&hits), Arc::clone(&paths));
-            let app = axum::Router::new().fallback(move |uri: Uri| {
-                let (answer, h, p) = (Arc::clone(&answer), Arc::clone(&h), Arc::clone(&p));
-                async move {
-                    h.fetch_add(1, Ordering::SeqCst);
-                    *p.lock().unwrap().entry(uri.path().to_string()).or_insert(0) += 1;
-                    let key = uri
-                        .path()
-                        .strip_prefix("/dp/v1/keys/")
-                        .and_then(|rest| rest.split('/').next())
-                        .unwrap_or("")
-                        .to_string();
-                    let (status, body) = answer(&key);
-                    tokio::time::sleep(delay).await;
-                    (
-                        status,
-                        [(axum::http::header::CONTENT_TYPE, "application/json")],
-                        body,
-                    )
-                }
-            });
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let (h, p, s) = (Arc::clone(&hits), Arc::clone(&paths), Arc::clone(&seen));
+            let app = axum::Router::new().fallback(
+                move |uri: Uri, Query(pairs): Query<Vec<(String, String)>>| {
+                    let (answer, h, p, s) = (
+                        Arc::clone(&answer),
+                        Arc::clone(&h),
+                        Arc::clone(&p),
+                        Arc::clone(&s),
+                    );
+                    async move {
+                        h.fetch_add(1, Ordering::SeqCst);
+                        let path = uri.path().to_string();
+                        *p.lock().unwrap().entry(path.clone()).or_insert(0) += 1;
+                        let key = path
+                            .strip_prefix("/dp/v1/keys/")
+                            .and_then(|rest| rest.split('/').next())
+                            .unwrap_or("")
+                            .to_string();
+                        let id = pairs
+                            .iter()
+                            .find(|(name, _)| name == "id")
+                            .map(|(_, v)| v.clone());
+                        s.lock().unwrap().push((path, pairs));
+                        let (status, body) = answer(&key, id.as_deref());
+                        tokio::time::sleep(delay).await;
+                        (
+                            status,
+                            [(axum::http::header::CONTENT_TYPE, "application/json")],
+                            body,
+                        )
+                    }
+                },
+            );
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
             tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -358,6 +388,7 @@ pub(crate) mod stand_in {
                 base: format!("http://{addr}"),
                 hits,
                 paths,
+                seen,
             }
         }
 
@@ -365,9 +396,14 @@ pub(crate) mod stand_in {
             self.hits.load(Ordering::SeqCst)
         }
 
+        /// Every request received so far, in order.
+        pub(crate) fn seen(&self) -> Vec<Seen> {
+            self.seen.lock().unwrap().clone()
+        }
+
         /// A client of this stand-in, configured with a trailing slash.
         pub(crate) fn client(&self) -> AccountClient {
-            let http = reqwest::Client::builder().no_proxy().build().unwrap();
+            let http = aisix_gateway::client_builder().no_proxy().build().unwrap();
             AccountClient::new(http, &format!("{}/", self.base))
         }
     }
