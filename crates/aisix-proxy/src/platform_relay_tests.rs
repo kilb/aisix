@@ -136,7 +136,7 @@ fn app_with(upstream: &MockServer, kind: Upstream, platform: bool, held: bool) -
         crate::seed_env_scoped_guardrail(&snap, ResourceEntry::new("g-held", row, 1));
     }
 
-    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let client = aisix_gateway::client_builder().no_proxy().build().unwrap();
     let hub = Arc::new(Hub::new());
     hub.register_specialized(
         "openai",
@@ -149,7 +149,7 @@ fn app_with(upstream: &MockServer, kind: Upstream, platform: bool, held: bool) -
     hub.register_family(
         aisix_core::Adapter::Vertex,
         Arc::new(aisix_provider_vertex::VertexBridge::with_client(
-            reqwest::Client::builder().no_proxy().build().unwrap(),
+            aisix_gateway::client_builder().no_proxy().build().unwrap(),
         )),
     );
     let state = crate::ProxyState::new(SnapshotHandle::new(snap), hub, &cfg()).without_cache();
