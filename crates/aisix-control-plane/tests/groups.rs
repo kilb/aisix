@@ -10,11 +10,12 @@
 
 mod support;
 
-use chrono::{TimeDelta, Utc};
+use aisix_control_plane::resources::write::RESOURCES_LOCK_KEY;
+use chrono::TimeDelta;
 use serde_json::{json, Value};
 use sqlx::PgPool;
 use support::migrate::{database_at, drop_database, migrate_rest};
-use support::world::{db_now, seed_model, seed_tenant};
+use support::world::{db_now, seed_key, seed_model, seed_tenant};
 use support::{OperatorSession, Resp, TestCp};
 use uuid::Uuid;
 
@@ -384,6 +385,17 @@ async fn a_rate_is_zero_to_one_hundred_with_four_decimals() {
     }
     let group = create_group(&cp, &admin, body("grp-rate-7c1", "标准", json!("100"))).await;
     let id = id_of(&group);
+    // The rate route answers a JSON number exactly as the group route does.
+    for rate in [json!(7.2), json!("100.0001"), json!(null)] {
+        let r = post_rate(
+            &cp,
+            &admin,
+            &id,
+            json!({"model_id": null, "cny_per_usd": rate, "effective_from": db_now(&cp).await}),
+        )
+        .await;
+        assert_422_at(&r, "/cny_per_usd");
+    }
     // A rate of 0 is a free group, and is written.
     let now = db_now(&cp).await;
     let r = post_rate(
@@ -969,7 +981,13 @@ async fn a_default_group_cannot_be_retired() {
             .expect("the designated default");
     let r = retire(&cp, &admin, &default_id.to_string()).await;
     assert_status(&r, 409, "group_in_use");
-    assert_eq!(r.body["counts"]["default_group"], 1, "{r:?}");
+    // Everything else is 0 on a fresh database, so the designated flag alone
+    // is what refuses the retire.
+    assert_eq!(
+        r.body["counts"],
+        json!({"tenants": 0, "defaults": 0, "keys": 0, "provider_keys": 0, "default_group": 1}),
+        "{r:?}"
+    );
 }
 
 #[tokio::test]
@@ -1062,5 +1080,531 @@ async fn a_group_lists_its_provider_keys() {
         r.body["group"]["provider_keys"],
         json!([{"id": pk, "display_name": "acct-keys-7c1"}])
     );
-    let _ = Utc::now();
+}
+
+/// `group_id` of each key by label, from `tenant_keys`.
+async fn key_groups(pool: &PgPool) -> Vec<(String, Option<String>)> {
+    sqlx::query_as(
+        "SELECT k.label, g.name FROM tenant_keys k \
+         LEFT JOIN provider_groups g ON g.id = k.group_id ORDER BY k.label",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("read the keys' groups")
+}
+
+/// `group_id` of the key labelled `label`.
+async fn key_group(pool: &PgPool, label: &str) -> Option<String> {
+    let groups = key_groups(pool).await;
+    groups
+        .into_iter()
+        .find(|(l, _)| l == label)
+        .unwrap_or_else(|| panic!("a key labelled {label}"))
+        .1
+}
+
+/// The `detail` of the one audit row `action` names. Exactly one: a migration
+/// that wrote it twice would otherwise read as correct.
+async fn audit_detail(pool: &PgPool, action: &str) -> Value {
+    let details: Vec<Value> = sqlx::query_scalar(
+        "SELECT detail FROM audit_log WHERE action = $1 AND actor_kind = 'system' ORDER BY id",
+    )
+    .bind(action)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_else(|e| panic!("read the {action} audit rows: {e}"));
+    assert_eq!(details.len(), 1, "one {action} row: {details:?}");
+    details[0].clone()
+}
+
+/// How many audit rows carry `action`.
+async fn audit_rows(pool: &PgPool, action: &str) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM audit_log WHERE action = $1")
+        .bind(action)
+        .fetch_one(pool)
+        .await
+        .unwrap_or_else(|e| panic!("count the {action} audit rows: {e}"))
+}
+
+#[tokio::test]
+async fn the_migration_gives_each_key_the_group_it_can_only_mean() {
+    let Some(pool) = database_at(23).await else {
+        return;
+    };
+    // Two customer groups, created as an operator would before the upgrade,
+    // and one tenant of each shape the backfill reads.
+    let a = Uuid::new_v4();
+    let b = Uuid::new_v4();
+    let customer_one = Uuid::new_v4();
+    let customer_two = Uuid::new_v4();
+    let internal = Uuid::new_v4();
+    for sql in [
+        format!(
+            "INSERT INTO provider_groups (id, name, display_name) VALUES \
+             ('{a}', 'grp-a-7c1', '分组甲'), ('{b}', 'grp-b-7c1', '分组乙')"
+        ),
+        format!(
+            "INSERT INTO tenants (id, name, status, allowed_provider_groups) VALUES \
+             ('{customer_one}', 'one-7c1', 'active', '{{\"grp-b-7c1\"}}'), \
+             ('{customer_two}', 'two-7c1', 'active', '{{\"grp-a-7c1\",\"grp-b-7c1\"}}')"
+        ),
+        format!(
+            "INSERT INTO tenants (id, name, status, is_internal) VALUES \
+             ('{internal}', 'platform-7c1', 'active', true)"
+        ),
+        format!(
+            "INSERT INTO tenant_keys (id, tenant_id, label, key_hash, key_prefix, \
+             allowed_provider_groups, created_by_kind) VALUES \
+             (gen_random_uuid(), '{customer_one}', 'override-one-7c1', 'h1-7c1', 'k1', \
+              '{{\"grp-a-7c1\"}}', 'operator'), \
+             (gen_random_uuid(), '{customer_one}', 'tenant-one-7c1', 'h2-7c1', 'k2', \
+              NULL, 'operator'), \
+             (gen_random_uuid(), '{customer_two}', 'tenant-two-7c1', 'h3-7c1', 'k3', \
+              NULL, 'operator'), \
+             (gen_random_uuid(), '{internal}', 'internal-override-7c1', 'h4-7c1', 'k4', \
+              '{{\"grp-a-7c1\"}}', 'operator'), \
+             (gen_random_uuid(), '{internal}', 'internal-none-7c1', 'h5-7c1', 'k5', \
+              NULL, 'operator'), \
+             (gen_random_uuid(), '{internal}', 'internal-two-7c1', 'h6-7c1', 'k6', \
+              '{{\"grp-a-7c1\",\"grp-b-7c1\"}}', 'operator'), \
+             (gen_random_uuid(), '{customer_one}', 'revoked-7c1', 'h7-7c1', 'k7', \
+              '{{\"grp-a-7c1\"}}', 'operator')"
+        ),
+        "UPDATE tenant_keys SET revoked_at = now() WHERE label = 'revoked-7c1'".to_string(),
+    ] {
+        sqlx::query(&sql)
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+
+    migrate_rest(&pool).await.expect("the rest migrates");
+
+    // The one group a key's own override names is the group it can only
+    // mean, whoever its tenant is.
+    assert_eq!(
+        key_group(&pool, "override-one-7c1").await.as_deref(),
+        Some("grp-a-7c1")
+    );
+    assert_eq!(
+        key_group(&pool, "internal-override-7c1").await.as_deref(),
+        Some("grp-a-7c1")
+    );
+    // A customer key with no override takes the one group its tenant names.
+    assert_eq!(
+        key_group(&pool, "tenant-one-7c1").await.as_deref(),
+        Some("grp-b-7c1")
+    );
+    // Two groups are two readings, and the key is closed until one is set.
+    assert_eq!(key_group(&pool, "tenant-two-7c1").await, None);
+    // Every internal key still without one takes the designated default,
+    // which an operator can see it reaches.
+    assert_eq!(
+        key_group(&pool, "internal-none-7c1").await.as_deref(),
+        Some("default")
+    );
+    assert_eq!(
+        key_group(&pool, "internal-two-7c1").await.as_deref(),
+        Some("default")
+    );
+    // A revoked key takes none: it is not routed, and not priced.
+    assert_eq!(key_group(&pool, "revoked-7c1").await, None);
+    drop_database(pool).await;
+}
+
+#[tokio::test]
+async fn the_upgrade_reports_what_the_default_group_reaches() {
+    let Some(pool) = database_at(23).await else {
+        return;
+    };
+    let internal = Uuid::new_v4();
+    for sql in [
+        format!(
+            "INSERT INTO tenants (id, name, status, is_internal) VALUES \
+             ('{internal}', 'platform-7c1', 'active', true)"
+        ),
+        format!(
+            "INSERT INTO tenant_keys (id, tenant_id, label, key_hash, key_prefix, \
+             created_by_kind) VALUES \
+             (gen_random_uuid(), '{internal}', 'internal-none-7c1', 'h1-7c1', 'k1', 'operator'), \
+             (gen_random_uuid(), '{internal}', 'internal-none-too-7c1', 'h2-7c1', 'k2', 'operator')"
+        ),
+        "INSERT INTO gw_resources (kind, id, doc) VALUES ('provider_keys', gen_random_uuid(), \
+         '{\"display_name\": \"acct-def-7c1\", \"provider\": \"openai\", \"api_key\": \
+         \"sk-def-7c1\", \"groups\": [\"default\"]}')"
+            .to_string(),
+    ] {
+        sqlx::query(&sql)
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+
+    migrate_rest(&pool).await.expect("the rest migrates");
+
+    // The report names the keys it gave the group, and the upstreams that
+    // group reaches, so an operator can see what they now reach.
+    let detail = audit_detail(&pool, "provider_group.default_assigned").await;
+    assert_eq!(detail["name"], "default");
+    assert_eq!(detail["keys"], 2, "{detail}");
+    assert_eq!(detail["provider_keys"], json!(["acct-def-7c1"]));
+    drop_database(pool).await;
+}
+
+#[tokio::test]
+async fn the_upgrade_reports_a_default_group_that_reaches_no_upstream() {
+    let Some(pool) = database_at(23).await else {
+        return;
+    };
+    sqlx::query(
+        "INSERT INTO tenants (id, name, status, is_internal) VALUES \
+         (gen_random_uuid(), 'platform-7c1', 'active', true)",
+    )
+    .execute(&pool)
+    .await
+    .expect("seed the internal tenant");
+    sqlx::query(
+        "INSERT INTO tenant_keys (id, tenant_id, label, key_hash, key_prefix, created_by_kind) \
+         SELECT gen_random_uuid(), id, 'internal-none-7c1', 'h1-7c1', 'k1', 'operator' \
+         FROM tenants WHERE is_internal",
+    )
+    .execute(&pool)
+    .await
+    .expect("seed an internal key");
+    // An upstream account that lists another group: the report names the
+    // accounts the default group reaches, not every account there is.
+    sqlx::query(
+        "INSERT INTO gw_resources (kind, id, doc) VALUES ('provider_keys', gen_random_uuid(), \
+         '{\"display_name\": \"acct-shared-7c1\", \"provider\": \"openai\", \"api_key\": \
+         \"sk-shared-7c1\", \"groups\": [\"shared\"]}')",
+    )
+    .execute(&pool)
+    .await
+    .expect("seed an account of another group");
+
+    migrate_rest(&pool).await.expect("the rest migrates");
+
+    // routio.ai's shape: the internal tenant, and no account that reaches the
+    // default group. The report says so rather than leaving the question open.
+    let detail = audit_detail(&pool, "provider_group.default_assigned").await;
+    assert_eq!(detail["keys"], 1, "{detail}");
+    assert_eq!(detail["provider_keys"], json!([]), "{detail}");
+    drop_database(pool).await;
+}
+
+#[tokio::test]
+async fn a_fresh_install_writes_no_default_assigned_row() {
+    let Some(pool) = database_at(23).await else {
+        return;
+    };
+    // A fresh install's shape: the migrations run before
+    // `ensure_internal_tenant` creates the tenant, so there is no key to give
+    // the default group, and the upgrade records no change.
+    migrate_rest(&pool).await.expect("the rest migrates");
+    assert_eq!(
+        audit_rows(&pool, "provider_group.default_assigned").await,
+        0,
+        "an assignment that touched no key records no change"
+    );
+    // The default group is still designated, and the table still works.
+    let designated: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM provider_groups WHERE is_default")
+            .fetch_all(&pool)
+            .await
+            .expect("read the designated group");
+    assert_eq!(designated, vec!["default".to_string()]);
+    drop_database(pool).await;
+}
+
+#[tokio::test]
+async fn retiring_counts_keys_by_their_group() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let admin = cp
+        .admin_login_seeded(aisix_control_plane::auth::OperatorRole::Operator)
+        .await;
+    let group = create_group(&cp, &admin, body("grp-keycount-7c1", "标准", json!("7.2"))).await;
+    let id = id_of(&group);
+    let tenant = seed_tenant(&cp, &admin).await;
+    let key = seed_key(&cp, &admin, tenant, None).await;
+    let key_id = Uuid::parse_str(&key).expect("a key id");
+    // The column, as Task 11 sets it: a key names its group, and its own
+    // override may say nothing at all.
+    sqlx::query("UPDATE tenant_keys SET group_id = $1::uuid WHERE id = $2")
+        .bind(&id)
+        .bind(key_id)
+        .execute(cp.db().pool())
+        .await
+        .expect("set the key's group");
+
+    let r = retire(&cp, &admin, &id).await;
+    assert_status(&r, 409, "group_in_use");
+    assert_eq!(r.body["counts"]["keys"], 1, "{r:?}");
+
+    // A key of the same tenant with no group counts for nothing: an absent
+    // override must not read as naming the group.
+    let ungrouped = seed_key(&cp, &admin, tenant, None).await;
+    let ungrouped: Uuid = Uuid::parse_str(&ungrouped).expect("a key id");
+    sqlx::query("UPDATE tenant_keys SET group_id = NULL WHERE id = $1")
+        .bind(ungrouped)
+        .execute(cp.db().pool())
+        .await
+        .expect("clear the second key's group");
+    let r = retire(&cp, &admin, &id).await;
+    assert_status(&r, 409, "group_in_use");
+    assert_eq!(r.body["counts"]["keys"], 1, "{r:?}");
+
+    sqlx::query("UPDATE tenant_keys SET group_id = NULL WHERE id = $1")
+        .bind(key_id)
+        .execute(cp.db().pool())
+        .await
+        .expect("clear the key's group");
+    let r = retire(&cp, &admin, &id).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    assert_eq!(r.body["keys"], 0, "{r:?}");
+}
+
+/// Whether some session is queued for `RESOURCES_LOCK_KEY`.
+async fn resources_lock_queued(pool: &PgPool) -> bool {
+    sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'advisory' AND NOT granted \
+           AND classid::bigint = $1 AND objid::bigint = $2 AND objsubid = 1)",
+    )
+    .bind(RESOURCES_LOCK_KEY >> 32)
+    .bind(RESOURCES_LOCK_KEY & 0xffff_ffff)
+    .fetch_one(pool)
+    .await
+    .expect("read the queued locks")
+}
+
+/// Waits until a session is queued for the resources lock; fails after 10 s.
+async fn until_resources_lock_queued(pool: &PgPool) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !resources_lock_queued(pool).await {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no session queued for the resources lock"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// A provider-key document listing `groups`, as an operator posts it.
+fn provider_key_body(display_name: &str, groups: &[&str]) -> Value {
+    json!({"doc": {
+        "display_name": display_name,
+        "provider": "openai",
+        "api_key": "sk-write-race-7c1",
+        "groups": groups,
+    }})
+}
+
+async fn post_provider_key(cp: &TestCp, who: &OperatorSession, body: Value) -> Resp {
+    cp.send(
+        "POST",
+        "/admin/resources/provider_keys",
+        Some(who.cookie()),
+        Some(body),
+    )
+    .await
+}
+
+/// A provider-key write and a retire of the group it names, raced on the
+/// resources lock, never end with a retired group named by a live provider
+/// key: whichever gets the lock first, the other sees it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_provider_key_write_and_a_retire_never_end_with_a_retired_group_named() {
+    let Some(cp) = TestCp::start_with(|cfg| cfg.db_lock_timeout_ms = 60_000).await else {
+        return;
+    };
+    let admin = cp
+        .admin_login_seeded(aisix_control_plane::auth::OperatorRole::Operator)
+        .await;
+    let group = create_group(
+        &cp,
+        &admin,
+        body("grp-write-race-7c1", "标准", json!("7.2")),
+    )
+    .await;
+    let id = id_of(&group);
+
+    // The write gets the resources lock first: it commits, and the retire
+    // then counts it and refuses.
+    {
+        let mut holder = cp.db().pool().begin().await.expect("begin");
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(RESOURCES_LOCK_KEY)
+            .execute(&mut *holder)
+            .await
+            .expect("hold the resources lock");
+        let cookie = admin.cookie().to_string();
+        let url = cp.url("/admin/resources/provider_keys");
+        let write = tokio::spawn(async move {
+            reqwest::Client::builder()
+                .no_proxy()
+                .build()
+                .expect("an HTTP client")
+                .post(url)
+                .header(reqwest::header::COOKIE, cookie)
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .json(&provider_key_body(
+                    "acct-first-7c1",
+                    &["grp-write-race-7c1"],
+                ))
+                .send()
+                .await
+                .expect("send the write")
+                .status()
+                .as_u16()
+        });
+        until_resources_lock_queued(cp.db().pool()).await;
+        // The retire takes the group row and then the resources lock, so it
+        // is behind the write.
+        let retire_cp = &cp;
+        let cookie = admin.cookie().to_string();
+        let retire_url = cp.url(&format!("{GROUPS}/{id}/retire"));
+        let retire_request = tokio::spawn(async move {
+            reqwest::Client::builder()
+                .no_proxy()
+                .build()
+                .expect("an HTTP client")
+                .post(retire_url)
+                .header(reqwest::header::COOKIE, cookie)
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body("{}")
+                .send()
+                .await
+                .expect("send the retire")
+                .status()
+                .as_u16()
+        });
+        let _ = retire_cp;
+        holder.commit().await.expect("release the resources lock");
+        assert_eq!(write.await.expect("join the write"), 201);
+        assert_eq!(retire_request.await.expect("join the retire"), 409);
+    }
+    let r = rates(&cp, &admin, &id).await;
+    assert_eq!(
+        r["group"]["provider_keys"][0]["display_name"],
+        "acct-first-7c1"
+    );
+
+    // The retire gets it first: it retires, and the write naming the group
+    // is refused, so no live provider key is left naming a retired group.
+    let group = create_group(
+        &cp,
+        &admin,
+        body("grp-write-late-7c1", "标准", json!("7.2")),
+    )
+    .await;
+    let id = id_of(&group);
+    let r = post_provider_key(
+        &cp,
+        &admin,
+        provider_key_body("acct-second-7c1", &["grp-write-late-7c1"]),
+    )
+    .await;
+    assert_eq!(
+        r.status, 201,
+        "the group is live, so the account joins it: {r:?}"
+    );
+    // Clear it, so the group has no account and can retire.
+    let pk = r.body["id"]
+        .as_str()
+        .expect("a provider key id")
+        .to_string();
+    let version: i64 = sqlx::query_scalar(
+        "SELECT version FROM gw_resources WHERE kind = 'provider_keys' AND id = $1",
+    )
+    .bind(Uuid::parse_str(&pk).expect("a provider key id"))
+    .fetch_one(cp.db().pool())
+    .await
+    .expect("the provider key's version");
+    let response = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("an HTTP client")
+        .delete(cp.url(&format!("/admin/resources/provider_keys/{pk}")))
+        .header(reqwest::header::COOKIE, admin.cookie())
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .header(reqwest::header::IF_MATCH, format!("\"{version}\""))
+        .send()
+        .await
+        .expect("send the delete");
+    assert_eq!(response.status(), 200);
+    let r = retire(&cp, &admin, &id).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let r = post_provider_key(
+        &cp,
+        &admin,
+        provider_key_body("acct-third-7c1", &["grp-write-late-7c1"]),
+    )
+    .await;
+    assert_422_at(&r, "/groups/0");
+    let live: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM gw_resources WHERE kind = 'provider_keys' AND NOT deleted \
+           AND doc->'groups' ? 'grp-write-late-7c1'",
+    )
+    .fetch_one(cp.db().pool())
+    .await
+    .expect("count the live provider keys");
+    assert_eq!(live, 0, "no live provider key names the retired group");
+}
+
+/// The migration's own designation block, read from the file, applied as a
+/// replay would apply it: the test pins the SQL that ships, not a copy.
+async fn apply_designation(pool: &PgPool) -> Result<(), sqlx::Error> {
+    let sql = std::fs::read_to_string(format!(
+        "{}/migrations/0023_provider_groups.sql",
+        env!("CARGO_MANIFEST_DIR")
+    ))
+    .expect("read 0023");
+    let start = sql
+        .find("-- designation: begin")
+        .expect("the block's start")
+        + "-- designation: begin".len();
+    let end = sql.find("-- designation: end").expect("the block's end");
+    sqlx::raw_sql(&sql[start..end]).execute(pool).await?;
+    Ok(())
+}
+
+/// The designation leaves a designated default, even when a database already
+/// carries a retired group named `default` and the block runs again: a live
+/// group becomes the default rather than none.
+#[tokio::test]
+async fn designation_leaves_a_live_default_even_when_default_is_retired() {
+    let Some(pool) = database_at(23).await else {
+        return;
+    };
+    // The state a replayed designation meets: a retired `default` that is
+    // still flagged, and a live group that must become the designated one.
+    sqlx::query(
+        "UPDATE provider_groups SET retired_at = now(), is_default = true WHERE name = 'default'",
+    )
+    .execute(&pool)
+    .await
+    .expect("retire the default group");
+    sqlx::query(
+        "INSERT INTO provider_groups (name, display_name) VALUES ('grp-live-7c1', 'live-7c1')",
+    )
+    .execute(&pool)
+    .await
+    .expect("a live group");
+
+    apply_designation(&pool)
+        .await
+        .expect("the designation leaves a default");
+
+    let designated: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM provider_groups WHERE is_default ORDER BY name")
+            .fetch_all(&pool)
+            .await
+            .expect("read the designated group");
+    assert_eq!(
+        designated,
+        vec!["grp-live-7c1".to_string()],
+        "a retired `default` does not block designating a live group"
+    );
+    drop_database(pool).await;
 }

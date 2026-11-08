@@ -292,6 +292,16 @@ fn fixture(method: &str, path: &str, target: &SeededOperator) -> (String, Option
                 "note": "roles",
             })),
         ),
+        // The price import. The upload is refused at `/dataset_ref`, so
+        // nothing is written; the batch matches nothing: 404.
+        ("GET", "/admin/pricing/imports") => (path.to_string(), None),
+        ("POST", "/admin/pricing/imports") => (
+            path.to_string(),
+            Some(json!({"dataset_ref": "not a ref", "data": []})),
+        ),
+        ("GET", "/admin/pricing/imports/{id}") => {
+            (format!("/admin/pricing/imports/{}", Uuid::nil()), None)
+        }
         _ => panic!("no fixture for {method} {path}: add one to tests/roles.rs"),
     }
 }
