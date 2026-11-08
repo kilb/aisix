@@ -27,32 +27,15 @@ use uuid::Uuid;
 
 use super::api::PriceWarning;
 use super::baselines::OperatorRef;
-use super::store::{bump_pricing_version, starts_now_or_later};
+use super::store::{bump_pricing_version, created_by, refused, starts_now_or_later};
 use crate::audit::{self, Actor, AuditEntry};
 use crate::db::DbError;
-use crate::error::{ApiError, Detail};
+use crate::error::ApiError;
 use crate::groups::{self, LockMode};
 use crate::resources::Kind;
 
 /// The most characters a rate's note holds.
 const MAX_NOTE_CHARS: usize = 500;
-
-/// A `422` at `path`.
-fn refused(path: &str, message: impl Into<String>) -> ApiError {
-    ApiError::validation(vec![Detail {
-        path: path.to_string(),
-        message: message.into(),
-    }])
-}
-
-/// The operator a revision is written by; `None` for the control plane
-/// itself (and anyone who is not an operator, who the audit row names).
-fn created_by(actor: Actor<'_>) -> Option<Uuid> {
-    match actor {
-        Actor::Operator(op) => Some(op.id),
-        _ => None,
-    }
-}
 
 /// A rate revision to write.
 #[derive(Debug, Clone)]
@@ -95,9 +78,15 @@ impl<'r> sqlx::FromRow<'r, PgRow> for GroupRateRevision {
             group_id: row.try_get("group_id")?,
             model_id: row.try_get("model_id")?,
             effective_from: row.try_get("effective_from")?,
-            cny_per_usd: e4
-                .and_then(|e4| u32::try_from(e4).ok())
-                .map(|e4| CnyPerUsd(e4).to_string()),
+            cny_per_usd: e4.map(|e4| {
+                // The column's CHECK bounds it to `CnyPerUsd::MAX`, so a
+                // value outside that is corruption, not a rate that ended.
+                let e4 = u32::try_from(e4)
+                    .ok()
+                    .filter(|e4| *e4 <= CnyPerUsd::MAX.0)
+                    .expect("pricing_group_rates.cny_per_usd_e4 outside its CHECK");
+                CnyPerUsd(e4).to_string()
+            }),
             note: row.try_get("note")?,
             created_by: created_by
                 .zip(email)
@@ -132,23 +121,30 @@ pub async fn rate_plan(
     group_id: Uuid,
     model_id: Option<Uuid>,
 ) -> Result<RatePlan, DbError> {
+    // One instant for both halves of the plan: a revision landing exactly now
+    // is `current`, never both and never neither.
+    let now: DateTime<Utc> = sqlx::query_scalar("SELECT now()")
+        .fetch_one(&mut *conn)
+        .await?;
     let current: Option<GroupRateRevision> = sqlx::query_as(&format!(
         "SELECT {COLUMNS} FROM pricing_group_rates r LEFT JOIN operators o ON o.id = r.created_by \
-         WHERE r.group_id = $1 AND r.model_id IS NOT DISTINCT FROM $2 AND r.effective_from <= now() \
+         WHERE r.group_id = $1 AND r.model_id IS NOT DISTINCT FROM $2 AND r.effective_from <= $3 \
          ORDER BY r.effective_from DESC, r.revision_id DESC LIMIT 1"
     ))
     .bind(group_id)
     .bind(model_id)
+    .bind(now)
     .fetch_optional(&mut *conn)
     .await?;
     let upcoming: Vec<GroupRateRevision> = sqlx::query_as(&format!(
         "SELECT DISTINCT ON (r.effective_from) {COLUMNS} \
          FROM pricing_group_rates r LEFT JOIN operators o ON o.id = r.created_by \
-         WHERE r.group_id = $1 AND r.model_id IS NOT DISTINCT FROM $2 AND r.effective_from > now() \
+         WHERE r.group_id = $1 AND r.model_id IS NOT DISTINCT FROM $2 AND r.effective_from > $3 \
          ORDER BY r.effective_from, r.revision_id DESC"
     ))
     .bind(group_id)
     .bind(model_id)
+    .bind(now)
     .fetch_all(&mut *conn)
     .await?;
     Ok(RatePlan { current, upcoming })
