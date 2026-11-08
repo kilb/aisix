@@ -265,6 +265,12 @@ fn fixture(method: &str, path: &str, target: &SeededOperator) -> (String, Option
                 "note": "roles",
             })),
         ),
+        // An upstream account's own model list. The account matches nothing:
+        // past the role check it answers 404 and never dials an upstream.
+        ("GET", "/admin/provider-keys/{id}/upstream-models") => (
+            format!("/admin/provider-keys/{}/upstream-models", Uuid::nil()),
+            None,
+        ),
         _ => panic!("no fixture for {method} {path}: add one to tests/roles.rs"),
     }
 }

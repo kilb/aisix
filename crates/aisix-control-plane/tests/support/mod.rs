@@ -285,6 +285,25 @@ impl TestCp {
         Some(TestCp { running, database })
     }
 
+    /// [`TestCp::start`], whose outbound fetch may reach a fixture server on
+    /// a loopback address. The production policy refuses one
+    /// ([`TestCp::start`] keeps it); a test that must watch what the control
+    /// plane actually sends needs a real server, and this host has no
+    /// publicly routable address to put one on.
+    pub async fn start_reaching_loopback() -> Option<TestCp> {
+        let database = new_database().await?;
+        let cfg = test_config(&database.url);
+        let policy = aisix_core::config::SsrfProtectionConfig {
+            allowed_hosts: vec!["127.0.0.1".to_string()],
+            ..Default::default()
+        };
+        let running =
+            aisix_control_plane::start_with_policy(cfg, std::future::pending(), None, &policy)
+                .await
+                .expect("the control plane boots");
+        Some(TestCp { running, database })
+    }
+
     async fn boot(database: Arc<TestDatabase>, cfg: CpConfig) -> TestCp {
         let running = aisix_control_plane::start(cfg, std::future::pending())
             .await
