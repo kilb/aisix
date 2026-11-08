@@ -191,6 +191,30 @@ async fn delete_model(cp: &TestCp, admin: &OperatorSession, id: Uuid) {
     assert_eq!(status, 200, "delete model {id}");
 }
 
+/// `id`'s proposal rejected, as the reject route writes it: a `pending` row
+/// moved to `rejected` with its reason and decision, and nothing else
+/// touched.
+async fn reject_by_hand(cp: &TestCp, id: &str) {
+    sqlx::query(
+        "UPDATE pricing_import_proposals \
+         SET status = 'rejected', reject_reason = '与官方价格不符', decided_at = now() \
+         WHERE id = $1::uuid AND status = 'pending'",
+    )
+    .bind(id)
+    .execute(cp.db().pool())
+    .await
+    .expect("reject one proposal");
+}
+
+/// The error an SQL statement is refused with.
+async fn refused_sql(cp: &TestCp, sql: &str) -> String {
+    sqlx::query(sql)
+        .execute(cp.db().pool())
+        .await
+        .expect_err(sql)
+        .to_string()
+}
+
 /// Sessions of this test's database waiting for a lock.
 async fn lock_waiters(pool: &PgPool) -> i64 {
     sqlx::query_scalar(
@@ -242,6 +266,27 @@ async fn uploading_the_dataset_snapshot_creates_proposals() {
     assert_eq!(proposal["pricing_url"], json!(pricing_url));
     // The published file carries no checked date, so none is recorded.
     assert_eq!(proposal["prices_checked"], Value::Null);
+
+    // The two entries whose comments state that output is free become cards
+    // with a zero output; the input price is still the file's own.
+    for (provider, model) in [
+        ("perplexity", "pplx-decider-v1.2"),
+        ("perplexity", "pplx-decider-flash-v1.2"),
+    ] {
+        let (_, prices) = source(provider, model);
+        let p = current(&all, provider, model);
+        assert_eq!(p["flags"], json!([]), "{model}");
+        assert_eq!(
+            p["card"]["default"]["base"]["input"], *prices["input_mtok"],
+            "{model}"
+        );
+        assert_eq!(p["card"]["default"]["base"]["output"], "0", "{model}");
+    }
+    // A comment that says "output is free" on a model this build does not
+    // name is not read: `typesafe/jev` is an ordinary chat model.
+    let jev = current(&all, "openrouter", "typesafe/jev-1.13");
+    assert_eq!(jev["flags"], json!(["invalid_card"]));
+    assert_eq!(jev["card"], Value::Null);
 }
 
 #[tokio::test]
@@ -253,16 +298,11 @@ async fn a_newer_upload_supersedes_pending_proposals() {
     let first = upload(&cp, &op).await;
     let first_proposals = proposals(&cp, &op, &first).await;
     // One proposal of the first batch was decided before the next upload.
+    // Rejecting it is a legal transition, written as the route will write it;
+    // the route itself is another task's, so this is the one place a test
+    // decides a proposal by hand, and it decides it the way the route does.
     let decided = id(&first_proposals[0]).to_string();
-    sqlx::query(
-        "UPDATE pricing_import_proposals \
-         SET status = 'rejected', reject_reason = '与官方价格不符', decided_at = now() \
-         WHERE id = $1::uuid",
-    )
-    .bind(&decided)
-    .execute(cp.db().pool())
-    .await
-    .expect("decide one proposal");
+    reject_by_hand(&cp, &decided).await;
 
     let second = upload(&cp, &op).await;
     assert_eq!(second["status"], "open");
@@ -477,6 +517,52 @@ async fn a_proposal_equal_to_the_current_baseline_is_hidden_by_default() {
 }
 
 #[tokio::test]
+async fn a_deleted_models_proposal_is_no_longer_hidden() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let admin = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let model_id = model(&cp, &admin, "anthropic", "claude-opus-5-5").await;
+    let batch = upload(&cp, &admin).await;
+    let card = current(
+        &proposals(&cp, &admin, &batch).await,
+        "anthropic",
+        "claude-opus-5-5",
+    )["card"]
+        .clone();
+    let r = cp
+        .send(
+            "POST",
+            "/admin/pricing/baselines",
+            Some(admin.cookie()),
+            Some(json!({
+                "model_id": model_id,
+                "effective_from": db_now(&cp).await,
+                "card": card,
+                "note": "与数据集一致",
+            })),
+        )
+        .await;
+    assert_eq!(r.status, 201, "{r:?}");
+    // Hidden while the model it would price is live.
+    let shown = listed(&detail(&cp, &admin, &batch, false).await);
+    assert!(find(&shown, "anthropic", "claude-opus-5-5").is_none());
+
+    delete_model(&cp, &admin, model_id).await;
+    let shown = listed(&detail(&cp, &admin, &batch, false).await);
+    let listed_again = find(&shown, "anthropic", "claude-opus-5-5")
+        .expect("a proposal whose model is gone is still listed");
+    // It can no longer be confirmed, whatever its card says.
+    assert_eq!(listed_again["same_as_current"], false);
+    // Its model's baseline is still shown, as what it is.
+    assert_eq!(
+        listed_again["current_baseline"]["model_id"],
+        json!(model_id)
+    );
+    assert_eq!(listed_again["current_baseline"]["card"], card);
+}
+
+#[tokio::test]
 async fn the_suggested_model_is_a_direct_model_of_that_provider_and_name() {
     let Some(cp) = TestCp::start().await else {
         return;
@@ -543,6 +629,102 @@ async fn who_may_upload() {
     // A viewer reads what an operator uploaded.
     assert_eq!(batches(&cp, &viewer).await.len(), 1);
     assert_eq!(detail(&cp, &viewer, &batch, false).await["id"], batch["id"]);
+}
+
+#[tokio::test]
+async fn a_proposal_is_decided_once_and_never_rewritten() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let op = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let batch = upload(&cp, &op).await;
+    let all = proposals(&cp, &op, &batch).await;
+    let one = current(&all, "anthropic", "claude-opus-5-5").clone();
+    let pid = id(&one).to_string();
+    let filter = format!("WHERE id = '{pid}'");
+
+    // A card and flags are the upload's own.
+    for sql in [
+        format!(r#"UPDATE pricing_import_proposals SET card = '{{}}'::jsonb {filter}"#),
+        format!(r#"UPDATE pricing_import_proposals SET flags = '["bad_number"]'::jsonb {filter}"#),
+        format!(r#"UPDATE pricing_import_proposals SET provider = 'x' {filter}"#),
+        format!(r#"UPDATE pricing_import_proposals SET model = 'x' {filter}"#),
+        format!(r#"UPDATE pricing_import_proposals SET effective_from = now() {filter}"#),
+        format!(r#"UPDATE pricing_import_proposals SET batch_id = gen_random_uuid() {filter}"#),
+        format!("DELETE FROM pricing_import_proposals {filter}"),
+        "TRUNCATE pricing_import_proposals, pricing_baselines".to_string(),
+    ] {
+        let err = refused_sql(&cp, &sql).await;
+        assert!(
+            err.to_lowercase().contains("written once")
+                || err.to_lowercase().contains("never deleted")
+                || err.to_lowercase().contains("append-only")
+                || err.contains("cannot truncate"),
+            "{sql}: {err}"
+        );
+    }
+    // None of it moved.
+    let after = proposals(&cp, &op, &batch).await;
+    assert_eq!(after, all, "the rows are as uploaded");
+
+    // A confirmation's attestation is written once, with it.
+    let err = refused_sql(
+        &cp,
+        &format!(
+            "UPDATE pricing_import_proposals SET attested_by = '{}' {filter}",
+            op.id
+        ),
+    )
+    .await;
+    assert!(err.contains("only a confirmation attests"), "{err}");
+
+    // `pending` moves to one decision, and nothing moves out of it.
+    reject_by_hand(&cp, &pid).await;
+    let decided = proposals(&cp, &op, &batch)
+        .await
+        .into_iter()
+        .find(|p| id(p) == pid)
+        .expect("the proposal");
+    assert_eq!(decided["status"], "rejected");
+    for (sql, expected) in [
+        (
+            format!(r#"UPDATE pricing_import_proposals SET status = 'confirmed' {filter}"#),
+            "final",
+        ),
+        (
+            format!(r#"UPDATE pricing_import_proposals SET status = 'pending' {filter}"#),
+            "final",
+        ),
+        (
+            format!(r#"UPDATE pricing_import_proposals SET reject_reason = 'x' {filter}"#),
+            "final",
+        ),
+        (
+            format!(
+                r#"UPDATE pricing_import_proposals SET attested_by = '{}' {filter}"#,
+                op.id
+            ),
+            "only a confirmation attests",
+        ),
+    ] {
+        let err = refused_sql(&cp, &sql).await;
+        assert!(err.contains(expected), "{sql}: {err}");
+    }
+
+    // An undecided one takes no other status than the three decisions.
+    let pending = all
+        .iter()
+        .find(|p| p["status"] == "pending" && id(p) != pid)
+        .expect("another pending proposal");
+    let err = refused_sql(
+        &cp,
+        &format!(
+            "UPDATE pricing_import_proposals SET status = 'pending' WHERE id = '{}'",
+            id(pending)
+        ),
+    )
+    .await;
+    assert!(err.contains("cannot move from pending"), "{err}");
 }
 
 #[tokio::test]
