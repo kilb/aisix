@@ -78,6 +78,11 @@ pub fn tenant_fixture(method: &str, path: &str) -> (String, Option<Value>) {
             (method == "PATCH").then(|| json!({"label": "fixture-key"})),
         ),
         ("GET", "/api/billing/balance") => (path.to_string(), None),
+        ("GET", "/api/usage/calls") => (path.to_string(), None),
+        ("GET", "/api/usage/summary") => (
+            format!("{path}?group=day&from=2026-01-01T00:00:00Z&to=2026-01-02T00:00:00Z"),
+            None,
+        ),
         _ => panic!("no fixture for {method} {path}: add one to tests/support/members.rs"),
     }
 }
