@@ -253,7 +253,7 @@ export function App({ inviteToken }: { inviteToken: string | null }) {
           ) : current === "budgets" ? (
             <Budgets />
           ) : current === "billing" ? (
-            <Billing />
+            <Billing member={member} />
           ) : (
             <Org member={member} status={tenant.status} />
           )}
