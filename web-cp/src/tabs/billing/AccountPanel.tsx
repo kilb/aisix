@@ -19,6 +19,7 @@ import { Lamp } from "../../ui/Lamp";
 import { SidePanel } from "../../ui/SidePanel";
 import { useToast } from "../../ui/Toast";
 import { refusal, useLoad } from "../Tenants";
+import { CreditForm } from "./CreditForm";
 import "./billing.css";
 
 /** What every region of the panel is given. */
@@ -26,6 +27,8 @@ export interface RegionProps {
   account: BillingAccount;
   /** False for a viewer: the region renders no edit controls. */
   canEdit: boolean;
+  /** An admin operator: the one role that may credit a tenant directly. */
+  isAdmin: boolean;
   /** An action settled `account`'s new state: the list and the panel take it. */
   onChanged: (account: BillingAccount) => void;
 }
@@ -548,6 +551,7 @@ export const PANEL_REGIONS: { id: string; Component: ComponentType<RegionProps> 
   { id: "period-summary", Component: PeriodSummary },
   { id: "usage-summary", Component: UsageSummary },
   { id: "quotas", Component: Quotas },
+  { id: "credit", Component: CreditForm },
 ];
 
 /**
@@ -558,6 +562,7 @@ export const PANEL_REGIONS: { id: string; Component: ComponentType<RegionProps> 
 export function AccountPanel({
   account,
   canEdit,
+  isAdmin,
   onChanged,
   onClose,
 }: RegionProps & {
@@ -588,7 +593,7 @@ export function AccountPanel({
     >
       <Msg note={note} />
       {PANEL_REGIONS.map(({ id, Component }) => (
-        <Component key={id} account={account} canEdit={canEdit} onChanged={onChanged} />
+        <Component key={id} account={account} canEdit={canEdit} isAdmin={isAdmin} onChanged={onChanged} />
       ))}
     </SidePanel>
   );

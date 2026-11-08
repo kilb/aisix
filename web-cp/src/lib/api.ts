@@ -741,4 +741,17 @@ export const billing = {
   async budgets(tenantId: string, signal?: AbortSignal): Promise<Budget[]> {
     return (await call<{ items: Budget[] }>("GET", `/admin/tenants/${seg(tenantId)}/budgets`, undefined, undefined, signal)).data.items;
   },
+  /** Admin only: credits the tenant now. `amountUsd` is dollars and cents above 0; answers the top-up the backend recorded. Not idempotent: send once. */
+  async credit(tenantId: string, body: { amount_usd: string; reason: string; reference?: string }): Promise<CreditedTopup> {
+    return (await call<CreditedTopup>("POST", `/admin/tenants/${seg(tenantId)}/credits`, body)).data;
+  },
 };
+
+/** The top-up an operator credit recorded. */
+export interface CreditedTopup {
+  id: string;
+  origin: "operator";
+  amount_micro_usd: number;
+  reference: string;
+  credit_reason: string | null;
+}
