@@ -5,7 +5,7 @@ import { errorText, fmtInt } from "../../lib/fmt";
 import { Button } from "../../ui/Button";
 import { DataTable, Loading } from "../../ui/DataTable";
 import { Lamp } from "../../ui/Lamp";
-import { REASONS } from "./Charges";
+import { statusView } from "../../lib/pricingStatus";
 
 /** 计价状态: the pricing version, price revisions that cannot be used, and the last day's unpriced calls by reason. */
 export function PricingStatus(_props: TabProps) {
@@ -29,7 +29,7 @@ export function PricingStatus(_props: TabProps) {
     void read();
   }, []);
 
-  const codes = status ? Object.entries(status.unpriced_last_24h.by_code) : [];
+  const view = status ? statusView(status) : null;
   return (
     <div className="panel">
       <h2>计价状态</h2>
@@ -45,14 +45,14 @@ export function PricingStatus(_props: TabProps) {
         </div>
       )}
       {!status && !failure && <Loading />}
-      {status && (
+      {status && view && (
         <>
           <p className="hint">
             价格版本 <code>{status.pricing_version ?? "未知"}</code>
           </p>
 
           <h3>不可用的价格版本</h3>
-          {status.invalid_revisions.length === 0 ? (
+          {view.invalid.length === 0 ? (
             <p className="status-line">
               <Lamp state="applied">没有不可用的价格版本。</Lamp>
             </p>
@@ -66,10 +66,10 @@ export function PricingStatus(_props: TabProps) {
                 </tr>
               </thead>
               <tbody>
-                {status.invalid_revisions.map((r) => (
-                  <tr key={`${r.table}/${r.revision_id}`}>
+                {view.invalid.map((r) => (
+                  <tr key={r.key}>
                     <td>{r.table}</td>
-                    <td className="tabular">{r.revision_id}</td>
+                    <td className="tabular">{r.revision}</td>
                     <td>{r.reason}</td>
                   </tr>
                 ))}
@@ -78,7 +78,7 @@ export function PricingStatus(_props: TabProps) {
           )}
 
           <h3>最近 24 小时未计价</h3>
-          {status.unpriced_last_24h.total === 0 ? (
+          {view.unpricedTotal === 0 ? (
             <p className="status-line">
               <Lamp state="applied">最近 24 小时没有未计价的调用。</Lamp>
             </p>
@@ -91,15 +91,15 @@ export function PricingStatus(_props: TabProps) {
                 </tr>
               </thead>
               <tbody>
-                {codes.map(([code, n]) => (
-                  <tr key={code}>
-                    <td>{REASONS[code] ?? code}</td>
-                    <td className="num">{fmtInt(n)}</td>
+                {view.unpriced.map((u) => (
+                  <tr key={u.code}>
+                    <td>{u.label}</td>
+                    <td className="num">{fmtInt(u.count)}</td>
                   </tr>
                 ))}
                 <tr>
                   <th scope="row">合计</th>
-                  <td className="num">{fmtInt(status.unpriced_last_24h.total)}</td>
+                  <td className="num">{fmtInt(view.unpricedTotal)}</td>
                 </tr>
               </tbody>
             </DataTable>

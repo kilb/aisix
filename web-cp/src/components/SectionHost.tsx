@@ -12,13 +12,6 @@ export interface Section {
   minRole: OperatorRole;
 }
 
-let wanted: string | null = null;
-
-/** Names the section the next SectionHost to mount opens first, for a link from another tab. */
-export function openSectionNext(id: string): void {
-  wanted = id;
-}
-
 const RANK: Record<OperatorRole, number> = { viewer: 0, operator: 1, admin: 2 };
 
 /**
@@ -28,11 +21,7 @@ const RANK: Record<OperatorRole, number> = { viewer: 0, operator: 1, admin: 2 };
  */
 export function SectionHost({ label, sections, ...props }: TabProps & { label: string; sections: readonly Section[] }) {
   const shown = sections.filter((s) => RANK[props.operator.role] >= RANK[s.minRole]);
-  const [open, setOpen] = useState<string | null>(() => {
-    const w = wanted;
-    wanted = null;
-    return w;
-  });
+  const [open, setOpen] = useState<string | null>(props.initialSection ?? null);
   const current = shown.find((s) => s.id === open) ?? shown[0];
 
   if (!current) {

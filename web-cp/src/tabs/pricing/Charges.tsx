@@ -3,23 +3,10 @@ import type { TabProps } from "../../App";
 import { charges, resources, tenants as tenantsApi, type AdminKey, type Charge, type ChargeFilter, type Tenant } from "../../lib/api";
 import { errorText } from "../../lib/fmt";
 import { fmtMicroUsd, fmtUtc } from "../../lib/money";
+import { reasonLabel } from "../../lib/pricingStatus";
 import { Button } from "../../ui/Button";
 import { DataTable, Loading } from "../../ui/DataTable";
 import { EmptyState } from "../../ui/EmptyState";
-
-/** The pricing code behind an unpriced charge. A code not listed is shown as it came. */
-export const REASONS: Record<string, string> = {
-  missing_price: "未定价",
-  invalid_price: "价格不可用",
-  missing_tier_price: "缺少档位价",
-  missing_dimension_price: "缺少计量价",
-  inconsistent_usage: "用量不一致",
-  unpriced_operation: "不支持计价的操作",
-  undecodable_usage: "无法读取",
-  unknown_api_key: "未知密钥",
-  tenant_mismatch: "租户不符",
-  overflow: "溢出",
-};
 
 const STATUSES: [string, string][] = [
   ["charged", "已计价"],
@@ -190,7 +177,7 @@ export function Charges(_props: TabProps) {
                 <td>{tenantName(c.tenant_id)}</td>
                 <td>{models[c.requested_model_id] ?? c.requested_model_id}</td>
                 <td>{statusLabel(c.status)}</td>
-                <td>{c.error_code ? (REASONS[c.error_code] ?? c.error_code) : "—"}</td>
+                <td>{c.error_code ? reasonLabel(c.error_code) : "—"}</td>
                 <td className="num">{c.charge_micro_usd === null ? "—" : fmtMicroUsd(c.charge_micro_usd)}</td>
                 <td className="num">{c.cost_micro_usd === null ? "—" : fmtMicroUsd(c.cost_micro_usd)}</td>
                 <td>{c.service_tier ?? "—"}</td>
