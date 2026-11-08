@@ -38,7 +38,7 @@ pub mod store;
 
 use std::collections::{HashMap, HashSet};
 
-use aisix_pricing::{price_event, BillableUsage, Outcome, PricingError};
+use aisix_pricing::{price_event, BillableUsage, Outcome, Payer, PricingError};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::Value;
@@ -121,6 +121,16 @@ pub async fn price_stored(
             ),
             None => (String::new(), String::new()),
         };
+        // Who pays: the tenant the key belongs to and the group it names, both
+        // from the control plane's own key record, never from the row. The
+        // group is read unlocked: `tenant_keys.group_id` is set at most once
+        // and never changes after, and a group retired underneath this batch
+        // leaves the rate it already in force, which is what the row was
+        // billed at anyway.
+        let payer = Payer {
+            tenant_id: tenant_id.clone(),
+            group_id: key.and_then(|k| k.group_id).map(|g| g.to_string()),
+        };
         if key.is_some() && claim.user_id != member_id {
             tracing::error!(
                 event_id = row.event_id,
@@ -145,9 +155,8 @@ pub async fn price_stored(
             }
             Ok(()) => match BillableUsage::deserialize(&row.event) {
                 Err(_) => Err(ChargeError::Undecodable),
-                Ok(usage) => {
-                    price_event(&book, &usage, row.received_at).map_err(ChargeError::Pricing)
-                }
+                Ok(usage) => price_event(&book, &usage, &payer, row.received_at)
+                    .map_err(ChargeError::Pricing),
             },
         };
         if charge == Err(ChargeError::Pricing(PricingError::UnknownTenant)) {
@@ -173,6 +182,7 @@ pub async fn price_stored(
             api_key_id: claim.api_key_id,
             user_id: &member_id,
             requested_model_id: claim.requested_model_id,
+            group_id: key.and_then(|k| k.group_id),
             request_id: row.request_id.as_deref(),
         };
         let recorded = record_charge(&mut *conn, &ident, &charge).await?;
@@ -182,7 +192,7 @@ pub async fn price_stored(
             if p.outcome == Outcome::Charged && p.charge.0 > 0 {
                 debits.push(Posting {
                     tenant_id: k.tenant_id,
-                    amount_micro_usd: -p.charge.0,
+                    amount_micro_cny: -p.charge.0,
                     source: Source::Usage {
                         event_id: &row.event_id,
                     },
@@ -219,13 +229,13 @@ fn balances_after(accounts: Vec<Account>, postings: &[Posting<'_>]) -> Vec<Accou
     let mut moved: HashMap<Uuid, i64> = HashMap::new();
     for posting in postings {
         let sum = moved.entry(posting.tenant_id).or_default();
-        *sum = sum.saturating_add(posting.amount_micro_usd);
+        *sum = sum.saturating_add(posting.amount_micro_cny);
     }
     accounts
         .into_iter()
         .filter_map(|account| {
             moved.get(&account.tenant_id).map(|&delta| Account {
-                balance_micro_usd: account.balance_micro_usd.saturating_add(delta),
+                balance_micro_cny: account.balance_micro_cny.saturating_add(delta),
                 ..account
             })
         })
@@ -263,6 +273,10 @@ struct KeyRecord {
     tenant_id: Uuid,
     /// `None` for a key bound to no member.
     member_id: Option<Uuid>,
+    /// The provider group the key names, and the rate its rows are charged at.
+    /// `None` for a legacy key an older replica minted without one, whose rows
+    /// are stored `no_group` and priced again by a run once a group is set.
+    group_id: Option<Uuid>,
 }
 
 /// The key `text` names: a UUID in the lowercase hyphenated form key ids are
@@ -287,19 +301,21 @@ async fn key_records(
         return Ok(HashMap::new());
     }
     let keys: Vec<Uuid> = keys.into_iter().collect();
-    let records: Vec<(Uuid, Uuid, Option<Uuid>)> =
-        sqlx::query_as("SELECT id, tenant_id, member_id FROM tenant_keys WHERE id = ANY($1)")
-            .bind(keys)
-            .fetch_all(conn)
-            .await?;
+    let records: Vec<(Uuid, Uuid, Option<Uuid>, Option<Uuid>)> = sqlx::query_as(
+        "SELECT id, tenant_id, member_id, group_id FROM tenant_keys WHERE id = ANY($1)",
+    )
+    .bind(keys)
+    .fetch_all(conn)
+    .await?;
     Ok(records
         .into_iter()
-        .map(|(id, tenant_id, member_id)| {
+        .map(|(id, tenant_id, member_id, group_id)| {
             (
                 id,
                 KeyRecord {
                     tenant_id,
                     member_id,
+                    group_id,
                 },
             )
         })
@@ -422,6 +438,7 @@ mod tests {
             KeyRecord {
                 tenant_id: Uuid::parse_str(TENANT).expect("a uuid"),
                 member_id: None,
+                group_id: None,
             },
         )]);
         let claim = Claim {

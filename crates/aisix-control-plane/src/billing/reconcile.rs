@@ -8,10 +8,10 @@
 //! - `balance`: the account's balance against the total of the tenant's
 //!   entries;
 //! - `usage`: the total of its `usage` entries against minus the total of
-//!   `charge_micro_usd` over the charges filed under it as `charged` (a row
+//!   `charge_micro_cny` over the charges filed under it as `charged` (a row
 //!   charged 0 posts no entry and adds 0);
 //! - `adjustments`: the total of its `adjustment` entries against minus the
-//!   total of `pricing_adjustments.delta_micro_usd` over the charges filed
+//!   total of `pricing_adjustments.delta_micro_cny` over the charges filed
 //!   under it;
 //! - `topups`: the total of its `topup` entries against the total of its
 //!   approved top-ups, operator credits included;
@@ -90,8 +90,8 @@ pub struct Mismatch {
     pub tenant_id: Uuid,
     pub tenant_name: String,
     pub check: Check,
-    pub expected_micro_usd: i64,
-    pub actual_micro_usd: i64,
+    pub expected_micro_cny: i64,
+    pub actual_micro_cny: i64,
     /// The entry that breaks the running balance; `None` for the other
     /// checks.
     pub seq: Option<i64>,
@@ -220,30 +220,30 @@ async fn totals(
 ) -> Result<Vec<Mismatch>, DbError> {
     let sql = format!(
         "WITH accounts AS ( \
-           SELECT a.tenant_id, t.name, a.balance_micro_usd \
+           SELECT a.tenant_id, t.name, a.balance_micro_cny \
            FROM billing_accounts a JOIN tenants t ON t.id = a.tenant_id WHERE {accounts}), \
          entries AS ( \
-           SELECT l.tenant_id, SUM(l.amount_micro_usd)::bigint AS total, \
-             COALESCE(SUM(l.amount_micro_usd) FILTER (WHERE l.kind = 'usage'), 0)::bigint \
+           SELECT l.tenant_id, SUM(l.amount_micro_cny)::bigint AS total, \
+             COALESCE(SUM(l.amount_micro_cny) FILTER (WHERE l.kind = 'usage'), 0)::bigint \
                AS usage, \
-             COALESCE(SUM(l.amount_micro_usd) FILTER (WHERE l.kind = 'adjustment'), 0)::bigint \
+             COALESCE(SUM(l.amount_micro_cny) FILTER (WHERE l.kind = 'adjustment'), 0)::bigint \
                AS adjustment, \
-             COALESCE(SUM(l.amount_micro_usd) FILTER (WHERE l.kind = 'topup'), 0)::bigint \
+             COALESCE(SUM(l.amount_micro_cny) FILTER (WHERE l.kind = 'topup'), 0)::bigint \
                AS topup \
-           FROM billing_ledger l WHERE {ledger} GROUP BY l.tenant_id), \
+           FROM billing_ledger_cny l WHERE {ledger} GROUP BY l.tenant_id), \
          charged AS ( \
-           SELECT pc.tenant_id, SUM(pc.charge_micro_usd)::bigint AS total \
-           FROM pricing_charges pc WHERE pc.status = 'charged' AND {charges} \
+           SELECT pc.tenant_id, SUM(pc.charge_micro_cny)::bigint AS total \
+           FROM pricing_charges_cny pc WHERE pc.status = 'charged' AND {charges} \
            GROUP BY pc.tenant_id), \
          adjusted AS ( \
-           SELECT pc.tenant_id, SUM(pa.delta_micro_usd)::bigint AS total \
-           FROM pricing_adjustments pa JOIN pricing_charges pc ON pc.event_id = pa.event_id \
+           SELECT pc.tenant_id, SUM(pa.delta_micro_cny)::bigint AS total \
+           FROM pricing_adjustments_cny pa JOIN pricing_charges_cny pc ON pc.event_id = pa.event_id \
            WHERE {charges} GROUP BY pc.tenant_id), \
          approved AS ( \
-           SELECT p.tenant_id, SUM(p.amount_micro_usd)::bigint AS total \
-           FROM billing_topups p WHERE p.status = 'approved' AND {topups} \
+           SELECT p.tenant_id, SUM(p.amount_micro_cny)::bigint AS total \
+           FROM billing_topups_cny p WHERE p.status = 'approved' AND {topups} \
            GROUP BY p.tenant_id) \
-         SELECT a.tenant_id, a.name, a.balance_micro_usd, COALESCE(e.total, 0), \
+         SELECT a.tenant_id, a.name, a.balance_micro_cny, COALESCE(e.total, 0), \
            COALESCE(e.usage, 0), COALESCE(e.adjustment, 0), COALESCE(e.topup, 0), \
            COALESCE(c.total, 0), COALESCE(j.total, 0), COALESCE(p.total, 0) \
          FROM accounts a \
@@ -288,8 +288,8 @@ async fn totals(
                     tenant_id,
                     tenant_name: name.clone(),
                     check,
-                    expected_micro_usd: expected,
-                    actual_micro_usd: actual,
+                    expected_micro_cny: expected,
+                    actual_micro_cny: actual,
                     seq: None,
                 });
             }
@@ -306,14 +306,14 @@ async fn running_balances(
 ) -> Result<Vec<Mismatch>, DbError> {
     let sql = format!(
         "SELECT DISTINCT ON (r.tenant_id) r.tenant_id, t.name, r.seq, r.expected, \
-           r.balance_after_micro_usd \
-         FROM (SELECT l.tenant_id, l.seq, l.balance_after_micro_usd, \
-                 COALESCE(LAG(l.balance_after_micro_usd) \
-                   OVER (PARTITION BY l.tenant_id ORDER BY l.seq), 0) + l.amount_micro_usd \
+           r.balance_after_micro_cny \
+         FROM (SELECT l.tenant_id, l.seq, l.balance_after_micro_cny, \
+                 COALESCE(LAG(l.balance_after_micro_cny) \
+                   OVER (PARTITION BY l.tenant_id ORDER BY l.seq), 0) + l.amount_micro_cny \
                    AS expected \
-               FROM billing_ledger l WHERE {ledger}) r \
+               FROM billing_ledger_cny l WHERE {ledger}) r \
          JOIN tenants t ON t.id = r.tenant_id \
-         WHERE r.expected <> r.balance_after_micro_usd \
+         WHERE r.expected <> r.balance_after_micro_cny \
          ORDER BY r.tenant_id, r.seq",
         ledger = only(tenant_id, "l.tenant_id = $1"),
     );
@@ -329,8 +329,8 @@ async fn running_balances(
             tenant_id,
             tenant_name,
             check: Check::RunningBalance,
-            expected_micro_usd: expected,
-            actual_micro_usd: actual,
+            expected_micro_cny: expected,
+            actual_micro_cny: actual,
             seq: Some(seq),
         })
         .collect())
@@ -341,9 +341,9 @@ async fn charged_without_entry(
     tenant_id: Option<Uuid>,
 ) -> Result<i64, DbError> {
     let sql = format!(
-        "SELECT count(*) FROM pricing_charges pc \
-         WHERE pc.status = 'charged' AND pc.charge_micro_usd > 0 AND {charges} \
-           AND NOT EXISTS (SELECT 1 FROM billing_ledger l WHERE l.event_id = pc.event_id)",
+        "SELECT count(*) FROM pricing_charges_cny pc \
+         WHERE pc.status = 'charged' AND pc.charge_micro_cny > 0 AND {charges} \
+           AND NOT EXISTS (SELECT 1 FROM billing_ledger_cny l WHERE l.event_id = pc.event_id)",
         charges = only(tenant_id, "pc.tenant_id = $1::text"),
     );
     let mut query = sqlx::query_scalar::<_, i64>(&sql);

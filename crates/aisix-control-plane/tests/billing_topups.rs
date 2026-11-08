@@ -80,9 +80,9 @@ async fn request(cp: &TestCp, member: &MemberSession, body: Value) -> Resp {
     .await
 }
 
-/// Requests `amount_usd` as `member`, which must answer 201; the top-up's id.
-async fn requested(cp: &TestCp, member: &MemberSession, amount_usd: &str) -> String {
-    let r = request(cp, member, json!({ "amount_usd": amount_usd })).await;
+/// Requests `amount_cny` as `member`, which must answer 201; the top-up's id.
+async fn requested(cp: &TestCp, member: &MemberSession, amount_cny: &str) -> String {
+    let r = request(cp, member, json!({ "amount_cny": amount_cny })).await;
     assert_eq!(r.status, 201, "{r:?}");
     r.body["id"].as_str().expect("an id").to_string()
 }
@@ -116,7 +116,7 @@ async fn get(cp: &TestCp, cookie: &str, path: &str) -> Resp {
 /// after, topup id)`.
 async fn entries(pool: &PgPool, tenant: Uuid) -> Vec<(String, i64, i64, Option<Uuid>)> {
     sqlx::query_as(
-        "SELECT kind, amount_micro_usd, balance_after_micro_usd, topup_id FROM billing_ledger \
+        "SELECT kind, amount_micro_cny, balance_after_micro_cny, topup_id FROM billing_ledger_cny \
          WHERE tenant_id = $1 ORDER BY seq",
     )
     .bind(tenant)
@@ -126,7 +126,7 @@ async fn entries(pool: &PgPool, tenant: Uuid) -> Vec<(String, i64, i64, Option<U
 }
 
 async fn balance(pool: &PgPool, tenant: Uuid) -> i64 {
-    sqlx::query_scalar("SELECT balance_micro_usd FROM billing_accounts WHERE tenant_id = $1")
+    sqlx::query_scalar("SELECT balance_micro_cny FROM billing_accounts WHERE tenant_id = $1")
         .bind(tenant)
         .fetch_one(pool)
         .await
@@ -189,7 +189,7 @@ async fn a_tenant_requests_a_top_up_and_both_sides_see_it_pending() {
     let r = request(
         &s.cp,
         &s.owner,
-        json!({"amount_usd": "0.05", "reference": "wire-7c1"}),
+        json!({"amount_cny": "0.05", "reference": "wire-7c1"}),
     )
     .await;
     assert_eq!(r.status, 201, "{r:?}");
@@ -201,7 +201,7 @@ async fn a_tenant_requests_a_top_up_and_both_sides_see_it_pending() {
         json!({
             "id": id,
             "origin": "tenant",
-            "amount_micro_usd": 50_000,
+            "amount_micro_cny": 50_000,
             "note": "",
             "reference": "wire-7c1",
             "status": "pending",
@@ -239,7 +239,7 @@ async fn a_tenant_requests_a_top_up_and_both_sides_see_it_pending() {
     assert_eq!(item["tenant_id"], json!(s.tenant));
     assert_eq!(item["tenant_name"], json!(s.tenant_name));
     assert_eq!(item["status"], "pending");
-    assert_eq!(item["amount_micro_usd"], 50_000);
+    assert_eq!(item["amount_micro_cny"], 50_000);
     assert_eq!(item["decided_by"], Value::Null);
     assert_eq!(
         item["requested_by"],
@@ -252,7 +252,7 @@ async fn a_tenant_requests_a_top_up_and_both_sides_see_it_pending() {
             "member".to_string(),
             Some(s.owner.id),
             Some(id.clone()),
-            json!({"amount_micro_usd": 50_000})
+            json!({"amount_micro_cny": 50_000})
         )]
     );
     // Requesting moves no money.
@@ -292,7 +292,7 @@ async fn approving_credits_the_balance_once_in_the_same_transaction() {
             None,
         )
         .await;
-    assert_eq!(r.body["balance_micro_usd"], 50_000, "{r:?}");
+    assert_eq!(r.body["balance_micro_cny"], 50_000, "{r:?}");
     assert_eq!(r.body["exhausted"], false, "{r:?}");
     assert_eq!(
         audits(pool, s.tenant, "billing.topup.approve").await,
@@ -300,7 +300,7 @@ async fn approving_credits_the_balance_once_in_the_same_transaction() {
             "operator".to_string(),
             Some(s.op.id),
             Some(id.clone()),
-            json!({"amount_micro_usd": 50_000})
+            json!({"amount_micro_cny": 50_000})
         )]
     );
 
@@ -488,23 +488,23 @@ async fn a_top_up_amount_is_dollars_and_cents_only() {
     let Some(s) = shop().await else { return };
     let pool = s.cp.db().pool();
     for bad in ["0", "0.00", "0.001", "-1", "1e3", "1000000.01", "", " 1"] {
-        let r = request(&s.cp, &s.owner, json!({ "amount_usd": bad })).await;
+        let r = request(&s.cp, &s.owner, json!({ "amount_cny": bad })).await;
         assert_eq!(r.status, 422, "{bad:?}: {r:?}");
-        assert_eq!(r.body["details"][0]["path"], "/amount_usd", "{bad:?}");
+        assert_eq!(r.body["details"][0]["path"], "/amount_cny", "{bad:?}");
     }
     // A note and a reference are bounded and printable.
     for (body, path) in [
         (
-            json!({"amount_usd": "1", "note": "备".repeat(501)}),
+            json!({"amount_cny": "1", "note": "备".repeat(501)}),
             "/note",
         ),
-        (json!({"amount_usd": "1", "note": "bell\u{7}"}), "/note"),
+        (json!({"amount_cny": "1", "note": "bell\u{7}"}), "/note"),
         (
-            json!({"amount_usd": "1", "reference": "r".repeat(129)}),
+            json!({"amount_cny": "1", "reference": "r".repeat(129)}),
             "/reference",
         ),
         (
-            json!({"amount_usd": "1", "reference": "wire\n7c1"}),
+            json!({"amount_cny": "1", "reference": "wire\n7c1"}),
             "/reference",
         ),
     ] {
@@ -523,22 +523,22 @@ async fn a_top_up_amount_is_dollars_and_cents_only() {
         0
     );
 
-    let r = request(&s.cp, &s.owner, json!({"amount_usd": "1000000.00"})).await;
+    let r = request(&s.cp, &s.owner, json!({"amount_cny": "1000000.00"})).await;
     assert_eq!(r.status, 201, "{r:?}");
-    assert_eq!(r.body["amount_micro_usd"], 1_000_000_000_000_i64);
+    assert_eq!(r.body["amount_micro_cny"], 1_000_000_000_000_i64);
     // At the limits, counted in characters rather than bytes.
     let note = "备".repeat(500);
     let reference = "r".repeat(128);
     let r = request(
         &s.cp,
         &s.owner,
-        json!({"amount_usd": "0.01", "note": note, "reference": reference}),
+        json!({"amount_cny": "0.01", "note": note, "reference": reference}),
     )
     .await;
     assert_eq!(r.status, 201, "{r:?}");
     assert_eq!(r.body["note"], json!(note));
     assert_eq!(r.body["reference"], json!(reference));
-    assert_eq!(r.body["amount_micro_usd"], 10_000);
+    assert_eq!(r.body["amount_micro_cny"], 10_000);
 }
 
 #[tokio::test]
@@ -587,7 +587,7 @@ async fn a_tenant_holds_at_most_twenty_pending_requests() {
         let id = requested(&s.cp, &s.owner, "0.01").await;
         first.get_or_insert(id);
     }
-    let r = request(&s.cp, &s.owner, json!({"amount_usd": "0.01"})).await;
+    let r = request(&s.cp, &s.owner, json!({"amount_cny": "0.01"})).await;
     assert_eq!(
         (r.status, &r.body["code"]),
         (409, &json!("topup_limit")),
@@ -600,9 +600,9 @@ async fn a_tenant_holds_at_most_twenty_pending_requests() {
 
     let r = approve(&s.cp, &s.op, &first.expect("a first request")).await;
     assert_eq!(r.status, 200, "{r:?}");
-    let r = request(&s.cp, &s.owner, json!({"amount_usd": "0.01"})).await;
+    let r = request(&s.cp, &s.owner, json!({"amount_cny": "0.01"})).await;
     assert_eq!(r.status, 201, "{r:?}");
-    let r = request(&s.cp, &s.owner, json!({"amount_usd": "0.01"})).await;
+    let r = request(&s.cp, &s.owner, json!({"amount_cny": "0.01"})).await;
     assert_eq!(r.status, 409, "{r:?}");
 }
 
@@ -615,7 +615,7 @@ async fn members_cannot_request_or_read_top_ups() {
         s.cp.member_login_seeded(s.tenant, MemberRole::Billing)
             .await;
 
-    let r = request(&s.cp, &member, json!({"amount_usd": "0.05"})).await;
+    let r = request(&s.cp, &member, json!({"amount_cny": "0.05"})).await;
     assert_eq!(
         (r.status, &r.body["code"]),
         (403, &json!("forbidden")),
@@ -634,14 +634,14 @@ async fn members_cannot_request_or_read_top_ups() {
         let r = s.cp.send("GET", &path, Some(billing.cookie()), None).await;
         assert_eq!(r.status, 200, "{path}: {r:?}");
     }
-    let r = request(&s.cp, &billing, json!({"amount_usd": "0.05"})).await;
+    let r = request(&s.cp, &billing, json!({"amount_cny": "0.05"})).await;
     assert_eq!(r.status, 201, "{r:?}");
     assert_eq!(r.body["requested_by"]["id"], json!(billing.id));
 
     // A tenant that is not active requests nothing.
     let pending = s.cp.seed_tenant(TenantStatus::Pending).await;
     let owner = s.cp.member_login_seeded(pending, MemberRole::Owner).await;
-    let r = request(&s.cp, &owner, json!({"amount_usd": "0.05"})).await;
+    let r = request(&s.cp, &owner, json!({"amount_cny": "0.05"})).await;
     assert_eq!(
         (r.status, &r.body["code"]),
         (403, &json!("tenant_not_active")),
@@ -714,7 +714,7 @@ async fn an_approval_waits_for_the_account_before_it_reads_the_balance() {
         &mut holder,
         &[Posting {
             tenant_id: s.tenant,
-            amount_micro_usd: 10_000,
+            amount_micro_cny: 10_000,
             source: Source::Topup {
                 topup_id: credit.id,
             },
@@ -767,7 +767,7 @@ async fn an_operator_credit_shows_to_the_tenant_with_its_reason_and_no_operator(
                         &mut *conn,
                         &[Posting {
                             tenant_id: tenant,
-                            amount_micro_usd: 50_000,
+                            amount_micro_cny: 50_000,
                             source: Source::Topup { topup_id: row.id },
                         }],
                     )
@@ -806,7 +806,7 @@ async fn an_operator_credit_shows_to_the_tenant_with_its_reason_and_no_operator(
         s.cp.send("GET", "/api/billing/balance", Some(s.owner.cookie()), None)
             .await;
     assert_eq!(r.body["pending_topups"], 0, "{r:?}");
-    assert_eq!(r.body["balance_micro_usd"], 50_000, "{r:?}");
+    assert_eq!(r.body["balance_micro_cny"], 50_000, "{r:?}");
 }
 
 #[tokio::test]

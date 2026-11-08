@@ -16,8 +16,8 @@ use aisix_pricing::RateCard;
 use chrono::{DateTime, TimeDelta, Utc};
 use serde_json::{json, Value};
 use support::world::{
-    db_now, deliver, insert_sell, insert_sell_backdated, price, seed_key, seed_model, seed_tenant,
-    tokens_680, usage, world, World,
+    db_now, deliver, insert_baseline, insert_baseline_backdated, price, seed_key, seed_model,
+    seed_tenant, tokens_680, usage, world, World,
 };
 use support::{DpClient, Resp, TestCp};
 use uuid::Uuid;
@@ -79,7 +79,7 @@ async fn model(w: &World, name: &str, priced: bool) -> Uuid {
     let id = Uuid::parse_str(m.body["id"].as_str().expect("an id")).expect("a uuid");
     if priced {
         let since = db_now(&w.cp).await - TimeDelta::days(1);
-        insert_sell_backdated(
+        insert_baseline_backdated(
             w.cp.db(),
             id,
             json!({"default": {"base": {"input": "1", "output": "2", "cache_read": "0.1"}}}),
@@ -231,7 +231,7 @@ async fn reprice_input(cp: &TestCp, model: Uuid, input: &str) {
     }))
     .expect("a card");
     let now = db_now(cp).await;
-    insert_sell(cp, model, None, now, Some(card))
+    insert_baseline(cp, model, now, card)
         .await
         .expect("a new price");
 }
@@ -764,7 +764,7 @@ async fn a_lookup_past_its_statement_timeout_answers_503() {
     send_all(&w, vec![row(&w, "to-1", "req-lk-5c9", m, t0, tokens_680())]).await;
 
     let mut holder = w.cp.db().pool().begin().await.expect("begin");
-    sqlx::query("LOCK TABLE pricing_charges IN ACCESS EXCLUSIVE MODE")
+    sqlx::query("LOCK TABLE pricing_charges_cny IN ACCESS EXCLUSIVE MODE")
         .execute(&mut *holder)
         .await
         .expect("hold the charges");
@@ -807,7 +807,7 @@ async fn a_charge_carries_its_rows_request_id() {
     )
     .await;
     let stored: Vec<(String, Option<String>, Option<String>)> = sqlx::query_as(
-        "SELECT pc.event_id, pc.request_id, ue.request_id FROM pricing_charges pc \
+        "SELECT pc.event_id, pc.request_id, ue.request_id FROM pricing_charges_cny pc \
          JOIN usage_events ue ON ue.event_id = pc.event_id ORDER BY pc.event_id",
     )
     .fetch_all(w.cp.db().pool())
@@ -850,8 +850,8 @@ async fn a_charge_carries_its_rows_request_id() {
     .await
     .expect("insert the usage row");
     sqlx::query(
-        "INSERT INTO pricing_charges (event_id, tenant_id, api_key_id, user_id, \
-         requested_model_id, occurred_at, status, charge_micro_usd, engine_version) \
+        "INSERT INTO pricing_charges_cny (event_id, tenant_id, api_key_id, user_id, \
+         requested_model_id, occurred_at, status, charge_micro_cny, engine_version) \
          VALUES ('rq-raw', $1::text, $2, $3::text, $4::text, $5, 'charged', 680, 1)",
     )
     .bind(w.tenant)
@@ -894,7 +894,7 @@ async fn a_charge_carries_its_rows_request_id() {
     let set = |value: Option<&'static str>| {
         let w = &w;
         async move {
-            sqlx::query("UPDATE pricing_charges SET request_id = $1 WHERE event_id = 'rq-raw'")
+            sqlx::query("UPDATE pricing_charges_cny SET request_id = $1 WHERE event_id = 'rq-raw'")
                 .bind(value)
                 .execute(w.cp.db().pool())
                 .await
@@ -976,7 +976,7 @@ async fn stalled_lookups_never_hold_up_usage_intake() {
     .await;
 
     let mut holder = w.cp.db().pool().begin().await.expect("begin");
-    sqlx::query("LOCK TABLE pricing_adjustments IN ACCESS EXCLUSIVE MODE")
+    sqlx::query("LOCK TABLE pricing_adjustments_cny IN ACCESS EXCLUSIVE MODE")
         .execute(&mut *holder)
         .await
         .expect("hold the adjustments");

@@ -54,6 +54,10 @@ pub struct KeyAccess {
     pub tenant_id: Uuid,
     pub member_id: Option<Uuid>,
     pub is_internal: bool,
+    /// The provider group the key names. `None` for a legacy key an older
+    /// replica minted without one: its rows price nothing until a group is
+    /// set, and a re-pricing run charges them then (R11).
+    pub group_id: Option<Uuid>,
     /// From the key's member's current role; a key bound to no member sees
     /// what a member's key sees.
     pub visibility: Visibility,
@@ -64,8 +68,9 @@ pub async fn key_access(
     conn: &mut PgConnection,
     key_id: Uuid,
 ) -> Result<Option<KeyAccess>, DbError> {
-    let row: Option<(Uuid, Option<Uuid>, bool, Option<String>)> = sqlx::query_as(
-        "SELECT k.tenant_id, k.member_id, t.is_internal, m.role \
+    type Row = (Uuid, Option<Uuid>, bool, Option<String>, Option<Uuid>);
+    let row: Option<Row> = sqlx::query_as(
+        "SELECT k.tenant_id, k.member_id, t.is_internal, m.role, k.group_id \
          FROM tenant_keys k JOIN tenants t ON t.id = k.tenant_id \
          LEFT JOIN members m ON m.id = k.member_id \
          WHERE k.id = $1 AND k.revoked_at IS NULL",
@@ -73,15 +78,16 @@ pub async fn key_access(
     .bind(key_id)
     .fetch_optional(conn)
     .await?;
-    Ok(
-        row.map(|(tenant_id, member_id, is_internal, role)| KeyAccess {
+    Ok(row.map(
+        |(tenant_id, member_id, is_internal, role, group_id)| KeyAccess {
             key_id,
             tenant_id,
             member_id,
             is_internal,
+            group_id,
             visibility: role
                 .and_then(|r| r.parse::<MemberRole>().ok())
                 .map_or(Visibility::Own, session_visibility),
-        }),
-    )
+        },
+    ))
 }

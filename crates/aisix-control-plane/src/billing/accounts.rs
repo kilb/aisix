@@ -20,7 +20,7 @@ use sqlx::PgConnection;
 use uuid::Uuid;
 
 use super::marks;
-use super::money::parse_usd;
+use super::money::parse_cny;
 use crate::audit::{self, Actor, AuditEntry};
 use crate::auth::{MemberAuth, MemberRole, OperatorAuth, OperatorRole};
 use crate::db::DbError;
@@ -38,11 +38,11 @@ pub struct BillingAccount {
     pub status: String,
     pub is_internal: bool,
     pub billing_mode: String,
-    pub balance_micro_usd: i64,
-    pub credit_limit_micro_usd: i64,
+    pub balance_micro_cny: i64,
+    pub credit_limit_micro_cny: i64,
     /// The balance for a prepaid tenant, the balance plus the credit limit
     /// for a postpaid one.
-    pub available_micro_usd: i64,
+    pub available_micro_cny: i64,
     /// Whether the balance rule blocks the tenant now; never for the
     /// internal tenant.
     pub exhausted: bool,
@@ -53,8 +53,8 @@ pub struct BillingAccount {
 /// The columns of a [`BillingAccount`] read, with the account's own columns
 /// as zeros for a tenant that has no account yet.
 const SELECT: &str = "SELECT t.id, t.name, t.status, t.is_internal, t.billing_mode, \
-     COALESCE(a.balance_micro_usd, 0), COALESCE(a.credit_limit_micro_usd, 0), \
-     (SELECT count(*) FROM billing_topups p WHERE p.tenant_id = t.id AND p.status = 'pending') \
+     COALESCE(a.balance_micro_cny, 0), COALESCE(a.credit_limit_micro_cny, 0), \
+     (SELECT count(*) FROM billing_topups_cny p WHERE p.tenant_id = t.id AND p.status = 'pending') \
      FROM tenants t LEFT JOIN billing_accounts a ON a.tenant_id = t.id";
 
 type Raw = (Uuid, String, String, bool, String, i64, i64, i64);
@@ -70,9 +70,9 @@ fn account_of(raw: Raw) -> Result<BillingAccount, ApiError> {
         status,
         is_internal,
         billing_mode: mode,
-        balance_micro_usd: balance,
-        credit_limit_micro_usd: credit_limit,
-        available_micro_usd: match billing_mode {
+        balance_micro_cny: balance,
+        credit_limit_micro_cny: credit_limit,
+        available_micro_cny: match billing_mode {
             BillingMode::Prepaid => balance,
             BillingMode::Postpaid => balance.saturating_add(credit_limit),
         },
@@ -126,13 +126,13 @@ pub async fn get(
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SetCreditLimit {
-    credit_limit_usd: String,
+    credit_limit_cny: String,
 }
 
-/// `PATCH /admin/tenants/{id}/billing` with `{credit_limit_usd}` → `200
+/// `PATCH /admin/tenants/{id}/billing` with `{credit_limit_cny}` → `200
 /// BillingAccount`, settled: the new limit and the balance mark it decides
-/// are committed together. `422 /credit_limit_usd` unless the limit is
-/// dollars and cents (0 is allowed).
+/// are committed together. `422 /credit_limit_cny` unless the limit is
+/// yuan and fen (0 is allowed).
 pub async fn set_credit_limit(
     auth: OperatorAuth,
     State(state): State<AppState>,
@@ -141,7 +141,7 @@ pub async fn set_credit_limit(
 ) -> Result<Json<BillingAccount>, ApiError> {
     auth.require(OperatorRole::Operator)?;
     let id = Uuid::parse_str(&id).map_err(|_| ApiError::not_found())?;
-    let limit = parse_usd(&req.credit_limit_usd, "/credit_limit_usd")?;
+    let limit = parse_cny(&req.credit_limit_cny, "/credit_limit_cny")?;
     let ctx = WriteCtx::of(&state);
     let account = state
         .db
@@ -150,7 +150,7 @@ pub async fn set_credit_limit(
                 // The billing lock: the limit moves the balance mark.
                 tenants::lock_billing(&mut *conn, id).await?;
                 sqlx::query(
-                    "UPDATE billing_accounts SET credit_limit_micro_usd = $2 WHERE tenant_id = $1",
+                    "UPDATE billing_accounts SET credit_limit_micro_cny = $2 WHERE tenant_id = $1",
                 )
                 .bind(id)
                 .bind(limit)
@@ -166,7 +166,7 @@ pub async fn set_credit_limit(
                         target_kind: "tenant",
                         target_id: Some(id.to_string()),
                         tenant_id: Some(id),
-                        detail: json!({ "credit_limit_micro_usd": limit }),
+                        detail: json!({ "credit_limit_micro_cny": limit }),
                     },
                 )
                 .await?;
@@ -179,8 +179,8 @@ pub async fn set_credit_limit(
 }
 
 /// `GET /api/billing/balance` → the caller's own organization's account
-/// without its identity: `{billing_mode, balance_micro_usd,
-/// credit_limit_micro_usd, available_micro_usd, exhausted, pending_topups}`.
+/// without its identity: `{billing_mode, balance_micro_cny,
+/// credit_limit_micro_cny, available_micro_cny, exhausted, pending_topups}`.
 pub async fn balance(
     auth: MemberAuth,
     State(state): State<AppState>,
@@ -191,9 +191,9 @@ pub async fn balance(
     let account = find(&mut conn, auth.tenant_id).await?;
     Ok(Json(json!({
         "billing_mode": account.billing_mode,
-        "balance_micro_usd": account.balance_micro_usd,
-        "credit_limit_micro_usd": account.credit_limit_micro_usd,
-        "available_micro_usd": account.available_micro_usd,
+        "balance_micro_cny": account.balance_micro_cny,
+        "credit_limit_micro_cny": account.credit_limit_micro_cny,
+        "available_micro_cny": account.available_micro_cny,
         "exhausted": account.exhausted,
         "pending_topups": account.pending_topups,
     })))

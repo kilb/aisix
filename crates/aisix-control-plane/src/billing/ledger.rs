@@ -82,11 +82,11 @@ impl Source<'_> {
     }
 }
 
-/// One entry to post: `amount_micro_usd` moves `tenant_id`'s balance.
+/// One entry to post: `amount_micro_cny` moves `tenant_id`'s balance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Posting<'a> {
     pub tenant_id: Uuid,
-    pub amount_micro_usd: i64,
+    pub amount_micro_cny: i64,
     pub source: Source<'a>,
 }
 
@@ -94,8 +94,8 @@ pub struct Posting<'a> {
 #[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
 pub struct Account {
     pub tenant_id: Uuid,
-    pub balance_micro_usd: i64,
-    pub credit_limit_micro_usd: i64,
+    pub balance_micro_cny: i64,
+    pub credit_limit_micro_cny: i64,
     /// The id of the tenant's balance `budgets` document.
     pub balance_budget_id: Uuid,
     /// Whether the balance document as last projected says exhausted;
@@ -111,15 +111,15 @@ pub struct LedgerEntry {
     pub seq: i64,
     pub tenant_id: Uuid,
     pub kind: EntryKind,
-    pub amount_micro_usd: i64,
-    pub balance_after_micro_usd: i64,
+    pub amount_micro_cny: i64,
+    pub balance_after_micro_cny: i64,
     pub event_id: Option<String>,
     pub topup_id: Option<Uuid>,
     pub repricing_run_id: Option<Uuid>,
     pub posted_at: DateTime<Utc>,
 }
 
-const ACCOUNT_COLUMNS: &str = "tenant_id, balance_micro_usd, credit_limit_micro_usd, \
+const ACCOUNT_COLUMNS: &str = "tenant_id, balance_micro_cny, credit_limit_micro_cny, \
      balance_budget_id, marked_exhausted, marks_dirty";
 
 /// Tenant `tenant_id`'s account, locked (`FOR NO KEY UPDATE`) for the rest
@@ -250,7 +250,7 @@ pub async fn post_flagging(
     for posting in postings {
         tenant_ids.push(posting.tenant_id);
         kinds.push(posting.source.kind().as_str());
-        amounts.push(posting.amount_micro_usd);
+        amounts.push(posting.amount_micro_cny);
         let (event_id, topup_id, run_id) = match posting.source {
             Source::Usage { event_id } => (Some(event_id), None, None),
             Source::Topup { topup_id } => (None, Some(topup_id), None),
@@ -264,17 +264,17 @@ pub async fn post_flagging(
     // account is missing then fails on the NOT NULL balance and the foreign
     // key instead of being dropped.
     let mut entries: Vec<LedgerEntry> = sqlx::query_as(
-        "INSERT INTO billing_ledger \
-         (tenant_id, kind, amount_micro_usd, balance_after_micro_usd, event_id, topup_id, \
+        "INSERT INTO billing_ledger_cny \
+         (tenant_id, kind, amount_micro_cny, balance_after_micro_cny, event_id, topup_id, \
           repricing_run_id) \
          SELECT p.tenant_id, p.kind, p.amount, \
-                (SELECT a.balance_micro_usd FROM billing_accounts a WHERE a.tenant_id = p.tenant_id) \
+                (SELECT a.balance_micro_cny FROM billing_accounts a WHERE a.tenant_id = p.tenant_id) \
                   + SUM(p.amount) OVER (PARTITION BY p.tenant_id ORDER BY p.n)::bigint, \
                 p.event_id, p.topup_id, p.run_id \
          FROM unnest($1::uuid[], $2::text[], $3::bigint[], $4::text[], $5::uuid[], $6::uuid[]) \
            WITH ORDINALITY AS p(tenant_id, kind, amount, event_id, topup_id, run_id, n) \
          ORDER BY p.n \
-         RETURNING seq, tenant_id, kind, amount_micro_usd, balance_after_micro_usd, event_id, \
+         RETURNING seq, tenant_id, kind, amount_micro_cny, balance_after_micro_cny, event_id, \
                    topup_id, repricing_run_id, posted_at",
     )
     .bind(&tenant_ids)
@@ -288,7 +288,7 @@ pub async fn post_flagging(
     entries.sort_by_key(|entry| entry.seq);
     sqlx::query(
         "UPDATE billing_accounts AS a \
-         SET balance_micro_usd = a.balance_micro_usd + d.delta, \
+         SET balance_micro_cny = a.balance_micro_cny + d.delta, \
              marks_dirty = a.marks_dirty OR a.tenant_id = ANY($3), updated_at = now() \
          FROM (SELECT p.tenant_id, SUM(p.amount)::bigint AS delta \
                FROM unnest($1::uuid[], $2::bigint[]) AS p(tenant_id, amount) \

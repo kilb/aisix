@@ -1585,7 +1585,7 @@ async fn every_tenant_write_takes_the_tenant_before_the_resources_lock() {
                 "POST",
                 "/api/billing/topups",
                 Some(owner.cookie()),
-                Some(json!({"amount_usd": "0.05"})),
+                Some(json!({"amount_cny": "0.05"})),
             )
             .await;
         assert_eq!(r.status, 201, "{r:?}");
@@ -1755,7 +1755,7 @@ async fn every_tenant_write_takes_the_tenant_before_the_resources_lock() {
                 format!("/admin/tenants/{tenant}/billing"),
                 op.clone(),
                 None,
-                Some(json!({"credit_limit_usd": "1.00"})),
+                Some(json!({"credit_limit_cny": "1.00"})),
             )),
             200,
         ),
@@ -1793,7 +1793,7 @@ async fn every_tenant_write_takes_the_tenant_before_the_resources_lock() {
                 format!("/admin/tenants/{tenant}/credits"),
                 op.clone(),
                 None,
-                Some(json!({"amount_usd": "0.05", "reason": "线下收款 7c1"})),
+                Some(json!({"amount_cny": "0.05", "reason": "线下收款 7c1"})),
             )),
             201,
         ),

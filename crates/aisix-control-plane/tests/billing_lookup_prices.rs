@@ -1,7 +1,12 @@
 //! The prices a gateway looks up by key (`GET /dp/v1/keys/{key_id}/prices`):
-//! the key's tenant's effective per-token rates, as exact decimal strings in
-//! USD per token. Prices and grants are written through the operators' API
-//! and the gateway asks over its mTLS listener.
+//! the key's tenant's per-token rates for the key's group, as exact decimal
+//! strings — CNY per token under the field names the gateway decodes until
+//! it is upgraded. Baselines, group rates and discounts are written through
+//! the operators' API and the gateway asks over its mTLS listener.
+//!
+//! The world's group rate is `1` unless a test writes another, so a rate
+//! shown here is numerically the baseline's own USD figure; a test that
+//! writes a rate of its own scales the expectation by it.
 
 mod support;
 
@@ -45,6 +50,14 @@ fn id_of(v: &Value, pointer: &str) -> Uuid {
         .unwrap_or_else(|| panic!("a uuid at {pointer} in {v}"))
 }
 
+/// The `shared` group's id, which the first-boot tenant defaults assign.
+async fn shared_group(cp: &TestCp) -> Uuid {
+    sqlx::query_scalar("SELECT id FROM provider_groups WHERE name = 'shared'")
+        .fetch_one(cp.db().pool())
+        .await
+        .expect("the first-boot group")
+}
+
 /// A live model named `name`, on a provider key of its own.
 async fn seed_model(cp: &TestCp, admin: &OperatorSession, name: &str) -> Uuid {
     let pk = create(
@@ -85,22 +98,47 @@ async fn seed_tenant(cp: &TestCp, admin: &OperatorSession) -> Uuid {
     id_of(&tenant, "/id")
 }
 
-/// A sell price: the platform's for `model`, or with `tenant` that tenant's
-/// override; `card` null ends the override.
-async fn sell(
+/// A baseline revision of `card` for `model` starting at `effective_from`.
+async fn baseline(
     cp: &TestCp,
     admin: &OperatorSession,
     model: Uuid,
-    tenant: Option<Uuid>,
     effective_from: DateTime<Utc>,
     card: Value,
 ) -> i64 {
-    let mut body = json!({"model_id": model, "effective_from": effective_from, "card": card});
-    if let Some(tenant) = tenant {
-        body["tenant_id"] = json!(tenant);
-    }
-    let revision = create(cp, admin, "/admin/pricing/sell", body).await;
-    revision["revision_id"].as_i64().expect("a revision id")
+    let revision = create(
+        cp,
+        admin,
+        "/admin/pricing/baselines",
+        json!({"model_id": model, "effective_from": effective_from, "card": card,
+               "note": "the prices test's card"}),
+    )
+    .await;
+    revision["revision"]["revision_id"]
+        .as_i64()
+        .expect("a revision id")
+}
+
+/// A rate revision of `cny_per_usd` for `model` in `group` (`None`: the
+/// group's default), starting at `effective_from`.
+async fn rate(
+    cp: &TestCp,
+    admin: &OperatorSession,
+    group: Uuid,
+    model: Option<Uuid>,
+    effective_from: DateTime<Utc>,
+    cny_per_usd: &str,
+) -> i64 {
+    let revision = create(
+        cp,
+        admin,
+        &format!("/admin/provider-groups/{group}/rates"),
+        json!({"model_id": model, "cny_per_usd": cny_per_usd, "effective_from": effective_from}),
+    )
+    .await;
+    revision["revision"]["revision_id"]
+        .as_i64()
+        .expect("a revision id")
 }
 
 async fn discount(
@@ -147,17 +185,81 @@ async fn grant(cp: &TestCp, admin: &OperatorSession, tenant: Uuid, models: &[Uui
     assert_eq!(r.status().as_u16(), 200, "grant: {:?}", r.text().await);
 }
 
-/// A tenant with a key.
+/// The live group named `name`, created when there is none.
+async fn group(cp: &TestCp, admin: &OperatorSession, name: &str) -> Uuid {
+    let existing: Option<Uuid> =
+        sqlx::query_scalar("SELECT id FROM provider_groups WHERE name = $1 AND retired_at IS NULL")
+            .bind(name)
+            .fetch_optional(cp.db().pool())
+            .await
+            .expect("read the group");
+    if let Some(id) = existing {
+        return id;
+    }
+    let created = create(
+        cp,
+        admin,
+        "/admin/provider-groups",
+        json!({"name": name, "display_name": name, "default_cny_per_usd": "1"}),
+    )
+    .await;
+    id_of(&created, "/id")
+}
+
+/// A tenant of group `shared` with a key naming it.
 async fn tenant_with_key(cp: &TestCp, admin: &OperatorSession) -> (Uuid, Uuid) {
+    let group = shared_group(cp).await;
+    tenant_with_key_in(cp, admin, group).await
+}
+
+/// A tenant assigned `group` and `shared`, with a key naming `group`.
+async fn tenant_with_key_in(cp: &TestCp, admin: &OperatorSession, group: Uuid) -> (Uuid, Uuid) {
     let tenant = seed_tenant(cp, admin).await;
+    let name: String = sqlx::query_scalar("SELECT name FROM provider_groups WHERE id = $1")
+        .bind(group)
+        .fetch_one(cp.db().pool())
+        .await
+        .expect("the group's name");
+    // A customer key's group must be one its tenant is assigned, so the
+    // tenant is given the group before the key names it.
+    let version: i64 = sqlx::query_scalar("SELECT version FROM tenants WHERE id = $1")
+        .bind(tenant)
+        .fetch_one(cp.db().pool())
+        .await
+        .expect("read the tenant");
+    let r = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("a client")
+        .patch(cp.url(&format!("/admin/tenants/{tenant}")))
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .header(reqwest::header::COOKIE, admin.cookie())
+        .header(reqwest::header::IF_MATCH, format!("\"{version}\""))
+        .json(&json!({"allowed_provider_groups": [name.clone()]}))
+        .send()
+        .await
+        .expect("send");
+    assert_eq!(
+        r.status().as_u16(),
+        200,
+        "assign the group: {:?}",
+        r.text().await
+    );
     let key = create(
         cp,
         admin,
         &format!("/admin/tenants/{tenant}/keys"),
-        json!({"label": "prices-7c1"}),
+        json!({"label": "prices-7c1", "group_id": group}),
     )
     .await;
-    (tenant, id_of(&key, "/key/id"))
+    let key_id = id_of(&key, "/key/id");
+    let stored: Option<Uuid> = sqlx::query_scalar("SELECT group_id FROM tenant_keys WHERE id = $1")
+        .bind(key_id)
+        .fetch_one(cp.db().pool())
+        .await
+        .expect("read the key's group");
+    assert_eq!(stored, Some(group), "the key names the group asked for");
+    (tenant, key_id)
 }
 
 async fn prices(dp: &DpClient, key: Uuid) -> Resp {
@@ -177,7 +279,7 @@ fn entry(r: &Resp, model: Uuid) -> Value {
 }
 
 #[tokio::test]
-async fn prices_are_the_tenants_effective_rates_per_token() {
+async fn prices_are_the_keys_groups_rates_per_token() {
     let Some(cp) = TestCp::start().await else {
         return;
     };
@@ -187,7 +289,9 @@ async fn prices_are_the_tenants_effective_rates_per_token() {
     let (tenant, key) = tenant_with_key(&cp, &admin).await;
     grant(&cp, &admin, tenant, &[model]).await;
     let now = db_now(&cp).await;
-    sell(&cp, &admin, model, None, now, full_card()).await;
+    baseline(&cp, &admin, model, now, full_card()).await;
+    // `shared` at 1 CNY per USD: the charge in µ¥ is the baseline's in µ$.
+    rate(&cp, &admin, shared_group(&cp).await, None, now, "1").await;
 
     let r = prices(&dp, key).await;
     assert_eq!(r.status, 200, "{r:?}");
@@ -200,30 +304,30 @@ async fn prices_are_the_tenants_effective_rates_per_token() {
     assert!(m.get("input_cache_write").is_none(), "{m}");
     assert!(m.get("input_cache_write_1h").is_none(), "{m}");
 
-    // A 20% discount applies to the platform card.
+    // A 20% discount applies to the price the group charges.
     discount(&cp, &admin, tenant, now, 2000).await;
     let m = entry(&prices(&dp, key).await, model);
     assert_eq!(m["input"], "0.0000048", "{m}");
     assert_eq!(m["output"], "0.000016", "{m}");
 
-    // An override replaces the card, and the discount is not applied to it.
-    sell(
+    // A model override replaces the group default, and the discount still
+    // applies: a listing price is the final one (R12).
+    rate(
         &cp,
         &admin,
-        model,
-        Some(tenant),
-        now,
-        json!({"default": {"base": {"input": "3", "output": "4"}}}),
+        shared_group(&cp).await,
+        Some(model),
+        db_now(&cp).await,
+        "0.5",
     )
     .await;
     let m = entry(&prices(&dp, key).await, model);
-    assert_eq!(m["input"], "0.000003", "{m}");
-    assert_eq!(m["output"], "0.000004", "{m}");
-    assert!(m.get("input_cache_read").is_none(), "{m}");
+    assert_eq!(m["input"], "0.0000024", "{m}");
+    assert_eq!(m["output"], "0.000008", "{m}");
 }
 
 #[tokio::test]
-async fn a_scheduled_price_sets_valid_until() {
+async fn a_scheduled_rate_or_baseline_sets_valid_until() {
     let Some(cp) = TestCp::start().await else {
         return;
     };
@@ -233,10 +337,15 @@ async fn a_scheduled_price_sets_valid_until() {
     let (tenant, key) = tenant_with_key(&cp, &admin).await;
     grant(&cp, &admin, tenant, &[model]).await;
     let now = db_now(&cp).await;
-    sell(&cp, &admin, model, None, now, full_card()).await;
+    let group = shared_group(&cp).await;
+    baseline(&cp, &admin, model, now, full_card()).await;
+    rate(&cp, &admin, group, None, now, "1").await;
     let in_two_hours = now + TimeDelta::hours(2);
     let in_an_hour = now + TimeDelta::hours(1);
-    sell(&cp, &admin, model, None, in_two_hours, card("9")).await;
+    // A later baseline of the granted model, then a later rate in the group:
+    // the earliest of the two binds.
+    baseline(&cp, &admin, model, in_two_hours, card("9")).await;
+    rate(&cp, &admin, group, None, in_an_hour, "2").await;
 
     let r = prices(&dp, key).await;
     let until = |r: &Resp| -> DateTime<Utc> {
@@ -245,18 +354,54 @@ async fn a_scheduled_price_sets_valid_until() {
             .and_then(|s| s.parse().ok())
             .unwrap_or_else(|| panic!("a valid_until in {r:?}"))
     };
-    assert_eq!(until(&r), in_two_hours, "{r:?}");
+    assert_eq!(until(&r), in_an_hour, "{r:?}");
     // The current price is still the one shown.
     assert_eq!(entry(&r, model)["input"], "0.000006", "{r:?}");
 
     // The tenant's own discount revision counts, an earlier one first.
-    discount(&cp, &admin, tenant, in_an_hour, 1000).await;
-    assert_eq!(until(&prices(&dp, key).await), in_an_hour);
+    discount(&cp, &admin, tenant, now + TimeDelta::minutes(5), 1000).await;
+    assert_eq!(until(&prices(&dp, key).await), now + TimeDelta::minutes(5));
 
     // Another tenant's scheduled change does not.
     let (other, _) = tenant_with_key(&cp, &admin).await;
-    discount(&cp, &admin, other, now + TimeDelta::minutes(5), 1000).await;
-    assert_eq!(until(&prices(&dp, key).await), in_an_hour);
+    discount(&cp, &admin, other, now + TimeDelta::minutes(1), 1000).await;
+    assert_eq!(until(&prices(&dp, key).await), now + TimeDelta::minutes(5));
+}
+
+#[tokio::test]
+async fn two_keys_in_two_groups_see_two_prices() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let admin = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let dp = cp.issue_dp_client("gw-prices-h").await;
+    let model = seed_model(&cp, &admin, &format!("pr-{}", Uuid::new_v4().simple())).await;
+    let now = db_now(&cp).await;
+    baseline(&cp, &admin, model, now, full_card()).await;
+    let cheap = group(&cp, &admin, &format!("cheap-{}", Uuid::new_v4().simple())).await;
+    let (tenant_a, key_a) = tenant_with_key(&cp, &admin).await;
+    let (tenant_b, key_b) = tenant_with_key_in(&cp, &admin, cheap).await;
+    grant(&cp, &admin, tenant_a, &[model]).await;
+    grant(&cp, &admin, tenant_b, &[model]).await;
+    // A group's creation writes its own default rate, so the rates here start
+    // now rather than at the instant read before the group existed: a later
+    // start would be the one in force.
+    rate(
+        &cp,
+        &admin,
+        shared_group(&cp).await,
+        None,
+        db_now(&cp).await,
+        "7.2",
+    )
+    .await;
+    rate(&cp, &admin, cheap, None, db_now(&cp).await, "5").await;
+
+    assert_eq!(
+        entry(&prices(&dp, key_a).await, model)["input"],
+        "0.0000432"
+    );
+    assert_eq!(entry(&prices(&dp, key_b).await, model)["input"], "0.00003");
 }
 
 #[tokio::test]
@@ -273,8 +418,11 @@ async fn an_ungranted_or_unpriced_model_is_absent_from_prices() {
     let (tenant, key) = tenant_with_key(&cp, &admin).await;
     grant(&cp, &admin, tenant, &[m, u]).await;
     let now = db_now(&cp).await;
-    sell(&cp, &admin, m, None, now, full_card()).await;
-    sell(&cp, &admin, n, None, now, full_card()).await;
+    // `m` has a baseline and the group's rate; `n` has both but is not
+    // granted; `u` is granted but has no baseline at all.
+    baseline(&cp, &admin, m, now, full_card()).await;
+    baseline(&cp, &admin, n, now, full_card()).await;
+    rate(&cp, &admin, shared_group(&cp).await, None, now, "1").await;
 
     let r = prices(&dp, key).await;
     assert_eq!(r.status, 200, "{r:?}");
@@ -285,6 +433,24 @@ async fn an_ungranted_or_unpriced_model_is_absent_from_prices() {
         .map(|e| &e["model_id"])
         .collect();
     assert_eq!(ids, vec![&json!(m)], "{r:?}");
+
+    // Four refusals the table itself makes the last word on: a group default
+    // no rate, a rate outside 0..=100, a negative one, and a second default
+    // row in one group are all refused.
+    for body in [
+        json!({"model_id": null, "cny_per_usd": null, "effective_from": now}),
+        json!({"model_id": null, "cny_per_usd": "100.0001", "effective_from": now}),
+    ] {
+        let r = cp
+            .send(
+                "POST",
+                &format!("/admin/provider-groups/{}/rates", shared_group(&cp).await),
+                Some(admin.cookie()),
+                Some(body.clone()),
+            )
+            .await;
+        assert_eq!(r.status, 422, "{body}: {r:?}");
+    }
 }
 
 #[tokio::test]
@@ -313,7 +479,16 @@ async fn a_tiered_card_shows_its_default_base_rates() {
                                         "cache_write": "7", "cache_write_1h": "10"}}],
         },
     });
-    sell(&cp, &admin, model, None, db_now(&cp).await, card).await;
+    baseline(&cp, &admin, model, db_now(&cp).await, card).await;
+    rate(
+        &cp,
+        &admin,
+        shared_group(&cp).await,
+        None,
+        db_now(&cp).await,
+        "1",
+    )
+    .await;
     let m = entry(&prices(&dp, key).await, model);
     assert_eq!(m["input"], "0.000002", "{m}");
     assert_eq!(m["output"], "0.000008", "{m}");
@@ -365,48 +540,20 @@ async fn the_prices_lookup_is_served_only_on_the_gateway_listener() {
     assert_eq!(r.status, 404, "{r:?}");
 }
 
-/// Raw-inserts an override of `model` for `tenant` at engine version
-/// `engine_version`, which the write path would refuse when it is newer.
-async fn raw_override(
-    cp: &TestCp,
-    model: Uuid,
-    tenant: Uuid,
-    engine_version: i64,
-    card: Option<Value>,
-) {
+/// Raw-inserts a rate revision of `model` in `group` at `engine_version`,
+/// which the write path would refuse when it is newer.
+async fn raw_rate(cp: &TestCp, group: Uuid, model: Option<Uuid>, engine_version: i64) {
     sqlx::query(
-        "INSERT INTO pricing_sell_revisions \
-         (engine_version, model_id, tenant_id, effective_from, card, source) \
-         VALUES ($1, $2, $3, now(), $4, 'test')",
+        "INSERT INTO pricing_group_rates \
+         (engine_version, group_id, model_id, effective_from, cny_per_usd_e4, note) \
+         VALUES ($1, $2, $3, now(), 10000, 'test')",
     )
     .bind(engine_version)
+    .bind(group)
     .bind(model)
-    .bind(tenant)
-    .bind(card)
     .execute(cp.db().pool())
     .await
-    .expect("insert the override");
-}
-
-#[tokio::test]
-async fn an_ended_override_gives_way_to_the_discounted_platform_price() {
-    let Some(cp) = TestCp::start().await else {
-        return;
-    };
-    let admin = cp.admin_login_seeded(OperatorRole::Operator).await;
-    let dp = cp.issue_dp_client("gw-prices-f").await;
-    let model = seed_model(&cp, &admin, &format!("pr-{}", Uuid::new_v4().simple())).await;
-    let (tenant, key) = tenant_with_key(&cp, &admin).await;
-    grant(&cp, &admin, tenant, &[model]).await;
-    let now = db_now(&cp).await;
-    sell(&cp, &admin, model, None, now, full_card()).await;
-    discount(&cp, &admin, tenant, now, 2000).await;
-    sell(&cp, &admin, model, Some(tenant), now, card("3")).await;
-    assert_eq!(entry(&prices(&dp, key).await, model)["input"], "0.000003");
-    // A later revision ends the override.
-    raw_override(&cp, model, tenant, 1, None).await;
-    let m = entry(&prices(&dp, key).await, model);
-    assert_eq!(m["input"], "0.0000048", "{m}");
+    .expect("insert the rate");
 }
 
 #[tokio::test]
@@ -422,20 +569,22 @@ async fn an_unreadable_revision_in_force_leaves_the_model_unpriced() {
     let (tenant, key) = tenant_with_key(&cp, &admin).await;
     grant(&cp, &admin, tenant, &[a, b]).await;
     let now = db_now(&cp).await;
-    sell(&cp, &admin, a, None, now, full_card()).await;
-    sell(&cp, &admin, b, None, now, full_card()).await;
+    let group = shared_group(&cp).await;
+    baseline(&cp, &admin, a, now, full_card()).await;
+    baseline(&cp, &admin, b, now, full_card()).await;
+    rate(&cp, &admin, group, None, now, "1").await;
     let r = prices(&dp, key).await;
     assert!(!entry(&r, a).is_null() && !entry(&r, b).is_null(), "{r:?}");
 
-    // An override a newer engine wrote: the engine prices nothing from it
-    // and does not fall back to the platform card.
-    raw_override(&cp, a, tenant, 999, Some(card("1"))).await;
+    // A model override a newer engine wrote: the engine prices nothing from
+    // it and does not fall back to the group's default rate.
+    raw_rate(&cp, group, Some(a), 999).await;
     let r = prices(&dp, key).await;
     assert!(entry(&r, a).is_null(), "{r:?}");
     assert!(!entry(&r, b).is_null(), "{r:?}");
 
-    // A discount a newer engine wrote leaves platform-priced models
-    // unpriced, and an override (never discounted) stays priced.
+    // A discount a newer engine wrote leaves every model of that tenant
+    // unpriced: the discount cannot be read, so no final price exists.
     sqlx::query(
         "INSERT INTO pricing_discount_revisions (engine_version, tenant_id, effective_from, \
          discount_bps) VALUES (999, $1, now(), 1000)",
@@ -446,6 +595,37 @@ async fn an_unreadable_revision_in_force_leaves_the_model_unpriced() {
     .expect("insert the discount");
     let r = prices(&dp, key).await;
     assert!(entry(&r, b).is_null(), "{r:?}");
-    sell(&cp, &admin, b, Some(tenant), db_now(&cp).await, card("3")).await;
-    assert_eq!(entry(&prices(&dp, key).await, b)["input"], "0.000003");
+}
+
+#[tokio::test]
+async fn a_key_with_no_group_sees_no_price() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let admin = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let dp = cp.issue_dp_client("gw-prices-i").await;
+    let model = seed_model(&cp, &admin, &format!("pr-{}", Uuid::new_v4().simple())).await;
+    let (tenant, key) = tenant_with_key(&cp, &admin).await;
+    grant(&cp, &admin, tenant, &[model]).await;
+    baseline(&cp, &admin, model, db_now(&cp).await, full_card()).await;
+    rate(
+        &cp,
+        &admin,
+        shared_group(&cp).await,
+        None,
+        db_now(&cp).await,
+        "1",
+    )
+    .await;
+    // A legacy key an older replica minted without a group: it prices
+    // nothing rather than a guessed rate.
+    sqlx::query("UPDATE tenant_keys SET group_id = NULL WHERE id = $1 AND tenant_id = $2")
+        .bind(key)
+        .bind(tenant)
+        .execute(cp.db().pool())
+        .await
+        .expect("clear the key's group");
+    let r = prices(&dp, key).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    assert_eq!(r.body["models"], json!([]), "{r:?}");
 }

@@ -32,17 +32,17 @@ use crate::AppState;
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NewCredit {
-    amount_usd: String,
+    amount_cny: String,
     #[serde(default)]
     reason: Option<String>,
     #[serde(default)]
     reference: Option<String>,
 }
 
-/// `POST /admin/tenants/{id}/credits` with `{amount_usd, reason,
+/// `POST /admin/tenants/{id}/credits` with `{amount_cny, reason,
 /// reference?}` → `201 AdminTopup`, posted and settled before the answer.
-/// `422` at `/amount_usd` unless it is dollars and cents above 0 and at most
-/// $1,000,000, at `/reason` unless it is 1 to 500 characters, not blank and
+/// `422` at `/amount_cny` unless it is yuan and fen above 0 and at most
+/// ¥1,000,000, at `/reason` unless it is 1 to 500 characters, not blank and
 /// free of control characters, and at `/reference` when it is over 128
 /// characters or holds a control character; `404 not_found` for no such
 /// tenant or a pending one.
@@ -56,7 +56,7 @@ pub async fn create(
     let tenant_id = Uuid::parse_str(&id).map_err(|_| ApiError::not_found())?;
     let reference = req.reference.unwrap_or_default();
     let mut problems = Vec::new();
-    let amount = topups::topup_amount(&req.amount_usd).unwrap_or_else(|mut d| {
+    let amount = topups::topup_amount(&req.amount_cny).unwrap_or_else(|mut d| {
         problems.append(&mut d);
         0
     });
@@ -95,7 +95,7 @@ pub async fn create(
                     &mut *conn,
                     &[Posting {
                         tenant_id,
-                        amount_micro_usd: amount,
+                        amount_micro_cny: amount,
                         source: Source::Topup { topup_id: row.id },
                     }],
                 )
@@ -109,7 +109,7 @@ pub async fn create(
                         target_kind: "topup",
                         target_id: Some(row.id.to_string()),
                         tenant_id: Some(tenant_id),
-                        detail: json!({ "amount_micro_usd": amount, "reason": reason }),
+                        detail: json!({ "amount_micro_cny": amount, "reason": reason }),
                     },
                 )
                 .await?;

@@ -1,6 +1,6 @@
 //! The operators' pricing API, `/admin/pricing/*`: the built-in catalogue,
-//! the sell, cost and discount revisions, the charges, and the pricing
-//! status that is the alert surface for what cannot be priced.
+//! the cost and discount revisions, the charges, and the pricing status that
+//! is the alert surface for what cannot be priced.
 //!
 //! Revisions are append-only: there is no `PUT`, `PATCH` or `DELETE`, and a
 //! price changes only by a new `POST` starting now or later. Every write goes
@@ -12,21 +12,19 @@
 //! Charges and cost prices name upstream channels; this API is for
 //! operators only and is never projected to tenants.
 
-use aisix_pricing::{Catalogue, CatalogueEntry, RateCard};
+use aisix_pricing::{CatalogueEntry, RateCard};
 use axum::extract::rejection::QueryRejection;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::Json;
-use chrono::{DateTime, NaiveTime, Utc};
+use chrono::{DateTime, Utc};
 use futures::FutureExt;
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sqlx::{Postgres, QueryBuilder};
 use uuid::Uuid;
 
-use super::store::{
-    self, CostRevision, DiscountRevision, NewCostPrice, NewDiscount, NewSellPrice, SellRevision,
-};
+use super::store::{self, CostRevision, DiscountRevision, NewCostPrice, NewDiscount};
 use crate::audit::Actor;
 use crate::auth::{OperatorAuth, OperatorRole};
 use crate::db::DbError;
@@ -43,22 +41,10 @@ fn refused(path: &str, message: impl Into<String>) -> ApiError {
     }])
 }
 
-/// Any value a field holds, `null` included, as `Some`: a field that is
-/// absent stays `None` through `#[serde(default)]`, so the two can be told
-/// apart.
-fn present<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Value>, D::Error> {
-    Value::deserialize(d).map(Some)
-}
-
 /// A rate card from a request body, refused at `/card` when it does not
 /// decode. Whether it validates is the store's check.
 fn rate_card(card: Value) -> Result<RateCard, ApiError> {
     serde_json::from_value(card).map_err(|e| refused("/card", format!("价目卡不合法：{e}")))
-}
-
-/// UTC midnight of a catalogue date: when an entry dated that day starts.
-fn day_start(day: chrono::NaiveDate) -> DateTime<Utc> {
-    day.and_time(NaiveTime::MIN).and_utc()
 }
 
 // ---- the catalogue ----
@@ -91,84 +77,7 @@ pub async fn catalogue(
     ))
 }
 
-// ---- sell prices ----
-
-#[derive(Deserialize)]
-pub struct SellQuery {
-    model_id: Option<Uuid>,
-    tenant_id: Option<Uuid>,
-    /// `true`: only the platform's own prices, never a tenant override.
-    platform: Option<bool>,
-    limit: Option<i64>,
-    /// Only revisions with a smaller `revision_id`: the `next_before` of
-    /// the previous page.
-    before: Option<i64>,
-}
-
-/// Ends a revision query built on `SELECT … WHERE true`: newest first by
-/// `revision_id`, one row past `limit`, which [`page`] tells another page
-/// by.
-fn newest_revisions_first(sql: &mut QueryBuilder<'_, Postgres>, before: Option<i64>, limit: i64) {
-    if let Some(before) = before {
-        sql.push(" AND revision_id < ").push_bind(before);
-    }
-    sql.push(" ORDER BY revision_id DESC LIMIT ")
-        .push_bind(limit + 1);
-}
-
-/// `GET /admin/pricing/sell` → `{items: [SellRevision], next_before}`:
-/// sell revisions, newest first, optionally only those of a `model_id` or a
-/// `tenant_id`, or with `platform=true` only the platform's own prices
-/// (those of no tenant), `limit` (default 50, at most 500) at a time.
-pub async fn list_sell(
-    auth: OperatorAuth,
-    State(state): State<AppState>,
-    query: Result<Query<SellQuery>, QueryRejection>,
-) -> Result<Json<Value>, ApiError> {
-    auth.require(OperatorRole::Viewer)?;
-    let Query(q) = query.map_err(query_rejected)?;
-    let limit = page_limit(q.limit);
-    let mut sql = QueryBuilder::<Postgres>::new(
-        "SELECT revision_id, engine_version, model_id, tenant_id, effective_from, card, source, \
-                created_by, created_at \
-         FROM pricing_sell_revisions WHERE true",
-    );
-    if let Some(model_id) = q.model_id {
-        sql.push(" AND model_id = ").push_bind(model_id);
-    }
-    if let Some(tenant_id) = q.tenant_id {
-        sql.push(" AND tenant_id = ").push_bind(tenant_id);
-    }
-    if q.platform == Some(true) {
-        sql.push(" AND tenant_id IS NULL");
-    }
-    newest_revisions_first(&mut sql, q.before, limit);
-    let rows: Vec<SellRevision> = sql
-        .build_query_as()
-        .fetch_all(state.db.pool())
-        .await
-        .map_err(DbError::from)?;
-    let (items, next_before) = page(rows, limit, |r| r.revision_id);
-    Ok(Json(json!({ "items": items, "next_before": next_before })))
-}
-
-/// `POST /admin/pricing/sell`. Exactly one of `card` (a rate card, or
-/// `null` to end a tenant's override) and `catalogue_key` (import a list
-/// price, marked up by `markup_bps`).
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SellBody {
-    model_id: Uuid,
-    #[serde(default)]
-    tenant_id: Option<Uuid>,
-    effective_from: DateTime<Utc>,
-    #[serde(default, deserialize_with = "present")]
-    card: Option<Value>,
-    #[serde(default)]
-    catalogue_key: Option<String>,
-    #[serde(default)]
-    markup_bps: Option<u32>,
-}
+// ---- price warnings ----
 
 /// Something an operator should know about a price they wrote, which does
 /// not stop it being written.
@@ -183,251 +92,6 @@ pub struct PriceWarning {
     pub effective_from: Option<DateTime<Utc>>,
 }
 
-/// One sell revision a catalogue import writes.
-#[derive(Debug, Clone, PartialEq)]
-struct Planned {
-    effective_from: DateTime<Utc>,
-    card: RateCard,
-    source: String,
-}
-
-/// What importing a catalogue key comes to: the revisions, the first one
-/// starting at the requested instant, and what the operator is told.
-#[derive(Debug, Clone, PartialEq)]
-struct ImportPlan {
-    revisions: Vec<Planned>,
-    warnings: Vec<PriceWarning>,
-}
-
-/// Whether an entry's list price holds only at some times of day: its notes
-/// speak of peak hours. Such a price is the off-peak one, and peak hours
-/// have to be priced through the markup.
-fn has_time_of_day_price(entry: &CatalogueEntry) -> bool {
-    entry
-        .notes
-        .as_deref()
-        .is_some_and(|n| n.to_ascii_lowercase().contains("peak"))
-}
-
-/// The sell revisions importing `key` (`<provider>/<model>`, or an alias)
-/// at `effective_from` with `markup_bps` writes:
-/// - the entry in effect at `effective_from`, starting then;
-/// - each later-dated entry of the same key, starting at its own date with
-///   the same markup, so an upstream price change announced in the
-///   catalogue carries into the sell price instead of the platform selling
-///   below its new cost.
-///
-/// Each source is `catalogue:<version>:<entry key>@<entry date or ->`. An
-/// unknown key is refused at `/catalogue_key`, a key with no entry in effect
-/// yet at `/effective_from`, and a markup that takes a rate past the largest
-/// one at `/markup_bps`.
-fn import_plan(
-    catalogue: &Catalogue,
-    key: &str,
-    effective_from: DateTime<Utc>,
-    markup_bps: u32,
-) -> Result<ImportPlan, ApiError> {
-    let unknown = || refused("/catalogue_key", "价目目录中没有这个模型");
-    let (provider, model) = key.split_once('/').ok_or_else(unknown)?;
-    // Known at all: some entry of it is in effect at the end of time.
-    catalogue
-        .get(provider, model, DateTime::<Utc>::MAX_UTC)
-        .ok_or_else(unknown)?;
-    let first = catalogue
-        .get(provider, model, effective_from)
-        .ok_or_else(|| refused("/effective_from", "该目录价格在此生效时间之前还没有生效"))?;
-    let mut later: Vec<&CatalogueEntry> = catalogue
-        .entries()
-        .iter()
-        .filter(|e| {
-            e.key == first.key
-                && e.effective_from
-                    .is_some_and(|d| day_start(d) > effective_from)
-        })
-        .collect();
-    later.sort_by_key(|e| e.effective_from);
-
-    let mut revisions = Vec::new();
-    let mut warnings = Vec::new();
-    for (entry, starts) in std::iter::once((first, effective_from)).chain(
-        later
-            .iter()
-            .filter_map(|e| e.effective_from.map(|d| (*e, day_start(d)))),
-    ) {
-        let card = entry
-            .card
-            .with_markup(markup_bps)
-            .map_err(|e| refused("/markup_bps", format!("加价后的价格超出上限：{e}")))?;
-        let dated = entry
-            .effective_from
-            .map_or_else(|| "-".to_string(), |d| d.to_string());
-        revisions.push(Planned {
-            effective_from: starts,
-            card,
-            source: format!("catalogue:{}:{}@{dated}", catalogue.version(), entry.key),
-        });
-        if has_time_of_day_price(entry) {
-            warnings.push(PriceWarning {
-                code: "time_of_day_price",
-                message: format!(
-                    "{} 的目录价格是非高峰时段价格，高峰时段上游按更高价格收费；请通过加价覆盖高峰时段的成本",
-                    entry.key
-                ),
-                revision_id: None,
-                effective_from: None,
-            });
-        }
-    }
-    warnings.dedup();
-    Ok(ImportPlan {
-        revisions,
-        warnings,
-    })
-}
-
-/// `POST /admin/pricing/sell` → `201`: the sell revision starting at
-/// `effective_from`, plus `warnings` and the `later_revisions` a catalogue
-/// import also wrote (both empty otherwise). Three bodies:
-/// - `{model_id, tenant_id?, effective_from, card}`: a rate card, the
-///   platform's price or, with `tenant_id`, that tenant's override;
-/// - `{model_id, tenant_id?, effective_from, catalogue_key, markup_bps?}`:
-///   the catalogue's price marked up (see [`import_plan`]);
-/// - `{model_id, tenant_id, effective_from, card: null}`: ends the tenant's
-///   override from that instant.
-///
-/// Both `card` and `catalogue_key`, or neither, is `422 /card`; a markup
-/// without `catalogue_key` is `422 /markup_bps`.
-///
-/// A revision of the same model and tenant that already starts later than
-/// the one written takes over from it then; each is named in a
-/// `superseded_later` warning, and the write still succeeds.
-pub async fn create_sell(
-    auth: OperatorAuth,
-    State(state): State<AppState>,
-    ApiJson(body): ApiJson<SellBody>,
-) -> Result<(StatusCode, Json<Value>), ApiError> {
-    auth.require(OperatorRole::Operator)?;
-    let (plan, card_given) = match (body.card, body.catalogue_key) {
-        (Some(_), Some(_)) | (None, None) => {
-            return Err(refused(
-                "/card",
-                "必须且只能提供 card 或 catalogue_key 其中之一",
-            ))
-        }
-        (Some(card), None) => {
-            if body.markup_bps.is_some() {
-                return Err(refused(
-                    "/markup_bps",
-                    "markup_bps 只用于从价目目录导入（catalogue_key）",
-                ));
-            }
-            let card = match card {
-                Value::Null => None,
-                card => Some(rate_card(card)?),
-            };
-            (None, card)
-        }
-        (None, Some(key)) => {
-            let plan = import_plan(
-                state.prices.catalogue(),
-                &key,
-                body.effective_from,
-                body.markup_bps.unwrap_or(0),
-            )?;
-            (Some(plan), None)
-        }
-    };
-    let (model_id, tenant_id, effective_from) =
-        (body.model_id, body.tenant_id, body.effective_from);
-    let rows: Vec<NewSellPrice> = match &plan {
-        Some(plan) => plan
-            .revisions
-            .iter()
-            .map(|p| NewSellPrice {
-                model_id,
-                tenant_id,
-                effective_from: p.effective_from,
-                card: Some(p.card.clone()),
-                source: p.source.clone(),
-            })
-            .collect(),
-        None => vec![NewSellPrice {
-            model_id,
-            tenant_id,
-            effective_from,
-            card: card_given,
-            source: "manual".to_string(),
-        }],
-    };
-    let (written, superseded) = state
-        .db
-        .tx(move |conn| {
-            async move {
-                let mut written = Vec::with_capacity(rows.len());
-                for row in &rows {
-                    written.push(
-                        store::insert_sell_price(&mut *conn, row, Actor::Operator(&auth)).await?,
-                    );
-                }
-                let superseded = superseded_later(&mut *conn, &written).await?;
-                Ok::<_, ApiError>((written, superseded))
-            }
-            .boxed()
-        })
-        .await?;
-    let mut warnings: Vec<PriceWarning> = plan.map(|p| p.warnings).unwrap_or_default();
-    warnings.extend(superseded);
-    let mut written = written.into_iter();
-    let first = written
-        .next()
-        .ok_or_else(|| ApiError::internal("a sell price write wrote no revision"))?;
-    let mut view = to_object(&first)?;
-    view.insert("warnings".to_string(), json!(warnings));
-    view.insert(
-        "later_revisions".to_string(),
-        json!(written.collect::<Vec<_>>()),
-    );
-    Ok((StatusCode::CREATED, Json(Value::Object(view))))
-}
-
-/// The revisions of the model and tenant of `written` (the revisions one
-/// write made, first the one it was asked for) that were already there and
-/// start later than the first, oldest start first, as `superseded_later`
-/// warnings: from each one's start, it prices instead.
-async fn superseded_later(
-    conn: &mut sqlx::PgConnection,
-    written: &[SellRevision],
-) -> Result<Vec<PriceWarning>, DbError> {
-    let Some(first) = written.first() else {
-        return Ok(Vec::new());
-    };
-    let ours: Vec<i64> = written.iter().map(|r| r.revision_id).collect();
-    let later: Vec<(i64, DateTime<Utc>)> = sqlx::query_as(
-        "SELECT revision_id, effective_from FROM pricing_sell_revisions \
-         WHERE model_id = $1 AND tenant_id IS NOT DISTINCT FROM $2 AND effective_from > $3 \
-           AND NOT (revision_id = ANY($4)) \
-         ORDER BY effective_from, revision_id",
-    )
-    .bind(first.model_id)
-    .bind(first.tenant_id)
-    .bind(first.effective_from)
-    .bind(ours)
-    .fetch_all(conn)
-    .await?;
-    Ok(later
-        .into_iter()
-        .map(|(revision_id, effective_from)| PriceWarning {
-            code: "superseded_later",
-            message: format!(
-                "已有一条更晚生效的价格（修订 {revision_id}），将从 {} 起取代这次写入的价格",
-                effective_from.to_rfc3339()
-            ),
-            revision_id: Some(revision_id),
-            effective_from: Some(effective_from),
-        })
-        .collect())
-}
-
 /// `value` as a JSON object, to add fields to.
 fn to_object(value: &impl Serialize) -> Result<Map<String, Value>, ApiError> {
     match serde_json::to_value(value).map_err(ApiError::internal)? {
@@ -439,6 +103,17 @@ fn to_object(value: &impl Serialize) -> Result<Map<String, Value>, ApiError> {
 }
 
 // ---- cost prices ----
+
+/// Ends a revision query built on `SELECT … WHERE true`: newest first by
+/// `revision_id`, one row past `limit`, which [`page`] tells another page
+/// by.
+fn newest_revisions_first(sql: &mut QueryBuilder<'_, Postgres>, before: Option<i64>, limit: i64) {
+    if let Some(before) = before {
+        sql.push(" AND revision_id < ").push_bind(before);
+    }
+    sql.push(" ORDER BY revision_id DESC LIMIT ")
+        .push_bind(limit + 1);
+}
 
 #[derive(Deserialize)]
 pub struct CostQuery {
@@ -708,11 +383,14 @@ struct ChargeRow {
     occurred_at: DateTime<Utc>,
     price_instant: Option<DateTime<Utc>>,
     status: String,
-    charge_micro_usd: Option<i64>,
+    charge_micro_cny: Option<i64>,
     cost_micro_usd: Option<i64>,
     cost_source: Option<Value>,
-    sell_revision_id: Option<i64>,
-    tenant_override: bool,
+    group_id: Option<Uuid>,
+    baseline_revision_id: Option<i64>,
+    rate_revision_id: Option<i64>,
+    cny_per_usd_e4: Option<i64>,
+    rate_is_model_override: bool,
     discount_revision_id: Option<i64>,
     discount_bps: i64,
     service_tier: Option<String>,
@@ -747,11 +425,12 @@ pub async fn list_charges(
     let limit = page_limit(q.limit);
     let mut sql = QueryBuilder::<Postgres>::new(
         "SELECT seq, event_id, tenant_id, api_key_id, user_id, requested_model_id, occurred_at, \
-                price_instant, status, charge_micro_usd, cost_micro_usd, cost_source, \
-                sell_revision_id, tenant_override, discount_revision_id, discount_bps, \
+                price_instant, status, charge_micro_cny, cost_micro_usd, cost_source, \
+                group_id, baseline_revision_id, rate_revision_id, cny_per_usd_e4, \
+                rate_is_model_override, discount_revision_id, discount_bps, \
                 service_tier, requested_service_tier, long_context_above, estimated, exemption, \
                 error_code, lines, warnings, engine_version, priced_at \
-         FROM pricing_charges WHERE true",
+         FROM pricing_charges_cny WHERE true",
     );
     if let Some(before) = q.before {
         sql.push(" AND seq < ").push_bind(before);
@@ -832,172 +511,26 @@ pub async fn status(
 
 #[cfg(test)]
 mod tests {
-    use aisix_pricing::{Rate, ServiceTier};
+    use aisix_pricing::{Catalogue, CatalogueEntry};
 
     use super::*;
 
-    /// A catalogue with an announced price change (`openai/m1` from
-    /// 2026-12-01), a key only priced from 2027-01-01, and an off-peak price
-    /// with an alias.
+    /// A catalogue with an off-peak price carrying an alias.
     fn catalogue() -> Catalogue {
-        let entry = |key: &str, extra: &str, input: &str| {
-            format!(
-                r#"{{"key":"{key}","source_url":"https://openai.com/api/pricing","as_of":"2026-11-01",{extra}"card":{{"default":{{"base":{{"input":"{input}","output":"2"}}}}}}}}"#
-            )
-        };
-        let entries = [
-            entry("openai/m1", "", "1"),
-            entry("openai/m1", r#""effective_from":"2026-12-01","#, "3"),
-            entry("openai/m1", r#""effective_from":"2027-02-01","#, "5"),
-            entry("openai/soon", r#""effective_from":"2027-01-01","#, "1"),
-            entry(
-                "openai/offpeak",
-                r#""aliases":["offpeak-alias"],"notes":"Standard (off-peak) price; peak windows bill double.","#,
-                "1",
-            ),
-        ];
+        let entries = r#"{"key":"openai/offpeak","source_url":"https://openai.com/api/pricing","as_of":"2026-11-01","aliases":["offpeak-alias"],"notes":"Standard (off-peak) price; peak windows bill double.","card":{"default":{"base":{"input":"1","output":"2"}}}}"#;
         Catalogue::from_json(&format!(
-            r#"{{"version":"2026-11-06","entries":[{}]}}"#,
-            entries.join(",")
+            r#"{{"version":"2026-11-06","entries":[{entries}]}}"#
         ))
         .expect("the test catalogue loads")
     }
 
-    fn at(s: &str) -> DateTime<Utc> {
-        s.parse().expect("an RFC 3339 instant")
-    }
-
-    fn input(card: &RateCard) -> Rate {
-        card.0[&ServiceTier::default_tier()].base.input
-    }
-
-    /// `(starts, input rate, source)` of each planned revision.
-    fn summary(plan: &ImportPlan) -> Vec<(DateTime<Utc>, Rate, &str)> {
-        plan.revisions
-            .iter()
-            .map(|p| (p.effective_from, input(&p.card), p.source.as_str()))
-            .collect()
-    }
-
-    fn path_of(e: &ApiError) -> Vec<&str> {
-        e.details.iter().map(|d| d.path.as_str()).collect()
-    }
-
     #[test]
-    fn an_import_carries_every_announced_price_change_with_the_same_markup() {
+    fn an_entry_view_names_its_key_and_its_card() {
         let c = catalogue();
-        let now = at("2026-11-06T09:30:00Z");
-        let plan = import_plan(&c, "openai/m1", now, 5_000).expect("a plan");
-        // 1, 3 and 5 USD per million, each × 1.5.
-        assert_eq!(
-            summary(&plan),
-            vec![
-                (now, Rate(1_500_000), "catalogue:2026-11-06:openai/m1@-"),
-                (
-                    at("2026-12-01T00:00:00Z"),
-                    Rate(4_500_000),
-                    "catalogue:2026-11-06:openai/m1@2026-12-01"
-                ),
-                (
-                    at("2027-02-01T00:00:00Z"),
-                    Rate(7_500_000),
-                    "catalogue:2026-11-06:openai/m1@2027-02-01"
-                ),
-            ]
-        );
-        assert!(plan.warnings.is_empty());
-    }
-
-    #[test]
-    fn an_import_starts_from_the_entry_in_effect_then() {
-        let c = catalogue();
-        // On the day of the change, the change itself is in effect.
-        let plan = import_plan(&c, "openai/m1", at("2026-12-01T00:00:00Z"), 0).expect("a plan");
-        assert_eq!(
-            summary(&plan),
-            vec![
-                (
-                    at("2026-12-01T00:00:00Z"),
-                    Rate(3_000_000),
-                    "catalogue:2026-11-06:openai/m1@2026-12-01"
-                ),
-                (
-                    at("2027-02-01T00:00:00Z"),
-                    Rate(5_000_000),
-                    "catalogue:2026-11-06:openai/m1@2027-02-01"
-                ),
-            ]
-        );
-        let plan = import_plan(&c, "openai/m1", at("2027-03-01T00:00:00Z"), 0).expect("a plan");
-        assert_eq!(plan.revisions.len(), 1);
-        assert_eq!(input(&plan.revisions[0].card), Rate(5_000_000));
-    }
-
-    #[test]
-    fn an_import_names_a_known_key_in_effect_at_its_start() {
-        let c = catalogue();
-        let now = at("2026-11-06T09:30:00Z");
-        for key in ["openai/nope", "nope", "anthropic/m1", "openai/"] {
-            let e = import_plan(&c, key, now, 0).expect_err(key);
-            assert_eq!(path_of(&e), ["/catalogue_key"], "{key}");
-        }
-        let e = import_plan(&c, "openai/soon", now, 0).expect_err("not in effect yet");
-        assert_eq!(path_of(&e), ["/effective_from"]);
-        let plan =
-            import_plan(&c, "openai/soon", at("2027-01-01T00:00:00Z"), 0).expect("in effect");
-        assert_eq!(plan.revisions.len(), 1);
-        // A markup no rate can hold.
-        let e = import_plan(&c, "openai/m1", now, u32::MAX).expect_err("too large");
-        assert_eq!(path_of(&e), ["/markup_bps"]);
-    }
-
-    #[test]
-    fn an_off_peak_list_price_is_imported_with_a_warning() {
-        let c = catalogue();
-        let now = at("2026-11-06T09:30:00Z");
-        let plan = import_plan(&c, "openai/offpeak-alias", now, 0).expect("a plan");
-        assert_eq!(
-            summary(&plan),
-            vec![(
-                now,
-                Rate(1_000_000),
-                "catalogue:2026-11-06:openai/offpeak@-"
-            )]
-        );
-        assert_eq!(plan.warnings.len(), 1);
-        assert_eq!(plan.warnings[0].code, "time_of_day_price");
-        assert!(plan.warnings[0].message.contains("openai/offpeak"));
-    }
-
-    #[test]
-    fn every_builtin_deepseek_entry_warns_and_nothing_else_does() {
-        let builtin = Catalogue::builtin().expect("the builtin catalogue");
-        // DeepSeek lists an off-peak price; every entry of it must say so,
-        // and a note reworded past the check fails here.
-        let deepseek: Vec<&CatalogueEntry> = builtin
-            .entries()
-            .iter()
-            .filter(|e| e.key.starts_with("deepseek/"))
-            .collect();
-        assert!(!deepseek.is_empty());
-        for e in &deepseek {
-            let plan = import_plan(&builtin, &e.key, at("2026-11-06T09:30:00Z"), 0)
-                .unwrap_or_else(|err| panic!("import {}: {err:?}", e.key));
-            let codes: Vec<&str> = plan.warnings.iter().map(|w| w.code).collect();
-            assert_eq!(codes, ["time_of_day_price"], "{}", e.key);
-        }
-        let warned: std::collections::BTreeSet<&str> = builtin
-            .entries()
-            .iter()
-            .filter(|e| has_time_of_day_price(e))
-            .map(|e| e.key.as_str())
-            .collect();
-        assert_eq!(
-            warned,
-            std::collections::BTreeSet::from([
-                "deepseek/deepseek-flash",
-                "deepseek/deepseek-v4-pro"
-            ])
-        );
+        let entry: &CatalogueEntry = c.entries().first().expect("one entry");
+        let view = entry_view(entry);
+        assert_eq!(view["key"], "openai/offpeak");
+        assert_eq!(view["card"]["default"]["base"]["input"], "1");
+        assert_eq!(view["source_url"], "https://openai.com/api/pricing");
     }
 }

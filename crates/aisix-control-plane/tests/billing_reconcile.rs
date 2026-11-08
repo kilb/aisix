@@ -24,7 +24,7 @@ use chrono::{DateTime, TimeDelta, Utc};
 use futures::FutureExt;
 use serde_json::{json, Value};
 use support::world::{
-    db_now, deliver, insert_sell, price, seed_key, seed_model, seed_tenant, tokens_680, usage,
+    db_now, deliver, insert_baseline, price, seed_key, seed_model, seed_tenant, tokens_680, usage,
     world, World,
 };
 use support::{Bundle, DpClient, OperatorSession, TestCp};
@@ -65,10 +65,10 @@ async fn mismatches(db: &Db, body: &Value) -> Vec<Row> {
         rows.push((
             tenant,
             m["check"].as_str().expect("a check").to_string(),
-            m["expected_micro_usd"]
+            m["expected_micro_cny"]
                 .as_i64()
                 .expect("an expected amount"),
-            m["actual_micro_usd"].as_i64().expect("an actual amount"),
+            m["actual_micro_cny"].as_i64().expect("an actual amount"),
             m.get("seq").unwrap_or_else(|| panic!("seq in {m}")).clone(),
         ));
     }
@@ -140,28 +140,28 @@ async fn free_of_charge(cp: &TestCp, tenant: Uuid) {
         .expect("a 100 % discount");
 }
 
-/// An operator credit of `amount_usd` to `tenant` by `admin`.
-async fn credit(cp: &TestCp, admin: &OperatorSession, tenant: Uuid, amount_usd: &str) {
+/// An operator credit of `amount_cny` to `tenant` by `admin`.
+async fn credit(cp: &TestCp, admin: &OperatorSession, tenant: Uuid, amount_cny: &str) {
     let r = cp
         .send(
             "POST",
             &format!("/admin/tenants/{tenant}/credits"),
             Some(admin.cookie()),
-            Some(json!({"amount_usd": amount_usd, "reason": "线下收款 r23"})),
+            Some(json!({"amount_cny": amount_cny, "reason": "线下收款 r23"})),
         )
         .await;
     assert_eq!(r.status, 201, "{r:?}");
 }
 
-/// A top-up of `amount_usd` requested by an owner of `tenant`; its id.
-async fn request_topup(cp: &TestCp, tenant: Uuid, amount_usd: &str) -> Uuid {
+/// A top-up of `amount_cny` requested by an owner of `tenant`; its id.
+async fn request_topup(cp: &TestCp, tenant: Uuid, amount_cny: &str) -> Uuid {
     let owner = cp.member_login_seeded(tenant, MemberRole::Owner).await;
     let r = cp
         .send(
             "POST",
             "/api/billing/topups",
             Some(owner.cookie()),
-            Some(json!({ "amount_usd": amount_usd })),
+            Some(json!({ "amount_cny": amount_cny })),
         )
         .await;
     assert_eq!(r.status, 201, "{r:?}");
@@ -171,7 +171,7 @@ async fn request_topup(cp: &TestCp, tenant: Uuid, amount_usd: &str) -> Uuid {
 /// `(kind, amount)` of every entry of `tenant`, in order.
 async fn entries(db: &Db, tenant: Uuid) -> Vec<(String, i64)> {
     sqlx::query_as(
-        "SELECT kind, amount_micro_usd FROM billing_ledger WHERE tenant_id = $1 ORDER BY seq",
+        "SELECT kind, amount_micro_cny FROM billing_ledger_cny WHERE tenant_id = $1 ORDER BY seq",
     )
     .bind(tenant)
     .fetch_all(db.pool())
@@ -180,7 +180,7 @@ async fn entries(db: &Db, tenant: Uuid) -> Vec<(String, i64)> {
 }
 
 async fn charge_status(db: &Db, event_id: &str) -> (String, Option<i64>) {
-    sqlx::query_as("SELECT status, charge_micro_usd FROM pricing_charges WHERE event_id = $1")
+    sqlx::query_as("SELECT status, charge_micro_cny FROM pricing_charges_cny WHERE event_id = $1")
         .bind(event_id)
         .fetch_one(db.pool())
         .await
@@ -192,7 +192,7 @@ async fn charge_status(db: &Db, event_id: &str) -> (String, Option<i64>) {
 /// Moves `tenant`'s account by `by` with no entry.
 async fn bump_balance(db: &Db, tenant: Uuid, by: i64) {
     sqlx::query(
-        "UPDATE billing_accounts SET balance_micro_usd = balance_micro_usd + $2 \
+        "UPDATE billing_accounts SET balance_micro_cny = balance_micro_cny + $2 \
          WHERE tenant_id = $1",
     )
     .bind(tenant)
@@ -217,7 +217,7 @@ async fn raw_entry(
 ) -> i64 {
     let mut tx = db.pool().begin().await.expect("begin");
     let last: i64 = sqlx::query_scalar(
-        "SELECT COALESCE((SELECT balance_after_micro_usd FROM billing_ledger \
+        "SELECT COALESCE((SELECT balance_after_micro_cny FROM billing_ledger_cny \
                           WHERE tenant_id = $1 ORDER BY seq DESC LIMIT 1), 0)",
     )
     .bind(tenant)
@@ -225,8 +225,8 @@ async fn raw_entry(
     .await
     .expect("read the last balance");
     let seq: i64 = sqlx::query_scalar(
-        "INSERT INTO billing_ledger \
-         (tenant_id, kind, amount_micro_usd, balance_after_micro_usd, event_id, topup_id) \
+        "INSERT INTO billing_ledger_cny \
+         (tenant_id, kind, amount_micro_cny, balance_after_micro_cny, event_id, topup_id) \
          VALUES ($1, $2, $3, $4, $5, $6) RETURNING seq",
     )
     .bind(tenant)
@@ -239,7 +239,7 @@ async fn raw_entry(
     .await
     .expect("enter the entry");
     sqlx::query(
-        "UPDATE billing_accounts SET balance_micro_usd = balance_micro_usd + $2 \
+        "UPDATE billing_accounts SET balance_micro_cny = balance_micro_cny + $2 \
          WHERE tenant_id = $1",
     )
     .bind(tenant)
@@ -266,9 +266,9 @@ async fn raw_charged_without_entry(db: &Db, p: &Payer, model: Uuid, event_id: &s
     .await
     .expect("insert the usage row");
     sqlx::query(
-        "INSERT INTO pricing_charges \
+        "INSERT INTO pricing_charges_cny \
          (event_id, tenant_id, api_key_id, user_id, requested_model_id, occurred_at, price_instant, \
-          status, charge_micro_usd, engine_version) \
+          status, charge_micro_cny, engine_version) \
          VALUES ($1, $2::text, $3, $4::text, $5::text, now(), now(), 'charged', $6, $7)",
     )
     .bind(event_id)
@@ -287,7 +287,7 @@ async fn raw_charged_without_entry(db: &Db, p: &Payer, model: Uuid, event_id: &s
 /// Sets the pending top-up `id` approved, with no entry.
 async fn raw_approve(db: &Db, id: Uuid) {
     let n = sqlx::query(
-        "UPDATE billing_topups SET status = 'approved', decided_at = now() \
+        "UPDATE billing_topups_cny SET status = 'approved', decided_at = now() \
          WHERE id = $1 AND status = 'pending'",
     )
     .bind(id)
@@ -302,8 +302,8 @@ async fn raw_approve(db: &Db, id: Uuid) {
 async fn raw_credit(db: &Db, tenant: Uuid, amount: i64, by: Uuid) -> Uuid {
     let id = Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO billing_topups \
-         (id, tenant_id, amount_micro_usd, origin, status, decided_by, decided_at, credit_reason) \
+        "INSERT INTO billing_topups_cny \
+         (id, tenant_id, amount_micro_cny, origin, status, decided_by, decided_at, credit_reason) \
          VALUES ($1, $2, $3, 'operator', 'approved', $4, now(), 'r23')",
     )
     .bind(id)
@@ -320,9 +320,9 @@ async fn raw_credit(db: &Db, tenant: Uuid, amount: i64, by: Uuid) -> Uuid {
 async fn raw_run(db: &Db, by: Uuid) -> Uuid {
     let id = Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO billing_repricing_runs \
+        "INSERT INTO billing_repricing_runs_cny \
          (id, status, filter, reason, pricing_version, engine_version, events, changed, \
-          still_unpriced, skipped_unattributed, delta_micro_usd, by_tenant, created_by, \
+          still_unpriced, skipped_unattributed, delta_micro_cny, by_tenant, created_by, \
           applied_by, applied_at) \
          VALUES ($1, 'applied', '{}', 'r23', 0, $2, 0, 0, 0, 0, 0, '[]', $3, $3, now())",
     )
@@ -339,8 +339,8 @@ async fn raw_run(db: &Db, by: Uuid) -> Uuid {
 /// entry.
 async fn raw_adjustment(db: &Db, run: Uuid, event_id: &str, delta: i64, by: Uuid) {
     sqlx::query(
-        "INSERT INTO pricing_adjustments \
-         (run_id, event_id, delta_micro_usd, engine_version, reason, created_by) \
+        "INSERT INTO pricing_adjustments_cny \
+         (run_id, event_id, delta_micro_cny, engine_version, reason, created_by) \
          VALUES ($1, $2, $3, $4, 'r23', $5)",
     )
     .bind(run)
@@ -453,14 +453,14 @@ async fn a_consistent_ledger_reconciles() {
             "PATCH",
             &format!("/admin/tenants/{}/billing", w.tenant),
             Some(w.admin.cookie()),
-            Some(json!({"credit_limit_usd": "5.00"})),
+            Some(json!({"credit_limit_cny": "5.00"})),
         )
         .await;
     assert_eq!(r.status, 200, "{r:?}");
-    assert_eq!(r.body["credit_limit_micro_usd"], json!(5_000_000), "{r:?}");
+    assert_eq!(r.body["credit_limit_micro_cny"], json!(5_000_000), "{r:?}");
 
     // A run at doubled prices charges each of the three rows 680 µ$ more.
-    insert_sell(cp, model, None, db_now(cp).await, Some(doubled()))
+    insert_baseline(cp, model, db_now(cp).await, doubled())
         .await
         .expect("a new price");
     let to = db_now(cp).await;
@@ -776,7 +776,7 @@ async fn a_reconciliation_past_its_time_bound_answers_503() {
     };
     let viewer = cp.admin_login_seeded(OperatorRole::Viewer).await;
     let mut holder = cp.db().pool().begin().await.expect("begin");
-    sqlx::query("LOCK TABLE billing_ledger IN ACCESS EXCLUSIVE MODE")
+    sqlx::query("LOCK TABLE billing_ledger_cny IN ACCESS EXCLUSIVE MODE")
         .execute(&mut *holder)
         .await
         .expect("hold the ledger");
@@ -812,7 +812,7 @@ async fn the_time_bound_covers_the_whole_reconciliation_not_each_read() {
         .await
         .expect("hold the credentials");
     let mut ledger = pool.begin().await.expect("begin");
-    sqlx::query("LOCK TABLE billing_ledger IN ACCESS EXCLUSIVE MODE")
+    sqlx::query("LOCK TABLE billing_ledger_cny IN ACCESS EXCLUSIVE MODE")
         .execute(&mut *ledger)
         .await
         .expect("hold the ledger");
@@ -853,7 +853,7 @@ async fn a_lower_configured_statement_timeout_still_binds_a_reconciliation() {
     };
     let viewer = cp.admin_login_seeded(OperatorRole::Viewer).await;
     let mut ledger = cp.db().pool().begin().await.expect("begin");
-    sqlx::query("LOCK TABLE billing_ledger IN ACCESS EXCLUSIVE MODE")
+    sqlx::query("LOCK TABLE billing_ledger_cny IN ACCESS EXCLUSIVE MODE")
         .execute(&mut *ledger)
         .await
         .expect("hold the ledger");

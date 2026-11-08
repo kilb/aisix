@@ -77,7 +77,7 @@ async fn credit_at(cp: &TestCp, op: &OperatorSession, tenant: &str, body: Value)
 /// after, topup id)`.
 async fn entries(pool: &PgPool, tenant: Uuid) -> Vec<(String, i64, i64, Option<Uuid>)> {
     sqlx::query_as(
-        "SELECT kind, amount_micro_usd, balance_after_micro_usd, topup_id FROM billing_ledger \
+        "SELECT kind, amount_micro_cny, balance_after_micro_cny, topup_id FROM billing_ledger_cny \
          WHERE tenant_id = $1 ORDER BY seq",
     )
     .bind(tenant)
@@ -87,7 +87,7 @@ async fn entries(pool: &PgPool, tenant: Uuid) -> Vec<(String, i64, i64, Option<U
 }
 
 async fn balance(pool: &PgPool, tenant: Uuid) -> i64 {
-    sqlx::query_scalar("SELECT balance_micro_usd FROM billing_accounts WHERE tenant_id = $1")
+    sqlx::query_scalar("SELECT balance_micro_cny FROM billing_accounts WHERE tenant_id = $1")
         .bind(tenant)
         .fetch_one(pool)
         .await
@@ -158,7 +158,7 @@ async fn until_lock_waiters(pool: &PgPool, n: i64) {
 async fn an_operator_credit_needs_a_reason_and_posts_one_entry() {
     let Some(d) = desk().await else { return };
     let pool = d.cp.db().pool();
-    let r = credit(&d.cp, &d.admin, d.tenant, json!({"amount_usd": "0.05"})).await;
+    let r = credit(&d.cp, &d.admin, d.tenant, json!({"amount_cny": "0.05"})).await;
     assert_eq!(r.status, 422, "{r:?}");
     assert_eq!(r.body["details"][0]["path"], "/reason", "{r:?}");
     assert!(entries(pool, d.tenant).await.is_empty());
@@ -169,7 +169,7 @@ async fn an_operator_credit_needs_a_reason_and_posts_one_entry() {
         &d.cp,
         &d.admin,
         d.tenant,
-        json!({"amount_usd": "0.05", "reason": REASON}),
+        json!({"amount_cny": "0.05", "reason": REASON}),
     )
     .await;
     assert_eq!(r.status, 201, "{r:?}");
@@ -184,7 +184,7 @@ async fn an_operator_credit_needs_a_reason_and_posts_one_entry() {
         json!({
             "id": id,
             "origin": "operator",
-            "amount_micro_usd": 50_000,
+            "amount_micro_cny": 50_000,
             "note": "",
             "reference": "",
             "status": "approved",
@@ -212,7 +212,7 @@ async fn an_operator_credit_needs_a_reason_and_posts_one_entry() {
             Some(d.tenant),
             "topup".to_string(),
             Some(id.clone()),
-            json!({"amount_micro_usd": 50_000, "reason": REASON}),
+            json!({"amount_micro_cny": 50_000, "reason": REASON}),
         )]
     );
     // The operators' queue lists it as an operator credit.
@@ -234,28 +234,28 @@ async fn a_credit_reason_and_reference_are_bounded() {
     let Some(d) = desk().await else { return };
     let pool = d.cp.db().pool();
     for (body, path) in [
-        (json!({"amount_usd": "1", "reason": ""}), "/reason"),
-        (json!({"amount_usd": "1", "reason": "   "}), "/reason"),
+        (json!({"amount_cny": "1", "reason": ""}), "/reason"),
+        (json!({"amount_cny": "1", "reason": "   "}), "/reason"),
         (
-            json!({"amount_usd": "1", "reason": "因".repeat(501)}),
+            json!({"amount_cny": "1", "reason": "因".repeat(501)}),
             "/reason",
         ),
         // A NUL, which Postgres cannot store, and a line break: refused as
         // input, not failed in the database.
         (
-            json!({"amount_usd": "1", "reason": "线下\u{0}收款"}),
+            json!({"amount_cny": "1", "reason": "线下\u{0}收款"}),
             "/reason",
         ),
         (
-            json!({"amount_usd": "1", "reason": "线下\n收款"}),
+            json!({"amount_cny": "1", "reason": "线下\n收款"}),
             "/reason",
         ),
         (
-            json!({"amount_usd": "1", "reason": REASON, "reference": "r".repeat(129)}),
+            json!({"amount_cny": "1", "reason": REASON, "reference": "r".repeat(129)}),
             "/reference",
         ),
         (
-            json!({"amount_usd": "1", "reason": REASON, "reference": "wire\n7c1"}),
+            json!({"amount_cny": "1", "reason": REASON, "reference": "wire\n7c1"}),
             "/reference",
         ),
     ] {
@@ -268,7 +268,7 @@ async fn a_credit_reason_and_reference_are_bounded() {
         &d.cp,
         &d.admin,
         d.tenant,
-        json!({"amount_usd": "0", "reference": "a\u{7}b"}),
+        json!({"amount_cny": "0", "reference": "a\u{7}b"}),
     )
     .await;
     assert_eq!(r.status, 422, "{r:?}");
@@ -278,13 +278,13 @@ async fn a_credit_reason_and_reference_are_bounded() {
         .iter()
         .map(|d| d["path"].as_str().expect("a path"))
         .collect();
-    assert_eq!(paths, vec!["/amount_usd", "/reason", "/reference"], "{r:?}");
+    assert_eq!(paths, vec!["/amount_cny", "/reason", "/reference"], "{r:?}");
     // A field the route does not know is refused, not ignored.
     let r = credit(
         &d.cp,
         &d.admin,
         d.tenant,
-        json!({"amount_usd": "1", "reason": REASON, "requested_by": d.owner.id}),
+        json!({"amount_cny": "1", "reason": REASON, "requested_by": d.owner.id}),
     )
     .await;
     assert_eq!(r.status, 422, "{r:?}");
@@ -299,7 +299,7 @@ async fn a_credit_reason_and_reference_are_bounded() {
         &d.cp,
         &d.admin,
         d.tenant,
-        json!({"amount_usd": "0.01", "reason": reason, "reference": reference}),
+        json!({"amount_cny": "0.01", "reason": reason, "reference": reference}),
     )
     .await;
     assert_eq!(r.status, 201, "{r:?}");
@@ -307,7 +307,7 @@ async fn a_credit_reason_and_reference_are_bounded() {
     assert_eq!(r.body["reference"], json!(reference));
     assert_eq!(
         audits(pool, "billing.topup.credit").await[0].5,
-        json!({"amount_micro_usd": 10_000, "reason": reason})
+        json!({"amount_micro_cny": 10_000, "reason": reason})
     );
 }
 
@@ -315,7 +315,7 @@ async fn a_credit_reason_and_reference_are_bounded() {
 async fn only_admins_post_credits() {
     let Some(d) = desk().await else { return };
     let pool = d.cp.db().pool();
-    let body = json!({"amount_usd": "0.05", "reason": REASON});
+    let body = json!({"amount_cny": "0.05", "reason": REASON});
     for role in [OperatorRole::Viewer, OperatorRole::Operator] {
         let op = d.cp.admin_login_seeded(role).await;
         let r = credit(&d.cp, &op, d.tenant, body.clone()).await;
@@ -357,7 +357,7 @@ async fn only_admins_post_credits() {
 async fn an_unknown_or_pending_tenant_takes_no_credit() {
     let Some(d) = desk().await else { return };
     let pool = d.cp.db().pool();
-    let body = json!({"amount_usd": "0.05", "reason": REASON});
+    let body = json!({"amount_cny": "0.05", "reason": REASON});
     let pending = d.cp.seed_tenant(TenantStatus::Pending).await;
     for tenant in [
         Uuid::new_v4().to_string(),
@@ -441,7 +441,7 @@ async fn an_operator_credit_lifts_an_exhausted_postpaid_tenant_in_the_same_reque
             "PATCH",
             &format!("/admin/tenants/{tenant}/billing"),
             Some(admin.cookie()),
-            Some(json!({"credit_limit_usd": "0.01"})),
+            Some(json!({"credit_limit_cny": "0.01"})),
         )
         .await;
     assert_eq!(r.status, 200, "{r:?}");
@@ -468,7 +468,7 @@ async fn an_operator_credit_lifts_an_exhausted_postpaid_tenant_in_the_same_reque
         &w.cp,
         &w.admin,
         tenant,
-        json!({"amount_usd": "0.05", "reason": "线下收款 7c1"}),
+        json!({"amount_cny": "0.05", "reason": "线下收款 7c1"}),
     )
     .await;
     assert_eq!(r.status, 201, "{r:?}");
@@ -483,7 +483,7 @@ async fn an_operator_credit_lifts_an_exhausted_postpaid_tenant_in_the_same_reque
             None,
         )
         .await;
-    assert_eq!(r.body["balance_micro_usd"], 39_800, "{r:?}");
+    assert_eq!(r.body["balance_micro_cny"], 39_800, "{r:?}");
     assert_eq!(r.body["exhausted"], false, "{r:?}");
     let last = entries(pool, tenant).await.pop().expect("an entry");
     assert_eq!((last.0.as_str(), last.1, last.2), ("topup", 50_000, 39_800));
@@ -496,7 +496,7 @@ async fn an_operator_credit_shows_to_the_tenant_with_its_reason() {
         &d.cp,
         &d.admin,
         d.tenant,
-        json!({"amount_usd": "0.05", "reason": REASON, "reference": "pay-4b7"}),
+        json!({"amount_cny": "0.05", "reason": REASON, "reference": "pay-4b7"}),
     )
     .await;
     assert_eq!(r.status, 201, "{r:?}");
@@ -511,7 +511,7 @@ async fn an_operator_credit_shows_to_the_tenant_with_its_reason() {
     assert_eq!(item["id"], json!(id));
     assert_eq!(item["origin"], "operator");
     assert_eq!(item["status"], "approved");
-    assert_eq!(item["amount_micro_usd"], 50_000);
+    assert_eq!(item["amount_micro_cny"], 50_000);
     assert_eq!(item["requested_by"], Value::Null);
     assert_eq!(item["credit_reason"], REASON);
     assert_eq!(item["reference"], "pay-4b7");
@@ -536,7 +536,7 @@ async fn an_operator_credit_shows_to_the_tenant_with_its_reason() {
     let r =
         d.cp.send("GET", "/api/billing/balance", Some(d.owner.cookie()), None)
             .await;
-    assert_eq!(r.body["balance_micro_usd"], 50_000, "{r:?}");
+    assert_eq!(r.body["balance_micro_cny"], 50_000, "{r:?}");
     assert_eq!(r.body["exhausted"], false, "{r:?}");
 }
 
@@ -549,18 +549,18 @@ async fn a_credit_amount_is_dollars_and_cents_only() {
             &d.cp,
             &d.admin,
             d.tenant,
-            json!({"amount_usd": bad, "reason": REASON}),
+            json!({"amount_cny": bad, "reason": REASON}),
         )
         .await;
         assert_eq!(r.status, 422, "{bad:?}: {r:?}");
-        assert_eq!(r.body["details"][0]["path"], "/amount_usd", "{bad:?}");
+        assert_eq!(r.body["details"][0]["path"], "/amount_cny", "{bad:?}");
     }
     // A number rather than a dollar string is refused too.
     let r = credit(
         &d.cp,
         &d.admin,
         d.tenant,
-        json!({"amount_usd": 5, "reason": REASON}),
+        json!({"amount_cny": 5, "reason": REASON}),
     )
     .await;
     assert_eq!(r.status, 422, "{r:?}");
@@ -573,11 +573,11 @@ async fn a_credit_amount_is_dollars_and_cents_only() {
             &d.cp,
             &d.admin,
             d.tenant,
-            json!({"amount_usd": amount, "reason": REASON}),
+            json!({"amount_cny": amount, "reason": REASON}),
         )
         .await;
         assert_eq!(r.status, 201, "{amount}: {r:?}");
-        assert_eq!(r.body["amount_micro_usd"], micro, "{amount}");
+        assert_eq!(r.body["amount_micro_cny"], micro, "{amount}");
     }
     assert_eq!(balance(pool, d.tenant).await, 1_000_000_010_000);
 }
@@ -591,7 +591,7 @@ async fn a_credit_does_not_count_as_a_pending_request() {
                 "POST",
                 "/api/billing/topups",
                 Some(d.owner.cookie()),
-                Some(json!({"amount_usd": "0.01"})),
+                Some(json!({"amount_cny": "0.01"})),
             )
             .await;
         assert_eq!(r.status, 201, "{r:?}");
@@ -600,7 +600,7 @@ async fn a_credit_does_not_count_as_a_pending_request() {
         &d.cp,
         &d.admin,
         d.tenant,
-        json!({"amount_usd": "0.05", "reason": REASON}),
+        json!({"amount_cny": "0.05", "reason": REASON}),
     )
     .await;
     assert_eq!(r.status, 201, "{r:?}");
@@ -608,14 +608,14 @@ async fn a_credit_does_not_count_as_a_pending_request() {
         d.cp.send("GET", "/api/billing/balance", Some(d.owner.cookie()), None)
             .await;
     assert_eq!(r.body["pending_topups"], 20, "{r:?}");
-    assert_eq!(r.body["balance_micro_usd"], 50_000, "{r:?}");
+    assert_eq!(r.body["balance_micro_cny"], 50_000, "{r:?}");
     // And the tenant's own queue is still full.
     let r =
         d.cp.send(
             "POST",
             "/api/billing/topups",
             Some(d.owner.cookie()),
-            Some(json!({"amount_usd": "0.01"})),
+            Some(json!({"amount_cny": "0.01"})),
         )
         .await;
     assert_eq!(
@@ -654,7 +654,7 @@ async fn a_credit_waits_for_the_account_before_it_reads_the_balance() {
         &mut holder,
         &[Posting {
             tenant_id: d.tenant,
-            amount_micro_usd: 10_000,
+            amount_micro_cny: 10_000,
             source: Source::Topup {
                 topup_id: earlier.id,
             },
@@ -670,7 +670,7 @@ async fn a_credit_waits_for_the_account_before_it_reads_the_balance() {
                 &cp,
                 &admin,
                 tenant,
-                json!({"amount_usd": "0.05", "reason": REASON}),
+                json!({"amount_cny": "0.05", "reason": REASON}),
             )
             .await
         }

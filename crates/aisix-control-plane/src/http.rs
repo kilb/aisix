@@ -330,16 +330,6 @@ pub const ROUTE_ROLES: &[(&str, &str, MinRole)] = &[
     ),
     (
         "GET",
-        "/admin/pricing/sell",
-        MinRole::Op(OperatorRole::Viewer),
-    ),
-    (
-        "POST",
-        "/admin/pricing/sell",
-        MinRole::Op(OperatorRole::Operator),
-    ),
-    (
-        "GET",
         "/admin/pricing/cost",
         MinRole::Op(OperatorRole::Viewer),
     ),
@@ -762,10 +752,6 @@ pub fn browser_router(state: AppState) -> Router {
         .route("/admin/usage/batches", get(usage::list_batches))
         .route("/admin/usage/rejects", get(usage::list_rejects))
         .route("/admin/pricing/catalogue", get(pricing::api::catalogue))
-        .route(
-            "/admin/pricing/sell",
-            get(pricing::api::list_sell).post(pricing::api::create_sell),
-        )
         .route(
             "/admin/pricing/cost",
             get(pricing::api::list_cost).post(pricing::api::create_cost),

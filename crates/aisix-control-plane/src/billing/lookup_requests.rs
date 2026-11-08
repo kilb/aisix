@@ -49,7 +49,7 @@ use super::access::{key_access, KeyAccess, Visibility};
 use super::calls::{
     call_model, tenant_view, text, Models, TenantStatus, ADJUSTED, EVENT_FIELDS, VISIBLE,
 };
-use super::money::usd_string;
+use super::money::cny_string;
 use crate::db::DbError;
 use crate::dp::DpIdentity;
 use crate::error::{ApiError, Detail};
@@ -77,7 +77,7 @@ pub struct RequestRow {
     pub charge_status: &'static str,
     /// What the row was charged: the charge plus its adjustments; `None`
     /// while pending.
-    pub charge_micro_usd: Option<i64>,
+    pub charge_micro_cny: Option<i64>,
     pub estimated: bool,
     /// The billed quantities by dimension, under the names the price listing
     /// uses.
@@ -90,7 +90,7 @@ pub struct RequestCost {
     pub request_id: String,
     /// The sum of what the listed rows were charged; pending rows add
     /// nothing.
-    pub total_micro_usd: i64,
+    pub total_micro_cny: i64,
     /// Whether any listed row is still pending.
     pub pending: bool,
     /// Whether rows past [`MAX_REQUEST_ROWS`] were left out.
@@ -103,7 +103,7 @@ struct Row {
     occurred_at: DateTime<Utc>,
     requested_model_id: String,
     status: String,
-    charge_micro_usd: Option<i64>,
+    charge_micro_cny: Option<i64>,
     estimated: bool,
     lines: Value,
     /// The sum of the charge's adjustments, `None` when it has none.
@@ -155,13 +155,13 @@ pub async fn request_cost(
     request_id: &str,
 ) -> Result<Option<RequestCost>, DbError> {
     let mut sql = QueryBuilder::<Postgres>::new(
-        "SELECT pc.occurred_at, pc.requested_model_id, pc.status, pc.charge_micro_usd, \
+        "SELECT pc.occurred_at, pc.requested_model_id, pc.status, pc.charge_micro_cny, \
          pc.estimated, pc.lines, ",
     );
     sql.push(ADJUSTED).push(" AS adjusted, ");
     sql.push(EVENT_FIELDS).push(" AS ev");
     sql.push(
-        " FROM pricing_charges pc JOIN usage_events ue ON ue.event_id = pc.event_id \
+        " FROM pricing_charges_cny pc JOIN usage_events ue ON ue.event_id = pc.event_id \
          WHERE pc.tenant_id = ",
     )
     .push_bind(access.tenant_id)
@@ -194,20 +194,20 @@ pub async fn request_cost(
     let models = Models::load(&mut *conn, access.tenant_id, &model_ids).await?;
 
     let mut items = Vec::with_capacity(rows.len());
-    let mut total_micro_usd: i64 = 0;
+    let mut total_micro_cny: i64 = 0;
     for r in rows {
         let Some(view) = tenant_view(&r.ev, &r.status, r.adjusted.is_some()) else {
             continue;
         };
-        let charge_micro_usd = if view.charge_status == "pending" {
+        let charge_micro_cny = if view.charge_status == "pending" {
             None
         } else {
             let charged = r
-                .charge_micro_usd
+                .charge_micro_cny
                 .unwrap_or(0)
                 .checked_add(r.adjusted.unwrap_or(0))
                 .ok_or_else(overflow)?;
-            total_micro_usd = total_micro_usd.checked_add(charged).ok_or_else(overflow)?;
+            total_micro_cny = total_micro_cny.checked_add(charged).ok_or_else(overflow)?;
             Some(charged)
         };
         items.push(RequestRow {
@@ -221,7 +221,7 @@ pub async fn request_cost(
             status: view.status,
             error: view.error,
             charge_status: view.charge_status,
-            charge_micro_usd,
+            charge_micro_cny,
             estimated: r.estimated,
             quantities: quantities(&r.lines),
         });
@@ -231,8 +231,8 @@ pub async fn request_cost(
     }
     Ok(Some(RequestCost {
         request_id: request_id.to_string(),
-        total_micro_usd,
-        pending: items.iter().any(|i| i.charge_micro_usd.is_none()),
+        total_micro_cny,
+        pending: items.iter().any(|i| i.charge_micro_cny.is_none()),
         has_more,
         items,
     }))
@@ -262,7 +262,7 @@ pub struct RequestsQuery {
 fn dp_json(c: &RequestCost) -> Value {
     json!({
         "request_id": c.request_id,
-        "total_usd": usd_string(c.total_micro_usd),
+        "total_usd": cny_string(c.total_micro_cny),
         "pending": c.pending,
         "has_more": c.has_more,
         "items": c.items.iter().map(|i| json!({
@@ -271,7 +271,7 @@ fn dp_json(c: &RequestCost) -> Value {
             "status": i.status,
             "error": i.error,
             "charge_status": i.charge_status,
-            "charge_usd": i.charge_micro_usd.map(usd_string),
+            "charge_usd": i.charge_micro_cny.map(cny_string),
             "estimated": i.estimated,
             "quantities": i.quantities,
         })).collect::<Vec<_>>(),

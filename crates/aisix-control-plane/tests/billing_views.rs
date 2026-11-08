@@ -39,10 +39,11 @@ const CALL_KEYS: [&str; 14] = [
 ];
 
 /// The keys of a `Call`'s `charge`.
-const CHARGE_KEYS: [&str; 7] = [
+const CHARGE_KEYS: [&str; 8] = [
     "status",
-    "amount_micro_usd",
-    "adjusted_micro_usd",
+    "amount_micro_cny",
+    "group",
+    "adjusted_micro_cny",
     "service_tier",
     "estimated",
     "discount_bps",
@@ -50,7 +51,7 @@ const CHARGE_KEYS: [&str; 7] = [
 ];
 
 /// The keys of one line of a charge, as a tenant reads it.
-const LINE_KEYS: [&str; 3] = ["dimension", "quantity", "rate"];
+const LINE_KEYS: [&str; 3] = ["dimension", "quantity", "rate_cny"];
 
 /// A model named `name` for tenants, on a provider key and groups that carry
 /// the channel fixture tokens; granted to `tenant` when given.
@@ -188,7 +189,7 @@ async fn a_tenants_call_log_names_no_channel_and_no_cost() {
     // A later engine may store more on a charge line than a tenant reads,
     // such as a line's cost rate: written here as such an engine would.
     let stored = sqlx::query(
-        "UPDATE pricing_charges SET lines = (SELECT jsonb_agg(l || $1::jsonb) \
+        "UPDATE pricing_charges_cny SET lines = (SELECT jsonb_agg(l || $1::jsonb) \
          FROM jsonb_array_elements(lines) l) \
          WHERE event_id = 'ok1' AND jsonb_array_length(lines) > 0",
     )
@@ -453,7 +454,7 @@ async fn a_charged_retried_attempt_is_listed_as_retried() {
     assert_eq!(c["status_code"], Value::Null);
     assert_eq!(c["error_class"], Value::Null);
     assert_eq!(c["charge"]["status"], "charged");
-    assert_eq!(c["charge"]["amount_micro_usd"], 680);
+    assert_eq!(c["charge"]["amount_micro_cny"], 680);
 }
 
 #[tokio::test]
@@ -587,7 +588,7 @@ async fn a_usage_summary_counts_requests_charges_and_quantities_by_model_and_day
     let first = of("chat-bill");
     assert_eq!(first["model"]["id"], m.to_string());
     assert_eq!(first["requests"], 3);
-    assert_eq!(first["charged_micro_usd"], 2_040);
+    assert_eq!(first["charged_micro_cny"], 2_040);
     assert_eq!(first["estimated_requests"], 0);
     // 1000 prompt tokens, 800 of them cache hits, and 200 completion tokens.
     assert_eq!(first["quantities"]["input"], 600);
@@ -596,7 +597,7 @@ async fn a_usage_summary_counts_requests_charges_and_quantities_by_model_and_day
     let second = of("chat-bill-2");
     assert_eq!(second["model"]["id"], m2.to_string());
     assert_eq!(second["requests"], 1);
-    assert_eq!(second["charged_micro_usd"], 680);
+    assert_eq!(second["charged_micro_cny"], 680);
     assert_eq!(first["period_start"], second["period_start"]);
 
     // The range is bounded and well-formed.
@@ -633,7 +634,7 @@ async fn operators_read_any_tenants_usage_summary() {
         .await;
     assert_eq!(items(&r).len(), 1, "{r:?}");
     assert_eq!(items(&r)[0]["requests"], 1);
-    assert_eq!(items(&r)[0]["charged_micro_usd"], 680);
+    assert_eq!(items(&r)[0]["charged_micro_cny"], 680);
     let r =
         w.cp.send(
             "GET",

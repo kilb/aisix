@@ -25,7 +25,7 @@ async fn admin_ledger(w: &World, query: &str) -> support::Resp {
 }
 
 async fn seqs(pool: &PgPool, tenant: Uuid) -> Vec<i64> {
-    sqlx::query_scalar("SELECT seq FROM billing_ledger WHERE tenant_id = $1 ORDER BY seq DESC")
+    sqlx::query_scalar("SELECT seq FROM billing_ledger_cny WHERE tenant_id = $1 ORDER BY seq DESC")
         .bind(tenant)
         .fetch_all(pool)
         .await
@@ -83,8 +83,8 @@ async fn the_ledger_pages_newest_first_without_gaps() {
     let r = admin_ledger(&w, "?limit=1").await;
     let item = &r.body["items"][0];
     assert_eq!(item["kind"], "usage");
-    assert_eq!(item["amount_micro_usd"], -680);
-    assert_eq!(item["balance_after_micro_usd"], -3400);
+    assert_eq!(item["amount_micro_cny"], -680);
+    assert_eq!(item["balance_after_micro_cny"], -3400);
     assert_eq!(item["event_id"], "page-4");
     assert_eq!(item["topup_id"], Value::Null);
     let r = admin_ledger(&w, "?kind=grant").await;
@@ -165,7 +165,7 @@ async fn a_ledger_item_never_names_a_model_by_its_id() {
     // A charge recording the id of a model that is gone, whose event carried
     // no name.
     let gone = Uuid::new_v4();
-    sqlx::query("UPDATE pricing_charges SET requested_model_id = $2 WHERE event_id = $1")
+    sqlx::query("UPDATE pricing_charges_cny SET requested_model_id = $2 WHERE event_id = $1")
         .bind("by-id")
         .bind(gone.to_string())
         .execute(pool)
@@ -200,8 +200,8 @@ async fn raw_usage(
     .await
     .expect("insert the event");
     sqlx::query(
-        "INSERT INTO pricing_charges (event_id, tenant_id, api_key_id, user_id, \
-         requested_model_id, occurred_at, status, charge_micro_usd, engine_version) \
+        "INSERT INTO pricing_charges_cny (event_id, tenant_id, api_key_id, user_id, \
+         requested_model_id, occurred_at, status, charge_micro_cny, engine_version) \
          VALUES ($1, $2, '', '', '', $3, 'charged', $4, 1)",
     )
     .bind(event_id)
@@ -212,7 +212,7 @@ async fn raw_usage(
     .await
     .expect("insert the charge");
     sqlx::query(
-        "INSERT INTO billing_ledger (tenant_id, kind, amount_micro_usd, balance_after_micro_usd, \
+        "INSERT INTO billing_ledger_cny (tenant_id, kind, amount_micro_cny, balance_after_micro_cny, \
          event_id, posted_at) VALUES ($1, 'usage', $2, $3, $4, $5)",
     )
     .bind(tenant)
@@ -258,7 +258,7 @@ async fn a_ledger_summary_adds_up_by_utc_day() {
         today - TimeDelta::days(1),
     )
     .await;
-    sqlx::query("UPDATE billing_accounts SET balance_micro_usd = -300 WHERE tenant_id = $1")
+    sqlx::query("UPDATE billing_accounts SET balance_micro_cny = -300 WHERE tenant_id = $1")
         .bind(w.tenant)
         .execute(pool)
         .await
@@ -284,10 +284,10 @@ async fn a_ledger_summary_adds_up_by_utc_day() {
     let row = |start: DateTime<Utc>, usage: i64, closing: i64| {
         json!({
             "period_start": rfc(start),
-            "usage_micro_usd": usage,
-            "topups_micro_usd": 0,
-            "adjustments_micro_usd": 0,
-            "closing_balance_micro_usd": closing,
+            "usage_micro_cny": usage,
+            "topups_micro_cny": 0,
+            "adjustments_micro_cny": 0,
+            "closing_balance_micro_cny": closing,
         })
     };
     assert_eq!(
@@ -320,11 +320,11 @@ async fn a_ledger_summary_adds_up_by_utc_day() {
     assert!((1..=2).contains(&items.len()), "{r:?}");
     let total: i64 = items
         .iter()
-        .map(|i| i["usage_micro_usd"].as_i64().expect("usage"))
+        .map(|i| i["usage_micro_cny"].as_i64().expect("usage"))
         .sum();
     assert_eq!(total, -980);
     assert_eq!(
-        items.last().expect("a month")["closing_balance_micro_usd"],
+        items.last().expect("a month")["closing_balance_micro_cny"],
         -980
     );
 }
@@ -460,7 +460,7 @@ async fn raw_entry(
         .await
         .expect("relax the foreign keys");
     sqlx::query(
-        "INSERT INTO billing_ledger (tenant_id, kind, amount_micro_usd, balance_after_micro_usd, \
+        "INSERT INTO billing_ledger_cny (tenant_id, kind, amount_micro_cny, balance_after_micro_cny, \
          topup_id, repricing_run_id, posted_at) \
          VALUES ($1, $2, $3, $4, CASE WHEN $2 = 'topup' THEN gen_random_uuid() END, \
                  CASE WHEN $2 = 'adjustment' THEN gen_random_uuid() END, $5)",
@@ -518,15 +518,15 @@ async fn a_month_cut_by_the_range_closes_at_its_last_entry_inside_it() {
     let r = summary("2026-01-22T00:00:00Z").await;
     assert_eq!(r.status, 200, "{r:?}");
     assert_eq!(r.body["items"].as_array().map(Vec::len), Some(1), "{r:?}");
-    assert_eq!(r.body["items"][0]["usage_micro_usd"], -300, "{r:?}");
+    assert_eq!(r.body["items"][0]["usage_micro_cny"], -300, "{r:?}");
     assert_eq!(
-        r.body["items"][0]["closing_balance_micro_usd"], -300,
+        r.body["items"][0]["closing_balance_micro_cny"], -300,
         "{r:?}"
     );
     let r = summary("2026-02-01T00:00:00Z").await;
-    assert_eq!(r.body["items"][0]["usage_micro_usd"], -350, "{r:?}");
+    assert_eq!(r.body["items"][0]["usage_micro_cny"], -350, "{r:?}");
     assert_eq!(
-        r.body["items"][0]["closing_balance_micro_usd"], -350,
+        r.body["items"][0]["closing_balance_micro_cny"], -350,
         "{r:?}"
     );
 }
@@ -605,10 +605,10 @@ async fn topups_and_adjustments_are_listed_and_summed_beside_usage() {
         r.body["items"],
         json!([{
             "period_start": "2026-02-03T00:00:00Z",
-            "usage_micro_usd": -100,
-            "topups_micro_usd": 500,
-            "adjustments_micro_usd": -7,
-            "closing_balance_micro_usd": 393,
+            "usage_micro_cny": -100,
+            "topups_micro_cny": 500,
+            "adjustments_micro_cny": -7,
+            "closing_balance_micro_cny": 393,
         }]),
         "{r:?}"
     );

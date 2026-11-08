@@ -1,27 +1,34 @@
-//! What operators see of prices: each live model's platform price in force
-//! now and the ones scheduled after it (`GET /admin/pricing/models`), and one
-//! tenant's plan, its discount and its overrides
+//! What operators see of prices: every live model against every live group,
+//! with the CNY per million that group charges now and the ones scheduled
+//! after it (`GET /admin/pricing/models`), and one tenant's discount
 //! (`GET /admin/pricing/tenants/{id}`).
 //!
-//! "In force" is the price book's own rule: of one model's revisions in one
-//! scope (the platform's, or one tenant's overrides), the one with the
-//! greatest `effective_from` at or before the instant, ties going to the
-//! greatest `revision_id`. The instant is the database's `now()`, the clock
-//! every price write is checked against, so a row priced now is charged at
-//! the revision [`current_revision`] names. A revision this engine cannot use
-//! (a newer `engine_version`) is shown where it stands, since the book keeps
-//! its slot too and the rows it would price are refused, not priced at an
-//! older revision.
+//! A model's price in a group is its baseline in force times that group's
+//! rate for the model in force (its own override, else the group's default),
+//! before any tenant discount: this is the operators' view, and a tenant's
+//! discount applies on top of it at charging time (R12). A model with no
+//! baseline, or a group with no rate in force, shows no per-token figure and
+//! is listed first, which is the alert the price list exists for.
+//!
+//! "In force" is the price book's own rule: of one key's revisions, the one
+//! with the greatest `effective_from` at or before the instant, ties going to
+//! the greatest `revision_id`. The instant is the database's `now()`, the
+//! clock every price write is checked against, so a row priced now is charged
+//! at the revision named here. A revision this engine cannot use (a newer
+//! `engine_version`) is shown where it stands, since the book keeps its slot
+//! too and the rows it would price are refused, not priced at an older
+//! revision.
 //!
 //! An upcoming revision is one starting later than now. Of several starting
 //! at the same instant only the greatest `revision_id` is listed: it is the
 //! one that will apply, and the others never will.
 //!
-//! These views only read P2a's revision tables. Each answer is read in one
+//! These views only read the revision tables. Each answer is read in one
 //! transaction, so its current and upcoming revisions share one `now()`.
 
 use std::collections::HashMap;
 
+use aisix_pricing::{cny_per_million, CnyPerUsd, RateCard, ServiceTier};
 use axum::extract::{Path, State};
 use axum::Json;
 use futures::FutureExt;
@@ -30,74 +37,22 @@ use serde_json::{json, Value};
 use sqlx::PgConnection;
 use uuid::Uuid;
 
+use super::money::CURRENCY;
 use crate::auth::{OperatorAuth, OperatorRole};
 use crate::db::DbError;
 use crate::error::ApiError;
-use crate::pricing::store::{DiscountRevision, SellRevision};
+use crate::pricing::baselines::{current_baselines, upcoming_baselines, BaselineRevision};
+use crate::pricing::rates::rate_in_force;
+use crate::pricing::store::DiscountRevision;
 use crate::resources::Kind;
 use crate::AppState;
-
-/// The columns a [`SellRevision`] is read from.
-const SELL_COLUMNS: &str = "revision_id, engine_version, model_id, tenant_id, effective_from, \
-                            card, source, created_by, created_at";
 
 /// The columns a [`DiscountRevision`] is read from.
 const DISCOUNT_COLUMNS: &str =
     "revision_id, engine_version, tenant_id, effective_from, discount_bps, created_by, created_at";
 
-/// The sell revision in force now for `model_id`: the platform's price when
-/// `tenant_id` is `None`, otherwise that tenant's override (one whose `card`
-/// is null ended the override). `None` when no revision of that scope has
+/// The discount revision in force now for `tenant_id`; `None` when none has
 /// started.
-pub async fn current_revision(
-    conn: &mut PgConnection,
-    model_id: Uuid,
-    tenant_id: Option<Uuid>,
-) -> Result<Option<SellRevision>, DbError> {
-    Ok(current_revisions(conn, &[model_id], tenant_id).await?.pop())
-}
-
-/// [`current_revision`] for each of `model_ids` at once, one revision per
-/// model that has one, in no particular order.
-pub async fn current_revisions(
-    conn: &mut PgConnection,
-    model_ids: &[Uuid],
-    tenant_id: Option<Uuid>,
-) -> Result<Vec<SellRevision>, DbError> {
-    Ok(sqlx::query_as(&format!(
-        "SELECT DISTINCT ON (model_id) {SELL_COLUMNS} FROM pricing_sell_revisions \
-         WHERE model_id = ANY($1) AND tenant_id IS NOT DISTINCT FROM $2 \
-           AND effective_from <= now() \
-         ORDER BY model_id, effective_from DESC, revision_id DESC"
-    ))
-    .bind(model_ids)
-    .bind(tenant_id)
-    .fetch_all(conn)
-    .await?)
-}
-
-/// The sell revisions of `model_ids` in one scope that start later than
-/// now, at most one per instant, by model and then by start.
-async fn upcoming_revisions(
-    conn: &mut PgConnection,
-    model_ids: &[Uuid],
-    tenant_id: Option<Uuid>,
-) -> Result<Vec<SellRevision>, DbError> {
-    Ok(sqlx::query_as(&format!(
-        "SELECT DISTINCT ON (model_id, effective_from) {SELL_COLUMNS} \
-         FROM pricing_sell_revisions \
-         WHERE model_id = ANY($1) AND tenant_id IS NOT DISTINCT FROM $2 \
-           AND effective_from > now() \
-         ORDER BY model_id, effective_from, revision_id DESC"
-    ))
-    .bind(model_ids)
-    .bind(tenant_id)
-    .fetch_all(conn)
-    .await?)
-}
-
-/// The discount revision in force now for `tenant_id`, by the same rule as
-/// [`current_revision`]; `None` when none has started.
 pub async fn current_discount(
     conn: &mut PgConnection,
     tenant_id: Uuid,
@@ -129,60 +84,70 @@ async fn upcoming_discounts(
     .await?)
 }
 
-/// `PriceRow`: one model's price in one scope.
-#[derive(Debug, Serialize)]
-pub struct PriceRow {
-    model_id: Uuid,
-    name: String,
-    current: Option<SellRevision>,
-    /// By ascending `effective_from`.
-    upcoming: Vec<SellRevision>,
+/// One live group, as the price list names it.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+struct GroupRow {
+    id: Uuid,
+    display_name: String,
 }
 
-/// The price rows of `models` (`(id, name)`, in the order given) in one
-/// scope.
-async fn price_rows(
-    conn: &mut PgConnection,
-    models: Vec<(Uuid, String)>,
-    tenant_id: Option<Uuid>,
-) -> Result<Vec<PriceRow>, DbError> {
-    let ids: Vec<Uuid> = models.iter().map(|(id, _)| *id).collect();
-    let mut current: HashMap<Uuid, SellRevision> = current_revisions(&mut *conn, &ids, tenant_id)
-        .await?
-        .into_iter()
-        .map(|r| (r.model_id, r))
-        .collect();
-    let mut upcoming: HashMap<Uuid, Vec<SellRevision>> = HashMap::new();
-    // By start within each model, as read.
-    for r in upcoming_revisions(&mut *conn, &ids, tenant_id).await? {
-        upcoming.entry(r.model_id).or_default().push(r);
-    }
-    Ok(models
-        .into_iter()
-        .map(|(model_id, name)| PriceRow {
-            model_id,
-            name,
-            current: current.remove(&model_id),
-            upcoming: upcoming.remove(&model_id).unwrap_or_default(),
-        })
-        .collect())
-}
-
-/// Every live model as `(id, name)`, by name, then id.
-async fn live_models(conn: &mut PgConnection) -> Result<Vec<(Uuid, String)>, DbError> {
+/// Every live group, by display name, then id.
+async fn live_groups(conn: &mut PgConnection) -> Result<Vec<GroupRow>, DbError> {
     Ok(sqlx::query_as(
-        "SELECT id, COALESCE(doc->>'display_name', '') FROM gw_resources \
-         WHERE kind = $1 AND NOT deleted \
-         ORDER BY 2, 1",
+        "SELECT id, display_name FROM provider_groups WHERE retired_at IS NULL \
+         ORDER BY display_name, id",
     )
-    .bind(Kind::Models.segment())
     .fetch_all(conn)
     .await?)
 }
 
-/// `GET /admin/pricing/models` → `{items: [PriceRow]}`: every live model's
-/// platform price, the models with no price in force first, each group by
-/// name.
+/// The `default` tier's base rates of `card`, in CNY per million at `cny`.
+/// `None` when the card carries no default tier.
+fn per_million(card: &RateCard, cny: CnyPerUsd) -> Option<(String, String)> {
+    let base = &card.0.get(&ServiceTier::default_tier())?.base;
+    Some((
+        cny_per_million(base.input, cny, 0)?,
+        cny_per_million(base.output, cny, 0)?,
+    ))
+}
+
+/// What one group charges for one model.
+#[derive(Debug, Serialize)]
+struct GroupPrice {
+    group_id: Uuid,
+    display_name: String,
+    /// The rate in force, as the decimal string it was typed as; `null` when
+    /// the group has no rate for the model.
+    cny_per_usd: Option<String>,
+    /// `model` when the model's own override priced it, `default` when the
+    /// group's default did, `null` when neither is in force.
+    source: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    input_per_million_cny: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_per_million_cny: Option<String>,
+}
+
+/// One model's baseline and every live group's price for it.
+#[derive(Debug, Serialize)]
+struct ModelPriceRow {
+    model_id: Uuid,
+    name: String,
+    baseline: BaselinePlan,
+    groups: Vec<GroupPrice>,
+}
+
+/// A model's baseline in force and the ones scheduled after it.
+#[derive(Debug, Serialize)]
+struct BaselinePlan {
+    current: Option<BaselineRevision>,
+    /// By ascending `effective_from`.
+    upcoming: Vec<BaselineRevision>,
+}
+
+/// `GET /admin/pricing/models` → `{items: [ModelPriceRow]}`, in the design's
+/// charge-list shape: every live model, the ones with no baseline or no rated
+/// group first, each group by name.
 pub async fn models(
     auth: OperatorAuth,
     State(state): State<AppState>,
@@ -192,18 +157,84 @@ pub async fn models(
         .db
         .tx(|conn| {
             async move {
-                let models = live_models(&mut *conn).await?;
-                price_rows(conn, models, None).await
+                let models: Vec<(Uuid, String)> = sqlx::query_as(
+                    "SELECT id, COALESCE(doc->>'display_name', '') FROM gw_resources \
+                     WHERE kind = $1 AND NOT deleted ORDER BY 2, 1",
+                )
+                .bind(Kind::Models.segment())
+                .fetch_all(&mut *conn)
+                .await?;
+                let ids: Vec<Uuid> = models.iter().map(|(id, _)| *id).collect();
+                let groups = live_groups(&mut *conn).await?;
+                let mut current: HashMap<Uuid, BaselineRevision> =
+                    current_baselines(&mut *conn, &ids)
+                        .await?
+                        .into_iter()
+                        .map(|r| (r.model_id, r))
+                        .collect();
+                let mut upcoming: HashMap<Uuid, Vec<BaselineRevision>> = HashMap::new();
+                for r in upcoming_baselines(&mut *conn, &ids).await? {
+                    upcoming.entry(r.model_id).or_default().push(r);
+                }
+                let mut rows = Vec::with_capacity(models.len());
+                for (model_id, name) in models {
+                    let baseline_current = current.remove(&model_id);
+                    let card = baseline_current
+                        .as_ref()
+                        .and_then(|b| serde_json::from_value::<RateCard>(b.card.clone()).ok());
+                    let mut prices = Vec::with_capacity(groups.len());
+                    for group in &groups {
+                        let in_force = rate_in_force(&mut *conn, group.id, Some(model_id)).await?;
+                        prices.push(group_price(group, in_force, card.as_ref()));
+                    }
+                    rows.push(ModelPriceRow {
+                        model_id,
+                        name,
+                        baseline: BaselinePlan {
+                            current: baseline_current,
+                            upcoming: upcoming.remove(&model_id).unwrap_or_default(),
+                        },
+                        groups: prices,
+                    });
+                }
+                Ok::<_, DbError>(rows)
             }
             .boxed()
         })
         .await?;
-    // Stable, so each group keeps the name order.
-    rows.sort_by_key(|r| r.current.is_some());
-    Ok(Json(json!({ "items": rows })))
+    // Stable, so each group keeps the name order: a model with no baseline in
+    // force comes first, since that is the one nobody can price. A model
+    // whose baseline exists but whose groups have no rate is listed where its
+    // name puts it: the missing rate is the group's, and the group's row says
+    // so.
+    rows.sort_by_key(|r| r.baseline.current.is_some());
+    Ok(Json(json!({"currency": CURRENCY, "items": rows})))
 }
 
-/// `TenantPlan`'s `discount`.
+/// What `group` charges for the model, at the rate in force and the card it
+/// is given. A group with no rate for the model shows none, and one whose
+/// baseline is missing shows no per-token figure: the group's row is always
+/// listed, so an operator can see which group has no rate.
+fn group_price(
+    group: &GroupRow,
+    in_force: Option<(CnyPerUsd, i64, bool)>,
+    card: Option<&RateCard>,
+) -> GroupPrice {
+    let rates = match (card, in_force) {
+        (Some(card), Some((rate, _, _))) => per_million(card, rate),
+        _ => None,
+    };
+    GroupPrice {
+        group_id: group.id,
+        display_name: group.display_name.clone(),
+        cny_per_usd: in_force.map(|(rate, _, _)| rate.to_string()),
+        source: in_force.map(|(_, _, overridden)| if overridden { "model" } else { "default" }),
+        input_per_million_cny: rates.as_ref().map(|r| r.0.clone()),
+        output_per_million_cny: rates.as_ref().map(|r| r.1.clone()),
+    }
+}
+
+/// `TenantPlan`: a tenant's discount.
 #[derive(Debug, Serialize)]
 pub struct DiscountPlan {
     current: Option<DiscountRevision>,
@@ -211,18 +242,16 @@ pub struct DiscountPlan {
     upcoming: Vec<DiscountRevision>,
 }
 
-/// `TenantPlan`: a tenant's discount, and every live model it has an
-/// override revision for, by model name.
+/// `TenantPlan`: a tenant's discount, in basis points. A tenant's price is its
+/// key's group's, so there are no per-tenant prices.
 #[derive(Debug, Serialize)]
 pub struct TenantPlan {
     tenant_id: Uuid,
     discount: DiscountPlan,
-    overrides: Vec<PriceRow>,
 }
 
-/// `GET /admin/pricing/tenants/{id}` → `TenantPlan`. An override whose
-/// `current.card` is null has ended, and the platform price applies. An
-/// unknown or malformed tenant id is `404`.
+/// `GET /admin/pricing/tenants/{id}` → `TenantPlan`. An unknown or malformed
+/// tenant id is `404`.
 pub async fn tenant(
     auth: OperatorAuth,
     State(state): State<AppState>,
@@ -243,27 +272,12 @@ pub async fn tenant(
                 if !exists {
                     return Err(ApiError::not_found());
                 }
-                let discount = DiscountPlan {
-                    current: current_discount(&mut *conn, tenant_id).await?,
-                    upcoming: upcoming_discounts(&mut *conn, tenant_id).await?,
-                };
-                let overridden: Vec<(Uuid, String)> = sqlx::query_as(
-                    "SELECT r.id, COALESCE(r.doc->>'display_name', '') FROM gw_resources r \
-                     WHERE r.kind = $1 AND NOT r.deleted AND EXISTS ( \
-                       SELECT 1 FROM pricing_sell_revisions s \
-                       WHERE s.model_id = r.id AND s.tenant_id = $2) \
-                     ORDER BY 2, 1",
-                )
-                .bind(Kind::Models.segment())
-                .bind(tenant_id)
-                .fetch_all(&mut *conn)
-                .await
-                .map_err(DbError::from)?;
-                let overrides = price_rows(conn, overridden, Some(tenant_id)).await?;
                 Ok(TenantPlan {
                     tenant_id,
-                    discount,
-                    overrides,
+                    discount: DiscountPlan {
+                        current: current_discount(&mut *conn, tenant_id).await?,
+                        upcoming: upcoming_discounts(&mut *conn, tenant_id).await?,
+                    },
                 })
             }
             .boxed()

@@ -24,7 +24,7 @@ use uuid::Uuid;
 
 use super::access::{key_access, session_visibility, KeyAccess, Visibility};
 use super::budgets::{self, BudgetRow, BudgetScope, Kind, SetBy};
-use super::money::usd_string;
+use super::money::{cny_string, usd_string};
 use crate::auth::{MemberAuth, MemberRole};
 use crate::db::DbError;
 use crate::dp::DpIdentity;
@@ -45,11 +45,11 @@ pub enum Level {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct OrgFigures {
     pub billing_mode: String,
-    pub balance_micro_usd: i64,
-    pub credit_limit_micro_usd: i64,
+    pub balance_micro_cny: i64,
+    pub credit_limit_micro_cny: i64,
     /// The balance for a prepaid tenant, the balance plus the credit limit
     /// for a postpaid one.
-    pub available_micro_usd: i64,
+    pub available_micro_cny: i64,
 }
 
 /// One quota that applies to the key, with its spend now.
@@ -78,6 +78,10 @@ pub struct KeyQuota {
     pub as_of: DateTime<Utc>,
     pub org: Option<OrgFigures>,
     pub quotas: Vec<QuotaFigure>,
+    /// The smallest remaining of every level that applies. The organization's
+    /// is CNY since migration `0027` and a quota's USD until `0028`; at the
+    /// rate the interim window is entered with, both sides carry the same
+    /// number, so the comparison stands.
     pub effective_remaining_micro_usd: Option<i64>,
     pub binding_level: Option<Level>,
 }
@@ -115,8 +119,8 @@ pub async fn key_quota(
 ) -> Result<KeyQuota, DbError> {
     let now = budgets::db_now(&mut *conn).await?;
     let (billing_mode, balance, credit_limit): (String, i64, i64) = sqlx::query_as(
-        "SELECT t.billing_mode, COALESCE(a.balance_micro_usd, 0), \
-                COALESCE(a.credit_limit_micro_usd, 0) \
+        "SELECT t.billing_mode, COALESCE(a.balance_micro_cny, 0), \
+                COALESCE(a.credit_limit_micro_cny, 0) \
          FROM tenants t LEFT JOIN billing_accounts a ON a.tenant_id = t.id WHERE t.id = $1",
     )
     .bind(access.tenant_id)
@@ -160,9 +164,9 @@ pub async fn key_quota(
 
     let org = (vis == Visibility::Full && !access.is_internal).then_some(OrgFigures {
         billing_mode,
-        balance_micro_usd: balance,
-        credit_limit_micro_usd: credit_limit,
-        available_micro_usd: available,
+        balance_micro_cny: balance,
+        credit_limit_micro_cny: credit_limit,
+        available_micro_cny: available,
     });
     let quotas = applicable
         .iter()
@@ -180,17 +184,23 @@ pub async fn key_quota(
     })
 }
 
-/// `q` as a gateway relays it: every amount an exact decimal string in USD.
+/// `q` as a gateway relays it: every amount an exact decimal string.
+///
+/// The organization's amounts are micro-CNY since migration `0027` and a
+/// quota's are micro-USD until `0028`. The field names stay those the gateway
+/// decodes until it is upgraded, and the values are the same number either
+/// way at the rate the interim window is entered with.
 fn dp_json(q: &KeyQuota) -> Value {
     let usd = |micro: i64| usd_string(micro);
+    let cny = |micro: i64| cny_string(micro);
     json!({
         "key_id": q.key_id,
         "as_of": q.as_of,
         "org": q.org.as_ref().map(|o| json!({
             "billing_mode": o.billing_mode,
-            "balance_usd": usd(o.balance_micro_usd),
-            "credit_limit_usd": usd(o.credit_limit_micro_usd),
-            "available_usd": usd(o.available_micro_usd),
+            "balance_usd": cny(o.balance_micro_cny),
+            "credit_limit_usd": cny(o.credit_limit_micro_cny),
+            "available_usd": cny(o.available_micro_cny),
         })),
         "quotas": q.quotas.iter().map(|f| json!({
             "scope": f.scope,
@@ -204,7 +214,7 @@ fn dp_json(q: &KeyQuota) -> Value {
             "counted_from": f.counted_from,
             "exhausted": f.exhausted,
         })).collect::<Vec<_>>(),
-        "effective_remaining_usd": q.effective_remaining_micro_usd.map(usd),
+        "effective_remaining_usd": q.effective_remaining_micro_usd.map(cny),
         "binding_level": q.binding_level,
     })
 }

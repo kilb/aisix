@@ -150,6 +150,43 @@ pub async fn rate_plan(
     Ok(RatePlan { current, upcoming })
 }
 
+/// The rate in force for `model_id` in `group_id`: the model's own override
+/// when one is in effect, else the group's default. `(cny, revision_id,
+/// model_override)`; `None` when no rate is in force, or the revision in
+/// force cannot be read by this engine (an override that ended falls through
+/// to the default, as the price book reads it).
+pub async fn rate_in_force(
+    conn: &mut PgConnection,
+    group_id: Uuid,
+    model_id: Option<Uuid>,
+) -> Result<Option<(CnyPerUsd, i64, bool)>, DbError> {
+    let usable = |revision: &GroupRateRevision| -> Option<(CnyPerUsd, i64, bool)> {
+        if u32::try_from(revision.engine_version).unwrap_or(u32::MAX) > ENGINE_VERSION {
+            return None;
+        }
+        let cny = CnyPerUsd::parse(revision.cny_per_usd.as_deref()?).ok()?;
+        Some((cny, revision.revision_id, revision.model_id.is_some()))
+    };
+    let Some(model_id) = model_id else {
+        let plan = rate_plan(&mut *conn, group_id, None).await?;
+        return Ok(plan.current.as_ref().and_then(usable));
+    };
+    let model = rate_plan(&mut *conn, group_id, Some(model_id)).await?;
+    if let Some(revision) = model.current.as_ref() {
+        if u32::try_from(revision.engine_version).unwrap_or(u32::MAX) > ENGINE_VERSION {
+            // An override written by a newer engine prices nothing; it does
+            // not give way to the default.
+            return Ok(None);
+        }
+        if revision.cny_per_usd.is_some() {
+            return Ok(usable(revision));
+        }
+        // An override that ended gives way to the group's default.
+    }
+    let default = rate_plan(&mut *conn, group_id, None).await?;
+    Ok(default.current.as_ref().and_then(usable))
+}
+
 /// Writes a rate revision starting at `row.effective_from`, refusing with:
 /// `409 group_retired` for a retired group;
 /// `422 /effective_from` for one that starts in the past;

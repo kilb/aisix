@@ -103,8 +103,8 @@ pub async fn project(
     let account = ledger::lock_account(&mut *conn, tenant.id).await?;
     let exhausted = exhausted(
         tenant.billing_mode,
-        account.balance_micro_usd,
-        account.credit_limit_micro_usd,
+        account.balance_micro_cny,
+        account.credit_limit_micro_cny,
     );
     tenants::put(
         &mut *conn,
@@ -164,8 +164,8 @@ pub async fn crossings(conn: &mut PgConnection, after: &[Account]) -> Result<Vec
                         && account.marked_exhausted
                             != Some(exhausted(
                                 mode,
-                                account.balance_micro_usd,
-                                account.credit_limit_micro_usd,
+                                account.balance_micro_cny,
+                                account.credit_limit_micro_cny,
                             ))
                 })
         })

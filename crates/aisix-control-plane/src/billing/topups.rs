@@ -30,7 +30,7 @@ use uuid::Uuid;
 
 use super::ledger::{self, Posting, Source};
 use super::marks;
-use super::money::parse_usd;
+use super::money::parse_cny;
 use crate::audit::{self, Actor, AuditEntry};
 use crate::auth::{MemberAuth, MemberRole, OperatorAuth, OperatorRole};
 use crate::db::DbError;
@@ -44,8 +44,8 @@ use crate::AppState;
 /// The most top-up requests one tenant may have awaiting a decision.
 pub const MAX_PENDING_TOPUPS: i64 = 20;
 
-/// The largest top-up, $1,000,000, in micro-USD.
-pub const MAX_TOPUP_MICRO_USD: i64 = 1_000_000_000_000;
+/// The largest top-up, ¥1,000,000, in micro-CNY.
+pub const MAX_TOPUP_MICRO_CNY: i64 = 1_000_000_000_000;
 
 /// The longest note a request may carry, in characters.
 const MAX_NOTE_CHARS: usize = 500;
@@ -126,7 +126,7 @@ pub struct TopupRow {
     pub seq: i64,
     pub tenant_id: Uuid,
     pub tenant_name: String,
-    pub amount_micro_usd: i64,
+    pub amount_micro_cny: i64,
     #[sqlx(try_from = "String")]
     pub origin: Origin,
     pub note: String,
@@ -144,10 +144,10 @@ pub struct TopupRow {
 }
 
 const SELECT: &str = "SELECT p.id, p.seq, p.tenant_id, t.name AS tenant_name, \
-     p.amount_micro_usd, p.origin, p.note, p.reference, p.status, p.requested_by, \
+     p.amount_micro_cny, p.origin, p.note, p.reference, p.status, p.requested_by, \
      m.display_name AS requester_name, p.requested_at, p.decided_by, \
      o.email AS decider_email, p.decided_at, p.reject_reason, p.credit_reason \
-     FROM billing_topups p JOIN tenants t ON t.id = p.tenant_id \
+     FROM billing_topups_cny p JOIN tenants t ON t.id = p.tenant_id \
      LEFT JOIN members m ON m.id = p.requested_by \
      LEFT JOIN operators o ON o.id = p.decided_by";
 
@@ -158,7 +158,7 @@ pub fn to_tenant(row: &TopupRow) -> Value {
     json!({
         "id": row.id,
         "origin": row.origin,
-        "amount_micro_usd": row.amount_micro_usd,
+        "amount_micro_cny": row.amount_micro_cny,
         "note": row.note,
         "reference": row.reference,
         "status": row.status,
@@ -203,7 +203,7 @@ async fn read(conn: &mut PgConnection, id: Uuid) -> Result<TopupRow, DbError> {
 pub async fn insert_approved(
     conn: &mut PgConnection,
     tenant_id: Uuid,
-    amount_micro_usd: i64,
+    amount_micro_cny: i64,
     origin: Origin,
     requested_by: Option<Uuid>,
     credit_reason: Option<&str>,
@@ -212,14 +212,14 @@ pub async fn insert_approved(
 ) -> Result<TopupRow, DbError> {
     let id = Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO billing_topups \
-         (id, tenant_id, amount_micro_usd, origin, reference, status, requested_by, \
+        "INSERT INTO billing_topups_cny \
+         (id, tenant_id, amount_micro_cny, origin, reference, status, requested_by, \
           decided_by, decided_at, credit_reason) \
          VALUES ($1, $2, $3, $4, $5, 'approved', $6, $7, now(), $8)",
     )
     .bind(id)
     .bind(tenant_id)
-    .bind(amount_micro_usd)
+    .bind(amount_micro_cny)
     .bind(origin.as_str())
     .bind(reference)
     .bind(requested_by)
@@ -238,13 +238,13 @@ fn detail(path: &str, message: impl Into<String>) -> Detail {
 }
 
 /// `raw` as a top-up amount in micro-USD: dollars and cents, above 0 and at
-/// most [`MAX_TOPUP_MICRO_USD`]; the problem at `/amount_usd` otherwise.
+/// most [`MAX_TOPUP_MICRO_CNY`]; the problem at `/amount_cny` otherwise.
 pub fn topup_amount(raw: &str) -> Result<i64, Vec<Detail>> {
-    let micro = parse_usd(raw, "/amount_usd").map_err(|e| e.details)?;
-    if micro <= 0 || micro > MAX_TOPUP_MICRO_USD {
+    let micro = parse_cny(raw, "/amount_cny").map_err(|e| e.details)?;
+    if micro <= 0 || micro > MAX_TOPUP_MICRO_CNY {
         return Err(vec![detail(
-            "/amount_usd",
-            "金额须大于 0 且不超过 1,000,000 美元",
+            "/amount_cny",
+            "金额须大于 0 且不超过 1,000,000 元",
         )]);
     }
     Ok(micro)
@@ -293,7 +293,7 @@ fn decided_already() -> ApiError {
 /// The tenant of top-up `id`, read without a lock (it never changes); `404
 /// not_found` when there is none.
 async fn tenant_of(conn: &mut PgConnection, id: Uuid) -> Result<Uuid, ApiError> {
-    sqlx::query_scalar("SELECT tenant_id FROM billing_topups WHERE id = $1")
+    sqlx::query_scalar("SELECT tenant_id FROM billing_topups_cny WHERE id = $1")
         .bind(id)
         .fetch_optional(conn)
         .await
@@ -304,16 +304,16 @@ async fn tenant_of(conn: &mut PgConnection, id: Uuid) -> Result<Uuid, ApiError> 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NewTopup {
-    amount_usd: String,
+    amount_cny: String,
     #[serde(default)]
     note: Option<String>,
     #[serde(default)]
     reference: Option<String>,
 }
 
-/// `POST /api/billing/topups` with `{amount_usd, note?, reference?}` →
-/// `201 Topup`, pending. `422` at `/amount_usd` unless it is dollars and
-/// cents above 0 and at most $1,000,000, and at `/note` (500 characters) or
+/// `POST /api/billing/topups` with `{amount_cny, note?, reference?}` →
+/// `201 Topup`, pending. `422` at `/amount_cny` unless it is yuan and
+/// fen above 0 and at most ¥1,000,000, and at `/note` (500 characters) or
 /// `/reference` (128) when too long or holding a control character; `409
 /// topup_limit` while the tenant has [`MAX_PENDING_TOPUPS`] pending already.
 pub async fn request(
@@ -326,7 +326,7 @@ pub async fn request(
     let note = req.note.unwrap_or_default();
     let reference = req.reference.unwrap_or_default();
     let mut problems = Vec::new();
-    let amount = topup_amount(&req.amount_usd).unwrap_or_else(|mut d| {
+    let amount = topup_amount(&req.amount_cny).unwrap_or_else(|mut d| {
         problems.append(&mut d);
         0
     });
@@ -343,7 +343,7 @@ pub async fn request(
                 // below holds until this one is in.
                 tenants::lock(&mut *conn, auth.tenant_id).await?;
                 let pending: i64 = sqlx::query_scalar(
-                    "SELECT count(*) FROM billing_topups \
+                    "SELECT count(*) FROM billing_topups_cny \
                      WHERE tenant_id = $1 AND status = 'pending'",
                 )
                 .bind(auth.tenant_id)
@@ -358,8 +358,8 @@ pub async fn request(
                 }
                 let id = Uuid::new_v4();
                 sqlx::query(
-                    "INSERT INTO billing_topups \
-                     (id, tenant_id, amount_micro_usd, origin, note, reference, status, \
+                    "INSERT INTO billing_topups_cny \
+                     (id, tenant_id, amount_micro_cny, origin, note, reference, status, \
                       requested_by) \
                      VALUES ($1, $2, $3, 'tenant', $4, $5, 'pending', $6)",
                 )
@@ -383,7 +383,7 @@ pub async fn request(
                         target_kind: TARGET_KIND,
                         target_id: Some(id.to_string()),
                         tenant_id: Some(auth.tenant_id),
-                        detail: json!({ "amount_micro_usd": amount }),
+                        detail: json!({ "amount_micro_cny": amount }),
                     },
                 )
                 .await?;
@@ -532,9 +532,9 @@ pub async fn approve(
                 // moves the balance mark.
                 tenants::lock_billing(&mut *conn, tenant_id).await?;
                 let amount: Option<i64> = sqlx::query_scalar(
-                    "UPDATE billing_topups \
+                    "UPDATE billing_topups_cny \
                      SET status = 'approved', decided_by = $2, decided_at = now() \
-                     WHERE id = $1 AND status = 'pending' RETURNING amount_micro_usd",
+                     WHERE id = $1 AND status = 'pending' RETURNING amount_micro_cny",
                 )
                 .bind(id)
                 .bind(auth.id)
@@ -546,7 +546,7 @@ pub async fn approve(
                     &mut *conn,
                     &[Posting {
                         tenant_id,
-                        amount_micro_usd: amount,
+                        amount_micro_cny: amount,
                         source: Source::Topup { topup_id: id },
                     }],
                 )
@@ -560,7 +560,7 @@ pub async fn approve(
                         target_kind: TARGET_KIND,
                         target_id: Some(id.to_string()),
                         tenant_id: Some(tenant_id),
-                        detail: json!({ "amount_micro_usd": amount }),
+                        detail: json!({ "amount_micro_cny": amount }),
                     },
                 )
                 .await?;
@@ -603,7 +603,7 @@ pub async fn reject(
                 // stays with its usage intake.
                 tenants::lock(&mut *conn, tenant_id).await?;
                 let rejected = sqlx::query(
-                    "UPDATE billing_topups \
+                    "UPDATE billing_topups_cny \
                      SET status = 'rejected', decided_by = $2, decided_at = now(), \
                          reject_reason = $3 \
                      WHERE id = $1 AND status = 'pending'",
@@ -643,13 +643,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_top_up_is_dollars_and_cents_within_the_maximum() {
+    fn a_top_up_is_yuan_and_fen_within_the_maximum() {
         assert_eq!(topup_amount("0.01"), Ok(10_000));
-        assert_eq!(topup_amount("1000000"), Ok(MAX_TOPUP_MICRO_USD));
+        assert_eq!(topup_amount("1000000"), Ok(MAX_TOPUP_MICRO_CNY));
         for bad in ["0", "0.00", "1000000.01", "-1", "0.001"] {
             let problems = topup_amount(bad).expect_err(bad);
             assert_eq!(problems.len(), 1, "{bad}");
-            assert_eq!(problems[0].path, "/amount_usd", "{bad}");
+            assert_eq!(problems[0].path, "/amount_cny", "{bad}");
         }
     }
 

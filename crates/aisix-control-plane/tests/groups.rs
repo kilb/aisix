@@ -581,7 +581,11 @@ async fn rate_revisions_refuse_update_delete_and_truncate() {
     for sql in [
         "UPDATE pricing_group_rates SET cny_per_usd_e4 = 1",
         "DELETE FROM pricing_group_rates",
-        "TRUNCATE pricing_group_rates",
+        // A charge references the rate it was priced at, so a truncate that
+        // names only this table is refused by the foreign key before the
+        // trigger runs; `CASCADE` carries it to the referencing tables, and
+        // the append-only triggers are what refuse them.
+        "TRUNCATE pricing_group_rates CASCADE",
     ] {
         let e = sqlx::query(sql)
             .execute(cp.db().pool())

@@ -796,7 +796,7 @@ pub async fn create(
         BudgetScope::ApiKey => "api_key_id",
     };
     let so_far: i64 = sqlx::query_scalar(&format!(
-        "SELECT COALESCE(SUM(charge_micro_usd), 0)::bigint FROM pricing_charges \
+        "SELECT COALESCE(SUM(charge_micro_cny), 0)::bigint FROM pricing_charges_cny \
          WHERE tenant_id = $1::text AND {column} = $2::text AND status = 'charged' \
            AND occurred_at >= $3 AND price_instant >= $3 \
            AND ($4::timestamptz IS NULL OR price_instant < $4)"

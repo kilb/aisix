@@ -19,14 +19,14 @@ use aisix_control_plane::error::ApiError;
 use aisix_control_plane::pricing::store::{
     self, CostRevision, DiscountRevision, NewCostPrice, NewDiscount,
 };
-use aisix_pricing::{Catalogue, Rate, RateCard, ENGINE_VERSION};
+use aisix_pricing::{Catalogue, RateCard, ENGINE_VERSION};
 use chrono::{DateTime, TimeDelta, Utc};
 use futures::FutureExt;
 use serde_json::{json, Value};
 use sqlx::{Connection, PgConnection};
 use support::world::{
-    card, db_now, deliver, insert_sell, price, seed_key, seed_model, seed_provider_key,
-    seed_tenant, tokens_680, usage, world, World,
+    card, db_now, deliver, insert_baseline, insert_rate, price, seed_key, seed_model,
+    seed_provider_key, seed_tenant, tokens_680, usage, world, World,
 };
 use support::{OperatorSession, Resp, TestCp};
 use tokio::sync::Barrier;
@@ -150,8 +150,8 @@ impl Charge {
 
 async fn charge_of(cp: &TestCp, event_id: &str) -> Option<Charge> {
     sqlx::query_as(
-        "SELECT status, charge_micro_usd AS charge, error_code, tenant_id, api_key_id, user_id \
-         FROM pricing_charges WHERE event_id = $1",
+        "SELECT status, charge_micro_cny AS charge, error_code, tenant_id, api_key_id, user_id \
+         FROM pricing_charges_cny WHERE event_id = $1",
     )
     .bind(event_id)
     .fetch_optional(cp.db().pool())
@@ -187,7 +187,7 @@ async fn a_re_sent_batch_and_a_repeated_event_are_charged_once() {
     }
     let r = deliver(&w.dp, Uuid::new_v4(), vec![event.clone()]).await;
     assert_eq!((r.status, r.body.clone()), (200, counts(0, 0, 1)), "{r:?}");
-    assert_eq!(w.cp.count("pricing_charges").await, 1);
+    assert_eq!(w.cp.count("pricing_charges_cny").await, 1);
     assert_eq!(charge_of(&w.cp, "e1").await, Some(Charge::charged(&w, 680)));
 }
 
@@ -244,7 +244,7 @@ async fn concurrent_deliveries_of_one_batch_charge_once() {
         "{answers:?}"
     );
     assert_eq!(w.cp.count("usage_events").await, 1);
-    assert_eq!(w.cp.count("pricing_charges").await, 1);
+    assert_eq!(w.cp.count("pricing_charges_cny").await, 1);
     assert_eq!(charge_of(&w.cp, "c1").await, Some(Charge::charged(&w, 680)));
 }
 
@@ -271,31 +271,19 @@ async fn a_price_cannot_start_in_the_past() {
     let model = seed_model(&w.cp, &w.admin).await;
     let (version, audits) = (pricing_version(&w.cp).await, w.cp.count("audit_log").await);
     let now = db_now(&w.cp).await;
-    let err = insert_sell(
-        &w.cp,
-        model,
-        None,
-        now - TimeDelta::minutes(1),
-        Some(card()),
-    )
-    .await
-    .expect_err("a price that started a minute ago");
+    let err = insert_baseline(&w.cp, model, now - TimeDelta::minutes(1), card())
+        .await
+        .expect_err("a price that started a minute ago");
     assert_refused_at(&err, "/effective_from");
-    assert_eq!(w.cp.count("pricing_sell_revisions").await, 0);
+    assert_eq!(w.cp.count("pricing_baselines").await, 0);
     assert_eq!(w.cp.count("audit_log").await, audits);
     assert_eq!(pricing_version(&w.cp).await, version);
 
     // Inside the 5 s tolerance.
     let now = db_now(&w.cp).await;
-    let rev = insert_sell(
-        &w.cp,
-        model,
-        None,
-        now - TimeDelta::seconds(2),
-        Some(card()),
-    )
-    .await
-    .expect("a price that started 2 s ago");
+    let rev = insert_baseline(&w.cp, model, now - TimeDelta::seconds(2), card())
+        .await
+        .expect("a price that started 2 s ago");
     assert_eq!(rev.engine_version, i64::from(ENGINE_VERSION));
     assert_eq!(pricing_version(&w.cp).await, version + 1);
 }
@@ -309,8 +297,9 @@ async fn a_bad_card_unprices_only_its_model() {
     );
     // No output rate: a card no engine can bill with.
     sqlx::query(
-        "INSERT INTO pricing_sell_revisions (engine_version, model_id, effective_from, card, source) \
-         VALUES ($1, $2, now(), '{\"default\":{\"base\":{\"input\":\"1\"}}}', 'manual')",
+        "INSERT INTO pricing_baselines \
+         (engine_version, model_id, effective_from, card, source_kind, source) \
+         VALUES ($1, $2, now(), '{\"default\":{\"base\":{\"input\":\"1\"}}}', 'manual', '{}')",
     )
     .bind(i64::from(ENGINE_VERSION))
     .bind(a)
@@ -340,8 +329,9 @@ async fn a_bad_card_unprices_only_its_model() {
 /// by raw SQL as a newer control plane (or a hand edit) would.
 async fn raw_revision(cp: &TestCp, model: Uuid, engine_version: i64) {
     sqlx::query(
-        "INSERT INTO pricing_sell_revisions (engine_version, model_id, effective_from, card, source) \
-         VALUES ($1, $2, now(), $3, 'manual')",
+        "INSERT INTO pricing_baselines \
+         (engine_version, model_id, effective_from, card, source_kind, source) \
+         VALUES ($1, $2, now(), $3, 'manual', '{}')",
     )
     .bind(engine_version)
     .bind(model)
@@ -426,7 +416,7 @@ async fn a_database_error_while_loading_prices_is_503_and_stores_nothing() {
         .execute(&mut holder)
         .await
         .expect("begin");
-    sqlx::query("LOCK TABLE pricing_sell_revisions IN ACCESS EXCLUSIVE MODE")
+    sqlx::query("LOCK TABLE pricing_baselines IN ACCESS EXCLUSIVE MODE")
         .execute(&mut holder)
         .await
         .expect("lock the sell revisions");
@@ -449,7 +439,7 @@ async fn a_database_error_while_loading_prices_is_503_and_stores_nothing() {
     let r = deliver(&w.dp, b, events).await;
     assert_eq!((r.status, r.body.clone()), (200, counts(1, 0, 0)), "{r:?}");
     assert_eq!(w.cp.count("usage_events").await, 1);
-    assert_eq!(w.cp.count("pricing_charges").await, 1);
+    assert_eq!(w.cp.count("pricing_charges_cny").await, 1);
     assert_eq!(charge_of(&w.cp, "e1").await, Some(Charge::charged(&w, 680)));
 }
 
@@ -491,7 +481,7 @@ async fn the_price_book_is_reloaded_only_when_a_price_changes() {
     .await;
     assert_eq!(r.status, 200, "{r:?}");
     assert_eq!(prices.loads(), 2);
-    assert_eq!(w.cp.count("pricing_charges").await, 4);
+    assert_eq!(w.cp.count("pricing_charges_cny").await, 4);
 }
 
 /// Readers that all find the book stale after a price write share one load:
@@ -622,16 +612,11 @@ async fn an_invalid_card_never_reaches_the_table() {
     }))
     .expect("decodes; validate() is what refuses it");
     let now = db_now(&w.cp).await;
-    let err = insert_sell(&w.cp, model, None, now, Some(no_default))
+    let err = insert_baseline(&w.cp, model, now, no_default)
         .await
         .expect_err("a card without a default tier");
     assert_refused_at(&err, "/card");
-    // Only a tenant override can end; a platform price always has a card.
-    let err = insert_sell(&w.cp, model, None, now, None)
-        .await
-        .expect_err("a platform price without a card");
-    assert_refused_at(&err, "/card");
-    assert_eq!(w.cp.count("pricing_sell_revisions").await, 0);
+    assert_eq!(w.cp.count("pricing_baselines").await, 0);
     assert_eq!(w.cp.count("audit_log").await, audits);
     assert_eq!(pricing_version(&w.cp).await, version);
 }
@@ -640,7 +625,7 @@ async fn an_invalid_card_never_reaches_the_table() {
 async fn a_price_for_a_deleted_or_unknown_model_is_refused() {
     let Some(w) = world().await else { return };
     let now = db_now(&w.cp).await;
-    let err = insert_sell(&w.cp, Uuid::new_v4(), None, now, Some(card()))
+    let err = insert_baseline(&w.cp, Uuid::new_v4(), now, card())
         .await
         .expect_err("an unknown model");
     assert_refused_at(&err, "/model_id");
@@ -662,17 +647,19 @@ async fn a_price_for_a_deleted_or_unknown_model_is_refused() {
     .await;
     assert_eq!(status, 200, "delete the model");
     let now = db_now(&w.cp).await;
-    let err = insert_sell(&w.cp, model, None, now, Some(card()))
+    let err = insert_baseline(&w.cp, model, now, card())
         .await
         .expect_err("a deleted model");
     assert_refused_at(&err, "/model_id");
 
-    let live = seed_model(&w.cp, &w.admin).await;
-    let err = insert_sell(&w.cp, live, Some(Uuid::new_v4()), now, Some(card()))
+    // A rate for an unknown group is `404 group_not_found`, and one for a
+    // retired group `409 group_retired`: neither can price a row.
+    let err = insert_rate(&w.cp, Uuid::new_v4(), now)
         .await
-        .expect_err("an unknown tenant");
-    assert_refused_at(&err, "/tenant_id");
-    assert_eq!(w.cp.count("pricing_sell_revisions").await, 0);
+        .expect_err("an unknown group");
+    assert_eq!(err.status.as_u16(), 404, "{err:?}");
+    assert_eq!(w.cp.count("pricing_baselines").await, 0);
+    assert_eq!(w.cp.count("pricing_group_rates").await, 0);
 }
 
 /// `(action, target_kind, target_id, tenant_id, detail)` of every audit row
@@ -694,45 +681,23 @@ async fn every_price_write_is_audited_in_its_transaction() {
     let version = pricing_version(&w.cp).await;
     let rev = price(&w.cp, model).await;
     let audit = pricing_audit(&w.cp).await;
-    assert_eq!(audit.len(), 1, "{audit:?}");
-    let (action, kind, target, tenant, detail) = &audit[0];
+    // The world's `price()` writes the group's rate, then the baseline.
+    assert_eq!(audit.len(), 2, "{audit:?}");
+    let (action, kind, target, tenant, detail) = &audit[1];
     assert_eq!(
         (action.as_str(), kind.as_str(), target.clone(), *tenant),
         (
-            "pricing.sell.create",
-            "pricing_sell_revision",
+            "pricing.baseline.create",
+            "pricing_baseline",
             Some(rev.revision_id.to_string()),
             None
         )
     );
     assert_eq!(detail["model_id"], json!(model));
-    assert_eq!(detail["source"], json!("manual"));
-    assert_eq!(pricing_version(&w.cp).await, version + 1);
-
-    // A tenant override, then its end.
-    let now = db_now(&w.cp).await;
-    insert_sell(&w.cp, model, Some(w.tenant), now, Some(card()))
-        .await
-        .expect("an override");
-    let ended = insert_sell(&w.cp, model, Some(w.tenant), db_now(&w.cp).await, None)
-        .await
-        .expect("end the override");
-    assert_eq!(ended.card, None);
-    let audit = pricing_audit(&w.cp).await;
-    let actions: Vec<(&str, Option<Uuid>)> = audit
-        .iter()
-        .map(|(action, _, _, tenant, _)| (action.as_str(), *tenant))
-        .collect();
-    assert_eq!(
-        actions,
-        vec![
-            ("pricing.sell.create", None),
-            ("pricing.sell.create", Some(w.tenant)),
-            ("pricing.sell.end_override", Some(w.tenant)),
-        ]
-    );
-    assert_eq!(audit[2].2, Some(ended.revision_id.to_string()));
-    assert_eq!(pricing_version(&w.cp).await, version + 3);
+    assert_eq!(detail["source_kind"], json!("manual"));
+    assert_eq!(audit[0].0, "pricing.group_rate.create");
+    assert_eq!(audit[0].1, "pricing_group_rate");
+    assert_eq!(pricing_version(&w.cp).await, version + 2);
 }
 
 #[tokio::test]
@@ -1073,7 +1038,7 @@ async fn a_duplicate_from_another_gateway_is_not_charged_again() {
             .await
             .expect("read the batch row");
     assert_eq!(batch_rejected, 0);
-    assert_eq!(w.cp.count("pricing_charges").await, 1);
+    assert_eq!(w.cp.count("pricing_charges_cny").await, 1);
     assert_eq!(charge_of(&w.cp, "e1").await, Some(Charge::charged(&w, 100)));
     // The losing copy is kept for operators, under the gateway that sent it.
     let kept: Vec<(String, Uuid, Value)> = sqlx::query_as(
@@ -1244,25 +1209,8 @@ fn assert_422_at(r: &Resp, path: &str) {
     assert_eq!(paths, vec![path], "{r:?}");
 }
 
-/// The one charge `GET /admin/pricing/charges?event_id=` lists for `event_id`.
-async fn charge_via_api(w: &World, event_id: &str) -> Value {
-    let r = as_op(
-        &w.cp,
-        &w.admin,
-        "GET",
-        &format!("/admin/pricing/charges?event_id={event_id}"),
-        None,
-    )
-    .await;
-    assert_eq!(r.status, 200, "{r:?}");
-    let items = r.body["items"].as_array().expect("items");
-    assert_eq!(items.len(), 1, "{r:?}");
-    assert_eq!(r.body["next_before"], Value::Null, "{r:?}");
-    items[0].clone()
-}
-
 #[tokio::test]
-async fn an_operator_sets_a_price_and_a_viewer_reads_it() {
+async fn an_operator_sets_a_baseline_and_a_viewer_reads_it() {
     let Some(w) = world().await else { return };
     let viewer = w.cp.admin_login_seeded(OperatorRole::Viewer).await;
     let model = seed_model(&w.cp, &w.admin).await;
@@ -1272,12 +1220,13 @@ async fn an_operator_sets_a_price_and_a_viewer_reads_it() {
         "model_id": model,
         "effective_from": db_now(&w.cp).await,
         "card": {"default": {"base": {"input": "1", "output": "2", "cache_read": "0.1"}}},
+        "note": "the operator's own card",
     });
     let r = as_op(
         &w.cp,
         &viewer,
         "POST",
-        "/admin/pricing/sell",
+        "/admin/pricing/baselines",
         Some(body.clone()),
     )
     .await;
@@ -1286,33 +1235,45 @@ async fn an_operator_sets_a_price_and_a_viewer_reads_it() {
         (403, json!("forbidden")),
         "{r:?}"
     );
-    assert_eq!(w.cp.count("pricing_sell_revisions").await, 0);
+    assert_eq!(w.cp.count("pricing_baselines").await, 0);
     assert_eq!(w.cp.count("audit_log").await, audits);
 
-    let r = as_op(&w.cp, &w.admin, "POST", "/admin/pricing/sell", Some(body)).await;
-    assert_eq!(r.status, 201, "{r:?}");
-    let rev = r.body.clone();
-    assert_eq!(rev["model_id"], json!(model));
-    assert_eq!(rev["tenant_id"], Value::Null);
-    assert_eq!(rev["source"], "manual");
-    assert_eq!(rev["engine_version"], ENGINE_VERSION);
-    assert_eq!(rev["created_by"], json!(w.admin.id));
-    assert_eq!(rev["card"]["default"]["base"]["input"], "1");
-    assert_eq!(rev["warnings"], json!([]));
-    // A price for another model, which the filter must leave out.
     let r = as_op(
         &w.cp,
         &w.admin,
         "POST",
-        "/admin/pricing/sell",
-        Some(json!({"model_id": other, "effective_from": db_now(&w.cp).await, "card": card()})),
+        "/admin/pricing/baselines",
+        Some(body),
+    )
+    .await;
+    assert_eq!(r.status, 201, "{r:?}");
+    let rev = r.body["revision"].clone();
+    assert_eq!(rev["model_id"], json!(model));
+    assert_eq!(rev["source_kind"], "manual");
+    assert_eq!(rev["source"]["note"], "the operator's own card");
+    assert_eq!(rev["engine_version"], ENGINE_VERSION);
+    assert_eq!(rev["created_by"]["id"], json!(w.admin.id));
+    assert_eq!(rev["card"]["default"]["base"]["input"], "1");
+    assert_eq!(r.body["warnings"], json!([]));
+    // A price for another model, which the listing must include too.
+    let r = as_op(
+        &w.cp,
+        &w.admin,
+        "POST",
+        "/admin/pricing/baselines",
+        Some(json!({
+            "model_id": other,
+            "effective_from": db_now(&w.cp).await,
+            "card": card(),
+            "note": "another model's card",
+        })),
     )
     .await;
     assert_eq!(r.status, 201, "{r:?}");
     // Written by the operator, in the audit log.
     let audit: (String, Option<Uuid>, String) = sqlx::query_as(
         "SELECT actor_kind, actor_id, action FROM audit_log WHERE target_id = $1 \
-         AND target_kind = 'pricing_sell_revision'",
+         AND target_kind = 'pricing_baseline'",
     )
     .bind(
         rev["revision_id"]
@@ -1328,25 +1289,19 @@ async fn an_operator_sets_a_price_and_a_viewer_reads_it() {
         (
             "operator".to_string(),
             Some(w.admin.id),
-            "pricing.sell.create".to_string()
+            "pricing.baseline.create".to_string()
         )
     );
 
-    let r = as_op(
-        &w.cp,
-        &viewer,
-        "GET",
-        &format!("/admin/pricing/sell?model_id={model}"),
-        None,
-    )
-    .await;
+    let r = as_op(&w.cp, &viewer, "GET", "/admin/pricing/baselines", None).await;
     assert_eq!(r.status, 200, "{r:?}");
-    let mut listed = rev.clone();
-    let listed = listed.as_object_mut().expect("an object");
-    listed.remove("warnings");
-    listed.remove("later_revisions");
-    assert_eq!(r.body["items"], json!([listed]), "{r:?}");
-    assert_eq!(r.body["next_before"], Value::Null);
+    let items = r.body["items"].as_array().expect("items");
+    let mine = items
+        .iter()
+        .find(|i| i["model_id"] == json!(model))
+        .expect("the model's row");
+    assert_eq!(mine["current"]["revision_id"], rev["revision_id"], "{r:?}");
+    assert_eq!(mine["current"]["card"]["default"]["base"]["input"], "1");
 }
 
 /// A price write that does not say it is JSON is `415` and writes nothing,
@@ -1361,8 +1316,8 @@ async fn a_price_write_that_is_not_json_is_415_and_writes_nothing() {
     let audits = w.cp.count("audit_log").await;
     let writes = [
         (
-            "/admin/pricing/sell",
-            json!({"model_id": model, "effective_from": now, "card": card()}),
+            "/admin/pricing/baselines",
+            json!({"model_id": model, "effective_from": now, "card": card(), "note": "x"}),
         ),
         (
             "/admin/pricing/cost",
@@ -1394,7 +1349,7 @@ async fn a_price_write_that_is_not_json_is_415_and_writes_nothing() {
         }
     }
     for table in [
-        "pricing_sell_revisions",
+        "pricing_baselines",
         "pricing_cost_revisions",
         "pricing_discount_revisions",
     ] {
@@ -1405,212 +1360,124 @@ async fn a_price_write_that_is_not_json_is_415_and_writes_nothing() {
 }
 
 #[tokio::test]
-async fn a_catalogue_price_is_imported_with_its_markup() {
-    let Some(w) = world().await else { return };
-    let viewer = w.cp.admin_login_seeded(OperatorRole::Viewer).await;
-    let model = seed_model(&w.cp, &w.admin).await;
-    let r = as_op(&w.cp, &viewer, "GET", "/admin/pricing/catalogue", None).await;
-    assert_eq!(r.status, 200, "{r:?}");
-    let version = r.body["version"].as_str().expect("a version").to_string();
-    let items = r.body["items"].as_array().expect("items").clone();
-    assert!(items.len() > 1, "{r:?}");
-    let first = &items[0];
-    let key = first["key"].as_str().expect("a key");
-    assert!(first["source_url"].as_str().is_some(), "{first}");
-
-    let list_input = Rate::parse(
-        first["card"]["default"]["base"]["input"]
-            .as_str()
-            .expect("a list input rate"),
-    )
-    .expect("a rate");
-    let r = as_op(
-        &w.cp,
-        &w.admin,
-        "POST",
-        "/admin/pricing/sell",
-        Some(json!({
-            "model_id": model,
-            "effective_from": db_now(&w.cp).await,
-            "catalogue_key": key,
-            "markup_bps": 2000,
-        })),
-    )
-    .await;
-    assert_eq!(r.status, 201, "{r:?}");
-    // List × 1.2, rounded half up.
-    let expected = Rate((list_input.0 * 12 + 5) / 10);
-    let input = Rate::parse(
-        r.body["card"]["default"]["base"]["input"]
-            .as_str()
-            .expect("an input rate"),
-    )
-    .expect("a rate");
-    assert_eq!(input, expected, "{r:?}");
-    let source = r.body["source"].as_str().expect("a source");
-    assert!(source.starts_with("catalogue:"), "{source}");
-    let dated = first["effective_from"]
-        .as_str()
-        .map_or("-".to_string(), str::to_string);
-    assert_eq!(source, format!("catalogue:{version}:{key}@{dated}"));
-    assert_eq!(r.body["warnings"], json!([]), "{r:?}");
-
-    // A list price that holds only off peak says so.
-    let off_peak = items
-        .iter()
-        .find(|e| {
-            e["key"]
-                .as_str()
-                .is_some_and(|k| k.starts_with("deepseek/"))
-        })
-        .expect("a DeepSeek entry in the catalogue");
-    let r = as_op(
-        &w.cp,
-        &w.admin,
-        "POST",
-        "/admin/pricing/sell",
-        Some(json!({
-            "model_id": model,
-            "tenant_id": w.tenant,
-            "effective_from": db_now(&w.cp).await,
-            "catalogue_key": off_peak["key"],
-        })),
-    )
-    .await;
-    assert_eq!(r.status, 201, "{r:?}");
-    let warnings = r.body["warnings"].as_array().expect("warnings");
-    assert_eq!(warnings.len(), 1, "{r:?}");
-    assert_eq!(warnings[0]["code"], "time_of_day_price", "{r:?}");
-    assert!(
-        warnings[0]["message"]
-            .as_str()
-            .is_some_and(|m| !m.is_empty()),
-        "{r:?}"
-    );
-    // Without a markup the list price is stored as it is.
-    assert_eq!(r.body["card"], off_peak["card"], "{r:?}");
-    assert_eq!(r.body["tenant_id"], json!(w.tenant));
-
-    // An alias names its entry, which the source records by its key.
-    let alias = off_peak["aliases"][0].as_str().expect("an alias");
-    let provider = off_peak["key"]
-        .as_str()
-        .and_then(|k| k.split_once('/'))
-        .map(|(p, _)| p)
-        .expect("a provider");
-    let r = as_op(
-        &w.cp,
-        &w.admin,
-        "POST",
-        "/admin/pricing/sell",
-        Some(json!({
-            "model_id": model,
-            "effective_from": db_now(&w.cp).await,
-            "catalogue_key": format!("{provider}/{alias}"),
-        })),
-    )
-    .await;
-    assert_eq!(r.status, 201, "{r:?}");
-    assert_eq!(
-        r.body["source"],
-        json!(format!(
-            "catalogue:{version}:{}@-",
-            off_peak["key"].as_str().unwrap_or_default()
-        ))
-    );
-}
-
-#[tokio::test]
 async fn a_bad_price_is_422_with_the_field_path() {
     let Some(w) = world().await else { return };
     let model = seed_model(&w.cp, &w.admin).await;
     let now = db_now(&w.cp).await;
     let audits = w.cp.count("audit_log").await;
     let version = pricing_version(&w.cp).await;
-    let sell = |body: Value| as_op(&w.cp, &w.admin, "POST", "/admin/pricing/sell", Some(body));
-
-    let no_default = json!({"priority": {"base": {"input": "1", "output": "2"}}});
-    assert_422_at(
-        &sell(json!({"model_id": model, "effective_from": now, "card": no_default})).await,
-        "/card",
-    );
-    assert_422_at(
-        &sell(json!({"model_id": model, "effective_from": now, "card": {"default": {"base": {"input": "one", "output": "2"}}}})).await,
-        "/card",
-    );
-    assert_422_at(
-        &sell(json!({"model_id": model, "effective_from": now, "card": card(), "catalogue_key": "openai/gpt-5.4"})).await,
-        "/card",
-    );
-    assert_422_at(
-        &sell(json!({"model_id": model, "effective_from": now})).await,
-        "/card",
-    );
-    assert_422_at(
-        &sell(json!({"model_id": model, "effective_from": now, "card": null})).await,
-        "/card",
-    );
-    assert_422_at(
-        &sell(json!({"model_id": model, "effective_from": now, "catalogue_key": "openai/no-such-model-7c1"})).await,
-        "/catalogue_key",
-    );
-    assert_422_at(
-        &sell(
-            json!({"model_id": model, "effective_from": now, "catalogue_key": "no-provider-7c1"}),
-        )
-        .await,
-        "/catalogue_key",
-    );
-    // A markup applies only to a catalogue import.
-    assert_422_at(
-        &sell(
-            json!({"model_id": model, "effective_from": now, "card": card(), "markup_bps": 2000}),
-        )
-        .await,
-        "/markup_bps",
-    );
-    assert_422_at(
-        &sell(json!({"model_id": model, "tenant_id": Uuid::new_v4(), "effective_from": now, "card": card()})).await,
-        "/tenant_id",
-    );
-    assert_422_at(
-        &sell(json!({"model_id": Uuid::new_v4(), "effective_from": now, "card": card()})).await,
-        "/model_id",
-    );
-    assert_422_at(
-        &sell(
-            json!({"model_id": model, "effective_from": now - TimeDelta::hours(1), "card": card()}),
-        )
-        .await,
-        "/effective_from",
-    );
-
-    let discount = |body: Value| {
+    let baseline = |body: Value| {
         as_op(
             &w.cp,
             &w.admin,
             "POST",
-            "/admin/pricing/discounts",
+            "/admin/pricing/baselines",
             Some(body),
         )
     };
-    for bps in [10_001, -1, 70_000] {
+    let card_value = || serde_json::to_value(card()).expect("the card serializes");
+    let noted = |model: Uuid, card: Value, extra: Value| {
+        let mut body = json!({"model_id": model, "effective_from": now, "card": card,
+                              "note": "the test's own card"});
+        for (k, v) in extra.as_object().expect("an object") {
+            body[k] = v.clone();
+        }
+        body
+    };
+
+    let no_default = json!({"priority": {"base": {"input": "1", "output": "2"}}});
+    assert_422_at(
+        &baseline(noted(model, no_default.clone(), json!({}))).await,
+        "/card",
+    );
+    assert_422_at(
+        &baseline(noted(
+            model,
+            json!({"default": {"base": {"input": "one", "output": "2"}}}),
+            json!({}),
+        ))
+        .await,
+        "/card",
+    );
+    // Both a card and a catalogue key, or neither.
+    assert_422_at(
+        &baseline(noted(
+            model,
+            card_value(),
+            json!({"catalogue_key": "openai/gpt-5.4"}),
+        ))
+        .await,
+        "/card",
+    );
+    assert_422_at(
+        &as_op(
+            &w.cp,
+            &w.admin,
+            "POST",
+            "/admin/pricing/baselines",
+            Some(json!({"model_id": model, "effective_from": now})),
+        )
+        .await,
+        "/card",
+    );
+    assert_422_at(
+        &baseline(noted(model, Value::Null, json!({}))).await,
+        "/card",
+    );
+    // A manual card needs a note, and a catalogue key refuses one.
+    assert_422_at(
+        &as_op(
+            &w.cp,
+            &w.admin,
+            "POST",
+            "/admin/pricing/baselines",
+            Some(json!({"model_id": model, "effective_from": now, "card": card()})),
+        )
+        .await,
+        "/note",
+    );
+    assert_422_at(
+        &baseline(json!({"model_id": model, "effective_from": now,
+                         "catalogue_key": "openai/gpt-5.4", "note": "x"}))
+        .await,
+        "/note",
+    );
+    assert_422_at(
+        &baseline(json!({"model_id": model, "effective_from": now,
+                         "catalogue_key": "openai/no-such-model-7c1"}))
+        .await,
+        "/catalogue_key",
+    );
+    assert_422_at(
+        &baseline(json!({"model_id": model, "effective_from": now,
+                         "catalogue_key": "no-provider-7c1"}))
+        .await,
+        "/catalogue_key",
+    );
+    assert_422_at(
+        &baseline(noted(
+            model,
+            card_value(),
+            json!({"effective_from": now - TimeDelta::hours(1)}),
+        ))
+        .await,
+        "/effective_from",
+    );
+    // A rate is 0 to 100 with at most four decimals, and a group's default
+    // row must carry one.
+    let group = support::world::group_id(&w.cp, support::world::SHARED_GROUP).await;
+    let rates_path = format!("/admin/provider-groups/{group}/rates");
+    let rate = |body: Value| as_op(&w.cp, &w.admin, "POST", &rates_path, Some(body));
+    for bad in ["-1", "100.0001", "1.00001", "abc"] {
         assert_422_at(
-            &discount(json!({"tenant_id": w.tenant, "effective_from": now, "discount_bps": bps}))
-                .await,
-            "/discount_bps",
+            &rate(json!({"model_id": null, "cny_per_usd": bad, "effective_from": now})).await,
+            "/cny_per_usd",
         );
     }
     assert_422_at(
-        &discount(json!({"tenant_id": Uuid::new_v4(), "effective_from": now, "discount_bps": 500}))
-            .await,
-        "/tenant_id",
+        &rate(json!({"model_id": null, "cny_per_usd": null, "effective_from": now})).await,
+        "/cny_per_usd",
     );
-    assert_422_at(
-        &discount(json!({"tenant_id": w.tenant, "effective_from": now - TimeDelta::hours(1), "discount_bps": 500})).await,
-        "/effective_from",
-    );
-
     let cost = |body: Value| as_op(&w.cp, &w.admin, "POST", "/admin/pricing/cost", Some(body));
     let upstream = |card: Value| json!({"upstream_provider": "openai", "upstream_model": "gpt-4o-mini", "effective_from": now, "card": card});
     assert_422_at(&cost(upstream(Value::Null)).await, "/card");
@@ -1626,7 +1493,7 @@ async fn a_bad_price_is_422_with_the_field_path() {
 
     // Nothing reached a table.
     for table in [
-        "pricing_sell_revisions",
+        "pricing_baselines",
         "pricing_cost_revisions",
         "pricing_discount_revisions",
     ] {
@@ -1636,151 +1503,8 @@ async fn a_bad_price_is_422_with_the_field_path() {
     assert_eq!(pricing_version(&w.cp).await, version);
 }
 
-/// `platform=true` lists the platform's own prices only: a tenant's override
-/// revisions, ended ones included, are left out and do not shorten a page.
-#[tokio::test]
-async fn the_platform_filter_leaves_tenant_overrides_out_of_the_sell_history() {
-    let Some(w) = world().await else { return };
-    let model = seed_model(&w.cp, &w.admin).await;
-    let card = |rate: &str| json!({"default": {"base": {"input": rate, "output": "2"}}});
-    let mut platform_ids = Vec::new();
-    for body in [
-        json!({"model_id": model, "effective_from": db_now(&w.cp).await, "card": card("1")}),
-        json!({"model_id": model, "tenant_id": w.tenant, "effective_from": db_now(&w.cp).await, "card": card("9")}),
-        json!({"model_id": model, "tenant_id": w.tenant, "effective_from": db_now(&w.cp).await, "card": null}),
-        json!({"model_id": model, "effective_from": db_now(&w.cp).await, "card": card("4")}),
-    ] {
-        let tenant = !body["tenant_id"].is_null();
-        let r = as_op(&w.cp, &w.admin, "POST", "/admin/pricing/sell", Some(body)).await;
-        assert_eq!(r.status, 201, "{r:?}");
-        if !tenant {
-            platform_ids.push(r.body["revision_id"].clone());
-        }
-    }
-    let list = |query: String| {
-        let w = &w;
-        async move {
-            let r = as_op(
-                &w.cp,
-                &w.admin,
-                "GET",
-                &format!("/admin/pricing/sell?{query}"),
-                None,
-            )
-            .await;
-            assert_eq!(r.status, 200, "{r:?}");
-            r.body
-        }
-    };
-    let all = list(format!("model_id={model}")).await;
-    assert_eq!(all["items"].as_array().map(Vec::len), Some(4));
-    let only = list(format!("model_id={model}&platform=true")).await;
-    let ids: Vec<Value> = only["items"]
-        .as_array()
-        .expect("items")
-        .iter()
-        .map(|i| i["revision_id"].clone())
-        .collect();
-    platform_ids.reverse();
-    assert_eq!(ids, platform_ids);
-    // Paging counts platform rows only: a page of one still has a next.
-    let page = list(format!("model_id={model}&platform=true&limit=1")).await;
-    assert_eq!(page["items"].as_array().map(Vec::len), Some(1));
-    assert_eq!(page["next_before"], page["items"][0]["revision_id"]);
-}
-
-#[tokio::test]
-async fn ending_an_override_restores_the_platform_price_and_discount() {
-    let Some(w) = world().await else { return };
-    let model = seed_model(&w.cp, &w.admin).await;
-    let wr = &w;
-    let post = move |path: &'static str, body: Value| async move {
-        let r = as_op(&wr.cp, &wr.admin, "POST", path, Some(body)).await;
-        assert_eq!(r.status, 201, "POST {path}: {r:?}");
-        r.body
-    };
-    let input = |rate: &str| json!({"default": {"base": {"input": rate, "output": "2"}}});
-    post(
-        "/admin/pricing/sell",
-        json!({"model_id": model, "effective_from": db_now(&w.cp).await, "card": input("1")}),
-    )
-    .await;
-    let discount = post(
-        "/admin/pricing/discounts",
-        json!({"tenant_id": w.tenant, "effective_from": db_now(&w.cp).await, "discount_bps": 5000}),
-    )
-    .await;
-    assert_eq!(discount["discount_bps"], 5000);
-    assert_eq!(discount["tenant_id"], json!(w.tenant));
-    let r#override = post(
-        "/admin/pricing/sell",
-        json!({"model_id": model, "tenant_id": w.tenant, "effective_from": db_now(&w.cp).await, "card": input("3")}),
-    )
-    .await;
-
-    let thousand_in = json!({"prompt_tokens": 1000});
-    let r = deliver(
-        &w.dp,
-        Uuid::new_v4(),
-        vec![usage(&w, "e-override", model, thousand_in.clone())],
-    )
-    .await;
-    assert_eq!(r.status, 200, "{r:?}");
-    let charged = charge_via_api(&w, "e-override").await;
-    // The override replaces the price, and is not discounted again.
-    assert_eq!(
-        (
-            charged["status"].clone(),
-            charged["charge_micro_usd"].clone(),
-            charged["tenant_override"].clone(),
-            charged["sell_revision_id"].clone(),
-        ),
-        (
-            json!("charged"),
-            json!(3000),
-            json!(true),
-            r#override["revision_id"].clone()
-        )
-    );
-
-    let ended = post(
-        "/admin/pricing/sell",
-        json!({"model_id": model, "tenant_id": w.tenant, "effective_from": db_now(&w.cp).await, "card": null}),
-    )
-    .await;
-    assert_eq!(ended["card"], Value::Null);
-    let r = deliver(
-        &w.dp,
-        Uuid::new_v4(),
-        vec![usage(&w, "e-platform", model, thousand_in)],
-    )
-    .await;
-    assert_eq!(r.status, 200, "{r:?}");
-    let charged = charge_via_api(&w, "e-platform").await;
-    // The platform's 1000 µ$, at the tenant's 50%.
-    assert_eq!(
-        (
-            charged["status"].clone(),
-            charged["charge_micro_usd"].clone(),
-            charged["tenant_override"].clone(),
-            charged["discount_bps"].clone(),
-            charged["discount_revision_id"].clone(),
-        ),
-        (
-            json!("charged"),
-            json!(500),
-            json!(false),
-            json!(5000),
-            discount["revision_id"].clone()
-        )
-    );
-    let audit = pricing_audit(&w.cp).await;
-    assert_eq!(
-        audit.last().map(|a| a.0.as_str()),
-        Some("pricing.sell.end_override")
-    );
-}
-
+/// An unreadable baseline is isolated to its model, and both it and the
+/// unpriced charges it leaves are what the status page exists to show.
 #[tokio::test]
 async fn unpriced_charges_and_invalid_revisions_are_shown_to_operators() {
     let Some(w) = world().await else { return };
@@ -1791,8 +1515,9 @@ async fn unpriced_charges_and_invalid_revisions_are_shown_to_operators() {
     );
     // No output rate: a card no engine can bill with.
     let bad: i64 = sqlx::query_scalar(
-        "INSERT INTO pricing_sell_revisions (engine_version, model_id, effective_from, card, source) \
-         VALUES ($1, $2, now(), '{\"default\":{\"base\":{\"input\":\"1\"}}}', 'manual') \
+        "INSERT INTO pricing_baselines \
+         (engine_version, model_id, effective_from, card, source_kind, source) \
+         VALUES ($1, $2, now(), '{\"default\":{\"base\":{\"input\":\"1\"}}}', 'manual', '{}') \
          RETURNING revision_id",
     )
     .bind(i64::from(ENGINE_VERSION))
@@ -1830,7 +1555,7 @@ async fn unpriced_charges_and_invalid_revisions_are_shown_to_operators() {
         (
             items[0]["event_id"].clone(),
             items[0]["error_code"].clone(),
-            items[0]["charge_micro_usd"].clone()
+            items[0]["charge_micro_cny"].clone()
         ),
         (json!("e-unpriced"), json!("missing_price"), Value::Null)
     );
@@ -1853,7 +1578,7 @@ async fn unpriced_charges_and_invalid_revisions_are_shown_to_operators() {
             invalid[0]["table"].clone(),
             invalid[0]["revision_id"].clone()
         ),
-        (json!("sell"), json!(bad))
+        (json!("baseline"), json!(bad))
     );
     assert!(
         invalid[0]["reason"].as_str().is_some_and(|m| !m.is_empty()),
@@ -1907,10 +1632,13 @@ async fn every_unpriced_code_is_counted_over_the_last_day() {
     )
     .await;
     assert_eq!((r.status, r.body.clone()), (200, counts(7, 0, 0)), "{r:?}");
-    sqlx::query("UPDATE pricing_charges SET priced_at = now() - interval '25 hours' WHERE event_id = 'e-old'")
-        .execute(w.cp.db().pool())
-        .await
-        .expect("age a charge");
+    sqlx::query(
+        "UPDATE pricing_charges_cny SET priced_at = now() - interval '25 hours' \
+         WHERE event_id = 'e-old'",
+    )
+    .execute(w.cp.db().pool())
+    .await
+    .expect("age a charge");
     let r = as_op(&w.cp, &w.admin, "GET", "/admin/pricing/status", None).await;
     assert_eq!(r.status, 200, "{r:?}");
     assert_eq!(
@@ -1972,7 +1700,7 @@ async fn charges_are_listed_by_event_key_tenant_and_status() {
 
     let (ids, next, items) = list("event_id=e1".to_string()).await;
     assert_eq!((ids, next), (vec!["e1".to_string()], Value::Null));
-    assert_eq!(items[0]["charge_micro_usd"], 680);
+    assert_eq!(items[0]["charge_micro_cny"], 680);
     assert_eq!(items[0]["api_key_id"], json!(w.key));
     assert_eq!(items[0]["user_id"], json!(w.member));
     assert_eq!(items[0]["requested_model_id"], json!(model));
@@ -2020,14 +1748,15 @@ async fn charges_are_listed_by_event_key_tenant_and_status() {
 #[tokio::test]
 async fn the_charge_status_filter_has_its_own_index() {
     let Some(w) = world().await else { return };
-    let defs: Vec<String> =
-        sqlx::query_scalar("SELECT indexdef FROM pg_indexes WHERE tablename = 'pricing_charges'")
-            .fetch_all(w.cp.db().pool())
-            .await
-            .expect("read the indexes");
+    let defs: Vec<String> = sqlx::query_scalar(
+        "SELECT indexdef FROM pg_indexes WHERE tablename = 'pricing_charges_cny'",
+    )
+    .fetch_all(w.cp.db().pool())
+    .await
+    .expect("read the indexes");
     assert!(
         defs.iter().any(|d| d.contains("(status, seq)")),
-        "no (status, seq) index on pricing_charges: {defs:?}"
+        "no (status, seq) index on pricing_charges_cny: {defs:?}"
     );
 }
 
@@ -2274,6 +2003,7 @@ async fn a_cost_price_that_can_never_apply_says_so() {
 
 /// A catalogue whose `openai/fixture-7c1` announces two price changes far
 /// ahead (input 1, then 3 from 2099-01-01, then 5 from 2099-06-01).
+#[allow(dead_code)]
 fn announcing_catalogue() -> Arc<Catalogue> {
     let entry = |extra: &str, input: &str| {
         format!(
@@ -2289,6 +2019,7 @@ fn announcing_catalogue() -> Arc<Catalogue> {
     Arc::new(Catalogue::from_json(&file).expect("the fixture catalogue loads"))
 }
 
+#[allow(dead_code)]
 fn instant(v: &Value) -> DateTime<Utc> {
     v.as_str()
         .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
@@ -2296,145 +2027,465 @@ fn instant(v: &Value) -> DateTime<Utc> {
         .unwrap_or_else(|| panic!("an RFC 3339 instant: {v}"))
 }
 
-/// An import writes the price in effect now, and each price change the
-/// catalogue announces as a further revision at its own date, marked up the
-/// same.
-#[tokio::test]
-async fn an_import_writes_each_announced_price_change_at_its_own_date() {
-    let Some(cp) = TestCp::start_with_catalogue(announcing_catalogue()).await else {
-        return;
-    };
-    let admin = cp.admin_login_seeded(OperatorRole::Operator).await;
-    let model = seed_model(&cp, &admin).await;
-    let now = db_now(&cp).await;
+/// The `shared` group's id.
+async fn shared_group(cp: &TestCp) -> Uuid {
+    support::world::group_id(cp, support::world::SHARED_GROUP).await
+}
+
+/// A new group named `name` (`cheap-<random>` unless given) whose default
+/// rate is `cny_per_usd`; its id.
+async fn new_group(cp: &TestCp, admin: &OperatorSession, name: &str, cny_per_usd: &str) -> Uuid {
     let r = cp
         .send(
             "POST",
-            "/admin/pricing/sell",
+            "/admin/provider-groups",
             Some(admin.cookie()),
-            Some(json!({
-                "model_id": model,
-                "effective_from": now,
-                "catalogue_key": "openai/fixture-7c1",
-                "markup_bps": 5000,
-            })),
+            Some(json!({"name": name, "display_name": name, "default_cny_per_usd": cny_per_usd})),
         )
         .await;
     assert_eq!(r.status, 201, "{r:?}");
-    let input = |rev: &Value| rev["card"]["default"]["base"]["input"].clone();
-    assert_eq!(instant(&r.body["effective_from"]), now);
-    assert_eq!(
-        r.body["source"],
-        "catalogue:2026-11-06:openai/fixture-7c1@-"
-    );
-    assert_eq!(input(&r.body), "1.5");
-    let later = r.body["later_revisions"]
-        .as_array()
-        .expect("later revisions");
-    let seen: Vec<(DateTime<Utc>, Value, Value, Value)> = later
-        .iter()
-        .map(|rev| {
-            (
-                instant(&rev["effective_from"]),
-                rev["source"].clone(),
-                input(rev),
-                rev["model_id"].clone(),
-            )
-        })
-        .collect();
-    let day = |s: &str| instant(&json!(s));
-    assert_eq!(
-        seen,
-        vec![
-            (
-                day("2099-01-01T00:00:00Z"),
-                json!("catalogue:2026-11-06:openai/fixture-7c1@2099-01-01"),
-                json!("4.5"),
-                json!(model),
-            ),
-            (
-                day("2099-06-01T00:00:00Z"),
-                json!("catalogue:2026-11-06:openai/fixture-7c1@2099-06-01"),
-                json!("7.5"),
-                json!(model),
-            ),
-        ],
-        "{r:?}"
-    );
-    // The changes the import itself wrote are not news to the operator.
-    assert_eq!(r.body["warnings"], json!([]), "{r:?}");
-    assert_eq!(cp.count("pricing_sell_revisions").await, 3);
-    let audit = pricing_audit(&cp).await;
-    assert_eq!(audit.len(), 3, "{audit:?}");
+    Uuid::parse_str(r.body["id"].as_str().expect("a group id")).expect("a uuid")
 }
 
-/// A price written now that a revision already scheduled for later will
-/// replace is still written, and the answer names the revision that takes
-/// over and when; a later revision of another tenant does not count.
+/// `shared`'s default rate of `cny_per_usd`, starting now.
+async fn set_shared_rate(cp: &TestCp, admin: &OperatorSession, cny_per_usd: &str) {
+    let now = db_now(cp).await;
+    let r = cp
+        .send(
+            "POST",
+            &format!("/admin/provider-groups/{}/rates", shared_group(cp).await),
+            Some(admin.cookie()),
+            Some(json!({"model_id": null, "cny_per_usd": cny_per_usd, "effective_from": now})),
+        )
+        .await;
+    assert_eq!(r.status, 201, "{r:?}");
+}
+
+/// A key of `tenant` naming the live group `group`.
+async fn key_in_group(cp: &TestCp, admin: &OperatorSession, tenant: Uuid, group: Uuid) -> String {
+    let name: String = sqlx::query_scalar("SELECT name FROM provider_groups WHERE id = $1")
+        .bind(group)
+        .fetch_one(cp.db().pool())
+        .await
+        .expect("the group's name");
+    // Assign the group to the tenant first: a customer key may name only a
+    // group its tenant is assigned.
+    let version: i64 = sqlx::query_scalar("SELECT version FROM tenants WHERE id = $1")
+        .bind(tenant)
+        .fetch_one(cp.db().pool())
+        .await
+        .expect("read the tenant");
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("an HTTP client");
+    let r = client
+        .patch(cp.url(&format!("/admin/tenants/{tenant}")))
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .header(reqwest::header::COOKIE, admin.cookie())
+        .header(reqwest::header::IF_MATCH, format!("\"{version}\""))
+        .json(&json!({"allowed_provider_groups": [name]}))
+        .send()
+        .await
+        .expect("send");
+    assert_eq!(
+        r.status().as_u16(),
+        200,
+        "assign the group: {:?}",
+        r.text().await
+    );
+    let r = cp
+        .send(
+            "POST",
+            &format!("/admin/tenants/{tenant}/keys"),
+            Some(admin.cookie()),
+            Some(json!({"label": "group-7c1", "group_id": group})),
+        )
+        .await;
+    assert_eq!(r.status, 201, "{r:?}");
+    r.body["key"]["id"].as_str().expect("a key id").to_string()
+}
+
+// ---- the group's rate prices the row ----
+
 #[tokio::test]
-async fn a_price_a_scheduled_revision_will_replace_says_so() {
+async fn a_row_is_charged_at_its_keys_group_rate() {
     let Some(w) = world().await else { return };
     let model = seed_model(&w.cp, &w.admin).await;
-    let wr = &w;
-    let post = move |body: Value| async move {
-        let r = as_op(&wr.cp, &wr.admin, "POST", "/admin/pricing/sell", Some(body)).await;
-        assert_eq!(r.status, 201, "{r:?}");
-        r.body
-    };
-    let now = db_now(&w.cp).await;
-    let scheduled = post(json!({
-        "model_id": model,
-        "effective_from": now + TimeDelta::days(1),
-        "card": card(),
-    }))
+    price(&w.cp, model).await;
+    // `shared` at 7.2 CNY per USD: 680 µ$ × 7.2 is 4 896 µ¥.
+    set_shared_rate(&w.cp, &w.admin, "7.2").await;
+    let r = deliver(
+        &w.dp,
+        Uuid::new_v4(),
+        vec![usage(&w, "e1", model, tokens_680())],
+    )
     .await;
-    assert_eq!(scheduled["warnings"], json!([]));
-    let tenant_scheduled = post(json!({
-        "model_id": model,
-        "tenant_id": w.tenant,
-        "effective_from": now + TimeDelta::days(2),
-        "card": card(),
-    }))
-    .await;
-
-    let written =
-        post(json!({"model_id": model, "effective_from": db_now(&w.cp).await, "card": card()}))
-            .await;
-    let warnings = written["warnings"].as_array().expect("warnings");
-    assert_eq!(warnings.len(), 1, "{written}");
+    assert_eq!((r.status, r.body.clone()), (200, counts(1, 0, 0)), "{r:?}");
     assert_eq!(
-        (
-            warnings[0]["code"].clone(),
-            warnings[0]["revision_id"].clone(),
-            warnings[0]["effective_from"].clone(),
-        ),
-        (
-            json!("superseded_later"),
-            scheduled["revision_id"].clone(),
-            scheduled["effective_from"].clone(),
-        )
+        charge_of(&w.cp, "e1").await,
+        Some(Charge::charged(&w, 4_896))
     );
-    assert!(
-        warnings[0]["message"]
-            .as_str()
-            .is_some_and(|m| !m.is_empty()),
-        "{written}"
-    );
-    assert_eq!(w.cp.count("pricing_sell_revisions").await, 3);
+    // And the ledger holds exactly that debit.
+    let entry: (String, i64) = sqlx::query_as(
+        "SELECT kind, amount_micro_cny FROM billing_ledger_cny WHERE tenant_id = $1",
+    )
+    .bind(w.tenant)
+    .fetch_one(w.cp.db().pool())
+    .await
+    .expect("the debit");
+    assert_eq!(entry, ("usage".to_string(), -4_896));
+}
 
-    // The tenant's own override, written now, meets only the tenant's.
-    let override_now = post(json!({
-        "model_id": model,
-        "tenant_id": w.tenant,
-        "effective_from": db_now(&w.cp).await,
-        "card": card(),
-    }))
+#[tokio::test]
+async fn two_keys_of_one_tenant_in_two_groups_pay_two_prices() {
+    let Some(w) = world().await else { return };
+    let model = seed_model(&w.cp, &w.admin).await;
+    // A baseline of `card()` and no rate yet: the rows below are charged only
+    // once each group has one.
+    let now = db_now(&w.cp).await;
+    insert_baseline(&w.cp, model, now, card())
+        .await
+        .expect("the baseline");
+    let cheap = new_group(
+        &w.cp,
+        &w.admin,
+        &format!("cheap-{}", Uuid::new_v4().simple()),
+        "1",
+    )
     .await;
-    let ids: Vec<Value> = override_now["warnings"]
-        .as_array()
-        .expect("warnings")
-        .iter()
-        .map(|x| x["revision_id"].clone())
-        .collect();
-    assert_eq!(ids, vec![tenant_scheduled["revision_id"].clone()]);
+    // The tenant is assigned both groups, and has a key in each.
+    let shared = shared_group(&w.cp).await;
+    let name: String = sqlx::query_scalar("SELECT name FROM provider_groups WHERE id = $1")
+        .bind(cheap)
+        .fetch_one(w.cp.db().pool())
+        .await
+        .expect("the cheap group's name");
+    let version: i64 = sqlx::query_scalar("SELECT version FROM tenants WHERE id = $1")
+        .bind(w.tenant)
+        .fetch_one(w.cp.db().pool())
+        .await
+        .expect("read the tenant");
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("an HTTP client");
+    let r = client
+        .patch(w.cp.url(&format!("/admin/tenants/{}", w.tenant)))
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .header(reqwest::header::COOKIE, w.admin.cookie())
+        .header(reqwest::header::IF_MATCH, format!("\"{version}\""))
+        .json(&json!({"allowed_provider_groups": [support::world::SHARED_GROUP, name]}))
+        .send()
+        .await
+        .expect("send");
+    assert_eq!(r.status().as_u16(), 200, "assign the groups");
+    let r =
+        w.cp.send(
+            "POST",
+            &format!("/admin/tenants/{}/keys", w.tenant),
+            Some(w.admin.cookie()),
+            Some(json!({"label": "cheap-7c1", "group_id": cheap, "member_id": w.member})),
+        )
+        .await;
+    assert_eq!(r.status, 201, "{r:?}");
+    let cheap_key = r.body["key"]["id"].as_str().expect("a key id").to_string();
+    // 7.2 on `shared`, 5.0 on `cheap`: one row of 680 µ$ is 4 896 and 3 400.
+    set_shared_rate(&w.cp, &w.admin, "7.2").await;
+    let r =
+        w.cp.send(
+            "POST",
+            &format!("/admin/provider-groups/{cheap}/rates"),
+            Some(w.admin.cookie()),
+            Some(json!({"model_id": null, "cny_per_usd": "5",
+                        "effective_from": db_now(&w.cp).await})),
+        )
+        .await;
+    assert_eq!(r.status, 201, "{r:?}");
+
+    let mut cheap_row = usage(&w, "e-cheap", model, tokens_680());
+    cheap_row["api_key_id"] = json!(cheap_key);
+    let r = deliver(
+        &w.dp,
+        Uuid::new_v4(),
+        vec![usage(&w, "e-shared", model, tokens_680()), cheap_row],
+    )
+    .await;
+    assert_eq!((r.status, r.body.clone()), (200, counts(2, 0, 0)), "{r:?}");
+    assert_eq!(
+        charge_of(&w.cp, "e-shared").await,
+        Some(Charge::charged(&w, 4_896))
+    );
+    let cheap_charge: Option<i64> = sqlx::query_scalar(
+        "SELECT charge_micro_cny FROM pricing_charges_cny WHERE event_id = 'e-cheap'",
+    )
+    .fetch_optional(w.cp.db().pool())
+    .await
+    .expect("read the charge");
+    assert_eq!(cheap_charge, Some(3_400));
+    let _ = shared;
+}
+
+#[tokio::test]
+async fn the_charge_records_its_group_rate_baseline_and_discount() {
+    let Some(w) = world().await else { return };
+    let model = seed_model(&w.cp, &w.admin).await;
+    let baseline = price(&w.cp, model).await;
+    let group = shared_group(&w.cp).await;
+    set_shared_rate(&w.cp, &w.admin, "7.2").await;
+    let discount: i64 = sqlx::query_scalar(
+        "INSERT INTO pricing_discount_revisions \
+         (engine_version, tenant_id, effective_from, discount_bps) VALUES ($1, $2, now(), 1000) \
+         RETURNING revision_id",
+    )
+    .bind(i64::from(ENGINE_VERSION))
+    .bind(w.tenant)
+    .fetch_one(w.cp.db().pool())
+    .await
+    .expect("write a discount");
+    let r = deliver(
+        &w.dp,
+        Uuid::new_v4(),
+        vec![usage(&w, "e1", model, tokens_680())],
+    )
+    .await;
+    assert_eq!(r.status, 200, "{r:?}");
+    // 680 µ$ × 7.2 × 0.9 = 4 406.4, rounded up once: 4 407 µ¥.
+    /// `charge`, `group`, `baseline`, `rate`, `cny_per_usd_e4`, the override
+    /// flag, `discount_bps`, `discount_revision` of one charge.
+    type Charged = (
+        Option<i64>,
+        Option<Uuid>,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+        bool,
+        i64,
+        Option<i64>,
+    );
+    let row: Charged = sqlx::query_as(
+        "SELECT charge_micro_cny, group_id, baseline_revision_id, rate_revision_id, \
+                cny_per_usd_e4, rate_is_model_override, discount_bps, discount_revision_id \
+         FROM pricing_charges_cny WHERE event_id = 'e1'",
+    )
+    .fetch_one(w.cp.db().pool())
+    .await
+    .expect("read the charge");
+    assert_eq!(row.0, Some(4_407));
+    assert_eq!(row.1, Some(group));
+    assert_eq!(row.2, Some(baseline.revision_id));
+    assert!(row.3.is_some(), "a rate revision: {row:?}");
+    assert_eq!(row.4, Some(72_000));
+    assert!(!row.5);
+    assert_eq!(row.6, 1_000);
+    assert_eq!(row.7, Some(discount));
+}
+
+#[tokio::test]
+async fn a_row_of_a_key_with_no_group_is_unpriced_no_group() {
+    let Some(w) = world().await else { return };
+    let model = seed_model(&w.cp, &w.admin).await;
+    price(&w.cp, model).await;
+    // A legacy key an older replica minted without a group.
+    sqlx::query("UPDATE tenant_keys SET group_id = NULL WHERE id = $1")
+        .bind(Uuid::parse_str(&w.key).expect("a key id"))
+        .execute(w.cp.db().pool())
+        .await
+        .expect("clear the key's group");
+    let r = deliver(
+        &w.dp,
+        Uuid::new_v4(),
+        vec![usage(&w, "e1", model, tokens_680())],
+    )
+    .await;
+    assert_eq!((r.status, r.body.clone()), (200, counts(1, 0, 0)), "{r:?}");
+    assert_eq!(
+        charge_of(&w.cp, "e1").await,
+        Some(Charge::unpriced(&w, "no_group"))
+    );
+    let filed: Option<Uuid> =
+        sqlx::query_scalar("SELECT group_id FROM pricing_charges_cny WHERE event_id = 'e1'")
+            .fetch_one(w.cp.db().pool())
+            .await
+            .expect("read the charge's group");
+    assert_eq!(filed, None);
+}
+
+#[tokio::test]
+async fn an_internal_keys_usage_is_charged_and_posted_like_a_customers() {
+    let Some(w) = world().await else { return };
+    let model = seed_model(&w.cp, &w.admin).await;
+    price(&w.cp, model).await;
+    set_shared_rate(&w.cp, &w.admin, "7.2").await;
+    // The platform's own tenant funds itself postpaid and is priced like any
+    // other: its metrics `platform_own` exemption went with owner decision 8.
+    let internal: Uuid = sqlx::query_scalar("SELECT id FROM tenants WHERE is_internal")
+        .fetch_one(w.cp.db().pool())
+        .await
+        .expect("the internal tenant");
+    let mode: String = sqlx::query_scalar("SELECT billing_mode FROM tenants WHERE id = $1")
+        .bind(internal)
+        .fetch_one(w.cp.db().pool())
+        .await
+        .expect("read its mode");
+    assert_eq!(mode, "postpaid");
+    let r =
+        w.cp.send(
+            "POST",
+            &format!("/admin/tenants/{internal}/keys"),
+            Some(w.admin.cookie()),
+            Some(json!({"label": "ops-7c1", "group_id": shared_group(&w.cp).await})),
+        )
+        .await;
+    assert_eq!(r.status, 201, "{r:?}");
+    let key = r.body["key"]["id"].as_str().expect("a key id").to_string();
+    let mut row = usage(&w, "e-internal", model, tokens_680());
+    row["team_id"] = json!(internal.to_string());
+    row["api_key_id"] = json!(key);
+    row["user_id"] = json!("");
+    let r = deliver(&w.dp, Uuid::new_v4(), vec![row]).await;
+    assert_eq!((r.status, r.body.clone()), (200, counts(1, 0, 0)), "{r:?}");
+    let charge: Option<i64> = sqlx::query_scalar(
+        "SELECT charge_micro_cny FROM pricing_charges_cny WHERE event_id = 'e-internal'",
+    )
+    .fetch_one(w.cp.db().pool())
+    .await
+    .expect("read the charge");
+    assert_eq!(charge, Some(4_896));
+    // Posted to its ledger in the same transaction, and no budgets document
+    // is written for it: marks skip the platform's own tenant.
+    let entry: (String, i64) = sqlx::query_as(
+        "SELECT kind, amount_micro_cny FROM billing_ledger_cny WHERE tenant_id = $1",
+    )
+    .bind(internal)
+    .fetch_one(w.cp.db().pool())
+    .await
+    .expect("the internal tenant's debit");
+    assert_eq!(entry, ("usage".to_string(), -4_896));
+    let budgets: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM gw_resources WHERE kind = 'budgets' AND managed_by = $1",
+    )
+    .bind(format!("tenant:{internal}"))
+    .fetch_one(w.cp.db().pool())
+    .await
+    .expect("count its documents");
+    assert_eq!(budgets, 0, "the internal tenant has no budgets document");
+}
+
+#[tokio::test]
+async fn a_free_group_and_a_full_discount_post_nothing_and_keep_their_batch() {
+    let Some(w) = world().await else { return };
+    let model = seed_model(&w.cp, &w.admin).await;
+    price(&w.cp, model).await;
+    // T0 in a group whose rate is 0, T1 on `shared` at 7.2 with a 100 %
+    // discount, T2 on `shared` at 7.2 paying.
+    let free = new_group(
+        &w.cp,
+        &w.admin,
+        &format!("free-{}", Uuid::new_v4().simple()),
+        "0",
+    )
+    .await;
+    set_shared_rate(&w.cp, &w.admin, "7.2").await;
+    let t0 = seed_tenant(&w.cp, &w.admin).await;
+    let t1 = seed_tenant(&w.cp, &w.admin).await;
+    let free_key = key_in_group(&w.cp, &w.admin, t0, free).await;
+    let t1_key = {
+        let name: String = sqlx::query_scalar("SELECT name FROM provider_groups WHERE id = $1")
+            .bind(shared_group(&w.cp).await)
+            .fetch_one(w.cp.db().pool())
+            .await
+            .expect("the group's name");
+        let version: i64 = sqlx::query_scalar("SELECT version FROM tenants WHERE id = $1")
+            .bind(t1)
+            .fetch_one(w.cp.db().pool())
+            .await
+            .expect("read the tenant");
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("an HTTP client");
+        let r = client
+            .patch(w.cp.url(&format!("/admin/tenants/{t1}")))
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .header(reqwest::header::COOKIE, w.admin.cookie())
+            .header(reqwest::header::IF_MATCH, format!("\"{version}\""))
+            .json(&json!({"allowed_provider_groups": [name]}))
+            .send()
+            .await
+            .expect("send");
+        assert_eq!(r.status().as_u16(), 200);
+        let r =
+            w.cp.send(
+                "POST",
+                &format!("/admin/tenants/{t1}/keys"),
+                Some(w.admin.cookie()),
+                Some(json!({"label": "t1-7c1", "group_id": shared_group(&w.cp).await})),
+            )
+            .await;
+        assert_eq!(r.status, 201, "{r:?}");
+        r.body["key"]["id"].as_str().expect("a key id").to_string()
+    };
+    sqlx::query(
+        "INSERT INTO pricing_discount_revisions \
+         (engine_version, tenant_id, effective_from, discount_bps) VALUES ($1, $2, now(), 10000)",
+    )
+    .bind(i64::from(ENGINE_VERSION))
+    .bind(t1)
+    .execute(w.cp.db().pool())
+    .await
+    .expect("write a full discount");
+
+    let mut free_row = usage(&w, "e-free", model, tokens_680());
+    free_row["team_id"] = json!(t0.to_string());
+    free_row["api_key_id"] = json!(free_key);
+    free_row["user_id"] = json!("");
+    let mut discounted = usage(&w, "e-discounted", model, tokens_680());
+    discounted["team_id"] = json!(t1.to_string());
+    discounted["api_key_id"] = json!(t1_key);
+    discounted["user_id"] = json!("");
+    let r = deliver(
+        &w.dp,
+        Uuid::new_v4(),
+        vec![
+            free_row,
+            discounted,
+            usage(&w, "e-paying", model, tokens_680()),
+        ],
+    )
+    .await;
+    // One batch: the free row and the discounted one charge 0 and post
+    // nothing, and the paying tenant's debit is still stored.
+    assert_eq!((r.status, r.body.clone()), (200, counts(3, 0, 0)), "{r:?}");
+    for (event, tenant) in [("e-free", t0), ("e-discounted", t1)] {
+        let charge: Option<i64> = sqlx::query_scalar(
+            "SELECT charge_micro_cny FROM pricing_charges_cny WHERE event_id = $1",
+        )
+        .bind(event)
+        .fetch_one(w.cp.db().pool())
+        .await
+        .expect("read the charge");
+        assert_eq!(charge, Some(0), "{event}");
+        let entries: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM billing_ledger_cny WHERE tenant_id = $1")
+                .bind(tenant)
+                .fetch_one(w.cp.db().pool())
+                .await
+                .expect("count its entries");
+        assert_eq!(entries, 0, "{event} posted an entry");
+    }
+    let paying: Option<i64> = sqlx::query_scalar(
+        "SELECT charge_micro_cny FROM pricing_charges_cny WHERE event_id = 'e-paying'",
+    )
+    .fetch_one(w.cp.db().pool())
+    .await
+    .expect("read the paying charge");
+    assert_eq!(paying, Some(4_896));
+    let entries: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM billing_ledger_cny WHERE tenant_id = $1")
+            .bind(w.tenant)
+            .fetch_one(w.cp.db().pool())
+            .await
+            .expect("count the paying tenant's entries");
+    assert_eq!(entries, 1);
 }

@@ -88,11 +88,11 @@ async fn ledger_of(
     let limit = q.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
     // One row more than the page, to tell whether another page follows.
     let mut rows: Vec<Row> = sqlx::query_as(
-        "SELECT l.seq, l.posted_at, l.kind, l.amount_micro_usd, l.balance_after_micro_usd, \
+        "SELECT l.seq, l.posted_at, l.kind, l.amount_micro_cny, l.balance_after_micro_cny, \
                 l.event_id, l.topup_id, l.repricing_run_id, \
                 c.requested_model_id, u.event->>'requested_model' \
-         FROM billing_ledger l \
-         LEFT JOIN pricing_charges c ON c.event_id = l.event_id \
+         FROM billing_ledger_cny l \
+         LEFT JOIN pricing_charges_cny c ON c.event_id = l.event_id \
          LEFT JOIN usage_events u ON u.event_id = l.event_id \
          WHERE l.tenant_id = $1 \
            AND ($2::timestamptz IS NULL OR l.posted_at >= $2) \
@@ -151,8 +151,8 @@ async fn ledger_of(
                     "seq": seq,
                     "posted_at": posted_at,
                     "kind": kind,
-                    "amount_micro_usd": amount,
-                    "balance_after_micro_usd": balance_after,
+                    "amount_micro_cny": amount,
+                    "balance_after_micro_cny": balance_after,
                     "event_id": event_id,
                     "model": model,
                     "topup_id": topup_id,
@@ -179,11 +179,11 @@ async fn summary_of(
     };
     let rows: Vec<(DateTime<Utc>, i64, i64, i64, i64)> = sqlx::query_as(
         "SELECT date_trunc($4, posted_at, 'UTC') AS period, \
-                COALESCE(SUM(amount_micro_usd) FILTER (WHERE kind = 'usage'), 0)::bigint, \
-                COALESCE(SUM(amount_micro_usd) FILTER (WHERE kind = 'topup'), 0)::bigint, \
-                COALESCE(SUM(amount_micro_usd) FILTER (WHERE kind = 'adjustment'), 0)::bigint, \
-                (SELECT b.balance_after_micro_usd FROM billing_ledger b WHERE b.seq = MAX(l.seq)) \
-         FROM billing_ledger l \
+                COALESCE(SUM(amount_micro_cny) FILTER (WHERE kind = 'usage'), 0)::bigint, \
+                COALESCE(SUM(amount_micro_cny) FILTER (WHERE kind = 'topup'), 0)::bigint, \
+                COALESCE(SUM(amount_micro_cny) FILTER (WHERE kind = 'adjustment'), 0)::bigint, \
+                (SELECT b.balance_after_micro_cny FROM billing_ledger_cny b WHERE b.seq = MAX(l.seq)) \
+         FROM billing_ledger_cny l \
          WHERE l.tenant_id = $1 AND l.posted_at >= $2 AND l.posted_at < $3 \
          GROUP BY period ORDER BY period",
     )
@@ -199,10 +199,10 @@ async fn summary_of(
         .map(|(period, usage, topups, adjustments, closing)| {
             json!({
                 "period_start": period,
-                "usage_micro_usd": usage,
-                "topups_micro_usd": topups,
-                "adjustments_micro_usd": adjustments,
-                "closing_balance_micro_usd": closing,
+                "usage_micro_cny": usage,
+                "topups_micro_cny": topups,
+                "adjustments_micro_cny": adjustments,
+                "closing_balance_micro_cny": closing,
             })
         })
         .collect();

@@ -51,8 +51,8 @@ fn debit(amount: i64, balance_after: i64, event_id: &str) -> Entry {
 /// `tenant`'s ledger entries, in posting order.
 async fn entries(cp: &TestCp, tenant: Uuid) -> Vec<Entry> {
     sqlx::query_as(
-        "SELECT kind, amount_micro_usd AS amount, balance_after_micro_usd AS balance_after, \
-         event_id FROM billing_ledger WHERE tenant_id = $1 ORDER BY seq",
+        "SELECT kind, amount_micro_cny AS amount, balance_after_micro_cny AS balance_after, \
+         event_id FROM billing_ledger_cny WHERE tenant_id = $1 ORDER BY seq",
     )
     .bind(tenant)
     .fetch_all(cp.db().pool())
@@ -62,7 +62,7 @@ async fn entries(cp: &TestCp, tenant: Uuid) -> Vec<Entry> {
 
 /// `tenant`'s account balance; `None` when it has no account.
 async fn balance(cp: &TestCp, tenant: Uuid) -> Option<i64> {
-    sqlx::query_scalar("SELECT balance_micro_usd FROM billing_accounts WHERE tenant_id = $1")
+    sqlx::query_scalar("SELECT balance_micro_cny FROM billing_accounts WHERE tenant_id = $1")
         .bind(tenant)
         .fetch_optional(cp.db().pool())
         .await
@@ -98,7 +98,7 @@ fn usage_of(w: &World, o: &Other, event_id: &str, model: Uuid, fields: Value) ->
 
 /// `(status, charge)` of `event_id`'s charge.
 async fn charge_of(cp: &TestCp, event_id: &str) -> Option<(String, Option<i64>)> {
-    sqlx::query_as("SELECT status, charge_micro_usd FROM pricing_charges WHERE event_id = $1")
+    sqlx::query_as("SELECT status, charge_micro_cny FROM pricing_charges_cny WHERE event_id = $1")
         .bind(event_id)
         .fetch_optional(cp.db().pool())
         .await
@@ -146,8 +146,8 @@ async fn rows_that_are_not_charged_post_nothing() {
     )
     .await;
     assert_eq!(r.status, 200, "{r:?}");
-    assert_eq!(w.cp.count("pricing_charges").await, 3);
-    assert_eq!(w.cp.count("billing_ledger").await, 0);
+    assert_eq!(w.cp.count("pricing_charges_cny").await, 3);
+    assert_eq!(w.cp.count("billing_ledger_cny").await, 0);
     assert_eq!(balance(&w.cp, w.tenant).await, Some(0));
 }
 
@@ -186,7 +186,7 @@ async fn a_zero_charge_row_posts_nothing_and_does_not_fail_its_batch() {
         charge_of(&w.cp, "paid").await,
         Some(("charged".to_string(), Some(680)))
     );
-    assert_eq!(w.cp.count("billing_ledger").await, 1);
+    assert_eq!(w.cp.count("billing_ledger_cny").await, 1);
     assert_eq!(
         entries(&w.cp, w.tenant).await,
         vec![debit(-680, -680, "paid")]
@@ -432,7 +432,7 @@ async fn a_topup_request_never_waits_on_intakes_account_lock() {
             "POST",
             "/api/billing/topups",
             Some(owner.cookie()),
-            Some(json!({"amount_usd": "5"})),
+            Some(json!({"amount_cny": "5"})),
         ),
     )
     .await
@@ -474,8 +474,8 @@ async fn the_ledger_refuses_update_and_delete() {
     .await;
     assert_eq!(r.status, 200, "{r:?}");
     for statement in [
-        "UPDATE billing_ledger SET amount_micro_usd = -1",
-        "DELETE FROM billing_ledger",
+        "UPDATE billing_ledger_cny SET amount_micro_cny = -1",
+        "DELETE FROM billing_ledger_cny",
     ] {
         let e = sqlx::query(statement)
             .execute(w.cp.db().pool())
@@ -502,7 +502,7 @@ async fn the_ledger_refuses_truncate() {
     .await;
     assert_eq!(r.status, 200, "{r:?}");
     for statement in [
-        "TRUNCATE billing_ledger",
+        "TRUNCATE billing_ledger_cny",
         "TRUNCATE billing_accounts CASCADE",
     ] {
         let e = sqlx::query(statement)
@@ -646,7 +646,7 @@ async fn only_the_billing_lock_holds_the_account() {
         .await
         .expect("lock the tenant for billing");
     assert_eq!((tenant.id, account.tenant_id), (w.tenant, w.tenant));
-    assert_eq!(account.balance_micro_usd, 0);
+    assert_eq!(account.balance_micro_cny, 0);
     let e = sqlx::query(grab)
         .bind(w.tenant)
         .fetch_one(&mut other)
@@ -674,7 +674,7 @@ async fn a_billing_lock_opens_a_missing_account_under_its_own_tenant_lock() {
     let (_, account) = tenants::lock_billing(&mut tx, w.tenant)
         .await
         .expect("its own tenant lock does not refuse the account insert");
-    assert_eq!(account.balance_micro_usd, 0);
+    assert_eq!(account.balance_micro_cny, 0);
     tx.commit().await.expect("commit");
     assert_eq!(balance(&w.cp, w.tenant).await, Some(0));
 }

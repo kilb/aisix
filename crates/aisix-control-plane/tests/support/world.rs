@@ -1,14 +1,20 @@
 //! A priced world for the pricing and billing tests: an operator, a gateway,
 //! a tenant with one member and that member's key, models on provider keys
-//! of their own, platform prices, and usage rows delivered over
+//! of their own, baselines and a group rate, and usage rows delivered over
 //! `POST /dp/telemetry` exactly as a gateway sends them.
+//!
+//! Every seeded tenant is assigned the `shared` group and every seeded key
+//! names it, so a row is charged at `shared`'s rate. That rate is `1` here,
+//! one CNY per USD, which makes a charge in µ¥ numerically the baseline's in
+//! µ$: the amounts the billing tests were written with hold unchanged.
 
 use aisix_control_plane::audit::Actor;
 use aisix_control_plane::auth::{MemberRole, OperatorRole};
 use aisix_control_plane::db::Db;
 use aisix_control_plane::error::ApiError;
-use aisix_control_plane::pricing::store::{self, NewSellPrice, SellRevision};
-use aisix_pricing::{RateCard, ENGINE_VERSION};
+use aisix_control_plane::pricing::baselines::{self, BaselineSource, NewBaseline};
+use aisix_control_plane::pricing::rates::{self, NewGroupRate};
+use aisix_pricing::{CnyPerUsd, RateCard, ENGINE_VERSION};
 use chrono::{DateTime, Utc};
 use futures::FutureExt;
 use serde_json::{json, Value};
@@ -85,6 +91,9 @@ pub async fn seed_model(cp: &TestCp, admin: &OperatorSession) -> Uuid {
     Uuid::parse_str(&text(&model, "/id")).expect("a model id")
 }
 
+/// A tenant of group `shared`. The first-boot tenant defaults name that group
+/// (`settings::TenantDefaults::first_boot`), so the create needs no group list;
+/// the assignment is checked rather than assumed.
 pub async fn seed_tenant(cp: &TestCp, admin: &OperatorSession) -> Uuid {
     let tenant = create(
         cp,
@@ -93,7 +102,13 @@ pub async fn seed_tenant(cp: &TestCp, admin: &OperatorSession) -> Uuid {
         json!({"name": format!("tenant-{}", Uuid::new_v4().simple())}),
     )
     .await;
-    Uuid::parse_str(&text(&tenant, "/id")).expect("a tenant id")
+    let id = Uuid::parse_str(&text(&tenant, "/id")).expect("a tenant id");
+    assert_eq!(
+        tenant["allowed_provider_groups"],
+        json!([SHARED_GROUP]),
+        "a seeded tenant is assigned {SHARED_GROUP}"
+    );
+    id
 }
 
 /// The group a seeded tenant is assigned by the first-boot defaults
@@ -167,39 +182,83 @@ pub async fn world() -> Option<World> {
     })
 }
 
-pub async fn insert_sell(
+/// The rate `shared` charges from `effective_from`: `1`, one CNY per USD.
+pub const SHARED_RATE: &str = "1";
+
+/// A baseline revision of `card` for `model_id` starting at
+/// `effective_from`, written by the control plane's own path.
+pub async fn insert_baseline(
     cp: &TestCp,
     model_id: Uuid,
-    tenant_id: Option<Uuid>,
     effective_from: DateTime<Utc>,
-    card: Option<RateCard>,
-) -> Result<SellRevision, ApiError> {
-    let row = NewSellPrice {
+    card: RateCard,
+) -> Result<baselines::BaselineRevision, ApiError> {
+    let row = NewBaseline {
         model_id,
-        tenant_id,
         effective_from,
         card,
-        source: "manual".to_string(),
+        source: BaselineSource::Manual {
+            note: "the test world's baseline".to_string(),
+        },
     };
     cp.db()
-        .tx(move |c| async move { store::insert_sell_price(c, &row, Actor::System).await }.boxed())
+        .tx(move |c| {
+            async move {
+                baselines::insert_baseline(c, &row, Actor::System)
+                    .await
+                    .map(|(revision, _)| revision)
+            }
+            .boxed()
+        })
         .await
 }
 
-/// The platform price `card()` for `model`, starting now.
-pub async fn price(cp: &TestCp, model: Uuid) -> SellRevision {
+/// `shared`'s default rate of [`SHARED_RATE`], starting at `effective_from`.
+pub async fn insert_rate(
+    cp: &TestCp,
+    group: Uuid,
+    effective_from: DateTime<Utc>,
+) -> Result<rates::GroupRateRevision, ApiError> {
+    let row = NewGroupRate {
+        group_id: group,
+        model_id: None,
+        effective_from,
+        cny_per_usd: Some(CnyPerUsd::parse(SHARED_RATE).expect("a valid rate")),
+        note: "the test world's rate".to_string(),
+    };
+    cp.db()
+        .tx(move |c| {
+            async move {
+                rates::insert_group_rate(c, &row, Actor::System)
+                    .await
+                    .map(|(revision, _)| revision)
+            }
+            .boxed()
+        })
+        .await
+}
+
+/// The baseline `card()` for `model` and `shared`'s rate of `1`, starting
+/// now: one call of 1000 prompt tokens (800 cache hits) and 200 completion
+/// tokens is 680 µ¥.
+pub async fn price(cp: &TestCp, model: Uuid) -> baselines::BaselineRevision {
     let now = db_now(cp).await;
-    insert_sell(cp, model, None, now, Some(card()))
+    let group = group_id(cp, SHARED_GROUP).await;
+    // The rate first: a group with none leaves every row it prices unpriced,
+    // and the baseline is the part a test may replace.
+    insert_rate(cp, group, now).await.expect("rate the group");
+    insert_baseline(cp, model, now, card())
         .await
         .expect("price the model")
 }
 
-/// A platform sell revision of `card` for `model_id` starting at
+/// A baseline revision of `card` for `model_id` starting at
 /// `effective_from`, past or not, written by raw SQL with the
 /// `pricing_version` bump a price write makes, in one transaction: for rows
-/// dated in the past, which `insert_sell_price` cannot price (it refuses a
-/// backdate).
-pub async fn insert_sell_backdated(
+/// dated in the past, which `insert_baseline` cannot write (it refuses a
+/// backdate). `shared`'s rate of `1` is written at the start of time beside
+/// it, so a row occurring anywhere is priced at rate 1.
+pub async fn insert_baseline_backdated(
     db: &Db,
     model_id: Uuid,
     card: Value,
@@ -207,8 +266,9 @@ pub async fn insert_sell_backdated(
 ) {
     let mut tx = db.pool().begin().await.expect("begin");
     sqlx::query(
-        "INSERT INTO pricing_sell_revisions (engine_version, model_id, effective_from, card, source) \
-         VALUES ($1, $2, $3, $4, 'manual')",
+        "INSERT INTO pricing_baselines \
+         (engine_version, model_id, effective_from, card, source_kind, source) \
+         VALUES ($1, $2, $3, $4, 'manual', '{\"note\": \"backdated\"}')",
     )
     .bind(i64::from(ENGINE_VERSION))
     .bind(model_id)
@@ -217,6 +277,20 @@ pub async fn insert_sell_backdated(
     .execute(&mut *tx)
     .await
     .expect("write a backdated revision");
+    sqlx::query(
+        "INSERT INTO pricing_group_rates \
+         (engine_version, group_id, model_id, effective_from, cny_per_usd_e4, note) \
+         SELECT $1, id, NULL, '2000-01-01T00:00:00Z', $2, 'the test world''s rate' \
+         FROM provider_groups WHERE name = $3",
+    )
+    .bind(i64::from(ENGINE_VERSION))
+    .bind(i64::from(
+        CnyPerUsd::parse(SHARED_RATE).expect("a valid rate").0,
+    ))
+    .bind(SHARED_GROUP)
+    .execute(&mut *tx)
+    .await
+    .expect("rate the group from the start of time");
     sqlx::query(
         "UPDATE cp_settings SET value = to_jsonb((value::text)::bigint + 1), updated_at = now() \
          WHERE key = 'pricing_version'",
@@ -263,7 +337,10 @@ pub async fn deliver(dp: &DpClient, batch_id: Uuid, events: Vec<Value>) -> Resp 
 
 /// `count` usage rows of key `key` of `tenant` for `model`, written by raw
 /// SQL with an `unpriced` (`missing_price`) charge each, as intake stores a
-/// row on a model without a price: event ids `<prefix>-1` to
+/// row on a model without a price. The charge records the `shared` group a
+/// re-pricing run prices it at (R11): a row with no group can never be
+/// charged, and the key named is one the test made up rather than a real
+/// key. Rows are: event ids `<prefix>-1` to
 /// `<prefix>-<count>`, occurring `from` plus 1 ms, 2 ms and so on, each of
 /// 1000 prompt tokens (800 cache hits) and 200 completion tokens, which is
 /// 680 µ$ at `card()`. For volumes the gateway path would take minutes to
@@ -301,11 +378,12 @@ pub async fn insert_unpriced_charges(
     .await
     .expect("insert the usage rows");
     sqlx::query(
-        "INSERT INTO pricing_charges \
+        "INSERT INTO pricing_charges_cny \
          (event_id, tenant_id, api_key_id, user_id, requested_model_id, occurred_at, status, \
-          error_code, engine_version) \
+          error_code, engine_version, group_id) \
          SELECT event_id, team_id, api_key_id, '', $3::text, occurred_at, 'unpriced', \
-                'missing_price', $4 \
+                'missing_price', $4, \
+                (SELECT id FROM provider_groups WHERE name = 'shared') \
          FROM usage_events WHERE event_id LIKE $1 || '-%' AND team_id = $2::text",
     )
     .bind(prefix)

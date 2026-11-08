@@ -92,7 +92,7 @@ pub fn tenant_fixture(method: &str, path: &str) -> (String, Option<Value>) {
         ),
         ("GET", "/api/billing/topups") => (path.to_string(), None),
         // An amount of 0 is refused after the identity checks.
-        ("POST", "/api/billing/topups") => (path.to_string(), Some(json!({"amount_usd": "0"}))),
+        ("POST", "/api/billing/topups") => (path.to_string(), Some(json!({"amount_cny": "0"}))),
         ("GET", "/api/billing/topups/{id}") => {
             (format!("/api/billing/topups/{}", Uuid::new_v4()), None)
         }

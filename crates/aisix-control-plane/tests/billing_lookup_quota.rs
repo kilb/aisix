@@ -43,7 +43,7 @@ async fn setup() -> Option<Quota> {
             "PATCH",
             &format!("/admin/tenants/{tenant}/billing"),
             Some(admin.cookie()),
-            Some(json!({"credit_limit_usd": "1.00"})),
+            Some(json!({"credit_limit_cny": "1.00"})),
         )
         .await;
     assert_eq!(r.status, 200, "{r:?}");
@@ -96,7 +96,7 @@ async fn setup() -> Option<Quota> {
         })
         .await
         .expect("count the charges");
-    sqlx::query("UPDATE billing_accounts SET balance_micro_usd = -30000 WHERE tenant_id = $1")
+    sqlx::query("UPDATE billing_accounts SET balance_micro_cny = -30000 WHERE tenant_id = $1")
         .bind(tenant)
         .execute(cp.db().pool())
         .await
@@ -142,9 +142,9 @@ async fn a_key_quota_reports_every_level_and_the_smallest_remaining() {
     let Some(q) = setup().await else { return };
     let r = portal(&q, &q.owner, q.key).await;
     assert_eq!(r.status, 200, "{r:?}");
-    assert_eq!(r.body["org"]["available_micro_usd"], json!(970_000));
-    assert_eq!(r.body["org"]["balance_micro_usd"], json!(-30_000));
-    assert_eq!(r.body["org"]["credit_limit_micro_usd"], json!(1_000_000));
+    assert_eq!(r.body["org"]["available_micro_cny"], json!(970_000));
+    assert_eq!(r.body["org"]["balance_micro_cny"], json!(-30_000));
+    assert_eq!(r.body["org"]["credit_limit_micro_cny"], json!(1_000_000));
     let remaining = |scope: &str| {
         r.body["quotas"]
             .as_array()

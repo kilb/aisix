@@ -203,7 +203,7 @@ fn fixture(method: &str, path: &str, target: &SeededOperator) -> (String, Option
         ("GET", "/admin/billing/accounts") => (path.to_string(), None),
         ("GET" | "PATCH", "/admin/tenants/{id}/billing") => (
             format!("/admin/tenants/{}/billing", Uuid::nil()),
-            (method == "PATCH").then(|| json!({"credit_limit_usd": "1.00"})),
+            (method == "PATCH").then(|| json!({"credit_limit_cny": "1.00"})),
         ),
         // The ledger and its totals. The tenant matches nothing: 404 once
         // the role check passed.
@@ -242,7 +242,7 @@ fn fixture(method: &str, path: &str, target: &SeededOperator) -> (String, Option
         // check passed, so nothing is credited.
         ("POST", "/admin/tenants/{id}/credits") => (
             format!("/admin/tenants/{}/credits", Uuid::nil()),
-            Some(json!({"amount_usd": "0.05", "reason": "roles"})),
+            Some(json!({"amount_cny": "0.05", "reason": "roles"})),
         ),
         // Organization quotas. The tenant matches nothing: 404 once the role
         // check passed, so no quota is written.

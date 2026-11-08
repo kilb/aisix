@@ -32,7 +32,7 @@ use chrono::{DateTime, TimeDelta, TimeZone, Utc};
 use futures::FutureExt;
 use serde_json::{json, Value};
 use support::world::{
-    db_now, deliver, insert_sell, insert_unpriced_charges, price, seed_key, seed_model,
+    db_now, deliver, insert_baseline, insert_unpriced_charges, price, seed_key, seed_model,
     seed_tenant, tokens_680, usage, world, World,
 };
 use support::{OperatorSession, Resp, TestCp};
@@ -68,7 +68,7 @@ fn card(input: &str, output: &str, cache_read: &str) -> RateCard {
 /// A new platform price for `model`, starting now.
 async fn reprice_model(cp: &TestCp, model: Uuid, card: RateCard) {
     let now = db_now(cp).await;
-    insert_sell(cp, model, None, now, Some(card))
+    insert_baseline(cp, model, now, card)
         .await
         .expect("a new price");
 }
@@ -116,7 +116,7 @@ async fn apply(cp: &TestCp, by: &OperatorSession, id: &str) -> Resp {
 }
 
 async fn balance(db: &Db, tenant: Uuid) -> i64 {
-    sqlx::query_scalar("SELECT balance_micro_usd FROM billing_accounts WHERE tenant_id = $1")
+    sqlx::query_scalar("SELECT balance_micro_cny FROM billing_accounts WHERE tenant_id = $1")
         .bind(tenant)
         .fetch_one(db.pool())
         .await
@@ -126,8 +126,8 @@ async fn balance(db: &Db, tenant: Uuid) -> i64 {
 /// Tenant `tenant`'s ledger: `(kind, amount, balance after, run)`, in order.
 async fn entries(db: &Db, tenant: Uuid) -> Vec<(String, i64, i64, Option<Uuid>)> {
     sqlx::query_as(
-        "SELECT kind, amount_micro_usd, balance_after_micro_usd, repricing_run_id \
-         FROM billing_ledger WHERE tenant_id = $1 ORDER BY seq",
+        "SELECT kind, amount_micro_cny, balance_after_micro_cny, repricing_run_id \
+         FROM billing_ledger_cny WHERE tenant_id = $1 ORDER BY seq",
     )
     .bind(tenant)
     .fetch_all(db.pool())
@@ -138,7 +138,7 @@ async fn entries(db: &Db, tenant: Uuid) -> Vec<(String, i64, i64, Option<Uuid>)>
 /// Every adjustment: `(run, event, delta)`, by event.
 async fn adjustments(db: &Db) -> Vec<(Uuid, String, i64)> {
     sqlx::query_as(
-        "SELECT run_id, event_id, delta_micro_usd FROM pricing_adjustments \
+        "SELECT run_id, event_id, delta_micro_cny FROM pricing_adjustments_cny \
          ORDER BY event_id, created_at",
     )
     .fetch_all(db.pool())
@@ -148,11 +148,13 @@ async fn adjustments(db: &Db) -> Vec<(Uuid, String, i64)> {
 
 /// A charge's `(status, error_code, tenant_id)`.
 async fn charge(db: &Db, event_id: &str) -> (String, Option<String>, String) {
-    sqlx::query_as("SELECT status, error_code, tenant_id FROM pricing_charges WHERE event_id = $1")
-        .bind(event_id)
-        .fetch_one(db.pool())
-        .await
-        .expect("read the charge")
+    sqlx::query_as(
+        "SELECT status, error_code, tenant_id FROM pricing_charges_cny WHERE event_id = $1",
+    )
+    .bind(event_id)
+    .fetch_one(db.pool())
+    .await
+    .expect("read the charge")
 }
 
 async fn send(w: &World, events: Vec<Value>) {
@@ -219,12 +221,12 @@ async fn unpriced_rows_are_charged_by_a_run_at_the_current_price() {
     assert_eq!(run["changed"], 3);
     assert_eq!(run["still_unpriced"], 0);
     assert_eq!(run["skipped_unattributed"], 0);
-    assert_eq!(run["delta_micro_usd"], 2_040);
+    assert_eq!(run["delta_micro_cny"], 2_040);
     assert_eq!(run["by_tenant"].as_array().expect("by tenant").len(), 1);
     assert_eq!(uuid(&run["by_tenant"][0]["tenant_id"]), r.w.tenant);
     assert_eq!(run["by_tenant"][0]["events"], 3);
     assert_eq!(run["by_tenant"][0]["changed"], 3);
-    assert_eq!(run["by_tenant"][0]["delta_micro_usd"], 2_040);
+    assert_eq!(run["by_tenant"][0]["delta_micro_cny"], 2_040);
     assert_eq!(run["filter"]["model_id"], r.model.to_string());
     assert_eq!(run["created_by"]["email"], r.w.admin.email);
     assert!(run["applied_at"].is_null());
@@ -280,7 +282,7 @@ async fn a_preview_changes_nothing() {
         .await;
     assert_eq!(r2.status, 200, "{r2:?}");
     assert_eq!(r2.body["status"], "previewed");
-    assert_eq!(r2.body["delta_micro_usd"], 2_040);
+    assert_eq!(r2.body["delta_micro_cny"], 2_040);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -366,7 +368,7 @@ async fn an_apply_racing_intake_keeps_the_running_balance_exact() {
         &mut intake,
         &[Posting {
             tenant_id: r.w.tenant,
-            amount_micro_usd: -500,
+            amount_micro_cny: -500,
             source: Source::Usage {
                 event_id: "rc-debit-1",
             },
@@ -509,7 +511,7 @@ async fn a_tenant_mismatch_row_is_never_charged_by_a_run() {
     assert_eq!(run["events"], 1);
     assert_eq!(run["skipped_unattributed"], 1);
     assert_eq!(run["changed"], 0);
-    assert_eq!(run["delta_micro_usd"], 0);
+    assert_eq!(run["delta_micro_cny"], 0);
     let applied = apply(cp, &r.admin, &id).await;
     assert_eq!(applied.status, 200, "{applied:?}");
     assert!(adjustments(db).await.is_empty());
@@ -556,7 +558,7 @@ async fn a_run_prices_at_the_charges_own_tenant_plan() {
     let (from, to) = last_hour(cp).await;
     let (id, run) = previewed(cp, &r.w.admin, run_body(from, to, json!({}))).await;
     // 680 µ$ with B's 20 % off.
-    assert_eq!(run["delta_micro_usd"], 544);
+    assert_eq!(run["delta_micro_cny"], 544);
     assert_eq!(uuid(&run["by_tenant"][0]["tenant_id"]), b);
     let applied = apply(cp, &r.admin, &id).await;
     assert_eq!(applied.status, 200, "{applied:?}");
@@ -575,7 +577,7 @@ async fn a_lower_price_credits_the_difference() {
     let (from, to) = last_hour(cp).await;
     let (id, run) = previewed(cp, &r.w.admin, run_body(from, to, json!({}))).await;
     assert_eq!(run["changed"], 3);
-    assert_eq!(run["delta_micro_usd"], -1_020);
+    assert_eq!(run["delta_micro_cny"], -1_020);
     let applied = apply(cp, &r.admin, &id).await;
     assert_eq!(applied.status, 200, "{applied:?}");
     let run_id = Uuid::parse_str(&id).expect("a uuid");
@@ -657,7 +659,7 @@ async fn a_run_moves_a_cumulative_quota_and_not_a_periodic_one() {
     reprice_model(cp, r.model, card("2", "4", "0.2")).await;
     let (from, to) = last_hour(cp).await;
     let (id, run) = previewed(cp, &r.w.admin, run_body(from, to, json!({}))).await;
-    assert_eq!(run["delta_micro_usd"], 2_040);
+    assert_eq!(run["delta_micro_cny"], 2_040);
     let applied = apply(cp, &r.admin, &id).await;
     assert_eq!(applied.status, 200, "{applied:?}");
     assert_eq!(spent(cp, r.w.tenant, cumulative.id).await, 4_080);
@@ -713,12 +715,12 @@ async fn a_second_run_starts_from_the_adjusted_charge() {
     reprice_model(cp, r.model, card("2", "4", "0.2")).await;
     let (from, to) = last_hour(cp).await;
     let (id, run) = previewed(cp, &r.w.admin, run_body(from, to, json!({}))).await;
-    assert_eq!(run["delta_micro_usd"], 680);
+    assert_eq!(run["delta_micro_cny"], 680);
     assert_eq!(apply(cp, &r.admin, &id).await.status, 200);
     // Run 2 at three times: 2040 − (680 + 680).
     reprice_model(cp, r.model, card("3", "6", "0.3")).await;
     let (id, run) = previewed(cp, &r.w.admin, run_body(from, to, json!({}))).await;
-    assert_eq!(run["delta_micro_usd"], 680);
+    assert_eq!(run["delta_micro_cny"], 680);
     assert_eq!(apply(cp, &r.admin, &id).await.status, 200);
     assert_eq!(
         adjustments(db)
@@ -732,7 +734,7 @@ async fn a_second_run_starts_from_the_adjusted_charge() {
     // Run 3 at the same price changes nothing.
     let (_, run) = previewed(cp, &r.w.admin, run_body(from, to, json!({}))).await;
     assert_eq!(run["changed"], 0);
-    assert_eq!(run["delta_micro_usd"], 0);
+    assert_eq!(run["delta_micro_cny"], 0);
 }
 
 #[tokio::test]
@@ -805,7 +807,7 @@ async fn a_preview_is_refused_for_a_bad_filter_or_reason() {
     )
     .await;
     assert_eq!(run["events"], 0);
-    assert_eq!(cp.count("billing_repricing_runs").await, 1);
+    assert_eq!(cp.count("billing_repricing_runs_cny").await, 1);
 }
 
 #[tokio::test]
@@ -818,9 +820,9 @@ async fn the_adjustments_refuse_update_and_delete() {
     let (id, _) = previewed(cp, &r.w.admin, run_body(from, to, json!({}))).await;
     assert_eq!(apply(cp, &r.admin, &id).await.status, 200);
     for sql in [
-        "UPDATE pricing_adjustments SET delta_micro_usd = 1",
-        "DELETE FROM pricing_adjustments",
-        "TRUNCATE pricing_adjustments",
+        "UPDATE pricing_adjustments_cny SET delta_micro_cny = 1",
+        "DELETE FROM pricing_adjustments_cny",
+        "TRUNCATE pricing_adjustments_cny",
     ] {
         let err = sqlx::query(sql)
             .execute(db.pool())
@@ -870,7 +872,7 @@ async fn a_tenants_call_log_shows_the_adjusted_charge() {
     assert_eq!(items.len(), 2, "{calls:?}");
     for c in items {
         assert_eq!(c["charge"]["status"], "pending");
-        assert_eq!(c["charge"]["adjusted_micro_usd"], 0);
+        assert_eq!(c["charge"]["adjusted_micro_cny"], 0);
     }
 
     price(cp, r.model).await;
@@ -883,8 +885,8 @@ async fn a_tenants_call_log_shows_the_adjusted_charge() {
     assert_eq!(items.len(), 3, "{calls:?}");
     for c in items {
         assert_eq!(c["charge"]["status"], "charged", "{c}");
-        assert_eq!(c["charge"]["adjusted_micro_usd"], 680, "{c}");
-        assert!(c["charge"]["amount_micro_usd"].is_null(), "{c}");
+        assert_eq!(c["charge"]["adjusted_micro_cny"], 680, "{c}");
+        assert!(c["charge"]["amount_micro_cny"].is_null(), "{c}");
     }
     let retried = items
         .iter()
@@ -900,7 +902,7 @@ async fn a_tenants_usage_summary_counts_the_corrected_charge() {
     three_rows(&r.w, "su", r.model).await;
     let summary = owner_get(&r, &format!("/api/usage/summary?{}", around_now())).await;
     assert_eq!(summary.status, 200, "{summary:?}");
-    assert_eq!(summary.body["items"][0]["charged_micro_usd"], 2_040);
+    assert_eq!(summary.body["items"][0]["charged_micro_cny"], 2_040);
     reprice_model(cp, r.model, card("0.5", "1", "0.05")).await;
     let (from, to) = last_hour(cp).await;
     let (id, _) = previewed(cp, &r.w.admin, run_body(from, to, json!({}))).await;
@@ -909,13 +911,13 @@ async fn a_tenants_usage_summary_counts_the_corrected_charge() {
     assert_eq!(summary.body["items"].as_array().expect("items").len(), 1);
     assert_eq!(summary.body["items"][0]["requests"], 3);
     assert_eq!(
-        summary.body["items"][0]["charged_micro_usd"], 1_020,
+        summary.body["items"][0]["charged_micro_cny"], 1_020,
         "{summary:?}"
     );
     let calls = owner_get(&r, "/api/usage/calls").await;
     for c in calls.body["items"].as_array().expect("items") {
-        assert_eq!(c["charge"]["amount_micro_usd"], 680, "{c}");
-        assert_eq!(c["charge"]["adjusted_micro_usd"], -340, "{c}");
+        assert_eq!(c["charge"]["amount_micro_cny"], 680, "{c}");
+        assert_eq!(c["charge"]["adjusted_micro_cny"], -340, "{c}");
     }
     // Operators read the same corrected figure.
     let admin_summary = cp
@@ -930,7 +932,7 @@ async fn a_tenants_usage_summary_counts_the_corrected_charge() {
             None,
         )
         .await;
-    assert_eq!(admin_summary.body["items"][0]["charged_micro_usd"], 1_020);
+    assert_eq!(admin_summary.body["items"][0]["charged_micro_cny"], 1_020);
 }
 
 #[tokio::test]
@@ -943,7 +945,7 @@ async fn operators_preview_and_only_admins_apply() {
     let viewer = cp.admin_login_seeded(OperatorRole::Viewer).await;
     let refused = preview(cp, &viewer, run_body(from, to, json!({}))).await;
     assert_eq!(refused.status, 403, "{refused:?}");
-    assert_eq!(cp.count("billing_repricing_runs").await, 0);
+    assert_eq!(cp.count("billing_repricing_runs_cny").await, 0);
     // The world's operator previews, and may not apply.
     let (id, _) = previewed(cp, &r.w.admin, run_body(from, to, json!({}))).await;
     let refused = apply(cp, &r.w.admin, &id).await;
@@ -1191,12 +1193,12 @@ async fn an_apply_refuses_a_stored_run_past_the_tenant_cap() {
     let (from, to) = last_hour(cp).await;
     let (id, _) = previewed(cp, &r.w.admin, run_body(from, to, json!({}))).await;
     let mut by_tenant: Vec<Value> = (0..MAX_REPRICE_TENANTS)
-        .map(|_| json!({"tenant_id": Uuid::new_v4(), "events": 1, "changed": 1, "delta_micro_usd": 1}))
+        .map(|_| json!({"tenant_id": Uuid::new_v4(), "events": 1, "changed": 1, "delta_micro_cny": 1}))
         .collect();
     by_tenant.push(json!({
-        "tenant_id": r.w.tenant, "events": 3, "changed": 3, "delta_micro_usd": 2_040,
+        "tenant_id": r.w.tenant, "events": 3, "changed": 3, "delta_micro_cny": 2_040,
     }));
-    sqlx::query("UPDATE billing_repricing_runs SET by_tenant = $2 WHERE id = $1")
+    sqlx::query("UPDATE billing_repricing_runs_cny SET by_tenant = $2 WHERE id = $1")
         .bind(Uuid::parse_str(&id).expect("a run id"))
         .bind(sqlx::types::Json(by_tenant))
         .execute(db.pool())
@@ -1252,7 +1254,7 @@ async fn a_run_changing_two_tenants_posts_and_settles_each() {
                 "POST",
                 &format!("/admin/tenants/{tenant}/credits"),
                 Some(r.admin.cookie()),
-                Some(json!({"amount_usd": "0.01", "reason": "重新定价测试 7c1"})),
+                Some(json!({"amount_cny": "0.01", "reason": "重新定价测试 7c1"})),
             )
             .await;
         assert_eq!(r.status, 201, "{r:?}");
@@ -1285,13 +1287,13 @@ async fn a_run_changing_two_tenants_posts_and_settles_each() {
         .map(|t| {
             (
                 uuid(&t["tenant_id"]),
-                t["delta_micro_usd"].as_i64().expect("a delta"),
+                t["delta_micro_cny"].as_i64().expect("a delta"),
             )
         })
         .collect();
     // 20 000 µ$ for A, and for B with its 20 % off.
     assert_eq!(parts, HashMap::from([(a, 20_000), (b, 16_000)]));
-    assert_eq!(run["delta_micro_usd"], 36_000);
+    assert_eq!(run["delta_micro_cny"], 36_000);
     let applied = apply(cp, &r.admin, &id).await;
     assert_eq!(applied.status, 200, "{applied:?}");
 
@@ -1353,7 +1355,7 @@ async fn an_apply_holds_no_other_tenants_intake_while_it_settles_marks() {
                 "POST",
                 &format!("/admin/tenants/{tenant}/credits"),
                 Some(r.admin.cookie()),
-                Some(json!({"amount_usd": "0.01", "reason": "重新定价测试 7c1"})),
+                Some(json!({"amount_cny": "0.01", "reason": "重新定价测试 7c1"})),
             )
             .await;
         assert_eq!(credited.status, 201, "{credited:?}");
@@ -1478,9 +1480,9 @@ async fn two_runs_previewed_over_the_same_rows_correct_them_once() {
     reprice_model(cp, r.model, card("2", "4", "0.2")).await;
     let (from, to) = last_hour(cp).await;
     let (first, run) = previewed(cp, &r.w.admin, run_body(from, to, json!({}))).await;
-    assert_eq!(run["delta_micro_usd"], 680);
+    assert_eq!(run["delta_micro_cny"], 680);
     let (second, run) = previewed(cp, &r.w.admin, run_body(from, to, json!({}))).await;
-    assert_eq!(run["delta_micro_usd"], 680);
+    assert_eq!(run["delta_micro_cny"], 680);
 
     assert_eq!(apply(cp, &r.admin, &first).await.status, 200);
     let refused = apply(cp, &r.admin, &second).await;
@@ -1504,5 +1506,5 @@ async fn two_runs_previewed_over_the_same_rows_correct_them_once() {
     // A fresh preview starts from the corrected charge: nothing is left.
     let (_, run) = previewed(cp, &r.w.admin, run_body(from, to, json!({}))).await;
     assert_eq!(run["changed"], 0);
-    assert_eq!(run["delta_micro_usd"], 0);
+    assert_eq!(run["delta_micro_cny"], 0);
 }

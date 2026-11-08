@@ -25,7 +25,7 @@
 //!
 //! A charge is written once; a re-pricing run corrects it with adjustments
 //! (`pricing_adjustments`). A call shows their sum beside its charge
-//! (`adjusted_micro_usd`), and a summary's `charged_micro_usd` is the
+//! (`adjusted_micro_cny`), and a summary's `charged_micro_cny` is the
 //! corrected charge: the charges plus their adjustments.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -38,6 +38,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::{PgConnection, Postgres, QueryBuilder};
 use uuid::Uuid;
+
+use aisix_pricing::{cny_per_million, CnyPerUsd, Rate};
 
 use super::range::{checked_range, Group};
 use crate::auth::{MemberAuth, MemberRole, OperatorAuth, OperatorRole};
@@ -134,11 +136,11 @@ pub fn visible_to_tenant(is_final_attempt: bool, charge_status: &str, repriced: 
 /// [`visible_to_tenant`] over the joined `pc` (charge) and `ue` (usage row).
 pub(super) const VISIBLE: &str =
     "(ue.event->'is_final_attempt' = 'true'::jsonb OR pc.status = 'charged' \
-     OR EXISTS (SELECT 1 FROM pricing_adjustments pa WHERE pa.event_id = pc.event_id))";
+     OR EXISTS (SELECT 1 FROM pricing_adjustments_cny pa WHERE pa.event_id = pc.event_id))";
 
 /// The sum of the adjustments of the charge `pc`, `NULL` when it has none.
 pub(super) const ADJUSTED: &str =
-    "(SELECT SUM(pa.delta_micro_usd)::bigint FROM pricing_adjustments pa \
+    "(SELECT SUM(pa.delta_micro_cny)::bigint FROM pricing_adjustments_cny pa \
      WHERE pa.event_id = pc.event_id)";
 
 /// The only keys read out of a usage row's event.
@@ -233,10 +235,13 @@ pub struct MemberRef {
 #[derive(Debug, Serialize)]
 pub struct ChargeView {
     pub status: &'static str,
-    pub amount_micro_usd: Option<i64>,
+    pub amount_micro_cny: Option<i64>,
+    /// The group the charge was priced in; `null` for a row priced before a
+    /// key took a group, or one whose group has since been retired.
+    pub group: Option<ChargeGroup>,
     /// The sum of the event's re-pricing adjustments; 0 when no run adjusted
     /// it.
-    pub adjusted_micro_usd: i64,
+    pub adjusted_micro_cny: i64,
     pub service_tier: Option<String>,
     pub estimated: bool,
     pub discount_bps: i64,
@@ -317,7 +322,10 @@ impl Scope {
     /// ` FROM ... WHERE ...` over the charge `pc` and its usage row `ue`,
     /// with one row per charge line `l` when `lines` is set.
     fn push_from(&self, sql: &mut QueryBuilder<'_, Postgres>, lines: bool) {
-        sql.push(" FROM pricing_charges pc JOIN usage_events ue ON ue.event_id = pc.event_id");
+        sql.push(" FROM pricing_charges_cny pc JOIN usage_events ue ON ue.event_id = pc.event_id");
+        // The display name only: a charge's group is shown by what tenants may
+        // see, never by the routing name its provider keys carry.
+        sql.push(" LEFT JOIN provider_groups g ON g.id = pc.group_id");
         if lines {
             sql.push(" CROSS JOIN LATERAL jsonb_array_elements(pc.lines) l");
         }
@@ -364,11 +372,14 @@ struct CallRow {
     user_id: String,
     requested_model_id: String,
     status: String,
-    charge_micro_usd: Option<i64>,
+    charge_micro_cny: Option<i64>,
     service_tier: Option<String>,
     estimated: bool,
     discount_bps: i64,
     lines: Value,
+    cny_per_usd_e4: Option<i64>,
+    group_id: Option<Uuid>,
+    group_name: Option<String>,
     /// The sum of the charge's adjustments, `None` when it has none.
     adjusted: Option<i64>,
     request_id: Option<String>,
@@ -425,22 +436,45 @@ pub(super) fn tenant_view(ev: &Value, charge_status: &str, repriced: bool) -> Op
 }
 
 /// A charge's stored `lines` as a tenant reads them: each line's dimension,
-/// quantity and rate, and nothing else a stored line may carry.
-fn tenant_lines(lines: &Value) -> Value {
+/// quantity and CNY rate per million, and nothing else a stored line may
+/// carry. A stored line's `rate` is the baseline's in micro-USD per million;
+/// the tenant is shown the price it was charged at, so the rate is converted
+/// here at the rate recorded on the charge. A line whose stored rate this
+/// cannot read shows no rate rather than a wrong one.
+fn tenant_lines(lines: &Value, cny_per_usd_e4: Option<i64>) -> Value {
+    let cny = cny_per_usd_e4
+        .and_then(|e4| u32::try_from(e4).ok())
+        .and_then(|e4| CnyPerUsd::parse(&CnyPerUsd(e4).to_string()).ok());
     Value::Array(
         lines
             .as_array()
             .into_iter()
             .flatten()
             .map(|l| {
+                let line_rate = l
+                    .get("rate")
+                    .and_then(Value::as_str)
+                    .and_then(|r| Rate::parse(r).ok());
+                let rate_cny = match (line_rate, cny) {
+                    (Some(rate), Some(cny)) => cny_per_million(rate, cny, 0),
+                    _ => None,
+                };
                 json!({
                     "dimension": l.get("dimension"),
                     "quantity": l.get("quantity"),
-                    "rate": l.get("rate"),
+                    "rate_cny": rate_cny,
                 })
             })
             .collect(),
     )
+}
+
+/// The group a charge was priced in, as a tenant reads it: its display name,
+/// never the routing name the platform's provider keys carry.
+#[derive(Debug, Serialize)]
+pub struct ChargeGroup {
+    pub id: Uuid,
+    pub display_name: String,
 }
 
 /// `GET /api/usage/calls` → `{items: [Call], next_before}`, newest first.
@@ -477,8 +511,9 @@ pub async fn list_calls(
     let limit = page_limit(q.limit);
     let mut sql = QueryBuilder::<Postgres>::new(
         "SELECT pc.seq, pc.event_id, pc.occurred_at, pc.api_key_id, pc.user_id, \
-         pc.requested_model_id, pc.status, pc.charge_micro_usd, pc.service_tier, pc.estimated, \
-         pc.discount_bps, pc.lines, ue.request_id, ",
+         pc.requested_model_id, pc.status, pc.charge_micro_cny, pc.service_tier, pc.estimated, \
+         pc.discount_bps, pc.lines, pc.cny_per_usd_e4, pc.group_id, g.display_name AS group_name, \
+         ue.request_id, ",
     );
     sql.push(ADJUSTED).push(" AS adjusted, ");
     sql.push(EVENT_FIELDS).push(" AS ev");
@@ -566,12 +601,16 @@ pub async fn list_calls(
                     .filter(|ms| *ms > 0),
                 charge: ChargeView {
                     status: view.charge_status,
-                    amount_micro_usd: r.charge_micro_usd,
-                    adjusted_micro_usd: r.adjusted.unwrap_or(0),
+                    amount_micro_cny: r.charge_micro_cny,
+                    group: r
+                        .group_id
+                        .zip(r.group_name.clone())
+                        .map(|(id, display_name)| ChargeGroup { id, display_name }),
+                    adjusted_micro_cny: r.adjusted.unwrap_or(0),
                     service_tier: r.service_tier,
                     estimated: r.estimated,
                     discount_bps: r.discount_bps,
-                    lines: tenant_lines(&r.lines),
+                    lines: tenant_lines(&r.lines, r.cny_per_usd_e4),
                 },
                 event_id: r.event_id,
                 occurred_at: r.occurred_at,
@@ -588,7 +627,7 @@ pub struct UsageSummaryRow {
     pub period_start: DateTime<Utc>,
     pub model: ModelRef,
     pub requests: i64,
-    pub charged_micro_usd: i64,
+    pub charged_micro_cny: i64,
     pub estimated_requests: i64,
     pub quantities: BTreeMap<String, i64>,
 }
@@ -622,7 +661,7 @@ async fn summarize_snapshot(
 /// gateway resolved, never by the name a caller sent: calls whose model is
 /// not in the tenant's grants (or never resolved) share one row per period
 /// with `id` null and an empty name, and a granted model is named by its
-/// current display name. `charged_micro_usd` is the corrected charge: the
+/// current display name. `charged_micro_cny` is the corrected charge: the
 /// charged rows' charges plus every row's re-pricing adjustments, in the
 /// period the row occurred in.
 async fn summarize(
@@ -638,7 +677,7 @@ async fn summarize(
     let mut sql = QueryBuilder::<Postgres>::new("SELECT date_trunc(");
     sql.push_bind(unit).push(format!(
         ", pc.occurred_at, 'UTC'), pc.requested_model_id, count(*)::bigint, \
-         COALESCE(sum(pc.charge_micro_usd) FILTER (WHERE pc.status = 'charged'), 0)::bigint \
+         COALESCE(sum(pc.charge_micro_cny) FILTER (WHERE pc.status = 'charged'), 0)::bigint \
            + sum(COALESCE({ADJUSTED}, 0))::bigint, \
          (count(*) FILTER (WHERE pc.estimated))::bigint"
     ));
@@ -683,12 +722,12 @@ async fn summarize(
                     name: model.name.clone(),
                 },
                 requests: 0,
-                charged_micro_usd: 0,
+                charged_micro_cny: 0,
                 estimated_requests: 0,
                 quantities: BTreeMap::new(),
             });
         row.requests += requests;
-        row.charged_micro_usd += charged;
+        row.charged_micro_cny += charged;
         row.estimated_requests += estimated;
     }
     for (period, raw, dimension, quantity) in quantity_rows {
@@ -708,13 +747,13 @@ async fn summarize(
                 name: OTHER.to_string(),
             },
             requests: 0,
-            charged_micro_usd: 0,
+            charged_micro_cny: 0,
             estimated_requests: 0,
             quantities: BTreeMap::new(),
         };
         for row in rest {
             other.requests += row.requests;
-            other.charged_micro_usd += row.charged_micro_usd;
+            other.charged_micro_cny += row.charged_micro_cny;
             other.estimated_requests += row.estimated_requests;
             for (dimension, quantity) in row.quantities {
                 *other.quantities.entry(dimension).or_insert(0) += quantity;

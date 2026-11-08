@@ -28,7 +28,7 @@
 //! tenant's usage intake, and the resources lock from the first mark that
 //! moves, for as long as all of them take.
 //!
-//! A charge's effective amount is its `charge_micro_usd` (0 when it has
+//! A charge's effective amount is its `charge_micro_cny` (0 when it has
 //! none) plus its adjustments, and a run's delta for a row is the new charge
 //! (0 unless the engine charges it) minus that. Two kinds of row are counted
 //! and left as they are:
@@ -54,7 +54,9 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use aisix_pricing::{price_event, BillableUsage, Outcome, PriceBook, PricedEvent, ENGINE_VERSION};
+use aisix_pricing::{
+    price_event, BillableUsage, Outcome, Payer, PriceBook, PricedEvent, ENGINE_VERSION,
+};
 use axum::extract::rejection::QueryRejection;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -102,31 +104,35 @@ const UNATTRIBUTED: [&str; 3] = ["unknown_api_key", "tenant_mismatch", "undecoda
 
 /// Which charges a run selects: those that occurred in `[from, to)`, with
 /// `to` no later than the run's instant, narrowed to one model, one tenant
-/// (the tenant a charge is filed under) and one charge status when given.
+/// (the tenant a charge is filed under), one group and one charge status when
+/// given. The group filter matches the coalesced group ([`BILLED_GROUP`]),
+/// the one a re-pricing prices the row at, not the column alone.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepriceFilter {
     pub from: DateTime<Utc>,
     pub to: DateTime<Utc>,
     pub model_id: Option<Uuid>,
     pub tenant_id: Option<Uuid>,
+    pub group_id: Option<Uuid>,
     pub status: Option<String>,
 }
 
-/// Prices the stored usage row `event` again, for tenant `tenant_id` (the
-/// tenant its charge is filed under, never the row's own `team_id`) at the
-/// prices in force at `at`: the row is read as the engine reads it, with its
-/// `team_id` and `occurred_at` replaced, so its price instant is `at`. `None`
-/// when the engine refuses it, or the row does not decode.
+/// Prices the stored usage row `event` again for `payer` (the tenant its
+/// charge is filed under, never the row's own `team_id`, and the group it is
+/// billed at) at the prices in force at `at`: the row is read as the engine
+/// reads it, with its `team_id` and `occurred_at` replaced, so its price
+/// instant is `at`. `None` when the engine refuses it, or the row does not
+/// decode.
 pub fn reprice_one(
     book: &PriceBook,
     event: &Value,
-    tenant_id: &str,
+    payer: &Payer,
     at: DateTime<Utc>,
 ) -> Option<PricedEvent> {
     let mut usage = BillableUsage::deserialize(event).ok()?;
-    usage.team_id = tenant_id.to_string();
+    usage.team_id = payer.tenant_id.clone();
     usage.occurred_at = at;
-    price_event(book, &usage, at).ok()
+    price_event(book, &usage, payer, at).ok()
 }
 
 /// One tenant's part of a run.
@@ -136,7 +142,7 @@ pub struct TenantTotals {
     /// The selected charges filed under the tenant, skipped ones included.
     pub events: i64,
     pub changed: i64,
-    pub delta_micro_usd: i64,
+    pub delta_micro_cny: i64,
 }
 
 /// What a run comes to.
@@ -146,7 +152,7 @@ struct Totals {
     changed: i64,
     still_unpriced: i64,
     skipped_unattributed: i64,
-    delta_micro_usd: i64,
+    delta_micro_cny: i64,
     /// Ascending tenant id.
     by_tenant: Vec<TenantTotals>,
 }
@@ -161,7 +167,8 @@ struct Change {
     /// counts the correction there.
     price_instant: DateTime<Utc>,
     delta: i64,
-    sell_revision_id: Option<i64>,
+    baseline_revision_id: Option<i64>,
+    rate_revision_id: Option<i64>,
 }
 
 /// One selected charge with its usage row.
@@ -171,13 +178,26 @@ struct Selected {
     tenant_id: String,
     api_key_id: String,
     user_id: String,
-    charge_micro_usd: Option<i64>,
+    charge_micro_cny: Option<i64>,
     error_code: Option<String>,
     price_instant: DateTime<Utc>,
     event: Value,
     /// The sum of the charge's earlier adjustments.
     adjusted: i64,
+    /// The group the charge is billed at: the one recorded when it was priced,
+    /// or, when it was never priced, the key's (`BILLED_GROUP`).
+    group_id: Option<Uuid>,
 }
+
+/// The group a re-pricing prices the charge `pc` at (R11): the group recorded
+/// on the charge when it was priced, else the group of its key. A key's group
+/// is set at most once and never changes after, so the two agree whenever both
+/// are set; the fallback is what lets a row intake stored `no_group` be
+/// charged once its key has taken a group. The subquery runs only for a charge
+/// with no recorded group. */
+pub(super) const BILLED_GROUP: &str =
+    "COALESCE(pc.group_id, (SELECT k.group_id FROM tenant_keys k \
+     WHERE k.id::text = pc.api_key_id))";
 
 /// ` WHERE …` over the charge `pc` for `f`.
 fn push_where(sql: &mut QueryBuilder<'_, Postgres>, f: &RepriceFilter) {
@@ -195,6 +215,12 @@ fn push_where(sql: &mut QueryBuilder<'_, Postgres>, f: &RepriceFilter) {
             .push_bind(tenant)
             .push("::text");
     }
+    if let Some(group) = f.group_id {
+        sql.push(" AND ")
+            .push(BILLED_GROUP)
+            .push(" = ")
+            .push_bind(group);
+    }
     if let Some(status) = &f.status {
         sql.push(" AND pc.status = ").push_bind(status.clone());
     }
@@ -210,15 +236,16 @@ async fn select(
     limit: i64,
 ) -> Result<Vec<Selected>, DbError> {
     let mut sql = QueryBuilder::<Postgres>::new(
-        "SELECT pc.event_id, pc.tenant_id, pc.api_key_id, pc.user_id, pc.charge_micro_usd, \
+        "SELECT pc.event_id, pc.tenant_id, pc.api_key_id, pc.user_id, pc.charge_micro_cny, \
          pc.error_code, \
          COALESCE(pc.price_instant, LEAST(pc.occurred_at, ue.received_at + interval '5 minutes')) \
            AS price_instant, \
          ue.event, \
-         COALESCE((SELECT SUM(pa.delta_micro_usd)::bigint FROM pricing_adjustments pa \
-                   WHERE pa.event_id = pc.event_id), 0) AS adjusted \
-         FROM pricing_charges pc JOIN usage_events ue ON ue.event_id = pc.event_id",
+         COALESCE((SELECT SUM(pa.delta_micro_cny)::bigint FROM pricing_adjustments_cny pa \
+                   WHERE pa.event_id = pc.event_id), 0) AS adjusted, ",
     );
+    sql.push(BILLED_GROUP).push(" AS group_id");
+    sql.push(" FROM pricing_charges_cny pc JOIN usage_events ue ON ue.event_id = pc.event_id");
     push_where(&mut sql, f);
     sql.push(" LIMIT ").push_bind(limit);
     Ok(sql.build_query_as().fetch_all(conn).await?)
@@ -226,7 +253,7 @@ async fn select(
 
 /// How many charges `f` selects.
 async fn count(conn: &mut PgConnection, f: &RepriceFilter) -> Result<i64, DbError> {
-    let mut sql = QueryBuilder::<Postgres>::new("SELECT count(*) FROM pricing_charges pc");
+    let mut sql = QueryBuilder::<Postgres>::new("SELECT count(*) FROM pricing_charges_cny pc");
     push_where(&mut sql, f);
     Ok(sql.build_query_scalar().fetch_one(conn).await?)
 }
@@ -270,7 +297,7 @@ fn compute(
                     tenant_id: filed,
                     events: 0,
                     changed: 0,
-                    delta_micro_usd: 0,
+                    delta_micro_cny: 0,
                 })
                 .events += 1;
         }
@@ -278,7 +305,13 @@ fn compute(
             totals.skipped_unattributed += 1;
             continue;
         };
-        let Some(priced) = reprice_one(book, &row.event, &tenant_id.to_string(), at) else {
+        // The tenant the charge is filed under and the group it is billed at,
+        // both from the charge and its key, never from the row.
+        let payer = Payer {
+            tenant_id: tenant_id.to_string(),
+            group_id: row.group_id.map(|g| g.to_string()),
+        };
+        let Some(priced) = reprice_one(book, &row.event, &payer, at) else {
             totals.still_unpriced += 1;
             continue;
         };
@@ -288,7 +321,7 @@ fn compute(
             0
         };
         let current = row
-            .charge_micro_usd
+            .charge_micro_cny
             .unwrap_or(0)
             .checked_add(row.adjusted)
             .ok_or_else(overflow)?;
@@ -297,13 +330,13 @@ fn compute(
             continue;
         }
         totals.changed += 1;
-        totals.delta_micro_usd = totals
-            .delta_micro_usd
+        totals.delta_micro_cny = totals
+            .delta_micro_cny
             .checked_add(delta)
             .ok_or_else(overflow)?;
         if let Some(t) = by_tenant.get_mut(&tenant_id) {
             t.changed += 1;
-            t.delta_micro_usd = t.delta_micro_usd.checked_add(delta).ok_or_else(overflow)?;
+            t.delta_micro_cny = t.delta_micro_cny.checked_add(delta).ok_or_else(overflow)?;
         }
         changes.push(Change {
             event_id: row.event_id.clone(),
@@ -312,7 +345,8 @@ fn compute(
             api_key_id,
             price_instant: row.price_instant,
             delta,
-            sell_revision_id: priced.sell.map(|s| s.revision_id),
+            baseline_revision_id: priced.baseline.map(|b| b.revision_id),
+            rate_revision_id: priced.rate.map(|r| r.revision_id),
         });
     }
     totals.by_tenant = by_tenant.into_values().collect();
@@ -333,7 +367,7 @@ struct RunRow {
     changed: i64,
     still_unpriced: i64,
     skipped_unattributed: i64,
-    delta_micro_usd: i64,
+    delta_micro_cny: i64,
     by_tenant: Value,
     created_by: Uuid,
     creator_email: String,
@@ -345,9 +379,9 @@ struct RunRow {
 
 const SELECT_RUN: &str = "SELECT r.id, r.seq, r.status, r.filter, r.reason, r.pricing_version, \
      r.engine_version, r.events, r.changed, r.still_unpriced, r.skipped_unattributed, \
-     r.delta_micro_usd, r.by_tenant, r.created_by, c.email AS creator_email, r.created_at, \
+     r.delta_micro_cny, r.by_tenant, r.created_by, c.email AS creator_email, r.created_at, \
      r.applied_by, a.email AS applier_email, r.applied_at \
-     FROM billing_repricing_runs r JOIN operators c ON c.id = r.created_by \
+     FROM billing_repricing_runs_cny r JOIN operators c ON c.id = r.created_by \
      LEFT JOIN operators a ON a.id = r.applied_by";
 
 impl RunRow {
@@ -365,7 +399,7 @@ impl RunRow {
             changed: self.changed,
             still_unpriced: self.still_unpriced,
             skipped_unattributed: self.skipped_unattributed,
-            delta_micro_usd: self.delta_micro_usd,
+            delta_micro_cny: self.delta_micro_cny,
             by_tenant: self.by_tenant()?,
         })
     }
@@ -383,7 +417,7 @@ impl RunRow {
                     "tenant_name": name,
                     "events": t.events,
                     "changed": t.changed,
-                    "delta_micro_usd": t.delta_micro_usd,
+                    "delta_micro_cny": t.delta_micro_cny,
                 });
                 (name, view)
             })
@@ -398,7 +432,7 @@ impl RunRow {
             "changed": self.changed,
             "still_unpriced": self.still_unpriced,
             "skipped_unattributed": self.skipped_unattributed,
-            "delta_micro_usd": self.delta_micro_usd,
+            "delta_micro_cny": self.delta_micro_cny,
             "by_tenant": by_tenant.into_iter().map(|(_, v)| v).collect::<Vec<_>>(),
             "created_by": {"id": self.created_by, "email": self.creator_email},
             "created_at": self.created_at,
@@ -487,6 +521,8 @@ pub struct NewRun {
     #[serde(default)]
     tenant_id: Option<Uuid>,
     #[serde(default)]
+    group_id: Option<Uuid>,
+    #[serde(default)]
     status: Option<String>,
     #[serde(default)]
     reason: Option<String>,
@@ -535,6 +571,7 @@ pub async fn preview(
         to: req.to,
         model_id: req.model_id,
         tenant_id: req.tenant_id,
+        group_id: req.group_id,
         status: req.status,
     };
     let prices = state.prices.clone();
@@ -571,9 +608,9 @@ pub async fn preview(
                 within_tenant_cap(tenants_changed(&totals))?;
                 let id = Uuid::new_v4();
                 sqlx::query(
-                    "INSERT INTO billing_repricing_runs \
+                    "INSERT INTO billing_repricing_runs_cny \
                      (id, status, filter, reason, pricing_version, engine_version, events, changed, \
-                      still_unpriced, skipped_unattributed, delta_micro_usd, by_tenant, created_by) \
+                      still_unpriced, skipped_unattributed, delta_micro_cny, by_tenant, created_by) \
                      VALUES ($1, 'previewed', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
                 )
                 .bind(id)
@@ -585,7 +622,7 @@ pub async fn preview(
                 .bind(totals.changed)
                 .bind(totals.still_unpriced)
                 .bind(totals.skipped_unattributed)
-                .bind(totals.delta_micro_usd)
+                .bind(totals.delta_micro_cny)
                 .bind(sqlx::types::Json(&totals.by_tenant))
                 .bind(auth.id)
                 .execute(&mut *conn)
@@ -604,7 +641,7 @@ pub async fn preview(
                             "reason": reason,
                             "events": totals.events,
                             "changed": totals.changed,
-                            "delta_micro_usd": totals.delta_micro_usd,
+                            "delta_micro_cny": totals.delta_micro_cny,
                         }),
                     },
                 )
@@ -674,7 +711,7 @@ pub async fn apply(
                 // below changes is among them, or the totals differ.
                 tenants::lock_many_billing(&mut *conn, &mut changed_tenants).await?;
                 let status: String = sqlx::query_scalar(
-                    "SELECT status FROM billing_repricing_runs WHERE id = $1 FOR UPDATE",
+                    "SELECT status FROM billing_repricing_runs_cny WHERE id = $1 FOR UPDATE",
                 )
                 .bind(id)
                 .fetch_one(&mut *conn)
@@ -708,24 +745,27 @@ pub async fn apply(
                 if !changes.is_empty() {
                     let mut event_ids = Vec::with_capacity(changes.len());
                     let mut deltas = Vec::with_capacity(changes.len());
-                    let mut revisions = Vec::with_capacity(changes.len());
+                    let mut baselines = Vec::with_capacity(changes.len());
+                    let mut rates = Vec::with_capacity(changes.len());
                     for c in &changes {
                         event_ids.push(c.event_id.as_str());
                         deltas.push(c.delta);
-                        revisions.push(c.sell_revision_id);
+                        baselines.push(c.baseline_revision_id);
+                        rates.push(c.rate_revision_id);
                     }
                     sqlx::query(
-                        "INSERT INTO pricing_adjustments \
-                         (run_id, event_id, delta_micro_usd, sell_revision_id, engine_version, \
-                          reason, created_by) \
-                         SELECT $1, a.event_id, a.delta, a.revision, $5, $6, $7 \
-                         FROM unnest($2::text[], $3::bigint[], $4::bigint[]) \
-                           AS a(event_id, delta, revision)",
+                        "INSERT INTO pricing_adjustments_cny \
+                         (run_id, event_id, delta_micro_cny, baseline_revision_id, \
+                          rate_revision_id, engine_version, reason, created_by) \
+                         SELECT $1, a.event_id, a.delta, a.baseline, a.rate, $6, $7, $8 \
+                         FROM unnest($2::text[], $3::bigint[], $4::bigint[], $5::bigint[]) \
+                           AS a(event_id, delta, baseline, rate)",
                     )
                     .bind(id)
                     .bind(&event_ids)
                     .bind(&deltas)
-                    .bind(&revisions)
+                    .bind(&baselines)
+                    .bind(&rates)
                     .bind(i64::from(ENGINE_VERSION))
                     .bind(&run.reason)
                     .bind(auth.id)
@@ -746,11 +786,11 @@ pub async fn apply(
                         .collect();
                     let flag =
                         budgets::count_charges(&mut *conn, &counted, CountMode::Adjustment).await?;
-                    for t in totals.by_tenant.iter().filter(|t| t.delta_micro_usd != 0) {
+                    for t in totals.by_tenant.iter().filter(|t| t.delta_micro_cny != 0) {
                         postings.push(Posting {
                             tenant_id: t.tenant_id,
-                            amount_micro_usd: t
-                                .delta_micro_usd
+                            amount_micro_cny: t
+                                .delta_micro_cny
                                 .checked_neg()
                                 .ok_or_else(overflow)?,
                             source: Source::Repricing { run_id: id },
@@ -773,7 +813,7 @@ pub async fn apply(
                     marks::notify(&mut *conn).await?;
                 }
                 sqlx::query(
-                    "UPDATE billing_repricing_runs \
+                    "UPDATE billing_repricing_runs_cny \
                      SET status = 'applied', applied_by = $2, applied_at = now() WHERE id = $1",
                 )
                 .bind(id)
@@ -791,7 +831,7 @@ pub async fn apply(
                         tenant_id: filter.tenant_id,
                         detail: json!({
                             "changed": totals.changed,
-                            "delta_micro_usd": totals.delta_micro_usd,
+                            "delta_micro_cny": totals.delta_micro_cny,
                             "tenants_posted": postings.len(),
                         }),
                     },
@@ -873,24 +913,35 @@ pub async fn get(
 mod tests {
     use std::sync::Arc;
 
-    use aisix_pricing::{Catalogue, DiscountRow, PriceRows, SellPriceRow};
+    use aisix_pricing::{BaselineRow, Catalogue, DiscountRow, GroupRateRow, PriceRows};
     use chrono::TimeDelta;
 
     use super::*;
 
+    const GROUP: &str = "0b7e5a52-6a4f-4d3e-9c1b-2f6f4d1d9e10";
+
     /// A book pricing model `m` at input 1, output 2 and cache read 0.1 USD
-    /// per million, with tenant `discounted` on a 50 % discount.
+    /// per million for every group at `7.2` CNY per USD, with tenant
+    /// `discounted` on a 50 % discount.
     fn book(m: &str, discounted: &str, from: DateTime<Utc>) -> PriceBook {
+        let card = json!({
+            "default": {"base": {"input": "1", "output": "2", "cache_read": "0.1"}}
+        });
         let rows = PriceRows {
-            sell: vec![SellPriceRow {
+            baselines: vec![BaselineRow {
                 revision_id: 1,
                 engine_version: ENGINE_VERSION,
                 model_id: m.to_string(),
-                tenant_id: None,
                 effective_from: from,
-                card: Some(json!({
-                    "default": {"base": {"input": "1", "output": "2", "cache_read": "0.1"}}
-                })),
+                card: card.clone(),
+            }],
+            rates: vec![GroupRateRow {
+                revision_id: 1,
+                engine_version: ENGINE_VERSION,
+                group_id: GROUP.to_string(),
+                model_id: None,
+                effective_from: from,
+                cny_per_usd_e4: Some(72_000),
             }],
             cost: vec![],
             discounts: vec![DiscountRow {
@@ -903,6 +954,13 @@ mod tests {
         };
         let catalogue = Catalogue::builtin().expect("the built-in catalogue");
         PriceBook::from_rows(rows, Arc::clone(&catalogue))
+    }
+
+    fn payer(tenant: &str) -> Payer {
+        Payer {
+            tenant_id: tenant.to_string(),
+            group_id: Some(GROUP.to_string()),
+        }
     }
 
     fn event(m: &str, team_id: &str, occurred_at: DateTime<Utc>) -> Value {
@@ -919,20 +977,29 @@ mod tests {
         let book = book("m", "filed", now);
         // The row claims another tenant and occurred before any price.
         let row = event("m", "claimed", now - TimeDelta::days(30));
-        let priced = reprice_one(&book, &row, "filed", now).expect("priced");
-        assert_eq!(priced.charge.0, 340);
+        // 680 µ$ at the baseline, times a rate of 7.2, less 50 %: 2448 µ¥.
+        let priced = reprice_one(&book, &row, &payer("filed"), now).expect("priced");
+        assert_eq!(priced.charge.0, 2_448);
         assert_eq!(priced.tenant_id, "filed");
+        assert_eq!(priced.group_id.as_deref(), Some(GROUP));
         assert_eq!(priced.price_instant, now);
+        // Undiscounted the same row is 4896 µ¥.
         assert_eq!(
-            reprice_one(&book, &row, "claimed", now)
+            reprice_one(&book, &row, &payer("claimed"), now)
                 .expect("priced")
                 .charge
                 .0,
-            680
+            4_896
         );
         // Before the price starts, nothing is in force.
-        assert!(reprice_one(&book, &row, "filed", now - TimeDelta::seconds(1)).is_none());
+        assert!(reprice_one(&book, &row, &payer("filed"), now - TimeDelta::seconds(1)).is_none());
         // A row that does not decode is refused.
-        assert!(reprice_one(&book, &json!({"event_id": "e2"}), "filed", now).is_none());
+        assert!(reprice_one(&book, &json!({"event_id": "e2"}), &payer("filed"), now).is_none());
+        // A payer whose key names no group is refused, never guessed at.
+        let groupless = Payer {
+            tenant_id: "filed".to_string(),
+            group_id: None,
+        };
+        assert!(reprice_one(&book, &row, &groupless, now).is_none());
     }
 }

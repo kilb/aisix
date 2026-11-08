@@ -29,9 +29,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, PoisonError, RwLock};
 
 use aisix_pricing::{
-    Catalogue, ChargeLine, CostPriceRow, CostSource, DiscountRow, Exemption, Outcome, PriceBook,
-    PriceRows, PricedEvent, PricingError, PricingWarning, RateCard, RevisionTable, SellPriceRow,
-    ENGINE_VERSION,
+    BaselineRow, Catalogue, ChargeLine, CostPriceRow, CostSource, DiscountRow, Exemption,
+    GroupRateRow, Outcome, PriceBook, PriceRows, PricedEvent, PricingError, PricingWarning,
+    RateCard, RevisionTable, ENGINE_VERSION,
 };
 use chrono::{DateTime, TimeDelta, Utc};
 use serde::Serialize;
@@ -165,7 +165,7 @@ pub async fn pricing_version(conn: &mut PgConnection) -> Result<Option<i64>, DbE
 /// `/admin/pricing/status` and the reconciliation both report this.
 pub async fn unpriced_by_code(conn: &mut PgConnection) -> Result<Vec<(String, i64)>, DbError> {
     Ok(sqlx::query_as(
-        "SELECT COALESCE(error_code, 'unknown'), count(*)::bigint FROM pricing_charges \
+        "SELECT COALESCE(error_code, 'unknown'), count(*)::bigint FROM pricing_charges_cny \
          WHERE status = 'unpriced' AND priced_at >= now() - interval '24 hours' \
          GROUP BY 1 ORDER BY 1",
     )
@@ -176,17 +176,19 @@ pub async fn unpriced_by_code(conn: &mut PgConnection) -> Result<Vec<(String, i6
 /// The table an invalid revision is in, as the alert names it.
 fn table_name(table: RevisionTable) -> &'static str {
     match table {
-        RevisionTable::Sell => "pricing_sell_revisions",
+        RevisionTable::Baseline => "pricing_baselines",
+        RevisionTable::Rate => "pricing_group_rates",
         RevisionTable::Cost => "pricing_cost_revisions",
         RevisionTable::Discount => "pricing_discount_revisions",
     }
 }
 
-type SellTableRow = (i64, i64, Uuid, Option<Uuid>, DateTime<Utc>, Option<Value>);
+type BaselineTableRow = (i64, i64, Uuid, DateTime<Utc>, Value);
+type RateTableRow = (i64, i64, Uuid, Option<Uuid>, DateTime<Utc>, Option<i64>);
 type CostTableRow = (i64, i64, String, String, Option<Uuid>, DateTime<Utc>, Value);
 type DiscountTableRow = (i64, i64, Uuid, DateTime<Utc>, i64);
 
-/// Every revision of the three tables, read on `conn`, as a book. Ids are
+/// Every revision of the four tables, read on `conn`, as a book. Ids are
 /// written as `Uuid::to_string()`, the lowercase hyphenated form the control
 /// plane projects and the gateway echoes back; cards stay raw JSON, so one
 /// bad or newer card is isolated to its own revision.
@@ -194,9 +196,15 @@ pub async fn load_price_book(
     conn: &mut PgConnection,
     catalogue: Arc<Catalogue>,
 ) -> Result<PriceBook, DbError> {
-    let sell: Vec<SellTableRow> = sqlx::query_as(
-        "SELECT revision_id, engine_version, model_id, tenant_id, effective_from, card \
-         FROM pricing_sell_revisions",
+    let baselines: Vec<BaselineTableRow> = sqlx::query_as(
+        "SELECT revision_id, engine_version, model_id, effective_from, card \
+         FROM pricing_baselines",
+    )
+    .fetch_all(&mut *conn)
+    .await?;
+    let rates: Vec<RateTableRow> = sqlx::query_as(
+        "SELECT revision_id, engine_version, group_id, model_id, effective_from, cny_per_usd_e4 \
+         FROM pricing_group_rates",
     )
     .fetch_all(&mut *conn)
     .await?;
@@ -214,16 +222,30 @@ pub async fn load_price_book(
     .fetch_all(&mut *conn)
     .await?;
     let rows = PriceRows {
-        sell: sell
+        baselines: baselines
             .into_iter()
             .map(
-                |(revision_id, engine, model_id, tenant_id, effective_from, card)| SellPriceRow {
+                |(revision_id, engine, model_id, effective_from, card)| BaselineRow {
                     revision_id,
                     engine_version: engine_version(engine),
                     model_id: model_id.to_string(),
-                    tenant_id: tenant_id.map(|t| t.to_string()),
                     effective_from,
                     card,
+                },
+            )
+            .collect(),
+        rates: rates
+            .into_iter()
+            .map(
+                |(revision_id, engine, group_id, model_id, effective_from, cny_per_usd_e4)| {
+                    GroupRateRow {
+                        revision_id,
+                        engine_version: engine_version(engine),
+                        group_id: group_id.to_string(),
+                        model_id: model_id.map(|m| m.to_string()),
+                        effective_from,
+                        cny_per_usd_e4,
+                    }
                 },
             )
             .collect(),
@@ -287,6 +309,10 @@ pub struct ChargeIdentity<'a> {
     pub api_key_id: &'a str,
     pub user_id: &'a str,
     pub requested_model_id: &'a str,
+    /// The group the row's key names, as the control plane recorded it: the
+    /// group the charge is filed under, and what a re-pricing run prices a
+    /// `no_group` row at (R11). `None` for a row whose key names none.
+    pub group_id: Option<Uuid>,
     /// The row's request id as `usage_events` stores it.
     pub request_id: Option<&'a str>,
 }
@@ -342,8 +368,11 @@ struct Columns<'a> {
     charge: Option<i64>,
     cost: Option<i64>,
     cost_source: Option<Json<&'a CostSource>>,
-    sell_revision_id: Option<i64>,
-    tenant_override: bool,
+    group_id: Option<Uuid>,
+    baseline_revision_id: Option<i64>,
+    rate_revision_id: Option<i64>,
+    cny_per_usd_e4: Option<i64>,
+    rate_is_model_override: bool,
     discount_revision_id: Option<i64>,
     discount_bps: i64,
     service_tier: Option<&'a str>,
@@ -366,8 +395,11 @@ impl<'a> Columns<'a> {
                 charge: Some(p.charge.0),
                 cost: p.cost.as_ref().map(|c| c.amount.0),
                 cost_source: p.cost.as_ref().map(|c| Json(&c.source)),
-                sell_revision_id: p.sell.map(|s| s.revision_id),
-                tenant_override: p.sell.is_some_and(|s| s.tenant_override),
+                group_id: p.group_id.as_deref().and_then(|g| Uuid::parse_str(g).ok()),
+                baseline_revision_id: p.baseline.map(|b| b.revision_id),
+                rate_revision_id: p.rate.map(|r| r.revision_id),
+                cny_per_usd_e4: p.rate.map(|r| i64::from(r.cny_per_usd.0)),
+                rate_is_model_override: p.rate.is_some_and(|r| r.model_override),
                 discount_revision_id: p.discount.map(|d| d.revision_id),
                 discount_bps: p.discount.map_or(0, |d| i64::from(d.bps)),
                 service_tier: p.service_tier.as_ref().map(|t| t.as_str()),
@@ -392,8 +424,11 @@ impl<'a> Columns<'a> {
                 charge: None,
                 cost: None,
                 cost_source: None,
-                sell_revision_id: None,
-                tenant_override: false,
+                group_id: None,
+                baseline_revision_id: None,
+                rate_revision_id: None,
+                cny_per_usd_e4: None,
+                rate_is_model_override: false,
                 discount_revision_id: None,
                 discount_bps: 0,
                 service_tier: None,
@@ -420,14 +455,15 @@ pub async fn record_charge(
 ) -> Result<Recorded, DbError> {
     let c = Columns::of(charge);
     let inserted: Option<String> = sqlx::query_scalar(
-        "INSERT INTO pricing_charges \
+        "INSERT INTO pricing_charges_cny \
          (event_id, tenant_id, api_key_id, user_id, requested_model_id, occurred_at, \
-          price_instant, status, charge_micro_usd, cost_micro_usd, cost_source, sell_revision_id, \
-          tenant_override, discount_revision_id, discount_bps, service_tier, \
+          price_instant, status, charge_micro_cny, cost_micro_usd, cost_source, group_id, \
+          baseline_revision_id, rate_revision_id, cny_per_usd_e4, rate_is_model_override, \
+          discount_revision_id, discount_bps, service_tier, \
           requested_service_tier, long_context_above, estimated, exemption, error_code, lines, \
           warnings, engine_version, request_id) \
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, \
-                 $19, $20, $21, $22, $23, $24, $25) \
+                 $19, $20, $21, $22, $23, $24, $25, $26, $27, $28) \
          ON CONFLICT (event_id) DO NOTHING RETURNING event_id",
     )
     .bind(ident.event_id)
@@ -441,8 +477,11 @@ pub async fn record_charge(
     .bind(c.charge)
     .bind(c.cost)
     .bind(c.cost_source)
-    .bind(c.sell_revision_id)
-    .bind(c.tenant_override)
+    .bind(c.group_id)
+    .bind(c.baseline_revision_id)
+    .bind(c.rate_revision_id)
+    .bind(c.cny_per_usd_e4)
+    .bind(c.rate_is_model_override)
     .bind(c.discount_revision_id)
     .bind(c.discount_bps)
     .bind(c.service_tier)
@@ -463,18 +502,6 @@ pub async fn record_charge(
     })
 }
 
-/// A sell price to write: the platform's price for a model or, with a
-/// `tenant_id`, that tenant's override. `card: None` only with a
-/// `tenant_id`: it ends the override from `effective_from`.
-#[derive(Debug, Clone)]
-pub struct NewSellPrice {
-    pub model_id: Uuid,
-    pub tenant_id: Option<Uuid>,
-    pub effective_from: DateTime<Utc>,
-    pub card: Option<RateCard>,
-    pub source: String,
-}
-
 /// A cost price to write: what an upstream model costs the platform or,
 /// with a `provider_key_id`, what it costs through that one key.
 #[derive(Debug, Clone)]
@@ -493,20 +520,6 @@ pub struct NewDiscount {
     pub tenant_id: Uuid,
     pub effective_from: DateTime<Utc>,
     pub discount_bps: u16,
-}
-
-/// One `pricing_sell_revisions` row.
-#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
-pub struct SellRevision {
-    pub revision_id: i64,
-    pub engine_version: i64,
-    pub model_id: Uuid,
-    pub tenant_id: Option<Uuid>,
-    pub effective_from: DateTime<Utc>,
-    pub card: Option<Value>,
-    pub source: String,
-    pub created_by: Option<Uuid>,
-    pub created_at: DateTime<Utc>,
 }
 
 /// One `pricing_cost_revisions` row.
@@ -596,82 +609,6 @@ pub(crate) fn created_by(actor: Actor<'_>) -> Option<Uuid> {
         Actor::Operator(op) => Some(op.id),
         _ => None,
     }
-}
-
-/// Writes a sell revision starting at `row.effective_from`, refusing with
-/// `422` one that starts in the past (`/effective_from`), a card that does
-/// not validate or a platform price without one (`/card`), a model that is
-/// not live (`/model_id`) and an unknown tenant (`/tenant_id`).
-pub async fn insert_sell_price(
-    conn: &mut PgConnection,
-    row: &NewSellPrice,
-    actor: Actor<'_>,
-) -> Result<SellRevision, ApiError> {
-    starts_now_or_later(&mut *conn, row.effective_from).await?;
-    match (&row.card, row.tenant_id) {
-        (Some(card), _) => check_card(card)?,
-        (None, Some(_)) => {}
-        (None, None) => {
-            return Err(refused(
-                "/card",
-                "平台价格必须带价目卡；只有租户专属价格可以不带价目卡来结束",
-            ))
-        }
-    }
-    let live: bool = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM gw_resources WHERE kind = 'models' AND id = $1 AND NOT deleted)",
-    )
-    .bind(row.model_id)
-    .fetch_one(&mut *conn)
-    .await
-    .map_err(DbError::from)?;
-    if !live {
-        return Err(refused("/model_id", "模型不存在"));
-    }
-    if let Some(tenant) = row.tenant_id {
-        if !tenant_exists(&mut *conn, tenant).await? {
-            return Err(refused("/tenant_id", "租户不存在"));
-        }
-    }
-    let revision: SellRevision = sqlx::query_as(
-        "INSERT INTO pricing_sell_revisions \
-         (engine_version, model_id, tenant_id, effective_from, card, source, created_by) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7) \
-         RETURNING revision_id, engine_version, model_id, tenant_id, effective_from, card, source, \
-                   created_by, created_at",
-    )
-    .bind(i64::from(ENGINE_VERSION))
-    .bind(row.model_id)
-    .bind(row.tenant_id)
-    .bind(row.effective_from)
-    .bind(row.card.as_ref().map(Json))
-    .bind(&row.source)
-    .bind(created_by(actor))
-    .fetch_one(&mut *conn)
-    .await
-    .map_err(DbError::from)?;
-    bump_pricing_version(&mut *conn).await?;
-    audit::record(
-        conn,
-        AuditEntry {
-            actor,
-            action: if row.card.is_some() {
-                "pricing.sell.create"
-            } else {
-                "pricing.sell.end_override"
-            },
-            target_kind: "pricing_sell_revision",
-            target_id: Some(revision.revision_id.to_string()),
-            tenant_id: row.tenant_id,
-            detail: json!({
-                "model_id": row.model_id,
-                "effective_from": row.effective_from,
-                "source": row.source,
-            }),
-        },
-    )
-    .await?;
-    Ok(revision)
 }
 
 /// Writes a cost revision starting at `row.effective_from`, refusing with

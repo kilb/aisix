@@ -31,8 +31,8 @@ use chrono::{DateTime, Datelike, Days, NaiveTime, SecondsFormat, TimeDelta, Utc}
 use futures::FutureExt;
 use serde_json::{json, Value};
 use support::world::{
-    db_now, deliver, insert_sell_backdated, price, seed_key, seed_model, seed_tenant, tokens_680,
-    usage, world, World,
+    db_now, deliver, insert_baseline_backdated, price, seed_key, seed_model, seed_tenant,
+    tokens_680, usage, world, World,
 };
 use support::TestCp;
 use uuid::Uuid;
@@ -64,7 +64,7 @@ async fn fund(cp: &TestCp, w: &World, tenant: Uuid) {
             "POST",
             "/api/billing/topups",
             Some(owner.cookie()),
-            Some(json!({"amount_usd": "100"})),
+            Some(json!({"amount_cny": "100"})),
         )
         .await;
     assert_eq!(r.status, 201, "{r:?}");
@@ -550,7 +550,7 @@ async fn a_charge_priced_before_counted_from_is_not_counted() {
     let Some(q) = setup().await else { return };
     let cp = &q.w.cp;
     let now = db_now(cp).await;
-    insert_sell_backdated(cp.db(), q.model, card_json(), now - TimeDelta::hours(2)).await;
+    insert_baseline_backdated(cp.db(), q.model, card_json(), now - TimeDelta::hours(2)).await;
     let b = created(
         cp,
         q.w.tenant,
@@ -606,7 +606,7 @@ async fn a_charge_on_the_boundary_counts_in_the_period_it_starts() {
     let cp = &q.w.cp;
     let today = today(cp).await;
     let monday = today - Days::new(u64::from(today.weekday().num_days_from_monday()));
-    insert_sell_backdated(cp.db(), q.model, card_json(), monday - Days::new(2)).await;
+    insert_baseline_backdated(cp.db(), q.model, card_json(), monday - Days::new(2)).await;
     let b = created(
         cp,
         q.w.tenant,
@@ -647,7 +647,7 @@ async fn spend_from_an_earlier_period_never_exhausts_the_current_one() {
     let Some(q) = setup().await else { return };
     let (cp, db) = (&q.w.cp, q.w.cp.db());
     let today = today(cp).await;
-    insert_sell_backdated(db, q.model, card_json(), today - Days::new(2)).await;
+    insert_baseline_backdated(db, q.model, card_json(), today - Days::new(2)).await;
     let b = created(
         cp,
         q.w.tenant,
@@ -699,7 +699,7 @@ async fn a_periodic_quota_is_marked_again_once_its_period_rolls_over() {
     let Some(q) = setup().await else { return };
     let (cp, db) = (&q.w.cp, q.w.cp.db());
     let today = today(cp).await;
-    insert_sell_backdated(db, q.model, card_json(), today - Days::new(2)).await;
+    insert_baseline_backdated(db, q.model, card_json(), today - Days::new(2)).await;
     let b = created(
         cp,
         q.w.tenant,

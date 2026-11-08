@@ -1,19 +1,29 @@
 //! `GET /dp/v1/keys/{key_id}/prices`: a gateway asks what a key's tenant pays
 //! per token, so it can show its callers the prices they are charged at.
 //!
-//! The tenant comes from the control plane's own key record, never from the
-//! caller. Any gateway credential of the environment may ask about any key.
-//! The answer lists the tenant's granted models that have a price in force:
-//! the tenant's override card when one is current, otherwise the platform
-//! card less the tenant's current discount (an override is not discounted).
-//! Only the `default` tier's base rates are shown, in USD per token as exact
-//! decimal strings. It carries no channel information.
+//! The tenant and the group come from the control plane's own key record,
+//! never from the caller. Any gateway credential of the environment may ask
+//! about any key.
+//!
+//! A model's price is its baseline in force — the official USD list price,
+//! a full rate card — times the rate in force for the key's group and that
+//! model (its own override, else the group's default), less the tenant's
+//! current discount. Only the `default` tier's base rates are shown, in CNY
+//! per token as exact decimal strings (R12: a listing price is the final one,
+//! discount applied). A model with no baseline, or with no rate the group can
+//! price it at, is absent: the gateway then shows no price rather than a
+//! wrong one.
+//!
+//! The answer keeps the field names and the shape the gateway decodes today,
+//! under their old `input`/`output` names: a rename here would make every
+//! gateway of the interim window answer `/v1/key` with `503`. It carries no
+//! channel information.
 //!
 //! This is a lookup on its own route: it never touches model traffic.
 
 use std::collections::HashMap;
 
-use aisix_pricing::{Rate, RateCard, ServiceTier, ENGINE_VERSION};
+use aisix_pricing::{cny_per_token, CnyPerUsd, RateCard, ServiceTier, ENGINE_VERSION};
 use axum::extract::{Path, State};
 use axum::Json;
 use chrono::{DateTime, Utc};
@@ -23,31 +33,17 @@ use sqlx::PgConnection;
 use uuid::Uuid;
 
 use super::access::key_access;
-use super::plans::{current_discount, current_revisions};
+use super::plans::current_discount;
 use crate::db::DbError;
 use crate::dp::DpIdentity;
 use crate::error::ApiError;
-use crate::pricing::store::{pricing_version, SellRevision};
+use crate::pricing::baselines::current_baselines;
+use crate::pricing::rates::rate_in_force;
+use crate::pricing::store::pricing_version;
 use crate::resources::Kind;
 use crate::AppState;
 
-/// Rates are micro-USD per million units, which is pico-USD per unit; basis
-/// points add 10^4 more.
-const PER_TOKEN_DENOMINATOR: u128 = 10_000_000_000_000_000;
-
-/// `rate × kept_bps / 10 000` pico-USD per unit, as the exact decimal in USD
-/// per unit: no trailing zeros, no `.` for a whole amount.
-pub fn per_token_usd(rate: Rate, kept_bps: u32) -> String {
-    let n = u128::from(rate.0) * u128::from(kept_bps);
-    let (whole, frac) = (n / PER_TOKEN_DENOMINATOR, n % PER_TOKEN_DENOMINATOR);
-    if frac == 0 {
-        return whole.to_string();
-    }
-    let frac = format!("{frac:016}");
-    format!("{whole}.{}", frac.trim_end_matches('0'))
-}
-
-/// One model's price for one tenant, in USD per token.
+/// One model's price for one key's group, in CNY per token.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ModelPrice {
     pub model_id: Uuid,
@@ -72,49 +68,176 @@ pub struct TenantPrices {
     pub models: Vec<ModelPrice>,
 }
 
+/// One granted model with everything needed to price it, as the engine reads
+/// it: its baseline card, the group's rate and the tenant's discount.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PricedModel {
+    pub model_id: Uuid,
+    pub name: String,
+    /// The baseline's `default` tier base rates.
+    pub base: aisix_pricing::Rates,
+    pub cny: CnyPerUsd,
+    pub discount_bps: u16,
+}
+
+/// What every granted model a key's group can price costs, now.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PricedModels {
+    pub pricing_version: i64,
+    /// The earliest instant one of these prices changes: a baseline of a
+    /// granted model, a rate in the group, or the tenant's discount.
+    pub valid_until: Option<DateTime<Utc>>,
+    pub models: Vec<PricedModel>,
+}
+
 /// A stored `engine_version` as the price book reads it: one no `u32` holds
 /// reads as the newest.
 fn engine_version(stored: i64) -> u32 {
     u32::try_from(stored).unwrap_or(u32::MAX)
 }
 
-/// What one sell revision in force says, as the price book reads it.
-enum Sold {
-    /// A usable card.
-    Card(RateCard),
-    /// An override that ended: the platform price applies.
-    Ended,
-    /// Unreadable (a newer engine, or a card that does not decode): the
-    /// engine prices nothing from it and never gives way to another price.
-    Invalid,
+/// The `default` tier's base rates of `card`, `None` when the card carries no
+/// default tier.
+fn base_rates(card: &RateCard) -> Option<aisix_pricing::Rates> {
+    card.0
+        .get(&ServiceTier::default_tier())
+        .map(|t| t.base.clone())
 }
 
-fn read_sell(revision: &SellRevision) -> Sold {
-    if engine_version(revision.engine_version) > ENGINE_VERSION {
-        return Sold::Invalid;
+/// Every granted model of `tenant_id` that has a baseline and a rate for
+/// `group_id` in force, at their prices now.
+///
+/// `None` for a key that does not resolve, which the route answers `404`. A
+/// tenant with no group prices nothing: a grouped key is the only way a
+/// customer has one, and its absence is a closed key rather than a guess at a
+/// rate.
+pub async fn priced_models(
+    conn: &mut PgConnection,
+    tenant_id: Uuid,
+    group_id: Option<Uuid>,
+) -> Result<PricedModels, DbError> {
+    // Read first. Price writes bump it in their own transaction, and this
+    // transaction does not see one snapshot, so a write racing these reads
+    // can only leave the version older than the prices, never newer: a
+    // gateway that keys its cache on it then refetches, and never keeps
+    // stale prices under a fresh version.
+    let pricing_version = pricing_version(&mut *conn).await?.unwrap_or(0);
+    let granted: Vec<Uuid> =
+        sqlx::query_scalar("SELECT allowed_model_ids FROM tenants WHERE id = $1")
+            .bind(tenant_id)
+            .fetch_one(&mut *conn)
+            .await?;
+    // Granted models that still exist, with the name they are listed under.
+    let granted: Vec<(Uuid, String)> = sqlx::query_as(
+        "SELECT id, COALESCE(doc->>'display_name', '') FROM gw_resources \
+         WHERE kind = $1 AND NOT deleted AND id = ANY($2) ORDER BY id",
+    )
+    .bind(Kind::Models.segment())
+    .bind(&granted)
+    .fetch_all(&mut *conn)
+    .await?;
+    let Some(group_id) = group_id else {
+        return Ok(PricedModels {
+            pricing_version,
+            valid_until: None,
+            models: Vec::new(),
+        });
+    };
+    let ids: Vec<Uuid> = granted.iter().map(|(id, _)| *id).collect();
+    let baselines: HashMap<Uuid, RateCard> = current_baselines(&mut *conn, &ids)
+        .await?
+        .into_iter()
+        .filter(|b| engine_version(b.engine_version) <= ENGINE_VERSION)
+        .filter_map(|b| {
+            let card = serde_json::from_value::<RateCard>(b.card).ok()?;
+            Some((b.model_id, card))
+        })
+        .collect();
+    let discount: Option<u16> = match current_discount(&mut *conn, tenant_id).await? {
+        None => Some(0),
+        // A discount a newer engine wrote cannot be read, so no final price
+        // exists: every model of the tenant is absent rather than shown
+        // undiscounted.
+        Some(d) if engine_version(d.engine_version) > ENGINE_VERSION => None,
+        Some(d) => u16::try_from(d.discount_bps)
+            .ok()
+            .filter(|bps| *bps <= 10_000)
+            .map(Some)
+            .unwrap_or(None),
+    };
+    let Some(discount) = discount else {
+        return Ok(PricedModels {
+            pricing_version,
+            valid_until: None,
+            models: Vec::new(),
+        });
+    };
+    let mut models = Vec::new();
+    for (model_id, name) in granted {
+        let Some(base) = baselines.get(&model_id).and_then(base_rates) else {
+            continue;
+        };
+        let Some((rate, _, _)) = rate_in_force(&mut *conn, group_id, Some(model_id)).await? else {
+            continue;
+        };
+        models.push(PricedModel {
+            model_id,
+            name,
+            base,
+            cny: rate,
+            discount_bps: discount,
+        });
     }
-    match &revision.card {
-        None if revision.tenant_id.is_some() => Sold::Ended,
-        None => Sold::Invalid,
-        Some(card) => match serde_json::from_value(card.clone()) {
-            Ok(card) => Sold::Card(card),
-            Err(_) => Sold::Invalid,
-        },
-    }
-}
-
-/// The `default` tier's base rates of `card` at `kept_bps`.
-fn model_price(model_id: Uuid, card: &RateCard, kept_bps: u32) -> Option<ModelPrice> {
-    let base = &card.0.get(&ServiceTier::default_tier())?.base;
-    let show = |r: Rate| per_token_usd(r, kept_bps);
-    Some(ModelPrice {
-        model_id,
-        input: show(base.input),
-        output: show(base.output),
-        input_cache_read: base.cache_read.map(show),
-        input_cache_write: base.cache_write.map(show),
-        input_cache_write_1h: base.cache_write_1h.map(show),
+    Ok(PricedModels {
+        pricing_version,
+        valid_until: valid_until(&mut *conn, &ids, tenant_id, group_id).await?,
+        models,
     })
+}
+
+/// The earliest instant a price of one of `models` in `group_id`, or
+/// `tenant_id`'s discount, changes: the least scheduled `effective_from`
+/// among the three, or `None` when none is.
+async fn valid_until(
+    conn: &mut PgConnection,
+    models: &[Uuid],
+    tenant_id: Uuid,
+    group_id: Uuid,
+) -> Result<Option<DateTime<Utc>>, DbError> {
+    Ok(sqlx::query_scalar(
+        "SELECT min(effective_from) FROM ( \
+           SELECT effective_from FROM pricing_baselines \
+            WHERE model_id = ANY($1) AND effective_from > now() \
+           UNION ALL \
+           SELECT effective_from FROM pricing_group_rates \
+            WHERE group_id = $2 AND model_id = ANY($1) AND effective_from > now() \
+           UNION ALL \
+           SELECT effective_from FROM pricing_group_rates \
+            WHERE group_id = $2 AND model_id IS NULL AND effective_from > now() \
+           UNION ALL \
+           SELECT effective_from FROM pricing_discount_revisions \
+            WHERE tenant_id = $3 AND effective_from > now() \
+         ) s",
+    )
+    .bind(models)
+    .bind(group_id)
+    .bind(tenant_id)
+    .fetch_one(&mut *conn)
+    .await?)
+}
+
+/// One model's price for the gateway's answer: each rate in CNY per token at
+/// `cny`, less `discount_bps`.
+fn model_price(model: &PricedModel) -> ModelPrice {
+    let show = |r: aisix_pricing::Rate| cny_per_token(r, model.cny, model.discount_bps);
+    ModelPrice {
+        model_id: model.model_id,
+        input: show(model.base.input).unwrap_or_default(),
+        output: show(model.base.output).unwrap_or_default(),
+        input_cache_read: model.base.cache_read.and_then(show),
+        input_cache_write: model.base.cache_write.and_then(show),
+        input_cache_write_1h: model.base.cache_write_1h.and_then(show),
+    }
 }
 
 /// The prices of `key_id`'s tenant; `None` for an unknown or revoked key.
@@ -125,87 +248,12 @@ pub async fn tenant_prices(
     let Some(access) = key_access(&mut *conn, key_id).await? else {
         return Ok(None);
     };
-    let tenant_id = access.tenant_id;
-    let granted: Vec<Uuid> =
-        sqlx::query_scalar("SELECT allowed_model_ids FROM tenants WHERE id = $1")
-            .bind(tenant_id)
-            .fetch_one(&mut *conn)
-            .await?;
-    // Read first. Price writes bump it in their own transaction, and this
-    // transaction does not see one snapshot, so a write racing these reads
-    // can only leave the version older than the prices, never newer: a
-    // gateway that keys its cache on it then refetches, and never keeps
-    // stale prices under a fresh version.
-    let pricing_version = pricing_version(&mut *conn).await?.unwrap_or(0);
-    // Granted models that still exist.
-    let granted: Vec<Uuid> = sqlx::query_scalar(
-        "SELECT id FROM gw_resources WHERE kind = $1 AND NOT deleted AND id = ANY($2) ORDER BY id",
-    )
-    .bind(Kind::Models.segment())
-    .bind(&granted)
-    .fetch_all(&mut *conn)
-    .await?;
-
-    // The discount in force, as the engine reads it: `None` when the
-    // tenant has none, `Err` when it is unreadable, which leaves every
-    // platform-priced model unpriced. An override is never discounted.
-    let discount: Result<u32, ()> = match current_discount(&mut *conn, tenant_id).await? {
-        None => Ok(10_000),
-        Some(d) if engine_version(d.engine_version) > ENGINE_VERSION => Err(()),
-        Some(d) => u32::try_from(d.discount_bps)
-            .ok()
-            .and_then(|bps| 10_000u32.checked_sub(bps))
-            .ok_or(()),
-    };
-    let overrides: HashMap<Uuid, SellRevision> =
-        current_revisions(&mut *conn, &granted, Some(tenant_id))
-            .await?
-            .into_iter()
-            .map(|r| (r.model_id, r))
-            .collect();
-    let platform: HashMap<Uuid, SellRevision> = current_revisions(&mut *conn, &granted, None)
-        .await?
-        .into_iter()
-        .map(|r| (r.model_id, r))
-        .collect();
-    let models = granted
-        .iter()
-        .filter_map(|id| {
-            // The tenant's override in force wins, undiscounted; one that
-            // ended gives way to the platform card less the discount; an
-            // unreadable revision, either one, leaves the model unpriced.
-            match overrides.get(id).map(read_sell) {
-                Some(Sold::Card(card)) => return model_price(*id, &card, 10_000),
-                Some(Sold::Invalid) => return None,
-                Some(Sold::Ended) | None => {}
-            }
-            match read_sell(platform.get(id)?) {
-                Sold::Card(card) => model_price(*id, &card, discount.ok()?),
-                Sold::Ended | Sold::Invalid => None,
-            }
-        })
-        .collect();
-
-    let valid_until: Option<DateTime<Utc>> = sqlx::query_scalar(
-        "SELECT min(effective_from) FROM ( \
-           SELECT effective_from FROM pricing_sell_revisions \
-            WHERE model_id = ANY($1) AND (tenant_id IS NULL OR tenant_id = $2) \
-              AND effective_from > now() \
-           UNION ALL \
-           SELECT effective_from FROM pricing_discount_revisions \
-            WHERE tenant_id = $2 AND effective_from > now() \
-         ) s",
-    )
-    .bind(&granted)
-    .bind(tenant_id)
-    .fetch_one(&mut *conn)
-    .await?;
-
+    let priced = priced_models(&mut *conn, access.tenant_id, access.group_id).await?;
     Ok(Some(TenantPrices {
-        tenant_id,
-        pricing_version,
-        valid_until,
-        models,
+        tenant_id: access.tenant_id,
+        pricing_version: priced.pricing_version,
+        valid_until: priced.valid_until,
+        models: priced.models.iter().map(model_price).collect(),
     }))
 }
 
@@ -217,7 +265,7 @@ pub async fn prices(
 ) -> Result<Json<TenantPrices>, ApiError> {
     let key_id = Uuid::parse_str(&key_id).map_err(|_| ApiError::not_found())?;
     // One transaction, so every query shares one `now()` (not one data
-    // snapshot: see the order of the reads in `tenant_prices`).
+    // snapshot: see the order of the reads in `priced_models`).
     let found = state
         .lookups
         .tx(move |conn| async move { tenant_prices(conn, key_id).await }.boxed())
@@ -227,17 +275,83 @@ pub async fn prices(
 
 #[cfg(test)]
 mod tests {
+    use aisix_pricing::Rate;
+
     use super::*;
+
+    fn priced(base: aisix_pricing::Rates, cny: CnyPerUsd, discount_bps: u16) -> PricedModel {
+        PricedModel {
+            model_id: Uuid::nil(),
+            name: "m".to_string(),
+            base,
+            cny,
+            discount_bps,
+        }
+    }
 
     #[test]
     fn per_token_prices_are_exact() {
-        assert_eq!(per_token_usd(Rate::parse("6").unwrap(), 10_000), "0.000006");
-        assert_eq!(per_token_usd(Rate::parse("6").unwrap(), 8_000), "0.0000048");
-        assert_eq!(per_token_usd(Rate::parse("0").unwrap(), 10_000), "0");
-        // The smallest unit: 1 micro-USD per million tokens at 1 bp.
-        assert_eq!(per_token_usd(Rate(1), 1), "0.0000000000000001");
-        // The cap is USD 1 per token.
-        assert_eq!(per_token_usd(Rate::MAX, 10_000), "1");
-        assert_eq!(per_token_usd(Rate::MAX, 9_999), "0.9999");
+        let base = aisix_pricing::Rates {
+            input: Rate::parse("6").unwrap(),
+            output: Rate::parse("6").unwrap(),
+            cache_read: Some(Rate::parse("6").unwrap()),
+            cache_write: None,
+            cache_write_1h: None,
+            reasoning: None,
+            audio_input: None,
+            audio_output: None,
+            image_input: None,
+            image_output: None,
+            web_search: None,
+        };
+        // Rate 1: the CNY figure is the baseline's own.
+        let at_one = model_price(&priced(base.clone(), CnyPerUsd::ONE, 0));
+        assert_eq!(at_one.input, "0.000006");
+        assert_eq!(at_one.input_cache_read.as_deref(), Some("0.000006"));
+        assert_eq!(at_one.input_cache_write, None);
+        // 6 CNY per USD, half off.
+        let at_six = model_price(&priced(base, CnyPerUsd::parse("6").unwrap(), 5_000));
+        assert_eq!(at_six.input, "0.000018");
+        assert_eq!(at_six.output, "0.000018");
+        // The smallest unit: 1 micro-USD per million tokens at rate 0.0001,
+        // a two-thousandth of a fen per million.
+        let tiny = priced(
+            aisix_pricing::Rates {
+                input: Rate(1),
+                output: Rate(1),
+                cache_read: None,
+                cache_write: None,
+                cache_write_1h: None,
+                reasoning: None,
+                audio_input: None,
+                audio_output: None,
+                image_input: None,
+                image_output: None,
+                web_search: None,
+            },
+            CnyPerUsd(1),
+            9_999,
+        );
+        // 1 × 1 × 1 bp / 10²⁰: the smallest CNY per token a rate can express.
+        assert_eq!(model_price(&tiny).input, "0.00000000000000000001");
+        // The cap is USD 1 per token, at rate 1.
+        let capped = priced(
+            aisix_pricing::Rates {
+                input: Rate::MAX,
+                output: Rate::MAX,
+                cache_read: None,
+                cache_write: None,
+                cache_write_1h: None,
+                reasoning: None,
+                audio_input: None,
+                audio_output: None,
+                image_input: None,
+                image_output: None,
+                web_search: None,
+            },
+            CnyPerUsd::ONE,
+            0,
+        );
+        assert_eq!(model_price(&capped).input, "1");
     }
 }

@@ -25,7 +25,7 @@ async fn set_account(pool: &PgPool, tenant: Uuid, mode: &str, balance: i64, limi
         .await
         .expect("set the billing mode");
     sqlx::query(
-        "UPDATE billing_accounts SET balance_micro_usd = $2, credit_limit_micro_usd = $3 \
+        "UPDATE billing_accounts SET balance_micro_cny = $2, credit_limit_micro_cny = $3 \
          WHERE tenant_id = $1",
     )
     .bind(tenant)
@@ -68,7 +68,7 @@ async fn raising_the_credit_limit_lifts_the_mark_in_the_same_request() {
             "PATCH",
             &format!("/admin/tenants/{}/billing", w.tenant),
             Some(w.admin.cookie()),
-            Some(json!({"credit_limit_usd": "0.01"})),
+            Some(json!({"credit_limit_cny": "0.01"})),
         )
         .await;
     assert_eq!(r.status, 200, "{r:?}");
@@ -82,14 +82,14 @@ async fn raising_the_credit_limit_lifts_the_mark_in_the_same_request() {
             "PATCH",
             &format!("/admin/tenants/{}/billing", w.tenant),
             Some(w.admin.cookie()),
-            Some(json!({"credit_limit_usd": "1.00"})),
+            Some(json!({"credit_limit_cny": "1.00"})),
         )
         .await;
     assert_eq!(r.status, 200, "{r:?}");
     assert_eq!(r.body["exhausted"], false, "{r:?}");
-    assert_eq!(r.body["credit_limit_micro_usd"], 1_000_000);
-    assert_eq!(r.body["balance_micro_usd"], -10_200);
-    assert_eq!(r.body["available_micro_usd"], 989_800);
+    assert_eq!(r.body["credit_limit_micro_cny"], 1_000_000);
+    assert_eq!(r.body["balance_micro_cny"], -10_200);
+    assert_eq!(r.body["available_micro_cny"], 989_800);
     // Read right after the answer, without waiting for anything.
     let doc = balance_doc(pool, w.tenant)
         .await
@@ -103,7 +103,7 @@ async fn raising_the_credit_limit_lifts_the_mark_in_the_same_request() {
     .fetch_one(pool)
     .await
     .expect("the audit detail");
-    assert_eq!(detail, json!({"credit_limit_micro_usd": 1_000_000}));
+    assert_eq!(detail, json!({"credit_limit_micro_cny": 1_000_000}));
 }
 
 #[tokio::test]
@@ -117,7 +117,7 @@ async fn lowering_the_credit_limit_marks_the_tenant_in_the_same_request() {
             "PATCH",
             &path,
             Some(w.admin.cookie()),
-            Some(json!({ "credit_limit_usd": limit })),
+            Some(json!({ "credit_limit_cny": limit })),
         )
     };
     let r = patch("2.00").await;
@@ -152,11 +152,11 @@ async fn a_credit_limit_is_dollars_and_cents() {
                 "PATCH",
                 &path,
                 Some(w.admin.cookie()),
-                Some(json!({ "credit_limit_usd": bad })),
+                Some(json!({ "credit_limit_cny": bad })),
             )
             .await;
         assert_eq!(r.status, 422, "{bad:?}: {r:?}");
-        assert_eq!(r.body["details"][0]["path"], "/credit_limit_usd", "{bad:?}");
+        assert_eq!(r.body["details"][0]["path"], "/credit_limit_cny", "{bad:?}");
     }
     // A number is not dollars and cents either.
     let r =
@@ -164,7 +164,7 @@ async fn a_credit_limit_is_dollars_and_cents() {
             "PATCH",
             &path,
             Some(w.admin.cookie()),
-            Some(json!({"credit_limit_usd": 5})),
+            Some(json!({"credit_limit_cny": 5})),
         )
         .await;
     assert_eq!(r.status, 422, "{r:?}");
@@ -177,11 +177,11 @@ async fn a_credit_limit_is_dollars_and_cents() {
             "PATCH",
             &path,
             Some(w.admin.cookie()),
-            Some(json!({"credit_limit_usd": "0"})),
+            Some(json!({"credit_limit_cny": "0"})),
         )
         .await;
     assert_eq!(r.status, 200, "{r:?}");
-    assert_eq!(r.body["credit_limit_micro_usd"], 0);
+    assert_eq!(r.body["credit_limit_micro_cny"], 0);
 }
 
 #[tokio::test]
@@ -192,7 +192,7 @@ async fn a_credit_limit_of_an_unknown_tenant_is_not_found_and_a_pending_one_has_
             "PATCH",
             &format!("/admin/tenants/{}/billing", Uuid::new_v4()),
             Some(w.admin.cookie()),
-            Some(json!({"credit_limit_usd": "1"})),
+            Some(json!({"credit_limit_cny": "1"})),
         )
         .await;
     assert_eq!(r.status, 404, "{r:?}");
@@ -202,11 +202,11 @@ async fn a_credit_limit_of_an_unknown_tenant_is_not_found_and_a_pending_one_has_
             "PATCH",
             &format!("/admin/tenants/{pending}/billing"),
             Some(w.admin.cookie()),
-            Some(json!({"credit_limit_usd": "2.50"})),
+            Some(json!({"credit_limit_cny": "2.50"})),
         )
         .await;
     assert_eq!(r.status, 200, "{r:?}");
-    assert_eq!(r.body["credit_limit_micro_usd"], 2_500_000);
+    assert_eq!(r.body["credit_limit_micro_cny"], 2_500_000);
     // Its approval writes its first mark; until then it has none.
     assert!(balance_doc(w.cp.db().pool(), pending).await.is_none());
 }
@@ -276,8 +276,8 @@ async fn one_tenants_account_reads_as_the_list_does() {
     assert_eq!(r.status, 200, "{r:?}");
     assert_eq!(r.body["tenant_id"], json!(w.tenant.to_string()));
     assert_eq!(r.body["billing_mode"], "postpaid");
-    assert_eq!(r.body["balance_micro_usd"], -250_000);
-    assert_eq!(r.body["available_micro_usd"], 750_000);
+    assert_eq!(r.body["balance_micro_cny"], -250_000);
+    assert_eq!(r.body["available_micro_cny"], 750_000);
     assert_eq!(r.body["exhausted"], false);
     let r =
         w.cp.send(
@@ -307,9 +307,9 @@ async fn owners_admins_and_billing_members_read_the_balance() {
             r.body,
             json!({
                 "billing_mode": "prepaid",
-                "balance_micro_usd": 5_000_000,
-                "credit_limit_micro_usd": 0,
-                "available_micro_usd": 5_000_000,
+                "balance_micro_cny": 5_000_000,
+                "credit_limit_micro_cny": 0,
+                "available_micro_cny": 5_000_000,
                 "exhausted": false,
                 "pending_topups": 0,
             }),
@@ -347,7 +347,7 @@ async fn only_operators_change_a_credit_limit() {
     let viewer = cp.admin_login_seeded(OperatorRole::Viewer).await;
     let operator = cp.admin_login_seeded(OperatorRole::Operator).await;
     let path = format!("/admin/tenants/{tenant}/billing");
-    let body = || Some(json!({"credit_limit_usd": "3.00"}));
+    let body = || Some(json!({"credit_limit_cny": "3.00"}));
     let r = cp.send("PATCH", &path, Some(viewer.cookie()), body()).await;
     assert_eq!(
         (r.status, &r.body["code"]),
@@ -362,5 +362,5 @@ async fn only_operators_change_a_credit_limit() {
         .send("PATCH", &path, Some(operator.cookie()), body())
         .await;
     assert_eq!(r.status, 200, "{r:?}");
-    assert_eq!(r.body["credit_limit_micro_usd"], 3_000_000);
+    assert_eq!(r.body["credit_limit_micro_cny"], 3_000_000);
 }

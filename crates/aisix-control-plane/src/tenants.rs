@@ -706,7 +706,9 @@ pub async fn ensure_internal_tenant(db: &Db, ctx: &WriteCtx) -> Result<TenantRow
                             name: INTERNAL_TENANT_NAME,
                             status: TenantStatus::Active,
                             is_internal: true,
-                            billing_mode: BillingMode::Prepaid,
+                            // The platform funds its own tenant postpaid (R2):
+                            // never blocked, and its consumption is its balance.
+                            billing_mode: BillingMode::Postpaid,
                             groups: &[],
                             limits: &TenantLimits::default(),
                             approved_by: None,

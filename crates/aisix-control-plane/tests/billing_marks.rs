@@ -42,7 +42,7 @@ use uuid::Uuid;
 /// Tenant `tenant`'s billing account.
 async fn account(db: &Db, tenant: Uuid) -> Account {
     sqlx::query_as(
-        "SELECT tenant_id, balance_micro_usd, credit_limit_micro_usd, balance_budget_id, \
+        "SELECT tenant_id, balance_micro_cny, credit_limit_micro_cny, balance_budget_id, \
          marked_exhausted, marks_dirty FROM billing_accounts WHERE tenant_id = $1",
     )
     .bind(tenant)
@@ -127,8 +127,8 @@ async fn until_marked(db: &Db, tenant: Uuid, want: &Value) {
 /// flagging the account.
 async fn set_account(db: &Db, tenant: Uuid, balance: i64, credit_limit: Option<i64>) {
     sqlx::query(
-        "UPDATE billing_accounts SET balance_micro_usd = $2, \
-           credit_limit_micro_usd = COALESCE($3, credit_limit_micro_usd) \
+        "UPDATE billing_accounts SET balance_micro_cny = $2, \
+           credit_limit_micro_cny = COALESCE($3, credit_limit_micro_cny) \
          WHERE tenant_id = $1",
     )
     .bind(tenant)
@@ -414,7 +414,7 @@ async fn a_postpaid_tenant_is_marked_once_it_spends_its_credit_limit() {
     assert_eq!(r.status, 200, "{r:?}");
     let within = account(w.cp.db(), w.tenant).await;
     assert_eq!(
-        (within.balance_micro_usd, within.marks_dirty),
+        (within.balance_micro_cny, within.marks_dirty),
         (-9_520, false)
     );
     assert_eq!(live_mark(w.cp.db(), w.tenant).await.doc, open_doc(w.tenant));
@@ -422,7 +422,7 @@ async fn a_postpaid_tenant_is_marked_once_it_spends_its_credit_limit() {
     let r = deliver(&w.dp, Uuid::new_v4(), rows(&w, model, "past", 1)).await;
     assert_eq!(r.status, 200, "{r:?}");
     assert_eq!(
-        account(w.cp.db(), w.tenant).await.balance_micro_usd,
+        account(w.cp.db(), w.tenant).await.balance_micro_cny,
         -10_200
     );
     until_marked(
@@ -473,7 +473,7 @@ async fn switching_to_prepaid_with_a_negative_balance_marks_the_tenant() {
     settle(&w.cp, w.tenant).await;
     let r = deliver(&w.dp, Uuid::new_v4(), rows(&w, model, "spent", 1)).await;
     assert_eq!(r.status, 200, "{r:?}");
-    assert_eq!(account(w.cp.db(), w.tenant).await.balance_micro_usd, -680);
+    assert_eq!(account(w.cp.db(), w.tenant).await.balance_micro_cny, -680);
     assert_eq!(live_mark(w.cp.db(), w.tenant).await.doc, open_doc(w.tenant));
 
     let r = patch_tenant(
@@ -591,7 +591,7 @@ async fn ingest_never_waits_on_the_resources_lock() {
     assert_eq!(r.status, 200, "{r:?}");
     let crossed = account(w.cp.db(), w.tenant).await;
     assert_eq!(
-        (crossed.balance_micro_usd, crossed.marks_dirty),
+        (crossed.balance_micro_cny, crossed.marks_dirty),
         (-360, true)
     );
     // The settler does not wait for the lock either, so it holds no account
@@ -895,7 +895,7 @@ async fn a_crossing_batch_never_waits_on_a_held_tenant_row() {
     assert_eq!(r.status, 200, "{r:?}");
     let crossed = account(w.cp.db(), w.tenant).await;
     assert_eq!(
-        (crossed.balance_micro_usd, crossed.marks_dirty),
+        (crossed.balance_micro_cny, crossed.marks_dirty),
         (-360, true)
     );
     edit.rollback().await.expect("end the edit");
@@ -925,7 +925,7 @@ async fn the_internal_tenant_is_never_marked() {
     assert_eq!(r.status, 200, "{r:?}");
     let account = account(w.cp.db(), internal).await;
     assert_eq!(
-        (account.balance_micro_usd, account.marks_dirty),
+        (account.balance_micro_cny, account.marks_dirty),
         (-680, false)
     );
     let owned: i64 = sqlx::query_scalar("SELECT count(*) FROM gw_resources WHERE managed_by = $1")
@@ -1475,7 +1475,7 @@ async fn a_model_delete_never_makes_intake_wait() {
     assert_eq!(delivered.status, 200, "{delivered:?}");
     assert_eq!(deleted.status, 200, "{deleted:?}");
     assert_eq!(
-        account(w.cp.db(), w.tenant).await.balance_micro_usd,
+        account(w.cp.db(), w.tenant).await.balance_micro_cny,
         1_000_000 - 680
     );
 }
