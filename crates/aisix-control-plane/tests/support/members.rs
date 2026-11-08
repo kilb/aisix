@@ -53,7 +53,7 @@ pub fn tenant_fixture(method: &str, path: &str) -> (String, Option<Value>) {
             path.to_string(),
             Some(json!({"current_password": TEST_PASSWORD, "new_password": "short"})),
         ),
-        ("GET", "/api/org" | "/api/models" | "/api/members" | "/api/members/invites") => {
+        ("GET", "/api/org" | "/api/models" | "/api/groups" | "/api/members" | "/api/members/invites") => {
             (path.to_string(), None)
         }
         ("POST", "/api/members/invites") => (

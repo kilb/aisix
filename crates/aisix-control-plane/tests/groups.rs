@@ -642,7 +642,9 @@ async fn a_group_in_use_cannot_be_retired() {
             "POST",
             &format!("/admin/tenants/{tenant}/keys"),
             Some(unconfigured.cookie()),
-            Some(json!({"label": "inuse-7c1", "allowed_provider_groups": ["grp-inuse-7c1"]})),
+            // The tenant is assigned exactly this group, so the key takes it
+            // without naming it: a key's own group is fixed at creation.
+            Some(json!({"label": "inuse-7c1"})),
         )
         .await;
     assert_eq!(key.status, 201, "{key:?}");
@@ -705,7 +707,7 @@ async fn a_group_in_use_cannot_be_retired() {
         )
         .await;
     assert_eq!(r.status, 200, "{r:?}");
-    // The key's own override is revoked with the key.
+    // The key naming it is revoked, which leaves nothing naming the group.
     let key_id = key.body["key"]["id"]
         .as_str()
         .expect("a key id")

@@ -272,6 +272,8 @@ pub const ROUTE_ROLES: &[(&str, &str, MinRole)] = &[
     ("POST", "/api/password", MinRole::Member(EVERY_MEMBER)),
     ("GET", "/api/org", MinRole::Member(EVERY_MEMBER)),
     ("GET", "/api/models", MinRole::Member(EVERY_MEMBER)),
+    // The groups a tenant may choose a key's group from, by display name.
+    ("GET", "/api/groups", MinRole::Member(EVERY_MEMBER)),
     ("GET", "/api/members", MinRole::Member(MANAGERS)),
     ("GET", "/api/members/invites", MinRole::Member(MANAGERS)),
     ("POST", "/api/members/invites", MinRole::Member(MANAGERS)),
@@ -665,6 +667,7 @@ pub fn browser_router(state: AppState) -> Router {
         .route("/api/password", post(members::change_password))
         .route("/api/org", get(members::org))
         .route("/api/models", get(members::models))
+        .route("/api/groups", get(groups::tenant_groups))
         .route("/api/members", get(members::list))
         .route(
             "/api/members/invites",
