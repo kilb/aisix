@@ -88,6 +88,12 @@ pub fn tenant_fixture(method: &str, path: &str) -> (String, Option<Value>) {
             format!("{path}?group=day&from=2026-01-01T00:00:00Z&to=2026-01-02T00:00:00Z"),
             None,
         ),
+        ("GET", "/api/billing/topups") => (path.to_string(), None),
+        // An amount of 0 is refused after the identity checks.
+        ("POST", "/api/billing/topups") => (path.to_string(), Some(json!({"amount_usd": "0"}))),
+        ("GET", "/api/billing/topups/{id}") => {
+            (format!("/api/billing/topups/{}", Uuid::new_v4()), None)
+        }
         _ => panic!("no fixture for {method} {path}: add one to tests/support/members.rs"),
     }
 }

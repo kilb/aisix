@@ -200,6 +200,17 @@ fn fixture(method: &str, path: &str, target: &SeededOperator) -> (String, Option
             ),
             None,
         ),
+        // Top-ups. The top-up matches nothing: 404 once the role check
+        // passed, so nothing is decided.
+        ("GET", "/admin/billing/topups") => (path.to_string(), None),
+        ("POST", "/admin/billing/topups/{id}/approve") => (
+            format!("/admin/billing/topups/{}/approve", Uuid::nil()),
+            Some(json!({})),
+        ),
+        ("POST", "/admin/billing/topups/{id}/reject") => (
+            format!("/admin/billing/topups/{}/reject", Uuid::nil()),
+            Some(json!({"reason": "roles"})),
+        ),
         _ => panic!("no fixture for {method} {path}: add one to tests/roles.rs"),
     }
 }

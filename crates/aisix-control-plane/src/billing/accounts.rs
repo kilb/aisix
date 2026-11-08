@@ -46,20 +46,22 @@ pub struct BillingAccount {
     /// Whether the balance rule blocks the tenant now; never for the
     /// internal tenant.
     pub exhausted: bool,
-    /// Top-ups awaiting a decision; 0 until top-ups exist.
+    /// The tenant's top-up requests awaiting a decision.
     pub pending_topups: i64,
 }
 
 /// The columns of a [`BillingAccount`] read, with the account's own columns
 /// as zeros for a tenant that has no account yet.
 const SELECT: &str = "SELECT t.id, t.name, t.status, t.is_internal, t.billing_mode, \
-     COALESCE(a.balance_micro_usd, 0), COALESCE(a.credit_limit_micro_usd, 0) \
+     COALESCE(a.balance_micro_usd, 0), COALESCE(a.credit_limit_micro_usd, 0), \
+     (SELECT count(*) FROM billing_topups p WHERE p.tenant_id = t.id AND p.status = 'pending') \
      FROM tenants t LEFT JOIN billing_accounts a ON a.tenant_id = t.id";
 
-type Raw = (Uuid, String, String, bool, String, i64, i64);
+type Raw = (Uuid, String, String, bool, String, i64, i64, i64);
 
 fn account_of(raw: Raw) -> Result<BillingAccount, ApiError> {
-    let (tenant_id, tenant_name, status, is_internal, mode, balance, credit_limit) = raw;
+    let (tenant_id, tenant_name, status, is_internal, mode, balance, credit_limit, pending_topups) =
+        raw;
     let billing_mode = BillingMode::parse(&mode)
         .ok_or_else(|| ApiError::internal(format!("tenant {tenant_id}: billing mode {mode}")))?;
     Ok(BillingAccount {
@@ -75,7 +77,7 @@ fn account_of(raw: Raw) -> Result<BillingAccount, ApiError> {
             BillingMode::Postpaid => balance.saturating_add(credit_limit),
         },
         exhausted: !is_internal && marks::exhausted(billing_mode, balance, credit_limit),
-        pending_topups: 0,
+        pending_topups,
     })
 }
 
