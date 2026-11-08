@@ -102,6 +102,9 @@ function defaultRange(group: "day" | "month"): { from: string; to: string } {
   return utcRange(start.toISOString().slice(0, 10), todayUtc(now));
 }
 
+/** The longest span the control plane summarises: 92 days by day, 731 days by month. */
+const MAX_DAYS = { day: 92, month: 731 } as const;
+
 function Section({ title, children }: { title: string; children: ReactNode }) {
   return (
     <div className="panel list" role="region" aria-label={title}>
@@ -200,18 +203,20 @@ function Summary({ keys, showKeys }: { keys: TenantKey[]; showKeys: boolean }) {
   const [rows, setRows] = useState<UsageSummaryRow[] | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const range = rangeOf(fromDate, toDate);
+  // A summary needs both ends: a date left empty reads as the default span.
+  const fallback = defaultRange(group);
+  const span = range ? (Date.parse(range.to ?? fallback.to) - Date.parse(range.from ?? fallback.from)) / 86_400_000 : 0;
+  const tooLong = span > MAX_DAYS[group];
   // The latest request: an answer to an older filter is dropped.
   const ticket = useRef(0);
 
   useEffect(() => {
     const mine = ++ticket.current;
-    if (!range) {
+    if (!range || tooLong) {
       setRows([]);
       setErr(null);
       return;
     }
-    // A summary needs both ends: a date left empty reads as the default span.
-    const fallback = defaultRange(group);
     setRows(null);
     usageSummary({ group, from: range.from ?? fallback.from, to: range.to ?? fallback.to, ...(keyId ? { api_key_id: keyId } : {}) }).then(
       (items) => {
@@ -227,7 +232,7 @@ function Summary({ keys, showKeys }: { keys: TenantKey[]; showKeys: boolean }) {
     );
     // `range` is derived from the two dates.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [group, fromDate, toDate, keyId]);
+  }, [group, fromDate, toDate, keyId, tooLong]);
 
   return (
     <Section title="用量汇总">
@@ -242,7 +247,7 @@ function Summary({ keys, showKeys }: { keys: TenantKey[]; showKeys: boolean }) {
           <Field label="开始日期（UTC）" error={range ? null : "结束日期不能早于开始日期"}>
             <input type="date" value={fromDate} max={toDate || undefined} onChange={(e) => setFromDate(e.target.value)} />
           </Field>
-          <Field label="结束日期（UTC）">
+          <Field label="结束日期（UTC）" error={tooLong ? `时间范围过大：按天最多 ${MAX_DAYS.day} 天，按月最多 ${MAX_DAYS.month} 天` : null}>
             <input type="date" value={toDate} min={fromDate || undefined} onChange={(e) => setToDate(e.target.value)} />
           </Field>
           {showKeys && <KeySelect keys={keys} value={keyId} onChange={setKeyId} />}
@@ -258,7 +263,7 @@ function Summary({ keys, showKeys }: { keys: TenantKey[]; showKeys: boolean }) {
         )}
       </div>
       {rows === null && <Loading />}
-      {rows !== null && rows.length === 0 && !err && <EmptyState text="所选范围内没有用量" mark="route" />}
+      {rows !== null && rows.length === 0 && !err && !tooLong && <EmptyState text="所选范围内没有用量" mark="route" />}
       {rows !== null && rows.length > 0 && (
         <DataTable label="用量汇总">
           <thead>

@@ -126,6 +126,24 @@ async function grant(world: BillingWorld, modelId: string): Promise<void> {
   );
 }
 
+/** A model of its own with the standard price, granted to `world` and listed by the gateway. */
+async function pricedModel(world: BillingWorld, name: string): Promise<string> {
+  const id = await addModel(name);
+  const startsAt = Date.now() + 3_000;
+  await stack.admin.post("/admin/pricing/sell", {
+    model_id: id,
+    effective_from: new Date(startsAt).toISOString(),
+    card: { default: { base: { input: "1000", output: "2000" } } },
+  });
+  await grant(world, id);
+  await gatewayListsModel(world.key.plaintext, name);
+  await expect.poll(() => Date.now() > startsAt + 500).toBe(true);
+  return id;
+}
+
+/** The names a tenant must never read, anywhere in the page or in what the API sent it. */
+const CHANNEL = ["acct-ui-7c1", "grp-ui-5d2", "upstream-mdl-ui-9f3", "upstream-", "sk-acct-", "ECONNREFUSED", "127.0.0.1"];
+
 test("调用记录逐次列出模型、密钥、状态与费用，展开后看到计费明细", async ({ page }) => {
   const world = await seedBillingWorld(stack);
   expect(await chat(stack, world.key.plaintext, "chat-ui")).toBe(200);
@@ -158,11 +176,15 @@ test("调用记录与汇总里没有任何上游渠道、账号、分组或上�
   await expect(summary.getByRole("table", { name: "用量汇总" }).locator("tbody > tr")).toHaveCount(1);
 
   for (const region of [log, summary]) {
-    const text = await region.innerText();
     // The same read does see what the tenant may see, so an empty read cannot pass.
-    expect(text).toContain("chat-ui");
-    for (const channel of ["acct-ui-7c1", "grp-ui-5d2", "upstream-mdl-ui-9f3"]) expect(text).not.toContain(channel);
+    expect(await region.innerText()).toContain("chat-ui");
   }
+  // The page's markup, attributes included, and the log as the API sent it.
+  const html = await page.content();
+  for (const channel of CHANNEL) expect(html).not.toContain(channel);
+  const raw = JSON.stringify((await (await signedIn(world.owner)).get("/api/usage/calls")).items);
+  expect(raw).toContain("chat-ui");
+  for (const channel of [...CHANNEL, "error_message", "provider", "upstream_model"]) expect(raw).not.toContain(channel);
 });
 
 test("无权使用的模型与不存在的模型，在调用记录里显示相同的状态", async ({ page }) => {
@@ -200,8 +222,17 @@ test("上游无法访问时只显示归一后的原因", async ({ page }) => {
   const row = logRows(log).filter({ hasText: "chat-ui-down" });
   await expect(row).toHaveCount(1);
   await expect(row.getByRole("cell").nth(6)).toHaveText("失败（上游暂不可用）");
-  // Nothing of the address the upstream was tried at.
-  expect(await log.innerText()).not.toContain(String(closed));
+  // Nothing of the address the upstream was tried at, or of how it failed, in the page or in the API's answer.
+  const html = await page.content();
+  const raw = JSON.stringify((await (await signedIn(world.owner)).get("/api/usage/calls")).items);
+  expect(raw).toContain("chat-ui-down");
+  for (const text of [...CHANNEL, String(closed), "acct-chat-ui-down", "sk-chat-ui-down", "upstream-chat-ui-down"]) {
+    expect(html).not.toContain(text);
+    expect(raw).not.toContain(text);
+  }
+  // The Call shape has a `status_code`, which a failed call leaves null: no upstream status reaches the tenant.
+  for (const key of ["error_message", "provider"]) expect(raw).not.toContain(`"${key}"`);
+  expect(JSON.parse(raw).map((c: Json) => [c.status, c.error_class, c.status_code])).toEqual([["failed", "upstream_unavailable", null]]);
 });
 
 test("按请求 ID 找到一次调用", async ({ page }) => {
@@ -264,24 +295,28 @@ test("用量汇总与调用记录一致", async ({ page }) => {
   const row = summary.getByRole("row").filter({ hasText: today });
   await expect(row).toHaveCount(1);
   const cells = row.getByRole("cell");
+  await expect(summary).toContainText("按用量发生的时间汇总");
   await expect(cells.nth(1)).toHaveText("chat-ui");
   await expect(cells.nth(2)).toHaveText("3");
   await expect(cells.nth(3)).toHaveText("$0.033");
   await expect(cells.nth(4)).toHaveText(/输入 15(?!\d).*输出 9(?!\d)/);
 });
 
-// Last on purpose: its cache policy stays on the model for the rest of the stack, and a repeated
-// request in any later test would be served from the cache and not billed.
 test("缓存命中的调用显示不计费", async ({ page }) => {
-  const world = await seedBillingWorld(stack, { cachePolicy: true });
-  expect(await chat(stack, world.key.plaintext, "chat-ui")).toBe(200);
+  const world = await seedBillingWorld(stack);
+  // A model of its own, so the cache policy touches no other test.
+  const id = await pricedModel(world, "chat-ui-cached");
+  await stack.admin.post("/admin/resources/cache_policies", {
+    doc: { name: `cache-ui-${world.tenantId.slice(0, 8)}`, scope: "team", applies_to_model_id: id, ttl_seconds: 300 },
+  });
+  expect(await chat(stack, world.key.plaintext, "chat-ui-cached")).toBe(200);
   await logged(world.owner, 1);
   // The same request again: the answer is served from the cache, which may take a moment to fill.
   let calls = 1;
   await expect
     .poll(
       async () => {
-        expect(await chat(stack, world.key.plaintext, "chat-ui")).toBe(200);
+        expect(await chat(stack, world.key.plaintext, "chat-ui-cached")).toBe(200);
         calls += 1;
         const items = await logged(world.owner, calls, true);
         return items[0].cache_hit === true;
@@ -296,17 +331,18 @@ test("缓存命中的调用显示不计费", async ({ page }) => {
   await expect(logRows(log).last().getByRole("cell").nth(7)).toHaveText("$0.011");
 });
 
-// After the cache test: a new price for `chat-ui` outlives this test, and every other test
-// in the file reads the original one.
 test("重新计价后，调用的费用显示已调整的金额，汇总计入调整", async ({ page }) => {
+  await waitClearOfUtcMidnight();
   const world = await seedBillingWorld(stack);
-  expect(await chat(stack, world.key.plaintext, "chat-ui")).toBe(200);
+  // A model of its own, so the new price touches no other test.
+  const modelId = await pricedModel(world, "chat-ui-repriced");
+  expect(await chat(stack, world.key.plaintext, "chat-ui-repriced")).toBe(200);
   await logged(world.owner, 1);
 
   // The price doubles, from a moment ahead; a run then corrects the call at the new price.
   const startsAt = Date.now() + 3_000;
   await stack.admin.post("/admin/pricing/sell", {
-    model_id: world.model.id,
+    model_id: modelId,
     effective_from: new Date(startsAt).toISOString(),
     card: { default: { base: { input: "2000", output: "4000" } } },
   });
@@ -336,4 +372,15 @@ test("重新计价后，调用的费用显示已调整的金额，汇总计入�
   // The correction counts in the period the call occurred in: $0.011 charged and $0.011 corrected.
   const today = new Date().toISOString().slice(0, 10);
   await expect(summary.getByRole("row").filter({ hasText: today }).getByRole("cell").nth(3)).toHaveText("$0.022");
+});
+
+test("汇总的时间范围超过上限时，在日期旁说明，不发出请求", async ({ page }) => {
+  const world = await seedBillingWorld(stack);
+  const { summary } = await openUsage(page, world.owner);
+  await expect(summary.getByRole("combobox", { name: "汇总方式" })).toHaveValue("day");
+  await summary.getByLabel("开始日期（UTC）").fill("2020-01-01");
+  await summary.getByLabel("结束日期（UTC）").fill("2020-06-30");
+  await expect(summary).toContainText("按天最多 92 天，按月最多 731 天");
+  await summary.getByRole("combobox", { name: "汇总方式" }).selectOption("month");
+  await expect(summary).not.toContainText("时间范围过大");
 });

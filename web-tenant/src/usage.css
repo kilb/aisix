@@ -1,7 +1,7 @@
 /* 用量: the filters of the two panels and a call's expanded detail. Tokens only. */
 .usage-filters {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(calc(var(--s-12) * 4), 1fr));
   gap: var(--s-4);
   align-items: end;
 }
