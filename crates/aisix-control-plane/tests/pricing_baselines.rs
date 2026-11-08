@@ -689,7 +689,10 @@ async fn baselines_refuse_update_delete_and_truncate() {
     for sql in [
         "UPDATE pricing_baselines SET card = '{}'::jsonb",
         "DELETE FROM pricing_baselines",
-        "TRUNCATE pricing_baselines",
+        // With the table that references it in a proposal: Postgres refuses
+        // a truncate of `pricing_baselines` alone for the foreign key, which
+        // is a different refusal than the trigger's.
+        "TRUNCATE pricing_baselines, pricing_import_proposals",
     ] {
         let err = sqlx::query(sql)
             .execute(cp.db().pool())

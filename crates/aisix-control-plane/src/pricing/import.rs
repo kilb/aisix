@@ -45,16 +45,49 @@
 //! prices do not make a card [`RateCard::validate`] accepts (`invalid_card`).
 //! Any other flag leaves the card in place for the comparison, but a flagged
 //! proposal is never confirmable.
+//!
+//! # Uploads and proposals
+//!
+//! `POST /admin/pricing/imports` writes the batch and its proposals in one
+//! transaction, and supersedes every open batch, with its pending proposals,
+//! first: a newer upload is what an operator reviews. `GET
+//! /admin/pricing/imports` lists the newest [`LISTED_BATCHES`], and `GET
+//! /admin/pricing/imports/{id}` a batch with its proposals and, computed on
+//! read, each proposal's suggested model's [`BaselineRevision`] in force, the
+//! built-in catalogue's entry for the same provider and model, and whether
+//! the card already equals that baseline. A proposal with a model of its own
+//! is suggested by the live direct model whose document carries its
+//! `provider` and `model_name`; confirmation, which is what turns one into a
+//! price, is another route's.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use aisix_pricing::{Dimension, LongContextBand, Rate, RateCard, Rates, ServiceTier, TierRates};
+use aisix_pricing::{
+    CatalogueEntry, Dimension, LongContextBand, Rate, RateCard, Rates, ServiceTier, TierRates,
+};
+use axum::extract::rejection::QueryRejection;
+use axum::extract::{Path, Query, State};
+use axum::http::StatusCode;
+use axum::Json;
 use chrono::{DateTime, NaiveDate, NaiveTime, Utc};
+use futures::FutureExt;
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use serde_json::Value;
+use sqlx::postgres::PgRow;
+use sqlx::types::Json as JsonColumn;
+use sqlx::{PgConnection, Postgres, QueryBuilder, Row};
+use uuid::Uuid;
 
+use super::baselines::{self, BaselineRevision, OperatorRef};
+use crate::audit::{self, Actor, AuditEntry};
+use crate::auth::{OperatorAuth, OperatorRole};
+use crate::db::DbError;
 use crate::error::{ApiError, Detail};
+use crate::http::ApiJson;
+use crate::resources::Kind;
+use crate::usage::query_rejected;
+use crate::AppState;
 
 /// The dataset this import reads, recorded on every batch and on every
 /// baseline confirmed from it. The one place its name appears in code.
@@ -100,6 +133,9 @@ pub struct ParsedProposal {
     /// The date the dataset says it checked the model's prices, if it says.
     pub prices_checked: Option<NaiveDate>,
 }
+
+/// The most batches `GET /admin/pricing/imports` lists.
+const LISTED_BATCHES: usize = 20;
 
 /// A `422` at `path`.
 fn refused(path: &str, message: impl Into<String>) -> ApiError {
@@ -150,6 +186,472 @@ pub fn parse(data: &RawValue, now: DateTime<Utc>) -> Result<Vec<ParsedProposal>,
         return Err(unrecognised());
     }
     Ok(proposals)
+}
+
+/// One upload of a dataset.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ImportBatch {
+    pub id: Uuid,
+    pub dataset: String,
+    pub dataset_ref: String,
+    /// `open`, or `superseded` once a newer upload has taken over.
+    pub status: String,
+    /// How many proposals it made.
+    pub proposals: i64,
+    /// How many of them are flagged.
+    pub flagged: i64,
+    pub created_by: OperatorRef,
+    pub created_at: DateTime<Utc>,
+}
+
+impl<'r> sqlx::FromRow<'r, PgRow> for ImportBatch {
+    fn from_row(row: &'r PgRow) -> Result<ImportBatch, sqlx::Error> {
+        Ok(ImportBatch {
+            id: row.try_get("id")?,
+            dataset: row.try_get("dataset")?,
+            dataset_ref: row.try_get("dataset_ref")?,
+            status: row.try_get("status")?,
+            proposals: row.try_get("proposals")?,
+            flagged: row.try_get("flagged")?,
+            created_by: OperatorRef {
+                id: row.try_get("created_by")?,
+                email: row.try_get("created_by_email")?,
+            },
+            created_at: row.try_get("created_at")?,
+        })
+    }
+}
+
+/// The columns an [`ImportBatch`] is read from, over
+/// `pricing_import_batches b` joined to `operators o` on `created_by`.
+const BATCH_COLUMNS: &str = "b.id, b.dataset, b.dataset_ref, b.status, b.proposals, b.flagged, \
+                             b.created_by, o.email AS created_by_email, b.created_at";
+
+/// One proposal, as stored, with what the review compares it to, computed on
+/// read.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Proposal {
+    pub id: Uuid,
+    pub batch_id: Uuid,
+    /// The dataset's provider id.
+    pub provider: String,
+    /// The dataset's model id.
+    pub model: String,
+    /// `None`: in effect at upload.
+    pub effective_from: Option<DateTime<Utc>>,
+    /// The card it comes to, when its prices made one.
+    pub card: Option<Value>,
+    pub flags: Vec<Flag>,
+    /// The provider's first cited pricing page.
+    pub pricing_url: Option<String>,
+    pub prices_checked: Option<NaiveDate>,
+    /// A live direct model whose provider and model name are the entry's.
+    pub suggested_model_id: Option<Uuid>,
+    /// `pending`, `confirmed`, `rejected` or `superseded`.
+    pub status: String,
+    pub decided_by: Option<Uuid>,
+    pub decided_at: Option<DateTime<Utc>>,
+    pub reject_reason: Option<String>,
+    /// The baseline a confirmation wrote.
+    pub baseline_revision_id: Option<i64>,
+    /// The suggested model's baseline in force now, if it has one.
+    pub current_baseline: Option<BaselineRevision>,
+    /// The built-in catalogue's entry for the dataset's provider and model,
+    /// in effect at the proposal's start.
+    pub catalogue_entry: Option<CatalogueEntryView>,
+    /// Whether the card equals the current baseline's: nothing to confirm.
+    pub same_as_current: bool,
+}
+
+/// The built-in catalogue's entry for one model.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct CatalogueEntryView {
+    pub key: String,
+    pub card: RateCard,
+    pub source_url: String,
+    pub as_of: NaiveDate,
+}
+
+impl CatalogueEntryView {
+    fn of(entry: &CatalogueEntry) -> CatalogueEntryView {
+        CatalogueEntryView {
+            key: entry.key.clone(),
+            card: entry.card.clone(),
+            source_url: entry.source_url.clone(),
+            as_of: entry.as_of,
+        }
+    }
+}
+
+/// The columns a [`Proposal`] is read from, over
+/// `pricing_import_proposals p`.
+const PROPOSAL_COLUMNS: &str = "p.id, p.batch_id, p.provider, p.model, p.effective_from, p.card, \
+                                p.flags, p.pricing_url, p.prices_checked, p.suggested_model_id, \
+                                p.status, p.decided_by, p.decided_at, p.reject_reason, \
+                                p.baseline_revision_id";
+
+impl<'r> sqlx::FromRow<'r, PgRow> for Proposal {
+    /// The stored row; what it is compared to is added by [`read_proposals`].
+    fn from_row(row: &'r PgRow) -> Result<Proposal, sqlx::Error> {
+        let flags: Value = row.try_get("flags")?;
+        Ok(Proposal {
+            id: row.try_get("id")?,
+            batch_id: row.try_get("batch_id")?,
+            provider: row.try_get("provider")?,
+            model: row.try_get("model")?,
+            effective_from: row.try_get("effective_from")?,
+            card: row.try_get("card")?,
+            // A stored flag this build does not know reads as none, so the
+            // card still shows.
+            flags: serde_json::from_value(flags).unwrap_or_default(),
+            pricing_url: row.try_get("pricing_url")?,
+            prices_checked: row.try_get("prices_checked")?,
+            suggested_model_id: row.try_get("suggested_model_id")?,
+            status: row.try_get("status")?,
+            decided_by: row.try_get("decided_by")?,
+            decided_at: row.try_get("decided_at")?,
+            reject_reason: row.try_get("reject_reason")?,
+            baseline_revision_id: row.try_get("baseline_revision_id")?,
+            current_baseline: None,
+            catalogue_entry: None,
+            same_as_current: false,
+        })
+    }
+}
+
+/// Reads the stored proposals the query `build` writes (selecting
+/// [`PROPOSAL_COLUMNS`]), and adds to each what the review shows it against:
+/// its suggested model's baseline in force, whether the card equals that
+/// baseline's, and the built-in catalogue's entry for the dataset's provider
+/// and model at the proposal's own start. On `conn`, so every proposal of one
+/// read sees one `now()`.
+async fn read_proposals(
+    conn: &mut PgConnection,
+    build: impl FnOnce(&mut QueryBuilder<'_, Postgres>),
+    catalogue: &aisix_pricing::Catalogue,
+) -> Result<Vec<Proposal>, DbError> {
+    let mut sql = QueryBuilder::<Postgres>::new("");
+    build(&mut sql);
+    let mut proposals: Vec<Proposal> = sql.build_query_as().fetch_all(&mut *conn).await?;
+    let models: Vec<Uuid> = proposals
+        .iter()
+        .filter_map(|p| p.suggested_model_id)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let now: DateTime<Utc> = sqlx::query_scalar("SELECT now()")
+        .fetch_one(&mut *conn)
+        .await?;
+    let current: HashMap<Uuid, BaselineRevision> =
+        baselines::current_baselines(&mut *conn, models.as_slice())
+            .await?
+            .into_iter()
+            .map(|r| (r.model_id, r))
+            .collect();
+    let card = |v: &Value| serde_json::from_value::<RateCard>(v.clone()).ok();
+    for proposal in &mut proposals {
+        proposal.catalogue_entry = catalogue
+            .get(
+                &proposal.provider,
+                &proposal.model,
+                proposal.effective_from.unwrap_or(now),
+            )
+            .map(CatalogueEntryView::of);
+        let baseline = proposal.suggested_model_id.and_then(|m| current.get(&m));
+        // A stored card this engine cannot read equals nothing.
+        proposal.same_as_current = match (baseline, proposal.card.as_ref()) {
+            (Some(baseline), Some(proposed)) => {
+                card(&baseline.card).is_some_and(|b| card(proposed) == Some(b))
+            }
+            _ => false,
+        };
+        proposal.current_baseline = baseline.cloned();
+    }
+    Ok(proposals)
+}
+
+/// `POST /admin/pricing/imports`: one upload of the dataset.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UploadBody {
+    /// The dataset's revision: a tag, a commit or a file name.
+    #[serde(default)]
+    dataset_ref: Option<String>,
+    /// The dataset itself, read as its own text: every price is a number
+    /// whose decimal text is the price, and a binary float would lose it.
+    #[serde(default)]
+    data: Option<Box<RawValue>>,
+}
+
+/// Whether `dataset_ref` is `^[A-Za-z0-9._/-]{1,100}$`.
+fn valid_dataset_ref(reference: &str) -> bool {
+    !reference.is_empty()
+        && reference.len() <= 100
+        && reference
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'/' | b'-'))
+}
+
+/// The live direct model whose document's `provider` and `model_name` are
+/// `provider` and `model`, for each pair given: the smallest id of several.
+///
+/// It keys on the document's own upstream fields, so a routing, ensemble or
+/// semantic model (which carry neither) never matches, and an embedding
+/// model, which is a direct model, can.
+async fn suggest_models(
+    conn: &mut PgConnection,
+    proposals: &[ParsedProposal],
+) -> Result<HashMap<(String, String), Uuid>, DbError> {
+    let providers: Vec<String> = proposals
+        .iter()
+        .map(|p| p.provider.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let models: Vec<String> = proposals
+        .iter()
+        .map(|p| p.model.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let rows: Vec<(String, String, Uuid)> = sqlx::query_as(
+        "SELECT DISTINCT ON (doc->>'provider', doc->>'model_name') \
+                doc->>'provider', doc->>'model_name', id \
+         FROM gw_resources \
+         WHERE kind = $1 AND NOT deleted AND doc ? 'provider' AND doc ? 'model_name' \
+           AND doc->>'provider' = ANY($2) AND doc->>'model_name' = ANY($3) \
+         ORDER BY doc->>'provider', doc->>'model_name', id",
+    )
+    .bind(Kind::Models.segment())
+    .bind(&providers)
+    .bind(&models)
+    .fetch_all(&mut *conn)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(provider, model, id)| ((provider, model), id))
+        .collect())
+}
+
+/// `POST /admin/pricing/imports` → `201 ImportBatch`. The body is
+/// `{dataset_ref, data}`, `data` being the dataset file itself.
+///
+/// Refused with `422`: a `dataset_ref` outside `^[A-Za-z0-9._/-]{1,100}$`
+/// (`/dataset_ref`), and a body that is not a dataset, or makes more
+/// proposals than [`MAX_IMPORT_PROPOSALS`], (`/data`, see [`parse`]).
+///
+/// One transaction supersedes every open batch and every pending proposal of
+/// an older one, writes this batch and its proposals with the model each
+/// suggests, and records `pricing.import.upload`. Nothing here is a price.
+pub async fn upload(
+    auth: OperatorAuth,
+    State(state): State<AppState>,
+    ApiJson(body): ApiJson<UploadBody>,
+) -> Result<(StatusCode, Json<ImportBatch>), ApiError> {
+    auth.require(OperatorRole::Operator)?;
+    let dataset_ref = body
+        .dataset_ref
+        .filter(|r| valid_dataset_ref(r))
+        .ok_or_else(|| {
+            refused(
+                "/dataset_ref",
+                "数据集版本只能包含字母、数字和 . _ / -，最长 100 个字符",
+            )
+        })?;
+    let data = body
+        .data
+        .ok_or_else(|| refused("/data", "不是可识别的价格数据集"))?;
+    let now: DateTime<Utc> = sqlx::query_scalar("SELECT now()")
+        .fetch_one(state.db.pool())
+        .await
+        .map_err(DbError::from)?;
+    // Up to `MAX_IMPORT_BYTES` of JSON: parsed off the request workers.
+    let parsed = tokio::task::spawn_blocking(move || parse(&data, now))
+        .await
+        .map_err(ApiError::internal)??;
+    let batch = state
+        .db
+        .tx(move |conn| {
+            async move {
+                // Uploads one at a time: two at once would each supersede
+                // only what the other had committed, leaving two open
+                // batches. The mode conflicts with itself and with any
+                // write of a batch, and with no read.
+                sqlx::query("LOCK TABLE pricing_import_batches IN SHARE ROW EXCLUSIVE MODE")
+                    .execute(&mut *conn)
+                    .await
+                    .map_err(DbError::from)?;
+                // Every open batch, and with it every pending proposal of an
+                // older one: a newer upload is what an operator reviews now.
+                let superseded: u64 = sqlx::query(
+                    "WITH older AS (
+                       UPDATE pricing_import_batches SET status = 'superseded'
+                       WHERE status = 'open' RETURNING id)
+                     UPDATE pricing_import_proposals SET status = 'superseded'
+                     WHERE status = 'pending' AND batch_id IN (SELECT id FROM older)",
+                )
+                .execute(&mut *conn)
+                .await
+                .map_err(DbError::from)?
+                .rows_affected();
+                let batch: ImportBatch = sqlx::query_as(&format!(
+                    "WITH b AS (
+                       INSERT INTO pricing_import_batches
+                       (id, dataset, dataset_ref, status, proposals, flagged, created_by)
+                       VALUES ($1, $2, $3, 'open', $4, $5, $6) RETURNING *)
+                     SELECT {BATCH_COLUMNS} FROM b JOIN operators o ON o.id = b.created_by"
+                ))
+                .bind(Uuid::new_v4())
+                .bind(DATASET)
+                .bind(&dataset_ref)
+                .bind(parsed.len() as i64)
+                .bind(parsed.iter().filter(|p| !p.flags.is_empty()).count() as i64)
+                .bind(auth.id)
+                .fetch_one(&mut *conn)
+                .await
+                .map_err(DbError::from)?;
+                let suggested = suggest_models(&mut *conn, &parsed).await?;
+                for chunk in parsed.chunks(PROPOSALS_PER_INSERT) {
+                    let mut sql = QueryBuilder::<Postgres>::new(
+                        "INSERT INTO pricing_import_proposals \
+                         (id, batch_id, provider, model, effective_from, card, flags, pricing_url, \
+                          prices_checked, suggested_model_id, status) ",
+                    );
+                    sql.push_values(chunk, |mut row, p| {
+                        row.push_bind(Uuid::new_v4())
+                            .push_bind(batch.id)
+                            .push_bind(p.provider.clone())
+                            .push_bind(p.model.clone())
+                            .push_bind(p.effective_from)
+                            .push_bind(p.card.as_ref().map(JsonColumn))
+                            .push_bind(JsonColumn(p.flags.clone()))
+                            .push_bind(p.pricing_url.clone())
+                            .push_bind(p.prices_checked)
+                            .push_bind(
+                                suggested
+                                    .get(&(p.provider.clone(), p.model.clone()))
+                                    .copied(),
+                            )
+                            .push_bind("pending");
+                    });
+                    sql.build()
+                        .execute(&mut *conn)
+                        .await
+                        .map_err(DbError::from)?;
+                }
+                audit::record(
+                    &mut *conn,
+                    AuditEntry {
+                        actor: Actor::Operator(&auth),
+                        action: "pricing.import.upload",
+                        target_kind: "pricing_import_batch",
+                        target_id: Some(batch.id.to_string()),
+                        tenant_id: None,
+                        detail: serde_json::json!({
+                            "dataset": DATASET,
+                            "dataset_ref": dataset_ref,
+                            "proposals": batch.proposals,
+                            "flagged": batch.flagged,
+                            "superseded_proposals": superseded,
+                        }),
+                    },
+                )
+                .await?;
+                Ok::<_, ApiError>(batch)
+            }
+            .boxed()
+        })
+        .await?;
+    Ok((StatusCode::CREATED, Json(batch)))
+}
+
+/// `GET /admin/pricing/imports` → `{items: [ImportBatch]}`: the newest 20
+/// uploads, superseded ones included, newest first.
+pub async fn list(
+    auth: OperatorAuth,
+    State(state): State<AppState>,
+) -> Result<Json<Value>, ApiError> {
+    auth.require(OperatorRole::Viewer)?;
+    let items: Vec<ImportBatch> = sqlx::query_as(&format!(
+        "SELECT {BATCH_COLUMNS} FROM pricing_import_batches b \
+         JOIN operators o ON o.id = b.created_by \
+         ORDER BY b.seq DESC LIMIT $1"
+    ))
+    .bind(LISTED_BATCHES as i64)
+    .fetch_all(state.db.pool())
+    .await
+    .map_err(DbError::from)?;
+    Ok(Json(serde_json::json!({ "items": items })))
+}
+
+/// The most proposals one `INSERT` writes: 11 columns each, so 1,000 rows
+/// stay far below Postgres's 65,535 bound parameters.
+const PROPOSALS_PER_INSERT: usize = 1_000;
+
+/// `GET /admin/pricing/imports/{id}?all=` → one `ImportBatch` with its
+/// `proposals`, oldest first. With `all=true` a pending proposal whose card
+/// equals the suggested model's current baseline is listed too; by default
+/// it is left out, as there is nothing to confirm.
+///
+/// A `404` for an id that is not a batch's.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DetailQuery {
+    #[serde(default)]
+    all: Option<bool>,
+}
+
+pub async fn detail(
+    auth: OperatorAuth,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    query: Result<Query<DetailQuery>, QueryRejection>,
+) -> Result<Json<Value>, ApiError> {
+    auth.require(OperatorRole::Viewer)?;
+    let Query(q) = query.map_err(query_rejected)?;
+    let id = Uuid::parse_str(&id).map_err(|_| ApiError::not_found())?;
+    let catalogue = state.prices.catalogue().clone();
+    let all = q.all.unwrap_or(false);
+    let view = state
+        .db
+        .tx(move |conn| {
+            async move {
+                let batch: Option<ImportBatch> = sqlx::query_as(&format!(
+                    "SELECT {BATCH_COLUMNS} FROM pricing_import_batches b \
+                     JOIN operators o ON o.id = b.created_by WHERE b.id = $1"
+                ))
+                .bind(id)
+                .fetch_optional(&mut *conn)
+                .await
+                .map_err(DbError::from)?;
+                let Some(batch) = batch else {
+                    return Ok::<_, ApiError>(None);
+                };
+                let proposals = read_proposals(
+                    &mut *conn,
+                    |sql| {
+                        sql.push(format!(
+                            "SELECT {PROPOSAL_COLUMNS} FROM pricing_import_proposals p \
+                             WHERE p.batch_id = "
+                        ))
+                        .push_bind(id)
+                        .push(" ORDER BY p.effective_from NULLS FIRST, p.provider, p.model, p.id");
+                    },
+                    &catalogue,
+                )
+                .await?;
+                let mut view = serde_json::to_value(&batch).map_err(ApiError::internal)?;
+                let listed: Vec<Proposal> = proposals
+                    .into_iter()
+                    .filter(|p| all || p.status != "pending" || !p.same_as_current)
+                    .collect();
+                view["proposals"] = serde_json::to_value(listed).map_err(ApiError::internal)?;
+                Ok(Some(view))
+            }
+            .boxed()
+        })
+        .await?;
+    view.map(Json).ok_or_else(ApiError::not_found)
 }
 
 /// A price map: each price field to its value, kept as the text the file
