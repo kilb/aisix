@@ -244,8 +244,11 @@ test("价格对照展示不全的价目卡不能确认，并说明缺哪部分",
 test("切换上传批次会丢掉上一个批次的核对声明和勾选", async ({ page }) => {
   // A model for each entry, so each is bulk-selectable: the tick under test is
   // the bulk one, and it only exists while a picked row can be confirmed.
-  await newModel("switch", "cohere", "command-r");
-  await newModel("switch", "cohere", "command-a");
+  // Entries no other test confirms: a confirmed card becomes "same as
+  // current" and is hidden, so a shared entry would hide the row on a repeat
+  // run against the same stack.
+  await newModel("switch", "mistral", "mistral-saba");
+  await newModel("switch", "mistral", "ministral-8b");
   await openImports(page);
 
   // Two batches, each one entry, so switching between them is quick and the
@@ -263,10 +266,10 @@ test("切换上传批次会丢掉上一个批次的核对声明和勾选", async
     await page.getByRole("button", { name: "上传", exact: true }).click();
     await expect(page.getByLabel("上传批次")).toContainText(ref);
   };
-  await uploadIt(one("cohere", "command-r", 0.15, 0.6, "batch-a"), "batch-a");
-  await expect(row(page, "cohere/command-r")).toBeVisible();
-  await uploadIt(one("cohere", "command-a", 2.5, 10, "batch-b"), "batch-b");
-  await expect(row(page, "cohere/command-a")).toBeVisible();
+  await uploadIt(one("mistral", "mistral-saba", 0.2, 0.6, "batch-a"), "batch-a");
+  await expect(row(page, "mistral/mistral-saba")).toBeVisible();
+  await uploadIt(one("mistral", "ministral-8b", 0.1, 0.1, "batch-b"), "batch-b");
+  await expect(row(page, "mistral/ministral-8b")).toBeVisible();
 
   // The two batches by id, from the API: the selector's labels are prose.
   const { items } = await stack.admin.get("/admin/pricing/imports");
@@ -274,26 +277,26 @@ test("切换上传批次会丢掉上一个批次的核对声明和勾选", async
 
   // B is on screen, reviewed, ticked and picked.
   const bulk = page.getByRole("group", { name: "批量确认" });
-  await row(page, "cohere/command-a").getByRole("checkbox", { name: "选择 cohere/command-a" }).check();
+  await row(page, "mistral/ministral-8b").getByRole("checkbox", { name: "选择 mistral/ministral-8b" }).check();
   await bulk.getByRole("checkbox", { name: "已对照官方价格页核对" }).check();
   await expect(bulk.getByRole("button", { name: /^确认所选/ })).toBeEnabled();
 
   // Switching to A drops the tick with its picks: A's rows were not reviewed,
   // so nothing about them may confirm on B's attestation.
   await page.getByLabel("上传批次").selectOption(idOf("batch-a"));
-  await expect(row(page, "cohere/command-r")).toBeVisible();
+  await expect(row(page, "mistral/mistral-saba")).toBeVisible();
 
   // Back on B, the tick and the picks are gone rather than restored, and the
   // control is disabled: a tick never survives its batch leaving the selector.
   await page.getByLabel("上传批次").selectOption(idOf("batch-b"));
-  await expect(row(page, "cohere/command-a")).toBeVisible();
+  await expect(row(page, "mistral/ministral-8b")).toBeVisible();
   await expect(bulk.getByRole("checkbox", { name: "已对照官方价格页核对" })).not.toBeChecked();
   await expect(bulk.getByRole("button", { name: /^确认所选/ })).toBeDisabled();
   await expect(bulk.getByRole("button", { name: /^确认所选/ })).toHaveText("确认所选（0）");
 
   // The same claim does not carry over the 显示与当前基准价相同的提议 toggle:
   // the rows it reveals were not on screen when the tick was given.
-  await row(page, "cohere/command-a").getByRole("checkbox", { name: "选择 cohere/command-a" }).check();
+  await row(page, "mistral/ministral-8b").getByRole("checkbox", { name: "选择 mistral/ministral-8b" }).check();
   await bulk.getByRole("checkbox", { name: "已对照官方价格页核对" }).check();
   await expect(bulk.getByRole("button", { name: /^确认所选/ })).toBeEnabled();
   await page.getByRole("checkbox", { name: "显示与当前基准价相同的提议" }).check();
