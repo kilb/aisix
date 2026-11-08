@@ -42,6 +42,11 @@
 //! rows and before the resources lock, which is the documented order; this
 //! module never withdraws a grant, so it takes no tenant row at all
 //! (`crate/AGENTS.md`, "Lock order").
+//!
+//! A retire takes the same two in the same order, but takes the resources
+//! lock itself ([`refs::lock_resources`]) because its reference counts are
+//! plain `SELECT`s: a grant commits under that lock, so a count taken before
+//! it could miss one ([`retire`]).
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -60,7 +65,7 @@ use crate::error::{ApiError, Detail};
 use crate::http::ApiJson;
 use crate::resources::store::{self, ResourceRow};
 use crate::resources::write::{write_resource, ResourceWrite, WriteCtx, WriteOp};
-use crate::resources::Kind;
+use crate::resources::{refs, Kind};
 use crate::AppState;
 
 /// The longest a public model's name may be, in characters.
@@ -358,9 +363,10 @@ pub async fn regenerate(
     // Direct documents first: the routing document names them by id, and a
     // reference must be live when the referrer is written.
     for (channel, display_name, provider) in &served {
-        put(
+        crate::tenants::put(
             conn,
             ctx,
+            Kind::Models,
             channel.direct_model_id,
             &direct_doc(channel, &public, display_name, provider),
             &owner,
@@ -368,9 +374,10 @@ pub async fn regenerate(
         .await?;
     }
     let channels: Vec<ChannelModelRow> = served.into_iter().map(|(c, _, _)| c).collect();
-    put(
+    crate::tenants::put(
         conn,
         ctx,
+        Kind::Models,
         public_model_id,
         &routing_doc(&public, &channels),
         &owner,
@@ -403,51 +410,24 @@ pub async fn regenerate(
     Ok(())
 }
 
-/// Makes the model document `id` live with `doc` under `owner`: unchanged
-/// when it already is, replaced when it is live, created (or its tombstone
-/// revived) otherwise. [`crate::tenants::put`] is the same shape for a
-/// tenant's documents; this copy keeps the module's own write path.
-async fn put(
-    conn: &mut PgConnection,
-    ctx: &WriteCtx,
-    id: Uuid,
-    doc: &Value,
-    owner: &str,
-) -> Result<(), ApiError> {
-    let current = store::get(&mut *conn, Kind::Models, id).await?;
-    let op = match &current {
-        Some(row) if !row.deleted && row.doc == *doc => return Ok(()),
-        Some(row) if !row.deleted => WriteOp::Replace(doc),
-        _ => WriteOp::Create(doc),
-    };
-    write_resource(
-        conn,
-        ctx,
-        ResourceWrite {
-            kind: Kind::Models,
-            id,
-            op,
-            expected_version: None,
-            managed_by: Some(owner),
-        },
-    )
-    .await?;
-    Ok(())
-}
-
 /// Refuses the delete of a provider key any channel model names, `409
 /// in_use` with `counts {public_models}`, answering in the terms the
 /// operator used. `refs::incoming` already holds a key some direct document
 /// names; this covers the rest, a key whose channel rows are all disabled
 /// included. A caller runs it before the generic delete, in the same
 /// transaction.
+///
+/// Only rows of a **live** public model count. [`retire`] deletes a retired
+/// model's rows, so the join is belt and braces for a row that outlived its
+/// model by another route: a retired model pins no account.
 pub async fn refuse_if_served(
     conn: &mut PgConnection,
     provider_key_id: Uuid,
 ) -> Result<(), ApiError> {
     let serving: i64 = sqlx::query_scalar(
-        "SELECT COUNT(DISTINCT public_model_id)::bigint FROM channel_models \
-         WHERE provider_key_id = $1",
+        "SELECT COUNT(DISTINCT cm.public_model_id)::bigint FROM channel_models cm \
+         JOIN public_models p ON p.id = cm.public_model_id AND p.retired_at IS NULL \
+         WHERE cm.provider_key_id = $1",
     )
     .bind(provider_key_id)
     .fetch_one(&mut *conn)
@@ -747,7 +727,17 @@ pub async fn get(
 /// model already retired.
 ///
 /// Retiring removes the documents, the routing document first since it names
-/// the direct ones.
+/// the direct ones, and the model's channel rows with them: the row names a
+/// public model nobody can restore, so it holds nothing worth keeping.
+///
+/// The counts are read under `RESOURCES_LOCK_KEY`, and the delete and the
+/// update land while it is held. A grant is the reference that can arrive
+/// concurrently — `tenants::update` takes its tenant row, then that lock,
+/// then validates `allowed_model_ids` against live documents — so a grant
+/// that commits first is counted here and refused, and one that gets the
+/// lock second finds the model retired. The public model's row is held
+/// before the resources lock, which is the documented order; retire takes no
+/// tenant row (`groups::retire` is the same shape).
 pub async fn retire(
     auth: OperatorAuth,
     State(state): State<AppState>,
@@ -765,6 +755,7 @@ pub async fn retire(
                 if row.retired_at.is_some() {
                     return Err(retired());
                 }
+                refs::lock_resources(&mut *conn).await?;
                 let uses = references(&mut *conn, row.id).await?;
                 if uses.any() {
                     return Err(ApiError::public_model_in_use(
@@ -796,6 +787,11 @@ pub async fn retire(
                     )
                     .await?;
                 }
+                sqlx::query("DELETE FROM channel_models WHERE public_model_id = $1")
+                    .bind(id)
+                    .execute(&mut *conn)
+                    .await
+                    .map_err(DbError::from)?;
                 sqlx::query(
                     "UPDATE public_models SET retired_at = now(), enabled = false WHERE id = $1",
                 )

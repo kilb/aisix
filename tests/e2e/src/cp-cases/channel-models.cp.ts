@@ -92,10 +92,15 @@ describe("a public model served by several accounts routes within the caller's g
     gateway = await spawnManagedGateway(gw);
     await cp.admin.waitRegistered(gw.dpId);
 
+    // The two provider groups first: an account joins one by name, and every
+    // key names exactly one group, so the tenant's assigned group must be a
+    // live row before its key can be minted.
+    const group = await cp.admin.createGroup(GROUP, "渠道分组 7c1");
+    await cp.admin.createGroup(OTHER_GROUP, "另一分组 7c1");
+
     const accountA = await account(ACCOUNTS.a, a, GROUP);
     const accountB = await account(ACCOUNTS.b, b, GROUP);
     const accountC = await account(ACCOUNTS.c, c, OTHER_GROUP);
-
     const created = await cp.admin.post("/admin/public-models", { name: PUBLIC });
     expect(created.status, created.text).toBe(201);
     publicModel = created.body;
@@ -129,6 +134,7 @@ describe("a public model served by several accounts routes within the caller's g
     await fundTenant(cp, tenant.body.id, "100.00");
     const minted = await cp.admin.post(`/admin/tenants/${tenant.body.id}/keys`, {
       label: "channel-caller",
+      group_id: group.id,
     });
     expect(minted.status, minted.text).toBe(201);
     key = minted.body.plaintext;

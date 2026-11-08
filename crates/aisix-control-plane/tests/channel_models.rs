@@ -919,6 +919,287 @@ async fn a_provider_key_serving_a_public_model_cannot_be_deleted() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_provider_key_a_retired_model_named_can_be_deleted() {
+    // The sequence the review found unreachable: tick the model on the
+    // account, disable that row, retire the public model, delete the
+    // account. The row names a public model nobody can restore, so retiring
+    // takes it with the documents, and the credential is not pinned forever.
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let op = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let key = provider_key(&cp, &op, "acct-gp-5dc").await;
+    let (id, _) = create_public(&cp, &op, "pub-retired-8c1").await;
+    let r = put_channel(&cp, &op, key, id, json!({})).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let r = put_channel(&cp, &op, key, id, json!({"enabled": false})).await;
+    assert_eq!(r.status, 200, "{r:?}");
+
+    let r = cp
+        .send(
+            "POST",
+            &format!("{PUBLICS}/{id}/retire"),
+            Some(op.cookie()),
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(r.status, 200, "{r:?}");
+
+    // The channel row went with the model.
+    let rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::bigint FROM channel_models WHERE public_model_id = $1",
+    )
+    .bind(id)
+    .fetch_one(cp.db().pool())
+    .await
+    .expect("count the channel models");
+    assert_eq!(rows, 0, "the retired model's channel rows go");
+
+    // And the account can be deleted: the credential is not pinned.
+    let current = cp
+        .send(
+            "GET",
+            &format!("/admin/resources/provider_keys/{key}"),
+            Some(op.cookie()),
+            None,
+        )
+        .await;
+    let version = current.body["version"].as_i64().expect("a version");
+    let r = send_conditional(
+        &cp,
+        "DELETE",
+        &format!("/admin/resources/provider_keys/{key}"),
+        op.cookie(),
+        version,
+        None,
+    )
+    .await;
+    assert_eq!(r.status, 200, "{r:?}");
+}
+
+#[tokio::test]
+async fn a_channel_row_that_outlives_its_model_pins_nothing() {
+    // The second line of defence: a `channel_models` row of a **retired**
+    // public model pins no account, whatever route left it there. `retire`
+    // deletes the rows it can see, so this writes one behind its back and
+    // requires the delete to answer 200 anyway.
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let op = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let key = provider_key(&cp, &op, "acct-gp-5de").await;
+    let (id, _) = create_public(&cp, &op, "pub-orphan-8c1").await;
+    let r = cp
+        .send(
+            "POST",
+            &format!("{PUBLICS}/{id}/retire"),
+            Some(op.cookie()),
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(r.status, 200, "{r:?}");
+    sqlx::query(
+        "INSERT INTO channel_models \
+           (public_model_id, provider_key_id, enabled, upstream_model, priority, weight, direct_model_id) \
+         VALUES ($1, $2, true, NULL, 0, 1, $3)",
+    )
+    .bind(id)
+    .bind(key)
+    .bind(Uuid::new_v4())
+    .execute(cp.db().pool())
+    .await
+    .expect("plant a row its model never had");
+
+    let current = cp
+        .send(
+            "GET",
+            &format!("/admin/resources/provider_keys/{key}"),
+            Some(op.cookie()),
+            None,
+        )
+        .await;
+    let version = current.body["version"].as_i64().expect("a version");
+    let r = send_conditional(
+        &cp,
+        "DELETE",
+        &format!("/admin/resources/provider_keys/{key}"),
+        op.cookie(),
+        version,
+        None,
+    )
+    .await;
+    assert_eq!(r.status, 200, "{r:?}");
+}
+
+/// `POST /admin/public-models/{id}/retire` in a task of its own, so the test
+/// can decide when it is allowed to finish; its status and body.
+fn spawn_retire(cp: &TestCp, cookie: &str, id: Uuid) -> tokio::task::JoinHandle<(u16, Value)> {
+    let url = cp.url(&format!("{PUBLICS}/{id}/retire"));
+    let cookie = cookie.to_string();
+    tokio::spawn(async move {
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("an HTTP client")
+            .post(url)
+            .header(reqwest::header::COOKIE, cookie)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body("{}")
+            .send()
+            .await
+            .expect("send the retire");
+        let status = response.status().as_u16();
+        let text = response.text().await.expect("read the body");
+        (status, serde_json::from_str(&text).unwrap_or(Value::Null))
+    })
+}
+
+/// Whether a session of **this test's database** is queued for the resources
+/// lock. `pg_locks` is cluster-wide and this file's tests run in parallel, so
+/// a session elsewhere in the cluster — another test's, on the same key —
+/// must not count: it says nothing about this transaction's place in the
+/// queue.
+async fn resources_lock_queued(cp: &TestCp) -> bool {
+    sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'advisory' AND NOT granted \
+           AND classid::bigint = $1 AND objid::bigint = $2 AND objsubid = 1 \
+           AND database = (SELECT oid FROM pg_database WHERE datname = current_database()))",
+    )
+    .bind(RESOURCES_LOCK_KEY >> 32)
+    .bind(RESOURCES_LOCK_KEY & 0xffff_ffff)
+    .fetch_one(cp.db().pool())
+    .await
+    .expect("read the queued locks")
+}
+
+/// Waits until a session is queued for the resources lock; fails after 10 s.
+async fn until_resources_lock_queued(cp: &TestCp) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !resources_lock_queued(cp).await {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no session queued for the resources lock"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_retire_waits_for_the_resources_lock() {
+    // The counts are read under the resources lock, and a grant commits under
+    // that same lock, so a count taken before it can miss a grant that lands
+    // in between. Here the grant is uncommitted while the retire waits, and
+    // commits while it is still waiting: read after the lock, it is counted.
+    let Some(cp) = TestCp::start_with(|cfg| cfg.db_lock_timeout_ms = 60_000).await else {
+        return;
+    };
+    let op = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let (id, _) = create_public(&cp, &op, "pub-lock-8c1").await;
+    let tenant = tenant_granted(&cp, &op, &[]).await;
+
+    let mut held = cp.db().pool().begin().await.expect("begin");
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(RESOURCES_LOCK_KEY)
+        .execute(&mut *held)
+        .await
+        .expect("hold the resources lock");
+    // The grant `tenants::update` would write, uncommitted: under the
+    // resources lock it holds itself, which this session stands in for.
+    sqlx::query(
+        "UPDATE tenants SET allowed_model_ids = ARRAY[$2]::uuid[], version = version + 1 \
+         WHERE id = $1",
+    )
+    .bind(tenant)
+    .bind(id)
+    .execute(&mut *held)
+    .await
+    .expect("write the grant");
+
+    let mut retire = spawn_retire(&cp, op.cookie(), id);
+    // Queued on the lock means the retire has either counted already (the
+    // bug) or is waiting to count (the fix); the commit lands after that
+    // point either way, so the outcome tells the two apart.
+    until_resources_lock_queued(&cp).await;
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(300), &mut retire)
+            .await
+            .is_err(),
+        "the retire must wait for the resources lock"
+    );
+    held.commit().await.expect("release the resources lock");
+
+    let (status, body) = tokio::time::timeout(std::time::Duration::from_secs(10), retire)
+        .await
+        .expect("the retire proceeds once the lock is free")
+        .expect("join the retire");
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (409, Some("public_model_in_use")),
+        "the counts are read after the lock, so the committed grant is counted: {body}"
+    );
+    assert_eq!(body["counts"]["tenants"], 1, "the tenant it names: {body}");
+    let retired: Option<chrono::DateTime<chrono::Utc>> =
+        sqlx::query_scalar("SELECT retired_at FROM public_models WHERE id = $1")
+            .bind(id)
+            .fetch_one(cp.db().pool())
+            .await
+            .expect("read the public model");
+    assert!(retired.is_none(), "the model is not retired");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_grant_that_commits_first_makes_the_retire_refuse() {
+    // The grant takes the tenant row and then the resources lock; the retire
+    // takes the public model's row and then the resources lock. Whichever
+    // gets the lock first, the other sees it: a grant first is counted, so
+    // the retire is refused naming that tenant rather than withdrawing a
+    // model a live tenant now holds.
+    //
+    // The retire is held on the public model's row, which it takes before it
+    // counts, so the grant's commit is guaranteed to precede the count: the
+    // two locks are independent, and an advisory-lock wakeup order is not.
+    let Some(cp) = TestCp::start_with(|cfg| cfg.db_lock_timeout_ms = 60_000).await else {
+        return;
+    };
+    let op = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let key = provider_key(&cp, &op, "acct-gp-5dd").await;
+    let (id, _) = create_public(&cp, &op, "pub-race-8c1").await;
+    let tenant = tenant_granted(&cp, &op, &[]).await;
+    // A live routing document with no target: the grant has a model to name,
+    // and the retire has no channel model holding it.
+    let r = put_channel(&cp, &op, key, id, json!({})).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let r = put_channel(&cp, &op, key, id, json!({"enabled": false})).await;
+    assert_eq!(r.status, 200, "{r:?}");
+
+    let mut held = cp.db().pool().begin().await.expect("begin");
+    sqlx::query("SELECT 1 FROM public_models WHERE id = $1 FOR UPDATE")
+        .bind(id)
+        .execute(&mut *held)
+        .await
+        .expect("hold the public model's row");
+
+    let retire = spawn_retire(&cp, op.cookie(), id);
+    // The grant commits while the retire is still waiting for that row.
+    let granted = set_grants(&cp, &op, &tenant.to_string(), &[id]).await;
+    assert_eq!(granted.status, 200, "{granted:?}");
+    held.commit().await.expect("release the public model's row");
+
+    let (status, body) = tokio::time::timeout(std::time::Duration::from_secs(10), retire)
+        .await
+        .expect("the retire proceeds once the row is free")
+        .expect("join the retire");
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (409, Some("public_model_in_use")),
+        "the retire counts the grant that committed first: {body}"
+    );
+    assert_eq!(body["counts"]["tenants"], 1, "the tenant it names: {body}");
+    assert_eq!(grants(&cp, tenant).await, vec![id], "the grant stands");
+    assert!(is_live(&cp, Kind::Models, id).await, "the model stays");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn regenerating_waits_for_the_public_model_row() {
     let Some(cp) = TestCp::start().await else {
         return;
