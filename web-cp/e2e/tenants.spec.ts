@@ -1,5 +1,5 @@
 import { expect, test, type Page } from "@playwright/test";
-import { STACK_START_TIMEOUT_MS, startStack, type ApiClient, type Json, type Stack } from "./stack";
+import { STACK_START_TIMEOUT_MS, fundTenant, startStack, type ApiClient, type Json, type Stack } from "./stack";
 
 /**
  * The Tenants tab: approval, model grants, provider groups, limits, members,
@@ -62,6 +62,7 @@ async function signUp(org: string, email: string): Promise<TenantSide> {
 async function signUpActive(org: string, email: string, grants: Json[] = []): Promise<TenantSide> {
   const t = await signUp(org, email);
   await stack.admin.post(`/admin/tenants/${t.id}/approve`);
+  await fundTenant(stack.admin, t.id);
   if (grants.length > 0) {
     const current = await stack.admin.get(`/admin/tenants/${t.id}`);
     await stack.admin.patch(
