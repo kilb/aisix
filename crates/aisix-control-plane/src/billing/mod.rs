@@ -15,6 +15,7 @@
 //! of a missing account, which [`ledger::backfill_accounts`], run at boot and
 //! on every housekeeping tick, keeps unreachable in practice.
 
+pub mod access;
 pub mod accounts;
 pub mod budget_routes;
 pub mod budgets;
@@ -22,6 +23,7 @@ pub mod calls;
 pub mod credits;
 pub mod ledger;
 pub mod lookup_prices;
+pub mod lookup_quota;
 pub mod marks;
 pub mod money;
 pub mod plans;

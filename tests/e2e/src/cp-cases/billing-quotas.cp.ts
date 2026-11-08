@@ -27,6 +27,8 @@ describe("a tenant's own levels cap members and keys at the gateway", () => {
   let k3: string;
   let k3Id: string;
   let k1Cap: string;
+  // The clock before K1's cap was created: the mark's period is that day's or the next.
+  let capCreatedAt: Date;
 
   const chat = (key: string): Promise<GatewayAnswer> =>
     callGateway(world!.gateway.proxyUrl, key, "/v1/chat/completions", {
@@ -119,6 +121,7 @@ describe("a tenant's own levels cap members and keys at the gateway", () => {
   });
 
   test("A member's own key cap blocks that key only", async () => {
+    capCreatedAt = new Date();
     const cap = await member.post("/api/budgets", { scope: "api_key", scope_ref: k1Id, kind: "periodic", period: "day", limit_usd: "0.02" });
     expect(cap.status, cap.text).toBe(201);
     expect(cap.body.set_by).toBe("member");
@@ -162,9 +165,11 @@ describe("a tenant's own levels cap members and keys at the gateway", () => {
   });
 
   test("The mark holds for the current UTC period", async () => {
-    const midnight = new Date();
-    midnight.setUTCHours(0, 0, 0, 0);
-    const want = midnight.toISOString().replace(".000Z", "Z");
+    const midnightOf = (t: Date): string => {
+      const m = new Date(t);
+      m.setUTCHours(0, 0, 0, 0);
+      return m.toISOString().replace(".000Z", "Z");
+    };
     let last = "no read";
     const doc = await pollUntil(
       "the K1 cap's document to carry its mark",
@@ -175,6 +180,7 @@ describe("a tenant's own levels cap members and keys at the gateway", () => {
       },
       { timeoutMs: WITHIN_MS, intervalMs: 250, describe: () => last },
     );
-    expect(doc.exhausted.period_start).toBe(want);
+    // Either day's midnight, when the run crossed 00:00 UTC.
+    expect([midnightOf(capCreatedAt), midnightOf(new Date())]).toContain(doc.exhausted.period_start);
   });
 });

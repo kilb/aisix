@@ -255,6 +255,16 @@ pub const ROUTE_ROLES: &[(&str, &str, MinRole)] = &[
     ("GET", "/api/keys/{id}", MinRole::Member(KEY_HOLDERS)),
     ("PATCH", "/api/keys/{id}", MinRole::Member(KEY_HOLDERS)),
     ("DELETE", "/api/keys/{id}", MinRole::Member(KEY_HOLDERS)),
+    (
+        "GET",
+        "/api/keys/{id}/quota",
+        MinRole::Member(&[
+            MemberRole::Owner,
+            MemberRole::Admin,
+            MemberRole::Billing,
+            MemberRole::Member,
+        ]),
+    ),
     // Stored usage.
     (
         "GET",
@@ -486,6 +496,7 @@ pub const ROUTE_ROLES: &[(&str, &str, MinRole)] = &[
     // Gateways, on the gateway listener.
     ("POST", "/dp/heartbeat", MinRole::Dp),
     ("GET", "/dp/v1/keys/{key_id}/prices", MinRole::Dp),
+    ("GET", "/dp/v1/keys/{key_id}/quota", MinRole::Dp),
     ("ANY", "/dp/store/v1/{*rest}", MinRole::Dp),
     ("POST", "/dp/telemetry", MinRole::Dp),
 ];
@@ -675,6 +686,10 @@ pub fn browser_router(state: AppState) -> Router {
             patch(billing::budget_routes::update).delete(billing::budget_routes::delete),
         )
         .route(
+            "/api/keys/{id}/quota",
+            get(billing::lookup_quota::portal_quota),
+        )
+        .route(
             "/api/budgets",
             get(billing::budget_routes::member_list).post(billing::budget_routes::member_create),
         )
@@ -709,6 +724,10 @@ pub fn dp_router(state: AppState) -> Router {
         .route(
             "/dp/v1/keys/{key_id}/prices",
             get(billing::lookup_prices::prices),
+        )
+        .route(
+            "/dp/v1/keys/{key_id}/quota",
+            get(billing::lookup_quota::dp_quota),
         )
         .route("/dp/store/v1/{*rest}", any(dp::store::not_found))
         // A batch may be larger than the other routes' bodies, and every
