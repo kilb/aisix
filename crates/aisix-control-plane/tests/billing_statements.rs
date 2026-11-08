@@ -146,12 +146,37 @@ async fn a_ledger_item_hides_an_ungranted_models_id() {
         .execute(pool)
         .await
         .expect("ungrant the model");
+    // The name the caller sent stays; the model's current name is the
+    // tenant's to read only while it is granted, as in the call log.
     assert_eq!(
         read().await,
         vec![
-            json!({"id": null, "name": display}),
+            json!({"id": null, "name": "未知模型"}),
             json!({"id": null, "name": "chat-bill"}),
         ]
+    );
+}
+
+#[tokio::test]
+async fn a_ledger_item_never_names_a_model_by_its_id() {
+    let Some(w) = world().await else { return };
+    let pool = w.cp.db().pool();
+    raw_usage(pool, w.tenant, "by-id", -100, -100, Utc::now()).await;
+    // A charge recording the id of a model that is gone, whose event carried
+    // no name.
+    let gone = Uuid::new_v4();
+    sqlx::query("UPDATE pricing_charges SET requested_model_id = $2 WHERE event_id = $1")
+        .bind("by-id")
+        .bind(gone.to_string())
+        .execute(pool)
+        .await
+        .expect("record the model id");
+    let r = admin_ledger(&w, "?kind=usage").await;
+    assert_eq!(r.status, 200, "{r:?}");
+    assert_eq!(
+        r.body["items"][0]["model"],
+        json!({"id": null, "name": "未知模型"}),
+        "{r:?}"
     );
 }
 

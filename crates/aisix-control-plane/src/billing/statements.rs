@@ -20,20 +20,16 @@ use sqlx::PgConnection;
 use uuid::Uuid;
 
 use super::accounts;
+use super::calls::{call_model, Models};
 use super::ledger::EntryKind;
 use super::range::{checked_range, Group};
 use crate::auth::{MemberAuth, MemberRole, OperatorAuth, OperatorRole};
 use crate::db::DbError;
 use crate::error::{ApiError, Detail};
-use crate::resources::kinds::Kind;
 use crate::AppState;
 
 const DEFAULT_LIMIT: i64 = 50;
 const MAX_LIMIT: i64 = 500;
-
-/// What a charge's recorded model id looks like when it is a model's id; the
-/// column is text and may hold anything else.
-const UUID_TEXT: &str = "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$";
 
 /// What a usage entry's model is called when nothing names it.
 const UNKNOWN_MODEL: &str = "未知模型";
@@ -74,11 +70,8 @@ type Row = (
     Option<String>,
     Option<Uuid>,
     Option<Uuid>,
-    // The usage entry's model: the id the charge recorded and whether the
-    // tenant's grants still hold it, the name the event carried, and the
-    // model's current display name.
-    Option<String>,
-    Option<bool>,
+    // The usage entry's model: the id the charge recorded and the name the
+    // event carried.
     Option<String>,
     Option<String>,
 );
@@ -97,13 +90,7 @@ async fn ledger_of(
     let mut rows: Vec<Row> = sqlx::query_as(
         "SELECT l.seq, l.posted_at, l.kind, l.amount_micro_usd, l.balance_after_micro_usd, \
                 l.event_id, l.topup_id, l.repricing_run_id, \
-                c.requested_model_id, \
-                EXISTS (SELECT 1 FROM tenants t WHERE t.id = l.tenant_id \
-                          AND c.requested_model_id = ANY(t.allowed_model_ids::text[])), \
-                u.event->>'requested_model', \
-                (SELECT r.doc->>'display_name' FROM gw_resources r \
-                  WHERE r.kind = $6 AND r.id = CASE WHEN c.requested_model_id ~ $8 \
-                        THEN c.requested_model_id::uuid END) \
+                c.requested_model_id, u.event->>'requested_model' \
          FROM billing_ledger l \
          LEFT JOIN pricing_charges c ON c.event_id = l.event_id \
          LEFT JOIN usage_events u ON u.event_id = l.event_id \
@@ -112,22 +99,25 @@ async fn ledger_of(
            AND ($3::timestamptz IS NULL OR l.posted_at < $3) \
            AND ($4::text IS NULL OR l.kind = $4) \
            AND ($5::bigint IS NULL OR l.seq < $5) \
-         ORDER BY l.seq DESC LIMIT $7",
+         ORDER BY l.seq DESC LIMIT $6",
     )
     .bind(tenant)
     .bind(q.from)
     .bind(q.to)
     .bind(q.kind.map(EntryKind::as_str))
     .bind(q.before)
-    .bind(Kind::Models.segment())
     .bind(limit + 1)
-    .bind(UUID_TEXT)
-    .fetch_all(conn)
+    .fetch_all(&mut *conn)
     .await
     .map_err(DbError::from)?;
     let more = rows.len() as i64 > limit;
     rows.truncate(limit as usize);
     let next_before = if more { rows.last().map(|r| r.0) } else { None };
+    let model_ids: Vec<Uuid> = rows
+        .iter()
+        .filter_map(|r| r.8.as_deref().and_then(|id| Uuid::parse_str(id).ok()))
+        .collect();
+    let models = Models::load(&mut *conn, tenant, &model_ids).await?;
     let items: Vec<Value> = rows
         .into_iter()
         .map(
@@ -141,20 +131,21 @@ async fn ledger_of(
                 topup_id,
                 run_id,
                 model_id,
-                granted,
                 event_name,
-                current_name,
             )| {
-                // Only a usage entry has a model. Its id is shown while the
-                // tenant may still use the model.
+                // Only a usage entry has a model, named as the call log
+                // names it: its id and current name only while the tenant
+                // may still use it.
                 let model = (kind == "usage").then(|| {
-                    let name = [event_name, current_name, model_id.clone()]
-                        .into_iter()
-                        .flatten()
-                        .find(|n| !n.is_empty())
-                        .unwrap_or_else(|| UNKNOWN_MODEL.to_string());
-                    let id = model_id.filter(|_| granted == Some(true));
-                    json!({ "id": id, "name": name })
+                    let mut model = call_model(
+                        &models,
+                        model_id.as_deref().unwrap_or_default(),
+                        event_name.as_deref().unwrap_or_default(),
+                    );
+                    if model.name.is_empty() {
+                        model.name = UNKNOWN_MODEL.to_string();
+                    }
+                    json!(model)
                 });
                 json!({
                     "seq": seq,
