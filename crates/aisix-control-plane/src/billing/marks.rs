@@ -1,5 +1,5 @@
-//! Balance marks: what blocks a tenant at the gateway once its money runs
-//! out.
+//! Balance and quota marks: what blocks a tenant at the gateway once its
+//! money runs out, or a quota is used up (`billing::budgets`).
 //!
 //! Every customer tenant past pending has one `budgets` document, its
 //! balance mark: `scope: team` over the tenant's own team, written under the
@@ -11,19 +11,22 @@
 //! control plane lifts it, and no amounts. The internal tenant is never
 //! marked: its usage is the platform's own.
 //!
-//! Only [`project`] writes a mark, under the tenant's billing lock
-//! (`tenants::lock_billing`, so the account is held and the balance cannot
-//! move underneath): at the billing step of every tenant projection, and
-//! from [`settle`]. Usage intake never writes a document, and never takes
-//! the resources lock: it only flags the account ([`crossings`]) when a
-//! batch moves its balance across the floor, and the settler
-//! (`billing::settler`) settles the flag once the batch has committed.
+//! Only [`project`] writes a mark, balance and quotas alike, under the
+//! tenant's billing lock (`tenants::lock_billing`, so the account is held
+//! and neither the balance nor a quota's spend can move underneath): at the
+//! billing step of every tenant projection, and from [`settle`]. Usage
+//! intake never writes a document, and never takes the resources lock: it
+//! only flags the account when a batch moves its balance across the floor
+//! ([`crossings`]) or a quota across its limit
+//! (`budgets::count_charges`), and the settler (`billing::settler`) settles
+//! the flag once the batch has committed.
 
 use futures::FutureExt;
 use serde_json::{json, Value};
 use sqlx::PgConnection;
 use uuid::Uuid;
 
+use super::budgets;
 use super::ledger::{self, Account};
 use crate::db::{Db, DbError};
 use crate::error::ApiError;
@@ -84,9 +87,11 @@ pub fn balance_doc(tenant_id: Uuid, mode: BillingMode, exhausted: bool) -> Value
 }
 
 /// Writes `tenant`'s balance document as its account now stands, records
-/// what it says on the account and clears the account's flag. Writes
-/// nothing for the internal tenant. The caller holds the tenant's billing
-/// lock (`tenants::lock_billing`); the account is read under it.
+/// what it says on the account and clears the account's flag, then writes
+/// the document of every live quota of the tenant as its spend now stands
+/// (`budgets::project`). Writes nothing for the internal tenant. The caller
+/// holds the tenant's billing lock (`tenants::lock_billing`); the account is
+/// read under it.
 pub async fn project(
     conn: &mut PgConnection,
     ctx: &WriteCtx,
@@ -116,10 +121,10 @@ pub async fn project(
     )
     .bind(tenant.id)
     .bind(exhausted)
-    .execute(conn)
+    .execute(&mut *conn)
     .await
     .map_err(DbError::from)?;
-    Ok(())
+    budgets::project(conn, ctx, tenant.id).await
 }
 
 /// The tenants among `after` whose accounts are to be flagged: each one

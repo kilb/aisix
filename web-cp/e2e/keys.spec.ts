@@ -1,5 +1,5 @@
 import { expect, test, type Page } from "@playwright/test";
-import { STACK_START_TIMEOUT_MS, startStack, type ApiClient, type Json, type Stack } from "./stack";
+import { STACK_START_TIMEOUT_MS, fundTenant, startStack, type ApiClient, type Json, type Stack } from "./stack";
 
 /**
  * The Keys tab, the operator's side of API keys: minting (the plaintext shown
@@ -59,6 +59,7 @@ async function signUpActive(org: string, email: string, grants: Json[] = []): Pr
   const body = await client.post("/api/signup", { org_name: org, email, password: PASSWORD });
   const id: string = body.tenant.id;
   await stack.admin.post(`/admin/tenants/${id}/approve`);
+  await fundTenant(stack.admin, id);
   if (grants.length > 0) {
     const current = await stack.admin.get(`/admin/tenants/${id}`);
     await stack.admin.patch(`/admin/tenants/${id}`, { allowed_model_ids: grants.map((m) => m.id) }, current.version);

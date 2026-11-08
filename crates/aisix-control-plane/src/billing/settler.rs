@@ -393,7 +393,7 @@ async fn settle_one(
                         .map_err(|e| held(Holder::Resources)(e.into()))?;
                     // Never waited for while the resources lock is held.
                     sqlx::query(
-                        "SELECT 1 FROM billing_accounts WHERE tenant_id = $1 FOR UPDATE NOWAIT",
+                        "SELECT 1 FROM billing_accounts WHERE tenant_id = $1 FOR NO KEY UPDATE NOWAIT",
                     )
                     .bind(tenant_id)
                     .execute(&mut *conn)

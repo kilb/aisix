@@ -1,5 +1,5 @@
 import { expect, test, type Locator, type Page } from "@playwright/test";
-import { STACK_START_TIMEOUT_MS, startStack, type Json, type Stack } from "./stack";
+import { STACK_START_TIMEOUT_MS, fundTenant, startStack, type Json, type Stack } from "./stack";
 
 /**
  * The model catalog and routing tab: direct models on an upstream account,
@@ -95,6 +95,7 @@ async function internalKey(label: string, models: string[]): Promise<string> {
 /** A customer tenant granted `modelIds`, and one key that follows its grants. */
 async function grantedTenant(name: string, modelIds: string[]): Promise<{ tenant: Json; key: string }> {
   const created = await stack.admin.post("/admin/tenants", { name });
+  await fundTenant(stack.admin, created.id);
   const tenant = await stack.admin.patch(`/admin/tenants/${created.id}`, { allowed_model_ids: modelIds }, created.version);
   const { plaintext } = await stack.admin.post(`/admin/tenants/${created.id}/keys`, { label: `key-${name}` });
   return { tenant, key: plaintext };
@@ -333,6 +334,10 @@ test("移除路由目标要两步确认：取消保留，确认后移除，保�
   expect((await stack.admin.get(`/admin/resources/models/${route.id}`)).doc.routing.targets).toHaveLength(2);
   await form.getByRole("button", { name: "保存" }).click();
 
+  // Until the save is answered the row shows the rollout it was listed with,
+  // which may already read `applied`: wait for the answer (the form closes),
+  // so the badge below is the saved version's.
+  await expect(form).toHaveCount(0);
   await expect(badge(modelRow(page, "route-trim-e2e"))).toHaveAttribute("data-state", "applied", {
     timeout: APPLIED_WITHIN_MS,
   });

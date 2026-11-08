@@ -217,6 +217,20 @@ fn fixture(method: &str, path: &str, target: &SeededOperator) -> (String, Option
             format!("/admin/tenants/{}/credits", Uuid::nil()),
             Some(json!({"amount_usd": "0.05", "reason": "roles"})),
         ),
+        // Organization quotas. The tenant matches nothing: 404 once the role
+        // check passed, so no quota is written.
+        ("GET" | "POST", "/admin/tenants/{id}/budgets") => (
+            format!("/admin/tenants/{}/budgets", Uuid::nil()),
+            (method == "POST").then(|| json!({"limit_usd": "1.00"})),
+        ),
+        ("PATCH" | "DELETE", "/admin/tenants/{id}/budgets/{bid}") => (
+            format!(
+                "/admin/tenants/{}/budgets/{}",
+                Uuid::nil(),
+                Uuid::nil()
+            ),
+            (method == "PATCH").then(|| json!({"limit_usd": "1.00"})),
+        ),
         _ => panic!("no fixture for {method} {path}: add one to tests/roles.rs"),
     }
 }
