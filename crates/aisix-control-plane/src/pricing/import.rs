@@ -698,6 +698,11 @@ pub async fn detail(
 /// The most characters a rejection's reason holds.
 const MAX_REASON_CHARS: usize = 500;
 
+/// What a confirmation attests, in the operator's own words: the checkbox's
+/// text. It is the `422 /attested` answer and the audit row's record of what
+/// was affirmed.
+const ATTESTATION: &str = "已对照官方价格页核对";
+
 /// A proposal of batch `batch_id`, read `FOR UPDATE` with its batch's
 /// `dataset_ref`: everything a decision needs of the row itself.
 struct LockedProposal {
@@ -746,7 +751,20 @@ async fn lock_proposal(
     .bind(id)
     .fetch_optional(&mut *conn)
     .await
-    .map_err(DbError::from)?;
+    // The row is held by another transaction: an upload superseding this
+    // batch, or another operator deciding the same proposal. Either way the
+    // review page is showing a row that is about to change, which is what
+    // `proposal_state` tells the caller. Still logged, as `error.rs`'s own
+    // lock-timeout arm logs it: a run of them means something holds the row
+    // too long, and without the line a stuck upload reads as an operator
+    // double-clicking.
+    .map_err(|e| match DbError::from(e) {
+        e @ DbError::LockTimeout => {
+            tracing::warn!(error = %e, "a proposal row was held past lock_timeout");
+            ApiError::proposal_state()
+        }
+        e => ApiError::from(e),
+    })?;
     proposal.ok_or_else(ApiError::not_found)
 }
 
@@ -781,20 +799,38 @@ fn check_confirmable(proposal: &LockedProposal) -> Result<RateCard, ApiError> {
 /// `POST /admin/pricing/imports/{id}/proposals/{pid}/confirm`, body
 /// `{model_id, effective_from, attested}` → `201 BaselineRevision`.
 ///
-/// Refused with `422`: an `attested` that is not `true` (`/attested`, "请
-/// 确认已对照官方价格页核对"), a proposal that carries any flag or no card
-/// (`/flags`), and an `effective_from` before the proposal's own
-/// (`/effective_from`). Refused with `409 proposal_state` unless the proposal
-/// is still `pending`; a superseded one counts as not pending. `404` for a
-/// `pid` outside batch `{id}`.
+/// Refused in this order:
+/// 0. `400`/`422` for a body that does not deserialize (an unknown member,
+///    a missing `model_id` or `effective_from`), which answers before
+///    anything below it is read.
+/// 1. `422 /attested` unless `attested` is exactly `true`, with
+///    "请确认已对照官方价格页核对". This is checked **before the proposal is
+///    read**, so it is a bad body on a pid that names nothing that answers
+///    `/attested` rather than `404`; the caller's own claim is settled first.
+/// 2. `404` for a `pid` outside batch `{id}`, or an id that is not a UUID.
+/// 3. `409 proposal_state` unless the proposal is still `pending`; a
+///    superseded one counts as not pending.
+/// 4. `422 /flags` for a proposal that carries any flag, or whose card this
+///    engine cannot read (see [`check_confirmable`]).
+/// 5. `422 /effective_from` for a start before the proposal's own.
+/// 6. `insert_baseline`'s own refusals, which answer last: `422 /model_id`
+///    for a model that is not live, `422 /card` for a card it cannot apply,
+///    and its past-start `/effective_from` check.
 ///
 /// One transaction: the proposal row is taken `FOR UPDATE`, so of two
 /// decisions on it exactly one commits, and the other answers
-/// `409 proposal_state`. [`baselines::insert_baseline`] writes the revision
-/// labelled third-party, carrying the batch's `dataset_ref`, the proposal's
-/// own page and checked date, and this operator's attestation at `now()`; the
-/// proposal becomes `confirmed` and names the revision. The confirmation's
-/// audit row is `pricing.import.confirm`, beside the baseline's own
+/// `409 proposal_state`. A row another writer holds past `lock_timeout` — an
+/// in-flight upload's supersede sweep, or a concurrent decision — answers the
+/// same `409`, not a `503`/`500`: the row is being decided, and the page that
+/// sent the request is stale either way.
+///
+/// [`baselines::insert_baseline`] writes the revision labelled third-party,
+/// carrying the batch's `dataset_ref`, the proposal's own page and checked
+/// date, and this operator's attestation at `now()`; the proposal becomes
+/// `confirmed`, naming the revision and the attesting operator, which
+/// `0026`'s trigger permits only in this write. The confirmation's audit row
+/// is `pricing.import.confirm`, holding the attester, `attested: true` and
+/// the sentence affirmed, beside the baseline's own
 /// `pricing.baseline.create`.
 pub async fn confirm(
     auth: OperatorAuth,
@@ -804,7 +840,7 @@ pub async fn confirm(
 ) -> Result<(StatusCode, Json<BaselineRevision>), ApiError> {
     auth.require(OperatorRole::Operator)?;
     if body.attested != Some(true) {
-        return Err(refused("/attested", "请确认已对照官方价格页核对"));
+        return Err(refused("/attested", format!("请确认{ATTESTATION}")));
     }
     let id = Uuid::parse_str(&id).map_err(|_| ApiError::not_found())?;
     let pid = Uuid::parse_str(&pid).map_err(|_| ApiError::not_found())?;
@@ -846,11 +882,14 @@ pub async fn confirm(
                 let (revision, _) =
                     super::baselines::insert_baseline(&mut *conn, &row, Actor::Operator(&auth))
                         .await?;
-                sqlx::query(
+                // `attested_by` is written here and only here: `0026`'s
+                // trigger allows the column to change only on a confirmation,
+                // and refuses any update of a row already decided.
+                let written = sqlx::query(
                     "UPDATE pricing_import_proposals \
                      SET status = 'confirmed', decided_by = $1, decided_at = $2, \
-                         baseline_revision_id = $3 \
-                     WHERE id = $4",
+                         attested_by = $1, baseline_revision_id = $3 \
+                     WHERE id = $4 AND status = 'pending'",
                 )
                 .bind(auth.id)
                 .bind(now)
@@ -859,6 +898,13 @@ pub async fn confirm(
                 .execute(&mut *conn)
                 .await
                 .map_err(DbError::from)?;
+                // The row was locked `pending` a moment ago, so this is
+                // unreachable; should the lock ever stop carrying the
+                // invariant, the caller is told to refresh rather than
+                // answered as if it had confirmed.
+                if written.rows_affected() != 1 {
+                    return Err(ApiError::proposal_state());
+                }
                 audit::record(
                     &mut *conn,
                     AuditEntry {
@@ -871,6 +917,10 @@ pub async fn confirm(
                             "proposal_id": pid,
                             "model_id": body.model_id,
                             "attested": true,
+                            // The sentence the operator affirmed, so an
+                            // attestation stays readable after a later
+                            // release rewords the checkbox.
+                            "attestation": ATTESTATION,
                         }),
                     },
                 )
@@ -933,11 +983,11 @@ pub async fn reject(
             async move {
                 let proposal = lock_proposal(&mut *conn, id, pid).await?;
                 check_pending(&proposal)?;
-                sqlx::query(
+                let written = sqlx::query(
                     "UPDATE pricing_import_proposals \
                      SET status = 'rejected', reject_reason = $1, decided_by = $2, \
                          decided_at = now() \
-                     WHERE id = $3",
+                     WHERE id = $3 AND status = 'pending'",
                 )
                 .bind(&reason)
                 .bind(auth.id)
@@ -945,6 +995,11 @@ pub async fn reject(
                 .execute(&mut *conn)
                 .await
                 .map_err(DbError::from)?;
+                // As in `confirm`: unreachable under the row lock, and a
+                // refusal rather than a silent rewrite if that ever changes.
+                if written.rows_affected() != 1 {
+                    return Err(ApiError::proposal_state());
+                }
                 audit::record(
                     &mut *conn,
                     AuditEntry {

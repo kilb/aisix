@@ -864,6 +864,10 @@ async fn confirming_writes_a_third_party_baseline_with_its_attestation() {
     assert_eq!(confirmed["status"], "confirmed");
     assert_eq!(confirmed["decided_by"], json!(op.id));
     assert!(confirmed["decided_at"].is_string(), "{confirmed}");
+    // The proposal names its own attester too, not only the baseline: the
+    // column is written once, by this confirmation, and no later write may
+    // set it.
+    assert_eq!(confirmed["attested_by"], json!(op.id), "{confirmed}");
     assert_eq!(confirmed["baseline_revision_id"], revision["revision_id"]);
 
     // It is what the model bills from now.
@@ -884,9 +888,16 @@ async fn confirming_writes_a_third_party_baseline_with_its_attestation() {
         ],
         "{rows:?}"
     );
+    // The sentence the operator affirmed, so it stays readable after a
+    // later release rewords the checkbox.
     assert_eq!(
         rows[2].2,
-        json!({"proposal_id": proposal["id"], "model_id": model_id, "attested": true})
+        json!({
+            "proposal_id": proposal["id"],
+            "model_id": model_id,
+            "attested": true,
+            "attestation": "已对照官方价格页核对",
+        })
     );
     assert_eq!(rows[2].1, Some(id(&proposal).to_string()));
 }
@@ -987,8 +998,71 @@ async fn a_flagged_proposal_cannot_be_confirmed() {
     }
 }
 
+#[tokio::test]
+async fn a_second_decision_past_the_lock_writes_nothing() {
+    // The predicate's own proof, independent of the row lock: with the row
+    // already decided, the exact UPDATE each verb runs matches nothing, so a
+    // lost `FOR UPDATE` would refuse the second decision rather than rewrite
+    // the first. Without the `AND status = 'pending'` clause this UPDATE
+    // reports one affected row and the row is decided a second time.
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let op = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let model_id = model(&cp, &op, "anthropic", "claude-opus-5-5").await;
+    let batch = upload(&cp, &op).await;
+    let proposal = current(
+        &proposals(&cp, &op, &batch).await,
+        "anthropic",
+        "claude-opus-5-5",
+    )
+    .clone();
+    let pid = id(&proposal).to_string();
+
+    // Decide it for real, so the row is in the state the guarded UPDATE will
+    // meet: a check constraint ties `confirmed` to a baseline revision, which
+    // only the verb can write.
+    let body = json!({
+        "model_id": model_id,
+        "effective_from": db_now(&cp).await,
+        "attested": true,
+    });
+    let first = decide(&cp, &op, &batch, &proposal, "confirm", body).await;
+    assert_eq!(first.status, 201, "{first:?}");
+
+    for status in ["confirmed", "rejected"] {
+        let done = sqlx::query(
+            "UPDATE pricing_import_proposals \
+             SET status = $2, decided_at = now() \
+             WHERE id = $1::uuid AND status = 'pending'",
+        )
+        .bind(&pid)
+        .bind(status)
+        .execute(cp.db().pool())
+        .await
+        .expect("the guarded update runs");
+        assert_eq!(done.rows_affected(), 0, "{status}");
+    }
+
+    let stored: String =
+        sqlx::query_scalar("SELECT status FROM pricing_import_proposals WHERE id = $1::uuid")
+            .bind(&pid)
+            .fetch_one(cp.db().pool())
+            .await
+            .expect("read the decided row");
+    assert_eq!(stored, "confirmed", "the first decision stands");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_proposal_is_decided_once() {
+    // Two guards keep this invariant, and this case catches only their loss
+    // TOGETHER: the `FOR UPDATE OF p` that serialises the two decisions, and
+    // the `AND status = 'pending'` plus rows-affected check inside each verb.
+    // Removing the lock alone leaves this test green, because the loser's
+    // predicate matches nothing and it rolls back before its baseline lands.
+    // That is deliberate — the predicate is why a lost lock cannot rewrite a
+    // decided row — and `a_second_decision_past_the_lock_writes_nothing` is
+    // the proof the predicate carries on its own.
     let Some(cp) = TestCp::start().await else {
         return;
     };
@@ -1110,6 +1184,163 @@ async fn rejecting_writes_nothing_but_the_decision() {
     .await;
     assert_eq!(r.status, 409, "{r:?}");
     assert_eq!(r.body["code"], "proposal_state");
+}
+
+/// A proposal locked by another transaction for longer than the control
+/// plane's `lock_timeout`: the decision is refused as already handled, which
+/// is what it is — the row it would decide is being decided.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_proposal_locked_by_another_writer_answers_proposal_state() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let op = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let model_id = model(&cp, &op, "anthropic", "claude-opus-5-5").await;
+    let batch = upload(&cp, &op).await;
+    let proposal = current(
+        &proposals(&cp, &op, &batch).await,
+        "anthropic",
+        "claude-opus-5-5",
+    )
+    .clone();
+    let body = json!({
+        "model_id": model_id,
+        "effective_from": db_now(&cp).await,
+        "attested": true,
+    });
+    let body_r = json!({"reason": "并发的拒绝"});
+
+    // Another writer holds the row, as an in-flight upload's sweep or a
+    // concurrent decision does.
+    let mut holder = cp.db().pool().begin().await.expect("begin");
+    sqlx::query("SELECT id FROM pricing_import_proposals WHERE id = $1::uuid FOR UPDATE")
+        .bind(id(&proposal))
+        .execute(&mut *holder)
+        .await
+        .expect("lock the proposal");
+
+    let started = Instant::now();
+    let (confirmed, rejected) = tokio::join!(
+        decide(&cp, &op, &batch, &proposal, "confirm", body),
+        decide(&cp, &op, &batch, &proposal, "reject", body_r),
+    );
+    for r in [&confirmed, &rejected] {
+        assert_eq!(r.status, 409, "{r:?}");
+        assert_eq!(r.body["code"], "proposal_state", "{r:?}");
+    }
+    // Bounded by `lock_timeout` (5 s), not by the test's own timeout.
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "{:?}",
+        started.elapsed()
+    );
+    holder.rollback().await.expect("release the lock");
+
+    // Nothing was written while it waited, and the row is still decidable.
+    assert_eq!(cp.count("pricing_baselines").await, 0);
+    let r = decide(
+        &cp,
+        &op,
+        &batch,
+        &proposal,
+        "confirm",
+        json!({
+            "model_id": model_id,
+            "effective_from": db_now(&cp).await,
+            "attested": true,
+        }),
+    )
+    .await;
+    assert_eq!(r.status, 201, "{r:?}");
+    assert_eq!(cp.count("pricing_baselines").await, 1);
+}
+
+/// A confirmation refused by the baseline write leaves the proposal exactly
+/// as it was: no row, no version bump, still `pending`.
+#[tokio::test]
+async fn a_refused_baseline_leaves_the_proposal_pending() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let op = cp.admin_login_seeded(OperatorRole::Operator).await;
+    model(&cp, &op, "anthropic", "claude-opus-5-5").await;
+    let batch = upload(&cp, &op).await;
+    let proposal = current(
+        &proposals(&cp, &op, &batch).await,
+        "anthropic",
+        "claude-opus-5-5",
+    )
+    .clone();
+    let version = pricing_version(&cp).await;
+
+    // A dead model: `insert_baseline` refuses it inside the transaction.
+    let r = decide(
+        &cp,
+        &op,
+        &batch,
+        &proposal,
+        "confirm",
+        json!({
+            "model_id": Uuid::new_v4(),
+            "effective_from": db_now(&cp).await,
+            "attested": true,
+        }),
+    )
+    .await;
+    assert_eq!(r.status, 422, "{r:?}");
+    assert_eq!(r.body["code"], "validation_failed");
+    assert_eq!(refusal_paths(&r), vec!["/model_id"]);
+
+    assert_eq!(cp.count("pricing_baselines").await, 0);
+    assert_eq!(pricing_version(&cp).await, version);
+    let all = proposals(&cp, &op, &batch).await;
+    let p = all.iter().find(|p| p["id"] == proposal["id"]).expect("it");
+    assert_eq!(p["status"], "pending", "{p}");
+    assert_eq!(p["attested_by"], Value::Null, "{p}");
+    assert_eq!(audits(&cp).await.len(), 1, "only the upload's own row");
+}
+
+/// The attestation is the caller's own claim and is checked before the row is
+/// read, so a bad body on a pid that names nothing answers `/attested`, not
+/// `404`. The 404 answers once the body is good.
+#[tokio::test]
+async fn the_attestation_is_checked_before_the_proposal_is_read() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let op = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let batch = upload(&cp, &op).await;
+    let model_id = model(&cp, &op, "anthropic", "claude-opus-5-5").await;
+    let effective_from = db_now(&cp).await;
+
+    for pid in ["not-a-uuid", &Uuid::new_v4().to_string()] {
+        let path = format!("{PATH}/{}/proposals/{pid}/confirm", id(&batch));
+        for body in [
+            json!({"model_id": model_id, "effective_from": effective_from}),
+            json!({"model_id": model_id, "effective_from": effective_from, "attested": false}),
+        ] {
+            let r = cp
+                .send("POST", &path, Some(op.cookie()), Some(body.clone()))
+                .await;
+            assert_eq!(r.status, 422, "{pid} {body}: {r:?}");
+            assert_eq!(refusal_paths(&r), vec!["/attested"], "{pid} {body}");
+        }
+        // The body is good: now the missing row decides.
+        let r = cp
+            .send(
+                "POST",
+                &path,
+                Some(op.cookie()),
+                Some(json!({
+                    "model_id": model_id,
+                    "effective_from": effective_from,
+                    "attested": true,
+                })),
+            )
+            .await;
+        assert_eq!(r.status, 404, "{pid}: {r:?}");
+        assert_eq!(r.body["code"], "not_found", "{pid}");
+    }
 }
 
 #[tokio::test]
