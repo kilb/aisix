@@ -4,26 +4,36 @@
 //!
 //! - Proxy handlers call [`UsageSink::try_emit`] (defined in aisix-obs)
 //!   to push one event per chat completion onto an mpsc channel.
-//! - This worker drains the channel, batches up to [`MAX_BATCH`]
-//!   events or every [`FLUSH_INTERVAL`] (whichever fires first),
-//!   POSTs the batch as `{ events: [...] }` to the CP's
-//!   `/dp/telemetry` URL, and logs the outcome.
+//! - This worker drains the channel, serializing each event once as it
+//!   leaves the queue, batches up to [`MAX_BATCH`] events or
+//!   [`MAX_BATCH_BYTES`], or every [`FLUSH_INTERVAL`] (whichever comes
+//!   first), POSTs the batch as `{ events: [...] }` to the CP's
+//!   `/dp/telemetry` URL, and logs the outcome. An event too large to
+//!   travel with others ([`MAX_EVENT_BYTES`]) is dropped alone.
 //! - On HTTP error the batch is re-sent — but only while the control
 //!   plane's own answer proves re-sending cannot double-count. Every
 //!   POST carries [`USAGE_BATCH_ID_HEADER`], the control plane records
 //!   that id in the same transaction as the usage rows, and it answers
 //!   every response from that handler with [`USAGE_BATCH_DEDUP_HEADER`].
 //!   A failure whose response lacks that header — or carries it with an
-//!   undefined value — is dropped, exactly as every failure was before.
+//!   undefined value — is dropped, exactly as every failure was before. A
+//!   connection that could not be made is the exception: nothing was sent,
+//!   so it is re-sent whatever the control plane last said.
 //!   There is still no persistent disk queue: a batch is given up on once
 //!   its OLDEST event is [`RETRY_BUDGET`] old (which can be before its
 //!   first attempt, since the sender is single in-flight), or once the
 //!   control plane has answered and refused it [`MAX_ANSWERED_FAILURES`]
-//!   times in a row. Two failures do not count toward that cap and are
-//!   bounded by the budget alone: an attempt that got no response, and a
-//!   `503` carrying the de-duplication header, which is the control plane
+//!   times in a row. Two failures do not count toward that cap: an attempt
+//!   that got no response, bounded by the budget alone, and a `503`
+//!   carrying the de-duplication header, which is the control plane
 //!   reporting a transient store failure that the same batch, re-sent
-//!   unchanged, gets past. Every wait between re-sends is spread by
+//!   unchanged, gets past. Past [`REPORTED_OUTAGE_BUDGET`] of those, the
+//!   next batch is posted once to tell a store outage from a batch the
+//!   store keeps failing on: if it is stored, the held batch is re-sent once
+//!   more and, failing again, given up on; if it is not, the store is down,
+//!   and both are held within the budget. A batch given up on after an attempt that may have
+//!   reached the control plane unanswered is counted as unconfirmed rather
+//!   than as lost. Every wait between re-sends is spread by
 //!   [`RETRY_JITTER`], so gateways that failed together do not re-send
 //!   together. The `received_at` column on the control plane side
 //!   records when CP saw the row, so dashboards distinguish "DP never sent"
@@ -39,7 +49,8 @@ use std::time::Duration;
 
 use aisix_core::redact_url_for_log;
 use anyhow::{anyhow, Context};
-use serde::{Deserialize, Serialize};
+use hyper::body::Bytes;
+use serde::Deserialize;
 use tokio::sync::watch;
 use tokio::time::Instant;
 use uuid::Uuid;
@@ -48,11 +59,23 @@ use aisix_obs::{Metrics, UsageEvent, UsageEventLabels, UsageSink};
 
 use crate::heartbeat::MtlsBundle;
 
-/// Maximum number of events accumulated per outbound POST. Pinned in
-/// code rather than config — at >100 events/batch the request body
-/// approaches gin's default `MaxMultipartMemory` plumbing on the
-/// receiving side, and we'd rather flush more often than tune that.
-const MAX_BATCH: usize = 100;
+/// Maximum number of events accumulated per outbound POST: the most one
+/// batch may carry at the control plane (`MAX_EVENTS_PER_BATCH`), which
+/// skips any past it. One POST is in flight at a time, so this is what
+/// delivery's throughput is per round trip. A batch of large events is cut
+/// at [`MAX_BATCH_BYTES`] first.
+const MAX_BATCH: usize = 1000;
+
+/// The most bytes one POST's body may carry: half the control plane's 8 MiB
+/// body cap. A body past that cap is answered `413`, which is permanent, and
+/// every event in it would be lost.
+const MAX_BATCH_BYTES: usize = 4 << 20;
+
+/// The most bytes one event may serialize to. One larger is dropped alone,
+/// counted [`DROP_OVERSIZED`], rather than travel with others: far above any
+/// row the emit chokepoint lets through, which bounds every text a caller or
+/// an upstream chose.
+const MAX_EVENT_BYTES: usize = 256 << 10;
 
 /// Cadence at which the worker flushes whatever it has buffered, even
 /// if the buffer hasn't filled. Kept short so the control plane sees
@@ -115,6 +138,24 @@ const RETRY_MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// on the same beat for as long as the outage lasts.
 const RETRY_JITTER: f64 = 0.2;
 
+/// How long one batch may keep meeting `503`s that carry
+/// [`USAGE_BATCH_DEDUP_HEADER`], from the first of them, spread by
+/// [`RETRY_JITTER`] for each batch.
+///
+/// The control plane answers that for a store failure the same batch,
+/// re-sent unchanged, gets past, so those answers do not count toward
+/// [`MAX_ANSWERED_FAILURES`]. But one batch that keeps meeting them would
+/// otherwise hold the single in-flight sender for the whole
+/// [`RETRY_BUDGET`] while everything queued behind it overflows. Five
+/// minutes outlasts a database failover. Past it the sender asks whether
+/// the failure is the store's or the batch's: it posts the next batch once
+/// ([`probe_with_the_next_batch`]). Stored, the held batch gets one more
+/// attempt and, failing again with a reported outage, is given up on alone.
+/// Not stored, the store is down: the held batch is kept, within
+/// [`RETRY_BUDGET`], and the probe waits under its own id to go next, so an
+/// outage longer than five minutes loses nothing the budget would keep.
+const REPORTED_OUTAGE_BUDGET: Duration = Duration::from_secs(5 * 60);
+
 /// How long a batch may be re-sent, measured from its OLDEST event's
 /// `occurred_at` — NOT from its first attempt.
 ///
@@ -157,14 +198,16 @@ const RETRY_BUDGET: Duration = Duration::from_secs(30 * 60);
 /// timeout, an admin shutdown — and answers a permanent one `500`. Counted,
 /// a store outage longer than the backoff to the eighth answer (about a
 /// minute and a half) would drop the batch at the head of every gateway's
-/// queue although none of them was ever stored; it too is bounded by the
-/// budget instead, on the same backoff. Every other answered failure counts,
+/// queue although none of them was ever stored; it is bounded by
+/// [`REPORTED_OUTAGE_BUDGET`] instead, on the same backoff. Every other answered failure counts,
 /// including a `503` WITHOUT the header, which a proxy in front of the
 /// control plane can send and which says nothing about the store. See
 /// [`SendFailure::counts_toward_the_cap`].
 const MAX_ANSWERED_FAILURES: usize = 8;
 
-/// How long the shutdown drain keeps posting what is queued.
+/// How long the shutdown drain keeps posting what is queued, from the moment
+/// the worker first sees the stop: an attempt that was on the wire then, or a
+/// re-send's final attempt, counts against it too.
 ///
 /// A control plane that answers gets through a full queue well inside this.
 /// One that has stopped answering costs the request timeout per batch, and the
@@ -179,10 +222,25 @@ pub(crate) const FINAL_DRAIN_BUDGET: Duration = Duration::from_secs(20);
 /// failure was not retryable, or the gateway is shutting down.
 const DROP_SEND_FAILED: &str = "send_failed";
 
+/// `aisix_usage_event_drops_total{reason}` for a batch given up on although
+/// it may have been stored: an attempt of it reached the wire and got no
+/// response (a timeout, a connection lost after the request went out), or
+/// the shutdown drain ran out of time with it in flight. Distinct from the
+/// other reasons, which each say the control plane does not hold the
+/// events, so that `expected - drops` stays a bound the stored rows reach
+/// and `expected - drops - unconfirmed` one they do not fall below.
+const DROP_SEND_UNCONFIRMED: &str = "send_unconfirmed";
+
+/// `aisix_usage_event_drops_total{reason}` for an event that serialized to
+/// more than [`MAX_EVENT_BYTES`], given up on alone as it left the queue so
+/// that it cannot take the events of its batch with it.
+const DROP_OVERSIZED: &str = "oversized";
+
 /// `aisix_usage_event_drops_total{reason}` for a batch that ran out of room
 /// to keep trying: its events aged past [`RETRY_BUDGET`] (with or without
-/// an attempt ever being made), or the answers refusing it reached
-/// [`MAX_ANSWERED_FAILURES`]. Distinct from
+/// an attempt ever being made), the answers refusing it reached
+/// [`MAX_ANSWERED_FAILURES`], or the control plane kept reporting a store
+/// outage on it past [`REPORTED_OUTAGE_BUDGET`]. Distinct from
 /// [`DROP_SEND_FAILED`], which says the very first failure could not be
 /// re-sent at all.
 const DROP_RETRY_BUDGET_EXHAUSTED: &str = "retry_budget_exhausted";
@@ -288,7 +346,7 @@ async fn run(
     let mut ticker = tokio::time::interval(cfg.interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-    let mut buffer: Vec<UsageEvent> = Vec::with_capacity(MAX_BATCH);
+    let mut buffer = Buffer::default();
     let mut state = SenderState::default();
 
     tracing::info!(
@@ -307,16 +365,20 @@ async fn run(
             maybe_event = rx.recv() => {
                 match maybe_event {
                     Some(event) => {
-                        metrics.usage_delivery().note_waiting();
-                        buffer.push(event);
-                        if buffer.len() >= MAX_BATCH {
-                            flush(&client, &cfg, &metrics, &mut state, &mut buffer, Retry::Allowed, cancel).await;
+                        // An event dropped as too large waits for nothing.
+                        if buffer.push(event, &metrics) {
+                            metrics.usage_delivery().note_waiting();
+                        }
+                        if buffer.holds_a_full_batch() {
+                            flush(&client, &cfg, &metrics, &mut state, &mut buffer, &mut rx, Retry::Allowed, cancel).await;
                         }
                     }
                     None => {
                         // All senders dropped — proxy is shutting down.
                         // Drain anything left and exit.
-                        flush(&client, &cfg, &metrics, &mut state, &mut buffer, Retry::Disabled, cancel).await;
+                        while !buffer.is_empty() {
+                            flush(&client, &cfg, &metrics, &mut state, &mut buffer, &mut rx, Retry::Disabled, cancel).await;
+                        }
                         tracing::info!("telemetry sender: channel closed, exiting");
                         return;
                     }
@@ -324,8 +386,8 @@ async fn run(
             }
             _ = ticker.tick() => {
                 if !buffer.is_empty() {
-                    fill_ready_batch(&mut buffer, &mut rx);
-                    flush(&client, &cfg, &metrics, &mut state, &mut buffer, Retry::Allowed, cancel).await;
+                    fill_ready_batch(&mut buffer, &mut rx, &metrics);
+                    flush(&client, &cfg, &metrics, &mut state, &mut buffer, &mut rx, Retry::Allowed, cancel).await;
                 }
             }
             _ = cancel.changed() => {}
@@ -342,56 +404,48 @@ async fn run(
         // the shutdown and the drain would never run.
         if *cancel.borrow() {
             // Final drain — post whatever is still queued, in
-            // batches of at most MAX_BATCH. This is the one path
-            // that can meet a FULL queue (every other flush
-            // happens at or below the ceiling), and one POST of
-            // everything queued is exactly what the ceiling
-            // exists to prevent: cp-api rejects an oversized body
+            // batches within MAX_BATCH and MAX_BATCH_BYTES. This is the
+            // one path that can meet a FULL queue (every other flush
+            // happens at or below the ceilings), and one POST of
+            // everything queued is exactly what the ceilings
+            // exist to prevent: cp-api rejects an oversized body
             // and the whole backlog is gone, unretried.
             //
             // `Retry::Disabled`: every batch here gets one attempt. Waiting
             // out a backoff would hold the whole shutdown open for a
             // control plane that is already failing, and so would posting
             // into one that has stopped answering, one timeout per batch:
-            // past `FINAL_DRAIN_BUDGET` what is left is counted and given up on.
-            let drain_deadline = Instant::now() + FINAL_DRAIN_BUDGET;
+            // past the shutdown deadline what is left is counted and given
+            // up on. The deadline is the one fixed when this worker first saw
+            // the stop, which may have been during a re-send that ended
+            // before the drain began ([`SenderState::shutdown_deadline`]):
+            // that re-send and every attempt since count against it.
+            let drain_deadline = state.shutdown_deadline();
             loop {
-                fill_ready_batch(&mut buffer, &mut rx);
+                fill_ready_batch(&mut buffer, &mut rx, &metrics);
                 if buffer.is_empty() {
                     break;
                 }
-                let mut events = std::mem::take(&mut buffer);
-                let delivered = tokio::time::timeout_at(
-                    drain_deadline,
-                    deliver(
-                        &client,
-                        &cfg,
-                        &metrics,
-                        &mut state,
-                        &events,
-                        Retry::Disabled,
-                        cancel,
-                    ),
-                )
-                .await;
-                if delivered.is_err() {
-                    while let Ok(event) = rx.try_recv() {
-                        events.push(event);
-                    }
-                    drop_batch(
-                        &metrics,
-                        DROP_SEND_FAILED,
-                        &events,
-                        Uuid::new_v4(),
-                        0,
-                        Some(&SendFailure::NoResponse {
-                            error: anyhow::anyhow!(
-                                "the shutdown drain ran out of time before this batch was answered"
-                            ),
-                        }),
-                    );
+                if Instant::now() >= drain_deadline {
+                    give_up_unsent(&metrics, &mut buffer, &mut rx);
                     break;
                 }
+                let Some(batch) = buffer.take_next() else {
+                    break;
+                };
+                // Its one attempt is cut off at `drain_deadline` (`attempt`),
+                // which drops the batch as possibly stored.
+                deliver(
+                    &client,
+                    &cfg,
+                    &metrics,
+                    &mut state,
+                    &batch,
+                    Retry::Disabled,
+                    cancel,
+                    None,
+                )
+                .await;
             }
             tracing::info!("telemetry sender shutting down");
             return;
@@ -421,6 +475,9 @@ struct SenderState {
     /// [`random_jitter`], except in a test that has to see every wait go
     /// through it.
     jitter: fn(Duration) -> Duration,
+    /// When the shutdown drain must be over: [`FINAL_DRAIN_BUDGET`] after
+    /// this worker first saw the stop. `None` until it has.
+    shutdown_by: Option<Instant>,
 }
 
 impl Default for SenderState {
@@ -428,11 +485,21 @@ impl Default for SenderState {
         SenderState {
             dedup_seen: false,
             jitter: random_jitter,
+            shutdown_by: None,
         }
     }
 }
 
 impl SenderState {
+    /// The deadline every attempt after the stop is held to, fixed the first
+    /// time this is asked: by the run loop, by a re-send's backoff, or by an
+    /// attempt that was on the wire when the stop came.
+    fn shutdown_deadline(&mut self) -> Instant {
+        *self
+            .shutdown_by
+            .get_or_insert_with(|| Instant::now() + FINAL_DRAIN_BUDGET)
+    }
+
     /// Decide whether the batch that just produced `failure` may be re-sent,
     /// and record what the exchange said about the control plane.
     ///
@@ -444,10 +511,14 @@ impl SenderState {
     /// So: a response that carries the header and a retryable status may be
     /// re-sent; a response without the header may not, and clears the flag.
     ///
-    /// A failure with NO response — connect error, timeout — carries no
-    /// evidence at all, and that is the failure a control-plane outage
-    /// actually produces. It falls back to the flag: re-send only if the
-    /// most recent response this sender received carried the header and
+    /// A failure with NO response carries no evidence at all, and that is
+    /// the failure a control-plane outage actually produces. A connection
+    /// that could not be made sent nothing, so re-sending it can never count
+    /// anything twice, and it is re-sent whatever the flag says: a gateway
+    /// that boots while the control plane is down has seen no response yet.
+    /// Any other — a timeout, a connection lost after the request went out —
+    /// may have been stored, so it falls back to the flag: re-send only if
+    /// the most recent response this sender received carried the header and
     /// nothing since has come back without it.
     fn may_resend(&mut self, failure: &SendFailure) -> bool {
         match failure {
@@ -457,61 +528,402 @@ impl SenderState {
                 self.dedup_seen = *dedup;
                 *dedup && *retryable
             }
-            SendFailure::NoResponse { .. } => self.dedup_seen,
+            SendFailure::NoResponse { never_sent, .. } => *never_sent || self.dedup_seen,
         }
     }
 }
 
-fn fill_ready_batch(
-    buffer: &mut Vec<UsageEvent>,
+/// One event as it goes out, serialized once as it leaves the queue: its
+/// size is known before it joins a batch, and every re-send of its batch
+/// repeats the same bytes.
+#[derive(Debug)]
+struct Prepared {
+    json: Vec<u8>,
+    /// `occurred_at`, parsed; `None` when it does not parse (see
+    /// [`remaining_budget`]).
+    occurred_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The member pair a drop is counted against (see [`drop_batch`]).
+    user_id: String,
+    user_name: String,
+}
+
+impl Prepared {
+    /// Serialize `event` for the wire, or give it up alone when it is too
+    /// large to travel with others.
+    fn new(event: UsageEvent, metrics: &Metrics) -> Option<Prepared> {
+        let reason = match serde_json::to_vec(&event) {
+            Ok(json) if json.len() <= MAX_EVENT_BYTES => {
+                return Some(Prepared {
+                    json,
+                    occurred_at: chrono::DateTime::parse_from_rfc3339(&event.occurred_at)
+                        .ok()
+                        .map(|at| at.with_timezone(&chrono::Utc)),
+                    user_id: event.user_id,
+                    user_name: event.user_name,
+                });
+            }
+            Ok(_) => DROP_OVERSIZED,
+            Err(_) => DROP_SEND_FAILED,
+        };
+        metrics.record_usage_event_drop(
+            reason,
+            UsageEventLabels {
+                user_id: non_empty(&event.user_id),
+                user_name: non_empty(&event.user_name),
+                ..UsageEventLabels::default()
+            },
+        );
+        tracing::warn!(
+            request_id = event.request_id.as_str(),
+            reason,
+            max_bytes = MAX_EVENT_BYTES,
+            "usage event too large to send (event dropped)",
+        );
+        None
+    }
+}
+
+/// `{"events":[` and `]}`, around the comma-separated events of a body.
+const BODY_OPEN: &[u8] = br#"{"events":["#;
+const BODY_CLOSE: &[u8] = b"]}";
+
+/// The size of the body that carries `count` events of `event_bytes` in all.
+const fn body_len(event_bytes: usize, count: usize) -> usize {
+    BODY_OPEN.len() + event_bytes + count.saturating_sub(1) + BODY_CLOSE.len()
+}
+
+/// The `{ events: [...] }` body of one batch.
+fn batch_body(events: &[Prepared]) -> Bytes {
+    let event_bytes = events.iter().map(|e| e.json.len()).sum();
+    let mut body = Vec::with_capacity(body_len(event_bytes, events.len()));
+    body.extend_from_slice(BODY_OPEN);
+    for (i, event) in events.iter().enumerate() {
+        if i > 0 {
+            body.push(b',');
+        }
+        body.extend_from_slice(&event.json);
+    }
+    body.extend_from_slice(BODY_CLOSE);
+    body.into()
+}
+
+/// The events taken off the queue and not yet sent, in arrival order.
+#[derive(Debug, Default)]
+struct Buffer {
+    /// A batch already posted under its id, which must go out next and
+    /// under the same id: the probe [`probe_with_the_next_batch`] sent and
+    /// the store did not take.
+    parked: Option<Parked>,
+    events: std::collections::VecDeque<Prepared>,
+    /// The serialized size of `events`, in all.
+    bytes: usize,
+}
+
+/// See [`Buffer::parked`].
+#[derive(Debug)]
+struct Parked {
+    id: Uuid,
+    events: Vec<Prepared>,
+    /// Whether an attempt of it may have reached the control plane
+    /// unanswered.
+    maybe_stored: bool,
+}
+
+impl Buffer {
+    /// Queue `event` for its batch. `false` when it was too large to travel
+    /// and was dropped instead ([`Prepared::new`]).
+    fn push(&mut self, event: UsageEvent, metrics: &Metrics) -> bool {
+        let Some(prepared) = Prepared::new(event, metrics) else {
+            return false;
+        };
+        self.bytes += prepared.json.len();
+        self.events.push_back(prepared);
+        true
+    }
+
+    fn is_empty(&self) -> bool {
+        self.parked.is_none() && self.events.is_empty()
+    }
+
+    /// The next batch to deliver: the parked one under its own id, or
+    /// [`Self::take_batch`] under a new one. `None` when nothing is queued.
+    fn take_next(&mut self) -> Option<Parked> {
+        if let Some(parked) = self.parked.take() {
+            return Some(parked);
+        }
+        let events = self.take_batch();
+        (!events.is_empty()).then(|| Parked {
+            id: Uuid::new_v4(),
+            events,
+            maybe_stored: false,
+        })
+    }
+
+    /// Whether a whole batch is waiting: [`MAX_BATCH`] events, or enough of
+    /// them to fill [`MAX_BATCH_BYTES`].
+    fn holds_a_full_batch(&self) -> bool {
+        self.events.len() >= MAX_BATCH || body_len(self.bytes, self.events.len()) >= MAX_BATCH_BYTES
+    }
+
+    /// Take the next batch: the events at the front that fit both
+    /// ceilings, and at least one.
+    fn take_batch(&mut self) -> Vec<Prepared> {
+        let mut batch = Vec::new();
+        let mut bytes = 0;
+        while batch.len() < MAX_BATCH {
+            let Some(next) = self.events.front() else {
+                break;
+            };
+            let grown = bytes + next.json.len();
+            if !batch.is_empty() && body_len(grown, batch.len() + 1) > MAX_BATCH_BYTES {
+                break;
+            }
+            let Some(event) = self.events.pop_front() else {
+                break;
+            };
+            bytes = grown;
+            self.bytes -= event.json.len();
+            batch.push(event);
+        }
+        batch
+    }
+}
+
+/// The shutdown drain ran out of time: count everything still queued as
+/// dropped. A parked batch may have reached the control plane on an earlier
+/// attempt; the rest was never sent.
+fn give_up_unsent(
+    metrics: &Metrics,
+    buffer: &mut Buffer,
     rx: &mut tokio::sync::mpsc::Receiver<UsageEvent>,
 ) {
-    while buffer.len() < MAX_BATCH {
+    while let Ok(event) = rx.try_recv() {
+        buffer.push(event, metrics);
+    }
+    let Buffer { parked, events, .. } = std::mem::take(buffer);
+    if let Some(parked) = parked {
+        drop_batch(
+            metrics,
+            if parked.maybe_stored {
+                DROP_SEND_UNCONFIRMED
+            } else {
+                DROP_SEND_FAILED
+            },
+            &parked.events,
+            parked.id,
+            0,
+            Some(&SendFailure::NoResponse {
+                never_sent: !parked.maybe_stored,
+                error: anyhow!("the shutdown drain ran out of time before this batch was re-sent"),
+            }),
+        );
+    }
+    let unsent: Vec<Prepared> = events.into();
+    if !unsent.is_empty() {
+        drop_batch(
+            metrics,
+            DROP_SEND_FAILED,
+            &unsent,
+            Uuid::new_v4(),
+            0,
+            Some(&SendFailure::NoResponse {
+                never_sent: true,
+                error: anyhow!("the shutdown drain ran out of time before this batch was sent"),
+            }),
+        );
+    }
+}
+
+/// One POST of a batch. Once this worker has seen the stop, the attempt is
+/// cut off at the shutdown deadline ([`SenderState::shutdown_deadline`]),
+/// and that includes a stop that arrives while the attempt is on the wire:
+/// the exit then stays within [`FINAL_DRAIN_BUDGET`] of the stop rather
+/// than waiting out a request timeout first. An attempt cut off went out
+/// unanswered, so it may have been stored.
+async fn attempt(
+    client: &reqwest::Client,
+    cfg: &TelemetryConfig,
+    state: &mut SenderState,
+    cancel: &mut watch::Receiver<bool>,
+    batch_id: Uuid,
+    body: &Bytes,
+) -> Attempt {
+    let post = send(client, cfg, batch_id, body);
+    tokio::pin!(post);
+    if state.shutdown_by.is_none() && !*cancel.borrow() {
+        loop {
+            tokio::select! {
+                answered = &mut post => return answered,
+                // `Err` means the watch itself is gone, which only happens as
+                // the process tears down: treated as the stop.
+                changed = cancel.changed() => {
+                    if changed.is_err() || *cancel.borrow() {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    match tokio::time::timeout_at(state.shutdown_deadline(), post).await {
+        Ok(answered) => answered,
+        Err(_) => Attempt::Failed(SendFailure::NoResponse {
+            never_sent: false,
+            error: anyhow!("the shutdown drain ran out of time before this batch was answered"),
+        }),
+    }
+}
+
+fn fill_ready_batch(
+    buffer: &mut Buffer,
+    rx: &mut tokio::sync::mpsc::Receiver<UsageEvent>,
+    metrics: &Metrics,
+) {
+    while !buffer.holds_a_full_batch() {
         match rx.try_recv() {
-            Ok(event) => buffer.push(event),
+            Ok(event) => {
+                buffer.push(event, metrics);
+            }
             Err(_) => break,
         }
     }
 }
 
-/// POST one batch and clear the buffer, re-sending it while that is safe.
+/// POST the next batch off the buffer, re-sending it while that is safe.
 /// Errors are logged, not propagated — telemetry losses must not stall the
-/// worker.
+/// worker. The batch leaves the buffer whatever happens to it, so a hung
+/// control plane cannot grow the buffer (worst case the batch is dropped).
+#[allow(clippy::too_many_arguments)]
 async fn flush(
     client: &reqwest::Client,
     cfg: &TelemetryConfig,
     metrics: &Metrics,
     state: &mut SenderState,
-    buffer: &mut Vec<UsageEvent>,
+    buffer: &mut Buffer,
+    rx: &mut tokio::sync::mpsc::Receiver<UsageEvent>,
     retry: Retry,
     cancel: &mut watch::Receiver<bool>,
 ) {
-    if buffer.is_empty() {
+    let Some(batch) = buffer.take_next() else {
         return;
-    }
-    // Move events out into the request body; clear the buffer
-    // unconditionally so a hung CP doesn't grow the buffer
-    // indefinitely (worst case we drop the batch on error).
-    let events: Vec<UsageEvent> = std::mem::take(buffer);
-    buffer.reserve(MAX_BATCH);
+    };
+    deliver(
+        client,
+        cfg,
+        metrics,
+        state,
+        &batch,
+        retry,
+        cancel,
+        Some(Behind { buffer, rx }),
+    )
+    .await;
+}
 
-    deliver(client, cfg, metrics, state, &events, retry, cancel).await;
+/// What is queued behind the batch being delivered, which
+/// [`probe_with_the_next_batch`] asks with.
+struct Behind<'a> {
+    buffer: &'a mut Buffer,
+    rx: &'a mut tokio::sync::mpsc::Receiver<UsageEvent>,
+}
+
+/// Tell a store outage from a batch the store keeps failing on: post the
+/// next batch once. `true` when the control plane stored it. A probe that
+/// was not stored and may be re-sent goes next, under the id it went out
+/// with; one that may not be is given up on as [`deliver`] gives one up.
+/// `false` too when nothing is queued to ask with.
+async fn probe_with_the_next_batch(
+    client: &reqwest::Client,
+    cfg: &TelemetryConfig,
+    metrics: &Metrics,
+    state: &mut SenderState,
+    behind: &mut Behind<'_>,
+    cancel: &mut watch::Receiver<bool>,
+) -> bool {
+    fill_ready_batch(behind.buffer, behind.rx, metrics);
+    let Some(probe) = behind.buffer.take_next() else {
+        return false;
+    };
+    match attempt(
+        client,
+        cfg,
+        state,
+        cancel,
+        probe.id,
+        &batch_body(&probe.events),
+    )
+    .await
+    {
+        Attempt::Delivered { dedup, rejected } => {
+            metrics.usage_delivery().note_reached();
+            state.dedup_seen = dedup;
+            if rejected > 0 {
+                metrics.record_usage_events_rejected(rejected);
+                tracing::warn!(
+                    batch_id = %probe.id,
+                    count = probe.events.len(),
+                    rejected,
+                    "control plane rejected usage events in an accepted telemetry batch (events dropped)",
+                );
+            }
+            tracing::warn!(
+                batch_id = %probe.id,
+                count = probe.events.len(),
+                "telemetry batch stored while the one ahead of it kept meeting a reported store outage",
+            );
+            true
+        }
+        Attempt::Failed(failure) => {
+            let maybe_stored = probe.maybe_stored
+                || matches!(
+                    failure,
+                    SendFailure::NoResponse {
+                        never_sent: false,
+                        ..
+                    }
+                );
+            if state.may_resend(&failure) {
+                behind.buffer.parked = Some(Parked {
+                    maybe_stored,
+                    ..probe
+                });
+            } else {
+                drop_batch(
+                    metrics,
+                    if maybe_stored {
+                        DROP_SEND_UNCONFIRMED
+                    } else {
+                        DROP_SEND_FAILED
+                    },
+                    &probe.events,
+                    probe.id,
+                    1,
+                    Some(&failure),
+                );
+            }
+            false
+        }
+    }
 }
 
 /// Deliver one batch, re-sending the SAME batch — same id, same events, same
 /// order — until it lands, until re-sending stops being safe, or until
 /// [`RETRY_BUDGET`] runs out. Nothing else is sent meanwhile: the worker is
 /// single in-flight by design, and arriving events queue up behind it.
+/// `behind` is what [`probe_with_the_next_batch`] asks with when the batch
+/// keeps meeting a reported store outage; `None` asks nothing.
+#[allow(clippy::too_many_arguments)]
 async fn deliver(
     client: &reqwest::Client,
     cfg: &TelemetryConfig,
     metrics: &Metrics,
     state: &mut SenderState,
-    events: &[UsageEvent],
+    batch: &Parked,
     retry: Retry,
     cancel: &mut watch::Receiver<bool>,
+    mut behind: Option<Behind<'_>>,
 ) {
-    let batch_id = Uuid::new_v4();
+    let batch_id = batch.id;
+    let events = batch.events.as_slice();
     let count = events.len();
     let budget = remaining_budget(events);
     if budget.is_zero() {
@@ -533,13 +945,24 @@ async fn deliver(
     let mut attempts = 0usize;
     let mut answered_failures = 0usize;
     let mut resending = false;
+    // When the control plane's report of a store outage on this batch stops
+    // being believed: set at the first such report.
+    let mut reported_outage_ends: Option<Instant> = None;
+    // Whether an attempt may have reached the control plane unanswered, so a
+    // drop cannot say the events are not stored.
+    let mut maybe_stored = batch.maybe_stored;
+    // Set once the batch behind this one was stored while this one kept
+    // meeting a reported outage: the store works, so another such report on
+    // this batch is about the batch.
+    let mut the_store_answers = false;
     // Flipped when shutdown interrupts a backoff: the batch in hand gets one
     // final attempt, and then this worker stops holding the drain open.
     let mut last_attempt = retry == Retry::Disabled;
+    let body = batch_body(events);
 
     loop {
         attempts += 1;
-        let failure = match send(client, cfg, batch_id, events).await {
+        let failure = match attempt(client, cfg, state, cancel, batch_id, &body).await {
             Attempt::Delivered { dedup, rejected } => {
                 metrics.usage_delivery().note_reached();
                 state.dedup_seen = dedup;
@@ -574,6 +997,22 @@ async fn deliver(
         if failure.counts_toward_the_cap() {
             answered_failures += 1;
         }
+        if matches!(
+            failure,
+            SendFailure::NoResponse {
+                never_sent: false,
+                ..
+            }
+        ) {
+            maybe_stored = true;
+        }
+        let unconfirmed_or = |reason| {
+            if maybe_stored {
+                DROP_SEND_UNCONFIRMED
+            } else {
+                reason
+            }
+        };
         if let SendFailure::Response { status, .. } = &failure {
             // A content rejection is the control plane judging the batch:
             // delivery works, these events just will not be counted.
@@ -585,7 +1024,7 @@ async fn deliver(
         if !may_resend || last_attempt {
             drop_batch(
                 metrics,
-                DROP_SEND_FAILED,
+                unconfirmed_or(DROP_SEND_FAILED),
                 events,
                 batch_id,
                 attempts,
@@ -594,11 +1033,38 @@ async fn deliver(
             return;
         }
 
+        if failure.is_reported_outage() && the_store_answers {
+            drop_batch(
+                metrics,
+                unconfirmed_or(DROP_RETRY_BUDGET_EXHAUSTED),
+                events,
+                batch_id,
+                attempts,
+                Some(&failure),
+            );
+            return;
+        }
         let now = Instant::now();
+        let outage_over = failure.is_reported_outage()
+            && now
+                >= *reported_outage_ends
+                    .get_or_insert_with(|| now + spread(REPORTED_OUTAGE_BUDGET, rand::random()));
+        if outage_over {
+            // A new window either way: the next report on this batch starts
+            // it again.
+            reported_outage_ends = None;
+            if let Some(behind) = behind.as_mut() {
+                if probe_with_the_next_batch(client, cfg, metrics, state, behind, cancel).await {
+                    // Re-sent at once: the store took the batch behind it.
+                    the_store_answers = true;
+                    continue;
+                }
+            }
+        }
         if answered_failures >= MAX_ANSWERED_FAILURES || now >= deadline {
             drop_batch(
                 metrics,
-                DROP_RETRY_BUDGET_EXHAUSTED,
+                unconfirmed_or(DROP_RETRY_BUDGET_EXHAUSTED),
                 events,
                 batch_id,
                 attempts,
@@ -617,6 +1083,12 @@ async fn deliver(
             );
         }
 
+        // The stop came while that attempt was on the wire: no backoff, and
+        // the final attempt is held to the shutdown deadline.
+        if state.shutdown_by.is_some() {
+            last_attempt = true;
+            continue;
+        }
         // Never sleep past the budget: the last attempt happens at the
         // deadline, not one backoff after it.
         let wait = (state.jitter)(backoff).min(deadline - now);
@@ -635,6 +1107,10 @@ async fn deliver(
         if *cancel.borrow() {
             last_attempt = true;
         }
+        if last_attempt {
+            // From here every attempt counts against the drain.
+            state.shutdown_deadline();
+        }
         backoff = (backoff * 2).min(RETRY_MAX_BACKOFF);
     }
 }
@@ -644,8 +1120,13 @@ async fn deliver(
 /// `[0, 1)`, picks across ±[`RETRY_JITTER`] of it. The hold comes first, so a
 /// wait at the ceiling is still drawn from the whole band, 20 s to 30 s.
 fn jittered(step: Duration, unit: f64) -> Duration {
-    step.min(RETRY_MAX_BACKOFF * 5 / 6)
-        .mul_f64(1.0 + RETRY_JITTER * (2.0 * unit - 1.0))
+    spread(step.min(RETRY_MAX_BACKOFF * 5 / 6), unit)
+}
+
+/// `span` moved to the point `unit`, a draw from `[0, 1)`, picks across
+/// ±[`RETRY_JITTER`] of it.
+fn spread(span: Duration, unit: f64) -> Duration {
+    span.mul_f64(1.0 + RETRY_JITTER * (2.0 * unit - 1.0))
 }
 
 /// [`jittered`] with a fresh draw for every wait.
@@ -663,14 +1144,9 @@ fn random_jitter(step: Duration) -> Duration {
 /// An event whose `occurred_at` does not parse cannot be aged, so it does not
 /// shorten anything — what to do with a malformed timestamp is the control
 /// plane's call, by its own rules.
-fn remaining_budget(events: &[UsageEvent]) -> Duration {
+fn remaining_budget(events: &[Prepared]) -> Duration {
     let now = chrono::Utc::now();
-    let Some(oldest) = events
-        .iter()
-        .filter_map(|event| chrono::DateTime::parse_from_rfc3339(&event.occurred_at).ok())
-        .map(|at| at.with_timezone(&chrono::Utc))
-        .min()
-    else {
+    let Some(oldest) = events.iter().filter_map(|event| event.occurred_at).min() else {
         return RETRY_BUDGET;
     };
     // `to_std` fails on a negative span — an event stamped in the future,
@@ -692,7 +1168,7 @@ fn remaining_budget(events: &[UsageEvent]) -> Duration {
 fn drop_batch(
     metrics: &Metrics,
     reason: &'static str,
-    events: &[UsageEvent],
+    events: &[Prepared],
     batch_id: Uuid,
     attempts: usize,
     failure: Option<&SendFailure>,
@@ -736,11 +1212,6 @@ fn non_empty(value: &str) -> &str {
     }
 }
 
-#[derive(Debug, Serialize)]
-struct TelemetryBody<'a> {
-    events: &'a [UsageEvent],
-}
-
 /// The control plane's `2xx` answer to a batch. Decoded loosely — a newer
 /// control plane may add fields or drop this one.
 #[derive(Debug, Deserialize)]
@@ -778,13 +1249,18 @@ enum SendFailure {
     },
     /// No response at all — connect failure, timeout, TLS error. This
     /// exchange says nothing about what the control plane supports.
-    NoResponse { error: anyhow::Error },
+    /// `never_sent` says the connection itself could not be made, so
+    /// nothing of the request reached the control plane.
+    NoResponse {
+        never_sent: bool,
+        error: anyhow::Error,
+    },
 }
 
 impl std::fmt::Display for SendFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SendFailure::Response { error, .. } | SendFailure::NoResponse { error } => {
+            SendFailure::Response { error, .. } | SendFailure::NoResponse { error, .. } => {
                 write!(f, "{error:#}")
             }
         }
@@ -805,6 +1281,13 @@ impl SendFailure {
             SendFailure::NoResponse { .. } => false,
         }
     }
+
+    /// Whether this is the control plane reporting a store outage on the
+    /// batch: a `503` that carries [`USAGE_BATCH_DEDUP_HEADER`]. Bounded by
+    /// [`REPORTED_OUTAGE_BUDGET`] rather than by the cap.
+    fn is_reported_outage(&self) -> bool {
+        matches!(self, SendFailure::Response { .. }) && !self.counts_toward_the_cap()
+    }
 }
 
 /// A status a re-send can clear: the control plane was there but could not
@@ -821,21 +1304,26 @@ async fn send(
     client: &reqwest::Client,
     cfg: &TelemetryConfig,
     batch_id: Uuid,
-    events: &[UsageEvent],
+    body: &Bytes,
 ) -> Attempt {
     let resp = client
         .post(&cfg.url)
         // Same as /dp/heartbeat — no Authorization header; the control plane
         // derives identity from the peer cert SAN URI.
         .header(USAGE_BATCH_ID_HEADER, batch_id.to_string())
-        .json(&TelemetryBody { events })
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(body.clone())
         .send()
-        .await
-        .map_err(reqwest::Error::without_url)
-        .with_context(|| format!("POST {}", redact_url_for_log(&cfg.url)));
+        .await;
     let resp = match resp {
         Ok(resp) => resp,
-        Err(error) => return Attempt::Failed(SendFailure::NoResponse { error }),
+        Err(error) => {
+            return Attempt::Failed(SendFailure::NoResponse {
+                never_sent: error.is_connect(),
+                error: anyhow::Error::new(error.without_url())
+                    .context(format!("POST {}", redact_url_for_log(&cfg.url))),
+            })
+        }
     };
 
     // Read off THIS response, never remembered: see `SenderState::may_resend`.
@@ -992,6 +1480,20 @@ mod tests {
         }
     }
 
+    /// `events` as the worker sends them.
+    fn prepared(events: Vec<UsageEvent>) -> Vec<Prepared> {
+        let metrics = Metrics::new(false);
+        events
+            .into_iter()
+            .map(|event| Prepared::new(event, &metrics).expect("a test event fits"))
+            .collect()
+    }
+
+    /// The body the worker posts for `events`.
+    fn body_of(events: &[UsageEvent]) -> Bytes {
+        batch_body(&prepared(events.to_vec()))
+    }
+
     fn plain_client() -> reqwest::Client {
         reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
@@ -1016,7 +1518,7 @@ mod tests {
         let events = vec![sample_event("req-1"), sample_event("req-2")];
         let batch_id = Uuid::new_v4();
 
-        let attempt = send(&plain_client(), &cfg, batch_id, &events).await;
+        let attempt = send(&plain_client(), &cfg, batch_id, &body_of(&events)).await;
         // A control plane that does not set the header still delivers; it
         // is re-sending that its absence rules out.
         assert!(
@@ -1066,7 +1568,7 @@ mod tests {
         event.upstream_tpot_ms = Some(2.5);
         event.service_tier = Some("priority".into());
         event.modality_tokens.prompt_audio_tokens = Some(7);
-        send(&plain_client(), &cfg, Uuid::new_v4(), &[event]).await;
+        send(&plain_client(), &cfg, Uuid::new_v4(), &body_of(&[event])).await;
 
         let received = server.received_requests().await.unwrap();
         let body: serde_json::Value = serde_json::from_slice(&received[0].body).unwrap();
@@ -1106,7 +1608,7 @@ mod tests {
             &plain_client(),
             &cfg,
             Uuid::new_v4(),
-            &[sample_event("req-1")],
+            &body_of(&[sample_event("req-1")]),
         )
         .await;
         let Attempt::Failed(failure) = attempt else {
@@ -1129,7 +1631,8 @@ mod tests {
 
     /// The capability rule, stated at the one place that decides it: judge
     /// each response on its own, and fall back to the last response seen
-    /// only when an exchange produced none at all.
+    /// only when an exchange produced none at all — unless nothing was sent,
+    /// which is re-sent whatever was seen.
     #[test]
     fn resend_permission_is_judged_per_response_and_never_cached() {
         let response = |dedup: bool, retryable: bool| SendFailure::Response {
@@ -1139,15 +1642,23 @@ mod tests {
             error: anyhow!("boom"),
         };
         let no_response = || SendFailure::NoResponse {
+            never_sent: false,
+            error: anyhow!("operation timed out"),
+        };
+        let not_connected = || SendFailure::NoResponse {
+            never_sent: true,
             error: anyhow!("connection refused"),
         };
 
         let mut state = SenderState::default();
-        // Nothing seen yet: a connect failure cannot be re-sent.
+        // Nothing seen yet: a timeout cannot be re-sent, a connection that
+        // was never made can.
         assert!(!state.may_resend(&no_response()));
+        assert!(state.may_resend(&not_connected()));
+        assert!(!state.dedup_seen, "sending nothing proves nothing");
         // A retryable failure whose response proves de-duplication.
         assert!(state.may_resend(&response(true, true)));
-        // …and a connect failure after it inherits that evidence.
+        // …and a timeout after it inherits that evidence.
         assert!(state.may_resend(&no_response()));
         // A non-retryable status is never re-sent, header or not.
         assert!(!state.may_resend(&response(true, false)));
@@ -1155,8 +1666,10 @@ mod tests {
         // A header-less response — an older replica behind the same
         // Service, or a rolled-back control plane — clears the evidence…
         assert!(!state.may_resend(&response(false, true)));
-        // …so the connect failures after it are dropped again.
+        // …so the timeouts after it are dropped again, while a connection
+        // that was never made is still re-sent.
         assert!(!state.may_resend(&no_response()));
+        assert!(state.may_resend(&not_connected()));
     }
 
     /// Which failures use up [`MAX_ANSWERED_FAILURES`], pinned as a table
@@ -1195,7 +1708,8 @@ mod tests {
         );
         assert!(
             !SendFailure::NoResponse {
-                error: anyhow!("connection refused"),
+                never_sent: false,
+                error: anyhow!("operation timed out"),
             }
             .counts_toward_the_cap(),
             "a failure with no response is bounded by the budget alone",
@@ -1291,9 +1805,19 @@ mod tests {
     async fn local_server(
         respond: impl Fn(&axum::http::HeaderMap, &[u8]) -> Reply + Send + Sync + 'static,
     ) -> LocalServer {
+        local_server_on(
+            tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap(),
+            respond,
+        )
+    }
+
+    /// [`local_server`] on a listener the test made.
+    fn local_server_on(
+        listener: tokio::net::TcpListener,
+        respond: impl Fn(&axum::http::HeaderMap, &[u8]) -> Reply + Send + Sync + 'static,
+    ) -> LocalServer {
         use http_body_util::BodyExt;
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let respond = Arc::new(respond);
         tokio::spawn(async move {
@@ -1448,9 +1972,20 @@ mod tests {
     /// one dp-manager Service a rolling upgrade answers from both kinds of
     /// replica.
     async fn scripted_server(script: Vec<Answer>) -> (LocalServer, RecordedPosts) {
+        scripted_server_on(
+            tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap(),
+            script,
+        )
+    }
+
+    /// [`scripted_server`] on a listener the test made.
+    fn scripted_server_on(
+        listener: tokio::net::TcpListener,
+        script: Vec<Answer>,
+    ) -> (LocalServer, RecordedPosts) {
         let posts: RecordedPosts = Arc::new(std::sync::Mutex::new(Vec::new()));
         let recorded = Arc::clone(&posts);
-        let server = local_server(move |headers, body| {
+        let server = local_server_on(listener, move |headers, body| {
             // Read before locking: a failed expectation here must fail
             // the test, not poison the recording behind a confusing
             // second error.
@@ -1477,8 +2012,7 @@ mod tests {
                 reply.delay = Some(BEYOND_THE_REQUEST_TIMEOUT);
             }
             reply
-        })
-        .await;
+        });
         (server, posts)
     }
 
@@ -1683,7 +2217,12 @@ mod tests {
         drop(tx);
         finish_sender(sender.as_mut()).await;
         let sizes = assert_recorded_events(&batches, &expected);
-        assert_eq!(sizes, [vec![MAX_BATCH; 10], vec![26]].concat());
+        let total = BACKLOG_QUEUE + 2;
+        let full = total / MAX_BATCH;
+        assert_eq!(
+            sizes,
+            [vec![MAX_BATCH; full], vec![total - full * MAX_BATCH]].concat()
+        );
     }
 
     #[tokio::test]
@@ -1842,6 +2381,184 @@ mod tests {
         assert!(
             sizes.iter().all(|n| *n <= MAX_BATCH),
             "no POST may carry more than the batch ceiling: {sizes:?}"
+        );
+    }
+
+    /// [`recording_server`] that also keeps the size of every body it was
+    /// sent.
+    async fn sizing_server() -> (
+        LocalServer,
+        RecordedBatches,
+        Arc<std::sync::Mutex<Vec<usize>>>,
+    ) {
+        let batches: RecordedBatches = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sizes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (recorded, sized) = (Arc::clone(&batches), Arc::clone(&sizes));
+        let server = local_server(move |_, body| {
+            sized.lock().unwrap().push(body.len());
+            recorded
+                .lock()
+                .unwrap()
+                .push(serde_json::from_slice(body).unwrap());
+            Reply::status(200)
+        })
+        .await;
+        (server, batches, sizes)
+    }
+
+    /// `count` events whose `requested_model` makes each about `bytes` long.
+    fn sized_events(count: usize, bytes: usize) -> Vec<UsageEvent> {
+        ordered_events(count)
+            .into_iter()
+            .map(|mut event| {
+                event.requested_model = "m".repeat(bytes);
+                event
+            })
+            .collect()
+    }
+
+    /// The control plane refuses a body over 8 MiB with a `413`, which is
+    /// permanent, so a batch is cut by its size as well as by its count:
+    /// events that would only fit one body by count go out in several, each
+    /// well under the control plane's cap, in order and none lost.
+    #[tokio::test]
+    async fn a_batch_is_cut_by_its_size_as_well_as_by_its_count() {
+        const EVENT_BYTES: usize = 200 * 1024;
+        const EVENTS: usize = 30;
+        let (server, batches, sizes) = sizing_server().await;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(format!("{}/dp/telemetry", server.uri()), &dir);
+        let metrics = Metrics::new(false);
+        let (tx, rx) = tokio::sync::mpsc::channel(BACKLOG_QUEUE);
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        tokio::time::pause();
+        let mut sender = Box::pin(run(cfg, metrics.clone(), rx, &mut cancel_rx));
+        assert!(poll_sender(sender.as_mut()).await.is_pending());
+        let expected = sized_events(EVENTS, EVENT_BYTES);
+        for event in expected.clone() {
+            tx.try_send(event).unwrap();
+        }
+        tokio::time::advance(FLUSH_INTERVAL).await;
+        drive_until(
+            sender.as_mut(),
+            STEP_WHILE_SERVING,
+            || {
+                batches
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|b| b["events"].as_array().unwrap().len())
+                    .sum::<usize>()
+                    >= EVENTS
+            },
+            "the events were not all delivered",
+        )
+        .await;
+        drop(tx);
+        finish_sender(sender.as_mut()).await;
+
+        assert_recorded_events(&batches, &expected);
+        let sizes = sizes.lock().unwrap().clone();
+        assert!(
+            sizes.len() >= 2,
+            "one body for {EVENTS} large events: {sizes:?}"
+        );
+        assert!(
+            sizes.iter().all(|&n| n <= 4 << 20),
+            "a body over 4 MiB: {sizes:?}"
+        );
+        assert_eq!(drops_with_reason(&metrics, DROP_SEND_FAILED), 0);
+    }
+
+    /// The ceilings are set against the control plane's: at most 1000 events
+    /// a batch, which it skips past, and an 8 MiB body, which it answers
+    /// `413` past. Every other test here compares the sender with itself and
+    /// stays green if these move.
+    #[test]
+    fn the_batch_ceilings_sit_within_the_control_planes() {
+        assert_eq!(MAX_BATCH, 1000);
+        assert_eq!(MAX_BATCH_BYTES, 4 << 20);
+        assert_eq!(MAX_EVENT_BYTES, 256 << 10);
+        const {
+            assert!(MAX_EVENT_BYTES + body_len(0, 1) <= MAX_BATCH_BYTES);
+            assert!(MAX_BATCH_BYTES <= (8 << 20) / 2);
+        }
+    }
+
+    /// An event too large to travel with others is dropped alone, counted
+    /// `oversized` against its member, and the events beside it are
+    /// delivered.
+    #[tokio::test]
+    async fn an_event_too_large_to_travel_is_dropped_alone() {
+        let (server, batches, _sizes) = sizing_server().await;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(format!("{}/dp/telemetry", server.uri()), &dir);
+        let metrics = Metrics::new(false);
+        let (tx, rx) = tokio::sync::mpsc::channel(BACKLOG_QUEUE);
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        tokio::time::pause();
+        let mut sender = Box::pin(run(cfg, metrics.clone(), rx, &mut cancel_rx));
+        assert!(poll_sender(sender.as_mut()).await.is_pending());
+        let mut events = ordered_events(3);
+        events[1].requested_model = "m".repeat(300 * 1024);
+        for event in events.clone() {
+            tx.try_send(event).unwrap();
+        }
+        tokio::time::advance(FLUSH_INTERVAL).await;
+        drive_until(
+            sender.as_mut(),
+            STEP_WHILE_SERVING,
+            || !batches.lock().unwrap().is_empty(),
+            "nothing was delivered",
+        )
+        .await;
+        drop(tx);
+        finish_sender(sender.as_mut()).await;
+
+        assert_recorded_events(&batches, &[events[0].clone(), events[2].clone()]);
+        assert_eq!(drops_with_reason(&metrics, "oversized"), 1);
+        let rendered = metrics.render();
+        assert!(
+            rendered
+                .lines()
+                .any(|line| line.starts_with("aisix_usage_event_drops_total{")
+                    && line.contains("reason=\"oversized\"")
+                    && line.contains("user_id=\"user-1\"")),
+            "{rendered}"
+        );
+        assert_eq!(drops_with_reason(&metrics, DROP_SEND_FAILED), 0);
+    }
+
+    /// An event dropped as too large to travel leaves nothing waiting to be
+    /// delivered: with nothing else queued, delivery is not marked as
+    /// waiting, or a budget in strict mode would start refusing an idle
+    /// gateway once the grace period passed.
+    #[tokio::test]
+    async fn an_event_dropped_as_too_large_leaves_nothing_waiting() {
+        let (server, _batches, _sizes) = sizing_server().await;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(format!("{}/dp/telemetry", server.uri()), &dir);
+        let metrics = Metrics::new(false);
+        let (tx, rx) = tokio::sync::mpsc::channel(BACKLOG_QUEUE);
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        tokio::time::pause();
+        let mut sender = Box::pin(run(cfg, metrics.clone(), rx, &mut cancel_rx));
+        assert!(poll_sender(sender.as_mut()).await.is_pending());
+        let mut event = sample_event("too-large");
+        event.requested_model = "m".repeat(300 * 1024);
+        tx.try_send(event).unwrap();
+        drive_until(
+            sender.as_mut(),
+            STEP_WHILE_SERVING,
+            || drops_with_reason(&metrics, "oversized") == 1,
+            "the event was never dropped",
+        )
+        .await;
+        tokio::time::advance(FLUSH_INTERVAL).await;
+        assert!(poll_sender(sender.as_mut()).await.is_pending());
+        assert!(
+            !metrics.usage_delivery().is_waiting(),
+            "delivery waits for an event that was dropped"
         );
     }
 
@@ -2055,7 +2772,13 @@ mod tests {
             .await;
             let dir = tempfile::tempdir().unwrap();
             let cfg = test_config(format!("{}/dp/telemetry", server.uri()), &dir);
-            let attempt = send(&plain_client(), &cfg, Uuid::new_v4(), &[sample_event("r")]).await;
+            let attempt = send(
+                &plain_client(),
+                &cfg,
+                Uuid::new_v4(),
+                &body_of(&[sample_event("r")]),
+            )
+            .await;
             assert!(
                 matches!(attempt, Attempt::Delivered { rejected: 0, .. }),
                 "{attempt:?}"
@@ -2232,7 +2955,9 @@ mod tests {
     /// all. It proves nothing about the far side, so the worker falls back
     /// to the last response it DID see — here one that carried the header,
     /// so the batch is re-sent, and re-sent, until the budget that keeps it
-    /// inside the billing window runs out.
+    /// inside the billing window runs out. Its attempts reached the wire
+    /// unanswered, so any of them may have been stored: the batch is counted
+    /// as unconfirmed, not as lost.
     #[tokio::test]
     async fn no_response_after_a_dedup_bearing_response_resends_until_the_budget_ends() {
         // A retryable failure that proves de-duplication, and from then on
@@ -2275,7 +3000,7 @@ mod tests {
         drive_until(
             sender.as_mut(),
             STEP_WHILE_UNREACHABLE,
-            || drops_with_reason(&metrics, DROP_RETRY_BUDGET_EXHAUSTED) == 2,
+            || drops_with_reason(&metrics, DROP_SEND_UNCONFIRMED) == 2,
             "the batch was not re-sent until the budget ran out",
         )
         .await;
@@ -2307,12 +3032,19 @@ mod tests {
             "a batch re-sent to exhaustion is accounted apart from one \
              that was never re-sent",
         );
+        assert_eq!(
+            drops_with_reason(&metrics, DROP_RETRY_BUDGET_EXHAUSTED),
+            0,
+            "a batch that may have been stored is not counted as lost",
+        );
     }
 
     /// The other direction of the same rule: the last response carried no
     /// header — an older replica behind the same Service, or a rolled-back
     /// control plane — so the failures that follow it are dropped where they
-    /// fall. Caching "we saw the header once" is what this forbids.
+    /// fall. Caching "we saw the header once" is what this forbids. The
+    /// attempt went out and was never answered, so the drop is counted as
+    /// unconfirmed.
     #[tokio::test]
     async fn no_response_after_a_header_less_response_is_dropped_at_once() {
         // Fails with the header first, so the evidence IS set before the
@@ -2353,7 +3085,7 @@ mod tests {
         drive_until(
             sender.as_mut(),
             STEP_WHILE_UNREACHABLE,
-            || drops_with_reason(&metrics, DROP_SEND_FAILED) == 2,
+            || drops_with_reason(&metrics, DROP_SEND_UNCONFIRMED) == 2,
             "the batch was not dropped after a header-less response",
         )
         .await;
@@ -2364,6 +3096,7 @@ mod tests {
             "the batch that met no response was not re-sent",
         );
         assert_eq!(drops_with_reason(&metrics, DROP_RETRY_BUDGET_EXHAUSTED), 0);
+        assert_eq!(drops_with_reason(&metrics, DROP_SEND_FAILED), 0);
     }
 
     /// While a batch is being re-sent nothing else is sent — the worker is
@@ -2646,6 +3379,308 @@ mod tests {
         );
     }
 
+    /// A server that keeps reporting a store outage on the first batch it
+    /// sees and stores every other one while `down` is false; while `down`
+    /// is true it reports an outage on every batch. It records each post's
+    /// batch id, event count and status.
+    async fn server_with_an_outage(
+        down: Arc<std::sync::atomic::AtomicBool>,
+        first_batch_fails: bool,
+    ) -> (
+        LocalServer,
+        Arc<std::sync::Mutex<Vec<(String, usize, u16)>>>,
+    ) {
+        let posts = Arc::new(std::sync::Mutex::new(Vec::<(String, usize, u16)>::new()));
+        let recorded = Arc::clone(&posts);
+        let server = local_server(move |headers, body| {
+            let id = headers
+                .get(USAGE_BATCH_ID_HEADER)
+                .expect("every batch carries its id")
+                .to_str()
+                .unwrap()
+                .to_string();
+            let events = serde_json::from_slice::<serde_json::Value>(body).unwrap()["events"]
+                .as_array()
+                .unwrap()
+                .len();
+            let mut posts = recorded.lock().unwrap();
+            let the_first = posts.first().is_none_or(|(first, ..)| *first == id);
+            let fails =
+                down.load(std::sync::atomic::Ordering::SeqCst) || (first_batch_fails && the_first);
+            let status = if fails { 503 } else { 200 };
+            posts.push((id, events, status));
+            let mut reply = Reply::status(status);
+            reply
+                .headers
+                .push((USAGE_BATCH_DEDUP_HEADER, USAGE_BATCH_DEDUP_ENABLED));
+            reply
+        })
+        .await;
+        (server, posts)
+    }
+
+    fn drops_of_every_reason(metrics: &Metrics) -> u64 {
+        [
+            DROP_RETRY_BUDGET_EXHAUSTED,
+            DROP_SEND_FAILED,
+            DROP_SEND_UNCONFIRMED,
+        ]
+        .iter()
+        .map(|reason| drops_with_reason(metrics, reason))
+        .sum()
+    }
+
+    /// A batch the store keeps failing on alone, while it stores the one
+    /// behind it, holds the single in-flight sender for minutes, not for
+    /// the whole budget. Past [`REPORTED_OUTAGE_BUDGET`], spread per batch,
+    /// the batch behind it goes out once; it is stored, so the held batch
+    /// gets one more attempt and, failing again, is given up on.
+    #[tokio::test]
+    async fn a_batch_the_store_keeps_failing_alone_is_given_up_on_once_the_next_is_stored() {
+        let down = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (server, posts) = server_with_an_outage(down, true).await;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(format!("{}/dp/telemetry", server.uri()), &dir);
+        let metrics = Metrics::new(false);
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        tokio::time::pause();
+        let (mut sender, tx) = staged_sender(cfg, metrics.clone(), &mut cancel_rx, 2).await;
+
+        drive_until(
+            sender.as_mut(),
+            STEP_WHILE_SERVING,
+            || !posts.lock().unwrap().is_empty(),
+            "the batch never went out",
+        )
+        .await;
+        let first = Instant::now();
+        // What queues up behind it meanwhile.
+        for event in ordered_events(3) {
+            tx.try_send(event).unwrap();
+        }
+        drive_until(
+            sender.as_mut(),
+            STEP_WHILE_SERVING,
+            || drops_with_reason(&metrics, DROP_RETRY_BUDGET_EXHAUSTED) == 2,
+            "a batch the store kept failing on alone was never given up on",
+        )
+        .await;
+        let held = first.elapsed();
+        let low = REPORTED_OUTAGE_BUDGET.mul_f64(1.0 - RETRY_JITTER);
+        let high = REPORTED_OUTAGE_BUDGET.mul_f64(1.0 + RETRY_JITTER) + RETRY_MAX_BACKOFF;
+        assert!(
+            (low..=high).contains(&held),
+            "given up on {held:?} after its first answer"
+        );
+        assert_eq!(drops_of_every_reason(&metrics), 2);
+
+        let posts = posts.lock().unwrap();
+        let held_id = posts[0].0.clone();
+        let probe = posts
+            .iter()
+            .position(|(id, ..)| *id != held_id)
+            .expect("the batch behind it went out");
+        assert_eq!(posts[probe].1, 3, "{posts:?}");
+        assert_eq!(posts[probe].2, 200, "the batch behind it was stored");
+        assert_eq!(
+            posts[probe + 1].0,
+            held_id,
+            "the held batch was re-sent once more"
+        );
+        assert_eq!(posts.len(), probe + 2, "{posts:?}");
+    }
+
+    /// A store outage longer than [`REPORTED_OUTAGE_BUDGET`] loses nothing
+    /// the budget would keep. Each window ends with the next batch posted
+    /// once, under one id every time; the store takes it no more than the
+    /// held batch, so both are kept, and once the store answers again both
+    /// are stored, in order.
+    #[tokio::test]
+    async fn a_store_outage_longer_than_the_window_loses_nothing() {
+        let down = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let (server, posts) = server_with_an_outage(Arc::clone(&down), false).await;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(format!("{}/dp/telemetry", server.uri()), &dir);
+        let metrics = Metrics::new(false);
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        tokio::time::pause();
+        let (mut sender, tx) = staged_sender(cfg, metrics.clone(), &mut cancel_rx, 2).await;
+
+        drive_until(
+            sender.as_mut(),
+            STEP_WHILE_SERVING,
+            || !posts.lock().unwrap().is_empty(),
+            "the batch never went out",
+        )
+        .await;
+        for event in ordered_events(3) {
+            tx.try_send(event).unwrap();
+        }
+        // Two windows and more.
+        let outage_ends = Instant::now() + Duration::from_secs(12 * 60);
+        drive_until(
+            sender.as_mut(),
+            Duration::from_millis(20),
+            || Instant::now() >= outage_ends,
+            "the outage never ran its course",
+        )
+        .await;
+        assert_eq!(
+            drops_of_every_reason(&metrics),
+            0,
+            "dropped during the outage"
+        );
+        let probes: std::collections::BTreeSet<String> = {
+            let posts = posts.lock().unwrap();
+            let held_id = posts[0].0.clone();
+            posts
+                .iter()
+                .filter(|(id, ..)| *id != held_id)
+                .map(|(id, ..)| id.clone())
+                .collect()
+        };
+        assert_eq!(probes.len(), 1, "the probe keeps one id: {probes:?}");
+
+        down.store(false, std::sync::atomic::Ordering::SeqCst);
+        let stored = |posts: &[(String, usize, u16)]| -> usize {
+            posts
+                .iter()
+                .filter(|(.., status)| *status == 200)
+                .map(|(_, events, _)| *events)
+                .sum()
+        };
+        drive_until(
+            sender.as_mut(),
+            STEP_WHILE_SERVING,
+            || stored(&posts.lock().unwrap()) == 5,
+            "the batches held through the outage were never stored",
+        )
+        .await;
+        assert_eq!(drops_of_every_reason(&metrics), 0);
+        let posts = posts.lock().unwrap();
+        let stored_ids: Vec<&String> = posts
+            .iter()
+            .filter(|(.., status)| *status == 200)
+            .map(|(id, ..)| id)
+            .collect();
+        assert_eq!(
+            stored_ids,
+            [&posts[0].0, probes.iter().next().unwrap()],
+            "stored once each, the held batch first"
+        );
+    }
+
+    /// The window is drawn per batch, within a fifth of it either way, so
+    /// gateways that met one outage together do not all give up together.
+    #[test]
+    fn a_reported_outage_window_is_spread_around_five_minutes() {
+        assert_eq!(REPORTED_OUTAGE_BUDGET, Duration::from_secs(5 * 60));
+        assert_eq!(
+            spread(REPORTED_OUTAGE_BUDGET, 0.0),
+            Duration::from_secs(4 * 60)
+        );
+        assert_eq!(
+            spread(REPORTED_OUTAGE_BUDGET, 0.5),
+            Duration::from_secs(5 * 60)
+        );
+    }
+
+    /// A gateway that boots while the control plane is unreachable has seen
+    /// no response yet, so nothing says re-sending is safe — but a
+    /// connection that could not be made sent nothing, and re-sending it
+    /// cannot count anything twice. The batch waits for the control plane,
+    /// within the budget, and lands once it answers, even from one that does
+    /// not de-duplicate.
+    #[tokio::test]
+    async fn a_batch_that_could_not_connect_waits_for_the_control_plane() {
+        // Bound but not listening: every connection is refused until the
+        // control plane "comes up" on the same address.
+        let (socket, addr) = crate::dp_store::test_logs::refusing_addr();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(format!("http://{addr}/dp/telemetry"), &dir);
+        let metrics = Metrics::new(false);
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        tokio::time::pause();
+        let (mut sender, tx) = staged_sender(cfg, metrics.clone(), &mut cancel_rx, 2).await;
+
+        let down_until = Instant::now() + Duration::from_secs(10);
+        drive_until(
+            sender.as_mut(),
+            STEP_WHILE_SERVING,
+            || Instant::now() >= down_until,
+            "the sender stopped while the control plane was down",
+        )
+        .await;
+        for reason in [
+            DROP_SEND_FAILED,
+            DROP_SEND_UNCONFIRMED,
+            DROP_RETRY_BUDGET_EXHAUSTED,
+        ] {
+            assert_eq!(drops_with_reason(&metrics, reason), 0, "{reason}");
+        }
+
+        socket.listen(128).unwrap();
+        socket.set_nonblocking(true).unwrap();
+        let listener = tokio::net::TcpListener::from_std(socket.into()).unwrap();
+        let (_server, posts) = scripted_server_on(listener, vec![no_dedup(200)]);
+        drive_until(
+            sender.as_mut(),
+            STEP_WHILE_SERVING,
+            || !posts.lock().unwrap().is_empty(),
+            "the batch never reached the control plane once it was up",
+        )
+        .await;
+        drop(tx);
+        finish_sender(sender.as_mut()).await;
+
+        assert_identical_resends(&posts, 1);
+        assert_eq!(
+            posts.lock().unwrap()[0].1["events"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(drops_with_reason(&metrics, DROP_SEND_FAILED), 0);
+    }
+
+    /// An attempt that went out and was never answered may have been
+    /// stored, so giving its batch up is counted as unconfirmed: the stored
+    /// rows then lie between `expected - drops - unconfirmed` and
+    /// `expected - drops`.
+    #[tokio::test]
+    async fn a_batch_given_up_on_after_an_unanswered_attempt_is_unconfirmed() {
+        let (server, posts) = scripted_server(vec![stalls()]).await;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(format!("{}/dp/telemetry", server.uri()), &dir);
+        let metrics = Metrics::new(false);
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        tokio::time::pause();
+        let (mut sender, tx) = staged_sender(cfg, metrics.clone(), &mut cancel_rx, 2).await;
+
+        drive_until(
+            sender.as_mut(),
+            STEP_WHILE_SERVING,
+            || !posts.lock().unwrap().is_empty(),
+            "the batch never went out",
+        )
+        .await;
+        drive_until(
+            sender.as_mut(),
+            STEP_WHILE_UNREACHABLE,
+            || drops_with_reason(&metrics, DROP_SEND_UNCONFIRMED) == 2,
+            "the unanswered batch was not counted as unconfirmed",
+        )
+        .await;
+        drop(tx);
+        assert_eq!(drops_with_reason(&metrics, DROP_SEND_FAILED), 0);
+        assert_eq!(
+            posts.lock().unwrap().len(),
+            1,
+            "nothing proved a re-send safe"
+        );
+    }
+
     /// The exemption is read off the header, never off the status alone. A
     /// `503` without it — from a proxy in front of the control plane, or an
     /// older control plane — proves nothing about de-duplication, so it ends
@@ -2727,16 +3762,21 @@ mod tests {
             ..SenderState::default()
         };
         let client = plain_client();
-        let events = ordered_events(2);
+        let batch = Parked {
+            id: Uuid::new_v4(),
+            events: prepared(ordered_events(2)),
+            maybe_stored: false,
+        };
         tokio::time::pause();
         let mut delivering = Box::pin(deliver(
             &client,
             &cfg,
             &metrics,
             &mut state,
-            &events,
+            &batch,
             Retry::Allowed,
             &mut cancel_rx,
+            None,
         ));
 
         drive_until(
@@ -2764,7 +3804,9 @@ mod tests {
     /// The cap counts answered failures only. A control plane that has
     /// stopped answering is the outage this feature exists for, and it is
     /// bounded by the budget instead — so attempts that time out neither
-    /// consume the cap nor are stopped by it.
+    /// consume the cap nor are stopped by it. The batch given up on at the
+    /// cap had attempts that went unanswered, so it is counted as
+    /// unconfirmed.
     #[tokio::test]
     async fn failures_with_no_response_do_not_consume_the_cap() {
         // Alternating: every second attempt is answered with a failure that
@@ -2786,7 +3828,7 @@ mod tests {
         drive_until(
             sender.as_mut(),
             STEP_WHILE_SERVING,
-            || drops_with_reason(&metrics, DROP_RETRY_BUDGET_EXHAUSTED) == 2,
+            || drops_with_reason(&metrics, DROP_SEND_UNCONFIRMED) == 2,
             "the batch was never given up on",
         )
         .await;
@@ -2950,12 +3992,83 @@ mod tests {
             tokio::task::yield_now().await;
         }
 
+        // A batch that went out unanswered may have been stored — the first
+        // timed out on its own, the second was still in flight at the
+        // deadline — and one the drain never reached was not.
+        let unconfirmed = drops_with_reason(&metrics, DROP_SEND_UNCONFIRMED);
+        let unsent = drops_with_reason(&metrics, DROP_SEND_FAILED);
         assert_eq!(
-            drops_with_reason(&metrics, DROP_SEND_FAILED),
+            unconfirmed + unsent,
             QUEUED as u64,
             "everything the drain could not deliver is counted",
         );
+        assert!(
+            unconfirmed >= 2 * MAX_BATCH as u64,
+            "the batches that went out unanswered: {unconfirmed}"
+        );
+        assert!(
+            unsent >= MAX_BATCH as u64,
+            "the batches the drain never sent: {unsent}"
+        );
         assert!(tx.is_closed());
+    }
+
+    /// The stop can arrive while a batch is being re-sent, with that attempt
+    /// on the wire and a control plane that has stopped answering. The exit
+    /// still comes within [`FINAL_DRAIN_BUDGET`] of the stop, the bound the
+    /// shipped configs promise, and not after the attempt in flight, a final
+    /// attempt and a drain of its own, one after another. What it could not
+    /// deliver is counted.
+    #[tokio::test]
+    async fn a_stop_during_a_re_send_still_exits_within_the_drain_budget() {
+        const STEP: Duration = Duration::from_millis(250);
+
+        let (server, posts) = scripted_server(vec![dedups(503), stalls()]).await;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(format!("{}/dp/telemetry", server.uri()), &dir);
+        let metrics = Metrics::new(false);
+        let (cancel_tx, mut cancel_rx) = watch::channel(false);
+        tokio::time::pause();
+        let (mut sender, tx) = staged_sender(cfg, metrics.clone(), &mut cancel_rx, 2).await;
+
+        // The first attempt is refused as re-sendable; the re-send is on the
+        // wire, and nothing will answer it.
+        drive_until(
+            sender.as_mut(),
+            STEP_WHILE_SERVING,
+            || posts.lock().unwrap().len() >= 2,
+            "the failed batch was never re-sent",
+        )
+        .await;
+        for event in ordered_events(2) {
+            tx.try_send(event).unwrap();
+        }
+        cancel_tx.send(true).unwrap();
+
+        let stopped = Instant::now();
+        let wall_clock_deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while poll_sender(sender.as_mut()).await.is_pending() {
+            assert!(
+                stopped.elapsed() <= FINAL_DRAIN_BUDGET + Duration::from_secs(1),
+                "still running {:?} after the stop, after {} POSTs",
+                stopped.elapsed(),
+                posts.lock().unwrap().len(),
+            );
+            assert!(
+                std::time::Instant::now() < wall_clock_deadline,
+                "wall clock"
+            );
+            tokio::time::advance(STEP).await;
+            tokio::task::yield_now().await;
+        }
+
+        // The batch in hand went out unanswered, so it may be stored; the
+        // two queued behind it are counted either way.
+        let unconfirmed = drops_with_reason(&metrics, DROP_SEND_UNCONFIRMED);
+        let unsent = drops_with_reason(&metrics, DROP_SEND_FAILED);
+        assert_eq!(unconfirmed + unsent, 4, "everything undelivered is counted");
+        assert!(unconfirmed >= 2, "the batch in hand: {unconfirmed}");
+        drop(tx);
     }
 
     /// `managed.cp_base_url` may carry a password. It is used as configured
@@ -2979,7 +4092,13 @@ mod tests {
         );
         let debug = format!("{answered:?}");
         assert!(!debug.contains("hunter2"), "{debug}");
-        let attempt = send(&plain_client(), &answered, Uuid::new_v4(), &events).await;
+        let attempt = send(
+            &plain_client(),
+            &answered,
+            Uuid::new_v4(),
+            &body_of(&events),
+        )
+        .await;
         let Attempt::Failed(failure @ SendFailure::Response { .. }) = attempt else {
             panic!("expected the 400 back: {attempt:?}");
         };
@@ -2989,7 +4108,13 @@ mod tests {
 
         let (_refusing, addr) = crate::dp_store::test_logs::refusing_addr();
         let unanswered = test_config(format!("http://user:hunter2@{addr}/dp/telemetry"), &dir);
-        let attempt = send(&plain_client(), &unanswered, Uuid::new_v4(), &events).await;
+        let attempt = send(
+            &plain_client(),
+            &unanswered,
+            Uuid::new_v4(),
+            &body_of(&events),
+        )
+        .await;
         let Attempt::Failed(failure @ SendFailure::NoResponse { .. }) = attempt else {
             panic!("expected no response: {attempt:?}");
         };

@@ -33,18 +33,6 @@ struct KeyState {
     tpm: FixedWindowCounter,
     tph: FixedWindowCounter,
     tpd: FixedWindowCounter,
-    /// Micro-USD spent on this bucket since the process started counting.
-    ///
-    /// No window. It is the one counter here that never rolls, which is what
-    /// makes a granted allowance behave like an allowance instead of a
-    /// per-window ceiling that refills on its own.
-    consumed_micro_usd: u64,
-    /// 最近一次 acquire 时这个桶是否带着 `granted_micro_usd`。
-    ///
-    /// `consumed_micro_usd` 在每个桶上都会涨（`commit` / `add_tokens` 不知道
-    /// 自己记的是 token 还是 micro-USD），所以它本身说明不了「这是一份不能
-    /// 还回去的累计额度」；[`LocalStore::reap`] 要靠这个标记来分辨。
-    carries_allowance: bool,
     /// The members currently holding a concurrency slot, by name — not a
     /// bare count.
     ///
@@ -73,8 +61,6 @@ impl KeyState {
             tpm: FixedWindowCounter::new(MINUTE_SECS),
             tph: FixedWindowCounter::new(HOUR_SECS),
             tpd: FixedWindowCounter::new(DAY_SECS),
-            consumed_micro_usd: 0,
-            carries_allowance: false,
             in_flight: std::collections::HashSet::new(),
             last_touched: now,
         }
@@ -124,24 +110,6 @@ impl<C: Clock> LocalStore<C> {
             .clone()
     }
 
-    /// 记下这个桶是否带着累计额度，不计数、不占位。
-    ///
-    /// 给 Redis 后端用：它的 acquire 走 Redis，本地这份备份只在流式记账
-    /// （`add_tokens`）时被写到，而那条路不知道自己记的是 token 还是 micro-USD。
-    /// 这些桶的 `carries_allowance` 于是永远是 false，空闲一天后被 [`Self::reap`]
-    /// 收走，下一次断线时本地降级从 0 起算累计额度。由成功的那次 Redis acquire
-    /// 把它带的限额告诉本地，回收就认得出这是一份额度。
-    ///
-    /// 不带额度时只改已有的桶：Redis 正常时本地表里多半没有它，不必为每个桶建
-    /// 一份空状态。
-    pub(crate) fn note_allowance(&self, key: &str, limits: &RateLimit) {
-        if limits.granted_micro_usd.is_some() {
-            self.state_for(key).lock().carries_allowance = true;
-        } else if let Some(state) = self.states.get(key) {
-            state.lock().carries_allowance = false;
-        }
-    }
-
     /// Drop buckets untouched for longer than `idle_for`, so state for
     /// api keys, models and policies the control plane deleted does not
     /// accrue for the process lifetime. Bucket keys are config-derived, so
@@ -155,26 +123,7 @@ impl<C: Clock> LocalStore<C> {
         let cutoff = self.clock.unix_secs().saturating_sub(idle_for.as_secs());
         self.states.retain(|_, state| {
             let s = state.lock();
-            // `consumed_micro_usd` has NO window and never rolls, so dropping
-            // it is not reclaiming a stale bucket — it is handing the caller
-            // their whole `granted_micro_usd` back. The idle threshold is
-            // chosen so it "can never drop a bucket whose daily window is
-            // still open", which is the right rule for rpm/rph/rpd and simply
-            // does not apply to a lifetime total: a key that goes quiet for a
-            // day would come back with the allowance refilled, turning a
-            // cumulative cap into a per-active-day one.
-            //
-            // The Redis side already states this rule, in the Lua that writes
-            // the counter: cumulative spend takes no window and no EXPIRE,
-            // "setting an expiry degrades it into a cap". Reaping the bucket
-            // is that expiry by another name.
-            //
-            // 只留下真正带着累计额度、并且已经动用过的桶。`consumed_micro_usd`
-            // 在每个提交过的桶上都大于 0（token 桶也一样），单看它会让几乎
-            // 所有桶都免于回收；`carries_allowance` 才说明它是一份额度。
-            !s.in_flight.is_empty()
-                || s.last_touched >= cutoff
-                || (s.carries_allowance && s.consumed_micro_usd > 0)
+            !s.in_flight.is_empty() || s.last_touched >= cutoff
         });
     }
 }
@@ -197,16 +146,6 @@ impl<C: Clock> RateStore for LocalStore<C> {
                 return Err(RateLimitError::Concurrency {
                     detail: LimitDetail::concurrency(u64::from(max), s.in_flight.len() as u64),
                 });
-            }
-        }
-
-        // Cumulative allowance — checked ahead of the windows, because it is
-        // the one that does not come back on its own, so when both would
-        // reject it is the more useful thing to report.
-        s.carries_allowance = limits.granted_micro_usd.is_some();
-        if let Some(granted) = limits.granted_micro_usd {
-            if s.consumed_micro_usd >= granted {
-                return Err(RateLimitError::AllowanceExhausted);
             }
         }
 
@@ -330,9 +269,6 @@ impl<C: Clock> RateStore for LocalStore<C> {
         s.tpm.add(now, tokens);
         s.tph.add(now, tokens);
         s.tpd.add(now, tokens);
-        // Spend buckets pass micro-USD through this same argument, so the
-        // cumulative counter accumulates next to the windowed ones.
-        s.consumed_micro_usd = s.consumed_micro_usd.saturating_add(tokens);
         s.in_flight.remove(member);
         s.last_touched = now;
     }
@@ -387,15 +323,6 @@ impl<C: Clock> RateStore for LocalStore<C> {
         s.tpm.add(now, tokens);
         s.tph.add(now, tokens);
         s.tpd.add(now, tokens);
-        // 与 `commit` 完全一致：花费层通过同一个参数传 micro-USD，累计计数器
-        // 必须跟着涨。
-        //
-        // 这条路是**流式**的记账入口（`add_tokens_post_stream_all`），非流式走
-        // `commit`。少了这一行，累计额度闸对流式流量就等于不存在 —— 而流式是
-        // LLM 客户端的主流模式，所以那道闸看起来配好了、实际上从不触发。
-        // Redis 那侧的 `ADD_TOKENS_LUA` 一直有 `INCRBY prefix:consumed`，是本地
-        // store 落了单。
-        s.consumed_micro_usd = s.consumed_micro_usd.saturating_add(tokens);
         s.last_touched = now;
     }
 
@@ -466,7 +393,7 @@ mod tests {
     ///
     /// 进程内这份的寿命就是进程的寿命 —— 它保护的计数器也是，两者同寿是刻意
     /// 的（见 `RateStore::claim_once`）。共享存储那侧的跨实例语义由
-    /// `tests/redis_allowance.rs` 覆盖。
+    /// `tests/redis_integration.rs` 覆盖。
     #[tokio::test]
     async fn a_one_shot_claim_is_granted_once_until_it_expires() {
         let clock = TestClock::new(1_000);
@@ -584,10 +511,8 @@ mod tests {
         );
     }
 
-    /// 只有带累计额度的桶才因为「花过钱」而免于回收。`commit` / `add_tokens`
-    /// 对每个桶都累加 `consumed_micro_usd`（花费层借同一个参数传 micro-USD），
-    /// 所以一个普通的 token 桶只要提交过，这个计数就大于 0 —— 若以它为准，
-    /// 几乎没有桶会被回收，删掉的 key、轮换过的策略都会永远留在表里。
+    /// 提交过 token 的桶空闲后同样回收：窗口早已滚过，留着它什么也不保护，
+    /// 删掉的 key、轮换过的策略却会永远留在表里。
     #[tokio::test]
     async fn reap_drops_an_idle_token_bucket_that_has_committed() {
         let clock = TestClock::new(1_000);
@@ -603,42 +528,8 @@ mod tests {
 
         assert!(
             store.peek("tokens", &l).await.is_none(),
-            "a windowed bucket with no allowance must be reclaimed once idle, \
-             however many tokens it committed"
-        );
-    }
-
-    /// Redis 模式下本地这份备份只被 `add_tokens` 写到，从没在本地 acquire 过；带不带
-    /// 累计额度由 Redis 那次成功的 acquire 经 `note_allowance` 告诉它。带着额度、
-    /// 花过钱的不回收；额度后来撤掉了的照常回收。
-    #[tokio::test]
-    async fn reap_keeps_a_noted_allowance_bucket_filled_only_by_add_tokens() {
-        let clock = TestClock::new(1_000);
-        let store = LocalStore::with_clock(clock.clone());
-        let granted = RateLimit {
-            granted_micro_usd: Some(1_000),
-            ..Default::default()
-        };
-
-        store.note_allowance("kept", &granted);
-        store.add_tokens("kept", 1_500);
-        store.note_allowance("dropped", &granted);
-        store.add_tokens("dropped", 1_500);
-        store.note_allowance("dropped", &RateLimit::default());
-
-        clock.advance(DAY_SECS + 1);
-        store.reap(Duration::from_secs(DAY_SECS));
-
-        assert!(
-            matches!(
-                store.acquire("kept", &granted, "m").await,
-                Err(RateLimitError::AllowanceExhausted)
-            ),
-            "reaping handed back an allowance spent through add_tokens"
-        );
-        assert!(
-            store.peek("dropped", &granted).await.is_none(),
-            "a bucket whose allowance was withdrawn must be reclaimed once idle"
+            "a windowed bucket must be reclaimed once idle, however many \
+             tokens it committed"
         );
     }
 
@@ -654,175 +545,5 @@ mod tests {
         store.reap(Duration::from_secs(DAY_SECS));
 
         assert!(store.peek("recent", &l).await.is_some());
-    }
-}
-
-#[cfg(test)]
-mod allowance_tests {
-    use super::*;
-    use crate::clock::TestClock;
-
-    fn granted(n: u64) -> RateLimit {
-        RateLimit {
-            granted_micro_usd: Some(n),
-            ..RateLimit::default()
-        }
-    }
-
-    #[tokio::test]
-    async fn 累计额度用尽后拒绝() {
-        let s = LocalStore::with_clock(TestClock::new(0));
-        let lim = granted(1_000);
-        s.acquire("k", &lim, "").await.unwrap();
-        s.commit("k", 600, "").await;
-        // 还没到，放行。
-        s.acquire("k", &lim, "").await.unwrap();
-        s.commit("k", 600, "").await;
-        // 已消费 1200 ≥ 1000，拒绝。
-        assert!(matches!(
-            s.acquire("k", &lim, "").await,
-            Err(RateLimitError::AllowanceExhausted)
-        ));
-    }
-
-    /// 流式响应走的是 `add_tokens`，不是 `commit` —— 它也必须记进累计额。
-    ///
-    /// 流式的记账时机跟非流式不同：非流式在拿到完整应答时 `commit`，流式在流
-    /// 结束的同步回调里 `add_tokens`。两条路径记的都是同一份账，漏掉任何一条，
-    /// 那道闸对该模式的流量就等于不存在 —— 而流式是 LLM 客户端的主流模式。
-    /// Redis 那侧的脚本一直是两条都记的，本地 store 曾经只记窗口桶。
-    #[tokio::test]
-    async fn 流式的记账也要计入累计额() {
-        let s = LocalStore::with_clock(TestClock::new(0));
-        let lim = granted(1_000);
-        s.acquire("k", &lim, "").await.unwrap();
-        s.add_tokens("k", 600);
-        s.acquire("k", &lim, "").await.unwrap();
-        s.add_tokens("k", 600);
-        // 已消费 1200 ≥ 1000。只记窗口桶的话这里照样放行 —— 用户可以一直流下去。
-        assert!(
-            matches!(
-                s.acquire("k", &lim, "").await,
-                Err(RateLimitError::AllowanceExhausted)
-            ),
-            "流式记的账没有计入累计额，这道闸对流式流量形同不存在"
-        );
-    }
-
-    /// 两条记账路径必须等价：同样的数字，同样的结果。
-    #[tokio::test]
-    async fn 流式与非流式记账对累计额等价() {
-        let a = LocalStore::with_clock(TestClock::new(0));
-        let b = LocalStore::with_clock(TestClock::new(0));
-        let lim = granted(1_000);
-        a.acquire("k", &lim, "").await.unwrap();
-        a.commit("k", 1_000, "").await;
-        b.acquire("k", &lim, "").await.unwrap();
-        b.add_tokens("k", 1_000);
-        assert_eq!(
-            a.acquire("k", &lim, "").await.is_err(),
-            b.acquire("k", &lim, "").await.is_err(),
-            "同样的花费，流式与非流式给出了不同的判定"
-        );
-    }
-
-    #[tokio::test]
-    async fn 跨天不重置_这是它跟窗口上限的全部区别() {
-        let clock = TestClock::new(0);
-        let s = LocalStore::with_clock(clock.clone());
-        let lim = granted(1_000);
-        s.acquire("k", &lim, "").await.unwrap();
-        s.commit("k", 1_500, "").await;
-        assert!(s.acquire("k", &lim, "").await.is_err());
-
-        // 往后跳两天。窗口型上限到这里就「续杯」了 —— 累计额不能。
-        clock.set(2 * DAY_SECS + 10);
-        assert!(
-            matches!(
-                s.acquire("k", &lim, "").await,
-                Err(RateLimitError::AllowanceExhausted)
-            ),
-            "跨天之后额度自己回来了 —— 那就退化成了窗口上限",
-        );
-    }
-
-    #[tokio::test]
-    async fn 提高发放额即可继续_不需要重置任何东西() {
-        let s = LocalStore::with_clock(TestClock::new(0));
-        s.acquire("k", &granted(1_000), "").await.unwrap();
-        s.commit("k", 1_500, "").await;
-        assert!(s.acquire("k", &granted(1_000), "").await.is_err());
-        // 把总额提到 5000：已消费 1500 < 5000，放行。补额就是「换一个更大的数」。
-        s.acquire("k", &granted(5_000), "").await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn 没配发放额时不参与判断() {
-        let s = LocalStore::with_clock(TestClock::new(0));
-        let none = RateLimit::default();
-        s.acquire("k", &none, "").await.unwrap();
-        s.commit("k", 10_000_000, "").await;
-        // 消费再多，没配额度就不该被这条拦住。
-        s.acquire("k", &none, "").await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn 累计额与窗口上限同时生效_互不替代() {
-        let clock = TestClock::new(0);
-        let s = LocalStore::with_clock(clock.clone());
-        let both = RateLimit {
-            granted_micro_usd: Some(10_000),
-            tpd: Some(1_000),
-            ..RateLimit::default()
-        };
-        s.acquire("k", &both, "").await.unwrap();
-        s.commit("k", 1_200, "").await;
-        // 当天上限已破，拒绝。
-        assert!(s.acquire("k", &both, "").await.is_err());
-        // 跨天：窗口回来了，累计额还剩 8800，所以放行。
-        clock.set(DAY_SECS + 10);
-        s.acquire("k", &both, "").await.unwrap();
-    }
-
-    /// Reaping an idle bucket must not hand back a CUMULATIVE allowance.
-    ///
-    /// `reap` exists for the windowed counters, and its rationale says so:
-    /// one day plus a margin, "so it can never drop a bucket whose daily
-    /// window is still open" — a bucket idle longer than that has rolled and
-    /// carries nothing worth keeping. True of rpm/rph/rpd. NOT true of
-    /// `consumed_micro_usd`, which has no window and never rolls: dropping it
-    /// resets the spend to zero and gives the caller their whole
-    /// `granted_micro_usd` back.
-    ///
-    /// That turns a lifetime allowance into a per-active-day one, silently,
-    /// for any key that goes quiet for a day.
-    #[tokio::test]
-    async fn 回收闲置桶不能把累计额度还回去() {
-        let clock = TestClock::new(0);
-        let s = LocalStore::with_clock(clock.clone());
-        let lim = granted(1_000);
-
-        s.acquire("k", &lim, "").await.unwrap();
-        s.commit("k", 1_500, "").await;
-        assert!(
-            matches!(
-                s.acquire("k", &lim, "").await,
-                Err(RateLimitError::AllowanceExhausted)
-            ),
-            "spent past the allowance, so it must refuse"
-        );
-
-        // 闲置超过回收阈值，然后回收 —— 生产里每 5 分钟跑一次。
-        clock.set(DAY_SECS + 3600);
-        s.reap(std::time::Duration::from_secs(DAY_SECS + 300));
-
-        assert!(
-            matches!(
-                s.acquire("k", &lim, "").await,
-                Err(RateLimitError::AllowanceExhausted)
-            ),
-            "the allowance is cumulative — going quiet for a day must not \
-             refill it"
-        );
     }
 }

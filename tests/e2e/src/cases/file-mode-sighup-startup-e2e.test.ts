@@ -21,8 +21,8 @@ const BIN_PATH =
 // E2E: a file-mode gateway that receives SIGHUP while it is still starting
 // up keeps starting, and serves.
 //
-// File mode is the one a co-located portal reloads by writing the resources
-// file and broadcasting `pkill -HUP`. A write that lands while a gateway is
+// File mode is reloaded by writing the resources file and sending SIGHUP
+// (`pkill -HUP`). A write that lands while a gateway is
 // restarting sends that SIGHUP into the startup — and if the gateway only
 // installs its handler once the first load has finished, the signal's
 // default action terminates it, silently, with nothing in its log.

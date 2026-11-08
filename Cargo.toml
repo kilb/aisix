@@ -2,9 +2,7 @@
 resolver = "2"
 members = [
     "crates/aisix-a2a",
-    "crates/aisix-console",
     "crates/aisix-control-plane",
-    "crates/aisix-portal",
     "crates/aisix-core",
     "crates/aisix-etcd",
     "crates/aisix-gateway",
@@ -167,6 +165,7 @@ thiserror = "1"
 bytes = "1"
 rand = "0.8"
 regex = "1"
+memchr = "2"
 base64 = "0.22"
 url = "2"
 percent-encoding = "2"

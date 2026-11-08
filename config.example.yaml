@@ -176,12 +176,13 @@ proxy:
   # Applied at startup.
   # expose_debug_headers: false
   # Platform mode for multi-tenant deployments. Off by default. When
-  # enabled, id_key_env must name an environment variable holding a secret of
-  # at least 32 bytes; the gateway reads it once at startup and refuses to
-  # start when it is missing or too short.
+  # enabled, id_key_env must name an environment variable holding at least
+  # 32 random bytes as hex or base64 (`openssl rand -base64 48`); the gateway
+  # reads it once at startup and refuses to start when it is missing or does
+  # not decode to 32 bytes. expose_debug_headers must stay off with it.
   # platform:
   #   enabled: false
-  #   id_key_env: AISIX_PLATFORM_ID_KEY
+  #   id_key_env: PLATFORM_ID_KEY
 
 # Admin listener — read-only resource surface, OpenAPI reference, and
 # playground. Resources are managed declaratively (resources_file or

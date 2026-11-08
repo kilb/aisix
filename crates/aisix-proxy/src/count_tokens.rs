@@ -545,6 +545,13 @@ async fn dispatch(
     if !auth.key().can_access(snapshot, &model_name) {
         return Err(ProxyError::ModelForbidden(model_name.clone()));
     }
+    // A grouped key is answered as if no ensemble existed, ahead of
+    // everything that could tell the two apart (the IP check, guardrails).
+    crate::model_resolve::refuse_ensemble_to_grouped_key(
+        &model_name,
+        &model_entry.value,
+        &auth.key().allowed_provider_groups,
+    )?;
 
     // Client-IP allowlist gate (#557): reject before quota / upstream.
     crate::dispatch::check_ip_access(&model_entry.value, &client.source_ip)?;
@@ -684,9 +691,9 @@ async fn dispatch(
                         target_model: target_model.clone(),
                         target_model_id: target.id.clone(),
                         provider_key_id: pk_id.clone(),
-                        status: 429,
+                        status: e.status().as_u16(),
                         success: false,
-                        error_class: "rate_limit_exceeded".to_string(),
+                        error_class: crate::attempt::error_class(&e).to_string(),
                         error_message: e.to_string(),
                         latency_ms: 0,
                         dispatched: false,

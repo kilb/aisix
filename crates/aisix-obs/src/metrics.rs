@@ -45,9 +45,7 @@ pub const M_REQUESTS_TOTAL: &str = "aisix_requests_total";
 pub const M_REQUEST_DURATION: &str = "aisix_request_duration_seconds";
 pub const M_RATELIMIT_REJECTIONS: &str = "aisix_ratelimit_rejections_total";
 pub const M_TOKENS_CONSUMED: &str = "aisix_tokens_consumed_total";
-/// Micro-USD spent, per the gateway's own pricing. The portal bills each user
-/// from this counter's raw per-series value (`aisix-portal` sweeper): removing
-/// it, or dropping `user_id` / `api_key_id` from its labels, stops billing.
+/// Micro-USD spent, per the gateway's own pricing.
 pub const M_LLM_SPEND_MICRO_USD_TOTAL: &str = "aisix_llm_spend_micro_usd_total";
 pub const M_LLM_INPUT_TOKENS_TOTAL: &str = "aisix_llm_input_tokens_total";
 pub const M_LLM_OUTPUT_TOKENS_TOTAL: &str = "aisix_llm_output_tokens_total";
@@ -536,9 +534,9 @@ pub const M_A2A_TASK_STATE_TOTAL: &str = "aisix_a2a_task_state_total";
 /// Prometheus client name. A counter that restarts from zero cannot always be
 /// told apart from one that grew: if a restarted process spends more before the
 /// first scrape than the old one had accumulated, the value only went up.
-/// Consumers billing from counters (the portal) compare this per instance to
-/// see a restart regardless of the values. Reflected at scrape time with the
-/// config series.
+/// A consumer reading spend from counters compares this per instance to see a
+/// restart regardless of the values. Reflected at scrape time with the config
+/// series.
 pub const M_PROCESS_START_TIME_SECONDS: &str = "process_start_time_seconds";
 
 /// Captured when the process builds its metrics, i.e. at startup.
@@ -1362,8 +1360,9 @@ impl Metrics {
                 metrics::gauge!(M_PROCESS_MAX_FDS).set(p.max_fds as f64);
                 metrics::gauge!(M_PROCESS_CPU_SECONDS_TOTAL).set(p.cpu_seconds);
                 // Not `p.start_time_seconds`: `/proc/stat`'s `btime` moves when
-                // the wall clock is stepped, and the portal bills a whole counter
-                // when this value changes. One value for the process's lifetime.
+                // the wall clock is stepped, and a consumer reading counters takes
+                // a change of this value for a restart. One value for the
+                // process's lifetime.
                 metrics::gauge!(M_PROCESS_START_TIME_SECONDS).set(process_start_time_seconds());
             }
             if let Some(limit) = limit {

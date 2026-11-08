@@ -1254,6 +1254,105 @@ pub(crate) fn apply_winning_attempt(
     }
 }
 
+/// What an attempt that answered is billed: the counters, cost and served
+/// tier the request's success row records for it, in the upstream's own
+/// shape.
+///
+/// The upstream charges for an answer the moment it is sent, but a family
+/// writes its success row only after the work that follows: the output
+/// scan, the reservation commit, the cache write. A caller that hangs up in
+/// between drops the handler before that row exists, and the row the
+/// cancel guard writes in its place has to bill what the upstream charged
+/// rather than nothing. So each family notes this
+/// ([`crate::attribution::note_answered_usage`]) as soon as it has
+/// computed the values its success row takes, before its first await, and
+/// [`crate::cancel::emit`] stamps them onto that row with [`Self::apply`].
+/// Each field holds exactly what the family's success row would record:
+/// a family that records no cache counters leaves them at zero here too.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct AnsweredUsage {
+    pub prompt_tokens: u32,
+    /// The completion count before [`aisix_gateway::chat::recorded_completion_tokens`],
+    /// which [`Self::apply`] runs, as every success row does.
+    pub completion_tokens: u32,
+    pub reasoning_tokens: u32,
+    pub upstream_total_tokens: u32,
+    pub reasoning_folded_into_completion: u32,
+    pub cached_prompt_tokens: u32,
+    pub cache_write_tokens: Option<u32>,
+    pub cache_creation_tokens: u32,
+    pub cache_creation_ttl: aisix_gateway::CacheCreationTtl,
+    pub cache_read_tokens: u32,
+    pub modality: aisix_gateway::ModalityTokens,
+    pub web_search_requests: u32,
+    pub web_fetch_requests: u32,
+    pub audio_duration_seconds: f64,
+    pub usage_estimated: bool,
+    pub cost_usd: f64,
+    /// The tier the upstream reports it served, which the price is read at.
+    pub service_tier: Option<String>,
+    pub provider_request_id: String,
+    pub provider_model_version: String,
+}
+
+impl AnsweredUsage {
+    /// Every counter of `stats`, as the chat and messages success rows
+    /// record a [`aisix_gateway::UsageStats`]. The caller sets what the row
+    /// takes from elsewhere: an estimated count, the cost, the response's
+    /// identity.
+    pub(crate) fn from_stats(stats: &aisix_gateway::UsageStats) -> Self {
+        Self {
+            prompt_tokens: stats.prompt_tokens,
+            completion_tokens: stats.completion_tokens,
+            reasoning_tokens: stats.reasoning_tokens,
+            upstream_total_tokens: stats.upstream_total_tokens,
+            reasoning_folded_into_completion: stats.reasoning_folded_into_completion,
+            cached_prompt_tokens: stats.cached_prompt_tokens,
+            cache_write_tokens: stats.cache_write_tokens,
+            cache_creation_tokens: stats.cache_creation_tokens,
+            cache_creation_ttl: stats.cache_creation_ttl,
+            cache_read_tokens: stats.cache_read_tokens,
+            modality: stats.modality,
+            web_search_requests: stats.web_search_requests,
+            web_fetch_requests: stats.web_fetch_requests,
+            ..Self::default()
+        }
+    }
+
+    /// Stamp these onto `event`, with the arithmetic every success row
+    /// applies: the completion recorded without the reasoning the gateway
+    /// folded into it, and the upstream's own total.
+    pub(crate) fn apply(&self, event: &mut UsageEvent) {
+        event.prompt_tokens = self.prompt_tokens;
+        event.completion_tokens = aisix_gateway::chat::recorded_completion_tokens(
+            self.prompt_tokens,
+            self.completion_tokens,
+            self.reasoning_tokens,
+            self.reasoning_folded_into_completion,
+            self.upstream_total_tokens,
+        );
+        event.reasoning_unfolded_from_completion = self
+            .completion_tokens
+            .saturating_sub(event.completion_tokens);
+        event.reasoning_tokens = self.reasoning_tokens;
+        event.total_tokens = self.upstream_total_tokens;
+        event.cached_prompt_tokens = self.cached_prompt_tokens;
+        event.cache_write_tokens = self.cache_write_tokens;
+        event.cache_creation_tokens = self.cache_creation_tokens;
+        event.cache_creation_ttl = self.cache_creation_ttl;
+        event.cache_read_tokens = self.cache_read_tokens;
+        event.modality_tokens = self.modality;
+        event.web_search_requests = self.web_search_requests;
+        event.web_fetch_requests = self.web_fetch_requests;
+        event.audio_duration_seconds = self.audio_duration_seconds;
+        event.usage_estimated = self.usage_estimated;
+        event.cost_usd = self.cost_usd;
+        event.service_tier = self.service_tier.clone();
+        event.provider_request_id = self.provider_request_id.clone();
+        event.provider_model_version = self.provider_model_version.clone();
+    }
+}
+
 /// The [`emit_error_usage_event`] event without the emission, for a caller
 /// that attributes handler-specific fields (e.g. the passthrough route name)
 /// before handing it to [`emit_prepared_usage_event`].
@@ -1427,6 +1526,60 @@ fn stamp_billing_fields(snap: &AisixSnapshot, event: &mut UsageEvent, provider_k
     apply_upstream_identity(event, provider_key_id, model.as_deref().map(|e| &*e.value));
 }
 
+/// The most characters a usage row keeps of any one text a caller or an
+/// upstream chose.
+const MAX_OUTSIDE_TEXT_CHARS: usize = 512;
+
+/// The most characters a usage row keeps of its `error_message`: the cap
+/// every typed error is already rendered under, applied again here for a
+/// message built some other way.
+const MAX_ERROR_MESSAGE_CHARS: usize = 2048;
+
+/// Bound the text a caller or an upstream chose before the row leaves: control
+/// characters stripped and at most [`MAX_OUTSIDE_TEXT_CHARS`] characters kept.
+///
+/// A row is delivered in a batch with other tenants' rows, and the control
+/// plane refuses a batch whose body is too large, permanently. Nothing else
+/// bounds a caller's `model` (a request body may be any size), so without this
+/// one request could make its row large enough to sink every row it travels
+/// with. The text that is already bounded where it is written (`api_key_name`,
+/// the tiers, `error_class`) is left to that bound; text within the bound is
+/// unchanged.
+pub(crate) fn bound_outside_text(event: &mut UsageEvent) {
+    for text in [
+        &mut event.requested_model,
+        &mut event.client_user_agent,
+        &mut event.client_identity,
+        &mut event.jwt_subject,
+        &mut event.mcp_server_name,
+        &mut event.mcp_tool_name,
+        &mut event.a2a_method,
+        &mut event.a2a_task_id,
+        &mut event.a2a_context_id,
+        &mut event.provider_model_version,
+        &mut event.finish_reason,
+    ]
+    .into_iter()
+    // A wildcard row's upstream model is filled in from the caller's name.
+    .chain(event.upstream_model.as_mut())
+    {
+        if text.len() > MAX_OUTSIDE_TEXT_CHARS || text.chars().any(char::is_control) {
+            *text = text
+                .chars()
+                .filter(|c| !c.is_control())
+                .take(MAX_OUTSIDE_TEXT_CHARS)
+                .collect();
+        }
+    }
+    if event.error_message.len() > MAX_ERROR_MESSAGE_CHARS {
+        event.error_message = event
+            .error_message
+            .chars()
+            .take(MAX_ERROR_MESSAGE_CHARS)
+            .collect();
+    }
+}
+
 /// Name the upstream credential and model a row's call used: the
 /// ProviderKey `provider_key_id` names, and the `provider` and upstream
 /// model of `model` when that model calls an upstream itself. A routing,
@@ -1492,6 +1645,9 @@ pub(crate) fn emit_usage(
     event.is_final_attempt = terminal;
     stamp_requested_model_id(&mut event);
     stamp_billing_fields(snap, &mut event, labels.provider_key_id);
+    // After the name has looked up its entry, and before the access log and
+    // every consumer read the row.
+    bound_outside_text(&mut event);
     // Upstream-supplied text bound for line-oriented stores: the same
     // control-character strip and cap as the provider's response id.
     event.service_tier = event
@@ -2258,6 +2414,41 @@ mod tests {
         assert_eq!(row.upstream_model.as_deref(), Some("gpt-4o-2024-08-06"));
     }
 
+    /// A wildcard row fills `upstream_model` in from the name the caller
+    /// sent, so it is the caller's text as much as `requested_model` is and
+    /// gets the same bound. Unbounded, a megabyte-long name served by a
+    /// wildcard model would make its row too large to travel, and the
+    /// tokens it bought would never reach the control plane.
+    #[tokio::test]
+    #[allow(clippy::field_reassign_with_default)] // A literal here would read as an emitter to the scans below.
+    async fn a_wildcard_rows_upstream_model_is_bounded_like_the_name_it_came_from() {
+        let snap = snap_with_pk("pk-1", "");
+        let wildcard: aisix_core::Model = serde_json::from_value(serde_json::json!({
+            "display_name": "openai/*",
+            "provider": "openai",
+            "model_name": "*",
+            "provider_key_id": PK_ID,
+        }))
+        .unwrap();
+        snap.models
+            .insert(ResourceEntry::new("m-star", wildcard, 1));
+        let (state, mut rx) = state_reading_rows(snap);
+        let mut event = UsageEvent::default();
+        event.model_id = "m-star".to_string();
+        event.requested_model = format!("openai/\u{0}{}", "x".repeat(1 << 20));
+        let row = emitted_row(&state, &mut rx, event, PK_ID);
+        let upstream = row
+            .upstream_model
+            .expect("a wildcard row names its upstream model");
+        assert!(
+            upstream.chars().count() <= 512 && !upstream.chars().any(char::is_control),
+            "{} chars",
+            upstream.chars().count()
+        );
+        assert!(upstream.starts_with("xxx"), "{:?}", &upstream[..8]);
+        assert!(serde_json::to_vec(&row.requested_model).unwrap().len() < 1024);
+    }
+
     /// A row that reached no ProviderKey, or names an entry that is not an
     /// upstream of its own, carries none rather than a guess.
     ///
@@ -2305,6 +2496,65 @@ mod tests {
             );
         })
         .await;
+    }
+
+    /// Text a caller or an upstream chose is bound on the row: control
+    /// characters stripped and at most 512 characters kept, so one request
+    /// cannot make its row large enough for the control plane to refuse the
+    /// batch it travels in. The model name an unknown-model request carries
+    /// is the one a caller can make as long as its body.
+    #[tokio::test]
+    #[allow(clippy::field_reassign_with_default)] // A literal here would read as an emitter to the scans below.
+    async fn caller_and_upstream_text_is_bounded_before_it_leaves() {
+        let (state, mut rx) = state_reading_rows(AisixSnapshot::new());
+        let huge = format!("m\u{0}\n{}", "x".repeat(1 << 20));
+        let bounded = format!("m{}", "x".repeat(511));
+        let mut event = UsageEvent::default();
+        event.requested_model = huge.clone();
+        event.client_user_agent = huge.clone();
+        event.client_identity = huge.clone();
+        event.jwt_subject = huge.clone();
+        event.mcp_server_name = huge.clone();
+        event.mcp_tool_name = huge.clone();
+        event.a2a_method = huge.clone();
+        event.a2a_task_id = huge.clone();
+        event.a2a_context_id = huge.clone();
+        event.provider_model_version = huge.clone();
+        event.finish_reason = huge.clone();
+        event.error_class = "upstream_status".into();
+        event.error_message = "e".repeat(1 << 20);
+        let row = emitted_row(&state, &mut rx, event, "");
+        for (field, value) in [
+            ("requested_model", &row.requested_model),
+            ("client_user_agent", &row.client_user_agent),
+            ("client_identity", &row.client_identity),
+            ("jwt_subject", &row.jwt_subject),
+            ("mcp_server_name", &row.mcp_server_name),
+            ("mcp_tool_name", &row.mcp_tool_name),
+            ("a2a_method", &row.a2a_method),
+            ("a2a_task_id", &row.a2a_task_id),
+            ("a2a_context_id", &row.a2a_context_id),
+            ("provider_model_version", &row.provider_model_version),
+            ("finish_reason", &row.finish_reason),
+        ] {
+            assert!(
+                value == &bounded,
+                "{field}: {} chars, starting {:?}",
+                value.chars().count(),
+                value.chars().take(8).collect::<String>(),
+            );
+        }
+        assert_eq!(row.error_message.chars().count(), 2048);
+        let wire = serde_json::to_vec(&row).unwrap();
+        assert!(wire.len() < 16 * 1024, "a row of {} bytes", wire.len());
+
+        // Text within the bound is left exactly as it was.
+        let mut event = UsageEvent::default();
+        event.requested_model = "gpt-4o".into();
+        event.client_user_agent = "codex-cli/1.2".into();
+        let row = emitted_row(&state, &mut rx, event, "");
+        assert_eq!(row.requested_model, "gpt-4o");
+        assert_eq!(row.client_user_agent, "codex-cli/1.2");
     }
 
     /// Every row of a request carries the tier its body asked for, the

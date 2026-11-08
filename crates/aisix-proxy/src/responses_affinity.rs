@@ -84,19 +84,56 @@ pub(crate) fn seal_response_id(
     target_id: &str,
     upstream_id: &str,
 ) -> String {
-    seal_response_id_with(&cipher(key), owner, target_id, upstream_id)
+    let nonces = Nonces::new().expect("the system random source is readable");
+    seal_response_id_with(&cipher(key), nonces.next(), owner, target_id, upstream_id)
 }
 
 fn seal_response_id_with(
     cipher: &aead::LessSafeKey,
+    nonce: [u8; aead::NONCE_LEN],
     owner: &str,
     target_id: &str,
     upstream_id: &str,
 ) -> String {
     format!(
         "{RESP_ID_PREFIX}{}",
-        seal(cipher, RESP_ID_AAD, owner, target_id, upstream_id)
+        seal(cipher, RESP_ID_AAD, nonce, owner, target_id, upstream_id)
     )
+}
+
+/// The nonces one request seals under: a random 96-bit base drawn once,
+/// when the request starts, with a counter folded into its last eight
+/// bytes, so every seal of the request gets a nonce of its own. Drawing the
+/// randomness up front is what lets a random source that cannot be read
+/// refuse the request (a `500`) instead of failing in the middle of a
+/// response; the nonces stay as unpredictable across requests as one drawn
+/// per seal (the construction TLS 1.3 uses for its record nonces).
+#[derive(Debug)]
+struct Nonces {
+    base: [u8; aead::NONCE_LEN],
+    counter: std::sync::atomic::AtomicU64,
+}
+
+impl Nonces {
+    fn new() -> Result<Self, ring::error::Unspecified> {
+        let mut base = [0u8; aead::NONCE_LEN];
+        ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut base)?;
+        Ok(Self {
+            base,
+            counter: std::sync::atomic::AtomicU64::new(0),
+        })
+    }
+
+    fn next(&self) -> [u8; aead::NONCE_LEN] {
+        let n = self
+            .counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut nonce = self.base;
+        for (byte, count) in nonce[aead::NONCE_LEN - 8..].iter_mut().zip(n.to_be_bytes()) {
+            *byte ^= count;
+        }
+        nonce
+    }
 }
 
 /// `(target id, upstream id)` of a [`seal_response_id`] value; `None` for an
@@ -163,6 +200,7 @@ fn unescaped(field: &str) -> Option<String> {
 fn seal(
     cipher: &aead::LessSafeKey,
     aad: &[u8],
+    nonce: [u8; aead::NONCE_LEN],
     owner: &str,
     target_id: &str,
     value: &str,
@@ -172,11 +210,6 @@ fn seal(
         HEAD_BUCKET,
     );
     sealed.extend_from_slice(&crate::opaque_id::pad(value));
-    let mut nonce = [0u8; aead::NONCE_LEN];
-    // The operating system's random source; there is no id to hand out
-    // without it.
-    ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut nonce)
-        .expect("the system random source is readable");
     cipher
         .seal_in_place_append_tag(
             aead::Nonce::assume_unique_for_key(nonce),
@@ -234,6 +267,9 @@ pub(crate) struct TenantSeal {
     /// The cipher the platform settings set up once.
     cipher: Arc<aead::LessSafeKey>,
     owner: String,
+    /// The nonces this request seals under, shared by every response mark
+    /// made from it.
+    nonces: Arc<Nonces>,
 }
 
 impl std::fmt::Debug for TenantSeal {
@@ -245,17 +281,36 @@ impl std::fmt::Debug for TenantSeal {
 }
 
 impl TenantSeal {
-    pub(crate) fn new(platform: &crate::platform::PlatformSettings, owner: &str) -> Self {
-        Self {
+    /// The seal of one request. Draws the request's nonce base, so it fails
+    /// only when the system random source cannot be read; the request is
+    /// then refused as an internal error.
+    pub(crate) fn new(
+        platform: &crate::platform::PlatformSettings,
+        owner: &str,
+    ) -> Result<Self, crate::error::ProxyError> {
+        let nonces = Nonces::new().map_err(|_| {
+            crate::error::ProxyError::Bridge(aisix_gateway::BridgeError::Config(
+                "the system random source could not be read".into(),
+            ))
+        })?;
+        Ok(Self {
             cipher: platform.response_cipher().clone(),
             owner: owner.to_string(),
-        }
+            nonces: Arc::new(nonces),
+        })
     }
 
     fn mark_encrypted_content(&self, target_id: &str, original: &str) -> String {
         format!(
             "{ENC_PREFIX_V2}{};{original}",
-            seal(&self.cipher, ENC_AAD, &self.owner, target_id, "")
+            seal(
+                &self.cipher,
+                ENC_AAD,
+                self.nonces.next(),
+                &self.owner,
+                target_id,
+                ""
+            )
         )
     }
 
@@ -297,6 +352,7 @@ impl SealedResponseId {
         let fresh = || {
             seal_response_id_with(
                 &self.tenant.cipher,
+                self.tenant.nonces.next(),
                 &self.tenant.owner,
                 &self.target_id,
                 upstream_id,
@@ -410,6 +466,10 @@ pub(crate) struct ContextAffinity {
     /// whose id is not this tenant's seal
     /// ([`crate::opaque_id::unseal_responses_input`]).
     unopened_item_reference: Option<usize>,
+    /// The positions, in `input[]` as the caller sent it and ascending, of
+    /// the items [`Self::unwrap_input`] dropped, so a refusal can name an
+    /// item by the position the caller knows it at.
+    dropped_inputs: Vec<usize>,
 }
 
 impl ContextAffinity {
@@ -472,7 +532,7 @@ impl ContextAffinity {
             return;
         }
         let items = std::mem::take(input);
-        for mut item in items {
+        for (position, mut item) in items.into_iter().enumerate() {
             let decoded = item
                 .get("encrypted_content")
                 .and_then(Value::as_str)
@@ -484,12 +544,60 @@ impl ContextAffinity {
                 }
                 Some(EncryptedContent::Undecodable) => match strip_ciphertext(item) {
                     Some(kept) => item = kept,
-                    None => continue,
+                    None => {
+                        self.dropped_inputs.push(position);
+                        continue;
+                    }
                 },
                 Some(EncryptedContent::Plain) | None => {}
             }
             input.push(item);
         }
+    }
+
+    /// `err` with the `input[i]` its path starts with given as the item's
+    /// position in the request as the caller sent it: [`Self::unwrap_input`]
+    /// may have dropped items ahead of it. Every other error as it is.
+    pub(crate) fn at_caller_position(
+        &self,
+        err: crate::error::ProxyError,
+    ) -> crate::error::ProxyError {
+        use crate::error::ProxyError;
+        match err {
+            ProxyError::StoredObjectReference(path) => {
+                ProxyError::StoredObjectReference(self.caller_path(path))
+            }
+            ProxyError::ModelSelectorRefused(path) => {
+                ProxyError::ModelSelectorRefused(self.caller_path(path))
+            }
+            other => other,
+        }
+    }
+
+    fn caller_path(&self, path: String) -> String {
+        if self.dropped_inputs.is_empty() {
+            return path;
+        }
+        let parsed = path.strip_prefix("input[").and_then(|rest| {
+            let (digits, tail) = rest.split_once(']')?;
+            Some((digits.parse::<usize>().ok()?, tail))
+        });
+        match parsed {
+            Some((index, tail)) => format!("input[{}]{tail}", self.caller_index(index)),
+            None => path,
+        }
+    }
+
+    /// The position in the request as the caller sent it of what is now
+    /// `input[index]`.
+    fn caller_index(&self, index: usize) -> usize {
+        let mut position = index;
+        for &dropped in &self.dropped_inputs {
+            if dropped <= position {
+                position += 1;
+            }
+        }
+        position
     }
 
     /// Platform mode: record what [`crate::opaque_id::unseal_responses_input`]
@@ -507,7 +615,8 @@ impl ContextAffinity {
     pub(crate) fn refuse_unopened_item_reference(&self) -> Result<(), crate::error::ProxyError> {
         match self.unopened_item_reference {
             Some(index) => Err(crate::error::ProxyError::StoredObjectReference(format!(
-                "input[{index}].id"
+                "input[{}].id",
+                self.caller_index(index)
             ))),
             None => Ok(()),
         }
@@ -573,14 +682,24 @@ impl ContextAffinity {
         target_id: &str,
         target_provider_key_id: Option<&str>,
     ) -> Option<Value> {
-        let unreadable: Vec<usize> = self
-            .encrypted
-            .iter()
-            .filter(|(_, origin)| {
-                !Boundary::of(snapshot, origin).contains(target_id, target_provider_key_id)
-            })
-            .map(|(idx, _)| *idx)
-            .collect();
+        // One boundary per origin, however many items it tagged, and one
+        // flag per item: a long conversation of tagged items costs one pass.
+        let mut readable_by_origin: std::collections::HashMap<&str, bool> =
+            std::collections::HashMap::new();
+        let mut unreadable: Vec<bool> = Vec::new();
+        for (idx, origin) in &self.encrypted {
+            let readable = *readable_by_origin
+                .entry(origin.as_str())
+                .or_insert_with(|| {
+                    Boundary::of(snapshot, origin).contains(target_id, target_provider_key_id)
+                });
+            if !readable {
+                if unreadable.len() <= *idx {
+                    unreadable.resize(*idx + 1, false);
+                }
+                unreadable[*idx] = true;
+            }
+        }
         if unreadable.is_empty() {
             return None;
         }
@@ -588,7 +707,7 @@ impl ContextAffinity {
         if let Some(input) = body.get_mut("input").and_then(Value::as_array_mut) {
             let items = std::mem::take(input);
             for (idx, item) in items.into_iter().enumerate() {
-                if !unreadable.contains(&idx) {
+                if !unreadable.get(idx).copied().unwrap_or(false) {
                     input.push(item);
                 } else if let Some(kept) = strip_ciphertext(item) {
                     input.push(kept);
@@ -643,7 +762,8 @@ pub(crate) struct ResponseMark {
     target_id: Option<String>,
     previous_echo: Option<(String, String)>,
     /// Platform mode: output item ids leave sealed
-    /// ([`crate::opaque_id::seal_id`]), and channel metrics do not leave.
+    /// ([`crate::opaque_id::seal_id`]), and only the members the Responses
+    /// API documents leave ([`crate::opaque_id::RESPONSE_BODY`]).
     seal: Option<std::sync::Arc<crate::opaque_id::Sealer>>,
     /// Platform mode: the response id leaves sealed to the tenant, and so
     /// does a group target's ciphertext tag.
@@ -765,9 +885,7 @@ impl ResponseMark {
         }
         if let Some(sealer) = &self.seal {
             crate::opaque_id::seal_responses_body(sealer, body);
-            if let Some(map) = body.as_object_mut() {
-                map.remove(crate::opaque_id::CHANNEL_METRICS_KEY);
-            }
+            crate::opaque_id::retain_value(body, crate::opaque_id::RESPONSE_BODY);
         }
     }
 
@@ -780,14 +898,6 @@ impl ResponseMark {
     /// With `model`, the same pass restamps the snapshot's `response.model`
     /// to it ([`crate::model_echo::responses_snapshot_model`]).
     fn apply_to_event_json(&self, payload: &[u8], model: Option<&str>) -> Option<Vec<u8>> {
-        let tagged = self.tag_event_json(payload, model);
-        if self.seal.is_none() {
-            return tagged;
-        }
-        crate::opaque_id::strip_channel_metrics(tagged.as_deref().unwrap_or(payload)).or(tagged)
-    }
-
-    fn tag_event_json(&self, payload: &[u8], model: Option<&str>) -> Option<Vec<u8>> {
         let slot = std::cell::Cell::new(Slot::ResponseId);
         let select = |path: &[PathSeg]| {
             let picked = match path {
@@ -916,6 +1026,125 @@ mod tests {
         assert_eq!(a.encrypted, vec![(1, "m-2".to_string())]);
     }
 
+    /// A refusal names the position of the item in the request as the
+    /// caller sent it, also when an item ahead of it was dropped because its
+    /// ciphertext tag did not decode.
+    #[test]
+    fn a_refused_input_path_names_the_position_the_caller_sent() {
+        let mut body = json!({
+            "input": [
+                {"type": "reasoning", "id": "rs_1", "summary": [],
+                 "encrypted_content": "aisix_enc_v1:%%;junk"},
+                {"type": "message", "role": "user", "content": "hi"},
+                {"type": "item_reference", "id": "msg_foreign"},
+                {"type": "message", "role": "user", "content": [
+                    {"type": "input_file", "file_id": "file-1"}]},
+            ]
+        });
+        let mut a = ContextAffinity::unwrap_request(&mut body);
+        assert_eq!(
+            body["input"].as_array().unwrap().len(),
+            3,
+            "the first item is dropped"
+        );
+        a.note_unopened_item_reference(Some(1));
+        match a.refuse_unopened_item_reference() {
+            Err(crate::error::ProxyError::StoredObjectReference(path)) => {
+                assert_eq!(path, "input[2].id")
+            }
+            other => panic!("{other:?}"),
+        }
+        let refused = crate::stored_refs::refuse_in_responses(
+            Some(&crate::platform::PlatformSettings::from_secret("s")),
+            &body,
+        )
+        .unwrap_err();
+        match a.at_caller_position(refused) {
+            crate::error::ProxyError::StoredObjectReference(path) => {
+                assert_eq!(path, "input[3].content[0].file_id")
+            }
+            other => panic!("{other:?}"),
+        }
+        // Nothing dropped: the path is as found.
+        let mut body = json!({"input": [{"type": "item_reference", "id": "msg_foreign"}]});
+        let mut a = ContextAffinity::unwrap_request(&mut body);
+        a.note_unopened_item_reference(Some(0));
+        assert!(matches!(
+            a.refuse_unopened_item_reference(),
+            Err(crate::error::ProxyError::StoredObjectReference(path)) if path == "input[0].id"
+        ));
+    }
+
+    /// Every seal of one request gets a nonce of its own, and two requests'
+    /// nonces differ from the first one on: the base is drawn per request.
+    #[test]
+    fn every_seal_of_a_request_gets_its_own_nonce() {
+        let nonces = Nonces::new().unwrap();
+        let drawn: std::collections::HashSet<[u8; aead::NONCE_LEN]> =
+            (0..10_000).map(|_| nonces.next()).collect();
+        assert_eq!(drawn.len(), 10_000);
+        let other = Nonces::new().unwrap();
+        assert!(!drawn.contains(&other.next()));
+        // And what one request seals opens.
+        let platform = crate::platform::PlatformSettings::from_secret("s");
+        let tenant = TenantSeal::new(&platform, "team-a").unwrap();
+        let first = seal_response_id_with(
+            &tenant.cipher,
+            tenant.nonces.next(),
+            "team-a",
+            "m-1",
+            "resp_1",
+        );
+        let second = seal_response_id_with(
+            &tenant.cipher,
+            tenant.nonces.next(),
+            "team-a",
+            "m-1",
+            "resp_1",
+        );
+        assert_ne!(first, second);
+        for sealed in [first, second] {
+            assert_eq!(
+                open_response_id_with(&tenant.cipher, "team-a", &sealed),
+                Some(("m-1".to_string(), "resp_1".to_string()))
+            );
+        }
+    }
+
+    /// A conversation of many tagged items is read in one pass per target:
+    /// 60 000 items from one origin outside the target's boundary, which a
+    /// lookup per item per item took seconds over.
+    #[test]
+    fn a_long_tagged_conversation_is_read_once_per_target() {
+        let snap = aisix_core::AisixSnapshot::new();
+        let n = 60_000;
+        let input: Vec<Value> = (0..n)
+            .map(|i| {
+                json!({"type": "reasoning", "id": format!("rs_{i}"), "encrypted_content": "CT",
+                       "summary": [{"type": "summary_text", "text": "s"}]})
+            })
+            .collect();
+        let body = json!({"input": input});
+        let a = ContextAffinity {
+            encrypted: (0..n).map(|i| (i, "m-origin".to_string())).collect(),
+            ..Default::default()
+        };
+        let started = std::time::Instant::now();
+        let out = a.body_for_target(&snap, &body, "m-other", None).unwrap();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        let input = out["input"].as_array().unwrap();
+        assert_eq!(input.len(), n);
+        assert!(input
+            .iter()
+            .all(|item| item.get("encrypted_content").is_none()));
+        // A target inside the boundary reads every item as it was.
+        assert!(a.body_for_target(&snap, &body, "m-origin", None).is_none());
+    }
+
     #[test]
     fn strip_keeps_readable_reasoning_without_its_ciphertext() {
         let kept = strip_ciphertext(json!({
@@ -988,10 +1217,10 @@ mod tests {
             "usage": {"input_tokens": 9, "input_tokens_details": {"cached_tokens": 1, "cache_creation_tokens": 3}},
         });
         mark.apply_to_body(&mut body);
-        // A relayed answer keeps every usage field its upstream wrote.
+        // A relayed answer keeps the usage counters the API documents.
         assert_eq!(
             body["usage"],
-            json!({"input_tokens": 9, "input_tokens_details": {"cached_tokens": 1, "cache_creation_tokens": 3}})
+            json!({"input_tokens": 9, "input_tokens_details": {"cached_tokens": 1}})
         );
         assert_eq!(body["id"], mark_response_id("m-1", "resp_up"));
         assert_eq!(
@@ -1022,9 +1251,77 @@ mod tests {
         let out = String::from_utf8(mark.apply_to_sse_frame(done).unwrap()).unwrap();
         assert!(!out.contains("bdrk"), "{out}");
         assert!(out.contains(&mark_response_id("m-1", "resp_up")), "{out}");
-        assert!(out.ends_with("]}}\n\n"), "{out}");
+        // A cloud platform's invocation metrics go out as the upstream wrote
+        // them, in platform mode as without it.
+        assert!(
+            out.ends_with("]},\"amazon-bedrock-invocationMetrics\":{\"n\":1}}\n\n"),
+            "{out}"
+        );
         let buffered = mark.apply_to_sse_buffer([&frame[..], &done[..]].concat());
         assert!(!String::from_utf8(buffered).unwrap().contains("bdrk"));
+    }
+
+    /// In platform mode a buffered Response object keeps the members and the
+    /// usage counters the Responses API documents: what one channel writes
+    /// and another does not names the channel. A relayed stream frame keeps
+    /// what the upstream wrote apart from its ids: trimming it would cost a
+    /// pass per frame.
+    #[test]
+    fn a_platform_response_keeps_only_the_documented_members() {
+        let (mark, _) = sealing_mark(None);
+        let usage = json!({"input_tokens": 9, "output_tokens": 2, "total_tokens": 11,
+            "input_tokens_details": {"cached_tokens": 1, "cache_write_tokens": 0,
+                                     "cache_creation_tokens": 3},
+            "output_tokens_details": {"reasoning_tokens": 1, "audio_tokens": 0},
+            "region": "eastus"});
+        let kept_usage = json!({"input_tokens": 9, "output_tokens": 2, "total_tokens": 11,
+            "input_tokens_details": {"cached_tokens": 1, "cache_write_tokens": 0},
+            "output_tokens_details": {"reasoning_tokens": 1}});
+        let mut body = json!({"id": "resp_up", "object": "response", "created_at": 1,
+            "status": "completed", "model": "alias", "output": [], "usage": usage,
+            "content_filters": [{"blocked": false}], "service_tier": "default"});
+        mark.apply_to_body(&mut body);
+        let mut members: Vec<&str> = body
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        members.sort_unstable();
+        assert_eq!(
+            members,
+            [
+                "created_at",
+                "id",
+                "model",
+                "object",
+                "output",
+                "service_tier",
+                "status",
+                "usage"
+            ]
+        );
+        assert_eq!(body["usage"], kept_usage);
+
+        let done = format!(
+            "event: response.completed\ndata: {}\n\n",
+            json!({"type": "response.completed", "sequence_number": 7,
+                   "response": {"id": "resp_up", "object": "response", "output": [],
+                                "usage": usage, "content_filters": []}})
+        );
+        assert!(mark.apply_to_sse_frame(done.as_bytes()).is_none());
+        let delta = b"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"sequence_number\":3,\"item_id\":\"\",\"output_index\":0,\"content_index\":0,\"delta\":\"hi\",\"logprobs\":[],\"obfuscation\":\"Xy3\"}\n\n";
+        assert!(mark.apply_to_sse_frame(delta).is_none());
+
+        // Off platform mode both go out as the upstream wrote them.
+        let off = ContextAffinity::default()
+            .response_mark("m-1", false)
+            .sealing_ids(None, "team-a");
+        let mut body = json!({"id": "resp_up", "usage": usage, "content_filters": []});
+        let before = body.clone();
+        off.apply_to_body(&mut body);
+        assert_eq!(body, before);
+        assert!(off.apply_to_sse_frame(delta).is_none());
     }
 
     #[test]
@@ -1216,7 +1513,7 @@ mod tests {
     }
 
     fn tenant(owner: &str) -> TenantSeal {
-        TenantSeal::new(&crate::platform::PlatformSettings::from_secret("s"), owner)
+        TenantSeal::new(&crate::platform::PlatformSettings::from_secret("s"), owner).unwrap()
     }
 
     fn sealed_for(owner: &str, target: &str, upstream: &str) -> String {

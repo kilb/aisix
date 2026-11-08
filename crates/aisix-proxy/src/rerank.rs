@@ -864,6 +864,22 @@ async fn dispatch(
         aisix_core::InputTokens::uncached_only(total_tokens),
         0,
     );
+    // Billed from here on: a caller that leaves during the commit still owes
+    // this answer, priced as the success row prices it.
+    if let Some(u) = usage.as_ref() {
+        crate::attribution::note_answered_usage(crate::usage_attr::AnsweredUsage {
+            prompt_tokens: u.prompt_tokens,
+            upstream_total_tokens: u.upstream_total_tokens.unwrap_or(0),
+            cost_usd: crate::usage_attr::request_cost_usd(
+                snapshot,
+                &target.id,
+                aisix_core::InputTokens::uncached_only(u64::from(u.prompt_tokens)),
+                0,
+            ),
+            provider_request_id: provider_request_id.clone(),
+            ..Default::default()
+        });
+    }
     reservation.commit(total_tokens, spend).await;
 
     Ok(RerankDispatchSuccess {
@@ -1012,8 +1028,7 @@ fn emit_usage_event(
     crate::usage_attr::apply_caller_identity(&mut event, client.jwt.as_ref(), &client.caller);
     let usage_model =
         crate::usage_attr::usage_event_model_label(snap, &event.requested_model).into_owned();
-    // Read before the event is handed over: the spend counter below is what
-    // the portal bills from.
+    // Read before the event is handed over, for the spend counter below.
     let cost_usd = event.cost_usd;
     crate::usage_attr::emit_usage(
         state,

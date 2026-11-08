@@ -463,6 +463,13 @@ pub(crate) fn resolve_target(
             if !auth.key().can_access(snapshot, name) {
                 return Err(ProxyError::ModelForbidden(name.to_string()));
             }
+            // A grouped key is answered as if no ensemble existed, as on
+            // every other endpoint, ahead of the refusal below that names it.
+            crate::model_resolve::refuse_ensemble_to_grouped_key(
+                name,
+                &entry.value,
+                &auth.key().allowed_provider_groups,
+            )?;
             let m = &entry.value;
             if m.is_routing() || m.is_ensemble() || m.is_semantic() {
                 return Err(ProxyError::InvalidRequest(format!(
@@ -2877,6 +2884,43 @@ fn prepare_batch_attribution(
     })
 }
 
+/// How many batch attributions that can credit spend download their output
+/// file at once ([`crate::state::ProxyStateInner::batch_attribution_permits`]).
+/// Every download takes a permit, whichever path saw the batch end: a
+/// retrieve, a listing or the gateway's own watcher. A listing names a page
+/// of batches, so unbounded, one `GET /v1/batches` would start that many
+/// downloads together. Each download is read a line at a time, so what one
+/// holds in memory is the line it is reading, not the file.
+pub(crate) const BATCH_ATTRIBUTION_DOWNLOADS: usize = 4;
+
+/// How many batch attributions whose credit is ruled out
+/// ([`batch_credit_is_ruled_out`]) download their output at once
+/// ([`crate::state::ProxyStateInner::batch_backfill_permits`]). After a
+/// restart on the in-process rate-limit store, a listing names every older
+/// batch on its page again, and each of those only re-emits a usage row the
+/// control plane drops as a copy. In a lane of their own they never hold a
+/// permit that a batch which ended after the restart, and is still owed its
+/// credit, is waiting for.
+pub(crate) const BATCH_BACKFILL_DOWNLOADS: usize = 1;
+
+/// The permits `job`'s output download waits for: the backfill lane when its
+/// credit is ruled out, the attribution lane otherwise.
+fn download_lane(job: &BatchAttribution) -> &tokio::sync::Semaphore {
+    if batch_credit_is_ruled_out(&job.state, job.ended_at) {
+        &job.state.batch_backfill_permits
+    } else {
+        &job.state.batch_attribution_permits
+    }
+}
+
+/// [`attribute_batch_usage`], once `job`'s lane ([`download_lane`]) has a
+/// permit for it.
+async fn attribute_with_permit(job: &BatchAttribution) -> Result<(), String> {
+    // Never closed, so a permit always comes.
+    let _permit = download_lane(job).acquire().await;
+    attribute_batch_usage(job).await
+}
+
 /// 请求路径上观察到批次结束：归因放到后台去，这次应答不等它。
 fn maybe_attribute_batch(
     state: &ProxyState,
@@ -2891,7 +2935,7 @@ fn maybe_attribute_batch(
         return;
     };
     tokio::spawn(async move {
-        if let Err(e) = attribute_batch_usage(&job).await {
+        if let Err(e) = attribute_with_permit(&job).await {
             // Release the guard so a later retrieve can retry the download.
             job.state.billed_batches.remove(&job.raw_batch_id);
             tracing::warn!(
@@ -2926,10 +2970,9 @@ fn attribute_listed_batches(
         if require_safe_upstream_id(raw_id).is_err() || batch_submitter(&snap, batch).is_none() {
             continue;
         }
-        // 列表回头会看到同一批：记不进计数器的就不必再下载一遍结果文件。
-        if batch_ended_at(batch).is_some_and(|t| batch_credit_is_ruled_out(state, t)) {
-            continue;
-        }
+        // A batch that ended before this process started still gets its row:
+        // only its credit to the spend counter is ruled out, and
+        // `attribute_batch_usage` gates that alone.
         maybe_attribute_batch(state, auth, client, target, raw_id, batch);
     }
 }
@@ -2978,7 +3021,7 @@ fn watch_batch(
                             // 没有结果文件，或者别的路径已经在归因了。
                             return;
                         };
-                        match attribute_batch_usage(&job).await {
+                        match attribute_with_permit(&job).await {
                             Ok(()) => return,
                             Err(e) => {
                                 state.billed_batches.remove(&raw_batch_id);
@@ -3013,10 +3056,44 @@ async fn poll_batch(target: &JobTarget, raw_batch_id: &str, request_id: &str) ->
     resp.json().await.ok()
 }
 
+/// Cuts a body that arrives in chunks into its `\n`-ended lines, holding only
+/// the line that has not ended yet.
+#[derive(Default)]
+struct LineSplitter {
+    partial: Vec<u8>,
+}
+
+impl LineSplitter {
+    /// Take the next chunk, handing `each` every line it completes, without
+    /// its `\n`.
+    fn feed(&mut self, mut chunk: &[u8], mut each: impl FnMut(&[u8])) {
+        while let Some(end) = chunk.iter().position(|b| *b == b'\n') {
+            if self.partial.is_empty() {
+                each(&chunk[..end]);
+            } else {
+                self.partial.extend_from_slice(&chunk[..end]);
+                each(&self.partial);
+                self.partial.clear();
+            }
+            chunk = &chunk[end + 1..];
+        }
+        self.partial.extend_from_slice(chunk);
+    }
+
+    /// The body has ended: hand `each` its last line when no `\n` ended it.
+    fn finish(self, each: impl FnOnce(&[u8])) {
+        if !self.partial.is_empty() {
+            each(&self.partial);
+        }
+    }
+}
+
 /// Download the completed batch's output JSONL and emit aggregated
 /// UsageEvents (one per provider-billed model appearing in the lines).
 /// Per-line usage and cost, as mainstream gateways handle a completed batch.
 async fn attribute_batch_usage(job: &BatchAttribution) -> Result<(), String> {
+    use futures::StreamExt as _;
+
     let state = &job.state;
     let api_key_id = job.payer.entry.id.as_str();
     let jwt = job.payer.jwt.as_ref();
@@ -3044,10 +3121,6 @@ async fn attribute_batch_usage(job: &BatchAttribution) -> Result<(), String> {
     if !resp.status().is_success() {
         return Err(format!("output file download returned {}", resp.status()));
     }
-    let body = resp
-        .bytes()
-        .await
-        .map_err(|e| aisix_gateway::transport_error_message(&e))?;
 
     // Aggregate per provider-billed model (`response.body.model`).
     #[derive(Default)]
@@ -3062,12 +3135,12 @@ async fn attribute_batch_usage(job: &BatchAttribution) -> Result<(), String> {
         service_tier: TierAgreement,
     }
     let mut per_model: std::collections::BTreeMap<String, Agg> = Default::default();
-    for line in body.split(|b| *b == b'\n') {
+    let mut observe = |line: &[u8]| {
         if line.iter().all(u8::is_ascii_whitespace) {
-            continue;
+            return;
         }
         let Ok(v) = serde_json::from_slice::<Value>(line) else {
-            continue;
+            return;
         };
         let resp_body = &v["response"]["body"];
         let usage = &resp_body["usage"];
@@ -3080,7 +3153,7 @@ async fn attribute_batch_usage(job: &BatchAttribution) -> Result<(), String> {
             .as_u64()
             .unwrap_or(0);
         if prompt == 0 && completion == 0 {
-            continue; // errored line or embeddings-shape without usage
+            return; // errored line or embeddings-shape without usage
         }
         let model = resp_body["model"].as_str().unwrap_or("").to_string();
         let agg = per_model.entry(model).or_default();
@@ -3098,7 +3171,16 @@ async fn attribute_batch_usage(job: &BatchAttribution) -> Result<(), String> {
                 ));
         agg.lines += 1;
         agg.service_tier.observe(resp_body["service_tier"].as_str());
+    };
+    // A line at a time as the file arrives: an output file can run to
+    // hundreds of megabytes, and several downloads run at once.
+    let mut lines = LineSplitter::default();
+    let mut body = resp.bytes_stream();
+    while let Some(chunk) = body.next().await {
+        let chunk = chunk.map_err(|e| aisix_gateway::transport_error_message(&e))?;
+        lines.feed(&chunk, &mut observe);
     }
+    lines.finish(&mut observe);
 
     if per_model.is_empty() {
         tracing::info!(batch_id = %raw_batch_id, "completed batch output contained no usage lines");
@@ -3131,7 +3213,7 @@ async fn attribute_batch_usage(job: &BatchAttribution) -> Result<(), String> {
     let multi = per_model.len() > 1;
     // 这条归因会重放：进程内的去重集合是优化不是正确性机制，重启或换实例之后
     // 再看到同一个已完成批次就会重来一遍。用量事件带确定性 id，消费端据此去重
-    // ——**它**是幂等的。而下面两条不是：Prometheus 计数器和只增的花费计数器
+    // ——**它**是幂等的。而下面两条不是：Prometheus 计数器和花费计数器
     // 都没有那层保护，重放一次就是把这批多收一遍。
     //
     // 所以只给这两条加闸，且闸放在与计数器同一个存储里：共享存储下跨重启、跨
@@ -3140,6 +3222,9 @@ async fn attribute_batch_usage(job: &BatchAttribution) -> Result<(), String> {
     // 量级就是这个，之后不可能再被重取。
     //
     // 事件仍然无条件发 —— 它本来就该在重放时也到达消费端。
+    //
+    // The exporters' copy is not sent unconditionally: an exporter keeps
+    // every row it is sent, so that copy goes under `credit` too.
     let credit = if batch_credit_is_ruled_out(state, job.ended_at) {
         tracing::warn!(
             batch_id = %raw_batch_id,
@@ -3249,6 +3334,9 @@ async fn attribute_batch_usage(job: &BatchAttribution) -> Result<(), String> {
         // Attribution names the identity that observed completion — the
         // same caller the event's api_key_id already reflects.
         crate::usage_attr::apply_caller_identity(&mut event, jwt, caller);
+        // The chokepoint's bound on outside text, for the same reason as the
+        // tier above: the model name comes from the upstream's output file.
+        crate::usage_attr::bound_outside_text(&mut event);
         let usage_model =
             crate::usage_attr::usage_event_model_label(&snap, &event.requested_model).into_owned();
         state.usage_sink.try_emit(
@@ -3263,14 +3351,19 @@ async fn attribute_batch_usage(job: &BatchAttribution) -> Result<(), String> {
             upstream: crate::span_facts::upstream_facts(&snap, &event, pk_id),
             ..Default::default()
         });
-        state.otlp_fan_out.fan_out(
-            &event,
-            None,
-            None,
-            Some(&facts),
-            exporters.generation(),
-            exporters.iter().map(|e| &*e.value),
-        );
+        // The exporters keep every row they are sent, and none of them drops
+        // a copy by the row's id the way the control plane does, so a replay
+        // reaches them only when it is the one that credits the batch.
+        if credit {
+            state.otlp_fan_out.fan_out(
+                &event,
+                None,
+                None,
+                Some(&facts),
+                exporters.generation(),
+                exporters.iter().map(|e| &*e.value),
+            );
+        }
         // 同一笔钱也要进 Prometheus 的 token/花费族。事件只进控制面的账本，
         // 而按花费序列求和扣款的那一侧看不到它 —— 于是一个批次可以消耗巨量
         // token 而用户余额分毫不动。
@@ -4385,13 +4478,12 @@ mod tests {
 
     /// 批处理的花费归因会重放：进程内的去重集合是优化不是正确性机制，重启或
     /// 换实例之后再看到同一个已完成批次就会重来一遍。两类通道在重放下的表现
-    /// 必须不同 —— 用量事件带确定性 id，消费端去重，所以它该照发；而只增的
-    /// 花费计数器与 Prometheus 计数器没有那层保护，重放一次就是多收一遍，所以
+    /// 必须不同 —— 用量事件带确定性 id，消费端去重，所以它该照发；而花费
+    /// 计数器与 Prometheus 计数器没有那层保护，重放一次就是多收一遍，所以
     /// 它们必须被那个一次性标记挡住。
     ///
     /// 这里预先占掉标记来模拟「这批已经归因过了」。本地存储下标记随进程消失，
-    /// 所以真实部署里这条分支只在共享存储上起作用 —— 而共享存储正是预付余额
-    /// 本来就要求的形态（见 `granted_micro_usd` 的字段说明）。
+    /// 所以真实部署里这条分支只在共享存储上起作用。
     #[tokio::test]
     async fn a_replayed_batch_attribution_re_emits_the_event_but_not_the_counters() {
         let upstream = MockServer::builder().start().await;
@@ -4695,6 +4787,490 @@ mod tests {
             vec![("k-1".to_string(), 1_000_000)],
             "只有带标记的那一批入账，而且记在提交者头上"
         );
+    }
+
+    /// The batch row does not pass the emit chokepoint, so it applies the
+    /// chokepoint's bound itself: the model name an output file reports is
+    /// the upstream's text, and is kept to 512 characters like every other
+    /// row's.
+    #[tokio::test]
+    async fn a_batch_row_bounds_the_model_its_output_reports() {
+        let upstream = MockServer::builder().start().await;
+        Mock::given(wm_method("GET"))
+            .and(path("/v1/batches/batch_long"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "batch_long",
+                "status": "completed",
+                "completed_at": aisix_obs::metrics::process_start_time_seconds() + 1.0,
+                "output_file_id": "file-out"
+            })))
+            .mount(&upstream)
+            .await;
+        let long_model = format!("m{}", "x".repeat(4096));
+        let line = serde_json::json!({
+            "id": "batch_req_1",
+            "response": {"status_code": 200, "body": {
+                "model": long_model,
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5}
+            }}
+        });
+        Mock::given(wm_method("GET"))
+            .and(path("/v1/files/file-out/content"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(format!("{line}\n"), "application/jsonl"),
+            )
+            .mount(&upstream)
+            .await;
+        let (app, mut rx, _state) = build_app_with_sink_and_state(ended_batch_snapshot(&upstream));
+        let encoded = encode_routed_id("batch_long", "jobs-a", None);
+        let resp = app
+            .oneshot(get_as(format!("/v1/batches/{encoded}"), "sk-caller"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let mut row = None;
+        for _ in 0..40 {
+            match tokio::time::timeout(Duration::from_millis(100), rx.recv()).await {
+                Ok(Some(ev)) if ev.inbound_protocol == "batch" => {
+                    row = Some(ev);
+                    break;
+                }
+                Ok(Some(_)) => continue,
+                _ => {}
+            }
+        }
+        let row = row.expect("the batch row");
+        assert_eq!(row.provider_model_version.chars().count(), 512);
+        assert!(row.provider_model_version.starts_with("mxxx"));
+    }
+
+    /// A listed batch that ended before this process started is not credited
+    /// to the spend counter again (the in-process store cannot tell whether a
+    /// previous process did), but its usage row is still emitted: the control
+    /// plane drops a copy by the row's fixed id, and a caller that only lists
+    /// batches never reaches the by-id path that would emit it.
+    #[tokio::test]
+    async fn a_listed_batch_that_ended_before_this_process_still_emits_its_row() {
+        let upstream = MockServer::builder().start().await;
+        mount_ended_batch(
+            &upstream,
+            serde_json::json!({"id": "batch_unused", "status": "completed"}),
+        )
+        .await;
+        Mock::given(wm_method("GET"))
+            .and(path("/v1/batches"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "object": "list",
+                "data": [{
+                    "id": "batch_old",
+                    "status": "completed",
+                    "completed_at": 1_000_000_000,
+                    "output_file_id": "file-out",
+                    "metadata": {BATCH_SUBMITTER_KEY: "k-1", BATCH_MODEL_KEY: "jobs-a"}
+                }]
+            })))
+            .mount(&upstream)
+            .await;
+        let (app, mut rx, state) = build_app_with_sink_and_state(ended_batch_snapshot(&upstream));
+        assert!(!state.limiter.claims_outlive_process());
+
+        let resp = app
+            .oneshot(get_as("/v1/batches?model=jobs-a".to_string(), "sk-other"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let mut batch_row = None;
+        for _ in 0..40 {
+            match tokio::time::timeout(Duration::from_millis(100), rx.recv()).await {
+                Ok(Some(ev)) if ev.inbound_protocol == "batch" => {
+                    batch_row = Some(ev);
+                    break;
+                }
+                Ok(Some(_)) => continue,
+                _ => {}
+            }
+        }
+        let row = batch_row.expect("the listed batch's usage row was never emitted");
+        assert!(row.is_batch);
+        assert_eq!(
+            row.event_id,
+            batch_attribution_request_id("batch_old", 0, false)
+        );
+        assert!(
+            spend_series(&state).await.is_empty(),
+            "a batch a previous process may have credited is credited again"
+        );
+    }
+
+    /// One output line: 1000 + 1000 tokens, which `priced_model` prices at
+    /// 1_000_000 micro-USD.
+    fn priced_output_line() -> String {
+        let line = serde_json::json!({
+            "id": "batch_req_1",
+            "response": {"status_code": 200, "body": {
+                "model": "gpt-4o",
+                "usage": {"prompt_tokens": 1000, "completion_tokens": 1000}
+            }}
+        });
+        format!("{line}\n")
+    }
+
+    /// Mount `file`'s output, answered after `delay`.
+    async fn mount_output(upstream: &MockServer, file: &str, delay: Duration) {
+        Mock::given(wm_method("GET"))
+            .and(path(format!("/v1/files/{file}/content")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(priced_output_line(), "application/jsonl")
+                    .set_delay(delay),
+            )
+            .mount(upstream)
+            .await;
+    }
+
+    /// A listed batch that `k-1` submitted, which ended at `ended_at` with
+    /// `file` as its output.
+    fn listed_batch(id: &str, file: &str, ended_at: f64) -> Value {
+        serde_json::json!({
+            "id": id,
+            "status": "completed",
+            "completed_at": ended_at,
+            "output_file_id": file,
+            "metadata": {BATCH_SUBMITTER_KEY: "k-1", BATCH_MODEL_KEY: "jobs-a"}
+        })
+    }
+
+    async fn mount_listing(upstream: &MockServer, batches: Vec<Value>) {
+        Mock::given(wm_method("GET"))
+            .and(path("/v1/batches"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "object": "list",
+                "data": batches,
+            })))
+            .mount(upstream)
+            .await;
+    }
+
+    /// How many output downloads `upstream` has received for files whose id
+    /// starts with `prefix`.
+    async fn downloads_of(upstream: &MockServer, prefix: &str) -> usize {
+        upstream
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|r| {
+                r.url
+                    .path()
+                    .strip_prefix("/v1/files/")
+                    .is_some_and(|rest| rest.starts_with(prefix) && rest.ends_with("/content"))
+            })
+            .count()
+    }
+
+    /// The batch rows waiting on `rx`; the other rows are dropped.
+    fn batch_rows(rx: &mut tokio::sync::mpsc::Receiver<ObsUsageEvent>) -> Vec<ObsUsageEvent> {
+        let mut rows = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if ev.inbound_protocol == "batch" {
+                rows.push(ev);
+            }
+        }
+        rows
+    }
+
+    /// A listing names a page of batches, and their downloads go out at most
+    /// [`BATCH_ATTRIBUTION_DOWNLOADS`] at a time, not all together; every one
+    /// still emits its row. A download keeps its permit until its row is
+    /// emitted, so the downloads started, counted first, can never run more
+    /// than that ahead of the rows received after: no timing is assumed.
+    #[tokio::test]
+    async fn a_listing_downloads_a_few_outputs_at_a_time() {
+        const LISTED: usize = 12;
+        let upstream = MockServer::builder().start().await;
+        let ended_at = aisix_obs::metrics::process_start_time_seconds() + 1.0;
+        let mut batches = Vec::new();
+        for i in 0..LISTED {
+            let file = format!("file-page-{i}");
+            mount_output(&upstream, &file, Duration::from_millis(600)).await;
+            batches.push(listed_batch(&format!("batch_page_{i}"), &file, ended_at));
+        }
+        mount_listing(&upstream, batches).await;
+        let (app, mut rx, _state) = build_app_with_sink_and_state(ended_batch_snapshot(&upstream));
+        let resp = app
+            .oneshot(get_as("/v1/batches?model=jobs-a".to_string(), "sk-other"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut rows = 0;
+        while rows < LISTED {
+            let started = downloads_of(&upstream, "file-page-").await;
+            rows += batch_rows(&mut rx).len();
+            assert!(
+                started <= rows + BATCH_ATTRIBUTION_DOWNLOADS,
+                "{started} downloads started while {rows} rows were emitted"
+            );
+            assert!(
+                Instant::now() < deadline,
+                "{rows} of {LISTED} batch rows emitted"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(downloads_of(&upstream, "file-page-").await, LISTED);
+    }
+
+    /// After a restart on the in-process store, a listing names every batch
+    /// that ended before it again. Their downloads cannot credit anything, so
+    /// they go [`BATCH_BACKFILL_DOWNLOADS`] at a time in a lane of their own,
+    /// and a batch that ended after this process started, which is still
+    /// owed its credit, does not wait behind them.
+    #[tokio::test]
+    async fn a_backfill_listing_never_holds_up_a_batch_that_can_be_credited() {
+        const OLD: usize = 6;
+        let upstream = MockServer::builder().start().await;
+        let mut batches = Vec::new();
+        for i in 0..OLD {
+            let file = format!("file-old-{i}");
+            mount_output(&upstream, &file, Duration::from_millis(400)).await;
+            batches.push(listed_batch(
+                &format!("batch_old_{i}"),
+                &file,
+                1_000_000_000.0,
+            ));
+        }
+        // Listed last, behind every older batch.
+        mount_output(&upstream, "file-fresh", Duration::ZERO).await;
+        batches.push(listed_batch(
+            "batch_fresh",
+            "file-fresh",
+            aisix_obs::metrics::process_start_time_seconds() + 1.0,
+        ));
+        mount_listing(&upstream, batches).await;
+        let (app, mut rx, state) = build_app_with_sink_and_state(ended_batch_snapshot(&upstream));
+        assert!(!state.limiter.claims_outlive_process());
+        let resp = app
+            .oneshot(get_as("/v1/batches?model=jobs-a".to_string(), "sk-other"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let fresh = batch_attribution_request_id("batch_fresh", 0, false);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut old_rows = 0;
+        let mut old_rows_ahead_of_fresh = None;
+        while old_rows < OLD || old_rows_ahead_of_fresh.is_none() {
+            let started = downloads_of(&upstream, "file-old-").await;
+            for row in batch_rows(&mut rx) {
+                if row.event_id == fresh {
+                    old_rows_ahead_of_fresh = Some(old_rows);
+                } else {
+                    old_rows += 1;
+                }
+            }
+            assert!(
+                started <= old_rows + BATCH_BACKFILL_DOWNLOADS,
+                "{started} backfill downloads started while {old_rows} of their rows were emitted"
+            );
+            assert!(
+                Instant::now() < deadline,
+                "{old_rows} of {OLD} backfill rows emitted, the fresh one: {old_rows_ahead_of_fresh:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            old_rows_ahead_of_fresh,
+            Some(0),
+            "the batch still owed its credit waited behind the backfill"
+        );
+        assert_eq!(
+            spend_series(&state).await,
+            vec![("k-1".to_string(), 1_000_000)],
+            "only the batch that ended after this process started is credited"
+        );
+    }
+
+    /// The watcher's download takes a permit like any other: with every permit
+    /// held, a batch it sees end waits, and is charged once one comes free.
+    #[tokio::test]
+    async fn a_watched_batch_waits_for_a_download_permit() {
+        let upstream = MockServer::builder().start().await;
+        Mock::given(wm_method("POST"))
+            .and(path("/v1/batches"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "batch_1",
+                "object": "batch",
+                "status": "validating"
+            })))
+            .mount(&upstream)
+            .await;
+        mount_ended_batch(
+            &upstream,
+            serde_json::json!({
+                "id": "batch_1",
+                "status": "completed",
+                "output_file_id": "file-out"
+            }),
+        )
+        .await;
+
+        let (tx, _rx) = tokio::sync::mpsc::channel::<ObsUsageEvent>(32);
+        let state = crate::ProxyState::new(
+            SnapshotHandle::new(ended_batch_snapshot(&upstream)),
+            Arc::new(Hub::new()),
+            &cfg(),
+        )
+        .without_cache()
+        .with_usage_sink(UsageSink::new(tx))
+        .with_batch_watch_interval(Duration::from_millis(20));
+        let held = state
+            .batch_attribution_permits
+            .acquire_many(BATCH_ATTRIBUTION_DOWNLOADS as u32)
+            .await
+            .unwrap();
+        let app = crate::build_router(state.clone());
+
+        let body = serde_json::json!({
+            "input_file_id": encode_routed_id("file-in", "jobs-a", None),
+            "endpoint": "/v1/chat/completions",
+            "completion_window": "24h"
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/batches")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        assert_eq!(app.oneshot(req).await.unwrap().status(), StatusCode::OK);
+
+        // The watcher has seen the batch end and taken it on.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !state.billed_batches.contains_key("batch_1") {
+            assert!(
+                Instant::now() < deadline,
+                "the watcher never saw the batch end"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // A download that took no permit goes out at once; this wait only
+        // gives one the time to land, so a slow runner cannot turn it red.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            downloads_of(&upstream, "file-out").await,
+            0,
+            "the watcher downloaded with every permit held"
+        );
+
+        drop(held);
+        assert_eq!(
+            spend_series(&state).await,
+            vec![("k-1".to_string(), 1_000_000)]
+        );
+        assert_eq!(downloads_of(&upstream, "file-out").await, 1);
+    }
+
+    /// An exporter keeps every row it is sent and drops no copy by its id, so
+    /// a batch replayed after a restart, whose credit is ruled out, reaches
+    /// it no more than the counters: the control plane still gets the row.
+    /// One that ended after this process started reaches it as usual.
+    #[tokio::test]
+    async fn a_replayed_batch_row_reaches_no_exporter() {
+        let upstream = MockServer::builder().start().await;
+        let collector = MockServer::builder().start().await;
+        Mock::given(wm_method("POST"))
+            .and(path("/v1/traces"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&collector)
+            .await;
+        mount_output(&upstream, "file-old", Duration::ZERO).await;
+        mount_output(&upstream, "file-fresh", Duration::ZERO).await;
+        mount_listing(
+            &upstream,
+            vec![
+                listed_batch("batch_old", "file-old", 1_000_000_000.0),
+                listed_batch(
+                    "batch_fresh",
+                    "file-fresh",
+                    aisix_obs::metrics::process_start_time_seconds() + 1.0,
+                ),
+            ],
+        )
+        .await;
+        let snap = ended_batch_snapshot(&upstream);
+        let exporter = serde_json::from_value(serde_json::json!({
+            "name": "collector",
+            "kind": "otlp_http",
+            "endpoint": format!("{}/v1/traces", collector.uri()),
+        }))
+        .unwrap();
+        snap.observability_exporters
+            .insert(ResourceEntry::new("exporter-id", exporter, 1));
+        let (app, mut rx, state) = build_app_with_sink_and_state(snap);
+        let resp = app
+            .oneshot(get_as("/v1/batches?model=jobs-a".to_string(), "sk-other"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let old = batch_attribution_request_id("batch_old", 0, false);
+        let fresh = batch_attribution_request_id("batch_fresh", 0, false);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut rows = Vec::new();
+        while rows.len() < 2 {
+            rows.extend(batch_rows(&mut rx).into_iter().map(|row| row.event_id));
+            assert!(Instant::now() < deadline, "batch rows emitted: {rows:?}");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        rows.sort();
+        let mut both = vec![old.clone(), fresh.clone()];
+        both.sort();
+        assert_eq!(rows, both, "the control plane gets both rows");
+
+        // Every row handed to the exporter is posted before this returns.
+        state.otlp_fan_out.shutdown().await;
+        let exported: String = collector
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .collect();
+        assert!(
+            exported.contains(&fresh),
+            "the credited batch's row was never exported"
+        );
+        assert!(
+            !exported.contains(&old),
+            "a replayed batch's row was exported again"
+        );
+    }
+
+    /// The output file is read as it arrives: a line split across chunks is
+    /// put back together, the last line needs no `\n`, and between chunks the
+    /// splitter holds no more than the line it is in, never the file.
+    #[test]
+    fn an_output_file_is_read_a_line_at_a_time() {
+        let line = |i: usize| format!(r#"{{"n":{i},"pad":"{}"}}"#, "x".repeat(40 + i));
+        let lines: Vec<String> = (0..=50).map(line).collect();
+        let body = lines.join("\n");
+        let longest = lines.iter().map(String::len).max().unwrap();
+        for chunk_len in [1, 7, 64, 1000, body.len()] {
+            let mut splitter = LineSplitter::default();
+            let mut seen = Vec::new();
+            for chunk in body.as_bytes().chunks(chunk_len) {
+                splitter.feed(chunk, |l| seen.push(String::from_utf8(l.to_vec()).unwrap()));
+                assert!(
+                    splitter.partial.len() <= longest,
+                    "holding {} bytes between chunks of {chunk_len}",
+                    splitter.partial.len()
+                );
+            }
+            splitter.finish(|l| seen.push(String::from_utf8(l.to_vec()).unwrap()));
+            assert_eq!(seen, lines, "chunks of {chunk_len}");
+        }
     }
 
     /// 调用方压根不读批次也要入账：结果可以按 `output_file_id` 直接下，而上游照样

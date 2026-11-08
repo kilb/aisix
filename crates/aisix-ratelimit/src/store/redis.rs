@@ -97,8 +97,6 @@ const CODE_OK: i64 = 0;
 const CODE_CONCURRENCY: i64 = 1;
 const CODE_TOKENS: i64 = 2;
 const CODE_REQUESTS: i64 = 3;
-/// 累计发放额用尽。没有 retry_after —— 它不会自己回来。
-const CODE_ALLOWANCE: i64 = 4;
 
 /// What this process knows about one live concurrency member. A Redis command
 /// can fail after the server applies its Lua mutation but before the client
@@ -121,8 +119,6 @@ local conc_max = tonumber(ARGV[3])
 local conc_ttl = tonumber(ARGV[4])
 local conc_key_ttl = tonumber(ARGV[5])
 local grace = tonumber(ARGV[6])
--- granted 追加在**所有**可变长参数之后（见脚本末尾的 idx），不能插在这里：
--- 插在中间会把 idx = 7 起的那串请求/token 三元组整体错位。
 local t = redis.call('TIME')
 local now = tonumber(t[1])
 -- Keep the score in seconds so rolling upgrades still understand existing
@@ -159,17 +155,6 @@ local tok = {}
 for i = 1, ntok do
   tok[i] = {ARGV[idx], tonumber(ARGV[idx+1]), tonumber(ARGV[idx+2])}
   idx = idx + 3
-end
-local granted = tonumber(ARGV[idx]); idx = idx + 1
-
--- 累计发放额。ARGV 里 granted < 0 表示没配。
--- 放在窗口检查之前，与本地实现一致：它是不会自己回来的那一个，
--- 两者都会拒时报它更有用。
-if granted >= 0 then
-  local used = tonumber(redis.call('GET', prefix .. ':consumed') or '0')
-  if used >= granted then
-    return {4, 0}
-  end
 end
 
 for i = 1, ntok do
@@ -246,9 +231,6 @@ if tokens > 0 then
       redis.call('EXPIRE', k, d[2] + grace)
     end
   end
-  -- 累计消费：**不带窗口、不设 EXPIRE**。这是它跟上面那三个的唯一区别，
-  -- 也是「发放额度」跟「窗口上限」的全部区别。设了过期就退化成上限。
-  redis.call('INCRBY', prefix .. ':consumed', tokens)
 end
 redis.call('ZREM', prefix .. ':conc', member)
 return 1
@@ -272,8 +254,6 @@ if tokens > 0 then
       redis.call('EXPIRE', k, d[2] + grace)
     end
   end
-  -- 与 COMMIT_LUA 同步：累计消费不带窗口、不设 EXPIRE。
-  redis.call('INCRBY', prefix .. ':consumed', tokens)
 end
 return 1
 "#;
@@ -773,14 +753,6 @@ impl RateStore for RedisStore {
         ];
         push_dims(&mut args, &super::request_dims(limits));
         push_dims(&mut args, &token_dims(limits));
-        // 追加在所有可变长三元组之后 —— 脚本里的 idx 是顺序推进的，插在
-        // 中间会把整串参数错位。-1 表示没配发放额。
-        args.push(
-            limits
-                .granted_micro_usd
-                .map(|g| g.to_string())
-                .unwrap_or_else(|| "-1".to_string()),
-        );
 
         let script = Script::new(ACQUIRE_LUA);
         let mut invocation = script.prepare_invoke();
@@ -807,9 +779,6 @@ impl RateStore for RedisStore {
         match invocation.invoke_async::<Vec<i64>>(&mut conn).await {
             Ok(reply) => {
                 self.mark_ok();
-                // 本地备份要知道这个桶带不带累计额度，否则断线前攒下的流式花费会在
-                // 空闲回收时连桶一起丢掉（见 `LocalStore::note_allowance`）。
-                self.local.note_allowance(key, limits);
                 let code = reply.first().copied().unwrap_or(CODE_OK);
                 let retry = reply.get(1).copied().unwrap_or(0).max(0) as u64;
                 // The script reports which dimension refused as its
@@ -853,7 +822,6 @@ impl RateStore for RedisStore {
                         scope: aisix_core::RateLimitScope::Requests,
                         detail: refused(&super::request_dims(limits)),
                     }),
-                    CODE_ALLOWANCE => Err(RateLimitError::AllowanceExhausted),
                     _ => Ok(()),
                 }
             }
@@ -898,8 +866,8 @@ impl RateStore for RedisStore {
             Ok(_) => {
                 self.mark_ok();
                 // 与 `add_tokens_all` 一样，这笔花费也记一份进本地备份：断线时的
-                // 本地降级要接着用同一份累计额度和 token 窗口。只记流式的话，非流式
-                // 花掉的额度在断线期间又能花一遍。
+                // 本地降级要接着用同一份 token 窗口。只记流式的话，非流式花掉的
+                // 那部分在断线期间又能花一遍。
                 self.local.add_tokens(key, tokens);
                 // 这个 member 可能是断线时降级到本地占的位：Redis 侧的 commit
                 // 不碰本地，不在这里还掉就永远留在本地，下次断线时本地并发上限
@@ -1240,12 +1208,12 @@ mod lua_invariants {
     /// 一元请求走 `COMMIT_LUA`，流式请求走 `ADD_TOKENS_LUA`。两段脚本必须动到
     /// **同一组**计数器，否则同样的流量按流式还是一元发出去会记到不同的地方。
     ///
-    /// 模块注释里本来就写着这条不变量，但此前没有任何东西检查它 —— 加累计消费
-    /// 计数器时我得靠记性改两处，而记性正是这种测试要替代的东西。
+    /// 模块注释里本来就写着这条不变量，这里把它检查起来：给一边加计数器时
+    /// 漏了另一边，这条会红。
     #[test]
     fn 两段计费脚本动的是同一组计数器() {
         let counters = |lua: &str| {
-            let mut found: Vec<&str> = ["'tpm'", "'tph'", "'tpd'", ":consumed"]
+            let mut found: Vec<&str> = ["'tpm'", "'tph'", "'tpd'"]
                 .into_iter()
                 .filter(|c| lua.contains(c))
                 .collect();
@@ -1257,29 +1225,5 @@ mod lua_invariants {
             counters(ADD_TOKENS_LUA),
             "一元与流式的计费脚本动了不同的计数器",
         );
-        // 而且累计消费必须在两边都有 —— 少一边，流式流量就不计进发放额。
-        assert!(COMMIT_LUA.contains(":consumed"));
-        assert!(ADD_TOKENS_LUA.contains(":consumed"));
-    }
-
-    /// 累计消费计数器**绝不能设过期**：设了就退化成窗口上限，跨过那个窗口
-    /// 额度会自己回来。
-    #[test]
-    fn 累计消费计数器不设过期() {
-        for (name, lua) in [
-            ("COMMIT_LUA", COMMIT_LUA),
-            ("ADD_TOKENS_LUA", ADD_TOKENS_LUA),
-        ] {
-            let after = lua
-                .split(":consumed'")
-                .nth(1)
-                .unwrap_or_else(|| panic!("{name} 里没有累计消费计数器"));
-            // 同一条语句之内不该出现 EXPIRE。取到下一个换行为止。
-            let stmt = after.split('\n').next().unwrap_or("");
-            assert!(
-                !stmt.contains("EXPIRE"),
-                "{name} 给累计消费计数器设了过期 —— 那就退化成窗口上限了",
-            );
-        }
     }
 }

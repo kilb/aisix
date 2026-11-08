@@ -2,21 +2,18 @@
 
 use std::sync::Arc;
 
-use ring::{aead, hmac};
+use ring::aead;
 use sha2::{Digest, Sha256};
 
 /// Settings read once at startup when `proxy.platform.enabled` is true.
 ///
-/// Every key an id is mapped or sealed under is derived here, once, from
+/// Every key an id is sealed under is derived here, once, from
 /// [`Self::id_key`], and shared by every request: setting a key up costs
-/// more than the one id most requests map or seal with it.
+/// more than the one id most requests seal with it.
 #[derive(Clone)]
 pub struct PlatformSettings {
     /// Key derived from the platform secret: SHA-256 of its bytes.
     pub id_key: [u8; 32],
-    /// The HMAC key tool-call ids are mapped under
-    /// ([`crate::opaque_id::map_tool_call_id`]).
-    tool_id_key: hmac::Key,
     /// The keys Responses item and call ids are sealed under
     /// ([`crate::opaque_id::Sealer`]).
     seal_keys: Arc<crate::opaque_id::SealKeys>,
@@ -26,11 +23,10 @@ pub struct PlatformSettings {
 }
 
 impl PlatformSettings {
-    /// 由平台密钥派生 id_key（SHA-256），并一次派生出各个映射、封装所用的密钥。
+    /// 由平台密钥派生 id_key（SHA-256），并一次派生出各个封装所用的密钥。
     pub fn from_secret(secret: &str) -> PlatformSettings {
         let id_key: [u8; 32] = Sha256::digest(secret.as_bytes()).into();
         PlatformSettings {
-            tool_id_key: hmac::Key::new(hmac::HMAC_SHA256, &id_key),
             seal_keys: Arc::new(crate::opaque_id::SealKeys::new(
                 &crate::opaque_id::seal_key(&id_key),
             )),
@@ -39,10 +35,6 @@ impl PlatformSettings {
             )),
             id_key,
         }
-    }
-
-    pub(crate) fn tool_id_key(&self) -> &hmac::Key {
-        &self.tool_id_key
     }
 
     pub(crate) fn seal_keys(&self) -> &Arc<crate::opaque_id::SealKeys> {
@@ -79,12 +71,19 @@ pub(crate) fn relayed_content_type(
 }
 
 /// The tenant a platform-mode request belongs to: `team:<team id>` for a key
-/// in a team, `key:<key entry id>` for one without. Every id platform mode
+/// in a team, `key:<key entry id>` for one without, or with an empty
+/// `team_id`, which names no team (the boundary the cache's `team` scope
+/// draws too, `response_cache::cache_scope_value`). Every id platform mode
 /// seals for a caller is sealed to it, and opens only for it. The kind tag
 /// keeps a team id that equals some key's entry id from naming that key's
 /// tenant.
 pub(crate) fn tenant_owner(auth: &crate::auth::AuthenticatedKey) -> String {
-    match auth.key().team_id.as_deref() {
+    match auth
+        .key()
+        .team_id
+        .as_deref()
+        .filter(|team| !team.is_empty())
+    {
         Some(team) => format!("team:{team}"),
         None => format!("key:{}", auth.entry.id),
     }
@@ -124,6 +123,29 @@ mod tests {
             r#"PlatformSettings { id_key: "***", derived_keys: "***" }"#
         );
         assert!(!shown.contains(&format!("{:?}", settings.id_key)));
+    }
+
+    /// A key's tenant is its team, and a key with no team, or an empty
+    /// `team_id`, is a tenant of its own: the same boundary the cache's team
+    /// scope draws (`response_cache::cache_scope_value`).
+    #[test]
+    fn an_empty_team_id_is_no_team() {
+        let owner = |id: &str, team_id: Option<&str>| {
+            let snap = aisix_core::AisixSnapshot::new();
+            let key: aisix_core::ApiKey =
+                serde_json::from_value(serde_json::json!({"key_hash": "h", "team_id": team_id}))
+                    .unwrap();
+            tenant_owner(&crate::auth::AuthenticatedKey::new(
+                &snap,
+                std::sync::Arc::new(aisix_core::ResourceEntry::new(id, key, 1)),
+                None,
+                false,
+            ))
+        };
+        assert_eq!(owner("k1", Some("t1")), "team:t1");
+        assert_eq!(owner("k1", None), "key:k1");
+        assert_eq!(owner("k1", Some("")), "key:k1");
+        assert_ne!(owner("k1", Some("")), owner("k2", Some("")));
     }
 
     /// Every key is set up once, when the settings are built, and never

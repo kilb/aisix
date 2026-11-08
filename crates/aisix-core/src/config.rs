@@ -807,7 +807,8 @@ pub struct ProxyConfig {
     /// `x-aisix-cache` and `x-aisix-cache-layer` whatever this says, except
     /// in platform mode, where they too send them only when this is on.
     ///
-    /// Applied at startup. Changing it requires a restart.
+    /// Applied at startup. Changing it requires a restart. Refused together
+    /// with `platform.enabled`.
     #[serde(default)]
     pub expose_debug_headers: bool,
     /// Platform mode for multi-tenant deployments. Off by default.
@@ -825,10 +826,12 @@ pub struct PlatformConfig {
     /// Turn platform mode on. Requires `id_key_env`.
     #[serde(default)]
     pub enabled: bool,
-    /// Name of the environment variable that holds the platform secret,
-    /// at least 32 bytes long. The gateway reads the variable once at
-    /// startup and refuses to start when it is missing or too short. The
-    /// secret itself is never written to the configuration file.
+    /// Name of the environment variable that holds the platform secret: at
+    /// least 32 random bytes, written as hex or base64 (for example the
+    /// output of `openssl rand -base64 48`). The gateway reads the variable
+    /// once at startup and refuses to start when it is missing or does not
+    /// decode to 32 bytes. The secret itself is never written to the
+    /// configuration file.
     #[serde(default)]
     pub id_key_env: Option<String>,
 }
@@ -1440,7 +1443,7 @@ impl ObservabilityConfig {
 /// older gateway still loads. Any other unknown family name fails boot.
 ///
 /// `aisix_llm_spend_micro_usd_total` does not belong here: this gateway still
-/// emits it and the portal bills from it.
+/// emits it.
 pub const RETIRED_METRIC_FAMILIES: &[&str] = &[];
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -2301,8 +2304,8 @@ impl EnvOverrides {
                 "{name} was not applied as a configuration override: it names no \
                  gateway setting, and a nested setting is spelled \
                  AISIX_<SECTION>__<KEY>. If the configuration reads it by name \
-                 (etcd.password_env, a resources-file interpolation) it still \
-                 applies; otherwise nothing reads it — Kubernetes injects \
+                 (etcd.password_env, proxy.platform.id_key_env, a resources-file \
+                 interpolation) it still applies; otherwise nothing reads it — Kubernetes injects \
                  variables of this shape for every Service named aisix or \
                  aisix-*, which enableServiceLinks: false on the pod spec turns \
                  off."
@@ -2548,19 +2551,32 @@ impl Config {
             ));
         }
 
-        if self.proxy.platform.enabled
-            && self
-                .proxy
-                .platform
-                .id_key_env
-                .as_deref()
-                .is_none_or(|name| name.trim().is_empty())
-        {
-            return Err(BootstrapError::Config(
-                "proxy.platform.id_key_env must name the environment variable holding the \
-                 platform secret when proxy.platform.enabled is true"
-                    .to_string(),
-            ));
+        if self.proxy.platform.enabled {
+            let name = self.proxy.platform.id_key_env.as_deref().unwrap_or("");
+            if name.trim().is_empty() {
+                return Err(BootstrapError::Config(
+                    "proxy.platform.id_key_env must name the environment variable holding the \
+                     platform secret when proxy.platform.enabled is true"
+                        .to_string(),
+                ));
+            }
+            if name.trim() != name {
+                return Err(BootstrapError::Config(format!(
+                    "proxy.platform.id_key_env = {name:?} has whitespace around the variable \
+                     name"
+                )));
+            }
+            // The debug headers name the routing target that answered and
+            // tell a cache hit from a miss, which across tenants says what
+            // another one asked.
+            if self.proxy.expose_debug_headers {
+                return Err(BootstrapError::Config(
+                    "proxy.expose_debug_headers must be false when proxy.platform.enabled is \
+                     true: the debug headers name the routing target that answered and show \
+                     another tenant's cache hits"
+                        .to_string(),
+                ));
+            }
         }
 
         // Fail fast on an unusable rewrite rule: a broken rule would
@@ -3133,6 +3149,42 @@ admin:
         assert!(overrides.warnings[0].starts_with("AISIX_OSS_SERVICE_HOST "));
     }
 
+    /// The secret variable the example names is read by name, so it must not
+    /// look like a setting: an `AISIX_` name is warned about at every boot as
+    /// a variable nothing reads, and removing it to quiet the warning stops
+    /// the gateway from starting. A name an operator chose that way anyway is
+    /// told the warning does not apply to it.
+    #[test]
+    fn the_example_platform_secret_variable_draws_no_boot_warning() {
+        let example = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../config.example.yaml"
+        ))
+        .unwrap();
+        let name = example
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("#   id_key_env:"))
+            .expect("the example names the platform secret variable")
+            .trim();
+        let overrides =
+            EnvOverrides::partition(std::iter::once((name.to_string(), "secret".to_string())));
+        assert!(
+            overrides.warnings.is_empty(),
+            "{name}: {:?}",
+            overrides.warnings
+        );
+
+        let overrides = EnvOverrides::partition(std::iter::once((
+            "AISIX_PLATFORM_ID_KEY".to_string(),
+            "secret".to_string(),
+        )));
+        assert!(
+            overrides.warnings[0].contains("proxy.platform.id_key_env"),
+            "{:?}",
+            overrides.warnings
+        );
+    }
+
     #[test]
     fn a_deserialize_error_is_traced_to_the_variable_that_set_it() {
         let names = vec![
@@ -3178,6 +3230,47 @@ admin:
             .unwrap_err()
             .to_string();
         assert!(err.contains("proxy.platform.id_key_env"), "{err}");
+    }
+
+    /// A name with whitespace around it names no variable: refused here,
+    /// where the error can say so, rather than at boot as a variable that is
+    /// missing although the one the operator meant is set.
+    #[test]
+    fn platform_refuses_an_id_key_env_with_surrounding_whitespace() {
+        for name in ["\" P0_TEST_PLATFORM_KEY\"", "\"P0_TEST_PLATFORM_KEY \""] {
+            let err = load_with_platform(&format!(
+                "  platform: {{ enabled: true, id_key_env: {name} }}"
+            ))
+            .unwrap_err()
+            .to_string();
+            assert!(
+                err.contains("proxy.platform.id_key_env") && err.contains("whitespace"),
+                "{err}"
+            );
+        }
+    }
+
+    /// The debug headers name the routing target that answered and tell a
+    /// cache hit from a miss, which in platform mode tells one tenant what
+    /// another asked: the two are refused together rather than left to an
+    /// operator to keep apart.
+    #[test]
+    fn platform_refuses_the_debug_headers() {
+        let err = load_with_platform(
+            "  expose_debug_headers: true\n  platform: { enabled: true, id_key_env: P0_TEST_PLATFORM_KEY }",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("proxy.expose_debug_headers") && err.contains("proxy.platform.enabled"),
+            "{err}"
+        );
+        // Either one alone still loads.
+        load_with_platform("  expose_debug_headers: true").unwrap();
+        load_with_platform(
+            "  expose_debug_headers: false\n  platform: { enabled: true, id_key_env: P0_TEST_PLATFORM_KEY }",
+        )
+        .unwrap();
     }
 
     #[test]
@@ -4169,8 +4262,8 @@ not_a_section:
         }
     }
 
-    /// This gateway still emits the spend family and the portal bills from it,
-    /// so a labels entry for it is a real selection: telling the operator the
+    /// This gateway still emits the spend family, so a labels entry for it is
+    /// a real selection: telling the operator the
     /// family is gone and the entry ignored would be false on both counts.
     #[test]
     fn a_labels_entry_for_the_spend_family_is_not_reported_as_retired() {

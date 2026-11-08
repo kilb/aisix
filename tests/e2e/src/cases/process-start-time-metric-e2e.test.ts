@@ -6,7 +6,7 @@ import { EtcdClient, spawnApp, type SpawnedApp } from "../harness/index.js";
 //
 // 计数器在进程重启后从 0 重新累计，而只看计数器的值，有一种重启是认不出来的：
 // 重启后、第一次抓取之前花得比重启前还多，值看起来只是涨了。按计数器计费的一方
-// （门户）因此会少扣重启前那一段。启动时刻变了就是重启过，与值无关。
+// 因此会少扣重启前那一段。启动时刻变了就是重启过，与值无关。
 
 describe("the metrics listener exposes the process start time", () => {
   let app: SpawnedApp | undefined;

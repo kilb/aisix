@@ -9465,6 +9465,16 @@ data: [DONE]\n\n";
     /// walked away, so there are no tokens and no cost, and the vocabulary
     /// is the same one the mid-stream shape uses.
     fn assert_head_phase_cancel(event: &aisix_obs::UsageEvent) {
+        assert_head_phase_cancel_shape(event);
+        assert_eq!(event.prompt_tokens, 0);
+        assert_eq!(event.completion_tokens, 0);
+        assert_eq!(event.cost_usd, 0.0);
+    }
+
+    /// [`assert_head_phase_cancel`] without its token assertions, for a
+    /// cancel that landed after the upstream answered: that row bills the
+    /// answer.
+    fn assert_head_phase_cancel_shape(event: &aisix_obs::UsageEvent) {
         assert_eq!(event.status_code, CLIENT_CLOSED_REQUEST, "{event:?}");
         assert_eq!(event.error_class, CLIENT_DISCONNECTED_KIND, "{event:?}");
         assert_eq!(
@@ -9472,9 +9482,6 @@ data: [DONE]\n\n";
             cancel::CANCELLED_BEFORE_HEAD,
             "{event:?}"
         );
-        assert_eq!(event.prompt_tokens, 0);
-        assert_eq!(event.completion_tokens, 0);
-        assert_eq!(event.cost_usd, 0.0);
         // Attributable, or the control plane has nowhere to file the row.
         assert_eq!(event.api_key_id, "key-id-1", "{event:?}");
     }
@@ -9838,12 +9845,19 @@ data: [DONE]\n\n";
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "id": "cmpl-won",
                 "model": "gpt-4o",
+                "service_tier": "priority",
                 "choices": [{
                     "index": 0,
                     "message": {"role": "assistant", "content": "answered"},
                     "finish_reason": "stop"
                 }],
-                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+                "usage": {
+                    "prompt_tokens": 31,
+                    "completion_tokens": 17,
+                    "total_tokens": 48,
+                    "prompt_tokens_details": {"cached_tokens": 8},
+                    "completion_tokens_details": {"reasoning_tokens": 5}
+                }
             })))
             .mount(&upstream)
             .await;
@@ -9877,7 +9891,24 @@ data: [DONE]\n\n";
         cancel_in_flight(app, cancellable_chat_request("smart")).await;
 
         let event = next_event(&mut rx).await;
-        assert_head_phase_cancel(&event);
+        assert_head_phase_cancel_shape(&event);
+        // The upstream answered and billed the answer before the caller left,
+        // so the row bills it, in the upstream's own shape, at the tier it
+        // served.
+        assert_eq!(
+            (
+                event.prompt_tokens,
+                event.completion_tokens,
+                event.total_tokens,
+                event.cached_prompt_tokens,
+                event.reasoning_tokens,
+            ),
+            (31, 17, 48, 8, 5),
+            "{event:?}"
+        );
+        assert_eq!(event.service_tier.as_deref(), Some("priority"));
+        assert_eq!(event.provider_request_id, "cmpl-won");
+        assert!(!event.usage_estimated);
         assert_eq!(event.requested_model, "smart");
         assert_eq!(
             event.model_id, "m-primary",
@@ -9894,6 +9925,366 @@ data: [DONE]\n\n";
             rx.try_recv().is_err(),
             "the winner succeeded, so it is the only row"
         );
+    }
+
+    /// An output scanner that never answers within a test: a request that
+    /// reaches its scan is still in it when the caller hangs up.
+    async fn slow_output_scanner(state: &ProxyState) -> MockServer {
+        let scanner = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_secs(30))
+                    .set_body_json(serde_json::json!({})),
+            )
+            .mount(&scanner)
+            .await;
+        seed_guardrail(
+            &state.snapshot,
+            "g-slow-output",
+            &format!(
+                r#"{{"name":"slow-output","kind":"azure_content_safety_text_moderation","hook_point":"output","endpoint":"{}","api_key":"k"}}"#,
+                scanner.uri()
+            ),
+        );
+        scanner
+    }
+
+    /// A buffered POST of `body` to `uri` with the caller's key, in either
+    /// protocol's auth header.
+    fn cancellable_request(uri: &str, body: serde_json::Value) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("authorization", "Bearer sk-caller")
+            .header("x-api-key", "sk-caller")
+            .header("anthropic-version", "2023-06-01")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    /// The counters a cancel row bills, in the order the tests below
+    /// compare them: prompt, completion, the upstream's own total, the
+    /// OpenAI cache hit, the Anthropic cache read and write.
+    fn billed(event: &aisix_obs::UsageEvent) -> (u32, u32, u32, u32, u32, u32) {
+        (
+            event.prompt_tokens,
+            event.completion_tokens,
+            event.total_tokens,
+            event.cached_prompt_tokens,
+            event.cache_read_tokens,
+            event.cache_creation_tokens,
+        )
+    }
+
+    /// Drive `req` against `snap`, hang up while its answer is in the output
+    /// scan, and hand back the one row the request leaves.
+    async fn cancelled_during_the_output_scan(
+        snap: AisixSnapshot,
+        req: Request<Body>,
+        upstream: &MockServer,
+    ) -> aisix_obs::UsageEvent {
+        use aisix_obs::UsageSink;
+        use aisix_provider_anthropic::AnthropicBridge;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let state = build_state(snap, hub).with_usage_sink(UsageSink::new(tx));
+        let scanner = slow_output_scanner(&state).await;
+        let app = build_router(state);
+
+        cancel_in_flight(app, req).await;
+        assert_eq!(
+            upstream.received_requests().await.unwrap().len(),
+            1,
+            "the upstream must have answered before the caller left"
+        );
+        assert!(
+            !scanner.received_requests().await.unwrap().is_empty(),
+            "the caller must have left during the output scan"
+        );
+        let event = next_event(&mut rx).await;
+        assert_head_phase_cancel_shape(&event);
+        assert!(
+            rx.try_recv().is_err(),
+            "the answered attempt is the request's only row"
+        );
+        event
+    }
+
+    /// `/v1/messages` relayed to a native Anthropic upstream scans the answer
+    /// inside its attempt, so the caller leaves while the attempt is still
+    /// in flight: the row bills the answer all the same, in Anthropic's
+    /// shape, the cache counters on top of the prompt.
+    #[tokio::test]
+    async fn a_native_messages_answer_abandoned_during_its_scan_is_billed() {
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "msg_won",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude-3-5-haiku-20241022",
+                "content": [{"type": "text", "text": "answered"}],
+                "stop_reason": "end_turn",
+                "usage": {
+                    "input_tokens": 31,
+                    "output_tokens": 17,
+                    "cache_read_input_tokens": 4,
+                    "cache_creation_input_tokens": 6
+                }
+            })))
+            .mount(&upstream)
+            .await;
+        let snap = AisixSnapshot::new();
+        snap.provider_keys
+            .insert(matrix_anthropic_pk(&upstream.uri()));
+        snap.models.insert(anthropic_model_entry("my-claude"));
+        snap.apikeys
+            .insert(apikey_entry("sk-caller", &["my-claude"]));
+        let req = cancellable_request(
+            "/v1/messages",
+            serde_json::json!({
+                "model": "my-claude",
+                "max_tokens": 64,
+                "messages": [{"role": "user", "content": "hi"}]
+            }),
+        );
+
+        let event = cancelled_during_the_output_scan(snap, req, &upstream).await;
+        assert_eq!(billed(&event), (31, 17, 0, 0, 4, 6), "{event:?}");
+        assert_eq!(event.model_id, "model-anthropic-1");
+        assert_eq!(event.provider_request_id, "msg_won");
+    }
+
+    /// `/v1/messages` translated onto a Chat Completions upstream: the row
+    /// keeps the upstream's own OpenAI shape, the cache hit inside the
+    /// prompt, exactly as the success row would.
+    #[tokio::test]
+    async fn a_translated_messages_answer_abandoned_during_its_scan_is_billed() {
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "cmpl-won",
+                "model": "gpt-4o",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "answered"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": 31,
+                    "completion_tokens": 17,
+                    "total_tokens": 48,
+                    "prompt_tokens_details": {"cached_tokens": 8}
+                }
+            })))
+            .mount(&upstream)
+            .await;
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
+        let req = cancellable_request(
+            "/v1/messages",
+            serde_json::json!({
+                "model": "my-gpt4",
+                "max_tokens": 64,
+                "messages": [{"role": "user", "content": "hi"}]
+            }),
+        );
+
+        let event = cancelled_during_the_output_scan(snap, req, &upstream).await;
+        assert_eq!(billed(&event), (31, 17, 48, 8, 0, 0), "{event:?}");
+        assert_eq!(event.model_id, "model-id-1");
+    }
+
+    /// `/v1/responses` relayed to a Responses upstream, its scan inside the
+    /// attempt like the Messages relay's.
+    #[tokio::test]
+    async fn a_native_responses_answer_abandoned_during_its_scan_is_billed() {
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(wiremock::matchers::path_regex("responses$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "resp_won",
+                "object": "response",
+                "status": "completed",
+                "model": "gpt-4o",
+                "service_tier": "priority",
+                "output": [{
+                    "type": "message",
+                    "id": "msg_1",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [{"type": "output_text", "text": "answered", "annotations": []}]
+                }],
+                "usage": {
+                    "input_tokens": 31,
+                    "output_tokens": 17,
+                    "total_tokens": 48,
+                    "input_tokens_details": {"cached_tokens": 8}
+                }
+            })))
+            .mount(&upstream)
+            .await;
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
+        let req = cancellable_request(
+            "/v1/responses",
+            serde_json::json!({"model": "my-gpt4", "input": "hi"}),
+        );
+
+        let event = cancelled_during_the_output_scan(snap, req, &upstream).await;
+        assert_eq!(billed(&event), (31, 17, 48, 8, 0, 0), "{event:?}");
+        assert_eq!(event.service_tier.as_deref(), Some("priority"));
+        assert_eq!(event.provider_request_id, "resp_won");
+    }
+
+    /// `/v1/responses` translated onto a native Anthropic upstream: the row
+    /// keeps Anthropic's shape.
+    #[tokio::test]
+    async fn a_translated_responses_answer_abandoned_during_its_scan_is_billed() {
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "msg_won",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude-3-5-haiku-20241022",
+                "content": [{"type": "text", "text": "answered"}],
+                "stop_reason": "end_turn",
+                "usage": {
+                    "input_tokens": 31,
+                    "output_tokens": 17,
+                    "cache_read_input_tokens": 4,
+                    "cache_creation_input_tokens": 6
+                }
+            })))
+            .mount(&upstream)
+            .await;
+        let snap = AisixSnapshot::new();
+        snap.provider_keys
+            .insert(matrix_anthropic_pk(&upstream.uri()));
+        snap.models.insert(anthropic_model_entry("my-claude"));
+        snap.apikeys
+            .insert(apikey_entry("sk-caller", &["my-claude"]));
+        let req = cancellable_request(
+            "/v1/responses",
+            serde_json::json!({"model": "my-claude", "input": "hi"}),
+        );
+
+        let event = cancelled_during_the_output_scan(snap, req, &upstream).await;
+        assert_eq!(billed(&event), (31, 17, 0, 0, 4, 6), "{event:?}");
+    }
+
+    /// The single-shot family scans after its winner settled, like chat.
+    /// Legacy completions stands for the family's output scan.
+    #[tokio::test]
+    async fn a_completions_answer_abandoned_during_its_scan_is_billed() {
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(wiremock::matchers::path_regex("completions$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "cmpl-won",
+                "object": "text_completion",
+                "model": "gpt-4o",
+                "choices": [{"index": 0, "text": "answered", "finish_reason": "stop"}],
+                "usage": {
+                    "prompt_tokens": 31,
+                    "completion_tokens": 17,
+                    "total_tokens": 48,
+                    "prompt_tokens_details": {"cached_tokens": 8}
+                }
+            })))
+            .mount(&upstream)
+            .await;
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
+        let req = cancellable_request(
+            "/v1/completions",
+            serde_json::json!({"model": "my-gpt4", "prompt": "hi"}),
+        );
+
+        let event = cancelled_during_the_output_scan(snap, req, &upstream).await;
+        assert_eq!(billed(&event), (31, 17, 48, 8, 0, 0), "{event:?}");
+        assert_eq!(event.provider_request_id, "cmpl-won");
+    }
+
+    /// An image answer, whose revised prompt the output chain reads, on the
+    /// same family: its row bills the image tokens and their split.
+    #[tokio::test]
+    async fn an_image_answer_abandoned_during_its_scan_is_billed() {
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(wiremock::matchers::path_regex("images/generations$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "created": 0,
+                "data": [{"b64_json": "aGk=", "revised_prompt": "a cat on a mat"}],
+                "usage": {
+                    "input_tokens": 31,
+                    "output_tokens": 17,
+                    "total_tokens": 48,
+                    "input_tokens_details": {"text_tokens": 21, "image_tokens": 10}
+                }
+            })))
+            .mount(&upstream)
+            .await;
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
+        let req = cancellable_request(
+            "/v1/images/generations",
+            serde_json::json!({"model": "my-gpt4", "prompt": "a cat"}),
+        );
+
+        let event = cancelled_during_the_output_scan(snap, req, &upstream).await;
+        assert_eq!(billed(&event), (31, 17, 48, 0, 0, 0), "{event:?}");
+        assert_eq!(
+            event.modality_tokens.prompt_image_tokens,
+            Some(10),
+            "{event:?}"
+        );
+    }
+
+    /// A transcript, whose text the output chain reads: its row bills the
+    /// tokens and the duration the upstream priced it on.
+    #[tokio::test]
+    async fn a_transcript_abandoned_during_its_scan_is_billed() {
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(wiremock::matchers::path_regex("audio/transcriptions$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "text": "hello world",
+                "duration": 11.5,
+                "usage": {
+                    "type": "tokens",
+                    "input_tokens": 31,
+                    "output_tokens": 17,
+                    "total_tokens": 48
+                }
+            })))
+            .mount(&upstream)
+            .await;
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
+        let mut body: Vec<u8> = Vec::new();
+        body.extend_from_slice(
+            b"--b\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nmy-gpt4\r\n",
+        );
+        body.extend_from_slice(
+            b"--b\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.mp3\"\r\n\
+             Content-Type: audio/mpeg\r\n\r\nID3fakeaudio\r\n--b--\r\n",
+        );
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/audio/transcriptions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "multipart/form-data; boundary=b")
+            .body(Body::from(body))
+            .unwrap();
+
+        let event = cancelled_during_the_output_scan(snap, req, &upstream).await;
+        assert_eq!(billed(&event), (31, 17, 48, 0, 0, 0), "{event:?}");
+        assert_eq!(event.audio_duration_seconds, 11.5, "{event:?}");
     }
 
     /// A `499` snapshot for the body phase: the head went out, the caller

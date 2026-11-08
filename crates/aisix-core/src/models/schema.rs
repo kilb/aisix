@@ -5829,6 +5829,33 @@ mod tests {
         assert!(validate_rate_limit_policy(&v).is_err());
     }
 
+    /// `granted_micro_usd` was retired. The write path refuses it as an
+    /// unknown field. The read path loads a stored row that still carries it
+    /// beside a windowed limit, and skips one that carried nothing else: it
+    /// names no limit and no `window`.
+    #[test]
+    fn a_retired_allowance_is_refused_on_write_and_loads_only_beside_a_window() {
+        let windowed = json!({
+            "name": "p",
+            "scope": "api_key",
+            "scope_ref": "k",
+            "window": "day",
+            "max_requests": 1,
+            "granted_micro_usd": 5
+        });
+        assert!(validate_rate_limit_policy(&windowed).is_err());
+        validate_rate_limit_policy_lenient(&windowed)
+            .expect("a stored row with a windowed limit still loads");
+        let only = json!({
+            "name": "p",
+            "scope": "api_key",
+            "scope_ref": "k",
+            "granted_micro_usd": 5
+        });
+        assert!(validate_rate_limit_policy(&only).is_err());
+        assert!(validate_rate_limit_policy_lenient(&only).is_err());
+    }
+
     // ---- rate_limit_policy conditional form (#892) ----
 
     #[test]
