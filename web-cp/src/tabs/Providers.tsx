@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import type { TabProps } from "../App";
 import { ConflictNote } from "../components/ConflictNote";
-import { Field } from "../components/Field";
+import { Field, useRefusalFocus } from "../ui/Field";
 import { Msg, type Note } from "../components/Msg";
 import { RolloutBadge } from "../components/RolloutBadge";
 import { REDACTED, SecretInput } from "../components/SecretInput";
@@ -11,6 +11,10 @@ import { messageFor, problemAt } from "../lib/errors";
 import { errorText, maskUrl } from "../lib/fmt";
 import { describeAt, enumAt, loadSchema } from "../lib/schema";
 import { useResource } from "../lib/useResource";
+import { Button } from "../ui/Button";
+import { DataTable, Loading } from "../ui/DataTable";
+import { EmptyState } from "../ui/EmptyState";
+import { GroupList } from "../ui/GroupName";
 
 /** The fields of a `provider_key` this page edits; every other field is kept as stored. */
 interface ProviderKeyDoc {
@@ -175,15 +179,15 @@ export function Providers({ canEdit }: TabProps) {
       <div className="panel">
         <h2>
           上游账号
-          <button type="button" className="ghost" style={{ marginLeft: "auto" }} onClick={() => void pk.reload()}>
+          <Button size="sm" type="button" icon="refresh" onClick={() => void pk.reload()}>
             刷新
-          </button>
+          </Button>
         </h2>
         <p className="hint">网关调用上游供应商所用的账号。密钥保存后不再显示。{GROUPS_HINT}。</p>
         {canEdit && !open && (
-          <button className="act" disabled={opening} onClick={() => void openNew()}>
+          <Button kind="primary" disabled={opening} onClick={() => void openNew()}>
             新增上游账号
-          </button>
+          </Button>
         )}
         <Msg note={note} />
         {deleteFailure &&
@@ -217,75 +221,73 @@ export function Providers({ canEdit }: TabProps) {
           </div>
         )}
         {pk.items === null ? (
-          !pk.error && <p className="hint">载入中…</p>
+          !pk.error && <Loading />
         ) : pk.items.length === 0 ? (
-          <p className="hint">还没有上游账号。</p>
+          <EmptyState text="还没有上游账号。" />
         ) : (
-          <div className="scroll">
-            <table>
-              <thead>
-                <tr>
-                  <th>名称</th>
-                  <th>协议族</th>
-                  <th>供应商标识</th>
-                  <th>接口地址</th>
-                  <th>分组</th>
-                  <th>状态</th>
-                  <th className="right">操作</th>
-                </tr>
-              </thead>
-              <tbody>
-                {pk.items.map((a) => (
-                  <tr key={a.id}>
-                    <td>{nameOf(a)}</td>
-                    <td>{a.doc.adapter ?? "—"}</td>
-                    <td>{a.doc.provider || "—"}</td>
-                    <td>{a.doc.api_base ? <code>{maskUrl(a.doc.api_base)}</code> : "—"}</td>
-                    <td>{a.doc.groups?.length ? a.doc.groups.join("、") : "—"}</td>
-                    <td>
-                      <RolloutBadge rollout={a.rollout} />
-                    </td>
-                    <td className="right">
-                      {deleting === a.id ? (
-                        <>
-                          <button className="ghost" disabled={busy} onClick={() => void remove(a)}>
-                            确认删除
-                          </button>
-                          <button className="ghost" disabled={busy} onClick={() => setDeleting(null)}>
-                            取消
-                          </button>
-                        </>
-                      ) : (
-                        <>
-                          <button
-                            className="ghost"
+          <DataTable>
+            <thead>
+              <tr>
+                <th>名称</th>
+                <th>协议族</th>
+                <th>供应商标识</th>
+                <th>接口地址</th>
+                <th>分组</th>
+                <th>状态</th>
+                <th className="right">操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              {pk.items.map((a) => (
+                <tr key={a.id}>
+                  <td>{nameOf(a)}</td>
+                  <td>{a.doc.adapter ?? "—"}</td>
+                  <td>{a.doc.provider || "—"}</td>
+                  <td>{a.doc.api_base ? <code>{maskUrl(a.doc.api_base)}</code> : "—"}</td>
+                  <td>{a.doc.groups?.length ? <GroupList groups={a.doc.groups} /> : "—"}</td>
+                  <td>
+                    <RolloutBadge rollout={a.rollout} />
+                  </td>
+                  <td className="right">
+                    {deleting === a.id ? (
+                      <>
+                        <Button kind="danger" size="sm" busy={busy} busyLabel="确认删除" onClick={() => void remove(a)}>
+                          确认删除
+                        </Button>
+                        <Button size="sm" disabled={busy} onClick={() => setDeleting(null)}>
+                          取消
+                        </Button>
+                      </>
+                    ) : (
+                      <>
+                        <Button
+                          size="sm"
+                          onClick={() => {
+                            setNote(null);
+                            setOpen({ mode: "edit", id: a.id });
+                          }}
+                        >
+                          {canEdit ? "编辑" : "查看"}
+                        </Button>
+                        {canEdit && (
+                          <Button
+                            size="sm"
+                            disabled={busy}
                             onClick={() => {
-                              setNote(null);
-                              setOpen({ mode: "edit", id: a.id });
+                              setDeleteFailure(null);
+                              setDeleting(a.id);
                             }}
                           >
-                            {canEdit ? "编辑" : "查看"}
-                          </button>
-                          {canEdit && (
-                            <button
-                              className="ghost"
-                              disabled={busy}
-                              onClick={() => {
-                                setDeleteFailure(null);
-                                setDeleting(a.id);
-                              }}
-                            >
-                              删除
-                            </button>
-                          )}
-                        </>
-                      )}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+                            删除
+                          </Button>
+                        )}
+                      </>
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </DataTable>
         )}
       </div>
     </>
@@ -405,6 +407,7 @@ function AccountForm({
   const [removal, setRemoval] = useState<{ dropped: string[]; impact: Impact | string | null } | null>(null);
   // Numbers each impact lookup; a result is applied only while its number is the latest.
   const lookup = useRef(0);
+  const [form, focusRefusal] = useRefusalFocus<HTMLFormElement>();
 
   // A new account takes the first protocol family once the schema arrives.
   useEffect(() => {
@@ -468,6 +471,7 @@ function AccountForm({
       setRemoval(null);
       if (e instanceof ApiError && e.code === "version_mismatch") setConflict(true);
       else setErr(e instanceof ApiError ? e : String(e));
+      focusRefusal();
     } finally {
       setBusy(false);
     }
@@ -501,10 +505,10 @@ function AccountForm({
   }
 
   return (
-    <form className="panel" aria-label={title} onSubmit={submit}>
+    <form ref={form} className="panel" aria-label={title} onSubmit={submit}>
       <h2>{title}</h2>
       <div className="r">
-        <Field label="名称" problem={at("name")}>
+        <Field label="名称" error={at("name")}>
           {(aria) => <input required disabled={locked} value={name} onChange={(e) => setName(e.target.value)} {...aria} />}
         </Field>
         {schema && "error" in schema ? (
@@ -515,7 +519,7 @@ function AccountForm({
             </div>
           </div>
         ) : (
-          <Field label="协议族" problem={at("adapter")}>
+          <Field label="协议族" error={at("adapter")}>
             {(aria) => (
               <select
                 disabled={locked || adapters === null}
@@ -533,11 +537,11 @@ function AccountForm({
           </Field>
         )}
       </div>
-      <Field label="供应商标识" problem={at("provider")}>
+      <Field label="供应商标识" error={at("provider")}>
         {(aria) => <input disabled={locked} value={provider} onChange={(e) => setProvider(e.target.value)} {...aria} />}
       </Field>
       {schema && "providerHint" in schema && schema.providerHint && <p className="hint">{schema.providerHint}</p>}
-      <Field label="接口地址" problem={at("apiBase")}>
+      <Field label="接口地址" error={at("apiBase")}>
         {(aria) => (
           <input
             disabled={locked}
@@ -610,28 +614,35 @@ function AccountForm({
             </>
           )}
           <p>
-            <button className="act" type="button" disabled={busy || removal.impact === null} onClick={() => void write()}>
+            <Button
+              kind="danger"
+              type="button"
+              disabled={busy || removal.impact === null}
+              busy={busy}
+              busyLabel="确认移除分组"
+              onClick={() => void write()}
+            >
               确认移除分组
-            </button>{" "}
-            <button className="ghost" type="button" disabled={busy} onClick={() => setRemoval(null)}>
+            </Button>{" "}
+            <Button type="button" disabled={busy} onClick={() => setRemoval(null)}>
               取消
-            </button>
+            </Button>
           </p>
         </section>
       ) : readOnly ? (
         <p>
-          <button className="ghost" type="button" onClick={onClose}>
+          <Button type="button" onClick={onClose}>
             关闭
-          </button>
+          </Button>
         </p>
       ) : (
         <p>
-          <button className="act" type="submit" disabled={busy}>
-            {busy ? "保存中…" : "保存"}
-          </button>{" "}
-          <button className="ghost" type="button" disabled={busy} onClick={onClose}>
+          <Button kind="primary" type="submit" busy={busy} busyLabel="保存中…">
+            保存
+          </Button>{" "}
+          <Button type="button" disabled={busy} onClick={onClose}>
             取消
-          </button>
+          </Button>
         </p>
       )}
     </form>

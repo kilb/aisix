@@ -1,39 +1,183 @@
-/* The Tenants tab. Kept beside its page so the shared stylesheet stays as
-   Task 1 left it. */
+/* The Tenants and Keys tabs: a tenant's page and its parts. Kept beside the
+   page; every value comes from the tokens. */
 
-.tn-name{
-  background:none;border:0;padding:0;cursor:pointer;font:inherit;
-  color:var(--indigo);text-align:left;
+.tn-name {
+  max-width: 220px;
 }
-.tn-name:hover{text-decoration:underline}
-.tn-mark{margin-left:8px}
-.tn-actions{display:flex;gap:6px;flex-wrap:wrap}
-/* A confirmation's warning takes a line of its own above the buttons. */
-.tn-actions > .note{flex-basis:100%;margin:0}
-
-/* A part of the tenant's page: a heading over what it holds. */
-.tn-section{border:0;padding:0;margin:22px 0 0;min-width:0}
-.tn-section > legend,.tn-section > h3{
-  padding:0;margin:0 0 2px;font-size:14px;font-weight:600;color:var(--ink);
+/* The tenant whose detail is open: Concrete, with a Sign-yellow edge. */
+.dt tr:has(.tn-name[aria-expanded="true"]) {
+  background: var(--row-hover);
+}
+.dt tr:has(.tn-name[aria-expanded="true"]) > td:first-child {
+  box-shadow: inset 4px 0 0 var(--sign);
+}
+.tn-mark {
+  margin-left: var(--s-2);
+}
+/* Lined up at the top: an open two-step's warning hangs under the row's
+   buttons instead of pushing the others down to its middle. */
+.tn-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: var(--s-2);
+}
+td > .tn-actions {
+  flex-wrap: nowrap;
+}
+/* A note among the actions takes a line of its own above the buttons. */
+.tn-actions > .note {
+  flex-basis: 100%;
+  margin: 0;
+  white-space: normal;
 }
 
-.tn-checks{list-style:none;margin:6px 0 12px;padding:0;display:grid;gap:6px}
-.tn-checks label{display:inline-flex;align-items:center;gap:8px;cursor:pointer}
-.tn-note{margin-left:10px;font-size:12px;color:var(--ink-3)}
-.tn-error{display:block;margin-top:3px;font-size:12px;color:var(--oxide)}
+/* The facts under a tenant's name. */
+.tn-facts {
+  margin: var(--s-4) 0 0;
+  padding: var(--s-3) 0;
+  border-top: 1px solid var(--divider);
+  border-bottom: 1px solid var(--divider);
+  color: var(--text-2);
+}
+
+/* A part of the tenant's page: a heading over what it holds, 24px apart. */
+.tn-section {
+  min-width: 0;
+  margin: var(--s-6) 0 0;
+  padding: 0;
+  border: 0;
+}
+.tn-section > legend,
+.tn-section > h3 {
+  float: left;
+  width: 100%;
+  margin: 0 0 var(--s-2);
+  padding: 0;
+  color: var(--text);
+  font-size: var(--fs-19);
+  font-weight: 700;
+  line-height: var(--lh-heading);
+}
+.tn-section > legend + *,
+.tn-section > h3 + * {
+  clear: both;
+}
+.tn-section > .hint {
+  margin-bottom: var(--s-3);
+}
+/* The members list is unrelated to the access parts above it: a hairline. */
+.tn-section.tn-sep {
+  padding-top: var(--s-6);
+  border-top: 1px solid var(--divider);
+}
+.tn-section .tn-section > legend {
+  font-size: var(--fs-15);
+}
+.tn-section > .btn,
+.tn-section > .two-step,
+.tn-section > .tn-actions {
+  margin-top: var(--s-2);
+}
+
+.tn-checks {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: var(--s-2) var(--s-4);
+  margin: var(--s-3) 0 var(--s-4);
+  padding: 0;
+  list-style: none;
+}
+.tn-checks label {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--s-2);
+  line-height: var(--lh-table);
+  cursor: pointer;
+}
+.tn-checks .tn-note,
+.tn-checks .tn-error {
+  display: block;
+  margin: 2px 0 0 var(--s-6);
+}
+/* A list of groups: each with the accounts in it on a line under it. */
+.tn-checks.tn-groups {
+  grid-template-columns: minmax(0, 1fr);
+}
+.tn-note {
+  margin-left: var(--s-2);
+  color: var(--text-muted);
+  font-size: var(--fs-13);
+  line-height: var(--lh-table);
+}
+td .tn-note {
+  display: block;
+  margin: 2px 0 0;
+}
+.tn-error {
+  display: block;
+  margin-top: var(--s-1);
+  color: var(--error);
+  font-size: var(--fs-13);
+  font-weight: 600;
+  line-height: var(--lh-table);
+  white-space: normal;
+}
 /* Something about a key an operator should look at, on a line of its own. */
-.tn-flag{display:block;margin:3px 0 0;color:var(--oxide)}
+.tn-flag {
+  display: block;
+  color: var(--error);
+}
+td .tn-flag {
+  margin: 2px 0 0;
+}
 
-.tn-limits{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));column-gap:16px}
+.tn-limits {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: 0 var(--s-4);
+  margin: var(--s-3) 0 0;
+}
+.tn-limits > div > .f {
+  margin-bottom: var(--s-4);
+}
+.tn-limits .tn-error {
+  margin: calc(-1 * var(--s-2)) 0 var(--s-4);
+}
 
 /* A one-time secret: selectable as a whole, wrapped rather than cut off. */
-.tn-token{
-  display:block;margin:8px 0;font-family:var(--mono);font-size:12.5px;
-  word-break:break-all;user-select:all;color:var(--ink);
+.tn-token {
+  display: block;
+  margin: var(--s-3) 0;
+  padding: var(--s-2) var(--s-3);
+  border: 1px solid var(--border);
+  border-radius: var(--r-input);
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: var(--fs-13);
+  word-break: break-all;
+  user-select: all;
 }
 
-.tn-override{
-  border:1px solid var(--rule);border-radius:calc(var(--r) - 2px);
-  padding:10px 14px;margin:4px 0;min-width:0;
+.tn-override {
+  min-width: 0;
+  margin: 0;
+  padding: var(--s-4);
+  border: 1px solid var(--divider);
+  border-radius: var(--r-button);
+  background: var(--surface);
+  white-space: normal;
 }
-.tn-override > legend{padding:0 4px;font-size:12.5px;font-weight:600}
+.tn-override > legend {
+  padding: 0 var(--s-1);
+  font-weight: 700;
+}
+.tn-override > .hint {
+  margin-bottom: var(--s-2);
+}
+
+/* The invite form's row: the address and role, then the action. */
+.tn-section .r > .btn {
+  flex: none;
+}

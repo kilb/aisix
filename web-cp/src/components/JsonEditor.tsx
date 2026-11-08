@@ -1,5 +1,6 @@
 import { useId, useState } from "react";
 import type { Detail } from "../lib/api";
+import { Button } from "../ui/Button";
 
 /**
  * A JSON document in a monospace textarea, with a `格式化` control and,
@@ -44,9 +45,9 @@ export function JsonEditor({
       />
       {onChange && (
         <div className="r">
-          <button type="button" className="ghost" onClick={format}>
+          <Button type="button" onClick={format}>
             格式化
-          </button>
+          </Button>
         </div>
       )}
       {formatError && <div className="note crit">{formatError}</div>}

@@ -9,5 +9,5 @@ export interface Note {
 /** A result notice inside a panel. Takes no space when empty. */
 export function Msg({ note }: { note: Note | null }) {
   if (!note) return null;
-  return <div className={`note ${note.kind === "ok" ? "" : note.kind}`}>{note.text}</div>;
+  return <div className={`note ${note.kind}`}>{note.text}</div>;
 }
