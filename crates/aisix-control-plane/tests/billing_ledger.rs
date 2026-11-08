@@ -638,3 +638,16 @@ async fn only_the_billing_lock_holds_the_account() {
         .await
         .expect("the account is free");
 }
+
+#[tokio::test]
+async fn a_billing_lock_opens_a_missing_account_under_its_own_tenant_lock() {
+    let Some(w) = world().await else { return };
+    delete_account(&w.cp, w.tenant).await;
+    let mut tx = w.cp.db().pool().begin().await.expect("begin");
+    let (_, account) = tenants::lock_billing(&mut tx, w.tenant)
+        .await
+        .expect("its own tenant lock does not refuse the account insert");
+    assert_eq!(account.balance_micro_usd, 0);
+    tx.commit().await.expect("commit");
+    assert_eq!(balance(&w.cp, w.tenant).await, Some(0));
+}

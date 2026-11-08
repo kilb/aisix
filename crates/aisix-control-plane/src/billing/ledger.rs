@@ -135,7 +135,10 @@ const ACCOUNT_COLUMNS: &str = "tenant_id, balance_micro_usd, credit_limit_micro_
 /// the batch is answered `503` and sent again. A caller holding the row
 /// itself (`tenants::lock_billing`) is not refused by its own lock. The
 /// insert is logged, since it means a tenant was created without its
-/// account (by an older control plane during an upgrade, or by hand).
+/// account (by an older control plane during an upgrade, or by hand). The
+/// account of a customer tenant past pending is opened flagged, as
+/// [`backfill_accounts`] opens it, so that its first balance mark is
+/// written.
 pub async fn lock_account(conn: &mut PgConnection, tenant_id: Uuid) -> Result<Account, DbError> {
     let select =
         format!("SELECT {ACCOUNT_COLUMNS} FROM billing_accounts WHERE tenant_id = $1 FOR UPDATE");
@@ -146,18 +149,22 @@ pub async fn lock_account(conn: &mut PgConnection, tenant_id: Uuid) -> Result<Ac
     {
         return Ok(account);
     }
-    tracing::warn!(
-        tenant = %tenant_id,
-        "a tenant had no billing account; it is opened now"
-    );
     sqlx::query("SELECT 1 FROM tenants WHERE id = $1 FOR KEY SHARE NOWAIT")
         .bind(tenant_id)
         .execute(&mut *conn)
         .await?;
-    sqlx::query("INSERT INTO billing_accounts (tenant_id) VALUES ($1) ON CONFLICT DO NOTHING")
-        .bind(tenant_id)
-        .execute(&mut *conn)
-        .await?;
+    sqlx::query(
+        "INSERT INTO billing_accounts (tenant_id, marks_dirty) \
+         SELECT id, NOT is_internal AND status <> 'pending' FROM tenants WHERE id = $1 \
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(tenant_id)
+    .execute(&mut *conn)
+    .await?;
+    tracing::warn!(
+        tenant = %tenant_id,
+        "a tenant had no billing account; it was opened"
+    );
     Ok(sqlx::query_as(&select)
         .bind(tenant_id)
         .fetch_one(conn)
@@ -183,11 +190,13 @@ pub async fn lock_accounts(
 /// Opens an account for every tenant that has none, and returns how many it
 /// opened. Each tenant row is key-shared before its account is inserted, in
 /// ascending id, as the lock order has it; one another transaction holds is
-/// skipped rather than waited for, and opened by a later run.
+/// skipped rather than waited for, and opened by a later run. The account of
+/// a customer tenant past pending is opened flagged, as migration 0014
+/// opened the first ones, so that the settler writes its first balance mark.
 pub async fn backfill_accounts(conn: &mut PgConnection) -> Result<u64, DbError> {
     Ok(sqlx::query(
-        "INSERT INTO billing_accounts (tenant_id) \
-         SELECT t.id FROM tenants t \
+        "INSERT INTO billing_accounts (tenant_id, marks_dirty) \
+         SELECT t.id, NOT t.is_internal AND t.status <> 'pending' FROM tenants t \
          WHERE NOT EXISTS (SELECT 1 FROM billing_accounts a WHERE a.tenant_id = t.id) \
          ORDER BY t.id FOR KEY SHARE OF t SKIP LOCKED \
          ON CONFLICT DO NOTHING",

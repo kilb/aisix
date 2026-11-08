@@ -42,7 +42,8 @@ use serde_json::Value;
 use sqlx::PgConnection;
 use uuid::Uuid;
 
-use crate::billing::ledger::{self, Posting, Source};
+use crate::billing::ledger::{self, Account, LedgerEntry, Posting, Source};
+use crate::billing::marks;
 use crate::db::DbError;
 use store::{record_charge, ChargeError, ChargeIdentity, PriceBookCache, Recorded};
 
@@ -74,7 +75,10 @@ pub struct Priced {
 /// does a row that is not charged. The accounts of every tenant the rows'
 /// keys belong to are locked first, in ascending tenant id, so that two
 /// batches naming the same tenants cannot deadlock; no tenant row is locked,
-/// so a tenant an operator is editing does not hold up intake.
+/// so a tenant an operator is editing does not hold up intake. An account
+/// whose balance the batch moves across its tenant's floor is flagged for
+/// the settler (`marks::flag_crossings`); no gateway document is written
+/// here, so intake never waits on the resources lock.
 pub async fn price_stored(
     conn: &mut PgConnection,
     prices: &PriceBookCache,
@@ -89,7 +93,7 @@ pub async fn price_stored(
     let book = prices.current(&mut *conn).await?;
     let keys = key_records(&mut *conn, &stored).await?;
     let mut tenants: Vec<Uuid> = keys.values().map(|k| k.tenant_id).collect();
-    ledger::lock_accounts(&mut *conn, &mut tenants).await?;
+    let accounts = ledger::lock_accounts(&mut *conn, &mut tenants).await?;
     // A fixed order, by event_id compared as bytes, for the charge inserts
     // and the ledger entries.
     stored.sort_by(|a, b| a.event_id.cmp(&b.event_id));
@@ -171,9 +175,28 @@ pub async fn price_stored(
         }
     }
     if !debits.is_empty() {
-        ledger::post(&mut *conn, &debits).await?;
+        let entries = ledger::post(&mut *conn, &debits).await?;
+        marks::flag_crossings(&mut *conn, &balances_after(accounts, &entries)).await?;
     }
     Ok(priced)
+}
+
+/// The accounts `entries` posted to, each with the balance its tenant's last
+/// entry left. `entries` are in posting order.
+fn balances_after(accounts: Vec<Account>, entries: &[LedgerEntry]) -> Vec<Account> {
+    let mut last: HashMap<Uuid, i64> = HashMap::new();
+    for entry in entries {
+        last.insert(entry.tenant_id, entry.balance_after_micro_usd);
+    }
+    accounts
+        .into_iter()
+        .filter_map(|account| {
+            last.get(&account.tenant_id).map(|&balance| Account {
+                balance_micro_usd: balance,
+                ..account
+            })
+        })
+        .collect()
 }
 
 /// The text field `name` of `event`, `""` when it has none.

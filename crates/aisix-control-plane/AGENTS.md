@@ -42,7 +42,7 @@ way.
   `every_*_document_loads_on_the_lenient_schema` tests). A new builder adds
   one.
 
-## Lock order: tenant rows, then `RESOURCES_LOCK_KEY`
+## Lock order: tenant rows, then billing accounts, then `RESOURCES_LOCK_KEY`
 
 - **A transaction that touches a tenant and a gateway document takes the tenant
   first**: `tenants::lock`, or `tenants::lock_many` (ascending id) for several,
@@ -55,6 +55,21 @@ way.
   (`tests/tenants.rs`) sends each path that writes a tenant's documents while
   the tenant is held elsewhere and fails if it already holds the resources
   lock; a new such path adds a case there.
+- **A path that moves money or decides a mark takes the tenant's billing
+  account right after its row**: `tenants::lock_billing`, as the first lock of
+  its transaction. That is every ledger posting, credit-limit or quota change,
+  and every `tenants::project`, whose billing step writes the balance mark
+  (`marks::project`). An account is never taken after the resources lock, so
+  a path that locks its tenant twice moves only the first lock to
+  `lock_billing`. Every other tenant edit keeps `tenants::lock`, which leaves
+  the account to usage intake. Intake locks accounts only, in ascending tenant
+  id, never waits on a tenant row and never takes the resources lock: it flags
+  a crossing, and the settler (`billing::settler`) writes the mark after
+  commit. The settler takes each tenant row `NOWAIT` and the resources lock
+  only when it is free, so it never holds an account while waiting for it.
+  `every_marking_path_takes_the_account_before_the_resources_lock`
+  (`tests/billing_marks.rs`) sends each such path while the account is held
+  elsewhere; a new one adds a case there.
 - **Advisory lock keys must be unique.** They are the `*_LOCK_KEY` constants,
   all `0x6169_7369_7863_70xx`: operators `7030`, projector `7031`, resources
   `7032`, boot `7033`, signup `7073`. Postgres has one key space per database.
