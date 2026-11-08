@@ -333,6 +333,13 @@ pub async fn delete(
                 if kind == Kind::Models {
                     tenants::on_model_deleted(conn, &ctx, id).await?;
                 }
+                // An account some channel model names is refused in the
+                // operator's terms, before the generic reference check: a
+                // channel row whose direct document is already gone would
+                // otherwise leave nothing to hold the delete.
+                if kind == Kind::ProviderKeys {
+                    crate::channels::refuse_if_served(conn, id).await?;
+                }
                 let write = ResourceWrite {
                     kind,
                     id,

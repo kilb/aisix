@@ -317,3 +317,13 @@ pub async fn insert_unpriced_charges(
     .expect("insert their charges");
     tx.commit().await.expect("commit");
 }
+
+/// A public model named `name`, created as `admin`; its id.
+///
+/// A public model on its own writes no document: tick it on an upstream
+/// account through `PUT /admin/provider-keys/{key}/channel-models/{id}` for
+/// the routing document to exist.
+pub async fn public_model(cp: &TestCp, admin: &OperatorSession, name: &str) -> Uuid {
+    let body = create(cp, admin, "/admin/public-models", json!({"name": name})).await;
+    Uuid::parse_str(&text(&body, "/id")).expect("a public model id")
+}

@@ -103,7 +103,7 @@ export class ApiClient {
     return this.ok("POST", path, body);
   }
 
-  put(path: string, body: unknown, version: number): Promise<Json> {
+  put(path: string, body: unknown, version?: number): Promise<Json> {
     return this.ok("PUT", path, body, version);
   }
 

@@ -168,3 +168,10 @@ export async function billingWorld(opts: BillingWorldOptions = {}): Promise<Bill
     throw err;
   }
 }
+
+/** Ticks public model `publicModelId` on upstream account `providerKeyId`, which writes its documents. */
+export async function createChannelModel(cp: ControlPlaneStack, providerKeyId: string, publicModelId: string, body: Record<string, unknown> = {}): Promise<Json> {
+  const res = await cp.admin.put(`/admin/provider-keys/${providerKeyId}/channel-models/${publicModelId}`, body);
+  check(`ticking a public model on an account`, res, 200);
+  return res.body;
+}

@@ -300,3 +300,8 @@ export async function waitClearOfUtcMidnight(marginMs = 120_000): Promise<void> 
   if (sinceMidnight < marginMs) await sleep(marginMs - sinceMidnight);
   else if (DAY - sinceMidnight < marginMs) await sleep(DAY - sinceMidnight + marginMs);
 }
+
+/** Ticks public model `publicModelId` on upstream account `providerKeyId`, which writes its documents. */
+export async function createChannelModel(stack: Stack, providerKeyId: string, publicModelId: string, body: Record<string, unknown> = {}): Promise<Json> {
+  return stack.admin.put(`/admin/provider-keys/${providerKeyId}/channel-models/${publicModelId}`, body);
+}
