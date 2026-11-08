@@ -251,6 +251,8 @@ fn fixture(method: &str, path: &str, target: &SeededOperator) -> (String, Option
             format!("/admin/billing/repricing/{}/apply", Uuid::nil()),
             Some(json!({})),
         ),
+        // Reconciliation reads and changes nothing.
+        ("GET", "/admin/billing/reconciliation") => (path.to_string(), None),
         _ => panic!("no fixture for {method} {path}: add one to tests/roles.rs"),
     }
 }

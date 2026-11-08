@@ -158,6 +158,21 @@ pub async fn pricing_version(conn: &mut PgConnection) -> Result<Option<i64>, DbE
     .flatten())
 }
 
+/// The charges stored unpriced in the last 24 hours (by when they were
+/// priced), counted under each reason: the control plane's own
+/// (`unknown_api_key`, `tenant_mismatch`, `undecodable_usage`) as well as
+/// the engine's, and `unknown` for a charge with none. Ordered by reason.
+/// `/admin/pricing/status` and the reconciliation both report this.
+pub async fn unpriced_by_code(conn: &mut PgConnection) -> Result<Vec<(String, i64)>, DbError> {
+    Ok(sqlx::query_as(
+        "SELECT COALESCE(error_code, 'unknown'), count(*)::bigint FROM pricing_charges \
+         WHERE status = 'unpriced' AND priced_at >= now() - interval '24 hours' \
+         GROUP BY 1 ORDER BY 1",
+    )
+    .fetch_all(conn)
+    .await?)
+}
+
 /// The table an invalid revision is in, as the alert names it.
 fn table_name(table: RevisionTable) -> &'static str {
     match table {

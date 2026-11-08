@@ -812,13 +812,7 @@ pub async fn status(
                         })
                     })
                     .collect();
-                let by_code: Vec<(String, i64)> = sqlx::query_as(
-                    "SELECT COALESCE(error_code, 'unknown'), count(*)::bigint FROM pricing_charges \
-                     WHERE status = 'unpriced' AND priced_at >= now() - interval '24 hours' \
-                     GROUP BY 1 ORDER BY 1",
-                )
-                .fetch_all(&mut *conn)
-                .await?;
+                let by_code = store::unpriced_by_code(&mut *conn).await?;
                 Ok::<_, DbError>((version, invalid, by_code))
             }
             .boxed()

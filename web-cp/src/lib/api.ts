@@ -1130,3 +1130,51 @@ export const repricing = {
     return (await call<RepricingRun>("POST", `/admin/billing/repricing/${seg(id)}/apply`, {})).data;
   },
 };
+
+export type ReconcileCheck = "balance" | "usage" | "adjustments" | "topups" | "running_balance";
+
+export interface ReconcileMismatch {
+  tenant_id: string;
+  tenant_name: string;
+  check: ReconcileCheck | string;
+  expected_micro_usd: number;
+  actual_micro_usd: number;
+  /** The ledger entry that breaks the running balance; null for the other checks. */
+  seq: number | null;
+}
+
+export interface InstanceDrops {
+  dp_id: string;
+  credential_name: string;
+  instance_id: string;
+  hostname: string;
+  last_seen_at: string;
+  /** Usage events dropped since the process started, by reason. */
+  drops: Record<string, number>;
+}
+
+export interface Reconciliation {
+  checked_at: string;
+  tenant_id: string | null;
+  mismatches: ReconcileMismatch[];
+  /** The asked-for tenant's count when a tenant is given, otherwise every tenant's. */
+  charged_without_entry: number;
+  /** Every tenant's, whichever tenant is asked for. */
+  unpriced_last_24h: { total: number; by_code: Record<string, number> };
+  /** Every gateway's, whichever tenant is asked for. */
+  usage_loss: {
+    since: string;
+    dropped_total: number;
+    unconfirmed_total: number;
+    instances: InstanceDrops[];
+  };
+}
+
+/** Reconciliation: whether the ledger matches what moved it, and the usage the gateways report dropped. */
+export const reconciliation = {
+  /** `404` when `tenantId` names no tenant; `503` when the check outran its time bound. */
+  async get(tenantId?: string): Promise<Reconciliation> {
+    const query = tenantId ? `?tenant_id=${seg(tenantId)}` : "";
+    return (await call<Reconciliation>("GET", `/admin/billing/reconciliation${query}`)).data;
+  },
+};

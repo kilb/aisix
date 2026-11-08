@@ -29,6 +29,7 @@ pub mod marks;
 pub mod money;
 pub mod plans;
 pub mod range;
+pub mod reconcile;
 pub mod repricing;
 pub mod settler;
 pub mod statements;

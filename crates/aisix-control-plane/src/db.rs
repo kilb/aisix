@@ -5,7 +5,10 @@
 //! placeholders are `$n`; integers decoded as `i64` are `bigint`, flags
 //! `boolean`, times `timestamptz`; every SUM aggregate is cast `::bigint`,
 //! because Postgres sums a `bigint` column into `numeric`, which does not
-//! decode as `i64` (enforced over `src/` by [`uncast_sums`]); every
+//! decode as `i64`, or, where the total can pass the `bigint` range, cast
+//! `::numeric` explicitly and narrowed before it is decoded (the cast is
+//! enforced over `src/` by [`uncast_sums`]; the narrowing is the query's);
+//! every
 //! `ON CONFLICT … DO UPDATE` reads the proposed row through `EXCLUDED.` and
 //! qualifies the existing row's columns with the table name; a unique
 //! violation is recognised by SQLSTATE and constraint name, never by message
@@ -222,6 +225,12 @@ impl Db {
 /// after its window clause: `SUM(…) OVER (…)::bigint`) or as the first
 /// argument of a COALESCE that is (`COALESCE(…, 0)::bigint`).
 ///
+/// An explicit `::numeric` counts as a cast too, in the same places: it is
+/// how a total that can pass the `bigint` range (counts the gateways report
+/// as u64) says so. This checks only the cast: narrowing such a total before
+/// it is decoded is up to its query. What it refuses is a SUM left to
+/// Postgres's implicit `numeric`.
+///
 /// It reads any text, Rust source included: a call is the word `sum`, in
 /// any case, followed by `(`. A longer identifier ending in `sum`, a method
 /// call (`.sum()`) and a path (`Agg::Sum(`) are not calls. An unterminated
@@ -249,7 +258,7 @@ pub fn uncast_sums(sql_source: &str) -> Vec<String> {
             found.push(sql_source[start..line_end].to_string());
             continue;
         };
-        if !is_bigint_cast(b, past_window(b, close + 1)) && !in_bigint_coalesce(b, start) {
+        if !is_sum_cast(b, past_window(b, close + 1)) && !in_cast_coalesce(b, start) {
             found.push(sql_source[start..=close].to_string());
         }
     }
@@ -299,19 +308,22 @@ fn past_window(b: &[u8], pos: usize) -> usize {
     window + b[window..].iter().take_while(|&&c| is_ident(c)).count()
 }
 
-/// Whether `::bigint` (spaces allowed, any case) starts at `pos`.
-fn is_bigint_cast(b: &[u8], pos: usize) -> bool {
+/// Whether `::bigint` or `::numeric` (spaces allowed, any case) starts at
+/// `pos`.
+fn is_sum_cast(b: &[u8], pos: usize) -> bool {
     let pos = skip_ws(b, pos);
     if !b[pos..].starts_with(b"::") {
         return false;
     }
     let pos = skip_ws(b, pos + 2);
-    b[pos..].starts_with(b"bigint") && !b.get(pos + 6).is_some_and(|&c| is_ident(c))
+    [&b"bigint"[..], b"numeric"]
+        .iter()
+        .any(|ty| b[pos..].starts_with(ty) && !b.get(pos + ty.len()).is_some_and(|&c| is_ident(c)))
 }
 
 /// Whether the call at `start` is the first argument of a COALESCE whose
-/// result is cast to `bigint`.
-fn in_bigint_coalesce(b: &[u8], start: usize) -> bool {
+/// result is cast to `bigint` or `numeric`.
+fn in_cast_coalesce(b: &[u8], start: usize) -> bool {
     let Some(paren) = b[..start].iter().rposition(|c| !c.is_ascii_whitespace()) else {
         return false;
     };
@@ -327,5 +339,5 @@ fn in_bigint_coalesce(b: &[u8], start: usize) -> bool {
         .rposition(|&c| !is_ident(c))
         .map_or(0, |i| i + 1);
     &b[name_start..name_end] == b"coalesce"
-        && matching_paren(b, paren).is_some_and(|close| is_bigint_cast(b, close + 1))
+        && matching_paren(b, paren).is_some_and(|close| is_sum_cast(b, close + 1))
 }
