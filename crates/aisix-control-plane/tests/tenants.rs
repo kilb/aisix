@@ -1689,6 +1689,19 @@ async fn every_tenant_write_takes_the_tenant_before_the_resources_lock() {
             )),
             200,
         ),
+        // A credit limit settles the balance mark, which writes a document.
+        (
+            "PATCH /admin/tenants/{id}/billing",
+            Box::pin(fire(
+                cp.clone(),
+                "PATCH",
+                format!("/admin/tenants/{tenant}/billing"),
+                op.clone(),
+                None,
+                Some(json!({"credit_limit_usd": "1.00"})),
+            )),
+            200,
+        ),
     ];
     for (what, request, expected) in cases {
         let status = waits_for_the_tenant_first(&cp, tenant, what, request).await;

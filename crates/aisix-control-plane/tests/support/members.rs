@@ -77,6 +77,7 @@ pub fn tenant_fixture(method: &str, path: &str) -> (String, Option<Value>) {
             format!("/api/keys/{}", Uuid::new_v4()),
             (method == "PATCH").then(|| json!({"label": "fixture-key"})),
         ),
+        ("GET", "/api/billing/balance") => (path.to_string(), None),
         _ => panic!("no fixture for {method} {path}: add one to tests/support/members.rs"),
     }
 }

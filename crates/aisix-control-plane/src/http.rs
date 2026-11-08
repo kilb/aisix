@@ -328,6 +328,27 @@ pub const ROUTE_ROLES: &[(&str, &str, MinRole)] = &[
         "/admin/pricing/tenants/{id}",
         MinRole::Op(OperatorRole::Viewer),
     ),
+    // Billing accounts: balances and credit limits.
+    (
+        "GET",
+        "/admin/billing/accounts",
+        MinRole::Op(OperatorRole::Viewer),
+    ),
+    (
+        "GET",
+        "/admin/tenants/{id}/billing",
+        MinRole::Op(OperatorRole::Viewer),
+    ),
+    (
+        "PATCH",
+        "/admin/tenants/{id}/billing",
+        MinRole::Op(OperatorRole::Operator),
+    ),
+    (
+        "GET",
+        "/api/billing/balance",
+        MinRole::Member(&[MemberRole::Owner, MemberRole::Admin, MemberRole::Billing]),
+    ),
     // Gateways, on the gateway listener.
     ("POST", "/dp/heartbeat", MinRole::Dp),
     ("GET", "/dp/v1/keys/{key_id}/prices", MinRole::Dp),
@@ -471,6 +492,12 @@ pub fn browser_router(state: AppState) -> Router {
         .route("/admin/pricing/status", get(pricing::api::status))
         .route("/admin/pricing/models", get(billing::plans::models))
         .route("/admin/pricing/tenants/{id}", get(billing::plans::tenant))
+        .route("/admin/billing/accounts", get(billing::accounts::list))
+        .route(
+            "/admin/tenants/{id}/billing",
+            get(billing::accounts::get).patch(billing::accounts::set_credit_limit),
+        )
+        .route("/api/billing/balance", get(billing::accounts::balance))
         .route_layer(axum::middleware::from_fn(json_only))
         .route_layer(axum::middleware::from_fn(only_listed_routes))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
