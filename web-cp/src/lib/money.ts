@@ -26,7 +26,7 @@ export function isUsdAmount(s: string, opts: { allowZero: boolean }): boolean {
 
 /** The day after a `YYYY-MM-DD` date, as `YYYY-MM-DD`. */
 function nextDay(date: string): string {
-  const [y, m, d] = date.split("-").map(Number);
+  const [y = 0, m = 1, d = 1] = date.split("-").map(Number);
   return new Date(Date.UTC(y, m - 1, d + 1)).toISOString().slice(0, 10);
 }
 

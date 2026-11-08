@@ -19,11 +19,17 @@ import { Gate } from "./Gate";
 import { Keys } from "./Keys";
 import { Members } from "./Members";
 import { Org, ROLE_LABEL } from "./Org";
+import { Billing } from "./Billing";
+import { Budgets } from "./Budgets";
+import { Usage } from "./Usage";
 
 const TABS = [
   { id: "org", label: "组织" },
   { id: "keys", label: "密钥" },
   { id: "members", label: "成员" },
+  { id: "usage", label: "用量" },
+  { id: "budgets", label: "预算" },
+  { id: "billing", label: "账户" },
 ] as const;
 
 export type TabId = (typeof TABS)[number]["id"];
@@ -38,9 +44,15 @@ export type TabId = (typeof TABS)[number]["id"];
  * members pages, which then only close things (revoke a key, remove a
  * member): a key that leaked must not wait for the reactivation. A pending
  * one has neither, since nothing can exist there before the approval.
+ *
+ * The usage, budgets and account pages show only for an active organisation,
+ * because their routes answer `403 tenant_not_active` otherwise: usage and
+ * budgets to every known role, the account to those who see money (owner,
+ * admin, billing).
  */
 function canSee(id: TabId, member: SessionMember, status: TenantStatus): boolean {
   if (status !== "active" && status !== "suspended") return false;
+  if ((id === "usage" || id === "budgets" || id === "billing") && status !== "active") return false;
   switch (id) {
     case "org":
       return true;
@@ -48,6 +60,11 @@ function canSee(id: TabId, member: SessionMember, status: TenantStatus): boolean
       return member.role === "owner" || member.role === "admin" || member.role === "member";
     case "members":
       return member.role === "owner" || member.role === "admin";
+    case "usage":
+    case "budgets":
+      return member.role === "owner" || member.role === "admin" || member.role === "member" || member.role === "billing";
+    case "billing":
+      return member.role === "owner" || member.role === "admin" || member.role === "billing";
   }
 }
 
@@ -231,6 +248,12 @@ export function App({ inviteToken }: { inviteToken: string | null }) {
             <Keys member={member} status={tenant.status} onSelfChanged={() => void boot()} />
           ) : current === "members" ? (
             <Members member={member} status={tenant.status} onSelfChanged={() => void boot()} onLeft={leave} />
+          ) : current === "usage" ? (
+            <Usage />
+          ) : current === "budgets" ? (
+            <Budgets />
+          ) : current === "billing" ? (
+            <Billing />
           ) : (
             <Org member={member} status={tenant.status} />
           )}
