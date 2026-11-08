@@ -732,3 +732,51 @@ export const tenantPricing = {
     return (await call<TenantPlan>("GET", `/admin/pricing/tenants/${seg(tenantId)}`)).data;
   },
 };
+
+/** One top-up as an operator reads it: a tenant's request, or an operator's credit. */
+export interface Topup {
+  id: string;
+  origin: "tenant" | "operator";
+  /** Integer micro-dollars. */
+  amount_micro_usd: number;
+  note: string;
+  reference: string;
+  status: "pending" | "approved" | "rejected";
+  tenant_id: string;
+  tenant_name: string;
+  requested_by: { id: string; display_name: string | null } | null;
+  requested_at: string;
+  decided_at: string | null;
+  decided_by: { id: string; email: string | null } | null;
+  reject_reason: string | null;
+  credit_reason: string | null;
+}
+
+/** Top-up requests and their decisions (billing). */
+export const topups = {
+  /** One page, newest first; `before` is the previous page's `next_before`. */
+  async list(q: {
+    status?: Topup["status"];
+    origin?: Topup["origin"];
+    tenant_id?: string;
+    before?: number;
+  }): Promise<{ items: Topup[]; next_before: number | null }> {
+    const params = new URLSearchParams();
+    if (q.status) params.set("status", q.status);
+    if (q.origin) params.set("origin", q.origin);
+    if (q.tenant_id) params.set("tenant_id", q.tenant_id);
+    if (q.before !== undefined) params.set("before", String(q.before));
+    const query = params.toString();
+    return (
+      await call<{ items: Topup[]; next_before: number | null }>("GET", `/admin/billing/topups${query ? `?${query}` : ""}`)
+    ).data;
+  },
+  /** The amount is posted to the tenant's balance at once. `409 topup_state` when it is no longer pending. */
+  async approve(id: string): Promise<Topup> {
+    return (await call<Topup>("POST", `/admin/billing/topups/${seg(id)}/approve`)).data;
+  },
+  /** The reason (1 to 500 characters) is what the tenant reads. `409 topup_state` when it is no longer pending. */
+  async reject(id: string, reason: string): Promise<Topup> {
+    return (await call<Topup>("POST", `/admin/billing/topups/${seg(id)}/reject`, { reason })).data;
+  },
+};

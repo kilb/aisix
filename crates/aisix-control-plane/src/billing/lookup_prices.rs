@@ -22,6 +22,7 @@ use serde::Serialize;
 use sqlx::PgConnection;
 use uuid::Uuid;
 
+use super::access::key_access;
 use super::plans::{current_discount, current_revisions};
 use crate::db::DbError;
 use crate::dp::DpIdentity;
@@ -121,16 +122,15 @@ pub async fn tenant_prices(
     conn: &mut PgConnection,
     key_id: Uuid,
 ) -> Result<Option<TenantPrices>, DbError> {
-    let tenant: Option<(Uuid, Vec<Uuid>)> = sqlx::query_as(
-        "SELECT t.id, t.allowed_model_ids FROM tenant_keys k JOIN tenants t ON t.id = k.tenant_id \
-         WHERE k.id = $1 AND k.revoked_at IS NULL",
-    )
-    .bind(key_id)
-    .fetch_optional(&mut *conn)
-    .await?;
-    let Some((tenant_id, granted)) = tenant else {
+    let Some(access) = key_access(&mut *conn, key_id).await? else {
         return Ok(None);
     };
+    let tenant_id = access.tenant_id;
+    let granted: Vec<Uuid> =
+        sqlx::query_scalar("SELECT allowed_model_ids FROM tenants WHERE id = $1")
+            .bind(tenant_id)
+            .fetch_one(&mut *conn)
+            .await?;
     // Read first. Price writes bump it in their own transaction, and this
     // transaction does not see one snapshot, so a write racing these reads
     // can only leave the version older than the prices, never newer: a
