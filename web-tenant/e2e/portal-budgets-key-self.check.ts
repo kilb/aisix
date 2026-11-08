@@ -27,17 +27,28 @@ test("实际可用与 API 密钥自查一致", async ({ page }) => {
     .poll(() => chat(stack, km.plaintext, world.model.name), { message: "the gateway admits the call" })
     .toBe(200);
 
+  // The call is booked a moment after it is answered: the key's own answer through
+  // the gateway tells when, and it must agree with the page.
+  await expect
+    .poll(
+      async () => {
+        const res = await fetch(`${stack.proxyUrl}/v1/key`, { headers: { authorization: `Bearer ${km.plaintext}` } });
+        if (res.status !== 200) return res.status;
+        return ((await res.json()) as { data: { effective_remaining_usd: string } }).data.effective_remaining_usd;
+      },
+      { message: "GET /v1/key reports the booked spend", timeout: 15_000 },
+    )
+    .toBe("0.039000");
+
   await page.goto(stack.previewUrl);
   await page.getByLabel("邮箱").fill(world.owner.email);
   await page.getByLabel("口令", { exact: true }).fill(world.owner.password);
   await page.getByRole("button", { name: "登录", exact: true }).click();
   await page.getByRole("tab", { name: "预算" }).click();
-  const figures = page.getByRole("table", { name: "密钥实际可用", exact: true }).locator("tbody tr");
+  const figures = page
+    .getByRole("table", { name: "密钥实际可用", exact: true })
+    .locator("tbody tr")
+    .filter({ hasText: /member-key-/ });
   await expect(figures).toContainText("$0.039");
   await expect(figures).toContainText("密钥");
-
-  // The key's own answer through the gateway agrees with the page.
-  const res = await fetch(`${stack.proxyUrl}/v1/key`, { headers: { authorization: `Bearer ${km.plaintext}` } });
-  const body = (await res.json()) as { data: { effective_remaining_usd: string } };
-  expect(body.data.effective_remaining_usd).toBe("0.039000");
 });

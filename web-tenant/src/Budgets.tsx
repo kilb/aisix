@@ -129,10 +129,12 @@ export function Budgets({ member }: { member: SessionMember }) {
   const [quotas, setQuotas] = useState<Record<string, KeyQuota>>({});
   const [quotaErr, setQuotaErr] = useState<string | null>(null);
   const [tick, setTick] = useState(0);
+  const [reloading, setReloading] = useState(true);
   const reload = useCallback(() => setTick((n) => n + 1), []);
 
   useEffect(() => {
     let live = true;
+    setReloading(true);
     void (async () => {
       const [list, keyList, peopleList] = await Promise.allSettled([
         budgetApi.list(),
@@ -166,6 +168,7 @@ export function Budgets({ member }: { member: SessionMember }) {
       });
       setQuotas(next);
       setQuotaErr(failed === null ? null : failure(failed));
+      setReloading(false);
     })();
     return () => {
       live = false;
@@ -216,7 +219,7 @@ export function Budgets({ member }: { member: SessionMember }) {
             </div>
           )}
           <div>
-            <Button size="sm" icon="refresh" onClick={reload}>
+            <Button size="sm" icon="refresh" busy={reloading} busyLabel="刷新中…" onClick={reload}>
               刷新
             </Button>
           </div>
@@ -235,7 +238,7 @@ export function Budgets({ member }: { member: SessionMember }) {
   );
 }
 
-// ── 每把密钥还能花多少 ──────────────────────────────────────────────────────
+// ── what each key can still spend ───────────────────────────────────────────
 
 /** Per key, what it can still spend and the level that stops it first. */
 function KeyFigures({ keys, rows, quotas }: { keys: TenantKey[] | null; rows: Budget[]; quotas: Record<string, KeyQuota> }) {
@@ -471,7 +474,7 @@ function QuotaRow({
   );
 }
 
-// ── 新建额度 ────────────────────────────────────────────────────────────────
+// ── the new-quota form ──────────────────────────────────────────────────────
 
 type FormField = "scope" | "target" | "kind" | "period" | "limit";
 
@@ -512,7 +515,7 @@ function CreateForm({
 
   const options: { id: string; label: string }[] =
     scope === "member"
-      ? people.map((p) => ({ id: p.id, label: p.display_name ?? p.email }))
+      ? people.map((p) => ({ id: p.id, label: `${p.display_name ?? p.email}${p.disabled ? "（已停用）" : ""}` }))
       : (keys ?? []).map((k) => ({
           id: k.id,
           label: manager ? `${k.label}（${k.owner ? (k.owner.display_name ?? "成员") : "组织"}）` : k.label,

@@ -133,10 +133,16 @@ async function spentIs(who: Login, id: string, micro: number): Promise<void> {
     .toBe(micro);
 }
 
+// A fixed cadence bounds what the polling calls themselves can spend before the refusal lands.
 const refused = (key: Key, world: BillingWorld) =>
-  expect.poll(() => chat(stack, key.plaintext, world.model.name), { message: "the gateway refuses the call", timeout: REACH_MS });
+  expect.poll(() => chat(stack, key.plaintext, world.model.name), {
+    message: "the gateway refuses the call",
+    timeout: REACH_MS,
+    intervals: [1_000],
+  });
 
 test("为密钥设每日额度，用尽后该密钥被拒，另一把密钥照常", async ({ page }) => {
+  await waitClearOfUtcMidnight();
   const s = await seed();
   await openBudgets(page, s.world.owner);
   await createViaPage(page, { scope: "密钥", target: s.k1.id, period: "day", limit: "0.02" });
@@ -144,7 +150,8 @@ test("为密钥设每日额度，用尽后该密钥被拒，另一把密钥照�
   await expect(rowOf(keys, "world-owner-key")).toContainText("每天");
 
   await spend(s.k1, s.world, 2);
-  const quotaId = ((await (await apiAs(s.world.owner)).get("/api/budgets")).items[0] as { id: string }).id;
+  const listed = (await (await apiAs(s.world.owner)).get("/api/budgets")).items as { id: string; target: { id: string } }[];
+  const quotaId = listed.find((b) => b.target.id === s.k1.id)!.id;
   await spentIs(s.world.owner, quotaId, 22_000);
 
   await page.getByRole("button", { name: "刷新" }).click();
@@ -229,8 +236,16 @@ test("超过上级额度时给出提示，但仍能保存", async ({ page }) => 
   const form = region(page, "新建额度");
   await form.getByLabel(/^对象类型/).selectOption({ label: "密钥" });
   await form.getByLabel(/^对象(?!类型)/).selectOption(s.km.id);
+  const warning = form.getByText("超过上级额度时以先用尽者为准");
+  // Equal to the member's monthly 0.01 is not above it.
+  await form.getByLabel("限额（美元）").fill("0.01");
+  await expect(warning).toHaveCount(0);
+  // A daily cap is not compared with a monthly one.
+  await form.getByLabel(/^周期/).selectOption("day");
   await form.getByLabel("限额（美元）").fill("5.00");
-  await expect(form.getByText("超过上级额度时以先用尽者为准")).toBeVisible();
+  await expect(warning).toHaveCount(0);
+  await form.getByLabel(/^周期/).selectOption("month");
+  await expect(warning).toBeVisible();
   await form.getByRole("button", { name: "创建" }).click();
 
   const row = rowOf(table(page, "密钥额度"), "m-key-one");
@@ -243,6 +258,13 @@ test("实际可用显示最小的一级，并写明受限于哪一级", async ({
   const s = await seed();
   await setQuota(s.world.owner, { scope: "api_key", scope_ref: s.km.id, kind: "cumulative", limit_usd: "0.05" });
   await spend(s.km, s.world, 1);
+  // The call is booked a moment after it is answered; the page reads once on load.
+  await expect
+    .poll(
+      async () => ((await (await apiAs(s.world.owner)).get(`/api/keys/${s.km.id}/quota`)) as { effective_remaining_micro_usd: number }).effective_remaining_micro_usd,
+      { message: "the spend is booked", timeout: REACH_MS },
+    )
+    .toBe(39_000);
 
   await openBudgets(page, s.world.owner);
   const row = rowOf(table(page, "密钥实际可用"), "m-key-one");
@@ -293,4 +315,57 @@ test("账单角色只能查看额度，没有新建与修改", async ({ page }) 
   await expect(page.getByRole("region", { name: "新建额度" })).toHaveCount(0);
   await expect(page.getByRole("button", { name: "修改限额" })).toHaveCount(0);
   await expect(page.getByRole("button", { name: "删除", exact: true })).toHaveCount(0);
+});
+
+test("组织额度对所有者只读", async ({ page }) => {
+  const s = await seed();
+  await stack.admin.post(`/admin/tenants/${s.world.tenantId}/budgets`, { kind: "periodic", period: "month", limit_usd: "5.00" });
+  await openBudgets(page, s.world.owner);
+  const org = rowOf(table(page, "组织额度"), "每月");
+  await expect(org).toHaveCount(1);
+  await expect(org).toContainText("平台");
+  await expect(org.getByRole("button")).toHaveCount(0);
+});
+
+test("管理员可以给任何密钥设额度，并修改、删除自己设的额度", async ({ page }) => {
+  const s = await seed();
+  await (await apiAs(s.world.owner)).patch(`/api/members/${s.m.id}`, { role: "admin" });
+  await openBudgets(page, s.m);
+  const form = region(page, "新建额度");
+  await expect(form.getByLabel(/^对象类型/).locator("option")).toHaveText(["成员", "密钥"]);
+  await createViaPage(page, { scope: "密钥", target: s.k1.id, period: "month", limit: "0.50" });
+  const row = rowOf(table(page, "密钥额度"), "world-owner-key");
+  await expect(row).toContainText("组织管理员");
+  await row.getByRole("button", { name: "修改限额" }).click();
+  await row.getByLabel("新的限额（美元）").fill("0.60");
+  await row.getByRole("button", { name: "保存" }).click();
+  await expect(row).toContainText("$0.60");
+  await row.getByRole("button", { name: "删除", exact: true }).click();
+  await row.getByRole("button", { name: "确认删除" }).click();
+  await expect(rowOf(table(page, "密钥额度"), "world-owner-key")).toHaveCount(0);
+});
+
+test("成员可以修改自己为自己密钥设的额度", async ({ page }) => {
+  const s = await seed();
+  await setQuota(s.m, { scope: "api_key", scope_ref: s.km.id, kind: "periodic", period: "month", limit_usd: "0.01" });
+  await openBudgets(page, s.m);
+  const row = rowOf(table(page, "密钥额度"), "m-key-one");
+  await expect(row).toContainText("$0.01");
+  await row.getByRole("button", { name: "修改限额" }).click();
+  await row.getByLabel("新的限额（美元）").fill("0.03");
+  await row.getByRole("button", { name: "保存" }).click();
+  await expect(row).toContainText("$0.03");
+  await expect(row.getByRole("button", { name: "修改限额" })).toBeVisible();
+});
+
+test("所有者可以删除成员为自己密钥设的额度，但不能修改", async ({ page }) => {
+  const s = await seed();
+  await setQuota(s.m, { scope: "api_key", scope_ref: s.km.id, kind: "periodic", period: "month", limit_usd: "0.01" });
+  await openBudgets(page, s.world.owner);
+  const row = rowOf(table(page, "密钥额度"), "m-key-one");
+  await expect(row).toContainText("成员");
+  await expect(row.getByRole("button", { name: "修改限额" })).toHaveCount(0);
+  await row.getByRole("button", { name: "删除", exact: true }).click();
+  await row.getByRole("button", { name: "确认删除" }).click();
+  await expect(rowOf(table(page, "密钥额度"), "m-key-one")).toHaveCount(0);
 });
