@@ -32,7 +32,7 @@ use crate::metric_labels::{LabelRecorder, LabelSelection};
 use crate::prometheus::Recorder as PrometheusRecorder;
 use crate::scrape::Scrape;
 use metrics_exporter_prometheus::{DistributionBuilder, Matcher};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::hash::Hasher;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -840,6 +840,12 @@ struct MetricsInner {
     /// Usage delivery to the control plane, written by the telemetry
     /// sender and read by budget enforcement.
     usage_delivery: crate::usage_delivery::UsageDeliveryHealth,
+    /// Usage events dropped since the process started, by `reason`:
+    /// counted beside `aisix_usage_event_drops_total` and read by
+    /// [`Metrics::usage_event_drop_totals`]. Kept apart from the recorder
+    /// because the operator's label selection may leave `reason` out of
+    /// the rendered series, and the control plane needs it either way.
+    usage_event_drops: Mutex<BTreeMap<String, u64>>,
 }
 
 /// A gauge family whose label set can outlive what it describes.
@@ -1264,6 +1270,7 @@ impl Metrics {
                 memory: crate::memory::MemoryProbes::new(),
                 last_exporters: Mutex::new(Vec::new()),
                 usage_delivery: crate::usage_delivery::UsageDeliveryHealth::default(),
+                usage_event_drops: Mutex::new(BTreeMap::new()),
             }),
         })
     }
@@ -2957,7 +2964,23 @@ impl Metrics {
     /// one-sided — `emitted == delivered + dropped` is an invariant over
     /// the attribution dimensions, which is why the member pair `user_id`
     /// / `user_name` DOES appear on both.)
+    ///
+    /// Each drop is also tallied by `reason` alone, for the heartbeat
+    /// ([`Self::usage_event_drop_totals`]).
     pub fn record_usage_event_drop(&self, reason: &str, labels: UsageEventLabels<'_>) {
+        {
+            let mut drops = self
+                .inner
+                .usage_event_drops
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match drops.get_mut(reason) {
+                Some(count) => *count = count.saturating_add(1),
+                None => {
+                    drops.insert(reason.to_string(), 1);
+                }
+            }
+        }
         self.cached_counter(
             M_USAGE_EVENT_DROPS_TOTAL,
             1,
@@ -2983,6 +3006,19 @@ impl Metrics {
                 )
             },
         );
+    }
+
+    /// The usage events dropped since the process started, by `reason`:
+    /// everything [`Self::record_usage_event_drop`] counted, on this
+    /// instance or any clone of it, whatever labels each drop carried. The
+    /// heartbeat reports it to the control plane, so lost usage shows there
+    /// and not only on this gateway's scrape.
+    pub fn usage_event_drop_totals(&self) -> BTreeMap<String, u64> {
+        self.inner
+            .usage_event_drops
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// Issue #408: bump on every `UsageSink::try_emit` call (the
@@ -6427,6 +6463,49 @@ mod tests {
             },
         );
         assert_one_series_per_label_set(&m.render(), M_USAGE_EVENT_DROPS_TOTAL, 4);
+    }
+
+    /// The per-reason tally the heartbeat reports counts exactly what the
+    /// drops metric counts: the telemetry worker records on its own clone
+    /// of `Metrics`, the heartbeat reads another, and one reason's drops
+    /// spread over several label sets.
+    #[test]
+    fn drop_totals_count_every_reason_the_metric_counts() {
+        let m = Metrics::new(false);
+        assert_eq!(m.usage_event_drop_totals(), BTreeMap::new());
+        let worker = m.clone();
+        worker.record_usage_event_drop("sink_full", PK_A);
+        worker.record_usage_event_drop(
+            "sink_full",
+            UsageEventLabels {
+                model: "gpt-4o-mini",
+                ..PK_A
+            },
+        );
+        worker.record_usage_event_drop("send_failed", UsageEventLabels::default());
+
+        let totals = m.usage_event_drop_totals();
+        assert_eq!(
+            totals,
+            BTreeMap::from([("send_failed".to_string(), 1), ("sink_full".to_string(), 2)]),
+        );
+
+        let rendered = m.render();
+        let mut metric: BTreeMap<String, u64> = BTreeMap::new();
+        for line in series_lines(&rendered, M_USAGE_EVENT_DROPS_TOTAL) {
+            let reason = line
+                .split("reason=\"")
+                .nth(1)
+                .and_then(|rest| rest.split('"').next())
+                .unwrap_or_else(|| panic!("a reason label: {line}"));
+            let count: u64 = line
+                .rsplit(' ')
+                .next()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or_else(|| panic!("a count: {line}"));
+            *metric.entry(reason.to_string()).or_default() += count;
+        }
+        assert_eq!(metric, totals, "{rendered}");
     }
 
     /// AISIX-Cloud#1317: the two counters are read as one pair —
