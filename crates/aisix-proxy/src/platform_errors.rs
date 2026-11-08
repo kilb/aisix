@@ -1,18 +1,40 @@
-//! Platform mode's error classes.
+//! Platform mode's error classes, and the upstream request errors it relays.
 //!
 //! In platform mode one gateway serves many tenants from upstream channels
-//! and accounts the platform owns, and a tenant must never learn which
-//! channel or account served it. So every error that came from an upstream,
-//! and every gateway refusal whose text names the provider, provider key or
-//! upstream account a request resolved to, reaches the caller as one of the
-//! closed set of classes below: a fixed status, `error.type`, `error.code`
-//! and message, with only the upstream's `param` (a field name of the
-//! caller's own request) carried over. Streamed error frames and upstream
-//! error events relayed from a native stream are rewritten the same way.
+//! and accounts the platform owns. Hiding which channel or account served a
+//! tenant is best effort, and never at the cost of what a client does with
+//! an error.
+//!
+//! So an upstream's answer to a request error reaches the caller as the
+//! upstream sent it when the upstream speaks the caller's own protocol
+//! ([`relayed_status`]): a `400`, `413` or `422`, with the upstream's own
+//! status, `error.type`, `error.code`, `error.param` and message, buffered or
+//! as the frame or failed Response that ends a stream. Clients act on those
+//! words. Claude Code (2.1.319) compacts its conversation when a message says
+//! "prompt is too long", and retries or degrades on the texts of a bad
+//! thinking signature, `cache_control`, `effort`, a media limit or a
+//! `tool_use_id`; the OpenAI SDK and Codex key off codes such as
+//! `context_length_exceeded` and `previous_response_not_found`. What is
+//! relayed has been through the shared scrubber
+//! ([`aisix_gateway::upstream_error_scrub`]): the credentials the gateway
+//! sent, AWS ARNs and account ids, Google Cloud project ids, internal hosts in
+//! URLs, bearer tokens and prefixed keys are out of it.
+//!
+//! Every other error that came from an upstream, and every gateway refusal
+//! whose text names the provider, provider key or upstream account a request
+//! resolved to, reaches the caller as one of the closed set of classes below:
+//! a fixed status, `error.type`, `error.code` and message, with only the
+//! upstream's `param` (a field name of the caller's own request) carried over
+//! from a native dispatch. That is any other status (an upstream `401`, `403`,
+//! `404`, `408`, `409`, `424`, `429` or `5xx`), a transport failure or
+//! timeout, and any error of a translated dispatch, whose words are another
+//! protocol's and would not help the caller's client. Streamed error frames
+//! and upstream error events relayed from a native stream are rewritten the
+//! same way.
 //!
 //! The operator still sees what happened: the usage event's `error_message`,
 //! the access log and the per-attempt records are all written from the
-//! original error, never from the class.
+//! original error, never from the class or the relayed copy.
 //!
 //! The gateway's own refusals that name no upstream (budgets, rate limits,
 //! guardrails, request validation, authentication) keep their envelopes in
@@ -203,11 +225,13 @@ pub(crate) fn classify(err: &ProxyError) -> PlatformErrorClass {
         ProxyError::TargetRefused(_) => PlatformErrorClass::InvalidRequest {
             param: Some("model".into()),
         },
-        // Read exactly as the upstream's own answer for a `previous_response_id`
-        // it does not have: a 400 `invalid_request_error` with `param`
-        // `previous_response_id` and code `previous_response_not_found`
-        // (<https://developers.openai.com/api/docs/guides/websocket-mode>),
-        // which [`classify_upstream`] makes this same class.
+        // The gateway's own refusal of a `previous_response_id` it cannot
+        // open: a 400 `invalid_request_error` naming the field, the status,
+        // type and `param` of the upstream's own answer for one it does not
+        // have (<https://developers.openai.com/api/docs/guides/websocket-mode>).
+        // That answer is relayed with its own code and message
+        // ([`relayed_status`]); this refusal is the gateway's, and keeps the
+        // class.
         ProxyError::ResponseNotFound => PlatformErrorClass::InvalidRequest {
             param: Some("previous_response_id".into()),
         },
@@ -325,23 +349,6 @@ const CONTEXT_OVERFLOW_MARKERS: &[&str] = &[
 /// `rate_limit_error`.
 const RATE_LIMIT_TOKENS: &[&str] = &["rate_limit_exceeded", "rate_limit_error"];
 
-/// The field an Anthropic error names, which it writes at the head of its
-/// message rather than in a `param` of its own: `max_tokens: 64001 > 64000,
-/// which is the maximum allowed number of output tokens for this model`, or
-/// `messages.1.content.0.image.source.base64.media_type: Input should be …`
-/// (<https://docs.anthropic.com/en/api/errors>; Claude Code 2.1.319 matches
-/// these very texts). Only a head that starts with a lowercase letter, as
-/// every field of the Messages API does, and is followed by `": "`; the
-/// field-shape check in [`classify_upstream`] then applies to it as to any
-/// `param`.
-fn anthropic_field_path(view: &UpstreamErrorView) -> Option<String> {
-    let (head, _) = view.message.as_deref()?.split_once(": ")?;
-    head.as_bytes()
-        .first()
-        .is_some_and(u8::is_ascii_lowercase)
-        .then(|| head.to_string())
-}
-
 fn classify_upstream(
     status: Option<u16>,
     view: Option<&UpstreamErrorView>,
@@ -371,19 +378,15 @@ fn classify_upstream(
     // anything else is the upstream's own text. And only from a native
     // dispatch: after a translation it names a field of the request the
     // gateway built, in the upstream's protocol, which tells the caller what
-    // that protocol is. An Anthropic error names its field in its message.
+    // that protocol is.
     let param = || {
-        view.and_then(|v| match (&v.param, wire) {
-            (Some(param), _) => Some(param.clone()),
-            (None, UpstreamWire::Anthropic) => anthropic_field_path(v),
-            (None, _) => None,
-        })
-        .filter(|_| !crate::attribution::translated_dispatch())
-        .filter(|p| {
-            p.len() <= 256
-                && p.bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b"_.[]".contains(&b))
-        })
+        view.and_then(|v| v.param.clone())
+            .filter(|_| dispatched_natively(wire))
+            .filter(|p| {
+                p.len() <= 256
+                    && p.bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b"_.[]".contains(&b))
+            })
     };
     match status {
         Some(429) => PlatformErrorClass::RateLimited,
@@ -399,9 +402,52 @@ fn classify_upstream(
         Some(400..=499) => PlatformErrorClass::InvalidRequest { param: param() },
         Some(_) => PlatformErrorClass::UpstreamUnavailable,
         None if names(RATE_LIMIT_TOKENS) => PlatformErrorClass::RateLimited,
-        None if names(CALLER_FAULT_TOKENS) => PlatformErrorClass::InvalidRequest { param: param() },
+        // A native one is relayed ([`relayed_status`]), and a translated
+        // one's `param` is another protocol's: no field is kept.
+        None if names(CALLER_FAULT_TOKENS) => PlatformErrorClass::InvalidRequest { param: None },
         None => PlatformErrorClass::UpstreamUnavailable,
     }
+}
+
+/// The statuses of an upstream's answer to a request error, which platform
+/// mode relays from an upstream of the caller's own protocol: a bad request,
+/// a request too large and an unprocessable one.
+const RELAYED_STATUSES: [u16; 3] = [400, 413, 422];
+
+/// Whether the upstream that answered speaks the caller's own protocol, so
+/// that its error is in words the caller's client reads. Messages,
+/// count_tokens and Responses record it for each attempt
+/// ([`crate::attribution::note_translated_dispatch`]). Every other route is
+/// an OpenAI-shaped endpoint that reaches an upstream of another protocol only
+/// through a bridge, so there the wire the error came in says it: an
+/// OpenAI-wire upstream, Azure OpenAI's included, speaks it, and any other
+/// was translated to.
+fn dispatched_natively(wire: UpstreamWire) -> bool {
+    match crate::attribution::translated_dispatch() {
+        Some(translated) => !translated,
+        None => matches!(wire, UpstreamWire::OpenAI | UpstreamWire::AzureOpenAI),
+    }
+}
+
+/// The status `err` reaches the caller with when platform mode relays it as
+/// the upstream sent it: an upstream's answer to a request error
+/// ([`RELAYED_STATUSES`]) from an upstream of the caller's own protocol.
+/// An error an upstream reports inside a stream or a `2xx` body may carry no
+/// status of its own; it is a request error when its own code says so (a
+/// context overflow, a refused prompt or image, a content filter), which is
+/// when its class is a `400`. `None` when platform mode is off, and for every
+/// error that keeps a class.
+pub(crate) fn relayed_status(err: &BridgeError) -> Option<u16> {
+    if !active() {
+        return None;
+    }
+    let (status, wire) = match err {
+        BridgeError::UpstreamStatus { status, wire, .. } => (Some(*status), *wire),
+        BridgeError::UpstreamInBand { status, wire, .. } => (*status, *wire),
+        _ => return None,
+    };
+    let status = status.unwrap_or_else(|| classify_bridge(err).status().as_u16());
+    (RELAYED_STATUSES.contains(&status) && dispatched_natively(wire)).then_some(status)
 }
 
 /// Whether platform mode replaces `err` for the caller: everything but the
@@ -458,10 +504,11 @@ fn keeps_own_envelope(err: &ProxyError) -> bool {
     )
 }
 
-/// The one upstream-side variant left alone is the gateway's own request
-/// size limit, which names nothing.
+/// The upstream-side errors left alone are the gateway's own request size
+/// limit, which names nothing, and the request errors platform mode relays
+/// ([`relayed_status`]).
 fn hides_bridge(err: &BridgeError) -> bool {
-    !matches!(err, BridgeError::RequestTooLarge { .. })
+    !matches!(err, BridgeError::RequestTooLarge { .. }) && relayed_status(err).is_none()
 }
 
 /// Whether the request being served is served in platform mode.
@@ -500,9 +547,13 @@ pub(crate) fn stream_class(err: &BridgeError) -> Option<PlatformErrorClass> {
 }
 
 /// The `data:` payload of the OpenAI-shape SSE error frame ending a chat or
-/// legacy completions stream on `err`, in platform mode: the class's
-/// envelope, the same body the buffered response carries.
+/// legacy completions stream on `err`, in platform mode: the same body the
+/// buffered response carries, the upstream's own for a request error it
+/// relays and the class's envelope otherwise.
 pub(crate) fn openai_stream_payload(err: &BridgeError) -> Option<String> {
+    if let Some(relayed) = crate::error::relayed_upstream_envelope(err) {
+        return Some(serde_json::to_string(&relayed).unwrap_or_default());
+    }
     stream_class(err).map(|class| openai_payload(&class))
 }
 
@@ -524,36 +575,98 @@ fn anthropic_frame(class: &PlatformErrorClass) -> String {
 }
 
 /// An upstream's Anthropic `error` event, relayed from a native stream, as
-/// platform mode sends it: the class of the error it reports. `event` is the
-/// frame's parsed payload, `None` when it did not parse.
+/// platform mode sends it: the class of the error it reports, or, for a
+/// request error it relays ([`relayed_status`]), the event with its text
+/// through the shared scrubber. `event` is the frame's parsed payload, `None`
+/// when it did not parse. `None` too when the frame goes out as the upstream
+/// wrote it, less the credentials the caller takes out of its bytes.
 pub(crate) fn relayed_anthropic_error(event: Option<&Value>) -> Option<String> {
     if !active() {
         return None;
     }
-    let class = event
-        .and_then(aisix_provider_anthropic::wire::body_in_band_error)
-        .map_or(PlatformErrorClass::UpstreamUnavailable, |e| {
-            classify_bridge(&e)
-        });
+    let err = event.and_then(aisix_provider_anthropic::wire::body_in_band_error);
+    if let (Some(event), Some(err)) = (event, &err) {
+        if relayed_status(err).is_some() {
+            return scrubbed_error(event, "/error")
+                .map(|event| format!("event: error\ndata: {event}\n\n"));
+        }
+    }
+    let class = err.map_or(PlatformErrorClass::UpstreamUnavailable, |e| {
+        classify_bridge(&e)
+    });
     Some(anthropic_frame(&class))
 }
 
+/// `event` with every string of the error object at `pointer` through the
+/// shared scrubber, which a relayed body's bytes only get for the
+/// credentials the request sent. `None` when that changes nothing, and the
+/// event goes out as the upstream wrote it.
+fn scrubbed_error(event: &Value, pointer: &str) -> Option<Value> {
+    let mut scrubbed = event.clone();
+    scrub_strings(scrubbed.pointer_mut(pointer)?).then_some(scrubbed)
+}
+
+/// Every string in `value` through the shared scrubber; whether any changed.
+fn scrub_strings(value: &mut Value) -> bool {
+    match value {
+        Value::String(text) => {
+            let scrubbed = aisix_gateway::scrub_upstream_error_text(text);
+            let changed = scrubbed != *text;
+            *text = scrubbed;
+            changed
+        }
+        Value::Array(items) => items
+            .iter_mut()
+            .fold(false, |any, v| scrub_strings(v) | any),
+        Value::Object(map) => map
+            .values_mut()
+            .fold(false, |any, v| scrub_strings(v) | any),
+        _ => false,
+    }
+}
+
+/// `frame` carrying `payload`, under the `event:` name it was sent with.
+fn reframed(frame: &[u8], payload: &Value) -> Vec<u8> {
+    let name = String::from_utf8_lossy(frame)
+        .lines()
+        .find_map(|line| line.strip_prefix("event:").map(|n| n.trim().to_owned()));
+    match name {
+        Some(name) => format!("event: {name}\ndata: {payload}\n\n"),
+        None => format!("data: {payload}\n\n"),
+    }
+    .into_bytes()
+}
+
 /// A Responses-API stream frame that reports an upstream's failure, relayed
-/// from a native stream, as platform mode sends it. A `response.failed`
-/// keeps its Response object with the class in place of its `error`; any
-/// other failure frame becomes the flat `error` event, keeping the frame's
-/// `sequence_number`.
+/// from a native stream, as platform mode sends it. A request error it relays
+/// ([`relayed_status`]) keeps the frame, its error's text through the shared
+/// scrubber, and is `None` when that changes nothing. Otherwise a
+/// `response.failed` keeps its Response object with the class in place of its
+/// `error`, and any other failure frame becomes the flat `error` event,
+/// keeping the frame's `sequence_number`.
 pub(crate) fn relayed_responses_failure(frame: &[u8]) -> Option<Vec<u8>> {
     if !active() {
         return None;
     }
     let (event, _) = crate::redact::parse_sse_json_event(frame);
-    let class = event
+    let err = event
         .as_ref()
-        .and_then(crate::responses::responses_in_band_error)
-        .map_or(PlatformErrorClass::UpstreamUnavailable, |e| {
-            classify_bridge(&e)
-        });
+        .and_then(crate::responses::responses_in_band_error);
+    if let (Some(event), Some(err)) = (&event, &err) {
+        if relayed_status(err).is_some() {
+            let at = if event.get("type").and_then(Value::as_str) == Some("response.failed") {
+                "/response/error"
+            } else if event.get("error").is_some_and(Value::is_object) {
+                "/error"
+            } else {
+                ""
+            };
+            return scrubbed_error(event, at).map(|event| reframed(frame, &event));
+        }
+    }
+    let class = err.map_or(PlatformErrorClass::UpstreamUnavailable, |e| {
+        classify_bridge(&e)
+    });
     let error = serde_json::json!({
         "code": responses_failed_code(&class),
         "message": platform_message(&class),
@@ -611,16 +724,24 @@ pub(crate) fn responses_stream_failure(err: &BridgeError) -> Option<Vec<u8>> {
 
 /// A buffered Responses-API answer that is a failed Response object
 /// (`status: "failed"` with its own `error`), relayed as sent: in platform
-/// mode its `error` becomes the class of the error it reports, as a streamed
-/// `response.failed` does ([`relayed_responses_failure`]).
+/// mode its `error` becomes the class of the error it reports, or for a
+/// request error it relays ([`relayed_status`]) stays the upstream's, through
+/// the shared scrubber, as a streamed `response.failed` does
+/// ([`relayed_responses_failure`]).
 pub(crate) fn relayed_failed_response(body: &mut Value) {
     if !active() || body.get("status").and_then(Value::as_str) != Some("failed") {
         return;
     }
-    let class = aisix_gateway::capture_in_band_error_value(body, UpstreamWire::OpenAI)
-        .map_or(PlatformErrorClass::UpstreamUnavailable, |e| {
-            classify_bridge(&e)
-        });
+    let err = aisix_gateway::capture_in_band_error_value(body, UpstreamWire::OpenAI);
+    if err.as_ref().is_some_and(|e| relayed_status(e).is_some()) {
+        if let Some(error) = body.get_mut("error") {
+            scrub_strings(error);
+        }
+        return;
+    }
+    let class = err.map_or(PlatformErrorClass::UpstreamUnavailable, |e| {
+        classify_bridge(&e)
+    });
     body["error"] = serde_json::json!({
         "code": responses_failed_code(&class),
         "message": platform_message(&class),
@@ -657,14 +778,20 @@ pub(crate) fn relayed_responses_buffer(buf: &[u8]) -> Option<Vec<u8>> {
 
 /// An OpenAI-shape stream frame relayed from a native legacy completions
 /// stream, when it reports an upstream's in-band error, as platform mode
-/// sends it: the gateway's own error frame carrying the class.
+/// sends it: the gateway's own error frame carrying the class, or for a
+/// request error it relays ([`relayed_status`]) the frame with its error's
+/// text through the shared scrubber, `None` when that changes nothing.
 pub(crate) fn relayed_openai_error(frame: &[u8]) -> Option<Vec<u8>> {
     const KEY: &[u8] = b"\"error\"";
     if !active() || !frame.windows(KEY.len()).any(|w| w == KEY) {
         return None;
     }
     let (event, _) = crate::redact::parse_sse_json_event(frame);
-    let err = aisix_gateway::capture_in_band_error_value(&event?, UpstreamWire::OpenAI)?;
+    let event = event?;
+    let err = aisix_gateway::capture_in_band_error_value(&event, UpstreamWire::OpenAI)?;
+    if relayed_status(&err).is_some() {
+        return scrubbed_error(&event, "/error").map(|event| reframed(frame, &event));
+    }
     Some(
         format!(
             "event: error\ndata: {}\n\n",
@@ -808,27 +935,162 @@ mod tests {
     }
 
     /// The upstream's `param` names a field of the request the upstream
-    /// received. After a translation that is not the caller's request, so
-    /// the class keeps it only when the attempt was dispatched natively.
+    /// received. After a translation that is not the caller's request, so a
+    /// class keeps it only when the attempt was dispatched natively (a native
+    /// `400` itself is relayed whole, [`relayed_status`]). A route that
+    /// records nothing is told by the wire the error came in.
     #[test]
     fn a_param_is_kept_only_from_a_native_dispatch() {
-        let err = upstream_status_with_param(400, "bad", "messages[1].content");
-        let class = |translated: bool| {
+        let class = |wire: UpstreamWire, translated: Option<bool>| {
+            let err = ProxyError::Bridge(BridgeError::UpstreamStatus {
+                status: 400,
+                message: "bad".into(),
+                parsed: Some(Box::new(UpstreamErrorView {
+                    param: Some("messages[1].content".into()),
+                    ..Default::default()
+                })),
+                wire,
+                retry_after: None,
+                diagnostic: None,
+            });
             in_platform_mode(|| {
-                crate::attribution::note_translated_dispatch(translated);
-                caller_class(&err)
+                if let Some(translated) = translated {
+                    crate::attribution::note_translated_dispatch(translated);
+                }
+                classify(&err)
             })
         };
-        assert_eq!(
-            class(false),
-            Some(PlatformErrorClass::InvalidRequest {
-                param: Some("messages[1].content".into())
+        let kept = PlatformErrorClass::InvalidRequest {
+            param: Some("messages[1].content".into()),
+        };
+        let dropped = PlatformErrorClass::InvalidRequest { param: None };
+        assert_eq!(class(UpstreamWire::OpenAI, Some(false)), kept);
+        assert_eq!(class(UpstreamWire::Anthropic, Some(false)), kept);
+        assert_eq!(class(UpstreamWire::OpenAI, Some(true)), dropped);
+        assert_eq!(class(UpstreamWire::OpenAI, None), kept);
+        assert_eq!(class(UpstreamWire::AzureOpenAI, None), kept);
+        for wire in [
+            UpstreamWire::Anthropic,
+            UpstreamWire::Bedrock,
+            UpstreamWire::Vertex,
+            UpstreamWire::Unknown,
+        ] {
+            assert_eq!(class(wire, None), dropped, "{wire:?}");
+        }
+    }
+
+    /// What platform mode relays as the upstream sent it: a request error
+    /// (`400`, `413`, `422`, or a status-less error whose own code blames the
+    /// request) from an upstream of the caller's own protocol. Exact, so a
+    /// status that moves is caught.
+    #[test]
+    fn only_a_native_request_error_is_relayed() {
+        let relayed = |status: u16, wire: UpstreamWire, translated: Option<bool>| {
+            let err = BridgeError::UpstreamStatus {
+                status,
+                message: "upstream text".into(),
+                parsed: None,
+                wire,
+                retry_after: None,
+                diagnostic: None,
+            };
+            in_platform_mode(|| {
+                if let Some(translated) = translated {
+                    crate::attribution::note_translated_dispatch(translated);
+                }
+                relayed_status(&err)
             })
-        );
+        };
+        for status in [400, 413, 422] {
+            // Chat, completions and embeddings record nothing: an OpenAI-wire
+            // upstream speaks their protocol, any other was translated to.
+            assert_eq!(relayed(status, UpstreamWire::OpenAI, None), Some(status));
+            assert_eq!(
+                relayed(status, UpstreamWire::AzureOpenAI, None),
+                Some(status)
+            );
+            for wire in [
+                UpstreamWire::Anthropic,
+                UpstreamWire::Bedrock,
+                UpstreamWire::Vertex,
+                UpstreamWire::Unknown,
+            ] {
+                assert_eq!(relayed(status, wire, None), None, "{status} {wire:?}");
+            }
+            // Messages, count_tokens and Responses record it, whatever the
+            // wire: Claude on a cloud platform speaks Messages natively.
+            for wire in [UpstreamWire::Anthropic, UpstreamWire::Bedrock] {
+                assert_eq!(relayed(status, wire, Some(false)), Some(status), "{wire:?}");
+            }
+            assert_eq!(relayed(status, UpstreamWire::OpenAI, Some(true)), None);
+        }
+        for status in [
+            401, 402, 403, 404, 405, 408, 409, 424, 429, 500, 502, 503, 529,
+        ] {
+            assert_eq!(
+                relayed(status, UpstreamWire::OpenAI, Some(false)),
+                None,
+                "{status}"
+            );
+        }
+        // Off platform mode nothing is relayed: everything renders as it
+        // always has.
         assert_eq!(
-            class(true),
-            Some(PlatformErrorClass::InvalidRequest { param: None })
+            relayed_status(&BridgeError::UpstreamStatus {
+                status: 400,
+                message: "x".into(),
+                parsed: None,
+                wire: UpstreamWire::OpenAI,
+                retry_after: None,
+                diagnostic: None,
+            }),
+            None
         );
+
+        // An error reported inside a stream or a 2xx body: its own status,
+        // or else its own code.
+        let in_band = |status: Option<u16>, code: &str| {
+            let err = BridgeError::UpstreamInBand {
+                status,
+                message: "upstream text".into(),
+                parsed: Some(Box::new(UpstreamErrorView {
+                    code: Some(code.into()),
+                    ..Default::default()
+                })),
+                wire: UpstreamWire::OpenAI,
+            };
+            in_platform_mode(|| relayed_status(&err))
+        };
+        for code in [
+            "context_length_exceeded",
+            "invalid_prompt",
+            "invalid_image_url",
+            "content_policy_violation",
+        ] {
+            assert_eq!(in_band(None, code), Some(400), "{code}");
+        }
+        for code in [
+            "server_error",
+            "rate_limit_exceeded",
+            "vector_store_timeout",
+        ] {
+            assert_eq!(in_band(None, code), None, "{code}");
+        }
+        assert_eq!(in_band(Some(413), "server_error"), Some(413));
+        assert_eq!(in_band(Some(529), "invalid_prompt"), None);
+
+        // A failure no upstream answered with.
+        for err in [
+            BridgeError::Transport("connection refused".into()),
+            BridgeError::Timeout {
+                elapsed_ms: 10,
+                cause: String::new(),
+            },
+            BridgeError::StreamAborted,
+            BridgeError::InvalidRequest("bad".into()),
+        ] {
+            assert_eq!(in_platform_mode(|| relayed_status(&err)), None, "{err}");
+        }
     }
 
     #[test]
@@ -1084,14 +1346,14 @@ mod tests {
             );
             assert_eq!(class.code(), "invalid_request", "{code}");
         }
+        // Its field is not kept: a native one is relayed whole
+        // ([`relayed_status`]), and a translated one's is another protocol's.
         assert_eq!(
             classify_bridge(&in_band(
                 "invalid_image_url",
                 Some("input[0].content[1].image_url")
             )),
-            PlatformErrorClass::InvalidRequest {
-                param: Some("input[0].content[1].image_url".into())
-            }
+            PlatformErrorClass::InvalidRequest { param: None }
         );
         for code in [
             "server_error",
@@ -1340,11 +1602,13 @@ mod tests {
         assert_eq!(body_json(resp).await["error"]["type"], "overloaded_error");
     }
 
-    /// A response id this tenant was never handed reads exactly like a
-    /// `previous_response_id` the upstream does not have, which the upstream
-    /// answers with a 400 naming the field.
+    /// A response id the gateway cannot open is its own refusal: a 400 naming
+    /// the field, as the upstream answers a `previous_response_id` it does
+    /// not have. The upstream's own answer is relayed with its code, which
+    /// the OpenAI SDK tells clients to handle
+    /// (openai-python 3.41.0 `lib/responses_websocket/README.md`).
     #[tokio::test]
-    async fn an_unknown_previous_response_is_answered_as_the_upstream_answers_one() {
+    async fn an_unknown_previous_response_is_the_gateways_class_and_the_upstreams_is_relayed() {
         let unknown = in_platform_mode(|| ProxyError::ResponseNotFound.into_response());
         let upstream = in_platform_mode(|| {
             let message = "Previous response with id 'resp_1' not found.";
@@ -1364,15 +1628,19 @@ mod tests {
             .into_response()
         });
         assert_eq!(unknown.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(unknown.status(), upstream.status());
-        assert_eq!(unknown.headers(), upstream.headers());
-        let bytes =
-            |r: Response| async move { axum::body::to_bytes(r.into_body(), 65536).await.unwrap() };
-        let (unknown, upstream) = (bytes(unknown).await, bytes(upstream).await);
-        assert_eq!(unknown, upstream);
-        let body: Value = serde_json::from_slice(&unknown).unwrap();
-        assert_eq!(body["error"]["param"], "previous_response_id");
-        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert_eq!(upstream.status(), StatusCode::BAD_REQUEST);
+        let (unknown, upstream) = (body_json(unknown).await, body_json(upstream).await);
+        for body in [&unknown, &upstream] {
+            assert_eq!(body["error"]["param"], "previous_response_id", "{body}");
+            assert_eq!(body["error"]["type"], "invalid_request_error", "{body}");
+        }
+        assert_eq!(unknown["error"]["code"], "invalid_request");
+        assert_eq!(unknown["error"]["message"], "The request is invalid.");
+        assert_eq!(upstream["error"]["code"], "previous_response_not_found");
+        assert_eq!(
+            upstream["error"]["message"],
+            "Previous response with id 'resp_1' not found."
+        );
     }
 
     #[test]
@@ -1395,12 +1663,16 @@ mod tests {
         assert!(!on.to_string().contains("bedrock"), "{on}");
     }
 
-    /// An Anthropic error names the field at the head of its message. A
-    /// native Messages caller keeps it as `param`; the rest of the text, and
-    /// a head that is no field, stay the upstream's.
-    #[test]
-    fn an_anthropic_error_keeps_the_field_its_message_names() {
-        let on_wire = |wire: UpstreamWire, message: &str| {
+    /// An Anthropic error names the field at the head of its message
+    /// (`max_tokens: 64001 > 64000, …`), and Claude Code (2.1.319) matches
+    /// those very texts. A native Messages caller gets the message whole; a
+    /// translated one is in another protocol's words and gets the class,
+    /// naming no field.
+    #[tokio::test]
+    async fn an_anthropic_request_error_reaches_a_native_caller_whole() {
+        let message = "max_tokens: 64001 > 64000, which is the maximum allowed number of \
+                       output tokens for this model";
+        let err = || {
             ProxyError::Bridge(BridgeError::UpstreamStatus {
                 status: 400,
                 message: message.into(),
@@ -1410,62 +1682,28 @@ mod tests {
                     code: None,
                     param: None,
                 })),
-                wire,
+                wire: UpstreamWire::Anthropic,
                 retry_after: None,
                 diagnostic: None,
             })
         };
-        let anthropic = |_status: u16, message: &str| on_wire(UpstreamWire::Anthropic, message);
-        for (message, field) in [
-            (
-                "messages.1.content.0.image.source.base64.media_type: Input should be \
-                 'image/jpeg', 'image/png', 'image/gif' or 'image/webp'",
-                Some("messages.1.content.0.image.source.base64.media_type"),
-            ),
-            (
-                "max_tokens: 64001 > 64000, which is the maximum allowed number of output \
-                 tokens for this model",
-                Some("max_tokens"),
-            ),
-            // No field heads these.
-            ("Bedrock: ValidationException in us-east-1", None),
-            ("the request was malformed: try again", None),
-            ("Your credit balance is too low", None),
-        ] {
-            assert_eq!(
-                classify(&anthropic(400, message)),
-                PlatformErrorClass::InvalidRequest {
-                    param: field.map(str::to_owned)
-                },
-                "{message}"
-            );
-        }
-        // Only from a native dispatch, as any `param`.
-        let translated = in_platform_mode(|| {
-            crate::attribution::note_translated_dispatch(true);
-            caller_class(&anthropic(400, "max_tokens: Field required"))
-        });
+        let answer = |translated: bool| {
+            in_platform_mode(|| {
+                crate::attribution::note_translated_dispatch(translated);
+                err().into_anthropic_response()
+            })
+        };
+        let native = answer(false);
+        assert_eq!(native.status(), StatusCode::BAD_REQUEST);
         assert_eq!(
-            translated,
-            Some(PlatformErrorClass::InvalidRequest { param: None })
+            body_json(native).await,
+            serde_json::json!({"type": "error", "error": {
+                "type": "invalid_request_error", "message": message}})
         );
-        // Another wire's message is not read for a field.
-        for wire in [UpstreamWire::OpenAI, UpstreamWire::Bedrock] {
-            assert_eq!(
-                classify(&on_wire(wire, "max_tokens: Field required")),
-                PlatformErrorClass::InvalidRequest { param: None },
-                "{wire:?}"
-            );
-        }
-        // And the Anthropic envelope carries it.
-        let body: Value = serde_json::from_str(&in_platform_mode(|| {
-            crate::error::anthropic_platform_body(&classify(&anthropic(
-                400,
-                "max_tokens: Field required",
-            )))
-        }))
-        .unwrap();
-        assert_eq!(body["error"]["param"], "max_tokens");
+        let translated = body_json(answer(true)).await;
+        assert_eq!(translated["error"]["code"], "invalid_request");
+        assert_eq!(translated["error"]["message"], "The request is invalid.");
+        assert!(translated["error"].get("param").is_none(), "{translated}");
     }
 
     #[test]
@@ -1519,13 +1757,13 @@ mod tests {
         assert_eq!(v["sequence_number"], 4);
         assert!(!text.contains("Bedrock"), "{text}");
 
-        let failed = b"event: response.failed\ndata: {\"type\":\"response.failed\",\"sequence_number\":9,\"response\":{\"id\":\"resp_1\",\"status\":\"failed\",\"error\":{\"code\":\"context_length_exceeded\",\"message\":\"Anthropic said no\"}}}\n\n";
+        let failed = b"event: response.failed\ndata: {\"type\":\"response.failed\",\"sequence_number\":9,\"response\":{\"id\":\"resp_1\",\"status\":\"failed\",\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"Anthropic said no\"}}}\n\n";
         let out = in_platform_mode(|| relayed_responses_failure(failed)).unwrap();
         let (v, _) = crate::redact::parse_sse_json_event(&out);
         let v = v.unwrap();
         assert_eq!(v["type"], "response.failed");
         assert_eq!(v["response"]["status"], "failed");
-        assert_eq!(v["response"]["error"]["code"], "context_length_exceeded");
+        assert_eq!(v["response"]["error"]["code"], "rate_limit_exceeded");
         assert!(!String::from_utf8_lossy(&out).contains("Anthropic"));
 
         let mut buffer = b"event: response.created\ndata: {\"type\":\"response.created\",\"sequence_number\":0}\n\n".to_vec();
@@ -1534,7 +1772,7 @@ mod tests {
         let text = String::from_utf8(out).unwrap();
         assert!(text.starts_with("event: response.created\n"), "{text}");
         assert!(
-            text.contains("\"context_length_exceeded\"") && !text.contains("Anthropic"),
+            text.contains("\"rate_limit_exceeded\"") && !text.contains("Anthropic"),
             "{text}"
         );
     }
@@ -1600,25 +1838,34 @@ mod tests {
             assert_eq!(responses_failed_code(&class), code, "{class:?}");
         }
 
-        // An upstream's own `invalid_prompt`: a turn that fails the same way
-        // however often it is sent.
+        // An upstream's own `invalid_prompt`, after a translation: a turn
+        // that fails the same way however often it is sent. (A native one is
+        // relayed whole, [`relayed_status`].)
+        let translated = |f: &mut dyn FnMut()| {
+            in_platform_mode(|| {
+                crate::attribution::note_translated_dispatch(true);
+                f()
+            })
+        };
         let mut buffered = serde_json::json!({
             "object": "response",
             "status": "failed",
             "error": {"code": "invalid_prompt", "message": "flagged by the Bedrock stack"},
         });
-        in_platform_mode(|| relayed_failed_response(&mut buffered));
+        translated(&mut || relayed_failed_response(&mut buffered));
         assert_eq!(buffered["error"]["code"], "invalid_prompt");
         assert_eq!(buffered["error"]["message"], "The request is invalid.");
 
         let failed = b"event: response.failed\ndata: {\"type\":\"response.failed\",\"sequence_number\":3,\"response\":{\"id\":\"resp_1\",\"status\":\"failed\",\"error\":{\"code\":\"invalid_prompt\",\"message\":\"flagged by the Bedrock stack\"}}}\n\n";
-        let out = in_platform_mode(|| relayed_responses_failure(failed)).unwrap();
-        let (v, _) = crate::redact::parse_sse_json_event(&out);
+        let mut out = None;
+        translated(&mut || out = relayed_responses_failure(failed));
+        let (v, _) = crate::redact::parse_sse_json_event(&out.unwrap());
         assert_eq!(v.unwrap()["response"]["error"]["code"], "invalid_prompt");
 
         let flat = b"event: error\ndata: {\"type\":\"error\",\"code\":\"invalid_prompt\",\"message\":\"flagged\",\"param\":null,\"sequence_number\":3}\n\n";
-        let out = in_platform_mode(|| relayed_responses_failure(flat)).unwrap();
-        let (v, _) = crate::redact::parse_sse_json_event(&out);
+        let mut out = None;
+        translated(&mut || out = relayed_responses_failure(flat));
+        let (v, _) = crate::redact::parse_sse_json_event(&out.unwrap());
         assert_eq!(v.unwrap()["code"], "invalid_request");
     }
 
@@ -1650,6 +1897,49 @@ mod tests {
         assert_eq!(
             in_platform_mode(|| relayed_error(401, b"Incorrect API key for Azure resource")),
             Some(PlatformErrorClass::UpstreamUnavailable)
+        );
+    }
+
+    /// A request error a native stream reports goes out as its upstream wrote
+    /// it, less what the shared scrubber takes out of its text: a frame with
+    /// nothing to take out is left to the caller, which relays its bytes.
+    #[test]
+    fn a_relayed_request_error_frame_is_the_upstreams_less_what_the_scrubber_takes_out() {
+        let native = |frame: &[u8]| {
+            in_platform_mode(|| {
+                crate::attribution::note_translated_dispatch(false);
+                relayed_responses_failure(frame)
+            })
+        };
+        let clean = b"event: error\ndata: {\"type\":\"error\",\"code\":\"context_length_exceeded\",\"message\":\"Your input exceeds the context window.\",\"param\":\"input\",\"sequence_number\":4}\n\n";
+        assert_eq!(native(clean), None);
+
+        let arn = b"event: error\ndata: {\"type\":\"error\",\"code\":\"context_length_exceeded\",\"message\":\"Too long for arn:aws:bedrock:us-east-1:123456789012:inference-profile/x\",\"param\":\"input\",\"sequence_number\":4}\n\n";
+        let out = native(arn).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.starts_with("event: error\ndata: "), "{text}");
+        let (v, _) = crate::redact::parse_sse_json_event(text.as_bytes());
+        let v = v.unwrap();
+        assert_eq!(v["code"], "context_length_exceeded");
+        assert_eq!(v["param"], "input");
+        assert_eq!(v["sequence_number"], 4);
+        assert_eq!(v["message"], "Too long for <redacted>");
+
+        // A stream an output guardrail held back releases it the same way.
+        let mut buffer = b"event: response.created\ndata: {\"type\":\"response.created\",\"sequence_number\":0}\n\n".to_vec();
+        buffer.extend_from_slice(arn);
+        let out = in_platform_mode(|| {
+            crate::attribution::note_translated_dispatch(false);
+            relayed_responses_buffer(&buffer)
+        })
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.starts_with("event: response.created\n"), "{text}");
+        assert!(
+            text.contains("\"context_length_exceeded\"")
+                && text.contains("Too long for <redacted>")
+                && !text.contains("123456789012"),
+            "{text}"
         );
     }
 }
