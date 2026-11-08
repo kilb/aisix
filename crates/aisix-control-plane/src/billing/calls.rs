@@ -375,11 +375,53 @@ struct CallRow {
     ev: Value,
 }
 
-fn text(ev: &Value, key: &str) -> String {
+/// The text field `key` of `ev`, `""` when it has none.
+pub(super) fn text(ev: &Value, key: &str) -> String {
     ev.get(key)
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string()
+}
+
+/// What a tenant is shown of one recorded attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct TenantView {
+    pub status: TenantStatus,
+    /// Set for a final success only.
+    pub status_code: Option<u16>,
+    /// From the fixed vocabulary, for a final failure only.
+    pub error: Option<&'static str>,
+    /// The charge's status as a tenant reads it.
+    pub charge_status: &'static str,
+}
+
+/// How a tenant sees the usage row `ev` (read through [`EVENT_FIELDS`])
+/// whose charge is stored as `charge_status`, with `repriced` when a
+/// re-pricing run adjusted it; `None` when the row is hidden from the tenant
+/// ([`visible_to_tenant`]). Every tenant view of a row goes through here, so
+/// they cannot disagree on what a row shows.
+pub(super) fn tenant_view(ev: &Value, charge_status: &str, repriced: bool) -> Option<TenantView> {
+    let is_final = ev.get("is_final_attempt").and_then(Value::as_bool) == Some(true);
+    if !visible_to_tenant(is_final, charge_status, repriced) {
+        return None;
+    }
+    let status_code = ev
+        .get("status_code")
+        .and_then(Value::as_u64)
+        .and_then(|c| u16::try_from(c).ok())
+        .unwrap_or(0);
+    let (status, status_code, error) = tenant_outcome(
+        status_code,
+        &text(ev, "error_class"),
+        &text(ev, "error_message"),
+        is_final,
+    );
+    Some(TenantView {
+        status,
+        status_code,
+        error,
+        charge_status: tenant_charge_status(charge_status, repriced),
+    })
 }
 
 /// `GET /api/usage/calls` → `{items: [Call], next_before}`, newest first.
@@ -470,21 +512,7 @@ pub async fn list_calls(
     let items: Vec<Call> = rows
         .into_iter()
         .filter_map(|r| {
-            let is_final = r.ev.get("is_final_attempt").and_then(Value::as_bool) == Some(true);
-            if !visible_to_tenant(is_final, &r.status, r.adjusted.is_some()) {
-                return None;
-            }
-            let status_code =
-                r.ev.get("status_code")
-                    .and_then(Value::as_u64)
-                    .and_then(|c| u16::try_from(c).ok())
-                    .unwrap_or(0);
-            let (status, shown_code, error) = tenant_outcome(
-                status_code,
-                &text(&r.ev, "error_class"),
-                &text(&r.ev, "error_message"),
-                is_final,
-            );
+            let view = tenant_view(&r.ev, &r.status, r.adjusted.is_some())?;
             let key = Uuid::parse_str(&r.api_key_id)
                 .ok()
                 .and_then(|id| keys.get(&id));
@@ -505,9 +533,9 @@ pub async fn list_calls(
                 },
                 member,
                 operation: text(&r.ev, "operation"),
-                status,
-                status_code: shown_code,
-                error_class: error,
+                status: view.status,
+                status_code: view.status_code,
+                error_class: view.error,
                 cache_hit: text(&r.ev, "cache_status") == "hit",
                 guardrail_blocked: r.ev.get("guardrail_blocked").and_then(Value::as_bool)
                     == Some(true),
@@ -518,7 +546,7 @@ pub async fn list_calls(
                     .and_then(|ms| u32::try_from(ms).ok())
                     .filter(|ms| *ms > 0),
                 charge: ChargeView {
-                    status: tenant_charge_status(&r.status, r.adjusted.is_some()),
+                    status: view.charge_status,
                     amount_micro_usd: r.charge_micro_usd,
                     adjusted_micro_usd: r.adjusted.unwrap_or(0),
                     service_tier: r.service_tier,

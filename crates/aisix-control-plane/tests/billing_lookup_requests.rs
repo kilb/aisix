@@ -27,7 +27,8 @@ const PROVIDER_KEY: &str = "acct-bill-7c1";
 const GROUP: &str = "grp-bill-5d2";
 const UPSTREAM_MODEL: &str = "upstream-mdl-9f3";
 const UPSTREAM_ERROR: &str = "upstream secret 4b7";
-/// The `cost_usd` a row claims, which no answer may carry.
+/// The `cost_usd` a row claims: neither the field nor its value may reach
+/// an answer.
 const CLAIMED_COST: f64 = 98.7654;
 
 /// The keys of an answer and of one of its items, from the API section.
@@ -38,7 +39,7 @@ const ITEM_KEYS: [&str; 8] = [
     "status",
     "error",
     "charge_status",
-    "cost_usd",
+    "charge_usd",
     "estimated",
     "quantities",
 ];
@@ -326,8 +327,8 @@ async fn a_request_lookup_lists_the_callers_rows_newest_first() {
     }
     assert_eq!(time(&items[0]["occurred_at"]), t0 + TimeDelta::seconds(1));
     assert_eq!(time(&items[1]["occurred_at"]), t0);
-    assert_eq!(items[0]["cost_usd"], "0.010000");
-    assert_eq!(items[1]["cost_usd"], "0.000680");
+    assert_eq!(items[0]["charge_usd"], "0.010000");
+    assert_eq!(items[1]["charge_usd"], "0.000680");
     assert_eq!(
         items[0]["quantities"],
         json!({"input": 4000, "output": 3000})
@@ -435,9 +436,34 @@ async fn another_tenants_request_id_answers_like_an_unknown_one() {
             );
         }
     }
-    // And so does a key that does not exist.
+    // And so does a key that does not exist, and B's key once revoked.
     let unknown = lookup(&w.dp, &Uuid::new_v4().to_string(), "req-lk-9f3").await;
     assert_eq!((unknown.status, &unknown.body), (never.status, &never.body));
+    revoke(&w, &b_key).await;
+    let revoked = lookup(&w.dp, &b_key, "req-lk-9f3").await;
+    assert_eq!((revoked.status, &revoked.body), (never.status, &never.body));
+}
+
+/// Revokes key `key` as the world's operator.
+async fn revoke(w: &World, key: &str) {
+    let key = Uuid::parse_str(key).expect("a key id");
+    let version: i64 = sqlx::query_scalar("SELECT version FROM tenant_keys WHERE id = $1")
+        .bind(key)
+        .fetch_one(w.cp.db().pool())
+        .await
+        .expect("read the key");
+    let r = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("a client")
+        .delete(w.cp.url(&format!("/admin/keys/{key}")))
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .header(reqwest::header::COOKIE, w.admin.cookie())
+        .header(reqwest::header::IF_MATCH, format!("\"{version}\""))
+        .send()
+        .await
+        .expect("send");
+    assert!(r.status().is_success(), "{r:?}");
 }
 
 #[tokio::test]
@@ -460,6 +486,13 @@ async fn a_member_key_sees_only_its_members_rows_for_a_request_id() {
     assert_eq!(items(&lookup(&w.dp, &w.key, "req-lk-2e8").await).len(), 1);
     assert_eq!(
         items(&lookup(&w.dp, &owner_key, "req-lk-2e8").await).len(),
+        2
+    );
+    // An admin's key sees the tenant's rows too.
+    let admin = w.cp.seed_member(w.tenant, MemberRole::Admin).await.id;
+    let admin_key = seed_key(&w.cp, &w.admin, w.tenant, Some(admin)).await;
+    assert_eq!(
+        items(&lookup(&w.dp, &admin_key, "req-lk-2e8").await).len(),
         2
     );
 
@@ -520,19 +553,31 @@ async fn an_unpriced_row_makes_the_total_pending() {
                 t0 + TimeDelta::seconds(1),
                 tokens_680(),
             ),
+            // A request that used nothing: billed nothing, which is not
+            // pending.
+            row(
+                &w,
+                "up-3",
+                "req-lk-4b7",
+                priced,
+                t0 + TimeDelta::seconds(2),
+                json!({}),
+            ),
         ],
     )
     .await;
     let r = lookup(&w.dp, &w.key, "req-lk-4b7").await;
     let items = items(&r);
-    assert_eq!(items.len(), 2, "{r:?}");
+    assert_eq!(items.len(), 3, "{r:?}");
     assert_eq!(r.body["pending"], true);
     assert_eq!(r.body["total_usd"], "0.000680");
-    assert_eq!(items[0]["charge_status"], "pending");
-    assert_eq!(items[0]["cost_usd"], Value::Null);
-    assert_eq!(items[0]["quantities"], json!({}));
-    assert_eq!(items[1]["charge_status"], "charged");
-    assert_eq!(items[1]["cost_usd"], "0.000680");
+    assert_eq!(items[0]["charge_status"], "nothing_to_bill");
+    assert_eq!(items[0]["charge_usd"], "0.000000");
+    assert_eq!(items[1]["charge_status"], "pending");
+    assert_eq!(items[1]["charge_usd"], Value::Null);
+    assert_eq!(items[1]["quantities"], json!({}));
+    assert_eq!(items[2]["charge_status"], "charged");
+    assert_eq!(items[2]["charge_usd"], "0.000680");
 }
 
 #[tokio::test]
@@ -559,7 +604,7 @@ async fn an_adjusted_row_shows_its_corrected_cost() {
     )
     .await;
     let r = lookup(&w.dp, &w.key, "req-lk-8a2").await;
-    assert_eq!(items(&r)[0]["cost_usd"], "0.010000", "{r:?}");
+    assert_eq!(items(&r)[0]["charge_usd"], "0.010000", "{r:?}");
     assert_eq!(r.body["pending"], true);
 
     // Input goes to 1.034 USD per million, so the first row costs 340 µ$
@@ -569,11 +614,13 @@ async fn an_adjusted_row_shows_its_corrected_cost() {
     run_repricing(&w.cp).await;
     let r = lookup(&w.dp, &w.key, "req-lk-8a2").await;
     let items = items(&r);
-    assert_eq!(items[0]["cost_usd"], "0.010340", "{r:?}");
+    assert_eq!(items[0]["charge_usd"], "0.010340", "{r:?}");
     assert_eq!(items[0]["charge_status"], "charged");
     // A row the run charged reads charged, as in the call log.
-    assert_eq!(items[1]["cost_usd"], "0.000680", "{r:?}");
+    assert_eq!(items[1]["charge_usd"], "0.000680", "{r:?}");
     assert_eq!(items[1]["charge_status"], "charged");
+    // A run records no charge lines, so such a row shows no quantities.
+    assert_eq!(items[1]["quantities"], json!({}));
     assert_eq!(r.body["total_usd"], "0.011020");
     assert_eq!(r.body["pending"], false);
 }
@@ -627,6 +674,7 @@ async fn the_request_lookup_names_no_channel() {
         UPSTREAM_ERROR,
         "provider",
         "529",
+        "cost_usd",
         &CLAIMED_COST.to_string(),
         "cost_micro_usd",
         "cost_source",
@@ -702,4 +750,37 @@ async fn a_request_id_with_reserved_characters_is_found() {
     let r = lookup(&w.dp, &w.key, id).await;
     assert_eq!(items(&r).len(), 1, "{r:?}");
     assert_eq!(r.body["request_id"], id);
+}
+
+/// A lookup whose query cannot finish within its statement timeout (here
+/// one waiting on a table another transaction holds) gives its connection
+/// back and answers `503` after that timeout, not the pool-wide one; the
+/// next lookup is served.
+#[tokio::test]
+async fn a_lookup_past_its_statement_timeout_answers_503() {
+    let Some(w) = world().await else { return };
+    let m = model(&w, "chat-bill", true).await;
+    let t0 = base(&w.cp).await;
+    send_all(&w, vec![row(&w, "to-1", "req-lk-5c9", m, t0, tokens_680())]).await;
+
+    let mut holder = w.cp.db().pool().begin().await.expect("begin");
+    sqlx::query("LOCK TABLE pricing_charges IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *holder)
+        .await
+        .expect("hold the charges");
+    let started = std::time::Instant::now();
+    let r = lookup(&w.dp, &w.key, "req-lk-5c9").await;
+    let took = started.elapsed();
+    holder.rollback().await.expect("release the charges");
+    assert_eq!(
+        (r.status, &r.body["code"]),
+        (503, &json!("unavailable")),
+        "{r:?}"
+    );
+    // The lookup's own 2 s, well before the 5 s lock timeout every other
+    // statement has.
+    assert!(took >= std::time::Duration::from_millis(1_900), "{took:?}");
+    assert!(took < std::time::Duration::from_millis(4_000), "{took:?}");
+
+    assert_eq!(items(&lookup(&w.dp, &w.key, "req-lk-5c9").await).len(), 1);
 }
