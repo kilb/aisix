@@ -60,8 +60,10 @@ export interface TabProps {
   canEdit: boolean;
   /** Opens `tab`, and on a tab of sections the section named `section`. */
   onGoto: (tab: TabId, section?: string) => void;
-  /** The section a link asked this tab to open first. */
+  /** The section a link asked this tab to open. */
   initialSection?: string;
+  /** Counts the links that named a section, so asking for the same one again still switches. */
+  sectionVisit?: number;
   /** Reads the shell's attention markers again, after a page changed what they show. */
   refreshShell: () => void;
 }
@@ -217,9 +219,13 @@ export function App() {
   const [signOutError, setSignOutError] = useState<string | null>(null);
   const [tab, setTabOnly] = useState<TabId>("overview");
   const [section, setSection] = useState<string | undefined>(undefined);
+  // Each link that names a section bumps this: the same section asked for twice
+  // must still switch, and the name alone would not change.
+  const [sectionVisit, setSectionVisit] = useState(0);
   const setTab = useCallback((t: TabId, s?: string) => {
     setTabOnly(t);
     setSection(s);
+    if (s !== undefined) setSectionVisit((n) => n + 1);
   }, []);
   const [sessionEnded, setSessionEnded] = useState(false);
   const [passwordOpen, setPasswordOpen] = useState(false);
@@ -419,6 +425,7 @@ export function App() {
                 onGoto={setTab}
                 refreshShell={shell.refresh}
                 initialSection={section}
+                sectionVisit={sectionVisit}
               />
             </section>
           </main>

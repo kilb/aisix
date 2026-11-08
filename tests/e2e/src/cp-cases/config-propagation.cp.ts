@@ -20,14 +20,39 @@ import { startOpenAiUpstream, type OpenAiUpstream } from "../harness/upstream-op
 
 const chat = (model: string) => ({ model, messages: [{ role: "user", content: "hi" }] });
 
+/** The group the platform's own caller key names, and every account sits in. */
+const INTERNAL_GROUP = "grp-cfg-internal-7c1";
+
+/**
+ * `INTERNAL_GROUP`'s id, created once per stack: the group list the operator
+ * API answers carries names, not ids, until the groups table's own list
+ * lands, so a key's group is read from the create that answered it. Each
+ * `describe` block starts a stack of its own, and a group of one is not in
+ * another's database.
+ */
+const internalGroups = new WeakMap<ControlPlaneStack, Promise<string>>();
+function internalGroupId(cp: ControlPlaneStack): Promise<string> {
+  let group = internalGroups.get(cp);
+  if (!group) {
+    group = cp.admin
+      .createGroup(INTERNAL_GROUP, "配置下发 7c1")
+      .then((created: Json) => created.id as string);
+    internalGroups.set(cp, group);
+  }
+  return group;
+}
+
 /** An upstream account (in the default `shared` group) and one model on it. */
 async function seedModel(cp: ControlPlaneStack, upstream: OpenAiUpstream, name: string): Promise<Json> {
+  // The platform's own caller key names the group it reaches, so every
+  // account here is in it beside `shared`.
+  await internalGroupId(cp);
   const account = await cp.admin.create("provider_keys", {
     display_name: `${name}-account`,
     provider: "openai",
     api_key: "sk-cfg-upstream-e2e",
     api_base: `${upstream.baseUrl}/v1`,
-    groups: ["shared"],
+    groups: ["shared", INTERNAL_GROUP],
   });
   return cp.admin.create("models", {
     display_name: name,
@@ -37,14 +62,21 @@ async function seedModel(cp: ControlPlaneStack, upstream: OpenAiUpstream, name: 
   });
 }
 
-/** An operator's key on the platform's own tenant, for every model; its plaintext. */
+/**
+ * An operator's key on the platform's own tenant, for every model; its
+ * plaintext. Every key names one group, and the platform's own tenant has no
+ * assignment list to take it from, so the key names `INTERNAL_GROUP`, where
+ * this case's accounts are.
+ */
 async function mintInternalKey(cp: ControlPlaneStack): Promise<string> {
   const tenants = await cp.admin.get("/admin/tenants");
   const internal = (tenants.body.items as Json[]).find((t) => t.is_internal);
   expect(internal, tenants.text).toBeDefined();
+  const groupId = await internalGroupId(cp);
   const res = await cp.admin.post(`/admin/tenants/${internal.id}/keys`, {
     label: "cfg-caller",
     allowed_models: ["*"],
+    group_id: groupId,
   });
   expect(res.status, res.text).toBe(201);
   return res.body.plaintext;

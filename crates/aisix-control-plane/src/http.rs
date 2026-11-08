@@ -31,7 +31,7 @@ use crate::auth::{MemberRole, OperatorRole, KEY_HOLDERS};
 use crate::error::{ApiError, Detail};
 use crate::{
     audit, billing, channels, dp, gateways, groups, keys, members, operators, pricing, projector,
-    resources, rollout, tenants, usage, AppState,
+    resources, rollout, tenants, upstream_models, usage, AppState,
 };
 
 /// The largest request body either listener reads.
@@ -263,6 +263,13 @@ pub const ROUTE_ROLES: &[(&str, &str, MinRole)] = &[
         "/admin/keys/{id}",
         MinRole::Op(OperatorRole::Operator),
     ),
+    // An upstream account's own model list, for the pickers. Operator, not
+    // Viewer: it spends the account's credential on a call to the upstream.
+    (
+        "GET",
+        "/admin/provider-keys/{id}/upstream-models",
+        MinRole::Op(OperatorRole::Operator),
+    ),
     // The tenant API.
     ("POST", "/api/signup", MinRole::Public),
     ("POST", "/api/login", MinRole::Public),
@@ -272,6 +279,8 @@ pub const ROUTE_ROLES: &[(&str, &str, MinRole)] = &[
     ("POST", "/api/password", MinRole::Member(EVERY_MEMBER)),
     ("GET", "/api/org", MinRole::Member(EVERY_MEMBER)),
     ("GET", "/api/models", MinRole::Member(EVERY_MEMBER)),
+    // The groups a tenant may choose a key's group from, by display name.
+    ("GET", "/api/groups", MinRole::Member(EVERY_MEMBER)),
     ("GET", "/api/members", MinRole::Member(MANAGERS)),
     ("GET", "/api/members/invites", MinRole::Member(MANAGERS)),
     ("POST", "/api/members/invites", MinRole::Member(MANAGERS)),
@@ -578,6 +587,34 @@ pub const ROUTE_ROLES: &[(&str, &str, MinRole)] = &[
         "/admin/provider-keys/{id}/channel-models/{public_model_id}",
         MinRole::Op(OperatorRole::Operator),
     ),
+    // The price import: an upload of a public dataset, and its proposals.
+    (
+        "GET",
+        "/admin/pricing/imports",
+        MinRole::Op(OperatorRole::Viewer),
+    ),
+    (
+        "POST",
+        "/admin/pricing/imports",
+        MinRole::Op(OperatorRole::Operator),
+    ),
+    (
+        "GET",
+        "/admin/pricing/imports/{id}",
+        MinRole::Op(OperatorRole::Viewer),
+    ),
+    // Deciding a proposal: a confirmation writes a baseline, a rejection
+    // only the decision.
+    (
+        "POST",
+        "/admin/pricing/imports/{id}/proposals/{pid}/confirm",
+        MinRole::Op(OperatorRole::Operator),
+    ),
+    (
+        "POST",
+        "/admin/pricing/imports/{id}/proposals/{pid}/reject",
+        MinRole::Op(OperatorRole::Operator),
+    ),
     // Gateways, on the gateway listener.
     ("POST", "/dp/heartbeat", MinRole::Dp),
     ("GET", "/dp/v1/keys/{key_id}/prices", MinRole::Dp),
@@ -693,6 +730,10 @@ pub fn browser_router(state: AppState) -> Router {
                 .patch(keys::admin_update)
                 .delete(keys::admin_revoke),
         )
+        .route(
+            "/admin/provider-keys/{id}/upstream-models",
+            get(upstream_models::list),
+        )
         .route("/api/signup", post(members::signup))
         .route("/api/login", post(members::login))
         .route("/api/logout", post(members::logout))
@@ -701,6 +742,7 @@ pub fn browser_router(state: AppState) -> Router {
         .route("/api/password", post(members::change_password))
         .route("/api/org", get(members::org))
         .route("/api/models", get(members::models))
+        .route("/api/groups", get(groups::tenant_groups))
         .route("/api/members", get(members::list))
         .route(
             "/api/members/invites",
@@ -830,6 +872,26 @@ pub fn browser_router(state: AppState) -> Router {
         .route(
             "/admin/provider-keys/{id}/channel-models/{public_model_id}",
             axum::routing::put(channels::put_channel).delete(channels::delete_channel),
+        )
+        // A dataset is far larger than any other body: the upload's own
+        // limit, as `/dp/telemetry` has. The listing takes no body, so the
+        // limit binds only the upload.
+        .route(
+            "/admin/pricing/imports",
+            get(pricing::import::list)
+                .post(pricing::import::upload)
+                .layer(DefaultBodyLimit::max(pricing::import::MAX_IMPORT_BYTES)),
+        )
+        .route("/admin/pricing/imports/{id}", get(pricing::import::detail))
+        // Deciding a proposal: a confirmation writes a third-party baseline,
+        // a rejection only the decision.
+        .route(
+            "/admin/pricing/imports/{id}/proposals/{pid}/confirm",
+            post(pricing::import::confirm),
+        )
+        .route(
+            "/admin/pricing/imports/{id}/proposals/{pid}/reject",
+            post(pricing::import::reject),
         )
         .route_layer(axum::middleware::from_fn(json_only))
         .route_layer(axum::middleware::from_fn(only_listed_routes))

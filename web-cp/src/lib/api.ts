@@ -1178,3 +1178,88 @@ export const reconciliation = {
     return (await call<Reconciliation>("GET", `/admin/billing/reconciliation${query}`)).data;
   },
 };
+
+// ── pricing: baselines ──────────────────────────────────────────────────────
+
+/** Where a baseline's card came from: the built-in catalogue, an attested third-party dataset, or an operator's own entry. */
+export type BaselineSource =
+  | {
+      source_kind: "catalogue";
+      source: {
+        catalogue_version: string;
+        entry_key: string;
+        entry_effective_from: string | null;
+        source_url: string;
+        as_of: string;
+      };
+    }
+  | {
+      source_kind: "third_party";
+      source: {
+        dataset: string;
+        dataset_ref: string;
+        pricing_url: string | null;
+        prices_checked: string | null;
+        import_id: string;
+        proposal_id: string;
+        attested_by: string;
+        attested_at: string;
+      };
+    }
+  | { source_kind: "manual"; source: { note: string } };
+
+/** One baseline revision: the official USD list price of a model, from `effective_from`, and where it came from. */
+export interface BaselineRevision {
+  revision_id: number;
+  engine_version: number;
+  model_id: string;
+  effective_from: string;
+  /** As stored: a card this engine cannot read is still listed. */
+  card: RateCard;
+  source_kind: BaselineSource["source_kind"];
+  source: Record<string, unknown>;
+  /** `null` when the control plane itself wrote it. */
+  created_by: { id: string; email: string } | null;
+  created_at: string;
+}
+
+/** The catalogue's word on a model's baseline, when it says something else now. */
+export interface CatalogueUpdate {
+  catalogue_version: string;
+  entry_key: string;
+  entries: { effective_from: string | null; card: RateCard }[];
+}
+
+/** One model's baselines: in force now, scheduled after it, and the catalogue's update to them. */
+export interface BaselineRow {
+  model_id: string;
+  name: string;
+  current: BaselineRevision | null;
+  upcoming: BaselineRevision[];
+  catalogue_update: CatalogueUpdate | null;
+}
+
+/** What `POST /admin/pricing/baselines` takes: a card with its `note`, or a `catalogue_key`, never both. */
+export interface NewBaseline {
+  model_id: string;
+  effective_from: string;
+  card?: RateCard;
+  catalogue_key?: string;
+  note?: string;
+}
+
+export type BaselineCreated = {
+  revision: BaselineRevision;
+  later_revisions: BaselineRevision[];
+  warnings: PriceWarning[];
+};
+
+export const baselines = {
+  /** Every live model's baseline, the models without one first. */
+  async list(): Promise<BaselineRow[]> {
+    return (await call<{ items: BaselineRow[] }>("GET", "/admin/pricing/baselines")).data.items;
+  },
+  async create(body: NewBaseline): Promise<BaselineCreated> {
+    return (await call<BaselineCreated>("POST", "/admin/pricing/baselines", body)).data;
+  },
+};

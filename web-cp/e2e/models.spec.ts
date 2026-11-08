@@ -63,14 +63,19 @@ async function directModel(name: string, accountId: string, upstreamModel = "gpt
   return createModel({ display_name: name, provider: "openai", model_name: upstreamModel, provider_key_id: accountId });
 }
 
-/** An upstream account the stand-in answers for, in `groups`. */
+/**
+ * An upstream account the stand-in answers for, in `groups` and in the group
+ * the spec's internal key names: that key reaches only the accounts of the
+ * one group it names.
+ */
 async function mockAccount(name: string, groups: string[]): Promise<Json> {
+  await internalGroupId();
   return createAccount({
     display_name: name,
     provider: "openai",
     api_key: `sk-e2e-${name}-upstream`,
     api_base: `${stack.mockUpstreamUrl}/v1`,
-    groups,
+    groups: [...groups, INTERNAL_GROUP],
   });
 }
 
@@ -83,12 +88,36 @@ async function status(path: string): Promise<number> {
   return (await stack.admin.request("GET", path)).status;
 }
 
+/** The group every mock account of this spec joins, and its key names. */
+const INTERNAL_GROUP = "grp-models-ui-7c1";
+const internalGroups = new WeakMap<Stack, Promise<string>>();
+function internalGroupId(): Promise<string> {
+  let group = internalGroups.get(stack);
+  if (!group) {
+    group = stack.admin
+      .post("/admin/provider-groups", {
+        name: INTERNAL_GROUP,
+        display_name: "模型自用 7c1",
+        default_cny_per_usd: "7.2",
+      })
+      .then((created: Json) => created.id as string);
+    internalGroups.set(stack, group);
+  }
+  return group;
+}
+
 /** A key of the platform's own tenant that may call `models` by name. */
 async function internalKey(label: string, models: string[]): Promise<string> {
   const { items } = await stack.admin.get("/admin/tenants");
   const internal = (items as Json[]).find((t) => t.is_internal);
   expect(internal, JSON.stringify(items)).toBeDefined();
-  const { plaintext } = await stack.admin.post(`/admin/tenants/${internal.id}/keys`, { label, allowed_models: models });
+  // Every key names one group; the platform's own tenant has no assignment
+  // list, so it names the one this spec's accounts join.
+  const { plaintext } = await stack.admin.post(`/admin/tenants/${internal.id}/keys`, {
+    label,
+    allowed_models: models,
+    group_id: await internalGroupId(),
+  });
   return plaintext;
 }
 

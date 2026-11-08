@@ -144,6 +144,8 @@ export async function billingWorld(opts: BillingWorldOptions = {}): Promise<Bill
         );
         check(`granting tenant ${name}`, granted, 200);
         await opts.setup?.(id);
+        // The tenant's one assigned group is `shared`, by the first boot's
+        // defaults, so its key takes it without naming it.
         const minted = await stack.admin.post(`/admin/tenants/${id}/keys`, { label: `${name} key` });
         check(`minting a key of ${name}`, minted, 201);
         const key: string = minted.body.plaintext;

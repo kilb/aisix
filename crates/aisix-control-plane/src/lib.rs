@@ -38,6 +38,8 @@ pub mod resources;
 pub mod rollout;
 pub mod settings;
 pub mod tenants;
+pub mod upstream_http;
+pub mod upstream_models;
 pub mod usage;
 
 use auth::password::{LoginThrottle, PasswordGate, ARGON2_GATE_PERMITS};
@@ -84,6 +86,10 @@ pub struct AppState {
     /// they never take the connections usage intake needs
     /// ([`billing::access::LOOKUP_POOL_SIZE`]).
     pub lookups: Db,
+    /// The one outbound client, and the model lists it has fetched
+    /// ([`upstream_models::Cache`]).
+    pub upstream: Arc<upstream_http::Client>,
+    pub upstream_models: Arc<upstream_models::Cache>,
 }
 
 /// A booted control plane. Dropping it stops everything it runs.
@@ -167,6 +173,32 @@ pub async fn start_with_catalogue<S>(
     cfg: CpConfig,
     shutdown: S,
     catalogue: Option<Arc<aisix_pricing::Catalogue>>,
+) -> Result<Running, BootError>
+where
+    S: Future<Output = ()> + Send + 'static,
+{
+    start_with_policy(
+        cfg,
+        shutdown,
+        catalogue,
+        &aisix_core::config::SsrfProtectionConfig::default(),
+    )
+    .await
+}
+
+/// [`start_with_catalogue`], with the outbound address policy the
+/// upstream-model route applies.
+///
+/// Production takes [`aisix_core::config::SsrfProtectionConfig::default`] —
+/// on, with no allowed hosts — and no configuration or environment variable
+/// reaches this parameter. Only a caller of this library can pass another
+/// policy, which is how a test reaches a fixture server on a loopback
+/// address the default refuses.
+pub async fn start_with_policy<S>(
+    cfg: CpConfig,
+    shutdown: S,
+    catalogue: Option<Arc<aisix_pricing::Catalogue>>,
+    outbound: &aisix_core::config::SsrfProtectionConfig,
 ) -> Result<Running, BootError>
 where
     S: Future<Output = ()> + Send + 'static,
@@ -268,6 +300,7 @@ where
         billing::access::LOOKUP_POOL_SIZE,
         billing::access::LOOKUP_ACQUIRE_TIMEOUT,
     );
+    let upstream = upstream_http::Client::new(outbound).map_err(BootError::OutboundPolicy)?;
     let state = AppState {
         db,
         env,
@@ -282,6 +315,8 @@ where
         telemetry_bodies: Arc::new(Semaphore::new(dp::telemetry::MAX_BODIES_IN_FLIGHT)),
         prices: Arc::new(PriceBookCache::new(catalogue)),
         lookups,
+        upstream: Arc::new(upstream),
+        upstream_models: Arc::new(upstream_models::Cache::default()),
     };
 
     // Nothing fails from here on, so nothing spawned below is left behind

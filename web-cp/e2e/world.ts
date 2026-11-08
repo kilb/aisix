@@ -126,6 +126,29 @@ function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+/**
+ * The group the Dashboard's internal-key fixtures mint into, created once per
+ * stack and cached: a key names one group by id, the platform's own tenant has
+ * no assignment list to take it from, and the operator API's group list
+ * answers names.
+ */
+const internalGroups = new WeakMap<Stack, Promise<string>>();
+export function internalGroupId(stack: Stack): Promise<string> {
+  let group = internalGroups.get(stack);
+  if (!group) {
+    group = stack.admin
+      .post("/admin/provider-groups", {
+        name: "grp-internal-ui-7c1",
+        display_name: "平台自用 7c1",
+        description: "e2e 内部租户的密钥",
+        default_cny_per_usd: "7.2",
+      })
+      .then((created: Json) => created.id as string);
+    internalGroups.set(stack, group);
+  }
+  return group;
+}
+
 /** A `/api` client signed in as `login`. */
 async function signedIn(stack: Stack, login: Login): Promise<ApiClient> {
   const client = stack.tenant();
@@ -230,9 +253,12 @@ export async function internalKey(stack: Stack): Promise<string> {
   const { items } = await stack.admin.get("/admin/tenants");
   const internal = items.find((t: { is_internal?: boolean }) => t.is_internal);
   if (!internal) throw new Error("the stack has no internal tenant");
+  // The platform's own keys name one group too, and the tenant has no
+  // assignment list to take it from.
   const created = await stack.admin.post(`/admin/tenants/${internal.id}/keys`, {
     label: `internal-load-${randomUUID().slice(0, 6)}`,
     allowed_models: ["*"],
+    group_id: await internalGroupId(stack),
   });
   await gatewayAdmits(stack, created.plaintext);
   return created.plaintext;

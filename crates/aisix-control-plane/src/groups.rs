@@ -4,10 +4,10 @@
 //! ([`crate::pricing::rates`]).
 //!
 //! A group is never deleted. Retiring one refuses `409 group_in_use` while
-//! any tenant, the tenant defaults, a live key's override or a live provider
-//! key still names it, and the answer counts each. A retired group accepts
-//! no rate, leaves every picker, and keeps its row and its name for the
-//! history that references it.
+//! any tenant, the tenant defaults, a live key's group or override, or a
+//! live provider key still names it, and the answer counts each. A retired
+//! group accepts no rate, leaves every picker, and keeps its row and its
+//! name for the history that references it.
 //!
 //! At most one group is designated the default (`is_default`): the one an
 //! upgrade gives every internal key still without a group. It cannot be
@@ -18,8 +18,27 @@
 //! The lock order is tenant row, then its billing account, then group rows
 //! (ascending id), then `RESOURCES_LOCK_KEY` (design D20). A path that names
 //! a group takes its row `FOR SHARE` ([`lock_one`], as a rate write does);
-//! retiring and `make-default` take it `FOR UPDATE`, so no write can name a
-//! group between retire's count and its update.
+//! `make-default` takes it `FOR UPDATE`, so two designations serialise.
+//!
+//! A retire takes its group row `FOR UPDATE` and then also
+//! `RESOURCES_LOCK_KEY`, and counts the references under both. That closes
+//! the two ways a name could land after the count:
+//! - a tenant, a key or a rate naming the group waits on the row itself (a
+//!   key's own `group_id` row is not locked, but assigning a group to a
+//!   tenant and writing a rate both are, and a key is created under its
+//!   tenant's row);
+//! - a provider-key document is written under `RESOURCES_LOCK_KEY` only, so
+//!   the retire holds that lock for its count and its update. A provider-key
+//!   write that gets the lock second is refused at `/groups` for naming a
+//!   retired group ([`crate::resources::write`]); one that gets it first has
+//!   committed before the count reads it, and the retire refuses with
+//!   `group_in_use`.
+//!
+//! So a group is never retired while a live provider key names it, and a
+//! provider key never names a retired group. Task 12's provider-key write
+//! additionally takes its groups `FOR SHARE` before the resources lock,
+//! which orders the two writes' waits on the group row rather than on the
+//! resources lock; the invariant holds with either lock order.
 //!
 //! # References are counted, never copied
 //!
@@ -39,12 +58,15 @@ use sqlx::PgConnection;
 use uuid::Uuid;
 
 use crate::audit::{self, Actor, AuditEntry};
-use crate::auth::{OperatorAuth, OperatorRole};
+use crate::auth::{MemberAuth, MemberRole, OperatorAuth, OperatorRole};
 use crate::db::DbError;
 use crate::error::{ApiError, Detail};
 use crate::http::ApiJson;
+use crate::keys::KeyGroup;
 use crate::pricing::rates::{self, NewGroupRate, RatePlan};
-use crate::resources::{store, Kind};
+use crate::pricing::store;
+use crate::resources::{refs, Kind};
+use crate::tenants::{self, TenantRow};
 use crate::AppState;
 
 /// The longest a routing name may be, in characters: the same bound every
@@ -55,18 +77,130 @@ const MAX_NAME_CHARS: usize = 64;
 const MAX_DISPLAY_CHARS: usize = 64;
 const MAX_DESCRIPTION_CHARS: usize = 500;
 
-/// A `422` at `path`.
-fn refused(path: &str, message: impl Into<String>) -> ApiError {
-    ApiError::validation(vec![Detail {
-        path: path.to_string(),
-        message: message.into(),
-    }])
-}
-
 /// The group `raw` names; `404` for an id that names nothing, as every id in
 /// a path does.
 fn group_id(raw: &str) -> Result<Uuid, ApiError> {
     Uuid::parse_str(raw).map_err(|_| ApiError::not_found())
+}
+
+/// The one refusal every `/group_id` a tenant may not name shares: an id
+/// that names nothing to it, a retired group and another tenant's group are
+/// the same answer, so nothing leaks which groups exist.
+fn group_unavailable() -> ApiError {
+    store::refused("/group_id", "分组不存在或不可用")
+}
+
+/// The group a key of tenant `t` should name, given the `group_id` its body
+/// carries (`None` when it left it out). Takes the group's row `FOR SHARE`,
+/// so the caller must hold `t`'s lock and must call this before
+/// `write_resource`, as [`crate::keys::create_key`] does.
+///
+/// - An id: the live group it names. For a customer it must be one of `t`'s
+///   assigned groups; the platform's own tenant may name any live group.
+/// - Omitted: the one live group `t` is assigned, when it is assigned
+///   exactly one. A customer with several, and the platform's own tenant,
+///   which has no assignment list, must choose.
+///
+/// Refused `422 /group_id`: "分组不存在或不可用" for an id that names
+/// nothing, a retired group or another tenant's, and "请选择分组" when the
+/// id was omitted and no single group applies.
+pub async fn key_group(
+    conn: &mut PgConnection,
+    t: &TenantRow,
+    raw: Option<&str>,
+) -> Result<KeyGroup, ApiError> {
+    let Some(raw) = raw else {
+        let only = match t.allowed_provider_groups.as_slice() {
+            [only] => Some(only.clone()),
+            _ => None,
+        };
+        // The platform's own tenant has no assignment list, so it never has
+        // a single group to fall back on: its keys always choose.
+        let only = match only {
+            Some(name) if !t.is_internal => Some(name),
+            _ => None,
+        };
+        let Some(name) = only else {
+            return Err(store::refused("/group_id", "请选择分组"));
+        };
+        let row: Option<GroupRow> = sqlx::query_as(&format!(
+            "SELECT {COLUMNS} FROM provider_groups \
+             WHERE name = $1 AND retired_at IS NULL FOR SHARE"
+        ))
+        .bind(&name)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(DbError::from)?;
+        let row = row.ok_or_else(group_unavailable)?;
+        return Ok(row.key_group());
+    };
+    let id = Uuid::parse_str(raw).map_err(|_| group_unavailable())?;
+    let row = sqlx::query_as::<_, GroupRow>(&format!(
+        "SELECT {COLUMNS} FROM provider_groups WHERE id = $1 FOR SHARE"
+    ))
+    .bind(id)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(DbError::from)?
+    .ok_or_else(group_unavailable)?;
+    if row.retired_at.is_some() {
+        return Err(group_unavailable());
+    }
+    if !t.is_internal && !t.allowed_provider_groups.contains(&row.name) {
+        return Err(group_unavailable());
+    }
+    Ok(row.key_group())
+}
+
+impl GroupRow {
+    /// The group as a key records it: its id, its routing name and what a
+    /// tenant sees.
+    fn key_group(&self) -> KeyGroup {
+        KeyGroup {
+            id: self.id,
+            name: self.name.clone(),
+            display_name: self.display_name.clone(),
+        }
+    }
+}
+
+/// `GET /api/groups` → `{items: [{id, display_name, description}]}`: the
+/// live groups `t` assigns, by display name, which is what a tenant chooses
+/// its keys' group from. Never a routing `name`, and never a group its tenant
+/// is not assigned.
+pub async fn tenant_groups(
+    auth: MemberAuth,
+    State(state): State<AppState>,
+) -> Result<Json<Value>, ApiError> {
+    auth.require_active()?;
+    auth.require(&[
+        MemberRole::Owner,
+        MemberRole::Admin,
+        MemberRole::Member,
+        MemberRole::Billing,
+    ])?;
+    let mut conn = state.db.pool().acquire().await.map_err(DbError::from)?;
+    let tenant = tenants::find(&mut conn, auth.tenant_id).await?;
+    let items: Vec<Value> = groups_of(&mut conn, &tenant.allowed_provider_groups)
+        .await?
+        .into_iter()
+        .map(|row| {
+            json!({"id": row.id, "display_name": row.display_name, "description": row.description})
+        })
+        .collect();
+    Ok(Json(json!({ "items": items })))
+}
+
+/// The live groups `names` assigns, by display name then id.
+async fn groups_of(conn: &mut PgConnection, names: &[String]) -> Result<Vec<GroupRow>, DbError> {
+    sqlx::query_as(&format!(
+        "SELECT {COLUMNS} FROM provider_groups \
+         WHERE name = ANY($1) AND retired_at IS NULL ORDER BY display_name, id"
+    ))
+    .bind(names)
+    .fetch_all(conn)
+    .await
+    .map_err(DbError::from)
 }
 
 /// The decimal-string message a rate or a description of one is refused
@@ -155,7 +289,15 @@ impl GroupUse {
     /// Whether anything still names the group.
     #[must_use]
     pub fn any(self) -> bool {
-        self.tenants + self.defaults + self.keys + self.provider_keys + self.default_group > 0
+        [
+            self.tenants,
+            self.defaults,
+            self.keys,
+            self.provider_keys,
+            self.default_group,
+        ]
+        .into_iter()
+        .any(|count| count > 0)
     }
 }
 
@@ -235,27 +377,19 @@ async fn provider_keys_of(
     conn: &mut PgConnection,
     name: &str,
 ) -> Result<Vec<ProviderKeyRef>, DbError> {
-    let mut keys: Vec<ProviderKeyRef> = store::list(&mut *conn, Kind::ProviderKeys)
-        .await?
+    let rows: Vec<(Uuid, String)> = sqlx::query_as(
+        "SELECT id, COALESCE(doc->>'display_name', '') FROM gw_resources \
+         WHERE kind = $1 AND NOT deleted AND doc->'groups' ? $2 \
+         ORDER BY 2, 1",
+    )
+    .bind(Kind::ProviderKeys.segment())
+    .bind(name)
+    .fetch_all(&mut *conn)
+    .await?;
+    Ok(rows
         .into_iter()
-        .filter(|row| {
-            row.doc
-                .get("groups")
-                .and_then(Value::as_array)
-                .is_some_and(|groups| groups.iter().any(|g| g.as_str() == Some(name)))
-        })
-        .map(|row| ProviderKeyRef {
-            id: row.id,
-            display_name: row
-                .doc
-                .get("display_name")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
-        })
-        .collect();
-    keys.sort_by(|a, b| a.display_name.cmp(&b.display_name).then(a.id.cmp(&b.id)));
-    Ok(keys)
+        .map(|(id, display_name)| ProviderKeyRef { id, display_name })
+        .collect())
 }
 
 /// The API's `Group`: the row, what still names it, its provider keys and
@@ -327,12 +461,14 @@ fn checked_description(raw: &str) -> Result<String, Detail> {
     Ok(raw.trim().to_string())
 }
 
-/// A rate as given: a decimal string of at most four decimals, 0 to 100.
-fn checked_rate(raw: &Value) -> Result<aisix_pricing::CnyPerUsd, Detail> {
-    raw.as_str()
+/// A rate as given, at `path`: a decimal string of at most four decimals, 0
+/// to 100. `null`, an absent field and a JSON number are all refused, so the
+/// two routes that take a rate answer the same input the same way.
+fn checked_rate(path: &str, raw: Option<&Value>) -> Result<aisix_pricing::CnyPerUsd, Detail> {
+    raw.and_then(Value::as_str)
         .and_then(|s| aisix_pricing::CnyPerUsd::parse(s).ok())
         .ok_or_else(|| Detail {
-            path: "/default_cny_per_usd".to_string(),
+            path: path.to_string(),
             message: RATE_MESSAGE.to_string(),
         })
 }
@@ -373,6 +509,10 @@ pub struct UpdateBody {
 /// `POST /admin/provider-groups` → `201 Group`: the group and its default
 /// rate, in one transaction, audited as `provider_group.create` and
 /// `pricing.group_rate.create`.
+///
+/// The default rate creating a group takes no `note`: it is the rate the
+/// group starts at, not a hand-entered revision, and a later one may be
+/// written with its own note through `POST /admin/provider-groups/{id}/rates`.
 pub async fn create(
     auth: OperatorAuth,
     State(state): State<AppState>,
@@ -408,7 +548,7 @@ pub async fn create(
             None
         }
     };
-    let rate = match checked_rate(&default_cny_per_usd) {
+    let rate = match checked_rate("/default_cny_per_usd", Some(&default_cny_per_usd)) {
         Ok(rate) => Some(rate),
         Err(d) => {
             problems.push(d);
@@ -444,7 +584,7 @@ pub async fn create(
                         if db.code().as_deref() == Some("23505")
                             && db.constraint() == Some("provider_groups_name_key") =>
                     {
-                        refused("/name", "分组名称已存在")
+                        store::refused("/name", "分组名称已存在")
                     }
                     _ => ApiError::from(DbError::from(e)),
                 })?;
@@ -589,6 +729,13 @@ pub async fn update(
 /// `retired_at` once nothing names the group; `409 group_in_use` with the
 /// counts while something does. Retiring a retired group changes nothing and
 /// answers its view.
+///
+/// The counts are read under the group's own `FOR UPDATE` lock and under
+/// `RESOURCES_LOCK_KEY`, and the update lands while both are held. A
+/// provider-key write waits on the same resources lock: one that gets it
+/// first is counted, and one that gets it second is refused at `/groups`
+/// because the group is retired by then
+/// (`a_provider_key_write_and_a_retire_never_end_with_a_retired_group_named`).
 pub async fn retire(
     auth: OperatorAuth,
     State(state): State<AppState>,
@@ -603,6 +750,12 @@ pub async fn retire(
             async move {
                 let row = lock_one(&mut *conn, id, LockMode::Update).await?;
                 if row.retired_at.is_none() {
+                    // The provider-key half of `references` counts documents
+                    // a `write_resource` writes under this lock, so holding
+                    // it across the count and the update is what makes the
+                    // refusal true for them. The group row is already held,
+                    // which is the documented order: group rows, then this.
+                    refs::lock_resources(&mut *conn).await?;
                     let uses = references(&mut *conn, &row).await?;
                     if uses.any() {
                         return Err(ApiError::group_in_use(&uses));
@@ -750,8 +903,10 @@ pub struct RateBody {
     #[serde(default)]
     model_id: Option<Uuid>,
     /// A decimal string; `null` or absent on a model row ends its override.
+    /// Parsed like the group's own default rate, so a JSON number answers
+    /// `422 /cny_per_usd` here too.
     #[serde(default)]
-    cny_per_usd: Option<String>,
+    cny_per_usd: Option<Value>,
     effective_from: DateTime<Utc>,
     #[serde(default)]
     note: Option<String>,
@@ -770,9 +925,9 @@ pub async fn create_rate(
     let id = group_id(&raw)?;
     let rate = body
         .cny_per_usd
-        .as_deref()
+        .as_ref()
         .map(|raw| {
-            aisix_pricing::CnyPerUsd::parse(raw).map_err(|_| refused("/cny_per_usd", RATE_MESSAGE))
+            checked_rate("/cny_per_usd", Some(raw)).map_err(|d| ApiError::validation(vec![d]))
         })
         .transpose()?;
     let row = NewGroupRate {

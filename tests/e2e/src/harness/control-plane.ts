@@ -187,6 +187,28 @@ export class CpAdmin extends CpClient {
     return res.body;
   }
 
+  /**
+   * Creates a provider group and returns its view, whose `id` a key names as
+   * `group_id`: every key names exactly one group. A case that routes a key
+   * to one group gives that group a provider account (`groups`) and mints
+   * the key into it.
+   */
+  async createGroup(
+    name: string,
+    displayName: string,
+    cnyPerUsd = "7.2",
+  ): Promise<Json> {
+    const res = await this.post("/admin/provider-groups", {
+      name,
+      display_name: displayName,
+      description: "e2e 分组",
+      default_cny_per_usd: cnyPerUsd,
+    });
+    if (res.status !== 201) throw new Error(`creating group ${name} answered ${res.status}: ${res.text}`);
+    return res.body;
+  }
+
+
   /** The gateway instance running under credential `dpId`, if it has reported. */
   async instance(dpId: string): Promise<Json | undefined> {
     const res = await this.get("/admin/gateways/instances");

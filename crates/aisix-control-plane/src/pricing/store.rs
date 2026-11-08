@@ -537,7 +537,7 @@ pub struct DiscountRevision {
 }
 
 /// A `422` at `path`.
-fn refused(path: &str, message: impl Into<String>) -> ApiError {
+pub(crate) fn refused(path: &str, message: impl Into<String>) -> ApiError {
     ApiError::validation(vec![Detail {
         path: path.to_string(),
         message: message.into(),

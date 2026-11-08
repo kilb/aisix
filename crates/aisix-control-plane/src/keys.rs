@@ -23,8 +23,18 @@
 //! carries either. On `/api/*` a key is looked up within the caller's tenant
 //! (and, for a member who does not manage keys, among their own) before
 //! anything else, so another tenant's key answers exactly as an id that
-//! names nothing; tenant views name no provider group and no endpoint
-//! family.
+//! names nothing; tenant views name a group by its display name only, never
+//! its routing name, and no endpoint family.
+//!
+//! # One group per key
+//!
+//! Every key names exactly one provider group, chosen when it is created
+//! ([`crate::groups::key_group`]) and fixed from then on: switching groups
+//! means a new key. Its document routes to that group alone
+//! ([`effective_groups`]). A customer key without a group is closed, and so
+//! is one whose group its tenant no longer assigns; assigning it back
+//! reopens them ([`closed_for_group`]). The platform's own tenant's keys are
+//! never closed for a group reason, and may name any live group.
 
 use std::collections::{HashMap, HashSet};
 
@@ -103,6 +113,36 @@ pub struct KeyCreator {
     pub id: Option<Uuid>,
 }
 
+/// The one provider group a key names, fixed when the key is created: its
+/// document routes to `[name]` and nothing else. `name` is the routing name
+/// the gateway reads; `display_name` is what a tenant is shown, and the
+/// operator API is the only place both appear.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeyGroup {
+    pub id: Uuid,
+    /// The immutable routing name. Never appears in an `/api` answer.
+    pub name: String,
+    pub display_name: String,
+}
+
+impl KeyGroup {
+    /// What a tenant sees of it.
+    #[must_use]
+    pub fn view(&self) -> KeyGroupView {
+        KeyGroupView {
+            id: self.id,
+            display_name: self.display_name.clone(),
+        }
+    }
+}
+
+/// A group as a tenant sees it: never its routing name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct KeyGroupView {
+    pub id: Uuid,
+    pub display_name: String,
+}
+
 /// One row of `tenant_keys`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct KeyRow {
@@ -119,8 +159,14 @@ pub struct KeyRow {
     pub model_ids: Option<Vec<Uuid>>,
     /// Model name patterns, for the platform's own keys only.
     pub allowed_models: Option<Vec<String>>,
-    /// The groups set for this key alone; `None` takes the tenant's.
+    /// The groups set for this key alone; `None` takes the tenant's. No
+    /// longer set on a customer's key, whose [`KeyRow::group`] decides its
+    /// routing instead; read only for a key that has no group yet.
     pub allowed_provider_groups: Option<Vec<String>>,
+    /// The one group this key routes to, fixed when it was created. A
+    /// customer key without one is closed; an internal key without one still
+    /// routes by [`effective_groups`]'s old rule.
+    pub group: Option<KeyGroup>,
     pub rate_limit: KeyLimits,
     /// Switched off on the tenant's side (by a member who may change the
     /// key), whatever the tenant's or the member's state.
@@ -133,68 +179,63 @@ pub struct KeyRow {
     pub created_by: KeyCreator,
 }
 
-type RawKey = (
-    Uuid,
-    Uuid,
-    Option<Uuid>,
-    String,
-    String,
-    String,
-    Option<Vec<Uuid>>,
-    Option<Vec<String>>,
-    Option<Vec<String>>,
-    Value,
-    bool,
-    bool,
-    Option<DateTime<Utc>>,
-    i64,
-    DateTime<Utc>,
-    Value,
-);
+/// A `tenant_keys` row as SQL answers it. `sqlx::FromRow` rather than a
+/// tuple: the row carries seventeen columns, past the sixteen a tuple
+/// decodes. `group`, `rate_limit` and `created_by` arrive as one JSON value
+/// each, so each stays a single column.
+#[derive(sqlx::FromRow)]
+struct RawKey {
+    id: Uuid,
+    tenant_id: Uuid,
+    member_id: Option<Uuid>,
+    label: String,
+    key_hash: String,
+    key_prefix: String,
+    model_ids: Option<Vec<Uuid>>,
+    allowed_models: Option<Vec<String>>,
+    allowed_provider_groups: Option<Vec<String>>,
+    group: Option<Value>,
+    rate_limit: Value,
+    disabled: bool,
+    operator_disabled: bool,
+    expires_at: Option<DateTime<Utc>>,
+    version: i64,
+    created_at: DateTime<Utc>,
+    created_by: Value,
+}
 
-// `created_by` as one value, so the row stays within the 16 columns a
-// tuple decodes.
+// The key's group as one value, `NULL` while it has none; `created_by` as
+// one value. The group's subquery reads `group_id` of the row being
+// selected, so the same `COLUMNS` works in a `RETURNING`.
 const COLUMNS: &str = "id, tenant_id, member_id, label, key_hash, key_prefix, model_ids, \
-     allowed_models, allowed_provider_groups, rate_limit, disabled, operator_disabled, expires_at, \
-     version, created_at, jsonb_build_object('kind', created_by_kind, 'id', created_by)";
+     allowed_models, allowed_provider_groups, (SELECT jsonb_build_object('id', g.id, \
+       'name', g.name, 'display_name', g.display_name) FROM provider_groups g \
+       WHERE g.id = group_id) AS \"group\", rate_limit, disabled, operator_disabled, expires_at, \
+     version, created_at, jsonb_build_object('kind', created_by_kind, 'id', created_by) AS created_by";
 
-impl KeyRow {
-    fn from_raw(raw: RawKey) -> Result<KeyRow, ApiError> {
-        let (
-            id,
-            tenant_id,
-            member_id,
-            label,
-            key_hash,
-            key_prefix,
-            model_ids,
-            allowed_models,
-            allowed_provider_groups,
-            rate_limit,
-            disabled,
-            operator_disabled,
-            expires_at,
-            version,
-            created_at,
-            created_by,
-        ) = raw;
+impl RawKey {
+    fn into_row(self) -> Result<KeyRow, ApiError> {
         Ok(KeyRow {
-            id,
-            tenant_id,
-            member_id,
-            label,
-            key_hash,
-            key_prefix,
-            model_ids,
-            allowed_models,
-            allowed_provider_groups,
-            rate_limit: serde_json::from_value(rate_limit).map_err(ApiError::internal)?,
-            disabled,
-            operator_disabled,
-            expires_at,
-            version,
-            created_at,
-            created_by: serde_json::from_value(created_by).map_err(ApiError::internal)?,
+            id: self.id,
+            tenant_id: self.tenant_id,
+            member_id: self.member_id,
+            label: self.label,
+            key_hash: self.key_hash,
+            key_prefix: self.key_prefix,
+            model_ids: self.model_ids,
+            allowed_models: self.allowed_models,
+            allowed_provider_groups: self.allowed_provider_groups,
+            group: self
+                .group
+                .map(|g| serde_json::from_value(g).map_err(ApiError::internal))
+                .transpose()?,
+            rate_limit: serde_json::from_value(self.rate_limit).map_err(ApiError::internal)?,
+            disabled: self.disabled,
+            operator_disabled: self.operator_disabled,
+            expires_at: self.expires_at,
+            version: self.version,
+            created_at: self.created_at,
+            created_by: serde_json::from_value(self.created_by).map_err(ApiError::internal)?,
         })
     }
 }
@@ -240,12 +281,34 @@ fn granted_model_ids(t: &TenantRow, k: &KeyRow) -> Vec<String> {
     ids.iter().map(Uuid::to_string).collect()
 }
 
-/// The provider groups a key of `t` may route to: its own when it sets
-/// some, the tenant's otherwise. An empty list here means every upstream.
+/// The provider groups a key of `t` may route to. A key that names a group
+/// routes to that group alone, and nothing else: `[<its name>]`. Without one
+/// it keeps the old rule — its own override when it sets some, the tenant's
+/// otherwise, which is none for the internal tenant, so every upstream.
 fn effective_groups(t: &TenantRow, k: &KeyRow) -> Vec<String> {
+    if let Some(group) = &k.group {
+        return vec![group.name.clone()];
+    }
     match &k.allowed_provider_groups {
         Some(own) if !own.is_empty() => own.clone(),
         _ => t.allowed_provider_groups.clone(),
+    }
+}
+
+/// Whether a customer key is closed for a group reason: it names no group,
+/// or the group it names is no longer one of its tenant's. A group that left
+/// the tenant's list closes its keys, and assigning it back reopens them; a
+/// key is never moved to another group, which would change its price
+/// silently. The internal tenant's keys are never closed for a group reason
+/// (R2): its keys may name any live group and are priced like any other
+/// tenant's.
+fn closed_for_group(t: &TenantRow, k: &KeyRow) -> bool {
+    if t.is_internal {
+        return false;
+    }
+    match &k.group {
+        None => true,
+        Some(group) => !t.allowed_provider_groups.contains(&group.name),
     }
 }
 
@@ -266,16 +329,15 @@ fn effective_limits(t: &TenantRow, k: &KeyRow) -> KeyLimits {
 }
 
 /// Whether the gateway refuses a key of `t`: switched off on the tenant's
-/// side or by an operator, its tenant not active, or its member no longer
-/// holding keys (`member_active` false). A customer key with no provider
-/// group would reach every upstream; no customer can be saved so, and one
-/// found so stays closed.
+/// side or by an operator, its tenant not active, its member no longer
+/// holding keys (`member_active` false), or a customer key closed for a
+/// group reason ([`closed_for_group`]).
 fn effective_disabled(t: &TenantRow, k: &KeyRow, member_active: bool) -> bool {
     k.disabled
         || k.operator_disabled
         || t.status != TenantStatus::Active
         || !member_active
-        || (!t.is_internal && effective_groups(t, k).is_empty())
+        || closed_for_group(t, k)
 }
 
 /// The shape of the documents [`build_key_doc`] writes. A release that
@@ -285,7 +347,7 @@ fn effective_disabled(t: &TenantRow, k: &KeyRow, member_active: bool) -> bool {
 /// whose own state did not change. Kept per row, so a key an older replica
 /// writes during a rolling upgrade, or one written before a rollback and a
 /// second upgrade, is caught up too.
-pub const KEY_DOC_VERSION: i32 = 1;
+pub const KEY_DOC_VERSION: i32 = 2;
 
 /// The gateway `api_keys` document of key `k` of tenant `t`, whose member,
 /// if it has one, is `member_active`: neither disabled nor removed, and in
@@ -298,8 +360,10 @@ pub const KEY_DOC_VERSION: i32 = 1;
 ///   may call [`FIRST_PHASE_ENDPOINTS`] only.
 /// - The platform's own key names models by its patterns when it has some,
 ///   and by id otherwise, and calls every endpoint.
-/// - `allowed_provider_groups`: the key's own, else the tenant's; left out
-///   when there are none, never written empty.
+/// - `allowed_provider_groups`: the one group the key names — an exact
+///   allow-list of one — else, for a key an older replica minted without
+///   one, the old rule ([`effective_groups`]); left out when there are none,
+///   never written empty.
 /// - `rate_limit`: the key's limits within the tenant's per-key caps; left
 ///   out when neither sets any.
 /// - `disabled` per [`effective_disabled`].
@@ -364,7 +428,7 @@ async fn select(
     .fetch_all(conn)
     .await
     .map_err(DbError::from)?;
-    raw.into_iter().map(KeyRow::from_raw).collect()
+    raw.into_iter().map(RawKey::into_row).collect()
 }
 
 /// The live key `id`, within the tenant and among the member's keys when
@@ -720,7 +784,11 @@ struct Changes {
     label: Option<String>,
     model_ids: Option<Option<Vec<String>>>,
     allowed_models: Option<Option<Vec<String>>>,
-    allowed_provider_groups: Option<Option<Vec<String>>>,
+    /// The group the key should name, already resolved against the tenant
+    /// by [`create_key`] or [`update_key`] under the tenant's lock. On a
+    /// create it is always present; on an update only while the key had
+    /// none.
+    group: Option<KeyGroup>,
     rate_limit: Option<Option<LimitsBody>>,
     /// The tenant's switch, set on `/api`.
     disabled: Option<bool>,
@@ -735,14 +803,11 @@ impl Changes {
         [
             ("allowed_models", self.allowed_models.is_some()),
             (
-                "allowed_provider_groups",
-                self.allowed_provider_groups.is_some(),
-            ),
-            (
                 "disabled",
                 self.disabled.is_some() || self.operator_disabled.is_some(),
             ),
             ("expires_at", self.expires_at.is_some()),
+            ("group_id", self.group.is_some()),
             ("label", self.label.is_some()),
             ("model_ids", self.model_ids.is_some()),
             ("rate_limit", self.rate_limit.is_some()),
@@ -767,6 +832,8 @@ impl Changes {
     /// a `422` with a detail for every field that cannot be set so, and
     /// `key` unchanged then. Only the fields given are checked, so a key
     /// whose stored limits a lowered cap now bounds can still be renamed.
+    /// The group is not one of them: its id is resolved against the tenant
+    /// and its row, which takes the database, before this is called.
     fn apply(self, t: &TenantRow, key: &mut KeyRow) -> Result<(), ApiError> {
         let mut next = key.clone();
         let mut problems = Vec::new();
@@ -792,17 +859,16 @@ impl Changes {
                 next.allowed_models = raw;
             }
         }
-        if let Some(raw) = self.allowed_provider_groups {
-            let at = "/allowed_provider_groups";
-            match raw
-                .map(|groups| tenants::checked_groups(&groups, at))
-                .transpose()
-            {
-                Ok(Some(groups)) if groups.is_empty() && !t.is_internal => {
-                    problems.push(tenants::no_groups(at))
-                }
-                Ok(groups) => next.allowed_provider_groups = groups,
-                Err(found) => problems.extend(found),
+        if let Some(group) = self.group {
+            // A key's group is fixed once it has one. A key that names none
+            // (one an older replica minted) may take one once.
+            if key.group.is_some() {
+                problems.push(detail(
+                    "/group_id",
+                    "密钥的分组创建后不能更改；如需更换分组，请新建密钥",
+                ));
+            } else {
+                next.group = Some(group);
             }
         }
         if let Some(raw) = self.rate_limit {
@@ -913,17 +979,25 @@ fn audit_entry<'a>(
 }
 
 /// Mints a key of tenant `t`, bound to `member_id` (already checked to be a
-/// live member of `t`), as `changes` set it, writes its document and
-/// records it; the key, and the plaintext, which is shown this once. The
-/// caller holds `t`'s lock.
+/// live member of `t`), naming `group_id` (or `t`'s one assigned group when
+/// it is left out) and as `changes` set it, writes its document and records
+/// it; the key, and the plaintext, which is shown this once. The caller
+/// holds `t`'s lock, so the group row is taken after it and before
+/// `write_resource` ([`groups::key_group`]).
 async fn create_key(
     conn: &mut PgConnection,
     ctx: &WriteCtx,
     t: &TenantRow,
     member_id: Option<Uuid>,
+    group_id: Option<&str>,
     changes: Changes,
     by: Actor<'_>,
 ) -> Result<(KeyRow, String), ApiError> {
+    let group = crate::groups::key_group(&mut *conn, t, group_id).await?;
+    let changes = Changes {
+        group: Some(group),
+        ..changes
+    };
     let fields = changes.fields();
     let mut key = KeyRow {
         id: Uuid::new_v4(),
@@ -935,6 +1009,7 @@ async fn create_key(
         model_ids: None,
         allowed_models: None,
         allowed_provider_groups: None,
+        group: None,
         rate_limit: KeyLimits::default(),
         disabled: false,
         operator_disabled: false,
@@ -956,7 +1031,7 @@ async fn create_key(
     let rate_limit = serde_json::to_value(key.rate_limit).map_err(ApiError::internal)?;
     let raw: RawKey = sqlx::query_as(&format!(
         "INSERT INTO tenant_keys (id, tenant_id, member_id, label, key_hash, key_prefix, \
-           model_ids, allowed_models, allowed_provider_groups, rate_limit, disabled, \
+           model_ids, allowed_models, group_id, rate_limit, disabled, \
            operator_disabled, expires_at, created_by_kind, created_by) \
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) \
          RETURNING {COLUMNS}"
@@ -969,7 +1044,7 @@ async fn create_key(
     .bind(prefix_of(&plaintext))
     .bind(&key.model_ids)
     .bind(&key.allowed_models)
-    .bind(&key.allowed_provider_groups)
+    .bind(key.group.as_ref().map(|g| g.id))
     .bind(rate_limit)
     .bind(key.disabled)
     .bind(key.operator_disabled)
@@ -979,7 +1054,7 @@ async fn create_key(
     .fetch_one(&mut *conn)
     .await
     .map_err(DbError::from)?;
-    let key = KeyRow::from_raw(raw)?;
+    let key = raw.into_row()?;
     let active = member_active(&mut *conn, key.member_id).await?;
     project(&mut *conn, ctx, t, &key, active, KEY_DOC_VERSION).await?;
     audit::record(
@@ -995,16 +1070,27 @@ async fn create_key(
     Ok((key, plaintext))
 }
 
-/// Changes `key` of tenant `t` as `changes` set it, writes its document and
-/// records it. The caller holds `t`'s lock and has checked the version.
+/// Changes `key` of tenant `t` as `changes` set it, names `group_id` while
+/// the key has no group, writes its document and records it. The caller
+/// holds `t`'s lock and has checked the version; the group row is taken
+/// after that lock and before `write_resource` ([`groups::key_group`]).
 async fn update_key(
     conn: &mut PgConnection,
     ctx: &WriteCtx,
     t: &TenantRow,
     mut key: KeyRow,
+    group_id: Option<&str>,
     changes: Changes,
     by: Actor<'_>,
 ) -> Result<KeyRow, ApiError> {
+    // Resolved before [`Changes::apply`], so an id that names nothing is
+    // refused even on a key whose group is already fixed: the answer is the
+    // same `422` whichever of the two is wrong.
+    let group = match group_id {
+        Some(raw) => Some(crate::groups::key_group(&mut *conn, t, Some(raw)).await?),
+        None => None,
+    };
+    let changes = Changes { group, ..changes };
     let detail = changes.audit_detail();
     let limits_given = changes.rate_limit.is_some();
     changes.apply(t, &mut key)?;
@@ -1016,15 +1102,15 @@ async fn update_key(
         .map_err(ApiError::internal)?;
     let raw: RawKey = sqlx::query_as(&format!(
         "UPDATE tenant_keys SET label = $2, model_ids = $3, allowed_models = $4, \
-           allowed_provider_groups = $5, rate_limit = COALESCE($6, rate_limit), disabled = $7, \
-           operator_disabled = $8, expires_at = $9, version = version + 1 \
+           group_id = COALESCE(group_id, $5), rate_limit = COALESCE($6, rate_limit), \
+           disabled = $7, operator_disabled = $8, expires_at = $9, version = version + 1 \
          WHERE id = $1 RETURNING {COLUMNS}"
     ))
     .bind(key.id)
     .bind(&key.label)
     .bind(&key.model_ids)
     .bind(&key.allowed_models)
-    .bind(&key.allowed_provider_groups)
+    .bind(key.group.as_ref().map(|g| g.id))
     .bind(rate_limit)
     .bind(key.disabled)
     .bind(key.operator_disabled)
@@ -1032,7 +1118,7 @@ async fn update_key(
     .fetch_one(&mut *conn)
     .await
     .map_err(DbError::from)?;
-    let key = KeyRow::from_raw(raw)?;
+    let key = raw.into_row()?;
     let active = member_active(&mut *conn, key.member_id).await?;
     project(&mut *conn, ctx, t, &key, active, KEY_DOC_VERSION).await?;
     audit::record(conn, audit_entry(by, "key.update", &key, detail)).await?;
@@ -1078,7 +1164,8 @@ pub struct KeyOwner {
     display_name: Option<String>,
 }
 
-/// `TenantKey` in the tenant API: no provider group, no endpoint family.
+/// `TenantKey` in the tenant API: the group it names by display name, and
+/// no routing name, endpoint family or upstream.
 #[derive(Debug, Serialize)]
 pub struct TenantKeyView {
     id: Uuid,
@@ -1086,6 +1173,12 @@ pub struct TenantKeyView {
     prefix: String,
     owner: Option<KeyOwner>,
     model_ids: Option<Vec<Uuid>>,
+    /// The group the key routes to, as a tenant sees it; `null` for a key an
+    /// older replica minted without one.
+    group: Option<KeyGroupView>,
+    /// Whether that group still routes: false when the key has no group, or
+    /// its group is no longer one of the tenant's, which closes the key.
+    group_available: bool,
     rate_limit: KeyLimits,
     /// The tenant's own switch, which `PATCH /api/keys/{id}` sets.
     disabled: bool,
@@ -1096,12 +1189,45 @@ pub struct TenantKeyView {
     version: i64,
 }
 
-async fn tenant_views(
-    conn: &mut PgConnection,
+/// The tenant's own view of its keys, which decides each one's
+/// `group_available` by whether `t` still assigns the group.
+fn tenant_views(
+    t: &TenantRow,
     keys: Vec<KeyRow>,
-) -> Result<Vec<TenantKeyView>, ApiError> {
+    names: HashMap<Uuid, Option<String>>,
+) -> Vec<TenantKeyView> {
+    keys.into_iter()
+        .map(|k| {
+            let group_available = k.group.is_some() && !closed_for_group(t, &k);
+            TenantKeyView {
+                id: k.id,
+                label: k.label,
+                prefix: k.key_prefix,
+                owner: k.member_id.map(|id| KeyOwner {
+                    id,
+                    display_name: names.get(&id).cloned().flatten(),
+                }),
+                group: k.group.as_ref().map(KeyGroup::view),
+                group_available,
+                model_ids: k.model_ids,
+                rate_limit: k.rate_limit,
+                disabled: k.disabled,
+                disabled_by_platform: k.operator_disabled,
+                expires_at: k.expires_at,
+                created_at: k.created_at,
+                version: k.version,
+            }
+        })
+        .collect()
+}
+
+/// The member display names of `keys`' owners, by member id.
+async fn owner_names(
+    conn: &mut PgConnection,
+    keys: &[KeyRow],
+) -> Result<HashMap<Uuid, Option<String>>, ApiError> {
     let members: Vec<Uuid> = keys.iter().filter_map(|k| k.member_id).collect();
-    let names: HashMap<Uuid, Option<String>> = sqlx::query_as::<_, (Uuid, Option<String>)>(
+    Ok(sqlx::query_as::<_, (Uuid, Option<String>)>(
         "SELECT id, display_name FROM members WHERE id = ANY($1)",
     )
     .bind(&members)
@@ -1109,31 +1235,16 @@ async fn tenant_views(
     .await
     .map_err(DbError::from)?
     .into_iter()
-    .collect();
-    Ok(keys
-        .into_iter()
-        .map(|k| TenantKeyView {
-            id: k.id,
-            label: k.label,
-            prefix: k.key_prefix,
-            owner: k.member_id.map(|id| KeyOwner {
-                id,
-                display_name: names.get(&id).cloned().flatten(),
-            }),
-            model_ids: k.model_ids,
-            rate_limit: k.rate_limit,
-            disabled: k.disabled,
-            disabled_by_platform: k.operator_disabled,
-            expires_at: k.expires_at,
-            created_at: k.created_at,
-            version: k.version,
-        })
-        .collect())
+    .collect())
 }
 
-async fn tenant_view(conn: &mut PgConnection, key: KeyRow) -> Result<TenantKeyView, ApiError> {
-    tenant_views(conn, vec![key])
-        .await?
+async fn tenant_view(
+    conn: &mut PgConnection,
+    t: &TenantRow,
+    key: KeyRow,
+) -> Result<TenantKeyView, ApiError> {
+    let names = owner_names(&mut *conn, std::slice::from_ref(&key)).await?;
+    tenant_views(t, vec![key], names)
         .pop()
         .ok_or_else(|| ApiError::internal("a key view went missing"))
 }
@@ -1149,7 +1260,12 @@ pub struct AdminKeyView {
     member_id: Option<Uuid>,
     model_ids: Option<Vec<Uuid>>,
     allowed_models: Option<Vec<String>>,
+    /// Read-only, and legacy: the override a key minted before groups were
+    /// data carries. No request body sets it, and `effective_provider_groups`
+    /// is what the gateway is given.
     allowed_provider_groups: Option<Vec<String>>,
+    /// The group the key names, fixed at creation, with its routing name.
+    group: Option<KeyGroup>,
     effective_provider_groups: Vec<String>,
     rate_limit: KeyLimits,
     /// The operators' switch, which `PATCH /admin/keys/{id}` sets: the key
@@ -1178,6 +1294,7 @@ fn admin_view(t: &TenantRow, k: KeyRow, member_active: bool) -> AdminKeyView {
         model_ids: k.model_ids,
         allowed_models: k.allowed_models,
         allowed_provider_groups: k.allowed_provider_groups,
+        group: k.group,
         rate_limit: k.rate_limit,
         disabled: k.operator_disabled,
         disabled_by_tenant: k.disabled,
@@ -1242,6 +1359,10 @@ pub struct CreateKey {
     #[serde(default, deserialize_with = "present")]
     member_id: Option<Option<String>>,
     model_ids: Option<Vec<String>>,
+    /// The group the key routes to. Left out, the tenant's one assigned
+    /// group; refused when it has several, and always for the platform's own
+    /// tenant.
+    group_id: Option<String>,
     rate_limit: Option<LimitsBody>,
     expires_at: Option<String>,
 }
@@ -1252,6 +1373,9 @@ pub struct UpdateKey {
     label: Option<String>,
     #[serde(default, deserialize_with = "present")]
     model_ids: Option<Option<Vec<String>>>,
+    /// Accepted only while the key has no group: a key's group is fixed once
+    /// it has one.
+    group_id: Option<String>,
     #[serde(default, deserialize_with = "present")]
     rate_limit: Option<Option<LimitsBody>>,
     disabled: Option<bool>,
@@ -1281,7 +1405,9 @@ pub struct AdminCreateKey {
     model_ids: Option<Vec<String>>,
     /// The platform's own tenant only.
     allowed_models: Option<Vec<String>>,
-    allowed_provider_groups: Option<Vec<String>>,
+    /// The group the key routes to: any live group for the platform's own
+    /// tenant, one of its assigned groups for a customer's.
+    group_id: Option<String>,
     rate_limit: Option<LimitsBody>,
     expires_at: Option<String>,
 }
@@ -1294,8 +1420,8 @@ pub struct AdminUpdateKey {
     model_ids: Option<Option<Vec<String>>>,
     #[serde(default, deserialize_with = "present")]
     allowed_models: Option<Option<Vec<String>>>,
-    #[serde(default, deserialize_with = "present")]
-    allowed_provider_groups: Option<Option<Vec<String>>>,
+    /// Accepted only while the key has no group.
+    group_id: Option<String>,
     #[serde(default, deserialize_with = "present")]
     rate_limit: Option<Option<LimitsBody>>,
     disabled: Option<bool>,
@@ -1309,11 +1435,11 @@ impl From<AdminUpdateKey> for Changes {
             label: req.label,
             model_ids: req.model_ids,
             allowed_models: req.allowed_models,
-            allowed_provider_groups: req.allowed_provider_groups,
             rate_limit: req.rate_limit,
             disabled: None,
             operator_disabled: req.disabled,
             expires_at: req.expires_at,
+            ..Changes::default()
         }
     }
 }
@@ -1330,8 +1456,10 @@ pub async fn list(
 ) -> Result<Json<Value>, ApiError> {
     auth.require(KEY_HOLDERS)?;
     let mut conn = state.db.pool().acquire().await.map_err(DbError::from)?;
+    let tenant = tenants::find(&mut conn, auth.tenant_id).await?;
     let keys = select(&mut conn, None, Some(auth.tenant_id), own_only(&auth)).await?;
-    let items = tenant_views(&mut conn, keys).await?;
+    let names = owner_names(&mut conn, &keys).await?;
+    let items = tenant_views(&tenant, keys, names);
     Ok(Json(json!({ "items": items })))
 }
 
@@ -1347,12 +1475,13 @@ pub async fn get(
     let mut conn = state.db.pool().acquire().await.map_err(DbError::from)?;
     let key = live_key(&mut conn, id, Some(auth.tenant_id), own_only(&auth)).await?;
     let etag = format!("\"{}\"", key.version);
-    let view = tenant_view(&mut conn, key).await?;
+    let tenant = tenants::find(&mut conn, auth.tenant_id).await?;
+    let view = tenant_view(&mut conn, &tenant, key).await?;
     Ok(([(header::ETAG, etag)], Json(view)).into_response())
 }
 
-/// `POST /api/keys` with `{label, member_id?, model_ids?, rate_limit?,
-/// expires_at?}` → `201 {key: TenantKey, plaintext}`. At most
+/// `POST /api/keys` with `{label, member_id?, model_ids?, group_id?,
+/// rate_limit?, expires_at?}` → `201 {key: TenantKey, plaintext}`. At most
 /// [`MINTS_PER_MINUTE`] a minute per member (`429 busy`); `503
 /// unavailable` while a registered gateway is too old for the key's
 /// fields.
@@ -1383,6 +1512,7 @@ pub async fn create(
                     Some(None) => None,
                     Some(Some(raw)) => Some(bound_member(&mut *conn, tenant.id, &raw).await?),
                 };
+                let group_id = req.group_id.clone();
                 let changes = Changes {
                     label: Some(req.label),
                     model_ids: req.model_ids.map(Some),
@@ -1395,11 +1525,12 @@ pub async fn create(
                     &ctx,
                     &tenant,
                     member_id,
+                    group_id.as_deref(),
                     changes,
                     member_actor(&auth),
                 )
                 .await?;
-                Ok::<_, ApiError>((tenant_view(conn, key).await?, plaintext))
+                Ok::<_, ApiError>((tenant_view(conn, &tenant, key).await?, plaintext))
             }
             .boxed()
         })
@@ -1411,7 +1542,7 @@ pub async fn create(
     ))
 }
 
-/// `PATCH /api/keys/{id}` with `{label?, model_ids?, rate_limit?,
+/// `PATCH /api/keys/{id}` with `{label?, model_ids?, group_id?, rate_limit?,
 /// disabled?, expires_at?}` and `If-Match` → `200 TenantKey`. The key is
 /// looked up before `If-Match` is read, so `428` and `412` answer only for
 /// the caller's own keys. `disabled` is the tenant's own switch: switching
@@ -1445,16 +1576,18 @@ pub async fn update(
                         ..ApiError::forbidden()
                     });
                 }
+                let group_id = req.group_id.clone();
                 let key = update_key(
                     &mut *conn,
                     &ctx,
                     &tenant,
                     key,
+                    group_id.as_deref(),
                     req.into(),
                     member_actor(&auth),
                 )
                 .await?;
-                tenant_view(conn, key).await
+                tenant_view(conn, &tenant, key).await
             }
             .boxed()
         })
@@ -1515,7 +1648,7 @@ pub async fn admin_list(
 }
 
 /// `POST /admin/tenants/{id}/keys` with `{label, member_id?, model_ids?,
-/// allowed_models?, allowed_provider_groups?, rate_limit?, expires_at?}` →
+/// allowed_models?, group_id?, rate_limit?, expires_at?}` →
 /// `201 {key: AdminKey, plaintext}`, in an active or a suspended tenant. A
 /// pending tenant is `409 tenant_state`: it gives the gateways nothing until
 /// it is approved, and a key would need its team and its member's user.
@@ -1543,11 +1676,11 @@ pub async fn admin_create(
                     None => None,
                     Some(raw) => Some(bound_member(&mut *conn, tenant.id, raw).await?),
                 };
+                let group_id = req.group_id.clone();
                 let changes = Changes {
                     label: Some(req.label),
                     model_ids: req.model_ids.map(Some),
                     allowed_models: req.allowed_models.map(Some),
-                    allowed_provider_groups: req.allowed_provider_groups.map(Some),
                     rate_limit: req.rate_limit.map(Some),
                     expires_at: req.expires_at.map(Some),
                     ..Changes::default()
@@ -1557,6 +1690,7 @@ pub async fn admin_create(
                     &ctx,
                     &tenant,
                     member_id,
+                    group_id.as_deref(),
                     changes,
                     Actor::Operator(&auth),
                 )
@@ -1599,7 +1733,7 @@ async fn locked_key(conn: &mut PgConnection, id: Uuid) -> Result<(KeyRow, Tenant
 }
 
 /// `PATCH /admin/keys/{id}` with `{label?, model_ids?, allowed_models?,
-/// allowed_provider_groups?, rate_limit?, disabled?, expires_at?}` and
+/// group_id?, rate_limit?, disabled?, expires_at?}` and
 /// `If-Match` → `200 AdminKey`. `disabled` is the operators' switch: it
 /// keeps the key off whatever the tenant does, and clearing it leaves the
 /// tenant's own switch as it is.
@@ -1620,11 +1754,13 @@ pub async fn admin_update(
             async move {
                 let (key, tenant) = locked_key(&mut *conn, id).await?;
                 check_version(&key, Ok(expected))?;
+                let group_id = req.group_id.clone();
                 let key = update_key(
                     &mut *conn,
                     &ctx,
                     &tenant,
                     key,
+                    group_id.as_deref(),
                     req.into(),
                     Actor::Operator(&auth),
                 )
@@ -1714,6 +1850,7 @@ mod tests {
             model_ids: model_ids.map(<[Uuid]>::to_vec),
             allowed_models: None,
             allowed_provider_groups: None,
+            group: None,
             rate_limit: KeyLimits::default(),
             disabled: false,
             operator_disabled: false,
@@ -1727,6 +1864,16 @@ mod tests {
         }
     }
 
+    /// The one group every unit key here names, unless a case gives it
+    /// another: a customer key without one is closed.
+    fn group(name: &str) -> KeyGroup {
+        KeyGroup {
+            id: Uuid::new_v4(),
+            name: name.to_string(),
+            display_name: "显示名 7c1".to_string(),
+        }
+    }
+
     fn ids(ids: &[Uuid]) -> serde_json::Value {
         let mut ids: Vec<String> = ids.iter().map(Uuid::to_string).collect();
         ids.sort();
@@ -1736,7 +1883,10 @@ mod tests {
     #[test]
     fn a_customer_key_is_confined_to_the_first_phase_endpoints_and_its_grants() {
         let t = tenant(&[M1, M2], &["grp-eu-5d2"]);
-        let k = key(Some(&[M2, M9]));
+        let k = KeyRow {
+            group: Some(group("grp-eu-5d2")),
+            ..key(Some(&[M2, M9]))
+        };
         let d = build_key_doc(&t, &k, true);
         assert_eq!(d["allowed_endpoints"], json!(FIRST_PHASE_ENDPOINTS));
         assert_eq!(d["allowed_model_ids"], json!([M2.to_string()]));
@@ -1806,30 +1956,55 @@ mod tests {
     #[test]
     fn a_suspended_tenant_or_inactive_member_disables_the_key() {
         let active = tenant(&[M1], &["shared"]);
-        assert_eq!(build_key_doc(&active, &key(None), true)["disabled"], false);
+        let grouped = KeyRow {
+            group: Some(group("shared")),
+            ..key(None)
+        };
+        assert_eq!(build_key_doc(&active, &grouped, true)["disabled"], false);
         for status in [TenantStatus::Suspended, TenantStatus::Pending] {
             let t = TenantRow {
                 status,
                 ..active.clone()
             };
             assert_eq!(
-                build_key_doc(&t, &key(None), true)["disabled"],
+                build_key_doc(&t, &grouped, true)["disabled"],
                 true,
                 "{status:?}"
             );
         }
-        assert_eq!(build_key_doc(&active, &key(None), false)["disabled"], true);
+        assert_eq!(build_key_doc(&active, &grouped, false)["disabled"], true);
         let off = KeyRow {
             disabled: true,
-            ..key(None)
+            ..grouped.clone()
         };
         assert_eq!(build_key_doc(&active, &off, true)["disabled"], true);
         // An operator's switch closes it whatever the tenant's is.
         let by_platform = KeyRow {
             operator_disabled: true,
-            ..key(None)
+            ..grouped.clone()
         };
         assert_eq!(build_key_doc(&active, &by_platform, true)["disabled"], true);
+        // A customer key without a group is closed, and so is one whose
+        // group its tenant no longer assigns; assigning it back reopens it.
+        assert_eq!(build_key_doc(&active, &key(None), true)["disabled"], true);
+        let elsewhere = KeyRow {
+            group: Some(group("grp-dedicated-9f3")),
+            ..key(None)
+        };
+        assert_eq!(build_key_doc(&active, &elsewhere, true)["disabled"], true);
+        let assigned = TenantRow {
+            allowed_provider_groups: vec!["shared".to_string(), "grp-dedicated-9f3".to_string()],
+            ..active.clone()
+        };
+        assert_eq!(
+            build_key_doc(&assigned, &elsewhere, true)["disabled"],
+            false
+        );
+        // The platform's own keys are never closed for a group reason.
+        assert_eq!(
+            build_key_doc(&internal(&[M1]), &key(None), true)["disabled"],
+            false
+        );
     }
 
     #[test]
@@ -1972,12 +2147,25 @@ mod tests {
             allowed_models: Some(vec!["*".to_string()]),
             ..key(None)
         };
+        // One group per key: the same document a customer key and the
+        // platform's own get, and a key without one that an older replica
+        // may still have left behind.
+        let grouped = |g: &str| KeyRow {
+            group: Some(KeyGroup {
+                id: Uuid::new_v4(),
+                name: g.to_string(),
+                display_name: "显示名 7c1".to_string(),
+            }),
+            ..key(None)
+        };
         let docs = [
             build_key_doc(&customer, &key(None), true),
+            build_key_doc(&customer, &grouped("grp-eu-5d2"), true),
             build_key_doc(&customer, &full, true),
-            build_key_doc(&suspended, &key(Some(&[])), false),
+            build_key_doc(&suspended, &grouped("grp-eu-5d2"), false),
             build_key_doc(&tenant(&[], &["shared"]), &key(None), true),
             build_key_doc(&internal(&[]), &patterned, true),
+            build_key_doc(&internal(&[M1]), &grouped("grp-ops-7c1"), true),
             build_key_doc(&internal(&[M1]), &key(None), true),
         ];
         for doc in docs {

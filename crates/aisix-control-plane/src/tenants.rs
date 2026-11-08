@@ -527,7 +527,9 @@ pub async fn project(conn: &mut PgConnection, ctx: &WriteCtx, id: Uuid) -> Resul
 /// [`project`] without the billing step, for a caller holding only the
 /// tenant's row: an edit that changes neither the status nor the billing
 /// mode nor any money (a rename, a grant, limits, groups), and a model
-/// delete. None of them can open a key, so the marks already written stand.
+/// delete. A groups edit can reopen keys, but no mark depends on whether a
+/// key is open: a mark is the tenant's or a quota's, so the marks already
+/// written stand.
 async fn project_without_marks(
     conn: &mut PgConnection,
     ctx: &WriteCtx,
