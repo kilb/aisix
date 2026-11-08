@@ -94,7 +94,6 @@ export function Org({ member, status }: { member: SessionMember; status: TenantS
           <Reading label="单个密钥的并发上限" value={org ? cap(org.limits.key_concurrency_max) : "—"} />
           <Reading label="单个密钥的每分钟请求上限" value={org ? cap(org.limits.key_rpm_max) : "—"} />
         </div>
-        <p className="hint">用量与账单将在后续版本提供</p>
       </div>
       <PasswordForm />
     </div>

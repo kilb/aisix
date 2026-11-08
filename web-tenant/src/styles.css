@@ -404,3 +404,207 @@
     grid-template-columns: minmax(0, 1fr);
   }
 }
+
+/* ── 账户: the balance, the readout and the ledger ───────────── */
+.billing-top {
+  grid-template-columns: minmax(0, 2fr) minmax(0, 3fr);
+  align-items: start;
+}
+.balance-state {
+  line-height: var(--lh-table);
+}
+
+/* The balance readout: what can still be spent, large, then one stop per
+   level on a route line, the level that binds filled and marked. */
+.readout-pick {
+  max-width: 320px;
+}
+.readout-label {
+  color: var(--text-2);
+}
+.readout-amt {
+  margin-top: var(--s-1);
+  font-size: var(--fs-45);
+  line-height: var(--lh-heading);
+  letter-spacing: -0.01em;
+}
+.readout-amt .cur {
+  margin-right: var(--s-1);
+  font-size: var(--fs-29);
+  font-weight: 600;
+}
+.readout-open {
+  font-weight: 700;
+}
+.levels {
+  --n: 3;
+  position: relative;
+  display: grid;
+  grid-template-columns: repeat(var(--n), minmax(0, 1fr));
+  margin: var(--s-4) 0 0;
+  padding: 0;
+  list-style: none;
+}
+/* The line runs from the first stop's centre to the last's, and no further. */
+.levels::before {
+  content: "";
+  position: absolute;
+  top: 41px;
+  left: 10px;
+  right: calc(100% / var(--n) - 10px);
+  height: 2px;
+  background: var(--route-line);
+}
+.levels:has(> :only-child)::before {
+  display: none;
+}
+.levels li {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--s-2);
+  min-width: 0;
+  padding-right: var(--s-4);
+}
+.levels .lv {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  height: var(--s-6);
+  color: var(--text-2);
+  line-height: var(--lh-table);
+  white-space: nowrap;
+}
+.levels .box {
+  position: relative;
+  display: grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+}
+.levels .stop {
+  width: 12px;
+  height: 12px;
+  border: 2px solid var(--route-line);
+  border-radius: 50%;
+  background: var(--surface);
+  box-sizing: border-box;
+}
+.levels .bind .stop {
+  width: 20px;
+  height: 20px;
+  border: 0;
+  background: radial-gradient(circle, var(--surface) 0 3px, var(--route-line) 3.5px);
+}
+.levels .m {
+  font-size: var(--fs-19);
+  font-weight: 600;
+  line-height: var(--lh-heading);
+  color: var(--text-2);
+}
+.levels .m .cur {
+  font-size: var(--fs-15);
+}
+.levels .bind .m {
+  font-weight: 800;
+  color: var(--text);
+}
+.levels .bind .lv {
+  color: var(--text);
+  font-weight: 600;
+}
+.levels .k {
+  font-size: var(--fs-13);
+  line-height: var(--lh-table);
+  color: var(--text-muted);
+}
+/* 以此为准: a small plate on the level that binds. */
+.bind-plate {
+  display: inline-flex;
+  align-items: center;
+  height: 20px;
+  padding: 0 var(--s-2);
+  border-radius: var(--r-chip);
+  background: var(--route-line);
+  color: var(--surface);
+  font-size: var(--fs-12);
+  font-weight: 600;
+  line-height: 1;
+}
+
+/* The ledger's filters, on one row where there is room. */
+.filters {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: start;
+  gap: var(--s-4);
+}
+.filters .field {
+  min-width: 176px;
+}
+.panel-more {
+  display: flex;
+  justify-content: center;
+  padding: var(--s-4) var(--s-6);
+  border-top: 1px solid var(--divider);
+}
+
+@media (max-width: 959px) {
+  .billing-top {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+/* A phone: the levels run down a vertical line, the stop beside its text. */
+@media (max-width: 719px) {
+  .readout-amt {
+    font-size: var(--fs-36);
+  }
+  .readout-amt .cur {
+    font-size: var(--fs-23);
+  }
+  .levels {
+    display: block;
+  }
+  .levels::before {
+    display: none;
+  }
+  .levels li {
+    position: relative;
+    display: grid;
+    grid-template-columns: 20px minmax(0, 1fr);
+    column-gap: var(--s-3);
+    row-gap: var(--s-1);
+    padding: 0 0 var(--s-5);
+  }
+  .levels li:last-child {
+    padding-bottom: 0;
+  }
+  .levels li > .box {
+    grid-column: 1;
+    grid-row: 1 / span 3;
+    align-self: start;
+    margin-top: 2px;
+  }
+  .levels li > :is(.lv, .m, .k) {
+    grid-column: 2;
+  }
+  .levels li:not(:last-child)::after {
+    content: "";
+    position: absolute;
+    left: 9px;
+    top: 12px;
+    bottom: -12px;
+    width: 2px;
+    background: var(--route-line);
+  }
+  .levels .box {
+    z-index: 1;
+  }
+  .filters .field {
+    flex: 1 1 100%;
+  }
+  .panel-more {
+    padding: var(--s-4);
+  }
+}

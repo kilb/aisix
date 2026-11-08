@@ -1,0 +1,296 @@
+import { expect, test, type Locator, type Page } from "@playwright/test";
+import { STACK_START_TIMEOUT_MS, startStack, type ApiClient, type Stack } from "./stack";
+import {
+  CALL_MICRO_USD,
+  approveTopup,
+  chat,
+  rejectTopup,
+  seedBillingWorld,
+  waitClearOfUtcMidnight,
+  type BillingWorld,
+  type Login,
+} from "./world";
+
+/**
+ * 账户: the balance, the readout of what can still be spent, top-up requests
+ * and the ledger, against the real control plane and gateway. Funds move
+ * only through the real operator and organisation APIs and real calls.
+ */
+
+let stack: Stack;
+
+test.beforeAll(async () => {
+  test.setTimeout(STACK_START_TIMEOUT_MS);
+  stack = await startStack();
+});
+
+test.afterAll(async () => {
+  await stack?.stop();
+});
+
+async function login(page: Page, who: Login): Promise<void> {
+  await page.goto(stack.previewUrl);
+  await page.getByLabel("邮箱").fill(who.email);
+  await page.getByLabel("口令", { exact: true }).fill(who.password);
+  await page.getByRole("button", { name: "登录", exact: true }).click();
+  await expect(page.getByRole("banner")).toBeVisible();
+}
+
+/** Signs in and opens 账户. */
+async function openAccount(page: Page, who: Login): Promise<void> {
+  await login(page, who);
+  await page.getByRole("tab", { name: "账户" }).click();
+  await expect(region(page, "余额")).toBeVisible();
+}
+
+const region = (page: Page, name: string): Locator => page.getByRole("region", { name, exact: true });
+
+/** The body rows of a region's table, newest first as shown. */
+const bodyRows = (r: Locator): Locator => r.locator("tbody tr");
+
+async function ownerApi(world: BillingWorld): Promise<ApiClient> {
+  const api = stack.tenant();
+  await api.post("/api/login", world.owner);
+  return api;
+}
+
+async function balanceOf(world: BillingWorld): Promise<number> {
+  return (await stack.admin.get(`/admin/tenants/${world.tenantId}/billing`)).balance_micro_usd;
+}
+
+/** One call that is admitted and charged, once the gateway has the balance. */
+async function paidChat(world: BillingWorld): Promise<void> {
+  await expect.poll(() => chat(stack, world.key.plaintext, world.model.name), { message: "the gateway admits the call" }).toBe(200);
+}
+
+/** Dollars as the portal writes them: at least two decimals, more only where the amount needs them. */
+function usd(micro: number): string {
+  const sign = micro < 0 ? "-" : "";
+  const abs = Math.abs(micro);
+  let frac = String(abs % 1_000_000).padStart(6, "0");
+  while (frac.length > 2 && frac.endsWith("0")) frac = frac.slice(0, -1);
+  return `${sign}$${Math.floor(abs / 1_000_000)}.${frac}`;
+}
+
+function utcDay(offsetDays: number): string {
+  return new Date(Date.now() + offsetDays * 86_400_000).toISOString().slice(0, 10);
+}
+
+test("新开通的预付组织余额为零，状态写明调用已停止", async ({ page }) => {
+  const world = await seedBillingWorld(stack, { creditUsd: "0" });
+  await openAccount(page, world.owner);
+  const balance = region(page, "余额");
+  await expect(balance).toContainText("$0.00");
+  await expect(balance.locator("[data-state]")).toHaveAttribute("data-state", "exhausted");
+  await expect(balance).toContainText("余额不足，调用已停止");
+  await expect.poll(() => chat(stack, world.key.plaintext, world.model.name), { message: "the gateway refuses the call" }).toBe(429);
+});
+
+test.describe.serial("充值与扣费", () => {
+  let world: BillingWorld;
+  test.beforeAll(async () => {
+    test.setTimeout(STACK_START_TIMEOUT_MS);
+    await waitClearOfUtcMidnight();
+    world = await seedBillingWorld(stack, { creditUsd: "0" });
+  });
+
+  test("提交充值申请后显示待审批；运营批准后余额到账，流水多一笔充值", async ({ page }) => {
+    await openAccount(page, world.owner);
+    const form = region(page, "申请充值");
+    await form.getByLabel("金额（美元）").fill("0.05");
+    await form.getByLabel("付款凭证号").fill("wire-ui-7c1");
+    await form.getByRole("button", { name: "提交申请" }).click();
+    const topups = region(page, "充值记录");
+    await expect(bodyRows(topups).first()).toContainText("$0.05");
+    await expect(bodyRows(topups).first()).toContainText("待审批");
+    await expect(region(page, "余额")).toContainText("1 笔");
+
+    const api = await ownerApi(world);
+    const listed = await api.get("/api/billing/topups");
+    await approveTopup(stack, listed.items[0].id);
+
+    await page.reload();
+    await page.getByRole("tab", { name: "账户" }).click();
+    const balance = region(page, "余额");
+    await expect(balance).toContainText("$0.05");
+    await expect(balance.locator("[data-state]")).toHaveAttribute("data-state", "ok");
+    const first = bodyRows(region(page, "余额流水")).first();
+    await expect(first.locator("td").nth(1)).toHaveText("充值");
+    await expect(first.locator("td").nth(2)).toHaveText("$0.05");
+    await expect(first.locator("td").nth(3)).toHaveText("$0.05");
+    await expect(bodyRows(topups).first()).toContainText("已到账");
+  });
+
+  test("调用逐笔扣费，流水带每笔之后的余额", async ({ page }) => {
+    await paidChat(world);
+    await paidChat(world);
+    await expect.poll(() => balanceOf(world)).toBe(50_000 - 2 * CALL_MICRO_USD);
+    await openAccount(page, world.owner);
+    const rows = bodyRows(region(page, "余额流水"));
+    await expect(rows.nth(0).locator("td").nth(2)).toHaveText("-$0.011");
+    await expect(rows.nth(0).locator("td").nth(3)).toHaveText("$0.028");
+    await expect(rows.nth(1).locator("td").nth(2)).toHaveText("-$0.011");
+    await expect(rows.nth(1).locator("td").nth(3)).toHaveText("$0.039");
+    await expect(rows.nth(0).locator("td").nth(4)).toHaveText("chat-ui");
+  });
+
+  test("可用额度显示各级剩余，并标出以哪一级为准", async ({ page }) => {
+    await openAccount(page, world.owner);
+    const readout = region(page, "可用额度");
+    await expect(readout.getByTestId("readout-amount")).toHaveText("$0.028");
+    const org = readout.getByRole("listitem").filter({ hasText: "组织" });
+    await expect(org).toContainText("以此为准");
+    await expect(readout.getByRole("listitem")).toHaveCount(1);
+
+    // The key is capped at a monthly 0.01, and this month's 0.022 already counts against it.
+    const api = await ownerApi(world);
+    await api.post("/api/budgets", { scope: "api_key", scope_ref: world.key.id, kind: "periodic", period: "month", limit_usd: "0.01" });
+    await page.reload();
+    await page.getByRole("tab", { name: "账户" }).click();
+    await expect(readout.getByTestId("readout-amount")).toHaveText("$0.00");
+    const key = readout.getByRole("listitem").filter({ hasText: "密钥" });
+    await expect(key).toContainText("以此为准");
+    await expect(readout.getByRole("listitem").filter({ hasText: "组织" })).not.toContainText("以此为准");
+    await expect(readout.getByRole("listitem").filter({ hasText: "组织" })).toContainText("$0.028");
+  });
+
+  test("按天汇总与时间筛选按 UTC 计算", async ({ browser }) => {
+    await waitClearOfUtcMidnight();
+    const context = await browser.newContext({ timezoneId: "Asia/Shanghai" });
+    const page = await context.newPage();
+    try {
+      await openAccount(page, world.owner);
+      const today = utcDay(0);
+      const ledger = region(page, "余额流水");
+      const summary = region(page, "按期汇总");
+      await ledger.getByLabel("开始日期（UTC）").fill(today);
+      await ledger.getByLabel("结束日期（UTC）").fill(today);
+      await expect(summary.getByRole("combobox", { name: "汇总方式" })).toHaveValue("day");
+      await expect(bodyRows(summary)).toHaveCount(1);
+      const row = bodyRows(summary).first().locator("td");
+      await expect(row.nth(0)).toHaveText(today);
+      await expect(row.nth(1)).toHaveText("-$0.022");
+      await expect(row.nth(2)).toHaveText("$0.05");
+      await expect(row.nth(4)).toHaveText("$0.028");
+      await expect(bodyRows(ledger)).toHaveCount(3);
+
+      // An end before the start names nothing, and the field says so.
+      await ledger.getByLabel("结束日期（UTC）").fill(utcDay(-1));
+      await expect(ledger.getByText("结束日期不能早于开始日期")).toBeVisible();
+      await expect(bodyRows(ledger)).toHaveCount(0);
+      await expect(bodyRows(summary)).toHaveCount(0);
+
+      // Yesterday, as a whole range of its own, holds nothing.
+      await ledger.getByLabel("开始日期（UTC）").fill(utcDay(-1));
+      await expect(ledger.getByText("所选范围内没有流水")).toBeVisible();
+      await expect(summary.getByText("所选范围内没有汇总")).toBeVisible();
+      await expect(bodyRows(ledger)).toHaveCount(0);
+      await expect(bodyRows(summary)).toHaveCount(0);
+    } finally {
+      await context.close();
+    }
+  });
+});
+
+test("平台直接入账显示为平台入账并带原因", async ({ page }) => {
+  const world = await seedBillingWorld(stack, { creditUsd: "0" });
+  await stack.admin.post(`/admin/tenants/${world.tenantId}/credits`, { amount_usd: "0.03", reason: "线下收款-ui-4b7" });
+  await openAccount(page, world.owner);
+  const row = bodyRows(region(page, "充值记录")).first().locator("td");
+  await expect(row.nth(0)).toHaveText("$0.03");
+  await expect(row.nth(2)).toHaveText("平台入账");
+  await expect(row.nth(3)).toHaveText("平台");
+  await expect(row.nth(6)).toContainText("线下收款-ui-4b7");
+  await expect(bodyRows(region(page, "余额流水")).first().locator("td").nth(4)).toHaveText("平台入账");
+});
+
+test("被驳回的申请显示驳回原因，余额不变", async ({ page }) => {
+  const world = await seedBillingWorld(stack, { creditUsd: "0" });
+  const api = await ownerApi(world);
+  const asked = await api.post("/api/billing/topups", { amount_usd: "0.10" });
+  await rejectTopup(stack, asked.id, "未收到款项-4b7");
+  await openAccount(page, world.owner);
+  const row = bodyRows(region(page, "充值记录")).first();
+  await expect(row).toContainText("已驳回");
+  await expect(row).toContainText("未收到款项-4b7");
+  await expect(region(page, "余额")).toContainText("$0.00");
+  await expect(region(page, "余额").locator("[data-state]")).toHaveAttribute("data-state", "exhausted");
+});
+
+test("后付组织显示信用额度与可用额度，用尽后显示已达信用额度", async ({ page }) => {
+  const world = await seedBillingWorld(stack, { mode: "postpaid", creditLimitUsd: "0.02" });
+  await openAccount(page, world.owner);
+  const balance = region(page, "余额");
+  await expect(balance).toContainText("信用额度");
+  await expect(balance.locator(".entry").filter({ hasText: "信用额度" })).toContainText("$0.02");
+  await paidChat(world);
+  await paidChat(world);
+  await expect.poll(() => balanceOf(world)).toBe(-2 * CALL_MICRO_USD);
+  await page.reload();
+  await page.getByRole("tab", { name: "账户" }).click();
+  await expect(balance.locator(".entry").filter({ hasText: "可用额度" })).toContainText("-$0.002");
+  await expect(balance.locator("[data-state]")).toHaveAttribute("data-state", "exhausted");
+  await expect(balance).toContainText("已达信用额度，调用已停止");
+});
+
+test("金额格式不对时不发送请求并提示", async ({ page }) => {
+  const world = await seedBillingWorld(stack, { creditUsd: "0" });
+  await openAccount(page, world.owner);
+  const form = region(page, "申请充值");
+  await form.getByLabel("金额（美元）").fill("0.001");
+  await form.getByRole("button", { name: "提交申请" }).click();
+  await expect(form.getByText("请输入金额，最多两位小数")).toBeVisible();
+  await expect(form.getByLabel("金额（美元）")).toBeFocused();
+  await page.reload();
+  await page.getByRole("tab", { name: "账户" }).click();
+  await expect(region(page, "充值记录").getByText("还没有充值记录")).toBeVisible();
+  await expect(bodyRows(region(page, "充值记录"))).toHaveCount(0);
+  const api = await ownerApi(world);
+  expect((await api.get("/api/billing/topups")).items).toEqual([]);
+});
+
+test("成员看不到账户页；账单角色能看到余额并提交充值，但没有密钥页", async ({ page }) => {
+  const world = await seedBillingWorld(stack, { creditUsd: "0", members: ["member", "billing"] });
+  const [plain, billing] = world.members;
+  if (!plain || !billing) throw new Error("the world has both members");
+
+  await login(page, plain);
+  await expect(page.getByRole("tab", { name: "账户" })).toHaveCount(0);
+  await page.getByRole("button", { name: "登出" }).click();
+
+  await openAccount(page, billing);
+  await expect(page.getByRole("tab", { name: "密钥" })).toHaveCount(0);
+  await expect(region(page, "余额")).toContainText("$0.00");
+  const readout = region(page, "可用额度");
+  await expect(readout.getByRole("listitem")).toHaveCount(1);
+  await expect(readout.getByRole("listitem")).toContainText("组织");
+  await expect(readout.getByLabel("密钥")).toHaveCount(0);
+  await expect(readout.getByTestId("readout-amount")).toHaveText("$0.00");
+
+  const form = region(page, "申请充值");
+  await form.getByLabel("金额（美元）").fill("0.01");
+  await form.getByRole("button", { name: "提交申请" }).click();
+  await expect(bodyRows(region(page, "充值记录")).first()).toContainText("待审批");
+});
+
+test("流水分页：加载更多既不重复也不遗漏", async ({ page }) => {
+  test.setTimeout(180_000);
+  const world = await seedBillingWorld(stack, { creditUsd: "1.00" });
+  await paidChat(world);
+  for (let i = 1; i < 50; i++) expect(await chat(stack, world.key.plaintext, world.model.name)).toBe(200);
+  await expect.poll(() => balanceOf(world), { timeout: 60_000 }).toBe(1_000_000 - 50 * CALL_MICRO_USD);
+
+  await openAccount(page, world.owner);
+  const ledger = region(page, "余额流水");
+  await expect(bodyRows(ledger)).toHaveCount(50);
+  await ledger.getByRole("button", { name: "加载更多" }).click();
+  await expect(bodyRows(ledger)).toHaveCount(51);
+  await expect(ledger.getByRole("button", { name: "加载更多" })).toHaveCount(0);
+
+  // Each entry's balance is the one before it less a call: 51 distinct, in order, none missing.
+  const balances = await bodyRows(ledger).locator("td:nth-child(4)").allTextContents();
+  const expected = [1_000_000];
+  for (let k = 1; k <= 50; k++) expected.unshift(1_000_000 - k * CALL_MICRO_USD);
+  expect(balances).toEqual(expected.map(usd));
+  expect(new Set(balances).size).toBe(51);
+});
