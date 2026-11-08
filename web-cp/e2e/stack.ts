@@ -132,6 +132,10 @@ export interface Stack {
   httpUrl: string;
   /** The managed gateway's proxy listener. */
   proxyUrl: string;
+  /** The managed gateway's Prometheus listener (`<url>/metrics`). */
+  gatewayMetricsUrl: string;
+  /** Present with `startStack({ telemetryRelay: true })`: holds the gateway's link to the control plane. */
+  relay?: { pause(): Promise<void>; resume(): Promise<void> };
   /** The upstream stand-in; an upstream account reaches it at `<url>/v1`. */
   mockUpstreamUrl: string;
   /** The stack's first operator, an admin. */
@@ -147,8 +151,9 @@ interface ReadyLine {
   ready: true;
   httpUrl: string;
   operator: { email: string; password: string };
-  gateway: { proxyUrl: string; dpId: string; name: string };
+  gateway: { proxyUrl: string; metricsUrl: string; dpId: string; name: string };
   mockUpstream: { url: string };
+  telemetryRelay?: { controlUrl: string };
 }
 
 function freePort(): Promise<number> {
@@ -196,6 +201,12 @@ function exited(child: ChildProcess): Promise<void> {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+async function relayCall(controlUrl: string, action: "pause" | "resume"): Promise<void> {
+  const res = await fetch(`${controlUrl}/__relay/${action}`, { method: "POST" });
+  await res.arrayBuffer();
+  if (res.status !== 204) throw new Error(`relay ${action} answered ${res.status}`);
 }
 
 /** Reads the stack's stdout until its ready line, racing its exit and a deadline. */
@@ -249,14 +260,14 @@ async function waitServing(url: string): Promise<void> {
   }
 }
 
-export async function startStack(): Promise<Stack> {
+export async function startStack(opts: { telemetryRelay?: boolean } = {}): Promise<Stack> {
   assertBuilt();
   // stdin is held open: the stack stops when it closes, so a worker that
   // dies takes its databases with it. Its own progress and every child's
   // lines go to stderr, which is this worker's.
   const stackProc = spawn(
     process.execPath,
-    ["../scripts/cp-dev-stack.mjs", "--gateway", "../target/debug/aisix", "--mock-upstream"],
+    ["../scripts/cp-dev-stack.mjs", "--gateway", "../target/debug/aisix", "--mock-upstream", ...(opts.telemetryRelay ? ["--telemetry-relay"] : [])],
     { cwd: WEB_CP, stdio: ["pipe", "pipe", "inherit"], detached: true },
   );
   let preview: ChildProcess | undefined;
@@ -296,12 +307,18 @@ export async function startStack(): Promise<Stack> {
     const previewUrl = `http://127.0.0.1:${port}`;
     await waitServing(previewUrl);
 
+    const control = ready.telemetryRelay?.controlUrl;
     const admin = new ApiClient(ready.httpUrl);
     await admin.post("/admin/login", ready.operator);
     return {
       previewUrl,
       httpUrl: ready.httpUrl,
       proxyUrl: ready.gateway.proxyUrl,
+      gatewayMetricsUrl: ready.gateway.metricsUrl,
+      relay: control === undefined ? undefined : {
+        pause: () => relayCall(control, "pause"),
+        resume: () => relayCall(control, "resume"),
+      },
       mockUpstreamUrl: ready.mockUpstream.url,
       operator: ready.operator,
       admin,

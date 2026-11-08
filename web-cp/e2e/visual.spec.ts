@@ -160,6 +160,25 @@ for (const [tab, label] of PAGES) {
   });
 }
 
+test("计费 · 对账：深色与手机宽度下不横向滚动", async ({ browser }) => {
+  const page = await systemDark(browser);
+  await login(page);
+  await open(page, "billing");
+  await page.getByRole("group", { name: "计费分区" }).getByRole("button", { name: "对账", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "对账", exact: true })).toBeVisible();
+  await expect(page.locator("main").getByText("载入中…")).toHaveCount(0);
+  await page.evaluate(() => document.fonts.ready.then(() => undefined));
+  await expect.poll(() => background(page)).toBe(LIGHT_BG);
+  await shoot(page, "visual-billing-reconciliation-light.png");
+  await page.getByRole("button", { name: "切换到深色" }).click();
+  await expect.poll(() => background(page)).toBe(DARK_BG);
+  await shoot(page, "visual-billing-reconciliation-dark.png");
+  await page.setViewportSize(PHONE);
+  await shoot(page, "visual-billing-reconciliation-360.png");
+  expect(await page.evaluate(() => document.documentElement.scrollWidth), "no sideways scroll").toBeLessThanOrEqual(PHONE.width);
+  await page.context().close();
+});
+
 test("两步确认用键盘打开时焦点落在「取消」，再按回车只是收回，不会执行", async ({ browser }) => {
   const org = "Focus Co 2b7";
   const signedUp = await stack.tenant().post("/api/signup", {

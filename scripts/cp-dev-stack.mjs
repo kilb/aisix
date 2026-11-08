@@ -8,7 +8,7 @@
 // Usage:
 //   node scripts/cp-dev-stack.mjs [--http-port N] [--dp-port N] [--kine-port N]
 //     [--etcd-prefix /aisix] [--gateway <aisix binary> [--gateway-name stack-gw]
-//     [--proxy-port N]] [--stale-secs 10] [--mock-upstream]
+//     [--proxy-port N]] [--stale-secs 10] [--mock-upstream] [--telemetry-relay]
 //
 // Ports default to free ones picked on 127.0.0.1.
 //
@@ -19,6 +19,15 @@
 // returns the records, `DELETE /__requests` clears them. An upstream account
 // reaches it with `api_base` set to `<url>/v1`. It stands in for a provider,
 // never for the control plane.
+//
+// --telemetry-relay (with --gateway) puts a TCP relay between the gateway and
+// the control plane's gateway listener: the gateway's `managed.cp_base_url`
+// names the relay. `POST <controlUrl>/__relay/pause` makes the control plane
+// unreachable without refusing anything (the relay keeps accepting and holds
+// every link, forwarding nothing); `POST <controlUrl>/__relay/resume` forwards
+// what the links still open held. A link whose client closed while paused is
+// torn down at once, upstream side included, so what it held never reaches
+// the control plane. The relay never reads or forges TLS: it forwards bytes.
 //
 // Environment:
 //   CP_E2E_PG_URL    required: a Postgres URL whose role may CREATE DATABASE.
@@ -32,8 +41,9 @@
 //
 // When everything is up it prints ONE line of JSON to stdout:
 //   {"ready": true, "httpUrl", "dpUrl", "envId", "kineEndpoint", "etcdPrefix",
-//    "operator": {"email", "password"}, "gateway"?: {"proxyUrl", "dpId", "name"},
-//    "mockUpstream"?: {"url"}}
+//    "operator": {"email", "password"},
+//    "gateway"?: {"proxyUrl", "metricsUrl", "dpId", "name"},
+//    "mockUpstream"?: {"url"}, "telemetryRelay"?: {"controlUrl"}}
 // Everything else (its own progress and every child's output, line-prefixed)
 // goes to stderr.
 //
@@ -80,7 +90,7 @@ const FLAGS = new Set([
   "--stale-secs",
 ]);
 /** Flags that take none. */
-const SWITCHES = new Set(["--mock-upstream"]);
+const SWITCHES = new Set(["--mock-upstream", "--telemetry-relay"]);
 
 function parseArgs(argv) {
   const out = {};
@@ -95,7 +105,7 @@ function parseArgs(argv) {
       process.stderr.write(
         "usage: node scripts/cp-dev-stack.mjs [--http-port N] [--dp-port N] [--kine-port N] " +
           "[--etcd-prefix /aisix] [--gateway <aisix binary>] [--gateway-name stack-gw] " +
-          "[--proxy-port N] [--stale-secs 10] [--mock-upstream]\n",
+          "[--proxy-port N] [--stale-secs 10] [--mock-upstream] [--telemetry-relay]\n",
       );
       process.exit(2);
     }
@@ -483,6 +493,78 @@ function startMockUpstream() {
   });
 }
 
+// ── the telemetry relay (--telemetry-relay) ─────────────────────────────────
+
+/**
+ * A TCP relay to `host:targetPort` with pause and resume (the behaviour of
+ * the e2e harness's swallow relay, without the swallow). Resolves to
+ * `{port, controlUrl}`; it lives in this process.
+ */
+async function startTelemetryRelay(host, targetPort) {
+  const links = new Set();
+  let paused = false;
+
+  const openUpstream = (link) => {
+    const upstream = connect(targetPort, host);
+    link.server = upstream;
+    upstream.on("error", link.end);
+    upstream.on("close", link.end);
+    upstream.on("data", (chunk) => {
+      if (paused) link.held.push({ up: false, chunk });
+      else link.client.write(chunk);
+    });
+  };
+  const relay = createServer((client) => {
+    const link = {
+      client,
+      server: undefined,
+      held: [],
+      end: () => {
+        links.delete(link);
+        client.destroy();
+        link.server?.destroy();
+      },
+    };
+    links.add(link);
+    client.on("error", link.end);
+    client.on("close", link.end);
+    client.on("data", (chunk) => {
+      if (paused) link.held.push({ up: true, chunk });
+      else link.server.write(chunk);
+    });
+    if (!paused) openUpstream(link);
+  });
+  await new Promise((r) => relay.listen(0, "127.0.0.1", r));
+  const port = relay.address().port;
+
+  const resume = () => {
+    paused = false;
+    for (const link of [...links]) {
+      if (link.server === undefined) openUpstream(link);
+      const held = link.held;
+      link.held = [];
+      for (const { up, chunk } of held) {
+        if (!links.has(link)) break;
+        if (up) link.server.write(chunk);
+        else link.client.write(chunk);
+      }
+    }
+  };
+  const control = createHttpServer((req, res) => {
+    req.resume();
+    const path = (req.url ?? "/").split("?")[0];
+    if (req.method !== "POST" || (path !== "/__relay/pause" && path !== "/__relay/resume")) {
+      return sendJson(res, 404, { error: "POST /__relay/pause or /__relay/resume" });
+    }
+    if (path === "/__relay/pause") paused = true;
+    else resume();
+    res.writeHead(204);
+    res.end();
+  });
+  await new Promise((r) => control.listen(0, "127.0.0.1", r));
+  return { port, controlUrl: `http://127.0.0.1:${control.address().port}` };
+}
+
 // ── main ────────────────────────────────────────────────────────────────────
 
 async function main() {
@@ -569,6 +651,13 @@ async function main() {
     operator: { email: OPERATOR_EMAIL, password },
   };
 
+  let relay;
+  if (args["telemetry-relay"]) {
+    if (args.gateway === undefined) return fail("--telemetry-relay needs --gateway");
+    relay = await startTelemetryRelay("127.0.0.1", dpPort);
+    out.telemetryRelay = { controlUrl: relay.controlUrl };
+  }
+
   if (args.gateway !== undefined) {
     const name = args["gateway-name"] ?? "stack-gw";
     const proxyPort = port(args["proxy-port"], "proxy-port") ?? (await freePort());
@@ -595,6 +684,7 @@ async function main() {
       AISIX_OBSERVABILITY__HEAP_PROFILING__AUTO_DUMP__DIR: join(gwDir, "heap"),
       AISIX_SHUTDOWN__MIN_DRAIN_SECS: "0",
     });
+    if (relay) gwEnv.AISIX_MANAGED__CP_BASE_URL = `https://127.0.0.1:${relay.port}`;
     startChild("gw", resolve(args.gateway), ["--config", join(REPO, "config.managed.yaml")], gwEnv);
     const proxyUrl = `http://127.0.0.1:${proxyPort}`;
     await waitFor(`${proxyUrl}/livez`, () => httpOk(`${proxyUrl}/livez`));
@@ -606,7 +696,7 @@ async function main() {
       const instances = await api(httpUrl, "GET", "/admin/gateways/instances", cookie);
       return instances.body.items.some((i) => i.dp_id === dpId);
     });
-    out.gateway = { proxyUrl, dpId, name };
+    out.gateway = { proxyUrl, metricsUrl: `http://127.0.0.1:${metricsPort}`, dpId, name };
   }
 
   if (args["mock-upstream"]) {
