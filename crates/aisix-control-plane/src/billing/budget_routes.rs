@@ -37,42 +37,79 @@ use crate::tenants::{self, TenantRow};
 use crate::AppState;
 use aisix_core::models::BudgetPeriod;
 
+/// Which members' emails a reader may see in a target's label.
+#[derive(Debug, Clone, Copy)]
+enum Emails {
+    /// Every member's: an operator, or an owner or admin, who may list the
+    /// members.
+    All,
+    /// Only the reader's own: every other member role.
+    OwnOnly(Uuid),
+}
+
+impl Emails {
+    fn of(auth: &MemberAuth) -> Emails {
+        match auth.role {
+            MemberRole::Owner | MemberRole::Admin => Emails::All,
+            _ => Emails::OwnOnly(auth.id),
+        }
+    }
+}
+
+/// A member target's label: its display name; else its email, for a reader
+/// `emails` allows; else 成员 and the start of its id.
+fn member_label(id: Uuid, display_name: Option<String>, email: String, emails: Emails) -> String {
+    if let Some(name) = display_name.filter(|n| !n.is_empty()) {
+        return name;
+    }
+    match emails {
+        Emails::OwnOnly(me) if me != id => format!("成员 {}", &id.simple().to_string()[..8]),
+        _ => email,
+    }
+}
+
 /// The label and liveness of each target of `rows`: the tenant's name, a
-/// member's display name or email, a key's label. A target that is gone
+/// member's label ([`member_label`]), a key's label. A target that is gone
 /// keeps its label and is not live; one that is not found at all reads as
 /// not live with an empty label.
 async fn targets(
     conn: &mut PgConnection,
     tenant: &TenantRow,
     rows: &[BudgetRow],
+    emails: Emails,
 ) -> Result<HashMap<Uuid, (String, bool)>, DbError> {
     let mut found = HashMap::new();
     found.insert(tenant.id, (tenant.name.clone(), true));
-    for (scope, sql) in [
-        (
-            BudgetScope::Member,
-            "SELECT id, COALESCE(display_name, email), removed_at IS NULL FROM members \
-             WHERE tenant_id = $1 AND id = ANY($2)",
-        ),
-        (
-            BudgetScope::ApiKey,
-            "SELECT id, label, revoked_at IS NULL FROM tenant_keys \
-             WHERE tenant_id = $1 AND id = ANY($2)",
-        ),
-    ] {
-        let ids: Vec<Uuid> = rows
-            .iter()
+    let ids = |scope: BudgetScope| -> Vec<Uuid> {
+        rows.iter()
             .filter(|b| b.scope == scope)
             .map(|b| b.scope_ref)
-            .collect();
-        if ids.is_empty() {
-            continue;
-        }
-        let named: Vec<(Uuid, String, bool)> = sqlx::query_as(sql)
-            .bind(tenant.id)
-            .bind(&ids)
-            .fetch_all(&mut *conn)
-            .await?;
+            .collect()
+    };
+    let members = ids(BudgetScope::Member);
+    if !members.is_empty() {
+        let named: Vec<(Uuid, Option<String>, String, bool)> = sqlx::query_as(
+            "SELECT id, display_name, email, removed_at IS NULL FROM members \
+             WHERE tenant_id = $1 AND id = ANY($2)",
+        )
+        .bind(tenant.id)
+        .bind(&members)
+        .fetch_all(&mut *conn)
+        .await?;
+        found.extend(named.into_iter().map(|(id, display_name, email, live)| {
+            (id, (member_label(id, display_name, email, emails), live))
+        }));
+    }
+    let keys = ids(BudgetScope::ApiKey);
+    if !keys.is_empty() {
+        let named: Vec<(Uuid, String, bool)> = sqlx::query_as(
+            "SELECT id, label, revoked_at IS NULL FROM tenant_keys \
+             WHERE tenant_id = $1 AND id = ANY($2)",
+        )
+        .bind(tenant.id)
+        .bind(&keys)
+        .fetch_all(&mut *conn)
+        .await?;
         found.extend(
             named
                 .into_iter()
@@ -110,7 +147,7 @@ pub async fn list(
     let now = budgets::db_now(&mut conn).await?;
     let rows = budgets::list(&mut conn, id, now).await?;
     let plain: Vec<BudgetRow> = rows.iter().map(|(b, _)| b.clone()).collect();
-    let found = targets(&mut conn, &tenant, &plain).await?;
+    let found = targets(&mut conn, &tenant, &plain, Emails::All).await?;
     let items: Vec<Value> = rows
         .iter()
         .map(|(b, spent)| api(b, *spent, now, &found))
@@ -237,7 +274,8 @@ pub async fn create(
                     })?;
                 let now = budgets::db_now(&mut *conn).await?;
                 let spent = budgets::spent(&mut *conn, &row, now).await?;
-                let found = targets(&mut *conn, &tenant, std::slice::from_ref(&row)).await?;
+                let found =
+                    targets(&mut *conn, &tenant, std::slice::from_ref(&row), Emails::All).await?;
                 Ok::<_, ApiError>((row, spent, now, found))
             }
             .boxed()
@@ -300,7 +338,8 @@ pub async fn update(
                 .await?;
                 let now = budgets::db_now(&mut *conn).await?;
                 let spent = budgets::spent(&mut *conn, &row, now).await?;
-                let found = targets(&mut *conn, &tenant, std::slice::from_ref(&row)).await?;
+                let found =
+                    targets(&mut *conn, &tenant, std::slice::from_ref(&row), Emails::All).await?;
                 Ok::<_, ApiError>((row, spent, now, found))
             }
             .boxed()
@@ -386,7 +425,7 @@ pub async fn member_list(
         rows.retain(|(b, _)| is_mine(b, auth.id, &keys));
     }
     let plain: Vec<BudgetRow> = rows.iter().map(|(b, _)| b.clone()).collect();
-    let found = targets(&mut conn, &tenant, &plain).await?;
+    let found = targets(&mut conn, &tenant, &plain, Emails::of(&auth)).await?;
     let items: Vec<Value> = rows
         .iter()
         .map(|(b, spent)| api(b, *spent, now, &found))
@@ -500,7 +539,13 @@ pub async fn member_create(
                 let row = budgets::create(&mut *conn, &ctx, &tenant, new, actor).await?;
                 let now = budgets::db_now(&mut *conn).await?;
                 let spent = budgets::spent(&mut *conn, &row, now).await?;
-                let found = targets(&mut *conn, &tenant, std::slice::from_ref(&row)).await?;
+                let found = targets(
+                    &mut *conn,
+                    &tenant,
+                    std::slice::from_ref(&row),
+                    Emails::of(&auth),
+                )
+                .await?;
                 Ok::<_, ApiError>((row, spent, now, found))
             }
             .boxed()
@@ -569,7 +614,13 @@ pub async fn member_update(
                 let row = budgets::set_limit(&mut *conn, &ctx, &tenant, bid, limit, actor).await?;
                 let now = budgets::db_now(&mut *conn).await?;
                 let spent = budgets::spent(&mut *conn, &row, now).await?;
-                let found = targets(&mut *conn, &tenant, std::slice::from_ref(&row)).await?;
+                let found = targets(
+                    &mut *conn,
+                    &tenant,
+                    std::slice::from_ref(&row),
+                    Emails::of(&auth),
+                )
+                .await?;
                 Ok::<_, ApiError>((row, spent, now, found))
             }
             .boxed()

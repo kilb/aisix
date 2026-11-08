@@ -747,6 +747,73 @@ async fn a_member_reads_its_own_levels_only() {
     }
 }
 
+/// A member quota's target label names the member by its display name; its
+/// email only to a reader who may list the members (an operator, an owner,
+/// an admin) or to the member itself.
+#[tokio::test]
+async fn a_quota_label_shows_a_members_email_only_to_who_may_list_members() {
+    let Some(w) = world().await else { return };
+    let t = tenant(&w).await;
+    let r = tsend(
+        &w.cp,
+        &t.owner,
+        "POST",
+        "/api/budgets",
+        Some(quota("member", t.m.id, "0.05")),
+    )
+    .await;
+    assert_eq!(r.status, 201, "{r:?}");
+    let qid = id(&r);
+    let billing =
+        w.cp.member_login_seeded(w.tenant, MemberRole::Billing)
+            .await;
+    let label_for = |r: &Resp| -> String {
+        assert_eq!(r.status, 200, "{r:?}");
+        r.body["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .find(|b| b["id"] == json!(qid))
+            .unwrap_or_else(|| panic!("the quota in {r:?}"))["target"]["label"]
+            .as_str()
+            .expect("a label")
+            .to_string()
+    };
+    let short = t.m.id.simple().to_string()[..8].to_string();
+
+    // M has no display name.
+    let by_billing = label_for(&tsend(&w.cp, &billing, "GET", "/api/budgets", None).await);
+    assert_eq!(by_billing, format!("成员 {short}"));
+    assert!(!by_billing.contains(&t.m.email), "{by_billing}");
+    for (who, r) in [
+        (
+            "owner",
+            tsend(&w.cp, &t.owner, "GET", "/api/budgets", None).await,
+        ),
+        (
+            "the member itself",
+            tsend(&w.cp, &t.m, "GET", "/api/budgets", None).await,
+        ),
+        ("an operator", get(&w, w.tenant).await),
+    ] {
+        assert_eq!(label_for(&r), t.m.email, "{who}");
+    }
+
+    // Once M has one, its display name is shown to every reader.
+    sqlx::query("UPDATE members SET display_name = 'Mia 7c1' WHERE id = $1")
+        .bind(t.m.id)
+        .execute(w.cp.db().pool())
+        .await
+        .expect("name the member");
+    for r in [
+        tsend(&w.cp, &billing, "GET", "/api/budgets", None).await,
+        tsend(&w.cp, &t.owner, "GET", "/api/budgets", None).await,
+        get(&w, w.tenant).await,
+    ] {
+        assert_eq!(label_for(&r), "Mia 7c1");
+    }
+}
+
 #[tokio::test]
 async fn a_quota_defaults_to_monthly() {
     let Some(w) = world().await else { return };
