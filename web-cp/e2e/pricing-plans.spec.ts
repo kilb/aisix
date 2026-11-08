@@ -60,6 +60,21 @@ test("租户方案：设置 20% 折扣与一个专属价，结束专属价后显
   await expect(row).toContainText("输入 500 输出 900");
   await expect(row).not.toContainText("已结束");
 
+  // An override is charged as typed, and the 20% discount is not applied on top:
+  // 5 x 500 + 3 x 900 = 5 200 µ$ (a discounted override would be 4 160).
+  const overrideReq = `req-plan-ovr-${randomUUID().slice(0, 8)}`;
+  expect(await chat(stack, world.key.plaintext, world.model.name, { requestId: overrideReq })).toBe(200);
+  await expect
+    .poll(async () => (await stack.admin.get(`/admin/usage/events?request_id=${overrideReq}`)).items.length, { timeout: 30_000 })
+    .toBe(1);
+  const overrideEvent = (await stack.admin.get(`/admin/usage/events?request_id=${overrideReq}`)).items[0];
+  await expect
+    .poll(async () => (await stack.admin.get(`/admin/pricing/charges?event_id=${overrideEvent.event_id}`)).items[0]?.charge_micro_usd, {
+      timeout: 30_000,
+    })
+    .toBe(5_200);
+  expect((await stack.admin.get(`/admin/pricing/charges?event_id=${overrideEvent.event_id}`)).items[0].tenant_override).toBe(true);
+
   await row.getByRole("button", { name: "结束专属价" }).click();
   await row.getByRole("button", { name: "确认结束专属价" }).click();
   await expect(row).toContainText("已结束，按平台价");

@@ -1,24 +1,8 @@
 import { useEffect, useId, useState } from "react";
-import { ApiError } from "../lib/api";
+import { parseUtc, type EffectiveResolver } from "../lib/effective";
 import { Field } from "../ui/Field";
 
-/** What a form asks `EffectiveFrom` for when it submits. */
-export interface EffectiveResolver {
-  /** True while 立即生效 is on: the instant is stamped at submit. */
-  immediate: boolean;
-  /** The ISO instant to send, stamped now when immediate; null when the typed time is not a UTC time. */
-  stamp(): string | null;
-}
-
-const TYPED = /^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2})(:\d{2})?Z?$/;
-
-/** A time typed as `YYYY-MM-DD HH:mm[:ss]` in UTC, as an ISO instant; null when it is not one. */
-function parseUtc(text: string): string | null {
-  const m = TYPED.exec(text.trim());
-  if (!m) return null;
-  const at = new Date(`${m[1]}T${m[2]}${m[3] ?? ":00"}Z`);
-  return Number.isNaN(at.getTime()) ? null : at.toISOString();
-}
+export { sendAt, type EffectiveResolver } from "../lib/effective";
 
 /**
  * When a price starts: `立即生效` (on by default), or a `生效时间（UTC）`.
@@ -70,28 +54,4 @@ export function EffectiveFrom({
       )}
     </>
   );
-}
-
-/**
- * Sends a write with the resolver's start. A start stamped at submit that the
- * server finds in the past (`422 /effective_from`: the clock moved between
- * the stamp and the check) is stamped again and sent once more; a typed time
- * is never retried. `null` from the resolver (a time that is not valid) is
- * `invalid`.
- */
-export async function sendAt<T>(
-  resolver: EffectiveResolver,
-  send: (effectiveFrom: string) => Promise<T>,
-): Promise<T | "invalid"> {
-  const first = resolver.stamp();
-  if (first === null) return "invalid";
-  try {
-    return await send(first);
-  } catch (e) {
-    const past = e instanceof ApiError && e.status === 422 && e.details.some((d) => d.path === "/effective_from");
-    if (!resolver.immediate || !past) throw e;
-    const again = resolver.stamp();
-    if (again === null) throw e;
-    return await send(again);
-  }
 }

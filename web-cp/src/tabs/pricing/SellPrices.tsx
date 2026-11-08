@@ -17,6 +17,7 @@ import {
 import { messageFor, problemAt, warningText } from "../../lib/errors";
 import { errorText } from "../../lib/fmt";
 import { fmtUtc } from "../../lib/money";
+import { markupBps } from "../../lib/percent";
 import { Button } from "../../ui/Button";
 import { DataTable, Loading } from "../../ui/DataTable";
 import { EmptyState } from "../../ui/EmptyState";
@@ -32,13 +33,6 @@ function headline(card: RateCard | null): { input: string; output: string } | nu
   const base = card?.default?.base;
   if (!base || base.input === undefined || base.output === undefined) return null;
   return { input: base.input, output: base.output };
-}
-
-/** `加价（%）` typed with at most 2 decimals, as basis points; null when it is not such a number. */
-export function markupBps(text: string): number | null {
-  const m = /^(\d{1,5})(?:\.(\d{1,2}))?$/.exec(text.trim());
-  if (!m) return null;
-  return Number(m[1]) * 100 + Number((m[2] ?? "").padEnd(2, "0"));
 }
 
 /** The model document fields this page reads, to find its catalogue entry. */
@@ -191,6 +185,8 @@ function ModelPrice({
   const [details, setDetails] = useState<Detail[]>([]);
   const [failure, setFailure] = useState<string | null>(null);
   const [warnings, setWarnings] = useState<PriceWarning[]>([]);
+  // The catalogue's later-dated prices an import wrote along with the one asked for.
+  const [later, setLater] = useState<SellRevision[]>([]);
 
   const keys = useMemo(() => [...new Set(catalogue.map((e) => e.key))], [catalogue]);
   // The model's own provider/model_name, when the catalogue knows it.
@@ -204,7 +200,7 @@ function ModelPrice({
   const loadHistory = useCallback(
     async (before?: number) => {
       try {
-        const page = await pricing.listSell({ model_id: row.model_id, limit: HISTORY_PAGE, ...(before ? { before } : {}) });
+        const page = await pricing.listSell({ model_id: row.model_id, platform: true, limit: HISTORY_PAGE, ...(before ? { before } : {}) });
         setHistory((h) => (before && h ? [...h, ...page.items] : page.items));
         setNext(page.next_before);
         setHistoryError(null);
@@ -230,6 +226,7 @@ function ModelPrice({
     if (saving) return;
     setFailure(null);
     setWarnings([]);
+    setLater([]);
     const refused: Detail[] = [];
     let bps: number | undefined;
     if (mode === "card") {
@@ -259,6 +256,7 @@ function ModelPrice({
         return;
       }
       setWarnings(created.warnings);
+      setLater(created.later_revisions);
       toast("已保存");
       await Promise.all([onSaved(), loadHistory()]);
     } catch (err) {
@@ -325,6 +323,12 @@ function ModelPrice({
               {failure}
             </div>
           )}
+          {later.length > 0 && (
+            <div className="note" role="status">
+              目录中该条目之后的 {later.length} 个价格也已写入：
+              {later.map((r) => fmtUtc(r.effective_from)).join("、")}
+            </div>
+          )}
           {warnings.length > 0 && (
             <div className="note warn" role="status">
               <ul className="sell-warnings">
@@ -358,8 +362,8 @@ function ModelPrice({
               <tr>
                 <th>版本</th>
                 <th>生效时间（UTC）</th>
-                <th>输入</th>
-                <th>输出</th>
+                <th>输入（美元/百万单位）</th>
+                <th>输出（美元/百万单位）</th>
                 <th>来源</th>
               </tr>
             </thead>

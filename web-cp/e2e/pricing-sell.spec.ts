@@ -228,10 +228,13 @@ test("页面显示的现行价格就是调用实际计费的价格", async ({ pa
   await openPrices(page);
   const panel = await openModel(page, world.model.name);
   await fillCard(panel, { 输入: "7", 输出: "9" });
+  const written = page.waitForResponse((r) => r.url().endsWith("/admin/pricing/sell") && r.request().method() === "POST");
   await panel.getByRole("button", { name: "保存" }).click();
+  const revision: number = (await (await written).json()).revision_id;
   await expect(page.getByText("已保存")).toBeVisible();
-  const shown = Number(((await row(page, world.model.name).getByRole("cell").nth(2).textContent()) ?? "").replace("#", ""));
-  expect(shown).toBeGreaterThan(0);
+  // Wait for the reloaded table to show the revision just written, not the one before it.
+  await expect(row(page, world.model.name).getByRole("cell").nth(2)).toHaveText(`#${revision}`);
+  const shown = revision;
 
   const requestId = `req-sell-${randomUUID().slice(0, 8)}`;
   expect(await chat(stack, world.key.plaintext, world.model.name, { requestId })).toBe(200);
@@ -262,4 +265,25 @@ test("只读运维看不到任何编辑控件", async ({ page }) => {
   await expect(page.getByRole("button", { name: "保存" })).toHaveCount(0);
   await expect(page.getByText("新价格")).toHaveCount(0);
   await expect(page.getByRole("form", { name: "新价格" })).toHaveCount(0);
+});
+
+test("平台价格历史不含租户专属价", async ({ page }) => {
+  const world = await seedTenant(stack);
+  await stack.admin.post("/admin/pricing/sell", {
+    model_id: world.model.id,
+    effective_from: new Date().toISOString(),
+    card: { default: { base: { input: "11", output: "12" } } },
+  });
+  await stack.admin.post("/admin/pricing/sell", {
+    model_id: world.model.id,
+    tenant_id: world.tenantId,
+    effective_from: new Date().toISOString(),
+    card: { default: { base: { input: "777", output: "888" } } },
+  });
+  await openPrices(page);
+  const panel = await openModel(page, world.model.name);
+  const table = panel.getByRole("table", { name: "价格历史" });
+  await expect(table).toContainText("11");
+  await expect(table).not.toContainText("777");
+  await expect(table).not.toContainText("888");
 });

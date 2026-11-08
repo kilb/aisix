@@ -669,11 +669,14 @@ export const pricing = {
   async listSell(q: {
     model_id?: string;
     tenant_id?: string;
+    /** Only the platform's own prices, never a tenant override. */
+    platform?: boolean;
     limit?: number;
     before?: number;
   }): Promise<{ items: SellRevision[]; next_before: number | null }> {
     const params = new URLSearchParams();
     if (q.model_id) params.set("model_id", q.model_id);
+    if (q.platform) params.set("platform", "true");
     if (q.tenant_id) params.set("tenant_id", q.tenant_id);
     if (q.limit !== undefined) params.set("limit", String(q.limit));
     if (q.before !== undefined) params.set("before", String(q.before));

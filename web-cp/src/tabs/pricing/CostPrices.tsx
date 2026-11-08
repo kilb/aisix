@@ -278,8 +278,8 @@ export function CostPrices({ canEdit }: TabProps) {
                 <th>上游模型</th>
                 <th>上游账号</th>
                 <th>生效时间（UTC）</th>
-                <th>输入</th>
-                <th>输出</th>
+                <th>输入（美元/百万单位）</th>
+                <th>输出（美元/百万单位）</th>
               </tr>
             </thead>
             <tbody>

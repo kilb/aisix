@@ -20,8 +20,7 @@
 .rate-card > .note {
   margin: 0 0 var(--s-3);
 }
-.sell-form > .check,
-.sell-form .check {
+.check {
   display: flex;
   align-items: center;
   gap: var(--s-2);
