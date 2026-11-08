@@ -92,7 +92,13 @@ type Scenario =
   // A refusal whose text quotes the credential the request was sent with.
   | "quoted_key"
   // A stream the upstream ends on a request error of its own.
-  | "midstream_request";
+  | "midstream_request"
+  // A request too large for the upstream (413).
+  | "too_large"
+  // A request the upstream could not process (422).
+  | "unprocessable"
+  // A 400 that reports the platform's own account: a spend limit it set.
+  | "account_limit";
 const MATRIX: Scenario[] = ["unauthorized", "rate_limited", "context", "midstream"];
 const ALL_SCENARIOS: Scenario[] = [
   ...MATRIX,
@@ -105,7 +111,16 @@ const ALL_SCENARIOS: Scenario[] = [
   "overflow",
   "quoted_key",
   "midstream_request",
+  "too_large",
+  "unprocessable",
+  "account_limit",
 ];
+/**
+ * Anthropic's words for a spend limit set on the account, with the date
+ * access resumes (https://platform.claude.com/docs/en/api/rate-limits).
+ */
+const SPEND_LIMIT =
+  "You have reached your specified workspace API usage limits. You will regain access on 2026-12-01 at 00:00 UTC.";
 /** Anthropic's own words for a prompt over the context window, which Claude Code compacts on. */
 const ANTHROPIC_OVERFLOW = "prompt is too long: 250000 tokens > 200000 maximum";
 /** OpenAI's own words for the same, under the code the OpenAI SDK and Codex read. */
@@ -152,6 +167,12 @@ function upstreamText(scenario: Scenario, tag: string, wire: "openai" | "anthrop
       return wire === "anthropic"
         ? `messages.0.content.1.image.source.base64: image exceeds 5 MB maximum on Bedrock us-east-1 [${tag}]`
         : `Your input exceeds the context window of this model on Bedrock us-east-1 [${tag}]`;
+    case "too_large":
+      return `Request exceeds the maximum allowed number of bytes on Bedrock us-east-1 [${tag}]`;
+    case "unprocessable":
+      return `Input should be a valid list on Bedrock us-east-1 [${tag}]`;
+    case "account_limit":
+      return SPEND_LIMIT;
   }
 }
 
@@ -338,7 +359,22 @@ function answerOpenAi(path: string, tag: string, scenario: Scenario, res: Server
       res.writeHead(400, { "content-type": "application/json", ...CHANNEL_HEADERS });
       res.end(JSON.stringify(requestErrorBody(scenario, tag, "openai", credential)));
       return;
+    case "unprocessable":
+      return fail(422, { type: "invalid_request_error", param: "input", code: null });
     case "midstream_request":
+      // A chat stream that ends on a request error of the upstream's own.
+      if (!responses) {
+        return sse(res, [
+          dataFrame({
+            id: "chatcmpl-up-1",
+            object: "chat.completion.chunk",
+            created: 1,
+            model: "m",
+            choices: [{ index: 0, delta: { role: "assistant", content: "Hel" }, finish_reason: null }],
+          }),
+          dataFrame(openAiFailureBody(text, { type: "invalid_request_error", param: "messages", code: "context_length_exceeded" })),
+        ]);
+      }
       // A Response that fails on the request: Codex reads its code.
       return sse(res, [
         ...responsesOpening(),
@@ -444,7 +480,10 @@ function answerAnthropic(tag: string, scenario: Scenario, res: ServerResponse, c
     case "field":
     case "overflow":
     case "quoted_key":
+    case "account_limit":
       return fail(400, "invalid_request_error");
+    case "too_large":
+      return fail(413, "request_too_large");
     // Some text, then a request error of the upstream's own.
     case "midstream_request":
       return sse(res, [...opening, eventFrame("error", anthropicFailureBody(text, "invalid_request_error"))]);
@@ -768,6 +807,10 @@ describe("platform mode: upstream failures reach the caller as the gateway's own
     }
     await model(MESSAGES_NATIVE, "midstream_request");
     await model(RESPONSES_NATIVE, "midstream_request");
+    await model(CHAT, "midstream_request");
+    await model(COUNT_NATIVE, "too_large");
+    await model(EMBEDDINGS, "unprocessable");
+    await model(MESSAGES_NATIVE, "account_limit");
     // A block-capable output guardrail holds the whole stream back before
     // releasing it, which is a path of its own.
     const held = await seed.createGuardrail(
@@ -912,6 +955,47 @@ describe("platform mode: upstream failures reach the caller as the gateway's own
       expectGatewayHeaders(answer);
     });
 
+    test("chat: a request error the upstream ends a stream on is its own error frame", async (ctx) => {
+      if (!etcdReachable || !app) return ctx.skip();
+      const answer = await call(CHAT, "midstream_request", true);
+      expect(answer.status, answer.text).toBe(200);
+      const errors = ssePayloads(answer.text).filter((payload) => payload.error !== undefined);
+      expect(errors, answer.text).toEqual([
+        {
+          error: {
+            message: upstreamText("midstream_request", CHAT.tag, "openai"),
+            type: "invalid_request_error",
+            param: "messages",
+            code: "context_length_exceeded",
+          },
+        },
+      ]);
+      expectGatewayHeaders(answer);
+    });
+
+    test("count_tokens: a request too large keeps its own 413", async (ctx) => {
+      if (!etcdReachable || !app) return ctx.skip();
+      const answer = await call(COUNT_NATIVE, "too_large", false);
+      expectRelayed(
+        answer,
+        413,
+        anthropicFailureBody(upstreamText("too_large", COUNT_NATIVE.tag, "anthropic"), "request_too_large"),
+      );
+    });
+
+    test("embeddings: a request the upstream could not process keeps its own 422", async (ctx) => {
+      if (!etcdReachable || !app) return ctx.skip();
+      const answer = await call(EMBEDDINGS, "unprocessable", false);
+      expectRelayed(answer, 422, {
+        error: {
+          message: upstreamText("unprocessable", EMBEDDINGS.tag, "openai"),
+          type: "invalid_request_error",
+          param: "input",
+          code: null,
+        },
+      });
+    });
+
     test("responses-native: a Response the upstream fails on the request keeps its own error", async (ctx) => {
       if (!etcdReachable || !app) return ctx.skip();
       const answer = await call(RESPONSES_NATIVE, "midstream_request", true);
@@ -950,6 +1034,16 @@ describe("platform mode: upstream failures reach the caller as the gateway's own
       },
     });
     expectNoLeak(answer);
+  });
+
+  test("messages-native: a 400 that reports the platform's own spend limit is the model being unavailable", async (ctx) => {
+    if (!etcdReachable || !app) return ctx.skip();
+    // It describes an account every tenant shares: the caller learns neither
+    // the limit nor when it resets, and may retry.
+    const answer = await call(MESSAGES_NATIVE, "account_limit", false);
+    expectClass(MESSAGES_NATIVE, answer, UNAVAILABLE);
+    expect(answer.text).not.toContain("2026-12-01");
+    expect(answer.text).not.toContain("usage limits");
   });
 
   test("messages-native: a stream the upstream cuts off ends with the class", async (ctx) => {

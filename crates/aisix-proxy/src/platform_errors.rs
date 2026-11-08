@@ -306,6 +306,36 @@ pub(crate) fn classify_bridge(err: &BridgeError) -> PlatformErrorClass {
     }
 }
 
+/// Error codes an upstream gives, under a request-error status, when the
+/// platform's own account is at fault rather than the request: OpenAI's
+/// `billing_hard_limit_reached`, a 400 an organization over its own monthly
+/// budget gets (reported at
+/// <https://community.openai.com/t/billing-hard-limit-reached-api-error/572481>;
+/// not on OpenAI's error-codes page, whose own spend codes are 429s).
+const ACCOUNT_STATE_CODES: &[&str] = &["billing_hard_limit_reached"];
+
+/// What an upstream writes, lowercased, when the platform's own account is at
+/// fault under a request-error status and no code of its own says so. Each is
+/// a 400 `invalid_request_error`:
+/// - Anthropic's own spend limit, whose message "starts with `You have reached
+///   your specified API usage limits`, or `You have reached your specified
+///   workspace API usage limits` for a workspace limit, and states when access
+///   resumes" (<https://platform.claude.com/docs/en/api/rate-limits>,
+///   "Setting your own spend limit");
+/// - Anthropic's "Your credit balance is too low to access the Anthropic API"
+///   and "This organization has been disabled.", both of which Claude Code
+///   (2.1.319) matches as account state rather than a request error;
+/// - OpenAI's "Your organization must be verified to stream this model" (code
+///   `unsupported_value`, `param` `stream`; reported at
+///   <https://community.openai.com/t/requests-fail-even-after-verifying-organization/1231444>).
+const ACCOUNT_STATE_MARKERS: &[&str] = &[
+    "you have reached your specified api usage limits",
+    "you have reached your specified workspace api usage limits",
+    "credit balance is too low",
+    "organization has been disabled",
+    "organization must be verified",
+];
+
 /// Codes and types upstreams use for a request their content policy refused:
 /// Azure OpenAI's `content_filter` and its inner `ResponsibleAIPolicyViolation`,
 /// OpenAI's `content_policy_violation`, and the policy codes of a failed
@@ -378,6 +408,16 @@ fn classify_upstream(
                 .any(|t| tokens.contains(&t))
         })
     };
+    // The platform's account (its spend limit, its credit, its organization's
+    // standing), not the caller's request: the platform's to fix, as an
+    // upstream 401 or 403 is, and never relayed, since it describes an account
+    // every tenant shares and can carry the date its limit resets.
+    if matches!(status, None | Some(400)) && {
+        let text = message.to_ascii_lowercase();
+        names(ACCOUNT_STATE_CODES) || ACCOUNT_STATE_MARKERS.iter().any(|m| text.contains(m))
+    } {
+        return PlatformErrorClass::UpstreamUnavailable;
+    }
     if names(CONTENT_FILTER_TOKENS) {
         return PlatformErrorClass::ContentFiltered;
     }
@@ -405,9 +445,11 @@ fn classify_upstream(
     };
     match status {
         Some(429) => PlatformErrorClass::RateLimited,
-        // The platform's account was refused: not the caller's credential,
-        // and not something the caller may learn about.
-        Some(401 | 403) => PlatformErrorClass::UpstreamUnavailable,
+        // The platform's account was refused, or its billing was (Anthropic's
+        // 402 `billing_error`, <https://platform.claude.com/docs/en/api/errors>):
+        // not the caller's credential, and not something the caller may learn
+        // about.
+        Some(401..=403) => PlatformErrorClass::UpstreamUnavailable,
         Some(404) => PlatformErrorClass::NotFound,
         // A timeout and a conflict, which the OpenAI SDKs retry
         // (openai-python 3.41.0 `_base_client.py:944`), and a failed
@@ -446,22 +488,44 @@ fn dispatched_natively(wire: UpstreamWire) -> bool {
 
 /// The status `err` reaches the caller with when platform mode relays it as
 /// the upstream sent it: an upstream's answer to a request error
-/// ([`RELAYED_STATUSES`]) from an upstream of the caller's own protocol.
-/// An error an upstream reports inside a stream or a `2xx` body may carry no
-/// status of its own; it is a request error when its own code says so (a
-/// context overflow, a refused prompt or image, a content filter), which is
-/// when its class is a `400`. `None` when platform mode is off, and for every
-/// error that keeps a class.
+/// ([`RELAYED_STATUSES`]) from an upstream of the caller's own protocol, in
+/// that protocol's own error envelope. An error an upstream reports inside a
+/// stream or a `2xx` body may carry no status of its own; it is a request
+/// error when its own code says so (a context overflow, a refused prompt or
+/// image, a content filter), which is when its class is a `400`.
+///
+/// `None` when platform mode is off, and for every error that keeps a class:
+/// one that reports the platform's own account under a request-error status
+/// ([`ACCOUNT_STATE_MARKERS`]), and a body the upstream's envelope parser did
+/// not recognise (an intermediary's HTML page, another API's shape), whose
+/// words are in no protocol a client reads.
 pub(crate) fn relayed_status(err: &BridgeError) -> Option<u16> {
     if !active() {
         return None;
     }
-    let (status, wire) = match err {
-        BridgeError::UpstreamStatus { status, wire, .. } => (Some(*status), *wire),
-        BridgeError::UpstreamInBand { status, wire, .. } => (*status, *wire),
+    let (status, wire, parsed) = match err {
+        BridgeError::UpstreamStatus {
+            status,
+            wire,
+            parsed,
+            ..
+        } => (Some(*status), *wire, parsed),
+        BridgeError::UpstreamInBand {
+            status,
+            wire,
+            parsed,
+            ..
+        } => (*status, *wire, parsed),
         _ => return None,
     };
-    let status = status.unwrap_or_else(|| classify_bridge(err).status().as_u16());
+    if parsed.is_none() {
+        return None;
+    }
+    let class = classify_bridge(err);
+    if class == PlatformErrorClass::UpstreamUnavailable {
+        return None;
+    }
+    let status = status.unwrap_or_else(|| class.status().as_u16());
     (RELAYED_STATUSES.contains(&status) && dispatched_natively(wire)).then_some(status)
 }
 
@@ -621,11 +685,16 @@ fn scrubbed_error(event: &Value, pointer: &str) -> Option<Value> {
     scrub_strings(scrubbed.pointer_mut(pointer)?).then_some(scrubbed)
 }
 
-/// Every string in `value` through the shared scrubber; whether any changed.
+/// Every string in `value` through the shared scrubber, then cut at the
+/// length a buffered relay's text is cut at
+/// ([`aisix_gateway::MAX_UPSTREAM_ERROR_MESSAGE_BYTES`]); whether any changed.
 fn scrub_strings(value: &mut Value) -> bool {
     match value {
         Value::String(text) => {
-            let scrubbed = aisix_gateway::scrub_upstream_error_text(text);
+            let scrubbed = aisix_gateway::truncate_lossy(
+                &aisix_gateway::scrub_upstream_error_text(text),
+                aisix_gateway::MAX_UPSTREAM_ERROR_MESSAGE_BYTES,
+            );
             let changed = scrubbed != *text;
             *text = scrubbed;
             changed
@@ -1000,7 +1069,10 @@ mod tests {
             let err = BridgeError::UpstreamStatus {
                 status,
                 message: "upstream text".into(),
-                parsed: None,
+                parsed: Some(Box::new(UpstreamErrorView {
+                    message: Some("upstream text".into()),
+                    ..Default::default()
+                })),
                 wire,
                 retry_after: None,
                 diagnostic: None,
@@ -1044,6 +1116,48 @@ mod tests {
                 "{status}"
             );
         }
+        // A body the upstream's envelope parser did not recognise, and one
+        // that reports the platform's own account, keep their class.
+        let unparsed = BridgeError::UpstreamStatus {
+            status: 400,
+            message: "<html>bad request</html>".into(),
+            parsed: None,
+            wire: UpstreamWire::OpenAI,
+            retry_after: None,
+            diagnostic: None,
+        };
+        assert_eq!(in_platform_mode(|| relayed_status(&unparsed)), None);
+        for (wire, message, code) in [
+            (UpstreamWire::Anthropic, "Your credit balance is too low to access the Anthropic API.", None),
+            (
+                UpstreamWire::Anthropic,
+                "You have reached your specified API usage limits. You will regain access on 2026-12-01 at 00:00 UTC.",
+                None,
+            ),
+            (UpstreamWire::Anthropic, "This organization has been disabled.", None),
+            (UpstreamWire::OpenAI, "Your organization must be verified to stream this model.", None),
+            (UpstreamWire::OpenAI, "Billing hard limit has been reached", Some("billing_hard_limit_reached")),
+        ] {
+            let err = BridgeError::UpstreamStatus {
+                status: 400,
+                message: message.into(),
+                parsed: Some(Box::new(UpstreamErrorView {
+                    message: Some(message.into()),
+                    code: code.map(str::to_owned),
+                    ..Default::default()
+                })),
+                wire,
+                retry_after: None,
+                diagnostic: None,
+            };
+            let (relayed, class) = in_platform_mode(|| {
+                crate::attribution::note_translated_dispatch(false);
+                (relayed_status(&err), classify_bridge(&err))
+            });
+            assert_eq!(relayed, None, "{message}");
+            assert_eq!(class, PlatformErrorClass::UpstreamUnavailable, "{message}");
+        }
+
         // Off platform mode nothing is relayed: everything renders as it
         // always has.
         assert_eq!(
@@ -1212,6 +1326,12 @@ mod tests {
         );
         assert_eq!(
             classify(&upstream_status(403, "account suspended")),
+            PlatformErrorClass::UpstreamUnavailable
+        );
+        // Anthropic's `billing_error`: the platform's billing, not the
+        // caller's request.
+        assert_eq!(
+            classify(&upstream_status(402, "billing issue")),
             PlatformErrorClass::UpstreamUnavailable
         );
         assert_eq!(
@@ -1966,5 +2086,68 @@ mod tests {
                 && !text.contains("123456789012"),
             "{text}"
         );
+    }
+
+    /// An Azure OpenAI request error is relayed with Azure's own code, not
+    /// the code the translation table maps it to, and a request error's type.
+    #[tokio::test]
+    async fn an_azure_request_error_keeps_azures_own_code() {
+        // As the Azure parser reads them: the code its translation keys on in
+        // `kind`, Azure's own code in `code`.
+        for (kind, code) in [
+            ("context_length_exceeded", "context_length_exceeded"),
+            ("ResponsibleAIPolicyViolation", "content_filter"),
+        ] {
+            let err = ProxyError::Bridge(BridgeError::UpstreamStatus {
+                status: 400,
+                message: "upstream text".into(),
+                parsed: Some(Box::new(UpstreamErrorView {
+                    kind: Some(kind.into()),
+                    message: Some("upstream text".into()),
+                    code: Some(code.into()),
+                    param: Some("messages".into()),
+                })),
+                wire: UpstreamWire::AzureOpenAI,
+                retry_after: None,
+                diagnostic: None,
+            });
+            let resp = in_platform_mode(|| err.into_response());
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+            let body = body_json(resp).await;
+            assert_eq!(
+                body["error"],
+                serde_json::json!({"message": "upstream text", "type": "invalid_request_error",
+                                   "param": "messages", "code": code}),
+                "{kind}"
+            );
+        }
+    }
+
+    /// A relayed frame's text is cut where a buffered relay's is, so a long
+    /// request error reads the same buffered and mid-stream.
+    #[test]
+    fn a_relayed_frame_is_cut_where_a_buffered_relay_is() {
+        let long = format!(
+            "{} at arn:aws:bedrock:us-east-1:123456789012:x",
+            "x".repeat(3000)
+        );
+        let event = serde_json::json!({"type": "error", "sequence_number": 4,
+            "code": "context_length_exceeded", "message": long, "param": "input"});
+        let frame = format!("event: error\ndata: {event}\n\n");
+        let out = in_platform_mode(|| {
+            crate::attribution::note_translated_dispatch(false);
+            relayed_responses_failure(frame.as_bytes())
+        })
+        .unwrap();
+        let (v, _) = crate::redact::parse_sse_json_event(&out);
+        let buffered = match aisix_gateway::capture_in_band_error_value(
+            &serde_json::json!({"error": {"message": long, "code": "context_length_exceeded"}}),
+            UpstreamWire::OpenAI,
+        ) {
+            Some(BridgeError::UpstreamInBand { message, .. }) => message,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(v.unwrap()["message"], buffered.as_str());
+        assert!(buffered.len() < long.len(), "{}", buffered.len());
     }
 }

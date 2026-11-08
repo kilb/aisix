@@ -957,10 +957,21 @@ pub(crate) fn relayed_upstream_envelope(err: &aisix_gateway::BridgeError) -> Opt
         return None;
     };
     let mut envelope = render_bridge_upstream_envelope(status, message, parsed.as_deref(), *wire);
-    envelope.error.kind = parsed
-        .as_ref()
-        .and_then(|view| view.kind.clone())
-        .unwrap_or_else(|| "invalid_request_error".to_string());
+    envelope.error.kind = match wire {
+        // Azure OpenAI's parser keeps the code its translation keys on in
+        // `kind`, so the type is not read from there. Azure answers a request
+        // error with `invalid_request_error`, or no type at all.
+        aisix_gateway::UpstreamWire::AzureOpenAI => "invalid_request_error".to_string(),
+        _ => parsed
+            .as_ref()
+            .and_then(|view| view.kind.clone())
+            .unwrap_or_else(|| "invalid_request_error".to_string()),
+    };
+    // Azure's own code, where the translation table would put OpenAI's
+    // (`content_filter` rather than `content_policy_violation`).
+    if *wire == aisix_gateway::UpstreamWire::AzureOpenAI {
+        envelope.error.code = parsed.as_ref().and_then(|view| view.code.clone());
+    }
     Some(envelope)
 }
 
