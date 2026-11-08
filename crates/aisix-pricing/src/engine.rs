@@ -1330,9 +1330,10 @@ mod tests {
         };
 
         // Past the band: 200001 × 8 + 30 × 45 = 1,601,358 µ$; × 6.0 less
-        // 1000 bps is 8,647,333.2 µ¥, rounded up once. Rounding the discounted
-        // µ$ amount first would give 8,647,338, and the base rates 4/20 would
-        // give 8,644,110.
+        // 1000 bps is 8,647,333.2 µ¥, rounded up once. Each wrong order lands
+        // on its own number: the base rates 4/20 give 4,323,262, the group
+        // default 5.0 gives 7,206,111, no discount 9,608,148, and rounding the
+        // discounted µ$ amount before the rate 8,647,338.
         let mut u = rate_row();
         u.prompt_tokens = 200_001;
         u.completion_tokens = 30;
