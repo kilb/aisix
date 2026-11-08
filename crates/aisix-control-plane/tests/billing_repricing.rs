@@ -11,6 +11,8 @@
 
 mod support;
 
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -18,7 +20,7 @@ use aisix_control_plane::audit::Actor;
 use aisix_control_plane::auth::{MemberRole, OperatorRole};
 use aisix_control_plane::billing::budgets::{self, BudgetRow, BudgetScope, Kind, NewBudget, SetBy};
 use aisix_control_plane::billing::ledger::{self, Posting, Source};
-use aisix_control_plane::billing::repricing::MAX_REPRICE_EVENTS;
+use aisix_control_plane::billing::repricing::{MAX_REPRICE_EVENTS, MAX_REPRICE_TENANTS};
 use aisix_control_plane::db::Db;
 use aisix_control_plane::pricing::store::{self, NewDiscount};
 use aisix_control_plane::resources::write::WriteCtx;
@@ -1028,29 +1030,38 @@ async fn the_runs_list_pages_newest_first() {
     assert!(second.body["next_before"].is_null());
 }
 
-/// Times one apply of `MAX_REPRICE_EVENTS` charges on a debug build. Intake
-/// for the run's tenants waits on their accounts while it runs. Run with
+/// Times one apply of `MAX_REPRICE_EVENTS` charges spread over
+/// `MAX_REPRICE_TENANTS` tenants, on a debug build. The apply locks every
+/// tenant it changes and settles each one's marks in its transaction, and
+/// intake for those tenants waits on their accounts while it runs. Run with
 /// `--ignored`; the report records the figure.
 #[tokio::test]
 #[ignore]
 async fn a_full_run_applies_within_three_seconds() {
     let Some(r) = setup(false).await else { return };
     let (cp, db) = (&r.w.cp, r.w.cp.db());
-    let key = Uuid::parse_str(&r.w.key).expect("a key id");
     let from = Utc
         .with_ymd_and_hms(2026, 1, 1, 0, 0, 0)
         .single()
         .expect("a time");
-    insert_unpriced_charges(
-        db,
-        "full",
-        MAX_REPRICE_EVENTS,
-        r.w.tenant,
-        key,
-        r.model,
-        from,
-    )
-    .await;
+    let tenant_count = i64::try_from(MAX_REPRICE_TENANTS).expect("a count");
+    let per_tenant = MAX_REPRICE_EVENTS / tenant_count;
+    let mut tenants = Vec::new();
+    for n in 0..MAX_REPRICE_TENANTS {
+        let tenant = seed_tenant(cp, &r.w.admin).await;
+        let key = Uuid::parse_str(&seed_key(cp, &r.w.admin, tenant, None).await).expect("a key");
+        insert_unpriced_charges(
+            db,
+            &format!("full{n}x"),
+            per_tenant,
+            tenant,
+            key,
+            r.model,
+            from,
+        )
+        .await;
+        tenants.push(tenant);
+    }
     price(cp, r.model).await;
     let (id, run) = previewed(
         cp,
@@ -1058,12 +1069,333 @@ async fn a_full_run_applies_within_three_seconds() {
         run_body(from, from + TimeDelta::days(1), json!({})),
     )
     .await;
-    assert_eq!(run["changed"], MAX_REPRICE_EVENTS);
+    assert_eq!(run["changed"], per_tenant * tenant_count);
+    assert_eq!(
+        run["by_tenant"].as_array().map(Vec::len),
+        Some(MAX_REPRICE_TENANTS)
+    );
     let started = Instant::now();
     let applied = apply(cp, &r.admin, &id).await;
     let took = started.elapsed();
     assert_eq!(applied.status, 200, "{applied:?}");
-    println!("apply of {MAX_REPRICE_EVENTS} charges took {took:?}");
-    assert_eq!(balance(db, r.w.tenant).await, -680 * MAX_REPRICE_EVENTS);
+    println!(
+        "apply of {} charges over {MAX_REPRICE_TENANTS} tenants took {took:?}",
+        per_tenant * tenant_count
+    );
+    for tenant in tenants {
+        assert_eq!(balance(db, tenant).await, -680 * per_tenant);
+    }
     assert!(took < Duration::from_secs(3), "apply took {took:?}");
+}
+
+/// `count` tenants that do not exist, each with one unpriced charge on
+/// `model` occurring at `at`, filed under it as intake files a row: rows a
+/// preview selects and prices, for counts of tenants a test cannot create
+/// quickly.
+async fn phantom_tenants(db: &Db, prefix: &str, count: usize, model: Uuid, at: DateTime<Utc>) {
+    for n in 0..count {
+        insert_unpriced_charges(
+            db,
+            &format!("{prefix}{n}x"),
+            1,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            model,
+            at,
+        )
+        .await;
+    }
+}
+
+/// The 422 at `/tenant_id` that names `count` tenants.
+fn assert_tenant_cap_refusal(r: &Resp, count: usize) {
+    assert_eq!(r.status, 422, "{r:?}");
+    assert_eq!(r.body["details"][0]["path"], "/tenant_id", "{r:?}");
+    let message = r.body["details"][0]["message"].as_str().expect("a message");
+    assert!(message.contains(&count.to_string()), "{message}");
+}
+
+#[tokio::test]
+async fn a_preview_changing_more_tenants_than_the_cap_is_refused() {
+    let Some(r) = setup(true).await else { return };
+    let (cp, db) = (&r.w.cp, r.w.cp.db());
+    let from = Utc
+        .with_ymd_and_hms(2026, 1, 1, 0, 0, 0)
+        .single()
+        .expect("a time");
+    let to = from + TimeDelta::days(1);
+    phantom_tenants(db, "tc", MAX_REPRICE_TENANTS, r.model, from).await;
+    // Exactly the cap previews.
+    let (_, run) = previewed(cp, &r.w.admin, run_body(from, to, json!({}))).await;
+    assert_eq!(
+        run["by_tenant"].as_array().map(Vec::len),
+        Some(MAX_REPRICE_TENANTS)
+    );
+    // One tenant more is refused, naming how many the run would change.
+    phantom_tenants(db, "tc-over", 1, r.model, from).await;
+    let refused = preview(cp, &r.w.admin, run_body(from, to, json!({}))).await;
+    assert_tenant_cap_refusal(&refused, MAX_REPRICE_TENANTS + 1);
+    // Narrowed to one tenant, the same window previews.
+    let narrowed = preview(
+        cp,
+        &r.w.admin,
+        run_body(from, to, json!({"tenant_id": r.w.tenant})),
+    )
+    .await;
+    assert_eq!(narrowed.status, 201, "{narrowed:?}");
+}
+
+#[tokio::test]
+async fn an_apply_refuses_a_run_that_grew_past_the_tenant_cap() {
+    let Some(r) = setup(false).await else { return };
+    let (cp, db) = (&r.w.cp, r.w.cp.db());
+    three_rows(&r.w, "gr", r.model).await;
+    price(cp, r.model).await;
+    let (from, to) = last_hour(cp).await;
+    let (id, run) = previewed(cp, &r.w.admin, run_body(from, to, json!({}))).await;
+    assert_eq!(run["by_tenant"].as_array().map(Vec::len), Some(1));
+    // Rows of as many other tenants again arrive late inside the window.
+    phantom_tenants(
+        db,
+        "gr-late",
+        MAX_REPRICE_TENANTS,
+        r.model,
+        to - TimeDelta::minutes(30),
+    )
+    .await;
+    let refused = apply(cp, &r.admin, &id).await;
+    assert_tenant_cap_refusal(&refused, MAX_REPRICE_TENANTS + 1);
+    assert!(adjustments(db).await.is_empty());
+    assert!(entries(db, r.w.tenant).await.is_empty());
+    let stored = cp
+        .send(
+            "GET",
+            &format!("/admin/billing/repricing/{id}"),
+            Some(r.admin.cookie()),
+            None,
+        )
+        .await;
+    assert_eq!(stored.body["status"], "previewed", "{stored:?}");
+}
+
+/// A run stored before the cap existed may change more tenants than it
+/// allows: apply refuses it before it locks any of them.
+#[tokio::test]
+async fn an_apply_refuses_a_stored_run_past_the_tenant_cap() {
+    let Some(r) = setup(false).await else { return };
+    let (cp, db) = (&r.w.cp, r.w.cp.db());
+    three_rows(&r.w, "sr", r.model).await;
+    price(cp, r.model).await;
+    let (from, to) = last_hour(cp).await;
+    let (id, _) = previewed(cp, &r.w.admin, run_body(from, to, json!({}))).await;
+    let mut by_tenant: Vec<Value> = (0..MAX_REPRICE_TENANTS)
+        .map(|_| json!({"tenant_id": Uuid::new_v4(), "events": 1, "changed": 1, "delta_micro_usd": 1}))
+        .collect();
+    by_tenant.push(json!({
+        "tenant_id": r.w.tenant, "events": 3, "changed": 3, "delta_micro_usd": 2_040,
+    }));
+    sqlx::query("UPDATE billing_repricing_runs SET by_tenant = $2 WHERE id = $1")
+        .bind(Uuid::parse_str(&id).expect("a run id"))
+        .bind(sqlx::types::Json(by_tenant))
+        .execute(db.pool())
+        .await
+        .expect("store an over-wide run");
+    let refused = apply(cp, &r.admin, &id).await;
+    assert_tenant_cap_refusal(&refused, MAX_REPRICE_TENANTS + 1);
+    assert!(adjustments(db).await.is_empty());
+}
+
+/// Tenant `tenant`'s balance document, as stored.
+async fn balance_doc(db: &Db, tenant: Uuid) -> Value {
+    sqlx::query_scalar(
+        "SELECT r.doc FROM gw_resources r JOIN billing_accounts a ON a.balance_budget_id = r.id \
+         WHERE a.tenant_id = $1 AND r.kind = 'budgets' AND NOT r.deleted",
+    )
+    .bind(tenant)
+    .fetch_one(db.pool())
+    .await
+    .expect("read the balance document")
+}
+
+#[tokio::test]
+async fn a_run_changing_two_tenants_posts_and_settles_each() {
+    let Some(r) = setup(false).await else { return };
+    let (cp, db) = (&r.w.cp, r.w.cp.db());
+    let a = r.w.tenant;
+    let b = seed_tenant(cp, &r.w.admin).await;
+    let b_key = seed_key(cp, &r.w.admin, b, None).await;
+    let now = db_now(cp).await;
+    cp.db()
+        .tx(move |c| {
+            async move {
+                store::insert_discount(
+                    c,
+                    &NewDiscount {
+                        tenant_id: b,
+                        effective_from: now,
+                        discount_bps: 2_000,
+                    },
+                    Actor::System,
+                )
+                .await
+            }
+            .boxed()
+        })
+        .await
+        .expect("discount B");
+    // Each prepaid tenant holds a credit of $0.01.
+    for tenant in [a, b] {
+        let r = cp
+            .send(
+                "POST",
+                &format!("/admin/tenants/{tenant}/credits"),
+                Some(r.admin.cookie()),
+                Some(json!({"amount_usd": "0.01", "reason": "重新定价测试 7c1"})),
+            )
+            .await;
+        assert_eq!(r.status, 201, "{r:?}");
+    }
+    // 20 000 input tokens each, on a model with no price yet.
+    let mut on_b = usage(&r.w, "pair-b", r.model, json!({"prompt_tokens": 20_000}));
+    on_b["team_id"] = json!(b.to_string());
+    on_b["api_key_id"] = json!(b_key);
+    on_b["user_id"] = json!("");
+    send(
+        &r.w,
+        vec![
+            usage(&r.w, "pair-a", r.model, json!({"prompt_tokens": 20_000})),
+            on_b,
+        ],
+    )
+    .await;
+    for tenant in [a, b] {
+        assert_eq!(balance(db, tenant).await, 10_000);
+        assert!(balance_doc(db, tenant).await["exhausted"].is_null());
+    }
+
+    price(cp, r.model).await;
+    let (from, to) = last_hour(cp).await;
+    let (id, run) = previewed(cp, &r.w.admin, run_body(from, to, json!({}))).await;
+    let parts: HashMap<Uuid, i64> = run["by_tenant"]
+        .as_array()
+        .expect("by_tenant")
+        .iter()
+        .map(|t| {
+            (
+                uuid(&t["tenant_id"]),
+                t["delta_micro_usd"].as_i64().expect("a delta"),
+            )
+        })
+        .collect();
+    // 20 000 µ$ for A, and for B with its 20 % off.
+    assert_eq!(parts, HashMap::from([(a, 20_000), (b, 16_000)]));
+    assert_eq!(run["delta_micro_usd"], 36_000);
+    let applied = apply(cp, &r.admin, &id).await;
+    assert_eq!(applied.status, 200, "{applied:?}");
+
+    let run_id = Some(Uuid::parse_str(&id).expect("a run id"));
+    for (tenant, delta, after) in [(a, 20_000, -10_000), (b, 16_000, -6_000)] {
+        let ledger = entries(db, tenant).await;
+        let adjusted: Vec<_> = ledger.iter().filter(|e| e.0 == "adjustment").collect();
+        assert_eq!(
+            adjusted,
+            [&("adjustment".to_string(), -delta, after, run_id)],
+            "{ledger:?}"
+        );
+        assert_eq!(balance(db, tenant).await, after);
+        // Each tenant's balance mark is settled exhausted by the apply.
+        let doc = balance_doc(db, tenant).await;
+        assert!(doc["exhausted"].is_object(), "{tenant}: {doc}");
+    }
+}
+
+/// A price write that has moved the price version but not committed when
+/// apply reads it: apply waits for it and then finds its preview stale,
+/// rather than reading the version from before the write.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_price_write_in_flight_at_apply_makes_it_stale() {
+    let Some(r) = setup(false).await else { return };
+    let (cp, db) = (&r.w.cp, r.w.cp.db());
+    three_rows(&r.w, "fl", r.model).await;
+    price(cp, r.model).await;
+    let (from, to) = last_hour(cp).await;
+    let (id, _) = previewed(cp, &r.w.admin, run_body(from, to, json!({}))).await;
+
+    let mut writer = db.pool().begin().await.expect("begin");
+    sqlx::query(
+        "UPDATE cp_settings SET value = to_jsonb((value::text)::bigint + 1), updated_at = now() \
+         WHERE key = 'pricing_version'",
+    )
+    .execute(&mut *writer)
+    .await
+    .expect("bump pricing_version");
+    let done = AtomicBool::new(false);
+    let applying = async {
+        let answer = apply(cp, &r.admin, &id).await;
+        done.store(true, Ordering::SeqCst);
+        answer
+    };
+    // The write commits once apply waits for it, or as soon as apply has
+    // answered without waiting.
+    let release = async {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !done.load(Ordering::SeqCst) && lock_waiters(cp).await < 1 {
+            assert!(
+                Instant::now() < deadline,
+                "apply neither waited nor answered"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        writer.commit().await.expect("commit the write");
+    };
+    let (applied, ()) = tokio::join!(applying, release);
+    assert_eq!(
+        (applied.status, &applied.body["code"]),
+        (409, &json!("stale_preview")),
+        "{applied:?}"
+    );
+    assert!(adjustments(db).await.is_empty());
+    assert!(entries(db, r.w.tenant).await.is_empty());
+}
+
+/// Two runs previewed over the same rows: the first applied corrects them,
+/// and the second, recomputed from the corrected charges, finds its preview
+/// stale, so the rows are corrected once.
+#[tokio::test]
+async fn two_runs_previewed_over_the_same_rows_correct_them_once() {
+    let Some(r) = setup(true).await else { return };
+    let (cp, db) = (&r.w.cp, r.w.cp.db());
+    send(&r.w, vec![usage(&r.w, "dbl1", r.model, tokens_680())]).await;
+    assert_eq!(balance(db, r.w.tenant).await, -680);
+    // Twice the price: 680 → 1360, so each preview says +680.
+    reprice_model(cp, r.model, card("2", "4", "0.2")).await;
+    let (from, to) = last_hour(cp).await;
+    let (first, run) = previewed(cp, &r.w.admin, run_body(from, to, json!({}))).await;
+    assert_eq!(run["delta_micro_usd"], 680);
+    let (second, run) = previewed(cp, &r.w.admin, run_body(from, to, json!({}))).await;
+    assert_eq!(run["delta_micro_usd"], 680);
+
+    assert_eq!(apply(cp, &r.admin, &first).await.status, 200);
+    let refused = apply(cp, &r.admin, &second).await;
+    assert_eq!(
+        (refused.status, &refused.body["code"]),
+        (409, &json!("stale_preview")),
+        "{refused:?}"
+    );
+    let first_id = Uuid::parse_str(&first).expect("a run id");
+    assert_eq!(
+        adjustments(db).await,
+        vec![(first_id, "dbl1".to_string(), 680)]
+    );
+    let adjusted: Vec<_> = entries(db, r.w.tenant)
+        .await
+        .into_iter()
+        .filter(|e| e.0 == "adjustment")
+        .collect();
+    assert_eq!(adjusted.len(), 1, "{adjusted:?}");
+    assert_eq!(balance(db, r.w.tenant).await, -1_360);
+    // A fresh preview starts from the corrected charge: nothing is left.
+    let (_, run) = previewed(cp, &r.w.admin, run_body(from, to, json!({}))).await;
+    assert_eq!(run["changed"], 0);
+    assert_eq!(run["delta_micro_usd"], 0);
 }

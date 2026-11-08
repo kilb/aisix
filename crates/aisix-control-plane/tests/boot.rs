@@ -664,6 +664,15 @@ fn an_uncast_sum_is_reported() {
     assert!(uncast_sums("SELECT SUM(delta)::bigint FROM ledger").is_empty());
     assert!(uncast_sums("SELECT COALESCE(SUM(delta)::bigint, 0) FROM ledger").is_empty());
     assert!(uncast_sums("SELECT coalesce( sum(delta) , 0 ) :: BIGINT FROM ledger").is_empty());
+    // An explicit numeric cast is a deliberate one, for a total that can
+    // pass the bigint range; only the implicit numeric is refused.
+    assert!(uncast_sums("SELECT SUM(n::numeric)::numeric FROM drops").is_empty());
+    assert!(
+        uncast_sums("SELECT LEAST(COALESCE(SUM(n)::numeric, 0), $1)::bigint FROM t").is_empty()
+    );
+    assert!(uncast_sums("SELECT COALESCE(SUM(n), 0) :: NUMERIC FROM drops").is_empty());
+    assert_eq!(uncast_sums("SELECT SUM(n)::numerical FROM t").len(), 1);
+    assert_eq!(uncast_sums("SELECT SUM(n)::int FROM t").len(), 1);
     assert_eq!(
         uncast_sums("select sum(delta) from ledger"),
         vec!["sum(delta)"]
@@ -731,7 +740,11 @@ fn the_crate_has_no_uncast_sum() {
             "{expected} not among {scanned:?}"
         );
     }
-    assert!(found.is_empty(), "cast every SUM to ::bigint: {found:#?}");
+    assert!(
+        found.is_empty(),
+        "cast every SUM to ::bigint, or to ::numeric when it can pass the bigint range: \
+         {found:#?}"
+    );
 }
 
 /// Every statement in `text` that inserts into, updates or deletes from

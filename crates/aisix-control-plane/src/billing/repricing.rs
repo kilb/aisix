@@ -42,7 +42,7 @@
 //! key-shares a tenant before it bumps the version, so the version is taken
 //! after the tenants), then the resources lock in the settle. Intake for
 //! those tenants waits on their accounts while an apply runs, which
-//! [`MAX_REPRICE_EVENTS`] bounds.
+//! [`MAX_REPRICE_EVENTS`] and [`MAX_REPRICE_TENANTS`] bound.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -76,6 +76,14 @@ use crate::AppState;
 /// The most charges one run may select. An apply holds its tenants' usage
 /// intake for as long as it runs, so a run stays one bounded transaction.
 pub const MAX_REPRICE_EVENTS: i64 = 10_000;
+
+/// The most tenants one run may change. An apply locks each tenant it changes
+/// for its whole transaction and settles each one's marks inside it, about
+/// nine round trips per tenant, which the event cap does not bound: against
+/// a database 1 ms away, 200 tenants hold their intake, and the resources
+/// lock, for about 2 s, the block-latency target and well under the 5 s
+/// `lock_timeout` at which intake gives up, where 1,000 would reach it.
+pub const MAX_REPRICE_TENANTS: usize = 200;
 
 /// The charge statuses a run may select by.
 const CHARGE_STATUSES: [&str; 4] = ["charged", "exempt", "nothing_to_bill", "unpriced"];
@@ -441,6 +449,26 @@ fn stale() -> ApiError {
     )
 }
 
+/// `422` at `/tenant_id` when a run changes more than
+/// [`MAX_REPRICE_TENANTS`] tenants.
+fn within_tenant_cap(changed: usize) -> Result<(), ApiError> {
+    if changed > MAX_REPRICE_TENANTS {
+        return Err(refused(
+            "/tenant_id",
+            format!(
+                "本次重新定价涉及 {changed} 个租户，超过单次上限 {MAX_REPRICE_TENANTS} 个，\
+                 请按租户筛选或缩小时间范围后分批预览"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// How many tenants `totals` changes.
+fn tenants_changed(totals: &Totals) -> usize {
+    totals.by_tenant.iter().filter(|t| t.changed > 0).count()
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NewRun {
@@ -462,7 +490,9 @@ pub struct NewRun {
 /// posted. `422` at `/reason` unless it is 1 to 500 characters, not blank
 /// and free of control characters; at `/status` unless it is a charge
 /// status; at `/to` unless `to` is after `from` and no later than now, or
-/// when the filter selects more than [`MAX_REPRICE_EVENTS`] charges.
+/// when the filter selects more than [`MAX_REPRICE_EVENTS`] charges; at
+/// `/tenant_id` when the run would change more than [`MAX_REPRICE_TENANTS`]
+/// tenants.
 pub async fn preview(
     auth: OperatorAuth,
     State(state): State<AppState>,
@@ -530,6 +560,7 @@ pub async fn preview(
                     ));
                 }
                 let (totals, _) = compute(&book, &rows, at)?;
+                within_tenant_cap(tenants_changed(&totals))?;
                 let id = Uuid::new_v4();
                 sqlx::query(
                     "INSERT INTO billing_repricing_runs \
@@ -598,7 +629,9 @@ async fn hold_pricing_version(conn: &mut PgConnection) -> Result<Option<i64>, Db
 /// settled in one transaction (see the module docs), and the run `applied`.
 /// `404 not_found` for no such run; `409 run_state` when it is no longer
 /// `previewed`; `409 stale_preview` when a price, the engine or the selected
-/// charges changed since the preview, in which case nothing is posted.
+/// charges changed since the preview; `422` at `/tenant_id` when the run, as
+/// stored or as computed again, changes more than [`MAX_REPRICE_TENANTS`]
+/// tenants. Nothing is posted on any of these.
 pub async fn apply(
     auth: OperatorAuth,
     State(state): State<AppState>,
@@ -625,6 +658,9 @@ pub async fn apply(
                     .filter(|t| t.changed > 0)
                     .map(|t| t.tenant_id)
                     .collect();
+                // A run stored by a release without the cap is refused
+                // before it locks a tenant.
+                within_tenant_cap(changed_tenants.len())?;
                 // The billing locks first: the run posts to these tenants'
                 // ledgers and settles their marks. A tenant the computation
                 // below changes is among them, or the totals differ.
@@ -655,6 +691,8 @@ pub async fn apply(
                     return Err(stale());
                 }
                 let (totals, changes) = compute(&book, &rows, at)?;
+                // Rows that arrived since the preview can widen the run.
+                within_tenant_cap(tenants_changed(&totals))?;
                 if totals != previewed {
                     return Err(stale());
                 }

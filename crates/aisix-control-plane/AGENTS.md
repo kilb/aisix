@@ -213,7 +213,9 @@ way.
 
 - Placeholders are `$n`. An integer decoded as `i64` is `bigint`, a flag
   `boolean`, a time `timestamptz`.
-- Every `SUM` is cast `::bigint` (`the_crate_has_no_uncast_sum`).
+- Every `SUM` is cast `::bigint` (`the_crate_has_no_uncast_sum`), or
+  `::numeric` explicitly where the total can pass the `bigint` range (the
+  u64 drop counts gateways report), narrowed before it is decoded.
 - Every `ON CONFLICT … DO UPDATE` uses `EXCLUDED.` and table-qualified columns.
 - A unique violation is recognised by SQLSTATE `23505` plus the constraint
   name, never by message text.
