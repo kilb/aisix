@@ -432,12 +432,18 @@ fn dollars(micro: i64) -> String {
 /// holds in (`period_start`), so the gateway lifts it at the next period on
 /// its own; a cumulative one names none and holds until the control plane
 /// lifts it, with `"period": "total"` in its reason.
+///
+/// An organization quota's mark names no amount, in its message or beside
+/// it, like the balance mark: every key of the tenant meets it, a member's
+/// included, and a member sees the organization only through the smallest
+/// remaining amount.
 pub fn budget_doc(b: &BudgetRow, spent: i64, now: DateTime<Utc>) -> Value {
     let period = b.period.map_or("month", BudgetPeriod::as_str);
     let mut doc = json!({"scope": b.scope.as_str(), "scope_ref": b.scope_ref, "period": period});
     if spent < b.limit_micro_usd {
         return doc;
     }
+    let team = b.scope == BudgetScope::Team;
     let limit = dollars(b.limit_micro_usd);
     let (message, reason_period) = match b.period {
         Some(p) => {
@@ -446,25 +452,34 @@ pub fn budget_doc(b: &BudgetRow, spent: i64, now: DateTime<Utc>) -> Value {
                 BudgetPeriod::Week => "weekly",
                 BudgetPeriod::Month => "monthly",
             };
-            (
-                format!("Budget exceeded: the {every} limit of {limit} USD is reached."),
-                p.as_str(),
-            )
+            let message = if team {
+                format!("Budget exceeded: the organization's {every} quota is reached.")
+            } else {
+                format!("Budget exceeded: the {every} limit of {limit} USD is reached.")
+            };
+            (message, p.as_str())
         }
+        None if team => (
+            "Quota exhausted: the organization's allocation is used up.".to_string(),
+            "total",
+        ),
         None => (
             format!("Quota exhausted: the allocation of {limit} USD is used up."),
             "total",
         ),
     };
-    let mut exhausted = json!({"reason": {
+    let mut reason = json!({
         "message": message,
         "scope": b.scope.as_str(),
         "scope_ref": b.scope_ref,
-        "limit_usd": usd_string(b.limit_micro_usd),
-        "spent_usd": usd_string(spent),
-        "remaining_usd": usd_string(b.limit_micro_usd.saturating_sub(spent)),
         "period": reason_period,
-    }});
+    });
+    if !team {
+        reason["limit_usd"] = json!(usd_string(b.limit_micro_usd));
+        reason["spent_usd"] = json!(usd_string(spent));
+        reason["remaining_usd"] = json!(usd_string(b.limit_micro_usd.saturating_sub(spent)));
+    }
+    let mut exhausted = json!({ "reason": reason });
     if let Some(p) = b.period {
         exhausted["period_start"] =
             json!(p.start_of(now).to_rfc3339_opts(SecondsFormat::Secs, true));
@@ -883,5 +898,66 @@ mod tests {
         assert_eq!(dollars(12_340_000), "12.34");
         assert_eq!(dollars(1_000_000), "1.00");
         assert_eq!(dollars(10_001), "0.010001");
+    }
+
+    fn row(scope: BudgetScope, period: Option<BudgetPeriod>) -> BudgetRow {
+        BudgetRow {
+            id: Uuid::new_v4(),
+            tenant_id: Uuid::new_v4(),
+            scope,
+            scope_ref: Uuid::new_v4(),
+            set_by: SetBy::Operator,
+            kind: if period.is_some() {
+                Kind::Periodic
+            } else {
+                Kind::Cumulative
+            },
+            period,
+            counted_from: period.is_none().then(Utc::now),
+            limit_micro_usd: 20_000,
+            marked_period_start: None,
+            marked_exhausted: None,
+            created_by_kind: "system".to_string(),
+            created_by: None,
+            created_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn an_organization_quotas_mark_names_no_amount() {
+        let now = Utc::now();
+        for period in [
+            Some(BudgetPeriod::Day),
+            Some(BudgetPeriod::Week),
+            Some(BudgetPeriod::Month),
+            None,
+        ] {
+            let b = row(BudgetScope::Team, period);
+            let doc = budget_doc(&b, 20_100, now);
+            let reason = &doc["exhausted"]["reason"];
+            for field in ["limit_usd", "spent_usd", "remaining_usd"] {
+                assert!(reason.get(field).is_none(), "{field} in {reason}");
+            }
+            let message = reason["message"].as_str().expect("a message");
+            assert!(
+                !message.chars().any(|c| c.is_ascii_digit()),
+                "an amount in {message:?}"
+            );
+            assert_eq!(reason["scope"], json!("team"));
+            assert_eq!(reason["scope_ref"], json!(b.scope_ref));
+            assert_eq!(
+                reason["period"],
+                json!(period.map_or("total", BudgetPeriod::as_str))
+            );
+            // A member's and a key's quota still carry theirs.
+            for scope in [BudgetScope::Member, BudgetScope::ApiKey] {
+                let doc = budget_doc(&row(scope, period), 20_100, now);
+                assert_eq!(
+                    doc["exhausted"]["reason"]["limit_usd"],
+                    json!("0.020000"),
+                    "{doc}"
+                );
+            }
+        }
     }
 }

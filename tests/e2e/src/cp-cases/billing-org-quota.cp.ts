@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 
 import { billingWorld, CHAT_MODEL, type BillingTenant, type BillingWorld } from "../harness/billing-world.js";
-import { fundTenant, pollUntil } from "../harness/control-plane.js";
+import { fundTenant, pollUntil, type Json } from "../harness/control-plane.js";
 import { callGateway, type GatewayAnswer } from "../harness/cp-upstream.js";
 import { ProxyClient } from "../harness/proxy.js";
 
@@ -9,7 +9,8 @@ import { ProxyClient } from "../harness/proxy.js";
 // the gateway, and raising it lets them call again, across both planes.
 // Everything is driven through the operator API and the real gateway; only
 // the upstream model is a stand-in. Each call costs 10 000 µ$, so a $0.02
-// quota is spent by two calls.
+// quota is spent by two calls. A member's key sees the organization only
+// through the minimum, so its refusal names neither the quota nor its spend.
 
 /** How long a change may take to reach the gateway. */
 const WITHIN_MS = 15_000;
@@ -19,6 +20,8 @@ describe("an operator's organization quota blocks every key of the tenant", () =
   let tenant: BillingTenant;
   let k1: string;
   let k2: string;
+  /** The key of a member whose role is `member`. */
+  let km: string;
   let quotaId: string;
 
   const chat = (key: string): Promise<GatewayAnswer> =>
@@ -55,6 +58,28 @@ describe("an operator's organization quota blocks every key of the tenant", () =
     await pollUntil("the second key to authenticate", async () =>
       (await proxy.listModels()).status === 200 ? true : undefined,
     );
+    // A member with the `member` role joins by invitation, and an operator
+    // mints a key bound to it.
+    const email = "member@org-quota-e2e.test";
+    const invite = await world.cp.admin.post(`/admin/tenants/${tenant.id}/invites`, { email, role: "member" });
+    expect(invite.status, invite.text).toBe(201);
+    const accepted = await world.cp.portal().post("/api/invites/accept", {
+      token: invite.body.invite_token,
+      password: "org-quota-e2e-pass-6b3",
+    });
+    expect(accepted.status, accepted.text).toBe(201);
+    const members = await world.cp.admin.get(`/admin/tenants/${tenant.id}/members`);
+    const memberId = (members.body.items as Json[]).find((m) => m.email === email).id as string;
+    const bound = await world.cp.admin.post(`/admin/tenants/${tenant.id}/keys`, {
+      label: "member key",
+      member_id: memberId,
+    });
+    expect(bound.status, bound.text).toBe(201);
+    km = bound.body.plaintext;
+    const memberProxy = new ProxyClient(world.gateway.proxyUrl, km);
+    await pollUntil("the member's key to authenticate", async () =>
+      (await memberProxy.listModels()).status === 200 ? true : undefined,
+    );
   });
 
   afterAll(async () => {
@@ -79,11 +104,17 @@ describe("an operator's organization quota blocks every key of the tenant", () =
       expect(spending.status, spending.text).toBe(200);
     }
 
-    for (const [name, key] of [["K1", k1], ["K2", k2]] as const) {
+    for (const [name, key] of [["K1", k1], ["K2", k2], ["KM", km]] as const) {
       const refused = await chatsAnswer(key, 429, `${name} to be refused at the organization quota`);
       expect(refused.json?.error?.code, refused.text).toBe("budget_exceeded");
       expect(refused.json?.error?.scope, refused.text).toBe("team");
       expect(refused.json?.error?.scope_ref, refused.text).toBe(tenant.id);
+      // The organization's limit and spend stay with the roles that may
+      // read them: no amount in a field, and none in the message.
+      expect(refused.json?.error?.limit_usd, refused.text).toBeUndefined();
+      expect(refused.json?.error?.spent_usd, refused.text).toBeUndefined();
+      expect(refused.json?.error?.message, refused.text).toEqual(expect.any(String));
+      expect(refused.json?.error?.message, refused.text).not.toMatch(/[0-9]/);
     }
   });
 
@@ -98,5 +129,6 @@ describe("an operator's organization quota blocks every key of the tenant", () =
 
     await chatsAnswer(k1, 200, "K1 to be served after the quota was raised");
     await chatsAnswer(k2, 200, "K2 to be served after the quota was raised");
+    await chatsAnswer(km, 200, "KM to be served after the quota was raised");
   });
 });

@@ -414,6 +414,18 @@ async fn an_organization_quota_counts_every_key() {
     assert_eq!(marked["period"], json!("month"));
     let first = today(cp).await.with_day(1).expect("the first of the month");
     assert_eq!(marked["exhausted"]["period_start"], json!(stamp(first)));
+    // Every key of the tenant meets this mark, a member's included, and a
+    // member sees the organization only through the minimum: like the
+    // balance mark, it names no amount.
+    let reason = &marked["exhausted"]["reason"];
+    for field in ["limit_usd", "spent_usd", "remaining_usd"] {
+        assert!(reason.get(field).is_none(), "{field} in {reason}");
+    }
+    let message = reason["message"].as_str().expect("a message");
+    assert!(
+        !message.chars().any(|c| c.is_ascii_digit()),
+        "an amount in {message:?}"
+    );
 }
 
 #[tokio::test]
