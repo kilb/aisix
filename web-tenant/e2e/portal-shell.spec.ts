@@ -281,6 +281,8 @@ test("等待审核时也能修改口令，之后旧口令被拒、新口令可�
   await page.getByRole("button", { name: "修改口令" }).click();
   await expect(page.getByRole("status")).toContainText("口令已修改");
   await page.getByRole("button", { name: "登出" }).click();
+  // Wait until the sign-out has landed: navigating away sooner can abort it.
+  await expect(page.getByLabel("邮箱")).toBeVisible();
 
   await login(page, "owner@password-9e5.test", "first-pass-9e5x");
   await expect(page.getByRole("alert")).toBeVisible();
