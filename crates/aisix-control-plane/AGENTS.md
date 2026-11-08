@@ -100,11 +100,129 @@ way.
   `a_crossing_batch_never_waits_on_a_held_tenant_row`).
 - **Advisory lock keys must be unique.** They are the `*_LOCK_KEY` constants,
   all `0x6169_7369_7863_70xx`: operators `7030`, projector `7031`, resources
-  `7032`, boot `7033`, signup `7073`. Postgres has one key space per database.
+  `7032`, boot `7033`, signup `7073`, and the test harness's template lock
+  `7074` (`tests/support/mod.rs`). Postgres has one key space per database.
   A reused value serialises unrelated work, and a value shared with the
   projector's session-level lock makes a writer wait out the leader's whole
   tenure (then `lock_timeout`, then `503`). No test checks this; grep
   `0x6169_7369_7863_70` before adding a key.
+
+## Billing: the ledger, the marks and the quotas
+
+Money fails the same quiet way: a wrong entry still answers 200, and shows
+only in reconciliation (`GET /admin/billing/reconciliation`) or on a tenant's
+statement.
+
+- **The ledger is append-only.** `billing_ledger` and `pricing_adjustments`
+  take inserts only: a trigger refuses every `UPDATE`, `DELETE` and
+  `TRUNCATE` (migrations `0014`, `0018`), and a correction is a new entry, a
+  re-pricing run's `adjustment`, never an edit of an old one. The balance
+  cached on `billing_accounts` is moved only by `ledger::post_flagging`, in
+  the same transaction as the entries it sums. A migration that drops or
+  replaces a trigger turns `the_ledger_refuses_update_and_delete`,
+  `the_ledger_refuses_truncate` or `the_adjustments_refuse_update_and_delete`
+  red; a cache moved without an entry shows in
+  `each_check_catches_its_own_drift` (`tests/billing_reconcile.rs`).
+- **An entry is posted in its cause's transaction, and only for an amount
+  other than 0.** The causes are a charge (`pricing::price_stored`, in
+  intake), a top-up approval (`topups::approve`), an operator credit
+  (`credits::create`) and an applied re-pricing run (`repricing::apply`).
+  Each posts before it commits, so a cause and its entry commit or roll back
+  together. A charge of 0 (a free model, a 100 % discount) and a run whose
+  deltas for a tenant sum to 0 post nothing: the ledger's
+  `CHECK (amount_micro_usd <> 0)` would fail the whole transaction, which for
+  intake is every tenant's rows in the batch.
+  `a_zero_charge_row_posts_nothing_and_does_not_fail_its_batch`,
+  `a_charged_row_posts_one_debit_with_the_balance_after_it`,
+  `a_re_sent_batch_and_a_repeated_event_post_once`,
+  `approving_credits_the_balance_once_in_the_same_transaction`,
+  `approving_twice_or_racing_two_approvals_credits_once`,
+  `an_operator_credit_needs_a_reason_and_posts_one_entry` and
+  `applying_twice_is_refused_and_posts_once` pin it; reconciliation's
+  `charged_without_entry` finds a charge that lost its entry.
+- **The lock order is the tenant row, then its account, then
+  `RESOURCES_LOCK_KEY`, and intake never takes a tenant row.** The rules and
+  their tests are under "Lock order" above. The one stated exception is
+  `ledger::lock_account`'s fallback insert of a missing account, the only row
+  intake inserts that references `tenants`: it key-shares the tenant row
+  `NOWAIT` first, so a held tenant fails the batch at once (`503`, and the
+  gateway sends it again) instead of making intake wait, and
+  `ledger::backfill_accounts`, run at boot and on every housekeeping tick,
+  keeps it unreachable in practice. Any other intake insert that references
+  a tenant would wait on an operator's edit
+  (`a_missing_account_never_makes_intake_wait_on_its_tenant`,
+  `the_backfill_restores_a_missing_account`,
+  `the_boot_and_every_housekeeping_tick_run_the_backfill`).
+- **Marks are written only by `marks::project`, after intake commits.** It
+  writes the balance document and, through `budgets::project`, every live
+  quota's, under the tenant's billing lock, from the account and spend as
+  they stand. Its callers are the billing step of `tenants::project` and
+  `marks::settle` / `settle_locked`: the settler after intake's commit, and
+  each admin money path inline in its own transaction. Intake writes no
+  document and never takes the resources lock; it only flags the account in
+  its one update and notifies `billing_marks_dirty`, which is delivered at
+  commit. A mark written from intake would take the resources lock there,
+  and a document `write_resource` refused would fail every batch; a mark
+  written anywhere else could be decided from a balance or spend another
+  transaction is still moving. The one other write of a `budgets` document
+  is the retirement of a deleted quota's (`budgets::delete`).
+  `ingest_never_waits_on_the_resources_lock`,
+  `a_batch_that_crosses_the_floor_wakes_the_settler`,
+  `the_sweep_settles_an_account_whose_notification_was_lost` and
+  `reactivating_a_tenant_writes_its_balance_mark_before_its_keys_open` pin
+  the path. No test checks that `marks::project` is the only writer; grep
+  `Kind::Budgets` before adding one.
+- **One period function is shared with the gateway.** A quota's period is
+  `aisix_core::models::BudgetPeriod::start_of` and nothing else: the control
+  plane counts a charge in the period `start_of(price_instant)` gives it and
+  writes a periodic mark's `period_start` as `start_of(now)`, and the gateway
+  (`aisix_proxy::budget::period_start`) holds a mark only while its
+  `period_start` equals `start_of(now)`. A second computation (a SQL
+  `date_trunc('week', …)`, a local-time conversion) that disagrees at a
+  boundary writes a mark that is never in force, or counts spend in a period
+  no mark names. The summaries' `date_trunc(…, 'UTC')` day and month buckets
+  are display only and decide no mark. `a_period_starts_on_the_utc_calendar`
+  (aisix-core), `periods_follow_the_utc_calendar` (aisix-proxy),
+  `a_charge_on_the_boundary_counts_in_the_period_it_starts` and
+  `a_periodic_quota_is_marked_again_once_its_period_rolls_over`
+  (`tests/billing_budgets.rs`) pin it.
+- **Tenant views and `/dp/v1` lookups are whitelists, and a lookup's tenant,
+  member and role come from the control plane's own key record.** Every
+  `/api/*` billing answer and every `/dp/v1/*` answer is built field by field
+  from named columns and event fields, never by passing a stored event or row
+  through, so a field added to a usage event or a column added to
+  `pricing_charges` (a provider, a cost, an upstream error) reaches no tenant
+  until someone names it. The request lookup renders its rows through the
+  call log's own `calls::tenant_view` and `VISIBLE`, so the two cannot drift.
+  A lookup resolves the key through `access::key_access` (the key record
+  joined to its tenant and its member's current role, read at lookup time);
+  the gateway sends only the key id it authenticated, and nothing a usage row
+  claims (`team_id`, `user_id`) decides whose rows are read.
+  `a_tenants_call_log_names_no_channel_and_no_cost` and
+  `the_request_lookup_names_no_channel` (exact key sets),
+  `the_quota_lookup_names_no_channel`,
+  `a_forbidden_models_call_reads_exactly_like_an_unknown_models`,
+  `a_failed_failover_attempt_shows_no_upstream_status`,
+  `rows_filed_under_another_tenant_never_appear`,
+  `another_tenants_request_id_answers_like_an_unknown_one`,
+  `a_role_change_shows_at_the_next_lookup` and
+  `an_unknown_or_revoked_key_is_not_found` pin it.
+- **Each quota level writes only its own rows, and no write compares
+  levels.** A quota is a `billing_budgets` row with its own document, one per
+  setter: the operators' `team` rows (`set_by 'operator'`), an owner's or
+  admin's `member` and `api_key` rows (`org_admin`), and a member's
+  `api_key` rows on its own keys (`member`). An operator writes only
+  `operator` rows; an owner or admin writes the tenant's own levels, a
+  member's caps on its keys included, and never an operator's; a member
+  writes only its own. A row above the caller answers `403 budget_managed`
+  (`budget_routes`, `editable_row`). No write reads another level to accept,
+  refuse or cap a limit: a child may exceed its parent (owner's decision),
+  and the gateway refuses a request when any document that applies is
+  exhausted, so the smallest remaining binds by construction.
+  `MAX_BUDGETS_PER_TENANT` counts the tenant's own levels only.
+  `each_level_edits_only_its_own_rows`, `an_operator_edits_only_operator_rows`,
+  `a_member_caps_only_its_own_keys`, `a_child_may_exceed_its_parent` and
+  `operator_rows_do_not_count_toward_the_tenant_limit` pin it.
 
 ## A field older gateways would misread gets a `FIELD_FLOORS` row
 
