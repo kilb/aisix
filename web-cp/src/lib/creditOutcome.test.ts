@@ -6,25 +6,25 @@ import { sendCredit } from "./creditOutcome.ts";
 
 const fail = (error: object) => () => Promise.reject(Object.assign(new Error("x"), error));
 
-test("网络错误：入账结果未知", async () => {
+test("network error: the credit outcome is unknown", async () => {
   const out = await sendCredit(fail({ status: 0, code: "network" }));
   assert.equal(out.kind, "unknown");
 });
 
-test("503：入账结果未知", async () => {
+test("503: the credit outcome is unknown", async () => {
   const out = await sendCredit(fail({ status: 503, code: "unavailable" }));
   assert.equal(out.kind, "unknown");
 });
 
-test("非 ApiError 的异常：入账结果未知", async () => {
+test("a non-ApiError exception: the credit outcome is unknown", async () => {
   assert.equal((await sendCredit(() => Promise.reject(new TypeError("boom")))).kind, "unknown");
 });
 
-test("明确的 4xx 拒绝：不是未知结果", async () => {
+test("a definite 4xx refusal: not an unknown outcome", async () => {
   assert.equal((await sendCredit(fail({ status: 422, code: "validation_failed" }))).kind, "refused");
   assert.equal((await sendCredit(fail({ status: 403, code: "forbidden" }))).kind, "refused");
 });
 
-test("成功", async () => {
+test("success", async () => {
   assert.deepEqual(await sendCredit(() => Promise.resolve(7)), { kind: "done", value: 7 });
 });

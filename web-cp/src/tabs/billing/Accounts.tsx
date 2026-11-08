@@ -10,7 +10,7 @@ import { AccountPanel, AccountState, MODE_LABEL } from "./AccountPanel";
 import "./billing.css";
 
 /** 账户: every tenant's balance and credit limit, and one tenant's billing in a side panel. */
-export function Accounts({ canEdit, operator }: TabProps) {
+export function Accounts({ canEdit, operator, onGoto }: TabProps) {
   const [items, setItems] = useState<BillingAccount[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
@@ -99,7 +99,7 @@ export function Accounts({ canEdit, operator }: TabProps) {
           )}
         </div>
       </div>
-      {open && <AccountPanel account={open} canEdit={canEdit} isAdmin={operator.role === "admin"} onChanged={take} onClose={() => setSelected(null)} />}
+      {open && <AccountPanel account={open} canEdit={canEdit} isAdmin={operator.role === "admin"} onChanged={take} onGoto={onGoto} onClose={() => setSelected(null)} />}
     </div>
   );
 }

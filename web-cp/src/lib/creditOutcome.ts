@@ -1,11 +1,13 @@
 /**
- * 直接入账没有幂等键：请求可能已经落库，而应答丢了（连接中断、代理的 5xx）。
- * 这种失败的结果是未知的，调用方不能把表单交还给操作员重试。
- * 只看 `status` 的形状，不引入 `ApiError` 本身，这样可以被 node:test 直接加载。
+ * A direct credit has no idempotency key: the request may have been stored while the
+ * answer was lost (dropped connection, a proxy's 5xx). The outcome of such a failure is
+ * unknown, so the caller must not hand the form back to the operator to retry.
+ * Only the shape of `status` is read, without importing `ApiError` itself, so this file
+ * loads directly under node:test.
  */
 export function isUnknownOutcome(e: unknown): boolean {
   const status = typeof e === "object" && e !== null ? (e as { status?: unknown }).status : undefined;
-  // 不是 ApiError（网络层的异常、解析失败）：不知道请求有没有到达后端。
+  // Not an ApiError (a network-layer exception, a parse failure): unknown whether the request reached the backend.
   if (typeof status !== "number") return true;
   return status === 0 || status >= 500;
 }

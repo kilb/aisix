@@ -1,4 +1,5 @@
 import { useEffect, useState, type ComponentType, type ReactNode } from "react";
+import type { TabProps } from "../../App";
 import { Msg, type Note } from "../../components/Msg";
 import {
   ApiError,
@@ -19,6 +20,7 @@ import { Lamp } from "../../ui/Lamp";
 import { SidePanel } from "../../ui/SidePanel";
 import { useToast } from "../../ui/Toast";
 import { refusal, useLoad } from "../Tenants";
+import { FailModeNote } from "../../components/FailModeNote";
 import { CreditForm } from "./CreditForm";
 import { OrgQuota } from "./OrgQuota";
 import "./billing.css";
@@ -32,6 +34,8 @@ export interface RegionProps {
   isAdmin: boolean;
   /** An action settled `account`'s new state: the list and the panel take it. */
   onChanged: (account: BillingAccount) => void;
+  /** Opens another tab, as the shell's `onGoto` does. */
+  onGoto?: TabProps["onGoto"];
 }
 
 export const MONEY_HINT = "请输入金额，最多两位小数";
@@ -542,6 +546,15 @@ function Quotas({ account }: RegionProps) {
   );
 }
 
+/** The environment-wide budget fail mode, where an operator reading a tenant's budgets would wonder about it. */
+function FailMode({ onGoto }: RegionProps) {
+  return (
+    <Region label="预算失败模式">
+      <FailModeNote onEdit={onGoto && (() => onGoto("resources", "budget_policy"))} />
+    </Region>
+  );
+}
+
 // ── the panel ───────────────────────────────────────────────────────────────
 
 /** The regions of the panel, top to bottom. Later tasks append theirs. */
@@ -554,6 +567,7 @@ export const PANEL_REGIONS: { id: string; Component: ComponentType<RegionProps> 
   { id: "quotas", Component: Quotas },
   { id: "org-quota", Component: OrgQuota },
   { id: "credit", Component: CreditForm },
+  { id: "fail-mode", Component: FailMode },
 ];
 
 /**
@@ -566,6 +580,7 @@ export function AccountPanel({
   canEdit,
   isAdmin,
   onChanged,
+  onGoto,
   onClose,
 }: RegionProps & {
   onClose: () => void;
@@ -595,7 +610,7 @@ export function AccountPanel({
     >
       <Msg note={note} />
       {PANEL_REGIONS.map(({ id, Component }) => (
-        <Component key={id} account={account} canEdit={canEdit} isAdmin={isAdmin} onChanged={onChanged} />
+        <Component key={id} account={account} canEdit={canEdit} isAdmin={isAdmin} onChanged={onChanged} onGoto={onGoto} />
       ))}
     </SidePanel>
   );
