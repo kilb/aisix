@@ -3,8 +3,10 @@
 -- the balance after it: `usage` debits one charged usage row (`event_id`),
 -- `topup` credits one top-up, and `adjustment` is one re-pricing run's
 -- correction for the tenant. Triggers refuse every UPDATE, DELETE and
--- TRUNCATE of the ledger. Ingest locks accounts, never tenant rows: a ledger
--- entry references its account, not its tenant.
+-- TRUNCATE of the ledger. The lock order is the tenant row, then its account
+-- (`tenants::lock_billing`), then the resources lock. Ingest locks accounts
+-- only and never waits on a tenant row: a ledger entry references its
+-- account, not its tenant.
 CREATE TABLE billing_accounts (
   tenant_id uuid PRIMARY KEY REFERENCES tenants(id),
   balance_micro_usd bigint NOT NULL DEFAULT 0,

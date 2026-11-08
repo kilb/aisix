@@ -42,7 +42,7 @@ way.
   `every_*_document_loads_on_the_lenient_schema` tests). A new builder adds
   one.
 
-## Lock order: tenant rows, then `RESOURCES_LOCK_KEY`
+## Lock order: tenant rows, then billing accounts, then `RESOURCES_LOCK_KEY`
 
 - **A transaction that touches a tenant and a gateway document takes the tenant
   first**: `tenants::lock`, or `tenants::lock_many` (ascending id) for several,
@@ -55,6 +55,36 @@ way.
   (`tests/tenants.rs`) sends each path that writes a tenant's documents while
   the tenant is held elsewhere and fails if it already holds the resources
   lock; a new such path adds a case there.
+- **A path that moves money or decides a mark takes the tenant's billing
+  account right after its row**: `tenants::lock_billing`, as the first lock of
+  its transaction. That is every ledger posting, credit-limit or quota change,
+  and every `tenants::project`, whose billing step writes the balance mark
+  (`marks::project`). An account is never taken after the resources lock, so
+  a path that locks its tenant twice moves only the first lock to
+  `lock_billing`. Every other tenant edit keeps `tenants::lock`, which leaves
+  the account to usage intake. Intake locks accounts only, in ascending tenant
+  id, never waits on a tenant row and never takes the resources lock: it flags
+  a crossing, and the settler (`billing::settler`) writes the mark after
+  commit. Intake updates each account once, flag included
+  (`ledger::post_flagging`): a second update of a row in one transaction has
+  the foreign key's check key-share its tenant row, which a held tenant would
+  make intake wait on.
+  `every_marking_path_takes_the_account_before_the_resources_lock`
+  (`tests/billing_marks.rs`) sends each such path while the account is held
+  elsewhere; a new one adds a case there.
+- **The settler is the one exception to the account-before-resources order,
+  and never waits while it is out of order.** It takes each tenant row
+  `NOWAIT`; then the account and the resources lock only if that is free.
+  Once a tenant's settle has found the resources lock busy for 10 s, its
+  attempts queue for the resources lock instead (for at most 2 s each,
+  holding only the tenant row) and take the account after it, `NOWAIT`. The
+  attempt that first queues logs a WARN naming the tenant and how long it had
+  been skipped, repeated at most once a minute while the tenant stays
+  unsettled. A lock taken without waiting is in no wait cycle, and no settle
+  holds an account while queued, so intake never waits behind the resources
+  lock (`an_escalated_settle_never_holds_up_intake`,
+  `an_escalated_settle_never_waits_for_the_account_while_it_holds_the_resources_lock`,
+  `a_crossing_batch_never_waits_on_a_held_tenant_row`).
 - **Advisory lock keys must be unique.** They are the `*_LOCK_KEY` constants,
   all `0x6169_7369_7863_70xx`: operators `7030`, projector `7031`, resources
   `7032`, boot `7033`, signup `7073`. Postgres has one key space per database.

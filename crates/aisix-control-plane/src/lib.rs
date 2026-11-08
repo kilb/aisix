@@ -91,8 +91,8 @@ pub struct Running {
     /// expired, or expires within a day).
     pub dp_addr: Option<SocketAddr>,
     serve: Option<JoinHandle<std::io::Result<()>>>,
-    /// The gateway listener, housekeeping and the projector: they stop once
-    /// told to.
+    /// The gateway listener, housekeeping, the projector and the billing
+    /// settler: they stop once told to.
     tasks: Vec<JoinHandle<()>>,
     /// The credential refresh, which holds nothing that needs a clean stop:
     /// aborted, never awaited.
@@ -143,8 +143,8 @@ impl Drop for Running {
 /// Boots the control plane: loads the built-in price catalogue, opens and
 /// migrates the database, pins the environment, loads the CA and the gateway
 /// credentials, and starts the browser listener, the gateway listener,
-/// housekeeping and the projector, which stop gracefully once `shutdown`
-/// resolves. A version stamp the gateway-version gate cannot read refuses
+/// housekeeping, the projector and the billing settler, which stop
+/// gracefully once `shutdown` resolves. A version stamp the gateway-version gate cannot read refuses
 /// the boot first, and a catalogue that does not load next.
 pub async fn start<S>(cfg: CpConfig, shutdown: S) -> Result<Running, BootError>
 where
@@ -298,6 +298,11 @@ where
         kine,
         WriteCtx::of(&state),
         async move { stopped(&mut projector_stop).await },
+    ));
+    tasks.push(billing::settler::spawn(
+        state.db.clone(),
+        WriteCtx::of(&state),
+        stopping.clone(),
     ));
     if let Some((listener, tls, _)) = dp {
         tasks.push(tokio::spawn(dp::listener::serve_dp(

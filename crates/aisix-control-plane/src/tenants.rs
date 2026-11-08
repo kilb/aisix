@@ -37,7 +37,7 @@ use uuid::Uuid;
 
 use crate::audit::{self, Actor, AuditEntry};
 use crate::auth::{OperatorAuth, OperatorRole};
-use crate::billing::ledger;
+use crate::billing::{ledger, marks};
 use crate::compat;
 use crate::db::{Db, DbError};
 use crate::error::{ApiError, BootError, Detail};
@@ -439,6 +439,8 @@ enum Step {
     Users,
     /// The limits policy, written (or revived) with this document.
     Policy(Value),
+    /// The tenant's balance mark (`marks::project`).
+    Billing,
     /// The tenant's keys, re-projected from its row.
     Keys,
     /// The limits policy deleted, if it is live.
@@ -458,8 +460,10 @@ enum Step {
 /// order is therefore chosen so that no stall leaves a key enabled and
 /// unlimited: the tenant's limit is in place before its keys are opened (an
 /// approval or a reactivation enables them), and is lifted only after they
-/// are closed (a suspension disables them). The team and the users come
-/// first, since the keys name them.
+/// are closed (a suspension disables them). Its balance mark is written right
+/// before the keys in every case, so a tenant out of money is blocked before
+/// any key of it opens. The team and the users come first, since the keys
+/// name them.
 fn steps(tenant: &TenantRow) -> Vec<Step> {
     let policy = match tenant.status {
         TenantStatus::Pending => return Vec::new(),
@@ -468,18 +472,21 @@ fn steps(tenant: &TenantRow) -> Vec<Step> {
     };
     let mut steps = vec![Step::Team(team_doc(&tenant.name)), Step::Users];
     match policy {
-        Some(doc) => steps.extend([Step::Policy(doc), Step::Keys]),
-        None => steps.extend([Step::Keys, Step::RetirePolicy]),
+        Some(doc) => steps.extend([Step::Policy(doc), Step::Billing, Step::Keys]),
+        None => steps.extend([Step::Billing, Step::Keys, Step::RetirePolicy]),
     }
     steps
 }
 
 /// Writes the documents tenant `id` derives, as its row now stands, in the
-/// order [`steps`] gives: the team, its members' users, its keys, and its
-/// limits policy, which is written while the tenant is active and limits it
-/// tenant-wide and deleted otherwise; nothing while it is pending. A
-/// document already as it should be is not written again. The caller holds
-/// the tenant's lock.
+/// order [`steps`] gives: the team, its members' users, its balance mark,
+/// its keys, and its limits policy, which is written while the tenant is
+/// active and limits it tenant-wide and deleted otherwise; nothing while it
+/// is pending. A document already as it should be is not written again. The
+/// caller holds the tenant's billing lock ([`lock_billing`]), taken before
+/// anything that takes the resources lock, since the balance mark is decided
+/// on the account; the transaction creating the tenant holds its new account
+/// already, and the internal tenant has no mark.
 pub async fn project(conn: &mut PgConnection, ctx: &WriteCtx, id: Uuid) -> Result<(), ApiError> {
     let tenant = lock(&mut *conn, id).await?;
     let owner = owner(id);
@@ -487,6 +494,7 @@ pub async fn project(conn: &mut PgConnection, ctx: &WriteCtx, id: Uuid) -> Resul
         match step {
             Step::Team(doc) => put(&mut *conn, ctx, Kind::Teams, id, &doc, &owner).await?,
             Step::Users => members::put_missing_users(&mut *conn, ctx, id).await?,
+            Step::Billing => marks::project(&mut *conn, ctx, &tenant).await?,
             Step::Policy(doc) => {
                 let policy_id = match tenant.limits_policy_id {
                     Some(policy_id) => policy_id,
@@ -713,6 +721,10 @@ async fn holders_of(conn: &mut PgConnection, model_id: Uuid) -> Result<Vec<Uuid>
 /// so they are looked up again once it is held: one that appeared in
 /// between, which cannot be locked now without breaking the lock order,
 /// fails the delete as `503 unavailable`, to be retried.
+///
+/// Each holder's projection decides its balance mark, so the holders'
+/// billing accounts are locked too, after their rows and before the
+/// resources lock, as [`lock_billing`] takes them.
 pub async fn on_model_deleted(
     conn: &mut PgConnection,
     ctx: &WriteCtx,
@@ -720,6 +732,7 @@ pub async fn on_model_deleted(
 ) -> Result<(), ApiError> {
     let mut holders = holders_of(&mut *conn, model_id).await?;
     lock_many(&mut *conn, &mut holders).await?;
+    ledger::lock_accounts(&mut *conn, &mut holders).await?;
     resources_lock(&mut *conn).await?;
     if holders_of(&mut *conn, model_id).await? != holders {
         tracing::warn!(%model_id, "a grant of the model was added while it was being deleted");
@@ -1270,7 +1283,9 @@ pub async fn update(
         .db
         .tx(move |conn| {
             async move {
-                let current = lock(&mut *conn, id).await?;
+                // The billing lock: the projection below decides the balance
+                // mark, and a billing mode change moves it.
+                let (current, _) = lock_billing(&mut *conn, id).await?;
                 if current.version != expected {
                     return Err(ApiError::version_mismatch(current.version));
                 }
@@ -1384,7 +1399,9 @@ async fn transition(
         .db
         .tx(move |conn| {
             async move {
-                let current = lock(&mut *conn, id).await?;
+                // The billing lock: the projection below writes the balance
+                // mark before the keys open.
+                let (current, _) = lock_billing(&mut *conn, id).await?;
                 if current.is_internal && matches!(t, Transition::Suspend) {
                     return Err(ApiError::conflict(
                         "tenant_state",
@@ -1638,6 +1655,33 @@ mod tests {
             assert!(
                 !closing.iter().any(|s| matches!(s, Step::Policy(_))),
                 "{closing:?}"
+            );
+        }
+    }
+
+    /// The balance mark is written right before the keys whether they open
+    /// or close, so a tenant out of money is blocked before a key of it
+    /// opens.
+    #[test]
+    fn the_balance_mark_is_written_right_before_the_keys() {
+        let limited = TenantLimits {
+            rpm: Some(60),
+            ..TenantLimits::default()
+        };
+        for t in [
+            tenant(TenantStatus::Active, limited.clone()),
+            tenant(TenantStatus::Active, TenantLimits::default()),
+            tenant(TenantStatus::Suspended, limited),
+        ] {
+            let steps = steps(&t);
+            assert_eq!(
+                at(&steps, |s| *s == Step::Billing) + 1,
+                at(&steps, |s| *s == Step::Keys),
+                "{steps:?}"
+            );
+            assert!(
+                at(&steps, |s| *s == Step::Users) < at(&steps, |s| *s == Step::Billing),
+                "{steps:?}"
             );
         }
     }

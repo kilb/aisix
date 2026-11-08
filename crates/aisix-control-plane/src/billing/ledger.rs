@@ -135,7 +135,10 @@ const ACCOUNT_COLUMNS: &str = "tenant_id, balance_micro_usd, credit_limit_micro_
 /// the batch is answered `503` and sent again. A caller holding the row
 /// itself (`tenants::lock_billing`) is not refused by its own lock. The
 /// insert is logged, since it means a tenant was created without its
-/// account (by an older control plane during an upgrade, or by hand).
+/// account (by an older control plane during an upgrade, or by hand). The
+/// account of a customer tenant past pending is opened flagged, as
+/// [`backfill_accounts`] opens it, so that its first balance mark is
+/// written.
 pub async fn lock_account(conn: &mut PgConnection, tenant_id: Uuid) -> Result<Account, DbError> {
     let select =
         format!("SELECT {ACCOUNT_COLUMNS} FROM billing_accounts WHERE tenant_id = $1 FOR UPDATE");
@@ -146,18 +149,22 @@ pub async fn lock_account(conn: &mut PgConnection, tenant_id: Uuid) -> Result<Ac
     {
         return Ok(account);
     }
-    tracing::warn!(
-        tenant = %tenant_id,
-        "a tenant had no billing account; it is opened now"
-    );
     sqlx::query("SELECT 1 FROM tenants WHERE id = $1 FOR KEY SHARE NOWAIT")
         .bind(tenant_id)
         .execute(&mut *conn)
         .await?;
-    sqlx::query("INSERT INTO billing_accounts (tenant_id) VALUES ($1) ON CONFLICT DO NOTHING")
-        .bind(tenant_id)
-        .execute(&mut *conn)
-        .await?;
+    sqlx::query(
+        "INSERT INTO billing_accounts (tenant_id, marks_dirty) \
+         SELECT id, NOT is_internal AND status <> 'pending' FROM tenants WHERE id = $1 \
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(tenant_id)
+    .execute(&mut *conn)
+    .await?;
+    tracing::warn!(
+        tenant = %tenant_id,
+        "a tenant had no billing account; it was opened"
+    );
     Ok(sqlx::query_as(&select)
         .bind(tenant_id)
         .fetch_one(conn)
@@ -183,11 +190,13 @@ pub async fn lock_accounts(
 /// Opens an account for every tenant that has none, and returns how many it
 /// opened. Each tenant row is key-shared before its account is inserted, in
 /// ascending id, as the lock order has it; one another transaction holds is
-/// skipped rather than waited for, and opened by a later run.
+/// skipped rather than waited for, and opened by a later run. The account of
+/// a customer tenant past pending is opened flagged, as migration 0014
+/// opened the first ones, so that the settler writes its first balance mark.
 pub async fn backfill_accounts(conn: &mut PgConnection) -> Result<u64, DbError> {
     Ok(sqlx::query(
-        "INSERT INTO billing_accounts (tenant_id) \
-         SELECT t.id FROM tenants t \
+        "INSERT INTO billing_accounts (tenant_id, marks_dirty) \
+         SELECT t.id, NOT t.is_internal AND t.status <> 'pending' FROM tenants t \
          WHERE NOT EXISTS (SELECT 1 FROM billing_accounts a WHERE a.tenant_id = t.id) \
          ORDER BY t.id FOR KEY SHARE OF t SKIP LOCKED \
          ON CONFLICT DO NOTHING",
@@ -210,6 +219,19 @@ pub async fn backfill_accounts(conn: &mut PgConnection) -> Result<u64, DbError> 
 pub async fn post(
     conn: &mut PgConnection,
     postings: &[Posting<'_>],
+) -> Result<Vec<LedgerEntry>, DbError> {
+    post_flagging(conn, postings, &[]).await
+}
+
+/// [`post`], also flagging the accounts of the tenants `flag` for the
+/// settler (`marks_dirty`) in the same update of each account. Usage intake
+/// flags this way and never with an update of its own: an account row
+/// updated a second time in one transaction has its tenant row key-shared by
+/// the foreign key's check, and intake must never wait on a tenant row.
+pub async fn post_flagging(
+    conn: &mut PgConnection,
+    postings: &[Posting<'_>],
+    flag: &[Uuid],
 ) -> Result<Vec<LedgerEntry>, DbError> {
     if postings.is_empty() {
         return Ok(Vec::new());
@@ -261,7 +283,8 @@ pub async fn post(
     entries.sort_by_key(|entry| entry.seq);
     sqlx::query(
         "UPDATE billing_accounts AS a \
-         SET balance_micro_usd = a.balance_micro_usd + d.delta, updated_at = now() \
+         SET balance_micro_usd = a.balance_micro_usd + d.delta, \
+             marks_dirty = a.marks_dirty OR a.tenant_id = ANY($3), updated_at = now() \
          FROM (SELECT p.tenant_id, SUM(p.amount)::bigint AS delta \
                FROM unnest($1::uuid[], $2::bigint[]) AS p(tenant_id, amount) \
                GROUP BY p.tenant_id) AS d \
@@ -269,6 +292,7 @@ pub async fn post(
     )
     .bind(&tenant_ids)
     .bind(&amounts)
+    .bind(flag)
     .execute(conn)
     .await?;
     Ok(entries)

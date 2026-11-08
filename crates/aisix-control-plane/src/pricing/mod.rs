@@ -42,7 +42,8 @@ use serde_json::Value;
 use sqlx::PgConnection;
 use uuid::Uuid;
 
-use crate::billing::ledger::{self, Posting, Source};
+use crate::billing::ledger::{self, Account, Posting, Source};
+use crate::billing::marks;
 use crate::db::DbError;
 use store::{record_charge, ChargeError, ChargeIdentity, PriceBookCache, Recorded};
 
@@ -74,7 +75,11 @@ pub struct Priced {
 /// does a row that is not charged. The accounts of every tenant the rows'
 /// keys belong to are locked first, in ascending tenant id, so that two
 /// batches naming the same tenants cannot deadlock; no tenant row is locked,
-/// so a tenant an operator is editing does not hold up intake.
+/// so a tenant an operator is editing does not hold up intake. An account
+/// whose balance the batch moves across its tenant's floor is flagged for
+/// the settler (`marks::crossings`) in the posting's own update of the
+/// account, so no tenant row is key-shared either; no gateway document is
+/// written here, so intake never waits on the resources lock.
 pub async fn price_stored(
     conn: &mut PgConnection,
     prices: &PriceBookCache,
@@ -89,7 +94,7 @@ pub async fn price_stored(
     let book = prices.current(&mut *conn).await?;
     let keys = key_records(&mut *conn, &stored).await?;
     let mut tenants: Vec<Uuid> = keys.values().map(|k| k.tenant_id).collect();
-    ledger::lock_accounts(&mut *conn, &mut tenants).await?;
+    let accounts = ledger::lock_accounts(&mut *conn, &mut tenants).await?;
     // A fixed order, by event_id compared as bytes, for the charge inserts
     // and the ledger entries.
     stored.sort_by(|a, b| a.event_id.cmp(&b.event_id));
@@ -171,9 +176,33 @@ pub async fn price_stored(
         }
     }
     if !debits.is_empty() {
-        ledger::post(&mut *conn, &debits).await?;
+        let flag = marks::crossings(&mut *conn, &balances_after(accounts, &debits)).await?;
+        ledger::post_flagging(&mut *conn, &debits, &flag).await?;
+        if !flag.is_empty() {
+            marks::notify(&mut *conn).await?;
+        }
     }
     Ok(priced)
+}
+
+/// The accounts `postings` post to, each with the balance its tenant's last
+/// entry will leave: the locked balance plus the tenant's amounts. A sum
+/// past the `i64` range saturates; `ledger::post` refuses it anyway.
+fn balances_after(accounts: Vec<Account>, postings: &[Posting<'_>]) -> Vec<Account> {
+    let mut moved: HashMap<Uuid, i64> = HashMap::new();
+    for posting in postings {
+        let sum = moved.entry(posting.tenant_id).or_default();
+        *sum = sum.saturating_add(posting.amount_micro_usd);
+    }
+    accounts
+        .into_iter()
+        .filter_map(|account| {
+            moved.get(&account.tenant_id).map(|&delta| Account {
+                balance_micro_usd: account.balance_micro_usd.saturating_add(delta),
+                ..account
+            })
+        })
+        .collect()
 }
 
 /// The text field `name` of `event`, `""` when it has none.
