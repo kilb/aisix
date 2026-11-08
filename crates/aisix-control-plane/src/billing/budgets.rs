@@ -26,6 +26,17 @@
 //! The settler then writes the documents (`marks::project`, which calls
 //! [`project`]). The domain writes take the tenant's billing lock and settle
 //! inline, so their answer already stands in the gateway's documents.
+//!
+//! A quota row is locked only by the writes here, after the tenant's
+//! billing lock. Intake's spend upsert key-shares the quota rows it counts
+//! against while it holds their account, so anything that took a quota row
+//! `FOR UPDATE` or `FOR SHARE` before the account (a read for a version
+//! check, say) would deadlock with intake.
+//!
+//! Spend and periods are read on the database's clock ([`db_now`]): a
+//! caller that shows a quota reads the clock once and passes it to
+//! [`list`] or [`spent`] and to [`to_api`], so the spend and the period it
+//! names always agree.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -276,7 +287,7 @@ fn current(b: &BudgetRow, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
 }
 
 /// The database's clock: within a transaction, its start.
-async fn db_now(conn: &mut PgConnection) -> Result<DateTime<Utc>, DbError> {
+pub async fn db_now(conn: &mut PgConnection) -> Result<DateTime<Utc>, DbError> {
     Ok(sqlx::query_scalar("SELECT now()").fetch_one(conn).await?)
 }
 
@@ -339,14 +350,14 @@ pub async fn get(
 }
 
 /// Every live quota of tenant `tenant_id`, oldest first, each with its
-/// current spend: the current UTC period's for a periodic quota, since
-/// `counted_from` for a cumulative one.
+/// spend at `now` ([`db_now`]): the UTC period's that holds `now` for a
+/// periodic quota, since `counted_from` for a cumulative one.
 pub async fn list(
     conn: &mut PgConnection,
     tenant_id: Uuid,
+    now: DateTime<Utc>,
 ) -> Result<Vec<(BudgetRow, i64)>, DbError> {
     let rows = live_rows(&mut *conn, &[tenant_id]).await?;
-    let now = db_now(&mut *conn).await?;
     let spends = spends(conn, &rows, now).await?;
     Ok(rows
         .into_iter()
@@ -357,9 +368,12 @@ pub async fn list(
         .collect())
 }
 
-/// Quota `b`'s current spend, as [`list`] gives it.
-pub async fn spent(conn: &mut PgConnection, b: &BudgetRow) -> Result<i64, DbError> {
-    let now = db_now(&mut *conn).await?;
+/// Quota `b`'s spend at `now` ([`db_now`]), as [`list`] gives it.
+pub async fn spent(
+    conn: &mut PgConnection,
+    b: &BudgetRow,
+    now: DateTime<Utc>,
+) -> Result<i64, DbError> {
     Ok(spends(conn, std::slice::from_ref(b), now)
         .await?
         .get(&b.id)
@@ -368,9 +382,16 @@ pub async fn spent(conn: &mut PgConnection, b: &BudgetRow) -> Result<i64, DbErro
 }
 
 /// Quota `row` as the API shows it (`Budget`): its target with
-/// `target_label`, and its spend `spent`, which is the current UTC
-/// period's for a periodic quota, whose `period_start` is that period's.
-pub fn to_api(row: &BudgetRow, spent: i64, target_label: &str, target_live: bool) -> Value {
+/// `target_label`, and `spent`, its spend at `now` as [`list`] or [`spent`]
+/// read it on the same clock. For a periodic quota that is the spend of the
+/// UTC period that holds `now`, whose start is its `period_start`.
+pub fn to_api(
+    row: &BudgetRow,
+    spent: i64,
+    now: DateTime<Utc>,
+    target_label: &str,
+    target_live: bool,
+) -> Value {
     json!({
         "id": row.id,
         "scope": row.scope,
@@ -382,7 +403,7 @@ pub fn to_api(row: &BudgetRow, spent: i64, target_label: &str, target_live: bool
         "limit_micro_usd": row.limit_micro_usd,
         "spent_micro_usd": spent,
         "remaining_micro_usd": row.limit_micro_usd.saturating_sub(spent),
-        "period_start": row.period.map(|p| p.start_of(Utc::now())),
+        "period_start": row.period.map(|p| p.start_of(now)),
         "counted_from": row.counted_from,
         "exhausted": spent >= row.limit_micro_usd,
         "created_at": row.created_at,
@@ -575,7 +596,9 @@ pub(crate) async fn project(
         "UPDATE billing_budgets AS b \
          SET marked_period_start = m.period_start, marked_exhausted = m.exhausted \
          FROM unnest($1::uuid[], $2::timestamptz[], $3::boolean[]) AS m(id, period_start, exhausted) \
-         WHERE b.id = m.id",
+         WHERE b.id = m.id \
+           AND (b.marked_period_start, b.marked_exhausted) \
+               IS DISTINCT FROM (m.period_start, m.exhausted)",
     )
     .bind(ids)
     .bind(period_starts)

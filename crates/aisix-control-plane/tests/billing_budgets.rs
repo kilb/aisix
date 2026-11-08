@@ -157,9 +157,21 @@ async fn spent(cp: &TestCp, tenant: Uuid, id: Uuid) -> i64 {
         .await
         .expect("read the quota")
         .expect("a live quota");
-    budgets::spent(&mut conn, &row)
+    let now = budgets::db_now(&mut conn).await.expect("read the clock");
+    budgets::spent(&mut conn, &row, now)
         .await
         .expect("read its spend")
+}
+
+/// Quota `b` as the API shows it, its spend and its period read on one
+/// clock, the database's.
+async fn shown(cp: &TestCp, b: &BudgetRow) -> Value {
+    let mut conn = cp.db().pool().acquire().await.expect("a connection");
+    let now = budgets::db_now(&mut conn).await.expect("read the clock");
+    let spent = budgets::spent(&mut conn, b, now)
+        .await
+        .expect("read its spend");
+    budgets::to_api(b, spent, now, "k1", true)
 }
 
 /// The stored `budgets` document `id`: its body, whether it is deleted, and
@@ -295,6 +307,20 @@ async fn a_key_quota_marks_that_key_only() {
     )
     .await;
     let balance = balance_doc(db, q.w.tenant).await;
+    assert_eq!(live(db, b.id).await, open("api_key", q.key, "day"));
+
+    // The same member's other key, and another member's key, are not this
+    // key.
+    let sibling = key_of(&q, Some(q.w.member)).await;
+    let n = cp.seed_member(q.w.tenant, MemberRole::Member).await.id;
+    let theirs = key_of(&q, Some(n)).await;
+    send(&q, rows(&q, sibling, Some(q.w.member), "sibling", 15, None)).await;
+    send(&q, rows(&q, theirs, Some(n), "theirs", 15, None)).await;
+    assert_eq!(
+        spent(cp, q.w.tenant, b.id).await,
+        0,
+        "another key's rows counted"
+    );
     assert_eq!(live(db, b.id).await, open("api_key", q.key, "day"));
 
     send(&q, rows(&q, q.key, Some(q.w.member), "within", 14, None)).await;
@@ -446,12 +472,26 @@ async fn an_owner_cap_and_a_member_cap_on_one_key_are_two_documents() {
         quota(BudgetScope::ApiKey, q.key, SetBy::Member, Some(Day), 10_000),
     )
     .await;
+    // A member quota at another level, which the same batch crosses too.
+    let member_level = created(
+        cp,
+        q.w.tenant,
+        quota(
+            BudgetScope::Member,
+            q.w.member,
+            SetBy::OrgAdmin,
+            Some(Day),
+            10_000,
+        ),
+    )
+    .await;
     assert_ne!(owners.id, members.id);
     assert_eq!(live(db, owners.id).await, open("api_key", q.key, "day"));
     assert_eq!(live(db, members.id).await, open("api_key", q.key, "day"));
 
     send(&q, rows(&q, q.key, Some(q.w.member), "r", 15, None)).await;
     until_exhausted(db, members.id).await;
+    until_exhausted(db, member_level.id).await;
     assert_eq!(spent(cp, q.w.tenant, owners.id).await, 10_200);
     assert_eq!(live(db, owners.id).await, open("api_key", q.key, "day"));
 }
@@ -469,7 +509,7 @@ async fn a_cumulative_quota_counts_from_its_creation_and_holds_with_no_period_st
     .await;
     assert_eq!((b.kind, b.period), (Kind::Cumulative, None));
     assert!(b.counted_from.is_some(), "{b:?}");
-    let shown = budgets::to_api(&b, spent(cp, q.w.tenant, b.id).await, "k1", true);
+    let shown = shown(cp, &b).await;
     assert_eq!(shown["spent_micro_usd"], json!(0));
     assert_eq!(shown["period"], Value::Null);
     assert_eq!(shown["period_start"], Value::Null);
@@ -533,11 +573,12 @@ async fn a_periodic_quota_counts_what_its_period_already_spent_when_created() {
         ),
     )
     .await;
-    let spent = spent(cp, q.w.tenant, b.id).await;
-    assert_eq!(spent, 10_200);
-    let shown = budgets::to_api(&b, spent, "k1", true);
+    assert_eq!(spent(cp, q.w.tenant, b.id).await, 10_200);
+    let shown = shown(cp, &b).await;
+    assert_eq!(shown["spent_micro_usd"], json!(10_200));
     assert_eq!(shown["exhausted"], json!(true));
     assert_eq!(shown["remaining_micro_usd"], json!(-200));
+    assert_eq!(shown["period_start"], json!(stamp(today(cp).await)));
     // Settled in the creating transaction: no settler pass is needed.
     let marked = live(db, b.id).await;
     assert_eq!(
@@ -589,7 +630,7 @@ async fn a_charge_on_the_boundary_counts_in_the_period_it_starts() {
     assert_eq!(spent(cp, q.w.tenant, b.id).await, 680);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn spend_from_an_earlier_period_never_exhausts_the_current_one() {
     let Some(q) = setup().await else { return };
     let (cp, db) = (&q.w.cp, q.w.cp.db());
@@ -608,11 +649,22 @@ async fn spend_from_an_earlier_period_never_exhausts_the_current_one() {
     )
     .await;
     let yesterday = today - TimeDelta::hours(12);
+    // The tenant's row is held across the batch, so the settler, which takes
+    // it without waiting, cannot clear a flag before it is read.
+    let mut edit = db.pool().begin().await.expect("begin");
+    tenants::lock(&mut edit, q.w.tenant)
+        .await
+        .expect("lock the tenant");
     send(
         &q,
         rows(&q, q.key, Some(q.w.member), "y", 20, Some(yesterday)),
     )
     .await;
+    assert!(
+        !flagged(db, q.w.tenant).await,
+        "yesterday's spend flagged today's quota"
+    );
+    edit.rollback().await.expect("end the edit");
     let held: i64 = sqlx::query_scalar(
         "SELECT spent_micro_usd FROM billing_budget_spend \
          WHERE budget_id = $1 AND period_start = $2",
@@ -624,11 +676,53 @@ async fn spend_from_an_earlier_period_never_exhausts_the_current_one() {
     .expect("yesterday's spend row");
     assert_eq!(held, 13_600);
     assert_eq!(spent(cp, q.w.tenant, b.id).await, 0);
-    assert!(
-        !flagged(db, q.w.tenant).await,
-        "yesterday's spend flagged today's quota"
-    );
     assert_eq!(live(db, b.id).await, open("api_key", q.key, "day"));
+}
+
+/// A periodic mark holds for the period it was set in, and the gateway lifts
+/// it at the next. A crossing in a later period is marked again, with that
+/// period's start.
+#[tokio::test]
+async fn a_periodic_quota_is_marked_again_once_its_period_rolls_over() {
+    let Some(q) = setup().await else { return };
+    let (cp, db) = (&q.w.cp, q.w.cp.db());
+    let today = today(cp).await;
+    insert_sell_backdated(db, q.model, card_json(), today - Days::new(2)).await;
+    let b = created(
+        cp,
+        q.w.tenant,
+        quota(
+            BudgetScope::ApiKey,
+            q.key,
+            SetBy::OrgAdmin,
+            Some(Day),
+            10_000,
+        ),
+    )
+    .await;
+    // Yesterday the quota was spent past its limit, and yesterday's settle
+    // marked yesterday: recorded here as that settle would have left it.
+    let yesterday = today - TimeDelta::hours(12);
+    send(
+        &q,
+        rows(&q, q.key, Some(q.w.member), "y", 15, Some(yesterday)),
+    )
+    .await;
+    sqlx::query("UPDATE billing_budgets SET marked_period_start = $2 WHERE id = $1")
+        .bind(b.id)
+        .bind(today - Days::new(1))
+        .execute(db.pool())
+        .await
+        .expect("record yesterday's mark");
+    assert_eq!(spent(cp, q.w.tenant, b.id).await, 0);
+
+    send(&q, rows(&q, q.key, Some(q.w.member), "t", 15, None)).await;
+    let marked = until_exhausted(db, b.id).await;
+    assert_eq!(marked["exhausted"]["period_start"], json!(stamp(today)));
+    assert_eq!(
+        marked["exhausted"]["reason"]["spent_usd"],
+        json!("0.010200")
+    );
 }
 
 #[tokio::test]
@@ -671,7 +765,8 @@ async fn raising_a_limit_lifts_the_mark_and_deleting_retires_the_document() {
             .await
             .expect("read")
             .is_none());
-        assert!(!budgets::list(&mut conn, q.w.tenant)
+        let now = budgets::db_now(&mut conn).await.expect("read the clock");
+        assert!(!budgets::list(&mut conn, q.w.tenant, now)
             .await
             .expect("list")
             .iter()
