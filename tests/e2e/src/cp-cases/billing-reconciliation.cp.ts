@@ -106,11 +106,13 @@ describe("the ledger matches the price table", () => {
       for (let round = 1; round <= ROUNDS; round++) {
         for (const [path, body] of firstPhaseCalls(`round ${round}`)) await send(path, body);
       }
-      expect(sent.size).toBe(21);
+      expect(sent.size).toBe(ROUNDS * firstPhaseCalls("").length);
 
-      // The barrier. The gateway delivers usage in the order it was made, so
-      // once the barrier's entry is in the ledger, every earlier call's usage
-      // has been delivered or dropped.
+      // The barrier. The gateway delivers usage in the order it was made, one
+      // batch at a time, and the control plane posts a batch's entries in the
+      // transaction that stores it; so once the barrier's entry is in the
+      // ledger, every earlier call's usage has been delivered or dropped.
+      // That no batch was stored after the barrier's is asserted below.
       const barrier = await send("/v1/chat/completions", {
         model: CHAT_MODEL,
         messages: [{ role: "user", content: "the barrier" }],
@@ -137,11 +139,11 @@ describe("the ledger matches the price table", () => {
         { timeoutMs: WITHIN_MS, describe: () => note },
       );
 
+      // A drop is a product failure, never an expected cost of the run. The
+      // amounts below still discount it, so that their messages describe
+      // what did reach the ledger.
       const dropped = (await drops()) - dropsBefore;
-      if (dropped !== 0) {
-        // A drop is a product signal, never an expected cost of the run.
-        console.warn(`the gateway dropped ${dropped} usage event(s) during the money check`);
-      }
+      expect.soft(dropped, "the gateway dropped usage events during the money check").toBe(0);
       const expected = (sent.size - dropped) * CALL_MICRO_USD;
 
       // The key's stored usage rows, and the tenant's usage entries.
@@ -161,6 +163,23 @@ describe("the ledger matches the price table", () => {
           `one usage entry for each of the key's rows, and none other: ${books}`,
         )
         .toEqual(rows.map((r) => r.event_id).sort());
+      expect
+        .soft(
+          keyEntries
+            .filter((e) => e.amount_micro_usd !== -CALL_MICRO_USD)
+            .map((e) => [pathOf.get(e.event_id), e.amount_micro_usd]),
+          `every usage entry is exactly the price table's amount: ${books}`,
+        )
+        .toEqual([]);
+      // Rows are stored in delivery order, a batch at a time: the newest of
+      // the key's rows is in the barrier's batch unless a batch landed after it.
+      const newest = rows.reduce((a, b) => (b.seq > a.seq ? b : a), rows[0]);
+      expect
+        .soft(
+          newest?.batch_id,
+          `no batch of the key's usage was stored after the barrier's: ${books}`,
+        )
+        .toBe(rows.find((r) => r.request_id === barrier)?.batch_id);
       expect
         .soft(
           keyEntries.reduce((sum, e) => sum + e.amount_micro_usd, 0),

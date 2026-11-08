@@ -114,8 +114,8 @@ describe("money blocks a tenant at the gateway within 2 s", () => {
 
       const sorted = [...latencies].sort((a, b) => a - b);
       // Nearest rank over 20 trials: the 10th and the 19th smallest.
-      const p50 = sorted[Math.ceil(TRIALS * 0.5) - 1];
-      const p95 = sorted[Math.ceil(TRIALS * 0.95) - 1];
+      const p50 = sorted[Math.ceil((TRIALS * 50) / 100) - 1];
+      const p95 = sorted[Math.ceil((TRIALS * 95) / 100) - 1];
       const report =
         `block latency over ${TRIALS} trials: p50 ${p50.toFixed(0)} ms, p95 ${p95.toFixed(0)} ms, ` +
         `largest overshoot k ${Math.max(...overshoots)}; ` +
