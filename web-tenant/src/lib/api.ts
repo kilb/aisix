@@ -235,6 +235,22 @@ export interface KeyLimits {
   rpm?: number;
 }
 
+/**
+ * A provider group as its organisation sees it: what it is called and what
+ * it is for. Never a routing name, which the control plane does not send.
+ */
+export interface PortalGroup {
+  id: string;
+  display_name: string;
+  description: string;
+}
+
+/** The group a key routes to, as its organisation sees it. */
+export interface KeyGroup {
+  id: string;
+  display_name: string;
+}
+
 /** `TenantKey`: a key as its organisation sees it. It never holds the plaintext. */
 export interface TenantKey {
   id: string;
@@ -244,6 +260,10 @@ export interface TenantKey {
   owner: { id: string; display_name: string | null } | null;
   /** The models selected from the grants; null follows every grant. */
   model_ids: string[] | null;
+  /** The group the key routes to, fixed when it was created; null for a key an older release left without one. */
+  group: KeyGroup | null;
+  /** Whether that group still routes to the organisation: false closes the key. */
+  group_available: boolean;
   rate_limit: KeyLimits;
   /** The organisation's own switch. */
   disabled: boolean;
@@ -259,6 +279,8 @@ export interface NewKey {
   label: string;
   member_id?: string;
   model_ids?: string[];
+  /** The group the key routes to. Left out, an organisation with one assigned group gets it. */
+  group_id?: string;
   rate_limit?: KeyLimits;
   expires_at?: string;
 }
@@ -299,6 +321,13 @@ export const models = {
   },
 };
 
+export const groups = {
+  /** The live groups the organisation is assigned, by display name and description. */
+  async list(): Promise<PortalGroup[]> {
+    return (await call<{ items: PortalGroup[] }>("GET", "/groups")).data.items;
+  },
+};
+
 export const keys = {
   /** Every key of the organisation for an owner or an admin; a member's own for a member. */
   async list(): Promise<TenantKey[]> {
@@ -315,6 +344,13 @@ export const keys = {
    */
   async setDisabled(id: string, disabled: boolean, version: number): Promise<TenantKey> {
     return (await call<TenantKey>("PATCH", `/keys/${at(id)}`, { disabled }, version)).data;
+  },
+  /**
+   * Sets a key's group, once: a key without a group (one an older release
+   * minted) may take one, and a key that has one is refused the change.
+   */
+  async setGroup(id: string, groupId: string, version: number): Promise<TenantKey> {
+    return (await call<TenantKey>("PATCH", `/keys/${at(id)}`, { group_id: groupId }, version)).data;
   },
   async revoke(id: string, version: number): Promise<void> {
     await call<null>("DELETE", `/keys/${at(id)}`, undefined, version);
