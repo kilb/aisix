@@ -86,7 +86,8 @@ pub struct IngestOutcome {
     /// The batch had been delivered before: nothing was stored, and
     /// `rejected` is what its first stored delivery refused.
     pub batch_duplicate: bool,
-    /// Events this delivery stored that were charged at a sell price.
+    /// Events this delivery stored that were charged: at the model's
+    /// baseline times the key's group rate, less the tenant's discount.
     pub charged: u64,
     /// Events this delivery stored that could not be priced; each is stored
     /// with an `unpriced` charge.

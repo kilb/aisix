@@ -39,12 +39,16 @@ failing unless it was written for them.
 - Rounding first and multiplying afterwards bills a different number. The
   discriminating case is pinned in `the_rate_and_the_discount_are_inside_the_one_rounding`:
   one token at USD 0.15/M × 7.2 is 1.08 µ¥, which is 2 µ¥ with no discount and
-  1 µ¥ at 1000 bps, where rounding the USD amount first gives 2 either way.
+  1 µ¥ at 1000 bps. Rounding the rate first gives ⌈1.08⌉ = 2 → ⌈1.8⌉ = 2, and
+  rounding the USD amount first gives ⌈0.15⌉ = 1 µ$ → ⌈7.2⌉ = 8; only the
+  implemented order, one rounding after both factors, gives 1.
 - A row's total stays exact in `u128` because every quantity is bounded by
   `MAX_QUANTITY` (three `u32` counters) and every rate by `Rate::MAX`,
   `CnyPerUsd::MAX` and 10⁴ bps; `rates.rs` asserts that bound at compile time
-  (ruling R1). Anything past `i64` is `PricingError::Overflow`, never a
-  wrapped or negative amount.
+  (ruling R1). An amount past `i64`, or a line product past `u128`, is
+  `PricingError::Overflow`, never a wrapped or negative amount. A discount
+  above 10000 bps is its own error (`DiscountAboveWhole`), because it is a
+  writer's bug rather than an arithmetic limit; it is refused, never clamped.
 - The gateway's `ModelCost` is `f64` and is used here only by the tests that
   compare against it (`tests/equivalence.rs`, `tests/golden.rs`), never to
   produce a charge. `cost_usd` on the row is never read for pricing.

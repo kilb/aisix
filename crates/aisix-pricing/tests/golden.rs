@@ -32,8 +32,10 @@ use serde_json::Value;
 /// one second after the instant the e2e stamps on each of them.
 const RECEIVED_AT: &str = "2026-11-06T00:00:01Z";
 
-/// Each family's one row: its outcome and its charge in micro-USD, worked
-/// out by hand from the mock upstream's usage and the book's card.
+/// Each family's one row: its outcome and its charge in micro-CNY, worked
+/// out by hand from the mock upstream's usage and the book's baseline card.
+/// The book's group rate is 1.0000, at which a charge in µ¥ is the
+/// baseline's in µ$, so these are the gateway's own figures too.
 const EXPECTED: &[(&str, &str, i64)] = &[
     ("openai-chat", "charged", 340), // flex: 200×0.5 + 800×0.05 + 200×1
     ("openai-chat-stream", "charged", 340),
@@ -249,12 +251,13 @@ fn the_engine_charges_what_the_gateway_reported() {
                 .unwrap_or_else(|| panic!("{family}: the row carries no cost_usd: {row}"));
             let gateway = i64::try_from(spend_micro_usd(reported)).expect("a spend fits in i64");
             let PricedEvent { charge, .. } = &priced;
-            // The engine rounds up once and the gateway rounds its float to
-            // the nearest µ$, so the engine is equal or one above, never below.
+            // At a rate of 1.0000 a charge in µ¥ is the baseline's in µ$. The
+            // engine rounds up once and the gateway rounds its float to the
+            // nearest µ$, so the engine is equal or one above, never below.
             let diff = charge.0 - gateway;
             assert!(
                 (0..=1).contains(&diff),
-                "{family}: the engine charges {} µ$, the gateway reported {reported} USD \
+                "{family}: the engine charges {} µ¥, the gateway reported {reported} USD \
                  ({gateway} µ$), engine - gateway = {diff}: {priced:?}",
                 charge.0
             );

@@ -102,7 +102,8 @@ pub struct Payer {
 #[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Outcome {
-    /// Billed at its sell price: `charge` is what the tenant owes.
+    /// Billed at its baseline times its group's rate: `charge` is what the
+    /// tenant owes.
     Charged,
     /// Not billed, by rule, whatever it reports.
     Exempt(Exemption),
@@ -212,20 +213,25 @@ pub enum PricingError {
     InvalidPrice { revision_id: i64 },
     /// The served tier (or `batch`) has no rates on the card. `tier` is the
     /// upstream's own string, so it stays operator-side.
-    #[error("the sell price has no rates for service tier {tier:?}")]
+    #[error("the baseline has no rates for service tier {tier:?}")]
     MissingTierPrice { tier: String },
     /// The row bills a quantity the rates in use carry no rate for, even by
     /// fallback. It is refused rather than billed at nothing.
-    #[error("the sell price has no rate for {dimension}")]
+    #[error("the baseline has no rate for {dimension}")]
     MissingDimensionPrice { dimension: Dimension },
     #[error("the usage counters contradict each other: {0:?}")]
     InconsistentUsage(Inconsistency),
     /// A successful row with no tokens of an operation priced in other units.
     #[error("operation {0} reported no quantity this engine can price")]
     UnpricedOperation(String),
-    /// A discount above 10000 bps, or an amount past `i64`. The USD charge
-    /// cannot get there within `Rate::MAX` and `u32` counters; the CNY charge
-    /// can, at the largest quantities and rates.
+    /// A discount above 10000 bps: an operator or a writer error, never an
+    /// amount. It is refused rather than clamped, because clamping would bill
+    /// a row at a price nobody wrote.
+    #[error("discount {bps} bps is above 10000")]
+    DiscountAboveWhole { bps: u16 },
+    /// An amount past `i64`, or a line product past `u128`. Within
+    /// `Rate::MAX`, `CnyPerUsd::MAX` and `MAX_QUANTITY` a row cannot get
+    /// there; a caller's own `ChargeLine`s can.
     #[error("the amount does not fit in i64")]
     Overflow,
 }
@@ -245,6 +251,7 @@ impl PricingError {
             PricingError::MissingDimensionPrice { .. } => "missing_dimension_price",
             PricingError::InconsistentUsage(_) => "inconsistent_usage",
             PricingError::UnpricedOperation(_) => "unpriced_operation",
+            PricingError::DiscountAboveWhole { .. } => "discount_above_whole",
             PricingError::Overflow => "overflow",
         }
     }
@@ -450,7 +457,8 @@ pub fn price_event(
 ///
 /// The CNY rate and the discount are inside the one rounding, upward, so no
 /// factor is rounded on its own and any amount above zero is at least 1 µ¥.
-/// A discount above 10000 bps, and an amount past `i64`, are `Overflow`.
+/// A discount above 10000 bps is `DiscountAboveWhole`; an amount past `i64`,
+/// or a line product past `u128`, is `Overflow`.
 /// A line whose product would pass `u128::MAX` is `Overflow`, never a
 /// wrapped amount; any line inside that bound returns its exact charge.
 pub fn charge_micro_cny(
@@ -460,7 +468,7 @@ pub fn charge_micro_cny(
 ) -> Result<MicroCny, PricingError> {
     let kept_bps = WHOLE_BPS
         .checked_sub(u128::from(discount_bps))
-        .ok_or(PricingError::Overflow)?;
+        .ok_or(PricingError::DiscountAboveWhole { bps: discount_bps })?;
     let factor = u128::from(cny.0) * kept_bps;
     // A u64 × u64 product is below u128::MAX; only the rest is checked.
     let numerator = lines
@@ -660,6 +668,15 @@ mod tests {
             model_id: None,
             effective_from: ts(from),
             cny_per_usd_e4: Some(e4),
+        }
+    }
+
+    /// Group `g`'s rate for model `model`: a model's own override.
+    fn override_(revision_id: i64, model: &str, from: &str, e4: i64) -> GroupRateRow {
+        GroupRateRow {
+            model_id: Some(model.to_owned()),
+            cny_per_usd_e4: Some(e4),
+            ..group_rate(revision_id, from, e4)
         }
     }
 
@@ -1275,6 +1292,87 @@ mod tests {
         );
     }
 
+    /// A card with a long-context band and a cheaper `flex` tier, so the row's
+    /// selected rates are not the base ones.
+    fn banded_card() -> Value {
+        json!({
+            "default": {
+                "base": {"input": "4", "output": "20", "cache_read": "1", "cache_write": "5"},
+                "long_context": [{"above_input_tokens": 200_000,
+                                  "rates": {"input": "8", "output": "45",
+                                            "cache_read": "2", "cache_write": "10"}}]
+            },
+            // A tier must carry the default's bands and every rate dimension.
+            "flex": {
+                "base": {"input": "5", "output": "12", "cache_read": "1", "cache_write": "5"},
+                "long_context": [{"above_input_tokens": 200_000,
+                                  "rates": {"input": "9", "output": "20",
+                                            "cache_read": "2", "cache_write": "10"}}]
+            }
+        })
+    }
+
+    #[test]
+    fn a_band_and_a_tier_are_priced_at_the_group_rate_inside_the_discount() {
+        // The group's default is 5.0, `m`'s override is 6.0, and `t` has a
+        // 1000-bps discount: the selected rates come from the baseline card
+        // and the rate and discount are applied to their sum, once.
+        let book = book_of(
+            vec![baseline(1, "m", T0, banded_card())],
+            vec![group_rate(1, T0, 50_000), override_(2, "m", T0, 60_000)],
+            vec![],
+            vec![discount(3, "t", T0, 1_000)],
+        );
+        let override_ref = RateRef {
+            revision_id: 2,
+            cny_per_usd: CnyPerUsd::parse("6").unwrap(),
+            model_override: true,
+        };
+
+        // Past the band: 200001 × 8 + 30 × 45 = 1,601,358 µ$; × 6.0 less
+        // 1000 bps is 8,647,333.2 µ¥, rounded up once. Rounding the discounted
+        // µ$ amount first would give 8,647,338, and the base rates 4/20 would
+        // give 8,644,110.
+        let mut u = rate_row();
+        u.prompt_tokens = 200_001;
+        u.completion_tokens = 30;
+        let p = price_event(&book, &u, &payer_of("t"), RECEIVED).unwrap();
+        assert_eq!(
+            (p.service_tier, p.long_context_above),
+            (Some(ServiceTier::default_tier()), Some(200_000))
+        );
+        assert_eq!(p.rate, Some(override_ref));
+        assert_eq!(
+            p.discount,
+            Some(DiscountRef {
+                revision_id: 3,
+                bps: 1_000
+            })
+        );
+        assert_eq!(p.charge, MicroCny(8_647_334));
+
+        // Below the band and on `flex`: 1000 × 5 + 100 × 12 = 6,200 µ$; × 6.0
+        // less 1000 bps is exactly 33,480 µ¥.
+        let mut u = rate_row();
+        u.prompt_tokens = 1_000;
+        u.completion_tokens = 100;
+        u.service_tier = Some("flex".into());
+        let p = price_event(&book, &u, &payer_of("t"), RECEIVED).unwrap();
+        assert_eq!(
+            (p.service_tier, p.long_context_above),
+            (ServiceTier::normalize(Some("flex"), false), None)
+        );
+        assert_eq!(p.rate, Some(override_ref));
+        assert_eq!(
+            p.discount,
+            Some(DiscountRef {
+                revision_id: 3,
+                bps: 1_000
+            })
+        );
+        assert_eq!(p.charge, MicroCny(33_480));
+    }
+
     #[test]
     fn a_group_with_no_rate_in_force_is_missing_rate() {
         // No override, and the group's default starts after the row.
@@ -1558,13 +1656,24 @@ mod tests {
     fn a_row_from_a_fast_clock_is_priced_no_later_than_five_minutes_after_receipt() {
         let later = RECEIVED + TimeDelta::minutes(30);
         let later = later.to_rfc3339();
+        // A second rate starting a minute after receipt, so `received_at`
+        // and the clamped instant resolve differently: only the clamp sees it.
+        let soon = (RECEIVED + TimeDelta::minutes(1)).to_rfc3339();
+        let nine = GroupRateRow {
+            revision_id: 2,
+            engine_version: ENGINE_VERSION,
+            group_id: "g".to_owned(),
+            model_id: None,
+            effective_from: ts(&soon),
+            cny_per_usd_e4: Some(CnyPerUsd::parse("9").unwrap().0.into()),
+        };
         let one = |input: &str| json!({"default": {"base": {"input": input, "output": "1"}}});
         let book = book_of(
             vec![
                 baseline(1, "m", T0, one("1")),
                 baseline(2, "m", &later, one("9")),
             ],
-            vec![rate_one(1, T0)],
+            vec![rate_one(1, T0), nine],
             vec![
                 cost(3, None, T0, one("0.4")),
                 cost(4, None, &later, one("0.8")),
@@ -1587,10 +1696,19 @@ mod tests {
             p.warnings,
             vec![PricingWarning::OccurredAtClamped { occurred_at }]
         );
-        // Every lookup is at the clamped instant: rev 1, cost rev 3 and no
-        // discount yet.
+        // Every lookup is at the clamped instant: baseline rev 1, cost rev 3,
+        // rate rev 2 (which starts after receipt) and no discount yet. A rate
+        // resolved at `received_at` would find rev 1 and charge 1000 µ¥.
         assert_eq!(p.baseline.unwrap().revision_id, 1);
-        assert_eq!((p.charge, p.discount), (MicroCny(1000), None));
+        assert_eq!(
+            p.rate,
+            Some(RateRef {
+                revision_id: 2,
+                cny_per_usd: CnyPerUsd::parse("9").unwrap(),
+                model_override: false
+            })
+        );
+        assert_eq!((p.charge, p.discount), (MicroCny(9000), None));
         assert_eq!(
             p.cost,
             Some(CostPriced {
@@ -1603,11 +1721,16 @@ mod tests {
         let edge = RECEIVED + TimeDelta::minutes(5);
         let p = at(edge);
         assert_eq!((p.price_instant, p.warnings), (edge, vec![]));
+        assert_eq!(p.charge, MicroCny(9000));
         let p = at(edge + TimeDelta::nanoseconds(1));
         assert_eq!(p.price_instant, edge);
-        // A row from the past is priced when it occurred.
+        assert_eq!(p.charge, MicroCny(9000));
+        // A row from the past is priced when it occurred: a second before
+        // receipt, so the second rate is not yet in force.
         let p = at(ts(OCCURRED));
         assert_eq!((p.price_instant, p.warnings), (ts(OCCURRED), vec![]));
+        assert_eq!(p.rate.unwrap().revision_id, 1);
+        assert_eq!(p.charge, MicroCny(1000));
     }
 
     #[test]
@@ -1711,7 +1834,7 @@ mod tests {
         ));
         assert_eq!((p.charge, p.cost), (MicroCny(250), None));
         // A quantity the cost card has no rate for leaves the cost unknown,
-        // never a cost without it; the sell card prices the search.
+        // never a cost without it; the baseline prices the search.
         let p = at(&format!(
             r#"{{"prompt_tokens":1000,"web_search_requests":1,{upstream}}}"#
         ));
@@ -1946,6 +2069,10 @@ mod tests {
                 PricingError::UnpricedOperation("speech".into()),
                 "unpriced_operation",
             ),
+            (
+                PricingError::DiscountAboveWhole { bps: 10_001 },
+                "discount_above_whole",
+            ),
             (PricingError::Overflow, "overflow"),
         ] {
             assert_eq!(e.code(), code);
@@ -2012,7 +2139,7 @@ mod tests {
         assert_eq!(charge_micro_cny(&lines, at, 10_000), Ok(MicroCny(0)));
         assert_eq!(
             charge_micro_cny(&lines, at, 10_001),
-            Err(PricingError::Overflow)
+            Err(PricingError::DiscountAboveWhole { bps: 10_001 })
         );
     }
 
