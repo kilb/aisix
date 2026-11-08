@@ -1,53 +1,20 @@
-import { useState, type ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
+import { Button } from "./ui/Button";
+import { useToast } from "./ui/Toast";
 
-/**
- * A destructive action in two steps, inline: `label`, then `确认<label>`
- * beside `取消`, with `warning` between them. Never `window.confirm`, which
- * leaves the page's own flow and is blocked in some embeddings.
- */
-export function ConfirmButton({
-  label,
-  warning,
-  disabled,
-  onConfirm,
-}: {
-  label: string;
-  warning?: string;
-  disabled?: boolean;
-  onConfirm: () => void;
-}) {
-  const [asking, setAsking] = useState(false);
-  if (!asking) {
-    return (
-      <button className="ghost" disabled={disabled} onClick={() => setAsking(true)}>
-        {label}
-      </button>
-    );
-  }
-  return (
-    <span className="acts">
-      {warning && <span className="hint warn-inline">{warning}</span>}
-      <button
-        className="ghost danger"
-        disabled={disabled}
-        onClick={() => {
-          setAsking(false);
-          onConfirm();
-        }}
-      >
-        确认{label}
-      </button>
-      <button className="ghost" onClick={() => setAsking(false)}>
-        取消
-      </button>
-    </span>
-  );
-}
+/** How long the copy button reads 已复制. */
+const COPIED_MS = 1500;
 
 /**
  * A secret shown this once (a key's plaintext, an invitation link), with
  * `复制`. It lives in the caller's state only, so it goes with `onDone`, a
  * reload or a change of page; nothing here stores, logs or routes it.
+ *
+ * A copy is confirmed three ways: the button itself reads 已复制 with a
+ * check for a moment, a toast says it, and the status text beside the
+ * buttons (which assistive technology reads) says it too, out of sight once
+ * it worked. A failed copy says so on screen, since the value then has to
+ * be selected by hand.
  */
 export function ShownOnce({
   title,
@@ -62,11 +29,22 @@ export function ShownOnce({
   onDone: () => void;
 }) {
   const [copied, setCopied] = useState<boolean | null>(null);
+  const [flash, setFlash] = useState(false);
+  const toast = useToast();
+
+  useEffect(() => {
+    if (!flash) return;
+    const t = window.setTimeout(() => setFlash(false), COPIED_MS);
+    return () => window.clearTimeout(t);
+  }, [flash]);
 
   async function copy() {
     try {
       await navigator.clipboard.writeText(value);
       setCopied(true);
+      setFlash(true);
+      // The status beside the buttons says it to assistive technology already.
+      toast("已复制", { announce: false });
     } catch {
       // No clipboard (an insecure context, a denied permission): the value
       // is still there to select by hand.
@@ -75,19 +53,19 @@ export function ShownOnce({
   }
 
   return (
-    <div className="note warn minted" role="region" aria-label={title}>
+    <div className="secret" role="region" aria-label={title}>
       <strong>{title}</strong>
       <input readOnly value={value} aria-label={title} onFocus={(e) => e.currentTarget.select()} />
       {children}
-      <span className="acts">
-        <button className="ghost" onClick={() => void copy()}>
-          复制
-        </button>
-        <button className="ghost" onClick={onDone}>
+      <span className="secret-acts">
+        <Button size="sm" icon={flash ? "check" : "copy"} onClick={() => void copy()}>
+          {flash ? "已复制" : "复制"}
+        </Button>
+        <Button size="sm" onClick={onDone}>
           我已保存
-        </button>
+        </Button>
         {copied !== null && (
-          <span className="hint" role="status">
+          <span className={copied ? "vh" : "field-problem"} role="status">
             {copied ? "已复制" : "无法写入剪贴板，请手动选中复制"}
           </span>
         )}

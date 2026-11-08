@@ -229,10 +229,8 @@ fn base_client_builder() -> reqwest::ClientBuilder {
         // fetching it. A passthrough route relaying a 3xx to its caller is
         // likewise more faithful than silently resolving it here.
         //
-        // Same policy, and the same reasoning, as the console's and portal's
-        // outbound clients — which have asserted it for longer than this one
-        // has had it. If an upstream ever does need a redirect followed, the
-        // symptom is a visible 3xx rather than a leaked credential.
+        // If an upstream ever does need a redirect followed, the symptom is a
+        // visible 3xx rather than a leaked credential.
         .redirect(reqwest::redirect::Policy::none())
         .user_agent(format!("aisix/{}", &*aisix_core::BUILD_VERSION))
         // Every client in the process resolves through the one cache, so
@@ -496,26 +494,8 @@ mod tests {
             // scoped to that one file so a bare rmcp client anywhere else
             // still gets flagged.
             let sanctioned_rmcp_site = file.ends_with("aisix-mcp/src/bridge.rs");
-            // The console is a separate binary that never loads gateway
-            // config, so `client_builder()` — which reads the global
-            // `UpstreamHttpConfig` — has nothing to read there. It pins the
-            // same connect timeout / keepalive / pool-idle values literally
-            // instead; `console_client_is_not_left_on_reqwest_defaults`
-            // below is what holds it to them.
-            let sanctioned_console_site = file.ends_with("aisix-console/src/main.rs");
-            // The portal is in the same position as the console: a separate
-            // binary that never loads gateway config, so `client_builder()`
-            // has no `UpstreamHttpConfig` to read. It pins the same values
-            // literally in one place, and
-            // `portal_client_is_not_left_on_reqwest_defaults` holds it to
-            // them. Scoped to that one file so a bare client anywhere else
-            // in the portal still gets flagged.
-            let sanctioned_portal_site = file.ends_with("aisix-portal/src/client.rs");
             for (n, line) in production.lines().enumerate() {
                 if sanctioned_rmcp_site && line.contains("rmcp_reqwest::Client::") {
-                    continue;
-                }
-                if sanctioned_console_site || sanctioned_portal_site {
                     continue;
                 }
                 if line.contains("reqwest::Client::builder()")
@@ -535,17 +515,13 @@ mod tests {
         );
     }
 
-    /// The gateway's OWN client is held to the rule its two siblings were
-    /// already held to.
+    /// The gateway's own client does not follow redirects.
     ///
-    /// The console's and portal's clients each had a test requiring
-    /// `redirect(`, and the comments there name the exact hazard: reqwest
-    /// follows up to ten redirects and strips only `Authorization`, `Cookie`,
-    /// `cookie2`, `Proxy-Authorization` and `WWW-Authenticate` cross-host, so
-    /// a custom credential header rides along. This client — the one that
-    /// actually carries provider credentials on every request, `x-api-key`
-    /// for Anthropic and `api-key` for Azure — was the one with no such test
-    /// and no such setting.
+    /// reqwest follows up to ten redirects and strips only `Authorization`,
+    /// `Cookie`, `cookie2`, `Proxy-Authorization` and `WWW-Authenticate`
+    /// cross-host, so a custom credential header rides along. This client
+    /// carries provider credentials on every request, `x-api-key` for
+    /// Anthropic and `api-key` for Azure.
     #[test]
     fn the_shared_upstream_client_does_not_follow_redirects() {
         let src =
@@ -632,7 +608,7 @@ mod tests {
         );
     }
 
-    /// The MCP bridge's client is the fourth of these, and had the same gap.
+    /// The MCP bridge's client is held to the same rule, and had the same gap.
     ///
     /// rmcp vendors its own reqwest, so it cannot share `client_builder()`
     /// and instead mirrors it field for field — which means the redirect
@@ -683,80 +659,6 @@ mod tests {
              may only appear as the last-resort arm of an `unwrap_or_else`, \
              never as the fallback client itself"
         );
-    }
-
-    /// The console is exempted from the scan above because it cannot call
-    /// `client_builder()` — but an exemption with nothing behind it just
-    /// removes it from the guard. This is what keeps it honest: its client
-    /// must still set every default reqwest gets wrong, or the exemption is
-    /// hiding exactly the bug the scan exists to catch.
-    ///
-    /// Asserted against the source rather than the built client because
-    /// `reqwest::Client` exposes none of these settings for readback.
-    #[test]
-    fn console_client_is_not_left_on_reqwest_defaults() {
-        let path = std::path::Path::new(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../aisix-console/src/main.rs"
-        ));
-        let Ok(src) = std::fs::read_to_string(path) else {
-            // The console is an optional member; absent is not a failure.
-            return;
-        };
-        let production = production_half(&src);
-        for setting in [
-            "connect_timeout(",
-            "tcp_keepalive(",
-            "pool_idle_timeout(",
-            // Redirects off: the console validates only the first hop
-            // before dialling an operator-supplied address, so following a
-            // 302 walks straight past that check — and reqwest strips only
-            // the standard auth headers cross-host, not the `x-api-key` that
-            // path sends.
-            "redirect(",
-        ] {
-            assert!(
-                production.contains(setting),
-                "the console's outbound client does not set `{setting}` — \
-                 reqwest's default there is what the workspace scan exists \
-                 to prevent, and the console is exempt from that scan",
-            );
-        }
-    }
-
-    /// The portal's exemption from the scan above is conditional on it
-    /// pinning the same values `client_builder()` would have applied. Same
-    /// reasoning as the console: reqwest's defaults leave no connect
-    /// timeout, TCP keepalive off, and a 90s pooled-connection lifetime that
-    /// outlives a typical hop's idle timeout, which shows up as an
-    /// occasional failure that succeeds on retry.
-    #[test]
-    fn portal_client_is_not_left_on_reqwest_defaults() {
-        let path = std::path::Path::new(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../aisix-portal/src/client.rs"
-        ));
-        let Ok(src) = std::fs::read_to_string(path) else {
-            // The portal is an optional member; absent is not a failure.
-            return;
-        };
-        let production = production_half(&src);
-        for setting in [
-            "connect_timeout(",
-            "tcp_keepalive(",
-            "pool_idle_timeout(",
-            // Redirects off: the portal dials operator-configured addresses,
-            // and following a 302 hands the choice of destination to whoever
-            // answered.
-            "redirect(",
-        ] {
-            assert!(
-                production.contains(setting),
-                "the portal's outbound client does not set `{setting}` — \
-                 reqwest's default there is what the workspace scan exists \
-                 to prevent, and the portal is exempt from that scan",
-            );
-        }
     }
 
     /// The outbound stacks that are *not* reqwest each have exactly one

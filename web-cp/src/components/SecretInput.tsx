@@ -1,4 +1,6 @@
 import { useId, useState } from "react";
+import { Button } from "../ui/Button";
+import { Lamp } from "../ui/Lamp";
 
 /** What the control plane reads every stored credential back as. */
 export const REDACTED = "[REDACTED]";
@@ -55,38 +57,36 @@ export function SecretInput({
         <span>{label}</span>
         <div className="secret">
           {mode === "keep" ? (
-            <span className="pill ok">已设置</span>
+            <Lamp state="applied">已设置</Lamp>
           ) : (
-            <span className="pill crit">保存后清除</span>
+            <Lamp state="pending">保存后清除</Lamp>
           )}
           {!readOnly && mode === "keep" && (
-            <button
+            <Button
               type="button"
-              className="ghost"
               onClick={() => {
                 setMode("replace");
                 onChange("");
               }}
             >
               替换
-            </button>
+            </Button>
           )}
           {!readOnly && mode === "keep" && !required && (
-            <button
+            <Button
               type="button"
-              className="ghost"
               onClick={() => {
                 setMode("clear");
                 onChange(undefined);
               }}
             >
               清除
-            </button>
+            </Button>
           )}
           {!readOnly && mode === "clear" && (
-            <button type="button" className="ghost" onClick={keep}>
+            <Button type="button" onClick={keep}>
               撤销
-            </button>
+            </Button>
           )}
         </div>
         {hint && <p className="hint">{hint}</p>}

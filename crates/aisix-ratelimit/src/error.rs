@@ -89,13 +89,6 @@ pub enum RateLimitError {
     },
     #[error("concurrency limit exceeded")]
     Concurrency { detail: LimitDetail },
-    /// Cumulative spend allowance used up.
-    ///
-    /// Carries no retry-after on purpose: unlike a window this does not come
-    /// back on its own, so telling the caller to wait would be telling them
-    /// something untrue. Someone has to raise the granted figure.
-    #[error("spend allowance exhausted")]
-    AllowanceExhausted,
 }
 
 impl RateLimitError {
@@ -104,27 +97,20 @@ impl RateLimitError {
             RateLimitError::Requests { scope, .. } => *scope,
             RateLimitError::Tokens { scope, .. } => *scope,
             RateLimitError::Concurrency { .. } => RateLimitScope::Requests,
-            RateLimitError::AllowanceExhausted => RateLimitScope::Tokens,
         }
     }
 
     /// The limit that fired, for the `x-ratelimit-*` headers on the 429.
-    ///
-    /// `None` for an exhausted allowance: it is a sum of money with no
-    /// window and no reset, so the trio would have to invent its numbers.
-    pub fn detail(&self) -> Option<LimitDetail> {
+    pub fn detail(&self) -> LimitDetail {
         match self {
             RateLimitError::Requests { detail, .. }
             | RateLimitError::Tokens { detail, .. }
-            | RateLimitError::Concurrency { detail } => Some(*detail),
-            RateLimitError::AllowanceExhausted => None,
+            | RateLimitError::Concurrency { detail } => *detail,
         }
     }
 
     pub fn retry_after_secs(&self) -> Option<u64> {
-        // 补额是人的动作，不是等待 —— 给一个 retry-after 等于告诉调用方
-        // 一件不实的事。
-        self.detail().map(|d| d.reset_secs)
+        Some(self.detail().reset_secs)
     }
 }
 
@@ -140,10 +126,9 @@ mod tests {
         };
         assert_eq!(e.scope(), RateLimitScope::Requests);
         assert_eq!(e.retry_after_secs(), Some(42));
-        let detail = e.detail().unwrap();
-        assert_eq!(detail.dimension, "rpm");
-        assert_eq!(detail.limit, 10);
-        assert_eq!(detail.remaining, 0);
+        assert_eq!(e.detail().dimension, "rpm");
+        assert_eq!(e.detail().limit, 10);
+        assert_eq!(e.detail().remaining, 0);
     }
 
     #[test]
@@ -156,23 +141,12 @@ mod tests {
             detail: LimitDetail::concurrency(8, 8),
         };
         assert_eq!(e.retry_after_secs(), Some(CONCURRENCY_RETRY_AFTER_SECS));
-        let detail = e.detail().unwrap();
-        assert_eq!(detail.dimension, "concurrency");
-        assert_eq!(detail.limit, 8);
-        assert_eq!(detail.remaining, 0);
+        assert_eq!(e.detail().dimension, "concurrency");
+        assert_eq!(e.detail().limit, 8);
+        assert_eq!(e.detail().remaining, 0);
         // Concurrency rejections still label the rejection metric with
         // the request scope — the metric's label set is unchanged.
         assert_eq!(e.scope(), RateLimitScope::Requests);
-    }
-
-    /// 额度用尽不会自己回来：不给 retry-after，也不报一组编出来的限额数字。
-    /// 指标上仍然归在 token 一侧。
-    #[test]
-    fn an_exhausted_allowance_reports_no_retry_hint_and_no_limit() {
-        let e = RateLimitError::AllowanceExhausted;
-        assert_eq!(e.retry_after_secs(), None);
-        assert_eq!(e.detail(), None);
-        assert_eq!(e.scope(), RateLimitScope::Tokens);
     }
 
     #[test]

@@ -268,6 +268,8 @@ export async function startPlatformUpstream(
 
 /** A gateway answer, read whole: status, headers and body text. */
 export interface GatewayAnswer {
+  /** The path the request was sent to. */
+  path: string;
   status: number;
   headers: Headers;
   text: string;
@@ -307,5 +309,18 @@ export async function callGateway(
   } catch {
     json = undefined;
   }
-  return { status: res.status, headers: res.headers, text, json };
+  return { path, status: res.status, headers: res.headers, text, json };
+}
+
+/**
+ * The answer's body with the ids the upstream issued taken out, on the two
+ * surfaces where those pass through to the caller unchanged: Chat Completions
+ * and Messages (the response id, tool-call and tool-use ids), buffered or
+ * streamed. Responses ids stay in, because they are sealed and name no
+ * channel; so does everything else a body carries.
+ */
+export function textWithoutPassedThroughIds(answer: GatewayAnswer): string {
+  const passes = answer.path === "/v1/chat/completions" || answer.path === "/v1/messages";
+  if (!passes) return answer.text;
+  return answer.text.replace(/"(id|tool_use_id|tool_call_id|tool_id)"\s*:\s*"[^"]*"/g, '"$1":"-"');
 }

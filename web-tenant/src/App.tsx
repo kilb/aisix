@@ -11,6 +11,10 @@ import {
 } from "./lib/api";
 import { EXPECTED_API_CONTRACT } from "./lib/contract";
 import { messageFor } from "./lib/errors";
+import { useTheme } from "./lib/useTheme";
+import { Button } from "./ui/Button";
+import { RouteNav } from "./ui/RouteNav";
+import { ThemeToggle } from "./ui/ThemeToggle";
 import { Gate } from "./Gate";
 import { Keys } from "./Keys";
 import { Members } from "./Members";
@@ -67,6 +71,7 @@ export function App({ inviteToken }: { inviteToken: string | null }) {
   /** Why the gate is showing again, when a session ended under the member. */
   const [notice, setNotice] = useState<string | null>(null);
   const [tab, setTab] = useState<TabId>("org");
+  const [theme, toggleTheme] = useTheme();
 
   // Any page's request that finds the session gone drops back to the gate:
   // what was on screen is no longer the member's to see or act on. (The
@@ -131,9 +136,9 @@ export function App({ inviteToken }: { inviteToken: string | null }) {
       <div className="centered">
         <div className="note crit" role="alert">
           <strong>无法读取登录状态。</strong> {bootError}{" "}
-          <button className="ghost" onClick={() => void boot()}>
+          <Button size="sm" icon="refresh" onClick={() => void boot()}>
             重试
-          </button>
+          </Button>
         </div>
       </div>
     );
@@ -161,6 +166,8 @@ export function App({ inviteToken }: { inviteToken: string | null }) {
   if (!me || invite !== null) {
     return (
       <Gate
+        theme={theme}
+        onToggleTheme={toggleTheme}
         invite={invite}
         signedIn={me !== null}
         notice={notice}
@@ -175,50 +182,59 @@ export function App({ inviteToken }: { inviteToken: string | null }) {
   const current: TabId = visible.some((t) => t.id === tab) ? tab : "org";
 
   return (
-    <div className="frame">
-      <header className="book-head">
-        <h1>{tenant.name}</h1>
-        <span className="sub">AISIX 组织门户</span>
-        <div className="tools">
-          <span className="pill" title={member.email}>
-            {member.display_name || member.email} · {ROLE_LABEL[member.role] ?? member.role}
+    <div className="shell">
+      <header className="topbar">
+        <div className="wrap">
+          <span className="brand">
+            <span className="mark">AISIX</span> <span className="app">组织门户</span>
           </span>
-          <button className="ghost" onClick={() => void signOut()}>
-            登出
-          </button>
+          <h1 className="org-name" title={tenant.name}>
+            {tenant.name}
+          </h1>
+          {/* The separator stays in the text (and in what a screen reader
+              hears); on screen the role reads as a tag after the name. */}
+          <span className="me" title={member.email}>
+            <span className="me-name">{member.display_name || member.email}</span>
+            <span className="vh"> · </span>
+            <span className="tag">{ROLE_LABEL[member.role] ?? member.role}</span>
+          </span>
+          <span className="tools">
+            <ThemeToggle theme={theme} onToggle={toggleTheme} />
+            <Button kind="quiet" size="sm" onClick={() => void signOut()}>
+              登出
+            </Button>
+          </span>
         </div>
       </header>
 
       {signOutError && (
-        <div className="note crit" role="alert">
-          {signOutError}
+        <div className="wrap">
+          <div className="note crit signout-err" role="alert">
+            {signOutError}
+          </div>
         </div>
       )}
 
       {visible.length > 0 && (
-        <nav className="tabs" role="tablist" aria-label="组织门户分区">
-          {visible.map((t) => (
-            <button
-              key={t.id}
-              role="tab"
-              data-tab={t.id}
-              aria-selected={current === t.id}
-              onClick={() => setTab(t.id)}
-            >
-              {t.label}
-            </button>
-          ))}
-        </nav>
+        <div className="wrap route-bar">
+          <RouteNav label="组织门户分区" items={visible} current={current} onSelect={setTab} docked />
+        </div>
       )}
 
-      <main>
-        {current === "keys" ? (
-          <Keys member={member} status={tenant.status} onSelfChanged={() => void boot()} />
-        ) : current === "members" ? (
-          <Members member={member} status={tenant.status} onSelfChanged={() => void boot()} onLeft={leave} />
-        ) : (
-          <Org member={member} status={tenant.status} />
-        )}
+      <main className="wrap page">
+        <section
+          id={`tab-${current}`}
+          role={visible.length > 0 ? "tabpanel" : undefined}
+          aria-labelledby={visible.length > 0 ? `stop-${current}` : undefined}
+        >
+          {current === "keys" ? (
+            <Keys member={member} status={tenant.status} onSelfChanged={() => void boot()} />
+          ) : current === "members" ? (
+            <Members member={member} status={tenant.status} onSelfChanged={() => void boot()} onLeft={leave} />
+          ) : (
+            <Org member={member} status={tenant.status} />
+          )}
+        </section>
       </main>
     </div>
   );

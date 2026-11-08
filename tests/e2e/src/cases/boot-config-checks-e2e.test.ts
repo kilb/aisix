@@ -22,9 +22,11 @@ const STILL_RUNNING_AFTER_MS = 3_000;
 
 const RESOURCES = '_format_version: "1"\n';
 
-/** Boot with `extra` merged into a minimal file-mode config; return exit code and output. */
+/** Boot with `extra` merged into a minimal file-mode config, and `extraEnv` added to the
+ * environment; return exit code and output. */
 async function boot(
   extra: Record<string, unknown>,
+  extraEnv: Record<string, string> = {},
 ): Promise<{ code: number | null; logs: string }> {
   const dir = await mkdtemp(join(tmpdir(), "aisix-boot-checks-"));
   try {
@@ -44,6 +46,7 @@ async function boot(
     for (const [k, v] of Object.entries(process.env)) {
       if (v !== undefined && !k.startsWith("AISIX_")) env[k] = v;
     }
+    Object.assign(env, extraEnv);
     try {
       const ok = await execFileP(BIN_PATH, ["--config", cfgPath], {
         env,
@@ -121,20 +124,40 @@ describe("a request body limit of null", () => {
   });
 });
 
-describe("a metric label selection without what billing reads", () => {
-  test("stops the boot, naming the label and why it is kept", async () => {
-    const { code, logs } = await boot({
-      observability: {
-        metrics: {
-          prometheus: { enabled: false },
-          labels: { aisix_llm_spend_micro_usd_total: ["endpoint", "model"] },
-        },
-      },
+describe("platform mode at boot", () => {
+  const SECRET_ENV = "BOOT_CHECKS_PLATFORM_SECRET";
+  // 32 random bytes as hex digits, the form the gateway requires.
+  const STRONG = "9c1d7e44b2a05f3866e1d0c47a9b2f5e13c8d6a0f4b7e2918d5c3a6f0e7b4d21";
+  const WEAK = "a short passphrase, do not print";
+  const platform = (extra: Record<string, unknown> = {}) => ({
+    proxy: {
+      addr: "127.0.0.1:0",
+      ...extra,
+      platform: { enabled: true, id_key_env: SECRET_ENV },
+    },
+  });
+
+  test("a secret that is not 32 random bytes stops the boot, naming the variable and not its value", async () => {
+    const { code, logs } = await boot(platform(), { [SECRET_ENV]: WEAK });
+    expect(code, logs).not.toBe(0);
+    expect(logs).toContain("proxy.platform.id_key_env");
+    expect(logs).toContain(SECRET_ENV);
+    expect(logs).not.toContain(WEAK);
+  });
+
+  test("debug headers stop the boot, naming the key and not the secret", async () => {
+    const { code, logs } = await boot(platform({ expose_debug_headers: true }), {
+      [SECRET_ENV]: STRONG,
     });
     expect(code, logs).not.toBe(0);
-    expect(logs).toContain("aisix_llm_spend_micro_usd_total");
-    expect(logs).toContain("user_id");
-    expect(logs).toContain("portal");
+    expect(logs).toContain("proxy.expose_debug_headers");
+    expect(logs).not.toContain(STRONG);
+  });
+
+  test("a strong secret without debug headers boots, and its value is never logged", async () => {
+    const { code, logs } = await boot(platform(), { [SECRET_ENV]: STRONG });
+    // Up until the test stopped it.
+    expect(code, logs).toBe(0);
+    expect(logs).not.toContain(STRONG);
   });
 });
-

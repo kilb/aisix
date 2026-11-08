@@ -7,7 +7,13 @@ import { messageFor } from "../lib/errors";
 import { errorText } from "../lib/fmt";
 import { defaultAt, enumAt, loadSchema, SchemaShapeError, valueDescriptionsAt } from "../lib/schema";
 import { useResource } from "../lib/useResource";
-import { Failure, TwoStep } from "./Tenants";
+import { Failure } from "./Tenants";
+import { Button } from "../ui/Button";
+import { useRefusalFocus } from "../ui/Field";
+import { DataTable, Loading } from "../ui/DataTable";
+import { EmptyState } from "../ui/EmptyState";
+import { Lamp } from "../ui/Lamp";
+import { TwoStep } from "../ui/TwoStep";
 
 /** A cache policy document; fields the form does not show are kept as stored. */
 interface CachePolicyDoc {
@@ -80,10 +86,13 @@ export function Cache({ canEdit, onGoto }: TabProps) {
   const [failure, setFailure] = useState<{ text: string; details: Detail[] } | null>(null);
   const [conflict, setConflict] = useState(false);
   const [busy, setBusy] = useState(false);
+  // The policy whose delete is in flight.
+  const [removing, setRemoving] = useState<string | null>(null);
   // A refused delete, shown on the row it was asked on.
   const [deleteFailure, setDeleteFailure] = useState<{ id: string; error: unknown } | null>(null);
   const scopeProblemId = useId();
   const ttlProblemId = useId();
+  const [panel, focusRefusal] = useRefusalFocus<HTMLDivElement>();
 
   useEffect(() => {
     let live = true;
@@ -188,6 +197,7 @@ export function Cache({ canEdit, onGoto }: TabProps) {
       void policies.watch(view.id).catch(() => undefined);
     } catch (e) {
       refused(e);
+      focusRefusal();
     } finally {
       setBusy(false);
     }
@@ -195,6 +205,7 @@ export function Cache({ canEdit, onGoto }: TabProps) {
 
   async function remove(p: ResourceView<CachePolicyDoc>) {
     setBusy(true);
+    setRemoving(p.id);
     setDeleteFailure(null);
     try {
       await policies.remove(p.id, p.version);
@@ -203,6 +214,7 @@ export function Cache({ canEdit, onGoto }: TabProps) {
       setDeleteFailure({ id: p.id, error: e });
     } finally {
       setBusy(false);
+      setRemoving(null);
     }
   }
 
@@ -234,17 +246,17 @@ export function Cache({ canEdit, onGoto }: TabProps) {
       <div className="panel">
         <h2>
           缓存策略
-          <button
+          <Button
+            size="sm"
             type="button"
-            className="ghost"
-            style={{ marginLeft: "auto" }}
+            icon="refresh"
             onClick={() => {
               void policies.reload();
               void models.reload();
             }}
           >
             刷新
-          </button>
+          </Button>
         </h2>
         <p className="hint">
           命中缓存的请求直接由网关应答，不再转发给上游。平台部署中缓存条目只在同一租户的 API 密钥之间共享（team 范围）。
@@ -256,9 +268,9 @@ export function Cache({ canEdit, onGoto }: TabProps) {
         )}
         {canEdit && (
           <div className="r">
-            <button type="button" className="act" disabled={!options} onClick={startNew}>
+            <Button kind="primary" type="button" disabled={!options} onClick={startNew}>
               新建缓存策略
-            </button>
+            </Button>
           </div>
         )}
         {policies.error && (
@@ -266,67 +278,69 @@ export function Cache({ canEdit, onGoto }: TabProps) {
             {messageFor(policies.error)}
           </div>
         )}
-        {policies.items === null && !policies.error && <p className="hint">载入中…</p>}
-        {policies.items !== null && policies.items.length === 0 && <p className="hint">还没有缓存策略。</p>}
+        {policies.items === null && !policies.error && <Loading />}
+        {policies.items !== null && policies.items.length === 0 && <EmptyState text="还没有缓存策略。" />}
         {policies.items !== null && policies.items.length > 0 && (
-          <div className="scroll">
-            <table>
-              <thead>
-                <tr>
-                  <th>名称</th>
-                  <th>范围</th>
-                  <th>作用于</th>
-                  <th className="right">缓存时长（秒）</th>
-                  <th>启用</th>
-                  <th>下发状态</th>
-                  <th />
+          <DataTable>
+            <thead>
+              <tr>
+                <th>名称</th>
+                <th>范围</th>
+                <th>作用于</th>
+                <th className="right">缓存时长（秒）</th>
+                <th>启用</th>
+                <th>下发状态</th>
+                <th />
+              </tr>
+            </thead>
+            <tbody>
+              {policies.items.map((p) => (
+                <tr key={p.id}>
+                  <td>{p.doc.name}</td>
+                  <td>
+                    <code>{p.doc.scope ?? "—"}</code>
+                  </td>
+                  <td>{appliesToText(p.doc)}</td>
+                  <td className="right">{p.doc.ttl_seconds ?? "—"}</td>
+                  <td>
+                    <Lamp state={p.doc.enabled === false ? "disabled" : "applied"}>{p.doc.enabled === false ? "否" : "是"}</Lamp>
+                  </td>
+                  <td>
+                    <RolloutBadge rollout={p.rollout} />
+                  </td>
+                  <td className="right">
+                    <Button size="sm" type="button" onClick={() => open(p)}>
+                      {canEdit && p.doc.scope !== ENV_SCOPE ? "编辑" : "查看"}
+                    </Button>
+                    {canEdit && (
+                      <TwoStep
+                        label="删除"
+                        size="sm"
+                        disabled={busy}
+                        busy={removing === p.id}
+                        warning={`删除「${p.doc.name ?? p.id}」后，它覆盖的请求不再由网关缓存应答。`}
+                        onConfirm={() => void remove(p)}
+                      />
+                    )}
+                    {deleteFailure?.id === p.id && (
+                      <Failure
+                        error={deleteFailure.error}
+                        onReload={() => {
+                          setDeleteFailure(null);
+                          void policies.reload();
+                        }}
+                      />
+                    )}
+                  </td>
                 </tr>
-              </thead>
-              <tbody>
-                {policies.items.map((p) => (
-                  <tr key={p.id}>
-                    <td>{p.doc.name}</td>
-                    <td>
-                      <code>{p.doc.scope ?? "—"}</code>
-                    </td>
-                    <td>{appliesToText(p.doc)}</td>
-                    <td className="right">{p.doc.ttl_seconds ?? "—"}</td>
-                    <td>{p.doc.enabled === false ? "否" : "是"}</td>
-                    <td>
-                      <RolloutBadge rollout={p.rollout} />
-                    </td>
-                    <td className="right">
-                      <button type="button" className="ghost" onClick={() => open(p)}>
-                        {canEdit && p.doc.scope !== ENV_SCOPE ? "编辑" : "查看"}
-                      </button>
-                      {canEdit && (
-                        <TwoStep
-                          label="删除"
-                          disabled={busy}
-                          warning={`删除「${p.doc.name ?? p.id}」后，它覆盖的请求不再由网关缓存应答。`}
-                          onConfirm={() => void remove(p)}
-                        />
-                      )}
-                      {deleteFailure?.id === p.id && (
-                        <Failure
-                          error={deleteFailure.error}
-                          onReload={() => {
-                            setDeleteFailure(null);
-                            void policies.reload();
-                          }}
-                        />
-                      )}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+              ))}
+            </tbody>
+          </DataTable>
         )}
       </div>
 
       {form && (
-        <div className="panel">
+        <div ref={panel} className="panel">
           <h2>
             {form.id === null ? "新建缓存策略" : `缓存策略 ${form.base.name ?? ""}`}
             {current && <RolloutBadge rollout={current.rollout} />}
@@ -335,9 +349,9 @@ export function Cache({ canEdit, onGoto }: TabProps) {
             <div className="note warn">
               {ENV_NOTE}{" "}
               {canEdit && (
-                <button type="button" className="ghost" onClick={() => onGoto("resources")}>
+                <Button type="button" onClick={() => onGoto("resources")}>
                   到「全部资源」修改
-                </button>
+                </Button>
               )}
             </div>
           )}
@@ -435,13 +449,20 @@ export function Cache({ canEdit, onGoto }: TabProps) {
           )}
           <div className="r">
             {!readOnly && (
-              <button type="button" className="act" disabled={busy || ttlMissing} onClick={() => void submit()}>
+              <Button
+                kind="primary"
+                type="button"
+                disabled={busy || ttlMissing}
+                busy={busy && removing === null}
+                busyLabel="保存"
+                onClick={() => void submit()}
+              >
                 保存
-              </button>
+              </Button>
             )}
-            <button type="button" className="ghost" onClick={() => setForm(null)}>
+            <Button type="button" onClick={() => setForm(null)}>
               {readOnly ? "关闭" : "取消"}
-            </button>
+            </Button>
           </div>
         </div>
       )}

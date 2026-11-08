@@ -1,23 +1,17 @@
-//! Platform mode: response and tool-call ids that name no upstream channel.
+//! Platform mode: Responses ids that name no upstream channel and belong to
+//! one tenant.
 //!
-//! An upstream's own ids can say which channel served a response: a cloud
-//! platform that resells a model often marks the ids it hands out. In
-//! platform mode none of them reaches a tenant, and multi-turn tool use keeps
-//! working on every protocol:
+//! A Responses output item's ids are sealed reversibly ([`Sealer`]) and
+//! unsealed on their way back in ([`unseal_responses_input`]): that protocol
+//! cannot take a substitute id, see there. An item id keeps its upstream's
+//! prefix, and a call id is shown behind a fixed `call_` ([`IdKind`]). The
+//! seal is what keeps one tenant's ids from opening for another; every id is
+//! restored before the upstream sees the request, so it gets back exactly
+//! what it issued.
 //!
-//! - A Chat Completions or Messages response id is minted fresh
-//!   ([`mint_response_id`]), one per response, shared by every frame of a
-//!   stream.
-//! - A Chat Completions or Messages tool-call id is mapped one way
-//!   ([`map_tool_call_id`]), and so are a Messages answer's server and MCP
-//!   tool-use ids ([`map_messages_tool_id`]). Both protocols carry the whole
-//!   conversation on every request, and an upstream pairs a tool call with
-//!   its result only inside that one request, so the mapped id travels
-//!   upstream unchanged on the next turn and still pairs.
-//! - A Responses output item's ids are sealed reversibly ([`Sealer`]) and
-//!   unsealed on their way back in ([`unseal_responses_input`]): that protocol
-//!   cannot take a substitute id, see there. An item id keeps its upstream's
-//!   prefix, and a call id is shown behind a fixed `call_` ([`IdKind`]).
+//! Chat Completions and Messages ids pass through as the upstream issued
+//! them, in platform mode as without it: an upstream that signs its reasoning
+//! must get back exactly the ids and blocks it issued.
 //!
 //! The usage event keeps the upstream's own id as `provider_request_id`;
 //! every rewrite here runs after telemetry has read the response.
@@ -26,131 +20,7 @@ use base64::Engine as _;
 use ring::{aead, hmac};
 use serde_json::Value;
 
-use crate::json_splice::{self, PathSeg};
-
-/// The client-facing protocols whose ids are rewritten one way.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Surface {
-    Chat,
-    Messages,
-}
-
-impl Surface {
-    /// Domain separation for [`map_tool_call_id`].
-    fn label(self) -> &'static [u8] {
-        match self {
-            Surface::Chat => b"chat",
-            Surface::Messages => b"messages",
-        }
-    }
-
-    fn response_id_prefix(self) -> &'static str {
-        match self {
-            Surface::Chat => "chatcmpl-",
-            Surface::Messages => "msg_",
-        }
-    }
-
-    fn tool_call_id_prefix(self) -> &'static str {
-        match self {
-            Surface::Chat => "call_",
-            Surface::Messages => "toolu_",
-        }
-    }
-}
-
-/// A fresh response id in the surface's own shape.
-pub(crate) fn mint_response_id(surface: Surface) -> String {
-    format!(
-        "{}{}",
-        surface.response_id_prefix(),
-        uuid::Uuid::new_v4().simple()
-    )
-}
-
-/// The id a tenant sees for an upstream tool-call id: the first 16 bytes of
-/// `HMAC-SHA256(id_key, surface || 0x00 || upstream_id)` in hex, behind the
-/// surface's tool-call prefix. The same input always maps to the same id.
-/// `key` is the platform's HMAC key
-/// ([`crate::platform::PlatformSettings::tool_id_key`]), set up once.
-pub(crate) fn map_tool_call_id(key: &hmac::Key, surface: Surface, upstream_id: &str) -> String {
-    mapped_id(key, surface, surface.tool_call_id_prefix(), upstream_id)
-}
-
-/// [`map_tool_call_id`]'s HMAC behind `prefix`. An id already in that form,
-/// `prefix` and 32 lowercase hex digits, is left as it is: only the caller's
-/// own history carries one, and an upstream that echoes it back (a Messages
-/// `pause_turn` continuation, a code-execution `caller.tool_id`) must still
-/// pair with it.
-fn mapped_id(key: &hmac::Key, surface: Surface, prefix: &str, upstream_id: &str) -> String {
-    if is_mapped_form(prefix, upstream_id) {
-        return upstream_id.to_string();
-    }
-    let mut ctx = hmac::Context::with_key(key);
-    for part in [surface.label(), &[0], upstream_id.as_bytes()] {
-        ctx.update(part);
-    }
-    let tag = ctx.sign();
-    let mut id = String::with_capacity(prefix.len() + 32);
-    id.push_str(prefix);
-    for byte in &tag.as_ref()[..16] {
-        id.push_str(&format!("{byte:02x}"));
-    }
-    id
-}
-
-/// The families of tool-use id a Messages answer carries, longest first: a
-/// server tool's (`srvtoolu_`), an MCP tool's (`mcptoolu_`) and a client
-/// tool's (`toolu_`).
-const MESSAGES_TOOL_ID_FAMILIES: [&str; 3] = ["srvtoolu_", "mcptoolu_", "toolu_"];
-
-/// The id a tenant sees for a Messages tool-use id: [`map_tool_call_id`]'s
-/// HMAC behind the family prefix the upstream id starts with, and `toolu_`
-/// when it starts with none. A client tool's id therefore maps exactly as
-/// [`map_tool_call_id`] maps it, and a server tool's keeps the `srvtoolu_`
-/// the Messages API requires of it on the next turn (the request pattern
-/// `^srvtoolu_[a-zA-Z0-9_]+$` of a `server_tool_use` block's `id`, a server
-/// tool result's `tool_use_id` and a `caller`'s `tool_id`,
-/// <https://platform.claude.com/docs/en/api/messages>).
-pub(crate) fn map_messages_tool_id(key: &hmac::Key, upstream_id: &str) -> String {
-    let prefix = MESSAGES_TOOL_ID_FAMILIES
-        .iter()
-        .find(|family| upstream_id.starts_with(*family))
-        .copied()
-        .unwrap_or(Surface::Messages.tool_call_id_prefix());
-    mapped_id(key, Surface::Messages, prefix, upstream_id)
-}
-
-/// Whether `id` is `prefix` followed by exactly 32 lowercase hex digits: the
-/// form [`mapped_id`] writes, and [`mint_response_id`] too.
-fn is_mapped_form(prefix: &str, id: &str) -> bool {
-    id.strip_prefix(prefix).is_some_and(|rest| {
-        rest.len() == 32
-            && rest
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-    })
-}
-
-/// Whether `id` has the shape of an id this module mints or maps on `surface`.
-#[cfg(test)]
-pub(crate) fn is_platform_id(surface: Surface, id: &str) -> bool {
-    [surface.response_id_prefix(), surface.tool_call_id_prefix()]
-        .iter()
-        .any(|prefix| is_mapped_form(prefix, id))
-}
-
-/// Map the `id` of every call in an OpenAI-shape `tool_calls` list. A
-/// streamed continuation carries no id, and an empty one is left empty.
-pub(crate) fn map_tool_calls(key: &hmac::Key, surface: Surface, calls: &mut [Value]) {
-    for call in calls {
-        if let Some(Value::String(id)) = call.get_mut("id") {
-            if !id.is_empty() {
-                *id = map_tool_call_id(key, surface, id);
-            }
-        }
-    }
-}
+use crate::json_splice::{PathSeg, Retain};
 
 fn hmac_parts(key: &[u8], parts: &[&[u8]]) -> hmac::Tag {
     let mut ctx = hmac::Context::with_key(&hmac::Key::new(hmac::HMAC_SHA256, key));
@@ -168,7 +38,7 @@ pub(crate) fn derive_key(key: &[u8], label: &[u8]) -> [u8; 32] {
 }
 
 /// The key [`seal_id`] takes, derived from the platform `id_key` under its
-/// own label so the seal never shares a key with [`map_tool_call_id`].
+/// own label so the seal never uses the id key itself.
 pub(crate) fn seal_key(id_key: &[u8; 32]) -> [u8; 32] {
     derive_key(id_key, b"seal-v1")
 }
@@ -195,6 +65,15 @@ pub(crate) enum IdKind {
     /// Completions or Messages upstream that served it, and that id's prefix
     /// (`tooluse_`, `toolu_`, `call_`) names the channel.
     Call,
+    /// The container a hosted tool ran in: a `code_interpreter_call`'s
+    /// `container_id`, and the `container_id` of a shell call's
+    /// `container_reference` environment (openai-python 3.41.0
+    /// `types/responses/response_code_interpreter_tool_call.py`,
+    /// `response_container_reference.py`). The seal keeps the upstream's
+    /// own prefix, as an item id's does. Unlike an item or call id, it is
+    /// never passed upstream unopened: a container is an object the
+    /// upstream stores ([`with_own_containers`]).
+    Container,
 }
 
 impl IdKind {
@@ -204,13 +83,14 @@ impl IdKind {
         match self {
             IdKind::Item => b'i',
             IdKind::Call => b'c',
+            IdKind::Container => b'k',
         }
     }
 
     /// The prefix a seal of `id` is shown behind.
     fn shown_prefix(self, id: &str) -> &str {
         match self {
-            IdKind::Item => kept_prefix(id),
+            IdKind::Item | IdKind::Container => kept_prefix(id),
             IdKind::Call => CALL_PREFIX,
         }
     }
@@ -421,7 +301,7 @@ impl Sealer {
         match kind {
             // The payload's alphabet includes `_`, so an id sealed without a
             // prefix is also tried whole.
-            IdKind::Item => id
+            IdKind::Item | IdKind::Container => id
                 .find('_')
                 .and_then(|end| self.open(kind, &id[..=end], &id[end + 1..]))
                 .or_else(|| self.open(kind, "", id)),
@@ -482,32 +362,54 @@ pub(crate) fn unseal_call(key: &[u8; 32], owner: &str, id: &str) -> Option<Strin
 }
 
 /// The kind of id a field of a Responses item holds, for the fields that
-/// name an item or a call — the values a client echoes back in a later
-/// request's `input[]`.
+/// name an item, a call or a container — the values a client echoes back in
+/// a later request's `input[]`.
 fn item_field_kind(field: &str) -> Option<IdKind> {
     match field {
         "id" | "approval_request_id" => Some(IdKind::Item),
         "call_id" => Some(IdKind::Call),
+        "container_id" => Some(IdKind::Container),
         _ => None,
     }
 }
 
+/// Where an item names its container, as JSON pointers into the item: a
+/// code interpreter call's own `container_id`, and a shell call's
+/// `environment`.
+const CONTAINER_SLOTS: [&str; 2] = ["/container_id", "/environment/container_id"];
+
 /// Run `visit` over every id field of one item, with the kind it holds. A
-/// `caller` object's `caller_id` names a call.
+/// `caller` object's `caller_id` names a call, and so does the `id` of a
+/// `local_shell_call_output`: that item has no `call_id`, and its `id` is the
+/// call id of the `local_shell_call` it answers (openai-python 3.41.0
+/// `types/responses/response_input_item_param.py`, `LocalShellCallOutput`).
+/// An `environment` object's `container_id` names a container
+/// ([`CONTAINER_SLOTS`]).
 fn for_each_item_id(item: &mut Value, mut visit: impl FnMut(IdKind, &mut String)) {
+    let names_call_by_id =
+        item.get("type").and_then(Value::as_str) == Some("local_shell_call_output");
     let Value::Object(map) = item else {
         return;
     };
     for (field, value) in map.iter_mut() {
         match value {
             Value::String(s) => {
-                if let Some(kind) = item_field_kind(field) {
+                let kind = match field.as_str() {
+                    "id" if names_call_by_id => Some(IdKind::Call),
+                    field => item_field_kind(field),
+                };
+                if let Some(kind) = kind {
                     visit(kind, s);
                 }
             }
             Value::Object(caller) if field == "caller" => {
                 if let Some(Value::String(s)) = caller.get_mut("caller_id") {
                     visit(IdKind::Call, s);
+                }
+            }
+            Value::Object(environment) if field == "environment" => {
+                if let Some(Value::String(s)) = environment.get_mut("container_id") {
+                    visit(IdKind::Container, s);
                 }
             }
             _ => {}
@@ -574,6 +476,11 @@ pub(crate) fn responses_event_id_kind(path: &[PathSeg]) -> Option<IdKind> {
             {
                 Some(IdKind::Call)
             }
+            [PathSeg::Key(environment), PathSeg::Key(field)]
+                if environment == "environment" && field == "container_id" =>
+            {
+                Some(IdKind::Container)
+            }
             _ => None,
         }
     }
@@ -634,7 +541,9 @@ pub(crate) fn unseal_responses_input(
         // that opens (a `call_id`, a `caller`) is no warrant for it.
         let reference_id = is_item_reference(item).then(|| item.get("id").cloned());
         for_each_item_id(item, |kind, slot| {
-            if slot.len() < MIN_SEALED_LEN {
+            // A container opens where the stored-object check runs
+            // ([`with_own_containers`]).
+            if kind == IdKind::Container || slot.len() < MIN_SEALED_LEN {
                 return;
             }
             let sealer = sealer.get_or_insert_with(|| Sealer::of(platform, owner));
@@ -655,248 +564,194 @@ pub(crate) fn unseal_responses_input(
     unopened_reference
 }
 
+/// Run `check`, the stored-object refusal of a `/v1/responses` request, with
+/// every container this tenant's own seal names taken out of `input[]`, then
+/// give the upstream back the container ids it issued. With platform mode
+/// off, `check` runs on the body as sent.
+///
+/// A container is an object the upstream stores, so the stored-object check
+/// refuses a request that names one (`crate::stored_refs`). But the
+/// container of a code interpreter or shell call the gateway handed this
+/// tenant is the tenant's own: the stateless way to continue a conversation
+/// sends the earlier output back in `input[]` (openai-python 3.41.0
+/// `types/responses/response_code_interpreter_tool_call_param.py:43`, where
+/// `container_id` is required), and an automatic container "reuses an active
+/// container that was used by a previous `code_interpreter_call` item in the
+/// model's context"
+/// (<https://developers.openai.com/api/docs/guides/tools-code-interpreter>).
+/// So such a container id is opened here, kept out of `check`'s sight, and
+/// written back as the upstream's own id afterwards, whatever `check` said.
+/// A container id that does not open (a bare upstream id, another tenant's
+/// seal, a forged one) stays where it is, and `check` refuses it as before.
+///
+/// Runs where the stored-object check runs, before guardrails, the cache and
+/// any upstream; the earlier unseal of item and call ids
+/// ([`unseal_responses_input`]) passes containers over. A sealer is built
+/// only when a value could be a seal.
+pub(crate) fn with_own_containers<E>(
+    platform: Option<&crate::platform::PlatformSettings>,
+    auth: &crate::auth::AuthenticatedKey,
+    body: &mut Value,
+    check: impl FnOnce(&Value) -> Result<(), E>,
+) -> Result<(), E> {
+    let Some(platform) = platform else {
+        return check(body);
+    };
+    let owner = crate::platform::tenant_owner(auth);
+    let owner = owner.as_str();
+    let mut opened: Vec<(usize, &'static str, String)> = Vec::new();
+    if let Some(items) = body.get_mut("input").and_then(Value::as_array_mut) {
+        let mut sealer: Option<Sealer> = None;
+        for (index, item) in items.iter_mut().enumerate() {
+            for slot in CONTAINER_SLOTS {
+                let Some(Value::String(id)) = item.pointer_mut(slot) else {
+                    continue;
+                };
+                if id.len() < MIN_SEALED_LEN {
+                    continue;
+                }
+                let sealer = sealer.get_or_insert_with(|| Sealer::of(platform, owner));
+                if let Some(original) = sealer.unseal(IdKind::Container, id) {
+                    // Empty names nothing, so the check passes it over.
+                    id.clear();
+                    opened.push((index, slot, original));
+                }
+            }
+        }
+    }
+    let checked = check(body);
+    for (index, slot, original) in opened {
+        if let Some(id) = body
+            .get_mut("input")
+            .and_then(|input| input.get_mut(index))
+            .and_then(|item| item.pointer_mut(slot))
+        {
+            *id = Value::String(original);
+        }
+    }
+    checked
+}
+
 /// Whether an `input[]` item is an item reference: `type` is
 /// `item_reference`, or it has no `type` and no `role`, the one item whose
 /// `type` is optional and that has no role (openai-python
 /// `types/responses/response_input_item_param.py`, `ItemReference`: "`id`:
 /// The ID of the item to reference", `type: Optional[Literal["item_reference"]]`).
+/// A `reasoning` item with an `id` and no `encrypted_content` is one too:
+/// the upstream looks its reasoning up by that id ("Item with id 'rs_…' not
+/// found", see [`unseal_responses_input`]).
 fn is_item_reference(item: &Value) -> bool {
     match item.get("type") {
+        Some(Value::String(t)) if t == "reasoning" => {
+            item.get("id").is_some()
+                && item
+                    .get("encrypted_content")
+                    .is_none_or(|content| content.is_null())
+        }
         Some(Value::String(t)) => t == "item_reference",
         None | Some(Value::Null) => item.get("role").is_none() && item.get("id").is_some(),
         Some(_) => false,
     }
 }
 
-/// The top-level member a cloud platform adds to a relayed Messages answer:
-/// its own invocation metrics, named after the platform.
-pub(crate) const CHANNEL_METRICS_KEY: &str = "amazon-bedrock-invocationMetrics";
+// What platform mode keeps of a Response object it holds parsed: the
+// members and usage counters the API's type definitions document. A member
+// an upstream adds beside them is the channel's own, and nothing a caller can
+// rely on, so it is left out. Every documented member is kept, even one only
+// some channels write (`service_tier`): it carries what a caller may act on,
+// and hiding the channel is best effort, never paid for with what the caller
+// gets. Only an answer already parsed is trimmed, buffered or built by the
+// gateway; a relayed stream frame goes out as the upstream wrote it apart
+// from its ids and model, since trimming it would cost a pass per frame.
+// Telemetry has read the upstream's answer before any of this runs.
 
-/// `doc` without a top-level [`CHANNEL_METRICS_KEY`] member, byte-preserving;
-/// `None` when it has none or cannot be read, and the caller keeps `doc`.
-pub(crate) fn strip_channel_metrics(doc: &[u8]) -> Option<Vec<u8>> {
-    let key = CHANNEL_METRICS_KEY.as_bytes();
-    if !doc.windows(key.len()).any(|w| w == key) {
-        return None;
-    }
-    match json_splice::remove_top_level_member(doc, CHANNEL_METRICS_KEY) {
-        Ok(stripped) => stripped,
-        Err(error) => {
-            tracing::debug!(%error, "channel metrics removal skipped; forwarding verbatim");
-            None
-        }
-    }
+/// A Responses `Response` object's top-level members, as openai-python
+/// 3.41.0 documents them (`types/responses/response.py`).
+fn response_member(key: &str) -> bool {
+    matches!(
+        key,
+        "id" | "access_programs"
+            | "created_at"
+            | "error"
+            | "incomplete_details"
+            | "instructions"
+            | "metadata"
+            | "model"
+            | "object"
+            | "output"
+            | "parallel_tool_calls"
+            | "temperature"
+            | "tool_choice"
+            | "tools"
+            | "top_p"
+            | "background"
+            | "completed_at"
+            | "conversation"
+            | "max_output_tokens"
+            | "max_tool_calls"
+            | "moderation"
+            | "previous_response_id"
+            | "prompt"
+            | "prompt_cache_diagnostics"
+            | "prompt_cache_key"
+            | "prompt_cache_options"
+            | "prompt_cache_retention"
+            | "reasoning"
+            | "safety_identifier"
+            | "service_tier"
+            | "status"
+            | "text"
+            | "tool_usage"
+            | "top_logprobs"
+            | "truncation"
+            | "usage"
+            | "user"
+    )
 }
 
-/// Per-response id state for an Anthropic Messages answer in platform mode:
-/// the one message id the whole response carries, and the key its tool-use
-/// ids are mapped under. Serves the native relay and the translated path.
-pub(crate) struct MessagesIds {
-    key: hmac::Key,
-    message_id: String,
+/// `types/responses/response_usage.py`.
+fn responses_usage_member(key: &str) -> bool {
+    matches!(
+        key,
+        "input_tokens"
+            | "input_tokens_details"
+            | "output_tokens"
+            | "output_tokens_details"
+            | "total_tokens"
+    )
 }
 
-#[derive(Clone, Copy)]
-enum MessagesSlot {
-    Model,
-    MessageId,
-    BlockType,
-    BlockId,
-    BlockToolUseId,
-    CallerToolId,
-}
+/// What platform mode keeps of a Response object.
+pub(crate) const RESPONSE_BODY: &[Retain<'static>] = &[
+    Retain {
+        path: &[],
+        keep: response_member,
+    },
+    Retain {
+        path: &["usage"],
+        keep: responses_usage_member,
+    },
+    Retain {
+        path: &["usage", "input_tokens_details"],
+        keep: |k| matches!(k, "cached_tokens" | "cache_write_tokens"),
+    },
+    Retain {
+        path: &["usage", "output_tokens_details"],
+        keep: |k| k == "reasoning_tokens",
+    },
+];
 
-/// Which of a content block's own ids name a tool use, by the block's type:
-/// the `id` of a `tool_use`, `server_tool_use` or `mcp_tool_use` block, and
-/// the `tool_use_id` of a block that answers one (`tool_result` and every
-/// `*_tool_result`, such as `web_search_tool_result` and `mcp_tool_result`).
-/// A `caller`'s `tool_id` names the server tool use that made the call on
-/// any block (anthropic-sdk-python `types/server_tool_caller_param.py`).
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
-struct BlockIds {
-    id: bool,
-    tool_use_id: bool,
-}
-
-impl BlockIds {
-    const ALL: Self = Self {
-        id: true,
-        tool_use_id: true,
-    };
-
-    fn of(block_type: Option<&str>) -> Self {
-        let Some(t) = block_type else {
-            return Self::default();
-        };
-        Self {
-            id: matches!(t, "tool_use" | "server_tool_use" | "mcp_tool_use"),
-            tool_use_id: t.ends_with("tool_result"),
+/// `value` with every member `rules` refuses removed from the objects they
+/// name.
+pub(crate) fn retain_value(value: &mut Value, rules: &[Retain<'_>]) {
+    for rule in rules {
+        let mut node = Some(&mut *value);
+        for step in rule.path {
+            node = node.and_then(|n| n.get_mut(*step));
         }
-    }
-
-    /// Whether `self` mapped an id `allowed` does not.
-    fn exceeds(self, allowed: Self) -> bool {
-        (self.id && !allowed.id) || (self.tool_use_id && !allowed.tool_use_id)
-    }
-}
-
-/// One splice pass over a Messages stream event.
-struct MessagesSplice {
-    spliced: Option<Vec<u8>>,
-    block_type: Option<String>,
-    mapped: BlockIds,
-}
-
-impl MessagesIds {
-    /// `tool_id_key` is the platform's
-    /// ([`crate::platform::PlatformSettings::tool_id_key`]).
-    pub(crate) fn new(tool_id_key: &hmac::Key) -> Self {
-        Self {
-            key: tool_id_key.clone(),
-            message_id: mint_response_id(Surface::Messages),
+        if let Some(Value::Object(map)) = node {
+            map.retain(|key, _| (rule.keep)(key));
         }
-    }
-
-    fn map_block(&self, block: &mut Value) {
-        let ids = BlockIds::of(block.get("type").and_then(Value::as_str));
-        let Some(map) = block.as_object_mut() else {
-            return;
-        };
-        for (field, wanted) in [("id", ids.id), ("tool_use_id", ids.tool_use_id)] {
-            if let Some(Value::String(id)) = map.get_mut(field).filter(|_| wanted) {
-                *id = map_messages_tool_id(&self.key, id);
-            }
-        }
-        if let Some(Value::String(id)) = map.get_mut("caller").and_then(|c| c.get_mut("tool_id")) {
-            *id = map_messages_tool_id(&self.key, id);
-        }
-    }
-
-    /// A buffered Messages answer: its `id`, the tool-use ids of its blocks
-    /// ([`BlockIds`]), and no channel metrics.
-    pub(crate) fn apply_to_body(&self, body: &mut Value) {
-        if let Some(Value::String(id)) = body.get_mut("id") {
-            id.clone_from(&self.message_id);
-        }
-        if let Some(blocks) = body.get_mut("content").and_then(Value::as_array_mut) {
-            for block in blocks {
-                self.map_block(block);
-            }
-        }
-        if let Some(map) = body.as_object_mut() {
-            map.remove(CHANNEL_METRICS_KEY);
-        }
-    }
-
-    /// One parsed stream event: `message_start.message.id` and the tool-use
-    /// ids of a `content_block_start`'s block.
-    pub(crate) fn apply_to_event(&self, event: &mut Value) {
-        if let Some(Value::String(id)) = event.pointer_mut("/message/id") {
-            id.clone_from(&self.message_id);
-        }
-        if let Some(block) = event.get_mut("content_block") {
-            self.map_block(block);
-        }
-        if let Some(map) = event.as_object_mut() {
-            map.remove(CHANNEL_METRICS_KEY);
-        }
-    }
-
-    /// One relayed stream event's JSON, byte-preserving: the caller-facing
-    /// `message.model` and the ids [`Self::apply_to_event`] rewrites, in one
-    /// splice pass, then any channel metrics. `None` when nothing changed or
-    /// the payload cannot be read, and the caller forwards it as it came.
-    pub(crate) fn rewrite_event_json(
-        &self,
-        payload: &[u8],
-        client_facing_model: &str,
-    ) -> Option<Vec<u8>> {
-        let spliced = match self.splice_event(payload, client_facing_model, BlockIds::ALL) {
-            // A block's id was mapped before its `type` said the block has
-            // no such tool-use id: splice again, mapping what the type says.
-            Ok(pass)
-                if pass
-                    .mapped
-                    .exceeds(BlockIds::of(pass.block_type.as_deref())) =>
-            {
-                self.splice_event(
-                    payload,
-                    client_facing_model,
-                    BlockIds::of(pass.block_type.as_deref()),
-                )
-            }
-            other => other,
-        };
-        let spliced = match spliced {
-            Ok(pass) => pass.spliced,
-            Err(error) => {
-                tracing::debug!(%error, "platform id rewrite skipped; forwarding verbatim");
-                return None;
-            }
-        };
-        strip_channel_metrics(spliced.as_deref().unwrap_or(payload)).or(spliced)
-    }
-
-    /// One splice pass, mapping the block ids `allowed` names; it reports
-    /// the block's type and the ids it mapped.
-    fn splice_event(
-        &self,
-        payload: &[u8],
-        client_facing_model: &str,
-        allowed: BlockIds,
-    ) -> Result<MessagesSplice, json_splice::SpliceError> {
-        let slot = std::cell::Cell::new(None);
-        let mut block_type: Option<String> = None;
-        let mut mapped = BlockIds::default();
-        let spliced = json_splice::rewrite_string_values(
-            payload,
-            |path| {
-                let picked = match path {
-                    [PathSeg::Key(parent), PathSeg::Key(field)] => {
-                        match (parent.as_str(), field.as_str()) {
-                            ("message", "model") => Some(MessagesSlot::Model),
-                            ("message", "id") => Some(MessagesSlot::MessageId),
-                            ("content_block", "type") => Some(MessagesSlot::BlockType),
-                            ("content_block", "id") if allowed.id => Some(MessagesSlot::BlockId),
-                            ("content_block", "tool_use_id") if allowed.tool_use_id => {
-                                Some(MessagesSlot::BlockToolUseId)
-                            }
-                            _ => None,
-                        }
-                    }
-                    [PathSeg::Key(block), PathSeg::Key(caller), PathSeg::Key(field)]
-                        if block == "content_block" && caller == "caller" && field == "tool_id" =>
-                    {
-                        Some(MessagesSlot::CallerToolId)
-                    }
-                    _ => None,
-                };
-                slot.set(picked);
-                picked.is_some()
-            },
-            |value| match slot.get()? {
-                MessagesSlot::Model => Some(client_facing_model.to_string()),
-                MessagesSlot::MessageId => Some(self.message_id.clone()),
-                MessagesSlot::BlockType => {
-                    block_type = Some(value.to_string());
-                    None
-                }
-                MessagesSlot::BlockId => {
-                    mapped.id = true;
-                    Some(map_messages_tool_id(&self.key, value))
-                }
-                MessagesSlot::BlockToolUseId => {
-                    mapped.tool_use_id = true;
-                    Some(map_messages_tool_id(&self.key, value))
-                }
-                MessagesSlot::CallerToolId => Some(map_messages_tool_id(&self.key, value)),
-            },
-        )?;
-        Ok(MessagesSplice {
-            spliced,
-            block_type,
-            mapped,
-        })
     }
 }
 
@@ -918,73 +773,8 @@ pub(crate) mod tests {
         pub(crate) static SEALS_MADE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     }
 
-    /// The HMAC key tool-call ids are mapped under, for a raw test key.
-    fn mac(key: &[u8; 32]) -> hmac::Key {
-        hmac::Key::new(hmac::HMAC_SHA256, key)
-    }
-
     fn sealers_built() -> usize {
         SEALERS_BUILT.with(std::cell::Cell::get)
-    }
-
-    #[test]
-    fn a_tool_call_id_maps_the_same_way_every_time() {
-        let k = [7u8; 32];
-        assert_eq!(
-            map_tool_call_id(&mac(&k), Surface::Messages, "toolu_bdrk_01ABC"),
-            map_tool_call_id(&mac(&k), Surface::Messages, "toolu_bdrk_01ABC")
-        );
-    }
-
-    #[test]
-    fn a_mapped_id_hides_the_channel_marker() {
-        let id = map_tool_call_id(&mac(&[7u8; 32]), Surface::Messages, "toolu_bdrk_01ABC");
-        assert!(id.starts_with("toolu_") && !id.contains("bdrk"), "{id}");
-    }
-
-    #[test]
-    fn different_upstream_ids_map_to_different_ids() {
-        let k = [7u8; 32];
-        assert_ne!(
-            map_tool_call_id(&mac(&k), Surface::Chat, "call_a"),
-            map_tool_call_id(&mac(&k), Surface::Chat, "call_b")
-        );
-    }
-
-    #[test]
-    fn mapped_ids_carry_the_surface_prefix_and_depend_on_the_key() {
-        let chat = map_tool_call_id(&mac(&K), Surface::Chat, "toolu_vrtx_01");
-        let messages = map_tool_call_id(&mac(&K), Surface::Messages, "toolu_vrtx_01");
-        assert!(chat.starts_with("call_"), "{chat}");
-        assert!(is_platform_id(Surface::Chat, &chat), "{chat}");
-        assert!(is_platform_id(Surface::Messages, &messages), "{messages}");
-        assert_ne!(
-            chat.trim_start_matches("call_"),
-            messages.trim_start_matches("toolu_"),
-            "each surface maps under its own label"
-        );
-        assert_ne!(
-            chat,
-            map_tool_call_id(&mac(&[8u8; 32]), Surface::Chat, "toolu_vrtx_01")
-        );
-    }
-
-    #[test]
-    fn minted_response_ids_carry_the_surface_prefix_and_never_repeat() {
-        let a = mint_response_id(Surface::Chat);
-        let b = mint_response_id(Surface::Chat);
-        assert!(
-            a.starts_with("chatcmpl-") && is_platform_id(Surface::Chat, &a),
-            "{a}"
-        );
-        assert_ne!(a, b);
-        let m = mint_response_id(Surface::Messages);
-        assert!(
-            m.starts_with("msg_") && is_platform_id(Surface::Messages, &m),
-            "{m}"
-        );
-        assert!(!is_platform_id(Surface::Messages, "msg_bdrk_01X"));
-        assert!(!is_platform_id(Surface::Chat, "chatcmpl-up"));
     }
 
     #[test]
@@ -1421,6 +1211,70 @@ pub(crate) mod tests {
         assert_eq!(plain, json!({"model": "m", "input": "hi"}));
     }
 
+    /// A typed `reasoning` item with an `id` and no `encrypted_content` has
+    /// the upstream look the reasoning up by that id ("Item with id 'rs_…'
+    /// not found"), so it is a reference to a stored item like any other:
+    /// refused unless the id is the tenant's own seal. With its encrypted
+    /// content it carries itself and is not a reference.
+    #[test]
+    fn a_reasoning_item_named_only_by_its_id_is_a_reference() {
+        let platform = crate::platform::PlatformSettings::from_secret("s");
+        let k = seal_key(&platform.id_key);
+        let run = |input: Value| {
+            let mut body = json!({"model": "m", "input": input});
+            unseal_responses_input(&platform, T, &mut body)
+        };
+        assert_eq!(
+            run(json!([{"role": "user", "content": "hi"},
+                       {"type": "reasoning", "id": "rs_bdrk_1", "summary": []}])),
+            Some(1)
+        );
+        assert_eq!(
+            run(
+                json!([{"type": "reasoning", "id": seal_id(&k, "team-b", "rs_1"),
+                        "summary": [{"type": "summary_text", "text": "why"}]}])
+            ),
+            Some(0)
+        );
+        assert_eq!(
+            run(json!([{"type": "reasoning", "id": seal_id(&k, T, "rs_1"), "summary": []}])),
+            None
+        );
+        assert_eq!(
+            run(json!([{"type": "reasoning", "id": "rs_1", "summary": [],
+                        "encrypted_content": "gAAAA"}])),
+            None
+        );
+        assert_eq!(run(json!([{"type": "reasoning", "summary": []}])), None);
+    }
+
+    /// A `local_shell_call_output` names the call it answers by `id`: the
+    /// call id the answer's `local_shell_call` carried as `call_id`
+    /// (openai-python 3.41.0 `types/responses/response_input_item_param.py`,
+    /// `LocalShellCallOutput`, which has no `call_id`). It is a call seal,
+    /// and opens as one; every other item's `id` is an item seal.
+    #[test]
+    fn a_local_shell_call_output_id_opens_as_the_call_it_answers() {
+        let platform = crate::platform::PlatformSettings::from_secret("s");
+        let k = seal_key(&platform.id_key);
+        let call = seal_call(&k, T, "call_up_1");
+        let mut body = json!({"input": [
+            {"type": "local_shell_call", "id": seal_id(&k, T, "lsh_up_1"), "call_id": call,
+             "action": {"type": "exec", "command": ["ls"], "env": {}}, "status": "completed"},
+            {"type": "local_shell_call_output", "id": call, "output": "a.txt"},
+        ]});
+        unseal_responses_input(&platform, T, &mut body);
+        assert_eq!(body["input"][0]["id"], "lsh_up_1");
+        assert_eq!(body["input"][0]["call_id"], "call_up_1");
+        assert_eq!(body["input"][1]["id"], "call_up_1");
+        // An item seal in that slot is not the call's, and stays as sent.
+        let item = seal_id(&k, T, "call_up_1");
+        let mut body = json!({"input": [
+            {"type": "local_shell_call_output", "id": item.clone(), "output": "a.txt"}]});
+        unseal_responses_input(&platform, T, &mut body);
+        assert_eq!(body["input"][0]["id"], item);
+    }
+
     /// A stream names one item on every delta: the sealer seals it once and
     /// hands back the same value, and a different id is sealed afresh.
     #[test]
@@ -1545,280 +1399,160 @@ pub(crate) mod tests {
         assert_eq!(sealer.unseal(IdKind::Item, &shortest[1..]), None);
     }
 
-    #[test]
-    fn a_messages_body_gets_a_new_id_mapped_tool_use_ids_and_no_channel_metrics() {
-        let ids = MessagesIds::new(&mac(&K));
-        let mut body = json!({
-            "id": "msg_bdrk_01X",
-            "type": "message",
-            "content": [
-                {"type": "text", "text": "calling"},
-                {"type": "tool_use", "id": "toolu_bdrk_01Y", "name": "f", "input": {}},
-                {"type": "server_tool_use", "id": "srvtoolu_01", "name": "web_search", "input": {}},
-            ],
-            "usage": {"input_tokens": 3, "output_tokens": 1},
-            "amazon-bedrock-invocationMetrics": {"inputTokenCount": 3},
-        });
-        ids.apply_to_body(&mut body);
-        assert!(
-            is_platform_id(Surface::Messages, body["id"].as_str().unwrap()),
-            "{body}"
-        );
-        assert_eq!(
-            body["content"][1]["id"],
-            map_tool_call_id(&mac(&K), Surface::Messages, "toolu_bdrk_01Y")
-        );
-        // A server tool's id is mapped behind its own family prefix.
-        assert_eq!(
-            body["content"][2]["id"],
-            map_messages_tool_id(&mac(&K), "srvtoolu_01")
-        );
-        assert!(body.get("amazon-bedrock-invocationMetrics").is_none());
-        assert_eq!(
-            body["usage"],
-            json!({"input_tokens": 3, "output_tokens": 1})
-        );
+    /// The caller a request's ids are sealed to: tenant `team:<team>`.
+    fn caller(team: &str) -> crate::auth::AuthenticatedKey {
+        let snap = aisix_core::AisixSnapshot::new();
+        let key: aisix_core::ApiKey = serde_json::from_value(
+            json!({"key_hash": "h", "allowed_models": ["*"], "team_id": team}),
+        )
+        .unwrap();
+        crate::auth::AuthenticatedKey::new(
+            &snap,
+            std::sync::Arc::new(aisix_core::resource::ResourceEntry::new("k-1", key, 1)),
+            None,
+            false,
+        )
     }
 
+    /// The container a hosted tool ran in leaves sealed, buffered and
+    /// streamed, keeping its prefix; it opens only as a container.
     #[test]
-    fn a_messages_stream_shares_one_id_and_maps_tool_use_blocks() {
-        let ids = MessagesIds::new(&mac(&K));
-        let start = br#"{"type":"message_start","message":{"id":"msg_bdrk_01X","model":"up","usage":{"input_tokens":1e2}}}"#;
-        let out = String::from_utf8(ids.rewrite_event_json(start, "alias").unwrap()).unwrap();
-        assert_eq!(
-            out,
-            format!(
-                r#"{{"type":"message_start","message":{{"id":"{}","model":"alias","usage":{{"input_tokens":1e2}}}}}}"#,
-                ids.message_id
-            )
-        );
-
-        let block = br#"{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_bdrk_01Y","name":"f","input":{}}}"#;
-        let out = String::from_utf8(ids.rewrite_event_json(block, "alias").unwrap()).unwrap();
-        let mapped = map_tool_call_id(&mac(&K), Surface::Messages, "toolu_bdrk_01Y");
-        assert!(out.contains(&format!(r#""id":"{mapped}""#)), "{out}");
-        // The id ahead of the type is still read against it.
-        let id_first = br#"{"type":"content_block_start","index":1,"content_block":{"id":"toolu_bdrk_01Y","type":"tool_use"}}"#;
-        assert!(
-            String::from_utf8(ids.rewrite_event_json(id_first, "alias").unwrap())
-                .unwrap()
-                .contains(&mapped)
-        );
-
-        // A block that is not a tool use keeps its ids, even one read ahead
-        // of the type.
-        let text = br#"{"type":"content_block_start","index":2,"content_block":{"id":"x_1","tool_use_id":"toolu_1","type":"text","text":""}}"#;
-        assert_eq!(ids.rewrite_event_json(text, "alias"), None);
-
-        let stop = br#"{"type":"message_stop","amazon-bedrock-invocationMetrics":{"inputTokenCount":3,"outputTokenCount":1}}"#;
-        assert_eq!(
-            ids.rewrite_event_json(stop, "alias").as_deref(),
-            Some(&br#"{"type":"message_stop"}"#[..])
-        );
-        let delta = br#"{"type":"content_block_delta","index":0,"delta":{"text":"hi"}}"#;
-        assert_eq!(ids.rewrite_event_json(delta, "alias"), None);
-    }
-
-    /// An id already in mapped form came from the caller's own history, so
-    /// an upstream that echoes it back keeps it, and it still pairs; a raw
-    /// id is still mapped, on both protocols.
-    #[test]
-    fn an_id_in_mapped_form_is_left_as_it_is() {
-        let key = mac(&K);
-        for upstream in [
-            "toolu_vrtx_01",
-            "srvtoolu_vrtx_01S",
-            "mcptoolu_vrtx_04",
-            "call_up_1",
-        ] {
-            let mapped = map_messages_tool_id(&key, upstream);
-            assert_ne!(mapped, upstream);
-            assert_eq!(map_messages_tool_id(&key, &mapped), mapped, "{upstream}");
-        }
-        let chat = map_tool_call_id(&key, Surface::Chat, "call_bdrk_1");
-        assert_ne!(chat, "call_bdrk_1");
-        assert_eq!(map_tool_call_id(&key, Surface::Chat, &chat), chat);
-        // Only the exact form: 32 lowercase hex digits behind the prefix.
-        for raw in [
-            format!("toolu_{}", "A".repeat(32)),
-            format!("toolu_{}", "a".repeat(31)),
-            format!("toolu_{}", "a".repeat(33)),
-            format!("srvtoolu_{}", "g".repeat(32)),
-        ] {
-            assert_ne!(map_messages_tool_id(&key, &raw), raw, "{raw}");
-        }
-        // In an answer: a paused turn's server tool use, its result and a
-        // caller that name the caller's own mapped id keep it.
-        let server = map_messages_tool_id(&key, "srvtoolu_vrtx_01S");
-        let ids = MessagesIds::new(&key);
-        let mut body = json!({"id": "msg_vrtx_2", "content": [
-            {"type": "server_tool_use", "id": server, "name": "code_execution", "input": {}},
-            {"type": "tool_use", "id": "toolu_vrtx_9", "name": "f", "input": {},
-             "caller": {"type": "code_execution_20250825", "tool_id": server}},
-            {"type": "code_execution_tool_result", "tool_use_id": server, "content": {}},
+    fn a_container_id_leaves_sealed_in_every_slot_an_answer_names_it() {
+        let sealer = Sealer::new(&K, T);
+        let mut body = json!({"output": [
+            {"type": "code_interpreter_call", "id": "ci_bdrk_1", "container_id": "cntr_bdrk_1",
+             "code": "1+1", "outputs": [], "status": "completed"},
+            {"type": "shell_call", "id": "sh_bdrk_1", "call_id": "call_bdrk_1",
+             "action": {"commands": ["ls"]}, "status": "completed",
+             "environment": {"type": "container_reference", "container_id": "cntr_bdrk_2"}},
         ]});
-        ids.apply_to_body(&mut body);
-        assert_eq!(body["content"][0]["id"], server.as_str());
-        assert_eq!(body["content"][1]["caller"]["tool_id"], server.as_str());
-        assert_eq!(body["content"][2]["tool_use_id"], server.as_str());
-        assert_eq!(
-            body["content"][1]["id"],
-            map_messages_tool_id(&key, "toolu_vrtx_9")
-        );
-        // The stream splice keeps it too.
-        let frame = format!(
-            r#"{{"type":"content_block_start","index":0,"content_block":{{"type":"server_tool_use","id":"{server}","name":"code_execution","input":{{}}}}}}"#
-        );
-        let out = ids
-            .rewrite_event_json(frame.as_bytes(), "alias")
-            .map(String::from_utf8)
-            .transpose()
-            .unwrap()
-            .unwrap_or_else(|| frame.clone());
-        assert_eq!(out, frame);
-    }
-
-    /// A client tool's id maps exactly as it did before server and MCP tool
-    /// ids were mapped too, whatever its upstream prefix.
-    #[test]
-    fn a_client_tool_id_maps_as_it_always_did() {
-        for upstream in [
-            "toolu_bdrk_01Y",
-            "toolu_vrtx_01",
-            "call_up_1",
-            "tooluse_x",
-            "",
+        seal_responses_body(&sealer, &mut body);
+        for (pointer, original) in [
+            ("/output/0/container_id", "cntr_bdrk_1"),
+            ("/output/1/environment/container_id", "cntr_bdrk_2"),
         ] {
+            let sealed = body.pointer(pointer).and_then(Value::as_str).unwrap();
+            assert!(sealed.starts_with("cntr_"), "{sealed}");
+            assert!(!sealed.contains("bdrk"), "{sealed}");
             assert_eq!(
-                map_messages_tool_id(&mac(&K), upstream),
-                map_tool_call_id(&mac(&K), Surface::Messages, upstream),
-                "{upstream}"
+                sealer.unseal(IdKind::Container, sealed).as_deref(),
+                Some(original)
+            );
+            assert_eq!(sealer.unseal(IdKind::Item, sealed), None, "{sealed}");
+            assert_eq!(
+                Sealer::new(&K, "team-b").unseal(IdKind::Container, sealed),
+                None
             );
         }
-    }
 
-    /// Server and MCP tool-use ids, and the result blocks and callers that
-    /// name them, are mapped like a tool_use id, behind their own family
-    /// prefix, so they still pair and still match the pattern the Messages
-    /// API sets for them on the next turn.
-    #[test]
-    fn server_and_mcp_tool_ids_are_mapped_behind_their_family_prefix() {
-        let ids = MessagesIds::new(&mac(&K));
-        let mut body = json!({
-            "id": "msg_vrtx_01M",
-            "type": "message",
-            "content": [
-                {"type": "server_tool_use", "id": "srvtoolu_vrtx_01S", "name": "web_search",
-                 "input": {"query": "weather"}},
-                {"type": "web_search_tool_result", "tool_use_id": "srvtoolu_vrtx_01S",
-                 "content": [{"type": "web_search_result", "url": "https://example.com", "title": "t",
-                              "encrypted_content": "EC"}]},
-                {"type": "server_tool_use", "id": "srvtoolu_vrtx_02C", "name": "code_execution", "input": {}},
-                {"type": "tool_use", "id": "toolu_vrtx_03", "name": "f", "input": {},
-                 "caller": {"type": "code_execution_20250825", "tool_id": "srvtoolu_vrtx_02C"}},
-                {"type": "code_execution_tool_result", "tool_use_id": "srvtoolu_vrtx_02C", "content": {}},
-                {"type": "mcp_tool_use", "id": "mcptoolu_vrtx_04", "name": "lookup", "server_name": "s",
-                 "input": {}},
-                {"type": "mcp_tool_result", "tool_use_id": "mcptoolu_vrtx_04", "content": []},
-                {"type": "text", "text": "Sunny."},
-            ],
-        });
-        ids.apply_to_body(&mut body);
-        let text = body.to_string();
-        assert!(!text.contains("vrtx"), "{text}");
-        let c = &body["content"];
-        let server = c[0]["id"].as_str().unwrap();
-        assert!(server.starts_with("srvtoolu_"), "{server}");
-        let pattern = |id: &str, prefix: &str| {
-            id.strip_prefix(prefix).is_some_and(|rest| {
-                !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
-            })
+        // A stream names it on the item and on the snapshot's output.
+        let key = |path: &[&str]| {
+            let path: Vec<PathSeg> = path
+                .iter()
+                .map(|seg| match seg.parse::<usize>() {
+                    Ok(i) => PathSeg::Index(i),
+                    Err(_) => PathSeg::Key((*seg).to_string()),
+                })
+                .collect();
+            responses_event_id_kind(&path)
         };
-        assert!(pattern(server, "srvtoolu_"), "{server}");
-        assert_eq!(c[1]["tool_use_id"], server, "the result pairs with its use");
-        assert_eq!(c[3]["caller"]["tool_id"], c[2]["id"]);
-        assert_eq!(c[4]["tool_use_id"], c[2]["id"]);
-        assert_eq!(
-            c[3]["id"],
-            map_tool_call_id(&mac(&K), Surface::Messages, "toolu_vrtx_03")
-        );
-        let mcp = c[5]["id"].as_str().unwrap();
-        assert!(pattern(mcp, "mcptoolu_"), "{mcp}");
-        assert_eq!(c[6]["tool_use_id"], mcp);
-        assert_eq!(c[1]["content"][0]["encrypted_content"], "EC");
-        assert_eq!(c[7]["text"], "Sunny.");
-    }
-
-    /// The stream splice maps the same ids, whichever order a block writes
-    /// its fields in.
-    #[test]
-    fn a_messages_stream_maps_server_and_mcp_tool_ids() {
-        let ids = MessagesIds::new(&mac(&K));
-        let server = map_messages_tool_id(&mac(&K), "srvtoolu_vrtx_01S");
-        let mcp = map_messages_tool_id(&mac(&K), "mcptoolu_vrtx_04");
-        for (frame, mapped) in [
-            (
-                &br#"{"type":"content_block_start","index":0,"content_block":{"type":"server_tool_use","id":"srvtoolu_vrtx_01S","name":"web_search","input":{}}}"#[..],
-                &server,
-            ),
-            (
-                br#"{"type":"content_block_start","index":0,"content_block":{"id":"srvtoolu_vrtx_01S","name":"web_search","type":"server_tool_use","input":{}}}"#,
-                &server,
-            ),
-            (
-                br#"{"type":"content_block_start","index":1,"content_block":{"tool_use_id":"srvtoolu_vrtx_01S","type":"web_search_tool_result","content":[]}}"#,
-                &server,
-            ),
-            (
-                br#"{"type":"content_block_start","index":2,"content_block":{"type":"mcp_tool_use","id":"mcptoolu_vrtx_04","name":"lookup","server_name":"s","input":{}}}"#,
-                &mcp,
-            ),
-            (
-                br#"{"type":"content_block_start","index":3,"content_block":{"type":"mcp_tool_result","tool_use_id":"mcptoolu_vrtx_04","content":[]}}"#,
-                &mcp,
-            ),
-            (
-                br#"{"type":"content_block_start","index":4,"content_block":{"type":"tool_use","id":"toolu_x","name":"f","input":{},"caller":{"type":"code_execution_20250825","tool_id":"srvtoolu_vrtx_01S"}}}"#,
-                &server,
-            ),
+        for path in [
+            &["item", "container_id"][..],
+            &["item", "environment", "container_id"],
+            &["response", "output", "0", "container_id"],
+            &["response", "output", "1", "environment", "container_id"],
         ] {
-            let out = String::from_utf8(ids.rewrite_event_json(frame, "alias").unwrap()).unwrap();
-            assert!(!out.contains("vrtx"), "{out}");
-            assert!(out.contains(mapped.as_str()), "{out}");
+            assert_eq!(key(path), Some(IdKind::Container), "{path:?}");
         }
-    }
-
-    #[test]
-    fn a_messages_encoder_event_gets_the_same_treatment() {
-        let ids = MessagesIds::new(&mac(&K));
-        let mut start =
-            json!({"type": "message_start", "message": {"id": "msg_gw", "content": []}});
-        let mut block = json!({"type": "content_block_start", "index": 0,
-            "content_block": {"type": "tool_use", "id": "call_up_1", "name": "f", "input": {}}});
-        ids.apply_to_event(&mut start);
-        ids.apply_to_event(&mut block);
-        assert_eq!(start["message"]["id"], ids.message_id.as_str());
+        // A citation of a file in a container is history, not an item's own
+        // container, and is left as written.
         assert_eq!(
-            block["content_block"]["id"],
-            map_tool_call_id(&mac(&K), Surface::Messages, "call_up_1")
+            key(&["item", "content", "0", "annotations", "0", "container_id"]),
+            None
         );
     }
 
+    /// A stateless conversation sends a code interpreter's or shell's own
+    /// container back: the tenant it was handed to passes the stored-object
+    /// check with it and the upstream gets its own id back; anyone else, and
+    /// a bare upstream id, is refused as before.
     #[test]
-    fn openai_shape_tool_calls_map_in_place() {
-        let mut calls = vec![
-            json!({"index": 0, "id": "toolu_bdrk_01Y", "type": "function", "function": {"name": "f", "arguments": ""}}),
-            json!({"index": 0, "function": {"arguments": "{}"}}),
-        ];
-        map_tool_calls(&mac(&K), Surface::Chat, &mut calls);
+    fn a_tenants_own_container_passes_the_stored_object_check_and_returns_as_issued() {
+        let platform = crate::platform::PlatformSettings::from_secret("s");
+        let own = Sealer::of(&platform, "team:team-a");
+        let body = |container: &str, environment: &str| {
+            json!({"model": "m", "input": [
+                {"role": "user", "content": "run it"},
+                {"type": "code_interpreter_call", "id": "ci_1", "container_id": container,
+                 "code": "1+1", "outputs": null, "status": "completed"},
+                {"type": "shell_call", "call_id": "call_1", "action": {"commands": ["ls"]},
+                 "environment": {"type": "container_reference", "container_id": environment}},
+                {"role": "user", "content": "and again"},
+            ]})
+        };
+        let refusal = |team: &str, mut sent: Value| {
+            let result = with_own_containers(Some(&platform), &caller(team), &mut sent, |b| {
+                crate::stored_refs::refuse_in_responses(Some(&platform), b)
+            });
+            (result, sent)
+        };
+
+        let (ci, sh) = (
+            own.seal(IdKind::Container, "cntr_up_1"),
+            own.seal(IdKind::Container, "cntr_up_2"),
+        );
+        let (result, sent) = refusal("team-a", body(&ci, &sh));
+        assert!(result.is_ok(), "{result:?}");
         assert_eq!(
-            calls[0]["id"],
-            map_tool_call_id(&mac(&K), Surface::Chat, "toolu_bdrk_01Y")
+            sent,
+            body("cntr_up_1", "cntr_up_2"),
+            "the upstream's own ids"
         );
-        assert!(
-            calls[1].get("id").is_none(),
-            "a continuation delta carries no id"
-        );
-        assert_eq!(calls[1]["function"]["arguments"], "{}");
+
+        // Another tenant's, an item seal of the same id, a bare upstream id.
+        for (team, container) in [
+            ("team-b", ci.clone()),
+            ("team-a", own.seal(IdKind::Item, "cntr_up_1")),
+            ("team-a", "cntr_up_1".to_string()),
+        ] {
+            let sent = body(&container, &sh);
+            let (result, after) = refusal(team, sent.clone());
+            match result {
+                Err(crate::error::ProxyError::StoredObjectReference(field)) => {
+                    assert_eq!(field, "input[1].container_id", "{team} {container}")
+                }
+                other => panic!("{team} {container}: {other:?}"),
+            }
+            if team == "team-a" {
+                // Its own shell container is still given back as issued.
+                assert_eq!(
+                    after["input"][2]["environment"]["container_id"],
+                    "cntr_up_2"
+                );
+            }
+        }
+        let (result, _) = refusal("team-a", body(&ci, "cntr_up_2"));
+        match result {
+            Err(crate::error::ProxyError::StoredObjectReference(field)) => {
+                assert_eq!(field, "input[2].environment.container_id")
+            }
+            other => panic!("{other:?}"),
+        }
+
+        // Platform mode off: the check reads the body as sent.
+        let mut sent = body(&ci, &sh);
+        let seen = std::cell::RefCell::new(None);
+        let result: Result<(), ()> = with_own_containers(None, &caller("team-a"), &mut sent, |b| {
+            *seen.borrow_mut() = Some(b.clone());
+            Ok(())
+        });
+        assert!(result.is_ok());
+        assert_eq!(seen.into_inner(), Some(body(&ci, &sh)));
+        assert_eq!(sent, body(&ci, &sh));
+
+        // The earlier unseal of item and call ids leaves a container as sent.
+        let mut sent = body(&ci, &sh);
+        unseal_responses_input(&platform, "team:team-a", &mut sent);
+        assert_eq!(sent["input"][1]["container_id"], ci.as_str());
     }
 }

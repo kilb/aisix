@@ -262,10 +262,14 @@ pub(crate) const BILLED_BATCH_DEDUP_WINDOW: std::time::Duration =
 const DEFAULT_BATCH_WATCH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Record that this process has attributed `batch_id`, returning `false` when
-/// it was already recorded inside the dedup window.
+/// it was already recorded inside the dedup window. An entry older than `ttl`
+/// is refreshed and counts as a first sighting.
 ///
-/// Entries older than `ttl` are reclaimed on the way through. The set is an
-/// optimization, not the correctness mechanism — the deterministic
+/// It touches the one entry only: a listing re-observes every batch on its
+/// page on the request path, so a walk of the whole map here would cost that
+/// much per listed batch. Entries no batch is looked up by again are
+/// reclaimed by [`sweep_billed_batches`], on the server's upkeep timer. The
+/// set is an optimization, not the correctness mechanism — the deterministic
 /// `request_id = "batch-<id>"` on the emitted events is what keeps
 /// re-emission idempotent across a restart (#720) — so expiring an entry
 /// costs at worst one redundant download and one redundant, already-idempotent
@@ -283,8 +287,29 @@ pub(crate) fn remember_billed_batch(
     now: std::time::Instant,
     ttl: std::time::Duration,
 ) -> bool {
+    match seen.entry(batch_id.to_string()) {
+        dashmap::mapref::entry::Entry::Occupied(mut recorded) => {
+            if now.duration_since(*recorded.get()) <= ttl {
+                return false;
+            }
+            recorded.insert(now);
+            true
+        }
+        dashmap::mapref::entry::Entry::Vacant(slot) => {
+            slot.insert(now);
+            true
+        }
+    }
+}
+
+/// Drop the entries of [`remember_billed_batch`]'s map that are older than
+/// `ttl`, so the map cannot grow for the life of the process.
+pub(crate) fn sweep_billed_batches(
+    seen: &dashmap::DashMap<String, std::time::Instant>,
+    now: std::time::Instant,
+    ttl: std::time::Duration,
+) {
     seen.retain(|_, recorded| now.duration_since(*recorded) <= ttl);
-    seen.insert(batch_id.to_string(), now).is_none()
 }
 
 #[derive(Clone)]
@@ -378,6 +403,15 @@ pub struct ProxyStateInner {
     /// deterministic `request_id = "batch-<id>"` on the emitted events is
     /// what keeps cross-restart re-emission idempotent on the control plane side.
     pub billed_batches: Arc<dashmap::DashMap<String, std::time::Instant>>,
+    /// Permits for the output download of a batch attribution that can
+    /// credit spend, so only [`crate::jobs::BATCH_ATTRIBUTION_DOWNLOADS`] run
+    /// at once.
+    pub(crate) batch_attribution_permits: Arc<tokio::sync::Semaphore>,
+    /// Permits for the output download of a batch attribution whose credit is
+    /// ruled out, which only re-emits a usage row:
+    /// [`crate::jobs::BATCH_BACKFILL_DOWNLOADS`] at once, in a lane of its
+    /// own so that it never waits ahead of a batch that can be credited.
+    pub(crate) batch_backfill_permits: Arc<tokio::sync::Semaphore>,
     /// How often [`crate::jobs`] re-reads a batch it created until it ends.
     pub batch_watch_interval: std::time::Duration,
     /// Boot-compiled User-Agent → `client_type` classifier: operator
@@ -479,6 +513,14 @@ impl ProxyState {
     pub fn guardrail_embedder(&self) -> aisix_guardrails::GuardrailEmbedderSlot {
         guardrail_embedder_slot(&self.hub, &self.snapshot, &self.semantic_cache)
     }
+
+    /// The upkeep job that reclaims billed-batch dedup entries past
+    /// [`BILLED_BATCH_DEDUP_WINDOW`] ([`sweep_billed_batches`]). The server
+    /// runs it on a timer, so the request path never walks the map.
+    pub fn billed_batch_sweep(&self) -> impl Fn() + Send + 'static {
+        let seen = Arc::clone(&self.billed_batches);
+        move || sweep_billed_batches(&seen, std::time::Instant::now(), BILLED_BATCH_DEDUP_WINDOW)
+    }
 }
 
 impl ProxyState {
@@ -547,6 +589,12 @@ impl ProxyState {
             url_rewrites: crate::rewrite::compile(&cfg.url_rewrites),
             expose_debug_headers: cfg.expose_debug_headers,
             billed_batches: Arc::new(dashmap::DashMap::new()),
+            batch_attribution_permits: Arc::new(tokio::sync::Semaphore::new(
+                crate::jobs::BATCH_ATTRIBUTION_DOWNLOADS,
+            )),
+            batch_backfill_permits: Arc::new(tokio::sync::Semaphore::new(
+                crate::jobs::BATCH_BACKFILL_DOWNLOADS,
+            )),
             batch_watch_interval: DEFAULT_BATCH_WATCH_INTERVAL,
             client_classifier: Arc::new(ClientTypeClassifier::builtin()),
             default_retries: aisix_core::config::DEFAULT_UPSTREAM_RETRIES,
@@ -605,6 +653,12 @@ impl ProxyState {
             url_rewrites: crate::rewrite::compile(&cfg.url_rewrites),
             expose_debug_headers: cfg.expose_debug_headers,
             billed_batches: Arc::new(dashmap::DashMap::new()),
+            batch_attribution_permits: Arc::new(tokio::sync::Semaphore::new(
+                crate::jobs::BATCH_ATTRIBUTION_DOWNLOADS,
+            )),
+            batch_backfill_permits: Arc::new(tokio::sync::Semaphore::new(
+                crate::jobs::BATCH_BACKFILL_DOWNLOADS,
+            )),
             batch_watch_interval: DEFAULT_BATCH_WATCH_INTERVAL,
             client_classifier: Arc::new(ClientTypeClassifier::builtin()),
             default_retries: aisix_core::config::DEFAULT_UPSTREAM_RETRIES,
@@ -687,6 +741,12 @@ impl ProxyState {
             url_rewrites: crate::rewrite::compile(&cfg.url_rewrites),
             expose_debug_headers: cfg.expose_debug_headers,
             billed_batches: Arc::new(dashmap::DashMap::new()),
+            batch_attribution_permits: Arc::new(tokio::sync::Semaphore::new(
+                crate::jobs::BATCH_ATTRIBUTION_DOWNLOADS,
+            )),
+            batch_backfill_permits: Arc::new(tokio::sync::Semaphore::new(
+                crate::jobs::BATCH_BACKFILL_DOWNLOADS,
+            )),
             batch_watch_interval: DEFAULT_BATCH_WATCH_INTERVAL,
             client_classifier: Arc::new(ClientTypeClassifier::builtin()),
             default_retries: aisix_core::config::DEFAULT_UPSTREAM_RETRIES,
@@ -810,8 +870,8 @@ mod tests {
     /// #720's dedup set is an optimization — the deterministic
     /// `request_id = "batch-<id>"` is what actually makes re-emission
     /// idempotent — so it must not grow for the life of the process. Entries
-    /// past the dedup window are reclaimed; a re-poll inside the window is
-    /// still suppressed.
+    /// past the dedup window are reclaimed by the sweep; a re-poll inside the
+    /// window is still suppressed, and one past it attributes again.
     #[test]
     fn billed_batch_dedup_is_bounded_by_its_window() {
         let seen = dashmap::DashMap::new();
@@ -826,16 +886,34 @@ mod tests {
             !remember_billed_batch(&seen, "batch-a", t0, ttl),
             "a re-poll inside the window is suppressed"
         );
+        assert!(remember_billed_batch(&seen, "batch-c", t0, ttl));
 
         let later = t0 + ttl + std::time::Duration::from_secs(1);
+        assert!(
+            remember_billed_batch(&seen, "batch-a", later, ttl),
+            "a sighting past the window attributes again"
+        );
+        assert!(
+            !remember_billed_batch(&seen, "batch-a", later, ttl),
+            "and the refreshed entry suppresses the next one"
+        );
         assert!(
             remember_billed_batch(&seen, "batch-b", later, ttl),
             "an unrelated batch still records"
         );
+        // A listing re-observes every batch on its page from the request
+        // path: a sighting touches its own entry and never walks the rest.
         assert!(
-            !seen.contains_key("batch-a"),
+            seen.contains_key("batch-c"),
+            "a sighting of another batch swept the map on the request path"
+        );
+
+        sweep_billed_batches(&seen, later, ttl);
+        assert!(
+            !seen.contains_key("batch-c"),
             "an entry past its window must be reclaimed, not kept forever"
         );
+        assert!(seen.contains_key("batch-a") && seen.contains_key("batch-b"));
     }
 
     // The re-arm is the only direction of this latch that can cause
@@ -869,7 +947,7 @@ mod tests {
             "and recovering the exact half must not re-arm the semantic one"
         );
     }
-    use super::{remember_billed_batch, ProxyState};
+    use super::{remember_billed_batch, sweep_billed_batches, ProxyState};
     use aisix_core::resource::ResourceEntry;
     use aisix_core::snapshot::SnapshotHandle;
     use aisix_core::{AisixSnapshot, ProxyConfig};

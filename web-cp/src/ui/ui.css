@@ -1,0 +1,1137 @@
+/* The shared components (one implementation in this app): buttons, fields
+   and native controls, tables, lamps, chips, notes, the two-step confirm,
+   empty and loading states, toasts, the side panel, tooltips, icons and the
+   route-line navigation. Every value comes from ../theme/tokens.css.
+
+   Every interactive element has all of its states: a 120ms colour change on
+   hover, one step darker with a 1px inset when pressed, the focus ring from
+   base.css, and 45% opacity with a not-allowed cursor when disabled. The
+   `.is-hover`, `.is-active` and `.is-focus` classes force a state for the
+   style guide's static matrix. */
+
+/* ── Icons ──────────────────────────────────────────────────── */
+.icon {
+  flex: none;
+  width: var(--icon);
+  height: var(--icon);
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.5;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.icon-32 {
+  width: 32px;
+  height: 32px;
+}
+
+/* ── Buttons: 36px, 32px small; icons centred by flex ────────── */
+.btn {
+  --fg: var(--text);
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--s-2);
+  height: var(--h-control);
+  padding: 0 var(--s-4);
+  border: 1px solid transparent;
+  border-radius: var(--r-button);
+  background: transparent;
+  color: var(--fg);
+  font-size: var(--fs-15);
+  font-weight: 600;
+  line-height: 16px;
+  white-space: nowrap;
+  text-decoration: none;
+  cursor: pointer;
+  user-select: none;
+  vertical-align: middle;
+  transition:
+    background-color var(--t-fast) ease,
+    border-color var(--t-fast) ease,
+    color var(--t-fast) ease,
+    box-shadow var(--t-fast) ease;
+}
+.btn-sm {
+  height: var(--h-control-sm);
+  padding: 0 var(--s-3);
+}
+.btn-block {
+  width: 100%;
+}
+.btn-icon {
+  width: var(--h-control);
+  padding: 0;
+}
+.btn-icon.btn-sm {
+  width: var(--h-control-sm);
+}
+
+.btn-primary {
+  --fg: var(--on-sign);
+  background: var(--sign);
+}
+.btn-primary:not(:disabled, [aria-disabled="true"]):is(:hover, .is-hover) {
+  background: var(--sign-hover);
+}
+.btn-primary:not(:disabled, [aria-disabled="true"]):is(:active, .is-active) {
+  background: var(--sign-press);
+  box-shadow: inset 0 1px 0 rgba(28, 42, 57, 0.22);
+}
+
+.btn-secondary {
+  border-color: var(--text);
+}
+.btn-secondary:not(:disabled, [aria-disabled="true"]):is(:hover, .is-hover) {
+  background: var(--hover);
+}
+.btn-secondary:not(:disabled, [aria-disabled="true"]):is(:active, .is-active) {
+  background: var(--press);
+  box-shadow: var(--inset);
+}
+
+.btn-quiet {
+  --fg: var(--text-2);
+  padding: 0 var(--s-2);
+}
+.btn-quiet.btn-icon {
+  padding: 0;
+}
+.btn-quiet:not(:disabled, [aria-disabled="true"]):is(:hover, .is-hover) {
+  --fg: var(--text);
+  background: var(--hover);
+}
+.btn-quiet:not(:disabled, [aria-disabled="true"]):is(:active, .is-active) {
+  --fg: var(--text);
+  background: var(--press);
+  box-shadow: var(--inset);
+}
+
+.btn-danger {
+  --fg: var(--on-stop);
+  background: var(--stop-fill);
+}
+.btn-danger:not(:disabled, [aria-disabled="true"]):is(:hover, .is-hover) {
+  background: var(--stop-fill-hover);
+}
+.btn-danger:not(:disabled, [aria-disabled="true"]):is(:active, .is-active) {
+  background: var(--stop-fill-press);
+  box-shadow: inset 0 1px 0 rgba(0, 0, 0, 0.24);
+}
+
+.btn:is(:disabled, [aria-disabled="true"]) {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+/* The focus ring forced for the style guide's static matrix. */
+.is-focus {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+/* Busy: a spinner takes the label's place, and the label keeps its place
+   (and so the width) underneath it, hidden; the name is the busy label. */
+.btn.is-busy:disabled {
+  opacity: 1;
+  cursor: progress;
+}
+.btn-label {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--s-2);
+  visibility: hidden;
+}
+.btn.is-busy::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  width: 16px;
+  height: 16px;
+  margin: auto;
+  border: 1.5px solid var(--fg);
+  border-right-color: transparent;
+  border-radius: 50%;
+  animation: ui-spin 0.7s linear infinite;
+}
+@keyframes ui-spin {
+  to {
+    transform: rotate(1turn);
+  }
+}
+
+/* A disabled action whose reason is not on screen keeps it in a tooltip,
+   on hover and on keyboard focus. */
+.has-tip {
+  position: relative;
+  display: inline-flex;
+}
+.tip {
+  position: absolute;
+  z-index: 30;
+  bottom: calc(100% + var(--s-2));
+  right: 0;
+  display: flex;
+  align-items: center;
+  width: max-content;
+  max-width: min(320px, 90vw);
+  min-height: var(--h-control-sm);
+  padding: var(--s-1) var(--s-3);
+  border-radius: var(--r-button);
+  background: var(--tooltip-bg);
+  color: var(--tooltip-text);
+  box-shadow: var(--shadow-float);
+  font-size: var(--fs-13);
+  font-weight: 400;
+  line-height: var(--lh-table);
+  white-space: normal;
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transition:
+    opacity var(--t-fast) ease,
+    visibility 0s linear var(--t-fast);
+}
+.has-tip:is(:hover, :focus-within) .tip,
+.tip.is-static {
+  opacity: 1;
+  visibility: visible;
+  transition: opacity var(--t-fast) ease;
+}
+.tip.is-static {
+  position: static;
+}
+
+/* A text action that reads as a link: a tenant's name in a list. */
+.link-button {
+  display: inline-block;
+  max-width: 100%;
+  padding: 0;
+  border: 0;
+  border-radius: var(--r-input);
+  background: none;
+  color: var(--text);
+  font-weight: 600;
+  line-height: var(--lh-table);
+  text-align: left;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: pointer;
+  vertical-align: middle;
+  transition: color var(--t-fast) ease;
+}
+.link-button:is(:hover, .is-hover) {
+  color: var(--link);
+  text-decoration: underline;
+  text-underline-offset: 4px;
+  text-decoration-thickness: 1px;
+}
+.link-button:is(:active, .is-active) {
+  color: var(--line-press);
+}
+
+/* ── Fields and native controls ─────────────────────────────── */
+.f {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-2);
+  min-width: 0;
+  margin: 0 0 var(--s-4);
+}
+.f > span:first-child,
+.f > label > span:first-child,
+.f-label {
+  color: var(--text-2);
+  line-height: var(--lh-table);
+}
+.f > label {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-2);
+}
+.field {
+  min-width: 0;
+  margin: 0 0 var(--s-4);
+}
+.field > .f {
+  margin-bottom: 0;
+}
+/* After the label rule, and as specific, so an error never takes the
+   label's colour. */
+.field-error,
+.field-problem,
+.f > .field-error,
+.f > .field-problem {
+  display: block;
+  margin: var(--s-2) 0 0;
+  color: var(--error);
+  font-size: var(--fs-13);
+  font-weight: 600;
+  line-height: var(--lh-table);
+}
+/* A refusal printed straight after a bare `.f` label. */
+.f + .field-problem {
+  margin: calc(-1 * var(--s-2)) 0 var(--s-4);
+}
+.field > .f + .field-problem {
+  margin: var(--s-2) 0 0;
+}
+/* A field's hint, between its control and its refusal. */
+.field > .hint {
+  margin: var(--s-2) 0 0;
+  color: var(--text-muted);
+  font-size: var(--fs-13);
+  line-height: var(--lh-table);
+}
+
+input:not([type="checkbox"], [type="radio"], [type="range"], [type="color"], [type="file"]),
+select,
+textarea {
+  width: 100%;
+  height: var(--h-control);
+  padding: 0 var(--s-3);
+  border: 1px solid var(--input-border);
+  border-radius: var(--r-input);
+  background-color: var(--surface);
+  color: var(--text);
+  font-size: var(--fs-15);
+  line-height: 20px;
+  transition:
+    border-color var(--t-fast) ease,
+    background-color var(--t-fast) ease;
+}
+input::placeholder,
+textarea::placeholder {
+  color: var(--text-muted);
+  opacity: 1;
+}
+input::-webkit-inner-spin-button,
+input::-webkit-outer-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+input[type="number"] {
+  -moz-appearance: textfield;
+  appearance: textfield;
+}
+:is(input, select, textarea):not(:disabled):is(:hover, .is-hover) {
+  border-color: var(--input-border-hover);
+}
+:is(input, select, textarea):is(:focus-visible, .is-focus) {
+  border-color: var(--focus);
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+:is(input, select, textarea)[aria-invalid="true"] {
+  border-color: var(--error);
+}
+:is(input, select, textarea):disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+  background-color: var(--bg);
+}
+input:read-only:not(:disabled, [type="checkbox"], [type="radio"]),
+textarea:read-only {
+  background-color: var(--bg);
+}
+textarea {
+  height: auto;
+  min-height: 320px;
+  padding: var(--s-3);
+  font-family: var(--font-mono);
+  font-size: var(--fs-13);
+  line-height: var(--lh-body);
+  resize: vertical;
+}
+
+/* A select is native, with a drawn chevron. */
+select {
+  appearance: none;
+  padding-right: var(--s-10);
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M4.75 6.25 8 9.5l3.25-3.25' fill='none' stroke='%2366737F' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right var(--s-3) center;
+  background-size: 16px 16px;
+  cursor: pointer;
+  text-overflow: ellipsis;
+}
+:root[data-theme="dark"] select {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M4.75 6.25 8 9.5l3.25-3.25' fill='none' stroke='%2397A4AE' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+}
+select:not(:disabled):is(:active, .is-active) {
+  background-color: var(--row-hover);
+}
+select.select-sm {
+  width: auto;
+  height: var(--h-control-sm);
+  padding: 0 var(--s-8) 0 var(--s-3);
+  background-position: right var(--s-2) center;
+}
+
+/* Checkbox and radio: native elements drawn in the system's style. */
+input[type="checkbox"],
+input[type="radio"] {
+  appearance: none;
+  flex: none;
+  display: inline-block;
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  border: 1px solid var(--box-border);
+  background: var(--surface) no-repeat center / 14px 14px;
+  vertical-align: middle;
+  cursor: pointer;
+  transition:
+    background-color var(--t-fast) ease,
+    border-color var(--t-fast) ease;
+}
+input[type="checkbox"] {
+  border-radius: var(--r-input);
+}
+input[type="radio"] {
+  border-radius: 50%;
+}
+input[type="checkbox"]:checked {
+  border-color: var(--sign-press);
+  background-color: var(--sign);
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 14 14'%3E%3Cpath d='M3.25 7.25 5.75 9.75 10.75 4.25' fill='none' stroke='%231C2A39' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+}
+input[type="radio"]:checked {
+  border-color: var(--sign-press);
+  background-color: var(--sign);
+  background-image: radial-gradient(circle, #1C2A39 0 3px, transparent 3.5px);
+}
+:is(input[type="checkbox"], input[type="radio"]):not(:disabled):is(:hover, .is-hover),
+label:hover > :is(input[type="checkbox"], input[type="radio"]):not(:disabled) {
+  border-color: var(--text);
+}
+:is(input[type="checkbox"], input[type="radio"]):not(:disabled, :checked):is(:active, .is-active) {
+  background-color: var(--press);
+}
+:is(input[type="checkbox"], input[type="radio"]):checked:not(:disabled):is(:hover, .is-hover),
+label:hover > :is(input[type="checkbox"], input[type="radio"]):checked:not(:disabled) {
+  border-color: var(--sign-press);
+  background-color: var(--sign-hover);
+}
+:is(input[type="checkbox"], input[type="radio"]):checked:not(:disabled):is(:active, .is-active) {
+  background-color: var(--sign-press);
+}
+:is(input[type="checkbox"], input[type="radio"]):disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+/* ── Signal lamps: a dot with a word, never colour alone ─────── */
+.lamp {
+  --c: var(--lamp-disabled);
+  --ring: transparent;
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--s-2);
+  line-height: var(--lh-table);
+  white-space: nowrap;
+  vertical-align: middle;
+}
+.lamp::before {
+  content: "";
+  flex: none;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--c);
+  box-shadow: inset 0 0 0 1.5px var(--ring);
+}
+.lamp[data-lamp="applied"] {
+  --c: var(--lamp-applied);
+}
+.lamp[data-lamp="propagating"] {
+  --c: var(--lamp-progress);
+}
+.lamp[data-lamp="pending"] {
+  --c: transparent;
+  --ring: var(--lamp-pending);
+}
+.lamp[data-lamp="rejected"] {
+  --c: var(--lamp-rejected);
+}
+.lamp[data-lamp="disabled"] {
+  --c: var(--lamp-disabled);
+}
+/* A rollout on its way pulses once when it appears. */
+.lamp[data-lamp="propagating"]::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 50%;
+  width: 8px;
+  height: 8px;
+  margin-top: -4px;
+  border-radius: 50%;
+  background: var(--c);
+  opacity: 0;
+  animation: ui-pulse 1.1s ease-out 1 both;
+}
+@keyframes ui-pulse {
+  from {
+    transform: scale(1);
+    opacity: 0.6;
+  }
+  to {
+    transform: scale(3.2);
+    opacity: 0;
+  }
+}
+
+/* Beside a heading, a lamp keeps body type. */
+:is(h1, h2, h3) :is(.lamp, .rollout) {
+  font-size: var(--fs-15);
+  font-weight: 400;
+  letter-spacing: 0;
+  line-height: var(--lh-table);
+}
+
+/* Chips and route-colour bars share the lamp's centre line and size step. */
+.tag {
+  display: inline-flex;
+  align-items: center;
+  height: 20px;
+  padding: 0 var(--s-2);
+  border-radius: var(--r-chip);
+  background: var(--chip);
+  color: var(--text-2);
+  font-size: var(--fs-12);
+  font-weight: 600;
+  line-height: 12px;
+  white-space: nowrap;
+  vertical-align: middle;
+}
+.grps {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: var(--s-1) var(--s-3);
+  vertical-align: middle;
+}
+.grps-one {
+  flex-wrap: nowrap;
+  align-items: center;
+  gap: var(--s-2);
+}
+.tag.more {
+  cursor: default;
+}
+.grp {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--s-2);
+  line-height: var(--lh-table);
+  white-space: nowrap;
+}
+.grp::before {
+  content: "";
+  flex: none;
+  width: 4px;
+  height: 12px;
+  border-radius: 1px;
+  background: var(--c, var(--route-1));
+}
+
+/* ── Notes: a passage in a panel, marked by a bar on its left ─── */
+.note {
+  margin: var(--s-4) 0;
+  padding: var(--s-3) var(--s-4);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--n3);
+  border-radius: var(--r-button);
+  background: var(--surface);
+  color: var(--text);
+  line-height: var(--lh-body);
+}
+.note.ok {
+  border-left-color: var(--proceed);
+}
+.note.warn {
+  border-left-color: var(--sign);
+}
+.note.crit {
+  border-left-color: var(--stop);
+}
+.note > p + p,
+.note > p + ul,
+.note > ul + p,
+.note > strong + p {
+  margin-top: var(--s-2);
+}
+.note ul {
+  margin: var(--s-2) 0 0;
+  padding-left: var(--s-5);
+}
+.note li + li {
+  margin-top: var(--s-1);
+}
+.note > :last-child {
+  margin-bottom: 0;
+}
+.note > p:has(> .btn),
+.note > .tn-actions {
+  margin-top: var(--s-3);
+}
+.note > .btn {
+  margin-left: var(--s-1);
+}
+
+/* ── Tables: 36px header, 44px rows, hover in Concrete, no zebra ─ */
+/* The table's box is the containing block of whatever is absolutely
+   placed inside it (a tooltip, visually hidden text), so the box clips it
+   instead of it widening the page past the screen. */
+.dt-wrap {
+  --dt-edge: var(--s-3);
+  position: relative;
+  overflow-x: auto;
+  margin: var(--s-4) 0 0;
+}
+.dt-wrap.dt-scroll {
+  max-height: min(70vh, 720px);
+  overflow-y: auto;
+}
+/* A table wider than its box scrolls sideways inside it, and a shadow at
+   the edge it continues past says so. The two surface-coloured layers move
+   with the content and cover the shadows while that edge is in view. */
+.dt-wrap {
+  background:
+    linear-gradient(to right, var(--surface) 30%, transparent) left / 32px 100% no-repeat local,
+    linear-gradient(to left, var(--surface) 30%, transparent) right / 32px 100% no-repeat local,
+    radial-gradient(farthest-side at 0 50%, var(--scroll-shadow), transparent) left / 12px 100% no-repeat scroll,
+    radial-gradient(farthest-side at 100% 50%, var(--scroll-shadow), transparent) right / 12px 100% no-repeat scroll;
+}
+.dt {
+  width: 100%;
+  border-collapse: collapse;
+  line-height: var(--lh-table);
+}
+.dt th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  height: var(--h-head);
+  padding: 0 var(--s-3);
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text-muted);
+  font-size: var(--fs-12);
+  font-weight: 600;
+  text-align: left;
+  white-space: nowrap;
+  vertical-align: middle;
+}
+/* Cells keep to one line, so a name or an id never wraps midway; a narrow
+   screen scrolls the table sideways instead. Notes under a value wrap. */
+.dt td {
+  height: var(--h-row);
+  padding: var(--s-1) var(--s-3);
+  border-bottom: 1px solid var(--divider);
+  vertical-align: middle;
+  white-space: nowrap;
+}
+.dt td :is(.cell-note, .tn-note, .tn-flag, .tn-error, .rollout-errors, .audit-detail, .note, .tn-override, .two-step-warn) {
+  white-space: normal;
+}
+.dt td :is(.cell-note, .tn-note, .tn-flag, .tn-error) {
+  max-width: 280px;
+}
+/* A row with a note line under its text is 56px. */
+.dt tr:has(.cell-note, .tn-note, .rollout-errors, .sub) > td {
+  padding-top: var(--s-2);
+  padding-bottom: var(--s-2);
+}
+.dt td > .lamp,
+.dt td > .rollout {
+  vertical-align: top;
+}
+.dt tbody tr:last-child > td {
+  border-bottom: 0;
+}
+.dt tbody tr {
+  transition: background-color var(--t-fast) ease;
+}
+.dt tbody tr:hover {
+  background: var(--row-hover);
+}
+.dt th:first-child,
+.dt td:first-child {
+  padding-left: var(--dt-edge);
+}
+.dt th:last-child,
+.dt td:last-child {
+  padding-right: var(--dt-edge);
+}
+.dt :is(th, td):is(.right, .num) {
+  text-align: right;
+  font-variant-numeric: tabular-nums lining-nums;
+}
+.dt.dt-compact td {
+  height: var(--h-row-compact);
+  padding-top: var(--s-1);
+  padding-bottom: var(--s-1);
+}
+/* A row that holds an editor under the row above it. */
+.dt tr.dt-detail > td {
+  padding-top: 0;
+  padding-bottom: var(--s-4);
+}
+.dt tr.dt-detail:hover,
+.dt tr:has(+ tr.dt-detail):hover {
+  background: none;
+}
+.dt tr:has(+ tr.dt-detail) > td {
+  border-bottom: 0;
+}
+/* Secondary text inside a cell: a second line in 13px. Its 2px gap is the
+   one step off the 4px grid, kept so a row with a note stays 56px; the
+   tenant list's notes (Tenants.css) take the same exception. */
+.dt .cell-note {
+  display: block;
+  margin-top: 2px;
+  color: var(--text-muted);
+  font-size: var(--fs-13);
+  line-height: var(--lh-table);
+}
+.dt code {
+  white-space: nowrap;
+}
+/* Actions in a row sit side by side, 8px apart, on one line, lined up at
+   their top, so an open two-step's warning hangs under the row's buttons
+   rather than pushing them down to its middle. */
+.dt td > :is(.btn, .two-step, .has-tip) {
+  vertical-align: top;
+}
+.dt td > .btn + .btn,
+.dt td > .btn + .two-step,
+.dt td > .two-step + .btn,
+.dt td > .btn + .has-tip {
+  margin-left: var(--s-2);
+}
+.dt td.right:has(> .btn, > .two-step) {
+  white-space: nowrap;
+}
+/* A table straight inside a panel runs edge to edge, its outer cells
+   padded to the panel's own 24px, so the header rule spans the panel. */
+.panel > .dt-wrap {
+  --dt-edge: var(--s-6);
+  margin-left: calc(-1 * var(--s-6));
+  margin-right: calc(-1 * var(--s-6));
+}
+/* Last in its panel: it closes the panel, and its rounded corners clip a
+   hovered last row. */
+.panel > .dt-wrap:last-child {
+  margin-bottom: calc(-1 * var(--s-6));
+  border-radius: 0 0 calc(var(--r-panel) - 1px) calc(var(--r-panel) - 1px);
+}
+/* A table nested in a part of a page lines up with the text around it. */
+.tn-section .dt-wrap,
+.note .dt-wrap {
+  --dt-edge: 0px;
+}
+
+/* A list loading: three rows of skeleton, and the status text hidden. */
+.loading {
+  margin: var(--s-4) 0 0;
+}
+.skeleton {
+  display: grid;
+  gap: 0;
+  border-top: 1px solid var(--divider);
+}
+.skeleton > span {
+  display: flex;
+  align-items: center;
+  gap: var(--s-8);
+  height: var(--h-row);
+  border-bottom: 1px solid var(--divider);
+}
+.skeleton i {
+  display: block;
+  height: 12px;
+  border-radius: var(--r-input);
+  background: var(--skeleton);
+}
+
+/* ── Empty states: a mark, one sentence, one action ──────────── */
+.empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--s-4);
+  margin: var(--s-4) 0 0;
+  padding: var(--s-12) var(--s-6);
+  border-top: 1px solid var(--divider);
+  color: var(--text-2);
+  text-align: center;
+}
+.empty > .icon {
+  color: var(--text-muted);
+}
+
+/* ── The two-step confirm, swapped in place ───────────────────── */
+/* The second step: the two buttons, then the warning on a line under
+   them, so a row's actions widen by the warning's length at most. The
+   swap fades in while the box eases to its new width (TwoStep.tsx). */
+.two-step {
+  display: inline-flex;
+  vertical-align: middle;
+}
+.two-step.is-asking {
+  display: inline-grid;
+  justify-items: start;
+  gap: var(--s-1);
+}
+.two-step-confirm {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--s-2);
+}
+.two-step.is-swapping {
+  overflow: clip;
+  overflow-clip-margin: 4px;
+}
+.two-step-warn {
+  /* Its own width up to 44ch, so a table shrinking its columns cannot
+     squeeze a short warning onto two lines; a long one wraps at 44ch. */
+  width: max-content;
+  max-width: 44ch;
+  color: var(--text-2);
+  font-size: var(--fs-13);
+  line-height: var(--lh-table);
+  white-space: normal;
+  text-wrap: balance;
+}
+/* In a row's actions column, against the column's right edge. */
+.right .two-step.is-asking {
+  justify-items: end;
+}
+.right .two-step-warn {
+  text-align: right;
+}
+.is-in {
+  animation: ui-fade var(--t-fast) ease-out both;
+}
+@keyframes ui-fade {
+  from {
+    opacity: 0;
+  }
+}
+
+/* ── Toasts: bottom left, slide up and fade in, fade out ──────── */
+.toasts {
+  position: fixed;
+  left: var(--s-6);
+  bottom: var(--s-6);
+  z-index: 40;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--s-2);
+  pointer-events: none;
+}
+.toast {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--s-2);
+  min-height: 40px;
+  padding: var(--s-2) var(--s-4);
+  border-radius: var(--r-button);
+  background: var(--tooltip-bg);
+  color: var(--tooltip-text);
+  box-shadow: var(--shadow-float);
+  font-weight: 600;
+  line-height: 16px;
+  animation: ui-toast-in var(--t-panel) ease-out both;
+}
+.toast::before {
+  content: "";
+  flex: none;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--lamp-applied);
+}
+.toast.is-leaving {
+  opacity: 0;
+  transition: opacity var(--t-leave) ease-in;
+}
+@keyframes ui-toast-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+}
+
+/* ── Panels and the side panel ───────────────────────────────── */
+.panel {
+  margin: 0 0 var(--s-4);
+  padding: var(--s-6);
+  border: 1px solid var(--border);
+  border-radius: var(--r-panel);
+  background: var(--surface);
+  min-width: 0;
+}
+.side-panel {
+  animation: ui-slide var(--t-panel) ease-out both;
+}
+.side-panel:focus {
+  outline: none;
+}
+.side-panel:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+.side-head {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2) var(--s-3);
+  min-width: 0;
+}
+.side-head > h2 {
+  min-width: 0;
+  overflow: hidden;
+  font-size: var(--fs-23);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.side-head > .side-close {
+  margin-left: auto;
+}
+@keyframes ui-slide {
+  from {
+    opacity: 0;
+    transform: translateX(24px);
+  }
+}
+/* The list and its detail: side by side from 1400px, stacked under it below. */
+.with-side {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 0 var(--s-4);
+  align-items: start;
+}
+@media (min-width: 1400px) {
+  .with-side.is-open {
+    grid-template-columns: minmax(0, 1fr) 416px;
+  }
+  .with-side.is-open > .side-panel {
+    position: sticky;
+    top: var(--s-4);
+    max-height: calc(100vh - 2 * var(--s-4));
+    overflow-y: auto;
+    overscroll-behavior: contain;
+  }
+}
+
+/* ── Route-line navigation, the one bold element ─────────────── */
+.route-nav {
+  --rail-line: var(--route-line);
+  background: var(--surface);
+}
+.route-nav ol {
+  position: relative;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.route-nav li {
+  position: relative;
+}
+.route-stop {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: var(--s-3);
+  width: calc(100% - 2 * var(--s-2));
+  height: 40px;
+  margin: 0 var(--s-2);
+  padding: 0 var(--s-2);
+  border: 0;
+  border-radius: var(--r-button);
+  background: none;
+  color: var(--text-2);
+  text-align: left;
+  cursor: pointer;
+  transition: color var(--t-fast) ease;
+}
+.stop-box {
+  position: relative;
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+}
+.stop {
+  width: 16px;
+  height: 16px;
+  border: 3px solid var(--rail-line);
+  border-radius: 50%;
+  background: var(--surface);
+  transition:
+    background-color var(--t-fast) ease,
+    width var(--t-fast) ease,
+    height var(--t-fast) ease;
+}
+.stop-name {
+  white-space: nowrap;
+  line-height: var(--lh-table);
+  transition: color var(--t-fast) ease;
+}
+.route-stop:is(:hover, .is-hover) {
+  color: var(--text);
+}
+.route-stop:is(:hover, .is-hover) .stop {
+  background: var(--row-hover);
+}
+.route-stop:active .stop {
+  background: var(--n4);
+}
+.route-stop[aria-selected="true"] {
+  color: var(--text);
+}
+.route-stop[aria-selected="true"] .stop {
+  width: 24px;
+  height: 24px;
+  background: var(--sign);
+}
+.route-stop[aria-selected="true"] .stop-name {
+  font-weight: 700;
+}
+/* Something needs attention in that section: a small Stop-red marker. */
+.route-stop[data-attention] .stop-box::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  right: 0;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--stop);
+  box-shadow: 0 0 0 2px var(--surface);
+}
+.route-stop[data-attention][aria-selected="true"] .stop-box::after {
+  top: -2px;
+  right: -2px;
+}
+
+/* ≥ 720px: a vertical line down the left edge, one stop per section. */
+@media (min-width: 720px) {
+  /* The rail's surface runs the page's full height; the line itself stays
+     in view while the page scrolls. */
+  .route-nav {
+    align-self: stretch;
+    border-right: 1px solid var(--border);
+  }
+  .route-nav ol {
+    position: sticky;
+    top: 0;
+    padding: var(--s-4) 0;
+  }
+  .route-nav ol::before {
+    content: "";
+    position: absolute;
+    left: 26px;
+    top: 36px;
+    bottom: 36px;
+    width: 4px;
+    border-radius: 2px;
+    background: var(--rail-line);
+  }
+}
+/* 720–1199px: stops only; a stop's name shows beside it on hover or focus. */
+@media (min-width: 720px) and (max-width: 1199px) {
+  .route-stop {
+    width: 40px;
+  }
+  .stop-name {
+    position: absolute;
+    left: calc(100% + var(--s-3));
+    top: 4px;
+    z-index: 30;
+    display: flex;
+    align-items: center;
+    height: var(--h-control-sm);
+    padding: 0 var(--s-3);
+    border-radius: var(--r-button);
+    background: var(--surface-raised);
+    box-shadow: var(--shadow-float);
+    color: var(--text);
+    font-weight: 600;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity var(--t-fast) ease;
+  }
+  .route-stop:is(:hover, :focus-visible) .stop-name {
+    opacity: 1;
+  }
+}
+/* ≥ 1200px: names stay visible beside the line. */
+@media (min-width: 1200px) {
+  .route-nav ol {
+    max-height: 100vh;
+    overflow-y: auto;
+  }
+}
+/* Under 720px: the line runs along a bar at the bottom of the screen. */
+@media (max-width: 719px) {
+  .route-nav {
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 20;
+    overflow-x: auto;
+    border-top: 1px solid var(--border);
+    scrollbar-width: none;
+  }
+  .route-nav::-webkit-scrollbar {
+    display: none;
+  }
+  /* The bar scrolls sideways: its ends fade, so a stop cut at the edge
+     reads as more of the line, not as a broken label. */
+  .route-nav {
+    mask-image: linear-gradient(90deg, transparent, #000 24px, #000 calc(100% - 24px), transparent);
+  }
+  .route-nav ol {
+    display: flex;
+    width: max-content;
+    padding: var(--s-2) var(--s-2) calc(var(--s-1) + env(safe-area-inset-bottom, 0px));
+  }
+  .route-nav ol::before {
+    content: "";
+    position: absolute;
+    left: 40px;
+    right: 40px;
+    top: 18px;
+    height: 4px;
+    border-radius: 2px;
+    background: var(--rail-line);
+  }
+  .route-stop {
+    flex-direction: column;
+    gap: var(--s-1);
+    width: 64px;
+    height: auto;
+    margin: 0;
+    padding: 0 0 var(--s-1);
+    text-align: center;
+  }
+  .stop-name {
+    color: var(--text-muted);
+    font-size: var(--fs-12);
+  }
+  .route-stop[aria-selected="true"] .stop-name {
+    color: var(--text);
+    font-weight: 600;
+  }
+  .toasts {
+    left: var(--s-4);
+    bottom: 88px;
+  }
+}

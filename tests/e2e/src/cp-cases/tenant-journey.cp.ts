@@ -14,6 +14,7 @@ import {
   callGateway,
   startPlatformUpstream,
   type GatewayAnswer,
+  textWithoutPassedThroughIds,
   type PlatformUpstream,
 } from "../harness/cp-upstream.js";
 
@@ -331,6 +332,11 @@ describe("a tenant's journey from signup to a working key, and the switches that
     expect(answers.length).toBeGreaterThanOrEqual(15);
     expect(answers.filter((a) => a.status === 403).length).toBeGreaterThanOrEqual(2);
     expect(answers.some((a) => a.status === 429)).toBe(true);
+    // A Chat Completions response id is the upstream's own, unchanged: the
+    // mock upstream puts the marker in it, so the sweep below skips ids on
+    // the two surfaces where they pass through.
+    const chatAnswer = answers.find((a) => a.path === "/v1/chat/completions" && a.status === 200);
+    expect(chatAnswer?.json?.id, chatAnswer?.text).toBe(`chatcmpl-${MARKER}`);
     const leaks = [
       MARKER,
       "acct-e2e-1",
@@ -346,7 +352,7 @@ describe("a tenant's journey from signup to a working key, and the switches that
     for (const answer of answers) {
       const headers = [...answer.headers.entries()].map(([k, v]) => `${k}: ${v}`).join("\n");
       for (const leak of leaks) {
-        expect(answer.text, `a ${answer.status} body names ${leak}`).not.toContain(leak);
+        expect(textWithoutPassedThroughIds(answer), `a ${answer.status} body names ${leak}`).not.toContain(leak);
         expect(headers, `a ${answer.status} answer's headers name ${leak}`).not.toContain(leak);
       }
     }

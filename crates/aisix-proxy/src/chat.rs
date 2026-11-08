@@ -576,8 +576,8 @@ pub async fn chat_completions(
                     // 上游已经为这些 token 收过钱了，所以这一发和成功的一发对
                     // 网关来说成本相同 —— 网关自己的额度闸也正是这么算的。定价
                     // 按调度到的目标（虚拟父级不带 `cost`），与成功路径同一条
-                    // 规则。写 0 会让客户账本上出现「有 token、没金额」，而门户
-                    // 按花费序列扣款，那笔钱就永远扣不到，两本账各说各话。
+                    // 规则。写 0 会让客户账本上出现「有 token、没金额」，花费
+                    // 序列也漏掉这笔钱，两本账各说各话。
                     let blocked_cost_usd = crate::usage_attr::request_cost_usd(
                         &snapshot,
                         event_model_id,
@@ -1055,7 +1055,7 @@ struct SemanticGateCtx {
 /// 「同族没有齐步走」—— 而那正是这个仓库反复吃亏的形状。
 ///
 /// 与路由那条的一个差别：命中缓存时这次请求根本不会走到提交预留那一步，所以这里
-/// 只发指标（门户按 user_id 求和照样扣得到），网关侧的额度计数器不包含它。
+/// 只发指标（花费序列里照样有它），网关侧的额度计数器不包含它。
 async fn cache_semantic_embed(
     state: &ProxyState,
     snapshot: &AisixSnapshot,
@@ -1683,6 +1683,14 @@ async fn dispatch(
     if !auth.key().can_access(snapshot, &req.model) {
         return Err(with_model(ProxyError::ModelForbidden(req.model.clone())));
     }
+    // A grouped key is answered as if no ensemble existed, ahead of
+    // everything that could tell the two apart (the IP check, guardrails).
+    crate::model_resolve::refuse_ensemble_to_grouped_key(
+        &req.model,
+        &virtual_entry.value,
+        &auth.key().allowed_provider_groups,
+    )
+    .map_err(with_model)?;
 
     // Client-IP allowlist gate (#557): reject before any guardrail / upstream
     // work when the resolved source IP is outside the model's allowed_cidrs.
@@ -2165,9 +2173,9 @@ async fn dispatch(
                             target_model,
                             target_model_id: attempt.id.clone(),
                             provider_key_id: pk_entry.id.clone(),
-                            status: 429,
+                            status: e.status().as_u16(),
                             success: false,
-                            error_class: "rate_limit_exceeded".to_string(),
+                            error_class: crate::attempt::error_class(&e).to_string(),
                             error_message: e.to_string(),
                             latency_ms: 0,
                             dispatched: false,
@@ -2915,7 +2923,11 @@ async fn dispatch(
     // purges, callers, or tenants.
     let cache_key_full = match (policy_cache.as_ref(), matched_policy.as_ref()) {
         (Some(_), Some(entry)) => {
-            let scope_value = crate::response_cache::cache_scope_value(entry.value.scope, auth);
+            let scope_value = crate::response_cache::cache_scope_value(
+                entry.value.scope,
+                auth,
+                state.platform().is_some(),
+            );
             Some(
                 CacheKey::from_request(req)
                     .with_scope(
@@ -3060,7 +3072,7 @@ async fn dispatch(
                 // 命中缓存：没有上游 chat 调用，所以 token 记 0。但**分类调用
                 // 已经发生了** —— 语义路由为了决定路由，在缓存查询之前就打了一发
                 // 嵌入调用。用 `commit_tokens_no_spend` 会把它从额度里漏掉（指标
-                // 里还在，所以门户照扣，但网关侧的闸不认它）。非语义请求这个数
+                // 里还在，但网关侧的闸不认它）。非语义请求这个数
                 // 是 0，行为与原来完全一致。
                 reservation.commit(0, semantic_embed_spend).await;
                 // Counted HERE, at the gate's decision — the same rule the
@@ -3384,7 +3396,7 @@ async fn dispatch(
     // DISPATCHED row, not the caller-addressed one** — for a routing group
     // or a semantic router the addressed entry is a virtual parent with no
     // `cost`, so pricing against it silently yields 0: no spend series, no
-    // allowance consumed, no budget enforced. Equal to `model_id` for a
+    // spend ceiling consumed, no budget enforced. Equal to `model_id` for a
     // direct model, which is why it went unnoticed. The streaming branch
     // already carries the winner's id (`winner_target_id`, #790).
     let mut chosen_target_id: Option<String> = None;
@@ -3515,9 +3527,9 @@ async fn dispatch(
                         target_model,
                         target_model_id: attempt.id.clone(),
                         provider_key_id: pk_entry.id.clone(),
-                        status: 429,
+                        status: e.status().as_u16(),
                         success: false,
-                        error_class: "rate_limit_exceeded".to_string(),
+                        error_class: crate::attempt::error_class(&e).to_string(),
                         error_message: e.to_string(),
                         latency_ms: 0,
                         dispatched: false,
@@ -3780,6 +3792,18 @@ async fn dispatch(
         ),
         completion,
     );
+    // Billed from here on, whatever the work below does or how long it takes:
+    // a caller that leaves during it still owes this answer.
+    crate::attribution::note_answered_usage(crate::usage_attr::AnsweredUsage {
+        prompt_tokens: prompt_tokens_u32,
+        completion_tokens: completion_tokens_u32,
+        usage_estimated,
+        cost_usd,
+        service_tier: service_tier.clone(),
+        provider_request_id: provider_request_id.clone(),
+        provider_model_version: provider_model_version.clone(),
+        ..crate::usage_attr::AnsweredUsage::from_stats(&upstream.usage)
+    });
     reservation
         .commit(total, crate::usage_attr::spend_micro_usd(cost_usd))
         .await;
@@ -4853,8 +4877,8 @@ async fn dispatch_ensemble(
     let total_tokens = panel_total + u64::from(effective_judge.usage.total_tokens);
     crate::attribution::note_ensemble_tokens_charged();
     reservation.commit_tokens_no_spend(total_tokens).await;
-    // One figure per sub-call for its row and for the spend metric the
-    // portal bills from, which `record_success` reads off `Success::cost_usd`.
+    // One figure per sub-call for its row and for the spend metric, which
+    // `record_success` reads off `Success::cost_usd`.
     let judge_cost_usd = crate::usage_attr::request_cost_usd(
         snapshot,
         &resolve_sub(&outcome.judge_model).0,
@@ -6149,7 +6173,7 @@ struct EnsembleCharge {
     entry_keys: Vec<String>,
     /// The panel's (or, abandoned, every returned sub-call's) usage.
     usage: aisix_gateway::chat::UsageStats,
-    /// What that usage cost, for the spend metric the portal bills from.
+    /// What that usage cost, for the spend metric.
     cost_usd: f64,
     bounded_model: String,
     metric_caller: crate::request_metrics::Owned,
@@ -6662,8 +6686,8 @@ fn build_sse_stream<F>(
     // `on_complete` (`comp`) counts stay stream-only. Zero for single-upstream
     // callers, where the fold is a no-op.
     base_usage: aisix_gateway::chat::UsageStats,
-    // Platform mode: every frame carries one minted id and mapped tool-call
-    // ids (see `render::render_chunk`).
+    // Platform mode: usage keeps to OpenAI's counters and an empty opening
+    // chunk is dropped; ids are the upstream's (see `render::render_chunk`).
     platform: Option<crate::platform::PlatformSettings>,
     // Token-estimation fallback context (#1074); see
     // `CompleteOnDrop::estimator`.
@@ -6799,7 +6823,7 @@ where
         let mut last_usage: Option<aisix_gateway::chat::UsageStats> = None;
         let fold_base = base_usage != aisix_gateway::chat::UsageStats::default();
         let mut last_chunk_id = String::new();
-        let mut stream_id = crate::render::StreamId::new(platform.is_some());
+        let mut stream_id = crate::render::StreamId::default();
         let mut last_chunk_model = String::new();
         let mut last_chunk_tier = None;
         // Render + serialise one held/live chunk into an SSE Event.
@@ -7072,6 +7096,16 @@ where
                         None => reported,
                     };
                     if reported
+                        && chunk.finish_reason.is_none()
+                        && chunk.has_no_payload()
+                    {
+                        continue;
+                    }
+                    // Platform mode: a chunk with nothing for the caller is
+                    // one channel's habit (a stream opening on a frame with
+                    // no choice), never another's, so relaying it would name
+                    // the channel.
+                    if platform.is_some()
                         && chunk.finish_reason.is_none()
                         && chunk.has_no_payload()
                     {
@@ -9598,5 +9632,97 @@ mod delivery_counter_tests {
             out.chunks_delivered, 4,
             "exact match — DeliveryCounter fires on every Ready(Some)"
         );
+    }
+}
+
+#[cfg(test)]
+mod platform_stream_tests {
+    use super::{build_sse_stream, StreamCompletion};
+    use aisix_gateway::{ChatChunk, ChatChunkStream};
+    use axum::response::{IntoResponse, Sse};
+    use std::sync::{Arc, Mutex};
+    use std::time::Instant;
+
+    /// The chunks the OpenAI wire relays for one upstream frame.
+    fn wire_chunks(frame: serde_json::Value) -> Vec<ChatChunk> {
+        let raw: aisix_provider_openai::wire::OpenAiStreamChunk =
+            serde_json::from_value(frame).expect("an OpenAI stream frame");
+        aisix_provider_openai::wire::stream_chunk_into_chat_chunks(raw, &mut Default::default())
+    }
+
+    /// What the caller receives from `chunks`, as `data:` payloads.
+    async fn payloads(
+        chunks: Vec<ChatChunk>,
+        platform: Option<crate::platform::PlatformSettings>,
+    ) -> Vec<String> {
+        let upstream: ChatChunkStream = Box::pin(futures::stream::iter(chunks.into_iter().map(Ok)));
+        let captured = Arc::new(Mutex::new(None::<StreamCompletion>));
+        let out = Arc::clone(&captured);
+        let stream = build_sse_stream(
+            upstream,
+            1,
+            None,
+            Instant::now(),
+            Instant::now(),
+            "gw".into(),
+            None,
+            false,
+            aisix_gateway::chat::UsageStats::default(),
+            platform,
+            None,
+            move |completion| {
+                *out.lock().unwrap() = Some(completion);
+            },
+        );
+        let body = axum::body::to_bytes(Sse::new(stream).into_response().into_body(), usize::MAX)
+            .await
+            .unwrap();
+        String::from_utf8_lossy(&body)
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: ").map(str::to_owned))
+            .collect()
+    }
+
+    /// One channel's stream opens on a frame with no choice (`choices: []`
+    /// beside its prompt filter results), which the OpenAI wire relays as a
+    /// chunk with an empty delta. Other channels never send it, so in
+    /// platform mode, where it would name the channel on every stream, a
+    /// chunk with nothing for the caller is dropped. Off platform mode it
+    /// is relayed as before.
+    #[tokio::test]
+    async fn a_chunk_with_nothing_for_the_caller_is_dropped_only_in_platform_mode() {
+        let frames = || {
+            let mut chunks = wire_chunks(serde_json::json!({
+                "id": "",
+                "model": "",
+                "choices": [],
+                "prompt_filter_results": [{"prompt_index": 0, "content_filter_results": {}}],
+            }));
+            chunks.extend(wire_chunks(serde_json::json!({
+                "id": "x",
+                "model": "m",
+                "choices": [{"index": 0, "delta": {"role": "assistant", "content": "hi"}, "finish_reason": null}],
+            })));
+            chunks.extend(wire_chunks(serde_json::json!({
+                "id": "x",
+                "model": "m",
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            })));
+            chunks
+        };
+
+        let off = payloads(frames(), None).await;
+        assert_eq!(off.len(), 4, "prelude, answer, finish, [DONE]: {off:?}");
+        assert!(off[0].contains(r#""delta":{}"#), "{off:?}");
+
+        let on = payloads(
+            frames(),
+            Some(crate::platform::PlatformSettings::from_secret("s")),
+        )
+        .await;
+        assert_eq!(on.len(), 3, "answer, finish, [DONE]: {on:?}");
+        assert!(on[0].contains(r#""role":"assistant""#), "{on:?}");
+        assert!(on[1].contains(r#""finish_reason":"stop""#), "{on:?}");
+        assert_eq!(on[2], "[DONE]");
     }
 }

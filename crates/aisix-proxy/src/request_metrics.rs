@@ -932,8 +932,8 @@ pub(crate) struct Tokens<'a> {
     pub cached: u32,
     pub cache_read: u32,
     pub cache_creation: u32,
-    /// 这次请求的花费（美元），写进 `aisix_llm_spend_micro_usd_total`，门户
-    /// 按这个计数器计费。必须显式给值：`..Default::default()` 能编译，但会
+    /// 这次请求的花费（美元），写进 `aisix_llm_spend_micro_usd_total`。
+    /// 必须显式给值：`..Default::default()` 能编译，但会
     /// 把这次请求静默记成零花费。
     pub spend_usd: f64,
     /// Normalised inbound client for the by-client series
