@@ -63,6 +63,8 @@ tokio-tungstenite.workspace = true
 async-trait.workspace = true
 async-stream = "0.3"
 dashmap.workspace = true
+# Bounded, expiring caches of the account lookups' answers (account/).
+moka.workspace = true
 arc-swap.workspace = true
 base64.workspace = true
 # Scheme validation of provider-supplied redirect targets on
@@ -99,6 +101,8 @@ tokio = { workspace = true, features = ["macros", "rt", "test-util"] }
 wiremock.workspace = true
 # Captures the auth-denial log lines so their per-request fields are pinned.
 tracing-subscriber.workspace = true
+# The platform-mode relay tests drive Claude on Vertex through the router.
+aisix-provider-vertex = { path = "../aisix-provider-vertex" }
 # The budget-gate boundary test loads a real `aisix_core::Config` from
 # a file so it exercises `managed.cp_base_url` normalisation.
 tempfile.workspace = true

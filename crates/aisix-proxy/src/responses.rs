@@ -10841,28 +10841,19 @@ data: [DONE]\n\n";
         (status, to_bytes(resp.into_body(), 65536).await.unwrap())
     }
 
-    /// What platform mode answers when an upstream says it does not have
-    /// the previous response: a 400 naming `previous_response_id`
+    /// What platform mode answers for a `previous_response_id` the gateway
+    /// cannot open: its own 400 naming `previous_response_id` under code
+    /// `previous_response_not_found`, the status, field and code of the
+    /// upstream's answer for one it does not have
     /// (<https://developers.openai.com/api/docs/guides/websocket-mode>).
     async fn platform_not_found() -> (StatusCode, bytes::Bytes) {
-        let resp = crate::error::tests::in_platform_mode(|| {
-            let message = "Previous response with id 'resp_x' not found.";
-            ProxyError::Bridge(aisix_gateway::BridgeError::UpstreamStatus {
-                status: 400,
-                message: message.into(),
-                parsed: Some(Box::new(aisix_gateway::UpstreamErrorView {
-                    kind: Some("invalid_request_error".into()),
-                    message: Some(message.into()),
-                    code: Some("previous_response_not_found".into()),
-                    param: Some("previous_response_id".into()),
-                })),
-                wire: aisix_gateway::UpstreamWire::OpenAI,
-                retry_after: None,
-                diagnostic: None,
-            })
-            .into_response()
-        });
-        status_and_body(resp).await
+        let resp =
+            crate::error::tests::in_platform_mode(|| ProxyError::ResponseNotFound.into_response());
+        let (status, body) = status_and_body(resp).await;
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["error"]["param"], "previous_response_id", "{v}");
+        assert_eq!(v["error"]["code"], "previous_response_not_found", "{v}");
+        (status, body)
     }
 
     /// An item reference that is not the caller's own seal is refused as a

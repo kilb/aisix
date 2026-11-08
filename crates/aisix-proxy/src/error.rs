@@ -414,6 +414,13 @@ pub enum ProxyError {
     /// cannot be known.
     #[error("budget could not be verified: usage has not reached the control plane")]
     BudgetUnverified,
+    /// An account lookup (`GET /v1/key`) the control plane could not answer:
+    /// it timed out, could not be reached, failed, or answered with something
+    /// that does not decode. Only the lookup fails; model requests never ask
+    /// the control plane. It names no upstream, so it keeps this envelope in
+    /// platform mode.
+    #[error("Account information is temporarily unavailable.")]
+    AccountUnavailable,
     /// Per RFC 9110 §15.5.14, a request body that exceeds a server-
     /// imposed limit gets a `413 Content Too Large`. The caller-visible
     /// `message` is intentionally bare of the actual incoming size
@@ -624,6 +631,7 @@ impl ProxyError {
             ProxyError::ContentFiltered { .. } => StatusCode::UNPROCESSABLE_ENTITY,
             ProxyError::BudgetExceeded(_) => StatusCode::TOO_MANY_REQUESTS,
             ProxyError::BudgetUnverified => StatusCode::SERVICE_UNAVAILABLE,
+            ProxyError::AccountUnavailable => StatusCode::SERVICE_UNAVAILABLE,
             ProxyError::RequestTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
             ProxyError::RateLimit(_) | ProxyError::ModelRateLimit(_) => {
                 StatusCode::TOO_MANY_REQUESTS
@@ -691,6 +699,9 @@ impl ProxyError {
             // A gateway-side dependency failed, like `JwksUnavailable`;
             // `error.code` carries the distinction.
             ProxyError::BudgetUnverified => "api_error",
+            // A gateway-side dependency failed, like `JwksUnavailable`;
+            // `error.code` carries the distinction.
+            ProxyError::AccountUnavailable => "api_error",
             ProxyError::RateLimit(_) | ProxyError::ModelRateLimit(_) => "rate_limit_exceeded",
             ProxyError::PolicyRateLimit { .. } => "rate_limit_exceeded",
             ProxyError::Bridge(b) => b.error_type(),
@@ -746,16 +757,20 @@ impl ProxyError {
 
     /// The OpenAI-shape envelope the caller receives. In platform mode an
     /// upstream's failure, or a refusal naming the target, is its platform
-    /// class instead (`crate::platform_errors`); the original error still
-    /// names the failure in the usage event and the access log. Platform mode
-    /// also answers a model the key may not use as an unknown one
-    /// (`crate::platform_errors::caller_error`).
+    /// class instead (`crate::platform_errors`), except an upstream's request
+    /// error that platform mode relays ([`relayed_upstream_envelope`]); the
+    /// original error still names the failure in the usage event and the
+    /// access log. Platform mode also answers a model the key may not use as
+    /// an unknown one (`crate::platform_errors::caller_error`).
     pub fn envelope(&self) -> ErrorEnvelope {
         if let Some(answered) = crate::platform_errors::caller_error(self) {
             return answered.envelope();
         }
         if let Some(class) = crate::platform_errors::caller_class(self) {
             return class.envelope();
+        }
+        if let Some(relayed) = self.as_bridge().and_then(relayed_upstream_envelope) {
+            return relayed;
         }
         // Bridge-surface upstream errors get special handling: the
         // bridge has best-effort-parsed the upstream envelope into a
@@ -839,6 +854,7 @@ impl ProxyError {
                 env
             }
             ProxyError::BudgetUnverified => env.with_code("budget_unverified"),
+            ProxyError::AccountUnavailable => env.with_code("control_plane_unavailable"),
             // Attribution for policy-layer 429s (#892): the
             // OpenAI envelope names the offending policy. The Anthropic
             // envelope keeps its strict {type,message} shape.
@@ -932,6 +948,51 @@ fn hides_budget_scope(r: &crate::budget::BudgetReason) -> bool {
         Some("api_key" | "member" | "team" | "team_member")
     );
     crate::platform_errors::active() && !(own_typed && own_text)
+}
+
+/// The OpenAI-shape envelope of an upstream's request error that platform
+/// mode relays as the upstream sent it
+/// (`crate::platform_errors::relayed_status`): the upstream's own `type`,
+/// `code`, `param` and message, which the bridge took through the shared
+/// scrubber when it read them. With platform mode off, `type` is the
+/// gateway's `upstream_error` (#327); a relayed answer keeps the upstream's,
+/// or `invalid_request_error` for one that names none, as the class it
+/// replaces did. `None` for every error platform mode does not relay.
+pub(crate) fn relayed_upstream_envelope(err: &aisix_gateway::BridgeError) -> Option<ErrorEnvelope> {
+    use aisix_gateway::BridgeError;
+    let status = crate::platform_errors::relayed_status(err)?;
+    let (BridgeError::UpstreamStatus {
+        message,
+        parsed,
+        wire,
+        ..
+    }
+    | BridgeError::UpstreamInBand {
+        message,
+        parsed,
+        wire,
+        ..
+    }) = err
+    else {
+        return None;
+    };
+    let mut envelope = render_bridge_upstream_envelope(status, message, parsed.as_deref(), *wire);
+    envelope.error.kind = match wire {
+        // Azure OpenAI's parser keeps the code its translation keys on in
+        // `kind`, so the type is not read from there. Azure answers a request
+        // error with `invalid_request_error`, or no type at all.
+        aisix_gateway::UpstreamWire::AzureOpenAI => "invalid_request_error".to_string(),
+        _ => parsed
+            .as_ref()
+            .and_then(|view| view.kind.clone())
+            .unwrap_or_else(|| "invalid_request_error".to_string()),
+    };
+    // Azure's own code, where the translation table would put OpenAI's
+    // (`content_filter` rather than `content_policy_violation`).
+    if *wire == aisix_gateway::UpstreamWire::AzureOpenAI {
+        envelope.error.code = parsed.as_ref().and_then(|view| view.code.clone());
+    }
+    Some(envelope)
 }
 
 /// Build the customer-visible envelope for an upstream HTTP error.
@@ -1096,7 +1157,23 @@ impl ProxyError {
         if let Some(answered) = crate::platform_errors::caller_error(self) {
             return answered.caller_status();
         }
+        // A relayed request error that came with no status of its own is
+        // answered with its class's.
+        if let Some(status) = self
+            .as_bridge()
+            .and_then(crate::platform_errors::relayed_status)
+        {
+            return StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_REQUEST);
+        }
         crate::platform_errors::caller_class(self).map_or_else(|| self.status(), |c| c.status())
+    }
+
+    /// The upstream-side failure this error is, if it is one.
+    fn as_bridge(&self) -> Option<&aisix_gateway::BridgeError> {
+        match self {
+            ProxyError::Bridge(e) => Some(e),
+            _ => None,
+        }
     }
 }
 
@@ -1236,12 +1313,7 @@ impl AnthropicErrorEnvelope {
                 kind: class.anthropic_kind().to_string(),
                 message: crate::platform_errors::platform_message(class).to_string(),
                 code: Some(class.code()),
-                param: match class {
-                    crate::platform_errors::PlatformErrorClass::InvalidRequest { param } => {
-                        param.clone()
-                    }
-                    _ => None,
-                },
+                param: class.param(),
             },
         }
     }
@@ -1359,7 +1431,10 @@ impl ProxyError {
         AnthropicErrorEnvelope {
             discriminator: "error",
             error: AnthropicErrorBody {
-                kind: anthropic_kind_from_status(self.status()).to_string(),
+                // The status the caller is answered with: in platform mode a
+                // relayed request error reported with no status of its own
+                // takes its class's.
+                kind: anthropic_kind_from_status(self.caller_status()).to_string(),
                 // Reuse OpenAI envelope only for the SAFE-MESSAGE logic
                 // (the upstream message, translated on a 4xx).
                 message: self.envelope().error.message,

@@ -27,6 +27,10 @@
 //! disagree about which route a path is. The census in this module's tests
 //! ties that map to the routes `build_router` mounts: a new route fails it
 //! until it declares a family, or a reason it needs none.
+//!
+//! The account routes ([`ACCOUNT_ROUTES`]) are open to every key whatever
+//! its list: they read the caller's own key and reach no upstream, so a key
+//! confined to the model endpoints can still read its own quota.
 
 use aisix_core::models::EndpointFamily;
 use aisix_core::ApiKey;
@@ -67,6 +71,17 @@ pub(crate) fn endpoint_family(path: &str) -> Option<EndpointFamily> {
         "/a2a" | "/a2a/{agent}/.well-known/agent-card.json" => F::A2a,
         _ => return None,
     })
+}
+
+/// The routes every key may call whatever its endpoint list, by route
+/// template, each with why. The extractor consults this before
+/// [`endpoint_family`].
+pub(crate) const ACCOUNT_ROUTES: &[(&str, &str)] = &[("/v1/key", "reads the caller's own key")];
+
+/// Whether `path` is one of [`ACCOUNT_ROUTES`].
+pub(crate) fn is_account_route(path: &str) -> bool {
+    let route = crate::normalize_endpoint_label(path);
+    ACCOUNT_ROUTES.iter().any(|(r, _)| *r == route)
 }
 
 /// Refuse `key` on a route of `family` unless the key may call it.
@@ -122,9 +137,11 @@ mod tests {
         Family(EndpointFamily),
         /// No family, and why: the route needs no key, or checks itself.
         Exempt(&'static str),
+        /// No family: every key may call it ([`ACCOUNT_ROUTES`]).
+        Account,
     }
 
-    use Expect::{Exempt, Family};
+    use Expect::{Account, Exempt, Family};
 
     const NO_KEY: &str = "answers without an API key";
 
@@ -136,6 +153,7 @@ mod tests {
         ("/readyz", Exempt("readiness probe")),
         ("/v1/models", Family(F::Models)),
         ("/v1/models/:id", Family(F::Models)),
+        ("/v1/key", Account),
         ("/v1/chat/completions", Family(F::ChatCompletions)),
         ("/v1/completions", Family(F::Completions)),
         ("/v1/embeddings", Family(F::Embeddings)),
@@ -315,7 +333,14 @@ mod tests {
         );
 
         for (route, expect) in ROUTES {
-            let got = endpoint_family(&concrete(route));
+            let path = concrete(route);
+            let got = endpoint_family(&path);
+            // Open to every key exactly when the row says so.
+            assert_eq!(
+                is_account_route(&path),
+                matches!(expect, Account),
+                "{route}"
+            );
             match expect {
                 Family(family) => assert_eq!(got, Some(*family), "{route}"),
                 Exempt(reason) => {
@@ -325,7 +350,30 @@ mod tests {
                     );
                     assert_eq!(got, None, "{route} is exempt yet maps to a family");
                 }
+                Account => {
+                    assert_eq!(
+                        got, None,
+                        "{route} is an account route yet maps to a family"
+                    );
+                    let (_, reason) = ACCOUNT_ROUTES
+                        .iter()
+                        .find(|(r, _)| r == route)
+                        .expect("an account route is listed in ACCOUNT_ROUTES");
+                    assert!(
+                        !reason.trim().is_empty(),
+                        "{route} is open without a reason"
+                    );
+                }
             }
+        }
+        // And no account route outlives its row.
+        for (route, _) in ACCOUNT_ROUTES {
+            assert!(
+                ROUTES
+                    .iter()
+                    .any(|(r, expect)| r == route && matches!(expect, Account)),
+                "{route} is in ACCOUNT_ROUTES without an Account row"
+            );
         }
     }
 
@@ -358,7 +406,7 @@ mod tests {
             .iter()
             .filter_map(|(_, expect)| match expect {
                 Family(f) => Some(*f),
-                Exempt(_) => None,
+                Exempt(_) | Account => None,
             })
             .chain([F::Passthrough])
             .collect();
@@ -490,6 +538,32 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
+    }
+
+    /// A key confined to chat may still read its own key: `GET /v1/key` is
+    /// answered as the route answers without a control plane (`404`), never
+    /// refused, while the same key is refused the model list.
+    #[tokio::test]
+    async fn the_key_route_is_open_to_a_restricted_key() {
+        let upstream = embeddings_upstream().await;
+        let router = router_with_key(&upstream, vec![F::ChatCompletions]);
+        let get = |uri: &str| {
+            Request::builder()
+                .method("GET")
+                .uri(uri)
+                .header("authorization", format!("Bearer {ALLOWED}"))
+                .body(Body::empty())
+                .unwrap()
+        };
+
+        let resp = router.clone().oneshot(get("/v1/key")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let body = json(resp).await;
+        assert_eq!(body["error"]["code"], "not_found", "{body}");
+
+        let resp = router.oneshot(get("/v1/models")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(json(resp).await["error"]["message"], REFUSAL);
     }
 
     /// `/v1/messages/count_tokens` is its own family, and its refusal comes

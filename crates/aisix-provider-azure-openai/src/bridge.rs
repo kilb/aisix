@@ -592,14 +592,15 @@ async fn map_http_error(status: StatusCode, resp: reqwest::Response) -> BridgeEr
 /// The OpenAI envelope, with Azure's code in both `kind` and `code`: Azure's
 /// `error.type` is not what the translation table keys on, so the renderer can
 /// override the code with a derived one (`DeploymentNotFound`) or pass it
-/// through (`rate_limit_exceeded`).
+/// through (`rate_limit_exceeded`). `code` stays Azure's own outer code, which
+/// a relayed error carries as sent.
 ///
 /// Azure-specific quirk: content-policy violations nest under
 /// `error.inner_error.code` *or* `error.innererror.code` (Azure emits
 /// both casings depending on endpoint).
-/// `"ResponsibleAIPolicyViolation"` on the inner code overrides the
-/// outer `code` so the gateway can recognise the policy hit even when
-/// the outer code is the generic `invalid_request_error`.
+/// `"ResponsibleAIPolicyViolation"` on the inner code becomes `kind` so the
+/// gateway can recognise the policy hit even when the outer code is the
+/// generic `invalid_request_error`.
 fn parse_azure_error_envelope(body: &[u8]) -> Option<aisix_gateway::UpstreamErrorView> {
     #[derive(serde::Deserialize)]
     struct Outer {
@@ -622,10 +623,11 @@ fn parse_azure_error_envelope(body: &[u8]) -> Option<aisix_gateway::UpstreamErro
             .or(o.error.innererror)
             .and_then(|i| i.code)
     });
-    if inner_code.as_deref() == Some(POLICY_VIOLATION) {
-        view.code = inner_code;
-    }
-    view.kind = view.code.clone();
+    view.kind = if inner_code.as_deref() == Some(POLICY_VIOLATION) {
+        inner_code
+    } else {
+        view.code.clone()
+    };
     Some(view)
 }
 
@@ -2467,6 +2469,8 @@ mod tests {
             BridgeError::UpstreamStatus { parsed, .. } => {
                 let parsed = parsed.expect("innererror parsed");
                 assert_eq!(parsed.kind.as_deref(), Some("ResponsibleAIPolicyViolation"));
+                // Azure's own outer code stays, for a relay to carry as sent.
+                assert_eq!(parsed.code.as_deref(), Some("invalid_request_error"));
             }
             other => panic!("expected UpstreamStatus, got {other:?}"),
         }
