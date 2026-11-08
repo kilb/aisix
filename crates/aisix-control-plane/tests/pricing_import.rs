@@ -998,8 +998,71 @@ async fn a_flagged_proposal_cannot_be_confirmed() {
     }
 }
 
+#[tokio::test]
+async fn a_second_decision_past_the_lock_writes_nothing() {
+    // The predicate's own proof, independent of the row lock: with the row
+    // already decided, the exact UPDATE each verb runs matches nothing, so a
+    // lost `FOR UPDATE` would refuse the second decision rather than rewrite
+    // the first. Without the `AND status = 'pending'` clause this UPDATE
+    // reports one affected row and the row is decided a second time.
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let op = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let model_id = model(&cp, &op, "anthropic", "claude-opus-5-5").await;
+    let batch = upload(&cp, &op).await;
+    let proposal = current(
+        &proposals(&cp, &op, &batch).await,
+        "anthropic",
+        "claude-opus-5-5",
+    )
+    .clone();
+    let pid = id(&proposal).to_string();
+
+    // Decide it for real, so the row is in the state the guarded UPDATE will
+    // meet: a check constraint ties `confirmed` to a baseline revision, which
+    // only the verb can write.
+    let body = json!({
+        "model_id": model_id,
+        "effective_from": db_now(&cp).await,
+        "attested": true,
+    });
+    let first = decide(&cp, &op, &batch, &proposal, "confirm", body).await;
+    assert_eq!(first.status, 201, "{first:?}");
+
+    for status in ["confirmed", "rejected"] {
+        let done = sqlx::query(
+            "UPDATE pricing_import_proposals \
+             SET status = $2, decided_at = now() \
+             WHERE id = $1::uuid AND status = 'pending'",
+        )
+        .bind(&pid)
+        .bind(status)
+        .execute(cp.db().pool())
+        .await
+        .expect("the guarded update runs");
+        assert_eq!(done.rows_affected(), 0, "{status}");
+    }
+
+    let stored: String =
+        sqlx::query_scalar("SELECT status FROM pricing_import_proposals WHERE id = $1::uuid")
+            .bind(&pid)
+            .fetch_one(cp.db().pool())
+            .await
+            .expect("read the decided row");
+    assert_eq!(stored, "confirmed", "the first decision stands");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_proposal_is_decided_once() {
+    // Two guards keep this invariant, and this case catches only their loss
+    // TOGETHER: the `FOR UPDATE OF p` that serialises the two decisions, and
+    // the `AND status = 'pending'` plus rows-affected check inside each verb.
+    // Removing the lock alone leaves this test green, because the loser's
+    // predicate matches nothing and it rolls back before its baseline lands.
+    // That is deliberate — the predicate is why a lost lock cannot rewrite a
+    // decided row — and `a_second_decision_past_the_lock_writes_nothing` is
+    // the proof the predicate carries on its own.
     let Some(cp) = TestCp::start().await else {
         return;
     };

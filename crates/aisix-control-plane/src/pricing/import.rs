@@ -754,9 +754,15 @@ async fn lock_proposal(
     // The row is held by another transaction: an upload superseding this
     // batch, or another operator deciding the same proposal. Either way the
     // review page is showing a row that is about to change, which is what
-    // `proposal_state` tells the caller.
+    // `proposal_state` tells the caller. Still logged, as `error.rs`'s own
+    // lock-timeout arm logs it: a run of them means something holds the row
+    // too long, and without the line a stuck upload reads as an operator
+    // double-clicking.
     .map_err(|e| match DbError::from(e) {
-        DbError::LockTimeout => ApiError::proposal_state(),
+        e @ DbError::LockTimeout => {
+            tracing::warn!(error = %e, "a proposal row was held past lock_timeout");
+            ApiError::proposal_state()
+        }
         e => ApiError::from(e),
     })?;
     proposal.ok_or_else(ApiError::not_found)
@@ -794,6 +800,9 @@ fn check_confirmable(proposal: &LockedProposal) -> Result<RateCard, ApiError> {
 /// `{model_id, effective_from, attested}` → `201 BaselineRevision`.
 ///
 /// Refused in this order:
+/// 0. `400`/`422` for a body that does not deserialize (an unknown member,
+///    a missing `model_id` or `effective_from`), which answers before
+///    anything below it is read.
 /// 1. `422 /attested` unless `attested` is exactly `true`, with
 ///    "请确认已对照官方价格页核对". This is checked **before the proposal is
 ///    read**, so it is a bad body on a pid that names nothing that answers
@@ -804,6 +813,9 @@ fn check_confirmable(proposal: &LockedProposal) -> Result<RateCard, ApiError> {
 /// 4. `422 /flags` for a proposal that carries any flag, or whose card this
 ///    engine cannot read (see [`check_confirmable`]).
 /// 5. `422 /effective_from` for a start before the proposal's own.
+/// 6. `insert_baseline`'s own refusals, which answer last: `422 /model_id`
+///    for a model that is not live, `422 /card` for a card it cannot apply,
+///    and its past-start `/effective_from` check.
 ///
 /// One transaction: the proposal row is taken `FOR UPDATE`, so of two
 /// decisions on it exactly one commits, and the other answers
