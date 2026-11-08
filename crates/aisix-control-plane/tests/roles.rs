@@ -308,6 +308,28 @@ fn fixture(method: &str, path: &str, target: &SeededOperator) -> (String, Option
             format!("/admin/provider-keys/{}/upstream-models", Uuid::nil()),
             None,
         ),
+        // Deciding a proposal. Both ids match nothing: past the role check,
+        // 404, so nothing is written.
+        ("POST", "/admin/pricing/imports/{id}/proposals/{pid}/confirm") => (
+            format!(
+                "/admin/pricing/imports/{}/proposals/{}/confirm",
+                Uuid::nil(),
+                Uuid::nil()
+            ),
+            Some(json!({
+                "model_id": Uuid::nil(),
+                "effective_from": chrono::Utc::now(),
+                "attested": true,
+            })),
+        ),
+        ("POST", "/admin/pricing/imports/{id}/proposals/{pid}/reject") => (
+            format!(
+                "/admin/pricing/imports/{}/proposals/{}/reject",
+                Uuid::nil(),
+                Uuid::nil()
+            ),
+            Some(json!({"reason": "roles"})),
+        ),
         _ => panic!("no fixture for {method} {path}: add one to tests/roles.rs"),
     }
 }

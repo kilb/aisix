@@ -567,6 +567,18 @@ pub const ROUTE_ROLES: &[(&str, &str, MinRole)] = &[
         "/admin/pricing/imports/{id}",
         MinRole::Op(OperatorRole::Viewer),
     ),
+    // Deciding a proposal: a confirmation writes a baseline, a rejection
+    // only the decision.
+    (
+        "POST",
+        "/admin/pricing/imports/{id}/proposals/{pid}/confirm",
+        MinRole::Op(OperatorRole::Operator),
+    ),
+    (
+        "POST",
+        "/admin/pricing/imports/{id}/proposals/{pid}/reject",
+        MinRole::Op(OperatorRole::Operator),
+    ),
     // Gateways, on the gateway listener.
     ("POST", "/dp/heartbeat", MinRole::Dp),
     ("GET", "/dp/v1/keys/{key_id}/prices", MinRole::Dp),
@@ -821,6 +833,16 @@ pub fn browser_router(state: AppState) -> Router {
                 .layer(DefaultBodyLimit::max(pricing::import::MAX_IMPORT_BYTES)),
         )
         .route("/admin/pricing/imports/{id}", get(pricing::import::detail))
+        // Deciding a proposal: a confirmation writes a third-party baseline,
+        // a rejection only the decision.
+        .route(
+            "/admin/pricing/imports/{id}/proposals/{pid}/confirm",
+            post(pricing::import::confirm),
+        )
+        .route(
+            "/admin/pricing/imports/{id}/proposals/{pid}/reject",
+            post(pricing::import::reject),
+        )
         .route_layer(axum::middleware::from_fn(json_only))
         .route_layer(axum::middleware::from_fn(only_listed_routes))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
