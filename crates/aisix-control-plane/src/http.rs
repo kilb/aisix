@@ -499,6 +499,17 @@ pub const ROUTE_ROLES: &[(&str, &str, MinRole)] = &[
         "/admin/billing/reconciliation",
         MinRole::Op(OperatorRole::Viewer),
     ),
+    // Baselines: each model's official list price, and where it came from.
+    (
+        "GET",
+        "/admin/pricing/baselines",
+        MinRole::Op(OperatorRole::Viewer),
+    ),
+    (
+        "POST",
+        "/admin/pricing/baselines",
+        MinRole::Op(OperatorRole::Operator),
+    ),
     // Gateways, on the gateway listener.
     ("POST", "/dp/heartbeat", MinRole::Dp),
     ("GET", "/dp/v1/keys/{key_id}/prices", MinRole::Dp),
@@ -720,6 +731,10 @@ pub fn browser_router(state: AppState) -> Router {
         .route(
             "/admin/billing/reconciliation",
             get(billing::reconcile::reconciliation),
+        )
+        .route(
+            "/admin/pricing/baselines",
+            get(pricing::baselines::list).post(pricing::baselines::create),
         )
         .route_layer(axum::middleware::from_fn(json_only))
         .route_layer(axum::middleware::from_fn(only_listed_routes))
