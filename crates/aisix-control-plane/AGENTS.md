@@ -65,11 +65,23 @@ way.
   the account to usage intake. Intake locks accounts only, in ascending tenant
   id, never waits on a tenant row and never takes the resources lock: it flags
   a crossing, and the settler (`billing::settler`) writes the mark after
-  commit. The settler takes each tenant row `NOWAIT` and the resources lock
-  only when it is free, so it never holds an account while waiting for it.
+  commit. Intake updates each account once, flag included
+  (`ledger::post_flagging`): a second update of a row in one transaction has
+  the foreign key's check key-share its tenant row, which a held tenant would
+  make intake wait on.
   `every_marking_path_takes_the_account_before_the_resources_lock`
   (`tests/billing_marks.rs`) sends each such path while the account is held
   elsewhere; a new one adds a case there.
+- **The settler is the one exception to the account-before-resources order,
+  and never waits while it is out of order.** It takes each tenant row
+  `NOWAIT`; then the account and the resources lock only if that is free. A
+  tenant that has found the resources lock busy for 10 s is reported at WARN,
+  and its settle then queues for the resources lock (for at most 2 s, holding
+  only the tenant row) and takes the account after it, `NOWAIT`. A lock taken
+  without waiting is in no wait cycle, and no settle holds an account while
+  queued, so intake never waits behind the resources lock
+  (`an_escalated_settle_never_holds_up_intake`,
+  `a_crossing_batch_never_waits_on_a_held_tenant_row`).
 - **Advisory lock keys must be unique.** They are the `*_LOCK_KEY` constants,
   all `0x6169_7369_7863_70xx`: operators `7030`, projector `7031`, resources
   `7032`, boot `7033`, signup `7073`. Postgres has one key space per database.
