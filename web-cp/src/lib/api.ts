@@ -693,3 +693,42 @@ export const pricing = {
     return (await call<{ items: PriceRow[] }>("GET", "/admin/pricing/models")).data.items;
   },
 };
+
+// ── pricing: tenant plans ───────────────────────────────────────────────────
+
+/** One discount revision: basis points off every charge of the tenant, from `effective_from`. */
+export interface DiscountRevision {
+  revision_id: number;
+  engine_version: number;
+  tenant_id: string;
+  effective_from: string;
+  discount_bps: number;
+  created_by: string | null;
+  created_at: string;
+}
+
+/** A tenant's plan: its discount, and the models it has override prices for. An override whose `current.card` is null has ended. */
+export interface TenantPlan {
+  tenant_id: string;
+  discount: { current: DiscountRevision | null; upcoming: DiscountRevision[] };
+  overrides: PriceRow[];
+}
+
+export const tenantPricing = {
+  async listDiscounts(q: { tenant_id?: string; limit?: number; before?: number }): Promise<{ items: DiscountRevision[]; next_before: number | null }> {
+    const params = new URLSearchParams();
+    if (q.tenant_id) params.set("tenant_id", q.tenant_id);
+    if (q.limit !== undefined) params.set("limit", String(q.limit));
+    if (q.before !== undefined) params.set("before", String(q.before));
+    const query = params.toString();
+    return (
+      await call<{ items: DiscountRevision[]; next_before: number | null }>("GET", `/admin/pricing/discounts${query ? `?${query}` : ""}`)
+    ).data;
+  },
+  async createDiscount(body: { tenant_id: string; effective_from: string; discount_bps: number }): Promise<DiscountRevision> {
+    return (await call<DiscountRevision>("POST", "/admin/pricing/discounts", body)).data;
+  },
+  async tenantPlan(tenantId: string): Promise<TenantPlan> {
+    return (await call<TenantPlan>("GET", `/admin/pricing/tenants/${seg(tenantId)}`)).data;
+  },
+};
