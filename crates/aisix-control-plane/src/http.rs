@@ -415,6 +415,27 @@ pub const ROUTE_ROLES: &[(&str, &str, MinRole)] = &[
         "/admin/tenants/{id}/credits",
         MinRole::Op(OperatorRole::Admin),
     ),
+    // Organization quotas: operators set a tenant's `team` level.
+    (
+        "GET",
+        "/admin/tenants/{id}/budgets",
+        MinRole::Op(OperatorRole::Viewer),
+    ),
+    (
+        "POST",
+        "/admin/tenants/{id}/budgets",
+        MinRole::Op(OperatorRole::Operator),
+    ),
+    (
+        "PATCH",
+        "/admin/tenants/{id}/budgets/{bid}",
+        MinRole::Op(OperatorRole::Operator),
+    ),
+    (
+        "DELETE",
+        "/admin/tenants/{id}/budgets/{bid}",
+        MinRole::Op(OperatorRole::Operator),
+    ),
     // Gateways, on the gateway listener.
     ("POST", "/dp/heartbeat", MinRole::Dp),
     ("GET", "/dp/v1/keys/{key_id}/prices", MinRole::Dp),
@@ -597,6 +618,14 @@ pub fn browser_router(state: AppState) -> Router {
         .route(
             "/admin/tenants/{id}/credits",
             post(billing::credits::create),
+        )
+        .route(
+            "/admin/tenants/{id}/budgets",
+            get(billing::budget_routes::list).post(billing::budget_routes::create),
+        )
+        .route(
+            "/admin/tenants/{id}/budgets/{bid}",
+            patch(billing::budget_routes::update).delete(billing::budget_routes::delete),
         )
         .route_layer(axum::middleware::from_fn(json_only))
         .route_layer(axum::middleware::from_fn(only_listed_routes))

@@ -1144,6 +1144,34 @@ async fn every_marking_path_takes_the_account_before_the_resources_lock() {
             .expect("a quota to edit")
             .id
     };
+    // The operator routes' own quotas: one each for the PATCH and the
+    // DELETE, a week and a cumulative one, so no route's write meets the
+    // quotas the cases above create (a day and a month).
+    let (for_patch, for_delete) = {
+        let ctx = WriteCtx::of(cp.state());
+        let week = organization_quota(BudgetPeriod::Week);
+        let total = NewBudget {
+            kind: Kind::Cumulative,
+            period: None,
+            ..organization_quota(BudgetPeriod::Week)
+        };
+        cp.db()
+            .tx(move |conn| {
+                async move {
+                    let (row, _) = tenants::lock_billing(&mut *conn, tenant).await?;
+                    let a = budgets::create(&mut *conn, &ctx, &row, week, Actor::System).await?;
+                    let b = budgets::create(&mut *conn, &ctx, &row, total, Actor::System).await?;
+                    Ok::<_, aisix_control_plane::error::ApiError>((a.id, b.id))
+                }
+                .boxed()
+            })
+            .await
+            .expect("quotas for the routes")
+    };
+    let route = |method: &'static str, path: String, body: Option<Value>| -> Request {
+        let (cp, admin) = (cp.clone(), admin.clone());
+        Box::pin(async move { cp.send(method, &path, Some(admin.cookie()), body).await })
+    };
     let cases: Vec<(&str, Uuid, Request, u16)> = vec![
         // A grant change takes the resources lock before it projects.
         (
@@ -1206,6 +1234,38 @@ async fn every_marking_path_takes_the_account_before_the_resources_lock() {
             tenant,
             quota_write(QuotaWrite::Delete(existing)),
             200,
+        ),
+        // The operators' quota routes. The month quota the cases above
+        // deleted is free again, so the POST creates it anew.
+        (
+            "POST /admin/tenants/{id}/budgets",
+            tenant,
+            route(
+                "POST",
+                format!("/admin/tenants/{tenant}/budgets"),
+                Some(json!({"limit_usd": "0.01"})),
+            ),
+            201,
+        ),
+        (
+            "PATCH /admin/tenants/{id}/budgets/{bid}",
+            tenant,
+            route(
+                "PATCH",
+                format!("/admin/tenants/{tenant}/budgets/{for_patch}"),
+                Some(json!({"limit_usd": "0.02"})),
+            ),
+            200,
+        ),
+        (
+            "DELETE /admin/tenants/{id}/budgets/{bid}",
+            tenant,
+            route(
+                "DELETE",
+                format!("/admin/tenants/{tenant}/budgets/{for_delete}"),
+                None,
+            ),
+            204,
         ),
     ];
     for (what, held, request, expected) in cases {
