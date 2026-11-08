@@ -18,25 +18,10 @@ test.beforeAll(async () => {
   // Every write that names a group names a live one: the accounts and the
   // tenant edits below included. A name a test here creates itself is
   // skipped.
-  const seededGroups = new Set<string>();
-  const seedGroups = async (names: string[]): Promise<void> => {
-    for (const name of names) {
-      if (seededGroups.has(name)) continue;
-      seededGroups.add(name);
-      const r = await stack.admin.request("POST", "/admin/provider-groups", {
-        name,
-        display_name: name,
-        default_cny_per_usd: "1",
-      });
-      if (r.status !== 201) {
-        throw new Error(`creating group ${name} answered ${r.status}: ${r.text}`);
-      }
-    }
-  };
   // The groups a test here creates itself (`grp-internal-keep-7c1`,
   // `grp-solo-6b2`, `grp-covered-6b2`, `grp-swap-a1c`, `grp-idle-4e1`) are
   // not seeded here: the edit that creates one also asserts what it answered.
-  await seedGroups(["grp-alpha-7c1", "grp-beta-3e9", "grp-dflt-8a3", "grp-x-41f", "grp-y-92c"]);
+  await stack.admin.seedGroups(["grp-alpha-7c1", "grp-beta-3e9", "grp-dflt-8a3", "grp-x-41f", "grp-y-92c"]);
 });
 
 test.afterAll(async () => {

@@ -117,6 +117,22 @@ export class ApiClient {
     });
   }
 
+  /**
+   * Every group in `names` a live one, created at the default rate unless it
+   * already is: a fixture that lists a group in an account, a tenant or the
+   * defaults names a live one first, and one a spec here creates itself is
+   * skipped.
+   */
+  async seedGroups(names: string[]): Promise<void> {
+    const listed: Json = await this.get("/admin/provider-groups");
+    const live = new Set<string>(listed.items.map((g: Json) => g.name as string));
+    for (const name of names) {
+      if (live.has(name)) continue;
+      await this.createGroup(name, name);
+      live.add(name);
+    }
+  }
+
   patch(path: string, body: unknown, version?: number): Promise<Json> {
     return this.ok("PATCH", path, body, version);
   }

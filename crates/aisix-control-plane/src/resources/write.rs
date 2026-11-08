@@ -179,7 +179,12 @@ fn check_size(doc: &Value) -> Result<(), ApiError> {
 }
 
 /// The live row `w` replaces or deletes, once the write may touch it.
-async fn writable_row(
+///
+/// [`super::api::replace`] calls it ahead of its pre-lock validation, so a
+/// request that fails both a stale `If-Match` and the strict schema answers
+/// `412`, as the tenant routes do. Calling it there changes no row: the
+/// version is compared again under the resources lock.
+pub(super) async fn writable_row(
     conn: &mut PgConnection,
     w: &ResourceWrite<'_>,
 ) -> Result<ResourceRow, ApiError> {

@@ -946,9 +946,12 @@ pub(crate) fn tenant_name(raw: &str) -> Result<String, Detail> {
 
 /// The group names `groups` as they are stored, a name given twice kept
 /// once (where it first appears); otherwise a detail at `<at>/<i>` for each
-/// name that is blank, starts or ends with whitespace, or is longer than 64
-/// characters. Names are matched exactly against provider keys' groups, so
-/// a stray space would match nothing.
+/// name that is blank, starts or ends with whitespace, carries a control
+/// character, or is longer than 64 characters. Names are matched exactly
+/// against provider keys' groups, so a stray space would match nothing; a
+/// control character is refused for the reason `tenant_name` refuses one,
+/// that Postgres rejects the parameter and the refusal would be a `500`
+/// instead of a detail at the name's own path.
 pub(crate) fn checked_groups(groups: &[String], at: &str) -> Result<Vec<String>, Vec<Detail>> {
     let problems: Vec<Detail> = groups
         .iter()
@@ -959,6 +962,8 @@ pub(crate) fn checked_groups(groups: &[String], at: &str) -> Result<Vec<String>,
                 Some(detail(&path, "分组名称不能为空"))
             } else if group.trim() != group {
                 Some(detail(&path, "分组名称前后不能有空白"))
+            } else if group.chars().any(char::is_control) {
+                Some(detail(&path, "分组名称不能包含控制字符"))
             } else if group.chars().count() > MAX_GROUP_CHARS {
                 Some(detail(
                     &path,

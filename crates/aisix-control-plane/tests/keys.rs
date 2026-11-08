@@ -3153,9 +3153,6 @@ async fn api_groups_lists_the_tenants_assigned_groups() {
     let admin = cp.admin_login_seeded(OperatorRole::Operator).await;
     let b = seed_group(&cp, &admin, "grp-b-7c1", "乙分组 7c1").await;
     let a = seed_group(&cp, &admin, "grp-a-7c1", "甲分组 7c1").await;
-    // A tenant's groups must be live ones, so a group retired before the
-    // assignment is refused at the field: the listing below is asked for a
-    // tenant that names only a and b.
     let gone = seed_group(&cp, &admin, "grp-gone-7c1", "已停用 7c1").await;
     let r = call(
         &cp,
@@ -3168,6 +3165,19 @@ async fn api_groups_lists_the_tenants_assigned_groups() {
     .await;
     assert_eq!(r.status, 200, "{r:?}");
     let tenant = tenant_with_groups(&cp, &admin, &["grp-b-7c1", "grp-a-7c1"]).await;
+    // The tenant does name the retired group, which no API write can produce
+    // any more: a group retired after the assignment, or a row written before
+    // the assignment refused one. It is written directly so the filter under
+    // test — the listing's `retired_at IS NULL`, not the assignment's
+    // refusal — is what keeps the group out of the answer.
+    sqlx::query(
+        "UPDATE tenants SET allowed_provider_groups = \
+           ARRAY['grp-b-7c1', 'grp-a-7c1', 'grp-gone-7c1'] WHERE id = $1",
+    )
+    .bind(tenant)
+    .execute(cp.db().pool())
+    .await
+    .expect("assign the retired group to the tenant");
     // Every member role may list them, a billing one included.
     for role in [MemberRole::Owner, MemberRole::Billing, MemberRole::Member] {
         let who = cp.member_login_seeded(tenant, role).await;

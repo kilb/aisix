@@ -482,6 +482,82 @@ async fn a_new_tenant_starts_in_the_default_groups() {
     assert_eq!(r.status, 200, "{r:?}");
 }
 
+/// A control character in a group name is refused at its own index, on both
+/// paths that carry a tenant's group list. Postgres rejects such a
+/// parameter, so a name reaching `groups::lock_named`'s bind answers `500`
+/// instead of naming the field; the tenant's own name is refused the same
+/// way by `tenant_name`.
+#[tokio::test]
+async fn a_control_character_in_a_group_name_is_422_at_its_index() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let admin = Admin::as_role(&cp, OperatorRole::Admin).await;
+    let session = cp.admin_login_seeded(OperatorRole::Admin).await;
+    let tenant = support::world::seed_tenant(&cp, &session).await;
+    let name = "grp\u{0}ctl-7c1";
+
+    let r = admin
+        .patch_tenant(
+            &tenant.to_string(),
+            1,
+            json!({"allowed_provider_groups": ["shared", name]}),
+        )
+        .await;
+    assert_eq!(r.status, 422, "{r:?}");
+    assert_eq!(r.body["code"], "validation_failed", "{r:?}");
+    assert_eq!(
+        r.body["details"][0]["path"], "/allowed_provider_groups/1",
+        "{r:?}"
+    );
+    assert_eq!(
+        r.body["details"][0]["message"], "分组名称不能包含控制字符",
+        "{r:?}"
+    );
+
+    let r = cp
+        .send(
+            "PUT",
+            "/admin/settings/tenant-defaults",
+            Some(&admin.cookie),
+            Some(json!({"concurrency": 20, "default_provider_groups": ["shared", name]})),
+        )
+        .await;
+    assert_eq!(r.status, 422, "{r:?}");
+    assert_eq!(r.body["code"], "validation_failed", "{r:?}");
+    assert_eq!(
+        r.body["details"][0]["path"], "/default_provider_groups/1",
+        "{r:?}"
+    );
+    assert_eq!(
+        r.body["details"][0]["message"], "分组名称不能包含控制字符",
+        "{r:?}"
+    );
+
+    // Neither refusal wrote anything: the tenant and the defaults keep the
+    // group they had, and no `500` reached either path.
+    let groups: Vec<String> =
+        sqlx::query_scalar("SELECT unnest(allowed_provider_groups) FROM tenants WHERE id = $1")
+            .bind(tenant)
+            .fetch_all(cp.db().pool())
+            .await
+            .expect("read the tenant's groups");
+    assert_eq!(groups, vec!["shared".to_string()]);
+    let r = cp
+        .send(
+            "GET",
+            "/admin/settings/tenant-defaults",
+            Some(&admin.cookie),
+            None,
+        )
+        .await;
+    assert_eq!(
+        r.body["default_provider_groups"],
+        json!(["shared"]),
+        "{r:?}"
+    );
+}
+
 /// Defaults that name no group (an edit made outside the API, or a row
 /// written before the API refused one) would open every upstream to each
 /// new customer tenant, so no tenant is created from them.
@@ -1608,8 +1684,12 @@ async fn every_tenant_write_takes_the_tenant_before_the_resources_lock() {
             )),
             200,
         ),
-        // A group edit takes the tenant first, then the named group's row,
-        // and only then the resources lock a grant change takes.
+        // A group edit takes no resources lock of its own, so this case can
+        // only observe that lock: what it pins is that the path is enumerated
+        // (a step added ahead of its groups, taking the resources lock, would
+        // fail here) and that it answers `200`. The group row's own place in
+        // the order is `a_group_edit_takes_its_groups_before_the_resources_lock`
+        // in `tests/groups.rs`.
         (
             "PATCH /admin/tenants/{id} (unassigning a group)",
             Box::pin(fire(

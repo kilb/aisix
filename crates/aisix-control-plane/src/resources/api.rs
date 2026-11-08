@@ -128,17 +128,21 @@ fn field_names(doc: &Value) -> Vec<String> {
 /// no row and a retired group are the same refusal. Taking the rows before
 /// the resources lock is what makes a write and a retire of the same group
 /// serialise on the group's own row ([`crate::groups::lock_named`]).
+///
+/// Only a provider key names a group, so every other kind returns before the
+/// check: it binds nothing, and a second `normalize` on a model write would
+/// resolve its model names again for nothing.
 async fn lock_named_groups(
     conn: &mut PgConnection,
     kind: Kind,
     doc: &Value,
 ) -> Result<(), ApiError> {
-    let mut checked = doc.clone();
-    crate::resources::normalize::normalize(conn, kind, &mut checked).await?;
-    super::validate::validate_strict(kind, &checked).map_err(ApiError::validation)?;
     if kind != Kind::ProviderKeys {
         return Ok(());
     }
+    let mut checked = doc.clone();
+    crate::resources::normalize::normalize(conn, kind, &mut checked).await?;
+    super::validate::validate_strict(kind, &checked).map_err(ApiError::validation)?;
     let names: Vec<String> = checked
         .get("groups")
         .and_then(Value::as_array)
@@ -273,8 +277,6 @@ pub async fn replace(
         .db
         .tx(move |conn| {
             async move {
-                // Before `write_resource`, which takes the resources lock.
-                lock_named_groups(&mut *conn, kind, &body.doc).await?;
                 let write = ResourceWrite {
                     kind,
                     id,
@@ -282,6 +284,12 @@ pub async fn replace(
                     expected_version: Some(expected),
                     managed_by: None,
                 };
+                // The row first, so a stale `If-Match`, a missing row or a
+                // managed one answers before the document is judged: the
+                // tenant routes keep that precedence too.
+                super::write::writable_row(&mut *conn, &write).await?;
+                // Before `write_resource`, which takes the resources lock.
+                lock_named_groups(&mut *conn, kind, &body.doc).await?;
                 let row = write_resource(conn, &ctx, write).await?;
                 if kind == Kind::Models {
                     tenants::refuse_ungrantable_reshape(conn, id, &row.doc).await?;

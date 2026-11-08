@@ -680,6 +680,21 @@ async fn a_stale_if_match_is_412_and_the_newer_doc_survives() {
     let r = admin.put(&path, Some("2"), json!({"doc": stale})).await;
     assert_eq!(r.status, 200, "{r:?}");
     assert_eq!(r.body["version"], 3);
+
+    // A request that fails both the version and the document answers `412`:
+    // the row is read before the document is judged, as on the tenant routes.
+    let mut invalid = provider_key("acct-412");
+    invalid["groups"] = json!(["grp-stale-7c1"]);
+    invalid
+        .as_object_mut()
+        .expect("a document")
+        .remove("api_key");
+    let r = admin
+        .put(&path, Some("\"2\""), json!({"doc": invalid}))
+        .await;
+    assert_eq!(r.status, 412, "{r:?}");
+    assert_eq!(r.body["code"], "version_mismatch");
+    assert_eq!(r.body["current_version"], 3);
 }
 
 #[tokio::test]

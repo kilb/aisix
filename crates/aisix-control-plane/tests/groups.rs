@@ -1990,44 +1990,102 @@ async fn a_group_edit_takes_its_groups_before_the_resources_lock() {
         .await
         .expect("the tenant's version");
 
+    let cookie = admin.cookie().to_string();
+    let body = json!({
+        "allowed_provider_groups": ["shared", "grp-order-7c1"],
+        "allowed_model_ids": [model],
+    });
+    let if_match = Some(format!("\"{version}\""));
+    waits_on_the_group_not_the_resources_lock(
+        &cp,
+        cp.url(&format!("/admin/tenants/{tenant}")),
+        ("PATCH", 200),
+        &cookie,
+        if_match.as_deref(),
+        body,
+        group_uuid,
+    )
+    .await;
+}
+
+/// A provider-key create that names a group takes the group row before the
+/// resources lock `write_resource` takes: while it waits for a retire's
+/// `FOR UPDATE` on the group, the resources lock is still free. The reverse
+/// order — the lock taken inside `write_resource` before the group's — would
+/// hold it while it waited.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_provider_key_write_takes_its_groups_before_the_resources_lock() {
+    let Some(cp) = TestCp::start_with(|cfg| cfg.db_lock_timeout_ms = 60_000).await else {
+        return;
+    };
+    let admin = cp.admin_login_seeded(OperatorRole::Admin).await;
+    let group = create_group(&cp, &admin, body("grp-order-7c1", "顺序", json!("1"))).await;
+    let group_uuid = Uuid::parse_str(&id_of(&group)).expect("a group id");
+    let cookie = admin.cookie().to_string();
+    waits_on_the_group_not_the_resources_lock(
+        &cp,
+        cp.url("/admin/resources/provider_keys"),
+        ("POST", 201),
+        &cookie,
+        None,
+        provider_key_body("acct-order-7c1", &["shared", "grp-order-7c1"]),
+        group_uuid,
+    )
+    .await;
+}
+
+/// Sends `request` while another session holds `group` `FOR UPDATE`, waits
+/// until it queues on that holder, and asserts `RESOURCES_LOCK_KEY` is free
+/// in that window: a caller that took its groups first waits on the group
+/// holding nothing else, an inverted one waits holding the resources lock.
+async fn waits_on_the_group_not_the_resources_lock(
+    cp: &TestCp,
+    url: String,
+    (method, status): (&str, u16),
+    cookie: &str,
+    if_match: Option<&str>,
+    body: Value,
+    group: Uuid,
+) {
     let mut holder = cp.db().pool().begin().await.expect("begin");
     let holder_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
         .fetch_one(&mut *holder)
         .await
         .expect("this session's pid");
     sqlx::query("SELECT 1 FROM provider_groups WHERE id = $1 FOR UPDATE")
-        .bind(group_uuid)
+        .bind(group)
         .execute(&mut *holder)
         .await
         .expect("hold the group");
-    let url = cp.url(&format!("/admin/tenants/{tenant}"));
-    let cookie = admin.cookie().to_string();
-    let edit = tokio::spawn(async move {
-        reqwest::Client::builder()
+    let method = reqwest::Method::from_bytes(method.as_bytes()).expect("an HTTP method");
+    let cookie = cookie.to_string();
+    let if_match = if_match.map(str::to_string);
+    let sent = tokio::spawn(async move {
+        let mut request = reqwest::Client::builder()
             .no_proxy()
             .build()
             .expect("an HTTP client")
-            .patch(url)
-            .header(reqwest::header::COOKIE, cookie)
+            .request(method, url)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .header(reqwest::header::IF_MATCH, format!("\"{version}\""))
-            .json(&json!({
-                "allowed_provider_groups": ["shared", "grp-order-7c1"],
-                "allowed_model_ids": [model],
-            }))
+            .header(reqwest::header::COOKIE, cookie)
+            .json(&body);
+        if let Some(version) = if_match {
+            request = request.header(reqwest::header::IF_MATCH, version);
+        }
+        request
             .send()
             .await
-            .expect("send the PATCH")
+            .expect("send the request")
             .status()
             .as_u16()
     });
     until_blocked(cp.db().pool(), holder_pid).await;
-    let resources_free = !resources_lock_held(&cp).await;
+    let resources_free = !resources_lock_held(cp).await;
     holder.commit().await.expect("release the group");
-    assert_eq!(edit.await.expect("join the edit"), 200);
+    assert_eq!(sent.await.expect("join the request"), status);
     assert!(
         resources_free,
-        "the edit took the resources lock before the group's: the lock order is inverted"
+        "the write took the resources lock before the group's: the lock order is inverted"
     );
 }
 

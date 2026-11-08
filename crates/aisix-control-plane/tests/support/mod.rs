@@ -666,7 +666,9 @@ impl DpClient {
 ///
 /// Every write that names a group names a live one, so a fixture that lists
 /// `name` in a provider key, a tenant or the tenant defaults creates it
-/// first with this.
+/// first with this. A group that already exists is kept: a helper that runs
+/// once per model, twice in one test whose control plane outlives the first
+/// run, would otherwise be refused for a name it created itself.
 pub async fn seed_group(cp: &TestCp, admin: &OperatorSession, name: &str) -> Uuid {
     let r = cp
         .send(
@@ -681,13 +683,25 @@ pub async fn seed_group(cp: &TestCp, admin: &OperatorSession, name: &str) -> Uui
             })),
         )
         .await;
-    assert_eq!(r.status, 201, "create group {name}: {r:?}");
-    Uuid::parse_str(
-        r.body["id"]
-            .as_str()
-            .unwrap_or_else(|| panic!("a group id in {}", r.body)),
-    )
-    .expect("a group id")
+    if r.status == 201 {
+        return Uuid::parse_str(
+            r.body["id"]
+                .as_str()
+                .unwrap_or_else(|| panic!("a group id in {}", r.body)),
+        )
+        .expect("a group id");
+    }
+    // The routing name is unique, retired groups included, so an existing
+    // name answers a 422 at `/name`; the row is read back to give its id.
+    assert_eq!(
+        r.body["code"], "validation_failed",
+        "create group {name}: {r:?}"
+    );
+    sqlx::query_scalar("SELECT id FROM provider_groups WHERE name = $1")
+        .bind(name)
+        .fetch_one(cp.db().pool())
+        .await
+        .unwrap_or_else(|e| panic!("read group {name}: {e}"))
 }
 
 /// An operator the harness inserted.

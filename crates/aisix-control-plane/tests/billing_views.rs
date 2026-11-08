@@ -52,25 +52,10 @@ const CHARGE_KEYS: [&str; 7] = [
 /// The keys of one line of a charge, as a tenant reads it.
 const LINE_KEYS: [&str; 3] = ["dimension", "quantity", "rate"];
 
-/// `GROUP`, the second group the fixture's account lists. A provider key
-/// names only live groups, so it is created first, once per test's control
-/// plane: a second account in the same test joins the group it made.
-async fn group_once(w: &World) {
-    let exists: bool =
-        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM provider_groups WHERE name = $1)")
-            .bind(GROUP)
-            .fetch_one(w.cp.db().pool())
-            .await
-            .expect("read the group");
-    if !exists {
-        support::seed_group(&w.cp, &w.admin, GROUP).await;
-    }
-}
-
 /// A model named `name` for tenants, on a provider key and groups that carry
 /// the channel fixture tokens; granted to `tenant` when given.
 async fn model(w: &World, name: &str, grant_to: Option<Uuid>) -> Uuid {
-    group_once(w).await;
+    support::seed_group(&w.cp, &w.admin, GROUP).await;
     let pk =
         w.cp.send(
             "POST",
