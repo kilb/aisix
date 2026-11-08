@@ -2,8 +2,10 @@ import { useCallback, useEffect, useRef, useState, type ReactNode } from "react"
 import {
   ApiError,
   billing,
+  budgets as budgetApi,
   keys as keyApi,
   type Balance,
+  type Budget,
   type KeyQuota,
   type LedgerItem,
   type LedgerKind,
@@ -87,16 +89,30 @@ export function Billing({ member }: { member: SessionMember }) {
     }
   }, []);
 
+  // The organisation's own quotas, which owner, admin and billing may read. A
+  // quota that is used up refuses calls while the balance is still positive,
+  // so the lamp and the billing member's readout both need them.
+  const [team, setTeam] = useState<Budget[]>([]);
+  const loadTeam = useCallback(async () => {
+    try {
+      setTeam((await budgetApi.list()).filter((b) => b.scope === "team"));
+    } catch {
+      // Not readable: the balance alone speaks, and its caption stays true.
+      setTeam([]);
+    }
+  }, []);
+
   useEffect(() => {
     void loadBalance();
     void loadTopups();
-  }, [loadBalance, loadTopups]);
+    void loadTeam();
+  }, [loadBalance, loadTopups, loadTeam]);
 
   return (
     <div className="stack billing">
       <div className="deck billing-top">
-        <BalancePanel balance={balance} err={balanceErr} />
-        <Readout member={member} balance={balance} />
+        <BalancePanel balance={balance} team={team} err={balanceErr} />
+        <Readout member={member} balance={balance} team={team} />
       </div>
       <TopupForm
         onRequested={() => {
@@ -110,12 +126,21 @@ export function Billing({ member }: { member: SessionMember }) {
   );
 }
 
-// ── 余额 ────────────────────────────────────────────────────────────────────
+// ── balance (余额) ────────────────────────────────────────────────────────────────────
 
-function BalancePanel({ balance, err }: { balance: Balance | null; err: string | null }) {
+function BalancePanel({ balance, team, err }: { balance: Balance | null; team: Budget[]; err: string | null }) {
   const postpaid = balance?.billing_mode === "postpaid";
-  const exhausted = balance?.exhausted === true;
-  const stateText = exhausted ? (postpaid ? "已达信用额度，调用已停止" : "余额不足，调用已停止") : "可正常调用";
+  const balanceOut = balance?.exhausted === true;
+  // The lamp means "calls are accepted now": a used-up organisation quota refuses them too.
+  const orgOut = team.some((b) => b.exhausted);
+  const exhausted = balanceOut || orgOut;
+  const stateText = balanceOut
+    ? postpaid
+      ? "已达信用额度，调用已停止"
+      : "余额不足，调用已停止"
+    : orgOut
+      ? "组织额度已用尽，调用已停止"
+      : "可正常调用";
   return (
     <Section title="余额">
       {err && (
@@ -141,7 +166,7 @@ function BalancePanel({ balance, err }: { balance: Balance | null; err: string |
   );
 }
 
-// ── 可用额度 ────────────────────────────────────────────────────────────────
+// ── what can still be spent (可用额度) ────────────────────────────────────────────────────────────────
 
 const LEVEL_LABEL: Record<QuotaLevel, string> = { organization: "组织", member: "成员", key: "密钥" };
 const SCOPE_LEVEL = { team: "organization", member: "member", api_key: "key" } as const;
@@ -168,7 +193,7 @@ function defaultKey(items: TenantKey[], member: SessionMember): string | null {
   return (own ?? newest(items))?.id ?? null;
 }
 
-function Readout({ member, balance }: { member: SessionMember; balance: Balance | null }) {
+function Readout({ member, balance, team }: { member: SessionMember; balance: Balance | null; team: Budget[] }) {
   const manager = member.role === "owner" || member.role === "admin";
   const [items, setItems] = useState<TenantKey[] | null>(manager ? null : []);
   const [keyId, setKeyId] = useState<string | null>(null);
@@ -234,8 +259,9 @@ function Readout({ member, balance }: { member: SessionMember; balance: Balance 
   if (keyId !== null && quota && quota.key_id === keyId) {
     view = { effective: quota.effective_remaining_micro_usd, stops: stopsOf(quota), binding: quota.binding_level };
   } else if (keyId === null && balance) {
-    // No key to read (a billing member's case): the organisation's balance alone.
-    const left = Math.max(0, balance.available_micro_usd);
+    // No key to read (a billing member's case): the smaller of the organisation's
+    // balance and its smallest remaining quota.
+    const left = Math.min(Math.max(0, balance.available_micro_usd), ...team.map((b) => Math.max(0, b.remaining_micro_usd)));
     view = { effective: left, stops: [{ level: "organization", label: "组织", remainingMicroUsd: left }], binding: "organization" };
   }
 
@@ -278,7 +304,7 @@ function Readout({ member, balance }: { member: SessionMember; balance: Balance 
   );
 }
 
-// ── 申请充值 ────────────────────────────────────────────────────────────────
+// ── top-up request (申请充值) ────────────────────────────────────────────────────────────────
 
 type TopupField = "amount" | "note" | "reference";
 
@@ -367,7 +393,7 @@ function TopupForm({ onRequested }: { onRequested: () => void }) {
   );
 }
 
-// ── 充值记录 ────────────────────────────────────────────────────────────────
+// ── top-up history (充值记录) ────────────────────────────────────────────────────────────────
 
 const TOPUP_STATE: Record<Topup["status"], { text: string; lamp: LampState }> = {
   pending: { text: "待审批", lamp: "pending" },
@@ -409,7 +435,7 @@ function TopupList({ items, err }: { items: Topup[] | null; err: string | null }
           </thead>
           <tbody>
             {items.map((t) => {
-              const state = TOPUP_STATE[t.status];
+              const state = TOPUP_STATE[t.status] ?? { text: t.status, lamp: "pending" as LampState };
               const why = explanation(t);
               return (
                 <tr key={t.id}>
@@ -443,7 +469,7 @@ function TopupList({ items, err }: { items: Topup[] | null; err: string | null }
   );
 }
 
-// ── 余额流水 and 按期汇总 ────────────────────────────────────────────────────
+// ── ledger (余额流水) and period summary (按期汇总) ────────────────────────────────────────────────────
 
 const KIND_LABEL: Record<LedgerKind, string> = { usage: "扣费", topup: "充值", adjustment: "调整" };
 
