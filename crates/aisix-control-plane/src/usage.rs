@@ -109,6 +109,10 @@ struct Reject {
     raw: Value,
 }
 
+/// A row the intake insert stored, as it returns it: `event_id`,
+/// `occurred_at`, `event`, `received_at` and `request_id`.
+type Fresh = (String, DateTime<Utc>, Value, DateTime<Utc>, Option<String>);
+
 /// Stores the events of `dp_id`'s batch `batch_id`, once (see the module
 /// docs), and prices each event it stores from `prices`, in one transaction:
 /// either all of it is stored, the batch id and the charges included, or
@@ -204,7 +208,7 @@ async fn store(
         // event_id in the order sent, so the first of them is the one kept.
         // The rows this statement inserted come back as stored, and only
         // they are priced.
-        let fresh: Vec<(String, DateTime<Utc>, Value, DateTime<Utc>)> = sqlx::query_as(
+        let fresh: Vec<Fresh> = sqlx::query_as(
             "INSERT INTO usage_events \
              (event_id, dp_id, batch_id, occurred_at, team_id, api_key_id, request_id, event) \
              SELECT u.event_id, $1, $2, u.occurred_at, u.team_id, u.api_key_id, u.request_id, u.event \
@@ -213,7 +217,7 @@ async fn store(
                AS u(event_id, occurred_at, team_id, api_key_id, request_id, event, n) \
              ORDER BY u.event_id, u.n \
              ON CONFLICT (event_id) DO NOTHING \
-             RETURNING event_id, occurred_at, event, received_at",
+             RETURNING event_id, occurred_at, event, received_at, request_id",
         )
         .bind(dp_id)
         .bind(batch_id)
@@ -239,12 +243,15 @@ async fn store(
         }
         let fresh = fresh
             .into_iter()
-            .map(|(event_id, occurred_at, event, received_at)| StoredEvent {
-                event_id,
-                occurred_at,
-                event,
-                received_at,
-            })
+            .map(
+                |(event_id, occurred_at, event, received_at, request_id)| StoredEvent {
+                    event_id,
+                    occurred_at,
+                    event,
+                    received_at,
+                    request_id,
+                },
+            )
             .collect();
         priced = pricing::price_stored(conn, prices, dp_id, batch_id, fresh).await?;
     }

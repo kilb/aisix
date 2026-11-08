@@ -4,24 +4,32 @@
 //! A request id is the caller's own input, not unique, and one request
 //! leaves one usage row per upstream attempt. So the answer lists every row
 //! the key's own tenant recorded under the id that the key may see, newest
-//! first, at most [`MAX_REQUEST_ROWS`], with the sum of their costs.
+//! first, at most [`MAX_REQUEST_ROWS`], with the sum of what they were
+//! charged. "Newest" is by when each attempt occurred (`occurred_at`), ties
+//! by arrival (`seq`): a request's attempts usually arrive in one batch,
+//! which intake stores in event-id order, so arrival alone would mix them
+//! up. The call log orders by `seq` because it pages by it; the two orders
+//! differ on purpose.
 //!
 //! - Rows are found by the request id as a bind parameter, matched exactly,
-//!   and filed under the tenant of the control plane's own key record
-//!   (`pricing_charges.tenant_id`), never under the row's `team_id`. Another
-//!   tenant's rows under the same id, and an id never sent, answer the same
-//!   `404`.
+//!   among the charges filed under the tenant of the control plane's own key
+//!   record (`pricing_charges.tenant_id` and `request_id`), never under the
+//!   row's `team_id`. Another tenant's rows under the same id are never
+//!   read, and they and an id never sent answer the same `404`.
 //! - What the key sees follows its member's current role ([`Visibility`]):
 //!   an owner's, admin's or billing member's key sees the tenant's rows, a
 //!   member's key the rows of the member's keys, and a key bound to no member
 //!   its own rows.
-//! - Each row is shown as the call log shows it ([`super::calls`]): the same
-//!   visibility rule, outcome vocabulary and charge status, and its cost is
-//!   the charge plus its re-pricing adjustments. Nothing of the platform's
-//!   channel is read: no provider, upstream model, cost price, error code or
-//!   upstream status or text.
+//! - Each row is shown as the call log shows it, through the same
+//!   [`tenant_view`] and SQL rules, and what it was charged is the charge
+//!   plus its re-pricing adjustments. Nothing of the platform's channel is
+//!   read: no provider, upstream model, cost price, error code or upstream
+//!   status or text.
 //!
-//! This is a lookup on its own route: it never touches model traffic.
+//! This is a lookup on its own route: it never touches model traffic. Its
+//! statements run under [`LOOKUP_STATEMENT_TIMEOUT_MS`], the time a gateway
+//! waits for it, so a slow lookup gives its pool connection back instead of
+//! holding one that usage intake shares; one that runs out answers `503`.
 
 use std::collections::BTreeMap;
 
@@ -37,8 +45,7 @@ use uuid::Uuid;
 
 use super::access::{key_access, KeyAccess, Visibility};
 use super::calls::{
-    call_model, tenant_charge_status, tenant_outcome, visible_to_tenant, Models, TenantStatus,
-    ADJUSTED, EVENT_FIELDS, VISIBLE,
+    call_model, tenant_view, text, Models, TenantStatus, ADJUSTED, EVENT_FIELDS, VISIBLE,
 };
 use super::money::usd_string;
 use crate::db::DbError;
@@ -48,6 +55,10 @@ use crate::AppState;
 
 /// The most rows one lookup lists; `has_more` says when there are more.
 pub const MAX_REQUEST_ROWS: i64 = 50;
+
+/// The longest any statement of a lookup may run: the time a gateway waits
+/// for the answer.
+pub const LOOKUP_STATEMENT_TIMEOUT_MS: u64 = 2_000;
 
 /// The longest request id a gateway accepts from a caller.
 const MAX_REQUEST_ID_BYTES: usize = 256;
@@ -62,8 +73,9 @@ pub struct RequestRow {
     /// From the fixed vocabulary, for a final failure only.
     pub error: Option<&'static str>,
     pub charge_status: &'static str,
-    /// The charge plus its adjustments; `None` while pending.
-    pub cost_micro_usd: Option<i64>,
+    /// What the row was charged: the charge plus its adjustments; `None`
+    /// while pending.
+    pub charge_micro_usd: Option<i64>,
     pub estimated: bool,
     /// The billed quantities by dimension, under the names the price listing
     /// uses.
@@ -74,7 +86,8 @@ pub struct RequestRow {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RequestCost {
     pub request_id: String,
-    /// The sum of the listed rows' costs; pending rows add nothing.
+    /// The sum of what the listed rows were charged; pending rows add
+    /// nothing.
     pub total_micro_usd: i64,
     /// Whether any listed row is still pending.
     pub pending: bool,
@@ -122,15 +135,18 @@ fn quantities(lines: &Value) -> BTreeMap<String, u64> {
     out
 }
 
-fn text(ev: &Value, key: &str) -> String {
-    ev.get(key)
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string()
+/// A sum past the `bigint` range: never reached, and never clamped.
+fn overflow() -> DbError {
+    DbError::Db(sqlx::Error::Decode(
+        "a request's charge leaves the bigint range".into(),
+    ))
 }
 
 /// The rows the key of `access` may see under `request_id`; `None` when it
-/// may see none, whether another tenant used the id or nobody did.
+/// may see none, whether another tenant used the id or nobody did. The
+/// query starts from the key's tenant's charges under the id
+/// (`pricing_charges_tenant_request`), so it never reads another tenant's
+/// rows, and stops after [`MAX_REQUEST_ROWS`] + 1 visible ones.
 pub async fn request_cost(
     conn: &mut PgConnection,
     access: &KeyAccess,
@@ -143,13 +159,12 @@ pub async fn request_cost(
     sql.push(ADJUSTED).push(" AS adjusted, ");
     sql.push(EVENT_FIELDS).push(" AS ev");
     sql.push(
-        " FROM usage_events ue JOIN pricing_charges pc ON pc.event_id = ue.event_id \
-         WHERE ue.request_id = ",
+        " FROM pricing_charges pc JOIN usage_events ue ON ue.event_id = pc.event_id \
+         WHERE pc.tenant_id = ",
     )
+    .push_bind(access.tenant_id)
+    .push("::text AND pc.request_id = ")
     .push_bind(request_id.to_string());
-    sql.push(" AND pc.tenant_id = ")
-        .push_bind(access.tenant_id)
-        .push("::text");
     match (access.visibility, access.member_id) {
         (Visibility::Full, _) => {}
         (Visibility::Own, Some(member)) => {
@@ -176,58 +191,46 @@ pub async fn request_cost(
         .collect();
     let models = Models::load(&mut *conn, access.tenant_id, &model_ids).await?;
 
-    let items: Vec<RequestRow> = rows
-        .into_iter()
-        .filter_map(|r| {
-            let is_final = r.ev.get("is_final_attempt").and_then(Value::as_bool) == Some(true);
-            let repriced = r.adjusted.is_some();
-            if !visible_to_tenant(is_final, &r.status, repriced) {
-                return None;
-            }
-            let status_code =
-                r.ev.get("status_code")
-                    .and_then(Value::as_u64)
-                    .and_then(|c| u16::try_from(c).ok())
-                    .unwrap_or(0);
-            let (status, _, error) = tenant_outcome(
-                status_code,
-                &text(&r.ev, "error_class"),
-                &text(&r.ev, "error_message"),
-                is_final,
-            );
-            let charge_status = tenant_charge_status(&r.status, repriced);
-            let cost_micro_usd = (charge_status != "pending").then(|| {
-                r.charge_micro_usd
-                    .unwrap_or(0)
-                    .saturating_add(r.adjusted.unwrap_or(0))
-            });
-            Some(RequestRow {
-                occurred_at: r.occurred_at,
-                model: call_model(
-                    &models,
-                    &r.requested_model_id,
-                    &text(&r.ev, "requested_model"),
-                )
-                .name,
-                status,
-                error,
-                charge_status,
-                cost_micro_usd,
-                estimated: r.estimated,
-                quantities: quantities(&r.lines),
-            })
-        })
-        .collect();
+    let mut items = Vec::with_capacity(rows.len());
+    let mut total_micro_usd: i64 = 0;
+    for r in rows {
+        let Some(view) = tenant_view(&r.ev, &r.status, r.adjusted.is_some()) else {
+            continue;
+        };
+        let charge_micro_usd = if view.charge_status == "pending" {
+            None
+        } else {
+            let charged = r
+                .charge_micro_usd
+                .unwrap_or(0)
+                .checked_add(r.adjusted.unwrap_or(0))
+                .ok_or_else(overflow)?;
+            total_micro_usd = total_micro_usd.checked_add(charged).ok_or_else(overflow)?;
+            Some(charged)
+        };
+        items.push(RequestRow {
+            occurred_at: r.occurred_at,
+            model: call_model(
+                &models,
+                &r.requested_model_id,
+                &text(&r.ev, "requested_model"),
+            )
+            .name,
+            status: view.status,
+            error: view.error,
+            charge_status: view.charge_status,
+            charge_micro_usd,
+            estimated: r.estimated,
+            quantities: quantities(&r.lines),
+        });
+    }
     if items.is_empty() {
         return Ok(None);
     }
     Ok(Some(RequestCost {
         request_id: request_id.to_string(),
-        total_micro_usd: items
-            .iter()
-            .filter_map(|i| i.cost_micro_usd)
-            .fold(0, i64::saturating_add),
-        pending: items.iter().any(|i| i.cost_micro_usd.is_none()),
+        total_micro_usd,
+        pending: items.iter().any(|i| i.charge_micro_usd.is_none()),
         has_more,
         items,
     }))
@@ -266,16 +269,23 @@ fn dp_json(c: &RequestCost) -> Value {
             "status": i.status,
             "error": i.error,
             "charge_status": i.charge_status,
-            "cost_usd": i.cost_micro_usd.map(usd_string),
+            "charge_usd": i.charge_micro_usd.map(usd_string),
             "estimated": i.estimated,
             "quantities": i.quantities,
         })).collect::<Vec<_>>(),
     })
 }
 
+/// Whether `e` is a statement Postgres cancelled (SQLSTATE `57014`), as
+/// `statement_timeout` does.
+fn cancelled(e: &DbError) -> bool {
+    matches!(e, DbError::Db(sqlx::Error::Database(db)) if db.code().as_deref() == Some("57014"))
+}
+
 /// `GET /dp/v1/keys/{key_id}/requests?id=`, with the key's own visibility.
 /// An unknown or revoked key, and an id under which the key may see no row,
-/// are `404`; an id no gateway could have recorded is `422` at `/id`.
+/// are `404`; an id no gateway could have recorded is `422` at `/id`; a
+/// lookup that runs past [`LOOKUP_STATEMENT_TIMEOUT_MS`] is `503`.
 pub async fn dp_requests(
     _dp: DpIdentity,
     State(state): State<AppState>,
@@ -292,6 +302,11 @@ pub async fn dp_requests(
         .db
         .tx(move |conn| {
             async move {
+                sqlx::query(&format!(
+                    "SET LOCAL statement_timeout = {LOOKUP_STATEMENT_TIMEOUT_MS}"
+                ))
+                .execute(&mut *conn)
+                .await?;
                 match key_access(&mut *conn, key_id).await? {
                     Some(access) => request_cost(conn, &access, &request_id).await,
                     None => Ok::<_, DbError>(None),
@@ -299,7 +314,18 @@ pub async fn dp_requests(
             }
             .boxed()
         })
-        .await?;
+        .await
+        .map_err(|e| {
+            if cancelled(&e) {
+                tracing::warn!(
+                    timeout_ms = LOOKUP_STATEMENT_TIMEOUT_MS,
+                    "a request-cost lookup ran past its statement timeout"
+                );
+                ApiError::unavailable()
+            } else {
+                ApiError::from(e)
+            }
+        })?;
     found
         .map(|c| Json(dp_json(&c)))
         .ok_or_else(ApiError::not_found)

@@ -79,10 +79,12 @@ pub const MAX_REPRICE_EVENTS: i64 = 10_000;
 
 /// The most tenants one run may change. An apply locks each tenant it changes
 /// for its whole transaction and settles each one's marks inside it, about
-/// nine round trips per tenant, which the event cap does not bound: against
-/// a database 1 ms away, 200 tenants hold their intake, and the resources
-/// lock, for about 2 s, the block-latency target and well under the 5 s
-/// `lock_timeout` at which intake gives up, where 1,000 would reach it.
+/// nine round trips per tenant plus one or more per live quota, which the
+/// event cap does not bound: against a database 1 ms away, 200 tenants with
+/// few quotas hold their intake, and the resources lock, for about 2 s, the
+/// block-latency target and well under the 5 s `lock_timeout` at which
+/// intake gives up, where 1,000 would reach it. Tenants with many quotas
+/// each take longer, so this is a floor on the hold, not a ceiling.
 pub const MAX_REPRICE_TENANTS: usize = 200;
 
 /// The charge statuses a run may select by.
