@@ -89,13 +89,13 @@ async function login(page: Page, email: string, password: string): Promise<void>
 }
 
 /** Fills the form for one tenant's calls on one model, up to this very second, and previews. */
-async function preview(page: Page, world: BillingWorld, model: { name: string }, reason = "补录价格-ui"): Promise<void> {
+async function preview(page: Page, world: BillingWorld, model: { name: string }, reason = "补录价格-ui", status = "unpriced"): Promise<void> {
   // The window's end is the clock as the control plane will read it, so it includes the calls just made.
   const form = page.getByRole("form", { name: "新建重新计价" });
   await form.getByLabel("结束（UTC）").fill(new Date().toISOString().slice(0, 19));
   await form.getByLabel("模型").selectOption({ label: model.name });
   await form.getByLabel("租户").selectOption({ label: world.tenantName });
-  await expect(form.getByLabel("状态")).toHaveValue("unpriced");
+  await form.getByLabel("状态").selectOption({ value: status });
   await form.getByLabel("原因").fill(reason);
   await form.getByRole("button", { name: "预览", exact: true }).click();
   await expect(page.getByRole("region", { name: "预览结果" })).toBeVisible();
@@ -217,7 +217,48 @@ test("请求没有得到回答时，不再提供执行，先读取运行状态",
   await context.setOffline(false);
 
   await page.getByRole("button", { name: "查看最新状态" }).click();
-  await expect(page.getByRole("status").filter({ hasText: "已确认：这次重新计价尚未执行" })).toBeVisible();
+  await expect(page.getByRole("status").filter({ hasText: "最新状态：尚未执行" })).toBeVisible();
   expect((await ledger(world)).filter((e) => e.kind === "adjustment")).toHaveLength(0);
   await expect(page.getByRole("button", { name: "执行", exact: true })).toBeVisible();
+});
+
+test("快速双击确认执行，只发出一次执行请求", async ({ page }) => {
+  const { world, model } = await unpricedWorld();
+  await price(model.id, CARD);
+  await login(page, stack.operator.email, stack.operator.password);
+  await preview(page, world, model, "双击-ui");
+  // Observing traffic only: nothing is intercepted or answered by the test.
+  let applies = 0;
+  page.on("request", (r) => {
+    if (r.method() === "POST" && /\/admin\/billing\/repricing\/[^/]+\/apply$/.test(new URL(r.url()).pathname)) applies++;
+  });
+  await page.getByRole("button", { name: "执行", exact: true }).click();
+  await page.getByRole("button", { name: "确认执行" }).dblclick();
+  await expect(page.getByRole("status").filter({ hasText: "已执行" })).toBeVisible();
+  expect(applies).toBe(1);
+  expect((await ledger(world)).filter((e) => e.kind === "adjustment")).toHaveLength(1);
+});
+
+test("价格调低之后重新计价是退还，合计与运行记录都写明退还", async ({ page }) => {
+  const { world, model } = await unpricedWorld();
+  await price(model.id, CARD);
+  // Setup through the control plane: the first run charges 3 x 11 000.
+  const first = await stack.admin.post("/admin/billing/repricing", {
+    from: new Date(Date.now() - 3_600_000).toISOString(),
+    to: new Date().toISOString(),
+    model_id: model.id,
+    tenant_id: world.tenantId,
+    status: "unpriced",
+    reason: "首次-ui",
+  });
+  await stack.admin.post(`/admin/billing/repricing/${first.id}/apply`, {});
+  // The price then goes down by half: 3 x 5 500, so the tenant is owed 3 x 5 500.
+  await price(model.id, { default: { base: { input: "500", output: "1000" } } });
+  await login(page, stack.operator.email, stack.operator.password);
+  await preview(page, world, model, "退还-ui", "");
+  const total = totals(page).getByRole("row", { name: /合计差额/ });
+  await expect(total).toContainText("-$0.0165");
+  await expect(total).toContainText("退还");
+  await expect(page.getByRole("table", { name: "重新计价运行" }).getByRole("row", { name: /退还-ui/ })).toContainText("退还");
+  await expect(page.getByRole("table", { name: "各租户差额" }).getByRole("row", { name: new RegExp(world.tenantName) })).toContainText("退还");
 });

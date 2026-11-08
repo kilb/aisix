@@ -207,8 +207,8 @@ export function Repricing({ operator, canEdit, refreshShell }: TabProps) {
         kind: "info",
         text:
           now.status === "applied"
-            ? "已确认：这次重新计价已经执行。"
-            : "已确认：这次重新计价尚未执行。如需执行，可以再次执行；若上一次请求仍在处理，系统只会执行一次。",
+            ? "最新状态：已执行。"
+            : "最新状态：尚未执行（若刚才的请求仍在处理，稍后再查看一次）。如需执行，可以再次执行，系统只会执行一次。",
       });
       refreshShell();
       await load();
@@ -530,7 +530,10 @@ export function Repricing({ operator, canEdit, refreshShell }: TabProps) {
                 <td>
                   <Lamp state={r.status === "applied" ? "applied" : "pending"}>{r.status === "applied" ? "已执行" : "已预览"}</Lamp>
                 </td>
-                <td className="num money">{fmtMicroUsd(r.delta_micro_usd)}</td>
+                <td className="num money">
+                  {fmtMicroUsd(r.delta_micro_usd)}
+                  <span className="cell-note">{deltaWord(r.delta_micro_usd)}</span>
+                </td>
                 <td className="right">
                   <Button size="sm" type="button" disabled={busy} onClick={() => void view(r.id)}>
                     查看
