@@ -260,3 +260,50 @@ test("提交被拒时焦点落在第一个被拒的字段上，表单的提示�
   expect((items as { name: string }[]).map((c) => c.name)).not.toContain("gw-focus-3c8");
   await page.context().close();
 });
+
+test("两步确认在请求途中显示载入、不能再次确认也不能取消，结束后只保存了一次", async ({ browser }) => {
+  // A tenant granted two models; the operator withdraws one, which asks first.
+  const { items } = await stack.admin.get("/admin/resources/models");
+  const byName = (name: string) => (items as { id: string; doc: { display_name?: string } }[]).find((m) => m.doc.display_name === name)!.id;
+  const org = "Busy Co 5d1";
+  const signedUp = await stack.tenant().post("/api/signup", { org_name: org, email: "owner@busy-5d1.test", password: PASSWORD });
+  const id: string = signedUp.tenant.id;
+  await stack.admin.post(`/admin/tenants/${id}/approve`);
+  const approved = await stack.admin.get(`/admin/tenants/${id}`);
+  await stack.admin.patch(`/admin/tenants/${id}`, { allowed_model_ids: [byName("chat-small"), byName("chat-large")] }, approved.version);
+  const before = await stack.admin.get(`/admin/tenants/${id}`);
+
+  const page = await systemDark(browser);
+  await login(page);
+  await open(page, "tenants");
+  await page.getByRole("button", { name: org }).click();
+  const grants = page.getByRole("group", { name: "授权模型" });
+  await grants.getByRole("checkbox", { name: "chat-large" }).uncheck();
+  await grants.getByRole("button", { name: "保存授权" }).click();
+  const confirm = grants.getByRole("button", { name: "确认保存授权" });
+  await expect(confirm).toBeVisible();
+
+  // A slow link keeps the save in flight long enough to look at it, and to try again.
+  const cdp = await page.context().newCDPSession(page);
+  await cdp.send("Network.enable");
+  const link = (latency: number) =>
+    cdp.send("Network.emulateNetworkConditions", { offline: false, latency, downloadThroughput: -1, uploadThroughput: -1 });
+  await link(2_000);
+  await confirm.click();
+  // In flight: the confirm shows it, and neither it nor 取消 can be pressed.
+  await expect(confirm).toHaveAttribute("aria-busy", "true");
+  await expect(confirm).toBeDisabled();
+  await expect(grants.getByRole("button", { name: "取消" })).toBeDisabled();
+  await confirm.evaluate((button) => (button as HTMLButtonElement).click());
+  await link(0);
+
+  // Done: the step closes, the save is reported, and it was made once.
+  await expect(grants).toContainText("已保存授权");
+  await expect(confirm).toHaveCount(0);
+  await expect(grants.getByRole("button", { name: "保存授权" })).toBeEnabled();
+  await expect(grants.getByRole("alert")).toHaveCount(0);
+  const after = await stack.admin.get(`/admin/tenants/${id}`);
+  expect(after.allowed_model_ids).toEqual([byName("chat-small")]);
+  expect(after.version, "one save, not two").toBe(before.version + 1);
+  await page.context().close();
+});

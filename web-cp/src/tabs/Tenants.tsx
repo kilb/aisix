@@ -487,6 +487,8 @@ export function Tenants({ operator, canEdit }: TabProps) {
                               size="sm"
                               type="button"
                               disabled={acting === t.id}
+                              busy={acting === t.id}
+                              busyLabel="批准"
                               onClick={() => void act(t, tenants.approve)}
                             >
                               批准
@@ -498,6 +500,7 @@ export function Tenants({ operator, canEdit }: TabProps) {
                               label="停用"
                               size="sm"
                               disabled={acting === t.id}
+                              busy={acting === t.id}
                               onConfirm={() => void act(t, tenants.suspend)}
                             />
                           )}
@@ -506,6 +509,8 @@ export function Tenants({ operator, canEdit }: TabProps) {
                               size="sm"
                               type="button"
                               disabled={acting === t.id}
+                              busy={acting === t.id}
+                              busyLabel="恢复"
                               onClick={() => void act(t, tenants.reactivate)}
                             >
                               恢复
@@ -850,6 +855,7 @@ function GrantsPart({
           label="保存授权"
           kind={withdrawn.length > 0 || granted ? "primary" : "secondary"}
           disabled={busy || catalog === null}
+          busy={busy}
           ask={() => withdrawn.length > 0}
           warning={`将撤销 ${withdrawn.map(nameOf).join("、")} 的授权。保存后，该租户的所有密钥都不能再调用这些模型。`}
           onConfirm={() => void submit()}
@@ -944,6 +950,7 @@ function GroupsPart({
           label="保存分组"
           kind={edited ? "primary" : "secondary"}
           disabled={busy}
+          busy={busy}
           ask={() => !picked.some(reachable)}
           warning={
             unreachable.length > 0
@@ -1077,7 +1084,8 @@ function LimitsPart({ tenant, canEdit, save, onReload }: PartProps) {
         <Button
           kind={JSON.stringify(draft) !== JSON.stringify(limitDraft(tenant.limits)) ? "primary" : "secondary"}
           type="button"
-          disabled={busy}
+          busy={busy}
+          busyLabel="保存限额"
           onClick={() => void submit()}
         >
           保存限额
@@ -1156,12 +1164,20 @@ function MembersPart({
                           size="sm"
                           type="button"
                           disabled={busy === m.id}
+                          busy={busy === m.id}
+                          busyLabel="启用"
                           onClick={() => void toggle(m)}
                         >
                           启用
                         </Button>
                       ) : (
-                        <TwoStep label="停用" size="sm" disabled={busy === m.id} onConfirm={() => void toggle(m)} />
+                        <TwoStep
+                          label="停用"
+                          size="sm"
+                          disabled={busy === m.id}
+                          busy={busy === m.id}
+                          onConfirm={() => void toggle(m)}
+                        />
                       )}
                     </div>
                     {rowError?.id === m.id && <Failure error={rowError.error} />}
@@ -1430,10 +1446,13 @@ export function OverrideEditor({
   const [sent, setSent] = useState<string[]>([]);
   const [refused, setRefused] = useState<Refusal | null>(null);
   const [busy, setBusy] = useState(false);
+  // Which of the two is in flight: the save or the clear.
+  const [clearing, setClearing] = useState(false);
   const shown = useMemo(() => groupOptions(null, [...options, ...(k.allowed_provider_groups ?? [])]), [options, k]);
 
   async function submit(groups: string[] | null) {
     setBusy(true);
+    setClearing(groups === null);
     setRefused(null);
     setSent(groups ?? []);
     try {
@@ -1482,6 +1501,7 @@ export function OverrideEditor({
           label="保存覆盖"
           kind="primary"
           disabled={busy}
+          busy={busy && !clearing}
           ask={() => picked.length > 0 && !picked.some(reachable)}
           warning={unreachableWarning(picked, "这个密钥")}
           onConfirm={() => void submit(picked)}
@@ -1489,6 +1509,8 @@ export function OverrideEditor({
         <Button
           type="button"
           disabled={busy || k.allowed_provider_groups === null}
+          busy={busy && clearing}
+          busyLabel="清除覆盖"
           disabledReason={k.allowed_provider_groups === null ? "这个密钥没有分组覆盖" : undefined}
           onClick={() => void submit(null)}
         >
@@ -1596,7 +1618,7 @@ function DefaultsForm({
         </div>
       )}
       <Msg note={note} />
-      <Button kind="primary" type="button" disabled={busy} onClick={() => void submit()}>
+      <Button kind="primary" type="button" busy={busy} busyLabel="保存默认值" onClick={() => void submit()}>
         保存默认值
       </Button>
     </section>

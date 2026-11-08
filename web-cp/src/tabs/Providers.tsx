@@ -251,7 +251,7 @@ export function Providers({ canEdit }: TabProps) {
                   <td className="right">
                     {deleting === a.id ? (
                       <>
-                        <Button kind="danger" size="sm" disabled={busy} onClick={() => void remove(a)}>
+                        <Button kind="danger" size="sm" busy={busy} busyLabel="确认删除" onClick={() => void remove(a)}>
                           确认删除
                         </Button>
                         <Button size="sm" disabled={busy} onClick={() => setDeleting(null)}>
@@ -614,7 +614,14 @@ function AccountForm({
             </>
           )}
           <p>
-            <Button kind="danger" type="button" disabled={busy || removal.impact === null} onClick={() => void write()}>
+            <Button
+              kind="danger"
+              type="button"
+              disabled={busy || removal.impact === null}
+              busy={busy}
+              busyLabel="确认移除分组"
+              onClick={() => void write()}
+            >
               确认移除分组
             </Button>{" "}
             <Button type="button" disabled={busy} onClick={() => setRemoval(null)}>

@@ -35,6 +35,8 @@ export function Operators({ operator }: TabProps) {
   const [creating, setCreating] = useState(false);
   const [pending, setPending] = useState<Pending | null>(null);
   const [busy, setBusy] = useState(false);
+  // The account whose change is in flight.
+  const [changing, setChanging] = useState<string | null>(null);
   const [outcome, setOutcome] = useState<{ ok: boolean; text: string } | null>(null);
 
   const reload = useCallback(async () => {
@@ -52,6 +54,7 @@ export function Operators({ operator }: TabProps) {
 
   async function change(account: OperatorAccount, changes: { role?: OperatorRole; disabled?: boolean }, done: string) {
     setBusy(true);
+    setChanging(account.id);
     setOutcome(null);
     try {
       const view = await operators.update(account.id, changes);
@@ -66,6 +69,7 @@ export function Operators({ operator }: TabProps) {
     } finally {
       setPending(null);
       setBusy(false);
+      setChanging(null);
     }
   }
 
@@ -163,6 +167,8 @@ export function Operators({ operator }: TabProps) {
                             size="sm"
                             type="button"
                             disabled={busy}
+                            busy={changing === a.id}
+                            busyLabel={`确认改为${roleLabel(mine.role)}`}
                             onClick={() =>
                               void change(a, { role: mine.role }, `${a.email} 已改为${roleLabel(mine.role)}`)
                             }
@@ -181,6 +187,8 @@ export function Operators({ operator }: TabProps) {
                             size="sm"
                             type="button"
                             disabled={busy}
+                            busy={changing === a.id}
+                            busyLabel="确认停用"
                             onClick={() => void change(a, { disabled: true }, `${a.email} 已停用`)}
                           >
                             确认停用
@@ -208,6 +216,8 @@ export function Operators({ operator }: TabProps) {
                           size="sm"
                           type="button"
                           disabled={busy}
+                          busy={changing === a.id}
+                          busyLabel="启用"
                           onClick={() => void change(a, { disabled: false }, `${a.email} 已启用`)}
                         >
                           启用

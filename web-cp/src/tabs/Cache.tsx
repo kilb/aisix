@@ -86,6 +86,8 @@ export function Cache({ canEdit, onGoto }: TabProps) {
   const [failure, setFailure] = useState<{ text: string; details: Detail[] } | null>(null);
   const [conflict, setConflict] = useState(false);
   const [busy, setBusy] = useState(false);
+  // The policy whose delete is in flight.
+  const [removing, setRemoving] = useState<string | null>(null);
   // A refused delete, shown on the row it was asked on.
   const [deleteFailure, setDeleteFailure] = useState<{ id: string; error: unknown } | null>(null);
   const scopeProblemId = useId();
@@ -203,6 +205,7 @@ export function Cache({ canEdit, onGoto }: TabProps) {
 
   async function remove(p: ResourceView<CachePolicyDoc>) {
     setBusy(true);
+    setRemoving(p.id);
     setDeleteFailure(null);
     try {
       await policies.remove(p.id, p.version);
@@ -211,6 +214,7 @@ export function Cache({ canEdit, onGoto }: TabProps) {
       setDeleteFailure({ id: p.id, error: e });
     } finally {
       setBusy(false);
+      setRemoving(null);
     }
   }
 
@@ -313,6 +317,7 @@ export function Cache({ canEdit, onGoto }: TabProps) {
                         label="删除"
                         size="sm"
                         disabled={busy}
+                        busy={removing === p.id}
                         warning={`删除「${p.doc.name ?? p.id}」后，它覆盖的请求不再由网关缓存应答。`}
                         onConfirm={() => void remove(p)}
                       />
@@ -444,7 +449,14 @@ export function Cache({ canEdit, onGoto }: TabProps) {
           )}
           <div className="r">
             {!readOnly && (
-              <Button kind="primary" type="button" disabled={busy || ttlMissing} onClick={() => void submit()}>
+              <Button
+                kind="primary"
+                type="button"
+                disabled={busy || ttlMissing}
+                busy={busy && removing === null}
+                busyLabel="保存"
+                onClick={() => void submit()}
+              >
                 保存
               </Button>
             )}

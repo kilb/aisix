@@ -406,13 +406,16 @@ function KeyActions({
   onReload: () => void;
 }) {
   const [busy, setBusy] = useState(false);
+  // Which of the row's actions is in flight.
+  const [acting, setActing] = useState<"switch" | "revoke" | null>(null);
   const [failed, setFailed] = useState<unknown>(null);
 
   // A new version of the key (a save, a reload) supersedes what was refused.
   useEffect(() => setFailed(null), [k.version]);
 
-  async function run(action: () => Promise<void>) {
+  async function run(what: "switch" | "revoke", action: () => Promise<void>) {
     setBusy(true);
+    setActing(what);
     setFailed(null);
     try {
       await action();
@@ -420,17 +423,25 @@ function KeyActions({
       setFailed(e);
     } finally {
       setBusy(false);
+      setActing(null);
     }
   }
 
   const setDisabled = (disabled: boolean) =>
-    run(async () => onSaved(await keysApi.update(k.id, { disabled }, k.version)));
+    run("switch", async () => onSaved(await keysApi.update(k.id, { disabled }, k.version)));
 
   return (
     <>
       <div className="tn-actions">
         {k.disabled ? (
-          <Button type="button" size="sm" disabled={busy} onClick={() => void setDisabled(false)}>
+          <Button
+            type="button"
+            size="sm"
+            disabled={busy}
+            busy={acting === "switch"}
+            busyLabel="启用"
+            onClick={() => void setDisabled(false)}
+          >
             启用
           </Button>
         ) : (
@@ -438,6 +449,7 @@ function KeyActions({
             label="停用"
             size="sm"
             disabled={busy}
+            busy={acting === "switch"}
             warning="停用后该密钥立即失效；租户不能自行重新启用。"
             onConfirm={() => void setDisabled(true)}
           />
@@ -449,9 +461,10 @@ function KeyActions({
           label="吊销"
           size="sm"
           disabled={busy}
+          busy={acting === "revoke"}
           warning="吊销后该密钥永久失效，不能恢复。"
           onConfirm={() =>
-            void run(async () => {
+            void run("revoke", async () => {
               await keysApi.revoke(k.id, k.version);
               onRevoked(k);
             })
@@ -702,6 +715,7 @@ function CreateForm({
           label="创建"
           kind="primary"
           disabled={busy}
+          busy={busy}
           ask={() => picked.length > 0 && !picked.some(reachable)}
           warning={unreachableWarning(picked, "这个密钥")}
           onConfirm={() => void submit()}

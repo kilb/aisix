@@ -68,6 +68,8 @@ export function Members({
   const [issued, setIssued] = useState<{ email: string; link: string; expiresAt: string } | null>(null);
   const [actionErr, setActionErr] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
+  // Which action on that member or invitation is in flight.
+  const [acting, setActing] = useState<"role" | "remove" | "revoke" | null>(null);
   /** A role picked for a member and not yet confirmed. */
   const [drafts, setDrafts] = useState<Record<string, MemberRole>>({});
 
@@ -99,8 +101,9 @@ export function Members({
    * row can leave them unable to read them. Otherwise, and on any refusal,
    * the lists are read again.
    */
-  async function act(key: string, change: () => Promise<unknown>, done?: () => void) {
+  async function act(key: string, what: "role" | "remove" | "revoke", change: () => Promise<unknown>, done?: () => void) {
     setBusy(key);
+    setActing(what);
     setActionErr(null);
     try {
       await change();
@@ -113,6 +116,7 @@ export function Members({
       setActionErr(failure(e));
     } finally {
       setBusy(null);
+      setActing(null);
     }
     await load();
   }
@@ -217,18 +221,21 @@ export function Members({
                                 kind="danger"
                                 size="sm"
                                 disabled={busy === m.id}
-                                onClick={() => {
-                                  dropDraft(m.id);
+                                busy={busy === m.id && acting === "role"}
+                                busyLabel="确认更改角色"
+                                onClick={() =>
+                                  // The step stays, busy, until the change is answered.
                                   void act(
                                     m.id,
+                                    "role",
                                     () => memberApi.setRole(m.id, draft),
                                     self ? onSelfChanged : undefined,
-                                  );
-                                }}
+                                  ).finally(() => dropDraft(m.id))
+                                }
                               >
                                 确认更改角色
                               </Button>
-                              <Button size="sm" onClick={() => dropDraft(m.id)}>
+                              <Button size="sm" disabled={busy === m.id} onClick={() => dropDraft(m.id)}>
                                 取消
                               </Button>
                             </span>
@@ -248,7 +255,8 @@ export function Members({
                           size="sm"
                           warning="该成员的所有密钥会被吊销"
                           disabled={busy === m.id}
-                          onConfirm={() => void act(m.id, () => memberApi.remove(m.id), self ? onLeft : undefined)}
+                          busy={busy === m.id && acting === "remove"}
+                          onConfirm={() => void act(m.id, "remove", () => memberApi.remove(m.id), self ? onLeft : undefined)}
                         />
                       )}
                     </td>
@@ -311,7 +319,9 @@ export function Members({
                           <Button
                             size="sm"
                             disabled={busy === inv.id}
-                            onClick={() => void act(inv.id, () => memberApi.revokeInvite(inv.id))}
+                            busy={busy === inv.id && acting === "revoke"}
+                            busyLabel="撤销"
+                            onClick={() => void act(inv.id, "revoke", () => memberApi.revokeInvite(inv.id))}
                           >
                             撤销
                           </Button>

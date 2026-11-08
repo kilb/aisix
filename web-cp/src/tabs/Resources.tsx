@@ -285,13 +285,13 @@ function KindPage({ info, canEdit }: { info: KindInfo; canEdit: boolean }) {
           )}
           <div className="r">
             {editing.mode === "new" && (
-              <Button kind="primary" type="button" disabled={busy} onClick={() => void submit()}>
+              <Button kind="primary" type="button" busy={busy} busyLabel="创建" onClick={() => void submit()}>
                 创建
               </Button>
             )}
             {editing.mode === "edit" && editable && !confirmDelete && (
               <>
-                <Button kind="primary" type="button" disabled={busy} onClick={() => void submit()}>
+                <Button kind="primary" type="button" busy={busy} busyLabel="保存" onClick={() => void submit()}>
                   保存
                 </Button>
                 <Button type="button" disabled={busy} onClick={() => setConfirmDelete(true)}>
@@ -302,7 +302,7 @@ function KindPage({ info, canEdit }: { info: KindInfo; canEdit: boolean }) {
             {/* Ruling P1b-R6: a destructive action confirms inline, never in a dialog. */}
             {editing.mode === "edit" && editable && confirmDelete && (
               <>
-                <Button kind="danger" type="button" disabled={busy} onClick={() => void del()}>
+                <Button kind="danger" type="button" busy={busy} busyLabel="确认删除" onClick={() => void del()}>
                   确认删除
                 </Button>
                 <Button type="button" disabled={busy} onClick={() => setConfirmDelete(false)}>

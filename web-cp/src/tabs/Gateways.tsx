@@ -45,6 +45,8 @@ export function Gateways({ operator }: TabProps) {
   const [credentialsError, setCredentialsError] = useState<string | null>(null);
   const [note, setNote] = useState<Note | null>(null);
   const [busy, setBusy] = useState(false);
+  // The credential whose revoke is in flight.
+  const [revoking, setRevoking] = useState<string | null>(null);
   // Held in this component's state only: it is gone when the tab is left or
   // the page reloads, and is never written to storage, the URL or a log.
   const [bundle, setBundle] = useState<IssuedCredential | null>(null);
@@ -82,6 +84,7 @@ export function Gateways({ operator }: TabProps) {
 
   async function revoke(c: Credential) {
     setBusy(true);
+    setRevoking(c.dp_id);
     setNote(null);
     try {
       const view = await gateways.revoke(c.dp_id);
@@ -91,6 +94,7 @@ export function Gateways({ operator }: TabProps) {
       setNote({ kind: "crit", text: errorText(e) });
     } finally {
       setBusy(false);
+      setRevoking(null);
     }
   }
 
@@ -187,6 +191,7 @@ export function Gateways({ operator }: TabProps) {
                     label="吊销"
                     size="sm"
                     disabled={busy}
+                    busy={revoking === c.dp_id}
                     warning={`吊销网关凭据「${c.name}」后，使用这份凭据的网关将被控制面拒绝连接，且无法恢复。`}
                     onConfirm={() => void revoke(c)}
                   />

@@ -327,6 +327,8 @@ export function Models({ canEdit }: TabProps) {
                               kind="danger"
                               size="sm"
                               disabled={busy || deleting.holders === null}
+                              busy={busy}
+                              busyLabel="确认删除"
                               onClick={() => void remove(m)}
                             >
                               确认删除

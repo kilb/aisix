@@ -65,6 +65,8 @@ export function Keys({
   const [minted, setMinted] = useState<string | null>(null);
   const [actionErr, setActionErr] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
+  // Which action on that key is in flight.
+  const [acting, setActing] = useState<"switch" | "revoke" | null>(null);
 
   const load = useCallback(async () => {
     try {
@@ -90,8 +92,9 @@ export function Keys({
   }, [active, manager]);
 
   /** One change of key `k`; the list is read again whatever the answer. */
-  async function act(k: TenantKey, change: () => Promise<unknown>) {
+  async function act(k: TenantKey, what: "switch" | "revoke", change: () => Promise<unknown>) {
     setBusy(k.id);
+    setActing(what);
     setActionErr(null);
     try {
       await change();
@@ -104,6 +107,7 @@ export function Keys({
       );
     } finally {
       setBusy(null);
+      setActing(null);
     }
     await load();
   }
@@ -230,7 +234,9 @@ export function Keys({
                           <Button
                             size="sm"
                             disabled={busy === k.id}
-                            onClick={() => void act(k, () => keyApi.setDisabled(k.id, !k.disabled, k.version))}
+                            busy={busy === k.id && acting === "switch"}
+                            busyLabel={k.disabled ? "启用" : "停用"}
+                            onClick={() => void act(k, "switch", () => keyApi.setDisabled(k.id, !k.disabled, k.version))}
                           >
                             {k.disabled ? "启用" : "停用"}
                           </Button>
@@ -240,7 +246,8 @@ export function Keys({
                           size="sm"
                           warning="吊销后立即失效，且无法恢复"
                           disabled={busy === k.id}
-                          onConfirm={() => void act(k, () => keyApi.revoke(k.id, k.version))}
+                          busy={busy === k.id && acting === "revoke"}
+                          onConfirm={() => void act(k, "revoke", () => keyApi.revoke(k.id, k.version))}
                         />
                       </span>
                     </td>

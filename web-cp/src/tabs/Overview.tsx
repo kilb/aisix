@@ -40,6 +40,8 @@ export function Overview({ operator, onGoto }: TabProps) {
   const [error, setError] = useState<string | null>(null);
   const [note, setNote] = useState<Note | null>(null);
   const [busy, setBusy] = useState(false);
+  // Which recovery is in flight.
+  const [acting, setActing] = useState<"take-over" | "clean" | null>(null);
 
   // A failed read keeps the last summary on screen, under the error.
   const readSummary = useCallback(async () => {
@@ -71,6 +73,7 @@ export function Overview({ operator, onGoto }: TabProps) {
 
   async function allowDeletes() {
     setBusy(true);
+    setActing("clean");
     setNote(null);
     try {
       const r = await rollout.reconcile(true);
@@ -79,12 +82,14 @@ export function Overview({ operator, onGoto }: TabProps) {
       setNote({ kind: "crit", text: errorText(e) });
     } finally {
       setBusy(false);
+      setActing(null);
       await readSummary();
     }
   }
 
   async function takeOver(owner: string) {
     setBusy(true);
+    setActing("take-over");
     setNote(null);
     try {
       await rollout.takeOver(owner);
@@ -93,6 +98,7 @@ export function Overview({ operator, onGoto }: TabProps) {
       setNote({ kind: "crit", text: errorText(e) });
     } finally {
       setBusy(false);
+      setActing(null);
       await readSummary();
     }
   }
@@ -148,6 +154,7 @@ export function Overview({ operator, onGoto }: TabProps) {
                 <TwoStep
                   label="接管该环境"
                   disabled={busy}
+                  busy={acting === "take-over"}
                   warning={
                     `将把该环境从数据库 ${blocked.owner_database_id} 接管到本控制面的数据库 ${blocked.database_id}。` +
                     "请先停止旧控制面的所有实例。此操作会记入审计日志。"
@@ -180,6 +187,7 @@ export function Overview({ operator, onGoto }: TabProps) {
                 <TwoStep
                   label="允许清理"
                   disabled={busy}
+                  busy={acting === "clean"}
                   warning="将删除 kine 中所有控制面不认识的键，删除后无法恢复。"
                   onConfirm={() => void allowDeletes()}
                 />
