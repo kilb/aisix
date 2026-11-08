@@ -1767,6 +1767,24 @@ async fn every_tenant_write_takes_the_tenant_before_the_resources_lock() {
             )),
             201,
         ),
+        // The tenant's own quota route writes a quota of a member of its
+        // own, which no other case here touches.
+        (
+            "POST /api/budgets",
+            Box::pin(fire(
+                cp.clone(),
+                "POST",
+                "/api/budgets".to_string(),
+                owner.cookie().to_string(),
+                None,
+                Some(json!({
+                    "scope": "member",
+                    "scope_ref": member.id,
+                    "limit_usd": "0.05",
+                })),
+            )),
+            201,
+        ),
     ];
     for (what, request, expected) in cases {
         let status = waits_for_the_tenant_first(&cp, tenant, what, request).await;

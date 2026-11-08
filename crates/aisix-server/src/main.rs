@@ -1612,6 +1612,12 @@ async fn run(mut cfg: Config, hangup: Option<HangupSignal>) -> anyhow::Result<()
         }));
         let fan_out = proxy_state.otlp_fan_out.clone();
         h = h.with_exporter_health_fetcher(Arc::new(move || fan_out.exporter_stats()));
+        // The same `Metrics` the telemetry worker and the usage queue count
+        // their drops on.
+        let metrics_for_drops = Arc::clone(&metrics);
+        h = h.with_usage_drops_fetcher(Arc::new(move || {
+            metrics_for_drops.usage_event_drop_totals()
+        }));
         heartbeat::spawn(h, cancel_rx.clone())
     });
 

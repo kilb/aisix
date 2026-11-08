@@ -25,7 +25,7 @@
 //!   - cancelled via the shared `watch::Receiver<bool>` so graceful
 //!     shutdown doesn't leave an in-flight request dangling
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -88,6 +88,13 @@ pub type ConfigHashFetcher = Arc<dyn Fn() -> Option<String> + Send + Sync>;
 /// "these DPs load your documents but do not enforce field X" — the
 /// signal that a fleet is mid-rollout behind a newer control plane.
 pub type PartialCompatFetcher = Arc<dyn Fn() -> Vec<PartialCompatEntry> + Send + Sync>;
+
+/// Per-tick source of the usage events this process dropped since it
+/// started, by `reason` (`Metrics::usage_event_drop_totals`). Reported as
+/// `usage_event_drops` so the control plane shows lost usage per instance
+/// instead of only on this gateway's scrape. The counts only grow while the
+/// process runs; a restart is a new instance, whose counts start at zero.
+pub type UsageDropsFetcher = Arc<dyn Fn() -> BTreeMap<String, u64> + Send + Sync>;
 
 /// File paths to the on-disk mTLS bundle the heartbeat client presents
 /// to the control plane. Same three files written by cert-bundle provisioning and
@@ -167,6 +174,10 @@ pub struct HeartbeatConfig {
     /// aggregate. `None` (tests / no supervisor) omits the field, same
     /// tolerance contract as the other optional fields. See #871.
     pub partial_compat_fetcher: Option<PartialCompatFetcher>,
+    /// Optional source of the usage events dropped since start, by
+    /// reason. `None` (tests / no telemetry) omits the field, same
+    /// tolerance contract as the other optional fields.
+    pub usage_drops_fetcher: Option<UsageDropsFetcher>,
 }
 
 impl std::fmt::Debug for HeartbeatConfig {
@@ -202,6 +213,10 @@ impl std::fmt::Debug for HeartbeatConfig {
                 "partial_compat_fetcher",
                 &self.partial_compat_fetcher.as_ref().map(|_| "<fn>"),
             )
+            .field(
+                "usage_drops_fetcher",
+                &self.usage_drops_fetcher.as_ref().map(|_| "<fn>"),
+            )
             .finish()
     }
 }
@@ -231,6 +246,7 @@ impl HeartbeatConfig {
             exporter_health_fetcher: None,
             config_hash_fetcher: None,
             partial_compat_fetcher: None,
+            usage_drops_fetcher: None,
         }
     }
 
@@ -269,6 +285,12 @@ impl HeartbeatConfig {
     /// Wire the supervisor's partially-compatible aggregate source (#871).
     pub fn with_partial_compat_fetcher(mut self, fetcher: PartialCompatFetcher) -> Self {
         self.partial_compat_fetcher = Some(fetcher);
+        self
+    }
+
+    /// Wire the source of the usage events dropped since start.
+    pub fn with_usage_drops_fetcher(mut self, fetcher: UsageDropsFetcher) -> Self {
+        self.usage_drops_fetcher = Some(fetcher);
         self
     }
 }
@@ -377,6 +399,12 @@ struct HeartbeatBody<'a> {
     /// ignores this until #1227 surfaces it.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     partially_compatible_resources: Vec<PartialCompatWire>,
+    /// Usage events dropped since the process started, by `reason`: what
+    /// `aisix_usage_event_drops_total` counts, summed per reason. Omitted
+    /// when nothing was dropped, which the control plane reads the same as
+    /// no drops, so the body keeps its historical shape until usage is lost.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    usage_event_drops: BTreeMap<String, u64>,
 }
 
 /// Cap on the `last_error` excerpt forwarded per exporter. The pipeline
@@ -534,6 +562,11 @@ async fn send(client: &reqwest::Client, cfg: &HeartbeatConfig, uptime: i64) -> a
         .as_ref()
         .map(|fetcher| fetcher().into_iter().map(PartialCompatWire::from).collect())
         .unwrap_or_default();
+    let usage_event_drops = cfg
+        .usage_drops_fetcher
+        .as_ref()
+        .map(|fetcher| fetcher())
+        .unwrap_or_default();
 
     let resp = client
         .post(&cfg.url)
@@ -551,6 +584,7 @@ async fn send(client: &reqwest::Client, cfg: &HeartbeatConfig, uptime: i64) -> a
             exporter_health,
             rejected_resources: rejections,
             partially_compatible_resources,
+            usage_event_drops,
         })
         .send()
         .await
@@ -1017,6 +1051,44 @@ managed:
             serde_json::json!([
                 {"kind": "api_keys", "field": "quota_profile", "count": 3}
             ]),
+        );
+    }
+
+    /// The usage events dropped since start ride the beat by reason, and a
+    /// gateway that dropped none sends no field at all.
+    #[tokio::test]
+    async fn the_heartbeat_reports_usage_drops_and_omits_none() {
+        let server = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path("/dp/heartbeat"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true
+            })))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mtls = write_test_bundle(dir.path());
+        let url = format!("{}/dp/heartbeat", server.uri());
+        let none = cfg_with_bundle(url.clone(), mtls.clone())
+            .with_usage_drops_fetcher(Arc::new(BTreeMap::new));
+        send(&plain_client(), &none, 7).await.unwrap();
+        let some = cfg_with_bundle(url, mtls).with_usage_drops_fetcher(Arc::new(|| {
+            BTreeMap::from([("send_failed".to_string(), 3)])
+        }));
+        send(&plain_client(), &some, 7).await.unwrap();
+
+        let received = server.received_requests().await.unwrap();
+        assert_eq!(received.len(), 2);
+        let body: serde_json::Value = serde_json::from_slice(&received[0].body).unwrap();
+        assert!(
+            body.get("usage_event_drops").is_none(),
+            "a gateway that dropped nothing sends no usage_event_drops: {body}",
+        );
+        let body: serde_json::Value = serde_json::from_slice(&received[1].body).unwrap();
+        assert_eq!(
+            body["usage_event_drops"],
+            serde_json::json!({"send_failed": 3}),
         );
     }
 

@@ -1173,16 +1173,14 @@ fn drop_batch(
     attempts: usize,
     failure: Option<&SendFailure>,
 ) {
-    for event in events {
-        metrics.record_usage_event_drop(
-            reason,
-            UsageEventLabels {
-                user_id: non_empty(&event.user_id),
-                user_name: non_empty(&event.user_name),
-                ..UsageEventLabels::default()
-            },
-        );
-    }
+    metrics.record_usage_event_drops(
+        reason,
+        events.iter().map(|event| UsageEventLabels {
+            user_id: non_empty(&event.user_id),
+            user_name: non_empty(&event.user_name),
+            ..UsageEventLabels::default()
+        }),
+    );
     let error = match failure {
         Some(failure) => failure.to_string(),
         // `attempts = 0` beside it: there is no failure to name, because
