@@ -435,6 +435,29 @@ async fn a_consistent_ledger_reconciles() {
         .await;
     assert_eq!(r.status, 200, "{r:?}");
     credit(cp, &admin, w.tenant, "1.50").await;
+    // Money that never came in, and a limit that moves no money: a rejected
+    // top-up, one still pending, and a credit-limit change.
+    let rejected = request_topup(cp, w.tenant, "4.00").await;
+    let r = cp
+        .send(
+            "POST",
+            &format!("/admin/billing/topups/{rejected}/reject"),
+            Some(w.admin.cookie()),
+            Some(json!({"reason": "未到账 r23"})),
+        )
+        .await;
+    assert_eq!(r.status, 200, "{r:?}");
+    request_topup(cp, w.tenant, "8.00").await;
+    let r = cp
+        .send(
+            "PATCH",
+            &format!("/admin/tenants/{}/billing", w.tenant),
+            Some(w.admin.cookie()),
+            Some(json!({"credit_limit_usd": "5.00"})),
+        )
+        .await;
+    assert_eq!(r.status, 200, "{r:?}");
+    assert_eq!(r.body["credit_limit_micro_usd"], json!(5_000_000), "{r:?}");
 
     // A run at doubled prices charges each of the three rows 680 µ$ more.
     insert_sell(cp, model, None, db_now(cp).await, Some(doubled()))
@@ -769,4 +792,76 @@ async fn a_reconciliation_past_its_time_bound_answers_503() {
     );
     // Released, it answers.
     reconcile(&cp, &viewer, None).await;
+}
+
+#[tokio::test]
+async fn the_time_bound_covers_the_whole_reconciliation_not_each_read() {
+    // Lock waits longer than the bound, so the bound is what ends them.
+    let Some(cp) = TestCp::start_with(|cfg| cfg.db_lock_timeout_ms = 60_000).await else {
+        return;
+    };
+    let viewer = cp.admin_login_seeded(OperatorRole::Viewer).await;
+    let pool = cp.db().pool().clone();
+    // The gateway credentials, which only the usage loss reads, are held
+    // throughout; the ledger, which the first checks read, for 6 s. The
+    // timer is the scenario, a first read that takes 6 s, not a wait for a
+    // condition.
+    let mut credentials = pool.begin().await.expect("begin");
+    sqlx::query("LOCK TABLE dp_credentials IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *credentials)
+        .await
+        .expect("hold the credentials");
+    let mut ledger = pool.begin().await.expect("begin");
+    sqlx::query("LOCK TABLE billing_ledger IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *ledger)
+        .await
+        .expect("hold the ledger");
+    let release = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        ledger.rollback().await.expect("release the ledger");
+    });
+    let started = Instant::now();
+    let r = cp.get_with_cookie(PATH, viewer.cookie()).await;
+    let elapsed = started.elapsed();
+    release.await.expect("the release ran");
+    credentials
+        .rollback()
+        .await
+        .expect("release the credentials");
+    // 6 s on the ledger leaves 4 s for the rest: 503 at about 10 s, not
+    // after a fresh 10 s for the read that waits on the credentials.
+    assert_eq!(r.status, 503, "{r:?}");
+    assert_eq!(r.body["code"], "unavailable", "{r:?}");
+    assert!(
+        elapsed >= Duration::from_secs(9) && elapsed < Duration::from_secs(12),
+        "{elapsed:?}"
+    );
+    reconcile(&cp, &viewer, None).await;
+}
+
+#[tokio::test]
+async fn a_lower_configured_statement_timeout_still_binds_a_reconciliation() {
+    // An operator's 2 s statement timeout, under the reconciliation's own
+    // bound, with lock waits longer than both.
+    let Some(cp) = TestCp::start_with(|cfg| {
+        cfg.db_statement_timeout_ms = 2_000;
+        cfg.db_lock_timeout_ms = 60_000;
+    })
+    .await
+    else {
+        return;
+    };
+    let viewer = cp.admin_login_seeded(OperatorRole::Viewer).await;
+    let mut ledger = cp.db().pool().begin().await.expect("begin");
+    sqlx::query("LOCK TABLE billing_ledger IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *ledger)
+        .await
+        .expect("hold the ledger");
+    let started = Instant::now();
+    let r = cp.get_with_cookie(PATH, viewer.cookie()).await;
+    let elapsed = started.elapsed();
+    ledger.rollback().await.expect("release the ledger");
+    assert_eq!(r.status, 503, "{r:?}");
+    assert_eq!(r.body["code"], "unavailable", "{r:?}");
+    assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
 }

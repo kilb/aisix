@@ -35,10 +35,13 @@
 //! It only reads. The route runs it in one read-only `REPEATABLE READ`
 //! transaction, so every check sees one snapshot, and takes no tenant,
 //! account or advisory lock, so it never holds up intake or a money path.
-//! Each statement is bounded by [`STATEMENT_TIMEOUT`], past which the route
-//! answers `503`.
+//! All of its reads together are bounded by [`TIME_BOUND`], past which the
+//! route answers `503`: a reconciliation holds a connection of the pool
+//! intake shares, and its tables' `ACCESS SHARE` locks, for as long as it
+//! runs.
 
 use std::collections::BTreeMap;
+use std::time::{Duration, Instant};
 
 use axum::extract::rejection::QueryRejection;
 use axum::extract::{Query, State};
@@ -53,11 +56,13 @@ use uuid::Uuid;
 use crate::auth::{OperatorAuth, OperatorRole};
 use crate::db::DbError;
 use crate::error::ApiError;
+use crate::pricing::store;
 use crate::usage::query_rejected;
 use crate::AppState;
 
-/// Bounds each statement of a reconciliation, which reads whole tables.
-const STATEMENT_TIMEOUT: &str = "SET LOCAL statement_timeout = '10s'";
+/// How long one reconciliation may take, all of its reads together. They
+/// read whole tables.
+const TIME_BOUND: Duration = Duration::from_secs(10);
 
 /// The drop reason for a batch the gateway sent without learning whether
 /// it was stored.
@@ -142,24 +147,52 @@ fn only(tenant_id: Option<Uuid>, condition: &str) -> &str {
     }
 }
 
-/// What [`check`] finds, for tenant `tenant_id` or every tenant. Run it in
-/// one `REPEATABLE READ` transaction, so every check reads one snapshot.
+/// The time left of a reconciliation's [`TIME_BOUND`], set as the
+/// statement timeout of its next read: at least 1 ms, so a spent budget
+/// cancels the next read (SQLSTATE `57014`), and never more than the
+/// connection's own `statement_timeout`, `session_ms` (0 for none).
+/// `set_config(…, true)` is local to the transaction, as `SET LOCAL` is.
+async fn bound(conn: &mut PgConnection, deadline: Instant, session_ms: i64) -> Result<(), DbError> {
+    let mut left = deadline
+        .saturating_duration_since(Instant::now())
+        .as_millis()
+        .max(1);
+    if let Ok(session_ms @ 1..) = u128::try_from(session_ms) {
+        left = left.min(session_ms);
+    }
+    sqlx::query("SELECT set_config('statement_timeout', $1, true)")
+        .bind(format!("{left}ms"))
+        .execute(conn)
+        .await?;
+    Ok(())
+}
+
+/// What [`check`] finds, for tenant `tenant_id` or every tenant, within
+/// [`TIME_BOUND`] (`57014` past it). Run it in one `REPEATABLE READ`
+/// transaction, so every check reads one snapshot.
 pub async fn check(
     conn: &mut PgConnection,
     tenant_id: Option<Uuid>,
 ) -> Result<Reconciliation, DbError> {
-    let (checked_at, since): (DateTime<Utc>, DateTime<Utc>) =
-        sqlx::query_as("SELECT now(), now() - interval '24 hours'")
-            .fetch_one(&mut *conn)
-            .await?;
+    let deadline = Instant::now() + TIME_BOUND;
+    let (checked_at, since, session_ms): (DateTime<Utc>, DateTime<Utc>, i64) = sqlx::query_as(
+        "SELECT now(), now() - interval '24 hours', \
+           (SELECT reset_val::bigint FROM pg_settings WHERE name = 'statement_timeout')",
+    )
+    .fetch_one(&mut *conn)
+    .await?;
+    bound(&mut *conn, deadline, session_ms).await?;
     let mut mismatches = totals(&mut *conn, tenant_id).await?;
+    bound(&mut *conn, deadline, session_ms).await?;
     mismatches.extend(running_balances(&mut *conn, tenant_id).await?);
     mismatches.sort_by(|a, b| {
         (&a.tenant_name, a.tenant_id, a.check).cmp(&(&b.tenant_name, b.tenant_id, b.check))
     });
+    bound(&mut *conn, deadline, session_ms).await?;
     let charged_without_entry = charged_without_entry(&mut *conn, tenant_id).await?;
+    bound(&mut *conn, deadline, session_ms).await?;
     let unpriced_last_24h = unpriced(&mut *conn).await?;
-    let usage_loss = usage_loss(conn, since).await?;
+    let usage_loss = usage_loss(conn, since, deadline, session_ms).await?;
     Ok(Reconciliation {
         checked_at,
         tenant_id,
@@ -314,18 +347,10 @@ async fn charged_without_entry(
     Ok(query.fetch_one(conn).await?)
 }
 
-/// The charges stored unpriced in the last 24 hours (by when they were
-/// priced), by reason, exactly as `/admin/pricing/status` counts them.
+/// The charges stored unpriced in the last 24 hours, by reason, counted as
+/// `/admin/pricing/status` counts them ([`store::unpriced_by_code`]).
 async fn unpriced(conn: &mut PgConnection) -> Result<Unpriced, DbError> {
-    let by_code: BTreeMap<String, i64> = sqlx::query_as::<_, (String, i64)>(
-        "SELECT COALESCE(error_code, 'unknown'), count(*)::bigint FROM pricing_charges \
-         WHERE status = 'unpriced' AND priced_at >= now() - interval '24 hours' \
-         GROUP BY 1 ORDER BY 1",
-    )
-    .fetch_all(conn)
-    .await?
-    .into_iter()
-    .collect();
+    let by_code: BTreeMap<String, i64> = store::unpriced_by_code(conn).await?.into_iter().collect();
     Ok(Unpriced {
         total: by_code.values().sum(),
         by_code,
@@ -337,8 +362,14 @@ async fn unpriced(conn: &mut PgConnection) -> Result<Unpriced, DbError> {
 /// A gateway counts drops in a u64 and reports each count as it is, and the
 /// heartbeat stores any count up to `u64::MAX`, so a `bigint` total could
 /// overflow and fail the route. The totals are added up as `numeric` and
-/// saturate at `i64::MAX` as they are read.
-async fn usage_loss(conn: &mut PgConnection, since: DateTime<Utc>) -> Result<UsageLoss, DbError> {
+/// saturate at `i64::MAX` as they are read. Each read is [`bound`].
+async fn usage_loss(
+    conn: &mut PgConnection,
+    since: DateTime<Utc>,
+    deadline: Instant,
+    session_ms: i64,
+) -> Result<UsageLoss, DbError> {
+    bound(&mut *conn, deadline, session_ms).await?;
     let instances: Vec<InstanceDrops> = sqlx::query_as(
         "SELECT i.dp_id, c.name AS credential_name, i.instance_id, i.hostname, i.last_seen_at, \
            i.usage_event_drops AS drops \
@@ -348,6 +379,7 @@ async fn usage_loss(conn: &mut PgConnection, since: DateTime<Utc>) -> Result<Usa
     .bind(since)
     .fetch_all(&mut *conn)
     .await?;
+    bound(&mut *conn, deadline, session_ms).await?;
     let (dropped_total, unconfirmed_total): (i64, i64) = sqlx::query_as(
         "SELECT \
            LEAST(COALESCE(SUM(CASE WHEN d.key = $2 THEN 0 ELSE d.value::numeric END)::numeric, \
@@ -377,8 +409,9 @@ pub struct ReconcileQuery {
 
 /// `GET /admin/billing/reconciliation[?tenant_id]` → `Reconciliation`
 /// ([`check`]); `404 not_found` for a tenant id that names no tenant, rather
-/// than an answer with nothing to report; `503 unavailable` when a
-/// statement runs past [`STATEMENT_TIMEOUT`].
+/// than an answer with nothing to report; `503 unavailable` when the reads
+/// run past [`TIME_BOUND`]. The tenant lookup before them is one row by its
+/// key, bounded by the connection's own timeouts as any route's read is.
 pub async fn reconciliation(
     auth: OperatorAuth,
     State(state): State<AppState>,
@@ -394,7 +427,6 @@ pub async fn reconciliation(
                 sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
                     .execute(&mut *conn)
                     .await?;
-                sqlx::query(STATEMENT_TIMEOUT).execute(&mut *conn).await?;
                 if let Some(id) = tenant_id {
                     let known: bool =
                         sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM tenants WHERE id = $1)")
@@ -414,13 +446,14 @@ pub async fn reconciliation(
     found.map(Json).ok_or_else(ApiError::not_found)
 }
 
-/// A statement cancelled by [`STATEMENT_TIMEOUT`] (SQLSTATE `57014`) is
-/// `503`, as a lock wait past `lock_timeout` is: the same request can
-/// succeed once the database is less busy.
+/// A read cancelled by its statement timeout (SQLSTATE `57014`), which
+/// [`bound`] sets from [`TIME_BOUND`], is `503`, as a lock wait past
+/// `lock_timeout` is: the same request can succeed once the database is less
+/// busy.
 fn api_error(e: DbError) -> ApiError {
     match &e {
         DbError::Db(sqlx::Error::Database(db)) if db.code().as_deref() == Some("57014") => {
-            tracing::warn!("a reconciliation ran past its statement timeout; answered 503");
+            tracing::warn!("a reconciliation ran past its time bound; answered 503");
             ApiError::unavailable()
         }
         _ => ApiError::from(e),

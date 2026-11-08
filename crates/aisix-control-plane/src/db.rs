@@ -6,8 +6,9 @@
 //! `boolean`, times `timestamptz`; every SUM aggregate is cast `::bigint`,
 //! because Postgres sums a `bigint` column into `numeric`, which does not
 //! decode as `i64`, or, where the total can pass the `bigint` range, cast
-//! `::numeric` explicitly and narrowed before it is decoded (enforced over
-//! `src/` by [`uncast_sums`]); every
+//! `::numeric` explicitly and narrowed before it is decoded (the cast is
+//! enforced over `src/` by [`uncast_sums`]; the narrowing is the query's);
+//! every
 //! `ON CONFLICT … DO UPDATE` reads the proposed row through `EXCLUDED.` and
 //! qualifies the existing row's columns with the table name; a unique
 //! violation is recognised by SQLSTATE and constraint name, never by message
@@ -226,8 +227,9 @@ impl Db {
 ///
 /// An explicit `::numeric` counts as a cast too, in the same places: it is
 /// how a total that can pass the `bigint` range (counts the gateways report
-/// as u64) says so, and its query narrows it before it is decoded. What the
-/// census refuses is a SUM left to Postgres's implicit `numeric`.
+/// as u64) says so. This checks only the cast: narrowing such a total before
+/// it is decoded is up to its query. What it refuses is a SUM left to
+/// Postgres's implicit `numeric`.
 ///
 /// It reads any text, Rust source included: a call is the word `sum`, in
 /// any case, followed by `(`. A longer identifier ending in `sum`, a method
