@@ -53,7 +53,8 @@ const MAX_NOTE_CHARS: usize = 500;
 /// The longest payment reference, in characters.
 pub const MAX_REFERENCE_CHARS: usize = 128;
 
-/// The longest rejection reason, in characters.
+/// The longest reason an operator gives (a rejection's or a credit's), in
+/// characters.
 const MAX_REASON_CHARS: usize = 500;
 
 const TARGET_KIND: &str = "topup";
@@ -265,6 +266,18 @@ fn text_problem(raw: &str, path: &str, max: usize) -> Option<Detail> {
 /// [`MAX_REFERENCE_CHARS`] characters, none a control character.
 pub fn reference_problem(reference: &str) -> Option<Detail> {
     text_problem(reference, "/reference", MAX_REFERENCE_CHARS)
+}
+
+/// `raw` as the reason an operator gives at `/reason` (a rejection's or a
+/// credit's): 1 to [`MAX_REASON_CHARS`] characters, not blank, and no control
+/// character. `missing` is the problem's message for an absent, blank or too
+/// long one.
+pub(crate) fn operator_reason(raw: Option<String>, missing: &str) -> Result<String, Detail> {
+    match raw {
+        Some(r) if r.chars().any(char::is_control) => Err(detail("/reason", "不能包含控制字符")),
+        Some(r) if !r.trim().is_empty() && r.chars().count() <= MAX_REASON_CHARS => Ok(r),
+        _ => Err(detail("/reason", missing)),
+    }
 }
 
 /// A top-up id in a path; a malformed one names no top-up.
@@ -569,8 +582,8 @@ pub struct Rejection {
 /// `POST /admin/billing/topups/{id}/reject` with `{reason}` → `200
 /// AdminTopup`: the top-up is rejected with the reason, which the tenant
 /// reads, and no money moves. `422 /reason` unless it is 1 to 500
-/// characters and not blank; `404 not_found` for no such top-up; `409
-/// topup_state` when it is no longer pending.
+/// characters, not blank and free of control characters; `404 not_found`
+/// for no such top-up; `409 topup_state` when it is no longer pending.
 pub async fn reject(
     auth: OperatorAuth,
     State(state): State<AppState>,
@@ -579,12 +592,8 @@ pub async fn reject(
 ) -> Result<Json<Value>, ApiError> {
     auth.require(OperatorRole::Operator)?;
     let id = topup_id(&id)?;
-    let reason = req
-        .reason
-        .filter(|r| !r.trim().is_empty() && r.chars().count() <= MAX_REASON_CHARS)
-        .ok_or_else(|| {
-            ApiError::validation(vec![detail("/reason", "请填写驳回原因（1–500 个字符）")])
-        })?;
+    let reason = operator_reason(req.reason, "请填写驳回原因（1–500 个字符）")
+        .map_err(|d| ApiError::validation(vec![d]))?;
     let row = state
         .db
         .tx(move |conn| {

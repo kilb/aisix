@@ -240,6 +240,16 @@ async fn a_credit_reason_and_reference_are_bounded() {
             json!({"amount_usd": "1", "reason": "因".repeat(501)}),
             "/reason",
         ),
+        // A NUL, which Postgres cannot store, and a line break: refused as
+        // input, not failed in the database.
+        (
+            json!({"amount_usd": "1", "reason": "线下\u{0}收款"}),
+            "/reason",
+        ),
+        (
+            json!({"amount_usd": "1", "reason": "线下\n收款"}),
+            "/reason",
+        ),
         (
             json!({"amount_usd": "1", "reason": REASON, "reference": "r".repeat(129)}),
             "/reference",

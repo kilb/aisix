@@ -23,14 +23,11 @@ use super::marks;
 use super::topups::{self, Origin};
 use crate::audit::{self, Actor, AuditEntry};
 use crate::auth::{OperatorAuth, OperatorRole};
-use crate::error::{ApiError, Detail};
+use crate::error::ApiError;
 use crate::http::ApiJson;
 use crate::resources::write::WriteCtx;
 use crate::tenants::{self, TenantStatus};
 use crate::AppState;
-
-/// The longest credit reason, in characters.
-const MAX_REASON_CHARS: usize = 500;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -45,9 +42,10 @@ pub struct NewCredit {
 /// `POST /admin/tenants/{id}/credits` with `{amount_usd, reason,
 /// reference?}` → `201 AdminTopup`, posted and settled before the answer.
 /// `422` at `/amount_usd` unless it is dollars and cents above 0 and at most
-/// $1,000,000, at `/reason` unless it is 1 to 500 characters and not blank,
-/// and at `/reference` when it is over 128 characters or holds a control
-/// character; `404 not_found` for no such tenant or a pending one.
+/// $1,000,000, at `/reason` unless it is 1 to 500 characters, not blank and
+/// free of control characters, and at `/reference` when it is over 128
+/// characters or holds a control character; `404 not_found` for no such
+/// tenant or a pending one.
 pub async fn create(
     auth: OperatorAuth,
     State(state): State<AppState>,
@@ -62,14 +60,9 @@ pub async fn create(
         problems.append(&mut d);
         0
     });
-    let reason = req
-        .reason
-        .filter(|r| !r.trim().is_empty() && r.chars().count() <= MAX_REASON_CHARS)
-        .unwrap_or_else(|| {
-            problems.push(Detail {
-                path: "/reason".to_string(),
-                message: "请填写入账原因（1–500 个字符）".to_string(),
-            });
+    let reason = topups::operator_reason(req.reason, "请填写入账原因（1–500 个字符）")
+        .unwrap_or_else(|d| {
+            problems.push(d);
             String::new()
         });
     problems.extend(topups::reference_problem(&reference));

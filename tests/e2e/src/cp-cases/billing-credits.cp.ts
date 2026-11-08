@@ -79,8 +79,13 @@ describe("operators credit tenants directly", () => {
     const blocked = await world!.cp.admin.get(`/admin/tenants/${tenant.id}/billing`);
     expect(blocked.status, blocked.text).toBe(200);
     expect(blocked.body.exhausted, blocked.text).toBe(true);
-    const debt: number = blocked.body.balance_micro_usd;
-    expect(debt, blocked.text).toBeLessThanOrEqual(-CALL_MICRO_USD);
+    // Calls served while the block was on its way to the gateway are billed
+    // too. The credit below (five calls, over a limit of one) lifts the block
+    // only while they number four or fewer.
+    expect(
+      blocked.body.balance_micro_usd,
+      `more calls were served past the credit limit than this scenario's credit covers: ${blocked.text}`,
+    ).toBeGreaterThan(-6 * CALL_MICRO_USD);
 
     // The stack's operator is an admin.
     const credited = await world!.cp.admin.post(`/admin/tenants/${tenant.id}/credits`, {
@@ -94,16 +99,21 @@ describe("operators credit tenants directly", () => {
     expect(credited.body.credit_reason).toBe(REASON);
     expect(credited.body.requested_by).toBeNull();
     expect(credited.body.tenant_id).toBe(tenant.id);
-    // Settled before the answer. A call served while the block was on its
-    // way to the gateway is billed too, and its charge may still land
-    // between the two reads, so the balance rose by the credit less at most
-    // a few calls: never by nothing, never by two credits.
-    const account = await world!.cp.admin.get(`/admin/tenants/${tenant.id}/billing`);
-    expect(account.status, account.text).toBe(200);
-    expect(account.body.exhausted, account.text).toBe(false);
-    const rise = account.body.balance_micro_usd - debt;
-    expect(rise, account.text).toBeGreaterThan(0);
-    expect(rise, account.text).toBeLessThanOrEqual(5 * CALL_MICRO_USD);
+    // The credit is one topup entry of exactly the amount credited, posted on
+    // top of the entry before it. Entries never change, so this holds however
+    // many overshoot charges land around it.
+    const ledger = await owner.get("/api/billing/ledger");
+    expect(ledger.status, ledger.text).toBe(200);
+    const entries = ledger.body.items as Json[]; // newest first
+    const credits = entries.filter((e) => e.kind === "topup");
+    expect(credits.map((e) => [e.amount_micro_usd, e.topup_id]), ledger.text).toEqual([
+      [5 * CALL_MICRO_USD, credited.body.id],
+    ]);
+    const before = entries[entries.indexOf(credits[0]) + 1]; // the first chat's debit at the latest
+    expect(before, ledger.text).toBeDefined();
+    expect(credits[0].balance_after_micro_usd - 5 * CALL_MICRO_USD, ledger.text).toBe(
+      before.balance_after_micro_usd,
+    );
 
     await chatsAnswer(tenant, 200, "chats to be served after the operator's credit");
 
