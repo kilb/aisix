@@ -101,12 +101,15 @@ describe("usage the gateway cannot deliver", () => {
     });
     await cp.admin.waitRegistered(gw.dpId);
 
+    // The platform's own key below names the group it reaches, so this case
+    // creates one and puts the account in it beside `shared`.
+    const group = await cp.admin.createGroup("grp-usage-loss-7c1", "用量丢失 7c1");
     const account = await cp.admin.create("provider_keys", {
       display_name: "usage-loss-account-e2e",
       provider: "openai",
       api_key: "sk-usage-loss-upstream-e2e",
       api_base: `${upstream.baseUrl}/v1`,
-      groups: ["shared"],
+      groups: ["shared", "grp-usage-loss-7c1"],
     });
     await cp.admin.create("models", {
       display_name: MODEL,
@@ -120,9 +123,12 @@ describe("usage the gateway cannot deliver", () => {
     expect(tenants.status, tenants.text).toBe(200);
     const internal = (tenants.body.items as Json[]).find((t) => t.is_internal);
     expect(internal, tenants.text).toBeDefined();
+    // Every key names one group; the platform's own tenant has no
+    // assignment list, so it names the one above.
     const minted = await cp.admin.post(`/admin/tenants/${internal.id}/keys`, {
       label: "usage-loss-caller",
       allowed_models: ["*"],
+      group_id: group.id,
     });
     expect(minted.status, minted.text).toBe(201);
     keyId = minted.body.key.id;

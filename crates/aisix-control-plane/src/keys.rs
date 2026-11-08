@@ -1996,9 +1996,15 @@ mod tests {
             allowed_provider_groups: vec!["shared".to_string(), "grp-dedicated-9f3".to_string()],
             ..active.clone()
         };
-        assert_eq!(build_key_doc(&assigned, &elsewhere, true)["disabled"], false);
+        assert_eq!(
+            build_key_doc(&assigned, &elsewhere, true)["disabled"],
+            false
+        );
         // The platform's own keys are never closed for a group reason.
-        assert_eq!(build_key_doc(&internal(&[M1]), &key(None), true)["disabled"], false);
+        assert_eq!(
+            build_key_doc(&internal(&[M1]), &key(None), true)["disabled"],
+            false
+        );
     }
 
     #[test]

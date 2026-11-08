@@ -2687,11 +2687,7 @@ fn assert_422(r: &Resp, path: &str, message: Option<&str>) {
 }
 
 /// A tenant assigned exactly `groups`, which must exist as live groups.
-async fn tenant_with_groups(
-    cp: &TestCp,
-    admin: &OperatorSession,
-    groups: &[&str],
-) -> Uuid {
+async fn tenant_with_groups(cp: &TestCp, admin: &OperatorSession, groups: &[&str]) -> Uuid {
     let tenant = cp.seed_tenant(TenantStatus::Active).await;
     patch_tenant_ok(
         cp,
@@ -2722,12 +2718,7 @@ async fn a_key_of_a_tenant_with_two_groups_must_name_one() {
     let r = admin_mint(&cp, &admin, tenant, json!({"label": "no-group-7c1"})).await;
     assert_422(&r, "/group_id", Some("请选择分组"));
 
-    let r = mint(
-        &cp,
-        &owner,
-        json!({"label": "in-a-7c1", "group_id": a}),
-    )
-    .await;
+    let r = mint(&cp, &owner, json!({"label": "in-a-7c1", "group_id": a})).await;
     assert_eq!(r.status, 201, "{r:?}");
     assert_eq!(r.body["key"]["group"]["id"], json!(a), "{r:?}");
     assert_eq!(
@@ -2736,7 +2727,10 @@ async fn a_key_of_a_tenant_with_two_groups_must_name_one() {
     );
     assert_eq!(r.body["key"]["group_available"], true, "{r:?}");
     let id = text(&r.body, "/key/id");
-    assert_eq!(stored_group_id(&cp, &id).await.map(|g| g.to_string()), Some(a.clone()));
+    assert_eq!(
+        stored_group_id(&cp, &id).await.map(|g| g.to_string()),
+        Some(a.clone())
+    );
     // The document routes to the group's name alone.
     assert_eq!(
         key_doc(&cp, &id).await["allowed_provider_groups"],
@@ -2810,12 +2804,7 @@ async fn another_tenants_group_answers_like_an_unknown_id() {
     let random = Uuid::new_v4().to_string();
     let mut answers = Vec::new();
     for group in [theirs.as_str(), retired.as_str(), random.as_str()] {
-        let r = mint(
-            &cp,
-            &owner,
-            json!({"label": "x-7c1", "group_id": group}),
-        )
-        .await;
+        let r = mint(&cp, &owner, json!({"label": "x-7c1", "group_id": group})).await;
         assert_422(&r, "/group_id", Some("分组不存在或不可用"));
         answers.push(r.body.to_string());
     }
@@ -2824,12 +2813,7 @@ async fn another_tenants_group_answers_like_an_unknown_id() {
     assert_eq!(cp.count("tenant_keys").await, 0);
 
     // The group it is assigned still works.
-    let (id, _) = mint_ok(
-        &cp,
-        &owner,
-        json!({"label": "ok-7c1", "group_id": mine}),
-    )
-    .await;
+    let (id, _) = mint_ok(&cp, &owner, json!({"label": "ok-7c1", "group_id": mine})).await;
     assert_eq!(
         key_doc(&cp, &id).await["allowed_provider_groups"],
         json!(["grp-mine-7c1"])
@@ -2846,12 +2830,7 @@ async fn a_keys_group_cannot_change() {
     let b = seed_group(&cp, &admin, "grp-b-7c1", "B 分组 7c1").await;
     let tenant = tenant_with_groups(&cp, &admin, &["grp-a-7c1", "grp-b-7c1"]).await;
     let owner = cp.member_login_seeded(tenant, MemberRole::Owner).await;
-    let (id, _) = mint_ok(
-        &cp,
-        &owner,
-        json!({"label": "fixed-7c1", "group_id": a}),
-    )
-    .await;
+    let (id, _) = mint_ok(&cp, &owner, json!({"label": "fixed-7c1", "group_id": a})).await;
 
     let message = "密钥的分组创建后不能更改；如需更换分组，请新建密钥";
     // The tenant's own route, and the operators'.
@@ -2865,13 +2844,23 @@ async fn a_keys_group_cannot_change() {
     assert_422(&r, "/group_id", Some(message));
 
     // Nothing moved.
-    assert_eq!(stored_group_id(&cp, &id).await.map(|g| g.to_string()), Some(a.clone()));
+    assert_eq!(
+        stored_group_id(&cp, &id).await.map(|g| g.to_string()),
+        Some(a.clone())
+    );
     assert_eq!(
         key_doc(&cp, &id).await["allowed_provider_groups"],
         json!(["grp-a-7c1"])
     );
     // Another change still lands.
-    let r = on_key(&cp, &owner, "PATCH", &id, Some(json!({"label": "renamed-7c1"}))).await;
+    let r = on_key(
+        &cp,
+        &owner,
+        "PATCH",
+        &id,
+        Some(json!({"label": "renamed-7c1"})),
+    )
+    .await;
     assert_eq!(r.status, 200, "{r:?}");
 }
 
@@ -2904,7 +2893,11 @@ async fn a_legacy_customer_key_is_closed_until_it_takes_a_group_once() {
     // What it carries is the old rule, which the closed document never
     // exercises: its tenant's groups, since it sets no override.
     assert_eq!(doc["disabled"], true, "{doc}");
-    assert_eq!(doc["allowed_provider_groups"], json!(["grp-a-7c1"]), "{doc}");
+    assert_eq!(
+        doc["allowed_provider_groups"],
+        json!(["grp-a-7c1"]),
+        "{doc}"
+    );
     let view = call(
         &cp,
         "GET",
@@ -2920,9 +2913,16 @@ async fn a_legacy_customer_key_is_closed_until_it_takes_a_group_once() {
     // It may take one once, and opens.
     let r = on_key(&cp, &owner, "PATCH", &id, Some(json!({"group_id": a}))).await;
     assert_eq!(r.status, 200, "{r:?}");
-    assert_eq!(stored_group_id(&cp, &id).await.map(|g| g.to_string()), Some(a.clone()));
+    assert_eq!(
+        stored_group_id(&cp, &id).await.map(|g| g.to_string()),
+        Some(a.clone())
+    );
     let doc = key_doc(&cp, &id).await;
-    assert_eq!(doc["allowed_provider_groups"], json!(["grp-a-7c1"]), "{doc}");
+    assert_eq!(
+        doc["allowed_provider_groups"],
+        json!(["grp-a-7c1"]),
+        "{doc}"
+    );
     assert_eq!(doc["disabled"], false, "{doc}");
     // And only once.
     let r = on_key(&cp, &owner, "PATCH", &id, Some(json!({"group_id": a}))).await;
@@ -2967,7 +2967,11 @@ async fn an_internal_key_must_name_a_live_group_and_routes_to_it() {
     assert_eq!(r.status, 201, "{r:?}");
     let id = text(&r.body, "/key/id");
     let doc = key_doc(&cp, &id).await;
-    assert_eq!(doc["allowed_provider_groups"], json!(["grp-own-7c1"]), "{doc}");
+    assert_eq!(
+        doc["allowed_provider_groups"],
+        json!(["grp-own-7c1"]),
+        "{doc}"
+    );
     assert_eq!(doc["disabled"], false, "{doc}");
     assert_eq!(
         r.body["key"]["group"]["name"], "grp-own-7c1",
@@ -3023,12 +3027,7 @@ async fn a_key_whose_group_leaves_its_tenant_closes_and_reopens() {
     let b = seed_group(&cp, &admin, "grp-b-7c1", "B 分组 7c1").await;
     let tenant = tenant_with_groups(&cp, &admin, &["grp-a-7c1", "grp-b-7c1"]).await;
     let owner = cp.member_login_seeded(tenant, MemberRole::Owner).await;
-    let (id, _) = mint_ok(
-        &cp,
-        &owner,
-        json!({"label": "in-a-7c1", "group_id": a}),
-    )
-    .await;
+    let (id, _) = mint_ok(&cp, &owner, json!({"label": "in-a-7c1", "group_id": a})).await;
     assert_eq!(key_doc(&cp, &id).await["disabled"], false);
 
     // The tenant loses the key's group: the key closes, and stays where it
@@ -3042,7 +3041,11 @@ async fn a_key_whose_group_leaves_its_tenant_closes_and_reopens() {
     .await;
     let doc = key_doc(&cp, &id).await;
     assert_eq!(doc["disabled"], true, "{doc}");
-    assert_eq!(doc["allowed_provider_groups"], json!(["grp-a-7c1"]), "{doc}");
+    assert_eq!(
+        doc["allowed_provider_groups"],
+        json!(["grp-a-7c1"]),
+        "{doc}"
+    );
     let view = call(
         &cp,
         "GET",
@@ -3065,8 +3068,15 @@ async fn a_key_whose_group_leaves_its_tenant_closes_and_reopens() {
     .await;
     let doc = key_doc(&cp, &id).await;
     assert_eq!(doc["disabled"], false, "{doc}");
-    assert_eq!(doc["allowed_provider_groups"], json!(["grp-a-7c1"]), "{doc}");
-    assert_eq!(stored_group_id(&cp, &id).await.map(|g| g.to_string()), Some(a));
+    assert_eq!(
+        doc["allowed_provider_groups"],
+        json!(["grp-a-7c1"]),
+        "{doc}"
+    );
+    assert_eq!(
+        stored_group_id(&cp, &id).await.map(|g| g.to_string()),
+        Some(a)
+    );
     let _ = b;
 }
 
@@ -3140,12 +3150,7 @@ async fn api_groups_lists_the_tenants_assigned_groups() {
     )
     .await;
     assert_eq!(r.status, 200, "{r:?}");
-    let tenant = tenant_with_groups(
-        &cp,
-        &admin,
-        &["grp-b-7c1", "grp-a-7c1", "grp-gone-7c1"],
-    )
-    .await;
+    let tenant = tenant_with_groups(&cp, &admin, &["grp-b-7c1", "grp-a-7c1", "grp-gone-7c1"]).await;
     // Every member role may list them, a billing one included.
     for role in [MemberRole::Owner, MemberRole::Billing, MemberRole::Member] {
         let who = cp.member_login_seeded(tenant, role).await;

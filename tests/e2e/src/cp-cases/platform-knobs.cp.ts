@@ -46,8 +46,12 @@ describe("platform configuration rules at the gateway", () => {
     await fundTenant(cp!, created.body.id, "100.00");
     return created.body.id;
   };
-  const mint = async (tenantId: string, label: string): Promise<string> => {
-    const res = await cp!.admin.post(`/admin/tenants/${tenantId}/keys`, { label });
+  /** A tenant's key; `group_id` when the tenant is assigned more than one. */
+  const mint = async (tenantId: string, label: string, groupId?: string): Promise<string> => {
+    const res = await cp!.admin.post(`/admin/tenants/${tenantId}/keys`, {
+      label,
+      ...(groupId ? { group_id: groupId } : {}),
+    });
     expect(res.status, res.text).toBe(201);
     return res.body.plaintext;
   };
@@ -84,6 +88,9 @@ describe("platform configuration rules at the gateway", () => {
       scope: "team",
       applies_to_model_id: cachedModel.id,
     });
+    // The group a tenant is assigned must exist: a key names it, and
+    // `grp-alpha-7c1` was only a name in the account's document.
+    await cp.admin.createGroup("grp-alpha-7c1", "甲组 7c1");
     const alphaModel = await direct("knob-alpha-e2e", await account("acct-alpha-e2e", alpha, ["grp-alpha-7c1"]));
     const betaModel = await direct("knob-beta-e2e", await account("acct-beta-e2e", beta, ["grp-beta-3e9"]));
     // B first, round robin: a group check that let B through would show.
@@ -102,6 +109,7 @@ describe("platform configuration rules at the gateway", () => {
     keys.t1a = await mint(t1, "knob-t1-a");
     keys.t1b = await mint(t1, "knob-t1-b");
     keys.t2 = await mint(t2, "knob-t2");
+    // t3 is assigned exactly one group, so its key takes that one.
     keys.t3 = await mint(t3, "knob-t3");
     for (const [name, key] of Object.entries(keys)) {
       const proxy = new ProxyClient(app.proxyUrl, key);
