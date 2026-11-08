@@ -379,7 +379,8 @@
   }
   .page {
     padding-top: var(--s-4);
-    padding-bottom: 96px;
+    /* Room for the route bar fixed along the bottom edge. */
+    padding-bottom: calc(var(--s-12) * 2 + env(safe-area-inset-bottom));
   }
   .panel {
     padding: var(--s-5) var(--s-4);
@@ -415,9 +416,18 @@
 }
 
 /* The balance readout: what can still be spent, large, then one stop per
-   level on a route line, the level that binds filled and marked. */
+   level on a route line, the level that binds filled and marked. Its
+   geometry is named once here and every offset derives from it. */
+.readout {
+  --stop: var(--s-5); /* the binding stop's box */
+  --dot: var(--s-3); /* an ordinary stop */
+  --eye: var(--s-1); /* the binding stop's centre */
+  --lv-h: var(--s-6); /* the label row above a stop */
+  --gap: var(--s-2);
+  --rail: 2px; /* a hairline: the route line and a stop's rim */
+}
 .readout-pick {
-  max-width: 320px;
+  max-width: 24ch;
 }
 .readout-label {
   color: var(--text-2);
@@ -426,7 +436,6 @@
   margin-top: var(--s-1);
   font-size: var(--fs-45);
   line-height: var(--lh-heading);
-  letter-spacing: -0.01em;
 }
 .readout-amt .cur {
   margin-right: var(--s-1);
@@ -449,10 +458,10 @@
 .levels::before {
   content: "";
   position: absolute;
-  top: 41px;
-  left: 10px;
-  right: calc(100% / var(--n) - 10px);
-  height: 2px;
+  top: calc(var(--lv-h) + var(--gap) + (var(--stop) - var(--rail)) / 2);
+  left: calc(var(--stop) / 2);
+  right: calc(100% / var(--n) - var(--stop) / 2);
+  height: var(--rail);
   background: var(--route-line);
 }
 .levels:has(> :only-child)::before {
@@ -462,7 +471,7 @@
   display: flex;
   flex-direction: column;
   align-items: flex-start;
-  gap: var(--s-2);
+  gap: var(--gap);
   min-width: 0;
   padding-right: var(--s-4);
 }
@@ -470,7 +479,7 @@
   display: flex;
   align-items: center;
   gap: var(--s-2);
-  height: var(--s-6);
+  height: var(--lv-h);
   color: var(--text-2);
   line-height: var(--lh-table);
   white-space: nowrap;
@@ -479,22 +488,23 @@
   position: relative;
   display: grid;
   place-items: center;
-  width: 20px;
-  height: 20px;
+  width: var(--stop);
+  height: var(--stop);
 }
 .levels .stop {
-  width: 12px;
-  height: 12px;
-  border: 2px solid var(--route-line);
+  width: var(--dot);
+  height: var(--dot);
+  border: var(--rail) solid var(--route-line);
   border-radius: 50%;
   background: var(--surface);
   box-sizing: border-box;
 }
 .levels .bind .stop {
-  width: 20px;
-  height: 20px;
+  width: var(--stop);
+  height: var(--stop);
   border: 0;
-  background: radial-gradient(circle, var(--surface) 0 3px, var(--route-line) 3.5px);
+  /* The half pixel is the edge's antialiasing. */
+  background: radial-gradient(circle, var(--surface) 0 var(--eye), var(--route-line) calc(var(--eye) + 0.5px));
 }
 .levels .m {
   font-size: var(--fs-19);
@@ -522,7 +532,7 @@
 .bind-plate {
   display: inline-flex;
   align-items: center;
-  height: 20px;
+  height: var(--stop);
   padding: 0 var(--s-2);
   border-radius: var(--r-chip);
   background: var(--route-line);
@@ -540,7 +550,7 @@
   gap: var(--s-4);
 }
 .filters .field {
-  min-width: 176px;
+  min-width: 14em;
 }
 .panel-more {
   display: flex;
@@ -572,7 +582,7 @@
   .levels li {
     position: relative;
     display: grid;
-    grid-template-columns: 20px minmax(0, 1fr);
+    grid-template-columns: var(--stop) minmax(0, 1fr);
     column-gap: var(--s-3);
     row-gap: var(--s-1);
     padding: 0 0 var(--s-5);
@@ -584,7 +594,7 @@
     grid-column: 1;
     grid-row: 1 / span 3;
     align-self: start;
-    margin-top: 2px;
+    margin-top: calc((var(--lv-h) - var(--stop)) / 2);
   }
   .levels li > :is(.lv, .m, .k) {
     grid-column: 2;
@@ -592,10 +602,10 @@
   .levels li:not(:last-child)::after {
     content: "";
     position: absolute;
-    left: 9px;
-    top: 12px;
-    bottom: -12px;
-    width: 2px;
+    left: calc((var(--stop) - var(--rail)) / 2);
+    top: calc(var(--lv-h) / 2);
+    bottom: calc(var(--lv-h) / -2);
+    width: var(--rail);
     background: var(--route-line);
   }
   .levels .box {

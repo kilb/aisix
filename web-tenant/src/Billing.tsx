@@ -425,7 +425,7 @@ function TopupList({ items, err }: { items: Topup[] | null; err: string | null }
                   <td className="tabular">{t.decided_at ? fmtUtc(t.decided_at) : "—"}</td>
                   <td>
                     {why ? (
-                      <span className="trunc" title={why} style={{ "--trunc": "280px" } as React.CSSProperties}>
+                      <span className="trunc" title={why}>
                         {why}
                       </span>
                     ) : (

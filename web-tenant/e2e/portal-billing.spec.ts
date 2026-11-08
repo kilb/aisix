@@ -156,11 +156,15 @@ test.describe.serial("充值与扣费", () => {
 
   test("按天汇总与时间筛选按 UTC 计算", async ({ browser }) => {
     await waitClearOfUtcMidnight();
-    const context = await browser.newContext({ timezoneId: "Asia/Shanghai" });
+    // A zone whose calendar date differs from UTC's at this very moment, at any hour:
+    // +14 from 10:00 UTC on (already tomorrow), -11 before that (still yesterday).
+    const timezoneId = new Date().getUTCHours() >= 10 ? "Pacific/Kiritimati" : "Pacific/Pago_Pago";
+    const context = await browser.newContext({ timezoneId });
     const page = await context.newPage();
     try {
       await openAccount(page, world.owner);
       const today = utcDay(0);
+      expect(await page.evaluate(() => new Date().toLocaleDateString("en-CA"))).not.toBe(today);
       const ledger = region(page, "余额流水");
       const summary = region(page, "按期汇总");
       await ledger.getByLabel("开始日期（UTC）").fill(today);
@@ -172,6 +176,23 @@ test.describe.serial("充值与扣费", () => {
       await expect(row.nth(1)).toHaveText("-$0.022");
       await expect(row.nth(2)).toHaveText("$0.05");
       await expect(row.nth(4)).toHaveText("$0.028");
+      await expect(bodyRows(ledger)).toHaveCount(3);
+
+      // By month the same day is one period, labelled by its UTC month.
+      await summary.getByLabel("汇总方式").selectOption("month");
+      await expect(bodyRows(summary)).toHaveCount(1);
+      await expect(bodyRows(summary).first().locator("td").nth(0)).toHaveText(today.slice(0, 7));
+      await expect(bodyRows(summary).first().locator("td").nth(1)).toHaveText("-$0.022");
+      await summary.getByLabel("汇总方式").selectOption("day");
+
+      // The 类型 filter narrows the ledger to one kind.
+      await ledger.getByLabel("类型").selectOption("usage");
+      await expect(bodyRows(ledger)).toHaveCount(2);
+      await expect(bodyRows(ledger).locator("td:nth-child(2)")).toHaveText(["扣费", "扣费"]);
+      await ledger.getByLabel("类型").selectOption("topup");
+      await expect(bodyRows(ledger)).toHaveCount(1);
+      await expect(bodyRows(ledger).first().locator("td").nth(1)).toHaveText("充值");
+      await ledger.getByLabel("类型").selectOption("");
       await expect(bodyRows(ledger)).toHaveCount(3);
 
       // An end before the start names nothing, and the field says so.
@@ -223,6 +244,9 @@ test("后付组织显示信用额度与可用额度，用尽后显示已达信�
   const balance = region(page, "余额");
   await expect(balance).toContainText("信用额度");
   await expect(balance.locator(".entry").filter({ hasText: "信用额度" })).toContainText("$0.02");
+  // Before any call the whole credit line is open, and the organisation binds.
+  await expect(region(page, "可用额度").getByTestId("readout-amount")).toHaveText("$0.02");
+  await expect(region(page, "可用额度").getByRole("listitem").filter({ hasText: "组织" })).toContainText("以此为准");
   await paidChat(world);
   await paidChat(world);
   await expect.poll(() => balanceOf(world)).toBe(-2 * CALL_MICRO_USD);
@@ -293,4 +317,28 @@ test("流水分页：加载更多既不重复也不遗漏", async ({ page }) => 
   for (let k = 1; k <= 50; k++) expected.unshift(1_000_000 - k * CALL_MICRO_USD);
   expect(balances).toEqual(expected.map(usd));
   expect(new Set(balances).size).toBe(51);
+});
+
+test("密钥选择切换可用额度，成员额度单独成一站", async ({ page }) => {
+  const world = await seedBillingWorld(stack, { creditUsd: "1.00" });
+  const api = await ownerApi(world);
+  const me = (await api.get("/api/session")).member;
+  const second = await api.post("/api/keys", { label: "second-key-4b7" });
+  await api.post("/api/budgets", { scope: "member", scope_ref: me.id, kind: "periodic", period: "month", limit_usd: "0.50" });
+  await api.post("/api/budgets", { scope: "api_key", scope_ref: second.key.id, kind: "periodic", period: "month", limit_usd: "0.30" });
+
+  await openAccount(page, world.owner);
+  const readout = region(page, "可用额度");
+  // The newest key of the viewer is read first: organisation, member and key all limit it.
+  await expect(readout.getByLabel("密钥")).toHaveValue(second.key.id);
+  await expect(readout.getByRole("listitem")).toHaveCount(3);
+  await expect(readout.getByTestId("readout-amount")).toHaveText("$0.30");
+  await expect(readout.getByRole("listitem").filter({ hasText: "密钥" })).toContainText("以此为准");
+  await expect(readout.getByRole("listitem").filter({ hasText: "成员" })).toContainText("$0.50");
+
+  // The first key has no quota of its own: the member's 0.50 binds.
+  await readout.getByLabel("密钥").selectOption(world.key.id);
+  await expect(readout.getByRole("listitem")).toHaveCount(2);
+  await expect(readout.getByTestId("readout-amount")).toHaveText("$0.50");
+  await expect(readout.getByRole("listitem").filter({ hasText: "成员" })).toContainText("以此为准");
 });
