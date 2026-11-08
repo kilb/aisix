@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use aisix_control_plane::audit::Actor;
-use aisix_control_plane::auth::OperatorRole;
+use aisix_control_plane::auth::{MemberRole, OperatorRole};
 use aisix_control_plane::billing::budgets::{self, BudgetScope, Kind, NewBudget, SetBy};
 use aisix_control_plane::billing::ledger;
 use aisix_control_plane::billing::ledger::Account;
@@ -1146,6 +1146,75 @@ async fn every_marking_path_takes_the_account_before_the_resources_lock() {
             .expect("a quota to edit")
             .id
     };
+    // The operator routes' own quotas: one each for the PATCH and the
+    // DELETE, a week and a cumulative one, so no route's write meets the
+    // quotas the cases above create (a day and a month).
+    let (for_patch, for_delete) = {
+        let ctx = WriteCtx::of(cp.state());
+        let week = organization_quota(BudgetPeriod::Week);
+        let total = NewBudget {
+            kind: Kind::Cumulative,
+            period: None,
+            ..organization_quota(BudgetPeriod::Week)
+        };
+        cp.db()
+            .tx(move |conn| {
+                async move {
+                    let (row, _) = tenants::lock_billing(&mut *conn, tenant).await?;
+                    let a = budgets::create(&mut *conn, &ctx, &row, week, Actor::System).await?;
+                    let b = budgets::create(&mut *conn, &ctx, &row, total, Actor::System).await?;
+                    Ok::<_, aisix_control_plane::error::ApiError>((a.id, b.id))
+                }
+                .boxed()
+            })
+            .await
+            .expect("quotas for the routes")
+    };
+    let for_post = support::world::seed_tenant(&cp, &admin).await;
+    let route = |method: &'static str, path: String, body: Option<Value>| -> Request {
+        let (cp, admin) = (cp.clone(), admin.clone());
+        Box::pin(async move { cp.send(method, &path, Some(admin.cookie()), body).await })
+    };
+    // The tenant's owner and the quotas its routes edit: a member quota for
+    // the POST to create, and a week and a cumulative one on a key.
+    let owner = Arc::new(cp.member_login_seeded(tenant, MemberRole::Owner).await);
+    let own_member = cp.seed_member(tenant, MemberRole::Member).await.id;
+    let own_key =
+        Uuid::parse_str(&support::world::seed_key(&cp, &admin, tenant, Some(owner.id)).await)
+            .expect("a key id");
+    let (own_patch, own_delete) = {
+        let ctx = WriteCtx::of(cp.state());
+        let make = |kind, period| NewBudget {
+            scope: BudgetScope::ApiKey,
+            scope_ref: own_key,
+            set_by: SetBy::OrgAdmin,
+            kind,
+            period,
+            limit_micro_usd: 10_000,
+            created_by_kind: "system",
+            created_by: None,
+        };
+        let (week, total) = (
+            make(Kind::Periodic, Some(BudgetPeriod::Week)),
+            make(Kind::Cumulative, None),
+        );
+        cp.db()
+            .tx(move |conn| {
+                async move {
+                    let (row, _) = tenants::lock_billing(&mut *conn, tenant).await?;
+                    let a = budgets::create(&mut *conn, &ctx, &row, week, Actor::System).await?;
+                    let b = budgets::create(&mut *conn, &ctx, &row, total, Actor::System).await?;
+                    Ok::<_, aisix_control_plane::error::ApiError>((a.id, b.id))
+                }
+                .boxed()
+            })
+            .await
+            .expect("quotas for the member routes")
+    };
+    let member_route = |method: &'static str, path: String, body: Option<Value>| -> Request {
+        let (cp, owner) = (cp.clone(), owner.clone());
+        Box::pin(async move { cp.send(method, &path, Some(owner.cookie()), body).await })
+    };
     // A re-pricing run that charges one of the tenant's unpriced rows,
     // previewed now and applied by an admin as the last case.
     let occurred = chrono::Utc::now() - chrono::TimeDelta::minutes(10);
@@ -1238,6 +1307,66 @@ async fn every_marking_path_takes_the_account_before_the_resources_lock() {
             tenant,
             quota_write(QuotaWrite::Delete(existing)),
             200,
+        ),
+        // The operators' quota routes. The POST has a tenant of its own, so
+        // no earlier case frees the slot it takes.
+        (
+            "POST /admin/tenants/{id}/budgets",
+            for_post,
+            route(
+                "POST",
+                format!("/admin/tenants/{for_post}/budgets"),
+                Some(json!({"limit_usd": "0.01"})),
+            ),
+            201,
+        ),
+        (
+            "PATCH /admin/tenants/{id}/budgets/{bid}",
+            tenant,
+            route(
+                "PATCH",
+                format!("/admin/tenants/{tenant}/budgets/{for_patch}"),
+                Some(json!({"limit_usd": "0.02"})),
+            ),
+            200,
+        ),
+        (
+            "DELETE /admin/tenants/{id}/budgets/{bid}",
+            tenant,
+            route(
+                "DELETE",
+                format!("/admin/tenants/{tenant}/budgets/{for_delete}"),
+                None,
+            ),
+            204,
+        ),
+        // The tenant's own quota routes, as its owner. Each has a target and
+        // a quota of its own, so no case meets another's.
+        (
+            "POST /api/budgets",
+            tenant,
+            member_route(
+                "POST",
+                "/api/budgets".to_string(),
+                Some(json!({"scope": "member", "scope_ref": own_member, "limit_usd": "0.01"})),
+            ),
+            201,
+        ),
+        (
+            "PATCH /api/budgets/{id}",
+            tenant,
+            member_route(
+                "PATCH",
+                format!("/api/budgets/{own_patch}"),
+                Some(json!({"limit_usd": "0.02"})),
+            ),
+            200,
+        ),
+        (
+            "DELETE /api/budgets/{id}",
+            tenant,
+            member_route("DELETE", format!("/api/budgets/{own_delete}"), None),
+            204,
         ),
         // A re-pricing run posts to the ledger and settles the marks.
         (

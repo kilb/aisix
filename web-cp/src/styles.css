@@ -688,3 +688,11 @@ td select {
 .skew p + p {
   margin-top: var(--s-2);
 }
+
+/* ── A tab made of sections: the switch above the open section ── */
+.sections-switch {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--s-2);
+  margin-bottom: var(--s-4);
+}

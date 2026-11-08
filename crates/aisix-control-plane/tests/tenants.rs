@@ -1591,6 +1591,7 @@ async fn every_tenant_write_takes_the_tenant_before_the_resources_lock() {
         assert_eq!(r.status, 201, "{r:?}");
         topups.push(r.body["id"].as_str().expect("an id").to_string());
     }
+
     // A re-pricing run that charges one of the tenant's unpriced rows.
     let model_id = Uuid::parse_str(&model).expect("a model id");
     let occurred = chrono::Utc::now() - chrono::TimeDelta::minutes(10);
@@ -1780,6 +1781,38 @@ async fn every_tenant_write_takes_the_tenant_before_the_resources_lock() {
                 op.clone(),
                 None,
                 Some(json!({"amount_usd": "0.05", "reason": "线下收款 7c1"})),
+            )),
+            201,
+        ),
+        // The operators' quota routes write a quota, settle the marks and
+        // retire documents.
+        (
+            "POST /admin/tenants/{id}/budgets",
+            Box::pin(fire(
+                cp.clone(),
+                "POST",
+                format!("/admin/tenants/{tenant}/budgets"),
+                op.clone(),
+                None,
+                Some(json!({"limit_usd": "0.05"})),
+            )),
+            201,
+        ),
+        // The tenant's own quota route writes a quota of a member of its
+        // own, which no other case here touches.
+        (
+            "POST /api/budgets",
+            Box::pin(fire(
+                cp.clone(),
+                "POST",
+                "/api/budgets".to_string(),
+                owner.cookie().to_string(),
+                None,
+                Some(json!({
+                    "scope": "member",
+                    "scope_ref": member.id,
+                    "limit_usd": "0.05",
+                })),
             )),
             201,
         ),
