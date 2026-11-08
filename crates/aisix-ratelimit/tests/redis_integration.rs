@@ -189,9 +189,7 @@ async fn refusal_detail_survives_the_shared_backend() {
         .await
         .expect_err("shared counter must refuse the second replica");
 
-    let detail = err
-        .detail()
-        .expect("a window or gauge refusal names its limit");
+    let detail = err.detail();
     assert_eq!(detail.dimension, "rpm", "got {err:?}");
     assert_eq!(detail.limit, 1);
     assert_eq!(detail.remaining, 0);
@@ -227,9 +225,7 @@ async fn concurrency_refusal_detail_survives_the_shared_backend() {
         .await
         .expect_err("shared concurrency gauge must refuse");
 
-    let detail = err
-        .detail()
-        .expect("a window or gauge refusal names its limit");
+    let detail = err.detail();
     assert_eq!(detail.dimension, "concurrency", "got {err:?}");
     assert_eq!(detail.limit, 1);
     assert_eq!(detail.remaining, 0);
@@ -1270,12 +1266,11 @@ async fn a_slot_taken_while_degraded_is_released_by_a_commit_after_recovery() {
     );
 }
 
-/// 流式花费在 Redis 模式下也记一份进本地备份（`add_tokens_all`），供断线时的本地
-/// 降级接着用。累计额度的那份不能因为空闲被回收：桶的 acquire 走的是 Redis，本地
-/// 从没见过它带的限额，回收认不出这是一份额度，空闲一天后整个收走 —— 下一次断线时
-/// 本地降级从 0 起算，用完的额度又放行了。
+/// 非流式的 token（`commit`）同样要记一份进本地备份，与流式的 `add_tokens_all`
+/// 一致。只记流式的话，Redis 断线时本地降级看到的 token 窗口里没有非流式花掉的
+/// 那部分 —— 已经打满的窗口在断线期间又放行了。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn stream_spend_on_an_allowance_survives_reaping_into_the_next_outage() {
+async fn unary_tokens_are_enforced_by_the_local_fallback() {
     let Some(url) = redis_url() else {
         eprintln!("skipping: RATELIMIT_TEST_REDIS_URL not set");
         return;
@@ -1283,56 +1278,10 @@ async fn stream_spend_on_an_allowance_survives_reaping_into_the_next_outage() {
     let proxy = FlakyProxy::start(&url).await;
     let flaky = store(&proxy.url).await;
     let direct = store(&url).await;
-    let key = unique_key("stream-allowance");
+    let key = unique_key("unary-tokens");
     let limits = RateLimit {
         concurrency: Some(1),
-        granted_micro_usd: Some(1_000),
-        ..rl()
-    };
-
-    // 连着 Redis。直连的副本拿不到并发位，说明这次 acquire 确实走的是 Redis ——
-    // 降级到本地的话本地 acquire 自己就会记下额度，这条用例什么都证明不了。
-    flaky
-        .acquire(&key, &limits, "m1")
-        .await
-        .expect("inside the allowance");
-    assert!(
-        direct.acquire(&key, &limits, "d").await.is_err(),
-        "the first acquire did not go through Redis"
-    );
-    flaky.release(&key, "m1");
-    // 流结束：花费越过额度，经 add_tokens 记账。
-    flaky.add_tokens(&key, 1_500);
-
-    // 例行回收。睡过一个整秒边界，桶才算真的空闲（`reap` 按整秒比较）。
-    tokio::time::sleep(Duration::from_millis(1_100)).await;
-    flaky.reap(Duration::from_secs(0));
-
-    // 断线：降级到本地，那份累计额度必须还在。
-    proxy.down();
-    let r = flaky.acquire(&key, &limits, "m2").await;
-    assert!(
-        matches!(r, Err(RateLimitError::AllowanceExhausted)),
-        "the local fallback started the allowance over after reaping: {r:?}"
-    );
-}
-
-/// 非流式的花费（`commit`）同样要记一份进本地备份，与流式的 `add_tokens_all`
-/// 一致。只记流式的话，Redis 断线时本地降级看到的累计额度里没有非流式花掉的
-/// 那部分 —— 已经用完的额度在断线期间又放行了。
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn unary_spend_on_an_allowance_is_enforced_by_the_local_fallback() {
-    let Some(url) = redis_url() else {
-        eprintln!("skipping: RATELIMIT_TEST_REDIS_URL not set");
-        return;
-    };
-    let proxy = FlakyProxy::start(&url).await;
-    let flaky = store(&proxy.url).await;
-    let direct = store(&url).await;
-    let key = unique_key("unary-allowance");
-    let limits = RateLimit {
-        concurrency: Some(1),
-        granted_micro_usd: Some(1_000),
+        tpd: Some(1_000),
         ..rl()
     };
 
@@ -1341,26 +1290,78 @@ async fn unary_spend_on_an_allowance_is_enforced_by_the_local_fallback() {
     flaky
         .acquire(&key, &limits, "m1")
         .await
-        .expect("inside the allowance");
+        .expect("inside the window");
     assert!(
         direct.acquire(&key, &limits, "d").await.is_err(),
         "the first acquire did not go through Redis"
     );
-    // 非流式请求结束：花费越过额度，经 commit 记账（同时还掉并发位）。
+    // 非流式请求结束：token 越过当天上限，经 commit 记账（同时还掉并发位）。
     flaky.commit(&key, 1_500, "m1").await;
-    // commit 也走的是 Redis：直连的副本这时看到的是用完的额度。
+    // commit 也走的是 Redis：直连的副本这时看到的是打满的窗口。
     let seen = direct.acquire(&key, &limits, "d").await;
     assert!(
-        matches!(seen, Err(RateLimitError::AllowanceExhausted)),
+        matches!(seen, Err(RateLimitError::Tokens { .. })),
         "the commit did not reach Redis: {seen:?}"
     );
 
-    // 断线：降级到本地，这笔非流式花费必须也在本地那份里。
+    // 断线：降级到本地，这笔非流式的 token 必须也在本地那份里。
     proxy.down();
     let r = flaky.acquire(&key, &limits, "m2").await;
     assert!(
-        matches!(r, Err(RateLimitError::AllowanceExhausted)),
-        "the local fallback never saw the unary spend: {r:?}"
+        matches!(r, Err(RateLimitError::Tokens { .. })),
+        "the local fallback never saw the unary tokens: {r:?}"
+    );
+}
+
+/// `claim_once` 是给「会重放、但记账不能重复」的副作用用的：批处理跑完之后的
+/// 花费归因就是这种 —— 它的用量事件带确定性 id，消费端能去重，而花费计数器和
+/// Prometheus 计数器都没有那层保护，重放一次就是多收一遍。
+///
+/// 用两个各自 `connect` 出来的存储，模拟「重启后的同一个网关」与「另一个实例」
+/// —— 它们不共享任何进程内状态，只共享 Redis。标记要在这种情况下仍然只发一次。
+#[tokio::test]
+async fn a_one_shot_claim_is_granted_once_across_instances() {
+    let Some(url) = redis_url() else {
+        eprintln!("skipping: RATELIMIT_TEST_REDIS_URL not set");
+        return;
+    };
+    let a = store(&url).await;
+    let b = store(&url).await;
+    let ttl = Duration::from_secs(600);
+    let first = unique_key("batch-spend-1");
+    let second = unique_key("batch-spend-2");
+
+    assert!(a.claim_once(&first, ttl).await, "第一次该拿到标记");
+    assert!(
+        !a.claim_once(&first, ttl).await,
+        "同一个存储重来一次不该再拿到"
+    );
+    assert!(
+        !b.claim_once(&first, ttl).await,
+        "另一个实例（也等价于重启后的自己）不该再拿到 —— 这正是本地内存那份\
+         做不到、必须放进共享存储的原因"
+    );
+    // 另一个批次互不影响。
+    assert!(
+        b.claim_once(&second, ttl).await,
+        "不同批次的标记被互相挡住了"
+    );
+
+    // TTL 真的落在键上：没有过期时间的标记会永久占着 Redis。
+    let client = redis::Client::open(url.as_str()).expect("redis client");
+    let mut conn = client
+        .get_multiplexed_async_connection()
+        .await
+        .expect("redis connection");
+    let marker = format!("{DEFAULT_PREFIX}:{{claim:{first}}}");
+    let secs: i64 = redis::cmd("TTL")
+        .arg(&marker)
+        .query_async(&mut conn)
+        .await
+        .expect("TTL 可用");
+    assert!(
+        secs > 0 && secs <= 600,
+        "标记键的 TTL 不对（{secs}）—— -2 表示键没建出来，-1 表示永不过期，那是泄漏"
     );
 }
 

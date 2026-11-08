@@ -13,6 +13,7 @@ import {
   callGateway,
   startPlatformUpstream,
   type GatewayAnswer,
+  textWithoutPassedThroughIds,
   type PlatformUpstream,
 } from "../harness/cp-upstream.js";
 import { ProxyClient } from "../harness/proxy.js";
@@ -154,7 +155,7 @@ describe("platform configuration rules at the gateway", () => {
     for (const answer of answers) {
       const headers = [...answer.headers.entries()].map(([k, v]) => `${k}: ${v}`).join("\n");
       for (const leak of LEAKS) {
-        expect(answer.text, `a ${answer.status} body names ${leak}`).not.toContain(leak);
+        expect(textWithoutPassedThroughIds(answer), `a ${answer.status} body names ${leak}`).not.toContain(leak);
         expect(headers, `a ${answer.status} answer's headers name ${leak}`).not.toContain(leak);
       }
     }

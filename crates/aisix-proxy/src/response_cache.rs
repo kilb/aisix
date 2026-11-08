@@ -209,16 +209,26 @@ impl CacheTelemetry {
 /// - `api_key`: the key's id, bare. That is the value every entry stored
 ///   under this scope has always been keyed by, so those entries stay
 ///   reachable.
-/// - `env`: `None`, so every caller shares, as it always has.
+/// - `env`: `None`, so every caller shares, as it always has; in platform
+///   mode, what `team` gives.
 /// - `team`: `team:<team_id>`, shared by the keys of one team. A key with no
 ///   team, or an empty `team_id`, gets `key:<id>` and shares with no one: a
 ///   key nobody assigned to a tenant must not land in some tenant's entries.
 ///   The two prefixes keep a team's value from ever equalling a key's.
-pub(crate) fn cache_scope_value(scope: CacheScope, auth: &AuthenticatedKey) -> Option<String> {
+///
+/// In platform mode (`platform`) `env` is read as `team`: every tenant is
+/// in the platform's one environment, so an entry every caller shares would
+/// replay one tenant's answer, semantic matches and sealed ids included, to
+/// another.
+pub(crate) fn cache_scope_value(
+    scope: CacheScope,
+    auth: &AuthenticatedKey,
+    platform: bool,
+) -> Option<String> {
     match scope {
         CacheScope::ApiKey => Some(auth.entry.id.clone()),
-        CacheScope::Env => None,
-        CacheScope::Team => Some(
+        CacheScope::Env if !platform => None,
+        CacheScope::Env | CacheScope::Team => Some(
             match auth
                 .key()
                 .team_id
@@ -295,7 +305,7 @@ impl BodyCache {
             .as_ref()?
             .for_policy_backend(entry.value.backend, &entry.id, &entry.value.name)?
             .clone();
-        let scope_value = cache_scope_value(entry.value.scope, auth);
+        let scope_value = cache_scope_value(entry.value.scope, auth, state.platform().is_some());
         let scope_part = body_scope_part(scope_value.as_deref())?;
         let generation = entry.value.purge_generation.to_string();
         let key_material = key_material();
@@ -545,6 +555,11 @@ mod tests {
     /// The same request, under a policy of `scope`, from the key `key_id`
     /// carrying `team_id`.
     fn key_for(scope: CacheScope, team_id: Option<&str>, key_id: &str) -> Keys {
+        key_for_in(false, scope, team_id, key_id)
+    }
+
+    /// [`key_for`] on a gateway in platform mode, or not.
+    fn key_for_in(platform: bool, scope: CacheScope, team_id: Option<&str>, key_id: &str) -> Keys {
         use aisix_core::resource::ResourceEntry;
         let snap = AisixSnapshot::new();
         let mut policy: aisix_core::CachePolicy =
@@ -560,6 +575,11 @@ mod tests {
             }))
             .unwrap(),
         );
+        let state = if platform {
+            state.with_platform(crate::platform::PlatformSettings::from_secret("s"))
+        } else {
+            state
+        };
         let key: aisix_core::ApiKey =
             serde_json::from_value(serde_json::json!({"key_hash": "h", "team_id": team_id}))
                 .unwrap();
@@ -591,7 +611,7 @@ mod tests {
         let chat = aisix_cache::CacheKey::from_request(&req).with_scope(
             "policy-1",
             0,
-            cache_scope_value(scope, &auth).as_deref(),
+            cache_scope_value(scope, &auth, platform).as_deref(),
         );
         Keys {
             exact: chat.fingerprint(),
@@ -640,6 +660,38 @@ mod tests {
         );
     }
 
+    /// In platform mode an `env` scope shares no further than a `team` one:
+    /// tenants share the platform's environment, and an entry shared across
+    /// it would replay one tenant's answer, and its sealed ids, to another.
+    /// Off platform mode it shares with every caller, as it always has.
+    #[test]
+    fn in_platform_mode_an_env_scope_shares_only_within_a_team() {
+        assert_eq!(
+            key_for_in(true, CacheScope::Env, Some("t1"), "k1"),
+            key_for_in(true, CacheScope::Team, Some("t1"), "k1"),
+        );
+        assert_eq!(
+            key_for_in(true, CacheScope::Env, Some("t1"), "k1"),
+            key_for_in(true, CacheScope::Env, Some("t1"), "k2"),
+        );
+        assert_isolated(
+            &key_for_in(true, CacheScope::Env, Some("t1"), "k1"),
+            &key_for_in(true, CacheScope::Env, Some("t2"), "k2"),
+        );
+        assert_isolated(
+            &key_for_in(true, CacheScope::Env, None, "k1"),
+            &key_for_in(true, CacheScope::Env, None, "k2"),
+        );
+        assert_eq!(
+            key_for_in(false, CacheScope::Env, Some("t1"), "k1"),
+            key_for_in(false, CacheScope::Env, Some("t2"), "k2"),
+        );
+        assert_eq!(
+            key_for_in(false, CacheScope::Env, Some("t1"), "k1"),
+            legacy(LEGACY_ENV_FINGERPRINT)
+        );
+    }
+
     #[test]
     fn keys_of_one_team_share_a_team_scoped_entry() {
         assert_eq!(
@@ -684,9 +736,9 @@ mod tests {
                 None,
                 false,
             );
-            assert_eq!(cache_scope_value(CacheScope::Env, &auth), None);
+            assert_eq!(cache_scope_value(CacheScope::Env, &auth, false), None);
             for scope in [CacheScope::ApiKey, CacheScope::Team] {
-                let value = cache_scope_value(scope, &auth);
+                let value = cache_scope_value(scope, &auth, false);
                 assert!(
                     value.as_deref().is_some_and(|v| !v.is_empty()),
                     "{scope:?} with team {team_id:?} gave {value:?}"
@@ -826,6 +878,158 @@ mod tests {
                 resp.headers()["x-aisix-cache-layer"],
                 "exact",
                 "debug {debug}"
+            );
+        }
+    }
+}
+
+/// The cache under provider groups, on every endpoint whose cache is read
+/// before its attempts are resolved: a key restricted to groups that hold
+/// nothing of the model gets no answer from the cache, a teammate's
+/// included, exactly as it gets none from an upstream.
+#[cfg(test)]
+mod grouped_key_tests {
+    use std::sync::Arc;
+
+    use aisix_core::models::AisixSnapshot;
+    use aisix_core::resource::ResourceEntry;
+    use aisix_core::snapshot::SnapshotHandle;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt as _;
+    use wiremock::matchers::{method, path_regex};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn key(id: &str, plaintext: &str, groups: &[&str]) -> ResourceEntry<aisix_core::ApiKey> {
+        use sha2::Digest as _;
+        let hash: String = sha2::Sha256::digest(plaintext.as_bytes())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let doc = serde_json::json!({"key_hash": hash, "allowed_models": ["*"],
+            "team_id": "team-t", "allowed_provider_groups": groups});
+        ResourceEntry::new(id, serde_json::from_value(doc).unwrap(), 1)
+    }
+
+    fn request(uri: &str, token: &str, body: &serde_json::Value) -> Request<axum::body::Body> {
+        Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_grouped_key_gets_no_cached_answer_from_a_model_outside_its_groups() {
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path_regex("/chat/completions$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "chatcmpl-1", "object": "chat.completion", "created": 1, "model": "gpt-4o",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"},
+                             "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}})))
+            .mount(&upstream)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex("/responses$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "resp_1", "object": "response", "status": "completed", "model": "gpt-4o",
+                "output": [{"type": "message", "id": "msg_1", "role": "assistant",
+                    "content": [{"type": "output_text", "text": "hi", "annotations": []}]}],
+                "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}})))
+            .mount(&upstream)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex("/embeddings$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "object": "list", "model": "gpt-4o",
+                "data": [{"object": "embedding", "index": 0, "embedding": [0.1]}],
+                "usage": {"prompt_tokens": 1, "total_tokens": 1}})))
+            .mount(&upstream)
+            .await;
+
+        let snap = AisixSnapshot::new();
+        let pk: aisix_core::ProviderKey = serde_json::from_value(serde_json::json!({
+            "display_name": "pk-ga", "secret": "sk-up", "api_base": upstream.uri(),
+            "provider": "openai", "adapter": "openai", "groups": ["ga"]}))
+        .unwrap();
+        snap.provider_keys.insert(ResourceEntry::new("pk-1", pk, 1));
+        let model: aisix_core::Model = serde_json::from_value(serde_json::json!({
+            "display_name": "m", "provider": "openai", "model_name": "gpt-4o",
+            "provider_key_id": "pk-1"}))
+        .unwrap();
+        snap.models.insert(ResourceEntry::new("m-1", model, 1));
+        // A teammate without groups, and a key whose groups hold nothing of `m`.
+        snap.apikeys.insert(key("k-open", "sk-open", &[]));
+        snap.apikeys.insert(key("k-grouped", "sk-grouped", &["gb"]));
+        let policy: aisix_core::CachePolicy = serde_json::from_value(serde_json::json!({
+            "name": "team-cache", "enabled": true, "backend": "memory", "ttl_seconds": 60,
+            "applies_to": "all", "scope": "team"}))
+        .unwrap();
+        snap.cache_policies
+            .insert(ResourceEntry::new("cp-1", policy, 1));
+        let hub = Arc::new(aisix_gateway::Hub::new());
+        hub.register_specialized(
+            "openai",
+            Arc::new(aisix_provider_openai::OpenAiBridge::new()),
+        );
+        let config: aisix_core::ProxyConfig =
+            serde_json::from_value(serde_json::json!({"addr": "127.0.0.1:0"})).unwrap();
+        let app = crate::build_router(crate::ProxyState::new(
+            SnapshotHandle::new(snap),
+            hub,
+            &config,
+        ));
+
+        let messages = serde_json::json!({"model": "m", "max_tokens": 8,
+            "messages": [{"role": "user", "content": "hello"}]});
+        let responses = serde_json::json!({"model": "m", "input": "hello"});
+        let embeddings = serde_json::json!({"model": "m", "input": "hello"});
+        for (uri, body) in [
+            ("/v1/messages", &messages),
+            ("/v1/responses", &responses),
+            ("/v1/embeddings", &embeddings),
+        ] {
+            let before = upstream.received_requests().await.unwrap().len();
+            let open = app
+                .clone()
+                .oneshot(request(uri, "sk-open", body))
+                .await
+                .unwrap();
+            let status = open.status();
+            let text = axum::body::to_bytes(open.into_body(), 65536).await.unwrap();
+            assert_eq!(status, StatusCode::OK, "{uri}: {text:?}");
+            let after_open = upstream.received_requests().await.unwrap().len();
+            assert_eq!(after_open, before + 1, "{uri}: the teammate went upstream");
+            // The same teammate is answered from the cache: the entry exists.
+            let again = app
+                .clone()
+                .oneshot(request(uri, "sk-open", body))
+                .await
+                .unwrap();
+            assert_eq!(again.status(), StatusCode::OK, "{uri}");
+            assert_eq!(
+                upstream.received_requests().await.unwrap().len(),
+                after_open,
+                "{uri}: the entry is served"
+            );
+
+            let grouped = app
+                .clone()
+                .oneshot(request(uri, "sk-grouped", body))
+                .await
+                .unwrap();
+            assert_eq!(
+                grouped.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{uri}: a grouped key is answered as for a model outside its groups"
+            );
+            assert_eq!(
+                upstream.received_requests().await.unwrap().len(),
+                after_open,
+                "{uri}: and nothing goes upstream"
             );
         }
     }

@@ -757,6 +757,13 @@ async fn prepare(
     if !auth.key().can_access(snapshot, &requested_model) {
         return Err(ProxyError::ModelForbidden(requested_model.to_string()));
     }
+    // A grouped key is answered as if no ensemble existed, as on every other
+    // endpoint, ahead of the refusal below that names it.
+    crate::model_resolve::refuse_ensemble_to_grouped_key(
+        &requested_model,
+        &model_entry.value,
+        &auth.key().allowed_provider_groups,
+    )?;
     let model = &model_entry.value;
     if model.is_routing() || model.is_ensemble() || model.is_semantic() {
         return Err(ProxyError::InvalidRequest(format!(
@@ -3467,6 +3474,57 @@ mod tests {
             "拒绝理由说的不是「这是个虚拟父级」，那说明闸没起作用、是后面某步偶然\
              拦下的: {msg}"
         );
+    }
+
+    /// A key restricted to provider groups is answered as if no ensemble
+    /// existed, here as on every other endpoint: as for a name nothing
+    /// serves, not with the refusal that names a virtual router.
+    #[tokio::test]
+    async fn a_grouped_key_naming_an_ensemble_is_answered_as_for_an_unknown_name() {
+        async fn prepared(model: &str, key_groups: &[&str]) -> ProxyError {
+            let snap = snapshot("http://127.0.0.1:1/v1", "openai", "openai");
+            let council: Model = serde_json::from_value(serde_json::json!({
+                "display_name": "rt-council",
+                "ensemble": {"panel": [{"model": "rt-model"}], "judge": {"model": "rt-model"}},
+            }))
+            .unwrap();
+            snap.models
+                .insert(ResourceEntry::new("m-rt-council", council, 1));
+            let handle = SnapshotHandle::new(snap);
+            let live = handle.load();
+            let state = crate::ProxyState::new(handle.clone(), Arc::new(Hub::new()), &cfg());
+            let key: aisix_core::ApiKey = serde_json::from_value(serde_json::json!({
+                "key_hash": "h", "allowed_models": ["*"],
+                "allowed_provider_groups": key_groups,
+            }))
+            .unwrap();
+            let auth = crate::auth::AuthenticatedKey::new(
+                &live,
+                Arc::new(ResourceEntry::new("k-1", key, 1)),
+                None,
+                false,
+            );
+            let params = HashMap::from([("model".to_string(), model.to_string())]);
+            let client = crate::client_ip::ClientContext::default();
+            match super::prepare(&state, &live, &params, &HeaderMap::new(), &client, auth).await {
+                Err(e) => e,
+                Ok(_) => panic!("{model} must not open a session"),
+            }
+        }
+
+        assert!(matches!(
+            prepared("rt-council", &["g"]).await,
+            ProxyError::ModelNotFound(name) if name == "rt-council"
+        ));
+        assert!(matches!(
+            prepared("nobody", &["g"]).await,
+            ProxyError::ModelNotFound(name) if name == "nobody"
+        ));
+        // A key without groups still learns why it cannot have one.
+        assert!(prepared("rt-council", &[])
+            .await
+            .to_string()
+            .contains("virtual router"));
     }
 
     /// A key restricted to provider groups opens a session only with a

@@ -377,6 +377,13 @@ async fn dispatch(
     if !auth.key().can_access(snapshot, &model_name) {
         return Err(ProxyError::ModelForbidden(model_name.clone()));
     }
+    // A grouped key is answered as if no ensemble existed, as on every other
+    // endpoint, ahead of the IP check and of the refusal below that names it.
+    crate::model_resolve::refuse_ensemble_to_grouped_key(
+        &model_name,
+        &model_entry.value,
+        &auth.key().allowed_provider_groups,
+    )?;
     crate::dispatch::check_ip_access(&model_entry.value, &client_ctx.source_ip)?;
     if let Some(kind) = unserved_kind(&model_entry.value) {
         return Err(unserved_kind_error(
@@ -672,6 +679,26 @@ async fn dispatch(
         decision_input_tokens(&usage),
         u64::from(usage.output),
     );
+    // Billed from here on: a caller that leaves during the commit still owes
+    // this answer, priced as the success row prices it.
+    crate::attribution::note_answered_usage(crate::usage_attr::AnsweredUsage {
+        prompt_tokens: usage.input,
+        completion_tokens: usage.output,
+        cached_prompt_tokens: usage.cached,
+        cache_write_tokens: usage.cache_write,
+        modality: usage.modality,
+        reasoning_tokens: usage.reasoning,
+        upstream_total_tokens: usage.upstream_total,
+        cost_usd: crate::usage_attr::request_cost_usd(
+            snapshot,
+            &target.id,
+            decision_input_tokens(&usage),
+            u64::from(usage.output),
+        ),
+        provider_request_id: provider_request_id.clone(),
+        provider_model_version: reported_model.clone(),
+        ..Default::default()
+    });
     reservation
         .commit(u64::from(usage.input) + u64::from(usage.output), spend)
         .await;
@@ -882,8 +909,8 @@ fn emit_usage_event(
 ) {
     let usage = &success.usage;
     let elapsed_ms = crate::attempt::measured_ms(elapsed);
-    // Priced from the dispatched row's `Model.cost`; the spend counter below
-    // is what the portal bills from.
+    // Priced from the dispatched row's `Model.cost`, for the event and the
+    // spend counter below.
     let cost_usd = crate::usage_attr::request_cost_usd(
         snap,
         &success.model_id,
@@ -1070,9 +1097,9 @@ mod tests {
     }
 
     /// The surface's money wiring. `..Default::default()` on the event compiles
-    /// and bills zero, so this pins the number on the event and on the counter
-    /// the portal bills from, cached input at its own rate, and that the
-    /// caller sees the window it spent.
+    /// and bills zero, so this pins the number on the event and on the spend
+    /// counter, cached input at its own rate, and that the caller sees the
+    /// window it spent.
     #[tokio::test]
     async fn a_priced_decision_reaches_the_spend_metric_and_reports_the_window() {
         use aisix_core::resource::ResourceEntry;

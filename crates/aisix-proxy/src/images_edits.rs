@@ -796,6 +796,11 @@ async fn dispatch(
             u64::from(u.completion_tokens),
         )
     });
+    // Billed from here on: a caller that leaves during the commit or the
+    // output review below still owes this answer.
+    if let Some(u) = usage.as_ref() {
+        crate::images::note_answered_image(snapshot, &target.id, u);
+    }
     reservation.commit(total_tokens, spend).await;
 
     let review = crate::images::review_image_output(
@@ -1496,8 +1501,8 @@ mod tests {
         assert!(!wire.contains("BLOCKME"), "{wire}");
     }
     /// The surface's money wiring. Every token this edit reports is priced off
-    /// the dispatched row, on the event and on the counter the portal bills
-    /// from, and the caller sees the window it spent.
+    /// the dispatched row, on the event and on the spend counter, and the
+    /// caller sees the window it spent.
     #[tokio::test]
     async fn a_priced_edit_reaches_the_spend_metric_and_reports_the_window() {
         use aisix_obs::UsageSink;

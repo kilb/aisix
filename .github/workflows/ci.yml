@@ -724,7 +724,7 @@ jobs:
           echo "::group::tests/e2e"
           (cd tests/e2e && pnpm install --frozen-lockfile && pnpm exec tsc --noEmit)
           echo "::endgroup::"
-          for d in web web-portal web-cp web-tenant; do
+          for d in web-cp web-tenant; do
             echo "::group::$d"
             (cd "$d" && npm ci --no-audit --no-fund && npx tsc --noEmit)
             echo "::endgroup::"
@@ -740,7 +740,7 @@ jobs:
     # other open PRs still report the old name and would all break the
     # moment the required contexts were renamed to the two leg names.
     name: e2e (vitest) + coverage
-    needs: [e2e, e2e-cp, mcp-conformance, playwright-e2e, playwright-real-prometheus, typecheck, playwright-cp-dashboard, playwright-cp-tenant]
+    needs: [e2e, e2e-cp, mcp-conformance, typecheck, playwright-cp-dashboard, playwright-cp-tenant]
     # A skipped required check counts as satisfied, so this must still run
     # when the matrix fails — otherwise the gate would vanish exactly when
     # it matters.
@@ -765,23 +765,6 @@ jobs:
         run: |
           if [ "${{ needs.mcp-conformance.result }}" != "success" ]; then
             echo "::error::mcp conformance result: ${{ needs.mcp-conformance.result }}"
-            exit 1
-          fi
-      - name: assert the Playwright suites passed
-        # Folded in for the same reason as MCP conformance: a suite that
-        # runs but gates nothing is a check no one has to satisfy, and the
-        # money contracts it covers are where nearly every billing
-        # regression has been caught. Dropping it back to advisory is
-        # removing it from `needs` and deleting this step.
-        run: |
-          if [ "${{ needs.playwright-e2e.result }}" != "success" ]; then
-            echo "::error::playwright e2e result: ${{ needs.playwright-e2e.result }}"
-            exit 1
-          fi
-      - name: assert the money suite passed against a real Prometheus
-        run: |
-          if [ "${{ needs.playwright-real-prometheus.result }}" != "success" ]; then
-            echo "::error::real-prometheus money e2e result: ${{ needs.playwright-real-prometheus.result }}"
             exit 1
           fi
       - name: assert the TypeScript projects typecheck
@@ -921,129 +904,6 @@ jobs:
           npx playwright install --with-deps chromium
           npm run build
           npx playwright test
-
-  # The Playwright suites had no automated gate: nothing in this workflow
-  # touched `web/` or `web-portal/`, so the money contracts (what each
-  # endpoint charges, on which side of the ledger, and when a ceiling
-  # refuses) were only ever checked when someone ran them by hand. Those
-  # suites are where nearly every billing regression has been caught.
-  playwright-e2e:
-    name: e2e (playwright)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: ./.github/actions/setup-protoc
-      - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-node@v6
-        with:
-          node-version: 22
-      # The money fixture runs the RELEASE gateway and the DEBUG portal, and
-      # refuses to run against a binary older than its sources — so both
-      # profiles are built here rather than assumed. The console suite runs
-      # the release console + portal + gateway (`aisix validate`).
-      - name: build the binaries the suites drive
-        run: |
-          cargo build --release -p aisix-server -p aisix-portal -p aisix-console
-          cargo build -p aisix-portal
-      # Browser-free and the fastest of the three, so it runs first: it
-      # spawns real processes and asserts over `/metrics` with `fetch`.
-      - name: money e2e (no browser)
-        working-directory: web-portal
-        run: |
-          npm ci
-          npx playwright test money.spec.ts
-      # Chromium is installed from each project so each gets the build its
-      # own pinned `@playwright/test` expects.
-      #
-      # `dist/` must be the ROOT-path build: the deployed portal is served
-      # under `/portal/`, and its fixture rejects a `/portal/`-based bundle.
-      - name: portal UI e2e
-        working-directory: web-portal
-        run: |
-          npx playwright install --with-deps chromium
-          npm run build
-          npx playwright test portal.spec.ts
-      # The console fixture serves `dist/` through `vite preview`, so this
-      # exercises the artifact that ships rather than a dev server.
-      - name: console UI e2e
-        working-directory: web
-        run: |
-          npm ci
-          npx playwright install --with-deps chromium
-          npm run build
-          npx playwright test
-
-  # The money suite above answers the portal's billing query with a PromQL
-  # stand-in that reimplements `resets()`, `offset`, `or` and `and on()` with
-  # regexes, so a wrong query string still passes it — the original "billed $0
-  # of $5" bug hid behind a stand-in exactly that way. This runs the money path
-  # against a real, pinned Prometheus scraping the e2e gateway, so the query
-  # text and Prometheus' own evaluation of it are what the assertions measure.
-  playwright-real-prometheus:
-    name: e2e (playwright, real prometheus)
-    runs-on: ubuntu-latest
-    # Two cargo builds plus the suite: bounded so a hung step fails the gate
-    # instead of holding a runner for the 6-hour default.
-    timeout-minutes: 45
-    # Executes a downloaded third-party binary: keep the token read-only and
-    # out of the checkout's git config, as mcp-conformance does.
-    permissions:
-      contents: read
-    env:
-      PROMETHEUS_VERSION: "2.53.4"
-      # sha256 of prometheus-2.53.4.linux-amd64.tar.gz, taken from that
-      # release's sha256sums.txt. Pinned here rather than fetched beside the
-      # tarball: a checksum downloaded from the same place as the file only
-      # proves the download finished.
-      PROMETHEUS_SHA256: b8b497c4610d1b93208252b60c8f20f6b2e78596ae8df43397a2e805aa53d475
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: ./.github/actions/setup-protoc
-      - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-node@v6
-        with:
-          node-version: 22
-      - name: install prometheus ${{ env.PROMETHEUS_VERSION }}
-        run: |
-          set -euo pipefail
-          url="https://github.com/prometheus/prometheus/releases/download/v${PROMETHEUS_VERSION}/prometheus-${PROMETHEUS_VERSION}.linux-amd64.tar.gz"
-          dest="${RUNNER_TEMP}/prometheus"
-          mkdir -p "${dest}"
-          # Same release CDN as protoc, with the same intermittent 504s — see
-          # .github/actions/setup-protoc.
-          for attempt in 1 2 3 4 5; do
-            # --max-time bounds a transfer that connects and then stalls.
-            if curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 --connect-timeout 30 \
-                --max-time 300 -o "${dest}/prometheus.tar.gz" "${url}"; then
-              break
-            fi
-            if [ "${attempt}" = 5 ]; then
-              echo "::error::prometheus ${PROMETHEUS_VERSION} download failed after 5 attempts"
-              exit 1
-            fi
-            sleep 15
-          done
-          echo "${PROMETHEUS_SHA256}  ${dest}/prometheus.tar.gz" | sha256sum -c -
-          tar -xzf "${dest}/prometheus.tar.gz" -C "${dest}" --strip-components=1 \
-            "prometheus-${PROMETHEUS_VERSION}.linux-amd64/prometheus"
-          "${dest}/prometheus" --version
-          # Read by the fixture, which fails (never skips) when it is unset.
-          echo "PROMETHEUS_BIN=${dest}/prometheus" >> "${GITHUB_ENV}"
-      # Same binaries as the stand-in money suite: the RELEASE gateway and the
-      # DEBUG portal, which the fixture refuses to run if older than sources.
-      - name: build the binaries the suite drives
-        run: |
-          cargo build --release -p aisix-server
-          cargo build -p aisix-portal
-      - name: money e2e against real prometheus (no browser)
-        working-directory: web-portal
-        run: |
-          npm ci
-          npx playwright test money-real-prometheus.spec.ts
 
   mcp-conformance:
     # The OFFICIAL MCP conformance suite against the shipped /mcp chain

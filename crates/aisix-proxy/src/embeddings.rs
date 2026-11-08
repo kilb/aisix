@@ -527,9 +527,21 @@ async fn dispatch(
     if !auth.key().can_access(snapshot, &body.model) {
         return Err(ProxyError::ModelForbidden(body.model.clone()));
     }
+    // A grouped key is answered as if no ensemble existed, ahead of
+    // everything that could tell the two apart (the IP check, the shape
+    // check, guardrails).
+    crate::model_resolve::refuse_ensemble_to_grouped_key(
+        &body.model,
+        &model_entry.value,
+        &auth.key().allowed_provider_groups,
+    )?;
 
     // Client-IP allowlist gate (#557): reject before guardrails / upstream.
     crate::dispatch::check_ip_access(&model_entry.value, &client_ctx.source_ip)?;
+
+    // Platform mode: the request cannot choose a model other than the one
+    // the key's model access admitted.
+    crate::stored_refs::refuse_in_embeddings(state.platform(), &body.extra)?;
 
     // A Model Group has no provider of its own — the group walk below
     // resolves one per target. Only the shapes this endpoint cannot serve
@@ -714,6 +726,12 @@ async fn dispatch(
         },
     );
     if let Some(gate) = gate.as_ref() {
+        crate::routing::check_group_access(
+            snapshot,
+            &body.model,
+            &model_entry.value,
+            &auth.key().allowed_provider_groups,
+        )?;
         crate::routing::check_member_ip_access(
             snapshot,
             &body.model,
@@ -922,6 +940,21 @@ async fn dispatch(
                 aisix_core::InputTokens::uncached_only(u64::from(prompt_tokens)),
                 0,
             );
+            // Billed from here on: a caller that leaves during the commit or
+            // the cache write below still owes this answer, priced as the
+            // success row prices it.
+            crate::attribution::note_answered_usage(crate::usage_attr::AnsweredUsage {
+                prompt_tokens,
+                upstream_total_tokens: embed_resp.usage.upstream_total_tokens,
+                usage_estimated,
+                cost_usd: crate::usage_attr::request_cost_usd(
+                    snapshot,
+                    &target.id,
+                    aisix_core::InputTokens::uncached_only(u64::from(prompt_tokens)),
+                    0,
+                ),
+                ..Default::default()
+            });
             reservation
                 .commit(
                     u64::from((embed_resp.usage.total_tokens).max(prompt_tokens)),
@@ -1223,8 +1256,7 @@ fn emit_usage_event(
     crate::usage_attr::apply_caller_identity(&mut event, client.jwt.as_ref(), &client.caller);
     let usage_model =
         crate::usage_attr::usage_event_model_label(snap, &event.requested_model).into_owned();
-    // Read before the event is handed over: the spend counter below is what
-    // the portal bills from.
+    // Read before the event is handed over, for the spend counter below.
     let cost_usd = event.cost_usd;
     crate::usage_attr::emit_usage(
         state,

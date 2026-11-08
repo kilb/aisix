@@ -349,8 +349,7 @@ async fn atomic_write(
     {
         let mut opts = tokio::fs::OpenOptions::new();
         opts.write(true).create(true).truncate(true);
-        // tokio 的 `OpenOptions` 在 unix 上自带 `mode()`，不需要 `OpenOptionsExt`
-        // （`aisix-portal/src/resources.rs` 里也记着这一条）。
+        // tokio 的 `OpenOptions` 在 unix 上自带 `mode()`，不需要 `OpenOptionsExt`。
         #[cfg(unix)]
         opts.mode(0o600);
         let f = opts.open(&tmp).await?;

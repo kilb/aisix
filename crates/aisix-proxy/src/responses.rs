@@ -397,9 +397,24 @@ pub async fn responses(
     let affinity = match state.platform() {
         Some(platform) => {
             let owner = crate::platform::tenant_owner(&auth);
+            let tenant = match crate::responses_affinity::TenantSeal::new(platform, &owner) {
+                Ok(tenant) => tenant,
+                // No random source, so no response id to hand out.
+                Err(err) => {
+                    return crate::reject::reject_before_dispatch(
+                        &state,
+                        "POST",
+                        "/v1/responses",
+                        &client.request_id,
+                        Some(&auth.entry.id),
+                        started,
+                        crate::reject::Envelope::OpenAi,
+                        err,
+                    );
+                }
+            };
             let mut affinity = crate::responses_affinity::ContextAffinity::unwrap_sealed_request(
-                &mut body,
-                crate::responses_affinity::TenantSeal::new(platform, &owner),
+                &mut body, tenant,
             );
             // The item ids a client echoes from an earlier answer leave here
             // sealed; the upstream gets back the ones it issued, for the
@@ -835,13 +850,23 @@ async fn dispatch(
     if !auth.key().can_access(snapshot, &model_name) {
         return Err(ProxyError::ModelForbidden(model_name.clone()).into());
     }
+    // A grouped key is answered as if no ensemble existed, ahead of
+    // everything that could tell the two apart (the IP check, guardrails).
+    crate::model_resolve::refuse_ensemble_to_grouped_key(
+        &model_name,
+        &model_entry.value,
+        &auth.key().allowed_provider_groups,
+    )?;
 
     // Client-IP allowlist gate (#557): reject before guardrails / upstream.
     crate::dispatch::check_ip_access(&model_entry.value, &client.source_ip)?;
 
     // Platform mode: nothing the request names may be an object stored
-    // upstream for another tenant.
-    crate::stored_refs::refuse_in_responses(state.platform(), body)?;
+    // upstream for another tenant. A container it was handed is its own.
+    crate::opaque_id::with_own_containers(state.platform(), auth, body, |body| {
+        crate::stored_refs::refuse_in_responses(state.platform(), body)
+    })
+    .map_err(|err| affinity.at_caller_position(err))?;
     affinity.refuse_unopened_item_reference()?;
 
     // Platform mode: a continuation names a response this tenant was handed,
@@ -999,6 +1024,12 @@ async fn dispatch(
         )
     };
     if let Some(gate) = cache_gate.as_ref() {
+        crate::routing::check_group_access(
+            snapshot,
+            &model_name,
+            &model_entry.value,
+            &auth.key().allowed_provider_groups,
+        )?;
         crate::routing::check_member_ip_access(
             snapshot,
             &model_name,
@@ -1250,9 +1281,9 @@ async fn dispatch(
                         target_model,
                         target_model_id: target.id.clone(),
                         provider_key_id: pk_id.clone(),
-                        status: 429,
+                        status: e.status().as_u16(),
                         success: false,
-                        error_class: "rate_limit_exceeded".to_string(),
+                        error_class: crate::attempt::error_class(&e).to_string(),
                         error_message: e.to_string(),
                         latency_ms: 0,
                         dispatched: false,
@@ -1294,11 +1325,13 @@ async fn dispatch(
             let mark = affinity
                 .response_mark(&target.id, is_routing_request)
                 .sealing_ids(state.platform(), &owner);
-            let result = if crate::dispatch::serves_natively(
+            let native = crate::dispatch::serves_natively(
                 snapshot,
                 &target.model,
                 aisix_core::ApiSurface::Responses,
-            ) {
+            );
+            crate::attribution::note_translated_dispatch(!native);
+            let result = if native {
                 responses_to_target(
                     state,
                     snapshot,
@@ -2468,6 +2501,11 @@ async fn responses_to_target(
             }
             Some(u)
         };
+        // Billed from here on: a caller that leaves during the scan below, or
+        // the commit and cache write after it, still owes this answer.
+        if let Some(u) = usage.as_ref() {
+            crate::attribution::note_answered_usage(u.answered(snapshot, model_id));
+        }
 
         // #719: run the output guardrail chain on the assistant's text so a
         // configured output block isn't bypassable by calling /v1/responses
@@ -3158,6 +3196,9 @@ async fn responses_cross_provider_to_target(
         }
         u
     };
+    // Billed from here on: a caller that leaves during the scan below, or the
+    // commit and cache write after it, still owes this answer.
+    crate::attribution::note_answered_usage(usage.answered(snapshot, model_id));
 
     // #719: run output guardrails on the bridged response before re-encoding
     // it as Responses JSON — the assistant text + tool calls are
@@ -3435,6 +3476,45 @@ fn parse_responses_terminal_usage(json: &Value) -> Option<ResponseUsage> {
 }
 
 impl ResponseUsage {
+    /// What [`emit_usage_event`] bills for these counters on an answer
+    /// `model_id` served, noted for a caller that leaves before that row is
+    /// written ([`crate::attribution::note_answered_usage`]).
+    fn answered(
+        &self,
+        snap: &aisix_core::AisixSnapshot,
+        model_id: &str,
+    ) -> crate::usage_attr::AnsweredUsage {
+        crate::usage_attr::AnsweredUsage {
+            prompt_tokens: self.prompt_tokens,
+            completion_tokens: self.completion_tokens,
+            reasoning_tokens: self.reasoning_tokens,
+            upstream_total_tokens: self.upstream_total_tokens,
+            reasoning_folded_into_completion: self.reasoning_folded_into_completion,
+            cached_prompt_tokens: self.cached_prompt_tokens,
+            cache_write_tokens: self.cache_write_tokens,
+            cache_creation_tokens: self.cache_creation_tokens,
+            cache_creation_ttl: self.cache_creation_ttl,
+            cache_read_tokens: self.cache_read_tokens,
+            modality: self.modality,
+            usage_estimated: self.usage_estimated,
+            cost_usd: crate::usage_attr::request_cost_usd(
+                snap,
+                model_id,
+                crate::usage_attr::input_tokens_for_pricing(
+                    u64::from(self.prompt_tokens),
+                    u64::from(self.cached_prompt_tokens),
+                    u64::from(self.cache_write_tokens.unwrap_or(0)),
+                    u64::from(self.cache_read_tokens),
+                    u64::from(self.cache_creation_tokens),
+                ),
+                u64::from(self.completion_tokens),
+            ),
+            service_tier: self.service_tier.clone(),
+            provider_request_id: self.provider_request_id.clone(),
+            ..Default::default()
+        }
+    }
+
     fn usage_stats(&self) -> aisix_gateway::UsageStats {
         aisix_gateway::UsageStats {
             cached_prompt_tokens: self.cached_prompt_tokens,
@@ -3575,7 +3655,7 @@ fn responses_stream_error_body(
             !delivered.is_empty(),
             false,
             class.code(),
-            class.code(),
+            crate::platform_errors::responses_failed_code(&class),
             crate::platform_errors::platform_message(&class),
         ),
         None => crate::responses_bridge::failure_frames(
@@ -4912,7 +4992,9 @@ where
         while let Some(item) = upstream.next().await {
             let bytes = match item {
                 Ok(bytes) => bytes,
-                // A mid-stream Err is forwarded as-is.
+                // A mid-stream Err is forwarded as-is; in platform mode the
+                // stream ends on its class instead, as a bridged channel's
+                // stream does for the same fault.
                 Err(error) => {
                     let bridge = raw_stream_bridge_error(&error, attempt_started);
                     let state = guard.state();
@@ -4921,6 +5003,10 @@ where
                         &bridge,
                     );
                     state.failure = Some(error.failure());
+                    if let Some(frame) = crate::platform_errors::responses_stream_failure(&bridge) {
+                        yield Ok(bytes::Bytes::from(frame));
+                        return;
+                    }
                     yield Err(error);
                     return;
                 }
@@ -5412,6 +5498,14 @@ fn apply_passthrough_headers(
         response
             .headers_mut()
             .insert(axum::http::header::CONTENT_TYPE, hv);
+    }
+    // Platform mode: the header a bridged stream sends, so the two kinds of
+    // channel answer under one header set.
+    if platform.is_some() {
+        response.headers_mut().insert(
+            axum::http::header::CACHE_CONTROL,
+            HeaderValue::from_static("no-cache"),
+        );
     }
     if let Ok(hv) = HeaderValue::from_str(request_id) {
         response
@@ -10747,14 +10841,25 @@ data: [DONE]\n\n";
         (status, to_bytes(resp.into_body(), 65536).await.unwrap())
     }
 
-    /// What platform mode answers when an upstream says the response does
-    /// not exist.
+    /// What platform mode answers when an upstream says it does not have
+    /// the previous response: a 400 naming `previous_response_id`
+    /// (<https://developers.openai.com/api/docs/guides/websocket-mode>).
     async fn platform_not_found() -> (StatusCode, bytes::Bytes) {
         let resp = crate::error::tests::in_platform_mode(|| {
-            ProxyError::Bridge(aisix_gateway::BridgeError::upstream_status(
-                404,
-                "Response with id 'resp_x' not found.",
-            ))
+            let message = "Previous response with id 'resp_x' not found.";
+            ProxyError::Bridge(aisix_gateway::BridgeError::UpstreamStatus {
+                status: 400,
+                message: message.into(),
+                parsed: Some(Box::new(aisix_gateway::UpstreamErrorView {
+                    kind: Some("invalid_request_error".into()),
+                    message: Some(message.into()),
+                    code: Some("previous_response_not_found".into()),
+                    param: Some("previous_response_id".into()),
+                })),
+                wire: aisix_gateway::UpstreamWire::OpenAI,
+                retry_after: None,
+                diagnostic: None,
+            })
             .into_response()
         });
         status_and_body(resp).await
@@ -10853,7 +10958,7 @@ data: [DONE]\n\n";
             .await;
         let app = build_platform_app(two_tenants(&upstream.uri()));
         let not_found = platform_not_found().await;
-        assert_eq!(not_found.0, StatusCode::NOT_FOUND);
+        assert_eq!(not_found.0, StatusCode::BAD_REQUEST);
 
         let tenant_a_id = crate::responses_affinity::seal_response_id(
             &response_key(),
@@ -11145,6 +11250,135 @@ data: [DONE]\n\n";
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// A native stream and a bridged one go out under the same headers in
+    /// platform mode: a header only one of them sends tells a tenant which
+    /// kind of channel served it.
+    #[tokio::test]
+    async fn platform_mode_sends_native_and_bridged_streams_under_one_header_set() {
+        let upstream = MockServer::builder().start().await;
+        let responses_sse = "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_r\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":1,\"total_tokens\":4}}}\n\n";
+        let messages_sse = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-3-haiku-20240307\",\"content\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}}\n\n\
+            event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
+            event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n\
+            event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+            event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n\
+            event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+        for (route, sse) in [
+            ("/v1/responses", responses_sse),
+            ("/v1/messages", messages_sse),
+        ] {
+            Mock::given(method("POST"))
+                .and(path(route))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_raw(sse, "text/event-stream; charset=utf-8"),
+                )
+                .mount(&upstream)
+                .await;
+        }
+        let snap = new_snap_openai(&upstream.uri());
+        snap.provider_keys.insert(anthropic_pk_at(&upstream.uri()));
+        snap.models.insert(openai_model("gpt-4o-resp"));
+        snap.models.insert(anthropic_model("claude-resp"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        let app = build_platform_app(snap);
+        let mut sets = Vec::new();
+        for model in ["gpt-4o-resp", "claude-resp"] {
+            let resp = app
+                .clone()
+                .oneshot(make_req(
+                    serde_json::json!({"model": model, "input": "hi", "stream": true}),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{model}");
+            let mut set: Vec<(String, String)> = resp
+                .headers()
+                .iter()
+                .map(|(name, value)| {
+                    let value = if name == "x-aisix-request-id" {
+                        String::new()
+                    } else {
+                        value.to_str().unwrap().to_owned()
+                    };
+                    (name.to_string(), value)
+                })
+                .collect();
+            set.sort();
+            let _ = to_bytes(resp.into_body(), 65536).await.unwrap();
+            sets.push(set);
+        }
+        assert_eq!(
+            sets[0], sets[1],
+            "native {:?}, bridged {:?}",
+            sets[0], sets[1]
+        );
+        assert!(sets[0].contains(&("cache-control".to_owned(), "no-cache".to_owned())));
+    }
+
+    /// A transport failure mid-stream aborts a native Responses body; in
+    /// platform mode the stream ends on its class instead, an event a
+    /// bridged channel's stream would end on as well.
+    #[tokio::test]
+    async fn in_platform_mode_a_mid_stream_transport_error_ends_on_its_class() {
+        use futures::StreamExt;
+        for platform in [false, true] {
+            let upstream = futures::stream::iter(vec![
+                Ok(bytes::Bytes::from_static(
+                    b"event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"output\":[]}}\n\n",
+                )),
+                Err(crate::stream_timeout::RawStreamError::Timeout { elapsed_ms: 5 }),
+            ]);
+            let now = std::time::Instant::now();
+            let mark = crate::responses_affinity::ContextAffinity::default()
+                .response_mark("m-1", false)
+                .sealing_ids(
+                    platform
+                        .then(|| crate::platform::PlatformSettings::from_secret("s"))
+                        .as_ref(),
+                    "team-a",
+                );
+            let cell = std::sync::Arc::new(
+                crate::attribution::RequestAttribution::default().in_platform_mode(platform),
+            );
+            let (wire, aborted) = crate::attribution::scope(cell, async move {
+                let stream = super::build_responses_passthrough_stream(
+                    upstream,
+                    now,
+                    now,
+                    None,
+                    None,
+                    None,
+                    true,
+                    "alias".into(),
+                    mark,
+                    |_, _, _, _, _| {},
+                );
+                futures::pin_mut!(stream);
+                let mut wire = Vec::new();
+                let mut aborted = false;
+                while let Some(item) = stream.next().await {
+                    match item {
+                        Ok(bytes) => wire.extend_from_slice(&bytes),
+                        Err(_) => aborted = true,
+                    }
+                }
+                (String::from_utf8(wire).unwrap(), aborted)
+            })
+            .await;
+            if !platform {
+                assert!(aborted, "off platform mode the body is aborted");
+                continue;
+            }
+            assert!(!aborted);
+            let last = wire.trim_end().rsplit("\n\n").next().unwrap();
+            let (event, _) = crate::redact::parse_sse_json_event(last.as_bytes());
+            let event = event.unwrap();
+            assert_eq!(event["type"], "error", "{last}");
+            assert_eq!(event["code"], "upstream_unavailable", "{last}");
+        }
     }
 
     /// A relayed event stream goes out under the upstream's own content

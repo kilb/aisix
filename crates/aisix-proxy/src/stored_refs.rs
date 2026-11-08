@@ -59,6 +59,11 @@
 //!       (<https://developers.openai.com/api/docs/guides/tools-code-interpreter>);
 //!     - a `container_reference` environment of a shell call
 //!       (`response_input_item_param.py:393`).
+//!
+//!     Both are refused unless they are the tenant's own seal: the gateway
+//!     seals the container of a code interpreter or shell call it hands a
+//!     tenant, and takes that tenant's own out of sight of this check
+//!     (`crate::opaque_id::with_own_containers`).
 //! - Chat Completions (`chat/`):
 //!   - the `file.file_id` of a `file` content part
 //!     (`chat_completion_content_part_param.py:22`);
@@ -106,47 +111,158 @@
 //!   headers (`anthropic-workspace-id` and `anthropic-user-profile-id`), and
 //!   the gateway forwards a client header only where the operator
 //!   configured it.
+//!
+//! # Fields that choose the model
+//!
+//! The key's model access decides which model a tenant may use, and the
+//! platform pays each upstream at the price of the model that actually ran.
+//! A request field with which the caller would choose another model, past
+//! that check, is refused the same way, as [`ProxyError::ModelSelectorRefused`]
+//! naming the field:
+//!
+//! - On every family, the top-level `models`, `provider` and `fallbacks`:
+//!   an aggregator channel's model list and provider routing, which it reads
+//!   on Chat Completions and Responses alike
+//!   (<https://openrouter.ai/docs/api/reference/overview>), and a fallback
+//!   chain (the Messages API's own, `beta/message_create_params.py:190` and
+//!   `beta/beta_fallback_param.py:28`, which runs a substitute model when the
+//!   requested one declines). Each of them reaches the upstream unread on
+//!   any family whose upstream reads it.
+//! - A tool definition that names the model it runs: Responses
+//!   `image_generation` (`responses/tool_param.py:300`), wherever a tool
+//!   definition appears, and on Messages any tool carrying a `model`, which
+//!   today is `advisor_20260301` (`beta/beta_advisor_tool_20260301_param.py:13`).
+//!
+//! Left alone: a `moderation.model` (`chat/completion_create_params.py:519`,
+//! `responses/response_create_params.py:397`), which picks the classifier
+//! that screens the request and never the model that answers it; and a
+//! Messages `fallback` block echoed in `messages[]`
+//! (`beta/beta_fallback_block_param.py`), which the API documents as not
+//! read for routing.
+//!
+//! Refused the same way, because the platform would pay for an answer the
+//! gateway never reads: a Responses `background: true`
+//! (`responses/response_create_params.py:49`). The upstream then runs the
+//! response after the request returns, and a caller reads the result by
+//! polling `GET /v1/responses/{id}`
+//! (<https://developers.openai.com/api/docs/guides/background>), or by
+//! continuing from it. The gateway serves no poll and reads no result, so
+//! no usage row could bill what the upstream charges for the response.
 
 use serde_json::Value;
 
 use crate::error::ProxyError;
 
-/// Refuse a `/v1/responses` request naming an object stored upstream.
+/// Refuse a `/v1/responses` request naming an object stored upstream, or
+/// choosing its own model.
 pub(crate) fn refuse_in_responses(
     platform: Option<&crate::platform::PlatformSettings>,
     body: &Value,
 ) -> Result<(), ProxyError> {
-    refuse(platform, || responses_reference(body))
+    refuse(
+        platform,
+        || responses_selector(body),
+        || responses_reference(body),
+    )
 }
 
-/// Refuse a `/v1/chat/completions` request naming an object stored upstream.
+/// Refuse a `/v1/chat/completions` request naming an object stored upstream,
+/// or choosing its own model.
 pub(crate) fn refuse_in_chat(
     platform: Option<&crate::platform::PlatformSettings>,
     req: &aisix_gateway::ChatFormat,
 ) -> Result<(), ProxyError> {
-    refuse(platform, || chat_reference(req))
+    refuse(
+        platform,
+        || model_selector(&req.extra),
+        || chat_reference(req),
+    )
 }
 
 /// Refuse a `/v1/messages` or `/v1/messages/count_tokens` request naming an
-/// object stored upstream.
+/// object stored upstream, or choosing its own model.
 pub(crate) fn refuse_in_messages(
     platform: Option<&crate::platform::PlatformSettings>,
     body: &Value,
 ) -> Result<(), ProxyError> {
-    refuse(platform, || messages_reference(body))
+    refuse(
+        platform,
+        || messages_selector(body),
+        || messages_reference(body),
+    )
+}
+
+/// Refuse a `/v1/embeddings` request choosing its own model: a top-level
+/// `models`, `provider` or `fallbacks`, which an aggregator channel reads on
+/// embeddings as on chat (<https://openrouter.ai/docs/api/reference/embeddings>).
+/// An embeddings request names no object stored upstream, so nothing else is
+/// read. `extra` is every member of the body the endpoint does not model
+/// itself, all of which reach the upstream.
+pub(crate) fn refuse_in_embeddings(
+    platform: Option<&crate::platform::PlatformSettings>,
+    extra: &serde_json::Map<String, Value>,
+) -> Result<(), ProxyError> {
+    refuse(platform, || model_selector(extra), || None)
 }
 
 fn refuse(
     platform: Option<&crate::platform::PlatformSettings>,
-    find: impl FnOnce() -> Option<String>,
+    selector: impl FnOnce() -> Option<String>,
+    reference: impl FnOnce() -> Option<String>,
 ) -> Result<(), ProxyError> {
     if platform.is_none() {
         return Ok(());
     }
-    match find() {
+    if let Some(field) = selector() {
+        return Err(ProxyError::ModelSelectorRefused(capped(field)));
+    }
+    match reference() {
         Some(field) => Err(ProxyError::StoredObjectReference(capped(field))),
         None => Ok(()),
     }
+}
+
+/// The top-level members with which a caller would choose the model that
+/// answers (see the module doc).
+const MODEL_SELECTORS: [&str; 3] = ["models", "provider", "fallbacks"];
+
+/// The first of [`MODEL_SELECTORS`] a request's top-level `members` set.
+fn model_selector(members: &serde_json::Map<String, Value>) -> Option<String> {
+    MODEL_SELECTORS
+        .into_iter()
+        .find(|field| names(members.get(*field)))
+        .map(str::to_owned)
+}
+
+fn responses_selector(body: &Value) -> Option<String> {
+    body.as_object()
+        .and_then(model_selector)
+        .or_else(|| find_in(body, "tools", &responses_model_node))
+        .or_else(|| find_in(body, "tool_choice", &responses_model_node))
+        .or_else(|| find_in(body, "input", &responses_model_node))
+        .or_else(|| {
+            (body.get("background") == Some(&Value::Bool(true))).then(|| "background".into())
+        })
+}
+
+/// A Responses tool definition that names the model it runs, walked
+/// wherever [`responses_node`] walks tool definitions.
+fn responses_model_node(node: &Value) -> Visit {
+    match kind(node) {
+        Some("function" | "custom" | "tool_search_call" | "mcp_list_tools") => Visit::Skip,
+        Some("image_generation") if names(node.get("model")) => Visit::Refuse("model".into()),
+        _ => Visit::Descend,
+    }
+}
+
+fn messages_selector(body: &Value) -> Option<String> {
+    body.as_object().and_then(model_selector).or_else(|| {
+        body.get("tools")?
+            .as_array()?
+            .iter()
+            .position(|tool| names(tool.get("model")))
+            .map(|i| format!("tools[{i}].model"))
+    })
 }
 
 /// The longest field path a refusal names; a longer one is cut here.
@@ -211,8 +327,10 @@ fn find_under(value: &Value, path: &mut String, check: &dyn Fn(&Value) -> Visit)
     let len = path.len();
     let found = match value {
         Value::Array(items) => items.iter().enumerate().find_map(|(i, item)| {
+            use std::fmt::Write as _;
             path.truncate(len);
-            path.push_str(&format!("[{i}]"));
+            // Into the one buffer the walk carries: no allocation per node.
+            let _ = write!(path, "[{i}]");
             find_under(item, path, check)
         }),
         Value::Object(map) => map
@@ -421,6 +539,31 @@ mod tests {
             Err(ProxyError::StoredObjectReference(field)) => Some(field),
             Err(other) => panic!("unexpected refusal {other:?}"),
             Ok(()) => None,
+        }
+    }
+
+    /// An embeddings request cannot choose its own model either, and only
+    /// in platform mode is it refused.
+    #[test]
+    fn an_embeddings_request_choosing_its_own_model_names_the_field() {
+        let extra = |body: Value| body.as_object().cloned().unwrap();
+        for (field, value) in [
+            ("models", json!(["openai/text-embedding-3-large"])),
+            ("provider", json!({"order": ["x"]})),
+            ("fallbacks", json!(["other-model"])),
+        ] {
+            let body = extra(json!({ "user": "u", field: value }));
+            match refuse_in_embeddings(Some(&platform()), &body) {
+                Err(ProxyError::ModelSelectorRefused(refused)) => assert_eq!(refused, field),
+                other => panic!("{field}: {other:?}"),
+            }
+            assert!(refuse_in_embeddings(None, &body).is_ok(), "{field}");
+        }
+        for body in [
+            json!({}),
+            json!({"user": "u", "models": [], "provider": null}),
+        ] {
+            assert!(refuse_in_embeddings(Some(&platform()), &extra(body)).is_ok());
         }
     }
 
@@ -805,6 +948,147 @@ mod tests {
         let path = refused_responses(json!({ "input": deep })).unwrap();
         assert_eq!(path.len(), MAX_PATH_LEN, "{path}");
         assert!(path.starts_with("input[0][0]"), "{path}");
+    }
+
+    /// The field a model-selection refusal names, `None` when the request
+    /// passes; any other refusal fails the test.
+    fn selector(refusal: Result<(), ProxyError>) -> Option<String> {
+        match refusal {
+            Err(ProxyError::ModelSelectorRefused(field)) => Some(field),
+            Err(other) => panic!("unexpected refusal {other:?}"),
+            Ok(()) => None,
+        }
+    }
+
+    /// A request cannot choose the model that answers past the key's model
+    /// access: not with a model list, provider routing or a fallback chain,
+    /// on any family, nor with a tool that names its own model.
+    #[test]
+    fn a_request_choosing_its_own_model_names_the_field() {
+        let chat = |body: Value| {
+            let req: aisix_gateway::ChatFormat = serde_json::from_value(body).unwrap();
+            selector(refuse_in_chat(Some(&platform()), &req))
+        };
+        let messages = |body: Value| selector(refuse_in_messages(Some(&platform()), &body));
+        let responses = |body: Value| selector(refuse_in_responses(Some(&platform()), &body));
+        let hi = json!([{"role": "user", "content": "hi"}]);
+        for field in ["models", "provider", "fallbacks"] {
+            let value = match field {
+                "provider" => json!({"order": ["x"]}),
+                _ => json!(["other-model"]),
+            };
+            let mut body = json!({"model": "m", "messages": hi, "input": "hi"});
+            body[field] = value;
+            assert_eq!(chat(body.clone()).as_deref(), Some(field), "chat {field}");
+            assert_eq!(
+                messages(body.clone()).as_deref(),
+                Some(field),
+                "messages {field}"
+            );
+            assert_eq!(
+                responses(body.clone()).as_deref(),
+                Some(field),
+                "responses {field}"
+            );
+        }
+        // The Messages API's own fallback chain, in both of its forms.
+        assert_eq!(
+            messages(json!({"messages": hi, "fallbacks": "default"})).as_deref(),
+            Some("fallbacks")
+        );
+        assert_eq!(
+            messages(json!({"messages": hi, "fallbacks": [{"model": "claude-x"}]})).as_deref(),
+            Some("fallbacks")
+        );
+        // A tool that runs a model of its own choosing.
+        assert_eq!(
+            messages(json!({"messages": hi, "tools": [
+                {"name": "f", "input_schema": {"type": "object"}},
+                {"type": "advisor_20260301", "name": "advisor", "model": "claude-x"}]}))
+            .as_deref(),
+            Some("tools[1].model")
+        );
+        assert_eq!(
+            responses(json!({"input": "hi", "tools": [
+                {"type": "image_generation", "model": "gpt-image-x"}]}))
+            .as_deref(),
+            Some("tools[0].model")
+        );
+        assert_eq!(
+            responses(
+                json!({"input": [{"type": "additional_tools", "role": "developer",
+                "tools": [{"type": "image_generation", "model": "gpt-image-x"}]}]})
+            )
+            .as_deref(),
+            Some("input[0].tools[0].model")
+        );
+        assert_eq!(
+            responses(
+                json!({"tool_choice": {"type": "allowed_tools", "mode": "auto",
+                "tools": [{"type": "image_generation", "model": "gpt-image-x"}]}})
+            )
+            .as_deref(),
+            Some("tool_choice.tools[0].model")
+        );
+
+        // Without such a field, or with one that is empty, nothing is refused.
+        for body in [
+            json!({"model": "m", "messages": hi, "input": "hi"}),
+            json!({"model": "m", "messages": hi, "models": null, "provider": null,
+                   "fallbacks": null}),
+            json!({"model": "m", "messages": hi, "models": [], "fallbacks": []}),
+        ] {
+            assert_eq!(chat(body.clone()), None, "chat {body}");
+            assert_eq!(messages(body.clone()), None, "messages {body}");
+            assert_eq!(responses(body.clone()), None, "responses {body}");
+        }
+        assert_eq!(
+            responses(json!({"input": "hi", "tools": [
+                {"type": "image_generation", "quality": "high"},
+                {"type": "function", "name": "f", "parameters": {"type": "object",
+                    "properties": {"model": {"type": "string"}}}}]})),
+            None
+        );
+        assert_eq!(
+            messages(json!({"messages": hi, "tools": [
+                {"name": "f", "input_schema": {"type": "object",
+                    "properties": {"model": {"type": "string"}}}}]})),
+            None
+        );
+
+        // Off platform mode every such field is forwarded as before.
+        let body = json!({"model": "m", "messages": hi, "models": ["x"], "fallbacks": "default",
+                          "tools": [{"type": "image_generation", "model": "gpt-image-x"}]});
+        assert!(refuse_in_messages(None, &body).is_ok());
+        assert!(refuse_in_responses(None, &body).is_ok());
+        let req: aisix_gateway::ChatFormat = serde_json::from_value(body).unwrap();
+        assert!(refuse_in_chat(None, &req).is_ok());
+    }
+
+    /// A Responses request run in the background is refused: the upstream
+    /// would bill an answer the gateway never reads, so no row could bill
+    /// it. Only `true` asks for one.
+    #[test]
+    fn a_background_response_is_refused() {
+        let responses = |body: Value| selector(refuse_in_responses(Some(&platform()), &body));
+        assert_eq!(
+            responses(json!({"model": "m", "input": "hi", "background": true})).as_deref(),
+            Some("background")
+        );
+        assert_eq!(
+            responses(json!({"model": "m", "input": "hi", "background": true,
+                             "stream": true, "store": true}))
+            .as_deref(),
+            Some("background")
+        );
+        for value in [json!(false), Value::Null] {
+            assert_eq!(
+                responses(json!({"model": "m", "input": "hi", "background": value})),
+                None
+            );
+        }
+        // Off platform mode it is forwarded as before.
+        assert!(refuse_in_responses(None, &json!({"input": "hi", "background": true})).is_ok());
     }
 
     #[test]
