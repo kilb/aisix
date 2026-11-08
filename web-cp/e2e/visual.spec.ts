@@ -1,3 +1,4 @@
+import { join } from "node:path";
 import { expect, test, type Browser, type Page } from "@playwright/test";
 import { STACK_START_TIMEOUT_MS, startStack, type Stack } from "./stack";
 
@@ -365,6 +366,34 @@ test("价格 · 基准价：深色与手机宽度下不横向滚动", async ({ b
   await shoot(page, "visual-pricing-baselines-dark.png");
   await page.setViewportSize(PHONE);
   await shoot(page, "visual-pricing-baselines-360.png");
+  expect(await page.evaluate(() => document.documentElement.scrollWidth), "no sideways scroll").toBeLessThanOrEqual(PHONE.width);
+  await page.context().close();
+});
+
+test("价格 · 导入审核：深色与手机宽度下不横向滚动", async ({ browser }) => {
+  const page = await systemDark(browser);
+  await login(page);
+  await open(page, "pricing");
+  await page.getByRole("group", { name: "价格分区" }).getByRole("button", { name: "导入审核", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "导入审核" })).toBeVisible();
+
+  // An uploaded batch, so the page shows its proposals and the third-party badge.
+  await page
+    .getByLabel("数据集文件")
+    .setInputFiles(join(process.cwd(), "..", "tests", "e2e", "fixtures", "pricing-import", "genai-prices-v2-7de757d.json"));
+  await page.getByLabel("数据集版本").fill("genai-prices-v2-7de757d");
+  await page.getByRole("button", { name: "上传", exact: true }).click();
+  await expect(page.getByRole("table", { name: "提议" })).toBeVisible();
+  await page.getByLabel("筛选模型").fill("anthropic/claude-opus-5-5");
+  await expect(page.getByRole("row").filter({ hasText: "anthropic/claude-opus-5-5" }).first()).toBeVisible();
+  await page.evaluate(() => document.fonts.ready.then(() => undefined));
+  await expect.poll(() => background(page)).toBe(LIGHT_BG);
+  await shoot(page, "visual-pricing-imports-light.png");
+  await page.getByRole("button", { name: "切换到深色" }).click();
+  await expect.poll(() => background(page)).toBe(DARK_BG);
+  await shoot(page, "visual-pricing-imports-dark.png");
+  await page.setViewportSize(PHONE);
+  await shoot(page, "visual-pricing-imports-360.png");
   expect(await page.evaluate(() => document.documentElement.scrollWidth), "no sideways scroll").toBeLessThanOrEqual(PHONE.width);
   await page.context().close();
 });

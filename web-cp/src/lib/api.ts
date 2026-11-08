@@ -1263,3 +1263,137 @@ export const baselines = {
     return (await call<BaselineCreated>("POST", "/admin/pricing/baselines", body)).data;
   },
 };
+
+// ── pricing: imports ────────────────────────────────────────────────────────
+
+/** Why a proposal cannot be confirmed as it stands; a code this build does not know is shown as it came. */
+export type ProposalFlag = "bad_number" | "unsupported_field" | "unsupported_variant" | "time_of_day" | "invalid_card";
+
+/** One upload of the public price dataset, and what it proposed. */
+export interface ImportBatch {
+  id: string;
+  dataset: string;
+  dataset_ref: string;
+  /** `open`, or `superseded` once a newer upload took over. */
+  status: string;
+  proposals: number;
+  flagged: number;
+  created_by: { id: string; email: string };
+  created_at: string;
+}
+
+/** The catalogue's entry for a proposal's own provider and model, at the proposal's start. */
+export interface CatalogueEntryView {
+  key: string;
+  card: RateCard;
+  source_url: string;
+  as_of: string;
+}
+
+/** One dataset entry at one date: a card to confirm, or the reasons it made none. */
+export interface Proposal {
+  id: string;
+  batch_id: string;
+  provider: string;
+  model: string;
+  /** `null`: in effect at upload. */
+  effective_from: string | null;
+  /** The card it comes to, when its prices made one. */
+  card: RateCard | null;
+  flags: ProposalFlag[];
+  pricing_url: string | null;
+  prices_checked: string | null;
+  /** A live direct model whose provider and model name are the entry's. */
+  suggested_model_id: string | null;
+  /** `pending`, `confirmed`, `rejected` or `superseded`. */
+  status: string;
+  decided_by: string | null;
+  decided_at: string | null;
+  reject_reason: string | null;
+  baseline_revision_id: number | null;
+  current_baseline: BaselineRevision | null;
+  catalogue_entry: CatalogueEntryView | null;
+  /** Whether the card equals the current baseline's: nothing to confirm. */
+  same_as_current: boolean;
+}
+
+/** What `POST .../confirm` takes: the model it prices, its start, and the operator's attestation. */
+export interface ConfirmProposal {
+  model_id: string;
+  effective_from: string;
+  attested: true;
+}
+
+/**
+ * Posts the dataset as the file's own text, spliced in as the `data` member
+ * rather than as a JSON string of it: the importer reads each price's decimal
+ * text, and `JSON.parse` followed by `JSON.stringify` would rewrite
+ * `1.5e-05` as `0.000015`, turning a refused price into a readable one. The
+ * body is assembled here for that reason, and `dataset_ref` is escaped as a
+ * JSON string.
+ */
+async function callWithDataset<T>(path: string, datasetRef: string, data: string): Promise<T> {
+  const body = `{"dataset_ref":${JSON.stringify(datasetRef)},"data":${data}}`;
+  let r: Response;
+  try {
+    r = await fetch(path, {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "content-type": "application/json" },
+      body,
+    });
+  } catch {
+    throw new ApiError("无法连接控制面", 0, "network", [], [], null);
+  }
+  const text = await r.text();
+  let parsed: unknown = null;
+  if (text) {
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      throw new ApiError(`服务端返回了非 JSON 响应（HTTP ${r.status}）`, r.status, "bad_response", [], [], null);
+    }
+  }
+  if (!r.ok) {
+    const e = (parsed ?? {}) as Envelope;
+    if (r.status === 401 && e.code === "unauthenticated") {
+      for (const listener of sessionEndedListeners) listener();
+    }
+    throw new ApiError(
+      e.error ?? `HTTP ${r.status}`,
+      r.status,
+      e.code ?? "bad_response",
+      e.details ?? [],
+      e.referenced_by ?? [],
+      e.current_version ?? null,
+    );
+  }
+  return parsed as T;
+}
+
+export const imports = {
+  /** The newest 20 uploads, superseded ones included. */
+  async list(): Promise<ImportBatch[]> {
+    return (await call<{ items: ImportBatch[] }>("GET", "/admin/pricing/imports")).data.items;
+  },
+  /**
+   * One batch with its proposals. `all` lists a pending proposal whose card
+   * equals its model's current baseline too; without it, that one is left out.
+   */
+  async detail(id: string, all: boolean): Promise<ImportBatch & { proposals: Proposal[] }> {
+    return (await call<ImportBatch & { proposals: Proposal[] }>("GET", `/admin/pricing/imports/${seg(id)}${all ? "?all=true" : ""}`))
+      .data;
+  },
+  /** Uploads the dataset's own text under its revision. */
+  async upload(dataset_ref: string, data: string): Promise<ImportBatch> {
+    return callWithDataset<ImportBatch>("/admin/pricing/imports", dataset_ref, data);
+  },
+  /** Confirms one proposal: writes its card as a third-party baseline. */
+  async confirm(id: string, pid: string, body: ConfirmProposal): Promise<BaselineRevision> {
+    return (await call<BaselineRevision>("POST", `/admin/pricing/imports/${seg(id)}/proposals/${seg(pid)}/confirm`, body)).data;
+  },
+  /** Rejects one proposal, with the reason as the operator typed it. */
+  async reject(id: string, pid: string, reason: string): Promise<Proposal> {
+    return (await call<Proposal>("POST", `/admin/pricing/imports/${seg(id)}/proposals/${seg(pid)}/reject`, { reason })).data;
+  },
+};
