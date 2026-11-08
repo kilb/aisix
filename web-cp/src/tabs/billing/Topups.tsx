@@ -51,6 +51,7 @@ export function Topups({ canEdit, refreshShell }: TabProps) {
   const [form, focusRefusal] = useRefusalFocus<HTMLFormElement>();
   // A newer read makes an older one's answer stale.
   const latest = useRef(0);
+  const sending = useRef(false);
 
   useEffect(() => {
     tenants.list().then(setTenantList, () => undefined);
@@ -84,6 +85,9 @@ export function Topups({ canEdit, refreshShell }: TabProps) {
   }, [load]);
 
   async function decide(t: Topup, kind: Flight["kind"], reason?: string) {
+    // One decision at a time, whatever the buttons say: a second call before the first ends is dropped.
+    if (sending.current) return;
+    sending.current = true;
     setFlight({ id: t.id, kind });
     setOutcome(null);
     try {
@@ -95,8 +99,9 @@ export function Topups({ canEdit, refreshShell }: TabProps) {
         text: kind === "approve" ? `已批准 ${t.tenant_name} 的 ${amount} 充值` : `已驳回 ${t.tenant_name} 的 ${amount} 充值`,
       });
       setRejecting(null);
-      void load();
       refreshShell();
+      // The row is gone from 待审批 before the controls come back.
+      await load();
     } catch (e) {
       const refusedReason = e instanceof ApiError ? e.details.find((d) => d.path === "/reason") : undefined;
       if (kind === "reject" && refusedReason) {
@@ -108,10 +113,11 @@ export function Topups({ canEdit, refreshShell }: TabProps) {
       // Another operator may have decided it: show what is stored now.
       if (e instanceof ApiError && e.code === "topup_state") {
         setRejecting(null);
-        void load();
         refreshShell();
+        await load();
       }
     } finally {
+      sending.current = false;
       setFlight(null);
     }
   }
@@ -256,9 +262,9 @@ export function Topups({ canEdit, refreshShell }: TabProps) {
                       >
                         <Field label="驳回原因" hint="租户会看到这段文字，1–500 个字符。" error={writing.problem}>
                           {(aria) => (
-                            <textarea
+                            <input
                               {...aria}
-                              rows={2}
+                              maxLength={500}
                               value={writing.reason}
                               disabled={mine?.kind === "reject"}
                               onChange={(e) => setRejecting({ ...writing, reason: e.target.value, problem: null })}

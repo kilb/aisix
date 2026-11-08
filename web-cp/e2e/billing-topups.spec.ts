@@ -94,6 +94,13 @@ test("驳回必须填写原因，租户看到原因", async ({ page }) => {
   const pending = (await stack.admin.get("/admin/billing/topups?status=pending")).items as Json[];
   expect(pending.some((t) => t.tenant_id === world.tenantId)).toBe(true);
 
+  // A pasted tab survives a single-line field; the server refuses it on the field.
+  await reason.fill("未收到\t款项");
+  await page.getByRole("button", { name: "确认驳回" }).click();
+  await expect(reason).toHaveAttribute("aria-invalid", "true");
+  await expect(reason).toBeFocused();
+  await expect(page.locator(".field-problem")).toContainText("控制字符");
+
   await reason.fill("未收到款项-ui");
   await page.getByRole("button", { name: "确认驳回" }).click();
   await expect(rowOf(page, world)).toHaveCount(0);
