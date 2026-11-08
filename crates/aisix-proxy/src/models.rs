@@ -305,7 +305,7 @@ fn anthropic_model(
 
 /// The caller's tenant's prices, in platform mode with a control plane to
 /// ask; `None` otherwise, without asking. Never fails the listing, and never
-/// holds it much past [`crate::account::prices::PRICES_TIMEOUT`].
+/// holds it past [`crate::account::prices::PRICES_TIMEOUT`].
 async fn tenant_prices(
     state: &ProxyState,
     auth: &AuthenticatedKey,
@@ -528,8 +528,8 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    use crate::account::prices::stand_in::PricesStandIn;
     use crate::account::prices::{PRICES_FAILURE_TTL, PRICES_TIMEOUT};
+    use crate::account::stand_in::StandIn;
     use crate::account::AccountClient;
 
     fn cfg() -> ProxyConfig {
@@ -1363,7 +1363,8 @@ mod tests {
         ResourceEntry::new(id, key, 1)
     }
 
-    /// `chat-1` (M1) and `chat-2` (M2), and two keys of tenant A.
+    /// `chat-1` (M1) and `chat-2` (M2); two keys of tenant A, one of
+    /// tenant B, and two keys in no team.
     fn priced_snap() -> AisixSnapshot {
         let snap = new_snap();
         snap.models.insert(model_entry(M1, "chat-1"));
@@ -1372,6 +1373,12 @@ mod tests {
             .insert(tenant_key("key-a1", "sk-a1", Some("tenant-a")));
         snap.apikeys
             .insert(tenant_key("key-a2", "sk-a2", Some("tenant-a")));
+        snap.apikeys
+            .insert(tenant_key("key-b1", "sk-b1", Some("tenant-b")));
+        snap.apikeys
+            .insert(tenant_key("key-solo1", "sk-solo1", None));
+        snap.apikeys
+            .insert(tenant_key("key-solo2", "sk-solo2", None));
         snap
     }
 
@@ -1449,7 +1456,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_listing_without_platform_mode_is_unchanged() {
-        let stand_in = PricesStandIn::start(Arc::new(|_| ok(m1_priced()))).await;
+        let stand_in = StandIn::start(Arc::new(|_| ok(m1_priced()))).await;
         let with = app_with(false, Some(stand_in.client()));
         let without = app_with(false, None);
         for (uri, anthropic) in [
@@ -1472,7 +1479,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_platform_listing_carries_each_models_price() {
-        let stand_in = PricesStandIn::start(Arc::new(|_| ok(m1_priced()))).await;
+        let stand_in = StandIn::start(Arc::new(|_| ok(m1_priced()))).await;
         let app = app_with(true, Some(stand_in.client()));
         let answer = get(&app, "/v1/models", "sk-a1", false).await;
         assert_eq!(answer.status, StatusCode::OK);
@@ -1510,11 +1517,55 @@ mod tests {
         );
     }
 
+    /// Each tenant is asked with its own key and shown only its own
+    /// prices, a failure included, and a key in no team is a tenant of its
+    /// own.
+    #[tokio::test]
+    async fn each_tenant_is_shown_only_its_own_prices() {
+        let stand_in = StandIn::start(Arc::new(|key| {
+            let input = match key {
+                "key-a1" | "key-a2" => "0.000006",
+                "key-b1" => "0.000003",
+                "key-solo1" => "0.000009",
+                // The control plane fails for key-solo2.
+                _ => return (StatusCode::SERVICE_UNAVAILABLE, "{}".to_string()),
+            };
+            ok(json!({"models": [{"model_id": M1, "input": input, "output": "0.00002"}]}))
+        }))
+        .await;
+        let app = app_with(true, Some(stand_in.client()));
+        for (key, expected) in [
+            ("sk-a1", Some("0.000006")),
+            ("sk-solo2", None),
+            ("sk-solo1", Some("0.000009")),
+            ("sk-b1", Some("0.000003")),
+            ("sk-a2", Some("0.000006")),
+        ] {
+            let listing = get(&app, "/v1/models", key, false).await.json();
+            let chat = listed(&listing, "chat-1");
+            match expected {
+                Some(input) => assert_eq!(chat["pricing"]["input"], input, "{key}: {listing}"),
+                None => assert!(chat.get("pricing").is_none(), "{key}: {listing}"),
+            }
+        }
+        // Each tenant was asked once, with its own key; A's second key was
+        // answered from A's entry.
+        let paths = stand_in.paths.lock().unwrap().clone();
+        assert_eq!(
+            paths,
+            HashMap::from([
+                ("/dp/v1/keys/key-a1/prices".to_string(), 1),
+                ("/dp/v1/keys/key-solo2/prices".to_string(), 1),
+                ("/dp/v1/keys/key-solo1/prices".to_string(), 1),
+                ("/dp/v1/keys/key-b1/prices".to_string(), 1),
+            ])
+        );
+    }
+
     #[tokio::test]
     async fn a_slow_control_plane_never_holds_the_listing() {
         let stand_in =
-            PricesStandIn::start_with_delay(Arc::new(|_| ok(m1_priced())), Duration::from_secs(3))
-                .await;
+            StandIn::start_with_delay(Arc::new(|_| ok(m1_priced())), Duration::from_secs(3)).await;
         let app = app_with(true, Some(stand_in.client()));
 
         let started = Instant::now();
@@ -1549,7 +1600,7 @@ mod tests {
     #[tokio::test]
     async fn prices_are_cached_per_tenant_until_valid_until() {
         // Every answer says the prices change one second from now.
-        let stand_in = PricesStandIn::start(Arc::new(|_| {
+        let stand_in = StandIn::start(Arc::new(|_| {
             let mut body = m1_priced();
             body["valid_until"] = json!(chrono::Utc::now() + chrono::Duration::seconds(1));
             ok(body)
@@ -1574,7 +1625,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_single_model_route_carries_the_same_pricing() {
-        let stand_in = PricesStandIn::start(Arc::new(|_| {
+        let stand_in = StandIn::start(Arc::new(|_| {
             ok(json!({"models": [{
                 "model_id": M1,
                 "input": "0.000006",
