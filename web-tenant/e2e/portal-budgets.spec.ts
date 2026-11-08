@@ -204,12 +204,20 @@ test("成员额度覆盖该成员的全部密钥", async ({ page }) => {
 
 test("成员只能给自己的密钥设额度，看不到组织额度", async ({ page }) => {
   const s = await seed();
-  await stack.admin.post(`/admin/tenants/${s.world.tenantId}/budgets`, { kind: "periodic", period: "month", limit_usd: "5.00" });
+  await stack.admin.post(`/admin/tenants/${s.world.tenantId}/budgets`, { kind: "periodic", period: "month", limit_usd: "5.43" });
   await setQuota(s.world.owner, { scope: "api_key", scope_ref: s.km.id, kind: "periodic", period: "month", limit_usd: "0.02" });
 
+  // What the member's browser is sent, as well as what it shows.
+  const bodies: string[] = [];
+  page.on("response", async (r) => {
+    if (r.url().includes("/api/")) bodies.push(await r.text().catch(() => ""));
+  });
   await openBudgets(page, s.m);
   await expect(page.getByRole("region", { name: /组织额度/ })).toHaveCount(0);
-  await expect(page.locator("main")).not.toContainText("余额");
+  await expect(page.locator("main")).not.toContainText("5.43");
+  await expect(rowOf(table(page, "密钥额度"), "m-key-one")).toBeVisible();
+  const seen = bodies.join("\n");
+  for (const token of ['"scope":"team"', "5430000", "balance_micro_usd"]) expect(seen).not.toContain(token);
 
   const form = region(page, "新建额度");
   await expect(form.getByLabel(/^对象类型/).locator("option")).toHaveText(["密钥"]);
@@ -368,4 +376,46 @@ test("所有者可以删除成员为自己密钥设的额度，但不能修改",
   await row.getByRole("button", { name: "删除", exact: true }).click();
   await row.getByRole("button", { name: "确认删除" }).click();
   await expect(rowOf(table(page, "密钥额度"), "m-key-one")).toHaveCount(0);
+});
+
+test("预算最多同时发出 4 个额度请求，且只读视图内的密钥", async ({ page }) => {
+  const world = await seedBillingWorld(stack, { creditUsd: "1.00", members: ["member", "member", "member"] });
+  // Minting is limited to 10 a minute per member, so the keys come from four members:
+  // 1 (the world's) + 9 + 3 x 8 = 34, past the 25 the table shows at first.
+  const total = 34;
+  for (const [who, n] of [[world.owner, 9], ...world.members.map((m) => [m, 8] as const)] as const) {
+    const api = await apiAs(who);
+    for (let i = 0; i < n; i++) await api.post("/api/keys", { label: `many-key-${i}` });
+  }
+
+  let inFlight = 0;
+  let peak = 0;
+  const asked = new Set<string>();
+  const quotaPath = /\/api\/keys\/([^/]+)\/quota/;
+  page.on("request", (r) => {
+    const m = quotaPath.exec(r.url());
+    if (!m) return;
+    asked.add(m[1]!);
+    inFlight += 1;
+    peak = Math.max(peak, inFlight);
+  });
+  const done = (r: { url(): string }) => {
+    if (quotaPath.test(r.url())) inFlight -= 1;
+  };
+  page.on("requestfinished", done);
+  page.on("requestfailed", done);
+
+  await openBudgets(page, world.owner);
+  await expect.poll(() => asked.size, { message: "the keys in view are read" }).toBe(25);
+  await expect(table(page, "密钥实际可用").locator("tbody tr")).toHaveCount(25);
+  await expect.poll(() => inFlight).toBe(0);
+  expect(peak).toBeLessThanOrEqual(4);
+  expect(peak).toBeGreaterThan(1);
+
+  // 显示更多 brings the next keys in, read the same way.
+  await page.getByRole("button", { name: "显示更多" }).click();
+  await expect(table(page, "密钥实际可用").locator("tbody tr")).toHaveCount(total);
+  await expect.poll(() => asked.size).toBe(total);
+  await expect.poll(() => inFlight).toBe(0);
+  expect(peak).toBeLessThanOrEqual(4);
 });

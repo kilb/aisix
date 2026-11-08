@@ -7,8 +7,9 @@ import { STACK_START_TIMEOUT_MS, startStack, type Stack } from "./stack";
  * width that neither scrolls sideways nor loses the route nav, which sits
  * at the bottom edge there. Each step saves a screenshot for the lane
  * review (`visual-<page>-{light,dark}.png` full-page; on the phone
- * `visual-<page>-360.png` as the screen shows it, with the route bar, and
- * `visual-<page>-360-full.png` for the rest of the page); nothing is
+ * `visual-<page>-360.png` as the screen shows it, with the route bar,
+ * `visual-<page>-360-full.png` for the rest of the page and
+ * `visual-<page>-360-dark.png` in dark); nothing is
  * compared pixel by pixel.
  *
  * Every context runs with the system set to dark, the setting the portal
@@ -73,7 +74,7 @@ test.beforeAll(async () => {
 
   const owner = stack.tenant();
   await owner.post("/api/login", { email: OWNER, password: PASSWORD });
-  await owner.post("/api/keys", { label: "prod-backend", rate_limit: { concurrency: 20, rpm: 600 } });
+  const prod = await owner.post("/api/keys", { label: "prod-backend", rate_limit: { concurrency: 20, rpm: 600 } });
   await owner.post("/api/keys", {
     label: "ci-runner",
     model_ids: modelIds.slice(0, 2),
@@ -90,6 +91,34 @@ test.beforeAll(async () => {
   const member = stack.tenant();
   await member.post("/api/login", { email: "lin@visual-7e4.test", password: PASSWORD });
   await member.post("/api/keys", { label: "nightly-eval", model_ids: modelIds.slice(1) });
+
+  // 账户, 用量 and 预算 need money and a call: a seven-figure balance (the widest
+  // figure the readout may carry), one priced call so the figures have sub-cent
+  // digits, and a key quota.
+  await stack.admin.post(`/admin/tenants/${id}/credits`, { amount_usd: "1000000.00", reason: "visual funding" });
+  await stack.admin.post(`/admin/tenants/${id}/credits`, { amount_usd: "234567.89", reason: "visual funding" });
+  const startsAt = Date.now() + 3_000;
+  await stack.admin.post("/admin/pricing/sell", {
+    model_id: modelIds[0],
+    effective_from: new Date(startsAt).toISOString(),
+    card: { default: { base: { input: "1000", output: "2000" } } },
+  });
+  await new Promise((r) => setTimeout(r, Math.max(0, startsAt - Date.now()) + 250));
+  await expect
+    .poll(
+      async () => {
+        const res = await fetch(`${stack.proxyUrl}/v1/chat/completions`, {
+          method: "POST",
+          headers: { authorization: `Bearer ${prod.plaintext}`, "content-type": "application/json" },
+          body: JSON.stringify({ model: "chat-small", messages: [{ role: "user", content: "hi" }] }),
+        });
+        await res.arrayBuffer();
+        return res.status;
+      },
+      { message: "the gateway admits the priced call", timeout: 60_000 },
+    )
+    .toBe(200);
+  await owner.post("/api/budgets", { scope: "api_key", scope_ref: prod.key.id, kind: "periodic", period: "month", limit_usd: "50.00" });
 });
 
 test.afterAll(async () => {
@@ -164,6 +193,39 @@ const PAGES: Shown[] = [
     },
   },
   {
+    slug: "usage",
+    name: "用量",
+    signedIn: true,
+    open: async (page) => {
+      await page.goto(stack.previewUrl);
+      await openTab(page, "用量", "调用记录");
+      await expect(page.getByRole("table", { name: "调用记录" }).locator("tbody tr").first()).toBeVisible();
+    },
+  },
+  {
+    slug: "budgets",
+    name: "预算",
+    signedIn: true,
+    open: async (page) => {
+      await page.goto(stack.previewUrl);
+      await openTab(page, "预算", "密钥额度");
+      await expect(page.getByRole("table", { name: "密钥实际可用" }).locator("tbody tr").first()).toBeVisible();
+      await expect(page.getByRole("table", { name: "密钥额度" }).locator("tbody tr").first()).toBeVisible();
+    },
+  },
+  {
+    slug: "billing",
+    name: "账户",
+    signedIn: true,
+    open: async (page) => {
+      await page.goto(stack.previewUrl);
+      await openTab(page, "账户", "余额流水");
+      // The seven-figure balance and the readout are in before the page is judged.
+      await expect(page.getByTestId("readout-amount")).toContainText("$");
+      await expect(page.getByRole("region", { name: "余额", exact: true })).toContainText("1,2");
+    },
+  },
+  {
     slug: "members",
     name: "成员",
     signedIn: true,
@@ -218,6 +280,13 @@ for (const shown of PAGES) {
     }
     await shot(page, testInfo, `visual-${shown.slug}-360.png`, false);
     await shot(page, testInfo, `visual-${shown.slug}-360-full.png`);
+
+    // Dark on the phone: no sideways scroll there either.
+    await page.getByRole("button", { name: "切换到深色" }).click();
+    await expect.poll(() => background(page)).toBe(DARK_BG);
+    await shown.open(page);
+    expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(PHONE.width);
+    await shot(page, testInfo, `visual-${shown.slug}-360-dark.png`, false);
     await page.context().close();
   });
 }

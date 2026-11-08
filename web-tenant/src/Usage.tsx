@@ -63,6 +63,10 @@ function chargeText(c: Call): string {
   const { charge } = c;
   switch (charge.status) {
     case "charged": {
+      // Unpriced when made, then corrected by re-pricing: the whole charge is the adjustment.
+      if (charge.amount_micro_usd === null && charge.adjusted_micro_usd !== 0) {
+        return `${fmtMicroUsd(charge.adjusted_micro_usd)}（重新计价）${charge.estimated ? "（估算）" : ""}`;
+      }
       const amount = charge.amount_micro_usd === null ? "—" : fmtMicroUsd(charge.amount_micro_usd);
       const adjusted = charge.adjusted_micro_usd !== 0 ? `（已调整 ${signed(charge.adjusted_micro_usd)}）` : "";
       return `${amount}${adjusted}${charge.estimated ? "（估算）" : ""}`;
@@ -73,12 +77,15 @@ function chargeText(c: Call): string {
       return "不计费";
     case "pending":
       return "待计价";
+    default:
+      return charge.status;
   }
 }
 
 function CallStatusLamp({ call }: { call: Call }) {
   if (call.status === "succeeded") return <Lamp state="applied">成功</Lamp>;
   if (call.status === "retried") return <Lamp state="pending">已重试</Lamp>;
+  if (call.status !== "failed") return <Lamp state="pending">{call.status}</Lamp>;
   const reason = call.error_class === null ? "失败" : (ERROR_LABEL[call.error_class] ?? call.error_class);
   return <Lamp state="rejected">{`失败（${reason}）`}</Lamp>;
 }
@@ -169,7 +176,7 @@ export function Usage({ member }: { member: SessionMember }) {
   );
 }
 
-// ── 用量汇总 ────────────────────────────────────────────────────────────────
+// ── usage summary (用量汇总) ────────────────────────────────────────────────────────────────
 
 function Quantities({ q }: { q: Record<string, number> }) {
   const names = Object.keys(q).sort((a, b) => {
@@ -297,7 +304,7 @@ function Summary({ keys, showKeys }: { keys: TenantKey[]; showKeys: boolean }) {
   );
 }
 
-// ── 调用记录 ────────────────────────────────────────────────────────────────
+// ── call log (调用记录) ────────────────────────────────────────────────────────────────
 
 /** How long typing in 请求 ID settles before the log is read again. */
 const TYPING_MS = 300;

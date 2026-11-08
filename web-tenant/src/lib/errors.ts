@@ -20,7 +20,7 @@ const TEXT: Record<string, string> = {
   tenant_not_active: "组织尚未通过审核或已被停用",
   version_mismatch: "该资源已被他人修改。重新载入后再编辑。",
   if_match_required: "缺少版本号，请重新载入后再保存",
-  topup_limit: "待审批的充值申请已达上限，请等待处理后再提交",
+  topup_limit: "待审批的充值申请过多，请等待处理",
   budget_exists: "该对象在这个周期已有额度",
   budget_limit: "额度数量已达上限",
   budget_managed: "该额度由上级设置，不能在这里修改",

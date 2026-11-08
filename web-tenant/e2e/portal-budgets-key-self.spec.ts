@@ -1,6 +1,4 @@
-// Not picked up by Playwright until it is renamed to `portal-budgets-key-self.spec.ts`:
-// it needs the gateway's `GET /v1/key` (P2b Task 20), which is not on this branch yet.
-// Rename it once that task has merged.
+// The page's 实际可用 for a key agrees with what the key reads about itself through the gateway (GET /v1/key).
 import { expect, test } from "@playwright/test";
 import { STACK_START_TIMEOUT_MS, startStack, type Stack } from "./stack";
 import { chat, memberKey, seedBillingWorld } from "./world";

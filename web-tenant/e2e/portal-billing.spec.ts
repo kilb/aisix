@@ -297,6 +297,45 @@ test("成员看不到账户页；账单角色能看到余额并提交充值，�
   await expect(bodyRows(region(page, "充值记录")).first()).toContainText("待审批");
 });
 
+test("组织额度未用尽时，账单角色的可用额度取余额与组织额度中较小的一项", async ({ page }) => {
+  const world = await seedBillingWorld(stack, { members: ["billing"] }); // balance 10.00
+  const [billing] = world.members;
+  if (!billing) throw new Error("the world has a billing member");
+  await stack.admin.post(`/admin/tenants/${world.tenantId}/budgets`, { kind: "periodic", period: "month", limit_usd: "5.00" });
+
+  await openAccount(page, billing);
+  await expect(region(page, "余额")).toContainText("$10.00");
+  await expect(region(page, "余额").locator("[data-state]")).toHaveAttribute("data-state", "ok");
+  await expect(region(page, "可用额度").getByTestId("readout-amount")).toHaveText("$5.00");
+});
+
+test("组织额度用尽而余额仍为正：状态灯写明调用已停止，账单角色的可用额度为零", async ({ page }) => {
+  const world = await seedBillingWorld(stack, { members: ["billing"] }); // balance 10.00
+  const [billing] = world.members;
+  if (!billing) throw new Error("the world has a billing member");
+  // A monthly 0.01 is spent by one call (0.011), long before the balance is.
+  await stack.admin.post(`/admin/tenants/${world.tenantId}/budgets`, { kind: "periodic", period: "month", limit_usd: "0.01" });
+  const api = await ownerApi(world);
+  await paidChat(world);
+  await expect.poll(async () => (await api.get("/api/budgets")).items.find((b: { scope: string }) => b.scope === "team")?.exhausted).toBe(true);
+  expect(await balanceOf(world)).toBeGreaterThan(0);
+  await expect.poll(() => chat(stack, world.key.plaintext, world.model.name), { message: "the gateway refuses the call" }).toBe(429);
+
+  // The billing member, who holds no key: the readout and the lamp both say calls are stopped.
+  await openAccount(page, billing);
+  const balance = region(page, "余额");
+  await expect(balance).toContainText("$9.");
+  await expect(balance.locator("[data-state]")).toHaveAttribute("data-state", "exhausted");
+  await expect(balance).toContainText("组织额度已用尽，调用已停止");
+  await expect(region(page, "可用额度").getByTestId("readout-amount")).toHaveText("$0.00");
+  await page.getByRole("button", { name: "登出" }).click();
+
+  // The owner reads the same lamp.
+  await openAccount(page, world.owner);
+  await expect(region(page, "余额").locator("[data-state]")).toHaveAttribute("data-state", "exhausted");
+  await expect(region(page, "余额")).toContainText("组织额度已用尽，调用已停止");
+});
+
 test("流水分页：加载更多既不重复也不遗漏", async ({ page }) => {
   test.setTimeout(180_000);
   const world = await seedBillingWorld(stack, { creditUsd: "1.00" });

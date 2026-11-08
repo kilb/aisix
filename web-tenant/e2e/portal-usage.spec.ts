@@ -276,11 +276,31 @@ test("成员只看到自己密钥的调用", async ({ page, browser }) => {
   const { log } = await openUsage(page, member);
   await expect(logRows(log)).toHaveCount(1);
   await expect(logRows(log).first().getByRole("cell").nth(3)).not.toHaveText("world-owner-key");
+  // The member's summary counts only the member's own call, at its own charge.
+  const mySummary = page.getByRole("region", { name: "用量汇总" });
+  const mine1 = mySummary.locator("tbody tr");
+  await expect(mine1).toHaveCount(1);
+  await expect(mine1.first().getByRole("cell").nth(2)).toHaveText("1");
+  await expect(mine1.first().getByRole("cell").nth(3)).toHaveText("$0.011");
 
   // The owner, in a browser of their own, sees all three.
   const ownerPage = await (await browser.newContext()).newPage();
   const { log: ownerLog } = await openUsage(ownerPage, world.owner);
   await expect(logRows(ownerLog)).toHaveCount(3);
+});
+
+test("账单角色看到全部调用，但没有密钥筛选和错误提示", async ({ page }) => {
+  const world = await seedBillingWorld(stack, { members: ["billing"] });
+  const billingMember = world.members[0]!;
+  expect(await chat(stack, world.key.plaintext, "chat-ui")).toBe(200);
+  await logged(world.owner, 1);
+
+  const { log, summary } = await openUsage(page, billingMember);
+  await expect(logRows(log)).toHaveCount(1);
+  await expect(summary.getByRole("row").filter({ hasText: "chat-ui" })).toHaveCount(1);
+  await expect(log.getByLabel("密钥", { exact: true })).toHaveCount(0);
+  await expect(summary.getByLabel("密钥", { exact: true })).toHaveCount(0);
+  await expect(page.getByRole("alert")).toHaveCount(0);
 });
 
 test("用量汇总与调用记录一致", async ({ page }) => {
@@ -372,6 +392,50 @@ test("重新计价后，调用的费用显示已调整的金额，汇总计入�
   // The correction counts in the period the call occurred in: $0.011 charged and $0.011 corrected.
   const today = new Date().toISOString().slice(0, 10);
   await expect(summary.getByRole("row").filter({ hasText: today }).getByRole("cell").nth(3)).toHaveText("$0.022");
+});
+
+test("先未计价、后经重新计价的调用，费用显示重新计价的金额", async ({ page }) => {
+  await waitClearOfUtcMidnight();
+  const world = await seedBillingWorld(stack);
+  // A model of its own with no price, granted to the organisation.
+  const name = "chat-ui-unpriced-then-priced";
+  const modelId = await addModel(name);
+  await grant(world, modelId);
+  await gatewayListsModel(world.key.plaintext, name);
+  expect(await chat(stack, world.key.plaintext, name)).toBe(200);
+  await logged(world.owner, 1, true);
+
+  const startsAt = Date.now() + 3_000;
+  await stack.admin.post("/admin/pricing/sell", {
+    model_id: modelId,
+    effective_from: new Date(startsAt).toISOString(),
+    card: { default: { base: { input: "1000", output: "2000" } } },
+  });
+  await expect.poll(() => Date.now() > startsAt + 500).toBe(true);
+  const from = new Date(Date.now() - 3_600_000).toISOString();
+  let runId = "";
+  await expect
+    .poll(
+      async () => {
+        const run = await stack.admin.post("/admin/billing/repricing", {
+          from,
+          to: new Date(Date.now() - 1_000).toISOString(),
+          tenant_id: world.tenantId,
+          reason: "usage page e2e, unpriced call",
+        });
+        runId = run.id;
+        return run.changed;
+      },
+      { message: "a run prices the call", timeout: 30_000 },
+    )
+    .toBe(1);
+  await stack.admin.post(`/admin/billing/repricing/${runId}/apply`, {});
+
+  const { log } = await openUsage(page, world.owner);
+  await expect(logRows(log)).toHaveCount(1);
+  const cell = logRows(log).first().getByRole("cell").nth(7);
+  await expect(cell).toHaveText("$0.011（重新计价）");
+  await expect(cell).not.toContainText("—");
 });
 
 test("汇总的时间范围超过上限时，在日期旁说明，不发出请求", async ({ page }) => {
