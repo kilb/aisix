@@ -10,7 +10,8 @@
 
 mod support;
 
-use chrono::{TimeDelta, Utc};
+use aisix_control_plane::resources::write::RESOURCES_LOCK_KEY;
+use chrono::TimeDelta;
 use serde_json::{json, Value};
 use sqlx::PgPool;
 use support::migrate::{database_at, drop_database, migrate_rest};
@@ -384,6 +385,17 @@ async fn a_rate_is_zero_to_one_hundred_with_four_decimals() {
     }
     let group = create_group(&cp, &admin, body("grp-rate-7c1", "标准", json!("100"))).await;
     let id = id_of(&group);
+    // The rate route answers a JSON number exactly as the group route does.
+    for rate in [json!(7.2), json!("100.0001"), json!(null)] {
+        let r = post_rate(
+            &cp,
+            &admin,
+            &id,
+            json!({"model_id": null, "cny_per_usd": rate, "effective_from": db_now(&cp).await}),
+        )
+        .await;
+        assert_422_at(&r, "/cny_per_usd");
+    }
     // A rate of 0 is a free group, and is written.
     let now = db_now(&cp).await;
     let r = post_rate(
@@ -969,7 +981,13 @@ async fn a_default_group_cannot_be_retired() {
             .expect("the designated default");
     let r = retire(&cp, &admin, &default_id.to_string()).await;
     assert_status(&r, 409, "group_in_use");
-    assert_eq!(r.body["counts"]["default_group"], 1, "{r:?}");
+    // Everything else is 0 on a fresh database, so the designated flag alone
+    // is what refuses the retire.
+    assert_eq!(
+        r.body["counts"],
+        json!({"tenants": 0, "defaults": 0, "keys": 0, "provider_keys": 0, "default_group": 1}),
+        "{r:?}"
+    );
 }
 
 #[tokio::test]
@@ -1062,7 +1080,6 @@ async fn a_group_lists_its_provider_keys() {
         r.body["group"]["provider_keys"],
         json!([{"id": pk, "display_name": "acct-keys-7c1"}])
     );
-    let _ = Utc::now();
 }
 
 /// `group_id` of each key by label, from `tenant_keys`.
@@ -1311,4 +1328,248 @@ async fn retiring_counts_keys_by_their_group() {
     let r = retire(&cp, &admin, &id).await;
     assert_eq!(r.status, 200, "{r:?}");
     assert_eq!(r.body["keys"], 0, "{r:?}");
+}
+
+/// Whether some session is queued for `RESOURCES_LOCK_KEY`.
+async fn resources_lock_queued(pool: &PgPool) -> bool {
+    sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'advisory' AND NOT granted \
+           AND classid::bigint = $1 AND objid::bigint = $2 AND objsubid = 1)",
+    )
+    .bind(RESOURCES_LOCK_KEY >> 32)
+    .bind(RESOURCES_LOCK_KEY & 0xffff_ffff)
+    .fetch_one(pool)
+    .await
+    .expect("read the queued locks")
+}
+
+/// Waits until a session is queued for the resources lock; fails after 10 s.
+async fn until_resources_lock_queued(pool: &PgPool) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !resources_lock_queued(pool).await {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no session queued for the resources lock"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// A provider-key document listing `groups`, as an operator posts it.
+fn provider_key_body(display_name: &str, groups: &[&str]) -> Value {
+    json!({"doc": {
+        "display_name": display_name,
+        "provider": "openai",
+        "api_key": "sk-write-race-7c1",
+        "groups": groups,
+    }})
+}
+
+async fn post_provider_key(cp: &TestCp, who: &OperatorSession, body: Value) -> Resp {
+    cp.send(
+        "POST",
+        "/admin/resources/provider_keys",
+        Some(who.cookie()),
+        Some(body),
+    )
+    .await
+}
+
+/// A provider-key write and a retire of the group it names, raced on the
+/// resources lock, never end with a retired group named by a live provider
+/// key: whichever gets the lock first, the other sees it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_provider_key_write_and_a_retire_never_end_with_a_retired_group_named() {
+    let Some(cp) = TestCp::start_with(|cfg| cfg.db_lock_timeout_ms = 60_000).await else {
+        return;
+    };
+    let admin = cp
+        .admin_login_seeded(aisix_control_plane::auth::OperatorRole::Operator)
+        .await;
+    let group = create_group(
+        &cp,
+        &admin,
+        body("grp-write-race-7c1", "标准", json!("7.2")),
+    )
+    .await;
+    let id = id_of(&group);
+
+    // The write gets the resources lock first: it commits, and the retire
+    // then counts it and refuses.
+    {
+        let mut holder = cp.db().pool().begin().await.expect("begin");
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(RESOURCES_LOCK_KEY)
+            .execute(&mut *holder)
+            .await
+            .expect("hold the resources lock");
+        let cookie = admin.cookie().to_string();
+        let url = cp.url("/admin/resources/provider_keys");
+        let write = tokio::spawn(async move {
+            reqwest::Client::builder()
+                .no_proxy()
+                .build()
+                .expect("an HTTP client")
+                .post(url)
+                .header(reqwest::header::COOKIE, cookie)
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .json(&provider_key_body(
+                    "acct-first-7c1",
+                    &["grp-write-race-7c1"],
+                ))
+                .send()
+                .await
+                .expect("send the write")
+                .status()
+                .as_u16()
+        });
+        until_resources_lock_queued(cp.db().pool()).await;
+        // The retire takes the group row and then the resources lock, so it
+        // is behind the write.
+        let retire_cp = &cp;
+        let cookie = admin.cookie().to_string();
+        let retire_url = cp.url(&format!("{GROUPS}/{id}/retire"));
+        let retire_request = tokio::spawn(async move {
+            reqwest::Client::builder()
+                .no_proxy()
+                .build()
+                .expect("an HTTP client")
+                .post(retire_url)
+                .header(reqwest::header::COOKIE, cookie)
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body("{}")
+                .send()
+                .await
+                .expect("send the retire")
+                .status()
+                .as_u16()
+        });
+        let _ = retire_cp;
+        holder.commit().await.expect("release the resources lock");
+        assert_eq!(write.await.expect("join the write"), 201);
+        assert_eq!(retire_request.await.expect("join the retire"), 409);
+    }
+    let r = rates(&cp, &admin, &id).await;
+    assert_eq!(
+        r["group"]["provider_keys"][0]["display_name"],
+        "acct-first-7c1"
+    );
+
+    // The retire gets it first: it retires, and the write naming the group
+    // is refused, so no live provider key is left naming a retired group.
+    let group = create_group(
+        &cp,
+        &admin,
+        body("grp-write-late-7c1", "标准", json!("7.2")),
+    )
+    .await;
+    let id = id_of(&group);
+    let r = post_provider_key(
+        &cp,
+        &admin,
+        provider_key_body("acct-second-7c1", &["grp-write-late-7c1"]),
+    )
+    .await;
+    assert_eq!(
+        r.status, 201,
+        "the group is live, so the account joins it: {r:?}"
+    );
+    // Clear it, so the group has no account and can retire.
+    let pk = r.body["id"]
+        .as_str()
+        .expect("a provider key id")
+        .to_string();
+    let version: i64 = sqlx::query_scalar(
+        "SELECT version FROM gw_resources WHERE kind = 'provider_keys' AND id = $1",
+    )
+    .bind(Uuid::parse_str(&pk).expect("a provider key id"))
+    .fetch_one(cp.db().pool())
+    .await
+    .expect("the provider key's version");
+    let response = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("an HTTP client")
+        .delete(cp.url(&format!("/admin/resources/provider_keys/{pk}")))
+        .header(reqwest::header::COOKIE, admin.cookie())
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .header(reqwest::header::IF_MATCH, format!("\"{version}\""))
+        .send()
+        .await
+        .expect("send the delete");
+    assert_eq!(response.status(), 200);
+    let r = retire(&cp, &admin, &id).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let r = post_provider_key(
+        &cp,
+        &admin,
+        provider_key_body("acct-third-7c1", &["grp-write-late-7c1"]),
+    )
+    .await;
+    assert_422_at(&r, "/groups/0");
+    let live: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM gw_resources WHERE kind = 'provider_keys' AND NOT deleted \
+           AND doc->'groups' ? 'grp-write-late-7c1'",
+    )
+    .fetch_one(cp.db().pool())
+    .await
+    .expect("count the live provider keys");
+    assert_eq!(live, 0, "no live provider key names the retired group");
+}
+
+/// The migration's own designation block, read from the file, applied as a
+/// replay would apply it: the test pins the SQL that ships, not a copy.
+async fn apply_designation(pool: &PgPool) -> Result<(), sqlx::Error> {
+    let sql = std::fs::read_to_string(format!(
+        "{}/migrations/0023_provider_groups.sql",
+        env!("CARGO_MANIFEST_DIR")
+    ))
+    .expect("read 0023");
+    let start = sql
+        .find("-- designation: begin")
+        .expect("the block's start")
+        + "-- designation: begin".len();
+    let end = sql.find("-- designation: end").expect("the block's end");
+    sqlx::raw_sql(&sql[start..end]).execute(pool).await?;
+    Ok(())
+}
+
+/// The designation leaves a designated default, even when a database already
+/// carries a retired group named `default` and the block runs again: a live
+/// group becomes the default rather than none.
+#[tokio::test]
+async fn designation_leaves_a_live_default_even_when_default_is_retired() {
+    let Some(pool) = database_at(23).await else {
+        return;
+    };
+    // The state a replayed designation meets: a retired `default` that is
+    // still flagged, and a live group that must become the designated one.
+    sqlx::query(
+        "UPDATE provider_groups SET retired_at = now(), is_default = true WHERE name = 'default'",
+    )
+    .execute(&pool)
+    .await
+    .expect("retire the default group");
+    sqlx::query(
+        "INSERT INTO provider_groups (name, display_name) VALUES ('grp-live-7c1', 'live-7c1')",
+    )
+    .execute(&pool)
+    .await
+    .expect("a live group");
+
+    apply_designation(&pool)
+        .await
+        .expect("the designation leaves a default");
+
+    let designated: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM provider_groups WHERE is_default ORDER BY name")
+            .fetch_all(&pool)
+            .await
+            .expect("read the designated group");
+    assert_eq!(
+        designated,
+        vec!["grp-live-7c1".to_string()],
+        "a retired `default` does not block designating a live group"
+    );
+    drop_database(pool).await;
 }

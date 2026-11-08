@@ -29,12 +29,36 @@ INSERT INTO provider_groups (name, display_name)
       (SELECT value->'default_provider_groups' FROM cp_settings WHERE key = 'tenant_defaults'),
       '["shared"]'))
   ) names WHERE btrim(name) <> '';
--- The designated default group. A backfilled `default` becomes it; otherwise
--- one is inserted. It gets no rate, like every backfilled group.
+-- designation: begin
+-- The designated default group. A backfilled live `default` becomes it;
+-- otherwise `default` / 默认 is inserted, unless a row already carries that
+-- name (a retired one, which keeps it). It gets no rate, like every
+-- backfilled group.
+--
+-- A database that ends this migration without a designated default would
+-- leave `0024` matching no row, silently assigning no internal key a group,
+-- so the DO block below refuses that state instead.
+-- A retired group is never the designated default, whoever retired it.
+UPDATE provider_groups SET is_default = false WHERE retired_at IS NOT NULL;
 UPDATE provider_groups SET is_default = true WHERE name = 'default' AND retired_at IS NULL;
 INSERT INTO provider_groups (name, display_name, is_default)
   SELECT 'default', '默认', true
-  WHERE NOT EXISTS (SELECT 1 FROM provider_groups WHERE is_default);
+  WHERE NOT EXISTS (SELECT 1 FROM provider_groups WHERE name = 'default')
+    AND NOT EXISTS (SELECT 1 FROM provider_groups WHERE is_default);
+-- Any other live group becomes the designated default when neither step
+-- above could: a retired `default` keeps its name, and some live group must
+-- be the one an upgrade hands the internal keys.
+UPDATE provider_groups SET is_default = true
+  WHERE id = (SELECT id FROM provider_groups WHERE retired_at IS NULL
+              ORDER BY name, id LIMIT 1)
+    AND NOT EXISTS (SELECT 1 FROM provider_groups WHERE is_default);
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM provider_groups WHERE is_default) THEN
+    RAISE EXCEPTION '0023 leaves no designated default group: every provider group is retired';
+  END IF;
+END $$;
+-- designation: end
 -- Rates: CNY per USD in ten-thousandths, per (group, model), with the
 -- group's model-less row as its default. Append-only, like every price.
 CREATE TABLE pricing_group_rates (

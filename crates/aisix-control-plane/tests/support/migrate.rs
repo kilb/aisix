@@ -68,9 +68,9 @@ pub async fn migrate_rest(pool: &PgPool) -> Result<(), sqlx::migrate::MigrateErr
         .acquire()
         .await
         .expect("a connection of the new database");
-    let mut migrator = sqlx::migrate!("./migrations");
-    migrator.set_ignore_missing(true);
-    migrator.run(&mut *conn).await
+    // No `ignore_missing`, as a boot has none: a migration deleted from disk
+    // after being applied fails here too.
+    sqlx::migrate!("./migrations").run(&mut *conn).await
 }
 
 /// Closes `pool` and drops the database behind it.
