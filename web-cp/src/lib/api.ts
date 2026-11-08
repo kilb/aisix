@@ -594,3 +594,25 @@ export const providerGroups = {
     return (await call<{ items: ProviderGroup[] }>("GET", "/admin/provider-groups")).data.items;
   },
 };
+
+/** One entry of the built-in price catalogue: a model's public list prices and where they came from. */
+export interface CatalogueEntry {
+  /** `<provider>/<model_name>`. */
+  key: string;
+  aliases: string[];
+  source_url: string;
+  /** The day the provider's page was read (`YYYY-MM-DD`). */
+  as_of: string;
+  /** The first UTC day these rates apply; null means from the beginning. */
+  effective_from: string | null;
+  notes: string | null;
+  /** The entry's rate card, as the control plane stores it. */
+  card: Record<string, unknown>;
+}
+
+/** The built-in price catalogue. */
+export const catalogue = {
+  async entries(): Promise<{ version: number; items: CatalogueEntry[] }> {
+    return (await call<{ version: number; items: CatalogueEntry[] }>("GET", "/admin/pricing/catalogue")).data;
+  },
+};
