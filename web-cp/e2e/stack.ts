@@ -107,6 +107,16 @@ export class ApiClient {
     return this.ok("PUT", path, body, version);
   }
 
+  /** A live provider group named `name`; its view. */
+  createGroup(name: string, displayName: string, cnyPerUsd = "1"): Promise<Json> {
+    return this.post("/admin/provider-groups", {
+      name,
+      display_name: displayName,
+      description: "e2e 分组",
+      default_cny_per_usd: cnyPerUsd,
+    });
+  }
+
   patch(path: string, body: unknown, version?: number): Promise<Json> {
     return this.ok("PATCH", path, body, version);
   }

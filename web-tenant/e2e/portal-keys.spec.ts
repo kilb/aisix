@@ -25,6 +25,9 @@ const GATEWAY_TEST_MS = 90_000;
 const SECRET_NOTICE = "明文只显示这一次";
 
 test.beforeAll(async () => {
+
+  test.setTimeout(STACK_START_TIMEOUT_MS);
+  stack = await startStack();
   // Every write that names a group names a live one: the accounts and the
   // tenant edits below included. A name a test here creates itself is
   // skipped.
@@ -33,20 +36,17 @@ test.beforeAll(async () => {
     for (const name of names) {
       if (seededGroups.has(name)) continue;
       seededGroups.add(name);
-      const r = await stack.admin.post("/admin/provider-groups", {
+      const r = await stack.admin.request("POST", "/admin/provider-groups", {
         name,
         display_name: name,
         default_cny_per_usd: "1",
       });
-      if (r.status !== 201 && r.status !== 422) {
+      if (r.status !== 201) {
         throw new Error(`creating group ${name} answered ${r.status}: ${r.text}`);
       }
     }
   };
   await seedGroups(["grp-eu-5d2"]);
-
-  test.setTimeout(STACK_START_TIMEOUT_MS);
-  stack = await startStack();
   // The platform's catalog: one upstream account, in the default group the
   // tenants here reach and in a second, named group, and one model on it.
   const account = await stack.admin.post("/admin/resources/provider_keys", {

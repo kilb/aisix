@@ -68,9 +68,11 @@ const catalogues = new WeakMap<Stack, Catalogue>();
 function catalogueOf(stack: Stack, opts: WorldOptions): Catalogue {
   let c = catalogues.get(stack);
   if (!c) {
-    // The account names only live groups, so the second one exists first.
-    const group = stack.admin.createGroup("grp-ui-5d2", "UI 分组 5d2");
-    const account = group
+    // The account names only live groups, so they exist first. It is also in
+    // the group the platform's own keys mint into (`internalKey`), which
+    // reaches only that group's accounts.
+    const groups = Promise.all([stack.admin.createGroup("grp-ui-5d2", "UI 分组 5d2"), internalGroupId(stack)]);
+    const account = groups
       .then(() =>
         stack.admin.post("/admin/resources/provider_keys", {
           doc: {
@@ -78,7 +80,7 @@ function catalogueOf(stack: Stack, opts: WorldOptions): Catalogue {
             provider: "openai",
             api_key: "sk-acct-ui-7c1-upstream",
             api_base: `${stack.mockUpstreamUrl}/v1`,
-            groups: ["shared", "grp-ui-5d2"],
+            groups: ["shared", "grp-ui-5d2", INTERNAL_GROUP],
           },
         }),
       )
@@ -136,13 +138,14 @@ function sleep(ms: number): Promise<void> {
  * no assignment list to take it from, and the operator API's group list
  * answers names.
  */
+const INTERNAL_GROUP = "grp-internal-ui-7c1";
 const internalGroups = new WeakMap<Stack, Promise<string>>();
 export function internalGroupId(stack: Stack): Promise<string> {
   let group = internalGroups.get(stack);
   if (!group) {
     group = stack.admin
       .post("/admin/provider-groups", {
-        name: "grp-internal-ui-7c1",
+        name: INTERNAL_GROUP,
         display_name: "平台自用 7c1",
         description: "e2e 内部租户的密钥",
         default_cny_per_usd: "7.2",

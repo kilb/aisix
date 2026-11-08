@@ -12,6 +12,9 @@ import { STACK_START_TIMEOUT_MS, startStack, type Json, type Stack } from "./sta
 let stack: Stack;
 
 test.beforeAll(async () => {
+
+  test.setTimeout(STACK_START_TIMEOUT_MS);
+  stack = await startStack();
   // Every write that names a group names a live one: the accounts and the
   // tenant edits below included. A name a test here creates itself is
   // skipped.
@@ -20,20 +23,20 @@ test.beforeAll(async () => {
     for (const name of names) {
       if (seededGroups.has(name)) continue;
       seededGroups.add(name);
-      const r = await stack.admin.post("/admin/provider-groups", {
+      const r = await stack.admin.request("POST", "/admin/provider-groups", {
         name,
         display_name: name,
         default_cny_per_usd: "1",
       });
-      if (r.status !== 201 && r.status !== 422) {
+      if (r.status !== 201) {
         throw new Error(`creating group ${name} answered ${r.status}: ${r.text}`);
       }
     }
   };
-  await seedGroups(["grp-alpha-7c1", "grp-beta-3e9", "grp-covered-6b2", "grp-dflt-8a3", "grp-idle-4e1", "grp-internal-keep-7c1", "grp-solo-6b2", "grp-swap-a1c", "grp-x-41f", "grp-y-92c"]);
-
-  test.setTimeout(STACK_START_TIMEOUT_MS);
-  stack = await startStack();
+  // The groups a test here creates itself (`grp-internal-keep-7c1`,
+  // `grp-solo-6b2`, `grp-covered-6b2`, `grp-swap-a1c`, `grp-idle-4e1`) are
+  // not seeded here: the edit that creates one also asserts what it answered.
+  await seedGroups(["grp-alpha-7c1", "grp-beta-3e9", "grp-dflt-8a3", "grp-x-41f", "grp-y-92c"]);
 });
 
 test.afterAll(async () => {
@@ -173,6 +176,17 @@ test("新建上游账号的默认分组跟随平台设置", async ({ page }) => 
 });
 
 test("只改分组不碰密钥：网关发给上游的仍是原来的密钥", async ({ page }) => {
+  const { items: tenants } = await stack.admin.get("/admin/tenants");
+  const internal = (tenants as Json[]).find((t) => t.is_internal);
+  expect(internal, JSON.stringify(tenants)).toBeDefined();
+  // Every key names one group, and the platform's own tenant has no
+  // assignment list to take it from: this group holds the account too. An
+  // account lists only live groups, so it exists before the account.
+  const group = await stack.admin.post("/admin/provider-groups", {
+    name: "grp-internal-keep-7c1",
+    display_name: "保留自用 7c1",
+    default_cny_per_usd: "7.2",
+  });
   const created = await createAccount({
     display_name: "acct-keep-e2e",
     provider: "openai",
@@ -182,16 +196,6 @@ test("只改分组不碰密钥：网关发给上游的仍是原来的密钥", as
   });
   await stack.admin.post("/admin/resources/models", {
     doc: { display_name: "chat-keep-e2e", provider: "openai", model_name: "gpt-4o-mini", provider_key_id: created.id },
-  });
-  const { items: tenants } = await stack.admin.get("/admin/tenants");
-  const internal = (tenants as Json[]).find((t) => t.is_internal);
-  expect(internal, JSON.stringify(tenants)).toBeDefined();
-  // Every key names one group, and the platform's own tenant has no
-  // assignment list to take it from: this group holds the account too.
-  const group = await stack.admin.post("/admin/provider-groups", {
-    name: "grp-internal-keep-7c1",
-    display_name: "保留自用 7c1",
-    default_cny_per_usd: "7.2",
   });
   const { plaintext } = await stack.admin.post(`/admin/tenants/${internal.id}/keys`, {
     label: "keep-e2e",
@@ -339,24 +343,14 @@ test("删除上游账号要两步确认：取消不删，确认后才删", async
 });
 
 test("移除分组前，点名因此用不到该账号的租户与密钥；取消则不保存", async ({ page }) => {
-  const created = await createAccount({
-    display_name: "acct-solo-e2e",
-    provider: "openai",
-    api_key: "sk-e2e-solo-upstream-6b2",
-    groups: ["shared", "grp-solo-6b2", "grp-covered-6b2"],
-  });
-  // A tenant may only be assigned a group that exists, and a key names it by
-  // id.
+  // A tenant may only be assigned a group that exists, an account may only
+  // list one, and a key names it by id.
   const soloGroup = await stack.admin.post("/admin/provider-groups", {
     name: "grp-solo-6b2",
     display_name: "单租户 6b2",
     default_cny_per_usd: "7.2",
   });
   const soloGroupId: string = soloGroup.id;
-  // Reaches the account only through grp-solo-6b2, with a key that follows it: loses it.
-  const solo = await stack.admin.post("/admin/tenants", { name: "tenant-solo-e2e" });
-  await stack.admin.patch(`/admin/tenants/${solo.id}`, { allowed_provider_groups: ["grp-solo-6b2"] }, solo.version);
-  await stack.admin.post(`/admin/tenants/${solo.id}/keys`, { label: "key-follows-e2e" });
   // Its groups lose the account, but its only key names a group that keeps
   // it: every key names one group from creation.
   const keepGroup = await stack.admin.post("/admin/provider-groups", {
@@ -364,6 +358,16 @@ test("移除分组前，点名因此用不到该账号的租户与密钥；取�
     display_name: "已覆盖 6b2",
     default_cny_per_usd: "7.2",
   });
+  const created = await createAccount({
+    display_name: "acct-solo-e2e",
+    provider: "openai",
+    api_key: "sk-e2e-solo-upstream-6b2",
+    groups: ["shared", "grp-solo-6b2", "grp-covered-6b2"],
+  });
+  // Reaches the account only through grp-solo-6b2, with a key that follows it: loses it.
+  const solo = await stack.admin.post("/admin/tenants", { name: "tenant-solo-e2e" });
+  await stack.admin.patch(`/admin/tenants/${solo.id}`, { allowed_provider_groups: ["grp-solo-6b2"] }, solo.version);
+  await stack.admin.post(`/admin/tenants/${solo.id}/keys`, { label: "key-follows-e2e" });
   const covered = await stack.admin.post("/admin/tenants", { name: "tenant-covered-e2e" });
   await stack.admin.patch(
     `/admin/tenants/${covered.id}`,
@@ -425,15 +429,16 @@ test("移除分组前，点名因此用不到该账号的租户与密钥；取�
 });
 
 test("取消后改为移除另一个分组：确认框只列这一次的影响，没人用的分组确认后移除", async ({ page }) => {
+  // Uses grp-swap-a1c; nobody uses grp-idle-4e1. An account lists only live
+  // groups, so both exist before it.
+  await stack.admin.post("/admin/provider-groups", { name: "grp-swap-a1c", display_name: "换组 a1c", default_cny_per_usd: "7.2" });
+  await stack.admin.post("/admin/provider-groups", { name: "grp-idle-4e1", display_name: "闲置 4e1", default_cny_per_usd: "7.2" });
   const created = await createAccount({
     display_name: "acct-swap-e2e",
     provider: "openai",
     api_key: "sk-e2e-swap-upstream-a1c",
     groups: ["shared", "grp-swap-a1c", "grp-idle-4e1"],
   });
-  // Uses grp-swap-a1c; nobody uses grp-idle-4e1.
-  await stack.admin.post("/admin/provider-groups", { name: "grp-swap-a1c", display_name: "换组 a1c", default_cny_per_usd: "7.2" });
-  await stack.admin.post("/admin/provider-groups", { name: "grp-idle-4e1", display_name: "闲置 4e1", default_cny_per_usd: "7.2" });
   const swap = await stack.admin.post("/admin/tenants", { name: "tenant-swap-e2e" });
   await stack.admin.patch(`/admin/tenants/${swap.id}`, { allowed_provider_groups: ["grp-swap-a1c"] }, swap.version);
   await stack.admin.post(`/admin/tenants/${swap.id}/keys`, { label: "key-swap-e2e" });

@@ -16,6 +16,10 @@
 //! document) takes [`lock_billing`] instead, which adds the tenant's billing
 //! account between the two. Every other edit leaves the account alone, so it
 //! never holds up the tenant's usage intake, which locks accounts only.
+//! A write that names provider groups takes their rows `FOR SHARE` straight
+//! after the tenant's and before the resources lock
+//! ([`crate::groups::lock_named`]), so it and a retire of the same group
+//! serialise on the group's own row.
 //!
 //! A lookup by id answers `404 not_found` for an id that names no tenant,
 //! the same answer whatever the reason, so the tenant routes built on these
