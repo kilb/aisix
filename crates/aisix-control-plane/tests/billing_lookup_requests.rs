@@ -786,8 +786,9 @@ async fn a_lookup_past_its_statement_timeout_answers_503() {
 }
 
 /// Intake stores a row's request id on its charge too, as the usage row
-/// stores it, and the lookup and the call log find a charge by the id it
-/// carries, among its own tenant's charges (`pricing_charges_tenant_request`).
+/// stores it, and so does the database for a writer that leaves it out; the
+/// lookup and the call log find a charge by the id it carries, among its own
+/// tenant's charges (`pricing_charges_tenant_request`).
 #[tokio::test]
 async fn a_charge_carries_its_rows_request_id() {
     let Some(w) = world().await else { return };
@@ -833,8 +834,9 @@ async fn a_charge_carries_its_rows_request_id() {
         "{defs:?}"
     );
 
-    // A charge whose own request id is unset is not found by the id its
-    // usage row carries: both views read the charge's.
+    // A charge an older writer inserts, one that predates the column and so
+    // leaves it out, still carries its usage row's request id: both views
+    // find it.
     sqlx::query(
         "INSERT INTO usage_events (event_id, dp_id, batch_id, occurred_at, team_id, api_key_id, \
          request_id, event) \
@@ -859,22 +861,76 @@ async fn a_charge_carries_its_rows_request_id() {
     .bind(t0)
     .execute(w.cp.db().pool())
     .await
-    .expect("insert the charge");
+    .expect("insert the charge as an older writer does");
     let owner = w.cp.member_login_seeded(w.tenant, MemberRole::Owner).await;
-    let calls =
-        w.cp.send(
-            "GET",
-            "/api/usage/calls?request_id=req-lk-raw",
-            Some(owner.cookie()),
-            None,
-        )
-        .await;
-    assert_eq!(calls.status, 200, "{calls:?}");
-    assert_eq!(calls.body["items"], json!([]), "{calls:?}");
-    assert_eq!(lookup(&w.dp, &w.key, "req-lk-raw").await.status, 404);
-    sqlx::query("UPDATE pricing_charges SET request_id = 'req-lk-raw' WHERE event_id = 'rq-raw'")
-        .execute(w.cp.db().pool())
-        .await
-        .expect("set the charge's request id");
-    assert_eq!(items(&lookup(&w.dp, &w.key, "req-lk-raw").await).len(), 1);
+    let found = |n: usize| {
+        let (w, owner) = (&w, &owner);
+        async move {
+            let calls =
+                w.cp.send(
+                    "GET",
+                    "/api/usage/calls?request_id=req-lk-raw",
+                    Some(owner.cookie()),
+                    None,
+                )
+                .await;
+            assert_eq!(calls.status, 200, "{calls:?}");
+            assert_eq!(
+                calls.body["items"].as_array().map(Vec::len),
+                Some(n),
+                "{calls:?}"
+            );
+            let r = lookup(&w.dp, &w.key, "req-lk-raw").await;
+            if n == 0 {
+                assert_eq!(r.status, 404, "{r:?}");
+            } else {
+                assert_eq!(items(&r).len(), n, "{r:?}");
+            }
+        }
+    };
+    found(1).await;
+
+    // Both views go by the charge's own request id, not its usage row's.
+    let set = |value: Option<&'static str>| {
+        let w = &w;
+        async move {
+            sqlx::query("UPDATE pricing_charges SET request_id = $1 WHERE event_id = 'rq-raw'")
+                .bind(value)
+                .execute(w.cp.db().pool())
+                .await
+                .expect("set the charge's request id");
+        }
+    };
+    set(None).await;
+    found(0).await;
+    set(Some("req-lk-raw")).await;
+    found(1).await;
+}
+
+/// The lookup's statement timeout is its transaction's own: every pooled
+/// connection, the one the lookup ran on among them, keeps the pool's
+/// configured timeout afterwards, so intake on it is not cut short.
+#[tokio::test]
+async fn a_lookups_statement_timeout_ends_with_its_transaction() {
+    let Some(w) = world().await else { return };
+    let m = model(&w, "chat-bill", true).await;
+    let t0 = base(&w.cp).await;
+    send_all(&w, vec![row(&w, "te-1", "req-lk-8d1", m, t0, tokens_680())]).await;
+    assert_eq!(items(&lookup(&w.dp, &w.key, "req-lk-8d1").await).len(), 1);
+    let pool = w.cp.db().pool();
+    let idle = pool.num_idle();
+    assert!(idle > 0, "no idle connection to check");
+    let mut held = Vec::new();
+    for _ in 0..idle {
+        let mut c = pool.acquire().await.expect("acquire");
+        let timeout: String = sqlx::query_scalar("SHOW statement_timeout")
+            .fetch_one(&mut *c)
+            .await
+            .expect("show statement_timeout");
+        assert_eq!(
+            timeout, "30s",
+            "a lookup's timeout outlived its transaction"
+        );
+        held.push(c);
+    }
 }
