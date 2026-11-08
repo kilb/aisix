@@ -168,12 +168,19 @@ export interface Stack {
   /** A fresh client with no session, for `/api` (sign up or log in first). */
   tenant(): ApiClient;
   /**
-   * One statement against this stack's own control-plane database, for a
-   * state no API write produces: a tenant an earlier release left without a
-   * live group, and a key an older replica minted without one. Never a
-   * stand-in for a route under test.
+   * Leaves tenant `id` naming no group, the state a release before groups
+   * left a customer in. No API write produces it (an empty list is refused,
+   * and a last group cannot be retired out from under its tenant), so a spec
+   * that needs it sets the row directly. Named for that one state, never a
+   * general escape hatch: a route under test is driven through the API.
    */
-  sql(statement: string): string;
+  clearTenantGroups(id: string): void;
+  /**
+   * Leaves key `id` without a group, the state migration 0024 leaves a key
+   * it cannot read. No API write produces it either (every create names a
+   * group), so a spec that needs it sets the row directly.
+   */
+  clearKeyGroup(id: string): void;
   stop(): Promise<void>;
 }
 
@@ -289,6 +296,14 @@ async function waitServing(url: string): Promise<void> {
 /** `psql`, or what `CP_E2E_PSQL` names. */
 const PSQL = process.env.CP_E2E_PSQL || "psql";
 
+/** A UUID, the only shape [`Stack.clearTenantGroups`] and [`Stack.clearKeyGroup`] interpolate. */
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function uuidArg(id: string): string {
+  if (!UUID.test(id)) throw new Error(`${id} is not a uuid`);
+  return id;
+}
+
 function sqlAgainst(database: string, statement: string): string {
   const pgUrl = process.env.CP_E2E_PG_URL;
   if (!pgUrl) throw new Error("CP_E2E_PG_URL is not set");
@@ -360,7 +375,13 @@ export async function startStack(): Promise<Stack> {
       operator: ready.operator,
       admin,
       tenant: () => new ApiClient(ready.httpUrl),
-      sql: (statement: string) => sqlAgainst(ready.cpDatabase, statement),
+      clearTenantGroups: (id: string) =>
+        sqlAgainst(
+          ready.cpDatabase,
+          `UPDATE tenants SET allowed_provider_groups = '{}' WHERE id = '${uuidArg(id)}'`,
+        ),
+      clearKeyGroup: (id: string) =>
+        sqlAgainst(ready.cpDatabase, `UPDATE tenant_keys SET group_id = NULL WHERE id = '${uuidArg(id)}'`),
       stop,
     };
   } catch (e) {

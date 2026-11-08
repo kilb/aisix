@@ -105,10 +105,15 @@ export function Keys({
       await change();
     } catch (e) {
       if (e instanceof ApiError && e.code === "tenant_not_active") onSelfChanged();
+      // A refused body's own details are the only text that says why: the
+      // group refusal ("密钥的分组创建后不能更改…", "分组不存在或不可用") is a
+      // 422 whose message alone is the canned 提交的内容未通过校验.
       setActionErr(
         e instanceof ApiError && e.code === "version_mismatch"
           ? "该密钥已被他人修改，列表已重新载入，请再操作一次"
-          : failure(e),
+          : e instanceof ApiError
+            ? formMessageFor(e)
+            : failure(e),
       );
     } finally {
       setBusy(null);
@@ -554,14 +559,23 @@ function NewKeyForm({
             ) : groups.length === 0 ? (
               <span className="hint">运营尚未为本组织分配分组。请联系平台运营分配分组后，再新建密钥。</span>
             ) : (
-              <div className="picks">
+              <div className="picks picks-cards">
                 {groups.map((g) => (
                   <label key={g.id} className="pick">
                     <input
                       type="radio"
                       name={`${id}-group`}
                       checked={group === g.id}
-                      onChange={() => setGroup(g.id)}
+                      onChange={() => {
+                        setGroup(g.id);
+                        // The refusal belonged to an empty choice; one made
+                        // is not refused any more.
+                        setErrs((was) => {
+                          if (!was.group) return was;
+                          const { group: _, ...rest } = was;
+                          return rest;
+                        });
+                      }}
                     />
                     <span className="pick-text">
                       <strong>{g.display_name}</strong>
