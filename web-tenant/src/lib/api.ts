@@ -508,3 +508,84 @@ export const budgets = {
     await call<null>("DELETE", `/budgets/${at(id)}`);
   },
 };
+
+// ── usage: the call log and the summary ─────────────────────────────────────
+
+/** A model as a call or a summary row names it; `id` is null once it is not in the organisation's grants. */
+export interface UsageModel {
+  id: string | null;
+  name: string;
+}
+
+export type CallStatus = "succeeded" | "retried" | "failed";
+
+/** What a call's charge is: `pending` waits for a price. */
+export type CallChargeStatus = "charged" | "exempt" | "nothing_to_bill" | "pending";
+
+/** One billed quantity of a call: `rate` is dollars per million units, as the price card wrote it. */
+export interface ChargeLine {
+  dimension: string;
+  quantity: number;
+  rate: string;
+}
+
+export interface CallCharge {
+  status: CallChargeStatus;
+  amount_micro_usd: number | null;
+  /** The sum of the re-pricing corrections of this call; 0 when none. */
+  adjusted_micro_usd: number;
+  estimated: boolean;
+  lines: ChargeLine[];
+}
+
+/** `Call`: one call of the organisation, with nothing of the platform's channel. */
+export interface Call {
+  event_id: string;
+  occurred_at: string;
+  request_id: string | null;
+  model: UsageModel;
+  api_key: { id: string; label: string; prefix: string };
+  member: { id: string; display_name: string | null } | null;
+  status: CallStatus;
+  /** A fixed vocabulary, set when `status` is `failed`. */
+  error_class: string | null;
+  cache_hit: boolean;
+  charge: CallCharge;
+}
+
+export interface CallsQuery {
+  from?: string;
+  to?: string;
+  api_key_id?: string;
+  model_id?: string;
+  request_id?: string;
+  limit?: number;
+  before?: number;
+}
+
+/** One period and model of the summary; the period is by when the usage occurred. */
+export interface UsageSummaryRow {
+  period_start: string;
+  model: UsageModel;
+  requests: number;
+  charged_micro_usd: number;
+  estimated_requests: number;
+  quantities: Record<string, number>;
+}
+
+export interface UsageSummaryQuery {
+  group: "day" | "month";
+  from: string;
+  to: string;
+  api_key_id?: string;
+  model_id?: string;
+}
+
+/** The call log, newest first; `next_before` is the cursor of the next page, null on the last. */
+export async function usageCalls(q: CallsQuery): Promise<{ items: Call[]; next_before: number | null }> {
+  return (await call<{ items: Call[]; next_before: number | null }>("GET", `/usage/calls${queryOf({ ...q })}`)).data;
+}
+
+export async function usageSummary(q: UsageSummaryQuery): Promise<UsageSummaryRow[]> {
+  return (await call<{ items: UsageSummaryRow[] }>("GET", `/usage/summary${queryOf({ ...q })}`)).data.items;
+}

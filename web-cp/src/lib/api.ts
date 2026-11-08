@@ -1072,3 +1072,61 @@ export const pricingStatus = {
     return (await call<PricingStatus>("GET", "/admin/pricing/status")).data;
   },
 };
+
+/** One tenant's part of a re-pricing run. Amounts are integer micro-dollars. */
+export interface RepricingTenant {
+  tenant_id: string;
+  tenant_name: string;
+  /** The selected calls filed under the tenant. */
+  events: number;
+  changed: number;
+  /** Positive: the tenant was charged too little before; negative: too much. */
+  delta_micro_usd: number;
+}
+
+/** A re-pricing run: previewed with its totals, then (by an admin) applied. */
+export interface RepricingRun {
+  id: string;
+  status: "previewed" | "applied";
+  filter: { from: string; to: string; model_id: string | null; tenant_id: string | null; status: string | null };
+  reason: string;
+  events: number;
+  changed: number;
+  still_unpriced: number;
+  skipped_unattributed: number;
+  delta_micro_usd: number;
+  by_tenant: RepricingTenant[];
+  created_by: { id: string; email: string };
+  created_at: string;
+  applied_by: { id: string; email: string | null } | null;
+  applied_at: string | null;
+}
+
+export interface RepricingFilterInput {
+  from: string;
+  to: string;
+  model_id?: string;
+  tenant_id?: string;
+  status?: string;
+  reason: string;
+}
+
+/** Re-pricing: correcting past charges at the prices in force now. */
+export const repricing = {
+  /** One page of runs, newest first; `before` is the previous page's `next_before`. */
+  async list(before?: number): Promise<{ items: RepricingRun[]; next_before: number | null }> {
+    const query = before === undefined ? "" : `?before=${before}`;
+    return (await call<{ items: RepricingRun[]; next_before: number | null }>("GET", `/admin/billing/repricing${query}`)).data;
+  },
+  /** Prices the selected calls again and stores the run as `previewed`. Posts nothing. */
+  async preview(f: RepricingFilterInput): Promise<RepricingRun> {
+    return (await call<RepricingRun>("POST", "/admin/billing/repricing", f)).data;
+  },
+  async get(id: string): Promise<RepricingRun> {
+    return (await call<RepricingRun>("GET", `/admin/billing/repricing/${seg(id)}`)).data;
+  },
+  /** Admin only. Moves money. `409 stale_preview` when prices or the selected calls changed since the preview; `409 run_state` when it is no longer `previewed`. */
+  async apply(id: string): Promise<RepricingRun> {
+    return (await call<RepricingRun>("POST", `/admin/billing/repricing/${seg(id)}/apply`, {})).data;
+  },
+};
