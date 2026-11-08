@@ -1636,6 +1636,59 @@ async fn a_bad_price_is_422_with_the_field_path() {
     assert_eq!(pricing_version(&w.cp).await, version);
 }
 
+/// `platform=true` lists the platform's own prices only: a tenant's override
+/// revisions, ended ones included, are left out and do not shorten a page.
+#[tokio::test]
+async fn the_platform_filter_leaves_tenant_overrides_out_of_the_sell_history() {
+    let Some(w) = world().await else { return };
+    let model = seed_model(&w.cp, &w.admin).await;
+    let card = |rate: &str| json!({"default": {"base": {"input": rate, "output": "2"}}});
+    let mut platform_ids = Vec::new();
+    for body in [
+        json!({"model_id": model, "effective_from": db_now(&w.cp).await, "card": card("1")}),
+        json!({"model_id": model, "tenant_id": w.tenant, "effective_from": db_now(&w.cp).await, "card": card("9")}),
+        json!({"model_id": model, "tenant_id": w.tenant, "effective_from": db_now(&w.cp).await, "card": null}),
+        json!({"model_id": model, "effective_from": db_now(&w.cp).await, "card": card("4")}),
+    ] {
+        let tenant = !body["tenant_id"].is_null();
+        let r = as_op(&w.cp, &w.admin, "POST", "/admin/pricing/sell", Some(body)).await;
+        assert_eq!(r.status, 201, "{r:?}");
+        if !tenant {
+            platform_ids.push(r.body["revision_id"].clone());
+        }
+    }
+    let list = |query: String| {
+        let w = &w;
+        async move {
+            let r = as_op(
+                &w.cp,
+                &w.admin,
+                "GET",
+                &format!("/admin/pricing/sell?{query}"),
+                None,
+            )
+            .await;
+            assert_eq!(r.status, 200, "{r:?}");
+            r.body
+        }
+    };
+    let all = list(format!("model_id={model}")).await;
+    assert_eq!(all["items"].as_array().map(Vec::len), Some(4));
+    let only = list(format!("model_id={model}&platform=true")).await;
+    let ids: Vec<Value> = only["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .map(|i| i["revision_id"].clone())
+        .collect();
+    platform_ids.reverse();
+    assert_eq!(ids, platform_ids);
+    // Paging counts platform rows only: a page of one still has a next.
+    let page = list(format!("model_id={model}&platform=true&limit=1")).await;
+    assert_eq!(page["items"].as_array().map(Vec::len), Some(1));
+    assert_eq!(page["next_before"], page["items"][0]["revision_id"]);
+}
+
 #[tokio::test]
 async fn ending_an_override_restores_the_platform_price_and_discount() {
     let Some(w) = world().await else { return };

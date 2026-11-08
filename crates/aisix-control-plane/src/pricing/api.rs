@@ -97,6 +97,8 @@ pub async fn catalogue(
 pub struct SellQuery {
     model_id: Option<Uuid>,
     tenant_id: Option<Uuid>,
+    /// `true`: only the platform's own prices, never a tenant override.
+    platform: Option<bool>,
     limit: Option<i64>,
     /// Only revisions with a smaller `revision_id`: the `next_before` of
     /// the previous page.
@@ -116,7 +118,8 @@ fn newest_revisions_first(sql: &mut QueryBuilder<'_, Postgres>, before: Option<i
 
 /// `GET /admin/pricing/sell` → `{items: [SellRevision], next_before}`:
 /// sell revisions, newest first, optionally only those of a `model_id` or a
-/// `tenant_id`, `limit` (default 50, at most 500) at a time.
+/// `tenant_id`, or with `platform=true` only the platform's own prices
+/// (those of no tenant), `limit` (default 50, at most 500) at a time.
 pub async fn list_sell(
     auth: OperatorAuth,
     State(state): State<AppState>,
@@ -135,6 +138,9 @@ pub async fn list_sell(
     }
     if let Some(tenant_id) = q.tenant_id {
         sql.push(" AND tenant_id = ").push_bind(tenant_id);
+    }
+    if q.platform == Some(true) {
+        sql.push(" AND tenant_id IS NULL");
     }
     newest_revisions_first(&mut sql, q.before, limit);
     let rows: Vec<SellRevision> = sql

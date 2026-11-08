@@ -1,11 +1,16 @@
 import type { TabProps } from "../App";
 import { SectionHost, type Section } from "../components/SectionHost";
+import { SellPrices } from "./pricing/SellPrices";
+import { TenantPlans } from "./pricing/TenantPlans";
+import { CostPrices } from "./pricing/CostPrices";
 import { Catalogue } from "./pricing/Catalogue";
 import { Charges } from "./pricing/Charges";
 import { PricingStatus } from "./pricing/PricingStatus";
 
 /** The sections of 「价格」, in order. Each task appends its own entry. */
-export const SECTIONS: Section[] = [
+export const SECTIONS: Section[] = [{ id: "sell", label: "平台价格", Component: SellPrices, minRole: "viewer" },
+  { id: "plans", label: "租户方案", Component: TenantPlans, minRole: "viewer" },
+  { id: "cost", label: "成本价", Component: CostPrices, minRole: "viewer" },
   { id: "catalogue", label: "价格目录", Component: Catalogue, minRole: "viewer" },
   { id: "charges", label: "计费明细", Component: Charges, minRole: "viewer" },
   { id: "status", label: "计价状态", Component: PricingStatus, minRole: "viewer" },
