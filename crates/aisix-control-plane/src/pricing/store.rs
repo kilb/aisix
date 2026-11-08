@@ -591,7 +591,7 @@ pub(crate) async fn bump_pricing_version(conn: &mut PgConnection) -> Result<(), 
 
 /// The operator a revision is written by; `None` for the control plane
 /// itself (and anyone who is not an operator, who the audit row names).
-fn created_by(actor: Actor<'_>) -> Option<Uuid> {
+pub(crate) fn created_by(actor: Actor<'_>) -> Option<Uuid> {
     match actor {
         Actor::Operator(op) => Some(op.id),
         _ => None,
