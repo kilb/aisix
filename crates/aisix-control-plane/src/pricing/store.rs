@@ -287,6 +287,8 @@ pub struct ChargeIdentity<'a> {
     pub api_key_id: &'a str,
     pub user_id: &'a str,
     pub requested_model_id: &'a str,
+    /// The row's request id as `usage_events` stores it.
+    pub request_id: Option<&'a str>,
 }
 
 /// Why a stored row was not priced. It is recorded as an `unpriced` charge
@@ -423,9 +425,9 @@ pub async fn record_charge(
           price_instant, status, charge_micro_usd, cost_micro_usd, cost_source, sell_revision_id, \
           tenant_override, discount_revision_id, discount_bps, service_tier, \
           requested_service_tier, long_context_above, estimated, exemption, error_code, lines, \
-          warnings, engine_version) \
+          warnings, engine_version, request_id) \
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, \
-                 $19, $20, $21, $22, $23, $24) \
+                 $19, $20, $21, $22, $23, $24, $25) \
          ON CONFLICT (event_id) DO NOTHING RETURNING event_id",
     )
     .bind(ident.event_id)
@@ -452,6 +454,7 @@ pub async fn record_charge(
     .bind(c.lines)
     .bind(c.warnings)
     .bind(c.engine_version)
+    .bind(ident.request_id)
     .fetch_optional(conn)
     .await?;
     Ok(match inserted {
