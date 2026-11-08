@@ -1740,6 +1740,19 @@ async fn every_tenant_write_takes_the_tenant_before_the_resources_lock() {
             )),
             200,
         ),
+        // A credit posts to the ledger and settles the balance mark.
+        (
+            "POST /admin/tenants/{id}/credits",
+            Box::pin(fire(
+                cp.clone(),
+                "POST",
+                format!("/admin/tenants/{tenant}/credits"),
+                op.clone(),
+                None,
+                Some(json!({"amount_usd": "0.05", "reason": "线下收款 7c1"})),
+            )),
+            201,
+        ),
     ];
     for (what, request, expected) in cases {
         let status = waits_for_the_tenant_first(&cp, tenant, what, request).await;

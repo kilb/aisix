@@ -380,6 +380,12 @@ pub const ROUTE_ROLES: &[(&str, &str, MinRole)] = &[
         "/api/billing/topups/{id}",
         MinRole::Member(&[MemberRole::Owner, MemberRole::Admin, MemberRole::Billing]),
     ),
+    // Operator credits: an admin credits a tenant directly.
+    (
+        "POST",
+        "/admin/tenants/{id}/credits",
+        MinRole::Op(OperatorRole::Admin),
+    ),
     // Gateways, on the gateway listener.
     ("POST", "/dp/heartbeat", MinRole::Dp),
     ("GET", "/dp/v1/keys/{key_id}/prices", MinRole::Dp),
@@ -543,6 +549,10 @@ pub fn browser_router(state: AppState) -> Router {
             get(billing::topups::list).post(billing::topups::request),
         )
         .route("/api/billing/topups/{id}", get(billing::topups::get))
+        .route(
+            "/admin/tenants/{id}/credits",
+            post(billing::credits::create),
+        )
         .route_layer(axum::middleware::from_fn(json_only))
         .route_layer(axum::middleware::from_fn(only_listed_routes))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
