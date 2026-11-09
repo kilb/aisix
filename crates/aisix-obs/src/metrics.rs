@@ -235,15 +235,6 @@ pub const M_BUDGET_DETAILS_PRESENT: &str = "aisix_budget_details_present";
 ///
 /// A non-zero rate here means a budget is configured but not enforcing.
 pub const M_BUDGET_UNPRICED_REQUESTS_TOTAL: &str = "aisix_budget_unpriced_requests_total";
-/// How many `RateLimitPolicy` rows currently carry a spend ceiling
-/// (`max_spend_micro_usd`).
-///
-/// Zero means no spend is capped anywhere. That is indistinguishable from
-/// "no traffic yet" on the spend counters alone, so alert on this gauge
-/// rather than on the absence of rejections — a deployment that expected
-/// budgets and has none configured looks identical to one comfortably
-/// under its limits.
-pub const M_BUDGET_POLICIES_CONFIGURED: &str = "aisix_budget_policies_configured";
 pub const M_REDIS_FAILURES_TOTAL: &str = "aisix_redis_failures_total";
 /// Post-stream counter updates dropped because the store's worker queue was
 /// full. These updates carry both token counts and, since spend ceilings
@@ -2895,14 +2886,6 @@ impl Metrics {
         }
     }
 
-    /// Publish how many spend ceilings are configured. Called on boot and on
-    /// every config reload so the series tracks the live snapshot.
-    pub fn set_budget_policies_configured(&self, count: usize) {
-        metrics::with_local_recorder(&self.inner.recorder, || {
-            metrics::gauge!(M_BUDGET_POLICIES_CONFIGURED).set(count as f64);
-        });
-    }
-
     /// Shared cached emit for the budget gauge family.
     fn cached_budget_gauge(&self, metric: &'static str, labels: BudgetLabels<'_>, value: f64) {
         self.cached_gauge(
@@ -4498,36 +4481,6 @@ mod tests {
         assert!(rendered.contains("provider=\"openai\""));
         assert!(rendered.contains("outcome=\"success\""));
         assert!(rendered.contains(M_REQUEST_DURATION));
-    }
-
-    /// 「一条花费上限都没配」和「配了但还没有流量」在拒绝计数上完全
-    /// 一样，所以配置条数必须自己成为一个可告警的系列 —— 包括归零，
-    /// 这是删掉最后一条预算策略后唯一能看出来的信号。
-    #[test]
-    fn budget_policy_count_is_exposed_and_follows_reloads() {
-        let m = Metrics::new(false);
-
-        m.set_budget_policies_configured(0);
-        assert!(
-            m.render().contains(M_BUDGET_POLICIES_CONFIGURED),
-            "零也必须发出来 —— 缺席等于「没配预算」不可见",
-        );
-
-        m.set_budget_policies_configured(3);
-        let rendered = m.render();
-        let line = rendered
-            .lines()
-            .find(|l| l.starts_with(M_BUDGET_POLICIES_CONFIGURED))
-            .unwrap_or_else(|| panic!("gauge 未出现在 exposition 里:\n{rendered}"));
-        assert!(line.ends_with(" 3"), "重载后未跟到新值: {line}");
-
-        m.set_budget_policies_configured(0);
-        let rendered = m.render();
-        let line = rendered
-            .lines()
-            .find(|l| l.starts_with(M_BUDGET_POLICIES_CONFIGURED))
-            .expect("gauge 消失了");
-        assert!(line.ends_with(" 0"), "删光策略后未归零: {line}");
     }
 
     /// 一个配了预算却调度到未定价模型的请求，必须在指标上留下痕迹。

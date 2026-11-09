@@ -1192,43 +1192,11 @@ async fn run(mut cfg: Config, hangup: Option<HangupSignal>) -> anyhow::Result<()
         None => (aisix_obs::UsageSink::disabled(), None),
     };
 
-    // 花费上限的可见性。托管部署的上限有两个来源：控制平面下发的 `budgets`
-    // 文档（`budget::enforce_key`）和 RateLimitPolicy 上的 `max_spend_micro_usd`
-    // （`quota::reject_spend`）。两边都没配时花费就是完全不设上限的 —— 而且这种
-    // 状态在指标上和「还没有流量」一模一样，只看拒绝计数分辨不出来。
-    //
-    // 两者都挂在 `subscribe_after_publish` 上，而不是在这里对快照采样一次：
-    // 托管模式强制走 etcd（`resources_file` 与之互斥），而 etcd 分支是先
-    // `restore_from_cache()` 再把 watch 任务 spawn 出去的，所以执行到这一
-    // 行时快照可能还是空的。在这里采样会让每个冷启动的托管部署都收到一条
-    // 必然误报的「没配预算」告警，而误报是训练运维忽略告警最快的办法。
-    //
-    // 闩锁只在**载入到内容之后**的第一个快照上判定：空快照代表"还什么都
-    // 不知道"，不是"确认没有预算"。gauge 则每次发布都跟着走，删掉最后一个
-    // 上限后会归零。
-    {
-        let metrics = metrics.clone();
-        let managed = heartbeat_cfg.is_some();
-        let warned = std::sync::atomic::AtomicBool::new(false);
-        snapshot_handle.subscribe_after_publish(move |view| {
-            let configured = count_spend_ceilings(&view.snapshot);
-            metrics.set_budget_policies_configured(configured);
-            if spend_is_uncapped(managed, configured, view.snapshot.total_entries())
-                && !warned.swap(true, std::sync::atomic::Ordering::Relaxed)
-            {
-                tracing::warn!(
-                    "managed mode is enabled but no `budgets` document applies and no \
-                     RateLimitPolicy carries `max_spend_micro_usd`: no spend ceiling is \
-                     configured — spend is UNCAPPED. Create a hard-stop budget, or set \
-                     `max_spend_micro_usd` on a RateLimitPolicy, to restore a ceiling.",
-                );
-            }
-        });
-    }
-
-    // Shapes that serve but do not do what they read as doing. On publication,
-    // for the same reason as the block above, and because the file source has
-    // no later hook: `/status/config` has to say so from the first load on.
+    // Shapes that serve but do not do what they read as doing. On publication
+    // rather than sampled here, because the etcd branch restores its cache
+    // before it spawns the watch, so the snapshot may still be empty at this
+    // line, and because the file source has no later hook: `/status/config`
+    // has to say so from the first load on.
     {
         let status = config_status.clone();
         snapshot_handle.subscribe_after_publish(move |view| {
@@ -4183,29 +4151,6 @@ fn config_warnings(snapshot: &AisixSnapshot) -> Vec<aisix_core::ConfigWarning> {
     .collect()
 }
 
-/// 快照里生效的花费上限条数：控制平面下发的 `budgets` 文档（只有硬上限才有
-/// 文档），加上配了 `max_spend_micro_usd` 的 RateLimitPolicy。
-fn count_spend_ceilings(snapshot: &AisixSnapshot) -> usize {
-    snapshot.budgets.len()
-        + snapshot
-            .rate_limit_policies
-            .entries()
-            .iter()
-            .filter(|entry| entry.value.max_spend_micro_usd.is_some())
-            .count()
-}
-
-/// 该不该就「花费完全不设上限」发告警。
-///
-/// `total_entries` 是空快照的判据，不是凑数的条件：托管模式强制走 etcd，
-/// 而 etcd 分支先 `restore_from_cache()` 再把 watch 任务 spawn 出去，
-/// 所以第一个快照可能什么都还没载入。空快照代表「还不知道」，不是
-/// 「确认没配」—— 拿它发告警会让每个冷启动的托管部署都收到一条必然误报，
-/// 而误报是训练运维忽略告警最快的办法。
-const fn spend_is_uncapped(managed: bool, configured: usize, total_entries: usize) -> bool {
-    managed && configured == 0 && total_entries > 0
-}
-
 #[cfg(test)]
 mod tests {
     fn warning_of<'a>(
@@ -4323,59 +4268,6 @@ mod tests {
     #[test]
     fn a_clean_snapshot_warns_about_nothing() {
         assert!(super::config_warnings(&aisix_core::AisixSnapshot::new()).is_empty());
-    }
-
-    /// 托管模式冷启动时快照还是空的（etcd 分支先 restore_from_cache 再
-    /// spawn watch）。拿空快照判定会让每个新托管部署都收到一条必然误报的
-    /// 「没配预算」告警 —— 实机启动时抓到过这个 bug，这里是它的回归保护。
-    #[test]
-    fn empty_snapshot_never_warns_about_uncapped_spend() {
-        assert!(
-            !super::spend_is_uncapped(true, 0, 0),
-            "空快照是「还不知道」，不是「确认没配」",
-        );
-        assert!(
-            super::spend_is_uncapped(true, 0, 7),
-            "载入到内容、且一条花费上限都没有 —— 这时才该告警",
-        );
-        assert!(!super::spend_is_uncapped(true, 1, 7), "配了上限就不该告警",);
-        assert!(
-            !super::spend_is_uncapped(false, 0, 7),
-            "非托管模式本来就没有控制平面预算可丢，不该告警",
-        );
-    }
-
-    /// 托管部署的上限也可能只来自 `budgets` 文档。没算上它们的话，每个这样的
-    /// 部署都会读到 0 并收到一条误报的「花费不设上限」告警。
-    #[test]
-    fn budget_documents_and_spend_policies_both_count_as_ceilings() {
-        use aisix_core::resource::ResourceEntry;
-        let snap = aisix_core::AisixSnapshot::new();
-        assert_eq!(super::count_spend_ceilings(&snap), 0);
-
-        let requests_only: aisix_core::RateLimitPolicy =
-            serde_json::from_value(serde_json::json!({
-                "name": "requests-only", "scope": "api_key", "scope_ref": "k",
-                "window": "day", "max_requests": 10,
-            }))
-            .unwrap();
-        snap.rate_limit_policies
-            .insert(ResourceEntry::new("p-1", requests_only, 1));
-        assert_eq!(super::count_spend_ceilings(&snap), 0);
-
-        let budget: aisix_core::models::Budget =
-            serde_json::from_value(serde_json::json!({"scope": "org", "period": "month"})).unwrap();
-        snap.budgets.insert(ResourceEntry::new("b-1", budget, 1));
-        assert_eq!(super::count_spend_ceilings(&snap), 1);
-
-        let spend: aisix_core::RateLimitPolicy = serde_json::from_value(serde_json::json!({
-            "name": "spend", "scope": "api_key", "scope_ref": "k",
-            "window": "day", "max_spend_micro_usd": 1000,
-        }))
-        .unwrap();
-        snap.rate_limit_policies
-            .insert(ResourceEntry::new("p-2", spend, 1));
-        assert_eq!(super::count_spend_ceilings(&snap), 2);
     }
 
     use super::*;

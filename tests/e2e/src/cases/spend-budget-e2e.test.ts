@@ -1,5 +1,4 @@
 import { createHash, randomUUID } from "node:crypto";
-import { writeFile } from "node:fs/promises";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   EtcdClient,
@@ -825,93 +824,5 @@ describe("spend budget e2e: team and team_member ceilings divide the budget diff
     // member suffix ever stops reaching the spend bucket, this is the line
     // that catches it: the ceiling silently becomes team-wide.
     await admit(MEMBER_D, 2);
-  }, 30_000);
-});
-
-// A deployment with no spend ceiling anywhere and one comfortably under
-// its ceilings look identical on the rejection counters: both report zero
-// budget 429s. So how many ceilings are configured has to be its own
-// series, or "nobody ever set a budget" is unmonitorable.
-//
-// File mode rather than etcd: this block needs a config it can rewrite and
-// reload on demand, and it must run wherever the suite runs — an
-// etcd-gated block that silently skips is exactly how a metric ships
-// without ever being scraped.
-describe("spend budget e2e: configured-ceiling count is scrapeable and follows reloads", () => {
-  let app: SpawnedApp | undefined;
-  let upstream: OpenAiUpstream | undefined;
-
-  const CALLER = "sk-sb-gauge-caller";
-  const CALLER_HASH = createHash("sha256").update(CALLER).digest("hex");
-
-  // `spendPolicies` spend-capped policies plus one policy that caps only
-  // requests — the request-capped one must NOT be counted, or the series
-  // degenerates into "how many rate-limit policies exist".
-  function resources(upstreamBase: string, spendPolicies: number): string {
-    const budgets = Array.from({ length: spendPolicies }, (_, i) => `
-  - name: sb-gauge-budget-${i}
-    scope: api_key
-    scope_ref: sb-gauge-caller
-    window: day
-    max_spend_micro_usd: ${1_000_000 * (i + 1)}`).join("");
-    return `
-_format_version: "1"
-provider_keys:
-  - display_name: sb-gauge-pk
-    provider: openai
-    api_key: sk-mock
-    api_base: ${upstreamBase}/v1
-models:
-  - display_name: sb-gauge-model
-    provider: openai
-    model_name: gpt-4o-mini
-    provider_key: sb-gauge-pk
-api_keys:
-  - display_name: sb-gauge-caller
-    key_hash: ${CALLER_HASH}
-    allowed_models: ["*"]
-rate_limit_policies:
-  - name: sb-gauge-requests-only
-    scope: api_key
-    scope_ref: sb-gauge-caller
-    window: day
-    max_requests: 100000${budgets}
-`;
-  }
-
-  async function configuredCeilings(): Promise<number | undefined> {
-    const samples = await scrapeMetrics(app!.metricsUrl);
-    return samples.find((s) => s.name === "aisix_budget_policies_configured")?.value;
-  }
-
-  beforeAll(async () => {
-    upstream = await startOpenAiUpstream();
-    app = await spawnApp({ resourcesFile: resources(upstream.baseUrl, 2) });
-  });
-
-  afterAll(async () => {
-    await app?.exit();
-    await upstream?.close();
-  });
-
-  test("the count is exposed, excludes request-only policies, and drops to zero when the last ceiling is removed", async () => {
-    if (!app || !upstream || !app.resourcesPath) throw new Error("setup failed");
-
-    expect(await configuredCeilings()).toBe(2);
-
-    // Removing the last spend ceiling must be visible. Zero has to be
-    // reported as zero — an absent series reads as "no traffic yet", which
-    // is the state this metric exists to distinguish from.
-    await writeFile(app.resourcesPath, resources(upstream.baseUrl, 0), "utf8");
-    app.signal("SIGHUP");
-    await waitConfigPropagation(async () => (await configuredCeilings()) === 0);
-    expect(await configuredCeilings()).toBe(0);
-
-    // And it comes back up on the next reload — a one-way gauge would
-    // still pass the assertion above.
-    await writeFile(app.resourcesPath, resources(upstream.baseUrl, 3), "utf8");
-    app.signal("SIGHUP");
-    await waitConfigPropagation(async () => (await configuredCeilings()) === 3);
-    expect(await configuredCeilings()).toBe(3);
   }, 30_000);
 });

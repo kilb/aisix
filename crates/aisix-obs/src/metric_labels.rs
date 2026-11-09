@@ -401,7 +401,6 @@ pub static METRIC_DEFINITIONS: &[MetricDefinition] = &[
         required = BUDGET
     ),
     metric!(M_BUDGET_UNPRICED_REQUESTS_TOTAL, &["policy", "model"]),
-    metric!(M_BUDGET_POLICIES_CONFIGURED, &[]),
     metric!(M_REDIS_FAILURES_TOTAL, &["operation"]),
     metric!(M_RATELIMIT_POST_STREAM_SHED_TOTAL, &[]),
     metric!(
