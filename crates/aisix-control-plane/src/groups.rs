@@ -946,14 +946,25 @@ pub async fn make_default(
                 if !row.is_default {
                     let previous = rows.iter().find(|r| r.is_default).map(|r| r.id);
                     let locked: Vec<Uuid> = rows.iter().map(|r| r.id).collect();
+                    // Two statements, the old default cleared first:
+                    // `provider_groups_one_default` is a unique index, which
+                    // is checked row by row and cannot be deferred, so one
+                    // statement setting the new default while the old one is
+                    // still set fails whenever it reaches the new row first.
                     sqlx::query(
-                        "UPDATE provider_groups SET is_default = (id = $1) WHERE id = ANY($2)",
+                        "UPDATE provider_groups SET is_default = false \
+                         WHERE id = ANY($1) AND id <> $2 AND is_default",
                     )
-                    .bind(id)
                     .bind(&locked)
+                    .bind(id)
                     .execute(&mut *conn)
                     .await
                     .map_err(DbError::from)?;
+                    sqlx::query("UPDATE provider_groups SET is_default = true WHERE id = $1")
+                        .bind(id)
+                        .execute(&mut *conn)
+                        .await
+                        .map_err(DbError::from)?;
                     audit::record(
                         &mut *conn,
                         AuditEntry {

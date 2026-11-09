@@ -1055,6 +1055,44 @@ async fn make_default_moves_the_flag() {
     assert_eq!(audit, 1);
 }
 
+/// The designation moves to a group created later, back to the first-boot
+/// `default`, and to the first-boot `shared`: whichever row the update meets
+/// first, exactly one group is designated after each move.
+#[tokio::test]
+async fn the_designation_moves_away_and_back() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let admin = cp
+        .admin_login_seeded(aisix_control_plane::auth::OperatorRole::Operator)
+        .await;
+    let later = id_of(&create_group(&cp, &admin, body("grp-back-7c1", "回切", json!("7.2"))).await);
+    let first_boot = |name: &'static str| {
+        let pool = cp.db().pool().clone();
+        async move {
+            sqlx::query_scalar::<_, Uuid>("SELECT id FROM provider_groups WHERE name = $1")
+                .bind(name)
+                .fetch_one(&pool)
+                .await
+                .expect("a first-boot group")
+                .to_string()
+        }
+    };
+    let original = first_boot("default").await;
+    let shared = first_boot("shared").await;
+    for target in [&later, &original, &later, &shared, &original, &shared] {
+        let r = make_default(&cp, &admin, target).await;
+        assert_eq!(r.status, 200, "designating {target}: {r:?}");
+        assert_eq!(r.body["is_default"], true, "{r:?}");
+        let designated: Vec<String> =
+            sqlx::query_scalar("SELECT id::text FROM provider_groups WHERE is_default")
+                .fetch_all(cp.db().pool())
+                .await
+                .expect("read the designated group");
+        assert_eq!(designated, vec![target.clone()]);
+    }
+}
+
 #[tokio::test]
 async fn a_group_lists_its_provider_keys() {
     let Some(cp) = TestCp::start().await else {
