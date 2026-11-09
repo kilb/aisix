@@ -323,7 +323,12 @@ statement.
   That lookup runs before the `If-Match` checks, so `428` and `412` answer only
   for the caller's own rows.
 - No `/api/*` answer carries a provider, a provider key, a group name or an
-  upstream model id.
+  upstream model id. **"Group name" means the routing name** — the immutable
+  identifier a provider key is matched against — never a group's
+  `display_name`: a tenant is shown the display name of the group its key is
+  priced in (design §5.1's `group: {id, display_name}` on the call log, on
+  `/api/groups` and on its keys), and nothing tells it which routing name
+  stands behind it.
 - **A pending tenant projects nothing**: no team, no member `users`
   document and no key until an operator approves it, since signup is
   anonymous. The approval writes the team and every live member's user ahead
