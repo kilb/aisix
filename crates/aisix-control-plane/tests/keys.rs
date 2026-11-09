@@ -382,11 +382,14 @@ async fn the_plaintext_is_returned_once_and_never_stored() {
     assert_eq!(r.status, 201, "{r:?}");
     let plaintext = text(&r.body, "/plaintext");
     let id = text(&r.body, "/key/id");
-    let hex = plaintext
-        .strip_prefix("sk-aisix-")
+    let random = plaintext
+        .strip_prefix("sk-rt-")
         .unwrap_or_else(|| panic!("{plaintext}"));
-    assert_eq!(hex.len(), 64, "{plaintext}");
-    assert!(hex.bytes().all(|b| b.is_ascii_hexdigit()), "{plaintext}");
+    assert_eq!(random.len(), 32, "{plaintext}");
+    assert!(
+        random.bytes().all(|b| b.is_ascii_alphanumeric()),
+        "{plaintext}"
+    );
     assert_eq!(r.body["key"]["prefix"], json!(plaintext[..12]));
     assert_eq!(r.body["key"]["label"], "ci-key-7c1");
     assert_eq!(r.body["key"]["version"], 1);
@@ -412,7 +415,7 @@ async fn the_plaintext_is_returned_once_and_never_stored() {
             .await
             .unwrap_or_else(|e| panic!("dump {table}: {e}"));
         assert!(
-            dump.iter().all(|row| !row.contains(hex)),
+            dump.iter().all(|row| !row.contains(random)),
             "{table} holds the plaintext"
         );
     }
@@ -467,7 +470,7 @@ async fn the_plaintext_is_returned_once_and_never_stored() {
     for read in reads {
         assert_eq!(read.status, 200, "{read:?}");
         let body = read.body.to_string();
-        assert!(!body.contains(hex), "a read shows the plaintext: {body}");
+        assert!(!body.contains(random), "a read shows the plaintext: {body}");
         assert!(!body.contains(&hash), "a read shows the hash: {body}");
         assert!(body.contains(&id), "{body}");
     }

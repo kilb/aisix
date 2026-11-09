@@ -319,7 +319,7 @@ export default function Styleguide() {
 
       <Row title="复制与提示">
         <Fig caption="复制后按钮显示已复制 1.5 秒，并弹出提示">
-          <CopyButton text="sk-aisix-example" onFailed={() => toast("复制没有成功")} />
+          <CopyButton text="sk-rt-example" onFailed={() => toast("复制没有成功")} />
         </Fig>
         <Fig caption="提示在左下角，用动作本身的动词">
           <Button size="sm" onClick={() => toast("已保存")}>

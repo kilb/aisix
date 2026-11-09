@@ -56,7 +56,7 @@ const LOG_DIR = process.env.CP_E2E_LOG_DIR;
 function scrubbed(text: string, secrets: string[]): string {
   let out = text
     .replace(/([a-z][a-z0-9+.-]*:\/\/)[^/@\s]+@/gi, "$1***@")
-    .replace(/sk-aisix-[0-9a-f]{16,}/g, "sk-aisix-***");
+    .replace(/sk-rt-[A-Za-z0-9]{16,}/g, "sk-rt-***");
   for (const secret of secrets) {
     if (secret) out = out.split(secret).join("***");
   }

@@ -77,7 +77,15 @@ pub const FIRST_PHASE_ENDPOINTS: [&str; 6] = [
 ];
 
 /// What every minted key starts with.
-const KEY_PREFIX: &str = "sk-aisix-";
+const KEY_PREFIX: &str = "sk-rt-";
+
+/// The characters a key's random part is drawn from: digits, upper and
+/// lower case letters.
+const KEY_ALPHABET: &[u8; 62] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+
+/// How many characters of [`KEY_ALPHABET`] follow the prefix: about 190
+/// bits of randomness.
+const KEY_RANDOM_CHARS: usize = 32;
 
 /// How much of a key's plaintext is kept to show it by (`key_prefix`).
 const PREFIX_CHARS: usize = 12;
@@ -245,18 +253,36 @@ pub fn owner(id: Uuid) -> String {
     format!("key:{id}")
 }
 
-/// A new key: `(plaintext, key_hash)`, the plaintext `sk-aisix-` and 32
-/// random bytes in hex, hashed as the gateway hashes a bearer token
-/// ([`ApiKey::hash_bearer`]). The randomness is plenty, so a plain SHA-256
-/// is the right hash; argon2 is for passwords people choose.
+/// A new key: `(plaintext, key_hash)`, the plaintext `sk-rt-` and
+/// [`KEY_RANDOM_CHARS`] characters of [`KEY_ALPHABET`], hashed as the gateway
+/// hashes a bearer token ([`ApiKey::hash_bearer`]). The randomness is plenty,
+/// so a plain SHA-256 is the right hash; argon2 is for passwords people
+/// choose.
 pub fn mint() -> Result<(String, String), ApiError> {
-    let mut bytes = [0u8; 32];
-    rand_core::OsRng
-        .try_fill_bytes(&mut bytes)
-        .map_err(ApiError::internal)?;
-    let plaintext = format!("{KEY_PREFIX}{}", hex::encode(bytes));
+    let mut plaintext = String::with_capacity(KEY_PREFIX.len() + KEY_RANDOM_CHARS);
+    plaintext.push_str(KEY_PREFIX);
+    let mut bytes = [0u8; 64];
+    while plaintext.len() < KEY_PREFIX.len() + KEY_RANDOM_CHARS {
+        rand_core::OsRng
+            .try_fill_bytes(&mut bytes)
+            .map_err(ApiError::internal)?;
+        plaintext.extend(
+            bytes
+                .iter()
+                .filter_map(|&b| alphabet_char(b))
+                .take(KEY_PREFIX.len() + KEY_RANDOM_CHARS - plaintext.len()),
+        );
+    }
     let key_hash = ApiKey::hash_bearer(&plaintext);
     Ok((plaintext, key_hash))
+}
+
+/// The character a random byte stands for, or `None` for a byte to drop:
+/// 248 is the largest multiple of 62 a byte reaches, so keeping only the
+/// bytes below it makes every character equally likely.
+fn alphabet_char(byte: u8) -> Option<char> {
+    const ACCEPT_BELOW: u8 = (256 / KEY_ALPHABET.len() * KEY_ALPHABET.len()) as u8;
+    (byte < ACCEPT_BELOW).then(|| char::from(KEY_ALPHABET[usize::from(byte) % KEY_ALPHABET.len()]))
 }
 
 /// The part of a plaintext kept to show the key by.
@@ -2184,14 +2210,46 @@ mod tests {
     }
 
     #[test]
-    fn a_minted_key_is_prefixed_hex_and_hashed_the_gateways_way() {
+    fn a_minted_key_is_prefixed_alphanumeric_and_hashed_the_gateways_way() {
         let (plaintext, hash) = mint().expect("mint");
-        let hex = plaintext.strip_prefix("sk-aisix-").expect("the prefix");
-        assert_eq!(hex.len(), 64);
-        assert!(hex.bytes().all(|b| b.is_ascii_hexdigit()), "{plaintext}");
+        let random = plaintext.strip_prefix("sk-rt-").expect("the prefix");
+        assert_eq!(random.len(), 32, "{plaintext}");
+        assert!(
+            random.bytes().all(|b| b.is_ascii_alphanumeric()),
+            "{plaintext}"
+        );
         assert_eq!(hash, ApiKey::hash_bearer(&plaintext));
         assert_eq!(prefix_of(&plaintext), &plaintext[..12]);
         let (again, _) = mint().expect("mint");
         assert_ne!(plaintext, again);
+    }
+
+    #[test]
+    fn minted_keys_draw_on_digits_and_both_cases() {
+        // 200 keys are 6,400 draws: a class missing from all of them has a
+        // chance below 10^-300 if every character is equally likely.
+        let drawn: String = (0..200)
+            .map(|_| mint().expect("mint").0[6..].to_string())
+            .collect();
+        assert!(drawn.bytes().any(|b| b.is_ascii_digit()));
+        assert!(drawn.bytes().any(|b| b.is_ascii_uppercase()));
+        assert!(drawn.bytes().any(|b| b.is_ascii_lowercase()));
+    }
+
+    #[test]
+    fn every_byte_maps_evenly_or_is_dropped() {
+        let mut hits = [0u32; 62];
+        for byte in 0..=u8::MAX {
+            if let Some(c) = alphabet_char(byte) {
+                let at = KEY_ALPHABET
+                    .iter()
+                    .position(|&a| char::from(a) == c)
+                    .expect("in the alphabet");
+                hits[at] += 1;
+            }
+        }
+        assert!(hits.iter().all(|&n| n == 4), "{hits:?}");
+        assert_eq!(alphabet_char(248), None);
+        assert_eq!(alphabet_char(255), None);
     }
 }

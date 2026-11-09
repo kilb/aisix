@@ -13,7 +13,7 @@ import {
 // E2E: caller credentials never reach the upstream.
 //
 // The proxy authenticates the caller with one secret (the caller's
-// ApiKey plaintext, presented as `Authorization: Bearer sk-aisix-…`
+// ApiKey plaintext, presented as `Authorization: Bearer sk-rt-…`
 // or `x-api-key`) and then dispatches upstream with a completely
 // separate secret (the matching ProviderKey's `secret`, presented
 // as `Authorization: Bearer sk-mock-…` for OpenAI-shape providers).

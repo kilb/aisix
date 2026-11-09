@@ -144,7 +144,7 @@ test("新建内部密钥：明文只显示一次，用它能调网关", async ({
   await expect(page.getByRole("button", { name: "复制" })).toBeVisible();
   const shown = page.getByLabel("密钥明文");
   const plaintext = ((await shown.textContent()) ?? "").trim();
-  expect(plaintext).toMatch(/^sk-aisix-\S{16,}$/);
+  expect(plaintext).toMatch(/^sk-rt-[A-Za-z0-9]{16,}$/);
 
   // The key the page showed is the real one: the gateway serves it, for the
   // models its pattern names only.
@@ -336,7 +336,7 @@ test("给客户租户新建密钥：只能调用所选模型，限额与过期�
   await form.getByRole("button", { name: "创建" }).click();
 
   const plaintext = ((await page.getByLabel("密钥明文").textContent()) ?? "").trim();
-  expect(plaintext).toMatch(/^sk-aisix-\S{16,}$/);
+  expect(plaintext).toMatch(/^sk-rt-[A-Za-z0-9]{16,}$/);
   await expect.poll(() => chatStatus(plaintext), { timeout: KEY_READY_MS }).toBe(200);
   expect(await chatStatus(plaintext, "other-t6-e2e")).not.toBe(200);
 
@@ -404,7 +404,7 @@ test("为客户租户新建密钥：从租户的分组里选一个，创建后�
   await expect(select.locator("option", { hasText: "Alpha 分组 7c1" })).toContainText("grp-alpha-7c1");
   await select.selectOption({ label: "Alpha 分组 7c1（grp-alpha-7c1）" });
   await form.getByRole("button", { name: "创建" }).click();
-  await expect.poll(() => page.getByLabel("密钥明文").textContent()).toMatch(/^sk-aisix-\S{16,}$/);
+  await expect.poll(() => page.getByLabel("密钥明文").textContent()).toMatch(/^sk-rt-[A-Za-z0-9]{16,}$/);
   await page.getByRole("button", { name: "关闭" }).click();
 
   const listed = (await stack.admin.get(`/admin/tenants/${t.id}/keys`)).items as Json[];
