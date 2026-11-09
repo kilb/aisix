@@ -15,6 +15,7 @@ import { DataTable, Loading } from "../ui/DataTable";
 import { EmptyState } from "../ui/EmptyState";
 import { GroupList } from "../ui/GroupName";
 import { GroupPicker, groupChoices, useLoad, type GroupChoice } from "./Tenants";
+import { ChannelModels } from "./providers/ChannelModels";
 
 /** The fields of a `provider_key` this page edits; every other field is kept as stored. */
 interface ProviderKeyDoc {
@@ -186,6 +187,16 @@ export function Providers({ canEdit }: TabProps) {
           onSaved={saved}
           onClose={() => setOpen(null)}
           onReload={() => void pk.reload()}
+        />
+      )}
+      {editing && (
+        // A sibling of the form, not inside it: its own buttons must not submit
+        // the account, and its save writes channel rows, not the account's document.
+        <ChannelModels
+          key={`models:${editing.id}`}
+          accountId={editing.id}
+          groups={editing.doc.groups ?? []}
+          canEdit={canEdit}
         />
       )}
 
