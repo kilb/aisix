@@ -79,7 +79,7 @@ test("审核通过后刷新即可看到密钥页签", async ({ page }) => {
   await stack.admin.post(`/admin/tenants/${await tenantId("Approve Org 7a3")}/approve`);
   await page.reload();
   // The owner of an active organisation reaches every page.
-  await expect(page.getByRole("tab")).toHaveText(["组织", "密钥", "成员", "用量", "预算", "账户"]);
+  await expect(page.getByRole("tab")).toHaveText(["组织", "密钥", "价格", "成员", "用量", "预算", "账户"]);
   await expect(page.getByText("组织正在等待平台审核")).toHaveCount(0);
 });
 
@@ -136,7 +136,7 @@ test("邀请链接：设置口令后以成员身份登录，同一链接再次�
   // Signed in as a member of that organisation: no members page.
   await expect(pb.getByRole("banner")).toContainText("Invite Org 2c9");
   await expect(pb.getByRole("banner")).toContainText("Mia 2c9 · 成员");
-  await expect(pb.getByRole("tab")).toHaveText(["组织", "密钥", "用量", "预算"]);
+  await expect(pb.getByRole("tab")).toHaveText(["组织", "密钥", "价格", "用量", "预算"]);
   // The token went out once, in a request body.
   expect(acceptBodies).toHaveLength(1);
   expect(acceptBodies[0]).toContain(token);
@@ -304,5 +304,5 @@ test("账单角色看不到密钥与成员页签", async ({ page }) => {
 
   await login(page, "billing@billing-1f7.test", "billing-pass-1f7x");
   await expect(page.getByRole("banner")).toContainText("Billing Org 1f7");
-  await expect(page.getByRole("tab")).toHaveText(["组织", "用量", "预算", "账户"]);
+  await expect(page.getByRole("tab")).toHaveText(["组织", "价格", "用量", "预算", "账户"]);
 });

@@ -379,6 +379,52 @@ export const members = {
   },
 };
 
+// ── prices: what each group the organisation is assigned charges ────────────
+
+/**
+ * One granted model's price in one group, in ¥ per million tokens, as the
+ * API's own exact decimal strings. A cache rate is absent when the model's
+ * baseline carries none, which is not the same as a price of 0.
+ */
+export interface PricedModel {
+  model_id: string;
+  name: string;
+  input_per_million: string;
+  output_per_million: string;
+  cache_read_per_million?: string;
+  cache_write_per_million?: string;
+  cache_write_1h_per_million?: string;
+}
+
+/**
+ * A group the organisation is assigned, and what it charges each model it
+ * can price. `models` leaves out a model the group cannot price at all: no
+ * baseline, or no rate that covers it, so nothing reads as free.
+ */
+export interface PricedGroup {
+  id: string;
+  display_name: string;
+  description: string;
+  models: PricedModel[];
+}
+
+/** `GET /api/prices`: every assigned live group, at the prices the organisation is charged. */
+export interface PriceList {
+  currency: "CNY";
+  groups: PricedGroup[];
+}
+
+export const prices = {
+  /**
+   * The organisation's assigned groups and their prices. The discount is
+   * already applied: a figure here is what the organisation pays, never a
+   * list price it must discount itself.
+   */
+  async list(): Promise<PriceList> {
+    return (await call<PriceList>("GET", "/prices")).data;
+  },
+};
+
 // ── billing: balance, top-ups, ledger and a key's quota ─────────────────────
 
 /** `GET /api/billing/balance`. `available` is the balance for prepaid, balance plus credit limit for postpaid. */

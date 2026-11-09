@@ -21,11 +21,13 @@ import { Members } from "./Members";
 import { Org, ROLE_LABEL } from "./Org";
 import { Billing } from "./Billing";
 import { Budgets } from "./Budgets";
+import { Prices } from "./Prices";
 import { Usage } from "./Usage";
 
 const TABS = [
   { id: "org", label: "组织" },
   { id: "keys", label: "密钥" },
+  { id: "prices", label: "价格" },
   { id: "members", label: "成员" },
   { id: "usage", label: "用量" },
   { id: "budgets", label: "预算" },
@@ -33,6 +35,21 @@ const TABS = [
 ] as const;
 
 export type TabId = (typeof TABS)[number]["id"];
+
+/**
+ * What the address asks for, when it names a section: `#<tab>` or
+ * `#<tab>?group=<id>`. The portal is one page whose sections are state, so
+ * the fragment is the only part of the address a link can carry; it is read
+ * once at boot (`#prices?group=<id>` from a key form's 查看价格) and again
+ * whenever it changes while the page is open. A fragment that names no
+ * known tab opens the organisation, as an absent one does.
+ */
+function routeOf(hash: string): { tab: TabId; group: string | null } {
+  const [name, query = ""] = hash.replace(/^#/, "").split("?", 2);
+  const tab = TABS.find((t) => t.id === name)?.id ?? "org";
+  const group = new URLSearchParams(query).get("group");
+  return { tab, group: group === "" ? null : group };
+}
 
 /**
  * Whether `member` sees tab `id` of an organisation in state `status`. A
@@ -52,7 +69,7 @@ export type TabId = (typeof TABS)[number]["id"];
  */
 function canSee(id: TabId, member: SessionMember, status: TenantStatus): boolean {
   if (status !== "active" && status !== "suspended") return false;
-  if ((id === "usage" || id === "budgets" || id === "billing") && status !== "active") return false;
+  if ((id === "usage" || id === "budgets" || id === "billing" || id === "prices") && status !== "active") return false;
   switch (id) {
     case "org":
       return true;
@@ -62,6 +79,7 @@ function canSee(id: TabId, member: SessionMember, status: TenantStatus): boolean
       return member.role === "owner" || member.role === "admin";
     case "usage":
     case "budgets":
+    case "prices":
       return member.role === "owner" || member.role === "admin" || member.role === "member" || member.role === "billing";
     case "billing":
       return member.role === "owner" || member.role === "admin" || member.role === "billing";
@@ -88,6 +106,8 @@ export function App({ inviteToken }: { inviteToken: string | null }) {
   /** Why the gate is showing again, when a session ended under the member. */
   const [notice, setNotice] = useState<string | null>(null);
   const [tab, setTab] = useState<TabId>("org");
+  /** The group a `#prices?group=<id>` link named, read when that page opens. */
+  const [priceGroup, setPriceGroup] = useState<string | null>(null);
   const [theme, toggleTheme] = useTheme();
 
   // Any page's request that finds the session gone drops back to the gate:
@@ -99,6 +119,20 @@ export function App({ inviteToken }: { inviteToken: string | null }) {
       setNotice("登录已过期，请重新登录");
     });
     return () => onSessionEnded(null);
+  }, []);
+
+  // The address opens a section, and a link to one opens it without a
+  // reload: `#prices?group=<id>` from a key form's 查看价格. Read once here,
+  // then on every change while the page is open.
+  useEffect(() => {
+    const apply = () => {
+      const route = routeOf(window.location.hash);
+      setTab(route.tab);
+      setPriceGroup(route.group);
+    };
+    apply();
+    window.addEventListener("hashchange", apply);
+    return () => window.removeEventListener("hashchange", apply);
   }, []);
 
   // The member removed themself, which ended their session on the control
@@ -246,6 +280,8 @@ export function App({ inviteToken }: { inviteToken: string | null }) {
         >
           {current === "keys" ? (
             <Keys member={member} status={tenant.status} onSelfChanged={() => void boot()} />
+          ) : current === "prices" ? (
+            <Prices initialGroup={priceGroup} />
           ) : current === "members" ? (
             <Members member={member} status={tenant.status} onSelfChanged={() => void boot()} onLeft={leave} />
           ) : current === "usage" ? (

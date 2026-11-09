@@ -145,11 +145,11 @@ export class ApiClient {
 
 /**
  * Funds a customer tenant with an operator credit, as `admin`: a prepaid
- * tenant at $0 is blocked by design, so a test that calls the gateway with
+ * tenant at ¥0 is blocked by design, so a test that calls the gateway with
  * its keys needs a balance first.
  */
 export async function fundTenant(admin: ApiClient, tenantId: string): Promise<void> {
-  await admin.post(`/admin/tenants/${tenantId}/credits`, { amount_usd: "10.00", reason: "e2e funding" });
+  await admin.post(`/admin/tenants/${tenantId}/credits`, { amount_cny: "10.00", reason: "e2e funding" });
 }
 
 export interface Stack {

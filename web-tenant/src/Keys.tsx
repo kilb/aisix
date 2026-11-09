@@ -589,6 +589,15 @@ function NewKeyForm({
           {groups !== null && groups.length > 0 && (
             <p className="hint" id={groupHint}>
               分组建好密钥后不能更换；如需更换分组，请新建密钥
+              {/* The prices of the group just picked, which is what the
+                  choice costs: the address carries the group's id, so the
+                  page opens on that tab (never on its first one). */}
+              {group !== "" && (
+                <>
+                  {" · "}
+                  <a href={`#prices?group=${encodeURIComponent(group)}`}>查看价格</a>
+                </>
+              )}
             </p>
           )}
           {errs.group && (

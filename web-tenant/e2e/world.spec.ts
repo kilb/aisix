@@ -22,7 +22,7 @@ test("种子组织的所有者能登录并看到组织页", async ({ page }) => 
   await page.getByLabel("口令", { exact: true }).fill(world.owner.password);
   await page.getByRole("button", { name: "登录", exact: true }).click();
   await expect(page.getByRole("banner")).toContainText(world.tenantName);
-  await expect(page.getByRole("tab")).toHaveText(["组织", "密钥", "成员", "用量", "预算", "账户"]);
+  await expect(page.getByRole("tab")).toHaveText(["组织", "密钥", "价格", "成员", "用量", "预算", "账户"]);
 });
 
 test("种子组织的密钥能调用模型，一次调用扣 11 000 µ$，成员各有各的角色", async () => {

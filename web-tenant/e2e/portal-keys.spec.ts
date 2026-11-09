@@ -536,7 +536,7 @@ test("账单角色看不到密钥页，直接请求也被拒", async ({ page }) 
   const id = await activeOrg("Billing Keys Org 4d1", "owner@billing-4d1.test");
   await joined(id, "billing@billing-4d1.test", "billing");
   await login(page, "billing@billing-4d1.test");
-  await expect(page.getByRole("tab")).toHaveText(["组织", "用量", "预算", "账户"]);
+  await expect(page.getByRole("tab")).toHaveText(["组织", "价格", "用量", "预算", "账户"]);
   await expect(page.getByRole("button", { name: "新建密钥" })).toHaveCount(0);
 
   const statuses = await page.evaluate(async () => {
@@ -607,7 +607,7 @@ test("最后一个所有者不能被降级", async ({ page }) => {
   // Still the owner, as the control plane sees it.
   await page.reload();
   await expect(page.getByRole("banner")).toContainText("所有者");
-  await expect(page.getByRole("tab")).toHaveText(["组织", "密钥", "成员", "用量", "预算", "账户"]);
+  await expect(page.getByRole("tab")).toHaveText(["组织", "密钥", "价格", "成员", "用量", "预算", "账户"]);
   const session = await (await signedIn("owner@last-6f3.test")).get("/api/session");
   expect(session.member.role).toBe("owner");
 });
