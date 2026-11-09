@@ -176,6 +176,13 @@ export interface Stack {
    * group) and which a spec that needs a legacy groupless key sets directly.
    */
   clearKeyGroup(id: string): void;
+  /**
+   * Adds to proposal `id`'s batch a pending copy of it dated `days` days
+   * before today (UTC midnight): the row an upload leaves once a date it
+   * found still ahead has passed, which no request can produce without the
+   * wait. The copy's id.
+   */
+  pastDatedProposal(id: string, days: number): string;
   stop(): Promise<void>;
 }
 
@@ -381,6 +388,16 @@ export async function startStack(opts: { telemetryRelay?: boolean } = {}): Promi
       tenant: () => new ApiClient(ready.httpUrl),
       clearKeyGroup: (id: string) =>
         sqlAgainst(ready.cpDatabase, `UPDATE tenant_keys SET group_id = NULL WHERE id = '${id}'`),
+      pastDatedProposal: (id: string, days: number) =>
+        sqlAgainst(
+          ready.cpDatabase,
+          "INSERT INTO pricing_import_proposals (id, batch_id, provider, model, effective_from, card, flags, " +
+            "pricing_url, prices_checked, suggested_model_id, status) " +
+            `SELECT gen_random_uuid(), batch_id, provider, model, ` +
+            `date_trunc('day', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC' - make_interval(days => ${days}), ` +
+            "card, flags, pricing_url, prices_checked, suggested_model_id, 'pending' " +
+            `FROM pricing_import_proposals WHERE id = '${id}' RETURNING id`,
+        ).trim(),
       stop,
     };
   } catch (e) {

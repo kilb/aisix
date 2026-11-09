@@ -502,6 +502,68 @@ test("他人先处理了提议时，确认显示中文提示并刷新该行", as
   expect(after.proposals.find((p: { id: string }) => p.id === id).status).toBe("rejected");
 });
 
+test("生效时间已过的提议可以选择生效时间确认；被更晚价格取代的确认在表单上说明原因", async ({ page }) => {
+  // Its own entry, from a file of its own: one price, in effect at upload.
+  const id = `m-past-${randomUUID().slice(0, 8)}`;
+  const entry = `google/${id}`;
+  const model = await newModel("past", "google", id);
+  await openImports(page);
+  await page.getByLabel("数据集文件").setInputFiles({
+    name: "past.json",
+    mimeType: "application/json",
+    buffer: Buffer.from(
+      JSON.stringify([
+        { id: "google", pricing_urls: ["https://ai.google.dev/pricing"], models: [{ id, prices: { input_mtok: 1, output_mtok: 2 } }] },
+      ]),
+    ),
+  });
+  await page.getByLabel("数据集版本").fill(`past-${id}`);
+  await page.getByRole("button", { name: "上传", exact: true }).click();
+  await expect(page.getByLabel("上传批次")).toContainText(`past-${id}`);
+  await expect(row(page, entry)).toBeVisible();
+
+  // The same upload had also said the price changes three days ago: the row
+  // it leaves once that date has passed, still pending.
+  const { batch, id: current } = await proposalOf(entry);
+  const past = stack.pastDatedProposal(current, 3);
+  const passed = new Date(Date.UTC(new Date().getUTCFullYear(), new Date().getUTCMonth(), new Date().getUTCDate() - 3));
+  const passedDay = passed.toISOString().slice(0, 10);
+  await page.reload();
+  await page.locator('[data-tab="pricing"]').click();
+  await page.getByRole("button", { name: "导入审核", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "导入审核" })).toBeVisible();
+  await expect(page.locator("main").getByText("载入中…")).toHaveCount(0);
+  await only(page, entry);
+  await expect(row(page, entry)).toHaveCount(2);
+
+  // The price in effect at upload was replaced three days ago, by the file's
+  // own word, so starting it now is refused, and the form says why.
+  await row(page, entry).filter({ hasText: "立即生效" }).getByRole("button", { name: entry, exact: true }).click();
+  let panel = page.getByRole("dialog", { name: `${entry} 的提议` });
+  await panel.getByRole("checkbox", { name: "已对照官方价格页核对" }).check();
+  await panel.getByRole("button", { name: "确认", exact: true }).click();
+  await expect(panel.getByRole("alert")).toContainText(passedDay);
+  await panel.getByRole("button", { name: "关闭" }).click();
+
+  // The dated one cannot start on its own date any more: the form says so,
+  // and starts it now.
+  await row(page, entry).filter({ hasNotText: "立即生效" }).getByRole("button", { name: entry, exact: true }).click();
+  panel = page.getByRole("dialog", { name: `${entry} 的提议` });
+  await expect(panel.getByRole("form", { name: "确认提议" })).toContainText("已过");
+  await expect(panel.getByRole("checkbox", { name: "立即生效" })).toBeChecked();
+  await panel.getByRole("checkbox", { name: "已对照官方价格页核对" }).check();
+  await panel.getByRole("button", { name: "确认", exact: true }).click();
+  await expect(page.locator(".toast").filter({ hasText: "已确认" }).first()).toBeVisible();
+
+  // It is the model's baseline now, from the confirmed proposal.
+  const detail = await stack.admin.get(`/admin/pricing/imports/${batch}?all=true`);
+  expect(detail.proposals.find((p: { id: string }) => p.id === past).status).toBe("confirmed");
+  expect(detail.proposals.find((p: { id: string }) => p.id === current).status).toBe("pending");
+  const listed = await stack.admin.get("/admin/pricing/baselines");
+  const now = listed.items.find((i: { model_id: string }) => i.model_id === model.id).current;
+  expect(now?.source_kind).toBe("third_party");
+});
+
 test("批量确认需要核对声明，并逐条显示结果", async ({ page }) => {
   const a = await newModel("bulk-a", "cohere", "command-r7b");
   const b = await newModel("bulk-b", "deepseek", "deepseek-v3.2");
