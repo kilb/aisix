@@ -42,7 +42,7 @@ way.
   `every_*_document_loads_on_the_lenient_schema` tests). A new builder adds
   one.
 
-## Lock order: tenant rows, then billing accounts, then `RESOURCES_LOCK_KEY`
+## Lock order: tenant rows, billing accounts, group rows, then `RESOURCES_LOCK_KEY`
 
 - **A transaction that touches a tenant and a gateway document takes the tenant
   first**: `tenants::lock`, or `tenants::lock_many` (ascending id) for several,
@@ -105,6 +105,48 @@ way.
   lock (`an_escalated_settle_never_holds_up_intake`,
   `an_escalated_settle_never_waits_for_the_account_while_it_holds_the_resources_lock`,
   `a_crossing_batch_never_waits_on_a_held_tenant_row`).
+- **A provider group's row sits between the billing account and
+  `RESOURCES_LOCK_KEY`, and a public model's row beside it there.** A path
+  that names a group takes its row `FOR SHARE` — `groups::lock_one`,
+  `groups::lock_named` (ascending id) and `groups::key_group`, which every
+  key create and every key `group_id` change goes through — and does so
+  before `write_resource`, as `keys::create_key` does. A path that changes or
+  retires one takes it `FOR UPDATE` (`LockMode::Update`): `retire`,
+  `make-default` and the rate writes. A retire holds the group's row **and**
+  `RESOURCES_LOCK_KEY` across its reference count and its update, so a
+  provider-key document cannot name a group that is about to be retired: a
+  write that gets the resources lock second is refused at `/groups`, and one
+  that gets it first has committed before the count reads it
+  (`a_provider_key_write_and_a_retire_never_end_with_a_retired_group_named`,
+  `a_group_edit_takes_its_groups_before_the_resources_lock`,
+  `a_provider_key_write_takes_its_groups_before_the_resources_lock`,
+  `waits_on_the_group_not_the_resources_lock`, `tests/groups.rs`).
+  A channel edit takes the public model's row `FOR UPDATE` before
+  `write_resource` (`channels::lock_public`), and its retire takes that row
+  and then `refs::lock_resources` itself, because its reference counts are
+  plain `SELECT`s (`a_retire_waits_for_the_resources_lock`,
+  `a_grant_that_commits_first_makes_the_retire_refuse`,
+  `tests/channel_models.rs`). Never take a group or public-model row after
+  the resources lock; a path that needs both takes the row first.
+- **A generated document's owner is `public:<public_model_id>`, and only
+  `src/channels.rs` writes one.** The direct and routing documents a public
+  model implies go through `write_resource` like any other, with
+  `managed_by: Some(&channels::owner(id))`, so a hand edit answers
+  `409 managed_resource` and a regeneration cannot silently overwrite one.
+  `only_the_resources_module_writes_gw_resources` (`tests/boot.rs`) enforces
+  the write half.
+- **The upstream-model route is the control plane's only outbound call: it
+  is operator-only, bounded, scrubbed and writes nothing.**
+  `GET /admin/provider-keys/{id}/upstream-models` (`src/upstream_models.rs`)
+  reaches the account's own configured host on that account's own credential,
+  through the SSRF guard, with a 5 s timeout and a 1 MiB body cap behind a
+  60 s cache keyed on the account id **and its document version**, so editing
+  the account misses at once. One call per account is in flight; a second
+  request waits for it and shares the answer. It follows no redirect and
+  writes no row, document or audit entry — the list feeds a picker, and a
+  value it offers is stored only when the operator saves it. Its errors go
+  through the shared scrubber, so neither the credential nor the operator's
+  infrastructure appears in an answer or a log line.
 - **Advisory lock keys must be unique.** They are the `*_LOCK_KEY` constants,
   all `0x6169_7369_7863_70xx`: operators `7030`, projector `7031`, resources
   `7032`, boot `7033`, signup `7073`, and the test harness's template lock
@@ -120,13 +162,49 @@ Money fails the same quiet way: a wrong entry still answers 200, and shows
 only in reconciliation (`GET /admin/billing/reconciliation`) or on a tenant's
 statement.
 
-- **The ledger is append-only.** `billing_ledger` and `pricing_adjustments`
-  take inserts only: a trigger refuses every `UPDATE`, `DELETE` and
-  `TRUNCATE` (migrations `0014`, `0018`), and a correction is a new entry, a
-  re-pricing run's `adjustment`, never an edit of an old one. The balance
-  cached on `billing_accounts` is moved only by `ledger::post_flagging`, in
-  the same transaction as the entries it sums. A migration that drops or
-  replaces a trigger turns `the_ledger_refuses_update_and_delete`,
+- **Money in the database is micro-CNY, in the `_cny` tables, and the USD
+  tables take no new rows.** `pricing_charges_cny`, `billing_ledger_cny`,
+  `billing_topups_cny`, `billing_repricing_runs_cny`, `pricing_adjustments_cny`
+  and the `*_micro_cny` columns on `billing_accounts` and `billing_budgets`
+  are the money this release reads and writes (`0027`, `0028`). The tables
+  they replace still exist, holding the rows a USD database had, and a
+  `BEFORE INSERT` trigger on each refuses every new row (`billing_usd_fenced`,
+  `0027`): an older replica's intake batch therefore fails and the gateway
+  sends it again, which is the fence doing its job, not a bug to route
+  around. Nothing converts between the two, anywhere: there is no exchange
+  rate in this platform, and `cost_micro_usd` is the one USD figure left,
+  because an upstream's cost is in the upstream's own currency. A migration
+  that drops a fence, or a query that writes a USD table, is what
+  `the_fences_refuse_every_usd_money_table_and_the_discount_still_inserts`
+  and `the_usd_quota_tables_take_no_new_rows` (`tests/billing_migration.rs`)
+  catch.
+- **`0027`'s guard refuses a database that still holds customer USD money,
+  at migration time, by name and by count.** It counts customer tenants with
+  ledger entries, pending top-ups, live quotas and a credit limit, and raises
+  rather than convert, move or delete a single amount. The upgrade path for
+  such a database is a human settling it, not a migration; the counts are
+  what the operator needs to do that.
+  `customer_usd_money_refuses_the_upgrade_and_names_the_counts` and
+  `a_platform_with_only_internal_usd_history_migrates`
+  (`tests/billing_migration.rs`) pin both sides.
+- **The internal tenant is priced and posted, and never marked.** Its usage
+  is charged at its keys' group rates and debited from its ledger like any
+  customer's, postpaid, so its balance runs negative as the platform's own
+  consumption. `marks::project` and `marks::settle_locked` return before
+  writing anything for it (`is_internal`): it gets no balance mark and no
+  blocking quota mark, so nothing refuses its traffic when the balance or a
+  quota crosses. An operator credit settles the negative balance for
+  bookkeeping; it is the only thing the tenant's ledger needs from a human.
+  A charge path that stops posting for `is_internal`, or a mark path that
+  starts writing one, is the regression to look for here.
+- **The ledger is append-only.** `billing_ledger_cny` and
+  `pricing_adjustments_cny` take inserts only: a trigger refuses every
+  `UPDATE`, `DELETE` and `TRUNCATE` (migrations `0014`, `0018`, and their
+  `_cny` twins in `0027`), and a correction is a new entry, a re-pricing
+  run's `adjustment`, never an edit of an old one. The balance cached on
+  `billing_accounts` is moved only by `ledger::post_flagging`, in the same
+  transaction as the entries it sums. A migration that drops or replaces a
+  trigger turns `the_ledger_refuses_update_and_delete`,
   `the_ledger_refuses_truncate` or `the_adjustments_refuse_update_and_delete`
   red; a cache moved without an entry shows in
   `each_check_catches_its_own_drift` (`tests/billing_reconcile.rs`).
@@ -137,7 +215,7 @@ statement.
   Each posts before it commits, so a cause and its entry commit or roll back
   together. A charge of 0 (a free model, a 100 % discount) and a run whose
   deltas for a tenant sum to 0 post nothing: the ledger's
-  `CHECK (amount_micro_usd <> 0)` would fail the whole transaction, which for
+  `CHECK (amount_micro_cny <> 0)` would fail the whole transaction, which for
   intake is every tenant's rows in the batch.
   `a_zero_charge_row_posts_nothing_and_does_not_fail_its_batch`,
   `a_charged_row_posts_one_debit_with_the_balance_after_it`,
@@ -314,6 +392,18 @@ statement.
   holds no working key), suspend, reactivate, a grant change and a model delete.
   A tenant's restrictions bracket what they guard: its limits policy is written
   before its keys open and retired after they close.
+- **A key's group is one routing name, chosen once, and it *is* the key's
+  routing.** `keys::effective_groups` writes `[<the group's name>]` and
+  nothing else, so a grouped key reaches that group's upstream accounts
+  alone. A key never changes group: `PATCH` accepts `group_id` only while the
+  key has none, because a silent move would silently change its price. A
+  customer key with no group, or one whose group has left its tenant's list,
+  is `closed_for_group` — projected disabled until a group is set once and
+  the group is the tenant's again. The internal tenant's keys are never closed
+  this way (R2): they may name any live group, and are priced and posted like
+  any other tenant's. A customer key falling closed is a live product state on
+  a database upgraded through `0024`, which backfills only what it can infer
+  and leaves the rest NULL.
 
 ## Tenancy on `/api/*`
 
@@ -380,9 +470,22 @@ statement.
   and a key of a tenant found that way stays disabled. A customer key always
   writes `allowed_model_ids` (`[]` grants none, where an absent list would fall
   back to names) and `allowed_endpoints`.
+- **A customer key names exactly one live group, and a key without one is
+  closed.** `groups::key_group` refuses an id naming nothing, a retired group
+  or another tenant's with `422 /group_id` ("分组不存在或不可用"), and an
+  omitted id with "请选择分组" unless the tenant is assigned exactly one
+  group. `closed_for_group` then keeps the key disabled while its group is
+  absent or has left the tenant's list, and reopening is the same test the
+  other way: assigning the group back opens its keys. The internal tenant's
+  keys are the exception the owner set (R2): `closed_for_group` never closes
+  one for a group reason, it may name any live group, and a key left with no
+  group is priced only once it has one — the upgrade gives every such key the
+  designated default instead (`0024`).
 - A value that cannot be read closes: an unreadable gateway version, an
   unknown endpoint family on the gateway, a stored tenant default with no
-  groups.
+  groups, a group name on a tenant, a tenant default or an upstream account
+  that names no live group. A new group's routing name must match
+  `[a-z0-9][a-z0-9_-]{0,63}` and never changes.
 - Every route has a `ROUTE_ROLES` row. The census fails a route without one,
   and `tests/roles.rs` sends each mutating route as the role just below its
   minimum; a new route adds its fixture there.

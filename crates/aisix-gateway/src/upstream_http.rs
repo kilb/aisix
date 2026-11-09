@@ -1068,6 +1068,11 @@ mod tests {
                 "aisix-server/src/telemetry.rs",
                 "aisix-server/src/heartbeat.rs",
                 "aisix-obs/src/otlp_http_sink.rs",
+                // The control plane is its own binary: this is its client
+                // for an upstream account's model list, built on its own
+                // pool, and no worker's dispatch pool ever stands in for
+                // it. It sends the same `aisix/<version>` identity.
+                "aisix-control-plane/src/upstream_http.rs",
             ]
             .iter()
             .any(|path| file.ends_with(path))
