@@ -824,6 +824,145 @@ async fn a_public_model_in_use_cannot_be_retired() {
     );
 }
 
+/// The direct document the channel row of `key` and `public` generated.
+async fn direct_of(cp: &TestCp, key: Uuid, public: Uuid) -> Uuid {
+    sqlx::query_scalar(
+        "SELECT direct_model_id FROM channel_models \
+         WHERE provider_key_id = $1 AND public_model_id = $2",
+    )
+    .bind(key)
+    .bind(public)
+    .fetch_one(cp.db().pool())
+    .await
+    .expect("read the channel row")
+}
+
+/// The refusal's message at `path`.
+fn message_at<'a>(r: &'a Resp, path: &str) -> Option<&'a str> {
+    r.body["details"]
+        .as_array()?
+        .iter()
+        .find(|d| d["path"] == path)?["message"]
+        .as_str()
+}
+
+#[tokio::test]
+async fn a_channels_direct_document_cannot_be_granted_to_a_customer() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let op = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let key = provider_key(&cp, &op, "acct-gp-5d9").await;
+    let (public, _) = create_public(&cp, &op, "pub-grant-8c1").await;
+    let r = put_channel(&cp, &op, key, public, json!({})).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let direct = direct_of(&cp, key, public).await;
+    assert!(
+        is_live(&cp, Kind::Models, direct).await,
+        "the direct document is live"
+    );
+
+    // Alone, and beside the public model: the refusal lands on the direct
+    // document's own index, and nothing is granted.
+    let tenant = tenant_granted(&cp, &op, &[]).await;
+    let customer = "公共模型生成的直连模型不能授权给客户租户，请授权该公共模型";
+    let r = set_grants(&cp, &op, &tenant.to_string(), &[direct]).await;
+    assert_422_at(&r, "/allowed_model_ids/0");
+    assert_eq!(
+        message_at(&r, "/allowed_model_ids/0"),
+        Some(customer),
+        "{r:?}"
+    );
+    let r = set_grants(&cp, &op, &tenant.to_string(), &[public, direct]).await;
+    assert_422_at(&r, "/allowed_model_ids/1");
+    assert_eq!(grants(&cp, tenant).await, Vec::<Uuid>::new());
+
+    // The public model itself is what a tenant is granted.
+    let r = set_grants(&cp, &op, &tenant.to_string(), &[public]).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    assert_eq!(grants(&cp, tenant).await, vec![public]);
+
+    // Refused to the platform's own tenant too: the document has no price of
+    // its own, and the platform's own tenant is priced like any other.
+    let internal: Uuid = sqlx::query_scalar("SELECT id FROM tenants WHERE is_internal")
+        .fetch_one(cp.db().pool())
+        .await
+        .expect("the internal tenant");
+    let r = set_grants(&cp, &op, &internal.to_string(), &[direct]).await;
+    assert_422_at(&r, "/allowed_model_ids/0");
+    assert_eq!(
+        message_at(&r, "/allowed_model_ids/0"),
+        Some("公共模型生成的直连模型不能授权给平台内部租户，请授权该公共模型"),
+        "{r:?}"
+    );
+    assert!(!grants(&cp, internal).await.contains(&direct));
+    let r = set_grants(&cp, &op, &internal.to_string(), &[public]).await;
+    assert_eq!(r.status, 200, "{r:?}");
+}
+
+#[tokio::test]
+async fn a_key_with_no_selection_counts_toward_the_models_keys() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let op = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let key = provider_key(&cp, &op, "acct-gp-5da").await;
+    let (public, _) = create_public(&cp, &op, "pub-keys-8c1").await;
+    let r = put_channel(&cp, &op, key, public, json!({})).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let shared: Uuid = sqlx::query_scalar("SELECT id FROM provider_groups WHERE name = 'shared'")
+        .fetch_one(cp.db().pool())
+        .await
+        .expect("the first-boot group");
+
+    // One key with no selection in a tenant granted the model: it reaches
+    // every grant, the model included. One in a tenant not granted it: it
+    // reaches nothing of this model.
+    let granted = tenant_granted(&cp, &op, &[public]).await;
+    let other = tenant_granted(&cp, &op, &[]).await;
+    for (tenant, label) in [(granted, "inherits-8c1"), (other, "elsewhere-8c1")] {
+        let r = cp
+            .send(
+                "POST",
+                &format!("/admin/tenants/{tenant}/keys"),
+                Some(op.cookie()),
+                Some(json!({"label": label, "group_id": shared})),
+            )
+            .await;
+        assert_eq!(r.status, 201, "{r:?}");
+        let selection: Option<Vec<Uuid>> =
+            sqlx::query_scalar("SELECT model_ids FROM tenant_keys WHERE label = $1")
+                .bind(label)
+                .fetch_one(cp.db().pool())
+                .await
+                .expect("read the key");
+        assert_eq!(selection, None, "the key selects no models of its own");
+    }
+
+    let view = public_model(&cp, &op, public).await;
+    assert_eq!(
+        (view["tenants"].clone(), view["keys"].clone()),
+        (json!(1), json!(1)),
+        "{view}"
+    );
+
+    // The retire refusal carries the same count.
+    let r = cp
+        .send(
+            "POST",
+            &format!("{PUBLICS}/{public}/retire"),
+            Some(op.cookie()),
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(
+        (r.status, r.body["code"].as_str()),
+        (409, Some("public_model_in_use")),
+        "{r:?}"
+    );
+    assert_eq!(r.body["counts"]["keys"], 1, "{r:?}");
+}
+
 #[tokio::test]
 async fn a_provider_key_serving_a_public_model_cannot_be_deleted() {
     let Some(cp) = TestCp::start().await else {

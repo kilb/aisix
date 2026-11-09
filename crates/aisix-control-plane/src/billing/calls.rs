@@ -236,8 +236,9 @@ pub struct MemberRef {
 pub struct ChargeView {
     pub status: &'static str,
     pub amount_micro_cny: Option<i64>,
-    /// The group the charge was priced in; `null` for a row priced before a
-    /// key took a group, or one whose group has since been retired.
+    /// The group the charge was priced in, shown by its display name even
+    /// once the group is retired; `null` for a row priced before its key
+    /// took a group.
     pub group: Option<ChargeGroup>,
     /// The sum of the event's re-pricing adjustments; 0 when no run adjusted
     /// it.

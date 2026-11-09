@@ -446,7 +446,9 @@ pub async fn refuse_if_served(
 pub struct PublicModelUse {
     /// Live tenants whose grants name it.
     pub tenants: i64,
-    /// Live keys whose model selection names it.
+    /// Live keys that reach it: those whose model selection names it, and
+    /// those with no selection, which reach every model their live tenant
+    /// is granted.
     pub keys: i64,
     /// Its enabled channel models.
     pub channels: i64,
@@ -469,8 +471,11 @@ async fn references(conn: &mut PgConnection, id: Uuid) -> Result<PublicModelUse,
     .await
     .map_err(DbError::from)?;
     let keys: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*)::bigint FROM tenant_keys \
-         WHERE revoked_at IS NULL AND $1 = ANY(model_ids)",
+        "SELECT COUNT(*)::bigint FROM tenant_keys k \
+         WHERE k.revoked_at IS NULL AND ($1 = ANY(k.model_ids) \
+           OR (k.model_ids IS NULL AND EXISTS (SELECT 1 FROM tenants t \
+                WHERE t.id = k.tenant_id AND t.status <> 'deleted' \
+                  AND $1 = ANY(t.allowed_model_ids))))",
     )
     .bind(id)
     .fetch_one(&mut *conn)

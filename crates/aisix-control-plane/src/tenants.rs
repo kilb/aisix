@@ -855,6 +855,30 @@ fn ungrantable(doc: &Value) -> Option<(&'static str, &'static str)> {
     None
 }
 
+/// Whether `model_id` is the direct document a public model generated for
+/// one serving account (`channel_models.direct_model_id`).
+///
+/// No tenant may be granted one, the platform's own included. Its name is
+/// `<public name>#<account display name>`, so a customer granted it is shown
+/// which upstream account serves the model, and its key calls that account
+/// alone, past the public model's priorities and weights. The platform's own
+/// tenant is refused too, for two reasons that hold for every tenant: the
+/// document has no price of its own (baselines and group rates key on the
+/// public model's id), so every call through it is stored unpriced, while
+/// the platform's own tenant is priced like any other; and the document
+/// lives and dies with its channel row, which removes it without withdrawing
+/// any grant (`channels` takes no tenant row), so a grant on it would be left
+/// naming a deleted model. The public model is what to grant instead.
+async fn generated_direct(conn: &mut PgConnection, model_id: Uuid) -> Result<bool, ApiError> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM channel_models WHERE direct_model_id = $1)",
+    )
+    .bind(model_id)
+    .fetch_one(conn)
+    .await
+    .map_err(DbError::from)?)
+}
+
 /// The model ids `raw` names, sorted and without repeats, once each is a
 /// live model a tenant of this kind may be granted; otherwise a detail at
 /// `/allowed_model_ids/<i>` for each one that is not. The caller holds the
@@ -883,6 +907,14 @@ async fn checked_grants(
         .map_err(DbError::from)?;
         match doc {
             None => problems.push(detail(&path, "模型不存在")),
+            Some(_) if generated_direct(&mut *conn, id).await? => problems.push(detail(
+                &path,
+                if is_internal {
+                    "公共模型生成的直连模型不能授权给平台内部租户，请授权该公共模型"
+                } else {
+                    "公共模型生成的直连模型不能授权给客户租户，请授权该公共模型"
+                },
+            )),
             Some(doc) => match ungrantable(&doc).filter(|_| !is_internal) {
                 Some((_, what)) => {
                     problems.push(detail(&path, &format!("{what}不能授权给客户租户")))

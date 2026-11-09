@@ -624,11 +624,13 @@ export interface ChargeGroup {
 export interface CallCharge {
   status: CallChargeStatus;
   amount_micro_cny: number | null;
-  /** `null` for a call priced before its key took a group, or whose group has since been retired. */
+  /** The group the call was priced in, even once it is retired; `null` for a call priced before its key took a group. */
   group: ChargeGroup | null;
   /** The sum of the re-pricing corrections of this call; 0 when none. */
   adjusted_micro_cny: number;
   estimated: boolean;
+  /** The organisation's discount the charge was taken at, in basis points: 1000 is 10 % off. The lines' rates are before it. */
+  discount_bps: number;
   lines: ChargeLine[];
 }
 
