@@ -36,6 +36,15 @@ const TEXT: Record<string, string> = {
   proposal_state: "该提议已被处理，请刷新",
   group_in_use: "该分组仍在使用中，无法停用",
   group_retired: "该分组已停用，不能再改名或设为默认分组",
+  // The upstream's own model list: each refusal says what to do instead, and
+  // every one of them leaves free text as the way forward.
+  upstream_models_unsupported: "该类型的上游不提供模型列表，请直接填写模型名称",
+  upstream_unreachable: "无法连接该上游获取模型列表，请直接填写模型名称",
+  upstream_timeout: "获取该上游的模型列表超时，请直接填写模型名称",
+  upstream_bad_response: "该上游的模型列表无法读取，请直接填写模型名称",
+  // Public models and the accounts that serve them.
+  public_model_in_use: "该公共模型仍在使用中，无法停用",
+  public_model_retired: "该公共模型已停用",
 };
 
 export function messageFor(e: ApiError): string {

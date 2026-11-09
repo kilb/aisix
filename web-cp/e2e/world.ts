@@ -334,3 +334,12 @@ export async function waitClearOfUtcMidnight(marginMs = 120_000): Promise<void> 
 export async function createChannelModel(stack: Stack, providerKeyId: string, publicModelId: string, body: Record<string, unknown> = {}): Promise<Json> {
   return stack.admin.put(`/admin/provider-keys/${providerKeyId}/channel-models/${publicModelId}`, body);
 }
+
+/**
+ * A public model named `name`: the row only, so no document exists until an
+ * upstream account is ticked for it. A name a live model already holds is
+ * refused rather than adopted, which is what the page shows on the field.
+ */
+export async function createPublicModel(stack: Stack, name: string): Promise<Json> {
+  return stack.admin.post("/admin/public-models", { name });
+}

@@ -1,0 +1,119 @@
+/* 上游账号 · 模型. Every value comes from the tokens. */
+
+/* A field whose list opens under it: the box wraps the input and the list. */
+.upicker {
+  position: relative;
+}
+.upicker > input {
+  width: 100%;
+  font-family: var(--font-mono);
+  font-size: var(--fs-13);
+}
+
+/* The account's list, while it is being read: the field is disabled, so the
+   spinner sits beside it rather than inside a disabled control. */
+.upicker-loading {
+  margin-left: var(--s-2);
+  color: var(--text-muted);
+  font-size: var(--fs-12);
+}
+
+/* The offered names, over the table rather than pushing it down. */
+.upicker-list {
+  position: absolute;
+  z-index: 20;
+  left: 0;
+  right: 0;
+  max-height: 16rem;
+  overflow-y: auto;
+  margin: var(--s-1) 0 0;
+  padding: var(--s-1) 0;
+  list-style: none;
+  background: var(--surface);
+  border: 1px solid var(--divider);
+  border-radius: var(--r-button);
+  box-shadow: var(--shadow-pop, 0 4px 16px rgb(0 0 0 / 12%));
+}
+.upicker-list > li[role="option"] {
+  padding: var(--s-1) var(--s-3);
+  font-family: var(--font-mono);
+  font-size: var(--fs-13);
+  cursor: pointer;
+}
+.upicker-list > li[role="option"]:hover,
+.upicker-list > li[aria-selected="true"] {
+  background: var(--chip);
+}
+.upicker-list > .upicker-more {
+  padding: var(--s-1) var(--s-3);
+  color: var(--text-muted);
+  font-size: var(--fs-12);
+}
+
+/* The reason the list is not offered, under a field that became free text. */
+.upicker-fallback {
+  margin: var(--s-1) 0 0;
+}
+.upicker-reason {
+  display: block;
+  color: var(--text-muted);
+  font-size: var(--fs-12);
+  overflow-wrap: anywhere;
+}
+
+/* The account's model section: its own panel under the account's form. */
+.ch-section {
+  margin-top: var(--s-5);
+}
+.ch-filter {
+  max-width: 24rem;
+}
+.ch-tick {
+  display: inline-flex;
+  align-items: center;
+}
+.ch-num {
+  width: 6.5rem;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+.ch-groups {
+  font-size: var(--fs-12);
+}
+
+/* A row's own failure, listed together under the table. */
+.ch-errors {
+  margin: var(--s-3) 0;
+  padding-left: var(--s-5);
+}
+.ch-errors > li {
+  margin: var(--s-1) 0;
+}
+
+/* The save, with what it will do beside it. */
+.ch-save {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--s-3);
+  margin: var(--s-4) 0 0;
+}
+.ch-warn-line {
+  display: block;
+}
+
+/* Creating a public model from an upstream name, in place. */
+.ch-create {
+  margin-top: var(--s-4);
+  padding-top: var(--s-4);
+  border-top: 1px solid var(--divider);
+}
+.ch-create-row {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--s-2);
+  flex-wrap: wrap;
+}
+.ch-create-row > .upicker {
+  flex: 1 1 18rem;
+}

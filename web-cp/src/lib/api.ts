@@ -1477,3 +1477,119 @@ export const margin = {
     return (await call<{ items: MarginRow[] }>("GET", `/admin/pricing/margin?${params}`)).data.items;
   },
 };
+
+// ── public models, and the accounts that serve them ─────────────────────────
+
+/** One account that serves a public model, as `served_by` lists it. */
+export interface ServedBy {
+  provider_key_id: string;
+  /** The account's name, as its own document gives it. */
+  display_name: string;
+  /** The routing names of the groups the account lists. */
+  groups: string[];
+  /** The upstream name the account calls; `null` means the public name itself. */
+  upstream_model: string | null;
+  priority: number;
+  weight: number;
+  enabled: boolean;
+}
+
+/**
+ * A public model: the name a tenant sends. Its `id` is the generated routing
+ * document's id, minted once, so a rename is a new public model.
+ */
+export interface PublicModel {
+  id: string;
+  name: string;
+  enabled: boolean;
+  served_by: ServedBy[];
+  /** Live tenants whose grants name it. */
+  tenants: number;
+  /** Live keys whose model selection names it. */
+  keys: number;
+  created_at: string;
+  retired_at: string | null;
+}
+
+/**
+ * One public model as an upstream account's checklist shows it: every live
+ * public model, served or not. `served` says whether this account has a
+ * channel row for it; `enabled` is that row's own flag.
+ */
+export interface ChannelModel {
+  public_model_id: string;
+  public_model_name: string;
+  upstream_model: string | null;
+  priority: number;
+  weight: number;
+  enabled: boolean;
+  served: boolean;
+}
+
+/**
+ * The upstream account's own model list, for the pickers. Read-only: nothing
+ * it returns becomes a price or a document without an operator's save.
+ */
+export interface UpstreamModelList {
+  items: { id: string }[];
+  fetched_at: string;
+  truncated: boolean;
+  /** What an operator should know about the answer, already in Chinese. */
+  warnings: string[];
+}
+
+/** What a channel-model write answers. */
+export interface ChannelModelSaved extends ChannelModel {
+  warnings?: string[];
+}
+
+export const publicModels = {
+  /** Every public model, live and retired, by name. */
+  async list(): Promise<PublicModel[]> {
+    return (await call<{ items: PublicModel[] }>("GET", "/admin/public-models")).data.items;
+  },
+  /** `422 /name` when a live model of any kind already holds the name; never adopts it. */
+  async create(name: string): Promise<PublicModel> {
+    return (await call<PublicModel>("POST", "/admin/public-models", { name })).data;
+  },
+  async get(id: string): Promise<PublicModel> {
+    return (await call<PublicModel>("GET", `/admin/public-models/${seg(id)}`)).data;
+  },
+  /** `409 public_model_in_use` with `counts {tenants, keys, channels}` while anything live names it. */
+  async retire(id: string): Promise<PublicModel> {
+    return (await call<PublicModel>("POST", `/admin/public-models/${seg(id)}/retire`, {})).data;
+  },
+};
+
+export const channelModels = {
+  /** Every live public model, with this account's row for each. */
+  async list(providerKeyId: string): Promise<ChannelModel[]> {
+    return (await call<{ items: ChannelModel[] }>("GET", `/admin/provider-keys/${seg(providerKeyId)}/channel-models`))
+      .data.items;
+  },
+  /** Creates or updates the row, and regenerates every document it implies, in one transaction. */
+  async put(
+    providerKeyId: string,
+    publicModelId: string,
+    body: { upstream_model?: string | null; priority?: number; weight?: number; enabled?: boolean },
+  ): Promise<ChannelModelSaved> {
+    return (
+      await call<ChannelModelSaved>(
+        "PUT",
+        `/admin/provider-keys/${seg(providerKeyId)}/channel-models/${seg(publicModelId)}`,
+        body,
+      )
+    ).data;
+  },
+  /** `204`, after regenerating the documents the removal implies. */
+  async remove(providerKeyId: string, publicModelId: string): Promise<void> {
+    await call<null>("DELETE", `/admin/provider-keys/${seg(providerKeyId)}/channel-models/${seg(publicModelId)}`);
+  },
+};
+
+/** The upstream account's own model list: operator-only, cached 60 s, writing nothing. */
+export const upstreamModels = {
+  async list(providerKeyId: string): Promise<UpstreamModelList> {
+    return (await call<UpstreamModelList>("GET", `/admin/provider-keys/${seg(providerKeyId)}/upstream-models`)).data;
+  },
+};

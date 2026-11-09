@@ -1,0 +1,22 @@
+/* 价格 · 公共模型. Every value comes from the tokens. */
+
+/* A model with no baseline, or a group with no rate: the word in the error red. */
+.pm-unpriced {
+  color: var(--error);
+  font-weight: 700;
+}
+
+/* The create form under the list: a bordered block, one field and its action. */
+.pm-create {
+  margin: var(--s-4) 0 0;
+  padding: var(--s-4);
+  border: 1px solid var(--divider);
+  border-radius: var(--r-button);
+}
+.pm-create > h3 {
+  margin: 0 0 var(--s-2);
+  font-size: var(--fs-15);
+}
+.pm-create > .r {
+  max-width: 32rem;
+}
