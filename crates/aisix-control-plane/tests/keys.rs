@@ -2771,7 +2771,7 @@ async fn a_tenant_with_one_group_gets_it_by_default() {
     .await;
     assert_eq!(view.body["group"]["id"], json!(shared), "{view:?}");
     // The first-boot group's display name, never its routing name (0030).
-    assert_eq!(view.body["group"]["display_name"], "默认分组", "{view:?}");
+    assert_eq!(view.body["group"]["display_name"], "通用分组", "{view:?}");
     assert_eq!(view.body["group_available"], true, "{view:?}");
     assert_eq!(
         key_doc(&cp, &id).await["allowed_provider_groups"],

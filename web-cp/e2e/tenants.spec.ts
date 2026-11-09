@@ -167,8 +167,8 @@ test("给租户设置可用分组后，运维侧的 key 显示它的分组，/ap
   const groups = page.getByRole("group", { name: "可用分组" });
   await expect(groups).toContainText("租户按显示名看到分组");
   await expect(groups.getByRole("checkbox", { name: "欧洲二区 7e2" })).toBeVisible();
-  // `shared` is shown by its display name, 默认分组 on a fresh database.
-  await groups.getByRole("checkbox", { name: "默认分组" }).uncheck();
+  // `shared` is shown by its display name, 通用分组 on a fresh database.
+  await groups.getByRole("checkbox", { name: "通用分组" }).uncheck();
   await groups.getByRole("checkbox", { name: "grp-eu-5d2" }).check();
   // The save stops the one key in `shared`, so it is confirmed first.
   await groups.getByRole("button", { name: "保存分组" }).click();
@@ -599,8 +599,8 @@ test("保存后租户没有任何带上游账号的分组时，先警告并要�
   await openTenant(page, t.org);
   const groups = page.getByRole("group", { name: "可用分组" });
   await expect(groups.getByRole("listitem").filter({ hasText: "grp-none-7d3" })).toContainText("没有上游账号在此分组");
-  // `shared` is shown by its display name, 默认分组 on a fresh database.
-  await groups.getByRole("checkbox", { name: "默认分组" }).uncheck();
+  // `shared` is shown by its display name, 通用分组 on a fresh database.
+  await groups.getByRole("checkbox", { name: "通用分组" }).uncheck();
   await groups.getByRole("button", { name: "保存分组" }).click();
   await expect(groups.getByRole("alert")).toContainText("grp-none-7d3");
   // Nothing is saved until it is confirmed.

@@ -241,10 +241,8 @@ async fn the_migration_backfills_a_group_for_every_name_in_use() {
         ],
         "the revoked key's group is not in use and must not be backfilled"
     );
-    // 0023 backfills each with its name as its display name; 0030, which
-    // runs in the same upgrade, then gives each a display name of its own,
-    // since a routing name is never what a tenant is shown.
-    let mut shown = Vec::new();
+    // 0023 backfills each with its name as its display name, and 0030, which
+    // runs in the same upgrade, renames only the first-boot groups.
     for name in ["grp-a-7c1", "grp-b-7c1", "grp-c-7c1", "grp-d-7c1"] {
         let (display_name, description, is_default): (String, String, bool) = sqlx::query_as(
             "SELECT display_name, description, is_default FROM provider_groups WHERE name = $1",
@@ -253,13 +251,9 @@ async fn the_migration_backfills_a_group_for_every_name_in_use() {
         .fetch_one(&pool)
         .await
         .expect("a backfilled group");
-        assert_ne!(display_name, name, "a routing name is not a display name");
-        assert_eq!(description, "", "{name}");
+        assert_eq!((display_name.as_str(), description.as_str()), (name, ""));
         assert!(!is_default, "{name} is not the designated default");
-        shown.push(display_name);
     }
-    shown.sort();
-    assert_eq!(shown, ["分组 1", "分组 2", "分组 3", "分组 4"]);
     // A backfilled group gets no rate: its rows are `missing_rate` until an
     // operator sets one.
     let rates: i64 = sqlx::query_scalar("SELECT count(*) FROM pricing_group_rates")
@@ -304,7 +298,7 @@ async fn a_fresh_database_has_the_first_boot_default_group() {
     assert_eq!((display_name.as_str(), is_default), ("默认", true));
     // The first-boot group is shown by a name of its own, not `shared`.
     let (display_name, _, is_default) = group_row(&cp, "shared").await;
-    assert_eq!((display_name.as_str(), is_default), ("默认分组", false));
+    assert_eq!((display_name.as_str(), is_default), ("通用分组", false));
     let designated: Vec<String> =
         sqlx::query_scalar("SELECT name FROM provider_groups WHERE is_default")
             .fetch_all(cp.db().pool())
@@ -2139,29 +2133,29 @@ async fn a_first_boot_tenant_is_shown_no_routing_name() {
         .iter()
         .map(|g| g["display_name"].as_str().expect("a display name"))
         .collect();
-    assert_eq!(shown, ["默认分组"], "{r:?}");
+    assert_eq!(shown, ["通用分组"], "{r:?}");
     let body = r.body.to_string();
     for name in group_names(&cp).await {
         assert!(!body.contains(&format!("\"{name}\"")), "{name} in {body}");
     }
 }
 
-/// 0030 on a database 0023 left a group shown by its routing name: the
-/// first-boot `shared` becomes 默认分组, every other such group 分组 N in
-/// creation order, retired or not, and a display name an operator chose is
-/// left as it is.
+/// 0030 renames the two first-boot groups and nothing else: `shared` becomes
+/// 通用分组 and a backfilled `default` becomes 默认, each only while its
+/// display name is still its routing name. A group an operator created keeps
+/// its display name, even one equal to its routing name, retired or not.
 #[tokio::test]
-async fn the_upgrade_gives_every_group_shown_by_its_routing_name_a_display_name() {
+async fn the_upgrade_renames_only_the_first_boot_groups() {
     let Some(pool) = database_at(29).await else {
         return;
     };
     for sql in [
-        "INSERT INTO provider_groups (name, display_name, created_at) VALUES \
-         ('grp-late-7c1', 'grp-late-7c1', '2026-03-01T00:00:00Z'), \
-         ('grp-early-7c1', 'grp-early-7c1', '2026-01-01T00:00:00Z'), \
-         ('grp-named-7c1', '专线', '2026-02-01T00:00:00Z')",
-        "INSERT INTO provider_groups (name, display_name, created_at, retired_at) VALUES \
-         ('grp-gone-7c1', 'grp-gone-7c1', '2026-02-15T00:00:00Z', '2026-04-01T00:00:00Z')",
+        "INSERT INTO provider_groups (name, display_name) VALUES \
+         ('grp-same-7c1', 'grp-same-7c1'), ('grp-named-7c1', '专线')",
+        "INSERT INTO provider_groups (name, display_name, retired_at) VALUES \
+         ('grp-gone-7c1', 'grp-gone-7c1', now())",
+        // A `default` 0023 backfilled keeps its name as its display name.
+        "UPDATE provider_groups SET display_name = 'default' WHERE name = 'default'",
     ] {
         sqlx::query(sql)
             .execute(&pool)
@@ -2186,11 +2180,10 @@ async fn the_upgrade_gives_every_group_shown_by_its_routing_name_a_display_name(
         shown,
         [
             ("default", "默认"),
-            ("grp-early-7c1", "分组 1"),
-            ("grp-gone-7c1", "分组 2"),
-            ("grp-late-7c1", "分组 3"),
+            ("grp-gone-7c1", "grp-gone-7c1"),
             ("grp-named-7c1", "专线"),
-            ("shared", "默认分组"),
+            ("grp-same-7c1", "grp-same-7c1"),
+            ("shared", "通用分组"),
         ]
         .map(|(n, d)| (n.to_string(), d.to_string()))
     );

@@ -161,7 +161,7 @@ async fn the_realised_rate_is_cny_charged_per_usd_of_cost() {
         support::world::group_id(&w.cp, "shared").await
     );
     // The first-boot group's display name (0030), not its routing name.
-    assert_eq!(item["group"]["display_name"], "默认分组");
+    assert_eq!(item["group"]["display_name"], "通用分组");
     assert_eq!(uuid(&item, "/model/id"), model);
     assert_eq!(item["charged_micro_cny"], 7_200);
     assert_eq!(item["cost_micro_usd"], 1_000);
