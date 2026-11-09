@@ -231,10 +231,10 @@ pub async fn insert_group_rate(
         // A charge reads the rate of the model the caller addressed, which
         // for a channel's generated direct document is its public model, so
         // an override written on the direct document would never apply.
-        if crate::channels::is_generated_direct(&mut *conn, model_id).await? {
+        if let Some(public) = crate::channels::generated_direct_of(&mut *conn, model_id).await? {
             return Err(refused(
                 "/model_id",
-                "该模型由公共模型生成，请为公共模型设置换算率",
+                format!("该模型由公共模型 {public} 生成，请为公共模型 {public} 设置换算率"),
             ));
         }
     } else if row.cny_per_usd.is_none() {

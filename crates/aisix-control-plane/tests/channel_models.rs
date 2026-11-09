@@ -902,7 +902,8 @@ async fn a_channels_direct_document_cannot_be_granted_to_a_customer() {
 
 /// A baseline is the public model's: charges key on the public model's id,
 /// so one written on the direct document a channel row generated would price
-/// nothing. It is refused at `/model_id`, naming what to price instead.
+/// nothing. It is refused at `/model_id`, naming the public model to price
+/// instead, and no price list offers the direct document.
 #[tokio::test]
 async fn a_channels_direct_document_takes_no_baseline() {
     let Some(cp) = TestCp::start().await else {
@@ -939,7 +940,7 @@ async fn a_channels_direct_document_takes_no_baseline() {
     assert_422_at(&r, "/model_id");
     assert_eq!(
         message_at(&r, "/model_id"),
-        Some("该模型由公共模型生成，请为公共模型设置基准价"),
+        Some("该模型由公共模型 pub-baseline-8c1 生成，请为公共模型 pub-baseline-8c1 设置基准价"),
         "{r:?}"
     );
     let written: i64 =
@@ -961,20 +962,26 @@ async fn a_channels_direct_document_takes_no_baseline() {
         .await;
     assert_eq!(r.status, 201, "{r:?}");
 
-    // And the baseline list offers the public model, never the direct
-    // document a baseline cannot be written on.
-    let r = cp
-        .send("GET", "/admin/pricing/baselines", Some(op.cookie()), None)
-        .await;
-    assert_eq!(r.status, 200, "{r:?}");
-    let listed: Vec<&str> = r.body["items"]
-        .as_array()
-        .expect("items")
-        .iter()
-        .filter_map(|i| i["model_id"].as_str())
-        .collect();
-    assert!(listed.contains(&public.to_string().as_str()), "{r:?}");
-    assert!(!listed.contains(&direct.to_string().as_str()), "{r:?}");
+    // And the baseline list and the charge list offer the public model,
+    // never the direct document a baseline cannot be written on.
+    for path in ["/admin/pricing/baselines", "/admin/pricing/models"] {
+        let r = cp.send("GET", path, Some(op.cookie()), None).await;
+        assert_eq!(r.status, 200, "{path}: {r:?}");
+        let listed: Vec<&str> = r.body["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .filter_map(|i| i["model_id"].as_str())
+            .collect();
+        assert!(
+            listed.contains(&public.to_string().as_str()),
+            "{path}: {r:?}"
+        );
+        assert!(
+            !listed.contains(&direct.to_string().as_str()),
+            "{path}: {r:?}"
+        );
+    }
 }
 
 /// A group rate is the public model's too: a charge reads the rate of the
@@ -1011,7 +1018,7 @@ async fn a_channels_direct_document_takes_no_group_rate() {
     assert_422_at(&r, "/model_id");
     assert_eq!(
         message_at(&r, "/model_id"),
-        Some("该模型由公共模型生成，请为公共模型设置换算率"),
+        Some("该模型由公共模型 pub-rate-8c1 生成，请为公共模型 pub-rate-8c1 设置换算率"),
         "{r:?}"
     );
     let written: i64 =
@@ -1040,66 +1047,31 @@ async fn a_channels_direct_document_takes_no_group_rate() {
     assert!(!listed.contains(&direct.to_string().as_str()), "{r:?}");
 }
 
-/// A grant of a channel's direct document stored before grants of one were
-/// refused, on the tenant or on a key's selection, is withdrawn by the next
-/// boot, and the key documents are rewritten without it. The public model
-/// stays granted. A later boot finds nothing to withdraw and rewrites
-/// nothing.
-#[tokio::test]
-async fn a_stored_grant_of_a_channels_direct_document_is_withdrawn_at_boot() {
-    let Some(cp) = TestCp::start().await else {
-        return;
-    };
-    let op = cp.admin_login_seeded(OperatorRole::Operator).await;
-    let key = provider_key(&cp, &op, "acct-gp-5dd").await;
-    let (public, _) = create_public(&cp, &op, "pub-sweep-8c1").await;
-    let r = put_channel(&cp, &op, key, public, json!({})).await;
-    assert_eq!(r.status, 200, "{r:?}");
-    let direct = direct_of(&cp, key, public).await;
-    let shared: Uuid = sqlx::query_scalar("SELECT id FROM provider_groups WHERE name = 'shared'")
-        .fetch_one(cp.db().pool())
-        .await
-        .expect("the first-boot group");
-
-    // A tenant granted the public model, with one key that follows every
-    // grant and one that selects the public model.
-    let tenant = tenant_granted(&cp, &op, &[public]).await;
-    let mut keys = Vec::new();
-    for body in [
-        json!({"label": "follows-8c1", "group_id": shared}),
-        json!({"label": "selects-8c1", "group_id": shared, "model_ids": [public]}),
-    ] {
-        let r = cp
-            .send(
-                "POST",
-                &format!("/admin/tenants/{tenant}/keys"),
-                Some(op.cookie()),
-                Some(body),
-            )
-            .await;
-        assert_eq!(r.status, 201, "{r:?}");
-        keys.push(
-            Uuid::parse_str(r.body["key"]["id"].as_str().expect("a key id")).expect("a uuid"),
-        );
-    }
-
-    // What a release before the refusal could store: the direct document
-    // granted beside the public model, and selected by the second key. The
-    // API refuses both now, so they are written as that release left them.
-    sqlx::query("UPDATE tenants SET allowed_model_ids = allowed_model_ids || $2 WHERE id = $1")
+/// Writes what a release before the refusal could store: `grants` on
+/// `tenant`, and each key's `selection`, by SQL, since the API refuses both
+/// now. Then renames the tenant, which re-projects its key documents from
+/// those rows, as that release did after the grant.
+async fn store_old_grants(
+    cp: &TestCp,
+    op: &OperatorSession,
+    tenant: Uuid,
+    grants: &[Uuid],
+    selections: &[(Uuid, Vec<Uuid>)],
+) {
+    sqlx::query("UPDATE tenants SET allowed_model_ids = $2 WHERE id = $1")
         .bind(tenant)
-        .bind(vec![direct])
+        .bind(grants)
         .execute(cp.db().pool())
         .await
-        .expect("seed the grant");
-    sqlx::query("UPDATE tenant_keys SET model_ids = model_ids || $2 WHERE id = $1")
-        .bind(keys[1])
-        .bind(vec![direct])
-        .execute(cp.db().pool())
-        .await
-        .expect("seed the selection");
-    // A rename re-projects the tenant's keys from its rows, as that release
-    // did after the grant: both key documents now name the direct document.
+        .expect("store the grants");
+    for (key, selection) in selections {
+        sqlx::query("UPDATE tenant_keys SET model_ids = $2 WHERE id = $1")
+            .bind(key)
+            .bind(selection)
+            .execute(cp.db().pool())
+            .await
+            .expect("store the selection");
+    }
     let current = cp
         .send(
             "GET",
@@ -1110,70 +1082,322 @@ async fn a_stored_grant_of_a_channels_direct_document_is_withdrawn_at_boot() {
         .await;
     let version = current.body["version"].as_i64().expect("a version");
     let r = send_conditional(
-        &cp,
+        cp,
         "PATCH",
         &format!("/admin/tenants/{tenant}"),
         op.cookie(),
         version,
-        Some(json!({"name": format!("swept-{}", Uuid::new_v4().simple())})),
+        Some(json!({"name": format!("stored-{}", Uuid::new_v4().simple())})),
     )
     .await;
     assert_eq!(r.status, 200, "{r:?}");
-    let names = |doc: &Value, model: Uuid| -> bool {
-        doc["allowed_model_ids"]
-            .as_array()
-            .is_some_and(|ids| ids.iter().any(|id| id == &json!(model.to_string())))
-    };
-    for k in &keys {
-        let doc = live(&cp, Kind::ApiKeys, *k).await;
-        assert!(names(&doc, direct), "before the boot, {k} names it: {doc}");
-    }
+}
 
-    let booted = cp.restart().await;
-    assert_eq!(grants(&booted, tenant).await, vec![public]);
-    let selection: Option<Vec<Uuid>> =
-        sqlx::query_scalar("SELECT model_ids FROM tenant_keys WHERE id = $1")
-            .bind(keys[1])
-            .fetch_one(booted.db().pool())
+/// A key of `tenant` in `shared` minted by an operator, with no selection of
+/// its own; its id.
+async fn new_key(cp: &TestCp, op: &OperatorSession, tenant: Uuid) -> Uuid {
+    let r = cp
+        .send(
+            "POST",
+            &format!("/admin/tenants/{tenant}/keys"),
+            Some(op.cookie()),
+            Some(json!({
+                "label": format!("stored-{}", Uuid::new_v4().simple()),
+                "group_id": support::world::group_id(cp, support::world::SHARED_GROUP).await,
+            })),
+        )
+        .await;
+    assert_eq!(r.status, 201, "{r:?}");
+    Uuid::parse_str(r.body["key"]["id"].as_str().expect("a key id")).expect("a uuid")
+}
+
+/// The model ids key `key`'s live document grants.
+async fn key_grants(cp: &TestCp, key: Uuid) -> Vec<Uuid> {
+    let doc = live(cp, Kind::ApiKeys, key).await;
+    doc["allowed_model_ids"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no model ids in {doc}"))
+        .iter()
+        .map(|id| Uuid::parse_str(id.as_str().expect("an id")).expect("a uuid"))
+        .collect()
+}
+
+/// A key's stored model selection.
+async fn selection(cp: &TestCp, key: Uuid) -> Option<Vec<Uuid>> {
+    sqlx::query_scalar("SELECT model_ids FROM tenant_keys WHERE id = $1")
+        .bind(key)
+        .fetch_one(cp.db().pool())
+        .await
+        .expect("read the key")
+}
+
+/// The audit rows the replacement wrote, by tenant.
+async fn replacement_rows(cp: &TestCp) -> Vec<(Option<Uuid>, String, Value)> {
+    sqlx::query_as(
+        "SELECT tenant_id, actor_kind, detail FROM audit_log \
+         WHERE action = 'tenant.generated_grants_replaced' ORDER BY id",
+    )
+    .fetch_all(cp.db().pool())
+    .await
+    .expect("read the audit log")
+}
+
+/// What a pass that touches nothing leaves as it was, for `tenants`: each
+/// row's version, each live key's version, the newest `seq` among the
+/// tenant's and its keys' documents, and the replacement's audit rows.
+async fn untouched(cp: &TestCp, tenants: &[Uuid]) -> (Vec<(i64, Vec<i64>, i64)>, usize) {
+    let mut each = Vec::new();
+    for tenant in tenants {
+        let version: i64 = sqlx::query_scalar("SELECT version FROM tenants WHERE id = $1")
+            .bind(tenant)
+            .fetch_one(cp.db().pool())
             .await
-            .expect("read the key");
-    assert_eq!(selection, Some(vec![public]));
-    for k in &keys {
-        let doc = live(&booted, Kind::ApiKeys, *k).await;
-        assert!(!names(&doc, direct), "{k} no longer names it: {doc}");
+            .expect("read the tenant");
+        let keys: Vec<(Uuid, i64)> =
+            sqlx::query_as("SELECT id, version FROM tenant_keys WHERE tenant_id = $1 ORDER BY id")
+                .bind(tenant)
+                .fetch_all(cp.db().pool())
+                .await
+                .expect("read the keys");
+        let ids: Vec<Uuid> = keys.iter().map(|(id, _)| *id).collect();
+        let seq: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(max(seq), 0)::bigint FROM gw_resources \
+             WHERE managed_by = $1 OR (kind = 'api_keys' AND id = ANY($2))",
+        )
+        .bind(format!("tenant:{tenant}"))
+        .bind(&ids)
+        .fetch_one(cp.db().pool())
+        .await
+        .expect("read the documents");
+        each.push((version, keys.into_iter().map(|(_, v)| v).collect(), seq));
+    }
+    (each, replacement_rows(cp).await.len())
+}
+
+/// A call of `key` (of `w`'s tenant) to `model`, as the gateway reports it:
+/// its charge's status and amount.
+async fn call(
+    w: &support::world::World,
+    event: &str,
+    key: Uuid,
+    model: Uuid,
+) -> (String, Option<i64>) {
+    let mut fields = support::world::tokens_680();
+    fields["api_key_id"] = json!(key.to_string());
+    if key.to_string() != w.key {
+        // A key minted with no member reports no user.
+        fields["user_id"] = json!("");
+    }
+    let r = support::world::deliver(
+        &w.dp,
+        Uuid::new_v4(),
+        vec![support::world::usage(w, event, model, fields)],
+    )
+    .await;
+    assert_eq!(r.status, 200, "{r:?}");
+    sqlx::query_as("SELECT status, charge_micro_cny FROM pricing_charges_cny WHERE event_id = $1")
+        .bind(event)
+        .fetch_one(w.cp.db().pool())
+        .await
+        .expect("the call's charge")
+}
+
+/// A grant of a channel's direct document that a release before the
+/// refusal stored becomes, at the next boot, a grant of its public model:
+/// the grant was of that model through one account. A key that selected the
+/// direct document selects the public model, and a call through either key
+/// to the one model its document grants is priced. Where the tenant already
+/// holds the public model, the direct document simply goes. A direct
+/// document whose public model is retired is withdrawn. Each tenant changed
+/// has one audit row naming what was replaced and withdrawn. A later boot
+/// touches nothing.
+#[tokio::test]
+async fn a_stored_grant_of_a_channels_direct_document_becomes_its_public_model() {
+    let Some(w) = support::world::world().await else {
+        return;
+    };
+    let (cp, op) = (&w.cp, &w.admin);
+    let account = provider_key(cp, op, "acct-gp-5dd").await;
+    let (public, _) = create_public(cp, op, "pub-swap-8c1").await;
+    let r = put_channel(cp, op, account, public, json!({})).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let direct = direct_of(cp, account, public).await;
+    // A second public model on the same account, retired since: a channel
+    // row that outlived its model, which nothing can be granted through.
+    let (gone, _) = create_public(cp, op, "pub-gone-8c1").await;
+    let r = put_channel(cp, op, account, gone, json!({})).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let gone_direct = direct_of(cp, account, gone).await;
+    sqlx::query("UPDATE public_models SET retired_at = now() WHERE id = $1")
+        .bind(gone)
+        .execute(cp.db().pool())
+        .await
+        .expect("retire it underneath its channel row");
+    support::world::price(cp, public).await;
+
+    // The world's tenant was granted only the two direct documents: its key
+    // follows every grant, and a second key selected only the first.
+    let selecting = new_key(cp, op, w.tenant).await;
+    store_old_grants(
+        cp,
+        op,
+        w.tenant,
+        &[direct, gone_direct],
+        &[(selecting, vec![direct])],
+    )
+    .await;
+    // Another tenant held the public model beside its direct document, and
+    // so did its key.
+    let other = tenant_granted(cp, op, &[public]).await;
+    let other_key = new_key(cp, op, other).await;
+    store_old_grants(
+        cp,
+        op,
+        other,
+        &[public, direct],
+        &[(other_key, vec![public, direct])],
+    )
+    .await;
+    let key = Uuid::parse_str(&w.key).expect("the world's key");
+    for k in [key, selecting, other_key] {
         assert!(
-            names(&doc, public),
-            "{k} still names the public model: {doc}"
+            key_grants(cp, k).await.contains(&direct),
+            "before the boot, {k}'s document names the direct document"
         );
     }
 
-    // Idempotent: a second boot finds no such grant and touches no row.
-    let versions = |pool: sqlx::PgPool| async move {
-        let tenant_version: i64 = sqlx::query_scalar("SELECT version FROM tenants WHERE id = $1")
-            .bind(tenant)
-            .fetch_one(&pool)
-            .await
-            .expect("read the tenant");
-        let key_versions: Vec<i64> =
-            sqlx::query_scalar("SELECT version FROM tenant_keys WHERE tenant_id = $1 ORDER BY id")
-                .bind(tenant)
-                .fetch_all(&pool)
-                .await
-                .expect("read the keys");
-        (tenant_version, key_versions)
+    let booted = cp.restart().await;
+    assert_eq!(grants(&booted, w.tenant).await, vec![public]);
+    assert_eq!(grants(&booted, other).await, vec![public]);
+    assert_eq!(selection(&booted, selecting).await, Some(vec![public]));
+    assert_eq!(selection(&booted, other_key).await, Some(vec![public]));
+    for k in [key, selecting, other_key] {
+        assert_eq!(key_grants(&booted, k).await, vec![public], "{k}");
+    }
+
+    // Each key's call to the one model its document grants is priced: the
+    // baseline and the group rate are the public model's.
+    for (event, k) in [("e-swap-follows", key), ("e-swap-selects", selecting)] {
+        let granted = key_grants(&booted, k).await;
+        assert_eq!(
+            call(&w, event, k, granted[0]).await,
+            ("charged".to_string(), Some(680)),
+            "{event}"
+        );
+    }
+
+    // One audit row per tenant changed, by the control plane itself.
+    let rows = replacement_rows(&booted).await;
+    let pair = json!({"model_id": direct, "public_model_id": public});
+    let mut who: Vec<(Option<Uuid>, String)> =
+        rows.iter().map(|(t, a, _)| (*t, a.clone())).collect();
+    who.sort();
+    let mut changed = vec![
+        (Some(w.tenant), "system".to_string()),
+        (Some(other), "system".to_string()),
+    ];
+    changed.sort();
+    assert_eq!(who, changed, "one row per tenant changed");
+    let detail_of = |tenant: Uuid| {
+        rows.iter()
+            .find(|(t, _, _)| *t == Some(tenant))
+            .map(|(_, _, d)| d.clone())
+            .unwrap_or_else(|| panic!("no audit row for {tenant}"))
     };
-    let before = versions(booted.db().pool().clone()).await;
+    assert_eq!(
+        detail_of(w.tenant),
+        json!({
+            "replaced": [pair],
+            "withdrawn": [gone_direct],
+            "keys": [{"key_id": selecting, "replaced": [pair], "withdrawn": []}],
+        })
+    );
+    assert_eq!(
+        detail_of(other),
+        json!({
+            "replaced": [pair],
+            "withdrawn": [],
+            "keys": [{"key_id": other_key, "replaced": [pair], "withdrawn": []}],
+        })
+    );
+
+    // Idempotent: a later boot finds nothing to replace, and writes no row,
+    // no document and no audit entry.
+    let before = untouched(&booted, &[w.tenant, other]).await;
     let again = booted.restart().await;
-    assert_eq!(versions(again.db().pool().clone()).await, before);
-    assert_eq!(grants(&again, tenant).await, vec![public]);
+    assert_eq!(untouched(&again, &[w.tenant, other]).await, before);
 }
 
-/// The boot's withdrawal takes each holder's row before the resources lock,
-/// as a model delete does: while a holder is held elsewhere, the boot waits
-/// for it holding no resources lock, and withdraws the grant once it is
+/// One tenant held elsewhere holds back no other: the pass replaces the
+/// grant of every tenant it can lock and leaves the held one, and the next
+/// housekeeping tick replaces that one. Both grants were written after the
+/// boot, as an older replica serving the old picker could.
+#[tokio::test]
+async fn a_held_tenant_holds_back_no_other_and_the_next_tick_replaces_its_grant() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let op = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let account = provider_key(&cp, &op, "acct-gp-5df").await;
+    let (public, _) = create_public(&cp, &op, "pub-held-8c1").await;
+    let r = put_channel(&cp, &op, account, public, json!({})).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let direct = direct_of(&cp, account, public).await;
+    let a = tenant_granted(&cp, &op, &[]).await;
+    let b = tenant_granted(&cp, &op, &[]).await;
+    // The pass takes tenants in id order, so the held one comes first.
+    let (held, free) = (a.min(b), a.max(b));
+    for tenant in [held, free] {
+        store_old_grants(&cp, &op, tenant, &[direct], &[]).await;
+    }
+
+    let ctx = WriteCtx::of(cp.state());
+    let mut holder = cp.db().pool().begin().await.expect("begin");
+    sqlx::query("SELECT 1 FROM tenants WHERE id = $1 FOR UPDATE")
+        .bind(held)
+        .execute(&mut *holder)
+        .await
+        .expect("hold the tenant");
+    let done = aisix_control_plane::tenants::replace_generated_grants(cp.db(), &ctx)
+        .await
+        .expect("the pass");
+    holder.rollback().await.expect("release the tenant");
+    assert_eq!(
+        done,
+        aisix_control_plane::tenants::GeneratedGrantsReplaced {
+            tenants: 1,
+            grants_replaced: 1,
+            grants_withdrawn: 0,
+            keys_changed: 0,
+            deferred: 1,
+            failed: 0,
+        }
+    );
+    assert_eq!(grants(&cp, free).await, vec![public]);
+    assert_eq!(grants(&cp, held).await, vec![direct]);
+
+    aisix_control_plane::housekeeping::tick(cp.db(), &ctx).await;
+    assert_eq!(grants(&cp, held).await, vec![public]);
+
+    // Nothing is left to replace: another pass changes no tenant, key,
+    // document or audit row.
+    let before = untouched(&cp, &[held, free]).await;
+    let done = aisix_control_plane::tenants::replace_generated_grants(cp.db(), &ctx)
+        .await
+        .expect("the pass");
+    assert_eq!(
+        done,
+        aisix_control_plane::tenants::GeneratedGrantsReplaced::default()
+    );
+    assert_eq!(untouched(&cp, &[held, free]).await, before);
+}
+
+/// The boot's replacement takes each holder's row before the resources
+/// lock, as every grant edit does: while a holder is held elsewhere, the boot
+/// waits for it holding no resources lock, and replaces the grant once it is
 /// free.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_boot_withdrawal_takes_the_tenant_before_the_resources_lock() {
+async fn the_boot_replacement_takes_the_tenant_before_the_resources_lock() {
     let Some(cp) = TestCp::start().await else {
         return;
     };

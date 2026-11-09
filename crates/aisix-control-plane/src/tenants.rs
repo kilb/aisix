@@ -886,91 +886,108 @@ pub async fn on_model_deleted(
     Ok(())
 }
 
-/// What one [`withdraw_generated_direct_grants`] did, in counts only.
+/// What one [`replace_generated_grants`] pass did, in counts only.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct GeneratedGrantsWithdrawn {
-    /// Tenant grants withdrawn.
-    pub grants: u64,
-    /// Live keys' selections withdrawn.
-    pub selections: u64,
-    /// Documents the gateway-version gate refused, or whose holders stayed
-    /// busy past the lock timeout, left for the next boot.
+pub struct GeneratedGrantsReplaced {
+    /// Tenants changed, each with its own audit row.
+    pub tenants: u64,
+    /// Tenant grants of a generated direct model replaced by its public
+    /// model (or dropped where the tenant already holds the public model).
+    pub grants_replaced: u64,
+    /// Tenant grants withdrawn, the public model being retired.
+    pub grants_withdrawn: u64,
+    /// Live keys whose model selection changed.
+    pub keys_changed: u64,
+    /// Tenants the gateway-version gate refused, or that stayed busy past
+    /// the lock timeout, left for the next pass.
     pub deferred: u64,
-    /// Documents whose withdrawal failed for another reason; the next boot
-    /// tries them again.
+    /// Tenants whose change failed for another reason; the next pass tries
+    /// them again.
     pub failed: u64,
 }
 
-/// Withdraws every tenant grant and live key selection that names a
-/// channel's generated direct document, which no tenant may hold
-/// ([`checked_grants`]) but a release before that refusal could store. Run
-/// at boot, once the database is migrated.
+/// One list of model ids with every channel's generated direct model in it
+/// replaced by its public model, sorted and without repeats, as grants and
+/// selections are stored: `(list, replaced, withdrawn)`. `live` maps each
+/// generated direct model the list may name to its public model, `None`
+/// when that public model is retired.
+fn replace_generated(
+    ids: &[Uuid],
+    live: &BTreeMap<Uuid, Option<Uuid>>,
+) -> (Vec<Uuid>, Vec<(Uuid, Uuid)>, Vec<Uuid>) {
+    let mut out = Vec::with_capacity(ids.len());
+    let (mut replaced, mut withdrawn) = (Vec::new(), Vec::new());
+    for id in ids {
+        match live.get(id) {
+            None => out.push(*id),
+            Some(Some(public)) => {
+                replaced.push((*id, *public));
+                out.push(*public);
+            }
+            Some(None) => withdrawn.push(*id),
+        }
+    }
+    out.sort();
+    out.dedup();
+    (out, replaced, withdrawn)
+}
+
+/// Replaces every tenant grant and live key selection that names a
+/// channel's generated direct model, which no tenant may hold
+/// ([`checked_grants`]) but a release before that refusal could store, and
+/// an older replica can still write during a rolling upgrade. The grant was
+/// of that public model through one account, so it becomes a grant of the
+/// public model; a key that selected the direct model selects the public
+/// one. Where the public model is retired, the grant is withdrawn. Run at
+/// boot and by every housekeeping tick.
 ///
-/// Each document is withdrawn exactly as a model delete withdraws one
-/// ([`on_model_deleted`]): its holders are locked before the resources lock
-/// and re-projected without their marks, so every key document that named
-/// it is rewritten through `write_resource`, in a transaction of its own.
-/// That transaction takes the boot lock first, so instances booting
-/// together withdraw each grant once. Idempotent: once withdrawn nothing
-/// names the document, and a fresh database holds no such grant.
+/// One transaction per tenant, so a tenant that fails holds back no other,
+/// and takes the locks of a grant edit and no more: the tenant's row, then
+/// the public models' rows `FOR SHARE` (a retire takes them `FOR UPDATE`, so
+/// none is retired while the replacement is decided), then the resources
+/// lock in the re-projection, which skips the billing step. The tenant's row
+/// serialises it with every grant and selection write and with a peer
+/// running the same pass, which then finds nothing to change. Each tenant
+/// changed gets one audit row, `tenant.generated_grants_replaced`, naming
+/// the model ids replaced and withdrawn, on the tenant and on each key.
 ///
-/// A document the gateway-version gate refuses, or one whose holders stay
-/// busy, is left for the next boot, and so is one that fails otherwise: the
-/// grant stays as it was, which is what the gateways already serve, so
-/// none of it stops the boot.
-pub async fn withdraw_generated_direct_grants(
+/// A tenant the gateway-version gate refuses, or that stays busy, is left
+/// for the next pass, and so is one that fails otherwise: its grant stays
+/// as it was, which is what the gateways already serve. A tenant whose
+/// grants name no such model is not written at all.
+pub async fn replace_generated_grants(
     db: &Db,
     ctx: &WriteCtx,
-) -> Result<GeneratedGrantsWithdrawn, ApiError> {
-    let held: Vec<Uuid> = sqlx::query_scalar(
-        "SELECT cm.direct_model_id FROM channel_models cm \
-         WHERE EXISTS (SELECT 1 FROM tenants t WHERE cm.direct_model_id = ANY(t.allowed_model_ids)) \
-            OR EXISTS (SELECT 1 FROM tenant_keys k WHERE k.revoked_at IS NULL \
-                         AND cm.direct_model_id = ANY(k.model_ids)) \
+) -> Result<GeneratedGrantsReplaced, ApiError> {
+    let holders: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT t.id FROM tenants t WHERE t.status <> 'deleted' \
+           AND EXISTS (SELECT 1 FROM channel_models cm WHERE cm.direct_model_id = ANY(t.allowed_model_ids)) \
+         UNION SELECT k.tenant_id FROM tenant_keys k JOIN tenants t ON t.id = k.tenant_id \
+         WHERE t.status <> 'deleted' AND k.revoked_at IS NULL \
+           AND EXISTS (SELECT 1 FROM channel_models cm WHERE cm.direct_model_id = ANY(k.model_ids)) \
          ORDER BY 1",
     )
     .fetch_all(db.pool())
     .await
     .map_err(DbError::from)?;
-    let mut outcome = GeneratedGrantsWithdrawn::default();
-    for model_id in held {
+    let mut outcome = GeneratedGrantsReplaced::default();
+    for tenant in holders {
         let ctx = WriteCtx {
             mk: crate::crypto::MasterKey(ctx.mk.0),
             env: ctx.env.clone(),
             cp_version: ctx.cp_version.clone(),
             stale_secs: ctx.stale_secs,
         };
-        let withdrawn = db
-            .tx(move |conn| {
-                async move {
-                    sqlx::query("SELECT pg_advisory_xact_lock($1)")
-                        .bind(BOOT_LOCK_KEY)
-                        .execute(&mut *conn)
-                        .await
-                        .map_err(DbError::from)?;
-                    // Read under the boot lock, so a peer that withdrew it
-                    // first leaves nothing to count.
-                    let (grants, selections): (i64, i64) = sqlx::query_as(
-                        "SELECT (SELECT count(*) FROM tenants WHERE $1 = ANY(allowed_model_ids)), \
-                                (SELECT count(*) FROM tenant_keys \
-                                 WHERE revoked_at IS NULL AND $1 = ANY(model_ids))",
-                    )
-                    .bind(model_id)
-                    .fetch_one(&mut *conn)
-                    .await
-                    .map_err(DbError::from)?;
-                    if grants > 0 || selections > 0 {
-                        on_model_deleted(&mut *conn, &ctx, model_id).await?;
-                    }
-                    Ok::<_, ApiError>((grants, selections))
-                }
-                .boxed()
-            })
+        let changed = db
+            .tx(move |conn| async move { replace_generated_in(conn, &ctx, tenant).await }.boxed())
             .await;
-        match withdrawn {
-            Ok((grants, selections)) => {
-                outcome.grants += u64::try_from(grants).unwrap_or_default();
-                outcome.selections += u64::try_from(selections).unwrap_or_default();
+        match changed {
+            Ok(None) => {}
+            Ok(Some((replaced, withdrawn, keys))) => {
+                outcome.tenants += 1;
+                outcome.grants_replaced += replaced;
+                outcome.grants_withdrawn += withdrawn;
+                outcome.keys_changed += keys;
             }
             Err(e) if compat::refused(&e) || e.status == StatusCode::SERVICE_UNAVAILABLE => {
                 outcome.deferred += 1;
@@ -979,12 +996,133 @@ pub async fn withdraw_generated_direct_grants(
                 outcome.failed += 1;
                 tracing::warn!(
                     code = e.code,
-                    "a grant of a channel's generated direct model could not be withdrawn"
+                    "a tenant's grants of channels' generated direct models could not be replaced"
                 );
             }
         }
     }
     Ok(outcome)
+}
+
+/// [`replace_generated_grants`] for one tenant, in the caller's
+/// transaction: `Some((grants replaced, grants withdrawn, keys changed))`
+/// when anything changed, `None` when nothing named such a model.
+async fn replace_generated_in(
+    conn: &mut PgConnection,
+    ctx: &WriteCtx,
+    tenant_id: Uuid,
+) -> Result<Option<(u64, u64, u64)>, ApiError> {
+    let tenant = lock(&mut *conn, tenant_id).await?;
+    let selections: Vec<(Uuid, Vec<Uuid>)> = sqlx::query_as(
+        "SELECT id, model_ids FROM tenant_keys \
+         WHERE tenant_id = $1 AND revoked_at IS NULL AND model_ids IS NOT NULL ORDER BY id",
+    )
+    .bind(tenant_id)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(DbError::from)?;
+    let named: Vec<Uuid> = tenant
+        .allowed_model_ids
+        .iter()
+        .chain(selections.iter().flat_map(|(_, ids)| ids.iter()))
+        .copied()
+        .collect();
+    let generated: Vec<(Uuid, Uuid)> = sqlx::query_as(
+        "SELECT direct_model_id, public_model_id FROM channel_models \
+         WHERE direct_model_id = ANY($1)",
+    )
+    .bind(&named)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(DbError::from)?;
+    if generated.is_empty() {
+        return Ok(None);
+    }
+    let mut publics: Vec<Uuid> = generated.iter().map(|(_, p)| *p).collect();
+    publics.sort();
+    publics.dedup();
+    // Held until commit, so no public model kept here is retired before the
+    // grant naming it commits. One whose routing document is gone is as
+    // good as retired: it could not be granted.
+    let live: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT p.id FROM public_models p \
+         WHERE p.id = ANY($1) AND p.retired_at IS NULL \
+           AND EXISTS (SELECT 1 FROM gw_resources r \
+                       WHERE r.kind = $2 AND r.id = p.id AND NOT r.deleted) \
+         ORDER BY p.id FOR SHARE OF p",
+    )
+    .bind(&publics)
+    .bind(Kind::Models.segment())
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(DbError::from)?;
+    let map: BTreeMap<Uuid, Option<Uuid>> = generated
+        .into_iter()
+        .map(|(direct, public)| (direct, live.contains(&public).then_some(public)))
+        .collect();
+
+    let (grants, replaced, withdrawn) = replace_generated(&tenant.allowed_model_ids, &map);
+    if !replaced.is_empty() || !withdrawn.is_empty() {
+        sqlx::query(
+            "UPDATE tenants SET allowed_model_ids = $2, version = version + 1 WHERE id = $1",
+        )
+        .bind(tenant_id)
+        .bind(&grants)
+        .execute(&mut *conn)
+        .await
+        .map_err(DbError::from)?;
+    }
+    let mut keys = Vec::new();
+    for (key_id, ids) in &selections {
+        let (selection, key_replaced, key_withdrawn) = replace_generated(ids, &map);
+        if key_replaced.is_empty() && key_withdrawn.is_empty() {
+            continue;
+        }
+        sqlx::query("UPDATE tenant_keys SET model_ids = $2, version = version + 1 WHERE id = $1")
+            .bind(key_id)
+            .bind(&selection)
+            .execute(&mut *conn)
+            .await
+            .map_err(DbError::from)?;
+        keys.push(json!({
+            "key_id": key_id,
+            "replaced": pairs(&key_replaced),
+            "withdrawn": key_withdrawn,
+        }));
+    }
+    if replaced.is_empty() && withdrawn.is_empty() && keys.is_empty() {
+        return Ok(None);
+    }
+    project_without_marks(&mut *conn, ctx, tenant_id).await?;
+    audit::record(
+        &mut *conn,
+        AuditEntry {
+            actor: Actor::System,
+            action: "tenant.generated_grants_replaced",
+            target_kind: TARGET_KIND,
+            target_id: Some(tenant_id.to_string()),
+            tenant_id: Some(tenant_id),
+            detail: json!({
+                "replaced": pairs(&replaced),
+                "withdrawn": withdrawn,
+                "keys": keys,
+            }),
+        },
+    )
+    .await?;
+    Ok(Some((
+        replaced.len() as u64,
+        withdrawn.len() as u64,
+        keys.len() as u64,
+    )))
+}
+
+/// `(generated direct model, public model)` pairs as audit detail.
+fn pairs(replaced: &[(Uuid, Uuid)]) -> Vec<Value> {
+    replaced
+        .iter()
+        .map(|(direct, public)| json!({"model_id": direct, "public_model_id": public}))
+        .collect()
 }
 
 async fn resources_lock(conn: &mut PgConnection) -> Result<(), ApiError> {

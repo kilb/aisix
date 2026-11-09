@@ -381,8 +381,6 @@ pub enum BootError {
     InternalTenant(String),
     #[error("cannot bring the tenants' key documents up to date: {0}")]
     KeyDocuments(String),
-    #[error("cannot look for grants of channels' generated direct models: {0}")]
-    GeneratedGrants(String),
     #[error("kine (CP_KINE_ENDPOINT): {0}")]
     Kine(#[from] crate::kine::KineError),
     #[error("cannot listen on CP_HTTP_ADDR: {0}")]

@@ -44,7 +44,6 @@ use crate::error::ApiError;
 use crate::pricing::baselines::{current_baselines, upcoming_baselines, BaselineRevision};
 use crate::pricing::rates::rate_in_force;
 use crate::pricing::store::DiscountRevision;
-use crate::resources::Kind;
 use crate::AppState;
 
 /// The columns a [`DiscountRevision`] is read from.
@@ -146,8 +145,9 @@ struct BaselinePlan {
 }
 
 /// `GET /admin/pricing/models` → `{items: [ModelPriceRow]}`, in the design's
-/// charge-list shape: every live model, the ones with no baseline or no rated
-/// group first, each group by name.
+/// charge-list shape: every live model but a channel's generated direct
+/// document, which is priced through its public model; the ones with no
+/// baseline or no rated group first, each group by name.
 pub async fn models(
     auth: OperatorAuth,
     State(state): State<AppState>,
@@ -157,13 +157,9 @@ pub async fn models(
         .db
         .tx(|conn| {
             async move {
-                let models: Vec<(Uuid, String)> = sqlx::query_as(
-                    "SELECT id, COALESCE(doc->>'display_name', '') FROM gw_resources \
-                     WHERE kind = $1 AND NOT deleted ORDER BY 2, 1",
-                )
-                .bind(Kind::Models.segment())
-                .fetch_all(&mut *conn)
-                .await?;
+                // A channel's generated direct document is priced through
+                // its public model, so it has no row of its own here.
+                let models = crate::channels::priceable_models(&mut *conn).await?;
                 let ids: Vec<Uuid> = models.iter().map(|(id, _)| *id).collect();
                 let groups = live_groups(&mut *conn).await?;
                 let mut current: HashMap<Uuid, BaselineRevision> =

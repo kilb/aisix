@@ -130,22 +130,50 @@ pub fn direct_display_name(public_name: &str, provider_key_display_name: &str) -
     format!("{public_name}#{provider_key_display_name}")
 }
 
-/// Whether `model_id` is the direct document a public model generated for
-/// one serving account (`channel_models.direct_model_id`), live or not.
+/// The name of the public model whose generated direct document `model_id`
+/// is (`channel_models.direct_model_id`, live or not), or `None` for any
+/// other model.
 ///
 /// Such a document is granted and priced only through its public model, and
 /// this is the one test for it: a tenant grant ([`crate::tenants`]), a
 /// baseline ([`crate::pricing::baselines`]) and a group rate
-/// ([`crate::pricing::rates`]) each refuse one, and the baseline and rate
-/// lists leave it out. A charge keys on the model the caller addressed,
-/// which is the public model, so a price written on the direct document
-/// prices nothing; and its name carries the account's.
-pub async fn is_generated_direct(conn: &mut PgConnection, model_id: Uuid) -> Result<bool, DbError> {
+/// ([`crate::pricing::rates`]) each refuse one, naming the public model to
+/// use instead, and the price lists ([`priceable_models`]) leave it out. A
+/// charge keys on the model the caller addressed, which is the public model,
+/// so a price written on the direct document prices nothing; and its name
+/// carries the account's.
+pub async fn generated_direct_of(
+    conn: &mut PgConnection,
+    model_id: Uuid,
+) -> Result<Option<String>, DbError> {
     Ok(sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM channel_models WHERE direct_model_id = $1)",
+        "SELECT p.name FROM channel_models cm JOIN public_models p ON p.id = cm.public_model_id \
+         WHERE cm.direct_model_id = $1",
     )
     .bind(model_id)
-    .fetch_one(conn)
+    .fetch_optional(conn)
+    .await?)
+}
+
+/// Whether `model_id` is a channel's generated direct document
+/// ([`generated_direct_of`]).
+pub async fn is_generated_direct(conn: &mut PgConnection, model_id: Uuid) -> Result<bool, DbError> {
+    Ok(generated_direct_of(conn, model_id).await?.is_some())
+}
+
+/// Every live model a price can be written on, as `(id, display name)` by
+/// name then id: every one but a channel's generated direct document, the
+/// same test as [`generated_direct_of`] in SQL. The baseline list, a group's
+/// rate list and the charge list read it.
+pub async fn priceable_models(conn: &mut PgConnection) -> Result<Vec<(Uuid, String)>, DbError> {
+    Ok(sqlx::query_as(
+        "SELECT r.id, COALESCE(r.doc->>'display_name', '') FROM gw_resources r \
+         WHERE r.kind = $1 AND NOT r.deleted \
+           AND NOT EXISTS (SELECT 1 FROM channel_models cm WHERE cm.direct_model_id = r.id) \
+         ORDER BY 2, 1",
+    )
+    .bind(Kind::Models.segment())
+    .fetch_all(conn)
     .await?)
 }
 

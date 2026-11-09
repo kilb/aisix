@@ -1006,22 +1006,11 @@ pub async fn list_rates(
                 let row = lock_one(&mut *conn, id, LockMode::Share).await?;
                 let group = view(&mut *conn, &row).await?;
                 let default = rates::rate_plan(&mut *conn, id, None).await?;
-                let models: Vec<(Uuid, String)> = sqlx::query_as(
-                    "SELECT id, COALESCE(doc->>'display_name', '') FROM gw_resources \
-                     WHERE kind = $1 AND NOT deleted ORDER BY 2, 1",
-                )
-                .bind(Kind::Models.segment())
-                .fetch_all(&mut *conn)
-                .await
-                .map_err(DbError::from)?;
+                // A channel's generated direct document takes no rate of its
+                // own (`rates::insert_group_rate`), so it is not offered one.
+                let models = crate::channels::priceable_models(&mut *conn).await?;
                 let mut items = Vec::with_capacity(models.len());
                 for (model_id, name) in models {
-                    // A channel's generated direct document takes no rate of
-                    // its own (`rates::insert_group_rate`), so it is not
-                    // offered one.
-                    if crate::channels::is_generated_direct(&mut *conn, model_id).await? {
-                        continue;
-                    }
                     let rate = rates::rate_plan(&mut *conn, id, Some(model_id)).await?;
                     items.push(json!({"model_id": model_id, "name": name, "rate": rate}));
                 }

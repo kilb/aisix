@@ -3,8 +3,10 @@
 //! new `instance_id` at every boot, so each restart leaves one behind), and
 //! the tombstones of deleted gateway resources once their delete has been
 //! projected for a day; catching up the key documents an older release
-//! wrote ([`keys::catch_up`]); and opening the billing account of any tenant
-//! that has none ([`ledger::backfill_accounts`]).
+//! wrote ([`keys::catch_up`]); opening the billing account of any tenant
+//! that has none ([`ledger::backfill_accounts`]); and replacing any grant of
+//! a channel's generated direct model by its public model
+//! ([`tenants::replace_generated_grants`]).
 //!
 //! Every instance runs the pass at boot and every 10 minutes after; the
 //! deletes are idempotent, and the catch-up takes one tenant at a time, so
@@ -19,9 +21,9 @@ use tokio::time::MissedTickBehavior;
 
 use crate::billing::ledger;
 use crate::db::{Db, DbError};
-use crate::keys;
 use crate::resources::write::{WriteCtx, RESOURCES_LOCK_KEY};
 use crate::stopped;
+use crate::{keys, tenants};
 
 const PERIOD: Duration = Duration::from_secs(600);
 
@@ -59,10 +61,12 @@ pub async fn run_once(db: &Db) -> Result<Pruned, DbError> {
 /// One tick: a pruning pass ([`run_once`]), then the key documents an
 /// older release wrote are caught up ([`keys::catch_up`]), then every tenant
 /// without a billing account gets one ([`ledger::backfill_accounts`]: an
-/// older release, during a rolling upgrade, creates tenants without one).
-/// Each part is logged on its own so that one failing leaves the others to
-/// run. A tenant the gateway-version gate refuses is caught up by a later
-/// tick.
+/// older release, during a rolling upgrade, creates tenants without one),
+/// then every grant of a channel's generated direct model is replaced by its
+/// public model ([`tenants::replace_generated_grants`]: an older release
+/// could grant one). Each part is logged on its own so that one failing
+/// leaves the others to run. A tenant the gateway-version gate refuses is
+/// caught up by a later tick.
 pub async fn tick(db: &Db, ctx: &WriteCtx) {
     match run_once(db).await {
         Ok(pruned) => tracing::debug!(?pruned, "housekeeping pass"),
@@ -73,6 +77,34 @@ pub async fn tick(db: &Db, ctx: &WriteCtx) {
         Err(e) => tracing::warn!(code = e.code, "catching up key documents failed"),
     }
     backfill_accounts(db).await;
+    replace_generated_grants(db, ctx).await;
+}
+
+/// Replaces every grant of a channel's generated direct model by its public
+/// model ([`tenants::replace_generated_grants`]), and logs what it changed,
+/// in counts only, or why it failed. A tenant it leaves behind is tried
+/// again by a later run.
+pub(crate) async fn replace_generated_grants(db: &Db, ctx: &WriteCtx) {
+    match tenants::replace_generated_grants(db, ctx).await {
+        Ok(done) if done == tenants::GeneratedGrantsReplaced::default() => {}
+        Ok(done) => tracing::warn!(
+            tenants = done.tenants,
+            grants_replaced = done.grants_replaced,
+            grants_withdrawn = done.grants_withdrawn,
+            keys_changed = done.keys_changed,
+            deferred = done.deferred,
+            failed = done.failed,
+            "replaced tenant grants and key selections of channels' generated direct models \
+             with their public models, withdrawing those whose public model is retired; each \
+             tenant changed has a tenant.generated_grants_replaced audit row, and a deferred or \
+             failed tenant is tried again at the next housekeeping tick"
+        ),
+        Err(e) => tracing::warn!(
+            code = e.code,
+            "looking for grants of channels' generated direct models failed; the next \
+             housekeeping tick tries again"
+        ),
+    }
 }
 
 /// Opens the billing account of every tenant that has none

@@ -699,6 +699,26 @@ async fn a_confirmed_suggestion_prices_a_call_to_the_public_model() {
     )
     .clone();
     assert_eq!(proposal["suggested_model_id"], json!(public), "{proposal}");
+    // A confirmation naming the direct document instead, as a proposal
+    // uploaded by an earlier build still suggests, is refused at
+    // `/model_id`, naming the public model to price; the proposal stays
+    // pending.
+    let r = decide(
+        cp,
+        op,
+        &batch,
+        &proposal,
+        "confirm",
+        json!({"model_id": direct, "effective_from": db_now(cp).await, "attested": true}),
+    )
+    .await;
+    assert_eq!(r.status, 422, "{r:?}");
+    assert_eq!(refusal_paths(&r), vec!["/model_id"], "{r:?}");
+    assert_eq!(
+        r.body["details"][0]["message"],
+        "该模型由公共模型 claude-opus-5-5 生成，请为公共模型 claude-opus-5-5 设置基准价",
+        "{r:?}"
+    );
     let r = decide(
         cp,
         op,

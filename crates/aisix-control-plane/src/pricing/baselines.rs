@@ -284,10 +284,10 @@ async fn write_row(
     // A channel's generated direct document is priced through its public
     // model: charges key on the public model's id, so a baseline written on
     // the direct document would price nothing.
-    if crate::channels::is_generated_direct(&mut *conn, row.model_id).await? {
+    if let Some(public) = crate::channels::generated_direct_of(&mut *conn, row.model_id).await? {
         return Err(refused(
             "/model_id",
-            "该模型由公共模型生成，请为公共模型设置基准价",
+            format!("该模型由公共模型 {public} 生成，请为公共模型 {public} 设置基准价"),
         ));
     }
     let (source_kind, source) = row.source.columns()?;
@@ -583,22 +583,9 @@ pub async fn list(
                 let now: DateTime<Utc> = sqlx::query_scalar("SELECT now()")
                     .fetch_one(&mut *conn)
                     .await?;
-                let live: Vec<(Uuid, String)> = sqlx::query_as(
-                    "SELECT id, COALESCE(doc->>'display_name', '') FROM gw_resources \
-                     WHERE kind = $1 AND NOT deleted \
-                     ORDER BY 2, 1",
-                )
-                .bind(Kind::Models.segment())
-                .fetch_all(&mut *conn)
-                .await?;
                 // A channel's generated direct document takes no baseline
                 // (`write_row`), so it is not offered one.
-                let mut models = Vec::with_capacity(live.len());
-                for (id, name) in live {
-                    if !crate::channels::is_generated_direct(&mut *conn, id).await? {
-                        models.push((id, name));
-                    }
-                }
+                let models = crate::channels::priceable_models(&mut *conn).await?;
                 let ids: Vec<Uuid> = models.iter().map(|(id, _)| *id).collect();
                 let mut current: HashMap<Uuid, BaselineRevision> =
                     current_baselines(&mut *conn, &ids)
