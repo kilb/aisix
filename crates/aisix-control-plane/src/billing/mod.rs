@@ -33,4 +33,5 @@ pub mod reconcile;
 pub mod repricing;
 pub mod settler;
 pub mod statements;
+pub mod tenant_prices;
 pub mod topups;

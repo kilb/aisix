@@ -261,7 +261,10 @@ pub async fn list(
 }
 
 /// The live groups `names` assigns, by display name then id.
-async fn groups_of(conn: &mut PgConnection, names: &[String]) -> Result<Vec<GroupRow>, DbError> {
+pub(crate) async fn groups_of(
+    conn: &mut PgConnection,
+    names: &[String],
+) -> Result<Vec<GroupRow>, DbError> {
     sqlx::query_as(&format!(
         "SELECT {COLUMNS} FROM provider_groups \
          WHERE name = ANY($1) AND retired_at IS NULL ORDER BY display_name, id"
