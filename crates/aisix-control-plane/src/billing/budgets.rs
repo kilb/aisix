@@ -16,7 +16,7 @@
 //! charge counts by its `price_instant`, in the period
 //! [`BudgetPeriod::start_of`] gives it, the function the gateway judges a
 //! mark's period with. Spend is kept per quota and period in
-//! `billing_budget_spend`; a cumulative quota has one row, at
+//! `billing_budget_spend_cny`; a cumulative quota has one row, at
 //! `counted_from`.
 //!
 //! Usage intake counts each charged row ([`count_charges`]) while it holds
@@ -37,6 +37,11 @@
 //! caller that shows a quota reads the clock once and passes it to
 //! [`list`] or [`spent`] and to [`to_api`], so the spend and the period it
 //! names always agree.
+//!
+//! Every amount here is integer micro-CNY, in the same unit as the account's
+//! balance and credit limit and the charges it counts: a quota's remaining is
+//! what a charge cost, so a lookup compares it with the balance directly and
+//! at any rate (`lookup_quota`).
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -48,7 +53,7 @@ use sqlx::PgConnection;
 use uuid::Uuid;
 
 use super::marks;
-use super::money::usd_string;
+use super::money::cny_string;
 use crate::audit::{self, Actor, AuditEntry};
 use crate::db::DbError;
 use crate::error::{ApiError, Detail};
@@ -147,7 +152,7 @@ fn parse_period(s: &str) -> Option<BudgetPeriod> {
         .find(|v| v.as_str() == s)
 }
 
-/// One live `billing_budgets` row.
+/// One live `billing_budgets_cny` row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BudgetRow {
     pub id: Uuid,
@@ -161,7 +166,7 @@ pub struct BudgetRow {
     /// Set exactly for a cumulative quota: charges priced from here on
     /// count.
     pub counted_from: Option<DateTime<Utc>>,
-    pub limit_micro_usd: i64,
+    pub limit_micro_cny: i64,
     /// Periodic: the period the projected document marks exhausted.
     pub marked_period_start: Option<DateTime<Utc>>,
     /// Cumulative: whether the projected document is exhausted; `None`
@@ -182,7 +187,7 @@ struct RawRow {
     kind: String,
     period: Option<String>,
     counted_from: Option<DateTime<Utc>>,
-    limit_micro_usd: i64,
+    limit_micro_cny: i64,
     marked_period_start: Option<DateTime<Utc>>,
     marked_exhausted: Option<bool>,
     created_by_kind: String,
@@ -191,7 +196,7 @@ struct RawRow {
 }
 
 const COLUMNS: &str = "id, tenant_id, scope, scope_ref, set_by, kind, period, counted_from, \
-     limit_micro_usd, marked_period_start, marked_exhausted, created_by_kind, created_by, \
+     limit_micro_cny, marked_period_start, marked_exhausted, created_by_kind, created_by, \
      created_at";
 
 fn decode(raw: RawRow) -> Result<BudgetRow, DbError> {
@@ -213,7 +218,7 @@ fn decode(raw: RawRow) -> Result<BudgetRow, DbError> {
         tenant_id: raw.tenant_id,
         scope_ref: raw.scope_ref,
         counted_from: raw.counted_from,
-        limit_micro_usd: raw.limit_micro_usd,
+        limit_micro_cny: raw.limit_micro_cny,
         marked_period_start: raw.marked_period_start,
         marked_exhausted: raw.marked_exhausted,
         created_by_kind: raw.created_by_kind,
@@ -231,7 +236,7 @@ pub struct NewBudget {
     pub kind: Kind,
     /// Required for a periodic quota, refused for a cumulative one.
     pub period: Option<BudgetPeriod>,
-    pub limit_micro_usd: i64,
+    pub limit_micro_cny: i64,
     pub created_by_kind: &'static str,
     pub created_by: Option<Uuid>,
 }
@@ -246,7 +251,7 @@ pub enum CountMode {
     Adjustment,
 }
 
-/// One charge to count: `amount` µ$ (negative only for an `Adjustment`),
+/// One charge to count: `amount` µ¥ (negative only for an `Adjustment`),
 /// priced at `price_instant`, of key `api_key_id` of tenant `tenant_id`,
 /// bound to `member_id`, all as the control plane's key record says.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -297,7 +302,7 @@ async fn live_rows(
     tenant_ids: &[Uuid],
 ) -> Result<Vec<BudgetRow>, DbError> {
     let raws: Vec<RawRow> = sqlx::query_as(&format!(
-        "SELECT {COLUMNS} FROM billing_budgets \
+        "SELECT {COLUMNS} FROM billing_budgets_cny \
          WHERE tenant_id = ANY($1) AND deleted_at IS NULL ORDER BY created_at, id"
     ))
     .bind(tenant_ids)
@@ -320,7 +325,7 @@ async fn spends(
         return Ok(HashMap::new());
     }
     let found: Vec<(Uuid, i64)> = sqlx::query_as(
-        "SELECT s.budget_id, s.spent_micro_usd FROM billing_budget_spend s \
+        "SELECT s.budget_id, s.spent_micro_cny FROM billing_budget_spend_cny s \
          JOIN unnest($1::uuid[], $2::timestamptz[]) AS k(budget_id, period_start) \
            ON s.budget_id = k.budget_id AND s.period_start = k.period_start",
     )
@@ -339,7 +344,7 @@ pub async fn get(
     id: Uuid,
 ) -> Result<Option<BudgetRow>, DbError> {
     let raw: Option<RawRow> = sqlx::query_as(&format!(
-        "SELECT {COLUMNS} FROM billing_budgets \
+        "SELECT {COLUMNS} FROM billing_budgets_cny \
          WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL"
     ))
     .bind(id)
@@ -400,21 +405,20 @@ pub fn to_api(
         "set_by": row.set_by,
         "kind": row.kind,
         "period": row.period.map(BudgetPeriod::as_str),
-        "limit_micro_usd": row.limit_micro_usd,
-        "spent_micro_usd": spent,
-        "remaining_micro_usd": row.limit_micro_usd.saturating_sub(spent),
+        "limit_micro_cny": row.limit_micro_cny,
+        "spent_micro_cny": spent,
+        "remaining_micro_cny": row.limit_micro_cny.saturating_sub(spent),
         "period_start": row.period.map(|p| p.start_of(now)),
         "counted_from": row.counted_from,
-        "exhausted": spent >= row.limit_micro_usd,
+        "exhausted": spent >= row.limit_micro_cny,
         "created_at": row.created_at,
     })
 }
 
-/// `micro` as the dollars a person set, with two decimals: every limit
-/// typed is whole cents. One that is not is written exactly, never
-/// rounded.
-fn dollars(micro: i64) -> String {
-    let exact = usd_string(micro);
+/// `micro` as the yuan a person set, with two decimals: every limit typed is
+/// whole fen. One that is not is written exactly, never rounded.
+fn yuan(micro: i64) -> String {
+    let exact = cny_string(micro);
     if micro % 10_000 == 0 {
         exact[..exact.len() - 4].to_string()
     } else {
@@ -428,23 +432,25 @@ fn dollars(micro: i64) -> String {
 /// periodic quota and the placeholder `month` for a cumulative one: the
 /// gateway requires one, and a value it does not know would make it skip
 /// the document. Once `spent` reaches the limit it carries an `exhausted`
-/// mark with the limit and the spend. A periodic mark names the period it
-/// holds in (`period_start`), so the gateway lifts it at the next period on
-/// its own; a cumulative one names none and holds until the control plane
-/// lifts it, with `"period": "total"` in its reason.
+/// mark. A periodic mark names the period it holds in (`period_start`), so
+/// the gateway lifts it at the next period on its own; a cumulative one
+/// names none and holds until the control plane lifts it, with
+/// `"period": "total"` in its reason.
 ///
-/// An organization quota's mark names no amount, in its message or beside
-/// it, like the balance mark: every key of the tenant meets it, a member's
-/// included, and a member sees the organization only through the smallest
-/// remaining amount.
+/// A mark names no amount at any level: its reason is exactly
+/// `{message, scope, scope_ref, period}`. The figures are in the message, in
+/// CNY, and in `GET /v1/key`, the key's own lookup. An organization quota's
+/// message names none either, like the balance mark: every key of the tenant
+/// meets it, a member's included, and a member sees the organization only
+/// through the smallest remaining amount.
 pub fn budget_doc(b: &BudgetRow, spent: i64, now: DateTime<Utc>) -> Value {
     let period = b.period.map_or("month", BudgetPeriod::as_str);
     let mut doc = json!({"scope": b.scope.as_str(), "scope_ref": b.scope_ref, "period": period});
-    if spent < b.limit_micro_usd {
+    if spent < b.limit_micro_cny {
         return doc;
     }
     let team = b.scope == BudgetScope::Team;
-    let limit = dollars(b.limit_micro_usd);
+    let limit = yuan(b.limit_micro_cny);
     let (message, reason_period) = match b.period {
         Some(p) => {
             let every = match p {
@@ -455,7 +461,7 @@ pub fn budget_doc(b: &BudgetRow, spent: i64, now: DateTime<Utc>) -> Value {
             let message = if team {
                 format!("Budget exceeded: the organization's {every} quota is reached.")
             } else {
-                format!("Budget exceeded: the {every} limit of {limit} USD is reached.")
+                format!("Budget exceeded: the {every} limit of CNY {limit} is reached.")
             };
             (message, p.as_str())
         }
@@ -464,21 +470,16 @@ pub fn budget_doc(b: &BudgetRow, spent: i64, now: DateTime<Utc>) -> Value {
             "total",
         ),
         None => (
-            format!("Quota exhausted: the allocation of {limit} USD is used up."),
+            format!("Quota exhausted: the allocation of CNY {limit} is used up."),
             "total",
         ),
     };
-    let mut reason = json!({
+    let reason = json!({
         "message": message,
         "scope": b.scope.as_str(),
         "scope_ref": b.scope_ref,
         "period": reason_period,
     });
-    if !team {
-        reason["limit_usd"] = json!(usd_string(b.limit_micro_usd));
-        reason["spent_usd"] = json!(usd_string(spent));
-        reason["remaining_usd"] = json!(usd_string(b.limit_micro_usd.saturating_sub(spent)));
-    }
     let mut exhausted = json!({ "reason": reason });
     if let Some(p) = b.period {
         exhausted["period_start"] =
@@ -539,14 +540,14 @@ pub async fn count_charges(
         amounts.push(amount);
     }
     let totals: Vec<(Uuid, DateTime<Utc>, i64, DateTime<Utc>)> = sqlx::query_as(
-        "INSERT INTO billing_budget_spend (budget_id, period_start, spent_micro_usd) \
+        "INSERT INTO billing_budget_spend_cny (budget_id, period_start, spent_micro_cny) \
          SELECT k.budget_id, k.period_start, k.amount \
          FROM unnest($1::uuid[], $2::timestamptz[], $3::bigint[]) \
            WITH ORDINALITY AS k(budget_id, period_start, amount, n) \
          ORDER BY k.n \
          ON CONFLICT (budget_id, period_start) DO UPDATE \
-           SET spent_micro_usd = billing_budget_spend.spent_micro_usd + EXCLUDED.spent_micro_usd \
-         RETURNING budget_id, period_start, spent_micro_usd, now()",
+           SET spent_micro_cny = billing_budget_spend_cny.spent_micro_cny + EXCLUDED.spent_micro_cny \
+         RETURNING budget_id, period_start, spent_micro_cny, now()",
     )
     .bind(ids)
     .bind(starts)
@@ -557,7 +558,7 @@ pub async fn count_charges(
         .into_iter()
         .filter_map(|(id, start, spent, now)| {
             let b = quotas.iter().find(|b| b.id == id)?;
-            let reached = spent >= b.limit_micro_usd;
+            let reached = spent >= b.limit_micro_cny;
             let crossed = match b.period {
                 Some(period) => {
                     reached && start == period.start_of(now) && b.marked_period_start != Some(start)
@@ -594,7 +595,7 @@ pub(crate) async fn project(
         let spent = spends.get(&b.id).copied().unwrap_or(0);
         let doc = budget_doc(b, spent, now);
         tenants::put(&mut *conn, ctx, ResourceKind::Budgets, b.id, &doc, &owner).await?;
-        let reached = spent >= b.limit_micro_usd;
+        let reached = spent >= b.limit_micro_cny;
         ids.push(b.id);
         match b.period {
             Some(period) => {
@@ -608,7 +609,7 @@ pub(crate) async fn project(
         }
     }
     sqlx::query(
-        "UPDATE billing_budgets AS b \
+        "UPDATE billing_budgets_cny AS b \
          SET marked_period_start = m.period_start, marked_exhausted = m.exhausted \
          FROM unnest($1::uuid[], $2::timestamptz[], $3::boolean[]) AS m(id, period_start, exhausted) \
          WHERE b.id = m.id \
@@ -631,9 +632,9 @@ fn invalid(path: &str, message: &str) -> ApiError {
     }])
 }
 
-fn check_limit(limit_micro_usd: i64) -> Result<(), ApiError> {
-    if limit_micro_usd <= 0 {
-        return Err(invalid("/limit_usd", "额度必须大于 0"));
+fn check_limit(limit_micro_cny: i64) -> Result<(), ApiError> {
+    if limit_micro_cny <= 0 {
+        return Err(invalid("/limit_cny", "额度必须大于 0"));
     }
     Ok(())
 }
@@ -688,7 +689,7 @@ async fn record(
                 "set_by": b.set_by,
                 "kind": b.kind,
                 "period": b.period.map(BudgetPeriod::as_str),
-                "limit_micro_usd": b.limit_micro_usd,
+                "limit_micro_cny": b.limit_micro_cny,
             }),
         },
     )
@@ -701,7 +702,7 @@ async fn record(
 /// Takes the tenant's billing lock first (a no-op when the caller holds
 /// it), so its quotas and its account do not move underneath. Refused with
 /// `422` at `/period` for a cumulative quota with a period or a periodic
-/// one without, at `/limit_usd` for a limit below 1 µ$, and at `/scope_ref`
+/// one without, at `/limit_cny` for a limit below 1 µ¥, and at `/scope_ref`
 /// for a target that is not the tenant's own, exactly as for one that does
 /// not exist; `409 budget_limit` once the tenant's own quotas reach
 /// [`MAX_BUDGETS_PER_TENANT`], and `409 budget_exists` when the target has a
@@ -724,13 +725,13 @@ pub async fn create(
         (Kind::Cumulative, Some(_)) => return Err(invalid("/period", "累计额度不设周期")),
         _ => {}
     }
-    check_limit(new.limit_micro_usd)?;
+    check_limit(new.limit_micro_cny)?;
     if !target_is_own(&mut *conn, &tenant, new.scope, new.scope_ref).await? {
         return Err(invalid("/scope_ref", "额度对象不存在"));
     }
     if new.set_by != SetBy::Operator {
         let count: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM billing_budgets \
+            "SELECT count(*) FROM billing_budgets_cny \
              WHERE tenant_id = $1 AND deleted_at IS NULL AND set_by <> 'operator'",
         )
         .bind(tenant.id)
@@ -745,8 +746,8 @@ pub async fn create(
         }
     }
     let raw: RawRow = sqlx::query_as(&format!(
-        "INSERT INTO billing_budgets \
-         (id, tenant_id, scope, scope_ref, set_by, kind, period, counted_from, limit_micro_usd, \
+        "INSERT INTO billing_budgets_cny \
+         (id, tenant_id, scope, scope_ref, set_by, kind, period, counted_from, limit_micro_cny, \
           created_by_kind, created_by) \
          VALUES ($1, $2, $3, $4, $5, $6, $7, CASE WHEN $6 = 'cumulative' THEN now() END, $8, \
           $9, $10) \
@@ -759,14 +760,14 @@ pub async fn create(
     .bind(new.set_by.as_str())
     .bind(new.kind.as_str())
     .bind(new.period.map(BudgetPeriod::as_str))
-    .bind(new.limit_micro_usd)
+    .bind(new.limit_micro_cny)
     .bind(new.created_by_kind)
     .bind(new.created_by)
     .fetch_one(&mut *conn)
     .await
     .map_err(|e| match DbError::from(e) {
         DbError::UniqueViolation { constraint }
-            if constraint == "billing_budgets_one_per_setter" =>
+            if constraint == "billing_budgets_cny_one_per_setter" =>
         {
             ApiError::conflict("budget_exists", "该对象已有同一设置方的同类额度")
         }
@@ -809,7 +810,7 @@ pub async fn create(
     .await
     .map_err(DbError::from)?;
     sqlx::query(
-        "INSERT INTO billing_budget_spend (budget_id, period_start, spent_micro_usd) \
+        "INSERT INTO billing_budget_spend_cny (budget_id, period_start, spent_micro_cny) \
          VALUES ($1, $2, $3)",
     )
     .bind(row.id)
@@ -823,27 +824,27 @@ pub async fn create(
     Ok(row)
 }
 
-/// Sets live quota `id` of `tenant` to `limit_micro_usd`, settles its marks
+/// Sets live quota `id` of `tenant` to `limit_micro_cny`, settles its marks
 /// and records `budget.update`. Takes the tenant's billing lock first, like
 /// [`create`]; `404` for a quota that is not the tenant's or is deleted,
-/// `422 /limit_usd` for a limit below 1 µ$.
+/// `422 /limit_cny` for a limit below 1 µ¥.
 pub async fn set_limit(
     conn: &mut PgConnection,
     ctx: &WriteCtx,
     tenant: &TenantRow,
     id: Uuid,
-    limit_micro_usd: i64,
+    limit_micro_cny: i64,
     actor: Actor<'_>,
 ) -> Result<BudgetRow, ApiError> {
     let (tenant, _) = tenants::lock_billing(&mut *conn, tenant.id).await?;
-    check_limit(limit_micro_usd)?;
+    check_limit(limit_micro_cny)?;
     let raw: Option<RawRow> = sqlx::query_as(&format!(
-        "UPDATE billing_budgets SET limit_micro_usd = $3 \
+        "UPDATE billing_budgets_cny SET limit_micro_cny = $3 \
          WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL RETURNING {COLUMNS}"
     ))
     .bind(id)
     .bind(tenant.id)
-    .bind(limit_micro_usd)
+    .bind(limit_micro_cny)
     .fetch_optional(&mut *conn)
     .await
     .map_err(DbError::from)?;
@@ -866,7 +867,7 @@ pub async fn delete(
 ) -> Result<(), ApiError> {
     let (tenant, _) = tenants::lock_billing(&mut *conn, tenant.id).await?;
     let raw: Option<RawRow> = sqlx::query_as(&format!(
-        "UPDATE billing_budgets SET deleted_at = now() \
+        "UPDATE billing_budgets_cny SET deleted_at = now() \
          WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL RETURNING {COLUMNS}"
     ))
     .bind(id)
@@ -893,11 +894,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_limit_reads_in_cents_and_is_never_rounded() {
-        assert_eq!(dollars(10_000), "0.01");
-        assert_eq!(dollars(12_340_000), "12.34");
-        assert_eq!(dollars(1_000_000), "1.00");
-        assert_eq!(dollars(10_001), "0.010001");
+    fn a_limit_reads_in_fen_and_is_never_rounded() {
+        assert_eq!(yuan(10_000), "0.01");
+        assert_eq!(yuan(12_340_000), "12.34");
+        assert_eq!(yuan(1_000_000), "1.00");
+        assert_eq!(yuan(10_001), "0.010001");
     }
 
     fn row(scope: BudgetScope, period: Option<BudgetPeriod>) -> BudgetRow {
@@ -914,7 +915,7 @@ mod tests {
             },
             period,
             counted_from: period.is_none().then(Utc::now),
-            limit_micro_usd: 20_000,
+            limit_micro_cny: 20_000,
             marked_period_start: None,
             marked_exhausted: None,
             created_by_kind: "system".to_string(),
@@ -923,41 +924,68 @@ mod tests {
         }
     }
 
+    /// A quota exhausted at every level names no amount: its reason is
+    /// exactly `{message, scope, scope_ref, period}`, and only an
+    /// organization's message is free of one.
     #[test]
-    fn an_organization_quotas_mark_names_no_amount() {
+    fn a_quota_mark_names_no_amount_at_any_level() {
         let now = Utc::now();
-        for period in [
-            Some(BudgetPeriod::Day),
-            Some(BudgetPeriod::Week),
-            Some(BudgetPeriod::Month),
-            None,
-        ] {
-            let b = row(BudgetScope::Team, period);
-            let doc = budget_doc(&b, 20_100, now);
-            let reason = &doc["exhausted"]["reason"];
-            for field in ["limit_usd", "spent_usd", "remaining_usd"] {
-                assert!(reason.get(field).is_none(), "{field} in {reason}");
-            }
-            let message = reason["message"].as_str().expect("a message");
-            assert!(
-                !message.chars().any(|c| c.is_ascii_digit()),
-                "an amount in {message:?}"
-            );
-            assert_eq!(reason["scope"], json!("team"));
-            assert_eq!(reason["scope_ref"], json!(b.scope_ref));
-            assert_eq!(
-                reason["period"],
-                json!(period.map_or("total", BudgetPeriod::as_str))
-            );
-            // A member's and a key's quota still carry theirs.
-            for scope in [BudgetScope::Member, BudgetScope::ApiKey] {
-                let doc = budget_doc(&row(scope, period), 20_100, now);
+        for scope in [BudgetScope::Team, BudgetScope::Member, BudgetScope::ApiKey] {
+            for period in [
+                Some(BudgetPeriod::Day),
+                Some(BudgetPeriod::Week),
+                Some(BudgetPeriod::Month),
+                None,
+            ] {
+                let b = row(scope, period);
+                let doc = budget_doc(&b, 20_100, now);
+                let reason = doc["exhausted"]["reason"]
+                    .as_object()
+                    .unwrap_or_else(|| panic!("{scope:?} {period:?}: no reason in {doc}"));
+                let mut keys: Vec<&str> = reason.keys().map(String::as_str).collect();
+                keys.sort_unstable();
                 assert_eq!(
-                    doc["exhausted"]["reason"]["limit_usd"],
-                    json!("0.020000"),
-                    "{doc}"
+                    keys,
+                    ["message", "period", "scope", "scope_ref"],
+                    "{scope:?} {period:?}"
                 );
+                assert_eq!(reason["scope"], json!(scope.as_str()));
+                assert_eq!(reason["scope_ref"], json!(b.scope_ref));
+                assert_eq!(
+                    reason["period"],
+                    json!(period.map_or("total", BudgetPeriod::as_str))
+                );
+                let message = reason["message"].as_str().expect("a message");
+                if scope == BudgetScope::Team {
+                    assert!(
+                        !message.chars().any(|c| c.is_ascii_digit()),
+                        "an amount in {message:?}"
+                    );
+                } else {
+                    // The figures are in the message and in `GET /v1/key`.
+                    assert!(message.contains("CNY 0.02"), "{message:?}");
+                }
             }
         }
+    }
+
+    /// A member's monthly limit of one yuan reads as yuan, in CNY.
+    #[test]
+    fn a_members_mark_states_its_limit_in_cny() {
+        let now = Utc::now();
+        let mut b = row(BudgetScope::Member, Some(BudgetPeriod::Month));
+        b.limit_micro_cny = 1_000_000;
+        let doc = budget_doc(&b, 1_000_000, now);
+        assert_eq!(
+            doc["exhausted"]["reason"]["message"],
+            json!("Budget exceeded: the monthly limit of CNY 1.00 is reached.")
+        );
+        let mut b = row(BudgetScope::ApiKey, None);
+        b.limit_micro_cny = 2_500_000;
+        let doc = budget_doc(&b, 2_500_000, now);
+        assert_eq!(
+            doc["exhausted"]["reason"]["message"],
+            json!("Quota exhausted: the allocation of CNY 2.50 is used up.")
+        );
     }
 }

@@ -387,6 +387,155 @@ async fn the_fences_refuse_every_usd_money_table_and_the_discount_still_inserts(
     drop_database(db).await;
 }
 
+/// `billing_budgets` takes no new row once the money path is in CNY: a plain
+/// insert is refused, and the `_cny` twin takes it. The spend table's own
+/// fence, and the upsert shape intake writes, is the next test's.
+#[tokio::test]
+async fn the_usd_quota_tables_take_no_new_rows() {
+    let Some(db) = database_at(AT_USD).await else {
+        return;
+    };
+    let customer = customer_tenant(&db, "quota-fence-7c1").await;
+    migrate_rest(&db).await.expect("the migration runs");
+
+    // The twins exist and are the tables the release reads.
+    for table in ["billing_budgets_cny", "billing_budget_spend_cny"] {
+        assert_eq!(count(&db, table).await, 0, "{table} is created");
+    }
+
+    let budget = Uuid::new_v4();
+    expect_refused(
+        &db,
+        "billing_budgets",
+        &format!(
+            "INSERT INTO billing_budgets \
+             (id, tenant_id, scope, scope_ref, set_by, kind, counted_from, limit_micro_usd, \
+              created_by_kind) \
+             VALUES ('{budget}', '{customer}', 'team', '{customer}', 'operator', 'cumulative', \
+              now(), 10000, 'system')"
+        ),
+    )
+    .await;
+    // The twin takes the same row, so the fence is the old table's and not
+    // the shape's.
+    sqlx::query(
+        "INSERT INTO billing_budgets_cny \
+         (id, tenant_id, scope, scope_ref, set_by, kind, counted_from, limit_micro_cny, \
+          created_by_kind) \
+         VALUES ($1, $2, 'team', $2, 'operator', 'cumulative', now(), 10000, 'system')",
+    )
+    .bind(budget)
+    .bind(customer)
+    .execute(&db)
+    .await
+    .expect("the CNY table takes a quota");
+    drop_database(db).await;
+}
+
+/// `billing_budget_spend` takes no new row either, and a `BEFORE INSERT`
+/// trigger fires on `INSERT … ON CONFLICT` too: that is the shape intake's
+/// spend write takes, so a fence on the plain insert alone would leave the
+/// spend of a dollar quota moving.
+///
+/// Its quota is the platform's own: a customer's would fail `0027`'s guard,
+/// which is the migration's subject and not this one's.
+#[tokio::test]
+async fn the_usd_spend_table_takes_no_new_rows_even_from_an_upsert() {
+    let Some(db) = database_at(AT_USD).await else {
+        return;
+    };
+    let internal = internal_tenant(&db).await;
+    // The quota and one spend row, written before the migration.
+    let budget = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO billing_budgets \
+         (id, tenant_id, scope, scope_ref, set_by, kind, counted_from, limit_micro_usd, \
+          created_by_kind) \
+         VALUES ($1, $2, 'team', $2, 'operator', 'cumulative', now(), 10000, 'system')",
+    )
+    .bind(budget)
+    .bind(internal)
+    .execute(&db)
+    .await
+    .expect("a USD quota, before the migration");
+    sqlx::query(
+        "INSERT INTO billing_budget_spend (budget_id, period_start, spent_micro_usd) \
+         VALUES ($1, '2000-01-01T00:00:00Z', 680)",
+    )
+    .bind(budget)
+    .execute(&db)
+    .await
+    .expect("a USD spend row, before the migration");
+    migrate_rest(&db).await.expect("the migration runs");
+    // The upsert against that existing row, exactly as `count_charges`
+    // writes it: it must be refused rather than adding to the dollar total.
+    expect_refused(
+        &db,
+        "billing_budget_spend",
+        &format!(
+            "INSERT INTO billing_budget_spend (budget_id, period_start, spent_micro_usd) \
+             VALUES ('{budget}', '2000-01-01T00:00:00Z', 200) \
+             ON CONFLICT (budget_id, period_start) DO UPDATE \
+               SET spent_micro_usd = billing_budget_spend.spent_micro_usd + \
+                 EXCLUDED.spent_micro_usd"
+        ),
+    )
+    .await;
+    // The plain insert, on a period with no row, is refused too.
+    expect_refused(
+        &db,
+        "billing_budget_spend",
+        &format!(
+            "INSERT INTO billing_budget_spend (budget_id, period_start, spent_micro_usd) \
+             VALUES ('{budget}', '2000-01-02T00:00:00Z', 680)"
+        ),
+    )
+    .await;
+    // The row the database had is untouched.
+    let total: i64 =
+        sqlx::query_scalar("SELECT spent_micro_usd FROM billing_budget_spend WHERE budget_id = $1")
+            .bind(budget)
+            .fetch_one(&db)
+            .await
+            .expect("read the USD spend");
+    assert_eq!(total, 680, "the upsert added to a dollar quota");
+    // The twin takes both shapes, so the refusal is the old table's.
+    sqlx::query(
+        "INSERT INTO billing_budgets_cny \
+         (id, tenant_id, scope, scope_ref, set_by, kind, counted_from, limit_micro_cny, \
+          created_by_kind) \
+         VALUES ($1, $2, 'team', $2, 'operator', 'cumulative', now(), 10000, 'system')",
+    )
+    .bind(budget)
+    .bind(internal)
+    .execute(&db)
+    .await
+    .expect("the CNY table takes a quota");
+    for (what, spent) in [("insert", 680_i64), ("upsert", 200_i64)] {
+        sqlx::query(
+            "INSERT INTO billing_budget_spend_cny (budget_id, period_start, spent_micro_cny) \
+             VALUES ($1, '2000-01-01T00:00:00Z', $2) \
+             ON CONFLICT (budget_id, period_start) DO UPDATE \
+               SET spent_micro_cny = billing_budget_spend_cny.spent_micro_cny + \
+                 EXCLUDED.spent_micro_cny",
+        )
+        .bind(budget)
+        .bind(spent)
+        .execute(&db)
+        .await
+        .unwrap_or_else(|e| panic!("the CNY spend {what} is refused: {e}"));
+    }
+    let total: i64 = sqlx::query_scalar(
+        "SELECT spent_micro_cny FROM billing_budget_spend_cny WHERE budget_id = $1",
+    )
+    .bind(budget)
+    .fetch_one(&db)
+    .await
+    .expect("read the CNY spend");
+    assert_eq!(total, 880, "the upsert adds to the row instead of failing");
+    drop_database(db).await;
+}
+
 #[tokio::test]
 async fn the_cny_ledger_and_adjustments_are_append_only() {
     let Some(db) = database_at(AT_USD).await else {

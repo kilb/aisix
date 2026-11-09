@@ -8,7 +8,7 @@ import { ProxyClient } from "../harness/proxy.js";
 // E2E: an owner's member quota and a member's own key caps block at the
 // gateway, across both planes. Everything is driven through the tenant
 // portal API and the real gateway; only the upstream model is a stand-in.
-// Each call costs 10 000 µ$ ($0.01).
+// Each call costs 10 000 µ¥ (¥0.01).
 
 /** How long a change may take to reach the gateway. */
 const WITHIN_MS = 15_000;
@@ -100,11 +100,11 @@ describe("a tenant's own levels cap members and keys at the gateway", () => {
   });
 
   test("An owner's member quota blocks both of that member's keys and not the owner's", async () => {
-    const created = await owner.post("/api/budgets", { scope: "member", scope_ref: memberId, kind: "periodic", period: "day", limit_usd: "0.05" });
+    const created = await owner.post("/api/budgets", { scope: "member", scope_ref: memberId, kind: "periodic", period: "day", limit_cny: "0.05" });
     expect(created.status, created.text).toBe(201);
     expect(created.body.set_by).toBe("org_admin");
 
-    // Five calls through K2 spend the $0.05; each is served, since the quota
+    // Five calls through K2 spend the ¥0.05; each is served, since the quota
     // still has money when it is sent.
     for (let i = 0; i < 5; i++) await served(k2);
     for (const [name, key] of [["K1", k1], ["K2", k2]] as const) {
@@ -122,11 +122,11 @@ describe("a tenant's own levels cap members and keys at the gateway", () => {
 
   test("A member's own key cap blocks that key only", async () => {
     capCreatedAt = new Date();
-    const cap = await member.post("/api/budgets", { scope: "api_key", scope_ref: k1Id, kind: "periodic", period: "day", limit_usd: "0.02" });
+    const cap = await member.post("/api/budgets", { scope: "api_key", scope_ref: k1Id, kind: "periodic", period: "day", limit_cny: "0.02" });
     expect(cap.status, cap.text).toBe(201);
     expect(cap.body.set_by).toBe("member");
     k1Cap = cap.body.id;
-    // The call served above spent $0.01 of K1's day, and one more reaches it.
+    // The call served above spent ¥0.01 of K1's day, and one more reaches it.
     await served(k1);
     const refused = await chatsAnswer(k1, 429, "K1 to be refused at its cap");
     expect(refused.json?.error?.code, refused.text).toBe("budget_exceeded");
@@ -137,7 +137,7 @@ describe("a tenant's own levels cap members and keys at the gateway", () => {
   });
 
   test("A cumulative cap blocks with no reset time", async () => {
-    const cap = await member.post("/api/budgets", { scope: "api_key", scope_ref: k2Id, kind: "cumulative", limit_usd: "0.01" });
+    const cap = await member.post("/api/budgets", { scope: "api_key", scope_ref: k2Id, kind: "cumulative", limit_cny: "0.01" });
     expect(cap.status, cap.text).toBe(201);
     await served(k2);
     const refused = await chatsAnswer(k2, 429, "K2 to be refused at its cumulative cap");
@@ -145,15 +145,15 @@ describe("a tenant's own levels cap members and keys at the gateway", () => {
     expect(refused.json?.error?.period_resets_at, refused.text).toBeUndefined();
     expect(refused.headers.get("retry-after")).toBeNull();
 
-    const raised = await member.patch(`/api/budgets/${cap.body.id}`, { limit_usd: "1.00" });
+    const raised = await member.patch(`/api/budgets/${cap.body.id}`, { limit_cny: "1.00" });
     expect(raised.status, raised.text).toBe(200);
     await chatsAnswer(k2, 200, "K2 to be served after the cap was raised");
   });
 
-  test("A refusal states the cap's figures exactly as the key's own lookup does", async () => {
-    // A tenant with a 20 % discount pays $0.008 a call, so its spend is not
-    // whole cents. Its member caps key KX at $0.01 in total, which the second
-    // call passes, at $0.016.
+  test("A refusal names its limit in CNY and carries no amount beside it", async () => {
+    // A tenant with a 20 % discount pays ¥0.008 a call, so its spend is not
+    // whole fen. Its member caps key KX at ¥0.01 in total, which the second
+    // call passes, at ¥0.016.
     const exact = await world!.tenant("Quotas Exact Co", {
       setup: async (id) => {
         await fundTenant(world!.cp, id, "1.00");
@@ -167,7 +167,7 @@ describe("a tenant's own levels cap members and keys at the gateway", () => {
     });
     const holder = await seat("member@quotas-exact-e2e.test", "member", exact.id);
     const kx = await mint("kx", holder.id, exact.id);
-    const cap = await holder.portal.post("/api/budgets", { scope: "api_key", scope_ref: kx.id, kind: "cumulative", limit_usd: "0.01" });
+    const cap = await holder.portal.post("/api/budgets", { scope: "api_key", scope_ref: kx.id, kind: "cumulative", limit_cny: "0.01" });
     expect(cap.status, cap.text).toBe(201);
     await served(kx.plaintext);
     await served(kx.plaintext);
@@ -189,21 +189,31 @@ describe("a tenant's own levels cap members and keys at the gateway", () => {
     expect(refused.json?.error?.code, refused.text).toBe("budget_exceeded");
     expect(refused.json?.error?.scope, refused.text).toBe("api_key");
 
+    // The mark names no amount of its own: no field, and no figure the key's
+    // own lookup reports either. The limit is in the message, in CNY.
+    for (const field of ["limit_usd", "spent_usd", "remaining_usd"]) {
+      expect(refused.json?.error?.[field], refused.text).toBeUndefined();
+    }
+    expect(refused.json?.error?.message, refused.text).toBe(
+      "Quota exhausted: the allocation of CNY 0.01 is used up.",
+    );
+
+    // The figures the refusal leaves out are in `GET /v1/key`: the same key's
+    // own lookup shows ¥0.016 spent of ¥0.01.
     const lookup = await callGateway(world!.gateway.proxyUrl, kx.plaintext, "/v1/key", undefined);
     expect(lookup.status, lookup.text).toBe(200);
     const keyCap = (lookup.json.data.budgets as Json[]).find((b) => b.scope === "api_key");
     expect(keyCap?.spend_usd, lookup.text).toBe("0.016000");
-    expect(refused.json.error.spent_usd, refused.text).toBe(keyCap.spend_usd);
-    expect(refused.json.error.limit_usd, refused.text).toBe(keyCap.limit_usd);
+    expect(keyCap?.limit_usd, lookup.text).toBe("0.010000");
   });
 
   test("A member cannot touch what an owner set", async () => {
-    const ownerCap = await owner.post("/api/budgets", { scope: "api_key", scope_ref: k1Id, limit_usd: "0.50" });
+    const ownerCap = await owner.post("/api/budgets", { scope: "api_key", scope_ref: k1Id, limit_cny: "0.50" });
     expect(ownerCap.status, ownerCap.text).toBe(201);
     const deleted = await member.del(`/api/budgets/${ownerCap.body.id}`);
     expect(deleted.status, deleted.text).toBe(403);
     expect(deleted.body.code).toBe("budget_managed");
-    const posted = await member.post("/api/budgets", { scope: "api_key", scope_ref: k3Id, limit_usd: "0.50" });
+    const posted = await member.post("/api/budgets", { scope: "api_key", scope_ref: k3Id, limit_cny: "0.50" });
     expect(posted.status, posted.text).toBe(403);
     expect(posted.body.code).toBe("forbidden");
     // The owner's cap is still there.

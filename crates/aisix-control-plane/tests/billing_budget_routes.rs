@@ -64,7 +64,7 @@ async fn other_level(
         set_by,
         kind: Kind::Periodic,
         period: Some(BudgetPeriod::Month),
-        limit_micro_usd: 5_000_000,
+        limit_micro_cny: 5_000_000,
         created_by_kind: "system",
         created_by: None,
     };
@@ -110,15 +110,15 @@ async fn an_operator_sets_the_organization_quota() {
         .fetch_one(w.cp.db().pool())
         .await
         .expect("the tenant's name");
-    let r = post(&w, w.tenant, json!({"limit_usd": "0.01"})).await;
+    let r = post(&w, w.tenant, json!({"limit_cny": "0.01"})).await;
     assert_eq!(r.status, 201, "{r:?}");
     let b = &r.body;
     assert_eq!(b["scope"], json!("team"));
     assert_eq!(b["set_by"], json!("operator"));
     assert_eq!(b["kind"], json!("periodic"));
     assert_eq!(b["period"], json!("month"));
-    assert_eq!(b["limit_micro_usd"], json!(10_000));
-    assert_eq!(b["spent_micro_usd"], json!(0));
+    assert_eq!(b["limit_micro_cny"], json!(10_000));
+    assert_eq!(b["spent_micro_cny"], json!(0));
     assert_eq!(b["target"], json!({"id": w.tenant, "label": name}));
     assert_eq!(b["target_live"], json!(true));
     assert_eq!(audits(&w.cp, "budget.create").await, 1);
@@ -129,7 +129,7 @@ async fn an_operator_sets_the_organization_quota() {
     let r = post(
         &w,
         w.tenant,
-        json!({"kind": "cumulative", "limit_usd": "3"}),
+        json!({"kind": "cumulative", "limit_cny": "3"}),
     )
     .await;
     assert_eq!(r.status, 201, "{r:?}");
@@ -140,16 +140,57 @@ async fn an_operator_sets_the_organization_quota() {
     assert!(r.body["counted_from"].is_string(), "{r:?}");
 }
 
+/// A quota's limit is typed in yuan and fen, up to ¥99,999,999.99: an amount
+/// with three decimals, or one past the cap, is refused at `/limit_cny`.
+#[tokio::test]
+async fn a_quota_limit_is_yuan_and_fen() {
+    let Some(w) = world().await else { return };
+    for (body, path) in [
+        (json!({"limit_cny": "1.001"}), "/limit_cny"),
+        (json!({"limit_cny": "100000000"}), "/limit_cny"),
+        (json!({"limit_cny": "0"}), "/limit_cny"),
+        (json!({"limit_cny": "-1"}), "/limit_cny"),
+    ] {
+        let r = post(&w, w.tenant, body.clone()).await;
+        assert_eq!(
+            (r.status, detail_path(&r)),
+            (422, &json!(path)),
+            "{body}: {r:?}"
+        );
+    }
+    // A dollar limit is no field of this route's body: refused as a body the
+    // interface does not define, which is a `422` and writes nothing. The
+    // tenant takes its one monthly quota below, so this is asked first.
+    let r = post(&w, w.tenant, json!({"limit_usd": "1"})).await;
+    assert_eq!(r.status, 422, "{r:?}");
+    assert_eq!(audits(&w.cp, "budget.create").await, 0);
+
+    let r = post(&w, w.tenant, json!({"limit_cny": "99999999.99"})).await;
+    assert_eq!(r.status, 201, "{r:?}");
+    assert_eq!(r.body["limit_micro_cny"], json!(99_999_999_990_000_i64));
+    assert_eq!(r.body["spent_micro_cny"], json!(0));
+
+    // A limit with one decimal is the same fen amount.
+    let r = post(
+        &w,
+        w.tenant,
+        json!({"kind": "cumulative", "limit_cny": "2.5"}),
+    )
+    .await;
+    assert_eq!(r.status, 201, "{r:?}");
+    assert_eq!(r.body["limit_micro_cny"], json!(2_500_000));
+}
+
 #[tokio::test]
 async fn a_quota_the_domain_refuses_answers_at_a_path_of_this_route() {
     let Some(w) = world().await else { return };
     for (body, path) in [
-        (json!({"limit_usd": "0"}), "/limit_usd"),
-        (json!({"limit_usd": "0.001"}), "/limit_usd"),
-        (json!({"limit_usd": "1", "kind": "yearly"}), "/kind"),
-        (json!({"limit_usd": "1", "period": "year"}), "/period"),
+        (json!({"limit_cny": "0"}), "/limit_cny"),
+        (json!({"limit_cny": "0.001"}), "/limit_cny"),
+        (json!({"limit_cny": "1", "kind": "yearly"}), "/kind"),
+        (json!({"limit_cny": "1", "period": "year"}), "/period"),
         (
-            json!({"limit_usd": "1", "kind": "cumulative", "period": "day"}),
+            json!({"limit_cny": "1", "kind": "cumulative", "period": "day"}),
             "/period",
         ),
     ] {
@@ -161,16 +202,16 @@ async fn a_quota_the_domain_refuses_answers_at_a_path_of_this_route() {
         );
     }
     assert_eq!(
-        post(&w, w.tenant, json!({"limit_usd": "1", "extra": 1}))
+        post(&w, w.tenant, json!({"limit_cny": "1", "extra": 1}))
             .await
             .status,
         422
     );
     assert_eq!(post(&w, w.tenant, json!({})).await.status, 422);
 
-    let first = post(&w, w.tenant, json!({"limit_usd": "1", "period": "day"})).await;
+    let first = post(&w, w.tenant, json!({"limit_cny": "1", "period": "day"})).await;
     assert_eq!(first.status, 201, "{first:?}");
-    let again = post(&w, w.tenant, json!({"limit_usd": "2", "period": "day"})).await;
+    let again = post(&w, w.tenant, json!({"limit_cny": "2", "period": "day"})).await;
     assert_eq!(
         (again.status, &again.body["code"]),
         (409, &json!("budget_exists")),
@@ -182,14 +223,14 @@ async fn a_quota_the_domain_refuses_answers_at_a_path_of_this_route() {
         .fetch_one(w.cp.db().pool())
         .await
         .expect("the internal tenant");
-    let r = post(&w, internal, json!({"limit_usd": "1"})).await;
+    let r = post(&w, internal, json!({"limit_cny": "1"})).await;
     assert_eq!(
         (r.status, detail_path(&r)),
         (422, &json!("/tenant_id")),
         "{r:?}"
     );
 
-    let r = post(&w, Uuid::new_v4(), json!({"limit_usd": "1"})).await;
+    let r = post(&w, Uuid::new_v4(), json!({"limit_cny": "1"})).await;
     assert_eq!(r.status, 404, "{r:?}");
     assert_eq!(audits(&w.cp, "budget.create").await, 1);
 }
@@ -198,7 +239,7 @@ async fn a_quota_the_domain_refuses_answers_at_a_path_of_this_route() {
 async fn an_operator_reads_every_level() {
     let Some(w) = world().await else { return };
     let key = Uuid::parse_str(&w.key).expect("a key id");
-    let team = post(&w, w.tenant, json!({"limit_usd": "9"})).await;
+    let team = post(&w, w.tenant, json!({"limit_cny": "9"})).await;
     assert_eq!(team.status, 201, "{team:?}");
     let member = other_level(
         &w.cp,
@@ -211,7 +252,7 @@ async fn an_operator_reads_every_level() {
     let cap = other_level(&w.cp, w.tenant, BudgetScope::ApiKey, key, SetBy::Member).await;
     // Another tenant's quota is not in the list.
     let other = seed_tenant(&w.cp, &w.admin).await;
-    post(&w, other, json!({"limit_usd": "1"})).await;
+    post(&w, other, json!({"limit_cny": "1"})).await;
 
     let r = get(&w, w.tenant).await;
     assert_eq!(r.status, 200, "{r:?}");
@@ -248,7 +289,7 @@ async fn an_operator_reads_every_level() {
 async fn an_operator_edits_only_operator_rows() {
     let Some(w) = world().await else { return };
     let key = Uuid::parse_str(&w.key).expect("a key id");
-    let mine = post(&w, w.tenant, json!({"limit_usd": "1"})).await.body["id"]
+    let mine = post(&w, w.tenant, json!({"limit_cny": "1"})).await.body["id"]
         .as_str()
         .expect("an id")
         .to_string();
@@ -270,7 +311,7 @@ async fn an_operator_edits_only_operator_rows() {
             &w.admin,
             "PATCH",
             &p,
-            Some(json!({"limit_usd": "7"})),
+            Some(json!({"limit_cny": "7"})),
         )
         .await;
         assert_eq!(
@@ -295,14 +336,14 @@ async fn an_operator_edits_only_operator_rows() {
         items
             .as_array()
             .and_then(|a| a.iter().find(|b| b["id"] == json!(id)))
-            .map(|b| b["limit_micro_usd"].clone())
+            .map(|b| b["limit_micro_cny"].clone())
     };
     assert_eq!(limit(member.id), Some(json!(5_000_000)));
     assert_eq!(limit(cap.id), Some(json!(5_000_000)));
 
     // Another tenant's quota is a 404 through this tenant's path.
     let other = seed_tenant(&w.cp, &w.admin).await;
-    let theirs = post(&w, other, json!({"limit_usd": "1"})).await.body["id"]
+    let theirs = post(&w, other, json!({"limit_cny": "1"})).await.body["id"]
         .as_str()
         .expect("an id")
         .to_string();
@@ -312,7 +353,7 @@ async fn an_operator_edits_only_operator_rows() {
             &w.admin,
             "PATCH",
             &path(&id),
-            Some(json!({"limit_usd": "2"})),
+            Some(json!({"limit_cny": "2"})),
         )
         .await;
         assert_eq!(r.status, 404, "{r:?}");
@@ -327,23 +368,23 @@ async fn an_operator_edits_only_operator_rows() {
         &w.admin,
         "PATCH",
         &path(&mine),
-        Some(json!({"limit_usd": "2.50"})),
+        Some(json!({"limit_cny": "2.50"})),
     )
     .await;
     assert_eq!(r.status, 200, "{r:?}");
-    assert_eq!(r.body["limit_micro_usd"], json!(2_500_000));
+    assert_eq!(r.body["limit_micro_cny"], json!(2_500_000));
     assert_eq!(audits(&w.cp, "budget.update").await, 1);
     let r = send(
         &w.cp,
         &w.admin,
         "PATCH",
         &path(&mine),
-        Some(json!({"limit_usd": "0"})),
+        Some(json!({"limit_cny": "0"})),
     )
     .await;
     assert_eq!(
         (r.status, detail_path(&r)),
-        (422, &json!("/limit_usd")),
+        (422, &json!("/limit_cny")),
         "{r:?}"
     );
     let r = send(&w.cp, &w.admin, "DELETE", &path(&mine), None).await;
@@ -360,7 +401,7 @@ async fn who_may_call_the_operator_quota_routes() {
     let viewer = w.cp.admin_login_seeded(OperatorRole::Viewer).await;
     let operator = w.cp.admin_login_seeded(OperatorRole::Operator).await;
     let url = format!("/admin/tenants/{}/budgets", w.tenant);
-    let body = json!({"limit_usd": "0.01"});
+    let body = json!({"limit_cny": "0.01"});
 
     let r = send(&w.cp, &viewer, "GET", &url, None).await;
     assert_eq!(r.status, 200, "{r:?}");
@@ -389,7 +430,7 @@ async fn who_may_call_the_operator_quota_routes() {
         &viewer,
         "PATCH",
         &one,
-        Some(json!({"limit_usd": "1"})),
+        Some(json!({"limit_cny": "1"})),
     )
     .await;
     assert_eq!(r.status, 403, "{r:?}");
@@ -413,7 +454,7 @@ async fn tsend(
 }
 
 fn quota(scope: &str, target: impl std::fmt::Display, limit: &str) -> Value {
-    json!({"scope": scope, "scope_ref": target.to_string(), "limit_usd": limit})
+    json!({"scope": scope, "scope_ref": target.to_string(), "limit_cny": limit})
 }
 
 /// A tenant with an owner O, a member M, a key of each and the sessions.
@@ -540,7 +581,7 @@ async fn a_member_caps_only_its_own_keys() {
 async fn each_level_edits_only_its_own_rows() {
     let Some(w) = world().await else { return };
     let t = tenant(&w).await;
-    let op = post(&w, w.tenant, json!({"limit_usd": "1"})).await;
+    let op = post(&w, w.tenant, json!({"limit_cny": "1"})).await;
     let op_path = format!("/api/budgets/{}", id(&op));
     let owners_cap =
         other_level(&w.cp, w.tenant, BudgetScope::ApiKey, t.k_m, SetBy::OrgAdmin).await;
@@ -562,7 +603,7 @@ async fn each_level_edits_only_its_own_rows() {
         &t.owner,
         "PATCH",
         &op_path,
-        Some(json!({"limit_usd": "2"})),
+        Some(json!({"limit_cny": "2"})),
     )
     .await;
     assert_eq!(managed(&r), want, "{r:?}");
@@ -574,7 +615,7 @@ async fn each_level_edits_only_its_own_rows() {
         &t.m,
         "PATCH",
         &cap_path,
-        Some(json!({"limit_usd": "2"})),
+        Some(json!({"limit_cny": "2"})),
     )
     .await;
     assert_eq!(managed(&r), want, "{r:?}");
@@ -615,11 +656,11 @@ async fn each_level_edits_only_its_own_rows() {
         &t.owner,
         "PATCH",
         &hidden,
-        Some(json!({"limit_usd": "3"})),
+        Some(json!({"limit_cny": "3"})),
     )
     .await;
     assert_eq!(
-        (r.status, &r.body["limit_micro_usd"]),
+        (r.status, &r.body["limit_micro_cny"]),
         (200, &json!(3_000_000)),
         "{r:?}"
     );
@@ -628,7 +669,7 @@ async fn each_level_edits_only_its_own_rows() {
         &t.owner,
         "PATCH",
         &cap_path,
-        Some(json!({"limit_usd": "4"})),
+        Some(json!({"limit_cny": "4"})),
     )
     .await;
     assert_eq!(r.status, 200, "{r:?}");
@@ -648,11 +689,11 @@ async fn each_level_edits_only_its_own_rows() {
         &t.m,
         "PATCH",
         &own,
-        Some(json!({"limit_usd": "0.50"})),
+        Some(json!({"limit_cny": "0.50"})),
     )
     .await;
     assert_eq!(
-        (r.status, &r.body["limit_micro_usd"]),
+        (r.status, &r.body["limit_micro_cny"]),
         (200, &json!(500_000)),
         "{r:?}"
     );
@@ -663,7 +704,7 @@ async fn each_level_edits_only_its_own_rows() {
 
     // Another tenant's quota is a 404.
     let other = seed_tenant(&w.cp, &w.admin).await;
-    let theirs = post(&w, other, json!({"limit_usd": "1"})).await;
+    let theirs = post(&w, other, json!({"limit_cny": "1"})).await;
     for p in [
         format!("/api/budgets/{}", id(&theirs)),
         format!("/api/budgets/{}", Uuid::new_v4()),
@@ -671,7 +712,7 @@ async fn each_level_edits_only_its_own_rows() {
         for who in [&t.owner, &t.m] {
             let r = tsend(&w.cp, who, "DELETE", &p, None).await;
             assert_eq!(r.status, 404, "{r:?}");
-            let r = tsend(&w.cp, who, "PATCH", &p, Some(json!({"limit_usd": "1"}))).await;
+            let r = tsend(&w.cp, who, "PATCH", &p, Some(json!({"limit_cny": "1"}))).await;
             assert_eq!(r.status, 404, "{r:?}");
         }
     }
@@ -682,7 +723,7 @@ async fn each_level_edits_only_its_own_rows() {
 async fn a_member_reads_its_own_levels_only() {
     let Some(w) = world().await else { return };
     let t = tenant(&w).await;
-    let team = post(&w, w.tenant, json!({"limit_usd": "9"})).await;
+    let team = post(&w, w.tenant, json!({"limit_cny": "9"})).await;
     let mine = other_level(
         &w.cp,
         w.tenant,
@@ -836,7 +877,7 @@ async fn a_quota_defaults_to_monthly() {
         &t.owner,
         "POST",
         "/api/budgets",
-        Some(json!({"scope": "member", "scope_ref": t.owner.id, "kind": "cumulative", "limit_usd": "1"})),
+        Some(json!({"scope": "member", "scope_ref": t.owner.id, "kind": "cumulative", "limit_cny": "1"})),
     )
     .await;
     assert_eq!(
@@ -899,7 +940,7 @@ async fn who_may_call_the_tenant_quota_routes() {
         &billing,
         "PATCH",
         &one,
-        Some(json!({"limit_usd": "2"})),
+        Some(json!({"limit_cny": "2"})),
     )
     .await;
     assert_eq!(r.status, 403, "{r:?}");

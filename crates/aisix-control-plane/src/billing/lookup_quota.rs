@@ -5,7 +5,7 @@
 //! The quotas that apply to a key are the organization's (`team`), its
 //! member's and its own, and the organization's balance or credit. A request
 //! is refused when any of them is used up, so the smallest remaining amount
-//! binds ([`KeyQuota::effective_remaining_micro_usd`]), and the level that
+//! binds ([`KeyQuota::effective_remaining_micro_cny`]), and the level that
 //! holds it is [`KeyQuota::binding_level`]. The effective remaining is
 //! computed from every applicable level whatever the visibility; what the
 //! holder may see of the organization is [`Visibility`]'s. The answer
@@ -24,7 +24,7 @@ use uuid::Uuid;
 
 use super::access::{key_access, session_visibility, KeyAccess, Visibility};
 use super::budgets::{self, BudgetRow, BudgetScope, Kind, SetBy};
-use super::money::{cny_string, usd_string};
+use super::money::cny_string;
 use crate::auth::{MemberAuth, MemberRole};
 use crate::db::DbError;
 use crate::dp::DpIdentity;
@@ -60,9 +60,9 @@ pub struct QuotaFigure {
     pub set_by: SetBy,
     pub kind: Kind,
     pub period: Option<&'static str>,
-    pub limit_micro_usd: i64,
-    pub spent_micro_usd: i64,
-    pub remaining_micro_usd: i64,
+    pub limit_micro_cny: i64,
+    pub spent_micro_cny: i64,
+    pub remaining_micro_cny: i64,
     pub period_start: Option<DateTime<Utc>>,
     pub counted_from: Option<DateTime<Utc>>,
     pub exhausted: bool,
@@ -78,11 +78,10 @@ pub struct KeyQuota {
     pub as_of: DateTime<Utc>,
     pub org: Option<OrgFigures>,
     pub quotas: Vec<QuotaFigure>,
-    /// The smallest remaining of every level that applies. The organization's
-    /// is CNY since migration `0027` and a quota's USD until `0028`; at the
-    /// rate the interim window is entered with, both sides carry the same
-    /// number, so the comparison stands.
-    pub effective_remaining_micro_usd: Option<i64>,
+    /// The smallest remaining of every level that applies, in micro-CNY.
+    /// The organization's balance and every quota's remaining are the same
+    /// unit, so the comparison is exact at any conversion rate.
+    pub effective_remaining_micro_cny: Option<i64>,
     pub binding_level: Option<Level>,
 }
 
@@ -101,12 +100,12 @@ fn figure(b: &BudgetRow, spent: i64, now: DateTime<Utc>) -> QuotaFigure {
         set_by: b.set_by,
         kind: b.kind,
         period: b.period.map(BudgetPeriod::as_str),
-        limit_micro_usd: b.limit_micro_usd,
-        spent_micro_usd: spent,
-        remaining_micro_usd: b.limit_micro_usd.saturating_sub(spent),
+        limit_micro_cny: b.limit_micro_cny,
+        spent_micro_cny: spent,
+        remaining_micro_cny: b.limit_micro_cny.saturating_sub(spent),
         period_start: b.period.map(|p| p.start_of(now)),
         counted_from: b.counted_from,
-        exhausted: spent >= b.limit_micro_usd,
+        exhausted: spent >= b.limit_micro_cny,
         created_at: b.created_at,
     }
 }
@@ -153,7 +152,7 @@ pub async fn key_quota(
         lower(Level::Organization, available);
     }
     for (b, spent) in &applicable {
-        lower(level_of(b.scope), b.limit_micro_usd.saturating_sub(*spent));
+        lower(level_of(b.scope), b.limit_micro_cny.saturating_sub(*spent));
     }
     let effective = remaining.iter().flatten().copied().min();
     let binding_level = effective.and_then(|min| {
@@ -179,19 +178,17 @@ pub async fn key_quota(
         as_of: now,
         org,
         quotas,
-        effective_remaining_micro_usd: effective,
+        effective_remaining_micro_cny: effective,
         binding_level,
     })
 }
 
 /// `q` as a gateway relays it: every amount an exact decimal string.
 ///
-/// The organization's amounts are micro-CNY since migration `0027` and a
-/// quota's are micro-USD until `0028`. The field names stay those the gateway
-/// decodes until it is upgraded, and the values are the same number either
-/// way at the rate the interim window is entered with.
+/// The amounts are micro-CNY. The field names are the ones the gateway
+/// decodes today; they carry the value under its old name until the gateway
+/// is upgraded, which reads the neutral names and the `currency` field.
 fn dp_json(q: &KeyQuota) -> Value {
-    let usd = |micro: i64| usd_string(micro);
     let cny = |micro: i64| cny_string(micro);
     json!({
         "key_id": q.key_id,
@@ -207,14 +204,14 @@ fn dp_json(q: &KeyQuota) -> Value {
             "set_by": f.set_by,
             "kind": f.kind,
             "period": f.period,
-            "limit_usd": usd(f.limit_micro_usd),
-            "spend_usd": usd(f.spent_micro_usd),
-            "remaining_usd": usd(f.remaining_micro_usd),
+            "limit_usd": cny(f.limit_micro_cny),
+            "spend_usd": cny(f.spent_micro_cny),
+            "remaining_usd": cny(f.remaining_micro_cny),
             "period_start": f.period_start,
             "counted_from": f.counted_from,
             "exhausted": f.exhausted,
         })).collect::<Vec<_>>(),
-        "effective_remaining_usd": q.effective_remaining_micro_usd.map(cny),
+        "effective_remaining_usd": q.effective_remaining_micro_cny.map(cny),
         "binding_level": q.binding_level,
     })
 }
@@ -243,7 +240,7 @@ pub async fn dp_quota(
         .ok_or_else(ApiError::not_found)
 }
 
-/// `GET /api/keys/{id}/quota` → `KeyQuota` in micro-USD, with the session's
+/// `GET /api/keys/{id}/quota` → `KeyQuota` in micro-CNY, with the session's
 /// visibility. An owner, admin or billing member reads any key of the
 /// organization; a member reads the keys bound to it. Any other key, another
 /// tenant's included, is `404`.

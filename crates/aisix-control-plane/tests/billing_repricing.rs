@@ -636,7 +636,7 @@ async fn a_run_moves_a_cumulative_quota_and_not_a_periodic_one() {
         set_by: SetBy::OrgAdmin,
         kind,
         period,
-        limit_micro_usd: limit,
+        limit_micro_cny: limit,
         created_by_kind: "system",
         created_by: None,
     };

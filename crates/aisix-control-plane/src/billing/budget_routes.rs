@@ -26,7 +26,7 @@ use sqlx::PgConnection;
 use uuid::Uuid;
 
 use super::budgets::{self, BudgetRow, BudgetScope, Kind, NewBudget, SetBy};
-use super::money::parse_usd;
+use super::money::parse_cny;
 use crate::audit::Actor;
 use crate::auth::{MemberAuth, MemberRole, OperatorAuth, OperatorRole};
 use crate::db::DbError;
@@ -162,7 +162,7 @@ pub struct NewQuota {
     kind: Option<String>,
     #[serde(default)]
     period: Option<String>,
-    limit_usd: String,
+    limit_cny: String,
 }
 
 fn invalid(path: &str, message: &str) -> ApiError {
@@ -175,11 +175,11 @@ fn invalid(path: &str, message: &str) -> ApiError {
 /// A quota's `kind`, `period` and limit as typed: `periodic` (the default)
 /// or `cumulative`; a periodic quota's period is `day`, `week` or `month`
 /// (the default), a cumulative one has none. What is wrong is added to
-/// `problems` at `/kind`, `/period` and `/limit_usd`.
+/// `problems` at `/kind`, `/period` and `/limit_cny`.
 fn terms(
     kind: Option<&str>,
     period: Option<&str>,
-    limit_usd: &str,
+    limit_cny: &str,
     problems: &mut Vec<Detail>,
 ) -> (Kind, Option<BudgetPeriod>, i64) {
     let kind = match kind {
@@ -210,19 +210,19 @@ fn terms(
             }
         },
     };
-    let limit = parse_usd(limit_usd, "/limit_usd").unwrap_or_else(|e| {
+    let limit = parse_cny(limit_cny, "/limit_cny").unwrap_or_else(|e| {
         problems.extend(e.details);
         0
     });
     (kind, period, limit)
 }
 
-/// `POST /admin/tenants/{id}/budgets` with `{kind?, period?, limit_usd}` →
+/// `POST /admin/tenants/{id}/budgets` with `{kind?, period?, limit_cny}` →
 /// `201 Budget`: the organization's quota (scope `team`, `set_by
 /// "operator"`), settled before the answer. `kind` is `periodic` (the
 /// default) or `cumulative`; a periodic quota's `period` is `day`, `week` or
 /// `month` (the default), and a cumulative one has none. `422` at `/kind`,
-/// `/period`, `/limit_usd` (dollars and cents above 0) and, for the internal
+/// `/period`, `/limit_cny` (yuan and fen above 0) and, for the internal
 /// tenant, which takes no quota, at `/tenant_id`; `409 budget_exists` when
 /// the tenant already has an operator quota of that kind and period; `404`
 /// for no such tenant.
@@ -238,7 +238,7 @@ pub async fn create(
     let (kind, period, limit) = terms(
         req.kind.as_deref(),
         req.period.as_deref(),
-        &req.limit_usd,
+        &req.limit_cny,
         &mut problems,
     );
     if !problems.is_empty() {
@@ -257,7 +257,7 @@ pub async fn create(
                     set_by: SetBy::Operator,
                     kind,
                     period,
-                    limit_micro_usd: limit,
+                    limit_micro_cny: limit,
                     created_by_kind: "operator",
                     created_by: Some(auth.id),
                 };
@@ -287,7 +287,7 @@ pub async fn create(
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SetLimit {
-    limit_usd: String,
+    limit_cny: String,
 }
 
 /// An operator's own quota `bid` of tenant `tenant`, locked behind the
@@ -307,10 +307,10 @@ async fn operator_row(
     Ok(row)
 }
 
-/// `PATCH /admin/tenants/{id}/budgets/{bid}` with `{limit_usd}` → `200
+/// `PATCH /admin/tenants/{id}/budgets/{bid}` with `{limit_cny}` → `200
 /// Budget`, settled. Only an operator's quota: another level's is `403
 /// budget_managed`, another tenant's or a deleted one `404`; `422
-/// /limit_usd` unless the limit is dollars and cents above 0.
+/// /limit_cny` unless the limit is yuan and fen above 0.
 pub async fn update(
     auth: OperatorAuth,
     State(state): State<AppState>,
@@ -319,7 +319,7 @@ pub async fn update(
 ) -> Result<Json<Value>, ApiError> {
     auth.require(OperatorRole::Operator)?;
     let (id, bid) = ids(&id, &bid)?;
-    let limit = parse_usd(&req.limit_usd, "/limit_usd")?;
+    let limit = parse_cny(&req.limit_cny, "/limit_cny")?;
     let ctx = WriteCtx::of(&state);
     let (row, spent, now, found) = state
         .db
@@ -442,10 +442,10 @@ pub struct NewMemberQuota {
     kind: Option<String>,
     #[serde(default)]
     period: Option<String>,
-    limit_usd: String,
+    limit_cny: String,
 }
 
-/// `POST /api/budgets` with `{scope, scope_ref, kind?, period?, limit_usd}`
+/// `POST /api/budgets` with `{scope, scope_ref, kind?, period?, limit_cny}`
 /// → `201 Budget`, settled. The scope is `member` or `api_key`; `team` is
 /// the operators' (`403 budget_managed`). An owner or admin sets a `member`
 /// quota or one on any live key of the tenant (`set_by "org_admin"`); a
@@ -454,7 +454,7 @@ pub struct NewMemberQuota {
 /// member's key. A target that is not the tenant's, another tenant's
 /// included, is `422` at `/scope_ref`, as for one that does not exist.
 /// `kind` and `period` default to `periodic` and `month`; `422` at `/scope`,
-/// `/kind`, `/period` and `/limit_usd` as for the operators' route.
+/// `/kind`, `/period` and `/limit_cny` as for the operators' route.
 pub async fn member_create(
     auth: MemberAuth,
     State(state): State<AppState>,
@@ -478,7 +478,7 @@ pub async fn member_create(
     let (kind, period, limit) = terms(
         req.kind.as_deref(),
         req.period.as_deref(),
-        &req.limit_usd,
+        &req.limit_cny,
         &mut problems,
     );
     // An id that is no uuid names nothing, like one that is not found.
@@ -528,7 +528,7 @@ pub async fn member_create(
                     },
                     kind,
                     period,
-                    limit_micro_usd: limit,
+                    limit_micro_cny: limit,
                     created_by_kind: "member",
                     created_by: Some(auth.id),
                 };
@@ -585,11 +585,11 @@ fn bid_of(s: &str) -> Result<Uuid, ApiError> {
     Uuid::parse_str(s).map_err(|_| ApiError::not_found())
 }
 
-/// `PATCH /api/budgets/{id}` with `{limit_usd}` → `200 Budget`, settled. An
+/// `PATCH /api/budgets/{id}` with `{limit_cny}` → `200 Budget`, settled. An
 /// owner or admin edits `org_admin` and `member` quotas, a member only its
 /// own (`set_by "member"`); an operator's quota is `403 budget_managed`, as
 /// is the owner's cap on a member's key for that member. Another tenant's
-/// quota is `404`; `422 /limit_usd` unless dollars and cents above 0.
+/// quota is `404`; `422 /limit_cny` unless yuan and fen above 0.
 pub async fn member_update(
     auth: MemberAuth,
     State(state): State<AppState>,
@@ -599,7 +599,7 @@ pub async fn member_update(
     auth.require_active()?;
     auth.require(&[MemberRole::Owner, MemberRole::Admin, MemberRole::Member])?;
     let bid = bid_of(&bid)?;
-    let limit = parse_usd(&req.limit_usd, "/limit_usd")?;
+    let limit = parse_cny(&req.limit_cny, "/limit_cny")?;
     let ctx = WriteCtx::of(&state);
     let (row, spent, now, found) = state
         .db
