@@ -190,16 +190,17 @@ async fn rows_without_a_cost_are_counted_apart() {
     let item = one(&margin(&w.cp, &w.admin, "").await);
     // Both rows' money is reported: the second row was charged too, and
     // charging it is not made not to have happened by its cost being
-    // unknown. Only the cost side is partial, and `rows_without_cost` says
-    // how partial.
+    // unknown.
     assert_eq!(item["charged_micro_cny"], 14_400, "{item}");
+    // But the rate divides the costed half by the cost the costed half
+    // carries: 7200 µ¥ over 1000 µ$ is 7.2, and a rate diluted into 14.4
+    // would not be a check of anything.
+    assert_eq!(item["charged_with_cost_micro_cny"], 7_200, "{item}");
+    assert_eq!(item["charged_without_cost_micro_cny"], 7_200, "{item}");
     assert_eq!(item["cost_micro_usd"], 1_000, "{item}");
+    assert_eq!(item["realised_cny_per_usd"], REALISED_7_2, "{item}");
     assert_eq!(item["rows"], 1, "{item}");
     assert_eq!(item["rows_without_cost"], 1, "{item}");
-    // So the rate over the known-cost rows alone is 7.2, and the rate the
-    // two figures on the page give is 14.4: the difference is the reader's
-    // warning that one of the two rows has no cost behind it.
-    assert_eq!(item["realised_cny_per_usd"], "14.4000", "{item}");
 }
 
 #[tokio::test]
@@ -338,6 +339,22 @@ async fn a_row_repriced_after_its_key_took_a_group_reports_under_that_group() {
     assert_eq!(item["rows_without_cost"], 1, "{item}");
     // No cost, so no rate: null, not 0 and not a division by nothing.
     assert_eq!(item["realised_cny_per_usd"], Value::Null, "{item}");
+
+    // A costed charge on the same model in the same group, beside it: the
+    // item now holds both populations, and the rate divides only the costed
+    // one. Reading `charged_micro_cny` here would give 14.4 instead of 7.2.
+    send(&w, vec![served(&w, "m1", model, tokens_1000())]).await;
+    let item = one(&margin(&w.cp, &w.admin, "").await);
+    assert_eq!(item["charged_micro_cny"], 14_400, "{item}");
+    assert_eq!(item["charged_with_cost_micro_cny"], 7_200, "{item}");
+    assert_eq!(item["charged_without_cost_micro_cny"], delta, "{item}");
+    assert_eq!(item["cost_micro_usd"], 1_000, "{item}");
+    assert_eq!(item["realised_cny_per_usd"], REALISED_7_2, "{item}");
+    assert_eq!(
+        (item["rows"].as_i64(), item["rows_without_cost"].as_i64()),
+        (Some(1), Some(1)),
+        "{item}"
+    );
 }
 
 #[tokio::test]

@@ -103,12 +103,18 @@ fn uuid_filter(raw: Option<&str>, path: &str) -> Result<Option<Uuid>, ApiError> 
 /// range the sum of `charged_micro_cny` over every item equals the charges
 /// plus their adjustments — whatever the grouping.
 ///
-/// `charged_micro_cny` is the corrected charge of every row in the group:
-/// its `charge_micro_cny` plus every adjustment to it. `cost_micro_usd` sums
-/// the rows whose cost is known, and `rows_without_cost` counts the rest, so
-/// the two figures are shown as they stand and a reader can see how much of
-/// the charge no cost is known against — a cost that cannot be known never
-/// silently changes either amount.
+/// **The rate divides one population by itself.** `charged_micro_cny` is the
+/// group's whole corrected charge: every row's `charge_micro_cny` plus every
+/// adjustment to it. `cost_micro_usd` and `charged_with_cost_micro_cny` cover
+/// only the rows whose cost is known, and `realised_cny_per_usd` divides the
+/// second by the first — a repriced row whose cost price records nothing
+/// contributes money to the total but no cost, and dividing that money by a
+/// cost it never had would inflate the rate into a false check. So the answer
+/// carries both figures: `charged_without_cost_micro_cny` is the part of the
+/// total with no cost behind it (`charged_micro_cny` less
+/// `charged_with_cost_micro_cny`), and `rows_without_cost` counts its rows.
+/// A reader who trusts the rate can see exactly how much charge it does not
+/// describe.
 ///
 /// The filters are bounded by the range: `model_id` alone has no index of
 /// its own besides `pricing_charges_cny_occurred` (0027), and the range cap
@@ -145,6 +151,13 @@ pub async fn list(
                                  FROM pricing_adjustments_cny pa \
                                  WHERE pa.event_id = c.event_id)), 0)::bigint) \
                   AS charged, \
+                (COALESCE(SUM(c.charge_micro_cny) \
+                          FILTER (WHERE c.cost_micro_usd IS NOT NULL), 0)::bigint \
+                 + COALESCE(SUM((SELECT COALESCE(SUM(pa.delta_micro_cny)::bigint, 0) \
+                                 FROM pricing_adjustments_cny pa \
+                                 WHERE pa.event_id = c.event_id)) \
+                            FILTER (WHERE c.cost_micro_usd IS NOT NULL), 0)::bigint) \
+                  AS charged_with_cost, \
                 COALESCE(SUM(c.cost_micro_usd), 0)::bigint AS cost, \
                 (COUNT(*) FILTER (WHERE c.cost_micro_usd IS NOT NULL))::bigint AS rows, \
                 (COUNT(*) FILTER (WHERE c.cost_micro_usd IS NULL))::bigint \
@@ -186,8 +199,12 @@ pub async fn list(
                     "name": row.model_name,
                 },
                 "charged_micro_cny": row.charged,
+                "charged_with_cost_micro_cny": row.charged_with_cost,
+                "charged_without_cost_micro_cny": row.charged - row.charged_with_cost,
                 "cost_micro_usd": row.cost,
-                "realised_cny_per_usd": realised(row.charged, row.cost),
+                // The rate divides the charge that has a cost behind it by
+                // that cost: the two populations must match.
+                "realised_cny_per_usd": realised(row.charged_with_cost, row.cost),
                 "rows": row.rows,
                 "rows_without_cost": row.rows_without_cost,
             })
@@ -208,6 +225,8 @@ struct MarginRow {
     /// The model's display name; `None` when no live model row has its id.
     model_name: Option<String>,
     charged: i64,
+    /// [`Self::charged`] restricted to the rows whose cost is known.
+    charged_with_cost: i64,
     cost: i64,
     rows: i64,
     rows_without_cost: i64,
