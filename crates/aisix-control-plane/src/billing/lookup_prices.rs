@@ -143,11 +143,11 @@ pub async fn priced_models(
     // gateway that keys its cache on it then refetches, and never keeps
     // stale prices under a fresh version.
     let pricing_version = pricing_version(&mut *conn).await?.unwrap_or(0);
-    let granted: Vec<Uuid> =
-        sqlx::query_scalar("SELECT allowed_model_ids FROM tenants WHERE id = $1")
-            .bind(tenant_id)
-            .fetch_one(&mut *conn)
-            .await?;
+    // What the tenant's model scope gives it: its stored list, or every
+    // live public model when the scope is all. Read here rather than from a
+    // row cached elsewhere, so a public model created since the gateway's
+    // last lookup is priced at this one.
+    let granted: Vec<Uuid> = crate::tenants::scope_model_ids(&mut *conn, tenant_id).await?;
     // Granted models that still exist, with the name they are listed under.
     let granted: Vec<(Uuid, String)> = sqlx::query_as(
         "SELECT id, COALESCE(doc->>'display_name', '') FROM gw_resources \

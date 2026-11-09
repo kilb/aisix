@@ -2,8 +2,14 @@
 //!
 //! The gateways see a tenant as a team, `teams/<tenant id>`, named after it,
 //! once it is approved: a pending tenant gives them nothing (see `steps`).
-//! A tenant reaches the global model catalog only through its grants
-//! (`allowed_model_ids`). Its default protection (`limits`) is projected,
+//! A tenant reaches the global model catalog through its **model scope**: all
+//! public models ([`ModelScope::All`], what every tenant starts on) or the
+//! list it holds ([`ModelScope::Selected`], `allowed_model_ids`). "All" is
+//! computed at read time ([`scope_model_ids`]) rather than stored as one
+//! row per tenant per model, so a public model created later reaches every
+//! all-scope tenant without an edit, and retiring one needs no withdrawal.
+//! A key's own selection narrows within that scope, never past it. Its
+//! default protection (`limits`) is projected,
 //! while it is active, as one conditional rate-limit policy over the team,
 //! written under an id minted once (`limits_policy_id`). Both documents are
 //! the tenant's own (`managed_by = "tenant:<id>"`), so only the code here
@@ -121,6 +127,40 @@ impl BillingMode {
     }
 }
 
+/// What a tenant may reach: every public model, or the list it holds.
+///
+/// [`ModelScope::All`] is the default, for a new tenant of either origin and
+/// for a stored row written before the scope existed. It resolves to the
+/// live public models — the tenant-facing names an operator creates in the
+/// public model catalogue and assigns to upstream accounts — and is
+/// **computed** whenever it is read ([`scope_model_ids`], and beside the row
+/// in [`TenantRow::effective_model_ids`]), never written into a row. A hand-made model in the model catalogue is reachable only
+/// through [`ModelScope::Selected`], which keeps the stored
+/// `allowed_model_ids` and its existing meaning: the listed models, and an
+/// empty list grants none.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ModelScope {
+    #[default]
+    All,
+    Selected,
+}
+
+impl ModelScope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ModelScope::All => "all",
+            ModelScope::Selected => "selected",
+        }
+    }
+
+    pub(crate) fn parse(s: &str) -> Option<ModelScope> {
+        [ModelScope::All, ModelScope::Selected]
+            .into_iter()
+            .find(|scope| scope.as_str() == s)
+    }
+}
+
 /// A tenant's default protection. The first three bound the whole tenant
 /// (every key together); the `key_*_max` fields cap what one key of the
 /// tenant may be given. Unset means unbounded.
@@ -185,7 +225,16 @@ pub struct TenantRow {
     pub status: TenantStatus,
     pub is_internal: bool,
     pub billing_mode: BillingMode,
+    pub model_scope: ModelScope,
+    /// The stored selection, whose meaning `model_scope` decides.
     pub allowed_model_ids: Vec<Uuid>,
+    /// What the tenant reaches, resolved when the row was read: every live
+    /// public model under [`ModelScope::All`], the stored list under
+    /// [`ModelScope::Selected`]. Readable by every consumer that has the
+    /// row, so no model-keyed mechanism has to know which scope it is
+    /// looking at. Never the place a decision is made about the *stored*
+    /// list: `allowed_model_ids` stays what an operator last selected.
+    pub effective_model_ids: Vec<Uuid>,
     pub allowed_provider_groups: Vec<String>,
     pub limits: TenantLimits,
     pub limits_policy_id: Option<Uuid>,
@@ -200,6 +249,7 @@ type RawTenant = (
     String,
     bool,
     String,
+    String,
     Vec<Uuid>,
     Vec<String>,
     Value,
@@ -209,10 +259,15 @@ type RawTenant = (
     Option<DateTime<Utc>>,
 );
 
-const COLUMNS: &str = "id, name, status, is_internal, billing_mode, allowed_model_ids, \
-     allowed_provider_groups, limits, limits_policy_id, version, created_at, approved_at";
+const COLUMNS: &str = "id, name, status, is_internal, billing_mode, model_scope, \
+     allowed_model_ids, allowed_provider_groups, limits, limits_policy_id, version, created_at, \
+     approved_at";
 
 impl TenantRow {
+    /// The row with the scope it stored, and **not** yet with what that
+    /// scope resolves to ([`TenantRow::effective_model_ids`, filled by
+    /// [`load`] and the lock helpers, the only readers): a row built by hand
+    /// has no catalogue read behind it.
     fn from_raw(raw: RawTenant) -> Result<TenantRow, ApiError> {
         let (
             id,
@@ -220,6 +275,7 @@ impl TenantRow {
             status,
             is_internal,
             billing_mode,
+            model_scope,
             allowed_model_ids,
             allowed_provider_groups,
             limits,
@@ -237,7 +293,11 @@ impl TenantRow {
             billing_mode: BillingMode::parse(&billing_mode).ok_or_else(|| {
                 ApiError::internal(format!("tenant {id}: billing mode {billing_mode}"))
             })?,
+            model_scope: ModelScope::parse(&model_scope).ok_or_else(|| {
+                ApiError::internal(format!("tenant {id}: model scope {model_scope}"))
+            })?,
             allowed_model_ids,
+            effective_model_ids: Vec::new(),
             allowed_provider_groups,
             limits: serde_json::from_value(limits).map_err(ApiError::internal)?,
             limits_policy_id,
@@ -287,6 +347,25 @@ pub fn limits_policy_doc(id: Uuid, limits: &TenantLimits) -> Option<Value> {
     }))
 }
 
+/// [`TenantRow`] with the scope it resolves to (`effective_model_ids`)
+/// filled in: the one place a read becomes a row every consumer can use.
+///
+/// Under [`ModelScope::All`] that is the live public models as they stand
+/// now. It is read here, beside the row, rather than per key document, so
+/// every key of one tenant in one transaction resolves the same set. A
+/// retire cannot slip in between: a retire takes the public model's row and
+/// then the resources lock, and the paths that write a key document take
+/// the tenant's row first, so either the retire commits before this row is
+/// read and the set already lacks the model, or it waits and finds the key
+/// documents already narrowed.
+async fn load(conn: &mut PgConnection, raw: RawTenant) -> Result<TenantRow, ApiError> {
+    let mut tenant = TenantRow::from_raw(raw)?;
+    tenant.effective_model_ids = scope_model_ids(&mut *conn, tenant.id)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(tenant)
+}
+
 /// Tenant `id`, locked for the rest of the transaction; `404 not_found`
 /// when there is none. Locking a row the transaction already holds is a
 /// no-op. Its billing account is not locked: see [`lock_billing`].
@@ -295,10 +374,10 @@ pub async fn lock(conn: &mut PgConnection, id: Uuid) -> Result<TenantRow, ApiErr
         "SELECT {COLUMNS} FROM tenants WHERE id = $1 FOR UPDATE"
     ))
     .bind(id)
-    .fetch_optional(conn)
+    .fetch_optional(&mut *conn)
     .await
     .map_err(DbError::from)?;
-    TenantRow::from_raw(raw.ok_or_else(ApiError::not_found)?)
+    load(conn, raw.ok_or_else(ApiError::not_found)?).await
 }
 
 /// Tenant `id` and then its billing account ([`ledger::lock_account`]),
@@ -323,10 +402,28 @@ pub(crate) async fn find(conn: &mut PgConnection, id: Uuid) -> Result<TenantRow,
     let raw: Option<RawTenant> =
         sqlx::query_as(&format!("SELECT {COLUMNS} FROM tenants WHERE id = $1"))
             .bind(id)
-            .fetch_optional(conn)
+            .fetch_optional(&mut *conn)
             .await
             .map_err(DbError::from)?;
-    TenantRow::from_raw(raw.ok_or_else(ApiError::not_found)?)
+    load(conn, raw.ok_or_else(ApiError::not_found)?).await
+}
+
+/// Locks every tenant on [`ModelScope::All`], in ascending id order, so a
+/// write that changes what those tenants reach (`channels::regenerate`, a
+/// public model's retire) can reproject their key documents in the same
+/// transaction, under the lock order: the tenant rows first, then the
+/// public model's row, then the resources lock.
+///
+/// A selected-scope tenant holds no reference to a public model as a whole,
+/// so it is not taken here; a change in the public model catalogue reaches
+/// it only through an operator's edit of its list.
+pub async fn lock_all_scope(conn: &mut PgConnection) -> Result<Vec<TenantRow>, ApiError> {
+    let mut ids: Vec<Uuid> =
+        sqlx::query_scalar("SELECT id FROM tenants WHERE model_scope = 'all' ORDER BY id")
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(DbError::from)?;
+    lock_many(conn, &mut ids).await
 }
 
 /// Locks the tenants `ids`, in ascending id order (which `ids` is sorted
@@ -385,16 +482,26 @@ async fn insert(
     let id = Uuid::new_v4();
     let limits = serde_json::to_value(new.limits).map_err(ApiError::internal)?;
     sqlx::query(
-        "INSERT INTO tenants (id, name, status, is_internal, billing_mode, \
+        "INSERT INTO tenants (id, name, status, is_internal, billing_mode, model_scope, \
            allowed_provider_groups, limits, approved_at, approved_by) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, \
-           CASE WHEN $3 = 'active' THEN now() END, $8)",
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, \
+           CASE WHEN $3 = 'active' THEN now() END, $9)",
     )
     .bind(id)
     .bind(new.name)
     .bind(new.status.as_str())
     .bind(new.is_internal)
     .bind(new.billing_mode.as_str())
+    // The platform's own tenant stays `selected` with its (empty) list: its
+    // keys are the platform's, and `all` would widen them from the hand-made
+    // models an operator grants by id to every public model. A customer
+    // starts on every public model, the owner's default.
+    .bind(if new.is_internal {
+        ModelScope::Selected
+    } else {
+        ModelScope::All
+    }
+    .as_str())
     .bind(new.groups)
     .bind(limits)
     .bind(new.approved_by)
@@ -814,6 +921,66 @@ pub(crate) async fn settle_boot_projection(
         .await
         .map_err(DbError::from)?;
     Ok(kept)
+}
+
+/// Every live public model: the tenant-facing model names, by id, sorted.
+///
+/// A public model counts once it is **callable** — its row is live and its
+/// routing document is live. A newly created one has no document until an
+/// operator assigns it to an upstream account (`channels::create` writes the
+/// row alone), so it reaches no tenant before there is something to call,
+/// and a model whose every serving account is disabled keeps its document
+/// (with no target) and stays listed, answering `upstream_unavailable`,
+/// exactly as a grant of it would.
+pub async fn public_model_ids(conn: &mut PgConnection) -> Result<Vec<Uuid>, DbError> {
+    Ok(sqlx::query_scalar(
+        "SELECT p.id FROM public_models p \
+         WHERE p.retired_at IS NULL \
+           AND EXISTS (SELECT 1 FROM gw_resources r \
+                       WHERE r.kind = $1 AND r.id = p.id AND NOT r.deleted) \
+         ORDER BY p.id",
+    )
+    .bind(Kind::Models.segment())
+    .fetch_all(conn)
+    .await?)
+}
+
+/// The model ids tenant `id` reaches, sorted: every live public model under
+/// [`ModelScope::All`], and its stored list under [`ModelScope::Selected`].
+/// The tenant's scope is read from its row, so this answers on a connection
+/// that has no use for a whole [`TenantRow`] — the gateway's price lookups
+/// on their own pool.
+///
+/// This is the one computation of what a tenant's scope gives it, read by
+/// the key documents, the gateway's price lookups and the tenant-facing
+/// model list. "All" is computed here rather than materialised as one row
+/// per tenant per model, so creating a public model reaches every all-scope
+/// tenant at once and retiring one withdraws nothing: the set is what the
+/// catalogue holds at the moment it is read, and there is no row to keep in
+/// step with it, to delete on a retire, or to backfill for a tenant created
+/// between two ticks.
+///
+/// Under [`ModelScope::Selected`] the stored ids are returned as they are,
+/// without re-checking each document: a grant is validated when it is
+/// written, under the resources lock, and a model delete withdraws it
+/// (`on_model_deleted`).
+pub async fn scope_model_ids(
+    conn: &mut PgConnection,
+    tenant_id: Uuid,
+) -> Result<Vec<Uuid>, DbError> {
+    // A tenant row the caller holds is there; one that is not is answered as
+    // `RowNotFound`, which the price lookup renders as the `404` it answers an
+    // unknown key with.
+    let stored: (String, Vec<Uuid>) =
+        sqlx::query_as("SELECT model_scope, allowed_model_ids FROM tenants WHERE id = $1")
+            .bind(tenant_id)
+            .fetch_optional(&mut *conn)
+            .await?
+            .ok_or(sqlx::Error::RowNotFound)?;
+    match ModelScope::parse(&stored.0) {
+        Some(ModelScope::Selected) => Ok(stored.1),
+        _ => public_model_ids(conn).await,
+    }
 }
 
 /// The tenants whose grants, or whose live keys' selections, include
@@ -1379,6 +1546,10 @@ pub struct TenantView {
     status: TenantStatus,
     is_internal: bool,
     billing_mode: BillingMode,
+    /// `all` or `selected`; see [`ModelScope`].
+    model_scope: ModelScope,
+    /// The stored selection, which the scope decides the meaning of: under
+    /// `all` it is kept but grants nothing on its own.
     allowed_model_ids: Vec<Uuid>,
     allowed_provider_groups: Vec<String>,
     limits: TenantLimits,
@@ -1465,6 +1636,7 @@ async fn views(
                 status: t.status,
                 is_internal: t.is_internal,
                 billing_mode: t.billing_mode,
+                model_scope: t.model_scope,
                 allowed_model_ids: t.allowed_model_ids,
                 allowed_provider_groups: t.allowed_provider_groups,
                 limits: t.limits,
@@ -1628,6 +1800,11 @@ pub async fn create_tenant(
 pub struct UpdateTenant {
     name: Option<String>,
     billing_mode: Option<BillingMode>,
+    /// `all` or `selected`. Sending `allowed_model_ids` without it means
+    /// `selected`: a list is a selection, and accepting it under `all` would
+    /// store a list that grants nothing. Sending `all` with a list is
+    /// refused, for the same reason read the other way.
+    model_scope: Option<ModelScope>,
     allowed_model_ids: Option<Vec<String>>,
     allowed_provider_groups: Option<Vec<String>>,
     /// Replaces every limit: a field left out is unset.
@@ -1675,12 +1852,28 @@ pub async fn update(
         Some(Ok(limits)) => Some(limits),
         None => None,
     };
+    // A list under `all` would be stored and grant nothing, which looks like
+    // a selection and is not one: refused rather than ignored.
+    if req.model_scope == Some(ModelScope::All) && req.allowed_model_ids.is_some() {
+        problems.push(detail(
+            "/allowed_model_ids",
+            "范围是全部模型时不能同时指定模型列表；要指定列表，请把范围改为 selected",
+        ));
+    }
     if !problems.is_empty() {
         return Err(ApiError::validation(problems));
     }
+    // A list is a selection; `all` is the only scope that ignores it. Naming
+    // neither leaves the scope as it is.
+    let scope = req.model_scope.or_else(|| {
+        req.allowed_model_ids
+            .is_some()
+            .then_some(ModelScope::Selected)
+    });
     let mut fields: Vec<&'static str> = [
         ("name", req.name.is_some()),
         ("billing_mode", req.billing_mode.is_some()),
+        ("model_scope", req.model_scope.is_some()),
         ("allowed_model_ids", req.allowed_model_ids.is_some()),
         (
             "allowed_provider_groups",
@@ -1725,13 +1918,31 @@ pub async fn update(
                     crate::groups::lock_named(&mut *conn, names, "/allowed_provider_groups")
                         .await?;
                 }
-                let grants = match &req.allowed_model_ids {
-                    Some(raw) => {
+                let grants = match (&req.allowed_model_ids, scope) {
+                    (Some(raw), _) => {
                         resources_lock(&mut *conn).await?;
                         Some(checked_grants(&mut *conn, current.is_internal, raw).await?)
                     }
-                    None => None,
+                    // Narrowing to `selected` starts from what the tenant
+                    // reaches now, so an operator narrows rather than
+                    // silently drops everything. The current set is read
+                    // under the resources lock the grant write takes, so a
+                    // public model created meanwhile is either in it or
+                    // written after this commits.
+                    (None, Some(ModelScope::Selected))
+                        if current.model_scope == ModelScope::All =>
+                    {
+                        resources_lock(&mut *conn).await?;
+                        let mut ids = scope_model_ids(&mut *conn, id).await?;
+                        ids.sort();
+                        Some(ids)
+                    }
+                    _ => None,
                 };
+                // Switching to `all` keeps the stored list as it is: it is
+                // what the tenant returns to if it is narrowed again, and
+                // nothing reads it while the scope is `all`.
+                let scope = scope.map(ModelScope::as_str);
                 let limits = limits
                     .map(|l| serde_json::to_value(&l))
                     .transpose()
@@ -1742,6 +1953,7 @@ pub async fn update(
                 sqlx::query(
                     "UPDATE tenants SET name = COALESCE($2, name), \
                        billing_mode = COALESCE($3, billing_mode), \
+                       model_scope = COALESCE($7, model_scope), \
                        allowed_model_ids = COALESCE($4, allowed_model_ids), \
                        allowed_provider_groups = COALESCE($5, allowed_provider_groups), \
                        limits = COALESCE($6, limits), version = version + 1 \
@@ -1753,6 +1965,7 @@ pub async fn update(
                 .bind(grants)
                 .bind(groups)
                 .bind(limits)
+                .bind(scope)
                 .execute(&mut *conn)
                 .await
                 .map_err(DbError::from)?;
@@ -1993,7 +2206,9 @@ mod tests {
             status,
             is_internal: false,
             billing_mode: BillingMode::Prepaid,
+            model_scope: ModelScope::Selected,
             allowed_model_ids: Vec::new(),
+            effective_model_ids: Vec::new(),
             allowed_provider_groups: vec!["shared".to_string()],
             limits,
             limits_policy_id: Some(Uuid::new_v4()),
