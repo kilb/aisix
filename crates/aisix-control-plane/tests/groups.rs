@@ -10,7 +10,7 @@
 
 mod support;
 
-use aisix_control_plane::auth::OperatorRole;
+use aisix_control_plane::auth::{MemberRole, OperatorRole};
 use aisix_control_plane::resources::write::RESOURCES_LOCK_KEY;
 use chrono::TimeDelta;
 use serde_json::{json, Value};
@@ -241,6 +241,10 @@ async fn the_migration_backfills_a_group_for_every_name_in_use() {
         ],
         "the revoked key's group is not in use and must not be backfilled"
     );
+    // 0023 backfills each with its name as its display name; 0030, which
+    // runs in the same upgrade, then gives each a display name of its own,
+    // since a routing name is never what a tenant is shown.
+    let mut shown = Vec::new();
     for name in ["grp-a-7c1", "grp-b-7c1", "grp-c-7c1", "grp-d-7c1"] {
         let (display_name, description, is_default): (String, String, bool) = sqlx::query_as(
             "SELECT display_name, description, is_default FROM provider_groups WHERE name = $1",
@@ -249,9 +253,13 @@ async fn the_migration_backfills_a_group_for_every_name_in_use() {
         .fetch_one(&pool)
         .await
         .expect("a backfilled group");
-        assert_eq!((display_name.as_str(), description.as_str()), (name, ""));
+        assert_ne!(display_name, name, "a routing name is not a display name");
+        assert_eq!(description, "", "{name}");
         assert!(!is_default, "{name} is not the designated default");
+        shown.push(display_name);
     }
+    shown.sort();
+    assert_eq!(shown, ["分组 1", "分组 2", "分组 3", "分组 4"]);
     // A backfilled group gets no rate: its rows are `missing_rate` until an
     // operator sets one.
     let rates: i64 = sqlx::query_scalar("SELECT count(*) FROM pricing_group_rates")
@@ -294,6 +302,9 @@ async fn a_fresh_database_has_the_first_boot_default_group() {
     );
     let (display_name, _, is_default) = group_row(&cp, "default").await;
     assert_eq!((display_name.as_str(), is_default), ("默认", true));
+    // The first-boot group is shown by a name of its own, not `shared`.
+    let (display_name, _, is_default) = group_row(&cp, "shared").await;
+    assert_eq!((display_name.as_str(), is_default), ("默认分组", false));
     let designated: Vec<String> =
         sqlx::query_scalar("SELECT name FROM provider_groups WHERE is_default")
             .fetch_all(cp.db().pool())
@@ -960,8 +971,9 @@ async fn the_upgrade_designates_a_default_group() {
         .expect("a default group");
     assert_eq!(
         (name.as_str(), display_name.as_str(), *is_default),
-        ("default", "default", true),
-        "a backfilled `default` keeps its name as its display name, and is designated"
+        ("default", "默认", true),
+        "a backfilled `default` is designated, and 0030 gives it the display name 0023 gives \
+         the `default` it creates"
     );
     assert_eq!(retired_at, &None);
     let designated: Vec<String> =
@@ -2104,4 +2116,286 @@ async fn resources_lock_held(cp: &TestCp) -> bool {
         .expect("try the resources lock");
     probe.rollback().await.expect("end the probe");
     !free
+}
+
+/// A tenant on the first-boot defaults is shown its group by a display name
+/// that is no group's routing name: `shared` is what provider keys are matched
+/// on, and 0030 gave it a display name of its own.
+#[tokio::test]
+async fn a_first_boot_tenant_is_shown_no_routing_name() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let admin = cp.admin_login_seeded(OperatorRole::Admin).await;
+    let tenant = seed_tenant(&cp, &admin).await;
+    let owner = cp.member_login_seeded(tenant, MemberRole::Owner).await;
+    let r = cp
+        .send("GET", "/api/groups", Some(owner.cookie()), None)
+        .await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let shown: Vec<&str> = r.body["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .map(|g| g["display_name"].as_str().expect("a display name"))
+        .collect();
+    assert_eq!(shown, ["默认分组"], "{r:?}");
+    let body = r.body.to_string();
+    for name in group_names(&cp).await {
+        assert!(!body.contains(&format!("\"{name}\"")), "{name} in {body}");
+    }
+}
+
+/// 0030 on a database 0023 left a group shown by its routing name: the
+/// first-boot `shared` becomes 默认分组, every other such group 分组 N in
+/// creation order, retired or not, and a display name an operator chose is
+/// left as it is.
+#[tokio::test]
+async fn the_upgrade_gives_every_group_shown_by_its_routing_name_a_display_name() {
+    let Some(pool) = database_at(29).await else {
+        return;
+    };
+    for sql in [
+        "INSERT INTO provider_groups (name, display_name, created_at) VALUES \
+         ('grp-late-7c1', 'grp-late-7c1', '2026-03-01T00:00:00Z'), \
+         ('grp-early-7c1', 'grp-early-7c1', '2026-01-01T00:00:00Z'), \
+         ('grp-named-7c1', '专线', '2026-02-01T00:00:00Z')",
+        "INSERT INTO provider_groups (name, display_name, created_at, retired_at) VALUES \
+         ('grp-gone-7c1', 'grp-gone-7c1', '2026-02-15T00:00:00Z', '2026-04-01T00:00:00Z')",
+    ] {
+        sqlx::query(sql)
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    let shared: String =
+        sqlx::query_scalar("SELECT display_name FROM provider_groups WHERE name = 'shared'")
+            .fetch_one(&pool)
+            .await
+            .expect("the first-boot group");
+    assert_eq!(shared, "shared", "what 0023 leaves on a fresh database");
+
+    migrate_rest(&pool).await.expect("0030 applies");
+
+    let shown: Vec<(String, String)> =
+        sqlx::query_as("SELECT name, display_name FROM provider_groups ORDER BY name")
+            .fetch_all(&pool)
+            .await
+            .expect("read the groups");
+    assert_eq!(
+        shown,
+        [
+            ("default", "默认"),
+            ("grp-early-7c1", "分组 1"),
+            ("grp-gone-7c1", "分组 2"),
+            ("grp-late-7c1", "分组 3"),
+            ("grp-named-7c1", "专线"),
+            ("shared", "默认分组"),
+        ]
+        .map(|(n, d)| (n.to_string(), d.to_string()))
+    );
+    drop_database(pool).await;
+}
+
+/// Holds `group` `FOR UPDATE` in a session of the test's own, sends
+/// `request`, and once it queues on that session retires the group by raw
+/// SQL, running `also` in the same transaction first, and commits: a retire
+/// committing while the request waits. The request's answer.
+async fn racing_a_retire(
+    cp: &TestCp,
+    group: Uuid,
+    request: reqwest::RequestBuilder,
+    also: &[&str],
+) -> (u16, Value) {
+    let mut holder = cp.db().pool().begin().await.expect("begin");
+    let holder_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *holder)
+        .await
+        .expect("this session's pid");
+    sqlx::query("SELECT 1 FROM provider_groups WHERE id = $1 FOR UPDATE")
+        .bind(group)
+        .execute(&mut *holder)
+        .await
+        .expect("hold the group");
+    let sent = tokio::spawn(async move {
+        let response = request.send().await.expect("send the request");
+        let status = response.status().as_u16();
+        let text = response.text().await.expect("read the answer");
+        (
+            status,
+            serde_json::from_str(&text).unwrap_or(Value::String(text)),
+        )
+    });
+    // It waits on the group row: a write that took no share lock on it
+    // would have answered by now, and this would time out.
+    until_blocked(cp.db().pool(), holder_pid).await;
+    for sql in also {
+        sqlx::query(sql)
+            .execute(&mut *holder)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    sqlx::query("UPDATE provider_groups SET retired_at = now() WHERE id = $1")
+        .bind(group)
+        .execute(&mut *holder)
+        .await
+        .expect("retire the group");
+    holder.commit().await.expect("release the group");
+    sent.await.expect("join the request")
+}
+
+/// An HTTP client that sends `request`s to the test's control plane.
+fn client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("an HTTP client")
+}
+
+/// A tenant created while a default group is being retired never names it.
+/// A retire refuses while the defaults name the group, so it commits only
+/// once they have moved to another: the create takes the default groups
+/// `FOR SHARE` before its tenant names them, waits for the retire, finds the
+/// group retired, and copies the defaults as they now stand.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_tenant_created_while_its_default_group_is_retired_never_names_it() {
+    let Some(cp) = TestCp::start_with(|cfg| cfg.db_lock_timeout_ms = 60_000).await else {
+        return;
+    };
+    let admin = cp.admin_login_seeded(OperatorRole::Admin).await;
+    let group = create_group(&cp, &admin, body("grp-dflt-7c1", "默认竞态", json!("1"))).await;
+    let group_uuid = Uuid::parse_str(&id_of(&group)).expect("a group id");
+    let r = cp
+        .send(
+            "PUT",
+            "/admin/settings/tenant-defaults",
+            Some(admin.cookie()),
+            Some(json!({"default_provider_groups": ["grp-dflt-7c1"]})),
+        )
+        .await;
+    assert_eq!(r.status, 200, "{r:?}");
+
+    let request = client()
+        .post(cp.url("/admin/tenants"))
+        .header(reqwest::header::COOKIE, admin.cookie())
+        .json(&json!({"name": "dflt-race-7c1"}));
+    // The defaults move back to `shared` in the retire's own transaction,
+    // as an operator's edit committed ahead of it would.
+    let (status, answer) = racing_a_retire(
+        &cp,
+        group_uuid,
+        request,
+        &[
+            "UPDATE cp_settings SET value = jsonb_set(value, '{default_provider_groups}', \
+           '[\"shared\"]') WHERE key = 'tenant_defaults'",
+        ],
+    )
+    .await;
+    assert_eq!(status, 201, "{answer}");
+    assert_eq!(
+        answer["allowed_provider_groups"],
+        json!(["shared"]),
+        "{answer}"
+    );
+    let naming: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM tenants WHERE 'grp-dflt-7c1' = ANY(allowed_provider_groups)",
+    )
+    .fetch_one(cp.db().pool())
+    .await
+    .expect("count the tenants naming it");
+    assert_eq!(naming, 0, "no tenant names the retired group");
+}
+
+/// A key created, or given its one group, while that group is being retired
+/// never names it: `key_group` takes the group's row `FOR SHARE`, so the
+/// write waits for the retire and then finds the group retired.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_key_naming_a_group_while_it_is_retired_never_names_it() {
+    let Some(cp) = TestCp::start_with(|cfg| cfg.db_lock_timeout_ms = 60_000).await else {
+        return;
+    };
+    let admin = cp.admin_login_seeded(OperatorRole::Admin).await;
+    let tenant = seed_tenant(&cp, &admin).await;
+    let mut groups = Vec::new();
+    for name in ["grp-key-a-7c1", "grp-key-b-7c1"] {
+        let group = create_group(&cp, &admin, body(name, name, json!("1"))).await;
+        groups.push(Uuid::parse_str(&id_of(&group)).expect("a group id"));
+    }
+    let version: i64 = sqlx::query_scalar("SELECT version FROM tenants WHERE id = $1")
+        .bind(tenant)
+        .fetch_one(cp.db().pool())
+        .await
+        .expect("the tenant's version");
+    let r = client()
+        .patch(cp.url(&format!("/admin/tenants/{tenant}")))
+        .header(reqwest::header::COOKIE, admin.cookie())
+        .header(reqwest::header::IF_MATCH, format!("\"{version}\""))
+        .json(&json!({"allowed_provider_groups": ["shared", "grp-key-a-7c1", "grp-key-b-7c1"]}))
+        .send()
+        .await
+        .expect("send the PATCH");
+    assert_eq!(r.status(), 200);
+
+    // A key create naming the group.
+    let request = client()
+        .post(cp.url(&format!("/admin/tenants/{tenant}/keys")))
+        .header(reqwest::header::COOKIE, admin.cookie())
+        .json(&json!({"label": "race-create-7c1", "group_id": groups[0]}));
+    let (status, answer) = racing_a_retire(&cp, groups[0], request, &[]).await;
+    assert_eq!(status, 422, "{answer}");
+    assert_eq!(answer["details"][0]["path"], "/group_id", "{answer}");
+    assert_eq!(keys_naming(&cp, groups[0]).await, 0);
+
+    // A key with no group yet, given its one group.
+    let r = cp
+        .send(
+            "POST",
+            &format!("/admin/tenants/{tenant}/keys"),
+            Some(admin.cookie()),
+            Some(json!({"label": "race-patch-7c1", "group_id": group_id_of(&cp, "shared").await})),
+        )
+        .await;
+    assert_eq!(r.status, 201, "{r:?}");
+    let key = Uuid::parse_str(r.body["key"]["id"].as_str().expect("a key id")).expect("a uuid");
+    // As a key an older release minted, before keys had a group.
+    let version: i64 = sqlx::query_scalar(
+        "UPDATE tenant_keys SET group_id = NULL WHERE id = $1 RETURNING version",
+    )
+    .bind(key)
+    .fetch_one(cp.db().pool())
+    .await
+    .expect("clear the key's group");
+    let request = client()
+        .patch(cp.url(&format!("/admin/keys/{key}")))
+        .header(reqwest::header::COOKIE, admin.cookie())
+        .header(reqwest::header::IF_MATCH, format!("\"{version}\""))
+        .json(&json!({"group_id": groups[1]}));
+    let (status, answer) = racing_a_retire(&cp, groups[1], request, &[]).await;
+    assert_eq!(status, 422, "{answer}");
+    assert_eq!(answer["details"][0]["path"], "/group_id", "{answer}");
+    assert_eq!(keys_naming(&cp, groups[1]).await, 0);
+    let still: Option<Uuid> = sqlx::query_scalar("SELECT group_id FROM tenant_keys WHERE id = $1")
+        .bind(key)
+        .fetch_one(cp.db().pool())
+        .await
+        .expect("read the key");
+    assert_eq!(still, None, "the key still has no group");
+}
+
+/// The live group `name`'s id.
+async fn group_id_of(cp: &TestCp, name: &str) -> Uuid {
+    sqlx::query_scalar("SELECT id FROM provider_groups WHERE name = $1 AND retired_at IS NULL")
+        .bind(name)
+        .fetch_one(cp.db().pool())
+        .await
+        .expect("the group's id")
+}
+
+/// How many keys name `group`.
+async fn keys_naming(cp: &TestCp, group: Uuid) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM tenant_keys WHERE group_id = $1")
+        .bind(group)
+        .fetch_one(cp.db().pool())
+        .await
+        .expect("count the keys naming it")
 }

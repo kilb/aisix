@@ -648,7 +648,11 @@ pub async fn create(
                 // public model cannot share a name with a hand-made one. The
                 // reverse side is the identity index, which refuses a
                 // hand-made model named after a public model's routing
-                // document.
+                // document. The check holds the resources lock, as every
+                // model write does, so a model written meanwhile is either
+                // seen here or written after this commits; the path takes no
+                // tenant, group or public-model row, so the order holds.
+                refs::lock_resources(&mut *conn).await?;
                 let taken: Option<Uuid> = sqlx::query_scalar(
                     "SELECT id FROM gw_resources \
                      WHERE kind = $1 AND identity = $2 AND NOT deleted LIMIT 1",

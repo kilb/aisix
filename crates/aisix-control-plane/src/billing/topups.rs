@@ -44,8 +44,9 @@ use crate::AppState;
 /// The most top-up requests one tenant may have awaiting a decision.
 pub const MAX_PENDING_TOPUPS: i64 = 20;
 
-/// The largest top-up, ¥1,000,000, in micro-CNY.
-pub const MAX_TOPUP_MICRO_CNY: i64 = 1_000_000_000_000;
+/// The largest top-up or credit, ¥99,999,999.99, in micro-CNY: the most a
+/// typed amount of eight integer digits can say (owner decision 10).
+pub const MAX_TOPUP_MICRO_CNY: i64 = 99_999_999_990_000;
 
 /// The longest note a request may carry, in characters.
 const MAX_NOTE_CHARS: usize = 500;
@@ -237,14 +238,14 @@ fn detail(path: &str, message: impl Into<String>) -> Detail {
     }
 }
 
-/// `raw` as a top-up amount in micro-USD: dollars and cents, above 0 and at
+/// `raw` as a top-up amount in micro-CNY: yuan and fen, above 0 and at
 /// most [`MAX_TOPUP_MICRO_CNY`]; the problem at `/amount_cny` otherwise.
 pub fn topup_amount(raw: &str) -> Result<i64, Vec<Detail>> {
     let micro = parse_cny(raw, "/amount_cny").map_err(|e| e.details)?;
     if micro <= 0 || micro > MAX_TOPUP_MICRO_CNY {
         return Err(vec![detail(
             "/amount_cny",
-            "金额须大于 0 且不超过 1,000,000 元",
+            "金额须大于 0 且不超过 99,999,999.99 元",
         )]);
     }
     Ok(micro)
@@ -313,7 +314,7 @@ pub struct NewTopup {
 
 /// `POST /api/billing/topups` with `{amount_cny, note?, reference?}` →
 /// `201 Topup`, pending. `422` at `/amount_cny` unless it is yuan and
-/// fen above 0 and at most ¥1,000,000, and at `/note` (500 characters) or
+/// fen above 0 and at most ¥99,999,999.99, and at `/note` (500 characters) or
 /// `/reference` (128) when too long or holding a control character; `409
 /// topup_limit` while the tenant has [`MAX_PENDING_TOPUPS`] pending already.
 pub async fn request(
@@ -645,8 +646,8 @@ mod tests {
     #[test]
     fn a_top_up_is_yuan_and_fen_within_the_maximum() {
         assert_eq!(topup_amount("0.01"), Ok(10_000));
-        assert_eq!(topup_amount("1000000"), Ok(MAX_TOPUP_MICRO_CNY));
-        for bad in ["0", "0.00", "1000000.01", "-1", "0.001"] {
+        assert_eq!(topup_amount("99999999.99"), Ok(MAX_TOPUP_MICRO_CNY));
+        for bad in ["0", "0.00", "100000000", "-1", "0.001"] {
             let problems = topup_amount(bad).expect_err(bad);
             assert_eq!(problems.len(), 1, "{bad}");
             assert_eq!(problems[0].path, "/amount_cny", "{bad}");

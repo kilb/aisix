@@ -81,7 +81,7 @@ pub(crate) struct Budget {
 /// The control plane's answer for one key.
 ///
 /// Decoded loosely: unknown fields are ignored and every field but
-/// `currency` and `effective_remaining_usd` — the two the answer exists to
+/// `currency` and `effective_remaining` — the two the answer exists to
 /// give, and one of them is what every amount is in — has a default. The
 /// route renders its own shape from these fields, so nothing the control
 /// plane adds reaches a caller until it is named here.

@@ -415,6 +415,10 @@ async fn insert(
 /// its billing account and writes its documents. An active tenant counts as
 /// approved by `actor`. Recording it in the audit log is the caller's: signup
 /// and the operator API record it differently.
+///
+/// The default groups are taken `FOR SHARE` ([`locked_defaults`]) before the
+/// tenant row names them, so a retire of one either commits first, and is
+/// then not copied, or waits for this create and counts the new tenant.
 pub async fn create(
     conn: &mut PgConnection,
     ctx: &WriteCtx,
@@ -423,16 +427,7 @@ pub async fn create(
     billing_mode: BillingMode,
     actor: Actor<'_>,
 ) -> Result<TenantRow, ApiError> {
-    let defaults = settings::tenant_defaults(&mut *conn).await?;
-    // A customer with no group is served by every upstream. The defaults
-    // API refuses to store none, so a stored row without one was written
-    // some other way; creating nothing is the closed failure.
-    if defaults.default_provider_groups.is_empty() {
-        return Err(ApiError::internal(
-            "the stored tenant defaults name no provider group; refusing to create a tenant \
-             that every upstream would serve",
-        ));
-    }
+    let defaults = locked_defaults(&mut *conn).await?;
     let approved_by = match (status, actor) {
         (TenantStatus::Active, Actor::Operator(op)) => Some(op.id),
         _ => None,
@@ -451,6 +446,49 @@ pub async fn create(
         },
     )
     .await
+}
+
+/// The stored tenant defaults, their groups taken `FOR SHARE` through
+/// [`crate::groups::lock_named`], in the lock order: after any tenant row
+/// (a create has none yet) and before `RESOURCES_LOCK_KEY`, which
+/// [`project`] takes.
+///
+/// A default group the lock finds retired was retired after the defaults
+/// were read, and a retire refuses while the defaults name the group, so
+/// the defaults changed in between: they are read once more. Refused a
+/// second time, they name a group that is not live, which the defaults API
+/// never stores, and nothing is created.
+async fn locked_defaults(conn: &mut PgConnection) -> Result<TenantDefaults, ApiError> {
+    let mut first = true;
+    loop {
+        let defaults = settings::tenant_defaults(&mut *conn).await?;
+        // A customer with no group is served by every upstream. The defaults
+        // API refuses to store none, so a stored row without one was written
+        // some other way; creating nothing is the closed failure.
+        if defaults.default_provider_groups.is_empty() {
+            return Err(ApiError::internal(
+                "the stored tenant defaults name no provider group; refusing to create a tenant \
+                 that every upstream would serve",
+            ));
+        }
+        match crate::groups::lock_named(
+            &mut *conn,
+            &defaults.default_provider_groups,
+            "/default_provider_groups",
+        )
+        .await
+        {
+            Ok(_) => return Ok(defaults),
+            Err(e) if e.status == StatusCode::UNPROCESSABLE_ENTITY && first => first = false,
+            Err(e) if e.status == StatusCode::UNPROCESSABLE_ENTITY => {
+                return Err(ApiError::internal(
+                    "the stored tenant defaults name a provider group that is not live; \
+                     refusing to create a tenant",
+                ))
+            }
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 /// One write [`project`] makes.

@@ -95,7 +95,7 @@ async fn balance(pool: &PgPool, tenant: Uuid) -> i64 {
 }
 
 async fn topup_rows(pool: &PgPool) -> i64 {
-    sqlx::query_scalar("SELECT count(*) FROM billing_topups")
+    sqlx::query_scalar("SELECT count(*) FROM billing_topups_cny")
         .fetch_one(pool)
         .await
         .expect("count top-ups")
@@ -541,10 +541,10 @@ async fn an_operator_credit_shows_to_the_tenant_with_its_reason() {
 }
 
 #[tokio::test]
-async fn a_credit_amount_is_dollars_and_cents_only() {
+async fn a_credit_amount_is_yuan_and_fen_only() {
     let Some(d) = desk().await else { return };
     let pool = d.cp.db().pool();
-    for bad in ["0", "0.001", "-1", "1e3", "1000000.01", "0.00", "", " 1"] {
+    for bad in ["0", "0.001", "-1", "1e3", "100000000", "0.00", "", " 1"] {
         let r = credit(
             &d.cp,
             &d.admin,
@@ -568,7 +568,8 @@ async fn a_credit_amount_is_dollars_and_cents_only() {
     assert_eq!(topup_rows(pool).await, 0);
     assert!(audits(pool, "billing.topup.credit").await.is_empty());
 
-    for (amount, micro) in [("0.01", 10_000_i64), ("1000000.00", 1_000_000_000_000)] {
+    // The largest amount eight integer digits can type, ¥99,999,999.99.
+    for (amount, micro) in [("0.01", 10_000_i64), ("99999999.99", 99_999_999_990_000)] {
         let r = credit(
             &d.cp,
             &d.admin,
@@ -579,7 +580,7 @@ async fn a_credit_amount_is_dollars_and_cents_only() {
         assert_eq!(r.status, 201, "{amount}: {r:?}");
         assert_eq!(r.body["amount_micro_cny"], micro, "{amount}");
     }
-    assert_eq!(balance(pool, d.tenant).await, 1_000_000_010_000);
+    assert_eq!(balance(pool, d.tenant).await, 100_000_000_000_000);
 }
 
 #[tokio::test]

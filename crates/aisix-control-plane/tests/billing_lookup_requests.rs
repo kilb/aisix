@@ -831,11 +831,12 @@ async fn a_charge_carries_its_rows_request_id() {
         ]
     );
 
-    let defs: Vec<String> =
-        sqlx::query_scalar("SELECT indexdef FROM pg_indexes WHERE tablename = 'pricing_charges'")
-            .fetch_all(w.cp.db().pool())
-            .await
-            .expect("read the indexes");
+    let defs: Vec<String> = sqlx::query_scalar(
+        "SELECT indexdef FROM pg_indexes WHERE tablename = 'pricing_charges_cny'",
+    )
+    .fetch_all(w.cp.db().pool())
+    .await
+    .expect("read the indexes");
     assert!(
         defs.iter()
             .any(|d| d.contains("(tenant_id, request_id, occurred_at, seq)")),
