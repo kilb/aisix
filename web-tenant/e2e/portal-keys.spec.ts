@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { expect, test, type Locator, type Page } from "@playwright/test";
+import { expect, test, type ElementHandle, type Locator, type Page } from "@playwright/test";
 import { STACK_START_TIMEOUT_MS, fundTenant, startStack, type ApiClient, type Json, type Stack } from "./stack";
 
 /**
@@ -32,15 +32,30 @@ test.beforeAll(async () => {
   // tenant edits below included. A name a test here creates itself is
   // skipped.
   await stack.admin.seedGroups(["grp-eu-5d2"]);
+  // Two groups a test assigns to an organisation, with distinct display
+  // names and descriptions, and one whose route name a page must not show.
+  for (const [name, display, description] of [
+    ["grp-a-7c3", "A 通道 7c3", "走 A 通道的说明 7c3"],
+    ["grp-b-7c3", "B 通道 7c3", "走 B 通道的说明 7c3"],
+    ["grp-route-9f3", "只显示这个名字 9f3", "路由名不可见 9f3"],
+  ]) {
+    await stack.admin.post("/admin/provider-groups", {
+      name,
+      display_name: display,
+      description,
+      default_cny_per_usd: "1",
+    });
+  }
   // The platform's catalog: one upstream account, in the default group the
-  // tenants here reach and in a second, named group, and one model on it.
+  // tenants here reach, in a second named group, and in A 通道, and one
+  // model on it.
   const account = await stack.admin.post("/admin/resources/provider_keys", {
     doc: {
       display_name: "acct-e2e-1",
       provider: "openai",
       api_key: "sk-acct-e2e-1-upstream",
       api_base: `${stack.mockUpstreamUrl}/v1`,
-      groups: ["shared", "grp-eu-5d2"],
+      groups: ["shared", "grp-eu-5d2", "grp-a-7c3"],
     },
   });
   const model = await stack.admin.post("/admin/resources/models", {
@@ -69,6 +84,41 @@ async function activeOrg(name: string, ownerEmail: string, limits?: Json): Promi
     current.version,
   );
   return id;
+}
+
+/** `activeOrg`, with the organisation assigned `groups` (routing names). */
+async function orgWithGroups(name: string, ownerEmail: string, groups: string[]): Promise<string> {
+  const id = await activeOrg(name, ownerEmail);
+  await assignGroups(id, groups);
+  return id;
+}
+
+/** Replaces `id`'s assigned groups, as an operator does. */
+async function assignGroups(id: string, groups: string[]): Promise<void> {
+  const current = await stack.admin.get(`/admin/tenants/${id}`);
+  await stack.admin.patch(`/admin/tenants/${id}`, { allowed_provider_groups: groups }, current.version);
+}
+
+/** The id of the live group whose routing name is `name`, as the operators see it. */
+async function groupIdOf(name: string): Promise<string> {
+  const listed = await stack.admin.get("/admin/provider-groups");
+  const group = listed.items.find((g: Json) => g.name === name);
+  if (!group) throw new Error(`no live group named ${name}`);
+  return group.id;
+}
+
+/** The id of the tenant named `name`, as the operators see it. */
+async function tenantIdOf(name: string): Promise<string> {
+  const listed = await stack.admin.get("/admin/tenants");
+  const tenant = listed.items.find((t: Json) => t.name === name);
+  if (!tenant) throw new Error(`no tenant named ${name}`);
+  return tenant.id;
+}
+
+/** An element's computed border width, the one property the card style sets. */
+function borderWidth(el: ElementHandle | null): Promise<string> {
+  if (!el) throw new Error("no element");
+  return el.evaluate((node) => getComputedStyle(node as Element).borderTopWidth);
 }
 
 /** `email` joins organisation `id` as `role`: an operator invites, the invitee accepts through `/api`. */
@@ -135,6 +185,223 @@ function description(field: Locator): Promise<string> {
       .join(" "),
   );
 }
+
+test("有多个分组时创建密钥必须选择分组，单选卡片显示显示名与说明", async ({ page }) => {
+  await orgWithGroups("Multi Group Org 1b2", "owner@multi-1b2.test", ["grp-a-7c3", "grp-b-7c3"]);
+  await login(page, "owner@multi-1b2.test");
+  await openTab(page, "密钥");
+
+  // One card per assigned group, by display name and description, neither
+  // preselected: the tenant chooses what it buys.
+  const picker = page.getByRole("group", { name: "分组" });
+  await expect(picker.getByRole("radio")).toHaveCount(2);
+  const a = picker.getByRole("radio", { name: /A 通道 7c3/ });
+  const b = picker.getByRole("radio", { name: /B 通道 7c3/ });
+  await expect(a).toBeVisible();
+  await expect(b).toBeVisible();
+  await expect(a).not.toBeChecked();
+  await expect(b).not.toBeChecked();
+  await expect(picker).toContainText("走 A 通道的说明 7c3");
+  await expect(picker).toContainText("走 B 通道的说明 7c3");
+  // The group outside the organisation's assignment is not offered.
+  await expect(page.getByText("只显示这个名字 9f3")).toHaveCount(0);
+
+  // The cards are the group picker's alone: the model labels one field
+  // below carry no card border, as they did before this page changed.
+  const modelPick = page.getByRole("group", { name: "可用模型" }).locator("label.pick").first();
+  const groupCard = picker.locator("label.pick").first();
+  expect(await borderWidth(await modelPick.elementHandle())).toBe("0px");
+  expect(await borderWidth(await groupCard.elementHandle())).toBe("1px");
+
+  // Submitting without a choice is refused at the field, before it leaves
+  // the page: counting the posts is what tells a local refusal from the
+  // control plane's own, whose `422 /group_id` reads the same on screen.
+  const posts: string[] = [];
+  page.on("request", (r) => {
+    if (r.method() === "POST" && new URL(r.url()).pathname === "/api/keys") posts.push(r.url());
+  });
+  await page.getByLabel("名称", { exact: true }).fill("no-group-picked-1b2");
+  await page.getByRole("button", { name: "新建密钥" }).click();
+  await expect(picker).toHaveAttribute("aria-invalid", "true");
+  await expect.poll(() => description(picker)).toContain("请选择分组");
+  expect(posts).toEqual([]);
+  expect(await (await signedIn("owner@multi-1b2.test")).get("/api/keys")).toEqual({ items: [] });
+
+  // The choice this page still offers may be gone: another session of the
+  // same organisation unassigns B, so the server refuses the create the
+  // page believed it could make, and its own detail is what the tenant
+  // reads. (Not the canned 提交的内容未通过校验.)
+  await assignGroups(await tenantIdOf("Multi Group Org 1b2"), ["grp-a-7c3"]);
+  await b.check();
+  await page.getByRole("button", { name: "新建密钥" }).click();
+  await expect(picker).toHaveAttribute("aria-invalid", "true");
+  await expect.poll(() => description(picker)).toContain("分组不存在或不可用");
+  expect(await (await signedIn("owner@multi-1b2.test")).get("/api/keys")).toEqual({ items: [] });
+
+  // With one chosen the key is created in it, and its answer names the
+  // display name, which the list then shows.
+  await page.reload();
+  await openTab(page, "密钥");
+  await expect(picker.getByRole("radio")).toHaveCount(1);
+  await page.getByLabel("名称", { exact: true }).fill("no-group-picked-1b2");
+  await page.getByRole("button", { name: "新建密钥" }).click();
+  await expect(page.getByRole("region", { name: SECRET_NOTICE })).toBeVisible();
+  const created = (await (await signedIn("owner@multi-1b2.test")).get("/api/keys")).items;
+  expect(created).toHaveLength(1);
+  expect(created[0].group.display_name).toBe("A 通道 7c3");
+  expect(created[0].group_available).toBe(true);
+  // And the key cannot be moved afterwards: the list offers no control that
+  // would change it, on this key or any other.
+  const made = row(page, "no-group-picked-1b2");
+  await expect(made).toContainText("A 通道 7c3");
+  await expect(made.getByRole("combobox")).toHaveCount(0);
+  await expect(made.getByRole("button", { name: "选择分组" })).toHaveCount(0);
+  await expect(made.getByRole("button", { name: "确认选择" })).toHaveCount(0);
+});
+
+test("只有一个分组时自动选中，但仍然显示", async ({ page }) => {
+  await activeOrg("One Group Org 2c3", "owner@one-2c3.test");
+  await login(page, "owner@one-2c3.test");
+  await openTab(page, "密钥");
+  const picker = page.getByRole("group", { name: "分组" });
+  await expect(picker.getByRole("radio")).toHaveCount(1);
+  await expect(picker.getByRole("radio")).toBeChecked();
+  await expect(picker).toContainText("shared");
+
+  // A create needs no click on it, and the key records the group.
+  await page.getByLabel("名称", { exact: true }).fill("preselected-2c3");
+  await page.getByRole("button", { name: "新建密钥" }).click();
+  await expect(page.getByRole("region", { name: SECRET_NOTICE })).toBeVisible();
+  const [created] = (await (await signedIn("owner@one-2c3.test")).get("/api/keys")).items;
+  expect(created.group.display_name).toBe("shared");
+  await expect(row(page, "preselected-2c3")).toContainText("shared");
+});
+
+test("密钥列表显示分组显示名；运营移除分组后显示分组已停用", async ({ page }) => {
+  test.setTimeout(GATEWAY_TEST_MS);
+  const id = await orgWithGroups("Group Leave Org 3d4", "owner@leave-3d4.test", ["grp-a-7c3", "grp-b-7c3"]);
+  const owner = await signedIn("owner@leave-3d4.test");
+  const key = await owner.post("/api/keys", { label: "grouped-key-3d4", group_id: (await groupIdOf("grp-a-7c3")) });
+  await chatSettles(key.plaintext, 200);
+
+  await login(page, "owner@leave-3d4.test");
+  await openTab(page, "密钥");
+  const listed = row(page, "grouped-key-3d4");
+  await expect(listed).toContainText("A 通道 7c3");
+  await expect(listed).not.toContainText("分组已停用");
+  // Open, so the state lamp says so: the note without this would let a page
+  // that still reads 可用 pass.
+  await expect(listed.getByText("可用", { exact: true })).toHaveCount(1);
+
+  // The operator unassigns the key's group: the key closes, the gateway
+  // refuses it, and the page, read again, says why.
+  await assignGroups(id, ["grp-b-7c3"]);
+  await page.reload();
+  await openTab(page, "密钥");
+  await expect(listed).toContainText("分组已停用");
+  // The lamp follows the group reason: this key's own switches are as they
+  // were, so 可用 beside it would contradict the note.
+  await expect(listed.getByText("可用", { exact: true })).toHaveCount(0);
+  await expect(listed.getByText("已停用", { exact: true })).toHaveCount(1);
+  await chatSettles(key.plaintext, 401);
+  // Still the group it was created in, and never moved to the other one.
+  await expect(listed).toContainText("A 通道 7c3");
+
+  // Assigned back, it opens again.
+  await assignGroups(id, ["grp-a-7c3", "grp-b-7c3"]);
+  await page.reload();
+  await openTab(page, "密钥");
+  await expect(listed).not.toContainText("分组已停用");
+  await expect(listed.getByText("可用", { exact: true })).toHaveCount(1);
+  await chatSettles(key.plaintext, 200);
+});
+
+test("未选分组的旧密钥可以选择一次分组", async ({ page }) => {
+  test.setTimeout(GATEWAY_TEST_MS);
+  const id = await orgWithGroups("Legacy Key Org 4e5", "owner@legacy-4e5.test", ["grp-a-7c3", "grp-b-7c3"]);
+  const owner = await signedIn("owner@legacy-4e5.test");
+  const key = await owner.post("/api/keys", { label: "legacy-key-4e5", group_id: await groupIdOf("grp-a-7c3") });
+  // A key an older control plane minted carries no group. Set it behind the
+  // API's back: no route produces one, so this is the only way the state
+  // arrives, exactly as migration 0024 leaves a key it cannot read.
+  stack.clearKeyGroup(key.key.id);
+  await assignGroups(id, ["grp-a-7c3", "grp-b-7c3"]);
+
+  await login(page, "owner@legacy-4e5.test");
+  await openTab(page, "密钥");
+  let listed = row(page, "legacy-key-4e5");
+  await expect(listed).toContainText("未选分组");
+
+  // The choice the page offers may be gone by the time it is confirmed:
+  // another session unassigns B, and the server's own refusal — not the
+  // canned 提交的内容未通过校验 — is what the tenant must read.
+  await assignGroups(id, ["grp-a-7c3"]);
+  await listed.getByRole("button", { name: "选择分组" }).click();
+  await listed.getByRole("combobox", { name: "分组" }).selectOption({ label: "B 通道 7c3" });
+  await listed.getByRole("button", { name: "确认选择" }).click();
+  const refusal = page.getByRole("alert").filter({ hasText: "分组" });
+  await expect(refusal).toContainText("分组不存在或不可用");
+  await expect(refusal).not.toContainText("提交的内容未通过校验");
+  // The key is as it was: still without a group.
+  await listed.getByRole("button", { name: "取消" }).click();
+  await expect(listed).toContainText("未选分组");
+  expect((await owner.get("/api/keys")).items[0].group).toBeNull();
+
+  // The one-time action, from the groups the organisation has now: choose A.
+  await page.reload();
+  await openTab(page, "密钥");
+  listed = row(page, "legacy-key-4e5");
+  await listed.getByRole("button", { name: "选择分组" }).click();
+  await listed.getByRole("combobox", { name: "分组" }).selectOption({ label: "A 通道 7c3" });
+  await listed.getByRole("button", { name: "确认选择" }).click();
+  await expect(listed).toContainText("A 通道 7c3");
+  await expect(listed).not.toContainText("未选分组");
+  await expect(listed.getByRole("button", { name: "选择分组" })).toHaveCount(0);
+  const after = (await owner.get("/api/keys")).items[0];
+  expect(after.group.display_name).toBe("A 通道 7c3");
+  expect(after.group_available).toBe(true);
+  // And the key serves again: the group is in its document, not only on the
+  // page. (The account reaches A 通道.)
+  await chatSettles(key.plaintext, 200);
+});
+
+test("组织没有分组时，创建表单说明需要运营分配且不能提交", async ({ page }) => {
+  const id = await activeOrg("No Group Org 5f6", "owner@nogrp-5f6.test");
+  // A customer the API refuses to leave without a group (PATCH `[]` is
+  // refused, and a tenant is never created from empty defaults) can still be
+  // one a release before groups left that way. Written directly, so the page
+  // is what is under test.
+  stack.clearTenantGroups(id);
+
+  await login(page, "owner@nogrp-5f6.test");
+  await openTab(page, "密钥");
+  await expect(page.getByRole("group", { name: "分组" })).toContainText("运营");
+  const submit = page.getByRole("button", { name: "新建密钥" });
+  // Disabled is the whole of the client-side guarantee here: a click
+  // dispatches no activation event on a disabled button, so the form never
+  // submits and there is no request to count. The independent request-count
+  // proof of the same rule lives in the multi-group test, where the button
+  // is enabled and only the form's own check can stop the post.
+  await expect(submit).toBeDisabled();
+  await page.getByLabel("名称", { exact: true }).fill("never-created-5f6");
+  await submit.click({ force: true });
+  await expect(page.getByRole("region", { name: SECRET_NOTICE })).toHaveCount(0);
+  expect(await (await signedIn("owner@nogrp-5f6.test")).get("/api/keys")).toEqual({ items: [] });
+});
+
+test("门户的密钥页不出现分组的路由名", async ({ page }) => {
+  await orgWithGroups("Route Name Org 6a7", "owner@route-6a7.test", ["grp-route-9f3"]);
+  const owner = await signedIn("owner@route-6a7.test");
+  await owner.post("/api/keys", { label: "route-key-6a7", group_id: await groupIdOf("grp-route-9f3") });
+  await login(page, "owner@route-6a7.test");
+  await openTab(page, "密钥");
+  // The display name is what the page shows, in the list and the picker.
+  await expect(row(page, "route-key-6a7")).toContainText("只显示这个名字 9f3");
+  await expect(page.getByRole("group", { name: "分组" })).toContainText("只显示这个名字 9f3");
+  // The routing name appears nowhere in what it renders.
+  const seen = [await page.locator("body").innerText(), await page.content()];
+  for (const text of seen) expect.soft(text).not.toContain("grp-route-9f3");
+});
 
 test("新建密钥：明文只显示一次，能调用被授权的模型，不能调用图片接口", async ({ page }) => {
   test.setTimeout(GATEWAY_TEST_MS);
