@@ -59,6 +59,18 @@ function microCny(rate: string): number {
   return Math.ceil((MICRO_USD * rateE4(rate)) / 10_000);
 }
 
+/**
+ * A listed price per token, in CNY, for `usdPerMillion` (a whole number of
+ * USD per million tokens) at `rate`: exact, in its shortest form.
+ */
+function perToken(usdPerMillion: number, rate: string): string {
+  // USD per million × the rate × 10⁴ is CNY per token × 10¹⁰.
+  const scaled = BigInt(usdPerMillion) * BigInt(rateE4(rate));
+  const whole = scaled / 10_000_000_000n;
+  const frac = (scaled % 10_000_000_000n).toString().padStart(10, "0").replace(/0+$/, "");
+  return frac === "" ? whole.toString() : `${whole}.${frac}`;
+}
+
 /** `micro` µ¥ as the six-decimal yuan string the API answers with. */
 function yuan(micro: number): string {
   const whole = Math.floor(micro / 1_000_000);
@@ -265,6 +277,40 @@ describe("a call is charged its own group's rate, and the answer names the curre
     expect(key.text).not.toContain("_usd");
   });
 
+  test("Two keys of one tenant list X at their own group's price", async () => {
+    /** X's pricing as `key`'s `/v1/models` lists it. */
+    const listedX = async (key: string): Promise<Json | undefined> => {
+      const answer = await callGateway(app!.proxyUrl, key, "/v1/models", undefined);
+      expect(answer.status, answer.text).toBe(200);
+      return (answer.json.data as Json[]).find((m) => m.id === "gp-x-9f3")?.pricing as Json | undefined;
+    };
+    // X's baseline is 6 USD per million input tokens: 0.0000432 CNY a token
+    // at A's 7.2, and 0.00003 at B's override of 5.
+    const inA = perToken(6, GROUP_A.rate);
+    const inB = perToken(6, X_IN_B);
+    expect(inA).not.toBe(inB);
+
+    const a = await listedX(keyA);
+    expect(a?.currency, JSON.stringify(a)).toBe("CNY");
+    expect(a?.input, JSON.stringify(a)).toBe(inA);
+    // The other key of the same tenant, right after: B's own price, never the
+    // figure A's listing just cached.
+    const listedAt = Date.now();
+    let last: Json | undefined;
+    const b = await pollUntil(
+      "KB to list X at B's price",
+      async () => {
+        last = await listedX(keyB);
+        return last?.input === inB ? last : undefined;
+      },
+      { timeoutMs: 10_000, intervalMs: 250, describe: () => JSON.stringify(last) },
+    );
+    expect(Date.now() - listedAt, "within 10 s of KA's listing").toBeLessThan(10_000);
+    expect(b.currency, JSON.stringify(b)).toBe("CNY");
+    // And KA still lists A's.
+    expect((await listedX(keyA))?.input).toBe(inA);
+  });
+
   test("A rate scheduled 5 s ahead applies only after it starts", async () => {
     const startsAt = new Date(Date.now() + 5_000);
     const scheduled = await cp!.admin.post(`/admin/provider-groups/${groups[GROUP_A.name].id}/rates`, {
@@ -283,7 +329,7 @@ describe("a call is charged its own group's rate, and the answer names the curre
         yuan(microCny(GROUP_A.rate)),
       );
     }
-    // A model no baseline prices is listed without pricing, whatever the rate.
+    // A priced model is listed with its group's per-token price in CNY.
     const listed = await callGateway(app!.proxyUrl, keyA, "/v1/models", undefined);
     expect(listed.status, listed.text).toBe(200);
     const pricing = (listed.json.data as Json[]).find((m) => m.id === "gp-y-7c1")?.pricing as

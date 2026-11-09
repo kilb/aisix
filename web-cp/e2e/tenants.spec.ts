@@ -104,6 +104,12 @@ async function login(page: Page, email: string, password: string): Promise<void>
   await page.getByRole("button", { name: "登录" }).click();
 }
 
+/** What the group pickers label group `name` with: its display name, which a fresh database gives `shared` too. */
+async function shownAs(name: string): Promise<string> {
+  const { items } = await stack.admin.get("/admin/provider-groups");
+  return (items as Json[]).find((g) => g.name === name).display_name as string;
+}
+
 async function openTenants(page: Page): Promise<void> {
   await login(page, stack.operator.email, stack.operator.password);
   await page.locator('[data-tab="tenants"]').click();
@@ -161,7 +167,8 @@ test("给租户设置可用分组后，运维侧的 key 显示它的分组，/ap
   const groups = page.getByRole("group", { name: "可用分组" });
   await expect(groups).toContainText("租户按显示名看到分组");
   await expect(groups.getByRole("checkbox", { name: "欧洲二区 7e2" })).toBeVisible();
-  await groups.getByRole("checkbox", { name: "shared" }).uncheck();
+  // `shared` is shown by its display name, 默认分组 on a fresh database.
+  await groups.getByRole("checkbox", { name: "默认分组" }).uncheck();
   await groups.getByRole("checkbox", { name: "grp-eu-5d2" }).check();
   // The save stops the one key in `shared`, so it is confirmed first.
   await groups.getByRole("button", { name: "保存分组" }).click();
@@ -498,7 +505,7 @@ test("客户租户的可用分组不能清空：被拒并在分组处说明，�
   await openTenants(page);
   await openTenant(page, t.org);
   const groups = page.getByRole("group", { name: "可用分组" });
-  for (const group of before) await groups.getByRole("checkbox", { name: group }).uncheck();
+  for (const group of before) await groups.getByRole("checkbox", { name: await shownAs(group), exact: true }).uncheck();
   // No group at all reaches no upstream: the save is confirmed first.
   await groups.getByRole("button", { name: "保存分组" }).click();
   await groups.getByRole("button", { name: "确认保存分组" }).click();
@@ -522,7 +529,8 @@ test("保存后租户没有任何带上游账号的分组时，先警告并要�
   await openTenant(page, t.org);
   const groups = page.getByRole("group", { name: "可用分组" });
   await expect(groups.getByRole("listitem").filter({ hasText: "grp-none-7d3" })).toContainText("没有上游账号在此分组");
-  await groups.getByRole("checkbox", { name: "shared" }).uncheck();
+  // `shared` is shown by its display name, 默认分组 on a fresh database.
+  await groups.getByRole("checkbox", { name: "默认分组" }).uncheck();
   await groups.getByRole("button", { name: "保存分组" }).click();
   await expect(groups.getByRole("alert")).toContainText("grp-none-7d3");
   // Nothing is saved until it is confirmed.
@@ -620,7 +628,9 @@ test("新租户默认值的默认分组不能清空：被拒并在该字段说�
   await page.getByRole("button", { name: "新租户默认值" }).click();
   const panel = page.getByRole("region", { name: "新租户默认值" });
   const groups = panel.getByRole("group", { name: "默认分组" });
-  for (const group of before.default_provider_groups) await groups.getByRole("checkbox", { name: group }).uncheck();
+  for (const group of before.default_provider_groups) {
+    await groups.getByRole("checkbox", { name: await shownAs(group), exact: true }).uncheck();
+  }
   await panel.getByRole("button", { name: "保存默认值" }).click();
   await expect(groups.getByRole("alert")).toBeVisible();
   expect(await stack.admin.get("/admin/settings/tenant-defaults")).toEqual(before);
@@ -658,8 +668,9 @@ test("管理员修改新租户默认值后，新注册的租户带上新的默�
   const panel = page.getByRole("region", { name: "新租户默认值" });
   const groups = panel.getByRole("group", { name: "默认分组" });
   for (const group of before.default_provider_groups) {
-    await expect(groups.getByRole("checkbox", { name: group })).toBeChecked();
-    await groups.getByRole("checkbox", { name: group }).uncheck();
+    const shown = await shownAs(group);
+    await expect(groups.getByRole("checkbox", { name: shown, exact: true })).toBeChecked();
+    await groups.getByRole("checkbox", { name: shown, exact: true }).uncheck();
   }
   await groups.getByRole("checkbox", { name: "grp-eu-5d2" }).check();
   await panel.getByLabel("租户每分钟 token").fill("50000");
