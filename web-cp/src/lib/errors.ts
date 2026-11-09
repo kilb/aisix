@@ -34,6 +34,8 @@ const TEXT: Record<string, string> = {
   stale_preview: "预览之后价格或数据有变化，请重新预览",
   run_state: "这次重新计价已经执行过，无法再次执行",
   proposal_state: "该提议已被处理，请刷新",
+  group_in_use: "该分组仍在使用中，无法停用",
+  group_retired: "该分组已停用，不能再改名或设为默认分组",
 };
 
 export function messageFor(e: ApiError): string {

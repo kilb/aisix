@@ -16,9 +16,9 @@ export interface Detail {
 
 /**
  * An error answer: the envelope's `error` as the message, its `code`, and
- * the optional `details`, `referenced_by` and `current_version`. An answer
- * that is not JSON has `code` `bad_response`; a request that never got an
- * answer has `code` `network` and status 0.
+ * the optional `details`, `referenced_by`, `counts` and `current_version`.
+ * An answer that is not JSON has `code` `bad_response`; a request that never
+ * got an answer has `code` `network` and status 0.
  */
 export class ApiError extends Error {
   constructor(
@@ -28,6 +28,8 @@ export class ApiError extends Error {
     readonly details: Detail[],
     readonly referencedBy: { kind: string; id: string; name: string | null }[],
     readonly currentVersion: number | null,
+    /** The figures a refusal explains itself with, as the backend read them. */
+    readonly counts: Record<string, number> | null = null,
   ) {
     super(message);
   }
@@ -39,6 +41,7 @@ interface Envelope {
   details?: Detail[];
   referenced_by?: { kind: string; id: string; name: string | null }[];
   current_version?: number;
+  counts?: Record<string, number>;
 }
 
 const sessionEndedListeners = new Set<() => void>();
@@ -101,6 +104,7 @@ async function readAnswer<T>(r: Response): Promise<{ data: T; version: number | 
       e.details ?? [],
       e.referenced_by ?? [],
       e.current_version ?? null,
+      e.counts ?? null,
     );
   }
   return { data: parsed as T, version: etagVersion(r.headers.get("etag")) };
@@ -1386,5 +1390,153 @@ export const imports = {
   /** Rejects one proposal, with the reason as the operator typed it. */
   async reject(id: string, pid: string, reason: string): Promise<Proposal> {
     return (await call<Proposal>("POST", `/admin/pricing/imports/${seg(id)}/proposals/${seg(pid)}/reject`, { reason })).data;
+  },
+};
+
+// ── provider groups and their rates ─────────────────────────────────────────
+
+/** One rate revision of a group: its default (`model_id` null) or a model's override. */
+export interface GroupRateRevision {
+  revision_id: number;
+  engine_version: number;
+  group_id: string;
+  model_id: string | null;
+  effective_from: string;
+  /** The decimal string it was typed as; `null` on a model row that ends its override. */
+  cny_per_usd: string | null;
+  note: string;
+  created_by: { id: string; email: string } | null;
+  created_at: string;
+}
+
+/** A rate's revisions in force now and scheduled after it, by ascending start. */
+export interface RatePlan {
+  current: GroupRateRevision | null;
+  upcoming: GroupRateRevision[];
+}
+
+/** One live provider group as the API answers it. */
+export interface Group {
+  id: string;
+  /** The routing name: immutable, operator-only. */
+  name: string;
+  display_name: string;
+  description: string;
+  /** The designated default group: the one an upgrade gives every internal key still without a group. */
+  is_default: boolean;
+  default_rate: RatePlan;
+  tenants: number;
+  defaults: number;
+  keys: number;
+  /** The live upstream accounts that list it. */
+  provider_keys: { id: string; display_name: string }[];
+  retired_at: string | null;
+}
+
+/** Every model a group can price, with its rate plan. */
+export interface GroupRates {
+  group: Group;
+  default: RatePlan;
+  models: { model_id: string; name: string; rate: RatePlan }[];
+}
+
+/** What a group charges for one model: its rate in force and, with a baseline, the ¥/M that follows. */
+export interface GroupModelPrice {
+  group_id: string;
+  display_name: string;
+  cny_per_usd: string | null;
+  /** `model` when the model's own override priced it, `default` when the group's did, `null` when neither is in force. */
+  source: "model" | "default" | null;
+  input_per_million_cny?: string;
+  output_per_million_cny?: string;
+}
+
+/** One model's baseline and every live group's price for it. */
+export interface ModelGroupPriceRow {
+  model_id: string;
+  name: string;
+  baseline: { current: BaselineRevision | null; upcoming: BaselineRevision[] };
+  groups: GroupModelPrice[];
+}
+
+export const groups = {
+  /** Every live group, by routing name. */
+  async list(): Promise<Group[]> {
+    return (await call<{ items: Group[] }>("GET", "/admin/provider-groups")).data.items;
+  },
+  /** Operator and up. The routing name must match `[a-z0-9][a-z0-9_-]{0,63}` and is unique for good. */
+  async create(body: {
+    name: string;
+    display_name: string;
+    description?: string;
+    default_cny_per_usd: string;
+    effective_from?: string;
+  }): Promise<Group> {
+    return (await call<Group>("POST", "/admin/provider-groups", body)).data;
+  },
+  /** What tenants see. A field left out stays as it is. */
+  async update(id: string, changes: { display_name?: string; description?: string }): Promise<Group> {
+    return (await call<Group>("PATCH", `/admin/provider-groups/${seg(id)}`, changes)).data;
+  },
+  /** `409 group_in_use` with `counts` while anything still names it. */
+  async retire(id: string): Promise<Group> {
+    return (await call<Group>("POST", `/admin/provider-groups/${seg(id)}/retire`, {})).data;
+  },
+  /** Moves the designated default to this group; `409 group_retired` for a retired one. */
+  async makeDefault(id: string): Promise<Group> {
+    return (await call<Group>("POST", `/admin/provider-groups/${seg(id)}/make-default`, {})).data;
+  },
+  /** Every live model's rate in the group, by model name. */
+  async rates(id: string): Promise<GroupRates> {
+    return (await call<GroupRates>("GET", `/admin/provider-groups/${seg(id)}/rates`)).data;
+  },
+  /**
+   * Writes a rate from `effective_from`: a model's override, or the group's
+   * default (`model_id` left out). A model row with no `cny_per_usd` ends that
+   * model's override; a default row with none is `422 /cny_per_usd`.
+   */
+  async writeRate(
+    id: string,
+    body: { model_id?: string | null; cny_per_usd?: string | null; effective_from: string; note?: string },
+  ): Promise<{ revision: GroupRateRevision; warnings: PriceWarning[] }> {
+    return (await call<{ revision: GroupRateRevision; warnings: PriceWarning[] }>("POST", `/admin/provider-groups/${seg(id)}/rates`, body))
+      .data;
+  },
+};
+
+// ── pricing: each model's price in every group, and the realised margin ─────
+
+/**
+ * Every live model's baseline and each live group's price for it
+ * (`GET /admin/pricing/models`). A model with no baseline comes first. The
+ * ¥ figures are the API's own exact decimal strings, before any tenant
+ * discount.
+ */
+export const groupPrices = {
+  async list(): Promise<ModelGroupPriceRow[]> {
+    return (await call<{ items: ModelGroupPriceRow[] }>("GET", "/admin/pricing/models")).data.items;
+  },
+};
+
+/** What one (group, model) charged against what its upstream cost. */
+export interface MarginRow {
+  group: { id: string; display_name: string };
+  model: { id: string | null; name: string };
+  charged_micro_cny: number;
+  cost_micro_usd: number;
+  /** CNY charged per USD of cost, four decimal places; `null` when the cost is not known. */
+  realised_cny_per_usd: string | null;
+  rows: number;
+  rows_without_cost: number;
+}
+
+/** The realised rate: the CNY a group charged per USD its upstreams cost. */
+export const margin = {
+  /** Both ends are required; rows outside them are left out. */
+  async list(q: { from: string; to: string; group_id?: string; model_id?: string }): Promise<MarginRow[]> {
+    const params = new URLSearchParams({ from: q.from, to: q.to });
+    if (q.group_id) params.set("group_id", q.group_id);
+    if (q.model_id) params.set("model_id", q.model_id);
+    return (await call<{ items: MarginRow[] }>("GET", `/admin/pricing/margin?${params}`)).data.items;
   },
 };

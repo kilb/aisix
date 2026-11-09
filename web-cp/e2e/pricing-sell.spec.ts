@@ -51,6 +51,8 @@ async function login(page: Page, email: string, password: string): Promise<void>
 async function openPrices(page: Page, who = stack.operator): Promise<void> {
   await login(page, who.email, who.password);
   await page.locator('[data-tab="pricing"]').click();
+  // 价格 opens on 分组, which Task 17 put first; this page is one switch away.
+  await page.getByRole("group", { name: "价格分区" }).getByRole("button", { name: "平台价格", exact: true }).click();
   await expect(page.getByRole("table", { name: "平台价格" })).toBeVisible();
 }
 
@@ -204,6 +206,7 @@ test("价格卡缺少输出单价时，错误显示在价格卡上，什么也�
 
   await page.reload();
   await page.locator('[data-tab="pricing"]').click();
+  await page.getByRole("group", { name: "价格分区" }).getByRole("button", { name: "平台价格", exact: true }).click();
   await expect(row(page, model.name)).toHaveAttribute("data-state", "unpriced");
   const stored = await stack.admin.get(`/admin/pricing/sell?model_id=${model.id}`);
   expect(stored.items).toHaveLength(0);
