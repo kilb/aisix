@@ -47,6 +47,11 @@
 //! lock itself ([`refs::lock_resources`]) because its reference counts are
 //! plain `SELECT`s: a grant commits under that lock, so a count taken before
 //! it could miss one ([`retire`]).
+//!
+//! A bulk apply ([`bulk_channels`]) holds several public models at once: it
+//! takes every one it reuses in ascending id order, and only then the
+//! resources lock, so two applies, or an apply and a channel edit, never
+//! wait on each other out of order.
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -1128,6 +1133,374 @@ pub async fn put_channel(
         })
         .await?;
     Ok(Json(answer))
+}
+
+/// The most upstream models one `POST
+/// /admin/provider-keys/{id}/channel-models` applies.
+///
+/// The whole selection is one transaction that holds `RESOURCES_LOCK_KEY`
+/// from its first collision check to its commit, and every other document
+/// write — a tenant's key create included — queues behind it, failing with
+/// `503` once it has waited `lock_timeout` (5 s by default). Each model
+/// costs a public-model insert, a channel row, two audit rows and two
+/// document writes, so 100 keeps the hold far inside that bound
+/// (`a_full_selection_holds_the_resources_lock_briefly`), while still taking
+/// a whole provider family from a typical list in one step.
+pub const MAX_BULK_MODELS: usize = 100;
+
+/// `POST /admin/provider-keys/{id}/channel-models`: maps upstream models of
+/// this account to the public models of the same names, in one transaction.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BulkBody {
+    upstream_models: Vec<String>,
+}
+
+/// What a bulk apply did with one upstream model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum BulkOutcome {
+    /// No public model had the name: one was created, and this account's
+    /// row added to it.
+    Created,
+    /// The public model of that name existed, and this account's row was
+    /// added to it.
+    Added,
+    /// This account already maps the upstream model, or already serves the
+    /// public model of that name under another upstream name: its row is
+    /// left exactly as it was.
+    Unchanged,
+}
+
+/// One upstream model of a bulk apply, as the answer lists it.
+#[derive(Debug, Clone, Serialize)]
+struct BulkItem {
+    upstream_model: String,
+    public_model_id: Uuid,
+    public_model_name: String,
+    outcome: BulkOutcome,
+}
+
+/// The selection as given: each name trimmed and checked as a public
+/// model's name ([`checked_name`]), the first of any repeat kept, with the
+/// index it was sent at. `422` naming every name that cannot be one, at
+/// `/upstream_models/<index>`; an empty or oversized selection is `422` at
+/// `/upstream_models`.
+fn checked_selection(raw: &[String]) -> Result<Vec<(usize, String)>, ApiError> {
+    if raw.is_empty() {
+        return Err(refused("/upstream_models", "请至少选择一个上游模型"));
+    }
+    let mut problems = Vec::new();
+    let mut names: Vec<(usize, String)> = Vec::new();
+    for (index, given) in raw.iter().enumerate() {
+        match checked_name(given) {
+            Ok(name) => {
+                if !names.iter().any(|(_, n)| *n == name) {
+                    names.push((index, name));
+                }
+            }
+            Err(d) => problems.push(Detail {
+                path: format!("/upstream_models/{index}"),
+                message: format!("「{}」不能作为公共模型名称：{}", given.trim(), d.message),
+            }),
+        }
+    }
+    if !problems.is_empty() {
+        return Err(ApiError::validation(problems));
+    }
+    if names.len() > MAX_BULK_MODELS {
+        return Err(refused(
+            "/upstream_models",
+            format!("一次最多选择 {MAX_BULK_MODELS} 个上游模型"),
+        ));
+    }
+    Ok(names)
+}
+
+/// What the apply decided for one name before it writes anything.
+enum Plan {
+    /// Create the public model and add this account's row.
+    Create,
+    /// Add this account's row to the live public model.
+    Add(PublicModelRow),
+    /// Leave everything as it is: the account already maps it.
+    Keep {
+        public_model_id: Uuid,
+        public_name: String,
+    },
+}
+
+/// `POST /admin/provider-keys/{id}/channel-models` with `{upstream_models:
+/// [name]}` → `200 {items: [{upstream_model, public_model_id,
+/// public_model_name, outcome}]}`, one item per distinct name in the order
+/// sent.
+///
+/// For each upstream model: a live public model of the same name is reused,
+/// or one is created; this account's channel row is added with the
+/// upstream name set to the model, at the priority (0) and weight (1) a
+/// ticked row starts with; and every document each affected public model
+/// implies is regenerated. A model this account already maps — under any
+/// public model, enabled or not — and a public model of that name this
+/// account already serves under another upstream name are left as they are
+/// (`unchanged`): nothing here edits or duplicates an existing row.
+///
+/// All or nothing. Every name is checked before the transaction, and every
+/// collision under the resources lock before the first write; any refusal
+/// is one `422` naming each offending model at `/upstream_models/<index>`,
+/// with nothing written: a name that is not a valid public-model name, a
+/// public model of that name that is retired, a live model of another kind
+/// holding the name, and a public model of that name created while this
+/// request waited for the lock (sent again, it is reused). Never more than
+/// [`MAX_BULK_MODELS`] names.
+///
+/// Locks, in the documented order: the live public models it reuses, `FOR
+/// UPDATE` in ascending id order, then `RESOURCES_LOCK_KEY`, which it takes
+/// itself because its collision checks are plain `SELECT`s, as
+/// [`create`]'s is. A public model it creates is inserted under that lock,
+/// as [`create`] inserts one, so no other transaction can be waiting for its
+/// row. No tenant, group or account row is taken. The account is read under
+/// the resources lock, so a delete of it cannot commit between the check
+/// and the rows this writes.
+pub async fn bulk_channels(
+    auth: OperatorAuth,
+    State(state): State<AppState>,
+    Path(raw): Path<String>,
+    ApiJson(body): ApiJson<BulkBody>,
+) -> Result<Json<Value>, ApiError> {
+    auth.require(OperatorRole::Operator)?;
+    let provider_key_id = path_id(&raw)?;
+    let names = checked_selection(&body.upstream_models)?;
+    let ctx = WriteCtx::of(&state);
+    let items = state
+        .db
+        .tx(move |conn| {
+            async move {
+                let wanted: Vec<String> = names.iter().map(|(_, n)| n.clone()).collect();
+                // The public models this reuses, held before the resources
+                // lock. One that is retired while this waits drops out of
+                // the result, and is refused below as a retired name.
+                let live: Vec<PublicModelRow> = sqlx::query_as(&format!(
+                    "SELECT {PUBLIC_COLUMNS} FROM public_models \
+                     WHERE name = ANY($1) AND retired_at IS NULL ORDER BY id FOR UPDATE"
+                ))
+                .bind(&wanted)
+                .fetch_all(&mut *conn)
+                .await
+                .map_err(DbError::from)?;
+                refs::lock_resources(&mut *conn).await?;
+
+                let Some((display_name, provider)) =
+                    provider_key_of(&mut *conn, provider_key_id).await?
+                else {
+                    return Err(refused("/provider_key_id", "该上游账号不存在或已删除"));
+                };
+                // This account's rows of live public models, each with the
+                // name it asks its upstream for.
+                let mine: Vec<(Uuid, String, String)> = sqlx::query_as(
+                    "SELECT cm.public_model_id, p.name, COALESCE(cm.upstream_model, p.name) \
+                     FROM channel_models cm JOIN public_models p ON p.id = cm.public_model_id \
+                     WHERE cm.provider_key_id = $1 AND p.retired_at IS NULL \
+                     ORDER BY p.name, cm.public_model_id",
+                )
+                .bind(provider_key_id)
+                .fetch_all(&mut *conn)
+                .await
+                .map_err(DbError::from)?;
+                // Every other name a public model has, retired or created
+                // since `live` was read, and every live model holding one.
+                let other_publics: Vec<(String, bool)> = sqlx::query_as(
+                    "SELECT name, retired_at IS NOT NULL FROM public_models \
+                     WHERE name = ANY($1) AND NOT (id = ANY($2))",
+                )
+                .bind(&wanted)
+                .bind(live.iter().map(|p| p.id).collect::<Vec<Uuid>>())
+                .fetch_all(&mut *conn)
+                .await
+                .map_err(DbError::from)?;
+                let holders: Vec<(String, Uuid)> = sqlx::query_as(
+                    "SELECT identity, id FROM gw_resources \
+                     WHERE kind = $1 AND identity = ANY($2) AND NOT deleted",
+                )
+                .bind(Kind::Models.segment())
+                .bind(&wanted)
+                .fetch_all(&mut *conn)
+                .await
+                .map_err(DbError::from)?;
+
+                let mut plans: Vec<(String, Plan)> = Vec::with_capacity(names.len());
+                let mut problems = Vec::new();
+                for (index, name) in &names {
+                    if let Some((public_model_id, public_name, _)) =
+                        mine.iter().find(|(_, _, upstream)| upstream == name)
+                    {
+                        plans.push((
+                            name.clone(),
+                            Plan::Keep {
+                                public_model_id: *public_model_id,
+                                public_name: public_name.clone(),
+                            },
+                        ));
+                        continue;
+                    }
+                    let public = live.iter().find(|p| p.name == *name);
+                    if let Some(public) = public {
+                        if mine.iter().any(|(id, _, _)| *id == public.id) {
+                            plans.push((
+                                name.clone(),
+                                Plan::Keep {
+                                    public_model_id: public.id,
+                                    public_name: public.name.clone(),
+                                },
+                            ));
+                            continue;
+                        }
+                    }
+                    let problem =
+                        if let Some((_, retired)) = other_publics.iter().find(|(n, _)| n == name) {
+                            Some(if *retired {
+                                "同名公共模型已停用，该名称不能再用于公共模型"
+                            } else {
+                                "刚刚有同名公共模型被创建，请重新获取上游模型后再试"
+                            })
+                        } else if holders
+                            .iter()
+                            .any(|(n, id)| n == name && public.is_none_or(|p| p.id != *id))
+                        {
+                            Some("已有同名的其他模型，不能用作公共模型名称")
+                        } else {
+                            None
+                        };
+                    match problem {
+                        Some(message) => problems.push(Detail {
+                            path: format!("/upstream_models/{index}"),
+                            message: format!("「{name}」{message}"),
+                        }),
+                        None => plans.push((
+                            name.clone(),
+                            match public {
+                                Some(public) => Plan::Add(public.clone()),
+                                None => Plan::Create,
+                            },
+                        )),
+                    }
+                }
+                if !problems.is_empty() {
+                    return Err(ApiError::validation(problems));
+                }
+
+                let mut items = Vec::with_capacity(plans.len());
+                let mut touched: Vec<Uuid> = Vec::new();
+                for (name, plan) in plans {
+                    let (public_model_id, public_model_name, outcome) = match plan {
+                        Plan::Keep {
+                            public_model_id,
+                            public_name,
+                        } => {
+                            items.push(BulkItem {
+                                upstream_model: name,
+                                public_model_id,
+                                public_model_name: public_name,
+                                outcome: BulkOutcome::Unchanged,
+                            });
+                            continue;
+                        }
+                        Plan::Add(public) => (public.id, public.name, BulkOutcome::Added),
+                        Plan::Create => {
+                            let id = insert_public(&mut *conn, &name, auth.id).await?;
+                            audit::record(
+                                &mut *conn,
+                                AuditEntry {
+                                    actor: Actor::Operator(&auth),
+                                    action: "public_model.create",
+                                    target_kind: "public_model",
+                                    target_id: Some(id.to_string()),
+                                    tenant_id: None,
+                                    detail: json!({"name": name, "bulk": true}),
+                                },
+                            )
+                            .await?;
+                            (id, name.clone(), BulkOutcome::Created)
+                        }
+                    };
+                    let row: ChannelModelRow = sqlx::query_as(&format!(
+                        "INSERT INTO channel_models \
+                         (provider_key_id, public_model_id, upstream_model, priority, weight, \
+                          enabled, direct_model_id, created_by) \
+                         VALUES ($1, $2, $3, 0, 1, true, $4, $5) RETURNING {CHANNEL_COLUMNS}"
+                    ))
+                    .bind(provider_key_id)
+                    .bind(public_model_id)
+                    .bind(&name)
+                    .bind(Uuid::new_v4())
+                    .bind(Some(auth.id))
+                    .fetch_one(&mut *conn)
+                    .await
+                    .map_err(DbError::from)?;
+                    audit::record(
+                        &mut *conn,
+                        AuditEntry {
+                            actor: Actor::Operator(&auth),
+                            action: "channel_model.put",
+                            target_kind: "public_model",
+                            target_id: Some(public_model_id.to_string()),
+                            tenant_id: None,
+                            detail: json!({
+                                "provider_key_id": provider_key_id,
+                                "provider_key_display_name": display_name,
+                                "provider": provider,
+                                "upstream_model": row.upstream_model,
+                                "priority": row.priority,
+                                "weight": row.weight,
+                                "enabled": row.enabled,
+                                "created": true,
+                                "bulk": true,
+                            }),
+                        },
+                    )
+                    .await?;
+                    touched.push(public_model_id);
+                    items.push(BulkItem {
+                        upstream_model: name,
+                        public_model_id,
+                        public_model_name,
+                        outcome,
+                    });
+                }
+                touched.sort();
+                for public_model_id in touched {
+                    regenerate(&mut *conn, &ctx, public_model_id).await?;
+                }
+                Ok::<_, ApiError>(items)
+            }
+            .boxed()
+        })
+        .await?;
+    let items = serde_json::to_value(items).map_err(ApiError::internal)?;
+    Ok(Json(json!({ "items": items })))
+}
+
+/// Inserts the public model `name`, created by `operator`; its id. The
+/// caller holds `RESOURCES_LOCK_KEY` and has checked the name, as [`create`]
+/// does; the unique index still answers a name taken meanwhile.
+async fn insert_public(
+    conn: &mut PgConnection,
+    name: &str,
+    operator: Uuid,
+) -> Result<Uuid, ApiError> {
+    sqlx::query_scalar("INSERT INTO public_models (name, created_by) VALUES ($1, $2) RETURNING id")
+        .bind(name)
+        .bind(Some(operator))
+        .fetch_one(conn)
+        .await
+        .map_err(|e| match &e {
+            sqlx::Error::Database(db)
+                if db.code().as_deref() == Some("23505")
+                    && db.constraint() == Some("public_models_name_key") =>
+            {
+                ApiError::public_model_name_taken()
+            }
+            _ => ApiError::from(DbError::from(e)),
+        })
 }
 
 /// `DELETE /admin/provider-keys/{id}/channel-models/{public_model_id}` →

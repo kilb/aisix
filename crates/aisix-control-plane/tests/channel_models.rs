@@ -2207,3 +2207,653 @@ fn every_generated_document_loads_on_both_schemas() {
     // The canonical fallback: an upstream name absent means the public name.
     assert_eq!(docs[1]["model_name"], "pub-gen-8c1");
 }
+
+// ── a selection of upstream models, mapped in one step ──────────────────────
+
+/// `POST /admin/provider-keys/{key}/channel-models` as `who`, mapping
+/// `names`.
+async fn bulk(cp: &TestCp, who: &OperatorSession, key: Uuid, names: &[&str]) -> Resp {
+    cp.send(
+        "POST",
+        &format!("/admin/provider-keys/{key}/channel-models"),
+        Some(who.cookie()),
+        Some(json!({ "upstream_models": names })),
+    )
+    .await
+}
+
+/// Each item of a bulk answer as `(upstream_model, public_model_name,
+/// outcome)`, in the answer's order.
+fn outcomes(r: &Resp) -> Vec<(String, String, String)> {
+    r.body["items"]
+        .as_array()
+        .unwrap_or_else(|| panic!("items: {r:?}"))
+        .iter()
+        .map(|i| {
+            let text = |field: &str| i[field].as_str().unwrap_or_default().to_string();
+            (
+                text("upstream_model"),
+                text("public_model_name"),
+                text("outcome"),
+            )
+        })
+        .collect()
+}
+
+/// The public model id the answer names for `upstream`.
+fn answered_id(r: &Resp, upstream: &str) -> Uuid {
+    let item = r.body["items"]
+        .as_array()
+        .and_then(|items| items.iter().find(|i| i["upstream_model"] == upstream))
+        .unwrap_or_else(|| panic!("no item for {upstream}: {r:?}"));
+    Uuid::parse_str(item["public_model_id"].as_str().expect("an id")).expect("a uuid")
+}
+
+/// The public model named `name`, if any row has it.
+async fn public_named(cp: &TestCp, name: &str) -> Option<Uuid> {
+    sqlx::query_scalar("SELECT id FROM public_models WHERE name = $1")
+        .bind(name)
+        .fetch_optional(cp.db().pool())
+        .await
+        .expect("read the public models")
+}
+
+/// Account `key`'s row for `public`: `(upstream_model, priority, weight,
+/// enabled, direct_model_id, updated_at)`.
+type ChannelSnapshot = (
+    Option<String>,
+    i32,
+    i32,
+    bool,
+    Uuid,
+    chrono::DateTime<chrono::Utc>,
+);
+
+async fn channel_row(cp: &TestCp, key: Uuid, public: Uuid) -> ChannelSnapshot {
+    sqlx::query_as(
+        "SELECT upstream_model, priority, weight, enabled, direct_model_id, updated_at \
+         FROM channel_models WHERE provider_key_id = $1 AND public_model_id = $2",
+    )
+    .bind(key)
+    .bind(public)
+    .fetch_one(cp.db().pool())
+    .await
+    .expect("read the channel row")
+}
+
+/// What a request that writes nothing leaves as it was: the public models,
+/// the channel rows, the newest document `seq` and the audit rows.
+async fn footprint(cp: &TestCp) -> (i64, i64, i64, i64) {
+    sqlx::query_as(
+        "SELECT (SELECT count(*) FROM public_models), (SELECT count(*) FROM channel_models), \
+           (SELECT COALESCE(max(seq), 0) FROM gw_resources), (SELECT count(*) FROM audit_log)",
+    )
+    .fetch_one(cp.db().pool())
+    .await
+    .expect("read the footprint")
+}
+
+/// The paths of a `422`'s details, in order.
+fn detail_paths(r: &Resp) -> Vec<String> {
+    assert_eq!(
+        (r.status, r.body["code"].as_str()),
+        (422, Some("validation_failed")),
+        "{r:?}"
+    );
+    r.body["details"]
+        .as_array()
+        .expect("details")
+        .iter()
+        .filter_map(|d| d["path"].as_str().map(str::to_string))
+        .collect()
+}
+
+#[tokio::test]
+async fn a_selection_reuses_or_creates_the_public_model_of_each_name() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let op = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let key = provider_key(&cp, &op, "acct-bulk-a1").await;
+    let other = provider_key(&cp, &op, "acct-bulk-b1").await;
+    // A public model another account already serves, at a higher priority.
+    let (reused, _) = create_public(&cp, &op, "bulk-reuse-8c1").await;
+    let r = put_channel(&cp, &op, other, reused, json!({"priority": 2})).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let other_direct = direct_of(&cp, other, reused).await;
+    let publics_before: i64 = sqlx::query_scalar("SELECT count(*) FROM public_models")
+        .fetch_one(cp.db().pool())
+        .await
+        .expect("count the public models");
+
+    let r = bulk(&cp, &op, key, &["bulk-reuse-8c1", "bulk-new-8c1"]).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    assert_eq!(
+        outcomes(&r),
+        vec![
+            (
+                "bulk-reuse-8c1".to_string(),
+                "bulk-reuse-8c1".to_string(),
+                "added".to_string()
+            ),
+            (
+                "bulk-new-8c1".to_string(),
+                "bulk-new-8c1".to_string(),
+                "created".to_string()
+            ),
+        ]
+    );
+    // Reused by id: the existing public model, not a second one.
+    assert_eq!(answered_id(&r, "bulk-reuse-8c1"), reused);
+    let created = public_named(&cp, "bulk-new-8c1")
+        .await
+        .expect("the new public model");
+    assert_eq!(answered_id(&r, "bulk-new-8c1"), created);
+    let publics_after: i64 = sqlx::query_scalar("SELECT count(*) FROM public_models")
+        .fetch_one(cp.db().pool())
+        .await
+        .expect("count the public models");
+    assert_eq!(
+        publics_after,
+        publics_before + 1,
+        "one public model created"
+    );
+
+    for (public, name) in [(reused, "bulk-reuse-8c1"), (created, "bulk-new-8c1")] {
+        // The row a ticked model starts with, naming the upstream model.
+        let (upstream, priority, weight, enabled, direct, _) = channel_row(&cp, key, public).await;
+        assert_eq!(
+            (upstream.as_deref(), priority, weight, enabled),
+            (Some(name), 0, 1, true),
+            "{name}"
+        );
+        let doc = live(&cp, Kind::Models, direct).await;
+        assert_eq!(doc["display_name"], format!("{name}#acct-bulk-a1"));
+        assert_eq!(doc["model_name"], name);
+        assert_eq!(doc["provider_key_id"], key.to_string());
+        let owner = format!("public:{public}");
+        for model in [public, direct] {
+            let (_, _, managed_by) = stored(&cp, Kind::Models, model).await.expect("a row");
+            assert_eq!(managed_by.as_deref(), Some(owner.as_str()), "{model}");
+        }
+    }
+
+    // The reused routing document gains this account behind the other one;
+    // the created one is served by this account alone.
+    let key_reused = direct_of(&cp, key, reused).await;
+    assert_eq!(
+        live(&cp, Kind::Models, reused).await["routing"]["targets"],
+        json!([
+            {"model_id": other_direct.to_string(), "priority": 2, "weight": 1},
+            {"model_id": key_reused.to_string(), "priority": 0, "weight": 1},
+        ])
+    );
+    let key_created = direct_of(&cp, key, created).await;
+    let routing = live(&cp, Kind::Models, created).await;
+    assert_eq!(routing["display_name"], "bulk-new-8c1");
+    assert_eq!(
+        routing["routing"]["targets"],
+        json!([{"model_id": key_created.to_string(), "priority": 0, "weight": 1}])
+    );
+
+    // Audited as the one-at-a-time routes audit, in the same transaction.
+    let rows: Vec<(String, Option<String>, Value)> = sqlx::query_as(
+        "SELECT action, target_id, detail FROM audit_log \
+         WHERE action IN ('public_model.create', 'channel_model.put') AND detail->>'bulk' = 'true' \
+         ORDER BY id",
+    )
+    .fetch_all(cp.db().pool())
+    .await
+    .expect("read the audit rows");
+    let created_rows: Vec<_> = rows
+        .iter()
+        .filter(|(action, _, _)| action == "public_model.create")
+        .collect();
+    assert_eq!(created_rows.len(), 1, "{rows:?}");
+    assert_eq!(created_rows[0].1, Some(created.to_string()));
+    let mut put_targets: Vec<Option<String>> = rows
+        .iter()
+        .filter(|(action, _, d)| {
+            action == "channel_model.put" && d["provider_key_id"] == key.to_string()
+        })
+        .map(|(_, target, _)| target.clone())
+        .collect();
+    put_targets.sort();
+    let mut expected = vec![Some(reused.to_string()), Some(created.to_string())];
+    expected.sort();
+    assert_eq!(put_targets, expected, "{rows:?}");
+}
+
+#[tokio::test]
+async fn an_invalid_or_colliding_name_refuses_the_whole_selection() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let op = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let viewer = cp.admin_login_seeded(OperatorRole::Viewer).await;
+    let key = provider_key(&cp, &op, "acct-bulk-a2").await;
+    // A hand-made model holding a name, and a retired public model's name.
+    let r = cp
+        .send(
+            "POST",
+            "/admin/resources/models",
+            Some(op.cookie()),
+            Some(json!({"doc": {
+                "display_name": "bulk-taken-8c1",
+                "provider": "openai",
+                "model_name": "gpt-4o",
+                "provider_key_id": key.to_string(),
+            }})),
+        )
+        .await;
+    assert_eq!(r.status, 201, "{r:?}");
+    let (retired, _) = create_public(&cp, &op, "bulk-retired-8c1").await;
+    let r = cp
+        .send(
+            "POST",
+            &format!("{PUBLICS}/{retired}/retire"),
+            Some(op.cookie()),
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let before = footprint(&cp).await;
+
+    // Names a public model cannot have: each named at its own index.
+    let r = bulk(
+        &cp,
+        &op,
+        key,
+        &["bulk-ok-8c1", "bad#8c1", "bulk-ok2-8c1", "bad*8c1", " "],
+    )
+    .await;
+    assert_eq!(
+        detail_paths(&r),
+        vec![
+            "/upstream_models/1",
+            "/upstream_models/3",
+            "/upstream_models/4"
+        ]
+    );
+    assert!(
+        message_at(&r, "/upstream_models/1").is_some_and(|m| m.contains("bad#8c1")),
+        "{r:?}"
+    );
+    assert!(
+        message_at(&r, "/upstream_models/3").is_some_and(|m| m.contains("bad*8c1")),
+        "{r:?}"
+    );
+    assert_eq!(footprint(&cp).await, before, "nothing is written");
+
+    // Names the existing create refuses: a live model of another kind, and a
+    // retired public model.
+    let r = bulk(
+        &cp,
+        &op,
+        key,
+        &["bulk-ok-8c1", "bulk-taken-8c1", "bulk-retired-8c1"],
+    )
+    .await;
+    assert_eq!(
+        detail_paths(&r),
+        vec!["/upstream_models/1", "/upstream_models/2"]
+    );
+    assert!(
+        message_at(&r, "/upstream_models/1").is_some_and(|m| m.contains("bulk-taken-8c1")),
+        "{r:?}"
+    );
+    assert!(
+        message_at(&r, "/upstream_models/2").is_some_and(|m| m.contains("bulk-retired-8c1")),
+        "{r:?}"
+    );
+    assert_eq!(footprint(&cp).await, before, "nothing is written");
+    assert_eq!(public_named(&cp, "bulk-ok-8c1").await, None);
+
+    // An account that does not exist, an empty selection, and a viewer.
+    let r = bulk(&cp, &op, Uuid::new_v4(), &["bulk-ok-8c1"]).await;
+    assert_eq!(detail_paths(&r), vec!["/provider_key_id"]);
+    let r = bulk(&cp, &op, key, &[]).await;
+    assert_eq!(detail_paths(&r), vec!["/upstream_models"]);
+    let r = bulk(&cp, &viewer, key, &["bulk-ok-8c1"]).await;
+    assert_eq!(r.status, 403, "{r:?}");
+    assert_eq!(footprint(&cp).await, before, "nothing is written");
+
+    // Without the offending names the same selection applies.
+    let r = bulk(&cp, &op, key, &["bulk-ok-8c1", "bulk-ok2-8c1"]).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    assert!(public_named(&cp, "bulk-ok-8c1").await.is_some());
+}
+
+#[tokio::test]
+async fn rows_the_account_already_maps_are_left_as_they_are() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let op = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let key = provider_key(&cp, &op, "acct-bulk-a3").await;
+    // The account maps `up-mapped-8c1` under a public model of another
+    // name, and serves `bulk-served-8c1` under another upstream name, with
+    // that row switched off.
+    let (mapped, _) = create_public(&cp, &op, "bulk-mapped-8c1").await;
+    let r = put_channel(
+        &cp,
+        &op,
+        key,
+        mapped,
+        json!({"upstream_model": "up-mapped-8c1", "priority": 5, "weight": 7}),
+    )
+    .await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let (served, _) = create_public(&cp, &op, "bulk-served-8c1").await;
+    let r = put_channel(
+        &cp,
+        &op,
+        key,
+        served,
+        json!({"upstream_model": "up-other-8c1", "enabled": false}),
+    )
+    .await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let mapped_row = channel_row(&cp, key, mapped).await;
+    let served_row = channel_row(&cp, key, served).await;
+    let mapped_doc = stored(&cp, Kind::Models, mapped).await;
+    let served_doc = stored(&cp, Kind::Models, served).await;
+
+    let r = bulk(
+        &cp,
+        &op,
+        key,
+        &["up-mapped-8c1", "bulk-served-8c1", "bulk-fresh-8c1"],
+    )
+    .await;
+    assert_eq!(r.status, 200, "{r:?}");
+    assert_eq!(
+        outcomes(&r),
+        vec![
+            (
+                "up-mapped-8c1".to_string(),
+                "bulk-mapped-8c1".to_string(),
+                "unchanged".to_string()
+            ),
+            (
+                "bulk-served-8c1".to_string(),
+                "bulk-served-8c1".to_string(),
+                "unchanged".to_string()
+            ),
+            (
+                "bulk-fresh-8c1".to_string(),
+                "bulk-fresh-8c1".to_string(),
+                "created".to_string()
+            ),
+        ]
+    );
+    assert_eq!(answered_id(&r, "up-mapped-8c1"), mapped);
+    assert_eq!(answered_id(&r, "bulk-served-8c1"), served);
+
+    // Neither existing row nor its documents changed, and no public model
+    // took the already-mapped upstream name.
+    assert_eq!(channel_row(&cp, key, mapped).await, mapped_row);
+    assert_eq!(channel_row(&cp, key, served).await, served_row);
+    assert_eq!(stored(&cp, Kind::Models, mapped).await, mapped_doc);
+    assert_eq!(stored(&cp, Kind::Models, served).await, served_doc);
+    assert_eq!(public_named(&cp, "up-mapped-8c1").await, None);
+    let rows: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM channel_models WHERE provider_key_id = $1")
+            .bind(key)
+            .fetch_one(cp.db().pool())
+            .await
+            .expect("count the account's rows");
+    assert_eq!(rows, 3, "one row added, none duplicated");
+
+    // Sent again, every model is already mapped: nothing is written.
+    let before = footprint(&cp).await;
+    let r = bulk(
+        &cp,
+        &op,
+        key,
+        &["up-mapped-8c1", "bulk-served-8c1", "bulk-fresh-8c1"],
+    )
+    .await;
+    assert_eq!(r.status, 200, "{r:?}");
+    assert!(
+        outcomes(&r).iter().all(|(_, _, o)| o == "unchanged"),
+        "{r:?}"
+    );
+    assert_eq!(footprint(&cp).await, before, "nothing is written");
+}
+
+#[tokio::test]
+async fn a_full_selection_holds_the_resources_lock_briefly() {
+    // The cap is what keeps one apply's hold on the resources lock short:
+    // every other document write queues behind it, and fails once it has
+    // waited `lock_timeout`. One over the cap is refused before anything is
+    // locked; a full selection applies, well inside half of the default
+    // `lock_timeout` (5 s), measured end to end, so the hold is shorter.
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let op = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let key = provider_key(&cp, &op, "acct-bulk-a4").await;
+    let names: Vec<String> = (0..=channels::MAX_BULK_MODELS)
+        .map(|i| format!("bulk-cap-{i:03}"))
+        .collect();
+    let all: Vec<&str> = names.iter().map(String::as_str).collect();
+    let before = footprint(&cp).await;
+
+    let r = bulk(&cp, &op, key, &all).await;
+    assert_eq!(detail_paths(&r), vec!["/upstream_models"]);
+    assert!(
+        message_at(&r, "/upstream_models")
+            .is_some_and(|m| m.contains(&channels::MAX_BULK_MODELS.to_string())),
+        "{r:?}"
+    );
+    assert_eq!(footprint(&cp).await, before, "nothing is written");
+
+    let full = &all[..channels::MAX_BULK_MODELS];
+    let started = std::time::Instant::now();
+    let r = bulk(&cp, &op, key, full).await;
+    let took = started.elapsed();
+    assert_eq!(r.status, 200, "{r:?}");
+    assert_eq!(outcomes(&r).len(), channels::MAX_BULK_MODELS);
+    assert!(outcomes(&r).iter().all(|(_, _, o)| o == "created"), "{r:?}");
+    eprintln!(
+        "a full selection of {} took {took:?}",
+        channels::MAX_BULK_MODELS
+    );
+    assert!(
+        took < std::time::Duration::from_millis(2_500),
+        "a full selection took {took:?}"
+    );
+}
+
+/// Every document a bulk apply writes — direct documents for a reused and a
+/// created public model, and both routing documents — loads on the schema
+/// a gateway reads it with, and on the strict one the write path applied.
+#[tokio::test]
+async fn every_document_a_selection_writes_loads_on_the_lenient_schema() {
+    use aisix_control_plane::resources::validate::{validate_lenient, validate_strict};
+
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let op = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let key = provider_key(&cp, &op, "acct-bulk-a5").await;
+    let other = provider_key(&cp, &op, "acct-bulk-b5").await;
+    let (reused, _) = create_public(&cp, &op, "bulk-schema-8c1").await;
+    let r = put_channel(&cp, &op, other, reused, json!({})).await;
+    assert_eq!(r.status, 200, "{r:?}");
+
+    let r = bulk(&cp, &op, key, &["bulk-schema-8c1", "bulk-schema-new-8c1"]).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let created = answered_id(&r, "bulk-schema-new-8c1");
+
+    let docs: Vec<Value> = sqlx::query_scalar(
+        "SELECT doc FROM gw_resources WHERE kind = $1 AND NOT deleted \
+         AND managed_by = ANY($2) ORDER BY id",
+    )
+    .bind(Kind::Models.segment())
+    .bind(vec![channels::owner(reused), channels::owner(created)])
+    .fetch_all(cp.db().pool())
+    .await
+    .expect("read the generated documents");
+    // Two routing documents, two direct ones for the reused model and one
+    // for the created one.
+    assert_eq!(docs.len(), 5, "{docs:?}");
+    for doc in &docs {
+        validate_strict(Kind::Models, doc)
+            .unwrap_or_else(|e| panic!("strict refused a generated document: {e:?} {doc}"));
+        validate_lenient(Kind::Models, doc)
+            .unwrap_or_else(|e| panic!("a gateway would skip this document: {e:?} {doc}"));
+    }
+}
+
+/// A bulk apply's direct documents are as internal as a ticked row's: the
+/// price lists offer the public models, never the direct documents, and a
+/// tenant is granted the public model, never a direct document.
+#[tokio::test]
+async fn a_selections_direct_documents_are_never_priced_or_granted() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let op = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let key = provider_key(&cp, &op, "acct-bulk-a6").await;
+    let (reused, _) = create_public(&cp, &op, "bulk-priced-8c1").await;
+    let r = bulk(&cp, &op, key, &["bulk-priced-8c1", "bulk-priced-new-8c1"]).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let created = answered_id(&r, "bulk-priced-new-8c1");
+    let publics = [reused, created];
+    let mut directs = Vec::new();
+    for public in publics {
+        let direct = direct_of(&cp, key, public).await;
+        assert!(is_live(&cp, Kind::Models, direct).await, "{direct}");
+        directs.push(direct);
+    }
+
+    let shared: Uuid = sqlx::query_scalar("SELECT id FROM provider_groups WHERE name = 'shared'")
+        .fetch_one(cp.db().pool())
+        .await
+        .expect("the first-boot group");
+    for (path, field) in [
+        ("/admin/pricing/baselines".to_string(), "items"),
+        ("/admin/pricing/models".to_string(), "items"),
+        (format!("/admin/provider-groups/{shared}/rates"), "models"),
+    ] {
+        let r = cp.send("GET", &path, Some(op.cookie()), None).await;
+        assert_eq!(r.status, 200, "{path}: {r:?}");
+        let listed: Vec<&str> = r.body[field]
+            .as_array()
+            .unwrap_or_else(|| panic!("{path}: {r:?}"))
+            .iter()
+            .filter_map(|i| i["model_id"].as_str())
+            .collect();
+        for public in publics {
+            assert!(
+                listed.contains(&public.to_string().as_str()),
+                "{path} offers {public}: {r:?}"
+            );
+        }
+        for direct in &directs {
+            assert!(
+                !listed.contains(&direct.to_string().as_str()),
+                "{path} offers the direct document {direct}: {r:?}"
+            );
+        }
+    }
+
+    let tenant = tenant_granted(&cp, &op, &[]).await;
+    for direct in &directs {
+        let r = set_grants(&cp, &op, &tenant.to_string(), &[*direct]).await;
+        assert_422_at(&r, "/allowed_model_ids/0");
+    }
+    assert_eq!(grants(&cp, tenant).await, Vec::<Uuid>::new());
+    let r = set_grants(&cp, &op, &tenant.to_string(), &publics).await;
+    assert_eq!(r.status, 200, "{r:?}");
+}
+
+/// Waits until a session waits on the transaction of backend `holder`; fails
+/// after 10 s.
+async fn until_blocked(cp: &TestCp, holder: i32) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let waiting: Option<i32> = sqlx::query_scalar(
+            "SELECT pid FROM pg_locks l WHERE NOT l.granted AND l.locktype = 'transactionid' \
+             AND $1 = ANY(pg_blocking_pids(l.pid)) LIMIT 1",
+        )
+        .bind(holder)
+        .fetch_optional(cp.db().pool())
+        .await
+        .expect("read pg_locks");
+        if waiting.is_some() {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no session waits on the public model's holder"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// Whether some session holds `RESOURCES_LOCK_KEY`, tried from a session of
+/// the test's own.
+async fn resources_lock_held(cp: &TestCp) -> bool {
+    let mut probe = cp.db().pool().begin().await.expect("begin");
+    let free: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1)")
+        .bind(RESOURCES_LOCK_KEY)
+        .fetch_one(&mut *probe)
+        .await
+        .expect("try the resources lock");
+    probe.rollback().await.expect("end the probe");
+    !free
+}
+
+/// A bulk apply takes the public models it reuses before the resources lock:
+/// while it waits for one held elsewhere, the resources lock is still free.
+/// The reverse order would hold the resources lock while it waited, and a
+/// channel edit holding that row would then wait for the resources lock
+/// behind it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_selection_takes_its_public_models_before_the_resources_lock() {
+    let Some(cp) = TestCp::start_with(|cfg| cfg.db_lock_timeout_ms = 60_000).await else {
+        return;
+    };
+    let op = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let key = provider_key(&cp, &op, "acct-bulk-a7").await;
+    let (reused, _) = create_public(&cp, &op, "bulk-order-8c1").await;
+
+    let mut holder = cp.db().pool().begin().await.expect("begin");
+    let holder_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *holder)
+        .await
+        .expect("this session's pid");
+    sqlx::query("SELECT 1 FROM public_models WHERE id = $1 FOR UPDATE")
+        .bind(reused)
+        .execute(&mut *holder)
+        .await
+        .expect("hold the public model");
+
+    let url = cp.url(&format!("/admin/provider-keys/{key}/channel-models"));
+    let cookie = op.cookie().to_string();
+    let sent = tokio::spawn(async move {
+        reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("an HTTP client")
+            .post(url)
+            .header(reqwest::header::COOKIE, cookie)
+            .json(&json!({"upstream_models": ["bulk-order-8c1", "bulk-order-new-8c1"]}))
+            .send()
+            .await
+            .expect("send the request")
+            .status()
+            .as_u16()
+    });
+    until_blocked(&cp, holder_pid).await;
+    let resources_free = !resources_lock_held(&cp).await;
+    holder.commit().await.expect("release the public model");
+    assert_eq!(sent.await.expect("join the request"), 200);
+    assert!(
+        resources_free,
+        "the apply took the resources lock before the public model's: the lock order is inverted"
+    );
+}
