@@ -21,7 +21,9 @@ use aisix_control_plane::pricing::store::{self, NewCostPrice};
 use chrono::{DateTime, TimeDelta, Utc};
 use futures::FutureExt;
 use serde_json::{json, Value};
-use support::world::{card, db_now, deliver, insert_baseline, seed_model, usage, world, World};
+use support::world::{
+    card, db_now, deliver, insert_baseline, seed_model, seed_provider_key, usage, world, World,
+};
 use support::{OperatorSession, Resp, TestCp};
 use uuid::Uuid;
 
@@ -158,7 +160,8 @@ async fn the_realised_rate_is_cny_charged_per_usd_of_cost() {
         uuid(&item, "/group/id"),
         support::world::group_id(&w.cp, "shared").await
     );
-    assert_eq!(item["group"]["display_name"], "shared");
+    // The first-boot group's display name (0030), not its routing name.
+    assert_eq!(item["group"]["display_name"], "默认分组");
     assert_eq!(uuid(&item, "/model/id"), model);
     assert_eq!(item["charged_micro_cny"], 7_200);
     assert_eq!(item["cost_micro_usd"], 1_000);
@@ -588,6 +591,100 @@ async fn the_margin_filters_by_group_and_model() {
     // A malformed id is refused at its path.
     let bad = margin(&w.cp, &w.admin, "&group_id=nope").await;
     assert_eq!(bad.status, 422, "{bad:?}");
+}
+
+/// A cost price of `input` USD per million input tokens for the upstream the
+/// seeded models reach, when account `account` serves it, starting now.
+async fn account_cost(cp: &TestCp, account: Uuid, input: &str) {
+    let now = db_now(cp).await;
+    let row = NewCostPrice {
+        upstream_provider: UPSTREAM_PROVIDER.to_string(),
+        upstream_model: UPSTREAM_MODEL.to_string(),
+        provider_key_id: Some(account),
+        effective_from: now,
+        card: serde_json::from_value(json!({
+            "default": {"base": {"input": input, "output": "2"}}
+        }))
+        .expect("a cost card"),
+        source: "manual".to_string(),
+    };
+    cp.db()
+        .tx(move |c| async move { store::insert_cost_price(c, &row, Actor::System).await }.boxed())
+        .await
+        .expect("a cost price");
+}
+
+/// Account `id`'s display name, as its stored document holds it.
+async fn account_name(cp: &TestCp, id: Uuid) -> String {
+    sqlx::query_scalar(
+        "SELECT doc->>'display_name' FROM gw_resources WHERE kind = 'provider_keys' AND id = $1",
+    )
+    .bind(id)
+    .fetch_one(cp.db().pool())
+    .await
+    .expect("the account's name")
+}
+
+/// Two accounts serve one model in one group: both charge the group's price,
+/// and each costs its own. Filtered to one account, the margin is that
+/// account's charge over that account's cost, and its items name it.
+#[tokio::test]
+async fn a_margin_filtered_by_account_names_only_that_accounts_cost() {
+    let Some(w) = world().await else { return };
+    let model = seed_model(&w.cp, &w.admin).await;
+    price_at_rate(&w.cp, model).await;
+    let (a, b) = (
+        seed_provider_key(&w.cp, &w.admin).await,
+        seed_provider_key(&w.cp, &w.admin).await,
+    );
+    // A costs 1 USD per million input tokens, B costs 3.
+    account_cost(&w.cp, a, "1").await;
+    account_cost(&w.cp, b, "3").await;
+    let via = |event_id: &str, account: Uuid| {
+        let mut event = served(&w, event_id, model, tokens_1000());
+        event["provider_key_id"] = json!(account);
+        event
+    };
+    send(&w, vec![via("ma", a), via("mb", b)]).await;
+
+    // 7200 µ¥ each. A's is over 1000 µ$ of cost, a realised 7.2; B's over
+    // 3000 µ$, a realised 2.4.
+    for (account, cost, rate) in [(a, 1_000, "7.2000"), (b, 3_000, "2.4000")] {
+        let item = one(&margin(&w.cp, &w.admin, &format!("&provider_key_id={account}")).await);
+        assert_eq!(uuid(&item, "/model/id"), model, "{item}");
+        assert_eq!(item["charged_micro_cny"], 7_200, "{item}");
+        assert_eq!(item["cost_micro_usd"], cost, "{item}");
+        assert_eq!(item["realised_cny_per_usd"], rate, "{item}");
+        assert_eq!(item["rows"], 1, "{item}");
+        assert_eq!(item["provider_key_id"], json!(account), "{item}");
+        assert_eq!(
+            item["provider_key_display_name"],
+            json!(account_name(&w.cp, account).await),
+            "{item}"
+        );
+    }
+    // Over every account: both rows, one item, and no account named.
+    let item = one(&margin(&w.cp, &w.admin, "").await);
+    assert_eq!(item["charged_micro_cny"], 14_400, "{item}");
+    assert_eq!(item["cost_micro_usd"], 4_000, "{item}");
+    assert_eq!(item["realised_cny_per_usd"], "3.6000", "{item}");
+    assert_eq!(item["provider_key_id"], Value::Null, "{item}");
+    assert_eq!(item["provider_key_display_name"], Value::Null, "{item}");
+    // An account that served nothing matches nothing, and a malformed id is
+    // refused at its path.
+    let none = margin(
+        &w.cp,
+        &w.admin,
+        &format!("&provider_key_id={}", Uuid::new_v4()),
+    )
+    .await;
+    assert_eq!(none.body["items"], json!([]), "{none:?}");
+    let bad = margin(&w.cp, &w.admin, "&provider_key_id=nope").await;
+    assert_eq!(bad.status, 422, "{bad:?}");
+    assert_eq!(
+        bad.body["details"][0]["path"], "/provider_key_id",
+        "{bad:?}"
+    );
 }
 
 #[tokio::test]

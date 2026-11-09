@@ -59,6 +59,20 @@ function bulkable(p: Proposal): boolean {
   return confirmable(p) && p.suggested_model_id !== null;
 }
 
+/**
+ * When a proposal starts if confirmed now, stamped at send: its own date, or
+ * now for one in effect at upload and for a dated one whose date has passed,
+ * since a price never starts in the past. `immediate` while the stamp is now,
+ * so a start the clock overtook between stamp and check is stamped again.
+ */
+function startOf(p: Proposal): EffectiveResolver {
+  const own = p.effective_from === null ? null : Date.parse(p.effective_from);
+  return {
+    immediate: own === null || own <= Date.now(),
+    stamp: () => new Date(own === null ? Date.now() : Math.max(own, Date.now())).toISOString(),
+  };
+}
+
 /** One card's rate of `dimension`, as the card wrote it, or null. */
 function rate(card: RateCard | null, dimension: string): string | null {
   return card?.default?.base?.[dimension] ?? null;
@@ -199,11 +213,9 @@ export function PricingImport({ canEdit, onGoto }: TabProps) {
     for (const p of chosen) {
       const entry = `${p.provider}/${p.model}`;
       try {
-        await imports.confirm(batchId, p.id, {
-          model_id: p.suggested_model_id ?? "",
-          effective_from: p.effective_from ?? new Date().toISOString(),
-          attested: true,
-        });
+        await sendAt(startOf(p), (effective_from) =>
+          imports.confirm(batchId, p.id, { model_id: p.suggested_model_id ?? "", effective_from, attested: true }),
+        );
         done.push(`已确认 ${entry}`);
       } catch (e) {
         // A lost answer is not a refusal: the row is read again below, and its
@@ -738,7 +750,7 @@ function ConfirmForm({
   onDecided: (notice?: string) => Promise<void>;
 }) {
   const toast = useToast();
-  const [, focusRefusal] = useRefusalFocus<HTMLFormElement>();
+  const [formRef, focusRefusal] = useRefusalFocus<HTMLFormElement>();
   const [model, setModel] = useState(proposal.suggested_model_id ?? "");
   const [checked, setChecked] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -748,6 +760,16 @@ function ConfirmForm({
 
   /** The proposal's own date, when it has one: nothing earlier may be confirmed. */
   const dated = proposal.effective_from !== null;
+  /**
+   * Whether the operator chooses the start: always for a proposal in effect
+   * at upload, and for a dated one once its date has passed, since a price
+   * cannot start in the past and its own date can no longer be sent. A dated
+   * one refused at `/effective_from` (its date passed while the form was
+   * open) offers the choice from then on.
+   */
+  const [choosing, setChoosing] = useState(() => !dated || Date.parse(proposal.effective_from!) <= Date.now());
+  /** Whether the chosen start is stamped at submit (立即生效) rather than typed. */
+  const [stamped, setStamped] = useState(true);
 
   async function submit(e: React.FormEvent) {
     e.preventDefault();
@@ -763,9 +785,7 @@ function ConfirmForm({
     try {
       const send = (effective_from: string) =>
         imports.confirm(batchId, proposal.id, { model_id: model, effective_from, attested: true });
-      const answer = dated
-        ? await send(proposal.effective_from!)
-        : await sendAt(resolver.current, send);
+      const answer = choosing ? await sendAt(resolver.current, send) : await send(proposal.effective_from!);
       if (answer === "invalid") {
         setDetails([{ path: "/effective_from", message: "生效时间应写成 年-月-日 时:分，按 UTC 计" }]);
         focusRefusal();
@@ -779,6 +799,7 @@ function ConfirmForm({
         await onDecided(messageFor(err));
       } else if (err instanceof ApiError && err.status === 422 && err.details.length > 0) {
         setDetails(err.details);
+        if (err.details.some((d) => d.path === "/effective_from")) setChoosing(true);
         focusRefusal();
       } else if (err instanceof ApiError && (err.code === "network" || err.code === "bad_response")) {
         // The answer was lost, so whether this confirmation was written is
@@ -797,9 +818,10 @@ function ConfirmForm({
   const stray = details.filter(
     (d) => !(d.path === "/model_id" || d.path === "/effective_from" || d.path === "/attested" || d.path === "/flags"),
   );
+  const startRefused = problemAt(details, (p) => p === "/effective_from");
 
   return (
-    <form aria-label="确认提议" className="import-decide" onSubmit={(e) => void submit(e)} noValidate>
+    <form ref={formRef} aria-label="确认提议" className="import-decide" onSubmit={(e) => void submit(e)} noValidate>
       <h3>确认</h3>
       <Field label="模型" hint="确认后，这项价格成为该模型的基准价" error={problemAt(details, (p) => p === "/model_id")}>
         {(aria) => (
@@ -831,15 +853,29 @@ function ConfirmForm({
           )}
         </p>
       )}
-      {dated ? (
-        <p className="hint tabular">生效时间：{fmtUtc(proposal.effective_from!)}（该提议自己的生效时间）</p>
+      {choosing ? (
+        <>
+          {dated && (
+            <p className="hint tabular">
+              该提议的生效时间 {fmtUtc(proposal.effective_from!)} 已过；价格只能从现在或将来开始生效，请选择生效时间。
+            </p>
+          )}
+          <EffectiveFrom
+            onResolve={(r) => {
+              resolver.current = r;
+              setStamped(r.immediate);
+            }}
+            error={startRefused}
+          />
+        </>
       ) : (
-        <EffectiveFrom
-          onResolve={(r) => {
-            resolver.current = r;
-          }}
-          error={problemAt(details, (p) => p === "/effective_from")}
-        />
+        <p className="hint tabular">生效时间：{fmtUtc(proposal.effective_from!)}（该提议自己的生效时间）</p>
+      )}
+      {/* The time field shows a refusal of a typed time itself; a start the form stamped has no field to show it in. */}
+      {startRefused && !(choosing && !stamped) && (
+        <div className="note crit" role="alert">
+          {startRefused}
+        </div>
       )}
       {problemAt(details, (p) => p === "/attested") && (
         <div className="note crit" role="alert">

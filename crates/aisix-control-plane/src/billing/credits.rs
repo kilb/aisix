@@ -42,7 +42,7 @@ pub struct NewCredit {
 /// `POST /admin/tenants/{id}/credits` with `{amount_cny, reason,
 /// reference?}` → `201 AdminTopup`, posted and settled before the answer.
 /// `422` at `/amount_cny` unless it is yuan and fen above 0 and at most
-/// ¥1,000,000, at `/reason` unless it is 1 to 500 characters, not blank and
+/// ¥99,999,999.99, at `/reason` unless it is 1 to 500 characters, not blank and
 /// free of control characters, and at `/reference` when it is over 128
 /// characters or holds a control character; `404 not_found` for no such
 /// tenant or a pending one.

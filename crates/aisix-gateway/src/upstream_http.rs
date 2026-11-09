@@ -483,6 +483,12 @@ mod tests {
         let crates_dir = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/.."));
         let mut offenders = Vec::new();
         for file in rust_sources(crates_dir) {
+            // This module is where the shared builder is defined. Matched
+            // by its whole path: another crate's file of the same name is
+            // in scope like any other.
+            if file.ends_with("aisix-gateway/src/upstream_http.rs") {
+                continue;
+            }
             let src = std::fs::read_to_string(&file).expect("read source");
             // Tests build throwaway clients on purpose; only the
             // production half of each file is in scope.
@@ -494,8 +500,19 @@ mod tests {
             // scoped to that one file so a bare rmcp client anywhere else
             // still gets flagged.
             let sanctioned_rmcp_site = file.ends_with("aisix-mcp/src/bridge.rs");
+            // The control plane is its own binary, with no dispatch pool
+            // and none of the gateway's startup config: its one outbound
+            // client (an upstream account's model list) is built bare, in
+            // its own `Client::builder`, and that crate's
+            // `the_outbound_client_takes_no_proxy_both_timeouts_no_redirect_and_the_identity`
+            // pins what it sets. Only that builder line is exempt.
+            let sanctioned_control_plane_site =
+                file.ends_with("aisix-control-plane/src/upstream_http.rs");
             for (n, line) in production.lines().enumerate() {
                 if sanctioned_rmcp_site && line.contains("rmcp_reqwest::Client::") {
+                    continue;
+                }
+                if sanctioned_control_plane_site && line.trim() == "reqwest::Client::builder()" {
                     continue;
                 }
                 if line.contains("reqwest::Client::builder()")
@@ -505,8 +522,6 @@ mod tests {
                 }
             }
         }
-        // This module is where the shared builder is defined.
-        offenders.retain(|o| !o.contains("upstream_http.rs"));
         assert!(
             offenders.is_empty(),
             "these build a reqwest client directly instead of \

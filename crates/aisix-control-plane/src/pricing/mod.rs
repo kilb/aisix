@@ -66,7 +66,7 @@ pub struct StoredEvent {
 /// What pricing a delivery's stored rows came to.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Priced {
-    /// Rows charged at a sell price.
+    /// Rows charged: a baseline times their key's group rate.
     pub charged: u64,
     /// Rows stored unpriced.
     pub unpriced: u64,

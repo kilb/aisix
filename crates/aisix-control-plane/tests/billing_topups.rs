@@ -484,10 +484,10 @@ async fn an_approval_that_lifts_the_floor_clears_the_mark_in_the_same_request() 
 }
 
 #[tokio::test]
-async fn a_top_up_amount_is_dollars_and_cents_only() {
+async fn a_top_up_amount_is_yuan_and_fen_only() {
     let Some(s) = shop().await else { return };
     let pool = s.cp.db().pool();
-    for bad in ["0", "0.00", "0.001", "-1", "1e3", "1000000.01", "", " 1"] {
+    for bad in ["0", "0.00", "0.001", "-1", "1e3", "100000000", "", " 1"] {
         let r = request(&s.cp, &s.owner, json!({ "amount_cny": bad })).await;
         assert_eq!(r.status, 422, "{bad:?}: {r:?}");
         assert_eq!(r.body["details"][0]["path"], "/amount_cny", "{bad:?}");
@@ -516,16 +516,17 @@ async fn a_top_up_amount_is_dollars_and_cents_only() {
         .await
         .is_empty());
     assert_eq!(
-        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM billing_topups")
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM billing_topups_cny")
             .fetch_one(pool)
             .await
             .expect("count top-ups"),
         0
     );
 
-    let r = request(&s.cp, &s.owner, json!({"amount_cny": "1000000.00"})).await;
+    // The largest amount eight integer digits can type, ¥99,999,999.99.
+    let r = request(&s.cp, &s.owner, json!({"amount_cny": "99999999.99"})).await;
     assert_eq!(r.status, 201, "{r:?}");
-    assert_eq!(r.body["amount_micro_cny"], 1_000_000_000_000_i64);
+    assert_eq!(r.body["amount_micro_cny"], 99_999_999_990_000_i64);
     // At the limits, counted in characters rather than bytes.
     let note = "备".repeat(500);
     let reference = "r".repeat(128);

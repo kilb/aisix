@@ -107,20 +107,31 @@ way.
   `a_crossing_batch_never_waits_on_a_held_tenant_row`).
 - **A provider group's row sits between the billing account and
   `RESOURCES_LOCK_KEY`, and a public model's row beside it there.** A path
-  that names a group takes its row `FOR SHARE` — `groups::lock_one`,
-  `groups::lock_named` (ascending id) and `groups::key_group`, which every
-  key create and every key `group_id` change goes through — and does so
-  before `write_resource`, as `keys::create_key` does. A path that changes or
-  retires one takes it `FOR UPDATE` (`LockMode::Update`): `retire`,
-  `make-default` and the rate writes. A retire holds the group's row **and**
-  `RESOURCES_LOCK_KEY` across its reference count and its update, so a
-  provider-key document cannot name a group that is about to be retired: a
-  write that gets the resources lock second is refused at `/groups`, and one
-  that gets it first has committed before the count reads it
+  that names a group takes its row `FOR SHARE` — `groups::lock_one(Share)`
+  (a rate write), `groups::lock_named` (ascending id: a tenant's groups, the
+  tenant defaults, and a tenant create copying them) and `groups::key_group`,
+  which every key create and every key `group_id` change goes through — and
+  does so before `write_resource`, as `keys::create_key` does. A path that
+  changes or retires one — `retire`, `PATCH` and `make-default` — takes it
+  `FOR NO KEY UPDATE` (`LockMode::Update`), never `FOR UPDATE`: every charge
+  intake stores references its group, and the foreign key's check takes
+  `FOR KEY SHARE` on the group row, which `FOR UPDATE` would make wait — and
+  a retire holds the row while it queues for the resources lock, so intake
+  would wait behind that lock (`a_held_group_write_never_makes_intake_wait`,
+  `tests/billing_marks.rs`). `make-default` locks the old default and the new
+  one in one ascending pass, and takes the pass again if the default moved
+  meanwhile, so it never locks out of id order. A retire holds the group's
+  row **and** `RESOURCES_LOCK_KEY` across its reference count and its update,
+  so a provider-key document cannot name a group that is about to be retired:
+  a write that gets the resources lock second is refused at `/groups`, and
+  one that gets it first has committed before the count reads it
   (`a_provider_key_write_and_a_retire_never_end_with_a_retired_group_named`,
   `a_group_edit_takes_its_groups_before_the_resources_lock`,
   `a_provider_key_write_takes_its_groups_before_the_resources_lock`,
-  `waits_on_the_group_not_the_resources_lock`, `tests/groups.rs`).
+  `waits_on_the_group_not_the_resources_lock`,
+  `a_tenant_created_while_its_default_group_is_retired_never_names_it`,
+  `a_key_naming_a_group_while_it_is_retired_never_names_it`,
+  `tests/groups.rs`).
   A channel edit takes the public model's row `FOR UPDATE` before
   `write_resource` (`channels::lock_public`), and its retire takes that row
   and then `refs::lock_resources` itself, because its reference counts are

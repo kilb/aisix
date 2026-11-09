@@ -69,10 +69,11 @@ pub struct MarginQuery {
     to: Option<DateTime<Utc>>,
     group_id: Option<String>,
     model_id: Option<String>,
+    provider_key_id: Option<String>,
 }
 
-/// A UUID filter: `422` at `path` for a malformed one, which names no group
-/// or model either way.
+/// A UUID filter: `422` at `path` for a malformed one, which names no group,
+/// model or account either way.
 fn uuid_filter(raw: Option<&str>, path: &str) -> Result<Option<Uuid>, ApiError> {
     match raw {
         None => Ok(None),
@@ -85,10 +86,20 @@ fn uuid_filter(raw: Option<&str>, path: &str) -> Result<Option<Uuid>, ApiError> 
     }
 }
 
-/// `GET /admin/pricing/margin?from&to&group_id&model_id` → `{items:
-/// [MarginRow]}`, grouped by (group, model) and ordered by the group's
-/// display name (a null group last), then the group's id, then the model's
-/// id.
+/// `GET /admin/pricing/margin?from&to&group_id&model_id&provider_key_id` →
+/// `{items: [MarginRow]}`, grouped by (group, model) and ordered by the
+/// group's display name (a null group last), then the group's id, then the
+/// model's id.
+///
+/// **`provider_key_id` keeps the rows one upstream account served**: the
+/// account the usage row names (`provider_key_id` on the stored event). Two
+/// accounts serving one public model in one group charge the same price and
+/// cost what each costs, so this is how their realised rates are told apart
+/// (design C7). Each item of a filtered answer names that account:
+/// `provider_key_id`, and `provider_key_display_name` read from the
+/// account's own live document, never from the event (`null` once the
+/// account is deleted). An answer over every account names none: both are
+/// `null`, and its items stay one per (group, model).
 ///
 /// **The group is the one the charge was billed at**, not the column alone:
 /// `COALESCE(c.group_id, the key's group_id)`, the same expression a
@@ -116,11 +127,13 @@ fn uuid_filter(raw: Option<&str>, path: &str) -> Result<Option<Uuid>, ApiError> 
 /// A reader who trusts the rate can see exactly how much charge it does not
 /// describe.
 ///
-/// The filters are bounded by the range: `model_id` alone has no index of
-/// its own besides `pricing_charges_cny_occurred` (0027), and the range cap
-/// of 731 days (`billing::range`) is what bounds that scan; a group and a
-/// model together use `pricing_charges_cny_margin`, and `group_id` alone
-/// uses its leading column.
+/// The filters are bounded by the range, not by an index: the window is read
+/// through `pricing_charges_cny_occurred` (0027), and the range cap of 731
+/// days (`billing::range`) is what bounds that scan. `group_id` is matched
+/// on the billed group, `COALESCE(c.group_id, k.group_id)`, an expression
+/// across a join that `pricing_charges_cny_margin` cannot serve; `model_id`
+/// and `provider_key_id` are checked on each row in the window, the second
+/// through the row's own usage event.
 pub async fn list(
     auth: OperatorAuth,
     State(state): State<AppState>,
@@ -140,6 +153,9 @@ pub async fn list(
     let group_id = uuid_filter(q.group_id.as_deref(), "/group_id")?;
     let model_id = uuid_filter(q.model_id.as_deref(), "/model_id")?;
     let model_filter = model_id.map(|id| id.to_string());
+    let account = uuid_filter(q.provider_key_id.as_deref(), "/provider_key_id")?;
+    let account_filter = account.map(|id| id.to_string());
+    let mut conn = state.db.pool().acquire().await.map_err(DbError::from)?;
     let rows: Vec<MarginRow> = sqlx::query_as(
         "SELECT COALESCE(c.group_id, k.group_id) AS billed_group_id, \
                 g.display_name AS group_display_name, \
@@ -163,6 +179,7 @@ pub async fn list(
                 (COUNT(*) FILTER (WHERE c.cost_micro_usd IS NULL))::bigint \
                   AS rows_without_cost \
          FROM pricing_charges_cny c \
+         JOIN usage_events ue ON ue.event_id = c.event_id \
          LEFT JOIN tenant_keys k ON k.id::text = c.api_key_id \
          LEFT JOIN provider_groups g ON g.id = COALESCE(c.group_id, k.group_id) \
          LEFT JOIN gw_resources r ON r.kind = 'models' AND NOT r.deleted \
@@ -170,6 +187,7 @@ pub async fn list(
          WHERE c.occurred_at >= $1 AND c.occurred_at < $2 \
            AND ($3::uuid IS NULL OR COALESCE(c.group_id, k.group_id) = $3) \
            AND ($4::text IS NULL OR c.requested_model_id = $4) \
+           AND ($5::text IS NULL OR ue.event->>'provider_key_id' = $5) \
          GROUP BY COALESCE(c.group_id, k.group_id), g.display_name, c.requested_model_id, \
                   r.id, r.doc->>'display_name' \
          ORDER BY g.display_name NULLS LAST, COALESCE(c.group_id, k.group_id), \
@@ -179,9 +197,23 @@ pub async fn list(
     .bind(to)
     .bind(group_id)
     .bind(model_filter)
-    .fetch_all(state.db.pool())
+    .bind(&account_filter)
+    .fetch_all(&mut *conn)
     .await
     .map_err(DbError::from)?;
+    // The account's name as the control plane records it now.
+    let account_name: Option<String> = match account {
+        None => None,
+        Some(id) => sqlx::query_scalar(
+            "SELECT doc->>'display_name' FROM gw_resources \
+             WHERE kind = 'provider_keys' AND id = $1 AND NOT deleted",
+        )
+        .bind(id)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(DbError::from)?
+        .flatten(),
+    };
     let items: Vec<Value> = rows
         .into_iter()
         .map(|row| {
@@ -207,6 +239,8 @@ pub async fn list(
                 "realised_cny_per_usd": realised(row.charged_with_cost, row.cost),
                 "rows": row.rows,
                 "rows_without_cost": row.rows_without_cost,
+                "provider_key_id": account,
+                "provider_key_display_name": account_name,
             })
         })
         .collect();

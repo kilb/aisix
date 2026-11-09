@@ -283,9 +283,10 @@ pub async fn incoming(
 
 /// Takes `RESOURCES_LOCK_KEY` to the end of this transaction: every gateway
 /// document write, a group's retire, which must not count a provider key that
-/// is about to land ([`crate::groups::retire`]), and a public model's retire,
+/// is about to land ([`crate::groups::retire`]), a public model's retire,
 /// which must not count a grant another tenant edit is committing
-/// ([`crate::channels::retire`]).
+/// ([`crate::channels::retire`]), and a public model's create, whose name
+/// check must not miss a model being written ([`crate::channels::create`]).
 pub async fn lock_resources(conn: &mut PgConnection) -> Result<(), ApiError> {
     sqlx::query("SELECT pg_advisory_xact_lock($1)")
         .bind(crate::resources::write::RESOURCES_LOCK_KEY)

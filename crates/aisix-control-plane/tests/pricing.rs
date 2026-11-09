@@ -428,7 +428,7 @@ async fn a_database_error_while_loading_prices_is_503_and_stores_nothing() {
         "{r:?}"
     );
     assert_eq!(r.header(DEDUP), Some("1"));
-    for table in ["usage_batches", "usage_events", "pricing_charges"] {
+    for table in ["usage_batches", "usage_events", "pricing_charges_cny"] {
         assert_eq!(w.cp.count(table).await, 0, "{table}");
     }
 
@@ -2319,6 +2319,34 @@ async fn a_row_of_a_key_with_no_group_is_unpriced_no_group() {
             .await
             .expect("read the charge's group");
     assert_eq!(filed, None);
+}
+
+/// A row the engine refuses is still filed under its key's group: the charge
+/// says which group's rate a re-pricing run will bill it at, and which group a
+/// missing price or rate belongs to.
+#[tokio::test]
+async fn an_unpriced_row_of_a_grouped_key_records_its_group() {
+    let Some(w) = world().await else { return };
+    // A model with no baseline, on a key whose group has a rate.
+    let model = seed_model(&w.cp, &w.admin).await;
+    set_shared_rate(&w.cp, &w.admin, "7.2").await;
+    let r = deliver(
+        &w.dp,
+        Uuid::new_v4(),
+        vec![usage(&w, "e1", model, tokens_680())],
+    )
+    .await;
+    assert_eq!((r.status, r.body.clone()), (200, counts(1, 0, 0)), "{r:?}");
+    assert_eq!(
+        charge_of(&w.cp, "e1").await,
+        Some(Charge::unpriced(&w, "missing_price"))
+    );
+    let filed: Option<Uuid> =
+        sqlx::query_scalar("SELECT group_id FROM pricing_charges_cny WHERE event_id = 'e1'")
+            .fetch_one(w.cp.db().pool())
+            .await
+            .expect("read the charge's group");
+    assert_eq!(filed, Some(shared_group(&w.cp).await));
 }
 
 #[tokio::test]

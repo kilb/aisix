@@ -27,9 +27,12 @@ use aisix_control_plane::billing::marks::{
 use aisix_control_plane::billing::settler::{self, Settler, Timing};
 use aisix_control_plane::crypto::MasterKey;
 use aisix_control_plane::db::Db;
+use aisix_control_plane::groups::{self, LockMode};
+use aisix_control_plane::pricing::rates::{self, NewGroupRate};
 use aisix_control_plane::resources::write::{WriteCtx, RESOURCES_LOCK_KEY};
 use aisix_control_plane::tenants::{self, BillingMode, TenantStatus};
 use aisix_core::models::BudgetPeriod;
+use aisix_pricing::CnyPerUsd;
 use futures::FutureExt;
 use serde_json::{json, Value};
 use sqlx::postgres::PgListener;
@@ -620,6 +623,112 @@ async fn ingest_never_waits_on_the_resources_lock() {
         &exhausted_doc(w.tenant, BALANCE_MESSAGE_PREPAID),
     )
     .await;
+}
+
+/// The group a charge is filed under is referenced by a foreign key, so each
+/// charge insert takes `FOR KEY SHARE` on its group's row. A write that holds
+/// the row while it changes it — a retire queued behind the resources lock,
+/// an edit, a rate write — must not make intake wait: the batch for a key in
+/// that group is answered, and its charge filed, while the write is held.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_held_group_write_never_makes_intake_wait() {
+    let Some(w) = world().await else { return };
+    let model = seed_model(&w.cp, &w.admin).await;
+    price(&w.cp, model).await;
+    let shared = support::world::group_id(&w.cp, support::world::SHARED_GROUP).await;
+    let filed = |event_id: String| {
+        let db = w.cp.db().clone();
+        async move {
+            sqlx::query_as::<_, (String, Option<Uuid>)>(
+                "SELECT status, group_id FROM pricing_charges_cny WHERE event_id = $1",
+            )
+            .bind(event_id)
+            .fetch_one(db.pool())
+            .await
+            .expect("the charge")
+        }
+    };
+
+    // A retire of the key's group, queued for the resources lock while it
+    // holds the group's row.
+    let mut writer = w.cp.db().pool().begin().await.expect("begin");
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(RESOURCES_LOCK_KEY)
+        .execute(&mut *writer)
+        .await
+        .expect("hold the resources lock");
+    let path = format!("/admin/provider-groups/{shared}/retire");
+    let retire =
+        w.cp.send("POST", &path, Some(w.admin.cookie()), Some(json!({})));
+    let probe = async {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !resources_lock_queued(w.cp.db()).await {
+            assert!(
+                Instant::now() < deadline,
+                "the retire never queued for the resources lock"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let delivered = tokio::time::timeout(
+            Duration::from_secs(2),
+            deliver(&w.dp, Uuid::new_v4(), rows(&w, model, "retiring", 1)),
+        )
+        .await;
+        writer.rollback().await.expect("end the write");
+        delivered
+    };
+    let (retired, delivered) = tokio::join!(retire, probe);
+    let delivered = delivered.expect("the batch is answered while a retire holds its group");
+    assert_eq!(delivered.status, 200, "{delivered:?}");
+    // The retire then counts the tenant naming the group, and refuses.
+    assert_eq!(retired.status, 409, "{retired:?}");
+    assert_eq!(
+        filed("retiring-1".to_string()).await,
+        ("charged".to_string(), Some(shared))
+    );
+
+    // An edit's lock (a `PATCH`, and `make-default`'s mode), held open.
+    let mut editor = w.cp.db().pool().begin().await.expect("begin");
+    groups::lock_one(&mut editor, shared, LockMode::Update)
+        .await
+        .expect("hold the group as an edit does");
+    let delivered = tokio::time::timeout(
+        Duration::from_secs(2),
+        deliver(&w.dp, Uuid::new_v4(), rows(&w, model, "editing", 1)),
+    )
+    .await
+    .expect("the batch is answered while an edit holds its group");
+    assert_eq!(delivered.status, 200, "{delivered:?}");
+    editor.rollback().await.expect("end the edit");
+    assert_eq!(
+        filed("editing-1".to_string()).await,
+        ("charged".to_string(), Some(shared))
+    );
+
+    // A rate write on the group, written and not yet committed.
+    let mut rater = w.cp.db().pool().begin().await.expect("begin");
+    let row = NewGroupRate {
+        group_id: shared,
+        model_id: None,
+        effective_from: support::world::db_now(&w.cp).await + chrono::TimeDelta::hours(1),
+        cny_per_usd: Some(CnyPerUsd::parse("2").expect("a rate")),
+        note: "held open".to_string(),
+    };
+    rates::insert_group_rate(&mut rater, &row, Actor::System)
+        .await
+        .expect("write a rate");
+    let delivered = tokio::time::timeout(
+        Duration::from_secs(2),
+        deliver(&w.dp, Uuid::new_v4(), rows(&w, model, "rating", 1)),
+    )
+    .await
+    .expect("the batch is answered while a rate write holds its group");
+    assert_eq!(delivered.status, 200, "{delivered:?}");
+    rater.rollback().await.expect("end the rate write");
+    assert_eq!(
+        filed("rating-1".to_string()).await,
+        ("charged".to_string(), Some(shared))
+    );
 }
 
 /// What is logged at WARN and above on the thread that set it up.

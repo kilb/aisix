@@ -133,8 +133,9 @@ test("新建内部密钥：明文只显示一次，用它能调网关", async ({
   const form = page.getByRole("group", { name: "新建密钥" });
   await form.getByLabel("名称").fill("ops-key-t6");
   // The platform's own tenant chooses among every live group, so the
-  // operator answers the select. The account serving `chat-t6-*` is in `shared`.
-  await form.getByLabel("分组（必选）").selectOption({ label: "shared" });
+  // operator answers the select. The account serving `chat-t6-*` is in `shared`,
+  // offered by its display name with the routing name beside it.
+  await form.getByLabel("分组（必选）").selectOption({ label: "默认分组（shared）" });
   await form.getByLabel("模型（可写通配）").fill("chat-t6-*");
   await form.getByRole("button", { name: "创建" }).click();
 
@@ -447,7 +448,7 @@ test("未选分组的旧密钥可以设置一次分组", async ({ page }) => {
   // shows by its display name.
   await editor.getByRole("checkbox", { name: "Alpha 分组 7c1" }).check();
   await expect(editor.getByRole("checkbox", { checked: true })).toHaveCount(1);
-  await editor.getByRole("checkbox", { name: "shared" }).check();
+  await editor.getByRole("checkbox", { name: "默认分组" }).check();
   await expect(editor.getByRole("checkbox", { checked: true })).toHaveCount(1);
   await editor.getByRole("checkbox", { name: "Alpha 分组 7c1" }).check();
   await editor.getByRole("button", { name: "保存分组" }).click();
@@ -564,7 +565,7 @@ test("选择分组打开期间另一位运维设了它：刷新后再保存被�
   await expect(row).toContainText("未选分组");
   await row.getByRole("button", { name: "选择分组" }).click();
   const editor = keyTable(page).getByRole("group", { name: "选择分组" });
-  await editor.getByRole("checkbox", { name: "shared" }).check();
+  await editor.getByRole("checkbox", { name: "默认分组" }).check();
   // Meanwhile another operator gives the key a group.
   const version = await stack.admin.request("GET", `/admin/keys/${key.key.id}`);
   const alpha = (await stack.admin.get("/admin/provider-groups")).items.find(

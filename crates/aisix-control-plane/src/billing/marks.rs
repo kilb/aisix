@@ -45,7 +45,7 @@ pub const BALANCE_MESSAGE_POSTPAID: &str =
 /// The channel ingest notifies when it flags an account.
 pub const DIRTY_CHANNEL: &str = "billing_marks_dirty";
 
-/// Whether a tenant in `mode` with `balance` and `credit_limit` (micro-USD)
+/// Whether a tenant in `mode` with `balance` and `credit_limit` (micro-CNY)
 /// is out of money. A prepaid tenant is at its floor at 0, whatever its
 /// credit limit; a postpaid one at minus its credit limit. A sum that leaves
 /// the `i64` range counts as exhausted.
@@ -224,7 +224,7 @@ mod tests {
     use crate::resources::validate::{validate_lenient, validate_strict};
 
     #[test]
-    fn prepaid_is_exhausted_at_zero_and_not_one_micro_usd_above() {
+    fn prepaid_is_exhausted_at_zero_and_not_one_micro_cny_above() {
         assert!(exhausted(BillingMode::Prepaid, 0, 0));
         assert!(!exhausted(BillingMode::Prepaid, 1, 0));
         assert!(exhausted(BillingMode::Prepaid, -5, 1_000_000));

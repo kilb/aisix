@@ -266,15 +266,17 @@ test("只有一个分组时自动选中，但仍然显示", async ({ page }) => 
   const picker = page.getByRole("group", { name: "分组" });
   await expect(picker.getByRole("radio")).toHaveCount(1);
   await expect(picker.getByRole("radio")).toBeChecked();
-  await expect(picker).toContainText("shared");
+  // The first-boot group by its display name, and never by its routing name.
+  await expect(picker).toContainText("默认分组");
+  await expect(picker).not.toContainText("shared");
 
   // A create needs no click on it, and the key records the group.
   await page.getByLabel("名称", { exact: true }).fill("preselected-2c3");
   await page.getByRole("button", { name: "新建密钥" }).click();
   await expect(page.getByRole("region", { name: SECRET_NOTICE })).toBeVisible();
   const [created] = (await (await signedIn("owner@one-2c3.test")).get("/api/keys")).items;
-  expect(created.group.display_name).toBe("shared");
-  await expect(row(page, "preselected-2c3")).toContainText("shared");
+  expect(created.group.display_name).toBe("默认分组");
+  await expect(row(page, "preselected-2c3")).toContainText("默认分组");
 });
 
 test("密钥列表显示分组显示名；运营移除分组后显示分组已停用", async ({ page }) => {

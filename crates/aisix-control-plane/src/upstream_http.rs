@@ -439,6 +439,66 @@ fn transport_text(error: &reqwest::Error) -> String {
 mod tests {
     use super::*;
 
+    /// The body of `fn <signature>` in this file, without its comment
+    /// lines: an explanation survives deleting the call it explains, and a
+    /// guard satisfied by its own rationale guards nothing.
+    fn body_of(signature: &str) -> String {
+        let src =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/upstream_http.rs"))
+                .expect("this module is readable");
+        src.split_once(signature)
+            .unwrap_or_else(|| panic!("`{signature}` is declared here"))
+            .1
+            .split_once("\n    }")
+            .expect("closed")
+            .0
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// What the gateway's shared client guarantees, held here by name: the
+    /// control plane builds its client bare (the gateway's census exempts
+    /// that one line for it), so nothing else would notice a setting lost.
+    ///
+    /// - No proxy: a proxy resolves the name again, which the SSRF pin cannot
+    ///   cover.
+    /// - Both timeouts, the route's own bounds.
+    /// - No redirect followed: a `3xx` cannot steer the call to an address
+    ///   the check refused, nor carry the account's credential there.
+    /// - The `aisix/<version>` identity every gateway client sends.
+    ///
+    /// Source-level, as the gateway's own: `reqwest::Client` exposes none of
+    /// these for readback.
+    #[test]
+    fn the_outbound_client_takes_no_proxy_both_timeouts_no_redirect_and_the_identity() {
+        let builder = body_of("fn builder() -> reqwest::ClientBuilder {");
+        for setting in [
+            ".redirect(reqwest::redirect::Policy::none())",
+            ".no_proxy()",
+            ".connect_timeout(CONNECT_TIMEOUT)",
+            ".timeout(TOTAL_TIMEOUT)",
+            ".user_agent(format!(\"aisix/{}\", &*aisix_core::BUILD_VERSION))",
+        ] {
+            assert!(
+                builder.contains(setting),
+                "the control plane's outbound client does not set `{setting}`:\n{builder}"
+            );
+        }
+        // Both clients the route dials through start from that builder.
+        let new = body_of("pub fn new(cfg: &SsrfProtectionConfig) -> Result<Client, String> {");
+        assert_eq!(
+            new.matches("Self::builder()").count(),
+            2,
+            "`pinned` and `direct` are each built from `Self::builder()`:\n{new}"
+        );
+        assert!(
+            !new.contains("reqwest::Client::"),
+            "a client built beside `Self::builder()` skips its settings:\n{new}"
+        );
+    }
+
     fn key(adapter: Option<Adapter>, provider: &str, api_base: Option<&str>) -> ProviderKey {
         let mut doc = serde_json::json!({
             "display_name": "acct",

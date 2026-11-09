@@ -1,8 +1,8 @@
 //! Billing accounts and their ledger.
 //!
 //! Each tenant has one account (`billing_accounts`), holding its signed
-//! balance in micro-USD, and an append-only ledger (`billing_ledger`) of the
-//! entries that moved it. The balance on the account is a cache of the
+//! balance in micro-CNY (`balance_micro_cny`), and an append-only ledger
+//! (`billing_ledger_cny`) of the entries that moved it. The balance on the account is a cache of the
 //! ledger: [`post`] moves both in one transaction, under the account's lock,
 //! so the balance always equals the sum of the tenant's entries and each
 //! entry's `balance_after` the running sum up to it.

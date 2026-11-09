@@ -267,11 +267,16 @@ pub struct Proposal {
     pub effective_from: Option<DateTime<Utc>>,
     /// The card it comes to, when its prices made one.
     pub card: Option<Value>,
-    pub flags: Vec<Flag>,
+    /// Every stored flag by its name, one this build does not know
+    /// included ([`stored_flags`]).
+    pub flags: Vec<String>,
     /// The provider's first cited pricing page.
     pub pricing_url: Option<String>,
     pub prices_checked: Option<NaiveDate>,
-    /// A live direct model whose provider and model name are the entry's.
+    /// The model a confirmation would price: the public model a channel
+    /// model serves the entry's upstream name through, or a hand-made live
+    /// direct model whose provider and model name are the entry's
+    /// ([`suggest_models`]).
     pub suggested_model_id: Option<Uuid>,
     /// `pending`, `confirmed`, `rejected` or `superseded`.
     pub status: String,
@@ -329,9 +334,7 @@ impl<'r> sqlx::FromRow<'r, PgRow> for Proposal {
             model: row.try_get("model")?,
             effective_from: row.try_get("effective_from")?,
             card: row.try_get("card")?,
-            // A stored flag this build does not know reads as none, so the
-            // card still shows.
-            flags: serde_json::from_value(flags).unwrap_or_default(),
+            flags: stored_flags(flags),
             pricing_url: row.try_get("pricing_url")?,
             prices_checked: row.try_get("prices_checked")?,
             suggested_model_id: row.try_get("suggested_model_id")?,
@@ -345,6 +348,24 @@ impl<'r> sqlx::FromRow<'r, PgRow> for Proposal {
             catalogue_entry: None,
             same_as_current: false,
         })
+    }
+}
+
+/// A stored `flags` column as the review lists it: each flag by its name,
+/// a known one or not, so a proposal reads as flagged exactly when
+/// [`check_confirmable`] refuses it. Decoding into [`Flag`] would lose a
+/// flag a newer build wrote, and with it every known flag beside it.
+fn stored_flags(flags: Value) -> Vec<String> {
+    match flags {
+        Value::Null => Vec::new(),
+        Value::Array(flags) => flags
+            .into_iter()
+            .map(|flag| match flag {
+                Value::String(name) => name,
+                other => other.to_string(),
+            })
+            .collect(),
+        other => vec![other.to_string()],
     }
 }
 
@@ -433,12 +454,19 @@ fn valid_dataset_ref(reference: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'/' | b'-'))
 }
 
-/// The live direct model whose document's `provider` and `model_name` are
-/// `provider` and `model`, for each pair given: the smallest id of several.
+/// The model a confirmation of each pair `(provider, model)` should price:
+/// the one tenants call for that upstream model.
+///
+/// A live direct document whose `provider` and `model_name` are the pair's
+/// matches. One a channel model generated (`channel_models.direct_model_id`)
+/// is never offered itself: tenants call its public model, whose id is the
+/// one a baseline prices calls by, so the match resolves to that public
+/// model. A public model is preferred over a hand-made direct model of the
+/// same pair, then the smallest id of several.
 ///
 /// It keys on the document's own upstream fields, so a routing, ensemble or
-/// semantic model (which carry neither) never matches, and an embedding
-/// model, which is a direct model, can.
+/// semantic model (which carry neither) never matches by itself, and an
+/// embedding model, which is a direct model, can.
 async fn suggest_models(
     conn: &mut PgConnection,
     proposals: &[ParsedProposal],
@@ -455,13 +483,16 @@ async fn suggest_models(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
+    // A generated document's public model is retired with its documents, so
+    // a live generated document always resolves to a live public model.
     let rows: Vec<(String, String, Uuid)> = sqlx::query_as(
-        "SELECT DISTINCT ON (doc->>'provider', doc->>'model_name') \
-                doc->>'provider', doc->>'model_name', id \
-         FROM gw_resources \
-         WHERE kind = $1 AND NOT deleted AND doc ? 'provider' AND doc ? 'model_name' \
-           AND doc->>'provider' = ANY($2) AND doc->>'model_name' = ANY($3) \
-         ORDER BY doc->>'provider', doc->>'model_name', id",
+        "SELECT DISTINCT ON (r.doc->>'provider', r.doc->>'model_name') \
+                r.doc->>'provider', r.doc->>'model_name', COALESCE(cm.public_model_id, r.id) \
+         FROM gw_resources r LEFT JOIN channel_models cm ON cm.direct_model_id = r.id \
+         WHERE r.kind = $1 AND NOT r.deleted AND r.doc ? 'provider' AND r.doc ? 'model_name' \
+           AND r.doc->>'provider' = ANY($2) AND r.doc->>'model_name' = ANY($3) \
+         ORDER BY r.doc->>'provider', r.doc->>'model_name', cm.public_model_id IS NULL, \
+                  COALESCE(cm.public_model_id, r.id)",
     )
     .bind(Kind::Models.segment())
     .bind(&providers)
@@ -812,7 +843,11 @@ fn check_confirmable(proposal: &LockedProposal) -> Result<RateCard, ApiError> {
 ///    superseded one counts as not pending.
 /// 4. `422 /flags` for a proposal that carries any flag, or whose card this
 ///    engine cannot read (see [`check_confirmable`]).
-/// 5. `422 /effective_from` for a start before the proposal's own.
+/// 5. `422 /effective_from` for a start before the proposal's own, and for
+///    one at or after the date a later-dated proposal of the same entry in
+///    the same batch takes effect: the dataset itself says the price changed
+///    by then, so that later proposal is the one to confirm, and the answer
+///    names its date.
 /// 6. `insert_baseline`'s own refusals, which answer last: `422 /model_id`
 ///    for a model that is not live, `422 /card` for a card it cannot apply,
 ///    and its past-start `/effective_from` check.
@@ -858,6 +893,33 @@ pub async fn confirm(
                     return Err(refused(
                         "/effective_from",
                         "生效时间不能早于该提议自己的生效时间",
+                    ));
+                }
+                // The latest of the entry's later-dated proposals that has
+                // taken effect by the requested start, whatever its own
+                // status: the dataset's word on the price does not change
+                // with a decision on it.
+                let later: Option<DateTime<Utc>> = sqlx::query_scalar(
+                    "SELECT max(effective_from) FROM pricing_import_proposals \
+                     WHERE batch_id = $1 AND provider = $2 AND model = $3 \
+                       AND effective_from > COALESCE($4, '-infinity'::timestamptz) \
+                       AND effective_from <= $5",
+                )
+                .bind(id)
+                .bind(&proposal.provider)
+                .bind(&proposal.model)
+                .bind(proposal.effective_from)
+                .bind(body.effective_from)
+                .fetch_one(&mut *conn)
+                .await
+                .map_err(DbError::from)?;
+                if let Some(later) = later {
+                    return Err(refused(
+                        "/effective_from",
+                        format!(
+                            "数据集中该模型自 {} 起已有更新的价格：生效时间须早于该日，或确认那一条",
+                            later.format("%Y-%m-%d")
+                        ),
                     ));
                 }
                 let now: DateTime<Utc> = sqlx::query_scalar("SELECT now()")
@@ -1363,7 +1425,10 @@ impl Price {
     }
 }
 
-/// Whether `url` is an `http` or `https` page: a scheme, then a host.
+/// Whether `url` is an `http` or `https` page: a scheme, then a host, and
+/// nothing in the authority that makes the host a browser dials differ from
+/// the text the review prints: no userinfo (`https://a.example@b.example/`
+/// goes to `b.example`) and no backslash, which a browser reads as `/`.
 fn is_web_page(url: &str) -> bool {
     let (scheme, rest) = match url.split_once("://") {
         Some(parts) => parts,
@@ -1374,7 +1439,7 @@ fn is_web_page(url: &str) -> bool {
     }
     let host = rest.split(['/', '?', '#']).next().unwrap_or_default();
     // The dataset's own entries all name a host; a scheme alone names none.
-    !host.is_empty()
+    !host.is_empty() && !host.contains(['@', '\\'])
 }
 
 /// The dataset's models whose output price is a stated zero rather than a
@@ -2064,7 +2129,10 @@ mod tests {
                 {"id":"r","pricing_urls":["javascript:alert(1)","http://r.example/p"],
                  "models":[{"id":"m-untrusted","prices":{"input_mtok":1,"output_mtok":2}}]},
                 {"id":"s","pricing_urls":["data:text/html,<script>alert(1)</script>","ftp://s.example/p"],
-                 "models":[{"id":"m-no-page","prices":{"input_mtok":1,"output_mtok":2}}]}]"#,
+                 "models":[{"id":"m-no-page","prices":{"input_mtok":1,"output_mtok":2}}]},
+                {"id":"t","pricing_urls":["https://openai.com@t.example/p","https://openai.com\\t.example/p",
+                                          "https://t.example/pricing"],
+                 "models":[{"id":"m-disguised","prices":{"input_mtok":1,"output_mtok":2}}]}]"#,
         );
         let checked = current(&all, "m-checked");
         assert_eq!(checked.provider, "p");
@@ -2086,6 +2154,29 @@ mod tests {
             Some("http://r.example/p")
         );
         assert_eq!(current(&all, "m-no-page").pricing_url, None);
+        // A page whose printed text names one host and whose link goes to
+        // another is no page: userinfo, and a backslash a browser reads as
+        // `/`, both put the real host elsewhere.
+        assert_eq!(
+            current(&all, "m-disguised").pricing_url.as_deref(),
+            Some("https://t.example/pricing")
+        );
+    }
+
+    #[test]
+    fn a_stored_flag_this_build_does_not_know_is_listed_beside_the_known_ones() {
+        assert_eq!(
+            stored_flags(json!(["unsupported_field", "new_flag"])),
+            vec!["unsupported_field".to_string(), "new_flag".to_string()]
+        );
+        assert!(stored_flags(json!([])).is_empty());
+        assert!(stored_flags(Value::Null).is_empty());
+        // Whatever else the column holds still reads as flagged, as
+        // `check_confirmable` reads it.
+        assert_eq!(
+            stored_flags(json!({"x": 1})),
+            vec![r#"{"x":1}"#.to_string()]
+        );
     }
 
     #[test]

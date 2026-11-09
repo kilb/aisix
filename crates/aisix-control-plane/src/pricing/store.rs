@@ -310,8 +310,10 @@ pub struct ChargeIdentity<'a> {
     pub user_id: &'a str,
     pub requested_model_id: &'a str,
     /// The group the row's key names, as the control plane recorded it: the
-    /// group the charge is filed under, and what a re-pricing run prices a
-    /// `no_group` row at (R11). `None` for a row whose key names none.
+    /// group the charge is filed under, whatever its outcome (a row the
+    /// engine refused included), and what a re-pricing run prices a
+    /// `no_group` row at (R11). `None` for a row whose key names none, or
+    /// does not resolve.
     pub group_id: Option<Uuid>,
     /// The row's request id as `usage_events` stores it.
     pub request_id: Option<&'a str>,
@@ -368,7 +370,6 @@ struct Columns<'a> {
     charge: Option<i64>,
     cost: Option<i64>,
     cost_source: Option<Json<&'a CostSource>>,
-    group_id: Option<Uuid>,
     baseline_revision_id: Option<i64>,
     rate_revision_id: Option<i64>,
     cny_per_usd_e4: Option<i64>,
@@ -395,7 +396,6 @@ impl<'a> Columns<'a> {
                 charge: Some(p.charge.0),
                 cost: p.cost.as_ref().map(|c| c.amount.0),
                 cost_source: p.cost.as_ref().map(|c| Json(&c.source)),
-                group_id: p.group_id.as_deref().and_then(|g| Uuid::parse_str(g).ok()),
                 baseline_revision_id: p.baseline.map(|b| b.revision_id),
                 rate_revision_id: p.rate.map(|r| r.revision_id),
                 cny_per_usd_e4: p.rate.map(|r| i64::from(r.cny_per_usd.0)),
@@ -424,7 +424,6 @@ impl<'a> Columns<'a> {
                 charge: None,
                 cost: None,
                 cost_source: None,
-                group_id: None,
                 baseline_revision_id: None,
                 rate_revision_id: None,
                 cny_per_usd_e4: None,
@@ -477,7 +476,9 @@ pub async fn record_charge(
     .bind(c.charge)
     .bind(c.cost)
     .bind(c.cost_source)
-    .bind(c.group_id)
+    // The key's group, whatever the outcome: the engine prices a row at
+    // exactly this group, and a row it refused is still filed under it.
+    .bind(ident.group_id)
     .bind(c.baseline_revision_id)
     .bind(c.rate_revision_id)
     .bind(c.cny_per_usd_e4)

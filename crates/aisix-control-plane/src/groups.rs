@@ -18,15 +18,26 @@
 //! The lock order is tenant row, then its billing account, then group rows
 //! (ascending id), then `RESOURCES_LOCK_KEY` (design D20). A path that names
 //! a group takes its row `FOR SHARE` ([`lock_one`], as a rate write does);
-//! `make-default` takes it `FOR UPDATE`, so two designations serialise.
+//! a path that changes or retires one — `retire`, `PATCH` and
+//! `make-default` — takes it `FOR NO KEY UPDATE` ([`LockMode::Update`]), so
+//! two designations serialise.
 //!
-//! A retire takes its group row `FOR UPDATE` and then also
+//! `FOR NO KEY UPDATE`, never `FOR UPDATE`: every charge intake stores
+//! references its group (`pricing_charges_cny.group_id`), and the foreign
+//! key's check takes `FOR KEY SHARE` on the group row. `FOR UPDATE` conflicts
+//! with that, so a retire queued on `RESOURCES_LOCK_KEY` while holding the
+//! row would make intake wait behind the resources lock. No group write
+//! changes `id`, the one column a foreign key references, so the weaker mode
+//! is the exact one (`a_held_group_write_never_makes_intake_wait`,
+//! `tests/billing_marks.rs`). It still conflicts with `FOR SHARE`.
+//!
+//! A retire takes its group row `FOR NO KEY UPDATE` and then also
 //! `RESOURCES_LOCK_KEY`, and counts the references under both. That closes
 //! the two ways a name could land after the count:
-//! - a tenant, a key or a rate naming the group waits on the row itself (a
-//!   key's own `group_id` row is not locked, but assigning a group to a
-//!   tenant and writing a rate both are, and a key is created under its
-//!   tenant's row);
+//! - a tenant, a key or a rate naming the group waits on the row itself:
+//!   assigning a group to a tenant (`lock_named`), choosing a key's group
+//!   (`key_group`) and writing a rate (`lock_one(Share)`) each take the row
+//!   `FOR SHARE`;
 //! - a provider-key document is written under `RESOURCES_LOCK_KEY` only, so
 //!   the retire holds that lock for its count and its update. A provider-key
 //!   write that gets the lock second is refused at `/groups` for naming a
@@ -198,7 +209,7 @@ pub async fn tenant_groups(
 /// live one": a name with no row and a retired group are the same refusal,
 /// so nothing leaks which groups exist. The share lock is what makes an
 /// assignment and a retire of the same group serialise — the retire takes
-/// the row `FOR UPDATE`, so it lands either before (and the assigner then
+/// the row `FOR NO KEY UPDATE`, so it lands either before (and the assigner then
 /// finds the group retired) or after (and then counts the assignment).
 ///
 /// Runs after any tenant lock and before [`crate::resources::write::
@@ -299,7 +310,11 @@ pub struct GroupRow {
 /// retire it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LockMode {
+    /// `FOR SHARE`.
     Share,
+    /// `FOR NO KEY UPDATE`: it waits for every path that names the group,
+    /// and never for the `FOR KEY SHARE` a charge's foreign key takes, so
+    /// usage intake does not wait on it (see the module doc).
     Update,
 }
 
@@ -311,7 +326,7 @@ pub async fn lock_one(
 ) -> Result<GroupRow, ApiError> {
     let lock = match mode {
         LockMode::Share => "FOR SHARE",
-        LockMode::Update => "FOR UPDATE",
+        LockMode::Update => "FOR NO KEY UPDATE",
     };
     sqlx::query_as(&format!(
         "SELECT {COLUMNS} FROM provider_groups WHERE id = $1 {lock}"
@@ -373,8 +388,8 @@ impl GroupUse {
     }
 }
 
-/// What still names `g`, read on `conn`: a retire's own `FOR UPDATE` lock on
-/// the row is what keeps these counts true until its update.
+/// What still names `g`, read on `conn`: a retire's own `FOR NO KEY UPDATE`
+/// lock on the row is what keeps these counts true until its update.
 pub async fn references(conn: &mut PgConnection, g: &GroupRow) -> Result<GroupUse, DbError> {
     let name = &g.name;
     let tenants: i64 = sqlx::query_scalar(
@@ -802,7 +817,7 @@ pub async fn update(
 /// counts while something does. Retiring a retired group changes nothing and
 /// answers its view.
 ///
-/// The counts are read under the group's own `FOR UPDATE` lock and under
+/// The counts are read under the group's own `FOR NO KEY UPDATE` lock and under
 /// `RESOURCES_LOCK_KEY`, and the update lands while both are held. A
 /// provider-key write waits on the same resources lock: one that gets it
 /// first is counted, and one that gets it second is refused at `/groups`
@@ -859,10 +874,56 @@ pub async fn retire(
     Ok(Json(answer))
 }
 
+/// Group `id` and the designated default, each taken `FOR NO KEY UPDATE` in
+/// ascending id, once the pass holds the default as it stands: see
+/// [`make_default`].
+async fn lock_default_and(conn: &mut PgConnection, id: Uuid) -> Result<Vec<GroupRow>, ApiError> {
+    loop {
+        sqlx::query("SAVEPOINT lock_default")
+            .execute(&mut *conn)
+            .await
+            .map_err(DbError::from)?;
+        let rows: Vec<GroupRow> = sqlx::query_as(&format!(
+            "SELECT {COLUMNS} FROM provider_groups WHERE is_default OR id = $1 \
+             ORDER BY id FOR NO KEY UPDATE"
+        ))
+        .bind(id)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(DbError::from)?;
+        // A statement of its own, so it sees a designation that committed
+        // while the pass waited; one that commits later had to wait for the
+        // default this pass holds.
+        let default: Option<Uuid> =
+            sqlx::query_scalar("SELECT id FROM provider_groups WHERE is_default")
+                .fetch_optional(&mut *conn)
+                .await
+                .map_err(DbError::from)?;
+        if default.is_none_or(|d| rows.iter().any(|r| r.id == d)) {
+            sqlx::query("RELEASE SAVEPOINT lock_default")
+                .execute(&mut *conn)
+                .await
+                .map_err(DbError::from)?;
+            return Ok(rows);
+        }
+        sqlx::query("ROLLBACK TO SAVEPOINT lock_default")
+            .execute(&mut *conn)
+            .await
+            .map_err(DbError::from)?;
+    }
+}
+
 /// `POST /admin/provider-groups/{id}/make-default` → `200 Group`: moves the
-/// designated default to this group. Both rows are taken `FOR UPDATE` in
-/// ascending id, so two operators designating different groups serialise. A
-/// retired group is `409 group_retired`.
+/// designated default to this group. Both rows are taken `FOR NO KEY UPDATE`
+/// in ascending id, so two operators designating different groups serialise.
+/// A retired group is `409 group_retired`.
+///
+/// Only rows taken in that one ascending pass are updated. When the default
+/// moved between the pass's snapshot and its locks (another designation
+/// committed meanwhile), the pass is rolled back to its savepoint, which
+/// releases what it took, and taken again: locking the new default after the
+/// row already held could be out of id order, and deadlock with a tenant
+/// assignment that holds both `FOR SHARE`.
 pub async fn make_default(
     auth: OperatorAuth,
     State(state): State<AppState>,
@@ -875,16 +936,7 @@ pub async fn make_default(
         .db
         .tx(move |conn| {
             async move {
-                // Ascending id: whichever two operators pick, the lower id is
-                // locked first.
-                let rows: Vec<GroupRow> = sqlx::query_as(&format!(
-                    "SELECT {COLUMNS} FROM provider_groups WHERE is_default OR id = $1 \
-                     ORDER BY id FOR UPDATE"
-                ))
-                .bind(id)
-                .fetch_all(&mut *conn)
-                .await
-                .map_err(DbError::from)?;
+                let rows = lock_default_and(&mut *conn, id).await?;
                 let Some(row) = rows.iter().find(|r| r.id == id) else {
                     return Err(ApiError::not_found());
                 };
@@ -893,15 +945,15 @@ pub async fn make_default(
                 }
                 if !row.is_default {
                     let previous = rows.iter().find(|r| r.is_default).map(|r| r.id);
-                    sqlx::query("UPDATE provider_groups SET is_default = false WHERE is_default")
-                        .execute(&mut *conn)
-                        .await
-                        .map_err(DbError::from)?;
-                    sqlx::query("UPDATE provider_groups SET is_default = true WHERE id = $1")
-                        .bind(id)
-                        .execute(&mut *conn)
-                        .await
-                        .map_err(DbError::from)?;
+                    let locked: Vec<Uuid> = rows.iter().map(|r| r.id).collect();
+                    sqlx::query(
+                        "UPDATE provider_groups SET is_default = (id = $1) WHERE id = ANY($2)",
+                    )
+                    .bind(id)
+                    .bind(&locked)
+                    .execute(&mut *conn)
+                    .await
+                    .map_err(DbError::from)?;
                     audit::record(
                         &mut *conn,
                         AuditEntry {

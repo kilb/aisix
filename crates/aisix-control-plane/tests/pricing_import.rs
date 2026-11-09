@@ -20,7 +20,10 @@ use serde::Deserialize;
 use serde_json::value::RawValue;
 use serde_json::{json, Value};
 use sqlx::PgPool;
-use support::world::{db_now, seed_provider_key};
+use support::world::{
+    db_now, deliver, group_id, insert_rate, public_model, seed_provider_key, usage, world,
+    SHARED_GROUP,
+};
 use support::{OperatorSession, Resp, TestCp};
 use uuid::Uuid;
 
@@ -609,6 +612,139 @@ async fn the_suggested_model_is_a_direct_model_of_that_provider_and_name() {
     );
 }
 
+/// `text`, a price as the dataset writes it, in millionths: `"0.3"` is
+/// 300 000.
+fn millionths(text: &str) -> i64 {
+    let (whole, fraction) = text.split_once('.').unwrap_or((text, ""));
+    assert!(fraction.len() <= 6, "{text}");
+    let whole: i64 = whole.parse().expect("digits");
+    let fraction: i64 = format!("{fraction:0<6}").parse().expect("digits");
+    whole * 1_000_000 + fraction
+}
+
+/// The setup the channel-style configuration recommends: a public model
+/// ticked on an upstream account, which generates a direct document carrying
+/// the account's provider and the upstream name. Tenants call the public
+/// model, so that is the model the import suggests, and a confirmed
+/// suggestion prices the tenant's call.
+#[tokio::test]
+async fn a_confirmed_suggestion_prices_a_call_to_the_public_model() {
+    let Some(w) = world().await else { return };
+    let (cp, op) = (&w.cp, &w.admin);
+    let r = cp
+        .send(
+            "POST",
+            "/admin/resources/provider_keys",
+            Some(op.cookie()),
+            Some(json!({"doc": {
+                "display_name": "acct-gp-5d2",
+                "provider": "anthropic",
+                "api_key": "sk-ant-import-7c1",
+                "groups": [SHARED_GROUP],
+            }})),
+        )
+        .await;
+    assert_eq!(r.status, 201, "{r:?}");
+    let account = id(&r.body).to_string();
+    let public = public_model(cp, op, "claude-opus-5-5").await;
+    let r = cp
+        .send(
+            "PUT",
+            &format!("/admin/provider-keys/{account}/channel-models/{public}"),
+            Some(op.cookie()),
+            Some(json!({"priority": 0, "weight": 1})),
+        )
+        .await;
+    assert_eq!(r.status, 200, "{r:?}");
+    // The generated direct document is the one carrying the entry's
+    // provider and upstream name.
+    let direct: Uuid = sqlx::query_scalar(
+        "SELECT id FROM gw_resources WHERE kind = 'models' AND NOT deleted \
+           AND doc->>'provider' = 'anthropic' AND doc->>'model_name' = 'claude-opus-5-5'",
+    )
+    .fetch_one(cp.db().pool())
+    .await
+    .expect("the generated direct document");
+    assert_ne!(direct, public);
+    // The tenant is granted the public model, and its key's group is rated
+    // at 1 CNY per USD.
+    let version: i64 = sqlx::query_scalar("SELECT version FROM tenants WHERE id = $1")
+        .bind(w.tenant)
+        .fetch_one(cp.db().pool())
+        .await
+        .expect("the tenant's version");
+    let granted = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("an HTTP client")
+        .patch(cp.url(&format!("/admin/tenants/{}", w.tenant)))
+        .header(reqwest::header::COOKIE, op.cookie())
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .header(reqwest::header::IF_MATCH, format!("\"{version}\""))
+        .json(&json!({"allowed_model_ids": [public]}))
+        .send()
+        .await
+        .expect("send the grant");
+    assert_eq!(granted.status(), 200);
+    insert_rate(cp, group_id(cp, SHARED_GROUP).await, db_now(cp).await)
+        .await
+        .expect("rate the group");
+
+    let batch = upload(cp, op).await;
+    let proposal = current(
+        &proposals(cp, op, &batch).await,
+        "anthropic",
+        "claude-opus-5-5",
+    )
+    .clone();
+    assert_eq!(proposal["suggested_model_id"], json!(public), "{proposal}");
+    let r = decide(
+        cp,
+        op,
+        &batch,
+        &proposal,
+        "confirm",
+        json!({
+            "model_id": proposal["suggested_model_id"],
+            "effective_from": db_now(cp).await,
+            "attested": true,
+        }),
+    )
+    .await;
+    assert_eq!(r.status, 201, "{r:?}");
+
+    // One call to the public model: 1000 input and 200 output tokens, at
+    // the snapshot's own prices for the entry, times a rate of 1.
+    let r = deliver(
+        &w.dp,
+        Uuid::new_v4(),
+        vec![usage(
+            &w,
+            "e-opus",
+            public,
+            json!({"prompt_tokens": 1000, "completion_tokens": 200}),
+        )],
+    )
+    .await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let (_, prices) = source("anthropic", "claude-opus-5-5");
+    let owed = 1000 * millionths(&prices["input_mtok"]) + 200 * millionths(&prices["output_mtok"]);
+    let expected = (owed + 999_999) / 1_000_000;
+    let (status, charge, error): (String, Option<i64>, Option<String>) = sqlx::query_as(
+        "SELECT status, charge_micro_cny, error_code FROM pricing_charges_cny \
+         WHERE event_id = 'e-opus'",
+    )
+    .fetch_one(cp.db().pool())
+    .await
+    .expect("the call's charge");
+    assert_eq!(
+        (status.as_str(), charge, error),
+        ("charged", Some(expected), None),
+        "the call to the public model is priced"
+    );
+    assert!(expected > 0);
+}
+
 #[tokio::test]
 async fn who_may_upload() {
     let Some(cp) = TestCp::start().await else {
@@ -725,6 +861,55 @@ async fn a_proposal_is_decided_once_and_never_rewritten() {
     )
     .await;
     assert!(err.contains("cannot move from pending"), "{err}");
+}
+
+/// A confirmed proposal always names its attester: the database refuses a
+/// confirmation written without one (0030), whoever writes it — the route
+/// sets both in one update, so only a write around it could try.
+#[tokio::test]
+async fn the_database_refuses_a_confirmation_without_its_attester() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let op = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let model_id = model(&cp, &op, "anthropic", "claude-opus-5-5").await;
+    let batch = upload(&cp, &op).await;
+    let proposal = current(
+        &proposals(&cp, &op, &batch).await,
+        "anthropic",
+        "claude-opus-5-5",
+    )
+    .clone();
+    let revision =
+        support::world::insert_baseline(&cp, model_id, db_now(&cp).await, support::world::card())
+            .await
+            .expect("a baseline to name");
+    let err = refused_sql(
+        &cp,
+        &format!(
+            "UPDATE pricing_import_proposals \
+             SET status = 'confirmed', decided_at = now(), baseline_revision_id = {} \
+             WHERE id = '{}'",
+            revision.revision_id,
+            id(&proposal)
+        ),
+    )
+    .await;
+    assert!(err.contains("pricing_import_proposals_attested"), "{err}");
+    // The same write naming its attester is what the route writes.
+    sqlx::query(&format!(
+        "UPDATE pricing_import_proposals \
+         SET status = 'confirmed', decided_at = now(), baseline_revision_id = {}, \
+             decided_by = '{}', attested_by = '{}' \
+         WHERE id = '{}'",
+        revision.revision_id,
+        op.id,
+        op.id,
+        id(&proposal)
+    ))
+    .execute(cp.db().pool())
+    .await
+    .expect("a confirmation with its attester");
 }
 
 #[tokio::test]
@@ -1343,28 +1528,53 @@ async fn the_attestation_is_checked_before_the_proposal_is_read() {
     }
 }
 
+/// A dataset of one entry, `google`/`model`: input 1 and output 2 now, and
+/// input 3 and output 4 from `day` on.
+fn dated_dataset(model: &str, day: chrono::NaiveDate) -> String {
+    format!(
+        r#"[{{"id":"google","pricing_urls":["https://ai.google.dev/pricing"],"models":[
+             {{"id":"{model}","prices":[
+               {{"prices":{{"input_mtok":1,"output_mtok":2}}}},
+               {{"constraint":{{"start_date":"{day}"}},"prices":{{"input_mtok":3,"output_mtok":4}}}}]}}]}}]"#
+    )
+}
+
+/// An upload of `data`, which must answer 201; the batch it answers.
+async fn upload_ok(cp: &TestCp, op: &OperatorSession, data: &str) -> Value {
+    let r = upload_text(cp, op, "inline-7c1", data).await;
+    assert_eq!(r.status, 201, "{r:?}");
+    r.body
+}
+
+/// `model`'s two proposals in `all`: the one in effect at upload, and the
+/// dated one.
+fn now_and_dated(all: &[Value], model: &str) -> (Value, Value) {
+    let of = |dated: bool| {
+        all.iter()
+            .find(|p| p["model"] == model && p["effective_from"].is_null() != dated)
+            .unwrap_or_else(|| panic!("no proposal of {model} (dated: {dated}): {all:?}"))
+            .clone()
+    };
+    (of(false), of(true))
+}
+
 #[tokio::test]
 async fn a_dated_proposal_starts_no_earlier_than_its_date() {
     let Some(cp) = TestCp::start().await else {
         return;
     };
     let op = cp.admin_login_seeded(OperatorRole::Operator).await;
-    let model_id = model(&cp, &op, "google", "gemini-3.6-flash").await;
-    let batch = upload(&cp, &op).await;
+    let model_id = model(&cp, &op, "google", "m-dated-7c1").await;
+    // Dated from the database's own clock, so the date stays ahead of the
+    // upload whenever the test runs.
+    let day = (db_now(&cp).await + chrono::TimeDelta::days(30)).date_naive();
+    let batch = upload_ok(&cp, &op, &dated_dataset("m-dated-7c1", day)).await;
     let all = proposals(&cp, &op, &batch).await;
-    let dated = all
-        .iter()
-        .find(|p| {
-            p["provider"] == "google"
-                && p["model"] == "gemini-3.6-flash"
-                && !p["effective_from"].is_null()
-                && p["flags"] == json!([])
-                && !p["card"].is_null()
-        })
-        .unwrap_or_else(|| panic!("no dated, unflagged google/gemini-3.6-flash: {all:?}"))
-        .clone();
+    let (_, dated) = now_and_dated(&all, "m-dated-7c1");
+    assert_eq!(dated["flags"], json!([]), "{dated}");
     let starts: chrono::DateTime<chrono::Utc> =
         serde_json::from_value(dated["effective_from"].clone()).expect("a date");
+    assert_eq!(starts.date_naive(), day, "the dataset's own date");
 
     let early = decide(
         &cp,
@@ -1408,6 +1618,74 @@ async fn a_dated_proposal_starts_no_earlier_than_its_date() {
         Value::Null,
         "scheduled, not in force"
     );
+}
+
+/// An entry's earlier price cannot be confirmed to start once the same
+/// upload says a later one has taken over: the dataset itself replaced it by
+/// then, and the refusal names the later price's date.
+#[tokio::test]
+async fn an_earlier_price_cannot_start_after_the_entrys_later_one() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let op = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let model_id = model(&cp, &op, "google", "m-later-7c1").await;
+    let day = (db_now(&cp).await + chrono::TimeDelta::days(10)).date_naive();
+    let batch = upload_ok(&cp, &op, &dated_dataset("m-later-7c1", day)).await;
+    let all = proposals(&cp, &op, &batch).await;
+    let (now, dated) = now_and_dated(&all, "m-later-7c1");
+    assert_eq!(now["flags"], json!([]), "{now}");
+    let later: chrono::DateTime<chrono::Utc> =
+        serde_json::from_value(dated["effective_from"].clone()).expect("a date");
+
+    // At the later price's own start, and a day past it: both refused.
+    for start in [later, later + chrono::TimeDelta::days(1)] {
+        let r = decide(
+            &cp,
+            &op,
+            &batch,
+            &now,
+            "confirm",
+            json!({"model_id": model_id, "effective_from": start, "attested": true}),
+        )
+        .await;
+        assert_eq!(r.status, 422, "{start}: {r:?}");
+        assert_eq!(refusal_paths(&r), vec!["/effective_from"], "{start}");
+        let message = r.body["details"][0]["message"].as_str().expect("a message");
+        assert!(message.contains(&day.to_string()), "{message}");
+    }
+    assert_eq!(cp.count("pricing_baselines").await, 0);
+    let still = proposals(&cp, &op, &batch).await;
+    let p = still.iter().find(|p| p["id"] == now["id"]).expect("it");
+    assert_eq!(p["status"], "pending", "{p}");
+
+    // Before it, the earlier price is what the dataset says, and it is
+    // written.
+    let r = decide(
+        &cp,
+        &op,
+        &batch,
+        &now,
+        "confirm",
+        json!({
+            "model_id": model_id,
+            "effective_from": later - chrono::TimeDelta::seconds(1),
+            "attested": true,
+        }),
+    )
+    .await;
+    assert_eq!(r.status, 201, "{r:?}");
+    // And the later one still confirms at its own date.
+    let r = decide(
+        &cp,
+        &op,
+        &batch,
+        &dated,
+        "confirm",
+        json!({"model_id": model_id, "effective_from": later, "attested": true}),
+    )
+    .await;
+    assert_eq!(r.status, 201, "{r:?}");
 }
 
 #[tokio::test]

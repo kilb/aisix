@@ -261,11 +261,14 @@ test("面板列出每个分组的人民币售价：基准价乘以该分组现�
   await expect(page.getByText("已保存")).toBeVisible();
 
   // The scenario's own arithmetic: 3 USD per million at 1.2 is ¥3.60, and 6 is
-  // ¥7.20. The first-boot `shared` group has no rate in force in this world, so
-  // its row says which one is missing rather than showing a figure.
+  // ¥7.20. The first-boot `shared` group (shown as 默认分组) has no rate in
+  // force in this world, so its row says which one is missing rather than
+  // showing a figure.
   const matrix = panel.getByRole("table", { name: "各分组售价" });
   const rated = matrix.getByRole("row").filter({ hasText: "换算 1.2 分组" });
   await expect(rated).toContainText("¥3.60");
   await expect(rated).toContainText("¥7.20");
-  await expect(matrix.getByRole("row").filter({ hasText: "shared" })).toContainText("分组未设换算率");
+  // By its whole cell: the 默认 group's row reads 默认 then 分组未设换算率.
+  const shared = matrix.getByRole("row").filter({ has: page.getByRole("cell", { name: "默认分组", exact: true }) });
+  await expect(shared).toContainText("分组未设换算率");
 });
