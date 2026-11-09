@@ -55,18 +55,19 @@
 //! ## Prices, in platform mode
 //!
 //! In platform mode, with a control plane to ask, each model the caller's
-//! tenant has a price for carries `pricing`: `input`, `output` and, when the
-//! price has them, `input_cache_read`, `input_cache_write` and
-//! `input_cache_write_1h`, in USD per token as the control plane's exact
-//! decimal strings ([`crate::account::prices`]), in both shapes and on both
-//! routes. The field names follow the hosted gateways' listings, which carry
-//! the same per-token prices as strings. A price is found by the listed
-//! row's resource id: it keys on the entry the caller addresses, whatever
-//! its kind (a direct model, an embedding model, or a routing, semantic or
-//! ensemble alias, each priced as itself; a wildcard alias is never listed).
-//! A model without a price, or a listing whose prices the control plane did
-//! not give in time, is listed exactly as it is without platform mode's
-//! prices; with platform mode off nothing is asked and nothing changes.
+//! tenant has a price for carries `pricing`: `currency`, `input`, `output`
+//! and, when the price has them, `input_cache_read`, `input_cache_write` and
+//! `input_cache_write_1h`, per token as the control plane's exact decimal
+//! strings in the currency it names ([`crate::account::prices`]), in both
+//! shapes and on both routes. The field names follow the hosted gateways'
+//! listings, which carry the same per-token prices as strings. A price is
+//! found by the listed row's resource id: it keys on the entry the caller
+//! addresses, whatever its kind (a direct model, an embedding model, or a
+//! routing, semantic or ensemble alias, each priced as itself; a wildcard
+//! alias is never listed). A model without a price, or a listing whose prices
+//! the control plane did not give in time, is listed exactly as it is without
+//! platform mode's prices; with platform mode off nothing is asked and
+//! nothing changes.
 
 use std::sync::Arc;
 
@@ -304,8 +305,10 @@ fn anthropic_model(
 }
 
 /// The caller's tenant's prices, in platform mode with a control plane to
-/// ask; `None` otherwise, without asking. Never fails the listing, and never
-/// holds it past [`crate::account::prices::PRICES_TIMEOUT`].
+/// ask; `None` otherwise, without asking. Cached per tenant and provider
+/// group ([`crate::account::prices::prices_cache_key`]), since a price is the
+/// key's group's rate. Never fails the listing, and never holds it past
+/// [`crate::account::prices::PRICES_TIMEOUT`].
 async fn tenant_prices(
     state: &ProxyState,
     auth: &AuthenticatedKey,
@@ -313,7 +316,10 @@ async fn tenant_prices(
     state.platform()?;
     let account = state.account.as_deref()?;
     account
-        .tenant_prices(&crate::platform::tenant_owner(auth), &auth.entry.id)
+        .tenant_prices(
+            &crate::account::prices::prices_cache_key(auth),
+            &auth.entry.id,
+        )
         .await
 }
 
@@ -1352,33 +1358,41 @@ mod tests {
     const M1: &str = "0b3e8a2c-5d41-4f6e-9a7b-1c2d3e4f5a61";
     const M2: &str = "0b3e8a2c-5d41-4f6e-9a7b-1c2d3e4f5a62";
 
-    /// A key of `team` (none for a key of no team), seeing every model.
-    fn tenant_key(id: &str, plaintext: &str, team: Option<&str>) -> ResourceEntry<ApiKey> {
+    /// A key of `team` (none for a key of no team) in provider `groups`,
+    /// seeing every model.
+    fn tenant_key(
+        id: &str,
+        plaintext: &str,
+        team: Option<&str>,
+        groups: &[&str],
+    ) -> ResourceEntry<ApiKey> {
         let key: ApiKey = serde_json::from_value(json!({
             "key_hash": ApiKey::hash_bearer(plaintext),
             "allowed_models": ["*"],
             "team_id": team,
+            "allowed_provider_groups": groups,
         }))
         .unwrap();
         ResourceEntry::new(id, key, 1)
     }
 
-    /// `chat-1` (M1) and `chat-2` (M2); two keys of tenant A, one of
-    /// tenant B, and two keys in no team.
+    /// `chat-1` (M1) and `chat-2` (M2); two keys of tenant A in `grp-a`, a
+    /// third in `grp-b`, one of tenant B, and two keys in no team.
     fn priced_snap() -> AisixSnapshot {
         let snap = new_snap();
         snap.models.insert(model_entry(M1, "chat-1"));
         snap.models.insert(model_entry(M2, "chat-2"));
-        snap.apikeys
-            .insert(tenant_key("key-a1", "sk-a1", Some("tenant-a")));
-        snap.apikeys
-            .insert(tenant_key("key-a2", "sk-a2", Some("tenant-a")));
-        snap.apikeys
-            .insert(tenant_key("key-b1", "sk-b1", Some("tenant-b")));
-        snap.apikeys
-            .insert(tenant_key("key-solo1", "sk-solo1", None));
-        snap.apikeys
-            .insert(tenant_key("key-solo2", "sk-solo2", None));
+        for (id, plaintext, team, groups) in [
+            ("key-a1", "sk-a1", Some("tenant-a"), ["grp-a"]),
+            ("key-a2", "sk-a2", Some("tenant-a"), ["grp-a"]),
+            ("key-a3", "sk-a3", Some("tenant-a"), ["grp-b"]),
+            ("key-b1", "sk-b1", Some("tenant-b"), ["grp-a"]),
+            ("key-solo1", "sk-solo1", None, ["grp-a"]),
+            ("key-solo2", "sk-solo2", None, ["grp-a"]),
+        ] {
+            snap.apikeys
+                .insert(tenant_key(id, plaintext, team, &groups));
+        }
         snap
     }
 
@@ -1439,8 +1453,9 @@ mod tests {
         json!({
             "tenant_id": "tenant-a",
             "pricing_version": 7,
+            "currency": "CNY",
             "valid_until": null,
-            "models": [{"model_id": M1, "input": "0.000006", "output": "0.00002"}],
+            "items": [{"model_id": M1, "input": "0.000006", "output": "0.00002"}],
         })
     }
 
@@ -1486,7 +1501,7 @@ mod tests {
         let mut listing = answer.json();
         assert_eq!(
             listed(&listing, "chat-1")["pricing"],
-            json!({"input": "0.000006", "output": "0.00002"})
+            json!({"currency": "CNY", "input": "0.000006", "output": "0.00002"})
         );
         assert!(
             listed(&listing, "chat-2").get("pricing").is_none(),
@@ -1505,7 +1520,7 @@ mod tests {
         let anthropic = get(&app, "/v1/models", "sk-a1", true).await.json();
         assert_eq!(
             listed(&anthropic, "chat-1")["pricing"],
-            json!({"input": "0.000006", "output": "0.00002"})
+            json!({"currency": "CNY", "input": "0.000006", "output": "0.00002"})
         );
         assert!(listed(&anthropic, "chat-2").get("pricing").is_none());
 
@@ -1530,7 +1545,10 @@ mod tests {
                 // The control plane fails for key-solo2.
                 _ => return (StatusCode::SERVICE_UNAVAILABLE, "{}".to_string()),
             };
-            ok(json!({"models": [{"model_id": M1, "input": input, "output": "0.00002"}]}))
+            ok(json!({
+                "currency": "CNY",
+                "items": [{"model_id": M1, "input": input, "output": "0.00002"}],
+            }))
         }))
         .await;
         let app = app_with(true, Some(stand_in.client()));
@@ -1559,6 +1577,54 @@ mod tests {
                 ("/dp/v1/keys/key-solo1/prices".to_string(), 1),
                 ("/dp/v1/keys/key-b1/prices".to_string(), 1),
             ])
+        );
+    }
+
+    /// The prices cache is keyed by the tenant **and** the key document's
+    /// provider groups, not by the tenant alone: two keys of one tenant in
+    /// two groups are shown their own groups' prices, and two keys in one
+    /// group share one fetch.
+    #[tokio::test]
+    async fn a_second_group_of_one_tenant_is_shown_its_own_prices() {
+        // Each group's price, by the key that asked.
+        let stand_in = StandIn::start(Arc::new(|key| {
+            let (input, output) = match key {
+                // Tenant A's key in `grp-a`, and the same tenant's in `grp-b`.
+                "key-a1" | "key-a2" => ("0.000006", "0.00002"),
+                "key-a3" => ("0.000003", "0.00001"),
+                _ => ("0.000009", "0.00003"),
+            };
+            ok(json!({
+                "currency": "CNY",
+                "items": [{"model_id": M1, "input": input, "output": output}],
+            }))
+        }))
+        .await;
+        let app = app_with(true, Some(stand_in.client()));
+
+        for (key, input, output) in [
+            ("sk-a1", "0.000006", "0.00002"),
+            ("sk-a3", "0.000003", "0.00001"),
+            // A's other key of the first group is served from that group's
+            // entry, never the second group's.
+            ("sk-a2", "0.000006", "0.00002"),
+        ] {
+            let listing = get(&app, "/v1/models", key, false).await.json();
+            let price = &listed(&listing, "chat-1")["pricing"];
+            assert_eq!(price["currency"], "CNY", "{key}: {listing}");
+            assert_eq!(price["input"], input, "{key}: {listing}");
+            assert_eq!(price["output"], output, "{key}: {listing}");
+        }
+        // Two groups of one tenant, two fetches; the second key of the first
+        // group asked nothing.
+        let paths = stand_in.paths.lock().unwrap().clone();
+        assert_eq!(
+            paths,
+            HashMap::from([
+                ("/dp/v1/keys/key-a1/prices".to_string(), 1),
+                ("/dp/v1/keys/key-a3/prices".to_string(), 1),
+            ]),
+            "one fetch per group, one per tenant-and-group entry"
         );
     }
 
@@ -1626,19 +1692,23 @@ mod tests {
     #[tokio::test]
     async fn the_single_model_route_carries_the_same_pricing() {
         let stand_in = StandIn::start(Arc::new(|_| {
-            ok(json!({"models": [{
-                "model_id": M1,
-                "input": "0.000006",
-                "output": "0.00002",
-                "input_cache_read": "0.0000006",
-                "input_cache_write": "0.0000075",
-                "input_cache_write_1h": "0.000012",
-            }]}))
+            ok(json!({
+                "currency": "CNY",
+                "items": [{
+                    "model_id": M1,
+                    "input": "0.000006",
+                    "output": "0.00002",
+                    "input_cache_read": "0.0000006",
+                    "input_cache_write": "0.0000075",
+                    "input_cache_write_1h": "0.000012",
+                }],
+            }))
         }))
         .await;
         let app = app_with(true, Some(stand_in.client()));
         let listing = get(&app, "/v1/models", "sk-a1", false).await.json();
         let expected = json!({
+            "currency": "CNY",
             "input": "0.000006",
             "output": "0.00002",
             "input_cache_read": "0.0000006",

@@ -269,9 +269,9 @@ async fn prices(dp: &DpClient, key: Uuid) -> Resp {
 
 /// The entry of `model` in an answer.
 fn entry(r: &Resp, model: Uuid) -> Value {
-    r.body["models"]
+    r.body["items"]
         .as_array()
-        .unwrap_or_else(|| panic!("models in {r:?}"))
+        .unwrap_or_else(|| panic!("items in {r:?}"))
         .iter()
         .find(|m| m["model_id"] == json!(model))
         .cloned()
@@ -297,6 +297,11 @@ async fn prices_are_the_keys_groups_rates_per_token() {
     assert_eq!(r.status, 200, "{r:?}");
     assert_eq!(r.body["tenant_id"], json!(tenant));
     assert_eq!(r.body["valid_until"], Value::Null, "{r:?}");
+    assert_eq!(r.body["currency"], json!("CNY"), "{r:?}");
+    // The prices are `items`, never `models`: a gateway from before the
+    // currency field must fail to decode this answer rather than show CNY
+    // figures under no currency.
+    assert!(r.body.get("models").is_none(), "{r:?}");
     let m = entry(&r, model);
     assert_eq!(m["input"], "0.000006", "{r:?}");
     assert_eq!(m["output"], "0.00002", "{r:?}");
@@ -327,7 +332,7 @@ async fn prices_are_the_keys_groups_rates_per_token() {
 }
 
 #[tokio::test]
-async fn a_scheduled_rate_or_baseline_sets_valid_until() {
+async fn valid_until_includes_the_next_baseline_rate_and_discount_change() {
     let Some(cp) = TestCp::start().await else {
         return;
     };
@@ -369,7 +374,7 @@ async fn a_scheduled_rate_or_baseline_sets_valid_until() {
 }
 
 #[tokio::test]
-async fn two_keys_in_two_groups_see_two_prices() {
+async fn two_keys_in_two_groups_get_their_own_groups_prices() {
     let Some(cp) = TestCp::start().await else {
         return;
     };
@@ -426,9 +431,9 @@ async fn an_ungranted_or_unpriced_model_is_absent_from_prices() {
 
     let r = prices(&dp, key).await;
     assert_eq!(r.status, 200, "{r:?}");
-    let ids: Vec<&Value> = r.body["models"]
+    let ids: Vec<&Value> = r.body["items"]
         .as_array()
-        .expect("models")
+        .expect("items")
         .iter()
         .map(|e| &e["model_id"])
         .collect();
@@ -627,5 +632,8 @@ async fn a_key_with_no_group_sees_no_price() {
         .expect("clear the key's group");
     let r = prices(&dp, key).await;
     assert_eq!(r.status, 200, "{r:?}");
-    assert_eq!(r.body["models"], json!([]), "{r:?}");
+    assert_eq!(r.body["items"], json!([]), "{r:?}");
+    // A key with no group prices nothing, and says which currency that
+    // nothing would have been in.
+    assert_eq!(r.body["currency"], json!("CNY"), "{r:?}");
 }

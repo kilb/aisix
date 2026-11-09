@@ -14,10 +14,12 @@
 //! price it at, is absent: the gateway then shows no price rather than a
 //! wrong one.
 //!
-//! The answer keeps the field names and the shape the gateway decodes today,
-//! under their old `input`/`output` names: a rename here would make every
-//! gateway of the interim window answer `/v1/key` with `503`. It carries no
-//! channel information.
+//! The answer names the currency its amounts are in, and every amount is a
+//! neutral name (`input`, `output`, …) rather than one carrying a unit. A
+//! gateway requires the currency, and an answer without it lists no price at
+//! all. The list of models is `items`, deliberately not `models`; the
+//! doc comment on [`TenantPrices`] says why. The answer carries no channel
+//! information.
 //!
 //! This is a lookup on its own route: it never touches model traffic.
 
@@ -33,6 +35,7 @@ use sqlx::PgConnection;
 use uuid::Uuid;
 
 use super::access::key_access;
+use super::money::CURRENCY;
 use super::plans::current_discount;
 use crate::db::DbError;
 use crate::dp::DpIdentity;
@@ -69,10 +72,21 @@ pub struct ModelPrice {
 pub struct TenantPrices {
     pub tenant_id: Uuid,
     pub pricing_version: i64,
+    /// The currency every amount here is in. A gateway requires it: an
+    /// answer without it lists no price rather than a figure of unknown
+    /// unit.
+    pub currency: &'static str,
     /// The earliest instant a price shown here (or the tenant's discount)
     /// changes; `null` when nothing is scheduled.
     pub valid_until: Option<DateTime<Utc>>,
-    pub models: Vec<ModelPrice>,
+    /// The granted models this key's group can price.
+    ///
+    /// `items`, not `models`: a gateway from before the currency field
+    /// requires `models` to be an array of prices and has no `currency`, and
+    /// the rename makes it fail to decode the answer. It then lists the
+    /// models without prices, instead of showing CNY figures under no
+    /// currency.
+    pub items: Vec<ModelPrice>,
 }
 
 /// One granted model with everything needed to price it, as the engine reads
@@ -259,8 +273,9 @@ pub async fn tenant_prices(
     Ok(Some(TenantPrices {
         tenant_id: access.tenant_id,
         pricing_version: priced.pricing_version,
+        currency: CURRENCY,
         valid_until: priced.valid_until,
-        models: priced.models.iter().map(model_price).collect(),
+        items: priced.models.iter().map(model_price).collect(),
     }))
 }
 

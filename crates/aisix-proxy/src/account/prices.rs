@@ -4,9 +4,11 @@
 //! The prices come from the control plane's `GET /dp/v1/keys/{key_id}/prices`,
 //! asked with the id of the key the request authenticated with. The answer
 //! lists what that key's tenant pays per token for each granted model with a
-//! price in force, in USD per token as exact decimal strings, which reach the
-//! caller exactly as the control plane wrote them: the gateway does no money
-//! arithmetic.
+//! price in force, as exact decimal strings in the currency the control plane
+//! names, which reach the caller exactly as the control plane wrote them: the
+//! gateway does no money arithmetic. The currency is required, and an answer
+//! without it lists no price at all, rather than a figure whose unit no one
+//! named.
 //!
 //! Unlike the other lookups, this one decorates a route that answers without
 //! it, so it never fails that route or holds it back. A fetch, and a
@@ -15,10 +17,13 @@
 //! `404`, an answer that does not decode) is `None`, with which the models
 //! are listed as they are without platform mode's prices.
 //!
-//! The cache holds one entry per tenant, keyed by
-//! [`crate::platform::tenant_owner`]: the key document's team, or the key
-//! itself for a key in no team, so one tenant's entry, a failure included,
-//! never answers another. An answer lives [`PRICES_TTL`], or until its
+//! The cache holds one entry per [`prices_cache_key`]: the tenant, from
+//! [`crate::platform::tenant_owner`] (the key document's team, or the key
+//! itself for a key in no team), and the key document's
+//! `allowed_provider_groups`, sorted and deduplicated. Two keys of one tenant
+//! in two groups therefore hold two entries, since a price is its group's
+//! rate (§2.4), and two keys in one group share theirs. One tenant's entry, a
+//! failure included, never answers another. An answer lives [`PRICES_TTL`], or until its
 //! `valid_until` (the next scheduled price change) when that comes sooner,
 //! but never less than [`PRICES_MIN_TTL`]. A `None` lives [`PRICES_FAILURE_TTL`], so a control plane that cannot answer
 //! costs a tenant's listings at most one [`PRICES_TIMEOUT`] per
@@ -27,7 +32,9 @@
 //! holds at most [`CACHE_CAPACITY`](super::CACHE_CAPACITY) tenants.
 //!
 //! The answer decodes loosely: unknown fields are ignored, and every field
-//! but `models` (and, within a model, its `model_id`) has a default.
+//! but `currency`, `items` (and, within an item, its `model_id`) has a
+//! default. "A Control-Plane Response Decodes Loosely": a control plane newer
+//! than this gateway adds fields it must ignore.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -51,11 +58,15 @@ pub const PRICES_MIN_TTL: Duration = Duration::from_secs(1);
 /// them before the control plane is asked again.
 pub const PRICES_FAILURE_TTL: Duration = Duration::from_secs(2);
 
-/// One model's price for the caller's tenant, in USD per token, as the
-/// control plane wrote it. What the listing shows as a model's `pricing`.
+/// One model's price for the caller's tenant, per token, as the control plane
+/// wrote it. What the listing shows as a model's `pricing`.
+///
+/// `currency` is the answer's, stamped on every item when it is decoded. It
+/// is part of the price because a figure with no unit is not one.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default)]
 pub(crate) struct ModelPricing {
+    currency: String,
     input: Option<String>,
     output: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -74,12 +85,19 @@ struct ModelPriceWire {
     pricing: ModelPricing,
 }
 
-/// The control plane's answer, decoded loosely.
+/// The control plane's answer, decoded loosely but for the three fields the
+/// lookup hinges on: the currency every amount is in, and the items.
+///
+/// The list is `items`, not `models`: a gateway from before the currency
+/// field requires `models` to be an array of prices and has no `currency`, so
+/// the rename makes it fail to decode this answer rather than show figures
+/// under no currency.
 #[derive(Deserialize)]
 struct PricesWire {
+    currency: String,
     #[serde(default)]
     valid_until: Option<DateTime<Utc>>,
-    models: Vec<ModelPriceWire>,
+    items: Vec<ModelPriceWire>,
 }
 
 /// A tenant's prices, by model resource id.
@@ -99,12 +117,22 @@ impl TenantPricesAnswer {
 
 impl From<PricesWire> for TenantPricesAnswer {
     fn from(wire: PricesWire) -> Self {
+        let PricesWire {
+            currency,
+            valid_until,
+            items,
+        } = wire;
         TenantPricesAnswer {
-            valid_until: wire.valid_until,
-            by_model: wire
-                .models
+            valid_until,
+            by_model: items
                 .into_iter()
-                .map(|m| (m.model_id, m.pricing))
+                .map(|m| {
+                    let pricing = ModelPricing {
+                        currency: currency.clone(),
+                        ..m.pricing
+                    };
+                    (m.model_id, pricing)
+                })
                 .collect(),
         }
     }
@@ -112,6 +140,36 @@ impl From<PricesWire> for TenantPricesAnswer {
 
 /// A tenant's prices; `None` is the control plane's `404`.
 type Prices = Option<Arc<TenantPricesAnswer>>;
+
+/// The prices cache's key for `auth`'s request: the tenant plus the provider
+/// groups its key document allows, sorted and deduplicated.
+///
+/// A price depends on the group, so two keys of one tenant in two groups must
+/// not share an entry, and two keys in one group must. The groups are the
+/// key document's `allowed_provider_groups` — what the key routes by — and
+/// not the tenant's, because a price follows the key that asks.
+///
+/// Which model identity: this keys on **neither** half. It keys on the caller
+/// and the groups it may reach, and the prices inside the entry are looked up
+/// per requested model by its resource id (`pricing` in `models.rs`), so a
+/// wildcard-served name, a routing parent and a direct model all read the
+/// price of the model the caller addressed. No dispatched target is involved:
+/// the answer is one lookup per key, not per target.
+///
+/// The key is JSON so that no pair of distinct inputs can render the same
+/// string: [`crate::platform::tenant_owner`] already holds a `:` for a
+/// tenantless key, and a group name may hold anything.
+pub(crate) fn prices_cache_key(auth: &crate::auth::AuthenticatedKey) -> String {
+    let mut groups: Vec<&str> = auth
+        .key()
+        .allowed_provider_groups
+        .iter()
+        .map(String::as_str)
+        .collect();
+    groups.sort_unstable();
+    groups.dedup();
+    serde_json::json!([crate::platform::tenant_owner(auth), groups]).to_string()
+}
 
 /// The prices lookups by tenant.
 pub(crate) type PricesCache = SharedLookup<Prices>;
@@ -139,17 +197,17 @@ pub(super) fn prices_cache() -> PricesCache {
 }
 
 impl AccountClient {
-    /// The prices of tenant `tenant_id` (as [`crate::platform::tenant_owner`]
-    /// names it), fetched with the caller's key `key_id` when the cache has
-    /// no entry for the tenant. `None` when the control plane gave no answer
-    /// in time; never waits past [`PRICES_TIMEOUT`].
+    /// The prices of the tenant and provider groups [`prices_cache_key`]
+    /// names, fetched with the caller's key `key_id` when the cache has no
+    /// entry for them. `None` when the control plane gave no answer in time;
+    /// never waits past [`PRICES_TIMEOUT`].
     pub(crate) async fn tenant_prices(
         &self,
-        tenant_id: &str,
+        cache_key: &str,
         key_id: &str,
     ) -> Option<Arc<TenantPricesAnswer>> {
         self.prices
-            .get(tenant_id, || {
+            .get(cache_key, || {
                 let (client, path) = (self.clone(), key_path(key_id, "prices"));
                 async move {
                     client
@@ -181,13 +239,15 @@ mod tests {
         json!({
             "tenant_id": "t-1",
             "pricing_version": 3,
+            "currency": "CNY",
             "valid_until": null,
-            "models": [{"model_id": model_id, "input": "0.000006", "output": "0.00002"}],
+            "items": [{"model_id": model_id, "input": "0.000006", "output": "0.00002"}],
         })
     }
 
     fn pricing(input: &str, output: &str) -> ModelPricing {
         ModelPricing {
+            currency: "CNY".to_string(),
             input: Some(input.to_string()),
             output: Some(output.to_string()),
             ..ModelPricing::default()
@@ -200,11 +260,14 @@ mod tests {
             "k-new" => {
                 let mut body = priced("m-1");
                 body["a_field_from_a_newer_release"] = json!({"nested": [1]});
-                body["models"][0]["another_new_field"] = json!(7);
+                body["items"][0]["another_new_field"] = json!(7);
                 ok(body)
             }
             // Only what the lookup hinges on.
-            _ => ok(json!({"models": [{"model_id": "m-1", "input_cache_read": "0.0000006"}]})),
+            _ => ok(json!({
+                "currency": "CNY",
+                "items": [{"model_id": "m-1", "input_cache_read": "0.0000006"}],
+            })),
         }))
         .await;
         let client = stand_in.client();
@@ -217,6 +280,7 @@ mod tests {
         assert_eq!(
             answer.price_of("m-1"),
             Some(&ModelPricing {
+                currency: "CNY".to_string(),
                 input_cache_read: Some("0.0000006".to_string()),
                 ..ModelPricing::default()
             })
@@ -232,8 +296,16 @@ mod tests {
             "k-missing" => (StatusCode::NOT_FOUND, "{}".to_string()),
             "k-failing" => (StatusCode::INTERNAL_SERVER_ERROR, "{}".to_string()),
             "k-garbled" => (StatusCode::OK, "not json".to_string()),
-            "k-no-models" => ok(json!({"tenant_id": "t-1", "valid_until": null})),
-            "k-numbers" => ok(json!({"models": [{"model_id": "m-1", "input": 0.000006}]})),
+            "k-no-items" => ok(json!({"currency": "CNY", "tenant_id": "t-1", "valid_until": null})),
+            "k-no-currency" => ok(json!({
+                "tenant_id": "t-1",
+                "valid_until": null,
+                "items": [{"model_id": "m-1", "input": "0.000006"}],
+            })),
+            "k-numbers" => ok(json!({
+                "currency": "CNY",
+                "items": [{"model_id": "m-1", "input": 0.000006}],
+            })),
             _ => ok(priced("m-1")),
         }))
         .await;
@@ -242,7 +314,8 @@ mod tests {
             "k-missing",
             "k-failing",
             "k-garbled",
-            "k-no-models",
+            "k-no-items",
+            "k-no-currency",
             "k-numbers",
         ] {
             assert!(
@@ -254,7 +327,7 @@ mod tests {
             );
         }
         let before = stand_in.hits();
-        assert_eq!(before, 5);
+        assert_eq!(before, 6);
         assert!(client
             .tenant_prices("team:k-failing", "k-failing")
             .await
@@ -428,5 +501,135 @@ mod tests {
         tokio::time::sleep(PRICES_MIN_TTL + Duration::from_millis(300)).await;
         assert!(client.tenant_prices("team:a", "k-4").await.is_some());
         assert_eq!(stand_in.hits(), 2, "past PRICES_MIN_TTL");
+    }
+
+    /// The currency is not defaulted either: an answer without it gives no
+    /// price at all, so a listing shows the models without pricing rather than
+    /// figures whose unit nobody named. The unit is not guessed, and a price
+    /// the control plane does send carries it.
+    #[tokio::test]
+    async fn a_prices_answer_without_its_currency_lists_no_pricing() {
+        let stand_in = StandIn::start(Arc::new(|key| match key {
+            // Every amount the answer ever gives, under no currency.
+            "k-no-currency" => {
+                let mut body = priced("m-1");
+                body.as_object_mut().unwrap().remove("currency");
+                ok(body)
+            }
+            _ => ok(priced("m-1")),
+        }))
+        .await;
+        let client = stand_in.client();
+        assert!(client
+            .tenant_prices("team:a", "k-no-currency")
+            .await
+            .is_none());
+        // The same answer with its currency lists the price, and names it.
+        let answer = client.tenant_prices("team:b", "k-ok").await.unwrap();
+        assert_eq!(
+            answer.price_of("m-1").map(|p| p.currency.as_str()),
+            Some("CNY")
+        );
+    }
+
+    /// The cache key is the tenant plus the key document's provider groups,
+    /// sorted and deduplicated: two keys of one tenant in two groups hold two
+    /// entries, and two keys in one group share theirs.
+    #[tokio::test]
+    async fn the_prices_cache_is_keyed_by_tenant_and_groups() {
+        use aisix_core::resource::ResourceEntry;
+        use aisix_core::{AisixSnapshot, ApiKey};
+
+        fn key_of(
+            entry_id: &str,
+            team: Option<&str>,
+            groups: &[&str],
+        ) -> crate::auth::AuthenticatedKey {
+            let snap = AisixSnapshot::new();
+            let doc = json!({
+                "key_hash": "h",
+                "allowed_models": [],
+                "team_id": team,
+                "allowed_provider_groups": groups,
+            });
+            let entry = Arc::new(ResourceEntry::new(
+                entry_id,
+                serde_json::from_value::<ApiKey>(doc).unwrap(),
+                1,
+            ));
+            crate::auth::AuthenticatedKey::new(&snap, entry, None, false)
+        }
+        let (k1, k2) = ("k-1", "k-2");
+
+        // Two keys of one tenant in two groups: two entries.
+        assert_ne!(
+            prices_cache_key(&key_of(k1, Some("team-a"), &["grp-a"])),
+            prices_cache_key(&key_of(k2, Some("team-a"), &["grp-b"])),
+            "a price follows the group"
+        );
+        // Two keys in one group: one entry, whichever key asks.
+        assert_eq!(
+            prices_cache_key(&key_of(k1, Some("team-a"), &["grp-a"])),
+            prices_cache_key(&key_of(k2, Some("team-a"), &["grp-a"])),
+        );
+        // The order and the repetition of the document's list do not matter.
+        assert_eq!(
+            prices_cache_key(&key_of(k1, Some("team-a"), &["grp-b", "grp-a"])),
+            prices_cache_key(&key_of(k1, Some("team-a"), &["grp-a", "grp-b"])),
+            "a fixed order"
+        );
+        assert_eq!(
+            prices_cache_key(&key_of(k1, Some("team-a"), &["grp-a", "grp-a"])),
+            prices_cache_key(&key_of(k1, Some("team-a"), &["grp-a"])),
+            "deduplicated"
+        );
+        // Two tenants in one group: two entries.
+        assert_ne!(
+            prices_cache_key(&key_of(k1, Some("team-a"), &["grp-a"])),
+            prices_cache_key(&key_of(k1, Some("team-b"), &["grp-a"])),
+        );
+        // Two keys in no team are two tenants, and a key with no group is the
+        // tenant alone.
+        assert_ne!(
+            prices_cache_key(&key_of(k1, None, &["grp-a"])),
+            prices_cache_key(&key_of(k2, None, &["grp-a"])),
+        );
+        assert_ne!(
+            prices_cache_key(&key_of(k1, Some("team-a"), &[])),
+            prices_cache_key(&key_of(k1, Some("team-a"), &["grp-a"])),
+        );
+    }
+
+    /// The lookup holds one entry per key of the cache, so two keys of one
+    /// tenant in two groups each fetch their own answer, and a second key in
+    /// the first group's entry is served from it.
+    #[tokio::test]
+    async fn two_groups_of_one_tenant_fetch_twice_and_one_group_once() {
+        let stand_in = StandIn::start(Arc::new(|key| {
+            ok(match key {
+                "k-a1" | "k-a2" => priced("m-a"),
+                _ => priced("m-b"),
+            })
+        }))
+        .await;
+        let client = stand_in.client();
+        let a = client
+            .tenant_prices("[\"team:a\",[\"grp-a\"]]", "k-a1")
+            .await;
+        assert!(a.is_some());
+        let b = client
+            .tenant_prices("[\"team:a\",[\"grp-b\"]]", "k-b1")
+            .await;
+        assert!(b.is_some());
+        assert_eq!(stand_in.hits(), 2, "two groups, two lookups");
+        // The second key of the first group is served the first group's
+        // answer, not the second group's.
+        let a_again = client
+            .tenant_prices("[\"team:a\",[\"grp-a\"]]", "k-a2")
+            .await
+            .unwrap();
+        assert_eq!(stand_in.hits(), 2, "one group, one entry");
+        assert!(a_again.price_of("m-a").is_some(), "A's own answer");
+        assert!(a_again.price_of("m-b").is_none(), "not B's");
     }
 }

@@ -24,7 +24,7 @@ use uuid::Uuid;
 
 use super::access::{key_access, session_visibility, KeyAccess, Visibility};
 use super::budgets::{self, BudgetRow, BudgetScope, Kind, SetBy};
-use super::money::cny_string;
+use super::money::{cny_string, CURRENCY};
 use crate::auth::{MemberAuth, MemberRole};
 use crate::db::DbError;
 use crate::dp::DpIdentity;
@@ -183,35 +183,37 @@ pub async fn key_quota(
     })
 }
 
-/// `q` as a gateway relays it: every amount an exact decimal string.
+/// `q` as a gateway relays it: every amount an exact decimal string, under a
+/// neutral name, with the currency they are in.
 ///
-/// The amounts are micro-CNY. The field names are the ones the gateway
-/// decodes today; they carry the value under its old name until the gateway
-/// is upgraded, which reads the neutral names and the `currency` field.
+/// The amounts are micro-CNY. `currency` is required by the gateway: without
+/// it no amount is shown at all, so a caller is never handed a figure whose
+/// unit it would have to guess.
 fn dp_json(q: &KeyQuota) -> Value {
     let cny = |micro: i64| cny_string(micro);
     json!({
         "key_id": q.key_id,
         "as_of": q.as_of,
+        "currency": CURRENCY,
         "org": q.org.as_ref().map(|o| json!({
             "billing_mode": o.billing_mode,
-            "balance_usd": cny(o.balance_micro_cny),
-            "credit_limit_usd": cny(o.credit_limit_micro_cny),
-            "available_usd": cny(o.available_micro_cny),
+            "balance": cny(o.balance_micro_cny),
+            "credit_limit": cny(o.credit_limit_micro_cny),
+            "available": cny(o.available_micro_cny),
         })),
         "quotas": q.quotas.iter().map(|f| json!({
             "scope": f.scope,
             "set_by": f.set_by,
             "kind": f.kind,
             "period": f.period,
-            "limit_usd": cny(f.limit_micro_cny),
-            "spend_usd": cny(f.spent_micro_cny),
-            "remaining_usd": cny(f.remaining_micro_cny),
+            "limit": cny(f.limit_micro_cny),
+            "spend": cny(f.spent_micro_cny),
+            "remaining": cny(f.remaining_micro_cny),
             "period_start": f.period_start,
             "counted_from": f.counted_from,
             "exhausted": f.exhausted,
         })).collect::<Vec<_>>(),
-        "effective_remaining_usd": q.effective_remaining_micro_cny.map(cny),
+        "effective_remaining": q.effective_remaining_micro_cny.map(cny),
         "binding_level": q.binding_level,
     })
 }

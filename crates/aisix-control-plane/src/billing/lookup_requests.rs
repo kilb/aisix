@@ -49,7 +49,7 @@ use super::access::{key_access, KeyAccess, Visibility};
 use super::calls::{
     call_model, tenant_view, text, Models, TenantStatus, ADJUSTED, EVENT_FIELDS, VISIBLE,
 };
-use super::money::cny_string;
+use super::money::{cny_string, CURRENCY};
 use crate::db::DbError;
 use crate::dp::DpIdentity;
 use crate::error::{ApiError, Detail};
@@ -258,11 +258,17 @@ pub struct RequestsQuery {
     id: Option<String>,
 }
 
-/// `c` as a gateway relays it: every amount an exact decimal string in USD.
+/// `c` as a gateway relays it: every amount an exact decimal string, under a
+/// neutral name, with the currency they are in.
+///
+/// The amounts are micro-CNY, and `currency` is required by the gateway:
+/// without it no amount is shown, so a caller is never handed a figure whose
+/// unit it would have to guess.
 fn dp_json(c: &RequestCost) -> Value {
     json!({
         "request_id": c.request_id,
-        "total_usd": cny_string(c.total_micro_cny),
+        "currency": CURRENCY,
+        "total": cny_string(c.total_micro_cny),
         "pending": c.pending,
         "has_more": c.has_more,
         "items": c.items.iter().map(|i| json!({
@@ -271,7 +277,7 @@ fn dp_json(c: &RequestCost) -> Value {
             "status": i.status,
             "error": i.error,
             "charge_status": i.charge_status,
-            "charge_usd": i.charge_micro_cny.map(cny_string),
+            "charge": i.charge_micro_cny.map(cny_string),
             "estimated": i.estimated,
             "quantities": i.quantities,
         })).collect::<Vec<_>>(),

@@ -5,16 +5,23 @@
 //! for the key the request authenticated with, so a caller can only ever read
 //! its own key. A request is refused when any level applying to the key is
 //! used up, so the answer names the smallest remaining amount
-//! (`effective_remaining_usd`) and the level that holds it (`binding_level`),
+//! (`effective_remaining`) and the level that holds it (`binding_level`),
 //! beside every quota the key's holder may see and, for an owner's, admin's or
 //! billing member's key, the organization's balance. Amounts are the control
-//! plane's exact decimal strings, passed through: the gateway does no money
-//! arithmetic.
+//! plane's exact decimal strings, passed through under neutral names: the
+//! gateway does no money arithmetic.
+//!
+//! The answer names its currency (`data.currency`), and every amount is named
+//! for what it is (`limit`, `spend`, `remaining`, `balance`), never for a
+//! unit. `currency` is required, and an answer without it is
+//! [`ProxyError::AccountUnavailable`] (`503`), so no amount is ever shown
+//! without the unit it is in; it is the one required field beside
+//! `effective_remaining`, and every other field defaults ("A Control-Plane
+//! Response Decodes Loosely").
 //!
 //! The shape follows the hosted routers' own-key route (a `data` object with
-//! `budgets` of `limit_usd`, `spend_usd` and `remaining_usd`, amounts as
-//! strings) and adds `binding_level`, because the smallest remaining level
-//! binds.
+//! `budgets` of `limit`, `spend` and `remaining`, amounts as strings) and
+//! adds `binding_level`, because the smallest remaining level binds.
 //!
 //! - No account client (a gateway reading a resources file, or a managed
 //!   gateway without a certificate bundle), or a key the control plane does
@@ -50,9 +57,9 @@ use crate::state::ProxyState;
 #[serde(default)]
 pub(crate) struct Balance {
     billing_mode: Option<String>,
-    balance_usd: Option<String>,
-    credit_limit_usd: Option<String>,
-    available_usd: Option<String>,
+    balance: Option<String>,
+    credit_limit: Option<String>,
+    available: Option<String>,
 }
 
 /// One quota that applies to the key, with its spend now.
@@ -63,9 +70,9 @@ pub(crate) struct Budget {
     set_by: Option<String>,
     kind: Option<String>,
     period: Option<String>,
-    limit_usd: Option<String>,
-    spend_usd: Option<String>,
-    remaining_usd: Option<String>,
+    limit: Option<String>,
+    spend: Option<String>,
+    remaining: Option<String>,
     period_start: Option<String>,
     counted_from: Option<String>,
     exhausted: Option<bool>,
@@ -74,11 +81,14 @@ pub(crate) struct Budget {
 /// The control plane's answer for one key.
 ///
 /// Decoded loosely: unknown fields are ignored and every field but
-/// `effective_remaining_usd`, which the answer exists to give, has a default.
-/// The route renders its own shape from these fields, so nothing the
-/// control plane adds reaches a caller until it is named here.
+/// `currency` and `effective_remaining_usd` — the two the answer exists to
+/// give, and one of them is what every amount is in — has a default. The
+/// route renders its own shape from these fields, so nothing the control
+/// plane adds reaches a caller until it is named here.
 #[derive(Debug, Deserialize)]
 pub(crate) struct KeyQuotaAnswer {
+    /// Required: a figure with no unit is not an answer.
+    currency: String,
     #[serde(default)]
     as_of: Option<String>,
     #[serde(default)]
@@ -87,7 +97,7 @@ pub(crate) struct KeyQuotaAnswer {
     quotas: Vec<Budget>,
     /// Present in every answer, `null` when no level applies.
     #[serde(deserialize_with = "present")]
-    effective_remaining_usd: Option<String>,
+    effective_remaining: Option<String>,
     #[serde(default)]
     binding_level: Option<String>,
 }
@@ -145,10 +155,11 @@ struct KeyInfo<'a> {
 #[derive(Serialize)]
 struct KeyData<'a> {
     as_of: Option<&'a str>,
+    currency: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     balance: Option<&'a Balance>,
     budgets: &'a [Budget],
-    effective_remaining_usd: Option<&'a str>,
+    effective_remaining: Option<&'a str>,
     binding_level: Option<&'a str>,
 }
 
@@ -157,9 +168,10 @@ impl<'a> From<&'a KeyQuotaAnswer> for KeyInfo<'a> {
         KeyInfo {
             data: KeyData {
                 as_of: answer.as_of.as_deref(),
+                currency: &answer.currency,
                 balance: answer.org.as_ref(),
                 budgets: &answer.quotas,
-                effective_remaining_usd: answer.effective_remaining_usd.as_deref(),
+                effective_remaining: answer.effective_remaining.as_deref(),
                 binding_level: answer.binding_level.as_deref(),
             },
         }
@@ -231,25 +243,26 @@ mod tests {
         json!({
             "key_id": "k-owner",
             "as_of": "2026-11-07T10:00:00Z",
+            "currency": "CNY",
             "org": {
                 "billing_mode": "prepaid",
-                "balance_usd": "0.970000",
-                "credit_limit_usd": "0.000000",
-                "available_usd": "0.970000",
+                "balance": "0.970000",
+                "credit_limit": "0.000000",
+                "available": "0.970000",
             },
             "quotas": [{
                 "scope": "team",
                 "set_by": "operator",
                 "kind": "periodic",
                 "period": "month",
-                "limit_usd": "0.500000",
-                "spend_usd": "0.030000",
-                "remaining_usd": "0.470000",
+                "limit": "0.500000",
+                "spend": "0.030000",
+                "remaining": "0.470000",
                 "period_start": "2026-11-01T00:00:00Z",
                 "counted_from": null,
                 "exhausted": false,
             }],
-            "effective_remaining_usd": "0.470000",
+            "effective_remaining": "0.470000",
             "binding_level": "organization",
         })
     }
@@ -274,10 +287,10 @@ mod tests {
             .await
             .unwrap()
             .expect("an answer");
-        assert_eq!(answer.effective_remaining_usd.as_deref(), Some("0.470000"));
-        assert_eq!(answer.quotas[0].limit_usd.as_deref(), Some("0.500000"));
+        assert_eq!(answer.effective_remaining.as_deref(), Some("0.470000"));
+        assert_eq!(answer.quotas[0].limit.as_deref(), Some("0.500000"));
         assert_eq!(
-            answer.org.as_ref().unwrap().available_usd.as_deref(),
+            answer.org.as_ref().unwrap().available.as_deref(),
             Some("0.970000")
         );
     }
@@ -285,7 +298,11 @@ mod tests {
     #[tokio::test]
     async fn an_answer_missing_an_optional_field_still_decodes() {
         let stand_in = StandIn::start(Arc::new(|_| {
-            ok(json!({"quotas": [{"scope": "api_key"}], "effective_remaining_usd": null}))
+            ok(json!({
+                "currency": "CNY",
+                "quotas": [{"scope": "api_key"}],
+                "effective_remaining": null,
+            }))
         }))
         .await;
         let answer = stand_in
@@ -298,7 +315,7 @@ mod tests {
         assert!(answer.binding_level.is_none());
         assert!(answer.as_of.is_none());
         assert_eq!(answer.quotas[0].scope.as_deref(), Some("api_key"));
-        assert!(answer.quotas[0].limit_usd.is_none());
+        assert!(answer.quotas[0].limit.is_none());
     }
 
     /// The one field the answer exists to give is not defaulted: an answer
@@ -307,9 +324,7 @@ mod tests {
     async fn an_answer_without_its_effective_remaining_is_unavailable() {
         let stand_in = StandIn::start(Arc::new(|_| {
             let mut body = full_answer();
-            body.as_object_mut()
-                .unwrap()
-                .remove("effective_remaining_usd");
+            body.as_object_mut().unwrap().remove("effective_remaining");
             ok(body)
         }))
         .await;
@@ -317,6 +332,38 @@ mod tests {
             stand_in.client().key_quota("k-owner").await.unwrap_err(),
             AccountError::Unavailable
         );
+    }
+
+    /// The currency is not defaulted either: a figure with no unit is not an
+    /// answer. The route answers `503`, so nothing is ever shown without it.
+    #[tokio::test]
+    async fn a_quota_answer_without_its_currency_is_unavailable() {
+        // The lookup itself fails, whatever else the answer carries.
+        let stand_in = StandIn::start(Arc::new(|_| {
+            let mut body = full_answer();
+            body.as_object_mut().unwrap().remove("currency");
+            ok(body)
+        }))
+        .await;
+        assert_eq!(
+            stand_in.client().key_quota("k-owner").await.unwrap_err(),
+            AccountError::Unavailable
+        );
+
+        // And through the route, which is where a caller would read a figure.
+        let stand_in = StandIn::start(Arc::new(|_| {
+            let mut body = full_answer();
+            body.as_object_mut().unwrap().remove("currency");
+            ok(body)
+        }))
+        .await;
+        let (status, body) = get_key(router(Some(stand_in.client()), false), OWNER).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert_eq!(body["error"]["code"], "control_plane_unavailable", "{body}");
+        // No figure of the answer reached the caller.
+        for amount in ["0.970000", "0.500000", "0.470000"] {
+            assert!(!body.to_string().contains(amount), "{amount} in {body}");
+        }
     }
 
     #[tokio::test]
@@ -528,12 +575,13 @@ mod tests {
             "k-member" => ok(json!({
                 "key_id": "k-member",
                 "as_of": "2026-11-07T10:00:00Z",
+                "currency": "CNY",
                 "org": null,
                 "quotas": [{"scope": "api_key", "set_by": "member", "kind": "cumulative",
-                            "period": null, "limit_usd": "0.050000", "spend_usd": "0.030000",
-                            "remaining_usd": "0.020000", "period_start": null,
+                            "period": null, "limit": "0.050000", "spend": "0.030000",
+                            "remaining": "0.020000", "period_start": null,
                             "counted_from": "2026-11-07T09:00:00Z", "exhausted": false}],
-                "effective_remaining_usd": "0.020000",
+                "effective_remaining": "0.020000",
                 "binding_level": "key",
             })),
             "k-stranger" => (StatusCode::NOT_FOUND, "{}".to_string()),
@@ -553,26 +601,28 @@ mod tests {
             body,
             json!({"data": {
                 "as_of": "2026-11-07T10:00:00Z",
+                "currency": "CNY",
                 "balance": {
                     "billing_mode": "prepaid",
-                    "balance_usd": "0.970000",
-                    "credit_limit_usd": "0.000000",
-                    "available_usd": "0.970000",
+                    "balance": "0.970000",
+                    "credit_limit": "0.000000",
+                    "available": "0.970000",
                 },
                 "budgets": [{
                     "scope": "team", "set_by": "operator", "kind": "periodic", "period": "month",
-                    "limit_usd": "0.500000", "spend_usd": "0.030000", "remaining_usd": "0.470000",
+                    "limit": "0.500000", "spend": "0.030000", "remaining": "0.470000",
                     "period_start": "2026-11-01T00:00:00Z", "counted_from": null, "exhausted": false,
                 }],
-                "effective_remaining_usd": "0.470000",
+                "effective_remaining": "0.470000",
                 "binding_level": "organization",
             }})
         );
 
         let (status, body) = get_key(app, MEMBER).await;
         assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["data"]["currency"], "CNY", "{body}");
         assert!(body["data"].get("balance").is_none(), "{body}");
-        assert_eq!(body["data"]["effective_remaining_usd"], "0.020000");
+        assert_eq!(body["data"]["effective_remaining"], "0.020000");
         assert_eq!(body["data"]["binding_level"], "key");
         assert_eq!(
             body["data"]["budgets"][0]["counted_from"],

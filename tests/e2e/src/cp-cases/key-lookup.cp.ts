@@ -8,6 +8,7 @@ import { startSwallowRelay, type SwallowRelay } from "../harness/swallow-relay.j
 
 // E2E: a caller reads its own key's quota at every level with the key
 // itself, `GET /v1/key` on the gateway, which asks the control plane for it.
+// Every amount is CNY, under a neutral name, and the answer names it.
 // The gateway's REST link to the control plane (`cp_base_url`) runs through a
 // relay that can hold every connection; its etcd link goes straight to the
 // control plane, so configuration keeps flowing while the relay holds the
@@ -152,24 +153,60 @@ describe("a caller looks up its own quota with its API key", () => {
       async () => {
         const answer = await lookup(ko);
         last = `${answer.status} ${answer.text}`;
-        return answer.status === 200 && answer.json?.data?.balance?.available_usd === "0.970000"
+        return answer.status === 200 && answer.json?.data?.balance?.available === "0.970000"
           ? answer.json.data
           : undefined;
       },
       { timeoutMs: 5_000, intervalMs: 250, describe: () => last },
     );
-    expect(owner.effective_remaining_usd, last).toBe("0.470000");
+    expect(owner.currency, last).toBe("CNY");
+    expect(owner.effective_remaining, last).toBe("0.470000");
     expect(owner.binding_level, last).toBe("organization");
     const team = (owner.budgets as Json[]).filter((b) => b.scope === "team");
     expect(team, last).toHaveLength(1);
-    expect(team[0].limit_usd, last).toBe("0.500000");
-    expect(team[0].remaining_usd, last).toBe("0.470000");
+    expect(team[0].limit, last).toBe("0.500000");
+    expect(team[0].remaining, last).toBe("0.470000");
 
     // KM's own cap has ¥0.02 left, less than M's ¥0.17 and the organization's.
     const mine = await lookup(km);
     expect(mine.status, mine.text).toBe(200);
-    expect(mine.json.data.effective_remaining_usd, mine.text).toBe("0.020000");
+    expect(mine.json.data.effective_remaining, mine.text).toBe("0.020000");
     expect(mine.json.data.binding_level, mine.text).toBe("key");
+  });
+
+  test("/v1/key answers in CNY with neutral names", async () => {
+    const mine = await lookup(km);
+    expect(mine.status, mine.text).toBe(200);
+    const data = mine.json.data as Json;
+    // The answer says which currency its amounts are in, and every amount
+    // is named for what it is.
+    expect(data.currency, mine.text).toBe("CNY");
+    expect(Object.keys(data).sort(), mine.text).toEqual([
+      "as_of",
+      "binding_level",
+      "budgets",
+      "currency",
+      "effective_remaining",
+    ]);
+    for (const budget of data.budgets as Json[]) {
+      for (const name of ["limit", "spend", "remaining"]) {
+        expect(budget, mine.text).toHaveProperty(name);
+      }
+    }
+    for (const amount of ["0.05", "0.03", "0.02", "0.20", "0.17"]) {
+      expect(mine.text, amount).toContain(amount);
+    }
+    // No amount anywhere in the answer is named for a unit, and no figure
+    // the control plane sends under an old name reaches the caller.
+    expect(mine.text).not.toContain("_usd");
+    const owner = await lookup(ko);
+    const balance = (owner.json.data as Json).balance as Json;
+    expect(Object.keys(balance).sort(), owner.text).toEqual([
+      "available",
+      "balance",
+      "billing_mode",
+      "credit_limit",
+    ]);
   });
 
   test("A member's key sees no organization balance", async () => {
@@ -179,12 +216,12 @@ describe("a caller looks up its own quota with its API key", () => {
     const budgets = mine.json.data.budgets as Json[];
     expect(budgets.map((b) => b.scope).sort(), mine.text).toEqual(["api_key", "member"]);
     const memberQuota = budgets.find((b) => b.scope === "member");
-    expect(memberQuota.limit_usd, mine.text).toBe("0.200000");
-    expect(memberQuota.remaining_usd, mine.text).toBe("0.170000");
+    expect(memberQuota.limit, mine.text).toBe("0.200000");
+    expect(memberQuota.remaining, mine.text).toBe("0.170000");
     const keyCap = budgets.find((b) => b.scope === "api_key");
     expect(keyCap.kind, mine.text).toBe("cumulative");
-    expect(keyCap.limit_usd, mine.text).toBe("0.050000");
-    expect(keyCap.remaining_usd, mine.text).toBe("0.020000");
+    expect(keyCap.limit, mine.text).toBe("0.050000");
+    expect(keyCap.remaining, mine.text).toBe("0.020000");
   });
 
   test("Figures move after spend", async () => {
@@ -195,7 +232,7 @@ describe("a caller looks up its own quota with its API key", () => {
       async () => {
         const answer = await lookup(km);
         last = `${answer.status} ${answer.text}`;
-        return answer.json?.data?.effective_remaining_usd === "0.010000" ? true : undefined;
+        return answer.json?.data?.effective_remaining === "0.010000" ? true : undefined;
       },
       { timeoutMs: QUOTA_TTL_MS + 2_000, intervalMs: 250, describe: () => last },
     );
@@ -205,7 +242,7 @@ describe("a caller looks up its own quota with its API key", () => {
     const theirs = await lookup(tenantB.key);
     expect(theirs.status, theirs.text).toBe(200);
     // Tenant B spent nothing: its organization quota of ¥0.40 binds.
-    expect(theirs.json.data.effective_remaining_usd, theirs.text).toBe("0.400000");
+    expect(theirs.json.data.effective_remaining, theirs.text).toBe("0.400000");
     expect(theirs.json.data.binding_level, theirs.text).toBe("organization");
     // A key of no member sees no balance and no organization quota.
     expect(theirs.json.data, theirs.text).not.toHaveProperty("balance");
