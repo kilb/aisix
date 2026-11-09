@@ -55,7 +55,12 @@ pub fn tenant_fixture(method: &str, path: &str) -> (String, Option<Value>) {
         ),
         (
             "GET",
-            "/api/org" | "/api/models" | "/api/groups" | "/api/members" | "/api/members/invites",
+            "/api/org"
+            | "/api/models"
+            | "/api/groups"
+            | "/api/prices"
+            | "/api/members"
+            | "/api/members/invites",
         ) => (path.to_string(), None),
         ("POST", "/api/members/invites") => (
             path.to_string(),

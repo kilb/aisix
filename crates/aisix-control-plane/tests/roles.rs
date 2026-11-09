@@ -193,8 +193,14 @@ fn fixture(method: &str, path: &str, target: &SeededOperator) -> (String, Option
             })),
         ),
         // Price views. The tenant matches nothing: 404 once the role check
-        // passed.
+        // passed. The margin reads a window with nothing in it.
         ("GET", "/admin/pricing/models") => (path.to_string(), None),
+        ("GET", "/admin/pricing/margin") => (
+            format!(
+                "{path}?from=2026-01-01T00:00:00Z&to=2026-01-02T00:00:00Z"
+            ),
+            None,
+        ),
         ("GET", "/admin/pricing/tenants/{id}") => {
             (format!("/admin/pricing/tenants/{}", Uuid::nil()), None)
         }

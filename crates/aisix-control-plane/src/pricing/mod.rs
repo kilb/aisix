@@ -33,6 +33,7 @@
 pub mod api;
 pub mod baselines;
 pub mod import;
+pub mod margin;
 pub mod rates;
 pub mod store;
 
