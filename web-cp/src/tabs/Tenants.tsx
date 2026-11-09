@@ -894,7 +894,11 @@ function GrantsPart({
     setNote(null);
     setSent(ids);
     try {
-      await save({ model_scope: scope, allowed_model_ids: ids });
+      // Under `all` the list is not a grant and must not be sent with it: the
+      // control plane refuses the two together, so a save there would answer
+      // 422 for a scope that needs no list at all. The stored list stays as it
+      // is, which is what a later narrowing goes back to.
+      await save(all ? { model_scope: scope } : { model_scope: scope, allowed_model_ids: ids });
       setNote({ kind: "ok", text: "已保存授权。" });
     } catch (e) {
       setRefused(refusal(e, (p) => /^\/allowed_model_ids\/\d+$/.test(p)));

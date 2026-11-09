@@ -527,6 +527,27 @@ test("撤销授权要先确认：确认前不保存，确认后该模型从授�
   expect((await stack.admin.get(`/admin/tenants/${t.id}`)).allowed_model_ids).toEqual([models.other.id]);
 });
 
+test("改回全部公共模型后保存成功，范围是 all 且不再带模型列表", async ({ page }) => {
+  // A tenant on a list, which is the state the scope can be widened from. The
+  // save under `all` sends no list: the control plane refuses the two
+  // together, so sending one answers 422 and the scope never moves.
+  const t = await signUpActive("T5 Widen Co 9c7", "owner@widen-t5.test", [models.chat]);
+
+  await openTenants(page);
+  await openTenant(page, t.org);
+  const grants = page.getByRole("group", { name: "授权模型" });
+  await expect(grants.getByRole("radio", { name: "指定模型" })).toBeChecked();
+  await grants.getByRole("radio", { name: "全部公共模型" }).check();
+  await grants.getByRole("button", { name: "保存授权" }).click();
+  await expect(grants).toContainText("已保存授权");
+
+  const stored = await stack.admin.get(`/admin/tenants/${t.id}`);
+  expect(stored.model_scope).toBe("all");
+  // The stored selection is what a later narrowing returns to, not a grant
+  // the all scope carries.
+  expect(stored.allowed_model_ids).toEqual([models.chat.id]);
+});
+
 test("刷新后列出页面打开后才注册的租户", async ({ page }) => {
   await openTenants(page);
   await expect(tenantRow(page, "平台内部")).toHaveCount(1);
