@@ -146,7 +146,10 @@ export function Providers({ canEdit }: TabProps) {
   }
 
   const editing = open?.mode === "edit" ? pk.items?.find((a) => a.id === open.id) : undefined;
-  const choices = groupChoices(groups.data);
+  // The stored names are offered too: a group retired since the account was
+  // saved must still be listed, so it can be taken away.
+  const newChoices = groupChoices(groups.data, open?.mode === "new" ? open.groups : []);
+  const editChoices = groupChoices(groups.data, editing?.doc.groups ?? []);
 
   return (
     <>
@@ -156,7 +159,7 @@ export function Providers({ canEdit }: TabProps) {
           account={null}
           initialGroups={open.groups}
           groupsNote={open.groupsNote}
-          choices={choices}
+          choices={newChoices}
           groupsError={groups.error}
           schema={schema}
           readOnly={false}
@@ -174,7 +177,7 @@ export function Providers({ canEdit }: TabProps) {
           account={editing}
           initialGroups={[]}
           groupsNote={null}
-          choices={choices}
+          choices={editChoices}
           groupsError={groups.error}
           schema={schema}
           readOnly={!canEdit}
