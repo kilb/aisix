@@ -281,6 +281,8 @@ pub const ROUTE_ROLES: &[(&str, &str, MinRole)] = &[
     ("GET", "/api/models", MinRole::Member(EVERY_MEMBER)),
     // The groups a tenant may choose a key's group from, by display name.
     ("GET", "/api/groups", MinRole::Member(EVERY_MEMBER)),
+    // What each of a tenant's groups charges, in CNY per million tokens.
+    ("GET", "/api/prices", MinRole::Member(EVERY_MEMBER)),
     ("GET", "/api/members", MinRole::Member(MANAGERS)),
     ("GET", "/api/members/invites", MinRole::Member(MANAGERS)),
     ("POST", "/api/members/invites", MinRole::Member(MANAGERS)),
@@ -367,6 +369,12 @@ pub const ROUTE_ROLES: &[(&str, &str, MinRole)] = &[
     (
         "GET",
         "/admin/pricing/tenants/{id}",
+        MinRole::Op(OperatorRole::Viewer),
+    ),
+    // What each group charged against what its upstream cost, per model.
+    (
+        "GET",
+        "/admin/pricing/margin",
         MinRole::Op(OperatorRole::Viewer),
     ),
     // Billing accounts: balances and credit limits.
@@ -615,7 +623,7 @@ pub const ROUTE_ROLES: &[(&str, &str, MinRole)] = &[
 ];
 
 /// Every tenant role.
-const EVERY_MEMBER: &[MemberRole] = &[
+pub(crate) const EVERY_MEMBER: &[MemberRole] = &[
     MemberRole::Owner,
     MemberRole::Admin,
     MemberRole::Member,
@@ -733,6 +741,7 @@ pub fn browser_router(state: AppState) -> Router {
         .route("/api/org", get(members::org))
         .route("/api/models", get(members::models))
         .route("/api/groups", get(groups::tenant_groups))
+        .route("/api/prices", get(billing::tenant_prices::prices))
         .route("/api/members", get(members::list))
         .route(
             "/api/members/invites",
@@ -764,6 +773,7 @@ pub fn browser_router(state: AppState) -> Router {
         .route("/admin/pricing/status", get(pricing::api::status))
         .route("/admin/pricing/models", get(billing::plans::models))
         .route("/admin/pricing/tenants/{id}", get(billing::plans::tenant))
+        .route("/admin/pricing/margin", get(pricing::margin::list))
         .route("/admin/billing/accounts", get(billing::accounts::list))
         .route(
             "/admin/tenants/{id}/billing",
@@ -1042,12 +1052,13 @@ async fn healthz() -> Json<Value> {
 mod tests {
     use std::path::Path;
 
-    use super::{MinRole, INACTIVE_TENANT_ROUTES, ROUTE_ROLES};
+    use super::{MinRole, EVERY_MEMBER, INACTIVE_TENANT_ROUTES, ROUTE_ROLES};
     use crate::auth::{MemberRole, KEY_HOLDERS};
 
     /// The role lists a handler may name in `.require(..)` instead of
     /// spelling the roles out, by the name it uses.
-    const NAMED_ROLE_LISTS: &[(&str, &[MemberRole])] = &[("KEY_HOLDERS", KEY_HOLDERS)];
+    const NAMED_ROLE_LISTS: &[(&str, &[MemberRole])] =
+        &[("KEY_HOLDERS", KEY_HOLDERS), ("EVERY_MEMBER", EVERY_MEMBER)];
 
     /// The part of `src` before its test module.
     fn production(src: &str) -> &str {

@@ -24,6 +24,7 @@ use serde_json::{json, Map, Value};
 use sqlx::{Postgres, QueryBuilder};
 use uuid::Uuid;
 
+use super::margin;
 use super::store::{self, CostRevision, DiscountRevision, NewCostPrice, NewDiscount};
 use crate::audit::Actor;
 use crate::auth::{OperatorAuth, OperatorRole};
@@ -403,6 +404,10 @@ struct ChargeRow {
     warnings: Value,
     engine_version: i64,
     priced_at: DateTime<Utc>,
+    /// Not a column: the charge's realised rate, filled from its own two
+    /// amounts by [`list_charges`].
+    #[sqlx(skip)]
+    realised_cny_per_usd: Option<String>,
 }
 
 /// `GET /admin/pricing/charges` → `{items: [Charge], next_before}`: the
@@ -410,6 +415,10 @@ struct ChargeRow {
 /// `tenant_id` and `api_key_id`, newest first by `seq`, paged as
 /// [`crate::usage::list_events`] is. A charge's tenant and member are the
 /// ones its key belongs to, never what its usage row claims.
+///
+/// Each charge carries `realised_cny_per_usd`, the CNY it charged per USD
+/// its row cost ([`margin::realised`]): `null` when the row's cost is
+/// unknown, never 0.
 pub async fn list_charges(
     auth: OperatorAuth,
     State(state): State<AppState>,
@@ -448,11 +457,17 @@ pub async fn list_charges(
         sql.push(" AND api_key_id = ").push_bind(api_key_id);
     }
     sql.push(" ORDER BY seq DESC LIMIT ").push_bind(limit + 1);
-    let rows: Vec<ChargeRow> = sql
+    let mut rows: Vec<ChargeRow> = sql
         .build_query_as()
         .fetch_all(state.db.pool())
         .await
         .map_err(DbError::from)?;
+    for row in &mut rows {
+        row.realised_cny_per_usd = row
+            .charge_micro_cny
+            .zip(row.cost_micro_usd)
+            .and_then(|(charged, cost)| margin::realised(charged, cost));
+    }
     let (items, next_before) = page(rows, limit, |r| r.seq);
     Ok(Json(json!({ "items": items, "next_before": next_before })))
 }
