@@ -1,7 +1,7 @@
 // Shared: web-cp/src/ui and web-tenant/src/ui carry byte-equal copies of
 // this file, pinned by web-tenant/src/lib/tokenParity.test.ts; change both
 // together. The contract is in CONTRACT.md beside it.
-import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
+import { useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { Button } from "./Button";
 
 const SWAP_MS = 120;
@@ -75,8 +75,10 @@ export function TwoStep({
     setAsking(next);
   }
 
-  // The confirmed request has ended, or never started: the step closes.
-  useEffect(() => {
+  // The confirmed request has ended, or never started: the step closes, in
+  // the same commit that ends it, so the page is never seen with the step's
+  // warning still up beside what the page shows of the outcome.
+  useLayoutEffect(() => {
     if (!confirmed || busy) return;
     setConfirmed(false);
     swap(false, held.current);

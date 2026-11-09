@@ -541,6 +541,41 @@ test("两个运维同时操作同一密钥：后操作的被拒并提示重新�
   expect([stored.label, stored.disabled]).toEqual(["race-key-t6-renamed", false]);
 });
 
+test("被拒的停用在慢机器上：拒绝提示出现时确认步骤已收起，两者从不同时出现", async ({ page }) => {
+  const t = await signUpActive("T6 Slow Race Co 7e4", "owner@slow-race-t6.test", [models.chat]);
+  const { key } = await mint(t, "slow-race-key-t6");
+
+  await openKeys(page, t.org);
+  const row = keyRow(page, "slow-race-key-t6");
+  await expect(row).toContainText("正常");
+  const current = await stack.admin.request("GET", `/admin/keys/${key.id}`);
+  await stack.admin.patch(`/admin/keys/${key.id}`, { label: "slow-race-key-t6-renamed" }, current.version!);
+
+  await row.getByRole("button", { name: "停用" }).click();
+  // Every state the row passes through, not only the ones a poll lands on:
+  // the number of alerts in it after each change to the page.
+  await page.evaluate(() => {
+    const seen: number[] = [];
+    (window as unknown as { alertsSeen: number[] }).alertsSeen = seen;
+    new MutationObserver(() => {
+      const tr = [...document.querySelectorAll("tr")].find((r) => r.textContent?.includes("slow-race-key-t6"));
+      if (tr) seen.push(tr.querySelectorAll('[role="alert"]').length);
+    }).observe(document.body, { subtree: true, childList: true, attributes: true, characterData: true });
+  });
+  // A slow machine: the page's work after the refusal spans more than one task.
+  const cdp = await page.context().newCDPSession(page);
+  await cdp.send("Emulation.setCPUThrottlingRate", { rate: 20 });
+  await row.getByRole("button", { name: "确认停用" }).click();
+  await expect(row.getByText("该资源已被他人修改")).toBeVisible();
+  await cdp.send("Emulation.setCPUThrottlingRate", { rate: 1 });
+
+  const seen = await page.evaluate(() => (window as unknown as { alertsSeen: number[] }).alertsSeen);
+  expect(Math.max(...seen), `alerts in the row after each change: ${seen.join(",")}`).toBe(1);
+  await expect(row.getByRole("alert")).toHaveCount(1);
+  await expect(row.getByRole("alert")).toContainText("该资源已被他人修改");
+  expect((await stack.admin.get(`/admin/keys/${key.id}`)).disabled).toBe(false);
+});
+
 test("选择分组打开期间另一位运维设了它：刷新后再保存被拒，另一位的修改保留", async ({ page }) => {
   const t = await signUpActive("T6 Override Race Co 2d8", "owner@orace-t6.test", [models.chat]);
   const current = await stack.admin.get(`/admin/tenants/${t.id}`);
