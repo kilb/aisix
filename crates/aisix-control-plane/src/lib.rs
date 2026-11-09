@@ -239,6 +239,22 @@ where
         stale_secs: gateways::stale_window_secs(&cfg),
     };
     tenants::ensure_internal_tenant(&db, &write_ctx).await?;
+    // Grants of a channel's generated direct model an older release stored.
+    // One left behind does not stop the boot: the next boot tries again.
+    let withdrawn = tenants::withdraw_generated_direct_grants(&db, &write_ctx)
+        .await
+        .map_err(|e| BootError::GeneratedGrants(format!("{}: {}", e.code, e.message)))?;
+    if withdrawn != tenants::GeneratedGrantsWithdrawn::default() {
+        tracing::warn!(
+            grants = withdrawn.grants,
+            key_selections = withdrawn.selections,
+            deferred = withdrawn.deferred,
+            failed = withdrawn.failed,
+            "withdrew the tenant grants of channels' generated direct models, which no tenant \
+             may hold; the tenants keep the public models (deferred and failed ones are tried \
+             again at the next boot)"
+        );
+    }
     // Keys an older release wrote. A tenant left behind, whatever the reason,
     // is tried again by every housekeeping tick, so it does not stop the
     // boot: refusing to start would only stop the control plane serving

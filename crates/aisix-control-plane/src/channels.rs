@@ -130,6 +130,25 @@ pub fn direct_display_name(public_name: &str, provider_key_display_name: &str) -
     format!("{public_name}#{provider_key_display_name}")
 }
 
+/// Whether `model_id` is the direct document a public model generated for
+/// one serving account (`channel_models.direct_model_id`), live or not.
+///
+/// Such a document is granted and priced only through its public model, and
+/// this is the one test for it: a tenant grant ([`crate::tenants`]), a
+/// baseline ([`crate::pricing::baselines`]) and a group rate
+/// ([`crate::pricing::rates`]) each refuse one, and the baseline and rate
+/// lists leave it out. A charge keys on the model the caller addressed,
+/// which is the public model, so a price written on the direct document
+/// prices nothing; and its name carries the account's.
+pub async fn is_generated_direct(conn: &mut PgConnection, model_id: Uuid) -> Result<bool, DbError> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM channel_models WHERE direct_model_id = $1)",
+    )
+    .bind(model_id)
+    .fetch_one(conn)
+    .await?)
+}
+
 /// The direct model document for one channel model.
 ///
 /// `provider` and `provider_key_id` come from the account's own document;

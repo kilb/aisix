@@ -15,6 +15,7 @@ import {
 } from "../../lib/api";
 import { messageFor, problemAt } from "../../lib/errors";
 import { errorText } from "../../lib/fmt";
+import { generatedDirect } from "../../lib/generatedDirect";
 import { COMPARED_DIMENSIONS, datasetNotes, flagText, statusText, unshownParts } from "../../lib/importReview";
 import { fmtUtc } from "../../lib/money";
 import { safeHttpUrl } from "../../lib/safeUrl";
@@ -827,11 +828,14 @@ function ConfirmForm({
         {(aria) => (
           <select {...aria} value={model} onChange={(e) => setModel(e.target.value)}>
             <option value="">请选择</option>
-            {models.map((m) => (
-              <option key={m.id} value={m.id}>
-                {m.doc.display_name || m.id}
-              </option>
-            ))}
+            {/* A channel's generated direct document is priced through its public model. */}
+            {models
+              .filter((m) => !generatedDirect(m))
+              .map((m) => (
+                <option key={m.id} value={m.id}>
+                  {m.doc.display_name || m.id}
+                </option>
+              ))}
           </select>
         )}
       </Field>

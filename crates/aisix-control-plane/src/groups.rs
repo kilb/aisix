@@ -988,7 +988,8 @@ pub async fn make_default(
 }
 
 /// `GET /admin/provider-groups/{id}/rates` → `{group, default, models:
-/// [{model_id, name, rate}]}`, over every live model.
+/// [{model_id, name, rate}]}`, over every live model but a channel's
+/// generated direct document, which is priced through its public model.
 pub async fn list_rates(
     auth: OperatorAuth,
     State(state): State<AppState>,
@@ -1015,6 +1016,12 @@ pub async fn list_rates(
                 .map_err(DbError::from)?;
                 let mut items = Vec::with_capacity(models.len());
                 for (model_id, name) in models {
+                    // A channel's generated direct document takes no rate of
+                    // its own (`rates::insert_group_rate`), so it is not
+                    // offered one.
+                    if crate::channels::is_generated_direct(&mut *conn, model_id).await? {
+                        continue;
+                    }
                     let rate = rates::rate_plan(&mut *conn, id, Some(model_id)).await?;
                     items.push(json!({"model_id": model_id, "name": name, "rate": rate}));
                 }

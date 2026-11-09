@@ -217,6 +217,23 @@ test("为模型设置覆盖换算率后显示 ¥/百万 tokens，结束覆盖后
   await expect(back.getByRole("button", { name: "结束覆盖", exact: true })).toHaveCount(0);
 });
 
+test("公共模型在分组换算率里可设置覆盖，它为上游账号生成的直连模型不列出", async ({ page }) => {
+  const group = await newGroup("7.2");
+  const account = await newAccount(group);
+  const publicName = `pub-gp-${randomUUID().slice(0, 8)}`;
+  const pub = await stack.admin.post("/admin/public-models", { name: publicName });
+  await stack.admin.put(`/admin/provider-keys/${account}/channel-models/${pub.id}`, {});
+  await openGroups(page);
+  await openDetail(page, group.display_name as string);
+
+  // One row carries the public model's name: its own, which takes an
+  // override. None carries it with an account after it.
+  const rows = page.getByRole("table", { name: "分组换算率" }).getByRole("row");
+  await expect(rows.filter({ hasText: publicName })).toHaveCount(1);
+  await expect(rows.filter({ hasText: `${publicName}#` })).toHaveCount(0);
+  await expect(modelRow(page, publicName).getByRole("button", { name: "设置覆盖", exact: true })).toBeVisible();
+});
+
 test("换算率 0 需要二次确认", async ({ page }) => {
   const suffix = randomUUID().slice(0, 8);
   const routing = `grp-free-${suffix}`;

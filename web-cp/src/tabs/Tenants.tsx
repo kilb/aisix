@@ -23,6 +23,7 @@ import {
   type TenantLimits,
 } from "../lib/api";
 import { messageFor } from "../lib/errors";
+import { generatedDirect } from "../lib/generatedDirect";
 import { errorText, fmtInt, fmtTime } from "../lib/fmt";
 import { Button } from "../ui/Button";
 import { useRefusalFocus } from "../ui/Field";
@@ -96,17 +97,6 @@ interface ModelDoc {
 /** A model a customer tenant cannot be granted: a wildcard row or an ensemble. */
 function ungrantable(doc: ModelDoc): boolean {
   return (doc.display_name ?? "").includes("*") || (doc.ensemble !== undefined && doc.ensemble !== null);
-}
-
-/**
- * A direct document a public model generated for one serving account: owned
- * by that public model (`public:<its id>`) and at an id other than its own,
- * which is the routing document's. No tenant may be granted one — its name
- * carries the account's — so the picker never offers it; the public model is
- * what is granted.
- */
-function generatedDirect(m: ResourceView<ModelDoc>): boolean {
-  return m.managed_by !== null && m.managed_by.startsWith("public:") && m.managed_by !== `public:${m.id}`;
 }
 
 /**

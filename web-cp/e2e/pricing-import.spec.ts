@@ -156,6 +156,47 @@ test("确认后在基准价页显示第三方数据来源与确认人", async ({
   await expect(baseline).toContainText(stack.operator.email);
 });
 
+test("上游账号经公共模型提供的条目，确认表单预选公共模型，不出现账号名", async ({ page }) => {
+  // An upstream account serving a public model under the entry's own upstream
+  // name. Tenants call the public model, so that is what the price is for.
+  const suffix = randomUUID().slice(0, 8);
+  const account = await stack.admin.post("/admin/resources/provider_keys", {
+    doc: {
+      display_name: `acct-imp-${suffix}`,
+      provider: "openai",
+      api_key: `sk-acct-imp-${suffix}`,
+      api_base: `${stack.mockUpstreamUrl}/v1`,
+      groups: ["shared"],
+    },
+  });
+  const publicName = `pub-imp-${suffix}`;
+  const pub = await stack.admin.post("/admin/public-models", { name: publicName });
+  await stack.admin.put(`/admin/provider-keys/${account.id}/channel-models/${pub.id}`, { upstream_model: "gpt-3.5-turbo-16k" });
+  await openImports(page);
+  await upload(page);
+
+  const panel = await openProposal(page, "openai/gpt-3.5-turbo-16k");
+  const select = panel.getByLabel("模型");
+  await expect(select).toHaveValue(pub.id);
+  await expect(select.locator("option:checked")).toHaveText(publicName);
+  // No choice the form offers names an upstream account.
+  await expect(select.locator("option", { hasText: "#acct-" })).toHaveCount(0);
+
+  await panel.getByRole("checkbox", { name: "已对照官方价格页核对" }).check();
+  await panel.getByRole("button", { name: "确认", exact: true }).click();
+  await expect(page.locator(".toast").filter({ hasText: "已确认" }).first()).toBeVisible();
+
+  // The baseline page lists the public model, priced, and no row that names
+  // the account.
+  await page.getByRole("group", { name: "价格分区" }).getByRole("button", { name: "基准价", exact: true }).click();
+  const rows = page.getByRole("table", { name: "基准价" }).getByRole("row");
+  await expect(rows.filter({ has: page.getByRole("button", { name: publicName, exact: true }) })).toHaveAttribute(
+    "data-state",
+    "priced",
+  );
+  await expect(rows.filter({ hasText: `#acct-imp-${suffix}` })).toHaveCount(0);
+});
+
 test("带标记的提议不能确认，只提供手动录入入口", async ({ page }) => {
   await openImports(page);
   await upload(page);

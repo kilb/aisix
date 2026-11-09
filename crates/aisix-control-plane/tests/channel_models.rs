@@ -960,6 +960,281 @@ async fn a_channels_direct_document_takes_no_baseline() {
         )
         .await;
     assert_eq!(r.status, 201, "{r:?}");
+
+    // And the baseline list offers the public model, never the direct
+    // document a baseline cannot be written on.
+    let r = cp
+        .send("GET", "/admin/pricing/baselines", Some(op.cookie()), None)
+        .await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let listed: Vec<&str> = r.body["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .filter_map(|i| i["model_id"].as_str())
+        .collect();
+    assert!(listed.contains(&public.to_string().as_str()), "{r:?}");
+    assert!(!listed.contains(&direct.to_string().as_str()), "{r:?}");
+}
+
+/// A group rate is the public model's too: a charge reads the rate of the
+/// model the caller addressed, so an override written on the direct document
+/// a channel row generated would never apply. It is refused at `/model_id`,
+/// naming what to set instead, and the group's rate list does not offer the
+/// direct document.
+#[tokio::test]
+async fn a_channels_direct_document_takes_no_group_rate() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let op = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let key = provider_key(&cp, &op, "acct-gp-5dc").await;
+    let (public, _) = create_public(&cp, &op, "pub-rate-8c1").await;
+    let r = put_channel(&cp, &op, key, public, json!({})).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let direct = direct_of(&cp, key, public).await;
+    assert!(
+        is_live(&cp, Kind::Models, direct).await,
+        "the direct document is live"
+    );
+    let shared: Uuid = sqlx::query_scalar("SELECT id FROM provider_groups WHERE name = 'shared'")
+        .fetch_one(cp.db().pool())
+        .await
+        .expect("the first-boot group");
+
+    let now = support::world::db_now(&cp).await;
+    let rate = |model: Uuid| json!({"model_id": model, "cny_per_usd": "6", "effective_from": now});
+    let path = format!("/admin/provider-groups/{shared}/rates");
+    let r = cp
+        .send("POST", &path, Some(op.cookie()), Some(rate(direct)))
+        .await;
+    assert_422_at(&r, "/model_id");
+    assert_eq!(
+        message_at(&r, "/model_id"),
+        Some("该模型由公共模型生成，请为公共模型设置换算率"),
+        "{r:?}"
+    );
+    let written: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM pricing_group_rates WHERE model_id = $1")
+            .bind(direct)
+            .fetch_one(cp.db().pool())
+            .await
+            .expect("count the direct document's rates");
+    assert_eq!(written, 0);
+
+    // The public model is what takes the override.
+    let r = cp
+        .send("POST", &path, Some(op.cookie()), Some(rate(public)))
+        .await;
+    assert_eq!(r.status, 201, "{r:?}");
+
+    let r = cp.send("GET", &path, Some(op.cookie()), None).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let listed: Vec<&str> = r.body["models"]
+        .as_array()
+        .expect("models")
+        .iter()
+        .filter_map(|m| m["model_id"].as_str())
+        .collect();
+    assert!(listed.contains(&public.to_string().as_str()), "{r:?}");
+    assert!(!listed.contains(&direct.to_string().as_str()), "{r:?}");
+}
+
+/// A grant of a channel's direct document stored before grants of one were
+/// refused, on the tenant or on a key's selection, is withdrawn by the next
+/// boot, and the key documents are rewritten without it. The public model
+/// stays granted. A later boot finds nothing to withdraw and rewrites
+/// nothing.
+#[tokio::test]
+async fn a_stored_grant_of_a_channels_direct_document_is_withdrawn_at_boot() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let op = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let key = provider_key(&cp, &op, "acct-gp-5dd").await;
+    let (public, _) = create_public(&cp, &op, "pub-sweep-8c1").await;
+    let r = put_channel(&cp, &op, key, public, json!({})).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let direct = direct_of(&cp, key, public).await;
+    let shared: Uuid = sqlx::query_scalar("SELECT id FROM provider_groups WHERE name = 'shared'")
+        .fetch_one(cp.db().pool())
+        .await
+        .expect("the first-boot group");
+
+    // A tenant granted the public model, with one key that follows every
+    // grant and one that selects the public model.
+    let tenant = tenant_granted(&cp, &op, &[public]).await;
+    let mut keys = Vec::new();
+    for body in [
+        json!({"label": "follows-8c1", "group_id": shared}),
+        json!({"label": "selects-8c1", "group_id": shared, "model_ids": [public]}),
+    ] {
+        let r = cp
+            .send(
+                "POST",
+                &format!("/admin/tenants/{tenant}/keys"),
+                Some(op.cookie()),
+                Some(body),
+            )
+            .await;
+        assert_eq!(r.status, 201, "{r:?}");
+        keys.push(
+            Uuid::parse_str(r.body["key"]["id"].as_str().expect("a key id")).expect("a uuid"),
+        );
+    }
+
+    // What a release before the refusal could store: the direct document
+    // granted beside the public model, and selected by the second key. The
+    // API refuses both now, so they are written as that release left them.
+    sqlx::query("UPDATE tenants SET allowed_model_ids = allowed_model_ids || $2 WHERE id = $1")
+        .bind(tenant)
+        .bind(vec![direct])
+        .execute(cp.db().pool())
+        .await
+        .expect("seed the grant");
+    sqlx::query("UPDATE tenant_keys SET model_ids = model_ids || $2 WHERE id = $1")
+        .bind(keys[1])
+        .bind(vec![direct])
+        .execute(cp.db().pool())
+        .await
+        .expect("seed the selection");
+    // A rename re-projects the tenant's keys from its rows, as that release
+    // did after the grant: both key documents now name the direct document.
+    let current = cp
+        .send(
+            "GET",
+            &format!("/admin/tenants/{tenant}"),
+            Some(op.cookie()),
+            None,
+        )
+        .await;
+    let version = current.body["version"].as_i64().expect("a version");
+    let r = send_conditional(
+        &cp,
+        "PATCH",
+        &format!("/admin/tenants/{tenant}"),
+        op.cookie(),
+        version,
+        Some(json!({"name": format!("swept-{}", Uuid::new_v4().simple())})),
+    )
+    .await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let names = |doc: &Value, model: Uuid| -> bool {
+        doc["allowed_model_ids"]
+            .as_array()
+            .is_some_and(|ids| ids.iter().any(|id| id == &json!(model.to_string())))
+    };
+    for k in &keys {
+        let doc = live(&cp, Kind::ApiKeys, *k).await;
+        assert!(names(&doc, direct), "before the boot, {k} names it: {doc}");
+    }
+
+    let booted = cp.restart().await;
+    assert_eq!(grants(&booted, tenant).await, vec![public]);
+    let selection: Option<Vec<Uuid>> =
+        sqlx::query_scalar("SELECT model_ids FROM tenant_keys WHERE id = $1")
+            .bind(keys[1])
+            .fetch_one(booted.db().pool())
+            .await
+            .expect("read the key");
+    assert_eq!(selection, Some(vec![public]));
+    for k in &keys {
+        let doc = live(&booted, Kind::ApiKeys, *k).await;
+        assert!(!names(&doc, direct), "{k} no longer names it: {doc}");
+        assert!(
+            names(&doc, public),
+            "{k} still names the public model: {doc}"
+        );
+    }
+
+    // Idempotent: a second boot finds no such grant and touches no row.
+    let versions = |pool: sqlx::PgPool| async move {
+        let tenant_version: i64 = sqlx::query_scalar("SELECT version FROM tenants WHERE id = $1")
+            .bind(tenant)
+            .fetch_one(&pool)
+            .await
+            .expect("read the tenant");
+        let key_versions: Vec<i64> =
+            sqlx::query_scalar("SELECT version FROM tenant_keys WHERE tenant_id = $1 ORDER BY id")
+                .bind(tenant)
+                .fetch_all(&pool)
+                .await
+                .expect("read the keys");
+        (tenant_version, key_versions)
+    };
+    let before = versions(booted.db().pool().clone()).await;
+    let again = booted.restart().await;
+    assert_eq!(versions(again.db().pool().clone()).await, before);
+    assert_eq!(grants(&again, tenant).await, vec![public]);
+}
+
+/// The boot's withdrawal takes each holder's row before the resources lock,
+/// as a model delete does: while a holder is held elsewhere, the boot waits
+/// for it holding no resources lock, and withdraws the grant once it is
+/// free.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_boot_withdrawal_takes_the_tenant_before_the_resources_lock() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let op = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let key = provider_key(&cp, &op, "acct-gp-5de").await;
+    let (public, _) = create_public(&cp, &op, "pub-sweep-order-8c1").await;
+    let r = put_channel(&cp, &op, key, public, json!({})).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let direct = direct_of(&cp, key, public).await;
+    let tenant = tenant_granted(&cp, &op, &[public]).await;
+    sqlx::query("UPDATE tenants SET allowed_model_ids = allowed_model_ids || $2 WHERE id = $1")
+        .bind(tenant)
+        .bind(vec![direct])
+        .execute(cp.db().pool())
+        .await
+        .expect("seed the grant");
+
+    let mut holder = cp.db().pool().begin().await.expect("begin");
+    sqlx::query("SELECT 1 FROM tenants WHERE id = $1 FOR UPDATE")
+        .bind(tenant)
+        .execute(&mut *holder)
+        .await
+        .expect("hold the tenant");
+    let pool = cp.db().pool().clone();
+    // Polled beside the boot, on this task: once the boot waits for the
+    // tenant, whether the resources lock is free; then the tenant is let go.
+    let watch = async move {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let waiting: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM pg_stat_activity \
+                 WHERE datname = current_database() AND wait_event_type = 'Lock')",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("read the waiters");
+            if waiting {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the boot never waited for the held tenant"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let mut probe = pool.begin().await.expect("begin");
+        let free: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1)")
+            .bind(RESOURCES_LOCK_KEY)
+            .fetch_one(&mut *probe)
+            .await
+            .expect("try the resources lock");
+        probe.rollback().await.expect("end the probe");
+        holder.rollback().await.expect("release the tenant");
+        free
+    };
+    let (booted, free) = tokio::join!(cp.restart(), watch);
+    assert!(
+        free,
+        "the boot held the resources lock while it waited for the tenant"
+    );
+    assert_eq!(grants(&booted, tenant).await, vec![public]);
 }
 
 #[tokio::test]

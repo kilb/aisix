@@ -284,14 +284,7 @@ async fn write_row(
     // A channel's generated direct document is priced through its public
     // model: charges key on the public model's id, so a baseline written on
     // the direct document would price nothing.
-    let generated: bool = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM channel_models WHERE direct_model_id = $1)",
-    )
-    .bind(row.model_id)
-    .fetch_one(&mut *conn)
-    .await
-    .map_err(DbError::from)?;
-    if generated {
+    if crate::channels::is_generated_direct(&mut *conn, row.model_id).await? {
         return Err(refused(
             "/model_id",
             "该模型由公共模型生成，请为公共模型设置基准价",
@@ -573,9 +566,10 @@ struct BaselineItem {
 
 /// `GET /admin/pricing/baselines` → `{items: [BaselineItem]}`: every live
 /// model's baseline in force now, the ones scheduled after it, and the
-/// catalogue's update to it, if any ([`catalogue_update`]). The models with
-/// no baseline in force come first, each group by name. Read in one
-/// transaction, so every item shares one `now()`.
+/// catalogue's update to it, if any ([`catalogue_update`]). A channel's
+/// generated direct document is left out: it is priced through its public
+/// model. The models with no baseline in force come first, each group by
+/// name. Read in one transaction, so every item shares one `now()`.
 pub async fn list(
     auth: OperatorAuth,
     State(state): State<AppState>,
@@ -589,7 +583,7 @@ pub async fn list(
                 let now: DateTime<Utc> = sqlx::query_scalar("SELECT now()")
                     .fetch_one(&mut *conn)
                     .await?;
-                let models: Vec<(Uuid, String)> = sqlx::query_as(
+                let live: Vec<(Uuid, String)> = sqlx::query_as(
                     "SELECT id, COALESCE(doc->>'display_name', '') FROM gw_resources \
                      WHERE kind = $1 AND NOT deleted \
                      ORDER BY 2, 1",
@@ -597,6 +591,14 @@ pub async fn list(
                 .bind(Kind::Models.segment())
                 .fetch_all(&mut *conn)
                 .await?;
+                // A channel's generated direct document takes no baseline
+                // (`write_row`), so it is not offered one.
+                let mut models = Vec::with_capacity(live.len());
+                for (id, name) in live {
+                    if !crate::channels::is_generated_direct(&mut *conn, id).await? {
+                        models.push((id, name));
+                    }
+                }
                 let ids: Vec<Uuid> = models.iter().map(|(id, _)| *id).collect();
                 let mut current: HashMap<Uuid, BaselineRevision> =
                     current_baselines(&mut *conn, &ids)

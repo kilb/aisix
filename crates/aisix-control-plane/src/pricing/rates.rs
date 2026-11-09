@@ -190,7 +190,8 @@ pub async fn rate_in_force(
 /// Writes a rate revision starting at `row.effective_from`, refusing with:
 /// `409 group_retired` for a retired group;
 /// `422 /effective_from` for one that starts in the past;
-/// `422 /model_id` for a model that is not live;
+/// `422 /model_id` for a model that is not live, and for a channel's
+/// generated direct document, which is priced through its public model;
 /// `422 /cny_per_usd` for a default row with no rate, and one above the cap
 /// or with more than four decimals.
 ///
@@ -226,6 +227,15 @@ pub async fn insert_group_rate(
         .map_err(DbError::from)?;
         if !live {
             return Err(refused("/model_id", "模型不存在"));
+        }
+        // A charge reads the rate of the model the caller addressed, which
+        // for a channel's generated direct document is its public model, so
+        // an override written on the direct document would never apply.
+        if crate::channels::is_generated_direct(&mut *conn, model_id).await? {
+            return Err(refused(
+                "/model_id",
+                "该模型由公共模型生成，请为公共模型设置换算率",
+            ));
         }
     } else if row.cny_per_usd.is_none() {
         return Err(refused("/cny_per_usd", "默认换算率不能为空"));

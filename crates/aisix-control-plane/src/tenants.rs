@@ -867,6 +867,107 @@ pub async fn on_model_deleted(
     Ok(())
 }
 
+/// What one [`withdraw_generated_direct_grants`] did, in counts only.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GeneratedGrantsWithdrawn {
+    /// Tenant grants withdrawn.
+    pub grants: u64,
+    /// Live keys' selections withdrawn.
+    pub selections: u64,
+    /// Documents the gateway-version gate refused, or whose holders stayed
+    /// busy past the lock timeout, left for the next boot.
+    pub deferred: u64,
+    /// Documents whose withdrawal failed for another reason; the next boot
+    /// tries them again.
+    pub failed: u64,
+}
+
+/// Withdraws every tenant grant and live key selection that names a
+/// channel's generated direct document, which no tenant may hold
+/// ([`checked_grants`]) but a release before that refusal could store. Run
+/// at boot, once the database is migrated.
+///
+/// Each document is withdrawn exactly as a model delete withdraws one
+/// ([`on_model_deleted`]): its holders are locked before the resources lock
+/// and re-projected without their marks, so every key document that named
+/// it is rewritten through `write_resource`, in a transaction of its own.
+/// That transaction takes the boot lock first, so instances booting
+/// together withdraw each grant once. Idempotent: once withdrawn nothing
+/// names the document, and a fresh database holds no such grant.
+///
+/// A document the gateway-version gate refuses, or one whose holders stay
+/// busy, is left for the next boot, and so is one that fails otherwise: the
+/// grant stays as it was, which is what the gateways already serve, so
+/// none of it stops the boot.
+pub async fn withdraw_generated_direct_grants(
+    db: &Db,
+    ctx: &WriteCtx,
+) -> Result<GeneratedGrantsWithdrawn, ApiError> {
+    let held: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT cm.direct_model_id FROM channel_models cm \
+         WHERE EXISTS (SELECT 1 FROM tenants t WHERE cm.direct_model_id = ANY(t.allowed_model_ids)) \
+            OR EXISTS (SELECT 1 FROM tenant_keys k WHERE k.revoked_at IS NULL \
+                         AND cm.direct_model_id = ANY(k.model_ids)) \
+         ORDER BY 1",
+    )
+    .fetch_all(db.pool())
+    .await
+    .map_err(DbError::from)?;
+    let mut outcome = GeneratedGrantsWithdrawn::default();
+    for model_id in held {
+        let ctx = WriteCtx {
+            mk: crate::crypto::MasterKey(ctx.mk.0),
+            env: ctx.env.clone(),
+            cp_version: ctx.cp_version.clone(),
+            stale_secs: ctx.stale_secs,
+        };
+        let withdrawn = db
+            .tx(move |conn| {
+                async move {
+                    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+                        .bind(BOOT_LOCK_KEY)
+                        .execute(&mut *conn)
+                        .await
+                        .map_err(DbError::from)?;
+                    // Read under the boot lock, so a peer that withdrew it
+                    // first leaves nothing to count.
+                    let (grants, selections): (i64, i64) = sqlx::query_as(
+                        "SELECT (SELECT count(*) FROM tenants WHERE $1 = ANY(allowed_model_ids)), \
+                                (SELECT count(*) FROM tenant_keys \
+                                 WHERE revoked_at IS NULL AND $1 = ANY(model_ids))",
+                    )
+                    .bind(model_id)
+                    .fetch_one(&mut *conn)
+                    .await
+                    .map_err(DbError::from)?;
+                    if grants > 0 || selections > 0 {
+                        on_model_deleted(&mut *conn, &ctx, model_id).await?;
+                    }
+                    Ok::<_, ApiError>((grants, selections))
+                }
+                .boxed()
+            })
+            .await;
+        match withdrawn {
+            Ok((grants, selections)) => {
+                outcome.grants += u64::try_from(grants).unwrap_or_default();
+                outcome.selections += u64::try_from(selections).unwrap_or_default();
+            }
+            Err(e) if compat::refused(&e) || e.status == StatusCode::SERVICE_UNAVAILABLE => {
+                outcome.deferred += 1;
+            }
+            Err(e) => {
+                outcome.failed += 1;
+                tracing::warn!(
+                    code = e.code,
+                    "a grant of a channel's generated direct model could not be withdrawn"
+                );
+            }
+        }
+    }
+    Ok(outcome)
+}
+
 async fn resources_lock(conn: &mut PgConnection) -> Result<(), ApiError> {
     sqlx::query("SELECT pg_advisory_xact_lock($1)")
         .bind(RESOURCES_LOCK_KEY)
@@ -891,30 +992,6 @@ fn ungrantable(doc: &Value) -> Option<(&'static str, &'static str)> {
         return Some(("/ensemble", "集成（ensemble）模型"));
     }
     None
-}
-
-/// Whether `model_id` is the direct document a public model generated for
-/// one serving account (`channel_models.direct_model_id`).
-///
-/// No tenant may be granted one, the platform's own included. Its name is
-/// `<public name>#<account display name>`, so a customer granted it is shown
-/// which upstream account serves the model, and its key calls that account
-/// alone, past the public model's priorities and weights. The platform's own
-/// tenant is refused too, for two reasons that hold for every tenant: the
-/// document has no price of its own (baselines and group rates key on the
-/// public model's id), so every call through it is stored unpriced, while
-/// the platform's own tenant is priced like any other; and the document
-/// lives and dies with its channel row, which removes it without withdrawing
-/// any grant (`channels` takes no tenant row), so a grant on it would be left
-/// naming a deleted model. The public model is what to grant instead.
-async fn generated_direct(conn: &mut PgConnection, model_id: Uuid) -> Result<bool, ApiError> {
-    Ok(sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM channel_models WHERE direct_model_id = $1)",
-    )
-    .bind(model_id)
-    .fetch_one(conn)
-    .await
-    .map_err(DbError::from)?)
 }
 
 /// The model ids `raw` names, sorted and without repeats, once each is a
@@ -945,14 +1022,27 @@ async fn checked_grants(
         .map_err(DbError::from)?;
         match doc {
             None => problems.push(detail(&path, "模型不存在")),
-            Some(_) if generated_direct(&mut *conn, id).await? => problems.push(detail(
-                &path,
-                if is_internal {
-                    "公共模型生成的直连模型不能授权给平台内部租户，请授权该公共模型"
-                } else {
-                    "公共模型生成的直连模型不能授权给客户租户，请授权该公共模型"
-                },
-            )),
+            // No tenant may be granted a channel's generated direct document,
+            // the platform's own included. Its name is `<public name>#<account
+            // display name>`, so a customer granted it is shown which upstream
+            // account serves the model, and its key calls that account alone,
+            // past the public model's priorities and weights. Every tenant is
+            // refused for two more reasons: the document has no price of its
+            // own, so every call through it is stored unpriced, while the
+            // platform's own tenant is priced like any other; and it lives and
+            // dies with its channel row, which removes it without withdrawing
+            // any grant (`channels` takes no tenant row), so a grant on it
+            // would be left naming a deleted model. The public model is what
+            // to grant instead.
+            Some(_) if crate::channels::is_generated_direct(&mut *conn, id).await? => problems
+                .push(detail(
+                    &path,
+                    if is_internal {
+                        "公共模型生成的直连模型不能授权给平台内部租户，请授权该公共模型"
+                    } else {
+                        "公共模型生成的直连模型不能授权给客户租户，请授权该公共模型"
+                    },
+                )),
             Some(doc) => match ungrantable(&doc).filter(|_| !is_internal) {
                 Some((_, what)) => {
                     problems.push(detail(&path, &format!("{what}不能授权给客户租户")))
