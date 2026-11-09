@@ -1057,11 +1057,11 @@ struct Provider<'a> {
     #[serde(default)]
     pricing_urls: Vec<String>,
     #[serde(borrow)]
-    models: Vec<Model<'a>>,
+    models: Vec<DatasetModel<'a>>,
 }
 
 #[derive(Deserialize)]
-struct Model<'a> {
+struct DatasetModel<'a> {
     id: String,
     /// A price map, or a list of conditional ones ([`conditionals`]).
     #[serde(borrow)]
