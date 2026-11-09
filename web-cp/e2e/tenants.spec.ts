@@ -26,9 +26,16 @@ test.beforeAll(async () => {
       doc: { display_name, provider: "openai", api_key, api_base, groups },
     });
   // Every write that names a group names a live one, the accounts below and
-  // the tenant and defaults edits in the specs included.
-  for (const name of ["grp-eu-5d2", "grp-us-8a4", "grp-none-7d3"]) {
-    await stack.admin.createGroup(name, name);
+  // the tenant and defaults edits in the specs included. `grp-ui-7e2` names a
+  // display name different from its routing name, so a picker that offers the
+  // routing name in its place is visible.
+  for (const [name, display] of [
+    ["grp-eu-5d2", "grp-eu-5d2"],
+    ["grp-us-8a4", "grp-us-8a4"],
+    ["grp-none-7d3", "grp-none-7d3"],
+    ["grp-ui-7e2", "欧洲二区 7e2"],
+  ] as const) {
+    await stack.admin.createGroup(name, display);
   }
   // Every account a tenant key reaches by default is in `shared`.
   const shared = await account("acct-t5-shared", ["shared"], "sk-t5-upstream-shared-1");
@@ -141,24 +148,33 @@ test("授权一个模型后，租户的 /api/models 只列出它", async ({ page
     .toEqual(["chat-t5-e2e"]);
 });
 
-test("给租户设置可用分组后，运维侧的 key 显示生效分组，/api 的任何响应都不含分组名", async ({ page }) => {
+test("给租户设置可用分组后，运维侧的 key 显示它的分组，/api 的任何响应都不含分组名", async ({ page }) => {
   const t = await signUpActive("T5 Groups Co 4c3", "owner@groups-t5.test", [models.chat]);
   await t.client.post("/api/keys", { label: "groups-key-t5" });
 
   await openTenants(page);
   await openTenant(page, t.org);
   const keyRow = page.getByRole("table", { name: "密钥" }).getByRole("row").filter({ hasText: "groups-key-t5" });
-  // Before the change the key follows the tenant's default group.
+  // The key names the group its tenant has when it was minted; the tenant
+  // shows groups by display name, with the routing name in small text.
   await expect(keyRow).toContainText("shared");
   const groups = page.getByRole("group", { name: "可用分组" });
-  await expect(groups).toContainText("租户看不到分组名");
+  await expect(groups).toContainText("租户按显示名看到分组");
+  await expect(groups.getByRole("checkbox", { name: "欧洲二区 7e2" })).toBeVisible();
   await groups.getByRole("checkbox", { name: "shared" }).uncheck();
   await groups.getByRole("checkbox", { name: "grp-eu-5d2" }).check();
-  // grp-eu-5d2 holds an upstream account, so the save asks for no confirmation.
+  // The save stops the one key in `shared`, so it is confirmed first.
   await groups.getByRole("button", { name: "保存分组" }).click();
+  await expect(groups.getByRole("alert")).toContainText("将停用该租户在此分组下的 1 个密钥");
+  await groups.getByRole("button", { name: "确认保存分组" }).click();
+  await expect
+    .poll(async () => (await stack.admin.get(`/admin/tenants/${t.id}`)).allowed_provider_groups)
+    .toEqual(["grp-eu-5d2"]);
 
-  await expect(keyRow).toContainText("grp-eu-5d2");
-  await expect(keyRow).not.toContainText("grp-us-8a4");
+  // The key keeps its group and is closed by it: a key is never moved.
+  await expect(keyRow).toContainText("shared");
+  await expect(keyRow).toContainText("已停用");
+  await expect(keyRow).toContainText("不在租户的可用分组中");
   expect((await stack.admin.get(`/admin/tenants/${t.id}`)).allowed_provider_groups).toEqual(["grp-eu-5d2"]);
 
   for (const path of ["/api/session", "/api/org", "/api/models", "/api/keys"]) {
@@ -186,6 +202,83 @@ test("把通配模型授给租户被拒，并在该模型旁说明原因", async
   await expect(grants.getByRole("listitem").filter({ hasText: "chat-t5-e2e" })).not.toContainText(reason);
   // Refused as a whole: nothing was granted.
   expect((await stack.admin.get(`/admin/tenants/${t.id}`)).allowed_model_ids).toEqual([]);
+});
+
+test("租户分组按显示名选择，路由名以小字显示", async ({ page }) => {
+  const t = await signUpActive("T5 Picker Co 6a1", "owner@picker-t5.test");
+  const current = await stack.admin.get(`/admin/tenants/${t.id}`);
+  await stack.admin.patch(
+    `/admin/tenants/${t.id}`,
+    { allowed_provider_groups: ["grp-ui-7e2"] },
+    current.version,
+  );
+
+  await openTenants(page);
+  await openTenant(page, t.org);
+  const groups = page.getByRole("group", { name: "可用分组" });
+  const option = groups.getByRole("listitem").filter({ hasText: "欧洲二区 7e2" });
+  await expect(option).toContainText("欧洲二区 7e2");
+  await expect(option).toContainText("grp-ui-7e2");
+  // The control is named by the display name; the routing name is text beside it.
+  await expect(groups.getByRole("checkbox", { name: "欧洲二区 7e2" })).toBeChecked();
+  // Choosing by display name saves that group's routing name, not its display name.
+  await groups.getByRole("checkbox", { name: "grp-eu-5d2" }).check();
+  await groups.getByRole("button", { name: "保存分组" }).click();
+  await expect
+    .poll(async () => [...(await stack.admin.get(`/admin/tenants/${t.id}`)).allowed_provider_groups].sort())
+    .toEqual(["grp-eu-5d2", "grp-ui-7e2"]);
+});
+
+test("移除分组前提示将停用 N 个密钥；确认后这些密钥显示已停用，恢复后重新可用", async ({ page }) => {
+  const t = await signUpActive("T5 Removal Co 8d2", "owner@removal-t5.test", [models.chat]);
+  let tenant = await stack.admin.get(`/admin/tenants/${t.id}`);
+  await stack.admin.patch(
+    `/admin/tenants/${t.id}`,
+    { allowed_provider_groups: ["grp-us-8a4", "grp-eu-5d2"] },
+    tenant.version,
+  );
+  // Two keys in grp-us-8a4 and one elsewhere: the warning counts the group's
+  // own keys, never every key the tenant has.
+  const us = (await stack.admin.get("/admin/provider-groups")).items.find(
+    (g: { name: string }) => g.name === "grp-us-8a4",
+  );
+  const eu = (await stack.admin.get("/admin/provider-groups")).items.find(
+    (g: { name: string }) => g.name === "grp-eu-5d2",
+  );
+  for (const label of ["us-one-t5", "us-two-t5"]) {
+    await stack.admin.post(`/admin/tenants/${t.id}/keys`, { label, group_id: us.id });
+  }
+  const euKey = await stack.admin.post(`/admin/tenants/${t.id}/keys`, { label: "eu-one-t5", group_id: eu.id });
+
+  await openTenants(page);
+  await openTenant(page, t.org);
+  const groups = page.getByRole("group", { name: "可用分组" });
+  await groups.getByRole("checkbox", { name: "grp-us-8a4" }).uncheck();
+  await groups.getByRole("button", { name: "保存分组" }).click();
+  await expect(groups.getByRole("alert")).toContainText("将停用该租户在此分组下的 2 个密钥");
+  // Nothing is saved until it is confirmed.
+  tenant = await stack.admin.get(`/admin/tenants/${t.id}`);
+  expect(tenant.allowed_provider_groups).toEqual(["grp-us-8a4", "grp-eu-5d2"]);
+  await groups.getByRole("button", { name: "确认保存分组" }).click();
+  await expect
+    .poll(async () => (await stack.admin.get(`/admin/tenants/${t.id}`)).allowed_provider_groups)
+    .toEqual(["grp-eu-5d2"]);
+
+  const keys = page.getByRole("table", { name: "密钥" });
+  await expect(keys.getByRole("row").filter({ hasText: "us-one-t5" })).toContainText("已停用");
+  await expect(keys.getByRole("row").filter({ hasText: "us-two-t5" })).toContainText("已停用");
+  await expect(keys.getByRole("row").filter({ hasText: "eu-one-t5" })).toContainText("正常");
+  // A closed key keeps its group's name as its routing name, but the gateway
+  // disables it: the operator API marks it disabled with the group reason.
+  const closed = await stack.admin.get(`/admin/keys/${euKey.key.id}`);
+  expect(closed.effective_disabled).toBe(false);
+
+  // Assigning the group back reopens exactly its keys: a key is never moved.
+  await groups.getByRole("checkbox", { name: "grp-us-8a4" }).check();
+  await groups.getByRole("button", { name: "保存分组" }).click();
+  await expect(keys.getByRole("row").filter({ hasText: "us-one-t5" })).toContainText("正常");
+  await expect(keys.getByRole("row").filter({ hasText: "us-two-t5" })).toContainText("正常");
+  await expect(keys.getByRole("row").filter({ hasText: "eu-one-t5" })).toContainText("正常");
 });
 
 test("在 Dashboard 停用成员后，他的 key 在网关上被拒，启用后恢复", async ({ page }) => {
@@ -440,20 +533,67 @@ test("保存后租户没有任何带上游账号的分组时，先警告并要�
     .toEqual(["grp-none-7d3"]);
 });
 
-test("在租户页给 key 设置分组覆盖后，该 key 的生效分组随之改变", async ({ page }) => {
+test("在租户页给旧密钥选择一次分组后，它的分组随之改变，且不能再次更改", async ({ page }) => {
   const t = await signUpActive("T5 Override Co 4f3", "owner@override-t5.test", [models.chat]);
+  // The key is minted while the tenant has one group, then set back to no
+  // group: the state an older control-plane replica leaves.
   const created = await t.client.post("/api/keys", { label: "override-key-t5" });
+  stack.clearKeyGroup(created.key.id);
+  const current = await stack.admin.request("GET", `/admin/tenants/${t.id}`);
+  await stack.admin.patch(
+    `/admin/tenants/${t.id}`,
+    { allowed_provider_groups: ["shared", "grp-us-8a4", "grp-eu-5d2"] },
+    current.version!,
+  );
 
   await openTenants(page);
   await openTenant(page, t.org);
   const row = page.getByRole("table", { name: "密钥" }).getByRole("row").filter({ hasText: "override-key-t5" });
-  await expect(row).not.toContainText("grp-us-8a4");
-  await row.getByRole("button", { name: "分组覆盖" }).click();
-  const editor = page.getByRole("group", { name: "分组覆盖" });
+  await expect(row).toContainText("未选分组");
+  await row.getByRole("button", { name: "选择分组" }).click();
+  const editor = page.getByRole("group", { name: "选择分组" });
   await editor.getByRole("checkbox", { name: "grp-us-8a4" }).check();
-  await editor.getByRole("button", { name: "保存覆盖" }).click();
+  await editor.getByRole("button", { name: "保存分组" }).click();
   await expect(row).toContainText("grp-us-8a4");
   expect((await stack.admin.get(`/admin/keys/${created.key.id}`)).effective_provider_groups).toEqual(["grp-us-8a4"]);
+  // One group, once: the one-time action is gone from the row.
+  await expect(row.getByRole("button", { name: "选择分组" })).toHaveCount(0);
+});
+
+test("授权一个未定价的模型时显示未定价提示", async ({ page }) => {
+  const t = await signUpActive("T5 Unpriced Co 9a1", "owner@unpriced-t5.test");
+  // `chat-t5-e2e` has no baseline; this second model gets one, so the notice
+  // is pinned to the unpriced one rather than to every grant.
+  const priced = await stack.admin.post("/admin/resources/models", {
+    doc: {
+      display_name: "priced-t5-e2e",
+      provider: "openai",
+      model_name: "gpt-4.1",
+      provider_key_id: (await stack.admin.get("/admin/resources/provider_keys")).items.find(
+        (k: Json) => k.doc.display_name === "acct-t5-shared",
+      ).id,
+    },
+  });
+  await stack.admin.post("/admin/pricing/baselines", {
+    model_id: priced.id,
+    effective_from: new Date(Date.now() - 4_000).toISOString(),
+    card: { default: { base: { input: "1000", output: "2000" } } },
+    note: "定价提示用例",
+  });
+
+  await openTenants(page);
+  await openTenant(page, t.org);
+  const grants = page.getByRole("group", { name: "授权模型" });
+  const notice = "未定价：调用会暂不计费，直到设置基准价";
+  await grants.getByRole("checkbox", { name: "chat-t5-e2e" }).check();
+  await grants.getByRole("button", { name: "保存授权" }).click();
+  const unpriced = grants.getByRole("listitem").filter({ hasText: "chat-t5-e2e" });
+  await expect(unpriced).toContainText(notice);
+  await expect(grants.getByRole("listitem").filter({ hasText: "priced-t5-e2e" })).not.toContainText(notice);
+  // The grant itself was saved: the notice is advice, not a refusal.
+  await expect
+    .poll(async () => (await stack.admin.get(`/admin/tenants/${t.id}`)).allowed_model_ids)
+    .toContain(models.chat.id);
 });
 
 test("只读账号在租户页看不到任何操作", async ({ page }) => {
@@ -484,6 +624,29 @@ test("新租户默认值的默认分组不能清空：被拒并在该字段说�
   await panel.getByRole("button", { name: "保存默认值" }).click();
   await expect(groups.getByRole("alert")).toBeVisible();
   expect(await stack.admin.get("/admin/settings/tenant-defaults")).toEqual(before);
+});
+
+test("新租户默认分组使用同一选择器：按显示名选择，路由名以小字显示", async ({ page }) => {
+  const before: Json = await stack.admin.get("/admin/settings/tenant-defaults");
+  try {
+    await openTenants(page);
+    await page.getByRole("button", { name: "新租户默认值" }).click();
+    const panel = page.getByRole("region", { name: "新租户默认值" });
+    const groups = panel.getByRole("group", { name: "默认分组" });
+    const option = groups.getByRole("listitem").filter({ hasText: "欧洲二区 7e2" });
+    await expect(option).toContainText("欧洲二区 7e2");
+    await expect(option).toContainText("grp-ui-7e2");
+    await expect(groups.getByRole("checkbox", { name: "欧洲二区 7e2" })).toBeVisible();
+    await groups.getByRole("checkbox", { name: "欧洲二区 7e2" }).check();
+    await panel.getByRole("button", { name: "保存默认值" }).click();
+    // The saved value is the routing name the list stores, not the display name.
+    await expect
+      .poll(async () => (await stack.admin.get("/admin/settings/tenant-defaults")).default_provider_groups)
+      .toContain("grp-ui-7e2");
+  } finally {
+    const restored = await stack.admin.request("PUT", "/admin/settings/tenant-defaults", before);
+    expect(restored.status, restored.text).toBe(200);
+  }
 });
 
 // Last: it changes what every later signup starts with.

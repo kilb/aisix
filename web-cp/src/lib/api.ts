@@ -238,6 +238,14 @@ export interface Invite {
   expires_at: string;
 }
 
+/** The one group a key names, fixed when it was created. */
+export interface KeyGroup {
+  id: string;
+  /** The routing name: immutable, operator-only. */
+  name: string;
+  display_name: string;
+}
+
 export interface AdminKey {
   id: string;
   tenant_id: string;
@@ -246,7 +254,11 @@ export interface AdminKey {
   member_id: string | null;
   model_ids: string[] | null;
   allowed_models: string[] | null;
+  /** The override a key minted before groups were data carries; no request body sets it. */
   allowed_provider_groups: string[] | null;
+  /** The group the key routes to, chosen at creation; `null` for a legacy key that has none yet. */
+  group: KeyGroup | null;
+  /** What the gateway is given: the key's group's name, or the old rule for a groupless key. */
   effective_provider_groups: string[];
   rate_limit: { concurrency?: number; rpm?: number };
   /** The operators' switch. */
@@ -267,7 +279,8 @@ export interface NewKey {
   model_ids?: string[];
   /** Model name patterns, for the platform's own tenant only. */
   allowed_models?: string[];
-  allowed_provider_groups?: string[];
+  /** The one group the key routes to. Required: any live group for the internal tenant, one of its assigned groups otherwise. */
+  group_id?: string;
   rate_limit?: { concurrency?: number; rpm?: number };
   /** RFC 3339. */
   expires_at?: string;
@@ -350,11 +363,6 @@ export interface AuditEntry {
 export interface AuditPage {
   items: AuditEntry[];
   next_before: number | null;
-}
-
-export interface ProviderGroup {
-  name: string;
-  provider_keys: { id: string; display_name: string | null }[];
 }
 
 export interface Environment {
@@ -491,12 +499,12 @@ export const keys = {
     return (await call<MintedKey>("POST", `/admin/tenants/${seg(tenantId)}/keys`, body)).data;
   },
   /**
-   * `disabled` is the operators' switch; `allowed_provider_groups: null` drops
-   * the key's own groups, so it follows its tenant's.
+   * `disabled` is the operators' switch; `group_id` names the key's group and
+   * is accepted only while the key has none, so a legacy key takes one once.
    */
   async update(
     id: string,
-    changes: { disabled?: boolean; allowed_provider_groups?: string[] | null },
+    changes: { disabled?: boolean; group_id?: string },
     version: number,
   ): Promise<AdminKey> {
     return (await call<AdminKey>("PATCH", `/admin/keys/${seg(id)}`, changes, version)).data;
@@ -601,13 +609,6 @@ export const settings = {
   /** Replaces the whole defaults: a limit left out is unset. */
   async saveTenantDefaults(defaults: TenantDefaults): Promise<TenantDefaults> {
     return (await call<TenantDefaults>("PUT", "/admin/settings/tenant-defaults", defaults)).data;
-  },
-};
-
-/** Every group a live upstream account is in, with its accounts. */
-export const providerGroups = {
-  async list(): Promise<ProviderGroup[]> {
-    return (await call<{ items: ProviderGroup[] }>("GET", "/admin/provider-groups")).data.items;
   },
 };
 

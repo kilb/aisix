@@ -6,15 +6,16 @@ import { Msg, type Note } from "../components/Msg";
 import { RolloutBadge } from "../components/RolloutBadge";
 import {
   ApiError,
+  groupPrices,
+  groups as groupsApi,
   keys as keysApi,
-  providerGroups,
   resources,
   settings,
   tenants,
   type AdminKey,
+  type Group,
   type Invite,
   type Member,
-  type ProviderGroup,
   type ResourceView,
   type Tenant,
   type TenantChanges,
@@ -28,7 +29,7 @@ import { useRefusalFocus } from "../ui/Field";
 import { CopyButton } from "../ui/CopyButton";
 import { DataTable, Loading } from "../ui/DataTable";
 import { EmptyState } from "../ui/EmptyState";
-import { GroupList, GroupName } from "../ui/GroupName";
+import { GroupName } from "../ui/GroupName";
 import { Lamp, type LampState } from "../ui/Lamp";
 import { SidePanel } from "../ui/SidePanel";
 import { TwoStep } from "../ui/TwoStep";
@@ -79,6 +80,9 @@ const UNGRANTABLE = "通配模型与 ensemble 模型不能授给租户";
 
 /** Shown beside a granted model the model catalog, as last read, does not list. */
 const NOT_IN_CATALOG = "目录中未找到";
+
+/** Shown beside a granted model with no baseline in force (design D9). */
+const UNPRICED = "未定价：调用会暂不计费，直到设置基准价";
 
 const WATCH_INTERVAL_MS = 1_000;
 const WATCH_BUDGET_MS = 30_000;
@@ -253,23 +257,42 @@ function limitsFrom(draft: LimitDraft): TenantLimits {
   return limits;
 }
 
-/** Every group name worth offering: the accounts' groups and those already chosen, sorted. */
-export function groupOptions(available: ProviderGroup[] | null, stored: string[]): string[] {
-  return [...new Set([...(available ?? []).map((g) => g.name), ...stored])].sort((a, b) => a.localeCompare(b));
+/** Every group worth offering: the live groups and those already named, by routing name. */
+function groupOptions(available: Group[] | null, stored: string[]): Group[] {
+  const live = available ?? [];
+  const listed = new Set(live.map((g) => g.name));
+  // A group a stored value names but the table does not list any more (retired
+  // since it was chosen) stays listed, so it can be seen and taken away.
+  const gone = stored
+    .filter((name) => !listed.has(name))
+    .map((name) => ({ id: name, name, display_name: name }) as Group);
+  return [...live, ...gone].sort((a, b) => a.display_name.localeCompare(b.display_name));
 }
 
 /** The upstream accounts in each group, by display name. */
-export function accountsByGroup(available: ProviderGroup[] | null): Map<string, string[]> {
+function accountsByGroup(available: Group[] | null): Map<string, string[]> {
   return new Map((available ?? []).map((g) => [g.name, g.provider_keys.map((k) => k.display_name ?? k.id)]));
 }
 
+/** The picker's options: each live group by display name, with the accounts in it. */
+export function groupChoices(available: Group[] | null, stored: string[] = []): GroupChoice[] {
+  const accounts = accountsByGroup(available);
+  return groupOptions(available, stored).map((g) => ({
+    id: g.id,
+    name: g.name,
+    display_name: g.display_name,
+    accounts: accounts.get(g.name) ?? [],
+  }));
+}
+
 /**
- * The groups key `k`'s override names that tenant `t` does not have. A tenant
- * with no groups reaches every upstream, so nothing is outside it.
+ * The groups key `k` says it is in that tenant `t` no longer assigns. A key
+ * names one group, chosen at creation; losing that group from the tenant
+ * closes the key rather than moving it.
  */
 export function strayGroups(k: AdminKey, t: Tenant): string[] {
-  if (!k.allowed_provider_groups || t.allowed_provider_groups.length === 0) return [];
-  return k.allowed_provider_groups.filter((g) => !t.allowed_provider_groups.includes(g));
+  if (!k.group || t.is_internal) return [];
+  return t.allowed_provider_groups.includes(k.group.name) ? [] : [k.group.name];
 }
 
 /**
@@ -282,17 +305,11 @@ export function groupsText(groups: string[], tenant: Tenant): string {
   return tenant.is_internal ? "全部上游" : "无分组（密钥不可用）";
 }
 
-/** A key's effective groups in a table cell: each with its route colour, or what having none means. */
-export function EffectiveGroups({ groups, tenant }: { groups: string[]; tenant: Tenant }) {
-  if (groups.length > 0) return <GroupList groups={groups} />;
-  return <>{groupsText(groups, tenant)}</>;
-}
-
-/** The note beside a key whose override reaches past its tenant's groups. */
+/** The note beside a key whose group its tenant no longer assigns. */
 export function StrayNote({ k, tenant }: { k: AdminKey; tenant: Tenant }) {
   const stray = strayGroups(k, tenant);
   if (stray.length === 0) return null;
-  return <span className="tn-note tn-flag">覆盖中的 {stray.join("、")} 不在租户的可用分组中</span>;
+  return <span className="tn-note tn-flag">所在分组 {stray.join("、")} 不在租户的可用分组中，该密钥已停用</span>;
 }
 
 /** The warning before a group choice whose groups hold no upstream account is saved. */
@@ -585,7 +602,10 @@ function TenantDetail({
   // Read again with every version of the tenant: a grant made elsewhere can
   // name a model created after the last read.
   const catalog = useLoad(() => resources.list<ModelDoc>("models"), [tenant.version, tick]);
-  const groups = useLoad(() => providerGroups.list(), [tick]);
+  const groups = useLoad(() => groupsApi.list(), [tick]);
+  // Every model a group can price, with its baseline: a granted model with
+  // none is a call nobody can bill yet.
+  const prices = useLoad(() => groupPrices.list(), [tick]);
   const members = useLoad(() => tenants.members(tenant.id), [tenant.id, tick]);
   // Every change to the tenant's row can change what its keys are given.
   const keyList = useLoad(() => tenants.keys(tenant.id), [tenant.id, tenant.version, tick]);
@@ -599,11 +619,17 @@ function TenantDetail({
     [tenant.id, tenant.version, onView],
   );
 
-  const options = useMemo(
-    () => groupOptions(groups.data, tenant.allowed_provider_groups),
+  const choices = useMemo(
+    () => groupChoices(groups.data, tenant.allowed_provider_groups),
     [groups.data, tenant.allowed_provider_groups],
   );
-  const accounts = useMemo(() => accountsByGroup(groups.data), [groups.data]);
+  const priced = useMemo(
+    () =>
+      prices.data === null
+        ? null
+        : new Set((prices.data ?? []).filter((r) => r.baseline.current !== null).map((r) => r.model_id)),
+    [prices.data],
+  );
   const part = { tenant, canEdit, save, onReload };
 
   return (
@@ -619,8 +645,13 @@ function TenantDetail({
         {tenant.is_internal && " · 平台内部租户：它的密钥是运维密钥，没有成员"}
       </p>
 
-      <GrantsPart {...part} catalog={catalog.data} catalogError={catalog.error} />
-      <GroupsPart {...part} options={options} accounts={accounts} groupsError={groups.error} />
+      <GrantsPart
+        {...part}
+        catalog={catalog.data}
+        catalogError={catalog.error}
+        priced={priced}
+      />
+      <GroupsPart {...part} choices={choices} groupsError={groups.error} keys={keyList.data} />
       <LimitsPart {...part} />
 
       {!tenant.is_internal && (
@@ -642,8 +673,7 @@ function TenantDetail({
         keys={keyList.data}
         error={keyList.error}
         members={members.data}
-        options={options}
-        accounts={accounts}
+        choices={choices}
         canEdit={canEdit}
         onSaved={(k) => {
           keyList.setData((list) => list && list.map((x) => (x.id === k.id ? k : x)));
@@ -663,7 +693,7 @@ export function Check({
   onChange,
   note,
   error,
-  group = false,
+  route,
 }: {
   label: string;
   checked: boolean;
@@ -671,8 +701,8 @@ export function Check({
   onChange: (on: boolean) => void;
   note?: string;
   error?: string;
-  /** The label is a provider group's name, drawn with its route colour. */
-  group?: boolean;
+  /** The routing name beside the label, in small text: the control is still named by the label. */
+  route?: string;
 }) {
   const errorId = useId();
   return (
@@ -686,8 +716,9 @@ export function Check({
           aria-invalid={error ? true : undefined}
           aria-describedby={error ? errorId : undefined}
         />
-        {group ? <GroupName name={label} /> : label}
+        {label}
       </label>
+      {route !== undefined && <code className="grp-route">{route}</code>}
       {note && <span className="tn-note">{note}</span>}
       {error && (
         <span id={errorId} className="tn-error" role="alert">
@@ -698,40 +729,54 @@ export function Check({
   );
 }
 
-/** A multi-select of provider groups, each with the upstream accounts in it. */
+/** One group the picker offers: what people choose by, and the routing name the documents store. */
+export interface GroupChoice {
+  /** The group's id, which a key names. */
+  id: string;
+  /** The routing name: what a tenant's assignment list, a key's group and an account's document hold. */
+  name: string;
+  /** What people see and choose by. */
+  display_name: string;
+  /** The upstream accounts in the group, by display name. */
+  accounts: string[];
+}
+
+/**
+ * The group picker every operator page shares: a checkbox per group, named by
+ * its display name, with the routing name in small text beside it, so an
+ * operator chooses what a tenant sees and still sees what the document
+ * stores. A group with no account in it says so: choosing only those leaves
+ * whoever it is for with no upstream to reach.
+ */
 export function GroupPicker({
   options,
   chosen,
   onChange,
   disabled,
-  accounts,
   errorFor,
 }: {
-  options: string[];
+  options: GroupChoice[];
+  /** The routing names chosen. */
   chosen: string[];
   onChange: (next: string[]) => void;
   disabled: boolean;
-  accounts: Map<string, string[]>;
   errorFor?: (group: string) => string | undefined;
 }) {
-  if (options.length === 0) return <p className="hint">还没有上游账号设置分组。</p>;
+  if (options.length === 0) return <p className="hint">还没有可选的分组。</p>;
   return (
     <ul className="tn-checks tn-groups">
-      {options.map((g) => {
-        const inGroup = accounts.get(g) ?? [];
-        return (
-          <Check
-            key={g}
-            group
-            label={g}
-            checked={chosen.includes(g)}
-            disabled={disabled}
-            onChange={(on) => onChange(on ? [...chosen, g] : chosen.filter((x) => x !== g))}
-            note={inGroup.length > 0 ? `上游账号：${inGroup.join("、")}` : "没有上游账号在此分组"}
-            error={errorFor?.(g)}
-          />
-        );
-      })}
+      {options.map((g) => (
+        <Check
+          key={g.name}
+          label={g.display_name}
+          route={g.name !== g.display_name ? g.name : undefined}
+          checked={chosen.includes(g.name)}
+          disabled={disabled}
+          onChange={(on) => onChange(on ? [...chosen, g.name] : chosen.filter((x) => x !== g.name))}
+          note={g.accounts.length > 0 ? `上游账号：${g.accounts.join("、")}` : "没有上游账号在此分组"}
+          error={errorFor?.(g.name)}
+        />
+      ))}
     </ul>
   );
 }
@@ -743,7 +788,13 @@ function GrantsPart({
   onReload,
   catalog,
   catalogError,
-}: PartProps & { catalog: ResourceView<ModelDoc>[] | null; catalogError: string | null }) {
+  priced,
+}: PartProps & {
+  catalog: ResourceView<ModelDoc>[] | null;
+  catalogError: string | null;
+  /** The ids of the models with a baseline in force; `null` until the list is read. */
+  priced: Set<string> | null;
+}) {
   const [chosen, setChosen] = useState(() => new Set(tenant.allowed_model_ids));
   const [part, focusRefusal] = useRefusalFocus<HTMLFieldSetElement>();
   // The ids in the order last sent: a refusal names an entry by its index.
@@ -780,6 +831,19 @@ function GrantsPart({
     const refusedHere = i >= 0 ? refused?.at.get(`/allowed_model_ids/${i}`) : undefined;
     if (refusedHere === undefined) return undefined;
     return row.doc && ungrantable(row.doc) ? UNGRANTABLE : refusedHere;
+  }
+
+  /**
+   * What an operator should know before saving the row: a model the catalog
+   * does not list, and a model with no baseline in force, whose calls are
+   * stored unpriced until one is set (D9). The second is read only once the
+   * price list has arrived: an unknown price is not an absent one.
+   */
+  function noteFor(row: (typeof rows)[number]): string | undefined {
+    const notes: string[] = [];
+    if (!row.doc) notes.push(NOT_IN_CATALOG);
+    if (priced !== null && !priced.has(row.id)) notes.push(UNPRICED);
+    return notes.length > 0 ? notes.join(" ") : undefined;
   }
 
   // Grants the save takes away: every key of the tenant loses those models.
@@ -834,7 +898,7 @@ function GrantsPart({
                   return next;
                 })
               }
-              note={r.doc ? undefined : NOT_IN_CATALOG}
+              note={noteFor(r)}
               error={reasonFor(r)}
             />
           ))}
@@ -865,15 +929,20 @@ function GrantsPart({
   );
 }
 
+/** The id of the group a routing name names, from a picker's own list; the name when none does. */
+export function idOf(choices: GroupChoice[], name: string): string {
+  return choices.find((g) => g.name === name)?.id ?? name;
+}
+
 function GroupsPart({
   tenant,
   canEdit,
   save,
   onReload,
-  options,
-  accounts,
+  choices,
   groupsError,
-}: PartProps & { options: string[]; accounts: Map<string, string[]>; groupsError: string | null }) {
+  keys,
+}: PartProps & { choices: GroupChoice[]; groupsError: string | null; keys: AdminKey[] | null }) {
   const [chosen, setChosen] = useState<string[]>(tenant.allowed_provider_groups);
   const [part, focusRefusal] = useRefusalFocus<HTMLFieldSetElement>();
   const [sent, setSent] = useState<string[]>([]);
@@ -888,10 +957,22 @@ function GroupsPart({
   }, [stored]);
   useConflictClears(tenant.version, setRefused);
 
-  const picked = options.filter((g) => chosen.includes(g));
-  const reachable = (g: string) => (accounts.get(g) ?? []).length > 0;
+  const picked = choices.filter((g) => chosen.includes(g.name)).map((g) => g.name);
+  const reachable = (name: string) => (choices.find((g) => g.name === name)?.accounts.length ?? 0) > 0;
   const unreachable = picked.filter((g) => !reachable(g));
-  const edited = picked.join() !== options.filter((g) => tenant.allowed_provider_groups.includes(g)).join();
+  const edited = picked.join() !== tenant.allowed_provider_groups.join();
+
+  // The groups this save takes away, and how many of the tenant's live keys
+  // each one stops: a key names one group, so losing it closes exactly the
+  // keys in it. Counting every key of the tenant would overstate the damage.
+  const removed = tenant.allowed_provider_groups.filter((name) => !chosen.includes(name));
+  const stopped = removed
+    .map((name) => ({ name, count: (keys ?? []).filter((k) => k.group?.name === name).length }))
+    .filter((s) => s.count > 0);
+  const labelOf = (name: string) => choices.find((g) => g.name === name)?.display_name ?? name;
+  const stopLines = stopped.map(
+    (s) => `移除分组「${labelOf(s.name)}」：将停用该租户在此分组下的 ${s.count} 个密钥。`,
+  );
 
   async function submit() {
     const groups = picked;
@@ -911,12 +992,15 @@ function GroupsPart({
   }
 
   const whole = refused?.at.get("/allowed_provider_groups");
+  // The save is confirmed when it stops keys, and when it would leave the
+  // tenant with no group that holds an upstream account.
+  const blocked = !picked.some(reachable);
   return (
     <fieldset ref={part} className="tn-section">
       <legend>可用分组</legend>
       <p className="hint">
-        租户看不到分组名。该租户的密钥只会路由到这些分组里的上游账号；单个密钥设了分组覆盖时以覆盖为准。
-        {tenant.is_internal && "平台内部租户不选分组即可使用全部上游账号。"}
+        租户按显示名看到分组。该租户的每个密钥只路由到它自己那一个分组里的上游账号；移除一个分组会停用该租户在这个分组下的密钥，再加回来时它们重新可用。
+        {tenant.is_internal && "平台内部租户的密钥可以选任意分组。"}
       </p>
       {groupsError && (
         <div className="note crit" role="alert">
@@ -924,11 +1008,10 @@ function GroupsPart({
         </div>
       )}
       <GroupPicker
-        options={options}
+        options={choices}
         chosen={chosen}
         onChange={setChosen}
         disabled={!canEdit}
-        accounts={accounts}
         errorFor={(g) => refused?.at.get(`/allowed_provider_groups/${sent.indexOf(g)}`)}
       />
       {whole && (
@@ -944,18 +1027,22 @@ function GroupsPart({
       {refused?.conflict && <ConflictNote onReload={onReload} />}
       <Msg note={note} />
       {canEdit && (
-        // A choice with no group that holds an upstream account leaves every key of the
-        // tenant with nothing to reach, so it is confirmed first.
         <TwoStep
           label="保存分组"
           kind={edited ? "primary" : "secondary"}
           disabled={busy}
           busy={busy}
-          ask={() => !picked.some(reachable)}
+          ask={() => stopped.length > 0 || blocked}
           warning={
-            unreachable.length > 0
-              ? unreachableWarning(unreachable, "该租户的密钥")
-              : "没有选择任何分组。保存后，该租户的密钥找不到任何上游账号，无法调用模型。"
+            <>
+              {stopLines.map((line) => (
+                <span key={line}>{line}</span>
+              ))}
+              {blocked &&
+                (unreachable.length > 0
+                  ? unreachableWarning(unreachable.map(labelOf), "该租户的密钥")
+                  : "没有选择任何分组。保存后，该租户的密钥找不到任何上游账号，无法调用模型。")}
+            </>
           }
           onConfirm={() => void submit()}
         />
@@ -1294,6 +1381,10 @@ export function whyOff(k: AdminKey, tenant: Tenant, members: Member[] | null): s
   if (k.disabled) why.push("运维停用");
   if (k.disabled_by_tenant) why.push("租户自行停用");
   if (tenant.status !== "active") why.push(`租户${STATUS_LABEL[tenant.status] ?? tenant.status}`);
+  if (!tenant.is_internal) {
+    if (k.group === null) why.push("未选分组");
+    else if (!tenant.allowed_provider_groups.includes(k.group.name)) why.push("所在分组已不在租户的可用分组中");
+  }
   const member = k.member_id ? members?.find((m) => m.id === k.member_id) : undefined;
   if (member?.disabled) why.push("成员已停用");
   if (member?.role === "billing") why.push("计费成员不持有可用的密钥");
@@ -1305,8 +1396,7 @@ function KeysPart({
   keys,
   error,
   members,
-  options,
-  accounts,
+  choices,
   canEdit,
   onSaved,
   onReload,
@@ -1315,14 +1405,13 @@ function KeysPart({
   keys: AdminKey[] | null;
   error: string | null;
   members: Member[] | null;
-  options: string[];
-  accounts: Map<string, string[]>;
+  choices: GroupChoice[];
   canEdit: boolean;
   onSaved: (key: AdminKey) => void;
   onReload: () => void;
 }) {
   const [editing, setEditing] = useState<string | null>(null);
-  const columns = canEdit ? 7 : 6;
+  const columns = canEdit ? 6 : 5;
   const ownerOf = (k: AdminKey) =>
     k.member_id ? (members?.find((m) => m.id === k.member_id)?.email ?? "成员") : "租户共用";
 
@@ -1330,7 +1419,7 @@ function KeysPart({
     <section className="tn-section">
       <h3>密钥</h3>
       <p className="hint">
-        生效分组：密钥设了分组覆盖时用覆盖，否则用租户的可用分组。密钥的新建、停用与吊销在「密钥」页。
+        每个密钥在创建时选定一个分组，之后不能更改；新建、停用与吊销在「密钥」页。分组被从租户移除时，该分组下的密钥停用，分组加回来时重新可用。
       </p>
       {error && (
         <div className="note crit" role="alert">
@@ -1348,8 +1437,7 @@ function KeysPart({
               <th>名称</th>
               <th>前缀</th>
               <th>成员</th>
-              <th>生效分组</th>
-              <th>分组覆盖</th>
+              <th>分组</th>
               <th>状态</th>
               {canEdit && <th>操作</th>}
             </tr>
@@ -1364,10 +1452,7 @@ function KeysPart({
                   </td>
                   <td>{ownerOf(k)}</td>
                   <td>
-                    <EffectiveGroups groups={k.effective_provider_groups} tenant={tenant} />
-                  </td>
-                  <td>
-                    {k.allowed_provider_groups?.length ? k.allowed_provider_groups.join("、") : "沿用租户"}
+                    <KeyGroupCell k={k} />
                     <StrayNote k={k} tenant={tenant} />
                   </td>
                   <td>
@@ -1382,24 +1467,25 @@ function KeysPart({
                   </td>
                   {canEdit && (
                     <td>
-                      <Button
-                        size="sm"
-                        type="button"
-                        aria-expanded={editing === k.id}
-                        onClick={() => setEditing(editing === k.id ? null : k.id)}
-                      >
-                        分组覆盖
-                      </Button>
+                      {k.group === null && (
+                        <Button
+                          size="sm"
+                          type="button"
+                          aria-expanded={editing === k.id}
+                          onClick={() => setEditing(editing === k.id ? null : k.id)}
+                        >
+                          选择分组
+                        </Button>
+                      )}
                     </td>
                   )}
                 </tr>
                 {editing === k.id && (
                   <tr className="dt-detail">
                     <td colSpan={columns}>
-                      <OverrideEditor
+                      <ChooseGroup
                         k={k}
-                        options={options}
-                        accounts={accounts}
+                        choices={choices}
                         onSaved={(saved) => {
                           setEditing(null);
                           onSaved(saved);
@@ -1422,63 +1508,68 @@ function KeysPart({
   );
 }
 
-export function OverrideEditor({
+/** A key's group in a table cell: its display name, with the routing name in small text when they differ. */
+export function KeyGroupCell({ k }: { k: AdminKey }) {
+  if (k.group === null) return <span className="tn-note">未选分组</span>;
+  const same = k.group.display_name === k.group.name;
+  return (
+    <span className="grps grps-one">
+      <GroupName name={same ? k.group.name : k.group.display_name} />
+      {!same && <span className="tn-note">{k.group.name}</span>}
+    </span>
+  );
+}
+
+/**
+ * The one-time group a legacy key takes, for a key an older control-plane
+ * replica minted without one. A key that has a group never takes another, so
+ * the page offers this only where `k.group` is null.
+ */
+export function ChooseGroup({
   k,
-  options,
-  accounts,
+  choices,
   onSaved,
   onCancel,
   onReload,
 }: {
   k: AdminKey;
-  options: string[];
-  accounts: Map<string, string[]>;
+  choices: GroupChoice[];
   onSaved: (key: AdminKey) => void;
   onCancel: () => void;
   onReload: () => void;
 }) {
-  const [chosen, setChosen] = useState<string[]>(k.allowed_provider_groups ?? []);
+  const [chosen, setChosen] = useState<string[]>([]);
   const [part, focusRefusal] = useRefusalFocus<HTMLFieldSetElement>();
-  // The version the edit started from. A list read while the editor is open
-  // brings a newer `k`; a change made meanwhile must refuse this save (412),
-  // not be overwritten by it.
+  // The version the edit started from: a newer one must refuse this save (412).
   const [version] = useState(k.version);
-  const [sent, setSent] = useState<string[]>([]);
   const [refused, setRefused] = useState<Refusal | null>(null);
   const [busy, setBusy] = useState(false);
-  // Which of the two is in flight: the save or the clear.
-  const [clearing, setClearing] = useState(false);
-  const shown = useMemo(() => groupOptions(null, [...options, ...(k.allowed_provider_groups ?? [])]), [options, k]);
+  const picked = choices.filter((g) => chosen.includes(g.name));
+  const reachable = (name: string) => (choices.find((g) => g.name === name)?.accounts.length ?? 0) > 0;
 
-  async function submit(groups: string[] | null) {
+  async function submit(name: string) {
     setBusy(true);
-    setClearing(groups === null);
     setRefused(null);
-    setSent(groups ?? []);
     try {
-      onSaved(await keysApi.update(k.id, { allowed_provider_groups: groups }, version));
+      onSaved(await keysApi.update(k.id, { group_id: idOf(choices, name) }, version));
     } catch (e) {
-      setRefused(refusal(e, atList("/allowed_provider_groups")));
+      setRefused(refusal(e, atList("/group_id")));
       focusRefusal();
     } finally {
       setBusy(false);
     }
   }
 
-  const whole = refused?.at.get("/allowed_provider_groups");
-  const picked = shown.filter((g) => chosen.includes(g));
-  const reachable = (g: string) => (accounts.get(g) ?? []).length > 0;
+  const whole = refused?.at.get("/group_id");
   return (
     <fieldset ref={part} className="tn-override">
-      <legend>分组覆盖</legend>
-      <p className="hint">只对这个密钥生效，取代租户的可用分组；清除覆盖后沿用租户的分组。</p>
+      <legend>选择分组</legend>
+      <p className="hint">这个密钥还没有分组（由旧版本创建）。分组只能设置一次，设置后不能更改。</p>
       <GroupPicker
-        options={shown}
+        options={choices}
         chosen={chosen}
-        onChange={setChosen}
+        onChange={(next) => setChosen(next.slice(-1))}
         disabled={busy}
-        accounts={accounts}
-        errorFor={(g) => refused?.at.get(`/allowed_provider_groups/${sent.indexOf(g)}`)}
       />
       {whole && (
         <div className="note crit" role="alert">
@@ -1496,26 +1587,15 @@ export function OverrideEditor({
       )}
       {refused?.conflict && <ConflictNote onReload={onReload} />}
       <div className="tn-actions">
-        {/* Groups none of which holds an upstream account leave the key nothing to reach (ruling P1b-R6). */}
         <TwoStep
-          label="保存覆盖"
+          label="保存分组"
           kind="primary"
-          disabled={busy}
-          busy={busy && !clearing}
-          ask={() => picked.length > 0 && !picked.some(reachable)}
-          warning={unreachableWarning(picked, "这个密钥")}
-          onConfirm={() => void submit(picked)}
+          disabled={busy || picked.length === 0}
+          busy={busy}
+          ask={() => picked.length > 0 && !picked.some((g) => reachable(g.name))}
+          warning={unreachableWarning(picked.map((g) => g.display_name), "这个密钥")}
+          onConfirm={() => void submit(picked[0]?.name ?? "")}
         />
-        <Button
-          type="button"
-          disabled={busy || k.allowed_provider_groups === null}
-          busy={busy && clearing}
-          busyLabel="清除覆盖"
-          disabledReason={k.allowed_provider_groups === null ? "这个密钥没有分组覆盖" : undefined}
-          onClick={() => void submit(null)}
-        >
-          清除覆盖
-        </Button>
         <Button type="button" onClick={onCancel}>
           取消
         </Button>
@@ -1527,7 +1607,7 @@ export function OverrideEditor({
 /** The defaults new tenants copy when they are created (admins only). */
 function DefaultsPanel() {
   const stored = useLoad(() => settings.tenantDefaults(), []);
-  const groups = useLoad(() => providerGroups.list(), []);
+  const groups = useLoad(() => groupsApi.list(), []);
   if (stored.data === null) {
     return (
       <section className="panel" aria-label="新租户默认值">
@@ -1551,7 +1631,7 @@ function DefaultsForm({
   onSaved,
 }: {
   stored: TenantDefaults;
-  available: ProviderGroup[] | null;
+  available: Group[] | null;
   onSaved: (defaults: TenantDefaults) => void;
 }) {
   const [draft, setDraft] = useState(() => limitDraft(stored));
@@ -1561,14 +1641,13 @@ function DefaultsForm({
   const [refused, setRefused] = useState<Refusal | null>(null);
   const [note, setNote] = useState<Note | null>(null);
   const [busy, setBusy] = useState(false);
-  const options = useMemo(
-    () => groupOptions(available, stored.default_provider_groups),
+  const choices = useMemo(
+    () => groupChoices(available, stored.default_provider_groups),
     [available, stored.default_provider_groups],
   );
-  const accounts = useMemo(() => accountsByGroup(available), [available]);
 
   async function submit() {
-    const groups = options.filter((g) => chosen.includes(g));
+    const groups = choices.filter((g) => chosen.includes(g.name)).map((g) => g.name);
     setBusy(true);
     setRefused(null);
     setNote(null);
@@ -1599,11 +1678,10 @@ function DefaultsForm({
         <legend>默认分组</legend>
         <p className="hint">新租户的密钥只会路由到这些分组里的上游账号；至少要选一个。</p>
         <GroupPicker
-          options={options}
+          options={choices}
           chosen={chosen}
           onChange={setChosen}
           disabled={false}
-          accounts={accounts}
           errorFor={(g) => refused?.at.get(`/default_provider_groups/${sent.indexOf(g)}`)}
         />
         {whole && (

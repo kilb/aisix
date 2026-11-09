@@ -5,8 +5,7 @@ import { Field, useRefusalFocus } from "../ui/Field";
 import { Msg, type Note } from "../components/Msg";
 import { RolloutBadge } from "../components/RolloutBadge";
 import { REDACTED, SecretInput } from "../components/SecretInput";
-import { TagInput } from "../components/TagInput";
-import { ApiError, settings, tenants, type AdminKey, type ResourceView, type Tenant } from "../lib/api";
+import { ApiError, groups as groupsApi, settings, tenants, type AdminKey, type ResourceView, type Tenant } from "../lib/api";
 import { messageFor, problemAt } from "../lib/errors";
 import { errorText, maskUrl } from "../lib/fmt";
 import { describeAt, enumAt, loadSchema } from "../lib/schema";
@@ -15,6 +14,7 @@ import { Button } from "../ui/Button";
 import { DataTable, Loading } from "../ui/DataTable";
 import { EmptyState } from "../ui/EmptyState";
 import { GroupList } from "../ui/GroupName";
+import { GroupPicker, groupChoices, useLoad, type GroupChoice } from "./Tenants";
 
 /** The fields of a `provider_key` this page edits; every other field is kept as stored. */
 interface ProviderKeyDoc {
@@ -70,6 +70,8 @@ function nameOf(a: Account): string {
  */
 export function Providers({ canEdit }: TabProps) {
   const pk = useResource<ProviderKeyDoc>("provider_keys");
+  // The live groups an account may list: chosen by display name, stored by routing name.
+  const groups = useLoad(() => groupsApi.list(), []);
   const [schema, setSchema] = useState<SchemaInfo | null>(null);
   const [open, setOpen] = useState<Open | null>(null);
   const [opening, setOpening] = useState(false);
@@ -102,6 +104,9 @@ export function Providers({ canEdit }: TabProps) {
   async function openNew() {
     setNote(null);
     setOpening(true);
+    // A group created since the page was opened must be offered here, so the
+    // list is read again with the form.
+    void groups.reload();
     try {
       const defaults = await settings.tenantDefaults();
       setOpen({ mode: "new", groups: defaults.default_provider_groups, groupsNote: null });
@@ -141,6 +146,7 @@ export function Providers({ canEdit }: TabProps) {
   }
 
   const editing = open?.mode === "edit" ? pk.items?.find((a) => a.id === open.id) : undefined;
+  const choices = groupChoices(groups.data);
 
   return (
     <>
@@ -150,6 +156,8 @@ export function Providers({ canEdit }: TabProps) {
           account={null}
           initialGroups={open.groups}
           groupsNote={open.groupsNote}
+          choices={choices}
+          groupsError={groups.error}
           schema={schema}
           readOnly={false}
           create={pk.create}
@@ -166,6 +174,8 @@ export function Providers({ canEdit }: TabProps) {
           account={editing}
           initialGroups={[]}
           groupsNote={null}
+          choices={choices}
+          groupsError={groups.error}
           schema={schema}
           readOnly={!canEdit}
           create={pk.create}
@@ -264,6 +274,9 @@ export function Providers({ canEdit }: TabProps) {
                           size="sm"
                           onClick={() => {
                             setNote(null);
+                            // A group created since the page was opened must be
+                            // offered by this form, so the list is read again with it.
+                            void groups.reload();
                             setOpen({ mode: "edit", id: a.id });
                           }}
                         >
@@ -307,16 +320,17 @@ const KEY_READS_IN_FLIGHT = 6;
 
 /**
  * Who loses an account whose groups go from `before` to `after`. Groups
- * "lose" it when they meet `before` but not `after`; no groups at all (the
- * platform's own tenant) reach every account.
+ * "lose" it when they meet `before` but not `after`; a group list that is
+ * empty reaches every account, which is what a legacy groupless key still
+ * does for the platform's own tenant.
  *
  * - Active and suspended tenants only: a suspended tenant's keys come back
  *   on reactivation. Pending sign-ups are not read.
- * - A key is named when it sets groups of its own that lose the account. A
- *   key without them follows its tenant.
+ * - A key is named when its own group loses the account. A key is never in
+ *   two groups, chosen once at creation.
  * - A tenant is named when its groups lose the account, unless every key it
- *   has sets groups of its own that still reach it. A tenant with no key yet
- *   is named: its next key takes those groups.
+ *   has names a group that still reaches it. A tenant with no key yet is
+ *   named: its next key takes one of those groups.
  *
  * Every tenant's keys are read, at most `KEY_READS_IN_FLIGHT` at a time.
  * This per-tenant cost stands until a backend endpoint reports the impact.
@@ -324,7 +338,9 @@ const KEY_READS_IN_FLIGHT = 6;
 async function whoLoses(before: string[], after: string[]): Promise<Impact> {
   const loses = (groups: string[]) =>
     groups.length > 0 && groups.some((g) => before.includes(g)) && !groups.some((g) => after.includes(g));
-  const ownGroups = (k: AdminKey) => (k.allowed_provider_groups?.length ?? 0) > 0;
+  /** The groups a key reaches by: its one group, or the old rule for a key without one. */
+  const ownGroups = (k: AdminKey) =>
+    k.group !== null ? [k.group.name] : (k.allowed_provider_groups ?? []);
   const live = (await tenants.list()).filter((t) => t.status === "active" || t.status === "suspended");
   const keysOf = new Map<string, AdminKey[]>();
   let next = 0;
@@ -337,11 +353,14 @@ async function whoLoses(before: string[], after: string[]): Promise<Impact> {
   for (const tenant of live) {
     const keys = keysOf.get(tenant.id) ?? [];
     for (const key of keys) {
-      if (ownGroups(key) && loses(key.effective_provider_groups)) impact.keys.push({ key, tenant });
+      if (ownGroups(key).length > 0 && loses(ownGroups(key))) impact.keys.push({ key, tenant });
     }
     const covered =
       keys.length > 0 &&
-      keys.every((k) => ownGroups(k) && k.effective_provider_groups.some((g) => after.includes(g)));
+      keys.every((k) => {
+        const own = ownGroups(k);
+        return own.length > 0 && own.some((g) => after.includes(g));
+      });
     if (loses(tenant.allowed_provider_groups) && !covered) impact.tenants.push(tenant);
   }
   return impact;
@@ -361,6 +380,8 @@ function AccountForm({
   account,
   initialGroups,
   groupsNote,
+  choices,
+  groupsError,
   schema,
   readOnly,
   create,
@@ -372,6 +393,9 @@ function AccountForm({
   account: Account | null;
   initialGroups: string[];
   groupsNote: string | null;
+  /** The live groups, by display name; an account lists only groups that exist. */
+  choices: GroupChoice[];
+  groupsError: string | null;
   schema: SchemaInfo | null;
   readOnly: boolean;
   create: (doc: ProviderKeyDoc) => Promise<Account>;
@@ -419,6 +443,8 @@ function AccountForm({
   const locked = readOnly || busy || removal !== null;
   const details = err instanceof ApiError ? err.details : [];
   const at = (field: keyof typeof ACCOUNT_FIELDS) => problemAt(details, within(ACCOUNT_FIELDS[field]));
+  /** A refusal this form shows beside the field of a list entry it names by index. */
+  const entryAt = (field: keyof typeof ACCOUNT_FIELDS, index: number) => problemAt(details, (path) => path === `${field}/${index}`);
   // Without its schema the adapter has no field to show a refusal at.
   const shown = Object.entries(ACCOUNT_FIELDS).flatMap(([field, paths]) =>
     field === "adapter" && schema && "error" in schema ? [] : paths,
@@ -561,14 +587,27 @@ function AccountForm({
         problem={at("secret")}
         onChange={setSecret}
       />
-      <TagInput
-        label="分组"
-        value={groups}
-        onChange={setGroups}
-        readOnly={locked}
-        hint={GROUPS_HINT}
-        problem={at("groups")}
-      />
+      <fieldset className="tn-section">
+        <legend>分组</legend>
+        <p className="hint">{GROUPS_HINT}；只能从已有的分组里选。</p>
+        {groupsError && (
+          <div className="note crit" role="alert">
+            分组读取失败：{groupsError}
+          </div>
+        )}
+        <GroupPicker
+          options={choices}
+          chosen={groups}
+          onChange={setGroups}
+          disabled={locked}
+          errorFor={(g) => entryAt("groups", groups.indexOf(g)) ?? undefined}
+        />
+        {at("groups") && (
+          <div className="note crit" role="alert">
+            {at("groups")}
+          </div>
+        )}
+      </fieldset>
       {groupsNote && <div className="note warn">{groupsNote}</div>}
 
       {conflict && <ConflictNote onReload={onReload} />}

@@ -29,8 +29,11 @@ test.beforeAll(async () => {
       doc: { display_name, provider: "openai", api_key, api_base, groups },
     });
   // Every write that names a group names a live one: the accounts below,
-  // and the tenant and key edits the specs make.
-  for (const name of ["grp-alpha-7c1", "grp-none-6b2", "grp-none-4c8"]) {
+  // and the tenant and key edits the specs make. `grp-alpha-7c1` carries a
+  // display name different from its routing name: its picker is named by the
+  // display name, with the routing name in small text beside it.
+  await stack.admin.createGroup("grp-alpha-7c1", "Alpha 分组 7c1");
+  for (const name of ["grp-none-6b2", "grp-none-4c8"]) {
     await stack.admin.createGroup(name, name);
   }
   // Every account a tenant key reaches by default is in `shared`.
@@ -129,6 +132,9 @@ test("新建内部密钥：明文只显示一次，用它能调网关", async ({
   await page.getByRole("button", { name: "新建密钥" }).click();
   const form = page.getByRole("group", { name: "新建密钥" });
   await form.getByLabel("名称").fill("ops-key-t6");
+  // The platform's own tenant chooses among every live group, so the
+  // operator answers the select. The account serving `chat-t6-*` is in `shared`.
+  await form.getByLabel("分组（必选）").selectOption({ label: "shared" });
   await form.getByLabel("模型（可写通配）").fill("chat-t6-*");
   await form.getByRole("button", { name: "创建" }).click();
 
@@ -263,27 +269,45 @@ test("吊销后它从列表消失，网关返回 401", async ({ page }) => {
   expect(listed.map((k) => k.label)).toEqual(["keep-key-t6"]);
 });
 
-test("给租户 key 设置分组覆盖 grp-alpha-7c1：运维侧显示，租户的 /api/keys 不含该分组", async ({ page }) => {
+test("给租户 key 选定 grp-alpha-7c1：运维侧按显示名显示，租户的 /api/keys 不含该分组", async ({ page }) => {
   const t = await signUpActive("T6 Alpha Co 7e4", "owner@alpha-t6.test", [models.chat, models.alpha]);
-  const { key, plaintext } = await mint(t, "alpha-key-t6");
-  await expect.poll(() => chatStatus(plaintext), { timeout: KEY_READY_MS }).toBe(200);
-  // The tenant's groups do not reach the alpha account.
-  expect(await chatStatus(plaintext, "alpha-t6-e2e")).not.toBe(200);
+  let tenant = await stack.admin.get(`/admin/tenants/${t.id}`);
+  // Two assigned groups, so the tenant's own `/api` key needs a group_id,
+  // and the account below reaches each group separately.
+  await stack.admin.patch(
+    `/admin/tenants/${t.id}`,
+    { allowed_provider_groups: ["shared", "grp-alpha-7c1"] },
+    tenant.version,
+  );
+  // `alpha-t6-e2e` is served by an account only in grp-alpha-7c1; `chat-t6-e2e`
+  // by one only in `shared`. A key in one group reaches its own model and not
+  // the other's.
+  const current = await stack.admin.get(`/admin/tenants/${t.id}`);
+  await stack.admin.patch(
+    `/admin/tenants/${t.id}`,
+    { allowed_model_ids: [models.chat.id, models.alpha.id] },
+    current.version,
+  );
+  const groupId = (await stack.admin.get("/admin/provider-groups")).items.find(
+    (g: { name: string }) => g.name === "grp-alpha-7c1",
+  ).id;
+  const created = await stack.admin.post(`/admin/tenants/${t.id}/keys`, {
+    label: "alpha-key-t6",
+    group_id: groupId,
+    model_ids: [models.alpha.id],
+  });
+  const plaintext: string = created.plaintext;
+  await expect.poll(() => chatStatus(plaintext, "alpha-t6-e2e"), { timeout: KEY_READY_MS }).toBe(200);
+  // The group is the routing rule: the same key cannot reach `shared`'s model.
+  expect(await chatStatus(plaintext, "chat-t6-e2e")).not.toBe(200);
 
   await openKeys(page, t.org);
   const row = keyRow(page, "alpha-key-t6");
-  await expect(row).toContainText("shared");
-  await expect(row).not.toContainText("grp-alpha-7c1");
-  await row.getByRole("button", { name: "分组覆盖" }).click();
-  const editor = keyTable(page).getByRole("group", { name: "分组覆盖" });
-  await editor.getByRole("checkbox", { name: "grp-alpha-7c1" }).check();
-  // grp-alpha-7c1 holds an upstream account, so the save asks for no confirmation.
-  await editor.getByRole("button", { name: "保存覆盖" }).click();
-
+  // The control plane's display name, with the routing name beside it.
+  await expect(row).toContainText("Alpha 分组 7c1");
   await expect(row).toContainText("grp-alpha-7c1");
-  expect((await stack.admin.get(`/admin/keys/${key.id}`)).effective_provider_groups).toEqual(["grp-alpha-7c1"]);
-  await expect.poll(() => chatStatus(plaintext, "alpha-t6-e2e"), { timeout: ROLLOUT_BOUND_MS }).toBe(200);
-  for (const path of ["/api/keys", `/api/keys/${key.id}`]) {
+  expect((await stack.admin.get(`/admin/keys/${created.key.id}`)).effective_provider_groups).toEqual(["grp-alpha-7c1"]);
+  for (const path of ["/api/keys", `/api/keys/${created.key.id}`]) {
     const answer = await t.client.request("GET", path);
     expect(answer.status, `${path}: ${answer.text}`).toBe(200);
     expect(answer.text, path).toContain("alpha-key-t6");
@@ -302,6 +326,8 @@ test("给客户租户新建密钥：只能调用所选模型，限额与过期�
   await expect(choices.getByRole("checkbox", { name: "other-t6-e2e" })).toBeVisible();
   await expect(choices.getByRole("checkbox", { name: "alpha-t6-e2e" })).toHaveCount(0);
   await form.getByLabel("名称").fill("scoped-key-t6");
+  // The tenant has one group, chosen in the form already.
+  await expect(form.getByLabel("分组（必选）")).toHaveValue("shared");
   await choices.getByRole("checkbox", { name: "chat-t6-e2e" }).check();
   await form.getByLabel("并发").fill("2");
   await form.getByLabel("每分钟请求").fill("30");
@@ -329,47 +355,108 @@ test("给客户租户新建密钥：只能调用所选模型，限额与过期�
   expect(stored.created_by.kind).toBe("operator");
 });
 
-test("分组覆盖只选没有上游账号的分组时，先警告并要求确认", async ({ page }) => {
+test("分组只选一个：分组没有上游账号时先警告并要求确认，确认后才创建", async ({ page }) => {
   const t = await signUpActive("T6 Unreach Co 8b3", "owner@unreach-t6.test", [models.chat]);
   const current = await stack.admin.request("GET", `/admin/tenants/${t.id}`);
   // A group no upstream account is in, beside the default one.
   await stack.admin.patch(`/admin/tenants/${t.id}`, { allowed_provider_groups: ["shared", "grp-none-6b2"] }, current.version!);
-  const { key } = await mint(t, "unreach-key-t6");
 
   await openKeys(page, t.org);
-  const row = keyRow(page, "unreach-key-t6");
-  await row.getByRole("button", { name: "分组覆盖" }).click();
-  const editor = keyTable(page).getByRole("group", { name: "分组覆盖" });
-  await expect(editor.getByRole("listitem").filter({ hasText: "grp-none-6b2" })).toContainText("没有上游账号在此分组");
-  await editor.getByRole("checkbox", { name: "grp-none-6b2" }).check();
-  await editor.getByRole("button", { name: "保存覆盖" }).click();
-  await expect(editor.getByRole("alert")).toContainText("grp-none-6b2");
-  // Nothing is saved until it is confirmed.
-  expect((await stack.admin.get(`/admin/keys/${key.id}`)).allowed_provider_groups).toBeNull();
-  await editor.getByRole("button", { name: "确认保存覆盖" }).click();
-  await expect
-    .poll(async () => (await stack.admin.get(`/admin/keys/${key.id}`)).allowed_provider_groups)
-    .toEqual(["grp-none-6b2"]);
+  await page.getByRole("button", { name: "新建密钥" }).click();
+  const form = page.getByRole("group", { name: "新建密钥" });
+  await form.getByLabel("名称").fill("unreach-key-t6");
+  const select = form.getByLabel("分组（必选）");
+  // The placeholder and the tenant's own two groups, and no others.
+  await expect(select.locator("option")).toHaveCount(3);
+  await expect(select.locator("option", { hasText: "grp-alpha-7c1" })).toHaveCount(0);
+  await select.selectOption({ label: "grp-none-6b2" });
+  await form.getByRole("button", { name: "创建" }).click();
+  await expect(form.getByRole("alert")).toContainText("grp-none-6b2");
+  expect((await stack.admin.get(`/admin/tenants/${t.id}/keys`)).items).toEqual([]);
+  await form.getByRole("button", { name: "确认创建" }).click();
+  const plaintext = ((await page.getByLabel("密钥明文").textContent()) ?? "").trim();
+  const listed = (await stack.admin.get(`/admin/tenants/${t.id}/keys`)).items as Json[];
+  const stored = listed.find((k) => k.label === "unreach-key-t6");
+  expect(stored.group.name).toBe("grp-none-6b2");
+  expect(stored.effective_provider_groups).toEqual(["grp-none-6b2"]);
+  // The group holds no upstream: the key reaches nothing, as the warning said.
+  expect(await chatStatus(plaintext)).not.toBe(200);
 });
 
-test("分组覆盖里只要有一个分组带上游账号，保存就不需确认", async ({ page }) => {
-  const t = await signUpActive("T6 Mixed Co 6f1", "owner@mixed-t6.test", [models.chat]);
+test("为客户租户新建密钥：从租户的分组里选一个，创建后不能更改", async ({ page }) => {
+  const t = await signUpActive("T6 Single Co 2a6", "owner@single-t6.test", [models.chat]);
   const current = await stack.admin.request("GET", `/admin/tenants/${t.id}`);
-  await stack.admin.patch(`/admin/tenants/${t.id}`, { allowed_provider_groups: ["shared", "grp-none-4c8"] }, current.version!);
-  const { key } = await mint(t, "mixed-key-t6");
+  await stack.admin.patch(
+    `/admin/tenants/${t.id}`,
+    { allowed_provider_groups: ["shared", "grp-alpha-7c1"] },
+    current.version!,
+  );
 
   await openKeys(page, t.org);
-  await keyRow(page, "mixed-key-t6").getByRole("button", { name: "分组覆盖" }).click();
-  const editor = keyTable(page).getByRole("group", { name: "分组覆盖" });
-  await expect(editor.getByRole("listitem").filter({ hasText: "grp-none-4c8" })).toContainText("没有上游账号在此分组");
+  await page.getByRole("button", { name: "新建密钥" }).click();
+  const form = page.getByRole("group", { name: "新建密钥" });
+  await form.getByLabel("名称").fill("single-key-t6");
+  const select = form.getByLabel("分组（必选）");
+  // A choice is required: the create button stays disabled until one is made.
+  await expect(form.getByRole("button", { name: "创建" })).toBeDisabled();
+  // Each option is the group's display name; a routing name that differs is shown with it.
+  await expect(select.locator("option", { hasText: "Alpha 分组 7c1" })).toContainText("grp-alpha-7c1");
+  await select.selectOption({ label: "Alpha 分组 7c1（grp-alpha-7c1）" });
+  await form.getByRole("button", { name: "创建" }).click();
+  await expect.poll(() => page.getByLabel("密钥明文").textContent()).toMatch(/^sk-aisix-\S{16,}$/);
+  await page.getByRole("button", { name: "关闭" }).click();
+
+  const listed = (await stack.admin.get(`/admin/tenants/${t.id}/keys`)).items as Json[];
+  const stored = listed.find((k) => k.label === "single-key-t6");
+  expect(stored.group.name).toBe("grp-alpha-7c1");
+  expect(stored.effective_provider_groups).toEqual(["grp-alpha-7c1"]);
+  // Shown by display name and routing name, and no way to change it.
+  const row = keyRow(page, "single-key-t6");
+  await expect(row).toContainText("Alpha 分组 7c1");
+  await expect(row).toContainText("grp-alpha-7c1");
+  await expect(row.getByRole("button", { name: "选择分组" })).toHaveCount(0);
+  expect((await stack.admin.get(`/admin/keys/${stored.id}`)).group.name).toBe("grp-alpha-7c1");
+});
+
+test("未选分组的旧密钥可以设置一次分组", async ({ page }) => {
+  const t = await signUpActive("T6 Legacy Co 4e7", "owner@legacy-t6.test", [models.chat]);
+  const current = await stack.admin.request("GET", `/admin/tenants/${t.id}`);
+  await stack.admin.patch(
+    `/admin/tenants/${t.id}`,
+    { allowed_provider_groups: ["shared", "grp-alpha-7c1"] },
+    current.version!,
+  );
+  const shared = (await stack.admin.get("/admin/provider-groups")).items.find(
+    (g: { name: string }) => g.name === "shared",
+  );
+  const created = await stack.admin.post(`/admin/tenants/${t.id}/keys`, {
+    label: "legacy-key-t6",
+    group_id: shared.id,
+  });
+  // The state an older control-plane replica leaves: a key with no group,
+  // which no API write produces.
+  stack.clearKeyGroup(created.key.id);
+  expect((await stack.admin.get(`/admin/keys/${created.key.id}`)).group).toBeNull();
+
+  await openKeys(page, t.org);
+  const row = keyRow(page, "legacy-key-t6");
+  await expect(row).toContainText("未选分组");
+  await row.getByRole("button", { name: "选择分组" }).click();
+  const editor = keyTable(page).getByRole("group", { name: "选择分组" });
+  // One group, once: checking another replaces the first, which the row
+  // shows by its display name.
+  await editor.getByRole("checkbox", { name: "Alpha 分组 7c1" }).check();
+  await expect(editor.getByRole("checkbox", { checked: true })).toHaveCount(1);
   await editor.getByRole("checkbox", { name: "shared" }).check();
-  await editor.getByRole("checkbox", { name: "grp-none-4c8" }).check();
-  // shared holds an upstream account, so one click saves.
-  await editor.getByRole("button", { name: "保存覆盖" }).click();
+  await expect(editor.getByRole("checkbox", { checked: true })).toHaveCount(1);
+  await editor.getByRole("checkbox", { name: "Alpha 分组 7c1" }).check();
+  await editor.getByRole("button", { name: "保存分组" }).click();
   await expect
-    .poll(async () => [...((await stack.admin.get(`/admin/keys/${key.id}`)).allowed_provider_groups ?? [])].sort())
-    .toEqual(["grp-none-4c8", "shared"]);
-  await expect(keyTable(page).getByRole("button", { name: "确认保存覆盖" })).toHaveCount(0);
+    .poll(async () => (await stack.admin.get(`/admin/keys/${created.key.id}`)).group?.name)
+    .toBe("grp-alpha-7c1");
+  // Never again: the one-time action is gone, and the operator API refuses another.
+  await expect(row.getByRole("button", { name: "选择分组" })).toHaveCount(0);
+  await expect(row).toContainText("Alpha 分组 7c1");
 });
 
 test("成员被改为计费角色后，他的密钥在网关上被拒，密钥页说明原因", async ({ page }) => {
@@ -397,26 +484,25 @@ test("成员被改为计费角色后，他的密钥在网关上被拒，密钥�
   await expect(row).toContainText("计费成员不持有可用的密钥");
 });
 
-test("密钥的分组覆盖指向租户已没有的分组时，在租户页和密钥页都标出", async ({ page }) => {
+test("密钥的分组不在租户的可用分组中时，在租户页和密钥页都标出并说明已停用", async ({ page }) => {
   const t = await signUpActive("T6 Stray Co 1f7", "owner@stray-t6.test", [models.chat]);
   let tenant = await stack.admin.request("GET", `/admin/tenants/${t.id}`);
   await stack.admin.patch(`/admin/tenants/${t.id}`, { allowed_provider_groups: ["shared", "grp-alpha-7c1"] }, tenant.version!);
-  const stray = (await mint(t, "stray-key-t6")).key;
-  const kept = (await mint(t, "kept-key-t6")).key;
-  for (const [k, groups] of [
-    [stray, ["grp-alpha-7c1"]],
-    [kept, ["shared"]],
-  ] as const) {
-    const v = (await stack.admin.request("GET", `/admin/keys/${k.id}`)).version!;
-    await stack.admin.patch(`/admin/keys/${k.id}`, { allowed_provider_groups: groups }, v);
-  }
-  // The tenant loses grp-alpha-7c1; the first key's override still names it.
+  const groups = (await stack.admin.get("/admin/provider-groups")).items as Json[];
+  const alpha = groups.find((g) => g.name === "grp-alpha-7c1");
+  const shared = groups.find((g) => g.name === "shared");
+  const stray = await stack.admin.post(`/admin/tenants/${t.id}/keys`, { label: "stray-key-t6", group_id: alpha.id });
+  const kept = await stack.admin.post(`/admin/tenants/${t.id}/keys`, { label: "kept-key-t6", group_id: shared.id });
+  // The tenant loses grp-alpha-7c1; the first key stays in it and is closed.
   tenant = await stack.admin.request("GET", `/admin/tenants/${t.id}`);
   await stack.admin.patch(`/admin/tenants/${t.id}`, { allowed_provider_groups: ["shared"] }, tenant.version!);
+  expect((await stack.admin.get(`/admin/keys/${stray.key.id}`)).effective_disabled).toBe(true);
+  expect((await stack.admin.get(`/admin/keys/${kept.key.id}`)).effective_disabled).toBe(false);
 
   const flag = "不在租户的可用分组中";
   await openKeys(page, t.org);
   await expect(keyRow(page, "stray-key-t6")).toContainText(flag);
+  await expect(keyRow(page, "stray-key-t6")).toContainText("已停用");
   await expect(keyRow(page, "kept-key-t6")).toContainText("shared");
   await expect(keyRow(page, "kept-key-t6")).not.toContainText(flag);
 
@@ -454,26 +540,44 @@ test("两个运维同时操作同一密钥：后操作的被拒并提示重新�
   expect([stored.label, stored.disabled]).toEqual(["race-key-t6-renamed", false]);
 });
 
-test("分组覆盖打开期间另一位运维改了它：刷新后再保存被拒，另一位的修改保留", async ({ page }) => {
+test("选择分组打开期间另一位运维设了它：刷新后再保存被拒，另一位的修改保留", async ({ page }) => {
   const t = await signUpActive("T6 Override Race Co 2d8", "owner@orace-t6.test", [models.chat]);
-  const { key } = await mint(t, "orace-key-t6");
+  const current = await stack.admin.get(`/admin/tenants/${t.id}`);
+  await stack.admin.patch(
+    `/admin/tenants/${t.id}`,
+    { allowed_provider_groups: ["shared", "grp-alpha-7c1"] },
+    current.version,
+  );
+  // A key with no group: the state an older replica leaves, and the only one
+  // a one-time choice is offered to.
+  const shared = (await stack.admin.get("/admin/provider-groups")).items.find(
+    (g: { name: string }) => g.name === "shared",
+  );
+  const key = await stack.admin.post(`/admin/tenants/${t.id}/keys`, {
+    label: "orace-key-t6",
+    group_id: shared.id,
+  });
+  stack.clearKeyGroup(key.key.id);
 
   await openKeys(page, t.org);
   const row = keyRow(page, "orace-key-t6");
-  await expect(row).toContainText("shared");
-  await row.getByRole("button", { name: "分组覆盖" }).click();
-  const editor = keyTable(page).getByRole("group", { name: "分组覆盖" });
+  await expect(row).toContainText("未选分组");
+  await row.getByRole("button", { name: "选择分组" }).click();
+  const editor = keyTable(page).getByRole("group", { name: "选择分组" });
   await editor.getByRole("checkbox", { name: "shared" }).check();
-  // Meanwhile another operator gives the key an override of its own.
-  const current = await stack.admin.request("GET", `/admin/keys/${key.id}`);
-  await stack.admin.patch(`/admin/keys/${key.id}`, { allowed_provider_groups: ["grp-alpha-7c1"] }, current.version!);
+  // Meanwhile another operator gives the key a group.
+  const version = await stack.admin.request("GET", `/admin/keys/${key.key.id}`);
+  const alpha = (await stack.admin.get("/admin/provider-groups")).items.find(
+    (g: { name: string }) => g.name === "grp-alpha-7c1",
+  );
+  await stack.admin.patch(`/admin/keys/${key.key.id}`, { group_id: alpha.id }, version.version!);
   // The page reads the list again while the editor stays open.
   await page.getByRole("button", { name: "刷新" }).click();
   await expect(row).toContainText("grp-alpha-7c1");
 
-  await editor.getByRole("button", { name: "保存覆盖" }).click();
+  await editor.getByRole("button", { name: "保存分组" }).click();
   await expect(editor.getByRole("alert")).toContainText("该资源已被他人修改");
-  expect((await stack.admin.get(`/admin/keys/${key.id}`)).allowed_provider_groups).toEqual(["grp-alpha-7c1"]);
+  expect((await stack.admin.get(`/admin/keys/${key.key.id}`)).group.name).toBe("grp-alpha-7c1");
 });
 
 test("待审核的租户在密钥页没有新建密钥", async ({ page }) => {

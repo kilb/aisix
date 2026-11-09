@@ -104,6 +104,13 @@ td > .tn-actions {
 .tn-checks.tn-groups {
   grid-template-columns: minmax(0, 1fr);
 }
+/* A group's routing name beside its display name, as the documents store it. */
+.grp-route {
+  margin-left: var(--s-2);
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: var(--fs-13);
+}
 .tn-note {
   margin-left: var(--s-2);
   color: var(--text-muted);

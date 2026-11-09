@@ -1,4 +1,4 @@
-import { spawn, type ChildProcess } from "node:child_process";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { join } from "node:path";
@@ -148,7 +148,7 @@ export class ApiClient {
  * its keys needs a balance first.
  */
 export async function fundTenant(admin: ApiClient, tenantId: string): Promise<void> {
-  await admin.post(`/admin/tenants/${tenantId}/credits`, { amount_usd: "10.00", reason: "e2e funding" });
+  await admin.post(`/admin/tenants/${tenantId}/credits`, { amount_cny: "10.00", reason: "e2e funding" });
 }
 
 export interface Stack {
@@ -170,16 +170,46 @@ export interface Stack {
   admin: ApiClient;
   /** A fresh client with no session, for `/api` (sign up or log in first). */
   tenant(): ApiClient;
+  /**
+   * Sets a key's `group_id` back to `NULL`: the state an older control-plane
+   * replica leaves behind, which no API write produces (every create names a
+   * group) and which a spec that needs a legacy groupless key sets directly.
+   */
+  clearKeyGroup(id: string): void;
   stop(): Promise<void>;
 }
 
 interface ReadyLine {
   ready: true;
   httpUrl: string;
+  /** The stack's own control-plane database, for [`sqlAgainst`]. */
+  cpDatabase: string;
   operator: { email: string; password: string };
   gateway: { proxyUrl: string; metricsUrl: string; dpId: string; name: string };
   mockUpstream: { url: string };
   telemetryRelay?: { controlUrl: string };
+}
+
+/** `psql`, or what `CP_E2E_PSQL` names. */
+const PSQL = process.env.CP_E2E_PSQL || "psql";
+
+/**
+ * One statement against the stack's control-plane database, for state no API
+ * write produces. The stack names its database, never a credential: the URL
+ * is built from the `CP_E2E_PG_URL` the run already holds.
+ */
+function sqlAgainst(database: string, statement: string): string {
+  const pgUrl = process.env.CP_E2E_PG_URL;
+  if (!pgUrl) throw new Error("CP_E2E_PG_URL is not set");
+  const url = new URL(pgUrl);
+  url.pathname = `/${database}`;
+  const r = spawnSync(PSQL, [url.toString(), "-v", "ON_ERROR_STOP=1", "-qAtc", statement], {
+    encoding: "utf8",
+    timeout: 30_000,
+  });
+  if (r.error) throw new Error(`cannot run ${PSQL}: ${r.error.message}`);
+  if (r.status !== 0) throw new Error(`${PSQL} failed (${statement}): ${r.stderr.trim()}`);
+  return r.stdout;
 }
 
 function freePort(): Promise<number> {
@@ -349,6 +379,8 @@ export async function startStack(opts: { telemetryRelay?: boolean } = {}): Promi
       operator: ready.operator,
       admin,
       tenant: () => new ApiClient(ready.httpUrl),
+      clearKeyGroup: (id: string) =>
+        sqlAgainst(ready.cpDatabase, `UPDATE tenant_keys SET group_id = NULL WHERE id = '${id}'`),
       stop,
     };
   } catch (e) {

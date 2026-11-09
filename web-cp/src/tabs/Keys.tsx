@@ -3,8 +3,8 @@ import type { TabProps } from "../App";
 import { GatewayTooOld } from "../components/GatewayTooOld";
 import { RolloutBadge } from "../components/RolloutBadge";
 import {
+  groups as groupsApi,
   keys as keysApi,
-  providerGroups,
   resources,
   tenants,
   type AdminKey,
@@ -15,17 +15,16 @@ import {
 } from "../lib/api";
 import { errorText, fmtTime } from "../lib/fmt";
 import {
-  accountsByGroup,
   atList,
   Check,
+  ChooseGroup,
   Failure,
   follow,
-  GroupPicker,
-  groupOptions,
-  EffectiveGroups,
+  groupChoices,
   groupsText,
+  idOf,
+  KeyGroupCell,
   LimitInput,
-  OverrideEditor,
   refusal,
   ROLE_LABEL,
   STATUS_LABEL,
@@ -34,6 +33,7 @@ import {
   useLifetime,
   useLoad,
   whyOff,
+  type GroupChoice,
   type Refusal,
 } from "./Tenants";
 import { Button } from "../ui/Button";
@@ -184,7 +184,7 @@ function TenantKeys({ tenantId, canEdit, tick }: { tenantId: string; canEdit: bo
   const keyList = useLoad(() => tenants.keys(tenantId), [tenantId, tick]);
   const members = useLoad(() => tenants.members(tenantId), [tenantId, tick]);
   const catalog = useLoad(() => resources.list<{ display_name?: string }>("models"), [tick]);
-  const groups = useLoad(() => providerGroups.list(), [tick]);
+  const groups = useLoad(() => groupsApi.list(), [tick]);
   const [creating, setCreating] = useState(false);
   // Held only here: switching tenant or leaving the tab drops it for good.
   const [minted, setMinted] = useState<MintedKey | null>(null);
@@ -217,11 +217,14 @@ function TenantKeys({ tenantId, canEdit, tick }: { tenantId: string; canEdit: bo
     () => new Map((catalog.data ?? []).map((m) => [m.id, m.doc.display_name || m.id])),
     [catalog.data],
   );
-  const options = useMemo(
-    () => groupOptions(groups.data, tenant?.allowed_provider_groups ?? []),
-    [groups.data, tenant?.allowed_provider_groups],
-  );
-  const accounts = useMemo(() => accountsByGroup(groups.data), [groups.data]);
+  const choices = useMemo(() => {
+    if (tenant === null) return [];
+    const all = groupChoices(groups.data);
+    // A customer's key takes one of its tenant's assigned groups; the
+    // platform's own tenant has no list to take one from, so it takes any.
+    if (tenant.is_internal) return all;
+    return all.filter((g) => tenant.allowed_provider_groups.includes(g.name));
+  }, [groups.data, tenant]);
 
   const saved = (k: AdminKey) => {
     keyList.setData((list) => list && list.map((x) => (x.id === k.id ? k : x)));
@@ -279,8 +282,7 @@ function TenantKeys({ tenantId, canEdit, tick }: { tenantId: string; canEdit: bo
           tenant={tenant}
           names={names}
           catalogError={catalog.error}
-          options={options}
-          accounts={accounts}
+          choices={choices}
           onMinted={(m) => {
             setMinted(m);
             setCreating(false);
@@ -314,7 +316,7 @@ function TenantKeys({ tenantId, canEdit, tick }: { tenantId: string; canEdit: bo
               <th>前缀</th>
               <th>成员</th>
               <th>模型</th>
-              <th>生效分组</th>
+              <th>分组</th>
               <th>限额</th>
               <th>状态</th>
               <th>创建者</th>
@@ -332,8 +334,7 @@ function TenantKeys({ tenantId, canEdit, tick }: { tenantId: string; canEdit: bo
                   <td>{ownerOf(k, tenant, members.data)}</td>
                   <td>{modelsOf(k, tenant, names)}</td>
                   <td>
-                    <EffectiveGroups groups={k.effective_provider_groups} tenant={tenant} />
-                    {k.allowed_provider_groups?.length ? <span className="tn-note">覆盖</span> : null}
+                    <KeyGroupCell k={k} />
                     <StrayNote k={k} tenant={tenant} />
                   </td>
                   <td>{limitsOf(k)}</td>
@@ -363,10 +364,9 @@ function TenantKeys({ tenantId, canEdit, tick }: { tenantId: string; canEdit: bo
                 {editing === k.id && (
                   <tr className="dt-detail">
                     <td colSpan={columns}>
-                      <OverrideEditor
+                      <ChooseGroup
                         k={k}
-                        options={options}
-                        accounts={accounts}
+                        choices={choices}
                         onSaved={(next) => {
                           setEditing(null);
                           saved(next);
@@ -454,9 +454,12 @@ function KeyActions({
             onConfirm={() => void setDisabled(true)}
           />
         )}
-        <Button type="button" size="sm" aria-expanded={editing} onClick={onEdit}>
-          分组覆盖
-        </Button>
+        {/* A legacy key minted without a group takes one once; one that has a group never changes it. */}
+        {k.group === null && (
+          <Button type="button" size="sm" aria-expanded={editing} onClick={onEdit}>
+            选择分组
+          </Button>
+        )}
         <TwoStep
           label="吊销"
           size="sm"
@@ -544,7 +547,7 @@ function placedInForm(path: string): boolean {
     path === "/label" ||
     atList("/allowed_models")(path) ||
     /^\/model_ids\/\d+$/.test(path) ||
-    atList("/allowed_provider_groups")(path) ||
+    path === "/group_id" ||
     path === "/rate_limit/concurrency" ||
     path === "/rate_limit/rpm" ||
     path === "/expires_at"
@@ -555,23 +558,23 @@ function CreateForm({
   tenant,
   names,
   catalogError,
-  options,
-  accounts,
+  choices,
   onMinted,
   onCancel,
 }: {
   tenant: Tenant;
   names: Map<string, string>;
   catalogError: string | null;
-  options: string[];
-  accounts: Map<string, string[]>;
+  /** The groups a key of this tenant may take: its own for a customer, every live one for the platform's. */
+  choices: GroupChoice[];
   onMinted: (minted: MintedKey) => void;
   onCancel: () => void;
 }) {
   const [label, setLabel] = useState("");
   const [patterns, setPatterns] = useState("");
   const [models, setModels] = useState<string[]>([]);
-  const [groups, setGroups] = useState<string[]>([]);
+  // One group, required. A tenant with a single group has it chosen already.
+  const [group, setGroup] = useState<string>(() => (choices.length === 1 && choices[0] ? choices[0].name : ""));
   const [concurrency, setConcurrency] = useState("");
   const [rpm, setRpm] = useState("");
   const [expires, setExpires] = useState("");
@@ -588,8 +591,6 @@ function CreateForm({
         .sort((a, b) => a.name.localeCompare(b.name)),
     [tenant.allowed_model_ids, names],
   );
-  const picked = options.filter((g) => groups.includes(g));
-  const reachable = (g: string) => (accounts.get(g) ?? []).length > 0;
 
   /** The create body: every field left blank is left out. */
   function body(): NewKey {
@@ -601,7 +602,7 @@ function CreateForm({
       const ids = grants.filter((m) => models.includes(m.id)).map((m) => m.id);
       if (ids.length > 0) b.model_ids = ids;
     }
-    if (picked.length > 0) b.allowed_provider_groups = picked;
+    if (group !== "") b.group_id = idOf(choices, group);
     const limit: NonNullable<NewKey["rate_limit"]> = {};
     if (concurrency.trim() !== "") limit.concurrency = Number(concurrency);
     if (rpm.trim() !== "") limit.rpm = Number(rpm);
@@ -672,19 +673,27 @@ function CreateForm({
         </fieldset>
       )}
       <fieldset className="tn-section">
-        <legend>分组覆盖</legend>
-        <p className="hint">只对这个密钥生效，取代租户的可用分组。不选则沿用租户的分组。</p>
-        <GroupPicker
-          options={options}
-          chosen={groups}
-          onChange={setGroups}
-          disabled={busy}
-          accounts={accounts}
-          errorFor={(g) => at(`/allowed_provider_groups/${sent?.allowed_provider_groups?.indexOf(g) ?? -1}`)}
-        />
-        {at("/allowed_provider_groups") && (
+        <legend>分组</legend>
+        <p className="hint">每个密钥只路由到这一个分组里的上游账号。分组创建后不能更改。</p>
+        {choices.length === 0 ? (
+          <p className="hint">该租户没有可用的分组；先在租户页给它一个。</p>
+        ) : (
+          <label className="f">
+            <span>分组（必选）</span>
+            <select value={group} disabled={busy} onChange={(e) => setGroup(e.target.value)}>
+              <option value="">请选择分组</option>
+              {choices.map((g) => (
+                <option key={g.id} value={g.name}>
+                  {g.display_name}
+                  {g.display_name === g.name ? "" : `（${g.name}）`}
+                </option>
+              ))}
+            </select>
+          </label>
+        )}
+        {at("/group_id") && (
           <div className="note crit" role="alert">
-            {at("/allowed_provider_groups")}
+            {at("/group_id")}
           </div>
         )}
       </fieldset>
@@ -710,14 +719,14 @@ function CreateForm({
         )
       )}
       <div className="tn-actions">
-        {/* Groups none of which holds an upstream account leave the key nothing to reach (ruling P1b-R6). */}
+        {/* A group with no upstream account leaves the key nothing to reach (ruling P1b-R6). */}
         <TwoStep
           label="创建"
           kind="primary"
-          disabled={busy}
+          disabled={busy || group === ""}
           busy={busy}
-          ask={() => picked.length > 0 && !picked.some(reachable)}
-          warning={unreachableWarning(picked, "这个密钥")}
+          ask={() => group !== "" && !(choices.find((g) => g.name === group)?.accounts.length ?? 0)}
+          warning={unreachableWarning(choices.filter((g) => g.name === group).map((g) => g.display_name), "这个密钥")}
           onConfirm={() => void submit()}
         />
         <Button type="button" onClick={onCancel}>

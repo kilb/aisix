@@ -57,9 +57,63 @@ function groupsField(page: Page) {
   return page.getByRole("group", { name: "分组", exact: true });
 }
 
+/**
+ * The display name and routing name of each group in the form, and whether
+ * it is chosen. Read from the DOM because the routing name sits beside the
+ * control rather than inside its label.
+ */
+async function groupBoxes(page: Page): Promise<{ display: string; route: string | null; checked: boolean }[]> {
+  return groupsField(page)
+    .getByRole("checkbox")
+    .evaluateAll((els) =>
+      els.map((el) => {
+        const label = el.parentElement as HTMLElement;
+        // The routing name is a sibling of the label, inside the same row.
+        const row = el.closest("li") as HTMLElement;
+        const route = row.querySelector("code.grp-route")?.textContent ?? null;
+        const display = Array.from(label.childNodes)
+          .filter((n) => n.nodeType === Node.TEXT_NODE)
+          .map((n) => n.textContent ?? "")
+          .join("")
+          .trim();
+        return { display, route, checked: (el as HTMLInputElement).checked };
+      }),
+    );
+}
+
+/**
+ * The routing names chosen in the form, sorted: what the document will store.
+ * A box reads its display name; its routing name is beside it only when the
+ * two differ, so an unadorned box's display name is its routing name unless
+ * it is one of `renamed`, whose display name differs and must be mapped.
+ */
+async function chosenGroups(page: Page, renamed: Record<string, string> = {}): Promise<string[]> {
+  const boxes = await groupBoxes(page);
+  return boxes
+    .filter((b) => b.checked)
+    .map((b) => (b.route === null ? (renamed[b.display] ?? b.display) : b.route))
+    .sort();
+}
+
+/**
+ * The display name a box reads for routing name `name`, from the control
+ * plane's own list: the form offers every live group by display name.
+ */
+async function displayOf(name: string): Promise<string | null> {
+  const items: { name: string; display_name: string }[] = (await stack.admin.get("/admin/provider-groups")).items;
+  return items.find((g) => g.name === name)?.display_name ?? null;
+}
+
 async function addGroup(page: Page, name: string): Promise<void> {
-  await page.getByRole("textbox", { name: "添加分组" }).fill(name);
-  await page.getByRole("button", { name: "添加", exact: true }).click();
+  const display = await displayOf(name);
+  if (display === null) throw new Error(`no group ${name} in the form: ${JSON.stringify(await groupBoxes(page))}`);
+  await groupsField(page).getByRole("checkbox", { name: display, exact: true }).check();
+}
+
+async function dropGroup(page: Page, name: string): Promise<void> {
+  const display = await displayOf(name);
+  if (display === null) throw new Error(`no group ${name} in the form: ${JSON.stringify(await groupBoxes(page))}`);
+  await groupsField(page).getByRole("checkbox", { name: display, exact: true }).uncheck();
 }
 
 async function createAccount(doc: Json): Promise<Json> {
@@ -122,9 +176,9 @@ test("新建上游账号默认带平台默认分组，保存后显示已生效",
   await loginAsOperator(page);
   await openTab(page, "上游账号");
   await page.getByRole("button", { name: "新增上游账号" }).click();
-  await expect(groupsField(page).getByRole("listitem")).toHaveText(["shared"]);
+  await expect.poll(() => chosenGroups(page)).toEqual(["shared"]);
   await addGroup(page, "grp-alpha-7c1");
-  await expect(groupsField(page).getByRole("listitem")).toHaveText(["shared", "grp-alpha-7c1"]);
+  await expect.poll(() => chosenGroups(page)).toEqual(["grp-alpha-7c1", "shared"]);
   await page.getByLabel("名称").fill("acct-alpha-e2e");
   await page.getByLabel("供应商标识").fill("openai");
   await page.getByLabel("接口地址").fill(`${stack.mockUpstreamUrl}/v1`);
@@ -142,6 +196,44 @@ test("新建上游账号默认带平台默认分组，保存后显示已生效",
   expect(stored.rollout.state).toBe("applied");
 });
 
+test("上游账号的分组从分组列表中选择，不能填写不存在的分组", async ({ page }) => {
+  // One group whose display name differs from its routing name, so a picker
+  // that offers the routing name in place of the display name is visible.
+  await stack.admin.createGroup("grp-ui-7e2", "欧洲二区 7e2");
+  await loginAsOperator(page);
+  await openTab(page, "上游账号");
+  await page.getByRole("button", { name: "新增上游账号" }).click();
+  const field = groupsField(page);
+  // A checkbox per live group, offered by display name: no box to type a name into.
+  await expect(field.getByRole("checkbox")).not.toHaveCount(0);
+  await expect(field.getByRole("textbox")).toHaveCount(0);
+  await expect(page.getByRole("textbox", { name: "添加分组" })).toHaveCount(0);
+  const boxes = await groupBoxes(page);
+  // Every live group is offered. A spec earlier in this file may have created
+  // one, so the list is a superset of the seed rather than equal to it.
+  // The routing name reads beside a display name that differs from it; a
+  // group whose display name equals its routing name reads once.
+  const live: { name: string; display_name: string }[] = (
+    await stack.admin.get("/admin/provider-groups")
+  ).items.map((g: Json) => ({ name: g.name, display_name: g.display_name }));
+  // A box reads its display name and, beside it, the routing name exactly
+  // when the two differ.
+  for (const g of live) {
+    const box = boxes.find((b) => b.display === g.display_name);
+    expect(box, `no box for ${g.display_name}: ${JSON.stringify(boxes)}`).toBeDefined();
+    expect(box!.route).toBe(g.display_name === g.name ? null : g.name);
+  }
+  expect(boxes.map((b) => b.display)).toContain("默认");
+  // A name that is not a group has nowhere to be typed: the only way to list
+  // one is to check a group that exists. The form starts on the platform's
+  // default group, `shared`.
+  await addGroup(page, "grp-alpha-7c1");
+  await expect.poll(() => chosenGroups(page)).toEqual(["grp-alpha-7c1", "shared"]);
+  await dropGroup(page, "grp-alpha-7c1");
+  await expect.poll(() => chosenGroups(page)).toEqual(["shared"]);
+  await page.getByRole("button", { name: "取消" }).click();
+});
+
 test("新建上游账号的默认分组跟随平台设置", async ({ page }) => {
   const before = await stack.admin.get("/admin/settings/tenant-defaults");
   const changed = await stack.admin.request("PUT", "/admin/settings/tenant-defaults", {
@@ -153,7 +245,7 @@ test("新建上游账号的默认分组跟随平台设置", async ({ page }) => 
     await loginAsOperator(page);
     await openTab(page, "上游账号");
     await page.getByRole("button", { name: "新增上游账号" }).click();
-    await expect(groupsField(page).getByRole("listitem")).toHaveText(["grp-dflt-8a3"]);
+    await expect.poll(() => chosenGroups(page)).toEqual(["grp-dflt-8a3"]);
   } finally {
     const restored = await stack.admin.request("PUT", "/admin/settings/tenant-defaults", before);
     expect(restored.status).toBe(200);
@@ -257,7 +349,7 @@ test("两个运维同时编辑同一个上游账号：后保存的被拒，先�
       await loginAsOperator(p);
       await openTab(p, "上游账号");
       await accountRow(p, "acct-race-e2e").getByRole("button", { name: "编辑" }).click();
-      await expect(groupsField(p).getByRole("listitem")).toHaveText(["shared"]);
+      await expect.poll(() => chosenGroups(p)).toEqual(["shared"]);
     }
 
     await addGroup(page, "grp-x-41f");
@@ -273,7 +365,7 @@ test("两个运维同时编辑同一个上游账号：后保存的被拒，先�
 
     // Reloading from the note shows what is stored now.
     await other.getByRole("button", { name: "重新载入" }).click();
-    await expect(groupsField(other).getByRole("listitem")).toHaveText(["shared", "grp-x-41f"]);
+    await expect.poll(() => chosenGroups(other)).toEqual(["grp-x-41f", "shared"]);
 
     await other.reload();
     await openTab(other, "上游账号");
@@ -386,13 +478,13 @@ test("移除分组前，点名因此用不到该账号的租户与密钥；取�
   await loginAsOperator(page);
   await openTab(page, "上游账号");
   await accountRow(page, "acct-solo-e2e").getByRole("button", { name: "编辑" }).click();
-  await page.getByRole("button", { name: "移除 grp-solo-6b2" }).click();
+  await dropGroup(page, "grp-solo-6b2");
   await page.getByRole("button", { name: "保存" }).click();
   const confirm = page.getByRole("region", { name: "移除分组" });
   await expect(confirm).toContainText("grp-solo-6b2");
-  await expect(confirm.getByRole("listitem").filter({ hasText: "tenant-solo-e2e" })).toContainText(
-    "租户默认分组不再包含该账号",
-  );
+  // The warning's two lines share the tenant's name, so each is found by its
+  // own text.
+  await expect(confirm.getByText("租户「tenant-solo-e2e」：租户默认分组不再包含该账号")).toBeVisible();
   await expect(confirm).toContainText("key-solo-e2e");
   await expect(confirm).not.toContainText("tenant-both-e2e");
   await expect(confirm).not.toContainText("tenant-covered-e2e");
@@ -433,7 +525,7 @@ test("取消后改为移除另一个分组：确认框只列这一次的影响�
   await accountRow(page, "acct-swap-e2e").getByRole("button", { name: "编辑" }).click();
   const confirm = page.getByRole("region", { name: "移除分组" });
   // The first removal names the tenant that uses the group.
-  await page.getByRole("button", { name: "移除 grp-swap-a1c" }).click();
+  await dropGroup(page, "grp-swap-a1c");
   await page.getByRole("button", { name: "保存" }).click();
   await expect(confirm).toContainText("tenant-swap-e2e");
   await confirm.getByRole("button", { name: "取消" }).click();
@@ -443,7 +535,7 @@ test("取消后改为移除另一个分组：确认框只列这一次的影响�
   await page.getByRole("button", { name: "保存" }).click();
   await confirm.getByRole("button", { name: "取消" }).click();
   await addGroup(page, "grp-swap-a1c");
-  await page.getByRole("button", { name: "移除 grp-idle-4e1" }).click();
+  await dropGroup(page, "grp-idle-4e1");
   await page.getByRole("button", { name: "保存" }).click();
   await expect(confirm.getByRole("button", { name: "确认移除分组" })).toBeEnabled();
   // Read once, the moment confirming is offered: a stale list would be showing now.
