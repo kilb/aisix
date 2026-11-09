@@ -1,7 +1,10 @@
 # 花费预算：从控制平面同步调用改为本地策略执行
 
 日期：2026-08-20
-状态：待实现
+状态：历史文档。`max_spend_micro_usd` 与其花费层已于 2026-11-09 移除（决策见
+`.superpowers/platform/design/2026-11-09-p4-gateway-quota-evaluation.md` 的选项 D）：
+所有按钱的拦截都走控制平面推送的 `budgets` 文档与 `exhausted` 标记。本文保留原样，
+只作为当时的取舍记录。
 
 ## 为什么
 

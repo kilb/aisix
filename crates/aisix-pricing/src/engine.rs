@@ -33,10 +33,9 @@ const NOT_MODEL_USAGE: [&str; 5] = ["a2a", "mcp", "files", "batches", "fine_tuni
 
 /// Operations an upstream can bill in units no usage counter carries yet:
 /// images, audio and video seconds, characters. A successful one that
-/// reported no tokens is unpriced, never free. The gateway's own spend makes
-/// the same exception (`costs_what_its_price_cannot_say` in
-/// `aisix-proxy/src/usage_attr.rs`). Rerank is added: an upstream that bills
-/// rerank by search unit reports no tokens (`aisix-proxy/src/rerank.rs`).
+/// reported no tokens is unpriced, never free. Rerank is added: an upstream
+/// that bills rerank by search unit reports no tokens
+/// (`aisix-proxy/src/rerank.rs`).
 const PRICED_IN_OTHER_UNITS: [&str; 7] = [
     "image_generation",
     "image_edit",

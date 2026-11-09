@@ -27,7 +27,6 @@ import {
 // dollar, so an expected value is arithmetic on the numbers in this file, read
 // here in micro-USD (one dollar is 1_000_000).
 
-const UNPRICED = "aisix_budget_unpriced_requests_total";
 const COST = { input_per_1k: 1, output_per_1k: 1 };
 const CREDENTIAL_REF = "mock";
 const LOGSTORE = "money-accounting";
@@ -261,8 +260,6 @@ const BUDGET = "sk-money-budget";
 const BUDGET_ID = randomUUID();
 const TOKENS = "sk-money-tokens";
 const TOKENS_ID = randomUUID();
-const CEILING = "sk-money-ceiling";
-const CEILING_ID = randomUUID();
 const SESSION = "sk-money-session";
 const SESSION_ID = randomUUID();
 
@@ -400,13 +397,6 @@ describe("what a request costs, who pays it, and what a cache hands back", () =>
       window: "day",
       max_tokens: 50,
     });
-    await seed.createRateLimitPolicy({
-      name: "money-ceiling",
-      scope: "api_key",
-      scope_ref: CEILING_ID,
-      window: "day",
-      max_spend_micro_usd: 50_000_000,
-    });
 
     // Keys last: once the last one authenticates, the rest is in the snapshot.
     const putKey = (id: string, plaintext: string) =>
@@ -417,7 +407,6 @@ describe("what a request costs, who pays it, and what a cache hands back", () =>
       });
     await putKey(BUDGET_ID, BUDGET);
     await putKey(TOKENS_ID, TOKENS);
-    await putKey(CEILING_ID, CEILING);
     await putKey(SUBMITTER_ID, SUBMITTER);
     await putKey(READER_ID, READER);
     await putKey(SESSION_ID, SESSION);
@@ -623,34 +612,6 @@ describe("what a request costs, who pays it, and what a cache hands back", () =>
       await new Promise((r) => setTimeout(r, 50));
     }
     expect(status, "2000 tokens went through a limit of 50").toBe(429);
-  });
-
-  test("a priced image counts as spend a ceiling cannot see", async (ctx) => {
-    if (!etcdReachable) return ctx.skip();
-    const before = await scrape();
-    const res = await post("/v1/images/generations", CEILING, { model: "painter", prompt: "a cat" });
-    expect(res.status).toBe(200);
-    const labels = { policy: "money-ceiling", model: "painter" };
-    expect(await deltaOf(before, UNPRICED, labels)).toBe(1);
-    expect(microOf(await rowOf(res))).toBe(0);
-  });
-
-  test("a web search counts as spend a ceiling cannot see, beside the tokens it does", async (ctx) => {
-    if (!etcdReachable) return ctx.skip();
-    const before = await scrape();
-    const res = await messages("searcher", "look it up", CEILING);
-    expect(res.status).toBe(200);
-    const labels = { policy: "money-ceiling", model: "searcher" };
-    expect(await deltaOf(before, UNPRICED, labels)).toBe(1);
-    expect(microOf(await rowOf(res))).toBe(2_000_000);
-  });
-
-  test("tokens a price covers are not reported as spend a ceiling cannot see", async (ctx) => {
-    if (!etcdReachable) return ctx.skip();
-    const before = await scrape();
-    expect((await chat("repeatable", "fully priced", CEILING)).status).toBe(200);
-    await settle();
-    expect(metricDelta(before, await scrape(), UNPRICED, { policy: "money-ceiling" })).toBe(0);
   });
 
   async function submitBatch(key: string): Promise<{ id: string; raw: string }> {

@@ -845,14 +845,7 @@ impl ProxyError {
             ProxyError::BudgetExceeded(r) if hides_budget_scope(r) => {
                 ErrorEnvelope::new(HIDDEN_BUDGET_MESSAGE, self.kind()).with_code("budget_exceeded")
             }
-            ProxyError::BudgetExceeded(r) => {
-                let mut env = env.with_code("budget_exceeded").with_budget(r);
-                // A message that names a policy is the platform's wording.
-                if let (true, Some(m)) = (crate::platform_errors::active(), &r.caller_message) {
-                    env.error.message = m.clone();
-                }
-                env
-            }
+            ProxyError::BudgetExceeded(r) => env.with_code("budget_exceeded").with_budget(r),
             ProxyError::BudgetUnverified => env.with_code("budget_unverified"),
             ProxyError::AccountUnavailable => env.with_code("control_plane_unavailable"),
             // Attribution for policy-layer 429s (#892): the
@@ -2166,27 +2159,6 @@ pub(crate) mod tests {
         assert!(!shown(&reason(Some(BudgetScope::ProviderKey), "team")));
         assert!(!shown(&reason(Some(BudgetScope::Team), "provider_key")));
         assert!(!shown(&reason(None, "team")));
-    }
-
-    #[test]
-    fn an_own_scope_budget_429_with_a_caller_message_names_no_policy() {
-        let err = ProxyError::BudgetExceeded(Box::new(crate::budget::BudgetReason {
-            message: "spend ceiling reached for policy acme-tier".into(),
-            caller_message: Some("Spend ceiling reached.".into()),
-            scope: Some("team".into()),
-            scope_kind: Some(aisix_core::models::BudgetScope::Team),
-            ..Default::default()
-        }));
-        let b = render_platform(&err);
-        assert_eq!(b["error"]["message"], "Spend ceiling reached.");
-        assert!(!b.to_string().contains("acme-tier"));
-        // Telemetry and the operator-facing text keep the policy name.
-        assert!(err.to_string().contains("acme-tier"));
-        let off = serde_json::to_value(err.envelope()).unwrap();
-        assert!(off["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("acme-tier"));
     }
 
     fn requests_detail() -> aisix_ratelimit::RateLimitError {

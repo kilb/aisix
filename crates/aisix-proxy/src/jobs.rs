@@ -2794,9 +2794,6 @@ struct BatchAttribution {
     payer: AuthenticatedKey,
     model: Arc<ResourceEntry<Model>>,
     price: Option<aisix_core::models::model::ModelCost>,
-    /// 付钱的那把密钥在定价模型上的花费桶。批处理的钱是事后落账的，那时没有
-    /// 任何预留可以取键。
-    spend_keys: Vec<String>,
     raw_batch_id: String,
     output_file_id: String,
     ended_at: Option<f64>,
@@ -2858,23 +2855,12 @@ fn prepare_batch_attribution(
         .for_snapshot(&snap)
         .resolve(&model.value)
         .cloned();
-    let spend_keys = crate::quota::spend_bucket_keys(
-        state,
-        &snap,
-        &payer,
-        &crate::quota::ModelRateLimit::from_model(
-            &model.value.display_name,
-            &model.id,
-            &model.value,
-        ),
-    );
     Some(BatchAttribution {
         state: state.clone(),
         target: target.clone(),
         payer,
         model,
         price,
-        spend_keys,
         raw_batch_id: raw_batch_id.to_string(),
         output_file_id,
         ended_at,
@@ -2884,7 +2870,7 @@ fn prepare_batch_attribution(
     })
 }
 
-/// How many batch attributions that can credit spend download their output
+/// How many batch attributions that can credit metrics download their output
 /// file at once ([`crate::state::ProxyStateInner::batch_attribution_permits`]).
 /// Every download takes a permit, whichever path saw the batch end: a
 /// retrieve, a listing or the gateway's own watcher. A listing names a page
@@ -3103,7 +3089,6 @@ async fn attribute_batch_usage(job: &BatchAttribution) -> Result<(), String> {
     let cost = job.price.as_ref();
     let pk_id = job.target.pk_entry.id.as_str();
     let raw_batch_id = job.raw_batch_id.as_str();
-    let spend_keys = &job.spend_keys;
     let request_headers = &job.request_headers;
     let user_agent = job.user_agent.as_str();
 
@@ -3213,10 +3198,10 @@ async fn attribute_batch_usage(job: &BatchAttribution) -> Result<(), String> {
     let multi = per_model.len() > 1;
     // 这条归因会重放：进程内的去重集合是优化不是正确性机制，重启或换实例之后
     // 再看到同一个已完成批次就会重来一遍。用量事件带确定性 id，消费端据此去重
-    // ——**它**是幂等的。而下面两条不是：Prometheus 计数器和额度计数器
-    // 都没有那层保护，重放一次就是把这批多记一遍。
+    // ——**它**是幂等的。而下面那条不是：Prometheus 计数器没有那层保护，
+    // 重放一次就是把这批多记一遍。
     //
-    // 所以只给这两条加闸，且闸放在与计数器同一个存储里：共享存储下跨重启、跨
+    // 所以只给它加闸，且闸放在与计数器同一个存储里：共享存储下跨重启、跨
     // 实例都只记一次。进程内存储下标记活不过重启，所以还要先看批次结束的时刻
     // （见 [`batch_credit_is_ruled_out`]）。TTL 取 30 天：供应商保留已完成批次的
     // 量级就是这个，之后不可能再被重取。
@@ -3229,24 +3214,20 @@ async fn attribute_batch_usage(job: &BatchAttribution) -> Result<(), String> {
         tracing::warn!(
             batch_id = %raw_batch_id,
             "batch ended before this process started and the rate-limit store does not \
-             outlive a process: its spend is left uncounted rather than risk charging it twice",
+             outlive a process: its metrics are left uncounted rather than risk counting it \
+             twice",
         );
         false
     } else {
         state
             .limiter
             .claim_once(
-                &format!("batch-spend:{raw_batch_id}"),
+                &format!("batch-credit:{raw_batch_id}"),
                 std::time::Duration::from_secs(30 * 24 * 3600),
             )
             .await
     };
-    // 先回扣额度，再发事件与指标。顺序是有意的：观察者只能看见事件和指标，
-    // 把额度放在它们之后，就存在一个「指标已到、额度未到」的窗口，任何据此
-    // 判断的检查都会间歇性地看错。
-    //
-    // 一处算价，两处用（额度那笔、事件那笔）。上一版把公式抄了两遍 —— 那正是
-    // 两个数字会各自漂走的形状。
+    // 一处算价，事件用。上一版把公式抄了两遍 —— 那正是两个数字会各自漂走的形状。
     //
     // 输出行里的 `prompt_tokens_details.cached_tokens` 有自己的费率
     // （`cached_input_per_1k`）：按全价输入算会多收，而事件里这个计数是照报的，
@@ -3267,15 +3248,6 @@ async fn attribute_batch_usage(job: &BatchAttribution) -> Result<(), String> {
         })
         .unwrap_or(0.0)
     };
-    let billed_micro_usd: u64 = per_model
-        .values()
-        .map(|agg| crate::usage_attr::spend_micro_usd(slice_cost_usd(agg)))
-        .fold(0u64, |a, b| a.saturating_add(b));
-    if credit && billed_micro_usd > 0 && !spend_keys.is_empty() {
-        state
-            .limiter
-            .add_tokens_post_stream_all(spend_keys, billed_micro_usd);
-    }
     for (idx, (provider_model, agg)) in per_model.iter().enumerate() {
         let request_id = batch_attribution_request_id(raw_batch_id, idx, multi);
         let mut event = UsageEvent {
@@ -4519,7 +4491,7 @@ mod tests {
         assert!(
             state
                 .limiter
-                .claim_once("batch-spend:batch_1", std::time::Duration::from_secs(600))
+                .claim_once("batch-credit:batch_1", std::time::Duration::from_secs(600))
                 .await,
             "标记该是空的"
         );

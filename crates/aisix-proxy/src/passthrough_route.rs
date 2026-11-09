@@ -1122,7 +1122,7 @@ async fn dispatch(
 
     let mut telemetry = RouteTelemetry {
         state: state.clone(),
-        token_keys: reservation.token_keys(),
+        token_keys: reservation.keys(),
         route_name: route.name.clone(),
         trace: client.trace.clone(),
         provider_label: pk_entry

@@ -1962,6 +1962,38 @@ mod tests {
         assert_eq!(entry.value.max_requests, Some(100));
     }
 
+    /// `max_spend_micro_usd` was retired. A stored row that still carries it
+    /// beside a limit this build enforces serves that limit, and reports the
+    /// retired field as one it ignored rather than failing the row.
+    #[test]
+    fn a_stored_policy_carrying_a_retired_spend_ceiling_loads_and_reports_it() {
+        let entries = vec![raw(
+            "/aisix/rate_limit_policies/rlp-spend",
+            br#"{
+                "name": "team-quota",
+                "scope": "team",
+                "scope_ref": "team-uuid-1",
+                "window": "day",
+                "max_requests": 100,
+                "max_spend_micro_usd": 5000000
+            }"#,
+            5,
+        )];
+        let (snap, stats) = build_snapshot(&env_prefixes(), &entries);
+        assert_eq!(stats.accepted, 1, "rejections: {:?}", stats.rejections);
+        assert!(stats.rejections.is_empty());
+        let entry = snap.rate_limit_policies.get_by_id("rlp-spend").unwrap();
+        assert_eq!(entry.value.max_requests, Some(100));
+        assert_eq!(
+            stats.partially_compatible,
+            vec![PartialCompatEntry {
+                kind: "rate_limit_policies".into(),
+                field: "max_spend_micro_usd".into(),
+                count: 1,
+            }]
+        );
+    }
+
     #[test]
     fn conditional_rate_limit_policy_loads_into_snapshot() {
         let entries = vec![raw(

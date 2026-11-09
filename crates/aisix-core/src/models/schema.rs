@@ -2914,9 +2914,8 @@ fn branch_kind(branch: &serde_json::Map<String, Value>) -> Option<&str> {
 ///
 /// - the classic/conditional form XOR
 ///   ([`super::rate_limit_policy::rate_limit_policy_form_one_of`]), which also
-///   carries the classic form's "at least one of
-///   `max_requests`/`max_tokens`/`max_spend_micro_usd`" and keeps every classic
-///   field off the conditional form;
+///   carries the classic form's "at least one of `max_requests`/`max_tokens`"
+///   and keeps every classic field off the conditional form;
 /// - the `PolicySchedule` day-selector XOR;
 /// - closing the `ConditionNode` object variants on the write path: the node
 ///   is `#[serde(untagged)]`, so serde buffers its content and silently
@@ -5905,37 +5904,32 @@ mod tests {
         assert!(validate_rate_limit_policy_lenient(&v).is_err());
     }
 
+    /// `max_spend_micro_usd` was retired. The write path refuses it as an
+    /// unknown field. The read path loads a stored row that still carries it
+    /// beside another limit, and refuses one that carried nothing else: it
+    /// names no limit the classic form can enforce.
     #[test]
-    fn rate_limit_policy_accepts_a_spend_only_classic_row() {
-        // A budget is typically "no token cap, just a money cap". The
-        // classic branch used to require max_requests or max_tokens, so
-        // such a row failed the write path and the ceiling was
-        // unconfigurable.
-        let v = json!({
-            "name": "daily-budget",
+    fn a_retired_spend_ceiling_is_refused_on_write_and_loads_only_beside_a_limit() {
+        let beside = json!({
+            "name": "p",
             "scope": "api_key",
-            "scope_ref": "k1",
+            "scope_ref": "k",
+            "window": "day",
+            "max_requests": 1,
+            "max_spend_micro_usd": 5_000_000u64
+        });
+        assert!(validate_rate_limit_policy(&beside).is_err());
+        validate_rate_limit_policy_lenient(&beside)
+            .expect("a stored row with another limit still loads");
+        let only = json!({
+            "name": "p",
+            "scope": "api_key",
+            "scope_ref": "k",
             "window": "day",
             "max_spend_micro_usd": 5_000_000u64
         });
-        assert!(validate_rate_limit_policy(&v).is_ok());
-        assert!(validate_rate_limit_policy_lenient(&v).is_ok());
-    }
-
-    #[test]
-    fn rate_limit_policy_rejects_max_spend_on_a_conditional_row() {
-        // `max_spend_micro_usd` projects onto a counter through `window`,
-        // which the conditional form does not have — so the gate could
-        // never read it. Accepting it would be a knob that loads and is
-        // never enforced; the form XOR rejects it instead.
-        let v = json!({
-            "name": "cond-spend",
-            "conditions": [ { "dimension": "team", "operator": "==", "value": "t-1" } ],
-            "limits": { "rpm": 5 },
-            "max_spend_micro_usd": 5_000_000u64
-        });
-        assert!(validate_rate_limit_policy(&v).is_err());
-        assert!(validate_rate_limit_policy_lenient(&v).is_err());
+        assert!(validate_rate_limit_policy(&only).is_err());
+        assert!(validate_rate_limit_policy_lenient(&only).is_err());
     }
 
     #[test]

@@ -1135,11 +1135,9 @@ struct SessionMeter<'a> {
     requested_model: &'a str,
     client_type: &'a str,
     token_keys: Vec<String>,
-    spend_keys: Vec<String>,
     input_tokens: u64,
     output_tokens: u64,
     cached_tokens: u64,
-    micro_usd: u64,
     /// What the session has cost so far: each response priced when it arrived.
     cost_usd: f64,
     responses: u32,
@@ -1193,14 +1191,11 @@ impl SessionMeter<'_> {
         (self.input_tokens, self.output_tokens, self.cached_tokens) =
             (usage.input_tokens, usage.output_tokens, usage.cached_tokens);
         self.cost_usd += self.price_usd(&snap, input, cached, output);
-        let micro_usd = crate::usage_attr::spend_micro_usd(self.cost_usd);
-        let spend = micro_usd.saturating_sub(self.micro_usd);
-        self.micro_usd = self.micro_usd.max(micro_usd);
         self.responses = usage.responses;
 
-        let limiter = &self.state.limiter;
-        limiter.add_tokens_post_stream_all(&self.token_keys, input + output);
-        limiter.add_tokens_post_stream_all(&self.spend_keys, spend);
+        self.state
+            .limiter
+            .add_tokens_post_stream_all(&self.token_keys, input + output);
         // A realtime session bills real tokens against a real model, and
         // reports them as each frame arrives.
         crate::request_metrics::record_usage(
@@ -1478,12 +1473,10 @@ async fn run_session(
         provider_label: &provider_label,
         requested_model: &requested_model,
         client_type,
-        token_keys: reservation.token_keys(),
-        spend_keys: reservation.spend_keys(),
+        token_keys: reservation.keys(),
         input_tokens: 0,
         output_tokens: 0,
         cached_tokens: 0,
-        micro_usd: 0,
         cost_usd: 0.0,
         responses: 0,
     };
@@ -1827,7 +1820,7 @@ async fn run_session(
     // the same one the event reports and the charges along the way add up to.
     meter.settle(&usage);
     let cost_usd = meter.cost_usd;
-    reservation.commit_tokens_no_spend(0).await;
+    reservation.commit_tokens(0).await;
 
     emit_access_log(
         &Method::GET,

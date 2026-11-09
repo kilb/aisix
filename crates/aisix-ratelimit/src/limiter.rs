@@ -115,18 +115,6 @@ impl Limiter {
         key: &str,
         limits: &RateLimit,
     ) -> Result<Reservation, RateLimitError> {
-        self.pre_commit_with_unit(key, limits, CounterUnit::Tokens)
-            .await
-    }
-
-    /// Same as [`Self::pre_commit`], but names the unit this layer's
-    /// counter is denominated in.
-    pub async fn pre_commit_with_unit(
-        &self,
-        key: &str,
-        limits: &RateLimit,
-        unit: CounterUnit,
-    ) -> Result<Reservation, RateLimitError> {
         let member = self.next_member();
         self.store.acquire(key, limits, &member).await?;
         let has_concurrency_slot = limits.concurrency.is_some();
@@ -149,7 +137,6 @@ impl Limiter {
             refresh_task,
             lease_loss,
             committed: false,
-            unit,
         })
     }
 
@@ -265,19 +252,6 @@ impl Default for Limiter {
     }
 }
 
-/// 一个预留层计数的单位。
-///
-/// store 对此无感——`FixedWindowCounter` 不关心它数的是什么，token 和钱
-/// 对它是同一种量。只有 `Reservation` 知道自己那个桶里的数字是什么单位，
-/// 所以分派发生在这一层，而不是store 层。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CounterUnit {
-    /// 桶里计的是 token 数。
-    Tokens,
-    /// 桶里计的是 micro-USD（1 USD = 1_000_000）。
-    MicroUsd,
-}
-
 /// Reservation guard. Dropping without a `commit_tokens` call is still
 /// safe — the concurrency slot is released, just no tokens are counted.
 pub struct Reservation {
@@ -293,8 +267,6 @@ pub struct Reservation {
     /// while `send_replace` keeps the terminal state for the later hold.
     lease_loss: tokio::sync::watch::Sender<bool>,
     committed: bool,
-    /// 见 [`CounterUnit`]。默认 `Tokens`，与本字段引入前的行为一致。
-    unit: CounterUnit,
 }
 
 impl std::fmt::Debug for Reservation {
@@ -320,14 +292,6 @@ impl Reservation {
         self.store.commit(&self.key, tokens, &self.member).await;
         self.committed = true;
     }
-
-    /// 该层应记的量：token 层记 token 数，花费层记 micro-USD。
-    fn amount_for(&self, tokens: u64, spend_micro_usd: u64) -> u64 {
-        match self.unit {
-            CounterUnit::Tokens => tokens,
-            CounterUnit::MicroUsd => spend_micro_usd,
-        }
-    }
 }
 
 impl Drop for Reservation {
@@ -352,50 +316,20 @@ impl MultiReservation {
         Self { reservations }
     }
 
-    /// 提交实际用量，每层按自己的 [`CounterUnit`] 取对应的数字。
-    pub async fn commit(self, tokens: u64, spend_micro_usd: u64) {
+    /// Commit the actual token cost to every layer.
+    pub async fn commit_tokens(self, tokens: u64) {
         for r in self.reservations {
-            let amount = r.amount_for(tokens, spend_micro_usd);
-            r.commit_tokens(amount).await;
+            r.commit_tokens(tokens).await;
         }
     }
 
-    /// 等价于 `commit(tokens, 0)`——如果这个预留带花费层，花费桶记的是 0。
-    /// 名字刻意长一点：调用它就是在断言"这个调用点没有花费数字要记"，
-    /// 而不是顺手图省事漏记了钱。适用场景——命中缓存（没有真实上游花费）、
-    /// 错误路径（没跑到能算出花费的地方）、以及任何本来就拿不到花费数字的
-    /// 调用点。44 处既有调用点都属于这几类之一；新调用点如果**有**花费数字，
-    /// 应该用 [`Self::commit`]，不要为了省事套用这个。
-    pub async fn commit_tokens_no_spend(self, tokens: u64) {
-        self.commit(tokens, 0).await;
-    }
-
-    /// 流结束后要记 token 数的桶键（[`CounterUnit::Tokens`] 那些层）。
-    ///
-    /// 刻意不提供「所有层的键」这一种取法：流式路径拿到键之后是用
-    /// [`Limiter::add_tokens_post_stream_all`] 一次批量加同一个数字，
-    /// 把两种单位的桶混在一张表里，就会把 token 数记进花费桶——数字看着
-    /// 正常，量纲完全不对，且不会有任何报错。
-    pub fn token_keys(&self) -> Vec<String> {
-        self.keys_of_unit(CounterUnit::Tokens)
-    }
-
-    /// 流结束后要记 micro-USD 的桶键（[`CounterUnit::MicroUsd`] 那些层）。
-    /// 与 [`Self::token_keys`] 成对使用，各记各的数字。
-    pub fn spend_keys(&self) -> Vec<String> {
-        self.keys_of_unit(CounterUnit::MicroUsd)
-    }
-
-    fn keys_of_unit(&self, unit: CounterUnit) -> Vec<String> {
-        self.reservations
-            .iter()
-            .filter(|r| r.unit == unit)
-            .map(|r| r.key.clone())
-            .collect()
+    /// Return owned keys for post-stream token accounting.
+    pub fn keys(&self) -> Vec<String> {
+        self.reservations.iter().map(|r| r.key.clone()).collect()
     }
 
     /// Absorb another reservation's layers into this one, so a single
-    /// `commit_tokens_no_spend` / `into_stream_hold` finalises both. Used by the
+    /// `commit_tokens` / `into_stream_hold` finalises both. Used by the
     /// routing dispatch to fold the winning target's model-layer
     /// reservation into the request-level reservation once the winner
     /// is known.
@@ -1189,7 +1123,7 @@ mod tests {
     // --- MultiReservation tests ----------------------------------------
 
     #[tokio::test]
-    async fn multi_reservation_commit_tokens_no_spend_updates_all_layers() {
+    async fn multi_reservation_commit_tokens_updates_all_layers() {
         let clock = TestClock::new(100);
         let limiter = Limiter::local_with_clock(clock.clone());
         let l = limits(None, Some(1000), None);
@@ -1198,7 +1132,7 @@ mod tests {
         let r2 = limiter.pre_commit("model:gpt-4o", &l).await.unwrap();
         let multi = MultiReservation::new(vec![r1, r2]);
 
-        multi.commit_tokens_no_spend(500).await;
+        multi.commit_tokens(500).await;
 
         let s1 = limiter.peek("api_key:k1", &l).await.unwrap();
         let s2 = limiter.peek("model:gpt-4o", &l).await.unwrap();
@@ -1305,25 +1239,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn multi_reservation_keys_are_split_by_counter_unit() {
-        let clock = TestClock::new(100);
-        let limiter = Limiter::local_with_clock(clock.clone());
-        let l = limits(Some(10), None, None);
-
-        let r1 = limiter.pre_commit("api_key:k1", &l).await.unwrap();
-        let r2 = limiter.pre_commit("model:m1", &l).await.unwrap();
-        let r3 = limiter
-            .pre_commit_with_unit("spend:api_key:k1", &l, CounterUnit::MicroUsd)
-            .await
-            .unwrap();
-        let multi = MultiReservation::new(vec![r1, r2, r3]);
-
-        // 流式路径按单位分两批记账。混在一起会把 token 数记进花费桶。
-        assert_eq!(multi.token_keys(), vec!["api_key:k1", "model:m1"]);
-        assert_eq!(multi.spend_keys(), vec!["spend:api_key:k1"]);
-    }
-
-    #[tokio::test]
     async fn multi_reservation_merge_commits_and_releases_absorbed_layers() {
         let clock = TestClock::new(100);
         let limiter = Limiter::local_with_clock(clock.clone());
@@ -1334,11 +1249,11 @@ mod tests {
 
         let mut multi = MultiReservation::new(vec![main]);
         multi.merge(MultiReservation::new(vec![member]));
-        assert_eq!(multi.token_keys(), vec!["api_key:k1", "model:target"]);
+        assert_eq!(multi.keys(), vec!["api_key:k1", "model:target"]);
 
         // One commit finalises both layers: tokens land on each and the
         // absorbed layer's concurrency slot is released.
-        multi.commit_tokens_no_spend(300).await;
+        multi.commit_tokens(300).await;
         let s = limiter.peek("model:target", &l).await.unwrap();
         assert_eq!(s.tpm_used, 300);
         assert!(limiter.pre_commit("model:target", &l).await.is_ok());
@@ -1477,64 +1392,5 @@ mod tests {
         }
         let err = limiter.pre_commit("k1", &l).await.unwrap_err();
         assert!(matches!(err, RateLimitError::Requests { .. }));
-    }
-
-    // --- CounterUnit dispatch tests --------------------------------------
-
-    /// 两个层各自计不同的量：token 层收 token 数，花费层收 micro-USD。
-    /// 把两者搞混不会让任何请求失败——只会让预算按 token 数扣钱，
-    /// 或让 token 窗口按分币计数，两种都静默。
-    #[tokio::test]
-    async fn commit_dispatches_each_layer_by_its_unit() {
-        let store = Arc::new(LocalStore::new());
-        let limiter = Limiter::with_store(Arc::clone(&store) as Arc<dyn RateStore>);
-        let limits = RateLimit {
-            tpd: Some(1_000_000),
-            ..RateLimit::default()
-        };
-
-        let tok = limiter
-            .pre_commit_with_unit("tok-layer", &limits, CounterUnit::Tokens)
-            .await
-            .expect("token layer reserves");
-        let spend = limiter
-            .pre_commit_with_unit("spend-layer", &limits, CounterUnit::MicroUsd)
-            .await
-            .expect("spend layer reserves");
-
-        MultiReservation::new(vec![tok, spend])
-            .commit(150, 4_200)
-            .await;
-
-        assert_eq!(
-            store.committed_tokens("tok-layer"),
-            150,
-            "token 层应收到 token 数"
-        );
-        assert_eq!(
-            store.committed_tokens("spend-layer"),
-            4_200,
-            "花费层应收到 micro-USD"
-        );
-    }
-
-    /// 旧入口保持原语义：全部按 token 层处理，花费为 0。
-    /// 44 处既有调用点依赖这一点。
-    #[tokio::test]
-    async fn commit_tokens_no_spend_still_treats_every_layer_as_tokens() {
-        let store = Arc::new(LocalStore::new());
-        let limiter = Limiter::with_store(Arc::clone(&store) as Arc<dyn RateStore>);
-        let limits = RateLimit {
-            tpd: Some(1_000),
-            ..RateLimit::default()
-        };
-        let r = limiter
-            .pre_commit("legacy", &limits)
-            .await
-            .expect("reserves");
-        MultiReservation::new(vec![r])
-            .commit_tokens_no_spend(77)
-            .await;
-        assert_eq!(store.committed_tokens("legacy"), 77);
     }
 }

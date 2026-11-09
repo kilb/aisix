@@ -628,4 +628,4 @@ Keeping tenants apart, which is not best effort either, still has this gap:
 
 Billing, which is not best effort, still has this gap:
 
-- A batch whose spend is credited after a restart (the batch attribution path credits spend keys this process never acquired) can still have that credit shed when the accounting queue is full.
+- A batch whose metrics are credited after a restart (the batch attribution path credits post-stream counters this process never acquired) can still have that credit shed when the accounting queue is full.

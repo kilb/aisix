@@ -1039,7 +1039,7 @@ async fn dispatch(
         )?;
         if let Some(hit) = gate.lookup().await {
             if let Some(r) = reservation.take() {
-                r.commit_tokens_no_spend(0).await;
+                r.commit_tokens(0).await;
             }
             let cache = crate::response_cache::CacheTelemetry::hit(&hit);
             // The cache answered for the entry the caller addressed: set the
@@ -1446,28 +1446,7 @@ async fn dispatch(
                                     )
                                 })
                                 .unwrap_or(0);
-                            // 花费按调度到的目标行定价——和这次请求的用量
-                            // 事件用的是同一个 model_id。
-                            let spend = success
-                                .usage
-                                .as_ref()
-                                .map(|u| {
-                                    crate::usage_attr::request_spend_micro_usd(
-                                        snapshot,
-                                        &target.id,
-                                        crate::usage_attr::input_tokens_from_counts(
-                                            u.prompt_tokens,
-                                            u.cached_prompt_tokens,
-                                            u.cache_write_tokens,
-                                            u.cache_read_tokens,
-                                            u.cache_creation_tokens,
-                                            u.cache_creation_ttl,
-                                        ),
-                                        u64::from(u.completion_tokens),
-                                    )
-                                })
-                                .unwrap_or(0);
-                            r.commit(total, spend).await;
+                            r.commit_tokens(total).await;
                         }
                     }
                     if let Some(gate) = cache_gate.as_ref() {
@@ -2176,7 +2155,7 @@ async fn responses_to_target(
         // #688: carry the reservation into the end-of-stream guard — keys drive
         // post-stream TPM/TPD accounting, the hold keeps the concurrency slot(s)
         // until the stream ends. `take()` leaves the handler's `reservation` as
-        // `None` so it won't also `commit_tokens_no_spend`.
+        // `None` so it won't also `commit_tokens`.
         // Fold this target's model-layer reservation in first (#1087)
         // so the guard covers the member's limits too; `take()` leaves it `None`
         // so the handler won't also commit it.
@@ -2186,16 +2165,7 @@ async fn responses_to_target(
                 None => *reservation = Some(member),
             }
         }
-        // 花费层的桶记 micro-USD，和 token 桶不能共用一张键表——同一批键
-        // 加同一个数字会把 token 数当成钱记进去。
-        let post_stream_keys = reservation
-            .as_ref()
-            .map(|r| r.token_keys())
-            .unwrap_or_default();
-        let spend_post_stream_keys = reservation
-            .as_ref()
-            .map(|r| r.spend_keys())
-            .unwrap_or_default();
+        let post_stream_keys = reservation.as_ref().map(|r| r.keys()).unwrap_or_default();
         let stream_hold = reservation.take().map(|r| r.into_stream_hold());
         let limiter_c = std::sync::Arc::clone(&state.limiter);
         let captured_prompt_c = captured_prompt.clone();
@@ -2253,7 +2223,7 @@ async fn responses_to_target(
                 }
                 // #688: apply the terminal token cost to TPM/TPD and release the
                 // concurrency hold now the stream has ended (sync analog of the
-                // reservation's async `commit_tokens_no_spend`, which this closure can't await).
+                // reservation's async `commit_tokens`, which this closure can't await).
                 let streamed_tokens = total_tokens_with_cache(
                     usage.prompt_tokens,
                     usage.completion_tokens,
@@ -2332,24 +2302,6 @@ async fn responses_to_target(
                 // A stream can outlive several config generations, so the
                 // end-of-stream emit reads a FRESH snapshot rather than the
                 // one the request started on (#941).
-                // 花费层记账（micro-USD），与上面的 token 记账成对。取值与
-                // 下面用量事件里的 cost_usd 同源：同一个快照、同一份 usage。
-                limiter_c.add_tokens_post_stream_all(
-                    &spend_post_stream_keys,
-                    crate::usage_attr::request_spend_micro_usd(
-                        &snap_c,
-                        &model_id_c,
-                        crate::usage_attr::input_tokens_from_counts(
-                            usage.prompt_tokens,
-                            usage.cached_prompt_tokens,
-                            usage.cache_write_tokens,
-                            usage.cache_read_tokens,
-                            usage.cache_creation_tokens,
-                            usage.cache_creation_ttl,
-                        ),
-                        u64::from(usage.completion_tokens),
-                    ),
-                );
                 emit_usage_event(
                     &state_c,
                     &snap_c,
@@ -2875,7 +2827,7 @@ async fn responses_cross_provider_to_target(
         // #688: carry the reservation into the end-of-stream guard — keys drive
         // post-stream TPM/TPD accounting, the hold keeps the concurrency slot(s)
         // until the stream ends. `take()` leaves the handler's `reservation` as
-        // `None` so it won't also `commit_tokens_no_spend`.
+        // `None` so it won't also `commit_tokens`.
         // Fold this target's model-layer reservation in first (#1087)
         // so the guard covers the member's limits too; `take()` leaves it `None`
         // so the handler won't also commit it.
@@ -2885,16 +2837,7 @@ async fn responses_cross_provider_to_target(
                 None => *reservation = Some(member),
             }
         }
-        // 花费层的桶记 micro-USD，和 token 桶不能共用一张键表——同一批键
-        // 加同一个数字会把 token 数当成钱记进去。
-        let post_stream_keys = reservation
-            .as_ref()
-            .map(|r| r.token_keys())
-            .unwrap_or_default();
-        let spend_post_stream_keys = reservation
-            .as_ref()
-            .map(|r| r.spend_keys())
-            .unwrap_or_default();
+        let post_stream_keys = reservation.as_ref().map(|r| r.keys()).unwrap_or_default();
         let stream_hold = reservation.take().map(|r| r.into_stream_hold());
         let limiter_c = std::sync::Arc::clone(&state.limiter);
         let captured_prompt_c = captured_prompt.clone();
@@ -2920,7 +2863,7 @@ async fn responses_cross_provider_to_target(
             move |mut comp| {
                 // #688: apply the terminal token cost to TPM/TPD and release the
                 // concurrency hold now the stream has ended (sync analog of the
-                // reservation's async `commit_tokens_no_spend`). Tokens count even on an
+                // reservation's async `commit_tokens`). Tokens count even on an
                 // output-guardrail block — the upstream still billed them.
                 let streamed_tokens = total_tokens_with_cache(
                     comp.prompt_tokens,
@@ -3022,24 +2965,6 @@ async fn responses_cross_provider_to_target(
                 // A stream can outlive several config generations, so the
                 // end-of-stream emit reads a FRESH snapshot rather than the
                 // one the request started on (#941).
-                // 花费层记账（micro-USD），与上面的 token 记账成对。取值与
-                // 下面用量事件里的 cost_usd 同源：同一个快照、同一份 usage。
-                limiter_c.add_tokens_post_stream_all(
-                    &spend_post_stream_keys,
-                    crate::usage_attr::request_spend_micro_usd(
-                        &snap_c,
-                        &model_id_c,
-                        crate::usage_attr::input_tokens_from_counts(
-                            usage.prompt_tokens,
-                            usage.cached_prompt_tokens,
-                            usage.cache_write_tokens,
-                            usage.cache_read_tokens,
-                            usage.cache_creation_tokens,
-                            usage.cache_creation_ttl,
-                        ),
-                        u64::from(usage.completion_tokens),
-                    ),
-                );
                 emit_usage_event(
                     &state_c,
                     &snap_c,
@@ -9764,92 +9689,6 @@ data: [DONE]\n\n";
         assert!(
             event.usage_estimated,
             "locally-counted tokens must be flagged"
-        );
-    }
-
-    /// 流式 `/v1/responses`（verbatim 透传）必须在流结束后把花费记进花费桶。
-    /// 这条路径不走 `MultiReservation::commit`，而是在流结束回调里拿
-    /// `spend_keys()` 单独记一笔——删掉那一次调用，token 侧一切照常，
-    /// 只有预算悄悄不再增长，没有任何报错。
-    ///
-    /// 这是 Codex 的流量入口：只测 chat 的话，这条路径会永远绿着而
-    /// 预算静默失效。
-    #[tokio::test]
-    async fn streaming_responses_commits_spend_and_the_next_request_is_refused() {
-        let upstream = MockServer::builder().start().await;
-        let sse_body = "\
-data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"}}\n\n\
-data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n\
-data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"usage\":{\"input_tokens\":500,\"output_tokens\":1000}}}\n\n\
-data: [DONE]\n\n";
-        Mock::given(method("POST"))
-            .and(path("/v1/responses"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .insert_header("content-type", "text/event-stream")
-                    .set_body_string(sse_body),
-            )
-            .mount(&upstream)
-            .await;
-
-        let snap = new_snap_openai(&upstream.uri());
-        // 1 USD / 1k token，进出同价 → (500 + 1000) / 1000 = 1.5 USD。
-        let model_json = format!(
-            r#"{{"display_name":"gpt-4o-resp","provider":"openai","model_name":"gpt-4o",
-                 "provider_key_id":"{OPENAI_PK_ID}",
-                 "cost":{{"input_per_1k":1.0,"output_per_1k":1.0}}}}"#
-        );
-        let m: Model = serde_json::from_str(&model_json).unwrap();
-        snap.models.insert(ResourceEntry::new("m-1", m, 1));
-        snap.apikeys.insert(apikey_entry(&["*"]));
-        // 只设花费上限：第二次被拒只可能是花费层干的。窗口取 minute，
-        // 好让 `peek` 能回读 tpm_used。
-        let policy: aisix_core::models::RateLimitPolicy =
-            serde_json::from_value(serde_json::json!({
-                "name": "budget",
-                "scope": "api_key",
-                "scope_ref": "k-1",
-                "window": "minute",
-                "max_spend_micro_usd": 1_000_000u64,
-            }))
-            .unwrap();
-        snap.rate_limit_policies
-            .insert(ResourceEntry::new("pol-spend", policy, 1));
-
-        let hub = Arc::new(Hub::new());
-        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
-        let state = crate::ProxyState::new(SnapshotHandle::new(snap), hub, &cfg()).without_cache();
-        let app = crate::build_router(state.clone());
-        let body = serde_json::json!({
-            "model": "gpt-4o-resp",
-            "input": "hi",
-            "stream": true,
-        });
-
-        let resp = app.clone().oneshot(make_req(body.clone())).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        // 读完 body，让流结束回调触发。
-        to_bytes(resp.into_body(), 65536).await.unwrap();
-
-        let spend_limits = aisix_core::RateLimit {
-            tpm: Some(1_000_000),
-            ..Default::default()
-        };
-        let status = state
-            .limiter
-            .peek("spend:api_key:k-1:pol-spend", &spend_limits)
-            .await
-            .expect("花费桶应已存在");
-        assert_eq!(
-            status.tpm_used, 1_500_000,
-            "花费桶里应是 micro-USD；记成 1500 就是把 token 数当成了钱",
-        );
-
-        let resp = app.oneshot(make_req(body)).await.unwrap();
-        assert_eq!(
-            resp.status(),
-            StatusCode::TOO_MANY_REQUESTS,
-            "流式 /v1/responses 的花费没有提交，预算完全不生效",
         );
     }
 

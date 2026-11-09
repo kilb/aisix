@@ -51,10 +51,6 @@ pub struct BudgetReason {
     /// figures only when both name one of the caller's own scopes; `None`
     /// is never the caller's.
     pub scope_kind: Option<aisix_core::models::BudgetScope>,
-    /// What a platform-mode caller reads in place of `message`, for a
-    /// message that names a policy. `message` still reaches the logs and
-    /// the usage event.
-    pub caller_message: Option<String>,
     pub scope_ref: Option<String>,
     pub limit_usd: Option<String>,
     pub spent_usd: Option<String>,
@@ -354,7 +350,6 @@ impl BudgetGate {
             scope_ref: doc.scope_ref.clone().or_else(|| budget.scope_ref.clone()),
             scope: Some(scope),
             scope_kind: Some(budget.scope),
-            caller_message: None,
             limit_usd: amount(&doc.limit_usd),
             spent_usd: amount(&doc.spent_usd),
             remaining_usd: amount(&doc.remaining_usd),

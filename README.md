@@ -136,13 +136,8 @@ For a multi-replica cluster, point the gateway at etcd instead — `resources_fi
   infrastructure. Choose AISIX Enterprise or AISIX Cloud when you want centralized
   management through a control plane and dashboard.
 - **Production controls built in.** Routing & failover, rate limits, guardrails, caching,
-  and observability ship in the box. Per-key and per-team spend caps
-  (`RateLimitPolicy.max_spend_micro_usd`) are enforced by the gateway itself, alongside
-  its other rate limits — never by calling out to a control plane. The default in-memory
-  backend adds no network call at all; the Redis backend trades one round trip to your
-  own Redis for counters shared across every replica. (Centrally managed budgets are
-  AISIX Enterprise and AISIX Cloud features — the gateway enforces the control plane's
-  decisions.)
+  and observability ship in the box. (Budgets and spend caps are AISIX Enterprise and
+  AISIX Cloud features — the gateway enforces the control plane's decisions.)
 
 ## 🧩 Features — available today
 
@@ -269,7 +264,7 @@ an API7-hosted commercial control plane.
 | Configuration | Declarative `resources.yaml`, or etcd for a cluster | Dashboard + AISIX Cloud Admin API | Dashboard + AISIX Cloud Admin API |
 | Tenancy | Single instance / namespace | Organization-scoped environments, teams, and members | Organization-scoped environments, teams, and members |
 | Provider keys | `${VAR}` references in `resources.yaml`; plaintext credentials in etcd | Encrypted at rest; operator-triggered in-place rotation | Encrypted at rest; operator-triggered in-place rotation |
-| Budgets | Per key / team spend caps (`RateLimitPolicy.max_spend_micro_usd`, enforced by the gateway; requests already in flight when the cap is crossed still complete) | Per key, provider, environment, organization, and team | Per key, provider, environment, organization, and team |
+| Budgets | — (rate and token limits only) | Per key, provider, environment, organization, and team | Per key, provider, environment, organization, and team |
 | RBAC and audit | Local admin key; no organization layer | Organization roles, invitations, and audit history | Organization roles, invitations, and audit history |
 | Operations | You operate the gateway | You operate the control plane and gateways | API7 operates the control plane; you operate gateways |
 

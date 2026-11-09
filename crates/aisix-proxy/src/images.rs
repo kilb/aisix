@@ -632,7 +632,7 @@ async fn dispatch(
     } = match dispatched {
         Ok(d) => d,
         Err(e) => {
-            reservation.commit_tokens_no_spend(0).await;
+            reservation.commit_tokens(0).await;
             return Err(e);
         }
     };
@@ -662,22 +662,12 @@ async fn dispatch(
             let total_tokens = usage.as_ref().map_or(0, |u| {
                 u64::from(u.prompt_tokens) + u64::from(u.completion_tokens)
             });
-            // 花费与本端点用量事件的 cost_usd 同源：按调度到的目标行定价，
-            // 输入全按新鲜计（这个表面没有提示缓存）。
-            let spend = usage.as_ref().map_or(0, |u| {
-                crate::usage_attr::request_spend_micro_usd(
-                    snapshot,
-                    &target.id,
-                    aisix_core::InputTokens::uncached_only(u64::from(u.prompt_tokens)),
-                    u64::from(u.completion_tokens),
-                )
-            });
             // Billed from here on: a caller that leaves during the commit or
             // the output review below still owes this answer.
             if let Some(u) = usage.as_ref() {
                 note_answered_image(snapshot, &target.id, u);
             }
-            reservation.commit(total_tokens, spend).await;
+            reservation.commit_tokens(total_tokens).await;
             let review = review_image_output(
                 &resolved_chain,
                 model_name,
@@ -724,7 +714,7 @@ async fn dispatch(
         // other failure left through the dispatch.
         Err(e) => {
             // No upstream call → no tokens to count; release the reservation.
-            reservation.commit_tokens_no_spend(0).await;
+            reservation.commit_tokens(0).await;
             let env = ErrorEnvelope::new(e.to_string(), "not_implemented");
             Ok(ImageDispatchSuccess {
                 response: (StatusCode::NOT_IMPLEMENTED, Json(env)).into_response(),

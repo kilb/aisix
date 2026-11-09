@@ -1706,7 +1706,7 @@ async fn multipart_dispatch(
     } = match dispatched {
         Ok(d) => d,
         Err(e) => {
-            reservation.commit_tokens_no_spend(0).await;
+            reservation.commit_tokens(0).await;
             return Err(e);
         }
     };
@@ -1743,8 +1743,7 @@ async fn multipart_dispatch(
             // concurrency slot stays held until the stream ends, and the
             // terminal token cost is applied to TPM/TPD from the guard —
             // the sync analog of the buffered path's `commit`.
-            let post_stream_keys = reservation.token_keys();
-            let spend_post_stream_keys = reservation.spend_keys();
+            let post_stream_keys = reservation.keys();
             let stream_hold = reservation.into_stream_hold();
             let limiter = std::sync::Arc::clone(&state.limiter);
             // least_busy: the target stays busy until the relay ends.
@@ -1810,16 +1809,6 @@ async fn multipart_dispatch(
                     // the end-of-stream emit reads a FRESH snapshot rather
                     // than the one the request started on (#941).
                     let snap = state_c.snapshot.load();
-                    // 花费与下面用量事件的 cost_usd 同源，token 与花费各记各的桶。
-                    limiter.add_tokens_post_stream_all(
-                        &spend_post_stream_keys,
-                        crate::usage_attr::request_spend_micro_usd(
-                            &snap,
-                            &model_id_c,
-                            aisix_core::InputTokens::uncached_only(u64::from(usage.prompt_tokens)),
-                            u64::from(usage.completion_tokens),
-                        ),
-                    );
                     let pk = crate::usage_attr::ResolvedPk::resolve(&snap, &pk_id_c);
                     let captured_content = match (&captured_prompt_c, content_cap) {
                         // A live scan that stopped at its bound read only part
@@ -1964,16 +1953,6 @@ async fn multipart_dispatch(
     let total_tokens = usage.as_ref().map_or(0, |u| {
         u64::from(u.prompt_tokens) + u64::from(u.completion_tokens)
     });
-    // 花费与本端点用量事件的 cost_usd 同源：按调度到的目标行定价，
-    // 输入全按新鲜计（这个表面没有提示缓存）。
-    let spend = usage.as_ref().map_or(0, |u| {
-        crate::usage_attr::request_spend_micro_usd(
-            snapshot,
-            &target.id,
-            aisix_core::InputTokens::uncached_only(u64::from(u.prompt_tokens)),
-            u64::from(u.completion_tokens),
-        )
-    });
     // Billed from here on: a caller that leaves during the commit or the
     // transcript scan below still owes this answer, priced as the success
     // row prices it, its duration included.
@@ -1992,7 +1971,7 @@ async fn multipart_dispatch(
         ),
         ..Default::default()
     });
-    reservation.commit(total_tokens, spend).await;
+    reservation.commit_tokens(total_tokens).await;
 
     // #696: run the output guardrail chain on the transcript — it is
     // caller-visible model output, scanned like chat's replies. Pre-fix an
@@ -2585,7 +2564,7 @@ async fn speech_dispatch(
     } = match dispatched {
         Ok(d) => d,
         Err(e) => {
-            reservation.commit_tokens_no_spend(0).await;
+            reservation.commit_tokens(0).await;
             return Err(e);
         }
     };

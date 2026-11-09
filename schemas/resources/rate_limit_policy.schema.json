@@ -335,11 +335,6 @@
           "required": [
             "max_tokens"
           ]
-        },
-        {
-          "required": [
-            "max_spend_micro_usd"
-          ]
         }
       ],
       "not": {
@@ -399,11 +394,6 @@
             "required": [
               "max_tokens"
             ]
-          },
-          {
-            "required": [
-              "max_spend_micro_usd"
-            ]
           }
         ]
       },
@@ -444,12 +434,6 @@
       "description": "Full 7-field limits (`rps/rpm/rph/rpd/tpm/tpd/concurrency`) — same shape and storage semantics as the inline model/api_key rate limits. Present on every conditional row (it is the form discriminator) and carries at least one field."
     },
     "max_requests": {
-      "format": "uint64",
-      "minimum": 1.0,
-      "type": "integer"
-    },
-    "max_spend_micro_usd": {
-      "description": "Spend ceiling for this window, in micro-USD (1 USD = 1,000,000).\n\nSpend is computed from the dispatched model's configured price, so a model with no price contributes nothing to this counter — the policy then admits every request regardless of the ceiling. The gateway counts those requests on `aisix_budget_unpriced_requests_total` and logs them rather than failing them. A price is per token, so an image, audio or video request whose upstream reports no tokens, and the web searches a request makes, also add nothing here and are counted on the same metric.\n\nEnforced as a ceiling on *recorded* spend, not on in-flight spend. A request is admitted when the spend already recorded for the window is below the ceiling, and its own cost is added only after the upstream answers — so every request already in flight when the ceiling is crossed still completes and still counts. Recorded spend for a window can therefore finish above `max_spend_micro_usd` by up to the combined cost of the requests that were concurrently in flight at that moment.\n\nTwo other ceilings bound that overshoot, and both stack with this one because every policy matching a request applies: `max_requests` on the same scope and window caps how many requests the window admits at all, and a separate policy that sets a `concurrency` limit and groups by `api_key` caps how many may be in flight at once. Both are checked and counted at admission rather than at completion, so both hold exactly. Set this ceiling below the amount you are actually willing to spend.\n\nNot honoured on a `second` window: spend, like tokens, is only known after the upstream answers, so a one-second ceiling would lag by about its own width. Configuring one is reported rather than silently ignored.\n\nNot enforced against ensemble model requests: panel and judge sub-call spend is never counted against this ceiling, so an api_key or team policy that also receives ensemble traffic sees only its non-ensemble spend capped.\n\nRecorded spend is held in the configured rate-limit store. The default in-process store keeps it in memory only, so a restart begins the window's tally again and is not shared between gateway instances; a shared Redis store keeps one tally across both.",
       "format": "uint64",
       "minimum": 1.0,
       "type": "integer"

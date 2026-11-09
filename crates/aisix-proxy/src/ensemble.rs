@@ -262,7 +262,7 @@ impl ModelCaller for ProxyModelCaller<'_> {
             &crate::chat::estimation_output_text(&response),
         );
         reservation
-            .commit_tokens_no_spend(u64::from(effective.usage.total_tokens))
+            .commit_tokens(u64::from(effective.usage.total_tokens))
             .await;
         Ok(ModelCallOutcome {
             response,

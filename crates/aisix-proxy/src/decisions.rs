@@ -634,7 +634,7 @@ async fn dispatch(
     } = match dispatched {
         Ok(d) => d,
         Err(e) => {
-            reservation.commit_tokens_no_spend(0).await;
+            reservation.commit_tokens(0).await;
             return Err(e);
         }
     };
@@ -671,14 +671,6 @@ async fn dispatch(
         }
     };
     let usage = usage.unwrap_or_default();
-    // Priced from the dispatched row, the same inputs as the usage event's
-    // `cost_usd`, so the spend layers and the event cannot disagree.
-    let spend = crate::usage_attr::request_spend_micro_usd(
-        snapshot,
-        &target.id,
-        decision_input_tokens(&usage),
-        u64::from(usage.output),
-    );
     // Billed from here on: a caller that leaves during the commit still owes
     // this answer, priced as the success row prices it.
     crate::attribution::note_answered_usage(crate::usage_attr::AnsweredUsage {
@@ -700,7 +692,7 @@ async fn dispatch(
         ..Default::default()
     });
     reservation
-        .commit(u64::from(usage.input) + u64::from(usage.output), spend)
+        .commit_tokens(u64::from(usage.input) + u64::from(usage.output))
         .await;
 
     let client_body = match (answers, &converted) {

@@ -226,21 +226,11 @@ pub const M_BUDGET_SPENT_USD: &str = "aisix_budget_spent_usd";
 pub const M_BUDGET_REMAINING_USD: &str = "aisix_budget_remaining_usd";
 pub const M_BUDGET_RESET_SECONDS: &str = "aisix_budget_reset_seconds";
 pub const M_BUDGET_DETAILS_PRESENT: &str = "aisix_budget_details_present";
-/// Requests under a policy that sets a spend ceiling that cost the provider
-/// something the ceiling never sees: the dispatched model has no configured
-/// price, or it has one and the request was billed in a unit a per-token price
-/// cannot express (an image, a second of audio, a video, a web search). Labels:
-/// `policy` (the policy's name), `model` (the resolved row name, never a
-/// caller-supplied string).
-///
-/// A non-zero rate here means a budget is configured but not enforcing.
-pub const M_BUDGET_UNPRICED_REQUESTS_TOTAL: &str = "aisix_budget_unpriced_requests_total";
 pub const M_REDIS_FAILURES_TOTAL: &str = "aisix_redis_failures_total";
 /// Post-stream counter updates dropped because the store's worker queue was
-/// full. These updates carry both token counts and, since spend ceilings
-/// became a local mechanism, micro-USD — so a non-zero rate here means the
-/// shared cross-replica counters undercount, and callers can spend past a
-/// `max_spend_micro_usd` ceiling by the dropped amount.
+/// full. These updates carry token counts, so a non-zero rate here means the
+/// shared cross-replica counters undercount, and callers can run past a
+/// token limit by the dropped amount.
 ///
 /// Distinct from `aisix_redis_failures_total`: nothing failed remotely, the
 /// local hand-off queue overflowed because the worker could not drain it
@@ -1999,25 +1989,6 @@ impl Metrics {
                     M_CACHE_REQUESTS_TOTAL,
                     "policy" => policy.to_string(),
                     "outcome" => outcome.to_string(),
-                )
-            },
-        );
-    }
-
-    /// Count one request that a spend ceiling could not price.
-    pub fn record_budget_unpriced(&self, policy: &str, model: &str) {
-        self.cached_counter(
-            M_BUDGET_UNPRICED_REQUESTS_TOTAL,
-            1,
-            |k| {
-                k.label(policy);
-                k.label(model);
-            },
-            || {
-                metrics::counter!(
-                    M_BUDGET_UNPRICED_REQUESTS_TOTAL,
-                    "policy" => policy.to_string(),
-                    "model" => model.to_string(),
                 )
             },
         );
@@ -4481,24 +4452,6 @@ mod tests {
         assert!(rendered.contains("provider=\"openai\""));
         assert!(rendered.contains("outcome=\"success\""));
         assert!(rendered.contains(M_REQUEST_DURATION));
-    }
-
-    /// 一个配了预算却调度到未定价模型的请求，必须在指标上留下痕迹。
-    /// 不留痕的话，"预算配了但从不触发"和"预算没被超过"在监控上完全一样。
-    #[test]
-    fn unpriced_request_under_a_budget_is_counted() {
-        let m = Metrics::new(false);
-        m.record_budget_unpriced("team-daily", "gpt-4o-mini");
-        let rendered = m.render();
-        assert!(
-            rendered.contains(M_BUDGET_UNPRICED_REQUESTS_TOTAL),
-            "series 缺失: {rendered}"
-        );
-        assert!(
-            rendered.contains("policy=\"team-daily\""),
-            "policy 标签缺失"
-        );
-        assert!(rendered.contains("model=\"gpt-4o-mini\""), "model 标签缺失");
     }
 
     /// #1076: the per-execution guardrail histogram renders with

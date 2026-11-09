@@ -19,17 +19,15 @@ import {
 //
 // The output check runs after the upstream has answered, so the provider has
 // already charged for those tokens: to the operator a blocked answer costs
-// exactly what a delivered one does. Both sides of the gateway's books must
-// see it. The request's usage row has to bill it, or the money is spent and
-// never recorded; and the caller's spend ceiling has to count it, or a caller
-// who keeps tripping the guardrail spends the operator's upstream money
-// without limit.
+// exactly what a delivered one does. The request's usage row has to bill it,
+// or the money is spent and never recorded — and exactly once, because a
+// caller who keeps tripping the guardrail must not be billed twice for one
+// answer.
 //
 // Every surface a client SDK uses is driven, buffered and streamed, because
-// each records spend on its own path: Chat Completions, Messages translated
+// each records a row on its own path: Chat Completions, Messages translated
 // from a Chat Completions upstream, Messages relayed from a native Anthropic
-// upstream, and Responses. Each cell has its own key, its own model and its
-// own day-window ceiling of two answers.
+// upstream, and Responses. Each cell has its own key and its own model.
 //
 // Every model is priced at 1 USD per 1k tokens and every upstream answer
 // reports 500 + 500 tokens, so one answer bills 1_000_000 micro-USD.
@@ -283,14 +281,6 @@ describe("an answer an output guardrail blocks is billed like one it lets throug
         cost: COST,
       });
       await seed.attachGuardrailToModel(rule.id as string, model.id as string);
-      // Room for two answers in the day: the warm-up and the blocked one.
-      await seed.createRateLimitPolicy({
-        name: `${cell.name}-ceiling`,
-        scope: "api_key",
-        scope_ref: cell.keyId,
-        window: "day",
-        max_spend_micro_usd: 2 * ONE_ANSWER,
-      });
     }
 
     // Keys last: once the last one authenticates, the rest is in the snapshot.
@@ -367,7 +357,7 @@ describe("an answer an output guardrail blocks is billed like one it lets throug
   };
 
   for (const cell of CELLS) {
-    test(`${cell.name}: the blocked answer is billed and counts against the ceiling`, async (ctx) => {
+    test(`${cell.name}: the blocked answer is billed exactly once`, async (ctx) => {
       if (!etcdReachable) ctx.skip();
 
       // An answer the guardrail lets through, billed as one answer.
@@ -395,27 +385,23 @@ describe("an answer an output guardrail blocks is billed like one it lets throug
         "the blocked answer was paid upstream but its row bills nothing",
       ).toBe(ONE_ANSWER);
 
-      // And the ceiling counts it: two answers spent its whole day, so the
-      // next request is refused before it reaches the upstream.
-      const refused = await send(cell, `please repeat ${MARKER}`);
+      // A second blocked answer is billed on its own row, and the first one is
+      // not billed again beside it: once per answer, not once per request that
+      // follows.
+      const blockedAgain = await send(cell, `please repeat ${MARKER}`);
+      if (cell.stream) {
+        expect([200, 422], blockedAgain.body).toContain(blockedAgain.status);
+      } else {
+        expect(blockedAgain.status, blockedAgain.body).toBe(422);
+      }
       expect(
-        refused.status,
-        `a blocked answer did not count against the caller's ceiling: ${refused.body}`,
-      ).toBe(429);
-
-      // Once, and the refused request not at all. The barrier is ordered,
-      // not timed: the refused request went out only after the blocked
-      // answer reached the caller, and the exporter receives rows in the
-      // order they were recorded, so once the refused request's row is in,
-      // any second row for the blocked answer would be too.
-      expect(
-        await billedFor(refused.requestId),
-        "the refused request reached no upstream and bills nothing",
-      ).toBe(0);
-      expect(
-        await billedFor(blocked.requestId),
-        "the blocked answer is billed once",
+        await billedFor(blockedAgain.requestId),
+        "the second blocked answer is billed as the first",
       ).toBe(ONE_ANSWER);
+      expect(
+        rowsOf(blocked.requestId),
+        "the first blocked answer was billed once",
+      ).toHaveLength(1);
     });
   }
 });

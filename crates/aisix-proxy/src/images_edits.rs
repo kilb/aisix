@@ -763,7 +763,7 @@ async fn dispatch(
     } = match dispatched {
         Ok(d) => d,
         Err(e) => {
-            reservation.commit_tokens_no_spend(0).await;
+            reservation.commit_tokens(0).await;
             return Err(e);
         }
     };
@@ -784,24 +784,12 @@ async fn dispatch(
     let total_tokens = usage.as_ref().map_or(0, |u| {
         u64::from(u.prompt_tokens) + u64::from(u.completion_tokens)
     });
-    // Priced from the dispatched row, the same inputs as the usage event's
-    // `cost_usd`, with every input token fresh: this surface has no prompt
-    // cache. Spend layers read this, so `commit_tokens_no_spend` here would
-    // let a key spend past its ceiling on image edits.
-    let spend = usage.as_ref().map_or(0, |u| {
-        crate::usage_attr::request_spend_micro_usd(
-            snapshot,
-            &target.id,
-            aisix_core::InputTokens::uncached_only(u64::from(u.prompt_tokens)),
-            u64::from(u.completion_tokens),
-        )
-    });
     // Billed from here on: a caller that leaves during the commit or the
     // output review below still owes this answer.
     if let Some(u) = usage.as_ref() {
         crate::images::note_answered_image(snapshot, &target.id, u);
     }
-    reservation.commit(total_tokens, spend).await;
+    reservation.commit_tokens(total_tokens).await;
 
     let review = crate::images::review_image_output(
         &resolved_chain,

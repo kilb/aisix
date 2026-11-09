@@ -763,7 +763,7 @@ async fn dispatch(
     } = match dispatched {
         Ok(d) => d,
         Err(e) => {
-            reservation.commit_tokens_no_spend(0).await;
+            reservation.commit_tokens(0).await;
             return Err(e);
         }
     };
@@ -856,14 +856,6 @@ async fn dispatch(
         .as_ref()
         .map(|u| u64::from(u.prompt_tokens))
         .unwrap_or(0);
-    // 花费与本端点用量事件的 cost_usd 同源：按调度到的目标行定价，
-    // 重排没有提示缓存也没有输出 token。
-    let spend = crate::usage_attr::request_spend_micro_usd(
-        snapshot,
-        &target.id,
-        aisix_core::InputTokens::uncached_only(total_tokens),
-        0,
-    );
     // Billed from here on: a caller that leaves during the commit still owes
     // this answer, priced as the success row prices it.
     if let Some(u) = usage.as_ref() {
@@ -880,7 +872,7 @@ async fn dispatch(
             ..Default::default()
         });
     }
-    reservation.commit(total_tokens, spend).await;
+    reservation.commit_tokens(total_tokens).await;
 
     Ok(RerankDispatchSuccess {
         response: resp,
