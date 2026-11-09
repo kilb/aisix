@@ -849,8 +849,9 @@ fn check_confirmable(proposal: &LockedProposal) -> Result<RateCard, ApiError> {
 ///    by then, so that later proposal is the one to confirm, and the answer
 ///    names its date.
 /// 6. `insert_baseline`'s own refusals, which answer last: `422 /model_id`
-///    for a model that is not live, `422 /card` for a card it cannot apply,
-///    and its past-start `/effective_from` check.
+///    for a model that is not live or is a channel's generated direct
+///    document, `422 /card` for a card it cannot apply, and its past-start
+///    `/effective_from` check.
 ///
 /// One transaction: the proposal row is taken `FOR UPDATE`, so of two
 /// decisions on it exactly one commits, and the other answers

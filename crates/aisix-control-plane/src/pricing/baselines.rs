@@ -232,8 +232,9 @@ pub async fn upcoming_baselines(
 
 /// Writes a baseline starting at `row.effective_from`, refusing with `422`
 /// one that starts in the past (`/effective_from`), a card that does not
-/// validate (`/card`) and a model that is not live (`/model_id`). The
-/// revision, the `pricing_version` bump and the audit row
+/// validate (`/card`), and a model that is not live or is a channel's
+/// generated direct document, which is priced through its public model
+/// (`/model_id`). The revision, the `pricing_version` bump and the audit row
 /// `pricing.baseline.create` go in the caller's transaction.
 ///
 /// Each baseline of the same model already there that starts later takes
@@ -279,6 +280,22 @@ async fn write_row(
     .map_err(DbError::from)?;
     if !live {
         return Err(refused("/model_id", "模型不存在"));
+    }
+    // A channel's generated direct document is priced through its public
+    // model: charges key on the public model's id, so a baseline written on
+    // the direct document would price nothing.
+    let generated: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM channel_models WHERE direct_model_id = $1)",
+    )
+    .bind(row.model_id)
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(DbError::from)?;
+    if generated {
+        return Err(refused(
+            "/model_id",
+            "该模型由公共模型生成，请为公共模型设置基准价",
+        ));
     }
     let (source_kind, source) = row.source.columns()?;
     let revision: BaselineRevision = sqlx::query_as(&format!(

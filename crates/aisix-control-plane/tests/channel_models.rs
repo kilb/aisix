@@ -900,6 +900,68 @@ async fn a_channels_direct_document_cannot_be_granted_to_a_customer() {
     assert_eq!(r.status, 200, "{r:?}");
 }
 
+/// A baseline is the public model's: charges key on the public model's id,
+/// so one written on the direct document a channel row generated would price
+/// nothing. It is refused at `/model_id`, naming what to price instead.
+#[tokio::test]
+async fn a_channels_direct_document_takes_no_baseline() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let op = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let key = provider_key(&cp, &op, "acct-gp-5db").await;
+    let (public, _) = create_public(&cp, &op, "pub-baseline-8c1").await;
+    let r = put_channel(&cp, &op, key, public, json!({})).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let direct = direct_of(&cp, key, public).await;
+    assert!(
+        is_live(&cp, Kind::Models, direct).await,
+        "the direct document is live"
+    );
+
+    let now = support::world::db_now(&cp).await;
+    let baseline = |model: Uuid| {
+        json!({
+            "model_id": model,
+            "effective_from": now,
+            "card": {"default": {"base": {"input": "4", "output": "20"}}},
+            "note": "按官方价格页录入",
+        })
+    };
+    let r = cp
+        .send(
+            "POST",
+            "/admin/pricing/baselines",
+            Some(op.cookie()),
+            Some(baseline(direct)),
+        )
+        .await;
+    assert_422_at(&r, "/model_id");
+    assert_eq!(
+        message_at(&r, "/model_id"),
+        Some("该模型由公共模型生成，请为公共模型设置基准价"),
+        "{r:?}"
+    );
+    let written: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM pricing_baselines WHERE model_id = $1")
+            .bind(direct)
+            .fetch_one(cp.db().pool())
+            .await
+            .expect("count the direct document's baselines");
+    assert_eq!(written, 0);
+
+    // The public model is what takes the baseline.
+    let r = cp
+        .send(
+            "POST",
+            "/admin/pricing/baselines",
+            Some(op.cookie()),
+            Some(baseline(public)),
+        )
+        .await;
+    assert_eq!(r.status, 201, "{r:?}");
+}
+
 #[tokio::test]
 async fn a_key_with_no_selection_counts_toward_the_models_keys() {
     let Some(cp) = TestCp::start().await else {
