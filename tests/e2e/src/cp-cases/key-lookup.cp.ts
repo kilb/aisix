@@ -93,18 +93,18 @@ describe("a caller looks up its own quota with its API key", () => {
     });
     const w = world;
 
-    // Tenant A: $1.00 to spend, an operator's organization quota of $0.50,
-    // an owner's quota of $0.20 on member M, and M's own cumulative cap of
-    // $0.05 on its key KM. The owner holds KO.
+    // Tenant A: ¥1.00 to spend, an operator's organization quota of ¥0.50,
+    // an owner's quota of ¥0.20 on member M, and M's own cumulative cap of
+    // ¥0.05 on its key KM. The owner holds KO.
     tenantA = await w.tenant("Key Lookup A", { setup: (id) => fundTenant(w.cp, id, "1.00") });
     const owner = await seat(tenantA.id, "owner@key-lookup-e2e.test", "owner");
     const member = await seat(tenantA.id, "member@key-lookup-e2e.test", "member");
-    const team = await w.cp.admin.post(`/admin/tenants/${tenantA.id}/budgets`, { limit_usd: "0.50" });
+    const team = await w.cp.admin.post(`/admin/tenants/${tenantA.id}/budgets`, { limit_cny: "0.50" });
     expect(team.status, team.text).toBe(201);
     const memberQuota = await owner.portal.post("/api/budgets", {
       scope: "member",
       scope_ref: member.id,
-      limit_usd: "0.20",
+      limit_cny: "0.20",
     });
     expect(memberQuota.status, memberQuota.text).toBe(201);
     const minted = await mint(tenantA.id, "km", member.id);
@@ -114,16 +114,16 @@ describe("a caller looks up its own quota with its API key", () => {
       scope: "api_key",
       scope_ref: minted.id,
       kind: "cumulative",
-      limit_usd: "0.05",
+      limit_cny: "0.05",
     });
     expect(cap.status, cap.text).toBe(201);
 
-    // Tenant B: $2.00 to spend and an organization quota of $0.40; its key
+    // Tenant B: ¥2.00 to spend and an organization quota of ¥0.40; its key
     // belongs to no member.
     tenantB = await w.tenant("Key Lookup B", {
       setup: async (id) => {
         await fundTenant(w.cp, id, "2.00");
-        const quota = await w.cp.admin.post(`/admin/tenants/${id}/budgets`, { limit_usd: "0.40" });
+        const quota = await w.cp.admin.post(`/admin/tenants/${id}/budgets`, { limit_cny: "0.40" });
         expect(quota.status, quota.text).toBe(201);
       },
     });
@@ -134,7 +134,7 @@ describe("a caller looks up its own quota with its API key", () => {
     await relay?.close();
   });
 
-  test("A restricted customer key reads its own quota in exact dollars", async () => {
+  test("A restricted customer key reads its own quota in exact yuan", async () => {
     // The customer's keys are confined to the model endpoints.
     const images = await callGateway(world!.gateway.proxyUrl, km, "/v1/images/generations", {
       model: CHAT_MODEL,
@@ -144,8 +144,8 @@ describe("a caller looks up its own quota with its API key", () => {
 
     for (let i = 0; i < 3; i++) await served(km);
 
-    // $0.03 spent of the $1.00: $0.97 available; the organization quota has
-    // $0.47 left, the smallest amount the owner's key can still spend.
+    // ¥0.03 spent of the ¥1.00: ¥0.97 available; the organization quota has
+    // ¥0.47 left, the smallest amount the owner's key can still spend.
     let last = "no lookup";
     const owner = await pollUntil(
       "the owner's lookup to show the three charges",
@@ -165,7 +165,7 @@ describe("a caller looks up its own quota with its API key", () => {
     expect(team[0].limit_usd, last).toBe("0.500000");
     expect(team[0].remaining_usd, last).toBe("0.470000");
 
-    // KM's own cap has $0.02 left, less than M's $0.17 and the organization's.
+    // KM's own cap has ¥0.02 left, less than M's ¥0.17 and the organization's.
     const mine = await lookup(km);
     expect(mine.status, mine.text).toBe(200);
     expect(mine.json.data.effective_remaining_usd, mine.text).toBe("0.020000");
@@ -204,7 +204,7 @@ describe("a caller looks up its own quota with its API key", () => {
   test("Another tenant's key sees only its own figures", async () => {
     const theirs = await lookup(tenantB.key);
     expect(theirs.status, theirs.text).toBe(200);
-    // Tenant B spent nothing: its organization quota of $0.40 binds.
+    // Tenant B spent nothing: its organization quota of ¥0.40 binds.
     expect(theirs.json.data.effective_remaining_usd, theirs.text).toBe("0.400000");
     expect(theirs.json.data.binding_level, theirs.text).toBe("organization");
     // A key of no member sees no balance and no organization quota.

@@ -97,7 +97,7 @@ fn quota(
             None => Kind::Cumulative,
         },
         period,
-        limit_micro_usd: limit,
+        limit_micro_cny: limit,
         created_by_kind: "system",
         created_by: None,
     }
@@ -375,10 +375,9 @@ async fn the_quota_document_carries_its_limit_and_spend_exactly() {
             "exhausted": {
                 "period_start": stamp(today(cp).await),
                 "reason": {
-                    "message": "Budget exceeded: the daily limit of 0.01 USD is reached.",
+                    "message": "Budget exceeded: the daily limit of CNY 0.01 is reached.",
                     "scope": "api_key", "scope_ref": key,
-                    "limit_usd": "0.010000", "spent_usd": "0.010200",
-                    "remaining_usd": "-0.000200", "period": "day",
+                    "period": "day",
                 },
             },
         })
@@ -418,7 +417,7 @@ async fn an_organization_quota_counts_every_key() {
     // member sees the organization only through the minimum: like the
     // balance mark, it names no amount.
     let reason = &marked["exhausted"]["reason"];
-    for field in ["limit_usd", "spent_usd", "remaining_usd"] {
+    for field in ["limit_cny", "spent_cny", "remaining_cny"] {
         assert!(reason.get(field).is_none(), "{field} in {reason}");
     }
     let message = reason["message"].as_str().expect("a message");
@@ -522,7 +521,7 @@ async fn a_cumulative_quota_counts_from_its_creation_and_holds_with_no_period_st
     assert_eq!((b.kind, b.period), (Kind::Cumulative, None));
     assert!(b.counted_from.is_some(), "{b:?}");
     let shown = shown(cp, &b).await;
-    assert_eq!(shown["spent_micro_usd"], json!(0));
+    assert_eq!(shown["spent_micro_cny"], json!(0));
     assert_eq!(shown["period"], Value::Null);
     assert_eq!(shown["period_start"], Value::Null);
     assert!(shown["counted_from"].is_string(), "{shown}");
@@ -536,10 +535,9 @@ async fn a_cumulative_quota_counts_from_its_creation_and_holds_with_no_period_st
         json!({
             "scope": "api_key", "scope_ref": key, "period": "month",
             "exhausted": {"reason": {
-                "message": "Quota exhausted: the allocation of 0.01 USD is used up.",
+                "message": "Quota exhausted: the allocation of CNY 0.01 is used up.",
                 "scope": "api_key", "scope_ref": key,
-                "limit_usd": "0.010000", "spent_usd": "0.010200",
-                "remaining_usd": "-0.000200", "period": "total",
+                "period": "total",
             }},
         })
     );
@@ -587,15 +585,15 @@ async fn a_periodic_quota_counts_what_its_period_already_spent_when_created() {
     .await;
     assert_eq!(spent(cp, q.w.tenant, b.id).await, 10_200);
     let shown = shown(cp, &b).await;
-    assert_eq!(shown["spent_micro_usd"], json!(10_200));
+    assert_eq!(shown["spent_micro_cny"], json!(10_200));
     assert_eq!(shown["exhausted"], json!(true));
-    assert_eq!(shown["remaining_micro_usd"], json!(-200));
+    assert_eq!(shown["remaining_micro_cny"], json!(-200));
     assert_eq!(shown["period_start"], json!(stamp(today(cp).await)));
     // Settled in the creating transaction: no settler pass is needed.
     let marked = live(db, b.id).await;
     assert_eq!(
-        marked["exhausted"]["reason"]["spent_usd"],
-        json!("0.010200"),
+        marked["exhausted"]["reason"]["message"],
+        json!("Budget exceeded: the daily limit of CNY 0.01 is reached."),
         "{marked}"
     );
 }
@@ -631,7 +629,7 @@ async fn a_charge_on_the_boundary_counts_in_the_period_it_starts() {
     )
     .await;
     let spend: Vec<(DateTime<Utc>, i64)> = sqlx::query_as(
-        "SELECT period_start, spent_micro_usd FROM billing_budget_spend WHERE budget_id = $1 \
+        "SELECT period_start, spent_micro_cny FROM billing_budget_spend_cny WHERE budget_id = $1 \
          ORDER BY period_start",
     )
     .bind(b.id)
@@ -678,7 +676,7 @@ async fn spend_from_an_earlier_period_never_exhausts_the_current_one() {
     );
     edit.rollback().await.expect("end the edit");
     let held: i64 = sqlx::query_scalar(
-        "SELECT spent_micro_usd FROM billing_budget_spend \
+        "SELECT spent_micro_cny FROM billing_budget_spend_cny \
          WHERE budget_id = $1 AND period_start = $2",
     )
     .bind(b.id)
@@ -720,7 +718,7 @@ async fn a_periodic_quota_is_marked_again_once_its_period_rolls_over() {
         rows(&q, q.key, Some(q.w.member), "y", 15, Some(yesterday)),
     )
     .await;
-    sqlx::query("UPDATE billing_budgets SET marked_period_start = $2 WHERE id = $1")
+    sqlx::query("UPDATE billing_budgets_cny SET marked_period_start = $2 WHERE id = $1")
         .bind(b.id)
         .bind(today - Days::new(1))
         .execute(db.pool())
@@ -732,8 +730,8 @@ async fn a_periodic_quota_is_marked_again_once_its_period_rolls_over() {
     let marked = until_exhausted(db, b.id).await;
     assert_eq!(marked["exhausted"]["period_start"], json!(stamp(today)));
     assert_eq!(
-        marked["exhausted"]["reason"]["spent_usd"],
-        json!("0.010200")
+        marked["exhausted"]["reason"]["message"],
+        json!("Budget exceeded: the daily limit of CNY 0.01 is reached.")
     );
 }
 
@@ -765,7 +763,7 @@ async fn raising_a_limit_lifts_the_mark_and_deleting_retires_the_document() {
 
     for (b, period) in [(&periodic, "day"), (&cumulative, "month")] {
         let raised = set_limit(cp, q.w.tenant, b.id, 1_000_000).await;
-        assert_eq!(raised.limit_micro_usd, 1_000_000);
+        assert_eq!(raised.limit_micro_cny, 1_000_000);
         // Settled in the same transaction.
         assert_eq!(live(db, b.id).await, open("api_key", q.key, period));
 
@@ -1177,7 +1175,7 @@ fn every_quota_document_loads_on_the_lenient_schema() {
                 },
                 period,
                 counted_from: period.is_none().then_some(now),
-                limit_micro_usd: 10_000,
+                limit_micro_cny: 10_000,
                 marked_period_start: None,
                 marked_exhausted: None,
                 created_by_kind: "system".to_string(),

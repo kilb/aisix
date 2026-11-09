@@ -1091,7 +1091,7 @@ async fn every_marking_path_takes_the_account_before_the_resources_lock() {
         set_by: SetBy::Operator,
         kind: Kind::Periodic,
         period: Some(period),
-        limit_micro_usd: 10_000,
+        limit_micro_cny: 10_000,
         created_by_kind: "system",
         created_by: None,
     };
@@ -1190,7 +1190,7 @@ async fn every_marking_path_takes_the_account_before_the_resources_lock() {
             set_by: SetBy::OrgAdmin,
             kind,
             period,
-            limit_micro_usd: 10_000,
+            limit_micro_cny: 10_000,
             created_by_kind: "system",
             created_by: None,
         };
@@ -1299,7 +1299,7 @@ async fn every_marking_path_takes_the_account_before_the_resources_lock() {
             route(
                 "POST",
                 format!("/admin/tenants/{for_post}/budgets"),
-                Some(json!({"limit_usd": "0.01"})),
+                Some(json!({"limit_cny": "0.01"})),
             ),
             201,
         ),
@@ -1309,7 +1309,7 @@ async fn every_marking_path_takes_the_account_before_the_resources_lock() {
             route(
                 "PATCH",
                 format!("/admin/tenants/{tenant}/budgets/{for_patch}"),
-                Some(json!({"limit_usd": "0.02"})),
+                Some(json!({"limit_cny": "0.02"})),
             ),
             200,
         ),
@@ -1331,7 +1331,7 @@ async fn every_marking_path_takes_the_account_before_the_resources_lock() {
             member_route(
                 "POST",
                 "/api/budgets".to_string(),
-                Some(json!({"scope": "member", "scope_ref": own_member, "limit_usd": "0.01"})),
+                Some(json!({"scope": "member", "scope_ref": own_member, "limit_cny": "0.01"})),
             ),
             201,
         ),
@@ -1341,7 +1341,7 @@ async fn every_marking_path_takes_the_account_before_the_resources_lock() {
             member_route(
                 "PATCH",
                 format!("/api/budgets/{own_patch}"),
-                Some(json!({"limit_usd": "0.02"})),
+                Some(json!({"limit_cny": "0.02"})),
             ),
             200,
         ),

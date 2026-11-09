@@ -254,7 +254,7 @@ fn fixture(method: &str, path: &str, target: &SeededOperator) -> (String, Option
         // check passed, so no quota is written.
         ("GET" | "POST", "/admin/tenants/{id}/budgets") => (
             format!("/admin/tenants/{}/budgets", Uuid::nil()),
-            (method == "POST").then(|| json!({"limit_usd": "1.00"})),
+            (method == "POST").then(|| json!({"limit_cny": "1.00"})),
         ),
         ("PATCH" | "DELETE", "/admin/tenants/{id}/budgets/{bid}") => (
             format!(
@@ -262,7 +262,7 @@ fn fixture(method: &str, path: &str, target: &SeededOperator) -> (String, Option
                 Uuid::nil(),
                 Uuid::nil()
             ),
-            (method == "PATCH").then(|| json!({"limit_usd": "1.00"})),
+            (method == "PATCH").then(|| json!({"limit_cny": "1.00"})),
         ),
         // Re-pricing runs. The preview selects nothing (a past window with no
         // usage) and posts nothing; the run matches nothing: 404 once the

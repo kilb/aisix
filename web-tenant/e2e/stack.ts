@@ -1,4 +1,4 @@
-import { spawn, type ChildProcess } from "node:child_process";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { join } from "node:path";
@@ -167,12 +167,28 @@ export interface Stack {
   admin: ApiClient;
   /** A fresh client with no session, for `/api` (sign up or log in first). */
   tenant(): ApiClient;
+  /**
+   * Leaves tenant `id` naming no group, the state a release before groups
+   * left a customer in. No API write produces it (an empty list is refused,
+   * and a last group cannot be retired out from under its tenant), so a spec
+   * that needs it sets the row directly. Named for that one state, never a
+   * general escape hatch: a route under test is driven through the API.
+   */
+  clearTenantGroups(id: string): void;
+  /**
+   * Leaves key `id` without a group, the state migration 0024 leaves a key
+   * it cannot read. No API write produces it either (every create names a
+   * group), so a spec that needs it sets the row directly.
+   */
+  clearKeyGroup(id: string): void;
   stop(): Promise<void>;
 }
 
 interface ReadyLine {
   ready: true;
   httpUrl: string;
+  /** The stack's own control-plane database, for [`Stack.sql`]. */
+  cpDatabase: string;
   operator: { email: string; password: string };
   gateway: { proxyUrl: string; dpId: string; name: string };
   mockUpstream: { url: string };
@@ -277,6 +293,31 @@ async function waitServing(url: string): Promise<void> {
   }
 }
 
+/** `psql`, or what `CP_E2E_PSQL` names. */
+const PSQL = process.env.CP_E2E_PSQL || "psql";
+
+/** A UUID, the only shape [`Stack.clearTenantGroups`] and [`Stack.clearKeyGroup`] interpolate. */
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function uuidArg(id: string): string {
+  if (!UUID.test(id)) throw new Error(`${id} is not a uuid`);
+  return id;
+}
+
+function sqlAgainst(database: string, statement: string): string {
+  const pgUrl = process.env.CP_E2E_PG_URL;
+  if (!pgUrl) throw new Error("CP_E2E_PG_URL is not set");
+  const url = new URL(pgUrl);
+  url.pathname = `/${database}`;
+  const r = spawnSync(PSQL, [url.toString(), "-v", "ON_ERROR_STOP=1", "-qAtc", statement], {
+    encoding: "utf8",
+    timeout: 30_000,
+  });
+  if (r.error) throw new Error(`cannot run ${PSQL}: ${r.error.message}`);
+  if (r.status !== 0) throw new Error(`${PSQL} failed (${statement}): ${r.stderr.trim()}`);
+  return r.stdout;
+}
+
 export async function startStack(): Promise<Stack> {
   assertBuilt();
   // stdin is held open: the stack stops when it closes, so a worker that
@@ -334,6 +375,13 @@ export async function startStack(): Promise<Stack> {
       operator: ready.operator,
       admin,
       tenant: () => new ApiClient(ready.httpUrl),
+      clearTenantGroups: (id: string) =>
+        sqlAgainst(
+          ready.cpDatabase,
+          `UPDATE tenants SET allowed_provider_groups = '{}' WHERE id = '${uuidArg(id)}'`,
+        ),
+      clearKeyGroup: (id: string) =>
+        sqlAgainst(ready.cpDatabase, `UPDATE tenant_keys SET group_id = NULL WHERE id = '${uuidArg(id)}'`),
       stop,
     };
   } catch (e) {

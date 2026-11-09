@@ -1861,7 +1861,7 @@ async fn every_tenant_write_takes_the_tenant_before_the_resources_lock() {
                 format!("/admin/tenants/{tenant}/budgets"),
                 op.clone(),
                 None,
-                Some(json!({"limit_usd": "0.05"})),
+                Some(json!({"limit_cny": "0.05"})),
             )),
             201,
         ),
@@ -1878,7 +1878,7 @@ async fn every_tenant_write_takes_the_tenant_before_the_resources_lock() {
                 Some(json!({
                     "scope": "member",
                     "scope_ref": member.id,
-                    "limit_usd": "0.05",
+                    "limit_cny": "0.05",
                 })),
             )),
             201,

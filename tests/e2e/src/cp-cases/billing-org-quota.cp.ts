@@ -8,7 +8,7 @@ import { ProxyClient } from "../harness/proxy.js";
 // E2E: an operator's organization quota blocks every key of the tenant at
 // the gateway, and raising it lets them call again, across both planes.
 // Everything is driven through the operator API and the real gateway; only
-// the upstream model is a stand-in. Each call costs 10 000 µ$, so a $0.02
+// the upstream model is a stand-in. Each call costs 10 000 µ¥, so a ¥0.02
 // quota is spent by two calls. A member's key sees the organization only
 // through the minimum, so its refusal names neither the quota nor its spend.
 
@@ -90,14 +90,14 @@ describe("an operator's organization quota blocks every key of the tenant", () =
     const created = await world!.cp.admin.post(`/admin/tenants/${tenant.id}/budgets`, {
       kind: "periodic",
       period: "month",
-      limit_usd: "0.02",
+      limit_cny: "0.02",
     });
     expect(created.status, created.text).toBe(201);
     expect(created.body.scope).toBe("team");
     expect(created.body.set_by).toBe("operator");
     quotaId = created.body.id;
 
-    // Two calls, one per key, spend the $0.02. Each is served, since the
+    // Two calls, one per key, spend the ¥0.02. Each is served, since the
     // organization still has money when it is sent.
     for (const key of [k1, k2]) {
       const spending = await chat(key);
@@ -120,10 +120,10 @@ describe("an operator's organization quota blocks every key of the tenant", () =
 
   test("Raising it lets them call again", async () => {
     const raised = await world!.cp.admin.patch(`/admin/tenants/${tenant.id}/budgets/${quotaId}`, {
-      limit_usd: "1.00",
+      limit_cny: "1.00",
     });
     expect(raised.status, raised.text).toBe(200);
-    expect(raised.body.limit_micro_usd).toBe(1_000_000);
+    expect(raised.body.limit_micro_cny).toBe(1_000_000);
     // Settled before the answer: the quota no longer says it is spent.
     expect(raised.body.exhausted, raised.text).toBe(false);
 

@@ -6,13 +6,19 @@
 
 mod support;
 
+use aisix_control_plane::audit::Actor;
 use aisix_control_plane::auth::{MemberRole, OperatorRole};
 use aisix_control_plane::billing::budgets::{self, ChargedRow, CountMode};
+use aisix_control_plane::pricing::rates::{self, NewGroupRate};
+use aisix_pricing::CnyPerUsd;
 use chrono::Utc;
 use futures::FutureExt;
 use serde_json::{json, Value};
 use support::members::MemberSession;
-use support::world::{seed_key, seed_tenant};
+use support::world::{
+    card, db_now, deliver, group_id, insert_baseline, seed_key, seed_key_in_group, seed_model,
+    seed_tenant,
+};
 use support::{OperatorSession, Resp, TestCp};
 use uuid::Uuid;
 
@@ -59,7 +65,7 @@ async fn setup() -> Option<Quota> {
         &cp,
         admin.cookie(),
         &format!("/admin/tenants/{tenant}/budgets"),
-        json!({"limit_usd": "0.50"}),
+        json!({"limit_cny": "0.50"}),
     )
     .await;
     assert_eq!(r.status, 201, "{r:?}");
@@ -68,7 +74,7 @@ async fn setup() -> Option<Quota> {
         &cp,
         owner.cookie(),
         "/api/budgets",
-        json!({"scope": "member", "scope_ref": m.id, "limit_usd": "0.20"}),
+        json!({"scope": "member", "scope_ref": m.id, "limit_cny": "0.20"}),
     )
     .await;
     assert_eq!(r.status, 201, "{r:?}");
@@ -76,7 +82,7 @@ async fn setup() -> Option<Quota> {
         &cp,
         m.cookie(),
         "/api/budgets",
-        json!({"scope": "api_key", "scope_ref": key, "kind": "cumulative", "limit_usd": "0.05"}),
+        json!({"scope": "api_key", "scope_ref": key, "kind": "cumulative", "limit_cny": "0.05"}),
     )
     .await;
     assert_eq!(r.status, 201, "{r:?}");
@@ -137,6 +143,163 @@ fn scopes(r: &Resp) -> Vec<String> {
         .collect()
 }
 
+/// The organization's balance and a quota's spend are compared in the same
+/// unit, and that unit is micro-CNY: a group charging at a rate other than 1
+/// makes a quota's remaining the yuan the charge cost, never the dollar the
+/// upstream billed. At rate 7.2 one 680 µ$ row is 4,896 µ¥, so a ¥1.00 quota
+/// has 995,104 µ¥ left — 999,320 if a dollar figure were counted with it.
+#[tokio::test]
+async fn a_quota_and_the_balance_are_compared_in_micro_cny_at_any_rate() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let admin = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let dp = cp.issue_dp_client("gw-quota-rate-7c2").await;
+    let tenant = seed_tenant(&cp, &admin).await;
+    let owner = cp.member_login_seeded(tenant, MemberRole::Owner).await;
+    // A group at 7.2 CNY per USD, assigned to the tenant, and a key in it.
+    let group = cp
+        .send(
+            "POST",
+            "/admin/provider-groups",
+            Some(admin.cookie()),
+            Some(json!({
+                "name": "gp-rate-7c2",
+                "display_name": "换算率 7.2",
+                "default_cny_per_usd": "7.2",
+            })),
+        )
+        .await;
+    assert_eq!(group.status, 201, "{group:?}");
+    let version: i64 = sqlx::query_scalar("SELECT version FROM tenants WHERE id = $1")
+        .bind(tenant)
+        .fetch_one(cp.db().pool())
+        .await
+        .expect("read the tenant's version");
+    // A tenant edit names its version in `If-Match`, which the harness's
+    // own sender does not set.
+    let assigned = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("a client")
+        .patch(cp.url(&format!("/admin/tenants/{tenant}")))
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .header(reqwest::header::COOKIE, admin.cookie())
+        .header(reqwest::header::IF_MATCH, format!("\"{version}\""))
+        .json(&json!({"allowed_provider_groups": ["gp-rate-7c2"]}))
+        .send()
+        .await
+        .expect("send the PATCH");
+    assert_eq!(assigned.status(), 200, "{assigned:?}");
+    let model = seed_model(&cp, &admin).await;
+    let group = group_id(&cp, "gp-rate-7c2").await;
+    let now = db_now(&cp).await;
+    let _ = insert_baseline(&cp, model, now, card())
+        .await
+        .expect("a baseline");
+    let rate = NewGroupRate {
+        group_id: group,
+        model_id: None,
+        effective_from: now,
+        cny_per_usd: Some(CnyPerUsd::parse("7.2").expect("a rate")),
+        note: "the test world at a second rate".to_string(),
+    };
+    cp.db()
+        .tx(move |conn| {
+            async move {
+                rates::insert_group_rate(conn, &rate, Actor::System)
+                    .await
+                    .map(|_| ())
+            }
+            .boxed()
+        })
+        .await
+        .expect("rate the group at 7.2");
+    let key = Uuid::parse_str(
+        &seed_key_in_group(&cp, &admin, tenant, Some(owner.id), "gp-rate-7c2").await,
+    )
+    .expect("a key id");
+    // The quota is ¥1.00, and the tenant is funded with ¥100.
+    let quota = post(
+        &cp,
+        admin.cookie(),
+        &format!("/admin/tenants/{tenant}/budgets"),
+        json!({"limit_cny": "1.00"}),
+    )
+    .await;
+    assert_eq!(quota.status, 201, "{quota:?}");
+    let funded = cp
+        .send(
+            "POST",
+            "/api/billing/topups",
+            Some(owner.cookie()),
+            Some(json!({"amount_cny": "100"})),
+        )
+        .await;
+    assert_eq!(funded.status, 201, "{funded:?}");
+    let approved = cp
+        .send(
+            "POST",
+            &format!(
+                "/admin/billing/topups/{}/approve",
+                funded.body["id"].as_str().expect("a top-up id")
+            ),
+            Some(admin.cookie()),
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(approved.status, 200, "{approved:?}");
+    // One row through intake, exactly as a gateway sends it: 680 µ$ at 7.2 is
+    // 4,896 µ¥, and intake counts the yuan it charged, not the dollars it cost.
+    let event = json!({
+        "event_id": "quota-rate-7c2-1",
+        "request_id": "req-quota-rate-7c2-1",
+        "occurred_at": Utc::now().to_rfc3339(),
+        "team_id": tenant.to_string(),
+        "api_key_id": key.to_string(),
+        "user_id": owner.id.to_string(),
+        "requested_model_id": model.to_string(),
+        "operation": "chat",
+        "status_code": 200,
+        "prompt_tokens": 1000,
+        "cached_prompt_tokens": 800,
+        "completion_tokens": 200,
+    });
+    let delivered = deliver(&dp, Uuid::new_v4(), vec![event]).await;
+    assert_eq!(delivered.status, 200, "{delivered:?}");
+    let charged: Option<i64> = sqlx::query_scalar(
+        "SELECT charge_micro_cny FROM pricing_charges_cny WHERE event_id = 'quota-rate-7c2-1'",
+    )
+    .fetch_optional(cp.db().pool())
+    .await
+    .expect("read the charge");
+    assert_eq!(charged, Some(4_896), "the row is priced at rate 7.2");
+    let r = cp
+        .send(
+            "GET",
+            &format!("/api/keys/{key}/quota"),
+            Some(owner.cookie()),
+            None,
+        )
+        .await;
+    assert_eq!(r.status, 200, "{r:?}");
+    // Both figures that bind are in micro-CNY: ¥1.00 less the 4,896 µ¥ the
+    // row cost, and the balance's ¥100.00 less the same amount.
+    assert_eq!(r.body["org"]["available_micro_cny"], json!(99_995_104));
+    assert_eq!(
+        r.body["quotas"][0]["spent_micro_cny"],
+        json!(4_896),
+        "{r:?}"
+    );
+    assert_eq!(
+        r.body["quotas"][0]["remaining_micro_cny"],
+        json!(995_104),
+        "{r:?}"
+    );
+    assert_eq!(r.body["effective_remaining_micro_cny"], json!(995_104));
+    assert_eq!(r.body["binding_level"], json!("organization"));
+}
+
 #[tokio::test]
 async fn a_key_quota_reports_every_level_and_the_smallest_remaining() {
     let Some(q) = setup().await else { return };
@@ -151,12 +314,12 @@ async fn a_key_quota_reports_every_level_and_the_smallest_remaining() {
             .expect("quotas")
             .iter()
             .find(|f| f["scope"] == json!(scope))
-            .map(|f| f["remaining_micro_usd"].clone())
+            .map(|f| f["remaining_micro_cny"].clone())
     };
     assert_eq!(remaining("team"), Some(json!(470_000)));
     assert_eq!(remaining("member"), Some(json!(170_000)));
     assert_eq!(remaining("api_key"), Some(json!(20_000)));
-    assert_eq!(r.body["effective_remaining_micro_usd"], json!(20_000));
+    assert_eq!(r.body["effective_remaining_micro_cny"], json!(20_000));
     assert_eq!(r.body["binding_level"], json!("key"));
 }
 
@@ -178,7 +341,7 @@ async fn a_member_keys_lookup_shows_no_organization_figures() {
             "PATCH",
             &format!("/admin/tenants/{}/budgets/{}", q.tenant, q.team_quota),
             Some(q.admin.cookie()),
-            Some(json!({"limit_usd": "0.04"})),
+            Some(json!({"limit_cny": "0.04"})),
         )
         .await;
     assert_eq!(r.status, 200, "{r:?}");
@@ -290,7 +453,7 @@ async fn a_cumulative_and_a_periodic_quota_on_one_key() {
         &q.cp,
         q.owner.cookie(),
         "/api/budgets",
-        json!({"scope": "api_key", "scope_ref": q.key, "period": "day", "limit_usd": "0.10"}),
+        json!({"scope": "api_key", "scope_ref": q.key, "period": "day", "limit_cny": "0.10"}),
     )
     .await;
     assert_eq!(r.status, 201, "{r:?}");
