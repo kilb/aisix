@@ -9,6 +9,7 @@ import { EmptyState } from "../../ui/EmptyState";
 import { TwoStep } from "../../ui/TwoStep";
 import { UpstreamModelPicker } from "../../ui/UpstreamModelPicker";
 import { upstreamNameProblem } from "../../lib/upstreamName";
+import { FetchUpstream } from "./FetchUpstream";
 import "./ChannelModels.css";
 
 /** The largest weight the control plane takes, as its own `channel_models` check does. */
@@ -67,7 +68,8 @@ function numberProblem(text: string, min: number, max: number, label: string): s
  *
  * A name that is not a public model yet can be created from here: the field
  * offers the account's own upstream list, and `以该名称新建公共模型` creates
- * the public model and this account's row in one flow.
+ * the public model and this account's row in one flow. `获取上游模型` does the
+ * same for a whole selection of the account's list at once ([`FetchUpstream`]).
  */
 export function ChannelModels({
   accountId,
@@ -81,6 +83,8 @@ export function ChannelModels({
 }) {
   const [rows, setRows] = useState<ChannelModel[] | null>(null);
   const [publics, setPublics] = useState<PublicModel[] | null>(null);
+  // Retired ones included: a retired name cannot be a public model's again.
+  const [everyPublic, setEveryPublic] = useState<PublicModel[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [drafts, setDrafts] = useState<Record<string, Draft>>({});
   const [rowErrors, setRowErrors] = useState<Record<string, string>>({});
@@ -98,6 +102,7 @@ export function ChannelModels({
       const [channels, models] = await Promise.all([channelModels.list(accountId), publicModels.list()]);
       setRows(channels);
       setPublics(models.filter((m) => m.retired_at === null));
+      setEveryPublic(models);
       setDrafts(Object.fromEntries(channels.map((r) => [r.public_model_id, draftOf(r)])));
       setError(null);
     } catch (e) {
@@ -414,6 +419,13 @@ export function ChannelModels({
             />
             {changed.length > 0 && <span className="hint">将保存 {changed.length} 个模型的改动。</span>}
           </p>
+          <FetchUpstream
+            accountId={accountId}
+            rows={rows}
+            publics={everyPublic}
+            disabled={busy || creating}
+            onApplied={load}
+          />
           <div className="ch-create">
             <p className="hint">上游有、公共模型还没有的名称可以在这里一并新建；价格仍然建在该公共模型上。</p>
             <div className="ch-create-row">

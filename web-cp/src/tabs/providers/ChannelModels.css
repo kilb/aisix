@@ -117,3 +117,27 @@
 .ch-create-row > .upicker {
   flex: 1 1 18rem;
 }
+
+/* 获取上游模型: the account's list as a multi-select, applied in one step. */
+.ch-fetch {
+  margin-top: var(--s-4);
+  padding-top: var(--s-4);
+  border-top: 1px solid var(--divider);
+}
+.ch-fetch-bar {
+  display: flex;
+  align-items: flex-end;
+  flex-wrap: wrap;
+  gap: var(--s-4);
+  margin-bottom: var(--s-3);
+}
+.ch-fetch-bar > .ch-filter {
+  flex: 1 1 16rem;
+}
+.ch-fetch-bar > .ch-tick {
+  gap: var(--s-2);
+}
+/* An id that cannot be ticked says why, quieter than one that can. */
+.ch-fetch-muted {
+  color: var(--text-muted);
+}

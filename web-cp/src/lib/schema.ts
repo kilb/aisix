@@ -112,14 +112,6 @@ export function enumAt(schema: JsonSchema, pointer: string): string[] {
   return values;
 }
 
-/** The description at `pointer`, or of the first schema it stands for that has one. */
-export function describeAt(schema: JsonSchema, pointer: string): string | null {
-  for (const n of expand(schema, nodeAt(schema, pointer), pointer)) {
-    if (typeof n.description === "string") return n.description;
-  }
-  return null;
-}
-
 /** The default at `pointer`, or of the first schema it stands for that has one. */
 export function defaultAt(schema: JsonSchema, pointer: string): unknown {
   for (const n of expand(schema, nodeAt(schema, pointer), pointer)) {

@@ -244,6 +244,9 @@ export function Models({ canEdit }: TabProps) {
         <p className="hint">
           租户按对外名称调用模型。直连模型经一个上游账号调用上游模型；路由模型按选路策略在若干直连模型之间选择。每个模型可服务的分组来自它的上游账号：普通租户只能用到其分组内的账号。
         </p>
+        <p className="hint">
+          要让租户看到和购买的模型，请在「上游账号 → 模型」中建为公共模型，它生成的直连模型只在内部使用；在这里新建的模型会出现在分组定价和租户授权中。
+        </p>
         {canEdit && !open && (
           <p>
             <Button kind="primary" onClick={() => openForm({ mode: "new", shape: "direct" })}>

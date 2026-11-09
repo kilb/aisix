@@ -128,6 +128,17 @@ async function addBaseline(modelId: string, input: string, output: string): Prom
   });
 }
 
+test("还没有模型时，分组详情指向公共模型与上游账号的模型", async ({ page }) => {
+  // First in this file, so no model exists yet on this stack: the rate list
+  // is empty, and says where a model a group can price comes from.
+  const group = await newGroup();
+  await openGroups(page);
+  const detail = await openDetail(page, group.display_name);
+  await expect(detail.getByText(/价格 → 公共模型/)).toBeVisible();
+  await expect(detail.getByText(/上游账号 → 模型/)).toBeVisible();
+  await expect(detail.getByText(/模型与路由/)).toHaveCount(0);
+});
+
 test("新建分组必须填写默认换算率；列表显示显示名、路由名与计数", async ({ page }) => {
   const suffix = randomUUID().slice(0, 8);
   const routing = `grp-new-${suffix}`;

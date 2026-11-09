@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { expect, test, type Locator, type Page } from "@playwright/test";
-import { STACK_START_TIMEOUT_MS, startStack, type Json, type Stack } from "./stack";
+import { STACK_START_TIMEOUT_MS, fundTenant, startStack, type Json, type Stack } from "./stack";
 
 /**
  * The 模型 section of an upstream account: ticking the public models an
@@ -347,4 +347,110 @@ test("无权限的视图角色看不到保存按钮", async ({ page }) => {
   await expect(section.getByRole("button", { name: "写入映射" })).toHaveCount(0);
   await expect(section.getByRole("button", { name: /新建公共模型/ })).toHaveCount(0);
   await expect(section.getByRole("checkbox", { name: `服务 ${pub.name}` })).toBeDisabled();
+});
+
+/** 获取上游模型 inside an account's 模型 section. */
+function fetchBlock(section: Locator): Locator {
+  return section.getByRole("group", { name: "获取上游模型" });
+}
+
+/** The public models the control plane holds, by name. */
+async function publicNames(): Promise<string[]> {
+  const { items } = await stack.admin.get("/admin/public-models");
+  return (items as Json[]).map((m) => m.name as string).sort();
+}
+
+test("获取上游模型时上游不可达：显示原因，不写入任何东西", async ({ page }) => {
+  // The stand-in is on loopback, which the control plane's outbound address
+  // policy refuses, so what this account's list answers here is a refusal:
+  // the page shows it and offers nothing to apply.
+  const name = accountName("acct-fetch");
+  await newAccount(name);
+  const before = await publicNames();
+
+  const section = await openAccountModels(page, name);
+  const block = fetchBlock(section);
+  await block.getByRole("button", { name: "获取上游模型" }).click();
+  await expect(block.getByRole("alert")).toContainText(/上游/);
+  await expect(block.getByRole("button", { name: "映射所选模型" })).toHaveCount(0);
+  await expect(block.getByRole("checkbox")).toHaveCount(0);
+  expect(await publicNames()).toEqual(before);
+});
+
+test("只读角色看不到获取上游模型", async ({ page }) => {
+  const name = accountName("acct-fetch-viewer");
+  await newAccount(name);
+  const viewer = { email: `viewer-fetch-${randomUUID().slice(0, 6)}@e2e.local`, password: "viewer-fetch-pass-8b2" };
+  const created = await stack.admin.request("POST", "/admin/operators", { ...viewer, role: "viewer" });
+  expect(created.status, created.text).toBe(201);
+
+  const section = await openAccountModels(page, name, viewer);
+  await expect(section.getByRole("button", { name: "获取上游模型" })).toHaveCount(0);
+});
+
+test("映射所选上游模型后：账号的模型与公共模型都可见，租户经网关调用新的公共模型成功", async ({ page }) => {
+  const suffix = randomUUID().slice(0, 8);
+  const name = accountName("acct-bulk");
+  const accountId = await newAccount(name);
+  // One selected model has a public model of its exact name already; the
+  // other has none.
+  const existing = await newPublicModel(`pub-bulk-${suffix}`);
+  const fresh = `up-bulk-${suffix}`;
+
+  // The selection, sent as 映射所选模型 sends it: this stack's control plane
+  // cannot read the stand-in's list (see above), so the ids are posted here.
+  const applied = await stack.admin.post(`/admin/provider-keys/${accountId}/channel-models`, {
+    upstream_models: [existing.name, fresh],
+  });
+  expect((applied.items as Json[]).map((i) => [i.upstream_model, i.public_model_name, i.outcome])).toEqual([
+    [existing.name, existing.name, "added"],
+    [fresh, fresh, "created"],
+  ]);
+  // The existing public model was reused, not doubled; the other was created.
+  expect((await publicNames()).filter((n) => n === existing.name || n === fresh)).toEqual([existing.name, fresh].sort());
+
+  // The account's 模型 section serves both, each asking its upstream for the
+  // selected name.
+  const section = await openAccountModels(page, name);
+  for (const model of [existing.name, fresh]) {
+    await expect(modelRow(section, model).getByRole("checkbox", { name: `服务 ${model}` })).toBeChecked();
+    await expect(picker(section, model)).toHaveValue(model);
+  }
+
+  // 价格 → 公共模型 lists the new public model, served by one account.
+  await page.locator('[data-tab="pricing"]').click();
+  await page.getByRole("group", { name: "价格分区" }).getByRole("button", { name: "公共模型", exact: true }).click();
+  const panel = page.locator(".panel").filter({ has: page.getByRole("heading", { name: "公共模型", level: 2 }) });
+  await expect(panel.getByText("载入中…")).toHaveCount(0);
+  const listed = panel.getByRole("row", { name: new RegExp(`^${escapeRe(fresh)}(?:\\s|$)`) });
+  await expect(listed).toBeVisible();
+  await expect(listed).toContainText("1 个");
+
+  // A customer granted the new public model calls it through the gateway,
+  // and the upstream is asked for the selected name.
+  const tenant = await stack.admin.post("/admin/tenants", { name: `tenant-bulk-${suffix}` });
+  await fundTenant(stack.admin, tenant.id);
+  const freshId = (applied.items as Json[]).find((i) => i.upstream_model === fresh).public_model_id;
+  await stack.admin.patch(`/admin/tenants/${tenant.id}`, { allowed_model_ids: [freshId] }, tenant.version);
+  const { plaintext } = await stack.admin.post(`/admin/tenants/${tenant.id}/keys`, { label: `key-bulk-${suffix}` });
+  const del = await fetch(`${stack.mockUpstreamUrl}/__requests`, { method: "DELETE" });
+  expect(del.status).toBe(204);
+  await expect
+    .poll(
+      async () => {
+        const res = await fetch(`${stack.proxyUrl}/v1/chat/completions`, {
+          method: "POST",
+          headers: { "content-type": "application/json", authorization: `Bearer ${plaintext}` },
+          body: JSON.stringify({ model: fresh, messages: [{ role: "user", content: "hi" }] }),
+        });
+        await res.arrayBuffer();
+        return res.status;
+      },
+      { timeout: APPLIED_WITHIN_MS },
+    )
+    .toBe(200);
+  const records = (await (await fetch(`${stack.mockUpstreamUrl}/__requests`)).json()) as Json[];
+  const asked = records.filter((r) => r.path === "/v1/chat/completions").map((r) => r.body?.model);
+  expect(asked.length).toBeGreaterThan(0);
+  expect(new Set(asked)).toEqual(new Set([fresh]));
 });

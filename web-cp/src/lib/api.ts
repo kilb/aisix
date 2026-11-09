@@ -1545,6 +1545,16 @@ export interface ChannelModelSaved extends ChannelModel {
   warnings?: string[];
 }
 
+/** What a bulk apply did with one upstream model. */
+export interface ChannelBulkItem {
+  upstream_model: string;
+  /** The public model it is mapped under: the reused or created one, or the one that already mapped it. */
+  public_model_id: string;
+  public_model_name: string;
+  /** `created` a new public model, `added` to an existing one, `unchanged` already mapped by this account. */
+  outcome: "created" | "added" | "unchanged";
+}
+
 export const publicModels = {
   /** Every public model, live and retired, by name. */
   async list(): Promise<PublicModel[]> {
@@ -1586,6 +1596,18 @@ export const channelModels = {
   /** `204`, after regenerating the documents the removal implies. */
   async remove(providerKeyId: string, publicModelId: string): Promise<void> {
     await call<null>("DELETE", `/admin/provider-keys/${seg(providerKeyId)}/channel-models/${seg(publicModelId)}`);
+  },
+  /**
+   * Maps upstream models of this account to the public models of the same
+   * names, creating the ones that do not exist, in one transaction. All or
+   * nothing: `422` naming each refused model at `/upstream_models/<index>`.
+   */
+  async bulk(providerKeyId: string, upstreamModels: string[]): Promise<ChannelBulkItem[]> {
+    return (
+      await call<{ items: ChannelBulkItem[] }>("POST", `/admin/provider-keys/${seg(providerKeyId)}/channel-models`, {
+        upstream_models: upstreamModels,
+      })
+    ).data.items;
   },
 };
 
