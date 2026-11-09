@@ -8,6 +8,10 @@ import type { PricingStatus } from "./api";
 export const REASONS: Record<string, string> = {
   missing_price: "未定价",
   invalid_price: "价格不可用",
+  // A key whose group sets no rate for the model: the operator sets one in 价格 · 分组.
+  missing_rate: "分组未设换算率",
+  // A key an older control plane minted with no group: it is priced once its key takes one.
+  no_group: "密钥未选分组",
   missing_tier_price: "缺少档位价",
   missing_dimension_price: "缺少计量价",
   inconsistent_usage: "用量不一致",
@@ -24,7 +28,7 @@ export const REASONS: Record<string, string> = {
 
 export const reasonLabel = (code: string): string => REASONS[code] ?? code;
 
-const TABLES: Record<string, string> = { sell: "售价", cost: "成本", discount: "折扣" };
+const TABLES: Record<string, string> = { baseline: "基准价", rate: "分组换算率", cost: "成本", discount: "折扣" };
 
 /** What 计价状态 and the Overview card show, derived once from the response. */
 export function statusView(s: PricingStatus) {

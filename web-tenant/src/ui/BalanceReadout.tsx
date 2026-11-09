@@ -1,12 +1,12 @@
 import { useId, type ReactNode } from "react";
-import { fmtMicroUsd } from "../lib/money";
+import { fmtMicroCny } from "../lib/money";
 
 export type ReadoutLevel = "organization" | "member" | "key";
 
 export interface ReadoutStop {
   level: ReadoutLevel;
   label: string;
-  remainingMicroUsd: number | null;
+  remainingMicroCny: number | null;
 }
 
 /** What each level's remaining amount is, under its figure. */
@@ -16,15 +16,15 @@ const NOTE: Record<ReadoutLevel, string> = {
   key: "密钥额度的剩余",
 };
 
-/** An amount with its currency sign muted and the minus before it: `-$0.011`. */
+/** An amount with its currency sign muted and the minus before it: `-¥0.011`. */
 export function Money({ micro }: { micro: number }) {
-  const text = fmtMicroUsd(micro);
+  const text = fmtMicroCny(micro);
   const negative = text.startsWith("-");
   return (
     <span className="money">
       {negative ? "-" : ""}
-      <span className="cur">$</span>
-      {text.replace(/^-?\$/, "")}
+      <span className="cur">¥</span>
+      {text.replace(/^-?¥/, "")}
     </span>
   );
 }
@@ -75,7 +75,7 @@ export function BalanceReadout({
               <span className="box" aria-hidden="true">
                 <span className="stop" />
               </span>
-              <span className="m">{s.remainingMicroUsd === null ? "—" : <Money micro={s.remainingMicroUsd} />}</span>
+              <span className="m">{s.remainingMicroCny === null ? "—" : <Money micro={s.remainingMicroCny} />}</span>
               <span className="k">{NOTE[s.level]}</span>
             </li>
           );

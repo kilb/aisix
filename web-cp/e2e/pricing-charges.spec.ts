@@ -1,6 +1,6 @@
 import { expect, test, type Page } from "@playwright/test";
 import { STACK_START_TIMEOUT_MS, startStack, type Json, type Stack } from "./stack";
-import { CALL_MICRO_USD, chat, seedTenant } from "./world";
+import { CALL_MICRO_CNY, chat, seedTenant } from "./world";
 
 /**
  * 价格 · 计费明细: every charge with its pricing reason. Real gateway, real
@@ -53,15 +53,25 @@ test("计费明细按租户与状态筛选", async ({ page }) => {
 
   await openCharges(page);
   const table = page.getByRole("table", { name: "计费明细" });
-  await expect(table.getByRole("columnheader")).toContainText(["时间（UTC）", "租户", "模型", "状态", "原因", "售价", "成本", "档位"]);
+  await expect(table.getByRole("columnheader")).toContainText([
+    "时间（UTC）",
+    "租户",
+    "模型",
+    "状态",
+    "原因",
+    "售价（元）",
+    "成本（$）",
+    "实际换算率",
+    "档位",
+  ]);
 
   // Tenant filter: only this organisation's two rows.
   await page.getByLabel("租户").selectOption({ label: world.tenantName });
   await expect(table.getByRole("row")).toHaveCount(3);
   await expect(table.getByRole("row", { name: new RegExp(other.tenantName) })).toHaveCount(0);
   const priced = table.getByRole("row", { name: new RegExp(`${world.model.name}(?!-)`) });
-  await expect(priced.getByRole("cell").nth(5)).toHaveText("$0.011");
-  expect(CALL_MICRO_USD).toBe(11_000);
+  await expect(priced.getByRole("cell").nth(5)).toHaveText("¥0.011");
+  expect(CALL_MICRO_CNY).toBe(11_000);
   await expect(priced).toContainText("已计价");
 
   // Status filter: only the unpriced one, with its reason.

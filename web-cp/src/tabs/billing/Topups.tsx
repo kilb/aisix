@@ -3,7 +3,7 @@ import type { TabProps } from "../../App";
 import { ApiError, tenants, topups, type Tenant, type Topup } from "../../lib/api";
 import { messageFor } from "../../lib/errors";
 import { errorText } from "../../lib/fmt";
-import { fmtMicroUsd, fmtUtc } from "../../lib/money";
+import { fmtMicroCny, fmtUtc } from "../../lib/money";
 import { Button } from "../../ui/Button";
 import { DataTable, Loading } from "../../ui/DataTable";
 import { Field, useRefusalFocus } from "../../ui/Field";
@@ -93,7 +93,7 @@ export function Topups({ canEdit, refreshShell }: TabProps) {
     try {
       if (kind === "approve") await topups.approve(t.id);
       else await topups.reject(t.id, reason ?? "");
-      const amount = fmtMicroUsd(t.amount_micro_usd);
+      const amount = fmtMicroCny(t.amount_micro_cny);
       setOutcome({
         ok: true,
         text: kind === "approve" ? `已批准 ${t.tenant_name} 的 ${amount} 充值` : `已驳回 ${t.tenant_name} 的 ${amount} 充值`,
@@ -208,7 +208,7 @@ export function Topups({ canEdit, refreshShell }: TabProps) {
               return [
                 <tr key={t.id}>
                   <td>{t.tenant_name}</td>
-                  <td className="num money">{fmtMicroUsd(t.amount_micro_usd)}</td>
+                  <td className="num money">{fmtMicroCny(t.amount_micro_cny)}</td>
                   <td>
                     {t.origin === "operator" ? (t.credit_reason ?? t.note) : t.note}
                     {t.status === "rejected" && t.reject_reason && (

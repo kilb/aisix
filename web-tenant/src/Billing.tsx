@@ -16,7 +16,7 @@ import {
   type Topup,
 } from "./lib/api";
 import { formMessageFor, messageFor } from "./lib/errors";
-import { fmtUtc, isUsdAmount, periodLabel, todayUtc, utcRange } from "./lib/money";
+import { fmtUtc, isCnyAmount, periodLabel, todayUtc, utcRange } from "./lib/money";
 import { BalanceReadout, Money, type ReadoutStop } from "./ui/BalanceReadout";
 import { Button } from "./ui/Button";
 import { DataTable, Loading } from "./ui/DataTable";
@@ -182,7 +182,7 @@ function stopsOf(q: KeyQuota): ReadoutStop[] {
   for (const f of q.quotas) lower(SCOPE_LEVEL[f.scope], f.remaining_micro_usd);
   return (["organization", "member", "key"] as const).flatMap((level) => {
     const remaining = least[level];
-    return remaining === undefined ? [] : [{ level, label: LEVEL_LABEL[level], remainingMicroUsd: remaining }];
+    return remaining === undefined ? [] : [{ level, label: LEVEL_LABEL[level], remainingMicroCny: remaining }];
   });
 }
 
@@ -262,7 +262,7 @@ function Readout({ member, balance, team }: { member: SessionMember; balance: Ba
     // No key to read (a billing member's case): the smaller of the organisation's
     // balance and its smallest remaining quota.
     const left = Math.min(Math.max(0, balance.available_micro_usd), ...team.map((b) => Math.max(0, b.remaining_micro_usd)));
-    view = { effective: left, stops: [{ level: "organization", label: "组织", remainingMicroUsd: left }], binding: "organization" };
+    view = { effective: left, stops: [{ level: "organization", label: "组织", remainingMicroCny: left }], binding: "organization" };
   }
 
   const picker =
@@ -324,7 +324,7 @@ function TopupForm({ onRequested }: { onRequested: () => void }) {
     e.preventDefault();
     setGeneral(null);
     const amountText = amount.trim();
-    if (!isUsdAmount(amountText, { allowZero: false })) {
+    if (!isCnyAmount(amountText, { allowZero: false })) {
       setErrors({ amount: "请输入金额，最多两位小数" });
       focusRefusal();
       return;

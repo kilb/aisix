@@ -5,6 +5,7 @@ import { RateCardEditor } from "../../components/RateCardEditor";
 import {
   ApiError,
   baselines,
+  groupPrices,
   pricing,
   resources,
   type BaselineRevision,
@@ -12,6 +13,7 @@ import {
   type BaselineSource,
   type CatalogueEntry,
   type Detail,
+  type ModelGroupPriceRow,
   type PriceWarning,
   type RateCard,
   type ResourceView,
@@ -19,7 +21,7 @@ import {
 import { messageFor, problemAt, warningText } from "../../lib/errors";
 import { errorText } from "../../lib/fmt";
 import { catalogueUpdateWords } from "../../lib/baselineUpdate";
-import { fmtUtc } from "../../lib/money";
+import { fmtCnyPerMillion, fmtUtc } from "../../lib/money";
 import { safeHttpUrl } from "../../lib/safeUrl";
 import { Button } from "../../ui/Button";
 import { DataTable, Loading } from "../../ui/DataTable";
@@ -27,6 +29,7 @@ import { EmptyState } from "../../ui/EmptyState";
 import { Field, useRefusalFocus } from "../../ui/Field";
 import { SidePanel } from "../../ui/SidePanel";
 import { useToast } from "../../ui/Toast";
+import "./PriceForms.css";
 import "./Baselines.css";
 
 /** The rates of a baseline's `default` tier, when the card has both. */
@@ -36,9 +39,55 @@ function headline(card: RateCard | null): { input: string; output: string } | nu
   return { input: base.input, output: base.output };
 }
 
-/** A rate as the page shows it: `$4 / 百万 tokens`. */
+/** A rate as the page shows it: `$4 / 百万 tokens`. The baseline is USD: it is what the rate multiplies. */
 export function usdPerMillion(rate: string): string {
   return `$${rate} / 百万 tokens`;
+}
+
+/**
+ * Every live group's price for one model, in ¥ per million tokens, from
+ * `GET /admin/pricing/models`: the current baseline times the group's rate
+ * in force, before any tenant discount. A group with no rate in force, or a
+ * model with no baseline, shows which one is missing rather than a figure.
+ */
+function GroupMatrix({ row }: { row: ModelGroupPriceRow | null }) {
+  if (!row) return <p className="hint">正在读取各分组的价格…</p>;
+  if (!row.baseline.current) {
+    return <p className="hint">这个模型还没有现行基准价，所以哪个分组都算不出售价。</p>;
+  }
+  if (row.groups.length === 0) return <p className="hint">还没有分组，所以还没有分组售价。</p>;
+  return (
+    <DataTable label="各分组售价" compact>
+      <thead>
+        <tr>
+          <th>分组</th>
+          <th className="num">输入（元/百万）</th>
+          <th className="num">输出（元/百万）</th>
+        </tr>
+      </thead>
+      <tbody>
+        {row.groups.map((g) => (
+          <tr key={g.group_id} data-state={g.input_per_million_cny === undefined ? "unpriced" : "priced"}>
+            <td>{g.display_name}</td>
+            <td className="num tabular">
+              {g.input_per_million_cny === undefined ? (
+                <span className="cell-note">分组未设换算率</span>
+              ) : (
+                fmtCnyPerMillion(g.input_per_million_cny)
+              )}
+            </td>
+            <td className="num tabular">
+              {g.output_per_million_cny === undefined ? (
+                <span className="cell-note">分组未设换算率</span>
+              ) : (
+                fmtCnyPerMillion(g.output_per_million_cny)
+              )}
+            </td>
+          </tr>
+        ))}
+      </tbody>
+    </DataTable>
+  );
 }
 
 /** A revision's source as typed, or null for one this build cannot read. */
@@ -150,6 +199,7 @@ export function Baselines({ canEdit, onGoto }: TabProps) {
   const [selected, setSelected] = useState<string | null>(null);
   const [catalogue, setCatalogue] = useState<CatalogueEntry[]>([]);
   const [models, setModels] = useState<ResourceView<ModelDoc>[]>([]);
+  const [prices, setPrices] = useState<ModelGroupPriceRow[]>([]);
 
   const load = useCallback(async () => {
     try {
@@ -158,6 +208,8 @@ export function Baselines({ canEdit, onGoto }: TabProps) {
     } catch (e) {
       setError(errorText(e));
     }
+    // The matrices are the same models: a failed read leaves them as they were.
+    groupPrices.list().then(setPrices, () => undefined);
   }, []);
 
   useEffect(() => {
@@ -168,6 +220,7 @@ export function Baselines({ canEdit, onGoto }: TabProps) {
   }, [load]);
 
   const detail = rows?.find((r) => r.model_id === selected) ?? null;
+  const detailPrice = prices.find((p) => p.model_id === detail?.model_id) ?? null;
 
   return (
     <div className={detail ? "with-side is-open" : "with-side"}>
@@ -180,7 +233,7 @@ export function Baselines({ canEdit, onGoto }: TabProps) {
             </Button>
           </h2>
           <p className="hint">
-            每个模型的官方美元标价。租户按它乘以所在分组的换算率计价。没有基准价的模型排在最前面：它们无法计费。
+            每个模型的官方美元标价。租户按它乘以密钥所在分组的换算率，得出以人民币计的售价；没有基准价的模型排在最前面：它们无法计费。
           </p>
           <p>
             <Button type="button" size="sm" onClick={() => onGoto("pricing", "imports")}>
@@ -267,6 +320,7 @@ export function Baselines({ canEdit, onGoto }: TabProps) {
           canEdit={canEdit}
           catalogue={catalogue}
           doc={models.find((m) => m.id === detail.model_id)?.doc ?? null}
+          prices={detailPrice}
           onClose={() => setSelected(null)}
           onSaved={load}
         />
@@ -280,6 +334,7 @@ function BaselinePanel({
   canEdit,
   catalogue,
   doc,
+  prices,
   onClose,
   onSaved,
 }: {
@@ -287,6 +342,8 @@ function BaselinePanel({
   canEdit: boolean;
   catalogue: CatalogueEntry[];
   doc: ModelDoc | null;
+  /** This model's price in every live group; `null` until the list arrives. */
+  prices: ModelGroupPriceRow | null;
   onClose: () => void;
   onSaved: () => Promise<void>;
 }) {
@@ -497,6 +554,11 @@ function BaselinePanel({
             {catalogueUpdateWords(row.catalogue_update).panel}
           </div>
         )}
+      </section>
+      <section className="baseline-now" aria-label="各分组售价">
+        <h3>各分组售价</h3>
+        <p className="hint">现行基准价乘以每个分组现行的换算率，按每百万 token 计；这是租户折扣之前的价格。</p>
+        <GroupMatrix row={prices} />
       </section>
     </SidePanel>
   );

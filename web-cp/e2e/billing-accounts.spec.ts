@@ -48,21 +48,21 @@ async function ledgerHolds(world: BillingWorld, n: number): Promise<void> {
 }
 
 test("账户列表显示每个租户的模式、余额与是否停止，平台内部租户在最后", async ({ page }) => {
-  const prepaid = await seedTenant(stack, { mode: "prepaid", creditUsd: "0" });
-  const postpaid = await seedTenant(stack, { mode: "postpaid", creditLimitUsd: "0.05" });
+  const prepaid = await seedTenant(stack, { mode: "prepaid", creditCny: "0" });
+  const postpaid = await seedTenant(stack, { mode: "postpaid", creditLimitCny: "0.05" });
   await login(page);
 
   const a = accountRow(page, prepaid);
   await expect(cell(a, 1)).toHaveText("预付");
-  await expect(cell(a, 2)).toHaveText("$0.00");
+  await expect(cell(a, 2)).toHaveText("¥0.00");
   await expect(cell(a, 5)).toHaveText("已停止");
   await expect(cell(a, 5).locator("[data-state]")).toHaveAttribute("data-state", "exhausted");
 
   const b = accountRow(page, postpaid);
   await expect(cell(b, 1)).toHaveText("后付");
-  await expect(cell(b, 2)).toHaveText("$0.00");
-  await expect(cell(b, 3)).toHaveText("$0.05");
-  await expect(cell(b, 4)).toHaveText("$0.05");
+  await expect(cell(b, 2)).toHaveText("¥0.00");
+  await expect(cell(b, 3)).toHaveText("¥0.05");
+  await expect(cell(b, 4)).toHaveText("¥0.05");
   await expect(cell(b, 5)).toHaveText("正常");
   await expect(cell(b, 5).locator("[data-state]")).toHaveAttribute("data-state", "ok");
 
@@ -81,49 +81,49 @@ test("后付租户未设信用额度时给出提示，设置后状态随之变�
   const panel = page.getByRole("dialog");
   await expect(panel.getByText("后付租户尚未设置信用额度，所有调用都会被拒绝")).toBeVisible();
 
-  await panel.getByLabel("信用额度（美元）").fill("1.00");
+  await panel.getByLabel("信用额度（元）").fill("1.00");
   await panel.getByRole("button", { name: "保存" }).click();
   await expect(panel.getByText("后付租户尚未设置信用额度，所有调用都会被拒绝")).toHaveCount(0);
   await expect(cell(accountRow(page, world), 5)).toHaveText("正常");
-  await expect(cell(accountRow(page, world), 3)).toHaveText("$1.00");
+  await expect(cell(accountRow(page, world), 3)).toHaveText("¥1.00");
   // The gateway now admits the tenant: the limit reached it with the answer.
   await expect.poll(() => chat(stack, world.key.plaintext, world.model.name), { timeout: 15_000 }).toBe(200);
 });
 
 test("金额格式不对时不发送请求并提示", async ({ page }) => {
-  const world = await seedTenant(stack, { mode: "postpaid", creditLimitUsd: "0.05" });
+  const world = await seedTenant(stack, { mode: "postpaid", creditLimitCny: "0.05" });
   await login(page);
   await accountRow(page, world).getByRole("button", { name: world.tenantName }).click();
   const panel = page.getByRole("dialog");
-  await panel.getByLabel("信用额度（美元）").fill("0.001");
+  await panel.getByLabel("信用额度（元）").fill("0.001");
   await panel.getByRole("button", { name: "保存" }).click();
   await expect(panel.getByText("请输入金额，最多两位小数")).toBeVisible();
-  await expect(panel.getByLabel("信用额度（美元）")).toBeFocused();
-  expect((await stack.admin.get(`/admin/tenants/${world.tenantId}/billing`)).credit_limit_micro_usd).toBe(50_000);
+  await expect(panel.getByLabel("信用额度（元）")).toBeFocused();
+  expect((await stack.admin.get(`/admin/tenants/${world.tenantId}/billing`)).credit_limit_micro_cny).toBe(50_000);
 });
 
 test("后付租户用尽信用额度后显示已停止，提高后恢复", async ({ page }) => {
-  const world = await seedTenant(stack, { mode: "postpaid", creditLimitUsd: "0.05" });
+  const world = await seedTenant(stack, { mode: "postpaid", creditLimitCny: "0.05" });
   // Five calls cost 0.055, one past the limit; the fifth is admitted because four cost only 0.044.
   for (let i = 0; i < 5; i++) expect(await chat(stack, world.key.plaintext, world.model.name)).toBe(200);
   await login(page);
   await refreshUntil(page, async () => {
     await expect(cell(accountRow(page, world), 5)).toHaveText("已停止", { timeout: 1_000 });
   });
-  await expect(cell(accountRow(page, world), 2)).toHaveText("-$0.055");
+  await expect(cell(accountRow(page, world), 2)).toHaveText("-¥0.055");
 
   await accountRow(page, world).getByRole("button", { name: world.tenantName }).click();
   const panel = page.getByRole("dialog");
-  await panel.getByLabel("信用额度（美元）").fill("1.00");
+  await panel.getByLabel("信用额度（元）").fill("1.00");
   await panel.getByRole("button", { name: "保存" }).click();
   await expect(cell(accountRow(page, world), 5)).toHaveText("正常");
-  await expect(cell(accountRow(page, world), 4)).toHaveText("$0.945");
+  await expect(cell(accountRow(page, world), 4)).toHaveText("¥0.945");
 });
 
 test("租户详情显示流水、用量汇总与只读额度", async ({ page }) => {
   await waitClearOfUtcMidnight();
-  const world = await seedTenant(stack, { mode: "prepaid", creditUsd: "10.00" });
-  await stack.admin.post(`/admin/tenants/${world.tenantId}/budgets`, { kind: "periodic", period: "month", limit_usd: "2.00" });
+  const world = await seedTenant(stack, { mode: "prepaid", creditCny: "10.00" });
+  await stack.admin.post(`/admin/tenants/${world.tenantId}/budgets`, { kind: "periodic", period: "month", limit_cny: "2.00" });
   expect(await chat(stack, world.key.plaintext, world.model.name)).toBe(200);
   await ledgerHolds(world, 2);
   await login(page);
@@ -132,45 +132,45 @@ test("租户详情显示流水、用量汇总与只读额度", async ({ page }) 
   const ledger = region(page, "余额流水");
   const usage = ledger.getByRole("row").filter({ hasText: "chat-ui" });
   await expect(cell(usage, 1)).toHaveText("扣费");
-  await expect(cell(usage, 2)).toHaveText("-$0.011");
-  await expect(cell(usage, 3)).toHaveText("$9.989");
+  await expect(cell(usage, 2)).toHaveText("-¥0.011");
+  await expect(cell(usage, 3)).toHaveText("¥9.989");
   const credit = ledger.getByRole("row").filter({ hasText: "充值" });
-  await expect(cell(credit, 2)).toHaveText("$10.00");
+  await expect(cell(credit, 2)).toHaveText("¥10.00");
 
   // Today, in UTC, whatever the browser's zone: one period row.
   const periods = region(page, "按期汇总").getByRole("row").filter({ has: page.getByRole("cell") });
   await expect(periods).toHaveCount(1);
-  await expect(cell(periods, 1)).toHaveText("-$0.011");
-  await expect(cell(periods, 2)).toHaveText("$10.00");
-  await expect(cell(periods, 4)).toHaveText("$9.989");
+  await expect(cell(periods, 1)).toHaveText("-¥0.011");
+  await expect(cell(periods, 2)).toHaveText("¥10.00");
+  await expect(cell(periods, 4)).toHaveText("¥9.989");
 
   const calls = region(page, "用量汇总").getByRole("row").filter({ hasText: "chat-ui" });
   await expect(cell(calls, 2)).toHaveText("1");
-  await expect(cell(calls, 3)).toHaveText("$0.011");
+  await expect(cell(calls, 3)).toHaveText("¥0.011");
   await expect(cell(calls, 4)).toContainText("输入 5");
 
   const quotas = region(page, "额度").getByRole("row").filter({ hasText: "平台" });
   await expect(cell(quotas, 0)).toHaveText("组织");
   await expect(cell(quotas, 4)).toHaveText("每月");
-  await expect(cell(quotas, 5)).toHaveText("$2.00");
+  await expect(cell(quotas, 5)).toHaveText("¥2.00");
   await expect(cell(quotas, 8)).toHaveText("正常");
   await expect(region(page, "额度").getByRole("button")).toHaveCount(0);
 });
 
 test("只读运维看不到修改额度", async ({ page }) => {
-  const world = await seedTenant(stack, { mode: "postpaid", creditLimitUsd: "0.05" });
+  const world = await seedTenant(stack, { mode: "postpaid", creditLimitCny: "0.05" });
   const viewer = { email: "viewer-accounts@e2e.local", password: "viewer-accounts-pass-4k9" };
   await stack.admin.post("/admin/operators", { ...viewer, role: "viewer" });
   await login(page, viewer.email, viewer.password);
   await accountRow(page, world).getByRole("button", { name: world.tenantName }).click();
   const panel = page.getByRole("dialog");
-  await expect(region(page, "信用额度")).toContainText("$0.05");
+  await expect(region(page, "信用额度")).toContainText("¥0.05");
   await expect(panel.getByRole("button", { name: "保存" })).toHaveCount(0);
-  await expect(panel.getByLabel("信用额度（美元）")).toHaveCount(0);
+  await expect(panel.getByLabel("信用额度（元）")).toHaveCount(0);
 });
 
 test("按期汇总：后端会拒绝的日期范围在本地说明原因，不发出请求", async ({ page }) => {
-  const world = await seedTenant(stack, { mode: "prepaid", creditUsd: "0" });
+  const world = await seedTenant(stack, { mode: "prepaid", creditCny: "0" });
   await login(page);
   await accountRow(page, world).getByRole("button", { name: world.tenantName }).click();
   const periods = region(page, "按期汇总");

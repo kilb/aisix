@@ -14,7 +14,7 @@ import {
   type TenantKey,
 } from "./lib/api";
 import { formMessageFor, messageFor } from "./lib/errors";
-import { fmtUtc, isUsdAmount } from "./lib/money";
+import { fmtUtc, isCnyAmount } from "./lib/money";
 import { Money } from "./ui/BalanceReadout";
 import { Button } from "./ui/Button";
 import { DataTable, Loading } from "./ui/DataTable";
@@ -37,7 +37,7 @@ const LEVEL: Record<QuotaLevel, string> = { organization: "组织", member: "成
 
 // ── amounts ─────────────────────────────────────────────────────────────────
 
-/** Micro-dollars of a typed amount that `isUsdAmount` accepted: integer arithmetic, no float. */
+/** Micro-cny of a typed amount that `isCnyAmount` accepted: integer arithmetic, no float. */
 function usdToMicro(s: string): number {
   const [whole = "0", cents = ""] = s.split(".");
   return Number(whole) * 1_000_000 + Number(cents.padEnd(2, "0")) * 10_000;
@@ -414,13 +414,13 @@ function QuotaRow({
   const [form, focusRefusal] = useRefusalFocus<HTMLTableRowElement>();
   const toast = useToast();
 
-  const draftOk = isUsdAmount(draft.trim(), { allowZero: false });
+  const draftOk = isCnyAmount(draft.trim(), { allowZero: false });
   const limit = editing && draftOk ? usdToMicro(draft.trim()) : b.limit_micro_usd;
   const over = exceeds({ ...termsOf(b), limit }, parents);
 
   async function save() {
     const text = draft.trim();
-    if (!isUsdAmount(text, { allowZero: false })) {
+    if (!isCnyAmount(text, { allowZero: false })) {
       setProblem("请输入金额，最多两位小数");
       focusRefusal();
       return;
@@ -593,7 +593,7 @@ function CreateForm({
   const text = limit.trim();
   const parents = scope === "member" ? team.map(termsOf) : keyParents(quotas[chosen]);
   const over =
-    isUsdAmount(text, { allowZero: false }) &&
+    isCnyAmount(text, { allowZero: false }) &&
     exceeds({ kind, period: kind === "periodic" ? period : null, limit: usdToMicro(text) }, parents);
 
   async function submit(e: React.FormEvent) {
@@ -601,7 +601,7 @@ function CreateForm({
     setGeneral(null);
     const next: Partial<Record<FormField, string>> = {};
     if (!chosen) next.target = "请选择对象";
-    if (!isUsdAmount(text, { allowZero: false })) next.limit = "请输入金额，最多两位小数";
+    if (!isCnyAmount(text, { allowZero: false })) next.limit = "请输入金额，最多两位小数";
     setErrors(next);
     if (Object.keys(next).length > 0) {
       focusRefusal();

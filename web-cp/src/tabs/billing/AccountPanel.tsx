@@ -11,7 +11,7 @@ import {
   type UsageSummaryRow,
 } from "../../lib/api";
 import { errorText } from "../../lib/fmt";
-import { fmtMicroUsd, fmtUtc, isUsdAmount, periodLabel, todayUtc, utcRange } from "../../lib/money";
+import { fmtMicroCny, fmtUtc, isCnyAmount, periodLabel, todayUtc, utcRange } from "../../lib/money";
 import { Button } from "../../ui/Button";
 import { DataTable, Loading } from "../../ui/DataTable";
 import { EmptyState } from "../../ui/EmptyState";
@@ -55,12 +55,12 @@ export function Region({ label, children }: { label: string; children: ReactNode
 
 export const MODE_LABEL: Record<BillingAccount["billing_mode"], string> = { prepaid: "预付", postpaid: "后付" };
 
-/** Dollars and cents as a person types them (`1.00`), from whole-cent micro-dollars; exact, never a float. */
-function usdInput(micro: number): string {
+/** Yuan and fen as a person types them (`1.00`), from whole-fen micro-cny; exact, never a float. */
+function cnyInput(micro: number): string {
   const value = BigInt(micro);
   const abs = value < 0n ? -value : value;
-  const cents = ((abs % 1_000_000n) / 10_000n).toString().padStart(2, "0");
-  return `${value < 0n ? "-" : ""}${abs / 1_000_000n}.${cents}`;
+  const fen = ((abs % 1_000_000n) / 10_000n).toString().padStart(2, "0");
+  return `${value < 0n ? "-" : ""}${abs / 1_000_000n}.${fen}`;
 }
 
 /** The state an account's lamp and `data-state` show. */
@@ -80,15 +80,15 @@ function BalanceCard({ account }: RegionProps) {
         <dt>计费方式</dt>
         <dd>{MODE_LABEL[account.billing_mode] ?? account.billing_mode}</dd>
         <dt>余额</dt>
-        <dd className="money">{fmtMicroUsd(account.balance_micro_usd)}</dd>
+        <dd className="money">{fmtMicroCny(account.balance_micro_cny)}</dd>
         {postpaid && (
           <>
             <dt>信用额度</dt>
-            <dd className="money">{fmtMicroUsd(account.credit_limit_micro_usd)}</dd>
+            <dd className="money">{fmtMicroCny(account.credit_limit_micro_cny)}</dd>
           </>
         )}
         <dt>可用</dt>
-        <dd className="money">{fmtMicroUsd(account.available_micro_usd)}</dd>
+        <dd className="money">{fmtMicroCny(account.available_micro_cny)}</dd>
         {!account.is_internal && (
           <>
             <dt>状态</dt>
@@ -106,7 +106,7 @@ function BalanceCard({ account }: RegionProps) {
 
 function CreditLimit({ account, canEdit, onChanged }: RegionProps) {
   const toast = useToast();
-  const stored = usdInput(account.credit_limit_micro_usd);
+  const stored = cnyInput(account.credit_limit_micro_cny);
   const [draft, setDraft] = useState(stored);
   const [busy, setBusy] = useState(false);
   const [refused, setRefused] = useState<ReturnType<typeof refusal> | null>(null);
@@ -123,7 +123,7 @@ function CreditLimit({ account, canEdit, onChanged }: RegionProps) {
   async function save(e: React.FormEvent) {
     e.preventDefault();
     const typed = draft.trim();
-    if (!isUsdAmount(typed, { allowZero: true })) {
+    if (!isCnyAmount(typed, { allowZero: true })) {
       setLocalError(MONEY_HINT);
       setRefused(null);
       focusRefusal();
@@ -136,15 +136,15 @@ function CreditLimit({ account, canEdit, onChanged }: RegionProps) {
       onChanged(await billing.setCreditLimit(account.tenant_id, typed));
       toast("已保存");
     } catch (err) {
-      setRefused(refusal(err, (p) => p === "/credit_limit_usd"));
+      setRefused(refusal(err, (p) => p === "/credit_limit_cny"));
       focusRefusal();
     } finally {
       setBusy(false);
     }
   }
 
-  const unset = account.billing_mode === "postpaid" && !account.is_internal && account.credit_limit_micro_usd === 0;
-  const problem = localError ?? refused?.at.get("/credit_limit_usd") ?? null;
+  const unset = account.billing_mode === "postpaid" && !account.is_internal && account.credit_limit_micro_cny === 0;
+  const problem = localError ?? refused?.at.get("/credit_limit_cny") ?? null;
   return (
     <Region label="信用额度">
       {unset && (
@@ -155,12 +155,12 @@ function CreditLimit({ account, canEdit, onChanged }: RegionProps) {
       {account.is_internal ? (
         <p className="hint">平台内部租户不受余额与信用额度限制。</p>
       ) : !canEdit ? (
-        <p className="money">{fmtMicroUsd(account.credit_limit_micro_usd)}</p>
+        <p className="money">{fmtMicroCny(account.credit_limit_micro_cny)}</p>
       ) : (
         <form ref={form} onSubmit={(e) => void save(e)} noValidate>
           <div className="bl-controls">
             <Field
-              label="信用额度（美元）"
+              label="信用额度（元）"
               hint={account.billing_mode === "prepaid" ? "预付租户按余额放行，信用额度只对后付租户生效。" : undefined}
               error={problem}
             >
@@ -266,7 +266,7 @@ function Ledger({ account }: RegionProps) {
       days.backwards
         ? Promise.resolve(null)
         : billing.ledger(account.tenant_id, { ...(days.from || days.to ? range : {}), ...(kind ? { kind } : {}) }),
-    [account.tenant_id, account.balance_micro_usd, days.from, days.to, days.backwards, kind],
+    [account.tenant_id, account.balance_micro_cny, days.from, days.to, days.backwards, kind],
   );
   // A new first page replaces whatever was loaded after the old one.
   useEffect(() => {
@@ -330,8 +330,8 @@ function Ledger({ account }: RegionProps) {
               <tr key={i.seq}>
                 <td className="tabular">{fmtUtc(i.posted_at)}</td>
                 <td>{KIND_LABEL[i.kind] ?? i.kind}</td>
-                <td className="num">{fmtMicroUsd(i.amount_micro_usd)}</td>
-                <td className="num">{fmtMicroUsd(i.balance_after_micro_usd)}</td>
+                <td className="num">{fmtMicroCny(i.amount_micro_cny)}</td>
+                <td className="num">{fmtMicroCny(i.balance_after_micro_cny)}</td>
                 <td>{entryNote(i)}</td>
               </tr>
             ))}
@@ -405,7 +405,7 @@ function PeriodSummary({ account }: RegionProps) {
     <Summary<LedgerSummaryRow>
       label="按期汇总"
       tenantId={account.tenant_id}
-      stamp={account.balance_micro_usd}
+      stamp={account.balance_micro_cny}
       load={(q) => billing.ledgerSummary(account.tenant_id, q)}
       render={(rows, group) => (
         <DataTable label="按期汇总" compact>
@@ -422,10 +422,10 @@ function PeriodSummary({ account }: RegionProps) {
             {rows.map((r) => (
               <tr key={r.period_start}>
                 <td className="tabular">{periodLabel(r.period_start, group)}</td>
-                <td className="num">{fmtMicroUsd(r.usage_micro_usd)}</td>
-                <td className="num">{fmtMicroUsd(r.topups_micro_usd)}</td>
-                <td className="num">{fmtMicroUsd(r.adjustments_micro_usd)}</td>
-                <td className="num">{fmtMicroUsd(r.closing_balance_micro_usd)}</td>
+                <td className="num">{fmtMicroCny(r.usage_micro_cny)}</td>
+                <td className="num">{fmtMicroCny(r.topups_micro_cny)}</td>
+                <td className="num">{fmtMicroCny(r.adjustments_micro_cny)}</td>
+                <td className="num">{fmtMicroCny(r.closing_balance_micro_cny)}</td>
               </tr>
             ))}
           </tbody>
@@ -460,7 +460,7 @@ function UsageSummary({ account }: RegionProps) {
     <Summary<UsageSummaryRow>
       label="用量汇总"
       tenantId={account.tenant_id}
-      stamp={account.balance_micro_usd}
+      stamp={account.balance_micro_cny}
       load={(q) => billing.usageSummary(account.tenant_id, q)}
       render={(rows, group) => (
         <DataTable label="用量汇总" compact>
@@ -479,7 +479,7 @@ function UsageSummary({ account }: RegionProps) {
                 <td className="tabular">{periodLabel(r.period_start, group)}</td>
                 <td>{usageModel(r.model)}</td>
                 <td className="num">{r.requests}</td>
-                <td className="num">{fmtMicroUsd(r.charged_micro_usd)}</td>
+                <td className="num">{fmtMicroCny(r.charged_micro_cny)}</td>
                 <td>
                   {Object.entries(r.quantities)
                     .map(([dimension, n]) => `${DIMENSION_LABEL[dimension] ?? dimension} ${n}`)
@@ -510,7 +510,7 @@ export function budgetPeriod(b: Budget): string {
 }
 
 function Quotas({ account, quotaRev }: RegionProps) {
-  const budgets = useLoad(() => billing.budgets(account.tenant_id), [account.tenant_id, account.balance_micro_usd, quotaRev]);
+  const budgets = useLoad(() => billing.budgets(account.tenant_id), [account.tenant_id, account.balance_micro_cny, quotaRev]);
   return (
     <Region label="额度">
       <p className="hint">这个租户在每一级设置的额度。组织额度在下方的「组织额度」里设置；成员与密钥的额度由租户自己管理，这里只读。</p>
@@ -548,9 +548,9 @@ function Quotas({ account, quotaRev }: RegionProps) {
                 <td>{SET_BY_LABEL[b.set_by] ?? b.set_by}</td>
                 <td>{b.kind === "cumulative" ? "一次性额度" : "按周期"}</td>
                 <td>{budgetPeriod(b)}</td>
-                <td className="num">{fmtMicroUsd(b.limit_micro_usd)}</td>
-                <td className="num">{fmtMicroUsd(b.spent_micro_usd)}</td>
-                <td className="num">{fmtMicroUsd(b.remaining_micro_usd)}</td>
+                <td className="num">{fmtMicroCny(b.limit_micro_cny)}</td>
+                <td className="num">{fmtMicroCny(b.spent_micro_cny)}</td>
+                <td className="num">{fmtMicroCny(b.remaining_micro_cny)}</td>
                 <td>
                   <span data-state={b.exhausted ? "exhausted" : "ok"}>
                     <Lamp state={b.exhausted ? "rejected" : "applied"}>{b.exhausted ? "已用尽" : "正常"}</Lamp>

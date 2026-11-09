@@ -12,7 +12,7 @@ import {
   type UsageSummaryRow,
 } from "./lib/api";
 import { formMessageFor, messageFor } from "./lib/errors";
-import { fmtMicroUsd, fmtUtc, periodLabel, todayUtc, utcRange } from "./lib/money";
+import { fmtMicroCny, fmtUtc, periodLabel, todayUtc, utcRange } from "./lib/money";
 import { Button } from "./ui/Button";
 import { DataTable, Loading } from "./ui/DataTable";
 import { EmptyState } from "./ui/EmptyState";
@@ -55,7 +55,7 @@ const ERROR_LABEL: Record<string, string> = {
 
 /** A signed amount for a correction: `+$0.002` or `-$0.002`. */
 function signed(micro: number): string {
-  return micro > 0 ? `+${fmtMicroUsd(micro)}` : fmtMicroUsd(micro);
+  return micro > 0 ? `+${fmtMicroCny(micro)}` : fmtMicroCny(micro);
 }
 
 /** What a call's 费用 cell says. */
@@ -65,9 +65,9 @@ function chargeText(c: Call): string {
     case "charged": {
       // Unpriced when made, then corrected by re-pricing: the whole charge is the adjustment.
       if (charge.amount_micro_usd === null && charge.adjusted_micro_usd !== 0) {
-        return `${fmtMicroUsd(charge.adjusted_micro_usd)}（重新计价）${charge.estimated ? "（估算）" : ""}`;
+        return `${fmtMicroCny(charge.adjusted_micro_usd)}（重新计价）${charge.estimated ? "（估算）" : ""}`;
       }
-      const amount = charge.amount_micro_usd === null ? "—" : fmtMicroUsd(charge.amount_micro_usd);
+      const amount = charge.amount_micro_usd === null ? "—" : fmtMicroCny(charge.amount_micro_usd);
       const adjusted = charge.adjusted_micro_usd !== 0 ? `（已调整 ${signed(charge.adjusted_micro_usd)}）` : "";
       return `${amount}${adjusted}${charge.estimated ? "（估算）" : ""}`;
     }
@@ -289,7 +289,7 @@ function Summary({ keys, showKeys }: { keys: TenantKey[]; showKeys: boolean }) {
                 <td>{summaryModel(r)}</td>
                 <td className="num">{r.requests}</td>
                 <td className="num">
-                  {fmtMicroUsd(r.charged_micro_usd)}
+                  {fmtMicroCny(r.charged_micro_usd)}
                   {r.estimated_requests > 0 ? "（含估算）" : ""}
                 </td>
                 <td>

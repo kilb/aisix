@@ -29,7 +29,7 @@ const SCOPE = "这个设置对整个环境的所有租户生效，不能按租�
 const CLOSED_CONSEQUENCE = "所以 closed 在宽限时间过后会拒绝所有客户的请求。";
 
 test("预算失败模式的说明写明对整个环境生效", async ({ page }) => {
-  const world = await seedTenant(stack, { mode: "prepaid", creditUsd: "10.00" });
+  const world = await seedTenant(stack, { mode: "prepaid", creditCny: "10.00" });
   await login(page);
   await page.locator('[data-tab="billing"]').click();
   await page

@@ -626,19 +626,6 @@ export interface TierRates {
 /** A price card: tiers by name; `default` is the one a request without a tier is priced at. */
 export type RateCard = Record<string, TierRates>;
 
-/** One sell price revision. A tenant override ended by a later revision has `card` null. */
-export interface SellRevision {
-  revision_id: number;
-  engine_version: number;
-  model_id: string;
-  tenant_id: string | null;
-  effective_from: string;
-  card: RateCard | null;
-  source: string;
-  created_by: string | null;
-  created_at: string;
-}
-
 /** Something to know about a price that was written all the same. */
 export interface PriceWarning {
   code: string;
@@ -646,9 +633,6 @@ export interface PriceWarning {
   revision_id?: number;
   effective_from?: string;
 }
-
-/** The answer to a sell price write: the revision starting as asked, what to know about it, and the later revisions an import also wrote. */
-export type SellCreated = SellRevision & { warnings: PriceWarning[]; later_revisions: SellRevision[] };
 
 export interface CatalogueEntry {
   key: string;
@@ -660,57 +644,13 @@ export interface CatalogueEntry {
   card: RateCard;
 }
 
-/** One model's platform price: in force now, and scheduled by ascending start. */
-export interface PriceRow {
-  model_id: string;
-  name: string;
-  current: SellRevision | null;
-  upcoming: SellRevision[];
-}
-
-/** What `POST /admin/pricing/sell` takes: exactly one of `card` and `catalogue_key`. */
-export interface NewSellPrice {
-  model_id: string;
-  tenant_id?: string;
-  effective_from: string;
-  card?: RateCard | null;
-  catalogue_key?: string;
-  markup_bps?: number;
-}
-
 export const pricing = {
   async catalogue(): Promise<{ version: string | number; items: CatalogueEntry[] }> {
     return (await call<{ version: string | number; items: CatalogueEntry[] }>("GET", "/admin/pricing/catalogue")).data;
   },
-  /** Sell revisions, newest first; `before` is the previous page's `next_before`. */
-  async listSell(q: {
-    model_id?: string;
-    tenant_id?: string;
-    /** Only the platform's own prices, never a tenant override. */
-    platform?: boolean;
-    limit?: number;
-    before?: number;
-  }): Promise<{ items: SellRevision[]; next_before: number | null }> {
-    const params = new URLSearchParams();
-    if (q.model_id) params.set("model_id", q.model_id);
-    if (q.platform) params.set("platform", "true");
-    if (q.tenant_id) params.set("tenant_id", q.tenant_id);
-    if (q.limit !== undefined) params.set("limit", String(q.limit));
-    if (q.before !== undefined) params.set("before", String(q.before));
-    const query = params.toString();
-    return (
-      await call<{ items: SellRevision[]; next_before: number | null }>(
-        "GET",
-        `/admin/pricing/sell${query ? `?${query}` : ""}`,
-      )
-    ).data;
-  },
-  async createSell(body: NewSellPrice): Promise<SellCreated> {
-    return (await call<SellCreated>("POST", "/admin/pricing/sell", body)).data;
-  },
-  /** Every live model's platform price, the unpriced ones first. */
-  async models(): Promise<PriceRow[]> {
-    return (await call<{ items: PriceRow[] }>("GET", "/admin/pricing/models")).data.items;
+  /** One tenant's discount plan. Its prices are its keys' groups', so there are no per-tenant prices. */
+  async tenantPlan(tenantId: string): Promise<TenantPlan> {
+    return (await call<TenantPlan>("GET", `/admin/pricing/tenants/${seg(tenantId)}`)).data;
   },
 };
 
@@ -778,44 +718,31 @@ export interface DiscountRevision {
   created_at: string;
 }
 
-/** A tenant's plan: its discount, and the models it has override prices for. An override whose `current.card` is null has ended. */
+/** A tenant's plan: its discount in force and the ones scheduled after it. */
 export interface TenantPlan {
   tenant_id: string;
   discount: { current: DiscountRevision | null; upcoming: DiscountRevision[] };
-  overrides: PriceRow[];
 }
 
+/** A tenant's discount revisions: an append-only list, one write per change. */
 export const tenantPricing = {
-  async listDiscounts(q: { tenant_id?: string; limit?: number; before?: number }): Promise<{ items: DiscountRevision[]; next_before: number | null }> {
-    const params = new URLSearchParams();
-    if (q.tenant_id) params.set("tenant_id", q.tenant_id);
-    if (q.limit !== undefined) params.set("limit", String(q.limit));
-    if (q.before !== undefined) params.set("before", String(q.before));
-    const query = params.toString();
-    return (
-      await call<{ items: DiscountRevision[]; next_before: number | null }>("GET", `/admin/pricing/discounts${query ? `?${query}` : ""}`)
-    ).data;
-  },
   async createDiscount(body: { tenant_id: string; effective_from: string; discount_bps: number }): Promise<DiscountRevision> {
     return (await call<DiscountRevision>("POST", "/admin/pricing/discounts", body)).data;
-  },
-  async tenantPlan(tenantId: string): Promise<TenantPlan> {
-    return (await call<TenantPlan>("GET", `/admin/pricing/tenants/${seg(tenantId)}`)).data;
   },
 };
 
 // ── billing (accounts, ledger, usage, quotas) ───────────────────────────────
 
-/** One tenant's billing account. All amounts are integer micro-dollars. */
+/** One tenant's billing account. All amounts are integer micro-cny. */
 export interface BillingAccount {
   tenant_id: string;
   tenant_name: string;
   status: string;
   is_internal: boolean;
   billing_mode: "prepaid" | "postpaid";
-  balance_micro_usd: number;
-  credit_limit_micro_usd: number;
-  available_micro_usd: number;
+  balance_micro_cny: number;
+  credit_limit_micro_cny: number;
+  available_micro_cny: number;
   /** Whether the balance rule blocks the tenant now; never for the internal tenant. */
   exhausted: boolean;
   pending_topups: number;
@@ -825,8 +752,8 @@ export interface LedgerItem {
   seq: number;
   posted_at: string;
   kind: "usage" | "topup" | "adjustment";
-  amount_micro_usd: number;
-  balance_after_micro_usd: number;
+  amount_micro_cny: number;
+  balance_after_micro_cny: number;
   event_id: string | null;
   model: { id: string | null; name: string } | null;
   topup_id: string | null;
@@ -841,10 +768,10 @@ export interface LedgerPage {
 
 export interface LedgerSummaryRow {
   period_start: string;
-  usage_micro_usd: number;
-  topups_micro_usd: number;
-  adjustments_micro_usd: number;
-  closing_balance_micro_usd: number;
+  usage_micro_cny: number;
+  topups_micro_cny: number;
+  adjustments_micro_cny: number;
+  closing_balance_micro_cny: number;
 }
 
 export interface UsageSummaryRow {
@@ -852,7 +779,7 @@ export interface UsageSummaryRow {
   /** `id` null: calls outside the tenant's grants, or the row that rolls up everything past the row cap (`name` `other`). */
   model: { id: string | null; name: string };
   requests: number;
-  charged_micro_usd: number;
+  charged_micro_cny: number;
   estimated_requests: number;
   quantities: Record<string, number>;
 }
@@ -865,9 +792,9 @@ export interface Budget {
   set_by: "operator" | "org_admin" | "member";
   kind: "periodic" | "cumulative";
   period: "day" | "week" | "month" | null;
-  limit_micro_usd: number;
-  spent_micro_usd: number;
-  remaining_micro_usd: number;
+  limit_micro_cny: number;
+  spent_micro_cny: number;
+  remaining_micro_cny: number;
   period_start: string | null;
   counted_from: string | null;
   exhausted: boolean;
@@ -894,9 +821,9 @@ export const billing = {
   async account(tenantId: string, signal?: AbortSignal): Promise<BillingAccount> {
     return (await call<BillingAccount>("GET", `/admin/tenants/${seg(tenantId)}/billing`, undefined, undefined, signal)).data;
   },
-  /** Operator and up; `creditLimitUsd` is dollars and cents, 0 allowed. Answers the settled account. */
-  async setCreditLimit(tenantId: string, creditLimitUsd: string): Promise<BillingAccount> {
-    return (await call<BillingAccount>("PATCH", `/admin/tenants/${seg(tenantId)}/billing`, { credit_limit_usd: creditLimitUsd })).data;
+  /** Operator and up; `creditLimitCny` is yuan and fen, 0 allowed. Answers the settled account. */
+  async setCreditLimit(tenantId: string, creditLimitCny: string): Promise<BillingAccount> {
+    return (await call<BillingAccount>("PATCH", `/admin/tenants/${seg(tenantId)}/billing`, { credit_limit_cny: creditLimitCny })).data;
   },
   /** One page of entries, newest first; `before` is the previous page's `next_before`. */
   async ledger(
@@ -950,8 +877,8 @@ export const billing = {
   async budgets(tenantId: string, signal?: AbortSignal): Promise<Budget[]> {
     return (await call<{ items: Budget[] }>("GET", `/admin/tenants/${seg(tenantId)}/budgets`, undefined, undefined, signal)).data.items;
   },
-  /** Admin only: credits the tenant now. `amountUsd` is dollars and cents above 0; answers the top-up the backend recorded. Not idempotent: send once. */
-  async credit(tenantId: string, body: { amount_usd: string; reason: string; reference?: string }): Promise<CreditedTopup> {
+  /** Admin only: credits the tenant now. `amount_cny` is yuan and fen above 0; answers the top-up the backend recorded. Not idempotent: send once. */
+  async credit(tenantId: string, body: { amount_cny: string; reason: string; reference?: string }): Promise<CreditedTopup> {
     return (await call<CreditedTopup>("POST", `/admin/tenants/${seg(tenantId)}/credits`, body)).data;
   },
 };
@@ -960,7 +887,7 @@ export const billing = {
 export interface CreditedTopup {
   id: string;
   origin: "operator";
-  amount_micro_usd: number;
+  amount_micro_cny: number;
   reference: string;
   credit_reason: string | null;
 }
@@ -968,8 +895,8 @@ export interface CreditedTopup {
 export interface Topup {
   id: string;
   origin: "tenant" | "operator";
-  /** Integer micro-dollars. */
-  amount_micro_usd: number;
+  /** Integer micro-cny. */
+  amount_micro_cny: number;
   note: string;
   reference: string;
   status: "pending" | "approved" | "rejected";
@@ -1017,21 +944,21 @@ export const topups = {
 /** Operator and up. A periodic quota's `period` defaults to month; a cumulative one has none. `409 budget_exists` for the same kind and period. */
 export async function createOrgQuota(
   tenantId: string,
-  body: { kind: "periodic" | "cumulative"; period?: "day" | "week" | "month"; limit_usd: string },
+  body: { kind: "periodic" | "cumulative"; period?: "day" | "week" | "month"; limit_cny: string },
 ): Promise<Budget> {
   return (await call<Budget>("POST", `/admin/tenants/${seg(tenantId)}/budgets`, body)).data;
 }
 
 /** Operator and up; only a quota the operator set (`403 budget_managed` otherwise). */
-export async function updateOrgQuota(tenantId: string, id: string, limitUsd: string): Promise<Budget> {
-  return (await call<Budget>("PATCH", `/admin/tenants/${seg(tenantId)}/budgets/${seg(id)}`, { limit_usd: limitUsd })).data;
+export async function updateOrgQuota(tenantId: string, id: string, limitCny: string): Promise<Budget> {
+  return (await call<Budget>("PATCH", `/admin/tenants/${seg(tenantId)}/budgets/${seg(id)}`, { limit_cny: limitCny })).data;
 }
 
 export async function deleteOrgQuota(tenantId: string, id: string): Promise<void> {
   await call<null>("DELETE", `/admin/tenants/${seg(tenantId)}/budgets/${seg(id)}`);
 }
 
-/** One charge: what a stored usage row was billed, or why it could not be. Amounts are integer micro-dollars. */
+/** One charge: what a stored usage row was billed in micro-cny, or why it could not be. */
 export interface Charge {
   seq: number;
   event_id: string;
@@ -1041,8 +968,16 @@ export interface Charge {
   requested_model_id: string;
   occurred_at: string;
   status: "charged" | "exempt" | "nothing_to_bill" | "unpriced";
-  charge_micro_usd: number | null;
+  charge_micro_cny: number | null;
+  /** What the call cost the platform at its upstream, in micro-dollars: the cost side stays USD. */
   cost_micro_usd: number | null;
+  group_id: string | null;
+  baseline_revision_id: number | null;
+  rate_revision_id: number | null;
+  /** The group's rate in force, as the exact decimal string it was typed as. */
+  cny_per_usd_e4: number | null;
+  /** CNY charged per USD of cost, four decimals; `null` when the cost is not known. */
+  realised_cny_per_usd: string | null;
   service_tier: string | null;
   requested_service_tier: string | null;
   long_context_above: number | null;
@@ -1090,7 +1025,7 @@ export const pricingStatus = {
   },
 };
 
-/** One tenant's part of a re-pricing run. Amounts are integer micro-dollars. */
+/** One tenant's part of a re-pricing run. Amounts are integer micro-cny. */
 export interface RepricingTenant {
   tenant_id: string;
   tenant_name: string;
@@ -1098,20 +1033,20 @@ export interface RepricingTenant {
   events: number;
   changed: number;
   /** Positive: the tenant was charged too little before; negative: too much. */
-  delta_micro_usd: number;
+  delta_micro_cny: number;
 }
 
 /** A re-pricing run: previewed with its totals, then (by an admin) applied. */
 export interface RepricingRun {
   id: string;
   status: "previewed" | "applied";
-  filter: { from: string; to: string; model_id: string | null; tenant_id: string | null; status: string | null };
+  filter: { from: string; to: string; model_id: string | null; tenant_id: string | null; group_id: string | null; status: string | null };
   reason: string;
   events: number;
   changed: number;
   still_unpriced: number;
   skipped_unattributed: number;
-  delta_micro_usd: number;
+  delta_micro_cny: number;
   by_tenant: RepricingTenant[];
   created_by: { id: string; email: string };
   created_at: string;
@@ -1124,6 +1059,7 @@ export interface RepricingFilterInput {
   to: string;
   model_id?: string;
   tenant_id?: string;
+  group_id?: string;
   status?: string;
   reason: string;
 }
@@ -1154,8 +1090,8 @@ export interface ReconcileMismatch {
   tenant_id: string;
   tenant_name: string;
   check: ReconcileCheck | string;
-  expected_micro_usd: number;
-  actual_micro_usd: number;
+  expected_micro_cny: number;
+  actual_micro_cny: number;
   /** The ledger entry that breaks the running balance; null for the other checks. */
   seq: number | null;
 }

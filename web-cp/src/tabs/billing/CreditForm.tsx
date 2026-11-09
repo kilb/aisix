@@ -1,7 +1,7 @@
 import { useRef, useState } from "react";
 import { billing } from "../../lib/api";
 import { sendCredit } from "../../lib/creditOutcome";
-import { isUsdAmount } from "../../lib/money";
+import { isCnyAmount } from "../../lib/money";
 import { Button } from "../../ui/Button";
 import { Field, useRefusalFocus } from "../../ui/Field";
 import { TwoStep } from "../../ui/TwoStep";
@@ -17,7 +17,7 @@ interface Problems {
 
 function check(amount: string, reason: string): Problems {
   const problems: Problems = {};
-  if (!isUsdAmount(amount.trim(), { allowZero: false })) problems.amount = MONEY_HINT;
+  if (!isCnyAmount(amount.trim(), { allowZero: false })) problems.amount = MONEY_HINT;
   if (reason.trim() === "") problems.reason = "请填写入账原因";
   return problems;
 }
@@ -70,7 +70,7 @@ function Form({ account, onChanged }: RegionProps) {
     setBusy(true);
     const outcome = await sendCredit(() =>
       billing.credit(account.tenant_id, {
-        amount_usd: amount.trim(),
+        amount_cny: amount.trim(),
         reason: reason.trim(),
         ...(reference.trim() !== "" ? { reference: reference.trim() } : {}),
       }),
@@ -82,7 +82,7 @@ function Form({ account, onChanged }: RegionProps) {
       return;
     }
     if (outcome.kind === "refused") {
-      setRefused(refusal(outcome.error, (p) => p === "/amount_usd" || p === "/reason" || p === "/reference"));
+      setRefused(refusal(outcome.error, (p) => p === "/amount_cny" || p === "/reason" || p === "/reference"));
       inFlight.current = false;
       setBusy(false);
       focusRefusal();
@@ -124,13 +124,13 @@ function Form({ account, onChanged }: RegionProps) {
     setUnknown(false);
   }
 
-  const amountProblem = local.amount ?? refused?.at.get("/amount_usd") ?? null;
+  const amountProblem = local.amount ?? refused?.at.get("/amount_cny") ?? null;
   const reasonProblem = local.reason ?? refused?.at.get("/reason") ?? null;
   return (
     <Region label="直接入账">
       <p className="hint">直接给这个租户入账，用于线下收款或补偿。入账后租户在自己的充值记录里看到这笔入账和原因。</p>
       <form ref={form} onSubmit={(e) => e.preventDefault()} noValidate>
-        <Field label="金额（美元）" error={amountProblem}>
+        <Field label="金额（元）" error={amountProblem}>
           {(aria) => (
             <input inputMode="decimal" value={amount} disabled={busy || unknown} onChange={(e) => setAmount(e.target.value)} {...aria} />
           )}

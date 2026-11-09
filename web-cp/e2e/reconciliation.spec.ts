@@ -59,7 +59,7 @@ test("对账：账实相符时显示无差异", async ({ page }) => {
   const world = await seedTenant(stack);
   for (let i = 0; i < 3; i++) expect(await chat(stack, world.key.plaintext, world.model.name)).toBe(200);
   const made = await (await tenantClient(stack, world)).post("/api/billing/topups", {
-    amount_usd: "5.00",
+    amount_cny: "5.00",
     note: "recon-topup",
     reference: "ref-recon",
   });

@@ -1,11 +1,13 @@
 import { randomUUID } from "node:crypto";
-import { expect, test, type Locator, type Page } from "@playwright/test";
+import { expect, test, type Page } from "@playwright/test";
 import { STACK_START_TIMEOUT_MS, startStack, type Stack } from "./stack";
 import { chat, seedTenant } from "./world";
 
 /**
  * 价格 · 租户方案 against the real control plane through the built `dist/`.
- * The only stand-in is the upstream the gateway calls.
+ * A tenant's plan is its discount: its prices are its keys' groups', so the
+ * page has no per-tenant price to edit. The only stand-in is the upstream the
+ * gateway calls.
  */
 
 let stack: Stack;
@@ -36,11 +38,7 @@ async function openPlan(page: Page, tenantName: string, who = stack.operator): P
   await expect(page.getByRole("region", { name: "折扣" })).toBeVisible();
 }
 
-function overrideRow(page: Page, model: string): Locator {
-  return page.getByRole("table", { name: "专属价" }).getByRole("row").filter({ hasText: model });
-}
-
-test("租户方案：设置 20% 折扣与一个专属价，结束专属价后显示按平台价", async ({ page }) => {
+test("租户方案：设置 20% 折扣，下一次调用按折后价计费", async ({ page }) => {
   const world = await seedTenant(stack);
   await openPlan(page, world.tenantName);
   const discount = page.getByRole("region", { name: "折扣" });
@@ -51,37 +49,9 @@ test("租户方案：设置 20% 折扣与一个专属价，结束专属价后显
   await form.getByRole("button", { name: "保存折扣" }).click();
   await expect(discount.getByTestId("current-discount")).toHaveText("20%");
 
-  const add = page.getByRole("form", { name: "添加专属价" });
-  await add.getByLabel("模型").selectOption({ label: world.model.name });
-  await add.getByLabel("输入", { exact: true }).fill("500");
-  await add.getByLabel("输出", { exact: true }).fill("900");
-  await add.getByRole("button", { name: "保存专属价" }).click();
-  const row = overrideRow(page, world.model.name);
-  await expect(row).toContainText("输入 500 输出 900");
-  await expect(row).not.toContainText("已结束");
-
-  // An override is charged as typed, and the 20% discount is not applied on top:
-  // 5 x 500 + 3 x 900 = 5 200 µ$ (a discounted override would be 4 160).
-  const overrideReq = `req-plan-ovr-${randomUUID().slice(0, 8)}`;
-  expect(await chat(stack, world.key.plaintext, world.model.name, { requestId: overrideReq })).toBe(200);
-  await expect
-    .poll(async () => (await stack.admin.get(`/admin/usage/events?request_id=${overrideReq}`)).items.length, { timeout: 30_000 })
-    .toBe(1);
-  const overrideEvent = (await stack.admin.get(`/admin/usage/events?request_id=${overrideReq}`)).items[0];
-  await expect
-    .poll(async () => (await stack.admin.get(`/admin/pricing/charges?event_id=${overrideEvent.event_id}`)).items[0]?.charge_micro_usd, {
-      timeout: 30_000,
-    })
-    .toBe(5_200);
-  expect((await stack.admin.get(`/admin/pricing/charges?event_id=${overrideEvent.event_id}`)).items[0].tenant_override).toBe(true);
-
-  await row.getByRole("button", { name: "结束专属价" }).click();
-  await row.getByRole("button", { name: "确认结束专属价" }).click();
-  await expect(row).toContainText("已结束，按平台价");
-  await expect(row).not.toContainText("输入 500");
-  await expect(row.getByRole("button", { name: "结束专属价" })).toHaveCount(0);
-
-  // The platform price of the world's model is 1000 / 2000 per million; one chat is 5 + 3 tokens.
+  // The world's card is 1000 / 2000 USD per million and its group's rate is 1
+  // CNY per USD, so one chat is 5 x 1000 + 3 x 2000 = 11 000 µ¥; 20% off is
+  // 8 800 µ¥, rounded once.
   const requestId = `req-plan-${randomUUID().slice(0, 8)}`;
   expect(await chat(stack, world.key.plaintext, world.model.name, { requestId })).toBe(200);
   await expect
@@ -89,7 +59,7 @@ test("租户方案：设置 20% 折扣与一个专属价，结束专属价后显
     .toBe(1);
   const event = (await stack.admin.get(`/admin/usage/events?request_id=${requestId}`)).items[0];
   await expect
-    .poll(async () => (await stack.admin.get(`/admin/pricing/charges?event_id=${event.event_id}`)).items[0]?.charge_micro_usd, {
+    .poll(async () => (await stack.admin.get(`/admin/pricing/charges?event_id=${event.event_id}`)).items[0]?.charge_micro_cny, {
       timeout: 30_000,
     })
     .toBe(8_800);
@@ -109,26 +79,20 @@ test("折扣超出 0 到 100 时被拒绝并说明原因，什么也没保存", 
   expect((await stack.admin.get(`/admin/pricing/discounts?tenant_id=${world.tenantId}`)).items).toHaveLength(0);
 });
 
-test("只读运维看不到折扣与专属价的编辑控件", async ({ page }) => {
+test("只读运维看到折扣，但没有编辑控件，也看不到专属价", async ({ page }) => {
   const world = await seedTenant(stack);
   await stack.admin.post("/admin/pricing/discounts", {
     tenant_id: world.tenantId,
     effective_from: new Date().toISOString(),
     discount_bps: 1250,
   });
-  await stack.admin.post("/admin/pricing/sell", {
-    model_id: world.model.id,
-    tenant_id: world.tenantId,
-    effective_from: new Date().toISOString(),
-    card: { default: { base: { input: "300", output: "600" } } },
-  });
   const viewer = { email: `viewer-plan-${randomUUID().slice(0, 6)}@e2e.local`, password: "viewer-plan-pass-6c1" };
   await stack.admin.post("/admin/operators", { ...viewer, display_name: "只读", role: "viewer" });
   await openPlan(page, world.tenantName, viewer);
 
   await expect(page.getByTestId("current-discount")).toHaveText("12.5%");
-  await expect(overrideRow(page, world.model.name)).toContainText("输入 300 输出 600");
+  // The tenant's price is its key's group's: this page has no per-tenant price.
+  await expect(page.getByRole("region", { name: "专属价" })).toHaveCount(0);
   await expect(page.getByRole("button", { name: /保存/ })).toHaveCount(0);
-  await expect(page.getByRole("button", { name: "结束专属价" })).toHaveCount(0);
   await expect(page.getByRole("form")).toHaveCount(0);
 });

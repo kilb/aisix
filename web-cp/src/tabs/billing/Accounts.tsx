@@ -2,7 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import type { TabProps } from "../../App";
 import { billing, type BillingAccount } from "../../lib/api";
 import { errorText } from "../../lib/fmt";
-import { fmtMicroUsd } from "../../lib/money";
+import { fmtMicroCny } from "../../lib/money";
 import { Button } from "../../ui/Button";
 import { DataTable, Loading } from "../../ui/DataTable";
 import { EmptyState } from "../../ui/EmptyState";
@@ -87,9 +87,9 @@ export function Accounts({ canEdit, operator, onGoto }: TabProps) {
                       {a.is_internal && <span className="tag bl-mark">平台内部</span>}
                     </td>
                     <td>{MODE_LABEL[a.billing_mode] ?? a.billing_mode}</td>
-                    <td className="num">{fmtMicroUsd(a.balance_micro_usd)}</td>
-                    <td className="num">{a.billing_mode === "postpaid" ? fmtMicroUsd(a.credit_limit_micro_usd) : "—"}</td>
-                    <td className="num">{fmtMicroUsd(a.available_micro_usd)}</td>
+                    <td className="num">{fmtMicroCny(a.balance_micro_cny)}</td>
+                    <td className="num">{a.billing_mode === "postpaid" ? fmtMicroCny(a.credit_limit_micro_cny) : "—"}</td>
+                    <td className="num">{fmtMicroCny(a.available_micro_cny)}</td>
                     <td>{a.is_internal ? "—" : <AccountState account={a} />}</td>
                     <td className="num">{a.pending_topups}</td>
                   </tr>

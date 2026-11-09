@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { expect, test, type Page } from "@playwright/test";
 import { STACK_START_TIMEOUT_MS, startStack, type Json, type Stack } from "./stack";
-import { CALL_MICRO_USD, chat, seedTenant, waitClearOfUtcMidnight, type BillingWorld } from "./world";
+import { CALL_MICRO_CNY, chat, seedTenant, waitClearOfUtcMidnight, type BillingWorld } from "./world";
 
 /**
  * 「计费 · 重新计价」 against the real control plane and gateway: a model with
@@ -26,10 +26,15 @@ test.afterAll(async () => {
 const CARD = { default: { base: { input: "1000", output: "2000" } } };
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-/** Writes a sell price and waits until it is in force (a price cannot start in the past). */
+/** Writes a baseline and waits until it is in force (a price cannot start in the past). */
 async function price(modelId: string, card: Json): Promise<void> {
   const startsAt = Date.now() + 3_000;
-  await stack.admin.post("/admin/pricing/sell", { model_id: modelId, effective_from: new Date(startsAt).toISOString(), card });
+  await stack.admin.post("/admin/pricing/baselines", {
+    model_id: modelId,
+    effective_from: new Date(startsAt).toISOString(),
+    card,
+    note: "the re-pricing test's card",
+  });
   await sleep(Math.max(0, startsAt - Date.now()) + 300);
 }
 
@@ -112,9 +117,9 @@ test("重新计价：先预览影响的调用数与各租户差额，再由管�
 
   await expect(totals(page).getByRole("row", { name: /选中的调用/ }).getByRole("cell")).toHaveText("3");
   await expect(totals(page).getByRole("row", { name: /有变化/ }).getByRole("cell")).toHaveText("3");
-  await expect(totals(page).getByRole("row", { name: /合计差额/ })).toContainText("$0.033");
-  expect(CALL_MICRO_USD * 3).toBe(33_000);
-  await expect(page.getByRole("table", { name: "各租户差额" }).getByRole("row", { name: new RegExp(world.tenantName) })).toContainText("$0.033");
+  await expect(totals(page).getByRole("row", { name: /合计差额/ })).toContainText("¥0.033");
+  expect(CALL_MICRO_CNY * 3).toBe(33_000);
+  await expect(page.getByRole("table", { name: "各租户差额" }).getByRole("row", { name: new RegExp(world.tenantName) })).toContainText("¥0.033");
   // A preview moves no money.
   expect((await ledger(world)).filter((e) => e.kind === "adjustment")).toHaveLength(0);
 
@@ -125,7 +130,7 @@ test("重新计价：先预览影响的调用数与各租户差额，再由管�
 
   const list = page.getByRole("table", { name: "重新计价运行" });
   await expect(list.getByRole("row", { name: /补录价格-ui/ })).toContainText("已执行");
-  await expect(page.getByRole("status").filter({ hasText: "已执行" })).toContainText("$0.033");
+  await expect(page.getByRole("status").filter({ hasText: "已执行" })).toContainText("¥0.033");
 });
 
 test("执行后租户流水出现一笔调整；同一预览不能再次执行", async ({ page }) => {
@@ -139,7 +144,7 @@ test("执行后租户流水出现一笔调整；同一预览不能再次执行",
 
   const entries = (await ledger(world)).filter((e) => e.kind === "adjustment");
   expect(entries).toHaveLength(1);
-  expect(entries[0].amount_micro_usd).toBe(-33_000);
+  expect(entries[0].amount_micro_cny).toBe(-33_000);
 
   // The run offers no 执行 any more, and the control plane agrees.
   await expect(page.getByRole("button", { name: /^(确认)?执行$/ })).toHaveCount(0);
@@ -155,7 +160,7 @@ test("预览之后价格又变，执行时提示需要重新预览", async ({ pa
   await price(model.id, CARD);
   await login(page, stack.operator.email, stack.operator.password);
   await preview(page, world, model, "过期-ui");
-  await expect(totals(page).getByRole("row", { name: /合计差额/ })).toContainText("$0.033");
+  await expect(totals(page).getByRole("row", { name: /合计差额/ })).toContainText("¥0.033");
 
   // A new sell price after the preview.
   await price(model.id, { default: { base: { input: "2000", output: "4000" } } });
@@ -168,7 +173,7 @@ test("预览之后价格又变，执行时提示需要重新预览", async ({ pa
 
   await page.getByRole("button", { name: "重新预览" }).click();
   // At the new price: 3 x 22 000.
-  await expect(totals(page).getByRole("row", { name: /合计差额/ })).toContainText("$0.066");
+  await expect(totals(page).getByRole("row", { name: /合计差额/ })).toContainText("¥0.066");
   await expect(page.getByRole("button", { name: "执行", exact: true })).toBeVisible();
 });
 
@@ -179,7 +184,7 @@ test("运维角色只能预览，执行按钮只给管理员", async ({ page, br
   await stack.admin.post("/admin/operators", { ...op, role: "operator" });
   await login(page, op.email, op.password);
   await preview(page, world, model, "运维-ui");
-  await expect(totals(page).getByRole("row", { name: /合计差额/ })).toContainText("$0.033");
+  await expect(totals(page).getByRole("row", { name: /合计差额/ })).toContainText("¥0.033");
   await expect(page.getByRole("button", { name: /执行/ })).toHaveCount(0);
   await expect(page.getByText("执行需要管理员权限")).toBeVisible();
   // The control plane agrees: an operator's apply is refused.
@@ -257,7 +262,7 @@ test("价格调低之后重新计价是退还，合计与运行记录都写明�
   await login(page, stack.operator.email, stack.operator.password);
   await preview(page, world, model, "退还-ui", "");
   const total = totals(page).getByRole("row", { name: /合计差额/ });
-  await expect(total).toContainText("-$0.0165");
+  await expect(total).toContainText("-¥0.0165");
   await expect(total).toContainText("退还");
   await expect(page.getByRole("table", { name: "重新计价运行" }).getByRole("row", { name: /退还-ui/ })).toContainText("退还");
   await expect(page.getByRole("table", { name: "各租户差额" }).getByRole("row", { name: new RegExp(world.tenantName) })).toContainText("退还");

@@ -141,7 +141,8 @@ test("确认后在基准价页显示第三方数据来源与确认人", async ({
   const panel = await openProposal(page, "cohere/command-a");
   await panel.getByRole("checkbox", { name: "已对照官方价格页核对" }).check();
   await panel.getByRole("button", { name: "确认", exact: true }).click();
-  await expect(panel.getByText("已确认").first()).toBeVisible();
+  // The toast is at app level, outside the dialog.
+  await expect(page.locator(".toast").filter({ hasText: "已确认" }).first()).toBeVisible();
 
   // The baseline page shows the model priced from the third party, by whom.
   await page.getByRole("group", { name: "价格分区" }).getByRole("button", { name: "基准价", exact: true }).click();
@@ -211,7 +212,8 @@ test("驳回需要填写原因，驳回后不再待处理", async ({ page }) => 
   const reason = "数据集把批量价写成了标准价，按官方价格页驳回";
   await panel.getByLabel("拒绝原因").fill(reason);
   await panel.getByRole("button", { name: "驳回", exact: true }).click();
-  await expect(panel.getByText("已驳回")).toBeVisible();
+  // The toast is at app level, outside the dialog.
+  await expect(page.locator(".toast").filter({ hasText: "已驳回" }).first()).toBeVisible();
 
   // The row is decided, not pending, and carries the reason.
   await expect(row(page, entry)).toContainText("已驳回");
@@ -315,7 +317,8 @@ test("在生效时间输入框里按回车也绕不过核对声明", async ({ pa
   // A typable 生效时间, which is where a keyboard submit starts.
   await panel.getByRole("checkbox", { name: "立即生效" }).uncheck();
   const when = panel.getByLabel("生效时间（UTC）");
-  await when.fill("2026-11-09 00:00");
+  // A time still to come, read the way the field takes it (`YYYY-MM-DD HH:MM`, UTC).
+  await when.fill(new Date(Date.now() + 86_400_000).toISOString().slice(0, 16).replace("T", " "));
 
   // Enter from that field submits the form without going through the button,
   // so the disabled attribute is not what holds: the submit guard is.
@@ -330,7 +333,8 @@ test("在生效时间输入框里按回车也绕不过核对声明", async ({ pa
   // Ticking it makes the same keystroke work.
   await panel.getByRole("checkbox", { name: "已对照官方价格页核对" }).check();
   await when.press("Enter");
-  await expect(panel.getByText("已确认").first()).toBeVisible();
+  // The toast is at app level, outside the dialog.
+  await expect(page.locator(".toast").filter({ hasText: "已确认" }).first()).toBeVisible();
 });
 
 test("从基准价页进入导入审核，落在本页", async ({ page }) => {

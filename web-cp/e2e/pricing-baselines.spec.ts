@@ -239,3 +239,33 @@ test("只读运维看不到编辑入口", async ({ page }) => {
   await expect(panel.getByRole("button", { name: "保存" })).toHaveCount(0);
   await expect(panel.getByRole("form", { name: "新基准价" })).toHaveCount(0);
 });
+
+test("面板列出每个分组的人民币售价：基准价乘以该分组现行的换算率", async ({ page }) => {
+  // A group at 1.2 CNY per USD, beside the first-boot `shared` group at 1.
+  const group = `grp-mx-${randomUUID().slice(0, 6)}`;
+  await stack.admin.post("/admin/provider-groups", {
+    name: group,
+    display_name: `换算 1.2 分组 ${group.slice(-4)}`,
+    description: "e2e 矩阵",
+    default_cny_per_usd: "1.2",
+  });
+  const model = await newModel("mx-base", "gpt-5.4-nano");
+
+  await openBaselines(page);
+  const panel = await openModel(page, model.name);
+  await panel.getByLabel("方式").selectOption("manual");
+  await panel.getByLabel("输入", { exact: true }).fill("3");
+  await panel.getByLabel("输出", { exact: true }).fill("6");
+  await panel.getByLabel("说明", { exact: true }).fill("矩阵价");
+  await panel.getByRole("button", { name: "保存" }).click();
+  await expect(page.getByText("已保存")).toBeVisible();
+
+  // The scenario's own arithmetic: 3 USD per million at 1.2 is ¥3.60, and 6 is
+  // ¥7.20. The first-boot `shared` group has no rate in force in this world, so
+  // its row says which one is missing rather than showing a figure.
+  const matrix = panel.getByRole("table", { name: "各分组售价" });
+  const rated = matrix.getByRole("row").filter({ hasText: "换算 1.2 分组" });
+  await expect(rated).toContainText("¥3.60");
+  await expect(rated).toContainText("¥7.20");
+  await expect(matrix.getByRole("row").filter({ hasText: "shared" })).toContainText("分组未设换算率");
+});

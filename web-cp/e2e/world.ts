@@ -14,13 +14,13 @@ import type { ApiClient, Json, Stack } from "./stack";
  */
 
 /**
- * What one non-streaming chat costs the organisation, in micro-dollars. The
- * stand-in reports 5 prompt and 3 completion tokens, and the model's price
- * card is `{"default":{"base":{"input":"1000","output":"2000"}}}` (USD per
- * million tokens, so 1000 and 2000 micro-dollars per token): 5 x 1000 + 3 x
- * 2000 = 11 000.
+ * What one non-streaming chat costs the organisation, in micro-cny. The
+ * stand-in reports 5 prompt and 3 completion tokens, the model's baseline card
+ * is `{"default":{"base":{"input":"1000","output":"2000"}}}` (USD per million
+ * tokens, so 1000 and 2000 micro-dollars per token: 5 x 1000 + 3 x 2000 =
+ * 11 000 µ$), and the seeded group's rate is 1 CNY per USD.
  */
-export const CALL_MICRO_USD = 11_000;
+export const CALL_MICRO_CNY = 11_000;
 
 const PRICE_CARD = { default: { base: { input: "1000", output: "2000" } } };
 /** How far ahead of the clock the price starts: past the control plane's own reading of "now". */
@@ -46,9 +46,9 @@ export interface BillingWorld {
 
 export interface WorldOptions {
   mode?: "prepaid" | "postpaid";
-  creditLimitUsd?: string;
+  creditLimitCny?: string;
   /** Posted as an operator credit. Left out, a prepaid organisation gets 10.00 so the gateway admits it; `"0"` posts nothing. */
-  creditUsd?: string;
+  creditCny?: string;
   members?: ("member" | "billing")[];
   /** Also create `chat-ui-later`, granted but with no price. */
   unpricedModel?: boolean;
@@ -217,10 +217,10 @@ export async function seedTenant(stack: Stack, opts: WorldOptions = {}): Promise
     },
     current.version,
   );
-  if (opts.creditLimitUsd !== undefined) {
-    await stack.admin.patch(`/admin/tenants/${tenantId}/billing`, { credit_limit_cny: opts.creditLimitUsd });
+  if (opts.creditLimitCny !== undefined) {
+    await stack.admin.patch(`/admin/tenants/${tenantId}/billing`, { credit_limit_cny: opts.creditLimitCny });
   }
-  const credit = opts.creditUsd ?? (opts.mode === "postpaid" ? "0" : "10.00");
+  const credit = opts.creditCny ?? (opts.mode === "postpaid" ? "0" : "10.00");
   if (credit !== "0") {
     await stack.admin.post(`/admin/tenants/${tenantId}/credits`, { amount_cny: credit, reason: "billing world funding" });
   }

@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { TabProps } from "../../App";
 import { charges, resources, tenants as tenantsApi, type AdminKey, type Charge, type ChargeFilter, type Tenant } from "../../lib/api";
 import { errorText } from "../../lib/fmt";
-import { fmtMicroUsd, fmtUtc } from "../../lib/money";
+import { fmtMicroCny, fmtMicroUsd, fmtUtc } from "../../lib/money";
 import { reasonLabel } from "../../lib/pricingStatus";
 import { Button } from "../../ui/Button";
 import { DataTable, Loading } from "../../ui/DataTable";
@@ -86,11 +86,16 @@ export function Charges(_props: TabProps) {
 
   const set = (patch: ChargeFilter) => setFilter((f) => ({ ...f, ...patch }));
   const tenantName = (id: string) => tenants.find((t) => t.id === id)?.name ?? id;
+  /** The CNY a charge billed per USD it cost, as the API gives it; `—` when the cost is unknown. */
+  const realised = (c: Charge) => (c.realised_cny_per_usd === null ? "—" : c.realised_cny_per_usd);
 
   return (
     <div className="panel">
       <h2>计费明细</h2>
-      <p className="hint">每一次调用的计价结果，最新的在前。未计价的行写明原因。</p>
+      <p className="hint">
+        每一次调用的计价结果，最新的在前。售价以人民币计，成本是上游的美元成本，实际换算率是这次调用收了多少人民币对一美元成本。
+        未计价的行写明原因。
+      </p>
       <form
         className="r"
         onSubmit={(e) => {
@@ -165,8 +170,9 @@ export function Charges(_props: TabProps) {
               <th>模型</th>
               <th>状态</th>
               <th>原因</th>
-              <th className="num">售价</th>
-              <th className="num">成本</th>
+              <th className="num">售价（元）</th>
+              <th className="num">成本（$）</th>
+              <th className="num">实际换算率</th>
               <th>档位</th>
             </tr>
           </thead>
@@ -178,8 +184,9 @@ export function Charges(_props: TabProps) {
                 <td>{models[c.requested_model_id] ?? c.requested_model_id}</td>
                 <td>{statusLabel(c.status)}</td>
                 <td>{c.error_code ? reasonLabel(c.error_code) : "—"}</td>
-                <td className="num">{c.charge_micro_usd === null ? "—" : fmtMicroUsd(c.charge_micro_usd)}</td>
-                <td className="num">{c.cost_micro_usd === null ? "—" : fmtMicroUsd(c.cost_micro_usd)}</td>
+                <td className="num">{c.charge_micro_cny === null ? "—" : fmtMicroCny(c.charge_micro_cny)}</td>
+                <td className="num money">{c.cost_micro_usd === null ? "—" : fmtMicroUsd(c.cost_micro_usd)}</td>
+                <td className="num tabular">{realised(c)}</td>
                 <td>{c.service_tier ?? "—"}</td>
               </tr>
             ))}

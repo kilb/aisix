@@ -3,7 +3,7 @@ import type { TabProps } from "../../App";
 import { ApiError, repricing, resources, tenants, type RepricingRun, type Tenant } from "../../lib/api";
 import { messageFor, problemAt } from "../../lib/errors";
 import { errorText } from "../../lib/fmt";
-import { fmtMicroUsd, fmtUtc } from "../../lib/money";
+import { fmtMicroCny, fmtUtc } from "../../lib/money";
 import { deltaWord, outcomeUnknown, utcInputToIso, utcInputValue } from "../../lib/repricing";
 import { Button } from "../../ui/Button";
 import { DataTable, Loading } from "../../ui/DataTable";
@@ -235,7 +235,7 @@ export function Repricing({ operator, canEdit, refreshShell }: TabProps) {
       setNotice({
         runId: run.id,
         kind: "done",
-        text: `已执行：${done.changed} 笔调用已改价，合计差额 ${fmtMicroUsd(done.delta_micro_usd)}（${deltaWord(done.delta_micro_usd)}）。`,
+        text: `已执行：${done.changed} 笔调用已改价，合计差额 ${fmtMicroCny(done.delta_micro_cny)}（${deltaWord(done.delta_micro_cny)}）。`,
       });
       refreshShell();
       await load();
@@ -404,8 +404,8 @@ export function Repricing({ operator, canEdit, refreshShell }: TabProps) {
               <tr>
                 <th scope="row">合计差额</th>
                 <td className="num money">
-                  {fmtMicroUsd(shown.delta_micro_usd)}
-                  <span className="cell-note">{deltaWord(shown.delta_micro_usd)}</span>
+                  {fmtMicroCny(shown.delta_micro_cny)}
+                  <span className="cell-note">{deltaWord(shown.delta_micro_cny)}</span>
                 </td>
               </tr>
             </tbody>
@@ -429,8 +429,8 @@ export function Repricing({ operator, canEdit, refreshShell }: TabProps) {
                     <td className="num">{t.events}</td>
                     <td className="num">{t.changed}</td>
                     <td className="num money">
-                      {fmtMicroUsd(t.delta_micro_usd)}
-                      <span className="cell-note">{deltaWord(t.delta_micro_usd)}</span>
+                      {fmtMicroCny(t.delta_micro_cny)}
+                      <span className="cell-note">{deltaWord(t.delta_micro_cny)}</span>
                     </td>
                   </tr>
                 ))}
@@ -533,8 +533,8 @@ export function Repricing({ operator, canEdit, refreshShell }: TabProps) {
                   <Lamp state={r.status === "applied" ? "applied" : "pending"}>{r.status === "applied" ? "已执行" : "已预览"}</Lamp>
                 </td>
                 <td className="num money">
-                  {fmtMicroUsd(r.delta_micro_usd)}
-                  <span className="cell-note">{deltaWord(r.delta_micro_usd)}</span>
+                  {fmtMicroCny(r.delta_micro_cny)}
+                  <span className="cell-note">{deltaWord(r.delta_micro_cny)}</span>
                 </td>
                 <td className="right">
                   <Button size="sm" type="button" disabled={busy} onClick={() => void view(r.id)}>

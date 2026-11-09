@@ -1,10 +1,7 @@
-/* 价格 · 平台价格. Every value comes from the tokens. */
+/* The price forms: 成本价, 基准价 and 导入审核 share the card fieldset, the
+   checkbox row and the warning list. Every value comes from the tokens. */
 
-/* A model with no price in force: the word in the error red, on Paper. */
-.price-unpriced {
-  color: var(--error);
-  font-weight: 700;
-}
+/* A price card as a fieldset: 成本价 and 基准价 both put one in their form. */
 .rate-card {
   min-width: 0;
   margin: 0 0 var(--s-4);
@@ -20,12 +17,16 @@
 .rate-card > .note {
   margin: 0 0 var(--s-3);
 }
+
+/* One checkbox and its label: the attestation in 导入审核, the immediate-start box. */
 .check {
   display: flex;
   align-items: center;
   gap: var(--s-2);
   margin: 0 0 var(--s-3);
 }
+
+/* A price written with warnings: the list under the form that wrote it. */
 .sell-history {
   margin-top: var(--s-6);
 }

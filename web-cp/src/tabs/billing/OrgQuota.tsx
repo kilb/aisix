@@ -1,6 +1,6 @@
 import { useRef, useState } from "react";
 import { createOrgQuota, deleteOrgQuota, updateOrgQuota, billing, type Budget } from "../../lib/api";
-import { fmtMicroUsd, isUsdAmount } from "../../lib/money";
+import { fmtMicroCny, isCnyAmount } from "../../lib/money";
 import { Button } from "../../ui/Button";
 import { DataTable, Loading } from "../../ui/DataTable";
 import { EmptyState } from "../../ui/EmptyState";
@@ -13,11 +13,11 @@ import { MONEY_HINT, PERIOD_LABEL, Region, budgetPeriod, type RegionProps } from
 
 type Refusal = ReturnType<typeof refusal>;
 
-/** Dollars and cents as a person types them, from whole-cent micro-dollars; exact, never a float. */
-function usdInput(micro: number): string {
+/** Yuan and fen as a person types them, from whole-fen micro-cny; exact, never a float. */
+function cnyInput(micro: number): string {
   const value = BigInt(micro);
-  const cents = ((value % 1_000_000n) / 10_000n).toString().padStart(2, "0");
-  return `${value / 1_000_000n}.${cents}`;
+  const fen = ((value % 1_000_000n) / 10_000n).toString().padStart(2, "0");
+  return `${value / 1_000_000n}.${fen}`;
 }
 
 function NewQuota({ account, onCreated }: { account: RegionProps["account"]; onCreated: () => Promise<void> }) {
@@ -36,7 +36,7 @@ function NewQuota({ account, onCreated }: { account: RegionProps["account"]; onC
     if (inFlight.current) return;
     const typed = limit.trim();
     setRefused(null);
-    if (!isUsdAmount(typed, { allowZero: false })) {
+    if (!isCnyAmount(typed, { allowZero: false })) {
       setLocal(MONEY_HINT);
       focusRefusal();
       return;
@@ -45,9 +45,9 @@ function NewQuota({ account, onCreated }: { account: RegionProps["account"]; onC
     inFlight.current = true;
     setBusy(true);
     try {
-      await createOrgQuota(account.tenant_id, { kind, ...(kind === "periodic" ? { period } : {}), limit_usd: typed });
+      await createOrgQuota(account.tenant_id, { kind, ...(kind === "periodic" ? { period } : {}), limit_cny: typed });
     } catch (err) {
-      setRefused(refusal(err, (p) => p === "/kind" || p === "/period" || p === "/limit_usd"));
+      setRefused(refusal(err, (p) => p === "/kind" || p === "/period" || p === "/limit_cny"));
       inFlight.current = false;
       setBusy(false);
       focusRefusal();
@@ -87,7 +87,7 @@ function NewQuota({ account, onCreated }: { account: RegionProps["account"]; onC
             )}
           </Field>
         )}
-        <Field label="限额（美元）" error={local ?? refused?.at.get("/limit_usd") ?? null}>
+        <Field label="限额（元）" error={local ?? refused?.at.get("/limit_cny") ?? null}>
           {(aria) => <input inputMode="decimal" value={limit} disabled={busy} onChange={(e) => setLimit(e.target.value)} {...aria} />}
         </Field>
         <Button kind="primary" type="submit" busy={busy} busyLabel="新建中…">
@@ -120,7 +120,7 @@ function RowActions({ tenantId, budget, onChanged }: { tenantId: string; budget:
     if (inFlight.current) return;
     const typed = draft.trim();
     setRefused(null);
-    if (!isUsdAmount(typed, { allowZero: false })) {
+    if (!isCnyAmount(typed, { allowZero: false })) {
       setLocal(MONEY_HINT);
       focusRefusal();
       return;
@@ -131,7 +131,7 @@ function RowActions({ tenantId, budget, onChanged }: { tenantId: string; budget:
     try {
       await updateOrgQuota(tenantId, budget.id, typed);
     } catch (err) {
-      setRefused(refusal(err, (p) => p === "/limit_usd"));
+      setRefused(refusal(err, (p) => p === "/limit_cny"));
       inFlight.current = false;
       setBusy(false);
       focusRefusal();
@@ -164,13 +164,13 @@ function RowActions({ tenantId, budget, onChanged }: { tenantId: string; budget:
     }
   }
 
-  const problem = local ?? refused?.at.get("/limit_usd") ?? null;
+  const problem = local ?? refused?.at.get("/limit_cny") ?? null;
   return (
     <div>
       {editing ? (
         <form ref={form} onSubmit={(e) => void save(e)} noValidate>
           <div className="bl-controls">
-            <Field label="新限额（美元）" error={problem}>
+            <Field label="新限额（元）" error={problem}>
               {(aria) => (
                 <input inputMode="decimal" value={draft} disabled={busy} autoFocus onChange={(e) => setDraft(e.target.value)} {...aria} />
               )}
@@ -189,7 +189,7 @@ function RowActions({ tenantId, budget, onChanged }: { tenantId: string; budget:
             type="button"
             size="sm"
             onClick={() => {
-              setDraft(usdInput(budget.limit_micro_usd));
+              setDraft(cnyInput(budget.limit_micro_cny));
               setLocal(null);
               setRefused(null);
               setEditing(true);
@@ -255,9 +255,9 @@ export function OrgQuota({ account, canEdit, onQuotasChanged }: RegionProps) {
               <tr key={b.id}>
                 <td>{b.kind === "cumulative" ? "一次性额度" : "按周期"}</td>
                 <td>{budgetPeriod(b)}</td>
-                <td className="num">{fmtMicroUsd(b.limit_micro_usd)}</td>
-                <td className="num">{fmtMicroUsd(b.spent_micro_usd)}</td>
-                <td className="num">{fmtMicroUsd(b.remaining_micro_usd)}</td>
+                <td className="num">{fmtMicroCny(b.limit_micro_cny)}</td>
+                <td className="num">{fmtMicroCny(b.spent_micro_cny)}</td>
+                <td className="num">{fmtMicroCny(b.remaining_micro_cny)}</td>
                 <td>
                   <span data-state={b.exhausted ? "exhausted" : "ok"}>
                     <Lamp state={b.exhausted ? "rejected" : "applied"}>{b.exhausted ? "已用尽" : "正常"}</Lamp>

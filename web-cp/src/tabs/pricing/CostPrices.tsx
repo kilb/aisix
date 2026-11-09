@@ -20,7 +20,7 @@ import { DataTable, Loading } from "../../ui/DataTable";
 import { EmptyState } from "../../ui/EmptyState";
 import { Field, useRefusalFocus } from "../../ui/Field";
 import { useToast } from "../../ui/Toast";
-import "./SellPrices.css";
+import "./PriceForms.css";
 import "./CostPrices.css";
 
 const PAGE = 20;

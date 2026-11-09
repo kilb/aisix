@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { TabProps } from "../../App";
 import { ApiError, reconciliation, tenants, type Reconciliation as Answer, type Tenant } from "../../lib/api";
 import { errorText, fmtInt } from "../../lib/fmt";
-import { fmtMicroUsd, fmtUtc } from "../../lib/money";
+import { fmtMicroCny, fmtUtc } from "../../lib/money";
 import { reasonLabel } from "../../lib/pricingStatus";
 import { checkLabel, dropLabel, failureText } from "../../lib/reconcile";
 import { Button } from "../../ui/Button";
@@ -130,8 +130,8 @@ export function Reconciliation(_props: TabProps) {
                       <tr key={`${m.tenant_id}-${m.check}`}>
                         <td>{m.tenant_name || m.tenant_id}</td>
                         <td>{checkLabel(m.check)}</td>
-                        <td className="num money">{fmtMicroUsd(m.expected_micro_usd)}</td>
-                        <td className="num money">{fmtMicroUsd(m.actual_micro_usd)}</td>
+                        <td className="num money">{fmtMicroCny(m.expected_micro_cny)}</td>
+                        <td className="num money">{fmtMicroCny(m.actual_micro_cny)}</td>
                         <td className="num">{m.seq ?? "—"}</td>
                       </tr>
                     ))}

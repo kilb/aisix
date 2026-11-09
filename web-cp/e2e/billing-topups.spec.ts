@@ -39,9 +39,9 @@ async function openTopups(page: Page, email = stack.operator.email, password = s
 
 /** A funded-with-nothing organisation whose owner has asked for `amount` dollars. */
 async function requested(amount: string, note: string): Promise<{ world: BillingWorld; topupId: string }> {
-  const world = await seedTenant(stack, { creditUsd: "0" });
+  const world = await seedTenant(stack, { creditCny: "0" });
   const tenant = await tenantClient(stack, world);
-  const made: Json = await tenant.post("/api/billing/topups", { amount_usd: amount, note, reference: `ref-${note}` });
+  const made: Json = await tenant.post("/api/billing/topups", { amount_cny: amount, note, reference: `ref-${note}` });
   return { world, topupId: made.id as string };
 }
 
@@ -55,7 +55,7 @@ test("批准充值需二次确认，批准后租户余额与流水更新", async
   const { world } = await requested("0.05", "批准-ui");
   await openTopups(page);
   const row = rowOf(page, world);
-  await expect(row).toContainText("$0.05");
+  await expect(row).toContainText("¥0.05");
   await expect(row).toContainText("批准-ui");
   await expect(row).toContainText("租户申请");
 
@@ -66,13 +66,13 @@ test("批准充值需二次确认，批准后租户余额与流水更新", async
 
   await row.getByRole("button", { name: "确认批准" }).click();
   await expect(row).toHaveCount(0);
-  await expect(page.getByRole("status").filter({ hasText: "已批准" })).toContainText("$0.05");
+  await expect(page.getByRole("status").filter({ hasText: "已批准" })).toContainText("¥0.05");
 
   const entries = await balance(world);
   expect(entries).toHaveLength(1);
   expect(entries[0].kind).toBe("topup");
-  expect(entries[0].amount_micro_usd).toBe(50_000);
-  expect(entries[0].balance_after_micro_usd).toBe(50_000);
+  expect(entries[0].amount_micro_cny).toBe(50_000);
+  expect(entries[0].balance_after_micro_cny).toBe(50_000);
 
   // 已批准 lists it with its outcome and no controls.
   await page.getByLabel("状态").selectOption("approved");
@@ -141,7 +141,7 @@ test("两位运维同时处理同一申请，后到的一方看到已被处理",
 
   const entries = await balance(world);
   expect(entries.filter((e) => e.kind === "topup")).toHaveLength(1);
-  expect(entries[0].balance_after_micro_usd).toBe(90_000);
+  expect(entries[0].balance_after_micro_cny).toBe(90_000);
 });
 
 test("有待审批的申请时，计费在导航上有提示", async ({ page }) => {
@@ -172,7 +172,7 @@ test("只读运维看不到批准与驳回", async ({ page }) => {
   await openTopups(page, viewer.email, viewer.password);
 
   const row = rowOf(page, world);
-  await expect(row).toContainText("$0.04");
+  await expect(row).toContainText("¥0.04");
   await expect(row.getByRole("button")).toHaveCount(0);
   await expect(page.getByRole("button", { name: /^(批准|驳回)/ })).toHaveCount(0);
 
