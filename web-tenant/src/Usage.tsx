@@ -12,7 +12,7 @@ import {
   type UsageSummaryRow,
 } from "./lib/api";
 import { formMessageFor, messageFor } from "./lib/errors";
-import { fmtMicroCny, fmtUtc, periodLabel, todayUtc, utcRange } from "./lib/money";
+import { fmtCnyPerMillion, fmtMicroCny, fmtUtc, periodLabel, todayUtc, utcRange } from "./lib/money";
 import { Button } from "./ui/Button";
 import { DataTable, Loading } from "./ui/DataTable";
 import { EmptyState } from "./ui/EmptyState";
@@ -53,7 +53,7 @@ const ERROR_LABEL: Record<string, string> = {
   failed: "失败",
 };
 
-/** A signed amount for a correction: `+$0.002` or `-$0.002`. */
+/** A signed amount for a correction: `+¥0.002` or `-¥0.002`. */
 function signed(micro: number): string {
   return micro > 0 ? `+${fmtMicroCny(micro)}` : fmtMicroCny(micro);
 }
@@ -64,11 +64,11 @@ function chargeText(c: Call): string {
   switch (charge.status) {
     case "charged": {
       // Unpriced when made, then corrected by re-pricing: the whole charge is the adjustment.
-      if (charge.amount_micro_usd === null && charge.adjusted_micro_usd !== 0) {
-        return `${fmtMicroCny(charge.adjusted_micro_usd)}（重新计价）${charge.estimated ? "（估算）" : ""}`;
+      if (charge.amount_micro_cny === null && charge.adjusted_micro_cny !== 0) {
+        return `${fmtMicroCny(charge.adjusted_micro_cny)}（重新计价）${charge.estimated ? "（估算）" : ""}`;
       }
-      const amount = charge.amount_micro_usd === null ? "—" : fmtMicroCny(charge.amount_micro_usd);
-      const adjusted = charge.adjusted_micro_usd !== 0 ? `（已调整 ${signed(charge.adjusted_micro_usd)}）` : "";
+      const amount = charge.amount_micro_cny === null ? "—" : fmtMicroCny(charge.amount_micro_cny);
+      const adjusted = charge.adjusted_micro_cny !== 0 ? `（已调整 ${signed(charge.adjusted_micro_cny)}）` : "";
       return `${amount}${adjusted}${charge.estimated ? "（估算）" : ""}`;
     }
     case "exempt":
@@ -289,7 +289,7 @@ function Summary({ keys, showKeys }: { keys: TenantKey[]; showKeys: boolean }) {
                 <td>{summaryModel(r)}</td>
                 <td className="num">{r.requests}</td>
                 <td className="num">
-                  {fmtMicroCny(r.charged_micro_usd)}
+                  {fmtMicroCny(r.charged_micro_cny)}
                   {r.estimated_requests > 0 ? "（含估算）" : ""}
                 </td>
                 <td>
@@ -436,6 +436,7 @@ function CallLog({ keys, showKeys, models }: { keys: TenantKey[]; showKeys: bool
               <th>成员</th>
               <th>请求 ID</th>
               <th>状态</th>
+              <th>分组</th>
               <th className="num">费用</th>
             </tr>
           </thead>
@@ -464,11 +465,12 @@ function CallLog({ keys, showKeys, models }: { keys: TenantKey[]; showKeys: bool
                     <td>
                       <CallStatusLamp call={c} />
                     </td>
+                    <td>{c.charge.group ? c.charge.group.display_name : "—"}</td>
                     <td className="num">{chargeText(c)}</td>
                   </tr>
                   {expanded && (
                     <tr className="usage-detail">
-                      <td colSpan={8}>
+                      <td colSpan={9}>
                         <h3>计费明细</h3>
                         {c.charge.lines.length === 0 ? (
                           <p className="hint">这次调用没有计费项</p>
@@ -478,7 +480,7 @@ function CallLog({ keys, showKeys, models }: { keys: TenantKey[]; showKeys: bool
                               <tr>
                                 <th>计量</th>
                                 <th className="num">数量</th>
-                                <th className="num">单价（美元/百万）</th>
+                                <th className="num">单价（元/百万）</th>
                               </tr>
                             </thead>
                             <tbody>
@@ -486,7 +488,7 @@ function CallLog({ keys, showKeys, models }: { keys: TenantKey[]; showKeys: bool
                                 <tr key={l.dimension}>
                                   <td>{dimensionLabel(l.dimension)}</td>
                                   <td className="num">{l.quantity}</td>
-                                  <td className="num">{l.rate}</td>
+                                  <td className="num">{l.rate_cny === null ? "—" : fmtCnyPerMillion(l.rate_cny)}</td>
                                 </tr>
                               ))}
                             </tbody>

@@ -15,12 +15,12 @@ test.afterAll(async () => {
 });
 
 test("实际可用与 API 密钥自查一致", async ({ page }) => {
-  const world = await seedBillingWorld(stack, { creditUsd: "1.00", members: ["member"] });
+  const world = await seedBillingWorld(stack, { creditCny: "1.00", members: ["member"] });
   const m = world.members[0]!;
   const km = await memberKey(stack, world, m);
   const owner = stack.tenant();
   await owner.post("/api/login", world.owner);
-  await owner.post("/api/budgets", { scope: "api_key", scope_ref: km.id, kind: "cumulative", limit_usd: "0.05" });
+  await owner.post("/api/budgets", { scope: "api_key", scope_ref: km.id, kind: "cumulative", limit_cny: "0.05" });
   await expect
     .poll(() => chat(stack, km.plaintext, world.model.name), { message: "the gateway admits the call" })
     .toBe(200);
@@ -32,7 +32,7 @@ test("实际可用与 API 密钥自查一致", async ({ page }) => {
       async () => {
         const res = await fetch(`${stack.proxyUrl}/v1/key`, { headers: { authorization: `Bearer ${km.plaintext}` } });
         if (res.status !== 200) return res.status;
-        return ((await res.json()) as { data: { effective_remaining_usd: string } }).data.effective_remaining_usd;
+        return ((await res.json()) as { data: { effective_remaining: string } }).data.effective_remaining;
       },
       { message: "GET /v1/key reports the booked spend", timeout: 15_000 },
     )
@@ -47,6 +47,6 @@ test("实际可用与 API 密钥自查一致", async ({ page }) => {
     .getByRole("table", { name: "密钥实际可用", exact: true })
     .locator("tbody tr")
     .filter({ hasText: /member-key-/ });
-  await expect(figures).toContainText("$0.039");
+  await expect(figures).toContainText("¥0.039");
   await expect(figures).toContainText("密钥");
 });

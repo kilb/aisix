@@ -154,9 +154,9 @@ function BalancePanel({ balance, team, err }: { balance: Balance | null; team: B
             <Lamp state={exhausted ? "rejected" : "applied"}>{stateText}</Lamp>
           </p>
           <div className="entries">
-            <Reading label="余额" value={<Money micro={balance.balance_micro_usd} />} />
-            {postpaid && <Reading label="信用额度" value={<Money micro={balance.credit_limit_micro_usd} />} />}
-            {postpaid && <Reading label="可用额度" value={<Money micro={balance.available_micro_usd} />} />}
+            <Reading label="余额" value={<Money micro={balance.balance_micro_cny} />} />
+            {postpaid && <Reading label="信用额度" value={<Money micro={balance.credit_limit_micro_cny} />} />}
+            {postpaid && <Reading label="可用额度" value={<Money micro={balance.available_micro_cny} />} />}
             <Reading label="待审批的充值" value={`${balance.pending_topups} 笔`} />
           </div>
         </>
@@ -178,8 +178,8 @@ function stopsOf(q: KeyQuota): ReadoutStop[] {
     const amount = Math.max(0, micro);
     least[level] = Math.min(least[level] ?? amount, amount);
   };
-  if (q.org) lower("organization", q.org.available_micro_usd);
-  for (const f of q.quotas) lower(SCOPE_LEVEL[f.scope], f.remaining_micro_usd);
+  if (q.org) lower("organization", q.org.available_micro_cny);
+  for (const f of q.quotas) lower(SCOPE_LEVEL[f.scope], f.remaining_micro_cny);
   return (["organization", "member", "key"] as const).flatMap((level) => {
     const remaining = least[level];
     return remaining === undefined ? [] : [{ level, label: LEVEL_LABEL[level], remainingMicroCny: remaining }];
@@ -222,7 +222,7 @@ function Readout({ member, balance, team }: { member: SessionMember; balance: Ba
 
   // The figures move as calls are made, so they are read again whenever the
   // key changes or the balance does.
-  const available = balance?.available_micro_usd;
+  const available = balance?.available_micro_cny;
   useEffect(() => {
     if (keyId === null) {
       setQuota(null);
@@ -257,11 +257,11 @@ function Readout({ member, balance, team }: { member: SessionMember; balance: Ba
 
   let view: { effective: number | null; stops: ReadoutStop[]; binding: QuotaLevel | null } | null = null;
   if (keyId !== null && quota && quota.key_id === keyId) {
-    view = { effective: quota.effective_remaining_micro_usd, stops: stopsOf(quota), binding: quota.binding_level };
+    view = { effective: quota.effective_remaining_micro_cny, stops: stopsOf(quota), binding: quota.binding_level };
   } else if (keyId === null && balance) {
     // No key to read (a billing member's case): the smaller of the organisation's
     // balance and its smallest remaining quota.
-    const left = Math.min(Math.max(0, balance.available_micro_usd), ...team.map((b) => Math.max(0, b.remaining_micro_usd)));
+    const left = Math.min(Math.max(0, balance.available_micro_cny), ...team.map((b) => Math.max(0, b.remaining_micro_cny)));
     view = { effective: left, stops: [{ level: "organization", label: "组织", remainingMicroCny: left }], binding: "organization" };
   }
 
@@ -308,7 +308,7 @@ function Readout({ member, balance, team }: { member: SessionMember; balance: Ba
 
 type TopupField = "amount" | "note" | "reference";
 
-const TOPUP_PATH: Record<string, TopupField> = { "/amount_usd": "amount", "/note": "note", "/reference": "reference" };
+const TOPUP_PATH: Record<string, TopupField> = { "/amount_cny": "amount", "/note": "note", "/reference": "reference" };
 
 function TopupForm({ onRequested }: { onRequested: () => void }) {
   const [amount, setAmount] = useState("");
@@ -333,7 +333,7 @@ function TopupForm({ onRequested }: { onRequested: () => void }) {
     setBusy(true);
     try {
       await billing.requestTopup({
-        amount_usd: amountText,
+        amount_cny: amountText,
         ...(note.trim() ? { note: note.trim() } : {}),
         ...(reference.trim() ? { reference: reference.trim() } : {}),
       });
@@ -365,7 +365,7 @@ function TopupForm({ onRequested }: { onRequested: () => void }) {
   return (
     <Section title="申请充值">
       <form className="form cols" ref={form} onSubmit={submit} noValidate>
-        <Field label="金额（美元）" error={errors.amount} hint="最多两位小数">
+        <Field label="充值金额（元）" error={errors.amount} hint="最多两位小数">
           {(aria) => (
             <input inputMode="decimal" autoComplete="off" value={amount} onChange={(e) => setAmount(e.target.value)} {...aria} />
           )}
@@ -440,7 +440,7 @@ function TopupList({ items, err }: { items: Topup[] | null; err: string | null }
               return (
                 <tr key={t.id}>
                   <td className="num">
-                    <Money micro={t.amount_micro_usd} />
+                    <Money micro={t.amount_micro_cny} />
                   </td>
                   <td>
                     <Lamp state={state.lamp}>{state.text}</Lamp>
@@ -605,10 +605,10 @@ function Ledger({ topups }: { topups: Topup[] | null }) {
                   <td className="tabular">{fmtUtc(r.posted_at)}</td>
                   <td>{KIND_LABEL[r.kind] ?? r.kind}</td>
                   <td className="num">
-                    <Money micro={r.amount_micro_usd} />
+                    <Money micro={r.amount_micro_cny} />
                   </td>
                   <td className="num">
-                    <Money micro={r.balance_after_micro_usd} />
+                    <Money micro={r.balance_after_micro_cny} />
                   </td>
                   <td>
                     <span className="trunc" title={explain(r)}>
@@ -706,16 +706,16 @@ function Summary({ range, fromDate, toDate }: { range: { from?: string; to?: str
               <tr key={r.period_start}>
                 <td className="tabular">{periodLabel(r.period_start, group)}</td>
                 <td className="num">
-                  <Money micro={r.usage_micro_usd} />
+                  <Money micro={r.usage_micro_cny} />
                 </td>
                 <td className="num">
-                  <Money micro={r.topups_micro_usd} />
+                  <Money micro={r.topups_micro_cny} />
                 </td>
                 <td className="num">
-                  <Money micro={r.adjustments_micro_usd} />
+                  <Money micro={r.adjustments_micro_cny} />
                 </td>
                 <td className="num">
-                  <Money micro={r.closing_balance_micro_usd} />
+                  <Money micro={r.closing_balance_micro_cny} />
                 </td>
               </tr>
             ))}

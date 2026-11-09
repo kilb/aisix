@@ -85,7 +85,7 @@ interface World {
 
 /** An organisation on a 1.00 credit: owner keys K1 and K2, and member M with its key KM. */
 async function seed(extra: ("member" | "billing")[] = ["member"]): Promise<World> {
-  const world = await seedBillingWorld(stack, { creditUsd: "1.00", members: extra });
+  const world = await seedBillingWorld(stack, { creditCny: "1.00", members: extra });
   const k1: Key = { id: world.key.id, label: "world-owner-key", plaintext: world.key.plaintext };
   const k2 = await mint(world.owner, "owner-key-two");
   const m = world.members[0]!;
@@ -97,7 +97,7 @@ async function seed(extra: ("member" | "billing")[] = ["member"]): Promise<World
 /** The owner's quota on `scope_ref`, set through the real API. */
 async function setQuota(
   who: Login,
-  body: { scope: "member" | "api_key"; scope_ref: string; kind?: string; period?: string; limit_usd: string },
+  body: { scope: "member" | "api_key"; scope_ref: string; kind?: string; period?: string; limit_cny: string },
 ) {
   return (await apiAs(who)).post("/api/budgets", body);
 }
@@ -112,7 +112,7 @@ async function createViaPage(
   await form.getByLabel(/^对象(?!类型)/).selectOption(q.target);
   if (q.kind) await form.getByLabel(/^类型/).selectOption(q.kind);
   if (q.period) await form.getByLabel(/^周期/).selectOption(q.period);
-  await form.getByLabel("限额（美元）").fill(q.limit);
+  await form.getByLabel("限额（元）").fill(q.limit);
   await form.getByRole("button", { name: "创建" }).click();
 }
 
@@ -126,7 +126,7 @@ async function spend(key: Key, world: BillingWorld, n: number): Promise<void> {
 /** Waits until the control plane has booked `micro` of spend on the owner's view of quota `id`. */
 async function spentIs(who: Login, id: string, micro: number): Promise<void> {
   await expect
-    .poll(async () => ((await (await apiAs(who)).get("/api/budgets")).items as { id: string; spent_micro_usd: number }[]).find((b) => b.id === id)?.spent_micro_usd, {
+    .poll(async () => ((await (await apiAs(who)).get("/api/budgets")).items as { id: string; spent_micro_cny: number }[]).find((b) => b.id === id)?.spent_micro_cny, {
       message: "the spend is booked",
       timeout: REACH_MS,
     })
@@ -156,7 +156,7 @@ test("为密钥设每日额度，用尽后该密钥被拒，另一把密钥照�
 
   await page.getByRole("button", { name: "刷新" }).click();
   const row = rowOf(keys, "world-owner-key");
-  await expect(row).toContainText("$0.022");
+  await expect(row).toContainText("¥0.022");
   await expect(row.locator("[data-state]")).toHaveAttribute("data-state", "exhausted");
   await expect(row.locator("[data-state]")).toHaveText("已用尽");
 
@@ -181,7 +181,7 @@ test("一次性额度用尽后被拒，提高限额后恢复", async ({ page }) 
   const row = rowOf(keys, "world-owner-key");
   await expect(row.locator("[data-state]")).toHaveAttribute("data-state", "exhausted");
   await row.getByRole("button", { name: "修改限额" }).click();
-  await row.getByLabel("新的限额（美元）").fill("1.00");
+  await row.getByLabel("新的限额（元）").fill("1.00");
   await row.getByRole("button", { name: "保存" }).click();
   await expect(row.locator("[data-state]")).toHaveAttribute("data-state", "ok");
   await expect(row.locator("[data-state]")).toHaveText("正常");
@@ -204,8 +204,8 @@ test("成员额度覆盖该成员的全部密钥", async ({ page }) => {
 
 test("成员只能给自己的密钥设额度，看不到组织额度", async ({ page }) => {
   const s = await seed();
-  await stack.admin.post(`/admin/tenants/${s.world.tenantId}/budgets`, { kind: "periodic", period: "month", limit_usd: "5.43" });
-  await setQuota(s.world.owner, { scope: "api_key", scope_ref: s.km.id, kind: "periodic", period: "month", limit_usd: "0.02" });
+  await stack.admin.post(`/admin/tenants/${s.world.tenantId}/budgets`, { kind: "periodic", period: "month", limit_cny: "5.43" });
+  await setQuota(s.world.owner, { scope: "api_key", scope_ref: s.km.id, kind: "periodic", period: "month", limit_cny: "0.02" });
 
   // What the member's browser is sent, as well as what it shows.
   const bodies: string[] = [];
@@ -216,8 +216,11 @@ test("成员只能给自己的密钥设额度，看不到组织额度", async ({
   await expect(page.getByRole("region", { name: /组织额度/ })).toHaveCount(0);
   await expect(page.locator("main")).not.toContainText("5.43");
   await expect(rowOf(table(page, "密钥额度"), "m-key-one")).toBeVisible();
+  // The member's own answers are in the sweep, so it reads non-empty.
+  expect(bodies.join("\n")).toContain('"scope":"api_key"');
   const seen = bodies.join("\n");
-  for (const token of ['"scope":"team"', "5430000", "balance_micro_usd"]) expect(seen).not.toContain(token);
+  // The organisation's own quota, its amount, and the balance figure it would carry.
+  for (const token of ['"scope":"team"', "5430000"]) expect(seen).not.toContain(token);
 
   const form = region(page, "新建额度");
   await expect(form.getByLabel(/^对象类型/).locator("option")).toHaveText(["密钥"]);
@@ -246,11 +249,11 @@ test("超过上级额度时给出提示，但仍能保存", async ({ page }) => 
   await form.getByLabel(/^对象(?!类型)/).selectOption(s.km.id);
   const warning = form.getByText("超过上级额度时以先用尽者为准");
   // Equal to the member's monthly 0.01 is not above it.
-  await form.getByLabel("限额（美元）").fill("0.01");
+  await form.getByLabel("限额（元）").fill("0.01");
   await expect(warning).toHaveCount(0);
   // A daily cap is not compared with a monthly one.
   await form.getByLabel(/^周期/).selectOption("day");
-  await form.getByLabel("限额（美元）").fill("5.00");
+  await form.getByLabel("限额（元）").fill("5.00");
   await expect(warning).toHaveCount(0);
   await form.getByLabel(/^周期/).selectOption("month");
   await expect(warning).toBeVisible();
@@ -259,24 +262,24 @@ test("超过上级额度时给出提示，但仍能保存", async ({ page }) => 
   const row = rowOf(table(page, "密钥额度"), "m-key-one");
   await expect(row).toHaveCount(1);
   await expect(row).toContainText("超过上级额度时以先用尽者为准");
-  await expect(row).toContainText("$5.00");
+  await expect(row).toContainText("¥5.00");
 });
 
 test("实际可用显示最小的一级，并写明受限于哪一级", async ({ page }) => {
   const s = await seed();
-  await setQuota(s.world.owner, { scope: "api_key", scope_ref: s.km.id, kind: "cumulative", limit_usd: "0.05" });
+  await setQuota(s.world.owner, { scope: "api_key", scope_ref: s.km.id, kind: "cumulative", limit_cny: "0.05" });
   await spend(s.km, s.world, 1);
   // The call is booked a moment after it is answered; the page reads once on load.
   await expect
     .poll(
-      async () => ((await (await apiAs(s.world.owner)).get(`/api/keys/${s.km.id}/quota`)) as { effective_remaining_micro_usd: number }).effective_remaining_micro_usd,
+      async () => ((await (await apiAs(s.world.owner)).get(`/api/keys/${s.km.id}/quota`)) as { effective_remaining_micro_cny: number }).effective_remaining_micro_cny,
       { message: "the spend is booked", timeout: REACH_MS },
     )
     .toBe(39_000);
 
   await openBudgets(page, s.world.owner);
   const row = rowOf(table(page, "密钥实际可用"), "m-key-one");
-  await expect(row).toContainText("$0.039");
+  await expect(row).toContainText("¥0.039");
   await expect(row).toContainText("密钥");
   // A key no quota caps is bound by the organisation's balance alone.
   await expect(rowOf(table(page, "密钥实际可用"), "owner-key-two")).toContainText("组织");
@@ -284,7 +287,7 @@ test("实际可用显示最小的一级，并写明受限于哪一级", async ({
 
 test("删除额度需要二次确认，删除后不再拦截", async ({ page }) => {
   const s = await seed();
-  await setQuota(s.world.owner, { scope: "api_key", scope_ref: s.k1.id, kind: "cumulative", limit_usd: "0.01" });
+  await setQuota(s.world.owner, { scope: "api_key", scope_ref: s.k1.id, kind: "cumulative", limit_cny: "0.01" });
   await spend(s.k1, s.world, 1);
   await refused(s.k1, s.world).toBe(429);
 
@@ -306,15 +309,15 @@ test("同一对象同一周期不能建两个额度，提示已存在", async ({
   await createViaPage(page, { scope: "密钥", target: s.k1.id, period: "month", limit: "2.00" });
   await expect(region(page, "新建额度").getByRole("alert")).toHaveText("该对象在这个周期已有额度");
   await expect(rowOf(table(page, "密钥额度"), "world-owner-key")).toHaveCount(1);
-  await expect(rowOf(table(page, "密钥额度"), "world-owner-key")).toContainText("$1.00");
+  await expect(rowOf(table(page, "密钥额度"), "world-owner-key")).toContainText("¥1.00");
 });
 
 test("账单角色只能查看额度，没有新建与修改", async ({ page }) => {
   const s = await seed(["billing"]);
   const billing = s.world.members[0]!;
-  await stack.admin.post(`/admin/tenants/${s.world.tenantId}/budgets`, { kind: "periodic", period: "month", limit_usd: "5.00" });
-  await setQuota(s.world.owner, { scope: "api_key", scope_ref: s.k1.id, kind: "periodic", period: "month", limit_usd: "0.50" });
-  await setQuota(s.world.owner, { scope: "member", scope_ref: billing.id, kind: "periodic", period: "month", limit_usd: "0.70" });
+  await stack.admin.post(`/admin/tenants/${s.world.tenantId}/budgets`, { kind: "periodic", period: "month", limit_cny: "5.00" });
+  await setQuota(s.world.owner, { scope: "api_key", scope_ref: s.k1.id, kind: "periodic", period: "month", limit_cny: "0.50" });
+  await setQuota(s.world.owner, { scope: "member", scope_ref: billing.id, kind: "periodic", period: "month", limit_cny: "0.70" });
 
   await openBudgets(page, billing);
   await expect(rowOf(table(page, "组织额度"), "每月")).toHaveCount(1);
@@ -327,7 +330,7 @@ test("账单角色只能查看额度，没有新建与修改", async ({ page }) 
 
 test("组织额度对所有者只读", async ({ page }) => {
   const s = await seed();
-  await stack.admin.post(`/admin/tenants/${s.world.tenantId}/budgets`, { kind: "periodic", period: "month", limit_usd: "5.00" });
+  await stack.admin.post(`/admin/tenants/${s.world.tenantId}/budgets`, { kind: "periodic", period: "month", limit_cny: "5.00" });
   await openBudgets(page, s.world.owner);
   const org = rowOf(table(page, "组织额度"), "每月");
   await expect(org).toHaveCount(1);
@@ -345,9 +348,9 @@ test("管理员可以给任何密钥设额度，并修改、删除自己设的�
   const row = rowOf(table(page, "密钥额度"), "world-owner-key");
   await expect(row).toContainText("组织管理员");
   await row.getByRole("button", { name: "修改限额" }).click();
-  await row.getByLabel("新的限额（美元）").fill("0.60");
+  await row.getByLabel("新的限额（元）").fill("0.60");
   await row.getByRole("button", { name: "保存" }).click();
-  await expect(row).toContainText("$0.60");
+  await expect(row).toContainText("¥0.60");
   await row.getByRole("button", { name: "删除", exact: true }).click();
   await row.getByRole("button", { name: "确认删除" }).click();
   await expect(rowOf(table(page, "密钥额度"), "world-owner-key")).toHaveCount(0);
@@ -355,20 +358,20 @@ test("管理员可以给任何密钥设额度，并修改、删除自己设的�
 
 test("成员可以修改自己为自己密钥设的额度", async ({ page }) => {
   const s = await seed();
-  await setQuota(s.m, { scope: "api_key", scope_ref: s.km.id, kind: "periodic", period: "month", limit_usd: "0.01" });
+  await setQuota(s.m, { scope: "api_key", scope_ref: s.km.id, kind: "periodic", period: "month", limit_cny: "0.01" });
   await openBudgets(page, s.m);
   const row = rowOf(table(page, "密钥额度"), "m-key-one");
-  await expect(row).toContainText("$0.01");
+  await expect(row).toContainText("¥0.01");
   await row.getByRole("button", { name: "修改限额" }).click();
-  await row.getByLabel("新的限额（美元）").fill("0.03");
+  await row.getByLabel("新的限额（元）").fill("0.03");
   await row.getByRole("button", { name: "保存" }).click();
-  await expect(row).toContainText("$0.03");
+  await expect(row).toContainText("¥0.03");
   await expect(row.getByRole("button", { name: "修改限额" })).toBeVisible();
 });
 
 test("所有者可以删除成员为自己密钥设的额度，但不能修改", async ({ page }) => {
   const s = await seed();
-  await setQuota(s.m, { scope: "api_key", scope_ref: s.km.id, kind: "periodic", period: "month", limit_usd: "0.01" });
+  await setQuota(s.m, { scope: "api_key", scope_ref: s.km.id, kind: "periodic", period: "month", limit_cny: "0.01" });
   await openBudgets(page, s.world.owner);
   const row = rowOf(table(page, "密钥额度"), "m-key-one");
   await expect(row).toContainText("成员");
@@ -379,7 +382,7 @@ test("所有者可以删除成员为自己密钥设的额度，但不能修改",
 });
 
 test("预算最多同时发出 4 个额度请求，且只读视图内的密钥", async ({ page }) => {
-  const world = await seedBillingWorld(stack, { creditUsd: "1.00", members: ["member", "member", "member"] });
+  const world = await seedBillingWorld(stack, { creditCny: "1.00", members: ["member", "member", "member"] });
   // Minting is limited to 10 a minute per member, so the keys come from four members:
   // 1 (the world's) + 9 + 3 x 8 = 34, past the 25 the table shows at first.
   const total = 34;

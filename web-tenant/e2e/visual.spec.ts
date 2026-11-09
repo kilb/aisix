@@ -95,13 +95,14 @@ test.beforeAll(async () => {
   // 账户, 用量 and 预算 need money and a call: a seven-figure balance (the widest
   // figure the readout may carry), one priced call so the figures have sub-cent
   // digits, and a key quota.
-  await stack.admin.post(`/admin/tenants/${id}/credits`, { amount_usd: "1000000.00", reason: "visual funding" });
-  await stack.admin.post(`/admin/tenants/${id}/credits`, { amount_usd: "234567.89", reason: "visual funding" });
+  await stack.admin.post(`/admin/tenants/${id}/credits`, { amount_cny: "1000000.00", reason: "visual funding" });
+  await stack.admin.post(`/admin/tenants/${id}/credits`, { amount_cny: "234567.89", reason: "visual funding" });
   const startsAt = Date.now() + 3_000;
-  await stack.admin.post("/admin/pricing/sell", {
+  await stack.admin.post("/admin/pricing/baselines", {
     model_id: modelIds[0],
     effective_from: new Date(startsAt).toISOString(),
     card: { default: { base: { input: "1000", output: "2000" } } },
+    note: "the visual spec's card",
   });
   await new Promise((r) => setTimeout(r, Math.max(0, startsAt - Date.now()) + 250));
   await expect
@@ -118,7 +119,7 @@ test.beforeAll(async () => {
       { message: "the gateway admits the priced call", timeout: 60_000 },
     )
     .toBe(200);
-  await owner.post("/api/budgets", { scope: "api_key", scope_ref: prod.key.id, kind: "periodic", period: "month", limit_usd: "50.00" });
+  await owner.post("/api/budgets", { scope: "api_key", scope_ref: prod.key.id, kind: "periodic", period: "month", limit_cny: "50.00" });
 });
 
 test.afterAll(async () => {
@@ -220,9 +221,10 @@ const PAGES: Shown[] = [
     open: async (page) => {
       await page.goto(stack.previewUrl);
       await openTab(page, "账户", "余额流水");
-      // The seven-figure balance and the readout are in before the page is judged.
-      await expect(page.getByTestId("readout-amount")).toContainText("$");
-      await expect(page.getByRole("region", { name: "余额", exact: true })).toContainText("1,2");
+      // The seven-figure ¥ balance and the readout are in before the page is judged:
+      // ¥1,234,567.89 is the widest figure either may carry.
+      await expect(page.getByTestId("readout-amount")).toContainText("¥");
+      await expect(page.getByRole("region", { name: "余额", exact: true })).toContainText("¥1,234,567.89");
     },
   },
   {
@@ -327,6 +329,44 @@ test("分区导航只用键盘也能走遍：方向键、Home、End 移动，回
   // The open section is the tab's panel, named by it.
   await expect(page.getByRole("tabpanel", { name: "密钥" })).toContainText("legacy-import");
   expect(await focused()).toBe("密钥");
+  await page.context().close();
+});
+
+test("七位数的余额在 360 px 下不横向滚动，也不挤进相邻的列", async ({ browser }) => {
+  const page = await systemDarkPage(browser);
+  await signIn(page);
+  await page.setViewportSize(PHONE);
+  await openTab(page, "账户", "余额流水");
+  // ¥1,234,567.89 is the widest figure the readout and the balance carry: seven
+  // digits before the point, three thousand separators and two after.
+  const amount = page.getByTestId("readout-amount");
+  await expect(amount).toContainText("¥1,234,567.89");
+  await expect(page.getByRole("region", { name: "余额", exact: true })).toContainText("¥1,234,567.89");
+
+  // The page does not scroll sideways, and the figure is not cut off inside its
+  // own box: the text's width fits the box that holds it.
+  expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(PHONE.width);
+  const fits = await amount.evaluate((el) => {
+    const box = el.getBoundingClientRect();
+    const range = document.createRange();
+    range.selectNodeContents(el);
+    const text = range.getBoundingClientRect();
+    return { left: text.left, right: text.right, boxLeft: box.left, boxRight: box.right };
+  });
+  expect(fits.left).toBeGreaterThanOrEqual(fits.boxLeft - 1);
+  expect(fits.right).toBeLessThanOrEqual(fits.boxRight + 1);
+
+  // The balance panel's own reading of the same figure stays inside its column too.
+  const reading = page.getByRole("region", { name: "余额", exact: true }).locator(".entry").filter({ hasText: "余额" }).first().locator(".val");
+  await expect(reading).toContainText("¥1,234,567.89");
+  const inside = await reading.evaluate((el) => {
+    const box = el.getBoundingClientRect();
+    const range = document.createRange();
+    range.selectNodeContents(el);
+    const text = range.getBoundingClientRect();
+    return { right: text.right, boxRight: box.right };
+  });
+  expect(inside.right).toBeLessThanOrEqual(inside.boxRight + 1);
   await page.context().close();
 });
 

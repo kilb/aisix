@@ -430,9 +430,9 @@ export const prices = {
 /** `GET /api/billing/balance`. `available` is the balance for prepaid, balance plus credit limit for postpaid. */
 export interface Balance {
   billing_mode: "prepaid" | "postpaid";
-  balance_micro_usd: number;
-  credit_limit_micro_usd: number;
-  available_micro_usd: number;
+  balance_micro_cny: number;
+  credit_limit_micro_cny: number;
+  available_micro_cny: number;
   exhausted: boolean;
   pending_topups: number;
 }
@@ -443,8 +443,8 @@ export interface LedgerItem {
   seq: number;
   posted_at: string;
   kind: LedgerKind;
-  amount_micro_usd: number;
-  balance_after_micro_usd: number;
+  amount_micro_cny: number;
+  balance_after_micro_cny: number;
   event_id: string | null;
   /** Only a usage entry has a model; its `id` is null unless the model is currently granted. */
   model: { id: string | null; name: string } | null;
@@ -454,17 +454,17 @@ export interface LedgerItem {
 
 export interface LedgerSummaryRow {
   period_start: string;
-  usage_micro_usd: number;
-  topups_micro_usd: number;
-  adjustments_micro_usd: number;
-  closing_balance_micro_usd: number;
+  usage_micro_cny: number;
+  topups_micro_cny: number;
+  adjustments_micro_cny: number;
+  closing_balance_micro_cny: number;
 }
 
 /** A top-up: requested by the organisation, or credited by the platform (`origin "operator"`, `requested_by` null). */
 export interface Topup {
   id: string;
   origin: "tenant" | "operator";
-  amount_micro_usd: number;
+  amount_micro_cny: number;
   note: string | null;
   reference: string | null;
   status: "pending" | "approved" | "rejected";
@@ -482,9 +482,9 @@ export interface QuotaFigure {
   set_by: "operator" | "org_admin" | "member";
   kind: "periodic" | "cumulative";
   period: "day" | "week" | "month" | null;
-  limit_micro_usd: number;
-  spent_micro_usd: number;
-  remaining_micro_usd: number;
+  limit_micro_cny: number;
+  spent_micro_cny: number;
+  remaining_micro_cny: number;
   period_start: string | null;
   counted_from: string | null;
   exhausted: boolean;
@@ -498,12 +498,12 @@ export interface KeyQuota {
   as_of: string;
   org: {
     billing_mode: "prepaid" | "postpaid";
-    balance_micro_usd: number;
-    credit_limit_micro_usd: number;
-    available_micro_usd: number;
+    balance_micro_cny: number;
+    credit_limit_micro_cny: number;
+    available_micro_cny: number;
   } | null;
   quotas: QuotaFigure[];
-  effective_remaining_micro_usd: number | null;
+  effective_remaining_micro_cny: number | null;
   binding_level: QuotaLevel | null;
 }
 
@@ -535,8 +535,8 @@ export const billing = {
   async topups(q: { status?: Topup["status"]; limit?: number; before?: number } = {}): Promise<Page<Topup>> {
     return (await call<Page<Topup>>("GET", `/billing/topups${queryOf(q)}`)).data;
   },
-  /** `amount_usd` is dollars with at most two decimals. */
-  async requestTopup(body: { amount_usd: string; note?: string; reference?: string }): Promise<Topup> {
+  /** `amount_cny` is yuan with at most two decimals. */
+  async requestTopup(body: { amount_cny: string; note?: string; reference?: string }): Promise<Topup> {
     return (await call<Topup>("POST", "/billing/topups", body)).data;
   },
   async keyQuota(keyId: string): Promise<KeyQuota> {
@@ -556,9 +556,9 @@ export interface Budget {
   set_by: "operator" | "org_admin" | "member";
   kind: "periodic" | "cumulative";
   period: "day" | "week" | "month" | null;
-  limit_micro_usd: number;
-  spent_micro_usd: number;
-  remaining_micro_usd: number;
+  limit_micro_cny: number;
+  spent_micro_cny: number;
+  remaining_micro_cny: number;
   period_start: string | null;
   counted_from: string | null;
   exhausted: boolean;
@@ -571,8 +571,8 @@ export interface NewBudget {
   scope_ref: string;
   kind?: Budget["kind"];
   period?: "day" | "week" | "month";
-  /** Dollars with at most two decimals. */
-  limit_usd: string;
+  /** Yuan with at most two decimals. */
+  limit_cny: string;
 }
 
 export const budgets = {
@@ -583,8 +583,8 @@ export const budgets = {
   async create(body: NewBudget): Promise<Budget> {
     return (await call<Budget>("POST", "/budgets", body)).data;
   },
-  async setLimit(id: string, limitUsd: string): Promise<Budget> {
-    return (await call<Budget>("PATCH", `/budgets/${at(id)}`, { limit_usd: limitUsd })).data;
+  async setLimit(id: string, limitCny: string): Promise<Budget> {
+    return (await call<Budget>("PATCH", `/budgets/${at(id)}`, { limit_cny: limitCny })).data;
   },
   async remove(id: string): Promise<void> {
     await call<null>("DELETE", `/budgets/${at(id)}`);
@@ -604,18 +604,30 @@ export type CallStatus = "succeeded" | "retried" | "failed";
 /** What a call's charge is: `pending` waits for a price. */
 export type CallChargeStatus = "charged" | "exempt" | "nothing_to_bill" | "pending";
 
-/** One billed quantity of a call: `rate` is dollars per million units, as the price card wrote it. */
+/**
+ * One billed quantity of a call: `rate_cny` is the group's price per million
+ * units in CNY, as an exact decimal string, and `null` when the stored rate
+ * cannot be read. The tenant's discount is not in it.
+ */
 export interface ChargeLine {
   dimension: string;
   quantity: number;
-  rate: string;
+  rate_cny: string | null;
+}
+
+/** The group a charge was priced in, by its display name: never the routing name. */
+export interface ChargeGroup {
+  id: string;
+  display_name: string;
 }
 
 export interface CallCharge {
   status: CallChargeStatus;
-  amount_micro_usd: number | null;
+  amount_micro_cny: number | null;
+  /** `null` for a call priced before its key took a group, or whose group has since been retired. */
+  group: ChargeGroup | null;
   /** The sum of the re-pricing corrections of this call; 0 when none. */
-  adjusted_micro_usd: number;
+  adjusted_micro_cny: number;
   estimated: boolean;
   lines: ChargeLine[];
 }
@@ -650,7 +662,7 @@ export interface UsageSummaryRow {
   period_start: string;
   model: UsageModel;
   requests: number;
-  charged_micro_usd: number;
+  charged_micro_cny: number;
   estimated_requests: number;
   quantities: Record<string, number>;
 }

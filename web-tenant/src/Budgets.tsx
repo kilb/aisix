@@ -38,13 +38,13 @@ const LEVEL: Record<QuotaLevel, string> = { organization: "组织", member: "成
 // ── amounts ─────────────────────────────────────────────────────────────────
 
 /** Micro-cny of a typed amount that `isCnyAmount` accepted: integer arithmetic, no float. */
-function usdToMicro(s: string): number {
+function cnyToMicro(s: string): number {
   const [whole = "0", cents = ""] = s.split(".");
   return Number(whole) * 1_000_000 + Number(cents.padEnd(2, "0")) * 10_000;
 }
 
-/** A limit as the dollars it was typed in (`1.50`), for an edit field. */
-function microToUsd(micro: number): string {
+/** A limit as the yuan it was set in (`1.50`), for an edit field. */
+function microToCny(micro: number): string {
   const v = BigInt(micro);
   return `${v / 1_000_000n}.${String((v % 1_000_000n) / 10_000n).padStart(2, "0")}`;
 }
@@ -106,10 +106,10 @@ function exceeds(own: Terms, parents: Terms[]): boolean {
 function keyParents(q: KeyQuota | undefined): Terms[] {
   return (q?.quotas ?? [])
     .filter((f) => f.scope !== "api_key")
-    .map((f) => ({ kind: f.kind, period: f.period, limit: f.limit_micro_usd }));
+    .map((f) => ({ kind: f.kind, period: f.period, limit: f.limit_micro_cny }));
 }
 
-const termsOf = (b: Budget): Terms => ({ kind: b.kind, period: b.period, limit: b.limit_micro_usd });
+const termsOf = (b: Budget): Terms => ({ kind: b.kind, period: b.period, limit: b.limit_micro_cny });
 
 // ── who may do what ─────────────────────────────────────────────────────────
 
@@ -326,7 +326,7 @@ function KeyFigures({
                 </span>
               </td>
               <td className="num">
-                {!q ? "—" : q.effective_remaining_micro_usd === null ? "不限" : <Money micro={q.effective_remaining_micro_usd} />}
+                {!q ? "—" : q.effective_remaining_micro_cny === null ? "不限" : <Money micro={q.effective_remaining_micro_cny} />}
               </td>
               <td>{q?.binding_level ? (LEVEL[q.binding_level] ?? q.binding_level) : "—"}</td>
             </tr>
@@ -415,7 +415,7 @@ function QuotaRow({
   const toast = useToast();
 
   const draftOk = isCnyAmount(draft.trim(), { allowZero: false });
-  const limit = editing && draftOk ? usdToMicro(draft.trim()) : b.limit_micro_usd;
+  const limit = editing && draftOk ? cnyToMicro(draft.trim()) : b.limit_micro_cny;
   const over = exceeds({ ...termsOf(b), limit }, parents);
 
   async function save() {
@@ -466,22 +466,22 @@ function QuotaRow({
       <td className="tabular">{periodText(b)}</td>
       <td className="num">
         {editing ? (
-          <Field label="新的限额（美元）" error={problem}>
+          <Field label="新的限额（元）" error={problem}>
             {(aria) => (
               <input inputMode="decimal" autoComplete="off" value={draft} onChange={(e) => setDraft(e.target.value)} {...aria} />
             )}
           </Field>
         ) : (
-          <Money micro={b.limit_micro_usd} />
+          <Money micro={b.limit_micro_cny} />
         )}
         {over && <span className="hint cell-note">{OVER_PARENT}</span>}
         {!editing && problem && <span className="field-problem">{problem}</span>}
       </td>
       <td className="num">
-        <Money micro={b.spent_micro_usd} />
+        <Money micro={b.spent_micro_cny} />
       </td>
       <td className="num">
-        <Money micro={b.remaining_micro_usd} />
+        <Money micro={b.remaining_micro_cny} />
       </td>
       <td>
         <span data-state={b.exhausted ? "exhausted" : "ok"}>
@@ -514,7 +514,7 @@ function QuotaRow({
                     size="sm"
                     disabled={acting !== null}
                     onClick={() => {
-                      setDraft(microToUsd(b.limit_micro_usd));
+                      setDraft(microToCny(b.limit_micro_cny));
                       setProblem(null);
                       setEditing(true);
                     }}
@@ -550,7 +550,7 @@ const FIELD_OF: Record<string, FormField> = {
   "/scope_ref": "target",
   "/kind": "kind",
   "/period": "period",
-  "/limit_usd": "limit",
+  "/limit_cny": "limit",
 };
 
 function CreateForm({
@@ -594,7 +594,7 @@ function CreateForm({
   const parents = scope === "member" ? team.map(termsOf) : keyParents(quotas[chosen]);
   const over =
     isCnyAmount(text, { allowZero: false }) &&
-    exceeds({ kind, period: kind === "periodic" ? period : null, limit: usdToMicro(text) }, parents);
+    exceeds({ kind, period: kind === "periodic" ? period : null, limit: cnyToMicro(text) }, parents);
 
   async function submit(e: React.FormEvent) {
     e.preventDefault();
@@ -614,7 +614,7 @@ function CreateForm({
         scope_ref: chosen,
         kind,
         ...(kind === "periodic" ? { period } : {}),
-        limit_usd: text,
+        limit_cny: text,
       });
       setLimit("");
       toast("已创建");
@@ -688,7 +688,7 @@ function CreateForm({
             )}
           </Field>
         )}
-        <Field label="限额（美元）" error={errors.limit} hint={over ? OVER_PARENT : "最多两位小数"}>
+        <Field label="限额（元）" error={errors.limit} hint={over ? OVER_PARENT : "最多两位小数"}>
           {(aria) => <input inputMode="decimal" autoComplete="off" value={limit} onChange={(e) => setLimit(e.target.value)} {...aria} />}
         </Field>
         {general && (

@@ -1,6 +1,6 @@
 import { expect, test } from "@playwright/test";
 import { STACK_START_TIMEOUT_MS, startStack, type Stack } from "./stack";
-import { CALL_MICRO_USD, chat, seedBillingWorld } from "./world";
+import { CALL_MICRO_CNY, chat, seedBillingWorld } from "./world";
 
 /** The billing world the other specs build on: seeded through the real API, usable through the real portal and gateway. */
 
@@ -25,15 +25,15 @@ test("种子组织的所有者能登录并看到组织页", async ({ page }) => 
   await expect(page.getByRole("tab")).toHaveText(["组织", "密钥", "价格", "成员", "用量", "预算", "账户"]);
 });
 
-test("种子组织的密钥能调用模型，一次调用扣 11 000 µ$，成员各有各的角色", async () => {
+test("种子组织的密钥能调用模型，一次调用扣 11 000 µ¥，成员各有各的角色", async () => {
   const world = await seedBillingWorld(stack, { members: ["member", "billing"], unpricedModel: true });
   expect(world.members.map((m) => m.role)).toEqual(["member", "billing"]);
   expect(world.laterModel?.name).toBe("chat-ui-later");
-  const before = (await stack.admin.get(`/admin/tenants/${world.tenantId}/billing`)).balance_micro_usd;
+  const before = (await stack.admin.get(`/admin/tenants/${world.tenantId}/billing`)).balance_micro_cny;
   expect(await chat(stack, world.key.plaintext, world.model.name)).toBe(200);
   await expect
-    .poll(async () => (await stack.admin.get(`/admin/tenants/${world.tenantId}/billing`)).balance_micro_usd, {
+    .poll(async () => (await stack.admin.get(`/admin/tenants/${world.tenantId}/billing`)).balance_micro_cny, {
       message: "the call is debited from the balance",
     })
-    .toBe(before - CALL_MICRO_USD);
+    .toBe(before - CALL_MICRO_CNY);
 });

@@ -12,13 +12,13 @@ import type { ApiClient, Json, Stack } from "./stack";
  */
 
 /**
- * What one non-streaming chat costs the organisation, in micro-dollars. The
+ * What one non-streaming chat costs the organisation, in micro-CNY. The
  * stand-in reports 5 prompt and 3 completion tokens, and the model's price
  * card is `{"default":{"base":{"input":"1000","output":"2000"}}}` (USD per
- * million tokens, so 1000 and 2000 micro-dollars per token): 5 x 1000 + 3 x
- * 2000 = 11 000.
+ * million tokens, so 1000 and 2000 micro-dollars per token), charged at the
+ * `shared` group's 1 CNY per USD: 5 x 1000 + 3 x 2000 = 11 000 micro-CNY.
  */
-export const CALL_MICRO_USD = 11_000;
+export const CALL_MICRO_CNY = 11_000;
 
 const PRICE_CARD = { default: { base: { input: "1000", output: "2000" } } };
 /** How far ahead of the clock the price starts: past the control plane's own reading of "now". */
@@ -44,9 +44,9 @@ export interface BillingWorld {
 
 export interface WorldOptions {
   mode?: "prepaid" | "postpaid";
-  creditLimitUsd?: string;
+  creditLimitCny?: string;
   /** Posted as an operator credit. Left out, a prepaid organisation gets 10.00 so the gateway admits it; `"0"` posts nothing. */
-  creditUsd?: string;
+  creditCny?: string;
   members?: ("member" | "billing")[];
   /** Also create `chat-ui-later`, granted but with no price. */
   unpricedModel?: boolean;
@@ -130,9 +130,18 @@ function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+/** The display name every seeded key's group reads: nothing like its routing name `shared`. */
+export const SHARED_DISPLAY_NAME = "共享分组 5d2";
+
 /**
- * The rate every seeded key's group charges: `shared` at 1 CNY per USD, so a
- * figure in µ¥ is the baseline's own in µ$. Written once per stack.
+ * One name for every figure the seeded keys are charged at: `shared` at 1 CNY
+ * per USD, so a figure in µ¥ is the baseline's own in µ$. Written once per
+ * stack.
+ *
+ * The group is also renamed, because a routing name and a display name that
+ * agree prove nothing: a page reading either would look right. Every seeded
+ * key's group therefore reads `共享分组 5d2` from here on, and `shared` is a
+ * name no tenant may see anywhere.
  */
 const sharedRates = new WeakMap<Stack, Promise<void>>();
 function ensureSharedRate(stack: Stack): Promise<void> {
@@ -142,8 +151,11 @@ function ensureSharedRate(stack: Stack): Promise<void> {
       const groups = await stack.admin.get("/admin/provider-groups");
       const shared = (groups.items as Json[]).find((g) => g.name === "shared");
       if (!shared) throw new Error("the first-boot shared group is missing");
+      if (shared.display_name !== SHARED_DISPLAY_NAME) {
+        await stack.admin.patch(`/admin/provider-groups/${shared.id}`, { display_name: SHARED_DISPLAY_NAME });
+      }
       // The group is created by the migration with `shared` as its routing
-      // name, so a rate for it is all that is missing.
+      // name, so a rate and a display name are all that is missing.
       // A price cannot start more than five seconds in the past, so it starts
       // at the earliest instant that rule allows.
       await stack.admin.post(`/admin/provider-groups/${shared.id}/rates`, {
@@ -189,10 +201,10 @@ export async function seedBillingWorld(stack: Stack, opts: WorldOptions = {}): P
     },
     current.version,
   );
-  if (opts.creditLimitUsd !== undefined) {
-    await stack.admin.patch(`/admin/tenants/${tenantId}/billing`, { credit_limit_cny: opts.creditLimitUsd });
+  if (opts.creditLimitCny !== undefined) {
+    await stack.admin.patch(`/admin/tenants/${tenantId}/billing`, { credit_limit_cny: opts.creditLimitCny });
   }
-  const credit = opts.creditUsd ?? (opts.mode === "postpaid" ? "0" : "10.00");
+  const credit = opts.creditCny ?? (opts.mode === "postpaid" ? "0" : "10.00");
   if (credit !== "0") {
     await stack.admin.post(`/admin/tenants/${tenantId}/credits`, { amount_cny: credit, reason: "billing world funding" });
   }

@@ -1,7 +1,7 @@
 import { createServer } from "node:net";
 import { expect, test, type Locator, type Page } from "@playwright/test";
 import { STACK_START_TIMEOUT_MS, startStack, type ApiClient, type Json, type Stack } from "./stack";
-import { chat, memberKey, seedBillingWorld, waitClearOfUtcMidnight, type BillingWorld, type Login } from "./world";
+import { SHARED_DISPLAY_NAME, chat, memberKey, seedBillingWorld, waitClearOfUtcMidnight, type BillingWorld, type Login } from "./world";
 
 /**
  * The tenant portal's 用量 page: the summary and the call log, against the
@@ -130,10 +130,11 @@ async function grant(world: BillingWorld, modelId: string): Promise<void> {
 async function pricedModel(world: BillingWorld, name: string): Promise<string> {
   const id = await addModel(name);
   const startsAt = Date.now() + 3_000;
-  await stack.admin.post("/admin/pricing/sell", {
+  await stack.admin.post("/admin/pricing/baselines", {
     model_id: id,
     effective_from: new Date(startsAt).toISOString(),
     card: { default: { base: { input: "1000", output: "2000" } } },
+    note: "the usage page's card",
   });
   await grant(world, id);
   await gatewayListsModel(world.key.plaintext, name);
@@ -156,13 +157,14 @@ test("调用记录逐次列出模型、密钥、状态与费用，展开后看�
   await expect(cells.nth(2)).toHaveText("chat-ui");
   await expect(cells.nth(3)).toHaveText("world-owner-key");
   await expect(cells.nth(6)).toHaveText("成功");
-  await expect(cells.nth(7)).toHaveText("$0.011");
+  await expect(cells.nth(7)).toHaveText(SHARED_DISPLAY_NAME);
+  await expect(cells.nth(8)).toHaveText("¥0.011");
 
   await rows.first().getByRole("button", { name: "展开明细" }).click();
   const detail = log.getByRole("table", { name: "计费明细" });
   await expect(detail.locator("tbody > tr")).toHaveCount(2);
-  await expect(detail.getByRole("row").filter({ hasText: "输入" }).getByRole("cell")).toHaveText(["输入", "5", "1000"]);
-  await expect(detail.getByRole("row").filter({ hasText: "输出" }).getByRole("cell")).toHaveText(["输出", "3", "2000"]);
+  await expect(detail.getByRole("row").filter({ hasText: "输入" }).getByRole("cell")).toHaveText(["输入", "5", "¥1,000.00"]);
+  await expect(detail.getByRole("row").filter({ hasText: "输出" }).getByRole("cell")).toHaveText(["输出", "3", "¥2,000.00"]);
 });
 
 test("调用记录与汇总里没有任何上游渠道、账号、分组或上游模型名", async ({ page }) => {
@@ -179,12 +181,17 @@ test("调用记录与汇总里没有任何上游渠道、账号、分组或上�
     // The same read does see what the tenant may see, so an empty read cannot pass.
     expect(await region.innerText()).toContain("chat-ui");
   }
+  // The group's display name is what a tenant may read; its routing name never is.
+  expect(await log.innerText()).toContain(SHARED_DISPLAY_NAME);
   // The page's markup, attributes included, and the log as the API sent it.
   const html = await page.content();
-  for (const channel of CHANNEL) expect(html).not.toContain(channel);
+  expect(html).toContain(SHARED_DISPLAY_NAME);
+  for (const channel of [...CHANNEL, "shared"]) expect(html).not.toContain(channel);
   const raw = JSON.stringify((await (await signedIn(world.owner)).get("/api/usage/calls")).items);
   expect(raw).toContain("chat-ui");
-  for (const channel of [...CHANNEL, "error_message", "provider", "upstream_model"]) expect(raw).not.toContain(channel);
+  expect(raw).toContain(SHARED_DISPLAY_NAME);
+  // The group's routing name is not in the answer either, only its display name.
+  for (const channel of [...CHANNEL, "shared", "error_message", "provider", "upstream_model"]) expect(raw).not.toContain(channel);
 });
 
 test("无权使用的模型与不存在的模型，在调用记录里显示相同的状态", async ({ page }) => {
@@ -260,7 +267,7 @@ test("尚未计价的调用显示待计价", async ({ page }) => {
 
   const row = logRows(log).filter({ hasText: "chat-ui-later" });
   await expect(row).toHaveCount(1);
-  await expect(row.getByRole("cell").nth(7)).toHaveText("待计价");
+  await expect(row.getByRole("cell").nth(8)).toHaveText("待计价");
 });
 
 test("成员只看到自己密钥的调用", async ({ page, browser }) => {
@@ -281,7 +288,7 @@ test("成员只看到自己密钥的调用", async ({ page, browser }) => {
   const mine1 = mySummary.locator("tbody tr");
   await expect(mine1).toHaveCount(1);
   await expect(mine1.first().getByRole("cell").nth(2)).toHaveText("1");
-  await expect(mine1.first().getByRole("cell").nth(3)).toHaveText("$0.011");
+  await expect(mine1.first().getByRole("cell").nth(3)).toHaveText("¥0.011");
 
   // The owner, in a browser of their own, sees all three.
   const ownerPage = await (await browser.newContext()).newPage();
@@ -318,7 +325,7 @@ test("用量汇总与调用记录一致", async ({ page }) => {
   await expect(summary).toContainText("按用量发生的时间汇总");
   await expect(cells.nth(1)).toHaveText("chat-ui");
   await expect(cells.nth(2)).toHaveText("3");
-  await expect(cells.nth(3)).toHaveText("$0.033");
+  await expect(cells.nth(3)).toHaveText("¥0.033");
   await expect(cells.nth(4)).toHaveText(/输入 15(?!\d).*输出 9(?!\d)/);
 });
 
@@ -347,8 +354,8 @@ test("缓存命中的调用显示不计费", async ({ page }) => {
   const { log } = await openUsage(page, world.owner);
 
   // Newest first: the top row is the cache hit.
-  await expect(logRows(log).first().getByRole("cell").nth(7)).toHaveText("不计费（缓存命中）");
-  await expect(logRows(log).last().getByRole("cell").nth(7)).toHaveText("$0.011");
+  await expect(logRows(log).first().getByRole("cell").nth(8)).toHaveText("不计费（缓存命中）");
+  await expect(logRows(log).last().getByRole("cell").nth(8)).toHaveText("¥0.011");
 });
 
 test("重新计价后，调用的费用显示已调整的金额，汇总计入调整", async ({ page }) => {
@@ -361,10 +368,11 @@ test("重新计价后，调用的费用显示已调整的金额，汇总计入�
 
   // The price doubles, from a moment ahead; a run then corrects the call at the new price.
   const startsAt = Date.now() + 3_000;
-  await stack.admin.post("/admin/pricing/sell", {
+  await stack.admin.post("/admin/pricing/baselines", {
     model_id: modelId,
     effective_from: new Date(startsAt).toISOString(),
     card: { default: { base: { input: "2000", output: "4000" } } },
+    note: "the usage page's doubled card",
   });
   await expect.poll(() => Date.now() > startsAt + 500).toBe(true);
   const from = new Date(Date.now() - 3_600_000).toISOString();
@@ -388,10 +396,10 @@ test("重新计价后，调用的费用显示已调整的金额，汇总计入�
 
   const { log, summary } = await openUsage(page, world.owner);
   await expect(logRows(log)).toHaveCount(1);
-  await expect(logRows(log).first().getByRole("cell").nth(7)).toHaveText("$0.011（已调整 +$0.011）");
-  // The correction counts in the period the call occurred in: $0.011 charged and $0.011 corrected.
+  await expect(logRows(log).first().getByRole("cell").nth(8)).toHaveText("¥0.011（已调整 +¥0.011）");
+  // The correction counts in the period the call occurred in: ¥0.011 charged and ¥0.011 corrected.
   const today = new Date().toISOString().slice(0, 10);
-  await expect(summary.getByRole("row").filter({ hasText: today }).getByRole("cell").nth(3)).toHaveText("$0.022");
+  await expect(summary.getByRole("row").filter({ hasText: today }).getByRole("cell").nth(3)).toHaveText("¥0.022");
 });
 
 test("先未计价、后经重新计价的调用，费用显示重新计价的金额", async ({ page }) => {
@@ -406,10 +414,11 @@ test("先未计价、后经重新计价的调用，费用显示重新计价的�
   await logged(world.owner, 1, true);
 
   const startsAt = Date.now() + 3_000;
-  await stack.admin.post("/admin/pricing/sell", {
+  await stack.admin.post("/admin/pricing/baselines", {
     model_id: modelId,
     effective_from: new Date(startsAt).toISOString(),
     card: { default: { base: { input: "1000", output: "2000" } } },
+    note: "the usage page's late card",
   });
   await expect.poll(() => Date.now() > startsAt + 500).toBe(true);
   const from = new Date(Date.now() - 3_600_000).toISOString();
@@ -433,8 +442,8 @@ test("先未计价、后经重新计价的调用，费用显示重新计价的�
 
   const { log } = await openUsage(page, world.owner);
   await expect(logRows(log)).toHaveCount(1);
-  const cell = logRows(log).first().getByRole("cell").nth(7);
-  await expect(cell).toHaveText("$0.011（重新计价）");
+  const cell = logRows(log).first().getByRole("cell").nth(8);
+  await expect(cell).toHaveText("¥0.011（重新计价）");
   await expect(cell).not.toContainText("—");
 });
 
