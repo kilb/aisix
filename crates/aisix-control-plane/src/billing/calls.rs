@@ -439,7 +439,10 @@ pub(super) fn tenant_view(ev: &Value, charge_status: &str, repriced: bool) -> Op
 /// quantity and CNY rate per million, and nothing else a stored line may
 /// carry. A stored line's `rate` is the baseline's in micro-USD per million;
 /// the tenant is shown the price it was charged at, so the rate is converted
-/// here at the rate recorded on the charge. A line whose stored rate this
+/// here at the rate recorded on the charge. The tenant's discount is NOT in
+/// `rate_cny` (it is shown separately as `discount_bps`), so a discounted
+/// tenant's `rate_cny × quantity` is more than the amount charged. A line
+/// whose stored rate this
 /// cannot read shows no rate rather than a wrong one.
 fn tenant_lines(lines: &Value, cny_per_usd_e4: Option<i64>) -> Value {
     let cny = cny_per_usd_e4

@@ -370,6 +370,9 @@ statement.
   there is no `BEGIN IMMEDIATE`.
 - Queries are runtime `sqlx::query` / `query_as`, never the `query!` macros.
   Migrations are additive, one file per change, and never edited once shipped.
+  A migration may also fence an old path, as `0027` does with its `BEFORE
+  INSERT` triggers: that is a one-way change, and while both versions run an
+  older replica's intake fails and its batch is resent (see `Db::migrate`).
 
 ## Defaults fail closed
 

@@ -375,9 +375,6 @@ pub type CataloguePlan<'c> = Vec<(DateTime<Utc>, &'c CatalogueEntry)>;
 /// An unknown key is refused at `/catalogue_key`, and a key with no entry in
 /// effect yet at `/effective_from`. An entry whose list price holds only off
 /// peak is written all the same, with a `time_of_day_price` warning.
-///
-/// Until the sell prices are retired, `api::import_plan` holds the same
-/// rules with a markup.
 pub fn catalogue_plan<'c>(
     catalogue: &'c Catalogue,
     key: &str,

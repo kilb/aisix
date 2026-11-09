@@ -2233,6 +2233,16 @@ async fn the_charge_records_its_group_rate_baseline_and_discount() {
     let baseline = price(&w.cp, model).await;
     let group = shared_group(&w.cp).await;
     set_shared_rate(&w.cp, &w.admin, "7.2").await;
+    // `shared`'s default rate revision in force: the one the charge must
+    // record.
+    let rate: i64 = sqlx::query_scalar(
+        "SELECT revision_id FROM pricing_group_rates \
+         WHERE group_id = $1 AND model_id IS NULL AND cny_per_usd_e4 = 72000",
+    )
+    .bind(group)
+    .fetch_one(w.cp.db().pool())
+    .await
+    .expect("the rate revision");
     let discount: i64 = sqlx::query_scalar(
         "INSERT INTO pricing_discount_revisions \
          (engine_version, tenant_id, effective_from, discount_bps) VALUES ($1, $2, now(), 1000) \
@@ -2274,7 +2284,7 @@ async fn the_charge_records_its_group_rate_baseline_and_discount() {
     assert_eq!(row.0, Some(4_407));
     assert_eq!(row.1, Some(group));
     assert_eq!(row.2, Some(baseline.revision_id));
-    assert!(row.3.is_some(), "a rate revision: {row:?}");
+    assert_eq!(row.3, Some(rate), "the rate revision in force: {row:?}");
     assert_eq!(row.4, Some(72_000));
     assert!(!row.5);
     assert_eq!(row.6, 1_000);

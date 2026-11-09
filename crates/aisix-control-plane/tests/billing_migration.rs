@@ -1,10 +1,11 @@
 //! Moving a database from USD billing to CNY (`0027_billing_cny`).
 //!
-//! The migration is additive and refuses, rather than converts, a database
-//! that holds customer money in USD: there is no exchange rate anywhere in
-//! this platform. What it always does is fence every USD money table against
-//! new rows, give the money path its `_cny` twins, and fund the platform's own
-//! tenant postpaid.
+//! The migration is mostly additive, and refuses rather than converts a
+//! database that holds customer money in USD: there is no exchange rate
+//! anywhere in this platform. What it always does is fence every USD money
+//! table against new rows (the one non-additive step: an older replica's intake
+//! fails while both versions run), give the money path its `_cny` twins, and
+//! fund the platform's own tenant postpaid.
 //!
 //! Each case seeds a database at migration 26 and then applies the rest, as a
 //! boot does. `support::migrate` gates on `CP_TEST_DATABASE_URL` as
@@ -279,7 +280,11 @@ async fn expect_refused(db: &PgPool, table: &str, sql: &str) {
         .execute(db)
         .await
         .expect_err(&format!("{table} took a new USD row"));
-    assert!(e.to_string().contains("takes no new rows"), "{table}: {e}");
+    let message = e.to_string();
+    assert!(
+        message.contains(&format!("{table} takes no new rows")),
+        "{table}: {message}"
+    );
 }
 
 #[tokio::test]
@@ -633,19 +638,19 @@ async fn the_cny_ledger_and_adjustments_are_append_only() {
 
 #[tokio::test]
 async fn an_event_stored_before_the_upgrade_is_not_priced_again() {
-    // Review Focus 2. A row priced before the migration keeps its USD charge,
-    // and the CNY table has no row for it, so nothing prices it a second time;
-    // after the upgrade a new row is charged in CNY. The world here is
-    // migrated to CNY, so the "before" state is the USD charge written by raw
-    // SQL into the fenced table, which is what one looks like once the
-    // migration has run.
+    // Review Focus 2. An event the database already holds is never priced
+    // again, and one it does not is charged in CNY. The dedupe is the
+    // `usage_events` primary key, which the upgrade keeps: e1 is stored as a
+    // database at 26 holds it (with no charge of its own, since a USD charge
+    // plays no part in the decision), and a batch carrying e1 and e2 charges
+    // only e2.
     if TestCp::start().await.is_none() {
         return;
     }
     let w = support::world::world().await.expect("a world");
     let model = support::world::seed_model(&w.cp, &w.admin).await;
     support::world::price(&w.cp, model).await;
-    // e1 was stored and charged in USD before the upgrade.
+    // e1 was stored before the upgrade.
     sqlx::query(
         "INSERT INTO usage_events (event_id, dp_id, batch_id, occurred_at, team_id, api_key_id, event) \
          VALUES ('e1', $1, $1, now(), $2::text, $3::text, '{}')",
@@ -656,30 +661,6 @@ async fn an_event_stored_before_the_upgrade_is_not_priced_again() {
     .execute(w.cp.db().pool())
     .await
     .expect("store the old row");
-    // The fence is off in this database because the migration created the
-    // table; a USD charge is written by disabling it for one statement, which
-    // is exactly the state a database at 26 carries into the upgrade.
-    sqlx::query("ALTER TABLE pricing_charges DISABLE TRIGGER pricing_charges_usd_fenced")
-        .execute(w.cp.db().pool())
-        .await
-        .expect("disable the fence");
-    sqlx::query(
-        "INSERT INTO pricing_charges \
-         (event_id, tenant_id, api_key_id, user_id, requested_model_id, occurred_at, price_instant, \
-          status, charge_micro_usd, engine_version) \
-         VALUES ('e1', $1::text, $2::text, $3::text, $4::text, now(), now(), 'charged', 680, 1)",
-    )
-    .bind(w.tenant.to_string())
-    .bind(&w.key)
-    .bind(w.member.to_string())
-    .bind(model.to_string())
-    .execute(w.cp.db().pool())
-    .await
-    .expect("charge the old row in USD");
-    sqlx::query("ALTER TABLE pricing_charges ENABLE TRIGGER pricing_charges_usd_fenced")
-        .execute(w.cp.db().pool())
-        .await
-        .expect("restore the fence");
     // A batch with the old row again and a new one.
     let r = support::world::deliver(
         &w.dp,

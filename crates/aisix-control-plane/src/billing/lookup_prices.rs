@@ -44,11 +44,18 @@ use crate::resources::Kind;
 use crate::AppState;
 
 /// One model's price for one key's group, in CNY per token.
+///
+/// `input` and `output` are omitted only when the rate is unrepresentable
+/// (a discount above 10000 bps), which `priced_models` already refuses to
+/// build: a price this cannot read is left out rather than sent as `""`,
+/// which a client decoding `Option<String>` would render as blank.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ModelPrice {
     pub model_id: Uuid,
-    pub input: String,
-    pub output: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input_cache_read: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -232,8 +239,8 @@ fn model_price(model: &PricedModel) -> ModelPrice {
     let show = |r: aisix_pricing::Rate| cny_per_token(r, model.cny, model.discount_bps);
     ModelPrice {
         model_id: model.model_id,
-        input: show(model.base.input).unwrap_or_default(),
-        output: show(model.base.output).unwrap_or_default(),
+        input: show(model.base.input),
+        output: show(model.base.output),
         input_cache_read: model.base.cache_read.and_then(show),
         input_cache_write: model.base.cache_write.and_then(show),
         input_cache_write_1h: model.base.cache_write_1h.and_then(show),
@@ -306,13 +313,13 @@ mod tests {
         };
         // Rate 1: the CNY figure is the baseline's own.
         let at_one = model_price(&priced(base.clone(), CnyPerUsd::ONE, 0));
-        assert_eq!(at_one.input, "0.000006");
+        assert_eq!(at_one.input.as_deref(), Some("0.000006"));
         assert_eq!(at_one.input_cache_read.as_deref(), Some("0.000006"));
         assert_eq!(at_one.input_cache_write, None);
         // 6 CNY per USD, half off.
         let at_six = model_price(&priced(base, CnyPerUsd::parse("6").unwrap(), 5_000));
-        assert_eq!(at_six.input, "0.000018");
-        assert_eq!(at_six.output, "0.000018");
+        assert_eq!(at_six.input.as_deref(), Some("0.000018"));
+        assert_eq!(at_six.output.as_deref(), Some("0.000018"));
         // The smallest unit: 1 micro-USD per million tokens at rate 0.0001,
         // a two-thousandth of a fen per million.
         let tiny = priced(
@@ -333,7 +340,10 @@ mod tests {
             9_999,
         );
         // 1 × 1 × 1 bp / 10²⁰: the smallest CNY per token a rate can express.
-        assert_eq!(model_price(&tiny).input, "0.00000000000000000001");
+        assert_eq!(
+            model_price(&tiny).input.as_deref(),
+            Some("0.00000000000000000001")
+        );
         // The cap is USD 1 per token, at rate 1.
         let capped = priced(
             aisix_pricing::Rates {
@@ -352,6 +362,6 @@ mod tests {
             CnyPerUsd::ONE,
             0,
         );
-        assert_eq!(model_price(&capped).input, "1");
+        assert_eq!(model_price(&capped).input.as_deref(), Some("1"));
     }
 }

@@ -2,6 +2,11 @@
 -- mirror `0016`'s tables with `*_micro_cny` columns, and the two USD tables
 -- are fenced against new rows, as every money table was in `0027`.
 --
+-- `0027`'s guard says quotas and credit limits are "re-expressed in CNY by
+-- this release". For the credit limit that is true of `0027` itself; for
+-- quotas it is THIS migration that does it, one file later in the same
+-- release. `0027` is shipped and cannot be edited to say so, hence the note.
+--
 -- Nothing is converted. `0027`'s guard already refuses a database holding a
 -- live customer quota, so a customer has none by the time this runs, and the
 -- platform tenant's USD quotas are history: the release reads no row from

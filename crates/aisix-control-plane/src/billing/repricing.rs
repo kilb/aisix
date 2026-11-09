@@ -194,7 +194,7 @@ struct Selected {
 /// is set at most once and never changes after, so the two agree whenever both
 /// are set; the fallback is what lets a row intake stored `no_group` be
 /// charged once its key has taken a group. The subquery runs only for a charge
-/// with no recorded group. */
+/// with no recorded group.
 pub(super) const BILLED_GROUP: &str =
     "COALESCE(pc.group_id, (SELECT k.group_id FROM tenant_keys k \
      WHERE k.id::text = pc.api_key_id))";

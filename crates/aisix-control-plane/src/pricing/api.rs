@@ -462,7 +462,8 @@ pub async fn list_charges(
 /// `GET /admin/pricing/status` → `{pricing_version, invalid_revisions:
 /// [{table, revision_id, reason}], unpriced_last_24h: {total, by_code}}`:
 /// the alert surface. `invalid_revisions` are the revisions the current
-/// price book cannot use (`table` is `sell`, `cost` or `discount`); their
+/// price book cannot use (`table` is `baseline`, `rate`, `cost` or
+/// `discount`); their
 /// rows are stored unpriced. `by_code` counts the charges stored unpriced in
 /// the last 24 hours (by when they were priced) under each reason, the
 /// control plane's own (`unknown_api_key`, `tenant_mismatch`,

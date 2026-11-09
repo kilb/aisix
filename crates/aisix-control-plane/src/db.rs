@@ -142,11 +142,18 @@ impl Db {
         let mut migrator = sqlx::migrate!("./migrations");
         // A database that a newer build has migrated further still opens, so
         // an older instance can run beside a newer one or after a rollback.
-        // This is only safe while every migration is additive: new tables,
-        // new nullable or defaulted columns, new indexes; nothing dropped,
-        // renamed or tightened. A shipped migration is never edited or
-        // reordered: sqlx refuses a changed checksum, and a reorder applies
-        // the same set in different orders on different databases.
+        // Most migrations are additive: new tables, new nullable or defaulted
+        // columns, new indexes; nothing dropped, renamed or tightened. A
+        // migration may also FENCE an old path — `0027`'s `BEFORE INSERT`
+        // triggers stop the USD money tables taking rows — and that is a
+        // one-way change: while both versions run, an older replica's intake
+        // fails its transaction and its batch answers 503, to be sent again,
+        // for as long as that replica lives. Fencing is allowed; a migration
+        // that drops, renames or retypes a column an older release reads is
+        // not, because the row it cannot load is a row that release skips. A
+        // shipped migration is never edited or reordered: sqlx refuses a
+        // changed checksum, and a reorder applies the same set in different
+        // orders on different databases.
         migrator.set_ignore_missing(true);
         let migrated = migrator.run(&mut migration_conn).await;
         // The run's own error is the one to report; closing only spares the

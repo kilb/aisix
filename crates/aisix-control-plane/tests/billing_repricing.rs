@@ -32,8 +32,8 @@ use chrono::{DateTime, TimeDelta, TimeZone, Utc};
 use futures::FutureExt;
 use serde_json::{json, Value};
 use support::world::{
-    db_now, deliver, insert_baseline, insert_unpriced_charges, price, seed_key, seed_model,
-    seed_tenant, tokens_680, usage, world, World,
+    db_now, deliver, group_id, insert_baseline, insert_unpriced_charges, price, seed_key,
+    seed_key_in_group, seed_model, seed_tenant, tokens_680, usage, world, World, SHARED_GROUP,
 };
 use support::{OperatorSession, Resp, TestCp};
 use uuid::Uuid;
@@ -1507,4 +1507,316 @@ async fn two_runs_previewed_over_the_same_rows_correct_them_once() {
     let (_, run) = previewed(cp, &r.w.admin, run_body(from, to, json!({}))).await;
     assert_eq!(run["changed"], 0);
     assert_eq!(run["delta_micro_cny"], 0);
+}
+
+/// Group `group`'s default rate becomes `cny_per_usd`, starting now: written
+/// through the route an operator uses, which is the only writer of a rate.
+async fn set_rate(cp: &TestCp, admin: &OperatorSession, group: Uuid, cny_per_usd: &str) {
+    let now = db_now(cp).await;
+    let r = cp
+        .send(
+            "POST",
+            &format!("/admin/provider-groups/{group}/rates"),
+            Some(admin.cookie()),
+            Some(json!({"model_id": null, "cny_per_usd": cny_per_usd, "effective_from": now})),
+        )
+        .await;
+    assert_eq!(r.status, 201, "{r:?}");
+}
+
+/// `shared`'s default rate becomes `cny_per_usd`, starting now.
+async fn set_shared_rate(cp: &TestCp, admin: &OperatorSession, cny_per_usd: &str) {
+    set_rate(cp, admin, group_id(cp, SHARED_GROUP).await, cny_per_usd).await;
+}
+
+/// `PATCH /admin/tenants/{id}` with `body` at the tenant's current version.
+async fn patch_tenant(cp: &TestCp, admin: &OperatorSession, tenant: Uuid, body: Value) -> Resp {
+    let version: i64 = sqlx::query_scalar("SELECT version FROM tenants WHERE id = $1")
+        .bind(tenant)
+        .fetch_one(cp.db().pool())
+        .await
+        .expect("read the tenant");
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("an HTTP client");
+    let response = client
+        .patch(cp.url(&format!("/admin/tenants/{tenant}")))
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .header(reqwest::header::COOKIE, admin.cookie())
+        .header(reqwest::header::IF_MATCH, format!("\"{version}\""))
+        .json(&body)
+        .send()
+        .await
+        .expect("send");
+    let status = response.status().as_u16();
+    let text = response.text().await.expect("read the body");
+    Resp {
+        status,
+        body: serde_json::from_str(&text).unwrap_or(Value::String(text)),
+        set_cookie: None,
+        headers: reqwest::header::HeaderMap::new(),
+    }
+}
+
+/// `PATCH /admin/keys/{id}` with `body` at the key's current version.
+async fn patch_key(cp: &TestCp, admin: &OperatorSession, key: &str, body: Value) -> Resp {
+    let version: i64 = sqlx::query_scalar("SELECT version FROM tenant_keys WHERE id::text = $1")
+        .bind(key)
+        .fetch_one(cp.db().pool())
+        .await
+        .expect("read the key");
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("an HTTP client");
+    let response = client
+        .patch(cp.url(&format!("/admin/keys/{key}")))
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .header(reqwest::header::COOKIE, admin.cookie())
+        .header(reqwest::header::IF_MATCH, format!("\"{version}\""))
+        .json(&body)
+        .send()
+        .await
+        .expect("send");
+    let status = response.status().as_u16();
+    let text = response.text().await.expect("read the body");
+    Resp {
+        status,
+        body: serde_json::from_str(&text).unwrap_or(Value::String(text)),
+        set_cookie: None,
+        headers: reqwest::header::HeaderMap::new(),
+    }
+}
+
+/// A model with a baseline and no rate row anywhere is stored `missing_rate`,
+/// not `missing_price`, and a run charges it once the rate exists.
+#[tokio::test]
+async fn a_missing_rate_row_is_charged_by_a_run_once_the_rate_is_set() {
+    let Some(r) = setup(false).await else { return };
+    let (cp, db) = (&r.w.cp, r.w.cp.db());
+    // The baseline in force and no rate at all: `shared` has none either, and
+    // a brand-new deployment is exactly that state.
+    let now = db_now(cp).await;
+    insert_baseline(cp, r.model, now, card("1", "2", "0.1"))
+        .await
+        .expect("the baseline");
+    send(&r.w, vec![usage(&r.w, "mr1", r.model, tokens_680())]).await;
+    let (status, code, _) = charge(db, "mr1").await;
+    assert_eq!(
+        (status.as_str(), code.as_deref()),
+        ("unpriced", Some("missing_rate")),
+        "no rate row is `missing_rate`, never a zero charge"
+    );
+    // A run while the rate is still missing changes nothing.
+    let (from, to) = last_hour(cp).await;
+    let (id, run) = previewed(cp, &r.w.admin, run_body(from, to, json!({}))).await;
+    assert_eq!(run["events"], 1);
+    assert_eq!(run["still_unpriced"], 1);
+    assert_eq!(run["changed"], 0);
+    assert_eq!(apply(cp, &r.admin, &id).await.status, 200);
+    assert!(adjustments(db).await.is_empty());
+    assert!(entries(db, r.w.tenant).await.is_empty());
+
+    // The operator sets the rate, and the next run charges the row at it.
+    set_shared_rate(cp, &r.admin, "1").await;
+    let (from, to) = last_hour(cp).await;
+    let (id, run) = previewed(cp, &r.w.admin, run_body(from, to, json!({}))).await;
+    assert_eq!(run["events"], 1);
+    assert_eq!(run["still_unpriced"], 0);
+    assert_eq!(run["changed"], 1);
+    assert_eq!(run["delta_micro_cny"], 680);
+    assert_eq!(apply(cp, &r.admin, &id).await.status, 200);
+    let run_id = Uuid::parse_str(&id).expect("a uuid");
+    assert_eq!(
+        adjustments(db).await,
+        vec![(run_id, "mr1".to_string(), 680)]
+    );
+    assert_eq!(
+        entries(db, r.w.tenant).await,
+        vec![("adjustment".to_string(), -680, -680, Some(run_id))]
+    );
+    assert_eq!(balance(db, r.w.tenant).await, -680);
+}
+
+/// `RepriceFilter.group_id` selects on the group the row is billed at, so a
+/// run over one group leaves every other group's rows alone.
+#[tokio::test]
+async fn a_run_filtered_by_group_touches_only_that_group() {
+    let Some(r) = setup(true).await else { return };
+    let (cp, db) = (&r.w.cp, r.w.cp.db());
+    // A second group at 2 CNY per USD, and a key of the same tenant in it.
+    let other = support::seed_group(
+        cp,
+        &r.w.admin,
+        &format!("grp-rep-{}", Uuid::new_v4().simple()),
+    )
+    .await;
+    let shared = group_id(cp, SHARED_GROUP).await;
+    let name: String = sqlx::query_scalar("SELECT name FROM provider_groups WHERE id = $1")
+        .bind(other)
+        .fetch_one(db.pool())
+        .await
+        .expect("the other group's name");
+    // A tenant's groups are routing names, so the assignment names both.
+    let assigned = patch_tenant(
+        cp,
+        &r.w.admin,
+        r.w.tenant,
+        json!({"allowed_provider_groups": [SHARED_GROUP, name]}),
+    )
+    .await;
+    assert_eq!(assigned.status, 200, "{assigned:?}");
+    let key = seed_key_in_group(cp, &r.w.admin, r.w.tenant, None, &name).await;
+    set_rate(cp, &r.w.admin, other, "2").await;
+    // `shared` keeps the rate `price` gave it, 1: each row is charged at
+    // intake at its own group's rate.
+    let mut in_other = usage(&r.w, "g2", r.model, tokens_680());
+    in_other["api_key_id"] = json!(key);
+    send(
+        &r.w,
+        vec![usage(&r.w, "g1", r.model, tokens_680()), in_other],
+    )
+    .await;
+    for (what, id, amount) in [
+        ("the shared group's", "g1", 680_i64),
+        ("the other group's", "g2", 1_360_i64),
+    ] {
+        let stored: Option<i64> = sqlx::query_scalar(
+            "SELECT charge_micro_cny FROM pricing_charges_cny WHERE event_id = $1",
+        )
+        .bind(id)
+        .fetch_one(db.pool())
+        .await
+        .expect("read the charge");
+        assert_eq!(stored, Some(amount), "{what} row is charged at its rate");
+    }
+    // The platform price doubles: 680 µ$ → 1 360 µ$ is +680 µ¥ at `shared`
+    // and +1 360 µ¥ at the other group's 2.
+    reprice_model(cp, r.model, card("2", "4", "0.2")).await;
+    let (from, to) = last_hour(cp).await;
+    let (id, run) = previewed(
+        cp,
+        &r.w.admin,
+        run_body(from, to, json!({"group_id": other})),
+    )
+    .await;
+    assert_eq!(run["events"], 1, "only the other group's row is selected");
+    assert_eq!(run["changed"], 1);
+    assert_eq!(run["delta_micro_cny"], 1_360);
+    assert_eq!(run["filter"]["group_id"], other.to_string());
+    assert_eq!(apply(cp, &r.admin, &id).await.status, 200);
+    let run_id = Uuid::parse_str(&id).expect("a uuid");
+    assert_eq!(
+        adjustments(db).await,
+        vec![(run_id, "g2".to_string(), 1_360)],
+        "the shared group's row is untouched"
+    );
+    // And the shared row still needs its own run, which selects it alone.
+    let (_, run) = previewed(
+        cp,
+        &r.w.admin,
+        run_body(from, to, json!({"group_id": shared})),
+    )
+    .await;
+    assert_eq!(run["events"], 1);
+    assert_eq!(run["delta_micro_cny"], 680);
+    assert_eq!(run["changed"], 1);
+}
+
+/// Review Focus 1: a legacy internal key's rows are stored `no_group` while
+/// it has none, and a run after the operator gives it one charges them at
+/// that group's rate — through `BILLED_GROUP`'s fallback to the key's group,
+/// since the charge itself records none.
+#[tokio::test]
+async fn a_legacy_internal_keys_rows_are_charged_at_the_group_it_takes_later() {
+    let Some(r) = setup(true).await else { return };
+    let (cp, db) = (&r.w.cp, r.w.cp.db());
+    set_shared_rate(cp, &r.admin, "7.2").await;
+    let internal: Uuid = sqlx::query_scalar("SELECT id FROM tenants WHERE is_internal")
+        .fetch_one(db.pool())
+        .await
+        .expect("the internal tenant");
+    let created = cp
+        .send(
+            "POST",
+            &format!("/admin/tenants/{internal}/keys"),
+            Some(r.w.admin.cookie()),
+            Some(json!({"label": "legacy-7c1"})),
+        )
+        .await;
+    // The internal tenant has no single group to fall back on, so its key
+    // must choose one; this key then has it cleared, as an older replica left
+    // it.
+    assert_eq!(created.status, 422, "{created:?}");
+    let created = cp
+        .send(
+            "POST",
+            &format!("/admin/tenants/{internal}/keys"),
+            Some(r.w.admin.cookie()),
+            Some(json!({"label": "legacy-7c1", "group_id": group_id(cp, SHARED_GROUP).await})),
+        )
+        .await;
+    assert_eq!(created.status, 201, "{created:?}");
+    let key = created.body["key"]["id"]
+        .as_str()
+        .expect("a key id")
+        .to_string();
+    sqlx::query("UPDATE tenant_keys SET group_id = NULL WHERE id::text = $1")
+        .bind(&key)
+        .execute(db.pool())
+        .await
+        .expect("clear the key's group");
+
+    let mut row = usage(&r.w, "e-legacy", r.model, tokens_680());
+    row["team_id"] = json!(internal.to_string());
+    row["api_key_id"] = json!(key);
+    row["user_id"] = json!("");
+    let delivered = deliver(&r.w.dp, Uuid::new_v4(), vec![row]).await;
+    assert_eq!(delivered.status, 200, "{delivered:?}");
+    let (status, code, _) = charge(db, "e-legacy").await;
+    assert_eq!(
+        (status.as_str(), code.as_deref()),
+        ("unpriced", Some("no_group")),
+        "the key has no group, so its row is stored no_group"
+    );
+    let filed: Option<Uuid> =
+        sqlx::query_scalar("SELECT group_id FROM pricing_charges_cny WHERE event_id = 'e-legacy'")
+            .fetch_one(db.pool())
+            .await
+            .expect("read the charge's group");
+    assert_eq!(filed, None, "the charge records no group");
+
+    // Still no group: a run charges nothing.
+    let (from, to) = last_hour(cp).await;
+    let (_, run) = previewed(cp, &r.w.admin, run_body(from, to, json!({}))).await;
+    assert_eq!(run["still_unpriced"], 1);
+    assert_eq!(run["changed"], 0);
+
+    // The operator gives the key its group; the next run bills the row at it.
+    let patched = patch_key(
+        cp,
+        &r.w.admin,
+        &key,
+        json!({"group_id": group_id(cp, SHARED_GROUP).await}),
+    )
+    .await;
+    assert_eq!(patched.status, 200, "{patched:?}");
+    let (from, to) = last_hour(cp).await;
+    let (id, run) = previewed(cp, &r.w.admin, run_body(from, to, json!({}))).await;
+    assert_eq!(run["still_unpriced"], 0, "the row is now priced");
+    assert_eq!(run["changed"], 1);
+    // 680 µ$ × 7.2 at `shared`.
+    assert_eq!(run["delta_micro_cny"], 4_896);
+    assert_eq!(apply(cp, &r.admin, &id).await.status, 200);
+    let run_id = Uuid::parse_str(&id).expect("a uuid");
+    assert_eq!(
+        adjustments(db).await,
+        vec![(run_id, "e-legacy".to_string(), 4_896)]
+    );
+    assert_eq!(
+        entries(db, internal).await,
+        vec![("adjustment".to_string(), -4_896, -4_896, Some(run_id))],
+        "the internal tenant pays like any other"
+    );
 }
