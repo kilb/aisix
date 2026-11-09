@@ -19,8 +19,11 @@ UPDATE provider_groups SET display_name = '默认'
 -- 2. A confirmed proposal names its attester. 0026's trigger refuses
 -- `attested_by` on anything but a confirmation; this is the other half: no
 -- confirmation without one. The confirmation route is the only write that
--- confirms a proposal, and has set `attested_by` in that same update since
--- 0026 shipped, so no confirmed row without an attester can exist and the
--- constraint is validated against every row as it is added.
+-- confirms a proposal, and it sets `attested_by` in that same update, but
+-- not in every build that carried 0026: the first builds of the route
+-- confirmed without writing it. Such a row cannot be repaired (0026's
+-- trigger refuses any update of a decided proposal), so the constraint is
+-- added NOT VALID: it binds every row written from now on, and a database
+-- holding an old confirmed row without an attester still migrates.
 ALTER TABLE pricing_import_proposals ADD CONSTRAINT pricing_import_proposals_attested
-  CHECK ((status = 'confirmed') = (attested_by IS NOT NULL));
+  CHECK ((status = 'confirmed') = (attested_by IS NOT NULL)) NOT VALID;

@@ -20,6 +20,7 @@ use serde::Deserialize;
 use serde_json::value::RawValue;
 use serde_json::{json, Value};
 use sqlx::PgPool;
+use support::migrate::{database_at, drop_database, migrate_rest};
 use support::world::{
     db_now, deliver, group_id, insert_rate, public_model, seed_provider_key, usage, world,
     SHARED_GROUP,
@@ -910,6 +911,62 @@ async fn the_database_refuses_a_confirmation_without_its_attester() {
     .execute(cp.db().pool())
     .await
     .expect("a confirmation with its attester");
+}
+
+/// The first builds of the confirmation route confirmed without writing the
+/// attester, and 0026's trigger keeps such a row as it is for good. A
+/// database holding one still migrates: the constraint binds the rows
+/// written after it, and the old row stays.
+#[tokio::test]
+async fn the_upgrade_keeps_a_confirmation_an_early_build_left_without_its_attester() {
+    let Some(pool) = database_at(29).await else {
+        return;
+    };
+    let operator = Uuid::new_v4();
+    let batch = Uuid::new_v4();
+    let proposal = Uuid::new_v4();
+    for sql in [
+        format!(
+            "INSERT INTO operators (id, email, password_hash, role) \
+             VALUES ('{operator}', 'early-7c1@ops.test', 'x', 'operator')"
+        ),
+        "INSERT INTO pricing_baselines \
+         (engine_version, model_id, effective_from, card, source_kind, source) \
+         VALUES (2, gen_random_uuid(), now(), '{}', 'manual', '{\"note\": \"x\"}')"
+            .to_string(),
+        format!(
+            "INSERT INTO pricing_import_batches \
+             (id, dataset, dataset_ref, status, proposals, flagged, created_by) \
+             VALUES ('{batch}', 'd', 'r', 'open', 1, 0, '{operator}')"
+        ),
+        format!(
+            "INSERT INTO pricing_import_proposals (id, batch_id, provider, model, card, status) \
+             VALUES ('{proposal}', '{batch}', 'p', 'm', '{{}}', 'pending')"
+        ),
+        // What an early build's confirmation wrote: no attester.
+        format!(
+            "UPDATE pricing_import_proposals SET status = 'confirmed', decided_at = now(), \
+               decided_by = '{operator}', \
+               baseline_revision_id = (SELECT max(revision_id) FROM pricing_baselines) \
+             WHERE id = '{proposal}'"
+        ),
+    ] {
+        sqlx::query(&sql)
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+
+    migrate_rest(&pool).await.expect("0030 applies");
+
+    let kept: (String, Option<Uuid>) =
+        sqlx::query_as("SELECT status, attested_by FROM pricing_import_proposals WHERE id = $1")
+            .bind(proposal)
+            .fetch_one(&pool)
+            .await
+            .expect("the old confirmation");
+    assert_eq!(kept, ("confirmed".to_string(), None));
+    drop_database(pool).await;
 }
 
 #[tokio::test]

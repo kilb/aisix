@@ -471,6 +471,13 @@ async fn locked_defaults(conn: &mut PgConnection) -> Result<TenantDefaults, ApiE
                  that every upstream would serve",
             ));
         }
+        // The first pass is released before the second: the defaults read
+        // again can name a group of a lower id than one the first pass
+        // still held, which would lock out of id order.
+        sqlx::query("SAVEPOINT tenant_defaults")
+            .execute(&mut *conn)
+            .await
+            .map_err(DbError::from)?;
         match crate::groups::lock_named(
             &mut *conn,
             &defaults.default_provider_groups,
@@ -478,8 +485,20 @@ async fn locked_defaults(conn: &mut PgConnection) -> Result<TenantDefaults, ApiE
         )
         .await
         {
-            Ok(_) => return Ok(defaults),
-            Err(e) if e.status == StatusCode::UNPROCESSABLE_ENTITY && first => first = false,
+            Ok(_) => {
+                sqlx::query("RELEASE SAVEPOINT tenant_defaults")
+                    .execute(&mut *conn)
+                    .await
+                    .map_err(DbError::from)?;
+                return Ok(defaults);
+            }
+            Err(e) if e.status == StatusCode::UNPROCESSABLE_ENTITY && first => {
+                sqlx::query("ROLLBACK TO SAVEPOINT tenant_defaults")
+                    .execute(&mut *conn)
+                    .await
+                    .map_err(DbError::from)?;
+                first = false;
+            }
             Err(e) if e.status == StatusCode::UNPROCESSABLE_ENTITY => {
                 return Err(ApiError::internal(
                     "the stored tenant defaults name a provider group that is not live; \

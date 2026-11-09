@@ -1429,7 +1429,10 @@ impl Price {
 /// Whether `url` is an `http` or `https` page: a scheme, then a host, and
 /// nothing in the authority that makes the host a browser dials differ from
 /// the text the review prints: no userinfo (`https://a.example@b.example/`
-/// goes to `b.example`) and no backslash, which a browser reads as `/`.
+/// goes to `b.example`), no backslash, which a browser reads as `/`, and no
+/// control character or whitespace, since a browser drops a tab or a line
+/// break from a URL before it reads the host
+/// (`https://a.example\n.b.example/` goes to `a.example.b.example`).
 fn is_web_page(url: &str) -> bool {
     let (scheme, rest) = match url.split_once("://") {
         Some(parts) => parts,
@@ -1440,7 +1443,10 @@ fn is_web_page(url: &str) -> bool {
     }
     let host = rest.split(['/', '?', '#']).next().unwrap_or_default();
     // The dataset's own entries all name a host; a scheme alone names none.
-    !host.is_empty() && !host.contains(['@', '\\'])
+    !host.is_empty()
+        && !host
+            .chars()
+            .any(|c| matches!(c, '@' | '\\') || c.is_control() || c.is_whitespace())
 }
 
 /// The dataset's models whose output price is a stated zero rather than a
@@ -2132,7 +2138,8 @@ mod tests {
                 {"id":"s","pricing_urls":["data:text/html,<script>alert(1)</script>","ftp://s.example/p"],
                  "models":[{"id":"m-no-page","prices":{"input_mtok":1,"output_mtok":2}}]},
                 {"id":"t","pricing_urls":["https://openai.com@t.example/p","https://openai.com\\t.example/p",
-                                          "https://t.example/pricing"],
+                                          "https://openai.com\n.t.example/p","https://openai.com\t.t.example/p",
+                                          "https://openai.com .t.example/p","https://t.example/pricing"],
                  "models":[{"id":"m-disguised","prices":{"input_mtok":1,"output_mtok":2}}]}]"#,
         );
         let checked = current(&all, "m-checked");
@@ -2156,8 +2163,9 @@ mod tests {
         );
         assert_eq!(current(&all, "m-no-page").pricing_url, None);
         // A page whose printed text names one host and whose link goes to
-        // another is no page: userinfo, and a backslash a browser reads as
-        // `/`, both put the real host elsewhere.
+        // another is no page: userinfo, a backslash a browser reads as `/`,
+        // and a tab or line break a browser drops all put the real host
+        // elsewhere.
         assert_eq!(
             current(&all, "m-disguised").pricing_url.as_deref(),
             Some("https://t.example/pricing")

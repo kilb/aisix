@@ -179,7 +179,6 @@ pub async fn list(
                 (COUNT(*) FILTER (WHERE c.cost_micro_usd IS NULL))::bigint \
                   AS rows_without_cost \
          FROM pricing_charges_cny c \
-         JOIN usage_events ue ON ue.event_id = c.event_id \
          LEFT JOIN tenant_keys k ON k.id::text = c.api_key_id \
          LEFT JOIN provider_groups g ON g.id = COALESCE(c.group_id, k.group_id) \
          LEFT JOIN gw_resources r ON r.kind = 'models' AND NOT r.deleted \
@@ -187,7 +186,9 @@ pub async fn list(
          WHERE c.occurred_at >= $1 AND c.occurred_at < $2 \
            AND ($3::uuid IS NULL OR COALESCE(c.group_id, k.group_id) = $3) \
            AND ($4::text IS NULL OR c.requested_model_id = $4) \
-           AND ($5::text IS NULL OR ue.event->>'provider_key_id' = $5) \
+           AND ($5::text IS NULL OR EXISTS (SELECT 1 FROM usage_events ue \
+                                            WHERE ue.event_id = c.event_id \
+                                              AND ue.event->>'provider_key_id' = $5)) \
          GROUP BY COALESCE(c.group_id, k.group_id), g.display_name, c.requested_model_id, \
                   r.id, r.doc->>'display_name' \
          ORDER BY g.display_name NULLS LAST, COALESCE(c.group_id, k.group_id), \

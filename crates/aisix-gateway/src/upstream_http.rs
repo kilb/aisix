@@ -508,6 +508,18 @@ mod tests {
             // pins what it sets. Only that builder line is exempt.
             let sanctioned_control_plane_site =
                 file.ends_with("aisix-control-plane/src/upstream_http.rs");
+            // Exempt once: a second bare builder line in that file would be
+            // a client the property test there never reads.
+            if sanctioned_control_plane_site {
+                let bare = production
+                    .lines()
+                    .filter(|l| l.trim() == "reqwest::Client::builder()")
+                    .count();
+                assert_eq!(
+                    bare, 1,
+                    "the control plane builds one bare client, in its `Client::builder`"
+                );
+            }
             for (n, line) in production.lines().enumerate() {
                 if sanctioned_rmcp_site && line.contains("rmcp_reqwest::Client::") {
                     continue;

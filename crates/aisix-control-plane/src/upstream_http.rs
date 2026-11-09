@@ -486,6 +486,24 @@ mod tests {
                 "the control plane's outbound client does not set `{setting}`:\n{builder}"
             );
         }
+        // Set once, so a later call cannot override what is pinned above,
+        // and no proxy configured beside `no_proxy`.
+        for once in [
+            ".redirect(",
+            ".timeout(",
+            ".connect_timeout(",
+            ".user_agent(",
+        ] {
+            assert_eq!(
+                builder.matches(once).count(),
+                1,
+                "`{once}` is set once:\n{builder}"
+            );
+        }
+        assert!(
+            !builder.contains(".proxy("),
+            "no proxy is configured:\n{builder}"
+        );
         // Both clients the route dials through start from that builder.
         let new = body_of("pub fn new(cfg: &SsrfProtectionConfig) -> Result<Client, String> {");
         assert_eq!(
@@ -497,6 +515,18 @@ mod tests {
             !new.contains("reqwest::Client::"),
             "a client built beside `Self::builder()` skips its settings:\n{new}"
         );
+        for setting in [
+            ".redirect(",
+            ".timeout(",
+            ".connect_timeout(",
+            ".user_agent(",
+            ".proxy(",
+        ] {
+            assert!(
+                !new.contains(setting),
+                "`{setting}` set after `Self::builder()` overrides it:\n{new}"
+            );
+        }
     }
 
     fn key(adapter: Option<Adapter>, provider: &str, api_base: Option<&str>) -> ProviderKey {
