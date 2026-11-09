@@ -199,6 +199,9 @@ export interface Tenant {
   status: "pending" | "active" | "suspended";
   is_internal: boolean;
   billing_mode: "prepaid" | "postpaid";
+  /** `all`: every public model, resolved live. `selected`: `allowed_model_ids`. */
+  model_scope: "all" | "selected";
+  /** The stored selection; it grants nothing on its own while the scope is `all`. */
   allowed_model_ids: string[];
   allowed_provider_groups: string[];
   limits: TenantLimits;
@@ -223,6 +226,8 @@ export interface Member {
 
 /** What `PATCH /admin/tenants/{id}` takes: each field given replaces the stored one. */
 export interface TenantChanges {
+  /** Sending `allowed_model_ids` alone means `selected`. */
+  model_scope?: "all" | "selected";
   allowed_model_ids?: string[];
   allowed_provider_groups?: string[];
   /** Replaces every limit: a limit left out is unset. */

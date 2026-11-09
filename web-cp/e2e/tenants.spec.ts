@@ -77,9 +77,11 @@ async function signUpActive(org: string, email: string, grants: Json[] = []): Pr
   await fundTenant(stack.admin, t.id);
   if (grants.length > 0) {
     const current = await stack.admin.get(`/admin/tenants/${t.id}`);
+    // A hand-made model is outside the all-public-model scope every new
+    // tenant starts on, so granting one is a move to the selected scope.
     await stack.admin.patch(
       `/admin/tenants/${t.id}`,
-      { allowed_model_ids: grants.map((m) => m.id) },
+      { model_scope: "selected", allowed_model_ids: grants.map((m) => m.id) },
       current.version,
     );
   }
@@ -142,11 +144,14 @@ test("经 /api 自助注册的租户出现在待审核列表，批准后其会�
 
 test("授权一个模型后，租户的 /api/models 只列出它", async ({ page }) => {
   const t = await signUpActive("T5 Grant Co 8b2", "owner@grant-t5.test");
+  // A new tenant starts on every public model; this stack has none, so it
+  // reaches nothing until an operator selects one.
   expect((await t.client.get("/api/models")).items).toEqual([]);
 
   await openTenants(page);
   await openTenant(page, t.org);
   const grants = page.getByRole("group", { name: "授权模型" });
+  await grants.getByRole("radio", { name: "指定模型" }).check();
   await grants.getByRole("checkbox", { name: "chat-t5-e2e" }).check();
   await grants.getByRole("button", { name: "保存授权" }).click();
   await expect
@@ -198,6 +203,8 @@ test("把通配模型授给租户被拒，并在该模型旁说明原因", async
   await openTenants(page);
   await openTenant(page, t.org);
   const grants = page.getByRole("group", { name: "授权模型" });
+  // The list is read-only until the scope is the selected one.
+  await grants.getByRole("radio", { name: "指定模型" }).check();
   // An ordinary model chosen with it, so the reason must land on the right one.
   await grants.getByRole("checkbox", { name: "chat-t5-e2e" }).check();
   await grants.getByRole("checkbox", { name: "wild-t5-*" }).check();
@@ -457,6 +464,7 @@ test("两个运维同时改同一租户的授权：后保存的被拒，重新�
   await openTenants(page);
   await openTenant(page, t.org);
   const grants = page.getByRole("group", { name: "授权模型" });
+  await grants.getByRole("radio", { name: "指定模型" }).check();
   await expect(grants.getByRole("checkbox", { name: "chat-t5-e2e" })).not.toBeChecked();
   // Another operator grants a different model first.
   const current = await stack.admin.request("GET", `/admin/tenants/${t.id}`);
@@ -536,6 +544,7 @@ test("一处未保存的修改，不会被另一处的保存冲掉", async ({ pa
   await openTenant(page, t.org);
   const limits = page.getByRole("group", { name: "限额" });
   const grants = page.getByRole("group", { name: "授权模型" });
+  await grants.getByRole("radio", { name: "指定模型" }).check();
   // A limit typed but not saved, then a grant saved.
   await limits.getByLabel("租户每分钟请求").fill("777");
   await grants.getByRole("checkbox", { name: "chat-t5-e2e" }).check();
@@ -543,14 +552,16 @@ test("一处未保存的修改，不会被另一处的保存冲掉", async ({ pa
   await expect(grants).toContainText("已保存授权");
   await expect(limits.getByLabel("租户每分钟请求")).toHaveValue("777");
 
-  // Both edits land.
+  // Both edits land. The list holds what the tenant reached when the scope
+  // became the selected one (every public model this stack has, which is not
+  // the point here) plus the model just ticked.
   await limits.getByRole("button", { name: "保存限额" }).click();
   await expect
     .poll(async () => {
       const tenant = await stack.admin.get(`/admin/tenants/${t.id}`);
-      return [tenant.limits.rpm, tenant.allowed_model_ids];
+      return [tenant.limits.rpm, (tenant.allowed_model_ids as string[]).includes(models.chat.id)];
     })
-    .toEqual([777, [models.chat.id]]);
+    .toEqual([777, true]);
 });
 
 test("停用租户唯一的所有者被拒，并在该成员旁说明原因", async ({ page }) => {
@@ -662,6 +673,7 @@ test("授权一个未定价的模型时显示未定价提示", async ({ page }) 
   await openTenants(page);
   await openTenant(page, t.org);
   const grants = page.getByRole("group", { name: "授权模型" });
+  await grants.getByRole("radio", { name: "指定模型" }).check();
   const notice = "未定价：调用会暂不计费，直到设置基准价";
   await grants.getByRole("checkbox", { name: "chat-t5-e2e" }).check();
   await grants.getByRole("button", { name: "保存授权" }).click();

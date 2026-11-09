@@ -9,6 +9,7 @@ import {
   groupPrices,
   groups as groupsApi,
   keys as keysApi,
+  publicModels,
   resources,
   settings,
   tenants,
@@ -16,6 +17,7 @@ import {
   type Group,
   type Invite,
   type Member,
+  type PublicModel,
   type ResourceView,
   type Tenant,
   type TenantChanges,
@@ -603,6 +605,9 @@ function TenantDetail({
   // Read again with every version of the tenant: a grant made elsewhere can
   // name a model created after the last read.
   const catalog = useLoad(() => resources.list<ModelDoc>("models"), [tenant.version, tick]);
+  // The public models, live and retired: the live ones are what the all scope
+  // covers, since a retired model's documents are gone.
+  const publics = useLoad<PublicModel[]>(() => publicModels.list(), [tenant.version, tick]);
   const groups = useLoad(() => groupsApi.list(), [tick]);
   // Every model a group can price, with its baseline: a granted model with
   // none is a call nobody can bill yet.
@@ -650,6 +655,7 @@ function TenantDetail({
         {...part}
         catalog={catalog.data}
         catalogError={catalog.error}
+        publics={publics.data?.filter((p: PublicModel) => p.retired_at === null).map((p: PublicModel) => p.id) ?? null}
         priced={priced}
       />
       <GroupsPart
@@ -796,13 +802,17 @@ function GrantsPart({
   onReload,
   catalog,
   catalogError,
+  publics,
   priced,
 }: PartProps & {
   catalog: ResourceView<ModelDoc>[] | null;
   catalogError: string | null;
+  /** The ids of the live public models; `null` until the list is read. */
+  publics: string[] | null;
   /** The ids of the models with a baseline in force; `null` until the list is read. */
   priced: Set<string> | null;
 }) {
+  const [scope, setScope] = useState(tenant.model_scope);
   const [chosen, setChosen] = useState(() => new Set(tenant.allowed_model_ids));
   const [part, focusRefusal] = useRefusalFocus<HTMLFieldSetElement>();
   // The ids in the order last sent: a refusal names an entry by its index.
@@ -812,12 +822,25 @@ function GrantsPart({
   const [busy, setBusy] = useState(false);
 
   // The stored grants changed (a save, a reload): the form edits them from now on.
-  const stored = JSON.stringify(tenant.allowed_model_ids);
+  const stored = JSON.stringify([tenant.model_scope, tenant.allowed_model_ids]);
   useEffect(() => {
+    setScope(tenant.model_scope);
     setChosen(new Set(tenant.allowed_model_ids));
     setRefused(null);
   }, [stored]);
   useConflictClears(tenant.version, setRefused);
+
+  // What an all-scope tenant reaches: every live public model, which the
+  // catalogue lists once its routing document is live.
+  const reachable = useMemo(() => new Set(publics ?? []), [publics]);
+  const all = scope === "all";
+  // The rows the save keeps under `all`: every public model the catalogue
+  // lists. A public model with no document yet is not callable and is not in
+  // scope until an account serves it.
+  const effective = useMemo(
+    () => (all ? (catalog ?? []).filter((m) => reachable.has(m.id)) : []),
+    [all, catalog, reachable],
+  );
 
   // The catalog's models, then every granted or chosen model it does not
   // list: a save sends the whole list, so a grant made since the catalog was
@@ -856,9 +879,12 @@ function GrantsPart({
   }
 
   // Grants the save takes away: every key of the tenant loses those models.
-  const withdrawn = tenant.allowed_model_ids.filter((id) => !chosen.has(id));
+  // Under `all` the rows are fixed, so a save there only ever widens the
+  // scope to what the catalogue now lists; a list save may withdraw.
+  const withdrawn = all ? [] : tenant.allowed_model_ids.filter((id) => !chosen.has(id));
   // Unsaved edits: the save turns Sign yellow only while there are some.
-  const granted = [...chosen].some((id) => !tenant.allowed_model_ids.includes(id));
+  const granted =
+    scope !== tenant.model_scope || [...chosen].some((id) => !tenant.allowed_model_ids.includes(id));
   const nameOf = (id: string) => rows.find((r) => r.id === id)?.name ?? id;
 
   async function submit() {
@@ -868,7 +894,7 @@ function GrantsPart({
     setNote(null);
     setSent(ids);
     try {
-      await save({ allowed_model_ids: ids });
+      await save({ model_scope: scope, allowed_model_ids: ids });
       setNote({ kind: "ok", text: "已保存授权。" });
     } catch (e) {
       setRefused(refusal(e, (p) => /^\/allowed_model_ids\/\d+$/.test(p)));
@@ -878,10 +904,53 @@ function GrantsPart({
     }
   }
 
+  /**
+   * Switches the scope. Narrowing to `selected` starts from what the tenant
+   * reaches now, so the form shows that set rather than nothing; going back
+   * to `all` restores the stored list the operator had chosen, which the
+   * scope had been standing aside.
+   */
+  function switchScope(next: "all" | "selected") {
+    if (next === "selected") {
+      setChosen(new Set(all ? effective.map((m) => m.id) : tenant.allowed_model_ids));
+    } else {
+      setChosen(new Set(tenant.allowed_model_ids));
+    }
+    setScope(next);
+  }
+
   return (
     <fieldset ref={part} className="tn-section">
       <legend>授权模型</legend>
-      <p className="hint">租户只能使用这里授权的模型，按平台名称调用；改名不影响授权。删除模型会把它从所有授权里移除。</p>
+      <div className="tn-scope" role="radiogroup" aria-label="模型范围">
+        <label>
+          <input
+            type="radio"
+            name="model-scope"
+            value="all"
+            checked={all}
+            disabled={!canEdit}
+            onChange={() => switchScope("all")}
+          />
+          全部公共模型
+        </label>
+        <label>
+          <input
+            type="radio"
+            name="model-scope"
+            value="selected"
+            checked={!all}
+            disabled={!canEdit}
+            onChange={() => switchScope("selected")}
+          />
+          指定模型
+        </label>
+      </div>
+      <p className="hint">
+        {all
+          ? "租户可以使用价格 → 公共模型里的全部公共模型，按平台名称调用；此后新建的公共模型自动包含在内，无需修改本页。模型与路由里手工创建的模型不在范围内，要授权请改选「指定模型」。"
+          : "租户只能使用这里勾选的模型，按平台名称调用；改名不影响授权。删除模型会把它从所有授权里移除。"}
+      </p>
       {catalogError && (
         <div className="note crit" role="alert">
           模型目录读取失败：{catalogError}
@@ -893,24 +962,29 @@ function GrantsPart({
         <p className="hint">模型目录还是空的。</p>
       ) : (
         <ul className="tn-checks">
-          {rows.map((r) => (
-            <Check
-              key={r.id}
-              label={r.name}
-              checked={chosen.has(r.id)}
-              disabled={!canEdit}
-              onChange={(on) =>
-                setChosen((prev) => {
-                  const next = new Set(prev);
-                  if (on) next.add(r.id);
-                  else next.delete(r.id);
-                  return next;
-                })
-              }
-              note={noteFor(r)}
-              error={reasonFor(r)}
-            />
-          ))}
+          {rows.map((r) => {
+            // Under `all` the public models are what the scope is, so they
+            // read as ticked and fixed; everything else is out of reach.
+            const inScope = all ? reachable.has(r.id) : chosen.has(r.id);
+            return (
+              <Check
+                key={r.id}
+                label={r.name}
+                checked={inScope}
+                disabled={!canEdit || all}
+                onChange={(on) =>
+                  setChosen((prev) => {
+                    const next = new Set(prev);
+                    if (on) next.add(r.id);
+                    else next.delete(r.id);
+                    return next;
+                  })
+                }
+                note={all ? (reachable.has(r.id) ? undefined : "不在全部公共模型的范围内") : noteFor(r)}
+                error={all ? undefined : reasonFor(r)}
+              />
+            );
+          })}
         </ul>
       )}
       {refused?.general && (
