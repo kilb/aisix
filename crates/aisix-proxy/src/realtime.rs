@@ -55,8 +55,8 @@
 //!
 //! The relay harvests `response.done` usage frames (and
 //! `conversation.item.input_audio_transcription.completed` token usage)
-//! from the upstream stream, charges each to the spend metric and the limits
-//! as it arrives, and emits ONE aggregated UsageEvent per
+//! from the upstream stream, charges each to the token metrics and the
+//! limits as it arrives, and emits ONE aggregated UsageEvent per
 //! session (`inbound_protocol = "realtime"`), committing total tokens to
 //! the rate-limit reservation like the other non-chat surfaces (#911
 //! [21]).
@@ -1124,9 +1124,8 @@ impl SessionUsage {
 /// What a session has charged so far, and everything it needs to charge more.
 ///
 /// A session runs for as long as its traffic does, so nothing it spends can wait
-/// for the close: a ledger reading the spend counter would not see it, a limit
-/// could not act on it, and a process that dies in between would never bill it.
-/// It settles each usage frame as it arrives.
+/// for the close: a limit could not act on it. It settles each usage frame as it
+/// arrives.
 struct SessionMeter<'a> {
     state: &'a ProxyState,
     auth: &'a crate::auth::AuthenticatedKey,
@@ -1179,9 +1178,9 @@ impl SessionMeter<'_> {
 
     /// Charge what arrived since the last call, at the price in force when it
     /// arrived: a price that changes mid-session applies from then on, not to
-    /// what was already charged. The metric and the limits get the difference
-    /// from the running total, so what they add up to is exactly what the
-    /// session's one usage event reports.
+    /// what was already charged. The token metrics and the limits get the
+    /// difference from the running total, so what they add up to is exactly
+    /// what the session's one usage event reports.
     fn settle(&mut self, usage: &SessionUsage) {
         if !self.behind(usage) {
             return;
@@ -1202,9 +1201,8 @@ impl SessionMeter<'_> {
         let limiter = &self.state.limiter;
         limiter.add_tokens_post_stream_all(&self.token_keys, input + output);
         limiter.add_tokens_post_stream_all(&self.spend_keys, spend);
-        // A realtime session bills real tokens against a real model. Its cost
-        // is resolved from the model row, same as every other endpoint, and
-        // feeds `aisix_llm_spend_micro_usd_total`.
+        // A realtime session bills real tokens against a real model, and
+        // reports them as each frame arrives.
         crate::request_metrics::record_usage(
             self.state,
             "/v1/realtime",
@@ -1228,7 +1226,6 @@ impl SessionMeter<'_> {
                 cached: cached.min(u32::MAX as u64) as u32,
                 cache_read: 0,
                 cache_creation: 0,
-                spend_usd: spend as f64 / 1_000_000.0,
                 client_type: self.client_type,
             },
         );
@@ -3221,15 +3218,16 @@ mod tests {
         addr
     }
 
-    /// The spend counter as `/metrics` shows it, waiting for it to reach `want`.
-    async fn spend_reaches(state: &crate::ProxyState, want: u64) -> u64 {
+    /// The total-token counter as `/metrics` shows it, waiting for it to reach
+    /// `want`. Each response the upstream above sends is 2000 tokens.
+    async fn tokens_reach(state: &crate::ProxyState, want: u64) -> u64 {
         let mut seen = 0;
         for _ in 0..60 {
             seen = state
                 .metrics
                 .render()
                 .lines()
-                .filter(|l| l.starts_with(aisix_obs::metrics::M_LLM_SPEND_MICRO_USD_TOTAL))
+                .filter(|l| l.starts_with(aisix_obs::metrics::M_LLM_TOTAL_TOKENS_TOTAL))
                 .filter_map(|l| l.rsplit(' ').next()?.parse::<u64>().ok())
                 .sum();
             if seen >= want {
@@ -3269,12 +3267,13 @@ mod tests {
         let (mut tx, client_rx) = ws.split();
         let ask = || TgMessage::Text(serde_json::json!({"type": "response.create"}).to_string());
 
-        // 1000 + 1000 tokens at $0.5/1k, then the same at $1/1k.
+        // 1000 + 1000 tokens at $0.5/1k, settled before the price changes,
+        // then the same at $1/1k.
         tx.send(ask()).await.unwrap();
-        assert_eq!(spend_reaches(&state, 1_000_000).await, 1_000_000);
+        assert_eq!(tokens_reach(&state, 2_000).await, 2_000);
         state.snapshot.load().pricing.insert(price(1.0, 2));
         tx.send(ask()).await.unwrap();
-        assert_eq!(spend_reaches(&state, 3_000_000).await, 3_000_000);
+        assert_eq!(tokens_reach(&state, 4_000).await, 4_000);
         drop((tx, client_rx));
 
         let ev = tokio::time::timeout(Duration::from_secs(3), rx.recv())
@@ -3283,8 +3282,8 @@ mod tests {
             .expect("sink closed");
         assert!((ev.cost_usd - 3.0).abs() < 1e-9, "{}", ev.cost_usd);
         assert_eq!(
-            spend_reaches(&state, 4_000_000).await,
-            3_000_000,
+            tokens_reach(&state, 6_000).await,
+            4_000,
             "nothing already charged is charged again"
         );
     }
@@ -3362,9 +3361,9 @@ mod tests {
         }
     }
 
-    /// A session can run for hours. What it spends has to reach the counter a
-    /// ledger reads while it is open, a key disabled meanwhile has to stop it,
-    /// and what the session's one event reports is what the charges add up to.
+    /// A session can run for hours. What it uses has to reach the counters while
+    /// it is open, a key disabled meanwhile has to stop it, and what the
+    /// session's one event reports is what the charges add up to.
     #[tokio::test]
     async fn an_open_session_is_charged_as_it_goes_and_ends_when_its_key_is_disabled() {
         let up_addr = spawn_open_upstream().await;
@@ -3389,9 +3388,9 @@ mod tests {
 
         // 1000 + 1000 tokens at $0.5/1k: $1 a response, with the session open.
         tx.send(ask()).await.unwrap();
-        assert_eq!(spend_reaches(&state, 1_000_000).await, 1_000_000);
+        assert_eq!(tokens_reach(&state, 2_000).await, 2_000);
         tx.send(ask()).await.unwrap();
-        assert_eq!(spend_reaches(&state, 2_000_000).await, 2_000_000);
+        assert_eq!(tokens_reach(&state, 4_000).await, 4_000);
 
         let live = state.snapshot.load();
         let key = live.apikeys.get_by_id("k-1").unwrap();
@@ -3425,8 +3424,8 @@ mod tests {
         assert_eq!(ev.completion_tokens, 3_000);
         assert!((ev.cost_usd - 3.0).abs() < 1e-9, "{}", ev.cost_usd);
         assert_eq!(
-            spend_reaches(&state, 3_000_000).await,
-            3_000_000,
+            tokens_reach(&state, 6_000).await,
+            6_000,
             "the charges add up to what the event reports, and no further"
         );
     }

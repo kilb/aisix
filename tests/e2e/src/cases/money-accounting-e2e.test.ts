@@ -8,23 +8,32 @@ import {
   metricDelta,
   scrapeMetrics,
   SeedClient,
+  slsLogsFor,
   spawnApp,
+  startMockSls,
   waitConfigPropagation,
+  waitForSlsLog,
   type MetricSample,
+  type MockSls,
   type SpawnedApp,
 } from "../harness/index.js";
 
 // E2E: what a request costs, who pays it, and what a cache may hand back, read
-// from the outside: the spend series a ledger debits from `GET /metrics`, the
-// status a caller sees, and whether the upstream was reached.
+// from the outside: the `cost_usd` and `api_key_id` on the usage row each
+// request leaves with an exporter, the status a caller sees, and whether the
+// upstream was reached.
 //
 // Every model below is priced in round numbers. 1000 tokens at 1 USD/1k is one
-// dollar, which reads as 1_000_000 on the spend series, so an expected value is
-// arithmetic on the numbers in this file.
+// dollar, so an expected value is arithmetic on the numbers in this file, read
+// here in micro-USD (one dollar is 1_000_000).
 
-const SPEND = "aisix_llm_spend_micro_usd_total";
 const UNPRICED = "aisix_budget_unpriced_requests_total";
 const COST = { input_per_1k: 1, output_per_1k: 1 };
+const CREDENTIAL_REF = "mock";
+const LOGSTORE = "money-accounting";
+
+/** A row's `cost_usd`, in micro-USD. */
+const microOf = (row: Map<string, string>) => Math.round(Number(row.get("cost_usd") ?? "0") * 1e6);
 
 const hash = (s: string) => createHash("sha256").update(s).digest("hex");
 
@@ -260,6 +269,7 @@ const SESSION_ID = randomUUID();
 describe("what a request costs, who pays it, and what a cache hands back", () => {
   let app: SpawnedApp | undefined;
   let mock: Mock | undefined;
+  let sls: MockSls | undefined;
   let seed: SeedClient | undefined;
   let etcdReachable = false;
 
@@ -268,10 +278,28 @@ describe("what a request costs, who pays it, and what a cache hands back", () =>
     etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
     mock = await startMock();
+    sls = await startMockSls();
     // The loopback client is a trusted proxy, so a test can say where a request
     // comes from.
-    app = await spawnApp({ realIp: { trusted_proxies: ["127.0.0.1/32"], recursive: true } });
+    app = await spawnApp({
+      realIp: { trusted_proxies: ["127.0.0.1/32"], recursive: true },
+      extraEnv: {
+        [`SLS_CRED_${CREDENTIAL_REF.toUpperCase()}_AK_ID`]: "mock-akid",
+        [`SLS_CRED_${CREDENTIAL_REF.toUpperCase()}_AK_SECRET`]: "mock-secret",
+      },
+    });
     seed = new SeedClient(etcd, app.etcdPrefix);
+    // Every request's usage row, as an exporter keeps it.
+    await seed.createObservabilityExporter({
+      name: "sls-money-accounting",
+      enabled: true,
+      kind: "aliyun_sls",
+      endpoint: sls.url,
+      project: "aisix-e2e-obs",
+      logstore: LOGSTORE,
+      credential_ref: CREDENTIAL_REF,
+      content_mode: "metadata_only",
+    });
 
     const openai = await seed.createProviderKey({
       display_name: "money-openai",
@@ -409,6 +437,7 @@ describe("what a request costs, who pays it, and what a cache hands back", () =>
   afterAll(async () => {
     await app?.exit();
     await mock?.close();
+    await sls?.close();
   });
 
   const scrape = () => scrapeMetrics(app!.metricsUrl);
@@ -440,6 +469,37 @@ describe("what a request costs, who pays it, and what a cache hands back", () =>
       headers,
     );
 
+  /** The usage row of the request `res` answered. */
+  const rowOf = (res: Response) => {
+    const requestId = res.headers.get("x-aisix-request-id") ?? "";
+    expect(requestId, "the response names its request").not.toBe("");
+    return waitForSlsLog(
+      sls!,
+      LOGSTORE,
+      (log) => log.get("request_id") === requestId,
+      `the usage row of ${requestId}`,
+      20_000,
+    );
+  };
+
+  /** Every usage row received so far that `pred` matches. */
+  const rowsWhere = (pred: (row: Map<string, string>) => boolean) =>
+    slsLogsFor(sls!, LOGSTORE).filter(pred);
+
+  /** Wait until `pred` matches at least `n` usage rows, and return them all. */
+  async function awaitRows(
+    pred: (row: Map<string, string>) => boolean,
+    n: number,
+    what: string,
+  ): Promise<Map<string, string>[]> {
+    for (let i = 0; i < 200; i++) {
+      const rows = rowsWhere(pred);
+      if (rows.length >= n) return rows;
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    throw new Error(`fewer than ${n} usage rows: ${what}`);
+  }
+
   /** Wait for a series to move from `before`, then read how far. */
   async function deltaOf(
     before: MetricSample[],
@@ -459,20 +519,20 @@ describe("what a request costs, who pays it, and what a cache hands back", () =>
 
   test("a cache write is charged at the write rate, inside a prompt that reports it", async (ctx) => {
     if (!etcdReachable) return ctx.skip();
-    const before = await scrape();
-    expect((await chat("cache-writer", "price this")).status).toBe(200);
+    const res = await chat("cache-writer", "price this");
+    expect(res.status).toBe(200);
     // Of 1000 prompt tokens: 100 read at 0.1, 700 written at 1.25, 200 plain at
     // 1. Plus 1000 completion tokens at 1.
-    expect(await deltaOf(before, SPEND, { model: "cache-writer" })).toBe(2_085_000);
+    expect(microOf(await rowOf(res))).toBe(2_085_000);
   });
 
   test("a prompt served entirely from the cache is charged at the cache rate alone", async (ctx) => {
     if (!etcdReachable) return ctx.skip();
-    const before = await scrape();
-    expect((await messages("cache-only", "a long and cached prompt")).status).toBe(200);
+    const res = await messages("cache-only", "a long and cached prompt");
+    expect(res.status).toBe(200);
     // 1000 read at 0.1, 1000 completion at 1. An input count of zero beside
     // those reads is what the provider reported, and nothing is added to it.
-    expect(await deltaOf(before, SPEND, { model: "cache-only" })).toBe(1_100_000);
+    expect(microOf(await rowOf(res))).toBe(1_100_000);
   });
 
   test("an answer worth repeating is cached, so the cases below are not vacuous", async (ctx) => {
@@ -572,16 +632,17 @@ describe("what a request costs, who pays it, and what a cache hands back", () =>
     expect(res.status).toBe(200);
     const labels = { policy: "money-ceiling", model: "painter" };
     expect(await deltaOf(before, UNPRICED, labels)).toBe(1);
-    expect(metricDelta(before, await scrape(), SPEND, { model: "painter" })).toBe(0);
+    expect(microOf(await rowOf(res))).toBe(0);
   });
 
   test("a web search counts as spend a ceiling cannot see, beside the tokens it does", async (ctx) => {
     if (!etcdReachable) return ctx.skip();
     const before = await scrape();
-    expect((await messages("searcher", "look it up", CEILING)).status).toBe(200);
+    const res = await messages("searcher", "look it up", CEILING);
+    expect(res.status).toBe(200);
     const labels = { policy: "money-ceiling", model: "searcher" };
     expect(await deltaOf(before, UNPRICED, labels)).toBe(1);
-    expect(metricDelta(before, await scrape(), SPEND, { model: "searcher" })).toBe(2_000_000);
+    expect(microOf(await rowOf(res))).toBe(2_000_000);
   });
 
   test("tokens a price covers are not reported as spend a ceiling cannot see", async (ctx) => {
@@ -616,35 +677,41 @@ describe("what a request costs, who pays it, and what a cache hands back", () =>
 
   test("a batch is charged to whoever submitted it, once, whoever reads it", async (ctx) => {
     if (!etcdReachable) return ctx.skip();
+    const batchRow = (row: Map<string, string>) =>
+      row.get("is_batch") === "true" && row.get("requested_model") === "batcher";
+    const earlier = rowsWhere(batchRow).length;
     const { id, raw } = await submitBatch(SUBMITTER);
     const batch = mock!.batches.get(raw)!;
     batch.status = "completed";
     batch.output_file_id = `file-out-${raw}`;
 
-    const before = await scrape();
     // Someone else's listing is the first time anyone sees it finish.
     const listed = await fetch(`${app!.proxyUrl}/v1/batches?model=batcher`, {
       headers: { authorization: `Bearer ${READER}` },
     });
     expect(listed.status).toBe(200);
-    expect(await deltaOf(before, SPEND, { api_key_id: SUBMITTER_ID, model: "batcher" })).toBe(
-      2_000_000,
-    );
-    expect(metricDelta(before, await scrape(), SPEND, { api_key_id: READER_ID })).toBe(0);
+    const [charged] = (await awaitRows(batchRow, earlier + 1, "the batch's row")).slice(earlier);
+    expect(charged.get("api_key_id"), "the submitter pays, not the reader").toBe(SUBMITTER_ID);
+    expect(microOf(charged)).toBe(2_000_000);
 
     // The submitter reading it afterwards is not a second charge.
     const read = await fetch(`${app!.proxyUrl}/v1/batches/${id}`, {
       headers: { authorization: `Bearer ${SUBMITTER}` },
     });
     expect(read.status).toBe(200);
-    await settle();
-    expect(metricDelta(before, await scrape(), SPEND, { api_key_id: SUBMITTER_ID })).toBe(
-      2_000_000,
-    );
+    // Ordered, not timed: a request after the read has its row exported after
+    // any the read produced.
+    const barrier = await chat("repeatable", "after the read", SUBMITTER);
+    expect(barrier.status).toBe(200);
+    await rowOf(barrier);
+    expect(rowsWhere(batchRow).slice(earlier), "one row for the batch").toHaveLength(1);
   });
 
   test("a batch cancelled with finished work is charged for that work", async (ctx) => {
     if (!etcdReachable) return ctx.skip();
+    const batchRow = (row: Map<string, string>) =>
+      row.get("is_batch") === "true" && row.get("api_key_id") === SUBMITTER_ID;
+    const earlier = rowsWhere(batchRow).length;
     const { id, raw } = await submitBatch(SUBMITTER);
     const cancel = await post(`/v1/batches/${id}/cancel`, SUBMITTER, {});
     expect(cancel.status).toBe(200);
@@ -653,17 +720,18 @@ describe("what a request costs, who pays it, and what a cache hands back", () =>
     batch.status = "cancelled";
     batch.output_file_id = `file-out-${raw}`;
 
-    const before = await scrape();
     const read = await fetch(`${app!.proxyUrl}/v1/batches/${id}`, {
       headers: { authorization: `Bearer ${SUBMITTER}` },
     });
     expect(read.status).toBe(200);
-    expect(await deltaOf(before, SPEND, { api_key_id: SUBMITTER_ID, model: "batcher" })).toBe(
-      2_000_000,
+    const [charged] = (await awaitRows(batchRow, earlier + 1, "the cancelled batch's row")).slice(
+      earlier,
     );
+    expect(charged.get("requested_model")).toBe("batcher");
+    expect(microOf(charged)).toBe(2_000_000);
   });
 
-  test("an open realtime session is charged as it goes, and ends when its key does", async (ctx) => {
+  test("an open realtime session is counted as it goes, and ends when its key does", async (ctx) => {
     if (!etcdReachable) return ctx.skip();
     const before = await scrape();
     const session = new WsClient(
@@ -682,9 +750,12 @@ describe("what a request costs, who pays it, and what a cache hands back", () =>
 
     session.send(JSON.stringify({ type: "response.create" }));
     expect(
-      await deltaOf(before, SPEND, { api_key_id: SESSION_ID, model: "speaker" }),
-      "billed while the session is still open",
-    ).toBe(2_000_000);
+      await deltaOf(before, "aisix_llm_input_tokens_total", {
+        api_key_id: SESSION_ID,
+        model: "speaker",
+      }),
+      "counted while the session is still open",
+    ).toBe(1000);
 
     await seed!.update("api_keys", SESSION_ID, {
       key_hash: hash(SESSION),
@@ -702,7 +773,13 @@ describe("what a request costs, who pays it, and what a cache hands back", () =>
     session.send(JSON.stringify({ type: "response.create" }));
     expect(await closed).toBe(1008);
     expect(frames, "the response already under way was delivered").toHaveLength(2);
-    await settle();
-    expect(metricDelta(before, await scrape(), SPEND, { api_key_id: SESSION_ID })).toBe(4_000_000);
+    // The session's one row bills both responses to the key that opened it.
+    const [row] = await awaitRows(
+      (r) => r.get("api_key_id") === SESSION_ID && r.get("requested_model") === "speaker",
+      1,
+      "the realtime session's row",
+    );
+    expect(row.get("prompt_tokens")).toBe("2000");
+    expect(microOf(row)).toBe(4_000_000);
   });
 });

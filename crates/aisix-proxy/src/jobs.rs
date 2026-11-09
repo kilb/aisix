@@ -2971,7 +2971,7 @@ fn attribute_listed_batches(
             continue;
         }
         // A batch that ended before this process started still gets its row:
-        // only its credit to the spend counter is ruled out, and
+        // only its credit to the counters is ruled out, and
         // `attribute_batch_usage` gates that alone.
         maybe_attribute_batch(state, auth, client, target, raw_id, batch);
     }
@@ -3213,8 +3213,8 @@ async fn attribute_batch_usage(job: &BatchAttribution) -> Result<(), String> {
     let multi = per_model.len() > 1;
     // 这条归因会重放：进程内的去重集合是优化不是正确性机制，重启或换实例之后
     // 再看到同一个已完成批次就会重来一遍。用量事件带确定性 id，消费端据此去重
-    // ——**它**是幂等的。而下面两条不是：Prometheus 计数器和花费计数器
-    // 都没有那层保护，重放一次就是把这批多收一遍。
+    // ——**它**是幂等的。而下面两条不是：Prometheus 计数器和额度计数器
+    // 都没有那层保护，重放一次就是把这批多记一遍。
     //
     // 所以只给这两条加闸，且闸放在与计数器同一个存储里：共享存储下跨重启、跨
     // 实例都只记一次。进程内存储下标记活不过重启，所以还要先看批次结束的时刻
@@ -3364,11 +3364,9 @@ async fn attribute_batch_usage(job: &BatchAttribution) -> Result<(), String> {
                 exporters.iter().map(|e| &*e.value),
             );
         }
-        // 同一笔钱也要进 Prometheus 的 token/花费族。事件只进控制面的账本，
-        // 而按花费序列求和扣款的那一侧看不到它 —— 于是一个批次可以消耗巨量
-        // token 而用户余额分毫不动。
-        //
-        // 与额度同受 `credit` 管：这是个计数器，重放一次就多收一次。
+        // The batch's tokens reach the Prometheus token families too, like
+        // every other surface's. Gated by `credit` with the limits: a counter
+        // counts a replay again.
         if credit {
             // 取付钱那把密钥本身，不按 id 回查快照：批次跑了几天，密钥可能已经被
             // 吊销，而这笔钱还是它的主人花的。
@@ -3389,7 +3387,6 @@ async fn attribute_batch_usage(job: &BatchAttribution) -> Result<(), String> {
                     output: event.completion_tokens,
                     total: event.prompt_tokens.saturating_add(event.completion_tokens),
                     cached: event.cached_prompt_tokens,
-                    spend_usd: event.cost_usd,
                     client_type: state.client_classifier.classify(user_agent),
                     ..Default::default()
                 },
@@ -4446,14 +4443,14 @@ mod tests {
         let mut rendered = String::new();
         for _ in 0..40 {
             rendered = state.metrics.render();
-            if rendered.contains(aisix_obs::metrics::M_LLM_SPEND_MICRO_USD_TOTAL) {
+            if rendered.contains(aisix_obs::metrics::M_LLM_TOTAL_TOKENS_TOTAL) {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         assert!(
-            rendered.contains(aisix_obs::metrics::M_LLM_SPEND_MICRO_USD_TOTAL),
-            "花费序列没出现，这条断言就量不到东西: {rendered}"
+            rendered.contains(aisix_obs::metrics::M_LLM_TOTAL_TOKENS_TOTAL),
+            "the token series never appeared, so this check measures nothing: {rendered}"
         );
         assert!(
             !rendered.contains("whatever-the-upstream-says-x9271"),
@@ -4461,25 +4458,25 @@ mod tests {
         );
         let series: Vec<&str> = rendered
             .lines()
-            .filter(|l| l.starts_with(aisix_obs::metrics::M_LLM_SPEND_MICRO_USD_TOTAL))
+            .filter(|l| l.starts_with(aisix_obs::metrics::M_LLM_TOTAL_TOKENS_TOTAL))
             .collect();
         assert_eq!(
             series.len(),
             1,
             "多模型批次该合并成一条 series（总量不变）: {series:?}"
         );
-        // 两行各 1000+1000 token，$0.5/1k —— 整批 $2.00，序列单位是 micro-USD。
+        // Two lines of 1000 + 1000 tokens each: 4000 for the batch.
         assert!(
-            series[0].ends_with(" 2000000"),
-            "合并后的总额不对（应为 2_000_000 micro-USD）: {}",
+            series[0].ends_with(" 4000"),
+            "the merged total is wrong (want 4000 tokens): {}",
             series[0]
         );
     }
 
-    /// 批处理的花费归因会重放：进程内的去重集合是优化不是正确性机制，重启或
+    /// 批处理的用量归因会重放：进程内的去重集合是优化不是正确性机制，重启或
     /// 换实例之后再看到同一个已完成批次就会重来一遍。两类通道在重放下的表现
-    /// 必须不同 —— 用量事件带确定性 id，消费端去重，所以它该照发；而花费
-    /// 计数器与 Prometheus 计数器没有那层保护，重放一次就是多收一遍，所以
+    /// 必须不同 —— 用量事件带确定性 id，消费端去重，所以它该照发；而额度
+    /// 计数器与 Prometheus 计数器没有那层保护，重放一次就是多记一遍，所以
     /// 它们必须被那个一次性标记挡住。
     ///
     /// 这里预先占掉标记来模拟「这批已经归因过了」。本地存储下标记随进程消失，
@@ -4553,8 +4550,8 @@ mod tests {
         // 而计数器一动不动。
         let rendered = state.metrics.render();
         assert!(
-            !rendered.contains(aisix_obs::metrics::M_LLM_SPEND_MICRO_USD_TOTAL),
-            "重放把这批的钱又收了一遍: {rendered}"
+            !rendered.contains(aisix_obs::metrics::M_LLM_TOTAL_TOKENS_TOTAL),
+            "a replay counted the batch's tokens again: {rendered}"
         );
     }
 
@@ -4570,7 +4567,7 @@ mod tests {
     }
 
     /// 一个结束了的批次和它的结果文件：一行 1000+1000 token。按 `priced_model`
-    /// 的 $0.5/1k，整批是 $1，即 1_000_000 micro-USD。
+    /// 的 $0.5/1k，整批是 $1。
     async fn mount_ended_batch(upstream: &MockServer, batch: Value) {
         let id = batch["id"].as_str().unwrap().to_string();
         Mock::given(wm_method("GET"))
@@ -4612,13 +4609,15 @@ mod tests {
             .unwrap()
     }
 
-    /// 花费序列渐渐出现（归因在后台跑）：等它的 `(api_key_id, 值)` 落定。
-    async fn spend_series(state: &crate::ProxyState) -> Vec<(String, u64)> {
+    /// The total-token series shows up as attribution runs in the background:
+    /// wait for its `(api_key_id, value)` pairs to land. A credited batch of
+    /// [`mount_ended_batch`] is 2000 tokens.
+    async fn token_series(state: &crate::ProxyState) -> Vec<(String, u64)> {
         for _ in 0..60 {
             let rendered = state.metrics.render();
             let series: Vec<(String, u64)> = rendered
                 .lines()
-                .filter(|l| l.starts_with(aisix_obs::metrics::M_LLM_SPEND_MICRO_USD_TOTAL))
+                .filter(|l| l.starts_with(aisix_obs::metrics::M_LLM_TOTAL_TOKENS_TOTAL))
                 .map(|l| {
                     let key = l
                         .split("api_key_id=\"")
@@ -4668,10 +4667,7 @@ mod tests {
             "网关的标记不该出现在给调用方的应答里: {v}"
         );
 
-        assert_eq!(
-            spend_series(&state).await,
-            vec![("k-1".to_string(), 1_000_000)]
-        );
+        assert_eq!(token_series(&state).await, vec![("k-1".to_string(), 2_000)]);
     }
 
     /// 读批次时换一个更便宜的 `?model=`（同一把上游密钥下）不能换一个价钱。
@@ -4694,7 +4690,7 @@ mod tests {
         ))
         .unwrap();
         snap.models.insert(ResourceEntry::new("m-cheap", cheap, 1));
-        let (app, _rx, state) = build_app_with_sink_and_state(snap);
+        let (app, mut rx, state) = build_app_with_sink_and_state(snap);
 
         let resp = app
             .oneshot(get_as(
@@ -4704,9 +4700,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(
-            spend_series(&state).await,
-            vec![("k-1".to_string(), 1_000_000)]
+        assert_eq!(token_series(&state).await, vec![("k-1".to_string(), 2_000)]);
+        let row = batch_rows(&mut rx)
+            .pop()
+            .expect("the batch's usage row was never emitted");
+        assert!(
+            (row.cost_usd - 1.0).abs() < 1e-9,
+            "priced off the model named at read time: {}",
+            row.cost_usd
         );
     }
 
@@ -4733,8 +4734,8 @@ mod tests {
                 .unwrap();
             assert_eq!(resp.status(), StatusCode::OK);
             assert_eq!(
-                spend_series(&state).await,
-                vec![("k-1".to_string(), 1_000_000)],
+                token_series(&state).await,
+                vec![("k-1".to_string(), 2_000)],
                 "{status}"
             );
         }
@@ -4783,8 +4784,8 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(
-            spend_series(&state).await,
-            vec![("k-1".to_string(), 1_000_000)],
+            token_series(&state).await,
+            vec![("k-1".to_string(), 2_000)],
             "只有带标记的那一批入账，而且记在提交者头上"
         );
     }
@@ -4845,7 +4846,7 @@ mod tests {
     }
 
     /// A listed batch that ended before this process started is not credited
-    /// to the spend counter again (the in-process store cannot tell whether a
+    /// to the counters again (the in-process store cannot tell whether a
     /// previous process did), but its usage row is still emitted: the control
     /// plane drops a copy by the row's fixed id, and a caller that only lists
     /// batches never reaches the by-id path that would emit it.
@@ -4898,13 +4899,13 @@ mod tests {
             batch_attribution_request_id("batch_old", 0, false)
         );
         assert!(
-            spend_series(&state).await.is_empty(),
+            token_series(&state).await.is_empty(),
             "a batch a previous process may have credited is credited again"
         );
     }
 
     /// One output line: 1000 + 1000 tokens, which `priced_model` prices at
-    /// 1_000_000 micro-USD.
+    /// $1.
     fn priced_output_line() -> String {
         let line = serde_json::json!({
             "id": "batch_req_1",
@@ -5086,8 +5087,8 @@ mod tests {
             "the batch still owed its credit waited behind the backfill"
         );
         assert_eq!(
-            spend_series(&state).await,
-            vec![("k-1".to_string(), 1_000_000)],
+            token_series(&state).await,
+            vec![("k-1".to_string(), 2_000)],
             "only the batch that ended after this process started is credited"
         );
     }
@@ -5165,10 +5166,7 @@ mod tests {
         );
 
         drop(held);
-        assert_eq!(
-            spend_series(&state).await,
-            vec![("k-1".to_string(), 1_000_000)]
-        );
+        assert_eq!(token_series(&state).await, vec![("k-1".to_string(), 2_000)]);
         assert_eq!(downloads_of(&upstream, "file-out").await, 1);
     }
 
@@ -5324,10 +5322,7 @@ mod tests {
             .unwrap();
         assert_eq!(app.oneshot(req).await.unwrap().status(), StatusCode::OK);
 
-        assert_eq!(
-            spend_series(&state).await,
-            vec![("k-1".to_string(), 1_000_000)]
-        );
+        assert_eq!(token_series(&state).await, vec![("k-1".to_string(), 2_000)]);
     }
 
     /// 提交者与定价模型记到上游的批次上；调用方自己写的同名键不算数，这样才伪造
@@ -5438,7 +5433,7 @@ mod tests {
         assert!(saw_batch_event, "事件本来就是幂等的，该发还是发");
         let rendered = state.metrics.render();
         assert!(
-            !rendered.contains(aisix_obs::metrics::M_LLM_SPEND_MICRO_USD_TOTAL),
+            !rendered.contains(aisix_obs::metrics::M_LLM_TOTAL_TOKENS_TOTAL),
             "前一个进程可能已经记过的批次又进了计数器: {rendered}"
         );
     }
@@ -5464,10 +5459,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(
-            spend_series(&state).await,
-            vec![("k-1".to_string(), 1_000_000)]
-        );
+        assert_eq!(token_series(&state).await, vec![("k-1".to_string(), 2_000)]);
     }
 
     #[tokio::test]

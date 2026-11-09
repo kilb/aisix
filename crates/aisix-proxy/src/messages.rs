@@ -4784,7 +4784,6 @@ fn emit_anthropic_usage_event(
             cached: metrics.cached_prompt_tokens,
             cache_read: metrics.cache_read_tokens,
             cache_creation: metrics.cache_creation_tokens,
-            spend_usd: event.cost_usd,
             client_type: state.client_classifier.classify(&client.user_agent),
         },
     );

@@ -1175,7 +1175,6 @@ pub(crate) fn record_embed_usage(
             cached: 0,
             cache_read: 0,
             cache_creation: 0,
-            spend_usd: spend as f64 / 1_000_000.0,
             // 发起者是网关自己（语义路由的分类调用），不是某个客户端。
             client_type: "gateway",
         },

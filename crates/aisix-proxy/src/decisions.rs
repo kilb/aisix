@@ -910,7 +910,7 @@ fn emit_usage_event(
     let usage = &success.usage;
     let elapsed_ms = crate::attempt::measured_ms(elapsed);
     // Priced from the dispatched row's `Model.cost`, for the event and the
-    // spend counter below.
+    // spend layer below.
     let cost_usd = crate::usage_attr::request_cost_usd(
         snap,
         &success.model_id,
@@ -976,7 +976,6 @@ fn emit_usage_event(
             input: usage.input,
             output: usage.output,
             total: usage.input.saturating_add(usage.output),
-            spend_usd: cost_usd,
             cached: usage.cached,
             cache_read: 0,
             cache_creation: 0,
@@ -1097,11 +1096,10 @@ mod tests {
     }
 
     /// The surface's money wiring. `..Default::default()` on the event compiles
-    /// and bills zero, so this pins the number on the event and on the spend
-    /// counter, cached input at its own rate, and that the caller sees the
-    /// window it spent.
+    /// and bills zero, so this pins the number on the event, cached input at
+    /// its own rate, and that the caller sees the window it spent.
     #[tokio::test]
-    async fn a_priced_decision_reaches_the_spend_metric_and_reports_the_window() {
+    async fn a_priced_decision_bills_its_event_and_reports_the_window() {
         use aisix_core::resource::ResourceEntry;
         use tower::ServiceExt;
         use wiremock::matchers::{method, path};
@@ -1200,13 +1198,6 @@ mod tests {
             .expect("UsageEvent must be emitted")
             .expect("usage_sink sender dropped");
         assert!((event.cost_usd - 1.0).abs() < 1e-9, "{}", event.cost_usd);
-        let scrape = state.metrics.render();
-        assert!(
-            scrape.lines().any(|line| {
-                line.starts_with("aisix_llm_spend_micro_usd_total{") && line.ends_with(" 1000000")
-            }),
-            "{scrape}"
-        );
     }
 
     /// A Provider Key's rule cannot write a content field through this route

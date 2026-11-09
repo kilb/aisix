@@ -3,14 +3,14 @@ import { createServer, type Server } from "node:http";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   EtcdClient,
-  metricDelta,
   ProxyClient,
-  scrapeMetrics,
   SeedClient,
   spawnApp,
+  startMockSls,
   startOpenAiUpstream,
   waitConfigPropagation,
-  type MetricSample,
+  waitForSlsLog,
+  type MockSls,
   type OpenAiUpstream,
   type SpawnedApp,
 } from "../harness/index.js";
@@ -31,7 +31,8 @@ import {
 // indistinguishable from a correct one unless something asserts the number.
 //
 // So this asserts the NUMBER, computed independently from the configured
-// rates, for both shapes.
+// rates, for both shapes: the `cost_usd` on each request's usage row, as an
+// exporter receives it.
 //
 // A cache write has a lifetime, and the longer one costs more: Anthropic
 // prices a five-minute write at 1.25x input and a one-hour write at 2x
@@ -43,6 +44,8 @@ import {
 
 const CALLER = "sk-cached-pricing-e2e";
 const HASH = createHash("sha256").update(CALLER).digest("hex");
+const CREDENTIAL_REF = "mock";
+const LOGSTORE = "cached-token-pricing";
 
 // Distinct enough that mixing two buckets up cannot land on the same total.
 const IN_PER_1K = 1.0;
@@ -129,6 +132,7 @@ describe("prompt-cached tokens are priced at their own rate", () => {
   let upstream: OpenAiUpstream | undefined;
   let streamUpstream: OpenAiUpstream | undefined;
   let splitUpstream: Awaited<ReturnType<typeof startSplitUpstream>> | undefined;
+  let sls: MockSls | undefined;
   let etcdReachable = false;
 
   beforeAll(async () => {
@@ -201,8 +205,24 @@ describe("prompt-cached tokens are priced at their own rate", () => {
       ],
     });
     splitUpstream = await startSplitUpstream();
-    app = await spawnApp();
+    sls = await startMockSls();
+    app = await spawnApp({
+      extraEnv: {
+        [`SLS_CRED_${CREDENTIAL_REF.toUpperCase()}_AK_ID`]: "mock-akid",
+        [`SLS_CRED_${CREDENTIAL_REF.toUpperCase()}_AK_SECRET`]: "mock-secret",
+      },
+    });
     const seed = new SeedClient(etcd, app.etcdPrefix);
+    await seed.createObservabilityExporter({
+      name: "sls-cached-token-pricing",
+      enabled: true,
+      kind: "aliyun_sls",
+      endpoint: sls.url,
+      project: "aisix-e2e-obs",
+      logstore: LOGSTORE,
+      credential_ref: CREDENTIAL_REF,
+      content_mode: "metadata_only",
+    });
 
     const openaiPk = await seed.createProviderKey({
       display_name: "ctp-openai-pk",
@@ -311,26 +331,22 @@ describe("prompt-cached tokens are priced at their own rate", () => {
     await new Promise<void>((resolve) =>
       splitUpstream ? splitUpstream.server.close(() => resolve()) : resolve(),
     );
+    await sls?.close();
   });
 
-  const scrape = () => scrapeMetrics(app!.metricsUrl);
-
-  async function spendDelta(
-    before: MetricSample[],
-    endpoint: string,
-    model: string,
-  ): Promise<number> {
-    for (let i = 0; i < 40; i++) {
-      const got = metricDelta(
-        before,
-        await scrape(),
-        "aisix_llm_spend_micro_usd_total",
-        { endpoint, model },
-      );
-      if (got !== 0) return got;
-      await new Promise((r) => setTimeout(r, 50));
-    }
-    return 0;
+  /** What the usage row of the request `res` answered bills, in micro-USD. */
+  async function billedFor(res: Response, model: string): Promise<number> {
+    const requestId = res.headers.get("x-aisix-request-id") ?? "";
+    expect(requestId, "the response names its request").not.toBe("");
+    const row = await waitForSlsLog(
+      sls!,
+      LOGSTORE,
+      (log) => log.get("request_id") === requestId,
+      `the usage row of ${requestId}`,
+      20_000,
+    );
+    expect(row.get("requested_model")).toBe(model);
+    return micro(Number(row.get("cost_usd") ?? "0"));
   }
 
   function chat(model: string, stream = false) {
@@ -371,9 +387,9 @@ describe("prompt-cached tokens are priced at their own rate", () => {
     }
     await waitConfigPropagation(async () => (await chat("ctp-chat")).ok);
 
-    const before = await scrape();
-    expect((await chat("ctp-chat")).status).toBe(200);
-    const got = await spendDelta(before, "/v1/chat/completions", "ctp-chat");
+    const res = await chat("ctp-chat");
+    expect(res.status).toBe(200);
+    const got = await billedFor(res, "ctp-chat");
 
     // 800 of the 1000 prompt tokens were cache hits, so only 200 are fresh.
     const want = micro(
@@ -397,9 +413,9 @@ describe("prompt-cached tokens are priced at their own rate", () => {
     }
     await waitConfigPropagation(async () => (await messages()).ok);
 
-    const before = await scrape();
-    expect((await messages()).status).toBe(200);
-    const got = await spendDelta(before, "/v1/messages", "ctp-messages");
+    const res = await messages();
+    expect(res.status).toBe(200);
+    const got = await billedFor(res, "ctp-messages");
 
     // input_tokens is already exclusive of both cache counters, so all three
     // buckets are additive.
@@ -430,7 +446,6 @@ describe("prompt-cached tokens are priced at their own rate", () => {
     }
     await waitConfigPropagation(async () => (await messages("ctp-messages-openai")).ok);
 
-    const before = await scrape();
     const res = await messages("ctp-messages-openai");
     expect(res.status).toBe(200);
     const body = (await res.json()) as { usage?: Record<string, number> };
@@ -438,7 +453,7 @@ describe("prompt-cached tokens are priced at their own rate", () => {
     expect(body.usage?.cache_read_input_tokens, "the cache hits, reported apart").toBe(800);
     expect(body.usage?.output_tokens).toBe(100);
 
-    const got = await spendDelta(before, "/v1/messages", "ctp-messages-openai");
+    const got = await billedFor(res, "ctp-messages-openai");
     expect(
       got,
       "800 cached prompt tokens must bill at the cached rate, not as fresh input",
@@ -456,7 +471,6 @@ describe("prompt-cached tokens are priced at their own rate", () => {
       return r.ok;
     });
 
-    const before = await scrape();
     const res = await messages("ctp-messages-openai-stream", true);
     expect(res.status).toBe(200);
     const sse = await res.text();
@@ -473,7 +487,7 @@ describe("prompt-cached tokens are priced at their own rate", () => {
     expect(data.usage?.input_tokens, "only the fresh part of the prompt").toBe(200);
     expect(data.usage?.cache_read_input_tokens, "the cache hits, reported apart").toBe(800);
 
-    const got = await spendDelta(before, "/v1/messages", "ctp-messages-openai-stream");
+    const got = await billedFor(res, "ctp-messages-openai-stream");
     expect(got).toBe(WANT_CROSS());
   }, 120_000);
 
@@ -484,9 +498,9 @@ describe("prompt-cached tokens are priced at their own rate", () => {
     }
     await waitConfigPropagation(async () => (await chat("ctp-chat-nocacherate")).ok);
 
-    const before = await scrape();
-    expect((await chat("ctp-chat-nocacherate")).status).toBe(200);
-    const got = await spendDelta(before, "/v1/chat/completions", "ctp-chat-nocacherate");
+    const res = await chat("ctp-chat-nocacherate");
+    expect(res.status).toBe(200);
+    const got = await billedFor(res, "ctp-chat-nocacherate");
 
     // Every prompt token at the input rate, cached or not — the behaviour
     // that existed before the cache rates did. Upgrading must not move an
@@ -537,11 +551,10 @@ describe("prompt-cached tokens are priced at their own rate", () => {
         }
         await callerAuthenticates();
 
-        const before = await scrape();
         const res = await send("ctp-1h", stream);
         const text = await res.text();
         expect(res.status, text).toBe(200);
-        const got = await spendDelta(before, endpoint, "ctp-1h");
+        const got = await billedFor(res, "ctp-1h");
         expect(
           got,
           `1000 of the 4000 written tokens were written for one hour and bill at ` +
@@ -559,11 +572,10 @@ describe("prompt-cached tokens are priced at their own rate", () => {
     }
     await callerAuthenticates();
 
-    const before = await scrape();
     const res = await messages("ctp-1h-norate");
     const text = await res.text();
     expect(res.status, text).toBe(200);
-    const got = await spendDelta(before, "/v1/messages", "ctp-1h-norate");
+    const got = await billedFor(res, "ctp-1h-norate");
     expect(
       got,
       "a `cost` written before the one-hour rate existed must report what it reported before",

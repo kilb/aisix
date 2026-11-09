@@ -3025,8 +3025,6 @@ fn emit_usage_event(
     crate::usage_attr::apply_caller_identity(&mut event, client.jwt.as_ref(), &client.caller);
     let usage_model =
         crate::usage_attr::usage_event_model_label(snap, &event.requested_model).into_owned();
-    // Read before the event is handed over, for the spend counter below.
-    let cost_usd = event.cost_usd;
     crate::usage_attr::emit_usage(
         state,
         snap,
@@ -3056,7 +3054,6 @@ fn emit_usage_event(
             input: usage.prompt_tokens,
             output: usage.completion_tokens,
             total: usage.prompt_tokens.saturating_add(usage.completion_tokens),
-            spend_usd: cost_usd,
             // No upstream on this surface reports prompt-cache detail.
             cached: 0,
             cache_read: 0,

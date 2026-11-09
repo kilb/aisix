@@ -5713,7 +5713,6 @@ fn emit_usage_event(
             cached: usage.cached_prompt_tokens,
             cache_read: usage.cache_read_tokens,
             cache_creation: usage.cache_creation_tokens,
-            spend_usd: event.cost_usd,
             client_type: state.client_classifier.classify(&client.user_agent),
         },
     );

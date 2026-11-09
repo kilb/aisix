@@ -932,10 +932,6 @@ pub(crate) struct Tokens<'a> {
     pub cached: u32,
     pub cache_read: u32,
     pub cache_creation: u32,
-    /// 这次请求的花费（美元），写进 `aisix_llm_spend_micro_usd_total`。
-    /// 必须显式给值：`..Default::default()` 能编译，但会
-    /// 把这次请求静默记成零花费。
-    pub spend_usd: f64,
     /// Normalised inbound client for the by-client series
     /// (`state.client_classifier.classify(&client.user_agent)`).
     pub client_type: &'a str,
@@ -945,8 +941,8 @@ pub(crate) struct Tokens<'a> {
 /// [`record`].
 ///
 /// Three families ride along, and each had a DIFFERENT endpoint coverage
-/// before #1234's follow-up: the `aisix_llm_*_tokens_total` and
-/// `aisix_llm_spend_micro_usd_total` families were chat and messages only,
+/// before #1234's follow-up: the `aisix_llm_*_tokens_total`
+/// families were chat and messages only,
 /// `aisix_llm_tokens_by_client_total` was chat, messages and responses, and
 /// the legacy `aisix_tokens_consumed_total` was chat ALONE. A gateway that
 /// billed a customer for `/v1/embeddings` reported none of those tokens.
@@ -998,7 +994,6 @@ pub(crate) fn record_usage(
             cached_input_tokens: tokens.cached,
             cache_read_input_tokens: tokens.cache_read,
             cache_creation_input_tokens: tokens.cache_creation,
-            spend_usd: tokens.spend_usd,
         },
     );
     // Deliberately NOT keyed on the labels above: this family is

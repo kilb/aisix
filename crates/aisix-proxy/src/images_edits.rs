@@ -1501,10 +1501,10 @@ mod tests {
         assert!(!wire.contains("BLOCKME"), "{wire}");
     }
     /// The surface's money wiring. Every token this edit reports is priced off
-    /// the dispatched row, on the event and on the spend counter, and the
-    /// caller sees the window it spent.
+    /// the dispatched row on the event, and the caller sees the window it
+    /// spent.
     #[tokio::test]
-    async fn a_priced_edit_reaches_the_spend_metric_and_reports_the_window() {
+    async fn a_priced_edit_bills_its_event_and_reports_the_window() {
         use aisix_obs::UsageSink;
         let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
@@ -1551,13 +1551,6 @@ mod tests {
             .expect("UsageEvent must be emitted")
             .expect("usage_sink sender dropped");
         assert!((ev.cost_usd - 10.685).abs() < 1e-9, "{}", ev.cost_usd);
-        let scrape = state.metrics.render();
-        assert!(
-            scrape.lines().any(|line| {
-                line.starts_with("aisix_llm_spend_micro_usd_total{") && line.ends_with(" 10685000")
-            }),
-            "{scrape}"
-        );
     }
 
     /// Generations and edits answer in one shape, so a mask rule rewrites a

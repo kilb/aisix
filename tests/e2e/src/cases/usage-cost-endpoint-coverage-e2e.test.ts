@@ -6,27 +6,28 @@ import {
   metricDelta,
   scrapeMetrics,
   spawnApp,
+  startMockSls,
   startOpenAiUpstream,
   waitConfigPropagation,
-  type MetricSample,
+  waitForSlsLog,
+  type MockSls,
   type OpenAiUpstream,
   type SpawnedApp,
 } from "../harness/index.js";
 
-// `aisix_llm_spend_micro_usd_total` is the one series an operator reads to
-// answer "what did this key cost me", and it had no e2e at all: the series
-// is skipped whenever spend is zero, and no spec ever configured a price,
-// so a scrape with the family entirely absent was indistinguishable from a
-// scrape of un-priced traffic. Every endpoint could report nothing forever
-// and every test would stay green.
+// The `cost_usd` on a usage row is what an exporter's reader adds up to
+// answer "what did this key cost me". It is zero whenever the row has no
+// price, so a row that dropped it reads exactly like un-priced traffic:
+// every endpoint could report nothing forever and a test that never
+// configured a price would stay green.
 //
-// What the family owes a caller, per endpoint:
+// What a row owes a caller, per endpoint:
 //
-//   spend = input_tokens/1000 * input_per_1k + output_tokens/1000 * output_per_1k
+//   cost_usd = input_tokens/1000 * input_per_1k + output_tokens/1000 * output_per_1k
 //
-// and nothing at all when the operator set no price on the row — the price
-// is opt-in, so a deployment whose billing lives upstream of the gateway
-// must not see a locally-invented number appear next to it.
+// and zero when the operator set no price on the model — the price is
+// opt-in, so a deployment whose billing lives upstream of the gateway must
+// not see a locally-invented number appear next to it.
 //
 // The prices below are deliberately different per model, so a handler that
 // priced against the wrong row (the caller-addressed alias, a sibling
@@ -34,6 +35,8 @@ import {
 // coincidence.
 
 const CALLER_PLAINTEXT = "sk-spend-metrics-caller";
+const CREDENTIAL_REF = "mock";
+const LOGSTORE = "usage-cost-coverage";
 const CALLER_KEY_HASH = createHash("sha256")
   .update(CALLER_PLAINTEXT)
   .digest("hex");
@@ -66,7 +69,7 @@ const PRICES = {
   [EMBED_MODEL]: { input_per_1k: 0.5, output_per_1k: 9 },
 } as const;
 
-/** The contract, in the metric's own unit. */
+/** The contract, in micro-USD. */
 function expectedMicroUsd(
   model: keyof typeof PRICES,
   inputTokens: number,
@@ -78,8 +81,9 @@ function expectedMicroUsd(
   return Math.round(usd * 1_000_000);
 }
 
-describe("spend metric endpoint coverage e2e", () => {
+describe("usage row cost endpoint coverage e2e", () => {
   let app: SpawnedApp | undefined;
+  let sls: MockSls | undefined;
   let chatUpstream: OpenAiUpstream | undefined;
   let streamUpstream: OpenAiUpstream | undefined;
   let respUpstream: OpenAiUpstream | undefined;
@@ -95,12 +99,28 @@ describe("spend metric endpoint coverage e2e", () => {
     streamUpstream = await startOpenAiUpstream({ streamEvents: streamEvents() });
     respUpstream = await startOpenAiUpstream({ nonStreamBody: responsesBody() });
     embedUpstream = await startOpenAiUpstream({ nonStreamBody: embeddingBody() });
-    app = await spawnApp();
+    sls = await startMockSls();
+    app = await spawnApp({
+      extraEnv: {
+        [`SLS_CRED_${CREDENTIAL_REF.toUpperCase()}_AK_ID`]: "mock-akid",
+        [`SLS_CRED_${CREDENTIAL_REF.toUpperCase()}_AK_SECRET`]: "mock-secret",
+      },
+    });
     const seed = new SeedClient(etcd, app.etcdPrefix);
+    await seed.createObservabilityExporter({
+      name: "sls-usage-cost-coverage",
+      enabled: true,
+      kind: "aliyun_sls",
+      endpoint: sls.url,
+      project: "aisix-e2e-obs",
+      logstore: LOGSTORE,
+      credential_ref: CREDENTIAL_REF,
+      content_mode: "metadata_only",
+    });
 
     // `/v1/messages` and the un-priced control share the chat upstream:
     // same bytes back, different row, so any difference in the recorded
-    // spend is the row's price and nothing else.
+    // cost is the row's price and nothing else.
     const rows: Array<[string, OpenAiUpstream, Record<string, unknown> | undefined]> = [
       [CHAT_MODEL, chatUpstream, PRICES[CHAT_MODEL]],
       [STREAM_MODEL, streamUpstream, PRICES[STREAM_MODEL]],
@@ -136,7 +156,18 @@ describe("spend metric endpoint coverage e2e", () => {
     await streamUpstream?.close();
     await respUpstream?.close();
     await embedUpstream?.close();
+    await sls?.close();
   });
+
+  /** The usage row of `requestId`, as the exporter received it. */
+  const rowOf = (requestId: string) =>
+    waitForSlsLog(
+      sls!,
+      LOGSTORE,
+      (log) => log.get("request_id") === requestId,
+      `the usage row of ${requestId}`,
+      20_000,
+    );
 
   test("every usage-bearing endpoint reports what its row prices", async (ctx) => {
     if (!etcdReachable || !app) {
@@ -156,7 +187,7 @@ describe("spend metric endpoint coverage e2e", () => {
       endpoint: string;
       model: keyof typeof PRICES;
       expected: number;
-      drive: () => Promise<{ status: number }>;
+      drive: () => Promise<{ status: number; requestId: string }>;
     }> = [
       {
         endpoint: "/v1/chat/completions",
@@ -207,20 +238,11 @@ describe("spend metric endpoint coverage e2e", () => {
     const missing: string[] = [];
     const wrong: string[] = [];
     for (const c of cases) {
-      const before = await scrape(app);
-      expect((await c.drive()).status, `${c.endpoint} (${c.model})`).toBe(200);
-      // Streaming spend is recorded when the stream terminates, which is
-      // after the response body is drained but not necessarily before the
-      // next scrape; poll rather than race it.
-      let got = 0;
-      for (let i = 0; i < 40; i++) {
-        got = metricDelta(before, await scrape(app), "aisix_llm_spend_micro_usd_total", {
-          endpoint: c.endpoint,
-          model: c.model,
-        });
-        if (got !== 0) break;
-        await new Promise((r) => setTimeout(r, 50));
-      }
+      const sent = await c.drive();
+      expect(sent.status, `${c.endpoint} (${c.model})`).toBe(200);
+      const row = await rowOf(sent.requestId);
+      expect(row.get("requested_model"), c.endpoint).toBe(c.model);
+      const got = Math.round(Number(row.get("cost_usd") ?? "0") * 1_000_000);
       if (got === 0) missing.push(`${c.endpoint} (${c.model})`);
       else if (got !== c.expected) {
         wrong.push(`${c.endpoint} (${c.model}): got ${got}, want ${c.expected}`);
@@ -229,8 +251,8 @@ describe("spend metric endpoint coverage e2e", () => {
 
     expect(
       missing,
-      `these endpoints billed tokens but reported no spend — the series is ` +
-        `absent, which reads exactly like "no traffic yet":\n` +
+      `these endpoints billed tokens but their rows report no cost, which ` +
+        `reads exactly like un-priced traffic:\n` +
         missing.map((m) => `  ${m}`).join("\n"),
     ).toEqual([]);
     expect(
@@ -240,21 +262,18 @@ describe("spend metric endpoint coverage e2e", () => {
     ).toEqual([]);
   }, 120_000);
 
-  test("a row with no price reports no spend at all", async (ctx) => {
+  test("a model with no price reports no cost at all", async (ctx) => {
     if (!etcdReachable || !app) {
       ctx.skip();
       return;
     }
 
     const before = await scrape(app);
-    expect(
-      (
-        await post("/v1/chat/completions", {
-          model: UNPRICED_MODEL,
-          messages: [{ role: "user", content: "hi" }],
-        })
-      ).status,
-    ).toBe(200);
+    const sent = await post("/v1/chat/completions", {
+      model: UNPRICED_MODEL,
+      messages: [{ role: "user", content: "hi" }],
+    });
+    expect(sent.status).toBe(200);
     const after = await scrape(app);
 
     // Tokens still flow — this is a live, billed request, not a no-op.
@@ -264,15 +283,15 @@ describe("spend metric endpoint coverage e2e", () => {
       }),
     ).toBe(CHAT_IN);
     // …but the gateway invents no price for it.
-    expect(
-      metricDelta(before, after, "aisix_llm_spend_micro_usd_total", {
-        model: UNPRICED_MODEL,
-      }),
-      "an un-priced row must not produce a spend figure",
-    ).toBe(0);
+    const row = await rowOf(sent.requestId);
+    expect(row.get("prompt_tokens")).toBe(String(CHAT_IN));
+    expect(Number(row.get("cost_usd")), "an un-priced model must not produce a cost").toBe(0);
   }, 30_000);
 
-  async function post(path: string, body: unknown): Promise<{ status: number }> {
+  async function post(
+    path: string,
+    body: unknown,
+  ): Promise<{ status: number; requestId: string }> {
     const res = await fetch(`${app!.proxyUrl}${path}`, {
       method: "POST",
       headers: {
@@ -285,11 +304,11 @@ describe("spend metric endpoint coverage e2e", () => {
     // Drain: a streamed body must reach its terminal event before the
     // stream-completion telemetry runs.
     await res.text();
-    return { status: res.status };
+    return { status: res.status, requestId: res.headers.get("x-aisix-request-id") ?? "" };
   }
 });
 
-async function scrape(app: SpawnedApp | undefined): Promise<MetricSample[]> {
+async function scrape(app: SpawnedApp | undefined) {
   return scrapeMetrics(app!.metricsUrl);
 }
 

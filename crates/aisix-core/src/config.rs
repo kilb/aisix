@@ -1418,8 +1418,9 @@ impl ObservabilityConfig {
             .any(|name| RETIRED_METRIC_FAMILIES.contains(&name.as_str()))
         {
             out.push(
-                "observability.metrics.labels names a metric family this gateway no longer \
-                 emits; the entry is ignored. Delete it.",
+                "observability.metrics.labels names aisix_llm_spend_micro_usd_total, which \
+                 this gateway no longer emits; the entry is ignored. Delete it. Spend is the \
+                 cost the control plane records for each request.",
             );
         }
         out
@@ -1441,10 +1442,7 @@ impl ObservabilityConfig {
 /// ignored, and warned about at boot
 /// ([`ObservabilityConfig::retired_settings`]), so a config written for an
 /// older gateway still loads. Any other unknown family name fails boot.
-///
-/// `aisix_llm_spend_micro_usd_total` does not belong here: this gateway still
-/// emits it.
-pub const RETIRED_METRIC_FAMILIES: &[&str] = &[];
+pub const RETIRED_METRIC_FAMILIES: &[&str] = &["aisix_llm_spend_micro_usd_total"];
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[cfg_attr(test, derive(schemars::JsonSchema))]
@@ -4262,11 +4260,11 @@ not_a_section:
         }
     }
 
-    /// This gateway still emits the spend family, so a labels entry for it is
-    /// a real selection: telling the operator the
-    /// family is gone and the entry ignored would be false on both counts.
+    /// A labels entry for a family the gateway no longer emits loads and is
+    /// warned about, rather than stopping a gateway configured for an older
+    /// release from booting.
     #[test]
-    fn a_labels_entry_for_the_spend_family_is_not_reported_as_retired() {
+    fn a_labels_entry_for_a_retired_metric_family_loads_and_warns() {
         let f = write_yaml(
             r#"
 etcd:
@@ -4284,8 +4282,9 @@ observability:
         );
         let cfg = Config::load_from_path(Some(f.path())).unwrap();
         let warnings = cfg.observability.retired_settings();
-        assert!(warnings.is_empty(), "{warnings:?}");
-        assert!(!RETIRED_METRIC_FAMILIES.contains(&"aisix_llm_spend_micro_usd_total"));
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("aisix_llm_spend_micro_usd_total"));
+        assert!(warnings[0].contains("control plane"));
     }
 
     #[test]
