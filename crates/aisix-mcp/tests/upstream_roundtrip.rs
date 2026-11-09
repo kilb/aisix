@@ -15,12 +15,16 @@ use std::sync::Arc;
 use aisix_mcp::{EphemeralBridge, McpBridge, McpUpstream, OAuthClientConfig, RmcpBridge};
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ListToolsResult,
-    PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
+    PaginatedRequestParams, ServerCapabilities, ServerConfig, Tool,
 };
 use rmcp::service::RequestContext;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use rmcp::{ErrorData, RoleServer, ServerHandler};
+
+/// Text length of the `oversized` answer: 1 MiB past the 16 MiB rmcp allows
+/// one upstream response, JSON body or SSE event.
+const OVERSIZED_ANSWER: usize = 17 * 1024 * 1024;
 
 /// A minimal real MCP server exposing one tool, `echo`, that returns its
 /// `text` argument back as a text content block.
@@ -64,11 +68,18 @@ impl ServerHandler for EchoServer {
         if text == "sleep" {
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         }
+        // An `oversized` argument answers past the client's response cap.
+        if text == "oversized" {
+            return Ok(CallToolResult::success(vec![ContentBlock::text(
+                "x".repeat(OVERSIZED_ANSWER),
+            )])
+            .into());
+        }
         Ok(CallToolResult::success(vec![ContentBlock::text(text)]).into())
     }
 
-    fn get_info(&self) -> ServerInfo {
-        let mut info = ServerInfo::default();
+    fn get_info(&self) -> ServerConfig {
+        let mut info = ServerConfig::default();
         info.capabilities = ServerCapabilities::builder().enable_tools().build();
         info
     }
@@ -405,6 +416,103 @@ async fn upstream_401_without_challenge_also_invalidates_the_cached_token() {
         2,
         "a bare upstream 401 must also invalidate the cached token"
     );
+}
+
+/// Serve `app` on an ephemeral port; return its bound address.
+async fn serve(app: axum::Router) -> SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral port");
+    let addr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve");
+    });
+    addr
+}
+
+/// A bare `401` whose body is a JSON-RPC error: a server reporting a rejected
+/// token in-band, without a `WWW-Authenticate` challenge.
+async fn reject_with_json_rpc_401() -> axum::response::Response {
+    use axum::response::IntoResponse;
+    (
+        axum::http::StatusCode::UNAUTHORIZED,
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        r#"{"jsonrpc":"2.0","id":0,"error":{"code":-32001,"message":"token revoked"}}"#,
+    )
+        .into_response()
+}
+
+#[tokio::test]
+async fn upstream_401_with_a_json_rpc_body_also_invalidates_the_cached_token() {
+    let (token_url, mints) = spawn_token_endpoint().await;
+    let addr =
+        serve(axum::Router::new().route("/mcp", axum::routing::any(reject_with_json_rpc_401)))
+            .await;
+
+    let upstream = McpUpstream::new(format!("http://{addr}/mcp")).with_oauth2(OAuthClientConfig {
+        client_id: "cid-401-json-rpc".to_string(),
+        client_secret: "cs".to_string(),
+        token_url,
+        scopes: Vec::new(),
+    });
+    let bridge = EphemeralBridge::new(upstream);
+
+    assert!(bridge.list_tools().await.is_err());
+    assert!(bridge.list_tools().await.is_err());
+    assert_eq!(
+        mints.load(Ordering::SeqCst),
+        2,
+        "a 401 is a rejected token even when its body is a JSON-RPC error"
+    );
+}
+
+/// Call the `oversized` tool on an echo server answering in the framing
+/// `config` selects, and return the error the call must fail with.
+async fn call_for_an_oversized_answer(config: StreamableHttpServerConfig) -> String {
+    let service = StreamableHttpService::new(
+        || Ok(EchoServer),
+        Arc::new(LocalSessionManager::default()),
+        config,
+    );
+    let addr = serve(axum::Router::new().nest_service("/mcp", service)).await;
+    // A deadline well past the time a capped read takes, so an uncapped one
+    // shows up as a success or a timeout rather than as the cap's error.
+    let upstream = McpUpstream::new(format!("http://{addr}/mcp"))
+        .with_timeout(std::time::Duration::from_secs(30));
+    let bridge = RmcpBridge::connect(&upstream).await.expect("connect");
+    let msg = bridge
+        .call_tool("echo", serde_json::json!({ "text": "oversized" }))
+        .await
+        .map(|_| ())
+        .expect_err("an answer past the response cap must fail the call")
+        .to_string();
+    assert!(!msg.contains("timed out"), "failed on the deadline: {msg}");
+    msg
+}
+
+/// An upstream answering one `tools/call` with a non-streaming JSON body past
+/// 16 MiB fails the call naming the cap instead of buffering the whole body
+/// (RUSTSEC-2026-0462).
+#[tokio::test]
+async fn an_oversized_json_answer_fails_the_call_naming_the_cap() {
+    let mut config = StreamableHttpServerConfig::default();
+    config.legacy_session_mode = false;
+    config.json_response = true;
+    let msg = call_for_an_oversized_answer(config).await;
+    assert!(
+        msg.contains("exceeded the maximum size of 16777216 bytes"),
+        "{msg}"
+    );
+}
+
+/// The same answer delivered as one SSE event fails too: the bridge keeps
+/// rmcp's per-event cap, so the SSE framing is no way around the JSON body's.
+/// rmcp closes the response stream on the oversized event, so the call fails
+/// as a closed transport rather than naming the cap.
+#[tokio::test]
+async fn an_oversized_sse_answer_fails_the_call() {
+    let msg = call_for_an_oversized_answer(StreamableHttpServerConfig::default()).await;
+    assert!(msg.contains("Transport closed"), "{msg}");
 }
 
 #[tokio::test]

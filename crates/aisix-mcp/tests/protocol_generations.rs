@@ -4,9 +4,11 @@
 //! the version-negotiation behavior pinned by #1144/#1148 must not
 //! drift:
 //!
-//! - `initialize` echoes a supported requested version exactly, and falls
-//!   back to `2025-11-25` (the endpoint's historical answer) for anything
-//!   else — never to whatever the SDK's `LATEST` alias happens to be.
+//! - `initialize` echoes a supported requested version exactly when that
+//!   version has the handshake, and falls back to `2025-11-25` (the
+//!   endpoint's historical answer) for anything else — `2026-07-28`, which
+//!   has no `initialize`, included — never to whatever the SDK's `LATEST`
+//!   alias happens to be.
 //! - `server/discover` advertises exactly `SUPPORTED_PROTOCOL_VERSION_NAMES`.
 //! - Modern requests are served without any `Mcp-Session-Id`, carry
 //!   `resultType: "complete"`, and get the honest do-not-cache hints
@@ -24,7 +26,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use aisix_mcp::{streamable_http_service, McpBridge, McpError, McpGateway, McpTool, McpToolResult};
-use rmcp::model::{CallToolRequestParams, ClientInfo, ProtocolVersion};
+use rmcp::model::{CallToolRequestParams, ClientConfig, ProtocolVersion};
 use rmcp::transport::StreamableHttpClientTransport;
 use rmcp::{ClientLifecycleMode, ClientServiceExt, ServiceExt};
 
@@ -120,16 +122,24 @@ fn initialize_body(protocol_version: &str) -> serde_json::Value {
 }
 
 /// `initialize` echoes a requested version exactly when it is one we
-/// support, for BOTH generations' Streamable HTTP clients.
+/// support that has the handshake. `2026-07-28` has none — its versions are
+/// carried per request and advertised by `server/discover` — so an
+/// `initialize` naming it is answered with the newest handshake version,
+/// `2025-11-25`, which the client can still speak.
 #[tokio::test]
 async fn initialize_echoes_supported_versions_exactly() {
     let addr = spawn_gateway().await;
     for version in aisix_mcp::SUPPORTED_PROTOCOL_VERSION_NAMES {
         let (status, headers, body) = post_raw(addr, &[], initialize_body(version)).await;
         assert_eq!(status, 200, "initialize {version}: {body}");
+        let expected = if *version == "2026-07-28" {
+            "2025-11-25"
+        } else {
+            version
+        };
         assert_eq!(
-            body["result"]["protocolVersion"], *version,
-            "supported version must be echoed exactly: {body}"
+            body["result"]["protocolVersion"], expected,
+            "initialize {version} must be answered with {expected}: {body}"
         );
         // Stateless serving on every generation: no session is minted.
         assert!(
@@ -393,7 +403,7 @@ async fn legacy_results_keep_their_wire_shape() {
 #[tokio::test]
 async fn modern_rmcp_client_lifecycle_works_end_to_end() {
     let addr = spawn_gateway().await;
-    let client = ClientInfo::default()
+    let client = ClientConfig::default()
         .serve_with_lifecycle(
             StreamableHttpClientTransport::from_uri(format!("http://{addr}/mcp")),
             ClientLifecycleMode::Discover {
@@ -456,8 +466,8 @@ impl rmcp::ServerHandler for UpstreamEcho {
         )
     }
 
-    fn get_info(&self) -> rmcp::model::ServerInfo {
-        let mut info = rmcp::model::ServerInfo::default();
+    fn get_info(&self) -> rmcp::model::ServerConfig {
+        let mut info = rmcp::model::ServerConfig::default();
         info.capabilities = rmcp::model::ServerCapabilities::builder()
             .enable_tools()
             .build();
@@ -511,7 +521,7 @@ async fn modern_client_through_real_bridge_and_upstream() {
         axum::serve(gw_listener, app).await.expect("serve gateway");
     });
 
-    let client = ClientInfo::default()
+    let client = ClientConfig::default()
         .serve_with_lifecycle(
             StreamableHttpClientTransport::from_uri(format!("http://{gw_addr}/mcp")),
             ClientLifecycleMode::Discover {

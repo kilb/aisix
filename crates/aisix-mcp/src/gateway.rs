@@ -35,7 +35,8 @@ use std::sync::{Arc, OnceLock};
 
 use rmcp::model::{
     CacheScope, CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ErrorData,
-    ListToolsResult, PaginatedRequestParams, ProtocolVersion, ServerCapabilities, ServerInfo, Tool,
+    ListToolsResult, PaginatedRequestParams, ProtocolVersion, ServerCapabilities, ServerConfig,
+    Tool,
 };
 use rmcp::service::RequestContext;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
@@ -1015,7 +1016,8 @@ impl ServerHandler for McpGateway {
     /// default (`ProtocolVersion::KNOWN_VERSIONS`, which would advertise
     /// every version rmcp has ever heard of — including ones this endpoint
     /// does not serve). Consulted by rmcp for `initialize` negotiation (an
-    /// exact match is echoed; anything else falls back to
+    /// exact match of a version that has the handshake is echoed; anything
+    /// else, `2026-07-28` included, falls back to
     /// `get_info().protocol_version`) and advertised verbatim in
     /// `server/discover`.
     ///
@@ -1025,8 +1027,8 @@ impl ServerHandler for McpGateway {
         Cow::Borrowed(SUPPORTED_PROTOCOL_VERSIONS)
     }
 
-    fn get_info(&self) -> ServerInfo {
-        let mut info = ServerInfo::default();
+    fn get_info(&self) -> ServerConfig {
+        let mut info = ServerConfig::default();
         // Pinned, not `ProtocolVersion::default()`: this is the version a
         // legacy `initialize` falls back to when the client requests one we
         // don't list in `supported_protocol_versions` — the same answer the

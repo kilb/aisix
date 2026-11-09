@@ -20,7 +20,7 @@ use aisix_gateway::redact_url_for_log;
 use async_trait::async_trait;
 use futures::future::{BoxFuture, FutureExt};
 use http::{HeaderName, HeaderValue};
-use rmcp::model::{CallToolRequestParams, CallToolResponse, ClientInfo, ProtocolVersion};
+use rmcp::model::{CallToolRequestParams, CallToolResponse, ClientConfig, ProtocolVersion};
 use rmcp::service::{ClientInitializeError, RoleClient, RunningService, ServiceError};
 use rmcp::transport::streamable_http_client::{
     SseError, StreamableHttpClientTransportConfig, StreamableHttpError,
@@ -558,13 +558,13 @@ pub trait McpBridge: Send + Sync {
 /// `rmcp`-backed [`McpBridge`]: holds one running client session to the
 /// upstream. Dropping it tears the session down.
 pub struct RmcpBridge {
-    running: RunningService<RoleClient, ClientInfo>,
+    running: RunningService<RoleClient, ClientConfig>,
     timeout: Duration,
 }
 
-/// Base transport configuration for one upstream connection. Two rmcp
-/// defaults are deliberately overridden, both to keep "one inbound call =
-/// one upstream execution" true and the 1.8-era transport behavior stable:
+/// Base transport configuration for one upstream connection. One rmcp
+/// default is deliberately overridden, to keep "one inbound call = one
+/// upstream execution" true:
 ///
 /// - `reinit_on_expired_session = false`. On a session-expired 404 the SDK
 ///   default transparently re-runs `initialize` and RE-SENDS the in-flight
@@ -573,15 +573,15 @@ pub struct RmcpBridge {
 ///   (the session-layer sibling of the MRTR auto-retry disabled in
 ///   [`McpBridge::call_tool`]). The gateway surfaces the failure instead;
 ///   [`EphemeralBridge`] opens a fresh session on the next operation anyway.
-/// - `max_sse_event_size = usize::MAX`. 3.x introduced a 16 MiB per-event
-///   cap on upstream SSE frames that 1.8 never had — a large image/audio
-///   tool result delivered over SSE would fail while the identical JSON
-///   response succeeds. Unbounded preserves the shipped behavior; the
-///   per-operation deadline still bounds the read.
+///
+/// The per-event SSE cap stays at rmcp's 16 MiB default. rmcp also caps a
+/// non-streaming JSON response at 16 MiB (fixed, RUSTSEC-2026-0462), so an
+/// upstream answer over 16 MiB fails the same way in either framing. Lifting
+/// the SSE cap alone would let an upstream that never ends an event grow the
+/// gateway's memory until the operation deadline.
 fn transport_config(url: &str) -> StreamableHttpClientTransportConfig {
     let mut config = StreamableHttpClientTransportConfig::with_uri(url.to_string());
     config.reinit_on_expired_session = false;
-    config.max_sse_event_size = usize::MAX;
     config
 }
 
@@ -714,9 +714,9 @@ impl RmcpBridge {
             let transport =
                 StreamableHttpClientTransport::with_client(shared_http_client(), config);
             // Lifecycle follows the configured protocol revision. The
-            // handler is `ClientInfo::default()` on BOTH paths — identical
+            // handler is `ClientConfig::default()` on BOTH paths — identical
             // handshake bytes to the previous unit handler (whose default
-            // `get_info()` returns exactly `ClientInfo::default()`), plus
+            // `get_info()` returns exactly `ClientConfig::default()`), plus
             // the per-request metadata the Discover lifecycle needs.
             let lifecycle = match upstream.protocol {
                 McpProtocol::LegacyHandshake => ClientLifecycleMode::Initialize,
@@ -728,7 +728,7 @@ impl RmcpBridge {
                     preferred_versions: vec![ProtocolVersion::V_2026_07_28],
                 },
             };
-            ClientInfo::default()
+            ClientConfig::default()
                 .serve_with_lifecycle(transport, lifecycle)
                 .await
                 .map_err(|e| {
@@ -889,20 +889,14 @@ fn service_error_message(error: &ServiceError) -> String {
 /// The reqwest transport surfaces a 401 in one of two stable shapes (rmcp is
 /// pinned exactly, so these cannot drift silently): a 401 carrying a
 /// `WWW-Authenticate` header becomes `StreamableHttpError::AuthRequired`, and
-/// any other non-success status becomes
-/// `UnexpectedServerResponse("HTTP <status>: …")`. Both arrive here inside
+/// a bare 401 becomes `UnexpectedServerResponse("HTTP 401 …: <body>")` — a
+/// JSON-RPC error in its body included, which rmcp keeps as the status rather
+/// than as an in-band error. Both arrive here inside
 /// `ClientInitializeError::TransportError` as the type-erased transport error;
 /// the downcast names rmcp's own reqwest (`rmcp_reqwest`, the 0.13 line — not
 /// the workspace 0.12) so the types match. Post-handshake operations don't
 /// need this: [`EphemeralBridge`] reconnects per operation, so every request
 /// replays the handshake and a rejected token always surfaces on this path.
-///
-/// Known gap (availability-only): a bare 401 whose body parses as a JSON-RPC
-/// error arrives as `ClientInitializeError::JsonRpcError` — not a transport
-/// error — and is not recognized here, so a revoked token is replayed until
-/// the cache's expiry skew retires it (at most ~59 minutes at the default
-/// lifetime). Spec-conforming servers answer 401 with `WWW-Authenticate`,
-/// which IS recognized.
 fn init_error_is_unauthorized(error: &ClientInitializeError) -> bool {
     let ClientInitializeError::TransportError { error, .. } = error else {
         return false;
