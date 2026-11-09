@@ -574,10 +574,9 @@ pub async fn chat_completions(
                         .unwrap_or(elapsed);
                     let pk = crate::usage_attr::ResolvedPk::resolve(&snapshot, &c.provider_key_id);
                     // 上游已经为这些 token 收过钱了，所以这一发和成功的一发对
-                    // 网关来说成本相同 —— 网关自己的额度闸也正是这么算的。定价
-                    // 按调度到的目标（虚拟父级不带 `cost`），与成功路径同一条
-                    // 规则。写 0 会让客户账本上出现「有 token、没金额」，花费
-                    // 序列也漏掉这笔钱，两本账各说各话。
+                    // 网关来说成本相同。定价按调度到的目标（虚拟父级不带
+                    // `cost`），与成功路径同一条规则。写 0 会让客户账本上出现
+                    // 「有 token、没金额」。
                     let blocked_cost_usd = crate::usage_attr::request_cost_usd(
                         &snapshot,
                         event_model_id,
@@ -591,8 +590,8 @@ pub async fn chat_completions(
                         ),
                         u64::from(c.completion_tokens),
                     );
-                    // 同一笔钱也要进 Prometheus 的 token/花费族：`record` 记的是
-                    // 「这次请求发生了」，`record_usage` 记的是「花了多少」，
+                    // 同样的 token 也要进 Prometheus 的 token 族：`record` 记的是
+                    // 「这次请求发生了」，`record_usage` 记的是「用了多少」，
                     // 失败路径原先只发前者。`/v1/responses` 把输出拦截当成功路径
                     // 收尾，所以它一直是对的；这里补齐同一套。
                     let blocked_target = snapshot.models.get_by_id(event_model_id);
@@ -629,7 +628,6 @@ pub async fn chat_completions(
                             cached: c.cached_prompt_tokens,
                             cache_read: c.cache_read_tokens,
                             cache_creation: c.cache_creation_tokens,
-                            spend_usd: blocked_cost_usd,
                             client_type: state.client_classifier.classify(&client.user_agent),
                         },
                     );
@@ -1055,7 +1053,7 @@ struct SemanticGateCtx {
 /// 「同族没有齐步走」—— 而那正是这个仓库反复吃亏的形状。
 ///
 /// 与路由那条的一个差别：命中缓存时这次请求根本不会走到提交预留那一步，所以这里
-/// 只发指标（花费序列里照样有它），网关侧的额度计数器不包含它。
+/// 只发指标，网关侧的额度计数器不包含它。
 async fn cache_semantic_embed(
     state: &ProxyState,
     snapshot: &AisixSnapshot,
@@ -1853,10 +1851,9 @@ async fn dispatch(
         crate::usage_attr::note_screened_request(snapshot, || captured_request_json(req));
     }
 
-    // Key-level budgets, decided from the pushed budget documents. 策略的花费层
-    // 由下面 dispatch 前的 `quota::enforce_rate_limit` 预留，超限时报
-    // `ProxyError::BudgetExceeded`（`quota::reject_spend`），与 token/请求层的
-    // `PolicyRateLimit` 区分开。
+    // Key-level budgets, decided from the pushed budget documents, ahead of
+    // the rate-limit reservation `quota::enforce_rate_limit` takes before
+    // dispatch.
     crate::budget::enforce_key(state, snapshot, auth).map_err(&with_model)?;
 
     // Resolve the attempt-list of underlying Model entries. A semantic
@@ -1885,49 +1882,45 @@ async fn dispatch(
 
     // 分类阶段已计过请求数的路由策略桶：目标阶段只检查、不再计（M3）。
     let mut semantic_counted: Vec<String> = Vec::new();
-    let (attempt_models, semantic_route, semantic_embed_spend): (
-        Vec<AttemptModel>,
-        Option<String>,
-        u64,
-    ) = if virtual_entry.value.is_semantic() {
-        let prompt = last_user_message_text(req).unwrap_or_default();
-        crate::semantic::resolve(
-            state,
-            snapshot,
-            &virtual_entry,
-            auth,
-            &prompt,
-            &client.source_ip,
-            request_id,
-            &mut semantic_counted,
-        )
-        .await
-        .map_err(&with_model)?
-    } else {
-        let budget_gate = crate::budget::gate(state, snapshot);
-        let attempts = resolve_attempt_models(
-            &state.routing,
-            &state.runtime_status,
-            &state.pricing,
-            snapshot,
-            &req.model,
-            &virtual_entry.id,
-            &virtual_entry.value,
-            RoutingRequest {
-                tags: &client.routing_tags,
-                headers: Some(&client.headers),
-                api_key_id: auth.entry.id.as_str(),
-                source_ip: &client.source_ip,
-                context_origin: None,
-                budget: Some(&budget_gate),
-                serves: None,
-                allowed_groups: &auth.key().allowed_provider_groups,
-            },
-        )
-        .map_err(&with_model)?;
-        // 非语义路径没有分类调用，也就没有这笔额外花费。
-        (attempts, None, 0)
-    };
+    let (attempt_models, semantic_route): (Vec<AttemptModel>, Option<String>) =
+        if virtual_entry.value.is_semantic() {
+            let prompt = last_user_message_text(req).unwrap_or_default();
+            crate::semantic::resolve(
+                state,
+                snapshot,
+                &virtual_entry,
+                auth,
+                &prompt,
+                &client.source_ip,
+                request_id,
+                &mut semantic_counted,
+            )
+            .await
+            .map_err(&with_model)?
+        } else {
+            let budget_gate = crate::budget::gate(state, snapshot);
+            let attempts = resolve_attempt_models(
+                &state.routing,
+                &state.runtime_status,
+                &state.pricing,
+                snapshot,
+                &req.model,
+                &virtual_entry.id,
+                &virtual_entry.value,
+                RoutingRequest {
+                    tags: &client.routing_tags,
+                    headers: Some(&client.headers),
+                    api_key_id: auth.entry.id.as_str(),
+                    source_ip: &client.source_ip,
+                    context_origin: None,
+                    budget: Some(&budget_gate),
+                    serves: None,
+                    allowed_groups: &auth.key().allowed_provider_groups,
+                },
+            )
+            .map_err(&with_model)?;
+            (attempts, None)
+        };
 
     // For non-routing requests, surface a misconfigured bridge as a
     // proper 503 rather than burying it inside a generic Bridge error.
@@ -2408,17 +2401,10 @@ async fn dispatch(
         // stream hold keeps its concurrency slot(s) and `post_stream_keys`
         // bills its TPM/TPD at stream end too (#1087).
         //
-        // 语义路由那次分类调用的花费只进请求级的花费层（key、team、路由自己的
-        // 那一行），所以在并入目标的层之前记下它们：目标模型的花费层只管目标
-        // 自己的花费，分类调用已经记在嵌入模型自己的层上了。
-        let request_spend_keys = reservation.spend_keys();
         if let Some(member) = won_member_reservation.take() {
             reservation.merge(member);
         }
-        let post_stream_keys = reservation.token_keys();
-        // 花费层的桶记 micro-USD，和 token 桶不能共用一张键表——同一批键
-        // 加同一个数字会把 token 数当成钱记进去。
-        let spend_post_stream_keys = reservation.spend_keys();
+        let post_stream_keys = reservation.keys();
         let stream_concurrency_hold = reservation.into_stream_hold();
         // least_busy: `in_flight_hold` keeps this target counted as in-flight
         // for the stream's full lifetime. Like `stream_concurrency_hold`, the
@@ -2583,8 +2569,7 @@ async fn dispatch(
                     200,
                     winner_attempt_started,
                 );
-                // One figure for both the usage event and the spend metric —
-                // computing it twice is how the two drift.
+                // The usage event's cost, computed once.
                 let stream_cost_usd = crate::usage_attr::request_cost_usd(
                     &snap,
                     &model_id_for_telem,
@@ -2598,14 +2583,6 @@ async fn dispatch(
                     ),
                     u64::from(comp.completion_tokens),
                 );
-                // 花费层的 TPM/TPD 记账（单位是 micro-USD）。与上面的 token
-                // 记账成对：两批键各记各的数字。
-                limiter.add_tokens_post_stream_all(
-                    &spend_post_stream_keys,
-                    crate::usage_attr::spend_micro_usd(stream_cost_usd),
-                );
-                // 分类调用的花费也要进额度，但只进请求级的层（见上）。
-                limiter.add_tokens_post_stream_all(&request_spend_keys, semantic_embed_spend);
                 let deployment_success = terminal.error_class.is_empty() && terminal.status < 400;
                 routing_for_terminal.finish_staged(
                     &state_for_telem,
@@ -2759,7 +2736,6 @@ async fn dispatch(
                         cached: comp.cached_prompt_tokens,
                         cache_read: comp.cache_read_tokens,
                         cache_creation: comp.cache_creation_tokens,
-                        spend_usd: stream_cost_usd,
                         client_type: &client_type_for_metrics,
                     },
                 );
@@ -3069,12 +3045,8 @@ async fn dispatch(
                 // (#1571).
                 let entry_model = &virtual_entry.value;
                 crate::attribution::note_cache_hit_entry(entry_model, hit_layer.as_str());
-                // 命中缓存：没有上游 chat 调用，所以 token 记 0。但**分类调用
-                // 已经发生了** —— 语义路由为了决定路由，在缓存查询之前就打了一发
-                // 嵌入调用。用 `commit_tokens_no_spend` 会把它从额度里漏掉（指标
-                // 里还在，但网关侧的闸不认它）。非语义请求这个数
-                // 是 0，行为与原来完全一致。
-                reservation.commit(0, semantic_embed_spend).await;
+                // 命中缓存：没有上游 chat 调用，所以 token 记 0.
+                reservation.commit_tokens(0).await;
                 // Counted HERE, at the gate's decision — the same rule the
                 // `None` arm below already states. Recorded after the output
                 // chain instead, a hit the chain BLOCKS increments nothing at
@@ -3395,8 +3367,8 @@ async fn dispatch(
     // Entry id of the winning target. **Pricing resolves against the
     // DISPATCHED row, not the caller-addressed one** — for a routing group
     // or a semantic router the addressed entry is a virtual parent with no
-    // `cost`, so pricing against it silently yields 0: no spend series, no
-    // spend ceiling consumed, no budget enforced. Equal to `model_id` for a
+    // `cost`, so pricing against it silently yields 0: a usage row billing
+    // nothing. Equal to `model_id` for a
     // direct model, which is why it went unnoticed. The streaming branch
     // already carries the winner's id (`winner_target_id`, #790).
     let mut chosen_target_id: Option<String> = None;
@@ -3762,9 +3734,7 @@ async fn dispatch(
     let finish_reason = finish_reason_label(&upstream.finish_reason);
     // Fold the winning target's model-layer reservation in so one commit
     // bills the member's TPM/TPD alongside the request-level layers
-    // (#1087). The request-level spend keys are taken first: the semantic
-    // classifier's spend goes to those only (see the commit below).
-    let request_spend_keys = reservation.spend_keys();
+    // (#1087).
     if let Some(member) = won_member_reservation.take() {
         reservation.merge(member);
     }
@@ -3804,17 +3774,7 @@ async fn dispatch(
         provider_model_version: provider_model_version.clone(),
         ..crate::usage_attr::AnsweredUsage::from_stats(&upstream.usage)
     });
-    reservation
-        .commit(total, crate::usage_attr::spend_micro_usd(cost_usd))
-        .await;
-    // 语义路由那次分类调用的花费：它在预留建立之前发生，拦不住，但必须记进
-    // 额度 —— 不记的话用户能靠语义路由白嫖这一部分。只进请求级的花费层
-    // （key、team、路由自己的那一行）：目标模型的层只管目标自己的花费，分类
-    // 调用已经记在嵌入模型自己的层上，再记一次就是同一笔钱算两遍。非语义
-    // 请求是 0。
-    state
-        .limiter
-        .add_tokens_post_stream_all(&request_spend_keys, semantic_embed_spend);
+    reservation.commit_tokens(total).await;
 
     let (output_verdict, hits) = resolved_chain
         .check_output_non_segment_observed(&upstream)
@@ -4261,7 +4221,7 @@ async fn dispatch_ensemble(
     let progress = Arc::new(crate::ensemble::EnsembleProgress::default());
     crate::attribution::publish_ensemble(PendingEnsemble {
         ctx: row_ctx.clone(),
-        entry_keys: reservation.token_keys(),
+        entry_keys: reservation.keys(),
         stream: req.is_streaming(),
         progress: Arc::clone(&progress),
         bypass: bypass_reason.clone().unwrap_or_default(),
@@ -4335,9 +4295,7 @@ async fn dispatch_ensemble(
                         "ensemble panel did not reach the required number of responses",
                     )),
                 );
-                reservation
-                    .commit_tokens_no_spend(survivor_total(&panel))
-                    .await;
+                reservation.commit_tokens(survivor_total(&panel)).await;
                 return Err(failure);
             }
             // `run_ensemble_panel` never returns `Judge` (it stops before
@@ -4350,9 +4308,7 @@ async fn dispatch_ensemble(
             }) => {
                 let failure =
                     emit_panel_then_fail(&panel, &failed, Some(&judge), ProxyError::Bridge(source));
-                reservation
-                    .commit_tokens_no_spend(survivor_total(&panel))
-                    .await;
+                reservation.commit_tokens(survivor_total(&panel)).await;
                 return Err(failure);
             }
         };
@@ -4389,7 +4345,7 @@ async fn dispatch_ensemble(
                 Some(&judge_failure(&err, false, Instant::now())),
                 ProxyError::Bridge(err),
             );
-            reservation.commit_tokens_no_spend(panel_total).await;
+            reservation.commit_tokens(panel_total).await;
             return Err(failure);
         };
         let judge_model = &judge_entry.value;
@@ -4419,7 +4375,7 @@ async fn dispatch_ensemble(
                     Some(&judge_failure(&err, false, Instant::now())),
                     ProxyError::Bridge(err),
                 );
-                reservation.commit_tokens_no_spend(panel_total).await;
+                reservation.commit_tokens(panel_total).await;
                 return Err(failure);
             }
         };
@@ -4433,7 +4389,7 @@ async fn dispatch_ensemble(
                 Some(&judge_failure(&err, false, Instant::now())),
                 refused,
             );
-            reservation.commit_tokens_no_spend(panel_total).await;
+            reservation.commit_tokens(panel_total).await;
             return Err(failure);
         }
         let Some(judge_bridge) = crate::dispatch::resolve_bridge(&state.hub, &judge_pk.value)
@@ -4446,7 +4402,7 @@ async fn dispatch_ensemble(
                 Some(&judge_failure(&err, false, Instant::now())),
                 ProxyError::Bridge(err),
             );
-            reservation.commit_tokens_no_spend(panel_total).await;
+            reservation.commit_tokens(panel_total).await;
             return Err(failure);
         };
         let mut judge_ctx = crate::dispatch::bridge_ctx(
@@ -4496,7 +4452,7 @@ async fn dispatch_ensemble(
                     Some(&judge_failure(&err, true, Instant::now())),
                     ProxyError::Bridge(err),
                 );
-                reservation.commit_tokens_no_spend(panel_total).await;
+                reservation.commit_tokens(panel_total).await;
                 return Err(failure);
             }
         };
@@ -4521,7 +4477,7 @@ async fn dispatch_ensemble(
                     Some(&judge_failure(&be, false, judge_started)),
                     ProxyError::Bridge(be),
                 );
-                reservation.commit_tokens_no_spend(panel_total).await;
+                reservation.commit_tokens(panel_total).await;
                 return Err(failure);
             }
         };
@@ -4581,16 +4537,12 @@ async fn dispatch_ensemble(
         let panel_charge = EnsembleCharge::new(
             state,
             snapshot,
-            reservation.token_keys(),
+            reservation.keys(),
             panel
                 .iter()
                 .fold(aisix_gateway::chat::UsageStats::default(), |acc, p| {
                     acc.saturating_add(&p.effective_usage)
                 }),
-            panel_rows
-                .iter()
-                .map(|(_, row)| row.cost_usd(snapshot))
-                .sum(),
             &row_ctx,
         );
         let row_ctx_for_telem = row_ctx.clone();
@@ -4600,7 +4552,7 @@ async fn dispatch_ensemble(
         // #620: hold the judge's own concurrency slot for the stream lifetime
         // and add its tokens post-stream, the same way the entry reservation is
         // handled (snapshot keys before consuming into the owned guard).
-        let judge_post_stream_keys = judge_reservation.token_keys();
+        let judge_post_stream_keys = judge_reservation.keys();
         let judge_concurrency_hold = judge_reservation.into_stream_hold();
 
         // Token-estimation fallback (#1074) for the streamed
@@ -4650,7 +4602,7 @@ async fn dispatch_ensemble(
                     comp.guardrail_blocked,
                     &bypass_for_telem,
                 );
-                // One figure for the judge's row and the spend metric.
+                // The judge's row is priced off the judge's own target.
                 let judge_cost_usd = crate::usage_attr::request_cost_usd(
                     &snap,
                     &judge_model_id,
@@ -4664,7 +4616,7 @@ async fn dispatch_ensemble(
                     ),
                     u64::from(comp.completion_tokens),
                 );
-                panel_charge.settle_stream(&judge_post_stream_keys, &comp, judge_cost_usd);
+                panel_charge.settle_stream(&judge_post_stream_keys, &comp);
                 let judge_pk =
                     crate::usage_attr::ResolvedPk::resolve(&snap, &judge_provider_key_id);
                 let stream_error = crate::attempt::stream_error_fields(
@@ -4846,9 +4798,7 @@ async fn dispatch_ensemble(
                     /* blocked */ false,
                     input_bypass,
                 );
-                reservation
-                    .commit_tokens_no_spend(survivor_total(&panel))
-                    .await;
+                reservation.commit_tokens(survivor_total(&panel)).await;
                 return Err(DispatchFailure::new(
                     Some(model_id.to_string()),
                     None,
@@ -4876,21 +4826,14 @@ async fn dispatch_ensemble(
         .sum();
     let total_tokens = panel_total + u64::from(effective_judge.usage.total_tokens);
     crate::attribution::note_ensemble_tokens_charged();
-    reservation.commit_tokens_no_spend(total_tokens).await;
-    // One figure per sub-call for its row and for the spend metric, which
-    // `record_success` reads off `Success::cost_usd`.
+    reservation.commit_tokens(total_tokens).await;
+    // The judge's row is priced off the judge's own target.
     let judge_cost_usd = crate::usage_attr::request_cost_usd(
         snapshot,
         &resolve_sub(&outcome.judge_model).0,
         crate::usage_attr::input_tokens_of(&effective_judge.usage),
         u64::from(effective_judge.usage.completion_tokens),
     );
-    let ensemble_cost_usd = judge_cost_usd
-        + outcome
-            .panel
-            .iter()
-            .map(|member| EnsembleSubcall::of(snapshot, member).cost_usd(snapshot))
-            .sum::<f64>();
 
     // Emit one usage event per sub-call (each panel member + the judge),
     // all sharing `request_id`. `attempt_kind` is `"panel"` / `"judge"`;
@@ -5120,7 +5063,7 @@ async fn dispatch_ensemble(
         provider_key_id: crate::request_metrics::UNKNOWN.to_string(),
         upstream_model: crate::request_metrics::UNKNOWN.to_string(),
         finish_reason: String::new(),
-        cost_usd: ensemble_cost_usd,
+        cost_usd: 0.0,
         bypass_reason,
         cache_status: CacheStatus::Disabled,
         cache_hit_layer: None,
@@ -5228,7 +5171,6 @@ fn record_success(
             cached: s.cached_prompt_tokens,
             cache_read: s.cache_read_tokens,
             cache_creation: s.cache_creation_tokens,
-            spend_usd: s.cost_usd,
             client_type,
         },
     );
@@ -5721,7 +5663,7 @@ fn created_ts() -> i64 {
 /// most recently seen `total_tokens` and, on stream end, hand it to
 /// `on_complete` so the caller can post-account it against TPM/TPD.
 ///
-/// Pre-fix the streaming path called `reservation.commit_tokens_no_spend(0)`
+/// Pre-fix the streaming path called `reservation.commit_tokens(0)`
 /// up front and never revisited the counter, leaving TPM caps silently
 /// bypassed for all streaming traffic and the cost/usage telemetry
 /// reporting `$0`. See issue #108.
@@ -6069,8 +6011,8 @@ impl EnsembleSubcall {
         }
     }
 
-    /// This sub-call priced from its own target's row, the one figure its
-    /// usage row and the request's spend metric both report.
+    /// This sub-call priced from its own target's row, the figure its usage
+    /// row reports.
     fn cost_usd(&self, snap: &AisixSnapshot) -> f64 {
         crate::usage_attr::request_cost_usd(
             snap,
@@ -6173,8 +6115,6 @@ struct EnsembleCharge {
     entry_keys: Vec<String>,
     /// The panel's (or, abandoned, every returned sub-call's) usage.
     usage: aisix_gateway::chat::UsageStats,
-    /// What that usage cost, for the spend metric.
-    cost_usd: f64,
     bounded_model: String,
     metric_caller: crate::request_metrics::Owned,
     client: ClientContext,
@@ -6186,14 +6126,12 @@ impl EnsembleCharge {
         snapshot: &AisixSnapshot,
         entry_keys: Vec<String>,
         usage: aisix_gateway::chat::UsageStats,
-        cost_usd: f64,
         rows: &EnsembleRowCtx,
     ) -> Self {
         Self {
             state: state.clone(),
             entry_keys,
             usage,
-            cost_usd,
             bounded_model: crate::usage_attr::metric_model_label(snapshot, &rows.client_model)
                 .into_owned(),
             metric_caller: crate::request_metrics::Caller::from_api_key_id(
@@ -6205,11 +6143,10 @@ impl EnsembleCharge {
     }
 
     /// Settle a streaming ensemble with what its judge streamed: `comp` is
-    /// the judge's completion and `judge_cost_usd` its price, or
-    /// `StreamCompletion::default()` and `0.0` when the request was abandoned
-    /// before the judge produced anything — which charges the panel alone and
-    /// reports the request as a `499`.
-    fn settle_stream(&self, judge_keys: &[String], comp: &StreamCompletion, judge_cost_usd: f64) {
+    /// the judge's completion, or `StreamCompletion::default()` when the
+    /// request was abandoned before the judge produced anything — which
+    /// charges the panel alone and reports the request as a `499`.
+    fn settle_stream(&self, judge_keys: &[String], comp: &StreamCompletion) {
         let state = &self.state;
         let limiter = &state.limiter;
         // Rate-limit accounting: the panel tokens (already round-tripped)
@@ -6262,7 +6199,6 @@ impl EnsembleCharge {
                 cached: aggregate_cached,
                 cache_read: aggregate_cache_read,
                 cache_creation: aggregate_cache_creation,
-                spend_usd: self.cost_usd + judge_cost_usd,
                 client_type: state.client_classifier.classify(&self.client.user_agent),
             },
         );
@@ -6326,7 +6262,6 @@ impl EnsembleCharge {
                 cached: self.usage.cached_prompt_tokens,
                 cache_read: self.usage.cache_read_tokens,
                 cache_creation: self.usage.cache_creation_tokens,
-                spend_usd: self.cost_usd,
                 client_type: self
                     .state
                     .client_classifier
@@ -6409,13 +6344,11 @@ pub(crate) fn emit_abandoned_ensemble(
     let charged = judge.is_some() || panel.iter().any(Result::is_ok);
     let mut index = first_index;
     let mut usage = aisix_gateway::chat::UsageStats::default();
-    let mut cost_usd = 0.0;
     for member in panel {
         match member {
             Ok(outcome) => {
                 usage = usage.saturating_add(&outcome.effective_usage);
                 let sub = EnsembleSubcall::of(snap, &outcome);
-                cost_usd += sub.cost_usd(snap);
                 sub.emit(
                     state,
                     snap,
@@ -6433,7 +6366,6 @@ pub(crate) fn emit_abandoned_ensemble(
     if let Some(judge) = judge {
         usage = usage.saturating_add(&judge.outcome.effective_usage);
         let sub = EnsembleSubcall::of(snap, &judge.outcome);
-        cost_usd += sub.cost_usd(snap);
         let extras = UsageExtras {
             provider_request_id: crate::usage_attr::sanitize_provider_response_id(
                 &judge.response_id,
@@ -6450,16 +6382,9 @@ pub(crate) fn emit_abandoned_ensemble(
     if !charged {
         return index;
     }
-    let charge = EnsembleCharge::new(
-        state,
-        snap,
-        pending.entry_keys,
-        usage,
-        cost_usd,
-        &pending.ctx,
-    );
+    let charge = EnsembleCharge::new(state, snap, pending.entry_keys, usage, &pending.ctx);
     if pending.stream {
-        charge.settle_stream(&[], &StreamCompletion::default(), 0.0);
+        charge.settle_stream(&[], &StreamCompletion::default());
     } else {
         charge.settle_abandoned(pending.tokens_owed);
     }

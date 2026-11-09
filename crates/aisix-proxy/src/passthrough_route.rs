@@ -1122,7 +1122,7 @@ async fn dispatch(
 
     let mut telemetry = RouteTelemetry {
         state: state.clone(),
-        token_keys: reservation.token_keys(),
+        token_keys: reservation.keys(),
         route_name: route.name.clone(),
         trace: client.trace.clone(),
         provider_label: pk_entry
@@ -7672,7 +7672,6 @@ impl RouteTelemetry {
                     cached: usage.cached_prompt_tokens,
                     cache_read: usage.cache_read_tokens,
                     cache_creation: usage.cache_creation_tokens,
-                    spend_usd: event.cost_usd,
                     client_type: self
                         .state
                         .client_classifier

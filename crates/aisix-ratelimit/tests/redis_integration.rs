@@ -9,7 +9,7 @@
 //! Admission-time counters (requests, concurrency) are shared
 //! synchronously — the acquire round-trips to Redis, so the second replica
 //! sees the first one's increment before it answers. Post-hoc counters
-//! (tokens, spend) are not: their totals are only known once the upstream
+//! (tokens) are not: their totals are only known once the upstream
 //! has replied, and the update is handed to a worker rather than awaited,
 //! so a wedged Redis cannot add latency to the stream that just finished.
 //! For those, the shared counter is reached promptly, not instantly, and
@@ -1106,10 +1106,9 @@ impl aisix_core::RateLimitMetricsSink for CountingSink {
     }
 }
 
-/// Shedding a post-stream update means a caller's tokens — and, since spend
-/// ceilings became a local mechanism, their money — never reach the shared
-/// counters, so they can spend past a `max_spend_micro_usd` ceiling by the
-/// dropped amount.
+/// Shedding a post-stream update means a caller's tokens never reach the
+/// shared counters, so they can run past a token limit by the dropped
+/// amount.
 ///
 /// The store logs that once per process. A sustained shed therefore looks
 /// identical to one that recovered a second later, which is the state an
@@ -1314,8 +1313,8 @@ async fn unary_tokens_are_enforced_by_the_local_fallback() {
 }
 
 /// `claim_once` 是给「会重放、但记账不能重复」的副作用用的：批处理跑完之后的
-/// 花费归因就是这种 —— 它的用量事件带确定性 id，消费端能去重，而花费计数器和
-/// Prometheus 计数器都没有那层保护，重放一次就是多收一遍。
+/// 用量归因就是这种 —— 它的用量事件带确定性 id，消费端能去重，而
+/// Prometheus 计数器没有那层保护，重放一次就是多记一遍。
 ///
 /// 用两个各自 `connect` 出来的存储，模拟「重启后的同一个网关」与「另一个实例」
 /// —— 它们不共享任何进程内状态，只共享 Redis。标记要在这种情况下仍然只发一次。
@@ -1876,7 +1875,7 @@ async fn a_store_that_never_connected_fails_open_and_attaches_later() {
     while counter_value(&metrics.render(), "ratelimit_add_tokens") == 0.0 {
         assert!(
             std::time::Instant::now() < deadline,
-            "post-stream spend that cannot reach Redis must be counted"
+            "post-stream tokens that cannot reach Redis must be counted"
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }

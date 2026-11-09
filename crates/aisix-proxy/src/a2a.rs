@@ -2012,7 +2012,6 @@ fn emit_a2a_usage(
                 input: prompt_tokens,
                 output: completion_tokens,
                 total: prompt_tokens.saturating_add(completion_tokens),
-                spend_usd: event.cost_usd,
                 client_type: &call.client_type,
                 ..Default::default()
             },

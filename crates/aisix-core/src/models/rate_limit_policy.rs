@@ -253,51 +253,6 @@ pub struct RateLimitPolicy {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1))]
     pub max_tokens: Option<u64>,
-    /// Spend ceiling for this window, in micro-USD (1 USD = 1,000,000).
-    ///
-    /// Spend is computed from the dispatched model's configured price, so a
-    /// model with no price contributes nothing to this counter — the policy
-    /// then admits every request regardless of the ceiling. The gateway
-    /// counts those requests on `aisix_budget_unpriced_requests_total` and
-    /// logs them rather than failing them. A price is per token, so an image,
-    /// audio or video request whose upstream reports no tokens, and the web
-    /// searches a request makes, also add nothing here and are counted on the
-    /// same metric.
-    ///
-    /// Enforced as a ceiling on *recorded* spend, not on in-flight spend. A
-    /// request is admitted when the spend already recorded for the window is
-    /// below the ceiling, and its own cost is added only after the upstream
-    /// answers — so every request already in flight when the ceiling is
-    /// crossed still completes and still counts. Recorded spend for a window
-    /// can therefore finish above `max_spend_micro_usd` by up to the combined
-    /// cost of the requests that were concurrently in flight at that moment.
-    ///
-    /// Two other ceilings bound that overshoot, and both stack with this one
-    /// because every policy matching a request applies: `max_requests` on the
-    /// same scope and window caps how many requests the window admits at all,
-    /// and a separate policy that sets a `concurrency` limit and groups by
-    /// `api_key` caps how many may be in flight at once. Both are checked
-    /// and counted at admission rather than at completion, so both hold
-    /// exactly. Set this ceiling below the amount you are actually willing
-    /// to spend.
-    ///
-    /// Not honoured on a `second` window: spend, like tokens, is only known
-    /// after the upstream answers, so a one-second ceiling would lag by about
-    /// its own width. Configuring one is reported rather than silently
-    /// ignored.
-    ///
-    /// Not enforced against ensemble model requests: panel and judge
-    /// sub-call spend is never counted against this ceiling, so an
-    /// api_key or team policy that also receives ensemble traffic sees
-    /// only its non-ensemble spend capped.
-    ///
-    /// Recorded spend is held in the configured rate-limit store. The default
-    /// in-process store keeps it in memory only, so a restart begins the
-    /// window's tally again and is not shared between gateway instances;
-    /// a shared Redis store keeps one tally across both.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(range(min = 1))]
-    pub max_spend_micro_usd: Option<u64>,
     // —— conditional form (#892) ——
     /// Condition node tree the request must satisfy (implicit AND
     /// across the top level; `[]`/absent = every request in the env).
@@ -378,13 +333,7 @@ impl RateLimitPolicy {
             || self.scope_ref.is_some()
             || self.window.is_some()
             || self.max_requests.is_some()
-            || self.max_tokens.is_some()
-            // `max_spend_micro_usd` is a classic-form dimension: it needs
-            // `window` to project onto a counter, and the conditional form
-            // has no `window`. Listing it here is what makes a conditional
-            // row carrying it fail as a form mix rather than load and never
-            // be read.
-            || self.max_spend_micro_usd.is_some();
+            || self.max_tokens.is_some();
         let conditional = self.conditions.is_some()
             || self.group_by.is_some()
             || self.limits.is_some()
@@ -421,14 +370,8 @@ impl RateLimitPolicy {
         if self.scope.is_none() || self.scope_ref.is_none() || self.window.is_none() {
             return Err("classic policy requires `scope`, `scope_ref` and `window`".into());
         }
-        if self.max_requests.is_none()
-            && self.max_tokens.is_none()
-            && self.max_spend_micro_usd.is_none()
-        {
-            return Err(
-                "classic policy requires `max_requests`, `max_tokens` or `max_spend_micro_usd`"
-                    .into(),
-            );
+        if self.max_requests.is_none() && self.max_tokens.is_none() {
+            return Err("classic policy requires `max_requests` or `max_tokens`".into());
         }
         Ok(())
     }
@@ -437,17 +380,16 @@ impl RateLimitPolicy {
 /// The form XOR `schemars` can't derive, injected as a top-level `oneOf` by
 /// [`crate::models::schema::rate_limit_policy_root_schema`]: a row is either
 /// the classic form (scope/scope_ref/window required, at least one of
-/// `max_requests`/`max_tokens`/`max_spend_micro_usd`, none of the conditional
-/// fields) or the conditional form (`limits` required, none of the classic
-/// fields). Pre-#892 rows satisfy the classic branch byte-for-byte.
+/// `max_requests`/`max_tokens`, none of the conditional fields) or the
+/// conditional form (`limits` required, none of the classic fields).
+/// Pre-#892 rows satisfy the classic branch byte-for-byte.
 pub fn rate_limit_policy_form_one_of() -> Value {
     json!([
         {
             "required": ["scope", "scope_ref", "window"],
             "anyOf": [
                 { "required": ["max_requests"] },
-                { "required": ["max_tokens"] },
-                { "required": ["max_spend_micro_usd"] }
+                { "required": ["max_tokens"] }
             ],
             "not": { "anyOf": [
                 { "required": ["conditions"] },
@@ -463,8 +405,7 @@ pub fn rate_limit_policy_form_one_of() -> Value {
                 { "required": ["scope_ref"] },
                 { "required": ["window"] },
                 { "required": ["max_requests"] },
-                { "required": ["max_tokens"] },
-                { "required": ["max_spend_micro_usd"] }
+                { "required": ["max_tokens"] }
             ]}
         }
     ])
@@ -561,28 +502,6 @@ mod tests {
     #[test]
     fn resource_trait_returns_correct_kind() {
         assert_eq!(RateLimitPolicy::kind(), "rate_limit_policies");
-    }
-
-    /// 新字段可省略：既有策略文档必须原样加载，升级不改变任何人的配置含义。
-    #[test]
-    fn max_spend_is_optional_and_absent_by_default() {
-        let json = r#"{"name":"p","scope":"api_key","window":"day","max_requests":10}"#;
-        let p: RateLimitPolicy = serde_json::from_str(json).expect("既有文档仍可加载");
-        assert_eq!(p.max_spend_micro_usd, None);
-        // 未设置时不出现在序列化结果里，避免给存量文档凭空加字段。
-        let back = serde_json::to_string(&p).unwrap();
-        assert!(
-            !back.contains("max_spend_micro_usd"),
-            "未设置不应序列化: {back}"
-        );
-    }
-
-    /// 单位是 micro-USD 的整数：5 美元 = 5_000_000。
-    #[test]
-    fn max_spend_round_trips_as_micro_usd_integer() {
-        let json = r#"{"name":"p","scope":"api_key","window":"day","max_spend_micro_usd":5000000}"#;
-        let p: RateLimitPolicy = serde_json::from_str(json).expect("解析");
-        assert_eq!(p.max_spend_micro_usd, Some(5_000_000));
     }
 
     // --- dual form (#892) ----------------------------------
@@ -691,83 +610,6 @@ mod tests {
             .validate_semantics()
             .unwrap_err()
             .contains("repeats"));
-    }
-
-    /// 只配了 `max_spend_micro_usd` 的经典行必须能通过校验——预算的
-    /// 典型形态就是「不限 token、只限钱」。校验器早先要求
-    /// `max_requests`/`max_tokens` 二选一，会把整条策略在加载期拒掉，
-    /// 于是花费上限根本配不进来（执行侧的单测直接构造结构体，绕过校验，
-    /// 全绿也发现不了）。
-    #[test]
-    fn spend_only_classic_policy_validates() {
-        let p: RateLimitPolicy = serde_json::from_value(json!({
-            "name": "daily-budget",
-            "scope": "api_key",
-            "scope_ref": "k1",
-            "window": "day",
-            "max_spend_micro_usd": 5_000_000
-        }))
-        .unwrap();
-        p.validate_semantics().expect("纯预算策略必须能加载");
-    }
-
-    /// 三个维度一个都不配仍然要拒——放宽的是「哪些维度算数」，
-    /// 不是「可以一个都不配」。
-    #[test]
-    fn classic_policy_with_no_ceiling_at_all_is_still_rejected() {
-        let p: RateLimitPolicy = serde_json::from_value(json!({
-            "name": "none",
-            "scope": "api_key",
-            "scope_ref": "k1",
-            "window": "day"
-        }))
-        .unwrap();
-        assert!(p
-            .validate_semantics()
-            .unwrap_err()
-            .contains("max_spend_micro_usd"));
-    }
-
-    /// 条件形态的行带 `max_spend_micro_usd` 必须被拒。
-    ///
-    /// 花费上限要靠 `window` 才能投影到某个计数器，而条件形态没有
-    /// `window`（它用自带 7 维的 `limits`），所以执行侧永远读不到这个字段。
-    /// 收下它就是仓库点名的「accepted-but-unread config」那一类：
-    /// 一个旋钮要么按写的执行，要么被拒，不能半生效。
-    #[test]
-    fn conditional_policy_carrying_max_spend_is_rejected() {
-        let p: RateLimitPolicy = serde_json::from_value(json!({
-            "name": "cond-spend",
-            "conditions": [
-                { "dimension": "team", "operator": "==", "value": "t-1" }
-            ],
-            "limits": { "rpm": 5 },
-            "max_spend_micro_usd": 5_000_000
-        }))
-        .unwrap();
-        assert!(p.validate_semantics().unwrap_err().contains("mixes"));
-    }
-
-    /// schema 的 `oneOf` 要和 `validate_semantics` 说同一件事：经典分支把
-    /// 花费当作合格维度，条件分支把它列进禁用字段。两者不一致时，
-    /// 严格写入路径与加载校验会各拒各的。
-    #[test]
-    fn form_one_of_lists_max_spend_on_both_branches() {
-        let one_of = rate_limit_policy_form_one_of();
-        let classic_any_of = one_of[0]["anyOf"].as_array().unwrap();
-        assert!(
-            classic_any_of
-                .iter()
-                .any(|b| b["required"][0] == "max_spend_micro_usd"),
-            "经典分支未把花费上限算作合格维度: {classic_any_of:?}"
-        );
-        let conditional_not = one_of[1]["not"]["anyOf"].as_array().unwrap();
-        assert!(
-            conditional_not
-                .iter()
-                .any(|b| b["required"][0] == "max_spend_micro_usd"),
-            "条件分支未禁用花费上限: {conditional_not:?}"
-        );
     }
 
     #[test]

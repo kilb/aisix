@@ -220,10 +220,10 @@ pub trait RateStore: Send + Sync + 'static {
     /// a charge also has to ask [`RateStore::claims_outlive_process`].
     ///
     /// For work that may legitimately be redone but whose accounting must
-    /// not repeat. The after-the-fact spend attribution of a completed batch
+    /// not repeat. The after-the-fact usage attribution of a completed batch
     /// is the case: its usage event carries a deterministic id the consumer
-    /// dedups on, but crediting a spend counter and incrementing a
-    /// Prometheus counter are not idempotent, and the attribution replays
+    /// dedups on, but incrementing a Prometheus counter is not idempotent,
+    /// and the attribution replays
     /// whenever a process that has forgotten the batch sees it completed
     /// again.
     async fn claim_once(&self, key: &str, ttl: Duration) -> bool;

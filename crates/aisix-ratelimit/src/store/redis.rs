@@ -373,7 +373,8 @@ impl RedisStore {
     /// the driver can never use, which no amount of retrying fixes and
     /// which the operator needs told loudly rather than degraded around.
     /// A process that cannot start the accounting worker's thread ends up
-    /// here too: without it spend never reaches the shared counters.
+    /// here too: without it post-stream tokens never reach the shared
+    /// counters.
     pub async fn connect_or_attach_later(
         cfg: &RedisConnConfig,
     ) -> Result<(Self, Option<redis::RedisError>), redis::RedisError> {
@@ -463,8 +464,7 @@ impl RedisStore {
     /// whether it is still going. The counter is the signal to alert on.
     fn note_shed_post_stream(&self, dropped: usize) {
         // 计数每次都记，日志只打第一次。持续丢弃恰恰是「outage 开始时那一
-        // 条日志」最没用的场景：它说不出现在还在丢。而且这个队列自花费上限
-        // 本地化之后同时载着 token 和钱——丢一笔就是有人花的钱没记进预算。
+        // 条日志」最没用的场景：它说不出现在还在丢。
         if let Some(metrics) = &self.metrics {
             metrics.record_post_stream_shed(dropped as u64);
         }
@@ -474,8 +474,8 @@ impl RedisStore {
                 dropped,
                 queue_depth = POST_STREAM_QUEUE_DEPTH,
                 "post-stream accounting queue full; shedding updates rather than delaying \
-                 requests. Shared token AND spend counters undercount until it drains, so \
-                 a spend ceiling can be overrun by the shed amount. This logs once — watch \
+                 requests. Shared token counters undercount until it drains, so a token \
+                 limit can be overrun by the shed amount. This logs once — watch \
                  aisix_ratelimit_post_stream_shed_total for whether it is still happening."
             );
         }

@@ -763,7 +763,7 @@ async fn dispatch(
     } = match dispatched {
         Ok(d) => d,
         Err(e) => {
-            reservation.commit_tokens_no_spend(0).await;
+            reservation.commit_tokens(0).await;
             return Err(e);
         }
     };
@@ -856,14 +856,6 @@ async fn dispatch(
         .as_ref()
         .map(|u| u64::from(u.prompt_tokens))
         .unwrap_or(0);
-    // 花费与本端点用量事件的 cost_usd 同源：按调度到的目标行定价，
-    // 重排没有提示缓存也没有输出 token。
-    let spend = crate::usage_attr::request_spend_micro_usd(
-        snapshot,
-        &target.id,
-        aisix_core::InputTokens::uncached_only(total_tokens),
-        0,
-    );
     // Billed from here on: a caller that leaves during the commit still owes
     // this answer, priced as the success row prices it.
     if let Some(u) = usage.as_ref() {
@@ -880,7 +872,7 @@ async fn dispatch(
             ..Default::default()
         });
     }
-    reservation.commit(total_tokens, spend).await;
+    reservation.commit_tokens(total_tokens).await;
 
     Ok(RerankDispatchSuccess {
         response: resp,
@@ -1028,8 +1020,6 @@ fn emit_usage_event(
     crate::usage_attr::apply_caller_identity(&mut event, client.jwt.as_ref(), &client.caller);
     let usage_model =
         crate::usage_attr::usage_event_model_label(snap, &event.requested_model).into_owned();
-    // Read before the event is handed over, for the spend counter below.
-    let cost_usd = event.cost_usd;
     crate::usage_attr::emit_usage(
         state,
         snap,
@@ -1057,7 +1047,6 @@ fn emit_usage_event(
             input: usage.prompt_tokens,
             output: 0,
             total: usage.prompt_tokens,
-            spend_usd: cost_usd,
             // No upstream on this surface reports prompt-cache detail.
             cached: 0,
             cache_read: 0,

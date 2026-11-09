@@ -1,5 +1,8 @@
 # 花费预算本地化 实现计划
 
+> **状态：历史文档。** 本计划实现的一切已于 2026-11-09 移除（见
+> `2026-08-20-spend-budget-design.md` 的状态说明）。保留只作记录。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 把每 api_key 的花费预算从请求路径上的同步控制平面 HTTP 调用，改为 `RateLimitPolicy` 上的一个新维度、由现有限流器本地执行。

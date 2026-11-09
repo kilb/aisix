@@ -275,8 +275,8 @@ const DEFAULT_BATCH_WATCH_INTERVAL: std::time::Duration = std::time::Duration::f
 /// costs at worst one redundant download and one redundant, already-idempotent
 /// emit.
 ///
-/// That covers the event and nothing else. The spend counters the attribution
-/// also feeds are plain counters: re-crediting them charges the batch again.
+/// That covers the event and nothing else. The counters the attribution also
+/// feeds are plain counters: re-crediting them counts the batch again.
 /// They are guarded separately by a `RateStore::claim_once` marker, which
 /// lives beside the counters it protects and so survives exactly as long as
 /// they do. Do not extend this set's job to them — an in-process map cannot

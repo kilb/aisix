@@ -248,9 +248,6 @@ struct Pick {
     score: Option<f64>,
     /// Why there is no winner.
     miss: Option<SemanticFallback>,
-    /// 这次决策本身花的钱（micro-USD）。只有嵌入决策有：分类器不是一条
-    /// Model，既不按模型计量也不定价。
-    embed_spend: u64,
 }
 
 /// Resolve a semantic router to a single direct-model attempt + the name
@@ -272,7 +269,7 @@ pub(crate) async fn resolve(
     // 分类阶段已计过请求数、只因路由名才匹配上的策略桶，交给目标阶段去重
     // （见 `quota::ParentCounted`）。被拒或降级时已记下的照样有效。
     parent_counted: &mut Vec<String>,
-) -> Result<(Vec<AttemptModel>, Option<String>, u64), ProxyError> {
+) -> Result<(Vec<AttemptModel>, Option<String>), ProxyError> {
     let semantic = router_entry
         .value
         .semantic
@@ -303,8 +300,8 @@ pub(crate) async fn resolve(
             &default_target,
             None,
         )?;
-        // 没有可分类的文本 → 不发嵌入调用 → 这次没有额外花费。
-        return Ok((vec![attempt], None, 0));
+        // 没有可分类的文本 → 不发嵌入调用。
+        return Ok((vec![attempt], None));
     }
 
     let pick = match &semantic.classifier {
@@ -315,7 +312,6 @@ pub(crate) async fn resolve(
                     winner: confident.then_some(picked),
                     score: Some(confidence),
                     miss: (!confident).then_some(SemanticFallback::LowConfidence),
-                    embed_spend: 0,
                 })
             }
             Err((failure, error)) => {
@@ -394,7 +390,7 @@ pub(crate) async fn resolve(
         target = %attempt.model.display_name,
         "semantic routing decision",
     );
-    Ok((vec![attempt], route_name, pick.embed_spend))
+    Ok((vec![attempt], route_name))
 }
 
 fn note_decision(route: Option<String>, score: Option<f64>, fallback: Option<SemanticFallback>) {
@@ -532,12 +528,11 @@ async fn decide_by_embedding(
         }
     };
 
-    let embed_spend =
-        record_embed_usage(state, snapshot, &embed_entry, auth, embedded.prompt_tokens);
-    // 提交到嵌入模型自己的那些桶。父级那边的记账是另一笔：`embed_spend` 会被
-    // 调用方加进父级的提交里，两笔各记各的层，互不替代。
+    record_embed_usage(state, snapshot, &embed_entry, auth, embedded.prompt_tokens);
+    // 提交到嵌入模型自己的那些桶。父级那边的记账是另一笔，两笔各记各的层，
+    // 互不替代。
     embed_reservation
-        .commit(u64::from(embedded.prompt_tokens), embed_spend)
+        .commit_tokens(u64::from(embedded.prompt_tokens))
         .await;
     let mut iter = embedded.vectors.into_iter();
     let prompt_vec = iter
@@ -577,7 +572,6 @@ async fn decide_by_embedding(
             .winner
             .is_none()
             .then_some(SemanticFallback::NoMatch),
-        embed_spend,
     })
 }
 
@@ -598,13 +592,12 @@ fn fallback(
     groups: &[String],
     semantic: &Semantic,
     failure: DecisionFailure,
-) -> Result<(Vec<AttemptModel>, Option<String>, u64), ProxyError> {
+) -> Result<(Vec<AttemptModel>, Option<String>), ProxyError> {
     match failure_target(snapshot, semantic) {
         Some(alias) => {
             let (attempt, _) =
                 select_eligible(state, snapshot, router, source_ip, groups, &alias, None)?;
-            // 决策没有做成，上游没有报回 usage —— 没有可计的花费。
-            Ok((vec![attempt], None, 0))
+            Ok((vec![attempt], None))
         }
         None => Err(ProxyError::SemanticDecisionFailed {
             router: router.display_name.clone(),
@@ -1124,11 +1117,10 @@ async fn embed_texts_inner(
     })
 }
 
-/// 给一次嵌入子调用记账：发一条用量记录，并返回它的花费（micro-USD）。
+/// 给一次嵌入子调用记账：发一条用量记录。
 ///
-/// **两个系统各计一次，互不重复。** 指标这边按**嵌入模型自己的**标签发，所以
-/// 序列标注是对的，按 `user_id` 求和时也就自动算到了这个人头上；额度那边由
-/// 调用方把返回的数字并进本次请求的预留提交。
+/// 指标按**嵌入模型自己的**标签发，序列标注是对的，按 `user_id` 求和时也就自动
+/// 算到了这个人头上；token 额度由调用方提交进本次请求的预留。
 ///
 /// 记在 `/v1/embeddings` 名下而不是发起它的那个端点：上游确实是一次嵌入调用，
 /// 按它归类，成本分析里才看得出「路由本身花了多少」。
@@ -1138,14 +1130,8 @@ pub(crate) fn record_embed_usage(
     embed_entry: &ResourceEntry<Model>,
     auth: &crate::auth::AuthenticatedKey,
     prompt_tokens: u32,
-) -> u64 {
+) {
     let model = &embed_entry.value;
-    let spend = crate::usage_attr::request_spend_micro_usd(
-        snapshot,
-        &embed_entry.id,
-        aisix_core::InputTokens::uncached_only(u64::from(prompt_tokens)),
-        0,
-    );
     let provider = model
         .provider
         .as_deref()
@@ -1175,12 +1161,10 @@ pub(crate) fn record_embed_usage(
             cached: 0,
             cache_read: 0,
             cache_creation: 0,
-            spend_usd: spend as f64 / 1_000_000.0,
             // 发起者是网关自己（语义路由的分类调用），不是某个客户端。
             client_type: "gateway",
         },
     );
-    spend
 }
 
 /// What a failed [`embed_texts`] call may say on a log line.

@@ -22,7 +22,7 @@ mod window;
 pub use clock::{Clock, SystemClock, TestClock};
 pub use error::{LimitDetail, RateLimitError, CONCURRENCY_DIMENSION, CONCURRENCY_RETRY_AFTER_SECS};
 pub use limiter::{
-    CounterUnit, Limiter, MultiReservation, RateLimitStatus, Reservation, StreamConcurrencyGuard,
+    Limiter, MultiReservation, RateLimitStatus, Reservation, StreamConcurrencyGuard,
 };
 pub use store::local::LocalStore;
 pub use store::redis::RedisStore;

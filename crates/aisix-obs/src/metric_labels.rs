@@ -279,7 +279,6 @@ pub static METRIC_DEFINITIONS: &[MetricDefinition] = &[
         extra = &["policy_name"]
     ),
     metric!(M_TOKENS_CONSUMED, &["provider", "model"]),
-    metric!(M_LLM_SPEND_MICRO_USD_TOTAL, USAGE, extra = CALLER_NAMES),
     metric!(M_LLM_INPUT_TOKENS_TOTAL, USAGE, extra = CALLER_NAMES),
     metric!(M_LLM_OUTPUT_TOKENS_TOTAL, USAGE, extra = CALLER_NAMES),
     metric!(M_LLM_TOTAL_TOKENS_TOTAL, USAGE, extra = CALLER_NAMES),
@@ -401,8 +400,6 @@ pub static METRIC_DEFINITIONS: &[MetricDefinition] = &[
         extra = CALLER_NAMES,
         required = BUDGET
     ),
-    metric!(M_BUDGET_UNPRICED_REQUESTS_TOTAL, &["policy", "model"]),
-    metric!(M_BUDGET_POLICIES_CONFIGURED, &[]),
     metric!(M_REDIS_FAILURES_TOTAL, &["operation"]),
     metric!(M_RATELIMIT_POST_STREAM_SHED_TOTAL, &[]),
     metric!(
@@ -964,47 +961,15 @@ mod tests {
         );
     }
 
-    /// This gateway still emits the spend family, so a labels entry for it
-    /// reshapes the series like any other family's,
-    /// and is not ignored. Any unknown name still fails.
+    /// A family the gateway no longer emits is accepted and ignored, so a
+    /// config written for an older gateway still boots; any other unknown
+    /// name still fails.
     #[test]
-    fn a_labels_entry_for_the_spend_family_applies_and_an_unknown_one_still_fails() {
-        let metrics = Metrics::new_with_labels(
-            "env",
-            &HistogramBuckets::default(),
-            &selection(M_LLM_SPEND_MICRO_USD_TOTAL, &["endpoint", "user_id"]),
-        )
-        .expect("the spend family is a known family");
-        metrics.record_llm_usage(
-            UsageLabels {
-                endpoint: "/v1/chat/completions",
-                inbound_protocol: "openai",
-                upstream_protocol: "openai",
-                provider: "openai",
-                model: "m",
-                upstream_model: "m",
-                provider_key_id: "pk-1",
-                provider_key_name: "pk",
-                api_key_id: "ak-1",
-                api_key_name: "unknown",
-                team_id: "team-1",
-                team_name: "unknown",
-                user_id: "user-1",
-                user_name: "alice",
-            },
-            LlmUsage {
-                total_tokens: 1,
-                spend_usd: 0.001,
-                ..Default::default()
-            },
-        );
-        let out = metrics.render();
-        assert_eq!(
-            sample(&out, M_LLM_SPEND_MICRO_USD_TOTAL),
-            vec![
-                r#"aisix_llm_spend_micro_usd_total{endpoint="/v1/chat/completions",user_id="user-1"} 1000"#
-            ]
-        );
+    fn a_retired_family_is_ignored_and_an_unknown_one_still_fails() {
+        let retired = selection("aisix_llm_spend_micro_usd_total", &["endpoint"]);
+        let metrics = Metrics::new_with_labels("env", &HistogramBuckets::default(), &retired)
+            .expect("a retired family must not fail boot");
+        assert!(!metrics.render().contains("aisix_llm_spend_micro_usd_total"));
         assert!(
             LabelSelection::compile(&selection("aisix_no_such_family", &["endpoint"]))
                 .unwrap_err()

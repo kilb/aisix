@@ -847,7 +847,7 @@ async fn dispatch(
         } = match dispatched {
             Ok(d) => d,
             Err(e) => {
-                reservation.commit_tokens_no_spend(0).await;
+                reservation.commit_tokens(0).await;
                 return Err(e);
             }
         };
@@ -863,7 +863,7 @@ async fn dispatch(
             Ok(prepared) => prepared,
             Err(e) => {
                 // No upstream call → no tokens to count.
-                reservation.commit_tokens_no_spend(0).await;
+                reservation.commit_tokens(0).await;
                 return Ok(completion_not_implemented(
                     &e,
                     provider_label,
@@ -882,10 +882,7 @@ async fn dispatch(
         let stream = prepared;
         {
             {
-                // 花费层的桶记 micro-USD，和 token 桶不能共用一张键表——同一批键
-                // 加同一个数字会把 token 数当成钱记进去。
-                let post_stream_keys = reservation.token_keys();
-                let spend_post_stream_keys = reservation.spend_keys();
+                let post_stream_keys = reservation.keys();
                 let stream_hold = reservation.into_stream_hold();
                 let limiter = Arc::clone(&state.limiter);
                 let state_for_stream = state.clone();
@@ -1033,13 +1030,6 @@ async fn dispatch(
                             failure_message.clone_from(&refusal.error_message);
                         }
                         let snapshot = state_for_stream.snapshot.load();
-                        // 花费层记账（micro-USD），与上面的 token 记账成对。
-                        // 一个流可能跨过几代配置，所以按流结束时生效的价格算，
-                        // 和下面用量事件读的是同一份快照。
-                        limiter.add_tokens_post_stream_all(
-                            &spend_post_stream_keys,
-                            completion_spend_micro_usd(&snapshot, &model_id_for_stream, &usage),
-                        );
                         let pk = crate::usage_attr::ResolvedPk::resolve(
                             &snapshot,
                             &provider_key_id_for_stream,
@@ -1185,7 +1175,7 @@ async fn dispatch(
     } = match dispatched {
         Ok(d) => d,
         Err(e) => {
-            reservation.commit_tokens_no_spend(0).await;
+            reservation.commit_tokens(0).await;
             return Err(e);
         }
     };
@@ -1263,10 +1253,6 @@ async fn dispatch(
                 .as_ref()
                 .map(|u| u64::from(u.prompt_tokens) + u64::from(u.completion_tokens))
                 .unwrap_or(0);
-            let spend = usage
-                .as_ref()
-                .map(|u| completion_spend_micro_usd(snapshot, &model_entry_id, u))
-                .unwrap_or(0);
             // Billed from here on: a caller that leaves during the commit or
             // the output scan below still owes this answer.
             if let Some(u) = usage.as_ref() {
@@ -1276,7 +1262,7 @@ async fn dispatch(
                     &provider_request_id,
                 ));
             }
-            reservation.commit(total_tokens, spend).await;
+            reservation.commit_tokens(total_tokens).await;
 
             // #911 [23]: /v1/completions must run OUTPUT guardrails too. The
             // input hook above scans the prompt, but pre-fix the model's reply
@@ -1414,7 +1400,7 @@ async fn dispatch(
         // that refusal — every other failure left through the dispatch).
         Err(e) => {
             // No upstream call → no tokens to count; release the reservation.
-            reservation.commit_tokens_no_spend(0).await;
+            reservation.commit_tokens(0).await;
             Ok(completion_not_implemented(
                 &e,
                 provider_label,
@@ -1471,20 +1457,6 @@ impl CompletionUsage {
             ..Default::default()
         }
     }
-}
-
-/// 这次 `/v1/completions` 调用要记进花费桶的量（micro-USD）。
-fn completion_spend_micro_usd(
-    snap: &aisix_core::AisixSnapshot,
-    model_id: &str,
-    usage: &CompletionUsage,
-) -> u64 {
-    crate::usage_attr::request_spend_micro_usd(
-        snap,
-        model_id,
-        completion_input_tokens(usage),
-        u64::from(usage.completion_tokens),
-    )
 }
 
 /// Pull the usage counters out of a legacy /v1/completions response
@@ -1717,8 +1689,6 @@ fn emit_usage_event(
     crate::usage_attr::apply_caller_identity(&mut event, client.jwt.as_ref(), &client.caller);
     let usage_model =
         crate::usage_attr::usage_event_model_label(snap, &event.requested_model).into_owned();
-    // Read before the event moves into the emit: the spend family bills from it.
-    let cost_usd = event.cost_usd;
     crate::usage_attr::emit_usage(
         state,
         snap,
@@ -1754,7 +1724,6 @@ fn emit_usage_event(
             // the prompt tokens.
             cache_read: 0,
             cache_creation: 0,
-            spend_usd: cost_usd,
             client_type: state.client_classifier.classify(&client.user_agent),
         },
     );

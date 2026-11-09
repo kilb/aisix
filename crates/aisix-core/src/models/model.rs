@@ -188,11 +188,13 @@ impl InputTokens {
     }
 }
 
-/// USD to micro-USD, the integer unit of the spend counters
-/// (1 USD = 1_000_000).
+/// USD to micro-USD (1 USD = 1_000_000), the integer unit an amount of money
+/// is carried in by everything that compares against the gateway's own
+/// computation of one — the control plane's pricing tests, which check
+/// their charges against it.
 ///
 /// Rounds rather than truncates: a single call is often around 1e-4 USD, and
-/// always truncating would make spend systematically low. `max(0.0)` catches a
+/// always truncating would make a spend figure systematically low. `max(0.0)` catches a
 /// negative price and NaN (`f64::max` returns the other side when one side is
 /// NaN), and `as u64` is a saturating conversion in Rust, so it never wraps.
 pub fn spend_micro_usd(cost_usd: f64) -> u64 {

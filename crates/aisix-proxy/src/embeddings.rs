@@ -743,7 +743,7 @@ async fn dispatch(
             // The upstream was never called, so nothing was consumed —
             // release the reservation without spending tokens, exactly as
             // the chat gate does, and report the tokens the entry saved.
-            reservation.commit_tokens_no_spend(0).await;
+            reservation.commit_tokens(0).await;
             gate.record(state, crate::chat::CacheStatus::Hit);
             let cache = crate::response_cache::CacheTelemetry::hit(&hit);
             let mut response = axum::response::Response::new(axum::body::Body::from(hit.body));
@@ -881,7 +881,7 @@ async fn dispatch(
     } = match dispatched {
         Ok(d) => d,
         Err(e) => {
-            reservation.commit_tokens_no_spend(0).await;
+            reservation.commit_tokens(0).await;
             return Err(e);
         }
     };
@@ -932,14 +932,6 @@ async fn dispatch(
             // here even though other handlers commit 0. The estimation
             // fallback above keeps this accurate for upstreams that
             // report no usage.
-            // 花费与本端点用量事件的 cost_usd 同源：按调度到的目标行定价，
-            // 输入全按新鲜计（这个表面没有提示缓存），无输出 token。
-            let spend = crate::usage_attr::request_spend_micro_usd(
-                snapshot,
-                &target.id,
-                aisix_core::InputTokens::uncached_only(u64::from(prompt_tokens)),
-                0,
-            );
             // Billed from here on: a caller that leaves during the commit or
             // the cache write below still owes this answer, priced as the
             // success row prices it.
@@ -956,10 +948,9 @@ async fn dispatch(
                 ..Default::default()
             });
             reservation
-                .commit(
-                    u64::from((embed_resp.usage.total_tokens).max(prompt_tokens)),
-                    spend,
-                )
+                .commit_tokens(u64::from(
+                    (embed_resp.usage.total_tokens).max(prompt_tokens),
+                ))
                 .await;
             let provider_label = provider.clone();
             let upstream_total_tokens = embed_resp.usage.upstream_total_tokens;
@@ -1026,7 +1017,7 @@ async fn dispatch(
             // Drop the reservation without committing — the request
             // didn't hit the upstream. The handler emits no usage unless a
             // guardrail decision was already recorded before this branch.
-            reservation.commit_tokens_no_spend(0).await;
+            reservation.commit_tokens(0).await;
             let env = ErrorEnvelope::new(e.to_string(), "not_implemented");
             Ok(EmbedDispatchSuccess {
                 response: (StatusCode::NOT_IMPLEMENTED, Json(env)).into_response(),
@@ -1256,8 +1247,6 @@ fn emit_usage_event(
     crate::usage_attr::apply_caller_identity(&mut event, client.jwt.as_ref(), &client.caller);
     let usage_model =
         crate::usage_attr::usage_event_model_label(snap, &event.requested_model).into_owned();
-    // Read before the event is handed over, for the spend counter below.
-    let cost_usd = event.cost_usd;
     crate::usage_attr::emit_usage(
         state,
         snap,
@@ -1285,7 +1274,6 @@ fn emit_usage_event(
             input: prompt_tokens,
             output: 0,
             total: prompt_tokens,
-            spend_usd: cost_usd,
             // No upstream on this surface reports prompt-cache detail.
             cached: 0,
             cache_read: 0,

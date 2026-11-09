@@ -4,13 +4,13 @@ import type { AddressInfo } from "node:net";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   EtcdClient,
-  metricDelta,
-  scrapeMetrics,
   SeedClient,
+  slsLogsFor,
   spawnApp,
+  startMockSls,
   waitConfigPropagation,
-  waitForLogLine,
-  type MetricSample,
+  waitForSlsLog,
+  type MockSls,
   type SpawnedApp,
 } from "../harness/index.js";
 
@@ -19,23 +19,22 @@ import {
 //
 // The output check runs after the upstream has answered, so the provider has
 // already charged for those tokens: to the operator a blocked answer costs
-// exactly what a delivered one does. Both sides of the gateway's books must
-// see it. The spend series has to count it, or the money is spent and never
-// recorded; and the caller's spend ceiling has to count it, or a caller who
-// keeps tripping the guardrail spends the operator's upstream money without
-// limit.
+// exactly what a delivered one does. The request's usage row has to bill it,
+// or the money is spent and never recorded — and exactly once, because a
+// caller who keeps tripping the guardrail must not be billed twice for one
+// answer.
 //
 // Every surface a client SDK uses is driven, buffered and streamed, because
-// each records spend on its own path: Chat Completions, Messages translated
+// each records a row on its own path: Chat Completions, Messages translated
 // from a Chat Completions upstream, Messages relayed from a native Anthropic
-// upstream, and Responses. Each cell has its own key, its own model and its
-// own day-window ceiling of two answers.
+// upstream, and Responses. Each cell has its own key and its own model.
 //
 // Every model is priced at 1 USD per 1k tokens and every upstream answer
-// reports 500 + 500 tokens, so one answer is 1_000_000 on the spend series.
+// reports 500 + 500 tokens, so one answer bills 1_000_000 micro-USD.
 
-const SPEND = "aisix_llm_spend_micro_usd_total";
 const ONE_ANSWER = 1_000_000;
+const CREDENTIAL_REF = "mock";
+const LOGSTORE = "output-guardrail-billing";
 const MARKER = "bill-guard-marker";
 const COST = { input_per_1k: 1, output_per_1k: 1 };
 
@@ -218,6 +217,7 @@ async function startMock(): Promise<{ baseUrl: string; close(): Promise<void> }>
 describe("an answer an output guardrail blocks is billed like one it lets through", () => {
   let app: SpawnedApp | undefined;
   let mock: Awaited<ReturnType<typeof startMock>> | undefined;
+  let sls: MockSls | undefined;
   let etcdReachable = false;
 
   beforeAll(async () => {
@@ -225,9 +225,25 @@ describe("an answer an output guardrail blocks is billed like one it lets throug
     etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
     mock = await startMock();
-    // The access-log line is `info`; the barrier below waits for one.
-    app = await spawnApp({ logLevel: "info" });
+    sls = await startMockSls();
+    app = await spawnApp({
+      extraEnv: {
+        [`SLS_CRED_${CREDENTIAL_REF.toUpperCase()}_AK_ID`]: "mock-akid",
+        [`SLS_CRED_${CREDENTIAL_REF.toUpperCase()}_AK_SECRET`]: "mock-secret",
+      },
+    });
     const seed = new SeedClient(etcd, app.etcdPrefix);
+    // Every request's usage row, as an exporter keeps it.
+    await seed.createObservabilityExporter({
+      name: "sls-output-guardrail-billing",
+      enabled: true,
+      kind: "aliyun_sls",
+      endpoint: sls.url,
+      project: "aisix-e2e-obs",
+      logstore: LOGSTORE,
+      credential_ref: CREDENTIAL_REF,
+      content_mode: "metadata_only",
+    });
 
     const openai = await seed.createProviderKey({
       display_name: "bill-openai",
@@ -265,14 +281,6 @@ describe("an answer an output guardrail blocks is billed like one it lets throug
         cost: COST,
       });
       await seed.attachGuardrailToModel(rule.id as string, model.id as string);
-      // Room for two answers in the day: the warm-up and the blocked one.
-      await seed.createRateLimitPolicy({
-        name: `${cell.name}-ceiling`,
-        scope: "api_key",
-        scope_ref: cell.keyId,
-        window: "day",
-        max_spend_micro_usd: 2 * ONE_ANSWER,
-      });
     }
 
     // Keys last: once the last one authenticates, the rest is in the snapshot.
@@ -294,6 +302,7 @@ describe("an answer an output guardrail blocks is billed like one it lets throug
   afterAll(async () => {
     await app?.exit();
     await mock?.close();
+    await sls?.close();
   });
 
   const send = async (cell: Cell, text: string) => {
@@ -326,23 +335,38 @@ describe("an answer an output guardrail blocks is billed like one it lets throug
     };
   };
 
-  const spendSince = async (cell: Cell, before: MetricSample[]) =>
-    metricDelta(before, await scrapeMetrics(app!.metricsUrl), SPEND, { model: cell.name });
+  /** Every usage row received so far for `requestId`. */
+  const rowsOf = (requestId: string) =>
+    slsLogsFor(sls!, LOGSTORE).filter((log) => log.get("request_id") === requestId);
+
+  /** What the usage rows of `requestId` bill, in micro-USD, once one arrived.
+   * A stream records its row as it ends, which can follow the caller's last
+   * byte. */
+  const billedFor = async (requestId: string) => {
+    expect(requestId, "the response names its request").not.toBe("");
+    await waitForSlsLog(
+      sls!,
+      LOGSTORE,
+      (log) => log.get("request_id") === requestId,
+      `the usage row of ${requestId}`,
+      20_000,
+    );
+    return rowsOf(requestId)
+      .map((row) => Math.round(Number(row.get("cost_usd") ?? "0") * 1e6))
+      .reduce((a, b) => a + b, 0);
+  };
 
   for (const cell of CELLS) {
-    test(`${cell.name}: the blocked answer is billed and counts against the ceiling`, async (ctx) => {
+    test(`${cell.name}: the blocked answer is billed exactly once`, async (ctx) => {
       if (!etcdReachable) ctx.skip();
-      const start = await scrapeMetrics(app!.metricsUrl);
 
-      // An answer the guardrail lets through, billed as one answer. A stream
-      // records its spend as it ends, which can follow the caller's last byte.
+      // An answer the guardrail lets through, billed as one answer.
       const clean = await send(cell, "hello");
       expect(clean.status, clean.body).toBe(200);
       expect(clean.body).toContain("you said: hello");
-      await expect.poll(() => spendSince(cell, start), { timeout: 10_000 }).toBe(ONE_ANSWER);
+      expect(await billedFor(clean.requestId)).toBe(ONE_ANSWER);
 
       // An answer the guardrail blocks: the caller does not get it.
-      const before = await scrapeMetrics(app!.metricsUrl);
       const blocked = await send(cell, `please repeat ${MARKER}`);
       if (cell.stream) {
         // A stream may be refused with a status or with an error event.
@@ -355,39 +379,29 @@ describe("an answer an output guardrail blocks is billed like one it lets throug
         `you said: please repeat ${MARKER}`,
       );
 
-      // The upstream charged for it, so the spend series counts it.
-      await expect
-        .poll(() => spendSince(cell, before), {
-          timeout: 10_000,
-          message: "the blocked answer was paid upstream but never recorded as spend",
-        })
-        .toBeGreaterThan(0);
-
-      // And the ceiling counts it: two answers spent its whole day, so the
-      // next request is refused before it reaches the upstream.
-      const refused = await send(cell, `please repeat ${MARKER}`);
+      // The upstream charged for it, so its usage row bills it.
       expect(
-        refused.status,
-        `a blocked answer did not count against the caller's ceiling: ${refused.body}`,
-      ).toBe(429);
-
-      // Once, and the refused request not at all. The barrier is ordered,
-      // not timed: the refused request went out only after the blocked
-      // answer reached the caller, and its own access-log line is written
-      // once that request is done with, so the check below runs after both
-      // requests have finished.
-      expect(refused.requestId, "the refused request has an id").not.toBe("");
-      await waitForLogLine(
-        app!,
-        (l) =>
-          l.includes("proxy request completed") &&
-          l.includes(`request_id="${refused.requestId}"`),
-        `the access-log line for the refused request ${refused.requestId}`,
-      );
-      expect(
-        await spendSince(cell, before),
-        "the blocked answer is billed once and the refused request not at all",
+        await billedFor(blocked.requestId),
+        "the blocked answer was paid upstream but its row bills nothing",
       ).toBe(ONE_ANSWER);
+
+      // A second blocked answer is billed on its own row, and the first one is
+      // not billed again beside it: once per answer, not once per request that
+      // follows.
+      const blockedAgain = await send(cell, `please repeat ${MARKER}`);
+      if (cell.stream) {
+        expect([200, 422], blockedAgain.body).toContain(blockedAgain.status);
+      } else {
+        expect(blockedAgain.status, blockedAgain.body).toBe(422);
+      }
+      expect(
+        await billedFor(blockedAgain.requestId),
+        "the second blocked answer is billed as the first",
+      ).toBe(ONE_ANSWER);
+      expect(
+        rowsOf(blocked.requestId),
+        "the first blocked answer was billed once",
+      ).toHaveLength(1);
     });
   }
 });
