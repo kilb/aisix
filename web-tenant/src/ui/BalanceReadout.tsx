@@ -38,13 +38,13 @@ export function Money({ micro }: { micro: number }) {
  * no level limits it.
  */
 export function BalanceReadout({
-  effectiveMicroUsd,
+  effectiveMicroCny,
   stops,
   binding,
   picker,
   children,
 }: {
-  effectiveMicroUsd: number | null;
+  effectiveMicroCny: number | null;
   stops: ReadoutStop[];
   binding: ReadoutLevel | null;
   /** A control that chooses what the readout is for (the key), shown under the heading. */
@@ -60,7 +60,7 @@ export function BalanceReadout({
       <div className="readout-figure">
         <p className="readout-label">现在还能花</p>
         <p className="readout-amt display" data-testid="readout-amount">
-          {effectiveMicroUsd === null ? <span className="readout-open">不限</span> : <Money micro={effectiveMicroUsd} />}
+          {effectiveMicroCny === null ? <span className="readout-open">不限</span> : <Money micro={effectiveMicroCny} />}
         </p>
       </div>
       <ol className="levels" aria-label="每一级还剩多少" style={{ "--n": stops.length } as React.CSSProperties}>

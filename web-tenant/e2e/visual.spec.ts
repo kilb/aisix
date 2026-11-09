@@ -92,11 +92,20 @@ test.beforeAll(async () => {
   await member.post("/api/login", { email: "lin@visual-7e4.test", password: PASSWORD });
   await member.post("/api/keys", { label: "nightly-eval", model_ids: modelIds.slice(1) });
 
-  // 账户, 用量 and 预算 need money and a call: a seven-figure balance (the widest
-  // figure the readout may carry), one priced call so the figures have sub-cent
-  // digits, and a key quota.
+  // 账户, 用量 and 预算 need money and a call: a seven-figure balance, one
+  // priced call so the figures have sub-cent digits, and a key quota.
   await stack.admin.post(`/admin/tenants/${id}/credits`, { amount_cny: "1000000.00", reason: "visual funding" });
   await stack.admin.post(`/admin/tenants/${id}/credits`, { amount_cny: "234567.89", reason: "visual funding" });
+  // The keys are in the first boot's `shared` group, which has no rate until
+  // one is set: at 1 CNY per USD the call is charged its baseline's figure.
+  // A rate may start at most a few seconds back.
+  const groups = await stack.admin.get("/admin/provider-groups");
+  const shared = groups.items.find((g: { name: string }) => g.name === "shared");
+  await stack.admin.post(`/admin/provider-groups/${shared.id}/rates`, {
+    model_id: null,
+    cny_per_usd: "1",
+    effective_from: new Date(Date.now() - 4_000).toISOString(),
+  });
   const startsAt = Date.now() + 3_000;
   await stack.admin.post("/admin/pricing/baselines", {
     model_id: modelIds[0],
@@ -119,6 +128,14 @@ test.beforeAll(async () => {
       { message: "the gateway admits the priced call", timeout: 60_000 },
     )
     .toBe(200);
+  // 5 input tokens at $1,000/M and 3 output at $2,000/M, at 1 CNY per USD:
+  // ¥0.011 off the balance, once the call is priced.
+  await expect
+    .poll(async () => (await owner.get("/api/usage/calls")).items.map((c: { charge: { amount_micro_cny: number | null } }) => c.charge.amount_micro_cny), {
+      message: "the call is charged",
+      timeout: 30_000,
+    })
+    .toEqual([11_000]);
   await owner.post("/api/budgets", { scope: "api_key", scope_ref: prod.key.id, kind: "periodic", period: "month", limit_cny: "50.00" });
 });
 
@@ -200,7 +217,17 @@ const PAGES: Shown[] = [
     open: async (page) => {
       await page.goto(stack.previewUrl);
       await openTab(page, "用量", "调用记录");
-      await expect(page.getByRole("table", { name: "调用记录" }).locator("tbody tr").first()).toBeVisible();
+      await expect(page.getByRole("table", { name: "调用记录" }).locator("tbody tr").first()).toContainText("¥0.011");
+    },
+  },
+  {
+    slug: "prices",
+    name: "价格",
+    signedIn: true,
+    open: async (page) => {
+      await page.goto(stack.previewUrl);
+      // The priced model, at its group's rate: the table is in before the page is judged.
+      await openTab(page, "价格", "chat-small");
     },
   },
   {
@@ -222,9 +249,9 @@ const PAGES: Shown[] = [
       await page.goto(stack.previewUrl);
       await openTab(page, "账户", "余额流水");
       // The seven-figure ¥ balance and the readout are in before the page is judged:
-      // ¥1,234,567.89 is the widest figure either may carry.
+      // ¥1,234,567.879, the funding less the one call, is the widest figure either carries.
       await expect(page.getByTestId("readout-amount")).toContainText("¥");
-      await expect(page.getByRole("region", { name: "余额", exact: true })).toContainText("¥1,234,567.89");
+      await expect(page.getByRole("region", { name: "余额", exact: true })).toContainText("¥1,234,567.879");
     },
   },
   {
@@ -337,11 +364,11 @@ test("七位数的余额在 360 px 下不横向滚动，也不挤进相邻的列
   await signIn(page);
   await page.setViewportSize(PHONE);
   await openTab(page, "账户", "余额流水");
-  // ¥1,234,567.89 is the widest figure the readout and the balance carry: seven
-  // digits before the point, three thousand separators and two after.
+  // ¥1,234,567.879 is the widest figure the readout and the balance carry: seven
+  // digits before the point, two thousand separators and three after.
   const amount = page.getByTestId("readout-amount");
-  await expect(amount).toContainText("¥1,234,567.89");
-  await expect(page.getByRole("region", { name: "余额", exact: true })).toContainText("¥1,234,567.89");
+  await expect(amount).toContainText("¥1,234,567.879");
+  await expect(page.getByRole("region", { name: "余额", exact: true })).toContainText("¥1,234,567.879");
 
   // The page does not scroll sideways, and the figure is not cut off inside its
   // own box: the text's width fits the box that holds it.
@@ -358,7 +385,7 @@ test("七位数的余额在 360 px 下不横向滚动，也不挤进相邻的列
 
   // The balance panel's own reading of the same figure stays inside its column too.
   const reading = page.getByRole("region", { name: "余额", exact: true }).locator(".entry").filter({ hasText: "余额" }).first().locator(".val");
-  await expect(reading).toContainText("¥1,234,567.89");
+  await expect(reading).toContainText("¥1,234,567.879");
   const inside = await reading.evaluate((el) => {
     const box = el.getBoundingClientRect();
     const range = document.createRange();

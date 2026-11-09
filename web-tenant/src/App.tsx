@@ -135,6 +135,16 @@ export function App({ inviteToken }: { inviteToken: string | null }) {
     return () => window.removeEventListener("hashchange", apply);
   }, []);
 
+  // A section opened from the nav writes its own fragment, so the address
+  // always names the section shown: a reload reopens it, and a link to the
+  // section the address held before is a change again (a 查看价格 followed a
+  // second time). Replaced, not pushed: sections were never history entries.
+  const openSection = useCallback((t: TabId) => {
+    setTab(t);
+    setPriceGroup(null);
+    window.history.replaceState(null, "", `#${t}`);
+  }, []);
+
   // The member removed themself, which ended their session on the control
   // plane already: nothing is left to sign out of, and a logout request
   // would only answer that the session is gone.
@@ -163,8 +173,8 @@ export function App({ inviteToken }: { inviteToken: string | null }) {
     setInvite(null);
     setSignOutError(null);
     setNotice(null);
-    setTab("org");
-  }, []);
+    openSection("org");
+  }, [openSection]);
 
   // Signed out only once the control plane has ended the session (or says
   // there was none): a failed request leaves the session live, and showing
@@ -268,7 +278,7 @@ export function App({ inviteToken }: { inviteToken: string | null }) {
 
       {visible.length > 0 && (
         <div className="wrap route-bar">
-          <RouteNav label="组织门户分区" items={visible} current={current} onSelect={setTab} docked />
+          <RouteNav label="组织门户分区" items={visible} current={current} onSelect={openSection} docked />
         </div>
       )}
 

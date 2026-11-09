@@ -14,7 +14,7 @@ import {
   type TenantKey,
 } from "./lib/api";
 import { formMessageFor, messageFor } from "./lib/errors";
-import { fmtUtc, isCnyAmount } from "./lib/money";
+import { fmtUtc, isCnyAmount, microCnyToInput } from "./lib/money";
 import { Money } from "./ui/BalanceReadout";
 import { Button } from "./ui/Button";
 import { DataTable, Loading } from "./ui/DataTable";
@@ -41,12 +41,6 @@ const LEVEL: Record<QuotaLevel, string> = { organization: "组织", member: "成
 function cnyToMicro(s: string): number {
   const [whole = "0", cents = ""] = s.split(".");
   return Number(whole) * 1_000_000 + Number(cents.padEnd(2, "0")) * 10_000;
-}
-
-/** A limit as the yuan it was set in (`1.50`), for an edit field. */
-function microToCny(micro: number): string {
-  const v = BigInt(micro);
-  return `${v / 1_000_000n}.${String((v % 1_000_000n) / 10_000n).padStart(2, "0")}`;
 }
 
 /** Quota reads in flight at once: the page's share of the control plane's small connection pool. */
@@ -514,7 +508,7 @@ function QuotaRow({
                     size="sm"
                     disabled={acting !== null}
                     onClick={() => {
-                      setDraft(microToCny(b.limit_micro_cny));
+                      setDraft(microCnyToInput(b.limit_micro_cny));
                       setProblem(null);
                       setEditing(true);
                     }}

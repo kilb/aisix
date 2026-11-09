@@ -218,6 +218,15 @@ test("创建密钥时的查看价格链接打开所选分组", async ({ page }) 
   expect(page.url()).toContain("prices");
   await page.reload();
   await expect(groupTabs(page).getByRole("tab", { name: GROUP_B.display })).toHaveAttribute("aria-selected", "true");
+
+  // Back to 密钥 through the nav, and the same link again: it opens the same
+  // group a second time, and the address follows the nav in between.
+  await page.getByRole("tab", { name: "密钥", exact: true }).click();
+  await expect.soft(page).toHaveURL(/#keys$/);
+  await page.getByRole("group", { name: "分组" }).getByRole("radio", { name: new RegExp(GROUP_B.display) }).check();
+  await page.getByRole("link", { name: "查看价格" }).click();
+  await expect(page.getByRole("tab", { name: "价格", exact: true })).toHaveAttribute("aria-selected", "true");
+  await expect(groupTabs(page).getByRole("tab", { name: GROUP_B.display })).toHaveAttribute("aria-selected", "true");
 });
 
 test("价格页不出现分组的路由名", async ({ page }) => {

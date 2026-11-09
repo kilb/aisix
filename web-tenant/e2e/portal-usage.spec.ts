@@ -165,6 +165,34 @@ test("调用记录逐次列出模型、密钥、状态与费用，展开后看�
   await expect(detail.locator("tbody > tr")).toHaveCount(2);
   await expect(detail.getByRole("row").filter({ hasText: "输入" }).getByRole("cell")).toHaveText(["输入", "5", "¥1,000.00"]);
   await expect(detail.getByRole("row").filter({ hasText: "输出" }).getByRole("cell")).toHaveText(["输出", "3", "¥2,000.00"]);
+  // No discount, so nothing says one was taken.
+  await expect(log.getByText(/组织折扣/)).toHaveCount(0);
+});
+
+test("有组织折扣时，计费明细的单价标明为折扣前，并说明这次按组织折扣减免了多少", async ({ page }) => {
+  const world = await seedBillingWorld(stack);
+  // 10 % off, from a moment ago: the call below is priced with it.
+  await stack.admin.post("/admin/pricing/discounts", {
+    tenant_id: world.tenantId,
+    effective_from: new Date(Date.now() - 4_000).toISOString(),
+    discount_bps: 1_000,
+  });
+  expect(await chat(stack, world.key.plaintext, "chat-ui")).toBe(200);
+  await logged(world.owner, 1);
+  const { log } = await openUsage(page, world.owner);
+
+  const rows = logRows(log);
+  await expect(rows).toHaveCount(1);
+  // 5 input tokens at ¥1,000/M and 3 output at ¥2,000/M is ¥0.011 before
+  // the discount; 10 % off leaves ¥0.0099.
+  await expect(rows.first().getByRole("cell").nth(8)).toHaveText("¥0.0099");
+  await rows.first().getByRole("button", { name: "展开明细" }).click();
+  const detail = log.getByRole("table", { name: "计费明细" });
+  // The unit prices are the group's, before the discount, and say so.
+  await expect(detail.getByRole("columnheader")).toHaveText(["计量", "数量", "折扣前单价（元/百万）"]);
+  await expect(detail.getByRole("row").filter({ hasText: "输入" }).getByRole("cell")).toHaveText(["输入", "5", "¥1,000.00"]);
+  await expect(detail.getByRole("row").filter({ hasText: "输出" }).getByRole("cell")).toHaveText(["输出", "3", "¥2,000.00"]);
+  await expect(log.getByText("本次按组织折扣计费：在折扣前的价格上减免 10%。")).toBeVisible();
 });
 
 test("调用记录与汇总里没有任何上游渠道、账号、分组或上游模型名", async ({ page }) => {

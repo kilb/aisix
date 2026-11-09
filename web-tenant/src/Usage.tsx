@@ -58,6 +58,12 @@ function signed(micro: number): string {
   return micro > 0 ? `+${fmtMicroCny(micro)}` : fmtMicroCny(micro);
 }
 
+/** Basis points as the share taken off, in integer arithmetic: 1000 is `10%`, 1250 is `12.5%`. */
+function percentOf(bps: number): string {
+  const fraction = String(bps % 100).padStart(2, "0").replace(/0+$/, "");
+  return `${Math.floor(bps / 100)}${fraction ? `.${fraction}` : ""}%`;
+}
+
 /** What a call's 费用 cell says. */
 function chargeText(c: Call): string {
   const { charge } = c;
@@ -480,7 +486,7 @@ function CallLog({ keys, showKeys, models }: { keys: TenantKey[]; showKeys: bool
                               <tr>
                                 <th>计量</th>
                                 <th className="num">数量</th>
-                                <th className="num">单价（元/百万）</th>
+                                <th className="num">折扣前单价（元/百万）</th>
                               </tr>
                             </thead>
                             <tbody>
@@ -493,6 +499,11 @@ function CallLog({ keys, showKeys, models }: { keys: TenantKey[]; showKeys: bool
                               ))}
                             </tbody>
                           </DataTable>
+                        )}
+                        {c.charge.discount_bps > 0 && (
+                          <p className="hint">
+                            本次按组织折扣计费：在折扣前的价格上减免 {percentOf(c.charge.discount_bps)}。
+                          </p>
                         )}
                       </td>
                     </tr>

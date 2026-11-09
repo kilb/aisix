@@ -294,7 +294,7 @@ function Readout({ member, balance, team }: { member: SessionMember; balance: Ba
     );
   }
   return (
-    <BalanceReadout effectiveMicroUsd={view.effective} stops={view.stops} binding={view.binding} picker={picker}>
+    <BalanceReadout effectiveMicroCny={view.effective} stops={view.stops} binding={view.binding} picker={picker}>
       {err && (
         <div className="note crit" role="alert">
           {err}

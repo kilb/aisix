@@ -330,6 +330,7 @@ function GroupCell({
     }
     return (
       <span className="acts">
+        <span className="hint">分组只能选择一次，选定后不能更改，并决定这个密钥的价格。</span>
         <select aria-label="分组" value={choice} onChange={(e) => setChoice(e.target.value)}>
           <option value="">请选择</option>
           {(groups ?? []).map((g) => (

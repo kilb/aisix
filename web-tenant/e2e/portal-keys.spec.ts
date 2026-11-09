@@ -352,6 +352,9 @@ test("未选分组的旧密钥可以选择一次分组", async ({ page }) => {
   await openTab(page, "密钥");
   listed = row(page, "legacy-key-4e5");
   await listed.getByRole("button", { name: "选择分组" }).click();
+  // Before anything is chosen, the tenant is told the choice is for good and
+  // what it decides.
+  await expect(listed).toContainText("分组只能选择一次，选定后不能更改，并决定这个密钥的价格");
   await listed.getByRole("combobox", { name: "分组" }).selectOption({ label: "A 通道 7c3" });
   await listed.getByRole("button", { name: "确认选择" }).click();
   await expect(listed).toContainText("A 通道 7c3");
