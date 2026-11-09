@@ -137,7 +137,9 @@ way.
   and then `refs::lock_resources` itself, because its reference counts are
   plain `SELECT`s (`a_retire_waits_for_the_resources_lock`,
   `a_grant_that_commits_first_makes_the_retire_refuse`,
-  `tests/channel_models.rs`). Never take a group or public-model row after
+  `tests/channel_models.rs`). A bulk apply of an account's upstream models
+  takes every public model it reuses, in ascending id order, before that
+  lock (`a_selection_takes_its_public_models_before_the_resources_lock`). Never take a group or public-model row after
   the resources lock; a path that needs both takes the row first.
 - **A generated document's owner is `public:<public_model_id>`, and only
   `src/channels.rs` writes one.** The direct and routing documents a public

@@ -172,6 +172,39 @@ test("协议族的选项就是网关 schema 里的 Adapter 枚举", async ({ pag
   await expect(page.getByLabel("协议族").locator("option")).toHaveText(schema.definitions.Adapter.enum);
 });
 
+/** Three or more English words in a row: prose, as opposed to an identifier such as `openai`. */
+const ENGLISH_PROSE = /[A-Za-z]+ [A-Za-z]+ [A-Za-z]+/;
+
+test("账号表单的说明文字都是中文，供应商标识带中文说明", async ({ page }) => {
+  const account = await stack.admin.post("/admin/resources/provider_keys", {
+    doc: {
+      display_name: "acct-hint-e2e",
+      provider: "openai",
+      api_key: "sk-e2e-hint-upstream-3d1",
+      api_base: `${stack.mockUpstreamUrl}/v1`,
+      groups: ["shared"],
+    },
+  });
+  await loginAsOperator(page);
+  await openTab(page, "上游账号");
+
+  // A new account, and an existing one's edit view with its 模型 section.
+  await page.getByRole("button", { name: "新增上游账号" }).click();
+  const create = page.getByRole("form", { name: "新增上游账号" });
+  await expect(create.getByLabel("供应商标识")).toHaveAccessibleDescription(/供应商/);
+  await expect(create.getByLabel("供应商标识")).not.toHaveAccessibleDescription(ENGLISH_PROSE);
+  for (const hint of await create.locator(".hint").allTextContents()) expect(hint).not.toMatch(ENGLISH_PROSE);
+  await create.getByRole("button", { name: "取消" }).click();
+
+  await accountRow(page, account.doc.display_name).getByRole("button", { name: /编辑|查看/ }).click();
+  const edit = page.getByRole("form", { name: "编辑上游账号「acct-hint-e2e」" });
+  await expect(edit.getByLabel("供应商标识")).toHaveAccessibleDescription(/供应商/);
+  const section = page.getByRole("region", { name: "模型" });
+  await expect(section).toBeVisible();
+  for (const hint of await edit.locator(".hint").allTextContents()) expect(hint).not.toMatch(ENGLISH_PROSE);
+  for (const hint of await section.locator(".hint").allTextContents()) expect(hint).not.toMatch(ENGLISH_PROSE);
+});
+
 test("新建上游账号默认带平台默认分组，保存后显示已生效", async ({ page }) => {
   await loginAsOperator(page);
   await openTab(page, "上游账号");

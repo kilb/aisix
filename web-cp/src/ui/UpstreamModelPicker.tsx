@@ -33,7 +33,7 @@ function fetchOnce(accountId: string): Promise<UpstreamModelList> {
 }
 
 /** The refusal's own words: a scrubbed upstream detail names what went wrong. */
-function why(e: unknown): string {
+export function why(e: unknown): string {
   if (e instanceof ApiError) {
     return [messageFor(e), ...e.details.map((d) => d.message)].join("；");
   }

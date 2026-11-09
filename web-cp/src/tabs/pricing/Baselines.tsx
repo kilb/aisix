@@ -251,7 +251,7 @@ export function Baselines({ canEdit, onGoto }: TabProps) {
           {rows === null ? (
             !error && <Loading />
           ) : rows.length === 0 ? (
-            <EmptyState text="还没有模型。先在「模型与路由」中创建模型。" />
+            <EmptyState text="还没有模型。先在「价格 → 公共模型」中新建公共模型，或在「上游账号 → 模型」中获取上游模型。" />
           ) : (
             <DataTable label="基准价">
               <thead>

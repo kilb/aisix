@@ -8,7 +8,7 @@ import { REDACTED, SecretInput } from "../components/SecretInput";
 import { ApiError, groups as groupsApi, settings, tenants, type AdminKey, type ResourceView, type Tenant } from "../lib/api";
 import { messageFor, problemAt } from "../lib/errors";
 import { errorText, maskUrl } from "../lib/fmt";
-import { describeAt, enumAt, loadSchema } from "../lib/schema";
+import { enumAt, loadSchema } from "../lib/schema";
 import { useResource } from "../lib/useResource";
 import { Button } from "../ui/Button";
 import { DataTable, Loading } from "../ui/DataTable";
@@ -33,7 +33,14 @@ interface ProviderKeyDoc {
 type Account = ResourceView<ProviderKeyDoc>;
 
 /** What the form reads from the gateway's `provider_key` schema. */
-type SchemaInfo = { adapters: string[]; providerHint: string | null } | { error: string };
+type SchemaInfo = { adapters: string[] } | { error: string };
+
+/**
+ * The 供应商标识 field's help. The Dashboard's own words: the schema's
+ * description is the public API reference, in English.
+ */
+const PROVIDER_HINT =
+  "上游供应商的标识，例如 openai、deepseek、anthropic，或模型目录中的 ID。网关据此选择该供应商专属的调用方式，并校验接口地址。";
 
 /** Which form is open: a new account (with its starting groups), or one account. */
 type Open = { mode: "new"; groups: string[]; groupsNote: string | null } | { mode: "edit"; id: string };
@@ -88,7 +95,7 @@ export function Providers({ canEdit }: TabProps) {
       (s) => {
         let info: SchemaInfo;
         try {
-          info = { adapters: enumAt(s, "/properties/adapter"), providerHint: describeAt(s, "/properties/provider") };
+          info = { adapters: enumAt(s, "/properties/adapter") };
         } catch (e) {
           info = { error: e instanceof Error ? e.message : String(e) };
         }
@@ -582,10 +589,9 @@ function AccountForm({
           </Field>
         )}
       </div>
-      <Field label="供应商标识" error={at("provider")}>
+      <Field label="供应商标识" hint={PROVIDER_HINT} error={at("provider")}>
         {(aria) => <input disabled={locked} value={provider} onChange={(e) => setProvider(e.target.value)} {...aria} />}
       </Field>
-      {schema && "providerHint" in schema && schema.providerHint && <p className="hint">{schema.providerHint}</p>}
       <Field label="接口地址" error={at("apiBase")}>
         {(aria) => (
           <input

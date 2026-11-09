@@ -575,6 +575,12 @@ pub const ROUTE_ROLES: &[(&str, &str, MinRole)] = &[
         "/admin/provider-keys/{id}/channel-models",
         MinRole::Op(OperatorRole::Viewer),
     ),
+    // A selection of the account's upstream models, mapped in one step.
+    (
+        "POST",
+        "/admin/provider-keys/{id}/channel-models",
+        MinRole::Op(OperatorRole::Operator),
+    ),
     (
         "PUT",
         "/admin/provider-keys/{id}/channel-models/{public_model_id}",
@@ -863,7 +869,7 @@ pub fn browser_router(state: AppState) -> Router {
         .route("/admin/public-models/{id}/retire", post(channels::retire))
         .route(
             "/admin/provider-keys/{id}/channel-models",
-            get(channels::list_channels),
+            get(channels::list_channels).post(channels::bulk_channels),
         )
         .route(
             "/admin/provider-keys/{id}/channel-models/{public_model_id}",

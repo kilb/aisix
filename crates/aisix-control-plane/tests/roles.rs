@@ -318,6 +318,12 @@ fn fixture(method: &str, path: &str, target: &SeededOperator) -> (String, Option
             format!("/admin/provider-keys/{}/channel-models", Uuid::nil()),
             None,
         ),
+        // The account matches nothing: past the role check, 422 at the
+        // account, and the selection's public model is not created.
+        ("POST", "/admin/provider-keys/{id}/channel-models") => (
+            format!("/admin/provider-keys/{}/channel-models", Uuid::nil()),
+            Some(json!({"upstream_models": [format!("roles-{}", Uuid::new_v4().simple())]})),
+        ),
         ("PUT", "/admin/provider-keys/{id}/channel-models/{public_model_id}") => (
             format!(
                 "/admin/provider-keys/{}/channel-models/{}",

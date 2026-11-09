@@ -162,6 +162,16 @@ async function clearUpstream(): Promise<void> {
   expect(res.status).toBe(204);
 }
 
+test("模型与路由说明：租户可见的模型在上游账号的模型里建为公共模型", async ({ page }) => {
+  await openModels(page);
+  const panel = page.locator(".panel").filter({ has: page.getByRole("heading", { name: /模型与路由/, level: 2 }) });
+  const hint = panel.locator(".hint").filter({ hasText: "上游账号 → 模型" });
+  await expect(hint).toHaveCount(1);
+  await expect(hint).toContainText("公共模型");
+  await expect(hint).toContainText("分组定价");
+  await expect(hint).toContainText("授权");
+});
+
 test("直连模型：保存后网关能用它的对外名称调用", async ({ page }) => {
   const account = await mockAccount("acct-chat-e2e", ["shared"]);
 
