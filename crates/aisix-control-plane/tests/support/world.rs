@@ -91,7 +91,12 @@ pub async fn seed_model(cp: &TestCp, admin: &OperatorSession) -> Uuid {
     Uuid::parse_str(&text(&model, "/id")).expect("a model id")
 }
 
-/// A tenant of group `shared`. The first-boot tenant defaults name that group
+/// A tenant of group `shared`, on the **selected** model scope with the list
+/// the caller then grants, which is what most of these fixtures mean by "a
+/// tenant that reaches these models". A create leaves a tenant on `all`
+/// (`tenants::insert`), so this narrows it once, at the empty list.
+///
+/// The first-boot tenant defaults name `shared`
 /// (`settings::TenantDefaults::first_boot`), so the create needs no group list;
 /// the assignment is checked rather than assumed.
 pub async fn seed_tenant(cp: &TestCp, admin: &OperatorSession) -> Uuid {
@@ -108,6 +113,24 @@ pub async fn seed_tenant(cp: &TestCp, admin: &OperatorSession) -> Uuid {
         json!([SHARED_GROUP]),
         "a seeded tenant is assigned {SHARED_GROUP}"
     );
+    assert_eq!(tenant["model_scope"], "all", "a new tenant starts on all");
+    assert_eq!(
+        tenant["allowed_model_ids"],
+        json!([]),
+        "a new tenant's stored list is empty"
+    );
+    let version = tenant["version"].as_i64().expect("a version");
+    let narrowed = cp
+        .send_conditional(
+            "PATCH",
+            &format!("/admin/tenants/{id}"),
+            admin.cookie(),
+            version,
+            json!({"model_scope": "selected"}),
+        )
+        .await;
+    assert_eq!(narrowed.status, 200, "{narrowed:?}");
+    assert_eq!(narrowed.body["model_scope"], "selected", "{narrowed:?}");
     id
 }
 

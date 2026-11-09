@@ -1285,7 +1285,8 @@ pub async fn org(auth: MemberAuth, State(state): State<AppState>) -> Result<Json
 }
 
 /// `GET /api/models` → `{items: [{id, name}]}`: the live models the tenant
-/// is granted, by their platform name only, in name order.
+/// reaches through its model scope, by their platform name only, in name
+/// order.
 pub async fn models(
     auth: MemberAuth,
     State(state): State<AppState>,
@@ -1297,15 +1298,16 @@ pub async fn models(
         MemberRole::Member,
         MemberRole::Billing,
     ])?;
+    let mut conn = state.db.pool().acquire().await.map_err(DbError::from)?;
+    let tenant = tenants::find(&mut conn, auth.tenant_id).await?;
     let rows: Vec<(Uuid, String)> = sqlx::query_as(
         "SELECT r.id, COALESCE(r.doc->>'display_name', '') FROM gw_resources r \
-         JOIN tenants t ON r.id = ANY(t.allowed_model_ids) \
-         WHERE t.id = $1 AND r.kind = $2 AND NOT r.deleted \
+         WHERE r.kind = $2 AND NOT r.deleted AND r.id = ANY($1) \
          ORDER BY 2, 1",
     )
-    .bind(auth.tenant_id)
+    .bind(&tenant.effective_model_ids)
     .bind(Kind::Models.segment())
-    .fetch_all(state.db.pool())
+    .fetch_all(&mut *conn)
     .await
     .map_err(DbError::from)?;
     let items: Vec<Value> = rows

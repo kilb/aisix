@@ -430,8 +430,8 @@ async fn targets_are_ordered_by_priority_then_weight_then_id() {
     cp.db()
         .tx(move |conn| {
             async move {
-                channels::regenerate(conn, &ctx, id).await?;
-                channels::regenerate(conn, &ctx, id).await?;
+                channels::regenerate(conn, &ctx, id, &[]).await?;
+                channels::regenerate(conn, &ctx, id, &[]).await?;
                 Ok::<_, aisix_control_plane::error::ApiError>(())
             }
             .boxed()
@@ -745,7 +745,7 @@ async fn a_retired_public_model_cannot_be_regenerated_or_retired_again() {
         .db()
         .tx(move |conn| {
             async move {
-                channels::regenerate(conn, &ctx, id).await?;
+                channels::regenerate(conn, &ctx, id, &[]).await?;
                 Ok::<_, aisix_control_plane::error::ApiError>(())
             }
             .boxed()

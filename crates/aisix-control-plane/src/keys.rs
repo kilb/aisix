@@ -291,16 +291,19 @@ fn prefix_of(plaintext: &str) -> &str {
 }
 
 /// The models a key of `t` reaches by id: its selection within the
-/// tenant's grants, or every grant without one; sorted, and empty rather
-/// than absent when there is none.
+/// tenant's model scope (`t.effective_model_ids`), or every model of that
+/// scope without one; sorted, and empty rather than absent when there is
+/// none. An all-scope tenant's scope is every live public model, so a key
+/// with no selection names them all, and one with a selection picks from
+/// them.
 fn granted_model_ids(t: &TenantRow, k: &KeyRow) -> Vec<String> {
     let mut ids: Vec<Uuid> = match &k.model_ids {
         Some(selected) => selected
             .iter()
-            .filter(|id| t.allowed_model_ids.contains(id))
+            .filter(|id| t.effective_model_ids.contains(id))
             .copied()
             .collect(),
-        None => t.allowed_model_ids.clone(),
+        None => t.effective_model_ids.clone(),
     };
     ids.sort();
     ids.dedup();
@@ -373,7 +376,11 @@ fn effective_disabled(t: &TenantRow, k: &KeyRow, member_active: bool) -> bool {
 /// whose own state did not change. Kept per row, so a key an older replica
 /// writes during a rolling upgrade, or one written before a rollback and a
 /// second upgrade, is caught up too.
-pub const KEY_DOC_VERSION: i32 = 2;
+///
+/// 3: a tenant's model scope is resolved into the document, so a key of an
+/// all-scope tenant written as `[]` or as a stale list is rewritten to the
+/// live public models.
+pub const KEY_DOC_VERSION: i32 = 3;
 
 /// The gateway `api_keys` document of key `k` of tenant `t`, whose member,
 /// if it has one, is `member_active`: neither disabled nor removed, and in
@@ -383,7 +390,10 @@ pub const KEY_DOC_VERSION: i32 = 2;
 ///   `user_id` (the member, when there is one).
 /// - A customer's key names its models by id, always with the list written
 ///   (`[]` grants none, where an absent list would fall back to names), and
-///   may call [`FIRST_PHASE_ENDPOINTS`] only.
+///   may call [`FIRST_PHASE_ENDPOINTS`] only. The list is the key's
+///   selection within the tenant's model scope, or the whole scope without
+///   one; an all-scope tenant's is the live public models, resolved when the
+///   tenant row is read.
 /// - The platform's own key names models by its patterns when it has some,
 ///   and by id otherwise, and calls every endpoint.
 /// - `allowed_provider_groups`: the one group the key names — an exact
@@ -530,6 +540,22 @@ async fn project(
         .execute(conn)
         .await
         .map_err(DbError::from)?;
+    Ok(())
+}
+
+/// Rewrites the documents of every live key of each of the already-locked
+/// `tenants`, in the caller's transaction. Used where what tenants reach
+/// changed rather than their own rows: a public model became callable, or
+/// stopped being. The caller holds every one of their rows, taken before
+/// any public model's row ([`tenants::lock_all_scope`]).
+pub async fn reproject_tenants(
+    conn: &mut PgConnection,
+    ctx: &WriteCtx,
+    tenants: &[TenantRow],
+) -> Result<(), ApiError> {
+    for tenant in tenants {
+        reproject_tenant_at(&mut *conn, ctx, tenant.id, KEY_DOC_VERSION).await?;
+    }
     Ok(())
 }
 
@@ -726,15 +752,15 @@ fn checked_label(raw: &str) -> Result<String, Detail> {
 }
 
 /// The models `raw` selects, sorted without repeats, once each is one of
-/// the tenant's grants; otherwise a detail at `/model_ids/<i>` for each that
-/// is not. A model the tenant is not granted answers as an id that names
-/// nothing.
+/// the tenant's model scope (`t.effective_model_ids`); otherwise a detail
+/// at `/model_ids/<i>` for each that is not. A model the tenant does not
+/// reach answers as an id that names nothing.
 fn checked_model_ids(t: &TenantRow, raw: &[String]) -> Result<Vec<Uuid>, Vec<Detail>> {
     let mut ids = Vec::with_capacity(raw.len());
     let mut problems = Vec::new();
     for (i, entry) in raw.iter().enumerate() {
         match Uuid::parse_str(entry) {
-            Ok(id) if t.allowed_model_ids.contains(&id) => ids.push(id),
+            Ok(id) if t.effective_model_ids.contains(&id) => ids.push(id),
             _ => problems.push(detail(&format!("/model_ids/{i}"), "租户没有这个模型")),
         }
     }
@@ -1847,6 +1873,10 @@ mod tests {
             status: TenantStatus::Active,
             is_internal: false,
             billing_mode: BillingMode::Prepaid,
+            // The stored list is the scope these unit cases exercise; an
+            // all-scope row is built explicitly where one is wanted.
+            model_scope: crate::tenants::ModelScope::Selected,
+            effective_model_ids: grants.to_vec(),
             allowed_model_ids: grants.to_vec(),
             allowed_provider_groups: groups.iter().map(|g| g.to_string()).collect(),
             limits: TenantLimits::default(),
@@ -2184,6 +2214,19 @@ mod tests {
             }),
             ..key(None)
         };
+        // An all-scope customer: its stored list is empty and its effective
+        // set is the public models, written as concrete ids.
+        let all_scope = TenantRow {
+            model_scope: crate::tenants::ModelScope::All,
+            allowed_model_ids: Vec::new(),
+            effective_model_ids: vec![M1, M2],
+            ..tenant(&[], &["shared"])
+        };
+        let all_scope_doc = build_key_doc(&all_scope, &key(None), true);
+        assert_eq!(
+            all_scope_doc["allowed_model_ids"],
+            json!([M1.to_string(), M2.to_string()])
+        );
         let docs = [
             build_key_doc(&customer, &key(None), true),
             build_key_doc(&customer, &grouped("grp-eu-5d2"), true),
@@ -2193,6 +2236,7 @@ mod tests {
             build_key_doc(&internal(&[]), &patterned, true),
             build_key_doc(&internal(&[M1]), &grouped("grp-ops-7c1"), true),
             build_key_doc(&internal(&[M1]), &key(None), true),
+            all_scope_doc,
         ];
         for doc in docs {
             validate_strict(Kind::ApiKeys, &doc).unwrap_or_else(|e| panic!("strict: {e:?} {doc}"));

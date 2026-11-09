@@ -6,6 +6,8 @@
 use aisix_control_plane::audit::Actor;
 use aisix_control_plane::auth::password;
 use aisix_control_plane::auth::MemberRole;
+use aisix_control_plane::db::DbError;
+use aisix_control_plane::error::ApiError;
 use aisix_control_plane::members;
 use aisix_control_plane::resources::write::WriteCtx;
 use aisix_control_plane::tenants::{self, BillingMode, TenantStatus};
@@ -130,14 +132,20 @@ pub fn cookie_of(r: &Resp) -> Option<String> {
 }
 
 impl TestCp {
-    /// A new ordinary tenant in `status`, with the tenant defaults.
+    /// A new ordinary tenant in `status`, with the tenant defaults, on the
+    /// **selected** model scope with an empty list: the fixtures built on
+    /// this helper grant models explicitly, and a tenant on every public
+    /// model would silently reach more than each one means.
+    ///
+    /// A create leaves a tenant on `all` (`tenants::insert`), so the scope
+    /// is narrowed here in the same transaction.
     pub async fn seed_tenant(&self, status: TenantStatus) -> Uuid {
         let ctx = WriteCtx::of(self.state());
         let name = format!("tenant-{}", Uuid::new_v4().simple());
         self.db()
             .tx(move |conn| {
                 async move {
-                    tenants::create(
+                    let tenant = tenants::create(
                         conn,
                         &ctx,
                         &name,
@@ -145,7 +153,13 @@ impl TestCp {
                         BillingMode::Prepaid,
                         Actor::System,
                     )
-                    .await
+                    .await?;
+                    sqlx::query("UPDATE tenants SET model_scope = 'selected' WHERE id = $1")
+                        .bind(tenant.id)
+                        .execute(&mut *conn)
+                        .await
+                        .map_err(DbError::from)?;
+                    Ok::<_, ApiError>(tenant)
                 }
                 .boxed()
             })

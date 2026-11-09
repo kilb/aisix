@@ -1600,6 +1600,19 @@ async fn every_tenant_write_takes_the_tenant_before_the_resources_lock() {
         )
         .await;
     assert_eq!(r.status, 200, "{r:?}");
+    let r = cp
+        .send(
+            "POST",
+            "/admin/public-models",
+            Some(op.as_str()),
+            Some(json!({"name": "order-pub-7c1"})),
+        )
+        .await;
+    assert_eq!(r.status, 201, "{r:?}");
+    let public = r.body["id"]
+        .as_str()
+        .expect("a public model id")
+        .to_string();
     let owner = cp.member_login_seeded(tenant, MemberRole::Owner).await;
     let member = cp.seed_member(tenant, MemberRole::Member).await;
     let leaver = cp.seed_member(tenant, MemberRole::Member).await;
@@ -1902,24 +1915,50 @@ async fn every_tenant_write_takes_the_tenant_before_the_resources_lock() {
         assert_eq!(status, expected, "{what}");
     }
 
+    // A channel edit and a public model's retire reproject every all-scope
+    // tenant's keys, because what those tenants reach changed rather than
+    // their own rows: each takes their rows before the public model's. The
+    // tenant above is `selected`, so an all-scope one is made for this.
+    let all_scope =
+        Uuid::parse_str(&id_of(&admin.create_tenant("order-all-7c1").await)).expect("a uuid");
+    let what = "PUT /admin/provider-keys/{id}/channel-models/{id}";
+    let status = waits_for_the_tenant_first(
+        &cp,
+        all_scope,
+        what,
+        fire(
+            cp.clone(),
+            "PUT",
+            format!("/admin/provider-keys/{pk}/channel-models/{public}"),
+            op.clone(),
+            None,
+            Some(json!({})),
+        ),
+    )
+    .await;
+    assert_eq!(status, 200, "{what}");
+    let what = "POST /admin/public-models/{id}/retire";
+    let status = waits_for_the_tenant_first(
+        &cp,
+        all_scope,
+        what,
+        fire(
+            cp.clone(),
+            "POST",
+            format!("/admin/public-models/{public}/retire"),
+            op.clone(),
+            None,
+            Some(json!({})),
+        ),
+    )
+    .await;
+    assert_eq!(status, 409, "{what}");
+
     // The pass that replaces a grant of a channel's generated direct model
     // with its public model (`tenants::replace_generated_grants`, run at boot
     // and by every housekeeping tick) re-projects the tenant's keys. The
     // grant is written by SQL, as only a release before the refusal could
     // write it, once the cases above no longer rewrite the grants.
-    let r = cp
-        .send(
-            "POST",
-            "/admin/public-models",
-            Some(op.as_str()),
-            Some(json!({"name": "order-pub-7c1"})),
-        )
-        .await;
-    assert_eq!(r.status, 201, "{r:?}");
-    let public = r.body["id"]
-        .as_str()
-        .expect("a public model id")
-        .to_string();
     let r = cp
         .send(
             "PUT",
@@ -2195,7 +2234,7 @@ fn every_tenant_derived_document_loads_on_the_lenient_schema() {
 /// delete above, which does take its holders first. A grant that did
 /// disappear here would mean a withdrawal crept back in.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_channel_edit_takes_no_tenant_lock() {
+async fn a_channel_edit_takes_its_all_scope_tenants_first() {
     let Some(cp) = TestCp::start_with(patient).await else {
         return;
     };
@@ -2261,27 +2300,30 @@ async fn a_channel_edit_takes_no_tenant_lock() {
     .await;
     assert_eq!(granted, 200);
 
-    // Held tenant row: the disable runs to completion anyway, taking no
-    // tenant lock, and the grant survives.
-    let mut holder = cp.db().pool().begin().await.expect("begin");
-    sqlx::query("SELECT 1 FROM tenants WHERE id = $1 FOR UPDATE")
+    // A grant of the public model is written by SQL, as a release that let
+    // it store one did: an all-scope tenant holds no such grant as a
+    // reference, but the row is a reference row all the same, and a channel
+    // edit reprojects this tenant's keys. Held here, the edit waits for the
+    // row — and, while it waits, holds no resources lock.
+    sqlx::query("UPDATE tenants SET model_scope = 'all', allowed_model_ids = $2 WHERE id = $1")
         .bind(tenant)
-        .execute(&mut *holder)
+        .bind(vec![Uuid::parse_str(&public_id).expect("a uuid")])
+        .execute(cp.db().pool())
         .await
-        .expect("hold the tenant");
-    let disabled = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        cp.send(
+        .expect("store the grant");
+    let what = "PUT /admin/provider-keys/{id}/channel-models/{id}";
+    let status = {
+        let request = fire(
+            cp.clone(),
             "PUT",
-            &channel,
-            Some(op.cookie()),
+            channel.clone(),
+            op.cookie().to_string(),
+            None,
             Some(json!({"enabled": false})),
-        ),
-    )
-    .await
-    .expect("a channel edit takes no tenant lock");
-    holder.rollback().await.expect("release the tenant");
-    assert_eq!(disabled.status, 200, "{disabled:?}");
+        );
+        waits_for_the_tenant_first(&cp, tenant, what, request).await
+    };
+    assert_eq!(status, 200, "{what}");
     let grants: Vec<Uuid> =
         sqlx::query_scalar("SELECT allowed_model_ids FROM tenants WHERE id = $1")
             .bind(tenant)

@@ -36,17 +36,23 @@
 //!
 //! # Locks
 //!
-//! A channel edit is one transaction: the public model's row `FOR UPDATE`
+//! A channel edit is one transaction: every all-scope tenant's row
+//! ([`crate::tenants::lock_all_scope`]), the public model's row `FOR UPDATE`
 //! ([`lock_public`]), then [`write_resource`], which takes
-//! `RESOURCES_LOCK_KEY` itself. A public model's row sits after the tenant
-//! rows and before the resources lock, which is the documented order; this
-//! module never withdraws a grant, so it takes no tenant row at all
-//! (`crate/AGENTS.md`, "Lock order").
+//! `RESOURCES_LOCK_KEY` itself. A tenant's row sits before a public model's,
+//! which sits before the resources lock, which is the documented order. The
+//! tenants' rows are taken because a public model that becomes callable is
+//! in every all-scope tenant's scope at once, and their key documents, which
+//! name the models by id, are rewritten in the same transaction
+//! ([`crate::keys::reproject_tenants`]). This module still never withdraws a
+//! grant: a selected tenant's list is an operator's.
 //!
-//! A retire takes the same two in the same order, but takes the resources
-//! lock itself ([`refs::lock_resources`]) because its reference counts are
-//! plain `SELECT`s: a grant commits under that lock, so a count taken before
-//! it could miss one ([`retire`]).
+//! A retire takes the tenants' rows, then the public model's, then takes the
+//! resources lock itself ([`refs::lock_resources`]) because its reference
+//! counts are plain `SELECT`s: a grant commits under that lock, so a count
+//! taken before it could miss one ([`retire`]). It then rewrites the
+//! all-scope tenants' key documents before deleting the documents the
+//! retired model owns, so no key document names a model that is going.
 //!
 //! A bulk apply ([`bulk_channels`]) holds several public models at once: it
 //! takes every one it reuses in ascending id order, and only then the
@@ -379,6 +385,7 @@ pub async fn regenerate(
     conn: &mut PgConnection,
     ctx: &WriteCtx,
     public_model_id: Uuid,
+    all_scope: &[crate::tenants::TenantRow],
 ) -> Result<(), ApiError> {
     let public = lock_public(&mut *conn, public_model_id).await?;
     if public.retired_at.is_some() {
@@ -459,7 +466,15 @@ pub async fn regenerate(
         )
         .await?;
     }
-    Ok(())
+    // Every all-scope tenant reaches this public model from now on — or, for
+    // a model whose routing document this pass wrote without targets, still
+    // reaches it, listed and answering `upstream_unavailable` — so its keys
+    // are rewritten in the same transaction. A key's document names the
+    // models by id, so a public model that became callable reaches an
+    // all-scope tenant only once this has run; done here, it cannot be
+    // later than the routing document it depends on. The tenants' rows are
+    // held by the caller, before this public model's row.
+    crate::keys::reproject_tenants(&mut *conn, ctx, all_scope).await
 }
 
 /// Refuses the delete of a provider key any channel model names, `409
@@ -496,11 +511,15 @@ pub async fn refuse_if_served(
 /// What still holds a public model from being retired.
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct PublicModelUse {
-    /// Live tenants whose grants name it.
+    /// Live tenants whose **selected** scope names it. A tenant on every
+    /// public model is not a reference: its scope is what the catalogue
+    /// holds, so the model simply stops being in it.
     pub tenants: i64,
-    /// Live keys that reach it: those whose model selection names it, and
-    /// those with no selection, which reach every model their live tenant
-    /// is granted.
+    /// Live keys of **selected**-scope tenants that reach it: those whose
+    /// model selection names it, and those with no selection whose tenant's
+    /// list names it. A key of an all-scope tenant names no reference
+    /// whichever its selection says: the tenant's scope is the catalogue,
+    /// and the key's selection narrows within it.
     pub keys: i64,
     /// Its enabled channel models.
     pub channels: i64,
@@ -516,7 +535,8 @@ impl PublicModelUse {
 async fn references(conn: &mut PgConnection, id: Uuid) -> Result<PublicModelUse, ApiError> {
     let tenants: i64 = sqlx::query_scalar(
         "SELECT COUNT(*)::bigint FROM tenants \
-         WHERE status <> 'deleted' AND $1 = ANY(allowed_model_ids)",
+         WHERE status <> 'deleted' AND model_scope = 'selected' \
+           AND $1 = ANY(allowed_model_ids)",
     )
     .bind(id)
     .fetch_one(&mut *conn)
@@ -524,10 +544,14 @@ async fn references(conn: &mut PgConnection, id: Uuid) -> Result<PublicModelUse,
     .map_err(DbError::from)?;
     let keys: i64 = sqlx::query_scalar(
         "SELECT COUNT(*)::bigint FROM tenant_keys k \
-         WHERE k.revoked_at IS NULL AND ($1 = ANY(k.model_ids) \
-           OR (k.model_ids IS NULL AND EXISTS (SELECT 1 FROM tenants t \
+         WHERE k.revoked_at IS NULL AND EXISTS (SELECT 1 FROM tenants t \
                 WHERE t.id = k.tenant_id AND t.status <> 'deleted' \
-                  AND $1 = ANY(t.allowed_model_ids))))",
+                  AND t.model_scope = 'selected') \
+           AND ($1 = ANY(k.model_ids) \
+             OR (k.model_ids IS NULL AND EXISTS (SELECT 1 FROM tenants t \
+                  WHERE t.id = k.tenant_id AND t.status <> 'deleted' \
+                    AND t.model_scope = 'selected' \
+                    AND $1 = ANY(t.allowed_model_ids))))",
     )
     .bind(id)
     .fetch_one(&mut *conn)
@@ -812,6 +836,10 @@ pub async fn retire(
         .db
         .tx(move |conn| {
             async move {
+                // An all-scope tenant's keys name this model while it is
+                // callable and must stop naming it once it is retired, so
+                // their rows are held from here, before the public model's.
+                let all_scope = crate::tenants::lock_all_scope(&mut *conn).await?;
                 let row = lock_public(&mut *conn, id).await?;
                 if row.retired_at.is_some() {
                     return Err(retired());
@@ -823,6 +851,19 @@ pub async fn retire(
                         serde_json::to_value(uses).map_err(ApiError::internal)?,
                     ));
                 }
+                // Retired first, so the scope an all-scope tenant's keys are
+                // rewritten from no longer holds this model: a key document
+                // names the models by id, and `write_resource` refuses to
+                // delete a model one still names. All in one transaction, so
+                // no other reader sees the model retired but still served.
+                sqlx::query(
+                    "UPDATE public_models SET retired_at = now(), enabled = false WHERE id = $1",
+                )
+                .bind(id)
+                .execute(&mut *conn)
+                .await
+                .map_err(DbError::from)?;
+                crate::keys::reproject_tenants(&mut *conn, &ctx, &all_scope).await?;
                 let owner = owner(id);
                 // Referrers before referents: the routing document names
                 // every direct document by id.
@@ -853,13 +894,6 @@ pub async fn retire(
                     .execute(&mut *conn)
                     .await
                     .map_err(DbError::from)?;
-                sqlx::query(
-                    "UPDATE public_models SET retired_at = now(), enabled = false WHERE id = $1",
-                )
-                .bind(id)
-                .execute(&mut *conn)
-                .await
-                .map_err(DbError::from)?;
                 audit::record(
                     &mut *conn,
                     AuditEntry {
@@ -1032,6 +1066,11 @@ pub async fn put_channel(
                 else {
                     return Err(refused("/provider_key_id", "该上游账号不存在或已删除"));
                 };
+                // A channel edit can make a public model callable or
+                // uncallable, which changes what every all-scope tenant
+                // reaches: their rows are taken first, before the public
+                // model's, in the documented order.
+                let all_scope = crate::tenants::lock_all_scope(&mut *conn).await?;
                 let public = lock_public(&mut *conn, public_model_id).await?;
                 if public.retired_at.is_some() {
                     return Err(retired());
@@ -1109,7 +1148,7 @@ pub async fn put_channel(
                     },
                 )
                 .await?;
-                regenerate(&mut *conn, &ctx, public_model_id).await?;
+                regenerate(&mut *conn, &ctx, public_model_id, &all_scope).await?;
                 let warnings: Vec<&str> = if provider_key_of(&mut *conn, provider_key_id)
                     .await?
                     .is_none()
@@ -1276,6 +1315,10 @@ pub async fn bulk_channels(
         .tx(move |conn| {
             async move {
                 let wanted: Vec<String> = names.iter().map(|(_, n)| n.clone()).collect();
+                // Every all-scope tenant's row, before any public model's:
+                // the rows this apply may make callable are taken after
+                // them, in the documented order.
+                let all_scope = crate::tenants::lock_all_scope(&mut *conn).await?;
                 // The public models this reuses, held before the resources
                 // lock. One that is retired while this waits drops out of
                 // the result, and is refused below as a retired name.
@@ -1468,7 +1511,7 @@ pub async fn bulk_channels(
                 }
                 touched.sort();
                 for public_model_id in touched {
-                    regenerate(&mut *conn, &ctx, public_model_id).await?;
+                    regenerate(&mut *conn, &ctx, public_model_id, &all_scope).await?;
                 }
                 Ok::<_, ApiError>(items)
             }
@@ -1518,6 +1561,7 @@ pub async fn delete_channel(
         .db
         .tx(move |conn| {
             async move {
+                let all_scope = crate::tenants::lock_all_scope(&mut *conn).await?;
                 let public = lock_public(&mut *conn, public_model_id).await?;
                 if public.retired_at.is_some() {
                     return Err(retired());
@@ -1546,7 +1590,7 @@ pub async fn delete_channel(
                     },
                 )
                 .await?;
-                regenerate(&mut *conn, &ctx, public_model_id).await
+                regenerate(&mut *conn, &ctx, public_model_id, &all_scope).await
             }
             .boxed()
         })

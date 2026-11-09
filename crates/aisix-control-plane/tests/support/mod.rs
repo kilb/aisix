@@ -560,6 +560,30 @@ impl TestCp {
         let response = request.send().await.expect("send the request");
         Resp::read(response).await
     }
+
+    /// [`TestCp::send`] with `If-Match: "<version>"`, as the Dashboard sends
+    /// a write to a versioned row.
+    pub async fn send_conditional(
+        &self,
+        method: &str,
+        path: &str,
+        cookie: &str,
+        version: i64,
+        body: Value,
+    ) -> Resp {
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("an HTTP client");
+        let method = reqwest::Method::from_bytes(method.as_bytes()).expect("an HTTP method");
+        let request = client
+            .request(method, self.url(path))
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .header(reqwest::header::COOKIE, cookie)
+            .header(reqwest::header::IF_MATCH, format!("\"{version}\""))
+            .json(&body);
+        Resp::read(request.send().await.expect("send the request")).await
+    }
 }
 
 /// A gateway credential as issued: what a gateway is given.
@@ -739,7 +763,9 @@ pub struct Resp {
 }
 
 impl Resp {
-    async fn read(response: reqwest::Response) -> Resp {
+    /// The answer as [`Resp`], for a test that sends its own request (an
+    /// `If-Match`, say, which [`TestCp::send`] does not carry).
+    pub async fn read(response: reqwest::Response) -> Resp {
         let status = response.status().as_u16();
         let headers = response.headers().clone();
         let set_cookie = headers

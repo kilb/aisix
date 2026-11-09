@@ -80,6 +80,19 @@ td > .tn-actions {
   margin-top: var(--s-2);
 }
 
+/* The model scope: two radios on one line, above the list they govern. */
+.tn-scope {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--s-2) var(--s-4);
+  margin: var(--s-2) 0 0;
+}
+.tn-scope label {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--s-2);
+  cursor: pointer;
+}
 .tn-checks {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));

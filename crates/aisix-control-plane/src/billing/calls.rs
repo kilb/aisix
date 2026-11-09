@@ -171,20 +171,23 @@ pub struct Models {
 }
 
 impl Models {
-    /// Reads the grants of `tenant` and the current names of `ids`.
+    /// Reads the model scope of `tenant` and the current names of `ids`.
+    /// A model outside that scope is named without its id, as one the tenant
+    /// does not reach; an all-scope tenant reaches every live public model.
     pub async fn load(
         conn: &mut PgConnection,
         tenant: Uuid,
         ids: &[Uuid],
     ) -> Result<Models, DbError> {
+        let scope = crate::tenants::scope_model_ids(&mut *conn, tenant).await?;
         let rows: Vec<(Uuid, String, bool)> = sqlx::query_as(
-            "SELECT r.id, COALESCE(r.doc->>'display_name', ''), r.id = ANY(t.allowed_model_ids) \
-             FROM gw_resources r, tenants t \
-             WHERE t.id = $1 AND r.id = ANY($2) AND r.kind = $3 AND NOT r.deleted",
+            "SELECT r.id, COALESCE(r.doc->>'display_name', ''), r.id = ANY($2) \
+             FROM gw_resources r \
+             WHERE r.id = ANY($3) AND r.kind = $1 AND NOT r.deleted",
         )
-        .bind(tenant)
-        .bind(ids)
         .bind(Kind::Models.segment())
+        .bind(&scope)
+        .bind(ids)
         .fetch_all(conn)
         .await?;
         let mut models = Models {
