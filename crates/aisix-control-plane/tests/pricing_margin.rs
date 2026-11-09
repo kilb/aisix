@@ -188,11 +188,18 @@ async fn rows_without_a_cost_are_counted_apart() {
     .await;
 
     let item = one(&margin(&w.cp, &w.admin, "").await);
-    assert_eq!(item["charged_micro_cny"], 7_200, "{item}");
+    // Both rows' money is reported: the second row was charged too, and
+    // charging it is not made not to have happened by its cost being
+    // unknown. Only the cost side is partial, and `rows_without_cost` says
+    // how partial.
+    assert_eq!(item["charged_micro_cny"], 14_400, "{item}");
     assert_eq!(item["cost_micro_usd"], 1_000, "{item}");
     assert_eq!(item["rows"], 1, "{item}");
     assert_eq!(item["rows_without_cost"], 1, "{item}");
-    assert_eq!(item["realised_cny_per_usd"], "7.2000", "{item}");
+    // So the rate over the known-cost rows alone is 7.2, and the rate the
+    // two figures on the page give is 14.4: the difference is the reader's
+    // warning that one of the two rows has no cost behind it.
+    assert_eq!(item["realised_cny_per_usd"], "14.4000", "{item}");
 }
 
 #[tokio::test]
@@ -252,6 +259,179 @@ async fn adjustment(w: &World, event_id: &str, delta: i64) {
     .expect("insert the adjustment");
 }
 
+/// An unpriced charge of `event_id` on `model`, written by raw SQL as intake
+/// stores a row it cannot price: **no group**, no charge, no cost, and a
+/// positive adjustment on it as a re-pricing run writes once the key has
+/// taken a group (R11). The charge row is never updated, so its group column
+/// stays NULL while the money is real.
+async fn a_repriced_no_group_row(w: &World, event_id: &str, model: Uuid) -> i64 {
+    let occurred_at = Utc::now();
+    sqlx::query(
+        "INSERT INTO usage_events (event_id, dp_id, batch_id, occurred_at, team_id, api_key_id, \
+                                   event) \
+         VALUES ($1, $2, $2, $3, $4, $5, \
+                 jsonb_build_object('event_id', $1, 'team_id', $4, 'api_key_id', $5, \
+                   'requested_model_id', $6::text, 'operation', 'chat'))",
+    )
+    .bind(event_id)
+    .bind(Uuid::new_v4())
+    .bind(occurred_at)
+    .bind(w.tenant.to_string())
+    .bind(&w.key)
+    .bind(model)
+    .execute(w.cp.db().pool())
+    .await
+    .expect("insert the usage row");
+    sqlx::query(
+        "INSERT INTO pricing_charges_cny \
+         (event_id, tenant_id, api_key_id, user_id, requested_model_id, occurred_at, status, \
+          error_code, engine_version) \
+         VALUES ($1, $2, $3, $4, $5::text, $6, 'unpriced', 'no_group', $7)",
+    )
+    .bind(event_id)
+    .bind(w.tenant.to_string())
+    .bind(&w.key)
+    .bind(w.member.to_string())
+    .bind(model)
+    .bind(occurred_at)
+    .bind(i64::from(aisix_pricing::ENGINE_VERSION))
+    .execute(w.cp.db().pool())
+    .await
+    .expect("insert the unpriced charge");
+    // What a run charged once the key's group was set: 7.2 for 1000 tokens at
+    // the $1/M cost card, written as an adjustment because the charge row is
+    // append-only.
+    let delta = 7_200;
+    adjustment(w, event_id, delta).await;
+    delta
+}
+
+#[tokio::test]
+async fn a_row_repriced_after_its_key_took_a_group_reports_under_that_group() {
+    let Some(w) = world().await else { return };
+    let model = seed_model(&w.cp, &w.admin).await;
+    price_at_rate(&w.cp, model).await;
+    cost(&w.cp, "1").await;
+    let delta = a_repriced_no_group_row(&w, "ng1", model).await;
+
+    // The charge row still has no group of its own; its key has `shared`, and
+    // that is the group the run billed it at. It must be there, not absent.
+    let group: Option<Uuid> = sqlx::query_scalar(
+        "SELECT g.id FROM pricing_charges_cny c LEFT JOIN tenant_keys k \
+           ON k.id::text = c.api_key_id LEFT JOIN provider_groups g \
+           ON g.id = COALESCE(c.group_id, k.group_id) WHERE c.event_id = 'ng1'",
+    )
+    .fetch_one(w.cp.db().pool())
+    .await
+    .expect("read the billed group");
+    assert_eq!(
+        group,
+        Some(support::world::group_id(&w.cp, "shared").await),
+        "the fixture did not build a no-group row"
+    );
+
+    let item = one(&margin(&w.cp, &w.admin, "").await);
+    assert_eq!(uuid(&item, "/group/id"), group.expect("a group"), "{item}");
+    assert_eq!(item["charged_micro_cny"], delta, "{item}");
+    assert_eq!(item["cost_micro_usd"], 0, "{item}");
+    assert_eq!(item["rows"], 0, "{item}");
+    assert_eq!(item["rows_without_cost"], 1, "{item}");
+    // No cost, so no rate: null, not 0 and not a division by nothing.
+    assert_eq!(item["realised_cny_per_usd"], Value::Null, "{item}");
+}
+
+#[tokio::test]
+async fn a_row_whose_key_names_no_group_is_its_own_item_with_a_null_group() {
+    let Some(w) = world().await else { return };
+    let model = seed_model(&w.cp, &w.admin).await;
+    price_at_rate(&w.cp, model).await;
+    cost(&w.cp, "1").await;
+    let delta = a_repriced_no_group_row(&w, "ng1", model).await;
+    // A key that names no group (the one window R2 leaves open for a key an
+    // older replica minted): the run bills it at nothing, so its money has
+    // no group to be reported under. It must still be reported.
+    sqlx::query("UPDATE tenant_keys SET group_id = NULL WHERE id = $1::uuid")
+        .bind(&w.key)
+        .execute(w.cp.db().pool())
+        .await
+        .expect("clear the key's group");
+
+    let r = margin(&w.cp, &w.admin, "").await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let items = r.body["items"].as_array().expect("items");
+    assert_eq!(items.len(), 1, "{r:?}");
+    let item = &items[0];
+    assert_eq!(item["group"]["id"], Value::Null, "{item}");
+    assert_eq!(item["group"]["display_name"], Value::Null, "{item}");
+    assert_eq!(item["charged_micro_cny"], delta, "{item}");
+}
+
+#[tokio::test]
+async fn the_margin_items_account_for_every_charged_row() {
+    let Some(w) = world().await else { return };
+    let model = seed_model(&w.cp, &w.admin).await;
+    price_at_rate(&w.cp, model).await;
+    cost(&w.cp, "1").await;
+    // Three kinds of row in one range: a costed charge with an adjustment, a
+    // costless charge, and a repriced row whose charge names no group.
+    send(
+        &w,
+        vec![
+            served(&w, "m1", model, tokens_1000()),
+            usage(&w, "m2", model, tokens_1000()),
+        ],
+    )
+    .await;
+    adjustment(&w, "m1", 3_600).await;
+    a_repriced_no_group_row(&w, "ng1", model).await;
+
+    let (from, to) = (
+        db_now(&w.cp).await - TimeDelta::hours(1),
+        db_now(&w.cp).await + TimeDelta::hours(1),
+    );
+    // What the ledger says: every charge plus every adjustment to a charge in
+    // the range.
+    let total: i64 = sqlx::query_scalar(
+        "SELECT (COALESCE(SUM(c.charge_micro_cny), 0)::bigint \
+                 + COALESCE((SELECT SUM(pa.delta_micro_cny)::bigint \
+                             FROM pricing_adjustments_cny pa \
+                             JOIN pricing_charges_cny pc ON pc.event_id = pa.event_id \
+                             WHERE pc.occurred_at >= $1 AND pc.occurred_at < $2), 0)::bigint) \
+         FROM pricing_charges_cny c WHERE c.occurred_at >= $1 AND c.occurred_at < $2",
+    )
+    .bind(from)
+    .bind(to)
+    .fetch_one(w.cp.db().pool())
+    .await
+    .expect("sum the charges");
+    assert_eq!(
+        total,
+        7_200 + 7_200 + 3_600 + 7_200,
+        "the fixture's own total"
+    );
+
+    let r = margin(&w.cp, &w.admin, "").await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let items = r.body["items"].as_array().expect("items");
+    let summed: i64 = items
+        .iter()
+        .map(|i| i["charged_micro_cny"].as_i64().expect("an amount"))
+        .sum();
+    // Whatever the grouping, no charge and no adjustment is outside it.
+    assert_eq!(summed, total, "items {r:?}");
+    // And it is not one collapsed row: the model has a costed and a costless
+    // row, and the repriced one carries no cost of its own.
+    let costed: i64 = items
+        .iter()
+        .map(|i| i["rows"].as_i64().expect("rows"))
+        .sum();
+    let costless: i64 = items
+        .iter()
+        .map(|i| i["rows_without_cost"].as_i64().expect("rows"))
+        .sum();
+    assert_eq!((costed, costless), (1, 2), "items {r:?}");
+}
+
 #[tokio::test]
 async fn each_charge_shows_its_realised_rate() {
     let Some(w) = world().await else { return };
@@ -289,6 +469,37 @@ async fn each_charge_shows_its_realised_rate() {
     assert_eq!(row("m2")["realised_cny_per_usd"], Value::Null, "{r:?}");
 }
 
+#[tokio::test]
+async fn a_deleted_model_is_named_null_not_empty() {
+    let Some(w) = world().await else { return };
+    let model = seed_model(&w.cp, &w.admin).await;
+    price_at_rate(&w.cp, model).await;
+    cost(&w.cp, "1").await;
+    // A model that never carried a display name, so the two cases are told
+    // apart by the row's presence rather than by its text.
+    sqlx::query("UPDATE gw_resources SET doc = doc - 'display_name' WHERE id = $1")
+        .bind(model)
+        .execute(w.cp.db().pool())
+        .await
+        .expect("strip the display name");
+    send(&w, vec![served(&w, "d1", model, tokens_1000())]).await;
+    let item = one(&margin(&w.cp, &w.admin, "").await);
+    // The row is live but unnamed: `""` says "no display name", which is
+    // what the model's document says.
+    assert_eq!(item["model"]["name"], "", "{item}");
+
+    // Deleted, its row is a tombstone: `null` says "gone", which an empty
+    // string cannot.
+    sqlx::query("UPDATE gw_resources SET deleted = true WHERE id = $1")
+        .bind(model)
+        .execute(w.cp.db().pool())
+        .await
+        .expect("delete the model");
+    let item = one(&margin(&w.cp, &w.admin, "").await);
+    assert_eq!(item["model"]["name"], Value::Null, "{item}");
+    assert_eq!(item["charged_micro_cny"], 7_200, "{item}");
+}
+
 #[test]
 fn the_realised_rate_rounds_half_up_to_four_places() {
     // 7.2 is exact at any scale; 7.20005 rounds to 7.2001, not 7.2000.
@@ -310,6 +521,13 @@ fn the_realised_rate_rounds_half_up_to_four_places() {
     // shown rather than clamped: 10⁶ µ¥ charged per 1 µ$ of cost is one
     // million CNY per dollar.
     assert_eq!(realised(1_000_000, 1).as_deref(), Some("1000000.0000"));
+    // A group's net charge can be negative after adjustments that reverse
+    // more than it charged. The sign is kept: it must not read as its own
+    // magnitude.
+    assert_eq!(realised(-7_200_000, 1_000_000).as_deref(), Some("-7.2000"));
+    assert_eq!(realised(-1, 3).as_deref(), Some("-0.3333"));
+    // A magnitude below one place rounds to zero and keeps no sign.
+    assert_eq!(realised(-4, 1_000_000).as_deref(), Some("0.0000"));
 }
 
 #[tokio::test]
@@ -356,7 +574,138 @@ async fn the_margin_filters_by_group_and_model() {
 }
 
 #[tokio::test]
-async fn a_margin_range_is_bounded_and_ordered() {
+async fn the_margin_is_ordered_by_the_groups_display_name_then_the_model() {
+    let Some(w) = world().await else { return };
+    // Two groups whose creation order, routing names and ids all disagree
+    // with the display names, and two models per group whose names and ids
+    // disagree with their id order, so only the documented order passes.
+    let suffix = Uuid::new_v4().simple();
+    let zebra = group_named(&w.cp, &w.admin, &format!("aa-{suffix}"), "斑马").await;
+    let alpha = group_named(&w.cp, &w.admin, &format!("zz-{suffix}"), "阿阿尔法").await;
+    let b_model = seed_model(&w.cp, &w.admin).await;
+    let a_model = seed_model(&w.cp, &w.admin).await;
+    price_at_rate(&w.cp, b_model).await;
+    price_at_rate(&w.cp, a_model).await;
+    rate(&w.cp, zebra, db_now(&w.cp).await, RATE).await;
+    rate(&w.cp, alpha, db_now(&w.cp).await, RATE).await;
+    cost(&w.cp, "1").await;
+    // The tenant must be assigned both groups before a key may name either.
+    let version: i64 = sqlx::query_scalar("SELECT version FROM tenants WHERE id = $1")
+        .bind(w.tenant)
+        .fetch_one(w.cp.db().pool())
+        .await
+        .expect("read the version");
+    let r = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("an HTTP client")
+        .request(
+            reqwest::Method::PATCH,
+            w.cp.url(&format!("/admin/tenants/{}", w.tenant)),
+        )
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .header(reqwest::header::COOKIE, w.admin.cookie())
+        .header(reqwest::header::IF_MATCH, format!("\"{version}\""))
+        .json(&json!({"allowed_provider_groups": [
+            group_name(&w.cp, zebra).await, group_name(&w.cp, alpha).await,
+        ]}))
+        .send()
+        .await
+        .expect("assign the groups");
+    assert_eq!(r.status().as_u16(), 200, "assign the groups");
+    // A charge is billed at its key's group, so each group needs a key of its
+    // own for a row to land in it.
+    let mut events = Vec::new();
+    for (group, name) in [(zebra, "aa-"), (alpha, "zz-")] {
+        let key = support::world::seed_key_in_group(
+            &w.cp,
+            &w.admin,
+            w.tenant,
+            None,
+            &group_name(&w.cp, group).await,
+        )
+        .await;
+        for (model, prefix) in [(b_model, "b"), (a_model, "a")] {
+            let mut event = served(
+                &w,
+                &format!("{name}{prefix}-{suffix}"),
+                model,
+                tokens_1000(),
+            );
+            event["api_key_id"] = json!(key);
+            events.push(event);
+        }
+    }
+    send(&w, events).await;
+
+    let r = margin(&w.cp, &w.admin, "").await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let items = r.body["items"].as_array().expect("items");
+    // Display name first, then the group's id, then the model's id. Both
+    // groups hold both models, so each group contributes two items ordered by
+    // model id, and the groups are ordered by their display names as the
+    // database compares them (not as they were created, and not by routing
+    // name).
+    let order: Vec<(String, String)> = items
+        .iter()
+        .map(|i| {
+            (
+                i["group"]["display_name"]
+                    .as_str()
+                    .expect("a name")
+                    .to_string(),
+                i["model"]["id"].as_str().expect("an id").to_string(),
+            )
+        })
+        .collect();
+    let (first, second) = if "斑马" < "阿阿尔法" {
+        ("斑马", "阿阿尔法")
+    } else {
+        ("阿阿尔法", "斑马")
+    };
+    let mut expected: Vec<(String, String)> = Vec::new();
+    for group in [first, second] {
+        let mut models = vec![a_model, b_model];
+        models.sort_unstable();
+        for model in models {
+            expected.push((group.to_string(), model.to_string()));
+        }
+    }
+    assert_eq!(order, expected, "{r:?}");
+}
+
+/// The routing name of the group `id`, which a key is minted under.
+async fn group_name(cp: &support::TestCp, id: Uuid) -> String {
+    sqlx::query_scalar("SELECT name FROM provider_groups WHERE id = $1")
+        .bind(id)
+        .fetch_one(cp.db().pool())
+        .await
+        .expect("the group's name")
+}
+
+/// A live group whose routing name is `name` and whose display name is
+/// `display_name`, created as an operator; its id.
+async fn group_named(
+    cp: &support::TestCp,
+    admin: &OperatorSession,
+    name: &str,
+    display_name: &str,
+) -> Uuid {
+    let r = cp
+        .send(
+            "POST",
+            "/admin/provider-groups",
+            Some(admin.cookie()),
+            Some(json!({"name": name, "display_name": display_name,
+                        "description": "排序", "default_cny_per_usd": "1"})),
+        )
+        .await;
+    assert_eq!(r.status, 201, "create group {name}: {r:?}");
+    Uuid::parse_str(r.body["id"].as_str().expect("a group id")).expect("a uuid")
+}
+
+#[tokio::test]
+async fn a_margin_range_is_bounded() {
     let Some(w) = world().await else { return };
     // Longer than two years is refused, as every summary by month is.
     let now = db_now(&w.cp).await;

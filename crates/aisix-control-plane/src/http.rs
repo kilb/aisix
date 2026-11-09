@@ -623,7 +623,7 @@ pub const ROUTE_ROLES: &[(&str, &str, MinRole)] = &[
 ];
 
 /// Every tenant role.
-const EVERY_MEMBER: &[MemberRole] = &[
+pub(crate) const EVERY_MEMBER: &[MemberRole] = &[
     MemberRole::Owner,
     MemberRole::Admin,
     MemberRole::Member,
@@ -1052,12 +1052,13 @@ async fn healthz() -> Json<Value> {
 mod tests {
     use std::path::Path;
 
-    use super::{MinRole, INACTIVE_TENANT_ROUTES, ROUTE_ROLES};
+    use super::{MinRole, EVERY_MEMBER, INACTIVE_TENANT_ROUTES, ROUTE_ROLES};
     use crate::auth::{MemberRole, KEY_HOLDERS};
 
     /// The role lists a handler may name in `.require(..)` instead of
     /// spelling the roles out, by the name it uses.
-    const NAMED_ROLE_LISTS: &[(&str, &[MemberRole])] = &[("KEY_HOLDERS", KEY_HOLDERS)];
+    const NAMED_ROLE_LISTS: &[(&str, &[MemberRole])] =
+        &[("KEY_HOLDERS", KEY_HOLDERS), ("EVERY_MEMBER", EVERY_MEMBER)];
 
     /// The part of `src` before its test module.
     fn production(src: &str) -> &str {

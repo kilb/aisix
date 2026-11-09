@@ -23,9 +23,10 @@ use uuid::Uuid;
 
 use super::lookup_prices::{priced_models, PricedModel};
 use super::money::CURRENCY;
-use crate::auth::{MemberAuth, MemberRole};
+use crate::auth::MemberAuth;
 use crate::error::ApiError;
 use crate::groups::GroupRow;
+use crate::http::EVERY_MEMBER;
 use crate::tenants;
 use crate::AppState;
 
@@ -104,12 +105,9 @@ pub async fn prices(
     State(state): State<AppState>,
 ) -> Result<Json<Value>, ApiError> {
     auth.require_active()?;
-    auth.require(&[
-        MemberRole::Owner,
-        MemberRole::Admin,
-        MemberRole::Member,
-        MemberRole::Billing,
-    ])?;
+    // The same list the route's `ROUTE_ROLES` row names, so a role added there
+    // cannot leave this handler behind.
+    auth.require(EVERY_MEMBER)?;
     let tenant_id = auth.tenant_id;
     let body = state
         .db

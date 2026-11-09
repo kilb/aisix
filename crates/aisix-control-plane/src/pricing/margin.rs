@@ -10,9 +10,11 @@
 //!
 //! A row's cost is known only when it names the upstream that served it and
 //! a cost price covers that pair: a row that names neither carries no cost,
-//! and a cost nobody knows cannot enter either side of a ratio. Those rows
+//! and a cost nobody knows never enters the cost side of a ratio. Such rows
 //! are counted apart (`rows_without_cost`) rather than dropped silently, so
-//! an operator can see how much of a period the rate does not cover.
+//! an operator can see how much of a period's charge the cost side does not
+//! cover — and their money is still in `charged_micro_cny`, because they were
+//! charged.
 //!
 //! This API names upstream costs, so it is for operators only and is never
 //! projected to tenants.
@@ -85,17 +87,34 @@ fn uuid_filter(raw: Option<&str>, path: &str) -> Result<Option<Uuid>, ApiError> 
 
 /// `GET /admin/pricing/margin?from&to&group_id&model_id` → `{items:
 /// [MarginRow]}`, grouped by (group, model) and ordered by the group's
-/// display name, then the model's id.
+/// display name (a null group last), then the group's id, then the model's
+/// id.
 ///
-/// A row covers the period in which its usage occurred, and carries the
-/// charge the group made (its charge plus every re-pricing adjustment) and
-/// the upstream cost it was served at. `charged_micro_cny` and
-/// `cost_micro_usd` cover only the rows whose cost is known; the rows
-/// without one are counted in `rows_without_cost` and enter neither figure,
-/// so an unknown cost can never flatter or deflate the rate.
+/// **The group is the one the charge was billed at**, not the column alone:
+/// `COALESCE(c.group_id, the key's group_id)`, the same expression a
+/// re-pricing run prices a row at (`repricing::BILLED_GROUP`). Intake stores
+/// a row it could not price with `group_id` NULL; a later run bills it at its
+/// key's group and writes the money to `pricing_adjustments_cny`, while the
+/// charge row is never updated. Grouping on the column would then drop that
+/// money from every item. A row whose key names no group still belongs to
+/// none: it comes back as its own item with `group` `null`, so it is visible
+/// and countable rather than absent. The invariant this preserves, and
+/// `the_margin_items_account_for_every_charged_row` pins, is that over any
+/// range the sum of `charged_micro_cny` over every item equals the charges
+/// plus their adjustments — whatever the grouping.
 ///
-/// A charge filed under no group (a row from before the group's assignment
-/// took effect) belongs to no group's margin and is left out of every row.
+/// `charged_micro_cny` is the corrected charge of every row in the group:
+/// its `charge_micro_cny` plus every adjustment to it. `cost_micro_usd` sums
+/// the rows whose cost is known, and `rows_without_cost` counts the rest, so
+/// the two figures are shown as they stand and a reader can see how much of
+/// the charge no cost is known against — a cost that cannot be known never
+/// silently changes either amount.
+///
+/// The filters are bounded by the range: `model_id` alone has no index of
+/// its own besides `pricing_charges_cny_occurred` (0027), and the range cap
+/// of 731 days (`billing::range`) is what bounds that scan; a group and a
+/// model together use `pricing_charges_cny_margin`, and `group_id` alone
+/// uses its leading column.
 pub async fn list(
     auth: OperatorAuth,
     State(state): State<AppState>,
@@ -116,29 +135,32 @@ pub async fn list(
     let model_id = uuid_filter(q.model_id.as_deref(), "/model_id")?;
     let model_filter = model_id.map(|id| id.to_string());
     let rows: Vec<MarginRow> = sqlx::query_as(
-        "SELECT c.group_id, g.display_name AS group_display_name, \
+        "SELECT COALESCE(c.group_id, k.group_id) AS billed_group_id, \
+                g.display_name AS group_display_name, \
                 c.requested_model_id AS requested, \
-                COALESCE(r.doc->>'display_name', '') AS model_name, \
-                (COALESCE(SUM(c.charge_micro_cny) \
-                          FILTER (WHERE c.cost_micro_usd IS NOT NULL), 0)::bigint \
+                CASE WHEN r.id IS NULL THEN NULL \
+                     ELSE COALESCE(r.doc->>'display_name', '') END AS model_name, \
+                (COALESCE(SUM(c.charge_micro_cny), 0)::bigint \
                  + COALESCE(SUM((SELECT COALESCE(SUM(pa.delta_micro_cny)::bigint, 0) \
                                  FROM pricing_adjustments_cny pa \
-                                 WHERE pa.event_id = c.event_id)) \
-                            FILTER (WHERE c.cost_micro_usd IS NOT NULL), 0)::bigint) \
+                                 WHERE pa.event_id = c.event_id)), 0)::bigint) \
                   AS charged, \
-                COALESCE(SUM(c.cost_micro_usd) \
-                         FILTER (WHERE c.cost_micro_usd IS NOT NULL), 0)::bigint AS cost, \
+                COALESCE(SUM(c.cost_micro_usd), 0)::bigint AS cost, \
                 (COUNT(*) FILTER (WHERE c.cost_micro_usd IS NOT NULL))::bigint AS rows, \
                 (COUNT(*) FILTER (WHERE c.cost_micro_usd IS NULL))::bigint \
                   AS rows_without_cost \
          FROM pricing_charges_cny c \
-         JOIN provider_groups g ON g.id = c.group_id \
-         LEFT JOIN gw_resources r ON r.kind = 'models' AND r.id::text = c.requested_model_id \
+         LEFT JOIN tenant_keys k ON k.id::text = c.api_key_id \
+         LEFT JOIN provider_groups g ON g.id = COALESCE(c.group_id, k.group_id) \
+         LEFT JOIN gw_resources r ON r.kind = 'models' AND NOT r.deleted \
+                                  AND r.id::text = c.requested_model_id \
          WHERE c.occurred_at >= $1 AND c.occurred_at < $2 \
-           AND ($3::uuid IS NULL OR c.group_id = $3) \
+           AND ($3::uuid IS NULL OR COALESCE(c.group_id, k.group_id) = $3) \
            AND ($4::text IS NULL OR c.requested_model_id = $4) \
-         GROUP BY c.group_id, g.display_name, c.requested_model_id, r.doc->>'display_name' \
-         ORDER BY g.display_name, c.group_id, c.requested_model_id",
+         GROUP BY COALESCE(c.group_id, k.group_id), g.display_name, c.requested_model_id, \
+                  r.id, r.doc->>'display_name' \
+         ORDER BY g.display_name NULLS LAST, COALESCE(c.group_id, k.group_id), \
+                  c.requested_model_id",
     )
     .bind(from)
     .bind(to)
@@ -151,9 +173,16 @@ pub async fn list(
         .into_iter()
         .map(|row| {
             json!({
-                "group": {"id": row.group_id, "display_name": row.group_display_name},
+                // A null group is a charge whose key names no group: it is
+                // real money with no group to report it under.
+                "group": match row.billed_group_id {
+                    Some(id) => json!({"id": id, "display_name": row.group_display_name}),
+                    None => json!({"id": null, "display_name": null}),
+                },
                 "model": {
                     "id": row.model_id(),
+                    // `null` says the model is gone (deleted, or never a row);
+                    // `""` would only say it has no display name.
                     "name": row.model_name,
                 },
                 "charged_micro_cny": row.charged,
@@ -170,11 +199,14 @@ pub async fn list(
 /// One (group, model) of a margin answer, as the query selects it.
 #[derive(Debug, sqlx::FromRow)]
 struct MarginRow {
-    group_id: Uuid,
-    group_display_name: String,
+    /// The group the charge was billed at: `None` when its key names none.
+    billed_group_id: Option<Uuid>,
+    /// That group's display name; `None` with `billed_group_id`.
+    group_display_name: Option<String>,
     /// `pricing_charges_cny.requested_model_id`, a text column.
     requested: String,
-    model_name: String,
+    /// The model's display name; `None` when no live model row has its id.
+    model_name: Option<String>,
     charged: i64,
     cost: i64,
     rows: i64,
