@@ -1207,8 +1207,14 @@ async fn call(
 /// the grant was of that model through one account. A key that selected the
 /// direct document selects the public model, and a call through either key
 /// to the one model its document grants is priced. Where the tenant already
-/// holds the public model, the direct document simply goes. A direct
-/// document whose public model is retired is withdrawn. Each tenant changed
+/// holds the public model, the direct document simply goes.
+///
+/// A direct document whose channel an operator removed since (an untick, or
+/// a retire of its public model) is withdrawn, not replaced: it reaches
+/// nothing, and a key document naming it could not be written. A key's
+/// selection of a direct document whose public model its tenant does not
+/// hold is withdrawn too, never opened to the public model, and a key whose
+/// selection names no direct document is left as it is. Each tenant changed
 /// has one audit row naming what was replaced and withdrawn. A later boot
 /// touches nothing.
 #[tokio::test]
@@ -1222,42 +1228,50 @@ async fn a_stored_grant_of_a_channels_direct_document_becomes_its_public_model()
     let r = put_channel(cp, op, account, public, json!({})).await;
     assert_eq!(r.status, 200, "{r:?}");
     let direct = direct_of(cp, account, public).await;
-    // A second public model on the same account, retired since: a channel
-    // row that outlived its model, which nothing can be granted through.
+    // A second account serving the same public model, unticked later.
+    let unticked_account = provider_key(cp, op, "acct-gp-5e0").await;
+    let r = put_channel(cp, op, unticked_account, public, json!({})).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let unticked = direct_of(cp, unticked_account, public).await;
+    // A second public model on the first account, retired later.
     let (gone, _) = create_public(cp, op, "pub-gone-8c1").await;
     let r = put_channel(cp, op, account, gone, json!({})).await;
     assert_eq!(r.status, 200, "{r:?}");
     let gone_direct = direct_of(cp, account, gone).await;
-    sqlx::query("UPDATE public_models SET retired_at = now() WHERE id = $1")
-        .bind(gone)
-        .execute(cp.db().pool())
-        .await
-        .expect("retire it underneath its channel row");
     support::world::price(cp, public).await;
 
-    // The world's tenant was granted only the two direct documents: its key
-    // follows every grant, and a second key selected only the first.
+    // The world's tenant was granted only direct documents: its key follows
+    // every grant, and a second key selected only the first.
     let selecting = new_key(cp, op, w.tenant).await;
     store_old_grants(
         cp,
         op,
         w.tenant,
-        &[direct, gone_direct],
+        &[direct, unticked, gone_direct],
         &[(selecting, vec![direct])],
     )
     .await;
     // Another tenant held the public model beside its direct document, and
-    // so did its key.
+    // so did one key; a second key selected the public model alone.
     let other = tenant_granted(cp, op, &[public]).await;
     let other_key = new_key(cp, op, other).await;
+    let public_only = new_key(cp, op, other).await;
     store_old_grants(
         cp,
         op,
         other,
         &[public, direct],
-        &[(other_key, vec![public, direct])],
+        &[
+            (other_key, vec![public, direct]),
+            (public_only, vec![public]),
+        ],
     )
     .await;
+    // A third tenant holds nothing, while its key's selection still names
+    // the direct document, as one left behind by a grant withdrawn since.
+    let narrow = tenant_granted(cp, op, &[]).await;
+    let narrow_key = new_key(cp, op, narrow).await;
+    store_old_grants(cp, op, narrow, &[], &[(narrow_key, vec![direct])]).await;
     let key = Uuid::parse_str(&w.key).expect("the world's key");
     for k in [key, selecting, other_key] {
         assert!(
@@ -1266,14 +1280,62 @@ async fn a_stored_grant_of_a_channels_direct_document_becomes_its_public_model()
         );
     }
 
+    // Through the API, as an operator does it: untick the public model on
+    // the second account, and retire the second public model once its
+    // channel is off. Both remove the channel row and the direct document
+    // and leave the grants.
+    let r = cp
+        .send(
+            "DELETE",
+            &format!("/admin/provider-keys/{unticked_account}/channel-models/{public}"),
+            Some(op.cookie()),
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(r.status, 204, "{r:?}");
+    let r = put_channel(cp, op, account, gone, json!({"enabled": false})).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let r = cp
+        .send(
+            "POST",
+            &format!("{PUBLICS}/{gone}/retire"),
+            Some(op.cookie()),
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(r.status, 200, "{r:?}");
+    assert_eq!(
+        grants(cp, w.tenant).await,
+        vec![direct, unticked, gone_direct]
+    );
+    let public_only_version: i64 =
+        sqlx::query_scalar("SELECT version FROM tenant_keys WHERE id = $1")
+            .bind(public_only)
+            .fetch_one(cp.db().pool())
+            .await
+            .expect("read the key");
+
     let booted = cp.restart().await;
     assert_eq!(grants(&booted, w.tenant).await, vec![public]);
     assert_eq!(grants(&booted, other).await, vec![public]);
+    assert_eq!(grants(&booted, narrow).await, Vec::<Uuid>::new());
     assert_eq!(selection(&booted, selecting).await, Some(vec![public]));
     assert_eq!(selection(&booted, other_key).await, Some(vec![public]));
-    for k in [key, selecting, other_key] {
+    assert_eq!(selection(&booted, public_only).await, Some(vec![public]));
+    assert_eq!(selection(&booted, narrow_key).await, Some(vec![]));
+    for k in [key, selecting, other_key, public_only] {
         assert_eq!(key_grants(&booted, k).await, vec![public], "{k}");
     }
+    assert_eq!(key_grants(&booted, narrow_key).await, Vec::<Uuid>::new());
+    let version: i64 = sqlx::query_scalar("SELECT version FROM tenant_keys WHERE id = $1")
+        .bind(public_only)
+        .fetch_one(booted.db().pool())
+        .await
+        .expect("read the key");
+    assert_eq!(
+        version, public_only_version,
+        "a key with nothing to replace is not written"
+    );
 
     // Each key's call to the one model its document grants is priced: the
     // baseline and the group rate are the public model's.
@@ -1295,6 +1357,7 @@ async fn a_stored_grant_of_a_channels_direct_document_becomes_its_public_model()
     let mut changed = vec![
         (Some(w.tenant), "system".to_string()),
         (Some(other), "system".to_string()),
+        (Some(narrow), "system".to_string()),
     ];
     changed.sort();
     assert_eq!(who, changed, "one row per tenant changed");
@@ -1304,13 +1367,21 @@ async fn a_stored_grant_of_a_channels_direct_document_becomes_its_public_model()
             .map(|(_, _, d)| d.clone())
             .unwrap_or_else(|| panic!("no audit row for {tenant}"))
     };
+    let mut dead = vec![unticked, gone_direct];
+    dead.sort();
+    let mut withdrawn: Vec<Uuid> =
+        serde_json::from_value(detail_of(w.tenant)["withdrawn"].clone()).expect("withdrawn ids");
+    withdrawn.sort();
+    assert_eq!(withdrawn, dead);
     assert_eq!(
-        detail_of(w.tenant),
-        json!({
-            "replaced": [pair],
-            "withdrawn": [gone_direct],
-            "keys": [{"key_id": selecting, "replaced": [pair], "withdrawn": []}],
-        })
+        (
+            detail_of(w.tenant)["replaced"].clone(),
+            detail_of(w.tenant)["keys"].clone()
+        ),
+        (
+            json!([pair]),
+            json!([{"key_id": selecting, "replaced": [pair], "withdrawn": []}])
+        )
     );
     assert_eq!(
         detail_of(other),
@@ -1320,12 +1391,20 @@ async fn a_stored_grant_of_a_channels_direct_document_becomes_its_public_model()
             "keys": [{"key_id": other_key, "replaced": [pair], "withdrawn": []}],
         })
     );
+    assert_eq!(
+        detail_of(narrow),
+        json!({
+            "replaced": [],
+            "withdrawn": [],
+            "keys": [{"key_id": narrow_key, "replaced": [], "withdrawn": [direct]}],
+        })
+    );
 
     // Idempotent: a later boot finds nothing to replace, and writes no row,
     // no document and no audit entry.
-    let before = untouched(&booted, &[w.tenant, other]).await;
+    let before = untouched(&booted, &[w.tenant, other, narrow]).await;
     let again = booted.restart().await;
-    assert_eq!(untouched(&again, &[w.tenant, other]).await, before);
+    assert_eq!(untouched(&again, &[w.tenant, other, narrow]).await, before);
 }
 
 /// One tenant held elsewhere holds back no other: the pass replaces the

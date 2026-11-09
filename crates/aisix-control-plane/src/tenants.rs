@@ -938,8 +938,9 @@ fn replace_generated(
 /// an older replica can still write during a rolling upgrade. The grant was
 /// of that public model through one account, so it becomes a grant of the
 /// public model; a key that selected the direct model selects the public
-/// one. Where the public model is retired, the grant is withdrawn. Run at
-/// boot and by every housekeeping tick.
+/// one, where its tenant then holds it. Where the public model is retired,
+/// or the channel was removed since (no channel row and no live document),
+/// the grant is withdrawn. Run at boot and by every housekeeping tick.
 ///
 /// One transaction per tenant, so a tenant that fails holds back no other,
 /// and takes the locks of a grant edit and no more: the tenant's row, then
@@ -952,18 +953,18 @@ fn replace_generated(
 /// the model ids replaced and withdrawn, on the tenant and on each key.
 ///
 /// A tenant the gateway-version gate refuses, or that stays busy, is left
-/// for the next pass, and so is one that fails otherwise: its grant stays
-/// as it was, which is what the gateways already serve. A tenant whose
-/// grants name no such model is not written at all.
+/// for the next pass, and so is one that fails otherwise, logged with its
+/// id: its grant stays as it was, which is what the gateways already serve.
+/// A tenant whose grants name no such model is not written at all.
 pub async fn replace_generated_grants(
     db: &Db,
     ctx: &WriteCtx,
 ) -> Result<GeneratedGrantsReplaced, ApiError> {
     let holders: Vec<Uuid> = sqlx::query_scalar(
-        "SELECT t.id FROM tenants t WHERE t.status <> 'deleted' \
-           AND EXISTS (SELECT 1 FROM channel_models cm WHERE cm.direct_model_id = ANY(t.allowed_model_ids)) \
-         UNION SELECT k.tenant_id FROM tenant_keys k JOIN tenants t ON t.id = k.tenant_id \
-         WHERE t.status <> 'deleted' AND k.revoked_at IS NULL \
+        "SELECT t.id FROM tenants t \
+         WHERE EXISTS (SELECT 1 FROM channel_models cm WHERE cm.direct_model_id = ANY(t.allowed_model_ids)) \
+         UNION SELECT k.tenant_id FROM tenant_keys k \
+         WHERE k.revoked_at IS NULL \
            AND EXISTS (SELECT 1 FROM channel_models cm WHERE cm.direct_model_id = ANY(k.model_ids)) \
          ORDER BY 1",
     )
@@ -995,6 +996,7 @@ pub async fn replace_generated_grants(
             Err(e) => {
                 outcome.failed += 1;
                 tracing::warn!(
+                    tenant = %tenant,
                     code = e.code,
                     "a tenant's grants of channels' generated direct models could not be replaced"
                 );
@@ -1056,10 +1058,28 @@ async fn replace_generated_in(
     .fetch_all(&mut *conn)
     .await
     .map_err(DbError::from)?;
-    let map: BTreeMap<Uuid, Option<Uuid>> = generated
+    let mut map: BTreeMap<Uuid, Option<Uuid>> = generated
         .into_iter()
         .map(|(direct, public)| (direct, live.contains(&public).then_some(public)))
         .collect();
+    // An id that names no live model and no channel row is the direct model
+    // of a channel an operator removed since: an untick, or a retire of its
+    // public model, deletes the row and the document and leaves the grants.
+    // It reaches nothing, and a key document naming it fails the reference
+    // check, so it is withdrawn with the rest. It is not replaced: the
+    // operator stopped serving the model through that account.
+    let dead: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT DISTINCT u.id FROM unnest($1::uuid[]) AS u(id) \
+         WHERE NOT EXISTS (SELECT 1 FROM gw_resources r \
+                           WHERE r.kind = $2 AND r.id = u.id AND NOT r.deleted) \
+           AND NOT EXISTS (SELECT 1 FROM channel_models cm WHERE cm.direct_model_id = u.id)",
+    )
+    .bind(&named)
+    .bind(Kind::Models.segment())
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(DbError::from)?;
+    map.extend(dead.into_iter().map(|id| (id, None)));
 
     let (grants, replaced, withdrawn) = replace_generated(&tenant.allowed_model_ids, &map);
     if !replaced.is_empty() || !withdrawn.is_empty() {
@@ -1072,9 +1092,16 @@ async fn replace_generated_in(
         .await
         .map_err(DbError::from)?;
     }
+    // A key's selection becomes the public model only where its tenant holds
+    // that model after the pass; otherwise the entry goes, so no key reaches
+    // a model its tenant's grants would not give it.
+    let key_map: BTreeMap<Uuid, Option<Uuid>> = map
+        .iter()
+        .map(|(id, public)| (*id, public.filter(|p| grants.contains(p))))
+        .collect();
     let mut keys = Vec::new();
     for (key_id, ids) in &selections {
-        let (selection, key_replaced, key_withdrawn) = replace_generated(ids, &map);
+        let (selection, key_replaced, key_withdrawn) = replace_generated(ids, &key_map);
         if key_replaced.is_empty() && key_withdrawn.is_empty() {
             continue;
         }

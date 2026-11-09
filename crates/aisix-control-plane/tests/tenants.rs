@@ -1901,6 +1901,57 @@ async fn every_tenant_write_takes_the_tenant_before_the_resources_lock() {
         let status = waits_for_the_tenant_first(&cp, tenant, what, request).await;
         assert_eq!(status, expected, "{what}");
     }
+
+    // The pass that replaces a grant of a channel's generated direct model
+    // with its public model (`tenants::replace_generated_grants`, run at boot
+    // and by every housekeeping tick) re-projects the tenant's keys. The
+    // grant is written by SQL, as only a release before the refusal could
+    // write it, once the cases above no longer rewrite the grants.
+    let r = cp
+        .send(
+            "POST",
+            "/admin/public-models",
+            Some(op.as_str()),
+            Some(json!({"name": "order-pub-7c1"})),
+        )
+        .await;
+    assert_eq!(r.status, 201, "{r:?}");
+    let public = r.body["id"]
+        .as_str()
+        .expect("a public model id")
+        .to_string();
+    let r = cp
+        .send(
+            "PUT",
+            &format!("/admin/provider-keys/{pk}/channel-models/{public}"),
+            Some(op.as_str()),
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let direct: Uuid = sqlx::query_scalar(
+        "SELECT direct_model_id FROM channel_models WHERE public_model_id = $1::uuid",
+    )
+    .bind(&public)
+    .fetch_one(cp.db().pool())
+    .await
+    .expect("the generated direct document");
+    sqlx::query("UPDATE tenants SET allowed_model_ids = allowed_model_ids || $2 WHERE id = $1")
+        .bind(tenant)
+        .bind(vec![direct])
+        .execute(cp.db().pool())
+        .await
+        .expect("store the grant");
+    let (db, ctx) = (cp.db().clone(), WriteCtx::of(cp.state()));
+    let what = "the pass over grants of generated direct models";
+    let status = waits_for_the_tenant_first(&cp, tenant, what, async move {
+        match tenants::replace_generated_grants(&db, &ctx).await {
+            Ok(done) if done.tenants == 1 => 200,
+            _ => 500,
+        }
+    })
+    .await;
+    assert_eq!(status, 200, "{what}");
 }
 
 /// Several tenants are locked in ascending id order, whatever order they
