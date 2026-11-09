@@ -7,8 +7,10 @@ import { STACK_START_TIMEOUT_MS, startStack, type Json, type Stack } from "./sta
  *
  * Every figure asserted here comes from the baseline and the rate the test
  * itself configured, never from the product's own answers: a group at a rate
- * of 7.2 over a baseline of $4/M input and $20/M output is ¥28.8 and ¥144 per
- * million, and an override of 6 makes it ¥24 and ¥120. The realised rate is
+ * of 7.2 over a baseline of $4/M input and $20/M output is ¥28.80 and ¥144.00
+ * per million, and an override of 6 makes it ¥24.00 and ¥120.00, written as
+ * every ¥/M figure in the Dashboard is: at least two decimals, with thousands
+ * separators. The realised rate is
  * the one case a figure is read back, because it is a measurement of what was
  * charged rather than a price: a cost price equal to the baseline leaves
  * exactly the configured rate, 7.2000.
@@ -27,15 +29,19 @@ test.afterAll(async () => {
 
 const PASSWORD = "groups-pass-5c1x";
 
-/** A group's rate over a baseline rate, both per million, as `¥`-prefixed text: exact, never a float. */
+/**
+ * A group's rate over a baseline rate, both per million, as `¥`-prefixed
+ * text: exact, never a float, with at least two decimals and thousands
+ * separators.
+ */
 function cnyPerMillion(usd: string, cny: string): string {
   const micros = BigInt(Math.round(Number(usd) * 1_000_000));
   const e4 = BigInt(Math.round(Number(cny) * 10_000));
   const scale = 10n ** 10n;
   const value = micros * e4;
-  const whole = value / scale;
-  const frac = (value % scale).toString().padStart(10, "0").replace(/0+$/, "");
-  return `¥${frac === "" ? whole.toString() : `${whole}.${frac}`}`;
+  const whole = (value / scale).toString().replace(/\B(?=(\d{3})+$)/g, ",");
+  const frac = (value % scale).toString().padStart(10, "0").replace(/0+$/, "").padEnd(2, "0");
+  return `¥${whole}.${frac}`;
 }
 
 async function login(page: Page, who = stack.operator): Promise<void> {
@@ -241,15 +247,36 @@ test("换算率 0 需要二次确认", async ({ page }) => {
   const account = await newAccount(group);
   const model = await newModel("gp-zero", account);
   await addBaseline(model.id, "4", "20");
+  // One tenant on the group, with one key in it: what a free rate would reach.
+  const suffix2 = randomUUID().slice(0, 8);
+  const owner = { email: `owner-zero-${suffix2}@groups.test`, password: PASSWORD };
+  const signedUp = await stack.tenant().post("/api/signup", { org_name: `免费确认租户 ${suffix2}`, ...owner });
+  await stack.admin.post(`/admin/tenants/${signedUp.tenant.id}/approve`);
+  const current = await stack.admin.get(`/admin/tenants/${signedUp.tenant.id}`);
+  await stack.admin.patch(`/admin/tenants/${signedUp.tenant.id}`, { allowed_provider_groups: [group.name] }, current.version);
+  const api = stack.tenant();
+  await api.post("/api/login", owner);
+  await api.post("/api/keys", { label: "免费确认用例的密钥" });
   await page.getByRole("button", { name: "刷新", exact: true }).click();
   await openDetail(page, group.display_name as string);
+
+  // The group's default at 0: asked, naming how much it reaches.
+  const defaults = page.getByRole("group", { name: "修改默认换算率" });
+  await defaults.getByLabel("新默认换算率").fill("0");
+  await defaults.getByRole("button", { name: "保存默认换算率" }).click();
+  await expect(defaults.getByRole("alert")).toContainText("影响 1 个租户、1 个密钥");
+  await defaults.getByRole("button", { name: "取消" }).click();
 
   const priced = modelRow(page, model.name);
   await priced.getByRole("button", { name: "设置覆盖", exact: true }).click();
   const set = page.getByRole("group", { name: "设置覆盖" });
+  // The field says what an empty one does not do, and where ending is.
+  await expect(set).toContainText("要回到分组默认，请用「结束覆盖」");
   await set.getByLabel("换算率").fill("0");
   await set.getByRole("button", { name: "保存覆盖" }).click();
   await expect(set.getByRole("button", { name: "确认保存覆盖" })).toBeVisible();
+  await expect(set.getByRole("alert")).toContainText(`「${model.name}」在这个分组下不计价`);
+  await expect(set.getByRole("alert")).toContainText("影响这个分组的 1 个租户、1 个密钥");
   await set.getByRole("button", { name: "取消" }).click();
   await expect(modelRow(page, model.name).getByRole("cell").nth(4)).toHaveText(/默认\s*7\.2/);
 
@@ -331,6 +358,9 @@ test("实际换算率显示近 30 天的结果", async ({ page }) => {
   const group = await newGroup("7.2");
   const account = await newAccount(group);
   const model = await newModel("gp-real", account);
+  // A second model with the same list price and no cost price: its charge
+  // counts in no ratio, and the page must say how much that leaves out.
+  const uncosted = await newModel("gp-nocost", account);
   // One card, twice: the official list price and what the upstream costs. A
   // charge over a cost with the same card realises exactly the configured rate.
   const card = { default: { base: { input: "4", output: "20" } } };
@@ -345,6 +375,12 @@ test("实际换算率显示近 30 天的结果", async ({ page }) => {
     upstream_model: model.upstream,
     effective_from: new Date().toISOString(),
     card,
+  });
+  await stack.admin.post("/admin/pricing/baselines", {
+    model_id: uncosted.id,
+    effective_from: new Date().toISOString(),
+    card,
+    note: "分组页用例的官方价",
   });
 
   // A funded tenant on that group, whose one call costs the mock upstream's
@@ -361,7 +397,7 @@ test("实际换算率显示近 30 天的结果", async ({ page }) => {
   const current = await stack.admin.get(`/admin/tenants/${tenantId}`);
   await stack.admin.patch(
     `/admin/tenants/${tenantId}`,
-    { allowed_provider_groups: [group.name], allowed_model_ids: [model.id] },
+    { allowed_provider_groups: [group.name], allowed_model_ids: [model.id, uncosted.id] },
     current.version,
   );
   await stack.admin.post(`/admin/tenants/${tenantId}/credits`, { amount_cny: "10.00", reason: "分组页用例" });
@@ -379,13 +415,15 @@ test("实际换算率显示近 30 天的结果", async ({ page }) => {
     if (Date.now() >= deadline) throw new Error(`the gateway still answers ${res.status} to the new key`);
     await new Promise((r) => setTimeout(r, 250));
   }
-  const chat = await fetch(`${stack.proxyUrl}/v1/chat/completions`, {
-    method: "POST",
-    headers: { authorization: `Bearer ${plaintext}`, "content-type": "application/json" },
-    body: JSON.stringify({ model: model.name, messages: [{ role: "user", content: "hi" }] }),
-  });
-  await chat.arrayBuffer();
-  expect(chat.status).toBe(200);
+  for (const name of [model.name, uncosted.name]) {
+    const chat = await fetch(`${stack.proxyUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${plaintext}`, "content-type": "application/json" },
+      body: JSON.stringify({ model: name, messages: [{ role: "user", content: "hi" }] }),
+    });
+    await chat.arrayBuffer();
+    expect(chat.status).toBe(200);
+  }
 
   // The charge lands asynchronously; the page reads the margin route, so wait
   // for the row there rather than for a timer.
@@ -401,11 +439,24 @@ test("实际换算率显示近 30 天的结果", async ({ page }) => {
       { timeout: 60_000 },
     )
     .toBe("7.2000");
+  await expect
+    .poll(
+      async () => {
+        const margin = (await stack.admin.get(`/admin/pricing/margin?${query}`)) as Json;
+        return margin.items.find((i: Json) => i.model.id === uncosted.id)?.rows_without_cost ?? 0;
+      },
+      { timeout: 60_000 },
+    )
+    .toBe(1);
 
   await openGroups(page);
   await openDetail(page, group.display_name as string);
   const r = modelRow(page, model.name);
   await expect(r.getByRole("cell").nth(7)).toHaveText("7.2000");
+  // The same call with no cost: no ratio, and its ¥0.000576 named beside the dash.
+  const without = modelRow(page, uncosted.name).getByRole("cell").nth(7);
+  await expect(without).toContainText("—");
+  await expect(without).toContainText("另有 1 笔无成本，计 ¥0.000576");
 });
 
 test("默认分组有标记，可改为另一个分组；停用默认分组时显示原因", async ({ page }) => {

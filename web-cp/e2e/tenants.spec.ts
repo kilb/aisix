@@ -204,6 +204,76 @@ test("把通配模型授给租户被拒，并在该模型旁说明原因", async
   expect((await stack.admin.get(`/admin/tenants/${t.id}`)).allowed_model_ids).toEqual([]);
 });
 
+test("公共模型生成的直连模型不出现在授权列表里，公共模型本身可以勾选", async ({ page }) => {
+  const t = await signUpActive("T5 Direct Co 5d2", "owner@direct-t5.test");
+  const account = await stack.admin.post("/admin/resources/provider_keys", {
+    doc: {
+      display_name: "acct-gp-5d2",
+      provider: "openai",
+      api_key: "sk-t5-upstream-direct-5",
+      api_base: `${stack.mockUpstreamUrl}/v1`,
+      groups: ["shared"],
+    },
+  });
+  const pub = await stack.admin.post("/admin/public-models", { name: "pub-t5-direct" });
+  await stack.admin.put(`/admin/provider-keys/${account.id}/channel-models/${pub.id}`, { priority: 1, weight: 1 });
+  // The document that names the account exists: its absence below is the
+  // picker leaving it out, not a catalog that never had it.
+  const { items } = await stack.admin.get("/admin/resources/models");
+  expect((items as Json[]).some((m) => (m.doc.display_name as string | undefined)?.includes("acct-gp-5d2"))).toBe(true);
+
+  await openTenants(page);
+  await openTenant(page, t.org);
+  const grants = page.getByRole("group", { name: "授权模型" });
+  await expect(grants.getByRole("checkbox", { name: "pub-t5-direct", exact: true })).toBeVisible();
+  await expect(grants.getByRole("listitem").filter({ hasText: "acct-gp-5d2" })).toHaveCount(0);
+  await expect(grants).not.toContainText("acct-gp-5d2");
+});
+
+test("密钥列表读取失败时不能移除分组；重新读取后先提示将停用的密钥数", async ({ page, context }) => {
+  const t = await signUpActive("T5 Unread Co 4c7", "owner@unread-t5.test", [models.chat]);
+  const tenant = await stack.admin.get(`/admin/tenants/${t.id}`);
+  await stack.admin.patch(
+    `/admin/tenants/${t.id}`,
+    { allowed_provider_groups: ["grp-us-8a4", "grp-eu-5d2"] },
+    tenant.version,
+  );
+  const us = (await stack.admin.get("/admin/provider-groups")).items.find(
+    (g: { name: string }) => g.name === "grp-us-8a4",
+  );
+  for (const label of ["us-one-unread", "us-two-unread"]) {
+    await stack.admin.post(`/admin/tenants/${t.id}/keys`, { label, group_id: us.id });
+  }
+
+  await openTenants(page);
+  await openTenant(page, t.org);
+  const keys = page.getByRole("table", { name: "密钥" });
+  await expect(keys.getByRole("row").filter({ hasText: "us-two-unread" })).toBeVisible();
+
+  // The connection drops, and reading everything again fails: the keys the
+  // page showed may no longer be the tenant's keys.
+  await context.setOffline(true);
+  await page.getByRole("button", { name: "刷新", exact: true }).click();
+  const groups = page.getByRole("group", { name: "可用分组" });
+  await groups.getByRole("checkbox", { name: "grp-us-8a4" }).uncheck();
+  // The removal is refused until the count is known: no save, and why.
+  await expect(groups.getByRole("alert").filter({ hasText: "密钥列表读取失败" })).toBeVisible();
+  await expect(groups.getByRole("button", { name: "保存分组" })).toBeDisabled();
+  await context.setOffline(false);
+  expect((await stack.admin.get(`/admin/tenants/${t.id}`)).allowed_provider_groups).toEqual(["grp-us-8a4", "grp-eu-5d2"]);
+
+  // Read again, the save asks first and names the keys it would stop.
+  await groups.getByRole("button", { name: "重新读取密钥" }).click();
+  await expect(groups.getByRole("alert").filter({ hasText: "密钥列表读取失败" })).toHaveCount(0);
+  await groups.getByRole("button", { name: "保存分组" }).click();
+  // The groups' own read failed offline too, and its note stays until the next
+  // read: the confirmation is the alert that names the removal.
+  await expect(groups.getByRole("alert").filter({ hasText: "移除分组" })).toContainText("将停用该租户在此分组下的 2 个密钥");
+  await expect(groups.getByRole("button", { name: "确认保存分组" })).toBeVisible();
+  await groups.getByRole("button", { name: "取消" }).click();
+  expect((await stack.admin.get(`/admin/tenants/${t.id}`)).allowed_provider_groups).toEqual(["grp-us-8a4", "grp-eu-5d2"]);
+});
+
 test("租户分组按显示名选择，路由名以小字显示", async ({ page }) => {
   const t = await signUpActive("T5 Picker Co 6a1", "owner@picker-t5.test");
   const current = await stack.admin.get(`/admin/tenants/${t.id}`);

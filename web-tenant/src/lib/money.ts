@@ -38,6 +38,19 @@ export function fmtMicroUsd(micro: number): string {
   return `${value < 0n ? "-" : ""}$${grouped(abs / MICRO_PER_UNIT)}.${fraction}`;
 }
 
+/**
+ * An amount of micro-CNY as the yuan a person types into an edit field:
+ * `1_500_000` is `1.50`, `-500_000` is `-0.50`. Exact, never a float; no `¥`
+ * and no separators, so it reads back through `isCnyAmount`. Anything below
+ * the fen is dropped: every amount typed in is whole fen.
+ */
+export function microCnyToInput(micro: number): string {
+  const value = BigInt(micro);
+  const abs = value < 0n ? -value : value;
+  const fen = ((abs % MICRO_PER_UNIT) / 10_000n).toString().padStart(2, "0");
+  return `${value < 0n ? "-" : ""}${abs / MICRO_PER_UNIT}.${fen}`;
+}
+
 /** Yuan typed by a person: up to eight digits and at most two decimals, and above zero unless `allowZero`. */
 export function isCnyAmount(s: string, opts: { allowZero: boolean }): boolean {
   if (!/^\d{1,8}(\.\d{1,2})?$/.test(s)) return false;

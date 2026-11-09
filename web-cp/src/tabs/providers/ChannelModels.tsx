@@ -122,7 +122,7 @@ export function ChannelModels({
   }, [rows, drafts]);
 
   /**
-   * The public models this save would leave with no enabled serving account,
+   * The public models this save would take from their last enabled serving account,
    * by the tenants and keys that reach one today. Read from the API's own
    * `served_by`, `tenants` and `keys`: the page counts nothing itself.
    */
@@ -132,6 +132,9 @@ export function ChannelModels({
       const draft = drafts[row.public_model_id];
       const model = modelOf.get(row.public_model_id);
       if (draft === undefined || model === undefined) continue;
+      // Only a row that serves now and stops in this save takes anything
+      // away: editing a row that is already off changes nothing served.
+      if (!(row.served && row.enabled)) continue;
       // This account keeps serving it while the row is served and enabled.
       if (draft.served && draft.enabled) continue;
       const others = model.served_by.filter((s) => s.enabled && s.provider_key_id !== accountId).length;

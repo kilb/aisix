@@ -1,6 +1,16 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { fmtCnyPerMillion, fmtMicroCny, fmtMicroUsd, fmtUtc, isCnyAmount, periodLabel, todayUtc, utcRange } from "./money.ts";
+import {
+  fmtCnyPerMillion,
+  fmtMicroCny,
+  fmtMicroUsd,
+  fmtUtc,
+  isCnyAmount,
+  microCnyToInput,
+  periodLabel,
+  todayUtc,
+  utcRange,
+} from "./money.ts";
 
 // `npm run test:unit`.
 
@@ -33,6 +43,20 @@ test("金额输入只接受人民币元与分", () => {
   assert.ok(isCnyAmount("0", { allowZero: true }));
   assert.ok(!isCnyAmount("100000000", { allowZero: true }));
   assert.ok(!isCnyAmount("0.001", { allowZero: true }));
+});
+
+test("µ¥ 金额转成输入框里的元，精确到分，负数的符号在最前", () => {
+  assert.equal(microCnyToInput(1_500_000), "1.50");
+  assert.equal(microCnyToInput(0), "0.00");
+  assert.equal(microCnyToInput(10_000), "0.01");
+  assert.equal(microCnyToInput(-500_000), "-0.50");
+  assert.equal(microCnyToInput(-12_340_000), "-12.34");
+  assert.equal(microCnyToInput(99_999_999_990_000), "99999999.99");
+  // Below the fen is not an amount anyone typed: it is dropped, never rounded up.
+  assert.equal(microCnyToInput(19_999), "0.01");
+  for (const micro of [1_500_000, 10_000, 99_999_999_990_000]) {
+    assert.ok(isCnyAmount(microCnyToInput(micro), { allowZero: false }));
+  }
 });
 
 test("每百万 token 的单价按原样给出的小数位显示，不足两位补足", () => {

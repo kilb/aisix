@@ -99,6 +99,17 @@ function ungrantable(doc: ModelDoc): boolean {
 }
 
 /**
+ * A direct document a public model generated for one serving account: owned
+ * by that public model (`public:<its id>`) and at an id other than its own,
+ * which is the routing document's. No tenant may be granted one — its name
+ * carries the account's — so the picker never offers it; the public model is
+ * what is granted.
+ */
+function generatedDirect(m: ResourceView<ModelDoc>): boolean {
+  return m.managed_by !== null && m.managed_by.startsWith("public:") && m.managed_by !== `public:${m.id}`;
+}
+
+/**
  * Why an action was refused, where it was taken: a `gateway_too_old` refusal
  * with what it needs and the gateways that hold it back, a `412` with a
  * reload when `onReload` is given, anything else as its text.
@@ -651,7 +662,14 @@ function TenantDetail({
         catalogError={catalog.error}
         priced={priced}
       />
-      <GroupsPart {...part} choices={choices} groupsError={groups.error} keys={keyList.data} />
+      <GroupsPart
+        {...part}
+        choices={choices}
+        groupsError={groups.error}
+        keys={keyList.data}
+        keysError={keyList.error}
+        onReloadKeys={() => void keyList.reload()}
+      />
       <LimitsPart {...part} />
 
       {!tenant.is_internal && (
@@ -816,6 +834,7 @@ function GrantsPart({
   // read must stay in it rather than be withdrawn unseen.
   const rows = useMemo(() => {
     const listed: { id: string; name: string; doc: ModelDoc | null }[] = (catalog ?? [])
+      .filter((m) => !generatedDirect(m))
       .map((m) => ({ id: m.id, name: m.doc.display_name || m.id, doc: m.doc }))
       .sort((a, b) => a.name.localeCompare(b.name));
     const known = new Set(listed.map((r) => r.id));
@@ -942,7 +961,16 @@ function GroupsPart({
   choices,
   groupsError,
   keys,
-}: PartProps & { choices: GroupChoice[]; groupsError: string | null; keys: AdminKey[] | null }) {
+  keysError,
+  onReloadKeys,
+}: PartProps & {
+  choices: GroupChoice[];
+  groupsError: string | null;
+  keys: AdminKey[] | null;
+  /** The last read of the tenant's keys failed: the list shown, if any, may be out of date. */
+  keysError: string | null;
+  onReloadKeys: () => void;
+}) {
   const [chosen, setChosen] = useState<string[]>(tenant.allowed_provider_groups);
   const [part, focusRefusal] = useRefusalFocus<HTMLFieldSetElement>();
   const [sent, setSent] = useState<string[]>([]);
@@ -966,6 +994,12 @@ function GroupsPart({
   // each one stops: a key names one group, so losing it closes exactly the
   // keys in it. Counting every key of the tenant would overstate the damage.
   const removed = tenant.allowed_provider_groups.filter((name) => !chosen.includes(name));
+  // A removal is saved only once the keys it closes are counted: while the
+  // list is still being read the save waits, and when the last read failed
+  // the removal is refused until it is read again. An unread list is an
+  // unknown count, not zero.
+  const keysUnread = removed.length > 0 && keysError !== null;
+  const keysLoading = removed.length > 0 && keys === null && keysError === null;
   const stopped = removed
     .map((name) => ({ name, count: (keys ?? []).filter((k) => k.group?.name === name).length }))
     .filter((s) => s.count > 0);
@@ -1026,11 +1060,20 @@ function GroupsPart({
       )}
       {refused?.conflict && <ConflictNote onReload={onReload} />}
       <Msg note={note} />
+      {canEdit && keysUnread && (
+        <div className="note crit" role="alert">
+          该租户的密钥列表读取失败，无法确认移除分组会停用多少个密钥，暂不能移除分组。
+          <Button size="sm" type="button" onClick={onReloadKeys}>
+            重新读取密钥
+          </Button>
+        </div>
+      )}
+      {canEdit && keysLoading && <p className="hint">正在读取该租户的密钥，读取完成后才能移除分组。</p>}
       {canEdit && (
         <TwoStep
           label="保存分组"
           kind={edited ? "primary" : "secondary"}
-          disabled={busy}
+          disabled={busy || keysUnread || keysLoading}
           busy={busy}
           ask={() => stopped.length > 0 || blocked}
           warning={

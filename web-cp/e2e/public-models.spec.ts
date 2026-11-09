@@ -169,14 +169,18 @@ test("停用一个在用的公共模型需要确认并显示租户与密钥数�
   const owner = stack.tenant();
   await owner.post("/api/login", { email: `owner-${suffix}@retire-ui.test`, password: "retire-ui-pass-6c3" });
   await owner.post("/api/keys", { label: `retire-key-${suffix}`, model_ids: [pub.id] });
+  // And one that picks no models: it reaches every grant, this model included.
+  await owner.post("/api/keys", { label: `retire-all-${suffix}` });
 
   const panel = await openPublicModels(page);
   const row = listRow(panel, `pub-retire-${suffix}`);
+  // Both keys reach it, so both are counted, in the column and in the warning.
+  await expect(row.getByRole("cell").nth(4)).toHaveText("2");
   await row.getByRole("button", { name: "停用", exact: true }).click();
   // Asked once: the warning states the counts and what a retire would need
   // cleared first.
   await expect(row.getByRole("alert")).toContainText("1 个租户");
-  await expect(row.getByRole("alert")).toContainText("1 个密钥");
+  await expect(row.getByRole("alert")).toContainText("2 个密钥");
   await row.getByRole("button", { name: "确认停用" }).click();
 
   // Refused with the counts, and the model is untouched.
@@ -239,4 +243,102 @@ test("重新生成改写文档而不改表格", async ({ page }) => {
   const after = await modelDocs();
   expect(after[`pub-regen-${suffix}#acct-regen-renamed-${suffix}`].doc.model_name).toBe("upstream-regen-before");
   expect(after[`pub-regen-${suffix}#acct-regen-renamed-${suffix}`].version).not.toBe(beforeVersion);
+});
+
+test("有分组没有换算率时显示未定价，每个分组都有换算率后显示已定价", async ({ page }) => {
+  const suffix = randomUUID().slice(0, 8);
+  const name = `pub-priced-${suffix}`;
+  const pub = await stack.admin.post("/admin/public-models", { name });
+  const accountId = await newAccount(`acct-priced-${suffix}`);
+  await stack.admin.put(`/admin/provider-keys/${accountId}/channel-models/${pub.id}`, { priority: 1, weight: 1 });
+  // A price may start at most a few seconds back, so each starts just now.
+  const justNow = () => new Date(Date.now() - 2_000).toISOString();
+  await stack.admin.post("/admin/pricing/baselines", {
+    model_id: pub.id,
+    effective_from: justNow(),
+    card: { default: { base: { input: "4", output: "20" } } },
+    note: "the public-model list's card",
+  });
+  // Every live group but `shared` gets a rate for this model; `shared`, the
+  // first boot's group, is left with none.
+  const groups: Json[] = (await stack.admin.get("/admin/provider-groups")).items.filter((g: Json) => !g.retired_at);
+  const shared = groups.find((g) => g.name === "shared");
+  expect(shared, "the first-boot group is live").toBeDefined();
+  expect(groups.length, "a priced group beside the unpriced one").toBeGreaterThan(1);
+  const rate = (groupId: string) =>
+    stack.admin.post(`/admin/provider-groups/${groupId}/rates`, {
+      model_id: pub.id,
+      cny_per_usd: "7.2",
+      effective_from: justNow(),
+    });
+  for (const g of groups.filter((g) => g.name !== "shared")) await rate(g.id);
+
+  // One group without a rate: a call in it cannot be charged, so the model
+  // is not priced.
+  const panel = await openPublicModels(page);
+  await expect(listRow(panel, name).getByRole("cell").nth(2)).toHaveText("未定价");
+
+  // With `shared` rated too, every group prices it.
+  await rate(shared.id);
+  await panel.getByRole("button", { name: "刷新" }).click();
+  await expect(listRow(panel, name).getByRole("cell").nth(2)).toHaveText("已定价");
+});
+
+test("只有启用的账号还在服务时，停用的确认说明会被拒绝且不删除任何文档", async ({ page }) => {
+  const suffix = randomUUID().slice(0, 8);
+  const name = `pub-served-${suffix}`;
+  const pub = await stack.admin.post("/admin/public-models", { name });
+  const accountId = await newAccount(`acct-served-${suffix}`);
+  await stack.admin.put(`/admin/provider-keys/${accountId}/channel-models/${pub.id}`, { priority: 1, weight: 1 });
+
+  const panel = await openPublicModels(page);
+  const row = listRow(panel, name);
+  await row.getByRole("button", { name: "停用", exact: true }).click();
+  // No grant holds it, but an enabled account does: the operator is told the
+  // retire will be refused and why, not that documents will be deleted.
+  const warning = row.getByRole("alert");
+  await expect(warning).toContainText("1 个启用的账号");
+  await expect(warning).toContainText("停用会被拒绝");
+  await expect(warning).not.toContainText("删除由它生成的模型文档");
+  await row.getByRole("button", { name: "确认停用" }).click();
+
+  // And it is refused, with nothing deleted.
+  await expect(panel.getByRole("alert").filter({ hasText: "无法停用" })).toContainText("启用的账号 1");
+  const view = await stack.admin.get(`/admin/public-models/${pub.id}`);
+  expect(view.retired_at).toBeNull();
+  expect((await modelDocs())[name], "the routing document is still live").toBeDefined();
+});
+
+test("停用一个无人使用的公共模型也要先确认，并说明删除什么、不能恢复", async ({ page }) => {
+  const suffix = randomUUID().slice(0, 8);
+  const name = `pub-unused-${suffix}`;
+  const pub = await stack.admin.post("/admin/public-models", { name });
+  // One account mapped it, and that row is off: nothing holds the model, so
+  // the retire will go through.
+  const accountId = await newAccount(`acct-unused-${suffix}`);
+  await stack.admin.put(`/admin/provider-keys/${accountId}/channel-models/${pub.id}`, { priority: 1, weight: 1 });
+  await stack.admin.put(`/admin/provider-keys/${accountId}/channel-models/${pub.id}`, { enabled: false });
+
+  const panel = await openPublicModels(page);
+  const row = listRow(panel, name);
+  await row.getByRole("button", { name: "停用", exact: true }).click();
+  // The first click only asks, and says what the retire removes for good.
+  const warning = row.getByRole("alert");
+  await expect(warning).toContainText("不能恢复");
+  await expect(warning).toContainText("路由文档");
+  await expect(warning).toContainText("直连文档");
+  await expect(warning).toContainText(`名称「${name}」以后不能再用于公共模型`);
+  await expect(row.getByRole("button", { name: "确认停用" })).toBeVisible();
+  // Nothing has happened yet.
+  expect((await stack.admin.get(`/admin/public-models/${pub.id}`)).retired_at).toBeNull();
+  await expect(row.getByRole("cell").nth(5)).toHaveText("在用");
+
+  // Taken back, still nothing; confirmed, it is retired.
+  await row.getByRole("button", { name: "取消" }).click();
+  expect((await stack.admin.get(`/admin/public-models/${pub.id}`)).retired_at).toBeNull();
+  await row.getByRole("button", { name: "停用", exact: true }).click();
+  await row.getByRole("button", { name: "确认停用" }).click();
+  await expect(page.getByText(`已停用「${name}」。`)).toBeVisible();
+  await expect(listRow(panel, name).getByRole("cell").nth(5)).toHaveText("已停用");
+  expect((await stack.admin.get(`/admin/public-models/${pub.id}`)).retired_at).not.toBeNull();
 });

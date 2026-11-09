@@ -267,6 +267,9 @@ test("停用最后一个模型时提示将影响 N 个租户和 M 个密钥", as
   const owner = stack.tenant();
   await owner.post("/api/login", { email: `owner-${suffix}@models-ui.test`, password: "models-ui-pass-8h2" });
   await owner.post("/api/keys", { label: `models-key-${suffix}`, model_ids: [pub.id] });
+  // And one that picks no models: it follows every grant, so it loses the
+  // model too and is counted.
+  await owner.post("/api/keys", { label: `models-all-${suffix}` });
 
   // Disabling the only account that serves it: asked twice, with the counts.
   // A reload re-reads every public model's view, which is where the tenant
@@ -278,7 +281,7 @@ test("停用最后一个模型时提示将影响 N 个租户和 M 个密钥", as
   await row.getByRole("checkbox", { name: `启用 ${pub.name}` }).uncheck();
   await fresh.getByRole("button", { name: "写入映射" }).click();
   const warning = fresh.getByRole("alert").filter({ hasText: pub.name });
-  await expect(warning).toContainText("影响 1 个租户、1 个密钥");
+  await expect(warning).toContainText("影响 1 个租户、2 个密钥");
   await expect(fresh.getByRole("button", { name: "确认写入映射" })).toBeVisible();
 
   await fresh.getByRole("button", { name: "确认写入映射" }).click();
@@ -290,6 +293,44 @@ test("停用最后一个模型时提示将影响 N 个租户和 M 个密钥", as
   expect((await modelDocs())[pub.name].doc.routing.targets).toEqual([]);
   const after = await stack.admin.get(`/admin/tenants/${tenantId}`);
   expect(after.allowed_model_ids).toEqual([pub.id]);
+});
+
+test("改一个已停用的最后一行不再提示停用", async ({ page }) => {
+  const name = accountName("acct-off");
+  const accountId = await newAccount(name);
+  const pub = await newPublicModel(`pub-off-${randomUUID().slice(0, 8)}`);
+  // Its only row is already off: the model has no serving account before
+  // this edit, and still none after it.
+  await stack.admin.put(`/admin/provider-keys/${accountId}/channel-models/${pub.id}`, { priority: 1, weight: 1 });
+  await stack.admin.put(`/admin/provider-keys/${accountId}/channel-models/${pub.id}`, { enabled: false });
+
+  const section = await openAccountModels(page, name);
+  const row = modelRow(section, pub.name);
+  await expect(row.getByRole("checkbox", { name: `启用 ${pub.name}` })).not.toBeChecked();
+  await row.getByRole("textbox", { name: `权重 ${pub.name}`, exact: true }).fill("2");
+  await section.getByRole("button", { name: "写入映射" }).click();
+  // Nothing served is taken away, so nothing is asked.
+  await expect(section.getByText(/已保存 1 个模型的映射/)).toBeVisible();
+  await expect(section.getByRole("button", { name: "确认写入映射" })).toHaveCount(0);
+  const table = await stack.admin.get(`/admin/provider-keys/${accountId}/channel-models`);
+  expect(table.items.find((i: Json) => i.public_model_id === pub.id)).toMatchObject({ weight: 2, enabled: false });
+});
+
+test("仍在服务公共模型的账号不能删除，并说明先取消勾选", async ({ page }) => {
+  const name = accountName("acct-serving");
+  const accountId = await newAccount(name);
+  const pub = await newPublicModel(`pub-serving-${randomUUID().slice(0, 8)}`);
+  await stack.admin.put(`/admin/provider-keys/${accountId}/channel-models/${pub.id}`, { priority: 1, weight: 1 });
+
+  await login(page, stack.operator.email, stack.operator.password);
+  await page.locator('[data-tab="providers"]').click();
+  const row = page.getByRole("row", { name: new RegExp(name) });
+  await row.getByRole("button", { name: "删除" }).click();
+  await row.getByRole("button", { name: "确认删除" }).click();
+  const refused = page.getByRole("alert").filter({ hasText: `无法删除「${name}」` });
+  await expect(refused).toContainText("该账号仍为 1 个公共模型提供服务");
+  await expect(refused).toContainText("请先在该账号的「模型」里取消勾选");
+  expect((await stack.admin.request("GET", `/admin/resources/provider_keys/${accountId}`)).status).toBe(200);
 });
 
 test("无权限的视图角色看不到保存按钮", async ({ page }) => {

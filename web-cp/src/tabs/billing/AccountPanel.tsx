@@ -11,7 +11,7 @@ import {
   type UsageSummaryRow,
 } from "../../lib/api";
 import { errorText } from "../../lib/fmt";
-import { fmtMicroCny, fmtUtc, isCnyAmount, periodLabel, todayUtc, utcRange } from "../../lib/money";
+import { fmtMicroCny, fmtUtc, isCnyAmount, microCnyToInput, periodLabel, todayUtc, utcRange } from "../../lib/money";
 import { Button } from "../../ui/Button";
 import { DataTable, Loading } from "../../ui/DataTable";
 import { EmptyState } from "../../ui/EmptyState";
@@ -54,14 +54,6 @@ export function Region({ label, children }: { label: string; children: ReactNode
 }
 
 export const MODE_LABEL: Record<BillingAccount["billing_mode"], string> = { prepaid: "预付", postpaid: "后付" };
-
-/** Yuan and fen as a person types them (`1.00`), from whole-fen micro-cny; exact, never a float. */
-function cnyInput(micro: number): string {
-  const value = BigInt(micro);
-  const abs = value < 0n ? -value : value;
-  const fen = ((abs % 1_000_000n) / 10_000n).toString().padStart(2, "0");
-  return `${value < 0n ? "-" : ""}${abs / 1_000_000n}.${fen}`;
-}
 
 /** The state an account's lamp and `data-state` show. */
 export function AccountState({ account }: { account: BillingAccount }) {
@@ -106,7 +98,7 @@ function BalanceCard({ account }: RegionProps) {
 
 function CreditLimit({ account, canEdit, onChanged }: RegionProps) {
   const toast = useToast();
-  const stored = cnyInput(account.credit_limit_micro_cny);
+  const stored = microCnyToInput(account.credit_limit_micro_cny);
   const [draft, setDraft] = useState(stored);
   const [busy, setBusy] = useState(false);
   const [refused, setRefused] = useState<ReturnType<typeof refusal> | null>(null);

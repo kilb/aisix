@@ -1,6 +1,6 @@
 import { useRef, useState } from "react";
 import { createOrgQuota, deleteOrgQuota, updateOrgQuota, billing, type Budget } from "../../lib/api";
-import { fmtMicroCny, isCnyAmount } from "../../lib/money";
+import { fmtMicroCny, isCnyAmount, microCnyToInput } from "../../lib/money";
 import { Button } from "../../ui/Button";
 import { DataTable, Loading } from "../../ui/DataTable";
 import { EmptyState } from "../../ui/EmptyState";
@@ -12,13 +12,6 @@ import { refusal, useLoad } from "../Tenants";
 import { MONEY_HINT, PERIOD_LABEL, Region, budgetPeriod, type RegionProps } from "./AccountPanel";
 
 type Refusal = ReturnType<typeof refusal>;
-
-/** Yuan and fen as a person types them, from whole-fen micro-cny; exact, never a float. */
-function cnyInput(micro: number): string {
-  const value = BigInt(micro);
-  const fen = ((value % 1_000_000n) / 10_000n).toString().padStart(2, "0");
-  return `${value / 1_000_000n}.${fen}`;
-}
 
 function NewQuota({ account, onCreated }: { account: RegionProps["account"]; onCreated: () => Promise<void> }) {
   const toast = useToast();
@@ -189,7 +182,7 @@ function RowActions({ tenantId, budget, onChanged }: { tenantId: string; budget:
             type="button"
             size="sm"
             onClick={() => {
-              setDraft(cnyInput(budget.limit_micro_cny));
+              setDraft(microCnyToInput(budget.limit_micro_cny));
               setLocal(null);
               setRefused(null);
               setEditing(true);

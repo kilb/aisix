@@ -1465,6 +1465,8 @@ export interface MarginRow {
   realised_cny_per_usd: string | null;
   rows: number;
   rows_without_cost: number;
+  /** The part of `charged_micro_cny` from rows with no known cost, which the realised rate leaves out. */
+  charged_without_cost_micro_cny: number;
 }
 
 /** The realised rate: the CNY a group charged per USD its upstreams cost. */

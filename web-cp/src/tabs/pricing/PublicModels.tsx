@@ -21,6 +21,31 @@ import "./PublicModels.css";
 /** The counts a `409 public_model_in_use` carries. */
 type UseCounts = { tenants?: number; keys?: number; channels?: number };
 
+/**
+ * What the retire confirmation says will happen. While a grant or an enabled
+ * serving account still holds the model the retire is refused, so it says
+ * that, with the counts and what to clear. Otherwise the retire succeeds and
+ * cannot be undone: it says what goes — the routing document, the direct
+ * documents generated for each account, and the accounts' mappings — and
+ * that the name stays taken.
+ */
+function retireWarning(model: PublicModel): string {
+  const accounts = model.served_by.filter((s) => s.enabled).length;
+  const holders = [
+    ...(model.tenants > 0 || model.keys > 0 ? [`${model.tenants} 个租户、${model.keys} 个密钥的授权`] : []),
+    ...(accounts > 0 ? [`${accounts} 个启用的账号`] : []),
+  ];
+  if (holders.length === 0) {
+    const mappings = model.served_by.length > 0 ? `，以及 ${model.served_by.length} 个账号上的映射设置` : "";
+    return `停用后不能恢复：将删除它的路由文档和为各账号生成的直连文档${mappings}。名称「${model.name}」以后不能再用于公共模型，需要时请用新名称新建一个公共模型。`;
+  }
+  const clear = [
+    ...(model.tenants > 0 || model.keys > 0 ? ["从租户与密钥中移除它"] : []),
+    ...(accounts > 0 ? ["在上游账号的「模型」里取消勾选"] : []),
+  ];
+  return `仍有 ${holders.join("，以及 ")}指向它，停用会被拒绝，什么也不会删除：请先${clear.join("，并")}。`;
+}
+
 /** What still names a public model, by name, so the operator knows what to clear. */
 export function inUseText(e: ApiError): string {
   const counts = (e.counts ?? {}) as UseCounts;
@@ -41,7 +66,8 @@ function pricedState(model: PublicModel, prices: Map<string, ModelGroupPriceRow>
   const row = prices.get(model.id);
   if (!row || !row.baseline.current) return "unpriced";
   if (row.groups.length === 0) return "unpriced";
-  return row.groups.every((g) => g.cny_per_usd !== undefined) ? "priced" : "unpriced";
+  // The API sends `null` for a group with no rate in force, never omits it.
+  return row.groups.every((g) => g.cny_per_usd !== null) ? "priced" : "unpriced";
 }
 
 /**
@@ -206,14 +232,9 @@ export function PublicModels({ canEdit }: TabProps) {
                         size="sm"
                         busy={busy === m.id}
                         busyLabel="停用中…"
-                        ask={() => m.tenants > 0 || m.keys > 0 || m.served_by.some((s) => s.enabled)}
-                        warning={
-                          <>
-                            {m.tenants > 0 || m.keys > 0
-                              ? `有 ${m.tenants} 个租户、${m.keys} 个密钥的授权仍指向它，停用会被拒绝：请先从租户与密钥中移除。`
-                              : `停用会删除由它生成的模型文档。`}
-                          </>
-                        }
+                        // Always asked: refused, it says why; accepted, it cannot be undone.
+                        ask={() => true}
+                        warning={retireWarning(m)}
                         onConfirm={() => void retire(m)}
                       />
                     )}

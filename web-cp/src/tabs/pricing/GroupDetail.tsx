@@ -1,9 +1,20 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { EffectiveFrom, sendAt, type EffectiveResolver } from "../../components/EffectiveFrom";
-import { ApiError, groupPrices, groups, margin, type Detail, type Group, type GroupRates, type ModelGroupPriceRow, type RatePlan } from "../../lib/api";
+import {
+  ApiError,
+  groupPrices,
+  groups,
+  margin,
+  type Detail,
+  type Group,
+  type GroupRates,
+  type MarginRow,
+  type ModelGroupPriceRow,
+  type RatePlan,
+} from "../../lib/api";
 import { messageFor, problemAt } from "../../lib/errors";
 import { errorText } from "../../lib/fmt";
-import { fmtUtc } from "../../lib/money";
+import { fmtCnyPerMillion, fmtMicroCny, fmtUtc } from "../../lib/money";
 import { BaselineSourceBadge } from "./Baselines";
 import { Button } from "../../ui/Button";
 import { DataTable, Loading } from "../../ui/DataTable";
@@ -22,9 +33,22 @@ function isZeroRate(text: string): boolean {
   return typed !== "" && /^0*(\.0*)?$/.test(typed);
 }
 
-/** A rate as the page writes it: the API's own decimal string after `¥`. */
-function rateWords(rate: string | null | undefined): string {
-  return rate === null || rate === undefined ? "—" : `¥${rate}`;
+/**
+ * The 30-day realised rate, and beside it the part of the charge it leaves
+ * out: rows whose cost is not known count in no ratio, so their charge is
+ * named apart rather than hidden.
+ */
+function RealisedRate({ row }: { row: MarginRow | undefined }) {
+  return (
+    <>
+      {row?.realised_cny_per_usd ?? "—"}
+      {row !== undefined && row.rows_without_cost > 0 && (
+        <span className="cell-note">
+          另有 {row.rows_without_cost} 笔无成本，计 {fmtMicroCny(row.charged_without_cost_micro_cny)}
+        </span>
+      )}
+    </>
+  );
 }
 
 /** A plan's scheduled revisions, as their starts and what takes effect then. */
@@ -63,7 +87,8 @@ export function GroupDetail({
 }) {
   const [rates, setRates] = useState<GroupRates | null>(null);
   const [prices, setPrices] = useState<Map<string, ModelGroupPriceRow>>(new Map());
-  const [realised, setRealised] = useState<Map<string, string>>(new Map());
+  /** Each model's 30-day margin row: the realised rate, and the charge it leaves out for want of a cost. */
+  const [realised, setRealised] = useState<Map<string, MarginRow>>(new Map());
   const [error, setError] = useState<string | null>(null);
   const [picked, setPicked] = useState<{ modelId: string; name: string; mode: "override" | "end" } | null>(null);
 
@@ -78,13 +103,7 @@ export function GroupDetail({
       ]);
       setRates(plans);
       setPrices(new Map(all.map((row) => [row.model_id, row])));
-      setRealised(
-        new Map(
-          margins
-            .filter((m) => m.model.id !== null && m.realised_cny_per_usd !== null)
-            .map((m) => [m.model.id as string, m.realised_cny_per_usd as string]),
-        ),
-      );
+      setRealised(new Map(margins.filter((m) => m.model.id !== null).map((m) => [m.model.id as string, m])));
       setError(null);
     } catch (e) {
       setError(errorText(e));
@@ -179,9 +198,15 @@ export function GroupDetail({
                     <span className="tabular">{rate.rate ?? "未设置"}</span>
                     {later && <span className="cell-note">待生效 {later}</span>}
                   </td>
-                  <td className="num tabular">{rateWords(price?.input_per_million_cny)}</td>
-                  <td className="num tabular">{rateWords(price?.output_per_million_cny)}</td>
-                  <td className="num tabular">{realised.get(row.model_id) ?? "—"}</td>
+                  <td className="num tabular">
+                    {price?.input_per_million_cny === undefined ? "—" : fmtCnyPerMillion(price.input_per_million_cny)}
+                  </td>
+                  <td className="num tabular">
+                    {price?.output_per_million_cny === undefined ? "—" : fmtCnyPerMillion(price.output_per_million_cny)}
+                  </td>
+                  <td className="num tabular">
+                    <RealisedRate row={realised.get(row.model_id)} />
+                  </td>
                   <td className="right">
                     {canEdit && (
                       <span className="row-actions">
@@ -303,7 +328,7 @@ function DefaultRate({ group, plan, onSaved }: { group: Group; plan: RatePlan; o
           busy={saving}
           busyLabel="保存中…"
           ask={() => isZeroRate(rate)}
-          warning="换算率 0 表示这个分组下的调用不计价。确认无误再继续。"
+          warning={`换算率 0 表示这个分组下的调用不计价：影响 ${group.tenants} 个租户、${group.keys} 个密钥，生效期间的调用不收费，之后改回也不会补收。确认无误再继续。`}
           onConfirm={() => void submit()}
         />
       </p>
@@ -380,7 +405,7 @@ function ModelRate({
       ) : (
         <Field
           label="换算率"
-          hint="1 美元等于多少人民币，0 到 100，最多四位小数；留空不生效"
+          hint="1 美元等于多少人民币，0 到 100，最多四位小数；要回到分组默认，请用「结束覆盖」"
           error={problemAt(details, (p) => p === "/cny_per_usd")}
         >
           {(aria) => (
@@ -411,7 +436,7 @@ function ModelRate({
           busy={saving}
           busyLabel="保存中…"
           ask={() => !ending && isZeroRate(rate)}
-          warning="换算率 0 表示这个模型在这个分组下不计价。确认无误再继续。"
+          warning={`换算率 0 表示「${model.name}」在这个分组下不计价：影响这个分组的 ${group.tenants} 个租户、${group.keys} 个密钥，生效期间的调用不收费，之后改回也不会补收。确认无误再继续。`}
           onConfirm={() => void submit()}
         />
         <Button onClick={onClose}>关闭</Button>

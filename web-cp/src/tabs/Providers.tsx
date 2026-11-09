@@ -225,6 +225,11 @@ export function Providers({ canEdit }: TabProps) {
           ) : (
             <div className="note crit" role="alert">
               无法删除「{deleteFailure.name}」：{messageFor(deleteFailure.error)}
+              {(deleteFailure.error.counts?.public_models ?? 0) > 0 && (
+                <p>
+                  该账号仍为 {deleteFailure.error.counts?.public_models} 个公共模型提供服务，请先在该账号的「模型」里取消勾选，再删除。
+                </p>
+              )}
               {deleteFailure.error.referencedBy.length > 0 && (
                 <>
                   <p>被以下资源引用：</p>
