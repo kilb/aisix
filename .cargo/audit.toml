@@ -6,4 +6,11 @@ ignore = [
     # aws_lc_rs 后端。验证：`cargo tree --workspace --all-features -i rsa` 无输出。
     # 哪天这条命令有了输出（比如启用了 sqlx 的 mysql），这条就必须删掉。
     "RUSTSEC-2023-0071",
+    # libsqlite3-sys bundles SQLite (CVE-2026-119375, fixed in 0.39.0). It is in
+    # Cargo.lock only because sqlx's `migrate`/`json`/`uuid`/`chrono` features name
+    # `sqlx-sqlite?/…`, which Cargo records without building; the control plane
+    # enables only Postgres. No sqlx release allows 0.39 (0.8.6: ^0.30.1, 0.9.0: <0.38).
+    # Check: `cargo tree --workspace --all-features --target all -i libsqlite3-sys`
+    # prints nothing. Remove this once it prints something or sqlx allows >= 0.39.
+    "RUSTSEC-2026-0459",
 ]
