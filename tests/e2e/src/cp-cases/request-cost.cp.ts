@@ -145,8 +145,16 @@ describe("a caller looks up what one request cost with its API key", () => {
     await served(ko, OWNERS_REQUEST);
     const { answer, data } = await found(ko, OWNERS_REQUEST);
 
-    // One request, one attempt: 1000 input and 200 output tokens, $0.01.
-    expect(Object.keys(data).sort(), answer.text).toEqual(["has_more", "id", "items", "pending", "total_cost"]);
+    // One request, one attempt: 1000 input and 200 output tokens, ¥0.01.
+    expect(Object.keys(data).sort(), answer.text).toEqual([
+      "currency",
+      "has_more",
+      "id",
+      "items",
+      "pending",
+      "total_cost",
+    ]);
+    expect(data.currency, answer.text).toBe("CNY");
     expect(data.id, answer.text).toBe(OWNERS_REQUEST);
     expect(data.total_cost, answer.text).toBe("0.010000");
     expect(data.pending, answer.text).toBe(false);
@@ -174,7 +182,7 @@ describe("a caller looks up what one request cost with its API key", () => {
 
     // Nothing of the platform's channel: not the upstream model, the account
     // or the provider behind it.
-    for (const channel of ["gpt-4o-mini", "billing-account-e2e", "openai", "cost_usd", "charge_usd"]) {
+    for (const channel of ["gpt-4o-mini", "billing-account-e2e", "openai", "cost_usd", "charge_usd", "_usd"]) {
       expect(answer.text).not.toContain(channel);
     }
   });

@@ -11,7 +11,13 @@
 //! (`total_cost`). Rows another organization recorded under the same id, and
 //! rows the key may not see, are never listed: such an id answers exactly
 //! like one never sent. Amounts are the control plane's exact decimal
-//! strings, passed through: the gateway does no money arithmetic.
+//! strings, passed through under neutral names, and the answer names its
+//! currency (`data.currency`): the gateway does no money arithmetic.
+//!
+//! `currency` is required, and an answer without it is
+//! [`ProxyError::AccountUnavailable`] (`503`), so no amount is ever shown
+//! without the unit it is in. Every other field defaults ("A Control-Plane
+//! Response Decodes Loosely").
 //!
 //! The shape follows the hosted gateways' generation lookup (`data.id`,
 //! `data.total_cost`) and lists the rows in `data.items`, because the id
@@ -87,7 +93,7 @@ pub(crate) struct RequestItem {
     error: Option<String>,
     charge_status: Option<String>,
     /// The organization's own charge for the row, re-pricing included.
-    charge_usd: Option<String>,
+    charge: Option<String>,
     estimated: Option<bool>,
     /// Billed quantities by dimension name.
     quantities: Option<BTreeMap<String, u64>>,
@@ -95,14 +101,17 @@ pub(crate) struct RequestItem {
 
 /// The control plane's answer for one key and request id.
 ///
-/// Decoded loosely: unknown fields are ignored and every field but `items`,
-/// which the answer exists to give, has a default. The route renders its
-/// own shape from these fields, so nothing the control plane adds reaches a
-/// caller until it is named here.
+/// Decoded loosely: unknown fields are ignored and every field but
+/// `currency` and `items` — what every amount is in, and the rows the answer
+/// exists to give — has a default. The route renders its own shape from these
+/// fields, so nothing the control plane adds reaches a caller until it is
+/// named here.
 #[derive(Debug, Deserialize)]
 pub(crate) struct RequestCostAnswer {
+    /// Required: a figure with no unit is not an answer.
+    currency: String,
     #[serde(default)]
-    total_usd: Option<String>,
+    total: Option<String>,
     #[serde(default)]
     pending: Option<bool>,
     #[serde(default)]
@@ -225,6 +234,7 @@ struct Generation<'a> {
 #[derive(Serialize)]
 struct GenerationData<'a> {
     id: &'a str,
+    currency: &'a str,
     total_cost: Option<&'a str>,
     pending: Option<bool>,
     has_more: Option<bool>,
@@ -249,7 +259,8 @@ impl<'a> Generation<'a> {
         Generation {
             data: GenerationData {
                 id,
-                total_cost: answer.total_usd.as_deref(),
+                currency: &answer.currency,
+                total_cost: answer.total.as_deref(),
                 pending: answer.pending,
                 has_more: answer.has_more,
                 items: answer
@@ -261,7 +272,7 @@ impl<'a> Generation<'a> {
                         status: item.status.as_deref(),
                         error: item.error.as_deref(),
                         billing_status: item.charge_status.as_deref(),
-                        cost: item.charge_usd.as_deref(),
+                        cost: item.charge.as_deref(),
                         estimated: item.estimated,
                         quantities: item.quantities.as_ref(),
                     })
@@ -386,7 +397,8 @@ mod tests {
     fn owners_answer() -> Value {
         json!({
             "request_id": "req-7c1",
-            "total_usd": "0.010680",
+            "currency": "CNY",
+            "total": "0.010680",
             "pending": false,
             "has_more": false,
             "cost_usd": "98.7654",
@@ -398,7 +410,7 @@ mod tests {
                     "status": "succeeded",
                     "error": null,
                     "charge_status": "charged",
-                    "charge_usd": "0.010000",
+                    "charge": "0.010000",
                     "cost_usd": "98.7654",
                     "estimated": false,
                     "quantities": {"input": 1000, "output": 200},
@@ -410,7 +422,7 @@ mod tests {
                     "status": "retried",
                     "error": null,
                     "charge_status": "charged",
-                    "charge_usd": "0.000680",
+                    "charge": "0.000680",
                     "cost_usd": "98.7654",
                     "estimated": true,
                     "quantities": {"input": 100, "input_cache_read": 80},
@@ -572,6 +584,35 @@ mod tests {
                 AccountError::Unavailable,
                 "{id}"
             );
+        }
+    }
+
+    /// The currency is not defaulted either: an answer without it is not an
+    /// answer, and the route says so with `503` rather than showing a figure
+    /// of unknown unit.
+    #[tokio::test]
+    async fn a_generation_answer_without_its_currency_is_unavailable() {
+        let stand_in = stand_in(Arc::new(|_, _| {
+            let mut body = owners_answer();
+            body.as_object_mut().unwrap().remove("currency");
+            ok(body)
+        }))
+        .await;
+        assert_eq!(
+            stand_in
+                .client()
+                .request_found("k-owner", "req-7c1")
+                .await
+                .unwrap_err(),
+            AccountError::Unavailable
+        );
+
+        // Through the route, no amount of the answer reaches the caller.
+        let (status, body) = lookup(router(Some(stand_in.client()), false), OWNER, "req-7c1").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert_eq!(body["error"]["code"], "control_plane_unavailable", "{body}");
+        for amount in ["0.010680", "0.010000", "0.000680"] {
+            assert!(!body.to_string().contains(amount), "{amount} in {body}");
         }
     }
 
@@ -823,6 +864,7 @@ mod tests {
             body,
             json!({"data": {
                 "id": "req-7c1",
+                "currency": "CNY",
                 "total_cost": "0.010680",
                 "pending": false,
                 "has_more": false,
@@ -873,7 +915,10 @@ mod tests {
 
     #[tokio::test]
     async fn an_answer_missing_an_optional_field_still_decodes() {
-        let stand_in = stand_in(Arc::new(|_, _| ok(json!({"items": [{}]})))).await;
+        let stand_in = stand_in(Arc::new(|_, _| {
+            ok(json!({"currency": "CNY", "items": [{}]}))
+        }))
+        .await;
         let (status, body) = lookup(router(Some(stand_in.client()), false), OWNER, "req-7c1").await;
         assert_eq!(status, StatusCode::OK, "{body}");
         // What the control plane did not say is rendered `null`, never
@@ -882,6 +927,7 @@ mod tests {
             body,
             json!({"data": {
                 "id": "req-7c1",
+                "currency": "CNY",
                 "total_cost": null,
                 "pending": null,
                 "has_more": null,

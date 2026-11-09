@@ -333,7 +333,7 @@ async fn a_member_keys_lookup_shows_no_organization_figures() {
     let mut got = scopes(&r);
     got.sort();
     assert_eq!(got, ["api_key", "member"]);
-    assert_eq!(r.body["effective_remaining_usd"], json!("0.020000"));
+    assert_eq!(r.body["effective_remaining"], json!("0.020000"));
     assert_eq!(r.body["binding_level"], json!("key"));
     // The organization binds, and is still hidden.
     let r =
@@ -346,7 +346,7 @@ async fn a_member_keys_lookup_shows_no_organization_figures() {
         .await;
     assert_eq!(r.status, 200, "{r:?}");
     let r = dp(&q, &gw, q.key).await;
-    assert_eq!(r.body["effective_remaining_usd"], json!("0.010000"));
+    assert_eq!(r.body["effective_remaining"], json!("0.010000"));
     assert_eq!(r.body["binding_level"], json!("organization"));
     assert_eq!(r.body["org"], Value::Null);
     assert!(!scopes(&r).contains(&"team".to_string()), "{r:?}");
@@ -362,7 +362,7 @@ async fn owner_admin_and_billing_keys_see_the_balance() {
             .expect("a key id");
         let r = dp(&q, &gw, k).await;
         assert_eq!(r.status, 200, "{r:?}");
-        assert_eq!(r.body["org"]["available_usd"], json!("0.970000"), "{r:?}");
+        assert_eq!(r.body["org"]["available"], json!("0.970000"), "{r:?}");
         assert!(scopes(&r).contains(&"team".to_string()), "{r:?}");
     }
     sqlx::query("UPDATE members SET role = 'billing' WHERE id = $1")
@@ -371,7 +371,7 @@ async fn owner_admin_and_billing_keys_see_the_balance() {
         .await
         .expect("set the role");
     let r = dp(&q, &gw, q.key).await;
-    assert_eq!(r.body["org"]["available_usd"], json!("0.970000"), "{r:?}");
+    assert_eq!(r.body["org"]["available"], json!("0.970000"), "{r:?}");
 }
 
 #[tokio::test]
@@ -384,7 +384,7 @@ async fn an_unbound_key_sees_what_a_member_key_sees() {
     assert_eq!(r.body["org"], Value::Null);
     assert!(scopes(&r).is_empty(), "{r:?}");
     // Only the organization applies: 0.50 less 0.03 spent against the team.
-    assert_eq!(r.body["effective_remaining_usd"], json!("0.470000"));
+    assert_eq!(r.body["effective_remaining"], json!("0.470000"));
     assert_eq!(r.body["binding_level"], json!("organization"));
 }
 
@@ -399,7 +399,7 @@ async fn a_role_change_shows_at_the_next_lookup() {
         .await
         .expect("promote");
     let r = dp(&q, &gw, q.key).await;
-    assert_eq!(r.body["org"]["available_usd"], json!("0.970000"), "{r:?}");
+    assert_eq!(r.body["org"]["available"], json!("0.970000"), "{r:?}");
 }
 
 #[tokio::test]
@@ -442,7 +442,7 @@ async fn the_internal_tenant_has_no_organization_limit() {
     let r = dp(&q, &gw, k).await;
     assert_eq!(r.status, 200, "{r:?}");
     assert_eq!(r.body["org"], Value::Null);
-    assert_eq!(r.body["effective_remaining_usd"], Value::Null);
+    assert_eq!(r.body["effective_remaining"], Value::Null);
     assert_eq!(r.body["binding_level"], Value::Null);
 }
 
@@ -509,6 +509,68 @@ async fn a_key_quotas_figures_are_the_budgets_without_their_target() {
         assert!(fields["created_at"].is_string(), "{budget}");
         assert_eq!(figure, budget);
     }
+}
+
+/// The gateway's answer is a whitelist of neutral names: each amount sits
+/// under the name of what it is, never under one that carries a unit, and
+/// the answer says which currency the amounts are in. A gateway requires
+/// `currency`, so an answer without it shows no figure at all.
+#[tokio::test]
+async fn the_quota_lookup_answers_in_cny_with_neutral_names() {
+    let Some(q) = setup().await else { return };
+    let gw = q.cp.issue_dp_client("gw-quota-cny").await;
+    let r = dp(&q, &gw, q.key).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    assert_eq!(
+        keys_of(&r.body),
+        set(&[
+            "key_id",
+            "as_of",
+            "currency",
+            "org",
+            "quotas",
+            "effective_remaining",
+            "binding_level",
+        ]),
+        "{r:?}"
+    );
+    assert_eq!(r.body["currency"], json!("CNY"), "{r:?}");
+    // An owner's key sees the organization's figures, under the same
+    // neutral names.
+    let owner_key: Uuid =
+        Uuid::parse_str(&seed_key(&q.cp, &q.admin, q.tenant, Some(q.owner.id)).await)
+            .expect("a key id");
+    let r = dp(&q, &gw, owner_key).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    assert_eq!(
+        keys_of(&r.body["org"]),
+        set(&["billing_mode", "balance", "credit_limit", "available"]),
+        "{r:?}"
+    );
+    for figure in r.body["quotas"].as_array().expect("quotas") {
+        let got = keys_of(figure);
+        for name in ["limit", "spend", "remaining"] {
+            assert!(got.contains(name), "{name} in {figure}");
+        }
+        for name in ["limit_usd", "spend_usd", "remaining_usd"] {
+            assert!(!got.contains(name), "{name} in {figure}");
+        }
+    }
+    // No amount anywhere in the answer is named for a unit.
+    let body = r.body.to_string();
+    assert!(!body.contains("_usd"), "{body}");
+}
+
+fn keys_of(v: &Value) -> std::collections::BTreeSet<String> {
+    v.as_object()
+        .unwrap_or_else(|| panic!("an object: {v}"))
+        .keys()
+        .cloned()
+        .collect()
+}
+
+fn set(of: &[&str]) -> std::collections::BTreeSet<String> {
+    of.iter().map(|s| s.to_string()).collect()
 }
 
 #[tokio::test]

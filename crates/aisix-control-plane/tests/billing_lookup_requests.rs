@@ -32,14 +32,21 @@ const UPSTREAM_ERROR: &str = "upstream secret 4b7";
 const CLAIMED_COST: f64 = 98.7654;
 
 /// The keys of an answer and of one of its items, from the API section.
-const ANSWER_KEYS: [&str; 5] = ["request_id", "total_usd", "pending", "has_more", "items"];
+const ANSWER_KEYS: [&str; 6] = [
+    "request_id",
+    "currency",
+    "total",
+    "pending",
+    "has_more",
+    "items",
+];
 const ITEM_KEYS: [&str; 8] = [
     "occurred_at",
     "model",
     "status",
     "error",
     "charge_status",
-    "charge_usd",
+    "charge",
     "estimated",
     "quantities",
 ];
@@ -313,7 +320,7 @@ async fn a_request_lookup_lists_the_callers_rows_newest_first() {
     let r = lookup(&w.dp, &w.key, "req-lk-7c1").await;
     assert_eq!(keys_of(&r.body), set(&ANSWER_KEYS), "{r:?}");
     assert_eq!(r.body["request_id"], "req-lk-7c1");
-    assert_eq!(r.body["total_usd"], "0.010680");
+    assert_eq!(r.body["total"], "0.010680");
     assert_eq!(r.body["pending"], false);
     assert_eq!(r.body["has_more"], false);
     let items = items(&r);
@@ -328,8 +335,8 @@ async fn a_request_lookup_lists_the_callers_rows_newest_first() {
     }
     assert_eq!(time(&items[0]["occurred_at"]), t0 + TimeDelta::seconds(1));
     assert_eq!(time(&items[1]["occurred_at"]), t0);
-    assert_eq!(items[0]["charge_usd"], "0.010000");
-    assert_eq!(items[1]["charge_usd"], "0.000680");
+    assert_eq!(items[0]["charge"], "0.010000");
+    assert_eq!(items[1]["charge"], "0.000680");
     assert_eq!(
         items[0]["quantities"],
         json!({"input": 4000, "output": 3000})
@@ -393,7 +400,7 @@ async fn a_reused_request_id_lists_every_row_newest_first() {
         .collect();
     assert_eq!(shown, newest);
     // The total is the listed rows' sum: 50 × 680 µ$.
-    assert_eq!(r.body["total_usd"], "0.034000");
+    assert_eq!(r.body["total"], "0.034000");
     assert_eq!(r.body["pending"], false);
 }
 
@@ -571,14 +578,14 @@ async fn an_unpriced_row_makes_the_total_pending() {
     let items = items(&r);
     assert_eq!(items.len(), 3, "{r:?}");
     assert_eq!(r.body["pending"], true);
-    assert_eq!(r.body["total_usd"], "0.000680");
+    assert_eq!(r.body["total"], "0.000680");
     assert_eq!(items[0]["charge_status"], "nothing_to_bill");
-    assert_eq!(items[0]["charge_usd"], "0.000000");
+    assert_eq!(items[0]["charge"], "0.000000");
     assert_eq!(items[1]["charge_status"], "pending");
-    assert_eq!(items[1]["charge_usd"], Value::Null);
+    assert_eq!(items[1]["charge"], Value::Null);
     assert_eq!(items[1]["quantities"], json!({}));
     assert_eq!(items[2]["charge_status"], "charged");
-    assert_eq!(items[2]["charge_usd"], "0.000680");
+    assert_eq!(items[2]["charge"], "0.000680");
 }
 
 #[tokio::test]
@@ -605,7 +612,7 @@ async fn an_adjusted_row_shows_its_corrected_cost() {
     )
     .await;
     let r = lookup(&w.dp, &w.key, "req-lk-8a2").await;
-    assert_eq!(items(&r)[0]["charge_usd"], "0.010000", "{r:?}");
+    assert_eq!(items(&r)[0]["charge"], "0.010000", "{r:?}");
     assert_eq!(r.body["pending"], true);
 
     // Input goes to 1.034 USD per million, so the first row costs 340 µ$
@@ -615,14 +622,14 @@ async fn an_adjusted_row_shows_its_corrected_cost() {
     run_repricing(&w.cp).await;
     let r = lookup(&w.dp, &w.key, "req-lk-8a2").await;
     let items = items(&r);
-    assert_eq!(items[0]["charge_usd"], "0.010340", "{r:?}");
+    assert_eq!(items[0]["charge"], "0.010340", "{r:?}");
     assert_eq!(items[0]["charge_status"], "charged");
     // A row the run charged reads charged, as in the call log.
-    assert_eq!(items[1]["charge_usd"], "0.000680", "{r:?}");
+    assert_eq!(items[1]["charge"], "0.000680", "{r:?}");
     assert_eq!(items[1]["charge_status"], "charged");
     // A run records no charge lines, so such a row shows no quantities.
     assert_eq!(items[1]["quantities"], json!({}));
-    assert_eq!(r.body["total_usd"], "0.011020");
+    assert_eq!(r.body["total"], "0.011020");
     assert_eq!(r.body["pending"], false);
 }
 
@@ -1030,4 +1037,32 @@ async fn stalled_lookups_never_hold_up_usage_intake() {
         items(&lookup(&w.dp, &w.key, "req-lk-pool-2").await).len(),
         1
     );
+}
+
+/// The gateway's answer is a whitelist of neutral names, and it says which
+/// currency its amounts are in. A gateway requires `currency` and renders
+/// `total` and `items[].charge`: an answer without it shows no figure at
+/// all. Nothing here is named for a unit any more.
+#[tokio::test]
+async fn the_request_lookup_answers_in_cny() {
+    let Some(w) = world().await else { return };
+    let m = model(&w, "chat-bill", true).await;
+    let t0 = base(&w.cp).await;
+    send_all(
+        &w,
+        vec![
+            row(&w, "cny-1", "req-lk-cny", m, t0, tokens_10000()),
+            row(&w, "cny-2", "req-lk-cny", m, t0, tokens_680()),
+        ],
+    )
+    .await;
+    let r = lookup(&w.dp, &w.key, "req-lk-cny").await;
+    assert_eq!(r.status, 200, "{r:?}");
+    assert_eq!(r.body["currency"], json!("CNY"), "{r:?}");
+    // The same amounts under the neutral names, and no name carrying a unit.
+    // ¥0.01 and ¥0.000680, the two rows' own charges.
+    assert_eq!(r.body["total"], json!("0.010680"), "{r:?}");
+    let charges: Vec<&Value> = items(&r).iter().map(|i| &i["charge"]).collect();
+    assert_eq!(charges, [&json!("0.000680"), &json!("0.010000")], "{r:?}");
+    assert!(!r.body.to_string().contains("_usd"), "{r:?}");
 }

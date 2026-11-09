@@ -15,8 +15,10 @@ import { startSwallowRelay, type SwallowRelay } from "../harness/swallow-relay.j
 //
 // The platform prices `chat-bill` at input 6 and output 20 USD per million
 // tokens and `embed-bill` at input 10 and output 0, and leaves `chat-later`
-// unpriced. Tenant A pays the platform price; tenant C has a 20 % discount
-// (2 000 basis points). Both are granted all three models.
+// unpriced. The group every seeded key names charges 1 CNY per USD, so a
+// per-token CNY figure is numerically the card's USD one. Tenant A pays the
+// platform price; tenant C has a 20 % discount (2 000 basis points). Both are
+// granted all three models.
 
 /** The longest the gateway serves a tenant's prices from its cache. */
 const PRICES_TTL_MS = 10_000;
@@ -98,13 +100,13 @@ describe("in platform mode the model listing shows each model's price for the ca
 
   test("Each listed model carries the tenant's own per-token price", async () => {
     const a = await listing(tenantA.key);
-    expect(a.get(CHAT_MODEL)?.pricing).toEqual({ input: "0.000006", output: "0.00002" });
-    expect(a.get(EMBED_MODEL)?.pricing).toEqual({ input: "0.00001", output: "0" });
+    expect(a.get(CHAT_MODEL)?.pricing).toEqual({ currency: "CNY", input: "0.000006", output: "0.00002" });
+    expect(a.get(EMBED_MODEL)?.pricing).toEqual({ currency: "CNY", input: "0.00001", output: "0" });
 
     // C pays 80 % of every platform price.
     const c = await listing(tenantC.key);
-    expect(c.get(CHAT_MODEL)?.pricing).toEqual({ input: "0.0000048", output: "0.000016" });
-    expect(c.get(EMBED_MODEL)?.pricing).toEqual({ input: "0.000008", output: "0" });
+    expect(c.get(CHAT_MODEL)?.pricing).toEqual({ currency: "CNY", input: "0.0000048", output: "0.000016" });
+    expect(c.get(EMBED_MODEL)?.pricing).toEqual({ currency: "CNY", input: "0.000008", output: "0" });
   });
 
   test("A model with no price is listed without pricing", async () => {

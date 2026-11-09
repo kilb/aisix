@@ -203,8 +203,11 @@ describe("a tenant's own levels cap members and keys at the gateway", () => {
     const lookup = await callGateway(world!.gateway.proxyUrl, kx.plaintext, "/v1/key", undefined);
     expect(lookup.status, lookup.text).toBe(200);
     const keyCap = (lookup.json.data.budgets as Json[]).find((b) => b.scope === "api_key");
-    expect(keyCap?.spend_usd, lookup.text).toBe("0.016000");
-    expect(keyCap?.limit_usd, lookup.text).toBe("0.010000");
+    expect(keyCap?.spend, lookup.text).toBe("0.016000");
+    expect(keyCap?.limit, lookup.text).toBe("0.010000");
+    // The lookup names its currency, and no amount in it is named for a unit.
+    expect((lookup.json.data as Json).currency, lookup.text).toBe("CNY");
+    expect(lookup.text).not.toContain("_usd");
   });
 
   test("A member cannot touch what an owner set", async () => {
