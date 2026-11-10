@@ -299,4 +299,79 @@ describe("streaming edges e2e: client abort mid-stream", () => {
     expect(errCtor).not.toBe("SyntaxError");
     expect(errMessage).not.toContain("Could not parse message into JSON");
   });
+
+  test("n=2 stream that ends after only one choice finished: iterator throws, the open choice is not reported complete", async (ctx) => {
+    if (!etcdReachable || !app || !seed) {
+      ctx.skip();
+      return;
+    }
+
+    // Two choices stream; choice 0 finishes, choice 1 never does, and the
+    // upstream then closes the body cleanly with no `[DONE]`. A finish
+    // reason ends ONE choice (OpenAI streams `n` choices, each with its own
+    // `finish_reason`), so this answer is truncated: choice 1 was cut off.
+    const upstream = await startOpenAiUpstream({
+      streamEvents: [
+        '{"id":"n2","object":"chat.completion.chunk","model":"gpt-4o-mini","choices":[{"index":0,"delta":{"role":"assistant","content":"first "},"finish_reason":null}]}',
+        '{"id":"n2","object":"chat.completion.chunk","model":"gpt-4o-mini","choices":[{"index":1,"delta":{"role":"assistant","content":"second "},"finish_reason":null}]}',
+        '{"id":"n2","object":"chat.completion.chunk","model":"gpt-4o-mini","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}',
+      ],
+    });
+    upstreams.push(upstream);
+
+    const pk = await seed.createProviderKey({
+      display_name: "stream-n2-pk",
+      secret: "sk-mock",
+      api_base: `${upstream.baseUrl}/v1`,
+    });
+    await seed.createModel({
+      display_name: "stream-n2",
+      provider: "openai",
+      model_name: "gpt-4o-mini",
+      provider_key_id: pk.id,
+    });
+
+    const client = new OpenAI({
+      apiKey: CALLER_PLAINTEXT,
+      baseURL: `${app.proxyUrl}/v1`,
+      maxRetries: 0,
+    });
+    const probe = new ProxyClient(app.proxyUrl, CALLER_PLAINTEXT);
+    await waitConfigPropagation(async () => {
+      const r = await probe.listModels();
+      if (r.status !== 200) return false;
+      const data = (r.body as { data?: Array<{ id?: string }> }).data ?? [];
+      return data.some((m) => m.id === "stream-n2");
+    });
+
+    const finished = new Set<number>();
+    const text = new Map<number, string>();
+    let surfacedError = false;
+    const stream = await client.chat.completions.create({
+      model: "stream-n2",
+      messages: [{ role: "user", content: "two answers" }],
+      n: 2,
+      stream: true,
+    });
+    try {
+      for await (const chunk of stream) {
+        for (const choice of chunk.choices) {
+          if (choice.delta?.content) {
+            text.set(choice.index, (text.get(choice.index) ?? "") + choice.delta.content);
+          }
+          if (choice.finish_reason) finished.add(choice.index);
+        }
+      }
+    } catch {
+      surfacedError = true;
+    }
+
+    // What the upstream sent reached the caller, both choices' text.
+    expect(text.get(0)).toBe("first ");
+    expect(text.get(1)).toBe("second ");
+    // Choice 1 never finished upstream, and nothing claims it did.
+    expect([...finished]).toEqual([0]);
+    // The truncation surfaces as an error rather than a clean `[DONE]`.
+    expect(surfacedError).toBe(true);
+  });
 });
