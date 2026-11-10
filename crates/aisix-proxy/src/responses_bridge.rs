@@ -732,6 +732,11 @@ fn function_chat_tool(t: &Value, rename: Option<(String, Option<String>)>) -> Op
     if let Some(p) = t.get("parameters") {
         func.insert("parameters".to_string(), p.clone());
     }
+    // Chat's function definition takes the same optional `strict`, so one
+    // the caller set, `false` or `null` included, travels as sent.
+    if let Some(strict) = t.get("strict") {
+        func.insert("strict".to_string(), strict.clone());
+    }
     Some(json!({"type": "function", "function": Value::Object(func)}))
 }
 
@@ -5821,6 +5826,40 @@ mod tests {
             tools[1]["function"]["parameters"]["properties"]["task"]["type"],
             "string"
         );
+    }
+
+    /// A function tool's `strict` is the same optional member on a Chat
+    /// Completions function definition, so the value the caller set travels
+    /// as sent on a top-level function and on a namespace sub-tool alike,
+    /// and an omitted one stays omitted.
+    #[test]
+    fn a_function_tools_strict_reaches_the_chat_tool_as_sent() {
+        let chat = responses_request_to_chat(
+            "m",
+            &json!({"input": "go", "tools": [
+                {"type": "function", "name": "on", "strict": true,
+                 "parameters": {"type": "object"}},
+                {"type": "function", "name": "off", "strict": false},
+                {"type": "function", "name": "nulled", "strict": null},
+                {"type": "function", "name": "unset"},
+                multi_agent_namespace(),
+            ]}),
+        );
+        let tools = chat.extra["tools"].as_array().unwrap();
+        let strict = |name: &str| {
+            tools
+                .iter()
+                .find(|t| t["function"]["name"] == name)
+                .unwrap()["function"]
+                .get("strict")
+                .cloned()
+        };
+        assert_eq!(strict("on"), Some(json!(true)));
+        assert_eq!(strict("off"), Some(json!(false)));
+        assert_eq!(strict("nulled"), Some(Value::Null));
+        assert_eq!(strict("unset"), None);
+        assert_eq!(strict("multi_agent_v1__spawn_agent"), Some(json!(false)));
+        assert_eq!(strict("multi_agent_v1__close_agent"), None);
     }
 
     /// A sub-tool whose flattened name a top-level function already has is
