@@ -228,3 +228,60 @@ test("入账请求途中关闭面板再打开：新表单在旧请求有结果�
   await expect(page.getByText("已入账", { exact: true })).toBeVisible();
   expect(await topups(world)).toHaveLength(2);
 });
+
+/**
+ * A credit the control plane refuses after its form was closed: the reopened
+ * form must not just unlock as though nothing happened. The refusal is the
+ * real control plane's; only its answer is held at the network until the
+ * panel has been closed and opened again.
+ */
+test("入账请求途中关闭面板，随后被拒绝：重开的表单解锁，并说明上一笔被拒绝、未入账", async ({ page }) => {
+  const world = await seedTenant(stack, { mode: "prepaid", creditCny: "0" });
+  const CREDITS = `**/admin/tenants/${world.tenantId}/credits`;
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => (release = resolve));
+  let reached!: () => void;
+  const arrived = new Promise<void>((resolve) => (reached = resolve));
+  await page.route(CREDITS, async (route) => {
+    reached();
+    await held;
+    await route.continue();
+  });
+
+  await login(page);
+  let panel = await openPanel(page, world);
+  let form = credit(panel);
+  await form.getByLabel("金额（元）").fill("0.05");
+  // A control character the browser input keeps is refused by the backend at /reason.
+  await form.getByLabel("原因").evaluate((el: HTMLInputElement) => {
+    const set = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!;
+    set.call(el, "a\u0007b");
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  await form.getByRole("button", { name: "入账", exact: true }).click();
+  await form.getByRole("button", { name: "确认入账" }).click();
+  await arrived;
+
+  await panel.getByRole("button", { name: "关闭" }).click();
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+  panel = await openPanel(page, world);
+  form = credit(panel);
+  await expect(form.getByRole("status")).toContainText("上一笔入账仍在等待结果");
+
+  // Refused: the form unlocks and says the last credit was refused, and why.
+  release();
+  await expect(form.getByRole("alert").filter({ hasText: "上一笔入账被拒绝" })).toHaveText("上一笔入账被拒绝，未入账：不能包含控制字符");
+  await expect(form.getByLabel("金额（元）")).toBeEnabled();
+  await expect(form.getByRole("button", { name: "入账", exact: true })).toBeEnabled();
+  await page.unroute(CREDITS);
+  expect(await topups(world)).toHaveLength(0);
+
+  // The next credit starts clean.
+  await form.getByLabel("金额（元）").fill("0.03");
+  await form.getByLabel("原因").fill("拒绝之后-ui-7c5");
+  await form.getByRole("button", { name: "入账", exact: true }).click();
+  await form.getByRole("button", { name: "确认入账" }).click();
+  await expect(page.getByText("已入账", { exact: true })).toBeVisible();
+  await expect(form.getByRole("alert").filter({ hasText: "上一笔入账被拒绝" })).toHaveCount(0);
+  expect(await topups(world)).toHaveLength(1);
+});

@@ -67,3 +67,26 @@ test("a tenant's credit lock is taken once, and an unknown outcome keeps it unti
   locks.acquire("t3");
   assert.equal(seen, 7);
 });
+
+test("a credit refused after its form closed is told to the tenant's next form, until another credit is sent", () => {
+  const locks = createCreditLocks();
+  assert.equal(locks.acquire("t1"), true);
+  locks.settle("t1", "refused", "上一笔入账被拒绝，未入账：不能包含控制字符");
+  // The form unlocks, and says why nothing was credited.
+  assert.equal(locks.get("t1"), null);
+  assert.equal(locks.refusal("t1"), "上一笔入账被拒绝，未入账：不能包含控制字符");
+  assert.equal(locks.refusal("t2"), null);
+  // The next credit starts clean.
+  assert.equal(locks.acquire("t1"), true);
+  assert.equal(locks.refusal("t1"), null);
+  // A refusal the sending form shows itself leaves nothing behind.
+  locks.settle("t1", "refused");
+  assert.equal(locks.refusal("t1"), null);
+  // Only a refusal is kept: a credit that landed, or whose outcome is unknown, leaves none.
+  locks.acquire("t2");
+  locks.settle("t2", "done", "x");
+  assert.equal(locks.refusal("t2"), null);
+  locks.acquire("t3");
+  locks.settle("t3", "unknown", "x");
+  assert.equal(locks.refusal("t3"), null);
+});

@@ -35,11 +35,15 @@ export type CreditLock = "pending" | "unknown";
  * panel (or opening another tenant) never hands a fresh, unlocked form back,
  * and they are observable, so a form opened while a credit is still on its
  * way follows that credit to its end: locked while it is pending, and kept
- * locked if it turns out unknown. They last for this page load only; a
- * reload starts clean, as the operator then reads the ledger anyway.
+ * locked if it turns out unknown. A credit refused after its form closed
+ * leaves the refusal here, for the tenant's next form to say until another
+ * credit is sent: nothing was credited, and a form that just unlocks says
+ * nothing of it. They last for this page load only; a reload starts clean,
+ * as the operator then reads the ledger anyway.
  */
 export function createCreditLocks() {
   const locks = new Map<string, CreditLock>();
+  const refusals = new Map<string, string>();
   const listeners = new Set<() => void>();
   const changed = () => {
     for (const listener of listeners) listener();
@@ -56,14 +60,24 @@ export function createCreditLocks() {
     acquire(tenant: string): boolean {
       if (locks.has(tenant)) return false;
       locks.set(tenant, "pending");
+      refusals.delete(tenant);
       changed();
       return true;
     },
-    /** The credit ended: an unknown outcome keeps the lock until the operator has checked; any other frees it. */
-    settle(tenant: string, outcome: CreditOutcome<unknown>["kind"]): void {
+    /**
+     * The credit ended: an unknown outcome keeps the lock until the operator
+     * has checked; any other frees it. `refused` is what a refusal says when
+     * no form is left to show it.
+     */
+    settle(tenant: string, outcome: CreditOutcome<unknown>["kind"], refused?: string): void {
       if (outcome === "unknown") locks.set(tenant, "unknown");
       else locks.delete(tenant);
+      if (outcome === "refused" && refused !== undefined) refusals.set(tenant, refused);
       changed();
+    },
+    /** What the tenant's last credit, refused after its form closed, was refused for; `null` for none. */
+    refusal(tenant: string): string | null {
+      return refusals.get(tenant) ?? null;
     },
     /** The operator has checked an unknown credit and starts over; a credit still on its way keeps its lock. */
     release(tenant: string): void {

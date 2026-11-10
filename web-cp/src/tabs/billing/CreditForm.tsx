@@ -1,6 +1,7 @@
-import { useState, useSyncExternalStore } from "react";
+import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { billing } from "../../lib/api";
 import { creditLocks, sendCredit } from "../../lib/creditOutcome";
+import { errorText } from "../../lib/fmt";
 import { isCnyAmount } from "../../lib/money";
 import { Button } from "../../ui/Button";
 import { Field, useRefusalFocus } from "../../ui/Field";
@@ -38,6 +39,16 @@ function Form({ account, onChanged }: RegionProps) {
   const unknown = lock === "unknown";
   // A credit this form did not send is still on its way.
   const elsewhere = lock === "pending" && !busy;
+  // A credit refused after the form that sent it closed: nothing was credited.
+  const earlier = useSyncExternalStore(creditLocks.subscribe, () => creditLocks.refusal(account.tenant_id));
+  // Whether this form is still on screen to show its own refusal.
+  const mounted = useRef(true);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
   const [checking, setChecking] = useState(false);
   const [form, focusRefusal] = useRefusalFocus<HTMLFormElement>();
 
@@ -72,8 +83,11 @@ function Form({ account, onChanged }: RegionProps) {
       return;
     }
     if (outcome.kind === "refused") {
-      creditLocks.settle(account.tenant_id, "refused");
-      setRefused(refusal(outcome.error, (p) => p === "/amount_cny" || p === "/reason" || p === "/reference"));
+      const refused = refusal(outcome.error, (p) => p === "/amount_cny" || p === "/reason" || p === "/reference");
+      // Closed since, the form cannot show it: the tenant's next form says it instead.
+      const why = [...refused.at.values(), refused.general].filter(Boolean).join("；") || errorText(outcome.error);
+      creditLocks.settle(account.tenant_id, "refused", mounted.current ? undefined : `上一笔入账被拒绝，未入账：${why}`);
+      setRefused(refused);
       setBusy(false);
       focusRefusal();
       return;
@@ -146,6 +160,11 @@ function Form({ account, onChanged }: RegionProps) {
       {elsewhere && (
         <div className="note warn" role="status">
           这个租户的上一笔入账仍在等待结果，结果出来之前不能再次入账。
+        </div>
+      )}
+      {earlier && lock === null && (
+        <div className="note crit" role="alert">
+          {earlier}
         </div>
       )}
       {unknown && (
