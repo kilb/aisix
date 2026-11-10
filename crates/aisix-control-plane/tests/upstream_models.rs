@@ -500,7 +500,9 @@ async fn the_error_text_is_scrubbed_and_500_characters_at_most() {
 
     let r = list(&cp, &admin, id).await;
     assert_eq!(r.status, 502, "{r:?}");
-    assert_eq!(r.body["code"], "upstream_bad_response");
+    // A 401 is the account's key being refused, and says so; the scrub and
+    // the cap below are the same for every upstream refusal.
+    assert_eq!(r.body["code"], "upstream_auth_refused");
     let detail = r.body["details"][0]["message"]
         .as_str()
         .expect("a scrubbed detail");
@@ -530,6 +532,60 @@ async fn the_error_text_is_scrubbed_and_500_characters_at_most() {
         "the answer carries the upstream's status: {:?}",
         r.body
     );
+}
+
+/// An upstream that refuses the account's key on its model list — `401` for
+/// a bad or revoked key, `403` for one without the permission, as OpenAI- and
+/// Anthropic-compatible upstreams answer — is named as exactly that, with
+/// the upstream's own scrubbed words beside it. Any other refusal keeps the
+/// generic answer. The status stays the route's own `502` either way.
+#[tokio::test]
+async fn a_refused_key_is_named_as_the_accounts_key() {
+    let Some(cp) = TestCp::start_reaching_loopback().await else {
+        return;
+    };
+    let admin = cp.admin_login_seeded(OperatorRole::Admin).await;
+    for (status, code) in [
+        (StatusCode::UNAUTHORIZED, "upstream_auth_refused"),
+        (StatusCode::FORBIDDEN, "upstream_auth_refused"),
+        (StatusCode::NOT_FOUND, "upstream_bad_response"),
+        (StatusCode::INTERNAL_SERVER_ERROR, "upstream_bad_response"),
+    ] {
+        let fixture = Fixture::start(move || {
+            Answer::new(
+                status,
+                format!(
+                    r#"{{"error":{{"code":"","message":"Invalid token {KEY} (request id: 7c1)","type":"new_api_error"}}}}"#
+                ),
+            )
+        })
+        .await;
+        let id = account(&cp, &admin, &fixture, json!({})).await;
+        let r = list(&cp, &admin, id).await;
+        assert_eq!(r.status, 502, "{status}: {r:?}");
+        assert_eq!(r.body["code"], code, "{status}: {r:?}");
+        if code == "upstream_auth_refused" {
+            let message = r.body["error"].as_str().unwrap_or_default();
+            assert!(
+                message.contains("密钥"),
+                "{status}: the answer names the account's key: {r:?}"
+            );
+        }
+        let detail = r.body["details"][0]["message"].as_str().unwrap_or_default();
+        assert!(
+            detail.contains("Invalid token"),
+            "{status}: the upstream's words survive: {detail}"
+        );
+        assert!(
+            !detail.contains(KEY),
+            "{status}: the key reached the caller: {detail}"
+        );
+        assert!(
+            !r.body.to_string().contains(&status.as_u16().to_string()),
+            "{status}: the answer carries the upstream's status: {:?}",
+            r.body
+        );
+    }
 }
 
 #[tokio::test]

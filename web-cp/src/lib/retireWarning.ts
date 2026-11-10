@@ -28,10 +28,10 @@ export type UseCounts = { tenants?: number; keys?: number; channels?: number };
 /**
  * What the retire confirmation says will happen. While a grant or an enabled
  * serving account still holds the model the retire is refused, so it says
- * that, with the counts and what to clear. Otherwise the retire succeeds and
- * cannot be undone: it says what goes — the routing document, the direct
- * documents generated for each account, and the accounts' mappings — and
- * that the name stays taken.
+ * that, with the counts and what to clear. Otherwise the retire succeeds: it
+ * says what goes — the routing document, the direct documents generated for
+ * each account, and the accounts' mappings, which a later restore does not
+ * bring back — and that the name stays the model's own.
  */
 export function retireWarning(model: Retirable): string {
   const accounts = model.served_by.filter((s) => s.enabled).length;
@@ -41,7 +41,7 @@ export function retireWarning(model: Retirable): string {
   ];
   if (holders.length === 0) {
     const mappings = model.served_by.length > 0 ? `，以及 ${model.served_by.length} 个账号上的映射设置` : "";
-    return `停用后不能恢复：将删除它的路由文档和为各账号生成的直连文档${mappings}。名称「${model.name}」以后不能再用于公共模型，需要时请用新名称新建一个公共模型。`;
+    return `停用后不能恢复原有的账号映射：将删除它的路由文档和为各账号生成的直连文档${mappings}。名称「${model.name}」以后不能再用于公共模型，只能在「价格 → 公共模型」恢复它本身，恢复后要重新为账号勾选映射。`;
   }
   const clear = [
     ...(model.tenants > 0 || model.keys > 0 ? ["从租户与密钥中移除它"] : []),
@@ -73,7 +73,7 @@ export function deleteWarning(model: Retirable): string {
     model.served_by.length > 0
       ? `先删除 ${model.served_by.length} 个账号对它的映射，再删除它的路由文档和各账号的直连文档`
       : "删除它的路由文档和为各账号生成的直连文档";
-  return `删除后不能恢复：将${mappings}。名称「${model.name}」以后不能再用于公共模型，需要时请用新名称新建一个公共模型。`;
+  return `删除后不能恢复原有的账号映射：将${mappings}。名称「${model.name}」以后不能再用于公共模型，只能在这里恢复它本身，恢复后要重新为账号勾选映射。`;
 }
 
 /**

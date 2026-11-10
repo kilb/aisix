@@ -273,10 +273,13 @@ test("有分组没有换算率时显示未定价，每个分组都有换算率�
     });
   for (const g of groups.filter((g) => g.name !== "shared")) await rate(g.id);
 
-  // One group without a rate: a call in it cannot be charged, so the model
-  // is not priced.
+  // One group that serves it without a rate: a call in it cannot be
+  // charged, so the model is not priced, and the cell names that group.
   const panel = await openPublicModels(page);
-  await expect(listRow(panel, name).getByRole("cell").nth(2)).toHaveText("未定价");
+  const cell = listRow(panel, name).getByRole("cell").nth(2);
+  await expect(cell).toContainText("未定价");
+  await expect(cell).toContainText(`${shared.display_name} 未设换算率`);
+  await expect(cell).not.toContainText("已定价");
 
   // With `shared` rated too, every group prices it.
   await rate(shared.id);
@@ -318,11 +321,14 @@ test("两个账号都还在服务的公共模型可以一次删除：映射与�
     const table = await stack.admin.get(`/admin/provider-keys/${accountId}/channel-models`);
     expect(table.items.find((i: Json) => i.public_model_id === pub.id), "the mapping is gone").toBeUndefined();
   }
+  // Every one of the three documents is gone, not just one of them: the
+  // live names that are any of the three must be none at all.
+  const generated = [name, `${name}#acct-served-a-${suffix}`, `${name}#acct-served-b-${suffix}`];
   await expect
-    .poll(async () => Object.keys(await modelDocs()), { timeout: APPLIED_WITHIN_MS })
-    .not.toEqual(
-      expect.arrayContaining([name, `${name}#acct-served-a-${suffix}`, `${name}#acct-served-b-${suffix}`]),
-    );
+    .poll(async () => Object.keys(await modelDocs()).filter((n) => generated.includes(n)), {
+      timeout: APPLIED_WITHIN_MS,
+    })
+    .toEqual([]);
 });
 
 test("删除一个无人使用的公共模型也要先确认，并说明删除什么、不能恢复", async ({ page }) => {
@@ -357,4 +363,146 @@ test("删除一个无人使用的公共模型也要先确认，并说明删除�
   await expect(page.getByText(`已删除「${name}」`)).toBeVisible();
   await expect(listRow(panel, name).getByRole("cell").nth(5)).toHaveText("已停用");
   expect((await stack.admin.get(`/admin/public-models/${pub.id}`)).retired_at).not.toBeNull();
+});
+
+/** A baseline in force from just now, for `modelId`. */
+async function baselineNow(modelId: string): Promise<void> {
+  await stack.admin.post("/admin/pricing/baselines", {
+    model_id: modelId,
+    effective_from: new Date(Date.now() - 2_000).toISOString(),
+    card: { default: { base: { input: "4", output: "20" } } },
+    note: "the public-model list's card",
+  });
+}
+
+test("定价只看服务它的分组：不服务它的分组没有换算率仍是已定价，缺的时候写明缺哪个分组或基准价", async ({ page }) => {
+  const suffix = randomUUID().slice(0, 8);
+  const groups: Json[] = (await stack.admin.get("/admin/provider-groups")).items.filter((g: Json) => !g.retired_at);
+  const shared = groups.find((g) => g.name === "shared");
+  const rated = groups.find((g) => g.name === "grp-pub-8e3");
+  expect(shared, "the first-boot group, which has no rate").toBeDefined();
+  expect(rated, "the spec's group, created at a default rate").toBeDefined();
+  expect(rated.default_rate.current?.cny_per_usd, "it prices every model by default").toBeTruthy();
+  expect(shared.default_rate.current, "and `shared` prices none").toBeNull();
+
+  // Served only from the rated group: `shared` serves nothing of it, so its
+  // missing rate cannot leave a call unpriced.
+  const onlyRated = await stack.admin.post("/admin/public-models", { name: `pub-g-rated-${suffix}` });
+  const ratedAccount = await newAccount(`acct-g-rated-${suffix}`, ["grp-pub-8e3"]);
+  await stack.admin.put(`/admin/provider-keys/${ratedAccount}/channel-models/${onlyRated.id}`, {});
+  await baselineNow(onlyRated.id);
+  // Served only from `shared`, which has no rate for it.
+  const onlyShared = await stack.admin.post("/admin/public-models", { name: `pub-g-shared-${suffix}` });
+  const sharedAccount = await newAccount(`acct-g-shared-${suffix}`, ["shared"]);
+  await stack.admin.put(`/admin/provider-keys/${sharedAccount}/channel-models/${onlyShared.id}`, {});
+  await baselineNow(onlyShared.id);
+  // Served from the rated group, with no baseline at all.
+  const noBaseline = await stack.admin.post("/admin/public-models", { name: `pub-g-bare-${suffix}` });
+  await stack.admin.put(`/admin/provider-keys/${ratedAccount}/channel-models/${noBaseline.id}`, {});
+
+  const panel = await openPublicModels(page);
+  await expect(listRow(panel, onlyRated.name).getByRole("cell").nth(2)).toHaveText("已定价");
+  const missing = listRow(panel, onlyShared.name).getByRole("cell").nth(2);
+  await expect(missing).toContainText("未定价");
+  await expect(missing).toContainText(`${shared.display_name} 未设换算率`);
+  await expect(missing).not.toContainText(rated.display_name);
+  const bare = listRow(panel, noBaseline.name).getByRole("cell").nth(2);
+  await expect(bare).toContainText("未定价");
+  await expect(bare).toContainText("无基准价");
+});
+
+test("授权租户与密钥数的是能调用它的租户和密钥：全部模型范围的租户也算", async ({ page }) => {
+  const suffix = randomUUID().slice(0, 8);
+  const name = `pub-reach-${suffix}`;
+  const pub = await stack.admin.post("/admin/public-models", { name });
+  const accountId = await newAccount(`acct-reach-${suffix}`);
+  await stack.admin.put(`/admin/provider-keys/${accountId}/channel-models/${pub.id}`, {});
+  // A tenant on every public model (the default scope), with a key that
+  // picks no model of its own: it reaches this one without naming it.
+  const tenant = await stack.admin.post("/admin/tenants", { name: `tenant-reach-${suffix}` });
+  expect(tenant.model_scope).toBe("all");
+  const shared = (await stack.admin.get("/admin/provider-groups")).items.find((g: Json) => g.name === "shared");
+  await stack.admin.post(`/admin/tenants/${tenant.id}/keys`, { label: `key-reach-${suffix}`, group_id: shared.id });
+
+  const panel = await openPublicModels(page);
+  const row = listRow(panel, name);
+  // The only all-scope tenant this spec creates, and its one key: every
+  // other tenant here is narrowed to a list that does not name this model.
+  await expect(row.getByRole("cell").nth(3)).toHaveText("1");
+  await expect(row.getByRole("cell").nth(4)).toHaveText("1");
+  // Nothing in a selected scope names it, so a delete is not refused: the
+  // warning says what goes, not that it is held.
+  await row.getByRole("button", { name: "删除", exact: true }).click();
+  await expect(row.getByRole("alert")).not.toContainText("删除会被拒绝");
+  await row.getByRole("button", { name: "取消" }).click();
+});
+
+test("已停用的公共模型可以恢复：恢复后在用、没有可用账号，再映射后重新可调用", async ({ page }) => {
+  const suffix = randomUUID().slice(0, 8);
+  const name = `pub-restore-${suffix}`;
+  const pub = await stack.admin.post("/admin/public-models", { name });
+  const accountName = `acct-restore-${suffix}`;
+  const accountId = await newAccount(accountName);
+  await stack.admin.put(`/admin/provider-keys/${accountId}/channel-models/${pub.id}`, { priority: 1, weight: 1 });
+  await expect
+    .poll(async () => (await modelDocs())[name] !== undefined, { timeout: APPLIED_WITHIN_MS })
+    .toBe(true);
+
+  const panel = await openPublicModels(page);
+  const row = listRow(panel, name);
+  await row.getByRole("button", { name: "删除", exact: true }).click();
+  await row.getByRole("button", { name: "确认删除" }).click();
+  await expect(page.getByText(`已删除「${name}」`)).toBeVisible();
+  await expect(row.getByRole("cell").nth(5)).toHaveText("已停用");
+  await expect(row.getByRole("button", { name: "删除", exact: true })).toHaveCount(0);
+  await expect
+    .poll(async () => (await modelDocs())[name] === undefined, { timeout: APPLIED_WITHIN_MS })
+    .toBe(true);
+
+  // Retired, 基准价 does not list it.
+  const whileRetired = await stack.admin.get("/admin/pricing/baselines");
+  expect((whileRetired.items as Json[]).some((i) => i.model_id === pub.id)).toBe(false);
+
+  // 恢复 asks first, and says the mappings do not come back with it.
+  await row.getByRole("button", { name: "恢复", exact: true }).click();
+  await expect(row.getByRole("alert")).toContainText("原来的账号映射不会恢复");
+  expect((await stack.admin.get(`/admin/public-models/${pub.id}`)).retired_at).not.toBeNull();
+  await row.getByRole("button", { name: "确认恢复" }).click();
+  await expect(page.getByText(`已恢复「${name}」`)).toBeVisible();
+  await expect(row.getByRole("cell").nth(5)).toHaveText("在用");
+  await expect(row.getByRole("cell").nth(1)).toHaveText("没有可用账号");
+  await expect(row.getByRole("button", { name: "恢复", exact: true })).toHaveCount(0);
+  const restored = await stack.admin.get(`/admin/public-models/${pub.id}`);
+  expect(restored.retired_at).toBeNull();
+  expect(restored.served_by).toEqual([]);
+  // Its routing document is back, at its own id, with no target yet.
+  await expect
+    .poll(async () => (await modelDocs())[name]?.doc.routing.targets, { timeout: APPLIED_WITHIN_MS })
+    .toEqual([]);
+  expect((await modelDocs())[name].id).toBe(pub.id);
+  // And it is a model 基准价 lists again, taking a card entered by hand (a
+  // model the price library may not list): what 手动录入 sends.
+  const listed = await stack.admin.get("/admin/pricing/baselines");
+  expect((listed.items as Json[]).some((i) => i.model_id === pub.id)).toBe(true);
+  const priced = await stack.admin.request("POST", "/admin/pricing/baselines", {
+    model_id: pub.id,
+    effective_from: new Date(Date.now() - 2_000).toISOString(),
+    card: { default: { base: { input: "1.5", output: "6" } } },
+    note: "restored model, priced by hand",
+  });
+  expect(priced.status, priced.text).toBe(201);
+
+  // Mapped again the way 获取上游模型 → 写入映射 sends it (this stack's
+  // control plane cannot read the stand-in's list, so the selection is posted
+  // here): the restored public model is reused by name, under its own id.
+  const applied = await stack.admin.post(`/admin/provider-keys/${accountId}/channel-models`, {
+    upstream_models: [name],
+  });
+  expect((applied.items as Json[]).map((i) => [i.public_model_id, i.outcome])).toEqual([[pub.id, "added"]]);
+  await panel.getByRole("button", { name: "刷新" }).click();
+  await expect(row.getByRole("cell").nth(1)).toHaveText("1 个（优先级 0）");
+  await expect
+    .poll(async () => (await modelDocs())[`${name}#${accountName}`] !== undefined, { timeout: APPLIED_WITHIN_MS })
+    .toBe(true);
+  expect((await modelDocs())[name].doc.routing.targets).toHaveLength(1);
 });

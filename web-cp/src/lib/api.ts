@@ -1662,10 +1662,18 @@ export interface PublicModel {
    * A key that is absent means the gateway's own default.
    */
   routing: PublicModelRouting;
-  /** Live tenants whose grants name it. */
+  /**
+   * Selected-scope tenants whose list names it: what refuses a removal
+   * (`409 public_model_in_use`). An all-scope tenant is never counted here;
+   * who can call the model is `reachable_tenants`.
+   */
   tenants: number;
-  /** Live keys whose model selection names it. */
+  /** Keys of selected-scope tenants that reach it: what refuses a removal, as `tenants`. */
   keys: number;
+  /** Every tenant whose model scope reaches it now; 0 while it has no live routing document. */
+  reachable_tenants: number;
+  /** Every live key whose grant reaches it now, the platform's own name patterns included. */
+  reachable_keys: number;
   created_at: string;
   retired_at: string | null;
 }
@@ -1762,6 +1770,15 @@ export const publicModels = {
    */
   async delete(id: string): Promise<PublicModel> {
     return (await call<PublicModel>("POST", `/admin/public-models/${seg(id)}/delete`, {})).data;
+  },
+  /**
+   * Brings a retired public model back under its own id, with no account
+   * serving it yet (requests answer `503` until one does). `409
+   * public_model_not_retired` for a live one, `409 public_model_name_held`
+   * while another live model has the name.
+   */
+  async restore(id: string): Promise<PublicModel> {
+    return (await call<PublicModel>("POST", `/admin/public-models/${seg(id)}/restore`, {})).data;
   },
 };
 

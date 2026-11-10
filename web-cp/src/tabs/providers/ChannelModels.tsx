@@ -1,8 +1,16 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ApiError, channelModels, publicModels, type ChannelModel, type PublicModel } from "../../lib/api";
 import { messageFor } from "../../lib/errors";
 import { errorText } from "../../lib/fmt";
-import { keptText, removalFailedText, removeThenRetire, retiredText } from "../../lib/retireOutcome";
+import {
+  alreadyRetiredText,
+  keptText,
+  removalFailedText,
+  removeThenRetire,
+  retiredText,
+  unknownText,
+  type Readback,
+} from "../../lib/retireOutcome";
 import { retireWarning, withoutServing } from "../../lib/retireWarning";
 import { GroupList } from "../../ui/GroupName";
 import { Button } from "../../ui/Button";
@@ -105,32 +113,54 @@ export function ChannelModels({
   // The public model id whose `删除模型` is in flight.
   const [removing, setRemoving] = useState<string | null>(null);
 
+  // The rows the drafts were last started from: what "edited" is measured
+  // against, never the rows a reload has just brought.
+  const baseline = useRef<ChannelModel[] | null>(null);
+
   /**
-   * Re-reads the checklist. `keepDrafts` starts every row from the server's
-   * values except the rows the operator has edited since the last read, so a
-   * reload after 删除模型 does not throw those away; a draft of a row that no
-   * longer exists goes with it.
+   * Re-reads the checklist, and answers what it read (`null` when the read
+   * failed). `keepDrafts` starts every row from the server's values except
+   * the rows the operator has edited since the last read, so a reload after
+   * 删除模型 does not throw those away; a draft of a row that no longer
+   * exists goes with it.
+   *
+   * "Edited" is the draft against the row it was started from, not against
+   * the row just read: a row the server changed under an untouched draft
+   * (the mapping 删除模型 just removed) takes the server's values, so it
+   * never enters a later save on its own. The rows in `settled` take the
+   * server's values whatever their draft says — a write on them has just
+   * landed, and the draft described the state before it.
    */
-  const load = useCallback(async (keepDrafts = false) => {
-    try {
-      const [channels, models] = await Promise.all([channelModels.list(accountId), publicModels.list()]);
-      setRows(channels);
-      setPublics(models.filter((m) => m.retired_at === null));
-      setEveryPublic(models);
-      setDrafts((prev) => {
-        const fresh = Object.fromEntries(channels.map((r) => [r.public_model_id, draftOf(r)]));
-        if (!keepDrafts) return fresh;
-        for (const row of channels) {
-          const edited = prev[row.public_model_id];
-          if (edited !== undefined && !sameDraft(edited, draftOf(row))) fresh[row.public_model_id] = edited;
-        }
-        return fresh;
-      });
-      setError(null);
-    } catch (e) {
-      setError(errorText(e));
-    }
-  }, [accountId]);
+  const load = useCallback(
+    async (keepDrafts = false, settled: readonly string[] = []) => {
+      try {
+        const [channels, models] = await Promise.all([channelModels.list(accountId), publicModels.list()]);
+        const before = baseline.current;
+        baseline.current = channels;
+        setRows(channels);
+        setPublics(models.filter((m) => m.retired_at === null));
+        setEveryPublic(models);
+        setDrafts((prev) => {
+          const fresh = Object.fromEntries(channels.map((r) => [r.public_model_id, draftOf(r)]));
+          if (!keepDrafts) return fresh;
+          for (const row of channels) {
+            const id = row.public_model_id;
+            const edited = prev[id];
+            const was = before?.find((r) => r.public_model_id === id);
+            if (edited === undefined || was === undefined || settled.includes(id)) continue;
+            if (!sameDraft(edited, draftOf(was))) fresh[id] = edited;
+          }
+          return fresh;
+        });
+        setError(null);
+        return { channels, models };
+      } catch (e) {
+        setError(errorText(e));
+        return null;
+      }
+    },
+    [accountId],
+  );
 
   useEffect(() => {
     void load();
@@ -151,7 +181,8 @@ export function ChannelModels({
   /**
    * The public models this save would take from their last enabled serving account,
    * by the tenants and keys that reach one today. Read from the API's own
-   * `served_by`, `tenants` and `keys`: the page counts nothing itself.
+   * `served_by`, `reachable_tenants` and `reachable_keys`: the page counts
+   * nothing itself.
    */
   const unserved = useMemo(() => {
     const losing: PublicModel[] = [];
@@ -266,19 +297,45 @@ export function ChannelModels({
     setNote(null);
     setRefusal(null);
     setRemoving(row.public_model_id);
+    const id = row.public_model_id;
     const outcome = await removeThenRetire(
-      () => channelModels.remove(accountId, row.public_model_id),
-      () => publicModels.retire(row.public_model_id),
+      () => channelModels.remove(accountId, id),
+      () => publicModels.retire(id),
     );
-    setRemoving(null);
     if (outcome.kind === "removal_failed") {
+      setRemoving(null);
       setRefusal(removalFailedText(name, outcome.error));
       return;
     }
-    if (outcome.kind === "retired") setNote(retiredText(name));
-    else setRefusal(keptText(name, outcome));
-    // The mapping is gone either way; other rows keep whatever was edited.
-    await load(true);
+    // This model's row takes what the server now says, whatever its draft
+    // held; every other row keeps whatever was edited.
+    const read = await load(true, [id]);
+    setRemoving(null);
+    switch (outcome.kind) {
+      case "retired":
+        setNote(retiredText(name));
+        break;
+      case "already_retired":
+        setNote(alreadyRetiredText(name));
+        break;
+      case "kept_in_use":
+      case "kept_failed":
+        setRefusal(keptText(name, outcome));
+        break;
+      case "removal_unknown":
+      case "retire_unknown": {
+        // Said from what the read-back found, never from the lost answer.
+        const readback: Readback | null =
+          read === null
+            ? null
+            : {
+                served: read.channels.some((c) => c.public_model_id === id && c.served),
+                retired: read.models.find((m) => m.id === id)?.retired_at != null,
+              };
+        setRefusal(unknownText(name, outcome, readback));
+        break;
+      }
+    }
   }
 
   const filter = query.trim().toLowerCase();
@@ -446,7 +503,7 @@ export function ChannelModels({
                         warning={
                           model === undefined ? (
                             // The view was not read for it: say what the two writes do, without counts.
-                            `删除模型「${row.public_model_name}」：先移除本账号对它的映射，再停用它；停用后它的路由文档、各账号的直连文档和账号映射都会被删除，不能恢复。若仍有租户授权、密钥或启用的账号指向它，它会被保留，随后的提示会写明要先解除哪些。`
+                            `删除模型「${row.public_model_name}」：先移除本账号对它的映射，再停用它；停用后它的路由文档、各账号的直连文档和账号映射都会被删除，账号映射不能恢复（公共模型本身可以在「价格 → 公共模型」恢复）。若仍有租户授权、密钥或启用的账号指向它，它会被保留，随后的提示会写明要先解除哪些。`
                           ) : (
                             <>
                               <span className="ch-warn-line">
@@ -506,7 +563,7 @@ export function ChannelModels({
                   <>
                     {unserved.map((model) => (
                       <span key={model.id} className="ch-warn-line">
-                        停用后「{model.name}」将没有可用账号：影响 {model.tenants} 个租户、{model.keys} 个密钥。
+                        停用后「{model.name}」将没有可用账号：影响 {model.reachable_tenants} 个租户、{model.reachable_keys} 个密钥。
                       </span>
                     ))}
                     停用后这些公共模型仍然保留，但请求会失败（无可用上游）。
@@ -522,7 +579,9 @@ export function ChannelModels({
             rows={rows}
             publics={everyPublic}
             disabled={busy || creating}
-            onApplied={load}
+            onApplied={async () => {
+              await load();
+            }}
           />
           <div className="ch-create">
             <p className="hint">上游有、公共模型还没有的名称可以在这里一并新建；价格仍然建在该公共模型上。</p>

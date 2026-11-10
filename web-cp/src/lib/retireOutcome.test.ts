@@ -1,13 +1,27 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { ApiError } from "./api.ts";
-import { keptText, removalFailedText, removeThenRetire, retiredText } from "./retireOutcome.ts";
+import {
+  alreadyRetiredText,
+  keptText,
+  removalFailedText,
+  removeThenRetire,
+  retiredText,
+  unknownText,
+} from "./retireOutcome.ts";
 
 // `npm run test:unit`.
 
-/** A refusal's answer, by the fields this module reads (see its doc comment). */
-const refusal = (code: string, counts: Record<string, number> | null = null) =>
-  ({ message: "refused", code, counts }) as ApiError;
+/** A refusal's answer, by the fields this module reads (see its doc comment): the control plane's own 4xx. */
+const refusal = (code: string, counts: Record<string, number> | null = null, status = 409) =>
+  ({ message: "refused", code, counts, status }) as unknown as ApiError;
+
+/** An answer that was lost: the client's `network`, a proxy's 502 page, or the control plane's own 500. */
+const lost = {
+  network: () => ({ message: "无法连接控制面", code: "network", counts: null, status: 0 }) as unknown as ApiError,
+  proxy: () => ({ message: "服务端返回了非 JSON 响应（HTTP 502）", code: "bad_response", counts: null, status: 502 }) as unknown as ApiError,
+  internal: () => ({ message: "internal", code: "internal", counts: null, status: 500 }) as unknown as ApiError,
+};
 
 test("both writes succeed: retired", async () => {
   const out = await removeThenRetire(
@@ -60,14 +74,78 @@ test("the different counts in a kept_in_use answer name only what is there", asy
   assert.doesNotMatch(text, /租户/);
 });
 
-test("another retire failure: the mapping went, the model did not, and the reason is shown", async () => {
+test("another retire refusal: the mapping went, the model did not, and the reason is shown", async () => {
   const out = await removeThenRetire(
     () => Promise.resolve(),
-    () => Promise.reject(refusal("public_model_retired")),
+    () => Promise.reject(refusal("not_found", null, 404)),
   );
   assert.equal(out.kind, "kept_failed");
   if (out.kind !== "kept_failed") throw new Error("unreachable");
-  assert.match(keptText("pub-a", out), /本账号的映射已移除，但「pub-a」没有停用，仍然存在：该公共模型已停用/);
+  assert.match(keptText("pub-a", out), /本账号的映射已移除，但「pub-a」没有停用，仍然存在：资源不存在/);
+});
+
+test("public_model_retired at either step is the retired state, never 'not retired'", async () => {
+  for (const out of [
+    // Another operator retired it between the two writes.
+    await removeThenRetire(
+      () => Promise.resolve(),
+      () => Promise.reject(refusal("public_model_retired")),
+    ),
+    // Or before this delete began: the mapping removal meets a retired model.
+    await removeThenRetire(
+      () => Promise.reject(refusal("public_model_retired")),
+      () => Promise.reject(new Error("never sent")),
+    ),
+  ]) {
+    assert.deepEqual(out, { kind: "already_retired" });
+  }
+  const text = alreadyRetiredText("pub-a");
+  assert.match(text, /「pub-a」已经停用/);
+  assert.doesNotMatch(text, /没有停用|仍然存在|没有改动/);
+});
+
+test("a lost removal answer is unknown, and the retire is never sent", async () => {
+  for (const make of [lost.network, lost.proxy, lost.internal, () => new Error("boom")]) {
+    let retired = false;
+    const out = await removeThenRetire(
+      () => Promise.reject(make()),
+      () => {
+        retired = true;
+        return Promise.resolve();
+      },
+    );
+    assert.equal(out.kind, "removal_unknown");
+    assert.equal(retired, false);
+    if (out.kind !== "removal_unknown") throw new Error("unreachable");
+    // Not the refusal's "nothing changed": the answer did not say.
+    const unread = unknownText("pub-a", out, null);
+    assert.match(unread, /没能确认「pub-a」的删除结果/);
+    assert.match(unread, /结果仍未知/);
+    assert.doesNotMatch(unread, /没有改动|没有停用|已移除/);
+  }
+});
+
+test("a lost retire answer is unknown, and the read-back is what is reported", async () => {
+  const out = await removeThenRetire(
+    () => Promise.resolve(),
+    () => Promise.reject(lost.proxy()),
+  );
+  assert.equal(out.kind, "retire_unknown");
+  if (out.kind !== "retire_unknown") throw new Error("unreachable");
+  assert.match(unknownText("pub-a", out, null), /没能确认「pub-a」是否已停用.*结果仍未知/);
+  assert.match(unknownText("pub-a", out, { served: false, retired: true }), /重新读取后：本账号已不再映射它，公共模型已停用/);
+  assert.match(unknownText("pub-a", out, { served: false, retired: false }), /重新读取后：本账号已不再映射它，公共模型仍在用/);
+  assert.doesNotMatch(unknownText("pub-a", out, { served: false, retired: true }), /没有停用|仍然存在/);
+});
+
+test("a read-back after a lost removal says what it found", async () => {
+  const out = await removeThenRetire(
+    () => Promise.reject(lost.network()),
+    () => Promise.resolve(),
+  );
+  if (out.kind !== "removal_unknown") throw new Error("unreachable");
+  assert.match(unknownText("pub-a", out, { served: true, retired: false }), /本账号仍映射它，公共模型仍在用/);
+  assert.match(unknownText("pub-a", out, { served: false, retired: false }), /本账号已不再映射它/);
 });
 
 test("a reason that is not an API answer is printed as it is", async () => {
@@ -75,8 +153,8 @@ test("a reason that is not an API answer is printed as it is", async () => {
     () => Promise.resolve(),
     () => Promise.reject(new Error("boom")),
   );
-  if (out.kind !== "kept_failed") throw new Error("unreachable");
-  assert.match(keptText("pub-a", out), /boom/);
+  if (out.kind !== "retire_unknown") throw new Error("unreachable");
+  assert.match(unknownText("pub-a", out, null), /boom/);
 });
 
 test("the success sentence names the name and both removals", () => {

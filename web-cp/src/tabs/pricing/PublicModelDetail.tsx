@@ -101,8 +101,8 @@ export function PublicModelDetail({
         </Button>
       </h2>
       <p className="hint">
-        标识 <code>{model.id}</code>，创建于 {fmtUtc(model.created_at)}。授权租户 {model.tenants} 个、密钥{" "}
-        {model.keys} 个。
+        标识 <code>{model.id}</code>，创建于 {fmtUtc(model.created_at)}。授权租户 {model.reachable_tenants} 个、密钥{" "}
+        {model.reachable_keys} 个。
       </p>
       {error && (
         <div className="note crit" role="alert">

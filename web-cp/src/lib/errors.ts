@@ -42,6 +42,7 @@ const TEXT: Record<string, string> = {
   upstream_unreachable: "无法连接该上游获取模型列表，请直接填写模型名称",
   upstream_timeout: "获取该上游的模型列表超时，请直接填写模型名称",
   upstream_bad_response: "该上游的模型列表无法读取，请直接填写模型名称",
+  upstream_auth_refused: "上游拒绝了该账号的密钥：请检查该账号的密钥是否正确、是否仍然有效；也可以直接填写模型名称",
   // The price library: its fetch from the dataset's address, and a sync
   // whose preview moved before it was confirmed.
   library_fetch_failed: "无法获取价格库数据",
@@ -50,6 +51,7 @@ const TEXT: Record<string, string> = {
   // Public models and the accounts that serve them.
   public_model_in_use: "该公共模型仍在使用中",
   public_model_retired: "该公共模型已停用",
+  public_model_not_retired: "该公共模型没有停用，无需恢复",
 };
 
 /** Reads only the code and the message, so a caller-typed part of an answer passes too. */
