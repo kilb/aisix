@@ -53,6 +53,19 @@ impl Expiry<String, BodyEntry> for PerBodyEntryExpiry {
     ) -> Option<Duration> {
         Some(value.ttl)
     }
+
+    /// An overwrite is a fresh entry: it lives its own `ttl` from now. moka's
+    /// default keeps the replaced entry's deadline, so a refreshed answer
+    /// would expire on the old one's clock.
+    fn expire_after_update(
+        &self,
+        _key: &String,
+        value: &BodyEntry,
+        _updated_at: Instant,
+        _duration_until_expiry: Option<Duration>,
+    ) -> Option<Duration> {
+        Some(value.ttl)
+    }
 }
 
 #[derive(Debug)]
@@ -69,9 +82,10 @@ pub struct MemoryCache {
 }
 
 /// Per-entry expiry that defers to the value's stashed `ttl`.
-/// `expire_after_read` / `expire_after_update` return `None` so reads
-/// don't extend an entry's life (semantic is "expires N seconds from
-/// insert", not "expires N seconds from last access").
+/// `expire_after_read` keeps moka's default, which leaves the deadline
+/// alone, so reads don't extend an entry's life (semantic is "expires N
+/// seconds from the write", not "expires N seconds from last access").
+/// `expire_after_update` restarts the clock: an overwrite is a fresh write.
 struct PerEntryExpiry;
 
 impl Expiry<String, Entry> for PerEntryExpiry {
@@ -80,6 +94,19 @@ impl Expiry<String, Entry> for PerEntryExpiry {
         _key: &String,
         value: &Entry,
         _current_time: Instant,
+    ) -> Option<Duration> {
+        Some(value.ttl)
+    }
+
+    /// moka's default keeps the replaced entry's deadline, so a refreshed
+    /// answer (a `no-cache` revalidation writes the same key) would expire
+    /// on the old one's clock, early or late by its new `ttl`.
+    fn expire_after_update(
+        &self,
+        _key: &String,
+        value: &Entry,
+        _updated_at: Instant,
+        _duration_until_expiry: Option<Duration>,
     ) -> Option<Duration> {
         Some(value.ttl)
     }
@@ -325,6 +352,71 @@ mod tests {
         cache.put("k", updated).await.unwrap();
         let got = cache.get("k").await.unwrap().unwrap();
         assert_eq!(got.message.content_str(), "second");
+    }
+
+    /// An overwrite of a live key lives its own TTL from the overwrite, not
+    /// the replaced entry's remaining time: a refresh with an equal TTL must
+    /// outlive the original deadline, and one with a shorter TTL must not
+    /// inherit the original's longer one.
+    #[tokio::test]
+    async fn an_overwrite_restarts_the_entrys_ttl() {
+        let cache = MemoryCache::new(Duration::from_secs(300), 1 << 20);
+        let ttl = Duration::from_millis(400);
+        cache
+            .put_with_ttl("eq", sample_response(), ttl)
+            .await
+            .unwrap();
+        cache
+            .put_body_with_ttl("eq", sample_body(), ttl)
+            .await
+            .unwrap();
+        cache
+            .put_with_ttl("shorter", sample_response(), Duration::from_secs(60))
+            .await
+            .unwrap();
+        cache
+            .put_body_with_ttl("shorter", sample_body(), Duration::from_secs(60))
+            .await
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let mut refreshed = sample_response();
+        refreshed.message.content = Some("refreshed".into());
+        cache.put_with_ttl("eq", refreshed, ttl).await.unwrap();
+        let mut refreshed_body = sample_body();
+        refreshed_body.body = b"refreshed".to_vec();
+        cache
+            .put_body_with_ttl("eq", refreshed_body, ttl)
+            .await
+            .unwrap();
+        cache
+            .put_with_ttl("shorter", sample_response(), Duration::from_millis(50))
+            .await
+            .unwrap();
+        cache
+            .put_body_with_ttl("shorter", sample_body(), Duration::from_millis(50))
+            .await
+            .unwrap();
+
+        // Past the first write's deadline (400ms) and the shorter refresh's
+        // (50ms), well inside the equal refresh's own (650ms).
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        cache.inner.run_pending_tasks().await;
+        cache.bodies.run_pending_tasks().await;
+
+        let chat = cache
+            .get("eq")
+            .await
+            .unwrap()
+            .expect("refreshed chat entry");
+        assert_eq!(chat.message.content_str(), "refreshed");
+        let body = cache.get_body("eq").await.unwrap().expect("refreshed body");
+        assert_eq!(body.body, b"refreshed".to_vec());
+        assert!(
+            cache.get("shorter").await.unwrap().is_none(),
+            "a shorter refresh must not keep the old 60s deadline"
+        );
+        assert!(cache.get_body("shorter").await.unwrap().is_none());
     }
 
     /// Per-entry TTL: two keys inserted at the same time with
