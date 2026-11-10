@@ -59,6 +59,11 @@ export interface A2aUpstream {
 
 export interface A2aUpstreamOptions {
   cardMount?: A2aCardMount;
+  /**
+   * Serve the card in A2A 1.0's own shape, which has no top-level `url`: the
+   * agent's endpoints are only the `url`s inside `supportedInterfaces`.
+   */
+  cardWithoutLegacyUrl?: boolean;
   /** When set, the agent is registered with `auth_type: bearer` and this token. */
   token?: string;
   /** Wire shape of the results this agent returns. Defaults to `0.3`. */
@@ -177,6 +182,7 @@ export async function startA2aUpstream(
       servicePath,
       cardPath,
       token: options.token,
+      cardWithoutLegacyUrl: options.cardWithoutLegacyUrl ?? false,
       wireShape: options.wireShape ?? "0.3",
       streamChunks:
         options.streamChunks ?? (options.streamAnswer ? [...STREAM_ANSWER] : undefined),
@@ -226,6 +232,7 @@ async function handle(
     servicePath: string;
     cardPath: string;
     token?: string;
+    cardWithoutLegacyUrl: boolean;
     wireShape: A2aWireShape;
     streamChunks?: Array<string | unknown[]>;
     holdStreamOpen: boolean;
@@ -310,7 +317,7 @@ async function handle(
       description: "Stub agent for the A2A gateway e2e.",
       protocolVersion: "1.0",
       version: "2.1.0",
-      url: "https://internal.upstream.invalid/a2a",
+      ...(ctx.cardWithoutLegacyUrl ? {} : { url: "https://internal.upstream.invalid/a2a" }),
       supportedInterfaces: [
         {
           url: "https://internal.upstream.invalid/a2a",

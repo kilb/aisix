@@ -66,6 +66,12 @@ export interface McpUpstreamOptions {
    * was refused.
    */
   rejectAuthorization?: (authorization: string | undefined) => boolean;
+  /**
+   * Hand `tools/list` out this many tools at a time, chaining the pages with
+   * `nextCursor` as the protocol's pagination does. Unset, every tool is on
+   * one page.
+   */
+  toolsPageSize?: number;
 }
 
 /**
@@ -106,6 +112,21 @@ export async function startMcpUpstream(
   };
 }
 
+/** One `tools/list` page of `tools`, `pageSize` long, starting at `cursor`. */
+function paginate<T>(
+  cursor: string | undefined,
+  pageSize: number | undefined,
+  tools: T[],
+): { tools: T[]; nextCursor?: string } {
+  if (pageSize === undefined) return { tools };
+  const start = cursor === undefined ? 0 : Number(cursor);
+  const end = start + pageSize;
+  return {
+    tools: tools.slice(start, end),
+    ...(end < tools.length ? { nextCursor: String(end) } : {}),
+  };
+}
+
 async function handle(
   label: string,
   req: IncomingMessage,
@@ -143,8 +164,7 @@ async function handle(
       { name: `${label}-upstream`, version: "0.1.0" },
       { capabilities: { tools: {} } },
     );
-    server.setRequestHandler(ListToolsRequestSchema, async () => ({
-      tools: [
+    server.setRequestHandler(ListToolsRequestSchema, async (request) => paginate(request.params?.cursor, options.toolsPageSize, [
         {
           name: "echo",
           description: `echo the text back prefixed with "${label}:"`,
@@ -206,8 +226,7 @@ async function handle(
               },
             ]
           : []),
-      ],
-    }));
+      ]));
     server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const text = String(request.params.arguments?.text ?? "");
       if (request.params.name === "report" && options.reportContent) {
