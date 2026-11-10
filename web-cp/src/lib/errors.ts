@@ -51,6 +51,7 @@ const TEXT: Record<string, string> = {
   // Public models and the accounts that serve them.
   public_model_in_use: "该公共模型仍在使用中",
   public_model_retired: "该公共模型已停用",
+  public_model_not_retired: "该公共模型没有停用，无需恢复",
 };
 
 /** Reads only the code and the message, so a caller-typed part of an answer passes too. */

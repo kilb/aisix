@@ -3,12 +3,15 @@ import type { TabProps } from "../../App";
 import {
   ApiError,
   groupPrices,
+  groups as groupsApi,
   publicModels,
+  type Group,
   type ModelGroupPriceRow,
   type PublicModel,
 } from "../../lib/api";
 import { messageFor, problemAt } from "../../lib/errors";
 import { errorText } from "../../lib/fmt";
+import { pricedState, unpricedReason } from "../../lib/publicPricing";
 import { deleteRefusalText, deleteWarning } from "../../lib/retireWarning";
 import { Button } from "../../ui/Button";
 import { DataTable, Loading } from "../../ui/DataTable";
@@ -27,14 +30,9 @@ function tiersOf(model: PublicModel): string {
   return `${accounts.length} 个（优先级 ${tiers.join("、")}）`;
 }
 
-/** Whether a model has a baseline and a rate in every group; `null` while the prices are not read. */
-function pricedState(model: PublicModel, prices: Map<string, ModelGroupPriceRow> | null): "priced" | "unpriced" | null {
-  if (prices === null) return null;
-  const row = prices.get(model.id);
-  if (!row || !row.baseline.current) return "unpriced";
-  if (row.groups.length === 0) return "unpriced";
-  // The API sends `null` for a group with no rate in force, never omits it.
-  return row.groups.every((g) => g.cny_per_usd !== null) ? "priced" : "unpriced";
+/** What a restore does, asked before it runs. */
+function restoreWarning(model: PublicModel): string {
+  return `恢复「${model.name}」：它以原来的标识重新上线，授权、基准价和分组换算率照旧。原来的账号映射不会恢复：在上游账号的「模型」里勾选它，或用「获取上游模型 → 写入映射」，之前请求会以 503 失败（无可用上游）。`;
 }
 
 /**
@@ -47,18 +45,27 @@ function pricedState(model: PublicModel, prices: Map<string, ModelGroupPriceRow>
  * the name field, and the answer says the operator may use the model that
  * already has it.
  *
- * A row's one action is 删除, and it does the whole job: the accounts' mappings
- * for the model go, then the documents, then the model is retired. It offers
- * no 停用 of its own, because every model a retire would accept is one a delete
- * accepts with the same writes — the state that differs is the one a retire
- * refuses, where an account still serves it, and unticking the model on each
- * account in turn was never what the operator wanted. A delete is still
- * refused while a tenant grant or a key selection names the model.
+ * A live row's one action is 删除, and it does the whole job: the accounts'
+ * mappings for the model go, then the documents, then the model is retired.
+ * It offers no 停用 of its own, because every model a retire would accept is
+ * one a delete accepts with the same writes — the state that differs is the
+ * one a retire refuses, where an account still serves it, and unticking the
+ * model on each account in turn was never what the operator wanted. A delete
+ * is still refused while a tenant grant or a key selection names the model.
+ *
+ * A retired row's action is 恢复: the model comes back under its own id, with
+ * no account serving it until one maps it again.
+ *
+ * 定价 judges a model by the groups that serve it ([`pricedState`]); 授权租户
+ * and 密钥 count who can call it now, all-scope tenants included — not the
+ * narrower references a delete is refused on, which the delete's own warning
+ * states.
  */
 export function PublicModels({ canEdit }: TabProps) {
   const toast = useToast();
   const [rows, setRows] = useState<PublicModel[] | null>(null);
   const [prices, setPrices] = useState<Map<string, ModelGroupPriceRow> | null>(null);
+  const [liveGroups, setLiveGroups] = useState<Group[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [refusal, setRefusal] = useState<string | null>(null);
   /** The refusal belongs on the name field: a live model already holds the name. */
@@ -71,9 +78,10 @@ export function PublicModels({ canEdit }: TabProps) {
 
   const load = useCallback(async () => {
     try {
-      const [models, priced] = await Promise.all([publicModels.list(), groupPrices.list()]);
+      const [models, priced, groupList] = await Promise.all([publicModels.list(), groupPrices.list(), groupsApi.list()]);
       setRows(models);
       setPrices(new Map(priced.map((p) => [p.model_id, p] as const)));
+      setLiveGroups(groupList);
       setError(null);
     } catch (e) {
       setError(errorText(e));
@@ -136,6 +144,20 @@ export function PublicModels({ canEdit }: TabProps) {
     }
   }
 
+  async function restore(model: PublicModel) {
+    setBusy(model.id);
+    setRefusal(null);
+    try {
+      await publicModels.restore(model.id);
+      toast(`已恢复「${model.name}」。还没有账号服务它，请在上游账号的「模型」里重新映射。`);
+      await load();
+    } catch (e) {
+      setRefusal(e instanceof ApiError ? `无法恢复「${model.name}」：${messageFor(e)}` : errorText(e));
+    } finally {
+      setBusy(null);
+    }
+  }
+
   return (
     <div className="panel">
       <h2>
@@ -176,7 +198,7 @@ export function PublicModels({ canEdit }: TabProps) {
           </thead>
           <tbody>
             {rows.map((m) => {
-              const priced = pricedState(m, prices);
+              const priced = prices === null ? null : pricedState(m, prices.get(m.id), liveGroups);
               const retired = m.retired_at !== null;
               return (
                 <tr key={m.id} data-model={m.id}>
@@ -191,16 +213,29 @@ export function PublicModels({ canEdit }: TabProps) {
                       "—"
                     ) : priced === null ? (
                       "…"
-                    ) : priced === "priced" ? (
+                    ) : priced.kind === "priced" ? (
                       "已定价"
                     ) : (
-                      <span className="pm-unpriced">未定价</span>
+                      <>
+                        <span className="pm-unpriced">未定价</span>
+                        <div className="cell-note">{unpricedReason(priced)}</div>
+                      </>
                     )}
                   </td>
-                  <td className="num">{m.tenants}</td>
-                  <td className="num">{m.keys}</td>
+                  <td className="num">{m.reachable_tenants}</td>
+                  <td className="num">{m.reachable_keys}</td>
                   <td>{retired ? "已停用" : "在用"}</td>
                   <td className="right">
+                    {canEdit && retired && (
+                      <TwoStep
+                        label="恢复"
+                        size="sm"
+                        busy={busy === m.id}
+                        busyLabel="恢复中…"
+                        warning={restoreWarning(m)}
+                        onConfirm={() => void restore(m)}
+                      />
+                    )}
                     {canEdit && !retired && (
                       <TwoStep
                         label="删除"

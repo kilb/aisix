@@ -118,3 +118,13 @@ test("a refused delete names the two places to clear, not the accounts", () => {
     "该公共模型仍在使用中：1 个租户、2 个密钥仍指向它。请在租户的模型授权、以及密钥的模型选择里移除它，再删除。",
   );
 });
+
+test("a removal's warning says the model itself can be restored, and its mappings cannot", () => {
+  for (const text of [deleteWarning(model({ served_by: [] })), retireWarning(model({ served_by: [] }))]) {
+    assert.match(text, /不能恢复原有的账号映射/);
+    assert.match(text, /恢复它本身/);
+    assert.match(text, /重新为账号勾选映射/);
+    // Never the old promise that the name is gone for good.
+    assert.doesNotMatch(text, /请用新名称新建/);
+  }
+});
