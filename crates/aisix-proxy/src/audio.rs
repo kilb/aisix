@@ -735,6 +735,7 @@ pub async fn speech(
                 monitor_hits,
                 captured_content,
                 attempt_started,
+                settle,
             } = success;
             // Same window the other model-dispatch endpoints publish.
             let rl_limits = auth.key().rate_limit.clone().unwrap_or_default();
@@ -762,7 +763,28 @@ pub async fn speech(
                 .get(header::CONTENT_LENGTH)
                 .and_then(|v| v.to_str().ok())
                 .and_then(|v| v.parse::<u64>().ok());
-            let relayed = speech_relay(body, read_timeout, expected_len, move |outcome| {
+            let relayed = speech_relay(body, read_timeout, expected_len, move |mut outcome| {
+                // The audio's real ending settles the target: a failure counts
+                // against its health and cooldown, audio that reached its end
+                // marks it healthy, a caller that left says neither.
+                let terminal = crate::stream_timeout::finish_bridge_stream(
+                    &state_c.health,
+                    &state_c.runtime_status,
+                    &settle.model_display_name,
+                    &model_id,
+                    settle.cooldown.as_ref(),
+                    outcome.terminal_failure.take(),
+                    outcome.reached_end,
+                    200,
+                    attempt_started,
+                );
+                if let Some(deferred) = &settle.deferred {
+                    deferred.finish(
+                        &state_c,
+                        terminal.status,
+                        terminal.error_class.is_empty() && terminal.status < 400,
+                    );
+                }
                 // A stream can outlive several config generations, so the
                 // emit reads a FRESH snapshot (#941).
                 let snap = state_c.snapshot.load();
@@ -925,7 +947,10 @@ struct StreamedTranscript {
     terminal: Option<String>,
     /// Some of the transcript did not fit under the cap on what is assembled.
     text_truncated: bool,
-    /// False when the caller disconnected before the upstream ended.
+    /// The response was received in full: the upstream ended, or sent its
+    /// semantic terminal (a transcription's `transcript.text.done`, the
+    /// whole `Content-Length` of synthesized audio). False when the caller
+    /// disconnected before either.
     reached_end: bool,
     /// When the first upstream frame arrived — relayed to the caller at the
     /// same moment, the frames being forwarded verbatim.
@@ -933,6 +958,9 @@ struct StreamedTranscript {
     /// The upstream failure that ended the stream after its `200` went out:
     /// a transport error, a read timeout, or an in-band error envelope.
     failure: Option<crate::attempt::StreamFailure>,
+    /// The same failure as the typed cause the target's health and cooldown
+    /// are judged by.
+    terminal_failure: Option<aisix_gateway::BridgeError>,
     /// End-of-stream monitor observations (AISIX-Cloud#1010).
     output_hits: Vec<aisix_core::GuardrailMonitorHit>,
 }
@@ -943,6 +971,23 @@ impl StreamedTranscript {
     /// of this one.
     fn text(&self) -> &str {
         self.terminal.as_deref().unwrap_or(&self.deltas)
+    }
+
+    /// Record `err` as what ended the stream, unless an earlier failure
+    /// already did.
+    fn record_failure(&mut self, err: aisix_gateway::BridgeError) {
+        crate::attempt::StreamFailure::record(&mut self.failure, &err);
+        if self.terminal_failure.is_none() {
+            self.terminal_failure = Some(err);
+        }
+    }
+
+    /// Record a failed read of the body. One after the response was received
+    /// in full cost the caller nothing, so it fails nothing.
+    fn record_read_failure(&mut self, err: aisix_gateway::BridgeError) {
+        if !self.reached_end {
+            self.record_failure(err);
+        }
     }
 }
 
@@ -1019,15 +1064,14 @@ where
                         guard.observed().reached_end = true;
                     }
                 }
-                Err(e) => crate::attempt::StreamFailure::record(
-                    &mut guard.observed().failure,
-                    &crate::dispatch::reqwest_error_to_bridge(e, started),
-                ),
+                Err(e) => guard
+                    .observed()
+                    .record_read_failure(crate::dispatch::reqwest_error_to_bridge(e, started)),
             }
             yield item;
         }
         if let Some(e) = read_timeout.fired() {
-            crate::attempt::StreamFailure::record(&mut guard.observed().failure, &e);
+            guard.observed().record_read_failure(e);
         }
         guard.observed().reached_end = true;
         if let Some((f, observed)) = guard.slot.take() {
@@ -1108,15 +1152,14 @@ where
                 }
             }
             if let Err(e) = &item {
-                crate::attempt::StreamFailure::record(
-                    &mut guard.observed().failure,
-                    &crate::dispatch::reqwest_error_to_bridge(e, started),
-                );
+                guard
+                    .observed()
+                    .record_read_failure(crate::dispatch::reqwest_error_to_bridge(e, started));
             }
             yield item;
         }
         if let Some(e) = read_timeout.fired() {
-            crate::attempt::StreamFailure::record(&mut guard.observed().failure, &e);
+            guard.observed().record_read_failure(e);
         }
         if let Some(mut d) = decoder.take() {
             observe_transcript_events(
@@ -1173,8 +1216,16 @@ fn observe_transcript_events(
         if let Some(err) =
             aisix_gateway::capture_in_band_error(payload, aisix_gateway::UpstreamWire::OpenAI)
         {
-            crate::attempt::StreamFailure::record(&mut observed.failure, &err);
+            observed.record_failure(err);
             continue;
+        }
+        // The documented terminal event: the transcript is whole, and a
+        // caller that closes on it has received the response
+        // (<https://platform.openai.com/docs/api-reference/audio/transcript-text-done-event>).
+        // Marked before the frame is yielded, which is where such a caller
+        // drops the relay.
+        if value.get("type").and_then(Value::as_str) == Some("transcript.text.done") {
+            observed.reached_end = true;
         }
         if let Some(usage) = extract_token_usage(&value) {
             observed.usage = Some(usage);
@@ -1464,7 +1515,9 @@ async fn multipart_dispatch(
     // target.
     *routing_out = crate::attempt::RoutingTelemetry::for_request(&model_entry.value.display_name)
         .with_trace(client_ctx.trace.clone());
-    let dispatched = crate::routing::dispatch_with_failover(
+    // Staged, not recorded: whether the attempt succeeded is known when the
+    // answer is read whole, or, for a relayed stream, when it ends (below).
+    let dispatched = crate::routing::dispatch_stream_with_failover(
         state,
         snapshot,
         auth,
@@ -1702,7 +1755,7 @@ async fn multipart_dispatch(
         attempt_started,
         member_reservation,
         in_flight,
-        ..
+        deferred,
     } = match dispatched {
         Ok(d) => d,
         Err(e) => {
@@ -1717,10 +1770,18 @@ async fn multipart_dispatch(
         reservation.merge(member);
     }
 
-    state.health.record_success(&target.model.display_name);
-    state
-        .runtime_status
-        .mark_healthy(&target.id, attempt_started);
+    // An answer read whole succeeded here. A relayed stream has only opened:
+    // its terminal callback settles the target's health, cooldown and
+    // deployment outcome once it knows how the stream ended.
+    if let AudioUpstreamBody::Buffered(_) = &upstream_body {
+        if let Some(deferred) = &deferred {
+            deferred.finish(state, 200, true);
+        }
+        state.health.record_success(&target.model.display_name);
+        state
+            .runtime_status
+            .mark_healthy(&target.id, attempt_started);
+    }
 
     let body_bytes = match upstream_body {
         AudioUpstreamBody::Buffered(bytes) => bytes,
@@ -1764,6 +1825,8 @@ async fn multipart_dispatch(
             let state_c = state.clone();
             let request_id_c = request_id.to_string();
             let model_id_c = target.id.clone();
+            let model_display_name_c = target.model.display_name.clone();
+            let cooldown_c = target.model.cooldown.clone();
             let model_name_c = model_name.clone();
             let provider_c = provider_label.clone();
             let upstream_model_c = upstream_model.clone();
@@ -1797,7 +1860,28 @@ async fn multipart_dispatch(
                 read_timeout,
                 content_cap,
                 eos_scan,
-                move |outcome| {
+                move |mut outcome| {
+                    // The stream's real ending settles the target: a failure
+                    // counts against its health and cooldown, a whole answer
+                    // marks it healthy, a caller that left says neither.
+                    let terminal = crate::stream_timeout::finish_bridge_stream(
+                        &state_c.health,
+                        &state_c.runtime_status,
+                        &model_display_name_c,
+                        &model_id_c,
+                        cooldown_c.as_ref(),
+                        outcome.terminal_failure.take(),
+                        outcome.reached_end,
+                        200,
+                        attempt_started,
+                    );
+                    if let Some(deferred) = &deferred {
+                        deferred.finish(
+                            &state_c,
+                            terminal.status,
+                            terminal.error_class.is_empty() && terminal.status < 400,
+                        );
+                    }
                     let usage = outcome.usage.clone().unwrap_or_default();
                     let duration_seconds =
                         duration_cost_basis(outcome.duration_seconds, || probed_seconds);
@@ -2207,6 +2291,16 @@ struct SpeechDispatchSuccess {
     captured_content: Option<CapturedContent>,
     /// When the attempt that answered began (#655).
     attempt_started: Instant,
+    /// What the relay's end settles the serving target by: its health, its
+    /// cooldown and its staged deployment outcome.
+    settle: SpeechSettle,
+}
+
+/// The serving target of a relayed synthesis, settled when the audio ends.
+struct SpeechSettle {
+    model_display_name: String,
+    cooldown: Option<aisix_core::CooldownConfig>,
+    deferred: Option<crate::attempt::DeferredAttempt>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2374,7 +2468,9 @@ async fn speech_dispatch(
     let base_body = &body;
     *routing_out = crate::attempt::RoutingTelemetry::for_request(&model_entry.value.display_name)
         .with_trace(client_ctx.trace.clone());
-    let dispatched = crate::routing::dispatch_with_failover(
+    // Staged, not recorded: the audio is relayed, so the attempt succeeded
+    // only if it reaches its end (`speech_relay`).
+    let dispatched = crate::routing::dispatch_stream_with_failover(
         state,
         snapshot,
         auth,
@@ -2560,7 +2656,7 @@ async fn speech_dispatch(
         attempt_started,
         member_reservation,
         in_flight,
-        ..
+        deferred,
     } = match dispatched {
         Ok(d) => d,
         Err(e) => {
@@ -2575,10 +2671,8 @@ async fn speech_dispatch(
         reservation.merge(member);
     }
 
-    state.health.record_success(&target.model.display_name);
-    state
-        .runtime_status
-        .mark_healthy(&target.id, attempt_started);
+    // The target's health and cooldown are settled when the audio ends
+    // (`SpeechSettle`): the headers alone do not say the synthesis worked.
 
     // #911 [21]: speech synthesis (TTS) reports no token usage — it is billed
     // per input character — so there are no tokens to add to TPM/TPD. The
@@ -2628,6 +2722,11 @@ async fn speech_dispatch(
         monitor_hits,
         captured_content,
         attempt_started,
+        settle: SpeechSettle {
+            model_display_name: target.model.display_name.clone(),
+            cooldown: target.model.cooldown.clone(),
+            deferred,
+        },
     })
 }
 
@@ -4011,6 +4110,109 @@ mod tests {
     /// #998: with `stream=true` and an SSE answer the relay is live —
     /// the frames reach the caller as they arrive rather than being
     /// buffered — and the UsageEvent comes from the stream's own guard.
+    /// `transcript.text.done` is the transcription's terminal event: a caller
+    /// that closes on it received the response, whatever the upstream does
+    /// with its body afterwards — including failing to finish it.
+    #[tokio::test]
+    async fn a_transcription_is_whole_at_its_done_event() {
+        use futures::StreamExt as _;
+        const FRAMES: &str = concat!(
+            "data: {\"type\":\"transcript.text.delta\",\"delta\":\"hello\"}\n\n",
+            "data: {\"type\":\"transcript.text.done\",\"text\":\"hello\",",
+            "\"usage\":{\"type\":\"tokens\",\"input_tokens\":4,\"output_tokens\":2}}\n\n",
+        );
+        // The caller leaves after the done event, the upstream still open.
+        let observed = Arc::new(std::sync::Mutex::new(None));
+        let observed_out = Arc::clone(&observed);
+        {
+            let upstream = futures::stream::iter([Ok::<_, reqwest::Error>(
+                bytes::Bytes::from_static(FRAMES.as_bytes()),
+            )])
+            .chain(futures::stream::pending());
+            let relayed = super::transcription_relay(
+                upstream,
+                crate::stream_timeout::ReadTimeoutSignal::default(),
+                None,
+                None,
+                move |outcome| *observed_out.lock().unwrap() = Some(outcome),
+            );
+            futures::pin_mut!(relayed);
+            let first = relayed.next().await.unwrap().unwrap();
+            assert!(String::from_utf8_lossy(&first).contains("transcript.text.done"));
+        }
+        let outcome = observed.lock().unwrap().take().expect("on_complete fired");
+        assert!(outcome.reached_end);
+        assert_eq!(
+            crate::attempt::stream_status(outcome.reached_end, outcome.failure.as_ref()),
+            200
+        );
+        assert_eq!(outcome.usage.map(|u| u.completion_tokens), Some(2));
+
+        // The upstream's read times out after the done event: nothing the
+        // caller needed is missing, so it fails nothing.
+        let observed = Arc::new(std::sync::Mutex::new(None));
+        let observed_out = Arc::clone(&observed);
+        let upstream = futures::stream::iter([Ok::<_, reqwest::Error>(bytes::Bytes::from_static(
+            FRAMES.as_bytes(),
+        ))])
+        .chain(futures::stream::pending());
+        let signal = crate::stream_timeout::ReadTimeoutSignal::default();
+        let relayed = super::transcription_relay(
+            crate::stream_timeout::with_read_timeout_bytes_signalled(
+                upstream,
+                Some(std::time::Duration::from_millis(20)),
+                signal.clone(),
+            ),
+            signal,
+            None,
+            None,
+            move |outcome| *observed_out.lock().unwrap() = Some(outcome),
+        );
+        futures::pin_mut!(relayed);
+        while relayed.next().await.is_some() {}
+        let outcome = observed.lock().unwrap().take().expect("on_complete fired");
+        assert!(
+            outcome.failure.is_none(),
+            "{:?}",
+            outcome.failure.map(|f| f.error_message)
+        );
+        assert!(outcome.terminal_failure.is_none());
+        assert!(outcome.reached_end);
+    }
+
+    /// The same read timeout before the done event is the upstream failing
+    /// the request, with the typed cause the cooldown reads.
+    #[tokio::test]
+    async fn a_transcription_cut_before_its_done_event_records_the_typed_failure() {
+        use futures::StreamExt as _;
+        let observed = Arc::new(std::sync::Mutex::new(None));
+        let observed_out = Arc::clone(&observed);
+        let upstream = futures::stream::iter([Ok::<_, reqwest::Error>(bytes::Bytes::from_static(
+            b"data: {\"type\":\"transcript.text.delta\",\"delta\":\"hello\"}\n\n",
+        ))])
+        .chain(futures::stream::pending());
+        let signal = crate::stream_timeout::ReadTimeoutSignal::default();
+        let relayed = super::transcription_relay(
+            crate::stream_timeout::with_read_timeout_bytes_signalled(
+                upstream,
+                Some(std::time::Duration::from_millis(20)),
+                signal.clone(),
+            ),
+            signal,
+            None,
+            None,
+            move |outcome| *observed_out.lock().unwrap() = Some(outcome),
+        );
+        futures::pin_mut!(relayed);
+        while relayed.next().await.is_some() {}
+        let outcome = observed.lock().unwrap().take().expect("on_complete fired");
+        assert_eq!(outcome.failure.as_ref().map(|f| f.status), Some(504));
+        assert!(matches!(
+            outcome.terminal_failure,
+            Some(aisix_gateway::BridgeError::Timeout { .. })
+        ));
+    }
+
     /// The wire bytes must still be the upstream's, event for event, and
     /// the request must be billed exactly once.
     #[tokio::test]
