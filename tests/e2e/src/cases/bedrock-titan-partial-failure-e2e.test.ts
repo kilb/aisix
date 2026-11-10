@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { createServer, type Server } from "node:http";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
+  awaitWindowHeadroom,
   EtcdClient,
   SeedClient,
   spawnApp,
@@ -23,7 +24,8 @@ import {
 // the request even with retries configured, rather than replaying the
 // prefix on every retry. A caller that hangs up while a later text is still
 // in flight leaves a row that bills the texts already answered, as the
-// failure would have.
+// failure would have. A routing group's member is charged them against its
+// own token limit.
 
 const CALLER_PLAINTEXT = "sk-bedrock-titan-partial";
 const CALLER_KEY_HASH = createHash("sha256").update(CALLER_PLAINTEXT).digest("hex");
@@ -117,6 +119,19 @@ describe("Bedrock Titan: a later text fails after an earlier one was served", ()
       provider_key_id: pk.id,
       cost: { input_per_1k: 1, output_per_1k: 1 },
     });
+    // A group member with a token budget of its own: two answered texts
+    // spend all of it.
+    await seed.createModel({
+      display_name: "titan-member",
+      provider: "bedrock",
+      model_name: "amazon.titan-embed-text-v1",
+      provider_key_id: pk.id,
+      rate_limit: { tpm: 8 },
+    });
+    await seed.createModel({
+      display_name: "titan-member-group",
+      routing: { strategy: "failover", targets: [{ model: "titan-member" }] },
+    });
     // Seeded last, so this key authenticating implies the whole seed set
     // has reached the gateway's snapshot.
     await seed.createApiKey({ key_hash: CALLER_KEY_HASH, allowed_models: ["*"] });
@@ -190,6 +205,25 @@ describe("Bedrock Titan: a later text fails after an earlier one was served", ()
     // AWS billed the two answered texts, 4 input tokens each.
     expect(row.get("prompt_tokens")).toBe("8");
     expect(Number(row.get("cost_usd") ?? "0")).toBeGreaterThan(0);
+  });
+
+  test("a group member's own token limit is charged the texts it served before failing", async (ctx) => {
+    if (!etcdReachable || !app) return ctx.skip();
+    const embed = (input: string[]) =>
+      fetch(`${app!.proxyUrl}/v1/embeddings`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${CALLER_PLAINTEXT}`, "content-type": "application/json" },
+        body: JSON.stringify({ model: "titan-member-group", input }),
+      });
+    await awaitWindowHeadroom();
+    const failed = await embed(["served", "served", "fails"]);
+    await failed.text();
+    expect(failed.status).toBeGreaterThanOrEqual(500);
+    // The member was served 8 tokens, its whole minute: the next request
+    // is refused by its limit rather than served.
+    const next = await embed(["served"]);
+    const text = await next.text();
+    expect(next.status, text).toBe(429);
   });
 
   test("a failure at the first text bills nothing and keeps its retries", async (ctx) => {

@@ -774,7 +774,7 @@ where
                 model_id: &target.id,
             })
         };
-        let member_reservation = match crate::quota::reserve_routing_target(
+        let mut member_reservation = match crate::quota::reserve_routing_target(
             state,
             snapshot,
             auth,
@@ -822,6 +822,10 @@ where
         );
         let timeouts =
             effective_timeouts(&target.model, Some(&entry.value), state.default_timeouts);
+        // What this target's failed attempts had been served before they
+        // failed (`attribution::note_served_before_failure`), owed to its
+        // own limits when its reservation is released.
+        let mut served_on_target: u64 = 0;
         for attempt_idx in 0..=budget.attempts {
             if attempt_idx > 0 {
                 let hint = last_err.as_ref().and_then(|e| match e {
@@ -929,6 +933,12 @@ where
                             dispatched: crate::attempt::attempt_reached_upstream(&e),
                         },
                     );
+                    if let Some(served) = crate::attribution::served_before_failure(index) {
+                        served_on_target += u64::from(served.prompt_tokens);
+                        if let Some(member) = member_reservation.as_mut() {
+                            member.owe_tokens(served_on_target);
+                        }
+                    }
                     if !retryable {
                         if target_unusable(&e) {
                             last_err = Some(e);
