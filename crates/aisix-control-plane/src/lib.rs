@@ -90,6 +90,8 @@ pub struct AppState {
     /// ([`upstream_models::Cache`]).
     pub upstream: Arc<upstream_http::Client>,
     pub upstream_models: Arc<upstream_models::Cache>,
+    /// Where the price library is fetched from ([`pricing::library`]).
+    pub library: Arc<pricing::library::Source>,
 }
 
 /// A booted control plane. Dropping it stops everything it runs.
@@ -203,6 +205,28 @@ pub async fn start_with_policy<S>(
 where
     S: Future<Output = ()> + Send + 'static,
 {
+    let library = reqwest::Url::parse(pricing::library::LIBRARY_URL)
+        .map_err(|e| BootError::LibrarySource(e.to_string()))?;
+    start_with_sources(cfg, shutdown, catalogue, outbound, library).await
+}
+
+/// [`start_with_policy`], fetching the price library from `library` instead
+/// of [`pricing::library::LIBRARY_URL`].
+///
+/// Production always takes the constant, and no configuration, environment
+/// variable or request field reaches this parameter. Only a caller of this
+/// library can pass another address, which is how a test points the fetch at
+/// a stand-in, or at nothing, so that no test reaches the internet.
+pub async fn start_with_sources<S>(
+    cfg: CpConfig,
+    shutdown: S,
+    catalogue: Option<Arc<aisix_pricing::Catalogue>>,
+    outbound: &aisix_core::config::SsrfProtectionConfig,
+    library: reqwest::Url,
+) -> Result<Running, BootError>
+where
+    S: Future<Output = ()> + Send + 'static,
+{
     // Every TLS client that takes the process default (the kine client, a
     // gateway client in a test) gets ring, the provider this crate builds its
     // own configurations with. The Postgres driver picks ring itself. A
@@ -305,6 +329,7 @@ where
         billing::access::LOOKUP_ACQUIRE_TIMEOUT,
     );
     let upstream = upstream_http::Client::new(outbound).map_err(BootError::OutboundPolicy)?;
+    let library = pricing::library::Source::new(library).map_err(BootError::LibrarySource)?;
     let state = AppState {
         db,
         env,
@@ -321,6 +346,7 @@ where
         lookups,
         upstream: Arc::new(upstream),
         upstream_models: Arc::new(upstream_models::Cache::default()),
+        library: Arc::new(library),
     };
 
     // Nothing fails from here on, so nothing spawned below is left behind

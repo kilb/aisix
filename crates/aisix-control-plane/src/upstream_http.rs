@@ -1,5 +1,7 @@
-//! The one outbound HTTP client the control plane has: the model list of an
-//! upstream account (`GET /admin/provider-keys/{id}/upstream-models`).
+//! The control plane's outbound HTTP clients: the model list of an upstream
+//! account (`GET /admin/provider-keys/{id}/upstream-models`), and the price
+//! library's fetch from its one fixed address ([`fixed_origin_client`],
+//! `POST /admin/pricing/library/fetch`). Both start from the same builder.
 //!
 //! `api_base` is operator-set, so this is the first place the control plane
 //! dials a URL a person supplied. `outbound.ssrf_protection` applies, through
@@ -169,6 +171,35 @@ impl Client {
             )))),
         }
     }
+}
+
+/// The most redirects a [`fixed_origin_client`] follows, each to its own
+/// origin.
+const MAX_SAME_ORIGIN_REDIRECTS: usize = 3;
+
+/// A client for the one address `url` (the price library's, a constant of
+/// this build): the settings of [`Client::builder`], except that the whole
+/// call may take `timeout` and a redirect is followed only to `url`'s own
+/// origin (scheme, host and port), at most [`MAX_SAME_ORIGIN_REDIRECTS`]
+/// times. A redirect anywhere else is not followed, so the caller sees the
+/// `3xx` itself and refuses it.
+///
+/// No SSRF check applies, as no person supplies the address.
+pub fn fixed_origin_client(url: &Url, timeout: Duration) -> Result<reqwest::Client, String> {
+    let origin = url.origin();
+    Client::builder()
+        .redirect(reqwest::redirect::Policy::custom(move |attempt| {
+            if attempt.previous().len() > MAX_SAME_ORIGIN_REDIRECTS
+                || attempt.url().origin() != origin
+            {
+                attempt.stop()
+            } else {
+                attempt.follow()
+            }
+        }))
+        .timeout(timeout)
+        .build()
+        .map_err(|e| format!("the price library's client: {e}"))
 }
 
 /// The wire `pk` speaks, or `None` for a platform that cannot list models.

@@ -6,8 +6,10 @@
 //! - `catalogue`: the list prices built into this control plane, with the
 //!   catalogue's version, the entry's key and date, the provider's page it
 //!   was read from and the day it was read;
-//! - `third_party`: a public price dataset an operator uploaded, written only
-//!   once an operator has attested the price against the provider's page;
+//! - `third_party`: a public price dataset, written only once an operator has
+//!   attested the price against the provider's page: a confirmed proposal of
+//!   an upload ([`super::import`]), or a sync from the price library
+//!   ([`super::library`]);
 //! - `manual`: an operator's own entry, with a note saying where it comes
 //!   from.
 //!
@@ -92,17 +94,27 @@ pub enum BaselineSource {
         source_url: String,
         as_of: NaiveDate,
     },
-    /// A confirmed proposal of an uploaded dataset.
+    /// A public dataset's price, attested by an operator: a confirmed
+    /// proposal of an upload (`import_id`, `proposal_id`), or a sync from the
+    /// price library (`library_id`, `library_entry`).
     ThirdParty {
         dataset: String,
-        /// The dataset's revision, as the operator gave it.
+        /// The dataset's revision: as the operator gave it for an upload, or
+        /// the library's.
         dataset_ref: String,
         /// The provider's pricing page the dataset cites.
         pricing_url: Option<String>,
         /// When the dataset says the price was last checked.
         prices_checked: Option<NaiveDate>,
-        import_id: Uuid,
-        proposal_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        import_id: Option<Uuid>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        proposal_id: Option<Uuid>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        library_id: Option<Uuid>,
+        /// The library entry synced, as `<provider>/<model>`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        library_entry: Option<String>,
         /// The operator who attested the price against the provider's page.
         attested_by: Uuid,
         attested_at: DateTime<Utc>,

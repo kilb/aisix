@@ -501,9 +501,10 @@ mod tests {
             // still gets flagged.
             let sanctioned_rmcp_site = file.ends_with("aisix-mcp/src/bridge.rs");
             // The control plane is its own binary, with no dispatch pool
-            // and none of the gateway's startup config: its one outbound
-            // client (an upstream account's model list) is built bare, in
-            // its own `Client::builder`, and that crate's
+            // and none of the gateway's startup config: its outbound
+            // clients (an upstream account's model list, the price
+            // library's fetch) start from one bare builder, its own
+            // `Client::builder`, and that crate's
             // `the_outbound_client_takes_no_proxy_both_timeouts_no_redirect_and_the_identity`
             // pins what it sets. Only that builder line is exempt.
             let sanctioned_control_plane_site =
@@ -1095,10 +1096,11 @@ mod tests {
                 "aisix-server/src/telemetry.rs",
                 "aisix-server/src/heartbeat.rs",
                 "aisix-obs/src/otlp_http_sink.rs",
-                // The control plane is its own binary: this is its client
-                // for an upstream account's model list, built on its own
-                // pool, and no worker's dispatch pool ever stands in for
-                // it. It sends the same `aisix/<version>` identity.
+                // The control plane is its own binary: these are its
+                // clients for an upstream account's model list and the
+                // price library, built on pools of their own, and no
+                // worker's dispatch pool ever stands in for them. They send
+                // the same `aisix/<version>` identity.
                 "aisix-control-plane/src/upstream_http.rs",
             ]
             .iter()

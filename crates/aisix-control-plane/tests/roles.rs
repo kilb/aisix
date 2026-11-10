@@ -380,6 +380,26 @@ fn fixture(method: &str, path: &str, target: &SeededOperator) -> (String, Option
             ),
             Some(json!({"reason": "roles"})),
         ),
+        // The price library. Reads; a fetch from the harness's address,
+        // where nothing listens, so past the role check it answers 502 and
+        // stores nothing; and a sync of a library that does not exist,
+        // refused past the role check with 409, so nothing is written.
+        ("GET", "/admin/pricing/library")
+        | ("GET", "/admin/pricing/library/sync")
+        | ("POST", "/admin/pricing/library/fetch") => (path.to_string(), None),
+        ("POST", "/admin/pricing/library/sync") => (
+            path.to_string(),
+            Some(json!({
+                "library_id": Uuid::nil(),
+                "attested": true,
+                "items": [{
+                    "model_id": Uuid::nil(),
+                    "provider": "openai",
+                    "model": "gpt-4o",
+                    "card": {"default": {"base": {"input": "1", "output": "2"}}},
+                }],
+            })),
+        ),
         _ => panic!("no fixture for {method} {path}: add one to tests/roles.rs"),
     }
 }

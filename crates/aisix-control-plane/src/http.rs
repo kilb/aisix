@@ -633,6 +633,28 @@ pub const ROUTE_ROLES: &[(&str, &str, MinRole)] = &[
         "/admin/pricing/imports/{id}/proposals/{pid}/reject",
         MinRole::Op(OperatorRole::Operator),
     ),
+    // The price library: browsing it and previewing a sync read; fetching
+    // it and syncing write.
+    (
+        "GET",
+        "/admin/pricing/library",
+        MinRole::Op(OperatorRole::Viewer),
+    ),
+    (
+        "POST",
+        "/admin/pricing/library/fetch",
+        MinRole::Op(OperatorRole::Operator),
+    ),
+    (
+        "GET",
+        "/admin/pricing/library/sync",
+        MinRole::Op(OperatorRole::Viewer),
+    ),
+    (
+        "POST",
+        "/admin/pricing/library/sync",
+        MinRole::Op(OperatorRole::Operator),
+    ),
     // Gateways, on the gateway listener.
     ("POST", "/dp/heartbeat", MinRole::Dp),
     ("GET", "/dp/v1/keys/{key_id}/prices", MinRole::Dp),
@@ -913,6 +935,17 @@ pub fn browser_router(state: AppState) -> Router {
         .route(
             "/admin/pricing/imports/{id}/proposals/{pid}/reject",
             post(pricing::import::reject),
+        )
+        // The price library: a fetch from its fixed address writes a new
+        // copy, and a sync writes the baselines an operator attests.
+        .route("/admin/pricing/library", get(pricing::library::browse))
+        .route(
+            "/admin/pricing/library/fetch",
+            post(pricing::library::fetch),
+        )
+        .route(
+            "/admin/pricing/library/sync",
+            get(pricing::library::preview).post(pricing::library::sync),
         )
         .route_layer(axum::middleware::from_fn(json_only))
         .route_layer(axum::middleware::from_fn(only_listed_routes))

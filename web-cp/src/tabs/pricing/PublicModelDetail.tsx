@@ -7,6 +7,7 @@ import { Button } from "../../ui/Button";
 import { DataTable } from "../../ui/DataTable";
 import { GroupList } from "../../ui/GroupName";
 import { useToast } from "../../ui/Toast";
+import { LibrarySyncOne } from "./LibrarySync";
 import "./PublicModels.css";
 
 /**
@@ -161,6 +162,10 @@ export function PublicModelDetail({
             )}
           </tbody>
         </DataTable>
+      )}
+      {/* Priceable once an account has served it: its routing document is what a baseline prices. */}
+      {model.served_by.length > 0 && (
+        <LibrarySyncOne modelId={model.id} canEdit={canEdit} current={null} onSynced={onChanged} />
       )}
       {model.served_by.length > 0 && served.length === 0 && (
         <DataTable label="服务账号（全部停用）" compact>

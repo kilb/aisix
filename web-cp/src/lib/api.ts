@@ -1161,8 +1161,12 @@ export type BaselineSource =
         dataset_ref: string;
         pricing_url: string | null;
         prices_checked: string | null;
-        import_id: string;
-        proposal_id: string;
+        /** A confirmed proposal of an upload. */
+        import_id?: string;
+        proposal_id?: string;
+        /** A sync from the price library, and the entry synced (`provider/model`). */
+        library_id?: string;
+        library_entry?: string;
         attested_by: string;
         attested_at: string;
       };
@@ -1335,6 +1339,103 @@ export const imports = {
   /** Rejects one proposal, with the reason as the operator typed it. */
   async reject(id: string, pid: string, reason: string): Promise<Proposal> {
     return (await call<Proposal>("POST", `/admin/pricing/imports/${seg(id)}/proposals/${seg(pid)}/reject`, { reason })).data;
+  },
+};
+
+// ── pricing: the price library ──────────────────────────────────────────────
+
+/** The stored copy of the public price dataset a sync reads. */
+export interface LibraryMeta {
+  id: string;
+  dataset: string;
+  /** `fetch` (from the dataset's address) or `upload` (an operator's file). */
+  origin: string;
+  source_url: string | null;
+  /** The revision the payload names, or the one given with an upload. */
+  source_ref: string | null;
+  sha256: string;
+  bytes: number;
+  entries: number;
+  fetched_at: string;
+  created_by: { id: string; email: string };
+}
+
+/** One library entry, at its price in effect now. */
+export interface LibraryEntry {
+  provider: string;
+  model: string;
+  name: string | null;
+  aliases: string[];
+  /** `null` when its prices make no card. */
+  card: RateCard | null;
+  flags: ProposalFlag[];
+  pricing_url: string | null;
+  prices_checked: string | null;
+}
+
+export interface LibraryPage {
+  library: LibraryMeta | null;
+  /** How many entries match the search; `items` is the first page of them. */
+  total: number;
+  items: LibraryEntry[];
+}
+
+/** What a sync would do to one model. */
+export type SyncState = "create" | "update" | "same" | "flagged" | "unmatched" | "ambiguous";
+
+export interface SyncItem {
+  model_id: string;
+  name: string;
+  state: SyncState;
+  /** `exact`: the name is the entry's id; `alias`: by id or alias, case or a provider prefix aside. */
+  matched_by: "exact" | "alias" | null;
+  entry: LibraryEntry | null;
+  /** Every candidate of an ambiguous model, none of them picked. */
+  candidates: { provider: string; model: string; name: string | null }[];
+  current: BaselineRevision | null;
+}
+
+export interface SyncPreview {
+  library: LibraryMeta | null;
+  /** The most one sync writes. */
+  cap: number;
+  items: SyncItem[];
+}
+
+/** One model of a sync, as the preview showed it. */
+export interface SyncRequestItem {
+  model_id: string;
+  provider: string;
+  model: string;
+  card: RateCard;
+}
+
+export const library = {
+  /** The library in use and the entries matching `q` (name, id, alias or provider). */
+  async browse(q: string, limit?: number): Promise<LibraryPage> {
+    const params = new URLSearchParams();
+    if (q.trim()) params.set("q", q.trim());
+    if (limit !== undefined) params.set("limit", String(limit));
+    const query = params.toString();
+    return (await call<LibraryPage>("GET", `/admin/pricing/library${query ? `?${query}` : ""}`)).data;
+  },
+  /** Fetches the dataset from its fixed address and stores it as the library. */
+  async fetch(): Promise<LibraryMeta> {
+    return (await call<LibraryMeta>("POST", "/admin/pricing/library/fetch")).data;
+  },
+  /** What a sync would do to every priceable model, or to `modelId` alone. */
+  async preview(modelId?: string): Promise<SyncPreview> {
+    const query = modelId ? `?model_id=${seg(modelId)}` : "";
+    return (await call<SyncPreview>("GET", `/admin/pricing/library/sync${query}`)).data;
+  },
+  /** Writes the listed models' baselines from the library, under the operator's attestation. */
+  async sync(body: { library_id: string; attested: true; items: SyncRequestItem[] }): Promise<{
+    revisions: BaselineRevision[];
+    warnings: PriceWarning[];
+  }> {
+    return (
+      await call<{ revisions: BaselineRevision[]; warnings: PriceWarning[] }>("POST", "/admin/pricing/library/sync", body)
+    ).data;
   },
 };
 

@@ -33,7 +33,7 @@ import "./PricingImport.css";
  * The credit the dataset's authors ask for (its MIT licence, `LICENSE` beside
  * the committed snapshot): the one place its name appears on this page.
  */
-const CREDIT =
+export const CREDIT =
   "价格数据来自公开数据集 pydantic/genai-prices（MIT 许可），属第三方数据；确认前请对照官方价格页核对。";
 
 /** The most the upload may carry: the control plane's own limit, checked here first. */
