@@ -6,7 +6,9 @@
 //! wrote ([`keys::catch_up`]); opening the billing account of any tenant
 //! that has none ([`ledger::backfill_accounts`]); replacing any grant of
 //! a channel's generated direct model by its public model
-//! ([`tenants::replace_generated_grants`]); and flagging every balance mark
+//! ([`tenants::replace_generated_grants`]); regenerating every public
+//! model's routing document that lacks the routing settings the model
+//! stores ([`channels::repair_routing`]); and flagging every balance mark
 //! the rule in force would not write ([`marks::flag_stale_marks`]).
 //!
 //! Every instance runs the pass at boot and every 10 minutes after; the
@@ -24,7 +26,7 @@ use crate::billing::{ledger, marks};
 use crate::db::{Db, DbError};
 use crate::resources::write::{WriteCtx, RESOURCES_LOCK_KEY};
 use crate::stopped;
-use crate::{keys, tenants};
+use crate::{channels, keys, tenants};
 
 const PERIOD: Duration = Duration::from_secs(600);
 
@@ -65,9 +67,12 @@ pub async fn run_once(db: &Db) -> Result<Pruned, DbError> {
 /// older release, during a rolling upgrade, creates tenants without one),
 /// then every grant of a channel's generated direct model is replaced by its
 /// public model ([`tenants::replace_generated_grants`]: an older release
-/// could grant one), then every balance mark the rule in force would not
-/// write is flagged for the settler ([`marks::flag_stale_marks`]: an earlier
-/// rule, or an older replica, wrote it). Each part is logged on its own so
+/// could grant one), then every public model's routing document that lacks
+/// the settings the model stores is regenerated ([`channels::repair_routing`]:
+/// a control plane older than `0037` wrote it before `0039` fenced it out),
+/// then every balance mark the rule in force would not write is flagged for
+/// the settler ([`marks::flag_stale_marks`]: an earlier rule, or an older
+/// replica, wrote it). Each part is logged on its own so
 /// that one failing leaves the others to run. A tenant the gateway-version
 /// gate refuses is caught up by a later tick.
 pub async fn tick(db: &Db, ctx: &WriteCtx) {
@@ -81,6 +86,7 @@ pub async fn tick(db: &Db, ctx: &WriteCtx) {
     }
     backfill_accounts(db).await;
     replace_generated_grants(db, ctx).await;
+    repair_routing(db, ctx).await;
     match marks::flag_stale_marks(db).await {
         Ok(0) => {}
         Ok(flagged) => tracing::info!(
@@ -115,6 +121,29 @@ pub(crate) async fn replace_generated_grants(db: &Db, ctx: &WriteCtx) {
             code = e.code,
             "looking for grants of channels' generated direct models failed; the next \
              housekeeping tick tries again"
+        ),
+    }
+}
+
+/// Regenerates every public model's routing document that lacks the
+/// routing settings the model stores ([`channels::repair_routing`]), and
+/// logs what it did, in counts only, or why it failed. A model it leaves
+/// behind is tried again by a later run.
+pub(crate) async fn repair_routing(db: &Db, ctx: &WriteCtx) {
+    match channels::repair_routing(db, ctx).await {
+        Ok(done) if done == channels::RoutingRepaired::default() => {}
+        Ok(done) => tracing::warn!(
+            repaired = done.repaired,
+            deferred = done.deferred,
+            failed = done.failed,
+            "regenerated public models' routing documents that lacked the routing settings \
+             the models store; each has a public_model.routing_regenerated audit row, and a \
+             deferred or failed model is tried again at the next housekeeping tick"
+        ),
+        Err(e) => tracing::warn!(
+            code = e.code,
+            "looking for public models' routing documents without their stored settings \
+             failed; the next housekeeping tick tries again"
         ),
     }
 }

@@ -308,6 +308,80 @@ mod tests {
         assert!(!c.version().is_empty());
     }
 
+    /// `value` written with every object's keys in order, so the text follows
+    /// the content and not the file's layout or a map's iteration order.
+    fn canonical(value: &serde_json::Value, out: &mut String) {
+        match value {
+            serde_json::Value::Object(map) => {
+                let mut keys: Vec<&String> = map.keys().collect();
+                keys.sort();
+                out.push('{');
+                for (i, key) in keys.into_iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    out.push_str(&serde_json::to_string(key).unwrap());
+                    out.push(':');
+                    canonical(&map[key], out);
+                }
+                out.push('}');
+            }
+            serde_json::Value::Array(items) => {
+                out.push('[');
+                for (i, item) in items.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    canonical(item, out);
+                }
+                out.push(']');
+            }
+            scalar => out.push_str(&serde_json::to_string(scalar).unwrap()),
+        }
+    }
+
+    /// The FNV-1a 64 of `value`'s [`canonical`] text.
+    fn fingerprint(value: &serde_json::Value) -> u64 {
+        let mut text = String::new();
+        canonical(value, &mut text);
+        text.bytes().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+        })
+    }
+
+    /// Every built-in catalogue a commit shipped, by version, with the
+    /// [`fingerprint`] of its entries, oldest first. A baseline records the
+    /// version of the catalogue it was taken from and 基准价 names it beside
+    /// a catalogue update, so one version must name one content: a change to
+    /// the entries is a new, later version, appended here. A row once
+    /// shipped is never edited.
+    const SHIPPED: &[(&str, u64)] = &[
+        ("2026-11-10", 0x1475_1cdd_c88f_509d),
+        ("2026-11-11", 0xc550_ec1e_42b7_38a7),
+    ];
+
+    #[test]
+    fn the_builtin_catalogue_version_names_one_content() {
+        let file: serde_json::Value =
+            serde_json::from_str(include_str!("../catalogue/list-prices.json")).unwrap();
+        let version = file["version"].as_str().expect("a version");
+        let fingerprint = fingerprint(&file["entries"]);
+        assert_eq!(
+            SHIPPED.last().copied(),
+            Some((version, fingerprint)),
+            "catalogue/list-prices.json at version {version} has entries fingerprinted \
+             {fingerprint:#018x}: a change to the entries takes a later `version`, appended to \
+             SHIPPED with this fingerprint"
+        );
+        for pair in SHIPPED.windows(2) {
+            assert!(pair[0].0 < pair[1].0, "versions rise: {pair:?}");
+            assert_ne!(
+                pair[0].1, pair[1].1,
+                "a new version changes content: {pair:?}"
+            );
+        }
+    }
+
     #[test]
     fn an_incomplete_band_cannot_ship_in_the_catalogue() {
         let card = r#"{"default":{"base":{"input":"1","output":"2","cache_read":"0.1"},

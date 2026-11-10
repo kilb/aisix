@@ -62,6 +62,8 @@
 //! resources lock, so two applies, or an apply and a channel edit, never
 //! wait on each other out of order.
 
+use std::collections::{HashMap, HashSet};
+
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::Json;
@@ -74,9 +76,10 @@ use uuid::Uuid;
 
 use crate::audit::{self, Actor, AuditEntry};
 use crate::auth::{OperatorAuth, OperatorRole};
-use crate::db::DbError;
+use crate::db::{Db, DbError};
 use crate::error::{ApiError, Detail};
 use crate::http::ApiJson;
+use crate::keys::KeyReach;
 use crate::resources::store::{self, ResourceRow};
 use crate::resources::write::{write_resource, ResourceWrite, WriteCtx, WriteOp};
 use crate::resources::{refs, Kind};
@@ -659,6 +662,120 @@ pub async fn regenerate(
     crate::keys::reproject_tenants(&mut *conn, ctx, all_scope).await
 }
 
+/// The public models whose live routing document does not carry every
+/// routing setting the model stores, each key present with its stored value:
+/// the predicate the `public_routing_kept` trigger (migration `0039`)
+/// refuses a write of the document by. `$1` is the models' kind segment and
+/// `$2` one public model's id, or `NULL` for all.
+const DIVERGED_ROUTING: &str = "SELECT p.id FROM public_models p \
+     JOIN gw_resources r ON r.kind = $1 AND r.id = p.id \
+     WHERE ($2::uuid IS NULL OR p.id = $2) AND p.retired_at IS NULL AND NOT r.deleted \
+       AND r.managed_by = 'public:' || p.id::text \
+       AND jsonb_typeof(p.routing) = 'object' \
+       AND EXISTS (SELECT 1 FROM jsonb_each(p.routing) AS s(key, value) \
+                   WHERE (r.doc -> 'routing' -> s.key) IS DISTINCT FROM s.value) \
+     ORDER BY p.id";
+
+/// What one [`repair_routing`] pass did, in counts only.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RoutingRepaired {
+    /// Public models whose routing document was regenerated, each with its
+    /// own audit row.
+    pub repaired: u64,
+    /// Public models the gateway-version gate refused, or that stayed busy
+    /// past the lock timeout, left for the next pass.
+    pub deferred: u64,
+    /// Public models whose regeneration failed for another reason; the next
+    /// pass tries them again.
+    pub failed: u64,
+}
+
+/// Regenerates every public model whose live routing document does not
+/// carry the routing settings the model stores ([`DIVERGED_ROUTING`]). A
+/// control plane older than `0037` wrote such a document on a channel edit
+/// (the default strategy and none of the settings) until `0039` fenced it
+/// out; the fence judges only a write of the document, so one written
+/// before it stays as it was, served without the settings, until it is
+/// regenerated. Run at boot and by every housekeeping tick
+/// (`housekeeping::tick`).
+///
+/// One transaction per public model, under a channel edit's locks: the
+/// scope fence and every all-scope tenant's row
+/// ([`crate::tenants::lock_all_scope`]), the public model's row, then the
+/// resources lock in [`regenerate`], which writes the document through
+/// [`write_resource`] from the stored settings and the channel rows. The
+/// predicate is read again once the row is held, so a peer running the same
+/// pass, or an edit that committed meanwhile, leaves nothing to do. Each
+/// model regenerated gets one audit row, `public_model.routing_regenerated`.
+/// A model the gateway-version gate refuses, or that stays busy, is left for
+/// the next pass, and so is one that fails otherwise, logged with its id.
+pub async fn repair_routing(db: &Db, ctx: &WriteCtx) -> Result<RoutingRepaired, ApiError> {
+    let diverged: Vec<Uuid> = sqlx::query_scalar(DIVERGED_ROUTING)
+        .bind(Kind::Models.segment())
+        .bind(None::<Uuid>)
+        .fetch_all(db.pool())
+        .await
+        .map_err(DbError::from)?;
+    let mut outcome = RoutingRepaired::default();
+    for id in diverged {
+        let ctx = WriteCtx {
+            mk: crate::crypto::MasterKey(ctx.mk.0),
+            env: ctx.env.clone(),
+            cp_version: ctx.cp_version.clone(),
+            stale_secs: ctx.stale_secs,
+        };
+        let repaired = db
+            .tx(move |conn| {
+                async move {
+                    let all_scope = crate::tenants::lock_all_scope(&mut *conn).await?;
+                    let row = lock_public(&mut *conn, id).await?;
+                    let still: Option<Uuid> = sqlx::query_scalar(DIVERGED_ROUTING)
+                        .bind(Kind::Models.segment())
+                        .bind(Some(id))
+                        .fetch_optional(&mut *conn)
+                        .await
+                        .map_err(DbError::from)?;
+                    if still.is_none() {
+                        return Ok(false);
+                    }
+                    regenerate(&mut *conn, &ctx, id, &all_scope).await?;
+                    audit::record(
+                        &mut *conn,
+                        AuditEntry {
+                            actor: Actor::System,
+                            action: "public_model.routing_regenerated",
+                            target_kind: "public_model",
+                            target_id: Some(id.to_string()),
+                            tenant_id: None,
+                            detail: json!({"name": row.name}),
+                        },
+                    )
+                    .await?;
+                    Ok::<_, ApiError>(true)
+                }
+                .boxed()
+            })
+            .await;
+        match repaired {
+            Ok(false) => {}
+            Ok(true) => outcome.repaired += 1,
+            Err(e) if crate::compat::refused(&e) || e.status == StatusCode::SERVICE_UNAVAILABLE => {
+                outcome.deferred += 1;
+            }
+            Err(e) => {
+                outcome.failed += 1;
+                tracing::warn!(
+                    public_model_id = %id,
+                    code = e.code,
+                    "a public model's routing document could not be regenerated from its stored \
+                     settings"
+                );
+            }
+        }
+    }
+    Ok(outcome)
+}
+
 /// Rewrites the direct documents of account `provider_key_id`'s enabled
 /// channel models from its document as it now stands (`doc`), in the
 /// caller's transaction, after a replace of the account: a direct document
@@ -893,7 +1010,7 @@ pub struct PublicModelView {
     /// can call.
     pub reachable_tenants: i64,
     /// Every live key whose grant reaches the model now, read as its
-    /// document grants it ([`crate::keys::reaches`]): its selection within
+    /// document grants it ([`crate::keys::reach`]): its selection within
     /// its tenant's scope, or the platform's own name patterns.
     pub reachable_keys: i64,
     pub created_at: DateTime<Utc>,
@@ -902,24 +1019,57 @@ pub struct PublicModelView {
 
 /// Who can call public models as things stand, read once per answer so a
 /// list of every model costs one read of the tenants and keys, not one per
-/// model. Read without a lock: it is shown, never decided on.
+/// model, and counted per model as it is read, so each model's count is a
+/// lookup. Read without a lock: it is shown, never decided on.
 struct Reach {
     /// The public models with a live routing document
     /// ([`crate::tenants::public_model_ids`]): the only ones a key can call.
-    callable: Vec<Uuid>,
-    tenants: Vec<crate::tenants::TenantRow>,
-    keys: Vec<crate::keys::KeyRow>,
+    callable: HashSet<Uuid>,
+    /// How many tenants' scopes reach each model (`effective_model_ids`).
+    tenants: HashMap<Uuid, i64>,
+    /// How many live keys reach each model by id ([`KeyReach::Ids`]).
+    keys: HashMap<Uuid, i64>,
+    /// The live keys that reach models by name instead ([`KeyReach::Names`]),
+    /// which only a model's own name decides.
+    by_name: Vec<KeyReach>,
 }
 
 impl Reach {
     async fn read(conn: &mut PgConnection) -> Result<Reach, ApiError> {
-        Ok(Reach {
-            callable: crate::tenants::public_model_ids(&mut *conn)
-                .await
-                .map_err(ApiError::from)?,
-            tenants: crate::tenants::all(&mut *conn).await?,
-            keys: crate::keys::all_live(&mut *conn).await?,
-        })
+        let callable = crate::tenants::public_model_ids(&mut *conn)
+            .await
+            .map_err(ApiError::from)?;
+        let tenants = crate::tenants::all(&mut *conn).await?;
+        let keys = crate::keys::all_live(&mut *conn).await?;
+        let mut reach = Reach {
+            callable: callable.into_iter().collect(),
+            tenants: HashMap::new(),
+            keys: HashMap::new(),
+            by_name: Vec::new(),
+        };
+        for tenant in &tenants {
+            let ids: HashSet<Uuid> = tenant.effective_model_ids.iter().copied().collect();
+            for id in ids {
+                *reach.tenants.entry(id).or_default() += 1;
+            }
+        }
+        let by_id: HashMap<Uuid, &crate::tenants::TenantRow> =
+            tenants.iter().map(|t| (t.id, t)).collect();
+        for key in &keys {
+            // A key whose tenant was not read reaches nothing.
+            let Some(tenant) = by_id.get(&key.tenant_id) else {
+                continue;
+            };
+            match crate::keys::reach(tenant, key) {
+                KeyReach::Ids(ids) => {
+                    for id in ids {
+                        *reach.keys.entry(id).or_default() += 1;
+                    }
+                }
+                by_name => reach.by_name.push(by_name),
+            }
+        }
+        Ok(reach)
     }
 
     /// `(tenants, keys)` that reach `row`.
@@ -927,25 +1077,15 @@ impl Reach {
         if row.retired_at.is_some() || !self.callable.contains(&row.id) {
             return (0, 0);
         }
-        let tenants = self
-            .tenants
-            .iter()
-            .filter(|t| t.effective_model_ids.contains(&row.id))
-            .count();
+        let tenants = self.tenants.get(&row.id).copied().unwrap_or(0);
+        let by_name = self.by_name.iter().filter(|k| k.names(&row.name)).count();
         let keys = self
             .keys
-            .iter()
-            .filter(|k| {
-                self.tenants
-                    .iter()
-                    .find(|t| t.id == k.tenant_id)
-                    .is_some_and(|t| crate::keys::reaches(t, k, row.id, &row.name))
-            })
-            .count();
-        (
-            i64::try_from(tenants).unwrap_or(i64::MAX),
-            i64::try_from(keys).unwrap_or(i64::MAX),
-        )
+            .get(&row.id)
+            .copied()
+            .unwrap_or(0)
+            .saturating_add(i64::try_from(by_name).unwrap_or(i64::MAX));
+        (tenants, keys)
     }
 }
 
@@ -971,9 +1111,25 @@ async fn view(
     })
 }
 
-async fn view_json(conn: &mut PgConnection, row: &PublicModelRow) -> Result<Value, ApiError> {
-    let reach = Reach::read(&mut *conn).await?;
-    serde_json::to_value(view(conn, row, &reach).await?).map_err(ApiError::internal)
+/// Public model `id`'s view as it stands, read in a transaction of its own:
+/// what `GET` answers, and what every write answers once it has committed.
+/// Its reach counts read every tenant and every live key, and no write
+/// decides anything from them, so a write never reads them while it holds
+/// the scope fence, the all-scope tenants' rows, the public model's row and
+/// the resources lock. A model changed again in between is answered as it
+/// then stands, as a `GET` would answer it.
+async fn answer(state: &AppState, id: Uuid) -> Result<Value, ApiError> {
+    state
+        .db
+        .tx(move |conn| {
+            async move {
+                let row = read_public(&mut *conn, id).await?;
+                let reach = Reach::read(&mut *conn).await?;
+                serde_json::to_value(view(conn, &row, &reach).await?).map_err(ApiError::internal)
+            }
+            .boxed()
+        })
+        .await
 }
 
 /// The API's `ChannelModel`: one row per public model this account serves or
@@ -1037,7 +1193,7 @@ pub async fn create(
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     auth.require(OperatorRole::Operator)?;
     let name = checked_name(&body.name).map_err(|d| ApiError::validation(vec![d]))?;
-    let answer = state
+    let id = state
         .db
         .tx(move |conn| {
             async move {
@@ -1092,13 +1248,12 @@ pub async fn create(
                     },
                 )
                 .await?;
-                let row = read_public(&mut *conn, id).await?;
-                view_json(&mut *conn, &row).await
+                Ok::<_, ApiError>(id)
             }
             .boxed()
         })
         .await?;
-    Ok((StatusCode::CREATED, Json(answer)))
+    Ok((StatusCode::CREATED, Json(answer(&state, id).await?)))
 }
 
 /// `GET /admin/public-models/{id}` → `PublicModel`.
@@ -1109,17 +1264,7 @@ pub async fn get(
 ) -> Result<Json<Value>, ApiError> {
     auth.require(OperatorRole::Viewer)?;
     let id = path_id(&raw)?;
-    let answer = state
-        .db
-        .tx(move |conn| {
-            async move {
-                let row = read_public(&mut *conn, id).await?;
-                view_json(&mut *conn, &row).await
-            }
-            .boxed()
-        })
-        .await?;
-    Ok(Json(answer))
+    Ok(Json(answer(&state, id).await?))
 }
 
 /// `PATCH /admin/public-models/{id}` with `{routing: {...}}` → `200
@@ -1153,7 +1298,7 @@ pub async fn patch(
     let id = path_id(&raw)?;
     let routing = checked_routing(&body.routing).map_err(ApiError::validation)?;
     let ctx = WriteCtx::of(&state);
-    let answer = state
+    state
         .db
         .tx(move |conn| {
             async move {
@@ -1180,14 +1325,12 @@ pub async fn patch(
                     },
                 )
                 .await?;
-                regenerate(&mut *conn, &ctx, id, &all_scope).await?;
-                let row = read_public(&mut *conn, id).await?;
-                view_json(&mut *conn, &row).await
+                regenerate(&mut *conn, &ctx, id, &all_scope).await
             }
             .boxed()
         })
         .await?;
-    Ok(Json(answer))
+    Ok(Json(answer(&state, id).await?))
 }
 
 /// `PATCH /admin/public-models/{id}`: the routing settings, as a whole set.
@@ -1239,7 +1382,7 @@ async fn remove(
     all_scope: &[crate::tenants::TenantRow],
     serving: Serving,
     action: &'static str,
-) -> Result<Value, ApiError> {
+) -> Result<(), ApiError> {
     let id = row.id;
     let name = row.name.clone();
     let uses = references(&mut *conn, id).await?;
@@ -1315,8 +1458,7 @@ async fn remove(
         },
     )
     .await?;
-    let row = read_public(&mut *conn, id).await?;
-    view_json(&mut *conn, &row).await
+    Ok(())
 }
 
 /// `POST /admin/public-models/{id}/retire` → `200 PublicModel`: sets
@@ -1342,7 +1484,7 @@ pub async fn retire(
     auth.require(OperatorRole::Operator)?;
     let id = path_id(&raw)?;
     let ctx = WriteCtx::of(&state);
-    let answer = state
+    state
         .db
         .tx(move |conn| {
             async move {
@@ -1369,7 +1511,7 @@ pub async fn retire(
             .boxed()
         })
         .await?;
-    Ok(Json(answer))
+    Ok(Json(answer(&state, id).await?))
 }
 
 /// `POST /admin/public-models/{id}/delete` → `200 PublicModel`: the whole
@@ -1399,7 +1541,7 @@ pub async fn delete(
     auth.require(OperatorRole::Operator)?;
     let id = path_id(&raw)?;
     let ctx = WriteCtx::of(&state);
-    let answer = state
+    state
         .db
         .tx(move |conn| {
             async move {
@@ -1423,7 +1565,7 @@ pub async fn delete(
             .boxed()
         })
         .await?;
-    Ok(Json(answer))
+    Ok(Json(answer(&state, id).await?))
 }
 
 /// `POST /admin/public-models/{id}/restore` → `200 PublicModel`: brings a
@@ -1457,7 +1599,7 @@ pub async fn restore(
     auth.require(OperatorRole::Operator)?;
     let id = path_id(&raw)?;
     let ctx = WriteCtx::of(&state);
-    let answer = state
+    state
         .db
         .tx(move |conn| {
             async move {
@@ -1508,14 +1650,12 @@ pub async fn restore(
                     },
                 )
                 .await?;
-                regenerate(&mut *conn, &ctx, id, &all_scope).await?;
-                let row = read_public(&mut *conn, id).await?;
-                view_json(&mut *conn, &row).await
+                regenerate(&mut *conn, &ctx, id, &all_scope).await
             }
             .boxed()
         })
         .await?;
-    Ok(Json(answer))
+    Ok(Json(answer(&state, id).await?))
 }
 
 /// `GET /admin/provider-keys/{id}/channel-models` → `{items: [ChannelModel]}`,

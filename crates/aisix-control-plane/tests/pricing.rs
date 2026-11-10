@@ -2587,6 +2587,68 @@ async fn a_book_loaded_while_prices_change_never_mixes_two_versions() {
     assert_eq!(charge("e-early").await, Some(680));
 }
 
+/// R-001's fence gives a load up when `pricing_version` moved during it, and
+/// the batch's transaction fails once every one of its loads has. That is
+/// contention, like a lock timeout: the delivery is answered `503`, which
+/// the gateway sends again, never a `500` (an ERROR, and a fault on the
+/// dashboard) for a batch that can be stored a moment later.
+///
+/// Price writes that never stop are what makes every load see the version
+/// move: three connections bump it as fast as they can while batches are
+/// delivered, until one is refused for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_price_book_that_never_holds_still_is_answered_retryable() {
+    let Some(w) = world().await else { return };
+    let model = seed_model(&w.cp, &w.admin).await;
+    price(&w.cp, model).await;
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut bumpers = Vec::new();
+    for _ in 0..3 {
+        let mut conn = PgConnection::connect(w.cp.database_url())
+            .await
+            .expect("connect");
+        let stop = stop.clone();
+        bumpers.push(tokio::spawn(async move {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                sqlx::query(
+                    "UPDATE cp_settings SET value = to_jsonb((value::text)::bigint + 1) \
+                     WHERE key = 'pricing_version'",
+                )
+                .execute(&mut conn)
+                .await
+                .expect("bump");
+            }
+        }));
+    }
+    let mut statuses = Vec::new();
+    for i in 0..60 {
+        let r = deliver(
+            &w.dp,
+            Uuid::new_v4(),
+            vec![usage(&w, &format!("e-moving-{i}"), model, tokens_680())],
+        )
+        .await;
+        statuses.push(r.status);
+        if r.status == 503 {
+            break;
+        }
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    for bumper in bumpers {
+        bumper.await.expect("join");
+    }
+    assert!(!statuses.contains(&500), "{statuses:?}");
+    assert_eq!(
+        statuses.last(),
+        Some(&503),
+        "no delivery found the version moving during every load: {statuses:?}"
+    );
+    assert!(
+        statuses.iter().all(|s| [200, 503].contains(s)),
+        "{statuses:?}"
+    );
+}
+
 /// A model document's `display_name` and `version`.
 async fn model_doc(cp: &TestCp, id: Uuid) -> (String, i64) {
     sqlx::query_as(
@@ -2791,6 +2853,82 @@ async fn the_status_details_each_unpriced_kind_and_counts_corrected_rows_apart()
         (json!(name), json!(true)),
         "{n}"
     );
+}
+
+/// Stores `n` unpriced charges for `code`, one usage row each, for the
+/// models `<prefix>-1` … `<prefix>-<kinds>` in turn, so they come to `kinds`
+/// details of `code`.
+async fn unpriced_kinds(cp: &TestCp, prefix: &str, code: &str, n: i64, kinds: i64) {
+    let mut tx = cp.db().pool().begin().await.expect("begin");
+    sqlx::query(
+        "INSERT INTO usage_events (event_id, dp_id, batch_id, occurred_at, team_id, api_key_id, event) \
+         SELECT $1 || '-e' || i, $2, $2, now(), 't', 'k', \
+                jsonb_build_object('event_id', $1 || '-e' || i) \
+         FROM generate_series(1, $3::bigint) AS i",
+    )
+    .bind(prefix)
+    .bind(Uuid::new_v4())
+    .bind(n)
+    .execute(&mut *tx)
+    .await
+    .expect("insert the usage rows");
+    sqlx::query(
+        "INSERT INTO pricing_charges_cny \
+         (event_id, tenant_id, api_key_id, user_id, requested_model_id, occurred_at, status, \
+          error_code, engine_version) \
+         SELECT $1 || '-e' || i, 't', 'k', '', $1 || '-' || (1 + (i - 1) % $4::bigint), now(), \
+                'unpriced', $2, $5 \
+         FROM generate_series(1, $3::bigint) AS i",
+    )
+    .bind(prefix)
+    .bind(code)
+    .bind(n)
+    .bind(kinds)
+    .bind(i64::from(ENGINE_VERSION))
+    .execute(&mut *tx)
+    .await
+    .expect("insert their charges");
+    tx.commit().await.expect("commit");
+}
+
+/// 计价状态's details are the most frequent kinds of unpriced call, whatever
+/// their reason: a reason that sorts first and has more kinds than the list
+/// holds does not push a more frequent reason off it. Every reason's total
+/// is still answered (`unpriced_last_24h.by_code`), so what the list leaves
+/// out is countable.
+#[tokio::test]
+async fn the_status_details_list_the_most_frequent_kinds_of_every_reason() {
+    let Some(w) = world().await else { return };
+    let cp = &w.cp;
+    let max = store::MAX_UNPRICED_DETAILS;
+    // `missing_price` sorts before `unknown_api_key`; it has one more kind
+    // than the list holds, each called once, and `unknown_api_key` one kind,
+    // called three times.
+    unpriced_kinds(cp, "many", "missing_price", max + 1, max + 1).await;
+    unpriced_kinds(cp, "few", "unknown_api_key", 3, 1).await;
+
+    let r = as_op(cp, &w.admin, "GET", "/admin/pricing/status", None).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let s = &r.body;
+    assert_eq!(
+        s["unpriced_last_24h"],
+        json!({"total": max + 4, "by_code": {"missing_price": max + 1, "unknown_api_key": 3}}),
+        "{s}"
+    );
+    assert_eq!(s["unpriced_details"]["truncated"], true, "{s}");
+    let items = s["unpriced_details"]["items"]
+        .as_array()
+        .expect("the details");
+    assert_eq!(items.len() as i64, max);
+    // The most frequent kind leads, and the rest follow by count.
+    assert_eq!(
+        (items[0]["code"].clone(), items[0]["count"].clone()),
+        (json!("unknown_api_key"), json!(3)),
+        "{s}"
+    );
+    let counts: Vec<i64> = items.iter().map(|i| i["count"].as_i64().unwrap()).collect();
+    assert!(counts.windows(2).all(|c| c[0] >= c[1]), "{counts:?}");
+    assert!(items[1..].iter().all(|i| i["code"] == "missing_price"));
 }
 
 /// B4: an operator's charge listing says why a row was billed nothing and

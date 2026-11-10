@@ -316,6 +316,11 @@ fn prefix_of(plaintext: &str) -> &str {
 /// with no selection names them all, and one with a selection picks from
 /// them.
 fn granted_model_ids(t: &TenantRow, k: &KeyRow) -> Vec<String> {
+    granted_ids(t, k).iter().map(Uuid::to_string).collect()
+}
+
+/// [`granted_model_ids`], as ids.
+fn granted_ids(t: &TenantRow, k: &KeyRow) -> Vec<Uuid> {
     let mut ids: Vec<Uuid> = match &k.model_ids {
         Some(selected) => selected
             .iter()
@@ -326,20 +331,40 @@ fn granted_model_ids(t: &TenantRow, k: &KeyRow) -> Vec<String> {
     };
     ids.sort();
     ids.dedup();
-    ids.iter().map(Uuid::to_string).collect()
+    ids
 }
 
-/// Whether key `k` of tenant `t` reaches the model `model_id`, named
-/// `model_name`, read exactly as [`build_key_doc`] grants it: the platform's
-/// own key with name patterns matches them the way the gateway does
-/// (`aisix_core::wildcard`), every other key by [`granted_model_ids`]. A
-/// count for an operator's view, never a write's decision.
-pub(crate) fn reaches(t: &TenantRow, k: &KeyRow, model_id: Uuid, model_name: &str) -> bool {
+/// The models key `k` of tenant `t` reaches, read exactly as
+/// [`build_key_doc`] grants them ([`reach`]). For an operator's view, never
+/// a write's decision.
+pub(crate) enum KeyReach {
+    /// The platform's own key with name patterns: every model a pattern
+    /// matches the name of, the way the gateway matches it
+    /// (`aisix_core::wildcard`).
+    Names(Vec<String>),
+    /// Every other key: these ids ([`granted_model_ids`]), sorted, without
+    /// repeats.
+    Ids(Vec<Uuid>),
+}
+
+impl KeyReach {
+    /// Whether a model named `model_name` is one a [`KeyReach::Names`] key
+    /// reaches; never for a key that grants by id.
+    pub(crate) fn names(&self, model_name: &str) -> bool {
+        match self {
+            KeyReach::Names(patterns) => patterns
+                .iter()
+                .any(|p| aisix_core::wildcard::wildcard_matches(p, model_name)),
+            KeyReach::Ids(_) => false,
+        }
+    }
+}
+
+/// What key `k` of tenant `t` reaches ([`KeyReach`]).
+pub(crate) fn reach(t: &TenantRow, k: &KeyRow) -> KeyReach {
     match (&k.allowed_models, t.is_internal) {
-        (Some(patterns), true) => patterns
-            .iter()
-            .any(|p| aisix_core::wildcard::wildcard_matches(p, model_name)),
-        _ => granted_model_ids(t, k).contains(&model_id.to_string()),
+        (Some(patterns), true) => KeyReach::Names(patterns.clone()),
+        _ => KeyReach::Ids(granted_ids(t, k)),
     }
 }
 

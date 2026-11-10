@@ -144,13 +144,18 @@ way.
 - **A tenant's move onto `model_scope = all` is fenced against the
   catalogue writers by `tenants::SCOPE_LOCK_KEY`.** Every writer that counts
   the all-scope tenants (`tenants::lock_all_scope`: the channel edits, a
-  public model's `PATCH`, retire and delete, a bulk apply) takes it shared
-  before that count, ahead of every tenant row, and a tenant `PATCH` that
-  moves a tenant onto `all` takes it exclusive right after the tenant's row
-  (and account), before the groups and the resources lock. No wait cycle
-  follows: a writer waits only on rows of tenants already on `all`, and a
-  move waits for the fence only while its tenant is not
+  public model's `PATCH`, retire, delete and restore, a bulk apply, and the
+  housekeeping repair of a routing document, `channels::repair_routing`)
+  takes it shared before that count, ahead of every tenant row, and a
+  tenant `PATCH` that moves a tenant onto `all` takes it exclusive right
+  after the tenant's row (and account), before the groups and the resources
+  lock. A tenant's creation (`tenants::create`, operator and signup alike)
+  is a move onto `all`, since every customer starts there, and takes it
+  exclusive as its first lock. No wait cycle follows: a writer waits only
+  on rows of tenants already on `all`, a move waits for the fence only
+  while its tenant is not, and a create holds nothing while it waits
   (`a_tenant_moving_onto_all_while_a_model_becomes_callable_reaches_it`,
+  `a_tenant_created_while_a_model_becomes_callable_reaches_it`,
   `tests/tenant_model_scope.rs`). Nothing else takes it.
 - **A generated document's owner is `public:<public_model_id>`, and only
   `src/channels.rs` writes one.** The direct and routing documents a public
@@ -503,6 +508,13 @@ statement.
   A migration may also fence an old path, as `0027` does with its `BEFORE
   INSERT` triggers: that is a one-way change, and while both versions run an
   older replica's intake fails and its batch is resent (see `Db::migrate`).
+  A fence on `gw_resources` fires only on a write of the document (`INSERT`,
+  `UPDATE OF doc, deleted, managed_by`, as `0039`'s `public_routing_kept`
+  does): the projector updates every row's projection columns after its kine
+  write, and a row a fence refuses there stops every pass at its `seq`. A
+  row that broke the rule before the fence existed is repaired through
+  `write_resource` (`channels::repair_routing`, run by every housekeeping
+  tick), never by the fence.
 
 ## Defaults fail closed
 

@@ -160,7 +160,7 @@ pub async fn mark_dedup(mut response: Response) -> Response {
 /// re-send.
 pub(crate) fn transient(e: &DbError) -> bool {
     match e {
-        DbError::LockTimeout => true,
+        DbError::LockTimeout | DbError::PriceBookUnsettled { .. } => true,
         DbError::Db(
             sqlx::Error::PoolTimedOut
             | sqlx::Error::PoolClosed

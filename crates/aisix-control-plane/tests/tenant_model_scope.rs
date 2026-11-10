@@ -897,3 +897,80 @@ async fn a_tenant_moving_onto_all_while_a_model_becomes_callable_reaches_it() {
         "the key misses the model the edit made callable: {doc}"
     );
 }
+
+/// A tenant created while a channel edit that makes a model callable is
+/// between its count of the all-scope tenants and its commit still gets that
+/// model in the keys it mints: every customer starts on `all`, and the edit
+/// counted the tenants without it, so the create must not complete until
+/// the edit has. A create that completed first would mint from the catalogue
+/// without the model, and the edit would rewrite only the tenants it
+/// counted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_tenant_created_while_a_model_becomes_callable_reaches_it() {
+    let Some(cp) = TestCp::start_with(|cfg| cfg.db_lock_timeout_ms = 60_000).await else {
+        return;
+    };
+    let cp = std::sync::Arc::new(cp);
+    let admin = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let account = provider_key(&cp, &admin, "acct-create-race-3f7").await;
+    let p = public_model(&cp, &admin, "pub-create-race-3f7").await;
+
+    // The channel edit counts the all-scope tenants, then waits for the
+    // public model's row, held here.
+    let mut held = cp.db().pool().begin().await.expect("begin");
+    sqlx::query("SELECT 1 FROM public_models WHERE id = $1 FOR UPDATE")
+        .bind(p)
+        .execute(&mut *held)
+        .await
+        .expect("hold the public model");
+    let edit = tokio::spawn({
+        let (cp, admin) = (cp.clone(), admin.clone());
+        async move {
+            cp.send(
+                "PUT",
+                &format!("/admin/provider-keys/{account}/channel-models/{p}"),
+                Some(admin.cookie()),
+                Some(json!({})),
+            )
+            .await
+        }
+    });
+    until_lock_waiters(&cp, 1).await;
+    // The create: it either completes now (what the fence prevents) or
+    // waits for the edit.
+    let mut created = tokio::spawn({
+        let (cp, admin) = (cp.clone(), admin.clone());
+        async move { operator_tenant(&cp, &admin, "create-race-3f7").await }
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while !created.is_finished() && lock_waiters(&cp).await < 2 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the create neither ended nor waited"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    // A tenant that exists already mints its key now, while the edit waits.
+    let early = if created.is_finished() {
+        let t = (&mut created).await.expect("join");
+        Some((t, key(&cp, &admin, t, "create-race-early").await))
+    } else {
+        None
+    };
+    held.rollback().await.expect("release the public model");
+
+    let edit = edit.await.expect("join");
+    assert_eq!(edit.status, 200, "{edit:?}");
+    let k = match early {
+        Some((_, k)) => k,
+        None => {
+            let t = (&mut created).await.expect("join");
+            key(&cp, &admin, t, "create-race-late").await
+        }
+    };
+    let doc = key_doc(&cp, &k).await;
+    assert!(
+        ids(&doc).contains(&p.to_string()),
+        "the new tenant's key misses the model the edit made callable: {doc}"
+    );
+}

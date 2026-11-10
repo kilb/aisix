@@ -1835,7 +1835,6 @@ async fn a_mark_an_earlier_rule_wrote_is_recomputed_at_the_next_boot() {
         (stale.marked_exhausted, stale.marks_dirty),
         (Some(true), false)
     );
-    let held = live_mark(db, zero_credit).await.seq;
 
     let upgraded = w.cp.restart().await;
     until_marked(upgraded.db(), w.tenant, &open_doc(w.tenant)).await;
@@ -1846,6 +1845,21 @@ async fn a_mark_an_earlier_rule_wrote_is_recomputed_at_the_next_boot() {
         still.doc,
         exhausted_doc(zero_credit, BALANCE_MESSAGE_PREPAID)
     );
-    assert_eq!(still.seq, held, "a mark the rule agrees with was rewritten");
+
+    // That it was never flagged shows only in the flagging itself: a settle
+    // rewrites no document that does not change and clears the flag it
+    // finds, so neither the zero-credit mark's `seq` nor its flag after the
+    // boot could tell. The stale mark made again, the pass the boot ran
+    // flags exactly that tenant, and leaves the zero-credit one clean.
+    set_account(db, w.tenant, 0, Some(0)).await;
+    settle(&upgraded, w.tenant).await;
+    set_account(db, w.tenant, 0, Some(100_000_000_000)).await;
+    assert_eq!(
+        marks::flag_stale_marks(upgraded.db())
+            .await
+            .expect("flag the stale marks"),
+        1
+    );
     assert!(!account(db, zero_credit).await.marks_dirty);
+    until_marked(upgraded.db(), w.tenant, &open_doc(w.tenant)).await;
 }

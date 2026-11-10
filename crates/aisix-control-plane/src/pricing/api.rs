@@ -557,9 +557,10 @@ fn counted(by_code: Vec<(String, i64)>) -> Value {
 /// with the served tier for `missing_tier_price` and the group for
 /// `missing_rate`: `{code, count, latest_at, model: {id, name, deleted},
 /// service_tier, group: {id, name, display_name}}`, at most
-/// [`store::MAX_UNPRICED_DETAILS`] of them (`truncated` when there were
-/// more). `pricing_version` is null when the stored version is missing
-/// or malformed.
+/// [`store::MAX_UNPRICED_DETAILS`] of them, the most frequent first
+/// (`truncated` when there were more; `unpriced_last_24h.by_code` still
+/// counts every reason in full). `pricing_version` is null when the stored
+/// version is missing or malformed.
 pub async fn status(
     auth: OperatorAuth,
     State(state): State<AppState>,

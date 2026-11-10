@@ -411,17 +411,27 @@ pub(crate) async fn find(conn: &mut PgConnection, id: Uuid) -> Result<TenantRow,
 /// Every tenant as it stands, in id order, each with the scope it resolves
 /// to, taking no lock: what an operator view counts reach from
 /// (`channels::view`). Nothing written may be decided from it.
+///
+/// Two statements whatever the number of tenants: the rows, then the live
+/// public models once, which every all-scope tenant reaches. Each scope is
+/// resolved from them as [`scope_model_ids`] resolves it for one tenant.
 pub(crate) async fn all(conn: &mut PgConnection) -> Result<Vec<TenantRow>, ApiError> {
     let raws: Vec<RawTenant> =
         sqlx::query_as(&format!("SELECT {COLUMNS} FROM tenants ORDER BY id"))
             .fetch_all(&mut *conn)
             .await
             .map_err(DbError::from)?;
-    let mut rows = Vec::with_capacity(raws.len());
-    for raw in raws {
-        rows.push(load(&mut *conn, raw).await?);
-    }
-    Ok(rows)
+    let public = public_model_ids(&mut *conn).await.map_err(ApiError::from)?;
+    raws.into_iter()
+        .map(|raw| {
+            let mut tenant = TenantRow::from_raw(raw)?;
+            tenant.effective_model_ids = match tenant.model_scope {
+                ModelScope::Selected => tenant.allowed_model_ids.clone(),
+                ModelScope::All => public.clone(),
+            };
+            Ok(tenant)
+        })
+        .collect()
 }
 
 /// Fences a tenant's move onto [`ModelScope::All`] against a write that
@@ -435,10 +445,17 @@ pub(crate) async fn all(conn: &mut PgConnection) -> Result<Vec<TenantRow>, ApiEr
 /// change. Without it a tenant could join between the census and the
 /// write and be rewritten by neither.
 ///
+/// A tenant's creation is a move onto `all` too (every customer starts
+/// there): [`create`] takes it exclusive as its first lock, since there is
+/// no tenant row yet.
+///
 /// The writer takes it before any tenant row, the move after its tenant's
 /// row, and neither order can close a wait cycle: a writer waits only on
 /// rows of tenants already on `all`, and a move waits for the fence only
-/// while its tenant is not.
+/// while its tenant is not. A create holds nothing a writer waits on while
+/// it waits for the fence, and takes only the default groups' rows and the
+/// resources lock after it, which no writer holds while it waits for the
+/// fence.
 pub const SCOPE_LOCK_KEY: i64 = 0x6169_7369_7863_7034;
 
 /// Locks every tenant on [`ModelScope::All`], in ascending id order, so a
@@ -566,6 +583,16 @@ async fn insert(
 /// The default groups are taken `FOR SHARE` ([`locked_defaults`]) before the
 /// tenant row names them, so a retire of one either commits first, and is
 /// then not copied, or waits for this create and counts the new tenant.
+///
+/// A customer starts on [`ModelScope::All`], so a create is a move onto
+/// `all` and takes [`SCOPE_LOCK_KEY`] exclusive first, before any other lock
+/// (there is no tenant row yet): a catalogue write that counted the
+/// all-scope tenants without this one has committed before the tenant
+/// exists, and one that starts later waits for this commit and counts it.
+/// Without it a key minted for the new tenant while such a write is in
+/// flight would miss the model the write makes callable, and the write
+/// would rewrite only the tenants it counted. A pending tenant is fenced
+/// too: it is approved, and its keys minted, outside the writer's census.
 pub async fn create(
     conn: &mut PgConnection,
     ctx: &WriteCtx,
@@ -574,6 +601,11 @@ pub async fn create(
     billing_mode: BillingMode,
     actor: Actor<'_>,
 ) -> Result<TenantRow, ApiError> {
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(SCOPE_LOCK_KEY)
+        .execute(&mut *conn)
+        .await
+        .map_err(DbError::from)?;
     let defaults = locked_defaults(&mut *conn).await?;
     let approved_by = match (status, actor) {
         (TenantStatus::Active, Actor::Operator(op)) => Some(op.id),

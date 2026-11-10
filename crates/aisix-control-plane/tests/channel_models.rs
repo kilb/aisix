@@ -14,6 +14,7 @@ mod support;
 
 use aisix_control_plane::auth::OperatorRole;
 use aisix_control_plane::channels;
+use aisix_control_plane::housekeeping;
 use aisix_control_plane::resources::write::{WriteCtx, RESOURCES_LOCK_KEY};
 use aisix_control_plane::resources::Kind;
 use futures::FutureExt;
@@ -4227,4 +4228,207 @@ async fn an_older_writer_cannot_drop_a_public_models_stored_routing() {
     write_routing_doc(&cp, id, older)
         .await
         .expect("the settings are gone, so the older shape is today's again");
+}
+
+/// Whether the `kind`/`id` row's current version reaches kine within 20 s.
+async fn until_projected(cp: &TestCp, kind: Kind, id: Uuid) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let done: bool = sqlx::query_scalar(
+            "SELECT projected_version IS NOT DISTINCT FROM version FROM gw_resources \
+             WHERE kind = $1 AND id = $2",
+        )
+        .bind(kind.segment())
+        .bind(id)
+        .fetch_one(cp.db().pool())
+        .await
+        .expect("read the row's projection");
+        if done {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// A routing document a control plane older than `0037` wrote before
+/// `0039`'s fence existed lacks the settings its public model stores. The
+/// fence judges a write of the document, and nothing else: the projector's
+/// own bookkeeping on the row (the projection columns it updates after each
+/// kine write, which a reconcile also re-marks) must go through, or every
+/// pass would stop at that row and no later document, a revocation included,
+/// would reach the gateways. The housekeeping pass, which every boot runs
+/// too, then regenerates the document from the stored settings, once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_routing_document_that_diverged_before_the_fence_is_projected_and_then_regenerated() {
+    let Some(cp) = TestCp::start_with_kine().await else {
+        return;
+    };
+    let op = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let key = provider_key(&cp, &op, "acct-diverged-6a3").await;
+    let (id, _) = create_public(&cp, &op, "pub-diverged-6a3").await;
+    let r = put_channel(&cp, &op, key, id, json!({})).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    assert!(until_projected(&cp, Kind::Models, id).await);
+    let written = live(&cp, Kind::Models, id).await;
+
+    // What the older writer left: settings stored beside a document without
+    // them, whose projection is due again, as a reconcile that found kine
+    // drifted marks it. Marked with the triggers off, so that only the
+    // projector's own update meets the fence.
+    let settings = json!({"strategy": "failover", "retries": 2});
+    sqlx::query("UPDATE public_models SET routing = $2 WHERE id = $1")
+        .bind(id)
+        .bind(&settings)
+        .execute(cp.db().pool())
+        .await
+        .expect("store the settings");
+    let mut conn = <sqlx::PgConnection as sqlx::Connection>::connect(cp.database_url())
+        .await
+        .expect("connect");
+    sqlx::query("SET session_replication_role = replica")
+        .execute(&mut conn)
+        .await
+        .expect("triggers off");
+    sqlx::query("UPDATE gw_resources SET projected_version = NULL WHERE kind = $1 AND id = $2")
+        .bind(Kind::Models.segment())
+        .bind(id)
+        .execute(&mut conn)
+        .await
+        .expect("mark the projection due");
+    drop(conn);
+
+    // The projector writes it again, and goes on to what was written after.
+    let later = provider_key(&cp, &op, "acct-later-6a3").await;
+    assert!(
+        until_projected(&cp, Kind::ProviderKeys, later).await,
+        "a later document never reached kine: the projector stopped at the diverged row"
+    );
+    assert!(until_projected(&cp, Kind::Models, id).await);
+    assert_eq!(live(&cp, Kind::Models, id).await, written);
+
+    // The housekeeping pass regenerates it from the stored settings.
+    housekeeping::tick(cp.db(), &WriteCtx::of(cp.state())).await;
+    let doc = live(&cp, Kind::Models, id).await;
+    assert_eq!(doc["routing"]["strategy"], "failover", "{doc}");
+    assert_eq!(doc["routing"]["retries"], 2, "{doc}");
+    assert_eq!(
+        doc["routing"]["targets"], written["routing"]["targets"],
+        "{doc}"
+    );
+    assert_eq!(
+        audit_detail(&cp, "public_model.routing_regenerated", id).await,
+        json!({"name": "pub-diverged-6a3"})
+    );
+    assert!(until_projected(&cp, Kind::Models, id).await);
+    // Once: nothing is left for the next pass.
+    let again = channels::repair_routing(cp.db(), &WriteCtx::of(cp.state()))
+        .await
+        .expect("a pass");
+    assert_eq!(again, channels::RoutingRepaired::default());
+}
+
+/// Polls `sql` (one boolean, bound to `id`) for up to 10 s; whether it read
+/// true.
+async fn until_true(cp: &TestCp, sql: &str, id: Uuid) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let yes: bool = sqlx::query_scalar(sql)
+            .bind(id)
+            .fetch_one(cp.db().pool())
+            .await
+            .expect("read the state");
+        if yes {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// Every write of a public model answers the model's view with who can call
+/// it, which reads every tenant and live key. No write decides anything from
+/// those counts, so they are read once it has committed: never while it
+/// holds the scope fence, the all-scope tenants' rows, the public model's
+/// row and the resources lock. Each write below is sent while the key table
+/// is locked, and must commit before it waits for it. (A retire and a
+/// delete read the key table themselves, for the references that refuse
+/// them, so a lock on it cannot tell where their count is read; they answer
+/// through the same post-commit read as the writes below.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_public_model_write_commits_before_it_counts_who_reaches_the_model() {
+    let Some(cp) = TestCp::start_with(|cfg| cfg.db_lock_timeout_ms = 60_000).await else {
+        return;
+    };
+    let cp = std::sync::Arc::new(cp);
+    let op = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let (id, _) = create_public(&cp, &op, "pub-counted-2e5").await;
+    let (retired, _) = create_public(&cp, &op, "pub-counted-retired-2e5").await;
+    let r = cp
+        .send(
+            "POST",
+            &format!("{PUBLICS}/{retired}/retire"),
+            Some(op.cookie()),
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let cases: Vec<(&str, &str, String, Value, &str, Uuid, u16)> = vec![
+        (
+            "POST",
+            "create",
+            PUBLICS.to_string(),
+            json!({"name": "pub-counted-new-2e5"}),
+            "SELECT EXISTS (SELECT 1 FROM public_models \
+             WHERE name = 'pub-counted-new-2e5' AND $1::uuid IS NOT NULL)",
+            id,
+            201,
+        ),
+        (
+            "PATCH",
+            "routing",
+            format!("{PUBLICS}/{id}"),
+            json!({"routing": {"strategy": "failover"}}),
+            "SELECT routing = '{\"strategy\": \"failover\"}'::jsonb FROM public_models \
+             WHERE id = $1",
+            id,
+            200,
+        ),
+        (
+            "POST",
+            "restore",
+            format!("{PUBLICS}/{retired}/restore"),
+            json!({}),
+            "SELECT retired_at IS NULL FROM public_models WHERE id = $1",
+            retired,
+            200,
+        ),
+    ];
+    let mut late = Vec::new();
+    for (method, what, path, body, committed, row, status) in cases {
+        let mut holder = cp.db().pool().begin().await.expect("begin");
+        sqlx::query("LOCK TABLE tenant_keys IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *holder)
+            .await
+            .expect("lock the keys");
+        let sent = tokio::spawn({
+            let (cp, cookie) = (cp.clone(), op.cookie().to_string());
+            async move { cp.send(method, &path, Some(&cookie), Some(body)).await }
+        });
+        let done = until_true(&cp, committed, row).await;
+        holder.rollback().await.expect("release the keys");
+        let r = sent.await.expect("join");
+        if !done {
+            late.push(what);
+        }
+        assert_eq!(r.status, status, "{what}: {r:?}");
+    }
+    assert!(
+        late.is_empty(),
+        "these did not commit before they read the keys: {late:?}"
+    );
 }
