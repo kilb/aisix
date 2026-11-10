@@ -3117,6 +3117,137 @@ pub fn redact_transcription_response(
     Some((r.text.into_bytes(), r.counts))
 }
 
+/// Mask a streamed transcription (`stream: true`) held back for an output
+/// guardrail, frame by frame, on the decoded text of each event: a JSON
+/// escape (`@`) hides a match from the raw SSE bytes. The deltas of
+/// `transcript.text.delta` are one channel, rewritten as one text on its
+/// first frame (a match can span deltas); `transcript.text.done` and
+/// `transcript.text.segment` carry complete texts and are masked in place;
+/// an event of any other type has each of its string values but `type`
+/// masked, and a `data:` payload that is not JSON (but the `[DONE]`
+/// sentinel) is masked as plain text.
+/// Everything else in a frame (usage, ids, logprobs) is left as written,
+/// and a frame nothing matched in goes out byte for byte.
+///
+/// Also the scan surface: [`transcription_sse_text`] reads what this walk
+/// offers, so a slot the scan reads is a slot the mask rewrites.
+/// <https://platform.openai.com/docs/api-reference/audio/transcript-text-delta-event>
+pub fn redact_transcription_sse(
+    chain: &dyn Guardrail,
+    raw: &[u8],
+) -> Option<(Vec<u8>, RedactionCounts)> {
+    if !chain.redacts_output() {
+        return None;
+    }
+    let mut frames = split_sse_frames(raw);
+    let mut counts = RedactionCounts::new();
+    let event_type = |frame: &SseFrame| {
+        frame
+            .data
+            .as_ref()
+            .and_then(|d| d.get("type")?.as_str().map(str::to_owned))
+    };
+
+    let deltas: Vec<usize> = frames
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| event_type(f).as_deref() == Some("transcript.text.delta"))
+        .map(|(i, _)| i)
+        .collect();
+    let joined: String = deltas
+        .iter()
+        .filter_map(|&i| frames[i].data.as_ref()?.get("delta")?.as_str())
+        .collect();
+    if !joined.is_empty() {
+        if let Some(r) = redact_str(chain, Direction::Output, &joined) {
+            let mut first = true;
+            for &i in &deltas {
+                let frame = &mut frames[i];
+                if let Some(slot) = frame.data.as_mut().and_then(|d| d.get_mut("delta")) {
+                    if slot.is_string() {
+                        *slot = Value::String(if first {
+                            first = false;
+                            r.text.clone()
+                        } else {
+                            String::new()
+                        });
+                        frame.dirty = true;
+                    }
+                }
+            }
+            merge_counts(&mut counts, r.counts);
+        }
+    }
+
+    for frame in &mut frames {
+        let kind = event_type(frame);
+        match frame.data.as_mut() {
+            Some(data) => {
+                let before = masked_spans(&counts);
+                match kind.as_deref() {
+                    Some("transcript.text.delta") => {}
+                    Some("transcript.text.done" | "transcript.text.segment") => {
+                        if let Some(text) = data.get_mut("text") {
+                            apply_to_value_string(chain, Direction::Output, text, &mut counts);
+                        }
+                    }
+                    _ => {
+                        if let Some(map) = data.as_object_mut() {
+                            for (field, value) in map.iter_mut() {
+                                if field != "type" {
+                                    walk_value_strings(
+                                        chain,
+                                        Direction::Output,
+                                        value,
+                                        &mut counts,
+                                        false,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                frame.dirty |= masked_spans(&counts) != before;
+            }
+            // A payload that is not JSON has no slots to read it by, so the
+            // frame is read, and rewritten, as the text it is.
+            None if frame_payload(&frame.raw).is_some_and(|p| p.trim() != "[DONE]") => {
+                let text = String::from_utf8_lossy(&frame.raw).into_owned();
+                if let Some(r) = redact_str(chain, Direction::Output, &text) {
+                    frame.raw = r.text.into_bytes();
+                    merge_counts(&mut counts, r.counts);
+                }
+            }
+            None => {}
+        }
+    }
+
+    if counts.is_empty() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(raw.len());
+    for frame in &frames {
+        out.extend_from_slice(&frame.render());
+        out.extend_from_slice(frame.term);
+    }
+    Some((out, counts))
+}
+
+/// The text a streamed transcription's output guardrail reads: every slot
+/// [`redact_transcription_sse`] offers, decoded, once each (the done event
+/// repeats the deltas).
+pub fn transcription_sse_text(raw: &[u8]) -> String {
+    let mut texts: Vec<String> = Vec::new();
+    for segment in collect_segments(|g| {
+        let _ = redact_transcription_sse(g, raw);
+    }) {
+        if !texts.contains(&segment.text) {
+            texts.push(segment.text);
+        }
+    }
+    texts.join("\n")
+}
+
 /// Mask a legacy `/v1/completions` RESPONSE body in place: `choices[].text`.
 pub fn redact_completions_response(chain: &dyn Guardrail, body: &mut Value) -> RedactionCounts {
     let mut counts = RedactionCounts::new();
@@ -9264,6 +9395,54 @@ mod tests {
         assert_eq!(rewritten, b"speaker: [EMAIL_REDACTED]\n");
         assert_eq!(counts.get("email"), Some(&1));
         assert!(redact_transcription_response(chain.as_ref(), b"all clean\n").is_none());
+    }
+
+    /// A streamed transcription carries its text JSON-escaped, so the raw
+    /// bytes hide a match: the scan and the mask read each event decoded
+    /// (R-044). The delta channel is one text, the done event's text is
+    /// masked in place, and everything else in a frame stays as written.
+    #[test]
+    fn transcription_sse_is_read_and_masked_decoded() {
+        let chain = both();
+        let raw = concat!(
+            "data: {\"type\":\"transcript.text.delta\",\"delta\":\"mail alice\\u0040exam\"}\r\n\r\n",
+            "data: {\"type\":\"transcript.text.delta\",\"delta\":\"ple.com now\"}\r\n\r\n",
+            "data: {\"type\":\"transcript.text.done\",\"text\":\"mail alice\\u0040example.com now\",",
+            "\"usage\":{\"type\":\"tokens\",\"input_tokens\":26,\"output_tokens\":12,\"total_tokens\":38}}\r\n\r\n",
+            "data: [DONE]\r\n\r\n",
+        )
+        .as_bytes();
+        assert!(!String::from_utf8_lossy(raw).contains("alice@example.com"));
+        assert_eq!(
+            transcription_sse_text(raw),
+            "mail alice@example.com now",
+            "the deltas and the done text read once, decoded",
+        );
+
+        let (rewritten, counts) = redact_transcription_sse(chain.as_ref(), raw).expect("rewrite");
+        assert_eq!(counts.get("email"), Some(&2));
+        let out = String::from_utf8(rewritten).unwrap();
+        let events: Vec<Value> = out
+            .split("\r\n\r\n")
+            .filter_map(|f| f.strip_prefix("data: "))
+            .filter(|p| *p != "[DONE]")
+            .map(|p| serde_json::from_str(p).expect("each frame stays JSON"))
+            .collect();
+        assert_eq!(events.len(), 3);
+        let deltas: String = events[..2]
+            .iter()
+            .map(|e| e["delta"].as_str().unwrap())
+            .collect();
+        assert_eq!(deltas, "mail [EMAIL_REDACTED] now");
+        assert_eq!(events[2]["text"], "mail [EMAIL_REDACTED] now");
+        assert_eq!(
+            events[2]["usage"]["output_tokens"], 12,
+            "usage stays as written"
+        );
+        assert!(out.ends_with("data: [DONE]\r\n\r\n"), "{out}");
+
+        let clean = b"data: {\"type\":\"transcript.text.done\",\"text\":\"all clean\"}\n\n";
+        assert!(redact_transcription_sse(chain.as_ref(), clean).is_none());
     }
 
     // ── remote segment moderation (#932 bedrock follow-up) ──────────────

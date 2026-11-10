@@ -896,6 +896,62 @@ pub async fn speech(
 enum AudioUpstreamBody {
     Buffered(Bytes),
     Live(reqwest::Response),
+    /// A stream held back for an output guardrail that outgrew the chain's
+    /// hold-back cap: what was held, and the rest of the stream unread.
+    OverCap {
+        held: Bytes,
+        rest: reqwest::Response,
+    },
+}
+
+/// Read a streamed transcription held back for an output guardrail, under
+/// the hold-back cap the chain sets (`max_buffer_bytes` and the raw-byte
+/// bound derived from it, [`crate::held_content::HeldBuffer`]). The content
+/// measured is the transcript text the events carry, never their framing:
+/// the deltas and segment texts, or the done event's text where it is
+/// longer, since it repeats them. The body is whole when it fits, and
+/// otherwise stops at the frame that crossed the cap.
+async fn read_held_transcription(
+    mut resp: reqwest::Response,
+    max_buffer_bytes: usize,
+) -> Result<AudioUpstreamBody, aisix_gateway::BridgeError> {
+    let mut body: Vec<u8> = Vec::new();
+    let mut decoder = aisix_gateway::SseDecoder::with_max_frame_bytes(usize::MAX);
+    let mut held = crate::held_content::HeldBuffer::default();
+    let (mut streamed, mut done) = (0usize, 0usize);
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| aisix_gateway::upstream_body_read_error(&e))?
+    {
+        body.extend_from_slice(&chunk);
+        let before = streamed.max(done);
+        for event in decoder.feed(chunk.as_ref()).unwrap_or_default() {
+            let aisix_gateway::SseEvent::Data(payload) = event else {
+                continue;
+            };
+            let Ok(event) = serde_json::from_str::<Value>(&payload) else {
+                // A payload that is not JSON is held as the text it is.
+                streamed += payload.len();
+                continue;
+            };
+            let text_len =
+                |field: &str| event.get(field).and_then(Value::as_str).map_or(0, str::len);
+            match event.get("type").and_then(Value::as_str) {
+                Some("transcript.text.delta") => streamed += text_len("delta"),
+                Some("transcript.text.done") => done = done.max(text_len("text")),
+                _ => streamed += text_len("text"),
+            }
+        }
+        held.hold(streamed.max(done) - before, chunk.len());
+        if held.exceeds(max_buffer_bytes) {
+            return Ok(AudioUpstreamBody::OverCap {
+                held: Bytes::from(body),
+                rest: resp,
+            });
+        }
+    }
+    Ok(AudioUpstreamBody::Buffered(Bytes::from(body)))
 }
 
 /// Whether an upstream response is an SSE stream.
@@ -1356,6 +1412,12 @@ async fn multipart_dispatch(
     let live_relay = stream_requested
         && !(aisix_guardrails::Guardrail::runs_on_output(&resolved_chain)
             && aisix_guardrails::Guardrail::stream_output_policy(&resolved_chain).holds_back());
+    // A stream held back that way keeps no more than the chain's hold-back
+    // cap allows, and past it does what `on_buffer_exceeded` says, as every
+    // other held stream does.
+    let held_cap = (stream_requested && !live_relay)
+        .then(|| aisix_guardrails::Guardrail::stream_output_policy(&resolved_chain).hold_cap())
+        .flatten();
     let mut redactions = crate::redact::RedactionCounts::new();
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
     let mut input_capture_safe = true;
@@ -1655,6 +1717,14 @@ async fn multipart_dispatch(
                         if live_relay && is_event_stream(&upstream_headers) {
                             return Ok((upstream_headers, AudioUpstreamBody::Live(resp)));
                         }
+                        if let Some((cap, _)) =
+                            held_cap.filter(|_| is_event_stream(&upstream_headers))
+                        {
+                            let held = read_held_transcription(resp, cap).await.map_err(|be| {
+                                crate::cooldown::note_failure(tracker, model_id, cooldown_cfg, be)
+                            })?;
+                            return Ok((upstream_headers, held));
+                        }
                         let read = async {
                             match stream_budget.filter(|_| live_relay) {
                                 // No request-level timeout was set on the live path,
@@ -1722,8 +1792,33 @@ async fn multipart_dispatch(
         .runtime_status
         .mark_healthy(&target.id, attempt_started);
 
+    // Past the hold-back cap: under `fail_closed` what was held is refused
+    // below, billed with whatever usage it carried; under `fail_open` it is
+    // released unscanned and the rest of the stream is relayed live without
+    // an output scan, recorded as an `output_buffer_exceeded` bypass.
+    let mut over_cap_refused = false;
+    let (upstream_body, released_unscanned) = match upstream_body {
+        AudioUpstreamBody::OverCap { held, rest } => {
+            if held_cap.is_some_and(|(_, fail_open)| fail_open) {
+                crate::guardrail_stream::release_output_buffer_unscanned(&resolved_chain);
+                (AudioUpstreamBody::Live(rest), Some(held))
+            } else {
+                tracing::warn!(
+                    guardrail_name = crate::guardrail_stream::output_buffer_owner(&resolved_chain),
+                    guardrail_hook = "output",
+                    max_buffer_bytes = held_cap.map(|(cap, _)| cap),
+                    "streamed transcription exceeded max_buffer_bytes; failing closed",
+                );
+                aisix_guardrails::Guardrail::record_output_buffer_exceeded(&resolved_chain);
+                over_cap_refused = true;
+                (AudioUpstreamBody::Buffered(held), None)
+            }
+        }
+        other => (other, None),
+    };
     let body_bytes = match upstream_body {
         AudioUpstreamBody::Buffered(bytes) => bytes,
+        AudioUpstreamBody::OverCap { .. } => unreachable!("taken by the cap decision above"),
         // #998: forward the upstream's SSE frames as they arrive. The
         // caller sees the same wire bytes it would get straight from the
         // provider, at the same pace; a side-channel decoder reads the
@@ -1752,14 +1847,18 @@ async fn multipart_dispatch(
             // Monitor-only output chains still get their end-of-stream
             // observation (#1010); a block-capable chain never
             // reaches here — `live_relay` sent it down the buffered path.
-            let eos_scan =
-                aisix_guardrails::Guardrail::runs_on_output(&resolved_chain).then(|| {
-                    crate::guardrail_stream::EosOutputScan::new(
-                        std::sync::Arc::new(resolved_chain),
-                        upstream_model.clone(),
-                    )
-                });
+            // A stream released past the hold-back cap goes out without an
+            // output scan, and what it delivers was read by nothing.
+            let eos_scan = (released_unscanned.is_none()
+                && aisix_guardrails::Guardrail::runs_on_output(&resolved_chain))
+            .then(|| {
+                crate::guardrail_stream::EosOutputScan::new(
+                    std::sync::Arc::new(resolved_chain),
+                    upstream_model.clone(),
+                )
+            });
             let output_guarded_c = eos_scan.is_some();
+            let capture_unscanned = released_unscanned.is_some();
 
             let state_c = state.clone();
             let request_id_c = request_id.to_string();
@@ -1790,7 +1889,10 @@ async fn multipart_dispatch(
             let read_timeout = crate::stream_timeout::ReadTimeoutSignal::default();
             let relayed = transcription_relay(
                 crate::stream_timeout::with_read_timeout_bytes_signalled(
-                    resp.bytes_stream(),
+                    futures::StreamExt::chain(
+                        futures::stream::iter(released_unscanned.map(Ok)),
+                        resp.bytes_stream(),
+                    ),
                     stream_budget,
                     read_timeout.clone(),
                 ),
@@ -1816,6 +1918,7 @@ async fn multipart_dispatch(
                         // to the capture's own cap instead.
                         (Some(prompt), Some(cap))
                             if input_capture_safe
+                                && !capture_unscanned
                                 && !(output_guarded_c && outcome.text_truncated) =>
                         {
                             Some(CapturedContent::new(prompt, outcome.text(), cap as usize))
@@ -1981,10 +2084,15 @@ async fn multipart_dispatch(
     // usage marked `guardrail_blocked` — same as completions #911 [23].
     let mut output_capture_safe = true;
     if aisix_guardrails::Guardrail::runs_on_output(&resolved_chain) {
-        let scan = transcription_output_text(&body_bytes);
+        let scan = transcription_output_text(&body_bytes, is_event_stream(&upstream_headers));
         // `(guardrail_name, unavailable)` for the refusal to answer with,
         // set by either arm below so the two share one exit.
-        let mut refusal: Option<(Option<String>, Option<String>)> = None;
+        let mut refusal: Option<(Option<String>, Option<String>)> = over_cap_refused.then(|| {
+            (
+                None,
+                Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED.to_owned()),
+            )
+        });
         // A response the gateway cannot decode is scanned as a lossy copy,
         // so the bytes `from_utf8_lossy` replaced reach the caller having
         // been read by nothing. Refuse when a member of the chain both
@@ -1995,7 +2103,7 @@ async fn multipart_dispatch(
         // released unscreened in part, which is a bypass and is recorded
         // as one; the decodable text is still scanned below, so only the
         // undecodable bytes go unread.
-        if scan.undecodable {
+        if refusal.is_none() && scan.undecodable {
             if aisix_guardrails::Guardrail::refuses_unevaluable_output(&resolved_chain) {
                 tracing::warn!(
                     guardrail_hook = "output",
@@ -2070,14 +2178,18 @@ async fn multipart_dispatch(
 
     // #932/#696: mask-action PII rules rewrite the transcript AFTER the
     // block check passes, BEFORE it reaches the caller.
-    let body_bytes =
-        match crate::redact::redact_transcription_response(&resolved_chain, &body_bytes) {
-            Some((rewritten, counts)) => {
-                crate::redact::merge_counts(&mut redactions, counts);
-                Bytes::from(rewritten)
-            }
-            None => body_bytes,
-        };
+    let redaction = if is_event_stream(&upstream_headers) {
+        crate::redact::redact_transcription_sse(&resolved_chain, &body_bytes)
+    } else {
+        crate::redact::redact_transcription_response(&resolved_chain, &body_bytes)
+    };
+    let body_bytes = match redaction {
+        Some((rewritten, counts)) => {
+            crate::redact::merge_counts(&mut redactions, counts);
+            Bytes::from(rewritten)
+        }
+        None => body_bytes,
+    };
 
     // Content capture (#700): the transcript the caller sees — read from
     // the POST-redaction body so masked PII stays masked in the exported
@@ -2136,9 +2248,20 @@ struct TranscriptScan {
 /// only in segments can't bypass the check), or the raw body for the
 /// plain-text formats (`text` / `srt` / `vtt`).
 ///
+/// A streamed transcription (`event_stream`, the upstream answered SSE) is
+/// read event by event on the decoded text of each one
+/// ([`crate::redact::transcription_sse_text`]): the raw SSE bytes carry its
+/// text JSON-escaped, which hides a match from a scan of the bytes.
+///
 /// A JSON body is decodable by construction — `serde_json` produced the
 /// strings — so only the plain-text fallback can report otherwise.
-fn transcription_output_text(body: &[u8]) -> TranscriptScan {
+fn transcription_output_text(body: &[u8], event_stream: bool) -> TranscriptScan {
+    if event_stream && std::str::from_utf8(body).is_ok() {
+        return TranscriptScan {
+            text: crate::redact::transcription_sse_text(body),
+            undecodable: false,
+        };
+    }
     if let Ok(json) = serde_json::from_slice::<Value>(body) {
         let mut parts: Vec<&str> = Vec::new();
         if let Some(t) = json.get("text").and_then(|t| t.as_str()) {
