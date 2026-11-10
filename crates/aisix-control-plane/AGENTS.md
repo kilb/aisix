@@ -144,7 +144,7 @@ way.
 - **A tenant's move onto `model_scope = all` is fenced against the
   catalogue writers by `tenants::SCOPE_LOCK_KEY`.** Every writer that counts
   the all-scope tenants (`tenants::lock_all_scope`: the channel edits, a
-  public model's `PATCH`, retire and delete, a bulk apply) takes it shared
+  public model's `PATCH`, retire, delete and restore, a bulk apply) takes it shared
   before that count, ahead of every tenant row, and a tenant `PATCH` that
   moves a tenant onto `all` takes it exclusive right after the tenant's row
   (and account), before the groups and the resources lock. No wait cycle

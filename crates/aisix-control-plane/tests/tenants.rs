@@ -1953,6 +1953,46 @@ async fn every_tenant_write_takes_the_tenant_before_the_resources_lock() {
     )
     .await;
     assert_eq!(status, 409, "{what}");
+    // A restore makes a retired model callable again, so it rewrites every
+    // all-scope tenant's keys the way a channel edit does.
+    let r = cp
+        .send(
+            "POST",
+            "/admin/public-models",
+            Some(op.as_str()),
+            Some(json!({"name": "order-restore-7c1"})),
+        )
+        .await;
+    assert_eq!(r.status, 201, "{r:?}");
+    let retired = r.body["id"]
+        .as_str()
+        .expect("a public model id")
+        .to_string();
+    let r = cp
+        .send(
+            "POST",
+            &format!("/admin/public-models/{retired}/retire"),
+            Some(op.as_str()),
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let what = "POST /admin/public-models/{id}/restore";
+    let status = waits_for_the_tenant_first(
+        &cp,
+        all_scope,
+        what,
+        fire(
+            cp.clone(),
+            "POST",
+            format!("/admin/public-models/{retired}/restore"),
+            op.clone(),
+            None,
+            Some(json!({})),
+        ),
+    )
+    .await;
+    assert_eq!(status, 200, "{what}");
 
     // The pass that replaces a grant of a channel's generated direct model
     // with its public model (`tenants::replace_generated_grants`, run at boot
