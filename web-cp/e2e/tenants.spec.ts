@@ -773,8 +773,9 @@ test("新租户默认分组使用同一选择器：按显示名选择，路由�
 
 /**
  * Two public models served by the shared account, made once for the cases
- * below: the earlier cases rely on this stack having none, so they are made
- * only when a case that needs them runs, after those.
+ * below: an earlier case relies on this stack having none, so they are made
+ * only when a case that needs them runs, after it. Other cases add public
+ * models of their own, so these cases name every one the tenant reaches.
  */
 let servedPublics: Promise<Json[]> | undefined;
 function publicPair(): Promise<Json[]> {
@@ -798,7 +799,9 @@ async function reached(t: TenantSide): Promise<string[]> {
 test("全部公共模型改为指定模型时，去掉的公共模型要先确认：取消则不改，确认后只收回它", async ({ page }) => {
   const [a, b] = await publicPair();
   const t = await signUpActive("T5 Narrow Co 4e2", "owner@narrow-t5.test");
-  expect(await reached(t)).toEqual([a.name, b.name].sort());
+  // Every public model this stack serves, these two among them.
+  const before = await reached(t);
+  expect(before).toEqual(expect.arrayContaining([a.name, b.name]));
 
   await openTenants(page);
   await openTenant(page, t.org);
@@ -819,7 +822,7 @@ test("全部公共模型改为指定模型时，去掉的公共模型要先确�
   await grants.getByRole("button", { name: "取消" }).click();
   await expect(grants.getByRole("button", { name: "确认保存授权" })).toHaveCount(0);
   expect((await stack.admin.get(`/admin/tenants/${t.id}`)).model_scope).toBe("all");
-  expect(await reached(t)).toEqual([a.name, b.name].sort());
+  expect(await reached(t)).toEqual(before);
 
   // Confirmed: only the model named is taken away.
   await grants.getByRole("button", { name: "保存授权" }).click();
@@ -827,8 +830,10 @@ test("全部公共模型改为指定模型时，去掉的公共模型要先确�
   await expect(grants).toContainText("已保存授权");
   const after = await stack.admin.get(`/admin/tenants/${t.id}`);
   expect(after.model_scope).toBe("selected");
-  expect(after.allowed_model_ids).toEqual([a.id]);
-  expect(await reached(t)).toEqual([a.name]);
+  expect(after.allowed_model_ids).toContain(a.id);
+  expect(after.allowed_model_ids).not.toContain(b.id);
+  expect(after.allowed_model_ids).toHaveLength(before.length - 1);
+  expect(await reached(t)).toEqual(before.filter((name) => name !== b.name));
 });
 
 /**
@@ -841,7 +846,10 @@ test("全部公共模型改为指定模型时，去掉的公共模型要先确�
  */
 test("公共模型列表读取失败时：改为指定模型仍从当前可用的模型开始，不会存成空授权；改回全部要等列表读到", async ({ page }) => {
   const [a, b] = await publicPair();
-  const t = await signUpActive("T5 Unread Co 8f1", "owner@unread-t5.test");
+  const t = await signUpActive("T5 Unlisted Co 8f1", "owner@unlisted-t5.test");
+  // Every public model this stack serves, these two among them.
+  const before = await reached(t);
+  expect(before).toEqual(expect.arrayContaining([a.name, b.name]));
   const PUBLIC_LIST = "**/admin/public-models";
   await page.route(PUBLIC_LIST, (route) => route.abort());
 
@@ -859,8 +867,9 @@ test("公共模型列表读取失败时：改为指定模型仍从当前可用�
   await expect(grants).toContainText("已保存授权");
   const narrowed = await stack.admin.get(`/admin/tenants/${t.id}`);
   expect(narrowed.model_scope).toBe("selected");
-  expect([...narrowed.allowed_model_ids].sort()).toEqual([a.id, b.id].sort());
-  expect(await reached(t)).toEqual([a.name, b.name].sort());
+  expect(narrowed.allowed_model_ids).toEqual(expect.arrayContaining([a.id, b.id]));
+  expect(narrowed.allowed_model_ids).toHaveLength(before.length);
+  expect(await reached(t)).toEqual(before);
 
   // Back to all: the save waits for the list, and the retry brings it.
   await grants.getByRole("radio", { name: "全部公共模型" }).check();
