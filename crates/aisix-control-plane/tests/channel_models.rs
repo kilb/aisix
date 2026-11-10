@@ -4329,3 +4329,106 @@ async fn a_routing_document_that_diverged_before_the_fence_is_projected_and_then
         .expect("a pass");
     assert_eq!(again, channels::RoutingRepaired::default());
 }
+
+/// Polls `sql` (one boolean, bound to `id`) for up to 10 s; whether it read
+/// true.
+async fn until_true(cp: &TestCp, sql: &str, id: Uuid) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let yes: bool = sqlx::query_scalar(sql)
+            .bind(id)
+            .fetch_one(cp.db().pool())
+            .await
+            .expect("read the state");
+        if yes {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// Every write of a public model answers the model's view with who can call
+/// it, which reads every tenant and live key. No write decides anything from
+/// those counts, so they are read once it has committed: never while it
+/// holds the scope fence, the all-scope tenants' rows, the public model's
+/// row and the resources lock. Each write below is sent while the key table
+/// is locked, and must commit before it waits for it. (A retire and a
+/// delete read the key table themselves, for the references that refuse
+/// them, so a lock on it cannot tell where their count is read; they answer
+/// through the same post-commit read as the writes below.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_public_model_write_commits_before_it_counts_who_reaches_the_model() {
+    let Some(cp) = TestCp::start_with(|cfg| cfg.db_lock_timeout_ms = 60_000).await else {
+        return;
+    };
+    let cp = std::sync::Arc::new(cp);
+    let op = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let (id, _) = create_public(&cp, &op, "pub-counted-2e5").await;
+    let (retired, _) = create_public(&cp, &op, "pub-counted-retired-2e5").await;
+    let r = cp
+        .send(
+            "POST",
+            &format!("{PUBLICS}/{retired}/retire"),
+            Some(op.cookie()),
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let cases: Vec<(&str, &str, String, Value, &str, Uuid, u16)> = vec![
+        (
+            "POST",
+            "create",
+            PUBLICS.to_string(),
+            json!({"name": "pub-counted-new-2e5"}),
+            "SELECT EXISTS (SELECT 1 FROM public_models \
+             WHERE name = 'pub-counted-new-2e5' AND $1::uuid IS NOT NULL)",
+            id,
+            201,
+        ),
+        (
+            "PATCH",
+            "routing",
+            format!("{PUBLICS}/{id}"),
+            json!({"routing": {"strategy": "failover"}}),
+            "SELECT routing = '{\"strategy\": \"failover\"}'::jsonb FROM public_models \
+             WHERE id = $1",
+            id,
+            200,
+        ),
+        (
+            "POST",
+            "restore",
+            format!("{PUBLICS}/{retired}/restore"),
+            json!({}),
+            "SELECT retired_at IS NULL FROM public_models WHERE id = $1",
+            retired,
+            200,
+        ),
+    ];
+    let mut late = Vec::new();
+    for (method, what, path, body, committed, row, status) in cases {
+        let mut holder = cp.db().pool().begin().await.expect("begin");
+        sqlx::query("LOCK TABLE tenant_keys IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *holder)
+            .await
+            .expect("lock the keys");
+        let sent = tokio::spawn({
+            let (cp, cookie) = (cp.clone(), op.cookie().to_string());
+            async move { cp.send(method, &path, Some(&cookie), Some(body)).await }
+        });
+        let done = until_true(&cp, committed, row).await;
+        holder.rollback().await.expect("release the keys");
+        let r = sent.await.expect("join");
+        if !done {
+            late.push(what);
+        }
+        assert_eq!(r.status, status, "{what}: {r:?}");
+    }
+    assert!(
+        late.is_empty(),
+        "these did not commit before they read the keys: {late:?}"
+    );
+}

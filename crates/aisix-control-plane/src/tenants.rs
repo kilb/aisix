@@ -411,17 +411,27 @@ pub(crate) async fn find(conn: &mut PgConnection, id: Uuid) -> Result<TenantRow,
 /// Every tenant as it stands, in id order, each with the scope it resolves
 /// to, taking no lock: what an operator view counts reach from
 /// (`channels::view`). Nothing written may be decided from it.
+///
+/// Two statements whatever the number of tenants: the rows, then the live
+/// public models once, which every all-scope tenant reaches. Each scope is
+/// resolved from them as [`scope_model_ids`] resolves it for one tenant.
 pub(crate) async fn all(conn: &mut PgConnection) -> Result<Vec<TenantRow>, ApiError> {
     let raws: Vec<RawTenant> =
         sqlx::query_as(&format!("SELECT {COLUMNS} FROM tenants ORDER BY id"))
             .fetch_all(&mut *conn)
             .await
             .map_err(DbError::from)?;
-    let mut rows = Vec::with_capacity(raws.len());
-    for raw in raws {
-        rows.push(load(&mut *conn, raw).await?);
-    }
-    Ok(rows)
+    let public = public_model_ids(&mut *conn).await.map_err(ApiError::from)?;
+    raws.into_iter()
+        .map(|raw| {
+            let mut tenant = TenantRow::from_raw(raw)?;
+            tenant.effective_model_ids = match tenant.model_scope {
+                ModelScope::Selected => tenant.allowed_model_ids.clone(),
+                ModelScope::All => public.clone(),
+            };
+            Ok(tenant)
+        })
+        .collect()
 }
 
 /// Fences a tenant's move onto [`ModelScope::All`] against a write that
