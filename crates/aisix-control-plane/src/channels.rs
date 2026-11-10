@@ -782,14 +782,82 @@ pub struct PublicModelView {
     /// The routing settings the operator set, as stored; `{}` when none.
     /// `targets` is not part of it, and is read from `served_by`.
     pub routing: Value,
+    /// [`PublicModelUse::tenants`]: what refuses a removal, which an
+    /// all-scope tenant never does. Not who can call the model; that is
+    /// `reachable_tenants`.
     pub tenants: i64,
+    /// [`PublicModelUse::keys`], the same way; `reachable_keys` is who can
+    /// call it.
     pub keys: i64,
+    /// Every tenant whose model scope reaches the model now: an all-scope
+    /// tenant, or a selected one whose list names it. `0` for a model with
+    /// no live routing document (retired, or never served), which nothing
+    /// can call.
+    pub reachable_tenants: i64,
+    /// Every live key whose grant reaches the model now, read as its
+    /// document grants it ([`crate::keys::reaches`]): its selection within
+    /// its tenant's scope, or the platform's own name patterns.
+    pub reachable_keys: i64,
     pub created_at: DateTime<Utc>,
     pub retired_at: Option<DateTime<Utc>>,
 }
 
-async fn view(conn: &mut PgConnection, row: &PublicModelRow) -> Result<PublicModelView, ApiError> {
+/// Who can call public models as things stand, read once per answer so a
+/// list of every model costs one read of the tenants and keys, not one per
+/// model. Read without a lock: it is shown, never decided on.
+struct Reach {
+    /// The public models with a live routing document
+    /// ([`crate::tenants::public_model_ids`]): the only ones a key can call.
+    callable: Vec<Uuid>,
+    tenants: Vec<crate::tenants::TenantRow>,
+    keys: Vec<crate::keys::KeyRow>,
+}
+
+impl Reach {
+    async fn read(conn: &mut PgConnection) -> Result<Reach, ApiError> {
+        Ok(Reach {
+            callable: crate::tenants::public_model_ids(&mut *conn)
+                .await
+                .map_err(ApiError::from)?,
+            tenants: crate::tenants::all(&mut *conn).await?,
+            keys: crate::keys::all_live(&mut *conn).await?,
+        })
+    }
+
+    /// `(tenants, keys)` that reach `row`.
+    fn of(&self, row: &PublicModelRow) -> (i64, i64) {
+        if row.retired_at.is_some() || !self.callable.contains(&row.id) {
+            return (0, 0);
+        }
+        let tenants = self
+            .tenants
+            .iter()
+            .filter(|t| t.effective_model_ids.contains(&row.id))
+            .count();
+        let keys = self
+            .keys
+            .iter()
+            .filter(|k| {
+                self.tenants
+                    .iter()
+                    .find(|t| t.id == k.tenant_id)
+                    .is_some_and(|t| crate::keys::reaches(t, k, row.id, &row.name))
+            })
+            .count();
+        (
+            i64::try_from(tenants).unwrap_or(i64::MAX),
+            i64::try_from(keys).unwrap_or(i64::MAX),
+        )
+    }
+}
+
+async fn view(
+    conn: &mut PgConnection,
+    row: &PublicModelRow,
+    reach: &Reach,
+) -> Result<PublicModelView, ApiError> {
     let uses = references(conn, row.id).await?;
+    let (reachable_tenants, reachable_keys) = reach.of(row);
     Ok(PublicModelView {
         id: row.id,
         name: row.name.clone(),
@@ -798,13 +866,16 @@ async fn view(conn: &mut PgConnection, row: &PublicModelRow) -> Result<PublicMod
         routing: row.routing.clone(),
         tenants: uses.tenants,
         keys: uses.keys,
+        reachable_tenants,
+        reachable_keys,
         created_at: row.created_at,
         retired_at: row.retired_at,
     })
 }
 
 async fn view_json(conn: &mut PgConnection, row: &PublicModelRow) -> Result<Value, ApiError> {
-    serde_json::to_value(view(conn, row).await?).map_err(ApiError::internal)
+    let reach = Reach::read(&mut *conn).await?;
+    serde_json::to_value(view(conn, row, &reach).await?).map_err(ApiError::internal)
 }
 
 /// The API's `ChannelModel`: one row per public model this account serves or
@@ -837,9 +908,13 @@ pub async fn list(
                 .fetch_all(&mut *conn)
                 .await
                 .map_err(DbError::from)?;
+                let reach = Reach::read(&mut *conn).await?;
                 let mut items = Vec::with_capacity(rows.len());
                 for row in &rows {
-                    items.push(view_json(&mut *conn, row).await?);
+                    items.push(
+                        serde_json::to_value(view(&mut *conn, row, &reach).await?)
+                            .map_err(ApiError::internal)?,
+                    );
                 }
                 Ok::<_, ApiError>(Value::Array(items))
             }

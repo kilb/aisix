@@ -408,6 +408,22 @@ pub(crate) async fn find(conn: &mut PgConnection, id: Uuid) -> Result<TenantRow,
     load(conn, raw.ok_or_else(ApiError::not_found)?).await
 }
 
+/// Every tenant as it stands, in id order, each with the scope it resolves
+/// to, taking no lock: what an operator view counts reach from
+/// (`channels::view`). Nothing written may be decided from it.
+pub(crate) async fn all(conn: &mut PgConnection) -> Result<Vec<TenantRow>, ApiError> {
+    let raws: Vec<RawTenant> =
+        sqlx::query_as(&format!("SELECT {COLUMNS} FROM tenants ORDER BY id"))
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(DbError::from)?;
+    let mut rows = Vec::with_capacity(raws.len());
+    for raw in raws {
+        rows.push(load(&mut *conn, raw).await?);
+    }
+    Ok(rows)
+}
+
 /// Locks every tenant on [`ModelScope::All`], in ascending id order, so a
 /// write that changes what those tenants reach (`channels::regenerate`, a
 /// public model's retire) can reproject their key documents in the same

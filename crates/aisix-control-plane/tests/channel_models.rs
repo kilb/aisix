@@ -3422,3 +3422,160 @@ async fn a_retired_public_model_refuses_settings() {
         "{r:?}"
     );
 }
+
+/// The internal tenant's id.
+async fn internal_tenant(cp: &TestCp) -> Uuid {
+    sqlx::query_scalar("SELECT id FROM tenants WHERE is_internal")
+        .fetch_one(cp.db().pool())
+        .await
+        .expect("the internal tenant")
+}
+
+/// `POST /admin/tenants/{tenant}/keys` with `body`, which must answer 201;
+/// the key's id.
+async fn mint(cp: &TestCp, op: &OperatorSession, tenant: Uuid, body: Value) -> Uuid {
+    let r = cp
+        .send(
+            "POST",
+            &format!("/admin/tenants/{tenant}/keys"),
+            Some(op.cookie()),
+            Some(body),
+        )
+        .await;
+    assert_eq!(r.status, 201, "{r:?}");
+    Uuid::parse_str(r.body["key"]["id"].as_str().expect("a key id")).expect("a uuid")
+}
+
+/// A customer tenant as an operator creates it, which leaves it on every
+/// public model (the `all` scope); its id.
+async fn all_scope_tenant(cp: &TestCp, op: &OperatorSession) -> Uuid {
+    let created = cp
+        .send(
+            "POST",
+            "/admin/tenants",
+            Some(op.cookie()),
+            Some(json!({"name": format!("chan-all-{}", Uuid::new_v4().simple())})),
+        )
+        .await;
+    assert_eq!(created.status, 201, "{created:?}");
+    assert_eq!(created.body["model_scope"], "all", "{created:?}");
+    Uuid::parse_str(created.body["id"].as_str().expect("a tenant id")).expect("a uuid")
+}
+
+/// Who can call a public model is not what holds it from being removed: an
+/// all-scope tenant's keys reach every public model and name no reference.
+/// The view says both — `reachable_*` counts every tenant whose scope reaches
+/// the model and every live key whose grant does, the platform's own name
+/// patterns included — while `tenants`/`keys`, which the removal refusal
+/// reads, stay as they were.
+#[tokio::test]
+async fn an_all_scope_tenant_and_its_keys_reach_a_public_model_without_holding_it() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let op = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let account = provider_key(&cp, &op, "acct-reach-5d2").await;
+    let (public, _) = create_public(&cp, &op, "pub-reach-8c1").await;
+    let (other, _) = create_public(&cp, &op, "pub-elsewhere-8c1").await;
+    for id in [public, other] {
+        let r = put_channel(&cp, &op, account, id, json!({})).await;
+        assert_eq!(r.status, 200, "{r:?}");
+    }
+    let shared = support::world::group_id(&cp, support::world::SHARED_GROUP).await;
+
+    // An all-scope customer: one key with no selection (every public model),
+    // one selecting the model, one selecting only the other model.
+    let customer = all_scope_tenant(&cp, &op).await;
+    mint(
+        &cp,
+        &op,
+        customer,
+        json!({"label": "reach-all-8c1", "group_id": shared}),
+    )
+    .await;
+    mint(
+        &cp,
+        &op,
+        customer,
+        json!({"label": "reach-one-8c1", "group_id": shared, "model_ids": [public]}),
+    )
+    .await;
+    mint(
+        &cp,
+        &op,
+        customer,
+        json!({"label": "reach-other-8c1", "group_id": shared, "model_ids": [other]}),
+    )
+    .await;
+    // The platform's own keys, by name pattern: one that matches the model,
+    // one that does not.
+    let internal = internal_tenant(&cp).await;
+    mint(
+        &cp,
+        &op,
+        internal,
+        json!({"label": "ops-reach-8c1", "allowed_models": ["pub-reach-*"], "group_id": shared}),
+    )
+    .await;
+    mint(
+        &cp,
+        &op,
+        internal,
+        json!({"label": "ops-miss-8c1", "allowed_models": ["claude-*"], "group_id": shared}),
+    )
+    .await;
+
+    let view = public_model(&cp, &op, public).await;
+    assert_eq!(
+        (
+            view["reachable_tenants"].clone(),
+            view["reachable_keys"].clone()
+        ),
+        (json!(1), json!(3)),
+        "the customer, and its two keys that reach the model plus the matching pattern: {view}"
+    );
+    // The references a removal is refused on are unchanged: none of these
+    // names the model in a selected scope.
+    assert_eq!(
+        (view["tenants"].clone(), view["keys"].clone()),
+        (json!(0), json!(0)),
+        "{view}"
+    );
+    // The list answers the same counts.
+    let r = cp.send("GET", PUBLICS, Some(op.cookie()), None).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let listed = r.body["items"]
+        .as_array()
+        .and_then(|items| items.iter().find(|m| m["id"] == public.to_string()))
+        .cloned()
+        .expect("the model is listed");
+    assert_eq!(
+        (
+            listed["reachable_tenants"].clone(),
+            listed["reachable_keys"].clone()
+        ),
+        (json!(1), json!(3)),
+        "{listed}"
+    );
+    let other_view = public_model(&cp, &op, other).await;
+    assert_eq!(
+        (
+            other_view["reachable_tenants"].clone(),
+            other_view["reachable_keys"].clone()
+        ),
+        (json!(1), json!(2)),
+        "the key with no selection and the one selecting it: {other_view}"
+    );
+
+    // Nothing refuses the delete, and once retired nothing reaches it.
+    let r = delete_public(&cp, &op, public).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    assert_eq!(
+        (
+            r.body["reachable_tenants"].clone(),
+            r.body["reachable_keys"].clone()
+        ),
+        (json!(0), json!(0)),
+        "{r:?}"
+    );
+}

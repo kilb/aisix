@@ -329,6 +329,25 @@ fn granted_model_ids(t: &TenantRow, k: &KeyRow) -> Vec<String> {
     ids.iter().map(Uuid::to_string).collect()
 }
 
+/// Whether key `k` of tenant `t` reaches the model `model_id`, named
+/// `model_name`, read exactly as [`build_key_doc`] grants it: the platform's
+/// own key with name patterns matches them the way the gateway does
+/// (`aisix_core::wildcard`), every other key by [`granted_model_ids`]. A
+/// count for an operator's view, never a write's decision.
+pub(crate) fn reaches(t: &TenantRow, k: &KeyRow, model_id: Uuid, model_name: &str) -> bool {
+    match (&k.allowed_models, t.is_internal) {
+        (Some(patterns), true) => patterns
+            .iter()
+            .any(|p| aisix_core::wildcard::wildcard_matches(p, model_name)),
+        _ => granted_model_ids(t, k).contains(&model_id.to_string()),
+    }
+}
+
+/// Every live key of every tenant, taking no lock, for an operator's view.
+pub(crate) async fn all_live(conn: &mut PgConnection) -> Result<Vec<KeyRow>, ApiError> {
+    select(conn, None, None, None).await
+}
+
 /// The provider groups a key of `t` may route to. A key that names a group
 /// routes to that group alone, and nothing else: `[<its name>]`. Without one
 /// it keeps the old rule — its own override when it sets some, the tenant's
