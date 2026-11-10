@@ -117,6 +117,8 @@ test("每种未计价写明模型和处理办法，可直接打开对应的计�
   await row.getByRole("button", { name: "查看调用" }).click();
   await expect(page.getByRole("heading", { name: "计费明细" })).toBeVisible();
   await expect(page.getByRole("status").filter({ hasText: "只看" })).toContainText(`原因：未定价，模型：${model.name}`);
+  // The list cannot narrow to the row's window or leave corrected calls out, and says so.
+  await expect(page.getByRole("status").filter({ hasText: "只看" })).toContainText("不限分组/档位与时间");
   const charges = page.getByRole("table", { name: "计费明细" });
   await expect(charges.getByRole("row")).toHaveCount(3);
   for (const r of await charges.getByRole("row").all()) {

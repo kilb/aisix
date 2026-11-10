@@ -21,6 +21,9 @@ const statusLabel = (s: string) => STATUSES.find(([v]) => v === s)?.[1] ?? s;
 /**
  * 计费明细: every charge with its pricing reason, filterable and paged. A link
  * from 计价状态 opens it on that kind's calls (its status, reason and model).
+ * The charges list filters by none of the rest of a 计价状态 row's scope (its
+ * group or tier, the last 24 hours, corrected calls left out), so the filter
+ * says it is wider and its rows need not add up to that row's count.
  */
 export function Charges(_props: TabProps) {
   const [filter, setFilter] = useState<ChargeFilter>(() => takeChargesFilter() ?? {});
@@ -96,7 +99,7 @@ export function Charges(_props: TabProps) {
       <h2>计费明细</h2>
       <p className="hint">
         每一次调用的计价结果，最新的在前。售价和成本都以人民币计：成本是这次调用按上游账号的成本换算率算出的平台成本，未知时显示 —。
-        未计价的行写明原因；无需计费的行写明调用怎样结束（上游失败、请求被拒绝或没有用量），这些行不收费。
+        未计价的行写明原因；无需计费的行写明调用怎样结束（上游失败、没有可用的上游、调用方中断、网关出错、请求被拒绝或没有用量），这些行不收费。
       </p>
       <form
         className="r"
@@ -166,7 +169,7 @@ export function Charges(_props: TabProps) {
       </form>
       {linked.length > 0 && (
         <div className="r" role="status">
-          <span className="hint">只看 {linked.join("，")}</span>
+          <span className="hint">只看 {linked.join("，")}（不限分组/档位与时间，也含已通过重计价更正的调用，条数可能与计价状态的次数不同）</span>
           <Button type="button" size="sm" onClick={() => set({ error_code: undefined, model_id: undefined })}>
             清除
           </Button>

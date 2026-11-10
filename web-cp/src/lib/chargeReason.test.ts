@@ -51,6 +51,32 @@ test("a request the gateway refused says so, with its status", () => {
   assert.equal(nothingToBillReason({ status_code: 403, error_class: null, attempt_kind: "initial", attempt_index: 0 }), "请求被拒绝 · 403");
 });
 
+test("a caller that hung up is not a request the gateway refused", () => {
+  assert.equal(nothingToBillReason({ status_code: 499, error_class: "client_disconnected", attempt_kind: "initial", attempt_index: 0 }), "调用方中断");
+  assert.equal(
+    nothingToBillReason({ status_code: 499, error_class: "client_disconnected", attempt_kind: "retry", attempt_index: 1 }),
+    "调用方中断 · 第 1 次重试",
+  );
+});
+
+test("no upstream to take the call is said so, not as an upstream's 503", () => {
+  for (const cls of ["all_candidates_unavailable", "provider_unavailable"]) {
+    assert.equal(nothingToBillReason({ status_code: 503, error_class: cls, attempt_kind: "initial", attempt_index: 0 }), "调用失败 · 没有可用的上游", cls);
+    assert.equal(nothingToBillReason({ status_code: null, error_class: cls, attempt_kind: "initial", attempt_index: 0 }), "调用失败 · 没有可用的上游", cls);
+  }
+  // An upstream's own 503 still reads as the upstream's.
+  assert.equal(nothingToBillReason({ status_code: 503, error_class: "upstream_status", attempt_kind: "initial", attempt_index: 0 }), "调用失败 · 上游 503");
+});
+
+test("a fault of the gateway's own is not a request it refused", () => {
+  assert.equal(nothingToBillReason({ status_code: 500, error_class: "api_error", attempt_kind: "initial", attempt_index: 0 }), "网关出错 · 500");
+  assert.equal(nothingToBillReason({ status_code: 500, error_class: null, attempt_kind: "initial", attempt_index: 0 }), "网关出错 · 500");
+  assert.equal(nothingToBillReason({ status_code: 503, error_class: "api_error", attempt_kind: "initial", attempt_index: 0 }), "网关出错 · 503");
+  assert.equal(nothingToBillReason({ status_code: null, error_class: "semantic_decision_failed", attempt_kind: "initial", attempt_index: 0 }), "网关出错");
+  // A refusal stays a refusal.
+  assert.equal(nothingToBillReason({ status_code: 429, error_class: "rate_limit_exceeded", attempt_kind: "initial", attempt_index: 0 }), "请求被拒绝 · 429");
+});
+
 test("a call that ended well and reported nothing has no usage", () => {
   assert.equal(nothingToBillReason({ status_code: 200, error_class: null, attempt_kind: "initial", attempt_index: 0 }), "无用量");
 });
