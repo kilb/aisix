@@ -12,7 +12,7 @@ import {
   type UsageSummaryRow,
 } from "./lib/api";
 import { formMessageFor, messageFor } from "./lib/errors";
-import { fmtCnyPerMillion, fmtMicroCny, fmtUtc, periodLabel, todayUtc, utcRange } from "./lib/money";
+import { fmtCnyPerMillion, fmtMicroCny, fmtUtc, perThousandOfPerMillion, periodLabel, todayUtc, utcRange } from "./lib/money";
 import { Button } from "./ui/Button";
 import { DataTable, Loading } from "./ui/DataTable";
 import { EmptyState } from "./ui/EmptyState";
@@ -41,6 +41,18 @@ const DIMENSION_LABEL: Record<string, string> = {
 const DIMENSION_ORDER = Object.keys(DIMENSION_LABEL);
 
 const dimensionLabel = (d: string) => DIMENSION_LABEL[d] ?? d;
+
+/** The quantities billed per call rather than per token: their price reads per thousand calls. */
+const PER_CALL: ReadonlySet<string> = new Set(["web_search"]);
+
+/**
+ * A line's unit price, `perMillion` as the API sends it (¥ per million
+ * units): a token's as it is, under the column's 元/百万, and a call's, such
+ * as a web search, per thousand with its own unit, `¥72.00 / 千次`, exact.
+ */
+function unitPrice(dimension: string, perMillion: string): string {
+  return PER_CALL.has(dimension) ? `${fmtCnyPerMillion(perThousandOfPerMillion(perMillion))} / 千次` : fmtCnyPerMillion(perMillion);
+}
 
 /** What a failed call's reason is called; one not listed shows raw. */
 const ERROR_LABEL: Record<string, string> = {
@@ -494,7 +506,7 @@ function CallLog({ keys, showKeys, models }: { keys: TenantKey[]; showKeys: bool
                                 <tr key={l.dimension}>
                                   <td>{dimensionLabel(l.dimension)}</td>
                                   <td className="num">{l.quantity}</td>
-                                  <td className="num">{l.rate_cny === null ? "—" : fmtCnyPerMillion(l.rate_cny)}</td>
+                                  <td className="num">{l.rate_cny === null ? "—" : unitPrice(l.dimension, l.rate_cny)}</td>
                                 </tr>
                               ))}
                             </tbody>

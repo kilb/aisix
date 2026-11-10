@@ -21,6 +21,7 @@ import {
   syncRequest,
   syncStateText,
 } from "../../lib/library";
+import { TIER_HINT } from "../../lib/rateUnits";
 import { safeHttpUrl } from "../../lib/safeUrl";
 import { Button } from "../../ui/Button";
 import { DataTable, Loading } from "../../ui/DataTable";
@@ -44,7 +45,7 @@ function failureText(e: unknown): string {
 }
 
 /** The lines of a card, one per tier and band, or a dash. */
-function CardLines({ card }: { card: unknown }) {
+export function CardLines({ card }: { card: unknown }) {
   const lines = cardLines((card ?? null) as Parameters<typeof cardLines>[0]);
   if (lines.length === 0) return <>—</>;
   return (
@@ -260,6 +261,7 @@ export function LibrarySync({ canEdit, generation }: { canEdit: boolean; generat
       <p className="hint">
         按模型名称在价格库中查找对应条目：先找名称完全一致的，找不到再按数据集的 ID 与别名查找（不区分大小写，可带或不带「供应商/」前缀）。有多个候选时，先取模型自己的上游供应商的那一条，再取与上游账号协议相同的那一条；仍有多个时由你选择价格来源。同步按价格库的标价写入基准价，立即生效。
       </p>
+      <p className="hint">{TIER_HINT}</p>
       {error && (
         <div className="note crit" role="alert">
           {error}
@@ -312,7 +314,7 @@ export function LibrarySync({ canEdit, generation }: { canEdit: boolean; generat
                 <th>状态</th>
                 <th>价格库条目</th>
                 <th>现行基准价</th>
-                <th>价格库价格（美元/百万）</th>
+                <th>价格库价格（美元/百万 tokens）</th>
               </tr>
             </thead>
             <tbody>
@@ -475,10 +477,11 @@ export function LibrarySyncOne({
           )}
           {entry && item.state !== "flagged" && (
             <p className="library-card-block">
-              价格库价格（美元/百万）：
+              价格库价格（美元/百万 tokens）：
               <CardLines card={entry.card} />
             </p>
           )}
+          {entry && Object.keys(entry.card ?? {}).some((t) => t !== "default") && <p className="hint">{TIER_HINT}</p>}
           {warning && <p className="hint">{warning}</p>}
           {canEdit && writeable && (
             <div className="library-confirm" role="group" aria-label="确认从价格库同步">

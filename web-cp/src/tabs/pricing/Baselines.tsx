@@ -29,7 +29,7 @@ import { EmptyState } from "../../ui/EmptyState";
 import { Field, useRefusalFocus } from "../../ui/Field";
 import { SidePanel } from "../../ui/SidePanel";
 import { useToast } from "../../ui/Toast";
-import { LibrarySyncOne } from "./LibrarySync";
+import { CardLines, LibrarySyncOne } from "./LibrarySync";
 import "./PriceForms.css";
 import "./Baselines.css";
 
@@ -519,6 +519,7 @@ function BaselinePanel({
               )}
             </div>
             <p className="hint tabular">生效于 {fmtUtc(row.current.effective_from)}</p>
+            <CardLines card={row.current.card} />
             <BaselineSourceBadge revision={row.current} />
           </div>
         ) : (

@@ -3,9 +3,11 @@ import type { TabProps } from "../../App";
 import { JsonEditor } from "../../components/JsonEditor";
 import { pricing, type CatalogueEntry } from "../../lib/api";
 import { errorText } from "../../lib/fmt";
+import { TIER_HINT } from "../../lib/rateUnits";
 import { Button } from "../../ui/Button";
 import { DataTable, Loading } from "../../ui/DataTable";
 import { EmptyState } from "../../ui/EmptyState";
+import { CardLines } from "./LibrarySync";
 
 /** A row's identity: a key can appear again with a later `effective_from`. */
 const rowId = (e: CatalogueEntry) => `${e.key}@${e.effective_from ?? ""}`;
@@ -90,6 +92,11 @@ export function Catalogue(_props: TabProps) {
                   {expanded && (
                     <tr>
                       <td colSpan={6}>
+                        <p className="library-card-block">
+                          价格（美元/百万 tokens）：
+                          <CardLines card={e.card} />
+                        </p>
+                        <p className="hint">卡上的价格以每百万单位存储：联网搜索的 10000 即每千次 10 美元。{TIER_HINT}</p>
                         <JsonEditor value={JSON.stringify(e, null, 2)} details={[]} />
                       </td>
                     </tr>

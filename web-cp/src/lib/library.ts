@@ -1,5 +1,6 @@
 import type { RateCard, SyncCandidate, SyncItem, SyncRequestItem, SyncState } from "./api.ts";
 import { dimensionText, tierText } from "./importReview.ts";
+import { compactRateText } from "./rateUnits.ts";
 
 /**
  * The price library's words for a sync's preview. Kept beside their own test
@@ -40,18 +41,23 @@ export function byState(items: SyncItem[]): SyncItem[] {
   return [...items].sort((a, b) => rank(a.state) - rank(b.state));
 }
 
-/** One map of rates as `输入 $2.5 · 输出 $10`, each rate as the card wrote it. */
+/**
+ * One map of rates as `输入 $2.5 · 输出 $10 · 联网搜索 $10 / 千次`: a token rate
+ * as the card wrote it, per million tokens, and a rate per call per thousand
+ * calls (`compactRateText`).
+ */
 function rates(map: Record<string, unknown>): string {
   return Object.entries(map)
-    .map(([dimension, rate]) => `${dimensionText(dimension)} $${String(rate)}`)
+    .map(([dimension, rate]) => `${dimensionText(dimension)} ${compactRateText(dimension, String(rate))}`)
     .join(" · ");
 }
 
 /**
  * Every rate a card carries, one line per tier and per long-context band, in
- * USD per million units: the whole bill a sync would write, so nothing an
- * operator attests is off screen. The `default` tier comes first, the others
- * by name; a part this build does not know is shown by its own key.
+ * USD per million tokens, and a rate per call (web search) per thousand
+ * calls: the whole bill a sync would write, so nothing an operator attests
+ * is off screen. The `default` tier comes first, the others by name; a part
+ * this build does not know is shown by its own key.
  */
 export function cardLines(card: RateCard | null): string[] {
   if (!card) return [];

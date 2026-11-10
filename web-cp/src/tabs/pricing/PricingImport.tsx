@@ -26,6 +26,7 @@ import {
   unshownParts,
 } from "../../lib/importReview";
 import { fmtUtc } from "../../lib/money";
+import { usdRateText } from "../../lib/rateUnits";
 import { safeHttpUrl } from "../../lib/safeUrl";
 import { Button } from "../../ui/Button";
 import { DataTable, Loading } from "../../ui/DataTable";
@@ -717,10 +718,10 @@ function ProposalPanel({
   );
 }
 
-/** One comparison cell: the card's own rate text, in the page's one money format. */
+/** One comparison cell: the card's own rate text, per million tokens or, for a rate per call, per thousand calls. */
 function shownRate(card: RateCard | null, dimension: string): string {
   const r = rate(card, dimension);
-  return r === null ? "—" : usdPerMillion(r);
+  return r === null ? "—" : usdRateText(dimension, r);
 }
 
 /** The dataset's card against the model's baseline in force and the catalogue's entry. */
@@ -734,7 +735,7 @@ function PriceComparison({ proposal }: { proposal: Proposal }) {
   if (rows.length === 0) return null;
   return (
     <section className="import-compare" aria-label="价格对照">
-      <h3>价格对照（每百万 tokens）</h3>
+      <h3>价格对照（token 按每百万 tokens，联网搜索按每千次）</h3>
       <DataTable label="价格对照" compact>
         <thead>
           <tr>
