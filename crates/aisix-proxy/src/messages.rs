@@ -3670,7 +3670,16 @@ fn build_anthropic_sse_stream(
                                 crate::guardrail_stream::release_output_buffer_unscanned(chain.as_ref());
                             }
                             for held in held_chunks.drain(..) {
-                                for ev in encoder.next_events(&held) {
+                                if encoder.finishes_on(&held) {
+                                    guard.adopt_usage_estimate(&mut encoder);
+                                }
+                                let events = encoder.next_events(&held);
+                                if encoder.is_finished() {
+                                    // The closing pair is in `events`: see the
+                                    // live path below.
+                                    guard.comp().reached_end = true;
+                                }
+                                for ev in events {
                                     yield Ok::<_, std::io::Error>(downstream_bytes!(guard, ev));
                                 }
                                 if encoder.is_finished() {
@@ -3777,7 +3786,21 @@ fn build_anthropic_sse_stream(
                         held_chunks.push(chunk);
                         continue;
                     }
-                    for ev in encoder.next_events(&chunk) {
+                    // This chunk ends the response: the usage its closing pair
+                    // reports is final now, so the estimate for what the
+                    // upstream left unreported goes in before it is built.
+                    if encoder.finishes_on(&chunk) {
+                        guard.adopt_usage_estimate(&mut encoder);
+                    }
+                    let events = encoder.next_events(&chunk);
+                    if encoder.is_finished() {
+                        // The closing pair is in `events`: the response was
+                        // received in full. Recorded before it is yielded, so a
+                        // caller that closes on `message_stop` has not walked
+                        // away from it.
+                        guard.comp().reached_end = true;
+                    }
+                    for ev in events {
                         yield Ok::<_, std::io::Error>(downstream_bytes!(guard, ev));
                     }
                     if encoder.is_finished() {
@@ -3990,6 +4013,9 @@ fn build_anthropic_sse_stream(
                 }
             }
             for chunk in held_chunks.drain(..) {
+                if encoder.finishes_on(&chunk) {
+                    guard.adopt_usage_estimate(&mut encoder);
+                }
                 for ev in encoder.next_events(&chunk) {
                     yield Ok::<_, std::io::Error>(downstream_bytes!(guard, ev));
                 }
@@ -4004,28 +4030,9 @@ fn build_anthropic_sse_stream(
         // relay is about to force out carries the client-visible usage, and
         // it must be the same number the usage record gets. The guard keeps
         // its own copy of this fill for the stream a consumer abandoned
-        // before EOF, where no closing pair is emitted at all.
-        if let Some(est) = guard.estimator.take() {
-            let filled = {
-                let comp = guard.comp();
-                crate::token_estimate::fill_missing(
-                    &est,
-                    comp.prompt_tokens,
-                    comp
-                        .cache_read_tokens
-                        .saturating_add(comp.cache_creation_tokens),
-                    comp.completion_tokens,
-                    Some(comp.est_output_text.as_str()),
-                )
-            };
-            if filled.estimated {
-                let comp = guard.comp();
-                comp.prompt_tokens = filled.prompt_tokens;
-                comp.completion_tokens = filled.completion_tokens;
-                comp.usage_estimated = true;
-                encoder.set_estimated_usage(filled.prompt_tokens, filled.completion_tokens);
-            }
-        }
+        // before EOF, where no closing pair is emitted at all. A chunk that
+        // ended the response above already did this.
+        guard.adopt_usage_estimate(&mut encoder);
         if !encoder.is_finished() {
             for ev in encoder.force_finish() {
                 yield Ok(downstream_bytes!(guard, ev));
@@ -4234,6 +4241,35 @@ impl<F: FnOnce(AnthropicStreamCompletion)> CompleteAnthropicStreamOnDrop<F> {
             .as_mut()
             .expect("stream completion guard accessed after drop")
             .1
+    }
+
+    /// Token-estimation fallback (AISIX-Cloud#1074) for the closing pair:
+    /// fill the counters the upstream never reported, on the record and on
+    /// the client-visible usage the encoder is about to build, so the two
+    /// agree. Once per stream — the estimator is taken — and only once
+    /// nothing further can arrive to report them.
+    fn adopt_usage_estimate(
+        &mut self,
+        encoder: &mut aisix_provider_anthropic::AnthropicSseEncoder,
+    ) {
+        let Some(est) = self.estimator.take() else {
+            return;
+        };
+        let comp = self.comp();
+        let filled = crate::token_estimate::fill_missing(
+            &est,
+            comp.prompt_tokens,
+            comp.cache_read_tokens
+                .saturating_add(comp.cache_creation_tokens),
+            comp.completion_tokens,
+            Some(comp.est_output_text.as_str()),
+        );
+        if filled.estimated {
+            comp.prompt_tokens = filled.prompt_tokens;
+            comp.completion_tokens = filled.completion_tokens;
+            comp.usage_estimated = true;
+            encoder.set_estimated_usage(filled.prompt_tokens, filled.completion_tokens);
+        }
     }
 }
 
@@ -9141,6 +9177,139 @@ event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_toke
                 );
             }
         }
+    }
+
+    fn bridged_chunk(
+        content: Option<&str>,
+        finish: bool,
+        usage: Option<aisix_gateway::UsageStats>,
+    ) -> aisix_gateway::ChatChunk {
+        aisix_gateway::ChatChunk {
+            id: "chunk".into(),
+            model: "upstream-model".into(),
+            delta: aisix_gateway::ChatDelta {
+                content: content.map(str::to_string),
+                ..aisix_gateway::ChatDelta::default()
+            },
+            finish_reason: finish.then_some(aisix_gateway::FinishReason::Stop),
+            choice_index: 0,
+            logprobs: None,
+            usage,
+            service_tier: None,
+            accounting_usage: None,
+        }
+    }
+
+    /// The bridged sibling of the Responses relay's partial-usage case: a
+    /// finish chunk that reports the prompt but not the completion closes the
+    /// stream, so the estimate for the missing counter has to be in the
+    /// closing `message_delta` it builds — the number the usage record gets.
+    #[tokio::test]
+    async fn a_bridged_finish_with_partial_usage_reports_the_estimate_the_record_gets() {
+        use std::sync::{Arc, Mutex};
+        let upstream: aisix_gateway::ChatChunkStream = Box::pin(futures::stream::iter(vec![
+            Ok(bridged_chunk(
+                Some("a long enough answer to count more than zero tokens"),
+                false,
+                None,
+            )),
+            Ok(bridged_chunk(
+                None,
+                true,
+                Some(aisix_gateway::UsageStats::new(3, 0)),
+            )),
+        ]));
+        let captured = Arc::new(Mutex::new(None));
+        let captured_out = Arc::clone(&captured);
+        let now = std::time::Instant::now();
+        let body = super::build_anthropic_sse_stream(
+            upstream,
+            aisix_provider_anthropic::AnthropicSseEncoder::new("msg_est", "relay-openai", 0),
+            now,
+            now,
+            None,
+            "relay-openai".into(),
+            None,
+            Some(crate::token_estimate::Estimator::new(
+                "gpt-4o-mini",
+                crate::token_estimate::PromptInput::Anthropic(serde_json::json!({
+                    "model": "relay-openai",
+                    "max_tokens": 64,
+                    "messages": [{"role": "user", "content": "hi"}]
+                })),
+            )),
+            move |completion| *captured_out.lock().unwrap() = Some(completion),
+        );
+        let wire = String::from_utf8(to_bytes(body, usize::MAX).await.unwrap().to_vec()).unwrap();
+        let completion = captured.lock().unwrap().take().expect("on_complete fired");
+        let delta = wire
+            .split("\n\n")
+            .find(|frame| frame.starts_with("event: message_delta"))
+            .and_then(|frame| frame.split_once("data: "))
+            .map(|(_, data)| serde_json::from_str::<serde_json::Value>(data).unwrap())
+            .expect("a closing message_delta");
+        assert!(completion.usage_estimated);
+        assert!(completion.completion_tokens > 0, "the record was estimated");
+        assert_eq!(
+            delta["usage"]["output_tokens"], completion.completion_tokens,
+            "the client is told what the record bills"
+        );
+        assert_eq!(
+            delta["usage"]["input_tokens"], 3,
+            "the reported counter stands"
+        );
+    }
+
+    /// A caller that closes on `message_stop`, before the relay reads the
+    /// upstream's own end, received the whole response: a 200, not a 499.
+    #[tokio::test]
+    async fn a_caller_that_closes_on_the_bridged_message_stop_did_not_abandon_it() {
+        use futures::StreamExt as _;
+        use std::sync::{Arc, Mutex};
+        let upstream: aisix_gateway::ChatChunkStream = Box::pin(
+            futures::stream::iter(vec![
+                Ok(bridged_chunk(Some("answer"), false, None)),
+                Ok(bridged_chunk(
+                    None,
+                    true,
+                    Some(aisix_gateway::UsageStats::new(3, 2)),
+                )),
+            ])
+            .chain(futures::stream::pending()),
+        );
+        let captured = Arc::new(Mutex::new(None));
+        let captured_out = Arc::clone(&captured);
+        let now = std::time::Instant::now();
+        let body = super::build_anthropic_sse_stream(
+            upstream,
+            aisix_provider_anthropic::AnthropicSseEncoder::new("msg_stop", "relay-openai", 0),
+            now,
+            now,
+            None,
+            "relay-openai".into(),
+            None,
+            None,
+            move |completion| *captured_out.lock().unwrap() = Some(completion),
+        );
+        let mut frames = body.into_data_stream();
+        let mut seen = String::new();
+        while let Some(frame) = frames.next().await {
+            seen.push_str(&String::from_utf8_lossy(&frame.unwrap()));
+            if seen.contains("event: message_stop") {
+                break;
+            }
+        }
+        assert!(seen.contains("event: message_stop"), "{seen}");
+        drop(frames);
+        let completion = captured.lock().unwrap().take().expect("on_complete fired");
+        assert_eq!(
+            crate::attempt::guarded_stream_status(
+                completion.reached_end && !completion.verdict_pending,
+                completion.guardrail_blocked,
+                completion.failure.as_ref(),
+            ),
+            200,
+        );
     }
 
     #[tokio::test]

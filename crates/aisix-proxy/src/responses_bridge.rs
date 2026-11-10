@@ -1656,6 +1656,10 @@ pub struct ResponsesSseEncoder {
     cache_creation_ttl: aisix_gateway::CacheCreationTtl,
     cache_creation_tokens: u32,
     cache_read_tokens: u32,
+    /// Locally estimated `(prompt, completion)` counts for the ones the
+    /// upstream left at zero, applied when the terminal event is built
+    /// ([`Self::set_estimated_usage`]).
+    estimate: Option<(u32, u32)>,
     /// The last tier an OpenAI-shape upstream reported on this stream.
     service_tier: Option<String>,
     /// Platform mode: every event leaves with its item ids sealed.
@@ -1705,6 +1709,7 @@ impl ResponsesSseEncoder {
             cache_creation_ttl: Default::default(),
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
+            estimate: None,
             service_tier: None,
             seal: None,
         }
@@ -1812,10 +1817,22 @@ impl ResponsesSseEncoder {
     /// the same way, and the two must not disagree. A no-op once the
     /// terminal event has gone out: the client must never be handed
     /// numbers contradicting what it was already sent.
+    ///
+    /// Applied when the terminal event is built, after the chunk that ends
+    /// the stream has added whatever usage it carries, so it can be handed
+    /// over before that chunk ([`Self::finishes_on`]).
     pub fn set_estimated_usage(&mut self, prompt_tokens: u32, completion_tokens: u32) {
         if self.finished {
             return;
         }
+        self.estimate = Some((prompt_tokens, completion_tokens));
+    }
+
+    /// Fill the zero counters from [`Self::set_estimated_usage`]'s estimate.
+    fn apply_estimate(&mut self) {
+        let Some((prompt_tokens, completion_tokens)) = self.estimate.take() else {
+            return;
+        };
         let mut filled = false;
         if self.prompt_tokens == 0 && prompt_tokens > 0 {
             self.prompt_tokens = prompt_tokens;
@@ -2476,6 +2493,7 @@ impl ResponsesSseEncoder {
     }
 
     fn completed_event(&mut self, status: &str, reason: Option<&'static str>) -> ResponsesSseEvent {
+        self.apply_estimate();
         self.finished = true;
         let event_type = if status == "completed" {
             "response.completed"
@@ -2488,6 +2506,18 @@ impl ResponsesSseEncoder {
 
     pub fn is_finished(&self) -> bool {
         self.finished
+    }
+
+    /// Whether [`Self::next_events`] will emit the terminal event for
+    /// `chunk`: a finish reason, or the trailing usage frame a finish was
+    /// held for, once usage is known.
+    pub fn finishes_on(&self, chunk: &ChatChunk) -> bool {
+        if self.finished {
+            return false;
+        }
+        let chunk = chunk.first_choice_only();
+        let usage_known = self.usage_seen || chunk.usage.is_some();
+        usage_known && (self.pending_status.is_some() || chunk.finish_reason.is_some())
     }
 
     /// Whether any chunk so far carried something a response is made of —
@@ -2634,6 +2664,34 @@ impl<F: FnOnce(ResponsesStreamCompletion)> CompleteOnDrop<F> {
             .as_mut()
             .expect("stream completion guard accessed after drop")
             .1
+    }
+}
+
+impl<F: FnOnce(ResponsesStreamCompletion)> CompleteOnDrop<F> {
+    /// Token-estimation fallback (AISIX-Cloud#1074) for the stream's terminal
+    /// event: fill the counters the upstream never reported, on the record
+    /// and on the client-visible usage the encoder is about to build, so the
+    /// two agree. Once per stream — the estimator is taken — and only once
+    /// nothing further can arrive to report them.
+    fn adopt_usage_estimate(&mut self, encoder: &mut ResponsesSseEncoder) {
+        let Some(est) = self.estimator.take() else {
+            return;
+        };
+        let comp = self.comp();
+        let filled = crate::token_estimate::fill_missing(
+            &est,
+            comp.prompt_tokens,
+            comp.cache_read_tokens
+                .saturating_add(comp.cache_creation_tokens),
+            comp.completion_tokens,
+            Some(comp.est_output_text.as_str()),
+        );
+        if filled.estimated {
+            comp.prompt_tokens = filled.prompt_tokens;
+            comp.completion_tokens = filled.completion_tokens;
+            comp.usage_estimated = true;
+            encoder.set_estimated_usage(filled.prompt_tokens, filled.completion_tokens);
+        }
     }
 }
 
@@ -2841,6 +2899,13 @@ pub fn build_responses_bridge_stream(
                             comp.reasoning_folded_into_completion = u.reasoning_folded_into_completion;
                         }
                     }
+                    // This chunk ends the response: the usage its terminal
+                    // event reports is final now, so the estimate for what
+                    // the upstream left unreported goes in before it is
+                    // built (the stream reads nothing after it).
+                    if encoder.finishes_on(&chunk) {
+                        guard.adopt_usage_estimate(&mut encoder);
+                    }
                     let events = encoder.next_events(&chunk);
                     if encoder.overflowed() {
                         let aborted = aisix_gateway::BridgeError::StreamAborted;
@@ -2893,6 +2958,15 @@ pub fn build_responses_bridge_stream(
                         }
                         return;
                     }
+                    if encoder.is_finished() {
+                        // The terminal event is in `events`: the response was
+                        // received in full. Recorded before it is yielded, so a
+                        // caller that closes on it (Codex does) has not walked
+                        // away from it. Held, it waits for the verdict.
+                        let comp = guard.comp();
+                        comp.reached_end = true;
+                        comp.verdict_pending = buffering;
+                    }
                     if buffering {
                         held_content.hold(crate::held_content::chat_delta(&chunk.delta), 0);
                     }
@@ -2923,6 +2997,7 @@ pub fn build_responses_bridge_stream(
                             let comp = guard.comp();
                             comp.response_capture_safe = false;
                             comp.response_text.clear();
+                            comp.verdict_pending = false;
                         }
                         for b in held.drain(..) {
                             downstream_mark!();
@@ -3029,28 +3104,18 @@ pub fn build_responses_bridge_stream(
         // `output_tokens: 0` for a response it can see the text of has no way
         // to reconcile that with the dashboard. The guard keeps its own copy
         // of this fill for the stream a consumer abandoned before EOF, where
-        // no terminal event is emitted at all.
-        if let Some(est) = guard.estimator.take() {
-            let filled = {
-                let comp = guard.comp();
-                crate::token_estimate::fill_missing(
-                    &est,
-                    comp.prompt_tokens,
-                    comp
-                        .cache_read_tokens
-                        .saturating_add(comp.cache_creation_tokens),
-                    comp.completion_tokens,
-                    Some(comp.est_output_text.as_str()),
-                )
-            };
-            if filled.estimated {
-                let comp = guard.comp();
-                comp.prompt_tokens = filled.prompt_tokens;
-                comp.completion_tokens = filled.completion_tokens;
-                comp.usage_estimated = true;
-                encoder.set_estimated_usage(filled.prompt_tokens, filled.completion_tokens);
-            }
-        }
+        // no terminal event is emitted at all. A chunk that ended the
+        // response in the loop above already did this.
+        guard.adopt_usage_estimate(&mut encoder);
+
+        // Upstream EOF — the response was received in full. Record it before
+        // the closing events below go out, and before the guardrail work
+        // after them, which awaits a remote provider: both are routine drop
+        // points for clients that close on the terminal frame. Held, nothing
+        // has reached the caller yet, so that does not apply until the
+        // verdict is in.
+        guard.comp().reached_end = true;
+        guard.comp().verdict_pending = buffering;
 
         if !overflowed && !encoder.is_finished() {
             for ev in encoder.force_finish() {
@@ -3077,6 +3142,8 @@ pub fn build_responses_bridge_stream(
                         let comp = guard.comp();
                         comp.response_capture_safe = false;
                         comp.response_text.clear();
+                        // Released: no verdict is coming.
+                        comp.verdict_pending = false;
                     }
                     for b in held.drain(..) {
                         downstream_mark!();
@@ -3088,14 +3155,6 @@ pub fn build_responses_bridge_stream(
                 }
             }
         }
-
-        // Upstream EOF — the response was received in full. Record it before
-        // the guardrail work below, which awaits a remote provider and is a
-        // routine drop point for clients that close on the terminal frame.
-        // Held, nothing has reached the caller yet, so that does not apply
-        // until the verdict is in.
-        guard.comp().reached_end = true;
-        guard.comp().verdict_pending = buffering;
 
         // No output-hook guardrail, or its cap was exceeded under fail-open:
         // nothing to scan.
@@ -6319,6 +6378,121 @@ mod tests {
             ),
             crate::CLIENT_CLOSED_REQUEST,
         );
+    }
+
+    fn answer_chunk(content: Option<&str>, finish: bool, usage: Option<UsageStats>) -> ChatChunk {
+        ChatChunk {
+            choice_index: 0,
+            logprobs: None,
+            id: "c".into(),
+            model: "m".into(),
+            delta: ChatDelta {
+                content: content.map(str::to_string),
+                ..Default::default()
+            },
+            finish_reason: finish.then_some(FinishReason::Stop),
+            usage,
+            service_tier: None,
+            accounting_usage: None,
+        }
+    }
+
+    /// An upstream that reports the prompt but not the completion on its
+    /// finish chunk: the terminal event is built from that chunk, so the
+    /// estimate for the missing counter has to be in it — the same number the
+    /// usage record gets — rather than arriving after it was serialized.
+    #[tokio::test]
+    async fn a_finish_with_partial_usage_reports_the_estimate_the_record_gets() {
+        let answer = "a long enough answer to count more than zero tokens";
+        let (tx, rx) = std::sync::mpsc::channel();
+        let body = build_responses_bridge_stream(
+            Box::pin(futures::stream::iter(vec![
+                Ok(answer_chunk(Some(answer), false, None)),
+                Ok(answer_chunk(None, true, Some(UsageStats::new(3, 0)))),
+            ])),
+            ResponsesSseEncoder::new("resp_1", "m", 0, no_custom_tools()),
+            Instant::now(),
+            Instant::now(),
+            None,
+            false,
+            usize::MAX,
+            false,
+            "m".to_string(),
+            None,
+            Some(crate::token_estimate::Estimator::new(
+                "gpt-4o-mini",
+                crate::token_estimate::PromptInput::ResponsesWire(bytes::Bytes::from_static(
+                    br#"{"model":"m","input":"hi"}"#,
+                )),
+            )),
+            move |comp| tx.send(comp).unwrap(),
+        );
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let events = sse_events(&bytes);
+        let comp = rx.recv().unwrap();
+        let (name, completed) = events.last().unwrap();
+        assert_eq!(name, "response.completed");
+        let usage = &completed["response"]["usage"];
+        assert_eq!(usage["input_tokens"], 3, "the reported counter stands");
+        assert!(comp.usage_estimated);
+        assert!(comp.completion_tokens > 0, "the record was estimated");
+        assert_eq!(
+            usage["output_tokens"], comp.completion_tokens,
+            "the client is told what the record bills"
+        );
+        assert_eq!(usage["total_tokens"], 3 + comp.completion_tokens);
+    }
+
+    /// Codex reads `response.completed` as the end and closes. A caller that
+    /// leaves right after the terminal event, before the relay gets to the
+    /// upstream's own end, received the whole response: the row is a 200,
+    /// not a 499 — on the live path, and on the forced close of a stream
+    /// whose upstream sent no finish chunk.
+    #[tokio::test]
+    async fn a_caller_that_closes_on_the_terminal_event_did_not_abandon_it() {
+        use futures::StreamExt as _;
+        for with_finish in [true, false] {
+            let mut chunks = vec![Ok(answer_chunk(Some("answer"), false, None))];
+            if with_finish {
+                chunks.push(Ok(answer_chunk(None, true, Some(UsageStats::new(3, 2)))));
+            }
+            let (tx, rx) = std::sync::mpsc::channel();
+            let body = build_responses_bridge_stream(
+                Box::pin(futures::stream::iter(chunks)),
+                ResponsesSseEncoder::new("resp_1", "m", 0, no_custom_tools()),
+                Instant::now(),
+                Instant::now(),
+                None,
+                false,
+                usize::MAX,
+                false,
+                "m".to_string(),
+                None,
+                None,
+                move |comp| tx.send(comp).unwrap(),
+            );
+            let mut frames = body.into_data_stream();
+            let mut seen = String::new();
+            while let Some(frame) = frames.next().await {
+                seen.push_str(&String::from_utf8_lossy(&frame.unwrap()));
+                if seen.contains("event: response.completed") {
+                    break;
+                }
+            }
+            assert!(seen.contains("event: response.completed"), "{seen}");
+            // The caller hangs up on the terminal event.
+            drop(frames);
+            let comp = rx.recv().unwrap();
+            assert_eq!(
+                crate::attempt::guarded_stream_status(
+                    comp.reached_end && !comp.verdict_pending,
+                    comp.guardrail_blocked,
+                    comp.failure.as_ref(),
+                ),
+                200,
+                "with_finish={with_finish}"
+            );
+        }
     }
 
     #[tokio::test]
