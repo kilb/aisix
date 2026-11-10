@@ -388,6 +388,7 @@ impl TokenMinter {
                 if status.is_server_error() || status == StatusCode::TOO_MANY_REQUESTS {
                     BridgeError::upstream_status_with_retry_after(status.as_u16(), msg, retry_after)
                         .with_body_read_error(read_error)
+                        .answered_by_credential_endpoint()
                 } else {
                     BridgeError::Config(msg)
                 },
@@ -798,10 +799,12 @@ mod tests {
             BridgeError::UpstreamStatus {
                 status,
                 retry_after,
+                wire,
                 ..
             } => {
                 assert_eq!(status, 429);
                 assert_eq!(retry_after, Some(Duration::from_secs(60)));
+                assert_eq!(wire, aisix_gateway::UpstreamWire::CredentialEndpoint);
             }
             other => panic!("expected UpstreamStatus, got {other:?}"),
         }

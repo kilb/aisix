@@ -62,6 +62,13 @@ pub enum UpstreamWire {
     /// the legacy convenience constructors). Renders as the generic
     /// `upstream_error` envelope with no translation attempt.
     Unknown,
+    /// The answer of a credential token endpoint the bridge called before
+    /// the model request (Azure AD, a Google service account): the model's
+    /// upstream was never sent the request. Renders like [`Unknown`](Self::Unknown);
+    /// a routing group moves on from it to its next target, whose
+    /// credentials are its own, whatever its status. See
+    /// [`BridgeError::answered_by_credential_endpoint`].
+    CredentialEndpoint,
 }
 
 /// Structured view of an upstream error envelope, populated by each
@@ -509,6 +516,17 @@ impl BridgeError {
             retry_after,
             diagnostic: None,
         }
+    }
+
+    /// Mark this `UpstreamStatus` as a credential token endpoint's answer
+    /// ([`UpstreamWire::CredentialEndpoint`]). Its status, message and
+    /// `Retry-After` are unchanged: the caller and the cooldown layer see
+    /// the endpoint's answer as it was.
+    pub fn answered_by_credential_endpoint(mut self) -> Self {
+        if let Self::UpstreamStatus { wire, .. } = &mut self {
+            *wire = UpstreamWire::CredentialEndpoint;
+        }
+        self
     }
 
     /// Have `Display` name the read failure behind this `UpstreamStatus`. What

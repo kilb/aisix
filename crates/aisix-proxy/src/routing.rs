@@ -141,10 +141,22 @@ pub(crate) fn target_unusable(err: &ProxyError) -> bool {
 }
 
 /// [`target_unusable`] for the `BridgeError`-typed dispatch loops.
+///
+/// A credential token endpoint's answer is one too, whatever its status: the
+/// model's upstream was never sent the request, and the next target mints
+/// its own credentials. A throttled endpoint's `429` keeps its
+/// `Retry-After` for the cooldown it puts this target in and for the caller
+/// when no target is left, but does not end the walk the way an upstream
+/// `429` does unless `retry_on_429` is set.
 pub(crate) fn bridge_target_unusable(err: &BridgeError) -> bool {
     matches!(
         err,
-        BridgeError::InvalidUpstreamConfig(_) | BridgeError::InvalidUpstreamCredentials(_)
+        BridgeError::InvalidUpstreamConfig(_)
+            | BridgeError::InvalidUpstreamCredentials(_)
+            | BridgeError::UpstreamStatus {
+                wire: aisix_gateway::UpstreamWire::CredentialEndpoint,
+                ..
+            }
     )
 }
 
@@ -3616,6 +3628,16 @@ mod tests {
             ProxyError::ProviderUnavailable,
             ProxyError::Bridge(BridgeError::InvalidUpstreamConfig("no base".into())),
             ProxyError::Bridge(BridgeError::InvalidUpstreamCredentials("empty".into())),
+            // A credential token endpoint that throttles: the next target
+            // mints its own credentials.
+            ProxyError::Bridge(
+                BridgeError::upstream_status_with_retry_after(
+                    429,
+                    "token endpoint throttled",
+                    Some(Duration::from_secs(60)),
+                )
+                .answered_by_credential_endpoint(),
+            ),
         ] {
             assert!(target_unusable(&unusable), "{unusable:?}");
         }
@@ -3623,6 +3645,8 @@ mod tests {
             ProxyError::InvalidRequest("bad body".into()),
             ProxyError::Bridge(BridgeError::InvalidRequest("bad body".into())),
             ProxyError::Bridge(BridgeError::upstream_status(401, "expired")),
+            // The model's own upstream throttling the request is not.
+            ProxyError::Bridge(BridgeError::upstream_status(429, "slow down")),
             ProxyError::Bridge(BridgeError::UpstreamDecode("x".into())),
         ] {
             assert!(!target_unusable(&other), "{other:?}");

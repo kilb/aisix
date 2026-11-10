@@ -1018,7 +1018,12 @@ fn render_bridge_upstream_envelope(
         message
     };
     let is_4xx = (400..500).contains(&status);
-    if is_4xx && !matches!(wire, aisix_gateway::UpstreamWire::Unknown) {
+    if is_4xx
+        && !matches!(
+            wire,
+            aisix_gateway::UpstreamWire::Unknown | aisix_gateway::UpstreamWire::CredentialEndpoint
+        )
+    {
         return ErrorEnvelope {
             error: crate::error_translate::render_openai_envelope(parsed, wire, message),
         };

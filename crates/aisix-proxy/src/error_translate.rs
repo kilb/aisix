@@ -57,7 +57,9 @@ pub(crate) fn render_openai_envelope(
         .unwrap_or_else(|| fallback_message.to_string());
     let upstream_kind = view.kind.as_deref();
     let derived_code = match wire {
-        UpstreamWire::OpenAI | UpstreamWire::Unknown => view.code.clone(),
+        UpstreamWire::OpenAI | UpstreamWire::Unknown | UpstreamWire::CredentialEndpoint => {
+            view.code.clone()
+        }
         UpstreamWire::AzureOpenAI => derive_azure_code(upstream_kind),
         UpstreamWire::Anthropic => derive_anthropic_code(upstream_kind),
         UpstreamWire::Bedrock => derive_bedrock_code(upstream_kind),
