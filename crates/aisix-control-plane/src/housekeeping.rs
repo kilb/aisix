@@ -4,9 +4,10 @@
 //! the tombstones of deleted gateway resources once their delete has been
 //! projected for a day; catching up the key documents an older release
 //! wrote ([`keys::catch_up`]); opening the billing account of any tenant
-//! that has none ([`ledger::backfill_accounts`]); and replacing any grant of
+//! that has none ([`ledger::backfill_accounts`]); replacing any grant of
 //! a channel's generated direct model by its public model
-//! ([`tenants::replace_generated_grants`]).
+//! ([`tenants::replace_generated_grants`]); and flagging every balance mark
+//! the rule in force would not write ([`marks::flag_stale_marks`]).
 //!
 //! Every instance runs the pass at boot and every 10 minutes after; the
 //! deletes are idempotent, and the catch-up takes one tenant at a time, so
@@ -19,7 +20,7 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 
-use crate::billing::ledger;
+use crate::billing::{ledger, marks};
 use crate::db::{Db, DbError};
 use crate::resources::write::{WriteCtx, RESOURCES_LOCK_KEY};
 use crate::stopped;
@@ -64,9 +65,11 @@ pub async fn run_once(db: &Db) -> Result<Pruned, DbError> {
 /// older release, during a rolling upgrade, creates tenants without one),
 /// then every grant of a channel's generated direct model is replaced by its
 /// public model ([`tenants::replace_generated_grants`]: an older release
-/// could grant one). Each part is logged on its own so that one failing
-/// leaves the others to run. A tenant the gateway-version gate refuses is
-/// caught up by a later tick.
+/// could grant one), then every balance mark the rule in force would not
+/// write is flagged for the settler ([`marks::flag_stale_marks`]: an earlier
+/// rule, or an older replica, wrote it). Each part is logged on its own so
+/// that one failing leaves the others to run. A tenant the gateway-version
+/// gate refuses is caught up by a later tick.
 pub async fn tick(db: &Db, ctx: &WriteCtx) {
     match run_once(db).await {
         Ok(pruned) => tracing::debug!(?pruned, "housekeeping pass"),
@@ -78,6 +81,15 @@ pub async fn tick(db: &Db, ctx: &WriteCtx) {
     }
     backfill_accounts(db).await;
     replace_generated_grants(db, ctx).await;
+    match marks::flag_stale_marks(db).await {
+        Ok(0) => {}
+        Ok(flagged) => tracing::info!(
+            flagged,
+            "flagged the accounts whose balance mark the rule in force would not write; the \
+             settler writes their marks again"
+        ),
+        Err(e) => tracing::warn!(error = %e, "looking for stale balance marks failed"),
+    }
 }
 
 /// Replaces every grant of a channel's generated direct model by its public

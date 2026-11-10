@@ -1804,3 +1804,48 @@ async fn a_model_delete_never_makes_intake_wait() {
         1_000_000 - 680
     );
 }
+
+/// R-002: a balance mark written under an earlier rule, and left clean, is
+/// recomputed by the next control plane to boot. Before the credit limit
+/// counted for a prepaid tenant, a prepaid organisation with a zero balance
+/// and ¥100 000 of credit was marked exhausted and its flag cleared; the
+/// upgrade to the rule that counts the credit flagged nothing, and the
+/// settler takes only flagged accounts, so the mark stood until an operator
+/// happened to edit the tenant. A tenant whose mark the rule in force agrees
+/// with, a zero-credit one that is rightly exhausted among them, is neither
+/// flagged nor rewritten.
+#[tokio::test]
+async fn a_mark_an_earlier_rule_wrote_is_recomputed_at_the_next_boot() {
+    let Some(w) = world().await else { return };
+    let db = w.cp.db();
+    let zero_credit = support::world::seed_tenant(&w.cp, &w.admin).await;
+    for tenant in [w.tenant, zero_credit] {
+        set_account(db, tenant, 0, Some(0)).await;
+        settle(&w.cp, tenant).await;
+        assert_eq!(
+            live_mark(db, tenant).await.doc,
+            exhausted_doc(tenant, BALANCE_MESSAGE_PREPAID)
+        );
+    }
+    // The state the old rule left: credit beside an exhausted mark it
+    // recorded, unflagged.
+    set_account(db, w.tenant, 0, Some(100_000_000_000)).await;
+    let stale = account(db, w.tenant).await;
+    assert_eq!(
+        (stale.marked_exhausted, stale.marks_dirty),
+        (Some(true), false)
+    );
+    let held = live_mark(db, zero_credit).await.seq;
+
+    let upgraded = w.cp.restart().await;
+    until_marked(upgraded.db(), w.tenant, &open_doc(w.tenant)).await;
+    assert_eq!(account(db, w.tenant).await.marked_exhausted, Some(false));
+    // The zero-credit tenant is still blocked, by the same document.
+    let still = live_mark(db, zero_credit).await;
+    assert_eq!(
+        still.doc,
+        exhausted_doc(zero_credit, BALANCE_MESSAGE_PREPAID)
+    );
+    assert_eq!(still.seq, held, "a mark the rule agrees with was rewritten");
+    assert!(!account(db, zero_credit).await.marks_dirty);
+}

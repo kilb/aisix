@@ -174,6 +174,55 @@ pub async fn crossings(conn: &mut PgConnection, after: &[Account]) -> Result<Vec
     Ok(dirty)
 }
 
+/// Flags the account of every customer tenant past pending whose recorded
+/// mark (`marked_exhausted`, or none at all) is not what [`exhausted`]
+/// decides for its account now, wakes the settler, and returns how many
+/// accounts it flagged.
+///
+/// A mark is otherwise written again only when something moves what it
+/// depends on, and the settler takes only flagged accounts. So a mark an
+/// earlier rule wrote stands, clean, until an operator happens to edit the
+/// tenant: when the credit limit started to count for prepaid tenants, an
+/// upgraded database kept `exhausted` marks over positive credit, and an
+/// older replica can write one during a rolling upgrade. Housekeeping runs
+/// this at every tick, the first at boot (`housekeeping::tick`).
+///
+/// It decides by [`exhausted`], the one rule [`project`] writes by, and
+/// takes no lock to read: a flag set from a balance that has moved since only
+/// makes the settler write what the account then decides, and an account
+/// missed is found at the next tick. Each account is flagged in a statement
+/// of its own, so this never holds one account while waiting for another,
+/// and never waits on a tenant row.
+pub async fn flag_stale_marks(db: &Db) -> Result<u64, DbError> {
+    let accounts: Vec<(Uuid, i64, i64, Option<bool>)> = sqlx::query_as(
+        "SELECT a.tenant_id, a.balance_micro_cny, a.credit_limit_micro_cny, a.marked_exhausted \
+         FROM billing_accounts a JOIN tenants t ON t.id = a.tenant_id \
+         WHERE NOT t.is_internal AND t.status <> 'pending' AND NOT a.marks_dirty \
+         ORDER BY a.tenant_id",
+    )
+    .fetch_all(db.pool())
+    .await?;
+    let mut flagged = 0;
+    for (tenant_id, balance, credit_limit, marked) in accounts {
+        if marked == Some(exhausted(balance, credit_limit)) {
+            continue;
+        }
+        flagged += sqlx::query(
+            "UPDATE billing_accounts SET marks_dirty = true \
+             WHERE tenant_id = $1 AND NOT marks_dirty",
+        )
+        .bind(tenant_id)
+        .execute(db.pool())
+        .await?
+        .rows_affected();
+    }
+    if flagged > 0 {
+        let mut conn = db.pool().acquire().await?;
+        notify(&mut conn).await?;
+    }
+    Ok(flagged)
+}
+
 /// Wakes every instance's settler, once this transaction commits.
 pub async fn notify(conn: &mut PgConnection) -> Result<(), DbError> {
     sqlx::query("SELECT pg_notify($1, '')")
