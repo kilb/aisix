@@ -1020,7 +1020,10 @@ async fn dispatch(
             "/v1/responses",
             &model_name,
             &model_entry.value,
-            || body.to_string(),
+            || match crate::response_cache::continuation_partition(state, auth) {
+                Some(groups) => format!("{body}\nallowed_provider_groups: {groups}"),
+                None => body.to_string(),
+            },
         )
     };
     if let Some(gate) = cache_gate.as_ref() {

@@ -242,6 +242,36 @@ pub(crate) fn cache_scope_value(
     }
 }
 
+/// What else a stored Responses answer is keyed by in platform mode: the
+/// caller key's provider groups, sorted and deduplicated, when it has any.
+///
+/// A Response's ids are sealed to the tenant together with the target that
+/// served it, and a continuation from it is refused to a key whose groups do
+/// not hold that target (`ResponsesContext::admit_continuation`). A `team`
+/// scope shares entries between keys of one tenant, which may hold different
+/// groups, so without this a key could be handed a Response it cannot
+/// continue. Keys with the same groups reach the same targets and share.
+/// `None` outside platform mode, where nothing is sealed to a target, and for
+/// a key without groups, so neither changes its fingerprint.
+pub(crate) fn continuation_partition(
+    state: &ProxyState,
+    auth: &AuthenticatedKey,
+) -> Option<String> {
+    state.platform()?;
+    let mut groups: Vec<&str> = auth
+        .key()
+        .allowed_provider_groups
+        .iter()
+        .map(String::as_str)
+        .collect();
+    if groups.is_empty() {
+        return None;
+    }
+    groups.sort_unstable();
+    groups.dedup();
+    Some(serde_json::json!(groups).to_string())
+}
+
 /// A scope value as a part of the body fingerprint. Entries every caller
 /// shares have always been stored under an empty part, so only `None` is
 /// spelled that way. An empty `Some` has no spelling of its own in that
