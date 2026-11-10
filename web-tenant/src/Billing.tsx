@@ -91,14 +91,18 @@ export function Billing({ member }: { member: SessionMember }) {
 
   // The organisation's own quotas, which owner, admin and billing may read. A
   // quota that is used up refuses calls while the balance is still positive,
-  // so the lamp and the billing member's readout both need them.
-  const [team, setTeam] = useState<Budget[]>([]);
+  // so the lamp and the billing member's readout both need them. `null` until
+  // they are read: a read that failed is not an organisation without quotas,
+  // so nothing that depends on them is claimed until a read succeeds.
+  const [team, setTeam] = useState<Budget[] | null>(null);
+  const [teamErr, setTeamErr] = useState<string | null>(null);
   const loadTeam = useCallback(async () => {
     try {
       setTeam((await budgetApi.list()).filter((b) => b.scope === "team"));
-    } catch {
-      // Not readable: the balance alone speaks, and its caption stays true.
-      setTeam([]);
+      setTeamErr(null);
+    } catch (e) {
+      setTeam(null);
+      setTeamErr(failure(e));
     }
   }, []);
 
@@ -111,8 +115,8 @@ export function Billing({ member }: { member: SessionMember }) {
   return (
     <div className="stack billing">
       <div className="deck billing-top">
-        <BalancePanel balance={balance} team={team} err={balanceErr} />
-        <Readout member={member} balance={balance} team={team} />
+        <BalancePanel balance={balance} team={team} teamErr={teamErr} onRetryTeam={() => void loadTeam()} err={balanceErr} />
+        <Readout member={member} balance={balance} team={team} teamErr={teamErr} onRetryTeam={() => void loadTeam()} />
       </div>
       <TopupForm
         onRequested={() => {
@@ -128,19 +132,49 @@ export function Billing({ member }: { member: SessionMember }) {
 
 // ── balance (余额) ────────────────────────────────────────────────────────────────────
 
-function BalancePanel({ balance, team, err }: { balance: Balance | null; team: Budget[]; err: string | null }) {
+/** A failed read of the organisation's quotas, with a retry: what depends on them is not known until it succeeds. */
+function TeamFailed({ err, onRetry }: { err: string; onRetry: () => void }) {
+  return (
+    <div className="note crit" role="alert">
+      组织额度读取失败：{err}{" "}
+      <Button size="sm" onClick={onRetry}>
+        重试
+      </Button>
+    </div>
+  );
+}
+
+function BalancePanel({
+  balance,
+  team,
+  teamErr,
+  onRetryTeam,
+  err,
+}: {
+  balance: Balance | null;
+  team: Budget[] | null;
+  teamErr: string | null;
+  onRetryTeam: () => void;
+  err: string | null;
+}) {
   const postpaid = balance?.billing_mode === "postpaid";
   const balanceOut = balance?.exhausted === true;
-  // The lamp means "calls are accepted now": a used-up organisation quota refuses them too.
-  const orgOut = team.some((b) => b.exhausted);
+  // The lamp means "calls are accepted now": a used-up organisation quota refuses them too,
+  // so until the quotas are read only a spent balance decides.
+  const orgOut = team?.some((b) => b.exhausted) ?? false;
+  const known = balanceOut || team !== null;
   const exhausted = balanceOut || orgOut;
   const stateText = balanceOut
     ? postpaid
       ? "已达信用额度，调用已停止"
       : "余额不足，调用已停止"
-    : orgOut
-      ? "组织额度已用尽，调用已停止"
-      : "可正常调用";
+    : !known
+      ? teamErr
+        ? "组织额度未能读取，暂不能确认能否调用"
+        : "正在读取组织额度…"
+      : orgOut
+        ? "组织额度已用尽，调用已停止"
+        : "可正常调用";
   return (
     <Section title="余额">
       {err && (
@@ -150,9 +184,10 @@ function BalancePanel({ balance, team, err }: { balance: Balance | null; team: B
       )}
       {balance && (
         <>
-          <p className="balance-state" data-state={exhausted ? "exhausted" : "ok"}>
-            <Lamp state={exhausted ? "rejected" : "applied"}>{stateText}</Lamp>
+          <p className="balance-state" data-state={!known ? "unknown" : exhausted ? "exhausted" : "ok"}>
+            <Lamp state={!known ? "pending" : exhausted ? "rejected" : "applied"}>{stateText}</Lamp>
           </p>
+          {!known && teamErr && <TeamFailed err={teamErr} onRetry={onRetryTeam} />}
           <div className="entries">
             <Reading label="余额" value={<Money micro={balance.balance_micro_cny} />} />
             <Reading label="信用额度" value={<Money micro={balance.credit_limit_micro_cny} />} />
@@ -193,7 +228,19 @@ function defaultKey(items: TenantKey[], member: SessionMember): string | null {
   return (own ?? newest(items))?.id ?? null;
 }
 
-function Readout({ member, balance, team }: { member: SessionMember; balance: Balance | null; team: Budget[] }) {
+function Readout({
+  member,
+  balance,
+  team,
+  teamErr,
+  onRetryTeam,
+}: {
+  member: SessionMember;
+  balance: Balance | null;
+  team: Budget[] | null;
+  teamErr: string | null;
+  onRetryTeam: () => void;
+}) {
   const manager = member.role === "owner" || member.role === "admin";
   const [items, setItems] = useState<TenantKey[] | null>(manager ? null : []);
   const [keyId, setKeyId] = useState<string | null>(null);
@@ -258,9 +305,9 @@ function Readout({ member, balance, team }: { member: SessionMember; balance: Ba
   let view: { effective: number | null; stops: ReadoutStop[]; binding: QuotaLevel | null } | null = null;
   if (keyId !== null && quota && quota.key_id === keyId) {
     view = { effective: quota.effective_remaining_micro_cny, stops: stopsOf(quota), binding: quota.binding_level };
-  } else if (keyId === null && balance) {
+  } else if (keyId === null && balance && team !== null) {
     // No key to read (a billing member's case): the smaller of the organisation's
-    // balance and its smallest remaining quota.
+    // balance and its smallest remaining quota, once the quotas are read.
     const left = Math.min(Math.max(0, balance.available_micro_cny), ...team.map((b) => Math.max(0, b.remaining_micro_cny)));
     view = { effective: left, stops: [{ level: "organization", label: "组织", remainingMicroCny: left }], binding: "organization" };
   }
@@ -281,6 +328,8 @@ function Readout({ member, balance, team }: { member: SessionMember; balance: Ba
     ) : null;
 
   if (!view) {
+    // A billing member's figure waits on the organisation's quotas.
+    const quotaErr = keyId === null && team === null ? teamErr : null;
     return (
       <Section title="可用额度">
         {picker}
@@ -289,7 +338,8 @@ function Readout({ member, balance, team }: { member: SessionMember; balance: Ba
             {err}
           </div>
         )}
-        {!err && <Loading />}
+        {quotaErr && <TeamFailed err={quotaErr} onRetry={onRetryTeam} />}
+        {!err && !quotaErr && <Loading />}
       </Section>
     );
   }
@@ -502,15 +552,20 @@ function Ledger({ topups }: { topups: Topup[] | null }) {
   const [err, setErr] = useState<string | null>(null);
   const [more, setMore] = useState(false);
   const range = rangeOf(fromDate, toDate);
-  // The latest first-page request: an answer to an older filter is dropped.
+  // The latest first-page request: an answer to an older filter is dropped,
+  // and so is a later page of one.
   const ticket = useRef(0);
 
   useEffect(() => {
     const mine = ++ticket.current;
+    // A continuation of the old filter is not this one's: its busy state and
+    // its cursor go with it, so no next page is asked for until this
+    // filter's first page names one.
+    setMore(false);
+    setNext(null);
     // An end before the start names nothing: the field says so, and no row shows.
     if (!range) {
       setRows([]);
-      setNext(null);
       setErr(null);
       return;
     }
@@ -547,9 +602,9 @@ function Ledger({ topups }: { topups: Topup[] | null }) {
       });
       setNext(p.next_before);
     } catch (e) {
-      setErr(failure(e));
+      if (mine === ticket.current) setErr(failure(e));
     } finally {
-      setMore(false);
+      if (mine === ticket.current) setMore(false);
     }
   }
 
