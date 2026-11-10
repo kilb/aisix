@@ -3083,11 +3083,22 @@ pub async fn moderate_images_response_structured(
 }
 
 /// Mask an audio transcription/translation RESPONSE in place (#696). The
-/// wire body is either JSON (`json` / `verbose_json` response_format:
-/// top-level `text` + per-segment `segments[].text`) or raw text
-/// (`text` / `srt` / `vtt` formats). Returns the rewritten bytes + counts,
-/// or `None` when nothing matched (caller keeps the original body). A
-/// non-UTF-8 body is left untouched.
+/// wire body is either JSON (`json` / `verbose_json` / `diarized_json`
+/// response_format: top-level `text` + per-segment `segments[].text`) or raw
+/// text (`text` / `srt` / `vtt` formats). Returns the rewritten bytes +
+/// counts, or `None` when nothing matched (caller keeps the original body).
+/// A non-UTF-8 body is left untouched.
+///
+/// Once anything in a JSON answer is masked, nothing in it may still spell
+/// the transcript as it was. So it loses what no mask can rewrite and leave
+/// meaningful: `logprobs` (the tokens), `words` (word timestamps, the
+/// transcript word by word, where a match can span words) and each
+/// segment's `tokens` (the token ids of its original text). A value split
+/// across two segments is in neither alone, so when the segments read as one
+/// text still match, every segment's text is emptied; the top-level `text`
+/// carries the masked transcript. `words` are read for a match too, so a
+/// value only they carry still counts as masked and they are dropped.
+/// <https://platform.openai.com/docs/api-reference/audio/verbose-json-object>
 pub fn redact_transcription_response(
     chain: &dyn Guardrail,
     body: &[u8],
@@ -3101,25 +3112,76 @@ pub fn redact_transcription_response(
             apply_to_value_string(chain, Direction::Output, text, &mut counts);
         }
         if let Some(Value::Array(segments)) = json.get_mut("segments") {
-            for seg in segments {
+            for seg in segments.iter_mut() {
                 if let Some(text) = seg.get_mut("text") {
                     apply_to_value_string(chain, Direction::Output, text, &mut counts);
                 }
+            }
+            let texts: Vec<String> = segments
+                .iter()
+                .filter_map(|seg| seg.get("text")?.as_str().map(str::to_owned))
+                .collect();
+            if let Some(straddling) = straddling_match(chain, &texts) {
+                for seg in segments.iter_mut() {
+                    if let Some(text) = seg.get_mut("text").filter(|t| t.is_string()) {
+                        *text = Value::String(String::new());
+                    }
+                }
+                if counts.is_empty() {
+                    merge_counts(&mut counts, straddling);
+                }
+            }
+        }
+        if counts.is_empty() {
+            if let Some(r) = transcription_words_text(&json)
+                .and_then(|words| redact_str(chain, Direction::Output, &words))
+            {
+                merge_counts(&mut counts, r.counts);
             }
         }
         if counts.is_empty() {
             return None;
         }
-        // The tokens of the transcript as it was, which no mask can rewrite
-        // and leave meaningful (see [`masked_spans`]).
         if let Some(json) = json.as_object_mut() {
             json.remove("logprobs");
+            json.remove("words");
+            if let Some(Value::Array(segments)) = json.get_mut("segments") {
+                for seg in segments.iter_mut().filter_map(Value::as_object_mut) {
+                    seg.remove("tokens");
+                }
+            }
         }
         return serde_json::to_vec(&json).ok().map(|b| (b, counts));
     }
     let text = std::str::from_utf8(body).ok()?;
     let r = chain.redact_output_text(text)?;
     Some((r.text.into_bytes(), r.counts))
+}
+
+/// The words of a `verbose_json` transcript (`words[].word`), read as one
+/// text, or `None` when it carries none.
+pub(crate) fn transcription_words_text(json: &Value) -> Option<String> {
+    let words: Vec<&str> = json
+        .get("words")?
+        .as_array()?
+        .iter()
+        .filter_map(|w| w.get("word")?.as_str())
+        .collect();
+    (!words.is_empty()).then(|| words.join(" "))
+}
+
+/// The counts of a match in `texts`, each already masked on its own, once
+/// they are read as one text: a value split across two of them is in neither
+/// alone. Read both glued and space-joined, since one provider's pieces carry
+/// their leading space and another's do not.
+fn straddling_match(chain: &dyn Guardrail, texts: &[String]) -> Option<RedactionCounts> {
+    if texts.len() < 2 {
+        return None;
+    }
+    [texts.concat(), texts.join(" ")]
+        .iter()
+        .find_map(|joined| redact_str(chain, Direction::Output, joined))
+        .map(|r| r.counts)
 }
 
 /// Mask a streamed transcription (`stream: true`) held back for an output
@@ -3133,9 +3195,11 @@ pub fn redact_transcription_response(
 /// sentinel) is masked as plain text.
 /// Once anything was masked, every frame loses its `logprobs`: their tokens
 /// spell the transcript as it was, and the deltas' and the done event's
-/// repeat one text, so a frame left with them gives the mask away. Everything
-/// else in a frame (usage, ids) is left as written, and a stream nothing
-/// matched in goes out byte for byte.
+/// repeat one text, so a frame left with them gives the mask away. A value
+/// split across segment events empties every segment event's text, as in
+/// [`redact_transcription_response`]. Everything else in a frame (usage,
+/// ids) is left as written, and a stream nothing matched in goes out byte for
+/// byte.
 ///
 /// Also the scan surface: [`transcription_sse_text`] reads what this walk
 /// offers, so a slot the scan reads is a slot the mask rewrites.
@@ -3227,6 +3291,45 @@ pub fn redact_transcription_sse(
                 }
             }
             None => {}
+        }
+    }
+
+    // A value split across two `transcript.text.segment` events is in
+    // neither alone: when they read as one text still match, every segment
+    // event's text is emptied (the deltas and the done event carry the
+    // masked transcript).
+    let segments: Vec<usize> = frames
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| event_type(f).as_deref() == Some("transcript.text.segment"))
+        .map(|(i, _)| i)
+        .collect();
+    let texts: Vec<String> = segments
+        .iter()
+        .filter_map(|&i| {
+            frames[i]
+                .data
+                .as_ref()?
+                .get("text")?
+                .as_str()
+                .map(str::to_owned)
+        })
+        .collect();
+    if let Some(straddling) = straddling_match(chain, &texts) {
+        for &i in &segments {
+            let frame = &mut frames[i];
+            if let Some(text) = frame
+                .data
+                .as_mut()
+                .and_then(|d| d.get_mut("text"))
+                .filter(|t| t.is_string())
+            {
+                *text = Value::String(String::new());
+                frame.dirty = true;
+            }
+        }
+        if counts.is_empty() {
+            merge_counts(&mut counts, straddling);
         }
     }
 
@@ -9518,6 +9621,125 @@ mod tests {
             &serde_json::to_vec(&clean).unwrap()
         )
         .is_none());
+    }
+
+    /// A masked `verbose_json` answer spells the original nowhere: its word
+    /// timestamps (the transcript word by word) and its segments' token ids
+    /// go, a value split across two segments empties the segments' text, and
+    /// a value only the words carry still counts as masked.
+    #[test]
+    fn a_masked_verbose_transcription_keeps_the_original_nowhere() {
+        let chain = both();
+        let words = |ws: &[&str]| -> Value {
+            ws.iter()
+                .enumerate()
+                .map(|(i, w)| json!({"word": w, "start": i as f64, "end": i as f64 + 0.5}))
+                .collect()
+        };
+        let mask = |body: Value| -> Value {
+            let (rewritten, counts) =
+                redact_transcription_response(chain.as_ref(), &serde_json::to_vec(&body).unwrap())
+                    .expect("must rewrite");
+            assert!(!counts.is_empty());
+            serde_json::from_slice(&rewritten).unwrap()
+        };
+
+        let v = mask(json!({
+            "task": "transcribe", "language": "english", "duration": 3.0,
+            "text": "mail alice@example.com now",
+            "segments": [{"id": 0, "start": 0.0, "end": 3.0, "text": " mail alice@example.com now",
+                          "tokens": [50364, 2557, 419, 30533, 31, 3121, 1462, 13, 1112, 586]}],
+            "words": words(&["mail", "alice@example.com", "now"]),
+        }));
+        let out = v.to_string();
+        assert!(!out.contains("alice"), "{out}");
+        assert_eq!(v["text"], "mail [EMAIL_REDACTED] now");
+        assert_eq!(v["segments"][0]["text"], " mail [EMAIL_REDACTED] now");
+        assert!(v.get("words").is_none(), "{out}");
+        assert!(v["segments"][0].get("tokens").is_none(), "{out}");
+        assert_eq!(v["segments"][0]["end"], 3.0, "timings stay");
+
+        // Split across two segments: in neither alone.
+        let v = mask(json!({
+            "text": "mail alice@example.com now",
+            "segments": [{"id": 0, "start": 0.0, "end": 1.0, "text": " mail alice@exam"},
+                         {"id": 1, "start": 1.0, "end": 2.0, "text": "ple.com now"}],
+        }));
+        let out = v.to_string();
+        assert!(!out.contains("alice") && !out.contains("ple.com"), "{out}");
+        assert_eq!(v["segments"][1]["start"], 1.0, "the segments stay");
+        // Pieces without their leading space (a diarized answer's) are read
+        // space-joined too: a two-word name split between them is found
+        // only that way.
+        let name: Arc<dyn Guardrail> =
+            Arc::new(GuardrailChain::new(vec![Arc::new(PiiGuardrail::new(
+                vec![aisix_guardrails::PiiRule::new(
+                    "full_name",
+                    "John Smith",
+                    PiiAction::Mask,
+                    None,
+                )
+                .unwrap()],
+                aisix_core::models::GuardrailHookPoint::Both,
+                262_144,
+                false,
+            ))]));
+        let body = json!({
+            "text": "call John Smith now",
+            "segments": [{"type": "transcript.text.segment", "id": "seg_0", "speaker": "A",
+                          "start": 0.0, "end": 1.0, "text": "call John"},
+                         {"type": "transcript.text.segment", "id": "seg_1", "speaker": "A",
+                          "start": 1.0, "end": 2.0, "text": "Smith now"}],
+        });
+        let (rewritten, _) =
+            redact_transcription_response(name.as_ref(), &serde_json::to_vec(&body).unwrap())
+                .expect("must rewrite");
+        let out = String::from_utf8(rewritten).unwrap();
+        assert!(!out.contains("John") && !out.contains("Smith"), "{out}");
+
+        // Only the words carry it.
+        let v = mask(json!({
+            "text": "nothing here",
+            "words": words(&["alice@example.com"]),
+        }));
+        assert!(!v.to_string().contains("alice"), "{v}");
+
+        // Nothing matched: words, tokens and segments as written.
+        let clean = json!({
+            "text": "all clean",
+            "segments": [{"id": 0, "text": " all", "tokens": [1]}, {"id": 1, "text": " clean", "tokens": [2]}],
+            "words": words(&["all", "clean"]),
+        });
+        assert!(redact_transcription_response(
+            chain.as_ref(),
+            &serde_json::to_vec(&clean).unwrap()
+        )
+        .is_none());
+    }
+
+    /// The streamed form of a value split across two diarized segment
+    /// events: in neither alone, so the segment events lose their text.
+    #[test]
+    fn a_value_split_across_streamed_segments_is_masked() {
+        let chain = both();
+        let frame = |event: Value| format!("data: {event}\n\n");
+        let raw = [
+            frame(
+                json!({"type": "transcript.text.segment", "id": "seg_0", "speaker": "A",
+                         "start": 0.0, "end": 1.0, "text": "mail alice@exam"}),
+            ),
+            frame(
+                json!({"type": "transcript.text.segment", "id": "seg_1", "speaker": "A",
+                         "start": 1.0, "end": 2.0, "text": "ple.com now"}),
+            ),
+        ]
+        .concat();
+        let (rewritten, counts) =
+            redact_transcription_sse(chain.as_ref(), raw.as_bytes()).expect("must rewrite");
+        assert!(!counts.is_empty());
+        let out = String::from_utf8(rewritten).unwrap();
+        assert!(!out.contains("alice") && !out.contains("ple.com"), "{out}");
+        assert!(out.contains("\"speaker\":\"A\""), "the events stay: {out}");
     }
 
     // ── remote segment moderation (#932 bedrock follow-up) ──────────────

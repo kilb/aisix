@@ -2428,10 +2428,11 @@ struct TranscriptScan {
 }
 
 /// The caller-visible transcript text for output-guardrail scanning (#696):
-/// the JSON `text` field plus `segments[].text` (`json` / `verbose_json`
-/// response formats — segments are scanned too so a response carrying text
-/// only in segments can't bypass the check), or the raw body for the
-/// plain-text formats (`text` / `srt` / `vtt`).
+/// the JSON `text` field plus `segments[].text` and `words[].word`
+/// (`json` / `verbose_json` response formats — segments and words are
+/// scanned too so a response carrying text only in them can't bypass the
+/// check), or the raw body for the plain-text formats (`text` / `srt` /
+/// `vtt`).
 ///
 /// A streamed transcription (`event_stream`, the upstream answered SSE) is
 /// read event by event on the decoded text of each one
@@ -2459,6 +2460,10 @@ fn transcription_output_text(body: &[u8], event_stream: bool) -> TranscriptScan 
                     .filter_map(|s| s.get("text").and_then(|t| t.as_str())),
             );
         }
+        // The word timestamps spell the transcript too, and are what the mask
+        // reads them as ([`crate::redact::redact_transcription_response`]).
+        let words = crate::redact::transcription_words_text(&json);
+        parts.extend(words.as_deref());
         return TranscriptScan {
             text: parts.join("\n"),
             undecodable: false,
@@ -4124,6 +4129,18 @@ mod tests {
     /// exact bypass the file probe exists to close. Uses the header of a
     /// file ffmpeg produced (see `ebml::tests`), whose declared length is
     /// 7.008s.
+    /// A value only the word timestamps carry is still read: the scan is
+    /// what a block rule judges.
+    #[test]
+    fn the_transcript_scan_reads_the_word_timestamps() {
+        let body = serde_json::json!({
+            "text": "nothing here",
+            "words": [{"word": "alice@example.com", "start": 0.0, "end": 1.0}],
+        });
+        let scan = super::transcription_output_text(&serde_json::to_vec(&body).unwrap(), false);
+        assert!(scan.text.contains("alice@example.com"), "{:?}", scan.text);
+    }
+
     #[test]
     fn probing_reads_a_webm_upload() {
         let webm = crate::ebml::tests::REAL_FFMPEG_WEBM_HEADER;
