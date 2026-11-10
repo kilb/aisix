@@ -277,13 +277,15 @@ describe("model discovery in both dialects", () => {
     // `md-*` matches `md-alpha#acct-shared` by name — the grant is not what
     // keeps it out. The listing is, because the document says it is a
     // routing target. Named in the assertion so a list that simply returned
-    // nothing cannot pass.
+    // nothing cannot pass. `md-secret` is an ordinary model the pattern does
+    // reach (it is out of reach only for the explicit-list key), so it is
+    // listed here.
     const list = (await (
       await fetch(`${app.proxyUrl}/v1/models`, {
         headers: { authorization: `Bearer ${PATTERN_CALLER}` },
       })
     ).json()) as OpenAiList;
-    expect(list.data?.map((m) => m.id)).toEqual(["md-alpha", "md-bravo", "md-charlie"]);
+    expect(list.data?.map((m) => m.id)).toEqual(["md-alpha", "md-bravo", "md-charlie", "md-secret"]);
     expect(list.data?.map((m) => m.id)).not.toContain("md-alpha#acct-shared");
   }, 60_000);
 
