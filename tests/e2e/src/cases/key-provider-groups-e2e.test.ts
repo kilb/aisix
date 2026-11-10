@@ -118,6 +118,8 @@ describe("an API key routes only within its allowed provider groups", () => {
   let mockBStream: OpenAiUpstream | undefined;
   // Behind `groups-cache-b`, out of the grouped key's groups and cached.
   let mockCache: OpenAiUpstream | undefined;
+  // Behind the cached groups whose targets straddle both provider groups.
+  let mockMixed: OpenAiUpstream | undefined;
 
   beforeAll(async () => {
     const etcd = new EtcdClient();
@@ -134,6 +136,7 @@ describe("an API key routes only within its allowed provider groups", () => {
     mockAStream = await startOpenAiUpstream({ streamEvents: STREAM_EVENTS });
     mockBStream = await startOpenAiUpstream({ streamEvents: STREAM_EVENTS });
     mockCache = await startOpenAiUpstream({ pathBodies: PATH_BODIES });
+    mockMixed = await startOpenAiUpstream({ pathBodies: PATH_BODIES });
 
     app = await spawnApp();
     const seed = new SeedClient(etcd, app.etcdPrefix);
@@ -221,6 +224,63 @@ describe("an API key routes only within its allowed provider groups", () => {
       },
     });
 
+    // Two cached groups, each with one target in each provider group, both
+    // served by `mockMixed`. In `groups-cache-ip` the in-group target admits
+    // only 10.0.0.0/8, which this caller is not in; in `groups-cache-tag` only
+    // the out-of-group target carries the tag the request names.
+    const pkMixedAlpha = await seed.createProviderKey({
+      display_name: "pk-alpha-mixed",
+      secret: "sk-mock",
+      api_base: `${mockMixed.baseUrl}/v1`,
+      groups: ["grp-alpha"],
+    });
+    const pkMixedBeta = await seed.createProviderKey({
+      display_name: "pk-beta-mixed",
+      secret: "sk-mock",
+      api_base: `${mockMixed.baseUrl}/v1`,
+      groups: ["grp-beta"],
+    });
+    const mixedModel = (name: string, pk: string, extra: Record<string, unknown> = {}) =>
+      seed.createModel({
+        display_name: name,
+        provider: "openai",
+        model_name: "gpt-4o-mini",
+        provider_key_id: pk,
+        retries: 0,
+        ...extra,
+      });
+    await mixedModel("groups-ip-in", pkMixedAlpha.id, { allowed_cidrs: ["10.0.0.0/8"] });
+    await mixedModel("groups-ip-out", pkMixedBeta.id);
+    await mixedModel("groups-tag-in", pkMixedAlpha.id);
+    await mixedModel("groups-tag-out", pkMixedBeta.id);
+    await seed.createModel({
+      display_name: "groups-cache-ip",
+      routing: {
+        strategy: "failover",
+        targets: [{ model: "groups-ip-in" }, { model: "groups-ip-out" }],
+      },
+    });
+    await seed.createModel({
+      display_name: "groups-cache-tag",
+      routing: {
+        strategy: "failover",
+        targets: [
+          { model: "groups-tag-in", tags: ["tag-red"] },
+          { model: "groups-tag-out", tags: ["tag-blue"] },
+        ],
+      },
+    });
+    for (const model of ["groups-cache-ip", "groups-cache-tag"]) {
+      await seed.createCachePolicy({
+        name: `${model}-policy`,
+        enabled: true,
+        backend: "memory",
+        ttl_seconds: 300,
+        applies_to: `model:${model}`,
+        scope: "env",
+      });
+    }
+
     // Caller keys last; the grouped key is the readiness gate below.
     await seed.createApiKey({
       key_hash: sha256(OPEN_PLAINTEXT),
@@ -238,7 +298,9 @@ describe("an API key routes only within its allowed provider groups", () => {
   afterAll(async () => {
     await app?.exit();
     await Promise.all(
-      [mockA, mockB, mockADown, mockBUp, mockAStream, mockBStream, mockCache].map((u) => u?.close()),
+      [mockA, mockB, mockADown, mockBUp, mockAStream, mockBStream, mockCache, mockMixed].map((u) =>
+        u?.close(),
+      ),
     );
   });
 
@@ -408,6 +470,45 @@ describe("an API key routes only within its allowed provider groups", () => {
       expect(grouped.status, grouped.text).toBe(503);
       expect(mockCache!.receivedRequests.length - c0).toBe(1);
       expectNoLeak(grouped, endpoint);
+    },
+  );
+
+  // A cached answer skips dispatch, so the checks that admit a caller to it
+  // must narrow the same candidates dispatch would: the key's groups first,
+  // then the routing tags, then the client IP. A target outside the groups
+  // must not stand in for the allowlist or the tag of the one inside them.
+  test.for(["messages", "responses", "embeddings"] as Endpoint[])(
+    "%s: a cached answer is refused when the in-group target refuses this caller",
+    async (endpoint, ctx) => {
+      if (!etcdReachable || !app) {
+        ctx.skip();
+        return;
+      }
+      const cases: Array<[string, Record<string, string>, number]> = [
+        // The in-group target excludes this caller's address.
+        ["groups-cache-ip", {}, 403],
+        // Only the out-of-group target carries the requested tag.
+        ["groups-cache-tag", { "x-aisix-routing-tags": "tag-blue" }, 503],
+      ];
+      for (const [model, headers, refused] of cases) {
+        const text = `mixed-cache ${model} ${endpoint}`;
+        const m0 = mockMixed!.receivedRequests.length;
+        const stored = await send(endpoint, OPEN_PLAINTEXT, model, headers, text);
+        expect(stored.status, `${model}: ${stored.text}`).toBe(200);
+        expect(mockMixed!.receivedRequests.length - m0).toBe(1);
+        const again = await send(endpoint, OPEN_PLAINTEXT, model, headers, text);
+        expect(again.status, `${model}: ${again.text}`).toBe(200);
+        expect(mockMixed!.receivedRequests.length - m0, `${model}: served from the cache`).toBe(1);
+
+        // What dispatch tells the grouped key, for a request nothing cached.
+        const fresh = await send(endpoint, GROUPED_PLAINTEXT, model, headers, `${text} uncached`);
+        expect(fresh.status, `${model}: ${fresh.text}`).toBe(refused);
+        // The cached answer is refused the same way.
+        const grouped = await send(endpoint, GROUPED_PLAINTEXT, model, headers, text);
+        expect(grouped.status, `${model}: ${grouped.text}`).toBe(refused);
+        expect(mockMixed!.receivedRequests.length - m0).toBe(1);
+        expectNoLeak(grouped, `${endpoint} ${model}`);
+      }
     },
   );
 
