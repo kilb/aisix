@@ -496,6 +496,10 @@ describe("/v1/responses bridge: what an agent client needs from a non-OpenAI mod
       "Tools for spawning and managing sub-agents.\n\nSpawn a sub-agent.",
     );
     expect(sent.tools[1].function.parameters).toEqual(NAMESPACE_TOOL.tools[0]!.parameters);
+    // A function tool's `strict` is the Chat function definition's too: the
+    // value the caller set goes as sent, and an omitted one stays omitted.
+    expect(sent.tools[1].function.strict).toBe(false);
+    expect(sent.tools[0].function).not.toHaveProperty("strict");
     expect(sent.messages[1].tool_calls[0].function.name).toBe("multi_agent_v1__spawn_agent");
 
     const body = (await res.json()) as Record<string, any>;

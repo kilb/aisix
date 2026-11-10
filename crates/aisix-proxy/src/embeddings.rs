@@ -820,6 +820,10 @@ async fn dispatch(
     // target.
     *routing_out = crate::attempt::RoutingTelemetry::for_request(&model_entry.value.display_name)
         .with_trace(client_ctx.trace.clone());
+    // Input an attempt had been served before it failed part way (Titan
+    // embeds one text per upstream call): it is billed, and the answered
+    // calls are not sent again, so the failure ends the dispatch.
+    let served = std::sync::OnceLock::<u32>::new();
     let dispatched = crate::routing::dispatch_with_failover(
         state,
         snapshot,
@@ -828,12 +832,13 @@ async fn dispatch(
         &client_facing_model,
         &model_entry,
         routing_out,
-        |_| true,
+        |_| served.get().is_none(),
         |(answered, ..): &(Result<_, BridgeError>, String, String)| {
             answered.as_ref().err().map(ToString::to_string)
         },
         |target, timeouts| {
             let req = &req;
+            let served = &served;
             async move {
                 let provider =
                     crate::dispatch::require_provider(&target.model)?.to_ascii_lowercase();
@@ -860,12 +865,26 @@ async fn dispatch(
                         Err(e)
                     }
                     Err(e) => {
+                        if let Some(tokens) = aisix_gateway::take_served_input_tokens() {
+                            let _ = served.set(tokens);
+                            crate::attribution::note_served_before_failure(
+                                crate::attribution::ServedBeforeFailure {
+                                    prompt_tokens: tokens,
+                                    cost_usd: crate::usage_attr::request_cost_usd(
+                                        snapshot,
+                                        &target.id,
+                                        aisix_core::InputTokens::uncached_only(u64::from(tokens)),
+                                        0,
+                                    ),
+                                },
+                            );
+                        }
                         return Err(ProxyError::Bridge(crate::cooldown::note_failure(
                             &state.runtime_status,
                             &target.id,
                             target.model.cooldown.as_ref(),
                             e,
-                        )))
+                        )));
                     }
                 };
                 Ok((answered, provider, pk_entry.id.to_string()))
@@ -882,7 +901,9 @@ async fn dispatch(
     } = match dispatched {
         Ok(d) => d,
         Err(e) => {
-            reservation.commit_tokens(0).await;
+            reservation
+                .commit_tokens(served.get().copied().map_or(0, u64::from))
+                .await;
             return Err(e);
         }
     };

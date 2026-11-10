@@ -44,7 +44,7 @@
 //!   <https://www.rfc-editor.org/rfc/rfc6749#section-4.4>
 
 use aisix_gateway::{credential_fingerprint, BridgeError};
-use reqwest::Client;
+use reqwest::{Client, StatusCode};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -378,15 +378,20 @@ impl TokenMinter {
             let msg = format!("azure aad token mint upstream returned HTTP {status}: {truncated}");
             // Mirror Vertex audit MEDIUM (ai-gateway#387): 5xx is
             // transient upstream — should surface UpstreamStatus
-            // (cooldown semantics) with the Retry-After hint. 4xx
-            // (invalid_client / unauthorized_client / revoked secret)
-            // is operator-actionable, stays Config.
-            return Err(if status.is_server_error() {
-                BridgeError::upstream_status_with_retry_after(status.as_u16(), msg, retry_after)
-                    .with_body_read_error(read_error)
-            } else {
-                BridgeError::Config(msg)
-            });
+            // (cooldown semantics) with the Retry-After hint. So is 429:
+            // Entra throttles a client_credentials grant with
+            // `429 Too Many Requests` and `Retry-After`
+            // (<https://learn.microsoft.com/en-us/entra/msal/dotnet/advanced/client-and-server-throttling>).
+            // Every other 4xx (invalid_client / unauthorized_client /
+            // revoked secret) is operator-actionable, stays Config.
+            return Err(
+                if status.is_server_error() || status == StatusCode::TOO_MANY_REQUESTS {
+                    BridgeError::upstream_status_with_retry_after(status.as_u16(), msg, retry_after)
+                        .with_body_read_error(read_error)
+                } else {
+                    BridgeError::Config(msg)
+                },
+            );
         }
         let parsed: TokenResponse = resp.json().await.map_err(|e| {
             aisix_gateway::log_body_read_causes(&e);
@@ -767,6 +772,36 @@ mod tests {
             } => {
                 assert_eq!(status, 503);
                 assert_eq!(retry_after, Some(Duration::from_secs(45)));
+            }
+            other => panic!("expected UpstreamStatus, got {other:?}"),
+        }
+    }
+
+    /// Entra throttles a client_credentials grant with `429` and
+    /// `Retry-After` (MSAL "client and server throttling"); that is the
+    /// identity platform asking for a back-off, not a misconfigured key, so
+    /// it reaches the cooldown layer as a `429` with its hint.
+    #[tokio::test]
+    async fn token_endpoint_429_surfaces_as_upstream_status_with_retry_hint() {
+        let server = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("Retry-After", "60")
+                    .set_body_string(r#"{"error":"temporarily_unavailable"}"#),
+            )
+            .mount(&server)
+            .await;
+        let minter = TokenMinter::new(Client::new()).with_token_endpoint_override(server.uri());
+        let err = minter.get_token(&sample_creds()).await.err().unwrap();
+        match err {
+            BridgeError::UpstreamStatus {
+                status,
+                retry_after,
+                ..
+            } => {
+                assert_eq!(status, 429);
+                assert_eq!(retry_after, Some(Duration::from_secs(60)));
             }
             other => panic!("expected UpstreamStatus, got {other:?}"),
         }

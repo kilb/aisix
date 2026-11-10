@@ -1148,6 +1148,16 @@ pub trait Bridge: Send + Sync + 'static {
         false
     }
 
+    /// Whether the upstream `ctx` dispatches to carries images and documents
+    /// inside a tool result, read off a `role:"tool"` message's content
+    /// parts. A translation from a protocol whose tool results hold media
+    /// (Anthropic Messages) keeps them only when this is true; Chat
+    /// Completions takes text alone in a `tool` message and answers an image
+    /// there with a 400. The default is `false`.
+    fn reads_tool_result_media(&self, _ctx: &BridgeContext) -> bool {
+        false
+    }
+
     /// Non-streaming call: one request, one response.
     async fn chat(
         &self,

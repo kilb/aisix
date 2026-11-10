@@ -686,6 +686,22 @@ describe("decision endpoints e2e: /v1/systemone + /v1/decisions", () => {
     expect(row.get("cached_prompt_tokens")).toBe("100");
   });
 
+  // A `safety_identifier` names the end user for abuse detection and changes
+  // nothing about the question; System One has no field for it, so the
+  // converted request goes without it rather than being refused.
+  test("Decisions to a System One upstream: a safety_identifier is left out, not refused", async (ctx) => {
+    if (!ready(ctx)) return;
+    const from = typesafe!.receivedRequests.length;
+    const res = await post("/v1/decisions", decisionsBody("dec-typesafe", { safety_identifier: "u1" }));
+
+    expect(res.status).toBe(200);
+    const sent = JSON.parse(onlyCallSince(typesafe!, from).body);
+    expect(sent.state).toBe("The API returns 500 on every call since this morning.");
+    expect(Object.keys(sent.questions)).toEqual(["is_bug", "team", "severity"]);
+    expect(sent).not.toHaveProperty("safety_identifier");
+    expect(res.body.model).toBe("dec-typesafe");
+  });
+
   test("conversions that would change the question are refused before the upstream", async (ctx) => {
     if (!ready(ctx)) return;
     const tsFrom = typesafe!.receivedRequests.length;
@@ -706,10 +722,6 @@ describe("decision endpoints e2e: /v1/systemone + /v1/decisions", () => {
     });
     expect(image.status).toBe(400);
     expect(image.body.error.message).toContain("input_image");
-
-    const sid = await post("/v1/decisions", decisionsBody("dec-typesafe", { safety_identifier: "u1" }));
-    expect(sid.status).toBe(400);
-    expect(sid.body.error.message).toContain("safety_identifier");
 
     const single = await post("/v1/systemone", {
       model: "dec-openai",
