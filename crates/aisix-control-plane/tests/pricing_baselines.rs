@@ -346,6 +346,106 @@ async fn a_catalogue_baseline_carries_its_provenance_and_later_dated_entries() {
 }
 
 #[tokio::test]
+async fn a_manual_card_is_refused_at_the_field_that_breaks_it() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let admin = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let m = model(&cp, &admin, "bl-fields-3e9").await;
+    let now = db_now(&cp).await;
+    let version = pricing_version(&cp).await;
+    let band = |above: Value, rates: Value| json!({"above_input_tokens": above, "rates": rates});
+    let two = json!({"input": "1", "output": "2"});
+    for (card, at) in [
+        // A rate the card cannot read, in a tier other than the default.
+        (
+            json!({"default": {"base": two}, "batch": {"base": {"input": "0,5", "output": "1"}}}),
+            "/card/batch/base/input",
+        ),
+        // A rate written as a JSON number rather than its decimal text.
+        (
+            json!({"default": {"base": {"input": 1, "output": "2"}}}),
+            "/card/default/base/input",
+        ),
+        // A threshold that is no token count.
+        (
+            json!({"default": {"base": two, "long_context": [band(json!("200k"), two.clone())]}}),
+            "/card/default/long_context/0/above_input_tokens",
+        ),
+        // A tier without a rate the default tier's base carries.
+        (
+            json!({"default": {"base": {"input": "1", "output": "2", "cache_read": "0.1"}},
+                   "batch": {"base": {"input": "0.5", "output": "1"}}}),
+            "/card/batch/base/cache_read",
+        ),
+        // A band without a rate its own tier's base carries.
+        (
+            json!({"default": {"base": {"input": "1", "output": "2", "cache_read": "0.1"},
+                               "long_context": [band(json!(200000), two.clone())]}}),
+            "/card/default/long_context/0/rates/cache_read",
+        ),
+        // Bands at other thresholds than the default tier's.
+        (
+            json!({"default": {"base": two, "long_context": [band(json!(200000), two.clone())]},
+                   "batch": {"base": two, "long_context": [band(json!(100000), two.clone())]}}),
+            "/card/batch/long_context",
+        ),
+        // Thresholds out of order, and one of 0.
+        (
+            json!({"default": {"base": two, "long_context": [
+                band(json!(200000), two.clone()), band(json!(100000), two.clone())]}}),
+            "/card/default/long_context/1/above_input_tokens",
+        ),
+        (
+            json!({"default": {"base": two, "long_context": [band(json!(0), two.clone())]}}),
+            "/card/default/long_context/0/above_input_tokens",
+        ),
+        // A rate a card needs, left out of a band.
+        (
+            json!({"default": {"base": two, "long_context": [band(json!(200000), json!({"input": "2"}))]}}),
+            "/card/default/long_context/0/rates/output",
+        ),
+        // A tier name no served tier selects.
+        (
+            json!({"default": {"base": two}, "auto": {"base": two}}),
+            "/card/auto",
+        ),
+    ] {
+        let r = post(
+            &cp,
+            &admin,
+            json!({"model_id": m, "effective_from": now, "card": card, "note": "x"}),
+        )
+        .await;
+        assert_422_at(&r, at);
+        let message = r.body["details"][0]["message"].as_str().unwrap_or_default();
+        assert!(
+            !message.is_empty() && !message.contains("tier "),
+            "{at}: {r:?}"
+        );
+    }
+    assert_eq!(pricing_version(&cp).await, version, "nothing was written");
+
+    // The same shapes, written by the rules, are one card: two tiers, each
+    // with a band at the same threshold.
+    let card = json!({
+        "default": {"base": {"input": "3", "output": "15", "cache_read": "0.3"},
+                    "long_context": [band(json!(200000),
+                        json!({"input": "6", "output": "22.5", "cache_read": "0.6"}))]},
+        "batch": {"base": {"input": "1.5", "output": "7.5", "cache_read": "0.15"},
+                  "long_context": [band(json!(200000),
+                      json!({"input": "3", "output": "11.25", "cache_read": "0.3"}))]},
+    });
+    let body = write(
+        &cp,
+        &admin,
+        json!({"model_id": m, "effective_from": now, "card": card.clone(), "note": "x"}),
+    )
+    .await;
+    assert_eq!(body["revision"]["card"], card);
+}
+
+#[tokio::test]
 async fn a_baseline_is_a_card_or_a_catalogue_key() {
     let cat = catalogue(
         "2026-11-06",
@@ -367,18 +467,25 @@ async fn a_baseline_is_a_card_or_a_catalogue_key() {
         // Neither.
         json!({"model_id": m, "effective_from": now, "note": note}),
         json!({"model_id": m, "effective_from": now, "card": null, "note": note}),
-        // Cards that are no rate card, or that break its rules: no default
-        // tier, a negative rate, a rate that is no number.
+        // Cards that are no rate card, or that break a rule of the whole
+        // card: no default tier.
         json!({"model_id": m, "effective_from": now, "note": note,
                "card": {"flex": {"base": {"input": "1", "output": "2"}}}}),
-        json!({"model_id": m, "effective_from": now, "note": note,
-               "card": {"default": {"base": {"input": "-1", "output": "2"}}}}),
-        json!({"model_id": m, "effective_from": now, "note": note,
-               "card": {"default": {"base": {"input": "abc", "output": "2"}}}}),
         json!({"model_id": m, "effective_from": now, "note": note, "card": "4/20"}),
     ] {
         let r = post(&cp, &admin, body.clone()).await;
         assert_422_at(&r, "/card");
+    }
+    // A rate that is negative or no number is refused at its own field.
+    for rate in ["-1", "abc"] {
+        let r = post(
+            &cp,
+            &admin,
+            json!({"model_id": m, "effective_from": now, "note": note,
+                   "card": {"default": {"base": {"input": rate, "output": "2"}}}}),
+        )
+        .await;
+        assert_422_at(&r, "/card/default/base/input");
     }
     for key in ["openai/nope-7c1", "nope", "anthropic/either-7c1", "openai/"] {
         let r = post(

@@ -33,7 +33,10 @@
 
 use std::collections::HashMap;
 
-use aisix_pricing::{Catalogue, CatalogueEntry, RateCard, ENGINE_VERSION};
+use aisix_pricing::{
+    Catalogue, CatalogueEntry, Dimension, Rate, RateCard, RateCardError, ServiceTier,
+    ENGINE_VERSION,
+};
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::Json;
@@ -65,6 +68,165 @@ fn refused(path: &str, message: impl Into<String>) -> ApiError {
         path: path.to_string(),
         message: message.into(),
     }])
+}
+
+/// A dimension's name as the Dashboard's price forms label it.
+fn dimension_words(d: Dimension) -> &'static str {
+    match d {
+        Dimension::Input => "输入",
+        Dimension::Output => "输出",
+        Dimension::CacheRead => "缓存读",
+        Dimension::CacheWrite => "缓存写",
+        Dimension::CacheWrite1h => "1 小时缓存写",
+        Dimension::Reasoning => "推理",
+        Dimension::AudioInput => "音频输入",
+        Dimension::AudioOutput => "音频输出",
+        Dimension::ImageInput => "图像输入",
+        Dimension::ImageOutput => "图像输出",
+        Dimension::WebSearch => "联网搜索",
+    }
+}
+
+/// One JSON Pointer segment (RFC 6901): `~` and `/` escaped.
+fn pointer_segment(s: &str) -> String {
+    s.replace('~', "~0").replace('/', "~1")
+}
+
+/// A card's tier, as a pointer under `/card`.
+fn tier_path(tier: &ServiceTier) -> String {
+    format!("/card/{}", pointer_segment(tier.as_str()))
+}
+
+/// The refusal of a card that does not decode, at the field the decode
+/// stopped at: `/card/default/base/input` for a rate that is no amount, with
+/// what an amount looks like; `/card` with the decoder's words for anything
+/// else it cannot place.
+fn undecodable(card: &Value, e: serde_path_to_error::Error<serde_json::Error>) -> ApiError {
+    use serde_path_to_error::Segment;
+    let mut path = String::from("/card");
+    for segment in e.path().iter() {
+        match segment {
+            Segment::Seq { index } => path.push_str(&format!("/{index}")),
+            Segment::Map { key } => path.push_str(&format!("/{}", pointer_segment(key))),
+            Segment::Enum { variant } => path.push_str(&format!("/{}", pointer_segment(variant))),
+            Segment::Unknown => break,
+        }
+    }
+    // A field left out is refused at the field itself (serde's own wording,
+    // `missing field `input``), not at the map it is missing from.
+    let inner = e.inner().to_string();
+    if let Some(field) = inner
+        .strip_prefix("missing field `")
+        .and_then(|rest| rest.split_once('`'))
+        .map(|(field, _)| field)
+    {
+        let message = if field == "base" || field == "rates" {
+            "缺少这一档的价格"
+        } else {
+            "必须填写这一项"
+        };
+        return refused(&format!("{path}/{}", pointer_segment(field)), message);
+    }
+    // The card itself is no leaf: a string where a card belongs is no price.
+    let leaf = (path != "/card")
+        .then(|| card.pointer(&path["/card".len()..]))
+        .flatten();
+    let message = match leaf {
+        Some(Value::String(text)) => match Rate::parse(text) {
+            Err(RateCardError::RateTooLarge) => "价格超出上限".to_string(),
+            Err(_) => "价格应是不小于 0 的美元数，最多 6 位小数".to_string(),
+            Ok(_) => format!("价目卡不合法：{}", e.inner()),
+        },
+        Some(_) if path.ends_with("/above_input_tokens") => {
+            "长上下文门槛应是正整数（输入 token 数）".to_string()
+        }
+        Some(Value::Number(_)) => "价格应写成十进制字符串，例如 \"2.5\"".to_string(),
+        _ => format!("价目卡不合法：{}", e.inner()),
+    };
+    refused(&path, message)
+}
+
+/// A card read from an operator's own `value`, refused at the field that
+/// breaks it ([`undecodable`]) or, once it decodes, at the part a rule of
+/// [`RateCard::validate`] refuses ([`card_refusal`]).
+fn manual_card(value: &Value) -> Result<RateCard, ApiError> {
+    let card: RateCard =
+        serde_path_to_error::deserialize(value).map_err(|e| undecodable(value, e))?;
+    card.validate().map_err(|e| card_refusal(&card, &e))?;
+    Ok(card)
+}
+
+/// The refusal of `card` for `e`, which its [`RateCard::validate`] returned,
+/// at the part it names: a tier's missing rate at
+/// `/card/<tier>/base/<dimension>`, a band's at
+/// `/card/<tier>/long_context/<n>/rates/<dimension>`, a threshold out of order
+/// at `/card/<tier>/long_context/<n>/above_input_tokens`, bands unlike the
+/// default tier's at `/card/<tier>/long_context`, a bad tier name at
+/// `/card/<tier>`. Anything else is the whole card's, at `/card`.
+fn card_refusal(card: &RateCard, e: &RateCardError) -> ApiError {
+    let band_index = |tier: &ServiceTier, above: u64| {
+        card.0.get(tier).and_then(|t| {
+            t.long_context
+                .iter()
+                .position(|b| b.above_input_tokens == above)
+        })
+    };
+    match e {
+        RateCardError::TierMissingRate { tier, dimension } => refused(
+            &format!("{}/base/{dimension}", tier_path(tier)),
+            format!(
+                "标准档有{}价格，这个档位也必须填写",
+                dimension_words(*dimension)
+            ),
+        ),
+        RateCardError::BandMissingRate {
+            tier,
+            above,
+            dimension,
+        } => match band_index(tier, *above) {
+            Some(n) => refused(
+                &format!("{}/long_context/{n}/rates/{dimension}", tier_path(tier)),
+                format!(
+                    "这个档位的基础价或标准档同一门槛的分段有{}价格，这一分段也必须填写",
+                    dimension_words(*dimension)
+                ),
+            ),
+            None => refused("/card", format!("价目卡不合法：{e}")),
+        },
+        RateCardError::BandsDifferFromDefault { tier } => refused(
+            &format!("{}/long_context", tier_path(tier)),
+            "每个档位的长上下文门槛必须与标准档的完全相同",
+        ),
+        RateCardError::ZeroBandThreshold | RateCardError::BandsNotRising => {
+            // The first band in the order `validate` walks them that breaks
+            // the rule: every band before it passed every check.
+            let found = card.0.iter().find_map(|(tier, rates)| {
+                let mut below = 0;
+                rates.long_context.iter().enumerate().find_map(|(n, b)| {
+                    let bad = b.above_input_tokens == 0 || b.above_input_tokens <= below;
+                    below = b.above_input_tokens;
+                    bad.then_some((tier, n))
+                })
+            });
+            let message = if matches!(e, RateCardError::ZeroBandThreshold) {
+                "长上下文门槛必须大于 0"
+            } else {
+                "同一档位的长上下文门槛必须逐个递增"
+            };
+            match found {
+                Some((tier, n)) => refused(
+                    &format!("{}/long_context/{n}/above_input_tokens", tier_path(tier)),
+                    message,
+                ),
+                None => refused("/card", message),
+            }
+        }
+        RateCardError::BadTierName(name) => refused(
+            &format!("/card/{}", pointer_segment(name)),
+            "档位名称只能由小写字母、数字、_ 和 - 组成（最长 32 个字符），且不能是 standard 或 auto",
+        ),
+        _ => refused("/card", format!("价目卡不合法：{e}")),
+    }
 }
 
 /// UTC midnight of a catalogue date: when an entry dated that day starts.
@@ -281,7 +443,7 @@ async fn write_row(
     starts_now_or_later(&mut *conn, row.effective_from).await?;
     row.card
         .validate()
-        .map_err(|e| refused("/card", format!("价目卡不合法：{e}")))?;
+        .map_err(|e| card_refusal(&row.card, &e))?;
     let live: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM gw_resources WHERE kind = $1 AND id = $2 AND NOT deleted)",
     )
@@ -699,8 +861,7 @@ pub async fn create(
             if note.chars().count() > MAX_NOTE_CHARS {
                 return Err(refused("/note", "说明最多 500 个字符"));
             }
-            let card: RateCard = serde_json::from_value(card)
-                .map_err(|e| refused("/card", format!("价目卡不合法：{e}")))?;
+            let card = manual_card(&card)?;
             let row = NewBaseline {
                 model_id,
                 effective_from,
