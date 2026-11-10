@@ -15,6 +15,15 @@ test("parseUtc reads a UTC minute, with optional seconds and a T or Z", () => {
   for (const bad of ["", "2030-01-02", "2030-13-45 03:04", "02/01/2030 03:04"]) assert.equal(parseUtc(bad), null, bad);
 });
 
+test("parseUtc refuses a day or a time the calendar does not have, rather than moving it", () => {
+  for (const bad of ["2027-02-29 00:00", "2027-04-31 10:00", "2027-02-30 12:00", "2027-01-01 24:00", "2027-01-01 23:60", "2027-06-31T08:15:00Z"]) {
+    assert.equal(parseUtc(bad), null, bad);
+  }
+  // A leap year's 29 February, and the last minute of a month, are days like any other.
+  assert.equal(parseUtc("2028-02-29 00:00"), "2028-02-29T00:00:00.000Z");
+  assert.equal(parseUtc("2027-04-30 23:59:59"), "2027-04-30T23:59:59.000Z");
+});
+
 test("an invalid typed time is `invalid` and nothing is sent", async () => {
   let sent = 0;
   const r = await sendAt(resolver(false, [null]), async () => void sent++);

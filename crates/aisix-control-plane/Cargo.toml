@@ -72,6 +72,9 @@ tower = { version = "0.5", features = ["util"] }
 # TCP keepalive on the gateway listener's accepted sockets, which tokio does
 # not set (0.5.10 in Cargo.lock).
 socket2 = "0.5"
+# A manual price card is refused at the field that breaks it, read off the
+# decode error's path (0.1.20 in Cargo.lock, which axum already uses).
+serde_path_to_error = "0.1"
 # Release versions a heartbeat reports, compared with this build's
 # (1.0.28 in Cargo.lock).
 semver = "1"

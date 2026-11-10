@@ -1397,7 +1397,7 @@ async fn a_bad_price_is_422_with_the_field_path() {
             json!({}),
         ))
         .await,
-        "/card",
+        "/card/default/base/input",
     );
     // Both a card and a catalogue key, or neither.
     assert_422_at(

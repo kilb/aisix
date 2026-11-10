@@ -61,6 +61,13 @@
 //! model in [`FREE_OUTPUT`] whose `price_comments` say in so many words that
 //! its output is free, which becomes `output: 0`.
 //!
+//! What a whole parse may build is bounded too, since a card's size is the
+//! product of its tiers and the union of their bands, once per date: past
+//! [`MAX_IMPORT_PROPOSALS`] proposals or [`MAX_IMPORT_WORK`] steps the body is
+//! refused at `/data`, before the card that would cross either is built. The
+//! upload, the library's fetch and every read of the stored library parse
+//! through the same [`parse`], so the bound holds for all three.
+//!
 //! # Uploads and proposals
 //!
 //! `POST /admin/pricing/imports` writes the batch and its proposals in one
@@ -119,6 +126,19 @@ pub const MAX_IMPORT_PROPOSALS: usize = 10_000;
 /// the real dataset's largest is 2, and a body up to [`MAX_IMPORT_BYTES`]
 /// could otherwise ask for hundreds of thousands of bands in one card.
 pub const MAX_TIERS_PER_FIELD: usize = 64;
+
+/// The most work one parse may do, counted in the steps that grow faster
+/// than the body: each dated proposal's walk over its model's price entries
+/// and variants, each price field read (one more per tier it carries), and
+/// each rate set a card is built of (its tiers times its bands, plus the
+/// base). The per-field cap alone does not bound a card: its bands are the
+/// union of every tier's starts and every tier carries all of them, so a small
+/// body naming many tiers asks for their product, once per date. The
+/// published dataset (`LIBRARY_URL`, read on 2026-11-10: 2,353 proposals)
+/// takes about 13,000, and a parse past the limit is refused before the card
+/// that would cross it is built. At the limit a parse holds at most this many
+/// rate sets, under 100 MiB.
+pub const MAX_IMPORT_WORK: u64 = 500_000;
 
 /// Why a proposal cannot be confirmed as it stands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -216,14 +236,20 @@ fn refused(path: &str, message: impl Into<String>) -> ApiError {
 /// documentation.
 ///
 /// Refused at `/data`: a body that is not an array of providers with their
-/// models, one that prices nothing, and one that makes more than
-/// [`MAX_IMPORT_PROPOSALS`] proposals.
+/// models, one that prices nothing, one that makes more than
+/// [`MAX_IMPORT_PROPOSALS`] proposals, and one whose cards would take more
+/// than [`MAX_IMPORT_WORK`] to build. Both limits are checked before the
+/// cards that would cross them are built.
 pub fn parse(data: &RawValue, now: DateTime<Utc>) -> Result<Vec<ParsedProposal>, ApiError> {
     let unrecognised = || refused("/data", "不是可识别的价格数据集");
     let providers: Vec<Provider<'_>> =
         serde_json::from_str(data.get()).map_err(|_| unrecognised())?;
     let today = now.date_naive();
     let mut proposals = Vec::new();
+    let mut budget = Budget {
+        proposals: MAX_IMPORT_PROPOSALS,
+        work: MAX_IMPORT_WORK,
+    };
     for provider in &providers {
         // The page is shown as a link beside the attestation. Anything but a
         // page on the web is dropped rather than stored: a `javascript:` or
@@ -239,15 +265,18 @@ pub fn parse(data: &RawValue, now: DateTime<Utc>) -> Result<Vec<ParsedProposal>,
             let comments = model.price_comments.as_deref();
             let entry = (provider.id.as_str(), model.id.as_str());
             let aliases = aliases(&model.id, model.matches.as_ref());
-            for (effective_from, card, flags, dropped) in
-                model_proposals(&entries, variants, today, entry, comments)
-            {
-                if proposals.len() == MAX_IMPORT_PROPOSALS {
-                    return Err(refused(
+            let dated = model_proposals(&entries, variants, today, entry, comments, &mut budget)
+                .map_err(|over| match over {
+                    Over::Proposals => refused(
                         "/data",
                         format!("价格数据集产生的提议超过 {MAX_IMPORT_PROPOSALS} 条"),
-                    ));
-                }
+                    ),
+                    Over::Work => refused(
+                        "/data",
+                        "价格数据集展开后的价格过多（服务档位、长上下文分段与生效日期的组合超过上限）",
+                    ),
+                })?;
+            for (effective_from, card, flags, dropped) in dated {
                 proposals.push(ParsedProposal {
                     provider: provider.id.clone(),
                     model: model.id.clone(),
@@ -1342,16 +1371,45 @@ fn conditionals(prices: &RawValue) -> Option<Vec<Conditional<'_>>> {
 
 /// One proposal of a model: its start (`None` at upload), card, flags, and
 /// the fields left off the card.
-type Dated = (Option<DateTime<Utc>>, Option<RateCard>, Vec<Flag>, Vec<String>);
+type Dated = (
+    Option<DateTime<Utc>>,
+    Option<RateCard>,
+    Vec<Flag>,
+    Vec<String>,
+);
+
+/// What is left of one parse's limits: proposals, and work as
+/// [`MAX_IMPORT_WORK`] counts it.
+struct Budget {
+    proposals: usize,
+    work: u64,
+}
+
+/// Which limit a parse ran out of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Over {
+    Proposals,
+    Work,
+}
+
+impl Budget {
+    /// Takes `steps` of work, or refuses without taking any.
+    fn spend(&mut self, steps: u64) -> Result<(), Over> {
+        self.work = self.work.checked_sub(steps).ok_or(Over::Work)?;
+        Ok(())
+    }
+}
 
 /// One model's proposals: for the moment of upload and for each later date.
+/// Takes them, and the work of each, from `budget` before building any.
 fn model_proposals(
     entries: &[Conditional<'_>],
     variants: &[Variant<'_>],
     today: NaiveDate,
     entry: (&str, &str),
     comments: Option<&str>,
-) -> Vec<Dated> {
+    budget: &mut Budget,
+) -> Result<Vec<Dated>, Over> {
     let entry_conditions: Vec<Condition> = entries
         .iter()
         .map(|e| Condition::of(e.constraint.as_ref()))
@@ -1376,6 +1434,12 @@ fn model_proposals(
             Condition::Always | Condition::From(_) => {}
         }
     }
+    // One proposal now and one per later date, each walking every entry and
+    // variant of the model.
+    let dates = 1 + later.len();
+    budget.proposals = budget.proposals.checked_sub(dates).ok_or(Over::Proposals)?;
+    let walk = (entries.len() + variants.len()) as u64;
+    budget.spend((dates as u64).saturating_mul(walk))?;
     std::iter::once(None)
         .chain(later.into_iter().map(Some))
         .map(|from| {
@@ -1420,13 +1484,13 @@ fn model_proposals(
                 tiers.insert(tier, resolved);
             }
             let mut dropped = Vec::new();
-            let card = card(&tiers, entry, comments, &mut flags, &mut dropped);
-            (
+            let card = card(&tiers, entry, comments, &mut flags, &mut dropped, budget)?;
+            Ok((
                 from.map(|d| d.and_time(NaiveTime::MIN).and_utc()),
                 card,
                 flags.into_iter().collect(),
                 dropped,
-            )
+            ))
         })
         .collect()
 }
@@ -1662,20 +1726,23 @@ fn rates(prices: &BTreeMap<Dimension, Rate>) -> Option<Rates> {
 
 /// The card `tiers` (each tier's resolved price map) come to, adding to
 /// `flags` what keeps them from one and to `dropped` every field left off it,
-/// by the dataset's own name.
+/// by the dataset's own name. Each field it reads and each rate set it builds
+/// is taken from `budget` first.
 fn card(
     tiers: &BTreeMap<ServiceTier, PriceMap<'_>>,
     entry: (&str, &str),
     comments: Option<&str>,
     flags: &mut BTreeSet<Flag>,
     dropped: &mut Vec<String>,
-) -> Option<RateCard> {
+    budget: &mut Budget,
+) -> Result<Option<RateCard>, Over> {
     let mut priced: BTreeMap<&ServiceTier, BTreeMap<Dimension, Price>> = BTreeMap::new();
     // One field of several tiers is one field left off, named once.
     let mut left_off: BTreeSet<&str> = BTreeSet::new();
     for (tier, fields) in tiers {
         let prices = priced.entry(tier).or_default();
         for (field, value) in fields {
+            budget.spend(1)?;
             let Some((dimension, per)) = dimension(field) else {
                 flags.insert(Flag::UnsupportedField);
                 if left_off.insert(field) {
@@ -1685,6 +1752,7 @@ fn card(
             };
             match Price::read(value, per) {
                 Ok(price) => {
+                    budget.spend(price.starts().count() as u64)?;
                     prices.insert(dimension, price);
                 }
                 Err(Unreadable::Number) => {
@@ -1724,12 +1792,14 @@ fn card(
         }
     }
     if flags.contains(&Flag::BadNumber) {
-        return None;
+        return Ok(None);
     }
     let thresholds: BTreeSet<u64> = priced
         .values()
         .flat_map(|prices| prices.values().flat_map(Price::starts))
         .collect();
+    // Every tier carries every band: the card is their product.
+    budget.spend((priced.len() as u64).saturating_mul(thresholds.len() as u64 + 1))?;
     let card = priced
         .into_iter()
         .map(|(tier, prices)| {
@@ -1760,13 +1830,13 @@ fn card(
         })
         .collect::<Option<BTreeMap<_, _>>>()
         .map(RateCard);
-    match card {
+    Ok(match card {
         Some(card) if card.validate().is_ok() => Some(card),
         _ => {
             flags.insert(Flag::InvalidCard);
             None
         }
-    }
+    })
 }
 
 #[cfg(test)]
@@ -2378,6 +2448,116 @@ mod tests {
             stored_flags(json!({"x": 1})),
             vec![r#"{"x":1}"#.to_string()]
         );
+    }
+
+    /// One model priced in the default tier and `named` more service tiers,
+    /// each tier's input price carrying [`MAX_TIERS_PER_FIELD`] tiers at
+    /// starts no other tier shares, from upload on and from each of `later`
+    /// later days. Every field is within its cap; the card is not.
+    fn amplifying(named: usize, later: usize) -> String {
+        let input = |tier: usize| {
+            let tiers = (1..=MAX_TIERS_PER_FIELD)
+                .map(|i| format!(r#"{{"start":{},"price":2}}"#, tier * 1000 + i))
+                .collect::<Vec<_>>()
+                .join(",");
+            format!(r#"{{"base":1,"tiers":[{tiers}]}}"#)
+        };
+        let variants = (1..=named)
+            .map(|n| {
+                format!(
+                    r#"{{"when":{{"service_tier":"t{n}"}},"prices":{{"input_mtok":{}}}}}"#,
+                    input(n)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let dated = (1..=later)
+            .map(|d| {
+                let day = now().date_naive() + chrono::Days::new(d as u64);
+                format!(
+                    r#",{{"constraint":{{"start_date":"{day}"}},"prices":{{"input_mtok":{},"output_mtok":{d}}}}}"#,
+                    input(0)
+                )
+            })
+            .collect::<String>();
+        dataset(&format!(
+            r#"{{"id":"wide","prices":[{{"prices":{{"input_mtok":{},"output_mtok":1}}}}{dated}],"price_variants":[{variants}]}}"#,
+            input(0)
+        ))
+    }
+
+    #[test]
+    fn a_body_whose_cards_multiply_out_is_refused_before_they_are_built() {
+        // The boundary is written out, so moving the limit fails here first.
+        assert_eq!(MAX_IMPORT_WORK, 500_000);
+        // 41 tiers × (41 × 64 bands + the base) = 107,625 rate sets a card,
+        // five cards (now and four later days): over the limit, from a body
+        // of a few hundred KiB that every per-field cap admits.
+        let body = amplifying(40, 4);
+        assert!(body.len() < 512 << 10, "{} bytes", body.len());
+        let err = parse(&raw(&body), now()).expect_err("refused");
+        assert_eq!(err.status.as_u16(), 422, "{err:?}");
+        assert_eq!(
+            err.details
+                .iter()
+                .map(|d| d.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/data"]
+        );
+        assert!(err.details[0].message.contains("过多"), "{err:?}");
+
+        // The same shape a size smaller is a dataset like any other: every
+        // tier carries every band, and each card validates.
+        let all = proposals(&amplifying(3, 2));
+        assert_eq!(all.len(), 3);
+        for p in &all {
+            assert!(p.flags.is_empty(), "{:?}", p.flags);
+            let card = p.card.as_ref().expect("a card");
+            assert_eq!(card.0.len(), 4);
+            for tier in card.0.values() {
+                assert_eq!(tier.long_context.len(), 4 * MAX_TIERS_PER_FIELD);
+            }
+            card.validate().expect("the card validates");
+        }
+    }
+
+    #[test]
+    fn a_model_is_refused_before_any_of_its_cards_is_built() {
+        let text = amplifying(1, 2);
+        let providers: Vec<Provider<'_>> = serde_json::from_str(&text).unwrap();
+        let model = &providers[0].models[0];
+        let entries = conditionals(model.prices).unwrap();
+        let variants = model.price_variants.as_deref().unwrap_or_default();
+        let run = |budget: &mut Budget| {
+            model_proposals(
+                &entries,
+                variants,
+                now().date_naive(),
+                ("p", "wide"),
+                None,
+                budget,
+            )
+        };
+        // Three dates with two proposals left: refused with the work untouched.
+        let mut budget = Budget {
+            proposals: 2,
+            work: MAX_IMPORT_WORK,
+        };
+        assert_eq!(run(&mut budget).err(), Some(Over::Proposals));
+        assert_eq!(budget.work, MAX_IMPORT_WORK);
+        // What the three cards cost, measured on a budget that has it ...
+        let mut budget = Budget {
+            proposals: 3,
+            work: MAX_IMPORT_WORK,
+        };
+        assert_eq!(run(&mut budget).map(|d| d.len()), Ok(3));
+        let cost = MAX_IMPORT_WORK - budget.work;
+        // ... and one step short of it is refused, never overdrawn.
+        let mut budget = Budget {
+            proposals: 3,
+            work: cost - 1,
+        };
+        assert_eq!(run(&mut budget).err(), Some(Over::Work));
     }
 
     #[test]

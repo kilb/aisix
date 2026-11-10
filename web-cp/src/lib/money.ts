@@ -89,3 +89,44 @@ export function periodLabel(periodStart: string, group: "day" | "month"): string
   const day = Number.isNaN(at.getTime()) ? periodStart.slice(0, 10) : at.toISOString().slice(0, 10);
   return group === "day" ? day : day.slice(0, 7);
 }
+
+/**
+ * The decimal `s` with its point moved `places` to the right (left when
+ * negative): exact, since only the point moves, and in its shortest form.
+ * `null` for anything but digits with an optional `.` and more digits.
+ */
+function shiftPoint(s: string, places: number): string | null {
+  const m = /^(\d+)(?:\.(\d+))?$/.exec(s);
+  if (!m) return null;
+  const whole = m[1] ?? "";
+  let digits = whole + (m[2] ?? "");
+  let point = whole.length + places;
+  if (point < 0) {
+    digits = "0".repeat(-point) + digits;
+    point = 0;
+  }
+  if (point > digits.length) digits += "0".repeat(point - digits.length);
+  const int = digits.slice(0, point).replace(/^0+(?=\d)/, "") || "0";
+  const fraction = digits.slice(point).replace(/0+$/, "");
+  return fraction ? `${int}.${fraction}` : int;
+}
+
+/**
+ * A rate per million units as the same rate per thousand: `"10000"` is
+ * `"10"`, `"3.5"` is `"0.0035"`. Exact string arithmetic, never a float.
+ * What is not a decimal comes back as it was, so nothing is hidden.
+ */
+export function perThousandOfPerMillion(perMillion: string): string {
+  return shiftPoint(perMillion, -3) ?? perMillion;
+}
+
+/**
+ * A rate typed per thousand units as the rate per million a card stores:
+ * `"10"` is `"10000"`, `"0.0035"` is `"3.5"`. Exact; `null` for anything but
+ * a plain decimal of at most 9 decimals, which is the most a card's 6
+ * decimals per million hold.
+ */
+export function perMillionOfPerThousand(perThousand: string): string | null {
+  if (!/^\d+(\.\d{1,9})?$/.test(perThousand)) return null;
+  return shiftPoint(perThousand, 3);
+}

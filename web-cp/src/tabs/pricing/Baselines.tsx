@@ -29,7 +29,7 @@ import { EmptyState } from "../../ui/EmptyState";
 import { Field, useRefusalFocus } from "../../ui/Field";
 import { SidePanel } from "../../ui/SidePanel";
 import { useToast } from "../../ui/Toast";
-import { LibrarySyncOne } from "./LibrarySync";
+import { CardLines, LibrarySyncOne } from "./LibrarySync";
 import "./PriceForms.css";
 import "./Baselines.css";
 
@@ -380,7 +380,7 @@ function BaselinePanel({
     setLater([]);
     const refused: Detail[] = [];
     if (mode === "manual") {
-      if (!cardOk) refused.push({ path: "/card", message: "价目卡 JSON 不合法，修改尚未生效；请先改正" });
+      if (!cardOk) refused.push({ path: "/card", message: "价格卡中有无法读取的内容，修改尚未生效；请先改正" });
     } else if (!chosen) {
       refused.push({ path: "/catalogue_key", message: "请选择目录条目" });
     }
@@ -519,6 +519,7 @@ function BaselinePanel({
               )}
             </div>
             <p className="hint tabular">生效于 {fmtUtc(row.current.effective_from)}</p>
+            <CardLines card={row.current.card} />
             <BaselineSourceBadge revision={row.current} />
           </div>
         ) : (

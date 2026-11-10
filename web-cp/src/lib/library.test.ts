@@ -12,6 +12,16 @@ import {
 } from "./library.ts";
 import type { RateCard, SyncCandidate } from "./api.ts";
 
+test("价格卡的联网搜索按每千次列出，token 价格不带单位", () => {
+  assert.deepEqual(
+    cardLines({
+      default: { base: { cache_read: "1", input: "10", output: "50", web_search: "10000" } },
+      batch: { base: { input: "5", output: "25", web_search: "10000" } },
+    }),
+    ["标准：缓存读 $1 · 输入 $10 · 输出 $50 · 联网搜索 $10 / 千次", "批量：输入 $5 · 输出 $25 · 联网搜索 $10 / 千次"],
+  );
+});
+
 test("每种同步状态都有中文说法，未知的状态原样显示", () => {
   assert.equal(syncStateText("create"), "将新增");
   assert.equal(syncStateText("update"), "将更新");

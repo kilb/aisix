@@ -6,6 +6,8 @@ import {
   fmtUtc,
   isCnyAmount,
   microCnyToInput,
+  perMillionOfPerThousand,
+  perThousandOfPerMillion,
   periodLabel,
   todayUtc,
   utcRange,
@@ -78,4 +80,33 @@ test("时间与周期按 UTC 显示，不随浏览器时区", () => {
   assert.equal(periodLabel("2026-11-07T00:00:00Z", "day"), "2026-11-07");
   assert.equal(periodLabel("2026-11-01T00:00:00Z", "month"), "2026-11");
   assert.equal(periodLabel("2026-11-08T01:00:00+08:00", "day"), "2026-11-07");
+});
+
+test("每千次与每百万单位的价格互相换算是精确的十进制运算", () => {
+  // Typed per thousand, stored per million: the web search price is "$10 per 1,000 searches".
+  assert.equal(perMillionOfPerThousand("10"), "10000");
+  assert.equal(perMillionOfPerThousand("0.0035"), "3.5");
+  assert.equal(perMillionOfPerThousand("0.000000001"), "0.000001");
+  assert.equal(perMillionOfPerThousand("12.5"), "12500");
+  assert.equal(perMillionOfPerThousand("0"), "0");
+  assert.equal(perMillionOfPerThousand("007.10"), "7100");
+  // Shown per thousand from what a card stores.
+  assert.equal(perThousandOfPerMillion("10000"), "10");
+  assert.equal(perThousandOfPerMillion("3.5"), "0.0035");
+  assert.equal(perThousandOfPerMillion("0.000001"), "0.000000001");
+  assert.equal(perThousandOfPerMillion("72000.00000000000001"), "72.00000000000000001");
+  assert.equal(perThousandOfPerMillion("0"), "0");
+  // Round trips, both ways, never through a float (0.1 + 0.2 would show here).
+  for (const perThousand of ["10", "0.0035", "0.3", "999.999999999", "1000"]) {
+    assert.equal(perThousandOfPerMillion(perMillionOfPerThousand(perThousand)!), perThousand);
+  }
+  for (const perMillion of ["10000", "3.5", "0.000001", "300", "0.3"]) {
+    assert.equal(perMillionOfPerThousand(perThousandOfPerMillion(perMillion)), perMillion);
+  }
+  // What a card cannot hold exactly, or is no decimal, is refused rather than rounded.
+  for (const bad of ["", "0.0000000001", "-1", "1e3", "1,5", " 1", ".5", "5.", "abc"]) {
+    assert.equal(perMillionOfPerThousand(bad), null, bad);
+  }
+  // A stored text that is no decimal is shown as it came.
+  assert.equal(perThousandOfPerMillion("n/a"), "n/a");
 });

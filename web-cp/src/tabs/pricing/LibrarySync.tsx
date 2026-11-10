@@ -21,6 +21,7 @@ import {
   syncRequest,
   syncStateText,
 } from "../../lib/library";
+import { TIER_HINT } from "../../lib/rateUnits";
 import { safeHttpUrl } from "../../lib/safeUrl";
 import { Button } from "../../ui/Button";
 import { DataTable, Loading } from "../../ui/DataTable";
@@ -36,6 +37,12 @@ function keyOf(entry: { provider: string; model: string }): string {
   return `${entry.provider}/${entry.model}`;
 }
 
+/** An ambiguous item's candidate whose entry is `key`, in this preview; nothing for any other item. */
+function candidateOf(item: SyncItem, key: string | undefined): SyncCandidate | undefined {
+  if (item.state !== "ambiguous" || key === undefined) return undefined;
+  return item.candidates.find((c) => keyOf(c) === key);
+}
+
 /** An error as the page says it: the code's text, and each item the answer names. */
 function failureText(e: unknown): string {
   if (!(e instanceof ApiError)) return errorText(e);
@@ -44,7 +51,7 @@ function failureText(e: unknown): string {
 }
 
 /** The lines of a card, one per tier and band, or a dash. */
-function CardLines({ card }: { card: unknown }) {
+export function CardLines({ card }: { card: unknown }) {
   const lines = cardLines((card ?? null) as Parameters<typeof cardLines>[0]);
   if (lines.length === 0) return <>—</>;
   return (
@@ -80,6 +87,33 @@ function candidateLabel(c: LibraryEntry): string {
   return `${c.provider} · ${c.model}${rates}`;
 }
 
+/**
+ * What a sync from `entry` attests beside its card: how it was found, its
+ * pricing page (linked only when it is an http(s) page), its flags, every
+ * price it leaves off, and its long-context bands.
+ */
+function EntryMeta({ entry, how }: { entry: LibraryEntry; how: string }) {
+  const href = safeHttpUrl(entry.pricing_url);
+  return (
+    <>
+      <span className="cell-note">
+        {how}
+        {href && (
+          <>
+            {" · "}
+            <a href={href} target="_blank" rel="noopener noreferrer">
+              价格页面
+            </a>
+          </>
+        )}
+      </span>
+      {entry.flags.length > 0 && <span className="cell-note library-flags">{entry.flags.map(flagText).join("、")}</span>}
+      {entry.dropped?.length > 0 && <span className="cell-note">未计入：{entry.dropped.map(droppedFieldText).join("、")}</span>}
+      <LongContext card={entry.card} />
+    </>
+  );
+}
+
 /** The entry a model matched, or, for an ambiguous one, the candidate chosen. */
 function EntryCell({
   item,
@@ -105,35 +139,18 @@ function EntryCell({
             </option>
           ))}
         </select>
-        {chosen && <LongContext card={chosen.card} />}
+        {chosen && <EntryMeta entry={chosen} how="已选价格来源" />}
       </span>
     );
   }
   if (!item.entry) return <>—</>;
-  const href = safeHttpUrl(item.entry.pricing_url);
   return (
     <span className="library-entry">
       <span className="mono">{keyOf(item.entry)}</span>
-      <span className="cell-note">
-        {SOMEONE_CHOSE[item.matched_by ?? ""] ?? (item.matched_by === "alias" ? "按 ID 或别名匹配" : "名称一致")}
-        {href && (
-          <>
-            {" · "}
-            <a href={href} target="_blank" rel="noopener noreferrer">
-              价格页面
-            </a>
-          </>
-        )}
-      </span>
-      {item.entry.flags.length > 0 && (
-        <span className="cell-note library-flags">{item.entry.flags.map(flagText).join("、")}</span>
-      )}
-      {item.entry.dropped?.length > 0 && (
-        <span className="cell-note">
-          未计入：{item.entry.dropped.map(droppedFieldText).join("、")}
-        </span>
-      )}
-      <LongContext card={item.entry.card} />
+      <EntryMeta
+        entry={item.entry}
+        how={SOMEONE_CHOSE[item.matched_by ?? ""] ?? (item.matched_by === "alias" ? "按 ID 或别名匹配" : "名称一致")}
+      />
     </span>
   );
 }
@@ -182,8 +199,13 @@ export function LibrarySync({ canEdit, generation }: { canEdit: boolean; generat
   const [attested, setAttested] = useState(false);
   const [syncing, setSyncing] = useState(false);
   const [failure, setFailure] = useState<string | null>(null);
-  /** Each ambiguous model's candidate, as chosen on this page; nothing is chosen by default. */
-  const [chosen, setChosen] = useState<Record<string, SyncCandidate | undefined>>({});
+  /**
+   * Each ambiguous model's chosen candidate, by its entry's `provider/model`
+   * only: the candidate itself, and so the card sent, is always the one in
+   * the preview on screen, however often it was read again since the choice.
+   * Nothing is chosen by default.
+   */
+  const [chosenKeys, setChosenKeys] = useState<Record<string, string | undefined>>({});
   /** The newest preview asked for: an answer to an older one is dropped. */
   const latest = useRef(0);
 
@@ -206,13 +228,18 @@ export function LibrarySync({ canEdit, generation }: { canEdit: boolean; generat
     void load();
   }, [load, generation]);
 
+  const items = preview ? byState(preview.items) : [];
+  /** Each ambiguous model's chosen candidate in this preview, when it still has one by that key. */
+  const chosen: Record<string, SyncCandidate | undefined> = Object.fromEntries(
+    items.map((i) => [i.model_id, candidateOf(i, chosenKeys[i.model_id])]),
+  );
+
   /** The state a row shows: an ambiguous one's, once a candidate is chosen. */
   const shown = (item: SyncItem): SyncItem => {
-    const c = item.state === "ambiguous" ? chosen[item.model_id] : undefined;
+    const c = chosen[item.model_id];
     return c ? { ...item, state: c.state, entry: c } : item;
   };
 
-  const items = preview ? byState(preview.items) : [];
   const request = preview ? syncRequest(items, preview.cap, chosen) : [];
   const writable = items.filter((i) => {
     const s = shown(i).state;
@@ -227,7 +254,7 @@ export function LibrarySync({ canEdit, generation }: { canEdit: boolean; generat
     try {
       const done = await library.sync({ library_id: preview.library.id, attested: true, items: request });
       toast(`已同步 ${done.revisions.length} 个模型`);
-      setChosen({});
+      setChosenKeys({});
       await load();
     } catch (e) {
       setFailure(failureText(e));
@@ -242,7 +269,7 @@ export function LibrarySync({ canEdit, generation }: { canEdit: boolean; generat
     setFailure(null);
     try {
       await library.unbind(item.model_id);
-      setChosen((c) => ({ ...c, [item.model_id]: undefined }));
+      setChosenKeys((c) => ({ ...c, [item.model_id]: undefined }));
       await load();
     } catch (e) {
       setFailure(failureText(e));
@@ -260,6 +287,7 @@ export function LibrarySync({ canEdit, generation }: { canEdit: boolean; generat
       <p className="hint">
         按模型名称在价格库中查找对应条目：先找名称完全一致的，找不到再按数据集的 ID 与别名查找（不区分大小写，可带或不带「供应商/」前缀）。有多个候选时，先取模型自己的上游供应商的那一条，再取与上游账号协议相同的那一条；仍有多个时由你选择价格来源。同步按价格库的标价写入基准价，立即生效。
       </p>
+      <p className="hint">{TIER_HINT}</p>
       {error && (
         <div className="note crit" role="alert">
           {error}
@@ -312,7 +340,7 @@ export function LibrarySync({ canEdit, generation }: { canEdit: boolean; generat
                 <th>状态</th>
                 <th>价格库条目</th>
                 <th>现行基准价</th>
-                <th>价格库价格（美元/百万）</th>
+                <th>价格库价格（美元/百万 tokens）</th>
               </tr>
             </thead>
             <tbody>
@@ -336,7 +364,7 @@ export function LibrarySync({ canEdit, generation }: { canEdit: boolean; generat
                       <EntryCell
                         item={item}
                         chosen={chosen[item.model_id]}
-                        onChoose={(c) => setChosen((all) => ({ ...all, [item.model_id]: c }))}
+                        onChoose={(c) => setChosenKeys((all) => ({ ...all, [item.model_id]: c && keyOf(c) }))}
                       />
                       {item.state === "ambiguous" && item.binding && !chosen[item.model_id] && (
                         <span className="cell-note">
@@ -404,9 +432,10 @@ export function LibrarySyncOne({
     void load();
   }, [load, current?.revision_id]);
 
-  /** The candidate chosen on this panel, for an ambiguous model. */
-  const [chosen, setChosen] = useState<SyncCandidate | undefined>(undefined);
+  /** The candidate chosen on this panel, for an ambiguous model, by its entry's key: resolved in the preview on screen. */
+  const [chosenKey, setChosenKey] = useState<string | undefined>(undefined);
   const item = preview?.items[0] ?? null;
+  const chosen = item ? candidateOf(item, chosenKey) : undefined;
   const entry = item?.state === "ambiguous" && chosen ? chosen : (item?.entry ?? null);
   const request = item ? syncRequest([item], 1, chosen ? { [item.model_id]: chosen } : {}) : [];
   /** The state shown: the chosen candidate's, for an ambiguous model. */
@@ -419,7 +448,7 @@ export function LibrarySyncOne({
     setFailure(null);
     try {
       await library.unbind(item.model_id);
-      setChosen(undefined);
+      setChosenKey(undefined);
       await load();
     } catch (e) {
       setFailure(failureText(e));
@@ -433,7 +462,7 @@ export function LibrarySyncOne({
     try {
       await library.sync({ library_id: preview.library.id, attested: true, items: request });
       toast("已从价格库同步");
-      setChosen(undefined);
+      setChosenKey(undefined);
       await onSynced();
       await load();
     } catch (e) {
@@ -459,7 +488,8 @@ export function LibrarySyncOne({
       ) : !item ? null : (
         <>
           <p>
-            <span className="tag">{syncStateText(state ?? item.state)}</span> <EntryCell item={item} chosen={chosen} onChoose={setChosen} />
+            <span className="tag">{syncStateText(state ?? item.state)}</span>{" "}
+            <EntryCell item={item} chosen={chosen} onChoose={(c) => setChosenKey(c && keyOf(c))} />
           </p>
           {item.binding && (
             <p className="library-chosen">
@@ -468,17 +498,13 @@ export function LibrarySyncOne({
           )}
           {item.state === "ambiguous" && !chosen && <p className="hint">价格库中有多个候选条目：请选择价格来源。</p>}
           {item.state === "unmatched" && <p className="hint">价格库中没有与模型名称对应的条目。</p>}
-          {entry && entry.dropped?.length > 0 && (
-            <p className="cell-note">
-              未计入：{entry.dropped.map(droppedFieldText).join("、")}
-            </p>
-          )}
           {entry && item.state !== "flagged" && (
             <p className="library-card-block">
-              价格库价格（美元/百万）：
+              价格库价格（美元/百万 tokens）：
               <CardLines card={entry.card} />
             </p>
           )}
+          {entry && Object.keys(entry.card ?? {}).some((t) => t !== "default") && <p className="hint">{TIER_HINT}</p>}
           {warning && <p className="hint">{warning}</p>}
           {canEdit && writeable && (
             <div className="library-confirm" role="group" aria-label="确认从价格库同步">
