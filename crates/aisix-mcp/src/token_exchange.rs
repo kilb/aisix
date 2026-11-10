@@ -85,13 +85,17 @@ impl std::fmt::Debug for TokenExchangeConfig {
             .field("client_id", &self.client_id)
             .field("client_secret", &"***redacted***")
             .field("scopes", &self.scopes)
-            // The server's name only: what follows it is the server's URL, which
-            // may carry a credential of its own.
-            .field(
-                "server",
-                &self.server.split('\x1f').next().unwrap_or_default(),
-            )
+            .field("server", &self.server_name())
             .finish()
+    }
+}
+
+impl TokenExchangeConfig {
+    /// The server's name, the part of [`Self::server`] a log line or `Debug`
+    /// shows: what follows it is the server's URL, which may carry a
+    /// credential of its own.
+    fn server_name(&self) -> &str {
+        self.server.split('\x1f').next().unwrap_or_default()
     }
 }
 
@@ -253,7 +257,7 @@ async fn exchange(
         Ok(response) => response,
         Err(e) => {
             tracing::warn!(
-                server = %cfg.server,
+                server = %cfg.server_name(),
                 error = %crate::bridge::sanitize_error_message(&aisix_gateway::transport_error_message(&e.without_url())),
                 "upstream token exchange request failed"
             );
@@ -285,7 +289,7 @@ async fn exchange(
         // Only a code from the fixed list above is logged verbatim; any
         // other value is caller-influenced IdP text.
         tracing::warn!(
-            server = %cfg.server,
+            server = %cfg.server_name(),
             status = status.as_u16(),
             error = code.as_deref().filter(|_| gateway_fault).unwrap_or("-"),
             step_up = claims.is_some(),
@@ -299,14 +303,14 @@ async fn exchange(
     }
     if !status.is_success() {
         tracing::warn!(
-            server = %cfg.server,
+            server = %cfg.server_name(),
             status = status.as_u16(),
             "upstream token exchange failed"
         );
         return Err(TokenExchangeFailure::Unavailable);
     }
     let unusable = |reason: &str| {
-        tracing::warn!(server = %cfg.server, "upstream token exchange returned {reason}");
+        tracing::warn!(server = %cfg.server_name(), "upstream token exchange returned {reason}");
         TokenExchangeFailure::Unavailable
     };
     let token = match response.json::<TokenResponse>().await {
@@ -380,7 +384,7 @@ impl TokenExchangeAuth {
             Ok(outcome) => outcome,
             Err(_) => {
                 tracing::warn!(
-                    server = %self.config.server,
+                    server = %self.config.server_name(),
                     "upstream token exchange timed out"
                 );
                 Err(TokenExchangeFailure::Unavailable.into())
@@ -448,5 +452,82 @@ mod tests {
         assert!(matches!(result, Err(TokenExchangeFailure::Unavailable)));
         assert!(logged.to_lowercase().contains("refused"), "{logged}");
         assert!(!logged.contains("LEAK"), "{logged}");
+    }
+
+    /// Every warning an exchange can end in names the server, and none of
+    /// them prints the server's URL: its userinfo is a credential, and its
+    /// path and query may be one too.
+    #[tokio::test]
+    async fn no_exchange_warning_prints_the_server_url() {
+        use axum::http::StatusCode;
+        use axum::routing::post;
+        let app = axum::Router::new()
+            .route(
+                "/rejected",
+                post(|| async {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        axum::Json(serde_json::json!({"error": "invalid_grant"})),
+                    )
+                }),
+            )
+            .route(
+                "/failing",
+                post(|| async { StatusCode::SERVICE_UNAVAILABLE }),
+            )
+            .route("/malformed", post(|| async { "not a token response" }))
+            .route(
+                "/stalled",
+                post(|| async {
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                    "late"
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let cfg = |token_url: String| TokenExchangeConfig {
+            profile: Some(McpTokenExchangeProfile::EntraObo),
+            token_url,
+            client_id: "cid".into(),
+            client_secret: "obo-secret".into(),
+            scopes: vec!["api://x/.default".into()],
+            server: "erp-mcp\x1fhttps://svc:url-LEAK@mcp.example.com/mcp?key=query-LEAK".into(),
+        };
+        let mut logs = Vec::new();
+        for path in ["/rejected", "/failing", "/malformed"] {
+            let (result, logged) =
+                capture_logs(exchange(&cfg(format!("{base}{path}")), "subject")).await;
+            assert!(result.is_err(), "{path}");
+            logs.push(logged);
+        }
+        let (result, logged) = capture_logs(exchange(&cfg(refused_url("/token")), "subject")).await;
+        assert!(result.is_err());
+        logs.push(logged);
+        let auth = TokenExchangeAuth {
+            config: cfg(format!("{base}/stalled")),
+            subject: Some(SubjectToken("subject".into())),
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(200);
+        let (result, logged) = capture_logs(auth.token(deadline)).await;
+        assert!(result.is_err());
+        logs.push(logged);
+
+        for (outcome, logged) in [
+            "upstream token exchange rejected",
+            "upstream token exchange failed",
+            "upstream token exchange returned a malformed token response",
+            "upstream token exchange request failed",
+            "upstream token exchange timed out",
+        ]
+        .into_iter()
+        .zip(&logs)
+        {
+            assert!(logged.contains(outcome), "{outcome}: {logged}");
+            assert!(logged.contains("server=erp-mcp"), "{outcome}: {logged}");
+            assert!(!logged.contains("LEAK"), "{outcome}: {logged}");
+            assert!(!logged.contains("mcp.example.com"), "{outcome}: {logged}");
+        }
     }
 }
