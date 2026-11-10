@@ -14,7 +14,7 @@ import {
 } from "../lib/api";
 import { messageFor, problemAt } from "../lib/errors";
 import { errorText } from "../lib/fmt";
-import { modelSource, type ModelSource } from "../lib/modelSource";
+import { modelClass, modelSource, type ModelClass, type ModelSource } from "../lib/modelSource";
 import { inUseText, retireWarning } from "../lib/retireWarning";
 import { defaultAt, enumAt, loadSchema } from "../lib/schema";
 import { useResource } from "../lib/useResource";
@@ -59,12 +59,6 @@ type Account = ResourceView<AccountDoc>;
 /** The model's dispatch shape. Only direct and routing models have a form here. */
 type Shape = "direct" | "routing" | "ensemble" | "semantic";
 
-/** The 来源 filter's values, in the order the select lists them. */
-const SOURCE_OPTIONS: { value: "all" | "manual" | "generated"; label: string }[] = [
-  { value: "all", label: "全部" },
-  { value: "manual", label: "手工创建" },
-  { value: "generated", label: "由公共模型生成" },
-];
 
 const SHAPE_LABEL: Record<Shape, string> = {
   direct: "直连",
@@ -145,8 +139,12 @@ export function Models({ canEdit, onGoto }: TabProps) {
   const [schema, setSchema] = useState<SchemaInfo | null>(null);
   const [open, setOpen] = useState<Open | null>(null);
   const [note, setNote] = useState<Note | null>(null);
-  // `all`, or the kind of row shown; a stable value, so the select is plain.
-  const [source, setSource] = useState<"all" | "manual" | "generated">("all");
+  // Whether 内部直连 rows are listed. Off by default: they are the targets a
+  // public model's routing document dispatches to, one per serving account,
+  // and they are what made the flat list unreadable (27 public models served
+  // by 66 accounts is 93 rows, 66 of them plumbing). The operator's own
+  // models and every 对外 row stay listed either way.
+  const [showInternal, setShowInternal] = useState(false);
   // The row whose `删除` was clicked once, with the tenants granted it (null while read).
   const [deleting, setDeleting] = useState<{ id: string; holders: Tenant[] | string | null } | null>(null);
   // The public model id whose `停用` is in flight.
@@ -290,13 +288,13 @@ export function Models({ canEdit, onGoto }: TabProps) {
     }
   }
 
-  // The rows the 来源 filter shows; `generated` is the public model's direct
-  // documents AND its routing document, since both come from that model.
-  const shown = (models.items ?? []).filter((m) => {
-    if (source === "all") return true;
-    const src = modelSource(m);
-    return source === "generated" ? src.kind === "public" : src.kind === "manual";
-  });
+  // The rows listed, and how many each class holds: the count beside the
+  // toggle is what says the page is hiding rows rather than the operator
+  // seeing a short list for no stated reason.
+  const all = models.items ?? [];
+  const counts: Record<ModelClass, number> = { facing: 0, internal: 0, manual: 0 };
+  for (const m of all) counts[modelClass(m)] += 1;
+  const shown = showInternal ? all : all.filter((m) => modelClass(m) !== "internal");
 
   const editing = open?.mode === "edit" ? models.items?.find((m) => m.id === open.id) : undefined;
   // Only an operator's own model has a form here; a generated row is read-only
@@ -359,14 +357,12 @@ export function Models({ canEdit, onGoto }: TabProps) {
         <Msg note={note} />
         <div className="r">
           <label className="f filter">
-            <span>来源</span>
-            <select value={source} onChange={(e) => setSource(e.target.value as typeof source)}>
-              {SOURCE_OPTIONS.map((o) => (
-                <option key={o.value} value={o.value}>
-                  {o.label}
-                </option>
-              ))}
-            </select>
+            <input
+              type="checkbox"
+              checked={showInternal}
+              onChange={(e) => setShowInternal(e.target.checked)}
+            />{" "}
+            <span>显示内部直连模型（{counts.internal}）</span>
           </label>
         </div>
         {deleteFailure &&
@@ -416,13 +412,13 @@ export function Models({ canEdit, onGoto }: TabProps) {
         ) : models.items.length === 0 ? (
           <EmptyState text="还没有模型。" />
         ) : shown.length === 0 ? (
-          <EmptyState text={source === "manual" ? "没有手工创建的模型。" : "没有由公共模型生成的模型。"} />
+          <EmptyState text="没有模型。" />
         ) : (
           <DataTable>
             <thead>
               <tr>
                 <th>对外名称</th>
-                <th>来源</th>
+                <th>分类</th>
                 <th>类型</th>
                 <th>上游账号 / 路由目标</th>
                 <th>状态</th>
@@ -584,12 +580,18 @@ function Source({
   if (source.kind === "manual") return <>手工创建</>;
   const name = from?.name;
   const account = model.doc.provider_key_id ? catalog.accounts.get(model.doc.provider_key_id) : undefined;
+  // The row a caller names is 对外; the per-account documents behind it are
+  // 内部直连 — reachable only as that row's targets, never granted or priced.
+  const shared = (
+    <div className="sub">{publicRead ? (name ?? `${source.id}（公共模型已不在列表）`) : "…"}</div>
+  );
+  if (!source.generated) return <>对外{shared}</>;
   return (
     <>
-      公共模型
+      内部直连
+      {shared}
       <div className="sub">
-        {publicRead ? (name ?? `${source.id}（公共模型已不在列表）`) : "…"}
-        {source.generated && ` · 直连${account ? `：${account.doc.display_name || account.id}` : ""}`}
+        {account ? `账号：${account.doc.display_name || account.id}` : "账号：已不存在"}
       </div>
     </>
   );

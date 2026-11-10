@@ -484,14 +484,15 @@ async function serve(accountId: string, publicModelId: string): Promise<void> {
   });
 }
 
-/** The 来源 cell of a row whose 对外名称 is exactly `name`. */
+/** The 分类 cell of a row whose 对外名称 is exactly `name`. */
 function sourceCell(page: Page, name: string): Locator {
   return modelRow(page, name).getByRole("cell").nth(1);
 }
 
-/** Filters the catalog by where a row comes from. */
-async function bySource(page: Page, label: string): Promise<void> {
-  await page.getByLabel("来源").selectOption({ label });
+/** Shows or hides the 内部直连 rows the list leaves out by default. */
+async function showInternal(page: Page, on: boolean): Promise<void> {
+  const box = page.getByRole("checkbox", { name: /显示内部直连模型/ });
+  if ((await box.isChecked()) !== on) await box.click();
 }
 
 /** A live public model's own view. */
@@ -517,7 +518,7 @@ async function openAccountModels(page: Page, name: string): Promise<Locator> {
   return section;
 }
 
-test("来源列与筛选：手工创建的模型与公共模型生成的模型各自归位", async ({ page }) => {
+test("分类列与可折叠的内部直连：默认只列对外的和手工创建的模型", async ({ page }) => {
   const suffix = randomUUID().slice(0, 8);
   const accountName = `acct-source-${suffix}`;
   const account = await mockAccount(accountName, ["shared"]);
@@ -530,37 +531,33 @@ test("来源列与筛选：手工创建的模型与公共模型生成的模型�
   const directName = `${publicName}#${accountName}`;
 
   await openModels(page);
-  // Both rows of the public model, and the hand-made one, are listed.
+  // The default view lists the row a caller names and the operator's own
+  // models; the per-account documents behind the public model are hidden.
   await expect(modelRow(page, publicName)).toBeVisible();
-  await expect(modelRow(page, directName)).toBeVisible();
   await expect(modelRow(page, handMade)).toBeVisible();
+  await expect(modelRow(page, directName)).toHaveCount(0);
+  // And the page says how many it is holding back.
+  await expect(page.getByRole("checkbox", { name: /显示内部直连模型（\d+）/ })).not.toHaveCount(0);
 
-  // The hand-made model's source reads as written here, with no public name.
+  // The public model's routing document is the facing row, and names itself.
+  await expect(sourceCell(page, publicName)).toContainText("对外");
+  await expect(sourceCell(page, publicName)).toContainText(publicName);
+  // The hand-made model's class reads as written here, with no public name.
   await expect(sourceCell(page, handMade)).toHaveText("手工创建");
 
-  // The public model's routing document names the public model it came from.
-  await expect(sourceCell(page, publicName)).toContainText("公共模型");
-  await expect(sourceCell(page, publicName)).toContainText(publicName);
-  await expect(sourceCell(page, publicName)).not.toContainText(accountName);
-
-  // Its direct document names the same public model, and the account it serves through.
-  await expect(sourceCell(page, directName)).toContainText("公共模型");
+  // Asking for them lists the internal row, which names the public model it
+  // belongs to and the account it serves through.
+  await showInternal(page, true);
+  await expect(modelRow(page, directName)).toBeVisible();
+  await expect(sourceCell(page, directName)).toContainText("内部直连");
   await expect(sourceCell(page, directName)).toContainText(publicName);
   await expect(sourceCell(page, directName)).toContainText(accountName);
 
-  await bySource(page, "手工创建");
-  await expect(modelRow(page, handMade)).toBeVisible();
-  await expect(modelRow(page, publicName)).toHaveCount(0);
+  // Putting it back hides it again, and leaves everything else listed.
+  await showInternal(page, false);
   await expect(modelRow(page, directName)).toHaveCount(0);
-
-  await bySource(page, "由公共模型生成");
   await expect(modelRow(page, publicName)).toBeVisible();
-  await expect(modelRow(page, directName)).toBeVisible();
-  await expect(modelRow(page, handMade)).toHaveCount(0);
-
-  await bySource(page, "全部");
   await expect(modelRow(page, handMade)).toBeVisible();
-  await expect(modelRow(page, publicName)).toBeVisible();
 });
 
 test("公共模型生成的模型在这里只能停用：停用后两张文档都消失，手工模型不受影响", async ({ page }) => {
@@ -578,6 +575,8 @@ test("公共模型生成的模型在这里只能停用：停用后两张文档�
   const routeRow = modelRow(page, publicName);
   await expect(routeRow).toBeVisible();
   await expect(routeRow).toContainText("路由");
+  // The public model's per-account document is 内部直连, listed once asked for.
+  await showInternal(page, true);
   const directRow = modelRow(page, directName);
   await expect(directRow).toBeVisible();
 
