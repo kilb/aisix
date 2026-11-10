@@ -3,8 +3,11 @@
 //! Each `paths` operation becomes one tool: the tool name is the sanitized
 //! `operationId` (fallback `<method>_<path>`), path/query parameters become
 //! top-level schema properties, and a JSON request body becomes a single
-//! `body` property. Local `$ref`s are resolved (bounded) so referenced
-//! schemas keep their shape.
+//! `body` property. A parameter is identified by its name and location
+//! (<https://spec.openapis.org/oas/v3.1.1.html#parameter-object>), so a name
+//! that two of them share, or that a parameter shares with `body`, is
+//! published as `<name>__<in>` for each of them. Local `$ref`s are resolved
+//! (bounded) so referenced schemas keep their shape.
 //!
 //! This lives in the core crate, not beside the bridge that executes the
 //! tools, so the resource loaders (file source, etcd, `aisix validate`) judge
@@ -37,9 +40,32 @@ pub struct GeneratedTool {
     pub method: String,
     /// The path template as written in the spec, e.g. `/items/{id}`.
     pub path: String,
-    pub path_params: Vec<String>,
-    pub query_params: Vec<String>,
-    pub has_body: bool,
+    pub path_params: Vec<ToolParam>,
+    pub query_params: Vec<ToolParam>,
+    /// The request body's media type, the `requestBody.content` key it was
+    /// generated from; `None` when the operation takes no body.
+    pub body_media_type: Option<String>,
+}
+
+/// A path or query parameter of a [`GeneratedTool`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolParam {
+    /// The parameter's name in the API, as the request carries it.
+    pub name: String,
+    /// The tool argument that carries its value: `name`, or `<name>__<in>`
+    /// when another parameter of the operation, or its body, shares the name.
+    pub argument: String,
+}
+
+impl ToolParam {
+    /// A parameter whose argument is its own name.
+    pub fn named(name: impl Into<String>) -> Self {
+        let name = name.into();
+        Self {
+            argument: name.clone(),
+            name,
+        }
+    }
 }
 
 /// Map an `operationId` (or fallback) to a provider-safe tool name:
@@ -127,9 +153,9 @@ pub fn generate(spec: &Value) -> Result<Generation, String> {
             let request_body = operation
                 .get("requestBody")
                 .map(|rb| resolver.resolve(rb, 0));
-            let body_schema = match &request_body {
+            let body = match &request_body {
                 Some(rb) => match json_body_schema(rb, &mut resolver) {
-                    BodyOutcome::Schema(schema) => Some(schema),
+                    BodyOutcome::Schema { media_type, schema } => Some((media_type, schema)),
                     BodyOutcome::None => None,
                     BodyOutcome::Unsupported => {
                         skipped.push(format!("{} {}", method.to_uppercase(), path));
@@ -175,18 +201,50 @@ pub fn generate(spec: &Value) -> Result<Generation, String> {
             let mut path_params = Vec::new();
             let mut query_params = Vec::new();
 
-            for param in &params {
-                let Some(param_name) = param.get("name").and_then(Value::as_str) else {
-                    continue;
+            // header/cookie parameters are not exposed to the agent: upstream
+            // headers are the gateway's to set, not the caller's.
+            let exposed: Vec<(&str, &str, &Value)> = params
+                .iter()
+                .filter_map(|param| {
+                    let name = param.get("name").and_then(Value::as_str)?;
+                    let location = param.get("in").and_then(Value::as_str)?;
+                    matches!(location, "path" | "query").then_some((name, location, param))
+                })
+                .collect();
+            let shared = |name: &str| {
+                (body.is_some() && name == "body")
+                    || exposed.iter().filter(|(n, _, _)| *n == name).count() > 1
+            };
+            let mut arguments: HashSet<String> = exposed
+                .iter()
+                .filter(|(name, _, _)| !shared(name))
+                .map(|(name, _, _)| name.to_string())
+                .collect();
+            if body.is_some() {
+                arguments.insert("body".to_string());
+            }
+
+            for (param_name, location, param) in exposed.iter().copied() {
+                let argument = if shared(param_name) {
+                    let base = format!("{param_name}__{location}");
+                    let mut argument = base.clone();
+                    let mut n = 1;
+                    while !arguments.insert(argument.clone()) {
+                        n += 1;
+                        argument = format!("{base}_{n}");
+                    }
+                    argument
+                } else {
+                    param_name.to_string()
                 };
-                let location = param.get("in").and_then(Value::as_str).unwrap_or("");
-                match location {
-                    "path" => path_params.push(param_name.to_string()),
-                    "query" => query_params.push(param_name.to_string()),
-                    // header/cookie parameters are not exposed to the agent:
-                    // upstream headers are the gateway's to set, not the
-                    // caller's.
-                    _ => continue,
+                let tool_param = ToolParam {
+                    name: param_name.to_string(),
+                    argument: argument.clone(),
+                };
+                if location == "path" {
+                    path_params.push(tool_param);
+                } else {
+                    query_params.push(tool_param);
                 }
 
                 let mut schema = match param.get("schema") {
@@ -202,14 +260,14 @@ pub fn generate(spec: &Value) -> Result<Generation, String> {
                         .expect("schema coerced to object above")
                         .insert("description".to_string(), json!(desc));
                 }
-                properties.insert(param_name.to_string(), schema);
+                properties.insert(argument.clone(), schema);
 
                 if param.get("required").and_then(Value::as_bool) == Some(true) {
-                    required.push(param_name.to_string());
+                    required.push(argument);
                 }
             }
 
-            let has_body = if let Some(mut schema) = body_schema {
+            let body_media_type = if let Some((media_type, mut schema)) = body {
                 // A non-object or degraded-to-`{}` schema still gets an
                 // object hint, mirroring the string default on parameters.
                 if !schema.is_object() || schema.as_object().is_some_and(Map::is_empty) {
@@ -234,9 +292,9 @@ pub fn generate(spec: &Value) -> Result<Generation, String> {
                 {
                     required.push("body".to_string());
                 }
-                true
+                Some(media_type)
             } else {
-                false
+                None
             };
 
             tools.push(GeneratedTool {
@@ -251,7 +309,7 @@ pub fn generate(spec: &Value) -> Result<Generation, String> {
                 path: path.clone(),
                 path_params,
                 query_params,
-                has_body,
+                body_media_type,
             });
         }
     }
@@ -265,8 +323,9 @@ pub fn generate(spec: &Value) -> Result<Generation, String> {
 
 /// How an operation's `requestBody` maps onto the tool schema.
 enum BodyOutcome {
-    /// `application/json` variant found; its (resolved) schema.
-    Schema(Value),
+    /// A JSON variant found: its media type, as the `content` key names it,
+    /// and its (resolved) schema.
+    Schema { media_type: String, schema: Value },
     /// The body object carries no `content` at all — treat as body-less.
     None,
     /// A body exists but has no JSON variant (multipart upload, form data…).
@@ -281,19 +340,37 @@ fn json_body_schema(request_body: &Value, resolver: &mut RefResolver<'_>) -> Bod
         return BodyOutcome::None;
     }
     // Accept `application/json` plus parameterized variants like
-    // `application/json; charset=utf-8` or `application/problem+json`.
-    let json_variant = content.iter().find(|(mime, _)| {
-        let mime = mime.split(';').next().unwrap_or("").trim();
-        mime.eq_ignore_ascii_case("application/json")
-            || (mime.starts_with("application/") && mime.ends_with("+json"))
-    });
+    // `application/json; charset=utf-8` and structured-syntax `+json` types
+    // like `application/problem+json`. The body is sent under the media type
+    // it was generated from, so an API that offers several is sent the plain
+    // `application/json` one first, and a vendor type only when it offers
+    // nothing else.
+    let rank = |key: &str| {
+        let (mime, params) = key.split_once(';').unwrap_or((key, ""));
+        let mime = mime.trim();
+        if mime.eq_ignore_ascii_case("application/json") {
+            Some(if params.trim().is_empty() { 0 } else { 1 })
+        } else if mime.starts_with("application/") && mime.ends_with("+json") && !mime.contains('*')
+        {
+            Some(2)
+        } else {
+            None
+        }
+    };
+    let json_variant = content
+        .iter()
+        .filter_map(|(key, media)| Some((rank(key)?, key, media)))
+        .min_by_key(|(rank, _, _)| *rank);
     match json_variant {
-        Some((_, media)) => {
+        Some((_, key, media)) => {
             let schema = media
                 .get("schema")
                 .map(|s| resolver.resolve(s, 0))
                 .unwrap_or_else(|| json!({ "type": "object" }));
-            BodyOutcome::Schema(schema)
+            BodyOutcome::Schema {
+                media_type: key.trim().to_string(),
+                schema,
+            }
         }
         None => BodyOutcome::Unsupported,
     }
@@ -483,5 +560,101 @@ mod tests {
             "paths": { "/items": { "get": { "operationId": "listItems" } } }
         }))
         .unwrap();
+    }
+
+    /// A parameter is its name AND its location: two that share a name, or
+    /// one named like the reserved `body` argument of an operation with a
+    /// body, each get an argument of their own, and the schema publishes
+    /// exactly the arguments the call reads.
+    #[test]
+    fn parameters_sharing_a_name_get_an_argument_each() {
+        let spec = json!({
+            "paths": {
+                "/things/{id}/{body}": { "post": {
+                    "operationId": "mixed",
+                    "parameters": [
+                        { "name": "id", "in": "path", "required": true,
+                          "schema": { "type": "integer" } },
+                        { "name": "id", "in": "query", "schema": { "type": "string" } },
+                        { "name": "body", "in": "path", "required": true,
+                          "schema": { "type": "string" } },
+                        { "name": "limit", "in": "query", "schema": { "type": "integer" } }
+                    ],
+                    "requestBody": { "required": true, "content": { "application/json": {
+                        "schema": { "type": "object" } } } }
+                } },
+                "/plain/{body}": { "get": {
+                    "operationId": "plain",
+                    "parameters": [ { "name": "body", "in": "path", "required": true,
+                                      "schema": { "type": "string" } } ]
+                } }
+            }
+        });
+        let tools = generate(&spec).unwrap().tools;
+        let mixed = tools.iter().find(|t| t.name == "mixed").unwrap();
+        let arg = |name: &str, argument: &str| ToolParam {
+            name: name.into(),
+            argument: argument.into(),
+        };
+        assert_eq!(
+            mixed.path_params,
+            [arg("id", "id__path"), arg("body", "body__path")]
+        );
+        assert_eq!(
+            mixed.query_params,
+            [arg("id", "id__query"), arg("limit", "limit")]
+        );
+        let properties = mixed.input_schema["properties"].as_object().unwrap();
+        let mut published: Vec<&str> = properties.keys().map(String::as_str).collect();
+        published.sort_unstable();
+        assert_eq!(
+            published,
+            ["body", "body__path", "id__path", "id__query", "limit"]
+        );
+        assert_eq!(properties["body"]["type"], "object");
+        assert_eq!(properties["body__path"]["type"], "string");
+        assert_eq!(properties["id__path"]["type"], "integer");
+        let mut required: Vec<&str> = mixed.input_schema["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        required.sort_unstable();
+        assert_eq!(required, ["body", "body__path", "id__path"]);
+
+        // Without a request body, `body` is an ordinary name.
+        let plain = tools.iter().find(|t| t.name == "plain").unwrap();
+        assert_eq!(plain.path_params, [ToolParam::named("body")]);
+    }
+
+    /// The media type a body is generated from is kept, so it is the one
+    /// sent: plain JSON when the operation offers it, a vendor JSON type only
+    /// when it offers nothing else.
+    #[test]
+    fn a_body_keeps_the_media_type_it_was_generated_from() {
+        let body = |content: Value| {
+            let spec = json!({ "paths": { "/x": { "post": {
+                "operationId": "x", "requestBody": { "content": content }
+            } } } });
+            generate(&spec).unwrap().tools[0].body_media_type.clone()
+        };
+        let schema = json!({ "schema": { "type": "object" } });
+        assert_eq!(
+            body(json!({ "application/vnd.api+json": schema })).as_deref(),
+            Some("application/vnd.api+json")
+        );
+        assert_eq!(
+            body(json!({ "application/vnd.api+json": schema, "application/json": schema }))
+                .as_deref(),
+            Some("application/json")
+        );
+        assert_eq!(
+            body(json!({ "application/json; charset=utf-8": schema, "application/merge-patch+json": schema }))
+                .as_deref(),
+            Some("application/json; charset=utf-8")
+        );
+        let spec = json!({ "paths": { "/x": { "get": { "operationId": "x" } } } });
+        assert_eq!(generate(&spec).unwrap().tools[0].body_media_type, None);
     }
 }

@@ -603,6 +603,210 @@ async fn a_rest_api_quoting_the_basic_credential_of_its_url_does_not_reach_the_a
     client.cancel().await.ok();
 }
 
+/// A REST API that answers every request with what it received — method,
+/// path, raw query, `Content-Type` and raw body — so a test reads exactly
+/// what a generated tool put on the wire. Under `/strict` it refuses any
+/// media type but the one its spec declares, with `415`, as a conforming
+/// server may.
+async fn spawn_capture_api() -> SocketAddr {
+    async fn capture(
+        method: axum::http::Method,
+        uri: axum::http::Uri,
+        headers: HeaderMap,
+        body: axum::body::Bytes,
+    ) -> axum::response::Response {
+        let content_type = headers
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        if uri.path().starts_with("/api/strict")
+            && content_type.as_deref() != Some("application/vnd.api+json")
+        {
+            return (StatusCode::UNSUPPORTED_MEDIA_TYPE, "unsupported media type").into_response();
+        }
+        Json(json!({
+            "method": method.as_str(),
+            "path": uri.path(),
+            "query": uri.query(),
+            "content_type": content_type,
+            "body": String::from_utf8_lossy(&body),
+        }))
+        .into_response()
+    }
+    serve(axum::Router::new().fallback(capture)).await
+}
+
+/// One operation per body/parameter shape the generator publishes.
+fn capture_spec() -> Value {
+    let json_body = |schema: Value| json!({ "required": true, "content": { "application/json": { "schema": schema } } });
+    json!({
+        "openapi": "3.0.3",
+        "info": { "title": "capture", "version": "1" },
+        "paths": {
+            "/count": { "post": { "operationId": "count",
+                "requestBody": json_body(json!({ "type": "integer" })) } },
+            "/flag": { "post": { "operationId": "flag",
+                "requestBody": json_body(json!({ "type": "boolean" })) } },
+            "/label": { "post": { "operationId": "label",
+                "requestBody": json_body(json!({ "type": "string" })) } },
+            "/maybe": { "post": { "operationId": "maybe",
+                "requestBody": { "content": { "application/json": {
+                    "schema": { "type": "integer", "nullable": true } } } } } },
+            "/note": { "post": { "operationId": "note",
+                "requestBody": json_body(json!({ "type": "object" })) } },
+            "/things/{id}/{body}": { "post": {
+                "operationId": "things",
+                "parameters": [
+                    { "name": "id", "in": "path", "required": true, "schema": { "type": "integer" } },
+                    { "name": "id", "in": "query", "schema": { "type": "string" } },
+                    { "name": "body", "in": "path", "required": true, "schema": { "type": "string" } }
+                ],
+                "requestBody": json_body(json!({ "type": "object" }))
+            } },
+            "/batch/{ids}": { "get": {
+                "operationId": "batch",
+                "parameters": [ { "name": "ids", "in": "path", "required": true,
+                    "schema": { "type": "array", "items": { "type": "string" } } } ]
+            } },
+            "/strict": { "post": { "operationId": "strict",
+                "requestBody": { "required": true, "content": { "application/vnd.api+json": {
+                    "schema": { "type": "object" } } } } } },
+            "/either": { "post": { "operationId": "either",
+                "requestBody": { "required": true, "content": {
+                    "application/vnd.api+json": { "schema": { "type": "object" } },
+                    "application/json": { "schema": { "type": "object" } } } } } }
+        }
+    })
+}
+
+/// A client connected to a gateway serving [`capture_spec`] against the
+/// capture API, and a `tools/call` that returns what the API received.
+async fn capture_client(
+) -> impl Fn(&'static str, Value) -> futures::future::BoxFuture<'static, (Option<bool>, Value, Value)>
+{
+    let api = spawn_capture_api().await;
+    let snapshot = AisixSnapshot::new();
+    snapshot.mcp_servers.insert(openapi_entry(
+        "capture",
+        json!({
+            "name": "cap",
+            "type": "openapi",
+            "url": format!("http://{api}/api"),
+            "spec": capture_spec(),
+        }),
+    ));
+    let gw = spawn_gateway(McpGateway::from_snapshot(&snapshot)).await;
+    let client = std::sync::Arc::new(
+        ().serve(StreamableHttpClientTransport::from_uri(format!(
+            "http://{gw}/mcp"
+        )))
+        .await
+        .expect("connect downstream client"),
+    );
+    let tools = client.list_tools(None).await.expect("list tools").tools;
+    let schemas: HashMap<String, Value> = tools
+        .into_iter()
+        .map(|t| {
+            (
+                t.name.to_string(),
+                serde_json::to_value(&t.input_schema).unwrap(),
+            )
+        })
+        .collect();
+    move |name: &'static str, args: Value| {
+        let client = client.clone();
+        let schema = schemas[&format!("cap__{name}")].clone();
+        Box::pin(async move {
+            let result = client
+                .call_tool(call(&format!("cap__{name}"), args))
+                .await
+                .expect("tools/call");
+            let seen =
+                serde_json::from_str(&first_text(&result)).unwrap_or(json!(first_text(&result)));
+            (result.is_error, schema, seen)
+        })
+    }
+}
+
+/// A body schema that declares a primitive is sent the primitive the caller
+/// gave, as JSON; an explicit `null` reaches the API where the schema is
+/// nullable, and an omitted one sends no body.
+#[tokio::test]
+async fn a_primitive_body_reaches_the_api_as_published() {
+    let call = capture_client().await;
+    for (tool, value, wire) in [
+        ("count", json!(42), "42"),
+        ("flag", json!(true), "true"),
+        ("label", json!("plain text"), "\"plain text\""),
+        ("label", json!("{\"a\":1}"), "\"{\\\"a\\\":1}\""),
+        ("maybe", Value::Null, "null"),
+        ("note", json!({ "a": 1 }), "{\"a\":1}"),
+    ] {
+        let (is_error, schema, seen) = call(tool, json!({ "body": value })).await;
+        assert_ne!(is_error, Some(true), "{tool}: {seen}");
+        // The value sent is one the published schema admits.
+        let declared = &schema["properties"]["body"]["type"];
+        assert!(declared.is_string(), "{tool}: {schema}");
+        assert_eq!(seen["body"], wire, "{tool} sent {value}");
+        assert_eq!(seen["content_type"], "application/json", "{tool}");
+    }
+    let (_, _, seen) = call("maybe", json!({})).await;
+    assert_eq!(seen["body"], "", "an omitted optional body sends none");
+}
+
+/// Two parameters that share a name, and a path parameter named like the
+/// body, are each published under an argument of their own, and each value
+/// reaches its own place in the request.
+#[tokio::test]
+async fn parameters_sharing_a_name_reach_their_own_locations() {
+    let call = capture_client().await;
+    let (is_error, schema, seen) = call(
+        "things",
+        json!({ "id__path": 7, "id__query": "q-7", "body__path": "segment", "body": { "k": "v" } }),
+    )
+    .await;
+    assert_ne!(is_error, Some(true), "{seen}");
+    let mut published: Vec<String> = schema["properties"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect();
+    published.sort();
+    assert_eq!(published, ["body", "body__path", "id__path", "id__query"]);
+    assert_eq!(seen["path"], "/api/things/7/segment");
+    assert_eq!(seen["query"], "id=q-7");
+    assert_eq!(seen["body"], "{\"k\":\"v\"}");
+}
+
+/// An array path parameter is written in the default `simple` style: the
+/// items comma-separated, each encoded on its own.
+#[tokio::test]
+async fn an_array_path_parameter_is_written_in_simple_style() {
+    let call = capture_client().await;
+    let (is_error, schema, seen) = call("batch", json!({ "ids": ["a", "b c", "d,e"] })).await;
+    assert_ne!(is_error, Some(true), "{seen}");
+    assert_eq!(schema["properties"]["ids"]["type"], "array");
+    assert_eq!(seen["path"], "/api/batch/a,b%20c,d%2Ce");
+    // An item that would change the request target is still refused.
+    let (is_error, _, seen) = call("batch", json!({ "ids": ["a", "../x"] })).await;
+    assert_eq!(is_error, Some(true), "{seen}");
+}
+
+/// A body published from a vendor JSON media type is sent under it, so an API
+/// that insists on its declared type accepts the call; an operation that
+/// also offers plain JSON is sent plain JSON.
+#[tokio::test]
+async fn a_vendor_json_body_is_sent_under_its_own_media_type() {
+    let call = capture_client().await;
+    let (is_error, _, seen) = call("strict", json!({ "body": { "data": { "type": "x" } } })).await;
+    assert_ne!(is_error, Some(true), "{seen}");
+    assert_eq!(seen["content_type"], "application/vnd.api+json");
+    assert_eq!(seen["body"], "{\"data\":{\"type\":\"x\"}}");
+    let (_, _, seen) = call("either", json!({ "body": {} })).await;
+    assert_eq!(seen["content_type"], "application/json");
+}
+
 /// A REST response is read up to a fixed cap: one past it fails the call
 /// whole, whether its length is declared or it streams without one, rather
 /// than being held in memory; a small answer from the same API is

@@ -15,6 +15,12 @@
 //! their shape, and a non-2xx response is flagged `is_error` so the agent can
 //! react to a failed call.
 //!
+//! What the published schema describes is what is sent: a parameter is read
+//! from the argument it was published under, a body value the schema admits
+//! goes out as given, under the media type the schema came from, and a path
+//! parameter's array is written in the default `simple` style
+//! (<https://spec.openapis.org/oas/v3.1.1.html#style-values>).
+//!
 //! The spec is read from the resource snapshot (shared, never re-fetched at
 //! runtime): the control plane validates and materializes it at write time, so
 //! the tool set only changes when the resource does. The generation itself is
@@ -307,11 +313,20 @@ impl OpenApiBridge {
             .map_err(|_| McpError::Request(format!("unsupported HTTP method {}", tool.method)))?;
 
         let query = build_query_pairs(tool, &args);
-        let body = if tool.has_body {
-            coerce_body(args.get("body"))
-        } else {
-            None
+        let body = match &tool.body_media_type {
+            Some(_) => body_to_send(
+                tool.input_schema.pointer("/properties/body"),
+                args.get("body"),
+            ),
+            None => None,
         };
+        // The media type the body schema was published under: reqwest's
+        // `json` writes `application/json` only into an unset slot.
+        let content_type = tool.body_media_type.as_deref().map(|media_type| {
+            reqwest::header::HeaderValue::from_str(media_type).unwrap_or(
+                reqwest::header::HeaderValue::from_static("application/json"),
+            )
+        });
         // An exchanged token the REST API rejects is dropped and exchanged
         // afresh, once.
         let attempts = if self.server().auth_type == McpAuthType::OAuth2TokenExchange {
@@ -332,8 +347,10 @@ impl OpenApiBridge {
             if !query.is_empty() {
                 request = request.query(&query);
             }
-            if let Some(body) = &body {
-                request = request.json(body);
+            if let (Some(body), Some(content_type)) = (&body, &content_type) {
+                request = request
+                    .header(reqwest::header::CONTENT_TYPE, content_type.clone())
+                    .json(body);
             }
 
             // The error text is logged server-side by the gateway and never
@@ -556,20 +573,43 @@ fn build_url(
 ) -> Result<String, String> {
     let mut path = tool.path.clone();
     for param in &tool.path_params {
-        let value = args.get(param.as_str()).unwrap_or(&Value::Null);
-        let raw = match value {
-            Value::String(s) => s.clone(),
-            Value::Number(n) => n.to_string(),
-            Value::Bool(b) => b.to_string(),
-            Value::Null => return Err(format!("missing required path parameter '{param}'")),
-            _ => {
-                return Err(format!(
-                    "path parameter '{param}' must be a string, number, or boolean"
-                ))
+        let argument = param.argument.as_str();
+        let value = args.get(argument).unwrap_or(&Value::Null);
+        let scalar = |value: &Value| match value {
+            Value::String(s) => Some(s.clone()),
+            Value::Number(n) => Some(n.to_string()),
+            Value::Bool(b) => Some(b.to_string()),
+            _ => None,
+        };
+        let safe = match value {
+            Value::Null => return Err(format!("missing required path parameter '{argument}'")),
+            // `simple` style, the default for a path parameter: the items
+            // comma-separated, each one encoded on its own.
+            Value::Array(items) if !items.is_empty() => items
+                .iter()
+                .map(|item| {
+                    let raw = scalar(item).ok_or_else(|| {
+                        format!(
+                            "path parameter '{argument}' must be a list of strings, numbers, \
+                             or booleans"
+                        )
+                    })?;
+                    sanitize_path_value(&raw, argument)
+                })
+                .collect::<Result<Vec<_>, _>>()?
+                .join(","),
+            Value::Array(_) => return Err(format!("missing required path parameter '{argument}'")),
+            other => {
+                let raw = scalar(other).ok_or_else(|| {
+                    format!(
+                        "path parameter '{argument}' must be a string, number, boolean, or a \
+                         list of them"
+                    )
+                })?;
+                sanitize_path_value(&raw, argument)?
             }
         };
-        let safe = sanitize_path_value(&raw, param)?;
-        path = path.replace(&format!("{{{param}}}"), &safe);
+        path = path.replace(&format!("{{{}}}", param.name), &safe);
     }
     Ok(format!("{}{}", base_url.trim_end_matches('/'), path))
 }
@@ -597,17 +637,17 @@ fn sanitize_path_value(raw: &str, param: &str) -> Result<String, String> {
 fn build_query_pairs(tool: &GeneratedTool, args: &Map<String, Value>) -> Vec<(String, String)> {
     let mut pairs = Vec::new();
     for param in &tool.query_params {
-        let Some(value) = args.get(param.as_str()) else {
+        let Some(value) = args.get(param.argument.as_str()) else {
             continue;
         };
         match value {
             Value::Null => {}
             Value::Array(items) => {
                 for item in items {
-                    pairs.push((param.clone(), scalar_to_string(item)));
+                    pairs.push((param.name.clone(), scalar_to_string(item)));
                 }
             }
-            other => pairs.push((param.clone(), scalar_to_string(other))),
+            other => pairs.push((param.name.clone(), scalar_to_string(other))),
         }
     }
     pairs
@@ -618,6 +658,42 @@ fn scalar_to_string(value: &Value) -> String {
         Value::String(s) => s.clone(),
         other => other.to_string(),
     }
+}
+
+/// The JSON body to send for the `body` argument. A value the published body
+/// `schema` admits by its declared `type` is sent as given: an integer body is
+/// sent as that integer, and an explicit `null` as `null` where the schema
+/// allows one (`nullable` in OpenAPI 3.0, a `"null"` type in 3.1). Any other
+/// value goes through [`coerce_body`]; absent means no body.
+fn body_to_send(schema: Option<&Value>, value: Option<&Value>) -> Option<Value> {
+    let value = value?;
+    if schema.is_some_and(|schema| schema_admits(schema, value)) {
+        return Some(value.clone());
+    }
+    coerce_body(Some(value))
+}
+
+/// Whether `schema`'s declared `type` admits `value`'s JSON type. A schema
+/// that declares no `type` admits only the `null` its `nullable` allows.
+fn schema_admits(schema: &Value, value: &Value) -> bool {
+    let nullable = schema.get("nullable").and_then(Value::as_bool) == Some(true);
+    let types: Vec<&str> = match schema.get("type") {
+        Some(Value::String(t)) => vec![t.as_str()],
+        Some(Value::Array(ts)) => ts.iter().filter_map(Value::as_str).collect(),
+        _ => Vec::new(),
+    };
+    types.iter().any(|t| match (*t, value) {
+        ("null", Value::Null) => true,
+        ("boolean", Value::Bool(_)) => true,
+        ("string", Value::String(_)) => true,
+        ("number", Value::Number(_)) => true,
+        ("integer", Value::Number(n)) => {
+            n.is_i64() || n.is_u64() || n.as_f64().is_some_and(|f| f.fract() == 0.0)
+        }
+        ("array", Value::Array(_)) => true,
+        ("object", Value::Object(_)) => true,
+        _ => false,
+    }) || (nullable && value.is_null())
 }
 
 /// Coerce the `body` argument into the JSON body to send, mirroring mainstream gateways:
@@ -639,6 +715,7 @@ fn coerce_body(value: Option<&Value>) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aisix_core::mcp_openapi::ToolParam;
 
     fn tool_names(spec: &Value) -> Vec<String> {
         generate_tools(spec)
@@ -783,9 +860,9 @@ mod tests {
         let tool = find(&tools, "updateitem");
         assert_eq!(tool.method, "patch");
         assert_eq!(tool.path, "/items/{id}");
-        assert_eq!(tool.path_params, vec!["id"]);
-        assert_eq!(tool.query_params, vec!["dry_run"]);
-        assert!(tool.has_body);
+        assert_eq!(tool.path_params, vec![ToolParam::named("id")]);
+        assert_eq!(tool.query_params, vec![ToolParam::named("dry_run")]);
+        assert_eq!(tool.body_media_type.as_deref(), Some("application/json"));
 
         let schema = &tool.input_schema;
         let props = schema.get("properties").unwrap();
@@ -824,7 +901,7 @@ mod tests {
         let tools = generate_tools(&spec).unwrap();
         let tool = find(&tools, "getx");
         assert_eq!(tool.input_schema["properties"]["v"]["type"], "integer");
-        assert_eq!(tool.path_params, vec!["v"]);
+        assert_eq!(tool.path_params, vec![ToolParam::named("v")]);
     }
 
     #[test]
@@ -858,7 +935,7 @@ mod tests {
         });
         let tools = generate_tools(&spec).unwrap();
         let tool = find(&tools, "createorder");
-        assert_eq!(tool.query_params, vec!["per_page"]);
+        assert_eq!(tool.query_params, vec![ToolParam::named("per_page")]);
         let body = &tool.input_schema["properties"]["body"];
         assert_eq!(body["properties"]["sku"]["type"], "string");
         // Nested ref resolved one level deeper.
@@ -947,9 +1024,9 @@ mod tests {
             input_schema: json!({}),
             method: "get".into(),
             path: "/items/{id}/sub".into(),
-            path_params: vec!["id".into()],
+            path_params: vec![ToolParam::named("id")],
             query_params: vec![],
-            has_body: false,
+            body_media_type: None,
         };
         let args = |v: Value| {
             let mut m = Map::new();
@@ -991,8 +1068,11 @@ mod tests {
             method: "get".into(),
             path: "/".into(),
             path_params: vec![],
-            query_params: vec!["q".into(), "tags".into(), "filter".into(), "absent".into()],
-            has_body: false,
+            query_params: ["q", "tags", "filter", "absent"]
+                .into_iter()
+                .map(ToolParam::named)
+                .collect(),
+            body_media_type: None,
         };
         let mut args = Map::new();
         args.insert("q".into(), json!("text"));
