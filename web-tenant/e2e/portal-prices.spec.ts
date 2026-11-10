@@ -241,3 +241,41 @@ test("价格页不出现分组的路由名", async ({ page }) => {
   const seen = [await page.locator("body").innerText(), await page.content()];
   for (const text of seen) expect.soft(text).not.toContain(GROUP_ROUTE.name);
 });
+
+/**
+ * A one-hour cache write is billed at its own rate when the baseline gives
+ * one, so the page shows it beside the default write rather than leaving
+ * that rate for a reader to guess. A model with no such rate shows nothing
+ * extra (the existing cases pin that row to exactly its five cells).
+ */
+test("基准价单列 1 小时缓存写时，价格页在缓存写下另列这一价", async ({ page }) => {
+  const card = { input: "3", output: "15", cache_read: "0.3", cache_write: "3.5", cache_write_1h: "6" };
+  const account = (await stack.admin.get("/admin/resources/provider_keys")).items.find(
+    (k: { doc: { display_name?: string } }) => k.doc.display_name === "acct-price-3f7",
+  );
+  const model = await stack.admin.post("/admin/resources/models", {
+    doc: { display_name: "chat-1h-3f7", provider: "openai", model_name: "gpt-4o-mini", provider_key_id: account.id },
+  });
+  await stack.admin.post("/admin/pricing/baselines", {
+    model_id: model.id,
+    effective_from: new Date(Date.now() - 4_000).toISOString(),
+    card: { default: { base: card } },
+    note: "价格页 e2e 的 1 小时缓存写 3f7",
+  });
+  const id = await activeOrg("Prices 1h Org 5f8", "owner@prices-5f8.test", [GROUP_A.name]);
+  const current = await stack.admin.get(`/admin/tenants/${id}`);
+  await stack.admin.patch(`/admin/tenants/${id}`, { allowed_model_ids: [pricedModelId, model.id] }, current.version);
+
+  await login(page, "owner@prices-5f8.test");
+  await page.getByRole("tab", { name: "价格", exact: true }).click();
+  const panel = page.getByRole("tabpanel", { name: GROUP_A.display });
+  await expect(panel.getByRole("row", { name: /chat-1h-3f7/ }).getByRole("cell")).toHaveText([
+    "chat-1h-3f7",
+    yuanPerMillion(card.input, RATE_A, DISCOUNT_BPS),
+    yuanPerMillion(card.output, RATE_A, DISCOUNT_BPS),
+    yuanPerMillion(card.cache_read, RATE_A, DISCOUNT_BPS),
+    `${yuanPerMillion(card.cache_write, RATE_A, DISCOUNT_BPS)}1 小时缓存写 ${yuanPerMillion(card.cache_write_1h, RATE_A, DISCOUNT_BPS)}`,
+  ]);
+  // The model without a one-hour rate in the same table keeps its five plain cells.
+  await rowPrices(panel, "chat-price-3f7", RATE_A);
+});
