@@ -4890,11 +4890,12 @@ struct AnthropicStreamUsage {
 
 impl AnthropicStreamUsage {
     /// Record what ended the stream, in both of the forms its readers want.
-    /// An output that did not end cleanly is never attached to an exporter.
+    /// Capture safety is not this call's to change: an unguarded stream's row
+    /// still reports what the caller received, and a guarded one stays
+    /// unexportable unless its scan completes (`response_capture_safe`).
     fn note_stream_failure(&mut self, failure: crate::stream_timeout::RawStreamFailure) {
         crate::attempt::StreamFailure::record(&mut self.failure, &failure.bridge_error());
         self.stream_failure = Some(failure);
-        self.response_capture_safe = false;
     }
 }
 
@@ -9068,6 +9069,77 @@ event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_toke
             assert_eq!(completion.response_capture_safe, expect_exported);
             assert_eq!(completion.response_text == "partial", expect_exported);
             assert_eq!(completion.response_text.is_empty(), !expect_exported);
+        }
+    }
+
+    /// The native relay's sibling of the test above: an unguarded stream that
+    /// fails — an in-band `error` event, or an end with no `message_stop` —
+    /// still exports the text the caller received. Under an output guardrail
+    /// whose scan the failure cut short, nothing is exported.
+    #[tokio::test]
+    async fn a_failed_native_stream_exports_only_what_needed_no_scan() {
+        use aisix_core::models::GuardrailHookPoint;
+        use aisix_guardrails::{builtin_rule, Guardrail, GuardrailChain, PiiAction, PiiGuardrail};
+        use futures::StreamExt;
+        use std::sync::{Arc, Mutex};
+
+        const DELIVERED: &str = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_cut\",\"model\":\"claude\",\"usage\":{\"input_tokens\":30,\"output_tokens\":1}}}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n",
+        );
+        // Anthropic's documented mid-stream error event.
+        const OVERLOADED: &str = concat!(
+            "event: error\n",
+            "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n",
+        );
+        let monitor = || {
+            Arc::new(GuardrailChain::new(vec![Arc::new(PiiGuardrail::new(
+                vec![builtin_rule("email", PiiAction::Mask).unwrap()],
+                GuardrailHookPoint::Output,
+                262_144,
+                false,
+            ))
+                as Arc<dyn Guardrail>]))
+        };
+        for tail in [OVERLOADED, ""] {
+            for (guardrail, expect_exported) in [(None, true), (Some(monitor()), false)] {
+                let upstream =
+                    futures::stream::iter(vec![Ok::<_, crate::stream_timeout::RawStreamError>(
+                        bytes::Bytes::from(format!("{DELIVERED}{tail}")),
+                    )]);
+                let captured = Arc::new(Mutex::new(None));
+                let captured_out = Arc::clone(&captured);
+                let now = std::time::Instant::now();
+                let mut stream = super::build_anthropic_passthrough_stream(
+                    upstream,
+                    now,
+                    now,
+                    guardrail,
+                    "relay-claude".into(),
+                    Some(4096),
+                    None,
+                    move |usage| *captured_out.lock().unwrap() = Some(usage),
+                );
+                while stream.next().await.is_some() {}
+                drop(stream);
+
+                let usage = captured.lock().unwrap().take().expect("on_complete fired");
+                assert!(usage.failure.is_some(), "tail {tail:?}: the stream failed");
+                assert_eq!(
+                    usage.response_capture_safe, expect_exported,
+                    "tail {tail:?}, exported {expect_exported}"
+                );
+                assert_eq!(
+                    usage.response_text == "partial",
+                    expect_exported,
+                    "tail {tail:?}: {:?}",
+                    usage.response_text
+                );
+            }
         }
     }
 

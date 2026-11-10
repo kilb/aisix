@@ -264,10 +264,12 @@ describe("failure rows carry request and response bodies", () => {
       provider: "openai" | "anthropic",
       streamEvents: string[],
       providerKey: Record<string, unknown> = {},
+      // `false`: every event goes out and the body then ends cleanly.
+      disconnect = true,
     ): Promise<void> => {
       const upstream = await startOpenAiUpstream({
         streamEvents,
-        disconnectAfterEvents: streamEvents.length - 1,
+        disconnectAfterEvents: disconnect ? streamEvents.length - 1 : undefined,
         eventDelayMs: 100,
       });
       upstreams.push(upstream);
@@ -301,6 +303,35 @@ describe("failure rows carry request and response bodies", () => {
       JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "partial-answer" } }),
       JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: " more" } }),
     ]);
+    // A native Messages stream that the upstream itself ends as a failure
+    // after text went out: Anthropic's documented mid-stream `error` event,
+    // and a body that ends with no `message_stop`.
+    const messagesPrefix = [
+      JSON.stringify({
+        type: "message_start",
+        message: {
+          id: "msg_failed",
+          role: "assistant",
+          content: [],
+          model: "claude-3-5-haiku-20241022",
+          stop_reason: null,
+          usage: { input_tokens: 5, output_tokens: 1 },
+        },
+      }),
+      JSON.stringify({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }),
+      JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "partial-answer" } }),
+    ];
+    await cutModel(
+      "row-stream-error-messages",
+      "anthropic",
+      [
+        ...messagesPrefix,
+        JSON.stringify({ type: "error", error: { type: "overloaded_error", message: "Overloaded" } }),
+      ],
+      {},
+      false,
+    );
+    await cutModel("row-stream-eof-messages", "anthropic", messagesPrefix, {}, false);
     await cutModel("row-stream-cut-responses", "openai", [
       JSON.stringify({ type: "response.created", response: { id: "resp_cut", status: "in_progress" } }),
       JSON.stringify({ type: "response.output_text.delta", delta: "partial-answer" }),
@@ -489,6 +520,8 @@ describe("failure rows carry request and response bodies", () => {
         "row-truncated",
         "row-stream-cut",
         "row-stream-cut-messages",
+        "row-stream-error-messages",
+        "row-stream-eof-messages",
         "row-stream-cut-responses",
         "row-stream-cut-responses-bridge",
         "row-in-band",
@@ -1158,6 +1191,8 @@ describe("failure rows carry request and response bodies", () => {
   test.each([
     ["/v1/messages, bridged", "/v1/messages", "row-stream-cut", CUT_MESSAGES],
     ["/v1/messages, native", "/v1/messages", "row-stream-cut-messages", CUT_MESSAGES],
+    ["/v1/messages, native, in-band error", "/v1/messages", "row-stream-error-messages", CUT_MESSAGES],
+    ["/v1/messages, native, no message_stop", "/v1/messages", "row-stream-eof-messages", CUT_MESSAGES],
     ["/v1/responses, native", "/v1/responses", "row-stream-cut-responses", { input: "stream-cut-prompt" }],
     ["/v1/responses, bridged", "/v1/responses", "row-stream-cut-responses-bridge", { input: "stream-cut-prompt" }],
   ] as const)("%s: a stream cut off mid-way keeps the request and what had arrived", async (_, path, model, body) => {
