@@ -656,6 +656,8 @@ function TenantDetail({
         catalog={catalog.data}
         catalogError={catalog.error}
         publics={publics.data?.filter((p: PublicModel) => p.retired_at === null).map((p: PublicModel) => p.id) ?? null}
+        publicsError={publics.error}
+        onReloadPublics={() => void publics.reload()}
         priced={priced}
       />
       <GroupsPart
@@ -803,12 +805,16 @@ function GrantsPart({
   catalog,
   catalogError,
   publics,
+  publicsError,
+  onReloadPublics,
   priced,
 }: PartProps & {
   catalog: ResourceView<ModelDoc>[] | null;
   catalogError: string | null;
   /** The ids of the live public models; `null` until the list is read. */
   publics: string[] | null;
+  publicsError: string | null;
+  onReloadPublics: () => void;
   /** The ids of the models with a baseline in force; `null` until the list is read. */
   priced: Set<string> | null;
 }) {
@@ -830,17 +836,20 @@ function GrantsPart({
   }, [stored]);
   useConflictClears(tenant.version, setRefused);
 
-  // What an all-scope tenant reaches: every live public model, which the
-  // catalogue lists once its routing document is live.
-  const reachable = useMemo(() => new Set(publics ?? []), [publics]);
+  // What the tenant reaches now, as the control plane resolved it with the
+  // row. It comes with the tenant itself, so narrowing from it and checking
+  // a save against it never wait on, or guess at, another read.
+  const current = useMemo(() => new Set(tenant.effective_model_ids), [tenant.effective_model_ids]);
+  // What the `all` scope gives: every live public model the catalogue lists.
+  // A public model with no document yet is not callable and is not in scope
+  // until an account serves it. `null` until both lists are read: an unread
+  // list is not an empty one.
+  const allScope = useMemo(() => {
+    if (catalog === null || publics === null) return null;
+    const live = new Set(publics);
+    return new Set(catalog.filter((m) => live.has(m.id)).map((m) => m.id));
+  }, [catalog, publics]);
   const all = scope === "all";
-  // The rows the save keeps under `all`: every public model the catalogue
-  // lists. A public model with no document yet is not callable and is not in
-  // scope until an account serves it.
-  const effective = useMemo(
-    () => (all ? (catalog ?? []).filter((m) => reachable.has(m.id)) : []),
-    [all, catalog, reachable],
-  );
 
   // The catalog's models, then every granted or chosen model it does not
   // list: a save sends the whole list, so a grant made since the catalog was
@@ -878,10 +887,15 @@ function GrantsPart({
     return notes.length > 0 ? notes.join(" ") : undefined;
   }
 
-  // Grants the save takes away: every key of the tenant loses those models.
-  // Under `all` the rows are fixed, so a save there only ever widens the
-  // scope to what the catalogue now lists; a list save may withdraw.
-  const withdrawn = all ? [] : tenant.allowed_model_ids.filter((id) => !chosen.has(id));
+  // Grants the save takes away, whichever way the scope moves: what the
+  // tenant reaches now less what it will reach, which every key of the
+  // tenant loses. Leaving `all` for a list can drop public models, and going
+  // back to `all` drops a hand-made model the list held. `null` while what
+  // `all` gives is unknown: such a save is not offered, since nobody could
+  // be told what it takes away. Keeping `all` changes nothing.
+  const after = all ? allScope : chosen;
+  const withdrawn =
+    after === null ? null : all && tenant.model_scope === "all" ? [] : [...current].filter((id) => !after.has(id));
   // Unsaved edits: the save turns Sign yellow only while there are some.
   const granted =
     scope !== tenant.model_scope || [...chosen].some((id) => !tenant.allowed_model_ids.includes(id));
@@ -915,11 +929,7 @@ function GrantsPart({
    * scope had been standing aside.
    */
   function switchScope(next: "all" | "selected") {
-    if (next === "selected") {
-      setChosen(new Set(all ? effective.map((m) => m.id) : tenant.allowed_model_ids));
-    } else {
-      setChosen(new Set(tenant.allowed_model_ids));
-    }
+    setChosen(new Set(next === "selected" ? tenant.effective_model_ids : tenant.allowed_model_ids));
     setScope(next);
   }
 
@@ -960,8 +970,20 @@ function GrantsPart({
           模型目录读取失败：{catalogError}
         </div>
       )}
+      {all && publicsError && (
+        <div className="note crit" role="alert">
+          公共模型列表读取失败：{publicsError}{" "}
+          <Button type="button" size="sm" onClick={onReloadPublics}>
+            重试
+          </Button>
+        </div>
+      )}
       {catalog === null ? (
         !catalogError && <Loading />
+      ) : all && allScope === null ? (
+        // Which models `all` covers is not known yet: nothing is shown as in
+        // or out of it, and the save waits.
+        !publicsError && <Loading />
       ) : rows.length === 0 ? (
         <p className="hint">模型目录还是空的。</p>
       ) : (
@@ -969,7 +991,7 @@ function GrantsPart({
           {rows.map((r) => {
             // Under `all` the public models are what the scope is, so they
             // read as ticked and fixed; everything else is out of reach.
-            const inScope = all ? reachable.has(r.id) : chosen.has(r.id);
+            const inScope = all ? (allScope?.has(r.id) ?? false) : chosen.has(r.id);
             return (
               <Check
                 key={r.id}
@@ -984,7 +1006,7 @@ function GrantsPart({
                     return next;
                   })
                 }
-                note={all ? (reachable.has(r.id) ? undefined : "不在全部公共模型的范围内") : noteFor(r)}
+                note={all ? (inScope ? undefined : "不在全部公共模型的范围内") : noteFor(r)}
                 error={all ? undefined : reasonFor(r)}
               />
             );
@@ -1001,14 +1023,14 @@ function GrantsPart({
       {canEdit && (
         // Until the catalog is read the form shows no choices. A save that takes a
         // grant away cuts every key of the tenant off from it, so it is confirmed
-        // first (ruling P1b-R6).
+        // first (ruling P1b-R6); one whose losses cannot be known yet waits.
         <TwoStep
           label="保存授权"
-          kind={withdrawn.length > 0 || granted ? "primary" : "secondary"}
-          disabled={busy || catalog === null}
+          kind={(withdrawn?.length ?? 0) > 0 || granted ? "primary" : "secondary"}
+          disabled={busy || catalog === null || withdrawn === null}
           busy={busy}
-          ask={() => withdrawn.length > 0}
-          warning={`将撤销 ${withdrawn.map(nameOf).join("、")} 的授权。保存后，该租户的所有密钥都不能再调用这些模型。`}
+          ask={() => (withdrawn?.length ?? 0) > 0}
+          warning={`将撤销 ${(withdrawn ?? []).map(nameOf).join("、")} 的授权。保存后，该租户的所有密钥都不能再调用这些模型。`}
           onConfirm={() => void submit()}
         />
       )}
