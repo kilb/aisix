@@ -90,14 +90,26 @@ impl Scrape {
             let failed = {
                 let sender = sender.clone();
                 tokio::task::spawn_blocking(move || {
+                    let mut abandoned = false;
                     aisix_core::run_demoted("metrics-render", || {
-                        render(&mut |piece| hand_over(&runtime, &sender, Bytes::from(piece)))
-                    })
+                        render(&mut |piece| {
+                            hand_over(&runtime, &sender, Bytes::from(piece), &mut abandoned)
+                        })
+                    });
+                    abandoned
                 })
                 .await
             };
             match failed {
-                Ok(()) => drop(terminal),
+                Ok(false) => drop(terminal),
+                // Given up on a reader that stopped taking pieces. It may
+                // still read what is queued, and what it reads must not end
+                // as a whole exposition: the render stopped part-way.
+                Ok(true) => {
+                    terminal.send(Err(std::io::Error::other(
+                        "metrics scrape abandoned: the reader stopped reading",
+                    )));
+                }
                 Err(error) => {
                     tracing::error!(%error, "metrics render task failed");
                     // The headers left long ago, so the only way left to
@@ -116,7 +128,9 @@ impl Scrape {
 
 /// Give one piece to the response, waiting for it to take an earlier
 /// one. `false` means stop rendering: the response is gone, or it has
-/// stopped taking pieces for longer than any live scrape would.
+/// stopped taking pieces for longer than any live scrape would — the one
+/// case that also sets `abandoned`, since only then is someone still
+/// there to read a body that has to end as incomplete.
 ///
 /// The wait is a real wait, not a poll. Looking again on a timer costs
 /// every full channel the whole interval even when the response drained
@@ -127,6 +141,7 @@ fn hand_over(
     runtime: &tokio::runtime::Handle,
     sender: &mpsc::Sender<Result<Bytes, std::io::Error>>,
     piece: Bytes,
+    abandoned: &mut bool,
 ) -> bool {
     // The timeout is built INSIDE the block, where the runtime context
     // exists: a timer registers when it is created, not when it is
@@ -142,6 +157,7 @@ fn hand_over(
                 "a metrics scrape stopped reading; abandoning its render so later \
                  scrapes are not blocked behind it",
             );
+            *abandoned = true;
             false
         }
     }
@@ -206,7 +222,8 @@ mod tests {
                 assert!(hand_over(
                     &runtime,
                     &sender,
-                    Bytes::from_static(b"a series line\n")
+                    Bytes::from_static(b"a series line\n"),
+                    &mut false,
                 ));
             }
         });
@@ -303,6 +320,49 @@ mod tests {
             .expect("the second scrape must not wait on the first reader");
         assert_eq!(body, "series 2\n");
         drop(stalled);
+    }
+
+    /// A render given up on a stalled reader stopped part-way. If that
+    /// reader comes back and reads what was queued, the body must end
+    /// abnormally — a clean end would hand it the truncated exposition as
+    /// a whole one — and the next scrape must still get the gate.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_abandoned_render_ends_the_body_with_an_error() {
+        let scrape = Scrape::default();
+        let mut stalled = scrape.stream(|emit| {
+            for _ in 0..64 {
+                if !emit("series 1\n".to_owned()) {
+                    return;
+                }
+            }
+        });
+        // Held unread past the handover timeout, so the render gives up.
+        tokio::time::sleep(PIECE_TIMEOUT * 2).await;
+
+        let mut pieces = 0;
+        let last = loop {
+            match tokio::time::timeout(Duration::from_secs(10), stalled.recv())
+                .await
+                .expect("the abandoned body must end")
+            {
+                Some(Ok(_)) => pieces += 1,
+                other => break other,
+            }
+        };
+        assert!(pieces < 64, "the render was not abandoned");
+        assert!(
+            matches!(last, Some(Err(_))),
+            "after {pieces} pieces the body ended cleanly; a truncated exposition must end \
+             abnormally",
+        );
+
+        assert_eq!(
+            collect(scrape.stream(|emit| {
+                assert!(emit("the next scrape\n".to_owned()));
+            }))
+            .await,
+            "the next scrape\n",
+        );
     }
 
     /// A render that dies has already had its headers sent, so the only
