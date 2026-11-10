@@ -275,6 +275,8 @@ export interface AdminKey {
   created_at: string;
   created_by: { kind: string; id: string | null };
   version: number;
+  /** Whether the plaintext can be shown again; a key minted before the sealed copy was stored cannot. */
+  plaintext_available: boolean;
 }
 
 /** What `POST /admin/tenants/{id}/keys` takes; a field left out is unset. */
@@ -291,7 +293,7 @@ export interface NewKey {
   expires_at?: string;
 }
 
-/** A key at creation: the only answer that carries its plaintext. */
+/** A key at creation, with its plaintext. A later reveal answers the same plaintext. */
 export interface MintedKey {
   key: AdminKey;
   plaintext: string;
@@ -499,9 +501,19 @@ export const tenants = {
 };
 
 export const keys = {
-  /** The answer is the only one that carries the plaintext: never store or log it. */
+  /** Never store or log the plaintext: neither this answer nor a reveal of it. */
   async create(tenantId: string, body: NewKey): Promise<MintedKey> {
     return (await call<MintedKey>("POST", `/admin/tenants/${seg(tenantId)}/keys`, body)).data;
+  },
+  /**
+   * A key's plaintext again, from the copy the control plane keeps sealed.
+   * Only the platform's own tenant's keys: a customer's answers `403`. A
+   * POST, because reading a credential is an action: it is audited there,
+   * and its answer is never cached. A key minted before that copy existed
+   * answers `409 plaintext_unavailable`.
+   */
+  async reveal(id: string): Promise<string> {
+    return (await call<{ plaintext: string }>("POST", `/admin/keys/${seg(id)}/reveal`)).data.plaintext;
   },
   /**
    * `disabled` is the operators' switch; `group_id` names the key's group and

@@ -177,6 +177,12 @@ export interface Stack {
    */
   clearKeyGroup(id: string): void;
   /**
+   * Leaves key `id` without its sealed plaintext, the state a key minted by
+   * a release before the control plane stored one is in. No API write
+   * produces it either, so a spec that needs it sets the row directly.
+   */
+  clearKeySealed(id: string): void;
+  /**
    * Adds to proposal `id`'s batch a pending copy of it dated `days` days
    * before today (UTC midnight): the row an upload leaves once a date it
    * found still ahead has passed, which no request can produce without the
@@ -388,6 +394,8 @@ export async function startStack(opts: { telemetryRelay?: boolean } = {}): Promi
       tenant: () => new ApiClient(ready.httpUrl),
       clearKeyGroup: (id: string) =>
         sqlAgainst(ready.cpDatabase, `UPDATE tenant_keys SET group_id = NULL WHERE id = '${id}'`),
+      clearKeySealed: (id: string) =>
+        sqlAgainst(ready.cpDatabase, `UPDATE tenant_keys SET sealed_plaintext = NULL WHERE id = '${id}'`),
       pastDatedProposal: (id: string, days: number) =>
         sqlAgainst(
           ready.cpDatabase,

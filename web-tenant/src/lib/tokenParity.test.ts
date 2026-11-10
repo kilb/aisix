@@ -41,6 +41,8 @@ const SHARED_UI = [
   "EmptyState.tsx",
   "DataTable.tsx",
   "Icon.tsx",
+  "CopyButton.tsx",
+  "KeySecret.tsx",
 ];
 
 for (const file of SHARED_UI) {

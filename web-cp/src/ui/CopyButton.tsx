@@ -8,33 +8,57 @@ const DONE_MS = 1_500;
 /**
  * Copies `text` to the clipboard. On success the button itself says 已复制
  * with a check for 1.5s and a toast confirms it; a refusal goes to
- * `onFailed`, which the caller shows beside the text to copy by hand.
+ * `onFailed` with its cause, which the caller shows beside the text to copy
+ * by hand.
  */
 export function CopyButton({
   text,
   label = "复制",
   size,
   kind = "secondary",
+  disabled = false,
+  disabledReason,
   onFailed,
 }: {
-  text: string;
+  /**
+   * The value to copy, or a request that answers it: a key's plaintext is
+   * fetched only when it is copied, and a request that refuses copies
+   * nothing.
+   */
+  text: string | (() => Promise<string>);
   label?: string;
   size?: "sm";
   kind?: "primary" | "secondary";
-  onFailed: () => void;
+  /** Off, with `disabledReason` saying why: the button keeps its place in a row. */
+  disabled?: boolean;
+  disabledReason?: string;
+  /** What went wrong: a refused request, or a clipboard the browser would not write. */
+  onFailed: (cause: unknown) => void;
 }) {
   const [done, setDone] = useState(false);
+  const [fetching, setFetching] = useState(false);
   const toast = useToast();
   const timer = useRef<number | undefined>(undefined);
   useEffect(() => () => window.clearTimeout(timer.current), []);
 
   async function copy() {
+    setFetching(true);
+    let value: string;
     try {
-      await navigator.clipboard.writeText(text);
-    } catch {
-      onFailed();
+      value = typeof text === "string" ? text : await text();
+    } catch (cause) {
+      setFetching(false);
+      onFailed(cause);
       return;
     }
+    try {
+      await navigator.clipboard.writeText(value);
+    } catch (cause) {
+      setFetching(false);
+      onFailed(cause);
+      return;
+    }
+    setFetching(false);
     setDone(true);
     toast("已复制");
     window.clearTimeout(timer.current);
@@ -42,7 +66,16 @@ export function CopyButton({
   }
 
   return (
-    <Button type="button" kind={kind} size={size} onClick={() => void copy()}>
+    <Button
+      type="button"
+      kind={kind}
+      size={size}
+      disabled={disabled}
+      disabledReason={disabledReason}
+      busy={fetching}
+      busyLabel={label}
+      onClick={() => void copy()}
+    >
       {done ? (
         <>
           <Icon name="check" />

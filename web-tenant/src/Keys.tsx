@@ -21,6 +21,7 @@ import { Button } from "./ui/Button";
 import { DataTable, Loading } from "./ui/DataTable";
 import { EmptyState } from "./ui/EmptyState";
 import { Field, useRefusalFocus } from "./ui/Field";
+import { KeySecret } from "./ui/KeySecret";
 import { Lamp, type LampState } from "./ui/Lamp";
 import { TwoStep } from "./ui/TwoStep";
 
@@ -64,7 +65,7 @@ export function Keys({
   const [people, setPeople] = useState<Member[] | null>(null);
   const [readErr, setReadErr] = useState<string | null>(null);
   // The plaintext, in this page's state alone: it goes with a reload or a
-  // change of page, as the notice says.
+  // change of page. The list's own 复制 reveals it again.
   const [minted, setMinted] = useState<string | null>(null);
   const [actionErr, setActionErr] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
@@ -174,8 +175,8 @@ export function Keys({
         <div className="panel-notes">
           {!active && <div className="note crit">组织已被停用，所有密钥暂时无法调用；这里只能吊销密钥。</div>}
           {minted && (
-            <ShownOnce title="明文只显示这一次" value={minted} onDone={() => setMinted(null)}>
-              <span className="hint">请立即复制并妥善保存；关闭、刷新或离开此页后无法再次查看。</span>
+            <ShownOnce title="密钥明文（可再次复制）" value={minted} onDone={() => setMinted(null)}>
+              <span className="hint">密钥创建成功。之后可在下面的密钥列表里随时点「复制」再次获取明文。</span>
             </ShownOnce>
           )}
           {listErr && (
@@ -222,7 +223,23 @@ export function Keys({
                       </span>
                     </td>
                     <td>
-                      <code>{k.prefix}…</code>
+                      <KeySecret
+                        prefix={k.prefix}
+                        className="acts"
+                        reveal={() => keyApi.reveal(k.id)}
+                        unavailable={
+                          k.plaintext_available ? null : "该密钥创建于旧版本，无法再次查看；如需明文请新建密钥"
+                        }
+                        onError={(e) =>
+                          setActionErr(
+                            e instanceof ApiError && e.code === "plaintext_unavailable"
+                              ? messageFor(e)
+                              : e instanceof ApiError
+                                ? formMessageFor(e)
+                                : failure(e),
+                          )
+                        }
+                      />
                     </td>
                     <td>
                       <span className="trunc" style={{ "--trunc": "128px" } as CSSProperties} title={owner}>

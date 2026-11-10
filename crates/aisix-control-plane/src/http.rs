@@ -263,6 +263,14 @@ pub const ROUTE_ROLES: &[(&str, &str, MinRole)] = &[
         "/admin/keys/{id}",
         MinRole::Op(OperatorRole::Operator),
     ),
+    // The platform's own keys' plaintext, which operators mint for their own
+    // use. Operator, not Viewer: reading a credential is an action, and it
+    // is audited.
+    (
+        "POST",
+        "/admin/keys/{id}/reveal",
+        MinRole::Op(OperatorRole::Operator),
+    ),
     // An upstream account's own model list, for the pickers. Operator, not
     // Viewer: it spends the account's credential on a call to the upstream.
     (
@@ -298,6 +306,14 @@ pub const ROUTE_ROLES: &[(&str, &str, MinRole)] = &[
     ("GET", "/api/keys/{id}", MinRole::Member(KEY_HOLDERS)),
     ("PATCH", "/api/keys/{id}", MinRole::Member(KEY_HOLDERS)),
     ("DELETE", "/api/keys/{id}", MinRole::Member(KEY_HOLDERS)),
+    // A POST because reading the plaintext is an action: it is audited, and
+    // no cache may hold it. A billing member holds no key, so the role list
+    // is the one that does.
+    (
+        "POST",
+        "/api/keys/{id}/reveal",
+        MinRole::Member(KEY_HOLDERS),
+    ),
     (
         "GET",
         "/api/keys/{id}/quota",
@@ -734,6 +750,7 @@ pub fn browser_router(state: AppState) -> Router {
                 .patch(keys::admin_update)
                 .delete(keys::admin_revoke),
         )
+        .route("/admin/keys/{id}/reveal", post(keys::admin_reveal))
         .route(
             "/admin/provider-keys/{id}/upstream-models",
             get(upstream_models::list),
@@ -763,6 +780,7 @@ pub fn browser_router(state: AppState) -> Router {
             "/api/keys/{id}",
             get(keys::get).patch(keys::update).delete(keys::revoke),
         )
+        .route("/api/keys/{id}/reveal", post(keys::reveal))
         .route("/admin/usage/events", get(usage::list_events))
         .route("/admin/usage/batches", get(usage::list_batches))
         .route("/admin/usage/rejects", get(usage::list_rejects))

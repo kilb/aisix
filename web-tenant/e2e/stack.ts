@@ -181,6 +181,12 @@ export interface Stack {
    * group), so a spec that needs it sets the row directly.
    */
   clearKeyGroup(id: string): void;
+  /**
+   * Leaves key `id` without its sealed plaintext, the state a key minted by
+   * a release before the control plane stored one is in. No API write
+   * produces it either, so a spec that needs it sets the row directly.
+   */
+  clearKeySealed(id: string): void;
   stop(): Promise<void>;
 }
 
@@ -382,6 +388,8 @@ export async function startStack(): Promise<Stack> {
         ),
       clearKeyGroup: (id: string) =>
         sqlAgainst(ready.cpDatabase, `UPDATE tenant_keys SET group_id = NULL WHERE id = '${uuidArg(id)}'`),
+      clearKeySealed: (id: string) =>
+        sqlAgainst(ready.cpDatabase, `UPDATE tenant_keys SET sealed_plaintext = NULL WHERE id = '${uuidArg(id)}'`),
       stop,
     };
   } catch (e) {

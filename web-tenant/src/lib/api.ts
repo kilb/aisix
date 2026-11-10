@@ -269,6 +269,8 @@ export interface TenantKey {
   disabled: boolean;
   /** The platform's switch, which only the platform turns off again. */
   disabled_by_platform: boolean;
+  /** Whether the plaintext can be shown again; a key minted before the sealed copy was stored cannot. */
+  plaintext_available: boolean;
   expires_at: string | null;
   created_at: string;
   version: number;
@@ -336,6 +338,15 @@ export const keys = {
   /** The new key, and its plaintext, which no later answer carries. */
   async create(body: NewKey): Promise<{ key: TenantKey; plaintext: string }> {
     return (await call<{ key: TenantKey; plaintext: string }>("POST", "/keys", body)).data;
+  },
+  /**
+   * The key's plaintext again, from the copy the control plane keeps sealed.
+   * A POST, because reading a credential is an action: it is audited there,
+   * and its answer is never cached. A key minted before that copy existed
+   * answers `409 plaintext_unavailable`.
+   */
+  async reveal(id: string): Promise<string> {
+    return (await call<{ plaintext: string }>("POST", `/keys/${at(id)}/reveal`)).data.plaintext;
   },
   /**
    * The organisation's own switch, at `version`. The body names this one

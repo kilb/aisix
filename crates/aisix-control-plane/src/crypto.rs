@@ -7,11 +7,18 @@
 //! data (`aad`) binds a sealed value to the slot it was sealed for, so a
 //! value copied into another slot does not open. A named secret in
 //! `cp_secrets` is sealed for the slot `aisix-cp:<name>`.
+//!
+//! A value stored as text rather than bytes carries [`SEALED_PREFIX`] and
+//! then the same bytes in base64url without padding ([`MasterKey::seal_text`],
+//! [`MasterKey::open_text`]); a credential in a gateway document and a key's
+//! plaintext are both stored that way.
 
 use std::fmt;
 use std::io::Read;
 use std::path::Path;
 
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM, NONCE_LEN};
 use ring::rand::{SecureRandom, SystemRandom};
 use sqlx::PgConnection;
@@ -20,6 +27,10 @@ use crate::db::DbError;
 
 /// The key's file holds 64 hex characters, optionally followed by one newline.
 const HEX_LEN: usize = 64;
+
+/// What a sealed value stored as text starts with; the rest is
+/// `base64url(nonce || ciphertext || tag)` without padding.
+pub const SEALED_PREFIX: &str = "aisixsealed.v1.";
 
 #[derive(Debug, thiserror::Error)]
 pub enum CryptoError {
@@ -119,6 +130,26 @@ impl MasterKey {
         body.truncate(plaintext_len);
         Ok(body)
     }
+
+    /// [`MasterKey::seal`] as a stored text value: [`SEALED_PREFIX`] and the
+    /// sealed bytes in base64url without padding.
+    pub fn seal_text(&self, aad: &[u8], plaintext: &str) -> String {
+        format!(
+            "{SEALED_PREFIX}{}",
+            URL_SAFE_NO_PAD.encode(self.seal(aad, plaintext.as_bytes()))
+        )
+    }
+
+    /// Opens a value [`MasterKey::seal_text`] produced for the same `aad`.
+    pub fn open_text(&self, aad: &[u8], sealed: &str) -> Result<String, CryptoError> {
+        let sealed = sealed
+            .strip_prefix(SEALED_PREFIX)
+            .ok_or(CryptoError::Open)?;
+        let bytes = URL_SAFE_NO_PAD
+            .decode(sealed)
+            .map_err(|_| CryptoError::Open)?;
+        String::from_utf8(self.open(aad, &bytes)?).map_err(|_| CryptoError::Open)
+    }
 }
 
 /// The `aad` of the secret `name`: a secret copied under another name does
@@ -161,4 +192,29 @@ pub async fn get_secret(
     sealed
         .map(|s| mk.open(secret_aad(name).as_bytes(), &s))
         .transpose()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const KEY: MasterKey = MasterKey([3; 32]);
+
+    #[test]
+    fn a_text_seal_opens_only_for_its_slot_and_key() {
+        let sealed = KEY.seal_text(b"cp:key:7c1", "sk-rt-plain-7c1");
+        assert!(sealed.starts_with(SEALED_PREFIX), "{sealed}");
+        assert!(!sealed.contains("sk-rt-plain-7c1"), "{sealed}");
+        assert_eq!(
+            KEY.open_text(b"cp:key:7c1", &sealed)
+                .unwrap_or_else(|e| panic!("open: {e}")),
+            "sk-rt-plain-7c1"
+        );
+        // Another slot, another key, or a value with no prefix does not open.
+        assert!(KEY.open_text(b"cp:key:7c2", &sealed).is_err());
+        assert!(MasterKey([4; 32])
+            .open_text(b"cp:key:7c1", &sealed)
+            .is_err());
+        assert!(KEY.open_text(b"cp:key:7c1", "sk-rt-plain-7c1").is_err());
+    }
 }
