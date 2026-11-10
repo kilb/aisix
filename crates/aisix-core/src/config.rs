@@ -1163,6 +1163,9 @@ pub const CREDENTIAL_HEADERS: &[&str] = &[
     "proxy-authorization",  // proxy auth — never operator-controllable
     "cookie",               // session bleed between caller and upstream
     "host",                 // URL hijack via Host header
+    // A browser realtime client's gateway key rides the WebSocket
+    // subprotocol list (`openai-insecure-api-key.<key>`).
+    crate::forwarded_headers::WEBSOCKET_CREDENTIAL_HEADER,
 ];
 
 /// Where the gateway will accept a caller-supplied request id
@@ -3646,6 +3649,25 @@ admin:
             err.contains("proxy.request_id.accept_headers"),
             "expected the offending key in the error, got: {err}"
         );
+    }
+
+    /// A browser realtime client sends its gateway key as a WebSocket
+    /// subprotocol (`openai-insecure-api-key.<key>`), and a list without
+    /// spaces is an acceptable request id: reading the id out of that header
+    /// would echo, log and export the key.
+    #[test]
+    fn request_id_accept_headers_rejects_the_websocket_subprotocol_list() {
+        for spelling in ["sec-websocket-protocol", "Sec-WebSocket-Protocol"] {
+            let cfg = RequestIdConfig {
+                accept_headers: vec!["x-aisix-request-id".into(), spelling.into()],
+            };
+            assert_eq!(cfg.parse_accept_headers().unwrap_err(), spelling);
+        }
+        // The default and the opt-in standard header still parse.
+        let cfg = RequestIdConfig {
+            accept_headers: vec!["x-aisix-request-id".into(), "x-request-id".into()],
+        };
+        assert_eq!(cfg.parse_accept_headers().unwrap().len(), 2);
     }
 
     // A request id read out of a credential header would be echoed to the

@@ -163,6 +163,10 @@ impl RoutingTelemetry {
         // extends it to the measured stream end.
         if let Some(trace) = &self.trace {
             trace.end_attempt(rec.index);
+            // A locally refused attempt exports no upstream CLIENT span.
+            if !rec.dispatched {
+                trace.mark_not_dispatched(rec.index);
+            }
         }
         // …and hand the settled record to the attribution cell, so a cancel
         // arriving later still emits the attempts that already failed
@@ -748,6 +752,43 @@ mod tests {
         assert_eq!(measured_ms(Duration::from_micros(400)), 1);
         assert_eq!(measured_ms(Duration::from_micros(2_700)), 2);
         assert_eq!(measured_ms(Duration::from_secs(u64::MAX)), u32::MAX);
+    }
+
+    /// The settle chokepoint carries an attempt's `dispatched: false` onto
+    /// the trace, so a target refused by its own rate limit exports no
+    /// upstream CLIENT span; a dispatched attempt keeps its span.
+    #[test]
+    fn a_locally_refused_attempt_exports_no_client_span() {
+        let trace = std::sync::Arc::new(aisix_obs::RequestTraceBundle::new(None));
+        let mut telemetry = RoutingTelemetry::for_request("group").with_trace(Some(trace.clone()));
+        let record = |index: u32, dispatched: bool| AttemptRecord {
+            index,
+            kind: "initial",
+            target_model: "t".into(),
+            target_model_id: "m".into(),
+            provider_key_id: "pk".into(),
+            status: if dispatched { 200 } else { 429 },
+            success: dispatched,
+            error_class: String::new(),
+            error_message: String::new(),
+            latency_ms: 0,
+            dispatched,
+        };
+        let target = AttemptTarget {
+            display_name: "t",
+            target_model: "t",
+            model_id: "m",
+        };
+        let (refused, _) = telemetry.begin_attempt(target);
+        telemetry.settle(&record(refused, false));
+        assert!(trace.emission(false, refused, 0, false).spans.is_empty());
+
+        let (served, _) = telemetry.begin_attempt(target);
+        telemetry.settle(&record(served, true));
+        assert_eq!(
+            trace.emission(false, served, 0, true).spans[0].role,
+            aisix_obs::SpanRole::Attempt
+        );
     }
 
     /// One sample of every `BridgeError` variant.

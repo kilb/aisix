@@ -118,8 +118,9 @@ pub struct PassthroughRoute {
     /// on the usage event for per-employee audit attribution and stripped
     /// before forwarding. Lowercase-only so the forbidden credential-slot
     /// list in the coupling is exhaustive; credential-bearing names
-    /// (`authorization`, `cookie`, …) are rejected outright — their value
-    /// on the usage event would be credential retention, not identity.
+    /// (`authorization`, `cookie`, `x-aisix-api-key`, …), and the route's own
+    /// `auth_header_name` under `header_key`, are rejected outright — their
+    /// value on the usage event would be credential retention, not identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(regex(pattern = "^[!#$%&'*+.^_`|~0-9a-z-]+$"), length(min = 1))]
     pub identity_header: Option<String>,
@@ -270,6 +271,34 @@ impl PassthroughRoute {
         };
         crate::host::matches(hosts, host)
     }
+
+    /// The header whose value the route records as the caller's identity:
+    /// `identity_header`, unless it names a header that carries a credential
+    /// ([`identity_header_carries_credential`]). The write path refuses such a
+    /// name; a stored route that still carries one keeps serving and records
+    /// no identity rather than the credential.
+    pub fn recorded_identity_header(&self) -> Option<&str> {
+        let header = self.identity_header.as_deref()?;
+        let header_key_slot = match self.auth_mode {
+            PassthroughAuthMode::HeaderKey => self.auth_header_name.as_deref(),
+            PassthroughAuthMode::GatewayKey | PassthroughAuthMode::Anonymous => None,
+        };
+        (!identity_header_carries_credential(header, header_key_slot)).then_some(header)
+    }
+}
+
+/// Whether `identity_header` names a header whose value is a credential: a
+/// credential slot ([`FORBIDDEN_HEADER_SLOTS`], [`crate::CREDENTIAL_HEADERS`]),
+/// or the header a `header_key` route reads the gateway credential from
+/// (`header_key_slot`). Its value would be recorded on the usage event and
+/// exported as the caller's identity.
+pub fn identity_header_carries_credential(header: &str, header_key_slot: Option<&str>) -> bool {
+    FORBIDDEN_HEADER_SLOTS
+        .iter()
+        .chain(crate::CREDENTIAL_HEADERS)
+        .copied()
+        .chain(header_key_slot)
+        .any(|slot| slot.eq_ignore_ascii_case(header))
 }
 
 /// Cross-field coupling for the flat `PassthroughRoute` schema, injected as

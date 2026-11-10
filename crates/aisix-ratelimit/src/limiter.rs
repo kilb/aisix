@@ -137,6 +137,7 @@ impl Limiter {
             refresh_task,
             lease_loss,
             committed: false,
+            owed_tokens: 0,
         })
     }
 
@@ -267,6 +268,9 @@ pub struct Reservation {
     /// while `send_replace` keeps the terminal state for the later hold.
     lease_loss: tokio::sync::watch::Sender<bool>,
     committed: bool,
+    /// Tokens already known to be spent, credited if this reservation is
+    /// dropped without a commit ([`MultiReservation::owe_tokens`]).
+    owed_tokens: u64,
 }
 
 impl std::fmt::Debug for Reservation {
@@ -300,6 +304,10 @@ impl Drop for Reservation {
         if self.committed {
             return;
         }
+        // The post-stream credit, the only one a destructor can make.
+        if self.owed_tokens > 0 {
+            self.store.add_tokens(&self.key, self.owed_tokens);
+        }
         self.store.release(&self.key, &self.member);
     }
 }
@@ -314,6 +322,19 @@ pub struct MultiReservation {
 impl MultiReservation {
     pub fn new(reservations: Vec<Reservation>) -> Self {
         Self { reservations }
+    }
+
+    /// Record `tokens` as already spent while the concurrency slots stay
+    /// held: [`Self::commit_tokens`] later commits whatever it is given, and
+    /// a reservation dropped without a commit credits these tokens to every
+    /// layer as it releases. For an answer the upstream has billed while the
+    /// request still has work to do (an output check, a cache write): the
+    /// slot must stay taken until that work ends, and a caller that leaves
+    /// during it, or a refusal, still owes the tokens.
+    pub fn owe_tokens(&mut self, tokens: u64) {
+        for r in &mut self.reservations {
+            r.owed_tokens = tokens;
+        }
     }
 
     /// Commit the actual token cost to every layer.
@@ -1067,6 +1088,34 @@ mod tests {
                 "{key} must be credited by the batched post-stream commit"
             );
         }
+    }
+
+    /// Owed tokens keep the concurrency slot taken: a second request is
+    /// refused until the first ends. A reservation dropped after owing
+    /// (a refusal, a caller that left) credits the owed tokens once and
+    /// frees the slot; one committed after owing counts only what the commit
+    /// says.
+    #[tokio::test]
+    async fn owed_tokens_hold_the_slot_and_are_credited_once() {
+        let limiter = Limiter::local_with_clock(TestClock::new(100));
+        let l = limits(None, Some(10_000), Some(1));
+
+        let mut first = MultiReservation::new(vec![limiter.pre_commit("k", &l).await.unwrap()]);
+        first.owe_tokens(800);
+        assert!(
+            limiter.pre_commit("k", &l).await.is_err(),
+            "the slot is still taken while the owed answer is being checked"
+        );
+        drop(first);
+        assert_eq!(limiter.peek("k", &l).await.unwrap().tpm_used, 800);
+
+        let mut second = MultiReservation::new(vec![limiter.pre_commit("k", &l).await.unwrap()]);
+        second.owe_tokens(800);
+        second.commit_tokens(800).await;
+        assert_eq!(limiter.peek("k", &l).await.unwrap().tpm_used, 1_600);
+        // Released by the commit.
+        drop(limiter.pre_commit("k", &l).await.unwrap());
+        assert_eq!(limiter.peek("k", &l).await.unwrap().tpm_used, 1_600);
     }
 
     #[tokio::test]

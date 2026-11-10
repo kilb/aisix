@@ -1020,7 +1020,10 @@ async fn dispatch(
             "/v1/responses",
             &model_name,
             &model_entry.value,
-            || body.to_string(),
+            || match crate::response_cache::continuation_partition(state, auth) {
+                Some(groups) => format!("{body}\nallowed_provider_groups: {groups}"),
+                None => body.to_string(),
+            },
         )
     };
     if let Some(gate) = cache_gate.as_ref() {
@@ -1034,13 +1037,11 @@ async fn dispatch(
             snapshot,
             &model_name,
             &model_entry.value,
+            &auth.key().allowed_provider_groups,
             &client.routing_tags,
             &client.source_ip,
         )?;
         if let Some(hit) = gate.lookup().await {
-            if let Some(r) = reservation.take() {
-                r.commit_tokens(0).await;
-            }
             let cache = crate::response_cache::CacheTelemetry::hit(&hit);
             // The cache answered for the entry the caller addressed: set the
             // target attribution before the output chain below can refuse it,
@@ -1074,6 +1075,13 @@ async fn dispatch(
                 monitor_hits_out,
             )
             .await?;
+            // No upstream call, so nothing was consumed. Committed only once
+            // the output chain has let the hit through: the concurrency slot
+            // stays taken while it reads, and a blocked hit releases it as
+            // the reservation drops.
+            if let Some(r) = reservation.take() {
+                r.commit_tokens(0).await;
+            }
             let served = guarded.body;
             // A hit served content to the caller, so it is logged like a
             // fresh response — otherwise a content-capturing exporter's

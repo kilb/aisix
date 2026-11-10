@@ -969,7 +969,32 @@ pub fn validate_passthrough_route(value: &Value) -> Result<(), SchemaError> {
             PASSTHROUGH_ROUTE_RETIRED,
         )
     })?;
-    validate_source_cidrs(value)
+    validate_source_cidrs(value)?;
+    validate_identity_header(value)
+}
+
+/// A route's `identity_header` value is recorded on the usage event, so the
+/// write path refuses a header that carries a credential, the route's own
+/// `header_key` slot included (a cross-field equality the schema cannot
+/// express). Stored rows keep loading: the gateway records no identity for
+/// such a route instead (`PassthroughRoute::recorded_identity_header`).
+fn validate_identity_header(value: &Value) -> Result<(), SchemaError> {
+    let Some(header) = value.get("identity_header").and_then(Value::as_str) else {
+        return Ok(());
+    };
+    let header_key_slot = (value.get("auth_mode").and_then(Value::as_str) == Some("header_key"))
+        .then(|| value.get("auth_header_name").and_then(Value::as_str))
+        .flatten();
+    if super::passthrough_route::identity_header_carries_credential(header, header_key_slot) {
+        return Err(SchemaError {
+            path: "/identity_header".to_string(),
+            message: "must not name a header that carries a credential (a credential \
+                      header, or this route's `auth_header_name`): its value is recorded \
+                      as the caller's identity"
+                .to_string(),
+        });
+    }
+    Ok(())
 }
 
 // ---- lenient variants (etcd snapshot loader only, issue #871) ----
@@ -3074,6 +3099,62 @@ mod tests {
 
         doc["source_cidrs"] = serde_json::json!(["192.168.1.0/33"]);
         validate_passthrough_route_lenient(&doc).expect("stored rows must still load");
+    }
+
+    /// `identity_header`'s value is recorded as the caller's identity, so the
+    /// write path refuses every header that carries a credential, including
+    /// the gateway's own `x-aisix-api-key` and a `header_key` route's own
+    /// slot, while `x-aisix-api-key` stays a legal `auth_header_name` and an
+    /// ordinary identity header is accepted. Stored rows keep loading.
+    #[test]
+    fn write_path_rejects_an_identity_header_that_carries_a_credential() {
+        let route = |extra: serde_json::Value| {
+            let mut doc = serde_json::json!({
+                "name": "r",
+                "path_prefix": "/passthrough/x",
+                "target_url": "http://u.invalid",
+                "provider_key_id": "11111111-1111-1111-1111-111111111111"
+            });
+            doc.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            doc
+        };
+        for header in [
+            "x-aisix-api-key",
+            "api-key",
+            "x-goog-api-key",
+            "x-amz-security-token",
+            "sec-websocket-protocol",
+        ] {
+            let doc = route(serde_json::json!({ "identity_header": header }));
+            let err = validate_passthrough_route(&doc)
+                .expect_err(&format!("{header} carries a credential"));
+            assert_eq!(err.path, "/identity_header", "{header}: {}", err.message);
+            validate_passthrough_route_lenient(&doc).expect("stored rows must still load");
+        }
+
+        // The route's own gateway-credential slot.
+        let own_slot = route(serde_json::json!({
+            "auth_mode": "header_key",
+            "auth_header_name": "x-gw-key",
+            "identity_header": "x-gw-key"
+        }));
+        let err = validate_passthrough_route(&own_slot).expect_err("its own credential slot");
+        assert_eq!(err.path, "/identity_header", "{}", err.message);
+        validate_passthrough_route_lenient(&own_slot).expect("stored rows must still load");
+
+        // Controls: `x-aisix-api-key` stays a supported auth slot beside an
+        // ordinary identity header, and a custom slot's name is not refused
+        // as an identity on a route that reads no credential from it.
+        validate_passthrough_route(&route(serde_json::json!({
+            "auth_mode": "header_key",
+            "auth_header_name": "x-aisix-api-key",
+            "identity_header": "x-end-user"
+        })))
+        .expect("a custom auth slot beside a plain identity header");
+        validate_passthrough_route(&route(serde_json::json!({ "identity_header": "x-gw-key" })))
+            .expect("an ordinary identity header");
     }
 
     #[test]

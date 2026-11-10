@@ -1351,6 +1351,9 @@ async fn proxy_content(
     target: &VideoTarget,
     url: &str,
     request_id: &str,
+    // The caller key's concurrency slot, released when the relayed body ends
+    // or is dropped, not when the handler returns its head.
+    hold: Option<aisix_ratelimit::StreamConcurrencyGuard>,
 ) -> Result<Response, ProxyError> {
     let client = crate::http_client::client_for(target.conn.as_ref());
     // Same map-then-merge shape as `provider_call` — see the comment there
@@ -1440,9 +1443,14 @@ async fn proxy_content(
             dyn futures::Stream<Item = Result<bytes::Bytes, crate::stream_timeout::RawStreamError>>
                 + Send,
         >,
-    > = Box::pin(crate::request_id::in_request_span(
+    > = Box::pin(crate::request_id::in_request_span(futures::StreamExt::map(
         crate::stream_timeout::with_read_timeout_bytes(resp.bytes_stream(), stream_budget),
-    ));
+        // Owns the concurrency hold for as long as the body lives.
+        move |chunk| {
+            let _keep = &hold;
+            chunk
+        },
+    )));
     let mut response = Response::new(axum::body::Body::from_stream(wrapped));
     let headers = response.headers_mut();
     headers.insert(
@@ -2364,12 +2372,13 @@ pub async fn video_content(
     };
 
     let result: Result<(Response, bool), ProxyError> = async {
-        // Same model-layer exemption as the poll route (see get_video).
-        let reservation = crate::quota::enforce(&state, &snapshot, &auth, None).await?;
+        // Same model-layer exemption as the poll route (see get_video). The
+        // key layers' concurrency slot is held until the content is delivered:
+        // a proxied download keeps it until its body ends, every other
+        // outcome releases it below (or as it drops, on an error).
+        let mut reservation = Some(crate::quota::enforce(&state, &snapshot, &auth, None).await?);
         crate::budget::gate(&state, &snapshot).check_provider_key(&target.pk_id)?;
-        let result = poll_task(&state, &target, &task_id, &client.request_id).await;
-        reservation.commit_tokens(0).await;
-        let poll = result?;
+        let poll = poll_task(&state, &target, &task_id, &client.request_id).await?;
 
         let mut relays_body = false;
         let response = match poll.status {
@@ -2414,7 +2423,8 @@ pub async fn video_content(
                     }
                     ContentDelivery::Proxy { url } => {
                         relays_body = true;
-                        proxy_content(&state, &target, &url, &client.request_id).await?
+                        let hold = reservation.take().map(|r| r.into_stream_hold());
+                        proxy_content(&state, &target, &url, &client.request_id, hold).await?
                     }
                 }
             }
@@ -2438,6 +2448,9 @@ pub async fn video_content(
                 )));
             }
         };
+        if let Some(r) = reservation {
+            r.commit_tokens(0).await;
+        }
         Ok((response, relays_body))
     }
     .await;
@@ -4745,6 +4758,73 @@ mod tests {
             Some("Bearer sk-up"),
             "the gateway must inject the provider bearer on the content GET"
         );
+    }
+
+    /// A proxied download holds the key's concurrency slot until its body
+    /// ends: a second download under `concurrency: 1` is refused while the
+    /// first body is still open, and served once it is dropped.
+    #[tokio::test]
+    async fn a_proxied_download_holds_the_key_concurrency_until_its_body_ends() {
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/videos"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "video_hold", "object": "video", "model": "sora-2",
+                "status": "queued", "progress": 0, "created_at": 1770000000
+            })))
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/videos/video_hold"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "video_hold", "object": "video", "model": "sora-2",
+                "status": "completed", "progress": 100, "created_at": 1770000000
+            })))
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/videos/video_hold/content"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "video/mp4")
+                    .set_body_bytes(b"MP4-BYTES-HOLD".to_vec()),
+            )
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri(), "openai", "");
+        let key: ApiKey = serde_json::from_value(serde_json::json!({
+            "key_hash": "8b6712790a2089c67aa97a2d80022df18cc65c7814350e33baebe79aab508891",
+            "allowed_models": ["*"],
+            "rate_limit": {"concurrency": 1}
+        }))
+        .unwrap();
+        snap.apikeys.insert(ResourceEntry::new("k-1", key, 2));
+        let app = build_app(snap);
+        let created = tower::ServiceExt::oneshot(
+            app.clone(),
+            post_videos(serde_json::json!({"model": "my-video", "prompt": "a cat"})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(created.status(), StatusCode::OK);
+        let id = body_json(created).await["id"].as_str().unwrap().to_string();
+        let content = || get_uri(&format!("/v1/videos/{id}/content"));
+
+        let first = tower::ServiceExt::oneshot(app.clone(), content())
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        // The first body is still open: its slot is taken.
+        let second = tower::ServiceExt::oneshot(app.clone(), content())
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+        // Delivered and gone: the slot is free again.
+        let body = to_bytes(first.into_body(), 65536).await.unwrap();
+        assert_eq!(&body[..], b"MP4-BYTES-HOLD");
+        let third = tower::ServiceExt::oneshot(app, content()).await.unwrap();
+        assert_eq!(third.status(), StatusCode::OK);
     }
 
     /// PROXY content: when the upstream content GET returns a non-2xx (e.g.

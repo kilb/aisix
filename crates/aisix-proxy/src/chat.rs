@@ -3045,8 +3045,6 @@ async fn dispatch(
                 // (#1571).
                 let entry_model = &virtual_entry.value;
                 crate::attribution::note_cache_hit_entry(entry_model, hit_layer.as_str());
-                // 命中缓存：没有上游 chat 调用，所以 token 记 0.
-                reservation.commit_tokens(0).await;
                 // Counted HERE, at the gate's decision — the same rule the
                 // `None` arm below already states. Recorded after the output
                 // chain instead, a hit the chain BLOCKS increments nothing at
@@ -3117,6 +3115,10 @@ async fn dispatch(
                     }
                     _ => {}
                 }
+                // 命中缓存：没有上游 chat 调用，所以 token 记 0. Committed only
+                // now: the concurrency slot stays taken while the output chain
+                // reads the hit, and a blocked hit releases it as it drops.
+                reservation.commit_tokens(0).await;
                 // The structured rewrite above also masks cache entries that
                 // predate a newly added or tightened rule.
                 let prompt = cached.usage.prompt_tokens as u64;
@@ -3774,7 +3776,11 @@ async fn dispatch(
         provider_model_version: provider_model_version.clone(),
         ..crate::usage_attr::AnsweredUsage::from_stats(&upstream.usage)
     });
-    reservation.commit_tokens(total).await;
+    // Owed, not committed: the concurrency slot stays taken while the output
+    // chain reads the answer, and a refusal or a caller that leaves during it
+    // still credits the tokens as the reservation drops. Committed below once
+    // the chain lets the answer through.
+    reservation.owe_tokens(total);
 
     let (output_verdict, hits) = resolved_chain
         .check_output_non_segment_observed(&upstream)
@@ -3877,6 +3883,7 @@ async fn dispatch(
             }
         }
     }
+    reservation.commit_tokens(total).await;
 
     // The structured rewrite above runs before the cache write, so cached
     // entries contain masked values and never persist sensitive tool keys.
