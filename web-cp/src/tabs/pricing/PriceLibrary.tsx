@@ -3,7 +3,7 @@ import type { TabProps } from "../../App";
 import { ApiError, library, type LibraryMeta, type LibraryPage } from "../../lib/api";
 import { messageFor } from "../../lib/errors";
 import { errorText } from "../../lib/fmt";
-import { flagText } from "../../lib/importReview";
+import { droppedFieldText, flagText } from "../../lib/importReview";
 import { longContextLines, longContextText } from "../../lib/library";
 import { fmtUtc } from "../../lib/money";
 import { safeHttpUrl } from "../../lib/safeUrl";
@@ -149,6 +149,11 @@ export function PriceLibrary({ canEdit, onGoto }: TabProps) {
                         {e.name && e.name !== e.model && <span className="cell-note">{e.name}</span>}
                         {e.flags.length > 0 && (
                           <span className="cell-note library-flags">{e.flags.map(flagText).join("、")}</span>
+                        )}
+                        {e.dropped?.length > 0 && (
+                          <span className="cell-note">
+                            未计入：{e.dropped.map(droppedFieldText).join("、")}
+                          </span>
                         )}
                         {longContextLines(e.card).length > 0 && (
                           <span className="library-long-context">

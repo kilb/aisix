@@ -1246,7 +1246,13 @@ export const baselines = {
 // ── pricing: imports ────────────────────────────────────────────────────────
 
 /** Why a proposal cannot be confirmed as it stands; a code this build does not know is shown as it came. */
-export type ProposalFlag = "bad_number" | "unsupported_field" | "unsupported_variant" | "time_of_day" | "invalid_card";
+export type ProposalFlag =
+  | "bad_number"
+  | "unsupported_field"
+  | "truncated_field"
+  | "unsupported_variant"
+  | "time_of_day"
+  | "invalid_card";
 
 /** One upload of the public price dataset, and what it proposed. */
 export interface ImportBatch {
@@ -1280,6 +1286,8 @@ export interface Proposal {
   /** The card it comes to, when its prices made one. */
   card: RateCard | null;
   flags: ProposalFlag[];
+  /** Every price field left off the card, by the dataset's own name: what a confirmation does not bill. */
+  dropped: string[];
   pricing_url: string | null;
   prices_checked: string | null;
   /** A live direct model whose provider and model name are the entry's. */
@@ -1383,6 +1391,8 @@ export interface LibraryEntry {
   /** `null` when its prices make no card. */
   card: RateCard | null;
   flags: ProposalFlag[];
+  /** Every price field left off the card, by the dataset's own name: what a sync from it does not bill. */
+  dropped: string[];
   pricing_url: string | null;
   prices_checked: string | null;
 }

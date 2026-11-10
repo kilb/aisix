@@ -16,7 +16,15 @@ import {
 import { messageFor, problemAt } from "../../lib/errors";
 import { errorText } from "../../lib/fmt";
 import { generatedDirect } from "../../lib/generatedDirect";
-import { COMPARED_DIMENSIONS, datasetNotes, flagText, statusText, unshownParts } from "../../lib/importReview";
+import {
+  COMPARED_DIMENSIONS,
+  datasetNotes,
+  droppedFieldText,
+  flagText,
+  flagsBlock,
+  statusText,
+  unshownParts,
+} from "../../lib/importReview";
 import { fmtUtc } from "../../lib/money";
 import { safeHttpUrl } from "../../lib/safeUrl";
 import { Button } from "../../ui/Button";
@@ -46,9 +54,18 @@ function headline(card: RateCard | null): { input: string; output: string } | nu
   return { input: base.input, output: base.output };
 }
 
-/** Whether a proposal can be confirmed as it stands: pending, unflagged, and with a card fully shown. */
+/**
+ * Whether a proposal can be confirmed as it stands: pending, held back by no
+ * blocking flag, and with a card fully shown. A price the card cannot meter
+ * is dropped from it rather than blocking it, and is listed in `dropped`.
+ */
 function confirmable(p: Proposal): boolean {
-  return p.status === "pending" && p.flags.length === 0 && p.card !== null && unshownParts(p.card).length === 0;
+  return (
+    p.status === "pending" &&
+    !flagsBlock(p.flags) &&
+    p.card !== null &&
+    unshownParts(p.card).length === 0
+  );
 }
 
 /**
@@ -620,6 +637,8 @@ function ProposalPanel({
   };
   /** What the comparison cannot show, so a refusal can say which part. */
   const unshown = unshownParts(proposal.card);
+  /** The dataset fields this card leaves off; an older row has none. */
+  const dropped = proposal.dropped ?? [];
   return (
     <SidePanel title={entry} label={`${entry} 的提议`} onClose={onClose}>
       {stale && (
@@ -648,7 +667,14 @@ function ProposalPanel({
       </p>
       {proposal.flags.length > 0 && (
         <div className="note warn" role="status">
-          这项价格带有标记，不能直接确认：{proposal.flags.map(flagText).join("、")}。
+          {flagsBlock(proposal.flags)
+            ? `这项价格带有标记，不能直接确认：${proposal.flags.map(flagText).join("、")}。`
+            : `这项价格含无法计价的收费项：${proposal.flags.map(flagText).join("、")}。`}
+        </div>
+      )}
+      {dropped.length > 0 && (
+        <div className="note" role="status">
+          未计入：{dropped.map(droppedFieldText).join("、")}
         </div>
       )}
       {comment && (
@@ -670,8 +696,9 @@ function ProposalPanel({
         <>
           {/* A card whose whole bill the comparison cannot show is refused,
               not confirmed on a fraction of it: the operator is told what is
-              off screen so they can price it by hand from the source page. */}
-          {proposal.flags.length === 0 && unshown.length > 0 && (
+              off screen so they can price it by hand from the source page.
+              A dropped price never lands here: it is not on the card. */}
+          {!flagsBlock(proposal.flags) && unshown.length > 0 && (
             <div className="note warn" role="status">
               这项价格含价格对照无法展示的部分：{unshown.join("、")}。确认后会按这些价格计费，因此不能在这里确认，请到「基准价」手动录入。
             </div>

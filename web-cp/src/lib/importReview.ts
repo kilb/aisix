@@ -11,10 +11,30 @@ import type { ProposalFlag } from "./api.ts";
 const FLAG_TEXT: Record<ProposalFlag, string> = {
   bad_number: "价格数字无法读取",
   unsupported_field: "含无法计价的收费项",
+  truncated_field: "含分段过多无法完整换算的收费项",
   unsupported_variant: "含无法表达的计价条件",
   time_of_day: "分时段价格",
   invalid_card: "价格不足以构成价目卡",
 };
+
+/**
+ * The flags that keep a proposal from being confirmed. `unsupported_field`
+ * is not one of them: it names a price the rate card cannot meter, which
+ * was dropped from an otherwise complete card — see the proposal's `dropped`
+ * for what exactly.
+ */
+const BLOCKING_FLAGS: ReadonlySet<string> = new Set<ProposalFlag>([
+  "bad_number",
+  "truncated_field",
+  "unsupported_variant",
+  "time_of_day",
+  "invalid_card",
+]);
+
+/** Whether `proposal` is held back by a flag, rather than only carrying a dropped price. */
+export function flagsBlock(flags: string[]): boolean {
+  return flags.some((flag) => !Object.hasOwn(FLAG_TEXT, flag) || BLOCKING_FLAGS.has(flag));
+}
 
 /** A proposal's state. */
 const STATUS_TEXT: Record<string, string> = {
@@ -27,6 +47,39 @@ const STATUS_TEXT: Record<string, string> = {
 /** A flag in Chinese; one this build does not know is shown as it came. */
 export function flagText(flag: string): string {
   return (Object.hasOwn(FLAG_TEXT, flag) ? FLAG_TEXT[flag as ProposalFlag] : undefined) ?? flag;
+}
+
+/**
+ * The dataset's own price field names, by what they price. A name this build
+ * does not know is shown as the dataset writes it, so nothing is hidden.
+ */
+const FIELD_TEXT: Record<string, string> = {
+  storage_searches_kcount: "文件搜索存储",
+  audio_hours: "音频时长",
+  input_audio_hours: "输入音频时长",
+  input_image_mtok: "输入图像 token",
+  output_image_mtok: "输出图像 token",
+  cache_image_read_mtok: "图像缓存读 token",
+  cache_audio_read_mtok: "音频缓存读 token",
+  output_reasoning_mtok: "推理 token",
+  input_document_kpages: "文档输入页数",
+  input_annotated_document_kpages: "带标注文档输入页数",
+  input_video_mtok: "输入视频 token",
+  output_video_mtok: "输出视频 token",
+  output_citation_mtok: "引用 token",
+  input_mchars: "输入字符数",
+  requests_kcount: "请求次数",
+  input_text_messages_kcount: "文本消息条数",
+};
+
+/**
+ * One price field a card left off, in Chinese: what it prices, the dataset's
+ * own name for it, and that the gateway does not meter it — the operator is
+ * attesting a bill, and has to know this price is not part of it.
+ */
+export function droppedFieldText(field: string): string {
+  const name = Object.hasOwn(FIELD_TEXT, field) ? FIELD_TEXT[field] : field;
+  return `${name}（数据集字段 ${field}，网关不计量）`;
 }
 
 /** A state in Chinese; one this build does not know is shown as it came. */

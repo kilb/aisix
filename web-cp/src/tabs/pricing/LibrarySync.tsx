@@ -11,7 +11,7 @@ import {
 } from "../../lib/api";
 import { messageFor } from "../../lib/errors";
 import { errorText } from "../../lib/fmt";
-import { flagText } from "../../lib/importReview";
+import { droppedFieldText, flagText } from "../../lib/importReview";
 import {
   byState,
   cardLines,
@@ -127,6 +127,11 @@ function EntryCell({
       </span>
       {item.entry.flags.length > 0 && (
         <span className="cell-note library-flags">{item.entry.flags.map(flagText).join("、")}</span>
+      )}
+      {item.entry.dropped?.length > 0 && (
+        <span className="cell-note">
+          未计入：{item.entry.dropped.map(droppedFieldText).join("、")}
+        </span>
       )}
       <LongContext card={item.entry.card} />
     </span>
@@ -463,6 +468,11 @@ export function LibrarySyncOne({
           )}
           {item.state === "ambiguous" && !chosen && <p className="hint">价格库中有多个候选条目：请选择价格来源。</p>}
           {item.state === "unmatched" && <p className="hint">价格库中没有与模型名称对应的条目。</p>}
+          {entry && entry.dropped?.length > 0 && (
+            <p className="cell-note">
+              未计入：{entry.dropped.map(droppedFieldText).join("、")}
+            </p>
+          )}
           {entry && item.state !== "flagged" && (
             <p className="library-card-block">
               价格库价格（美元/百万）：

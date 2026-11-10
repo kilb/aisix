@@ -1151,7 +1151,8 @@ async fn confirming_writes_a_third_party_baseline_with_its_attestation() {
         "{rows:?}"
     );
     // The sentence the operator affirmed, so it stays readable after a
-    // later release rewords the checkbox.
+    // later release rewords the checkbox, and the fields its card leaves out,
+    // which for this entry is none.
     assert_eq!(
         rows[2].2,
         json!({
@@ -1159,6 +1160,7 @@ async fn confirming_writes_a_third_party_baseline_with_its_attestation() {
             "model_id": model_id,
             "attested": true,
             "attestation": "已对照官方价格页核对",
+            "dropped": [],
         })
     );
     assert_eq!(rows[2].1, Some(id(&proposal).to_string()));
@@ -1205,6 +1207,79 @@ async fn confirming_needs_the_attestation() {
 }
 
 #[tokio::test]
+async fn a_proposal_only_a_dropped_price_flagged_can_be_confirmed() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let op = cp.admin_login_seeded(OperatorRole::Operator).await;
+    // `openai/gpt-4.1` prices file-search storage per thousand searches, a
+    // quantity no usage event reports and no card dimension meters. That
+    // price is dropped and named, and the rest of the card is complete.
+    let model_id = model(&cp, &op, "openai", "gpt-4.1").await;
+    let batch = upload(&cp, &op).await;
+    let proposal = current(&proposals(&cp, &op, &batch).await, "openai", "gpt-4.1").clone();
+    assert_eq!(proposal["flags"], json!(["unsupported_field"]), "{proposal}");
+    assert_eq!(
+        proposal["dropped"],
+        json!(["storage_searches_kcount"]),
+        "{proposal}"
+    );
+    assert!(!proposal["card"].is_null(), "{proposal}");
+
+    let r = decide(
+        &cp,
+        &op,
+        &batch,
+        &proposal,
+        "confirm",
+        json!({
+            "model_id": model_id,
+            "effective_from": db_now(&cp).await,
+            "attested": true,
+        }),
+    )
+    .await;
+    assert_eq!(r.status, 201, "{r:?}");
+    let (_, prices) = source("openai", "gpt-4.1");
+    assert_eq!(
+        r.body["card"]["default"]["base"]["input"], prices["input_mtok"],
+        "{r:?}"
+    );
+    // The card carries the search price it could map, and nothing for the
+    // storage price it dropped.
+    let per_thousand = aisix_pricing::Rate::parse(&prices["web_searches_kcount"]).expect("a rate");
+    let per_million = aisix_pricing::Rate(per_thousand.0 * 1000).to_string();
+    assert_eq!(
+        r.body["card"]["default"]["base"]["web_search"], per_million,
+        "{r:?}"
+    );
+    let after = proposals(&cp, &op, &batch).await;
+    let p = after
+        .iter()
+        .find(|p| p["id"] == proposal["id"])
+        .expect("it");
+    assert_eq!(p["status"], "confirmed", "{p}");
+    // The audit row records which price the attested card left out.
+    let confirm: Vec<(Option<String>, Value)> = sqlx::query_as(
+        "SELECT target_id, detail FROM audit_log \
+         WHERE action = 'pricing.import.confirm' ORDER BY id",
+    )
+    .fetch_all(cp.db().pool())
+    .await
+    .expect("read the audit log");
+    let row = confirm
+        .iter()
+        .find(|(target, _)| target.as_deref() == Some(id(&proposal)))
+        .expect("the confirmation's audit row");
+    assert_eq!(
+        row.1["dropped"],
+        json!(["storage_searches_kcount"]),
+        "{row:?}"
+    );
+    assert_eq!(row.1["attested"], json!(true), "{row:?}");
+}
+
+#[tokio::test]
 async fn a_flagged_proposal_cannot_be_confirmed() {
     let Some(cp) = TestCp::start().await else {
         return;
@@ -1214,12 +1289,21 @@ async fn a_flagged_proposal_cannot_be_confirmed() {
     let batch = upload(&cp, &op).await;
     let all = proposals(&cp, &op, &batch).await;
 
-    // One the import flagged but still carded, and one whose prices made no
-    // card at all.
+    // One flag that blocks a confirmation while its card still stands, and
+    // one whose prices made no card at all.
+    let blocking: Vec<&str> = ["time_of_day", "unsupported_variant", "invalid_card"]
+        .to_vec();
     let flagged = all
         .iter()
-        .find(|p| p["flags"] != json!([]) && !p["card"].is_null())
-        .expect("a flagged proposal with a card");
+        .find(|p| {
+            !p["card"].is_null()
+                && p["flags"]
+                    .as_array()
+                    .expect("flags")
+                    .iter()
+                    .any(|f| blocking.contains(&f.as_str().expect("a flag")))
+        })
+        .expect("a blocked proposal with a card");
     let card_less = all
         .iter()
         .find(|p| p["card"].is_null())

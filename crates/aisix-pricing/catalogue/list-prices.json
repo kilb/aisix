@@ -1,5 +1,5 @@
 {
-  "version": "2026-11-06",
+  "version": "2026-11-10",
   "entries": [
     {
       "key": "openai/gpt-6-astra",
@@ -623,6 +623,35 @@
           "base": {
             "input": "0.10",
             "output": "0"
+          }
+        }
+      }
+    },
+    {
+      "key": "anthropic/claude-fable-5-2",
+      "aliases": [],
+      "source_url": "https://platform.claude.com/docs/en/about-claude/pricing",
+      "as_of": "2026-11-10",
+      "notes": "Source read on 2026-11-10 at the source_url. Default rates are the page's model table: $8 input, $40 output, $10 for a 5m cache write, $16 for a 1h cache write, and $0.20 for cache hits and refreshes (the page's 0.025x of input, footnoted for Fable 5.2). web_search 10000 is the page's '$10 USD per 1,000 searches' per 1M searches, priced apart from tokens and differing by no tier. Batch input and output are the page's Batch processing table ($4 and $20 per MTok, the 50 percent discount); batch cache rates are derived as the batch input price times the page's own multipliers (0.025x read, 1.25x write, 2x 1h write), the same derivation claude-fable-5-1 records.",
+      "card": {
+        "default": {
+          "base": {
+            "input": "8",
+            "output": "40",
+            "cache_read": "0.2",
+            "cache_write": "10",
+            "cache_write_1h": "16",
+            "web_search": "10000"
+          }
+        },
+        "batch": {
+          "base": {
+            "input": "4",
+            "output": "20",
+            "cache_read": "0.1",
+            "cache_write": "5",
+            "cache_write_1h": "8",
+            "web_search": "10000"
           }
         }
       }

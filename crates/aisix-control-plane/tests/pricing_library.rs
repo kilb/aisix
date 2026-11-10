@@ -683,8 +683,9 @@ async fn the_preview_names_what_a_sync_would_do_to_each_model() {
     // Two providers carry the name, and the model's own is neither.
     let ambiguous = served(&cp, &op, "gpt-4o", "relay-7c1").await;
     let unmatched = served(&cp, &op, "no-such-model-lib-7c1", "relay-7c1").await;
-    // Its own provider's entry carries a price no card meters.
-    let flagged = direct(&cp, &op, "gpt-4o-mini", "openai").await;
+    // Its own provider's entry carries a price no card meters, which is
+    // dropped rather than blocking: the card is complete without it.
+    let dropped = direct(&cp, &op, "gpt-4o-mini", "openai").await;
 
     let p = preview(&cp, &op, None).await;
     assert_eq!(p["library"]["source_ref"], "v2-7de757d");
@@ -731,13 +732,28 @@ async fn the_preview_names_what_a_sync_would_do_to_each_model() {
     assert_eq!(candidates, ["github-copilot/gpt-4o", "openai/gpt-4o"]);
 
     assert_eq!(item(&p, unmatched)["state"], "unmatched");
-    let f = item(&p, flagged);
-    assert_eq!(f["state"], "flagged", "{f}");
+    let f = item(&p, dropped);
+    assert_eq!(f["state"], "create", "{f}");
+    assert_eq!(f["matched_by"], "exact", "{f}");
     assert_eq!(
         (f["entry"]["provider"].clone(), f["entry"]["model"].clone()),
         (json!("openai"), json!("gpt-4o-mini"))
     );
-    assert_ne!(f["entry"]["flags"], json!([]));
+    // The price it cannot meter is named, so the operator sees what a sync
+    // from this entry does not bill.
+    assert_eq!(f["entry"]["flags"], json!(["unsupported_field"]), "{f}");
+    assert_eq!(f["entry"]["dropped"], json!(["storage_searches_kcount"]), "{f}");
+    // What it can meter is on the card.
+    let (_, prices) = source("openai", "gpt-4o-mini");
+    assert_eq!(
+        rate(&f["entry"]["card"], "input"),
+        micros(&prices["input_mtok"])
+    );
+    assert_eq!(
+        rate(&f["entry"]["card"], "web_search"),
+        micros("10000"),
+        "{f}"
+    );
 
     // A baseline equal to the library's card: nothing to do.
     let card = c["entry"]["card"].clone();
@@ -827,6 +843,9 @@ async fn a_sync_writes_exactly_the_listed_models_as_attested_third_party_baselin
     assert_eq!(rows[0]["attested"], json!(true));
     assert_eq!(rows[0]["attestation"], "已对照官方价格页核对");
     assert_eq!(rows[0]["library_entry"], "cohere/command-a");
+    // This entry prices nothing the card cannot meter, so the sync dropped
+    // nothing: the row says so rather than leaving the field out.
+    assert_eq!(rows[0]["dropped"], json!([]));
 
     let p = preview(&cp, &op, None).await;
     assert_eq!(item(&p, a)["state"], "same");

@@ -217,19 +217,24 @@ test("带标记的提议不能确认，只提供手动录入入口", async ({ pa
   );
 });
 
-test("构成价目卡但带标记的提议也不能确认", async ({ page }) => {
+test("只含网关不计量收费项的提议能确认，并说明未计入什么", async ({ page }) => {
   await openImports(page);
   await upload(page);
 
-  // A card it can build — input, cache read and output all priced — kept from
-  // confirmation by its flag alone: the dataset bills a connected minute
-  // (`audio_hours`), which no rate of a card meters.
+  // A card it can build — input, cache read and output all priced — whose
+  // only other price is a connected minute (`audio_hours`), which no usage
+  // event reports and no rate of a card meters. That price is dropped, so
+  // nothing billable is lost: the card is confirmable, and the panel says
+  // what it leaves out rather than leaving the operator to guess.
   const panel = await openProposal(page, "elevenlabs/eleven_realtime_v1_max");
   await expect(panel.getByRole("table", { name: "价格对照" })).toContainText("$1.8 / 百万 tokens");
   await expect(panel.getByRole("table", { name: "价格对照" })).toContainText("$9 / 百万 tokens");
   await expect(panel).toContainText("含无法计价的收费项");
-  await expect(panel.getByRole("button", { name: "确认", exact: true })).toHaveCount(0);
-  await expect(panel.getByRole("checkbox", { name: "已对照官方价格页核对" })).toHaveCount(0);
+  await expect(panel).toContainText("未计入：音频时长（数据集字段 audio_hours，网关不计量）");
+  await expect(panel).not.toContainText("不能直接确认");
+  // The confirmation is offered, attested as any other.
+  await expect(panel.getByRole("button", { name: "确认", exact: true })).toHaveCount(1);
+  await expect(panel.getByRole("checkbox", { name: "已对照官方价格页核对" })).toHaveCount(1);
 });
 
 /**

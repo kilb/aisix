@@ -1,15 +1,45 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { datasetNotes, flagText, statusText, unshownParts } from "./importReview.ts";
+import { datasetNotes, droppedFieldText, flagText, flagsBlock, statusText, unshownParts } from "./importReview.ts";
 
 test("每项标记都有中文说法，未知的标记原样显示", () => {
   assert.equal(flagText("bad_number"), "价格数字无法读取");
   assert.equal(flagText("unsupported_field"), "含无法计价的收费项");
+  assert.equal(flagText("truncated_field"), "含分段过多无法完整换算的收费项");
   assert.equal(flagText("unsupported_variant"), "含无法表达的计价条件");
   assert.equal(flagText("time_of_day"), "分时段价格");
   assert.equal(flagText("invalid_card"), "价格不足以构成价目卡");
   // A flag a newer control plane added reaches the operator verbatim, never blank.
   assert.equal(flagText("split_by_region"), "split_by_region");
+});
+
+test("只有含无法计价收费项这一种标记不阻止确认，其余都阻止", () => {
+  // An unmeterable price is dropped from a complete card: nothing billable is
+  // lost, so the card can be confirmed.
+  assert.equal(flagsBlock([]), false);
+  assert.equal(flagsBlock(["unsupported_field"]), false);
+  assert.equal(flagsBlock(["unsupported_field", "unsupported_field"]), false);
+  // A truncated price would have been billed, so it blocks — beside the
+  // dropped one or on its own.
+  assert.equal(flagsBlock(["truncated_field"]), true);
+  assert.equal(flagsBlock(["unsupported_field", "truncated_field"]), true);
+  for (const flag of ["bad_number", "unsupported_variant", "time_of_day", "invalid_card"]) {
+    assert.equal(flagsBlock([flag]), true, flag);
+  }
+  // A flag this build does not know blocks: it cannot say the flag is harmless.
+  assert.equal(flagsBlock(["split_by_region"]), true);
+});
+
+test("未计入的收费项说出它是什么、数据集里叫什么，以及网关不计量", () => {
+  assert.equal(
+    droppedFieldText("storage_searches_kcount"),
+    "文件搜索存储（数据集字段 storage_searches_kcount，网关不计量）",
+  );
+  // A field this build does not know is still named by the dataset's own name.
+  assert.equal(
+    droppedFieldText("new_metric_kcount"),
+    "new_metric_kcount（数据集字段 new_metric_kcount，网关不计量）",
+  );
 });
 
 test("每种状态都有中文说法，未知的状态原样显示", () => {

@@ -12,6 +12,8 @@ const STATE_TEXT: Record<SyncState, string> = {
   create: "将新增",
   update: "将更新",
   same: "一致",
+  // A blocking flag, or no card at all: the row cannot be written from the
+  // library, and a price an entry leaves off does not make one.
   flagged: "需手动录入",
   unmatched: "无匹配",
   ambiguous: "多个匹配",

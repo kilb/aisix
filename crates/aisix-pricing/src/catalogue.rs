@@ -576,6 +576,7 @@ mod tests {
             ("openai", "text-embedding-3-small"),
             ("openai", "text-embedding-3-large"),
             ("openai", "text-embedding-ada-002"),
+            ("anthropic", "claude-fable-5-2"),
             ("anthropic", "claude-fable-5-1"),
             ("anthropic", "claude-opus-5-5"),
             ("anthropic", "claude-sonnet-5-5"),
@@ -714,9 +715,10 @@ mod tests {
             .iter()
             .filter(|e| e.key.starts_with("anthropic/"))
         {
-            // 0.025x on Fable 5.1, 0.05x on Opus 5.5 and Sonnet 5.5, else 0.1x.
+            // 0.025x on Fable 5.2 and Fable 5.1, 0.05x on Opus 5.5 and
+            // Sonnet 5.5, else 0.1x.
             let (num, den) = match e.key.as_str() {
-                "anthropic/claude-fable-5-1" => (1, 40),
+                "anthropic/claude-fable-5-2" | "anthropic/claude-fable-5-1" => (1, 40),
                 "anthropic/claude-opus-5-5" | "anthropic/claude-sonnet-5-5" => (1, 20),
                 _ => (1, 10),
             };

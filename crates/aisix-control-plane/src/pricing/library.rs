@@ -388,6 +388,9 @@ struct EntryView<'a> {
     /// `None` when its prices make no card.
     card: Option<&'a RateCard>,
     flags: &'a [Flag],
+    /// Every price field left off the card, by the dataset's own name: what a
+    /// sync from this entry does not bill.
+    dropped: &'a [String],
     pricing_url: Option<&'a str>,
     prices_checked: Option<NaiveDate>,
 }
@@ -400,6 +403,7 @@ fn view(p: &ParsedProposal) -> EntryView<'_> {
         aliases: &p.aliases,
         card: p.card.as_ref(),
         flags: &p.flags,
+        dropped: &p.dropped,
         pricing_url: p.pricing_url.as_deref(),
         prices_checked: p.prices_checked,
     }
@@ -759,8 +763,10 @@ pub enum SyncState {
     Update,
     /// The entry's card is the baseline in force.
     Same,
-    /// The entry carries a flag, or no card: as in the import, it is never
-    /// written as it stands.
+    /// The entry carries a flag that blocks a sync, or no card: as in the
+    /// import, it is never written as it stands. A price the card cannot
+    /// meter does not count — it is left off the card and named in the
+    /// entry's `dropped`.
     Flagged,
     Unmatched,
     Ambiguous,
@@ -893,8 +899,16 @@ pub fn plan<'a>(
 
 /// Whether `entry`'s card would create, update or leave the baseline in
 /// force `current`. A stored card this engine cannot read equals nothing.
+///
+/// A flag of `unsupported_field` does not make a sync impossible: it names a
+/// price the card cannot meter and left off, and the card is complete
+/// without it. Every other flag does ([`Flag::blocks_sync`]).
 fn state_of(entry: &ParsedProposal, current: Option<&BaselineRevision>) -> SyncState {
-    let Some(card) = entry.card.as_ref().filter(|_| entry.flags.is_empty()) else {
+    let Some(card) = entry
+        .card
+        .as_ref()
+        .filter(|_| !entry.flags.iter().any(|f| f.blocks_sync()))
+    else {
         return SyncState::Flagged;
     };
     match current {
@@ -1225,6 +1239,9 @@ pub async fn sync(
                                 // The sentence the operator affirmed, as the
                                 // import's confirmation records it.
                                 "attestation": ATTESTATION,
+                                // Every price field the written card does not
+                                // bill, by the dataset's own name.
+                                "dropped": entry.dropped,
                             }),
                         },
                     )
@@ -1711,15 +1728,28 @@ mod tests {
     }
 
     #[test]
-    fn a_baseline_equal_to_the_entrys_card_is_the_same_and_a_flag_is_never_synced() {
-        let e = entries(&dataset(&[provider(
-            "p",
-            &[
-                model("m", r#"{"equals":"m"}"#),
-                r#"{"id":"odd","prices":{"input_mtok":1,"output_mtok":2,"storage_mtok":3}}"#
-                    .to_string(),
-            ],
-        )]));
+    fn a_baseline_equal_to_the_entrys_card_is_the_same_and_a_flag_that_blocks_is_never_synced() {
+        // `odd` carries a price no card dimension meters and one it cannot
+        // hold: the first is dropped from a complete card and syncs, the
+        // second would have been billed at a truncated rate and does not.
+        let over_cap = (1..=import::MAX_TIERS_PER_FIELD + 1)
+            .map(|i| format!(r#"{{"start":{},"price":2}}"#, i * 1000))
+            .collect::<Vec<_>>()
+            .join(",");
+        let e = entries(&dataset(&[
+            provider(
+                "p",
+                &[
+                    model("m", r#"{"equals":"m"}"#),
+                    r#"{"id":"odd","prices":{"input_mtok":1,"output_mtok":2,"storage_mtok":3}}"#
+                        .to_string(),
+                    format!(
+                        r#"{{"id":"cut","prices":{{"input_mtok":1,"output_mtok":2,
+                             "cache_read_mtok":{{"base":0.1,"tiers":[{over_cap}]}}}}}}"#
+                    ),
+                ],
+            ),
+        ]));
         let card = serde_json::to_value(e[0].card.as_ref().expect("a card")).expect("JSON");
         assert_eq!(state_of(&e[0], None), SyncState::Create);
         assert_eq!(state_of(&e[0], Some(&baseline(card))), SyncState::Same);
@@ -1737,6 +1767,16 @@ mod tests {
             state_of(&e[0], Some(&baseline(json!({"default": "?"})))),
             SyncState::Update
         );
-        assert_eq!(state_of(&e[1], None), SyncState::Flagged);
+        // An unmeterable price is dropped, and the card it leaves is
+        // complete: it creates a baseline like any other, and says what it
+        // does not bill.
+        assert_eq!(e[1].flags, vec![Flag::UnsupportedField]);
+        assert_eq!(e[1].dropped, vec!["storage_mtok".to_string()]);
+        assert_eq!(state_of(&e[1], None), SyncState::Create);
+        // A price field over the tier cap is dropped too, and that blocks:
+        // billing the bands that survived would under-bill.
+        assert_eq!(e[2].flags, vec![Flag::TruncatedField]);
+        assert_eq!(e[2].dropped, vec!["cache_read_mtok".to_string()]);
+        assert_eq!(state_of(&e[2], None), SyncState::Flagged);
     }
 }

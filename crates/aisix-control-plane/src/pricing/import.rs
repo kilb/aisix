@@ -36,20 +36,26 @@
 //!   below the band's threshold, or its base.
 //! - **Fields** map to card dimensions one to one; `web_searches_kcount` is
 //!   priced per thousand searches and becomes `web_search` per million. Any
-//!   other field is flagged `unsupported_field` and left off the card.
+//!   other field is flagged `unsupported_field`, named as dropped, and left
+//!   off the card.
 //! - **Time windows** (`start_time`, `end_time`) anywhere in a model flag
 //!   every proposal of it `time_of_day`; the price without the window is the
 //!   card.
 //!
 //! A proposal with a `bad_number` has no card, and neither does one whose
 //! prices do not make a card [`RateCard::validate`] accepts (`invalid_card`).
-//! Any other flag leaves the card in place for the comparison, but a flagged
-//! proposal is never confirmable.
+//! Any other flag leaves the card in place for the comparison. Only a flag
+//! [`Flag::blocks_sync`] blocks a confirmation: a field no dimension meters
+//! is dropped from a card that is otherwise complete, while a field whose
+//! tiers a card could not hold would have been billed at a truncated rate
+//! and still blocks. Both kinds of dropped field are listed on the proposal
+//! ([`ParsedProposal::dropped`]), since an attestation names the card and
+//! what it does not bill has to be visible beside it.
 //!
 //! Two rules bound what a card may be made of. A price field carries at most
 //! [`MAX_TIERS_PER_FIELD`] tiers, since a card's bands are the union of every
 //! field's tier starts; a field over the cap is left off and flagged
-//! `unsupported_field`. And a map with no output-side price is no card
+//! `truncated_field`. And a map with no output-side price is no card
 //! (`invalid_card`), because a chat model with a missing output price is a
 //! gap in the dataset rather than a free completion; the one exception is a
 //! model in [`FREE_OUTPUT`] whose `price_comments` say in so many words that
@@ -120,14 +126,49 @@ pub const MAX_TIERS_PER_FIELD: usize = 64;
 pub enum Flag {
     /// A price that is not plain digits with at most six decimals.
     BadNumber,
-    /// A price for a quantity no card dimension meters.
+    /// A price for a quantity no card dimension meters, so it is left off the
+    /// card and the rest is still billable. The only flag that blocks
+    /// nothing: see [`Flag::blocks_sync`].
     UnsupportedField,
+    /// A price for a quantity the card does meter but could not carry
+    /// faithfully: a field with more tiers than [`MAX_TIERS_PER_FIELD`], left
+    /// off the card. Billing at the truncated rate would under-bill, so this
+    /// blocks a sync.
+    TruncatedField,
     /// A price under a condition a card cannot express.
     UnsupportedVariant,
     /// A price that holds only at some times of day.
     TimeOfDay,
     /// The prices do not make a card the rate model accepts.
     InvalidCard,
+}
+
+impl Flag {
+    /// Whether this flag keeps a proposal from being confirmed.
+    ///
+    /// [`Flag::UnsupportedField`] does not: it names a price for a quantity
+    /// the gateway never bills and the card cannot meter, so leaving it off
+    /// loses nothing billable, and the card built from the rest is complete.
+    /// Every other flag does, [`Flag::TruncatedField`] because the price it
+    /// drops would have been billed at a truncated rate.
+    pub fn blocks_sync(self) -> bool {
+        self != Flag::UnsupportedField
+    }
+}
+
+/// Whether the stored flag names `raw` — one this build wrote, or one it does
+/// not know — keep the proposal from being confirmed. A name this build does
+/// not know lives in a column a newer build wrote, and is blocking: the
+/// column holds whatever flagged it, and this build cannot say it is
+/// harmless.
+fn stored_flag_blocks(raw: &Value) -> bool {
+    match raw {
+        Value::String(_) => serde_json::from_value::<Flag>(raw.clone())
+            .map(Flag::blocks_sync)
+            .unwrap_or(true),
+        // Not a name a flag is stored as: still something flagged it.
+        _ => true,
+    }
 }
 
 /// One dataset entry at one date: the card it comes to, or the flags that
@@ -143,6 +184,11 @@ pub struct ParsedProposal {
     pub effective_from: Option<DateTime<Utc>>,
     pub card: Option<RateCard>,
     pub flags: Vec<Flag>,
+    /// Every price field of the dataset entry that is not on the card, by the
+    /// dataset's own name, in the dataset's own order: a quantity no card
+    /// dimension meters, and one whose tiers a card could not hold. It is
+    /// what an operator attesting the card is told was left out.
+    pub dropped: Vec<String>,
     /// The provider's first cited pricing page.
     pub pricing_url: Option<String>,
     /// The date the dataset says it checked the model's prices, if it says.
@@ -193,7 +239,7 @@ pub fn parse(data: &RawValue, now: DateTime<Utc>) -> Result<Vec<ParsedProposal>,
             let comments = model.price_comments.as_deref();
             let entry = (provider.id.as_str(), model.id.as_str());
             let aliases = aliases(&model.id, model.matches.as_ref());
-            for (effective_from, card, flags) in
+            for (effective_from, card, flags, dropped) in
                 model_proposals(&entries, variants, today, entry, comments)
             {
                 if proposals.len() == MAX_IMPORT_PROPOSALS {
@@ -208,6 +254,7 @@ pub fn parse(data: &RawValue, now: DateTime<Utc>) -> Result<Vec<ParsedProposal>,
                     effective_from,
                     card,
                     flags,
+                    dropped,
                     pricing_url: pricing_url.clone(),
                     prices_checked: model.prices_checked,
                     name: model.name.clone(),
@@ -278,6 +325,9 @@ pub struct Proposal {
     /// Every stored flag by its name, one this build does not know
     /// included ([`stored_flags`]).
     pub flags: Vec<String>,
+    /// Every price field left off the card, by the dataset's own name: what
+    /// a confirmation of this proposal does not bill.
+    pub dropped: Vec<String>,
     /// The provider's first cited pricing page.
     pub pricing_url: Option<String>,
     pub prices_checked: Option<NaiveDate>,
@@ -327,9 +377,9 @@ impl CatalogueEntryView {
 /// The columns a [`Proposal`] is read from, over
 /// `pricing_import_proposals p`.
 const PROPOSAL_COLUMNS: &str = "p.id, p.batch_id, p.provider, p.model, p.effective_from, p.card, \
-                                p.flags, p.pricing_url, p.prices_checked, p.suggested_model_id, \
-                                p.status, p.decided_by, p.decided_at, p.reject_reason, \
-                                p.attested_by, p.baseline_revision_id";
+                                p.flags, p.dropped, p.pricing_url, p.prices_checked, \
+                                p.suggested_model_id, p.status, p.decided_by, p.decided_at, \
+                                p.reject_reason, p.attested_by, p.baseline_revision_id";
 
 impl<'r> sqlx::FromRow<'r, PgRow> for Proposal {
     /// The stored row; what it is compared to is added by [`read_proposals`].
@@ -343,6 +393,7 @@ impl<'r> sqlx::FromRow<'r, PgRow> for Proposal {
             effective_from: row.try_get("effective_from")?,
             card: row.try_get("card")?,
             flags: stored_flags(flags),
+            dropped: row.try_get::<JsonColumn<Vec<String>>, _>("dropped")?.0,
             pricing_url: row.try_get("pricing_url")?,
             prices_checked: row.try_get("prices_checked")?,
             suggested_model_id: row.try_get("suggested_model_id")?,
@@ -360,9 +411,10 @@ impl<'r> sqlx::FromRow<'r, PgRow> for Proposal {
 }
 
 /// A stored `flags` column as the review lists it: each flag by its name,
-/// a known one or not, so a proposal reads as flagged exactly when
-/// [`check_confirmable`] refuses it. Decoding into [`Flag`] would lose a
-/// flag a newer build wrote, and with it every known flag beside it.
+/// a known one or not, so a proposal reads as flagged whenever the column
+/// holds anything, and as unconfirmable exactly when [`check_confirmable`]
+/// refuses it. Decoding into [`Flag`] would lose a flag a newer build wrote,
+/// and with it every known flag beside it.
 fn stored_flags(flags: Value) -> Vec<String> {
     match flags {
         Value::Null => Vec::new(),
@@ -597,8 +649,8 @@ pub async fn upload(
                 for chunk in parsed.chunks(PROPOSALS_PER_INSERT) {
                     let mut sql = QueryBuilder::<Postgres>::new(
                         "INSERT INTO pricing_import_proposals \
-                         (id, batch_id, provider, model, effective_from, card, flags, pricing_url, \
-                          prices_checked, suggested_model_id, status) ",
+                         (id, batch_id, provider, model, effective_from, card, flags, dropped, \
+                          pricing_url, prices_checked, suggested_model_id, status) ",
                     );
                     sql.push_values(chunk, |mut row, p| {
                         row.push_bind(Uuid::new_v4())
@@ -608,6 +660,7 @@ pub async fn upload(
                             .push_bind(p.effective_from)
                             .push_bind(p.card.as_ref().map(JsonColumn))
                             .push_bind(JsonColumn(p.flags.clone()))
+                            .push_bind(JsonColumn(p.dropped.clone()))
                             .push_bind(p.pricing_url.clone())
                             .push_bind(p.prices_checked)
                             .push_bind(
@@ -770,6 +823,9 @@ struct LockedProposal {
     effective_from: Option<DateTime<Utc>>,
     card: Option<Value>,
     flags: Value,
+    /// The fields left off the card, named in the audit row of a
+    /// confirmation so what it does not bill is on record.
+    dropped: Vec<String>,
     pricing_url: Option<String>,
     prices_checked: Option<NaiveDate>,
     status: String,
@@ -784,6 +840,7 @@ impl<'r> sqlx::FromRow<'r, PgRow> for LockedProposal {
             effective_from: row.try_get("effective_from")?,
             card: row.try_get("card")?,
             flags: row.try_get("flags")?,
+            dropped: row.try_get::<JsonColumn<Vec<String>>, _>("dropped")?.0,
             pricing_url: row.try_get("pricing_url")?,
             prices_checked: row.try_get("prices_checked")?,
             status: row.try_get("status")?,
@@ -800,8 +857,8 @@ async fn lock_proposal(
     pid: Uuid,
 ) -> Result<LockedProposal, ApiError> {
     let proposal: Option<LockedProposal> = sqlx::query_as(
-        "SELECT p.id, p.provider, p.model, p.effective_from, p.card, p.flags, p.pricing_url, \
-                p.prices_checked, p.status, b.dataset_ref \
+        "SELECT p.id, p.provider, p.model, p.effective_from, p.card, p.flags, p.dropped, \
+                p.pricing_url, p.prices_checked, p.status, b.dataset_ref \
          FROM pricing_import_proposals p JOIN pricing_import_batches b ON b.id = p.batch_id \
          WHERE p.id = $1 AND p.batch_id = $2 \
          FOR UPDATE OF p",
@@ -837,12 +894,15 @@ fn check_pending(proposal: &LockedProposal) -> Result<(), ApiError> {
     }
 }
 
-/// Whether `proposal` carries a card this engine can read and no flag at
-/// all: the only kind a confirmation may write. A stored flag this build
-/// does not know still counts, since the column holds whatever flagged it.
+/// Whether `proposal` carries a card this engine can read and no flag that
+/// blocks a confirmation: the only kind a confirmation may write. A flag of
+/// [`Flag::UnsupportedField`] is not blocking — it names a price the card
+/// cannot meter and drops, and the card is complete without it — but a stored
+/// flag this build does not know does block, since the column holds whatever
+/// flagged it.
 fn check_confirmable(proposal: &LockedProposal) -> Result<RateCard, ApiError> {
-    let flagged = match &proposal.flags {
-        Value::Array(flags) => !flags.is_empty(),
+    let blocking = match &proposal.flags {
+        Value::Array(flags) => flags.iter().any(stored_flag_blocks),
         other => !other.is_null(),
     };
     let card = proposal
@@ -850,7 +910,7 @@ fn check_confirmable(proposal: &LockedProposal) -> Result<RateCard, ApiError> {
         .as_ref()
         .and_then(|c| serde_json::from_value::<RateCard>(c.clone()).ok());
     match card {
-        Some(card) if !flagged => Ok(card),
+        Some(card) if !blocking => Ok(card),
         _ => Err(refused("/flags", "该提议含无法自动换算的价格，请手动录入")),
     }
 }
@@ -869,8 +929,11 @@ fn check_confirmable(proposal: &LockedProposal) -> Result<RateCard, ApiError> {
 /// 2. `404` for a `pid` outside batch `{id}`, or an id that is not a UUID.
 /// 3. `409 proposal_state` unless the proposal is still `pending`; a
 ///    superseded one counts as not pending.
-/// 4. `422 /flags` for a proposal that carries any flag, or whose card this
-///    engine cannot read (see [`check_confirmable`]).
+/// 4. `422 /flags` for a proposal that carries a flag that blocks a
+///    confirmation, or whose card this engine cannot read (see
+///    [`check_confirmable`]). A proposal flagged only `unsupported_field` is
+///    confirmable: what that flag names is not on the card and not billed,
+///    and `detail` of the audit row lists it.
 /// 5. `422 /effective_from` for a start before the proposal's own, and for
 ///    one at or after the date a later-dated proposal of the same entry in
 ///    the same batch takes effect: the dataset itself says the price changed
@@ -1014,6 +1077,9 @@ pub async fn confirm(
                             // attestation stays readable after a later
                             // release rewords the checkbox.
                             "attestation": ATTESTATION,
+                            // Every price field the confirmed card does not
+                            // bill, by the dataset's own name.
+                            "dropped": proposal.dropped,
                         }),
                     },
                 )
@@ -1274,8 +1340,9 @@ fn conditionals(prices: &RawValue) -> Option<Vec<Conditional<'_>>> {
     }])
 }
 
-/// One proposal of a model: its start (`None` at upload), card and flags.
-type Dated = (Option<DateTime<Utc>>, Option<RateCard>, Vec<Flag>);
+/// One proposal of a model: its start (`None` at upload), card, flags, and
+/// the fields left off the card.
+type Dated = (Option<DateTime<Utc>>, Option<RateCard>, Vec<Flag>, Vec<String>);
 
 /// One model's proposals: for the moment of upload and for each later date.
 fn model_proposals(
@@ -1352,11 +1419,13 @@ fn model_proposals(
                 resolved.extend(prices);
                 tiers.insert(tier, resolved);
             }
-            let card = card(&tiers, entry, comments, &mut flags);
+            let mut dropped = Vec::new();
+            let card = card(&tiers, entry, comments, &mut flags, &mut dropped);
             (
                 from.map(|d| d.and_time(NaiveTime::MIN).and_utc()),
                 card,
                 flags.into_iter().collect(),
+                dropped,
             )
         })
         .collect()
@@ -1403,6 +1472,9 @@ fn dimension(field: &str) -> Option<(Dimension, u64)> {
         "cache_write_1h_mtok" => (Dimension::CacheWrite1h, 1),
         "input_audio_mtok" => (Dimension::AudioInput, 1),
         "output_audio_mtok" => (Dimension::AudioOutput, 1),
+        "input_image_mtok" => (Dimension::ImageInput, 1),
+        "output_image_mtok" => (Dimension::ImageOutput, 1),
+        "output_reasoning_mtok" => (Dimension::Reasoning, 1),
         "web_searches_kcount" => (Dimension::WebSearch, 1_000),
         _ => return None,
     })
@@ -1579,29 +1651,36 @@ fn rates(prices: &BTreeMap<Dimension, Rate>) -> Option<Rates> {
         cache_read: get(Dimension::CacheRead),
         cache_write: get(Dimension::CacheWrite),
         cache_write_1h: get(Dimension::CacheWrite1h),
-        reasoning: None,
+        reasoning: get(Dimension::Reasoning),
         audio_input: get(Dimension::AudioInput),
         audio_output: get(Dimension::AudioOutput),
-        image_input: None,
-        image_output: None,
+        image_input: get(Dimension::ImageInput),
+        image_output: get(Dimension::ImageOutput),
         web_search: get(Dimension::WebSearch),
     })
 }
 
 /// The card `tiers` (each tier's resolved price map) come to, adding to
-/// `flags` what keeps them from one.
+/// `flags` what keeps them from one and to `dropped` every field left off it,
+/// by the dataset's own name.
 fn card(
     tiers: &BTreeMap<ServiceTier, PriceMap<'_>>,
     entry: (&str, &str),
     comments: Option<&str>,
     flags: &mut BTreeSet<Flag>,
+    dropped: &mut Vec<String>,
 ) -> Option<RateCard> {
     let mut priced: BTreeMap<&ServiceTier, BTreeMap<Dimension, Price>> = BTreeMap::new();
+    // One field of several tiers is one field left off, named once.
+    let mut left_off: BTreeSet<&str> = BTreeSet::new();
     for (tier, fields) in tiers {
         let prices = priced.entry(tier).or_default();
         for (field, value) in fields {
             let Some((dimension, per)) = dimension(field) else {
                 flags.insert(Flag::UnsupportedField);
+                if left_off.insert(field) {
+                    dropped.push(field.clone());
+                }
                 continue;
             };
             match Price::read(value, per) {
@@ -1612,16 +1691,20 @@ fn card(
                     flags.insert(Flag::BadNumber);
                 }
                 Err(Unreadable::Tiers) => {
-                    // The value is a price this card cannot carry, not a
-                    // malformed one: it is left off like any other field no
-                    // dimension meters.
+                    // The value is a price this card cannot carry: it is left
+                    // off, and unlike a field no dimension meters it blocks a
+                    // sync, since the price it drops is one the card would
+                    // have billed.
                     tracing::warn!(
                         field,
                         tiers = MAX_TIERS_PER_FIELD + 1,
                         limit = MAX_TIERS_PER_FIELD,
                         "a price field carries more tiers than a card may hold; it is left off"
                     );
-                    flags.insert(Flag::UnsupportedField);
+                    flags.insert(Flag::TruncatedField);
+                    if left_off.insert(field) {
+                        dropped.push(field.clone());
+                    }
                 }
             }
         }
@@ -1776,12 +1859,42 @@ mod tests {
         );
         assert!(current(&all, "m-all").flags.is_empty());
         let requests = current(&all, "m-requests");
+        // A price no dimension meters is dropped from a card that is complete
+        // without it, and named: the only flag that does not block a sync.
         assert_eq!(requests.flags, vec![Flag::UnsupportedField]);
+        assert_eq!(requests.dropped, vec!["requests_kcount".to_string()]);
+        assert!(!Flag::UnsupportedField.blocks_sync());
         // What does map is still shown, for the comparison.
         assert_eq!(
             card_json(requests),
             json!({"default": {"base": {"input": "1", "output": "2"}}})
         );
+    }
+
+    #[test]
+    fn image_and_reasoning_prices_reach_their_dimensions() {
+        let all = proposals(&dataset(
+            r#"{"id":"m-image","prices":{"input_mtok":1,"output_mtok":2,
+                 "input_image_mtok":0.5,"output_image_mtok":30}},
+               {"id":"m-reasoning","prices":{"input_mtok":1,"output_mtok":2,
+                 "output_reasoning_mtok":9}}"#,
+        ));
+        // The three fields the card already meters now reach it, so nothing is
+        // dropped and nothing is flagged. Each is written under its own
+        // dimension's key, which is the key the engine reads a quantity on
+        // (`aisix_pricing::Dimension`, `engine::lines_at`).
+        let image = current(&all, "m-image");
+        assert!(image.flags.is_empty(), "{:?}", image.flags);
+        assert!(image.dropped.is_empty(), "{:?}", image.dropped);
+        let base = default_base(image);
+        assert_eq!(base.image_input, Some(Rate::parse("0.5").unwrap()));
+        assert_eq!(base.image_output, Some(Rate::parse("30").unwrap()));
+        assert_eq!(base.reasoning, None, "no reasoning price was given");
+
+        let reasoning = current(&all, "m-reasoning");
+        assert!(reasoning.flags.is_empty(), "{:?}", reasoning.flags);
+        let base = default_base(reasoning);
+        assert_eq!(base.reasoning, Some(Rate::parse("9").unwrap()));
     }
 
     #[test]
@@ -2017,15 +2130,25 @@ mod tests {
             ),
             // Neither side of a prompt, and no output.
             ("m-search-only", vec![Flag::InvalidCard]),
-            // An output side the card has no slot for.
-            (
-                "m-output-image",
-                vec![Flag::UnsupportedField, Flag::InvalidCard],
-            ),
+            // An image-output price the card meters, beside no text output:
+            // the field maps now, so what is missing is the price every card
+            // needs, not a dimension. Nothing is dropped.
+            ("m-output-image", vec![Flag::InvalidCard]),
         ] {
             let p = current(&all, id);
             assert_eq!((p.card.as_ref(), &p.flags[..]), (None, &flags[..]), "{id}");
         }
+        // What each entry left off its (absent) card, in the order its price
+        // map holds them, a field of several tiers named once.
+        assert_eq!(
+            current(&all, "m-unmappable").dropped,
+            vec![
+                "audio_hours".to_string(),
+                "input_document_kpages".to_string(),
+                "input_mchars".to_string(),
+            ]
+        );
+        assert!(current(&all, "m-output-image").dropped.is_empty());
     }
 
     #[test]
@@ -2160,18 +2283,22 @@ mod tests {
         card.validate().expect("the card validates");
 
         // One past it, the field is left off. For an input price that costs
-        // the card, since a card needs one.
+        // the card, since a card needs one, and it is `truncated_field`, not
+        // `unsupported_field`: dropping it would have billed the rest of the
+        // price's bands at a rate the dataset never states.
         let all = proposals(&body(over));
         let p = current(&all, &format!("m-{over}"));
         assert_eq!(
             p.flags,
-            vec![Flag::UnsupportedField, Flag::InvalidCard],
+            vec![Flag::TruncatedField, Flag::InvalidCard],
             "over the cap"
         );
         assert_eq!(p.card, None);
+        assert_eq!(p.dropped, vec!["input_mtok".to_string()]);
 
-        // Left off, not fatal: a field the card can do without is dropped and
-        // the card stands.
+        // Left off, not fatal for the row: a field the card can do without is
+        // dropped and the card stands, while the flag still says a price the
+        // card cannot hold was dropped.
         let optional = dataset(&format!(
             r#"{{"id":"m-optional","prices":{{"input_mtok":1,"output_mtok":2,
                  "cache_read_mtok":{{"base":0.1,"tiers":[{}]}}}}}}"#,
@@ -2179,7 +2306,8 @@ mod tests {
         ));
         let all = proposals(&optional);
         let p = current(&all, "m-optional");
-        assert_eq!(p.flags, vec![Flag::UnsupportedField]);
+        assert_eq!(p.flags, vec![Flag::TruncatedField]);
+        assert_eq!(p.dropped, vec!["cache_read_mtok".to_string()]);
         let card = p
             .card
             .as_ref()
