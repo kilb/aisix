@@ -391,6 +391,12 @@ impl From<DbError> for ApiError {
                 tracing::warn!(error = %e, "no database connection was free in time");
                 ApiError::unavailable()
             }
+            // Price writes kept moving the book while it loaded: the same,
+            // for the price book.
+            DbError::PriceBookUnsettled { .. } => {
+                tracing::warn!(error = %e, "the price book did not hold still to load");
+                ApiError::unavailable()
+            }
             e => ApiError::internal(e),
         }
     }

@@ -2587,6 +2587,68 @@ async fn a_book_loaded_while_prices_change_never_mixes_two_versions() {
     assert_eq!(charge("e-early").await, Some(680));
 }
 
+/// R-001's fence gives a load up when `pricing_version` moved during it, and
+/// the batch's transaction fails once every one of its loads has. That is
+/// contention, like a lock timeout: the delivery is answered `503`, which
+/// the gateway sends again, never a `500` (an ERROR, and a fault on the
+/// dashboard) for a batch that can be stored a moment later.
+///
+/// Price writes that never stop are what makes every load see the version
+/// move: three connections bump it as fast as they can while batches are
+/// delivered, until one is refused for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_price_book_that_never_holds_still_is_answered_retryable() {
+    let Some(w) = world().await else { return };
+    let model = seed_model(&w.cp, &w.admin).await;
+    price(&w.cp, model).await;
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut bumpers = Vec::new();
+    for _ in 0..3 {
+        let mut conn = PgConnection::connect(w.cp.database_url())
+            .await
+            .expect("connect");
+        let stop = stop.clone();
+        bumpers.push(tokio::spawn(async move {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                sqlx::query(
+                    "UPDATE cp_settings SET value = to_jsonb((value::text)::bigint + 1) \
+                     WHERE key = 'pricing_version'",
+                )
+                .execute(&mut conn)
+                .await
+                .expect("bump");
+            }
+        }));
+    }
+    let mut statuses = Vec::new();
+    for i in 0..60 {
+        let r = deliver(
+            &w.dp,
+            Uuid::new_v4(),
+            vec![usage(&w, &format!("e-moving-{i}"), model, tokens_680())],
+        )
+        .await;
+        statuses.push(r.status);
+        if r.status == 503 {
+            break;
+        }
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    for bumper in bumpers {
+        bumper.await.expect("join");
+    }
+    assert!(!statuses.contains(&500), "{statuses:?}");
+    assert_eq!(
+        statuses.last(),
+        Some(&503),
+        "no delivery found the version moving during every load: {statuses:?}"
+    );
+    assert!(
+        statuses.iter().all(|s| [200, 503].contains(s)),
+        "{statuses:?}"
+    );
+}
+
 /// A model document's `display_name` and `version`.
 async fn model_doc(cp: &TestCp, id: Uuid) -> (String, i64) {
     sqlx::query_as(

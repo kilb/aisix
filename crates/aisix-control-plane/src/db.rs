@@ -47,6 +47,12 @@ pub enum DbError {
          the migration lock, or a migration is stuck"
     )]
     MigrationTimeout { after: Duration },
+    /// The price book could not be loaded at one `pricing_version`: the
+    /// version moved during each of `loads` loads
+    /// (`pricing::store::MAX_BOOK_LOADS`). Contention, like a lock timeout:
+    /// the same work can succeed when it is tried again.
+    #[error("pricing_version moved during each of {loads} loads of the price book")]
+    PriceBookUnsettled { loads: usize },
     #[error(transparent)]
     Db(sqlx::Error),
 }

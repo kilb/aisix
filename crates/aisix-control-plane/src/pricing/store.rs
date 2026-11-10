@@ -33,7 +33,10 @@
 //! before and after the tables, and a load across which it moved is thrown
 //! away and done again ([`MAX_BOOK_LOADS`] times at most). Every price write
 //! moves the version in its own transaction, so a load whose fence held saw
-//! the tables exactly as that version left them.
+//! the tables exactly as that version left them. When every load saw it move,
+//! the caller's transaction fails with [`DbError::PriceBookUnsettled`],
+//! which is contention: intake answers it `503`, and the gateway sends the
+//! batch again.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, PoisonError, RwLock};
@@ -135,14 +138,14 @@ impl PriceBookCache {
                 return Ok(book);
             }
         }
-        tracing::error!(
+        tracing::warn!(
             loads = MAX_BOOK_LOADS,
             "pricing_version moved during every load of the price book; the caller's \
              transaction fails and is tried again"
         );
-        Err(DbError::Db(sqlx::Error::Protocol(format!(
-            "pricing_version moved during each of {MAX_BOOK_LOADS} loads of the price book"
-        ))))
+        Err(DbError::PriceBookUnsettled {
+            loads: MAX_BOOK_LOADS,
+        })
     }
 
     /// Loads the book on `conn`, logging each invalid revision.
