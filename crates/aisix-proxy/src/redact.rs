@@ -4459,10 +4459,22 @@ pub fn redact_anthropic_sse(chain: &dyn Guardrail, raw: &[u8]) -> AnthropicSseRe
         merge_counts(&mut counts, local);
     }
 
+    // A text block's opening `text` already went through its channel above,
+    // at the head of the joined deltas. The block pass below must not offer it
+    // a second time: the collect walk would record it twice, and once the
+    // channel rewrite lands in that slot the apply walk sees a text the
+    // collect walk never did, which is a drift and refuses the answer.
+    let channel_start_frames: std::collections::BTreeSet<usize> = text_channels
+        .values()
+        .flatten()
+        .filter(|(_, site)| matches!(site, Site::BlockStartText))
+        .map(|&(fi, _)| fi)
+        .collect();
+
     // A block start may carry complete text-bearing content (tool input,
     // document/search text, or a server-tool result) instead of later deltas.
     // Run the same official-block walker used by non-streaming Messages.
-    for frame in &mut frames {
+    for (fi, frame) in frames.iter_mut().enumerate() {
         let changed = {
             let Some(data) = frame.data.as_mut() else {
                 continue;
@@ -4474,6 +4486,16 @@ pub fn redact_anthropic_sse(chain: &dyn Guardrail, raw: &[u8]) -> AnthropicSseRe
                 continue;
             };
             let before = block.clone();
+            // Set aside for the walk and put back in place, so everything
+            // else in the block (its citations) is still walked.
+            let channel_text = channel_start_frames
+                .contains(&fi)
+                .then(|| {
+                    block
+                        .get_mut("text")
+                        .map(|text| std::mem::replace(text, Value::String(String::new())))
+                })
+                .flatten();
             unrewritable_tool_key |= redact_anthropic_value(
                 chain,
                 Direction::Output,
@@ -4481,6 +4503,9 @@ pub fn redact_anthropic_sse(chain: &dyn Guardrail, raw: &[u8]) -> AnthropicSseRe
                 &mut counts,
                 AnthropicKeyContext::Protocol,
             );
+            if let (Some(text), Some(slot)) = (channel_text, block.get_mut("text")) {
+                *slot = text;
+            }
             *block != before
         };
         frame.dirty |= changed;
@@ -10092,6 +10117,46 @@ mod tests {
         );
         assert_eq!(counts.get("EMAIL"), Some(&1));
         // The capture-rebuild helper reads the masked channel back.
+        assert_eq!(anthropic_sse_text(&held), "<M0:HELLO WORLD>");
+    }
+
+    /// A text block may open with text of its own (the start event's union
+    /// allows a non-empty one). That text heads its channel, so it is ONE
+    /// slot: offered again by the block pass, the apply walk would meet the
+    /// channel's rewrite where the collect walk saw the original and refuse
+    /// the answer as a drift (R-071). Its citations are still walked.
+    #[tokio::test]
+    async fn a_non_empty_start_text_is_one_slot_of_its_channel() {
+        let chain = seg_chain(StubSegments::masker());
+        let mut held: Vec<u8> = concat!(
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"hello \",\"citations\":[{\"type\":\"char_location\",\"cited_text\":\"quoted\"}]}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"world\"}}\n\n",
+        )
+        .as_bytes()
+        .to_vec();
+        let collected = collect_segments(|g| {
+            let _ = redact_anthropic_sse(g, &held);
+        });
+        let texts: Vec<&str> = collected.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(texts, ["hello world", "quoted"], "each text offered once");
+
+        let moderation = moderate_anthropic_sse(
+            &chain,
+            GuardrailVerdict::Allow,
+            &mut held,
+            &mut RedactionCounts::new(),
+            &mut Vec::new(),
+        )
+        .await;
+        assert_eq!(moderation.verdict, GuardrailVerdict::Allow);
+        let out = String::from_utf8(held.clone()).unwrap();
+        assert!(out.contains("<M0:HELLO WORLD>"), "{out}");
+        assert!(
+            out.contains("<M1:QUOTED>"),
+            "the citation is masked too: {out}"
+        );
         assert_eq!(anthropic_sse_text(&held), "<M0:HELLO WORLD>");
     }
 
