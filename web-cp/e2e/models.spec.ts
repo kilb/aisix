@@ -871,3 +871,73 @@ test("只读运维在账号页看得到模型，但没有删除模型的入口",
   await expect(section.getByRole("button", { name: "删除模型" })).toHaveCount(0);
   expect((await publicView(pub.id)).retired_at).toBeNull();
 });
+
+/** The account section's row for `name`: the one whose 服务 tick names it. */
+function accountRow(section: Locator, name: string): Locator {
+  return section.getByRole("row", { name: new RegExp(`^服务 ${escapeRe(name)}(?:\\s|$)`) });
+}
+
+test("账号页删除模型被保留后，只保存另一行的改动：被移除的映射不会被写回", async ({ page }) => {
+  const suffix = randomUUID().slice(0, 8);
+  const accountName = `acct-del-keep-${suffix}`;
+  const account = await mockAccount(accountName, ["shared"]);
+  const other = await mockAccount(`acct-del-other-${suffix}`, ["shared"]);
+  const removed = await newPublicModel(`pub-del-p-${suffix}`);
+  const edited = await newPublicModel(`pub-del-q-${suffix}`);
+  await serve(account.id, removed.id);
+  await serve(account.id, edited.id);
+  // Another account still serves P, so the retire after this account's
+  // removal is refused: P stays live, unserved here.
+  await serve(other.id, removed.id);
+  const requests: string[] = [];
+  page.on("request", (r) => {
+    if (r.url().includes(`/admin/provider-keys/${account.id}/channel-models/`)) requests.push(`${r.method()} ${r.url()}`);
+  });
+
+  const section = await openAccountModels(page, accountName);
+  // A genuine edit of Q, made before the delete and kept across it.
+  await accountRow(section, edited.name).getByRole("textbox", { name: `优先级 ${edited.name}` }).fill("7");
+  const pRow = accountRow(section, removed.name);
+  await pRow.getByRole("button", { name: "删除模型" }).click();
+  await pRow.getByRole("button", { name: "确认删除模型" }).click();
+  await expect(section.getByRole("alert").filter({ hasText: "本账号的映射已移除" })).toContainText(
+    `「${removed.name}」没有停用，仍然存在`,
+  );
+  // P is no longer this account's, so the default view no longer lists it.
+  await expect(accountRow(section, removed.name)).toHaveCount(0);
+  await expect(accountRow(section, edited.name).getByRole("textbox", { name: `优先级 ${edited.name}` })).toHaveValue("7");
+
+  await section.getByRole("button", { name: "写入映射" }).click();
+  // One row was edited, so one is written.
+  await expect(section.getByText("已保存 1 个模型的映射。")).toBeVisible();
+  const table = await stack.admin.get(`/admin/provider-keys/${account.id}/channel-models`);
+  const rowOf = (id: string) => (table.items as Json[]).find((i) => i.public_model_id === id);
+  expect(rowOf(removed.id)?.served, "the removed mapping stayed removed").toBe(false);
+  expect(rowOf(edited.id)).toMatchObject({ served: true, priority: 7 });
+  const puts = requests.filter((r) => r.startsWith("PUT "));
+  expect(puts.some((r) => r.endsWith(`/${removed.id}`)), puts.join("\n")).toBe(false);
+  expect(puts.some((r) => r.endsWith(`/${edited.id}`)), puts.join("\n")).toBe(true);
+});
+
+test("账号页删除模型时它已被别人停用：说它已经停用，而不是说没有停用", async ({ page }) => {
+  const suffix = randomUUID().slice(0, 8);
+  const accountName = `acct-del-gone-${suffix}`;
+  const account = await mockAccount(accountName, ["shared"]);
+  const pub = await newPublicModel(`pub-del-gone-${suffix}`);
+  await serve(account.id, pub.id);
+
+  const section = await openAccountModels(page, accountName);
+  const row = accountRow(section, pub.name);
+  await expect(row).toBeVisible();
+  // Another operator deletes the public model while this page is open.
+  await stack.admin.post(`/admin/public-models/${pub.id}/delete`, {});
+  expect((await publicView(pub.id)).retired_at).not.toBeNull();
+
+  await row.getByRole("button", { name: "删除模型" }).click();
+  await row.getByRole("button", { name: "确认删除模型" }).click();
+  await expect(section.getByRole("status").filter({ hasText: `「${pub.name}」已经停用` })).toBeVisible();
+  // Never the refusal's claim that nothing changed or that it is still live.
+  await expect(section.getByText("没有停用")).toHaveCount(0);
+  await expect(section.getByText("没有改动")).toHaveCount(0);
+  await expect(accountRow(section, pub.name)).toHaveCount(0);
+});
