@@ -13,7 +13,8 @@ const SWAP_MS = 120;
  * `window.confirm`, which leaves the page's own flow.
  *
  * `ask` decides, at each first click, whether to ask at all; when it says
- * no, the first click acts. `kind` styles the first step only.
+ * no, the first click acts. `kind` styles the first step only, and `danger`
+ * makes the whole action read as destructive from its first click.
  *
  * The swap fades the new step in while the box eases from the old width
  * to the new one, over 120ms. Focus that was on the swapped control moves
@@ -49,7 +50,7 @@ export function TwoStep({
   busy?: boolean;
   /** The busy button's name; its own label when absent. */
   busyLabel?: string;
-  kind?: "primary" | "secondary";
+  kind?: "primary" | "secondary" | "danger";
   size?: "sm";
   ask?: () => boolean;
   warning?: ReactNode;

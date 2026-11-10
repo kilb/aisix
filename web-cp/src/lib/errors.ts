@@ -48,7 +48,7 @@ const TEXT: Record<string, string> = {
   library_fetch_timeout: "获取价格库数据超时",
   library_stale: "价格库或模型已变化，请刷新预览后重试",
   // Public models and the accounts that serve them.
-  public_model_in_use: "该公共模型仍在使用中，无法停用",
+  public_model_in_use: "该公共模型仍在使用中",
   public_model_retired: "该公共模型已停用",
 };
 

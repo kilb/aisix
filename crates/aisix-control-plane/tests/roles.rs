@@ -321,6 +321,10 @@ fn fixture(method: &str, path: &str, target: &SeededOperator) -> (String, Option
             format!("/admin/public-models/{}/retire", Uuid::nil()),
             Some(json!({})),
         ),
+        ("POST", "/admin/public-models/{id}/delete") => (
+            format!("/admin/public-models/{}/delete", Uuid::nil()),
+            Some(json!({})),
+        ),
         ("GET", "/admin/provider-keys/{id}/channel-models") => (
             format!("/admin/provider-keys/{}/channel-models", Uuid::nil()),
             None,

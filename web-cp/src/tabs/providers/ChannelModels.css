@@ -68,6 +68,24 @@
 .ch-filter {
   max-width: 24rem;
 }
+
+/* The list's own filter row: the search box, and the toggle that reveals the
+   public models this account does not serve. */
+.ch-filter-row {
+  display: flex;
+  align-items: flex-end;
+  flex-wrap: wrap;
+  gap: var(--s-3) var(--s-4);
+  max-width: 44rem;
+  margin-bottom: var(--s-3);
+}
+.ch-filter-row > .f {
+  flex: 1 1 16rem;
+}
+.ch-filter-row > .ch-tick {
+  gap: var(--s-2);
+  padding-bottom: var(--s-1);
+}
 .ch-tick {
   display: inline-flex;
   align-items: center;

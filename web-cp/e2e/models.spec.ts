@@ -598,7 +598,7 @@ test("公共模型生成的模型在这里只能停用：停用后两张文档�
   await expect(warning).toContainText("1 个启用的账号");
   await expect(warning).toContainText("停用会被拒绝");
   await routeRow.getByRole("button", { name: "确认停用" }).click();
-  await expect(page.getByRole("alert").filter({ hasText: "无法停用" })).toContainText("启用的账号 1");
+  await expect(page.getByRole("alert").filter({ hasText: "仍在使用中" })).toContainText("启用的账号 1");
   expect((await publicView(pub.id)).retired_at).toBeNull();
   expect(await modelLive(pub.id)).toBe(true);
 

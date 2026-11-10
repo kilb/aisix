@@ -824,6 +824,247 @@ async fn a_public_model_in_use_cannot_be_retired() {
     );
 }
 
+/// Every `channel_models` row `public` has, across accounts.
+async fn channel_rows(cp: &TestCp, public: Uuid) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*)::bigint FROM channel_models WHERE public_model_id = $1")
+        .bind(public)
+        .fetch_one(cp.db().pool())
+        .await
+        .expect("count the channel rows")
+}
+
+/// `POST /admin/public-models/{id}/delete` as `who`.
+async fn delete_public(cp: &TestCp, who: &OperatorSession, id: Uuid) -> Resp {
+    cp.send(
+        "POST",
+        &format!("{PUBLICS}/{id}/delete"),
+        Some(who.cookie()),
+        Some(json!({})),
+    )
+    .await
+}
+
+/// The audit detail of the newest row for `action` on `public`.
+async fn audit_detail(cp: &TestCp, action: &str, public: Uuid) -> Value {
+    sqlx::query_scalar(
+        "SELECT detail FROM audit_log \
+         WHERE action = $1 AND target_kind = 'public_model' AND target_id = $2 \
+         ORDER BY id DESC LIMIT 1",
+    )
+    .bind(action)
+    .bind(public.to_string())
+    .fetch_one(cp.db().pool())
+    .await
+    .expect("read the audit row")
+}
+
+#[tokio::test]
+async fn deleting_a_public_model_removes_every_accounts_mapping_and_both_documents() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let op = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let first = provider_key(&cp, &op, "acct-del-two-8c2").await;
+    let second = provider_key(&cp, &op, "acct-del-two-8c3").await;
+    let (id, _) = create_public(&cp, &op, "pub-del-two-8c2").await;
+    for key in [first, second] {
+        let r = put_channel(&cp, &op, key, id, json!({})).await;
+        assert_eq!(r.status, 200, "{r:?}");
+    }
+    let direct_first = direct_of(&cp, first, id).await;
+    let direct_second = direct_of(&cp, second, id).await;
+    assert!(is_live(&cp, Kind::Models, direct_first).await);
+    assert!(is_live(&cp, Kind::Models, direct_second).await);
+    assert_eq!(channel_rows(&cp, id).await, 2);
+
+    // Two enabled accounts serve it, which refuses a retire and must not
+    // refuse this: the mapping is what the delete is for.
+    let r = delete_public(&cp, &op, id).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    assert!(r.body["retired_at"].is_string(), "{r:?}");
+    // Every mapping, every document it generated, and the routing document.
+    assert_eq!(channel_rows(&cp, id).await, 0, "the mappings go");
+    assert!(
+        !is_live(&cp, Kind::Models, id).await,
+        "the routing document goes"
+    );
+    assert!(!is_live(&cp, Kind::Models, direct_first).await);
+    assert!(!is_live(&cp, Kind::Models, direct_second).await);
+    // Both tombstones name the owner, so a hand edit cannot revive one.
+    for gone in [id, direct_first, direct_second] {
+        let (_, deleted, managed_by) = stored(&cp, Kind::Models, gone)
+            .await
+            .unwrap_or_else(|| panic!("no row at {gone}"));
+        assert!(deleted, "the row at {gone} is a tombstone");
+        assert_eq!(managed_by.as_deref(), Some(channels::owner(id).as_str()));
+    }
+    // The account's checklist no longer lists it, and the row is retired.
+    let r = cp
+        .send(
+            "GET",
+            &format!("/admin/provider-keys/{first}/channel-models"),
+            Some(op.cookie()),
+            None,
+        )
+        .await;
+    assert_eq!(r.status, 200, "{r:?}");
+    assert!(
+        !r.body["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .any(|i| i["public_model_id"] == json!(id)),
+        "{r:?}"
+    );
+    // The audit row says what the delete took, not only its name.
+    assert_eq!(
+        audit_detail(&cp, "public_model.delete", id).await,
+        json!({"name": "pub-del-two-8c2", "tenants": 0, "keys": 0, "channels": 2})
+    );
+}
+
+#[tokio::test]
+async fn a_delete_a_tenant_grant_holds_is_refused_and_deletes_nothing() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let op = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let key = provider_key(&cp, &op, "acct-del-grant-8c2").await;
+    let (id, _) = create_public(&cp, &op, "pub-del-grant-8c2").await;
+    let r = put_channel(&cp, &op, key, id, json!({})).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let direct = direct_of(&cp, key, id).await;
+    let tenant = tenant_granted(&cp, &op, &[id]).await;
+
+    let r = delete_public(&cp, &op, id).await;
+    assert_eq!(
+        (r.status, r.body["code"].as_str()),
+        (409, Some("public_model_in_use")),
+        "{r:?}"
+    );
+    assert_eq!(r.body["counts"]["tenants"], 1, "{r:?}");
+    assert_eq!(r.body["counts"]["keys"], 0, "{r:?}");
+    // The serving account is reported but is not why it was refused.
+    assert_eq!(r.body["counts"]["channels"], 1, "{r:?}");
+
+    // One transaction: the refusal left the mapping and both documents alone.
+    assert_eq!(channel_rows(&cp, id).await, 1, "the mapping is still there");
+    assert!(is_live(&cp, Kind::Models, id).await);
+    assert!(is_live(&cp, Kind::Models, direct).await);
+    assert!(
+        public_model(&cp, &op, id).await["retired_at"].is_null(),
+        "the model is not retired"
+    );
+
+    // With the grant cleared it goes, proof the grant was the only refusal.
+    let cleared = set_grants(&cp, &op, &tenant.to_string(), &[]).await;
+    assert_eq!(cleared.status, 200, "{cleared:?}");
+    let r = delete_public(&cp, &op, id).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    assert_eq!(channel_rows(&cp, id).await, 0);
+}
+
+#[tokio::test]
+async fn a_delete_a_key_selection_holds_is_refused_and_deletes_nothing() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let op = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let key = provider_key(&cp, &op, "acct-del-key-8c2").await;
+    let (id, _) = create_public(&cp, &op, "pub-del-key-8c2").await;
+    let r = put_channel(&cp, &op, key, id, json!({})).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let direct = direct_of(&cp, key, id).await;
+    // A tenant granted the model, and a key of it that names the model: the
+    // key's own selection is the reference, over the tenant's grant.
+    let tenant = tenant_granted(&cp, &op, &[id]).await;
+    let created = cp
+        .send(
+            "POST",
+            &format!("/admin/tenants/{tenant}/keys"),
+            Some(op.cookie()),
+            Some(json!({
+                "label": "del-key-8c2",
+                "group_id": support::world::group_id(&cp, support::world::SHARED_GROUP).await,
+                "model_ids": [id],
+            })),
+        )
+        .await;
+    assert_eq!(created.status, 201, "{created:?}");
+    // With the grant withdrawn the selection alone still holds it.
+    let cleared = set_grants(&cp, &op, &tenant.to_string(), &[]).await;
+    assert_eq!(cleared.status, 200, "{cleared:?}");
+
+    let r = delete_public(&cp, &op, id).await;
+    assert_eq!(
+        (r.status, r.body["code"].as_str()),
+        (409, Some("public_model_in_use")),
+        "{r:?}"
+    );
+    assert_eq!(r.body["counts"]["tenants"], 0, "{r:?}");
+    assert_eq!(r.body["counts"]["keys"], 1, "{r:?}");
+    assert_eq!(r.body["counts"]["channels"], 1, "{r:?}");
+
+    assert_eq!(channel_rows(&cp, id).await, 1, "the mapping is still there");
+    assert!(is_live(&cp, Kind::Models, id).await);
+    assert!(is_live(&cp, Kind::Models, direct).await);
+}
+
+#[tokio::test]
+async fn retire_still_refuses_an_enabled_serving_account_where_delete_does_not() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let op = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let key = provider_key(&cp, &op, "acct-del-retire-8c2").await;
+    let (id, _) = create_public(&cp, &op, "pub-del-retire-8c2").await;
+    let r = put_channel(&cp, &op, key, id, json!({})).await;
+    assert_eq!(r.status, 200, "{r:?}");
+
+    // The two routes answer the same state differently, which is the whole
+    // reason the delete exists: the enabled account refuses a retire only.
+    let r = cp
+        .send(
+            "POST",
+            &format!("{PUBLICS}/{id}/retire"),
+            Some(op.cookie()),
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(
+        (r.status, r.body["code"].as_str()),
+        (409, Some("public_model_in_use")),
+        "{r:?}"
+    );
+    assert_eq!(r.body["counts"]["channels"], 1, "{r:?}");
+    assert_eq!(channel_rows(&cp, id).await, 1, "the retire deleted nothing");
+    assert!(is_live(&cp, Kind::Models, id).await);
+
+    // An already retired model answers `public_model_retired` on both, and
+    // a refuse that leaves the row retired is not a double delete.
+    let r = delete_public(&cp, &op, id).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let r = delete_public(&cp, &op, id).await;
+    assert_eq!(
+        (r.status, r.body["code"].as_str()),
+        (409, Some("public_model_retired")),
+        "{r:?}"
+    );
+    let r = cp
+        .send(
+            "POST",
+            &format!("{PUBLICS}/{id}/retire"),
+            Some(op.cookie()),
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(
+        (r.status, r.body["code"].as_str()),
+        (409, Some("public_model_retired")),
+        "{r:?}"
+    );
+}
+
 /// The direct document the channel row of `key` and `public` generated.
 async fn direct_of(cp: &TestCp, key: Uuid, public: Uuid) -> Uuid {
     sqlx::query_scalar(

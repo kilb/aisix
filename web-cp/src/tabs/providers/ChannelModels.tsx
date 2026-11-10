@@ -91,6 +91,10 @@ export function ChannelModels({
   const [drafts, setDrafts] = useState<Record<string, Draft>>({});
   const [rowErrors, setRowErrors] = useState<Record<string, string>>({});
   const [query, setQuery] = useState("");
+  // Off by default: the list shows what this account serves, and revealing
+  // the rest is a deliberate act. It reads the server's `served`, not the
+  // draft, so unticking 服务 on a served row keeps it in view to be undone.
+  const [showAll, setShowAll] = useState(false);
   const [busy, setBusy] = useState(false);
   const [done, setDone] = useState(0);
   const [total, setTotal] = useState(0);
@@ -278,7 +282,13 @@ export function ChannelModels({
   }
 
   const filter = query.trim().toLowerCase();
-  const shown = (rows ?? []).filter((row) => {
+  // The default view is the models this account serves: an account that
+  // serves 1 of 27 reads as "this account serves that one", not as 26
+  // unchecked rows that look like state to fix. A revealed row keeps its
+  // place while it is being ticked, so the tick is what files it.
+  const unservedTotal = (rows ?? []).filter((row) => !row.served).length;
+  const visible = (rows ?? []).filter((row) => showAll || row.served);
+  const shown = visible.filter((row) => {
     if (filter === "") return true;
     const draft = drafts[row.public_model_id];
     return (
@@ -306,10 +316,18 @@ export function ChannelModels({
           读取失败：{error}
         </div>
       )}
-      <div className="ch-filter">
+      <div className="ch-filter-row">
         <label className="f">
           <span className="f-label">搜索模型</span>
           <input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="按公共模型名称或上游名称筛选" />
+        </label>
+        <label className="ch-tick">
+          <input
+            type="checkbox"
+            checked={showAll}
+            onChange={(e) => setShowAll(e.target.checked)}
+          />
+          <span>显示全部公共模型（{unservedTotal}）</span>
         </label>
       </div>
       {note && (
@@ -449,7 +467,15 @@ export function ChannelModels({
             {shown.length === 0 && (
               <tr>
                 <td colSpan={8}>
-                  <EmptyState text={rows.length === 0 ? "还没有公共模型。用下面的名称新建一个。" : "没有匹配的模型。"} />
+                  <EmptyState
+                    text={
+                      rows.length === 0
+                        ? "还没有公共模型。用下面的名称新建一个。"
+                        : !showAll && unservedTotal === rows.length
+                          ? "这个账号还没有服务任何模型。勾选「显示全部公共模型」来添加。"
+                          : "没有匹配的模型。"
+                    }
+                  />
                 </td>
               </tr>
             )}

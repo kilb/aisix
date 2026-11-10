@@ -525,12 +525,6 @@ pub struct PublicModelUse {
     pub channels: i64,
 }
 
-impl PublicModelUse {
-    fn any(&self) -> bool {
-        self.tenants > 0 || self.keys > 0 || self.channels > 0
-    }
-}
-
 /// What still names `id`, as [`PublicModelUse`].
 async fn references(conn: &mut PgConnection, id: Uuid) -> Result<PublicModelUse, ApiError> {
     let tenants: i64 = sqlx::query_scalar(
@@ -806,6 +800,126 @@ pub async fn get(
     Ok(Json(answer))
 }
 
+/// What a public model's removal does with the accounts that serve it.
+///
+/// The two routes differ only here: a retire holds the model while an enabled
+/// account serves it (the operator must mean to stop the name while its
+/// mappings stay as they were), and a delete takes the mappings with it, which
+/// is what an operator actually wants when they say the name should go.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Serving {
+    /// An enabled channel row refuses the removal: `retire`.
+    Holds,
+    /// The channel rows are the removal's business, deleted with it: `delete`.
+    Removed,
+}
+
+impl Serving {
+    /// Whether the channel rows this model has refuse the removal.
+    fn refuses(self, uses: &PublicModelUse) -> bool {
+        self == Serving::Holds && uses.channels > 0
+    }
+}
+
+/// The tail both removals run once `id`'s row is locked: the reference
+/// count, the tombstone of the routing and direct documents, the channel
+/// rows, the audit row, and the retired view.
+///
+/// The caller holds the all-scope tenants' rows, the public model's row and
+/// `RESOURCES_LOCK_KEY`, in that order; this function takes no further lock.
+/// A grant is the reference that can arrive concurrently — `tenants::update`
+/// takes its tenant row, then the resources lock, then validates
+/// `allowed_model_ids` against live documents — so a grant that commits first
+/// is counted here and refused, and one that gets the lock second finds the
+/// model retired.
+async fn remove(
+    conn: &mut PgConnection,
+    ctx: &WriteCtx,
+    auth: &OperatorAuth,
+    row: &PublicModelRow,
+    all_scope: &[crate::tenants::TenantRow],
+    serving: Serving,
+    action: &'static str,
+) -> Result<Value, ApiError> {
+    let id = row.id;
+    let name = row.name.clone();
+    let uses = references(&mut *conn, id).await?;
+    if uses.tenants > 0 || uses.keys > 0 || serving.refuses(&uses) {
+        return Err(ApiError::public_model_in_use(
+            serde_json::to_value(uses).map_err(ApiError::internal)?,
+        ));
+    }
+    // Retired first, so the scope an all-scope tenant's keys are rewritten
+    // from no longer holds this model: a key document names the models by
+    // id, and `write_resource` refuses to delete a model one still names.
+    // All in one transaction, so no other reader sees the model retired but
+    // still served.
+    sqlx::query("UPDATE public_models SET retired_at = now(), enabled = false WHERE id = $1")
+        .bind(id)
+        .execute(&mut *conn)
+        .await
+        .map_err(DbError::from)?;
+    crate::keys::reproject_tenants(&mut *conn, ctx, all_scope).await?;
+    let owner = owner(id);
+    // Referrers before referents: the routing document names every direct
+    // document by id.
+    let live: Vec<ResourceRow> = store::owned_by(&mut *conn, std::slice::from_ref(&owner)).await?;
+    let mut models: Vec<Uuid> = live
+        .iter()
+        .filter(|r| r.kind == Kind::Models && !r.deleted)
+        .map(|r| r.id)
+        .collect();
+    models.sort_by_key(|m| if *m == id { 0 } else { 1 });
+    for model in models {
+        write_resource(
+            &mut *conn,
+            ctx,
+            ResourceWrite {
+                kind: Kind::Models,
+                id: model,
+                op: WriteOp::Delete,
+                expected_version: None,
+                managed_by: Some(&owner),
+            },
+        )
+        .await?;
+    }
+    // The channel rows go once, whichever route ran: a retire's own
+    // refusal (`Serving::Holds`) has already seen them gone or disabled.
+    sqlx::query("DELETE FROM channel_models WHERE public_model_id = $1")
+        .bind(id)
+        .execute(&mut *conn)
+        .await
+        .map_err(DbError::from)?;
+    // A retire's row is what it always was — the model's name — because
+    // nothing about that path changes for an operator reading the audit log.
+    // A delete is the attested action that removes mappings, so who and what
+    // it removed is the record: the counts it refused on, or went through.
+    let detail = match serving {
+        Serving::Holds => json!({ "name": name }),
+        Serving::Removed => json!({
+            "name": name,
+            "tenants": uses.tenants,
+            "keys": uses.keys,
+            "channels": uses.channels,
+        }),
+    };
+    audit::record(
+        &mut *conn,
+        AuditEntry {
+            actor: Actor::Operator(auth),
+            action,
+            target_kind: "public_model",
+            target_id: Some(id.to_string()),
+            tenant_id: None,
+            detail,
+        },
+    )
+    .await?;
+    let row = read_public(&mut *conn, id).await?;
+    view_json(&mut *conn, &row).await
+}
+
 /// `POST /admin/public-models/{id}/retire` → `200 PublicModel`: sets
 /// `retired_at` once nothing live names it; `409 public_model_in_use` with
 /// the counts while something does, and `409 public_model_retired` for a
@@ -816,13 +930,9 @@ pub async fn get(
 /// public model nobody can restore, so it holds nothing worth keeping.
 ///
 /// The counts are read under `RESOURCES_LOCK_KEY`, and the delete and the
-/// update land while it is held. A grant is the reference that can arrive
-/// concurrently — `tenants::update` takes its tenant row, then that lock,
-/// then validates `allowed_model_ids` against live documents — so a grant
-/// that commits first is counted here and refused, and one that gets the
-/// lock second finds the model retired. The public model's row is held
-/// before the resources lock, which is the documented order; retire takes no
-/// tenant row (`groups::retire` is the same shape).
+/// update land while it is held. The public model's row is held before the
+/// resources lock, which is the documented order; retire takes no tenant row
+/// (`groups::retire` is the same shape).
 pub async fn retire(
     auth: OperatorAuth,
     State(state): State<AppState>,
@@ -845,69 +955,70 @@ pub async fn retire(
                     return Err(retired());
                 }
                 refs::lock_resources(&mut *conn).await?;
-                let uses = references(&mut *conn, row.id).await?;
-                if uses.any() {
-                    return Err(ApiError::public_model_in_use(
-                        serde_json::to_value(uses).map_err(ApiError::internal)?,
-                    ));
-                }
-                // Retired first, so the scope an all-scope tenant's keys are
-                // rewritten from no longer holds this model: a key document
-                // names the models by id, and `write_resource` refuses to
-                // delete a model one still names. All in one transaction, so
-                // no other reader sees the model retired but still served.
-                sqlx::query(
-                    "UPDATE public_models SET retired_at = now(), enabled = false WHERE id = $1",
+                remove(
+                    conn,
+                    &ctx,
+                    &auth,
+                    &row,
+                    &all_scope,
+                    Serving::Holds,
+                    "public_model.retire",
                 )
-                .bind(id)
-                .execute(&mut *conn)
                 .await
-                .map_err(DbError::from)?;
-                crate::keys::reproject_tenants(&mut *conn, &ctx, &all_scope).await?;
-                let owner = owner(id);
-                // Referrers before referents: the routing document names
-                // every direct document by id.
-                let live: Vec<ResourceRow> =
-                    store::owned_by(&mut *conn, std::slice::from_ref(&owner)).await?;
-                let mut models: Vec<Uuid> = live
-                    .iter()
-                    .filter(|r| r.kind == Kind::Models && !r.deleted)
-                    .map(|r| r.id)
-                    .collect();
-                models.sort_by_key(|m| if *m == id { 0 } else { 1 });
-                for model in models {
-                    write_resource(
-                        &mut *conn,
-                        &ctx,
-                        ResourceWrite {
-                            kind: Kind::Models,
-                            id: model,
-                            op: WriteOp::Delete,
-                            expected_version: None,
-                            managed_by: Some(&owner),
-                        },
-                    )
-                    .await?;
+            }
+            .boxed()
+        })
+        .await?;
+    Ok(Json(answer))
+}
+
+/// `POST /admin/public-models/{id}/delete` → `200 PublicModel`: the whole
+/// job, in one attested action — every account's channel row for the model
+/// goes, the routing and direct documents are tombstoned, and `retired_at`
+/// is set.
+///
+/// It is `retire` with one question answered differently: an enabled serving
+/// account does **not** refuse it. That is the point — a public model every
+/// account serves could otherwise be retired only by unticking it on each
+/// account in turn, and the tick was never what the operator wanted.
+///
+/// What still refuses it is a live tenant grant or a live key selection: the
+/// model is named in a document this route does not rewrite, and it answers
+/// `409 public_model_in_use` with `{tenants, keys, channels}`. It answers
+/// `409 public_model_retired` for a model already retired, as `retire` does.
+///
+/// The locks are `retire`'s exactly: the all-scope tenants' rows, the public
+/// model's row, then `RESOURCES_LOCK_KEY`. A refusal leaves everything as it
+/// was — the reference count and the write share one transaction.
+pub async fn delete(
+    auth: OperatorAuth,
+    State(state): State<AppState>,
+    Path(raw): Path<String>,
+    ApiJson(_): ApiJson<Value>,
+) -> Result<Json<Value>, ApiError> {
+    auth.require(OperatorRole::Operator)?;
+    let id = path_id(&raw)?;
+    let ctx = WriteCtx::of(&state);
+    let answer = state
+        .db
+        .tx(move |conn| {
+            async move {
+                let all_scope = crate::tenants::lock_all_scope(&mut *conn).await?;
+                let row = lock_public(&mut *conn, id).await?;
+                if row.retired_at.is_some() {
+                    return Err(retired());
                 }
-                sqlx::query("DELETE FROM channel_models WHERE public_model_id = $1")
-                    .bind(id)
-                    .execute(&mut *conn)
-                    .await
-                    .map_err(DbError::from)?;
-                audit::record(
-                    &mut *conn,
-                    AuditEntry {
-                        actor: Actor::Operator(&auth),
-                        action: "public_model.retire",
-                        target_kind: "public_model",
-                        target_id: Some(id.to_string()),
-                        tenant_id: None,
-                        detail: json!({"name": row.name}),
-                    },
+                refs::lock_resources(&mut *conn).await?;
+                remove(
+                    conn,
+                    &ctx,
+                    &auth,
+                    &row,
+                    &all_scope,
+                    Serving::Removed,
+                    "public_model.delete",
                 )
-                .await?;
-                let row = read_public(&mut *conn, id).await?;
-                view_json(&mut *conn, &row).await
+                .await
             }
             .boxed()
         })

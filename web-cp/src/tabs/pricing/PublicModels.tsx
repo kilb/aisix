@@ -9,7 +9,7 @@ import {
 } from "../../lib/api";
 import { messageFor, problemAt } from "../../lib/errors";
 import { errorText } from "../../lib/fmt";
-import { inUseText, retireWarning } from "../../lib/retireWarning";
+import { deleteRefusalText, deleteWarning } from "../../lib/retireWarning";
 import { Button } from "../../ui/Button";
 import { DataTable, Loading } from "../../ui/DataTable";
 import { EmptyState } from "../../ui/EmptyState";
@@ -46,6 +46,14 @@ function pricedState(model: PublicModel, prices: Map<string, ModelGroupPriceRow>
  * renamed and never adopted: a name a live model already holds is refused on
  * the name field, and the answer says the operator may use the model that
  * already has it.
+ *
+ * A row's one action is 删除, and it does the whole job: the accounts' mappings
+ * for the model go, then the documents, then the model is retired. It offers
+ * no 停用 of its own, because every model a retire would accept is one a delete
+ * accepts with the same writes — the state that differs is the one a retire
+ * refuses, where an account still serves it, and unticking the model on each
+ * account in turn was never what the operator wanted. A delete is still
+ * refused while a tenant grant or a key selection names the model.
  */
 export function PublicModels({ canEdit }: TabProps) {
   const toast = useToast();
@@ -114,15 +122,15 @@ export function PublicModels({ canEdit }: TabProps) {
     }
   }
 
-  async function retire(model: PublicModel) {
+  async function remove(model: PublicModel) {
     setBusy(model.id);
     setRefusal(null);
     try {
-      await publicModels.retire(model.id);
-      toast(`已停用「${model.name}」。`);
+      await publicModels.delete(model.id);
+      toast(`已删除「${model.name}」，各账号对它的映射和它的文档都已移除。`);
       await load();
     } catch (e) {
-      setRefusal(e instanceof ApiError ? inUseText(e) : errorText(e));
+      setRefusal(e instanceof ApiError ? deleteRefusalText(e) : errorText(e));
     } finally {
       setBusy(null);
     }
@@ -195,14 +203,15 @@ export function PublicModels({ canEdit }: TabProps) {
                   <td className="right">
                     {canEdit && !retired && (
                       <TwoStep
-                        label="停用"
+                        label="删除"
                         size="sm"
+                        kind="danger"
                         busy={busy === m.id}
-                        busyLabel="停用中…"
+                        busyLabel="删除中…"
                         // Always asked: refused, it says why; accepted, it cannot be undone.
                         ask={() => true}
-                        warning={retireWarning(m)}
-                        onConfirm={() => void retire(m)}
+                        warning={deleteWarning(m)}
+                        onConfirm={() => void remove(m)}
                       />
                     )}
                   </td>

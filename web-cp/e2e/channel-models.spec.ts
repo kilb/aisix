@@ -86,6 +86,16 @@ async function openAccountModels(page: Page, name: string, who = stack.operator)
   return openAccountSection(page, name);
 }
 
+/**
+ * Shows every live public model, not only the ones this account serves. The
+ * list defaults to the served rows, so a test that ticks an unserved model
+ * reveals it first, as an operator does.
+ */
+async function showAllModels(section: Locator, on = true): Promise<void> {
+  const box = section.getByRole("checkbox", { name: /显示全部公共模型/ });
+  if ((await box.isChecked()) !== on) await box.click();
+}
+
 /** `name` with every regex metacharacter escaped, for a role-name pattern. */
 function escapeRe(name: string): string {
   return name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -118,12 +128,78 @@ async function readyPicker(section: Locator, name: string): Promise<Locator> {
   return field;
 }
 
+test("账号的模型列表默认只列它服务的模型，勾选后列出全部", async ({ page }) => {
+  const name = accountName("acct-served-only");
+  const accountId = await newAccount(name);
+  // One served, one the account does not serve: the default view has to be
+  // the served row alone, not a second row that reads as broken state.
+  const served = await newPublicModel(`pub-default-served-${randomUUID().slice(0, 8)}`);
+  const other = await newPublicModel(`pub-default-other-${randomUUID().slice(0, 8)}`);
+  await stack.admin.put(`/admin/provider-keys/${accountId}/channel-models/${served.id}`, { priority: 1, weight: 1 });
+
+  const section = await openAccountModels(page, name);
+  // The served row is there, and the ones it does not serve are not.
+  await expect(modelRow(section, served.name)).toBeVisible();
+  await expect(modelRow(section, served.name).getByRole("checkbox", { name: `服务 ${served.name}` })).toBeChecked();
+  await expect(modelRow(section, other.name)).toHaveCount(0);
+  // The toggle counts what it would reveal, and says so.
+  const reveal = section.getByRole("checkbox", { name: /显示全部公共模型/ });
+  await expect(reveal).not.toBeChecked();
+  // The count beside it is the unserved models this account could add: the
+  // live public models here are `served` and `other`, so exactly one.
+  await expect(reveal).toHaveAccessibleName("显示全部公共模型（1）");
+
+  // Revealed, everything live is listed, and the served row is still served.
+  await reveal.check();
+  await expect(modelRow(section, other.name)).toBeVisible();
+  await expect(modelRow(section, served.name).getByRole("checkbox", { name: `服务 ${served.name}` })).toBeChecked();
+  await expect(modelRow(section, other.name).getByRole("checkbox", { name: `服务 ${other.name}` })).not.toBeChecked();
+  // Hiding again leaves only the served row.
+  await reveal.uncheck();
+  await expect(modelRow(section, other.name)).toHaveCount(0);
+  await expect(modelRow(section, served.name)).toBeVisible();
+});
+
+test("搜索模型在默认视图与全部视图里都只筛当前列出的行", async ({ page }) => {
+  const name = accountName("acct-search");
+  const accountId = await newAccount(name);
+  const served = await newPublicModel(`pub-search-served-${randomUUID().slice(0, 8)}`);
+  const unserved = await newPublicModel(`pub-search-unserved-${randomUUID().slice(0, 8)}`);
+  await stack.admin.put(`/admin/provider-keys/${accountId}/channel-models/${served.id}`, { priority: 1, weight: 1 });
+
+  const section = await openAccountModels(page, name);
+  const search = section.getByLabel("搜索模型");
+  // By default the unserved model is not listed even when searched for.
+  await search.fill(unserved.name);
+  await expect(modelRow(section, unserved.name)).toHaveCount(0);
+  await expect(section.getByText("没有匹配的模型。")).toBeVisible();
+  // Revealed, the same search finds it.
+  await showAllModels(section);
+  await expect(modelRow(section, unserved.name)).toBeVisible();
+  // And a search that matches neither lists neither.
+  await search.fill("nothing-matches-this-5a4");
+  await expect(modelRow(section, served.name)).toHaveCount(0);
+  await expect(modelRow(section, unserved.name)).toHaveCount(0);
+});
+
+test("一个模型都没服务的账号说明怎么添加", async ({ page }) => {
+  const name = accountName("acct-empty");
+  await newAccount(name);
+  await newPublicModel(`pub-empty-${randomUUID().slice(0, 8)}`);
+
+  const section = await openAccountModels(page, name);
+  // No row is served, so the default view is empty and says what to do.
+  await expect(section.getByText("这个账号还没有服务任何模型。勾选「显示全部公共模型」来添加。")).toBeVisible();
+});
+
 test("在上游账号页勾选模型、填写映射与优先级，保存后生成文档", async ({ page }) => {
   const name = accountName("acct-map");
   const accountId = await newAccount(name);
   const pub = await newPublicModel(`pub-map-${randomUUID().slice(0, 8)}`);
 
   const section = await openAccountModels(page, name);
+  // A model this account does not serve yet is behind the reveal.
+  await showAllModels(section);
   const row = modelRow(section, pub.name);
   await expect(row).toBeVisible();
   await row.getByRole("checkbox", { name: `服务 ${pub.name}` }).check();
@@ -170,6 +246,7 @@ test("模型名称下拉列出该上游的模型，可搜索", async ({ page }) 
   const pub = await newPublicModel(`pub-list-${randomUUID().slice(0, 8)}`);
 
   const section = await openAccountModels(page, name);
+  await showAllModels(section);
   await modelRow(section, pub.name).getByRole("checkbox", { name: `服务 ${pub.name}` }).check();
   const field = await readyPicker(section, pub.name);
   await field.click();
@@ -204,6 +281,7 @@ test("上游拒绝列表时改为自由填写，输入的名称可以保存", as
   const pub = await newPublicModel(`pub-refuse-${randomUUID().slice(0, 8)}`);
 
   const section = await openAccountModels(page, name);
+  await showAllModels(section);
   await modelRow(section, pub.name).getByRole("checkbox", { name: `服务 ${pub.name}` }).check();
   const field = await readyPicker(section, pub.name);
   await field.click();
@@ -229,6 +307,7 @@ test("列表里没有的名称也可以输入并保存", async ({ page }) => {
   const pub = await newPublicModel(`pub-outside-${randomUUID().slice(0, 8)}`);
 
   const section = await openAccountModels(page, name);
+  await showAllModels(section);
   const row = modelRow(section, pub.name);
   await row.getByRole("checkbox", { name: `服务 ${pub.name}` }).check();
   const field = await readyPicker(section, pub.name);
@@ -248,6 +327,7 @@ test("停用最后一个模型时提示将影响 N 个租户和 M 个密钥", as
   const pub = await newPublicModel(`pub-last-${suffix}`);
 
   const section = await openAccountModels(page, name);
+  await showAllModels(section);
   await modelRow(section, pub.name).getByRole("checkbox", { name: `服务 ${pub.name}` }).check();
   await section.getByRole("button", { name: "写入映射" }).click();
   await expect(section.getByText(/已保存 1 个模型的映射/)).toBeVisible();
@@ -343,6 +423,7 @@ test("无权限的视图角色看不到保存按钮", async ({ page }) => {
   expect(created.status, created.text).toBe(201);
 
   const section = await openAccountModels(page, name, viewer);
+  await showAllModels(section);
   await expect(modelRow(section, pub.name)).toBeVisible();
   await expect(section.getByRole("button", { name: "写入映射" })).toHaveCount(0);
   await expect(section.getByRole("button", { name: /新建公共模型/ })).toHaveCount(0);

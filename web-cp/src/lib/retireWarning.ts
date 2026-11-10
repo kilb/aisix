@@ -60,6 +60,23 @@ export function withoutServing(model: Retirable, providerKeyId: string): Retirab
 }
 
 /**
+ * What 删除 says it will do, on 价格 · 公共模型. A delete takes the accounts'
+ * mappings with it, so an enabled serving account never refuses it — that is
+ * the difference from a retire, and why the sentence is its own. A live
+ * grant or a live key selection still refuses it, and then nothing goes.
+ */
+export function deleteWarning(model: Retirable): string {
+  if (model.tenants > 0 || model.keys > 0) {
+    return `仍有 ${model.tenants} 个租户、${model.keys} 个密钥的授权指向它，删除会被拒绝，什么也不会删除：请先从租户与密钥中移除它。`;
+  }
+  const mappings =
+    model.served_by.length > 0
+      ? `先删除 ${model.served_by.length} 个账号对它的映射，再删除它的路由文档和各账号的直连文档`
+      : "删除它的路由文档和为各账号生成的直连文档";
+  return `删除后不能恢复：将${mappings}。名称「${model.name}」以后不能再用于公共模型，需要时请用新名称新建一个公共模型。`;
+}
+
+/**
  * What still names a public model, by name, so the operator knows what to
  * clear. Typed by the fields it reads rather than `ApiError`, which strip-only
  * TypeScript cannot load (see `retireOutcome.ts`); every caller passes a real one.
@@ -67,4 +84,13 @@ export function withoutServing(model: Retirable, providerKeyId: string): Retirab
 export function inUseText(e: Refusal): string {
   const counts = (e.counts ?? {}) as UseCounts;
   return `${messageFor(e)}：租户 ${counts.tenants ?? 0}、密钥 ${counts.keys ?? 0}、启用的账号 ${counts.channels ?? 0}`;
+}
+
+/**
+ * A refused 删除: the counts it carries, and the two places to clear. A
+ * serving account is never why a delete is refused, so it is not named.
+ */
+export function deleteRefusalText(e: Refusal): string {
+  const counts = (e.counts ?? {}) as UseCounts;
+  return `${messageFor(e)}：${counts.tenants ?? 0} 个租户、${counts.keys ?? 0} 个密钥仍指向它。请在租户的模型授权、以及密钥的模型选择里移除它，再删除。`;
 }

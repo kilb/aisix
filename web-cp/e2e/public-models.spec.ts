@@ -149,7 +149,7 @@ test("全部账号停用的公共模型显示无可用账号", async ({ page }) 
   expect(view.served_by[0].enabled).toBe(false);
 });
 
-test("停用一个在用的公共模型需要确认并显示租户与密钥数量", async ({ page }) => {
+test("删除一个仍有租户授权的公共模型需要确认，被拒时显示租户与密钥数量", async ({ page }) => {
   const suffix = randomUUID().slice(0, 8);
   const pub = await stack.admin.post("/admin/public-models", { name: `pub-retire-${suffix}` });
   const accountId = await newAccount(`acct-retire-${suffix}`);
@@ -176,15 +176,15 @@ test("停用一个在用的公共模型需要确认并显示租户与密钥数�
   const row = listRow(panel, `pub-retire-${suffix}`);
   // Both keys reach it, so both are counted, in the column and in the warning.
   await expect(row.getByRole("cell").nth(4)).toHaveText("2");
-  await row.getByRole("button", { name: "停用", exact: true }).click();
-  // Asked once: the warning states the counts and what a retire would need
-  // cleared first.
+  await row.getByRole("button", { name: "删除", exact: true }).click();
+  // Asked once: the warning states the counts and what has to be cleared
+  // first.
   await expect(row.getByRole("alert")).toContainText("1 个租户");
   await expect(row.getByRole("alert")).toContainText("2 个密钥");
-  await row.getByRole("button", { name: "确认停用" }).click();
+  await row.getByRole("button", { name: "确认删除" }).click();
 
   // Refused with the counts, and the model is untouched.
-  await expect(panel.getByRole("alert").filter({ hasText: "无法停用" })).toContainText("租户 1");
+  await expect(panel.getByRole("alert").filter({ hasText: "仍在使用中" })).toContainText("1 个租户、2 个密钥");
   const view = await stack.admin.get(`/admin/public-models/${pub.id}`);
   expect(view.retired_at).toBeNull();
   expect(view.tenants).toBe(1);
@@ -284,32 +284,48 @@ test("有分组没有换算率时显示未定价，每个分组都有换算率�
   await expect(listRow(panel, name).getByRole("cell").nth(2)).toHaveText("已定价");
 });
 
-test("只有启用的账号还在服务时，停用的确认说明会被拒绝且不删除任何文档", async ({ page }) => {
+test("两个账号都还在服务的公共模型可以一次删除：映射与两张文档全都没了", async ({ page }) => {
   const suffix = randomUUID().slice(0, 8);
   const name = `pub-served-${suffix}`;
   const pub = await stack.admin.post("/admin/public-models", { name });
-  const accountId = await newAccount(`acct-served-${suffix}`);
-  await stack.admin.put(`/admin/provider-keys/${accountId}/channel-models/${pub.id}`, { priority: 1, weight: 1 });
+  const first = await newAccount(`acct-served-a-${suffix}`);
+  const second = await newAccount(`acct-served-b-${suffix}`);
+  for (const accountId of [first, second]) {
+    await stack.admin.put(`/admin/provider-keys/${accountId}/channel-models/${pub.id}`, { priority: 1, weight: 1 });
+  }
+  await expect
+    .poll(async () => Object.keys(await modelDocs()), { timeout: APPLIED_WITHIN_MS })
+    .toEqual(
+      expect.arrayContaining([name, `${name}#acct-served-a-${suffix}`, `${name}#acct-served-b-${suffix}`]),
+    );
 
   const panel = await openPublicModels(page);
   const row = listRow(panel, name);
-  await row.getByRole("button", { name: "停用", exact: true }).click();
-  // No grant holds it, but an enabled account does: the operator is told the
-  // retire will be refused and why, not that documents will be deleted.
+  await row.getByRole("button", { name: "删除", exact: true }).click();
+  // No grant holds it, so nothing refuses this: the warning says the
+  // mappings go first, then the documents, and that it cannot be undone.
   const warning = row.getByRole("alert");
-  await expect(warning).toContainText("1 个启用的账号");
-  await expect(warning).toContainText("停用会被拒绝");
-  await expect(warning).not.toContainText("删除由它生成的模型文档");
-  await row.getByRole("button", { name: "确认停用" }).click();
+  await expect(warning).toContainText(`先删除 2 个账号对它的映射`);
+  await expect(warning).toContainText("不能恢复");
+  await row.getByRole("button", { name: "确认删除" }).click();
 
-  // And it is refused, with nothing deleted.
-  await expect(panel.getByRole("alert").filter({ hasText: "无法停用" })).toContainText("启用的账号 1");
+  await expect(page.getByText(`已删除「${name}」`)).toBeVisible();
+  await expect(listRow(panel, name).getByRole("cell").nth(5)).toHaveText("已停用");
   const view = await stack.admin.get(`/admin/public-models/${pub.id}`);
-  expect(view.retired_at).toBeNull();
-  expect((await modelDocs())[name], "the routing document is still live").toBeDefined();
+  expect(view.retired_at).not.toBeNull();
+  // Every mapping is gone from both accounts, and the documents with them.
+  for (const accountId of [first, second]) {
+    const table = await stack.admin.get(`/admin/provider-keys/${accountId}/channel-models`);
+    expect(table.items.find((i: Json) => i.public_model_id === pub.id), "the mapping is gone").toBeUndefined();
+  }
+  await expect
+    .poll(async () => Object.keys(await modelDocs()), { timeout: APPLIED_WITHIN_MS })
+    .not.toEqual(
+      expect.arrayContaining([name, `${name}#acct-served-a-${suffix}`, `${name}#acct-served-b-${suffix}`]),
+    );
 });
 
-test("停用一个无人使用的公共模型也要先确认，并说明删除什么、不能恢复", async ({ page }) => {
+test("删除一个无人使用的公共模型也要先确认，并说明删除什么、不能恢复", async ({ page }) => {
   const suffix = randomUUID().slice(0, 8);
   const name = `pub-unused-${suffix}`;
   const pub = await stack.admin.post("/admin/public-models", { name });
@@ -321,14 +337,14 @@ test("停用一个无人使用的公共模型也要先确认，并说明删除�
 
   const panel = await openPublicModels(page);
   const row = listRow(panel, name);
-  await row.getByRole("button", { name: "停用", exact: true }).click();
-  // The first click only asks, and says what the retire removes for good.
+  await row.getByRole("button", { name: "删除", exact: true }).click();
+  // The first click only asks, and says what the delete removes for good.
   const warning = row.getByRole("alert");
   await expect(warning).toContainText("不能恢复");
   await expect(warning).toContainText("路由文档");
   await expect(warning).toContainText("直连文档");
   await expect(warning).toContainText(`名称「${name}」以后不能再用于公共模型`);
-  await expect(row.getByRole("button", { name: "确认停用" })).toBeVisible();
+  await expect(row.getByRole("button", { name: "确认删除" })).toBeVisible();
   // Nothing has happened yet.
   expect((await stack.admin.get(`/admin/public-models/${pub.id}`)).retired_at).toBeNull();
   await expect(row.getByRole("cell").nth(5)).toHaveText("在用");
@@ -336,9 +352,9 @@ test("停用一个无人使用的公共模型也要先确认，并说明删除�
   // Taken back, still nothing; confirmed, it is retired.
   await row.getByRole("button", { name: "取消" }).click();
   expect((await stack.admin.get(`/admin/public-models/${pub.id}`)).retired_at).toBeNull();
-  await row.getByRole("button", { name: "停用", exact: true }).click();
-  await row.getByRole("button", { name: "确认停用" }).click();
-  await expect(page.getByText(`已停用「${name}」。`)).toBeVisible();
+  await row.getByRole("button", { name: "删除", exact: true }).click();
+  await row.getByRole("button", { name: "确认删除" }).click();
+  await expect(page.getByText(`已删除「${name}」`)).toBeVisible();
   await expect(listRow(panel, name).getByRole("cell").nth(5)).toHaveText("已停用");
   expect((await stack.admin.get(`/admin/public-models/${pub.id}`)).retired_at).not.toBeNull();
 });

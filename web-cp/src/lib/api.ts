@@ -1722,6 +1722,16 @@ export const publicModels = {
   async retire(id: string): Promise<PublicModel> {
     return (await call<PublicModel>("POST", `/admin/public-models/${seg(id)}/retire`, {})).data;
   },
+  /**
+   * The whole removal in one attested action: every account's mapping for the
+   * model goes, then its generated documents, then `retired_at` is set.
+   * `409 public_model_in_use` with `counts {tenants, keys, channels}` while a
+   * live tenant grant or key selection names it; an enabled serving account
+   * does not refuse it, unlike `retire`.
+   */
+  async delete(id: string): Promise<PublicModel> {
+    return (await call<PublicModel>("POST", `/admin/public-models/${seg(id)}/delete`, {})).data;
+  },
 };
 
 export const channelModels = {
