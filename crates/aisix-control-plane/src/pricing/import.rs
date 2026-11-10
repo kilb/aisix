@@ -62,9 +62,11 @@
 //! its output is free, which becomes `output: 0`.
 //!
 //! What a whole parse may build is bounded too, since a card's size is the
-//! product of its tiers and the union of their bands, once per date: past
+//! product of its tiers and the union of their bands, and each tier starts as
+//! a copy of the standard prices, once per date: past
 //! [`MAX_IMPORT_PROPOSALS`] proposals or [`MAX_IMPORT_WORK`] steps the body is
-//! refused at `/data`, before the card that would cross either is built. The
+//! refused at `/data`, before the tier copy or card that would cross either is
+//! built. The
 //! upload, the library's fetch and every read of the stored library parse
 //! through the same [`parse`], so the bound holds for all three.
 //!
@@ -129,14 +131,17 @@ pub const MAX_TIERS_PER_FIELD: usize = 64;
 
 /// The most work one parse may do, counted in the steps that grow faster
 /// than the body: each dated proposal's walk over its model's price entries
-/// and variants, each price field read (one more per tier it carries), and
-/// each rate set a card is built of (its tiers times its bands, plus the
-/// base). The per-field cap alone does not bound a card: its bands are the
-/// union of every tier's starts and every tier carries all of them, so a small
-/// body naming many tiers asks for their product, once per date. The
+/// and variants, each variant price merged, each price entry copied into a
+/// tier (every tier starts as a copy of the standard prices), each price
+/// field read (one more per tier it carries), and each rate set a card is
+/// built of (its tiers times its bands, plus the base). The per-field cap
+/// alone does not bound a card: its bands are the union of every tier's
+/// starts and every tier carries all of them, and every tier carries every
+/// standard field, so a small body naming many tiers asks for their product,
+/// once per date. Each step is taken before the work it counts is done. The
 /// published dataset (`LIBRARY_URL`, read on 2026-11-10: 2,353 proposals)
-/// takes about 13,000, and a parse past the limit is refused before the card
-/// that would cross it is built. At the limit a parse holds at most this many
+/// takes about 21,000, and a parse past the limit is refused before the tier
+/// copy or card that would cross it is built. At the limit a parse holds at most this many
 /// rate sets, under 100 MiB.
 pub const MAX_IMPORT_WORK: u64 = 500_000;
 
@@ -1452,6 +1457,15 @@ fn model_proposals(
                 .rev()
                 .find(|(_, c)| c.active(day))
                 .map_or(&entries[0].prices, |(e, _)| &e.prices);
+            // Merging the variants in force walks each one's prices, which is
+            // taken before any is merged.
+            let merged: u64 = variants
+                .iter()
+                .zip(&variant_conditions)
+                .filter(|(_, c)| c.active(day))
+                .map(|(v, _)| v.prices.len() as u64)
+                .sum();
+            budget.spend(merged)?;
             let mut overrides: BTreeMap<ServiceTier, PriceMap<'_>> = BTreeMap::new();
             for (variant, condition) in variants.iter().zip(&variant_conditions) {
                 if !condition.active(day) {
@@ -1466,6 +1480,14 @@ fn model_proposals(
                     prices.entry(field.clone()).or_insert(value);
                 }
             }
+            // Each tier is a copy of the standard prices with its own over
+            // them: the copies are taken before the first is made, since a
+            // standard map of many fields beside many tiers is their product
+            // in a body that is neither.
+            let copies = (overrides.len() as u64 + 1)
+                .saturating_mul(standard.len() as u64)
+                .saturating_add(overrides.values().map(|p| p.len() as u64).sum());
+            budget.spend(copies)?;
             let mut tiers = BTreeMap::from([(ServiceTier::default_tier(), standard.clone())]);
             for (tier, prices) in overrides {
                 if tier == ServiceTier::default_tier() {
@@ -2519,6 +2541,37 @@ mod tests {
             }
             card.validate().expect("the card validates");
         }
+    }
+
+    /// Many variants of one tier, each repeating the same prices, merge
+    /// into one small tier: what the card reads stays small while the merge
+    /// walks every variant's prices once per date. That walk is counted, so
+    /// a body that repeats it across many dates is refused rather than
+    /// merged again and again.
+    #[test]
+    fn variants_merged_again_on_every_date_are_counted() {
+        let fields = (0..300)
+            .map(|n| format!(r#""junk_{n:03}":1"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        let variants = (0..300)
+            .map(|_| format!(r#"{{"when":{{"service_tier":"t1"}},"prices":{{{fields}}}}}"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        let dated = (1..=200)
+            .map(|d| {
+                let day = now().date_naive() + chrono::Days::new(d);
+                format!(
+                    r#",{{"constraint":{{"start_date":"{day}"}},"prices":{{"input_mtok":1,"output_mtok":{d}}}}}"#
+                )
+            })
+            .collect::<String>();
+        let body = dataset(&format!(
+            r#"{{"id":"merged","prices":[{{"prices":{{"input_mtok":1,"output_mtok":1}}}}{dated}],"price_variants":[{variants}]}}"#
+        ));
+        let err = parse(&raw(&body), now()).expect_err("refused");
+        assert_eq!(err.status.as_u16(), 422, "{err:?}");
+        assert!(err.details[0].message.contains("过多"), "{err:?}");
     }
 
     #[test]
