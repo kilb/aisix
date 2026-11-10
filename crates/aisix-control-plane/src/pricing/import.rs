@@ -66,9 +66,8 @@
 //! a copy of the standard prices, once per date: past
 //! [`MAX_IMPORT_PROPOSALS`] proposals or [`MAX_IMPORT_WORK`] steps the body is
 //! refused at `/data`, before the tier copy or card that would cross either is
-//! built. The
-//! upload, the library's fetch and every read of the stored library parse
-//! through the same [`parse`], so the bound holds for all three.
+//! built. The upload, the library's fetch and every read of the stored
+//! library parse through the same [`parse`], so the bound holds for all three.
 //!
 //! # Uploads and proposals
 //!
@@ -141,8 +140,8 @@ pub const MAX_TIERS_PER_FIELD: usize = 64;
 /// once per date. Each step is taken before the work it counts is done. The
 /// published dataset (`LIBRARY_URL`, read on 2026-11-10: 2,353 proposals)
 /// takes about 21,000, and a parse past the limit is refused before the tier
-/// copy or card that would cross it is built. At the limit a parse holds at most this many
-/// rate sets, under 100 MiB.
+/// copy or card that would cross it is built. At the limit a parse holds at
+/// most this many rate sets, under 100 MiB.
 pub const MAX_IMPORT_WORK: u64 = 500_000;
 
 /// Why a proposal cannot be confirmed as it stands.

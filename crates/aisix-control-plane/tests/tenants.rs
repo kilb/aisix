@@ -1993,6 +1993,27 @@ async fn every_tenant_write_takes_the_tenant_before_the_resources_lock() {
     )
     .await;
     assert_eq!(status, 200, "{what}");
+    // The housekeeping pass that regenerates a routing document lacking its
+    // public model's stored settings (`channels::repair_routing`) rewrites
+    // the all-scope tenants' keys the same way. The settings are stored by
+    // SQL, as an older control plane would have left them beside the
+    // document.
+    sqlx::query("UPDATE public_models SET routing = $2 WHERE id = $1::uuid")
+        .bind(&retired)
+        .bind(json!({"strategy": "failover"}))
+        .execute(cp.db().pool())
+        .await
+        .expect("store the settings");
+    let (db, ctx) = (cp.db().clone(), WriteCtx::of(cp.state()));
+    let what = "the pass over routing documents without their stored settings";
+    let status = waits_for_the_tenant_first(&cp, all_scope, what, async move {
+        match aisix_control_plane::channels::repair_routing(&db, &ctx).await {
+            Ok(done) if done.repaired == 1 => 200,
+            _ => 500,
+        }
+    })
+    .await;
+    assert_eq!(status, 200, "{what}");
 
     // The pass that replaces a grant of a channel's generated direct model
     // with its public model (`tenants::replace_generated_grants`, run at boot
