@@ -24,6 +24,16 @@
 //! later commit only makes the next read reload. A version row that is
 //! missing or not a whole number never stops intake: the book is then
 //! reloaded for every batch, and each such read is logged at ERROR.
+//!
+//! A load reads the four revision tables in four statements, and under the
+//! default READ COMMITTED isolation each statement sees what had committed
+//! when it started. Price writes that commit between two of them would leave
+//! a book holding, say, the old baseline beside the new rate: a pair that was
+//! never in force together. So a load is fenced by the version: it is read
+//! before and after the tables, and a load across which it moved is thrown
+//! away and done again ([`MAX_BOOK_LOADS`] times at most). Every price write
+//! moves the version in its own transaction, so a load whose fence held saw
+//! the tables exactly as that version left them.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, PoisonError, RwLock};
@@ -47,6 +57,13 @@ use crate::error::{ApiError, Detail};
 /// backdating allowed, for the moment between an operator's choice of
 /// "now" and the commit.
 pub const BACKDATE_TOLERANCE: TimeDelta = TimeDelta::seconds(5);
+
+/// How many times [`PriceBookCache::current`] loads the book before it gives
+/// up on finding the price tables still: a load across which
+/// `pricing_version` moved is done again. Price writes are operator actions,
+/// so a second load all but always holds; one that never does fails its
+/// caller's transaction, and intake's gateway sends the batch again.
+pub const MAX_BOOK_LOADS: usize = 5;
 
 /// The most characters of a row's `team_id`, `api_key_id`, `user_id` or
 /// `requested_model_id` a charge copies: the same cap usage intake puts on
@@ -80,9 +97,12 @@ impl PriceBookCache {
     /// the book on the same connection only when the version differs from
     /// the cached one, and logs one ERROR per invalid revision on each
     /// reload. Readers that find it stale at the same time share one reload.
-    /// A version that is missing or not a whole number is logged at ERROR and
-    /// reloads the book on every call, so intake keeps pricing from what the
-    /// tables hold. The cache lock is never held across an await.
+    /// A reload is fenced by the version (see the module docs): it is cached
+    /// under the version read before it only when the version read after it
+    /// is the same. A version that is missing or not a whole number is logged
+    /// at ERROR and reloads the book on every call, unfenced, so intake keeps
+    /// pricing from what the tables hold. The cache lock is never held across
+    /// an await.
     pub async fn current(&self, conn: &mut PgConnection) -> Result<Arc<PriceBook>, DbError> {
         let Some(version) = pricing_version(&mut *conn).await? else {
             tracing::error!(
@@ -99,13 +119,30 @@ impl PriceBookCache {
         }
         // One reader reloads; the rest wait here and then find its book.
         let _reloading = self.reload.lock().await;
-        if let Some(book) = self.cached_at(version) {
-            return Ok(book);
+        for _ in 0..MAX_BOOK_LOADS {
+            // Read again: the reader that held the lock may have cached a
+            // later version than the one read above.
+            let Some(before) = pricing_version(&mut *conn).await? else {
+                return self.load(conn).await;
+            };
+            if let Some(book) = self.cached_at(before) {
+                return Ok(book);
+            }
+            let book = self.load(conn).await?;
+            if pricing_version(&mut *conn).await? == Some(before) {
+                *self.cached.write().unwrap_or_else(PoisonError::into_inner) =
+                    Some((before, book.clone()));
+                return Ok(book);
+            }
         }
-        let book = self.load(conn).await?;
-        *self.cached.write().unwrap_or_else(PoisonError::into_inner) =
-            Some((version, book.clone()));
-        Ok(book)
+        tracing::error!(
+            loads = MAX_BOOK_LOADS,
+            "pricing_version moved during every load of the price book; the caller's \
+             transaction fails and is tried again"
+        );
+        Err(DbError::Db(sqlx::Error::Protocol(format!(
+            "pricing_version moved during each of {MAX_BOOK_LOADS} loads of the price book"
+        ))))
     }
 
     /// Loads the book on `conn`, logging each invalid revision.

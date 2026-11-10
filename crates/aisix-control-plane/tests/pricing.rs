@@ -2455,3 +2455,134 @@ async fn a_free_group_and_a_full_discount_post_nothing_and_keep_their_batch() {
             .expect("count the paying tenant's entries");
     assert_eq!(entries, 1);
 }
+
+/// Whether a backend of this database is waiting for a lock while it reads
+/// `table`.
+async fn a_read_of_waits(cp: &TestCp, table: &str) -> bool {
+    sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pg_stat_activity \
+         WHERE datname = current_database() AND wait_event_type = 'Lock' \
+           AND query ILIKE '%FROM ' || $1 || '%')",
+    )
+    .bind(table)
+    .fetch_one(cp.db().pool())
+    .await
+    .expect("read pg_stat_activity")
+}
+
+/// R-001: intake loads the price book with one statement per table, each on
+/// a snapshot of its own. Two price writes that commit between its read of
+/// the baselines and its read of the group rates must not leave it pricing
+/// with the old baseline and the new rate, a pair that was never in force
+/// together: the book it prices with is one some version of the tables held.
+///
+/// The row occurs after both new revisions start (the 5 s backdate window a
+/// write is allowed): at the old prices it is 680 µ¥ (card × rate 1), at the
+/// new ones 2720 µ¥ (card × 2 at rate 2), and the mixed book would bill it
+/// 1360 µ¥. A row before both new revisions is still priced at the old pair.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_book_loaded_while_prices_change_never_mixes_two_versions() {
+    let Some(w) = world().await else { return };
+    let model = seed_model(&w.cp, &w.admin).await;
+    price(&w.cp, model).await;
+    let group = support::world::group_id(&w.cp, support::world::SHARED_GROUP).await;
+    // The revisions above start at the database's now; the new ones start a
+    // moment later, and before the row occurs.
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    let new_from = db_now(&w.cp).await;
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    let mut early = usage(&w, "e-early", model, tokens_680());
+    early["occurred_at"] = json!((new_from - TimeDelta::milliseconds(10)).to_rfc3339());
+    let late = usage(&w, "e-late", model, tokens_680());
+
+    // The group rates are held, so the load stops after reading the baselines.
+    let mut holder = PgConnection::connect(w.cp.database_url())
+        .await
+        .expect("connect");
+    sqlx::query("BEGIN")
+        .execute(&mut holder)
+        .await
+        .expect("begin");
+    sqlx::query("LOCK TABLE pricing_group_rates IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut holder)
+        .await
+        .expect("lock the group rates");
+
+    let delivered = deliver(&w.dp, Uuid::new_v4(), vec![early, late]);
+    let race = async {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+        while !a_read_of_waits(&w.cp, "pricing_group_rates").await {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "intake never waited on the group rates"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        // A new baseline, card × 2, commits while intake waits...
+        let doubled = json!({
+            "default": {"base": {"input": "2", "output": "4", "cache_read": "0.2"}}
+        });
+        let mut tx = w.cp.db().pool().begin().await.expect("begin");
+        sqlx::query(
+            "INSERT INTO pricing_baselines \
+             (engine_version, model_id, effective_from, card, source_kind, source) \
+             VALUES ($1, $2, $3, $4, 'manual', '{\"note\": \"doubled\"}')",
+        )
+        .bind(i64::from(ENGINE_VERSION))
+        .bind(model)
+        .bind(new_from)
+        .bind(doubled)
+        .execute(&mut *tx)
+        .await
+        .expect("write the new baseline");
+        sqlx::query(
+            "UPDATE cp_settings SET value = to_jsonb((value::text)::bigint + 1) \
+             WHERE key = 'pricing_version'",
+        )
+        .execute(&mut *tx)
+        .await
+        .expect("bump");
+        tx.commit().await.expect("commit the baseline");
+        // ...and then a new rate of 2, which releases the lock.
+        sqlx::query(
+            "INSERT INTO pricing_group_rates \
+             (engine_version, group_id, model_id, effective_from, cny_per_usd_e4, note) \
+             VALUES ($1, $2, NULL, $3, 20000, 'doubled')",
+        )
+        .bind(i64::from(ENGINE_VERSION))
+        .bind(group)
+        .bind(new_from)
+        .execute(&mut holder)
+        .await
+        .expect("write the new rate");
+        sqlx::query(
+            "UPDATE cp_settings SET value = to_jsonb((value::text)::bigint + 1) \
+             WHERE key = 'pricing_version'",
+        )
+        .execute(&mut holder)
+        .await
+        .expect("bump");
+        sqlx::query("COMMIT")
+            .execute(&mut holder)
+            .await
+            .expect("commit the rate");
+    };
+    let (r, ()) = tokio::join!(delivered, race);
+    assert_eq!((r.status, r.body.clone()), (200, counts(2, 0, 0)), "{r:?}");
+    let charge = |id: &'static str| {
+        let pool = w.cp.db().pool().clone();
+        async move {
+            sqlx::query_scalar::<_, Option<i64>>(
+                "SELECT charge_micro_cny FROM pricing_charges_cny WHERE event_id = $1",
+            )
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .expect("read the charge")
+        }
+    };
+    // Never the mixed 1360: the late row at the new pair.
+    assert_eq!(charge("e-late").await, Some(2_720));
+    // The book still holds the history: the early row at the old pair.
+    assert_eq!(charge("e-early").await, Some(680));
+}
