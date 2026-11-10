@@ -3381,7 +3381,12 @@ pub fn strip_billing_header_attribution(body: &serde_json::Value) -> Cow<'_, ser
 pub fn parse_inbound_request(
     body: &serde_json::Value,
 ) -> Result<ChatFormat, AnthropicInboundError> {
-    parse_inbound(body, InboundUse::Dispatch, CacheMarkers::Drop)
+    parse_inbound(
+        body,
+        InboundUse::Dispatch,
+        CacheMarkers::Drop,
+        ToolResultMedia::Drop,
+    )
 }
 
 /// What a translation does with the caller's `cache_control` prompt-cache
@@ -3394,6 +3399,20 @@ pub fn parse_inbound_request(
 /// arrays, which several OpenAI-compatible upstreams reject.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CacheMarkers {
+    Drop,
+    Keep,
+}
+
+/// What a translation does with the images and documents inside a
+/// `tool_result` block.
+///
+/// They are kept only for an upstream whose tool result can carry them
+/// ([`aisix_gateway::Bridge::reads_tool_result_media`]), as content parts of
+/// the `role:"tool"` message the block becomes. Every other upstream gets the
+/// result's text alone: Chat Completions takes text only in a `tool` message
+/// and answers an image there with a 400.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolResultMedia {
     Drop,
     Keep,
 }
@@ -3414,11 +3433,16 @@ pub enum CacheMarkers {
 /// Tool definitions are translated by [`translate_extras_to_openai_shape_with`].
 /// A `thinking` block's marker is not carried: replayed reasoning has no
 /// block of its own on the translated wires.
+///
+/// Under [`ToolResultMedia::Keep`] a `tool_result` block's images and
+/// documents become content parts of its `role:"tool"` message, beside its
+/// text.
 pub fn parse_inbound_request_with(
     body: &serde_json::Value,
     markers: CacheMarkers,
+    media: ToolResultMedia,
 ) -> Result<ChatFormat, AnthropicInboundError> {
-    parse_inbound(body, InboundUse::Dispatch, markers)
+    parse_inbound(body, InboundUse::Dispatch, markers, media)
 }
 
 /// The same parse, for the **input guardrail scan**: an assistant turn's
@@ -3435,13 +3459,19 @@ pub fn parse_inbound_request_with(
 pub fn parse_inbound_request_for_scan(
     body: &serde_json::Value,
 ) -> Result<ChatFormat, AnthropicInboundError> {
-    parse_inbound(body, InboundUse::Scan, CacheMarkers::Drop)
+    parse_inbound(
+        body,
+        InboundUse::Scan,
+        CacheMarkers::Drop,
+        ToolResultMedia::Drop,
+    )
 }
 
 fn parse_inbound(
     body: &serde_json::Value,
     purpose: InboundUse,
     markers: CacheMarkers,
+    media: ToolResultMedia,
 ) -> Result<ChatFormat, AnthropicInboundError> {
     use serde_json::Value;
     let obj = body.as_object().ok_or(AnthropicInboundError::NotAnObject)?;
@@ -3501,7 +3531,7 @@ fn parse_inbound(
             // upstreams receive it natively instead of a 400 here.
             ("system", Some(Value::String(s))) => messages.push(ChatMessage::system(s.clone())),
             ("user", Some(Value::Array(blocks))) => {
-                translate_user_blocks(blocks, markers, &mut messages);
+                translate_user_blocks(blocks, markers, media, &mut messages);
             }
             ("assistant", Some(Value::Array(blocks))) => {
                 messages.push(translate_assistant_blocks(blocks, purpose, markers));
@@ -3751,10 +3781,15 @@ fn tool_call_from_tool_use(
 }
 
 /// Translate one Anthropic `tool_result` block into the OpenAI
-/// `role:"tool"` message. Content forms: absent → "",
-/// string → string, single-text array → collapsed string, multi-block
-/// array → combined text+image content parts on ONE tool message.
-fn tool_message_from_tool_result(block: &serde_json::Value, markers: CacheMarkers) -> ChatMessage {
+/// `role:"tool"` message. Content forms: absent → "", string → string,
+/// an array → its text blocks joined; under [`ToolResultMedia::Keep`] an
+/// array holding an image or document → text and media content parts on
+/// ONE tool message.
+fn tool_message_from_tool_result(
+    block: &serde_json::Value,
+    markers: CacheMarkers,
+    media: ToolResultMedia,
+) -> ChatMessage {
     use serde_json::Value;
     let tool_use_id = block
         .get("tool_use_id")
@@ -3766,11 +3801,30 @@ fn tool_message_from_tool_result(block: &serde_json::Value, markers: CacheMarker
         Some(Value::String(s)) => (Some(s.clone()), None),
         Some(Value::Array(items)) => {
             let mut text = String::new();
+            let mut parts: Vec<Value> = Vec::new();
+            let mut has_media = false;
             for item in items {
                 match item.get("type").and_then(Value::as_str) {
                     Some("text") => {
                         if let Some(t) = item.get("text").and_then(Value::as_str) {
                             text.push_str(t);
+                            parts.push(serde_json::json!({"type": "text", "text": t}));
+                        }
+                    }
+                    // Media only where the target's tool result carries it.
+                    // Chat Completions rejects a `tool` message holding an
+                    // image ("Image URLs are only allowed for messages with
+                    // role 'user'"), so it goes nowhere else.
+                    Some("image" | "document") if media == ToolResultMedia::Keep => {
+                        match openai_media_part_from_anthropic(item) {
+                            Some(part) => {
+                                parts.push(part);
+                                has_media = true;
+                            }
+                            None => tracing::debug!(
+                                "dropping tool_result media with unsupported source on \
+                                 cross-provider dispatch",
+                            ),
                         }
                     }
                     other => {
@@ -3781,14 +3835,11 @@ fn tool_message_from_tool_result(block: &serde_json::Value, markers: CacheMarker
                     }
                 }
             }
-            // Text only, always. OpenAI rejects a `tool` message carrying
-            // an image part outright ("Image URLs are only allowed for
-            // messages with role 'user'"), and an Anthropic target filters a
-            // tool result back down to its text blocks. Only Converse reads
-            // media off a tool message, and the target is not known here, so
-            // forwarding the image would turn a tool result that answers into
-            // a 400 on every other route.
-            (Some(text), None)
+            if has_media {
+                (None, Some(parts))
+            } else {
+                (Some(text), None)
+            }
         }
         _ => (Some(String::new()), None),
     };
@@ -3824,6 +3875,7 @@ fn tool_message_from_tool_result(block: &serde_json::Value, markers: CacheMarker
 fn translate_user_blocks(
     blocks: &[serde_json::Value],
     markers: CacheMarkers,
+    media: ToolResultMedia,
     out: &mut Vec<ChatMessage>,
 ) {
     use serde_json::Value;
@@ -3869,7 +3921,7 @@ fn translate_user_blocks(
                 }
             }
             Some("tool_result") => {
-                tool_messages.push(tool_message_from_tool_result(block, markers))
+                tool_messages.push(tool_message_from_tool_result(block, markers, media))
             }
             other => {
                 tracing::debug!(
@@ -9672,7 +9724,8 @@ mod tests {
     #[test]
     fn kept_markers_reach_the_claude_body_where_the_caller_put_them() {
         let body = marked_messages_body();
-        let mut chat = parse_inbound_request_with(&body, CacheMarkers::Keep).unwrap();
+        let mut chat =
+            parse_inbound_request_with(&body, CacheMarkers::Keep, ToolResultMedia::Drop).unwrap();
         translate_extras_to_openai_shape_with(
             &mut chat.extra,
             MappedEffort::AsWritten,
@@ -9717,7 +9770,8 @@ mod tests {
     fn dropped_markers_leave_the_chat_form_as_it_always_was() {
         let body = marked_messages_body();
         let plain = parse_inbound_request(&body).unwrap();
-        let dropped = parse_inbound_request_with(&body, CacheMarkers::Drop).unwrap();
+        let dropped =
+            parse_inbound_request_with(&body, CacheMarkers::Drop, ToolResultMedia::Drop).unwrap();
         let plain = serde_json::to_value(&plain).unwrap();
         assert_eq!(plain, serde_json::to_value(&dropped).unwrap());
         assert!(
@@ -9838,6 +9892,51 @@ mod tests {
         // not cost the request.
         assert_eq!(tool_msg.content_str(), "screenshot:");
         assert!(tool_msg.content_blocks.is_none());
+    }
+
+    /// For a target whose tool result carries media, the image travels on
+    /// the tool message as a content part beside the text, under the
+    /// `tool_call_id` it answers; a document likewise.
+    #[test]
+    fn inbound_tool_result_media_is_kept_for_a_target_that_carries_it() {
+        let body = serde_json::json!({
+            "model": "claude",
+            "messages": [{"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": [
+                    {"type": "text", "text": "screenshot:"},
+                    {"type": "image", "source": {
+                        "type": "base64", "media_type": "image/png", "data": "aWc="
+                    }},
+                    {"type": "document", "title": "r.pdf", "source": {
+                        "type": "base64", "media_type": "application/pdf", "data": "JVBE"
+                    }},
+                ]},
+                {"type": "tool_result", "tool_use_id": "t2", "content": [
+                    {"type": "text", "text": "plain"},
+                ]},
+            ]}],
+        });
+        let chat =
+            parse_inbound_request_with(&body, CacheMarkers::Drop, ToolResultMedia::Keep).unwrap();
+        let tool_msg = &chat.messages[0];
+        assert_eq!(tool_msg.role, Role::Tool);
+        assert_eq!(tool_msg.tool_call_id.as_deref(), Some("t1"));
+        assert_eq!(
+            tool_msg.content_blocks.as_deref(),
+            Some(
+                &[
+                    serde_json::json!({"type": "text", "text": "screenshot:"}),
+                    serde_json::json!({"type": "image_url",
+                                       "image_url": {"url": "data:image/png;base64,aWc="}}),
+                    serde_json::json!({"type": "file", "file": {
+                        "filename": "r.pdf", "file_data": "data:application/pdf;base64,JVBE"}}),
+                ][..]
+            )
+        );
+        assert_eq!(tool_msg.content_str(), "screenshot:");
+        // A text-only result keeps its plain-string shape.
+        assert_eq!(chat.messages[1].content_str(), "plain");
+        assert!(chat.messages[1].content_blocks.is_none());
     }
 
     #[test]
@@ -10837,6 +10936,7 @@ mod request_contract_tests {
                 serde_json::json!({"type": "text", "text": "what does it say?"}),
             ],
             CacheMarkers::Drop,
+            ToolResultMedia::Drop,
             &mut out,
         );
         match out.pop() {

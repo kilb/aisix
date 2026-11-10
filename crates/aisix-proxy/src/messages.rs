@@ -2857,7 +2857,8 @@ async fn cross_provider_dispatch(
     use aisix_gateway::Bridge;
     use aisix_provider_anthropic::{
         chat_response_into_anthropic_json, wire::parse_inbound_request_with,
-        wire::translate_extras_to_openai_shape_with, wire::CacheMarkers, AnthropicSseEncoder,
+        wire::translate_extras_to_openai_shape_with, wire::CacheMarkers, wire::ToolResultMedia,
+        AnthropicSseEncoder,
     };
     use std::sync::Arc;
 
@@ -2921,7 +2922,14 @@ async fn cross_provider_dispatch(
     } else {
         CacheMarkers::Drop
     };
-    let mut chat = parse_inbound_request_with(body, markers)
+    // A tool result's images and documents likewise reach only an upstream
+    // whose tool result carries them (Converse); elsewhere its text goes.
+    let media = if bridge.reads_tool_result_media(&ctx) {
+        ToolResultMedia::Keep
+    } else {
+        ToolResultMedia::Drop
+    };
+    let mut chat = parse_inbound_request_with(body, markers, media)
         .map_err(|e| ProxyError::InvalidRequest(format!("invalid Anthropic body: {e}")))?;
     // Force the bridge dispatch to use the operator's display name
     // (`model_name`) so the bridge can re-resolve the upstream id

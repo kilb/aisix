@@ -1105,6 +1105,20 @@ impl Bridge for BedrockBridge {
         })
     }
 
+    /// A Converse `toolResult` holds images and documents beside its text
+    /// (<https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_ToolResultContentBlock.html>),
+    /// and every request for a model outside Claude and the Chat
+    /// Completions route goes to Converse. Claude answers a chat request
+    /// over the Messages wire, whose shared builder takes a tool result's
+    /// text only, and a Chat Completions model can be sent to that endpoint,
+    /// whose `tool` message is text only.
+    fn reads_tool_result_media(&self, ctx: &BridgeContext) -> bool {
+        upstream_model(ctx).is_ok_and(|id| {
+            BedrockPublisher::from_model_id(id) != Some(BedrockPublisher::Anthropic)
+                && !crate::openai_compat::is_default_route(id)
+        })
+    }
+
     async fn chat(
         &self,
         req: &ChatFormat,
@@ -8471,6 +8485,25 @@ mod tests {
                 sample_pk_with_secret(valid_secret_json()),
             );
             assert_eq!(bridge.reads_cache_markers(&ctx), reads, "{id}");
+        }
+    }
+
+    #[test]
+    fn reads_tool_result_media_only_where_converse_serves_the_request() {
+        let bridge = BedrockBridge::new();
+        for (id, reads) in [
+            ("amazon.nova-pro-v1:0", true),
+            ("us.amazon.nova-lite-v1:0", true),
+            ("meta.llama3-3-70b-instruct-v1:0", true),
+            ("anthropic.claude-3-5-haiku-20241022-v1:0", false),
+            ("us.xai.grok-4-1-fast-v1:0", false),
+        ] {
+            let ctx = BridgeContext::new(
+                "r",
+                sample_model_with(id),
+                sample_pk_with_secret(valid_secret_json()),
+            );
+            assert_eq!(bridge.reads_tool_result_media(&ctx), reads, "{id}");
         }
     }
 }
