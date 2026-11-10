@@ -115,6 +115,8 @@ pub struct ResponseHeaderTap {
     /// caller's request, for [`crate::upstream_error_scrub`]. Kept across
     /// attempts: an error a fallback relays may quote an earlier one.
     sent_credentials: Mutex<Vec<String>>,
+    /// See [`note_served_input_tokens`].
+    served_input_tokens: Mutex<Option<u32>>,
 }
 
 impl std::fmt::Debug for ResponseHeaderTap {
@@ -136,6 +138,7 @@ impl ResponseHeaderTap {
             request_id,
             latest: Mutex::default(),
             sent_credentials: Mutex::default(),
+            served_input_tokens: Mutex::default(),
         }
     }
 
@@ -195,6 +198,34 @@ pub fn note_upstream_error_body(body: &bytes::Bytes) {
             tap.lock().error_body = Some(body);
         }
     });
+}
+
+/// Note that the attempt now failing had already been served, and billed,
+/// in part: an operation the gateway makes in several upstream calls (one
+/// Titan embedding per text) that failed after some of them answered.
+/// `tokens` is the input those calls reported. The proxy takes it with
+/// [`take_served_input_tokens`] when the attempt fails, to bill it and to
+/// not replay the calls that answered. Outside a request scope it is a
+/// no-op.
+pub fn note_served_input_tokens(tokens: u32) {
+    let _ = TAP.try_with(|tap| {
+        *tap.served_input_tokens
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(tokens);
+    });
+}
+
+/// What [`note_served_input_tokens`] noted since the last take, leaving
+/// nothing behind. `None` outside a request scope.
+pub fn take_served_input_tokens() -> Option<u32> {
+    TAP.try_with(|tap| {
+        tap.served_input_tokens
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+    })
+    .ok()
+    .flatten()
 }
 
 /// The most credentials one request keeps: a request reaches a handful of
@@ -359,6 +390,21 @@ mod tests {
         let got = idle.take();
         assert!(got.headers.is_empty());
         assert_eq!(got.request_id, "req_1");
+    }
+
+    #[tokio::test]
+    async fn served_input_tokens_are_taken_once_and_only_inside_a_scope() {
+        note_served_input_tokens(7);
+        assert_eq!(take_served_input_tokens(), None);
+
+        let tap = Arc::new(ResponseHeaderTap::new(Vec::new(), false, String::new()));
+        let taken = scope(tap, async {
+            assert_eq!(take_served_input_tokens(), None);
+            note_served_input_tokens(8);
+            (take_served_input_tokens(), take_served_input_tokens())
+        })
+        .await;
+        assert_eq!(taken, (Some(8), None));
     }
 
     #[test]

@@ -1151,6 +1151,11 @@ pub(crate) fn emit_failed_attempts_as(
             error_message: rec.error_message.clone(),
             ..Default::default()
         };
+        // An attempt that failed part way bills what it had been served.
+        if let Some(served) = crate::attribution::served_before_failure(rec.index) {
+            event.prompt_tokens = served.prompt_tokens;
+            event.cost_usd = served.cost_usd;
+        }
         let pk = ResolvedPk::resolve(snap, &rec.provider_key_id);
         apply_pk_telemetry(&mut event, &pk);
         apply_caller_identity(&mut event, client.jwt.as_ref(), &client.caller);

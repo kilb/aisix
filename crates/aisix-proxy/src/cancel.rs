@@ -182,6 +182,7 @@ pub(crate) fn emit(
     // emitting: whatever it wrote stands, rather than being doubled.
     for rec in ctx.failed_attempts.iter().filter(|_| !ctx.emitted_any) {
         let pk = ResolvedPk::resolve(&snap, &rec.provider_key_id);
+        let served = ctx.served_before_failure(rec.index).unwrap_or_default();
         let event = UsageEvent {
             // NO-GUARDRAIL-CHAIN: this emitter runs from `Drop` with no
             // handler. `applied_guardrails`, the enforced hits, the scores
@@ -199,6 +200,10 @@ pub(crate) fn emit(
             attempt_model: rec.target_model.clone(),
             error_class: rec.error_class.clone(),
             error_message: rec.error_message.clone(),
+            // What the attempt had been served before it failed, as the
+            // handler's own emitter bills it.
+            prompt_tokens: served.prompt_tokens,
+            cost_usd: served.cost_usd,
             ..base_event(request_id, resolved, &ctx, &client, inbound_protocol, &pk)
         };
         emit_one(

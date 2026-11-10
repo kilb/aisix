@@ -290,6 +290,20 @@ pub(crate) struct CancelContext {
     /// The service tier the request body asked for. See
     /// [`note_requested_service_tier`].
     pub requested_service_tier: Option<String>,
+    /// What failed attempts had already been served, by attempt index. See
+    /// [`note_served_before_failure`].
+    pub served_before_failure: Vec<(u32, ServedBeforeFailure)>,
+}
+
+/// What an attempt that then failed had already been served, and billed,
+/// for: the input of the texts an embedding answered in several upstream
+/// calls before one of them failed
+/// ([`aisix_gateway::note_served_input_tokens`]). That attempt's failure row
+/// bills it.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct ServedBeforeFailure {
+    pub prompt_tokens: u32,
+    pub cost_usd: f64,
 }
 
 /// A streamed response's access-log line, parked by its handler until the
@@ -1544,6 +1558,26 @@ pub(crate) fn note_attempt_settled(rec: &AttemptRecord) {
     });
 }
 
+/// Note that the attempt in flight, which is failing, had already been
+/// served `served`. Its failure row bills it ([`served_before_failure`]).
+/// Outside an attempt it is a no-op.
+pub(crate) fn note_served_before_failure(served: ServedBeforeFailure) {
+    with_cancel(|c| {
+        if let Some(index) = c.in_flight.as_ref().map(|a| a.index) {
+            c.served_before_failure.push((index, served));
+        }
+    });
+}
+
+/// What [`note_served_before_failure`] noted for the attempt at
+/// `attempt_index`. `None` outside a request scope.
+pub(crate) fn served_before_failure(attempt_index: u32) -> Option<ServedBeforeFailure> {
+    CURRENT
+        .try_with(|a| a.lock().cancel.served_before_failure(attempt_index))
+        .ok()
+        .flatten()
+}
+
 /// Note what the answer of the attempt that answered is billed, the moment
 /// the family has computed what its success row takes and before its first
 /// await. A caller that hangs up during the work that follows (the output
@@ -1913,6 +1947,14 @@ pub(crate) fn note_refused_request(content: aisix_obs::CapturedContent) {
 }
 
 impl CancelContext {
+    /// See [`note_served_before_failure`].
+    pub(crate) fn served_before_failure(&self, attempt_index: u32) -> Option<ServedBeforeFailure> {
+        self.served_before_failure
+            .iter()
+            .find(|(index, _)| *index == attempt_index)
+            .map(|(_, served)| *served)
+    }
+
     /// The request body the rows of a request that hung up report.
     pub(crate) fn failure_body(&self) -> Option<&aisix_obs::CapturedContent> {
         self.failure_body_at(crate::CLIENT_CLOSED_REQUEST)

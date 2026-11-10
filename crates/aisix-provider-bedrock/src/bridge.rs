@@ -655,6 +655,35 @@ pub(crate) fn auth_headers(
         .collect())
 }
 
+/// Run `fut` within what is left of a non-streamed attempt's budget.
+///
+/// The attempt's `deadline`, counted from `started`, bounds everything the
+/// attempt does as a whole — obtaining credentials, downloading media, and
+/// every upstream operation of a request served in several (one Titan
+/// embedding per text) — rather than each phase on its own. The SDK's
+/// operation timeout starts again with each operation, so it cannot be that
+/// bound (<https://docs.aws.amazon.com/sdk-for-rust/latest/dg/timeouts.html>).
+async fn within_attempt<T>(
+    deadline: Option<std::time::Duration>,
+    started: Instant,
+    fut: impl std::future::Future<Output = Result<T, BridgeError>>,
+) -> Result<T, BridgeError> {
+    let Some(d) = deadline else {
+        return fut.await;
+    };
+    let timed_out = || BridgeError::Timeout {
+        elapsed_ms: started.elapsed().as_millis() as u64,
+        cause: String::new(),
+    };
+    let left = d
+        .checked_sub(started.elapsed())
+        .filter(|left| !left.is_zero())
+        .ok_or_else(timed_out)?;
+    tokio::time::timeout(left, fut)
+        .await
+        .unwrap_or_else(|_| Err(timed_out()))
+}
+
 /// Build a Bedrock SDK Client from the resolved authentication plus the
 /// optional endpoint override.
 fn build_client(
@@ -1152,38 +1181,7 @@ impl Bridge for BedrockBridge {
         req: std::borrow::Cow<'_, ChatFormat>,
         ctx: &BridgeContext,
     ) -> Result<ChatResponse, BridgeError> {
-        let req = aisix_gateway::tool_calls::chat_without_thought_signatures(req);
-        let upstream_id = upstream_model(ctx)?;
-        validate_model_id_chars(upstream_id)?;
-        let publisher = resolve_publisher(upstream_id)?;
-        if crate::openai_compat::serves(&req, upstream_id) {
-            let endpoint = self.chat_completions_endpoint(ctx)?;
-            return crate::openai_compat::chat(endpoint, req, ctx, upstream_id).await;
-        }
-        // InvokeModel and Converse take tools, not the legacy fields.
-        let (req, legacy) = aisix_gateway::tool_calls::legacy_functions_as_tools(req)?;
-        // Claude answers a non-streamed request through InvokeModel, in
-        // Anthropic Messages shape; every other publisher, and every
-        // streamed request, through Converse.
-        // InvokeModel has no place for `requestMetadata`, a Bedrock
-        // `outputConfig`, `additionalModelResponseFieldPaths` or
-        // `promptVariables`, so a Claude request carrying one is served by
-        // Converse, as it is when streamed.
-        let needs_converse = [
-            "requestMetadata",
-            "outputConfig",
-            "additionalModelResponseFieldPaths",
-            "promptVariables",
-        ]
-        .iter()
-        .any(|k| req.extra.get(*k).is_some_and(|v| !v.is_null()));
-        match publisher {
-            Some(BedrockPublisher::Anthropic) if !needs_converse => {
-                self.chat_anthropic(req, ctx, upstream_id).await
-            }
-            _ => self.chat_converse(req, ctx, upstream_id).await,
-        }
-        .map(|resp| legacy.reply(resp))
+        within_attempt(ctx.deadline, Instant::now(), self.chat_attempt(req, ctx)).await
     }
 
     async fn chat_stream(
@@ -1251,9 +1249,11 @@ impl Bridge for BedrockBridge {
         req.require_text_input()?;
         let upstream_id = upstream_model(ctx)?;
         validate_model_id_chars(upstream_id)?;
-        let client = self.build_client_from_ctx(ctx).await?;
+        // One budget for the whole attempt: the credentials and every
+        // operation below spend from it.
         let started = Instant::now();
         let deadline = ctx.deadline;
+        let client = within_attempt(deadline, started, self.build_client_from_ctx(ctx)).await?;
 
         let mut data = Vec::with_capacity(req.input.len());
         let mut prompt_tokens: u64 = 0;
@@ -1277,17 +1277,27 @@ impl Bridge for BedrockBridge {
                 }
                 let body_bytes = serde_json::to_vec(&body)
                     .map_err(|e| BridgeError::Config(format!("serialize Titan embed body: {e}")))?;
-                let resp = client
+                let send = client
                     .invoke_model()
                     .model_id(upstream_id)
                     .content_type("application/json")
                     .accept("application/json")
                     .body(Blob::new(body_bytes))
-                    .send()
-                    .await
-                    .map_err(|e| crate::errors::sdk_error(e, started, deadline))?;
+                    .send();
+                let resp = within_attempt(deadline, started, async {
+                    send.await
+                        .map_err(|e| crate::errors::sdk_error(e, started, deadline))
+                })
+                .await
+                .map_err(|e| titan_failed_after(i, prompt_tokens, e))?;
                 let parsed: TitanEmbedResponse = serde_json::from_slice(resp.body().as_ref())
-                    .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?;
+                    .map_err(|e| {
+                        titan_failed_after(
+                            i,
+                            prompt_tokens,
+                            BridgeError::UpstreamDecode(e.to_string()),
+                        )
+                    })?;
                 if let Some(token_count) = parsed.input_text_token_count {
                     prompt_tokens += token_count;
                 } else {
@@ -1330,15 +1340,18 @@ impl Bridge for BedrockBridge {
                 })
                 .map_err(|e| BridgeError::Config(format!("serialize Cohere embed body: {e}")))?,
             );
-            let resp = client
+            let send = client
                 .invoke_model()
                 .model_id(upstream_id)
                 .content_type("application/json")
                 .accept("application/json")
                 .body(Blob::new(body_bytes))
-                .send()
-                .await
-                .map_err(|e| crate::errors::sdk_error(e, started, deadline))?;
+                .send();
+            let resp = within_attempt(deadline, started, async {
+                send.await
+                    .map_err(|e| crate::errors::sdk_error(e, started, deadline))
+            })
+            .await?;
             let parsed: CohereEmbedResponse = serde_json::from_slice(resp.body().as_ref())
                 .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?;
             for (i, values) in parsed.embeddings.into_vectors().into_iter().enumerate() {
@@ -1386,6 +1399,18 @@ impl Bridge for BedrockBridge {
             },
         })
     }
+}
+
+/// `err`, for a Titan embedding that failed at text `index` after the texts
+/// before it had been answered, and billed: what they reported is noted for
+/// the attempt's row, which bills it, and so that the proxy does not send the
+/// answered texts again (Titan takes one text per call,
+/// <https://docs.aws.amazon.com/bedrock/latest/userguide/model-parameters-titan-embed-text.html>).
+fn titan_failed_after(index: usize, prompt_tokens: u64, err: BridgeError) -> BridgeError {
+    if index > 0 {
+        aisix_gateway::note_served_input_tokens(prompt_tokens.min(u64::from(u32::MAX)) as u32);
+    }
+    err
 }
 
 /// Titan embed response per the Amazon Titan Embeddings docs
@@ -1474,6 +1499,47 @@ fn shape_invoke_body(
 }
 
 impl BedrockBridge {
+    /// One non-streamed chat attempt: everything [`Bridge::chat_cow`] runs
+    /// inside the attempt's deadline.
+    async fn chat_attempt(
+        &self,
+        req: std::borrow::Cow<'_, ChatFormat>,
+        ctx: &BridgeContext,
+    ) -> Result<ChatResponse, BridgeError> {
+        let req = aisix_gateway::tool_calls::chat_without_thought_signatures(req);
+        let upstream_id = upstream_model(ctx)?;
+        validate_model_id_chars(upstream_id)?;
+        let publisher = resolve_publisher(upstream_id)?;
+        if crate::openai_compat::serves(&req, upstream_id) {
+            let endpoint = self.chat_completions_endpoint(ctx)?;
+            return crate::openai_compat::chat(endpoint, req, ctx, upstream_id).await;
+        }
+        // InvokeModel and Converse take tools, not the legacy fields.
+        let (req, legacy) = aisix_gateway::tool_calls::legacy_functions_as_tools(req)?;
+        // Claude answers a non-streamed request through InvokeModel, in
+        // Anthropic Messages shape; every other publisher, and every
+        // streamed request, through Converse.
+        // InvokeModel has no place for `requestMetadata`, a Bedrock
+        // `outputConfig`, `additionalModelResponseFieldPaths` or
+        // `promptVariables`, so a Claude request carrying one is served by
+        // Converse, as it is when streamed.
+        let needs_converse = [
+            "requestMetadata",
+            "outputConfig",
+            "additionalModelResponseFieldPaths",
+            "promptVariables",
+        ]
+        .iter()
+        .any(|k| req.extra.get(*k).is_some_and(|v| !v.is_null()));
+        match publisher {
+            Some(BedrockPublisher::Anthropic) if !needs_converse => {
+                self.chat_anthropic(req, ctx, upstream_id).await
+            }
+            _ => self.chat_converse(req, ctx, upstream_id).await,
+        }
+        .map(|resp| legacy.reply(resp))
+    }
+
     /// Dispatch Anthropic-on-Bedrock chat via the legacy /invoke
     /// path. Body shape per
     /// <https://docs.aws.amazon.com/bedrock/latest/userguide/model-parameters-anthropic-claude-messages.html>:
@@ -7963,6 +8029,119 @@ mod tests {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .contains("AWS4-HMAC-SHA256"));
+    }
+
+    /// The model's `timeout` bounds the attempt, not each Titan call: two
+    /// texts that each take most of the budget time out together instead of
+    /// answering after twice the budget.
+    #[tokio::test]
+    async fn titan_embed_items_share_one_attempt_deadline() {
+        use wiremock::matchers::{method as wm_method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::builder().start().await;
+        Mock::given(wm_method("POST"))
+            .and(wm_path("/model/amazon.titan-embed-text-v1/invoke"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(400))
+                    .set_body_json(serde_json::json!({
+                        "embedding": [0.25, 0.5],
+                        "inputTextTokenCount": 4
+                    })),
+            )
+            .mount(&server)
+            .await;
+
+        let bridge = BedrockBridge::new().with_endpoint_override(server.uri());
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("amazon.titan-embed-text-v1"),
+            sample_pk_with_secret(valid_secret_json()),
+        )
+        .with_deadline(Duration::from_millis(600));
+        let req = EmbeddingRequest {
+            extra: Default::default(),
+            token_input: None,
+            model: "customer-facing-name".into(),
+            input: vec!["a".into(), "b".into()],
+            input_was_single: false,
+            encoding_format: None,
+            dimensions: None,
+            input_type: None,
+            embedding_types: None,
+        };
+        let started = std::time::Instant::now();
+        let got = bridge.embed(&req, &ctx).await;
+        let elapsed = started.elapsed();
+        assert!(matches!(got, Err(BridgeError::Timeout { .. })), "{got:?}");
+        assert!(elapsed < Duration::from_millis(790), "{elapsed:?}");
+    }
+
+    /// Titan answers one text per call, so a failure at a later text comes
+    /// after the earlier ones were served and billed: their reported input
+    /// is noted for the attempt's row, and nothing is noted when the first
+    /// text fails.
+    #[tokio::test]
+    async fn a_later_titan_failure_notes_what_the_earlier_texts_were_served() {
+        use wiremock::matchers::{body_json, method as wm_method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::builder().start().await;
+        Mock::given(wm_method("POST"))
+            .and(wm_path("/model/amazon.titan-embed-text-v1/invoke"))
+            .and(body_json(serde_json::json!({"inputText": "a"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "embedding": [0.25, 0.5],
+                "inputTextTokenCount": 4
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(wm_method("POST"))
+            .and(wm_path("/model/amazon.titan-embed-text-v1/invoke"))
+            .and(body_json(serde_json::json!({"inputText": "b"})))
+            .respond_with(ResponseTemplate::new(503).set_body_json(serde_json::json!({
+                "message": "Model is getting throttled."
+            })))
+            .mount(&server)
+            .await;
+
+        let bridge = BedrockBridge::new().with_endpoint_override(server.uri());
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("amazon.titan-embed-text-v1"),
+            sample_pk_with_secret(valid_secret_json()),
+        );
+        let embed = |input: Vec<&str>| EmbeddingRequest {
+            extra: Default::default(),
+            token_input: None,
+            model: "customer-facing-name".into(),
+            input: input.into_iter().map(str::to_string).collect(),
+            input_was_single: false,
+            encoding_format: None,
+            dimensions: None,
+            input_type: None,
+            embedding_types: None,
+        };
+        let tap = std::sync::Arc::new(aisix_gateway::ResponseHeaderTap::new(
+            Vec::new(),
+            false,
+            String::new(),
+        ));
+        let (later, first) = aisix_gateway::response_tap::scope(tap, async {
+            let later = bridge.embed(&embed(vec!["a", "b"]), &ctx).await;
+            assert!(
+                matches!(later, Err(BridgeError::UpstreamStatus { status: 503, .. })),
+                "{later:?}"
+            );
+            let later = aisix_gateway::take_served_input_tokens();
+            let first = bridge.embed(&embed(vec!["b", "a"]), &ctx).await;
+            assert!(first.is_err(), "{first:?}");
+            (later, aisix_gateway::take_served_input_tokens())
+        })
+        .await;
+        assert_eq!(later, Some(4));
+        assert_eq!(first, None);
     }
 
     #[tokio::test]
