@@ -838,7 +838,11 @@ async fn a_delivery_waiting_for_a_body_slot_is_stored_once_one_frees() {
 /// held while it is stored.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_body_slot_is_held_until_its_store_ends_even_once_the_request_is_gone() {
-    let Some(cp) = TestCp::start().await else {
+    // The store waits on the table lock this test holds. Under the default
+    // 5 s `lock_timeout` a slow runner stalling the test before its COMMIT
+    // makes the store give up, which frees the slot and stores nothing: the
+    // test would then fail on the clock, not on the behaviour it checks.
+    let Some(cp) = TestCp::start_with(|c| c.db_lock_timeout_ms = 60_000).await else {
         return;
     };
     let dp = Arc::new(cp.issue_dp_client("gw-usage-7c1").await);
