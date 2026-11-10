@@ -186,6 +186,13 @@ pub(crate) fn init_reqwest_material(settings: &TlsSettings) -> Result<(), String
         })?),
         None => None,
     };
+    // The raw-rustls stack (the Realtime WebSocket) presents the same
+    // identity; parse it for that stack too, so one it cannot use fails the
+    // boot rather than the first Realtime session.
+    if let Some(id) = &settings.client_identity {
+        rustls_identity_config(id)
+            .map_err(|e| format!("upstream.tls.client_cert_file/client_key_file: {e}"))?;
+    }
     let _ = REQWEST_TLS.set(ReqwestTlsMaterial { roots, identity });
     Ok(())
 }
@@ -510,20 +517,79 @@ fn build_rustls_client_config(tls: &TlsSettings) -> rustls::ClientConfig {
     let builder = rustls::ClientConfig::builder_with_provider(provider.clone())
         .with_safe_default_protocol_versions()
         .expect("the crypto provider supports the default protocol versions");
-    let mut config = if tls.verify {
-        builder
-            .with_root_certificates(root_store(tls))
-            .with_no_client_auth()
+    let builder = if tls.verify {
+        builder.with_root_certificates(root_store(tls))
     } else {
         builder
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(danger::AcceptAnyServerCert(provider)))
-            .with_no_client_auth()
+    };
+    // The deployment's client identity, presented to a peer that asks for
+    // one, exactly as the reqwest clients present it.
+    let identity = tls.client_identity.as_deref().map(|id| {
+        rustls_identity(id).and_then(|(certs, key)| {
+            builder
+                .clone()
+                .with_client_auth_cert(certs, key)
+                .map_err(|e| e.to_string())
+        })
+    });
+    let mut config = match identity {
+        Some(Ok(config)) => config,
+        // Validated at boot (`init_reqwest_material`), so not reachable from
+        // a booted process; said loudly rather than presenting nothing.
+        Some(Err(e)) => {
+            tracing::error!(
+                error = %e,
+                "upstream.tls client certificate not applied to the Realtime WebSocket"
+            );
+            builder.with_no_client_auth()
+        }
+        None => builder.with_no_client_auth(),
     };
     // The WebSocket upstream is HTTP/1.1; advertising anything else
     // would let a peer negotiate a protocol the transport can't speak.
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
     config
+}
+
+/// The certificate chain and private key of `id`, as rustls takes them.
+fn rustls_identity(
+    id: &ClientIdentityPem,
+) -> Result<
+    (
+        Vec<rustls::pki_types::CertificateDer<'static>>,
+        rustls::pki_types::PrivateKeyDer<'static>,
+    ),
+    String,
+> {
+    let certs = rustls_pemfile::certs(&mut id.cert.as_slice())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("client certificate: {e}"))?;
+    if certs.is_empty() {
+        return Err("client certificate file contains no CERTIFICATE block".into());
+    }
+    let key = rustls_pemfile::private_key(&mut id.key.as_slice())
+        .map_err(|e| format!("client key: {e}"))?
+        .ok_or_else(|| "client key file contains no private key".to_string())?;
+    Ok((certs, key))
+}
+
+/// Check that rustls can present `id`: the same build
+/// [`build_rustls_client_config`] does, over an empty root store so it does
+/// not read the platform trust store at boot.
+fn rustls_identity_config(id: &ClientIdentityPem) -> Result<(), String> {
+    let provider = rustls::crypto::CryptoProvider::get_default()
+        .cloned()
+        .unwrap_or_else(|| Arc::new(rustls::crypto::aws_lc_rs::default_provider()));
+    let (certs, key) = rustls_identity(id)?;
+    rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| e.to_string())?
+        .with_root_certificates(rustls::RootCertStore::empty())
+        .with_client_auth_cert(certs, key)
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 /// Built-in roots (platform store + the compiled-in Mozilla set, which
@@ -1167,6 +1233,110 @@ mod tests {
     fn verify_true_builds_a_config_over_the_built_in_roots() {
         let cfg = build_rustls_client_config(&TlsSettings::default());
         assert_eq!(cfg.alpn_protocols, vec![b"http/1.1".to_vec()]);
+    }
+
+    /// A throwaway CA and a leaf it signs, both PEM: `(ca_cert, leaf_cert,
+    /// leaf_key)`.
+    fn signed_leaf(name: &str) -> (String, String, String) {
+        let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let ca = ca_params.self_signed(&ca_key).unwrap();
+        let leaf_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let leaf = rcgen::CertificateParams::new(vec![name.to_string()])
+            .unwrap()
+            .signed_by(&leaf_key, &ca, &ca_key)
+            .unwrap();
+        (ca.pem(), leaf.pem(), leaf_key.serialize_pem())
+    }
+
+    /// Whether a peer that requires a client certificate accepted the
+    /// handshake of a Realtime-stack client built from `tls`.
+    async fn mtls_peer_accepts(tls: &TlsSettings, client_ca: &str) -> bool {
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let (_, server_cert, server_key) = signed_leaf("localhost");
+        let mut client_roots = rustls::RootCertStore::empty();
+        for cert in rustls_pemfile::certs(&mut client_ca.as_bytes()) {
+            client_roots.add(cert.unwrap()).unwrap();
+        }
+        let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
+            Arc::new(client_roots),
+            provider.clone(),
+        )
+        .build()
+        .unwrap();
+        let server = rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_client_cert_verifier(verifier)
+            .with_single_cert(
+                rustls_pemfile::certs(&mut server_cert.as_bytes())
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap(),
+                rustls_pemfile::private_key(&mut server_key.as_bytes())
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server));
+        let accepted = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            acceptor.accept(socket).await.is_ok()
+        });
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(build_rustls_client_config(tls)));
+        let socket = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+        // Under TLS 1.3 the client finishes before the server has judged its
+        // certificate, so the verdict is read on the server's side.
+        let _client = connector.connect(name, socket).await;
+        accepted.await.unwrap()
+    }
+
+    /// The Realtime WebSocket dials over raw rustls, not reqwest, so the
+    /// deployment's client identity has to reach that config too: a peer
+    /// that requires mutual TLS refused it before.
+    #[tokio::test]
+    async fn the_realtime_tls_stack_presents_the_configured_client_certificate() {
+        let (client_ca, client_cert, client_key) = signed_leaf("aisix-gateway");
+        let with_identity = TlsSettings {
+            verify: false,
+            client_identity: Some(Arc::new(ClientIdentityPem {
+                key: client_key.into_bytes(),
+                cert: client_cert.into_bytes(),
+            })),
+            ..Default::default()
+        };
+        assert!(mtls_peer_accepts(&with_identity, &client_ca).await);
+        let without = TlsSettings {
+            verify: false,
+            ..Default::default()
+        };
+        assert!(
+            !mtls_peer_accepts(&without, &client_ca).await,
+            "control: the peer refuses a client that presents no certificate"
+        );
+    }
+
+    /// A key rustls cannot use fails the boot, naming the setting, instead of
+    /// a Realtime session that quietly presents nothing.
+    #[test]
+    fn an_identity_the_rustls_stack_cannot_present_fails_the_boot() {
+        let (_, cert, _) = signed_leaf("aisix-gateway");
+        let (_, _, other_key) = signed_leaf("someone-else");
+        let mismatched = TlsSettings {
+            client_identity: Some(Arc::new(ClientIdentityPem {
+                key: other_key.into_bytes(),
+                cert: cert.into_bytes(),
+            })),
+            ..Default::default()
+        };
+        let err = init_reqwest_material(&mismatched).unwrap_err();
+        assert!(
+            err.contains("upstream.tls.client_cert_file/client_key_file"),
+            "{err}"
+        );
     }
 
     fn shared_client() -> reqwest::Client {
