@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { deltaWord, outcomeUnknown, utcInputToIso, utcInputValue } from "./repricing.ts";
+import { deltaWord, outcomeUnknown, previewAgainBody, utcInputToIso, utcInputValue } from "./repricing.ts";
 
 // Shaped like the client's `ApiError`, whose class needs a TypeScript transform to load here.
 const err = (status: number, code: string) => Object.assign(new Error("x"), { status, code });
@@ -34,4 +34,20 @@ test("only a 4xx from the control plane proves an apply did nothing", () => {
   assert.equal(outcomeUnknown(err(200, "bad_response")), true);
   assert.equal(outcomeUnknown(err(404, "bad_response")), true);
   assert.equal(outcomeUnknown(new TypeError("boom")), true);
+});
+
+test("previewing a run again keeps every filter it was stored with, its group included", () => {
+  const filter = { from: "2026-11-10T00:00:00Z", to: "2026-11-10T01:00:00Z", model_id: "m", tenant_id: "t", group_id: "g-a", status: "unpriced" };
+  assert.deepEqual(previewAgainBody({ filter, reason: "补录" }), { ...filter, reason: "补录" });
+  // An unfiltered run stays unfiltered.
+  const open = { from: filter.from, to: filter.to, model_id: null, tenant_id: null, group_id: null, status: null };
+  assert.deepEqual(previewAgainBody({ filter: open, reason: "r" }), {
+    from: filter.from,
+    to: filter.to,
+    model_id: undefined,
+    tenant_id: undefined,
+    group_id: undefined,
+    status: undefined,
+    reason: "r",
+  });
 });
