@@ -272,3 +272,158 @@ test("面板列出每个分组的人民币售价：基准价乘以该分组现�
   const shared = matrix.getByRole("row").filter({ has: page.getByRole("cell", { name: "通用分组", exact: true }) });
   await expect(shared).toContainText("分组未设换算率");
 });
+
+/** Fills each `[label, value]` in `group`, by its exact label. */
+async function fill(group: Locator, values: [string, string][]): Promise<void> {
+  for (const [label, value] of values) await group.getByLabel(label, { exact: true }).fill(value);
+}
+
+test("手动录入可以填写多个档位与长上下文档，联网搜索按每千次填写，保存后从接口读回同一张卡", async ({ page }) => {
+  const model = await newModel("tier-base", "gpt-5.4-nano");
+  await openBaselines(page);
+  const panel = await openModel(page, model.name);
+  await panel.getByLabel("方式").selectOption("manual");
+
+  // The standard tier: its base, and a band above 200,000 input tokens. A
+  // web search is typed as the provider publishes it, $10 per 1,000.
+  await fill(panel.getByRole("group", { name: "标准档 基础价", exact: true }), [
+    ["输入", "3"],
+    ["输出", "15"],
+    ["缓存读", "0.3"],
+    ["联网搜索（每千次）", "10"],
+  ]);
+  await panel.getByRole("group", { name: "标准档", exact: true }).getByRole("button", { name: "添加长上下文档" }).click();
+  await fill(panel.getByRole("group", { name: "标准档 长上下文档 1", exact: true }), [
+    ["输入超过（tokens）", "200000"],
+    ["输入", "6"],
+    ["输出", "22.5"],
+    ["缓存读", "0.6"],
+    ["联网搜索（每千次）", "10"],
+  ]);
+
+  // A second tier, batch, with its band at the standard tier's threshold.
+  await panel.getByLabel("要添加的档位").selectOption("batch");
+  await panel.getByRole("button", { name: "添加档位" }).click();
+  const batchBand = panel.getByRole("group", { name: "批量档 长上下文档 1", exact: true });
+  await expect(batchBand.getByLabel("输入超过（tokens）")).toHaveValue("200000");
+  await fill(panel.getByRole("group", { name: "批量档 基础价", exact: true }), [
+    ["输入", "1.5"],
+    ["输出", "7.5"],
+    ["缓存读", "0.15"],
+    ["联网搜索（每千次）", "10"],
+  ]);
+  await fill(batchBand, [
+    ["输入", "3"],
+    ["输出", "11.25"],
+    ["缓存读", "0.3"],
+    ["联网搜索（每千次）", "10"],
+  ]);
+  await panel.getByLabel("说明", { exact: true }).fill("两档位与长上下文档");
+  await panel.getByRole("button", { name: "保存" }).click();
+  await expect(page.getByText("已保存")).toBeVisible();
+
+  // What the control plane stores: every rate as typed, per million units,
+  // so a search's $10 per 1,000 is 10000 per million searches.
+  const search = "10000";
+  const stored = (await stack.admin.get("/admin/pricing/baselines")) as Json;
+  const listed = stored.items.find((i: Json) => i.model_id === model.id);
+  expect(listed.current.card).toEqual({
+    default: {
+      base: { input: "3", output: "15", cache_read: "0.3", web_search: search },
+      long_context: [{ above_input_tokens: 200000, rates: { input: "6", output: "22.5", cache_read: "0.6", web_search: search } }],
+    },
+    batch: {
+      base: { input: "1.5", output: "7.5", cache_read: "0.15", web_search: search },
+      long_context: [{ above_input_tokens: 200000, rates: { input: "3", output: "11.25", cache_read: "0.3", web_search: search } }],
+    },
+  });
+
+  // Shown back per thousand searches, never as 10000 a search.
+  const now = panel.getByRole("region", { name: "现行基准价" });
+  await expect(now).toContainText("联网搜索 $10 / 千次");
+  await expect(now).not.toContainText("$10000");
+  // Read again on a fresh form, the whole card is filled in, in the unit it was typed in.
+  await page.reload();
+  await expect(page.locator("[data-tab]").first()).toBeVisible();
+  await page.locator('[data-tab="pricing"]').click();
+  await page.getByRole("button", { name: "基准价", exact: true }).click();
+  const again = await openModel(page, model.name);
+  await again.getByLabel("方式").selectOption("manual");
+  await expect(again.getByRole("group", { name: "批量档 长上下文档 1", exact: true }).getByLabel("输出", { exact: true })).toHaveValue("11.25");
+  await expect(again.getByRole("group", { name: "标准档 基础价", exact: true }).getByLabel("联网搜索（每千次）")).toHaveValue("10");
+});
+
+test("档位的长上下文门槛与标准档不同：在该档位旁报错，不写入基准价", async ({ page }) => {
+  const model = await newModel("tier-bad", "gpt-5.4-nano");
+  await openBaselines(page);
+  const panel = await openModel(page, model.name);
+  await panel.getByLabel("方式").selectOption("manual");
+
+  await fill(panel.getByRole("group", { name: "标准档 基础价", exact: true }), [
+    ["输入", "1"],
+    ["输出", "2"],
+  ]);
+  await panel.getByRole("group", { name: "标准档", exact: true }).getByRole("button", { name: "添加长上下文档" }).click();
+  await fill(panel.getByRole("group", { name: "标准档 长上下文档 1", exact: true }), [
+    ["输入超过（tokens）", "200000"],
+    ["输入", "2"],
+    ["输出", "4"],
+  ]);
+  await panel.getByLabel("要添加的档位").selectOption("batch");
+  await panel.getByRole("button", { name: "添加档位" }).click();
+  await fill(panel.getByRole("group", { name: "批量档 基础价", exact: true }), [
+    ["输入", "0.5"],
+    ["输出", "1"],
+  ]);
+  // The batch band at another threshold than the standard tier's.
+  await fill(panel.getByRole("group", { name: "批量档 长上下文档 1", exact: true }), [
+    ["输入超过（tokens）", "100000"],
+    ["输入", "1"],
+    ["输出", "2"],
+  ]);
+  await panel.getByLabel("说明", { exact: true }).fill("门槛不一致");
+  await panel.getByRole("button", { name: "保存" }).click();
+
+  // Refused beside the batch tier's bands, not above the whole card.
+  const batch = panel.getByRole("group", { name: "批量档", exact: true });
+  await expect(batch.getByRole("alert")).toContainText("长上下文门槛必须与标准档的完全相同");
+  await expect(panel.getByRole("group", { name: "标准档", exact: true }).getByRole("alert")).toHaveCount(0);
+  const stored = (await stack.admin.get("/admin/pricing/baselines")) as Json;
+  const listed = stored.items.find((i: Json) => i.model_id === model.id);
+  expect(listed.current).toBeNull();
+  expect(listed.upcoming).toHaveLength(0);
+
+  // Without the batch tier, a threshold out of order is refused at its own field.
+  await batch.getByRole("button", { name: "移除档位" }).click();
+  await expect(panel.getByRole("group", { name: "批量档", exact: true })).toHaveCount(0);
+  await panel.getByRole("group", { name: "标准档", exact: true }).getByRole("button", { name: "添加长上下文档" }).click();
+  await fill(panel.getByRole("group", { name: "标准档 长上下文档 2", exact: true }), [
+    ["输入超过（tokens）", "100000"],
+    ["输入", "3"],
+    ["输出", "5"],
+  ]);
+  await panel.getByRole("button", { name: "保存" }).click();
+  const threshold = panel.getByRole("group", { name: "标准档 长上下文档 2", exact: true }).getByLabel("输入超过（tokens）");
+  await expect(threshold).toHaveAttribute("aria-invalid", "true");
+  await expect(panel.getByRole("group", { name: "标准档 长上下文档 2", exact: true })).toContainText("长上下文门槛必须逐个递增");
+  const after = (await stack.admin.get("/admin/pricing/baselines")) as Json;
+  expect(after.items.find((i: Json) => i.model_id === model.id).current).toBeNull();
+});
+
+test("联网搜索的价格不是每千次的金额时，在字段旁提示，不提交", async ({ page }) => {
+  const model = await newModel("search-bad", "gpt-5.4-nano");
+  await openBaselines(page);
+  const panel = await openModel(page, model.name);
+  await panel.getByLabel("方式").selectOption("manual");
+  await fill(panel.getByRole("group", { name: "标准档 基础价", exact: true }), [
+    ["输入", "1"],
+    ["输出", "2"],
+    // Ten decimals per thousand: more than a card holds per million.
+    ["联网搜索（每千次）", "0.0000000001"],
+  ]);
+  await panel.getByLabel("说明", { exact: true }).fill("x");
+  await panel.getByRole("button", { name: "保存" }).click();
+  await expect(panel.getByText("按每千次的美元数填写，最多 9 位小数")).toBeVisible();
+  const stored = (await stack.admin.get("/admin/pricing/baselines")) as Json;
+  expect(stored.items.find((i: Json) => i.model_id === model.id).current).toBeNull();
+});

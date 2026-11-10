@@ -380,7 +380,7 @@ function BaselinePanel({
     setLater([]);
     const refused: Detail[] = [];
     if (mode === "manual") {
-      if (!cardOk) refused.push({ path: "/card", message: "价目卡 JSON 不合法，修改尚未生效；请先改正" });
+      if (!cardOk) refused.push({ path: "/card", message: "价格卡中有无法读取的内容，修改尚未生效；请先改正" });
     } else if (!chosen) {
       refused.push({ path: "/catalogue_key", message: "请选择目录条目" });
     }
