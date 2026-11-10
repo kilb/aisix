@@ -957,14 +957,53 @@ fn transport_error_is_unauthorized(error: &rmcp::transport::DynamicTransportErro
     }
 }
 
+/// Most `tools/list` pages read from one upstream. A server paginates at its
+/// own page size, so this is far past any real inventory; it stops one that
+/// keeps handing back a cursor from looping until the deadline.
+const MAX_TOOL_LIST_PAGES: usize = 100;
+
+/// Most tools kept from one upstream's `tools/list`, across its pages.
+const MAX_LISTED_TOOLS: usize = 10_000;
+
 #[async_trait]
 impl McpBridge for RmcpBridge {
+    /// Every page of the upstream's tool list, read under one deadline.
+    ///
+    /// `tools/list` is paginated: a result carrying `nextCursor` has more
+    /// tools behind it, fetched by sending the cursor back
+    /// (<https://modelcontextprotocol.io/specification/2025-11-25/server/utilities/pagination>).
+    /// The downstream list is one complete result, so the pages are joined
+    /// here; an upstream past [`MAX_TOOL_LIST_PAGES`] or [`MAX_LISTED_TOOLS`]
+    /// fails the list rather than serving part of it.
     async fn list_tools(&self) -> Result<Vec<McpTool>, McpError> {
-        let result = tokio::time::timeout(self.timeout, self.running.list_tools(None))
+        let list = async {
+            let mut tools = Vec::new();
+            let mut params = None;
+            for _ in 0..MAX_TOOL_LIST_PAGES {
+                let page = self
+                    .running
+                    .list_tools(params)
+                    .await
+                    .map_err(request_error)?;
+                tools.extend(page.tools.into_iter().map(into_mcp_tool));
+                if tools.len() > MAX_LISTED_TOOLS {
+                    return Err(McpError::Request(format!(
+                        "upstream tools/list returned more than {MAX_LISTED_TOOLS} tools"
+                    )));
+                }
+                let Some(cursor) = page.next_cursor else {
+                    return Ok(tools);
+                };
+                params =
+                    Some(rmcp::model::PaginatedRequestParams::default().with_cursor(Some(cursor)));
+            }
+            Err(McpError::Request(format!(
+                "upstream tools/list did not end within {MAX_TOOL_LIST_PAGES} pages"
+            )))
+        };
+        tokio::time::timeout(self.timeout, list)
             .await
             .map_err(|_| McpError::Request("upstream tools/list timed out".to_string()))?
-            .map_err(request_error)?;
-        Ok(result.tools.into_iter().map(into_mcp_tool).collect())
     }
 
     async fn call_tool(
