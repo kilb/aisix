@@ -14,6 +14,7 @@ import {
   type Tenant,
 } from "../lib/api";
 import { errorText, fmtTime } from "../lib/fmt";
+import { keyModels } from "../lib/keyModels";
 import {
   atList,
   Check,
@@ -124,12 +125,7 @@ function ownerOf(k: AdminKey, tenant: Tenant, members: Member[] | null): string 
 
 /** The models key `k` may call, by name; a selected model the tenant no longer grants is marked. */
 function modelsOf(k: AdminKey, tenant: Tenant, names: Map<string, string>): string {
-  if (k.allowed_models?.length) return k.allowed_models.join("、");
-  if (k.model_ids === null) return "全部授权模型";
-  if (k.model_ids.length === 0) return "无";
-  return k.model_ids
-    .map((id) => `${names.get(id) ?? id}${tenant.allowed_model_ids.includes(id) ? "" : "（租户未授权）"}`)
-    .join("、");
+  return keyModels(k, tenant, names);
 }
 
 function limitsOf(k: AdminKey): string {

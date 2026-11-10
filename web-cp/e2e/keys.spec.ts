@@ -47,6 +47,11 @@ test.beforeAll(async () => {
   models.other = await direct("other-t6-e2e", "gpt-4o", shared.id);
   // Served only by an account in grp-alpha-7c1.
   models.alpha = await direct("alpha-t6-e2e", "gpt-4.1-mini", alpha.id);
+  // A public model, which is what an `all`-scope tenant reaches: its scope is
+  // the public catalogue, not the hand-written model documents above.
+  const pub = await stack.admin.post("/admin/public-models", { name: "pub-t6-e2e" });
+  await stack.admin.put(`/admin/provider-keys/${shared.id}/channel-models/${pub.id}`, { priority: 1, weight: 1 });
+  models.pub = pub;
 });
 
 test.afterAll(async () => {
@@ -430,6 +435,40 @@ test("给客户租户新建密钥：只能调用所选模型，限额与过期�
   expect(stored.rate_limit).toEqual({ concurrency: 2, rpm: 30 });
   expect(new Date(stored.expires_at).getTime()).toBe(new Date("2031-01-02T03:04").getTime());
   expect(stored.created_by.kind).toBe("operator");
+});
+
+/**
+ * An `all`-scope tenant grants every public model, including ones added
+ * later, so its stored `allowed_model_ids` is empty by construction — yet a
+ * key may still carry a selection. The Keys table used to read the stored
+ * list alone and label every such model 租户未授权, which is the opposite of
+ * the truth for a key that is in fact narrowed to it.
+ *
+ * The tenant here is the production shape exactly: all scope, no stored
+ * list, and a key selecting one model. The scope is what decides the mark,
+ * never the list.
+ */
+test("全部范围租户的密钥不把已选模型标成租户未授权", async ({ page }) => {
+  const t = await signUpActive("T6 AllScope Co 6c2", "owner@allscope-t6.test");
+  const tenant = await stack.admin.get(`/admin/tenants/${t.id}`);
+  expect(tenant.model_scope).toBe("all");
+  expect(tenant.allowed_model_ids).toEqual([]);
+
+  // A key narrowed to one model. Its selection is checked against what the
+  // scope reaches, not against the (empty) stored list.
+  const minted = await stack.admin.post(`/admin/tenants/${t.id}/keys`, {
+    label: "allscope-key-t6",
+    model_ids: [models.pub.id],
+  });
+  const stored = ((await stack.admin.get(`/admin/tenants/${t.id}/keys`)).items as Json[]).find(
+    (k) => k.id === minted.key.id,
+  );
+  expect(stored.model_ids).toEqual([models.pub.id]);
+
+  await openKeys(page, t.org);
+  const row = keyRow(page, "allscope-key-t6");
+  await expect(row).toContainText("pub-t6-e2e");
+  await expect(row).not.toContainText("租户未授权");
 });
 
 test("分组只选一个：分组没有上游账号时先警告并要求确认，确认后才创建", async ({ page }) => {

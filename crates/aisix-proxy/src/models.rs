@@ -24,6 +24,15 @@
 //! to use, and the same key→model ACL that authorizes the request
 //! decides whether it appears here.
 //!
+//! The one exception is a model whose `internal` marker is set: the direct
+//! document a public model generates for one serving account, which is a
+//! routing target and never an entry a caller addresses. It is not a name a
+//! caller may put in `model` — [`crate::model_resolve::resolve_model`]
+//! refuses it exactly as it refuses a name no row serves — so it must not
+//! appear here either, whichever grant shape the key carries. The ACL alone
+//! could not do it: it matches by NAME, and a pattern grant matches a
+//! generated name by construction.
+//!
 //! OpenAI shape (<https://platform.openai.com/docs/api-reference/models>):
 //! `{"id", "object": "model", "created", "owned_by"}` inside
 //! `{"object": "list", "data": [...]}`.
@@ -239,13 +248,20 @@ fn permitted_model_names(
 }
 
 /// Whether a model is a name this caller may be shown, before the
-/// `allowed_models` ACL: not a wildcard alias, and not an ensemble when the
-/// key is held to provider groups, since every request naming one is
-/// answered as a model that does not exist
+/// `allowed_models` ACL: not a wildcard alias, not a model generated for one
+/// serving account of a public model, and not an ensemble when the key is
+/// held to provider groups, since every request naming one is answered as a
+/// model that does not exist
 /// ([`crate::model_resolve::refuse_ensemble_to_grouped_key`]). Keys on the
 /// requested entry, the only identity a listing has.
+///
+/// `internal` is filtered here rather than through the `allowed_models` ACL
+/// on purpose: that ACL matches by NAME, and a pattern grant (`["*"]`,
+/// `["claude-*"]`) matches a generated document's name by construction. The
+/// marker is a property of the document, so no grant can reintroduce it.
 fn listable(model: &aisix_core::Model, auth: &AuthenticatedKey) -> bool {
-    !model.display_name.contains('*')
+    !model.internal
+        && !model.display_name.contains('*')
         && crate::model_resolve::refuse_ensemble_to_grouped_key(
             &model.display_name,
             model,
@@ -599,6 +615,50 @@ mod tests {
         ResourceEntry::new(id, m, 1)
     }
 
+    /// The document a public model generates for one serving account
+    /// (`channels::direct_doc` in the control plane): the marker is what
+    /// keeps it a routing target and nothing else.
+    fn internal_model_entry(id: &str, name: &str) -> ResourceEntry<Model> {
+        let cfg = format!(
+            r#"{{
+                "display_name": "{name}",
+                "provider": "openai",
+                "model_name": "gpt-4o",
+                "provider_key_id": "{PK_ID}",
+                "internal": true
+            }}"#
+        );
+        let m: Model = serde_json::from_str(&cfg).unwrap();
+        assert!(m.internal, "the fixture must carry the marker");
+        ResourceEntry::new(id, m, 1)
+    }
+
+    /// A snapshot shaped like production: a public model, two internal
+    /// documents generated for it (one per serving account), and a second
+    /// public model whose name shares no prefix with the first.
+    fn generated_snap() -> AisixSnapshot {
+        let snap = new_snap();
+        snap.models.insert(model_entry("m-pub-1", "claude-fable-5"));
+        snap.models.insert(model_entry("m-pub-2", "gpt-4o"));
+        snap.models
+            .insert(internal_model_entry("m-int-1", "claude-fable-5#wj-cc"));
+        snap.models
+            .insert(internal_model_entry("m-int-2", "claude-fable-5#hk-cc"));
+        snap
+    }
+
+    /// The listed ids of one listing, sorted.
+    fn listed_ids(v: &serde_json::Value) -> Vec<String> {
+        let mut ids: Vec<String> = v["data"]
+            .as_array()
+            .expect("a data array")
+            .iter()
+            .map(|m| m["id"].as_str().expect("an id").to_string())
+            .collect();
+        ids.sort();
+        ids
+    }
+
     fn provider_key_entry() -> ResourceEntry<aisix_core::ProviderKey> {
         let pk: aisix_core::ProviderKey =
             serde_json::from_str(r#"{"display_name":"openai-up","secret":"sk-up","provider":"openai","adapter":"openai"}"#).unwrap();
@@ -916,6 +976,201 @@ mod tests {
         // Only the concrete gpt4, not the `openai/*` pattern.
         assert_eq!(data.len(), 1);
         assert_eq!(data[0]["id"], "gpt4");
+    }
+
+    /// A public model whose routing document targets internal documents
+    /// still serves: hiding a model from callers must not cut a group off
+    /// from its own targets. The targets are addressed by id, which is the
+    /// path the resolver change deliberately leaves alone.
+    #[tokio::test]
+    async fn a_routing_document_serves_through_its_internal_targets() {
+        let upstream = wiremock::MockServer::builder().start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/chat/completions"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                "id": "cmpl-int",
+                "model": "gpt-4o",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "served"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            })))
+            .mount(&upstream)
+            .await;
+
+        let snap = AisixSnapshot::new();
+        let pk: aisix_core::ProviderKey = serde_json::from_value(json!({
+            "display_name": "acct-shared",
+            "secret": "sk-up",
+            "api_base": upstream.uri(),
+            "provider": "openai",
+            "adapter": "openai",
+        }))
+        .unwrap();
+        snap.provider_keys.insert(ResourceEntry::new(PK_ID, pk, 1));
+        // Two serving accounts of one public model: the names are the ones
+        // the control plane generates.
+        for (id, name) in [
+            ("m-int-1", "public-model#acct-a"),
+            ("m-int-2", "public-model#acct-b"),
+        ] {
+            let m: Model = serde_json::from_value(json!({
+                "display_name": name,
+                "provider": "openai",
+                "model_name": "gpt-4o",
+                "provider_key_id": PK_ID,
+                "internal": true,
+            }))
+            .unwrap();
+            snap.models.insert(ResourceEntry::new(id, m, 1));
+        }
+        let routing: Model = serde_json::from_value(json!({
+            "display_name": "public-model",
+            "routing": {
+                "strategy": "failover",
+                "targets": [
+                    {"model_id": "m-int-1", "priority": 1},
+                    {"model_id": "m-int-2", "priority": 0},
+                ],
+            }
+        }))
+        .unwrap();
+        snap.models.insert(ResourceEntry::new("m-pub", routing, 1));
+        // Granted by id, as a customer key is: public models only.
+        let key: ApiKey = serde_json::from_value(json!({
+            "key_hash": ApiKey::hash_bearer("sk-caller"),
+            "allowed_model_ids": ["m-pub"],
+            "allowed_models": [],
+        }))
+        .unwrap();
+        snap.apikeys.insert(ResourceEntry::new("key-1", key, 1));
+
+        let app = build_app(snap);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                json!({
+                    "model": "public-model",
+                    "messages": [{"role": "user", "content": "hi"}],
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        // The caller sees the entry it addressed, never a target's name.
+        assert_eq!(v["model"], "public-model");
+        assert_eq!(v["choices"][0]["message"]["content"], "served");
+    }
+
+    /// A key granted the whole catalogue by pattern (`["*"]`) still lists no
+    /// generated document: the marker is on the document, so the grant shape
+    /// cannot change the answer.
+    #[tokio::test]
+    async fn an_all_models_grant_lists_no_internal_model() {
+        let snap = generated_snap();
+        snap.apikeys.insert(apikey_entry("sk-caller", &["*"]));
+
+        let app = build_app(snap);
+        assert_eq!(
+            listed_ids(&list_as_caller(app).await),
+            vec!["claude-fable-5".to_string(), "gpt-4o".to_string()]
+        );
+    }
+
+    /// The same listing through Anthropic's shape, which is a second
+    /// serializer over the same names — filtering one and not the other
+    /// would hide the leak behind a header.
+    #[tokio::test]
+    async fn an_all_models_grant_lists_no_internal_model_in_the_anthropic_shape() {
+        let snap = generated_snap();
+        snap.apikeys.insert(apikey_entry("sk-caller", &["*"]));
+
+        let app = build_app(snap);
+        let req = Request::builder()
+            .method("GET")
+            .uri("/v1/models")
+            .header("authorization", "Bearer sk-caller")
+            .header("anthropic-version", "2023-06-01")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            listed_ids(&v),
+            vec!["claude-fable-5".to_string(), "gpt-4o".to_string()]
+        );
+    }
+
+    /// A prefix grant is the shape production leaks through: `claude-*`
+    /// matches `claude-fable-5#wj-cc` by name, and matching by name is
+    /// exactly what the ACL does. Only the public models may come back.
+    #[tokio::test]
+    async fn a_prefix_grant_lists_only_the_public_models() {
+        let snap = generated_snap();
+        snap.apikeys
+            .insert(apikey_entry("sk-caller", &["claude-*"]));
+
+        let app = build_app(snap);
+        assert_eq!(
+            listed_ids(&list_as_caller(app).await),
+            vec!["claude-fable-5".to_string()]
+        );
+    }
+
+    /// `GET /v1/models/{id}` applies the same filter, so the one-model
+    /// endpoint cannot be used to confirm a hidden name exists: it answers a
+    /// 404 in the same envelope an unknown name gets.
+    #[tokio::test]
+    async fn the_one_model_endpoint_answers_an_internal_name_as_unknown() {
+        let snap = generated_snap();
+        snap.apikeys.insert(apikey_entry("sk-caller", &["*"]));
+        let app = build_app(snap);
+
+        // The `#` of a generated name is percent-encoded, as a client must.
+        const HIDDEN: &str = "claude-fable-5#wj-cc";
+        const UNKNOWN: &str = "nothing-here";
+        let hidden = "/v1/models/claude-fable-5%23wj-cc";
+        let answer = |app: Router, uri: &'static str| async move {
+            let req = Request::builder()
+                .method("GET")
+                .uri(uri)
+                .header("authorization", "Bearer sk-caller")
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+            let status = resp.status();
+            let body = to_bytes(resp.into_body(), 65536).await.unwrap().to_vec();
+            (status, body)
+        };
+        let (hidden_status, hidden_body) = answer(app.clone(), hidden).await;
+        let (unknown_status, unknown_body) = answer(app.clone(), "/v1/models/nothing-here").await;
+        assert_eq!(hidden_status, StatusCode::NOT_FOUND);
+        assert_eq!(hidden_status, unknown_status);
+        // Same envelope, key for key. The only difference is the name the
+        // caller itself sent — which each side echoes back verbatim, so
+        // replacing it normalises the two without hiding a difference in
+        // anything else.
+        let envelope =
+            |body: Vec<u8>, name: &str| String::from_utf8(body).unwrap().replace(name, "<model>");
+        assert_eq!(
+            envelope(hidden_body, HIDDEN),
+            envelope(unknown_body, UNKNOWN)
+        );
+
+        // The public model the documents were generated for still answers,
+        // and says nothing about them.
+        let public = answer(app, "/v1/models/claude-fable-5").await;
+        assert_eq!(public.0, StatusCode::OK);
     }
 
     #[tokio::test]

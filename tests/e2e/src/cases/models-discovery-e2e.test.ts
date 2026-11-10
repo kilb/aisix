@@ -24,6 +24,10 @@ import {
 // there.
 
 const CALLER = "sk-models-discovery-e2e";
+/// Granted by pattern, which is the grant shape a generated document's name
+/// would match; the ACL is checked by name, so only the document's marker
+/// keeps it out.
+const PATTERN_CALLER = "sk-models-discovery-pattern-e2e";
 const sha256 = (s: string) => createHash("sha256").update(s).digest("hex");
 
 interface OpenAiList {
@@ -80,10 +84,28 @@ describe("model discovery in both dialects", () => {
       model_name: "gpt-4o-mini",
       provider_key_id: pk.id,
     });
+    // The document a public model generates for one serving account: a
+    // routing target, never a name a caller addresses. Written before the
+    // key, so the gate below implies it has landed. Its exclusion is
+    // asserted through the pattern-granted key further down, which is the
+    // grant shape that would otherwise match it by name.
+    await seed.createModel({
+      display_name: "md-alpha#acct-shared",
+      provider: "openai",
+      model_name: "gpt-4o-mini",
+      provider_key_id: pk.id,
+      internal: true,
+    });
     // Last, so a gate on this key authenticating implies the rows above.
     await seed.createApiKey({
       key_hash: sha256(CALLER),
       allowed_models: ["md-alpha", "md-bravo", "md-charlie"],
+    });
+    // A second key granted by PATTERN, which is how a generated document
+    // would be listed at all: `md-*` matches its name by construction.
+    await seed.createApiKey({
+      key_hash: sha256(PATTERN_CALLER),
+      allowed_models: ["md-*"],
     });
   });
 
@@ -110,6 +132,10 @@ describe("model discovery in both dialects", () => {
       openai.data?.map((m) => m.id),
       "the list must not advertise a model this key cannot then use",
     ).not.toContain("md-secret");
+    expect(
+      openai.data?.map((m) => m.id),
+      "a generated document is a routing target, whichever grant shape the key carries",
+    ).not.toContain("md-alpha#acct-shared");
 
     const anthropic = (await (
       await get("/v1/models", { "anthropic-version": "2023-06-01" })
@@ -229,6 +255,36 @@ describe("model discovery in both dialects", () => {
     const forbidden = await get("/v1/models/md-secret");
     const missing = await get("/v1/models/md-nothing");
     expect([forbidden.status, missing.status]).toEqual([404, 404]);
+
+    // A generated document is answered as a name that does not exist too:
+    // confirming it would hand a caller one serving account of a public
+    // model, past its routing. Same envelope, key for key, apart from the
+    // name each answer echoes back — which is the caller's own input.
+    const internal = await get("/v1/models/md-alpha%23acct-shared");
+    expect(internal.status).toBe(404);
+    const envelope = (text: string, name: string) => text.replace(name, "<model>");
+    expect(envelope(await internal.text(), "md-alpha#acct-shared")).toBe(
+      envelope(await missing.text(), "md-nothing"),
+    );
+  }, 60_000);
+
+  test("a pattern grant lists the public models only", async (ctx) => {
+    if (!etcdReachable || !app) {
+      ctx.skip();
+      return;
+    }
+
+    // `md-*` matches `md-alpha#acct-shared` by name — the grant is not what
+    // keeps it out. The listing is, because the document says it is a
+    // routing target. Named in the assertion so a list that simply returned
+    // nothing cannot pass.
+    const list = (await (
+      await fetch(`${app.proxyUrl}/v1/models`, {
+        headers: { authorization: `Bearer ${PATTERN_CALLER}` },
+      })
+    ).json()) as OpenAiList;
+    expect(list.data?.map((m) => m.id)).toEqual(["md-alpha", "md-bravo", "md-charlie"]);
+    expect(list.data?.map((m) => m.id)).not.toContain("md-alpha#acct-shared");
   }, 60_000);
 
   function get(path: string, extra: Record<string, string> = {}) {

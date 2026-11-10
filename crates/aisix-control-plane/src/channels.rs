@@ -206,6 +206,12 @@ pub async fn priceable_models(conn: &mut PgConnection) -> Result<Vec<(Uuid, Stri
 /// none. No `cost`, `pricing_key`, `retries`, `cooldown` or
 /// `background_model_check`: the control plane never prices a target, and
 /// per-account timeouts are not part of this shape.
+///
+/// `internal: true` is what keeps this document a routing target and
+/// nothing else: the gateway does not list it on `/v1/models` and refuses a
+/// request that names it, so a key granted by pattern cannot pin one
+/// account and bypass the public model's routing. The routing document
+/// itself is not marked, because that is the entry callers address.
 pub fn direct_doc(
     channel: &ChannelModelRow,
     public: &PublicModelRow,
@@ -220,6 +226,7 @@ pub fn direct_doc(
             .as_deref()
             .unwrap_or(public.name.as_str()),
         "provider_key_id": channel.provider_key_id.to_string(),
+        "internal": true,
     })
 }
 

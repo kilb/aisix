@@ -1276,7 +1276,26 @@ pub fn model_root_schema(strict: bool) -> Value {
     // write path would leave a stored id-only reference dropping its row.
     apply_model_ref_alternatives(&mut schema);
     apply_effort_mapping_tokens(&mut schema, strict);
+    apply_internal_default(&mut schema);
     schema
+}
+
+/// Publish `internal`'s default on both sets.
+///
+/// `schemars` renders a `bool` as a plain property with no `default`, which
+/// leaves a consumer rendering a form unable to say what omitting it means.
+/// The runtime treats an absent field as `false` (the field's serde
+/// default), so that is the value stated. Applied to both sets like every
+/// other producer: strictness is a pass over one schema, and `default` is an
+/// annotation no validator acts on.
+fn apply_internal_default(schema: &mut Value) {
+    let Some(node) = schema
+        .pointer_mut("/properties/internal")
+        .and_then(Value::as_object_mut)
+    else {
+        return;
+    };
+    node.insert("default".to_string(), json!(false));
 }
 
 /// State `effort_mapping`'s reserved forms on both contracts: a `null` value
@@ -3253,6 +3272,58 @@ mod tests {
             validate_model(&case).unwrap_or_else(|e| panic!("strict rejected {case}: {e}"));
             validate_model_lenient(&case)
                 .unwrap_or_else(|e| panic!("lenient rejected {case}: {e}"));
+        }
+    }
+
+    /// A model document stored before `internal` existed must load, and must
+    /// load as an ordinary model — that is the fail-open direction for a
+    /// field whose absence means "not generated", which is what every row
+    /// written by an older control plane means. Proving it needs BOTH
+    /// contracts: the lenient set is the one the loader applies, and the
+    /// strict set is what a hand-written resources file is checked against,
+    /// so a document accepted by only one of them is a gap on that path.
+    #[test]
+    fn a_model_stored_before_the_internal_marker_still_loads() {
+        let doc = json!({
+            "display_name": "claude-fable-5",
+            "provider": "openai",
+            "model_name": "gpt-4o",
+            "provider_key_id": "pk-1",
+        });
+        validate_model(&doc).expect("the write contract accepts an omitting document");
+        validate_model_lenient(&doc).expect("a stored row without the field still loads");
+        let model: crate::models::Model = serde_json::from_value(doc).expect("and deserializes");
+        assert!(!model.internal, "absence means an ordinary model");
+
+        // Marking one is equally valid on both paths, and the marker keeps
+        // its published default so a form can render the omitted case.
+        let marked = json!({
+            "display_name": "claude-fable-5#wj-cc",
+            "provider": "openai",
+            "model_name": "gpt-4o",
+            "provider_key_id": "pk-1",
+            "internal": true,
+        });
+        validate_model(&marked).expect("an internal document is a valid model");
+        validate_model_lenient(&marked).expect("and loads");
+        let model: crate::models::Model = serde_json::from_value(marked).expect("and deserializes");
+        assert!(model.internal);
+
+        for strict in [true, false] {
+            let schema = resource_root_schema("model", strict);
+            assert_eq!(
+                schema.pointer("/properties/internal/default"),
+                Some(&Value::Bool(false)),
+                "strict={strict}: the published default is what omitting means"
+            );
+            assert!(
+                !schema
+                    .get("required")
+                    .and_then(Value::as_array)
+                    .is_some_and(|r| r.contains(&Value::String("internal".into()))),
+                "strict={strict}: the field is never required — requiring it would drop \
+                 every already-projected row"
+            );
         }
     }
 

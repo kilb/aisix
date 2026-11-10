@@ -2451,6 +2451,45 @@ fn every_generated_document_loads_on_both_schemas() {
     assert_eq!(docs[1]["model_name"], "pub-gen-8c1");
 }
 
+/// The generated direct document is marked internal and the routing document
+/// is not, because the routing document is the entry a caller addresses.
+///
+/// This is what the gateway reads: `internal` keeps the direct document off
+/// `/v1/models` and out of reach by name, so a key granted by pattern cannot
+/// pin one serving account and bypass the public model's routing. A document
+/// missing the marker would be listed and callable, and nothing else in the
+/// generated shape would say so — an assertion here is the only check that
+/// the marker is written at all.
+#[test]
+fn a_generated_direct_document_is_internal_and_its_routing_document_is_not() {
+    let public = channels::PublicModelRow {
+        id: Uuid::new_v4(),
+        name: "pub-int-9a4".to_string(),
+        enabled: true,
+        created_by: None,
+        created_at: chrono::Utc::now(),
+        retired_at: None,
+        routing: json!({}),
+    };
+    let channel = channels::ChannelModelRow {
+        id: Uuid::new_v4(),
+        provider_key_id: Uuid::new_v4(),
+        public_model_id: public.id,
+        upstream_model: Some("gpt-4o".to_string()),
+        priority: 0,
+        weight: 1,
+        enabled: true,
+        direct_model_id: Uuid::new_v4(),
+    };
+    let direct = channels::direct_doc(&channel, &public, "acct-int-9a4", "openai");
+    assert_eq!(direct["internal"], json!(true), "{direct}");
+    let routing = channels::routing_doc(&public, &[channel]);
+    assert!(
+        routing.get("internal").is_none(),
+        "the routing document is the caller-facing entry: {routing}"
+    );
+}
+
 // ── a selection of upstream models, mapped in one step ──────────────────────
 
 /// `POST /admin/provider-keys/{key}/channel-models` as `who`, mapping

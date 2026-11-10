@@ -24,6 +24,22 @@ use crate::error::ProxyError;
 
 /// Resolve `requested` against the snapshot's Model table, honoring `provider/*`
 /// wildcard Models when no exact match exists. Returns `None` if nothing matches.
+///
+/// A model carrying [`aisix_core::Model::internal`] resolves to `None`,
+/// exactly as a name nothing serves does. That marker is set on the direct
+/// document a public model generates per serving account, which is a routing
+/// TARGET and nothing else: letting a caller name one would pin a single
+/// upstream account and skip the public model's routing entirely.
+///
+/// The refusal is placed here, at the exact lookup, rather than at each
+/// handler, and the search stops instead of falling through to the wildcard
+/// rows: an internal document's name would otherwise be servable through a
+/// glob that happens to cover it (their names are ordinary strings, and a
+/// grant or a configured `*` pattern can match one by construction). Every
+/// caller-facing dispatch resolves its `model` through this function, so
+/// this is the one chokepoint; a target is resolved by id (see
+/// [`crate::routing::resolve_attempt_models`] and `resolve_model_ref`), so
+/// routing, ensemble and semantic targets are unaffected.
 pub(crate) fn resolve_model(
     snapshot: &AisixSnapshot,
     requested: &str,
@@ -33,6 +49,13 @@ pub(crate) fn resolve_model(
     // terminal emitters that run after the handler is gone read it back off
     // the request's attribution cell (see `attribution`).
     if let Some(exact) = snapshot.models.get_by_name(requested) {
+        if exact.value.internal {
+            // Answered as an unknown name in every respect, including
+            // attribution: nothing downstream may learn an internal row
+            // exists, so neither the requested-model note nor the
+            // dispatchable-entry note is written.
+            return None;
+        }
         crate::attribution::note_requested_model(requested, &exact.id);
         note_dispatchable_entry(&exact);
         return Some(exact);
@@ -236,6 +259,18 @@ mod tests {
         .unwrap()
     }
 
+    /// The document a public model generates for one serving account.
+    fn internal_model(display_name: &str, model_name: Option<&str>) -> Model {
+        serde_json::from_value(serde_json::json!({
+            "display_name": display_name,
+            "provider": "openai",
+            "model_name": model_name,
+            "provider_key_id": "pk-1",
+            "internal": true,
+        }))
+        .unwrap()
+    }
+
     /// `row_serves_name` gates a name that did NOT arrive on a live request
     /// body — it decides whether the gateway will echo a caller-supplied
     /// string back as its own `model`. A row must accept every name it
@@ -358,6 +393,58 @@ mod tests {
     fn no_match_returns_none() {
         let snap = snapshot_with(vec![("m-star", direct_model("openai/*", Some("*")))]);
         assert!(resolve_model(&snap, "anthropic/claude").is_none());
+    }
+
+    /// A generated document is a routing target and nothing else: its name
+    /// resolves to nothing, exactly as a name no row serves does.
+    #[test]
+    fn an_internal_model_is_not_resolvable_by_name() {
+        let snap = snapshot_with(vec![
+            ("m-pub", direct_model("claude-fable-5", Some("fable"))),
+            (
+                "m-int",
+                internal_model("claude-fable-5#wj-cc", Some("fable")),
+            ),
+        ]);
+        assert!(resolve_model(&snap, "claude-fable-5#wj-cc").is_none());
+        // The public model it was generated for is untouched.
+        assert_eq!(resolve_model(&snap, "claude-fable-5").unwrap().id, "m-pub");
+    }
+
+    /// The refusal stops the search rather than falling through: without
+    /// that, a configured glob covering the generated name would serve it,
+    /// which is the same bypass reached by a different route.
+    #[test]
+    fn a_wildcard_row_cannot_serve_an_internal_name() {
+        let snap = snapshot_with(vec![
+            ("m-star", direct_model("claude-*", Some("*"))),
+            (
+                "m-int",
+                internal_model("claude-fable-5#wj-cc", Some("fable")),
+            ),
+        ]);
+        assert!(resolve_model(&snap, "claude-fable-5#wj-cc").is_none());
+        // A name the glob covers but no internal row carries still resolves.
+        assert_eq!(resolve_model(&snap, "claude-other").unwrap().id, "m-star");
+    }
+
+    /// Targets are resolved by id, never by this function, so an internal
+    /// document stays reachable where it is meant to be: a routing
+    /// document's `model_id` resolves through `resolve_model_ref` to the
+    /// entry's display name, and the gateway looks that name up directly.
+    #[test]
+    fn a_routing_target_that_is_internal_still_resolves_by_id() {
+        let snap = snapshot_with(vec![(
+            "m-int",
+            internal_model("claude-fable-5#wj-cc", Some("fable")),
+        )]);
+        let target: aisix_core::models::RoutingTarget = serde_json::from_value(serde_json::json!({
+            "model_id": "m-int",
+        }))
+        .unwrap();
+        assert_eq!(target.model_ref(&snap), "claude-fable-5#wj-cc");
+        // The table lookup the dispatch loop performs finds it.
+        assert!(snap.models.get_by_name(&target.model_ref(&snap)).is_some());
     }
 
     /// An ensemble's members are not filtered by provider group, so to a key
@@ -528,5 +615,128 @@ mod grouped_ensemble_tests {
         let unknown = listed("nobody").await;
         assert_eq!(unknown.0, StatusCode::NOT_FOUND, "/v1/batches: {unknown:?}");
         assert_eq!(listed("council").await, unknown, "/v1/batches");
+    }
+}
+
+/// A request naming the document a public model generates for one serving
+/// account is answered exactly as one naming a model that does not exist —
+/// same status, same envelope, on every endpoint that addresses a model.
+/// Answering differently (a 403, a distinct code) would confirm the name.
+#[cfg(test)]
+mod internal_model_tests {
+    use std::sync::Arc;
+
+    use aisix_core::models::AisixSnapshot;
+    use aisix_core::resource::ResourceEntry;
+    use aisix_core::snapshot::SnapshotHandle;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt as _;
+
+    /// The generated name, and a name no row serves. Neither may be
+    /// distinguishable from the other.
+    const HIDDEN: &str = "claude-fable-5#wj-cc";
+    const UNKNOWN: &str = "no-such-model";
+
+    fn app() -> axum::Router {
+        let snap = AisixSnapshot::new();
+        let pk: aisix_core::ProviderKey = serde_json::from_value(serde_json::json!({
+            "display_name": "acct", "secret": "sk-up", "api_base": "http://127.0.0.1:9",
+            "provider": "openai", "adapter": "openai"}))
+        .unwrap();
+        snap.provider_keys.insert(ResourceEntry::new("pk-1", pk, 1));
+        // The public model the hidden one belongs to, and a normal direct
+        // model beside it, so the snapshot is a realistic catalogue.
+        for (id, name, internal) in [
+            ("m-pub", "claude-fable-5", false),
+            ("m-direct", "gpt-4o", false),
+            ("m-int-1", HIDDEN, true),
+            ("m-int-2", "claude-fable-5#hk-cc", true),
+        ] {
+            let model: aisix_core::Model = serde_json::from_value(serde_json::json!({
+                "display_name": name, "provider": "openai", "model_name": "gpt-4o",
+                "provider_key_id": "pk-1", "internal": internal}))
+            .unwrap();
+            snap.models.insert(ResourceEntry::new(id, model, 1));
+        }
+        let key: aisix_core::ApiKey = serde_json::from_value(serde_json::json!({
+            "key_hash": "8b6712790a2089c67aa97a2d80022df18cc65c7814350e33baebe79aab508891",
+            "allowed_models": ["*"]}))
+        .unwrap();
+        snap.apikeys.insert(ResourceEntry::new("k-1", key, 1));
+        let config: aisix_core::ProxyConfig =
+            serde_json::from_value(serde_json::json!({"addr": "127.0.0.1:0"})).unwrap();
+        crate::build_router(
+            crate::ProxyState::new(
+                SnapshotHandle::new(snap),
+                Arc::new(aisix_gateway::Hub::new()),
+                &config,
+            )
+            .without_cache(),
+        )
+    }
+
+    /// `(status, body)` for one endpoint and model name, the name replaced
+    /// so two answers can be compared: each error echoes the string the
+    /// caller sent, which is the caller's own input and the only part of the
+    /// answer that is allowed to differ.
+    async fn answer(app: &axum::Router, uri: &'static str, model: &str) -> (StatusCode, String) {
+        let body = match uri {
+            "/v1/chat/completions" => serde_json::json!({"model": model,
+                "messages": [{"role": "user", "content": "hi"}]}),
+            "/v1/messages" | "/v1/messages/count_tokens" => serde_json::json!({
+                "model": model, "max_tokens": 8,
+                "messages": [{"role": "user", "content": "hi"}]}),
+            "/v1/embeddings" => serde_json::json!({"model": model, "input": "hi"}),
+            _ => serde_json::json!({"model": model, "input": "hi"}),
+        };
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("authorization", "Bearer sk-caller")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 65536).await.unwrap();
+        (
+            status,
+            String::from_utf8_lossy(&bytes).replace(model, "<model>"),
+        )
+    }
+
+    #[tokio::test]
+    async fn every_model_endpoint_answers_an_internal_name_as_an_unknown_one() {
+        let app = app();
+        for uri in [
+            "/v1/chat/completions",
+            "/v1/messages",
+            "/v1/messages/count_tokens",
+            "/v1/responses",
+            "/v1/embeddings",
+        ] {
+            let unknown = answer(&app, uri, UNKNOWN).await;
+            assert_eq!(unknown.0, StatusCode::NOT_FOUND, "{uri}: {unknown:?}");
+            let hidden = answer(&app, uri, HIDDEN).await;
+            assert_eq!(hidden, unknown, "{uri}");
+        }
+    }
+
+    /// The public models around the hidden one are not affected: a name
+    /// that resolves really still resolves.
+    #[tokio::test]
+    async fn a_public_model_beside_a_hidden_one_still_resolves() {
+        let snap = AisixSnapshot::new();
+        let model: aisix_core::Model = serde_json::from_value(serde_json::json!({
+            "display_name": "claude-fable-5", "provider": "openai", "model_name": "gpt-4o",
+            "provider_key_id": "pk-1"}))
+        .unwrap();
+        snap.models.insert(ResourceEntry::new("m-pub", model, 1));
+        assert!(super::resolve_model(&snap, "claude-fable-5").is_some());
     }
 }
