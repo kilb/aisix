@@ -9,6 +9,7 @@ import { PricingStatus } from "./pricing/PricingStatus";
 import { Baselines } from "./pricing/Baselines";
 import { PricingImport } from "./pricing/PricingImport";
 import { PublicModels } from "./pricing/PublicModels";
+import { PriceLibrary } from "./pricing/PriceLibrary";
 
 /** The sections of 「价格」, in order. Each task appends its own entry. */
 export const SECTIONS: Section[] = [{ id: "groups", label: "分组", Component: Groups, minRole: "viewer" },
@@ -20,6 +21,7 @@ export const SECTIONS: Section[] = [{ id: "groups", label: "分组", Component: 
   { id: "baselines", label: "基准价", Component: Baselines, minRole: "viewer" },
   { id: "imports", label: "导入审核", Component: PricingImport, minRole: "viewer" },
   { id: "public-models", label: "公共模型", Component: PublicModels, minRole: "viewer" },
+  { id: "library", label: "价格库", Component: PriceLibrary, minRole: "viewer" },
 ];
 
 export function Pricing(props: TabProps) {

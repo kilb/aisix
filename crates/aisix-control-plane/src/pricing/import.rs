@@ -147,6 +147,11 @@ pub struct ParsedProposal {
     pub pricing_url: Option<String>,
     /// The date the dataset says it checked the model's prices, if it says.
     pub prices_checked: Option<NaiveDate>,
+    /// The model's display name in the dataset, if it gives one.
+    pub name: Option<String>,
+    /// The other names the dataset's own `match` says the model is called by
+    /// exactly ([`aliases`]), never the id itself.
+    pub aliases: Vec<String>,
 }
 
 /// The most batches `GET /admin/pricing/imports` lists.
@@ -187,6 +192,7 @@ pub fn parse(data: &RawValue, now: DateTime<Utc>) -> Result<Vec<ParsedProposal>,
             let variants = model.price_variants.as_deref().unwrap_or_default();
             let comments = model.price_comments.as_deref();
             let entry = (provider.id.as_str(), model.id.as_str());
+            let aliases = aliases(&model.id, model.matches.as_ref());
             for (effective_from, card, flags) in
                 model_proposals(&entries, variants, today, entry, comments)
             {
@@ -204,6 +210,8 @@ pub fn parse(data: &RawValue, now: DateTime<Utc>) -> Result<Vec<ParsedProposal>,
                     flags,
                     pricing_url: pricing_url.clone(),
                     prices_checked: model.prices_checked,
+                    name: model.name.clone(),
+                    aliases: aliases.clone(),
                 });
             }
         }
@@ -514,7 +522,9 @@ async fn suggest_models(
 ///
 /// One transaction supersedes every open batch and every pending proposal of
 /// an older one, writes this batch and its proposals with the model each
-/// suggests, and records `pricing.import.upload`. Nothing here is a price.
+/// suggests, stores the dataset as the price library in place of the one in
+/// use ([`super::library::replace`]), and records `pricing.import.upload`,
+/// naming the library stored. Nothing here is a price.
 pub async fn upload(
     auth: OperatorAuth,
     State(state): State<AppState>,
@@ -537,8 +547,9 @@ pub async fn upload(
         .fetch_one(state.db.pool())
         .await
         .map_err(DbError::from)?;
-    // Up to `MAX_IMPORT_BYTES` of JSON: parsed off the request workers.
-    let parsed = tokio::task::spawn_blocking(move || parse(&data, now))
+    // Up to `MAX_IMPORT_BYTES` of JSON: parsed off the request workers. The
+    // text comes back with the proposals, as the library stores it.
+    let (parsed, data) = tokio::task::spawn_blocking(move || parse(&data, now).map(|p| (p, data)))
         .await
         .map_err(ApiError::internal)??;
     let batch = state
@@ -611,6 +622,20 @@ pub async fn upload(
                         .await
                         .map_err(DbError::from)?;
                 }
+                // The upload is the library's offline path: the same text
+                // becomes the copy a sync reads.
+                let (library, replaced) = super::library::replace(
+                    &mut *conn,
+                    &super::library::NewLibrary {
+                        origin: "upload",
+                        source_url: None,
+                        source_ref: Some(&dataset_ref),
+                        data: data.get(),
+                        entries: super::library::entry_count(&parsed),
+                    },
+                    &auth,
+                )
+                .await?;
                 audit::record(
                     &mut *conn,
                     AuditEntry {
@@ -625,6 +650,9 @@ pub async fn upload(
                             "proposals": batch.proposals,
                             "flagged": batch.flagged,
                             "superseded_proposals": superseded,
+                            // The same text became the price library.
+                            "library_id": library.id,
+                            "library_replaced": replaced,
                         }),
                     },
                 )
@@ -731,8 +759,8 @@ const MAX_REASON_CHARS: usize = 500;
 
 /// What a confirmation attests, in the operator's own words: the checkbox's
 /// text. It is the `422 /attested` answer and the audit row's record of what
-/// was affirmed.
-const ATTESTATION: &str = "已对照官方价格页核对";
+/// was affirmed. A library sync attests the same sentence.
+pub(crate) const ATTESTATION: &str = "已对照官方价格页核对";
 
 /// A proposal of batch `batch_id`, read `FOR UPDATE` with its batch's
 /// `dataset_ref`: everything a decision needs of the row itself.
@@ -936,8 +964,10 @@ pub async fn confirm(
                         dataset_ref: proposal.dataset_ref.clone(),
                         pricing_url: proposal.pricing_url.clone(),
                         prices_checked: proposal.prices_checked,
-                        import_id: id,
-                        proposal_id: pid,
+                        import_id: Some(id),
+                        proposal_id: Some(pid),
+                        library_id: None,
+                        library_entry: None,
                         attested_by: auth.id,
                         attested_at: now,
                     },
@@ -1126,6 +1156,12 @@ struct Provider<'a> {
 #[derive(Deserialize)]
 struct DatasetModel<'a> {
     id: String,
+    #[serde(default)]
+    name: Option<String>,
+    /// The names the dataset's reference package matches the model by: a
+    /// clause tree of `equals`, `starts_with`, `or` and the like.
+    #[serde(default, rename = "match")]
+    matches: Option<Value>,
     /// A price map, or a list of conditional ones ([`conditionals`]).
     #[serde(borrow)]
     prices: &'a RawValue,
@@ -1193,6 +1229,34 @@ impl Condition {
             Condition::TimeOfDay | Condition::Other => false,
         }
     }
+}
+
+/// The exact names a model's `match` clause names besides its id: each
+/// `equals` at the top of the clause or under an `or`, by its text, in the
+/// clause's order and once each. A pattern (`starts_with`, `contains`,
+/// `regex`) names no one model, and an `equals` under an `and` holds only
+/// with the rest of its clause, so neither is an alias.
+fn aliases(id: &str, clause: Option<&Value>) -> Vec<String> {
+    fn walk(clause: &Value, out: &mut Vec<String>) {
+        let Value::Object(fields) = clause else {
+            return;
+        };
+        if let Some(Value::String(name)) = fields.get("equals") {
+            out.push(name.clone());
+        }
+        if let Some(Value::Array(branches)) = fields.get("or") {
+            for branch in branches {
+                walk(branch, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    if let Some(clause) = clause {
+        walk(clause, &mut out);
+    }
+    let mut seen = BTreeSet::new();
+    out.retain(|name| name != id && seen.insert(name.clone()));
+    out
 }
 
 /// A model's prices as a list, a single map being a list of one entry with

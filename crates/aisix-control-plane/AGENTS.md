@@ -148,8 +148,9 @@ way.
   `409 managed_resource` and a regeneration cannot silently overwrite one.
   `only_the_resources_module_writes_gw_resources` (`tests/boot.rs`) enforces
   the write half.
-- **The upstream-model route is the control plane's only outbound call: it
-  is operator-only, bounded, scrubbed and writes nothing.**
+- **The control plane makes two outbound calls, both operator-only,
+  bounded and scrubbed: the upstream-model route, which writes nothing, and
+  the price library's fetch, which writes only the library.**
   `GET /admin/provider-keys/{id}/upstream-models` (`src/upstream_models.rs`)
   reaches the account's own configured host on that account's own credential,
   through the SSRF guard, with a 5 s timeout and a 1 MiB body cap behind a
@@ -160,6 +161,17 @@ way.
   value it offers is stored only when the operator saves it. Its errors go
   through the shared scrubber, so neither the credential nor the operator's
   infrastructure appears in an answer or a log line.
+  `POST /admin/pricing/library/fetch` (`src/pricing/library.rs`) reads one
+  address, `LIBRARY_URL`, a constant of the build: no request field,
+  configuration or environment variable names another, and only a caller of
+  the library can (`start_with_sources`, which the test harness points at a
+  stand-in, or at port 0 so that no test reaches the internet). That fixed
+  host is why it takes no SSRF check. It sends no credential, takes 10 s for
+  the whole call and at most 10 MiB of body, follows a redirect only on the
+  address's own origin (`upstream_http::fixed_origin_client`, built from the
+  same `Client::builder`), and scrubs its errors the same way. It writes the
+  library (`pricing_library`, one copy kept) and its audit row and nothing
+  else: a baseline comes from it only through a sync an operator attests.
 - **Advisory lock keys must be unique.** They are the `*_LOCK_KEY` constants,
   all `0x6169_7369_7863_70xx`: operators `7030`, projector `7031`, resources
   `7032`, boot `7033`, signup `7073`, and the test harness's template lock

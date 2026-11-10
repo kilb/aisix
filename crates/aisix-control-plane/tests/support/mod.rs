@@ -217,6 +217,26 @@ fn test_config(database_url: &str) -> CpConfig {
     }
 }
 
+/// Where every test control plane fetches the price library from, unless a
+/// test points it at a stand-in ([`TestCp::start_with_library`]): port 0,
+/// where nothing listens, so a fetch fails at once and no test ever reaches
+/// the dataset's published address.
+pub const NO_LIBRARY: &str = "http://127.0.0.1:0/genai-prices/data.json";
+
+/// Boots a control plane on `cfg`, pricing from `catalogue` when given,
+/// under the outbound `policy`, fetching the price library from `library`.
+async fn boot_with(
+    cfg: CpConfig,
+    catalogue: Option<Arc<aisix_pricing::Catalogue>>,
+    policy: &aisix_core::config::SsrfProtectionConfig,
+    library: &str,
+) -> Running {
+    let library = reqwest::Url::parse(library).expect("a library address");
+    aisix_control_plane::start_with_sources(cfg, std::future::pending(), catalogue, policy, library)
+        .await
+        .expect("the control plane boots")
+}
+
 /// A running control plane on its own database.
 pub struct TestCp {
     // Declared before `database`: fields drop in order, and the server stops
@@ -279,10 +299,17 @@ impl TestCp {
     pub async fn start_with_catalogue(catalogue: Arc<aisix_pricing::Catalogue>) -> Option<TestCp> {
         let database = new_database().await?;
         let cfg = test_config(&database.url);
-        let running =
-            aisix_control_plane::start_with_catalogue(cfg, std::future::pending(), Some(catalogue))
-                .await
-                .expect("the control plane boots");
+        let running = boot_with(cfg, Some(catalogue), &Default::default(), NO_LIBRARY).await;
+        Some(TestCp { running, database })
+    }
+
+    /// [`TestCp::start`], fetching the price library from `library`: a
+    /// stand-in the test serves. Production fetches from one fixed address
+    /// that no configuration changes; only this harness passes another.
+    pub async fn start_with_library(library: &str) -> Option<TestCp> {
+        let database = new_database().await?;
+        let cfg = test_config(&database.url);
+        let running = boot_with(cfg, None, &Default::default(), library).await;
         Some(TestCp { running, database })
     }
 
@@ -298,17 +325,12 @@ impl TestCp {
             allowed_hosts: vec!["127.0.0.1".to_string()],
             ..Default::default()
         };
-        let running =
-            aisix_control_plane::start_with_policy(cfg, std::future::pending(), None, &policy)
-                .await
-                .expect("the control plane boots");
+        let running = boot_with(cfg, None, &policy, NO_LIBRARY).await;
         Some(TestCp { running, database })
     }
 
     async fn boot(database: Arc<TestDatabase>, cfg: CpConfig) -> TestCp {
-        let running = aisix_control_plane::start(cfg, std::future::pending())
-            .await
-            .expect("the control plane boots");
+        let running = boot_with(cfg, None, &Default::default(), NO_LIBRARY).await;
         TestCp { running, database }
     }
 
@@ -332,10 +354,7 @@ impl TestCp {
     /// catalogue would.
     pub async fn restart_with_catalogue(&self, catalogue: Arc<aisix_pricing::Catalogue>) -> TestCp {
         let cfg = test_config(&self.database.url);
-        let running =
-            aisix_control_plane::start_with_catalogue(cfg, std::future::pending(), Some(catalogue))
-                .await
-                .expect("the control plane boots");
+        let running = boot_with(cfg, Some(catalogue), &Default::default(), NO_LIBRARY).await;
         TestCp {
             running,
             database: self.database.clone(),

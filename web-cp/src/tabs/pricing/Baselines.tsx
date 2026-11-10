@@ -29,6 +29,7 @@ import { EmptyState } from "../../ui/EmptyState";
 import { Field, useRefusalFocus } from "../../ui/Field";
 import { SidePanel } from "../../ui/SidePanel";
 import { useToast } from "../../ui/Toast";
+import { LibrarySyncOne } from "./LibrarySync";
 import "./PriceForms.css";
 import "./Baselines.css";
 
@@ -143,6 +144,7 @@ export function BaselineSourceBadge({ revision }: { revision: BaselineRevision }
           <span className="tag">第三方数据</span>
           <span className="cell-note">
             {s.dataset} · <span className="tabular">{s.dataset_ref}</span>
+            {s.library_id && <> · 价格库同步</>}
           </span>
           <span className="cell-note">
             <span className="tabular">核对日期 {s.prices_checked ?? "未提供"}</span>
@@ -555,6 +557,7 @@ function BaselinePanel({
           </div>
         )}
       </section>
+      <LibrarySyncOne modelId={row.model_id} canEdit={canEdit} current={row.current} onSynced={onSaved} />
       <section className="baseline-now" aria-label="各分组售价">
         <h3>各分组售价</h3>
         <p className="hint">现行基准价乘以每个分组现行的换算率，按每百万 token 计；这是租户折扣之前的价格。</p>

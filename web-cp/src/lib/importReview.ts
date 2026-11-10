@@ -59,11 +59,21 @@ const DIMENSION_TEXT: Record<string, string> = {
 
 const COMPARED = new Set(COMPARED_DIMENSIONS.map(([d]) => d));
 
+/** A rate's name in Chinese; one this build does not know is shown as it came. */
+export function dimensionText(dimension: string): string {
+  return (Object.hasOwn(DIMENSION_TEXT, dimension) ? DIMENSION_TEXT[dimension] : undefined) ?? dimension;
+}
+
 /** A tier name as the engine spells it (`ServiceTier`); `default` is the one compared. */
 const TIER_TEXT: Record<string, string> = {
   default: "标准",
   batch: "批量",
 };
+
+/** A tier's name in Chinese; one this build does not know is shown as it came. */
+export function tierText(tier: string): string {
+  return (Object.hasOwn(TIER_TEXT, tier) ? TIER_TEXT[tier] : undefined) ?? tier;
+}
 
 /**
  * The parts of a card the price comparison cannot show, in Chinese: any tier

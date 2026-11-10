@@ -226,6 +226,48 @@ impl ApiError {
         }])
     }
 
+    /// The price library could not be fetched from its address: a failed
+    /// connection, an answer that is not a `2xx`, a body over the cap, or
+    /// one that is not the dataset. `detail` says which, and is scrubbed by
+    /// its caller.
+    pub fn library_unreachable(detail: impl Into<String>) -> ApiError {
+        ApiError {
+            details: vec![Detail {
+                path: "/source".to_string(),
+                message: detail.into(),
+            }],
+            ..Self::new(
+                StatusCode::BAD_GATEWAY,
+                "library_fetch_failed",
+                "无法获取价格库数据",
+            )
+        }
+    }
+
+    /// The price library's address did not answer in full within the fetch's
+    /// bound.
+    pub fn library_timeout() -> ApiError {
+        Self::new(
+            StatusCode::GATEWAY_TIMEOUT,
+            "library_fetch_timeout",
+            "获取价格库数据超时",
+        )
+    }
+
+    /// A sync whose preview no longer holds: the library was replaced, or a
+    /// model's match, state or card moved since it was shown. `details` names
+    /// each item that moved.
+    pub fn library_stale(details: Vec<Detail>) -> ApiError {
+        ApiError {
+            details,
+            ..Self::new(
+                StatusCode::CONFLICT,
+                "library_stale",
+                "价格库或模型已变化，请刷新预览后重试",
+            )
+        }
+    }
+
     /// A proposal of an import that has already been decided, or superseded
     /// by a newer upload: the review page is showing a stale row.
     pub fn proposal_state() -> ApiError {
@@ -407,6 +449,9 @@ pub enum BootError {
     /// parse, so the upstream-model route could judge nothing.
     #[error("outbound.ssrf_protection: {0}")]
     OutboundPolicy(String),
+    /// The price library's address or its client could not be set up.
+    #[error("the price library's source: {0}")]
+    LibrarySource(String),
 }
 
 #[cfg(test)]
