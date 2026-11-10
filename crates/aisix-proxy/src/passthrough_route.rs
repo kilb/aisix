@@ -648,10 +648,10 @@ async fn dispatch(
     aisix_gateway::note_url_userinfo(&url);
 
     // End-user identity injected by the upstream device, captured before
-    // the strip pass and recorded on the usage event.
+    // the strip pass and recorded on the usage event. A stored route whose
+    // `identity_header` names a credential slot records none.
     let client_identity = route
-        .identity_header
-        .as_deref()
+        .recorded_identity_header()
         .and_then(|h| incoming_headers.get(h))
         .and_then(|v| v.to_str().ok())
         .map(|v| {
@@ -11773,6 +11773,75 @@ data: {"type":"error","error":{"type":"server_error","code":null,"message":"nest
         let received = &upstream.received_requests().await.unwrap()[0];
         assert_eq!(
             received.headers.get("x-end-user").unwrap(),
+            "alice@example.com"
+        );
+    }
+
+    /// A stored route whose `identity_header` names a credential slot (the
+    /// write path refuses one, an older row may still carry it) keeps serving
+    /// and records no identity, never the credential; an ordinary identity
+    /// header is still recorded.
+    #[tokio::test]
+    async fn an_identity_header_naming_a_credential_records_no_identity() {
+        use aisix_obs::UsageSink;
+
+        async fn recorded_identity(
+            overrides: serde_json::Value,
+            headers: &[(&str, &str)],
+        ) -> String {
+            let (_upstream, snap) = slot_route_fixture(overrides).await;
+            let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+            let app = crate::build_router(
+                crate::ProxyState::new(SnapshotHandle::new(snap), Arc::new(Hub::new()), &cfg())
+                    .without_cache()
+                    .with_usage_sink(UsageSink::new(tx)),
+            );
+            let resp = app.oneshot(slot_request(headers)).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+            let ev = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+                .await
+                .expect("a usage event")
+                .expect("usage_sink sender dropped");
+            ev.client_identity
+        }
+
+        // The route's own `header_key` slot.
+        assert_eq!(
+            recorded_identity(
+                serde_json::json!({
+                    "auth_mode": "header_key",
+                    "auth_header_name": "x-gw-key",
+                    "identity_header": "x-gw-key"
+                }),
+                &[("x-gw-key", "sk-caller")],
+            )
+            .await,
+            ""
+        );
+        // The gateway's own credential header under `gateway_key`.
+        assert_eq!(
+            recorded_identity(
+                serde_json::json!({ "identity_header": "x-aisix-api-key" }),
+                &[("x-aisix-api-key", "sk-caller")],
+            )
+            .await,
+            ""
+        );
+        // Control: an identity header beside the same custom slot.
+        assert_eq!(
+            recorded_identity(
+                serde_json::json!({
+                    "auth_mode": "header_key",
+                    "auth_header_name": "x-gw-key",
+                    "identity_header": "x-end-user"
+                }),
+                &[
+                    ("x-gw-key", "sk-caller"),
+                    ("x-end-user", "alice@example.com")
+                ],
+            )
+            .await,
             "alice@example.com"
         );
     }
