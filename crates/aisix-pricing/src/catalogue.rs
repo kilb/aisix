@@ -851,6 +851,22 @@ mod tests {
         assert_eq!(tier("fast").as_str(), "fast");
     }
 
+    /// The catalogue's models the fast-mode page lists as available on the
+    /// Claude API (<https://platform.claude.com/docs/en/build-with-claude/fast-mode>,
+    /// "Availability"). Without the tier, a served `fast` row of the model is
+    /// left unpriced (`missing_tier_price`) rather than billed.
+    #[test]
+    fn every_anthropic_model_with_published_fast_mode_carries_a_fast_tier() {
+        let c = builtin();
+        for model in ["claude-fable-5-2", "claude-opus-5-5"] {
+            let e = c.get("anthropic", model, read_day()).unwrap();
+            assert!(
+                e.card.0.contains_key(&tier("fast")),
+                "{model} has no fast tier"
+            );
+        }
+    }
+
     // ---- a pinned spot table: changing a price means editing two places ----
 
     #[test]
@@ -891,6 +907,24 @@ mod tests {
         assert_eq!(
             rates("anthropic", "claude-opus-5-5", "fast", None).input,
             r("8").unwrap()
+        );
+        // Anthropic: Fable 5.2 fast mode, $16 / $80 on the page, and a cache
+        // read at its 0.025x of that input.
+        let fable_fast = rates("anthropic", "claude-fable-5-2", "fast", None);
+        assert_eq!(fable_fast.input, r("16").unwrap());
+        assert_eq!(fable_fast.output, r("80").unwrap());
+        assert_eq!(fable_fast.cache_read, r("0.4"));
+        assert_eq!(fable_fast.cache_write, r("20"));
+        assert_eq!(fable_fast.cache_write_1h, r("32"));
+        assert_eq!(fable_fast.web_search, r("10000"));
+        // ... and its standard and batch tiers, which fast mode leaves alone.
+        assert_eq!(
+            rates("anthropic", "claude-fable-5-2", "default", None).input,
+            r("8").unwrap()
+        );
+        assert_eq!(
+            rates("anthropic", "claude-fable-5-2", "batch", None).output,
+            r("20").unwrap()
         );
         // Anthropic: the over-100,000-token band.
         assert_eq!(
