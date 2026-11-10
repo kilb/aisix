@@ -52,6 +52,10 @@ test.beforeAll(async () => {
   const pub = await stack.admin.post("/admin/public-models", { name: "pub-t6-e2e" });
   await stack.admin.put(`/admin/provider-keys/${shared.id}/channel-models/${pub.id}`, { priority: 1, weight: 1 });
   models.pub = pub;
+  // A second one, so a key narrowed to the first has something it is denied.
+  const pub2 = await stack.admin.post("/admin/public-models", { name: "pub2-t6-e2e" });
+  await stack.admin.put(`/admin/provider-keys/${shared.id}/channel-models/${pub2.id}`, { priority: 1, weight: 1 });
+  models.pub2 = pub2;
 });
 
 test.afterAll(async () => {
@@ -469,6 +473,78 @@ test("全部范围租户的密钥不把已选模型标成租户未授权", async
   const row = keyRow(page, "allscope-key-t6");
   await expect(row).toContainText("pub-t6-e2e");
   await expect(row).not.toContainText("租户未授权");
+});
+
+/**
+ * The key form offers what the tenant reaches now. An `all`-scope tenant
+ * reaches every public model while its stored list is empty, and the form
+ * used to read the stored list: it offered nothing and said the tenant had no
+ * grants, so a key narrowed to one public model could not be made here.
+ */
+test("全部范围租户新建密钥：可从全部公共模型里选，只选一个后网关只放行它", async ({ page }) => {
+  const t = await signUpActive("T6 AllPick Co 7e3", "owner@allpick-t6.test");
+  const tenant = await stack.admin.get(`/admin/tenants/${t.id}`);
+  expect(tenant.model_scope).toBe("all");
+  expect(tenant.allowed_model_ids).toEqual([]);
+
+  await openKeys(page, t.org);
+  await page.getByRole("button", { name: "新建密钥" }).click();
+  const form = page.getByRole("group", { name: "新建密钥" });
+  const choices = form.getByRole("group", { name: "模型", exact: true });
+  // Both public models are offered; a hand-made model is outside the scope.
+  await expect(choices.getByRole("checkbox", { name: "pub-t6-e2e" })).toBeVisible();
+  await expect(choices.getByRole("checkbox", { name: "pub2-t6-e2e" })).toBeVisible();
+  await expect(choices.getByRole("checkbox", { name: "chat-t6-e2e" })).toHaveCount(0);
+  await expect(choices).not.toContainText("该租户还没有授权模型");
+
+  await form.getByLabel("名称").fill("allpick-key-t6");
+  await choices.getByRole("checkbox", { name: "pub-t6-e2e" }).check();
+  await form.getByRole("button", { name: "创建" }).click();
+  const created = page.getByRole("region", { name: "密钥已创建" });
+  const plaintext = ((await created.getByLabel("密钥明文").textContent()) ?? "").trim();
+  expect(plaintext).toMatch(/^sk-rt-[A-Za-z0-9]{16,}$/);
+
+  // The gateway serves the one model chosen, and only it.
+  await expect.poll(() => chatStatus(plaintext, "pub-t6-e2e"), { timeout: KEY_READY_MS }).toBe(200);
+  expect(await chatStatus(plaintext, "pub2-t6-e2e")).not.toBe(200);
+  const listed = (await stack.admin.get(`/admin/tenants/${t.id}/keys`)).items as Json[];
+  expect(listed.find((k) => k.label === "allpick-key-t6").model_ids).toEqual([models.pub.id]);
+
+  await created.getByRole("button", { name: "关闭" }).click();
+  const row = keyRow(page, "allpick-key-t6");
+  await expect(row).toContainText("pub-t6-e2e");
+  await expect(row).not.toContainText("租户未授权");
+});
+
+/**
+ * Back on `all` after a list, the stored list is kept but grants nothing:
+ * a key narrowed to a hand-made model from that list reaches nothing at the
+ * gateway. The Keys tab judges by what the tenant reaches, so the row says
+ * so, and a new key is offered the public models rather than the old list.
+ */
+test("指定模型改回全部后：旧列表里的手工模型在密钥上标为租户未授权，新建密钥只列公共模型", async ({ page }) => {
+  const t = await signUpActive("T6 Widened Co 5b1", "owner@widened-t6.test", [models.chat]);
+  const minted = await stack.admin.post(`/admin/tenants/${t.id}/keys`, {
+    label: "widened-key-t6",
+    model_ids: [models.chat.id],
+  });
+  await expect.poll(() => chatStatus(minted.plaintext), { timeout: KEY_READY_MS }).toBe(200);
+
+  const current = await stack.admin.get(`/admin/tenants/${t.id}`);
+  await stack.admin.patch(`/admin/tenants/${t.id}`, { model_scope: "all" }, current.version);
+  const widened = await stack.admin.get(`/admin/tenants/${t.id}`);
+  expect(widened.model_scope).toBe("all");
+  expect(widened.allowed_model_ids).toEqual([models.chat.id]);
+  // The key's one model is outside the scope now: the gateway refuses it.
+  await expect.poll(() => chatStatus(minted.plaintext), { timeout: ROLLOUT_BOUND_MS }).not.toBe(200);
+
+  await openKeys(page, t.org);
+  await expect(keyRow(page, "widened-key-t6")).toContainText("chat-t6-e2e（租户未授权）");
+  await page.getByRole("button", { name: "新建密钥" }).click();
+  const choices = page.getByRole("group", { name: "新建密钥" }).getByRole("group", { name: "模型", exact: true });
+  await expect(choices.getByRole("checkbox", { name: "pub-t6-e2e" })).toBeVisible();
+  await expect(choices.getByRole("checkbox", { name: "pub2-t6-e2e" })).toBeVisible();
+  await expect(choices.getByRole("checkbox", { name: "chat-t6-e2e" })).toHaveCount(0);
 });
 
 test("分组只选一个：分组没有上游账号时先警告并要求确认，确认后才创建", async ({ page }) => {

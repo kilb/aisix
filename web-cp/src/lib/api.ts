@@ -203,6 +203,12 @@ export interface Tenant {
   model_scope: "all" | "selected";
   /** The stored selection; it grants nothing on its own while the scope is `all`. */
   allowed_model_ids: string[];
+  /**
+   * What the scope gives the tenant now, as the control plane resolves it:
+   * every live public model under `all`, `allowed_model_ids` under
+   * `selected`. A key's selection is checked against this list.
+   */
+  effective_model_ids: string[];
   allowed_provider_groups: string[];
   limits: TenantLimits;
   member_count: number;
