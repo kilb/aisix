@@ -120,6 +120,73 @@ test("后付租户用尽信用额度后显示已停止，提高后恢复", async
   await expect(cell(accountRow(page, world), 4)).toHaveText("¥0.945");
 });
 
+test("预付租户设置信用额度后可以透支调用，用尽后停止，改为后付后状态随新的计费方式更新", async ({ page }) => {
+  // Signup, approval and a key are the world's own seed through the real
+  // `/api`; the organisation starts prepaid with no balance and no credit,
+  // so the credit limit is what opens it.
+  const world = await seedTenant(stack, { mode: "prepaid", creditCny: "0" });
+  await login(page);
+  await accountRow(page, world).getByRole("button", { name: world.tenantName }).click();
+  const panel = page.getByRole("dialog");
+
+  // A prepaid tenant with no credit is stopped, and the panel says so.
+  await expect(cell(accountRow(page, world), 5)).toHaveText("已停止");
+  await expect(panel.getByText("余额与信用额度都用尽，调用会被拒绝")).toBeVisible();
+  // The input is there for a prepaid tenant too: the limit is its overdraft.
+  await panel.getByLabel("信用额度（元）").fill("0.05");
+  await panel.getByRole("button", { name: "保存" }).click();
+  await expect(cell(accountRow(page, world), 3)).toHaveText("¥0.05");
+  await expect(cell(accountRow(page, world), 5)).toHaveText("正常");
+  // The gateway admits the prepaid tenant on the credit alone.
+  await expect.poll(() => chat(stack, world.key.plaintext, world.model.name), { timeout: 15_000 }).toBe(200);
+
+  // Four more calls cost 0.011 each, so the five together take the balance to
+  // -0.055, past the 0.05 limit; the fifth is admitted because four cost 0.044.
+  for (let i = 0; i < 4; i++) expect(await chat(stack, world.key.plaintext, world.model.name)).toBe(200);
+  // The limit is spent: the gateway refuses the next call, prepaid or not.
+  // Calls on their way while the mark is still being written may be
+  // admitted, so the balance ends at or past the limit, never at a figure
+  // that would leave money to spend.
+  await expect.poll(() => chat(stack, world.key.plaintext, world.model.name), { timeout: 15_000 }).toBe(429);
+
+  await refreshUntil(page, async () => {
+    await expect(cell(accountRow(page, world), 5)).toHaveText("已停止", { timeout: 1_000 });
+  });
+  const past = (await stack.admin.get(`/admin/tenants/${world.tenantId}/billing`)).balance_micro_cny as number;
+  expect(past).toBeLessThanOrEqual(-50_000);
+
+  // The billing mode is changed here, on the account's own panel, with a
+  // confirmation: it moves the block decision.
+  const mode = region(page, "计费方式");
+  await mode.getByRole("button", { name: "改为后付" }).click();
+  await mode.getByRole("button", { name: "确认改为后付" }).click();
+  await expect(cell(accountRow(page, world), 1)).toHaveText("后付");
+  await expect(mode).toContainText("后付");
+  expect((await stack.admin.get(`/admin/tenants/${world.tenantId}`)).billing_mode).toBe("postpaid");
+  // The same money under the same floor: still stopped, and the gateway
+  // still refuses until the limit is raised.
+  await expect(cell(accountRow(page, world), 5)).toHaveText("已停止");
+  await expect.poll(() => chat(stack, world.key.plaintext, world.model.name), { timeout: 15_000 }).toBe(429);
+
+  // Raising the limit lifts the mark for the postpaid tenant, and the
+  // gateway answers again.
+  await panel.getByLabel("信用额度（元）").fill("1.00");
+  await panel.getByRole("button", { name: "保存" }).click();
+  await expect(cell(accountRow(page, world), 5)).toHaveText("正常");
+  await expect.poll(() => chat(stack, world.key.plaintext, world.model.name), { timeout: 15_000 }).toBe(200);
+});
+
+test("预付租户没有信用额度时，面板说明余额用尽即停止", async ({ page }) => {
+  const world = await seedTenant(stack, { mode: "prepaid", creditCny: "10.00" });
+  await login(page);
+  await accountRow(page, world).getByRole("button", { name: world.tenantName }).click();
+  const panel = page.getByRole("dialog");
+  await expect(panel.getByText("尚无信用额度：余额用尽即停止调用")).toBeVisible();
+  // The limit reads as a figure on the panel for a prepaid tenant, not as
+  // an absent one.
+  await expect(region(page, "余额")).toContainText("信用额度");
+});
+
 test("租户详情显示流水、用量汇总与只读额度", async ({ page }) => {
   await waitClearOfUtcMidnight();
   const world = await seedTenant(stack, { mode: "prepaid", creditCny: "10.00" });

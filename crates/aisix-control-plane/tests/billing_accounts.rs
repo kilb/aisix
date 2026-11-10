@@ -291,6 +291,22 @@ async fn one_tenants_account_reads_as_the_list_does() {
 }
 
 #[tokio::test]
+async fn the_available_figure_adds_the_credit_limit_in_either_mode() {
+    let Some(w) = world().await else { return };
+    let pool = w.cp.db().pool();
+    let path = format!("/admin/tenants/{}/billing", w.tenant);
+    for mode in ["prepaid", "postpaid"] {
+        set_account(pool, w.tenant, mode, -250_000, 1_000_000).await;
+        let r = w.cp.send("GET", &path, Some(w.admin.cookie()), None).await;
+        assert_eq!(r.status, 200, "{mode}: {r:?}");
+        assert_eq!(r.body["billing_mode"], mode, "{r:?}");
+        assert_eq!(r.body["balance_micro_cny"], -250_000, "{mode}: {r:?}");
+        assert_eq!(r.body["available_micro_cny"], 750_000, "{mode}: {r:?}");
+        assert_eq!(r.body["exhausted"], false, "{mode}: {r:?}");
+    }
+}
+
+#[tokio::test]
 async fn owners_admins_and_billing_members_read_the_balance() {
     let Some(cp) = TestCp::start().await else {
         return;

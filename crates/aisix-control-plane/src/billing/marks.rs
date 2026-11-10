@@ -34,9 +34,11 @@ use crate::resources::write::WriteCtx;
 use crate::resources::Kind;
 use crate::tenants::{self, BillingMode, TenantRow, TenantStatus};
 
-/// What a prepaid tenant's refused request is told.
+/// What a prepaid tenant's refused request is told. The tenant may still
+/// hold credit, so the message names the shortfall rather than a spent
+/// balance: every surface that shows this reason uses this one wording.
 pub const BALANCE_MESSAGE_PREPAID: &str =
-    "Account balance exhausted. Ask an owner or billing member of your organization to top up.";
+    "Insufficient balance. Ask an owner or billing member of your organization to top up.";
 
 /// What a postpaid tenant's refused request is told.
 pub const BALANCE_MESSAGE_POSTPAID: &str =
@@ -45,17 +47,26 @@ pub const BALANCE_MESSAGE_POSTPAID: &str =
 /// The channel ingest notifies when it flags an account.
 pub const DIRTY_CHANNEL: &str = "billing_marks_dirty";
 
-/// Whether a tenant in `mode` with `balance` and `credit_limit` (micro-CNY)
-/// is out of money. A prepaid tenant is at its floor at 0, whatever its
-/// credit limit; a postpaid one at minus its credit limit. A sum that leaves
-/// the `i64` range counts as exhausted.
-pub fn exhausted(mode: BillingMode, balance: i64, credit_limit: i64) -> bool {
-    match mode {
-        BillingMode::Prepaid => balance <= 0,
-        BillingMode::Postpaid => balance
-            .checked_add(credit_limit)
-            .is_none_or(|available| available <= 0),
-    }
+/// Whether a tenant with `balance` and `credit_limit` (micro-CNY) is out of
+/// money: the credit limit is an overdraft, so the floor is available money
+/// at 0, whatever the billing mode. A sum that leaves the `i64` range counts
+/// as exhausted.
+///
+/// A credit limit of 0 makes this `balance <= 0`, which is exactly what a
+/// prepaid tenant was judged by before the limit applied to it too: a
+/// prepaid organisation that never set one behaves as it always has.
+pub fn exhausted(balance: i64, credit_limit: i64) -> bool {
+    balance
+        .checked_add(credit_limit)
+        .is_none_or(|available| available <= 0)
+}
+
+/// What a tenant may still spend: its balance plus its credit limit, which
+/// is an overdraft in either billing mode. Saturating, for a figure that is
+/// displayed rather than decided on; [`exhausted`] is the decision, and it
+/// fails closed on a sum that leaves the `i64` range instead.
+pub fn available(balance: i64, credit_limit: i64) -> i64 {
+    balance.saturating_add(credit_limit)
 }
 
 /// Who owns tenant `tenant_id`'s billing documents.
@@ -101,11 +112,7 @@ pub async fn project(
         return Ok(());
     }
     let account = ledger::lock_account(&mut *conn, tenant.id).await?;
-    let exhausted = exhausted(
-        tenant.billing_mode,
-        account.balance_micro_cny,
-        account.credit_limit_micro_cny,
-    );
+    let exhausted = exhausted(account.balance_micro_cny, account.credit_limit_micro_cny);
     tenants::put(
         &mut *conn,
         ctx,
@@ -128,42 +135,35 @@ pub async fn project(
 }
 
 /// The tenants among `after` whose accounts are to be flagged: each one
-/// whose balance has crossed its tenant's floor since its mark was last
-/// written (or that has never had one). `after` holds the accounts a batch
-/// posts to, each with the balance its last entry will leave; the caller
-/// holds their locks, and sets the flags in the posting's own update
+/// whose balance has crossed its floor since its mark was last written (or
+/// that has never had one). `after` holds the accounts a batch posts to,
+/// each with the balance its last entry will leave; the caller holds their
+/// locks, and sets the flags in the posting's own update
 /// (`ledger::post_flagging`), then calls [`notify`].
 ///
-/// Each tenant's billing mode is read here with a plain read, after the
-/// account lock: a mode change holds that lock too, so the mode read is
-/// current. The internal tenant is never flagged.
+/// The floor is `balance + credit_limit` for every mode ([`exhausted`]), so
+/// no tenant row is read here: the only thing it decides is that the internal
+/// tenant is never flagged.
 pub async fn crossings(conn: &mut PgConnection, after: &[Account]) -> Result<Vec<Uuid>, DbError> {
     if after.is_empty() {
         return Ok(Vec::new());
     }
     let ids: Vec<Uuid> = after.iter().map(|a| a.tenant_id).collect();
-    let tenants: Vec<(Uuid, bool, bool)> = sqlx::query_as(
-        "SELECT id, billing_mode = 'postpaid', is_internal FROM tenants WHERE id = ANY($1)",
-    )
-    .bind(&ids)
-    .fetch_all(&mut *conn)
-    .await?;
+    let tenants: Vec<(Uuid, bool)> =
+        sqlx::query_as("SELECT id, is_internal FROM tenants WHERE id = ANY($1)")
+            .bind(&ids)
+            .fetch_all(&mut *conn)
+            .await?;
     let dirty: Vec<Uuid> = after
         .iter()
         .filter(|account| {
             tenants
                 .iter()
-                .find(|(id, _, _)| *id == account.tenant_id)
-                .is_some_and(|&(_, postpaid, internal)| {
-                    let mode = if postpaid {
-                        BillingMode::Postpaid
-                    } else {
-                        BillingMode::Prepaid
-                    };
+                .find(|(id, _)| *id == account.tenant_id)
+                .is_some_and(|&(_, internal)| {
                     !internal
                         && account.marked_exhausted
                             != Some(exhausted(
-                                mode,
                                 account.balance_micro_cny,
                                 account.credit_limit_micro_cny,
                             ))
@@ -224,20 +224,37 @@ mod tests {
     use crate::resources::validate::{validate_lenient, validate_strict};
 
     #[test]
-    fn prepaid_is_exhausted_at_zero_and_not_one_micro_cny_above() {
-        assert!(exhausted(BillingMode::Prepaid, 0, 0));
-        assert!(!exhausted(BillingMode::Prepaid, 1, 0));
-        assert!(exhausted(BillingMode::Prepaid, -5, 1_000_000));
+    fn a_credit_limit_is_an_overdraft_whose_floor_is_available_money_at_zero() {
+        // ¥100 of credit: balance 0 still has it to draw, and a balance of
+        // exactly minus ¥100 has spent it.
+        assert!(!exhausted(0, 100_000_000));
+        assert!(!exhausted(-1, 100_000_000));
+        assert!(exhausted(-100_000_000, 100_000_000));
+        assert!(exhausted(-100_000_001, 100_000_000));
+        // The floor is available money, so a balance below zero is not
+        // exhausted on its own while credit remains.
+        assert!(!exhausted(-5, 1_000_000));
     }
 
     #[test]
-    fn postpaid_is_exhausted_at_its_credit_limit() {
-        assert!(exhausted(BillingMode::Postpaid, -1000, 1000));
-        assert!(!exhausted(BillingMode::Postpaid, -999, 1000));
-        assert!(exhausted(BillingMode::Postpaid, 0, 0));
-        // A sum past the range is exhausted rather than wrapping around.
-        assert!(exhausted(BillingMode::Postpaid, i64::MAX, 1));
-        assert!(!exhausted(BillingMode::Postpaid, i64::MAX, 0));
+    fn a_credit_limit_of_zero_keeps_prepaids_old_floor() {
+        // A prepaid organisation that never set a limit behaves as before:
+        // 0 is exhausted, one micro-CNY above is not.
+        assert!(exhausted(0, 0));
+        assert!(!exhausted(1, 0));
+    }
+
+    #[test]
+    fn available_adds_the_credit_limit_in_either_mode() {
+        assert_eq!(available(0, 100_000_000), 100_000_000);
+        assert_eq!(available(-250_000, 1_000_000), 750_000);
+        assert_eq!(available(5_000_000, 0), 5_000_000);
+    }
+
+    #[test]
+    fn a_sum_past_the_range_is_exhausted_rather_than_wrapping_around() {
+        assert!(exhausted(i64::MAX, 1));
+        assert!(!exhausted(i64::MAX, 0));
     }
 
     #[test]

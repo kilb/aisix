@@ -155,8 +155,8 @@ function BalancePanel({ balance, team, err }: { balance: Balance | null; team: B
           </p>
           <div className="entries">
             <Reading label="余额" value={<Money micro={balance.balance_micro_cny} />} />
-            {postpaid && <Reading label="信用额度" value={<Money micro={balance.credit_limit_micro_cny} />} />}
-            {postpaid && <Reading label="可用额度" value={<Money micro={balance.available_micro_cny} />} />}
+            <Reading label="信用额度" value={<Money micro={balance.credit_limit_micro_cny} />} />
+            <Reading label="可用额度" value={<Money micro={balance.available_micro_cny} />} />
             <Reading label="待审批的充值" value={`${balance.pending_topups} 笔`} />
           </div>
         </>

@@ -8,6 +8,7 @@ import {
   type BillingAccount,
   type LedgerItem,
   type LedgerSummaryRow,
+  tenants,
   type UsageSummaryRow,
 } from "../../lib/api";
 import { errorText } from "../../lib/fmt";
@@ -19,6 +20,7 @@ import { Field, useRefusalFocus } from "../../ui/Field";
 import { Lamp } from "../../ui/Lamp";
 import { SidePanel } from "../../ui/SidePanel";
 import { useToast } from "../../ui/Toast";
+import { TwoStep } from "../../ui/TwoStep";
 import { refusal, useLoad } from "../Tenants";
 import { FailModeNote } from "../../components/FailModeNote";
 import { CreditForm } from "./CreditForm";
@@ -65,7 +67,6 @@ export function AccountState({ account }: { account: BillingAccount }) {
 }
 
 function BalanceCard({ account }: RegionProps) {
-  const postpaid = account.billing_mode === "postpaid";
   return (
     <Region label="余额">
       <dl className="bl-facts">
@@ -73,12 +74,8 @@ function BalanceCard({ account }: RegionProps) {
         <dd>{MODE_LABEL[account.billing_mode] ?? account.billing_mode}</dd>
         <dt>余额</dt>
         <dd className="money">{fmtMicroCny(account.balance_micro_cny)}</dd>
-        {postpaid && (
-          <>
-            <dt>信用额度</dt>
-            <dd className="money">{fmtMicroCny(account.credit_limit_micro_cny)}</dd>
-          </>
-        )}
+        <dt>信用额度</dt>
+        <dd className="money">{fmtMicroCny(account.credit_limit_micro_cny)}</dd>
         <dt>可用</dt>
         <dd className="money">{fmtMicroCny(account.available_micro_cny)}</dd>
         {!account.is_internal && (
@@ -135,14 +132,27 @@ function CreditLimit({ account, canEdit, onChanged }: RegionProps) {
     }
   }
 
-  const unset = account.billing_mode === "postpaid" && !account.is_internal && account.credit_limit_micro_cny === 0;
+  // A tenant with no credit limit has only its balance to spend. Postpaid
+  // says so up front, because that is also why every call is refused while
+  // the balance is not positive; prepaid says which of the two cases it is
+  // in, and a tenant still holding money sees no warning at all.
+  const postpaidUnset = account.billing_mode === "postpaid" && !account.is_internal && account.credit_limit_micro_cny === 0;
+  const prepaidOut = account.billing_mode === "prepaid" && !account.credit_limit_micro_cny && !account.is_internal && account.exhausted;
   const problem = localError ?? refused?.at.get("/credit_limit_cny") ?? null;
   return (
     <Region label="信用额度">
-      {unset && (
+      {postpaidUnset && (
         <div className="note warn" role="status">
           后付租户尚未设置信用额度，所有调用都会被拒绝
         </div>
+      )}
+      {prepaidOut && (
+        <div className="note warn" role="status">
+          余额与信用额度都用尽，调用会被拒绝
+        </div>
+      )}
+      {account.billing_mode === "prepaid" && !account.is_internal && !account.credit_limit_micro_cny && !account.exhausted && (
+        <p className="hint">尚无信用额度：余额用尽即停止调用</p>
       )}
       {account.is_internal ? (
         <p className="hint">平台内部租户不受余额与信用额度限制。</p>
@@ -151,11 +161,7 @@ function CreditLimit({ account, canEdit, onChanged }: RegionProps) {
       ) : (
         <form ref={form} onSubmit={(e) => void save(e)} noValidate>
           <div className="bl-controls">
-            <Field
-              label="信用额度（元）"
-              hint={account.billing_mode === "prepaid" ? "预付租户按余额放行，信用额度只对后付租户生效。" : undefined}
-              error={problem}
-            >
+            <Field label="信用额度（元）" hint={CREDIT_HINT} error={problem}>
               {(aria) => <input inputMode="decimal" value={draft} onChange={(e) => setDraft(e.target.value)} {...aria} />}
             </Field>
             <Button kind="primary" type="submit" busy={busy} busyLabel="保存中…">
@@ -168,6 +174,66 @@ function CreditLimit({ account, canEdit, onChanged }: RegionProps) {
             </div>
           )}
         </form>
+      )}
+    </Region>
+  );
+}
+
+/** What the credit limit means, for either mode. */
+export const CREDIT_HINT = "可用额度 = 余额 + 信用额度；预付租户透支到 0 即停止调用";
+
+/**
+ * The billing mode, changed on the tenant row and saved with `If-Match`.
+ * The account carries no version, so the tenant is read first: the edit
+ * starts from the version the control plane holds now, and a 412 means
+ * someone else moved the tenant meanwhile.
+ */
+function BillingMode({ account, canEdit, onChanged }: RegionProps) {
+  const toast = useToast();
+  const [busy, setBusy] = useState(false);
+  const [note, setNote] = useState<Note | null>(null);
+  const next: BillingAccount["billing_mode"] = account.billing_mode === "prepaid" ? "postpaid" : "prepaid";
+
+  async function change() {
+    setBusy(true);
+    setNote(null);
+    try {
+      const tenant = await tenants.get(account.tenant_id);
+      await tenants.update(account.tenant_id, { billing_mode: next }, tenant.version);
+      onChanged(await billing.account(account.tenant_id));
+      toast(`已改为${MODE_LABEL[next]}`);
+    } catch (e) {
+      setNote({ text: errorText(e), kind: "crit" });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Region label="计费方式">
+      <dl className="bl-facts">
+        <dt>计费方式</dt>
+        <dd>{MODE_LABEL[account.billing_mode] ?? account.billing_mode}</dd>
+      </dl>
+      <p className="hint">
+        {account.is_internal
+          ? "平台内部租户不受余额与信用额度限制，计费方式不影响它是否被停止。"
+          : "预付 = 余额 + 信用额度；后付 = 同上，月底结算。"}
+      </p>
+      {!account.is_internal && canEdit && (
+        <>
+          <div className="bl-controls">
+            <TwoStep
+              label={`改为${MODE_LABEL[next]}`}
+              kind="secondary"
+              busy={busy}
+              busyLabel="保存中…"
+              warning={`切换后立即按${MODE_LABEL[next]}判断是否停止调用，余额与信用额度不变。`}
+              onConfirm={() => void change()}
+            />
+          </div>
+          <Msg note={note} />
+        </>
       )}
     </Region>
   );
@@ -571,6 +637,7 @@ function FailMode({ onGoto }: RegionProps) {
 /** The regions of the panel, top to bottom. Later tasks append theirs. */
 export const PANEL_REGIONS: { id: string; Component: ComponentType<RegionProps> }[] = [
   { id: "balance", Component: BalanceCard },
+  { id: "billing-mode", Component: BillingMode },
   { id: "credit-limit", Component: CreditLimit },
   { id: "ledger", Component: Ledger },
   { id: "period-summary", Component: PeriodSummary },

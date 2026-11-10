@@ -47,8 +47,8 @@ pub struct OrgFigures {
     pub billing_mode: String,
     pub balance_micro_cny: i64,
     pub credit_limit_micro_cny: i64,
-    /// The balance for a prepaid tenant, the balance plus the credit limit
-    /// for a postpaid one.
+    /// The balance plus the credit limit, which is an overdraft in either
+    /// billing mode.
     pub available_micro_cny: i64,
 }
 
@@ -125,11 +125,7 @@ pub async fn key_quota(
     .bind(access.tenant_id)
     .fetch_one(&mut *conn)
     .await?;
-    let available = if billing_mode == "postpaid" {
-        balance.saturating_add(credit_limit)
-    } else {
-        balance
-    };
+    let available = super::marks::available(balance, credit_limit);
 
     let all = budgets::list(&mut *conn, access.tenant_id, now).await?;
     let applicable: Vec<(BudgetRow, i64)> = all

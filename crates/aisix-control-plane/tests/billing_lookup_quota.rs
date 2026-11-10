@@ -301,6 +301,25 @@ async fn a_quota_and_the_balance_are_compared_in_micro_cny_at_any_rate() {
 }
 
 #[tokio::test]
+async fn a_prepaid_orgs_quota_answer_offers_its_credit_limit_too() {
+    let Some(q) = setup().await else { return };
+    // The setup's tenant is postpaid with ¥1.00 of credit and ¥0.03 spent.
+    // Prepaid with the same money must read the same available figure: the
+    // limit is an overdraft in either mode.
+    sqlx::query("UPDATE tenants SET billing_mode = 'prepaid' WHERE id = $1")
+        .bind(q.tenant)
+        .execute(q.cp.db().pool())
+        .await
+        .expect("make the tenant prepaid");
+    let r = portal(&q, &q.owner, q.key).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    assert_eq!(r.body["org"]["billing_mode"], json!("prepaid"), "{r:?}");
+    assert_eq!(r.body["org"]["balance_micro_cny"], json!(-30_000), "{r:?}");
+    assert_eq!(r.body["org"]["credit_limit_micro_cny"], json!(1_000_000));
+    assert_eq!(r.body["org"]["available_micro_cny"], json!(970_000));
+}
+
+#[tokio::test]
 async fn a_key_quota_reports_every_level_and_the_smallest_remaining() {
     let Some(q) = setup().await else { return };
     let r = portal(&q, &q.owner, q.key).await;

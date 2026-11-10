@@ -1,6 +1,6 @@
 //! Balance marks: every customer tenant past pending has one `budgets`
-//! document over its own team, marked exhausted while its money is out (a
-//! prepaid balance at 0, a postpaid one at minus its credit limit). Tenant
+//! document over its own team, marked exhausted while its money is out (the
+//! balance plus its credit limit at 0, in either billing mode). Tenant
 //! projections write it right before the keys; usage intake only flags an
 //! account whose balance crosses the floor, never waiting on the resources
 //! lock, and the settler writes the mark after the batch commits, skipping
@@ -373,6 +373,188 @@ async fn an_approved_postpaid_tenant_with_no_credit_limit_starts_exhausted() {
 }
 
 #[tokio::test]
+async fn a_prepaid_tenant_draws_its_credit_limit_before_it_is_marked() {
+    let Some(w) = world().await else { return };
+    // ¥100 of credit over a zero balance: the limit is an overdraft, so the
+    // tenant has money to spend and no mark is written.
+    set_account(w.cp.db(), w.tenant, 0, Some(100_000_000)).await;
+    settle(&w.cp, w.tenant).await;
+    assert_eq!(live_mark(w.cp.db(), w.tenant).await.doc, open_doc(w.tenant));
+    assert_eq!(
+        account(w.cp.db(), w.tenant).await.marked_exhausted,
+        Some(false)
+    );
+
+    // One micro-CNY of credit left is still open.
+    set_account(w.cp.db(), w.tenant, -99_999_999, None).await;
+    settle(&w.cp, w.tenant).await;
+    assert_eq!(live_mark(w.cp.db(), w.tenant).await.doc, open_doc(w.tenant));
+
+    // Spent to exactly the limit: marked, with the prepaid wording.
+    set_account(w.cp.db(), w.tenant, -100_000_000, None).await;
+    settle(&w.cp, w.tenant).await;
+    assert_eq!(
+        live_mark(w.cp.db(), w.tenant).await.doc,
+        exhausted_doc(w.tenant, BALANCE_MESSAGE_PREPAID)
+    );
+    assert_eq!(
+        account(w.cp.db(), w.tenant).await.marked_exhausted,
+        Some(true)
+    );
+}
+
+#[tokio::test]
+async fn a_prepaid_tenant_without_credit_is_marked_at_zero_as_before() {
+    let Some(w) = world().await else { return };
+    // The compatibility statement: a credit limit of 0 leaves prepaid's old
+    // floor in place, so a balance of 0 is exhausted and one micro-CNY above
+    // is not.
+    set_account(w.cp.db(), w.tenant, 1, Some(0)).await;
+    settle(&w.cp, w.tenant).await;
+    assert_eq!(live_mark(w.cp.db(), w.tenant).await.doc, open_doc(w.tenant));
+
+    set_account(w.cp.db(), w.tenant, 0, None).await;
+    settle(&w.cp, w.tenant).await;
+    assert_eq!(
+        live_mark(w.cp.db(), w.tenant).await.doc,
+        exhausted_doc(w.tenant, BALANCE_MESSAGE_PREPAID)
+    );
+}
+
+#[tokio::test]
+async fn a_billing_mode_change_rewrites_the_balance_mark_in_the_same_request() {
+    let Some(w) = world().await else { return };
+    // ¥50 of credit spent to the floor: exhausted, in either mode.
+    set_account(w.cp.db(), w.tenant, -50_000_000, Some(50_000_000)).await;
+    settle(&w.cp, w.tenant).await;
+    assert_eq!(
+        live_mark(w.cp.db(), w.tenant).await.doc,
+        exhausted_doc(w.tenant, BALANCE_MESSAGE_PREPAID)
+    );
+
+    // The mode change rewrites the mark to the new mode's wording, and the
+    // answer is not sent until it has.
+    let r = patch_tenant(
+        &w.cp,
+        &w.admin,
+        w.tenant,
+        json!({"billing_mode": "postpaid"}),
+    )
+    .await;
+    assert_eq!(r.status, 200, "{r:?}");
+    assert_eq!(r.body["billing_mode"], "postpaid", "{r:?}");
+    assert_eq!(
+        live_mark(w.cp.db(), w.tenant).await.doc,
+        exhausted_doc(w.tenant, BALANCE_MESSAGE_POSTPAID)
+    );
+    // And back again, the same transaction each time.
+    let r = patch_tenant(
+        &w.cp,
+        &w.admin,
+        w.tenant,
+        json!({"billing_mode": "prepaid"}),
+    )
+    .await;
+    assert_eq!(r.status, 200, "{r:?}");
+    assert_eq!(
+        live_mark(w.cp.db(), w.tenant).await.doc,
+        exhausted_doc(w.tenant, BALANCE_MESSAGE_PREPAID)
+    );
+}
+
+#[tokio::test]
+async fn the_credit_limit_decides_the_mark_in_prepaid_exactly_as_in_postpaid() {
+    let Some(w) = world().await else { return };
+    // The same money under each mode, written through the mode route, decides
+    // the same mark. Prepaid used to ignore its limit entirely, so a prepaid
+    // balance below 0 was marked however much credit it held.
+    for mode in ["prepaid", "postpaid"] {
+        set_account(w.cp.db(), w.tenant, -50_000_000, Some(100_000_000)).await;
+        let r = patch_tenant(&w.cp, &w.admin, w.tenant, json!({"billing_mode": mode})).await;
+        assert_eq!(r.status, 200, "{mode}: {r:?}");
+        assert_eq!(
+            live_mark(w.cp.db(), w.tenant).await.doc,
+            open_doc(w.tenant),
+            "{mode}: ¥50 of credit left is money to spend"
+        );
+
+        set_account(w.cp.db(), w.tenant, -100_000_000, None).await;
+        let r = patch_tenant(&w.cp, &w.admin, w.tenant, json!({"billing_mode": mode})).await;
+        assert_eq!(r.status, 200, "{mode}: {r:?}");
+        assert!(
+            live_mark(w.cp.db(), w.tenant).await.doc["exhausted"].is_object(),
+            "{mode}"
+        );
+        assert_eq!(
+            account(w.cp.db(), w.tenant).await.marked_exhausted,
+            Some(true),
+            "{mode}: ¥100 of credit spent to the floor is exhausted"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_mark_the_new_floor_no_longer_justifies_is_lifted_in_the_same_request() {
+    let Some(w) = world().await else { return };
+    // Prepaid at 0 with no credit is exhausted...
+    set_account(w.cp.db(), w.tenant, 0, Some(0)).await;
+    settle(&w.cp, w.tenant).await;
+    assert_eq!(
+        live_mark(w.cp.db(), w.tenant).await.doc,
+        exhausted_doc(w.tenant, BALANCE_MESSAGE_PREPAID)
+    );
+    // ...and a mode change on money that no longer justifies a mark lifts
+    // it: both modes hold the same floor, so the mark follows the money
+    // however it got there.
+    set_account(w.cp.db(), w.tenant, 0, Some(1_000_000)).await;
+    let r = patch_tenant(
+        &w.cp,
+        &w.admin,
+        w.tenant,
+        json!({"billing_mode": "postpaid"}),
+    )
+    .await;
+    assert_eq!(r.status, 200, "{r:?}");
+    assert_eq!(live_mark(w.cp.db(), w.tenant).await.doc, open_doc(w.tenant));
+    assert_eq!(
+        account(w.cp.db(), w.tenant).await.marked_exhausted,
+        Some(false)
+    );
+}
+
+#[tokio::test]
+async fn a_mode_change_never_marks_the_internal_tenant() {
+    let Some(w) = world().await else { return };
+    let internal: Uuid = sqlx::query_scalar("SELECT id FROM tenants WHERE is_internal")
+        .fetch_one(w.cp.db().pool())
+        .await
+        .expect("the internal tenant");
+    // The platform's own tenant runs a negative balance postpaid and is
+    // never marked; changing its mode must not change that.
+    let before = account(w.cp.db(), internal).await;
+    let r = patch_tenant(
+        &w.cp,
+        &w.admin,
+        internal,
+        json!({"billing_mode": "prepaid"}),
+    )
+    .await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let after = account(w.cp.db(), internal).await;
+    assert_eq!(
+        (after.balance_micro_cny, after.marks_dirty),
+        (before.balance_micro_cny, false)
+    );
+    let owned: i64 = sqlx::query_scalar("SELECT count(*) FROM gw_resources WHERE managed_by = $1")
+        .bind(format!("billing:{internal}"))
+        .fetch_one(w.cp.db().pool())
+        .await
+        .expect("count the documents");
+    assert_eq!(owned, 0);
+    assert!(mark(w.cp.db(), internal).await.is_none());
+}
+
+#[tokio::test]
 async fn reactivating_a_tenant_writes_its_balance_mark_before_its_keys_open() {
     let Some(w) = world().await else { return };
     set_account(w.cp.db(), w.tenant, 1_000, None).await;
@@ -460,7 +642,7 @@ async fn a_batch_that_crosses_the_floor_wakes_the_settler() {
 }
 
 #[tokio::test]
-async fn switching_to_prepaid_with_a_negative_balance_marks_the_tenant() {
+async fn switching_to_prepaid_keeps_the_floor_the_credit_limit_gives() {
     let Some(w) = world().await else { return };
     let model = seed_model(&w.cp, &w.admin).await;
     price(&w.cp, model).await;
@@ -472,6 +654,7 @@ async fn switching_to_prepaid_with_a_negative_balance_marks_the_tenant() {
     )
     .await;
     assert_eq!(r.status, 200, "{r:?}");
+    // ¥0.01 of credit spent a little past: still inside it, so no mark.
     set_account(w.cp.db(), w.tenant, 0, Some(10_000)).await;
     settle(&w.cp, w.tenant).await;
     let r = deliver(&w.dp, Uuid::new_v4(), rows(&w, model, "spent", 1)).await;
@@ -479,6 +662,9 @@ async fn switching_to_prepaid_with_a_negative_balance_marks_the_tenant() {
     assert_eq!(account(w.cp.db(), w.tenant).await.balance_micro_cny, -680);
     assert_eq!(live_mark(w.cp.db(), w.tenant).await.doc, open_doc(w.tenant));
 
+    // The credit limit is an overdraft in either mode, so the switch to
+    // prepaid leaves the tenant inside its money and unmarked. It used to
+    // mark it at once, at a balance of 0 whatever the limit.
     let r = patch_tenant(
         &w.cp,
         &w.admin,
@@ -487,7 +673,35 @@ async fn switching_to_prepaid_with_a_negative_balance_marks_the_tenant() {
     )
     .await;
     assert_eq!(r.status, 200, "{r:?}");
-    // In that request: read right after the answer.
+    assert_eq!(live_mark(w.cp.db(), w.tenant).await.doc, open_doc(w.tenant));
+    assert_eq!(
+        account(w.cp.db(), w.tenant).await.marked_exhausted,
+        Some(false)
+    );
+
+    // The same switch on the same money with no credit, however: the prepaid
+    // floor of old is the limit-0 floor of new.
+    set_account(w.cp.db(), w.tenant, -680, Some(0)).await;
+    let r = patch_tenant(
+        &w.cp,
+        &w.admin,
+        w.tenant,
+        json!({"billing_mode": "postpaid"}),
+    )
+    .await;
+    assert_eq!(r.status, 200, "{r:?}");
+    assert_eq!(
+        live_mark(w.cp.db(), w.tenant).await.doc,
+        exhausted_doc(w.tenant, BALANCE_MESSAGE_POSTPAID)
+    );
+    let r = patch_tenant(
+        &w.cp,
+        &w.admin,
+        w.tenant,
+        json!({"billing_mode": "prepaid"}),
+    )
+    .await;
+    assert_eq!(r.status, 200, "{r:?}");
     assert_eq!(
         live_mark(w.cp.db(), w.tenant).await.doc,
         exhausted_doc(w.tenant, BALANCE_MESSAGE_PREPAID)

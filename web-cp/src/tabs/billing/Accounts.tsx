@@ -44,7 +44,7 @@ export function Accounts({ canEdit, operator, onGoto }: TabProps) {
             </Button>
           </h2>
           <p className="hint">
-            预付租户余额为零即停止调用；后付租户用尽信用额度即停止。平台内部租户不受限制，排在最后。
+            可用额度 = 余额 + 信用额度，用尽即停止调用（预付透支到 0，后付同样透支到 0，月底结算）。平台内部租户不受限制，排在最后。
           </p>
           {error && (
             <div className="note crit" role="alert">
@@ -88,7 +88,7 @@ export function Accounts({ canEdit, operator, onGoto }: TabProps) {
                     </td>
                     <td>{MODE_LABEL[a.billing_mode] ?? a.billing_mode}</td>
                     <td className="num">{fmtMicroCny(a.balance_micro_cny)}</td>
-                    <td className="num">{a.billing_mode === "postpaid" ? fmtMicroCny(a.credit_limit_micro_cny) : "—"}</td>
+                    <td className="num">{fmtMicroCny(a.credit_limit_micro_cny)}</td>
                     <td className="num">{fmtMicroCny(a.available_micro_cny)}</td>
                     <td>{a.is_internal ? "—" : <AccountState account={a} />}</td>
                     <td className="num">{a.pending_topups}</td>

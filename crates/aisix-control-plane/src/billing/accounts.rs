@@ -40,8 +40,8 @@ pub struct BillingAccount {
     pub billing_mode: String,
     pub balance_micro_cny: i64,
     pub credit_limit_micro_cny: i64,
-    /// The balance for a prepaid tenant, the balance plus the credit limit
-    /// for a postpaid one.
+    /// The balance plus the credit limit, which is an overdraft in either
+    /// billing mode.
     pub available_micro_cny: i64,
     /// Whether the balance rule blocks the tenant now; never for the
     /// internal tenant.
@@ -62,7 +62,9 @@ type Raw = (Uuid, String, String, bool, String, i64, i64, i64);
 fn account_of(raw: Raw) -> Result<BillingAccount, ApiError> {
     let (tenant_id, tenant_name, status, is_internal, mode, balance, credit_limit, pending_topups) =
         raw;
-    let billing_mode = BillingMode::parse(&mode)
+    // A stored mode this build cannot read is a fault, even though no figure
+    // here depends on it any more: the tenant view shows the same string.
+    BillingMode::parse(&mode)
         .ok_or_else(|| ApiError::internal(format!("tenant {tenant_id}: billing mode {mode}")))?;
     Ok(BillingAccount {
         tenant_id,
@@ -72,11 +74,8 @@ fn account_of(raw: Raw) -> Result<BillingAccount, ApiError> {
         billing_mode: mode,
         balance_micro_cny: balance,
         credit_limit_micro_cny: credit_limit,
-        available_micro_cny: match billing_mode {
-            BillingMode::Prepaid => balance,
-            BillingMode::Postpaid => balance.saturating_add(credit_limit),
-        },
-        exhausted: !is_internal && marks::exhausted(billing_mode, balance, credit_limit),
+        available_micro_cny: marks::available(balance, credit_limit),
+        exhausted: !is_internal && marks::exhausted(balance, credit_limit),
         pending_topups,
     })
 }

@@ -226,6 +226,8 @@ export interface Member {
 
 /** What `PATCH /admin/tenants/{id}` takes: each field given replaces the stored one. */
 export interface TenantChanges {
+  /** 预付 or 后付; changing it moves the balance mark. */
+  billing_mode?: "prepaid" | "postpaid";
   /** Sending `allowed_model_ids` alone means `selected`. */
   model_scope?: "all" | "selected";
   allowed_model_ids?: string[];
