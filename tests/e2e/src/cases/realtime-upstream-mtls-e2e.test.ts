@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { createServer as createHttpsServer, type Server } from "node:https";
 import type { TLSSocket } from "node:tls";
 import { tmpdir } from "node:os";
@@ -53,16 +53,27 @@ function makePki(): Pki {
     "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
     "-keyout", p("client-ca.key"), "-out", p("client-ca.crt"),
     "-subj", "/CN=aisix-e2e-client-ca",
+    "-addext", "basicConstraints=critical,CA:TRUE",
+    "-addext", "keyUsage=critical,keyCertSign,cRLSign",
   ]);
   openssl(["genrsa", "-out", p("client.key"), "2048"]);
   openssl([
     "req", "-new", "-key", p("client.key"), "-out", p("client.csr"),
     "-subj", `/CN=${CLIENT_CN}`,
   ]);
+  // Extensions make the certificate X.509 v3 on every OpenSSL: without
+  // them `x509 -req` writes v1 before 3.2, which no TLS stack the gateway
+  // presents a client certificate through accepts.
+  writeFileSync(
+    p("client.ext"),
+    "basicConstraints=CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\n" +
+      "extendedKeyUsage=clientAuth\n",
+    "utf8",
+  );
   openssl([
     "x509", "-req", "-in", p("client.csr"),
     "-CA", p("client-ca.crt"), "-CAkey", p("client-ca.key"), "-CAcreateserial",
-    "-out", p("client.crt"), "-days", "1", "-sha256",
+    "-out", p("client.crt"), "-days", "1", "-sha256", "-extfile", p("client.ext"),
   ]);
   return {
     dir,
