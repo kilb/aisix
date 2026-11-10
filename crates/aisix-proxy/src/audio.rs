@@ -2253,14 +2253,18 @@ async fn multipart_dispatch(
         ),
         ..Default::default()
     });
-    reservation.commit_tokens(total_tokens).await;
+    // Owed, not committed: the concurrency slot stays taken while the output
+    // chain reads the transcript, and a refusal or a caller that leaves during
+    // it still credits the tokens as the reservation drops. Committed below
+    // once the chain lets the transcript through.
+    reservation.owe_tokens(total_tokens);
 
     // #696: run the output guardrail chain on the transcript — it is
     // caller-visible model output, scanned like chat's replies. Pre-fix an
     // output block/mask enforced on /v1/chat/completions was bypassable by
-    // transcribing audio. The upstream already billed (tokens committed
-    // above), so a block returns the redacted 422 while keeping the billed
-    // usage marked `guardrail_blocked` — same as completions #911 [23].
+    // transcribing audio. The upstream already billed (tokens owed above), so
+    // a block returns the redacted 422 while keeping the billed usage marked
+    // `guardrail_blocked` — same as completions #911 [23].
     let mut output_capture_safe = true;
     if aisix_guardrails::Guardrail::runs_on_output(&resolved_chain) {
         let scan = transcription_output_text(&body_bytes, is_event_stream(&upstream_headers));
@@ -2354,6 +2358,8 @@ async fn multipart_dispatch(
             });
         }
     }
+
+    reservation.commit_tokens(total_tokens).await;
 
     // #932/#696: mask-action PII rules rewrite the transcript AFTER the
     // block check passes, BEFORE it reaches the caller.

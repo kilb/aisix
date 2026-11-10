@@ -667,7 +667,11 @@ async fn dispatch(
             if let Some(u) = usage.as_ref() {
                 note_answered_image(snapshot, &target.id, u);
             }
-            reservation.commit_tokens(total_tokens).await;
+            // Owed, not committed: the concurrency slot stays taken while the
+            // output chain reviews the answer, and a refusal or a caller that
+            // leaves during it still credits the tokens as the reservation
+            // drops. Committed once the review lets the answer through.
+            reservation.owe_tokens(total_tokens);
             let review = review_image_output(
                 &resolved_chain,
                 model_name,
@@ -690,8 +694,14 @@ async fn dispatch(
                 _ => None,
             };
             let response = match review.refusal {
-                Some(refusal) => refusal.into_response(),
-                None => Json(resp_json).into_response(),
+                Some(refusal) => {
+                    drop(reservation);
+                    refusal.into_response()
+                }
+                None => {
+                    reservation.commit_tokens(total_tokens).await;
+                    Json(resp_json).into_response()
+                }
             };
             Ok(ImageDispatchSuccess {
                 response,
