@@ -1243,8 +1243,9 @@ async fn remove(
 /// model already retired.
 ///
 /// Retiring removes the documents, the routing document first since it names
-/// the direct ones, and the model's channel rows with them: the row names a
-/// public model nobody can restore, so it holds nothing worth keeping.
+/// the direct ones, and the model's channel rows with them: a [`restore`]
+/// brings the name back with no account serving it, so the rows hold
+/// nothing worth keeping.
 ///
 /// The counts are read under `RESOURCES_LOCK_KEY`, and the delete and the
 /// update land while it is held. The public model's row is held before the
@@ -1336,6 +1337,98 @@ pub async fn delete(
                     "public_model.delete",
                 )
                 .await
+            }
+            .boxed()
+        })
+        .await?;
+    Ok(Json(answer))
+}
+
+/// `POST /admin/public-models/{id}/restore` → `200 PublicModel`: brings a
+/// retired public model back under the id it always had, so the grants,
+/// baselines and group rates keyed on that id apply to it again.
+///
+/// It clears `retired_at`, switches the model on, and regenerates its
+/// documents through [`regenerate`], the path a channel edit takes. A retire
+/// removed every account's mapping, so the routing document comes back with
+/// no target: the model is listed and callable again, and answers
+/// `upstream_unavailable` until an account serves it. Every all-scope
+/// tenant's keys are rewritten in the same transaction, exactly as when a
+/// new public model first becomes callable; a selected tenant's list is an
+/// operator's and is not touched. The routing settings the model had are
+/// kept.
+///
+/// `409 public_model_not_retired` for a model that is not retired, `409
+/// public_model_name_held` while a live model of any kind holds the name
+/// (one created after the retire freed it), and `404` for an id that names
+/// nothing.
+///
+/// The locks are `retire`'s exactly: the all-scope tenants' rows, the public
+/// model's row, then `RESOURCES_LOCK_KEY`, taken here because the name check
+/// is a plain `SELECT`, as [`create`]'s is.
+pub async fn restore(
+    auth: OperatorAuth,
+    State(state): State<AppState>,
+    Path(raw): Path<String>,
+    ApiJson(_): ApiJson<Value>,
+) -> Result<Json<Value>, ApiError> {
+    auth.require(OperatorRole::Operator)?;
+    let id = path_id(&raw)?;
+    let ctx = WriteCtx::of(&state);
+    let answer = state
+        .db
+        .tx(move |conn| {
+            async move {
+                let all_scope = crate::tenants::lock_all_scope(&mut *conn).await?;
+                let row = lock_public(&mut *conn, id).await?;
+                if row.retired_at.is_none() {
+                    return Err(ApiError::conflict(
+                        "public_model_not_retired",
+                        "该公共模型没有停用，无需恢复",
+                    ));
+                }
+                refs::lock_resources(&mut *conn).await?;
+                let held: Option<Uuid> = sqlx::query_scalar(
+                    "SELECT id FROM gw_resources \
+                     WHERE kind = $1 AND identity = $2 AND NOT deleted AND id <> $3 LIMIT 1",
+                )
+                .bind(Kind::Models.segment())
+                .bind(&row.name)
+                .bind(id)
+                .fetch_optional(&mut *conn)
+                .await
+                .map_err(DbError::from)?;
+                if held.is_some() {
+                    return Err(ApiError::conflict(
+                        "public_model_name_held",
+                        format!(
+                            "已有同名的其他模型「{}」，不能恢复；请先删除或改名那个模型",
+                            row.name
+                        ),
+                    ));
+                }
+                sqlx::query(
+                    "UPDATE public_models SET retired_at = NULL, enabled = true WHERE id = $1",
+                )
+                .bind(id)
+                .execute(&mut *conn)
+                .await
+                .map_err(DbError::from)?;
+                audit::record(
+                    &mut *conn,
+                    AuditEntry {
+                        actor: Actor::Operator(&auth),
+                        action: "public_model.restore",
+                        target_kind: "public_model",
+                        target_id: Some(id.to_string()),
+                        tenant_id: None,
+                        detail: json!({"name": row.name}),
+                    },
+                )
+                .await?;
+                regenerate(&mut *conn, &ctx, id, &all_scope).await?;
+                let row = read_public(&mut *conn, id).await?;
+                view_json(&mut *conn, &row).await
             }
             .boxed()
         })

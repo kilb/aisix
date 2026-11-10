@@ -3580,6 +3580,185 @@ async fn an_all_scope_tenant_and_its_keys_reach_a_public_model_without_holding_i
     );
 }
 
+/// `POST /admin/public-models/{id}/restore` as `who`.
+async fn restore_public(cp: &TestCp, who: &OperatorSession, id: Uuid) -> Resp {
+    cp.send(
+        "POST",
+        &format!("{PUBLICS}/{id}/restore"),
+        Some(who.cookie()),
+        Some(json!({})),
+    )
+    .await
+}
+
+/// A retired public model comes back under its own id: live, enabled, its
+/// routing settings kept, its routing document regenerated with no target,
+/// and in every all-scope key's grant again — as a public model that just
+/// became callable is. Mapping an account by name reuses it, and a baseline
+/// can be written on it again.
+#[tokio::test]
+async fn a_retired_public_model_is_restored_under_its_own_id() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let op = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let account = provider_key(&cp, &op, "acct-restore-5d2").await;
+    let (public, _) = create_public(&cp, &op, "pub-restore-8c1").await;
+    let r = put_channel(&cp, &op, account, public, json!({})).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let r = patch_public(
+        &cp,
+        &op,
+        public,
+        json!({"routing": {"strategy": "failover", "retries": 2}}),
+    )
+    .await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let shared = support::world::group_id(&cp, support::world::SHARED_GROUP).await;
+    let customer = all_scope_tenant(&cp, &op).await;
+    let key = mint(
+        &cp,
+        &op,
+        customer,
+        json!({"label": "restore-8c1", "group_id": shared}),
+    )
+    .await;
+    assert!(key_grants(&cp, key).await.contains(&public));
+
+    let r = delete_public(&cp, &op, public).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    assert!(!is_live(&cp, Kind::Models, public).await);
+    assert!(!key_grants(&cp, key).await.contains(&public));
+    // Retired, the model takes no price.
+    let baseline = json!({
+        "model_id": public,
+        "effective_from": chrono::Utc::now(),
+        "card": {"default": {"base": {"input": "1", "output": "2"}}},
+        "note": "restore",
+    });
+    let r = cp
+        .send(
+            "POST",
+            "/admin/pricing/baselines",
+            Some(op.cookie()),
+            Some(baseline.clone()),
+        )
+        .await;
+    assert_422_at(&r, "/model_id");
+
+    let r = restore_public(&cp, &op, public).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    assert_eq!(r.body["id"], public.to_string());
+    assert!(r.body["retired_at"].is_null(), "{r:?}");
+    assert_eq!(r.body["enabled"], true, "{r:?}");
+    assert_eq!(r.body["served_by"], json!([]), "{r:?}");
+    assert_eq!(
+        r.body["routing"],
+        json!({"strategy": "failover", "retries": 2}),
+        "the settings the model had are kept: {r:?}"
+    );
+    assert_eq!(r.body["reachable_keys"], 1, "{r:?}");
+    let doc = live(&cp, Kind::Models, public).await;
+    assert_eq!(doc["display_name"], "pub-restore-8c1");
+    assert_eq!(doc["routing"]["targets"], json!([]), "{doc}");
+    assert_eq!(doc["routing"]["strategy"], "failover", "{doc}");
+    assert!(
+        key_grants(&cp, key).await.contains(&public),
+        "the all-scope key reaches the restored model again"
+    );
+    assert_eq!(
+        audit_detail(&cp, "public_model.restore", public).await,
+        json!({"name": "pub-restore-8c1"})
+    );
+
+    // The account maps it again by name, onto the same id.
+    let r = bulk(&cp, &op, account, &["pub-restore-8c1"]).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    assert_eq!(
+        outcomes(&r),
+        vec![(
+            "pub-restore-8c1".to_string(),
+            "pub-restore-8c1".to_string(),
+            "added".to_string()
+        )]
+    );
+    assert_eq!(answered_id(&r, "pub-restore-8c1"), public);
+    let doc = live(&cp, Kind::Models, public).await;
+    assert_eq!(
+        doc["routing"]["targets"].as_array().map(Vec::len),
+        Some(1),
+        "{doc}"
+    );
+
+    // And it takes a baseline again.
+    let r = cp
+        .send(
+            "POST",
+            "/admin/pricing/baselines",
+            Some(op.cookie()),
+            Some(baseline),
+        )
+        .await;
+    assert_eq!(r.status, 201, "{r:?}");
+}
+
+/// A restore is refused for a model that is not retired, for a name a live
+/// model took after the retire freed it, and for an id that names nothing;
+/// each refusal leaves the row as it was.
+#[tokio::test]
+async fn a_restore_is_refused_unless_the_model_is_retired_and_its_name_free() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let op = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let (live_model, _) = create_public(&cp, &op, "pub-live-8c1").await;
+    let r = restore_public(&cp, &op, live_model).await;
+    assert_eq!(
+        (r.status, r.body["code"].as_str()),
+        (409, Some("public_model_not_retired")),
+        "{r:?}"
+    );
+
+    let r = restore_public(&cp, &op, Uuid::new_v4()).await;
+    assert_eq!(r.status, 404, "{r:?}");
+
+    let account = provider_key(&cp, &op, "acct-held-5d2").await;
+    let (public, _) = create_public(&cp, &op, "pub-held-8c1").await;
+    let r = put_channel(&cp, &op, account, public, json!({})).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let r = delete_public(&cp, &op, public).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    // A hand-made model takes the name the retire freed.
+    let r = cp
+        .send(
+            "POST",
+            "/admin/resources/models",
+            Some(op.cookie()),
+            Some(json!({"doc": {
+                "display_name": "pub-held-8c1",
+                "provider": "openai",
+                "model_name": "gpt-4o-mini",
+                "provider_key_id": account,
+            }})),
+        )
+        .await;
+    assert_eq!(r.status, 201, "{r:?}");
+    let r = restore_public(&cp, &op, public).await;
+    assert_eq!(
+        (r.status, r.body["code"].as_str()),
+        (409, Some("public_model_name_held")),
+        "{r:?}"
+    );
+    let view = public_model(&cp, &op, public).await;
+    assert!(!view["retired_at"].is_null(), "still retired: {view}");
+    assert!(!is_live(&cp, Kind::Models, public).await);
+
+    // A viewer cannot restore.
+    let viewer = cp.admin_login_seeded(OperatorRole::Viewer).await;
+    let r = restore_public(&cp, &viewer, public).await;
+    assert_eq!(r.status, 403, "{r:?}");
+}
+
 /// `least_cost` ranks targets by their price, and a public model's generated
 /// targets carry none, so the strategy is refused at its field rather than
 /// stored and silently ordering by the target list.
