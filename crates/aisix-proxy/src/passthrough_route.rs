@@ -6560,6 +6560,16 @@ fn stream_response(
                                 }
                                 pending_held.clear();
                                 held_content = crate::held_content::HeldBuffer::default();
+                                // Released as every later frame is: an error
+                                // event goes out less the credentials this
+                                // request sent, and is the stream's failure.
+                                let frame = match frame_in_band_error(protocol, &frame) {
+                                    Some(err) => {
+                                        telemetry.record_failure(&err);
+                                        aisix_gateway::scrub_upstream_error_bytes(&frame).into_owned()
+                                    }
+                                    None => frame,
+                                };
                                 telemetry.mark_first_delivery();
                                 yield Ok(Bytes::from(frame));
                                 continue;
