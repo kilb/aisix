@@ -12,7 +12,7 @@ import { callGateway, type GatewayAnswer } from "../harness/cp-upstream.js";
 
 /** What a prepaid tenant out of money is told. */
 const PREPAID_MESSAGE =
-  "Account balance exhausted. Ask an owner or billing member of your organization to top up.";
+  "Insufficient balance. Ask an owner or billing member of your organization to top up.";
 /** How long a change may take to reach the gateway, or a charge the ledger. */
 const WITHIN_MS = 15_000;
 const OWNER_PASSWORD = "topups-e2e-owner-7c1";
@@ -74,7 +74,7 @@ describe("tenants top up and operators decide", () => {
   test("An approved top-up lets the tenant's keys call until the money runs out", async () => {
     const tenant = await world!.tenant("Topup Spend E2E Co");
     const owner = await ownerOf(tenant, "spend");
-    // Prepaid and at 0: nothing calls yet.
+    // Prepaid, at 0 and with no credit limit: nothing calls yet.
     const before = await chat(tenant);
     expect(before.status, before.text).toBe(429);
 
