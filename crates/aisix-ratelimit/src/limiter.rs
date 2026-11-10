@@ -293,6 +293,11 @@ impl Reservation {
     /// and releases the concurrency slot.
     pub async fn commit_tokens(mut self, tokens: u64) {
         self.stop_refresh();
+        // The commit replaces what was owed. Cleared before the await: a
+        // future dropped while the store applies it (a shared store's script
+        // may already have run) must not have `Drop` credit the owed tokens a
+        // second time on top of it.
+        self.owed_tokens = 0;
         self.store.commit(&self.key, tokens, &self.member).await;
         self.committed = true;
     }
@@ -1116,6 +1121,67 @@ mod tests {
         // Released by the commit.
         drop(limiter.pre_commit("k", &l).await.unwrap());
         assert_eq!(limiter.peek("k", &l).await.unwrap().tpm_used, 1_600);
+    }
+
+    /// A store whose commit applies, then never returns: a shared store's
+    /// script that has run while its reply is still in flight.
+    struct StalledCommitStore {
+        inner: LocalStore<TestClock>,
+    }
+
+    #[async_trait]
+    impl RateStore for StalledCommitStore {
+        async fn acquire(
+            &self,
+            key: &str,
+            limits: &RateLimit,
+            member: &str,
+        ) -> Result<(), RateLimitError> {
+            self.inner.acquire(key, limits, member).await
+        }
+
+        async fn commit(&self, key: &str, tokens: u64, member: &str) {
+            self.inner.commit(key, tokens, member).await;
+            std::future::pending::<()>().await;
+        }
+
+        fn release(&self, key: &str, member: &str) {
+            self.inner.release(key, member);
+        }
+
+        fn add_tokens(&self, key: &str, tokens: u64) {
+            self.inner.add_tokens(key, tokens);
+        }
+
+        async fn peek(&self, key: &str, limits: &RateLimit) -> Option<RateLimitStatus> {
+            self.inner.peek(key, limits).await
+        }
+
+        async fn claim_once(&self, key: &str, ttl: Duration) -> bool {
+            self.inner.claim_once(key, ttl).await
+        }
+    }
+
+    /// A commit abandoned mid-flight (the handler future dropped while the
+    /// store applies it) counts the tokens once: the owed credit is not added
+    /// again on top of a commit that may already have landed.
+    #[tokio::test]
+    async fn an_abandoned_commit_does_not_credit_the_owed_tokens_again() {
+        let store = Arc::new(StalledCommitStore {
+            inner: LocalStore::with_clock(TestClock::new(100)),
+        });
+        let limiter = Limiter::with_store(store);
+        let l = limits(None, Some(10_000), Some(1));
+        let mut reservation =
+            MultiReservation::new(vec![limiter.pre_commit("k", &l).await.unwrap()]);
+        reservation.owe_tokens(800);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), reservation.commit_tokens(800))
+                .await
+                .is_err(),
+            "the stalled commit is abandoned"
+        );
+        assert_eq!(limiter.peek("k", &l).await.unwrap().tpm_used, 800);
     }
 
     #[tokio::test]
