@@ -7802,6 +7802,11 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usa
         const OPENAI: &str =
             "data: {\"id\":\"c\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n";
         const OPENAI_FINISH: &str = "data: {\"id\":\"c\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n";
+        // A second choice (`n: 2`), and its own finish: one finished choice
+        // does not cover another that was cut off.
+        const OPENAI_1: &str =
+            "data: {\"id\":\"c\",\"choices\":[{\"index\":1,\"delta\":{\"content\":\"yo\"}}]}\n\n";
+        const OPENAI_FINISH_1: &str = "data: {\"id\":\"c\",\"choices\":[{\"index\":1,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n";
         const GEMINI: &str =
             "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hi\"}]}}]}\n\n";
         const GEMINI_FINISH: &str =
@@ -7809,7 +7814,7 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usa
         const CLAUDE: &str = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"model\":\"c\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n";
         const CLAUDE_FINISH: &str = "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n";
 
-        let cases: Vec<(&str, String, bool)> = vec![
+        let mut cases: Vec<(&str, String, bool)> = vec![
             ("gemini-2.5-flash", GEMINI.into(), true),
             (
                 "gemini-2.5-flash",
@@ -7850,6 +7855,21 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usa
                 false,
             ),
         ];
+        for model in ["meta/llama-3.3-70b-instruct-maas", "mistral-large-2411"] {
+            cases.extend([
+                (model, format!("{OPENAI}{OPENAI_1}{OPENAI_FINISH}"), true),
+                (
+                    model,
+                    format!("{OPENAI}{OPENAI_1}{OPENAI_FINISH}{OPENAI_FINISH_1}"),
+                    false,
+                ),
+                (
+                    model,
+                    format!("{OPENAI}{OPENAI_1}{OPENAI_FINISH}data: [DONE]\n\n"),
+                    false,
+                ),
+            ]);
+        }
         for (model, body, aborted) in cases {
             let server = MockServer::builder().start().await;
             Mock::given(method("POST"))
