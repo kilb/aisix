@@ -19,10 +19,12 @@ use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::Json;
 use chrono::{DateTime, Utc};
+use std::collections::HashMap;
+
 use futures::FutureExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
-use sqlx::{Postgres, QueryBuilder};
+use sqlx::{PgConnection, Postgres, QueryBuilder};
 use uuid::Uuid;
 
 use super::store::{self, CostRevision, DiscountRevision, NewDiscount};
@@ -31,6 +33,7 @@ use crate::auth::{OperatorAuth, OperatorRole};
 use crate::db::DbError;
 use crate::error::{ApiError, Detail};
 use crate::http::ApiJson;
+use crate::resources::Kind;
 use crate::usage::{page, page_limit, query_rejected};
 use crate::AppState;
 
@@ -233,8 +236,14 @@ const STATUSES: [&str; 4] = ["charged", "exempt", "nothing_to_bill", "unpriced"]
 pub struct ChargesQuery {
     event_id: Option<String>,
     status: Option<String>,
+    /// Every status but this one.
+    exclude_status: Option<String>,
     tenant_id: Option<String>,
     api_key_id: Option<String>,
+    /// The charge's `requested_model_id`, matched exactly.
+    model_id: Option<String>,
+    /// The charge's `error_code`; `unknown` matches a charge stored with none.
+    error_code: Option<String>,
     limit: Option<i64>,
     /// Only charges with a smaller `seq`: the `next_before` of the previous
     /// page.
@@ -276,17 +285,143 @@ struct ChargeRow {
     /// What the row cost the platform at its account's cost rate; `None`
     /// when unknown.
     cost_micro_cny: Option<i64>,
+    /// The sum of the charge's re-pricing adjustments; `None` when no run
+    /// corrected it.
+    adjusted_micro_cny: Option<i64>,
+    /// The fields of the usage row read below, `NULL` without one.
+    #[serde(skip)]
+    ev: Option<Value>,
+}
+
+/// The fields of a charge's usage row an operator reads beside it: what
+/// the caller sent and how the attempt ended.
+const CHARGE_EVENT: &str = "jsonb_build_object(\
+    'requested_model', ue.event->'requested_model', \
+    'status_code', ue.event->'status_code', \
+    'error_class', ue.event->'error_class', \
+    'attempt_kind', ue.event->'attempt_kind', \
+    'attempt_index', ue.event->'attempt_index', \
+    'is_final_attempt', ue.event->'is_final_attempt')";
+
+/// A charge as the listing shows it: its row, the model it names, and how
+/// its call ended.
+#[derive(Debug, Serialize)]
+struct ChargeItem {
+    #[serde(flatten)]
+    row: ChargeRow,
+    /// The model's name: its document's, the public model's, or the name the
+    /// call sent; `None` when the call named no model.
+    model_name: Option<String>,
+    /// Whether the model the charge names by id is gone.
+    model_deleted: bool,
+    /// The call's HTTP status; `None` when the row records none.
+    status_code: Option<u16>,
+    /// The failed attempt's error class; `None` for a success.
+    error_class: Option<String>,
+    /// `initial`, `retry` or `fallback`.
+    attempt_kind: String,
+    /// The attempt's 0-based index within its request.
+    attempt_index: u64,
+    is_final_attempt: Option<bool>,
+}
+
+/// A text field of `ev`, `None` when it is missing or empty.
+fn ev_text(ev: &Value, key: &str) -> Option<String> {
+    ev.get(key)
+        .and_then(Value::as_str)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
+}
+
+/// The name a model id is shown by, and whether the model is still there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ModelName {
+    name: String,
+    live: bool,
+}
+
+/// The names of the models `ids` name: a model document's `display_name`,
+/// live or deleted (a tombstone is kept for a day), else the public model's
+/// name, retired or not (a generated routing document's id is its public
+/// model's). A model is live while its document is.
+async fn model_names(
+    conn: &mut PgConnection,
+    ids: &[Uuid],
+) -> Result<HashMap<Uuid, ModelName>, DbError> {
+    let mut names = HashMap::new();
+    if ids.is_empty() {
+        return Ok(names);
+    }
+    let docs: Vec<(Uuid, Option<String>, bool)> = sqlx::query_as(
+        "SELECT id, doc->>'display_name', NOT deleted FROM gw_resources \
+         WHERE kind = $1 AND id = ANY($2)",
+    )
+    .bind(Kind::Models.segment())
+    .bind(ids)
+    .fetch_all(&mut *conn)
+    .await?;
+    let public: Vec<(Uuid, String)> =
+        sqlx::query_as("SELECT id, name FROM public_models WHERE id = ANY($1)")
+            .bind(ids)
+            .fetch_all(&mut *conn)
+            .await?;
+    for (id, name) in public {
+        names.insert(id, ModelName { name, live: false });
+    }
+    for (id, name, live) in docs {
+        let name = name
+            .filter(|n| !n.is_empty())
+            .or_else(|| names.get(&id).map(|m| m.name.clone()))
+            .unwrap_or_default();
+        names.insert(id, ModelName { name, live });
+    }
+    Ok(names)
+}
+
+/// The name and the deleted flag of the model `requested_model_id` names, by
+/// `names`, else by the name the call sent.
+fn shown_model(
+    names: &HashMap<Uuid, ModelName>,
+    requested_model_id: &str,
+    sent: Option<String>,
+) -> (Option<String>, bool) {
+    if requested_model_id.is_empty() {
+        return (sent, false);
+    }
+    let known = Uuid::parse_str(requested_model_id)
+        .ok()
+        .and_then(|id| names.get(&id));
+    match known {
+        Some(m) if !m.name.is_empty() => (Some(m.name.clone()), !m.live),
+        Some(m) => (sent, !m.live),
+        None => (sent, true),
+    }
+}
+
+/// The model ids `raw` holds, parsed, without repeats.
+fn model_ids<'a>(raw: impl Iterator<Item = &'a str>) -> Vec<Uuid> {
+    let mut ids: Vec<Uuid> = raw.filter_map(|r| Uuid::parse_str(r).ok()).collect();
+    ids.sort();
+    ids.dedup();
+    ids
 }
 
 /// `GET /admin/pricing/charges` → `{items: [Charge], next_before}`: the
-/// charge of one `event_id` (zero or one item), or charges by `status`,
-/// `tenant_id` and `api_key_id`, newest first by `seq`, paged as
+/// charge of one `event_id` (zero or one item), or charges by `status` (or
+/// every status but `exclude_status`), `tenant_id`, `api_key_id`, `model_id`
+/// (the charge's `requested_model_id`) and `error_code` (`unknown` for a
+/// charge stored without one), newest first by `seq`, paged as
 /// [`crate::usage::list_events`] is. A charge's tenant and member are the
 /// ones its key belongs to, never what its usage row claims.
 ///
 /// Each charge carries `cost_micro_cny`, what its row cost the platform at
 /// the serving account's cost rate: `null` when the cost is unknown, never
 /// 0. `cost_micro_usd` is a row priced before cost became a rate.
+/// `adjusted_micro_cny` is the sum of its re-pricing adjustments, `null`
+/// when no run corrected it. `model_name` names its model even once the
+/// model is deleted (`model_deleted`); `status_code`, `error_class`,
+/// `attempt_kind`, `attempt_index` and `is_final_attempt` say how its call
+/// ended. These are operators' fields: no tenant view reads them.
 pub async fn list_charges(
     auth: OperatorAuth,
     State(state): State<AppState>,
@@ -299,60 +434,139 @@ pub async fn list_charges(
             return Err(refused("status", "未知的计费状态"));
         }
     }
+    if let Some(status) = q.exclude_status.as_deref() {
+        if !STATUSES.contains(&status) {
+            return Err(refused("exclude_status", "未知的计费状态"));
+        }
+    }
     let limit = page_limit(q.limit);
-    let mut sql = QueryBuilder::<Postgres>::new(
-        "SELECT seq, event_id, tenant_id, api_key_id, user_id, requested_model_id, occurred_at, \
-                price_instant, status, charge_micro_cny, cost_micro_usd, cost_source, \
-                group_id, baseline_revision_id, rate_revision_id, cny_per_usd_e4, \
-                rate_is_model_override, discount_revision_id, discount_bps, \
-                service_tier, requested_service_tier, long_context_above, estimated, exemption, \
-                error_code, lines, warnings, engine_version, priced_at, cost_micro_cny \
-         FROM pricing_charges_cny WHERE true",
-    );
+    let mut sql = QueryBuilder::<Postgres>::new(format!(
+        "SELECT pc.seq, pc.event_id, pc.tenant_id, pc.api_key_id, pc.user_id, \
+                pc.requested_model_id, pc.occurred_at, pc.price_instant, pc.status, \
+                pc.charge_micro_cny, pc.cost_micro_usd, pc.cost_source, pc.group_id, \
+                pc.baseline_revision_id, pc.rate_revision_id, pc.cny_per_usd_e4, \
+                pc.rate_is_model_override, pc.discount_revision_id, pc.discount_bps, \
+                pc.service_tier, pc.requested_service_tier, pc.long_context_above, pc.estimated, \
+                pc.exemption, pc.error_code, pc.lines, pc.warnings, pc.engine_version, \
+                pc.priced_at, pc.cost_micro_cny, \
+                (SELECT SUM(pa.delta_micro_cny)::bigint FROM pricing_adjustments_cny pa \
+                 WHERE pa.event_id = pc.event_id) AS adjusted_micro_cny, \
+                CASE WHEN ue.event_id IS NOT NULL THEN {CHARGE_EVENT} END AS ev \
+         FROM pricing_charges_cny pc LEFT JOIN usage_events ue ON ue.event_id = pc.event_id \
+         WHERE true"
+    ));
     if let Some(before) = q.before {
-        sql.push(" AND seq < ").push_bind(before);
+        sql.push(" AND pc.seq < ").push_bind(before);
     }
     if let Some(event_id) = q.event_id {
-        sql.push(" AND event_id = ").push_bind(event_id);
+        sql.push(" AND pc.event_id = ").push_bind(event_id);
     }
     if let Some(status) = q.status {
-        sql.push(" AND status = ").push_bind(status);
+        sql.push(" AND pc.status = ").push_bind(status);
+    }
+    if let Some(status) = q.exclude_status {
+        sql.push(" AND pc.status <> ").push_bind(status);
     }
     if let Some(tenant_id) = q.tenant_id {
-        sql.push(" AND tenant_id = ").push_bind(tenant_id);
+        sql.push(" AND pc.tenant_id = ").push_bind(tenant_id);
     }
     if let Some(api_key_id) = q.api_key_id {
-        sql.push(" AND api_key_id = ").push_bind(api_key_id);
+        sql.push(" AND pc.api_key_id = ").push_bind(api_key_id);
     }
-    sql.push(" ORDER BY seq DESC LIMIT ").push_bind(limit + 1);
+    if let Some(model_id) = q.model_id {
+        sql.push(" AND pc.requested_model_id = ")
+            .push_bind(model_id);
+    }
+    match q.error_code.as_deref() {
+        None => {}
+        Some("unknown") => {
+            sql.push(" AND pc.error_code IS NULL");
+        }
+        Some(code) => {
+            sql.push(" AND pc.error_code = ")
+                .push_bind(code.to_string());
+        }
+    }
+    sql.push(" ORDER BY pc.seq DESC LIMIT ")
+        .push_bind(limit + 1);
+    let mut conn = state.db.pool().acquire().await.map_err(DbError::from)?;
     let rows: Vec<ChargeRow> = sql
         .build_query_as()
-        .fetch_all(state.db.pool())
+        .fetch_all(&mut *conn)
         .await
         .map_err(DbError::from)?;
-    let (items, next_before) = page(rows, limit, |r| r.seq);
+    let (rows, next_before) = page(rows, limit, |r| r.seq);
+    let names = model_names(
+        &mut conn,
+        &model_ids(rows.iter().map(|r| r.requested_model_id.as_str())),
+    )
+    .await?;
+    let items: Vec<ChargeItem> = rows
+        .into_iter()
+        .map(|row| {
+            let ev = row.ev.clone().unwrap_or(Value::Null);
+            let (model_name, model_deleted) = shown_model(
+                &names,
+                &row.requested_model_id,
+                ev_text(&ev, "requested_model"),
+            );
+            ChargeItem {
+                model_name,
+                model_deleted,
+                status_code: ev
+                    .get("status_code")
+                    .and_then(Value::as_u64)
+                    .and_then(|c| u16::try_from(c).ok())
+                    .filter(|c| *c > 0),
+                error_class: ev_text(&ev, "error_class"),
+                attempt_kind: ev_text(&ev, "attempt_kind").unwrap_or_else(|| "initial".into()),
+                attempt_index: ev.get("attempt_index").and_then(Value::as_u64).unwrap_or(0),
+                is_final_attempt: ev.get("is_final_attempt").and_then(Value::as_bool),
+                row,
+            }
+        })
+        .collect();
     Ok(Json(json!({ "items": items, "next_before": next_before })))
 }
 
 // ---- status ----
 
+/// `{total, by_code}` of `(code, count)` pairs.
+fn counted(by_code: Vec<(String, i64)>) -> Value {
+    let total: i64 = by_code.iter().map(|(_, n)| n).sum();
+    let by_code: Map<String, Value> = by_code
+        .into_iter()
+        .map(|(code, n)| (code, json!(n)))
+        .collect();
+    json!({"total": total, "by_code": by_code})
+}
+
 /// `GET /admin/pricing/status` → `{pricing_version, invalid_revisions:
-/// [{table, revision_id, reason}], unpriced_last_24h: {total, by_code}}`:
-/// the alert surface. `invalid_revisions` are the revisions the current
-/// price book cannot use (`table` is `baseline`, `rate`, `cost` or
-/// `discount`); their
-/// rows are stored unpriced. `by_code` counts the charges stored unpriced in
-/// the last 24 hours (by when they were priced) under each reason, the
-/// control plane's own (`unknown_api_key`, `tenant_mismatch`,
-/// `undecodable_usage`) as well as the engine's. `pricing_version` is null
-/// when the stored version is missing or malformed.
+/// [{table, revision_id, reason}], unpriced_last_24h: {total, by_code},
+/// unpriced_details: {items, truncated}, corrected_last_24h: {total,
+/// by_code}}`: the
+/// alert surface. `invalid_revisions` are the revisions the current price
+/// book cannot use (`table` is `baseline`, `rate`, `cost` or `discount`);
+/// their rows are stored unpriced. `by_code` counts the charges stored
+/// unpriced in the last 24 hours (by when they were priced) under each
+/// reason, the control plane's own (`unknown_api_key`, `tenant_mismatch`,
+/// `undecodable_usage`) as well as the engine's. A charge an applied
+/// re-pricing run has corrected since is counted under `corrected_last_24h`
+/// instead. `unpriced_details` breaks the uncorrected ones down by reason
+/// and model,
+/// with the served tier for `missing_tier_price` and the group for
+/// `missing_rate`: `{code, count, latest_at, model: {id, name, deleted},
+/// service_tier, group: {id, name, display_name}}`, at most
+/// [`store::MAX_UNPRICED_DETAILS`] of them (`truncated` when there were
+/// more). `pricing_version` is null when the stored version is missing
+/// or malformed.
 pub async fn status(
     auth: OperatorAuth,
     State(state): State<AppState>,
 ) -> Result<Json<Value>, ApiError> {
     auth.require(OperatorRole::Viewer)?;
     let prices = state.prices.clone();
-    let (version, invalid, by_code) = state
+    let (version, invalid, by_code, corrected, details, truncated) = state
         .db
         .tx(move |conn| {
             async move {
@@ -370,20 +584,61 @@ pub async fn status(
                     })
                     .collect();
                 let by_code = store::unpriced_by_code(&mut *conn).await?;
-                Ok::<_, DbError>((version, invalid, by_code))
+                let corrected = store::corrected_by_code(&mut *conn).await?;
+                let (rows, truncated) = store::unpriced_details(&mut *conn).await?;
+                let names = model_names(
+                    &mut *conn,
+                    &model_ids(rows.iter().map(|r| r.requested_model_id.as_str())),
+                )
+                .await?;
+                let mut group_ids: Vec<Uuid> = rows.iter().filter_map(|r| r.group_id).collect();
+                group_ids.sort();
+                group_ids.dedup();
+                let groups: HashMap<Uuid, (String, String)> =
+                    sqlx::query_as::<_, (Uuid, String, String)>(
+                        "SELECT id, name, display_name FROM provider_groups WHERE id = ANY($1)",
+                    )
+                    .bind(&group_ids)
+                    .fetch_all(&mut *conn)
+                    .await?
+                    .into_iter()
+                    .map(|(id, name, display)| (id, (name, display)))
+                    .collect();
+                let details: Vec<Value> = rows
+                    .into_iter()
+                    .map(|r| {
+                        let (name, deleted) =
+                            shown_model(&names, &r.requested_model_id, r.sent_model.clone());
+                        json!({
+                            "code": r.code,
+                            "count": r.count,
+                            "latest_at": r.latest_at,
+                            "model": {
+                                "id": (!r.requested_model_id.is_empty())
+                                    .then_some(r.requested_model_id.as_str()),
+                                "name": name,
+                                "deleted": deleted,
+                            },
+                            "service_tier": r.service_tier,
+                            "group": r.group_id.map(|id| {
+                                let (name, display) =
+                                    groups.get(&id).cloned().unwrap_or_default();
+                                json!({"id": id, "name": name, "display_name": display})
+                            }),
+                        })
+                    })
+                    .collect();
+                Ok::<_, DbError>((version, invalid, by_code, corrected, details, truncated))
             }
             .boxed()
         })
         .await?;
-    let total: i64 = by_code.iter().map(|(_, n)| n).sum();
-    let by_code: Map<String, Value> = by_code
-        .into_iter()
-        .map(|(code, n)| (code, json!(n)))
-        .collect();
     Ok(Json(json!({
         "pricing_version": version,
         "invalid_revisions": invalid,
-        "unpriced_last_24h": {"total": total, "by_code": by_code},
+        "unpriced_last_24h": counted(by_code),
+        "unpriced_details": {"items": details, "truncated": truncated},
+        "corrected_last_24h": counted(corrected),
     })))
 }
 

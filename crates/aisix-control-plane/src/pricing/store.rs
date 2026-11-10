@@ -195,19 +195,98 @@ pub async fn pricing_version(conn: &mut PgConnection) -> Result<Option<i64>, DbE
     .flatten())
 }
 
+/// The charges stored unpriced in the last 24 hours, by when they were
+/// priced, over the charge `pc`.
+const UNPRICED_LAST_DAY: &str =
+    "pc.status = 'unpriced' AND pc.priced_at >= now() - interval '24 hours'";
+
+/// Whether an applied re-pricing run has corrected the charge `pc`: it has
+/// an adjustment, which only an apply writes, and for a charge stored
+/// unpriced only when the run charged it. The charge itself still reads
+/// `unpriced`: it is written once.
+const CORRECTED: &str =
+    "EXISTS (SELECT 1 FROM pricing_adjustments_cny pa WHERE pa.event_id = pc.event_id)";
+
 /// The charges stored unpriced in the last 24 hours (by when they were
-/// priced), counted under each reason: the control plane's own
-/// (`unknown_api_key`, `tenant_mismatch`, `undecodable_usage`) as well as
-/// the engine's, and `unknown` for a charge with none. Ordered by reason.
-/// `/admin/pricing/status` and the reconciliation both report this.
+/// priced) that no re-pricing run has corrected since, counted under each
+/// reason: the control plane's own (`unknown_api_key`, `tenant_mismatch`,
+/// `undecodable_usage`) as well as the engine's, and `unknown` for a charge
+/// with none. Ordered by reason. `/admin/pricing/status` and the
+/// reconciliation both report this; a corrected one is counted by
+/// [`corrected_by_code`] instead.
 pub async fn unpriced_by_code(conn: &mut PgConnection) -> Result<Vec<(String, i64)>, DbError> {
-    Ok(sqlx::query_as(
-        "SELECT COALESCE(error_code, 'unknown'), count(*)::bigint FROM pricing_charges_cny \
-         WHERE status = 'unpriced' AND priced_at >= now() - interval '24 hours' \
-         GROUP BY 1 ORDER BY 1",
-    )
+    Ok(sqlx::query_as(&format!(
+        "SELECT COALESCE(pc.error_code, 'unknown'), count(*)::bigint FROM pricing_charges_cny pc \
+         WHERE {UNPRICED_LAST_DAY} AND NOT {CORRECTED} GROUP BY 1 ORDER BY 1"
+    ))
     .fetch_all(conn)
     .await?)
+}
+
+/// The charges [`unpriced_by_code`] leaves out because an applied re-pricing
+/// run has corrected them, counted under the reason they were stored
+/// unpriced for. Ordered by reason.
+pub async fn corrected_by_code(conn: &mut PgConnection) -> Result<Vec<(String, i64)>, DbError> {
+    Ok(sqlx::query_as(&format!(
+        "SELECT COALESCE(pc.error_code, 'unknown'), count(*)::bigint FROM pricing_charges_cny pc \
+         WHERE {UNPRICED_LAST_DAY} AND {CORRECTED} GROUP BY 1 ORDER BY 1"
+    ))
+    .fetch_all(conn)
+    .await?)
+}
+
+/// One kind of charge [`unpriced_by_code`] counts: its reason, the model the
+/// call addressed, and the served tier or the group when the reason is about
+/// one.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct UnpricedDetail {
+    /// The reason, as [`unpriced_by_code`] names it.
+    pub code: String,
+    /// The charge's `requested_model_id`, `""` when the call named none.
+    pub requested_model_id: String,
+    /// For `missing_tier_price`: the tier the engine looked for, the one the
+    /// upstream reported (`batch` for a batch row), `""` when it reported
+    /// none. `None` for every other reason.
+    pub service_tier: Option<String>,
+    /// For `missing_rate`: the group the charge is filed under, whose rate is
+    /// missing. `None` for every other reason.
+    pub group_id: Option<Uuid>,
+    pub count: i64,
+    /// When the latest of these calls occurred.
+    pub latest_at: DateTime<Utc>,
+    /// The model name a call sent, for a model the control plane no longer
+    /// knows by its id.
+    pub sent_model: Option<String>,
+}
+
+/// The most kinds [`unpriced_details`] lists.
+pub const MAX_UNPRICED_DETAILS: i64 = 200;
+
+/// What [`unpriced_by_code`] counts, by reason, model, and the tier or group
+/// the reason is about, with the latest occurrence of each; at most
+/// [`MAX_UNPRICED_DETAILS`] of them, by reason and then the most frequent
+/// first, and whether there were more.
+pub async fn unpriced_details(
+    conn: &mut PgConnection,
+) -> Result<(Vec<UnpricedDetail>, bool), DbError> {
+    let mut rows: Vec<UnpricedDetail> = sqlx::query_as(&format!(
+        "SELECT COALESCE(pc.error_code, 'unknown') AS code, pc.requested_model_id, \
+           CASE WHEN pc.error_code = 'missing_tier_price' THEN \
+             CASE WHEN ue.event->'is_batch' = 'true'::jsonb THEN 'batch' \
+                  ELSE COALESCE(ue.event->>'service_tier', '') END END AS service_tier, \
+           CASE WHEN pc.error_code = 'missing_rate' THEN pc.group_id END AS group_id, \
+           count(*)::bigint AS count, max(pc.occurred_at) AS latest_at, \
+           max(NULLIF(ue.event->>'requested_model', '')) AS sent_model \
+         FROM pricing_charges_cny pc LEFT JOIN usage_events ue ON ue.event_id = pc.event_id \
+         WHERE {UNPRICED_LAST_DAY} AND NOT {CORRECTED} \
+         GROUP BY 1, 2, 3, 4 ORDER BY 1, 5 DESC, 6 DESC LIMIT $1"
+    ))
+    .bind(MAX_UNPRICED_DETAILS + 1)
+    .fetch_all(conn)
+    .await?;
+    let more = rows.len() as i64 > MAX_UNPRICED_DETAILS;
+    rows.truncate(MAX_UNPRICED_DETAILS as usize);
+    Ok((rows, more))
 }
 
 /// The table an invalid revision is in, as the alert names it.
