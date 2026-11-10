@@ -393,3 +393,86 @@ test("含长上下文价的条目在价格库与同步预览中标出，基准�
   await expect(done).toContainText("含长上下文价");
   await expect(done).not.toContainText("当前基准价缺少长上下文档");
 });
+
+test("多个匹配的模型选好来源后价格库被替换：预览按新价格显示所选来源及其未计入项，再次确认写入新价格", async ({ page }) => {
+  const suffix = randomUUID().slice(0, 6);
+  const group = await stack.admin.createGroup(`grp-moved-${suffix}`, `换价分组 ${suffix}`, "2");
+  // Two providers price `command-r-plus`, and neither is the account's own.
+  const relay = await account(`relay-${suffix}`, [group.name as string]);
+  const modelId = await publicModel("command-r-plus", relay);
+  const cohere = snapshot("cohere", "command-r-plus");
+
+  await login(page);
+  await uploadDataset(page);
+  await section(page, "价格库");
+  const sync = page.getByRole("region", { name: "同步基准价" });
+  const row = previewRow(page, "command-r-plus");
+  await expect(row).toContainText("多个匹配");
+  await row.getByLabel("选择价格来源 command-r-plus").selectOption({ value: "cohere/command-r-plus" });
+  await expect(row).toContainText(`输入 $${cohere.input} · 输出 $${cohere.output}`);
+
+  // Meanwhile, from another tab, the library is replaced. In the new file the
+  // chosen entry's input price moved, it prices web searches ($10 per
+  // 1,000), and it carries a price the gateway does not meter.
+  const original = readFileSync(SNAPSHOT, "utf8");
+  const before = `{"equals":"command-r-plus-08-2024"}]},"prices":{"input_mtok":${cohere.input},"output_mtok":${cohere.output}}}`;
+  expect(original.split(before)).toHaveLength(2);
+  const moved = original.replace(
+    before,
+    `{"equals":"command-r-plus-08-2024"}]},"prices":{"input_mtok":2.75,"output_mtok":${cohere.output},"web_searches_kcount":10,"storage_searches_kcount":2.5}}`,
+  );
+  const other = await page.context().newPage();
+  await other.goto(stack.previewUrl);
+  await expect(other.locator("[data-tab]").first()).toBeVisible();
+  await other.locator('[data-tab="pricing"]').click();
+  await section(other, "导入审核");
+  await other.getByLabel("数据集文件").setInputFiles({ name: "moved.json", mimeType: "application/json", buffer: Buffer.from(moved) });
+  await other.getByLabel("数据集版本").fill(`${REVISION}-moved`);
+  await other.getByRole("button", { name: "上传", exact: true }).click();
+  await expect(other.getByRole("table", { name: "提议" })).toBeVisible();
+  await other.close();
+
+  // The confirmation was given against the old preview: refused, and the
+  // preview is read again.
+  await sync.getByRole("checkbox", { name: "已对照官方价格页核对" }).check();
+  await sync.getByRole("button", { name: /^同步 \d+ 个模型$/ }).click();
+  await expect(sync.getByRole("alert")).toContainText("同步失败");
+  // The source stays chosen, shown as the library now prices it: the new
+  // input, the search per thousand, what it leaves off, and its page.
+  await expect(row).toHaveAttribute("data-shown", "create");
+  await expect(row).toContainText("输入 $2.75");
+  await expect(row).toContainText("联网搜索 $10 / 千次");
+  await expect(row).not.toContainText("$10000");
+  await expect(row).toContainText("未计入：文件搜索存储（数据集字段 storage_searches_kcount，网关不计量）");
+  await expect(row.getByRole("link", { name: "价格页面" })).toHaveAttribute("href", cohere.page);
+
+  // Confirmed again, it writes what is shown.
+  await expect(sync.getByRole("checkbox", { name: "已对照官方价格页核对" })).not.toBeChecked();
+  const writes = await page
+    .getByRole("table", { name: "同步预览" })
+    .locator('tr[data-shown="create"], tr[data-shown="update"]')
+    .count();
+  await sync.getByRole("checkbox", { name: "已对照官方价格页核对" }).check();
+  await sync.getByRole("button", { name: `同步 ${writes} 个模型`, exact: true }).click();
+  await expect(page.locator(".toast").filter({ hasText: `已同步 ${writes} 个模型` }).first()).toBeVisible();
+  await expect(row).toHaveAttribute("data-shown", "same");
+  const stored = (await stack.admin.get("/admin/pricing/baselines")) as Json;
+  const listed = stored.items.find((i: Json) => i.model_id === modelId);
+  // $10 per 1,000 searches is 10000 per million, the unit every rate is stored in.
+  expect(listed.current.card).toEqual({ default: { base: { input: "2.75", output: cohere.output, web_search: "10000" } } });
+
+  // 基准价's own view of the model reads the search per thousand too.
+  await section(page, "基准价");
+  await page
+    .getByRole("table", { name: "基准价" })
+    .getByRole("row")
+    .filter({ has: page.getByRole("button", { name: "command-r-plus", exact: true }) })
+    .getByRole("button", { name: "command-r-plus", exact: true })
+    .click();
+  const panel = page.getByRole("dialog", { name: "command-r-plus 的基准价" });
+  await expect(panel.getByRole("region", { name: "现行基准价" })).toContainText("联网搜索 $10 / 千次");
+  const one = panel.getByRole("region", { name: "从价格库同步" });
+  await expect(one).toContainText("一致");
+  await expect(one).toContainText("联网搜索 $10 / 千次");
+  await expect(panel).not.toContainText("$10000");
+});
