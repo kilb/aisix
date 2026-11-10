@@ -168,6 +168,8 @@ export function Models({ canEdit }: TabProps) {
   const [deleting, setDeleting] = useState<{ id: string; holders: Tenant[] | string | null } | null>(null);
   // The public model id whose `停用` is in flight.
   const [retiring, setRetiring] = useState<string | null>(null);
+  // The direct model row whose `移除该目标` is in flight.
+  const [removingTarget, setRemovingTarget] = useState<string | null>(null);
   // A refused write: a manual delete, a retire, or a save.
   const [deleteFailure, setDeleteFailure] = useState<{ name: string; error: ApiError } | null>(null);
   const [busy, setBusy] = useState(false);
@@ -304,6 +306,36 @@ export function Models({ canEdit }: TabProps) {
       setDeleteFailure({ name: named ?? id, error });
     } finally {
       setRetiring(null);
+    }
+  }
+
+  /**
+   * Takes one account out of a public model's routing: the account's mapping
+   * goes, which removes its direct document and rewrites the routing document
+   * without that target. The public model and every other account are left as
+   * they are — retiring the name is the routing row's own action.
+   */
+  async function removeTarget(m: Model) {
+    const source = modelSource(m);
+    const account = m.doc.provider_key_id;
+    if (source.kind !== "public" || !source.generated || !account) return;
+    setNote(null);
+    setDeleteFailure(null);
+    setRemovingTarget(m.id);
+    try {
+      await channelModels.remove(account, source.id);
+      setNote({
+        kind: "ok",
+        text: `已移除「${catalog.accounts.get(account)?.doc.display_name ?? account}」对「${
+          publicById?.get(source.id)?.name ?? source.id
+        }」的服务，该目标已不在路由里。`,
+      });
+      refresh();
+    } catch (e) {
+      const error = e instanceof ApiError ? e : new ApiError(String(e), 0, "client", [], [], null);
+      setDeleteFailure({ name: nameOf(m), error });
+    } finally {
+      setRemovingTarget(null);
     }
   }
 
@@ -519,7 +551,24 @@ export function Models({ canEdit }: TabProps) {
                             >
                               {canEdit && !src.generated ? "编辑" : "查看"}
                             </Button>
-                            {canEdit && from && (
+                            {/* A direct row is one account's mapping, so the one
+                                removal that fits it takes that account out of the
+                                routing model and leaves the name alone. Retiring the
+                                public model is the routing row's own action. */}
+                            {canEdit && src.generated && m.doc.provider_key_id && (
+                              <TwoStep
+                                label="移除该目标"
+                                size="sm"
+                                busy={removingTarget === m.id}
+                                busyLabel="移除中…"
+                                warning={`移除后「${
+                                  catalog.accounts.get(m.doc.provider_key_id)?.doc.display_name ??
+                                  m.doc.provider_key_id
+                                }」不再服务「${publicById?.get(src.id)?.name ?? src.id}」：本账号的映射被删除，它的直连文档随之移除。公共模型和其他账号不受影响。`}
+                                onConfirm={() => void removeTarget(m)}
+                              />
+                            )}
+                            {canEdit && !src.generated && from && (
                               <TwoStep
                                 label="停用"
                                 size="sm"

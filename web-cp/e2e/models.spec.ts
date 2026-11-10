@@ -723,6 +723,10 @@ test("公共模型生成的模型在这里只能停用：停用后两张文档�
   await expect(routeRow.getByRole("button", { name: "编辑", exact: true })).toBeVisible();
   await expect(directRow.getByRole("button", { name: "查看", exact: true })).toBeVisible();
   await expect(directRow).toContainText("账号的「模型」里改");
+  // The per-account row's one removal takes that account out of the routing
+  // model; retiring the public name stays the routing row's own action.
+  await expect(directRow.getByRole("button", { name: "移除该目标" })).toBeVisible();
+  await expect(directRow.getByRole("button", { name: "停用", exact: true })).toHaveCount(0);
   // No row leads anywhere else for the public model: the page completes it.
   await expect(page.getByRole("button", { name: "去公共模型" })).toHaveCount(0);
 
