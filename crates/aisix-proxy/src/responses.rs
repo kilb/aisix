@@ -1042,9 +1042,6 @@ async fn dispatch(
             &client.source_ip,
         )?;
         if let Some(hit) = gate.lookup().await {
-            if let Some(r) = reservation.take() {
-                r.commit_tokens(0).await;
-            }
             let cache = crate::response_cache::CacheTelemetry::hit(&hit);
             // The cache answered for the entry the caller addressed: set the
             // target attribution before the output chain below can refuse it,
@@ -1078,6 +1075,13 @@ async fn dispatch(
                 monitor_hits_out,
             )
             .await?;
+            // No upstream call, so nothing was consumed. Committed only once
+            // the output chain has let the hit through: the concurrency slot
+            // stays taken while it reads, and a blocked hit releases it as
+            // the reservation drops.
+            if let Some(r) = reservation.take() {
+                r.commit_tokens(0).await;
+            }
             let served = guarded.body;
             // A hit served content to the caller, so it is logged like a
             // fresh response — otherwise a content-capturing exporter's
