@@ -397,22 +397,25 @@ fn message_pair(m: &ChatMessage) -> (String, String) {
     // `tool_calls` MUST NOT share a fingerprint.
     //
     // Each representation is type-prefixed (`t:` plain text, `b:`
-    // canonical content blocks, `j:` decorated) so a plain message
-    // whose CONTENT happens to equal another form's serialization can
-    // never collide with it.
+    // canonical content blocks, `n:` null content, `j:` decorated) so a
+    // plain message whose CONTENT happens to equal another form's
+    // serialization can never collide with it. The decorated form keeps
+    // the content's own prefix inside it: a named message whose string
+    // content spells a block array is a different request from one that
+    // sends the array.
+    let content_kind = match (&m.content_blocks, &m.content) {
+        (Some(_), _) => "b:",
+        (None, Some(_)) => "t:",
+        (None, None) => "n:",
+    };
     if m.name.is_none() && m.tool_call_id.is_none() && m.extra.is_empty() {
-        let prefix = if m.content_blocks.is_some() {
-            "b:"
-        } else {
-            "t:"
-        };
         return (
             role_str(m.role).to_string(),
-            format!("{prefix}{content_repr}"),
+            format!("{content_kind}{content_repr}"),
         );
     }
     let decorated = serde_json::json!({
-        "content": content_repr,
+        "content": format!("{content_kind}{content_repr}"),
         "name": m.name,
         "tool_call_id": m.tool_call_id,
         "extra": canonicalise(&serde_json::Value::Object(m.extra.clone())),
@@ -1025,6 +1028,40 @@ mod tests {
             CacheKey::from_request(&decorated).fingerprint(),
             CacheKey::from_request(&plain).fingerprint(),
         );
+    }
+
+    /// A decorated message keeps its content's representation: a named user
+    /// message whose string content spells a block array, the same message
+    /// sending that block array, and the same message with `null` content
+    /// are three different requests upstream and three different keys.
+    #[test]
+    fn decorated_messages_keep_their_content_kind() {
+        let blocks = vec![serde_json::json!({"type": "text", "text": "hi"})];
+        // Exactly the canonical (sorted-key) serialization of `blocks`.
+        let spelled = r#"[{"text":"hi","type":"text"}]"#.to_string();
+        let named = |mut m: ChatMessage| {
+            m.name = Some("alice".into());
+            req("m", vec![m], None)
+        };
+        let as_string = named(ChatMessage::user(spelled));
+        let mut as_blocks_msg = ChatMessage::user("");
+        as_blocks_msg.content = None;
+        as_blocks_msg.content_blocks = Some(blocks);
+        let as_blocks = named(as_blocks_msg);
+        let mut null_msg = ChatMessage::user("");
+        null_msg.content = None;
+        let as_null = named(null_msg);
+        let empty = named(ChatMessage::user(""));
+        let fps = [&as_string, &as_blocks, &as_null, &empty]
+            .map(|r| CacheKey::from_request(r).fingerprint());
+        for i in 0..fps.len() {
+            for j in i + 1..fps.len() {
+                assert_ne!(fps[i], fps[j], "forms {i} and {j} share a key");
+            }
+        }
+        // Each form still hits its own entry.
+        assert_eq!(CacheKey::from_request(&as_string).fingerprint(), fps[0]);
+        assert_eq!(CacheKey::from_request(&as_blocks).fingerprint(), fps[1]);
     }
 
     #[test]
