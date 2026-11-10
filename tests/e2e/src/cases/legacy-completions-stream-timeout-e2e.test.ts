@@ -173,6 +173,8 @@ describe("legacy completions stream timeout", () => {
   let malformedDone: OpenAiUpstream | undefined;
   let doneTrailer: OpenAiUpstream | undefined;
   let malformedWithDone: OpenAiUpstream | undefined;
+  let inBandError: OpenAiUpstream | undefined;
+  let inBandModelId = "";
   let slowModelId = "";
   let midModelId = "";
   let truncatedModelId = "";
@@ -226,6 +228,25 @@ describe("legacy completions stream timeout", () => {
       ],
     });
 
+    // How vLLM's completions server ends a generation that failed after the
+    // head went out: the error envelope as a data event, then `[DONE]`
+    // (`vllm/entrypoints/openai/completion/serving.py`, the stream
+    // generator's `except` arms; the envelope is its `ErrorResponse`).
+    inBandError = await startOpenAiUpstream({
+      rawSseChunks: [
+        `data: ${chunk("written-before-the-error")}\n\n`,
+        `data: ${JSON.stringify({
+          error: {
+            message: "engine failed mid-generation",
+            type: "InternalServerError",
+            param: null,
+            code: 500,
+          },
+        })}\n\n`,
+        "data: [DONE]\n\n",
+      ],
+    });
+
     app = await spawnApp();
     const seed = new SeedClient(etcd, app.etcdPrefix);
     const providerKey = async (name: string, upstream: OpenAiUpstream) =>
@@ -253,6 +274,7 @@ describe("legacy completions stream timeout", () => {
       "legacy-done-with-trailer",
       doneTrailer,
     );
+    const inBandPk = await providerKey("legacy-in-band-error", inBandError);
 
     const slowModel = await seed.createModel({
       display_name: "legacy-timeout-slow",
@@ -318,6 +340,15 @@ describe("legacy completions stream timeout", () => {
       retries: 0,
       cooldown: { enabled: true, default_seconds: 60 },
     });
+    const inBandModel = await seed.createModel({
+      display_name: "legacy-in-band-error",
+      provider: "openai",
+      model_name: "gpt-3.5-turbo-instruct",
+      provider_key_id: inBandPk,
+      retries: 0,
+      cooldown: { enabled: true, default_seconds: 60 },
+    });
+    inBandModelId = inBandModel.id;
 
     // The caller key is the final revision. Authenticated model listing is a
     // propagation barrier without exercising the timeout behavior under test.
@@ -331,6 +362,7 @@ describe("legacy completions stream timeout", () => {
         "legacy-malformed-before-done",
         "legacy-malformed-with-done",
         "legacy-done-with-trailer",
+        "legacy-in-band-error",
       ],
     });
     await waitConfigPropagation(async () => {
@@ -350,7 +382,8 @@ describe("legacy completions stream timeout", () => {
         ids.has("legacy-malformed") &&
         ids.has("legacy-malformed-before-done") &&
         ids.has("legacy-malformed-with-done") &&
-        ids.has("legacy-done-with-trailer")
+        ids.has("legacy-done-with-trailer") &&
+        ids.has("legacy-in-band-error")
       );
     });
   });
@@ -365,6 +398,7 @@ describe("legacy completions stream timeout", () => {
       malformedDone?.close(),
       doneTrailer?.close(),
       malformedWithDone?.close(),
+      inBandError?.close(),
     ]);
   });
 
@@ -503,6 +537,32 @@ describe("legacy completions stream timeout", () => {
         (await outputTokenCounter("legacy-malformed-before-done")) >
         outputBaseline,
     );
+  });
+
+  test("an in-band error before DONE is recorded as the upstream's failure, not a success", async (ctx) => {
+    if (!etcdReachable || !app || !inBandError) {
+      ctx.skip();
+      return;
+    }
+    const usageBaseline = await usage5xxCounter();
+    const successBaseline = await usage2xxCounter();
+
+    const response = await completion("legacy-in-band-error");
+
+    expect(response.status).toBe(200);
+    const body = await readCommittedStream(response);
+    // The caller gets what the upstream sent: its text, its error, its [DONE].
+    expect(body).toContain("written-before-the-error");
+    expect(body).toContain("engine failed mid-generation");
+    expect(body).toContain("[DONE]");
+    // The request failed upstream: a 5xx row, and the target cools down.
+    await waitForTimeoutObservability(
+      inBandModelId,
+      "legacy-in-band-error",
+      usageBaseline,
+      "upstream_server_error",
+    );
+    expect(await usage2xxCounter()).toBe(successBaseline);
   });
 
   test("malformed SSE written together with DONE reaches the caller the same way", async (ctx) => {
