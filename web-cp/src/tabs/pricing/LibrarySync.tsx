@@ -364,7 +364,11 @@ export function LibrarySync({ canEdit, generation }: { canEdit: boolean; generat
                       <EntryCell
                         item={item}
                         chosen={chosen[item.model_id]}
-                        onChoose={(c) => setChosenKeys((all) => ({ ...all, [item.model_id]: c && keyOf(c) }))}
+                        onChoose={(c) => {
+                          setChosenKeys((all) => ({ ...all, [item.model_id]: c && keyOf(c) }));
+                          // A tick is a claim about the sources on screen: another source is not checked.
+                          setAttested(false);
+                        }}
                       />
                       {item.state === "ambiguous" && item.binding && !chosen[item.model_id] && (
                         <span className="cell-note">
@@ -489,7 +493,15 @@ export function LibrarySyncOne({
         <>
           <p>
             <span className="tag">{syncStateText(state ?? item.state)}</span>{" "}
-            <EntryCell item={item} chosen={chosen} onChoose={(c) => setChosenKey(c && keyOf(c))} />
+            <EntryCell
+              item={item}
+              chosen={chosen}
+              onChoose={(c) => {
+                setChosenKey(c && keyOf(c));
+                // A tick is a claim about the source on screen: another source is not checked.
+                setAttested(false);
+              }}
+            />
           </p>
           {item.binding && (
             <p className="library-chosen">

@@ -352,6 +352,61 @@ test("多个匹配的模型选好价格来源后同步：写入基准价、记�
   await expect(again).not.toContainText("已选");
 });
 
+test("勾选核对后改选价格来源：核对声明随之取消，同步不可用，单个模型的同步也一样", async ({ page }) => {
+  const suffix = randomUUID().slice(0, 6);
+  const group = await stack.admin.createGroup(`grp-reattest-${suffix}`, `重新核对分组 ${suffix}`, "2");
+  // Two providers price each of these, and neither is the account's own.
+  const relay = await account(`relay-${suffix}`, [group.name as string]);
+  const ids = [await publicModel("phi-4-reasoning-plus", relay), await publicModel("phi-4-multimodal-instruct", relay)];
+
+  await login(page);
+  await uploadDataset(page);
+  await section(page, "价格库");
+  const sync = page.getByRole("region", { name: "同步基准价" });
+  const row = previewRow(page, "phi-4-reasoning-plus");
+  await expect(row).toContainText("多个匹配");
+  const pick = row.getByLabel("选择价格来源 phi-4-reasoning-plus");
+  await pick.selectOption({ value: "azure/phi-4-reasoning-plus" });
+  const azure = snapshot("azure", "phi-4-reasoning-plus");
+  await expect(row).toContainText(`输入 $${azure.input} · 输出 $${azure.output}`);
+  const attest = sync.getByRole("checkbox", { name: "已对照官方价格页核对" });
+  const all = sync.getByRole("button", { name: /^同步 \d+ 个模型$/ });
+  await attest.check();
+  await expect(all).toBeEnabled();
+
+  // The tick was given for the source then shown; another one is not checked.
+  await pick.selectOption({ value: "openrouter/phi-4-reasoning-plus" });
+  const openrouter = snapshot("openrouter", "phi-4-reasoning-plus");
+  await expect(row).toContainText(`输入 $${openrouter.input} · 输出 $${openrouter.output}`);
+  await expect(attest).not.toBeChecked();
+  await expect(all).toBeDisabled();
+
+  // The same in one model's own 从价格库同步.
+  await section(page, "基准价");
+  await page
+    .getByRole("table", { name: "基准价" })
+    .getByRole("row")
+    .filter({ has: page.getByRole("button", { name: "phi-4-multimodal-instruct", exact: true }) })
+    .getByRole("button", { name: "phi-4-multimodal-instruct", exact: true })
+    .click();
+  const one = page.getByRole("dialog", { name: "phi-4-multimodal-instruct 的基准价" }).getByRole("region", { name: "从价格库同步" });
+  const pickOne = one.getByLabel("选择价格来源 phi-4-multimodal-instruct");
+  await pickOne.selectOption({ value: "azure/phi-4-multimodal-instruct" });
+  const attestOne = one.getByRole("checkbox", { name: "已对照官方价格页核对" });
+  const button = one.getByRole("button", { name: "从价格库同步", exact: true });
+  await attestOne.check();
+  await expect(button).toBeEnabled();
+  await pickOne.selectOption({ value: "openrouter/phi-4-multimodal-instruct" });
+  const other = snapshot("openrouter", "phi-4-multimodal-instruct");
+  await expect(one).toContainText(`输入 $${other.input} · 输出 $${other.output}`);
+  await expect(attestOne).not.toBeChecked();
+  await expect(button).toBeDisabled();
+
+  // Nothing was written for either.
+  const stored = (await stack.admin.get("/admin/pricing/baselines")) as Json;
+  for (const id of ids) expect((stored.items as Json[]).find((i) => i.model_id === id).current).toBeNull();
+});
+
 test("含长上下文价的条目在价格库与同步预览中标出，基准价缺少这一段时预览给出提示", async ({ page }) => {
   // One provider prices `claude-sonnet-4-5`: a base rate and a band above
   // 200K input tokens.
