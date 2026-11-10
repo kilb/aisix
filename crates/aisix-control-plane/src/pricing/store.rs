@@ -264,8 +264,11 @@ pub const MAX_UNPRICED_DETAILS: i64 = 200;
 
 /// What [`unpriced_by_code`] counts, by reason, model, and the tier or group
 /// the reason is about, with the latest occurrence of each; at most
-/// [`MAX_UNPRICED_DETAILS`] of them, by reason and then the most frequent
-/// first, and whether there were more.
+/// [`MAX_UNPRICED_DETAILS`] of them, the most frequent first (then the
+/// latest, then by reason and model), and whether there were more. Ordered
+/// by count rather than by reason, so a reason with many rare kinds never
+/// pushes a frequent one of another reason off the list; what is left off
+/// is counted, per reason, by [`unpriced_by_code`].
 pub async fn unpriced_details(
     conn: &mut PgConnection,
 ) -> Result<(Vec<UnpricedDetail>, bool), DbError> {
@@ -279,7 +282,7 @@ pub async fn unpriced_details(
            max(NULLIF(ue.event->>'requested_model', '')) AS sent_model \
          FROM pricing_charges_cny pc LEFT JOIN usage_events ue ON ue.event_id = pc.event_id \
          WHERE {UNPRICED_LAST_DAY} AND NOT {CORRECTED} \
-         GROUP BY 1, 2, 3, 4 ORDER BY 1, 5 DESC, 6 DESC LIMIT $1"
+         GROUP BY 1, 2, 3, 4 ORDER BY 5 DESC, 6 DESC, 1, 2, 3, 4 LIMIT $1"
     ))
     .bind(MAX_UNPRICED_DETAILS + 1)
     .fetch_all(conn)

@@ -2793,6 +2793,82 @@ async fn the_status_details_each_unpriced_kind_and_counts_corrected_rows_apart()
     );
 }
 
+/// Stores `n` unpriced charges for `code`, one usage row each, for the
+/// models `<prefix>-1` … `<prefix>-<kinds>` in turn, so they come to `kinds`
+/// details of `code`.
+async fn unpriced_kinds(cp: &TestCp, prefix: &str, code: &str, n: i64, kinds: i64) {
+    let mut tx = cp.db().pool().begin().await.expect("begin");
+    sqlx::query(
+        "INSERT INTO usage_events (event_id, dp_id, batch_id, occurred_at, team_id, api_key_id, event) \
+         SELECT $1 || '-e' || i, $2, $2, now(), 't', 'k', \
+                jsonb_build_object('event_id', $1 || '-e' || i) \
+         FROM generate_series(1, $3::bigint) AS i",
+    )
+    .bind(prefix)
+    .bind(Uuid::new_v4())
+    .bind(n)
+    .execute(&mut *tx)
+    .await
+    .expect("insert the usage rows");
+    sqlx::query(
+        "INSERT INTO pricing_charges_cny \
+         (event_id, tenant_id, api_key_id, user_id, requested_model_id, occurred_at, status, \
+          error_code, engine_version) \
+         SELECT $1 || '-e' || i, 't', 'k', '', $1 || '-' || (1 + (i - 1) % $4::bigint), now(), \
+                'unpriced', $2, $5 \
+         FROM generate_series(1, $3::bigint) AS i",
+    )
+    .bind(prefix)
+    .bind(code)
+    .bind(n)
+    .bind(kinds)
+    .bind(i64::from(ENGINE_VERSION))
+    .execute(&mut *tx)
+    .await
+    .expect("insert their charges");
+    tx.commit().await.expect("commit");
+}
+
+/// 计价状态's details are the most frequent kinds of unpriced call, whatever
+/// their reason: a reason that sorts first and has more kinds than the list
+/// holds does not push a more frequent reason off it. Every reason's total
+/// is still answered (`unpriced_last_24h.by_code`), so what the list leaves
+/// out is countable.
+#[tokio::test]
+async fn the_status_details_list_the_most_frequent_kinds_of_every_reason() {
+    let Some(w) = world().await else { return };
+    let cp = &w.cp;
+    let max = store::MAX_UNPRICED_DETAILS;
+    // `missing_price` sorts before `unknown_api_key`; it has one more kind
+    // than the list holds, each called once, and `unknown_api_key` one kind,
+    // called three times.
+    unpriced_kinds(cp, "many", "missing_price", max + 1, max + 1).await;
+    unpriced_kinds(cp, "few", "unknown_api_key", 3, 1).await;
+
+    let r = as_op(cp, &w.admin, "GET", "/admin/pricing/status", None).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let s = &r.body;
+    assert_eq!(
+        s["unpriced_last_24h"],
+        json!({"total": max + 4, "by_code": {"missing_price": max + 1, "unknown_api_key": 3}}),
+        "{s}"
+    );
+    assert_eq!(s["unpriced_details"]["truncated"], true, "{s}");
+    let items = s["unpriced_details"]["items"]
+        .as_array()
+        .expect("the details");
+    assert_eq!(items.len() as i64, max);
+    // The most frequent kind leads, and the rest follow by count.
+    assert_eq!(
+        (items[0]["code"].clone(), items[0]["count"].clone()),
+        (json!("unknown_api_key"), json!(3)),
+        "{s}"
+    );
+    let counts: Vec<i64> = items.iter().map(|i| i["count"].as_i64().unwrap()).collect();
+    assert!(counts.windows(2).all(|c| c[0] >= c[1]), "{counts:?}");
+    assert!(items[1..].iter().all(|i| i["code"] == "missing_price"));
+}
+
 /// B4: an operator's charge listing says why a row was billed nothing and
 /// names its model even once the model is gone: the call's status, error
 /// class and attempt, the model's name from its document (or the name the
