@@ -86,6 +86,27 @@ export function modelText(name: string | null, deleted: boolean): string {
 
 const TABLES: Record<string, string> = { baseline: "基准价", rate: "分组换算率", cost: "成本换算率", discount: "折扣" };
 
+/**
+ * Per reason, the calls a detail list cut short leaves out: the reason's
+ * count less the counts listed under it, where that is more than 0, in
+ * `byCode`'s order. Whichever kinds the cut keeps, every call is then in a
+ * row. A list that is not cut short lists every kind, so it has none (the
+ * counts and the list are read one after the other, and a difference there
+ * is a call that aged out or was corrected in between, not one unlisted).
+ */
+export function unlistedByCode(
+  byCode: Record<string, number>,
+  items: Pick<UnpricedDetail, "code" | "count">[],
+  truncated: boolean,
+): { code: string; count: number }[] {
+  if (!truncated) return [];
+  const listed = new Map<string, number>();
+  for (const d of items) listed.set(d.code, (listed.get(d.code) ?? 0) + d.count);
+  return Object.entries(byCode)
+    .map(([code, count]) => ({ code, count: count - (listed.get(code) ?? 0) }))
+    .filter((r) => r.count > 0);
+}
+
 /** What 计价状态 and the Overview card show, derived once from the response. */
 export function statusView(s: PricingStatus) {
   return {
@@ -117,6 +138,15 @@ export function statusView(s: PricingStatus) {
       remedy: remedy(d),
       filter: chargesFilterFor(d),
     })),
+    unlisted: unlistedByCode(s.unpriced_last_24h.by_code, s.unpriced_details?.items ?? [], s.unpriced_details?.truncated ?? false).map(
+      (r) => ({
+        key: `${r.code}/unlisted`,
+        code: r.code,
+        label: reasonLabel(r.code),
+        count: r.count,
+        filter: { status: "unpriced", error_code: r.code },
+      }),
+    ),
     detailsTruncated: s.unpriced_details?.truncated ?? false,
     correctedTotal: s.corrected_last_24h?.total ?? 0,
   };
