@@ -917,11 +917,13 @@ where
         let mut tool_call_indexer = ToolCallIndexer::default();
         let mut stream = Box::pin(byte_stream);
         let mut done_marker_seen = false;
-        let mut semantic_terminal_seen = false;
+        // A finish reason ends one choice; the answer is whole once every
+        // choice the stream carried has finished.
+        let mut choices = aisix_gateway::ChoiceFinishCensus::default();
         'outer: while let Some(next) = stream.next().await {
             let chunk = match next {
                 Ok(chunk) => chunk,
-                Err(_) if semantic_terminal_seen => return,
+                Err(_) if choices.all_finished() => return,
                 Err(e) => {
                     Err(BridgeError::Transport(
                         aisix_gateway::transport_error_message(&e),
@@ -940,7 +942,7 @@ where
                     SseEvent::Data(payload) => {
                         let parsed = parse_stream_chunk(&payload, reasoning_path.as_deref())?;
                         for chunk in stream_chunk_into_chat_chunks(parsed, &mut tool_call_indexer) {
-                            semantic_terminal_seen |= chunk.finish_reason.is_some();
+                            choices.observe(&chunk);
                             yield chunk.with_fallback_service_tier(&header_tier);
                         }
                     }
@@ -964,7 +966,7 @@ where
             Some(SseEvent::Data(payload)) => {
                 let parsed = parse_stream_chunk(&payload, reasoning_path.as_deref())?;
                 for chunk in stream_chunk_into_chat_chunks(parsed, &mut tool_call_indexer) {
-                    semantic_terminal_seen |= chunk.finish_reason.is_some();
+                    choices.observe(&chunk);
                     yield chunk.with_fallback_service_tier(&header_tier);
                 }
             }
@@ -994,7 +996,7 @@ where
                 }
             }
         }
-        if !done_marker_seen && !semantic_terminal_seen {
+        if !done_marker_seen && !choices.all_finished() {
             Err(BridgeError::StreamAborted)?;
         }
     }
@@ -1685,6 +1687,60 @@ data: [DONE]\n\n";
             Err(BridgeError::StreamAborted)
         ));
         assert!(stream.next().await.is_none());
+    }
+
+    /// With `n: 2` a finish reason ends one choice, not the stream: a body
+    /// that stops after choice 0 finished and before choice 1 did is
+    /// truncated, and must fail like any other truncation. Both choices
+    /// finishing, or `[DONE]`, is whole.
+    #[tokio::test]
+    async fn a_finished_choice_does_not_cover_an_unfinished_one() {
+        fn frame(index: u32, content: &str, finish: Option<&str>) -> String {
+            let finish = finish.map_or("null".to_string(), |f| format!("\"{f}\""));
+            format!(
+                "data: {{\"id\":\"c\",\"model\":\"m\",\"choices\":[{{\"index\":{index},\
+                 \"delta\":{{\"content\":\"{content}\"}},\"finish_reason\":{finish}}}]}}\n\n"
+            )
+        }
+        let both_open = format!("{}{}", frame(0, "a", None), frame(1, "b", None));
+        for (body, aborted) in [
+            (format!("{both_open}{}", frame(0, "", Some("stop"))), true),
+            (
+                format!(
+                    "{both_open}{}{}",
+                    frame(0, "", Some("stop")),
+                    frame(1, "", Some("stop"))
+                ),
+                false,
+            ),
+            (
+                format!("{both_open}{}data: [DONE]\n\n", frame(0, "", Some("stop"))),
+                false,
+            ),
+        ] {
+            let bytes = futures::stream::iter(vec![Ok::<_, reqwest::Error>(bytes::Bytes::from(
+                body.clone(),
+            ))]);
+            let mut stream = Box::pin(build_chunk_stream(
+                bytes,
+                None,
+                None,
+                "openai",
+                "req".to_string(),
+                None,
+            ));
+            let mut failure = None;
+            while let Some(item) = stream.next().await {
+                if let Err(e) = item {
+                    failure = Some(e);
+                }
+            }
+            assert_eq!(
+                matches!(failure, Some(BridgeError::StreamAborted)),
+                aborted,
+                "{body:?}: {failure:?}"
+            );
+        }
     }
 
     #[tokio::test]

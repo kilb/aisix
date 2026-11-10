@@ -1647,14 +1647,15 @@ impl VertexBridge {
             let mut decoder = SseDecoder::new();
             let mut tool_call_indexer = ToolCallIndexer::default();
             let mut byte_stream = Box::pin(byte_stream);
-            // `[DONE]` or a finish reason says the answer is complete; a body
-            // that ends before either is truncated.
-            let mut terminal_seen = false;
+            // `[DONE]`, or a finish reason on every choice, says the answer is
+            // complete; a body that ends before either is truncated.
+            let mut done_seen = false;
+            let mut choices = aisix_gateway::ChoiceFinishCensus::default();
 
             while let Some(item) = byte_stream.next().await {
                 let bytes: Bytes = match item {
                     Ok(bytes) => bytes,
-                    Err(_) if terminal_seen => return,
+                    Err(_) if done_seen || choices.all_finished() => return,
                     Err(e) => {
                         Err(BridgeError::Transport(aisix_gateway::transport_error_message(&e)))?
                     }
@@ -1670,13 +1671,13 @@ impl VertexBridge {
                                 "vertex openai-shim stream chunk parse",
                             )?;
                             for chunk in openai_stream_chunk_into_chat_chunks(parsed, &mut tool_call_indexer) {
-                                terminal_seen |= chunk.finish_reason.is_some();
+                                choices.observe(&chunk);
                                 yield chunk.with_fallback_service_tier(&header_tier);
                             }
                         }
                         // OpenAI shim terminates with `data: [DONE]`;
                         // stop emitting on the sentinel.
-                        SseEvent::Done => terminal_seen = true,
+                        SseEvent::Done => done_seen = true,
                     }
                 }
             }
@@ -1686,20 +1687,20 @@ impl VertexBridge {
                 .finish()
                 .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?
             {
-                Some(SseEvent::Done) => terminal_seen = true,
+                Some(SseEvent::Done) => done_seen = true,
                 Some(SseEvent::Data(data)) => {
                     let parsed = parse_vertex_openai_stream_payload(
                         &data,
                         "vertex openai-shim stream tail parse",
                     )?;
                     for chunk in openai_stream_chunk_into_chat_chunks(parsed, &mut tool_call_indexer) {
-                        terminal_seen |= chunk.finish_reason.is_some();
+                        choices.observe(&chunk);
                         yield chunk.with_fallback_service_tier(&header_tier);
                     }
                 }
                 None => {}
             }
-            if !terminal_seen {
+            if !done_seen && !choices.all_finished() {
                 Err(BridgeError::StreamAborted)?;
             }
         };
@@ -1919,14 +1920,15 @@ impl VertexBridge {
             let mut decoder = SseDecoder::new();
             let mut tool_call_indexer = ToolCallIndexer::default();
             let mut byte_stream = Box::pin(byte_stream);
-            // `[DONE]` or a finish reason says the answer is complete; a body
-            // that ends before either is truncated.
-            let mut terminal_seen = false;
+            // `[DONE]`, or a finish reason on every choice, says the answer is
+            // complete; a body that ends before either is truncated.
+            let mut done_seen = false;
+            let mut choices = aisix_gateway::ChoiceFinishCensus::default();
 
             while let Some(item) = byte_stream.next().await {
                 let bytes: Bytes = match item {
                     Ok(bytes) => bytes,
-                    Err(_) if terminal_seen => return,
+                    Err(_) if done_seen || choices.all_finished() => return,
                     Err(e) => {
                         Err(BridgeError::Transport(aisix_gateway::transport_error_message(&e)))?
                     }
@@ -1942,13 +1944,13 @@ impl VertexBridge {
                                 "vertex partner :streamRawPredict chunk parse",
                             )?;
                             for chunk in openai_stream_chunk_into_chat_chunks(parsed, &mut tool_call_indexer) {
-                                terminal_seen |= chunk.finish_reason.is_some();
+                                choices.observe(&chunk);
                                 yield chunk.with_fallback_service_tier(&header_tier);
                             }
                         }
                         // OpenAI-compatible upstreams (Mistral / AI21)
                         // terminate with `data: [DONE]`; stop on the sentinel.
-                        SseEvent::Done => terminal_seen = true,
+                        SseEvent::Done => done_seen = true,
                     }
                 }
             }
@@ -1956,20 +1958,20 @@ impl VertexBridge {
                 .finish()
                 .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?
             {
-                Some(SseEvent::Done) => terminal_seen = true,
+                Some(SseEvent::Done) => done_seen = true,
                 Some(SseEvent::Data(data)) => {
                     let parsed = parse_vertex_openai_stream_payload(
                         &data,
                         "vertex partner :streamRawPredict tail parse",
                     )?;
                     for chunk in openai_stream_chunk_into_chat_chunks(parsed, &mut tool_call_indexer) {
-                        terminal_seen |= chunk.finish_reason.is_some();
+                        choices.observe(&chunk);
                         yield chunk.with_fallback_service_tier(&header_tier);
                     }
                 }
                 None => {}
             }
-            if !terminal_seen {
+            if !done_seen && !choices.all_finished() {
                 Err(BridgeError::StreamAborted)?;
             }
         };

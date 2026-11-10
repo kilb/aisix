@@ -12,6 +12,9 @@ use std::time::{Duration, Instant};
 pub(super) enum CompletionStreamFailure {
     Timeout,
     Decode,
+    /// The upstream reported an error inside the stream; the typed error is
+    /// [`CompletionSseAccumulator::in_band_error`].
+    InBand,
     Other,
 }
 
@@ -69,6 +72,11 @@ pub(super) struct CompletionSseAccumulator {
     /// frame began — `0` when it began in an earlier push.
     pub(super) done_frame_start: usize,
     pub(super) malformed_data: bool,
+    /// The first error the upstream reported inside the stream (vLLM ends a
+    /// failed generation with `data: {"error":…}` and then `[DONE]`). It
+    /// decides how the stream ended, whatever `[DONE]` or a disconnect says
+    /// after it.
+    pub(super) in_band_error: Option<BridgeError>,
     pub(super) usage: Option<CompletionUsage>,
     pub(super) provider_request_id: String,
 }
@@ -88,6 +96,7 @@ impl Default for CompletionSseAccumulator {
             saw_done: false,
             done_frame_start: 0,
             malformed_data: false,
+            in_band_error: None,
             usage: None,
             provider_request_id: String::new(),
         }
@@ -200,6 +209,12 @@ impl CompletionSseAccumulator {
         let Some(json) = json else {
             return;
         };
+        if self.in_band_error.is_none() {
+            self.in_band_error = aisix_gateway::capture_in_band_error_value(
+                &json,
+                aisix_gateway::UpstreamWire::OpenAI,
+            );
+        }
         if self.provider_request_id.is_empty() {
             self.provider_request_id = crate::usage_attr::provider_response_id(&json);
         }
@@ -330,6 +345,17 @@ impl SseBoundaryDetector {
             _ => self.line_empty = false,
         }
         SseBoundary::None
+    }
+}
+
+impl CompletionStreamOutcome {
+    /// How a stream ended whose upstream reported `error` inside it.
+    fn in_band(error: &BridgeError) -> Self {
+        Self::UpstreamError {
+            status: error.http_status(),
+            failure: CompletionStreamFailure::InBand,
+            error_class: error.error_type(),
+        }
     }
 }
 
@@ -507,7 +533,15 @@ impl<F: FnOnce(CompletionSseAccumulator, CompletionStreamOutcome, CompletionOutp
             } else {
                 CompletionOutputObservation::unguarded()
             };
-            complete(accumulator, self.drop_outcome, observation);
+            // The upstream already failed the request; a caller leaving
+            // after that is not what ended it.
+            let outcome = match (&self.drop_outcome, &accumulator.in_band_error) {
+                (CompletionStreamOutcome::DownstreamDrop, Some(error)) => {
+                    CompletionStreamOutcome::in_band(error)
+                }
+                _ => self.drop_outcome,
+            };
+            complete(accumulator, outcome, observation);
         }
     }
 }
@@ -693,14 +727,18 @@ where
                 estimate_text: Some(estimate_text),
                 ..Default::default()
             });
-            guard.drop_outcome = CompletionStreamOutcome::UpstreamError {
-                status: error.http_status(),
-                failure: match &error {
-                    BridgeError::Timeout { .. } => CompletionStreamFailure::Timeout,
-                    BridgeError::UpstreamDecode(_) => CompletionStreamFailure::Decode,
-                    _ => CompletionStreamFailure::Other,
+            guard.drop_outcome = match &accumulator.in_band_error {
+                // What the upstream reported before the read failed is the cause.
+                Some(reported) => CompletionStreamOutcome::in_band(reported),
+                None => CompletionStreamOutcome::UpstreamError {
+                    status: error.http_status(),
+                    failure: match &error {
+                        BridgeError::Timeout { .. } => CompletionStreamFailure::Timeout,
+                        BridgeError::UpstreamDecode(_) => CompletionStreamFailure::Decode,
+                        _ => CompletionStreamFailure::Other,
+                    },
+                    error_class: error.error_type(),
                 },
-                error_class: error.error_type(),
             };
             drop(guard);
             yield Ok(upstream_failure_frame(&error));
@@ -773,14 +811,15 @@ where
         )
         .await;
         let capture_safe = moderation.capture_safe && !truncated;
-        let upstream_end = if truncated {
-            CompletionStreamOutcome::UpstreamError {
+        let upstream_end = match (&accumulator.in_band_error, truncated) {
+            // The upstream's own report of a failure ends it, `[DONE]` or not.
+            (Some(error), _) => CompletionStreamOutcome::in_band(error),
+            (None, true) => CompletionStreamOutcome::UpstreamError {
                 status: 502,
                 failure: CompletionStreamFailure::Other,
                 error_class: "stream_aborted",
-            }
-        } else {
-            CompletionStreamOutcome::CleanEof
+            },
+            (None, false) => CompletionStreamOutcome::CleanEof,
         };
         if let aisix_guardrails::GuardrailVerdict::Block {
             reason,
@@ -902,19 +941,28 @@ where
                     }
                 }
                 Err(error) => {
-                    outcome = CompletionStreamOutcome::UpstreamError {
-                        status: error.http_status(),
-                        failure: match error {
-                            BridgeError::Timeout { .. } => CompletionStreamFailure::Timeout,
-                            BridgeError::UpstreamDecode(_) => CompletionStreamFailure::Decode,
-                            _ => CompletionStreamFailure::Other,
-                        },
-                        error_class: error.error_type(),
-                    };
-                    guard.drop_outcome = outcome;
                     if let Some((_, accumulator)) = guard.slot.as_mut() {
                         accumulator.finish();
                     }
+                    let reported = guard
+                        .slot
+                        .as_ref()
+                        .and_then(|(_, accumulator)| accumulator.in_band_error.as_ref());
+                    outcome = match reported {
+                        // What the upstream reported before the read failed
+                        // is the cause.
+                        Some(reported) => CompletionStreamOutcome::in_band(reported),
+                        None => CompletionStreamOutcome::UpstreamError {
+                            status: error.http_status(),
+                            failure: match error {
+                                BridgeError::Timeout { .. } => CompletionStreamFailure::Timeout,
+                                BridgeError::UpstreamDecode(_) => CompletionStreamFailure::Decode,
+                                _ => CompletionStreamFailure::Other,
+                            },
+                            error_class: error.error_type(),
+                        },
+                    };
+                    guard.drop_outcome = outcome;
                 }
             }
             let item = match (item, wire_len) {
@@ -964,7 +1012,14 @@ where
                     ));
                     return;
                 }
-                guard.drop_outcome = CompletionStreamOutcome::CleanEof;
+                // `[DONE]` closes the stream, but an error the upstream
+                // reported before it is how the request ended.
+                let terminal = guard
+                    .slot
+                    .as_ref()
+                    .and_then(|(_, accumulator)| accumulator.in_band_error.as_ref())
+                    .map_or(CompletionStreamOutcome::CleanEof, CompletionStreamOutcome::in_band);
+                guard.drop_outcome = terminal;
                 let observation = match output_observer.as_ref() {
                     Some(chain) => {
                         let (text, truncated) = guard
@@ -985,7 +1040,7 @@ where
                     None => CompletionOutputObservation::unguarded(),
                 };
                 if let Some((complete, accumulator)) = guard.slot.take() {
-                    complete(accumulator, CompletionStreamOutcome::CleanEof, observation);
+                    complete(accumulator, terminal, observation);
                 }
                 yield item;
                 return;
@@ -1011,6 +1066,8 @@ where
                     failure: CompletionStreamFailure::Decode,
                     error_class: "upstream_decode_error",
                 };
+            } else if let Some(error) = &accumulator.in_band_error {
+                outcome = CompletionStreamOutcome::in_band(error);
             } else if !accumulator.saw_done {
                 outcome = CompletionStreamOutcome::UpstreamError {
                     status: 502,
@@ -1449,6 +1506,134 @@ mod tests {
                 error_class: "upstream_decode_error",
             })
         );
+    }
+
+    /// What vLLM's completions server writes when generation fails after the
+    /// head went out: the error envelope as a data event, then `[DONE]`
+    /// (`vllm/entrypoints/openai/completion/serving.py`, the generator's
+    /// `except` arm).
+    const IN_BAND_ERROR_THEN_DONE: &[u8] = b"data: {\"error\":{\"message\":\"generation failed\",\
+\"type\":\"BadRequestError\",\"param\":null,\"code\":400}}\n\ndata: [DONE]\n\n";
+
+    fn in_band_outcome() -> Option<CompletionStreamOutcome> {
+        Some(CompletionStreamOutcome::UpstreamError {
+            status: 400,
+            failure: CompletionStreamFailure::InBand,
+            error_class: "upstream_in_band_error",
+        })
+    }
+
+    /// An error the upstream reported inside the stream ends it as that error,
+    /// `[DONE]` after it or not, and keeps the typed error for the row and the
+    /// cooldown. The frames still reach the caller as the upstream sent them.
+    #[tokio::test]
+    async fn an_in_band_error_before_done_is_the_streams_failure() {
+        for tail in [
+            IN_BAND_ERROR_THEN_DONE,
+            &IN_BAND_ERROR_THEN_DONE[..IN_BAND_ERROR_THEN_DONE.len() - 14],
+        ] {
+            let mut body = frame("partial", true);
+            body.extend_from_slice(tail);
+            let upstream: CompletionByteStream =
+                Box::pin(futures::stream::iter([Ok(bytes::Bytes::from(body))]));
+            let outcome = Arc::new(std::sync::Mutex::new(None));
+            let outcome_for_callback = Arc::clone(&outcome);
+            let stream = build_completion_passthrough_stream(
+                upstream,
+                None,
+                "model".to_string(),
+                move |accumulator, terminal, _| {
+                    *outcome_for_callback.lock().unwrap() =
+                        Some((terminal, accumulator.in_band_error.map(|e| e.to_string())));
+                },
+            );
+            futures::pin_mut!(stream);
+            let mut relayed = Vec::new();
+            while let Some(item) = stream.next().await {
+                relayed.extend_from_slice(&item.unwrap());
+            }
+            let relayed = String::from_utf8_lossy(&relayed);
+            assert!(relayed.contains("generation failed"), "{relayed}");
+            let (terminal, error) = outcome.lock().unwrap().take().expect("terminal fired");
+            assert_eq!(
+                Some(terminal),
+                in_band_outcome(),
+                "tail {:?}",
+                String::from_utf8_lossy(tail)
+            );
+            assert!(error.is_some_and(|e| e.contains("generation failed")));
+        }
+    }
+
+    /// A caller that leaves after the upstream reported its failure did not end
+    /// the request: the upstream did.
+    #[tokio::test]
+    async fn a_drop_after_an_in_band_error_keeps_the_upstreams_failure() {
+        let mut body = frame("partial", true);
+        body.extend_from_slice(&IN_BAND_ERROR_THEN_DONE[..IN_BAND_ERROR_THEN_DONE.len() - 14]);
+        let upstream: CompletionByteStream = Box::pin(
+            futures::stream::iter([Ok(bytes::Bytes::from(body))]).chain(futures::stream::pending()),
+        );
+        let outcome = Arc::new(std::sync::Mutex::new(None));
+        let outcome_for_callback = Arc::clone(&outcome);
+        {
+            let stream = build_completion_passthrough_stream(
+                upstream,
+                None,
+                "model".to_string(),
+                move |_, terminal, _| *outcome_for_callback.lock().unwrap() = Some(terminal),
+            );
+            futures::pin_mut!(stream);
+            assert!(stream.next().await.unwrap().is_ok());
+        }
+        assert_eq!(*outcome.lock().unwrap(), in_band_outcome());
+    }
+
+    /// The held relay judges the same way: the error and `[DONE]` are released
+    /// as the upstream sent them, and the stream ends as the upstream's error.
+    #[tokio::test]
+    async fn a_held_completion_with_an_in_band_error_ends_as_that_error() {
+        struct Holds;
+        #[async_trait::async_trait]
+        impl aisix_guardrails::Guardrail for Holds {
+            fn name(&self) -> &'static str {
+                "holds"
+            }
+            fn stream_output_policy(&self) -> aisix_guardrails::StreamOutputPolicy {
+                aisix_guardrails::StreamOutputPolicy::BufferFull {
+                    max_buffer_bytes: 1 << 20,
+                    on_exceeded_fail_open: false,
+                }
+            }
+        }
+        let mut body = frame("partial", true);
+        body.extend_from_slice(IN_BAND_ERROR_THEN_DONE);
+        let upstream: CompletionByteStream =
+            Box::pin(futures::stream::iter([Ok(bytes::Bytes::from(body))]));
+        let chain = Arc::new(aisix_guardrails::GuardrailChain::new(vec![
+            Arc::new(Holds) as Arc<dyn aisix_guardrails::Guardrail>
+        ]));
+        let outcome = Arc::new(std::sync::Mutex::new(None));
+        let outcome_in_callback = Arc::clone(&outcome);
+        let stream = build_held_completion_stream(
+            upstream,
+            chain,
+            "model".to_string(),
+            "model".to_string(),
+            Instant::now(),
+            None,
+            None,
+            Arc::new(OnceLock::new()),
+            move |_, terminal, _| *outcome_in_callback.lock().unwrap() = Some(terminal),
+        );
+        futures::pin_mut!(stream);
+        let mut released = Vec::new();
+        while let Some(item) = stream.next().await {
+            released.extend_from_slice(&item.unwrap());
+        }
+        let released = String::from_utf8_lossy(&released);
+        assert!(released.contains("generation failed"), "{released}");
+        assert_eq!(*outcome.lock().unwrap(), in_band_outcome());
     }
 
     /// An upstream that pauses inside a frame leaves the heartbeat something

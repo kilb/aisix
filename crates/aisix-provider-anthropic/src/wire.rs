@@ -4306,6 +4306,10 @@ pub struct AnthropicSseEncoder {
     seen_cache_creation_tokens: u32,
     seen_cache_read_tokens: u32,
     usage_seen: bool,
+    /// Locally estimated `(input, output)` counts for the ones the upstream
+    /// left at zero, applied when the closing pair is built
+    /// ([`Self::set_estimated_usage`]).
+    estimate: Option<(u32, u32)>,
 }
 
 impl AnthropicSseEncoder {
@@ -4338,6 +4342,7 @@ impl AnthropicSseEncoder {
             seen_cache_creation_tokens: 0,
             seen_cache_read_tokens: 0,
             usage_seen: false,
+            estimate: None,
         }
     }
 
@@ -4560,16 +4565,27 @@ impl AnthropicSseEncoder {
     /// must not disagree. A no-op once the closing pair has gone out:
     /// the client must never be handed numbers contradicting what it was
     /// already sent.
+    ///
+    /// Applied when the closing pair is built, after the chunk that ends
+    /// the stream has added whatever usage it carries, so it can be handed
+    /// over before that chunk ([`Self::finishes_on`]).
     pub fn set_estimated_usage(&mut self, prompt_tokens: u32, completion_tokens: u32) {
         if self.finished {
             return;
         }
-        if self.seen_input_tokens == 0 {
-            self.seen_input_tokens = prompt_tokens;
+        self.estimate = Some((prompt_tokens, completion_tokens));
+    }
+
+    /// Whether [`Self::next_events`] will emit the closing pair for
+    /// `chunk`: a finish reason, or the trailing usage frame a finish was
+    /// held for, once usage is known.
+    pub fn finishes_on(&self, chunk: &ChatChunk) -> bool {
+        if self.finished {
+            return false;
         }
-        if self.seen_output_tokens == 0 {
-            self.seen_output_tokens = completion_tokens;
-        }
+        let chunk = chunk.first_choice_only();
+        let usage_known = self.usage_seen || chunk.usage.is_some();
+        usage_known && (self.pending_stop_reason.is_some() || chunk.finish_reason.is_some())
     }
 
     /// The closing `message_delta` + `message_stop` pair, carrying the
@@ -4579,6 +4595,14 @@ impl AnthropicSseEncoder {
     /// place the client can learn the prompt token count. The same goes
     /// for the cache counters (AISIX-Cloud#1405).
     fn closing_pair(&mut self, stop_reason: &'static str) -> Vec<AnthropicSseEvent> {
+        if let Some((prompt_tokens, completion_tokens)) = self.estimate.take() {
+            if self.seen_input_tokens == 0 {
+                self.seen_input_tokens = prompt_tokens;
+            }
+            if self.seen_output_tokens == 0 {
+                self.seen_output_tokens = completion_tokens;
+            }
+        }
         let input = AnthropicInputUsage::from_usage(&UsageStats {
             prompt_tokens: self.seen_input_tokens,
             cached_prompt_tokens: self.seen_cached_prompt_tokens,

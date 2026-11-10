@@ -1676,6 +1676,37 @@ impl ChatChunk {
     }
 }
 
+/// Which choices of a streamed answer have reached their finish reason.
+///
+/// A finish reason ends one choice, not the stream: with `n > 1` the
+/// upstream finishes each choice in its own chunk, so a body that stops
+/// after the first finish and before the others is truncated even though
+/// it carried a finish reason. Every choice a chunk carried something for
+/// has to finish before the answer is whole.
+#[derive(Debug, Default, Clone)]
+pub struct ChoiceFinishCensus {
+    open: std::collections::BTreeSet<u32>,
+    finished: std::collections::BTreeSet<u32>,
+}
+
+impl ChoiceFinishCensus {
+    /// Count `chunk` toward its choice.
+    pub fn observe(&mut self, chunk: &ChatChunk) {
+        let index = chunk.choice_index;
+        if chunk.finish_reason.is_some() {
+            self.open.remove(&index);
+            self.finished.insert(index);
+        } else if !chunk.has_no_payload() && !self.finished.contains(&index) {
+            self.open.insert(index);
+        }
+    }
+
+    /// At least one choice finished and none it saw is still open.
+    pub fn all_finished(&self) -> bool {
+        !self.finished.is_empty() && self.open.is_empty()
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ChatDelta {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1852,6 +1883,44 @@ pub struct EmbeddingUsage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every choice that carried something has to finish; a usage-only
+    /// frame names no choice, so it neither opens one nor keeps one open.
+    #[test]
+    fn the_census_waits_for_every_choice_it_saw() {
+        let chunk = |choice_index: u32, content: Option<&str>, finish: bool| ChatChunk {
+            id: String::new(),
+            model: String::new(),
+            choice_index,
+            delta: ChatDelta {
+                content: content.map(str::to_string),
+                ..ChatDelta::default()
+            },
+            finish_reason: finish.then_some(FinishReason::Stop),
+            logprobs: None,
+            usage: None,
+            service_tier: None,
+            accounting_usage: None,
+        };
+        let mut census = ChoiceFinishCensus::default();
+        assert!(!census.all_finished(), "nothing finished yet");
+        census.observe(&chunk(0, Some("a"), false));
+        census.observe(&chunk(1, Some("b"), false));
+        census.observe(&chunk(0, None, true));
+        assert!(!census.all_finished(), "choice 1 is still open");
+        census.observe(&chunk(1, None, true));
+        assert!(census.all_finished());
+        let usage_only = ChatChunk {
+            usage: Some(UsageStats::default()),
+            ..chunk(0, None, false)
+        };
+        census.observe(&usage_only);
+        assert!(census.all_finished(), "a usage frame reopens nothing");
+
+        let mut single = ChoiceFinishCensus::default();
+        single.observe(&chunk(0, Some("a"), true));
+        assert!(single.all_finished());
+    }
 
     /// A usage-only frame is dropped by the chat relay, so a legacy streamed
     /// call has to read as a payload or its name and arguments go with it.

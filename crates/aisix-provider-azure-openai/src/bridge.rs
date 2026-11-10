@@ -1088,7 +1088,9 @@ where
         let mut tool_call_indexer = ToolCallIndexer::default();
         let mut stream = Box::pin(byte_stream);
         let mut done_marker_seen = false;
-        let mut semantic_terminal_seen = false;
+        // A finish reason ends one choice; the answer is whole once every
+        // choice the stream carried has finished.
+        let mut choices = aisix_gateway::ChoiceFinishCensus::default();
         'outer: loop {
             // Audit H2: bound each individual chunk wait. `tokio::time::timeout`
             // (not `timeout_at`) so the budget restarts on every chunk — the
@@ -1110,7 +1112,7 @@ where
             let Some(next) = next else { break 'outer; };
             let chunk = match next {
                 Ok(chunk) => chunk,
-                Err(_) if semantic_terminal_seen => return,
+                Err(_) if choices.all_finished() => return,
                 Err(e) => {
                     Err(BridgeError::Transport(aisix_gateway::transport_error_message(&e)))?
                 }
@@ -1127,7 +1129,7 @@ where
                     SseEvent::Data(payload) => {
                         let parsed = parse_stream_chunk(&payload, reasoning_path.as_deref())?;
                         for chunk in stream_chunk_into_chat_chunks(parsed, &mut tool_call_indexer) {
-                            semantic_terminal_seen |= chunk.finish_reason.is_some();
+                            choices.observe(&chunk);
                             yield chunk;
                         }
                     }
@@ -1144,7 +1146,7 @@ where
             Some(SseEvent::Data(payload)) => {
                 let parsed = parse_stream_chunk(&payload, reasoning_path.as_deref())?;
                 for chunk in stream_chunk_into_chat_chunks(parsed, &mut tool_call_indexer) {
-                    semantic_terminal_seen |= chunk.finish_reason.is_some();
+                    choices.observe(&chunk);
                     yield chunk;
                 }
             }
@@ -1172,7 +1174,7 @@ where
                 }
             }
         }
-        if !done_marker_seen && !semantic_terminal_seen {
+        if !done_marker_seen && !choices.all_finished() {
             Err(BridgeError::StreamAborted)?;
         }
     }
@@ -3010,11 +3012,19 @@ mod tests {
         const CONTENT: &str =
             "data: {\"id\":\"c\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n";
         const FINISH: &str = "data: {\"id\":\"c\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n";
+        // `n: 2`: a finish reason ends one choice, so choice 1 still open
+        // after choice 0 finished is a truncation.
+        const SECOND: &str =
+            "data: {\"id\":\"c\",\"choices\":[{\"index\":1,\"delta\":{\"content\":\"yo\"}}]}\n\n";
+        const SECOND_FINISH: &str = "data: {\"id\":\"c\",\"choices\":[{\"index\":1,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n";
         for (body, aborted) in [
             (CONTENT.to_string(), true),
             (format!("{CONTENT}{FINISH}"), false),
             (format!("{CONTENT}data: [DONE]\n\n"), false),
             (format!("{CONTENT}data: [DONE]\n"), false),
+            (format!("{CONTENT}{SECOND}{FINISH}"), true),
+            (format!("{CONTENT}{SECOND}{FINISH}{SECOND_FINISH}"), false),
+            (format!("{CONTENT}{SECOND}{FINISH}data: [DONE]\n\n"), false),
         ] {
             let mut stream = Box::pin(build_chunk_stream(
                 chunks_of(&body),

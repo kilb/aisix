@@ -915,7 +915,7 @@ async fn dispatch(
                 let held_verdict = Arc::new(std::sync::OnceLock::new());
                 let held_verdict_c = Arc::clone(&held_verdict);
                 let on_complete =
-                    move |accumulator: CompletionSseAccumulator,
+                    move |mut accumulator: CompletionSseAccumulator,
                           outcome: CompletionStreamOutcome,
                           output_observation: CompletionOutputObservation| {
                         let held: Option<&HeldCompletionVerdict> = held_verdict_c.get();
@@ -951,6 +951,12 @@ async fn dispatch(
                                     CompletionStreamFailure::Decode => BridgeError::UpstreamDecode(
                                         "malformed legacy completion SSE data event".to_string(),
                                     ),
+                                    // The upstream's own report, scrubbed when
+                                    // it was read.
+                                    CompletionStreamFailure::InBand => accumulator
+                                        .in_band_error
+                                        .take()
+                                        .unwrap_or(BridgeError::StreamAborted),
                                     CompletionStreamFailure::Other => BridgeError::StreamAborted,
                                 };
                                 let error = crate::cooldown::note_failure(

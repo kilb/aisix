@@ -504,13 +504,14 @@ pub(crate) async fn chat_stream(
         let mut indexer = ToolCallIndexer::default();
         let mut minted: Vec<((u32, u64), String)> = Vec::new();
         let mut byte_stream = Box::pin(byte_stream);
-        // `[DONE]` or a finish reason says the answer is complete; a body that
-        // ends before either is truncated.
-        let mut terminal_seen = false;
+        // `[DONE]`, or a finish reason on every choice, says the answer is
+        // complete; a body that ends before either is truncated.
+        let mut done_seen = false;
+            let mut choices = aisix_gateway::ChoiceFinishCensus::default();
         'outer: while let Some(next) = byte_stream.next().await {
             let bytes = match next {
                 Ok(bytes) => bytes,
-                Err(_) if terminal_seen => return,
+                Err(_) if done_seen || choices.all_finished() => return,
                 Err(e) => {
                     Err(BridgeError::Transport(aisix_gateway::transport_error_message(&e)))?
                 }
@@ -518,12 +519,12 @@ pub(crate) async fn chat_stream(
             for event in decoder.feed(bytes.as_ref()).map_err(|e| BridgeError::UpstreamDecode(e.to_string()))? {
                 match event {
                     SseEvent::Done => {
-                        terminal_seen = true;
+                        done_seen = true;
                         break 'outer;
                     }
                     SseEvent::Data(payload) => {
                         for chunk in chunk_from(&payload, &mut indexer, &mut minted, &request_id)? {
-                            terminal_seen |= chunk.finish_reason.is_some();
+                            choices.observe(&chunk);
                             yield chunk;
                         }
                     }
@@ -531,16 +532,16 @@ pub(crate) async fn chat_stream(
             }
         }
         match decoder.finish().map_err(|e| BridgeError::UpstreamDecode(e.to_string()))? {
-            Some(SseEvent::Done) => terminal_seen = true,
+            Some(SseEvent::Done) => done_seen = true,
             Some(SseEvent::Data(payload)) => {
                 for chunk in chunk_from(&payload, &mut indexer, &mut minted, &request_id)? {
-                    terminal_seen |= chunk.finish_reason.is_some();
+                    choices.observe(&chunk);
                     yield chunk;
                 }
             }
             None => {}
         }
-        if !terminal_seen {
+        if !done_seen && !choices.all_finished() {
             Err(BridgeError::StreamAborted)?;
         }
     };
