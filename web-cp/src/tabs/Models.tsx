@@ -80,6 +80,13 @@ type SchemaInfo = { strategies: string[]; preset: string | null } | { error: str
  */
 const GENERATED_STRATEGY = "round_robin";
 
+/**
+ * The strategy a public model cannot route by: it orders targets by price,
+ * and the targets its accounts generate carry none (`channels::checked_routing`
+ * refuses it).
+ */
+const UNPRICED_STRATEGY = "least_cost";
+
 /** Which form is open: a new model of one shape, or one model. */
 type Open = { mode: "new"; shape: "direct" | "routing" } | { mode: "edit"; id: string };
 
@@ -204,30 +211,44 @@ export function Models({ canEdit }: TabProps) {
   // What each generated row came from, by public model id; null until the read.
   const publicById = publics === null ? null : new Map(publics.map((p) => [p.id, p] as const));
 
+  // Numbers each read of the public models; an answer is applied only while
+  // its number is the latest, so a read that started before a save can never
+  // land after the save's own answer and put the old settings back.
+  const publicsRead = useRef(0);
+
   /**
    * Reads the public models again. A failed read leaves the last good list
    * and says so: an empty list would read as "every public model is gone",
    * which is a different — and false — statement.
    */
   async function loadPublics() {
+    const ticket = ++publicsRead.current;
     try {
-      setPublics(await publicModels.list());
+      const list = await publicModels.list();
+      if (ticket !== publicsRead.current) return;
+      setPublics(list);
       setPublicsError(null);
     } catch (e) {
-      setPublicsError(errorText(e));
+      if (ticket === publicsRead.current) setPublicsError(errorText(e));
     }
+  }
+
+  /**
+   * A write's own answer for one public model, applied at once: it is newer
+   * than any read still in flight, which is therefore dropped. The routing
+   * form is keyed by its document's version, so the reload a save starts
+   * remounts it, and it must remount from these settings, not from a list
+   * read before the save.
+   */
+  function applyPublic(view: PublicModel) {
+    publicsRead.current++;
+    setPublics((list) => list?.map((p) => (p.id === view.id ? view : p)) ?? list);
   }
 
   // The public models, once per page: they are read to name the 来源 column
   // and to carry a retire's own counts. Only a failed read retries on 刷新.
   useEffect(() => {
-    publicModels.list().then(
-      (list) => {
-        setPublics(list);
-        setPublicsError(null);
-      },
-      (e) => setPublicsError(errorText(e)),
-    );
+    void loadPublics();
   }, []);
 
   // Every read this page needs, together: the row 刷新 and the retire both do.
@@ -358,7 +379,12 @@ export function Models({ canEdit }: TabProps) {
     editing && editingSource?.kind === "public" && !editingSource.generated
       ? publicById?.get(editingSource.id)
       : undefined;
-  const editable = editing !== undefined && (editingSource?.kind === "manual" || editingPublic !== undefined);
+  const editable =
+    editing !== undefined &&
+    (editingSource?.kind === "manual" ||
+      editingPublic !== undefined ||
+      // Opened read-only below: the catalog form with every field locked.
+      (editingSource?.kind === "public" && editingSource.generated));
   const formProps = {
     catalog,
     schema,
@@ -387,6 +413,9 @@ export function Models({ canEdit }: TabProps) {
               kind: "ok",
               text: `已保存「${view.name}」的路由设置。`,
             });
+            // The saved settings first, so the form the reload remounts
+            // starts from them whichever read lands first.
+            applyPublic(view);
             // The targets are regenerated with the document: read them back.
             void models.reload();
             void loadPublics();
@@ -1271,7 +1300,12 @@ function PublicRoutingForm({
   // The strategy options come from the schema, never from a list here: the
   // one the generator uses for "not set" leads, since an operator who wants it
   // back cannot find it otherwise (it is not the schema's own default).
-  const fromSchema = schema && "strategies" in schema ? schema.strategies : null;
+  //
+  // `least_cost` is left out: it ranks targets by their price, a generated
+  // target carries none, and the control plane refuses it for a public model.
+  // A stored one is still shown, below, so the form reads what is there.
+  const fromSchema =
+    schema && "strategies" in schema ? schema.strategies.filter((v) => v !== UNPRICED_STRATEGY) : null;
   const strategies =
     fromSchema === null
       ? null

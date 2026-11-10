@@ -941,3 +941,107 @@ test("账号页删除模型时它已被别人停用：说它已经停用，而�
   await expect(section.getByText("没有改动")).toHaveCount(0);
   await expect(accountRow(section, pub.name)).toHaveCount(0);
 });
+
+test("公共模型的选路策略不提供 least_cost：目标不带价格，控制面也拒绝它", async ({ page }) => {
+  const suffix = randomUUID().slice(0, 8);
+  const accountName = `acct-least-${suffix}`;
+  const account = await mockAccount(accountName, ["shared"]);
+  const publicName = `pub-least-${suffix}`;
+  const pub = await newPublicModel(publicName);
+  await serve(account.id, pub.id);
+
+  const refused = await stack.admin.request("PATCH", `/admin/public-models/${pub.id}`, {
+    routing: { strategy: "least_cost" },
+  });
+  expect(refused.status, refused.text).toBe(422);
+  expect(JSON.parse(refused.text).details.map((d: Json) => d.path)).toEqual(["/routing/strategy"]);
+
+  await openModels(page);
+  await modelRow(page, publicName).getByRole("button", { name: "编辑", exact: true }).click();
+  const form = page.getByRole("form", { name: `编辑模型「${publicName}」` });
+  const options = form.getByLabel("选路策略").locator("option");
+  await expect(options.filter({ hasText: /^least_latency$/ })).toHaveCount(1);
+  await expect(options.filter({ hasText: /^least_cost$/ })).toHaveCount(0);
+});
+
+test("保存路由设置后接着改：模型列表先读回来也从刚保存的设置继续，再改一项不丢前面的设置", async ({ page }) => {
+  const suffix = randomUUID().slice(0, 8);
+  const accountName = `acct-route-again-${suffix}`;
+  const account = await mockAccount(accountName, ["shared"]);
+  const publicName = `pub-route-again-${suffix}`;
+  const pub = await newPublicModel(publicName);
+  await serve(account.id, pub.id);
+
+  await openModels(page);
+  await modelRow(page, publicName).getByRole("button", { name: "编辑", exact: true }).click();
+  const form = page.getByRole("form", { name: `编辑模型「${publicName}」` });
+  await form.getByLabel("选路策略").selectOption("failover");
+  await form.getByLabel("重试次数").fill("2");
+
+  // After the save, the public models' list is held back for a moment, so
+  // the model list's read — which remounts this form at the regenerated
+  // document's version — lands first. The request still reaches the real
+  // control plane and its answer is passed on unchanged; only when it
+  // arrives moves, to the order the race needs.
+  let hold = false;
+  await page.route(/\/admin\/public-models$/, async (route) => {
+    if (hold && route.request().method() === "GET") await new Promise((r) => setTimeout(r, 2_500));
+    await route.continue();
+  });
+  hold = true;
+  const modelsRead = page.waitForResponse(
+    (r) => r.request().method() === "GET" && /\/admin\/resources\/models$/.test(new URL(r.url()).pathname),
+  );
+  await form.getByRole("button", { name: "保存" }).click();
+  await expect(page.getByText(`已保存「${publicName}」的路由设置`)).toBeVisible();
+  await modelsRead;
+  // The remounted form shows what was just saved, not the defaults.
+  const again = page.getByRole("form", { name: `编辑模型「${publicName}」` });
+  await expect(again.getByLabel("选路策略")).toHaveValue("failover");
+  await expect(again.getByLabel("重试次数")).toHaveValue("2");
+
+  // Changing one more field and saving keeps the others.
+  await again.getByLabel("最多切换几个目标").fill("1");
+  await again.getByRole("button", { name: "保存" }).click();
+  await expect
+    .poll(async () => (await publicView(pub.id)).routing, { timeout: APPLIED_WITHIN_MS })
+    .toEqual({ strategy: "failover", retries: 2, max_fallbacks: 1 });
+  await page.unroute(/\/admin\/public-models$/);
+});
+
+test("内部直连行的查看打开只读表单：名称、账号、上游模型都在，没有修改入口", async ({ page }) => {
+  const suffix = randomUUID().slice(0, 8);
+  const accountName = `acct-view-direct-${suffix}`;
+  const account = await mockAccount(accountName, ["shared"]);
+  const publicName = `pub-view-direct-${suffix}`;
+  const pub = await newPublicModel(publicName);
+  const upstream = `gpt-view-up-${suffix}`;
+  await stack.admin.put(`/admin/provider-keys/${account.id}/channel-models/${pub.id}`, {
+    upstream_model: upstream,
+    priority: 1,
+    weight: 1,
+  });
+  const directName = `${publicName}#${accountName}`;
+  const viewer = { email: `viewer-direct-${suffix}@e2e.local`, password: "viewer-direct-pass-4c2" };
+  const created = await stack.admin.request("POST", "/admin/operators", { ...viewer, role: "viewer" });
+  expect(created.status, created.text).toBe(201);
+
+  for (const who of [stack.operator, viewer]) {
+    await page.context().clearCookies();
+    await openModels(page, who);
+    await showInternal(page, true);
+    const row = modelRow(page, directName);
+    await row.getByRole("button", { name: "查看", exact: true }).click();
+    const form = page.getByRole("form", { name: `模型「${directName}」` });
+    await expect(form, who.email).toBeVisible();
+    await expect(form.getByLabel("对外名称")).toHaveValue(directName);
+    await expect(form.getByLabel("对外名称")).toBeDisabled();
+    await expect(form.getByLabel("上游账号")).toHaveValue(account.id);
+    await expect(form.getByLabel("上游账号")).toBeDisabled();
+    await expect(form.getByLabel("上游模型")).toHaveValue(upstream);
+    await expect(form.getByLabel("上游模型")).toBeDisabled();
+    await expect(form.getByRole("button", { name: "保存" })).toHaveCount(0);
+    await form.getByRole("button", { name: "关闭" }).click();
+    await expect(form).toHaveCount(0);
+  }
+});
