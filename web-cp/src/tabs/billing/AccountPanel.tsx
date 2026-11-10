@@ -1,4 +1,4 @@
-import { useEffect, useState, type ComponentType, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ComponentType, type ReactNode } from "react";
 import type { TabProps } from "../../App";
 import { Msg, type Note } from "../../components/Msg";
 import {
@@ -132,12 +132,13 @@ function CreditLimit({ account, canEdit, onChanged }: RegionProps) {
     }
   }
 
-  // A tenant with no credit limit has only its balance to spend. Postpaid
-  // says so up front, because that is also why every call is refused while
-  // the balance is not positive; prepaid says which of the two cases it is
-  // in, and a tenant still holding money sees no warning at all.
-  const postpaidUnset = account.billing_mode === "postpaid" && !account.is_internal && account.credit_limit_micro_cny === 0;
-  const prepaidOut = account.billing_mode === "prepaid" && !account.credit_limit_micro_cny && !account.is_internal && account.exhausted;
+  // A tenant with no credit limit has only its balance to spend, in either
+  // mode (available = balance + credit). Calls are refused only once that is
+  // used up, so the warning waits for the account to be exhausted; until
+  // then the hint says the balance is what is left.
+  const noCredit = !account.is_internal && !account.credit_limit_micro_cny;
+  const postpaidUnset = account.billing_mode === "postpaid" && noCredit && account.exhausted;
+  const prepaidOut = account.billing_mode === "prepaid" && noCredit && account.exhausted;
   const problem = localError ?? refused?.at.get("/credit_limit_cny") ?? null;
   return (
     <Region label="信用额度">
@@ -151,9 +152,7 @@ function CreditLimit({ account, canEdit, onChanged }: RegionProps) {
           余额与信用额度都用尽，调用会被拒绝
         </div>
       )}
-      {account.billing_mode === "prepaid" && !account.is_internal && !account.credit_limit_micro_cny && !account.exhausted && (
-        <p className="hint">尚无信用额度：余额用尽即停止调用</p>
-      )}
+      {noCredit && !account.exhausted && <p className="hint">尚无信用额度：余额用尽即停止调用</p>}
       {account.is_internal ? (
         <p className="hint">平台内部租户不受余额与信用额度限制。</p>
       ) : !canEdit ? (
@@ -318,38 +317,47 @@ function Ledger({ account }: RegionProps) {
   const [more, setMore] = useState<{ items: LedgerItem[]; next: number | null } | null>(null);
   const [moreBusy, setMoreBusy] = useState(false);
   const [moreError, setMoreError] = useState<string | null>(null);
+  // Bumped whenever the first page shown changes: a continuation started
+  // under an earlier one is not this list's, so its answer is dropped.
+  const moreSeq = useRef(0);
   const range = days.from || days.to ? utcRange(days.from || "1970-01-01", days.to || todayUtc()) : {};
+  const query = { ...(days.from || days.to ? range : {}), ...(kind ? { kind } : {}) };
+  // The filter as chosen, not the instants it resolves to (an open end moves
+  // with the date).
+  const key = JSON.stringify([days.from, days.to, kind]);
+  // Each first page carries the filter it answers, so the list and its next
+  // page are only ever taken from the filter shown now.
   const first = useLoad(
-    () =>
-      days.backwards
-        ? Promise.resolve(null)
-        : billing.ledger(account.tenant_id, { ...(days.from || days.to ? range : {}), ...(kind ? { kind } : {}) }),
+    () => (days.backwards ? Promise.resolve(null) : billing.ledger(account.tenant_id, query).then((page) => ({ key, query, page }))),
     [account.tenant_id, account.balance_micro_cny, days.from, days.to, days.backwards, kind],
   );
+  // The first page of the filter shown; `null` while it is on its way, when
+  // an older filter's page must not stand in for it.
+  const base = first.data?.key === key ? first.data : null;
   // A new first page replaces whatever was loaded after the old one.
   useEffect(() => {
+    moreSeq.current += 1;
     setMore(null);
     setMoreError(null);
-  }, [first.data]);
+    setMoreBusy(false);
+  }, [base]);
 
-  const items = first.data ? [...first.data.items, ...(more?.items ?? [])] : null;
-  const next = more ? more.next : (first.data?.next_before ?? null);
+  const items = base ? [...base.page.items, ...(more?.items ?? [])] : null;
+  const next = base === null ? null : more ? more.next : base.page.next_before;
 
   async function loadMore() {
-    if (next === null) return;
+    if (base === null || next === null) return;
+    const mine = ++moreSeq.current;
     setMoreBusy(true);
     setMoreError(null);
     try {
-      const page = await billing.ledger(account.tenant_id, {
-        ...(days.from || days.to ? range : {}),
-        ...(kind ? { kind } : {}),
-        before: next,
-      });
+      const page = await billing.ledger(account.tenant_id, { ...base.query, before: next });
+      if (mine !== moreSeq.current) return;
       setMore((m) => ({ items: [...(m?.items ?? []), ...page.items], next: page.next_before }));
     } catch (e) {
-      setMoreError(errorText(e));
+      if (mine === moreSeq.current) setMoreError(errorText(e));
     } finally {
-      setMoreBusy(false);
+      if (mine === moreSeq.current) setMoreBusy(false);
     }
   }
 
