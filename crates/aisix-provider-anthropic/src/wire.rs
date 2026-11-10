@@ -1019,6 +1019,19 @@ fn translate_service_tier(extras: &mut serde_json::Map<String, serde_json::Value
     }
 }
 
+/// Anthropic's `service_tier` in OpenAI's vocabulary, the inverse of
+/// [`translate_service_tier`]: `standard_only` asks for standard capacity,
+/// which Chat Completions calls `default`, and `auto` is the same word on
+/// both (<https://platform.claude.com/docs/en/api/messages>,
+/// <https://platform.openai.com/docs/api-reference/chat/create>). Anything
+/// else is the upstream's own to answer.
+fn service_tier_to_openai(tier: serde_json::Value) -> serde_json::Value {
+    match tier.as_str() {
+        Some("standard_only") => "default".into(),
+        _ => tier,
+    }
+}
+
 /// OpenAI's `stop` (a string or an array of strings) as Anthropic's
 /// `stop_sequences`, which takes an array only. A `stop_sequences` the
 /// caller sent natively wins. `null` and an empty array set nothing; any
@@ -1693,10 +1706,15 @@ fn block_has_cache_control(block: &serde_json::Value) -> bool {
 ///
 ///   - a server tool — a `type` that is not one of OpenAI's own tool kinds,
 ///     plus a `name` (e.g. `web_search_20250305` / `web_search`);
-///   - a client tool — a `name` plus an `input_schema`, with no `type`.
+///   - a client tool — a `name` plus an `input_schema`, with no `type` or
+///     with the optional `type: "custom"` Anthropic allows on it
+///     (`anthropic-sdk-python` `types/tool_param.py`, `type:
+///     Optional[Literal["custom"]]`).
 ///
-/// `type: "custom"` is OpenAI's freeform-tool kind, not an Anthropic one, so
-/// it is excluded explicitly rather than mistaken for a server tool.
+/// `type: "custom"` is also OpenAI's freeform-tool kind, which nests its
+/// definition under `custom` and has no `input_schema`; only the flat
+/// Anthropic declaration is forwarded, so a freeform tool is never mistaken
+/// for a server tool or given a schema it does not have.
 ///
 /// Forwarding verbatim is deliberate: these declarations carry optional
 /// fields the gateway has no reason to model (`max_uses`, `allowed_domains`,
@@ -1717,9 +1735,12 @@ fn anthropic_native_tool(tool: &serde_json::Value) -> Option<serde_json::Value> 
         return None;
     }
     let native = match obj.get("type").and_then(|v| v.as_str()) {
+        // An Anthropic client tool that names its optional type; OpenAI's
+        // freeform tool nests its definition under `custom` instead.
+        Some("custom") => obj.contains_key("input_schema") && !obj.contains_key("custom"),
         // A versioned Anthropic server tool (`web_search_20250305`,
         // `web_fetch_20250910`, `code_execution_20260120`, …).
-        Some(t) => t != "custom" && !obj.contains_key("function"),
+        Some(_) => !obj.contains_key("function"),
         // No `type` at all: an Anthropic client tool is `{name,
         // description, input_schema}`.
         None => obj.contains_key("input_schema"),
@@ -1758,10 +1779,16 @@ pub fn translate_openai_tools_to_anthropic(
                 anthropic_tool.insert("strict".into(), strict.clone());
             }
             // OpenAI's `parameters` (JSON Schema) maps to Anthropic's
-            // `input_schema` verbatim — both are JSON Schema.
-            if let Some(params) = function.get("parameters") {
-                anthropic_tool.insert("input_schema".into(), params.clone());
-            }
+            // `input_schema` verbatim — both are JSON Schema. Omitting it
+            // declares a function that takes no arguments, while Anthropic
+            // requires the field, so an omitted one is written as the
+            // empty object schema; one the caller sent, `null` included,
+            // goes as sent.
+            let params = function
+                .get("parameters")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({"type": "object", "properties": {}}));
+            anthropic_tool.insert("input_schema".into(), params);
             // Anthropic tools accept a `cache_control` prompt-cache
             // marker on the tool entry
             // (<https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching>).
@@ -1893,15 +1920,18 @@ fn anthropic_tools_to_openai(
 
 /// An Anthropic server tool: Anthropic runs it itself, so no other upstream
 /// can — offering one there as a function the model may call would invent
-/// a tool nobody executes. Anthropic's client tools (`bash_*`,
-/// `text_editor_*`, `computer_*`, `memory_*`) are executed by the caller
-/// and are not in this list.
+/// a tool nobody executes. The advisor tool (`advisor_20260301`) is one:
+/// Anthropic runs the advisor model's sub-inference and the caller executes
+/// nothing (<https://platform.claude.com/docs/en/agents-and-tools/tool-use/advisor-tool>).
+/// Anthropic's client tools (`bash_*`, `text_editor_*`, `computer_*`,
+/// `memory_*`) are executed by the caller and are not in this list.
 fn is_anthropic_server_tool(tool_type: &str) -> bool {
     const SERVER_TOOL_PREFIXES: &[&str] = &[
         "web_search_",
         "web_fetch_",
         "code_execution_",
         "tool_search_tool_",
+        "advisor_",
     ];
     SERVER_TOOL_PREFIXES
         .iter()
@@ -1951,6 +1981,7 @@ pub fn translate_anthropic_tool_choice_to_openai(
 ///   tool_choice.disable_parallel_tool_use → parallel_tool_calls
 ///   stop_sequences                     → stop
 ///   metadata.user_id                   → user
+///   service_tier                       → service_tier (`standard_only` as `default`)
 ///   thinking / output_config.effort    → reasoning_effort
 ///   output_format / output_config.format → response_format
 ///
@@ -2007,6 +2038,9 @@ pub fn translate_extras_to_openai_shape_with(
                 if let Some(user_id) = value.get("user_id").and_then(|v| v.as_str()) {
                     extra.insert("user".to_string(), user_id.into());
                 }
+            }
+            "service_tier" if !value.is_null() => {
+                extra.insert("service_tier".to_string(), service_tier_to_openai(value));
             }
             "thinking" => thinking = Some(value),
             "output_config" => output_config = Some(value),
@@ -5913,6 +5947,72 @@ mod tests {
         assert_eq!(translated[0]["input_schema"]["type"], "object");
     }
 
+    /// Anthropic lets a client tool name its type as `custom`
+    /// (`types/tool_param.py`), the same declaration as one that omits it,
+    /// so both survive; OpenAI's freeform `custom` tool, nested under
+    /// `custom`, still does not.
+    #[test]
+    fn an_anthropic_client_tool_typed_custom_is_forwarded_verbatim() {
+        let typed = serde_json::json!({
+            "type": "custom", "name": "lookup", "description": "d",
+            "input_schema": {"type": "object", "properties": {}},
+        });
+        let tools = serde_json::json!([
+            typed.clone(),
+            {"type": "custom", "custom": {"name": "freeform"}},
+            {"type": "custom", "name": "freeform_flat", "format": {"type": "text"}},
+        ]);
+        let translated = translate_openai_tools_to_anthropic(tools).unwrap();
+        assert_eq!(translated, vec![typed]);
+    }
+
+    /// OpenAI documents an omitted `parameters` as a function with an empty
+    /// parameter list; Anthropic requires `input_schema`, so the omission is
+    /// written as the empty object schema. A schema the caller sent, `null`
+    /// included, is the caller's and goes as sent.
+    #[test]
+    fn a_function_without_parameters_gets_the_empty_input_schema() {
+        let tools = serde_json::json!([
+            {"type": "function", "function": {"name": "now"}},
+            {"type": "function", "function": {"name": "nulled", "parameters": null}},
+            {"type": "function",
+             "function": {"name": "typed", "parameters": {"type": "object", "required": ["x"]}}},
+        ]);
+        let translated = translate_openai_tools_to_anthropic(tools).unwrap();
+        assert_eq!(
+            translated[0]["input_schema"],
+            serde_json::json!({"type": "object", "properties": {}})
+        );
+        assert_eq!(translated[1]["input_schema"], serde_json::Value::Null);
+        assert_eq!(
+            translated[2]["input_schema"],
+            serde_json::json!({"type": "object", "required": ["x"]})
+        );
+    }
+
+    /// The legacy `functions` field reaches the same writer once it is
+    /// carried as tools, so an argument-less legacy function gets the same
+    /// schema.
+    #[test]
+    fn a_legacy_function_without_parameters_gets_the_empty_input_schema() {
+        let mut req = ChatFormat::new("claude", vec![ChatMessage::user("hi")]);
+        req.extra.insert(
+            "functions".into(),
+            serde_json::json!([{"name": "now", "description": "the time"}]),
+        );
+        let (req, _) =
+            aisix_gateway::tool_calls::legacy_functions_as_tools(std::borrow::Cow::Owned(req))
+                .unwrap();
+        let (system, messages) = split_system(&req).unwrap();
+        let built = build_request(&req, "claude-sonnet-4-5", system, messages, false).unwrap();
+        let wire = serde_json::to_value(&built).unwrap();
+        assert_eq!(wire["tools"][0]["name"], "now");
+        assert_eq!(
+            wire["tools"][0]["input_schema"],
+            serde_json::json!({"type": "object", "properties": {}})
+        );
+    }
+
     /// The mirror: an OpenAI built-in tool is NOT rewritten into an
     /// Anthropic server tool. The two run different indexes and return
     /// different citation shapes, so a mapping would look successful while
@@ -6535,6 +6635,35 @@ mod tests {
             .collect();
         assert_eq!(names, ["bash", "f"]);
         assert_eq!(tools[1]["function"]["strict"], true);
+    }
+
+    /// Anthropic runs the advisor tool's sub-inference itself, so another
+    /// upstream offered it as a function would ask the caller to execute a
+    /// tool it has no executor for. A choice that named only it goes with
+    /// it, and a sibling client tool stays.
+    #[test]
+    fn the_advisor_server_tool_is_dropped_on_the_way_to_chat() {
+        let advisor = serde_json::json!(
+            {"type": "advisor_20260301", "name": "advisor", "model": "claude-opus-4-1"}
+        );
+        let mut extra = serde_json::json!({
+            "tools": [advisor.clone()],
+            "tool_choice": {"type": "any"},
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        translate_extras_to_openai_shape(&mut extra, MappedEffort::AsWritten);
+        assert!(!extra.contains_key("tools"), "{extra:?}");
+        assert!(!extra.contains_key("tool_choice"), "{extra:?}");
+
+        let tools = translate_anthropic_tools_to_openai(serde_json::json!([
+            advisor,
+            {"name": "f", "input_schema": {"type": "object"}},
+        ]))
+        .unwrap();
+        assert_eq!(tools.as_array().unwrap().len(), 1, "{tools}");
+        assert_eq!(tools[0]["function"]["name"], "f");
     }
 
     #[test]
@@ -7538,7 +7667,6 @@ mod tests {
             "top_k": 40,
             "mcp_servers": [{"type": "url", "url": "https://example.com/mcp"}],
             "container": "container_abc",
-            "service_tier": "standard_only",
             "betas": ["context-management-2025-06-27"],
             "anthropic_version": "2023-06-01",
         })
@@ -7547,6 +7675,28 @@ mod tests {
         .clone();
         translate_extras_to_openai_shape(&mut extra, MappedEffort::AsWritten);
         assert!(extra.is_empty(), "expected all dropped, got: {extra:?}");
+    }
+
+    /// Anthropic's `service_tier` takes `auto` or `standard_only`; Chat
+    /// Completions calls standard capacity `default` and `auto` the same.
+    /// An absent or `null` tier stays absent, and any other value is the
+    /// upstream's to answer.
+    #[test]
+    fn extras_shape_carries_service_tier_in_openai_vocabulary() {
+        for (sent, want) in [
+            (Some(serde_json::json!("standard_only")), Some(serde_json::json!("default"))),
+            (Some(serde_json::json!("auto")), Some(serde_json::json!("auto"))),
+            (Some(serde_json::json!("priority")), Some(serde_json::json!("priority"))),
+            (Some(serde_json::Value::Null), None),
+            (None, None),
+        ] {
+            let mut extra = serde_json::Map::new();
+            if let Some(tier) = sent.clone() {
+                extra.insert("service_tier".into(), tier);
+            }
+            translate_extras_to_openai_shape(&mut extra, MappedEffort::AsWritten);
+            assert_eq!(extra.get("service_tier").cloned(), want, "{sent:?}");
+        }
     }
 
     #[test]

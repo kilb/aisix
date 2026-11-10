@@ -361,4 +361,56 @@ describe("tools cross-provider e2e: OpenAI tools → Anthropic upstream tool_use
     };
     expect(sentBody.tool_choice).toEqual({ type: "auto" });
   });
+
+  // OpenAI documents an omitted `parameters` as a function that takes no
+  // arguments; Anthropic requires `input_schema` on every client tool.
+  // A tool the caller already wrote in Anthropic's own client-tool shape,
+  // naming its optional `type: "custom"`, is the target's declaration and
+  // goes as written.
+  test("an argument-less function and a typed Anthropic client tool reach Anthropic as valid tools", async (ctx) => {
+    if (!etcdReachable || !app || !upstream) {
+      ctx.skip();
+      return;
+    }
+
+    const anthropicClientTool = {
+      type: "custom",
+      name: "lookup",
+      description: "Look a word up",
+      input_schema: {
+        type: "object",
+        properties: { word: { type: "string" } },
+        required: ["word"],
+      },
+    };
+    const baseline = upstream.receivedRequests.length;
+    const res = await fetch(`${app.proxyUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${CALLER_PLAINTEXT}`,
+      },
+      body: JSON.stringify({
+        model: "tools-xprov",
+        messages: [{ role: "user", content: "What time is it?" }],
+        tools: [
+          { type: "function", function: { name: "now", description: "The time" } },
+          anthropicClientTool,
+        ],
+      }),
+    });
+    expect(res.status).toBe(200);
+
+    const messagesReq = upstream.receivedRequests
+      .slice(baseline)
+      .find((r) => r.path === "/v1/messages");
+    expect(messagesReq).toBeDefined();
+    const sentBody = JSON.parse(messagesReq!.body) as {
+      tools?: Array<Record<string, unknown>>;
+    };
+    expect(sentBody.tools).toHaveLength(2);
+    const now = sentBody.tools?.find((t) => t.name === "now");
+    expect(now?.input_schema).toEqual({ type: "object", properties: {} });
+    expect(sentBody.tools?.find((t) => t.name === "lookup")).toEqual(anthropicClientTool);
+  });
 });

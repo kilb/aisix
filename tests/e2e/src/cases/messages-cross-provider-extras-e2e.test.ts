@@ -21,6 +21,11 @@ import {
 //
 // The gateway must translate what maps cleanly onto the OpenAI chat
 // shape and drop the rest — never forward Anthropic-only fields.
+//
+// `service_tier` is not Anthropic-only: Chat Completions has the same knob,
+// and Anthropic's `standard_only` is the tier it calls `default`. A
+// server-executed Anthropic tool (the advisor) has no executor behind a
+// Chat Completions upstream, so it must not be offered there as a function.
 
 // Every Anthropic-only /v1/messages field with no OpenAI equivalent,
 // including newer SDK fields like context_management (the #953 trigger).
@@ -34,7 +39,6 @@ const ANTHROPIC_ONLY_FIELDS: Record<string, unknown> = {
     { type: "url", url: "https://example.com/mcp", name: "example" },
   ],
   container: "container_abc",
-  service_tier: "standard_only",
   betas: ["context-management-2025-06-27"],
   anthropic_version: "2023-06-01",
 };
@@ -44,6 +48,14 @@ function expectNoAnthropicOnlyFields(sentBody: Record<string, unknown>) {
     expect(sentBody[key], `\`${key}\` leaked to upstream`).toBeUndefined();
   }
 }
+
+// Anthropic runs the advisor's sub-inference itself; the caller executes
+// nothing for it.
+const ADVISOR_TOOL = {
+  type: "advisor_20260301",
+  name: "advisor",
+  model: "claude-opus-4-1",
+};
 
 const CALLER_PLAINTEXT = "sk-anth-extras-xprov-caller";
 const CALLER_KEY_HASH = createHash("sha256")
@@ -149,8 +161,10 @@ describe("Anthropic Messages → OpenAI upstream: Anthropic-only extras are not 
             description: "Get the current time",
             input_schema: { type: "object", properties: {} },
           },
+          ADVISOR_TOOL,
         ],
         tool_choice: { type: "auto" },
+        service_tier: "standard_only",
         messages: [{ role: "user", content: "hello" }],
         ...ANTHROPIC_ONLY_FIELDS,
       }),
@@ -184,6 +198,7 @@ describe("Anthropic Messages → OpenAI upstream: Anthropic-only extras are not 
     expect(tools[0]?.type).toBe("function");
     expect(tools[0]?.function?.name).toBe("get_time");
     expect(sentBody.tool_choice).toBe("auto");
+    expect(sentBody.service_tier).toBe("default");
   });
 });
 
@@ -294,6 +309,9 @@ describe("Anthropic Messages → OpenAI upstream: streaming extras are not forwa
         model: "anth-extras-stream-xprov",
         max_tokens: 200,
         stream: true,
+        tools: [ADVISOR_TOOL],
+        tool_choice: { type: "any" },
+        service_tier: "auto",
         messages: [{ role: "user", content: "hello" }],
         ...ANTHROPIC_ONLY_FIELDS,
       }),
@@ -310,5 +328,10 @@ describe("Anthropic Messages → OpenAI upstream: streaming extras are not forwa
 
     expectNoAnthropicOnlyFields(sentBody);
     expect(sentBody.stream).toBe(true);
+    // The advisor was the only tool: nothing is offered, and the choice
+    // that would have forced a call goes with it.
+    expect(sentBody.tools).toBeUndefined();
+    expect(sentBody.tool_choice).toBeUndefined();
+    expect(sentBody.service_tier).toBe("auto");
   });
 });
