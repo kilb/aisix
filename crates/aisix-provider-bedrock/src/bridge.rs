@@ -1136,15 +1136,16 @@ impl Bridge for BedrockBridge {
 
     /// A Converse `toolResult` holds images and documents beside its text
     /// (<https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_ToolResultContentBlock.html>),
-    /// and every request for a model outside Claude and the Chat
-    /// Completions route goes to Converse. Claude answers a chat request
-    /// over the Messages wire, whose shared builder takes a tool result's
-    /// text only, and a Chat Completions model can be sent to that endpoint,
-    /// whose `tool` message is text only.
-    fn reads_tool_result_media(&self, ctx: &BridgeContext) -> bool {
+    /// and every request for a model outside Claude that the Chat
+    /// Completions endpoint does not serve goes to Converse — a GPT request
+    /// carrying tools among them ([`crate::openai_compat::serves`]). Claude
+    /// answers a chat request over the Messages wire, whose shared builder
+    /// takes a tool result's text only, and the Chat Completions endpoint's
+    /// `tool` message is text only.
+    fn reads_tool_result_media(&self, req: &ChatFormat, ctx: &BridgeContext) -> bool {
         upstream_model(ctx).is_ok_and(|id| {
             BedrockPublisher::from_model_id(id) != Some(BedrockPublisher::Anthropic)
-                && !crate::openai_compat::is_default_route(id)
+                && !crate::openai_compat::serves(req, id)
         })
     }
 
@@ -8667,22 +8668,47 @@ mod tests {
         }
     }
 
+    /// Decided on the route the request itself takes: a GPT request
+    /// carrying tools is served by Converse, which keeps a tool result's
+    /// image, and one without them by Chat Completions, which does not.
     #[test]
     fn reads_tool_result_media_only_where_converse_serves_the_request() {
         let bridge = BedrockBridge::new();
-        for (id, reads) in [
-            ("amazon.nova-pro-v1:0", true),
-            ("us.amazon.nova-lite-v1:0", true),
-            ("meta.llama3-3-70b-instruct-v1:0", true),
-            ("anthropic.claude-3-5-haiku-20241022-v1:0", false),
-            ("us.xai.grok-4-1-fast-v1:0", false),
+        let tool = serde_json::json!([{"type": "function", "function": {"name": "f"}}]);
+        let plain = serde_json::json!({});
+        let tools = serde_json::json!({"tools": tool});
+        let tools_without_reasoning =
+            serde_json::json!({"tools": tool, "reasoning_effort": "none"});
+        for (id, extra, reads) in [
+            ("amazon.nova-pro-v1:0", &plain, true),
+            ("us.amazon.nova-lite-v1:0", &tools, true),
+            ("meta.llama3-3-70b-instruct-v1:0", &plain, true),
+            ("anthropic.claude-3-5-haiku-20241022-v1:0", &tools, false),
+            ("us.xai.grok-4-1-fast-v1:0", &plain, false),
+            ("us.xai.grok-4-1-fast-v1:0", &tools, false),
+            ("us.openai.gpt-5.6-sol", &plain, false),
+            ("us.openai.gpt-5.6-sol", &tools, true),
+            ("us.openai.gpt-5.6-sol", &tools_without_reasoning, false),
+            ("openai.gpt-5.6-sol", &plain, true),
         ] {
+            let mut body = serde_json::json!({
+                "model": "m",
+                "messages": [{"role": "user", "content": "hi"}],
+            });
+            for (k, v) in extra.as_object().unwrap() {
+                body[k] = v.clone();
+            }
+            let req: ChatFormat = serde_json::from_value(body).unwrap();
             let ctx = BridgeContext::new(
                 "r",
                 sample_model_with(id),
                 sample_pk_with_secret(valid_secret_json()),
             );
-            assert_eq!(bridge.reads_tool_result_media(&ctx), reads, "{id}");
+            assert_eq!(
+                bridge.reads_tool_result_media(&req, &ctx),
+                reads,
+                "{id} {extra}"
+            );
         }
     }
 }

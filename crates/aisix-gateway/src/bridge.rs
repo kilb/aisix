@@ -1148,13 +1148,16 @@ pub trait Bridge: Send + Sync + 'static {
         false
     }
 
-    /// Whether the upstream `ctx` dispatches to carries images and documents
-    /// inside a tool result, read off a `role:"tool"` message's content
-    /// parts. A translation from a protocol whose tool results hold media
-    /// (Anthropic Messages) keeps them only when this is true; Chat
-    /// Completions takes text alone in a `tool` message and answers an image
-    /// there with a 400. The default is `false`.
-    fn reads_tool_result_media(&self, _ctx: &BridgeContext) -> bool {
+    /// Whether the upstream `ctx` dispatches `req` to carries images and
+    /// documents inside a tool result, read off a `role:"tool"` message's
+    /// content parts. Asked about the request as it will be sent, because a
+    /// bridge can choose its endpoint by the request (Bedrock serves a GPT
+    /// request carrying tools through Converse, and one without through
+    /// Chat Completions). A translation from a protocol whose tool results
+    /// hold media (Anthropic Messages) keeps them only when this is true;
+    /// Chat Completions takes text alone in a `tool` message and answers an
+    /// image there with a 400. The default is `false`.
+    fn reads_tool_result_media(&self, _req: &ChatFormat, _ctx: &BridgeContext) -> bool {
         false
     }
 

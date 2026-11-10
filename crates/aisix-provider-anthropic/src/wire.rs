@@ -3475,6 +3475,27 @@ pub fn parse_inbound_request_with(
     parse_inbound(body, InboundUse::Dispatch, markers, media)
 }
 
+/// Turn a request parsed under [`ToolResultMedia::Keep`] into the one
+/// [`ToolResultMedia::Drop`] parses: every `role:"tool"` message holding
+/// media keeps the text of its text parts alone. For a dispatch whose
+/// upstream, known only once the request is translated
+/// ([`aisix_gateway::Bridge::reads_tool_result_media`]), takes a tool
+/// result's text only.
+pub fn drop_tool_result_media(chat: &mut ChatFormat) {
+    use serde_json::Value;
+    for message in chat.messages.iter_mut().filter(|m| m.role == Role::Tool) {
+        if let Some(parts) = message.content_blocks.take() {
+            message.content = Some(
+                parts
+                    .iter()
+                    .filter(|p| p.get("type").and_then(Value::as_str) == Some("text"))
+                    .filter_map(|p| p.get("text").and_then(Value::as_str))
+                    .collect(),
+            );
+        }
+    }
+}
+
 /// The same parse, for the **input guardrail scan**: an assistant turn's
 /// `thinking` blocks contribute their text.
 ///
@@ -10045,6 +10066,55 @@ mod tests {
         // A text-only result keeps its plain-string shape.
         assert_eq!(chat.messages[1].content_str(), "plain");
         assert!(chat.messages[1].content_blocks.is_none());
+    }
+
+    /// Dropping the media of a request parsed with it kept is the request
+    /// parsed without it, byte for byte, markers included: a dispatch that
+    /// learns only after translating that its upstream takes text sends what
+    /// it always sent there.
+    #[test]
+    fn dropping_kept_tool_result_media_matches_a_parse_that_dropped_it() {
+        let body = serde_json::json!({
+            "model": "claude",
+            "messages": [
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "t1", "name": "shot", "input": {}},
+                    {"type": "tool_use", "id": "t2", "name": "shot", "input": {}},
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "cache_control": {"type": "ephemeral"},
+                     "content": [
+                        {"type": "text", "text": "screen "},
+                        {"type": "image", "source": {
+                            "type": "base64", "media_type": "image/png", "data": "aWc="
+                        }},
+                        {"type": "image", "source": {"type": "file", "file_id": "f1"}},
+                        {"type": "text", "text": "two"},
+                        {"type": "document", "title": "r.pdf", "source": {
+                            "type": "base64", "media_type": "application/pdf", "data": "JVBE"
+                        }},
+                    ]},
+                    {"type": "tool_result", "tool_use_id": "t2", "content": "plain"},
+                    {"type": "image", "source": {
+                        "type": "base64", "media_type": "image/png", "data": "aWc="
+                    }},
+                    {"type": "text", "text": "and this"},
+                ]},
+            ],
+        });
+        for markers in [CacheMarkers::Drop, CacheMarkers::Keep] {
+            let mut kept =
+                parse_inbound_request_with(&body, markers, ToolResultMedia::Keep).unwrap();
+            assert!(kept.messages[1].content_blocks.is_some(), "{markers:?}");
+            drop_tool_result_media(&mut kept);
+            let dropped =
+                parse_inbound_request_with(&body, markers, ToolResultMedia::Drop).unwrap();
+            assert_eq!(
+                serde_json::to_value(&kept).unwrap(),
+                serde_json::to_value(&dropped).unwrap(),
+                "{markers:?}"
+            );
+        }
     }
 
     #[test]
