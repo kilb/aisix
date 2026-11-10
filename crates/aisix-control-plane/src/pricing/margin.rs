@@ -1,20 +1,18 @@
-//! The realised margin: what the platform earned against what its upstreams
-//! cost it (D17).
+//! The margin: what the platform charged against what its upstream
+//! accounts cost it, both in CNY.
 //!
-//! No exchange rate is stored anywhere in this platform. A charge is in CNY
-//! and an upstream cost is in USD, so margin is shown as the **realised
-//! rate**: the CNY a group charged per USD of upstream cost, over the rows
-//! whose cost is known ([`realised`]). An operator compares it with what the
-//! platform pays for its dollars; when the cost is the official list price,
-//! the realised rate equals the configured rate, which is the self-check.
+//! A charge is micro-CNY, and so is a cost: the charge's own baseline lines
+//! at the serving account's cost rate (`pricing::cost_rates`). Profit is the
+//! charge less the cost, and the margin is that profit as a percentage of
+//! the charge, both over the rows whose cost is known ([`margin_pct`]).
 //!
-//! A row's cost is known only when it names the upstream that served it and
-//! a cost price covers that pair: a row that names neither carries no cost,
-//! and a cost nobody knows never enters the cost side of a ratio. Such rows
-//! are counted apart (`rows_without_cost`) rather than dropped silently, so
-//! an operator can see how much of a period's charge the cost side does not
-//! cover — and their money is still in `charged_micro_cny`, because they were
-//! charged.
+//! A row's cost is known only when it names the account that served it and
+//! that account has a cost rate in force for the model; a row priced before
+//! cost became a rate has no CNY cost either. A cost nobody knows never
+//! enters the cost side, and is never read as 0: such rows are counted apart
+//! (`rows_without_cost`) rather than dropped silently, so an operator can
+//! see how much of a period's charge the cost side does not cover — and
+//! their money is still in `charged_micro_cny`, because they were charged.
 //!
 //! This API names upstream costs, so it is for operators only and is never
 //! projected to tenants.
@@ -34,33 +32,31 @@ use crate::error::{ApiError, Detail};
 use crate::usage::query_rejected;
 use crate::AppState;
 
-/// The scale `realised` shows: four decimal places.
-const PLACES: i128 = 10_000;
+/// Hundredths of a percent in a whole: the margin shows two decimal places.
+const PCT_PLACES: i128 = 10_000;
 
-/// The CNY a group charged per USD of upstream cost, as four decimal places:
-/// `charged × 10⁴ / cost`, rounded half up. `None` when `cost` is at or below
-/// zero, where no ratio exists.
+/// `profit` as a percentage of `charged`, to two decimal places:
+/// `profit × 10⁴ / charged`, rounded half away from zero. `None` when
+/// `charged` is at or below zero, where no percentage exists.
 ///
-/// Integer arithmetic in `i128` throughout: a charge is at most `i64::MAX`,
-/// so `× 10_000` and the doubling below stay inside `i128`, and no float ever
-/// decides an amount.
-pub fn realised(charged_micro_cny: i64, cost_micro_usd: i64) -> Option<String> {
-    if cost_micro_usd <= 0 {
+/// Integer arithmetic in `i128` throughout: an amount is at most
+/// `i64::MAX`, so `× 10_000` and the doubling below stay inside `i128`, and
+/// no float ever decides a figure.
+pub fn margin_pct(profit_micro_cny: i64, charged_micro_cny: i64) -> Option<String> {
+    if charged_micro_cny <= 0 {
         return None;
     }
-    let numerator = i128::from(charged_micro_cny) * PLACES;
-    let cost = i128::from(cost_micro_usd);
+    let numerator = i128::from(profit_micro_cny) * PCT_PLACES;
+    let charged = i128::from(charged_micro_cny);
     // Round half away from zero: |n|/d, ties going away from zero, then the
     // sign back. `2|n| + d` over `2d` is exactly that for a positive `d`.
-    let magnitude = (numerator.abs() * 2 + cost) / (cost * 2);
-    let rounded = if numerator < 0 { -magnitude } else { magnitude };
-    let sign = if rounded < 0 { "-" } else { "" };
-    let magnitude = rounded.abs();
-    Some(format!(
-        "{sign}{}.{:04}",
-        magnitude / PLACES,
-        magnitude % PLACES
-    ))
+    let magnitude = (numerator.abs() * 2 + charged) / (charged * 2);
+    let sign = if numerator < 0 && magnitude > 0 {
+        "-"
+    } else {
+        ""
+    };
+    Some(format!("{sign}{}.{:02}", magnitude / 100, magnitude % 100))
 }
 
 #[derive(Deserialize)]
@@ -91,10 +87,16 @@ fn uuid_filter(raw: Option<&str>, path: &str) -> Result<Option<Uuid>, ApiError> 
 /// group's display name (a null group last), then the group's id, then the
 /// model's id.
 ///
+/// **The rows are the billed ones**: a charge with status `charged`, or one a
+/// re-pricing run adjusted. An exempt row (a response-cache hit, agent or
+/// tool traffic), a row that billed nothing, and an unpriced row nobody
+/// corrected carry no charge, and a rate set later would never give them a
+/// cost, so they are neither costed nor counted as unknown.
+///
 /// **`provider_key_id` keeps the rows one upstream account served**: the
 /// account the usage row names (`provider_key_id` on the stored event). Two
 /// accounts serving one public model in one group charge the same price and
-/// cost what each costs, so this is how their realised rates are told apart
+/// cost what each costs, so this is how their margins are told apart
 /// (design C7). Each item of a filtered answer names that account:
 /// `provider_key_id`, and `provider_key_display_name` read from the
 /// account's own live document, never from the event (`null` once the
@@ -114,18 +116,19 @@ fn uuid_filter(raw: Option<&str>, path: &str) -> Result<Option<Uuid>, ApiError> 
 /// range the sum of `charged_micro_cny` over every item equals the charges
 /// plus their adjustments — whatever the grouping.
 ///
-/// **The rate divides one population by itself.** `charged_micro_cny` is the
-/// group's whole corrected charge: every row's `charge_micro_cny` plus every
-/// adjustment to it. `cost_micro_usd` and `charged_with_cost_micro_cny` cover
-/// only the rows whose cost is known, and `realised_cny_per_usd` divides the
-/// second by the first — a repriced row whose cost price records nothing
-/// contributes money to the total but no cost, and dividing that money by a
-/// cost it never had would inflate the rate into a false check. So the answer
-/// carries both figures: `charged_without_cost_micro_cny` is the part of the
-/// total with no cost behind it (`charged_micro_cny` less
+/// **Profit and margin set one population against itself.**
+/// `charged_micro_cny` is the group's whole corrected charge: every row's
+/// `charge_micro_cny` plus every adjustment to it. `cost_micro_cny` and
+/// `charged_with_cost_micro_cny` cover only the rows whose cost is known;
+/// `profit_micro_cny` is the second less the first, and `margin_pct` that
+/// profit over the second ([`margin_pct`]) — a row with no known cost
+/// contributes money to the total but no cost, and setting that money
+/// against a cost it never had would inflate the profit into a false figure.
+/// So the answer carries both: `charged_without_cost_micro_cny` is the part
+/// of the total with no cost behind it (`charged_micro_cny` less
 /// `charged_with_cost_micro_cny`), and `rows_without_cost` counts its rows.
-/// A reader who trusts the rate can see exactly how much charge it does not
-/// describe.
+/// A reader who trusts the profit can see exactly how much charge it does
+/// not describe.
 ///
 /// The filters are bounded by the range, not by an index: the window is read
 /// through `pricing_charges_cny_occurred` (0027), and the range cap of 731
@@ -168,15 +171,15 @@ pub async fn list(
                                  WHERE pa.event_id = c.event_id)), 0)::bigint) \
                   AS charged, \
                 (COALESCE(SUM(c.charge_micro_cny) \
-                          FILTER (WHERE c.cost_micro_usd IS NOT NULL), 0)::bigint \
+                          FILTER (WHERE c.cost_micro_cny IS NOT NULL), 0)::bigint \
                  + COALESCE(SUM((SELECT COALESCE(SUM(pa.delta_micro_cny)::bigint, 0) \
                                  FROM pricing_adjustments_cny pa \
                                  WHERE pa.event_id = c.event_id)) \
-                            FILTER (WHERE c.cost_micro_usd IS NOT NULL), 0)::bigint) \
+                            FILTER (WHERE c.cost_micro_cny IS NOT NULL), 0)::bigint) \
                   AS charged_with_cost, \
-                COALESCE(SUM(c.cost_micro_usd), 0)::bigint AS cost, \
-                (COUNT(*) FILTER (WHERE c.cost_micro_usd IS NOT NULL))::bigint AS rows, \
-                (COUNT(*) FILTER (WHERE c.cost_micro_usd IS NULL))::bigint \
+                COALESCE(SUM(c.cost_micro_cny), 0)::bigint AS cost, \
+                (COUNT(*) FILTER (WHERE c.cost_micro_cny IS NOT NULL))::bigint AS rows, \
+                (COUNT(*) FILTER (WHERE c.cost_micro_cny IS NULL))::bigint \
                   AS rows_without_cost \
          FROM pricing_charges_cny c \
          LEFT JOIN tenant_keys k ON k.id::text = c.api_key_id \
@@ -184,6 +187,9 @@ pub async fn list(
          LEFT JOIN gw_resources r ON r.kind = 'models' AND NOT r.deleted \
                                   AND r.id::text = c.requested_model_id \
          WHERE c.occurred_at >= $1 AND c.occurred_at < $2 \
+           AND (c.status = 'charged' \
+                OR EXISTS (SELECT 1 FROM pricing_adjustments_cny pa \
+                           WHERE pa.event_id = c.event_id)) \
            AND ($3::uuid IS NULL OR COALESCE(c.group_id, k.group_id) = $3) \
            AND ($4::text IS NULL OR c.requested_model_id = $4) \
            AND ($5::text IS NULL OR EXISTS (SELECT 1 FROM usage_events ue \
@@ -234,10 +240,11 @@ pub async fn list(
                 "charged_micro_cny": row.charged,
                 "charged_with_cost_micro_cny": row.charged_with_cost,
                 "charged_without_cost_micro_cny": row.charged - row.charged_with_cost,
-                "cost_micro_usd": row.cost,
-                // The rate divides the charge that has a cost behind it by
-                // that cost: the two populations must match.
-                "realised_cny_per_usd": realised(row.charged_with_cost, row.cost),
+                "cost_micro_cny": row.cost,
+                // Profit and margin set the charge that has a cost behind it
+                // against that cost: the two populations must match.
+                "profit_micro_cny": row.charged_with_cost - row.cost,
+                "margin_pct": margin_pct(row.charged_with_cost - row.cost, row.charged_with_cost),
                 "rows": row.rows,
                 "rows_without_cost": row.rows_without_cost,
                 "provider_key_id": account,

@@ -3,7 +3,6 @@ import { test } from "node:test";
 import {
   fmtCnyPerMillion,
   fmtMicroCny,
-  fmtMicroUsd,
   fmtUtc,
   isCnyAmount,
   microCnyToInput,
@@ -24,15 +23,6 @@ test("µ¥ 金额精确格式化，不经浮点", () => {
   assert.equal(fmtMicroCny(123_456_789_012), "¥123,456.789012");
   assert.equal(fmtMicroCny(9_007_199_254_740_991), "¥9,007,199,254.740991");
   assert.equal(fmtMicroCny(-1_234_560_000), "-¥1,234.56");
-});
-
-test("µ$ 金额只剩上游成本一处使用，仍精确", () => {
-  assert.equal(fmtMicroUsd(0), "$0.00");
-  assert.equal(fmtMicroUsd(1), "$0.000001");
-  assert.equal(fmtMicroUsd(11_000), "$0.011");
-  assert.equal(fmtMicroUsd(-11_000), "-$0.011");
-  assert.equal(fmtMicroUsd(123_456_789_012), "$123,456.789012");
-  assert.equal(fmtMicroUsd(9_007_199_254_740_991), "$9,007,199,254.740991");
 });
 
 test("金额输入只接受人民币元与分", () => {

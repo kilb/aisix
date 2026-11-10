@@ -32,6 +32,7 @@
 
 pub mod api;
 pub mod baselines;
+pub mod cost_rates;
 pub mod import;
 pub mod margin;
 pub mod rates;

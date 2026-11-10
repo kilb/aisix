@@ -911,9 +911,7 @@ pub async fn get(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
-    use aisix_pricing::{BaselineRow, Catalogue, DiscountRow, GroupRateRow, PriceRows};
+    use aisix_pricing::{BaselineRow, DiscountRow, GroupRateRow, PriceRows};
     use chrono::TimeDelta;
 
     use super::*;
@@ -943,7 +941,7 @@ mod tests {
                 effective_from: from,
                 cny_per_usd_e4: Some(72_000),
             }],
-            cost: vec![],
+            cost_rates: vec![],
             discounts: vec![DiscountRow {
                 revision_id: 1,
                 engine_version: ENGINE_VERSION,
@@ -952,8 +950,7 @@ mod tests {
                 discount_bps: 5_000,
             }],
         };
-        let catalogue = Catalogue::builtin().expect("the built-in catalogue");
-        PriceBook::from_rows(rows, Arc::clone(&catalogue))
+        PriceBook::from_rows(rows)
     }
 
     fn payer(tenant: &str) -> Payer {

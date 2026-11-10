@@ -185,8 +185,12 @@ statement.
   `0027`): an older replica's intake batch therefore fails and the gateway
   sends it again, which is the fence doing its job, not a bug to route
   around. Nothing converts between the two, anywhere: there is no exchange
-  rate in this platform, and `cost_micro_usd` is the one USD figure left,
-  because an upstream's cost is in the upstream's own currency. A migration
+  rate in this platform. An upstream's cost is micro-CNY too
+  (`pricing_charges_cny.cost_micro_cny`): the charge's own baseline lines at
+  the serving account's cost rate (`pricing_cost_rates`, `0032`), never a
+  converted USD figure. `cost_micro_usd` and `pricing_cost_revisions` hold
+  the per-dimension cost cards of rows priced before that, and nothing
+  writes or prices from them any more. A migration
   that drops a fence, or a query that writes a USD table, is what
   `the_fences_refuse_every_usd_money_table_and_the_discount_still_inserts`
   and `the_usd_quota_tables_take_no_new_rows` (`tests/billing_migration.rs`)

@@ -7,12 +7,14 @@
 //! is an integer, and the charge is rounded once, upward: the model's USD
 //! baseline list price, times the payer's group rate in CNY per USD, times
 //! the tenant's discount, so any amount above zero charges at least 1 µ¥.
+//! The cost is the same baseline lines times the serving account's cost
+//! rate, rounded the same way, with no discount.
 
 use chrono::{DateTime, TimeDelta, Utc};
 use serde::Serialize;
 
-use crate::book::{CostSource, PriceBook};
-use crate::rates::{CnyPerUsd, Dimension, MicroCny, MicroUsd, Rate, Rates, ServiceTier};
+use crate::book::PriceBook;
+use crate::rates::{CnyPerUsd, Dimension, MicroCny, Rate, Rates, ServiceTier};
 use crate::usage::{quantities, BillableUsage, Inconsistency, Quantities};
 use crate::ENGINE_VERSION;
 
@@ -76,8 +78,8 @@ pub struct PricedEvent {
     pub long_context_above: Option<u64>,
     /// One line per dimension billed, in `Dimension` order.
     pub lines: Vec<ChargeLine>,
-    /// What the upstream cost the platform; `None` when unknown. It names
-    /// the upstream channel, so it stays operator-side.
+    /// What the upstream account cost the platform; `None` when unknown. It
+    /// names the upstream channel, so it stays operator-side.
     pub cost: Option<CostPriced>,
     /// The row's usage was estimated by the gateway.
     pub estimated: bool,
@@ -138,13 +140,14 @@ pub struct BaselineRef {
     pub revision_id: i64,
 }
 
-/// The group rate that priced a row.
+/// The group rate that priced a row, or the cost rate that costed it.
 #[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RateRef {
     pub revision_id: i64,
     /// The rate in effect, ten-thousandths of a CNY per USD.
     pub cny_per_usd: CnyPerUsd,
-    /// The model's own override priced it, not the group's default.
+    /// The model's own override priced it, not the group's or the
+    /// account's default.
     pub model_override: bool,
 }
 
@@ -163,11 +166,12 @@ pub struct ChargeLine {
     pub rate: Rate,
 }
 
-/// What a row cost the platform, and which cost price said so.
+/// What a row cost the platform, in micro-CNY, and the serving account's
+/// cost rate that said so.
 #[derive(Serialize, Debug, Clone, PartialEq, Eq)]
 pub struct CostPriced {
-    pub amount: MicroUsd,
-    pub source: CostSource,
+    pub amount: MicroCny,
+    pub rate: RateRef,
 }
 
 /// Something a charge did not take as the row says.
@@ -257,7 +261,7 @@ impl PricingError {
 }
 
 /// Prices one stored usage row: the tenant's charge and, when the book knows
-/// it, the platform's cost.
+/// the serving account's cost rate, the platform's cost.
 ///
 /// # Which model identity prices what
 ///
@@ -265,15 +269,18 @@ impl PricingError {
 /// (`requested_model_id`) and the upstream that served it
 /// (`upstream_provider`, `upstream_model`, `provider_key_id`). The
 /// **baseline** keys on the requested entry, the **rate** on the payer's
-/// group and the requested entry, and the **cost** on the dispatched
-/// upstream, so one platform model costs a tenant what its group charges
-/// whichever channel served it. By model shape:
+/// group and the requested entry, and the **cost** on the upstream account
+/// that served it (`provider_key_id`) and the requested entry, so one
+/// platform model costs a tenant what its group charges whichever channel
+/// served it, and costs the platform what that channel's account costs per
+/// USD of the same baseline. By model shape:
 ///
 /// - direct and embedding models are one entry, so both keys name it;
 /// - a routing or semantic group bills the group's price whichever member
-///   served, and costs the member;
+///   served, and costs at the serving member's account rate for the group;
 /// - a wildcard row bills the row's price (the row is the entry a
-///   caller-minted alias resolves to), and costs the concrete upstream model;
+///   caller-minted alias resolves to), and costs at its account's rate for
+///   the row;
 /// - an ensemble bills each sub-call row at the ensemble's price. It is
 ///   experimental, and the control plane does not grant it to tenants.
 ///
@@ -313,11 +320,14 @@ impl PricingError {
 /// 13. The charge is
 ///     `⌈Σ quantity × rate × cny_per_usd_e4 × (10000 − bps) / 10¹⁴⌉` µ¥: the
 ///     one rounding, upward, with the rate and the discount inside it.
-/// 14. The cost is the dispatched upstream's cost price at the same tier and
-///     band, `⌈Σ quantity × rate / 10⁶⌉` µ$, with no discount and no
-///     warnings. A tier it lacks, a quantity it has no rate for, or an
-///     unreadable cost revision leaves the cost unknown, never a cost that
-///     leaves something out.
+/// 14. The cost is the charge's own lines (the baseline card at the same
+///     tier and band) at the serving account's cost rate in force at
+///     `price_instant`, its override for the requested model or else its
+///     default: `⌈Σ quantity × rate × cost_cny_per_usd_e4 / 10¹⁰⌉` µ¥, the
+///     charge's formula with no discount, rounded once, upward. A row that
+///     names no account, an account with no cost rate in force, an
+///     unreadable cost-rate revision, or an amount past `i64` leaves the
+///     cost unknown, never 0, and never refuses the charge.
 pub fn price_event(
     book: &PriceBook,
     usage: &BillableUsage,
@@ -429,7 +439,7 @@ pub fn price_event(
     };
     let charge = charge_micro_cny(&lines, rate.cny, discount.map_or(0, |d| d.bps))?;
 
-    let cost = cost_of(book, u, &tier, &q, price_instant)?;
+    let cost = cost_of(book, u, &lines, price_instant);
 
     Ok(PricedEvent {
         charge,
@@ -484,31 +494,30 @@ pub fn charge_micro_cny(
         .map_err(|_| PricingError::Overflow)
 }
 
-/// What the dispatched upstream cost the platform, at `tier` and the band
-/// the row selects. `None` when the row does not name its upstream, or the
-/// book knows no usable cost for it: no readable cost price, no rates for
-/// the tier, or no rate for one of the row's quantities.
+/// What the upstream account that served the row cost the platform: the
+/// charge's own `lines` at the account's cost rate for the requested model,
+/// through [`charge_micro_cny`] with no discount, so the one rounding is the
+/// charge's. `None` when the row names no account, the account has no cost
+/// rate in force at `at`, the revision in force cannot be read, or the
+/// amount does not fit in `i64`: the cost is then unknown, and the charge
+/// stands.
 fn cost_of(
     book: &PriceBook,
     u: &BillableUsage,
-    tier: &ServiceTier,
-    q: &Quantities,
+    lines: &[ChargeLine],
     at: DateTime<Utc>,
-) -> Result<Option<CostPriced>, PricingError> {
-    let (Some(provider), Some(model)) = (&u.upstream_provider, &u.upstream_model) else {
-        return Ok(None);
-    };
-    let Some((source, card)) = book.cost(u.provider_key_id.as_deref(), provider, model, at) else {
-        return Ok(None);
-    };
-    let Some(selected) = card.select(tier, q.input_total()) else {
-        return Ok(None);
-    };
-    let Ok(lines) = lines_at(selected.rates, q) else {
-        return Ok(None);
-    };
-    let amount = ceil_micro_usd(sum(&lines), PER_MILLION)?;
-    Ok(Some(CostPriced { amount, source }))
+) -> Option<CostPriced> {
+    let account = u.provider_key_id.as_deref()?;
+    let rate = book.cost_rate(account, &u.requested_model_id, at)?.ok()?;
+    let amount = charge_micro_cny(lines, rate.cny, 0).ok()?;
+    Some(CostPriced {
+        amount,
+        rate: RateRef {
+            revision_id: rate.revision_id,
+            cny_per_usd: rate.cny,
+            model_override: rate.model_override,
+        },
+    })
 }
 
 /// A result that bills nothing: the row's own facts and nothing priced.
@@ -561,35 +570,17 @@ fn lines_at(rates: &Rates, q: &Quantities) -> Result<Vec<ChargeLine>, Dimension>
     Ok(lines)
 }
 
-/// `Σ quantity × rate`, exact: at most one line per dimension, and
-/// `rates.rs` asserts that even `× 10000` stays inside `u128`.
-fn sum(lines: &[ChargeLine]) -> u128 {
-    lines
-        .iter()
-        .map(|l| u128::from(l.quantity) * u128::from(l.rate.0))
-        .sum()
-}
-
-/// `numerator / divisor` micro-USD, rounded up.
-fn ceil_micro_usd(numerator: u128, divisor: u128) -> Result<MicroUsd, PricingError> {
-    i64::try_from(numerator.div_ceil(divisor))
-        .map(MicroUsd)
-        .map_err(|_| PricingError::Overflow)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
 
     use aisix_core::reasoning_beside_completion;
     use proptest::prelude::*;
     use serde_json::{json, Value};
 
     use crate::book::{
-        BaselineRow, CostPriceRow, DiscountRow, GroupRateRow, PriceRows, RevisionTable,
+        BaselineRow, CostRateRow, DiscountRow, GroupRateRow, PriceRows, RevisionTable,
     };
-    use crate::catalogue::Catalogue;
     use crate::rates::{RateCard, MAX_QUANTITY};
 
     /// 2026-11-06T00:00:01Z: when the control plane received the test rows.
@@ -686,20 +677,16 @@ mod tests {
         group_rate(revision_id, from, CnyPerUsd::ONE.0.into())
     }
 
-    fn cost(
-        revision_id: i64,
-        provider_key_id: Option<&str>,
-        from: &str,
-        card: Value,
-    ) -> CostPriceRow {
-        CostPriceRow {
+    /// Account `pk`'s cost rate at `e4` ten-thousandths of a CNY per USD:
+    /// its default with no `model`, else that model's override.
+    fn cost_rate(revision_id: i64, model: Option<&str>, from: &str, e4: i64) -> CostRateRow {
+        CostRateRow {
             revision_id,
             engine_version: ENGINE_VERSION,
-            upstream_provider: "openai".to_owned(),
-            upstream_model: "up-1".to_owned(),
-            provider_key_id: provider_key_id.map(str::to_owned),
+            provider_key_id: "pk".to_owned(),
+            model_id: model.map(str::to_owned),
             effective_from: ts(from),
-            card,
+            cny_per_usd_e4: Some(e4),
         }
     }
 
@@ -716,19 +703,15 @@ mod tests {
     fn book_of(
         baselines: Vec<BaselineRow>,
         rates: Vec<GroupRateRow>,
-        cost: Vec<CostPriceRow>,
+        cost_rates: Vec<CostRateRow>,
         discounts: Vec<DiscountRow>,
     ) -> PriceBook {
-        let catalogue = Catalogue::from_json(r#"{"version":"2026-11-06","entries":[]}"#).unwrap();
-        PriceBook::from_rows(
-            PriceRows {
-                baselines,
-                rates,
-                cost,
-                discounts,
-            },
-            Arc::new(catalogue),
-        )
+        PriceBook::from_rows(PriceRows {
+            baselines,
+            rates,
+            cost_rates,
+            discounts,
+        })
     }
 
     /// Model `m` at `test_card`, for group `g` at a rate of one; tenant `t`
@@ -1675,15 +1658,13 @@ mod tests {
             ],
             vec![rate_one(1, T0), nine],
             vec![
-                cost(3, None, T0, one("0.4")),
-                cost(4, None, &later, one("0.8")),
+                cost_rate(3, None, T0, 4_000),
+                cost_rate(4, None, &later, 8_000),
             ],
             vec![discount(5, "t", &later, 5_000)],
         );
         let at = |occurred_at: DateTime<Utc>| {
-            let mut u = row(
-                r#"{"prompt_tokens":1000,"upstream_provider":"openai","upstream_model":"up-1"}"#,
-            );
+            let mut u = row(r#"{"prompt_tokens":1000,"provider_key_id":"pk"}"#);
             u.occurred_at = occurred_at;
             price_event(&book, &u, &payer(), RECEIVED).unwrap()
         };
@@ -1696,9 +1677,10 @@ mod tests {
             p.warnings,
             vec![PricingWarning::OccurredAtClamped { occurred_at }]
         );
-        // Every lookup is at the clamped instant: baseline rev 1, cost rev 3,
-        // rate rev 2 (which starts after receipt) and no discount yet. A rate
-        // resolved at `received_at` would find rev 1 and charge 1000 µ¥.
+        // Every lookup is at the clamped instant: baseline rev 1, cost rate
+        // rev 3, rate rev 2 (which starts after receipt) and no discount yet.
+        // A rate resolved at `received_at` would find rev 1 and charge
+        // 1000 µ¥.
         assert_eq!(p.baseline.unwrap().revision_id, 1);
         assert_eq!(
             p.rate,
@@ -1712,8 +1694,12 @@ mod tests {
         assert_eq!(
             p.cost,
             Some(CostPriced {
-                amount: MicroUsd(400),
-                source: CostSource::Upstream { revision_id: 3 },
+                amount: MicroCny(400),
+                rate: RateRef {
+                    revision_id: 3,
+                    cny_per_usd: CnyPerUsd::parse("0.4").unwrap(),
+                    model_override: false
+                },
             })
         );
 
@@ -1747,21 +1733,17 @@ mod tests {
                 baseline(2, "m", &b, one("9")),
             ],
             vec![rate_one(1, T0)],
-            vec![cost(3, None, T0, one("0.4")), cost(4, None, &b, one("0.8"))],
+            vec![cost_rate(3, None, T0, 4_000), cost_rate(4, None, &b, 8_000)],
             vec![discount(5, "t", &b, 5_000)],
         );
-        let u =
-            row(r#"{"prompt_tokens":1000,"upstream_provider":"openai","upstream_model":"up-1"}"#);
+        let u = row(r#"{"prompt_tokens":1000,"provider_key_id":"pk"}"#);
         let p = price_event(&book, &u, &payer(), received).unwrap();
         assert_eq!(p.price_instant, ts(OCCURRED));
         assert_eq!(
             (p.baseline.unwrap().revision_id, p.charge, p.discount),
             (1, MicroCny(1000), None)
         );
-        assert_eq!(
-            p.cost.map(|c| c.source),
-            Some(CostSource::Upstream { revision_id: 3 })
-        );
+        assert_eq!(p.cost.map(|c| c.rate.revision_id), Some(3));
         // At the boundary instant the new revisions price it.
         let mut at_boundary = u.clone();
         at_boundary.occurred_at = boundary;
@@ -1770,149 +1752,217 @@ mod tests {
             (p.baseline.unwrap().revision_id, p.charge),
             (2, MicroCny(4500))
         );
-        assert_eq!(p.cost.map(|c| c.amount), Some(MicroUsd(800)));
+        // 1000 tokens at the new baseline's 9 USD per million, at the new
+        // cost rate of 0.8: 7200 µ¥, with no discount.
+        assert_eq!(p.cost.map(|c| c.amount), Some(MicroCny(7_200)));
     }
 
     // ---- cost ----
 
+    /// The worked example: a baseline of 10 USD per million input and 30
+    /// per million output, 1M tokens of each, is 40 USD of list price. At a
+    /// group rate of 7 it charges ¥280; at an account cost rate of 0.3 it
+    /// costs ¥12; the platform keeps ¥268.
+    fn worked_book(cost_rates: Vec<CostRateRow>, discounts: Vec<DiscountRow>) -> PriceBook {
+        book_of(
+            vec![baseline(
+                1,
+                "m",
+                T0,
+                json!({"default": {"base": {"input": "10", "output": "30"}}}),
+            )],
+            vec![group_rate(2, T0, 70_000)],
+            cost_rates,
+            discounts,
+        )
+    }
+
+    const MILLION_EACH: &str =
+        r#"{"prompt_tokens":1000000,"completion_tokens":1000000,"provider_key_id":"pk"}"#;
+
     #[test]
-    fn cost_is_priced_from_the_dispatched_upstream_without_discount() {
-        let cost_card = json!({"default": {"base": {"input": "0.4", "output": "1"},
-            "long_context": [{"above_input_tokens": 200_000, "rates": {"input": "0.8", "output": "1.5"}}]}});
-        let book = book_of(
-            vec![baseline(1, "m", T0, test_card())],
-            vec![rate_one(1, T0)],
-            vec![
-                cost(2, None, T0, cost_card),
-                cost(
-                    3,
-                    Some("pk-1"),
-                    T0,
-                    json!({"default": {"base": {"input": "0.3", "output": "1"}}}),
-                ),
-            ],
+    fn the_cost_is_the_charges_lines_at_the_accounts_rate() {
+        let book = worked_book(vec![cost_rate(3, None, T0, 3_000)], vec![]);
+        let p = price_event(&book, &row(MILLION_EACH), &payer(), RECEIVED).unwrap();
+        assert_eq!(p.charge, MicroCny(280_000_000));
+        assert_eq!(
+            p.cost,
+            Some(CostPriced {
+                amount: MicroCny(12_000_000),
+                rate: RateRef {
+                    revision_id: 3,
+                    cny_per_usd: CnyPerUsd::parse("0.3").unwrap(),
+                    model_override: false
+                },
+            })
+        );
+        // The tenant's discount is the tenant's: it halves the charge and
+        // leaves the cost.
+        let book = worked_book(
+            vec![cost_rate(3, None, T0, 3_000)],
             vec![discount(4, "t", T0, 5_000)],
         );
-        let at = |json: &str| price_event(&book, &row(json), &payer(), RECEIVED).unwrap();
-        let upstream = r#""upstream_provider":"openai","upstream_model":"up-1""#;
-
-        let p = at(&format!(r#"{{"prompt_tokens":1000,{upstream}}}"#));
-        assert_eq!(p.charge, MicroCny(500));
+        let p = price_event(&book, &row(MILLION_EACH), &payer(), RECEIVED).unwrap();
         assert_eq!(
-            p.cost,
-            Some(CostPriced {
-                amount: MicroUsd(400),
-                source: CostSource::Upstream { revision_id: 2 },
-            })
+            (p.charge, p.cost.map(|c| c.amount)),
+            (MicroCny(140_000_000), Some(MicroCny(12_000_000)))
         );
-        // Rounded up, once.
-        let cost_of = |json: &str| at(json).cost.map(|c| c.amount);
-        assert_eq!(
-            cost_of(&format!(r#"{{"prompt_tokens":1001,{upstream}}}"#)),
-            Some(MicroUsd(401))
-        );
-        // At the band the row selects.
-        assert_eq!(
-            cost_of(&format!(r#"{{"prompt_tokens":200001,{upstream}}}"#)),
-            Some(MicroUsd(160_001))
-        );
-        // The key that served it, when it has its own cost.
-        let p = at(&format!(
-            r#"{{"prompt_tokens":1000,"provider_key_id":"pk-1",{upstream}}}"#
-        ));
-        assert_eq!(
-            p.cost,
-            Some(CostPriced {
-                amount: MicroUsd(300),
-                source: CostSource::ProviderKey { revision_id: 3 },
-            })
-        );
-        // A tier the cost card lacks leaves the cost unknown, and the charge
-        // stands.
-        let p = at(&format!(
-            r#"{{"prompt_tokens":1000,"service_tier":"flex",{upstream}}}"#
-        ));
-        assert_eq!((p.charge, p.cost), (MicroCny(250), None));
-        // A quantity the cost card has no rate for leaves the cost unknown,
-        // never a cost without it; the baseline prices the search.
-        let p = at(&format!(
-            r#"{{"prompt_tokens":1000,"web_search_requests":1,{upstream}}}"#
-        ));
-        assert_eq!((p.charge, p.cost), (MicroCny(5_500), None));
-        // Without both halves of the upstream's name there is no cost.
-        for json in [
-            r#"{"prompt_tokens":1000}"#,
-            r#"{"prompt_tokens":1000,"upstream_provider":"openai"}"#,
-            r#"{"prompt_tokens":1000,"upstream_model":"up-1"}"#,
-        ] {
-            assert_eq!(at(json).cost, None, "{json}");
-        }
     }
 
     #[test]
-    fn the_cost_band_and_tier_are_the_rows_own() {
-        let book = book_of(
-            vec![baseline(1, "m", T0, test_card())],
-            vec![rate_one(1, T0)],
-            vec![cost(2, None, T0, test_card())],
+    fn an_accounts_override_beats_its_default_for_its_own_model() {
+        let book = worked_book(
+            vec![
+                cost_rate(3, None, T0, 3_000),
+                cost_rate(4, Some("m"), T0, 2_000),
+                cost_rate(5, Some("other"), T0, 9_000),
+            ],
             vec![],
         );
-        let up = r#""upstream_provider":"openai","upstream_model":"up-1""#;
-        let cost = |json: String| {
-            price_event(&book, &row(&json), &payer(), RECEIVED)
+        let p = price_event(&book, &row(MILLION_EACH), &payer(), RECEIVED).unwrap();
+        assert_eq!(
+            p.cost,
+            Some(CostPriced {
+                amount: MicroCny(8_000_000),
+                rate: RateRef {
+                    revision_id: 4,
+                    cny_per_usd: CnyPerUsd::parse("0.2").unwrap(),
+                    model_override: true
+                },
+            })
+        );
+        // The charge is the group's, whatever the account costs.
+        assert_eq!(p.charge, MicroCny(280_000_000));
+    }
+
+    #[test]
+    fn a_cost_rate_starting_later_does_not_cost_a_row_before_it() {
+        let from = ts(OCCURRED) + TimeDelta::milliseconds(500);
+        let book = worked_book(
+            vec![
+                cost_rate(3, None, T0, 3_000),
+                cost_rate(4, None, &from.to_rfc3339(), 5_000),
+            ],
+            vec![],
+        );
+        let at = |occurred_at: DateTime<Utc>| {
+            let mut u = row(MILLION_EACH);
+            u.occurred_at = occurred_at;
+            let p = price_event(&book, &u, &payer(), RECEIVED).unwrap();
+            p.cost.map(|c| (c.rate.revision_id, c.amount))
+        };
+        // A millisecond before its start, the old rate.
+        assert_eq!(
+            at(from - TimeDelta::milliseconds(1)),
+            Some((3, MicroCny(12_000_000)))
+        );
+        // From its start, the new one.
+        assert_eq!(at(from), Some((4, MicroCny(20_000_000))));
+    }
+
+    #[test]
+    fn without_an_account_or_its_rate_the_cost_is_unknown_and_the_charge_stands() {
+        let unreadable = CostRateRow {
+            provider_key_id: "pk-bad".to_owned(),
+            cny_per_usd_e4: Some(1_000_001),
+            ..cost_rate(4, None, T0, 0)
+        };
+        let book = worked_book(vec![cost_rate(3, None, T0, 3_000), unreadable], vec![]);
+        for json in [
+            // Names no account.
+            r#"{"prompt_tokens":1000000,"completion_tokens":1000000}"#,
+            // An account with no cost rate.
+            r#"{"prompt_tokens":1000000,"completion_tokens":1000000,"provider_key_id":"pk-2"}"#,
+            // An account whose rate in force cannot be read.
+            r#"{"prompt_tokens":1000000,"completion_tokens":1000000,"provider_key_id":"pk-bad"}"#,
+        ] {
+            let p = price_event(&book, &row(json), &payer(), RECEIVED).unwrap();
+            assert_eq!(
+                (p.outcome, p.charge, p.cost),
+                (Outcome::Charged, MicroCny(280_000_000), None),
+                "{json}"
+            );
+        }
+        // A rate of 0 is a cost of 0, which is known, not unknown.
+        let book = worked_book(vec![cost_rate(3, None, T0, 0)], vec![]);
+        let p = price_event(&book, &row(MILLION_EACH), &payer(), RECEIVED).unwrap();
+        assert_eq!(p.cost.map(|c| c.amount), Some(MicroCny(0)));
+    }
+
+    #[test]
+    fn the_cost_is_rounded_up_once_over_every_line() {
+        let cost_at = |card: Value, e4: i64, json: &str| {
+            let book = book_of(
+                vec![baseline(1, "m", T0, card)],
+                vec![rate_one(2, T0)],
+                vec![cost_rate(3, None, T0, e4)],
+                vec![],
+            );
+            price_event(&book, &row(json), &payer(), RECEIVED)
                 .unwrap()
                 .cost
                 .map(|c| c.amount)
         };
-        // Cached input counts toward the cost card's band too:
-        // 100000 × 2 + 100001 × 0.2 = 220000.2, rounded up.
+        // One token at 0.15 USD per million, at 7.2: 1.08 µ¥, so 2. Rounding
+        // the USD first would give ⌈0.15⌉ = 1 µ$, so 8 µ¥.
+        let card = json!({"default": {"base": {"input": "0.15", "output": "0.15"}}});
         assert_eq!(
-            cost(format!(
-                r#"{{"prompt_tokens":100000,"cache_read_tokens":100001,{up}}}"#
-            )),
-            Some(MicroUsd(220_001))
+            cost_at(
+                card,
+                72_000,
+                r#"{"prompt_tokens":1,"provider_key_id":"pk"}"#
+            ),
+            Some(MicroCny(2))
         );
-        // A batch row is costed at the cost card's batch tier, whatever it
-        // reports.
+        // Half a µ¥ on each of two lines is 1 µ¥ in all. Rounding each line
+        // would give 2.
+        let card = json!({"default": {"base": {"input": "0.5", "output": "0.5"}}});
         assert_eq!(
-            cost(format!(
-                r#"{{"is_batch":true,"service_tier":"default","prompt_tokens":1000,{up}}}"#
-            )),
-            Some(MicroUsd(500))
+            cost_at(
+                card,
+                10_000,
+                r#"{"prompt_tokens":1,"completion_tokens":1,"provider_key_id":"pk"}"#
+            ),
+            Some(MicroCny(1))
         );
     }
 
     #[test]
-    fn an_unreadable_key_cost_leaves_the_cost_unknown_and_the_charge_priced() {
-        // P2-R14 at the engine: the upstream's own cost is never substituted
-        // for the key's unreadable one.
+    fn the_cost_is_read_at_the_charges_tier_and_band() {
         let book = book_of(
             vec![baseline(1, "m", T0, test_card())],
-            vec![rate_one(1, T0)],
-            vec![
-                cost(
-                    2,
-                    None,
-                    T0,
-                    json!({"default": {"base": {"input": "0.4", "output": "1"}}}),
-                ),
-                cost(
-                    3,
-                    Some("pk-1"),
-                    T0,
-                    json!({"default": {"base": {"input": "0.3"}}}),
-                ),
-            ],
+            vec![rate_one(2, T0)],
+            vec![cost_rate(3, None, T0, 10_000)],
             vec![],
         );
-        let u = row(
-            r#"{"prompt_tokens":1000,"provider_key_id":"pk-1","upstream_provider":"openai","upstream_model":"up-1"}"#,
-        );
-        let p = price_event(&book, &u, &payer(), RECEIVED).unwrap();
+        let both = |json: &str| {
+            let p = price_event(&book, &row(json), &payer(), RECEIVED).unwrap();
+            (p.charge, p.cost.map(|c| c.amount))
+        };
+        // At a cost rate of one, the cost in µ¥ is the baseline's in µ$, as
+        // the charge is at a group rate of one: the same lines.
+        // The flex tier: 1000 × 0.5.
         assert_eq!(
-            (p.outcome, p.charge, p.cost),
-            (Outcome::Charged, MicroCny(1000), None)
+            both(r#"{"prompt_tokens":1000,"service_tier":"flex","provider_key_id":"pk"}"#),
+            (MicroCny(500), Some(MicroCny(500)))
         );
+        // The long-context band: 200001 × 2.
+        assert_eq!(
+            both(r#"{"prompt_tokens":200001,"provider_key_id":"pk"}"#),
+            (MicroCny(400_002), Some(MicroCny(400_002)))
+        );
+    }
+
+    #[test]
+    fn a_row_that_bills_nothing_costs_nothing_known() {
+        let book = worked_book(vec![cost_rate(3, None, T0, 3_000)], vec![]);
+        for json in [
+            r#"{"cache_status":"hit","prompt_tokens":100,"provider_key_id":"pk"}"#,
+            r#"{"provider_key_id":"pk"}"#,
+        ] {
+            let p = price_event(&book, &row(json), &payer(), RECEIVED).unwrap();
+            assert_eq!(p.cost, None, "{json}");
+        }
     }
 
     // ---- what a charge records ----
@@ -1970,17 +2020,11 @@ mod tests {
         let book = book_of(
             vec![baseline(1, "m", T0, test_card())],
             vec![rate_one(1, T0)],
-            vec![cost(
-                2,
-                None,
-                T0,
-                json!({"default": {"base": {"input": "0.4", "output": "1"}}}),
-            )],
+            vec![cost_rate(2, None, T0, 4_000)],
             vec![discount(3, "t", T0, 2_500)],
         );
-        let u = row(
-            r#"{"prompt_tokens":10,"requested_service_tier":"flex","upstream_provider":"openai","upstream_model":"up-1"}"#,
-        );
+        let u =
+            row(r#"{"prompt_tokens":10,"requested_service_tier":"flex","provider_key_id":"pk"}"#);
         let p = serde_json::to_value(price_event(&book, &u, &payer(), RECEIVED).unwrap()).unwrap();
         assert_eq!(
             p,
@@ -1995,7 +2039,8 @@ mod tests {
                 "service_tier": "default", "requested_service_tier": "flex",
                 "long_context_above": null,
                 "lines": [{"dimension": "input", "quantity": 10, "rate": "1"}],
-                "cost": {"amount": 4, "source": {"kind": "upstream", "revision_id": 2}},
+                "cost": {"amount": 4,
+                         "rate": {"revision_id": 2, "cny_per_usd": "0.4", "model_override": false}},
                 "estimated": false,
                 "warnings": [{"kind": "served_tier_unreported", "requested": "flex"}],
                 "engine_version": ENGINE_VERSION,
@@ -2078,14 +2123,6 @@ mod tests {
             assert_eq!(e.code(), code);
             assert!(!e.to_string().is_empty(), "{code}");
         }
-    }
-
-    #[test]
-    fn an_amount_past_i64_is_an_error_never_a_zero_charge() {
-        let d = PER_MILLION * WHOLE_BPS;
-        let max = u128::try_from(i64::MAX).unwrap();
-        assert_eq!(ceil_micro_usd(max * d, d), Ok(MicroUsd(i64::MAX)));
-        assert_eq!(ceil_micro_usd(max * d + 1, d), Err(PricingError::Overflow));
     }
 
     #[test]

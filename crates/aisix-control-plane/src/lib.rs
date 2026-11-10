@@ -213,8 +213,8 @@ where
     if compat::GatewayVersion::parse(&cfg.cp_version) == compat::GatewayVersion::Unrecognized {
         return Err(BootError::UnreadableVersion(cfg.cp_version));
     }
-    // A catalogue this build cannot read would leave cost prices unknown
-    // everywhere, unseen.
+    // A catalogue this build cannot read would leave the built-in list
+    // prices that baselines are taken from missing everywhere, unseen.
     let catalogue = match catalogue {
         Some(catalogue) => catalogue,
         None => aisix_pricing::Catalogue::builtin()?,

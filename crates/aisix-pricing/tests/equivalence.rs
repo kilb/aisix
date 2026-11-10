@@ -61,16 +61,14 @@
 //! tokens on a row, at most USD 100 per million), so `|ε| < 10⁻⁶` µ$. The
 //! bound holds up to `X ≈ 5.6 × 10¹⁴` µ$ (2⁴⁹), USD 560 million on one row.
 
-use std::sync::Arc;
-
 use aisix_core::{input_tokens_for_pricing, one_hour_cache_writes, spend_micro_usd, ModelCost};
 use aisix_gateway::chat::recorded_completion_tokens;
 use aisix_gateway::{CacheCreationTtl, ModalityTokens};
 use aisix_obs::UsageEvent;
 use aisix_pricing::{
-    price_event, BaselineRow, BillableUsage, Catalogue, ChargeLine, CnyPerUsd, Dimension,
-    Exemption, GroupRateRow, Outcome, Payer, PriceBook, PriceRows, PricedEvent, PricingError, Rate,
-    RateCard, Rates, ServiceTier, TierRates, ENGINE_VERSION,
+    price_event, BaselineRow, BillableUsage, ChargeLine, CnyPerUsd, Dimension, Exemption,
+    GroupRateRow, Outcome, Payer, PriceBook, PriceRows, PricedEvent, PricingError, Rate, RateCard,
+    Rates, ServiceTier, TierRates, ENGINE_VERSION,
 };
 use chrono::{DateTime, Utc};
 use proptest::option;
@@ -222,29 +220,25 @@ fn book(rates: Rates) -> PriceBook {
         )]
         .into(),
     );
-    let catalogue = Catalogue::from_json(r#"{"version":"2026-11-06","entries":[]}"#).unwrap();
-    let book = PriceBook::from_rows(
-        PriceRows {
-            baselines: vec![BaselineRow {
-                revision_id: 1,
-                engine_version: ENGINE_VERSION,
-                model_id: "m".into(),
-                effective_from: "2026-01-01T00:00:00Z".parse().unwrap(),
-                card: serde_json::to_value(&card).unwrap(),
-            }],
-            rates: vec![GroupRateRow {
-                revision_id: 1,
-                engine_version: ENGINE_VERSION,
-                group_id: "g".into(),
-                model_id: None,
-                effective_from: "2026-01-01T00:00:00Z".parse().unwrap(),
-                cny_per_usd_e4: Some(CnyPerUsd::ONE.0.into()),
-            }],
-            cost: vec![],
-            discounts: vec![],
-        },
-        Arc::new(catalogue),
-    );
+    let book = PriceBook::from_rows(PriceRows {
+        baselines: vec![BaselineRow {
+            revision_id: 1,
+            engine_version: ENGINE_VERSION,
+            model_id: "m".into(),
+            effective_from: "2026-01-01T00:00:00Z".parse().unwrap(),
+            card: serde_json::to_value(&card).unwrap(),
+        }],
+        rates: vec![GroupRateRow {
+            revision_id: 1,
+            engine_version: ENGINE_VERSION,
+            group_id: "g".into(),
+            model_id: None,
+            effective_from: "2026-01-01T00:00:00Z".parse().unwrap(),
+            cny_per_usd_e4: Some(CnyPerUsd::ONE.0.into()),
+        }],
+        cost_rates: vec![],
+        discounts: vec![],
+    });
     let refused = book.invalid_revisions();
     assert!(refused.is_empty(), "the book refused the card: {refused:?}");
     book

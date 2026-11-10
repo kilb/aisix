@@ -10,10 +10,10 @@ import { STACK_START_TIMEOUT_MS, startStack, type Json, type Stack } from "./sta
  * of 7.2 over a baseline of $4/M input and $20/M output is ¥28.80 and ¥144.00
  * per million, and an override of 6 makes it ¥24.00 and ¥120.00, written as
  * every ¥/M figure in the Dashboard is: at least two decimals, with thousands
- * separators. The realised rate is
- * the one case a figure is read back, because it is a measurement of what was
- * charged rather than a price: a cost price equal to the baseline leaves
- * exactly the configured rate, 7.2000.
+ * separators. The margin is worked the same way: the stand-in's 5 prompt and
+ * 3 completion tokens at that baseline are 80 µ$, charged ¥0.000576 at 7.2
+ * and costing ¥0.000024 at an account cost rate of 0.3, which leaves
+ * ¥0.000552, a margin of 95.83 %.
  */
 
 let stack: Stack;
@@ -382,41 +382,27 @@ test("未定价的模型排在最前并标注未定价", async ({ page }) => {
   await expect(modelRow(page, pricedModel.name)).toHaveAttribute("data-state", "priced");
 });
 
-test("实际换算率显示近 30 天的结果", async ({ page }) => {
+test("毛利显示近 30 天的售价、成本与利润，成本未知的另列", async ({ page }) => {
   const group = await newGroup("7.2");
+  // Two accounts in the group: one costs 0.3 CNY per USD of the baseline,
+  // the other has no cost rate, so what it serves has no known cost.
   const account = await newAccount(group);
+  const unrated = await newAccount(group);
   const model = await newModel("gp-real", account);
-  // A second model with the same list price and no cost price: its charge
-  // counts in no ratio, and the page must say how much that leaves out.
-  const uncosted = await newModel("gp-nocost", account);
-  // One card, twice: the official list price and what the upstream costs. A
-  // charge over a cost with the same card realises exactly the configured rate.
-  const card = { default: { base: { input: "4", output: "20" } } };
-  await stack.admin.post("/admin/pricing/baselines", {
-    model_id: model.id,
+  const uncosted = await newModel("gp-nocost", unrated);
+  await stack.admin.post(`/admin/provider-keys/${account}/cost-rates`, {
+    model_id: null,
+    cny_per_usd: "0.3",
     effective_from: new Date().toISOString(),
-    card,
-    note: "分组页用例的官方价",
   });
-  await stack.admin.post("/admin/pricing/cost", {
-    upstream_provider: "openai",
-    upstream_model: model.upstream,
-    effective_from: new Date().toISOString(),
-    card,
-  });
-  await stack.admin.post("/admin/pricing/baselines", {
-    model_id: uncosted.id,
-    effective_from: new Date().toISOString(),
-    card,
-    note: "分组页用例的官方价",
-  });
+  for (const m of [model, uncosted]) await addBaseline(m.id, "4", "20");
 
-  // A funded tenant on that group, whose one call costs the mock upstream's
-  // 5 prompt and 3 completion tokens: $0.08, charged at ¥0.576.
+  // A funded tenant on that group, whose one call to each model reports the
+  // stand-in's 5 prompt and 3 completion tokens: 80 µ$, charged ¥0.000576.
   const suffix = randomUUID().slice(0, 8);
   const owner = { email: `owner-real-${suffix}@groups.test`, password: PASSWORD };
   const signedUp = await stack.tenant().post("/api/signup", {
-    org_name: `实际换算率租户 ${suffix}`,
+    org_name: `毛利租户 ${suffix}`,
     email: owner.email,
     password: owner.password,
   });
@@ -431,7 +417,7 @@ test("实际换算率显示近 30 天的结果", async ({ page }) => {
   await stack.admin.post(`/admin/tenants/${tenantId}/credits`, { amount_cny: "10.00", reason: "分组页用例" });
   const api = stack.tenant();
   await api.post("/api/login", owner);
-  const created = await api.post("/api/keys", { label: "实际换算率用例" });
+  const created = await api.post("/api/keys", { label: "毛利用例" });
   const plaintext = created.plaintext as string;
 
   // The key reaches the gateway, then one call goes through it.
@@ -462,11 +448,11 @@ test("实际换算率显示近 30 天的结果", async ({ page }) => {
     .poll(
       async () => {
         const margin = (await stack.admin.get(`/admin/pricing/margin?${query}`)) as Json;
-        return margin.items.find((i: Json) => i.model.id === model.id)?.realised_cny_per_usd ?? null;
+        return margin.items.find((i: Json) => i.model.id === model.id)?.margin_pct ?? null;
       },
       { timeout: 60_000 },
     )
-    .toBe("7.2000");
+    .toBe("95.83");
   await expect
     .poll(
       async () => {
@@ -479,12 +465,14 @@ test("实际换算率显示近 30 天的结果", async ({ page }) => {
 
   await openGroups(page);
   await openDetail(page, group.display_name as string);
-  const r = modelRow(page, model.name);
-  await expect(r.getByRole("cell").nth(7)).toHaveText("7.2000");
-  // The same call with no cost: no ratio, and its ¥0.000576 named beside the dash.
+  const r = modelRow(page, model.name).getByRole("cell").nth(7);
+  await expect(r).toContainText("95.83%");
+  await expect(r).toContainText("售价 ¥0.000576，成本 ¥0.000024，利润 ¥0.000552");
+  // The same call with no known cost: no margin, and its ¥0.000576 named beside the dash.
   const without = modelRow(page, uncosted.name).getByRole("cell").nth(7);
   await expect(without).toContainText("—");
-  await expect(without).toContainText("另有 1 笔无成本，计 ¥0.000576");
+  await expect(without).toContainText("另有 1 笔成本未知，计 ¥0.000576");
+  await expect(without).not.toContainText("利润");
 });
 
 test("默认分组有标记，可改为另一个分组；停用默认分组时显示原因", async ({ page }) => {

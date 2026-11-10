@@ -659,54 +659,59 @@ export const pricing = {
   },
 };
 
-// ── pricing: cost prices ────────────────────────────────────────────────────
+// ── pricing: cost rates ─────────────────────────────────────────────────────
 
-/** One cost price revision: what an upstream model costs the platform, through one account or any. */
-export interface CostRevision {
+/** One cost-rate revision: what an upstream account costs, in CNY per USD of a model's official price. */
+export interface CostRateRevision {
   revision_id: number;
   engine_version: number;
-  upstream_provider: string;
-  upstream_model: string;
-  provider_key_id: string | null;
+  provider_key_id: string;
+  model_id: string | null;
   effective_from: string;
-  card: RateCard;
-  source: string;
-  created_by: string | null;
+  /** The decimal string it was typed as; `null` on a model row that ends its override. */
+  cny_per_usd: string | null;
+  note: string;
+  created_by: { id: string; email: string } | null;
   created_at: string;
 }
 
-export type CostCreated = CostRevision & { warnings: PriceWarning[] };
-
-export interface NewCostPrice {
-  upstream_provider: string;
-  upstream_model: string;
-  provider_key_id?: string;
-  effective_from: string;
-  card: RateCard;
+/** When a cost rate applies: the revision in force now, and the ones scheduled. */
+export interface CostRatePlan {
+  current: CostRateRevision | null;
+  upcoming: CostRateRevision[];
 }
 
-export const costPricing = {
-  /** Cost revisions, newest first; `before` is the previous page's `next_before`. */
-  async listCost(q: {
-    upstream_provider?: string;
-    upstream_model?: string;
-    provider_key_id?: string;
-    limit?: number;
-    before?: number;
-  }): Promise<{ items: CostRevision[]; next_before: number | null }> {
-    const params = new URLSearchParams();
-    if (q.upstream_provider) params.set("upstream_provider", q.upstream_provider);
-    if (q.upstream_model) params.set("upstream_model", q.upstream_model);
-    if (q.provider_key_id) params.set("provider_key_id", q.provider_key_id);
-    if (q.limit !== undefined) params.set("limit", String(q.limit));
-    if (q.before !== undefined) params.set("before", String(q.before));
-    const query = params.toString();
-    return (
-      await call<{ items: CostRevision[]; next_before: number | null }>("GET", `/admin/pricing/cost${query ? `?${query}` : ""}`)
-    ).data;
+/** An upstream account as the cost-rate routes name it. */
+export interface CostAccount {
+  id: string;
+  display_name: string;
+  provider: string;
+}
+
+/** One account's default cost rate and each of its models' overrides. */
+export interface AccountCostRates {
+  account: CostAccount;
+  default: CostRatePlan;
+  models: { model_id: string; name: string; rate: CostRatePlan }[];
+}
+
+export const costRates = {
+  /** Every live upstream account with its default cost rate. */
+  async accounts(): Promise<{ account: CostAccount; default: CostRatePlan }[]> {
+    return (await call<{ items: { account: CostAccount; default: CostRatePlan }[] }>("GET", "/admin/pricing/cost-rates")).data.items;
   },
-  async createCost(body: NewCostPrice): Promise<CostCreated> {
-    return (await call<CostCreated>("POST", "/admin/pricing/cost", body)).data;
+  /** One account's default and the models it serves, each with its override plan. */
+  async account(id: string): Promise<AccountCostRates> {
+    return (await call<AccountCostRates>("GET", `/admin/provider-keys/${seg(id)}/cost-rates`)).data;
+  },
+  /** Operator and up. `model_id` null is the account's default; `cny_per_usd` null ends a model's override. */
+  async write(
+    id: string,
+    body: { model_id?: string | null; cny_per_usd?: string | null; effective_from: string; note?: string },
+  ): Promise<{ revision: CostRateRevision; warnings: PriceWarning[] }> {
+    return (
+      await call<{ revision: CostRateRevision; warnings: PriceWarning[] }>("POST", `/admin/provider-keys/${seg(id)}/cost-rates`, body)
+    ).data;
   },
 };
 
@@ -974,15 +979,13 @@ export interface Charge {
   occurred_at: string;
   status: "charged" | "exempt" | "nothing_to_bill" | "unpriced";
   charge_micro_cny: number | null;
-  /** What the call cost the platform at its upstream, in micro-dollars: the cost side stays USD. */
-  cost_micro_usd: number | null;
+  /** What the call cost the platform at its account's cost rate, in micro-CNY; `null` when unknown. */
+  cost_micro_cny: number | null;
   group_id: string | null;
   baseline_revision_id: number | null;
   rate_revision_id: number | null;
   /** The group's rate in force, as the exact decimal string it was typed as. */
   cny_per_usd_e4: number | null;
-  /** CNY charged per USD of cost, four decimals; `null` when the cost is not known. */
-  realised_cny_per_usd: string | null;
   service_tier: string | null;
   requested_service_tier: string | null;
   long_context_above: number | null;
@@ -1446,7 +1449,7 @@ export const groups = {
   },
 };
 
-// ── pricing: each model's price in every group, and the realised margin ─────
+// ── pricing: each model's price in every group, and the margin ──────────────
 
 /**
  * Every live model's baseline and each live group's price for it
@@ -1460,21 +1463,25 @@ export const groupPrices = {
   },
 };
 
-/** What one (group, model) charged against what its upstream cost. */
+/** What one (group, model) charged against what its upstream accounts cost, all in CNY. */
 export interface MarginRow {
   group: { id: string; display_name: string };
   model: { id: string | null; name: string };
   charged_micro_cny: number;
-  cost_micro_usd: number;
-  /** CNY charged per USD of cost, four decimal places; `null` when the cost is not known. */
-  realised_cny_per_usd: string | null;
+  /** The part of `charged_micro_cny` from rows whose cost is known: what profit and margin are measured on. */
+  charged_with_cost_micro_cny: number;
+  cost_micro_cny: number;
+  /** `charged_with_cost_micro_cny` less `cost_micro_cny`. */
+  profit_micro_cny: number;
+  /** Profit as a percentage of the charge it is measured on, two decimals; `null` when that charge is not above 0. */
+  margin_pct: string | null;
   rows: number;
   rows_without_cost: number;
-  /** The part of `charged_micro_cny` from rows with no known cost, which the realised rate leaves out. */
+  /** The part of `charged_micro_cny` from rows with no known cost, which profit and margin leave out. */
   charged_without_cost_micro_cny: number;
 }
 
-/** The realised rate: the CNY a group charged per USD its upstreams cost. */
+/** The margin: what each (group, model) charged against what it cost, in CNY. */
 export const margin = {
   /** Both ends are required; rows outside them are left out. */
   async list(q: { from: string; to: string; group_id?: string; model_id?: string }): Promise<MarginRow[]> {

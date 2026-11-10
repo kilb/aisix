@@ -175,14 +175,16 @@ fn fixture(method: &str, path: &str, target: &SeededOperator) -> (String, Option
                 "card": {"default": {"base": {"input": "1", "output": "2"}}},
             })),
         ),
-        ("POST", "/admin/pricing/cost") => (
-            path.to_string(),
-            Some(json!({
-                "upstream_provider": "openai",
-                "upstream_model": "gpt-4o-mini",
-                "effective_from": chrono::Utc::now(),
-                "card": {"flex": {"base": {"input": "1", "output": "2"}}},
-            })),
+        // Cost rates. The account matches nothing: past the role check, a
+        // read or a write answers 404, so nothing is written.
+        ("GET", "/admin/pricing/cost-rates") => (path.to_string(), None),
+        ("GET", "/admin/provider-keys/{id}/cost-rates") => (
+            format!("/admin/provider-keys/{}/cost-rates", Uuid::nil()),
+            None,
+        ),
+        ("POST", "/admin/provider-keys/{id}/cost-rates") => (
+            format!("/admin/provider-keys/{}/cost-rates", Uuid::nil()),
+            Some(json!({"model_id": null, "cny_per_usd": "0.3", "effective_from": chrono::Utc::now()})),
         ),
         ("POST", "/admin/pricing/discounts") => (
             path.to_string(),

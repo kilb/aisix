@@ -26,19 +26,6 @@ export function fmtMicroCny(micro: number): string {
 }
 
 /**
- * An amount of micro-dollars as `$1,234.5678`, exactly as `fmtMicroCny` is
- * for ¥. One use is left: `cost_micro_usd`, what a call cost the platform at
- * its upstream, which stays in dollars. Everything a tenant pays is ¥.
- */
-export function fmtMicroUsd(micro: number): string {
-  const value = BigInt(micro);
-  const abs = value < 0n ? -value : value;
-  let fraction = (abs % MICRO_PER_UNIT).toString().padStart(6, "0");
-  while (fraction.length > 2 && fraction.endsWith("0")) fraction = fraction.slice(0, -1);
-  return `${value < 0n ? "-" : ""}$${grouped(abs / MICRO_PER_UNIT)}.${fraction}`;
-}
-
-/**
  * An amount of micro-CNY as the yuan a person types into an edit field:
  * `1_500_000` is `1.50`, `-500_000` is `-0.50`. Exact, never a float; no `¥`
  * and no separators, so it reads back through `isCnyAmount`. Anything below

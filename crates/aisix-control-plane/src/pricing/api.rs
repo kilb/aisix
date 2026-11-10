@@ -1,6 +1,7 @@
 //! The operators' pricing API, `/admin/pricing/*`: the built-in catalogue,
-//! the cost and discount revisions, the charges, and the pricing status that
-//! is the alert surface for what cannot be priced.
+//! the history of the retired cost cards, the discount revisions, the
+//! charges, and the pricing status that is the alert surface for what cannot
+//! be priced. Cost rates have their own routes ([`super::cost_rates`]).
 //!
 //! Revisions are append-only: there is no `PUT`, `PATCH` or `DELETE`, and a
 //! price changes only by a new `POST` starting now or later. Every write goes
@@ -9,10 +10,10 @@
 //! audit row in one transaction. A write is one transaction however many
 //! revisions it makes, so a catalogue import lands whole or not at all.
 //!
-//! Charges and cost prices name upstream channels; this API is for
-//! operators only and is never projected to tenants.
+//! Charges and costs name upstream channels; this API is for operators only
+//! and is never projected to tenants.
 
-use aisix_pricing::{CatalogueEntry, RateCard};
+use aisix_pricing::CatalogueEntry;
 use axum::extract::rejection::QueryRejection;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
@@ -24,8 +25,7 @@ use serde_json::{json, Map, Value};
 use sqlx::{Postgres, QueryBuilder};
 use uuid::Uuid;
 
-use super::margin;
-use super::store::{self, CostRevision, DiscountRevision, NewCostPrice, NewDiscount};
+use super::store::{self, CostRevision, DiscountRevision, NewDiscount};
 use crate::audit::Actor;
 use crate::auth::{OperatorAuth, OperatorRole};
 use crate::db::DbError;
@@ -40,12 +40,6 @@ fn refused(path: &str, message: impl Into<String>) -> ApiError {
         path: path.to_string(),
         message: message.into(),
     }])
-}
-
-/// A rate card from a request body, refused at `/card` when it does not
-/// decode. Whether it validates is the store's check.
-fn rate_card(card: Value) -> Result<RateCard, ApiError> {
-    serde_json::from_value(card).map_err(|e| refused("/card", format!("价目卡不合法：{e}")))
 }
 
 // ---- the catalogue ----
@@ -93,17 +87,7 @@ pub struct PriceWarning {
     pub effective_from: Option<DateTime<Utc>>,
 }
 
-/// `value` as a JSON object, to add fields to.
-fn to_object(value: &impl Serialize) -> Result<Map<String, Value>, ApiError> {
-    match serde_json::to_value(value).map_err(ApiError::internal)? {
-        Value::Object(fields) => Ok(fields),
-        _ => Err(ApiError::internal(
-            "a revision did not serialize as an object",
-        )),
-    }
-}
-
-// ---- cost prices ----
+// ---- the retired cost cards ----
 
 /// Ends a revision query built on `SELECT … WHERE true`: newest first by
 /// `revision_id`, one row past `limit`, which [`page`] tells another page
@@ -127,10 +111,11 @@ pub struct CostQuery {
     before: Option<i64>,
 }
 
-/// `GET /admin/pricing/cost` → `{items: [CostRevision], next_before}`: cost
-/// revisions, newest first, optionally only those of an
-/// `upstream_provider`, an `upstream_model` or a `provider_key_id`; paged as
-/// [`list_sell`] is.
+/// `GET /admin/pricing/cost` → `{items: [CostRevision], next_before}`: the
+/// per-dimension cost cards written before cost became a rate, newest
+/// first, optionally only those of an `upstream_provider`, an
+/// `upstream_model` or a `provider_key_id`; paged as [`list_sell`] is. They
+/// price nothing now and take no new rows: there is no write route.
 pub async fn list_cost(
     auth: OperatorAuth,
     State(state): State<AppState>,
@@ -161,122 +146,6 @@ pub async fn list_cost(
         .map_err(DbError::from)?;
     let (items, next_before) = page(rows, limit, |r| r.revision_id);
     Ok(Json(json!({ "items": items, "next_before": next_before })))
-}
-
-/// `POST /admin/pricing/cost`: what an upstream model costs the platform,
-/// or, with `provider_key_id`, what it costs through that key. A card is
-/// required.
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CostBody {
-    upstream_provider: String,
-    upstream_model: String,
-    #[serde(default)]
-    provider_key_id: Option<Uuid>,
-    effective_from: DateTime<Utc>,
-    #[serde(default)]
-    card: Option<Value>,
-}
-
-/// `POST /admin/pricing/cost` → `201 CostRevision` plus `warnings`. An empty
-/// provider or model, or one with spaces around it (it would match no
-/// usage), is `422` at its path, and a missing or `null` card `422 /card`.
-///
-/// A `no_matching_upstream` warning says the revision can never apply: no
-/// live model has that provider and model name, or the given provider key
-/// belongs to another provider. The write still succeeds.
-pub async fn create_cost(
-    auth: OperatorAuth,
-    State(state): State<AppState>,
-    ApiJson(body): ApiJson<CostBody>,
-) -> Result<(StatusCode, Json<Value>), ApiError> {
-    auth.require(OperatorRole::Operator)?;
-    if body.upstream_provider.trim().is_empty() {
-        return Err(refused("/upstream_provider", "上游提供方不能为空"));
-    }
-    if body.upstream_provider.trim() != body.upstream_provider {
-        return Err(refused("/upstream_provider", "上游提供方请去掉首尾空格"));
-    }
-    if body.upstream_model.trim().is_empty() {
-        return Err(refused("/upstream_model", "上游模型不能为空"));
-    }
-    if body.upstream_model.trim() != body.upstream_model {
-        return Err(refused("/upstream_model", "上游模型请去掉首尾空格"));
-    }
-    let card = match body.card {
-        None | Some(Value::Null) => return Err(refused("/card", "成本价格必须带价目卡")),
-        Some(card) => rate_card(card)?,
-    };
-    let row = NewCostPrice {
-        upstream_provider: body.upstream_provider,
-        upstream_model: body.upstream_model,
-        provider_key_id: body.provider_key_id,
-        effective_from: body.effective_from,
-        card,
-        source: "manual".to_string(),
-    };
-    let (revision, warnings) = state
-        .db
-        .tx(move |conn| {
-            async move {
-                let revision =
-                    store::insert_cost_price(&mut *conn, &row, Actor::Operator(&auth)).await?;
-                let warnings = unmatched_upstream(&mut *conn, &revision).await?;
-                Ok::<_, ApiError>((revision, warnings))
-            }
-            .boxed()
-        })
-        .await?;
-    let mut view = to_object(&revision)?;
-    view.insert("warnings".to_string(), json!(warnings));
-    Ok((StatusCode::CREATED, Json(Value::Object(view))))
-}
-
-/// A `no_matching_upstream` warning for a cost revision that no usage can
-/// ever match: no live model has its provider and model name exactly, or its
-/// provider key is another provider's.
-async fn unmatched_upstream(
-    conn: &mut sqlx::PgConnection,
-    revision: &CostRevision,
-) -> Result<Vec<PriceWarning>, DbError> {
-    let model_exists: bool = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM gw_resources WHERE kind = 'models' AND NOT deleted \
-                          AND doc->>'provider' = $1 AND doc->>'model_name' = $2)",
-    )
-    .bind(&revision.upstream_provider)
-    .bind(&revision.upstream_model)
-    .fetch_one(&mut *conn)
-    .await?;
-    let key_provider_differs: bool = match revision.provider_key_id {
-        Some(key) => sqlx::query_scalar(
-            "SELECT EXISTS (SELECT 1 FROM gw_resources WHERE kind = 'provider_keys' \
-                              AND id = $1 AND NOT deleted AND doc->>'provider' IS DISTINCT FROM $2)",
-        )
-        .bind(key)
-        .bind(&revision.upstream_provider)
-        .fetch_one(&mut *conn)
-        .await?,
-        None => false,
-    };
-    let mut warnings = Vec::new();
-    if !model_exists {
-        warnings.push(PriceWarning {
-            code: "no_matching_upstream",
-            message: "没有任何模型使用这个上游提供方和模型名，这条成本价格暂时不会被用到"
-                .to_string(),
-            revision_id: None,
-            effective_from: None,
-        });
-    }
-    if key_provider_differs {
-        warnings.push(PriceWarning {
-            code: "no_matching_upstream",
-            message: "所选供应商密钥属于另一个提供方，这条成本价格不会被用到".to_string(),
-            revision_id: None,
-            effective_from: None,
-        });
-    }
-    Ok(warnings)
 }
 
 // ---- discounts ----
@@ -404,10 +273,9 @@ struct ChargeRow {
     warnings: Value,
     engine_version: i64,
     priced_at: DateTime<Utc>,
-    /// Not a column: the charge's realised rate, filled from its own two
-    /// amounts by [`list_charges`].
-    #[sqlx(skip)]
-    realised_cny_per_usd: Option<String>,
+    /// What the row cost the platform at its account's cost rate; `None`
+    /// when unknown.
+    cost_micro_cny: Option<i64>,
 }
 
 /// `GET /admin/pricing/charges` → `{items: [Charge], next_before}`: the
@@ -416,9 +284,9 @@ struct ChargeRow {
 /// [`crate::usage::list_events`] is. A charge's tenant and member are the
 /// ones its key belongs to, never what its usage row claims.
 ///
-/// Each charge carries `realised_cny_per_usd`, the CNY it charged per USD
-/// its row cost ([`margin::realised`]): `null` when the row's cost is
-/// unknown, never 0.
+/// Each charge carries `cost_micro_cny`, what its row cost the platform at
+/// the serving account's cost rate: `null` when the cost is unknown, never
+/// 0. `cost_micro_usd` is a row priced before cost became a rate.
 pub async fn list_charges(
     auth: OperatorAuth,
     State(state): State<AppState>,
@@ -438,7 +306,7 @@ pub async fn list_charges(
                 group_id, baseline_revision_id, rate_revision_id, cny_per_usd_e4, \
                 rate_is_model_override, discount_revision_id, discount_bps, \
                 service_tier, requested_service_tier, long_context_above, estimated, exemption, \
-                error_code, lines, warnings, engine_version, priced_at \
+                error_code, lines, warnings, engine_version, priced_at, cost_micro_cny \
          FROM pricing_charges_cny WHERE true",
     );
     if let Some(before) = q.before {
@@ -457,17 +325,11 @@ pub async fn list_charges(
         sql.push(" AND api_key_id = ").push_bind(api_key_id);
     }
     sql.push(" ORDER BY seq DESC LIMIT ").push_bind(limit + 1);
-    let mut rows: Vec<ChargeRow> = sql
+    let rows: Vec<ChargeRow> = sql
         .build_query_as()
         .fetch_all(state.db.pool())
         .await
         .map_err(DbError::from)?;
-    for row in &mut rows {
-        row.realised_cny_per_usd = row
-            .charge_micro_cny
-            .zip(row.cost_micro_usd)
-            .and_then(|(charged, cost)| margin::realised(charged, cost));
-    }
     let (items, next_before) = page(rows, limit, |r| r.seq);
     Ok(Json(json!({ "items": items, "next_before": next_before })))
 }

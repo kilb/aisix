@@ -685,6 +685,7 @@ async fn the_request_lookup_names_no_channel() {
         "cost_usd",
         &CLAIMED_COST.to_string(),
         "cost_micro_usd",
+        "cost_micro_cny",
         "cost_source",
         "error_code",
         "error_class",

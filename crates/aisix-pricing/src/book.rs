@@ -2,9 +2,10 @@
 //!
 //! Four revision tables feed it: baselines (each model's official list
 //! price), group rates (a group's CNY-per-USD rate, default and per-model
-//! overrides), cost prices (an upstream model's, and a provider key's), and
-//! tenant discounts. A revision applies from its `effective_from` until a
-//! later revision of the same key starts; a price never changes in place.
+//! overrides), cost rates (an upstream account's CNY-per-USD rate, default
+//! and per-model overrides, read the way group rates are), and tenant
+//! discounts. A revision applies from its `effective_from` until a later
+//! revision of the same key starts; a price never changes in place.
 //!
 //! Each revision is read on its own. One this engine cannot use is listed in
 //! [`PriceBook::invalid_revisions`] and keeps its slot in time, so a lookup
@@ -12,12 +13,10 @@
 //! other key is affected.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::catalogue::Catalogue;
 use crate::rates::{CnyPerUsd, RateCard, RateCardError};
 use crate::ENGINE_VERSION;
 
@@ -27,6 +26,9 @@ const NEWER_ENGINE: &str = "written by a newer engine";
 /// The reason given for a group's default-rate row without a rate.
 const NO_DEFAULT_RATE: &str = "a group's default rate row has no rate";
 
+/// The reason given for an account's default cost-rate row without a rate.
+const NO_DEFAULT_COST_RATE: &str = "an account's default cost rate row has no rate";
+
 /// Rows exactly as the four revision tables hold them. Cards arrive as raw
 /// JSON so that one bad or newer card is isolated to its own revision
 /// instead of failing the whole book.
@@ -34,7 +36,7 @@ const NO_DEFAULT_RATE: &str = "a group's default rate row has no rate";
 pub struct PriceRows {
     pub baselines: Vec<BaselineRow>,
     pub rates: Vec<GroupRateRow>,
-    pub cost: Vec<CostPriceRow>,
+    pub cost_rates: Vec<CostRateRow>,
     pub discounts: Vec<DiscountRow>,
 }
 
@@ -68,18 +70,22 @@ pub struct GroupRateRow {
     pub cny_per_usd_e4: Option<i64>,
 }
 
-/// One cost-price revision: what an upstream model costs the platform or,
-/// with a `provider_key_id`, what it costs through that one key.
+/// One cost-rate revision: what an upstream account (a provider key) costs
+/// the platform, in CNY per USD of the baseline, as ten-thousandths. With a
+/// `model_id` it overrides that one model; without one it is the account's
+/// default. The same shape as a [`GroupRateRow`], keyed on the account.
 #[derive(Debug, Clone, Deserialize)]
-pub struct CostPriceRow {
+pub struct CostRateRow {
     pub revision_id: i64,
     pub engine_version: u32,
-    pub upstream_provider: String,
-    pub upstream_model: String,
-    pub provider_key_id: Option<String>,
+    pub provider_key_id: String,
+    /// `None`: the account's default rate. Set: that model's override, whose
+    /// `None` rate ends it.
+    pub model_id: Option<String>,
     pub effective_from: DateTime<Utc>,
-    /// A [`RateCard`].
-    pub card: serde_json::Value,
+    /// Ten-thousandths of a CNY per USD, `0..=1_000_000`. `None` only on a
+    /// model row, where it ends the override.
+    pub cny_per_usd_e4: Option<i64>,
 }
 
 /// One discount revision: a tenant's discount off its group's price, in
@@ -108,28 +114,9 @@ pub struct InvalidRevision {
 pub enum RevisionTable {
     Baseline,
     Rate,
+    /// The cost rates.
     Cost,
     Discount,
-}
-
-/// Where a cost price came from. It names the upstream channel, so it stays
-/// operator-side.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum CostSource {
-    /// The cost revision of the provider key that served the row.
-    ProviderKey { revision_id: i64 },
-    /// The cost revision of the upstream model, whichever key served it.
-    Upstream { revision_id: i64 },
-    /// The built-in catalogue's list price: the catalogue's version, the
-    /// entry's own key (whichever alias matched) and the entry's
-    /// `effective_from`, which tells a key's dated entries apart (`None`:
-    /// the entry that applies from the beginning of time).
-    Catalogue {
-        version: String,
-        key: String,
-        effective_from: Option<NaiveDate>,
-    },
 }
 
 /// The baseline in effect for one model.
@@ -139,12 +126,13 @@ pub(crate) struct Baseline<'a> {
     pub(crate) card: &'a RateCard,
 }
 
-/// The group rate in effect for one model.
+/// The CNY-per-USD rate in effect for one model: a group's, or an
+/// account's cost rate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct GroupRate {
+pub(crate) struct RateInEffect {
     pub(crate) revision_id: i64,
     pub(crate) cny: CnyPerUsd,
-    /// The model's own override priced it, not the group's default.
+    /// The model's own override priced it, not the default.
     pub(crate) model_override: bool,
 }
 
@@ -175,44 +163,93 @@ fn in_effect<T>(revisions: &[Revision<T>], at: DateTime<Utc>) -> Option<&Revisio
     revisions.get(started.checked_sub(1)?)
 }
 
-/// What one cost source says at `at`: `None` when it has no revision in
-/// effect, so a less specific source may decide; otherwise its revision in
-/// effect, `Err(revision_id)` when that revision is invalid.
-fn cost_at(
-    revisions: &[Revision<RateCard>],
-    at: DateTime<Utc>,
-) -> Option<Result<(i64, &RateCard), i64>> {
-    let r = in_effect(revisions, at)?;
-    Some(r.read().map(|card| (r.revision_id, card)))
-}
-
-/// One group's rates.
+/// One group's rates, or one account's cost rates.
 #[derive(Debug, Default)]
-struct GroupRates {
+struct RateRevisions {
     default: Vec<Revision<CnyPerUsd>>,
     /// By model id. A `None` rate ended the override.
     overrides: BTreeMap<String, Vec<Revision<Option<CnyPerUsd>>>>,
 }
 
-/// One upstream model's cost prices.
-#[derive(Debug, Default)]
-struct UpstreamCost {
-    upstream: Vec<Revision<RateCard>>,
-    /// By provider key id.
-    by_key: BTreeMap<String, Vec<Revision<RateCard>>>,
+impl RateRevisions {
+    /// The rate for `model_id` at `at`. The model's override in effect wins.
+    /// One in effect that ended gives way to the default in effect. An
+    /// invalid revision in effect, override or default, is `Err(revision_id)`
+    /// and never gives way to another rate. `None` when no rate is in effect.
+    fn at(&self, model_id: &str, at: DateTime<Utc>) -> Option<Result<RateInEffect, i64>> {
+        let model = self.overrides.get(model_id);
+        if let Some(r) = model.and_then(|revisions| in_effect(revisions, at)) {
+            match r.read() {
+                Ok(Some(cny)) => {
+                    return Some(Ok(RateInEffect {
+                        revision_id: r.revision_id,
+                        cny: *cny,
+                        model_override: true,
+                    }))
+                }
+                // The override ended.
+                Ok(None) => {}
+                Err(revision_id) => return Some(Err(revision_id)),
+            }
+        }
+        let r = in_effect(&self.default, at)?;
+        Some(r.read().map(|cny| RateInEffect {
+            revision_id: r.revision_id,
+            cny: *cny,
+            model_override: false,
+        }))
+    }
+}
+
+/// One rate revision as both rate tables hold it: its owner (a group, or an
+/// account), and the rest of the row.
+struct RateRow {
+    owner: String,
+    revision_id: i64,
+    engine_version: u32,
+    model_id: Option<String>,
+    effective_from: DateTime<Utc>,
+    cny_per_usd_e4: Option<i64>,
+}
+
+/// Every rate revision of one table, by owner, each in its slot. A default
+/// row (no model) without a rate is invalid with `no_default`. `rows` are in
+/// time order.
+fn index_rates(
+    invalid: &mut Vec<InvalidRevision>,
+    table: RevisionTable,
+    no_default: &str,
+    rows: impl IntoIterator<Item = RateRow>,
+) -> BTreeMap<String, RateRevisions> {
+    let mut by_owner: BTreeMap<String, RateRevisions> = BTreeMap::new();
+    for row in rows {
+        let cny = this_engine(row.engine_version).and_then(|()| read_rate(row.cny_per_usd_e4));
+        let owner = by_owner.entry(row.owner).or_default();
+        let (id, from) = (row.revision_id, row.effective_from);
+        match row.model_id {
+            Some(model) => {
+                let revision = admit(invalid, table, id, from, cny);
+                owner.overrides.entry(model).or_default().push(revision);
+            }
+            None => {
+                let cny = cny.and_then(|cny| cny.ok_or_else(|| no_default.to_owned()));
+                owner.default.push(admit(invalid, table, id, from, cny));
+            }
+        }
+    }
+    by_owner
 }
 
 /// Every price revision, indexed by its key, each key's revisions sorted by
 /// `(effective_from, revision_id)`.
 #[derive(Debug)]
 pub struct PriceBook {
-    catalogue: Arc<Catalogue>,
     /// By model id.
     baselines: BTreeMap<String, Vec<Revision<RateCard>>>,
     /// By group id.
-    rates: BTreeMap<String, GroupRates>,
-    /// By upstream provider, then upstream model.
-    cost: BTreeMap<String, BTreeMap<String, UpstreamCost>>,
+    rates: BTreeMap<String, RateRevisions>,
+    /// By provider key id.
+    cost_rates: BTreeMap<String, RateRevisions>,
     /// By tenant id.
     discounts: BTreeMap<String, Vec<Revision<u16>>>,
     invalid: Vec<InvalidRevision>,
@@ -223,17 +260,18 @@ impl PriceBook {
     /// engine cannot use is listed in [`Self::invalid_revisions`] and
     /// affects only its own key. A revision is unusable when it was written
     /// by a newer engine, its card does not decode or breaks the rate
-    /// model's rules, its rate is outside `0..=1_000_000`, a group's default
-    /// rate row carries no rate, or it is a discount outside
-    /// 0..=10000 basis points.
-    pub fn from_rows(mut rows: PriceRows, catalogue: Arc<Catalogue>) -> PriceBook {
+    /// model's rules, its rate is outside `0..=1_000_000`, a group's or an
+    /// account's default rate row carries no rate, or it is a discount
+    /// outside 0..=10000 basis points.
+    pub fn from_rows(mut rows: PriceRows) -> PriceBook {
         // Taking each table in time order leaves every key's revisions
         // sorted, which `in_effect` relies on.
         rows.baselines
             .sort_by_key(|r| (r.effective_from, r.revision_id));
         rows.rates
             .sort_by_key(|r| (r.effective_from, r.revision_id));
-        rows.cost.sort_by_key(|r| (r.effective_from, r.revision_id));
+        rows.cost_rates
+            .sort_by_key(|r| (r.effective_from, r.revision_id));
         rows.discounts
             .sort_by_key(|r| (r.effective_from, r.revision_id));
         let mut invalid = Vec::new();
@@ -251,44 +289,33 @@ impl PriceBook {
             baselines.entry(row.model_id).or_default().push(revision);
         }
 
-        let mut rates: BTreeMap<String, GroupRates> = BTreeMap::new();
-        for row in rows.rates {
-            let cny = this_engine(row.engine_version).and_then(|()| read_rate(row.cny_per_usd_e4));
-            let group = rates.entry(row.group_id).or_default();
-            let (id, from) = (row.revision_id, row.effective_from);
-            match row.model_id {
-                Some(model) => {
-                    let revision = admit(&mut invalid, RevisionTable::Rate, id, from, cny);
-                    group.overrides.entry(model).or_default().push(revision);
-                }
-                None => {
-                    let cny = cny.and_then(|cny| cny.ok_or_else(|| NO_DEFAULT_RATE.to_owned()));
-                    let revision = admit(&mut invalid, RevisionTable::Rate, id, from, cny);
-                    group.default.push(revision);
-                }
-            }
-        }
+        let rates = index_rates(
+            &mut invalid,
+            RevisionTable::Rate,
+            NO_DEFAULT_RATE,
+            rows.rates.into_iter().map(|r| RateRow {
+                owner: r.group_id,
+                revision_id: r.revision_id,
+                engine_version: r.engine_version,
+                model_id: r.model_id,
+                effective_from: r.effective_from,
+                cny_per_usd_e4: r.cny_per_usd_e4,
+            }),
+        );
 
-        let mut cost: BTreeMap<String, BTreeMap<String, UpstreamCost>> = BTreeMap::new();
-        for row in rows.cost {
-            let card = this_engine(row.engine_version).and_then(|()| read_card(row.card));
-            let revision = admit(
-                &mut invalid,
-                RevisionTable::Cost,
-                row.revision_id,
-                row.effective_from,
-                card,
-            );
-            let upstream = cost
-                .entry(row.upstream_provider)
-                .or_default()
-                .entry(row.upstream_model)
-                .or_default();
-            match row.provider_key_id {
-                Some(key) => upstream.by_key.entry(key).or_default().push(revision),
-                None => upstream.upstream.push(revision),
-            }
-        }
+        let cost_rates = index_rates(
+            &mut invalid,
+            RevisionTable::Cost,
+            NO_DEFAULT_COST_RATE,
+            rows.cost_rates.into_iter().map(|r| RateRow {
+                owner: r.provider_key_id,
+                revision_id: r.revision_id,
+                engine_version: r.engine_version,
+                model_id: r.model_id,
+                effective_from: r.effective_from,
+                cny_per_usd_e4: r.cny_per_usd_e4,
+            }),
+        );
 
         let mut discounts: BTreeMap<String, Vec<Revision<u16>>> = BTreeMap::new();
         for row in rows.discounts {
@@ -310,17 +337,16 @@ impl PriceBook {
         }
 
         PriceBook {
-            catalogue,
             baselines,
             rates,
-            cost,
+            cost_rates,
             discounts,
             invalid,
         }
     }
 
     /// Every revision this engine cannot use, for alerts: baselines, then
-    /// rates, then cost prices, then discounts, each in time order.
+    /// rates, then cost rates, then discounts, each in time order.
     pub fn invalid_revisions(&self) -> &[InvalidRevision] {
         &self.invalid
     }
@@ -355,29 +381,27 @@ impl PriceBook {
         group_id: &str,
         model_id: &str,
         at: DateTime<Utc>,
-    ) -> Option<Result<GroupRate, i64>> {
-        let group = self.rates.get(group_id)?;
-        let model = group.overrides.get(model_id);
-        if let Some(r) = model.and_then(|revisions| in_effect(revisions, at)) {
-            match r.read() {
-                Ok(Some(cny)) => {
-                    return Some(Ok(GroupRate {
-                        revision_id: r.revision_id,
-                        cny: *cny,
-                        model_override: true,
-                    }))
-                }
-                // The override ended.
-                Ok(None) => {}
-                Err(revision_id) => return Some(Err(revision_id)),
-            }
-        }
-        let r = in_effect(&group.default, at)?;
-        Some(r.read().map(|cny| GroupRate {
-            revision_id: r.revision_id,
-            cny: *cny,
-            model_override: false,
-        }))
+    ) -> Option<Result<RateInEffect, i64>> {
+        self.rates.get(group_id)?.at(model_id, at)
+    }
+
+    /// `provider_key_id`'s cost rate for `model_id` at `at`: what the
+    /// upstream account that served a row costs the platform per USD of the
+    /// model's baseline. It keys on the account the row names and on the
+    /// entry the caller addressed, the same model the baseline and the
+    /// group rate key on, so a cost and a charge always read one card.
+    ///
+    /// Read exactly as [`Self::rate`] reads a group's: the model's override
+    /// in effect wins, an ended one gives way to the account's default, and
+    /// an invalid revision in effect is `Err(revision_id)`, never another
+    /// rate. `None` when no cost rate is in effect.
+    pub(crate) fn cost_rate(
+        &self,
+        provider_key_id: &str,
+        model_id: &str,
+        at: DateTime<Utc>,
+    ) -> Option<Result<RateInEffect, i64>> {
+        self.cost_rates.get(provider_key_id)?.at(model_id, at)
     }
 
     /// `tenant_id`'s discount in effect at `at`, as `(revision_id, bps)`;
@@ -389,51 +413,6 @@ impl PriceBook {
     ) -> Option<Result<(i64, u16), i64>> {
         let r = in_effect(self.discounts.get(tenant_id)?, at)?;
         Some(r.read().map(|bps| (r.revision_id, *bps)))
-    }
-
-    /// What `provider`'s `model`, served through `provider_key_id`, costs
-    /// the platform at `at`. It keys on the upstream that served the row,
-    /// never on the model the caller addressed.
-    ///
-    /// The most specific source with a revision in effect decides: the
-    /// key's cost revisions, then the upstream model's, then the built-in
-    /// catalogue's list price in effect at `at`. When the deciding revision
-    /// is invalid the cost is unknown (`None`). It never gives way to a less
-    /// specific source: a key's row exists because its cost differs, and a
-    /// substituted cost could not be told apart on the charge. The revision
-    /// is still listed in [`Self::invalid_revisions`].
-    ///
-    /// Cost revisions match `provider` and `model` exactly. The catalogue's
-    /// aliases apply only to the catalogue fallback.
-    pub(crate) fn cost(
-        &self,
-        provider_key_id: Option<&str>,
-        provider: &str,
-        model: &str,
-        at: DateTime<Utc>,
-    ) -> Option<(CostSource, &RateCard)> {
-        let upstream = self.cost.get(provider).and_then(|m| m.get(model));
-        let by_key = upstream
-            .zip(provider_key_id)
-            .and_then(|(u, key)| u.by_key.get(key))
-            .and_then(|revisions| cost_at(revisions, at));
-        if let Some(decided) = by_key {
-            let (revision_id, card) = decided.ok()?;
-            return Some((CostSource::ProviderKey { revision_id }, card));
-        }
-        if let Some(decided) = upstream.and_then(|u| cost_at(&u.upstream, at)) {
-            let (revision_id, card) = decided.ok()?;
-            return Some((CostSource::Upstream { revision_id }, card));
-        }
-        let entry = self.catalogue.get(provider, model, at)?;
-        Some((
-            CostSource::Catalogue {
-                version: self.catalogue.version().to_owned(),
-                key: entry.key.clone(),
-                effective_from: entry.effective_from,
-            },
-            &entry.card,
-        ))
     }
 }
 
@@ -556,22 +535,22 @@ mod tests {
         }
     }
 
-    fn cost(
+    /// An account's cost rate: its default with no `model_id`, else that
+    /// model's override, which a `None` rate ends.
+    fn cost_rate(
         revision_id: i64,
-        provider: &str,
-        model: &str,
-        provider_key_id: Option<&str>,
+        provider_key_id: &str,
+        model_id: Option<&str>,
         from: &str,
-        card: Value,
-    ) -> CostPriceRow {
-        CostPriceRow {
+        e4: Option<i64>,
+    ) -> CostRateRow {
+        CostRateRow {
             revision_id,
             engine_version: ENGINE_VERSION,
-            upstream_provider: provider.to_owned(),
-            upstream_model: model.to_owned(),
-            provider_key_id: provider_key_id.map(str::to_owned),
+            provider_key_id: provider_key_id.to_owned(),
+            model_id: model_id.map(str::to_owned),
             effective_from: ts(from),
-            card,
+            cny_per_usd_e4: e4,
         }
     }
 
@@ -585,40 +564,18 @@ mod tests {
         }
     }
 
-    /// A synthetic catalogue, no real price: `openai/up-1` (alias
-    /// `up-1-latest`) at input 3 from the beginning of time, and at input 4
-    /// from 2026-12-01.
-    fn catalogue() -> Arc<Catalogue> {
-        let entry = |from: &str, input: &str| {
-            format!(
-                r#"{{"key":"openai/up-1","aliases":["up-1-latest"],"source_url":"https://openai.com/api/pricing",
-                    "as_of":"2026-11-06","effective_from":{from},
-                    "card":{{"default":{{"base":{{"input":"{input}","output":"1"}}}}}}}}"#
-            )
-        };
-        let json = format!(
-            r#"{{"version":"2026-11-06","entries":[{},{}]}}"#,
-            entry("null", "3"),
-            entry(r#""2026-12-01""#, "4")
-        );
-        Arc::new(Catalogue::from_json(&json).unwrap())
-    }
-
     fn book_of(
         baselines: Vec<BaselineRow>,
         rates: Vec<GroupRateRow>,
-        cost: Vec<CostPriceRow>,
+        cost_rates: Vec<CostRateRow>,
         discounts: Vec<DiscountRow>,
     ) -> PriceBook {
-        PriceBook::from_rows(
-            PriceRows {
-                baselines,
-                rates,
-                cost,
-                discounts,
-            },
-            catalogue(),
-        )
+        PriceBook::from_rows(PriceRows {
+            baselines,
+            rates,
+            cost_rates,
+            discounts,
+        })
     }
 
     fn book(baselines: &[BaselineRow]) -> PriceBook {
@@ -637,11 +594,6 @@ mod tests {
 
     fn usd(n: u64) -> Rate {
         Rate(n * 1_000_000)
-    }
-
-    /// The cost source for key `k1` on `openai/up-1` at `at`.
-    fn source_of(b: &PriceBook, at: &str) -> CostSource {
-        b.cost(Some("k1"), "openai", "up-1", ts(at)).unwrap().0
     }
 
     fn invalid(table: RevisionTable, revision_id: i64, reason: &str) -> InvalidRevision {
@@ -872,7 +824,7 @@ mod tests {
             );
             assert_eq!(
                 b.rate("g", "m", ts(T1)),
-                Some(Ok(GroupRate {
+                Some(Ok(RateInEffect {
                     revision_id: 3,
                     cny: CnyPerUsd(ok as u32),
                     model_override: false
@@ -1056,16 +1008,13 @@ mod tests {
             Vec::new(),
             Vec::new(),
             vec![
-                cost(6, "openai", "up-1", None, T0, card(6)),
-                cost(2, "openai", "up-1", None, T0, card(2)),
+                cost_rate(6, "k1", None, T0, Some(6_000)),
+                cost_rate(2, "k1", None, T0, Some(2_000)),
             ],
             vec![discount(7, "acme", T0, 700), discount(3, "acme", T0, 300)],
         );
-        let (source, card) = b.cost(None, "openai", "up-1", ts(T1)).unwrap();
-        assert_eq!(
-            (source, input(card)),
-            (CostSource::Upstream { revision_id: 6 }, usd(6))
-        );
+        let p = b.cost_rate("k1", "m", ts(T1)).unwrap().unwrap();
+        assert_eq!((p.revision_id, p.cny), (6, CnyPerUsd(6_000)));
         assert_eq!(b.discount("acme", ts(T1)), Some(Ok((7, 700))));
     }
 
@@ -1110,148 +1059,93 @@ mod tests {
         );
     }
 
-    // ---- cost ----
+    // ---- cost rates ----
 
     #[test]
-    fn cost_prefers_the_provider_key_then_the_upstream_then_the_catalogue() {
+    fn an_accounts_override_beats_its_default_until_it_ends() {
         let b = book_of(
             Vec::new(),
             Vec::new(),
             vec![
-                cost(1, "openai", "up-1", Some("k1"), T0, card(1)),
-                cost(2, "openai", "up-1", None, T0, card(2)),
+                cost_rate(1, "k1", None, T0, Some(3_000)),
+                cost_rate(2, "k1", Some("m"), T1, Some(2_000)),
+                cost_rate(3, "k1", Some("m"), T3, None),
             ],
             Vec::new(),
         );
-        let (source, card) = b.cost(Some("k1"), "openai", "up-1", ts(T1)).unwrap();
-        assert_eq!(
-            (source, input(card)),
-            (CostSource::ProviderKey { revision_id: 1 }, usd(1))
-        );
-        for key in [Some("k2"), None] {
-            let (source, card) = b.cost(key, "openai", "up-1", ts(T1)).unwrap();
-            assert_eq!(
-                (source, input(card)),
-                (CostSource::Upstream { revision_id: 2 }, usd(2))
-            );
-        }
-        // Cost rows match the upstream model exactly; under the catalogue's
-        // alias only the catalogue prices it.
-        let (source, card) = b.cost(Some("k1"), "openai", "up-1-latest", ts(T1)).unwrap();
-        let catalogue = CostSource::Catalogue {
-            version: "2026-11-06".to_owned(),
-            key: "openai/up-1".to_owned(),
-            effective_from: None,
+        let at = |model: &str, instant: &str| {
+            let p = b.cost_rate("k1", model, ts(instant)).unwrap().unwrap();
+            (p.revision_id, p.cny, p.model_override)
         };
-        assert_eq!((source, input(card)), (catalogue.clone(), usd(3)));
-        // No cost row at all: the catalogue, under the entry's own key.
-        let empty = book(&[]);
-        let (source, card) = empty.cost(Some("k1"), "openai", "up-1", ts(T1)).unwrap();
-        assert_eq!((source, input(card)), (catalogue, usd(3)));
-        assert!(empty.cost(None, "openai", "unknown", ts(T1)).is_none());
-        assert!(empty.cost(None, "google", "up-1", ts(T1)).is_none());
+        // Before the override starts, the account's default.
+        assert_eq!(at("m", T0), (1, CnyPerUsd(3_000), false));
+        // From its start, the override.
+        assert_eq!(at("m", T1), (2, CnyPerUsd(2_000), true));
+        assert_eq!(at("m", T2), (2, CnyPerUsd(2_000), true));
+        // Ended, the default again.
+        assert_eq!(at("m", T3), (1, CnyPerUsd(3_000), false));
+        // The override is for its own model only.
+        assert_eq!(at("other", T2), (1, CnyPerUsd(3_000), false));
     }
 
     #[test]
-    fn a_cost_row_not_yet_in_effect_leaves_the_next_source() {
+    fn a_cost_rate_keys_on_its_account_alone() {
+        // A group rate and a cost rate with the same owner string are two
+        // different things: neither is ever read as the other.
         let b = book_of(
             Vec::new(),
-            Vec::new(),
-            vec![
-                cost(1, "openai", "up-1", Some("k1"), T2, card(1)),
-                cost(2, "openai", "up-1", None, T3, card(2)),
-            ],
-            Vec::new(),
-        );
-        assert!(matches!(source_of(&b, T1), CostSource::Catalogue { .. }));
-        assert_eq!(
-            source_of(&b, T2),
-            CostSource::ProviderKey { revision_id: 1 }
-        );
-        let unkeyed = |at| b.cost(None, "openai", "up-1", ts(at)).unwrap().0;
-        assert!(matches!(unkeyed(T2), CostSource::Catalogue { .. }));
-        assert_eq!(unkeyed(T3), CostSource::Upstream { revision_id: 2 });
-    }
-
-    #[test]
-    fn an_invalid_cost_revision_leaves_the_cost_unknown() {
-        // Ruling P2-R14: the most specific source with a revision in effect
-        // decides, and an invalid one decides "unknown".
-        let b = book_of(
-            Vec::new(),
-            Vec::new(),
-            vec![
-                cost(1, "openai", "up-1", Some("k1"), T0, card(1)),
-                cost(2, "openai", "up-1", Some("k1"), T2, undecodable()),
-                cost(3, "openai", "up-1", None, T0, card(3)),
-            ],
+            vec![rate(1, "x", T0, 70_000)],
+            vec![cost_rate(2, "k1", None, T0, Some(3_000))],
             Vec::new(),
         );
         assert_eq!(
-            source_of(&b, T1),
-            CostSource::ProviderKey { revision_id: 1 }
+            b.cost_rate("k1", "m", ts(T1)).unwrap().unwrap().revision_id,
+            2
         );
-        // Neither the key's older row nor the upstream row stands in.
-        assert_eq!(b.cost(Some("k1"), "openai", "up-1", ts(T3)), None);
-        // Another key, or none, still reads the upstream row.
-        for key in [Some("k2"), None] {
-            let (source, _) = b.cost(key, "openai", "up-1", ts(T3)).unwrap();
-            assert_eq!(source, CostSource::Upstream { revision_id: 3 });
+        for other in ["", "k2", "K1", "x"] {
+            assert!(b.cost_rate(other, "m", ts(T1)).is_none(), "{other:?}");
         }
-        let listed = b.invalid_revisions();
-        assert_eq!(
-            (listed.len(), listed[0].table, listed[0].revision_id),
-            (1, RevisionTable::Cost, 2)
-        );
+        assert!(b.rate("k1", "m", ts(T1)).is_none());
+        // Nothing in effect before the first revision.
+        assert!(b.cost_rate("k1", "m", ts("2025-12-31T23:59:59Z")).is_none());
+    }
 
-        // An invalid upstream row is not replaced by the catalogue, which
-        // prices this model; nor is a newer engine's key row.
-        let mut newer = cost(5, "openai", "up-1", Some("k1"), T0, card(1));
+    #[test]
+    fn an_unusable_cost_rate_is_isolated_and_never_gives_way() {
+        let mut newer = cost_rate(5, "k1", Some("n"), T0, Some(2_000));
         newer.engine_version = ENGINE_VERSION + 1;
         let b = book_of(
             Vec::new(),
             Vec::new(),
-            vec![cost(4, "openai", "up-1", None, T0, undecodable()), newer],
+            vec![
+                cost_rate(1, "k1", None, T0, Some(3_000)),
+                // Out of range: the model's cost is unknown, not the default.
+                cost_rate(2, "k1", Some("m"), T0, Some(1_000_001)),
+                // A default row with no rate.
+                cost_rate(3, "k2", None, T0, None),
+                newer,
+            ],
             Vec::new(),
         );
-        assert!(book(&[]).cost(None, "openai", "up-1", ts(T1)).is_some());
-        assert_eq!(b.cost(None, "openai", "up-1", ts(T1)), None);
-        assert_eq!(b.cost(Some("k1"), "openai", "up-1", ts(T1)), None);
-        let listed: Vec<_> = b
-            .invalid_revisions()
-            .iter()
-            .map(|r| (r.table, r.revision_id))
-            .collect();
-        assert_eq!(listed, [(RevisionTable::Cost, 4), (RevisionTable::Cost, 5)]);
-    }
-
-    #[test]
-    fn the_catalogue_fallback_is_dated_by_the_event_instant() {
-        // Ruling P2-R7: the list price in effect when the event occurred.
-        // Ruling P2-R13: the source names the dated entry that priced it.
-        let b = book(&[]);
-        let dec_1 = NaiveDate::from_ymd_opt(2026, 12, 1);
-        for (at, want, effective_from) in [
-            ("2026-11-30T23:59:59.999Z", 3, None),
-            ("2026-12-01T00:00:00Z", 4, dec_1),
-            ("2027-06-01T00:00:00Z", 4, dec_1),
-        ] {
-            for model in ["up-1", "up-1-latest"] {
-                let (source, card) = b.cost(None, "openai", model, ts(at)).unwrap();
-                assert_eq!(
-                    (source, input(card)),
-                    (
-                        CostSource::Catalogue {
-                            version: "2026-11-06".to_owned(),
-                            key: "openai/up-1".to_owned(),
-                            effective_from,
-                        },
-                        usd(want)
-                    ),
-                    "{model} at {at}"
-                );
-            }
-        }
+        assert_eq!(b.cost_rate("k1", "m", ts(T1)), Some(Err(2)));
+        assert_eq!(b.cost_rate("k2", "m", ts(T1)), Some(Err(3)));
+        assert_eq!(b.cost_rate("k1", "n", ts(T1)), Some(Err(5)));
+        assert_eq!(
+            b.cost_rate("k1", "o", ts(T1)).unwrap().unwrap().revision_id,
+            1
+        );
+        assert_eq!(
+            b.invalid_revisions(),
+            [
+                invalid(
+                    RevisionTable::Cost,
+                    2,
+                    "cny_per_usd_e4 1000001 is outside 0..=1000000"
+                ),
+                invalid(RevisionTable::Cost, 3, NO_DEFAULT_COST_RATE),
+                invalid(RevisionTable::Cost, 5, "written by a newer engine"),
+            ]
+        );
     }
 
     // ---- the rows ----
@@ -1273,10 +1167,9 @@ mod tests {
                 {"revision_id": 7, "engine_version": 1, "group_id": "g", "model_id": "m",
                  "effective_from": T2, "cny_per_usd_e4": null}
             ],
-            "cost": [
-                {"revision_id": 3, "engine_version": 1, "upstream_provider": "openai",
-                 "upstream_model": "up-1", "provider_key_id": "k1", "effective_from": T0,
-                 "card": card(2)}
+            "cost_rates": [
+                {"revision_id": 3, "engine_version": 1, "provider_key_id": "k1", "model_id": null,
+                 "effective_from": T0, "cny_per_usd_e4": 3000}
             ],
             "discounts": [
                 {"revision_id": 4, "engine_version": 1, "tenant_id": "acme",
@@ -1284,7 +1177,7 @@ mod tests {
             ]
         }))
         .unwrap();
-        let b = PriceBook::from_rows(rows, catalogue());
+        let b = PriceBook::from_rows(rows);
         assert!(b.invalid_revisions().is_empty());
         assert_eq!(b.baseline("m", ts(T3)).unwrap().unwrap().revision_id, 2);
         let p = b.rate("g", "m", ts(T1)).unwrap().unwrap();
@@ -1297,9 +1190,10 @@ mod tests {
             (p.revision_id, p.cny, p.model_override),
             (5, CnyPerUsd(10_000), false)
         );
+        let p = b.cost_rate("k1", "m", ts(T1)).unwrap().unwrap();
         assert_eq!(
-            b.cost(Some("k1"), "openai", "up-1", ts(T1)).unwrap().0,
-            CostSource::ProviderKey { revision_id: 3 }
+            (p.revision_id, p.cny, p.model_override),
+            (3, CnyPerUsd(3_000), false)
         );
         assert_eq!(b.discount("acme", ts(T1)), Some(Ok((4, 2_500))));
     }
