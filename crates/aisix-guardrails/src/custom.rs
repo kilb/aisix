@@ -314,10 +314,19 @@ impl CustomGuardrail {
         model: Option<&str>,
         fail_open: bool,
     ) -> SegmentsOutcome {
+        // Output slots are the model's answer, so they read as the
+        // assistant's, the role the plain `check_output` hook gives the same
+        // text. Input slots are flattened from every message, so they keep
+        // the one role the flattening can claim.
+        let role = if hook == "output" {
+            aisix_gateway::Role::Assistant
+        } else {
+            aisix_gateway::Role::User
+        };
         let messages: Vec<ScriptMessage> = texts
             .iter()
             .map(|t| ScriptMessage {
-                role: aisix_gateway::Role::User,
+                role,
                 text: t.clone(),
             })
             .collect();
@@ -1092,12 +1101,15 @@ async fn host_fetch(
         Err(e) => {
             // Never the full URL: scripts commonly build it from a secret
             // (`${base}/scan?key=${ctx.secrets.SCAN_KEY}`), and this line
-            // goes to the operator's log.
+            // goes to the operator's log. Nor in what the script's `fetch`
+            // rejects with: a script that does not catch it has the gateway
+            // log the rejection as the error it threw.
+            let e = e.without_url();
             let for_script = e.to_string();
             tracing::warn!(
                 guardrail_name = %row_name,
                 target = %redact_url(&url),
-                error = %crate::error_chain(&e.without_url()),
+                error = %crate::error_chain(&e),
                 "custom guardrail fetch failed",
             );
             return fetch_error(for_script);
@@ -1499,6 +1511,48 @@ mod tests {
         assert!(
             matches!(verdict, GuardrailVerdict::Block { .. }),
             "{verdict:?}",
+        );
+    }
+
+    /// The segment output hook is how the LLM families run a custom row over
+    /// an answer, so a rule keyed on `ctx.messages[].role` must see the
+    /// assistant there, as the plain output hook shows it (R-054).
+    #[tokio::test]
+    async fn output_segments_are_the_assistant_s_messages() {
+        let cfg = config(
+            "export function checkOutput(ctx) {
+               return ctx.messages.some((m) => m.role === 'assistant' && m.text.includes('SECRET'))
+                 ? { action: 'block' } : { action: 'none' };
+             }
+             export function checkInput(ctx) {
+               return ctx.messages.every((m) => m.role === 'user')
+                 ? { action: 'block' } : { action: 'none' };
+             }",
+        );
+        let g = guardrail(&cfg, false);
+        let resp = aisix_gateway::ChatResponse {
+            logprobs: None,
+            more_choices: Vec::new(),
+            id: String::new(),
+            model: "gpt-4o".into(),
+            message: aisix_gateway::ChatMessage::assistant("the SECRET".to_owned()),
+            finish_reason: aisix_gateway::FinishReason::Stop,
+            usage: aisix_gateway::UsageStats::default(),
+            service_tier: None,
+        };
+        let plain = g.check_output(&resp).await;
+        assert!(matches!(plain, GuardrailVerdict::Block { .. }), "{plain:?}");
+        let segments = g.moderate_output_segments(&["the SECRET".to_owned()]).await;
+        assert!(
+            matches!(segments.verdict, GuardrailVerdict::Block { .. }),
+            "{:?}",
+            segments.verdict,
+        );
+        let input = g.moderate_input_segments(&["hello".to_owned()], None).await;
+        assert!(
+            matches!(input.verdict, GuardrailVerdict::Block { .. }),
+            "input slots stay the user's: {:?}",
+            input.verdict,
         );
     }
 
@@ -2129,5 +2183,41 @@ mod tests {
             .to_owned();
         assert!(error.contains("error sending request"), "{error}");
         assert!(!error.to_lowercase().contains("refused"), "{error}");
+    }
+
+    /// A script that does not catch a failed `fetch` has the gateway log the
+    /// rejection as the error it threw. That error is built by the gateway,
+    /// not the script, so it must not carry the URL whose query holds the
+    /// secret either (R-087); the row still fails closed.
+    #[tokio::test]
+    async fn an_uncaught_failed_fetch_logs_no_query_secret() {
+        use crate::call_error::testing::*;
+        let endpoint = refused_endpoint();
+        let mut cfg = config(&format!(
+            "export async function checkInput(ctx) {{
+               await fetch('{endpoint}/scan?key=' + ctx.secrets.SCAN_KEY);
+               return {{ action: 'none' }};
+             }}"
+        ));
+        cfg.secrets
+            .insert("SCAN_KEY".to_owned(), "sk-live-query-42".to_owned());
+        let g = guardrail(&cfg, false);
+        let mut verdict = GuardrailVerdict::Allow;
+        let logged = capture_logs(|| async {
+            verdict = g.check_input(&request("hello")).await;
+        })
+        .await;
+        assert!(logged.contains("custom guardrail script threw"), "{logged}");
+        assert!(!logged.contains("sk-live-query-42"), "{logged}");
+        assert!(
+            matches!(
+                verdict,
+                GuardrailVerdict::Block {
+                    unavailable: Some(_),
+                    ..
+                }
+            ),
+            "{verdict:?}",
+        );
     }
 }
