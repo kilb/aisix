@@ -29,6 +29,7 @@ use aisix_core::mcp_openapi::{generate, GeneratedTool};
 use aisix_core::snapshot::ResourceTable;
 use aisix_core::{McpAuthType, McpServer, ResourceEntry};
 use async_trait::async_trait;
+use futures::StreamExt;
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 use serde_json::{json, Map, Value};
 
@@ -38,6 +39,12 @@ use crate::error::McpError;
 /// Header the API key is sent under for `auth_type: api_key` when the
 /// resource sets no `api_key_header`.
 pub const DEFAULT_API_KEY_HEADER: &str = "x-api-key";
+
+/// Most bytes of a REST response a tool call reads. A response is held whole
+/// before it becomes the tool's result, so this bounds what one call can make
+/// the gateway allocate; it is the cap a native MCP upstream's answer has
+/// (rmcp's 16 MiB) and an A2A agent's.
+const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
 /// Everything except RFC 3986 unreserved characters is percent-encoded when a
 /// path parameter value is substituted into the URL template.
@@ -362,17 +369,9 @@ impl OpenApiBridge {
         };
 
         let status = response.status();
-        let body = tokio::time::timeout_at(deadline, response.text())
+        let body = tokio::time::timeout_at(deadline, read_response_text(response))
             .await
-            .map_err(|_| tool_call_timed_out())?
-            .map_err(|e| {
-                McpError::Request(format!(
-                    "failed to read response: {}",
-                    crate::bridge::sanitize_error_message(&crate::bridge::transport_failure_text(
-                        e
-                    ))
-                ))
-            })?;
+            .map_err(|_| tool_call_timed_out())??;
 
         if status.is_success() {
             Ok(McpToolResult {
@@ -393,6 +392,40 @@ impl OpenApiBridge {
 
 fn tool_call_timed_out() -> McpError {
     McpError::Request("tool call timed out".to_string())
+}
+
+/// The response body as text, refused past [`MAX_RESPONSE_BYTES`]: up front
+/// when `Content-Length` declares more, and as chunks arrive when it is
+/// absent or understates. A body that does not fit fails the call whole,
+/// whatever its status, rather than handing the agent part of it.
+async fn read_response_text(response: reqwest::Response) -> Result<String, McpError> {
+    let too_large = || {
+        McpError::Request(format!(
+            "response exceeded the {MAX_RESPONSE_BYTES}-byte limit for a tool result"
+        ))
+    };
+    if response
+        .content_length()
+        .is_some_and(|len| len > MAX_RESPONSE_BYTES as u64)
+    {
+        return Err(too_large());
+    }
+    let mut body = Vec::new();
+    let mut chunks = response.bytes_stream();
+    while let Some(chunk) = chunks.next().await {
+        let chunk = chunk.map_err(|e| {
+            McpError::Request(format!(
+                "failed to read response: {}",
+                crate::bridge::sanitize_error_message(&crate::bridge::transport_failure_text(e))
+            ))
+        })?;
+        if body.len() + chunk.len() > MAX_RESPONSE_BYTES {
+            return Err(too_large());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    // What `Response::text` does on this build (no `charset` feature).
+    Ok(String::from_utf8_lossy(&body).into_owned())
 }
 
 /// A tool-level error result (`isError: true` with a text message) — the

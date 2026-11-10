@@ -602,3 +602,64 @@ async fn a_rest_api_quoting_the_basic_credential_of_its_url_does_not_reach_the_a
     );
     client.cancel().await.ok();
 }
+
+/// A REST response is read up to a fixed cap: one past it fails the call
+/// whole, whether its length is declared or it streams without one, rather
+/// than being held in memory; a small answer from the same API is
+/// unaffected. Driven on the bridge itself, because a downstream MCP client
+/// caps what it reads too and would hide whether the gateway buffered it.
+#[tokio::test]
+async fn a_response_past_the_cap_fails_the_call_instead_of_being_buffered() {
+    use aisix_mcp::{McpBridge, McpError, OpenApiBridge};
+    const PAST_CAP: usize = 17 * 1024 * 1024;
+    let app = axum::Router::new()
+        .route("/declared", get(|| async { "x".repeat(PAST_CAP) }))
+        .route(
+            "/streamed",
+            get(|| async {
+                let chunk = axum::body::Bytes::from(vec![b'x'; 1024 * 1024]);
+                let chunks = futures::stream::iter(
+                    (0..17).map(move |_| Ok::<_, std::convert::Infallible>(chunk.clone())),
+                );
+                axum::body::Body::from_stream(chunks)
+            }),
+        )
+        .route(
+            "/failing",
+            get(|| async { (StatusCode::INTERNAL_SERVER_ERROR, "x".repeat(PAST_CAP)) }),
+        )
+        .route("/small", get(|| async { "small answer" }));
+    let api = serve(app).await;
+    let bridge = OpenApiBridge::new(std::sync::Arc::new(openapi_entry(
+        "big",
+        json!({
+            "name": "big",
+            "type": "openapi",
+            "url": format!("http://{api}"),
+            "spec": { "openapi": "3.0.0", "paths": {
+                "/declared": { "get": { "operationId": "declared" } },
+                "/streamed": { "get": { "operationId": "streamed" } },
+                "/failing": { "get": { "operationId": "failing" } },
+                "/small": { "get": { "operationId": "small" } }
+            } },
+        }),
+    )));
+
+    for tool in ["declared", "streamed", "failing"] {
+        match bridge.call_tool(tool, Value::Null).await {
+            Err(McpError::Request(message)) => {
+                assert!(message.contains("limit"), "{tool}: {message}")
+            }
+            Err(other) => panic!("{tool}: {other}"),
+            Ok(result) => panic!(
+                "{tool}: a response past the cap was buffered into a {}-byte result",
+                result.content.to_string().len()
+            ),
+        }
+    }
+    let result = bridge
+        .call_tool("small", Value::Null)
+        .await
+        .expect("a small answer is served");
+    assert_eq!(result.content[0]["text"], "small answer");
+}
