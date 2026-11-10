@@ -1,6 +1,6 @@
-import { useRef, useState } from "react";
+import { useState, useSyncExternalStore } from "react";
 import { billing } from "../../lib/api";
-import { sendCredit } from "../../lib/creditOutcome";
+import { creditLocks, sendCredit } from "../../lib/creditOutcome";
 import { isCnyAmount } from "../../lib/money";
 import { Button } from "../../ui/Button";
 import { Field, useRefusalFocus } from "../../ui/Field";
@@ -22,32 +22,22 @@ function check(amount: string, reason: string): Problems {
   return problems;
 }
 
-/**
- * Tenants whose last credit ended with an unknown outcome, kept outside the form so closing
- * the panel (or opening another tenant) does not hand a fresh, unlocked form back. It lives
- * for this page load only; a reload starts clean, as the operator then reads the ledger anyway.
- */
-const unknownCredits = new Set<string>();
-
 function Form({ account, onChanged }: RegionProps) {
   const toast = useToast();
   const [amount, setAmount] = useState("");
   const [reason, setReason] = useState("");
   const [reference, setReference] = useState("");
   const [busy, setBusy] = useState(false);
-  // Synchronous re-entry guard: a second confirm before the state update cannot get in.
-  const inFlight = useRef(false);
   const [local, setLocal] = useState<Problems>({});
   const [refused, setRefused] = useState<ReturnType<typeof refusal> | null>(null);
   const [stale, setStale] = useState<string | null>(null);
-  // The credit may have been stored while its answer was lost: the form stays locked until the operator has checked and starts over.
-  const [unknown, setUnknownState] = useState(() => unknownCredits.has(account.tenant_id));
-  const setUnknown = (on: boolean) => {
-    if (on) unknownCredits.add(account.tenant_id);
-    else unknownCredits.delete(account.tenant_id);
-    // A no-op when the panel was closed before the answer came; the lock above still holds.
-    setUnknownState(on);
-  };
+  // The tenant's credit lock, which outlives this form: a credit sent from a form since closed
+  // is still followed here. An unknown outcome may have been stored while its answer was lost:
+  // the form stays locked until the operator has checked and starts over.
+  const lock = useSyncExternalStore(creditLocks.subscribe, () => creditLocks.get(account.tenant_id));
+  const unknown = lock === "unknown";
+  // A credit this form did not send is still on its way.
+  const elsewhere = lock === "pending" && !busy;
   const [checking, setChecking] = useState(false);
   const [form, focusRefusal] = useRefusalFocus<HTMLFormElement>();
 
@@ -65,8 +55,9 @@ function Form({ account, onChanged }: RegionProps) {
   }
 
   async function send() {
-    if (inFlight.current || Object.keys(check(amount, reason)).length > 0) return;
-    inFlight.current = true;
+    // The lock is taken synchronously before anything is sent: a second confirm, or another
+    // form of the same tenant, cannot get in.
+    if (Object.keys(check(amount, reason)).length > 0 || !creditLocks.acquire(account.tenant_id)) return;
     setBusy(true);
     const outcome = await sendCredit(() =>
       billing.credit(account.tenant_id, {
@@ -76,14 +67,13 @@ function Form({ account, onChanged }: RegionProps) {
       }),
     );
     if (outcome.kind === "unknown") {
-      setUnknown(true);
-      inFlight.current = false;
+      creditLocks.settle(account.tenant_id, "unknown");
       setBusy(false);
       return;
     }
     if (outcome.kind === "refused") {
+      creditLocks.settle(account.tenant_id, "refused");
       setRefused(refusal(outcome.error, (p) => p === "/amount_cny" || p === "/reason" || p === "/reference"));
-      inFlight.current = false;
       setBusy(false);
       focusRefusal();
       return;
@@ -98,7 +88,7 @@ function Form({ account, onChanged }: RegionProps) {
     } catch {
       setStale("已入账，但读取最新余额失败，请刷新账户列表。");
     } finally {
-      inFlight.current = false;
+      creditLocks.settle(account.tenant_id, "done");
       setBusy(false);
     }
   }
@@ -121,7 +111,7 @@ function Form({ account, onChanged }: RegionProps) {
     setReference("");
     setLocal({});
     setRefused(null);
-    setUnknown(false);
+    creditLocks.release(account.tenant_id);
   }
 
   const amountProblem = local.amount ?? refused?.at.get("/amount_cny") ?? null;
@@ -132,19 +122,20 @@ function Form({ account, onChanged }: RegionProps) {
       <form ref={form} onSubmit={(e) => e.preventDefault()} noValidate>
         <Field label="金额（元）" error={amountProblem}>
           {(aria) => (
-            <input inputMode="decimal" value={amount} disabled={busy || unknown} onChange={(e) => setAmount(e.target.value)} {...aria} />
+            <input inputMode="decimal" value={amount} disabled={busy || lock !== null} onChange={(e) => setAmount(e.target.value)} {...aria} />
           )}
         </Field>
         <Field label="原因" error={reasonProblem}>
-          {(aria) => <input value={reason} maxLength={500} disabled={busy || unknown} onChange={(e) => setReason(e.target.value)} {...aria} />}
+          {(aria) => <input value={reason} maxLength={500} disabled={busy || lock !== null} onChange={(e) => setReason(e.target.value)} {...aria} />}
         </Field>
         <Field label="凭证号" error={refused?.at.get("/reference") ?? null}>
-          {(aria) => <input value={reference} maxLength={128} disabled={busy || unknown} onChange={(e) => setReference(e.target.value)} {...aria} />}
+          {(aria) => <input value={reference} maxLength={128} disabled={busy || lock !== null} onChange={(e) => setReference(e.target.value)} {...aria} />}
         </Field>
         {!unknown && (
         <TwoStep
           label="入账"
           kind="primary"
+          disabled={elsewhere}
           busy={busy}
           ask={ask}
           warning="将立即计入该租户余额"
@@ -152,6 +143,11 @@ function Form({ account, onChanged }: RegionProps) {
         />
         )}
       </form>
+      {elsewhere && (
+        <div className="note warn" role="status">
+          这个租户的上一笔入账仍在等待结果，结果出来之前不能再次入账。
+        </div>
+      )}
       {unknown && (
         <div className="note crit" role="alert">
           入账结果未知：请先在「计费 · 充值审批」中把状态选为「已批准」、来源选为「平台入账」，按租户、原因与凭证号确认这笔入账是否已记录，再决定是否重试。本面板「余额流水」里的「充值」条目不分租户申请的充值与平台入账，不能据此判断。
