@@ -3579,3 +3579,37 @@ async fn an_all_scope_tenant_and_its_keys_reach_a_public_model_without_holding_i
         "{r:?}"
     );
 }
+
+/// `least_cost` ranks targets by their price, and a public model's generated
+/// targets carry none, so the strategy is refused at its field rather than
+/// stored and silently ordering by the target list.
+#[tokio::test]
+async fn a_public_model_cannot_route_by_least_cost() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let op = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let (public, _) = create_public(&cp, &op, "pub-cost-8c1").await;
+    let r = patch_public(
+        &cp,
+        &op,
+        public,
+        json!({"routing": {"strategy": "least_cost"}}),
+    )
+    .await;
+    assert_422_at(&r, "/routing/strategy");
+    assert_eq!(stored_routing(&cp, public).await, json!({}));
+    // The other metric strategies need no price, and are kept.
+    let r = patch_public(
+        &cp,
+        &op,
+        public,
+        json!({"routing": {"strategy": "least_latency"}}),
+    )
+    .await;
+    assert_eq!(r.status, 200, "{r:?}");
+    assert_eq!(
+        stored_routing(&cp, public).await,
+        json!({"strategy": "least_latency"})
+    );
+}

@@ -291,6 +291,10 @@ pub fn routing_doc(public: &PublicModelRow, channels: &[ChannelModelRow]) -> Val
 /// The strategy a public model dispatches with when the operator set none.
 pub const DEFAULT_STRATEGY: &str = "round_robin";
 
+/// The strategy a public model cannot use: it orders targets by their price,
+/// and no generated target carries one.
+const UNPRICED_STRATEGY: &str = "least_cost";
+
 /// The settings a public model's `routing` column may hold a non-default
 /// value for: every property of the gateway's own `Routing` definition
 /// except `targets`, which is generated.
@@ -350,6 +354,18 @@ fn checked_routing(settings: &Value) -> Result<Value, Vec<Detail>> {
                 },
             });
         }
+    }
+    // `least_cost` ranks targets by the price each one carries, and a
+    // generated target carries none ([`direct_doc`]): every target would rank
+    // as unpriced and the strategy would silently fall back to the order the
+    // targets are listed in. Refused rather than accepted and inert.
+    if settings.get("strategy").and_then(Value::as_str) == Some(UNPRICED_STRATEGY) {
+        problems.push(Detail {
+            path: "/routing/strategy".to_string(),
+            message: format!(
+                "公共模型的路由目标不带价格，「{UNPRICED_STRATEGY}」无法按价格排序；请选择其他选路策略"
+            ),
+        });
     }
     if !problems.is_empty() {
         return Err(problems);
