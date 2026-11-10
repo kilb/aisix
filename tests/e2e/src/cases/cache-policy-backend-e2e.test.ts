@@ -1,5 +1,4 @@
 import { createHash, randomUUID } from "node:crypto";
-import { connect } from "node:net";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   EtcdClient,
@@ -11,6 +10,7 @@ import {
   type OpenAiUpstream,
   type SpawnedApp,
 } from "../harness/index.js";
+import { redisReady } from "../harness/redis.js";
 
 // E2E: per-policy cache backend dispatch (api7/#519 B.8).
 //
@@ -32,25 +32,6 @@ const CALLER_KEY_HASH = createHash("sha256")
 
 const REDIS_URL =
   process.env.AISIX_E2E_REDIS ?? "redis://127.0.0.1:6379";
-
-/** RESP-level PING so the redis-positive suite can skip honestly when
- *  no redis is reachable (CI provisions redis:7-alpine on :6379). */
-async function redisPing(url: string): Promise<boolean> {
-  const m = /^redis:\/\/(?:[^@/]*@)?([^:/]+)(?::(\d+))?/.exec(url);
-  if (!m) return false;
-  const host = m[1];
-  const port = m[2] ? Number(m[2]) : 6379;
-  return new Promise((resolve) => {
-    const sock = connect({ host, port }, () => sock.write("PING\r\n"));
-    const done = (ok: boolean) => {
-      sock.destroy();
-      resolve(ok);
-    };
-    sock.once("data", (buf) => done(buf.toString().startsWith("+PONG")));
-    sock.once("error", () => done(false));
-    sock.setTimeout(1000, () => done(false));
-  });
-}
 
 interface SeededApp {
   app: SpawnedApp;
@@ -215,7 +196,7 @@ describe("cache policy backend=redis with a configured redis is shared across DP
 
   beforeAll(async () => {
     infraReady =
-      (await new EtcdClient().ping()) && (await redisPing(REDIS_URL));
+      (await new EtcdClient().ping()) && (await redisReady(REDIS_URL, "any"));
     if (!infraReady) return;
 
     upstream = await startOpenAiUpstream();

@@ -1,5 +1,4 @@
 import { createHash } from "node:crypto";
-import { connect } from "node:net";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   EtcdClient,
@@ -10,6 +9,7 @@ import {
   type OpenAiUpstream,
   type SpawnedApp,
 } from "../harness/index.js";
+import { redisReady } from "../harness/redis.js";
 
 // A `CachePolicy` has no endpoint dimension: an operator writes one for a
 // model, and it reasonably covers that model wherever it is addressed. Only
@@ -31,23 +31,6 @@ const CALLER_KEY_HASH = createHash("sha256")
   .digest("hex");
 
 const REDIS_URL = process.env.AISIX_E2E_REDIS ?? "redis://127.0.0.1:6379";
-
-async function redisPing(url: string): Promise<boolean> {
-  const m = /^redis:\/\/(?:[^@/]*@)?([^:/]+)(?::(\d+))?/.exec(url);
-  if (!m) return false;
-  const host = m[1];
-  const port = m[2] ? Number(m[2]) : 6379;
-  return new Promise((resolve) => {
-    const sock = connect({ host, port }, () => sock.write("PING\r\n"));
-    const done = (ok: boolean) => {
-      sock.destroy();
-      resolve(ok);
-    };
-    sock.once("data", (buf) => done(buf.toString().startsWith("+PONG")));
-    sock.once("error", () => done(false));
-    sock.setTimeout(1000, () => done(false));
-  });
-}
 
 /** The three endpoints under test, and a request body for each. */
 const CASES = [
@@ -266,7 +249,7 @@ describe("response cache endpoint coverage on redis", () => {
   let infraReady = false;
 
   beforeAll(async () => {
-    infraReady = (await new EtcdClient().ping()) && (await redisPing(REDIS_URL));
+    infraReady = (await new EtcdClient().ping()) && (await redisReady(REDIS_URL, "any"));
     if (!infraReady) return;
     upstream = await startOpenAiUpstream({ pathBodies: pathBodies() });
     const extra = { cache: { backend: "memory", redis: { url: REDIS_URL } } };

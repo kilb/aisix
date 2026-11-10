@@ -1,5 +1,4 @@
 import { createHash, randomUUID } from "node:crypto";
-import { connect } from "node:net";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   EtcdClient,
@@ -12,6 +11,7 @@ import {
   type OpenAiUpstream,
   type SpawnedApp,
 } from "../harness/index.js";
+import { redisReady } from "../harness/redis.js";
 
 // E2E: the response cache is isolated per environment on a shared Redis
 // (api7/#788, P1-1).
@@ -42,26 +42,6 @@ const REDIS_URL = process.env.AISIX_E2E_REDIS ?? "redis://127.0.0.1:6379";
 // across environments — the env namespace is the only thing keeping their
 // cache entries apart.
 const MODEL = "cache-envns";
-
-/** RESP-level PING so the suite skips honestly when no redis is reachable
- *  (CI provisions redis:7-alpine on :6379). */
-async function redisPing(url: string): Promise<boolean> {
-  const m = /^redis:\/\/(?:[^@/]*@)?([^:/]+)(?::(\d+))?/.exec(url);
-  if (!m) return false;
-  const host = m[1];
-  const port = m[2] ? Number(m[2]) : 6379;
-  return new Promise((resolve) => {
-    const sock = connect({ host, port });
-    const done = (ok: boolean) => {
-      sock.destroy();
-      resolve(ok);
-    };
-    sock.once("connect", () => sock.write("PING\r\n"));
-    sock.once("data", (buf: Buffer) => done(buf.toString().startsWith("+PONG")));
-    sock.once("error", () => done(false));
-    sock.setTimeout(1000, () => done(false));
-  });
-}
 
 /** A shared etcd base prefix, but each app carries its own `env_id`, so
  *  `effective_prefix` (`<prefix>/<env_id>/`) keeps their config namespaces
@@ -158,7 +138,7 @@ describe("response cache is isolated per env on a shared Redis (#788 P1-1)", () 
   const envB = `env-b-${randomUUID()}`;
 
   beforeAll(async () => {
-    infraReady = (await new EtcdClient().ping()) && (await redisPing(REDIS_URL));
+    infraReady = (await new EtcdClient().ping()) && (await redisReady(REDIS_URL, "any"));
     if (!infraReady) return;
 
     upstreamA = await startOpenAiUpstream({
