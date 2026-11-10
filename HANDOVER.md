@@ -52,7 +52,7 @@ Platform side — ours:
 
 ### Web apps (`web-cp`, `web-tenant`)
 
-Vite + React 19, no component library. Shared UI files (`Button`, `Field`, `TwoStep`, `CopyButton`, `KeySecret`, money helpers, …) live in `web-cp/src/ui/` and are copied byte-for-byte into `web-tenant/src/ui/`; `web-tenant/src/lib/tokenParity.test.ts` fails if the copies drift. UI copy is Chinese; code comments are English.
+Vite + React 19, no component library. Shared UI files (`Button`, `Field`, `Toast`, `TwoStep`, `Lamp`, `EmptyState`, `DataTable`, `Icon`, `CopyButton`, `KeySecret`, and `CONTRACT.md`) live in `web-cp/src/ui/` and are copied byte-for-byte into `web-tenant/src/ui/`; the money helper (`src/lib/money.ts`) is pinned the same way but lives under `lib/`. `web-tenant/src/lib/tokenParity.test.ts` lists both sets and fails if a copy drifts. UI copy is Chinese; code comments are English.
 
 ### Deploy kit and artefacts — **not in the repo**
 
@@ -67,7 +67,7 @@ Everything below lives under `/home/ubuntu/code/aisix/.claude/worktrees/merge-up
   - `deploy-log.txt` — append-only; the script writes its own lines into it. `releases/` beside it holds each tarball, the preflight/precheck outputs and each run's log; that is where you reconstruct the last successful upgrade.
 - `platform/design/` — `2026-11-06-platform-control-plane-design.md` (the design), the P0–P3 plans, the group-pricing design and plan, the P4 quota evaluation, `follow-up-issues.md`, UI direction, recon notes.
 - `platform/node-dl/`, `platform/kine-dl/` — pinned Node 22.23.4 and kine 0.17.5 for tests.
-- `sdd/2026-11-08-group-pricing-plan/progress.md` — the ledger of every ruling and test count to date. The fastest way to learn why something is the way it is.
+- `sdd/2026-11-07-p3-deploy-plan/progress.md` — the deploy ledger (rulings, checks). The group-pricing ledger lives in a worktree, `.claude/worktrees/gp/.superpowers/sdd/2026-11-08-group-pricing-plan/progress.md`; between them they record every ruling and test count, and are the fastest way to learn why something is the way it is.
 
 **Both kit scripts hardcode `REPO=/home/ubuntu/code/aisix`** (the main checkout) and the Node path above, so they build from and read tarballs out of the main checkout, not out of the worktree you are in.
 
@@ -165,7 +165,7 @@ $KIT/gp-upgrade.sh rollback <gateway|cp|all>
 
 **Open** (all on the **fork's** tracker, i.e. `kilb/aisix`, where `main` and the PRs live):
 
-- `follow-up-issues.md` in the design kit, and issues **#65–#81**. Worth knowing: **#77** (audit advisories — fixed; the remaining ignore is justified in `.cargo/audit.toml`), **#78** (one flaky dev-stack port; the TwoStep half is fixed), **#80** (the upstream-model list cannot be driven in e2e past the SSRF guard — deliberate, with the options recorded), **#81** (a body-slot test that raced `lock_timeout` — fixed).
+- `follow-up-issues.md` in the design kit lists the follow-ups filed after PR #64; on the fork they are issues **#65–#76 and #78, #80, #81** (PR #79 is the code batch, not an issue). Read each issue's state in the tracker rather than this file. The ones worth knowing: **#77** (audit advisories: the four are fixed, and one justified ignore remains in `.cargo/audit.toml`), **#78** (one flaky dev-stack port; its TwoStep half is fixed), **#80** (the upstream-model list cannot be driven in e2e past the SSRF guard — deliberate, options recorded), **#81** (a body-slot test that raced `lock_timeout` — fixed and closed).
 - **P4 remainder**: adapt and bill the second-phase endpoints (images, audio, video, MCP, A2A) for platform mode — each its own plan, written into `platform/design/`.
 - **Functional gaps**: no online payment (manual top-ups only); bulk upstream mapping is capped at 100 names per confirmation (`MAX_BULK_MODELS` in `channels.rs`, and the Dashboard refuses an over-cap selection before sending); the price library fetches one fixed URL (`LIBRARY_URL` in `pricing/library.rs`).
 
@@ -173,7 +173,7 @@ $KIT/gp-upgrade.sh rollback <gateway|cp|all>
 
 ## 6. Things a new agent will trip on
 
-1. **No `docs/` prose in the repo.** User documentation lives in `api7/docs`; do not add pages here.
+1. **No user-facing prose in the repo.** User documentation lives in `api7/docs`. `docs/design/` holds two historical gateway design notes, kept deliberately and marked as such; do not add pages there or anywhere else under `docs/`.
 2. **The kit is not in the repo** (`.superpowers/` is gitignored), so a fresh clone cannot deploy or run the UI tests. It is shared by every worktree.
 3. **The fork tracks upstream.** Gateway crates are upstream's; expect periodic merges from `upstream`. `aisix-control-plane`, `aisix-pricing` and both web apps are ours.
 4. **Worktrees.** Development happens in `git worktree`s; each has its own `target/` (minutes of compile). Reuse one worktree for a run of small changes, and stop the services you start.
@@ -195,4 +195,4 @@ $KIT/gp-upgrade.sh rollback <gateway|cp|all>
 - **"Change the gateway's request path"**: read `crates/aisix-proxy/AGENTS.md` in full first; run both gateway e2e modes.
 - **"Deploy"**: build the tarball, retarget and run `gp-upgrade.sh run`, keep the previous release, check `deploy-log.txt`.
 
-When something is ambiguous, the design documents in `platform/design/` and the ledger in `sdd/2026-11-08-group-pricing-plan/progress.md` usually answer it, with the reasoning and the date.
+When something is ambiguous, the design documents in `platform/design/` and the ledgers named in §2 usually answer it, with the reasoning and the date.
