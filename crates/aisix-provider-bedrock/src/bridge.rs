@@ -3216,15 +3216,8 @@ fn build_converse_additional_model_request_fields(
     let mut thinking_max_tokens = None;
     let claude = BedrockPublisher::from_model_id(upstream_id) == Some(BedrockPublisher::Anthropic);
     if claude {
-        let mut extras = req.extra.clone();
-        let budget_max_tokens = write_thinking_budget(req, &mut extras);
-        thinking_max_tokens = translate_reasoning_effort_to_anthropic(
-            req,
-            &mut extras,
-            bedrock_claude_model_name(upstream_id).unwrap_or(upstream_id),
-            crate::converse_req::max_tokens(req),
-        )?
-        .or(budget_max_tokens);
+        let (mut extras, max_tokens) = claude_thinking_extras(req, upstream_id)?;
+        thinking_max_tokens = max_tokens;
         for name in ["thinking", "output_config", "anthropic_beta"] {
             if let Some(value) = extras.remove(name) {
                 fields.insert(name.to_string(), value);
@@ -3267,6 +3260,51 @@ fn build_converse_additional_model_request_fields(
     }
     let fields = (!fields.is_empty()).then(|| json_to_document(&serde_json::Value::Object(fields)));
     Ok((fields, thinking_max_tokens))
+}
+
+/// The request's extras with Claude's thinking controls written the way the
+/// Anthropic Messages builder writes them: the exact budget a `/v1/messages`
+/// caller sent, else `reasoning_effort` in Claude's terms. The second value
+/// is the `max_tokens` a translated thinking budget needs when the caller
+/// sent none.
+fn claude_thinking_extras(
+    req: &ChatFormat,
+    upstream_id: &str,
+) -> Result<(serde_json::Map<String, serde_json::Value>, Option<u32>), BridgeError> {
+    let mut extras = req.extra.clone();
+    let budget_max_tokens = write_thinking_budget(req, &mut extras);
+    let thinking_max_tokens = translate_reasoning_effort_to_anthropic(
+        req,
+        &mut extras,
+        bedrock_claude_model_name(upstream_id).unwrap_or(upstream_id),
+        crate::converse_req::max_tokens(req),
+    )?
+    .or(budget_max_tokens);
+    Ok((extras, thinking_max_tokens))
+}
+
+/// Whether the Converse request goes out with Claude's extended thinking on,
+/// which AWS refuses beside a `toolChoice` that forces a tool
+/// (<https://docs.aws.amazon.com/bedrock/latest/userguide/claude-messages-extended-thinking.html#claude-messages-extended-thinking-tool-use>).
+/// On Claude that is the `thinking` the gateway writes into
+/// `additionalModelRequestFields` — the caller's own, or one translated from
+/// a `/v1/messages` budget or `reasoning_effort` — and otherwise one the
+/// caller put there itself; elsewhere it is a raw `thinking` field.
+fn converse_thinking_enabled(req: &ChatFormat, upstream_id: &str) -> Result<bool, BridgeError> {
+    let on = |thinking: Option<&serde_json::Value>| {
+        thinking
+            .and_then(|t| t.get("type"))
+            .and_then(|t| t.as_str())
+            .is_some_and(|t| t != "disabled")
+    };
+    if BedrockPublisher::from_model_id(upstream_id) != Some(BedrockPublisher::Anthropic) {
+        return Ok(on(req.extra.get("thinking")));
+    }
+    let (extras, _) = claude_thinking_extras(req, upstream_id)?;
+    Ok(match extras.get("thinking") {
+        Some(thinking) => on(Some(thinking)),
+        None => on(crate::converse_req::caller_additional_fields(req, upstream_id).get("thinking")),
+    })
 }
 
 /// Decide what a request's OpenAI `response_format` becomes on Bedrock.
@@ -3488,16 +3526,13 @@ fn build_tool_config(
     }
     let mut config = ToolConfiguration::builder().set_tools(Some(tools));
     let client_set_tool_choice = tool_choice_states_a_preference(req.extra.get("tool_choice"));
-    let thinking_enabled = req
-        .extra
-        .get("thinking")
-        .and_then(|t| t.get("type"))
-        .and_then(|t| t.as_str())
-        .is_some_and(|t| t != "disabled");
+    // Thinking is read as it reaches the wire, after the gateway's own
+    // translation of the caller's effort, so a forced choice the gateway
+    // invents never meets thinking it also wrote.
     let force_json_tool = json_tool_schema.is_some()
         && !client_set_tool_choice
-        && !thinking_enabled
-        && crate::converse_req::forces_json_tool(upstream_id);
+        && crate::converse_req::forces_json_tool(upstream_id)
+        && !converse_thinking_enabled(req, upstream_id)?;
     if force_json_tool {
         if let Ok(choice) = SpecificToolChoice::builder().name(JSON_TOOL_NAME).build() {
             config = config.tool_choice(ToolChoice::Tool(choice));
@@ -6193,6 +6228,52 @@ mod tests {
             JSON_TOOL_NAME
         );
         assert!(body.get("outputConfig").is_none(), "body={body}");
+    }
+
+    /// AWS refuses extended thinking beside a `toolChoice` that forces a
+    /// tool, so the synthetic JSON tool is only forced while the request
+    /// carries no thinking — including thinking the gateway itself writes
+    /// from the caller's `reasoning_effort`. Claude reaches Converse on a
+    /// non-streamed request when it carries a field only Converse takes.
+    #[tokio::test]
+    async fn converse_does_not_force_the_json_tool_beside_translated_thinking() {
+        let claude_on_converse = |effort: Option<&str>| {
+            let mut req = structured_request(person_schema());
+            req.extra
+                .insert("requestMetadata".into(), serde_json::json!({"team": "a"}));
+            if let Some(effort) = effort {
+                req.extra.insert("reasoning_effort".into(), effort.into());
+            }
+            req
+        };
+        let model = "anthropic.claude-sonnet-4-20250514-v1:0";
+
+        let body =
+            capture_bedrock_body(model, "converse", &claude_on_converse(Some("high")), false)
+                .await;
+        assert_eq!(
+            body["additionalModelRequestFields"]["thinking"]["type"], "enabled",
+            "body={body}"
+        );
+        assert_eq!(
+            body["toolConfig"]["tools"][0]["toolSpec"]["name"],
+            JSON_TOOL_NAME
+        );
+        assert!(
+            body["toolConfig"].get("toolChoice").is_none(),
+            "body={body}"
+        );
+
+        // Without thinking the tool is still forced.
+        let body = capture_bedrock_body(model, "converse", &claude_on_converse(None), false).await;
+        assert!(
+            body.pointer("/additionalModelRequestFields/thinking").is_none(),
+            "body={body}"
+        );
+        assert_eq!(
+            body["toolConfig"]["toolChoice"]["tool"]["name"],
+            JSON_TOOL_NAME
+        );
     }
 
     #[tokio::test]
