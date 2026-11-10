@@ -30,8 +30,9 @@
 //!
 //! What the front holds is bounded: at most [`MAX_WATCHES`] watch calls,
 //! [`MAX_WATCHES_PER_CREDENTIAL`] of one credential's, each with one
-//! connection to kine and [`WATCH_BUFFER`] answers queued each way, none
-//! longer than [`MAX_WATCH_ANSWER`]; and at most [`MAX_RANGES`] ranges read
+//! connection to kine, at most [`MAX_CREATES_PER_CALL`] watch on it, and
+//! [`WATCH_BUFFER`] answers queued each way, none longer than
+//! [`MAX_WATCH_ANSWER`]; and at most [`MAX_RANGES`] ranges read
 //! from kine at once, each answer at most [`MAX_RANGE_ANSWER`] bytes. A
 //! range waits up to [`RANGE_WAIT`] for its turn. Past a cap a gateway is
 //! told `ResourceExhausted`, which it retries.
@@ -76,6 +77,14 @@ pub const MAX_WATCHES: usize = 1024;
 /// its environment's and the global prefix's, and a credential is shared
 /// by the replicas of a fleet, up to `MAX_INSTANCES` of them.
 pub const MAX_WATCHES_PER_CREDENTIAL: usize = 2 * crate::dp::heartbeat::MAX_INSTANCES as usize;
+
+/// Watches one watch call may create. kine keeps every watch a call
+/// creates until it is cancelled or the call ends, each with a task of its
+/// own, so the caps on calls would bound nothing if one call could create
+/// any number. A gateway creates one watch per call (`aisix-etcd`'s
+/// `EtcdConfigProvider::watch` opens a call for each), and a second create
+/// on a call ends it `ResourceExhausted`.
+pub const MAX_CREATES_PER_CALL: usize = 1;
 
 /// Answers queued each way on one watch call. Bounded, so a gateway that
 /// stops reading stops the front reading kine, and kine's own slow-reader
@@ -398,8 +407,10 @@ impl Front {
     /// Gateway → kine: every request of the call, each create checked
     /// first. A create outside the gateway's key spaces, or one sent once
     /// its credential no longer admits it, ends the call refused, and
-    /// nothing of it reaches kine. Returns when the gateway's side of the
-    /// call ends, which closes kine's side too, or when the call does.
+    /// nothing of it reaches kine; so does one past
+    /// [`MAX_CREATES_PER_CALL`], `ResourceExhausted`. Returns when the
+    /// gateway's side of the call ends, which closes kine's side too, or
+    /// when the call does.
     async fn forward_requests(
         self,
         caller: Caller,
@@ -408,6 +419,7 @@ impl Front {
         to_gateway: Answers,
         end: CallEnd,
     ) {
+        let mut creates = 0usize;
         loop {
             let request = tokio::select! {
                 request = requests.message() => request,
@@ -425,6 +437,14 @@ impl Front {
                     Some(caller.refuse())
                 };
                 if let Some(status) = refused {
+                    end.finish(&to_gateway, status).await;
+                    return;
+                }
+                creates += 1;
+                if creates > MAX_CREATES_PER_CALL {
+                    tracing::warn!(dp_id = %caller.dp_id,
+                        "refused an etcd watch: a second create on one watch call");
+                    let status = Status::resource_exhausted("etcdserver: one watch per call");
                     end.finish(&to_gateway, status).await;
                     return;
                 }
