@@ -1845,21 +1845,35 @@ pub(crate) fn cache_vary_tags(model: &Model, tags: &[String]) -> Option<String> 
 
 /// Refuse a caller no routing target admits, for an answer that will not reach
 /// [`resolve_attempt_models`]: a cache hit dispatches nothing, and an allowlist
-/// on a member has to hold for it all the same. Only the IP half of that walk.
-/// A target that names nothing admits nobody, since nothing could be
-/// dispatched to it; only when every target names nothing is the request left
-/// for dispatch to report.
+/// on a member has to hold for it all the same. The walk narrows ONE candidate
+/// set the way dispatch does: the key's provider groups first, then the
+/// routing tags (with their default fallback) among what the groups left, then
+/// the client IP among what the tags left. Checking each against the whole
+/// target list instead would let one target satisfy the groups and another,
+/// outside them, satisfy the tags or the allowlist.
+///
+/// Nothing inside the key's groups matching the tags is refused as dispatch
+/// refuses it ([`no_routing_target_in_groups`]). A target that names nothing
+/// admits nobody, since nothing could be dispatched to it; only when every
+/// target names nothing is the request left for dispatch to report.
+/// Run after [`check_group_access`], which answers a model with nothing in the
+/// key's groups.
 pub(crate) fn check_member_ip_access(
     snapshot: &AisixSnapshot,
     virtual_name: &str,
     model: &Model,
+    allowed_groups: &[String],
     tags: &[String],
     source_ip: &str,
 ) -> Result<(), ProxyError> {
     let Some(routing) = model.routing.as_ref() else {
         return Ok(());
     };
-    let eligible = eligible_targets(&routing.targets, tags);
+    let grouped = targets_in_groups(snapshot, &routing.targets, allowed_groups);
+    let eligible = eligible_targets(&grouped, tags);
+    if eligible.is_empty() && !allowed_groups.is_empty() {
+        return Err(no_routing_target_in_groups(virtual_name, routing));
+    }
     let mut live = eligible
         .iter()
         .filter_map(|t| snapshot.models.get_by_name(&t.model_ref(snapshot)))
@@ -3322,16 +3336,16 @@ mod tests {
             None,
         ));
         assert!(matches!(
-            check_member_ip_access(&snap, "group", &group, &[], "8.8.8.8"),
+            check_member_ip_access(&snap, "group", &group, &[], &[], "8.8.8.8"),
             Err(ProxyError::ModelIpRestricted(_))
         ));
-        assert!(check_member_ip_access(&snap, "group", &group, &[], "10.1.2.3").is_ok());
+        assert!(check_member_ip_access(&snap, "group", &group, &[], &[], "10.1.2.3").is_ok());
         let all_gone = group_model(r(
             RoutingStrategy::Failover,
             vec![RoutingTarget::new("deleted")],
             None,
         ));
-        assert!(check_member_ip_access(&snap, "group", &all_gone, &[], "8.8.8.8").is_ok());
+        assert!(check_member_ip_access(&snap, "group", &all_gone, &[], &[], "8.8.8.8").is_ok());
     }
 
     #[test]
@@ -3724,6 +3738,79 @@ mod tests {
             None,
         ));
         assert!(check_group_access(&snap, "group", &outside, &alpha).is_err());
+    }
+
+    /// A cache hit's member walk narrows one candidate set the way dispatch
+    /// does — groups, then tags, then IP — so a target outside the key's
+    /// groups can satisfy neither the tags nor the allowlist on behalf of
+    /// one inside them. Each case agrees with what dispatch answers.
+    #[test]
+    fn a_cached_answer_walks_groups_then_tags_then_ip_over_one_candidate_set() {
+        let snap = groups_snapshot();
+        // model-a (grp-alpha) admits only 10/8; model-b (grp-beta) admits all.
+        let mut a: Model = (*snap.models.get_by_name("model-a").unwrap().value).clone();
+        a.allowed_cidrs = Some(vec!["10.0.0.0/8".into()]);
+        snap.models
+            .insert(aisix_core::ResourceEntry::new("id-model-a", a, 2));
+        let alpha = groups(&["grp-alpha"]);
+        let walk = |targets: Vec<RoutingTarget>, allowed: &[String], tags: &[String], ip: &str| {
+            let group = group_model(r(RoutingStrategy::Failover, targets.clone(), Some(5)));
+            let hit = check_group_access(&snap, "group", &group, allowed)
+                .and_then(|()| check_member_ip_access(&snap, "group", &group, allowed, tags, ip));
+            let dispatch = grouped_select(
+                &snap,
+                targets,
+                RoutingRequest {
+                    allowed_groups: allowed,
+                    tags,
+                    source_ip: ip,
+                    ..RoutingRequest::default()
+                },
+            );
+            assert_eq!(hit.is_ok(), dispatch.is_ok(), "{hit:?} vs {dispatch:?}");
+            hit
+        };
+
+        // The IP half: the key's only target refuses this caller; the target
+        // that admits it is outside the key's groups.
+        let both = || vec![RoutingTarget::new("model-a"), RoutingTarget::new("model-b")];
+        assert!(matches!(
+            walk(both(), &alpha, &[], "8.8.8.8"),
+            Err(ProxyError::ModelIpRestricted(_))
+        ));
+        assert!(walk(both(), &alpha, &[], "10.1.2.3").is_ok());
+        assert!(
+            walk(both(), &[], &[], "8.8.8.8").is_ok(),
+            "an ungrouped key"
+        );
+
+        // The tag half: the tag only matches a target outside the groups.
+        let blue = groups(&["blue"]);
+        let err = walk(
+            vec![tagged("model-a", &["red"]), tagged("model-b", &["blue"])],
+            &alpha,
+            &blue,
+            "10.1.2.3",
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, ProxyError::AllCandidatesUnavailable { .. }),
+            "{err:?}"
+        );
+        assert_names_no_group_or_member(&err);
+        // Control: a default target inside the groups is the documented
+        // fallback, and still serves.
+        assert!(walk(
+            vec![
+                tagged("model-a", &["red"]),
+                tagged("model-d", &["default"]),
+                tagged("model-b", &["blue"]),
+            ],
+            &alpha,
+            &blue,
+            "8.8.8.8",
+        )
+        .is_ok());
     }
 
     #[test]

@@ -736,6 +736,7 @@ async fn dispatch(
             snapshot,
             &body.model,
             &model_entry.value,
+            &auth.key().allowed_provider_groups,
             &client_ctx.routing_tags,
             &client_ctx.source_ip,
         )?;

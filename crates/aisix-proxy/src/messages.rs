@@ -874,6 +874,7 @@ async fn dispatch(
             snapshot,
             &model_name,
             &model_entry.value,
+            &auth.key().allowed_provider_groups,
             &client.routing_tags,
             &client.source_ip,
         )?;
