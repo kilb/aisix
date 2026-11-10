@@ -4,22 +4,24 @@ import { billingWorld, CALL_MICRO_CNY, CHAT_MODEL, type BillingTenant, type Bill
 import { pollUntil } from "../harness/control-plane.js";
 import { callGateway, type GatewayAnswer } from "../harness/cp-upstream.js";
 
-// E2E: an operator-set credit limit decides when a postpaid tenant is
-// blocked at the gateway, and changing it (or the billing mode) moves the
-// block, across both planes. Everything is driven through the operator API
-// and the real gateway; only the upstream model is a stand-in.
+// E2E: an operator-set credit limit decides when a tenant is blocked at the
+// gateway, across both planes: it is an overdraft in either billing mode, so
+// the block falls where the balance plus the limit reaches 0, changing the
+// limit moves it, and changing the billing mode changes what the refusal
+// says. Everything is driven through the operator API and the real gateway;
+// only the upstream model is a stand-in.
 
 /** What a postpaid tenant at its credit limit is told. */
 const POSTPAID_MESSAGE = "Credit limit reached. Contact the platform to settle the balance.";
 /** What a prepaid tenant out of money is told. */
 const PREPAID_MESSAGE =
-  "Account balance exhausted. Ask an owner or billing member of your organization to top up.";
+  "Insufficient balance. Ask an owner or billing member of your organization to top up.";
 
 const LIMIT_MICRO_USD = 30_000;
 /** How long a change may take to reach the gateway. */
 const WITHIN_MS = 15_000;
 
-describe("an operator-set credit limit blocks a postpaid tenant at the gateway", () => {
+describe("an operator-set credit limit blocks a tenant at the gateway in either billing mode", () => {
   let world: BillingWorld | undefined;
   let tenant: BillingTenant;
 
@@ -33,15 +35,19 @@ describe("an operator-set credit limit blocks a postpaid tenant at the gateway",
     expect(res.status, res.text).toBe(200);
     return res.body;
   };
-  /** Sends chats, one at a time, until one answers `status`; fails after 15 s. */
-  const chatsAnswer = (status: number, what: string): Promise<GatewayAnswer> => {
+  /**
+   * Sends chats, one at a time, until one answers `status` (and, when
+   * `message` is given, an error with that message); fails after 15 s.
+   */
+  const chatsAnswer = (status: number, what: string, message?: string): Promise<GatewayAnswer> => {
     let last = "no chat sent";
     return pollUntil(
       what,
       async () => {
         const answer = await chat();
         last = `${answer.status} ${answer.text}`;
-        return answer.status === status ? answer : undefined;
+        const matches = answer.status === status && (message === undefined || answer.json?.error?.message === message);
+        return matches ? answer : undefined;
       },
       { timeoutMs: WITHIN_MS, intervalMs: 250, describe: () => last },
     );
@@ -94,14 +100,9 @@ describe("an operator-set credit limit blocks a postpaid tenant at the gateway",
     expect(refused.json?.error?.code, refused.text).toBe("budget_exceeded");
   });
 
-  test("Raising the credit limit lets it call again; switching it to prepaid refuses it again", async () => {
-    const raised = await world!.cp.admin.patch(`/admin/tenants/${tenant.id}/billing`, { credit_limit_cny: "1.00" });
-    expect(raised.status, raised.text).toBe(200);
-    // Settled before the answer: the account already says it is not blocked.
-    expect(raised.body.exhausted, raised.text).toBe(false);
-    expect(raised.body.credit_limit_micro_cny).toBe(1_000_000);
-    await chatsAnswer(200, "chats to be served after the credit limit was raised");
-
+  test("Switching it to prepaid keeps it refused, in the prepaid wording; raising the credit limit lets it call again", async () => {
+    // The tenant is where the case above left it: postpaid, its balance at
+    // or below minus its limit, and refused with the credit-limit message.
     const current = await world!.cp.admin.get(`/admin/tenants/${tenant.id}`);
     expect(current.status, current.text).toBe(200);
     const prepaid = await world!.cp.admin.patch(
@@ -110,9 +111,28 @@ describe("an operator-set credit limit blocks a postpaid tenant at the gateway",
       current.version,
     );
     expect(prepaid.status, prepaid.text).toBe(200);
-    // A prepaid tenant is blocked at a balance of 0, and this one is below it.
-    expect((await account()).exhausted).toBe(true);
-    const refused = await chatsAnswer(429, "chats to be refused once the tenant is prepaid");
-    expect(refused.json?.error?.message, refused.text).toBe(PREPAID_MESSAGE);
+    expect(prepaid.body.billing_mode, prepaid.text).toBe("prepaid");
+    // The credit limit is an overdraft in prepaid too, so the money left is
+    // still the balance plus the limit, and it is still none.
+    const held = await account();
+    expect(held.billing_mode).toBe("prepaid");
+    expect(held.credit_limit_micro_cny).toBe(LIMIT_MICRO_USD);
+    expect(held.available_micro_cny).toBe(held.balance_micro_cny + LIMIT_MICRO_USD);
+    expect(held.exhausted).toBe(true);
+    // The mode change alone rewrites the block: the gateway goes on refusing,
+    // now with the prepaid wording.
+    const refused = await chatsAnswer(429, "chats to be refused in the prepaid wording", PREPAID_MESSAGE);
+    expect(refused.json?.error?.code, refused.text).toBe("budget_exceeded");
+
+    // Raising the limit gives a prepaid tenant below 0 money to spend.
+    const raised = await world!.cp.admin.patch(`/admin/tenants/${tenant.id}/billing`, { credit_limit_cny: "1.00" });
+    expect(raised.status, raised.text).toBe(200);
+    // Settled before the answer: the account already says it is not blocked.
+    expect(raised.body.billing_mode, raised.text).toBe("prepaid");
+    expect(raised.body.credit_limit_micro_cny).toBe(1_000_000);
+    expect(raised.body.balance_micro_cny, raised.text).toBeLessThan(0);
+    expect(raised.body.available_micro_cny, raised.text).toBe(raised.body.balance_micro_cny + 1_000_000);
+    expect(raised.body.exhausted, raised.text).toBe(false);
+    await chatsAnswer(200, "chats to be served after the credit limit was raised");
   });
 });

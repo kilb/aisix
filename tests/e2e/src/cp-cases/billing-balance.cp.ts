@@ -4,14 +4,14 @@ import { billingWorld, CHAT_MODEL, EMBED_MODEL, type BillingTenant, type Billing
 import { callGateway } from "../harness/cp-upstream.js";
 
 // E2E: money blocks a tenant at the gateway, across both planes. A prepaid
-// tenant an operator creates has a balance of 0, which is no money at all,
-// so from its first request the gateway refuses it, on every endpoint
-// family, streamed or not, with a billing error about its own organization,
-// and nothing reaches the upstream.
+// tenant an operator creates has a balance of 0 and no credit limit, which
+// is no money at all, so from its first request the gateway refuses it, on
+// every endpoint family, streamed or not, with a billing error about its own
+// organization, and nothing reaches the upstream.
 
 /** What a prepaid tenant out of money is told. */
 const PREPAID_MESSAGE =
-  "Account balance exhausted. Ask an owner or billing member of your organization to top up.";
+  "Insufficient balance. Ask an owner or billing member of your organization to top up.";
 
 type Envelope = "openai" | "anthropic";
 
@@ -41,7 +41,7 @@ describe("a tenant's balance blocks it at the gateway", () => {
     await world?.close();
   });
 
-  test("A prepaid tenant with no balance is refused with its own billing error on every first-phase endpoint", async () => {
+  test("A prepaid tenant with no balance and no credit limit is refused with its own billing error on every first-phase endpoint", async () => {
     const calls: Array<[string, unknown, Envelope]> = [
       ["/v1/chat/completions", chat(false), "openai"],
       ["/v1/chat/completions", chat(true), "openai"],
