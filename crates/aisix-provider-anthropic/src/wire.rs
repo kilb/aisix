@@ -1918,6 +1918,16 @@ fn anthropic_tools_to_openai(
     }
 }
 
+/// The `name` of every entry of an Anthropic `tools` array.
+fn tool_names(tools: &serde_json::Value) -> Vec<String> {
+    tools
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|t| t.get("name")?.as_str().map(str::to_owned))
+        .collect()
+}
+
 /// An Anthropic server tool: Anthropic runs it itself, so no other upstream
 /// can — offering one there as a function the model may call would invent
 /// a tool nobody executes. The advisor tool (`advisor_20260301`) is one:
@@ -2015,10 +2025,20 @@ pub fn translate_extras_to_openai_shape_with(
     let mut output_config = None;
     let mut output_format = None;
     let mut serial_tool_calls = false;
+    // Names of the caller's tools the translation could not offer.
+    let mut dropped_tools: Vec<String> = Vec::new();
     for (key, value) in anthropic {
         match key.as_str() {
             "tools" => {
+                dropped_tools = tool_names(&value);
                 if let Some(translated) = anthropic_tools_to_openai(value, markers) {
+                    let offered: Vec<&str> = translated
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|t| t.get("function")?.get("name")?.as_str())
+                        .collect();
+                    dropped_tools.retain(|name| !offered.contains(&name.as_str()));
                     extra.insert("tools".to_string(), translated);
                 }
             }
@@ -2061,6 +2081,16 @@ pub fn translate_extras_to_openai_shape_with(
     // entries this bridge cannot express (AISIX-Cloud#1614).
     if !extra.contains_key("tools") && extra.remove("tool_choice").is_some() {
         tracing::debug!("dropping tool_choice: no tool survived translation to OpenAI shape");
+    }
+    // The same for a choice that forces one of the tools that did not
+    // survive (the advisor server tool beside a client tool): it would name
+    // a function the upstream was never offered. A name the caller never
+    // declared at all is still sent, for the upstream to answer.
+    let forced = extra
+        .get("tool_choice")
+        .and_then(|c| c.get("function")?.get("name")?.as_str());
+    if forced.is_some_and(|name| dropped_tools.iter().any(|d| d == name)) {
+        extra.remove("tool_choice");
     }
 
     // Anthropic carries "one tool call at a time" inside `tool_choice`;
@@ -6740,6 +6770,51 @@ mod tests {
         .unwrap();
         assert_eq!(tools.as_array().unwrap().len(), 1, "{tools}");
         assert_eq!(tools[0]["function"]["name"], "f");
+    }
+
+    /// A choice forcing the advisor beside a client tool would name a
+    /// function the upstream was never offered, which it refuses. It goes
+    /// with the advisor; a choice of the surviving tool stays, and so does
+    /// a name the caller never declared, for the upstream to answer.
+    #[test]
+    fn a_choice_forcing_a_dropped_tool_is_dropped_with_it() {
+        let translate = |choice: serde_json::Value| {
+            let mut extra = serde_json::json!({
+                "tools": [
+                    {"type": "advisor_20260301", "name": "advisor", "model": "claude-opus-4-1"},
+                    {"name": "get_weather", "input_schema": {"type": "object"}},
+                ],
+                "tool_choice": choice,
+            })
+            .as_object()
+            .unwrap()
+            .clone();
+            translate_extras_to_openai_shape(&mut extra, MappedEffort::AsWritten);
+            let names: Vec<String> = extra["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t["function"]["name"].as_str().unwrap().to_owned())
+                .collect();
+            assert_eq!(names, ["get_weather"], "{extra:?}");
+            extra.get("tool_choice").cloned()
+        };
+        assert_eq!(
+            translate(serde_json::json!({"type": "tool", "name": "advisor"})),
+            None
+        );
+        assert_eq!(
+            translate(serde_json::json!({"type": "tool", "name": "get_weather"})),
+            Some(serde_json::json!({"type": "function", "function": {"name": "get_weather"}}))
+        );
+        assert_eq!(
+            translate(serde_json::json!({"type": "tool", "name": "undeclared"})),
+            Some(serde_json::json!({"type": "function", "function": {"name": "undeclared"}}))
+        );
+        assert_eq!(
+            translate(serde_json::json!({"type": "any"})),
+            Some(serde_json::json!("required"))
+        );
     }
 
     #[test]

@@ -215,6 +215,56 @@ describe("Anthropic Messages client → OpenAI upstream: tools translation (#236
     // tool_choice: Anthropic {type:"any"} → OpenAI "required"
     expect(sentBody.tool_choice).toBe("required");
   });
+
+  // The advisor is a server tool Anthropic runs itself, so it is not offered
+  // to an OpenAI upstream. A choice forcing it would then name a function
+  // the upstream was never offered, which an OpenAI-compatible upstream
+  // refuses; it goes with the tool, and the client tool beside it stays.
+  test("a choice forcing the advisor server tool is not sent without the tool", async (ctx) => {
+    if (!etcdReachable || !app || !upstream) {
+      ctx.skip();
+      return;
+    }
+    await waitConfigPropagation(async () => {
+      const res = await fetch(`${app!.proxyUrl}/v1/models`, {
+        headers: { authorization: `Bearer ${CALLER_PLAINTEXT}` },
+      });
+      await res.text();
+      return res.status === 200;
+    });
+    const baseline = upstream.receivedRequests.length;
+    const res = await fetch(`${app.proxyUrl}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-api-key": CALLER_PLAINTEXT },
+      body: JSON.stringify({
+        model: "anth-tools-xprov",
+        max_tokens: 200,
+        tools: [
+          { type: "advisor_20260301", name: "advisor", model: "claude-opus-4-1" },
+          {
+            name: "get_time",
+            description: "Get the current time",
+            input_schema: { type: "object", properties: { timezone: { type: "string" } } },
+          },
+        ],
+        tool_choice: { type: "tool", name: "advisor" },
+        messages: [{ role: "user", content: "Ask the advisor what time it is." }],
+      }),
+    });
+    const text = await res.text();
+    expect(res.status, text).toBe(200);
+
+    const upstreamReq = upstream.receivedRequests
+      .slice(baseline)
+      .find((r) => r.path === "/v1/chat/completions");
+    expect(upstreamReq).toBeDefined();
+    const sentBody = JSON.parse(upstreamReq!.body) as {
+      tools?: Array<{ function?: { name?: string } }>;
+      tool_choice?: unknown;
+    };
+    expect(sentBody.tools?.map((t) => t.function?.name)).toEqual(["get_time"]);
+    expect(sentBody).not.toHaveProperty("tool_choice");
+  });
 });
 
 // ─── Streaming test ─────────────────────────────────────────────────
