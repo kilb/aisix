@@ -3110,6 +3110,11 @@ pub fn redact_transcription_response(
         if counts.is_empty() {
             return None;
         }
+        // The tokens of the transcript as it was, which no mask can rewrite
+        // and leave meaningful (see [`masked_spans`]).
+        if let Some(json) = json.as_object_mut() {
+            json.remove("logprobs");
+        }
         return serde_json::to_vec(&json).ok().map(|b| (b, counts));
     }
     let text = std::str::from_utf8(body).ok()?;
@@ -3126,8 +3131,11 @@ pub fn redact_transcription_response(
 /// an event of any other type has each of its string values but `type`
 /// masked, and a `data:` payload that is not JSON (but the `[DONE]`
 /// sentinel) is masked as plain text.
-/// Everything else in a frame (usage, ids, logprobs) is left as written,
-/// and a frame nothing matched in goes out byte for byte.
+/// Once anything was masked, every frame loses its `logprobs`: their tokens
+/// spell the transcript as it was, and the deltas' and the done event's
+/// repeat one text, so a frame left with them gives the mask away. Everything
+/// else in a frame (usage, ids) is left as written, and a stream nothing
+/// matched in goes out byte for byte.
 ///
 /// Also the scan surface: [`transcription_sse_text`] reads what this walk
 /// offers, so a slot the scan reads is a slot the mask rewrites.
@@ -3225,6 +3233,11 @@ pub fn redact_transcription_sse(
     if counts.is_empty() {
         return None;
     }
+    for frame in &mut frames {
+        if let Some(data) = frame.data.as_mut().and_then(Value::as_object_mut) {
+            frame.dirty |= data.remove("logprobs").is_some();
+        }
+    }
     let mut out = Vec::with_capacity(raw.len());
     for frame in &frames {
         out.extend_from_slice(&frame.render());
@@ -3237,11 +3250,12 @@ pub fn redact_transcription_sse(
 /// [`redact_transcription_sse`] offers, decoded, once each (the done event
 /// repeats the deltas).
 pub fn transcription_sse_text(raw: &[u8]) -> String {
+    let mut seen = std::collections::HashSet::new();
     let mut texts: Vec<String> = Vec::new();
     for segment in collect_segments(|g| {
         let _ = redact_transcription_sse(g, raw);
     }) {
-        if !texts.contains(&segment.text) {
+        if seen.insert(segment.text.clone()) {
             texts.push(segment.text);
         }
     }
@@ -9443,6 +9457,67 @@ mod tests {
 
         let clean = b"data: {\"type\":\"transcript.text.done\",\"text\":\"all clean\"}\n\n";
         assert!(redact_transcription_sse(chain.as_ref(), clean).is_none());
+    }
+
+    /// `include[]=logprobs` puts the transcript's tokens beside its text, on
+    /// the JSON answer and on every streamed event. A masked transcript loses
+    /// them wherever they are, or the address the mask took out could be read
+    /// back off the tokens; an unmasked one keeps them as written.
+    #[test]
+    fn a_masked_transcription_loses_its_logprobs() {
+        let chain = both();
+        let tokens = |ts: &[&str]| -> Value {
+            ts.iter()
+                .map(|t| json!({"token": t, "logprob": -0.1, "bytes": t.as_bytes()}))
+                .collect()
+        };
+
+        let body = json!({
+            "text": "mail alice@example.com now",
+            "logprobs": tokens(&["mail", " alice", "@", "example", ".com", " now"]),
+            "usage": {"type": "tokens", "input_tokens": 26, "output_tokens": 12, "total_tokens": 38}
+        });
+        let (rewritten, _) =
+            redact_transcription_response(chain.as_ref(), &serde_json::to_vec(&body).unwrap())
+                .expect("must rewrite");
+        let v: Value = serde_json::from_slice(&rewritten).unwrap();
+        assert_eq!(v["text"], "mail [EMAIL_REDACTED] now");
+        assert!(v.get("logprobs").is_none(), "{v}");
+        assert_eq!(v["usage"]["output_tokens"], 12);
+
+        let frame = |event: Value| format!("data: {event}\n\n");
+        let raw = [
+            frame(
+                json!({"type": "transcript.text.delta", "delta": "mail alice@exam",
+                         "logprobs": tokens(&["mail", " alice", "@", "exam"])}),
+            ),
+            frame(
+                json!({"type": "transcript.text.delta", "delta": "ple.com now",
+                         "logprobs": tokens(&["ple", ".com", " now"])}),
+            ),
+            frame(
+                json!({"type": "transcript.text.done", "text": "mail alice@example.com now",
+                         "logprobs": tokens(&["mail", " alice", "@", "example", ".com", " now"])}),
+            ),
+        ]
+        .concat();
+        let (rewritten, _) =
+            redact_transcription_sse(chain.as_ref(), raw.as_bytes()).expect("must rewrite");
+        let out = String::from_utf8(rewritten).unwrap();
+        assert!(!out.contains("logprobs"), "{out}");
+        for token in ["alice", "exam", "ple"] {
+            assert!(!out.contains(token), "{token} survived in {out}");
+        }
+
+        let clean = frame(json!({"type": "transcript.text.done", "text": "all clean",
+                                 "logprobs": tokens(&["all", " clean"])}));
+        assert!(redact_transcription_sse(chain.as_ref(), clean.as_bytes()).is_none());
+        let clean = json!({"text": "all clean", "logprobs": tokens(&["all", " clean"])});
+        assert!(redact_transcription_response(
+            chain.as_ref(),
+            &serde_json::to_vec(&clean).unwrap()
+        )
+        .is_none());
     }
 
     // ── remote segment moderation (#932 bedrock follow-up) ──────────────
