@@ -811,6 +811,13 @@ struct MetricsInner {
     /// Populated on the registration path only (a worker-cache miss), so
     /// the steady-state emit never touches this lock.
     retirable: Mutex<HashMap<Box<str>, RetirableSeries>>,
+    /// Bumped whenever a sweep forgets a [`GaugeLiveness::Gone`] series. It
+    /// is part of every retirable family's worker-cache key, so a write
+    /// after the bump misses the cache and registers the series again: a
+    /// request that resolved a deleted key before the sweep would
+    /// otherwise write its old snapshot through a cached handle, leaving a
+    /// finite value no later sweep knows about.
+    retire_epoch: std::sync::atomic::AtomicU64,
     /// Runtimes and stores read at scrape time by [`Metrics::sync_memory`].
     memory: crate::memory::MemoryProbes,
     /// Exporter names reported on the previous scrape, so a removed
@@ -1232,6 +1239,16 @@ impl WorkerKey<'_> {
         self.buf.push(WORKER_KEY_SEP);
         self.buf.push(if value { 't' } else { 'f' });
     }
+
+    /// A retirable family's [`Metrics::retire_epoch`], as fixed-width hex.
+    fn label_epoch(&mut self, value: u64) {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        self.buf.push(WORKER_KEY_SEP);
+        for shift in (0..16).rev() {
+            self.buf
+                .push(char::from(HEX[((value >> (shift * 4)) & 0xf) as usize]));
+        }
+    }
 }
 
 impl std::fmt::Debug for Metrics {
@@ -1319,6 +1336,7 @@ impl Metrics {
                 },
                 config_labels: Mutex::new(ConfigLabelState::default()),
                 retirable: Mutex::new(HashMap::new()),
+                retire_epoch: std::sync::atomic::AtomicU64::new(0),
                 memory: crate::memory::MemoryProbes::new(),
                 last_exporters: Mutex::new(Vec::new()),
                 usage_delivery: crate::usage_delivery::UsageDeliveryHealth::default(),
@@ -1512,6 +1530,14 @@ impl Metrics {
         );
     }
 
+    /// The current [`MetricsInner::retire_epoch`], read into a retirable
+    /// family's worker-cache key.
+    fn retire_epoch(&self) -> u64 {
+        self.inner
+            .retire_epoch
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
     /// The registry key of one rendered series: the metric and the values
     /// of the labels its selection keeps, in selection order. `env_id` is
     /// constant per process and stays out of it.
@@ -1569,6 +1595,7 @@ impl Metrics {
         };
         let mut retired = 0usize;
         let mut keep = Vec::with_capacity(taken.len());
+        let mut epoch_moved = false;
         metrics::with_local_recorder(&self.inner.recorder, || {
             for (key, mut series) in taken {
                 let selected = self.inner.recorder.selected_labels(series.metric);
@@ -1601,6 +1628,16 @@ impl Metrics {
                 }
                 if !series.retired {
                     retired += 1;
+                }
+                // A forgotten series must be registered again by whatever
+                // writes it next. Moved before the retiring write, so a
+                // write that still hits its cached handle lands before it
+                // and is overwritten.
+                if liveness == GaugeLiveness::Gone && !epoch_moved {
+                    self.inner
+                        .retire_epoch
+                        .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                    epoch_moved = true;
                 }
                 // The presence flag is boolean and its documented cleared
                 // value is 0; everything else carries a quantity and
@@ -2807,6 +2844,7 @@ impl Metrics {
                     k.label(api_key_id);
                     k.label(api_key_name);
                     k.label(model);
+                    k.label_epoch(self.retire_epoch());
                 },
                 || {
                     self.track_retirable(
@@ -2835,6 +2873,7 @@ impl Metrics {
                     k.label(api_key_id);
                     k.label(api_key_name);
                     k.label(model);
+                    k.label_epoch(self.retire_epoch());
                 },
                 || {
                     self.track_retirable(
@@ -2869,6 +2908,7 @@ impl Metrics {
                 k.label(labels.team_name);
                 k.label(labels.user_id);
                 k.label(labels.user_name);
+                k.label_epoch(self.retire_epoch());
             },
             || {
                 self.track_retirable(
@@ -6006,6 +6046,51 @@ mod tests {
                 ("Platform Eng".to_owned(), "45".to_owned()),
             ]
         );
+    }
+
+    /// A request that resolved a key before it was deleted can write its
+    /// remaining-quota gauge AFTER the sweep forgot the series, through a
+    /// handle this worker still caches. That write must register the series
+    /// again so the next sweep retires it, instead of leaving a finite value
+    /// nothing tracks. The control, a live key, keeps its written value.
+    #[test]
+    fn a_gone_series_written_after_retirement_is_retired_again() {
+        let m = Metrics::new(false);
+        let requests = |m: &Metrics, key: &str| {
+            series_lines(&m.render(), M_RATELIMIT_REMAINING_REQUESTS)
+                .into_iter()
+                .find(|l| l.contains(&format!("api_key_id=\"{key}\"")))
+                .unwrap_or_else(|| panic!("no series for {key}"))
+                .rsplit(' ')
+                .next()
+                .unwrap()
+                .to_owned()
+        };
+        let live = |series: LiveGaugeSeries<'_>| match series {
+            LiveGaugeSeries::RatelimitRemaining { api_key_id, .. } => api_key_id != "ak-gone",
+            _ => true,
+        };
+        m.set_rate_limit_remaining("ak-gone", "unknown", "gpt", Some(7), Some(70));
+        m.set_rate_limit_remaining("ak-live", "unknown", "gpt", Some(9), None);
+        assert_eq!(m.retire_stale_gauges(live), 2);
+        assert_eq!(requests(&m, "ak-gone"), "NaN");
+
+        // The in-flight request finishes with its old snapshot, on the same
+        // worker thread, after the sweep.
+        m.set_rate_limit_remaining("ak-gone", "unknown", "gpt", Some(6), Some(60));
+        m.set_rate_limit_remaining("ak-live", "unknown", "gpt", Some(8), None);
+        assert_eq!(requests(&m, "ak-gone"), "6");
+
+        m.retire_stale_gauges(live);
+        assert_eq!(requests(&m, "ak-gone"), "NaN");
+        assert!(
+            series_lines(&m.render(), M_RATELIMIT_REMAINING_TOKENS)
+                .iter()
+                .all(|l| l.ends_with(" NaN")),
+            "{}",
+            m.render()
+        );
+        assert_eq!(requests(&m, "ak-live"), "8");
     }
 
     /// The same for the rate-limit gauges and `api_key_name`.
