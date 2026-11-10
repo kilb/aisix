@@ -97,7 +97,9 @@ async function login(page: Page, email: string, password: string): Promise<void>
 async function preview(page: Page, world: BillingWorld, model: { name: string }, reason = "补录价格-ui", status = "unpriced"): Promise<void> {
   // The window's end is the clock as the control plane will read it, so it includes the calls just made.
   const form = page.getByRole("form", { name: "新建重新计价" });
-  await form.getByLabel("结束（UTC）").fill(new Date().toISOString().slice(0, 19));
+  // A `datetime-local` input drops `:00` seconds from its value, which `fill`
+  // reads back as a malformed value: write a whole minute without them.
+  await form.getByLabel("结束（UTC）").fill(new Date().toISOString().slice(0, 19).replace(/:00$/, ""));
   await form.getByLabel("模型").selectOption({ label: model.name });
   await form.getByLabel("租户").selectOption({ label: world.tenantName });
   await form.getByLabel("状态").selectOption({ value: status });
