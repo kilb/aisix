@@ -155,7 +155,7 @@ export function Gate({
       <div id="gate">
         <header className="plate">
           <h1>
-            <span className="mark">AISIX</span> 组织门户
+            <span className="mark">Routio</span> 组织门户
           </h1>
           <span className="sub">组织、成员与 API 密钥</span>
         </header>

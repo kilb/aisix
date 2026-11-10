@@ -247,7 +247,7 @@ export function App({ inviteToken }: { inviteToken: string | null }) {
       <header className="topbar">
         <div className="wrap">
           <span className="brand">
-            <span className="mark">AISIX</span> <span className="app">组织门户</span>
+            <span className="mark">Routio</span> <span className="app">组织门户</span>
           </span>
           <h1 className="org-name" title={tenant.name}>
             {tenant.name}

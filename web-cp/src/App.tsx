@@ -361,7 +361,7 @@ export function App() {
       <div className="shell-main">
         <header className="topbar">
           <div className="brand">
-            <h1 className="display">AISIX Dashboard</h1>
+            <h1 className="display">Routio 运维台</h1>
             <span className="brand-sub">控制面</span>
           </div>
           {(shell.env || fleet) && (
