@@ -3532,3 +3532,67 @@ async fn shutdown_frees_the_projector_lock() {
     })
     .await;
 }
+
+/// A kine whose ranges are not byte ranges, as under a table collation
+/// other than `COLLATE "C"`: a list answers every key it holds, whatever
+/// the prefix.
+#[derive(Default)]
+struct CollatingKine(MemKine);
+
+#[async_trait]
+impl KineWriter for CollatingKine {
+    async fn create(&self, key: &str, value: &[u8]) -> Result<WriteOutcome, KineError> {
+        self.0.create(key, value).await
+    }
+
+    async fn update(&self, key: &str, rev: i64, value: &[u8]) -> Result<WriteOutcome, KineError> {
+        self.0.update(key, rev, value).await
+    }
+
+    async fn delete(&self, key: &str, rev: i64) -> Result<WriteOutcome, KineError> {
+        self.0.delete(key, rev).await
+    }
+
+    async fn get(&self, key: &str) -> Result<Option<KeyValue>, KineError> {
+        self.0.get(key).await
+    }
+
+    async fn list(&self, _prefix: &str) -> Result<Vec<(Vec<u8>, KeyValue)>, KineError> {
+        self.0.list("").await
+    }
+}
+
+#[tokio::test]
+async fn reconcile_never_takes_a_key_outside_its_prefix_for_a_stray() {
+    let Some(bare) = BareDatabase::new().await else {
+        return;
+    };
+    let (db, env) = (&bare.db, &bare.env);
+    let kine = CollatingKine::default();
+    create_key(db, env, &unique("acct")).await;
+    projector::project_once(db, &kine, &ctx(env))
+        .await
+        .expect("projected");
+    let prefix = env.env_prefix();
+    // Another environment's document, and one of a sibling whose name
+    // starts with this environment's id: both inside the range under a
+    // collation that is not a byte order.
+    let foreign = [
+        format!("/aisix/{}/models/{}", Uuid::new_v4(), Uuid::new_v4()),
+        format!("/aisix/{}x/models/{}", env.env_id, Uuid::new_v4()),
+    ];
+    for key in &foreign {
+        kine.0.put_raw(key.as_bytes(), b"{}");
+    }
+    let stray = format!("{prefix}models/{}", Uuid::new_v4());
+    kine.0.put_raw(stray.as_bytes(), b"{}");
+
+    let report = projector::reconcile(db, &kine, &ctx(env), false)
+        .await
+        .expect("reconciled");
+    assert_eq!((report.deleted_strays, report.blocked), (1, false));
+    assert!(kine.0.value(&stray).is_none(), "the stray was kept");
+    for key in &foreign {
+        assert!(kine.0.value(key).is_some(), "{key} was deleted");
+    }
+}

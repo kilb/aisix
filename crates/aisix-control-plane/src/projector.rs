@@ -648,7 +648,17 @@ async fn reconcile_on(
     by: Option<&OperatorAuth>,
 ) -> Result<ReconcileReport, ProjectError> {
     let prefix = ctx.env.env_prefix();
-    let in_kine: HashMap<Vec<u8>, KeyValue> = kine.list(&prefix).await?.into_iter().collect();
+    // Only keys under the prefix, byte for byte. kine answers a range in its
+    // table's collation, which is a byte order only under `COLLATE "C"` (the
+    // etcd front filters its answers the same way): under another one,
+    // another environment's keys can fall inside the range, and each would
+    // look like a stray of this one.
+    let in_kine: HashMap<Vec<u8>, KeyValue> = kine
+        .list(&prefix)
+        .await?
+        .into_iter()
+        .filter(|(key, _)| key.starts_with(prefix.as_bytes()))
+        .collect();
 
     // The keys rows own: every live row's, and a deleted row's until its
     // delete is projected.
