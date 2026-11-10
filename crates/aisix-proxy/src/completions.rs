@@ -1268,7 +1268,11 @@ async fn dispatch(
                     &provider_request_id,
                 ));
             }
-            reservation.commit_tokens(total_tokens).await;
+            // Owed, not committed: the concurrency slot stays taken while the
+            // output chain reads the answer, and a refusal or a caller that
+            // leaves during it still credits the tokens as the reservation
+            // drops. Committed below once the chain lets the answer through.
+            reservation.owe_tokens(total_tokens);
 
             // #911 [23]: /v1/completions must run OUTPUT guardrails too. The
             // input hook above scans the prompt, but pre-fix the model's reply
@@ -1276,7 +1280,7 @@ async fn dispatch(
             // /v1/chat/completions was bypassable by switching to this surface
             // for the response leg. Mirror chat's output check: buffer the reply
             // text into a synthetic ChatResponse and run the chain. The upstream
-            // already billed (tokens committed above), so a block surfaces a
+            // already billed (tokens owed above), so a block surfaces a
             // redacted 422 rather than the response.
             let mut resp_json = resp_json;
             let mut output_capture_safe = true;
@@ -1326,7 +1330,8 @@ async fn dispatch(
                         "guardrail blocked /v1/completions response",
                     );
                     // The upstream already billed for this response (tokens
-                    // committed above), so return the redacted 422 body BUT
+                    // owed above, credited as the reservation drops), so
+                    // return the redacted 422 body BUT
                     // carry the billed `usage` marked `guardrail_blocked` —
                     // recording zero tokens here would let the control plane's ledger
                     // under-report spend the customer was charged for. Same
@@ -1359,6 +1364,8 @@ async fn dispatch(
                     });
                 }
             }
+
+            reservation.commit_tokens(total_tokens).await;
 
             // Echo the model name the caller addressed. The request half
             // already translates the alias to the upstream id

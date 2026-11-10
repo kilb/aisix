@@ -2515,6 +2515,32 @@ fn append_raw_top_level_strings(out: &mut String, body: &[u8], key: &str) -> Opt
     Some(())
 }
 
+/// The string values of every top-level `arguments` document in `body`,
+/// decoded. A tool call's `arguments` is JSON inside a JSON string, and the
+/// upstream or the tool runner that parses it reads its escapes decoded
+/// (`\u0040` as `@`), while the string decoded once, which the selectors scan,
+/// still shows them escaped. So each value is scanned decoded too, every value
+/// of a repeated key included. A string with no backslash decodes to nothing
+/// it does not already show, and one that is not a JSON document is read only
+/// as written. A document too deep or too large to decode leaves the
+/// selection unevaluable.
+fn append_decoded_top_level_arguments(out: &mut String, body: &[u8]) -> Option<()> {
+    for value in raw_top_level_values(body, "arguments")? {
+        let Ok(arguments) = serde_json::from_str::<String>(value.get()) else {
+            continue;
+        };
+        if !arguments.contains('\\') {
+            continue;
+        }
+        match crate::json_splice::collect_string_values(arguments.as_bytes()) {
+            Ok(decoded) => append_scan_text(out, &decoded)?,
+            Err(error) if error.is_unevaluable() => return None,
+            Err(_) => {}
+        }
+    }
+    Some(())
+}
+
 fn append_typed_top_level_strings(
     out: &mut String,
     body: &[u8],
@@ -2978,6 +3004,9 @@ fn append_chat_request_message_strings(
     for tool_calls in tool_calls {
         append_chat_request_tool_call_strings(out, &tool_calls, scan_error)?;
     }
+    // A legacy `function_call` is read with the message's other strings
+    // above; its `arguments` document is read decoded here.
+    append_decoded_function_arguments(out, message_body, "function_call", scan_error)?;
     append_raw_top_level_strings(out, message_body, "reasoning_content")?;
     Some(())
 }
@@ -3010,6 +3039,33 @@ fn append_chat_request_tool_call_strings(
             decoded_json_string_values_including_empty(call.get().as_bytes(), scan_error)?
         };
         append_scan_text(out, &text)?;
+        if raw_is_object(&call) {
+            append_decoded_function_arguments(out, call.get().as_bytes(), "function", scan_error)?;
+        }
+    }
+    Some(())
+}
+
+/// [`append_decoded_top_level_arguments`] for each object under `key` in a
+/// request carrier: a tool call's `function`, a message's legacy
+/// `function_call`.
+fn append_decoded_function_arguments(
+    out: &mut String,
+    body: &[u8],
+    key: &str,
+    scan_error: &mut Option<crate::json_splice::SpliceError>,
+) -> Option<()> {
+    let Some(functions) = raw_top_level_values(body, key) else {
+        mark_unevaluable(scan_error);
+        return None;
+    };
+    for function in functions {
+        if raw_is_object(&function)
+            && append_decoded_top_level_arguments(out, function.get().as_bytes()).is_none()
+        {
+            mark_unevaluable(scan_error);
+            return None;
+        }
     }
     Some(())
 }
@@ -3097,6 +3153,7 @@ fn append_responses_item_strings(
             append_raw_text_value(out, &value, key == "content", scan_error)?;
         }
     }
+    append_decoded_top_level_arguments(out, item_body)?;
     Some(())
 }
 
@@ -3322,6 +3379,9 @@ fn append_chat_tool_call_strings(out: &mut String, tool_calls: &RawJson<'_>) -> 
                 let payload_body = payload.get().as_bytes();
                 append_raw_top_level_strings(out, payload_body, "name")?;
                 append_raw_top_level_strings(out, payload_body, field)?;
+                if *field == "arguments" {
+                    append_decoded_top_level_arguments(out, payload_body)?;
+                }
             }
         }
     }
@@ -3340,6 +3400,7 @@ fn append_chat_legacy_function_call_strings(
     let function_body = function_call.get().as_bytes();
     append_raw_top_level_strings(out, function_body, "name")?;
     append_raw_top_level_strings(out, function_body, "arguments")?;
+    append_decoded_top_level_arguments(out, function_body)?;
     Some(())
 }
 
@@ -3597,6 +3658,7 @@ fn append_responses_output_item_strings(out: &mut String, item: &RawJson<'_>) ->
             for key in ["name", "arguments"] {
                 append_raw_top_level_strings(out, item_body, key)?;
             }
+            append_decoded_top_level_arguments(out, item_body)?;
         }
         Some("custom_tool_call") => {
             for key in ["name", "input"] {
@@ -6498,6 +6560,16 @@ fn stream_response(
                                 }
                                 pending_held.clear();
                                 held_content = crate::held_content::HeldBuffer::default();
+                                // Released as every later frame is: an error
+                                // event goes out less the credentials this
+                                // request sent, and is the stream's failure.
+                                let frame = match frame_in_band_error(protocol, &frame) {
+                                    Some(err) => {
+                                        telemetry.record_failure(&err);
+                                        aisix_gateway::scrub_upstream_error_bytes(&frame).into_owned()
+                                    }
+                                    None => frame,
+                                };
                                 telemetry.mark_first_delivery();
                                 yield Ok(Bytes::from(frame));
                                 continue;
@@ -9466,6 +9538,76 @@ data: {"type":"error","error":{"type":"server_error","code":null,"message":"nest
         let text = response_guardrail_text(PassthroughProtocol::OpenaiChat, resp);
         assert!(text.contains("sure"));
         assert!(text.contains("SECRET"), "tool-call output scanned: {text}");
+    }
+
+    /// A tool call's `arguments` is JSON inside a JSON string, and what reads
+    /// it decodes the inner document's escapes: an address spelled
+    /// `alice\u0040example.com` there reaches the upstream, or the tool
+    /// runner, as `alice@example.com`. Every `arguments` carrier is scanned
+    /// with that inner document decoded, on both hooks and both envelopes.
+    #[test]
+    fn tool_arguments_are_scanned_with_their_inner_escapes_decoded() {
+        const ADDRESS: &str = "alice@example.com";
+        // The inner document as the client writes it: `@` escaped.
+        let inner = r#"{"to":"alice\u0040example.com","to":"safe"}"#;
+        assert!(!inner.contains(ADDRESS));
+        let arguments = serde_json::Value::String(inner.to_owned());
+        let cases = [
+            (
+                "chat request tool_calls",
+                PassthroughProtocol::OpenaiChat,
+                serde_json::json!({"model": "m", "messages": [{"role": "assistant", "content": null,
+                    "tool_calls": [{"id": "c1", "type": "function",
+                        "function": {"name": "send", "arguments": arguments}}]}]}),
+                true,
+            ),
+            (
+                "chat request legacy function_call",
+                PassthroughProtocol::OpenaiChat,
+                serde_json::json!({"model": "m", "messages": [{"role": "assistant", "content": null,
+                    "function_call": {"name": "send", "arguments": arguments}}]}),
+                true,
+            ),
+            (
+                "responses request function_call item",
+                PassthroughProtocol::OpenaiResponses,
+                serde_json::json!({"model": "m", "input": [{"type": "function_call",
+                    "call_id": "c1", "name": "send", "arguments": arguments}]}),
+                true,
+            ),
+            (
+                "chat response tool_calls",
+                PassthroughProtocol::OpenaiChat,
+                serde_json::json!({"choices": [{"index": 0, "message": {"role": "assistant",
+                    "tool_calls": [{"id": "c1", "type": "function",
+                        "function": {"name": "send", "arguments": arguments}}]}}]}),
+                false,
+            ),
+            (
+                "chat response legacy function_call",
+                PassthroughProtocol::OpenaiChat,
+                serde_json::json!({"choices": [{"index": 0, "message": {"role": "assistant",
+                    "function_call": {"name": "send", "arguments": arguments}}}]}),
+                false,
+            ),
+            (
+                "responses response function_call item",
+                PassthroughProtocol::OpenaiResponses,
+                serde_json::json!({"output": [{"type": "function_call", "id": "fc_1",
+                    "call_id": "c1", "name": "send", "arguments": arguments}]}),
+                false,
+            ),
+        ];
+        for (name, protocol, body, request) in cases {
+            let body = body.to_string();
+            let text = if request {
+                request_guardrail_text(protocol, body.as_bytes())
+            } else {
+                response_guardrail_text(protocol, body.as_bytes())
+            };
+            assert!(text.contains(ADDRESS), "{name}: {text:?}");
+            assert!(text.contains("safe"), "{name}: {text:?}");
+        }
     }
 
     #[test]

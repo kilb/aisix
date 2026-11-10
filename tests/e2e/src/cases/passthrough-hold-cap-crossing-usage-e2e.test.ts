@@ -26,8 +26,13 @@ import {
 // The visible text ("Hello!") stays under the content cap, so only the raw
 // bound trips, and it trips exactly on the usage frame: the frames before it
 // are padded to sit just under the bound.
+//
+// The crossing frame can be an error event too. Under `fail_open` it is
+// released like every later frame: less the credentials the request sent,
+// and recorded as the stream's failure.
 
 const CALLER = "sk-passthrough-crossing-usage";
+const PK_SECRET = "sk-ant-crossing-secret";
 const CREDENTIAL_REF = "mock";
 const LOGSTORE = "passthrough-crossing-usage";
 const CAP = 7;
@@ -78,6 +83,21 @@ function frames(): string[] {
   return [...head, usageFrame, stopFrame];
 }
 
+/** An upstream that names the key it was sent in an error event. */
+const errorFrame = frame("error", {
+  error: { type: "overloaded_error", message: `overloaded for key ${PK_SECRET}` },
+});
+
+/** A stream whose error event is the frame that crosses the raw bound. */
+function errorFrames(): string[] {
+  const fill = RAW_BOUND - 10 - messageStart("").length;
+  const head = messageStart("p".repeat(fill));
+  if (head.length > RAW_BOUND || head.length + errorFrame.length <= RAW_BOUND) {
+    throw new Error(`fixture does not cross on the error frame: ${head.length}`);
+  }
+  return [head, errorFrame];
+}
+
 describe("a passthrough hold-back cap that trips on a usage frame keeps its usage", () => {
   let app: SpawnedApp | undefined;
   let upstream: Server | undefined;
@@ -89,12 +109,13 @@ describe("a passthrough hold-back cap that trips on a usage frame keeps its usag
     etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
     const body = frames().join("");
+    const errorBody = errorFrames().join("");
     upstream = createServer((req, res) => {
       req.on("data", () => {});
       req.on("end", () => {
         res.statusCode = 200;
         res.setHeader("content-type", "text/event-stream");
-        res.end(body);
+        res.end((req.url ?? "").startsWith("/error/") ? errorBody : body);
       });
     });
     await new Promise<void>((resolve) => upstream!.listen(0, "127.0.0.1", resolve));
@@ -121,13 +142,17 @@ describe("a passthrough hold-back cap that trips on a usage frame keeps its usag
       display_name: "crossing-anthropic",
       provider: "anthropic",
       adapter: "anthropic",
-      secret: "sk-ant-mock",
+      secret: PK_SECRET,
       api_base: upstreamUrl,
     });
-    for (const policy of ["fail_closed", "fail_open"]) {
+    for (const [name, policy, target] of [
+      ["fail_closed", "fail_closed", upstreamUrl],
+      ["fail_open", "fail_open", upstreamUrl],
+      ["error-fail_open", "fail_open", `${upstreamUrl}/error`],
+    ]) {
       const guard = await seed.createGuardrail(
         {
-          name: `crossing-${policy}`,
+          name: `crossing-${name}`,
           enabled: true,
           hook_point: "output",
           kind: "pii",
@@ -138,9 +163,9 @@ describe("a passthrough hold-back cap that trips on a usage frame keeps its usag
         { attach: false },
       );
       const route = await seed.createPassthroughRoute({
-        name: `crossing-${policy}`,
-        path_prefix: `/passthrough/crossing-${policy}`,
-        target_url: upstreamUrl,
+        name: `crossing-${name}`,
+        path_prefix: `/passthrough/crossing-${name}`,
+        target_url: target,
         provider_key_id: pk.id,
       });
       await seed.update("guardrail_attachments", randomUUID(), {
@@ -216,4 +241,36 @@ describe("a passthrough hold-back cap that trips on a usage frame keeps its usag
       ).toBe("15");
     });
   }
+
+  test("fail_open: an error event that crosses the bound goes out scrubbed, as the stream's failure", async (ctx) => {
+    if (!etcdReachable) ctx.skip();
+    const res = await fetch(`${app!.proxyUrl}/passthrough/crossing-error-fail_open/v1/messages`, {
+      method: "POST",
+      headers: {
+        "x-api-key": CALLER,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "claude-3-5-haiku-20241022",
+        max_tokens: 64,
+        stream: true,
+        messages: [{ role: "user", content: "say hello" }],
+      }),
+    });
+    const text = await res.text();
+    const requestId = res.headers.get("x-aisix-request-id") ?? "";
+    expect(requestId).not.toBe("");
+    expect(text, "fail_open releases the error event").toContain("overloaded_error");
+    expect(text, "the key the gateway sent reached the caller").not.toContain(PK_SECRET);
+
+    const row = await waitForSlsLog(
+      sls!,
+      LOGSTORE,
+      (log) => log.get("request_id") === requestId,
+      `the usage row of ${requestId}`,
+      20_000,
+    );
+    expect(Number(row.get("status_code")), "the error event is the stream's failure").toBeGreaterThanOrEqual(500);
+  });
 });

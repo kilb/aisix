@@ -23,6 +23,12 @@ import {
 // a key and matches nothing goes out byte for byte, and a single-valued key is
 // masked as before. Chat Completions and Responses requests carry the string
 // in the request; a Chat Completions answer carries it in the response.
+//
+// A passthrough route relays the same documents byte for byte, and its block
+// rule reads them the way the upstream or the tool runner does: an address
+// behind a JSON escape inside `arguments` is refused there too, in a tool
+// call, a legacy `function_call` and a Responses `function_call` item, on the
+// request and on the answer.
 
 const SECRET = "alice@example.com";
 const ESCAPED = "alice\\u0040example.com";
@@ -31,7 +37,12 @@ const REPEATED_SECRET_LAST = `{"x":"safe","x":"${SECRET}"}`;
 const REPEATED_ESCAPED = `{"x":"${ESCAPED}","x":"safe"}`;
 const REPEATED_CLEAN = `{"x":"a","x":"b"}`;
 const UNIQUE_SECRET = `{"to":"${SECRET}"}`;
+const UNIQUE_ESCAPED = `{"to":"${ESCAPED}"}`;
+const ESCAPED_CLEAN = `{"to":"bob\\u0020smith"}`;
 const TOOL_OUT = "answer-with-a-tool-call";
+const TOOL_OUT_ESCAPED = "answer-with-an-escaped-tool-call";
+const PT_KEY = "sk-repeated-key-passthrough";
+const PT_PREFIX = "/passthrough/repeated-key";
 const MASK_KEY = "sk-repeated-key-mask";
 const BLOCK_KEY = "sk-repeated-key-block";
 
@@ -84,7 +95,9 @@ async function startMock(): Promise<{ baseUrl: string; bodies: string[]; close()
       }
       const messages = (body.messages as Json[] | undefined) ?? [];
       const last = messages[messages.length - 1];
-      const toolOut = typeof last?.content === "string" && last.content.includes(TOOL_OUT);
+      const asked = typeof last?.content === "string" ? last.content : "";
+      const escapedOut = asked.includes(TOOL_OUT_ESCAPED);
+      const toolOut = escapedOut || asked.includes(TOOL_OUT);
       const message = toolOut
         ? {
             role: "assistant",
@@ -93,7 +106,7 @@ async function startMock(): Promise<{ baseUrl: string; bodies: string[]; close()
               {
                 id: "call_out",
                 type: "function",
-                function: { name: "send", arguments: REPEATED_SECRET },
+                function: { name: "send", arguments: escapedOut ? UNIQUE_ESCAPED : REPEATED_SECRET },
               },
             ],
           }
@@ -188,7 +201,20 @@ describe("an enforcing PII rule judges every value of a repeated tool-argument k
       });
       await seed.attachGuardrailToModel(rule.id as string, model.id as string);
     }
+    const route = await seed.createPassthroughRoute({
+      name: "repeated-key-passthrough",
+      path_prefix: PT_PREFIX,
+      target_url: `${mock.baseUrl}/v1`,
+      provider_key_id: pk.id,
+    });
+    await seed.update("guardrail_attachments", randomUUID(), {
+      guardrail_id: block.id,
+      scope_type: "passthrough_route",
+      scope_id: route.id,
+      priority: 100,
+    });
     // Keys last: once the last one authenticates, the rest is in the snapshot.
+    await seed.createApiKey({ key_hash: hash(PT_KEY), allowed_models: ["*"], allowed_routes: ["*"] });
     await seed.createApiKey({ key_hash: hash(MASK_KEY), allowed_models: ["repeated-key-mask"] });
     await seed.createApiKey({ key_hash: hash(BLOCK_KEY), allowed_models: ["repeated-key-block"] });
     await waitConfigPropagation(async () => {
@@ -268,6 +294,74 @@ describe("an enforcing PII rule judges every value of a repeated tool-argument k
       expect(res.status, res.body).toBe(422);
     });
   }
+
+  describe("through a passthrough route, under a block rule", () => {
+    test("an escaped address in a tool call's arguments is refused before the upstream", async (ctx) => {
+      if (!etcdReachable) ctx.skip();
+      const res = await post(
+        `${PT_PREFIX}/chat/completions`,
+        PT_KEY,
+        chatWithToolCall("gpt-4o-mini", UNIQUE_ESCAPED),
+      );
+      expectRefusedBeforeUpstream(res);
+    });
+
+    test("an escaped address in a legacy function_call is refused before the upstream", async (ctx) => {
+      if (!etcdReachable) ctx.skip();
+      const res = await post(`${PT_PREFIX}/chat/completions`, PT_KEY, {
+        model: "gpt-4o-mini",
+        messages: [
+          { role: "user", content: "send the note" },
+          { role: "assistant", content: null, function_call: { name: "send", arguments: UNIQUE_ESCAPED } },
+          { role: "function", name: "send", content: "sent" },
+          { role: "user", content: "thanks" },
+        ],
+      });
+      expectRefusedBeforeUpstream(res);
+    });
+
+    test("an escaped address in a Responses function_call item is refused before the upstream", async (ctx) => {
+      if (!etcdReachable) ctx.skip();
+      const res = await post(`${PT_PREFIX}/responses`, PT_KEY, {
+        model: "gpt-4o-mini",
+        input: [
+          { type: "message", role: "user", content: "send the note" },
+          { type: "function_call", call_id: "call_1", name: "send", arguments: UNIQUE_ESCAPED },
+          { type: "function_call_output", call_id: "call_1", output: "sent" },
+          { type: "message", role: "user", content: "thanks" },
+        ],
+      });
+      expectRefusedBeforeUpstream(res);
+    });
+
+    test("an escaped address in an answer's tool call never reaches the caller", async (ctx) => {
+      if (!etcdReachable) ctx.skip();
+      const res = await post(`${PT_PREFIX}/chat/completions`, PT_KEY, {
+        model: "gpt-4o-mini",
+        messages: [{ role: "user", content: TOOL_OUT_ESCAPED }],
+      });
+      expect(res.upstream(), "the answer came from the upstream").toHaveLength(1);
+      // Escaped or not, and however many times: the mailbox name is the part
+      // no escape changes.
+      expect(res.body, "the address reached the caller").not.toContain("alice");
+      expect(res.status, res.body).toBe(422);
+    });
+
+    test("escaped arguments that name no address are forwarded byte for byte", async (ctx) => {
+      if (!etcdReachable) ctx.skip();
+      const res = await post(
+        `${PT_PREFIX}/chat/completions`,
+        PT_KEY,
+        chatWithToolCall("gpt-4o-mini", ESCAPED_CLEAN),
+      );
+      expect(res.status, res.body).toBe(200);
+      const sent = res.upstream();
+      expect(sent).toHaveLength(1);
+      const forwarded = JSON.parse(sent[0]) as { messages: Array<{ tool_calls?: Json[] }> };
+      const call = forwarded.messages[1].tool_calls?.[0] as { function: { arguments: string } };
+      expect(call.function.arguments).toBe(ESCAPED_CLEAN);
+    });
+  });
 
   test("a repeated key that matches nothing is forwarded byte for byte", async (ctx) => {
     if (!etcdReachable) ctx.skip();

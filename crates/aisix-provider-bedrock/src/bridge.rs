@@ -8961,9 +8961,15 @@ mod stream_contract_tests {
     const CONTENT: &str =
         "data: {\"id\":\"c\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n";
     const FINISH: &str = "data: {\"id\":\"c\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n";
+    /// A second choice (`n: 2`), and its own finish.
+    const CONTENT_1: &str =
+        "data: {\"id\":\"c\",\"choices\":[{\"index\":1,\"delta\":{\"content\":\"yo\"}}]}\n\n";
+    const FINISH_1: &str = "data: {\"id\":\"c\",\"choices\":[{\"index\":1,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n";
 
     /// EOF with no terminal is a failure on Bedrock's Chat Completions route;
-    /// `[DONE]` or a finish reason is the terminal.
+    /// `[DONE]` or a finish reason is the terminal, and with several choices
+    /// every choice's finish reason: one finished choice does not cover
+    /// another that was cut off.
     #[tokio::test]
     async fn a_chat_completions_stream_with_no_terminal_fails() {
         for (body, aborted) in [
@@ -8971,6 +8977,12 @@ mod stream_contract_tests {
             (format!("{CONTENT}{FINISH}"), false),
             (format!("{CONTENT}data: [DONE]\n\n"), false),
             (format!("{CONTENT}data: [DONE]\n"), false),
+            (format!("{CONTENT}{CONTENT_1}{FINISH}"), true),
+            (format!("{CONTENT}{CONTENT_1}{FINISH}{FINISH_1}"), false),
+            (
+                format!("{CONTENT}{CONTENT_1}{FINISH}data: [DONE]\n\n"),
+                false,
+            ),
         ] {
             let server = compat_server(&body).await;
             let bridge = BedrockBridge::new().with_endpoint_override(server.uri());

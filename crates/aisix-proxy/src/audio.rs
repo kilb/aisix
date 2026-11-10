@@ -919,11 +919,16 @@ enum AudioUpstreamBody {
     Buffered(Bytes),
     Live(reqwest::Response),
     /// A stream held back for an output guardrail that outgrew the chain's
-    /// hold-back cap: what was held, and the rest of the stream unread.
+    /// hold-back cap under `fail_open`: what was held, and the rest of the
+    /// stream unread.
     OverCap {
         held: Bytes,
         rest: reqwest::Response,
     },
+    /// The same past the cap under `fail_closed`: the stream was read to its
+    /// terminal event and nothing of its text kept, only the counters that
+    /// event reported (see [`drain_refused_transcription`]).
+    OverCapRefused(Bytes),
 }
 
 /// Read a streamed transcription held back for an output guardrail, under
@@ -931,16 +936,20 @@ enum AudioUpstreamBody {
 /// bound derived from it, [`crate::held_content::HeldBuffer`]). The content
 /// measured is the transcript text the events carry, never their framing:
 /// the deltas and segment texts, or the done event's text where it is
-/// longer, since it repeats them. The body is whole when it fits, and
-/// otherwise stops at the frame that crossed the cap.
+/// longer, since it repeats them. The body is whole when it fits. Past the
+/// cap, `fail_open` stops at the frame that crossed it and hands on the rest
+/// unread; `fail_closed` reads on to the terminal event for its counters
+/// alone, since the upstream bills the whole transcript either way.
 async fn read_held_transcription(
     mut resp: reqwest::Response,
     max_buffer_bytes: usize,
+    fail_open: bool,
 ) -> Result<AudioUpstreamBody, aisix_gateway::BridgeError> {
     let mut body: Vec<u8> = Vec::new();
     let mut decoder = aisix_gateway::SseDecoder::with_max_frame_bytes(usize::MAX);
     let mut held = crate::held_content::HeldBuffer::default();
     let (mut streamed, mut done) = (0usize, 0usize);
+    let (mut counters, mut terminal): (Option<Value>, bool) = (None, false);
     while let Some(chunk) = resp
         .chunk()
         .await
@@ -957,6 +966,8 @@ async fn read_held_transcription(
                 streamed += payload.len();
                 continue;
             };
+            counters = transcription_counters(&event).or(counters);
+            terminal |= event.get("type").and_then(Value::as_str) == Some("transcript.text.done");
             let text_len =
                 |field: &str| event.get(field).and_then(Value::as_str).map_or(0, str::len);
             match event.get("type").and_then(Value::as_str) {
@@ -967,13 +978,85 @@ async fn read_held_transcription(
         }
         held.hold(streamed.max(done) - before, chunk.len());
         if held.exceeds(max_buffer_bytes) {
-            return Ok(AudioUpstreamBody::OverCap {
-                held: Bytes::from(body),
-                rest: resp,
-            });
+            if fail_open {
+                return Ok(AudioUpstreamBody::OverCap {
+                    held: Bytes::from(body),
+                    rest: resp,
+                });
+            }
+            // Refused: none of what was held reaches anyone, so it is let go
+            // before the rest is read.
+            drop((body, held));
+            if !terminal {
+                counters = drain_refused_transcription(resp, decoder, counters).await;
+            }
+            return Ok(AudioUpstreamBody::OverCapRefused(
+                counters.map_or_else(Bytes::new, |counters| {
+                    Bytes::from(format!("data: {counters}\n\n"))
+                }),
+            ));
         }
     }
     Ok(AudioUpstreamBody::Buffered(Bytes::from(body)))
+}
+
+/// An event's counters with its text removed: its `type` and `usage`, or
+/// `None` when it reports no `usage`.
+fn transcription_counters(event: &Value) -> Option<Value> {
+    let usage = event.get("usage").filter(|u| u.is_object())?;
+    Some(serde_json::json!({ "type": event.get("type"), "usage": usage }))
+}
+
+/// Read the rest of a held transcription refused past its cap, for the
+/// counters its terminal `transcript.text.done` reports: the upstream bills
+/// the whole transcript whether or not the caller receives it, so the refusal
+/// is billed, and counted against the key's token limits, as the answer is.
+/// No text is kept, only the last counters seen (`seen` carries those of the
+/// frames read before the cap); the caller renders them as one SSE frame, so
+/// the usage and duration readers find them where a whole body carries them.
+///
+/// The read ends at the terminal event or the end of the body. The request
+/// timeout bounds it, as it bounds the read before the cap, and so does the
+/// frame bound every relayed stream has: a frame that grows past
+/// [`aisix_gateway::sse::MAX_SSE_FRAME_BYTES`] without ending stops the read. So
+/// does a read that fails. Either way the refusal stands, billed with the
+/// counters seen by then.
+async fn drain_refused_transcription(
+    mut resp: reqwest::Response,
+    mut decoder: aisix_gateway::SseDecoder,
+    mut seen: Option<Value>,
+) -> Option<Value> {
+    // Keep the event's counters, if any; `true` at the terminal event.
+    fn take(payload: &str, seen: &mut Option<Value>) -> bool {
+        let Ok(event) = serde_json::from_str::<Value>(payload) else {
+            return false;
+        };
+        *seen = transcription_counters(&event).or(seen.take());
+        event.get("type").and_then(Value::as_str) == Some("transcript.text.done")
+    }
+    let mut unframed = 0usize;
+    'read: while let Ok(Some(chunk)) = resp.chunk().await {
+        let events = decoder.feed(chunk.as_ref()).unwrap_or_default();
+        if events.is_empty() {
+            unframed = unframed.saturating_add(chunk.len());
+            if unframed > aisix_gateway::sse::MAX_SSE_FRAME_BYTES {
+                break;
+            }
+        } else {
+            unframed = 0;
+        }
+        for event in events {
+            if let aisix_gateway::SseEvent::Data(payload) = event {
+                if take(&payload, &mut seen) {
+                    break 'read;
+                }
+            }
+        }
+    }
+    if let Ok(Some(aisix_gateway::SseEvent::Data(payload))) = decoder.finish() {
+        take(&payload, &mut seen);
+    }
+    seen
 }
 
 /// Whether an upstream response is an SSE stream.
@@ -1770,12 +1853,19 @@ async fn multipart_dispatch(
                         if live_relay && is_event_stream(&upstream_headers) {
                             return Ok((upstream_headers, AudioUpstreamBody::Live(resp)));
                         }
-                        if let Some((cap, _)) =
+                        if let Some((cap, fail_open)) =
                             held_cap.filter(|_| is_event_stream(&upstream_headers))
                         {
-                            let held = read_held_transcription(resp, cap).await.map_err(|be| {
-                                crate::cooldown::note_failure(tracker, model_id, cooldown_cfg, be)
-                            })?;
+                            let held = read_held_transcription(resp, cap, fail_open)
+                                .await
+                                .map_err(|be| {
+                                    crate::cooldown::note_failure(
+                                        tracker,
+                                        model_id,
+                                        cooldown_cfg,
+                                        be,
+                                    )
+                                })?;
                             return Ok((upstream_headers, held));
                         }
                         let read = async {
@@ -1840,9 +1930,36 @@ async fn multipart_dispatch(
         reservation.merge(member);
     }
 
-    // An answer read whole succeeded here. A relayed stream has only opened:
-    // its terminal callback settles the target's health, cooldown and
-    // deployment outcome once it knows how the stream ended.
+    // Past the hold-back cap: under `fail_closed` the transcript is refused
+    // below, billed with the counters its terminal event reported; under
+    // `fail_open` what was held is released unscanned and the rest of the
+    // stream is relayed live without an output scan, recorded as an
+    // `output_buffer_exceeded` bypass.
+    let mut over_cap_refused = false;
+    let (upstream_body, released_unscanned) = match upstream_body {
+        AudioUpstreamBody::OverCap { held, rest } => {
+            crate::guardrail_stream::release_output_buffer_unscanned(&resolved_chain);
+            (AudioUpstreamBody::Live(rest), Some(held))
+        }
+        AudioUpstreamBody::OverCapRefused(counters) => {
+            tracing::warn!(
+                guardrail_name = crate::guardrail_stream::output_buffer_owner(&resolved_chain),
+                guardrail_hook = "output",
+                max_buffer_bytes = held_cap.map(|(cap, _)| cap),
+                "streamed transcription exceeded max_buffer_bytes; failing closed",
+            );
+            aisix_guardrails::Guardrail::record_output_buffer_exceeded(&resolved_chain);
+            over_cap_refused = true;
+            (AudioUpstreamBody::Buffered(counters), None)
+        }
+        other => (other, None),
+    };
+
+    // An answer read whole succeeded here, a transcript refused past the cap
+    // included: the upstream answered it in full. A relayed stream has only
+    // opened: its terminal callback settles the target's health, cooldown and
+    // deployment outcome once it knows how the stream ended. Decided after
+    // the cap, which is what turns a held stream into one or the other.
     if let AudioUpstreamBody::Buffered(_) = &upstream_body {
         if let Some(deferred) = &deferred {
             deferred.finish(state, 200, true);
@@ -1853,33 +1970,11 @@ async fn multipart_dispatch(
             .mark_healthy(&target.id, attempt_started);
     }
 
-    // Past the hold-back cap: under `fail_closed` what was held is refused
-    // below, billed with whatever usage it carried; under `fail_open` it is
-    // released unscanned and the rest of the stream is relayed live without
-    // an output scan, recorded as an `output_buffer_exceeded` bypass.
-    let mut over_cap_refused = false;
-    let (upstream_body, released_unscanned) = match upstream_body {
-        AudioUpstreamBody::OverCap { held, rest } => {
-            if held_cap.is_some_and(|(_, fail_open)| fail_open) {
-                crate::guardrail_stream::release_output_buffer_unscanned(&resolved_chain);
-                (AudioUpstreamBody::Live(rest), Some(held))
-            } else {
-                tracing::warn!(
-                    guardrail_name = crate::guardrail_stream::output_buffer_owner(&resolved_chain),
-                    guardrail_hook = "output",
-                    max_buffer_bytes = held_cap.map(|(cap, _)| cap),
-                    "streamed transcription exceeded max_buffer_bytes; failing closed",
-                );
-                aisix_guardrails::Guardrail::record_output_buffer_exceeded(&resolved_chain);
-                over_cap_refused = true;
-                (AudioUpstreamBody::Buffered(held), None)
-            }
-        }
-        other => (other, None),
-    };
     let body_bytes = match upstream_body {
         AudioUpstreamBody::Buffered(bytes) => bytes,
-        AudioUpstreamBody::OverCap { .. } => unreachable!("taken by the cap decision above"),
+        AudioUpstreamBody::OverCap { .. } | AudioUpstreamBody::OverCapRefused(_) => {
+            unreachable!("taken by the cap decision above")
+        }
         // #998: forward the upstream's SSE frames as they arrive. The
         // caller sees the same wire bytes it would get straight from the
         // provider, at the same pace; a side-channel decoder reads the
@@ -2158,14 +2253,18 @@ async fn multipart_dispatch(
         ),
         ..Default::default()
     });
-    reservation.commit_tokens(total_tokens).await;
+    // Owed, not committed: the concurrency slot stays taken while the output
+    // chain reads the transcript, and a refusal or a caller that leaves during
+    // it still credits the tokens as the reservation drops. Committed below
+    // once the chain lets the transcript through.
+    reservation.owe_tokens(total_tokens);
 
     // #696: run the output guardrail chain on the transcript — it is
     // caller-visible model output, scanned like chat's replies. Pre-fix an
     // output block/mask enforced on /v1/chat/completions was bypassable by
-    // transcribing audio. The upstream already billed (tokens committed
-    // above), so a block returns the redacted 422 while keeping the billed
-    // usage marked `guardrail_blocked` — same as completions #911 [23].
+    // transcribing audio. The upstream already billed (tokens owed above), so
+    // a block returns the redacted 422 while keeping the billed usage marked
+    // `guardrail_blocked` — same as completions #911 [23].
     let mut output_capture_safe = true;
     if aisix_guardrails::Guardrail::runs_on_output(&resolved_chain) {
         let scan = transcription_output_text(&body_bytes, is_event_stream(&upstream_headers));
@@ -2259,6 +2358,8 @@ async fn multipart_dispatch(
             });
         }
     }
+
+    reservation.commit_tokens(total_tokens).await;
 
     // #932/#696: mask-action PII rules rewrite the transcript AFTER the
     // block check passes, BEFORE it reaches the caller.

@@ -554,6 +554,13 @@ fn build_rustls_client_config(tls: &TlsSettings) -> rustls::ClientConfig {
 }
 
 /// The certificate chain and private key of `id`, as rustls takes them.
+///
+/// Read from the two files joined ([`ClientIdentityPem::joined`]), the way
+/// reqwest reads its identity, so the two stacks take the same identity from
+/// the same files: every certificate in the order they appear, and the last
+/// private key. A deployment whose cert and key files hold each other's
+/// blocks, or hold both, presents to the Realtime WebSocket what it presents
+/// to every other upstream.
 fn rustls_identity(
     id: &ClientIdentityPem,
 ) -> Result<
@@ -563,15 +570,23 @@ fn rustls_identity(
     ),
     String,
 > {
-    let certs = rustls_pemfile::certs(&mut id.cert.as_slice())
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| format!("client certificate: {e}"))?;
-    if certs.is_empty() {
-        return Err("client certificate file contains no CERTIFICATE block".into());
+    let joined = id.joined();
+    let mut certs = Vec::new();
+    let mut key = None;
+    for item in rustls_pemfile::read_all(&mut joined.as_slice()) {
+        match item.map_err(|e| format!("client certificate and key: {e}"))? {
+            rustls_pemfile::Item::X509Certificate(cert) => certs.push(cert),
+            rustls_pemfile::Item::Pkcs1Key(k) => key = Some(k.into()),
+            rustls_pemfile::Item::Pkcs8Key(k) => key = Some(k.into()),
+            rustls_pemfile::Item::Sec1Key(k) => key = Some(k.into()),
+            _ => {}
+        }
     }
-    let key = rustls_pemfile::private_key(&mut id.key.as_slice())
-        .map_err(|e| format!("client key: {e}"))?
-        .ok_or_else(|| "client key file contains no private key".to_string())?;
+    if certs.is_empty() {
+        return Err("client certificate and key files contain no CERTIFICATE block".into());
+    }
+    let key =
+        key.ok_or_else(|| "client certificate and key files contain no private key".to_string())?;
     Ok((certs, key))
 }
 
@@ -589,7 +604,16 @@ fn rustls_identity_config(id: &ClientIdentityPem) -> Result<(), String> {
         .with_root_certificates(rustls::RootCertStore::empty())
         .with_client_auth_cert(certs, key)
         .map(|_| ())
-        .map_err(|e| e.to_string())
+        .map_err(|e| {
+            let e = e.to_string();
+            // webpki reads only X.509 v3, and reqwest's client build refuses
+            // the same certificate, so the fix is the certificate's.
+            if e.contains("UnsupportedCertVersion") {
+                format!("{e}: the client certificate must be X.509 v3")
+            } else {
+                e
+            }
+        })
 }
 
 /// Built-in roots (platform store + the compiled-in Mozilla set, which
@@ -1337,6 +1361,96 @@ mod tests {
             err.contains("upstream.tls.client_cert_file/client_key_file"),
             "{err}"
         );
+    }
+
+    /// reqwest reads its identity from the two files joined, wherever each
+    /// block sits, so a deployment whose files hold each other's blocks, or
+    /// one file holding both, boots and presents its certificate. The
+    /// Realtime stack reads the same identity from the same files.
+    #[tokio::test]
+    async fn the_realtime_stack_reads_the_identity_wherever_reqwest_finds_it() {
+        let (client_ca, cert, key) = signed_leaf("aisix-gateway");
+        let layouts = [
+            ("swapped files", key.clone(), cert.clone()),
+            (
+                "both in the cert file",
+                String::new(),
+                format!("{key}{cert}"),
+            ),
+            (
+                "both in the key file",
+                format!("{cert}{key}"),
+                String::new(),
+            ),
+        ];
+        for (layout, cert_file, key_file) in layouts {
+            let tls = TlsSettings {
+                verify: false,
+                client_identity: Some(Arc::new(ClientIdentityPem {
+                    key: key_file.into_bytes(),
+                    cert: cert_file.into_bytes(),
+                })),
+                ..Default::default()
+            };
+            let id = tls.client_identity.as_deref().unwrap();
+            assert!(
+                reqwest::Identity::from_pem(&id.joined()).is_ok(),
+                "{layout}: reqwest takes it"
+            );
+            // The boot's own check (`init_reqwest_material` installs process
+            // state, so it is not called for a passing case here).
+            assert_eq!(rustls_identity_config(id), Ok(()), "{layout}: it boots");
+            assert!(
+                mtls_peer_accepts(&tls, &client_ca).await,
+                "{layout}: the Realtime stack presents it"
+            );
+        }
+    }
+
+    /// An X.509 v1 client certificate, and its key. The certificate pre-dates
+    /// extensions and webpki takes only v3.
+    const V1_CLIENT_CERT: &str = "-----BEGIN CERTIFICATE-----
+MIIBJDCBywIUa8JWRK5mGOg8cEIOR6/R78OEhL8wCgYIKoZIzj0EAwIwEDEOMAwG
+A1UEAwwFdjEtY2EwIBcNMjYxMTEwMTkxNDQ0WhgPMjEyNjEwMTcxOTE0NDRaMBgx
+FjAUBgNVBAMMDWFpc2l4LWdhdGV3YXkwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNC
+AAS6BW9rMltVTnBU1G94E14j0Jgs/m36X17A3EVrPDGV+ue9g6YKFfXOu9oCcTko
+pNofEBIVGAG/IyLsYxscDNuOMAoGCCqGSM49BAMCA0gAMEUCIGRxc4tfHz2V/qGA
+WDcuMZnrDrqMVLxzSewRQ9DJRiKZAiEAs1XIdI/bMDuULjcZlU1cyatHW2WKWJfa
+TDYqotokQIc=
+-----END CERTIFICATE-----
+";
+    const V1_CLIENT_KEY: &str = "-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgIiLRDGdXjvpy6MBR
+rwmIQKrmYzS1Zhaq+NoJlePI+GShRANCAAS6BW9rMltVTnBU1G94E14j0Jgs/m36
+X17A3EVrPDGV+ue9g6YKFfXOu9oCcTkopNofEBIVGAG/IyLsYxscDNuO
+-----END PRIVATE KEY-----
+";
+
+    /// A v1 client certificate is one the HTTP clients cannot present
+    /// either: reqwest's client build refuses it, which left every outbound
+    /// client on the minimal fallback (no CA, no identity). So the boot
+    /// refuses it, and says what to change.
+    #[test]
+    fn a_v1_client_certificate_is_refused_by_both_stacks() {
+        let tls = TlsSettings {
+            client_identity: Some(Arc::new(ClientIdentityPem {
+                key: V1_CLIENT_KEY.as_bytes().to_vec(),
+                cert: V1_CLIENT_CERT.as_bytes().to_vec(),
+            })),
+            ..Default::default()
+        };
+        let id = tls.client_identity.as_deref().unwrap();
+        let identity = reqwest::Identity::from_pem(&id.joined()).expect("reqwest parses the PEM");
+        assert!(
+            reqwest::Client::builder()
+                .identity(identity)
+                .build()
+                .is_err(),
+            "reqwest's client build refuses a v1 certificate"
+        );
+        let err = init_reqwest_material(&tls).unwrap_err();
+        assert!(err.contains("upstream.tls.client_cert_file"), "{err}");
+        assert!(err.contains("X.509 v3"), "{err}");
     }
 
     fn shared_client() -> reqwest::Client {

@@ -22,18 +22,29 @@ import {
 // The output guardrail is a moderation service that answers at once, except
 // for a text carrying the armed marker, which it holds until the test lets it
 // go. Each cell has its own key and its own model: a fresh Chat Completions
-// answer, and a cache hit on Chat Completions, Messages and Responses.
+// answer, and a cache hit on Chat Completions, Messages and Responses. The
+// other surfaces whose answer an output guardrail reads before it is
+// released hold the slot the same way: a fresh legacy Completions answer, a
+// generated and an edited image (its revised prompt), and a transcript.
 
 const hash = (s: string) => createHash("sha256").update(s).digest("hex");
 
 type Json = Record<string, unknown>;
-type Endpoint = "chat" | "messages" | "responses";
+type Endpoint =
+  | "chat"
+  | "messages"
+  | "responses"
+  | "completions"
+  | "images"
+  | "image-edits"
+  | "transcriptions";
 
 interface Cell {
   name: string;
   endpoint: Endpoint;
   cached: boolean;
   key: string;
+  upstreamModel: string;
 }
 
 const CELLS: Cell[] = [
@@ -41,11 +52,26 @@ const CELLS: Cell[] = [
   { name: "held-hit-chat", endpoint: "chat", cached: true },
   { name: "held-hit-messages", endpoint: "messages", cached: true },
   { name: "held-hit-responses", endpoint: "responses", cached: true },
-].map((c) => ({ ...c, endpoint: c.endpoint as Endpoint, key: `sk-${c.name}-e2e` }));
+  { name: "held-fresh-completions", endpoint: "completions", cached: false, upstreamModel: "gpt-3.5-turbo-instruct" },
+  { name: "held-fresh-images", endpoint: "images", cached: false, upstreamModel: "gpt-image-1" },
+  { name: "held-fresh-image-edits", endpoint: "image-edits", cached: false, upstreamModel: "gpt-image-1" },
+  {
+    name: "held-fresh-transcriptions",
+    endpoint: "transcriptions",
+    cached: false,
+    upstreamModel: "gpt-4o-transcribe",
+  },
+].map((c) => ({
+  upstreamModel: "gpt-4o-mini",
+  ...c,
+  endpoint: c.endpoint as Endpoint,
+  key: `sk-${c.name}-e2e`,
+}));
 
 /** The text of the last user turn, whichever protocol carried it. */
 function promptOf(body: Json): string {
   if (typeof body.input === "string") return body.input;
+  if (typeof body.prompt === "string") return body.prompt;
   const turns = (body.messages ?? []) as Json[];
   const user = [...turns].reverse().find((t) => t.role === "user");
   const content = user?.content;
@@ -68,16 +94,47 @@ async function startUpstream(): Promise<{ baseUrl: string; calls: string[]; clos
     req.on("data", (c: Buffer) => chunks.push(c));
     req.on("end", () => {
       const path = (req.url ?? "/").split("?")[0];
+      const raw = Buffer.concat(chunks).toString("utf8");
       let body: Json = {};
       try {
-        body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as Json;
+        body = JSON.parse(raw) as Json;
       } catch {
-        body = {};
+        // A multipart form (image edits, transcriptions): its `prompt` part.
+        body = { prompt: /name="prompt"\r\n\r\n([^\r]*)/.exec(raw)?.[1] ?? "" };
       }
       const answer = `you said: ${promptOf(body)}`;
       calls.push(answer);
       res.statusCode = 200;
       res.setHeader("content-type", "application/json");
+      if (path === "/v1/completions") {
+        return res.end(
+          JSON.stringify({
+            id: `cmpl-${randomUUID()}`,
+            object: "text_completion",
+            created: 0,
+            model: String(body.model ?? ""),
+            choices: [{ index: 0, text: answer, finish_reason: "stop", logprobs: null }],
+            usage: { prompt_tokens: 5, completion_tokens: 3, total_tokens: 8 },
+          }),
+        );
+      }
+      if (path === "/v1/images/generations" || path === "/v1/images/edits") {
+        return res.end(
+          JSON.stringify({
+            created: 0,
+            data: [{ b64_json: "aGk=", revised_prompt: answer }],
+            usage: { input_tokens: 5, output_tokens: 3, total_tokens: 8 },
+          }),
+        );
+      }
+      if (path === "/v1/audio/transcriptions") {
+        return res.end(
+          JSON.stringify({
+            text: answer,
+            usage: { type: "tokens", input_tokens: 5, output_tokens: 3, total_tokens: 8 },
+          }),
+        );
+      }
       if (path === "/v1/responses") {
         return res.end(
           JSON.stringify({
@@ -202,7 +259,7 @@ describe("a key at its concurrency limit stays there while its answer is checked
       const model = await seed.createModel({
         display_name: cell.name,
         provider: "openai",
-        model_name: "gpt-4o-mini",
+        model_name: cell.upstreamModel,
         provider_key_id: pk.id,
       });
       await seed.attachGuardrailToModel(scan.id as string, model.id as string);
@@ -245,13 +302,32 @@ describe("a key at its concurrency limit stays there while its answer is checked
       chat: "/v1/chat/completions",
       messages: "/v1/messages",
       responses: "/v1/responses",
+      completions: "/v1/completions",
+      images: "/v1/images/generations",
+      "image-edits": "/v1/images/edits",
+      transcriptions: "/v1/audio/transcriptions",
     }[cell.endpoint];
+    if (cell.endpoint === "image-edits" || cell.endpoint === "transcriptions") {
+      const form = new FormData();
+      form.set("model", cell.name);
+      form.set("prompt", text);
+      const [field, type, file] =
+        cell.endpoint === "image-edits" ? ["image", "image/png", "in.png"] : ["file", "audio/mpeg", "a.mp3"];
+      form.set(field, new Blob([new Uint8Array([0x49, 0x44, 0x33])], { type }), file);
+      return fetch(`${app!.proxyUrl}${path}`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${cell.key}` },
+        body: form,
+      });
+    }
     const body: Json =
       cell.endpoint === "responses"
         ? { model: cell.name, input: text }
         : cell.endpoint === "messages"
           ? { model: cell.name, max_tokens: 64, messages: [{ role: "user", content: text }] }
-          : { model: cell.name, messages: [{ role: "user", content: text }] };
+          : cell.endpoint === "completions" || cell.endpoint === "images"
+            ? { model: cell.name, prompt: text }
+            : { model: cell.name, messages: [{ role: "user", content: text }] };
     return fetch(`${app!.proxyUrl}${path}`, {
       method: "POST",
       headers: {
