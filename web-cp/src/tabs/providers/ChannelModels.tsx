@@ -2,6 +2,8 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { ApiError, channelModels, publicModels, type ChannelModel, type PublicModel } from "../../lib/api";
 import { messageFor } from "../../lib/errors";
 import { errorText } from "../../lib/fmt";
+import { keptText, removalFailedText, removeThenRetire, retiredText } from "../../lib/retireOutcome";
+import { retireWarning, withoutServing } from "../../lib/retireWarning";
 import { GroupList } from "../../ui/GroupName";
 import { Button } from "../../ui/Button";
 import { DataTable, Loading } from "../../ui/DataTable";
@@ -96,14 +98,30 @@ export function ChannelModels({
   const [newName, setNewName] = useState("");
   const [creating, setCreating] = useState(false);
   const [refusal, setRefusal] = useState<string | null>(null);
+  // The public model id whose `删除模型` is in flight.
+  const [removing, setRemoving] = useState<string | null>(null);
 
-  const load = useCallback(async () => {
+  /**
+   * Re-reads the checklist. `keepDrafts` starts every row from the server's
+   * values except the rows the operator has edited since the last read, so a
+   * reload after 删除模型 does not throw those away; a draft of a row that no
+   * longer exists goes with it.
+   */
+  const load = useCallback(async (keepDrafts = false) => {
     try {
       const [channels, models] = await Promise.all([channelModels.list(accountId), publicModels.list()]);
       setRows(channels);
       setPublics(models.filter((m) => m.retired_at === null));
       setEveryPublic(models);
-      setDrafts(Object.fromEntries(channels.map((r) => [r.public_model_id, draftOf(r)])));
+      setDrafts((prev) => {
+        const fresh = Object.fromEntries(channels.map((r) => [r.public_model_id, draftOf(r)]));
+        if (!keepDrafts) return fresh;
+        for (const row of channels) {
+          const edited = prev[row.public_model_id];
+          if (edited !== undefined && !sameDraft(edited, draftOf(row))) fresh[row.public_model_id] = edited;
+        }
+        return fresh;
+      });
       setError(null);
     } catch (e) {
       setError(errorText(e));
@@ -233,6 +251,32 @@ export function ChannelModels({
     }
   }
 
+  /**
+   * 删除模型: this account's mapping goes first, then the public model is
+   * stopped — the two writes [removeThenRetire] names, kept apart in the
+   * answer because the second can be refused after the first succeeded. A
+   * partial outcome is never reported as a plain failure.
+   */
+  async function deleteModel(row: ChannelModel) {
+    const name = row.public_model_name;
+    setNote(null);
+    setRefusal(null);
+    setRemoving(row.public_model_id);
+    const outcome = await removeThenRetire(
+      () => channelModels.remove(accountId, row.public_model_id),
+      () => publicModels.retire(row.public_model_id),
+    );
+    setRemoving(null);
+    if (outcome.kind === "removal_failed") {
+      setRefusal(removalFailedText(name, outcome.error));
+      return;
+    }
+    if (outcome.kind === "retired") setNote(retiredText(name));
+    else setRefusal(keptText(name, outcome));
+    // The mapping is gone either way; other rows keep whatever was edited.
+    await load(true);
+  }
+
   const filter = query.trim().toLowerCase();
   const shown = (rows ?? []).filter((row) => {
     if (filter === "") return true;
@@ -291,6 +335,7 @@ export function ChannelModels({
               <th className="num">权重</th>
               <th>启用</th>
               <th>账号分组</th>
+              <th className="right">操作</th>
             </tr>
           </thead>
           <tbody>
@@ -371,12 +416,39 @@ export function ChannelModels({
                       groups.length > 0 ? <GroupList groups={groups} /> : "—"
                     )}
                   </td>
+                  <td className="right">
+                    {canEdit && row.served && (
+                      <TwoStep
+                        label="删除模型"
+                        size="sm"
+                        kind="secondary"
+                        busy={removing === row.public_model_id}
+                        busyLabel="删除中…"
+                        disabled={busy}
+                        warning={
+                          model === undefined ? (
+                            // The view was not read for it: say what the two writes do, without counts.
+                            `删除模型「${row.public_model_name}」：先移除本账号对它的映射，再停用它；停用后它的路由文档、各账号的直连文档和账号映射都会被删除，不能恢复。若仍有租户授权、密钥或启用的账号指向它，它会被保留，随后的提示会写明要先解除哪些。`
+                          ) : (
+                            <>
+                              <span className="ch-warn-line">
+                                删除模型「{row.public_model_name}」：先移除本账号对它的映射，再停用它。
+                              </span>
+                              {/* The retire meets the state after this account's row is gone, so it is asked that way. */}
+                              {retireWarning(withoutServing(model, accountId))}
+                            </>
+                          )
+                        }
+                        onConfirm={() => void deleteModel(row)}
+                      />
+                    )}
+                  </td>
                 </tr>
               );
             })}
             {shown.length === 0 && (
               <tr>
-                <td colSpan={7}>
+                <td colSpan={8}>
                   <EmptyState text={rows.length === 0 ? "还没有公共模型。用下面的名称新建一个。" : "没有匹配的模型。"} />
                 </td>
               </tr>

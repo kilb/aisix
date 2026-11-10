@@ -52,7 +52,8 @@ const TEXT: Record<string, string> = {
   public_model_retired: "该公共模型已停用",
 };
 
-export function messageFor(e: ApiError): string {
+/** Reads only the code and the message, so a caller-typed part of an answer passes too. */
+export function messageFor(e: Pick<ApiError, "message" | "code">): string {
   return TEXT[e.code] ?? e.message;
 }
 

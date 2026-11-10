@@ -4,14 +4,24 @@ import { ConflictNote } from "../components/ConflictNote";
 import { Field, useRefusalFocus } from "../ui/Field";
 import { Msg, type Note } from "../components/Msg";
 import { RolloutBadge } from "../components/RolloutBadge";
-import { ApiError, tenants, type ResourceView, type Tenant } from "../lib/api";
+import {
+  ApiError,
+  publicModels,
+  tenants,
+  type PublicModel,
+  type ResourceView,
+  type Tenant,
+} from "../lib/api";
 import { messageFor, problemAt } from "../lib/errors";
 import { errorText } from "../lib/fmt";
+import { modelSource, type ModelSource } from "../lib/modelSource";
+import { inUseText, retireWarning } from "../lib/retireWarning";
 import { defaultAt, enumAt, loadSchema } from "../lib/schema";
 import { useResource } from "../lib/useResource";
 import { Button } from "../ui/Button";
 import { DataTable, Loading } from "../ui/DataTable";
 import { EmptyState } from "../ui/EmptyState";
+import { TwoStep } from "../ui/TwoStep";
 
 /** One routing target; fields this page does not edit (such as `tags`) are kept as stored. */
 interface Target {
@@ -48,6 +58,13 @@ type Account = ResourceView<AccountDoc>;
 
 /** The model's dispatch shape. Only direct and routing models have a form here. */
 type Shape = "direct" | "routing" | "ensemble" | "semantic";
+
+/** The 来源 filter's values, in the order the select lists them. */
+const SOURCE_OPTIONS: { value: "all" | "manual" | "generated"; label: string }[] = [
+  { value: "all", label: "全部" },
+  { value: "manual", label: "手工创建" },
+  { value: "generated", label: "由公共模型生成" },
+];
 
 const SHAPE_LABEL: Record<Shape, string> = {
   direct: "直连",
@@ -110,15 +127,31 @@ function groupsOf(m: Model | undefined, catalog: Catalog): string {
  * account and routing models over them, each with the provider groups that
  * can reach it, its rollout, a form for both shapes and a two-step delete.
  * Ensemble and semantic models are listed and edited on 全部资源.
+ *
+ * Each row also says where it comes from. A model the operator wrote here is
+ * edited and deleted here. One a public model generated is not: it is owned
+ * by that public model, so a `DELETE` on it is refused as `managed_resource`
+ * and a save would only be refused too. Those rows are read-only and lead to
+ * 价格 · 公共模型; the only removal that works is retiring that public model,
+ * which is what 停用 does — it deletes the routing document, every account's
+ * direct document and the account mappings, or is refused with what still
+ * names the model.
  */
-export function Models({ canEdit }: TabProps) {
+export function Models({ canEdit, onGoto }: TabProps) {
   const models = useResource<ModelDoc>("models");
   const accounts = useResource<AccountDoc>("provider_keys");
+  const [publics, setPublics] = useState<PublicModel[] | null>(null);
+  const [publicsError, setPublicsError] = useState<string | null>(null);
   const [schema, setSchema] = useState<SchemaInfo | null>(null);
   const [open, setOpen] = useState<Open | null>(null);
   const [note, setNote] = useState<Note | null>(null);
+  // `all`, or the kind of row shown; a stable value, so the select is plain.
+  const [source, setSource] = useState<"all" | "manual" | "generated">("all");
   // The row whose `删除` was clicked once, with the tenants granted it (null while read).
   const [deleting, setDeleting] = useState<{ id: string; holders: Tenant[] | string | null } | null>(null);
+  // The public model id whose `停用` is in flight.
+  const [retiring, setRetiring] = useState<string | null>(null);
+  // A refused write: a manual delete, a retire, or a save.
   const [deleteFailure, setDeleteFailure] = useState<{ name: string; error: ApiError } | null>(null);
   const [busy, setBusy] = useState(false);
   // Numbers each holder lookup; a result is applied only while its number is the latest.
@@ -149,6 +182,41 @@ export function Models({ canEdit }: TabProps) {
     models: new Map((models.items ?? []).map((m) => [m.id, m])),
     accounts: new Map((accounts.items ?? []).map((a) => [a.id, a])),
   };
+  // What each generated row came from, by public model id; null until the read.
+  const publicById = publics === null ? null : new Map(publics.map((p) => [p.id, p] as const));
+
+  /**
+   * Reads the public models again. A failed read leaves the last good list
+   * and says so: an empty list would read as "every public model is gone",
+   * which is a different — and false — statement.
+   */
+  async function loadPublics() {
+    try {
+      setPublics(await publicModels.list());
+      setPublicsError(null);
+    } catch (e) {
+      setPublicsError(errorText(e));
+    }
+  }
+
+  // The public models, once per page: they are read to name the 来源 column
+  // and to carry a retire's own counts. Only a failed read retries on 刷新.
+  useEffect(() => {
+    publicModels.list().then(
+      (list) => {
+        setPublics(list);
+        setPublicsError(null);
+      },
+      (e) => setPublicsError(errorText(e)),
+    );
+  }, []);
+
+  // Every read this page needs, together: the row 刷新 and the retire both do.
+  function refresh() {
+    void models.reload();
+    void accounts.reload();
+    void loadPublics();
+  }
 
   // Opening a form clears the last result, a refused delete included.
   function openForm(next: Open) {
@@ -199,7 +267,41 @@ export function Models({ canEdit }: TabProps) {
     }
   }
 
+  /**
+   * Retires the public model a generated row came from. Its answer is the
+   * whole outcome: on success the routing document, every account's direct
+   * document and the account mappings are gone; refused as
+   * `public_model_in_use`, the counts say what still names it.
+   */
+  async function retire(id: string) {
+    const named = publicById?.get(id)?.name;
+    setNote(null);
+    setDeleteFailure(null);
+    setRetiring(id);
+    try {
+      await publicModels.retire(id);
+      setNote({ kind: "ok", text: `已停用公共模型「${named ?? id}」，它生成的模型已删除。` });
+      refresh();
+    } catch (e) {
+      const error = e instanceof ApiError ? e : new ApiError(String(e), 0, "client", [], [], null);
+      setDeleteFailure({ name: named ?? id, error });
+    } finally {
+      setRetiring(null);
+    }
+  }
+
+  // The rows the 来源 filter shows; `generated` is the public model's direct
+  // documents AND its routing document, since both come from that model.
+  const shown = (models.items ?? []).filter((m) => {
+    if (source === "all") return true;
+    const src = modelSource(m);
+    return source === "generated" ? src.kind === "public" : src.kind === "manual";
+  });
+
   const editing = open?.mode === "edit" ? models.items?.find((m) => m.id === open.id) : undefined;
+  // Only an operator's own model has a form here; a generated row is read-only
+  // (a save on it would be refused as `managed_resource` all the same).
+  const editable = editing !== undefined && modelSource(editing).kind === "manual";
   const formProps = {
     catalog,
     schema,
@@ -214,7 +316,7 @@ export function Models({ canEdit }: TabProps) {
       {open?.mode === "new" && (
         <ModelForm key={`new-${open.shape}`} model={null} shape={open.shape} readOnly={false} onReload={() => undefined} {...formProps} />
       )}
-      {editing && (shapeOf(editing.doc) === "direct" || shapeOf(editing.doc) === "routing") && (
+      {editing && editable && (shapeOf(editing.doc) === "direct" || shapeOf(editing.doc) === "routing") && (
         // Keyed by version: a reload that finds a newer version starts the edit over.
         <ModelForm
           key={`${editing.id}:${editing.version}`}
@@ -233,10 +335,7 @@ export function Models({ canEdit }: TabProps) {
             size="sm"
             type="button"
             icon="refresh"
-            onClick={() => {
-              void models.reload();
-              void accounts.reload();
-            }}
+            onClick={refresh}
           >
             刷新
           </Button>
@@ -258,6 +357,18 @@ export function Models({ canEdit }: TabProps) {
           </p>
         )}
         <Msg note={note} />
+        <div className="r">
+          <label className="f filter">
+            <span>来源</span>
+            <select value={source} onChange={(e) => setSource(e.target.value as typeof source)}>
+              {SOURCE_OPTIONS.map((o) => (
+                <option key={o.value} value={o.value}>
+                  {o.label}
+                </option>
+              ))}
+            </select>
+          </label>
+        </div>
         {deleteFailure &&
           (deleteFailure.error.code === "version_mismatch" ? (
             <ConflictNote
@@ -268,7 +379,9 @@ export function Models({ canEdit }: TabProps) {
             />
           ) : (
             <div className="note crit" role="alert">
-              无法删除「{deleteFailure.name}」：{messageFor(deleteFailure.error)}
+              {deleteFailure.error.code === "public_model_in_use"
+                ? inUseText(deleteFailure.error)
+                : `无法删除「${deleteFailure.name}」：${messageFor(deleteFailure.error)}`}
               {deleteFailure.error.referencedBy.length > 0 && (
                 <>
                   <p>被以下资源引用：</p>
@@ -293,15 +406,23 @@ export function Models({ canEdit }: TabProps) {
             上游账号读取失败，账号名与分组无法显示：{messageFor(accounts.error)}
           </div>
         )}
+        {publicsError && (
+          <div className="note crit" role="alert">
+            公共模型读取失败，来源一列的名称无法显示：{publicsError}
+          </div>
+        )}
         {models.items === null ? (
           !models.error && <Loading />
         ) : models.items.length === 0 ? (
           <EmptyState text="还没有模型。" />
+        ) : shown.length === 0 ? (
+          <EmptyState text={source === "manual" ? "没有手工创建的模型。" : "没有由公共模型生成的模型。"} />
         ) : (
           <DataTable>
             <thead>
               <tr>
                 <th>对外名称</th>
+                <th>来源</th>
                 <th>类型</th>
                 <th>上游账号 / 路由目标</th>
                 <th>状态</th>
@@ -309,13 +430,18 @@ export function Models({ canEdit }: TabProps) {
               </tr>
             </thead>
             <tbody>
-              {models.items.map((m) => {
+              {shown.map((m) => {
                 const shape = shapeOf(m.doc);
                 const hasForm = shape === "direct" || shape === "routing";
+                const src = modelSource(m);
+                const from = src.kind === "public" ? publicById?.get(src.id) : undefined;
                 return (
                   <Fragment key={m.id}>
                     <tr>
                       <td>{nameOf(m)}</td>
+                      <td>
+                        <Source model={m} source={src} from={from} publicRead={publicById !== null} catalog={catalog} />
+                      </td>
                       <td>{SHAPE_LABEL[shape]}</td>
                       <td>
                         <Upstream model={m} catalog={catalog} />
@@ -324,7 +450,27 @@ export function Models({ canEdit }: TabProps) {
                         <RolloutBadge rollout={m.rollout} />
                       </td>
                       <td className="right">
-                        {deleting?.id === m.id ? (
+                        {src.kind === "public" ? (
+                          <>
+                            {/* No form here: the row is owned by its public model, so it is changed there. */}
+                            <div className="sub">由公共模型生成，在这里只读</div>
+                            <Button size="sm" onClick={() => onGoto("pricing", "public-models")}>
+                              去公共模型
+                            </Button>
+                            {canEdit && from && (
+                              <TwoStep
+                                label="停用"
+                                size="sm"
+                                busy={retiring === src.id}
+                                busyLabel="停用中…"
+                                // Asked on the row the operator clicked: the warning says what goes,
+                                // or that the retire would be refused and why.
+                                warning={retireWarning(from)}
+                                onConfirm={() => void retire(src.id)}
+                              />
+                            )}
+                          </>
+                        ) : deleting?.id === m.id ? (
                           <>
                             <Button
                               kind="danger"
@@ -358,8 +504,17 @@ export function Models({ canEdit }: TabProps) {
                     </tr>
                     {deleting?.id === m.id && (
                       <tr className="dt-detail">
-                        <td colSpan={5}>
+                        <td colSpan={6}>
                           <DeleteWarning holders={deleting.holders} />
+                        </td>
+                      </tr>
+                    )}
+                    {src.kind === "public" && !from && publicById !== null && (
+                      <tr className="dt-detail">
+                        <td colSpan={6}>
+                          <p className="hint">
+                            它的公共模型「{src.id}」已不在列表里，请刷新；这次停用不能在这里执行。
+                          </p>
                         </td>
                       </tr>
                     )}
@@ -404,6 +559,40 @@ function Upstream({ model, catalog }: { model: Model; catalog: Catalog }) {
     default:
       return <span className="sub">在「全部资源」页查看与编辑</span>;
   }
+}
+
+/**
+ * Where a row comes from: the operator wrote it here, or a public model
+ * generated it. A generated direct document also names the account it serves
+ * through, since several of one public model's rows differ only in that.
+ */
+function Source({
+  model,
+  source,
+  from,
+  publicRead,
+  catalog,
+}: {
+  model: Model;
+  source: ModelSource;
+  /** The public model it came from, once the list is read. */
+  from: PublicModel | undefined;
+  /** Whether that list was read: without it a missing name is not a missing model. */
+  publicRead: boolean;
+  catalog: Catalog;
+}) {
+  if (source.kind === "manual") return <>手工创建</>;
+  const name = from?.name;
+  const account = model.doc.provider_key_id ? catalog.accounts.get(model.doc.provider_key_id) : undefined;
+  return (
+    <>
+      公共模型
+      <div className="sub">
+        {publicRead ? (name ?? `${source.id}（公共模型已不在列表）`) : "…"}
+        {source.generated && ` · 直连${account ? `：${account.doc.display_name || account.id}` : ""}`}
+      </div>
+    </>
+  );
 }
 
 /** What deleting a model withdraws, shown between `删除` and `确认删除` (ruling 13). */

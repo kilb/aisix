@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { expect, test, type Locator, type Page } from "@playwright/test";
 import { STACK_START_TIMEOUT_MS, fundTenant, startStack, type Json, type Stack } from "./stack";
 
@@ -40,6 +41,11 @@ async function openModels(page: Page, as?: { email: string; password: string }):
   const who = as ?? stack.operator;
   await login(page, who.email, who.password);
   await page.getByRole("tab", { name: "模型与路由" }).click();
+}
+
+/** `name` with every regex metacharacter escaped, for a role-name pattern. */
+function escapeRe(name: string): string {
+  return name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 /** The catalog row whose name cell is exactly `name`. */
@@ -463,4 +469,267 @@ test("刷新后列出页面打开后才新增的模型", async ({ page }) => {
 
   await page.getByRole("button", { name: "刷新" }).click();
   await expect(modelRow(page, "late-model-e2e")).toBeVisible();
+});
+
+/** A public model through the real API. */
+async function newPublicModel(name: string): Promise<Json> {
+  return stack.admin.post("/admin/public-models", { name });
+}
+
+/** Maps `publicModelId` on this account, which is how the generate-a-model path starts. */
+async function serve(accountId: string, publicModelId: string): Promise<void> {
+  await stack.admin.put(`/admin/provider-keys/${accountId}/channel-models/${publicModelId}`, {
+    priority: 1,
+    weight: 1,
+  });
+}
+
+/** The 来源 cell of a row whose 对外名称 is exactly `name`. */
+function sourceCell(page: Page, name: string): Locator {
+  return modelRow(page, name).getByRole("cell").nth(1);
+}
+
+/** Filters the catalog by where a row comes from. */
+async function bySource(page: Page, label: string): Promise<void> {
+  await page.getByLabel("来源").selectOption({ label });
+}
+
+/** A live public model's own view. */
+async function publicView(id: string): Promise<Json> {
+  return stack.admin.get(`/admin/public-models/${id}`);
+}
+
+/** Whether the model list still holds a row at `id`. */
+async function modelLive(id: string): Promise<boolean> {
+  return (await status(`/admin/resources/models/${id}`)) === 200;
+}
+
+/** Signs in, opens 上游账号, and one account's 模型 section. */
+async function openAccountModels(page: Page, name: string): Promise<Locator> {
+  await login(page, stack.operator.email, stack.operator.password);
+  await page.locator('[data-tab="providers"]').click();
+  const row = page.getByRole("row", { name: new RegExp(name) });
+  await expect(row).toBeVisible();
+  await row.getByRole("button", { name: /编辑|查看/ }).click();
+  const section = page.getByRole("region", { name: "模型" });
+  await expect(section).toBeVisible();
+  await expect(section.getByText("载入中…")).toHaveCount(0);
+  return section;
+}
+
+test("来源列与筛选：手工创建的模型与公共模型生成的模型各自归位", async ({ page }) => {
+  const suffix = randomUUID().slice(0, 8);
+  const accountName = `acct-source-${suffix}`;
+  const account = await mockAccount(accountName, ["shared"]);
+  const handMade = `chat-source-manual-${suffix}`;
+  await directModel(handMade, account.id, "gpt-source-up-manual");
+  const publicName = `pub-source-${suffix}`;
+  const pub = await newPublicModel(publicName);
+  await serve(account.id, pub.id);
+  // Named `<public>#<account>`, so neither row can be mistaken for the other.
+  const directName = `${publicName}#${accountName}`;
+
+  await openModels(page);
+  // Both rows of the public model, and the hand-made one, are listed.
+  await expect(modelRow(page, publicName)).toBeVisible();
+  await expect(modelRow(page, directName)).toBeVisible();
+  await expect(modelRow(page, handMade)).toBeVisible();
+
+  // The hand-made model's source reads as written here, with no public name.
+  await expect(sourceCell(page, handMade)).toHaveText("手工创建");
+
+  // The public model's routing document names the public model it came from.
+  await expect(sourceCell(page, publicName)).toContainText("公共模型");
+  await expect(sourceCell(page, publicName)).toContainText(publicName);
+  await expect(sourceCell(page, publicName)).not.toContainText(accountName);
+
+  // Its direct document names the same public model, and the account it serves through.
+  await expect(sourceCell(page, directName)).toContainText("公共模型");
+  await expect(sourceCell(page, directName)).toContainText(publicName);
+  await expect(sourceCell(page, directName)).toContainText(accountName);
+
+  await bySource(page, "手工创建");
+  await expect(modelRow(page, handMade)).toBeVisible();
+  await expect(modelRow(page, publicName)).toHaveCount(0);
+  await expect(modelRow(page, directName)).toHaveCount(0);
+
+  await bySource(page, "由公共模型生成");
+  await expect(modelRow(page, publicName)).toBeVisible();
+  await expect(modelRow(page, directName)).toBeVisible();
+  await expect(modelRow(page, handMade)).toHaveCount(0);
+
+  await bySource(page, "全部");
+  await expect(modelRow(page, handMade)).toBeVisible();
+  await expect(modelRow(page, publicName)).toBeVisible();
+});
+
+test("公共模型生成的模型在这里只能停用：停用后两张文档都消失，手工模型不受影响", async ({ page }) => {
+  const suffix = randomUUID().slice(0, 8);
+  const accountName = `acct-retire-row-${suffix}`;
+  const account = await mockAccount(accountName, ["shared"]);
+  const handMade = `chat-retire-manual-${suffix}`;
+  const kept = await directModel(handMade, account.id, "gpt-retire-up-manual");
+  const publicName = `pub-retire-row-${suffix}`;
+  const pub = await newPublicModel(publicName);
+  await serve(account.id, pub.id);
+  const directName = `${publicName}#${accountName}`;
+
+  await openModels(page);
+  const routeRow = modelRow(page, publicName);
+  await expect(routeRow).toBeVisible();
+  await expect(routeRow).toContainText("路由");
+  const directRow = modelRow(page, directName);
+  await expect(directRow).toBeVisible();
+
+  // The delete that cannot work is gone: a generated row offers 停用, not 删除.
+  // (Before this change it offered 删除, whose confirmation answered
+  // `409 managed_resource` and left the row in place.)
+  await expect(routeRow.getByRole("button", { name: "删除", exact: true })).toHaveCount(0);
+  await expect(directRow.getByRole("button", { name: "删除", exact: true })).toHaveCount(0);
+  // 编辑 led to a save that would have been refused too; it leads to the public model instead.
+  await expect(routeRow.getByRole("button", { name: /编辑|查看/, exact: true })).toHaveCount(0);
+  await expect(routeRow.getByRole("button", { name: "去公共模型" })).toBeVisible();
+  // And it says why it has no form here, rather than leaving the operator guessing.
+  await expect(routeRow).toContainText("由公共模型生成，在这里只读");
+
+  // An enabled account still serves it, so the retire is refused: the
+  // warning says so before the confirmation, and the answer says why.
+  await routeRow.getByRole("button", { name: "停用", exact: true }).click();
+  const warning = routeRow.getByRole("alert");
+  await expect(warning).toContainText("1 个启用的账号");
+  await expect(warning).toContainText("停用会被拒绝");
+  await routeRow.getByRole("button", { name: "确认停用" }).click();
+  await expect(page.getByRole("alert").filter({ hasText: "无法停用" })).toContainText("启用的账号 1");
+  expect((await publicView(pub.id)).retired_at).toBeNull();
+  expect(await modelLive(pub.id)).toBe(true);
+
+  // With nothing naming it any more, the same two clicks retire it.
+  await stack.admin.del(`/admin/provider-keys/${account.id}/channel-models/${pub.id}`);
+  await page.reload();
+  await page.getByRole("tab", { name: "模型与路由" }).click();
+  const again = modelRow(page, publicName);
+  await expect(again).toBeVisible();
+  await again.getByRole("button", { name: "停用", exact: true }).click();
+  await expect(again.getByRole("alert")).toContainText("停用后不能恢复");
+  await expect(again.getByRole("alert")).toContainText("路由文档");
+  await again.getByRole("button", { name: "确认停用" }).click();
+
+  // Both documents the public model owned are gone, and the page says what happened.
+  await expect(page.getByText(`已停用公共模型「${publicName}」`)).toBeVisible();
+  await expect(modelRow(page, publicName)).toHaveCount(0, { timeout: APPLIED_WITHIN_MS });
+  await expect(modelRow(page, directName)).toHaveCount(0);
+  expect(await modelLive(pub.id)).toBe(false);
+  expect((await publicView(pub.id)).retired_at).not.toBeNull();
+  // The hand-made model is untouched.
+  expect(await modelLive(kept.id)).toBe(true);
+  await expect(modelRow(page, handMade)).toBeVisible();
+});
+
+test("账号页的删除模型：只有这个账号在用时会移除映射并停用公共模型", async ({ page }) => {
+  const suffix = randomUUID().slice(0, 8);
+  const accountName = `acct-del-model-${suffix}`;
+  const account = await mockAccount(accountName, ["shared"]);
+  const publicName = `pub-del-model-${suffix}`;
+  const pub = await newPublicModel(publicName);
+  await serve(account.id, pub.id);
+  const directName = `${publicName}#${accountName}`;
+
+  const section = await openAccountModels(page, accountName);
+  const row = section.getByRole("row", { name: new RegExp(`^服务 ${escapeRe(publicName)}(?:\\s|$)`) });
+  await expect(row).toBeVisible();
+  await row.getByRole("button", { name: "删除模型" }).click();
+  const warning = row.getByRole("alert");
+  await expect(warning).toContainText(publicName);
+  await expect(warning).toContainText("先移除本账号对它的映射，再停用它");
+  // Nothing else holds it once this account's row goes, so the confirmation
+  // promises the deletion rather than a refusal.
+  await expect(warning).toContainText("停用后不能恢复");
+  await expect(warning).toContainText("将删除它的路由文档");
+  await row.getByRole("button", { name: "确认删除模型" }).click();
+
+  // Both writes happened, and the page says so in the success voice.
+  await expect(section.getByText(`已删除「${publicName}」`)).toBeVisible();
+  await expect(section.getByText("本账号的映射和它生成的模型都已移除")).toBeVisible();
+  expect((await publicView(pub.id)).retired_at).not.toBeNull();
+  expect(await modelLive(pub.id)).toBe(false);
+  // The generated document and the account's mapping are gone with it.
+  const { items } = await stack.admin.get("/admin/resources/models");
+  expect((items as Json[]).some((m) => m.doc.display_name === directName)).toBe(false);
+  const table = await stack.admin.get(`/admin/provider-keys/${account.id}/channel-models`);
+  expect((table.items as Json[]).some((i) => i.public_model_id === pub.id)).toBe(false);
+  // The checklist is read again: the public model is no longer offered.
+  await expect(section.getByRole("row", { name: new RegExp(`^服务 ${escapeRe(publicName)}(?:\\s|$)`) })).toHaveCount(0);
+});
+
+test("账号页的删除模型：租户还授权着它时，说明映射已移除而模型保留，模型仍在列表里", async ({ page }) => {
+  const suffix = randomUUID().slice(0, 8);
+  const accountName = `acct-del-hold-${suffix}`;
+  const account = await mockAccount(accountName, ["shared"]);
+  const publicName = `pub-del-hold-${suffix}`;
+  const pub = await newPublicModel(publicName);
+  await serve(account.id, pub.id);
+  // A tenant granted it, and one key of that tenant naming it: the count the
+  // refusal carries, and the reason the model stays.
+  const { tenant } = await grantedTenant(`tenant-del-hold-${suffix}`, [pub.id]);
+
+  const section = await openAccountModels(page, accountName);
+  const row = section.getByRole("row", { name: new RegExp(`^服务 ${escapeRe(publicName)}(?:\\s|$)`) });
+  await row.getByRole("button", { name: "删除模型" }).click();
+  await row.getByRole("button", { name: "确认删除模型" }).click();
+
+  // The partial outcome, unmistakably: the mapping went, the model did not.
+  const partial = section.getByRole("alert").filter({ hasText: "本账号的映射已移除" });
+  await expect(partial).toBeVisible();
+  await expect(partial).toContainText("「" + publicName + "」没有停用，仍然存在");
+  await expect(partial).toContainText("1 个租户、1 个密钥的授权");
+  await expect(partial).toContainText("从租户与密钥中移除它");
+  // Never the success sentence, and never a plain failure either.
+  await expect(section.getByText("都已移除")).toHaveCount(0);
+
+  // The mapping is gone, and the account no longer serves it.
+  const table = await stack.admin.get(`/admin/provider-keys/${account.id}/channel-models`);
+  const served = (table.items as Json[]).find((i) => i.public_model_id === pub.id);
+  expect(served?.served).toBe(false);
+  // The model stayed live, with its routing document, and the tenant keeps its grant.
+  const view = await publicView(pub.id);
+  expect(view.retired_at).toBeNull();
+  expect(view.tenants).toBe(1);
+  expect(await modelLive(pub.id)).toBe(true);
+  expect((await stack.admin.get(`/admin/tenants/${tenant.id}`)).allowed_model_ids).toEqual([pub.id]);
+
+  // 价格 · 公共模型 still lists it: the operator sees it where it can be handled.
+  await page.locator('[data-tab="pricing"]').click();
+  await page.getByRole("group", { name: "价格分区" }).getByRole("button", { name: "公共模型", exact: true }).click();
+  const panel = page.locator(".panel").filter({ has: page.getByRole("heading", { name: "公共模型", level: 2 }) });
+  await expect(panel.getByRole("row", { name: new RegExp(`^${escapeRe(publicName)}(?:\\s|$)`) })).toBeVisible();
+
+  // And the catalog keeps both its rows: the routing document is still there,
+  // the direct one for this account is not.
+  await page.getByRole("tab", { name: "模型与路由" }).click();
+  await expect(modelRow(page, publicName)).toBeVisible();
+  await expect(modelRow(page, `${publicName}#${accountName}`)).toHaveCount(0);
+});
+
+test("只读运维在账号页看得到模型，但没有删除模型的入口", async ({ page }) => {
+  const suffix = randomUUID().slice(0, 8);
+  const accountName = `acct-del-viewer-${suffix}`;
+  const account = await mockAccount(accountName, ["shared"]);
+  const publicName = `pub-del-viewer-${suffix}`;
+  const pub = await newPublicModel(publicName);
+  await serve(account.id, pub.id);
+  const viewer = { email: `viewer-del-${suffix}@e2e.local`, password: "viewer-del-pass-9f1" };
+  const created = await stack.admin.request("POST", "/admin/operators", { ...viewer, role: "viewer" });
+  expect(created.status, created.text).toBe(201);
+
+  await login(page, viewer.email, viewer.password);
+  await page.locator('[data-tab="providers"]').click();
+  const row = page.getByRole("row", { name: new RegExp(accountName) });
+  await row.getByRole("button", { name: "查看" }).click();
+  const section = page.getByRole("region", { name: "模型" });
+  await expect(section).toBeVisible();
+  await expect(section.getByText("载入中…")).toHaveCount(0);
+  // The row is visible; the action is not, and nothing changed.
+  await expect(section.getByRole("row", { name: new RegExp(`^服务 ${escapeRe(publicName)}(?:\\s|$)`) })).toBeVisible();
+  await expect(section.getByRole("button", { name: "删除模型" })).toHaveCount(0);
+  expect((await publicView(pub.id)).retired_at).toBeNull();
 });
