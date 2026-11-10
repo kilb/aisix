@@ -811,12 +811,13 @@ struct MetricsInner {
     /// Populated on the registration path only (a worker-cache miss), so
     /// the steady-state emit never touches this lock.
     retirable: Mutex<HashMap<Box<str>, RetirableSeries>>,
-    /// Bumped whenever a sweep forgets a [`GaugeLiveness::Gone`] series. It
-    /// is part of every retirable family's worker-cache key, so a write
-    /// after the bump misses the cache and registers the series again: a
-    /// request that resolved a deleted key before the sweep would
-    /// otherwise write its old snapshot through a cached handle, leaving a
-    /// finite value no later sweep knows about.
+    /// Bumped whenever a sweep forgets a [`GaugeLiveness::Gone`] series. A
+    /// worker that sees it move drops its gauge handles
+    /// ([`Metrics::cached_retirable_gauge`]), so a write after the bump
+    /// misses the cache and registers the series again: a request that
+    /// resolved a deleted key before the sweep would otherwise write its
+    /// old snapshot through a cached handle, leaving a finite value no later
+    /// sweep knows about.
     retire_epoch: std::sync::atomic::AtomicU64,
     /// Runtimes and stores read at scrape time by [`Metrics::sync_memory`].
     memory: crate::memory::MemoryProbes,
@@ -1152,6 +1153,10 @@ struct WorkerCache {
     /// place and allocates nothing; only a first-sight miss allocates the
     /// stored `Box<str>`.
     key_buf: String,
+    /// The `Metrics` instance and its [`MetricsInner::retire_epoch`] this
+    /// worker's gauge handles were taken under. See
+    /// [`Metrics::cached_retirable_gauge`].
+    gauge_epoch: (usize, u64),
 }
 
 thread_local! {
@@ -1238,16 +1243,6 @@ impl WorkerKey<'_> {
     fn label_bool(&mut self, value: bool) {
         self.buf.push(WORKER_KEY_SEP);
         self.buf.push(if value { 't' } else { 'f' });
-    }
-
-    /// A retirable family's [`Metrics::retire_epoch`], as fixed-width hex.
-    fn label_epoch(&mut self, value: u64) {
-        const HEX: &[u8; 16] = b"0123456789abcdef";
-        self.buf.push(WORKER_KEY_SEP);
-        for shift in (0..16).rev() {
-            self.buf
-                .push(char::from(HEX[((value >> (shift * 4)) & 0xf) as usize]));
-        }
     }
 }
 
@@ -1530,8 +1525,9 @@ impl Metrics {
         );
     }
 
-    /// The current [`MetricsInner::retire_epoch`], read into a retirable
-    /// family's worker-cache key.
+    /// The current [`MetricsInner::retire_epoch`], compared by a retirable
+    /// family's emit against the one its worker's gauge handles were taken
+    /// under.
     fn retire_epoch(&self) -> u64 {
         self.inner
             .retire_epoch
@@ -2371,6 +2367,11 @@ impl Metrics {
         WORKER_CACHE.with(|cell| cell.borrow().usage_series.len())
     }
 
+    #[cfg(test)]
+    fn worker_gauges_len() -> usize {
+        WORKER_CACHE.with(|cell| cell.borrow().gauges.len())
+    }
+
     fn with_request_series(
         &self,
         labels: RequestLabels<'_>,
@@ -2466,6 +2467,33 @@ impl Metrics {
             || metrics::with_local_recorder(&self.inner.recorder, register),
             |gauge| gauge.set(value),
         );
+    }
+
+    /// [`Self::cached_gauge`] for a retirable family. The first such emit on
+    /// a worker after a sweep moved [`MetricsInner::retire_epoch`] drops the
+    /// worker's gauge handles, so it registers its series again (and the
+    /// next sweep can retire it) instead of writing through a handle to a
+    /// series the registry forgot. Dropping them replaces each one in
+    /// place: an epoch kept in the key instead would leave every earlier
+    /// epoch's handles in the map until the capacity valve evicted them.
+    /// Re-registering a series that was never retired returns a handle to
+    /// the same storage.
+    fn cached_retirable_gauge(
+        &self,
+        site: &'static str,
+        value: f64,
+        build_key: impl FnOnce(&mut WorkerKey<'_>),
+        register: impl FnOnce() -> metrics::Gauge,
+    ) {
+        let seen = (Arc::as_ptr(&self.inner) as usize, self.retire_epoch());
+        WORKER_CACHE.with(|cell| {
+            let cache = &mut *cell.borrow_mut();
+            if cache.gauge_epoch != seen {
+                cache.gauges.clear();
+                cache.gauge_epoch = seen;
+            }
+        });
+        self.cached_gauge(site, value, build_key, register);
     }
 
     /// Record into a worker-cached histogram, same contract as
@@ -2837,14 +2865,13 @@ impl Metrics {
         tokens: Option<u64>,
     ) {
         if let Some(value) = requests {
-            self.cached_gauge(
+            self.cached_retirable_gauge(
                 M_RATELIMIT_REMAINING_REQUESTS,
                 value as f64,
                 |k| {
                     k.label(api_key_id);
                     k.label(api_key_name);
                     k.label(model);
-                    k.label_epoch(self.retire_epoch());
                 },
                 || {
                     self.track_retirable(
@@ -2866,14 +2893,13 @@ impl Metrics {
             );
         }
         if let Some(value) = tokens {
-            self.cached_gauge(
+            self.cached_retirable_gauge(
                 M_RATELIMIT_REMAINING_TOKENS,
                 value as f64,
                 |k| {
                     k.label(api_key_id);
                     k.label(api_key_name);
                     k.label(model);
-                    k.label_epoch(self.retire_epoch());
                 },
                 || {
                     self.track_retirable(
@@ -2898,7 +2924,7 @@ impl Metrics {
 
     /// Shared cached emit for the budget gauge family.
     fn cached_budget_gauge(&self, metric: &'static str, labels: BudgetLabels<'_>, value: f64) {
-        self.cached_gauge(
+        self.cached_retirable_gauge(
             metric,
             value,
             |k| {
@@ -2908,7 +2934,6 @@ impl Metrics {
                 k.label(labels.team_name);
                 k.label(labels.user_id);
                 k.label(labels.user_name);
-                k.label_epoch(self.retire_epoch());
             },
             || {
                 self.track_retirable(
@@ -6091,6 +6116,36 @@ mod tests {
             m.render()
         );
         assert_eq!(requests(&m, "ak-live"), "8");
+    }
+
+    /// Every sweep that forgets a series moves the retire epoch. The handles
+    /// a worker took under an earlier epoch must not stay in its gauge map
+    /// beside the new ones: each sweep would otherwise leave one orphan per
+    /// series the worker writes, until the capacity valve evicted entries
+    /// at random.
+    #[test]
+    fn a_moved_retire_epoch_leaves_no_orphaned_gauge_handles() {
+        let m = Metrics::new(false);
+        let live = |series: LiveGaugeSeries<'_>| match series {
+            LiveGaugeSeries::RatelimitRemaining { api_key_id, .. } => api_key_id != "ak-gone",
+            _ => true,
+        };
+        for round in 0..20 {
+            m.set_rate_limit_remaining("ak-gone", "unknown", "gpt", Some(round), None);
+            m.set_rate_limit_remaining("ak-live", "unknown", "gpt", Some(round), None);
+            m.retire_stale_gauges(live);
+        }
+        m.set_rate_limit_remaining("ak-live", "unknown", "gpt", Some(99), None);
+        assert!(
+            Metrics::worker_gauges_len() <= 2,
+            "{} gauge handles cached for 2 series",
+            Metrics::worker_gauges_len()
+        );
+        let line = series_lines(&m.render(), M_RATELIMIT_REMAINING_REQUESTS)
+            .into_iter()
+            .find(|l| l.contains("api_key_id=\"ak-live\""))
+            .map(str::to_owned);
+        assert!(line.is_some_and(|l| l.ends_with(" 99")));
     }
 
     /// The same for the rate-limit gauges and `api_key_name`.
