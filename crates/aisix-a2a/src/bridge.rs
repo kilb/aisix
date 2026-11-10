@@ -126,6 +126,17 @@ fn scrub_strings(value: &mut serde_json::Value) {
     }
 }
 
+/// A JSON-RPC envelope's `error` member through [`scrub_strings`]. An error is
+/// the agent's own failure, relayed to the caller, so it passes the shared
+/// scrubber as an LLM upstream's error does — on a unary answer, on the JSON
+/// answer to a streaming call, and on every streamed event alike. A `result`
+/// is the agent's answer and is left as sent.
+fn scrub_error_member(envelope: &mut serde_json::Value) {
+    if let Some(error) = envelope.get_mut("error") {
+        scrub_strings(error);
+    }
+}
+
 /// Convert reqwest failures without ever retaining the request URL. Reqwest's
 /// default Display includes it, including path/query values that may contain
 /// tenant secrets in rows written before URL validation was tightened.
@@ -322,8 +333,12 @@ pub fn upstream_from_a2a_agent(agent: &A2aAgent) -> A2aUpstream {
 pub struct AgentCard {
     /// The agent's advertised name.
     pub name: String,
-    /// The A2A service endpoint the agent advertises for itself.
-    pub url: String,
+    /// The A2A service endpoint the agent advertises for itself, on a 0.3
+    /// card. A 1.0 card has no such field: its endpoints are the `url`s
+    /// inside `supportedInterfaces`, which stay in [`Self::rest`]. Absent, it
+    /// is omitted again when the card is re-serialized.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
     /// Every other agent-card field, preserved verbatim for lossless round-trip.
     #[serde(flatten)]
     pub rest: serde_json::Map<String, serde_json::Value>,
@@ -581,11 +596,7 @@ impl A2aBridge for HttpBridge {
         let bytes = read_capped(resp).await?;
         let mut value = serde_json::from_slice::<serde_json::Value>(&bytes)
             .map_err(|e| A2aError::Request(format!("malformed JSON-RPC response: {e}")))?;
-        // A JSON-RPC error is the agent's own failure, relayed to the caller:
-        // it passes the shared scrubber, as an LLM upstream's error does.
-        if let Some(error) = value.get_mut("error") {
-            scrub_strings(error);
-        }
+        scrub_error_member(&mut value);
         Ok(value)
     }
 
@@ -601,8 +612,13 @@ impl A2aBridge for HttpBridge {
         // otherwise pin this request, and the quota slot it holds, forever.
         // `reqwest`'s own `.timeout()` cannot express that: it covers reading
         // the body too, so it would cap the stream's whole life.
-        let resp = tokio::time::timeout(
-            self.upstream.timeout,
+        //
+        // Opening ends when there is a stream to hand back: the response head
+        // for an SSE answer, and the whole body for the JSON one below, which
+        // is read before anything is returned. One deadline covers both.
+        let deadline = tokio::time::Instant::now() + self.upstream.timeout;
+        let resp = tokio::time::timeout_at(
+            deadline,
             self.prepare(
                 self.endpoint
                     .clone()
@@ -644,12 +660,17 @@ impl A2aBridge for HttpBridge {
                     .starts_with(SSE_CONTENT_TYPE)
             });
         if !is_sse {
-            let bytes = read_capped(resp).await?;
-            let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| {
+            let bytes = tokio::time::timeout_at(deadline, read_capped(resp))
+                .await
+                .map_err(|_| {
+                    A2aError::Request("timed out reading the upstream response".to_string())
+                })??;
+            let mut value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| {
                 A2aError::Request(format!(
                     "upstream answered a streaming call with neither SSE nor JSON: {e}"
                 ))
             })?;
+            scrub_error_member(&mut value);
             return Ok(Box::pin(futures::stream::once(async move { Ok(value) })));
         }
         Ok(Box::pin(sse_events(resp)))
@@ -725,9 +746,10 @@ fn parse_sse_frame(frame: &[u8]) -> Result<Option<serde_json::Value>, A2aError> 
     if payload.is_empty() {
         return Ok(None);
     }
-    serde_json::from_str(payload)
-        .map(Some)
-        .map_err(|e| A2aError::Request(format!("malformed JSON-RPC event: {e}")))
+    let mut event: serde_json::Value = serde_json::from_str(payload)
+        .map_err(|e| A2aError::Request(format!("malformed JSON-RPC event: {e}")))?;
+    scrub_error_member(&mut event);
+    Ok(Some(event))
 }
 
 #[cfg(test)]
