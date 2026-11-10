@@ -124,7 +124,7 @@ function ownerOf(k: AdminKey, tenant: Tenant, members: Member[] | null): string 
 }
 
 /** The models key `k` may call, by name; a selected model the tenant no longer grants is marked. */
-function modelsOf(k: AdminKey, tenant: Tenant, names: Map<string, string>): string {
+function modelsOf(k: AdminKey, tenant: Tenant, names: Map<string, string> | null): string {
   return keyModels(k, tenant, names);
 }
 
@@ -213,8 +213,10 @@ function TenantKeys({ tenantId, canEdit, tick }: { tenantId: string; canEdit: bo
     void refresh();
   }, [refresh]);
 
+  // `null` until the catalogue is read, so a key's models can tell "the list
+  // is not here yet" from "this model was deleted".
   const names = useMemo(
-    () => new Map((catalog.data ?? []).map((m) => [m.id, m.doc.display_name || m.id])),
+    () => (catalog.data === null ? null : new Map(catalog.data.map((m) => [m.id, m.doc.display_name || m.id]))),
     [catalog.data],
   );
   const choices = useMemo(() => {
@@ -598,7 +600,8 @@ function CreateForm({
   onCancel,
 }: {
   tenant: Tenant;
-  names: Map<string, string>;
+  /** `null` until the catalogue is read: a key's models tell "not loaded" from "deleted" by it. */
+  names: Map<string, string> | null;
   catalogError: string | null;
   /** The groups a key of this tenant may take: its own for a customer, every live one for the platform's. */
   choices: GroupChoice[];
@@ -622,7 +625,10 @@ function CreateForm({
   const grants = useMemo(
     () =>
       tenant.allowed_model_ids
-        .map((id) => ({ id, name: names.get(id) ?? id }))
+        // The grant picker is built from the tenant's own list, so a name
+        // missing here is a model the catalogue has not loaded yet; the id
+        // is the honest fallback.
+        .map((id) => ({ id, name: names?.get(id) ?? id }))
         .sort((a, b) => a.name.localeCompare(b.name)),
     [tenant.allowed_model_ids, names],
   );

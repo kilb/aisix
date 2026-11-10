@@ -47,8 +47,18 @@ test("an empty selection is none, and a name pattern is shown as written", () =>
   );
 });
 
-test("an id with no catalog entry falls back to the id, still unmarked on all scope", () => {
+test("an id the catalogue does not hold is a deleted model, not a bare uuid", () => {
   const GONE = "b2c1e0f4-1111-4a2b-9c3d-000000000003";
-  assert.equal(keyModels({ model_ids: [GONE] }, allScope, names), GONE);
-  assert.equal(keyModels({ model_ids: [GONE] }, selected, names), `${GONE}（租户未授权）`);
+  assert.equal(keyModels({ model_ids: [GONE] }, allScope, names), `${GONE}（已删除的模型）`);
+  assert.equal(
+    keyModels({ model_ids: [GONE] }, selected, names),
+    `${GONE}（已删除的模型）（租户未授权）`,
+  );
+});
+
+test("an unread catalogue shows the id bare, because nothing says it is gone", () => {
+  // `null` is "not read", which is not the same statement as "not found":
+  // labelling a model deleted while the list is still loading would be a
+  // different, false claim.
+  assert.equal(keyModels({ model_ids: [CHAT] }, allScope, null), CHAT);
 });
