@@ -554,13 +554,10 @@ fn systemone_keys(questions: &[Question]) -> Vec<String> {
     }
 }
 
-/// Write the request a System One upstream receives.
+/// Write the request a System One upstream receives. System One has no
+/// field for a Decisions `safety_identifier`, an end-user id for abuse
+/// detection that changes nothing about the question, so it is left out.
 pub(crate) fn to_systemone_request(model: &str, req: &Request) -> Result<Json, String> {
-    if req.safety_identifier.is_some() {
-        return Err(
-            "`safety_identifier` is supported only when the model is served by OpenAI".into(),
-        );
-    }
     let state = match &req.input {
         Input::State(state) => state.clone(),
         Input::Messages(messages) => {
@@ -1725,6 +1722,21 @@ mod tests {
         );
     }
 
+    /// A `safety_identifier` changes nothing about the question and System
+    /// One has no field for it, so the System One request goes without it.
+    #[test]
+    fn a_safety_identifier_is_left_out_of_a_systemone_request() {
+        let sid = parse_decisions_request(&parse(
+            r#"{"input":"x","safety_identifier":"u1","questions":[{"type":"predicate","instructions":"?"}]}"#,
+        ))
+        .unwrap();
+        let out = serde_json::to_value(to_systemone_request("jev", &sid).unwrap()).unwrap();
+        assert_eq!(out["model"], "jev");
+        assert_eq!(out["state"], "x");
+        assert_eq!(out["questions"]["0"]["type"], "noul");
+        assert!(out.get("safety_identifier").is_none(), "{out}");
+    }
+
     #[test]
     fn lossy_requests_are_refused_rather_than_degraded() {
         let image = parse_decisions_request(&parse(
@@ -1735,14 +1747,6 @@ mod tests {
         assert!(to_systemone_request("jev", &image)
             .unwrap_err()
             .contains("input_image"));
-
-        let sid = parse_decisions_request(&parse(
-            r#"{"input":"x","safety_identifier":"u1","questions":[{"type":"predicate","instructions":"?"}]}"#,
-        ))
-        .unwrap();
-        assert!(to_systemone_request("jev", &sid)
-            .unwrap_err()
-            .contains("safety_identifier"));
 
         let single = parse_systemone_request(&parse(
             r#"{"state":"x","questions":{"c":{"type":"choice","criteria":{"only":null}}}}"#,
