@@ -1,6 +1,6 @@
 # Handover — Routio platform on the AISIX gateway
 
-Written 2026-11-10 at `main` = `9e1fcefa` (the P5 batch plus this document), for whoever — person or agent — picks this up next. It assumes no context from earlier sessions. Read it once end to end, then read the `CLAUDE.md` / `AGENTS.md` files it points at: those are the binding rules, this is the map.
+Written 2026-11-10 at `main` = `dad89946` (the P5 batch plus this document), for whoever — person or agent — picks this up next. It assumes no context from earlier sessions. Read it once end to end, then read the `CLAUDE.md` / `AGENTS.md` files it points at: those are the binding rules, this is the map.
 
 ---
 
@@ -159,7 +159,7 @@ $KIT/gp-upgrade.sh rollback <gateway|cp|all>
 
 ## 5. Current state (2026-11-10)
 
-**Live on routio.ai**: signup (rate-limited), tenant approval, groups and rates, public models and channel mapping including bulk fetch from an upstream account, baselines plus an imported price library with one-click attested sync, cost rate per account, the CNY ledger with top-ups/credits/quotas/re-pricing, the tenant portal, and API key plaintext reveal.
+**Live on routio.ai** (runs `dad89946`): signup (rate-limited), tenant approval, groups and rates, public models and channel mapping including bulk fetch from an upstream account, baselines plus an imported price library with one-click attested sync, cost rate per account, the CNY ledger with top-ups/credits/quotas/re-pricing, the tenant portal, and API key plaintext reveal.
 
 **Done in the platform plan**: P0 (gateway), P1 (control plane + Dashboard), P2 (pricing and billing), P3 (deploy), the group-pricing phase, the P4 dependency and quota-reduction batch, and the P5 batch (cost rate, price library, key reveal, Routio branding, credit limit in both modes). PRs #64 and #79 merged.
 
