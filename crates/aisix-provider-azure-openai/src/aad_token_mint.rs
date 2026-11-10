@@ -384,12 +384,14 @@ impl TokenMinter {
             // (<https://learn.microsoft.com/en-us/entra/msal/dotnet/advanced/client-and-server-throttling>).
             // Every other 4xx (invalid_client / unauthorized_client /
             // revoked secret) is operator-actionable, stays Config.
-            return Err(if status.is_server_error() || status == StatusCode::TOO_MANY_REQUESTS {
-                BridgeError::upstream_status_with_retry_after(status.as_u16(), msg, retry_after)
-                    .with_body_read_error(read_error)
-            } else {
-                BridgeError::Config(msg)
-            });
+            return Err(
+                if status.is_server_error() || status == StatusCode::TOO_MANY_REQUESTS {
+                    BridgeError::upstream_status_with_retry_after(status.as_u16(), msg, retry_after)
+                        .with_body_read_error(read_error)
+                } else {
+                    BridgeError::Config(msg)
+                },
+            );
         }
         let parsed: TokenResponse = resp.json().await.map_err(|e| {
             aisix_gateway::log_body_read_causes(&e);

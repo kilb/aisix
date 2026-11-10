@@ -6329,8 +6329,7 @@ mod tests {
         let model = "anthropic.claude-sonnet-4-20250514-v1:0";
 
         let body =
-            capture_bedrock_body(model, "converse", &claude_on_converse(Some("high")), false)
-                .await;
+            capture_bedrock_body(model, "converse", &claude_on_converse(Some("high")), false).await;
         assert_eq!(
             body["additionalModelRequestFields"]["thinking"]["type"], "enabled",
             "body={body}"
@@ -6347,7 +6346,8 @@ mod tests {
         // Without thinking the tool is still forced.
         let body = capture_bedrock_body(model, "converse", &claude_on_converse(None), false).await;
         assert!(
-            body.pointer("/additionalModelRequestFields/thinking").is_none(),
+            body.pointer("/additionalModelRequestFields/thinking")
+                .is_none(),
             "body={body}"
         );
         assert_eq!(

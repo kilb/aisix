@@ -343,12 +343,14 @@ impl TokenMinter {
             // `oauth2/_client.py` `_can_retry`). Every other 4xx
             // (invalid_grant / bad SA / clock skew) IS
             // operator-actionable, so it stays Config.
-            return Err(if status.is_server_error() || status == StatusCode::TOO_MANY_REQUESTS {
-                BridgeError::upstream_status_with_retry_after(status.as_u16(), msg, retry_after)
-                    .with_body_read_error(read_error)
-            } else {
-                BridgeError::Config(msg)
-            });
+            return Err(
+                if status.is_server_error() || status == StatusCode::TOO_MANY_REQUESTS {
+                    BridgeError::upstream_status_with_retry_after(status.as_u16(), msg, retry_after)
+                        .with_body_read_error(read_error)
+                } else {
+                    BridgeError::Config(msg)
+                },
+            );
         }
         let parsed: TokenResponse = resp.json().await.map_err(|e| {
             aisix_gateway::log_body_read_causes(&e);

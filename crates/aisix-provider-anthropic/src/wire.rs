@@ -7736,9 +7736,18 @@ mod tests {
     #[test]
     fn extras_shape_carries_service_tier_in_openai_vocabulary() {
         for (sent, want) in [
-            (Some(serde_json::json!("standard_only")), Some(serde_json::json!("default"))),
-            (Some(serde_json::json!("auto")), Some(serde_json::json!("auto"))),
-            (Some(serde_json::json!("priority")), Some(serde_json::json!("priority"))),
+            (
+                Some(serde_json::json!("standard_only")),
+                Some(serde_json::json!("default")),
+            ),
+            (
+                Some(serde_json::json!("auto")),
+                Some(serde_json::json!("auto")),
+            ),
+            (
+                Some(serde_json::json!("priority")),
+                Some(serde_json::json!("priority")),
+            ),
             (Some(serde_json::Value::Null), None),
             (None, None),
         ] {
