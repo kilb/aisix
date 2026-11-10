@@ -1,0 +1,19 @@
+-- A key's plaintext, sealed under the master key, so its owner can copy it
+-- again rather than only once at creation. The value is
+-- `aisixsealed.v1.` and base64url of `nonce || ciphertext || tag`, sealed
+-- for the slot `cp:key:<id>`; `crypto::MasterKey::seal_text` writes it and
+-- `open_text` reads it. Only the reveal routes open it (`keys::reveal_*`),
+-- and each reads it for one row at a time: no list, document or audit row
+-- carries it.
+--
+-- Nullable, and left NULL for every row that exists when this runs: a key
+-- minted before this release kept no plaintext at all, and nothing here can
+-- invent the value it would have had. A reveal of such a row is refused
+-- with `409 plaintext_unavailable` ("该密钥创建于旧版本，无法再次查看；如需
+-- 明文请新建密钥") rather than answered with anything derived. Revocation
+-- clears the column as well: a revoked key authenticates nothing, and a
+-- sealed copy of its plaintext is then only something to lose.
+--
+-- The column is additive and the gateway document does not carry it: the
+-- hash, and how a key authenticates, are unchanged.
+ALTER TABLE tenant_keys ADD COLUMN sealed_plaintext text;

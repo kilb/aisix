@@ -13,8 +13,6 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::LazyLock;
 
 use aisix_core::credentials::{visit_credentials, CredentialSlot, REDACTED};
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use base64::Engine;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
@@ -24,8 +22,9 @@ use crate::crypto::{CryptoError, MasterKey};
 use crate::error::Detail;
 
 /// What a sealed value starts with; the rest is
-/// `base64url(nonce || ciphertext || tag)` without padding.
-pub const SEALED_PREFIX: &str = "aisixsealed.v1.";
+/// `base64url(nonce || ciphertext || tag)` without padding. Defined with
+/// the scheme itself ([`crate::crypto::SEALED_PREFIX`]).
+pub use crate::crypto::SEALED_PREFIX;
 
 /// The additional authenticated data a slot is sealed with, which binds the
 /// sealed value to this slot of this row.
@@ -90,8 +89,8 @@ pub fn seal(mk: &MasterKey, kind: Kind, id: Uuid, doc: &mut Value) {
         if plain.starts_with(SEALED_PREFIX) {
             return;
         }
-        let sealed = mk.seal(aad(kind, id, &slot.field_key).as_bytes(), plain.as_bytes());
-        *value = Value::String(format!("{SEALED_PREFIX}{}", URL_SAFE_NO_PAD.encode(sealed)));
+        let sealed = mk.seal_text(aad(kind, id, &slot.field_key).as_bytes(), plain);
+        *value = Value::String(sealed);
     });
 }
 
@@ -104,14 +103,12 @@ pub fn unseal(mk: &MasterKey, kind: Kind, id: Uuid, doc: &mut Value) -> Result<(
         if failed.is_some() {
             return;
         }
-        let Some(sealed) = value.as_str().and_then(|v| v.strip_prefix(SEALED_PREFIX)) else {
+        let Some(sealed) = value.as_str().filter(|v| v.starts_with(SEALED_PREFIX)) else {
             return;
         };
-        let opened = URL_SAFE_NO_PAD
-            .decode(sealed)
-            .map_err(|_| CryptoError::Open)
-            .and_then(|bytes| mk.open(aad(kind, id, &slot.field_key).as_bytes(), &bytes))
-            .and_then(|plain| String::from_utf8(plain).map_err(|_| CryptoError::Open));
+        let opened = mk
+            .open_text(aad(kind, id, &slot.field_key).as_bytes(), sealed)
+            .map_err(|_| CryptoError::Open);
         match opened {
             Ok(plain) => *value = Value::String(plain),
             Err(e) => failed = Some(e),

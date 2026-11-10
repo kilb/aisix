@@ -18,13 +18,18 @@
 //! ([`tenants::lock`]) and only then reaches `write_resource`, which takes
 //! the resources lock.
 //!
-//! The plaintext is returned once, by the request that mints it; only its
-//! SHA-256 (`key_hash`) is stored, and no log line, audit row or error
-//! carries either. On `/api/*` a key is looked up within the caller's tenant
-//! (and, for a member who does not manage keys, among their own) before
-//! anything else, so another tenant's key answers exactly as an id that
-//! names nothing; tenant views name a group by its display name only, never
-//! its routing name, and no endpoint family.
+//! The plaintext is returned by the request that mints it, and again by
+//! [`reveal`] and [`admin_reveal`]: a sealed copy is stored with the key
+//! (`sealed_plaintext`, under the master key, for the slot
+//! `cp:key:<id>`), so an owner can copy it at any time. Only the hash is
+//! what authenticates ([`KeyRow::key_hash`]), and no list, gateway document,
+//! audit row or log line carries the plaintext. A key minted before this
+//! release has no sealed copy and its reveal is refused. On `/api/*` a key
+//! is looked up within the caller's tenant (and, for a member who does not
+//! manage keys, among their own) before anything else, so another tenant's
+//! key answers exactly as an id that names nothing; tenant views name a
+//! group by its display name only, never its routing name, and no endpoint
+//! family.
 //!
 //! # One group per key
 //!
@@ -185,6 +190,10 @@ pub struct KeyRow {
     pub version: i64,
     pub created_at: DateTime<Utc>,
     pub created_by: KeyCreator,
+    /// Whether the key's plaintext can be revealed: a key minted from the
+    /// release that stores it has a sealed copy, and one minted before it has
+    /// none. Never the sealed value itself, which no row read carries.
+    pub plaintext_available: bool,
 }
 
 /// A `tenant_keys` row as SQL answers it. `sqlx::FromRow` rather than a
@@ -210,16 +219,19 @@ struct RawKey {
     version: i64,
     created_at: DateTime<Utc>,
     created_by: Value,
+    plaintext_available: bool,
 }
 
 // The key's group as one value, `NULL` while it has none; `created_by` as
-// one value. The group's subquery reads `group_id` of the row being
-// selected, so the same `COLUMNS` works in a `RETURNING`.
+// one value; whether the plaintext can be revealed, never the sealed value.
+// The group's subquery reads `group_id` of the row being selected, so the
+// same `COLUMNS` works in a `RETURNING`.
 const COLUMNS: &str = "id, tenant_id, member_id, label, key_hash, key_prefix, model_ids, \
      allowed_models, allowed_provider_groups, (SELECT jsonb_build_object('id', g.id, \
        'name', g.name, 'display_name', g.display_name) FROM provider_groups g \
        WHERE g.id = group_id) AS \"group\", rate_limit, disabled, operator_disabled, expires_at, \
-     version, created_at, jsonb_build_object('kind', created_by_kind, 'id', created_by) AS created_by";
+     version, created_at, jsonb_build_object('kind', created_by_kind, 'id', created_by) AS created_by, \
+     sealed_plaintext IS NOT NULL AS plaintext_available";
 
 impl RawKey {
     fn into_row(self) -> Result<KeyRow, ApiError> {
@@ -244,6 +256,7 @@ impl RawKey {
             version: self.version,
             created_at: self.created_at,
             created_by: serde_json::from_value(self.created_by).map_err(ApiError::internal)?,
+            plaintext_available: self.plaintext_available,
         })
     }
 }
@@ -251,6 +264,12 @@ impl RawKey {
 /// Who owns the document derived from key `id`.
 pub fn owner(id: Uuid) -> String {
     format!("key:{id}")
+}
+
+/// The `aad` a key's sealed plaintext is bound to: its own row, so a sealed
+/// value copied into another key's row does not open.
+pub fn plaintext_aad(id: Uuid) -> String {
+    format!("cp:key:{id}")
 }
 
 /// A new key: `(plaintext, key_hash)`, the plaintext `sk-rt-` and
@@ -610,17 +629,18 @@ pub async fn reproject_member(
 }
 
 /// Revokes every live key of member `member_id`, who is being removed: each
-/// is marked revoked and its document deleted, in the removal's transaction
-/// and before the member's `users` document, which the key documents name.
-/// The caller holds the member's tenant's lock. The keys revoked, in id
-/// order.
+/// is marked revoked, its sealed plaintext dropped and its document deleted,
+/// in the removal's transaction and before the member's `users` document,
+/// which the key documents name. The caller holds the member's tenant's
+/// lock. The keys revoked, in id order.
 pub async fn revoke_member(
     conn: &mut PgConnection,
     ctx: &WriteCtx,
     member_id: Uuid,
 ) -> Result<Vec<Uuid>, ApiError> {
     let mut revoked: Vec<Uuid> = sqlx::query_scalar(
-        "UPDATE tenant_keys SET revoked_at = now(), version = version + 1 \
+        "UPDATE tenant_keys SET revoked_at = now(), sealed_plaintext = NULL, \
+           version = version + 1 \
          WHERE member_id = $1 AND revoked_at IS NULL RETURNING id",
     )
     .bind(member_id)
@@ -1033,9 +1053,10 @@ fn audit_entry<'a>(
 /// Mints a key of tenant `t`, bound to `member_id` (already checked to be a
 /// live member of `t`), naming `group_id` (or `t`'s one assigned group when
 /// it is left out) and as `changes` set it, writes its document and records
-/// it; the key, and the plaintext, which is shown this once. The caller
-/// holds `t`'s lock, so the group row is taken after it and before
-/// `write_resource` ([`groups::key_group`]).
+/// it; the key, and the plaintext, which this answer shows. The caller holds
+/// `t`'s lock, so the group row is taken after it and before
+/// `write_resource` ([`groups::key_group`]). The plaintext is also stored
+/// sealed, in this same insert, so a reveal can show it again.
 async fn create_key(
     conn: &mut PgConnection,
     ctx: &WriteCtx,
@@ -1072,9 +1093,13 @@ async fn create_key(
             kind: String::new(),
             id: None,
         },
+        plaintext_available: false,
     };
     changes.apply(t, &mut key)?;
     let (plaintext, key_hash) = mint()?;
+    let sealed = ctx
+        .mk
+        .seal_text(plaintext_aad(key.id).as_bytes(), &plaintext);
     let (created_by_kind, created_by) = match by {
         Actor::Operator(op) => ("operator", Some(op.id)),
         Actor::Member { id, .. } => ("member", Some(id)),
@@ -1084,8 +1109,8 @@ async fn create_key(
     let raw: RawKey = sqlx::query_as(&format!(
         "INSERT INTO tenant_keys (id, tenant_id, member_id, label, key_hash, key_prefix, \
            model_ids, allowed_models, group_id, rate_limit, disabled, \
-           operator_disabled, expires_at, created_by_kind, created_by) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) \
+           operator_disabled, expires_at, created_by_kind, created_by, sealed_plaintext) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16) \
          RETURNING {COLUMNS}"
     ))
     .bind(key.id)
@@ -1103,6 +1128,7 @@ async fn create_key(
     .bind(key.expires_at)
     .bind(created_by_kind)
     .bind(created_by)
+    .bind(sealed)
     .fetch_one(&mut *conn)
     .await
     .map_err(DbError::from)?;
@@ -1177,19 +1203,24 @@ async fn update_key(
     Ok(key)
 }
 
-/// Revokes `key`: marked revoked, so it leaves every list, and its document
-/// deleted. The caller holds its tenant's lock and has checked the version.
+/// Revokes `key`: marked revoked, so it leaves every list, its sealed
+/// plaintext dropped (a revoked key authenticates nothing, so a copy of its
+/// plaintext would only be something to lose), and its document deleted.
+/// The caller holds its tenant's lock and has checked the version.
 async fn revoke_key(
     conn: &mut PgConnection,
     ctx: &WriteCtx,
     key: &KeyRow,
     by: Actor<'_>,
 ) -> Result<(), ApiError> {
-    sqlx::query("UPDATE tenant_keys SET revoked_at = now(), version = version + 1 WHERE id = $1")
-        .bind(key.id)
-        .execute(&mut *conn)
-        .await
-        .map_err(DbError::from)?;
+    sqlx::query(
+        "UPDATE tenant_keys SET revoked_at = now(), sealed_plaintext = NULL, \
+           version = version + 1 WHERE id = $1",
+    )
+    .bind(key.id)
+    .execute(&mut *conn)
+    .await
+    .map_err(DbError::from)?;
     tenants::retire(&mut *conn, ctx, Kind::ApiKeys, key.id, &owner(key.id)).await?;
     audit::record(conn, audit_entry(by, "key.revoke", key, json!({}))).await?;
     Ok(())
@@ -1239,6 +1270,9 @@ pub struct TenantKeyView {
     expires_at: Option<DateTime<Utc>>,
     created_at: DateTime<Utc>,
     version: i64,
+    /// Whether the plaintext can be shown again; a key minted before the
+    /// sealed copy was stored cannot.
+    plaintext_available: bool,
 }
 
 /// The tenant's own view of its keys, which decides each one's
@@ -1268,6 +1302,7 @@ fn tenant_views(
                 expires_at: k.expires_at,
                 created_at: k.created_at,
                 version: k.version,
+                plaintext_available: k.plaintext_available,
             }
         })
         .collect()
@@ -1332,6 +1367,9 @@ pub struct AdminKeyView {
     /// removed can be found.
     created_by: KeyCreator,
     version: i64,
+    /// Whether the plaintext can be shown again; a key minted before the
+    /// sealed copy was stored cannot.
+    plaintext_available: bool,
 }
 
 fn admin_view(t: &TenantRow, k: KeyRow, member_active: bool) -> AdminKeyView {
@@ -1354,6 +1392,7 @@ fn admin_view(t: &TenantRow, k: KeyRow, member_active: bool) -> AdminKeyView {
         created_at: k.created_at,
         created_by: k.created_by,
         version: k.version,
+        plaintext_available: k.plaintext_available,
     }
 }
 
@@ -1677,6 +1716,74 @@ pub async fn revoke(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// The key's plaintext, opened from its sealed copy, with the reveal
+/// recorded; `409 plaintext_unavailable` for a key minted before the copy
+/// was stored, which is refused rather than answered with anything derived.
+///
+/// The audit row names the key and the actor and carries no plaintext. The
+/// row is written in the caller's transaction, so the plaintext is answered
+/// only once it is recorded.
+async fn reveal_plaintext(
+    conn: &mut PgConnection,
+    mk: &crate::crypto::MasterKey,
+    key: &KeyRow,
+    by: Actor<'_>,
+) -> Result<String, ApiError> {
+    let sealed: Option<String> =
+        sqlx::query_scalar("SELECT sealed_plaintext FROM tenant_keys WHERE id = $1")
+            .bind(key.id)
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(DbError::from)?;
+    let Some(sealed) = sealed else {
+        return Err(ApiError::conflict(
+            "plaintext_unavailable",
+            "该密钥创建于旧版本，无法再次查看；如需明文请新建密钥",
+        ));
+    };
+    let plaintext = mk
+        .open_text(plaintext_aad(key.id).as_bytes(), &sealed)
+        .map_err(|e| {
+            // The wrong master key or a damaged value: the reason names
+            // neither, and neither is anything to show.
+            ApiError::internal(e)
+        })?;
+    audit::record(conn, audit_entry(by, "key.reveal", key, json!({}))).await?;
+    Ok(plaintext)
+}
+
+/// `POST /api/keys/{id}/reveal` → `{plaintext}`, `Cache-Control: no-store`.
+/// The key's own member may reveal it, and an owner or an admin any key of
+/// the tenant; a billing member holds no key, so the role check refuses it.
+/// Another tenant's id, a member's id that is not theirs, and a revoked key
+/// all answer `404 not_found`, exactly as an id that names nothing does.
+pub async fn reveal(
+    auth: MemberAuth,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Response, ApiError> {
+    auth.require_active()?;
+    auth.require(KEY_HOLDERS)?;
+    let id = key_id(&id)?;
+    let mk = crate::crypto::MasterKey(state.cfg.master_key.0);
+    let plaintext = state
+        .db
+        .tx(move |conn| {
+            async move {
+                let auth = members::current(&mut *conn, &auth, KEY_HOLDERS).await?;
+                let key = live_key(&mut *conn, id, Some(auth.tenant_id), own_only(&auth)).await?;
+                reveal_plaintext(&mut *conn, &mk, &key, member_actor(&auth)).await
+            }
+            .boxed()
+        })
+        .await?;
+    Ok((
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(json!({ "plaintext": plaintext })),
+    )
+        .into_response())
+}
+
 /// `GET /admin/tenants/{id}/keys` → `{items: [AdminKey]}`.
 pub async fn admin_list(
     auth: OperatorAuth,
@@ -1850,6 +1957,46 @@ pub async fn admin_revoke(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// `POST /admin/keys/{id}/reveal` → `{plaintext}`, `Cache-Control: no-store`.
+/// Only the platform's own tenant's keys: operators mint those for the
+/// platform's use and must be able to copy one again, while a customer's
+/// key is the customer's to reveal in its own portal, so it answers `403
+/// forbidden`. A revoked key is `404`, and a key minted before this release
+/// answers the same `409 plaintext_unavailable` as on `/api`.
+pub async fn admin_reveal(
+    auth: OperatorAuth,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Response, ApiError> {
+    auth.require(OperatorRole::Operator)?;
+    let id = key_id(&id)?;
+    let mk = crate::crypto::MasterKey(state.cfg.master_key.0);
+    let plaintext = state
+        .db
+        .tx(move |conn| {
+            async move {
+                let key = live_key(&mut *conn, id, None, None).await?;
+                let tenant = tenants::find(&mut *conn, key.tenant_id).await?;
+                // The operators mint the platform's own keys and must be able
+                // to copy one again; a customer's is its own to reveal.
+                if !tenant.is_internal {
+                    return Err(ApiError {
+                        message: "客户租户的密钥明文只能由该租户在自己的门户里复制".to_string(),
+                        ..ApiError::forbidden()
+                    });
+                }
+                reveal_plaintext(&mut *conn, &mk, &key, Actor::Operator(&auth)).await
+            }
+            .boxed()
+        })
+        .await?;
+    Ok((
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(json!({ "plaintext": plaintext })),
+    )
+        .into_response())
+}
+
 #[cfg(test)]
 mod tests {
     use aisix_core::models::{ApiKey, EndpointFamily};
@@ -1917,6 +2064,7 @@ mod tests {
                 kind: "member".to_string(),
                 id: None,
             },
+            plaintext_available: true,
         }
     }
 

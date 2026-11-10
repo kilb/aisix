@@ -9,6 +9,7 @@ mod support;
 use std::collections::BTreeSet;
 
 use aisix_control_plane::auth::{MemberRole, OperatorRole};
+use aisix_control_plane::crypto::{self, MasterKey};
 use aisix_control_plane::housekeeping;
 use aisix_control_plane::keys::{self, KEY_DOC_VERSION};
 use aisix_control_plane::resources::write::WriteCtx;
@@ -236,6 +237,32 @@ async fn admin_mint(cp: &TestCp, admin: &OperatorSession, tenant: Uuid, body: Va
     .await
 }
 
+/// `POST /api/keys/{id}/reveal` as `by`.
+async fn reveal(cp: &TestCp, by: &MemberSession, id: &str) -> Resp {
+    call(
+        cp,
+        "POST",
+        &format!("/api/keys/{id}/reveal"),
+        Some(by.cookie()),
+        None,
+        None,
+    )
+    .await
+}
+
+/// `POST /admin/keys/{id}/reveal` as `admin`.
+async fn admin_reveal(cp: &TestCp, admin: &OperatorSession, id: &str) -> Resp {
+    call(
+        cp,
+        "POST",
+        &format!("/admin/keys/{id}/reveal"),
+        Some(admin.cookie()),
+        None,
+        None,
+    )
+    .await
+}
+
 /// The stored version of key `id`.
 async fn key_version(cp: &TestCp, id: &str) -> i64 {
     sqlx::query_scalar("SELECT version FROM tenant_keys WHERE id = $1::uuid")
@@ -370,7 +397,7 @@ async fn act(cp: &TestCp, admin: &OperatorSession, tenant: Uuid, action: &str) -
 }
 
 #[tokio::test]
-async fn the_plaintext_is_returned_once_and_never_stored() {
+async fn the_plaintext_is_shown_at_creation_and_stored_sealed() {
     let Some(cp) = TestCp::start().await else {
         return;
     };
@@ -395,20 +422,53 @@ async fn the_plaintext_is_returned_once_and_never_stored() {
     assert_eq!(r.body["key"]["version"], 1);
     let hash = ApiKey::hash_bearer(&plaintext);
 
-    // Only the hash is kept, in the key row and in its gateway document.
-    let (stored_hash, prefix): (String, String) =
-        sqlx::query_as("SELECT key_hash, key_prefix FROM tenant_keys WHERE id = $1::uuid")
-            .bind(&id)
-            .fetch_one(cp.db().pool())
-            .await
-            .expect("read the key");
+    // The hash is what authenticates, in the key row and in its gateway
+    // document; the plaintext itself is kept sealed, and only the reveal
+    // routes open it.
+    let (stored_hash, prefix, sealed): (String, String, Option<String>) = sqlx::query_as(
+        "SELECT key_hash, key_prefix, sealed_plaintext FROM tenant_keys WHERE id = $1::uuid",
+    )
+    .bind(&id)
+    .fetch_one(cp.db().pool())
+    .await
+    .expect("read the key");
     assert_eq!(
         (stored_hash, prefix),
         (hash.clone(), plaintext[..12].to_string())
     );
+    assert!(
+        r.body["key"]["plaintext_available"].as_bool() == Some(true),
+        "a minted key can be revealed: {r:?}"
+    );
+    // The stored copy is the scheme's sealed text, for this key's slot, and
+    // the plaintext is in the clear nowhere in it.
+    let sealed = sealed.expect("a sealed copy");
+    assert!(
+        sealed.starts_with(crypto::SEALED_PREFIX),
+        "the stored copy is not sealed: {sealed}"
+    );
+    assert!(!sealed.contains(random), "{sealed}");
+    let mk = MasterKey(support::TEST_MASTER_KEY);
+    assert_eq!(
+        mk.open_text(
+            keys::plaintext_aad(Uuid::parse_str(&id).expect("an id")).as_bytes(),
+            &sealed
+        )
+        .expect("the stored copy opens"),
+        plaintext
+    );
+    assert!(
+        mk.open_text(keys::plaintext_aad(Uuid::new_v4()).as_bytes(), &sealed)
+            .is_err(),
+        "a sealed copy moved to another key's row opens"
+    );
     let doc = stored(&cp, "api_keys", &id).await;
     assert_eq!(doc.doc["key_hash"], json!(hash));
     assert_eq!(doc.managed_by, Some(format!("key:{id}")));
+    assert!(
+        doc.doc.get("sealed_plaintext").is_none(),
+        "the document carries no plaintext: {doc:?}"
+    );
     for table in ["tenant_keys", "gw_resources", "audit_log", "sessions"] {
         let dump: Vec<String> = sqlx::query_scalar(&format!("SELECT t::text FROM {table} t"))
             .fetch_all(cp.db().pool())
@@ -474,6 +534,339 @@ async fn the_plaintext_is_returned_once_and_never_stored() {
         assert!(!body.contains(&hash), "a read shows the hash: {body}");
         assert!(body.contains(&id), "{body}");
     }
+}
+
+#[tokio::test]
+async fn a_revealed_plaintext_is_the_minted_one_and_the_hash_authenticates() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let tenant = cp.seed_tenant(TenantStatus::Active).await;
+    let owner = cp.member_login_seeded(tenant, MemberRole::Owner).await;
+    let (id, minted) = mint_ok(&cp, &owner, json!({"label": "ci-reveal-7c1"})).await;
+
+    let r = reveal(&cp, &owner, &id).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let revealed = text(&r.body, "/plaintext");
+    assert_eq!(revealed, minted);
+    // The plaintext revealed is the one the gateway authenticates: it hashes
+    // to the stored `key_hash`, which the key's document carries.
+    let (hash, prefix): (String, String) =
+        sqlx::query_as("SELECT key_hash, key_prefix FROM tenant_keys WHERE id = $1::uuid")
+            .bind(&id)
+            .fetch_one(cp.db().pool())
+            .await
+            .expect("read the key");
+    assert_eq!(ApiKey::hash_bearer(&revealed), hash);
+    assert_eq!(revealed[..12], prefix);
+    assert_eq!(key_doc(&cp, &id).await["key_hash"], json!(hash));
+    // A `POST` answer that carries a credential is cached by nothing.
+    assert_eq!(
+        r.headers
+            .get(reqwest::header::CACHE_CONTROL)
+            .map(|v| v.to_str().expect("ASCII")),
+        Some("no-store"),
+        "{r:?}"
+    );
+
+    // Revealing again is the same value: it is stored, not regenerated.
+    let again = reveal(&cp, &owner, &id).await;
+    assert_eq!(again.status, 200, "{again:?}");
+    assert_eq!(text(&again.body, "/plaintext"), minted);
+
+    // Each reveal is recorded, and the row carries no plaintext.
+    let rows: Vec<(String, String, Option<String>, Option<Uuid>)> = sqlx::query_as(
+        "SELECT actor_kind, action, target_id, tenant_id FROM audit_log \
+         WHERE action = 'key.reveal' ORDER BY id",
+    )
+    .fetch_all(cp.db().pool())
+    .await
+    .expect("the reveal rows");
+    assert_eq!(
+        rows,
+        vec![
+            (
+                "member".to_string(),
+                "key.reveal".to_string(),
+                Some(id.clone()),
+                Some(tenant)
+            );
+            2
+        ]
+    );
+    let dump: Vec<String> = sqlx::query_scalar("SELECT t::text FROM audit_log t")
+        .fetch_all(cp.db().pool())
+        .await
+        .expect("dump the audit log");
+    assert!(
+        dump.iter().all(|row| !row.contains(&minted)),
+        "an audit row holds the plaintext"
+    );
+}
+
+#[tokio::test]
+async fn only_the_keys_own_member_or_a_manager_reveals_it_and_never_another_tenants() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let tenant = cp.seed_tenant(TenantStatus::Active).await;
+    let owner = cp.member_login_seeded(tenant, MemberRole::Owner).await;
+    let admin = cp.member_login_seeded(tenant, MemberRole::Admin).await;
+    let member = cp.member_login_seeded(tenant, MemberRole::Member).await;
+    let other = cp.member_login_seeded(tenant, MemberRole::Member).await;
+    let billing = cp.member_login_seeded(tenant, MemberRole::Billing).await;
+    let (mine, minted) = mint_ok(&cp, &member, json!({"label": "member-key-7c1"})).await;
+    let (owners, owners_plaintext) = mint_ok(&cp, &owner, json!({"label": "owner-key-7c1"})).await;
+
+    // The key's own member reveals it.
+    let r = reveal(&cp, &member, &mine).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    assert_eq!(text(&r.body, "/plaintext"), minted);
+    // An owner and an admin reveal any key of the tenant.
+    for manager in [&owner, &admin] {
+        let r = reveal(&cp, manager, &mine).await;
+        assert_eq!(r.status, 200, "{manager:?}: {r:?}");
+        assert_eq!(text(&r.body, "/plaintext"), minted);
+    }
+    // Another member of the tenant does not: it answers as an id that names
+    // nothing, as it does for a key they do not own.
+    let r = reveal(&cp, &other, &mine).await;
+    assert_eq!(
+        (r.status, r.body["code"].clone()),
+        (404, json!("not_found")),
+        "{r:?}"
+    );
+    // A billing member reveals none of the tenant's keys.
+    for id in [&mine, &owners] {
+        let r = reveal(&cp, &billing, id).await;
+        assert_eq!(
+            (r.status, r.body["code"].clone()),
+            (403, json!("forbidden")),
+            "{r:?}"
+        );
+        assert!(!r.body.to_string().contains(&minted));
+    }
+
+    // Another tenant's key id answers exactly as a random id does.
+    let elsewhere = cp.seed_tenant(TenantStatus::Active).await;
+    let stranger = cp.member_login_seeded(elsewhere, MemberRole::Owner).await;
+    let (theirs, their_plaintext) =
+        mint_ok(&cp, &stranger, json!({"label": "their-key-7c1"})).await;
+    let theirs_answer = reveal(&cp, &owner, &theirs).await;
+    let random_answer = reveal(&cp, &owner, &Uuid::new_v4().to_string()).await;
+    assert_eq!(theirs_answer.status, 404, "{theirs_answer:?}");
+    assert_eq!(random_answer.status, 404, "{random_answer:?}");
+    assert_eq!(
+        (theirs_answer.body.clone(), theirs_answer.status),
+        (random_answer.body.clone(), random_answer.status)
+    );
+    assert!(!theirs_answer.body.to_string().contains(&their_plaintext));
+    // Not even the owner of that key's own tenant reaches it from here: the
+    // other tenant's owner does, from their own tenant.
+    assert_eq!(reveal(&cp, &stranger, &theirs).await.status, 200);
+    assert_eq!(
+        text(&reveal(&cp, &stranger, &theirs).await.body, "/plaintext"),
+        their_plaintext
+    );
+    assert_eq!(
+        text(&reveal(&cp, &owner, &owners).await.body, "/plaintext"),
+        owners_plaintext
+    );
+}
+
+#[tokio::test]
+async fn an_operator_reveals_only_the_platforms_own_keys() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let operator = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let viewer = cp.admin_login_seeded(OperatorRole::Viewer).await;
+    let internal: Uuid = sqlx::query_scalar("SELECT id FROM tenants WHERE is_internal")
+        .fetch_one(cp.db().pool())
+        .await
+        .expect("the internal tenant");
+    let group = seed_group(&cp, &operator, "grp-ops-reveal-7c1", "平台自用 7c1").await;
+    let r = admin_mint(
+        &cp,
+        &operator,
+        internal,
+        json!({"label": "ops-reveal-7c1", "group_id": group}),
+    )
+    .await;
+    assert_eq!(r.status, 201, "{r:?}");
+    let internal_key = text(&r.body, "/key/id");
+    let internal_plaintext = text(&r.body, "/plaintext");
+
+    // An operator reveals the platform's own key again.
+    let r = admin_reveal(&cp, &operator, &internal_key).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    assert_eq!(text(&r.body, "/plaintext"), internal_plaintext);
+    assert_eq!(
+        r.headers
+            .get(reqwest::header::CACHE_CONTROL)
+            .map(|v| v.to_str().expect("ASCII")),
+        Some("no-store"),
+        "{r:?}"
+    );
+
+    // A viewer does not: reading a credential is an operator's action.
+    let r = admin_reveal(&cp, &viewer, &internal_key).await;
+    assert_eq!(
+        (r.status, r.body["code"].clone()),
+        (403, json!("forbidden")),
+        "{r:?}"
+    );
+
+    // A customer tenant's key is refused: the platform does not need its
+    // customers' credentials.
+    let tenant = cp.seed_tenant(TenantStatus::Active).await;
+    let owner = cp.member_login_seeded(tenant, MemberRole::Owner).await;
+    let (customer_key, customer_plaintext) =
+        mint_ok(&cp, &owner, json!({"label": "customer-reveal-7c1"})).await;
+    let before: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM audit_log WHERE action = 'key.reveal'")
+            .fetch_one(cp.db().pool())
+            .await
+            .expect("count the reveal rows");
+    let r = admin_reveal(&cp, &operator, &customer_key).await;
+    assert_eq!(
+        (r.status, r.body["code"].clone()),
+        (403, json!("forbidden")),
+        "{r:?}"
+    );
+    assert!(!r.body.to_string().contains(&customer_plaintext));
+    assert!(
+        r.body["error"]
+            .as_str()
+            .is_some_and(|m| m.contains("客户租户的密钥明文")),
+        "{r:?}"
+    );
+    let after: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM audit_log WHERE action = 'key.reveal'")
+            .fetch_one(cp.db().pool())
+            .await
+            .expect("count the reveal rows");
+    assert_eq!(after, before, "a refused reveal was recorded");
+    // The key's own tenant still reveals it.
+    assert_eq!(
+        text(&reveal(&cp, &owner, &customer_key).await.body, "/plaintext"),
+        customer_plaintext
+    );
+}
+
+#[tokio::test]
+async fn a_revoked_key_is_not_revealed_and_its_sealed_copy_is_gone() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let tenant = cp.seed_tenant(TenantStatus::Active).await;
+    let owner = cp.member_login_seeded(tenant, MemberRole::Owner).await;
+    let (id, _) = mint_ok(&cp, &owner, json!({"label": "gone-7c1"})).await;
+    assert_eq!(reveal(&cp, &owner, &id).await.status, 200);
+    let r = on_key(&cp, &owner, "DELETE", &id, None).await;
+    assert_eq!(r.status, 204, "{r:?}");
+
+    assert_eq!(
+        {
+            let answer = reveal(&cp, &owner, &id).await;
+            (answer.status, answer.body["code"].clone())
+        },
+        (404, json!("not_found"))
+    );
+    let admin = cp.admin_login_seeded(OperatorRole::Operator).await;
+    assert_eq!(admin_reveal(&cp, &admin, &id).await.status, 404);
+    let sealed: Option<String> =
+        sqlx::query_scalar("SELECT sealed_plaintext FROM tenant_keys WHERE id = $1::uuid")
+            .bind(&id)
+            .fetch_one(cp.db().pool())
+            .await
+            .expect("read the key");
+    assert!(sealed.is_none(), "a revoked key keeps its sealed copy");
+}
+
+#[tokio::test]
+async fn a_key_minted_before_the_sealed_copy_answers_a_clear_refusal() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let tenant = cp.seed_tenant(TenantStatus::Active).await;
+    let owner = cp.member_login_seeded(tenant, MemberRole::Owner).await;
+    let (id, _) = mint_ok(&cp, &owner, json!({"label": "old-7c1"})).await;
+    // The state a key minted by an older release is in: no sealed copy.
+    sqlx::query("UPDATE tenant_keys SET sealed_plaintext = NULL WHERE id = $1::uuid")
+        .bind(&id)
+        .execute(cp.db().pool())
+        .await
+        .expect("drop the sealed copy");
+
+    // The list says so, so a page does not offer to copy it.
+    let listed = call(&cp, "GET", "/api/keys", Some(owner.cookie()), None, None).await;
+    assert_eq!(listed.status, 200, "{listed:?}");
+    let view = listed.body["items"]
+        .as_array()
+        .expect("the items")
+        .iter()
+        .find(|k| k["id"] == json!(id))
+        .expect("the key");
+    assert_eq!(view["plaintext_available"], false, "{view}");
+
+    let before: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM audit_log WHERE action = 'key.reveal'")
+            .fetch_one(cp.db().pool())
+            .await
+            .expect("count the reveal rows");
+    let r = reveal(&cp, &owner, &id).await;
+    assert_eq!(
+        (r.status, r.body["code"].clone()),
+        (409, json!("plaintext_unavailable")),
+        "{r:?}"
+    );
+    assert_eq!(
+        r.body["error"],
+        json!("该密钥创建于旧版本，无法再次查看；如需明文请新建密钥")
+    );
+    // The key still authenticates and is still managed as before; only the
+    // reveal is refused, and nothing was recorded for it.
+    assert_eq!(key_version(&cp, &id).await, 1);
+    let after: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM audit_log WHERE action = 'key.reveal'")
+            .fetch_one(cp.db().pool())
+            .await
+            .expect("count the reveal rows");
+    assert_eq!(after, before);
+
+    // The operators' route refuses it the same way, for the platform's own
+    // tenant too.
+    let operator = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let internal: Uuid = sqlx::query_scalar("SELECT id FROM tenants WHERE is_internal")
+        .fetch_one(cp.db().pool())
+        .await
+        .expect("the internal tenant");
+    let group = seed_group(&cp, &operator, "grp-ops-old-7c1", "平台自用 7c1").await;
+    let r = admin_mint(
+        &cp,
+        &operator,
+        internal,
+        json!({"label": "ops-old-7c1", "group_id": group}),
+    )
+    .await;
+    assert_eq!(r.status, 201, "{r:?}");
+    let ops_key = text(&r.body, "/key/id");
+    sqlx::query("UPDATE tenant_keys SET sealed_plaintext = NULL WHERE id = $1::uuid")
+        .bind(&ops_key)
+        .execute(cp.db().pool())
+        .await
+        .expect("drop the sealed copy");
+    let r = admin_reveal(&cp, &operator, &ops_key).await;
+    assert_eq!(
+        (r.status, r.body["code"].clone()),
+        (409, json!("plaintext_unavailable")),
+        "{r:?}"
+    );
+    assert_eq!(
+        r.body["error"],
+        json!("该密钥创建于旧版本，无法再次查看；如需明文请新建密钥")
+    );
 }
 
 #[tokio::test]
@@ -1597,6 +1990,7 @@ async fn a_tenants_view_of_a_key_shows_the_display_name_never_the_name() {
             "label",
             "model_ids",
             "owner",
+            "plaintext_available",
             "prefix",
             "rate_limit",
             "version",
@@ -1646,6 +2040,7 @@ async fn operators_mint_and_manage_any_tenants_keys() {
             "label",
             "member_id",
             "model_ids",
+            "plaintext_available",
             "prefix",
             "rate_limit",
             "tenant_id",

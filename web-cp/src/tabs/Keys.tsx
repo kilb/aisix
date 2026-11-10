@@ -39,6 +39,7 @@ import {
 import { Button } from "../ui/Button";
 import { useRefusalFocus } from "../ui/Field";
 import { CopyButton } from "../ui/CopyButton";
+import { KeySecret } from "../ui/KeySecret";
 import { DataTable, Loading } from "../ui/DataTable";
 import { EmptyState } from "../ui/EmptyState";
 import { Lamp } from "../ui/Lamp";
@@ -83,7 +84,7 @@ export function Keys({ canEdit }: TabProps) {
           </Button>
         </h2>
         <p className="hint">
-          平台内部租户的密钥是运维自用的，可以按名称模式授权模型；其他租户的密钥只能使用该租户已授权的模型。明文只在创建时显示一次，之后只显示前缀。
+          平台内部租户的密钥是运维自用的，可以按名称模式授权模型；其他租户的密钥只能使用该租户已授权的模型。平台内部租户的密钥明文可随时复制；客户租户的密钥在这里只显示前缀，明文由该租户在自己的门户里复制。
         </p>
         {list.error && (
           <div className="note crit" role="alert">
@@ -189,6 +190,9 @@ function TenantKeys({ tenantId, canEdit, tick }: { tenantId: string; canEdit: bo
   // Held only here: switching tenant or leaving the tab drops it for good.
   const [minted, setMinted] = useState<MintedKey | null>(null);
   const [editing, setEditing] = useState<string | null>(null);
+  // A reveal that was refused: shown above the table, beside the row's own
+  // errors, never instead of it.
+  const [plaintextError, setPlaintextError] = useState<string | null>(null);
 
   // A view replaces the one shown unless it is older: a read that raced a write.
   const applyView = useCallback(
@@ -299,6 +303,11 @@ function TenantKeys({ tenantId, canEdit, tick }: { tenantId: string; canEdit: bo
           密钥读取失败：{keyList.error}
         </div>
       )}
+      {plaintextError && (
+        <div className="note crit" role="alert">
+          {plaintextError}
+        </div>
+      )}
       {members.error && (
         <div className="note crit" role="alert">
           成员读取失败：{members.error}
@@ -329,7 +338,7 @@ function TenantKeys({ tenantId, canEdit, tick }: { tenantId: string; canEdit: bo
                 <tr>
                   <td>{k.label}</td>
                   <td>
-                    <code>{k.prefix}…</code>
+                    <KeySecretCell k={k} tenant={tenant} onError={setPlaintextError} />
                   </td>
                   <td>{ownerOf(k, tenant, members.data)}</td>
                   <td>{modelsOf(k, tenant, names)}</td>
@@ -386,6 +395,36 @@ function TenantKeys({ tenantId, canEdit, tick }: { tenantId: string; canEdit: bo
         </DataTable>
       )}
     </section>
+  );
+}
+
+/**
+ * A key's prefix, and, for the platform's own tenant, its plaintext: `复制`
+ * reveals and copies it, and `显示` puts it in place of the prefix. A
+ * customer tenant's key shows the prefix alone: operators mint the platform's
+ * own keys and must be able to copy one again, while a customer's key is the
+ * customer's to reveal in its own portal.
+ */
+function KeySecretCell({
+  k,
+  tenant,
+  onError,
+}: {
+  k: AdminKey;
+  tenant: Tenant;
+  onError: (message: string) => void;
+}) {
+  if (!tenant.is_internal) return <code>{k.prefix}…</code>;
+  return (
+    <KeySecret
+      prefix={k.prefix}
+      className="tn-actions"
+      reveal={() => keysApi.reveal(k.id)}
+      unavailable={
+        k.plaintext_available ? null : "该密钥创建于旧版本，无法再次查看；如需明文请新建密钥"
+      }
+      onError={(e) => onError(errorText(e))}
+    />
   );
 }
 
@@ -484,8 +523,8 @@ function MintedNote({ minted, onClose }: { minted: MintedKey; onClose: () => voi
   const [copied, setCopied] = useState<string | null>(null);
 
   return (
-    <div className="note warn">
-      <strong>明文只显示这一次。</strong>密钥「{minted.key.label}」已创建。请现在复制并交给使用方；关闭或离开此页后无法再查看，列表只显示前缀。
+    <div className="note warn" role="region" aria-label="密钥已创建">
+      <strong>密钥「{minted.key.label}」已创建。</strong>现在可以复制并交给使用方；之后也能在密钥列表里随时点「复制」再次获取明文，关闭本提示不影响。
       <code className="tn-token" aria-label="密钥明文">
         {minted.plaintext}
       </code>

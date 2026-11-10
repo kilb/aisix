@@ -112,7 +112,7 @@ async function openKeys(page: Page, org?: string): Promise<void> {
 const keyTable = (page: Page) => page.getByRole("table", { name: "密钥列表" });
 const keyRow = (page: Page, label: string) => keyTable(page).getByRole("row").filter({ hasText: label });
 
-test("新建内部密钥：明文只显示一次，用它能调网关", async ({ page }) => {
+test("新建内部密钥：明文可随时再次复制，用它能调网关", async ({ page }) => {
   const logged: string[] = [];
   page.on("console", (m) => logged.push(m.text()));
   // A customer whose name sorts before the platform's own tenant, so that
@@ -139,10 +139,10 @@ test("新建内部密钥：明文只显示一次，用它能调网关", async ({
   await form.getByLabel("模型（可写通配）").fill("chat-t6-*");
   await form.getByRole("button", { name: "创建" }).click();
 
-  const notice = page.getByText("明文只显示这一次");
+  const notice = page.getByRole("region", { name: "密钥已创建" });
   await expect(notice).toBeVisible();
-  await expect(page.getByRole("button", { name: "复制" })).toBeVisible();
-  const shown = page.getByLabel("密钥明文");
+  await expect(notice.getByRole("button", { name: "复制" })).toBeVisible();
+  const shown = notice.getByLabel("密钥明文");
   const plaintext = ((await shown.textContent()) ?? "").trim();
   expect(plaintext).toMatch(/^sk-rt-[A-Za-z0-9]{16,}$/);
 
@@ -165,7 +165,7 @@ test("新建内部密钥：明文只显示一次，用它能调网关", async ({
   await page.locator('[data-tab="tenants"]').click();
   await page.locator('[data-tab="keys"]').click();
   await expect(keyRow(page, "ops-key-t6")).toContainText(`${plaintext.slice(0, 12)}…`);
-  await expect(page.getByLabel("密钥明文")).toHaveCount(0);
+  await expect(notice.getByLabel("密钥明文")).toHaveCount(0);
   expect(await page.content()).not.toContain(plaintext);
 
   // After a reload: the list shows the prefix only, and the plaintext is gone.
@@ -174,6 +174,81 @@ test("新建内部密钥：明文只显示一次，用它能调网关", async ({
   await expect(keyRow(page, "ops-key-t6")).toContainText(`${plaintext.slice(0, 12)}…`);
   expect(await page.content()).not.toContain(plaintext);
   expect(logged.join("\n")).not.toContain(plaintext);
+});
+
+test("内部密钥的明文可以再次复制；客户租户的密钥没有复制", async ({ page }) => {
+  const logged: string[] = [];
+  page.on("console", (m) => logged.push(m.text()));
+  const internal = ((await stack.admin.get("/admin/tenants")).items as Json[]).find((t) => t.is_internal);
+  await page.context().grantPermissions(["clipboard-read", "clipboard-write"], { origin: stack.previewUrl });
+
+  // An operator mints one for the platform's own use.
+  const made = await stack.admin.post(`/admin/tenants/${internal.id}/keys`, {
+    label: "ops-reveal-t6",
+    group_id: (await stack.admin.get("/admin/provider-groups")).items.find((g: Json) => g.name === "shared").id,
+    allowed_models: ["chat-t6-*"],
+  });
+  const minted: string = made.plaintext;
+  expect(minted).toMatch(/^sk-rt-[A-Za-z0-9]{16,}$/);
+
+  await openKeys(page);
+  const listed = keyRow(page, "ops-reveal-t6");
+  await expect(listed).toContainText(`${minted.slice(0, 12)}…`);
+  await expect(listed).not.toContainText(minted);
+  await page.evaluate(() => navigator.clipboard.writeText(""));
+
+  // A reload drops everything the page held; the list still has the key.
+  await page.reload();
+  await page.locator('[data-tab="keys"]').click();
+  // 显示 puts it in the row; 隐藏 takes it away.
+  await keyRow(page, "ops-reveal-t6").getByRole("button", { name: "显示" }).click();
+  await expect(keyRow(page, "ops-reveal-t6")).toContainText(minted);
+  await keyRow(page, "ops-reveal-t6").getByRole("button", { name: "隐藏" }).click();
+  await expect(keyRow(page, "ops-reveal-t6")).not.toContainText(minted);
+
+  // 复制 reveals it again and copies it in one click.
+  await keyRow(page, "ops-reveal-t6").getByRole("button", { name: "复制" }).click();
+  await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toBe(minted);
+  // The value copied is the key the gateway serves.
+  await expect.poll(() => chatStatus(minted), { timeout: KEY_READY_MS }).toBe(200);
+
+  // The reveal is audited, and neither the page's console nor the audit row
+  // holds the plaintext.
+  const audit = await stack.admin.get(`/admin/audit?target_id=${made.key.id}&limit=50`);
+  const reveals = (audit.items as Json[]).filter((r) => r.action === "key.reveal");
+  expect(reveals.length).toBeGreaterThanOrEqual(1);
+  for (const r of reveals) expect(JSON.stringify(r)).not.toContain(minted);
+  expect(logged.join("\n")).not.toContain(minted);
+
+  // A customer tenant's key has no copy at all: the platform does not need
+  // its customers' credentials.
+  const t = await signUpActive("T6 Reveal Co 9e2", "owner@reveal-t6.test", [models.chat]);
+  await mint(t, "customer-reveal-t6");
+  // The page's tenant list is read once; a reload shows the organisation the
+  // sign-up above added.
+  await page.reload();
+  await page.locator('[data-tab="keys"]').click();
+  await page.getByLabel("租户").selectOption({ label: t.org });
+  const theirs = keyRow(page, "customer-reveal-t6");
+  await expect(theirs).toBeVisible();
+  await expect(theirs.getByRole("button", { name: "复制" })).toHaveCount(0);
+  await expect(theirs.getByRole("button", { name: "显示" })).toHaveCount(0);
+
+  // An older key on the platform's own tenant offers the copy button off,
+  // with the reason.
+  const old = await stack.admin.post(`/admin/tenants/${internal.id}/keys`, {
+    label: "ops-old-t6",
+    group_id: (await stack.admin.get("/admin/provider-groups")).items.find((g: Json) => g.name === "shared").id,
+    allowed_models: ["chat-t6-*"],
+  });
+  stack.clearKeySealed(old.key.id);
+  // A reload drops what the page held and opens again on the platform's own
+  // tenant, which comes first.
+  await page.reload();
+  await page.locator('[data-tab="keys"]').click();
+  const stale = keyRow(page, "ops-old-t6");
+  await expect(stale.getByRole("button", { name: "复制" })).toHaveAttribute("aria-disabled", "true");
+  await expect(stale.getByRole("button", { name: "显示" })).toHaveCount(0);
 });
 
 test("停用后网关返回 401，启用后恢复", async ({ page }) => {
@@ -335,13 +410,14 @@ test("给客户租户新建密钥：只能调用所选模型，限额与过期�
   await form.getByLabel("过期时间").fill("2031-01-02T03:04");
   await form.getByRole("button", { name: "创建" }).click();
 
-  const plaintext = ((await page.getByLabel("密钥明文").textContent()) ?? "").trim();
+  const created = page.getByRole("region", { name: "密钥已创建" });
+  const plaintext = ((await created.getByLabel("密钥明文").textContent()) ?? "").trim();
   expect(plaintext).toMatch(/^sk-rt-[A-Za-z0-9]{16,}$/);
   await expect.poll(() => chatStatus(plaintext), { timeout: KEY_READY_MS }).toBe(200);
   expect(await chatStatus(plaintext, "other-t6-e2e")).not.toBe(200);
 
   // Closed: gone from the page.
-  await page.getByRole("button", { name: "关闭" }).click();
+  await created.getByRole("button", { name: "关闭" }).click();
   await expect(page.getByLabel("密钥明文")).toHaveCount(0);
   expect(await page.content()).not.toContain(plaintext);
 
@@ -375,7 +451,9 @@ test("分组只选一个：分组没有上游账号时先警告并要求确认�
   await expect(form.getByRole("alert")).toContainText("grp-none-6b2");
   expect((await stack.admin.get(`/admin/tenants/${t.id}/keys`)).items).toEqual([]);
   await form.getByRole("button", { name: "确认创建" }).click();
-  const plaintext = ((await page.getByLabel("密钥明文").textContent()) ?? "").trim();
+  const plaintext = (
+    (await page.getByRole("region", { name: "密钥已创建" }).getByLabel("密钥明文").textContent()) ?? ""
+  ).trim();
   const listed = (await stack.admin.get(`/admin/tenants/${t.id}/keys`)).items as Json[];
   const stored = listed.find((k) => k.label === "unreach-key-t6");
   expect(stored.group.name).toBe("grp-none-6b2");
@@ -404,8 +482,10 @@ test("为客户租户新建密钥：从租户的分组里选一个，创建后�
   await expect(select.locator("option", { hasText: "Alpha 分组 7c1" })).toContainText("grp-alpha-7c1");
   await select.selectOption({ label: "Alpha 分组 7c1（grp-alpha-7c1）" });
   await form.getByRole("button", { name: "创建" }).click();
-  await expect.poll(() => page.getByLabel("密钥明文").textContent()).toMatch(/^sk-rt-[A-Za-z0-9]{16,}$/);
-  await page.getByRole("button", { name: "关闭" }).click();
+  await expect
+    .poll(() => page.getByRole("region", { name: "密钥已创建" }).getByLabel("密钥明文").textContent())
+    .toMatch(/^sk-rt-[A-Za-z0-9]{16,}$/);
+  await page.getByRole("region", { name: "密钥已创建" }).getByRole("button", { name: "关闭" }).click();
 
   const listed = (await stack.admin.get(`/admin/tenants/${t.id}/keys`)).items as Json[];
   const stored = listed.find((k) => k.label === "single-key-t6");

@@ -22,7 +22,7 @@ const ROLLOUT_MS = 15_000;
 /** The tests that wait on the gateway more than once. */
 const GATEWAY_TEST_MS = 90_000;
 /** The notice a new key's secret is shown in. */
-const SECRET_NOTICE = "明文只显示这一次";
+const SECRET_NOTICE = "密钥明文（可再次复制）";
 
 test.beforeAll(async () => {
 
@@ -408,7 +408,7 @@ test("门户的密钥页不出现分组的路由名", async ({ page }) => {
   for (const text of seen) expect.soft(text).not.toContain("grp-route-9f3");
 });
 
-test("新建密钥：明文只显示一次，能调用被授权的模型，不能调用图片接口", async ({ page }) => {
+test("新建密钥：明文可随时再次复制，能调用被授权的模型，不能调用图片接口", async ({ page }) => {
   test.setTimeout(GATEWAY_TEST_MS);
   await activeOrg("Keys Org 1a7", "owner@keys-1a7.test");
   const consoleLines: string[] = [];
@@ -475,6 +475,65 @@ test("新建密钥：明文只显示一次，能调用被授权的模型，不�
   expect(kept).not.toContain(plaintext);
   expect(page.url()).not.toContain(plaintext);
   expect(consoleLines.join("\n")).not.toContain(plaintext);
+});
+
+test("密钥明文可以再次复制：刷新后复制到剪贴板，用复制到的值能调网关", async ({ page }) => {
+  test.setTimeout(GATEWAY_TEST_MS);
+  await activeOrg("Keys Reveal Org 5c1", "owner@reveal-5c1.test");
+  await page.context().grantPermissions(["clipboard-read", "clipboard-write"], { origin: stack.previewUrl });
+  await login(page, "owner@reveal-5c1.test");
+  await openTab(page, "密钥");
+  await expect(page.getByRole("group", { name: "可用模型" })).toBeVisible();
+  await page.getByLabel("名称", { exact: true }).fill("reveal-key-5c1");
+  await page.getByRole("button", { name: "新建密钥" }).click();
+  const notice = page.getByRole("region", { name: SECRET_NOTICE });
+  const minted = await notice.getByRole("textbox").inputValue();
+  expect(minted).toMatch(/^sk-rt-[A-Za-z0-9]{16,}$/);
+  await notice.getByRole("button", { name: "我已保存" }).click();
+  await expect(page.getByRole("region", { name: SECRET_NOTICE })).toHaveCount(0);
+  await expect(row(page, "reveal-key-5c1")).toContainText(minted.slice(0, 12));
+
+  // A reload drops everything the page held; the list still has the key.
+  await page.reload();
+  await openTab(page, "密钥");
+  const listed = row(page, "reveal-key-5c1");
+  await expect(listed).toBeVisible();
+  await expect(listed).not.toContainText(minted);
+
+  // 显示 puts the plaintext in the row, and 隐藏 takes it away again.
+  await listed.getByRole("button", { name: "显示" }).click();
+  await expect(listed).toContainText(minted);
+  await listed.getByRole("button", { name: "隐藏" }).click();
+  await expect(listed).not.toContainText(minted);
+  await expect(listed).toContainText(`${minted.slice(0, 12)}…`);
+
+  // 复制 copies it in one click, and the toast says so.
+  await page.evaluate(() => navigator.clipboard.writeText(""));
+  await listed.getByRole("button", { name: "复制" }).click();
+  await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toBe(minted);
+  await expect(page.getByText("已复制", { exact: true }).first()).toBeVisible();
+
+  // The value copied is the key the gateway serves.
+  await chatSettles(minted, 200);
+
+  // Each reveal is recorded as the key's own member's, and no row holds the
+  // plaintext.
+  const { items: keys } = await (await signedIn("owner@reveal-5c1.test")).get("/api/keys");
+  const keyId: string = keys.find((k: Json) => k.label === "reveal-key-5c1").id;
+  const audit = await stack.admin.get(`/admin/audit?target_id=${keyId}&limit=50`);
+  const reveals = (audit.items as Json[]).filter((r) => r.action === "key.reveal");
+  expect(reveals.length).toBeGreaterThanOrEqual(1);
+  for (const r of reveals) expect(JSON.stringify(r)).not.toContain(minted);
+
+  // A key minted before the platform stored a sealed copy offers no copy,
+  // and says why.
+  const old = await (await signedIn("owner@reveal-5c1.test")).post("/api/keys", { label: "old-key-5c1" });
+  stack.clearKeySealed(old.key.id);
+  await page.reload();
+  await openTab(page, "密钥");
+  const stale = row(page, "old-key-5c1");
+  await expect(stale.getByRole("button", { name: "复制" })).toHaveAttribute("aria-disabled", "true");
+  await expect(stale.getByRole("button", { name: "显示" })).toHaveCount(0);
 });
 
 test("门户页面上看不到任何上游信息", async ({ page }) => {
