@@ -61,9 +61,9 @@ use crate::sink::is_mcp;
 use crate::sink::{
     build_object_store_sink, resolve_datadog_credential, resolve_sls_credential, AliyunSlsSink,
     BatchUnit, CapturedContent, DatadogSink, ErrorRedactor, EventBatch, ExporterPipelines,
-    IdempotencyMarker, IdempotencyScheme, ObservabilitySink, OrderingScope, PipelineConfig,
-    SinkAck, SinkCapabilities, SinkContent, SinkError, SinkHealth, SinkRecord, SinkResult,
-    SinkStatsSnapshot,
+    IdempotencyMarker, IdempotencyScheme, ObservabilitySink, OrderingScope, PartialSuccess,
+    PipelineConfig, SinkAck, SinkCapabilities, SinkContent, SinkError, SinkHealth, SinkRecord,
+    SinkResult, SinkStatsSnapshot, RESPONSE_BODY_LIMIT,
 };
 use crate::usage::{GatewayEmbeddingCall, UsageEvent};
 
@@ -322,16 +322,18 @@ impl OtlpHttpFanOut {
 
     /// The pipeline delivering to `exp`, started on first sighting.
     ///
-    /// Dispatch on kind: each arm fingerprints its delivery-relevant config
-    /// (so a dashboard edit rebuilds the pipeline) and lazily builds the
-    /// matching sink. All kinds share one `ExporterPipelines` manager and the
+    /// Dispatch on kind: the exporter's fingerprint ([`fingerprint_exporter`])
+    /// decides when a dashboard edit rebuilds the pipeline, and each arm
+    /// lazily builds the matching sink. All kinds share one `ExporterPipelines` manager and the
     /// pooled client. A new `ExporterKind` variant makes this `match`
     /// non-exhaustive — a compile-time prompt to wire its sink here.
     fn pipeline_for(&self, exp: &ObservabilityExporter) -> crate::sink::SinkHandle {
         let client = self.inner.client.clone();
+        // The same fingerprint `reconcile` compares against, or a pipeline
+        // started here would be torn down by the next reconcile.
+        let fingerprint = fingerprint_exporter(exp);
         match &exp.kind {
             ExporterKind::OtlpHttp(cfg) => {
-                let fingerprint = fingerprint_otlp(cfg);
                 let name = exp.name.clone();
                 let endpoint = cfg.endpoint.clone();
                 let headers = cfg.headers.clone();
@@ -351,7 +353,6 @@ impl OtlpHttpFanOut {
                     })
             }
             ExporterKind::AliyunSls(cfg) => {
-                let fingerprint = fingerprint_sls(cfg);
                 let name = exp.name.clone();
                 let cfg = cfg.clone();
                 self.inner
@@ -375,7 +376,6 @@ impl OtlpHttpFanOut {
                     })
             }
             ExporterKind::ObjectStore(cfg) => {
-                let fingerprint = fingerprint_object_store(cfg);
                 let name = exp.name.clone();
                 let cfg = cfg.clone();
                 self.inner
@@ -390,7 +390,6 @@ impl OtlpHttpFanOut {
                     })
             }
             ExporterKind::Datadog(cfg) => {
-                let fingerprint = fingerprint_datadog(cfg);
                 let name = exp.name.clone();
                 let cfg = cfg.clone();
                 self.inner
@@ -478,13 +477,28 @@ impl Default for OtlpHttpFanOut {
     }
 }
 
+/// The fingerprint every pipeline decision keys on — the lazy start, the
+/// reconcile, and the stale-generation check: the kind's delivery config plus
+/// the exporter's two header selections.
+///
+/// The selections belong here because each queued record carries the header
+/// values its exporter selected when the record was built. Taking a header out
+/// of a selection is therefore a revocation like any other edit, and the old
+/// pipeline — with the copies it still holds — has to go, exactly as it does
+/// when the endpoint moves.
 fn fingerprint_exporter(exporter: &ObservabilityExporter) -> u64 {
-    match &exporter.kind {
+    use std::hash::{Hash, Hasher};
+    let kind = match &exporter.kind {
         ExporterKind::OtlpHttp(cfg) => fingerprint_otlp(cfg),
         ExporterKind::AliyunSls(cfg) => fingerprint_sls(cfg),
         ExporterKind::ObjectStore(cfg) => fingerprint_object_store(cfg),
         ExporterKind::Datadog(cfg) => fingerprint_datadog(cfg),
-    }
+    };
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    kind.hash(&mut hasher);
+    exporter.request_headers.hash(&mut hasher);
+    exporter.upstream_response_headers.hash(&mut hasher);
+    hasher.finish()
 }
 
 /// Hash an `otlp_http` exporter's delivery-relevant config. A change to any
@@ -764,6 +778,7 @@ impl ObservabilitySink for OtlpSink {
             .iter()
             .flat_map(|record| build_otlp_spans(record, &self.name))
             .collect();
+        let span_count = spans.len();
         let body = otlp_export_request(spans, &self.service_name);
         let bytes = serde_json::to_vec(&body)
             .map_err(|e| SinkError::Permanent(format!("otlp encode: {e}")))?;
@@ -781,13 +796,17 @@ impl ObservabilitySink for OtlpSink {
             Ok(resp) => {
                 let status = resp.status();
                 if status.is_success() {
+                    // A receiver that kept only part of the request still
+                    // answers 200 and says what it dropped in the body.
+                    let body = crate::sink::read_body_prefix(resp, RESPONSE_BODY_LIMIT).await;
                     return Ok(SinkAck {
                         accepted: batch.len(),
+                        partial: otlp_partial_success(&body, span_count),
                         ..SinkAck::default()
                     });
                 }
                 let retry_after = crate::sink::retry_after_of(status, resp.headers());
-                let text = resp.text().await.unwrap_or_default();
+                let text = crate::sink::read_body_prefix(resp, RESPONSE_BODY_LIMIT).await;
                 let detail = format!(
                     "HTTP {}: {}",
                     status,
@@ -831,6 +850,35 @@ impl ObservabilitySink for OtlpSink {
                 r.secret(value).secret(credential)
             })
     }
+}
+
+/// The `partial_success` of an OTLP/HTTP export response, when the receiver
+/// set one (<https://opentelemetry.io/docs/specs/otlp/#partial-success-1>):
+/// `rejectedSpans` above zero is a partial rejection, zero with an
+/// `errorMessage` is a warning on a full success. `rejectedSpans` is an
+/// int64, which the protobuf JSON mapping writes as a string; a number is
+/// read too. A body that is empty, `{}`, not JSON, or carries an empty
+/// `partialSuccess` is a full success.
+fn otlp_partial_success(body: &str, spans: usize) -> Option<PartialSuccess> {
+    let value: Value = serde_json::from_str(body).ok()?;
+    let partial = value.get("partialSuccess")?;
+    let rejected = match partial.get("rejectedSpans") {
+        Some(Value::String(count)) => count.trim().parse().unwrap_or(0),
+        Some(Value::Number(count)) => count.as_u64().unwrap_or(0),
+        _ => 0,
+    };
+    let message = partial
+        .get("errorMessage")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    let detail = match (rejected, message.is_empty()) {
+        (0, true) => return None,
+        (0, false) => format!("receiver warning: {message}"),
+        (_, true) => format!("receiver rejected {rejected} of {spans} spans"),
+        (_, false) => format!("receiver rejected {rejected} of {spans} spans: {message}"),
+    };
+    Some(PartialSuccess { rejected, detail })
 }
 
 /// Encode a record without a trace snapshot as one CLIENT span: a caller that
@@ -3720,6 +3768,135 @@ mod tests {
         assert!(!err.is_transient(), "4xx must be permanent: {err}");
     }
 
+    /// A receiver whose error body never ends must not have it buffered
+    /// before the excerpt is cut — compressed or not. The excerpt still
+    /// carries the body's start, and the delivery fails at once rather
+    /// than when the request timeout gives up on the body.
+    #[tokio::test]
+    async fn an_endless_error_body_is_read_only_as_far_as_its_excerpt() {
+        for gzip in [false, true] {
+            let base = crate::sink::endless_body::serve(gzip).await;
+            let sink = OtlpSink::new(
+                "e",
+                format!("{base}/v1/traces"),
+                BTreeMap::new(),
+                OtlpHttpFanOut::new().inner.client.clone(),
+            );
+            let started = std::time::Instant::now();
+            let err = sink
+                .append_batch(&batch_of(1), &IdempotencyMarker::None)
+                .await
+                .expect_err("a 500 fails the delivery")
+                .to_string();
+            assert!(
+                started.elapsed() < REQUEST_TIMEOUT - Duration::from_secs(1),
+                "gzip={gzip}: the read waited for the body to end: {:?}",
+                started.elapsed()
+            );
+            assert!(
+                err.contains("HTTP 500") && err.contains("xxxxxxxx"),
+                "gzip={gzip}: {err}"
+            );
+        }
+    }
+
+    /// Deliver `records` records through a pipeline to `sink` and return its
+    /// stats once the batch has been acknowledged.
+    async fn stats_after_one_delivery(sink: OtlpSink, records: usize) -> SinkStatsSnapshot {
+        let (handle, worker) = crate::sink::SinkPipeline::new(
+            Arc::new(sink),
+            PipelineConfig {
+                flush_interval: Duration::from_millis(20),
+                ..PipelineConfig::default()
+            },
+        );
+        let (cancel_tx, cancel) = tokio::sync::watch::channel(false);
+        let run = tokio::spawn(worker.run(cancel));
+        for _ in 0..records {
+            assert!(handle.try_enqueue(Arc::new(SinkRecord::metadata_only(sample_event()))));
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while handle.stats().delivered_batches + handle.stats().failed_batches == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "nothing was delivered"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        cancel_tx.send(true).unwrap();
+        run.await.unwrap();
+        handle.stats()
+    }
+
+    /// An OTLP receiver that keeps only part of a request still answers
+    /// 200, and says so in `partial_success`. The delivery is not retried —
+    /// the spec forbids it — but it is not reported as clean either: the
+    /// rejected spans are counted and the receiver's message is what the
+    /// health report shows. A warning with nothing rejected, an empty body
+    /// and `{}` are all full successes.
+    #[tokio::test]
+    async fn a_partial_success_is_counted_and_reported_but_not_retried() {
+        struct Case {
+            body: &'static str,
+            rejected: u64,
+            last_error: Option<&'static str>,
+        }
+        for case in [
+            Case {
+                body: r#"{"partialSuccess":{"rejectedSpans":"2","errorMessage":"span too large"}}"#,
+                rejected: 2,
+                last_error: Some("receiver rejected 2 of 3 spans: span too large"),
+            },
+            Case {
+                body: r#"{"partialSuccess":{"rejectedSpans":3}}"#,
+                rejected: 3,
+                last_error: Some("receiver rejected 3 of 3 spans"),
+            },
+            Case {
+                body: r#"{"partialSuccess":{"errorMessage":"attribute limit reached"}}"#,
+                rejected: 0,
+                last_error: None,
+            },
+            Case {
+                body: "",
+                rejected: 0,
+                last_error: None,
+            },
+            Case {
+                body: "{}",
+                rejected: 0,
+                last_error: None,
+            },
+        ] {
+            let server = wiremock::MockServer::builder().start().await;
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .respond_with(
+                    wiremock::ResponseTemplate::new(200)
+                        .insert_header("content-type", "application/json")
+                        .set_body_string(case.body),
+                )
+                .mount(&server)
+                .await;
+            let sink = OtlpSink::new(
+                "e",
+                format!("{}/v1/traces", server.uri()),
+                BTreeMap::new(),
+                otlp_test_client(),
+            );
+            let stats = stats_after_one_delivery(sink, 3).await;
+            let body = case.body;
+            assert_eq!(stats.rejected, case.rejected, "{body}");
+            assert_eq!(stats.last_error.as_deref(), case.last_error, "{body}");
+            assert_eq!(stats.sent, 3, "{body}");
+            assert_eq!((stats.delivered_batches, stats.dropped), (1, 0), "{body}");
+            assert_eq!(
+                stats.retries, 0,
+                "{body}: a partial success is never retried"
+            );
+            assert_eq!(server.received_requests().await.unwrap().len(), 1, "{body}");
+        }
+    }
+
     /// The `last_error` a pipeline records for `sink`'s first failed
     /// delivery — the text the warn log and the heartbeat carry too.
     async fn first_last_error(sink: OtlpSink) -> String {
@@ -3957,6 +4134,58 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
         f.shutdown().await;
+    }
+
+    /// A queued record carries the header values its exporter selected when
+    /// it was built. Taking a header out of either selection revokes those
+    /// copies the same way moving the endpoint does: the old pipeline goes,
+    /// and what it still held never reaches the receiver.
+    #[tokio::test]
+    async fn removing_a_header_selection_revokes_the_queued_copies() {
+        for removed in ["request_headers", "upstream_response_headers"] {
+            let server = wiremock::MockServer::builder().start().await;
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .and(wiremock::matchers::path("/v1/traces"))
+                .respond_with(wiremock::ResponseTemplate::new(200))
+                .mount(&server)
+                .await;
+            let old: ObservabilityExporter = serde_json::from_value(serde_json::json!({
+                "name": "selected",
+                "enabled": true,
+                "kind": "otlp_http",
+                "endpoint": format!("{}/v1/traces", server.uri()),
+                "headers": {},
+                "request_headers": ["x-team"],
+                "upstream_response_headers": ["x-request-id"],
+            }))
+            .unwrap();
+            let mut new = old.clone();
+            match removed {
+                "request_headers" => new.request_headers.clear(),
+                _ => new.upstream_response_headers.clear(),
+            }
+            let mut event = sample_event();
+            event
+                .request_headers
+                .insert("x-team".into(), "team-secret-label".into());
+            event
+                .upstream_response_headers
+                .insert("x-request-id".into(), "upstream-req-1".into());
+
+            let f = OtlpHttpFanOut::new();
+            f.fan_out(&event, None, None, None, 1, std::iter::once(&old));
+            f.reconcile(2, std::iter::once(&new));
+            assert!(
+                f.exporter_stats().is_empty(),
+                "{removed}: the pipeline holding the old selection must stop",
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(1_200)).await;
+            assert!(
+                server.received_requests().await.unwrap().is_empty(),
+                "{removed}: a copy queued under the old selection reached the receiver",
+            );
+            f.shutdown().await;
+        }
     }
 
     /// Under thread-per-core serving the first event an exporter sees comes

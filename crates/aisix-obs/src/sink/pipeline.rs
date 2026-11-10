@@ -88,6 +88,7 @@ impl Default for PipelineConfig {
 pub struct SinkStats {
     sent: AtomicU64,
     dropped: AtomicU64,
+    rejected: AtomicU64,
     retries: AtomicU64,
     delivered_batches: AtomicU64,
     failed_batches: AtomicU64,
@@ -105,6 +106,12 @@ pub struct SinkStatsSnapshot {
     /// Records dropped — queue-full backpressure plus retry-exhausted /
     /// permanent failures.
     pub dropped: u64,
+    /// Items receivers reported rejecting from deliveries they otherwise
+    /// accepted, in the receiver's own unit (spans, for an OTLP receiver),
+    /// so not comparable with the record counts beside it. The records
+    /// those deliveries carried are counted in `sent`: which of them the
+    /// rejected items came from is not something a receiver says.
+    pub rejected: u64,
     /// Retry attempts made across all batches.
     pub retries: u64,
     /// Batches the sink acknowledged.
@@ -112,9 +119,9 @@ pub struct SinkStatsSnapshot {
     /// Batches given up on after retries (or a permanent error).
     pub failed_batches: u64,
     /// Masked excerpt of the most recent failed delivery attempt — one
-    /// that will be retried as well as one that dropped its batch.
-    /// Cleared on the next successful delivery, so `Some` means
-    /// "currently failing".
+    /// that will be retried as well as one that dropped its batch, or a
+    /// delivery the receiver kept only part of. Cleared on the next
+    /// delivery kept whole, so `Some` means "currently failing".
     pub last_error: Option<String>,
     /// Unix seconds of the most recent successful batch delivery.
     pub last_success_unix: Option<i64>,
@@ -138,6 +145,9 @@ impl SinkStats {
     }
     fn add_dropped(&self, n: u64) {
         self.dropped.fetch_add(n, Ordering::Relaxed);
+    }
+    fn add_rejected(&self, n: u64) {
+        self.rejected.fetch_add(n, Ordering::Relaxed);
     }
     fn add_retries(&self, n: u64) {
         self.retries.fetch_add(n, Ordering::Relaxed);
@@ -165,6 +175,7 @@ impl SinkStats {
         SinkStatsSnapshot {
             sent: self.sent.load(Ordering::Relaxed),
             dropped: self.dropped.load(Ordering::Relaxed),
+            rejected: self.rejected.load(Ordering::Relaxed),
             retries: self.retries.load(Ordering::Relaxed),
             delivered_batches: self.delivered_batches.load(Ordering::Relaxed),
             failed_batches: self.failed_batches.load(Ordering::Relaxed),
@@ -222,20 +233,6 @@ impl SinkHandle {
         }
     }
 
-    /// Account for what the queue holds, for a caller about to abort the
-    /// worker. The discard itself is deliberate (a revoked exporter must not
-    /// receive what was queued for it), but it is a loss like any other.
-    pub(crate) fn count_queued_as_dropped(&self) {
-        let queued = self.queued();
-        if queued == 0 {
-            return;
-        }
-        self.stats.add_dropped(queued);
-        if let Some(m) = &self.metrics {
-            m.record_otlp_fanout_drop(&self.name, "worker_stopped", queued);
-        }
-    }
-
     /// Snapshot of this sink's delivery counters.
     pub fn stats(&self) -> SinkStatsSnapshot {
         self.stats.snapshot()
@@ -271,6 +268,38 @@ pub struct SinkPipeline {
     stats: Arc<SinkStats>,
     metrics: Option<Metrics>,
     redactor: ErrorRedactor,
+    /// Records the worker has taken off the queue and not yet settled —
+    /// buffered for the next batch, or in the batch being delivered. A
+    /// record is settled when its batch is acknowledged or counted as
+    /// dropped. What is still held when the worker is torn down is counted
+    /// on [`Drop`]; the queue alone cannot say, since it no longer holds
+    /// these.
+    held: AtomicU64,
+}
+
+/// Aborting the worker drops it mid-flight, and with it whatever it held:
+/// its buffer, the batch being delivered, and the queue behind them. The
+/// discard is deliberate — a revoked exporter must not receive what was
+/// queued for it — but it is a loss like any other, so it is counted here,
+/// where every record is in sight, rather than by the caller about to abort,
+/// who sees only the queue. A record in the batch being delivered is
+/// counted too, although the receiver may have accepted it before the
+/// request was cut: an unconfirmed delivery reads as lost.
+impl Drop for SinkPipeline {
+    fn drop(&mut self) {
+        self.rx.close();
+        let mut lost = *self.held.get_mut();
+        while self.rx.try_recv().is_ok() {
+            lost += 1;
+        }
+        if lost == 0 {
+            return;
+        }
+        self.stats.add_dropped(lost);
+        if let Some(m) = &self.metrics {
+            m.record_otlp_fanout_drop(self.sink.name(), "worker_stopped", lost);
+        }
+    }
 }
 
 impl SinkPipeline {
@@ -307,6 +336,7 @@ impl SinkPipeline {
             stats,
             metrics,
             redactor,
+            held: AtomicU64::new(0),
         };
         (handle, worker)
     }
@@ -337,6 +367,7 @@ impl SinkPipeline {
                 maybe = self.rx.recv() => match maybe {
                     Some(record) => {
                         buffer.push(record);
+                        self.hold(1);
                         if buffer.len() >= self.cfg.max_batch {
                             self.flush(&mut buffer, None, &mut shutdown).await;
                         }
@@ -386,7 +417,10 @@ impl SinkPipeline {
         loop {
             while buffer.len() < self.cfg.max_batch {
                 match self.rx.try_recv() {
-                    Ok(record) => buffer.push(record),
+                    Ok(record) => {
+                        buffer.push(record);
+                        self.hold(1);
+                    }
                     Err(_) => break,
                 }
             }
@@ -398,6 +432,7 @@ impl SinkPipeline {
                 // deadline is already spent. Account what is left rather
                 // than let it vanish unaccounted.
                 let mut lost = buffer.len();
+                self.settle(lost);
                 buffer.clear();
                 while self.rx.try_recv().is_ok() {
                     lost += 1;
@@ -453,9 +488,35 @@ impl SinkPipeline {
         loop {
             match self.sink.append_batch(batch, &marker).await {
                 Ok(ack) => {
+                    self.settle(count);
                     self.stats.add_sent(ack.accepted as u64);
                     self.stats.record_batch_delivered();
-                    self.stats.clear_error();
+                    match ack.partial {
+                        // The receiver kept the request but not all of it.
+                        // Not retried — it answered — but not a clean
+                        // delivery either: the health report says so until
+                        // a delivery is kept whole.
+                        Some(partial) if partial.rejected > 0 => {
+                            self.stats.add_rejected(partial.rejected);
+                            let detail = masked_text(&partial.detail, &self.redactor);
+                            tracing::warn!(
+                                sink = %self.sink.name(),
+                                rejected = partial.rejected,
+                                error = %detail,
+                                "sink receiver rejected part of a delivered batch",
+                            );
+                            self.stats.set_error(detail);
+                        }
+                        Some(warning) => {
+                            self.stats.clear_error();
+                            tracing::warn!(
+                                sink = %self.sink.name(),
+                                warning = %masked_text(&warning.detail, &self.redactor),
+                                "sink receiver accepted a batch with a warning",
+                            );
+                        }
+                        None => self.stats.clear_error(),
+                    }
                     return;
                 }
                 Err(err) => {
@@ -504,6 +565,7 @@ impl SinkPipeline {
                     } else {
                         "permanent_error"
                     };
+                    self.settle(count);
                     self.record_drop(count, &detail, reason);
                     return;
                 }
@@ -553,6 +615,16 @@ impl SinkPipeline {
             None => backoff(self.cfg.base_backoff, self.cfg.max_backoff, attempt + 1),
         };
         Some(delay.min(remaining))
+    }
+
+    /// `n` more records taken off the queue by the worker.
+    fn hold(&self, n: u64) {
+        self.held.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// `n` held records acknowledged or counted as dropped.
+    fn settle(&self, n: usize) {
+        self.held.fetch_sub(n as u64, Ordering::Relaxed);
     }
 
     fn record_drop(&self, count: usize, detail: &str, reason: &str) {
@@ -620,11 +692,12 @@ fn backoff(base: Duration, cap: Duration, attempt: u32) -> Duration {
 /// error source chain) survives with the enum prefix; trimming tighter than
 /// the sinks re-hides the cause they carry.
 fn masked(err: &SinkError, redactor: &ErrorRedactor) -> String {
-    redactor
-        .redact(&err.to_string())
-        .chars()
-        .take(600)
-        .collect()
+    masked_text(&err.to_string(), redactor)
+}
+
+/// [`masked`] for text a receiver sent with a delivery it accepted.
+fn masked_text(text: &str, redactor: &ErrorRedactor) -> String {
+    redactor.redact(text).chars().take(600).collect()
 }
 
 #[cfg(test)]

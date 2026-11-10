@@ -9,8 +9,10 @@ import {
   ProxyClient,
   SeedClient,
   spawnApp,
+  startMcpUpstream,
   startOpenAiUpstream,
   waitConfigPropagation,
+  type McpUpstream,
   type OpenAiUpstream,
   type SpawnedApp,
 } from "../harness/index.js";
@@ -342,6 +344,168 @@ describe("aisix export: etcd → export → file round-trip", () => {
       }
     } finally {
       await fileApp?.exit();
+      await etcd.deletePrefix(prefix);
+    }
+  });
+
+  // An api key's display_name is its label: the `${request.api_key.name}`
+  // header template and the `api_key_name` metric label read it. Moving the
+  // configuration to a file must not lose it.
+  test("an api key's label survives the move", async (ctx) => {
+    if (!etcdReachable || !upstream) {
+      ctx.skip();
+      return;
+    }
+    const etcd = new EtcdClient();
+    const prefix = `/aisix-export-label-${randomUUID()}`;
+    const seed = new SeedClient(etcd, prefix);
+    const caller = "sk-export-label-caller";
+    let labelApp: SpawnedApp | undefined;
+    try {
+      const pk = await seed.createProviderKey({
+        display_name: "label-pk",
+        api_key: "sk-label-secret",
+        api_base: `${upstream.baseUrl}/v1`,
+        request: { default_headers: { "x-caller-key": "${request.api_key.name}" } },
+      });
+      await seed.createModel({
+        display_name: "label-model",
+        provider: "openai",
+        model_name: "gpt-4o-mini",
+        provider_key_id: pk.id,
+      });
+      await seed.createApiKey({
+        key_hash: createHash("sha256").update(caller).digest("hex"),
+        display_name: "billing-service",
+        allowed_models: ["label-model"],
+      });
+
+      const { stdout: yaml } = await execFileP(BIN_PATH, [
+        "export",
+        "--etcd",
+        ETCD_ENDPOINT,
+        "--prefix",
+        prefix,
+      ]);
+      // A default header can carry a credential, so the export writes every
+      // one as a placeholder; the operator puts the template back through
+      // its variable like any other value.
+      labelApp = await spawnApp({
+        resourcesFile: yaml,
+        extraEnv: Object.fromEntries(
+          placeholderVars(yaml).map((v) => [
+            v,
+            v.endsWith("X_CALLER_KEY") ? "${request.api_key.name}" : "sk-label-secret",
+          ]),
+        ),
+      });
+      const before = upstream.receivedRequests.length;
+      const chat = await new ProxyClient(labelApp.proxyUrl, caller).chat({
+        model: "label-model",
+        messages: [{ role: "user", content: "who is calling" }],
+      });
+      expect(chat.status).toBe(200);
+      const sent = upstream.receivedRequests.slice(before);
+      expect(sent).toHaveLength(1);
+      expect(sent[0]!.headers["x-caller-key"]).toBe("billing-service");
+    } finally {
+      await labelApp?.exit();
+      await etcd.deletePrefix(prefix);
+    }
+  });
+
+  // Anonymous MCP access runs as an api key named by id, and in a file every
+  // api key id is derived from the key's name: exported verbatim, the etcd id
+  // names no key and anonymous access closes. The resource URL may carry a
+  // password in its userinfo, which the default export must not print.
+  test("anonymous MCP access and its resource URL survive the move", async (ctx) => {
+    if (!etcdReachable) {
+      ctx.skip();
+      return;
+    }
+    const etcd = new EtcdClient();
+    const prefix = `/aisix-export-anon-${randomUUID()}`;
+    const seed = new SeedClient(etcd, prefix);
+    const password = "resource-url-password-must-not-leak-7q6w";
+    let docs: McpUpstream | undefined;
+    let anonApp: SpawnedApp | undefined;
+    try {
+      docs = await startMcpUpstream("docs");
+      await seed.update("mcp_servers", randomUUID(), {
+        name: "docs",
+        url: docs.url,
+        enabled: true,
+      });
+      const principal = await seed.createApiKey({
+        key_hash: createHash("sha256").update(`sk-anon-${randomUUID()}`).digest("hex"),
+        display_name: "anonymous-docs",
+        allowed_models: [],
+        mcp_access: { allow: ["*"] },
+      });
+      await seed.update("mcp_auth_settings", randomUUID(), {
+        resource_url: `https://svc:${password}@gw.example.com/mcp`,
+        anonymous: {
+          enabled: true,
+          api_key_id: principal.id,
+          // The e2e client connects over loopback, in either family.
+          source_cidrs: ["127.0.0.0/8", "::1/128"],
+          servers: ["docs"],
+        },
+      });
+
+      const { stdout: yaml, stderr } = await execFileP(BIN_PATH, [
+        "export",
+        "--etcd",
+        ETCD_ENDPOINT,
+        "--prefix",
+        prefix,
+      ]);
+      expect(yaml).not.toContain(password);
+      expect(stderr).not.toContain(password);
+      const vars = placeholderVars(yaml);
+      const urlVar = vars.find((v) => v.includes("MCP_AUTH_SETTINGS") && v.endsWith("_PASSWORD"));
+      expect(urlVar, yaml).toBeDefined();
+
+      anonApp = await spawnApp({
+        resourcesFile: yaml,
+        extraEnv: Object.fromEntries(vars.map((v) => [v, password])),
+      });
+      // No credential at all, from an allowed source: served as the bound
+      // principal, exactly as the etcd-backed gateway would.
+      const rpc = (body: unknown) =>
+        fetch(`${anonApp!.proxyUrl}/mcp/docs`, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            accept: "application/json, text/event-stream",
+          },
+          body: JSON.stringify(body),
+        });
+      const init = await rpc({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: {
+          protocolVersion: "2025-11-25",
+          capabilities: {},
+          clientInfo: { name: "export-anon-e2e", version: "0.1" },
+        },
+      });
+      await init.text();
+      expect(init.status).toBe(200);
+      await (await rpc({ jsonrpc: "2.0", method: "notifications/initialized" })).text();
+      const call = await rpc({
+        jsonrpc: "2.0",
+        id: 2,
+        method: "tools/call",
+        params: { name: "echo", arguments: { text: "anonymous after export" } },
+      });
+      const reply = await call.text();
+      expect(call.status).toBe(200);
+      expect(reply).toContain("anonymous after export");
+    } finally {
+      await anonApp?.exit();
+      await docs?.close();
       await etcd.deletePrefix(prefix);
     }
   });

@@ -55,6 +55,7 @@ jobs:
     env:
       AWS_ROLE_ARN: ${{ secrets.AISIX_E2E_OIDC_AWS_ROLE_ARN }}
       AWS_REGION_CFG: ${{ secrets.AISIX_E2E_OBJSTORE_S3_REGION }}
+      AWS_BUCKET_CFG: ${{ secrets.AISIX_E2E_OBJSTORE_S3_BUCKET }}
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -63,15 +64,22 @@ jobs:
 
       - name: Report configuration
         run: |
-          if [ -n "$AWS_ROLE_ARN" ] && [ -n "$AWS_REGION_CFG" ]; then
-            echo "AWS OIDC: configured (role + region)"
+          # The keyless round-trip needs the role, the region AND the bucket:
+          # without the bucket the test self-skips after the role is assumed,
+          # and the run passes having written nothing. The region and bucket
+          # secrets are shared with the static-key job, so they alone do not
+          # mean keyless is configured — the role does, and with it the other
+          # two are required on any event.
+          if [ -n "$AWS_ROLE_ARN" ] && [ -n "$AWS_REGION_CFG" ] && [ -n "$AWS_BUCKET_CFG" ]; then
+            echo "AWS OIDC: configured (role + region + bucket)"
           elif [ -n "$AWS_ROLE_ARN" ]; then
-            echo "::warning::AWS_ROLE_ARN set but AISIX_E2E_OBJSTORE_S3_REGION is empty — S3 keyless self-skips"
+            echo "::error::AISIX_E2E_OIDC_AWS_ROLE_ARN is set but AISIX_E2E_OBJSTORE_S3_REGION and AISIX_E2E_OBJSTORE_S3_BUCKET are not both set — the S3 keyless round-trip would self-skip"
+            exit 1
           else
             echo "::warning::AWS OIDC role absent — S3 keyless self-skips"
           fi
-          if [ "${{ github.event_name }}" != "pull_request" ] && { [ -z "$AWS_ROLE_ARN" ] || [ -z "$AWS_REGION_CFG" ]; }; then
-            echo "::error::AWS OIDC not fully configured (role ARN + region); this ${{ github.event_name }} run would test nothing."
+          if [ "${{ github.event_name }}" != "pull_request" ] && [ -z "$AWS_ROLE_ARN" ]; then
+            echo "::error::AWS OIDC not configured (role ARN + region + bucket); this ${{ github.event_name }} run would test nothing."
             exit 1
           fi
 

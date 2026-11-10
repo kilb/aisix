@@ -1,6 +1,5 @@
 import { createHash } from "node:crypto";
 import { createServer, type Server } from "node:http";
-import { connect } from "node:net";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   EtcdClient,
@@ -12,6 +11,7 @@ import {
   type OpenAiUpstream,
   type SpawnedApp,
 } from "../harness/index.js";
+import { redisReady } from "../harness/redis.js";
 import { pickFreePort } from "../harness/ports.js";
 
 // E2E: semantic cache on the SHARED redis backend (#558,
@@ -24,8 +24,9 @@ import { pickFreePort } from "../harness/ports.js";
 // speaks the vector-search command family (redis:8+ — what CI
 // provisions); the degradation suite runs iff it does NOT (a plain
 // redis 6/7), pinning that `semantic` on a backend=redis policy then
-// stays exact-only without failing traffic. Each suite skips honestly
-// when its capability precondition doesn't hold.
+// stays exact-only without failing traffic. Locally each suite skips
+// when its capability precondition doesn't hold; on CI, which provisions
+// both servers, a missing capability fails the run (harness/redis.ts).
 
 const REDIS_URL = process.env.AISIX_E2E_REDIS ?? "redis://127.0.0.1:6379";
 
@@ -33,37 +34,6 @@ const CALLER_PLAINTEXT = "sk-semredis-caller";
 const CALLER_KEY_HASH = createHash("sha256")
   .update(CALLER_PLAINTEXT)
   .digest("hex");
-
-/** RESP-level probe: does the server speak FT.* (vector search)?
- *  `null` = server unreachable (both suites skip). */
-async function redisVectorSupport(url: string): Promise<boolean | null> {
-  // Plaintext RESP probe: a rediss:// target cannot be probed this way
-  // — that is "unknown", not "unsupported", so both suites skip
-  // honestly rather than mislabeling a TLS server as vector-less.
-  if (/^rediss:\/\//.test(url)) return null;
-  const m = /^redis:\/\/(?:[^@/]*@)?([^:/]+)(?::(\d+))?/.exec(url);
-  if (!m) return null;
-  const host = m[1];
-  const port = m[2] ? Number(m[2]) : 6379;
-  return new Promise((resolve) => {
-    const sock = connect({ host, port }, () => sock.write("FT._LIST\r\n"));
-    const done = (v: boolean | null) => {
-      sock.destroy();
-      resolve(v);
-    };
-    sock.once("data", (buf) => {
-      const head = buf.toString();
-      if (head.startsWith("*")) return done(true); // array reply = supported
-      // Only an explicit unknown-command error PROVES the capability is
-      // absent; anything else (auth required, loading, protocol noise)
-      // proves nothing either way.
-      if (/^-ERR unknown command/i.test(head)) return done(false);
-      done(null);
-    });
-    sock.once("error", () => done(null));
-    sock.setTimeout(1000, () => done(null));
-  });
-}
 
 function keywordVector(text: string): number[] {
   const t = text.toLowerCase();
@@ -225,7 +195,7 @@ describe("semantic cache on shared redis (vector-capable)", () => {
   beforeAll(async () => {
     const etcd = new EtcdClient();
     if (!(await etcd.ping())) return;
-    if ((await redisVectorSupport(REDIS_URL)) !== true) return;
+    if (!(await redisReady(REDIS_URL, "vector"))) return;
 
     embedMock = await startEmbeddingMock();
     upstream = await startOpenAiUpstream({
@@ -366,7 +336,7 @@ describe("semantic on backend=redis degrades to exact-only without vector suppor
   beforeAll(async () => {
     const etcd = new EtcdClient();
     if (!(await etcd.ping())) return;
-    if ((await redisVectorSupport(PLAIN_REDIS_URL)) !== false) return;
+    if (!(await redisReady(PLAIN_REDIS_URL, "plain"))) return;
 
     embedMock = await startEmbeddingMock();
     upstream = await startOpenAiUpstream();

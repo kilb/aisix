@@ -1914,6 +1914,7 @@ impl<P: ConfigProvider> Supervisor<P> {
         });
 
         let mut streams = Vec::with_capacity(self.sources.len());
+        let mut watching: Vec<&str> = Vec::with_capacity(self.sources.len());
         for (source, from) in self.sources.iter().zip(&load.revisions) {
             // Each prefix resumes from its own read, never from the
             // maximum across prefixes. A prefix whose read was refused
@@ -1925,7 +1926,10 @@ impl<P: ConfigProvider> Supervisor<P> {
                 watch = source.provider.watch(from + 1) => watch,
             };
             match watch {
-                Ok(stream) => streams.push(stream),
+                Ok(stream) => {
+                    streams.push(stream);
+                    watching.push(&source.prefix.prefix);
+                }
                 Err(err) if source.tolerates(&err) => {
                     // No stream for this prefix this cycle. It is retried
                     // whenever the cycle restarts — which is what a
@@ -1937,12 +1941,46 @@ impl<P: ConfigProvider> Supervisor<P> {
             }
         }
         *steady_since = Some(tokio::time::Instant::now());
+        // Nested prefixes see the same write twice. With no `env_id` the
+        // environment prefix is the bare base and `<base>/global/` sits
+        // inside it, so a catalog write arrives on both watches — and two
+        // watches are not ordered against each other, so the copy on the
+        // outer one can land after a newer write the inner one already
+        // delivered, and put back a row that was changed or deleted since.
+        // Each key therefore belongs to ONE live watch: the most specific
+        // prefix being watched that contains it, the same longest-prefix
+        // rule the initial load resolves keys by. Every other watch's copy
+        // is dropped. A prefix with no live watch this cycle (its watch was
+        // refused) owns nothing, so the outer watch keeps delivering its
+        // keys.
+        let owners: Vec<Vec<String>> = watching
+            .iter()
+            .map(|mine| {
+                let mine = mine.trim_end_matches('/');
+                watching
+                    .iter()
+                    .map(|other| other.trim_end_matches('/'))
+                    .filter(|other| other.len() > mine.len() && under(mine, other))
+                    .map(str::to_string)
+                    .collect()
+            })
+            .collect();
         // Each stream is tagged so its END is delivered as an item
         // rather than absorbed by `select_all`. See [`Watched`].
-        let mut stream = futures::stream::select_all(streams.into_iter().map(|s| {
-            s.map(Watched::Event)
+        let mut stream =
+            futures::stream::select_all(streams.into_iter().zip(owners).map(|(s, inner)| {
+                s.filter(move |item| {
+                    let foreign = match item {
+                        Ok(WatchEvent::Put(raw)) => Some(raw.key.as_str()),
+                        Ok(WatchEvent::Delete { key, .. }) => Some(key.as_str()),
+                        _ => None,
+                    }
+                    .is_some_and(|key| inner.iter().any(|prefix| under(prefix, key)));
+                    futures::future::ready(!foreign)
+                })
+                .map(Watched::Event)
                 .chain(futures::stream::iter([Watched::Ended]))
-        }));
+            }));
 
         // An event the drain below pulled off the stream but could not
         // add to its batch (a resync, a stream error, the end of the
@@ -2187,6 +2225,13 @@ impl PrefixLoad {
     fn applied_revision(&self) -> i64 {
         self.revisions.iter().flatten().copied().min().unwrap_or(0)
     }
+}
+
+/// Whether `key` lies under `prefix` (trailing `/` ignored) on a segment
+/// boundary, so `/aisix/global` does not contain `/aisix/globalx/...`.
+fn under(prefix: &str, key: &str) -> bool {
+    key.strip_prefix(prefix.trim_end_matches('/'))
+        .is_some_and(|rest| rest.starts_with('/'))
 }
 
 /// One item off the merged watch.
@@ -4205,6 +4250,92 @@ mod tests {
     /// never comes: a single event on an otherwise idle stream is applied
     /// well inside the maximum wait, because the QUIET period is what
     /// releases it.
+    /// With no `env_id` the environment prefix is the bare base and the
+    /// catalog prefix nests inside it, so a catalog write reaches both
+    /// watches. The two are not ordered against each other: the outer
+    /// watch's copy of a write can arrive after the inner watch already
+    /// delivered a newer one. That late copy must not put back a price
+    /// that has been deleted since — a key belongs to the most specific
+    /// prefix being watched, and only that watch's events apply to it.
+    #[tokio::test(start_paused = true)]
+    async fn a_late_copy_from_an_outer_watch_cannot_undo_a_newer_write() {
+        const PRICE: &str = "/aisix/global/pricing/p-1";
+        let (env, env_tx) = LiveProvider::new(1);
+        let (global, global_tx) = LiveProvider::new(1);
+        let sup = Arc::new(Supervisor::with_sources(
+            vec![
+                (WatchedPrefix::environment("/aisix"), env),
+                (WatchedPrefix::global("/aisix/global/"), global),
+            ],
+            SnapshotCache::disabled(),
+        ));
+        let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let watcher = tokio::spawn({
+            let sup = sup.clone();
+            async move {
+                let _ = sup.cycle(&cancel_rx, &mut None).await;
+            }
+        });
+        let until = |what: &'static str, done: Box<dyn Fn() -> bool>| async move {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while !done() {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "{what} never happened"
+                );
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        };
+        until("the initial load", {
+            let sup = sup.clone();
+            Box::new(move || sup.handle().version() > 0)
+        })
+        .await;
+
+        // The catalog watch delivers the price and then its deletion.
+        global_tx
+            .unbounded_send(Ok(WatchEvent::Put(entry(PRICE, VALID_PRICE, 5))))
+            .unwrap();
+        global_tx
+            .unbounded_send(Ok(WatchEvent::Delete {
+                key: PRICE.to_string(),
+                revision: 6,
+            }))
+            .unwrap();
+        until("the deletion", {
+            let sup = sup.clone();
+            Box::new(move || sup.watch_status().snapshot().revision >= 6)
+        })
+        .await;
+        assert_eq!(sup.handle().load().global_pricing.len(), 0);
+
+        // The environment watch's copy of the original write arrives late,
+        // followed by a write of its own that proves it was processed.
+        env_tx
+            .unbounded_send(Ok(WatchEvent::Put(entry(PRICE, VALID_PRICE, 5))))
+            .unwrap();
+        env_tx
+            .unbounded_send(Ok(WatchEvent::Put(entry(
+                "/aisix/models/m-1",
+                VALID_MODEL,
+                7,
+            ))))
+            .unwrap();
+        until("the environment's own write", {
+            let sup = sup.clone();
+            Box::new(move || sup.handle().load().models.len() == 1)
+        })
+        .await;
+        assert_eq!(
+            sup.handle().load().global_pricing.len(),
+            0,
+            "a stale copy from the outer watch brought a deleted price back",
+        );
+
+        drop((env_tx, global_tx));
+        watcher.await.unwrap();
+    }
+
     #[tokio::test(start_paused = true)]
     async fn a_lone_event_is_applied_within_the_quiet_period() {
         /// Slack for the 1 ms poll below, which can only overshoot the

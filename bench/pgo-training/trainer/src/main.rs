@@ -23,8 +23,11 @@
 //! before training, and a dependency-free build keeps that phase off the
 //! network and off the workspace lockfile.
 //!
-//! Exit code 0 means every request of the shape succeeded. Anything else is
-//! a training failure and MUST fail the calling pipeline — fail-closed, #967
+//! Exit code 0 means every request of the shape succeeded: a 200 whose body
+//! carries the canned reply and, for a stream, its protocol's terminal event,
+//! with no error in it. A 200 that streams an error instead trains the error
+//! path, so it counts as a failure like any other. Anything else is a
+//! training failure and MUST fail the calling pipeline — fail-closed, #967
 //! hard gate 2. Never weaken a failure here into a warning.
 
 use std::io::{BufRead, BufReader, Read, Write};
@@ -61,6 +64,48 @@ struct Shape {
     /// `None` = body built at runtime (the padded mid-size one).
     body: Option<&'static str>,
     anthropic_headers: bool,
+    /// What the gateway's answer must contain to be this shape's canned
+    /// success: the mock's fixed reply and, for a stream, the dialect's own
+    /// terminal event. An empty answer, or one that ends early, has none.
+    expect: &'static [&'static str],
+}
+
+/// The canned non-stream reply, in every dialect the mock answers in.
+const REPLY: &str = "PGO training reply.";
+
+/// What a successful answer never contains, in any dialect the shapes use:
+/// an OpenAI-style error object (a whole body or a stream frame), an
+/// Anthropic `error` event, a failed Responses stream.
+const ERROR_MARKERS: &[&str] = &[
+    r#"{"error":"#,
+    r#""type":"error""#,
+    "event: error",
+    "response.failed",
+];
+
+const CHAT_DONE: &[&str] = &[REPLY, r#""finish_reason":"stop""#];
+const CHAT_STREAM_DONE: &[&str] = &[r#""finish_reason":"stop""#, "data: [DONE]"];
+const MESSAGES_DONE: &[&str] = &[REPLY, r#""stop_reason":"end_turn""#];
+const MESSAGES_STREAM_DONE: &[&str] = &[r#""stop_reason":"end_turn""#, "event: message_stop"];
+const RESPONSES_DONE: &[&str] = &[REPLY, r#""status":"completed""#];
+const RESPONSES_STREAM_DONE: &[&str] = &["response.completed"];
+const EMBEDDINGS_DONE: &[&str] = &[r#""embedding":["#];
+
+/// Why `body` is not the shape's canned success, or `None` when it is.
+fn unexpected_body(shape: &Shape, body: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(body);
+    let excerpt = || text.chars().take(200).collect::<String>();
+    if let Some(marker) = ERROR_MARKERS.iter().find(|m| text.contains(**m)) {
+        return Some(format!(
+            "HTTP 200 carrying an error ({marker}): {}",
+            excerpt()
+        ));
+    }
+    shape
+        .expect
+        .iter()
+        .find(|m| !text.contains(**m))
+        .map(|missing| format!("HTTP 200 without {missing:?}: {:?}", excerpt()))
 }
 
 /// The v1 training matrix (#967, extended at the 2026-08-13 scenario review):
@@ -75,6 +120,7 @@ const SHAPES: &[Shape] = &[
         path: "/v1/chat/completions",
         body: Some(BOARD_BODY),
         anthropic_headers: false,
+        expect: CHAT_DONE,
     },
     Shape {
         name: "chat-stream",
@@ -83,12 +129,14 @@ const SHAPES: &[Shape] = &[
             r#"{"model":"gpt-4o-mini","stream":true,"messages":[{"role":"user","content":"hello"}],"max_tokens":64}"#,
         ),
         anthropic_headers: false,
+        expect: CHAT_STREAM_DONE,
     },
     Shape {
         name: "chat-mid",
         path: "/v1/chat/completions",
         body: None,
         anthropic_headers: false,
+        expect: CHAT_DONE,
     },
     Shape {
         name: "bridge-messages",
@@ -97,6 +145,7 @@ const SHAPES: &[Shape] = &[
             r#"{"model":"gpt-4o-mini","max_tokens":32,"messages":[{"role":"user","content":"hello"}]}"#,
         ),
         anthropic_headers: true,
+        expect: MESSAGES_DONE,
     },
     Shape {
         name: "bridge-messages-stream",
@@ -105,18 +154,21 @@ const SHAPES: &[Shape] = &[
             r#"{"model":"gpt-4o-mini","max_tokens":64,"stream":true,"messages":[{"role":"user","content":"hello"}]}"#,
         ),
         anthropic_headers: true,
+        expect: MESSAGES_STREAM_DONE,
     },
     Shape {
         name: "responses",
         path: "/v1/responses",
         body: Some(r#"{"model":"gpt-4o-mini","input":"hello"}"#),
         anthropic_headers: false,
+        expect: RESPONSES_DONE,
     },
     Shape {
         name: "responses-stream",
         path: "/v1/responses",
         body: Some(r#"{"model":"gpt-4o-mini","input":"hello","stream":true}"#),
         anthropic_headers: false,
+        expect: RESPONSES_STREAM_DONE,
     },
     Shape {
         name: "chat-ratelimit",
@@ -125,6 +177,7 @@ const SHAPES: &[Shape] = &[
             r#"{"model":"gpt-4o-mini-rl","messages":[{"role":"user","content":"hello"}],"max_tokens":16}"#,
         ),
         anthropic_headers: false,
+        expect: CHAT_DONE,
     },
     Shape {
         name: "native-messages",
@@ -133,6 +186,7 @@ const SHAPES: &[Shape] = &[
             r#"{"model":"claude-pgo","max_tokens":32,"messages":[{"role":"user","content":"hello"}]}"#,
         ),
         anthropic_headers: true,
+        expect: MESSAGES_DONE,
     },
     Shape {
         name: "native-messages-stream",
@@ -141,6 +195,7 @@ const SHAPES: &[Shape] = &[
             r#"{"model":"claude-pgo","max_tokens":64,"stream":true,"messages":[{"role":"user","content":"hello"}]}"#,
         ),
         anthropic_headers: true,
+        expect: MESSAGES_STREAM_DONE,
     },
     Shape {
         name: "chat-routing",
@@ -149,12 +204,14 @@ const SHAPES: &[Shape] = &[
             r#"{"model":"gpt-router","messages":[{"role":"user","content":"hello"}],"max_tokens":16}"#,
         ),
         anthropic_headers: false,
+        expect: CHAT_DONE,
     },
     Shape {
         name: "embeddings",
         path: "/v1/embeddings",
         body: Some(r#"{"model":"text-embedding-mock","input":"hello world"}"#),
         anthropic_headers: false,
+        expect: EMBEDDINGS_DONE,
     },
 ];
 
@@ -273,10 +330,8 @@ fn main() {
         let api_key = args.api_key.clone();
         let body = Arc::clone(&body);
         let ok = Arc::clone(&ok);
-        let path = shape.path;
-        let anthropic = shape.anthropic_headers;
         workers.push(thread::spawn(move || -> Result<(), String> {
-            drive(&gateway, &api_key, path, anthropic, &body, n, &ok)
+            drive(&gateway, &api_key, shape, &body, n, &ok)
         }));
     }
 
@@ -344,13 +399,13 @@ fn connect(gateway: &str) -> Result<(BufReader<TcpStream>, TcpStream), String> {
 fn drive(
     gateway: &str,
     api_key: &str,
-    path: &str,
-    anthropic: bool,
+    shape: &Shape,
     body: &str,
     n: u64,
     ok: &AtomicU64,
 ) -> Result<(), String> {
-    let extra = if anthropic {
+    let path = shape.path;
+    let extra = if shape.anthropic_headers {
         "anthropic-version: 2023-06-01\r\n"
     } else {
         ""
@@ -365,10 +420,13 @@ fn drive(
         writer
             .write_all(request.as_bytes())
             .map_err(|e| format!("{path} req {i}: write: {e}"))?;
-        let (status, reused) =
+        let (status, reused, answer) =
             read_response(&mut reader).map_err(|e| format!("{path} req {i}: {e}"))?;
         if status != 200 {
             return Err(format!("{path} req {i}: HTTP {status}"));
+        }
+        if let Some(why) = unexpected_body(shape, &answer) {
+            return Err(format!("{path} req {i}: {why}"));
         }
         ok.fetch_add(1, Ordering::Relaxed);
         if !reused {
@@ -380,11 +438,11 @@ fn drive(
     Ok(())
 }
 
-/// Read one HTTP/1.1 response. Returns (status, connection-reusable).
+/// Read one HTTP/1.1 response. Returns (status, connection-reusable, body).
 /// Handles both framings the gateway emits: content-length (JSON) and
 /// chunked (SSE) — reading to the zero chunk is dialect-agnostic, so one
 /// client covers every streaming shape.
-fn read_response(r: &mut BufReader<TcpStream>) -> Result<(u16, bool), String> {
+fn read_response(r: &mut BufReader<TcpStream>) -> Result<(u16, bool, Vec<u8>), String> {
     let mut line = String::new();
     r.read_line(&mut line).map_err(|e| format!("status: {e}"))?;
     if line.is_empty() {
@@ -420,6 +478,7 @@ fn read_response(r: &mut BufReader<TcpStream>) -> Result<(u16, bool), String> {
         }
     }
 
+    let mut body = Vec::new();
     if chunked {
         loop {
             let mut sz = String::new();
@@ -433,17 +492,17 @@ fn read_response(r: &mut BufReader<TcpStream>) -> Result<(u16, bool), String> {
             if sz == 0 {
                 break;
             }
+            body.extend_from_slice(&chunk[..sz]);
         }
     } else if let Some(len) = content_length {
-        let mut body = vec![0u8; len];
+        body = vec![0u8; len];
         r.read_exact(&mut body).map_err(|e| format!("body: {e}"))?;
     } else {
         // No length and not chunked: body runs to EOF; connection is done.
-        let mut sink = Vec::new();
-        r.read_to_end(&mut sink).map_err(|e| format!("body: {e}"))?;
-        return Ok((status, false));
+        r.read_to_end(&mut body).map_err(|e| format!("body: {e}"))?;
+        return Ok((status, false, body));
     }
-    Ok((status, !close))
+    Ok((status, !close, body))
 }
 
 // ---- mock upstream (server side) ----------------------------------------------
@@ -663,4 +722,68 @@ fn anthropic_sse_frames() -> Vec<String> {
     .to_string());
     f.push("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n".to_string());
     f
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn shape(name: &str) -> &'static Shape {
+        SHAPES.iter().find(|s| s.name == name).expect("known shape")
+    }
+
+    /// The mock's own answers, relayed as they are by the passthrough
+    /// shapes, are each shape's success — the normal workload stays green.
+    #[test]
+    fn the_canned_answers_pass() {
+        let joined = |frames: Vec<String>| frames.concat();
+        for (name, body) in [
+            ("chat-board", CHAT_JSON.to_string()),
+            ("chat-stream", joined(chat_sse_frames())),
+            ("responses", RESPONSES_JSON.to_string()),
+            ("responses-stream", joined(responses_sse_frames())),
+            ("native-messages", ANTHROPIC_JSON.to_string()),
+            ("native-messages-stream", joined(anthropic_sse_frames())),
+            ("embeddings", EMBEDDINGS_JSON.to_string()),
+        ] {
+            assert_eq!(
+                unexpected_body(shape(name), body.as_bytes()),
+                None,
+                "{name}"
+            );
+        }
+    }
+
+    /// A 200 is not a success by itself: an empty body, a stream that is
+    /// only an error, and one that errors after its content all train the
+    /// wrong path and must fail the shape.
+    #[test]
+    fn a_200_without_the_canned_success_fails() {
+        for s in SHAPES {
+            assert!(unexpected_body(s, b"").is_some(), "{}: empty body", s.name);
+        }
+        let error_only =
+            "data: {\"error\":{\"message\":\"upstream failed\",\"type\":\"server_error\"}}\n\n\
+                          data: [DONE]\n\n";
+        assert!(unexpected_body(shape("chat-stream"), error_only.as_bytes()).is_some());
+
+        let mut cut = anthropic_sse_frames();
+        cut.truncate(5);
+        cut.push(
+            "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\
+             \"message\":\"Overloaded\"}}\n\n"
+                .to_string(),
+        );
+        assert!(
+            unexpected_body(shape("native-messages-stream"), cut.concat().as_bytes()).is_some()
+        );
+
+        let mut failed = responses_sse_frames();
+        failed.truncate(3);
+        failed.push("event: response.failed\ndata: {\"type\":\"response.failed\"}\n\n".to_string());
+        assert!(unexpected_body(shape("responses-stream"), failed.concat().as_bytes()).is_some());
+
+        let json_error = r#"{"error":{"message":"boom","type":"server_error"}}"#;
+        assert!(unexpected_body(shape("chat-board"), json_error.as_bytes()).is_some());
+    }
 }

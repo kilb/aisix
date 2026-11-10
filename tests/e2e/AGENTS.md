@@ -71,3 +71,12 @@ would otherwise copy:
   skipped file contributes no assertions while the leg still reports
   green, and with a cluster per fork one dead endpoint would take out
   only the quarter of the suite bound to it — quietly.
+
+## Redis is gated the same way
+
+CI provisions a vector-capable Redis on `AISIX_E2E_REDIS` (6379) and a
+plain one on `AISIX_E2E_REDIS_PLAIN` (6377). Gate a Redis suite with
+`redisReady(url, "any" | "vector" | "plain")` from `harness/redis.ts`,
+never with a local `PING` / `FT._LIST` probe: off CI it answers `false`
+and the suite skips, on CI it throws when the server is unreachable or
+lacks the capability the suite needs, for the same reason `ping()` does.

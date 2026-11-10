@@ -2521,19 +2521,40 @@ fn endpoint_authority(endpoint: &str) -> &str {
         .map_or(without_scheme, |(_, authority)| authority)
 }
 
+/// Split an authority into its host and the port written after it, if any.
+/// A bracketed IPv6 literal is the host up to its `]`: its own colons are not
+/// a port separator, so `[::1]` has no port rather than the host `[:` and
+/// the port `1]`. The host comes back without the brackets, which is how a
+/// TLS server name or a resolver wants it.
+fn split_host_port(authority: &str) -> (&str, Option<&str>) {
+    if let Some((host, after)) = authority
+        .strip_prefix('[')
+        .and_then(|rest| rest.split_once(']'))
+    {
+        // Anything after the `]` other than `:<port>` is handed back as the
+        // port, for the port parse to refuse.
+        let port = (!after.is_empty()).then(|| after.strip_prefix(':').unwrap_or(after));
+        return (host, port);
+    }
+    match authority.rsplit_once(':') {
+        Some((host, port)) => (host, Some(port)),
+        None => (authority, None),
+    }
+}
+
 /// Shared endpoint → (host, port) splitter. Mirrors the logic in
 /// [`default_domain_from_endpoint`] plus a port parse.
 fn parse_host_port(endpoint: &str) -> anyhow::Result<(String, u16)> {
     let authority = endpoint_authority(endpoint);
     let shown = aisix_core::redact_userinfo(endpoint);
-    let (host, port) = match authority.rsplit_once(':') {
-        Some((h, p)) => (
-            h.trim_matches(|c| c == '[' || c == ']'),
+    let (host, port) = match split_host_port(authority) {
+        (h, Some(p)) => (
+            h,
             p.parse::<u16>()
                 .map_err(|e| anyhow::anyhow!("invalid port {p:?} in {shown:?}: {e}"))?,
         ),
         // No explicit port — default to the etcd v3 port.
-        None => (authority.trim_matches(|c| c == '[' || c == ']'), 2379),
+        (h, None) => (h, 2379),
     };
     if host.is_empty() {
         anyhow::bail!("endpoint {shown:?} has no host");
@@ -2542,12 +2563,7 @@ fn parse_host_port(endpoint: &str) -> anyhow::Result<(String, u16)> {
 }
 
 fn default_domain_from_endpoint(endpoint: &str) -> anyhow::Result<String> {
-    let authority = endpoint_authority(endpoint);
-    let host = authority
-        .rsplit_once(':')
-        .map(|(h, _)| h)
-        .unwrap_or(authority)
-        .trim_matches(|c| c == '[' || c == ']'); // strip IPv6 brackets
+    let (host, _) = split_host_port(endpoint_authority(endpoint));
     if host.is_empty() {
         let shown = aisix_core::redact_userinfo(endpoint);
         anyhow::bail!("cannot derive TLS domain_name from endpoint {shown:?}");
@@ -4663,6 +4679,43 @@ mcp_servers:
             default_domain_from_endpoint("https://[::1]:2379").unwrap(),
             "::1"
         );
+        // Without a port the colons inside the brackets are the address's
+        // own, not a port separator.
+        for endpoint in [
+            "https://[::1]",
+            "https://[fd00::2]",
+            "[fd00::2]",
+            "https://user:hunter2@[::1]",
+        ] {
+            let expected = if endpoint.contains("fd00") {
+                "fd00::2"
+            } else {
+                "::1"
+            };
+            assert_eq!(
+                default_domain_from_endpoint(endpoint).unwrap(),
+                expected,
+                "{endpoint}"
+            );
+            assert_eq!(
+                parse_host_port(endpoint).unwrap(),
+                (expected.to_string(), 2379),
+                "{endpoint}"
+            );
+        }
+        assert_eq!(
+            parse_host_port("https://[fd00::2]:7943").unwrap(),
+            ("fd00::2".to_string(), 7943)
+        );
+        assert!(parse_host_port("https://[::1]junk").is_err());
+        // What the TLS stack is handed must be a server name it takes.
+        for endpoint in ["https://[::1]", "https://[::1]:2379"] {
+            let domain = default_domain_from_endpoint(endpoint).unwrap();
+            assert!(
+                rustls::pki_types::ServerName::try_from(domain.as_str()).is_ok(),
+                "{endpoint} -> {domain:?}"
+            );
+        }
     }
 
     /// The platform secret must be at least 32 random bytes written as hex or

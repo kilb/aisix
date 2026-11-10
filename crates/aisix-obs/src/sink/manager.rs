@@ -104,7 +104,6 @@ impl ExporterPipelines {
             // immediately, then rebuild below. Draining here could deliver
             // captured content after the operator revoked that config.
             if let Some(old) = running.remove(key) {
-                old.handle.count_queued_as_dropped();
                 old.worker.abort();
                 tracing::info!(exporter = %key, "rebuilding reconfigured exporter pipeline");
             }
@@ -140,13 +139,11 @@ impl ExporterPipelines {
         running.retain(|key, pipeline| match desired.get(key) {
             Some(fingerprint) if *fingerprint == pipeline.fingerprint => true,
             Some(_) => {
-                pipeline.handle.count_queued_as_dropped();
                 pipeline.worker.abort();
                 tracing::info!(exporter = %key, "stopping reconfigured exporter pipeline");
                 false
             }
             None => {
-                pipeline.handle.count_queued_as_dropped();
                 pipeline.worker.abort();
                 tracing::info!(exporter = %key, "stopping removed exporter pipeline");
                 false
@@ -206,14 +203,16 @@ impl ExporterPipelines {
         }
         let until = tokio::time::Instant::now() + deadline;
         let mut finished = true;
-        for pipeline in pipelines {
-            let abort = pipeline.worker.abort_handle();
-            if tokio::time::timeout_at(until, pipeline.worker)
+        for mut pipeline in pipelines {
+            if tokio::time::timeout_at(until, &mut pipeline.worker)
                 .await
                 .is_err()
             {
-                pipeline.handle.count_queued_as_dropped();
-                abort.abort();
+                pipeline.worker.abort();
+                // Returns as soon as the abort lands, which is when the
+                // worker counts what it still held: the exit must not
+                // outrun that count.
+                let _ = pipeline.worker.await;
                 finished = false;
             }
         }
@@ -377,6 +376,9 @@ mod tests {
             } else {
                 mgr.reconcile(&HashMap::new());
             }
+            // Counted by the worker as the abort tears it down, which the
+            // runtime does on its next turn rather than inside the call.
+            wait_until(|| handle.stats().dropped >= 3).await;
             assert_eq!(handle.stats().dropped, 3);
             let rendered = metrics.render();
             assert!(
@@ -386,6 +388,63 @@ mod tests {
                     && line.ends_with(" 3")),
                 "reconfigured={reconfigured}: {rendered}"
             );
+        }
+    }
+
+    async fn wait_until(done: impl Fn() -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !done() {
+            assert!(std::time::Instant::now() < deadline, "condition never held");
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
+    /// The queue is not the only place a revoked pipeline holds records:
+    /// the worker has already taken some into its buffer, or into the batch
+    /// it is delivering. Every one of them is lost when the worker is
+    /// aborted and has to show up in the drop count — the queue alone
+    /// reports none of them.
+    #[tokio::test]
+    async fn records_the_worker_already_took_are_counted_when_it_is_aborted() {
+        // (max_batch, records left queued): a batch ceiling above the three
+        // records leaves all of them in the buffer waiting for the flush; a
+        // ceiling of two puts two into a delivery that never returns, with
+        // the third queued behind it.
+        for (max_batch, left_queued) in [(100, 0), (2, 1)] {
+            for reconfigured in [false, true] {
+                let case = format!("max_batch={max_batch} reconfigured={reconfigured}");
+                let metrics = Metrics::new(false);
+                let mgr = ExporterPipelines::new(PipelineConfig {
+                    flush_interval: std::time::Duration::from_secs(60),
+                    max_batch,
+                    ..PipelineConfig::default()
+                })
+                .with_metrics(metrics.clone());
+                let handle = mgr.get_or_create("held", 1, || {
+                    Arc::new(StuckSink) as Arc<dyn ObservabilitySink>
+                });
+                for _ in 0..3 {
+                    assert!(handle.try_enqueue(rec()));
+                }
+                wait_until(|| handle.queued() == left_queued).await;
+                if reconfigured {
+                    mgr.get_or_create("held", 2, || {
+                        Arc::new(StuckSink) as Arc<dyn ObservabilitySink>
+                    });
+                } else {
+                    mgr.reconcile(&HashMap::new());
+                }
+                wait_until(|| handle.stats().dropped >= 3).await;
+                assert_eq!(handle.stats().dropped, 3, "{case}");
+                let rendered = metrics.render();
+                assert!(
+                    rendered.lines().any(|line| line
+                        .starts_with(crate::metrics::M_OTLP_FANOUT_DROPS_TOTAL)
+                        && line.contains("reason=\"worker_stopped\"")
+                        && line.ends_with(" 3")),
+                    "{case}: {rendered}"
+                );
+            }
         }
     }
 

@@ -272,21 +272,18 @@ pub(crate) fn desugar_claim_mapping(doc: &mut Value, maps: &IdentityMaps) -> Res
     Ok(())
 }
 
-/// `api_keys[]`: strip the identity-only `display_name`, resolve
-/// `key_env` XOR `key_hash`. The plaintext read from the environment is
-/// hashed and dropped — it must never surface in errors, logs, or the
-/// emitted document, so every error here names the *variable*, not its
-/// value.
+/// `api_keys[]`: resolve `key_env` XOR `key_hash`. The `display_name` the
+/// file keys the entry by stays on the document: it is also the key's
+/// label, read by `${request.api_key.name}` and the `api_key_name` metric
+/// label, as on a key the control plane wrote. The plaintext read from the
+/// environment is hashed and dropped — it must never surface in errors,
+/// logs, or the emitted document, so every error here names the
+/// *variable*, not its value.
 pub(crate) fn desugar_api_key(doc: &mut Value, env: EnvLookup<'_>) -> Result<(), String> {
     let obj = match doc.as_object_mut() {
         Some(o) => o,
         None => return Ok(()),
     };
-    // Identity extraction already require display_name to be present;
-    // here it only needs stripping (the canonical api_key document has
-    // no name field and its schema would reject one).
-    obj.remove("display_name");
-
     let has_key_env = obj.contains_key("key_env");
     let has_key_hash = obj.contains_key("key_hash");
     match (has_key_env, has_key_hash) {
@@ -611,10 +608,9 @@ mod tests {
             "allowed_models": ["*"]
         });
         desugar_api_key(&mut doc, &env).unwrap();
-        assert!(
-            doc.get("display_name").is_none(),
-            "identity must be stripped"
-        );
+        // The identity is also the key's label, which the canonical
+        // document carries.
+        assert_eq!(doc["display_name"], json!("ci-bot"));
         assert!(doc.get("key_env").is_none(), "sugar must be stripped");
         // SHA-256 lowercase hex, identical to ApiKey::hash_bearer.
         assert_eq!(

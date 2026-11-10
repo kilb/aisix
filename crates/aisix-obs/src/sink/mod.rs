@@ -74,6 +74,22 @@ pub struct SinkAck {
     /// The idempotency marker now durably committed, if any (offset-token /
     /// file-sequence sinks). `None` for at-least-once sinks.
     pub committed: Option<IdempotencyMarker>,
+    /// What the receiver said it did not keep, or warned about, while
+    /// accepting the delivery. `None` = it kept everything and said nothing.
+    pub partial: Option<PartialSuccess>,
+}
+
+/// A receiver that accepted a delivery and reported dropping part of it, or
+/// attached a warning. Never retried: the receiver answered, and resending
+/// would duplicate what it did keep.
+#[derive(Debug, Clone, Default)]
+pub struct PartialSuccess {
+    /// Items the receiver rejected, in its own unit. An OTLP receiver counts
+    /// spans, and one record expands to several, so this is not a record
+    /// count. `0` means a warning on an otherwise full success.
+    pub rejected: u64,
+    /// The receiver's account of it, as the sink renders it.
+    pub detail: String,
 }
 
 /// Why a delivery failed. Drives the pipeline's retry/backoff/drop logic.
@@ -172,6 +188,36 @@ pub(crate) fn retry_after_of(
         .map(Duration::from_secs)
 }
 
+/// How much of a receiver's response body a sink reads.
+///
+/// A sink only ever keeps a short excerpt of an error body, and an OTLP
+/// success body is a few dozen bytes. Reading the body whole first meant the
+/// excerpt's cap bounded what was shown, not what was held: a receiver (or
+/// anything in between) answering with a large or endless body inside the
+/// request timeout had all of it buffered — decompressed, since the shared
+/// client decodes gzip. Large enough for any envelope the sinks parse.
+pub(crate) const RESPONSE_BODY_LIMIT: usize = 16 * 1024;
+
+/// The first `limit` bytes of `resp`'s body, as text (lossily decoded).
+///
+/// Reads chunk by chunk and stops at the cap: the rest of the body is never
+/// read, and dropping the response closes the connection. The cap counts the
+/// bytes after decompression, so a compressed body cannot expand past it
+/// either. A body that fails part-way yields what arrived before the failure.
+pub(crate) async fn read_body_prefix(mut resp: reqwest::Response, limit: usize) -> String {
+    let mut buf: Vec<u8> = Vec::with_capacity(limit.min(4096));
+    while buf.len() < limit {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => {
+                let take = chunk.len().min(limit - buf.len());
+                buf.extend_from_slice(&chunk[..take]);
+            }
+            Ok(None) | Err(_) => break,
+        }
+    }
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
 /// Render an error together with its full `source()` chain.
 ///
 /// `Display` on a transport error usually names only the outermost layer
@@ -241,11 +287,133 @@ pub trait ObservabilitySink: Send + Sync + 'static {
     }
 }
 
+/// A receiver that answers every request with a 500 whose body never ends,
+/// for the sinks' bounded-read cases.
+#[cfg(test)]
+pub(crate) mod endless_body {
+    use std::io::Write;
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// What `serve` writes as the body, chunk after chunk.
+    pub(crate) const FILL: u8 = b'x';
+
+    /// Past this many body bytes the receiver stops writing but keeps the
+    /// body open, so a reader that waits for its end still never gets one,
+    /// without a test of the broken reader holding gigabytes.
+    const SENT_CAP: usize = 64 << 20;
+
+    /// Serve on loopback and return `http://127.0.0.1:<port>`. `gzip` sends
+    /// the body as a gzip stream, every chunk of which decompresses to a
+    /// megabyte. Each connection ends when the client hangs up.
+    pub(crate) async fn serve(gzip: bool) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut conn, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    // Take the whole request first, so the client is reading
+                    // the response rather than still writing its body.
+                    let mut request = Vec::new();
+                    let mut buf = [0u8; 8192];
+                    loop {
+                        let Ok(n) = conn.read(&mut buf).await else {
+                            return;
+                        };
+                        if n == 0 {
+                            return;
+                        }
+                        request.extend_from_slice(&buf[..n]);
+                        let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") else {
+                            continue;
+                        };
+                        let head = String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
+                        let length = head
+                            .lines()
+                            .find_map(|l| l.strip_prefix("content-length:"))
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        if request.len() >= end + 4 + length {
+                            break;
+                        }
+                    }
+                    let encoding = if gzip {
+                        "content-encoding: gzip\r\n"
+                    } else {
+                        ""
+                    };
+                    let head = format!(
+                        "HTTP/1.1 500 Internal Server Error\r\ncontent-type: text/plain\r\n\
+                         {encoding}transfer-encoding: chunked\r\n\r\n"
+                    );
+                    if conn.write_all(head.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    let plain = vec![FILL; 1 << 20];
+                    let mut encoder =
+                        flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+                    let mut sent = 0;
+                    loop {
+                        if sent >= SENT_CAP {
+                            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                            return;
+                        }
+                        sent += if gzip { plain.len() } else { 64 * 1024 };
+                        let chunk = if gzip {
+                            encoder.write_all(&plain).unwrap();
+                            encoder.flush().unwrap();
+                            std::mem::take(encoder.get_mut())
+                        } else {
+                            plain[..64 * 1024].to_vec()
+                        };
+                        let framed = [
+                            format!("{:x}\r\n", chunk.len()).into_bytes(),
+                            chunk,
+                            b"\r\n".to_vec(),
+                        ]
+                        .concat();
+                        if conn.write_all(&framed).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::usage::UsageEvent;
     use std::sync::Arc;
+
+    /// An error body is read only as far as its excerpt needs, compressed
+    /// or not: a receiver that never stops sending must not be buffered.
+    #[tokio::test]
+    async fn a_response_body_is_read_only_up_to_the_cap() {
+        for gzip in [false, true] {
+            let base = endless_body::serve(gzip).await;
+            let resp = reqwest::Client::new()
+                .post(format!("{base}/"))
+                .body("{}")
+                .send()
+                .await
+                .unwrap();
+            let read = tokio::time::timeout(
+                Duration::from_secs(10),
+                read_body_prefix(resp, RESPONSE_BODY_LIMIT),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("gzip={gzip}: the read never stopped"));
+            assert_eq!(read.len(), RESPONSE_BODY_LIMIT, "gzip={gzip}");
+            assert!(
+                read.bytes().all(|b| b == endless_body::FILL),
+                "gzip={gzip}: the cap counts decoded bytes"
+            );
+        }
+    }
 
     #[test]
     fn http_status_error_retries_only_5xx_408_429() {

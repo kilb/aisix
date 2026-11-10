@@ -17,6 +17,7 @@ import {
   type OpenAiUpstream,
   type SpawnedApp,
 } from "../harness/index.js";
+import { redisReady } from "../harness/redis.js";
 import { metricDelta, scrapeMetrics } from "../harness/metrics.js";
 
 // E2E: cluster-level rate limiting (api7/#798).
@@ -57,25 +58,6 @@ const LEASE_LOSS_SLS_LOGSTORE = "rate-limit-lease-loss";
 
 const ETCD_ENDPOINT = etcdEndpoint();
 const REDIS_URL = process.env.AISIX_E2E_REDIS ?? "redis://127.0.0.1:6379";
-
-/** RESP-level PING so the suite skips honestly when no redis is reachable
- *  (CI provisions redis:7-alpine on :6379). */
-async function redisPing(url: string): Promise<boolean> {
-  const m = /^redis:\/\/(?:[^@/]*@)?([^:/]+)(?::(\d+))?/.exec(url);
-  if (!m) return false;
-  const host = m[1];
-  const port = m[2] ? Number(m[2]) : 6379;
-  return new Promise((resolve) => {
-    const sock = connect({ host, port }, () => sock.write("PING\r\n"));
-    const done = (ok: boolean) => {
-      sock.destroy();
-      resolve(ok);
-    };
-    sock.once("data", (buf) => done(buf.toString().startsWith("+PONG")));
-    sock.once("error", () => done(false));
-    sock.setTimeout(1000, () => done(false));
-  });
-}
 
 /**
  * One command over a fresh RESP connection, as an array of bulk strings.
@@ -221,7 +203,7 @@ describe("rate limit is shared across replicas with backend=redis (#798)", () =>
   const model = "rl-cluster";
 
   beforeAll(async () => {
-    infraReady = (await new EtcdClient().ping()) && (await redisPing(REDIS_URL));
+    infraReady = (await new EtcdClient().ping()) && (await redisReady(REDIS_URL, "any"));
     if (!infraReady) return;
 
     upstream = await startOpenAiUpstream();
@@ -279,7 +261,7 @@ describe("Redis post-stream TPM converges across replicas in thread-per-core mod
   const caller = "sk-rl-stream-exact-caller";
 
   beforeAll(async () => {
-    infraReady = (await new EtcdClient().ping()) && (await redisPing(REDIS_URL));
+    infraReady = (await new EtcdClient().ping()) && (await redisReady(REDIS_URL, "any"));
     if (!infraReady) return;
 
     upstream = await startOpenAiUpstream({
@@ -418,7 +400,7 @@ describe("passthrough SSE concurrency is shared and renewed across Redis replica
     });
 
   beforeAll(async () => {
-    infraReady = (await new EtcdClient().ping()) && (await redisPing(REDIS_URL));
+    infraReady = (await new EtcdClient().ping()) && (await redisReady(REDIS_URL, "any"));
     if (!infraReady) return;
 
     sls = await startMockSls();
@@ -632,7 +614,7 @@ describe("passthrough 502 SSE concurrency is shared through delayed EOF (#1737)"
   const call = (proxyUrl: string) => rawPost(`${proxyUrl}${routePrefix}/v1/any`, headers, body);
 
   beforeAll(async () => {
-    infraReady = (await new EtcdClient().ping()) && (await redisPing(REDIS_URL));
+    infraReady = (await new EtcdClient().ping()) && (await redisReady(REDIS_URL, "any"));
     if (!infraReady) return;
 
     upstream = await startOpenAiUpstream({
@@ -938,7 +920,7 @@ describe("a Redis outage on the shared rate-limit backend is scrapeable (#1060)"
   const model = "rl-redis-fail";
 
   beforeAll(async () => {
-    infraReady = (await new EtcdClient().ping()) && (await redisPing(REDIS_URL));
+    infraReady = (await new EtcdClient().ping()) && (await redisReady(REDIS_URL, "any"));
     if (!infraReady) return;
 
     upstream = await startOpenAiUpstream();
@@ -1050,7 +1032,7 @@ describe("an unreachable Redis degrades the limiter instead of hanging the reque
   const TIMEOUT_SECS = 2;
 
   beforeAll(async () => {
-    infraReady = (await new EtcdClient().ping()) && (await redisPing(REDIS_URL));
+    infraReady = (await new EtcdClient().ping()) && (await redisReady(REDIS_URL, "any"));
     if (!infraReady) return;
 
     upstream = await startOpenAiUpstream();
@@ -1145,7 +1127,7 @@ describe("a Redis unreachable at startup degrades the limiter, not the boot", ()
   const TIMEOUT_SECS = 2;
 
   beforeAll(async () => {
-    infraReady = (await new EtcdClient().ping()) && (await redisPing(REDIS_URL));
+    infraReady = (await new EtcdClient().ping()) && (await redisReady(REDIS_URL, "any"));
     if (!infraReady) return;
 
     upstream = await startOpenAiUpstream();
@@ -1291,7 +1273,7 @@ describe("a Redis that refuses the credential degrades the limiter, not the boot
   const TIMEOUT_SECS = 5;
 
   beforeAll(async () => {
-    infraReady = (await new EtcdClient().ping()) && (await redisPing(REDIS_URL));
+    infraReady = (await new EtcdClient().ping()) && (await redisReady(REDIS_URL, "any"));
     if (!infraReady) return;
 
     // The user exists and works — for a password the gateway does not have.

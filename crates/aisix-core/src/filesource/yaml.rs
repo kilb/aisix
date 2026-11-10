@@ -48,8 +48,11 @@ pub(crate) fn interpolate_str(input: &str, env: EnvLookup<'_>) -> Result<String,
                     name.push(c2);
                 }
                 if !closed {
+                    // The value is quoted so it can be found and fixed, and
+                    // may be a URL whose userinfo carries a password.
+                    let shown = crate::redact_userinfo(input);
                     return Err(format!(
-                        "unterminated `${{` in value {input:?} — close it with `}}` \
+                        "unterminated `${{` in value {shown:?} — close it with `}}` \
                          or escape the dollar sign as `$$`"
                     ));
                 }

@@ -14,6 +14,7 @@ import {
   type OpenAiUpstream,
   type SpawnedApp,
 } from "../harness/index.js";
+import { redisReady } from "../harness/redis.js";
 import { pickFreePort } from "../harness/ports.js";
 
 // E2E: what a Redis outage costs ONE request when the cache is on the
@@ -50,31 +51,6 @@ const TIMEOUT_SECS = 3;
 // process scheduling. It has to stay under TWO budgets, which is what the
 // defect costs at this setting (measured 4.0s).
 const ONE_BUDGET_MS = TIMEOUT_SECS * 1000 + 1_500;
-
-/** Does the server speak FT.* (vector search)? `null` = unreachable.
- *  Without it the semantic half of a policy never wires up and the case
- *  under test cannot occur, so the suite skips honestly. */
-async function redisVectorSupport(url: string): Promise<boolean | null> {
-  const m = /^redis:\/\/(?:[^@/]*@)?([^:/]+)(?::(\d+))?/.exec(url);
-  if (!m) return null;
-  const host = m[1];
-  const port = m[2] ? Number(m[2]) : 6379;
-  return new Promise((resolve) => {
-    const sock = connect({ host, port }, () => sock.write("FT._LIST\r\n"));
-    const done = (v: boolean | null) => {
-      sock.destroy();
-      resolve(v);
-    };
-    sock.once("data", (buf) => {
-      const head = buf.toString();
-      if (head.startsWith("*")) return done(true);
-      if (/^-ERR unknown command/i.test(head)) return done(false);
-      done(null);
-    });
-    sock.once("error", () => done(null));
-    sock.setTimeout(1000, () => done(null));
-  });
-}
 
 /** A TCP relay in front of Redis that the test can black-hole: after
  *  `blackhole()` the sockets stay open and nothing is forwarded or
@@ -324,7 +300,7 @@ async function tearDown(f: Fixture | undefined) {
 }
 
 async function vectorRedisReady(): Promise<boolean> {
-  return (await new EtcdClient().ping()) && (await redisVectorSupport(REDIS_URL)) === true;
+  return (await new EtcdClient().ping()) && (await redisReady(REDIS_URL, "vector"));
 }
 
 describe("a Redis outage costs one request one budget for the whole cache", () => {

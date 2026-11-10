@@ -16,9 +16,11 @@
 //!   resolves to no entry in the export set is kept verbatim and a
 //!   warning is raised — a dangling reference is a real data issue, not
 //!   something to hide.
-//! - **api-key identity** — canonical api-key documents have no name, but
-//!   the file keys every entry by one; a deterministic `apikey-<hash…>`
-//!   display_name is synthesized from the already-safe `key_hash`.
+//! - **api-key identity** — the file keys every api key by its
+//!   `display_name`, which is also the key's label. A key's own
+//!   display_name is kept when no other key shares it; a key without one,
+//!   or sharing one, gets a deterministic `apikey-<hash…>` synthesized from
+//!   the already-safe `key_hash`.
 //! - **secret redaction** — see [`super::secrets`].
 //!
 //! Two entries of one kind that would collapse to the same file identity
@@ -82,7 +84,9 @@ pub fn build_export_document(snapshot: &AisixSnapshot, reveal_secrets: bool) -> 
     // the same identities the entries are emitted under.
     let provider_key_names = id_to_name(&snapshot.provider_keys, |pk| pk.display_name.clone());
     let model_names = id_to_name(&snapshot.models, |m| m.display_name.clone());
-    let api_key_names = id_to_name(&snapshot.apikeys, |k| synthetic_api_key_name(&k.key_hash));
+    let api_key_file_names = api_key_file_names(&snapshot.apikeys, &mut diag);
+    let api_key_name = |k: &aisix_core::models::ApiKey| api_key_file_names[&k.key_hash].clone();
+    let api_key_names = id_to_name(&snapshot.apikeys, api_key_name);
     let mcp_server_names = id_to_name(&snapshot.mcp_servers, |s| s.name.clone());
     let route_names = id_to_name(&snapshot.passthrough_routes, |r| r.name.clone());
 
@@ -130,13 +134,14 @@ pub fn build_export_document(snapshot: &AisixSnapshot, reveal_secrets: bool) -> 
         ),
     );
 
-    // api_keys — identity: synthesized display_name; key_hash emitted verbatim.
+    // api_keys — identity: display_name (see `api_key_file_names`); key_hash
+    // emitted verbatim.
     push_kind(
         &mut collections,
         "api_keys",
         emit_entries(
             &snapshot.apikeys,
-            |k| synthetic_api_key_name(&k.key_hash),
+            api_key_name,
             "api_keys",
             &mut diag,
             |doc, identity, diag| {
@@ -378,7 +383,8 @@ pub fn build_export_document(snapshot: &AisixSnapshot, reveal_secrets: bool) -> 
     );
 
     // mcp_auth_settings — singleton per environment with a fixed
-    // identity; no secrets (the resource URL is public discovery data).
+    // identity. The resource URL is public discovery data, published
+    // without its userinfo, but the stored URL may carry a password there.
     push_kind(
         &mut collections,
         "mcp_auth_settings",
@@ -387,8 +393,20 @@ pub fn build_export_document(snapshot: &AisixSnapshot, reveal_secrets: bool) -> 
             |_| "mcp_auth_settings".to_string(),
             "mcp_auth_settings",
             &mut diag,
-            |doc, _, diag| resugar_anonymous_servers(doc, &mcp_server_names, diag),
-            |_, _| {},
+            |doc, _, diag| {
+                resugar_anonymous_servers(doc, &mcp_server_names, diag);
+                resugar_anonymous_principal(doc, &api_key_names, diag);
+            },
+            |doc, identity| {
+                let mut ctx = RedactionCtx {
+                    kind_token: "MCP_AUTH_SETTINGS",
+                    kind: "mcp_auth_settings",
+                    identity,
+                    reveal: reveal_secrets,
+                    out: &mut placeholders,
+                };
+                redact_credentials(doc, CredentialKind::McpAuthSettings, &mut ctx);
+            },
         ),
     );
 
@@ -600,8 +618,49 @@ fn scope_ref(a: &aisix_core::models::GuardrailAttachment) -> &str {
     a.scope_id.as_deref().unwrap_or("")
 }
 
-/// Deterministic file identity for a canonical api-key document, which
-/// carries no name of its own. `key_hash` is already a SHA-256 hash
+/// The name the file keys each api key by, by `key_hash`: the key's own
+/// `display_name` when it has one no other key shares, else
+/// [`synthetic_api_key_name`].
+///
+/// The file's name is also the key's label once loaded, so a key that has
+/// one keeps it. Two keys sharing a label cannot both be keyed by it — the
+/// file rejects duplicate names — and picking one of them to keep it would
+/// depend on iteration order, so both are renamed, and the operator told
+/// their label changes.
+fn api_key_file_names(
+    keys: &aisix_core::snapshot::ResourceTable<aisix_core::models::ApiKey>,
+    diag: &mut Diagnostics,
+) -> BTreeMap<String, String> {
+    let entries = keys.entries();
+    let mut uses: BTreeMap<&str, usize> = BTreeMap::new();
+    for entry in &entries {
+        if let Some(name) = entry.value.telemetry_name() {
+            *uses.entry(name).or_default() += 1;
+        }
+    }
+    for (name, count) in &uses {
+        if *count > 1 {
+            diag.warnings.push(format!(
+                "{count} api keys share the display_name {name:?}; the resources file keys each \
+                 api key by its name, so they are exported as `apikey-<hash>` and their label \
+                 (`api_key_name`, `${{request.api_key.name}}`) changes to that name"
+            ));
+        }
+    }
+    entries
+        .iter()
+        .map(|entry| {
+            let name = match entry.value.telemetry_name() {
+                Some(name) if uses[name] == 1 => name.to_string(),
+                _ => synthetic_api_key_name(&entry.value.key_hash),
+            };
+            (entry.value.key_hash.clone(), name)
+        })
+        .collect()
+}
+
+/// Deterministic file identity for an api-key document with no name the
+/// file can key it by. `key_hash` is already a SHA-256 hash
 /// (safe to surface) and unique per credential, so a hash prefix keys the
 /// entry stably without exposing anything sensitive. 16 hex chars (64
 /// bits) keeps the label short while making a cross-key prefix collision
@@ -1166,6 +1225,44 @@ fn resugar_anonymous_servers(
         );
     }
     anon.insert("servers".into(), Value::Array(names));
+}
+
+/// `anonymous.api_key_id` (etcd id) → the id the file will derive for that
+/// key, so anonymous MCP access still runs as the same principal after
+/// reload.
+///
+/// The file has no name spelling for this reference: the loader takes the id
+/// as written, and in file mode every api-key id is derived from the key's
+/// name. Left as the etcd id it would name no key, and anonymous access would
+/// close (`principal_missing`). An id naming no exported key is kept raw and
+/// warned: the gateway already closes anonymous access for it, and the
+/// exported file keeps doing so.
+fn resugar_anonymous_principal(
+    doc: &mut Value,
+    api_key_names: &BTreeMap<String, String>,
+    diag: &mut Diagnostics,
+) {
+    let Some(Value::Object(anon)) = doc.get_mut("anonymous") else {
+        return;
+    };
+    let Some(id) = anon
+        .get("api_key_id")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+    else {
+        return;
+    };
+    match api_key_names.get(&id) {
+        Some(name) => {
+            let file_id = aisix_core::filesource::derive_id("api_keys", name);
+            anon.insert("api_key_id".into(), Value::String(file_id));
+        }
+        None => diag.warnings.push(format!(
+            "the anonymous MCP principal api_key_id {id:?} is not among the exported api keys — \
+             kept as a raw id; anonymous MCP access stays closed after reload, as it is now \
+             (dangling reference in the source data)"
+        )),
+    }
 }
 
 /// `claim_mapping.resolve.api_key_id` (etcd id) → `resolve.api_key`

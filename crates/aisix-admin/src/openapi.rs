@@ -1426,7 +1426,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
           },
           "kind": {
             "$ref": "#/components/schemas/ModelKind",
-            "description": "Whether the entry describes a direct upstream model or a routing model."
+            "description": "Which kind of model the entry is: a direct upstream model, or a routing, ensemble or semantic model that dispatches to other models."
           },
           "status": {
             "$ref": "#/components/schemas/RuntimeStatus",
@@ -1459,9 +1459,11 @@ const OPENAPI_JSON_BASE: &str = r##"{
         "type": "string",
         "enum": [
           "direct",
-          "routing"
+          "routing",
+          "ensemble",
+          "semantic"
         ],
-        "description": "Model resource kind. `direct` models dispatch to one upstream target. `routing` models select from configured routing targets.",
+        "description": "Model resource kind. `direct` models dispatch to one upstream target. `routing` models select from configured routing targets. `ensemble` models send the request to a panel of models and have a judge model synthesize the answer. `semantic` models dispatch each request to the route whose examples it matches best.",
         "example": "direct"
       },
       "RuntimeStatus": {
@@ -1472,7 +1474,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
           "cooldown",
           "not_applicable"
         ],
-        "description": "`healthy` indicates that the model can receive traffic. `unhealthy` indicates that recent background checks failed and routing should avoid the model. `cooldown` indicates that recent request-path failures temporarily exclude the model until `cooldown_until`. `not_applicable` is used for routing models because runtime checks apply to their direct targets.",
+        "description": "`healthy` indicates that the model can receive traffic. `unhealthy` indicates that recent background checks failed and routing should avoid the model. `cooldown` indicates that recent request-path failures temporarily exclude the model until `cooldown_until`. `not_applicable` is used for routing, ensemble and semantic models because runtime checks apply to the direct models they dispatch to.",
         "example": "healthy"
       },
       "SystemTime": {
@@ -3040,6 +3042,57 @@ mod tests {
             .iter()
             .find(|branch| branch["properties"]["kind"]["enum"][0] == kind)
             .unwrap_or_else(|| panic!("schema has no `{kind}` branch"))
+    }
+
+    /// Every `kind` the model status endpoints actually answer with is a
+    /// value the served schema allows: a client generated from the document
+    /// must not reject a successful answer about a supported model.
+    #[test]
+    fn served_model_kind_enum_covers_every_status_answer() {
+        let parsed: serde_json::Value =
+            serde_json::from_str(merged_openapi()).expect("merged_openapi must parse");
+        let allowed = parsed["components"]["schemas"]["ModelKind"]["enum"]
+            .as_array()
+            .expect("ModelKind is an enum")
+            .clone();
+        let models: Vec<_> = [
+            json!({"display_name": "d", "provider": "openai", "model_name": "m", "provider_key_id": "pk"}),
+            json!({"display_name": "g", "routing": {"targets": [{"model": "d"}]}}),
+            json!({"display_name": "e", "ensemble": {"panel": [{"model": "d"}], "judge": {"model": "d"}}}),
+            json!({"display_name": "s", "semantic": {
+                "embedding_model": "d", "default": "d", "match": {"threshold": 0.9},
+                "routes": [{"name": "r", "target": "d", "examples": ["x"]}]
+            }}),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(i, model)| {
+            aisix_core::resource::ResourceEntry::new(
+                format!("m-{i}"),
+                serde_json::from_value::<aisix_core::Model>(model).unwrap(),
+                1,
+            )
+        })
+        .collect();
+        let answered: Vec<_> = crate::models_status_handler::render_models_status(models, None)
+            .into_iter()
+            .map(|view| serde_json::to_value(view).unwrap()["kind"].clone())
+            .collect();
+        assert_eq!(
+            answered,
+            [
+                json!("direct"),
+                json!("routing"),
+                json!("ensemble"),
+                json!("semantic")
+            ]
+        );
+        for kind in &answered {
+            assert!(
+                allowed.contains(kind),
+                "{kind} is answered but not in {allowed:?}"
+            );
+        }
     }
 
     #[tokio::test]

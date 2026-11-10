@@ -1018,10 +1018,11 @@ pub fn load_from_str(
             continue;
         };
         if let Some(first) = seen_issuers.insert(issuer, scope.as_str()) {
+            let shown = crate::redact_userinfo(issuer);
             errors.push(LoadError {
                 scope: scope.clone(),
                 message: format!(
-                    "duplicate enabled OIDC issuer {issuer:?}: already used by {first} — every \
+                    "duplicate enabled OIDC issuer {shown:?}: already used by {first} — every \
                      enabled provider must have a distinct issuer"
                 ),
             });
